@@ -1,0 +1,42 @@
+[
+  {
+    "fix_id": "fix_p0_25m03_001_c0fcba3f",
+    "workspace_id": "repo-4d73ffdc46",
+    "issue_id": "P0_25M03_001",
+    "status": "proposed",
+    "summary": "Live fix record",
+    "how": null,
+    "actor": {
+      "kind": "agent",
+      "name": "codex",
+      "runtime": "codex",
+      "model": "gpt-5.4-mini",
+      "key": "agent:codex",
+      "label": "codex:gpt-5.4-mini"
+    },
+    "run_id": null,
+    "session_id": null,
+    "changed_files": [
+      "api/src/example.py"
+    ],
+    "tests_run": [
+      "pytest test_example.py -q"
+    ],
+    "evidence": [],
+    "worktree": {
+      "available": true,
+      "is_git_repo": false,
+      "branch": null,
+      "head_sha": null,
+      "dirty_files": 0,
+      "staged_files": 0,
+      "untracked_files": 0,
+      "ahead": 0,
+      "behind": 0,
+      "dirty_paths": []
+    },
+    "notes": null,
+    "updated_at": "2026-03-30T19:17:29.015215+00:00",
+    "recorded_at": "2026-03-30T19:17:29.015217+00:00"
+  }
+]

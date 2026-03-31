@@ -1,0 +1,51 @@
+[
+  {
+    "fix_id": "fix_p0_25m03_001_13b64688",
+    "workspace_id": "repo-2d5d3dd8af",
+    "issue_id": "P0_25M03_001",
+    "status": "proposed",
+    "summary": "Scoped KB mutation checks",
+    "how": null,
+    "actor": {
+      "kind": "agent",
+      "name": "codex",
+      "runtime": "codex",
+      "model": "gpt-5.4-mini",
+      "key": "agent:codex",
+      "label": "codex:gpt-5.4-mini"
+    },
+    "run_id": "run_smoke_fix",
+    "session_id": "ses_smoke",
+    "changed_files": [
+      "api/src/example.py"
+    ],
+    "tests_run": [
+      "pytest test_kb_router.py -q"
+    ],
+    "evidence": [
+      {
+        "path": "/Users/for_home/Developer/CoTitanMigration/Co_Titan_Bug_Tracker/backend/data/workspaces/repo-2d5d3dd8af/runs/run_smoke_fix.out.json",
+        "line": null,
+        "excerpt": "Applied fix",
+        "normalized_path": null,
+        "path_exists": null,
+        "path_scope": null
+      }
+    ],
+    "worktree": {
+      "available": true,
+      "is_git_repo": false,
+      "branch": null,
+      "head_sha": null,
+      "dirty_files": 0,
+      "staged_files": 0,
+      "untracked_files": 0,
+      "ahead": 0,
+      "behind": 0,
+      "dirty_paths": []
+    },
+    "notes": null,
+    "updated_at": "2026-03-30T19:20:39.957004+00:00",
+    "recorded_at": "2026-03-30T19:20:39.957006+00:00"
+  }
+]

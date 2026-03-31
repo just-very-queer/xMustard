@@ -1,0 +1,29 @@
+[
+  {
+    "bug_id": "TRK_0001",
+    "title": "Tracker issue",
+    "severity": "P2",
+    "issue_status": "open",
+    "source": "tracker",
+    "source_doc": null,
+    "doc_status": "open",
+    "code_status": "unknown",
+    "summary": "Created from smoke",
+    "impact": null,
+    "evidence": [],
+    "verification_evidence": [],
+    "tests_added": [],
+    "tests_passed": [],
+    "drift_flags": [],
+    "labels": [
+      "smoke",
+      "tracker"
+    ],
+    "notes": null,
+    "verified_at": null,
+    "verified_by": null,
+    "needs_followup": false,
+    "fingerprint": "e225bb8fdec8a2189b2c0ec19da90d4e27b44bb1",
+    "updated_at": "2026-03-30T19:19:04.045276+00:00"
+  }
+]

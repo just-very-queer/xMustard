@@ -1,0 +1,29 @@
+[
+  {
+    "bug_id": "TRK_0001",
+    "title": "Tracker workflow issue",
+    "severity": "P2",
+    "issue_status": "open",
+    "source": "tracker",
+    "source_doc": null,
+    "doc_status": "open",
+    "code_status": "unknown",
+    "summary": "Created from live cli smoke",
+    "impact": null,
+    "evidence": [],
+    "verification_evidence": [],
+    "tests_added": [],
+    "tests_passed": [],
+    "drift_flags": [],
+    "labels": [
+      "smoke",
+      "tracker"
+    ],
+    "notes": null,
+    "verified_at": null,
+    "verified_by": null,
+    "needs_followup": false,
+    "fingerprint": "514f5e9917637347f8abe1bda4dc456c264cc3fc",
+    "updated_at": "2026-03-30T19:16:36.137055+00:00"
+  }
+]

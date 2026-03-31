@@ -1,0 +1,21 @@
+[project]
+name = "co-titan-bug-tracker-backend"
+version = "0.1.0"
+description = "Standalone bug tracker control plane for local codebases"
+requires-python = ">=3.9"
+dependencies = [
+  "fastapi>=0.115,<0.116",
+  "uvicorn>=0.34,<0.35",
+  "pydantic>=2.10,<3",
+  "typer>=0.12,<0.13",
+]
+
+[project.scripts]
+co-titan-bug-tracker = "app.cli:app"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["app*"]

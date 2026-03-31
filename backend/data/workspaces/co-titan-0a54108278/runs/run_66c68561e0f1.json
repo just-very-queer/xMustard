@@ -1,0 +1,40 @@
+{
+  "run_id": "run_66c68561e0f1",
+  "workspace_id": "co-titan-0a54108278",
+  "issue_id": "workspace-query",
+  "runtime": "codex",
+  "model": "gpt-5.4-mini",
+  "status": "cancelled",
+  "title": "codex:workspace-query",
+  "prompt": "Reply with exactly {\"status\":\"ok\"}",
+  "command": [
+    "/opt/homebrew/bin/codex",
+    "exec",
+    "--json",
+    "--skip-git-repo-check",
+    "-s",
+    "workspace-write",
+    "-C",
+    "/Users/for_home/Developer/CoTitanMigration/Co_Titan",
+    "-m",
+    "gpt-5.4-mini",
+    "Reply with exactly {\"status\":\"ok\"}"
+  ],
+  "command_preview": "/opt/homebrew/bin/codex exec --json --skip-git-repo-check -s workspace-write -C /Users/for_home/Developer/CoTitanMigration/Co_Titan -m gpt-5.4-mini 'Reply with exactly {\"status\":\"ok\"}'",
+  "log_path": "/Users/for_home/Developer/CoTitanMigration/Co_Titan_Bug_Tracker/backend/data/workspaces/co-titan-0a54108278/runs/run_66c68561e0f1.log",
+  "output_path": "/Users/for_home/Developer/CoTitanMigration/Co_Titan_Bug_Tracker/backend/data/workspaces/co-titan-0a54108278/runs/run_66c68561e0f1.out.json",
+  "created_at": "2026-03-30T19:01:22.072951+00:00",
+  "started_at": "2026-03-30T19:01:22.075101Z",
+  "completed_at": "2026-03-30T19:01:24.102005Z",
+  "exit_code": -15,
+  "pid": 23898,
+  "error": null,
+  "summary": {
+    "runtime": "codex",
+    "session_id": null,
+    "event_count": 2,
+    "tool_event_count": 0,
+    "last_event_type": "turn.started",
+    "text_excerpt": null
+  }
+}

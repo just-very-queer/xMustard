@@ -1,0 +1,50 @@
+[
+  {
+    "workspace_id": "co-titan-0a54108278",
+    "name": "Co_Titan",
+    "root_path": "/Users/for_home/Developer/CoTitanMigration/Co_Titan",
+    "latest_scan_at": "2026-03-30T15:52:42.666774+00:00",
+    "created_at": "2026-03-30T09:23:12.893727+00:00",
+    "updated_at": "2026-03-31T08:44:22.340919+00:00"
+  },
+  {
+    "workspace_id": "repo-cb6493e598",
+    "name": "repo",
+    "root_path": "/private/var/folders/01/wg4l3nwn13j2xnn36rvsxk6m0000gn/T/tmp.rVdbbxVN4C/repo",
+    "latest_scan_at": "2026-03-30T19:16:37.386524+00:00",
+    "created_at": "2026-03-30T19:16:32.100079+00:00",
+    "updated_at": "2026-03-30T19:16:37.386543+00:00"
+  },
+  {
+    "workspace_id": "repo-4d73ffdc46",
+    "name": "repo",
+    "root_path": "/private/var/folders/01/wg4l3nwn13j2xnn36rvsxk6m0000gn/T/tmp.usI78wSJpn/repo",
+    "latest_scan_at": "2026-03-30T19:17:29.760506+00:00",
+    "created_at": "2026-03-30T19:17:27.126231+00:00",
+    "updated_at": "2026-03-30T19:17:29.760524+00:00"
+  },
+  {
+    "workspace_id": "repo-30ecdc5685",
+    "name": "repo",
+    "root_path": "/private/var/folders/01/wg4l3nwn13j2xnn36rvsxk6m0000gn/T/tmp.eOCRMARb63/repo",
+    "latest_scan_at": "2026-03-30T19:19:05.753087+00:00",
+    "created_at": "2026-03-30T19:19:02.932476+00:00",
+    "updated_at": "2026-03-30T19:19:05.753103+00:00"
+  },
+  {
+    "workspace_id": "repo-d56ef7ff29",
+    "name": "repo",
+    "root_path": "/private/var/folders/01/wg4l3nwn13j2xnn36rvsxk6m0000gn/T/tmp.BRKQCkqgM6/repo",
+    "latest_scan_at": "2026-03-30T19:20:22.227908+00:00",
+    "created_at": "2026-03-30T19:20:19.641100+00:00",
+    "updated_at": "2026-03-30T19:20:22.227926+00:00"
+  },
+  {
+    "workspace_id": "repo-2d5d3dd8af",
+    "name": "repo",
+    "root_path": "/private/var/folders/01/wg4l3nwn13j2xnn36rvsxk6m0000gn/T/tmp.mEWmkNrhaE/repo",
+    "latest_scan_at": "2026-03-30T19:20:40.765650+00:00",
+    "created_at": "2026-03-30T19:20:37.537367+00:00",
+    "updated_at": "2026-03-30T19:20:40.765669+00:00"
+  }
+]

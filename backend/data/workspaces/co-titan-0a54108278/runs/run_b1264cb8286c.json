@@ -1,0 +1,40 @@
+{
+  "run_id": "run_b1264cb8286c",
+  "workspace_id": "co-titan-0a54108278",
+  "issue_id": "workspace-query",
+  "runtime": "codex",
+  "model": "gpt-5.4",
+  "status": "cancelled",
+  "title": "codex:workspace-query",
+  "prompt": "Summarize the current workspace focus and next actions in 5 bullets.",
+  "command": [
+    "/opt/homebrew/bin/codex",
+    "exec",
+    "--json",
+    "--skip-git-repo-check",
+    "-s",
+    "workspace-write",
+    "-C",
+    "/Users/for_home/Developer/CoTitanMigration/Co_Titan",
+    "-m",
+    "gpt-5.4",
+    "Summarize the current workspace focus and next actions in 5 bullets."
+  ],
+  "command_preview": "/opt/homebrew/bin/codex exec --json --skip-git-repo-check -s workspace-write -C /Users/for_home/Developer/CoTitanMigration/Co_Titan -m gpt-5.4 'Summarize the current workspace focus and next actions in 5 bullets.'",
+  "log_path": "/Users/for_home/Developer/CoTitanMigration/Co_Titan_Bug_Tracker/backend/data/workspaces/co-titan-0a54108278/runs/run_b1264cb8286c.log",
+  "output_path": "/Users/for_home/Developer/CoTitanMigration/Co_Titan_Bug_Tracker/backend/data/workspaces/co-titan-0a54108278/runs/run_b1264cb8286c.out.json",
+  "created_at": "2026-03-30T18:36:15.680820+00:00",
+  "started_at": "2026-03-30T18:36:15.685143Z",
+  "completed_at": "2026-03-30T18:37:01.524148Z",
+  "exit_code": -15,
+  "pid": 11426,
+  "error": null,
+  "summary": {
+    "runtime": "codex",
+    "session_id": null,
+    "event_count": 20,
+    "tool_event_count": 0,
+    "last_event_type": "item.completed",
+    "text_excerpt": null
+  }
+}

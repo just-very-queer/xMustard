@@ -1,0 +1,59 @@
+{
+  "bug_id": "P0_25M03_001",
+  "title": "KB term update/delete still bypasses scope ownership",
+  "severity": "P0",
+  "source_doc": "Co_Titan/docs/bugs/Bugs_25260323.md",
+  "source_line": 482,
+  "doc_status": "fixed",
+  "code_status": "fixed",
+  "issue_status": "resolved",
+  "verified_at": "2026-03-26",
+  "verified_by": "ledger",
+  "verification_method": "code_and_test_evidence",
+  "prior_refs": [
+    "Bugs_20032026.md",
+    "Bugs_25260323.md"
+  ],
+  "summary": "KB update and delete paths still mutate by raw `term_id` instead of first proving the row belongs to the requested case or bucket.",
+  "impact": "A caller with a known UUID can mutate or delete another scope's KB term.",
+  "evidence": [
+    {
+      "path": "Co_Titan/api/src/routers/kb.py",
+      "line": 264
+    },
+    {
+      "path": "Co_Titan/api/src/routers/kb.py",
+      "line": 304
+    }
+  ],
+  "verification_evidence": [
+    {
+      "path": "Co_Titan/api/src/routers/kb.py",
+      "line": 273
+    },
+    {
+      "path": "Co_Titan/api/src/routers/kb.py",
+      "line": 321
+    },
+    {
+      "path": "Co_Titan/common/kb_scope.py",
+      "line": 64
+    },
+    {
+      "path": "Co_Titan/test/test_kb_router.py",
+      "line": 110
+    },
+    {
+      "path": "Co_Titan/test/test_kb_router.py",
+      "line": 204
+    }
+  ],
+  "tests_added": [
+    "Co_Titan/test/test_kb_router.py"
+  ],
+  "tests_passed": [
+    "python3 -m pytest test/test_kb_router.py -v"
+  ],
+  "needs_followup": false,
+  "notes": "already fixed in the current branch worktree."
+}

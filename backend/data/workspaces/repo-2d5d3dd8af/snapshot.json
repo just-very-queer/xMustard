@@ -1,0 +1,599 @@
+{
+  "workspace": {
+    "workspace_id": "repo-2d5d3dd8af",
+    "name": "repo",
+    "root_path": "/private/var/folders/01/wg4l3nwn13j2xnn36rvsxk6m0000gn/T/tmp.mEWmkNrhaE/repo",
+    "latest_scan_at": "2026-03-30T19:20:40.765650+00:00",
+    "created_at": "2026-03-30T19:20:37.537367+00:00",
+    "updated_at": "2026-03-30T19:20:40.765669+00:00"
+  },
+  "summary": {
+    "issues_total": 2,
+    "issues_fixed": 1,
+    "issues_open": 1,
+    "signals_total": 0,
+    "signals_promoted": 0,
+    "drift_total": 2,
+    "sources_total": 3,
+    "tracker_issues_total": 1,
+    "fixes_total": 1,
+    "tree_files": 2,
+    "tree_directories": 4
+  },
+  "issues": [
+    {
+      "bug_id": "P0_25M03_001",
+      "title": "Example bug",
+      "severity": "P0",
+      "issue_status": "verification",
+      "source": "ledger",
+      "source_doc": "/private/var/folders/01/wg4l3nwn13j2xnn36rvsxk6m0000gn/T/tmp.mEWmkNrhaE/repo/docs/bugs/Bugs_25260323.md",
+      "doc_status": "fixed",
+      "code_status": "unknown",
+      "summary": "Example summary",
+      "impact": "Example impact",
+      "evidence": [
+        {
+          "path": "api/src/example.py",
+          "line": 12,
+          "excerpt": null,
+          "normalized_path": "api/src/example.py",
+          "path_exists": true,
+          "path_scope": "repo-relative"
+        }
+      ],
+      "verification_evidence": [],
+      "tests_added": [],
+      "tests_passed": [],
+      "drift_flags": [
+        "missing_verification_tests"
+      ],
+      "labels": [],
+      "notes": null,
+      "verified_at": "2026-03-30",
+      "verified_by": "ledger",
+      "needs_followup": false,
+      "fingerprint": "0668129422ca20123c61f24860ffba6bef6e64e8",
+      "updated_at": "2026-03-30T19:20:39.957593+00:00"
+    },
+    {
+      "bug_id": "TRK_0001",
+      "title": "Tracker issue",
+      "severity": "P2",
+      "issue_status": "open",
+      "source": "tracker",
+      "source_doc": null,
+      "doc_status": "open",
+      "code_status": "unknown",
+      "summary": "Created from smoke",
+      "impact": null,
+      "evidence": [],
+      "verification_evidence": [],
+      "tests_added": [],
+      "tests_passed": [],
+      "drift_flags": [
+        "missing_verification_tests"
+      ],
+      "labels": [
+        "smoke",
+        "tracker"
+      ],
+      "notes": null,
+      "verified_at": null,
+      "verified_by": null,
+      "needs_followup": false,
+      "fingerprint": "9cfc5b5e03b3b753532a35f60ae6197a05cc133d",
+      "updated_at": "2026-03-30T19:20:39.083907+00:00"
+    }
+  ],
+  "signals": [],
+  "sources": [
+    {
+      "source_id": "src_a4de584826",
+      "kind": "ledger",
+      "label": "Bugs_25260323.md",
+      "path": "/private/var/folders/01/wg4l3nwn13j2xnn36rvsxk6m0000gn/T/tmp.mEWmkNrhaE/repo/docs/bugs/Bugs_25260323.md",
+      "record_count": 2,
+      "modified_at": "2026-03-30T19:20:37.412555+00:00",
+      "notes": "Canonical markdown ledger source."
+    },
+    {
+      "source_id": "src_3e4e0dcada",
+      "kind": "tracker_issue",
+      "label": "tracker_issues.json",
+      "path": "/Users/for_home/Developer/CoTitanMigration/Co_Titan_Bug_Tracker/backend/data/workspaces/repo-2d5d3dd8af/tracker_issues.json",
+      "record_count": 1,
+      "modified_at": "2026-03-30T19:20:39.981984+00:00",
+      "notes": "Tracker-native issue records."
+    },
+    {
+      "source_id": "src_619007914a",
+      "kind": "fix_record",
+      "label": "fix_records.json",
+      "path": "/Users/for_home/Developer/CoTitanMigration/Co_Titan_Bug_Tracker/backend/data/workspaces/repo-2d5d3dd8af/fix_records.json",
+      "record_count": 1,
+      "modified_at": "2026-03-30T19:20:39.982004+00:00",
+      "notes": "Agent and operator fix history."
+    }
+  ],
+  "drift_summary": {
+    "missing_verification_tests": 2
+  },
+  "runtimes": [
+    {
+      "runtime": "codex",
+      "available": true,
+      "binary_path": "/opt/homebrew/bin/codex",
+      "models": [
+        {
+          "runtime": "codex",
+          "id": "gpt-5.4"
+        },
+        {
+          "runtime": "codex",
+          "id": "gpt-5.4-mini"
+        },
+        {
+          "runtime": "codex",
+          "id": "gpt-5.3-codex"
+        },
+        {
+          "runtime": "codex",
+          "id": "gpt-5.3-codex-spark"
+        },
+        {
+          "runtime": "codex",
+          "id": "gpt-5.2-codex"
+        }
+      ],
+      "notes": "Uses codex exec JSON streaming for issue runs."
+    },
+    {
+      "runtime": "opencode",
+      "available": true,
+      "binary_path": "/opt/homebrew/bin/opencode",
+      "models": [
+        {
+          "runtime": "opencode",
+          "id": "opencode/big-pickle"
+        },
+        {
+          "runtime": "opencode",
+          "id": "opencode/gpt-5-nano"
+        },
+        {
+          "runtime": "opencode",
+          "id": "opencode/mimo-v2-omni-free"
+        },
+        {
+          "runtime": "opencode",
+          "id": "opencode/mimo-v2-pro-free"
+        },
+        {
+          "runtime": "opencode",
+          "id": "opencode/minimax-m2.5-free"
+        },
+        {
+          "runtime": "opencode",
+          "id": "opencode/nemotron-3-super-free"
+        },
+        {
+          "runtime": "opencode",
+          "id": "opencode-go/glm-5"
+        },
+        {
+          "runtime": "opencode",
+          "id": "opencode-go/kimi-k2.5"
+        },
+        {
+          "runtime": "opencode",
+          "id": "opencode-go/minimax-m2.5"
+        },
+        {
+          "runtime": "opencode",
+          "id": "opencode-go/minimax-m2.7"
+        },
+        {
+          "runtime": "opencode",
+          "id": "local-ane/Huihui-GLM-4.7-Flash"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/black-forest-labs/flux.1-dev"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/deepseek-ai/deepseek-coder-6.7b-instruct"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/deepseek-ai/deepseek-r1"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/deepseek-ai/deepseek-r1-0528"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/deepseek-ai/deepseek-v3.1"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/deepseek-ai/deepseek-v3.1-terminus"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/deepseek-ai/deepseek-v3.2"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/google/codegemma-1.1-7b"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/google/codegemma-7b"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/google/gemma-2-27b-it"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/google/gemma-2-2b-it"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/google/gemma-3-12b-it"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/google/gemma-3-1b-it"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/google/gemma-3-27b-it"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/google/gemma-3n-e2b-it"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/google/gemma-3n-e4b-it"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/meta/codellama-70b"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/meta/llama-3.1-405b-instruct"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/meta/llama-3.1-70b-instruct"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/meta/llama-3.1-8b-instruct"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/meta/llama-3.2-11b-vision-instruct"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/meta/llama-3.2-1b-instruct"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/meta/llama-3.3-70b-instruct"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/meta/llama-4-maverick-17b-128e-instruct"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/meta/llama-4-scout-17b-16e-instruct"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/meta/llama3-70b-instruct"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/meta/llama3-8b-instruct"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/microsoft/phi-3-medium-128k-instruct"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/microsoft/phi-3-medium-4k-instruct"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/microsoft/phi-3-small-128k-instruct"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/microsoft/phi-3-small-8k-instruct"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/microsoft/phi-3-vision-128k-instruct"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/microsoft/phi-3.5-moe-instruct"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/microsoft/phi-3.5-vision-instruct"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/microsoft/phi-4-mini-instruct"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/minimaxai/minimax-m2.1"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/minimaxai/minimax-m2.5"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/mistralai/codestral-22b-instruct-v0.1"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/mistralai/devstral-2-123b-instruct-2512"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/mistralai/mamba-codestral-7b-v0.1"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/mistralai/ministral-14b-instruct-2512"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/mistralai/mistral-large-2-instruct"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/mistralai/mistral-large-3-675b-instruct-2512"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/mistralai/mistral-small-3.1-24b-instruct-2503"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/moonshotai/kimi-k2-instruct"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/moonshotai/kimi-k2-instruct-0905"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/moonshotai/kimi-k2-thinking"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/moonshotai/kimi-k2.5"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/nvidia/cosmos-nemotron-34b"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/nvidia/llama-3.1-nemotron-51b-instruct"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/nvidia/llama-3.1-nemotron-70b-instruct"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/nvidia/llama-3.1-nemotron-ultra-253b-v1"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/nvidia/llama-3.3-nemotron-super-49b-v1"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/nvidia/llama-3.3-nemotron-super-49b-v1.5"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/nvidia/llama-embed-nemotron-8b"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/nvidia/llama3-chatqa-1.5-70b"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/nvidia/nemoretriever-ocr-v1"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/nvidia/nemotron-3-nano-30b-a3b"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/nvidia/nemotron-3-super-120b-a12b"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/nvidia/nemotron-4-340b-instruct"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/nvidia/nvidia-nemotron-nano-9b-v2"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/nvidia/parakeet-tdt-0.6b-v2"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/openai/gpt-oss-120b"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/openai/whisper-large-v3"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/qwen/qwen2.5-coder-32b-instruct"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/qwen/qwen2.5-coder-7b-instruct"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/qwen/qwen3-235b-a22b"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/qwen/qwen3-coder-480b-a35b-instruct"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/qwen/qwen3-next-80b-a3b-instruct"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/qwen/qwen3-next-80b-a3b-thinking"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/qwen/qwen3.5-397b-a17b"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/qwen/qwq-32b"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/stepfun-ai/step-3.5-flash"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/z-ai/glm4.7"
+        },
+        {
+          "runtime": "opencode",
+          "id": "nvidia/z-ai/glm5"
+        },
+        {
+          "runtime": "opencode",
+          "id": "openai/codex-mini-latest"
+        },
+        {
+          "runtime": "opencode",
+          "id": "openai/gpt-5-codex"
+        },
+        {
+          "runtime": "opencode",
+          "id": "openai/gpt-5.1-codex"
+        },
+        {
+          "runtime": "opencode",
+          "id": "openai/gpt-5.1-codex-max"
+        },
+        {
+          "runtime": "opencode",
+          "id": "openai/gpt-5.1-codex-mini"
+        },
+        {
+          "runtime": "opencode",
+          "id": "openai/gpt-5.2"
+        },
+        {
+          "runtime": "opencode",
+          "id": "openai/gpt-5.2-codex"
+        },
+        {
+          "runtime": "opencode",
+          "id": "openai/gpt-5.3-codex"
+        },
+        {
+          "runtime": "opencode",
+          "id": "openai/gpt-5.3-codex-spark"
+        },
+        {
+          "runtime": "opencode",
+          "id": "openai/gpt-5.4"
+        },
+        {
+          "runtime": "opencode",
+          "id": "openai/gpt-5.4-mini"
+        },
+        {
+          "runtime": "opencode",
+          "id": "zai-coding-plan/glm-4.5"
+        },
+        {
+          "runtime": "opencode",
+          "id": "zai-coding-plan/glm-4.5-air"
+        },
+        {
+          "runtime": "opencode",
+          "id": "zai-coding-plan/glm-4.5-flash"
+        },
+        {
+          "runtime": "opencode",
+          "id": "zai-coding-plan/glm-4.5v"
+        },
+        {
+          "runtime": "opencode",
+          "id": "zai-coding-plan/glm-4.6"
+        },
+        {
+          "runtime": "opencode",
+          "id": "zai-coding-plan/glm-4.6v"
+        },
+        {
+          "runtime": "opencode",
+          "id": "zai-coding-plan/glm-4.7"
+        },
+        {
+          "runtime": "opencode",
+          "id": "zai-coding-plan/glm-4.7-flash"
+        },
+        {
+          "runtime": "opencode",
+          "id": "zai-coding-plan/glm-4.7-flashx"
+        },
+        {
+          "runtime": "opencode",
+          "id": "zai-coding-plan/glm-5"
+        },
+        {
+          "runtime": "opencode",
+          "id": "zai-coding-plan/glm-5-turbo"
+        },
+        {
+          "runtime": "opencode",
+          "id": "zai-coding-plan/glm-5.1"
+        }
+      ],
+      "notes": "Uses opencode run JSON streaming and supports local OpenCode providers."
+    }
+  ],
+  "latest_ledger": "/private/var/folders/01/wg4l3nwn13j2xnn36rvsxk6m0000gn/T/tmp.mEWmkNrhaE/repo/docs/bugs/Bugs_25260323.md",
+  "latest_verdicts": null,
+  "generated_at": "2026-03-30T19:20:40.765696+00:00"
+}
