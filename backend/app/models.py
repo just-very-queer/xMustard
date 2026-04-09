@@ -16,12 +16,14 @@ IssueStatus = Literal[
     "partial",
 ]
 IssueSource = Literal["ledger", "verdict", "manual", "signal", "tracker"]
-RunStatus = Literal["queued", "running", "completed", "failed", "cancelled"]
+RunStatus = Literal["queued", "planning", "running", "completed", "failed", "cancelled"]
+PlanPhase = Literal["pending", "generating", "awaiting_approval", "approved", "modified", "rejected", "executing"]
 SignalKind = Literal["annotation", "exception_swallow", "not_implemented", "test_marker"]
 RuntimeKind = Literal["codex", "opencode"]
 FixStatus = Literal["proposed", "in_review", "applied", "verified", "rejected"]
 RunReviewDisposition = Literal["dismissed", "investigation_only"]
 RunbookScope = Literal["issue", "workspace"]
+VerificationState = Literal["yes", "no", "unknown"]
 
 
 def utc_now() -> str:
@@ -297,6 +299,7 @@ class RunRecord(BaseModel):
     runbook_id: Optional[str] = None
     worktree: Optional[WorktreeStatus] = None
     summary: Optional[dict] = None
+    plan: Optional[RunPlan] = None
 
 
 class FixRecord(BaseModel):
@@ -345,6 +348,60 @@ class ReviewQueueItem(BaseModel):
     run: RunRecord
     issue: IssueRecord
     draft: Optional["FixDraftSuggestion"] = None
+
+
+class VerificationRecord(BaseModel):
+    verification_id: str
+    workspace_id: str
+    issue_id: str
+    run_id: str
+    runtime: RuntimeKind
+    model: str
+    code_checked: VerificationState = "unknown"
+    fixed: VerificationState = "unknown"
+    confidence: Literal["high", "medium", "low"] = "low"
+    summary: str = ""
+    evidence: list[str] = Field(default_factory=list)
+    tests: list[str] = Field(default_factory=list)
+    actor: ActivityActor
+    raw_excerpt: Optional[str] = None
+    created_at: str = Field(default_factory=utc_now)
+
+
+class VerificationSummary(BaseModel):
+    workspace_id: str
+    issue_id: str
+    records: list[VerificationRecord] = Field(default_factory=list)
+    checked_yes: int = 0
+    checked_no: int = 0
+    checked_unknown: int = 0
+    fixed_yes: int = 0
+    fixed_no: int = 0
+    fixed_unknown: int = 0
+    consensus_code_checked: VerificationState = "unknown"
+    consensus_fixed: VerificationState = "unknown"
+
+
+class PlanStep(BaseModel):
+    step_id: str
+    description: str
+    estimated_impact: Literal["low", "medium", "high"] = "medium"
+    files_affected: list[str] = Field(default_factory=list)
+    risks: list[str] = Field(default_factory=list)
+
+
+class RunPlan(BaseModel):
+    plan_id: str
+    run_id: str
+    phase: PlanPhase = "pending"
+    steps: list[PlanStep] = Field(default_factory=list)
+    summary: str = ""
+    reasoning: Optional[str] = None
+    created_at: str = Field(default_factory=utc_now)
+    approved_at: Optional[str] = None
+    approver: Optional[str] = None
+    feedback: Optional[str] = None
+    modified_summary: Optional[str] = None
 
 
 class WorkspaceSnapshot(BaseModel):
@@ -460,6 +517,15 @@ class RunbookUpsertRequest(BaseModel):
     template: str
 
 
+class VerifyIssueRequest(BaseModel):
+    runtime: RuntimeKind = "opencode"
+    models: list[str] = Field(default_factory=list)
+    runbook_id: Optional[str] = "verify"
+    instruction: Optional[str] = None
+    timeout_seconds: float = 60.0
+    poll_interval: float = 2.0
+
+
 class SavedIssueViewRequest(BaseModel):
     name: str
     query: str = ""
@@ -485,6 +551,7 @@ class ExportBundle(BaseModel):
     fixes: list[FixRecord] = Field(default_factory=list)
     run_reviews: list[RunReviewRecord] = Field(default_factory=list)
     runbooks: list[RunbookRecord] = Field(default_factory=list)
+    verifications: list[VerificationRecord] = Field(default_factory=list)
     activity: list[ActivityRecord] = Field(default_factory=list)
     exported_at: str = Field(default_factory=utc_now)
 
@@ -523,3 +590,11 @@ class TerminalWriteRequest(BaseModel):
 class TerminalResizeRequest(BaseModel):
     cols: int
     rows: int
+
+
+class PlanApproveRequest(BaseModel):
+    feedback: Optional[str] = None
+
+
+class PlanRejectRequest(BaseModel):
+    reason: str

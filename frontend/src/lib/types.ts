@@ -382,6 +382,37 @@ export type RunRecord = {
     last_event_type?: string | null
     text_excerpt?: string | null
   } | null
+  plan?: RunPlan | null
+}
+
+export type PlanStep = {
+  step_id: string
+  description: string
+  estimated_impact: 'low' | 'medium' | 'high'
+  files_affected: string[]
+  risks: string[]
+}
+
+export type RunPlan = {
+  plan_id: string
+  run_id: string
+  phase: 'pending' | 'generating' | 'awaiting_approval' | 'approved' | 'modified' | 'rejected' | 'executing'
+  steps: PlanStep[]
+  summary: string
+  reasoning?: string | null
+  created_at: string
+  approved_at?: string | null
+  approver?: string | null
+  feedback?: string | null
+  modified_summary?: string | null
+}
+
+export type PlanApproveRequest = {
+  feedback?: string
+}
+
+export type PlanRejectRequest = {
+  reason: string
 }
 
 export type TreeNode = {

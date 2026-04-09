@@ -11,7 +11,10 @@ import type {
   IssueContextPacket,
   IssueUpdateRequest,
   LocalAgentCapabilities,
+  PlanApproveRequest,
+  PlanRejectRequest,
   RuntimeProbeResult,
+  RunPlan,
   RunRecord,
   RunbookRecord,
   RunbookUpsertRequest,
@@ -270,6 +273,30 @@ export function readRunLog(workspaceId: string, runId: string, offset = 0) {
   return request<{ offset: number; content: string; eof: boolean }>(
     `/api/workspaces/${workspaceId}/runs/${runId}/log?offset=${offset}`,
   )
+}
+
+export function generatePlan(workspaceId: string, runId: string) {
+  return request<RunPlan>(`/api/workspaces/${workspaceId}/runs/${runId}/plan`, {
+    method: 'POST',
+  })
+}
+
+export function getPlan(workspaceId: string, runId: string) {
+  return request<RunPlan>(`/api/workspaces/${workspaceId}/runs/${runId}/plan`)
+}
+
+export function approvePlan(workspaceId: string, runId: string, payload: PlanApproveRequest) {
+  return request<RunPlan>(`/api/workspaces/${workspaceId}/runs/${runId}/plan/approve`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+}
+
+export function rejectPlan(workspaceId: string, runId: string, payload: PlanRejectRequest) {
+  return request<RunPlan>(`/api/workspaces/${workspaceId}/runs/${runId}/plan/reject`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
 }
 
 export function promoteSignal(workspaceId: string, signalId: string, severity: string) {

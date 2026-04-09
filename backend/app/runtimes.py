@@ -194,19 +194,21 @@ class RuntimeService:
         prompt: str,
         worktree: WorktreeStatus | None = None,
         runbook_id: str | None = None,
+        wait_for_approval: bool = False,
     ) -> RunRecord:
         run_id = f"run_{uuid.uuid4().hex[:12]}"
         run_dir = self.store.runs_dir(workspace_id)
         log_path = run_dir / f"{run_id}.log"
         output_path = run_dir / f"{run_id}.out.json"
         command = self._build_command(runtime, model, workspace_path, prompt)
+        status = "planning" if wait_for_approval else "queued"
         run = RunRecord(
             run_id=run_id,
             workspace_id=workspace_id,
             issue_id=issue_id,
             runtime=runtime,
             model=model,
-            status="queued",
+            status=status,
             title=f"{runtime}:{issue_id}",
             prompt=prompt,
             command=command,
@@ -217,13 +219,24 @@ class RuntimeService:
             worktree=worktree,
         )
         self.store.save_run(run)
+        if not wait_for_approval:
+            thread = threading.Thread(
+                target=self._run_process,
+                args=(run, workspace_path),
+                daemon=True,
+            )
+            thread.start()
+        return run
+
+    def start_approved_run(self, run: RunRecord, workspace_path: Path) -> None:
+        run = run.model_copy(update={"status": "queued", "started_at": __import__("datetime").datetime.utcnow().isoformat() + "Z"})
+        self.store.save_run(run)
         thread = threading.Thread(
             target=self._run_process,
             args=(run, workspace_path),
             daemon=True,
         )
         thread.start()
-        return run
 
     def _build_command(self, runtime: str, model: str, workspace_path: Path, prompt: str) -> list[str]:
         settings = self.store.load_settings()
@@ -319,6 +332,9 @@ class RuntimeService:
         )
 
     def _run_process(self, run: RunRecord, workspace_path: Path) -> None:
+        persisted = self.store.load_run(run.workspace_id, run.run_id)
+        if persisted and persisted.status in {"planning", "cancelled"}:
+            return
         log_path = Path(run.log_path)
         output_path = Path(run.output_path)
         log_path.parent.mkdir(parents=True, exist_ok=True)

@@ -5,6 +5,8 @@ import hashlib
 import json
 import re
 import subprocess
+import time
+import uuid
 from pathlib import Path
 from typing import Optional
 from urllib.parse import quote
@@ -26,7 +28,13 @@ from .models import (
     IssueContextPacket,
     IssueRecord,
     IssueUpdateRequest,
+    PlanApproveRequest,
+    PlanPhase,
+    PlanRejectRequest,
+    PlanStep,
     PromoteSignalRequest,
+    RunPlan,
+    RunRecord,
     RunReviewRecord,
     RunReviewRequest,
     RunAcceptRequest,
@@ -36,6 +44,9 @@ from .models import (
     SavedIssueView,
     SavedIssueViewRequest,
     SourceRecord,
+    VerificationRecord,
+    VerificationSummary,
+    VerifyIssueRequest,
     WorktreeStatus,
     WorkspaceLoadRequest,
     WorkspaceRecord,
@@ -686,6 +697,97 @@ class TrackerService:
             candidates.append(ReviewQueueItem(run=run, issue=issue, draft=draft))
         return sorted(candidates, key=lambda item: item.run.created_at, reverse=True)
 
+    def list_verifications(self, workspace_id: str, issue_id: Optional[str] = None) -> list[VerificationRecord]:
+        self.get_workspace(workspace_id)
+        records = self.store.list_verifications(workspace_id)
+        if issue_id:
+            records = [item for item in records if item.issue_id == issue_id]
+        return records
+
+    def verify_issue_three_pass(self, workspace_id: str, issue_id: str, request: VerifyIssueRequest) -> VerificationSummary:
+        packet = self.build_issue_context(workspace_id, issue_id)
+        models = request.models or self._default_verification_models(request.runtime)
+        if not models:
+            raise ValueError(f"No verification models available for runtime {request.runtime}")
+
+        records: list[VerificationRecord] = []
+        for model in models:
+            self.runtime_service.validate_runtime_model(request.runtime, model)
+            prompt = self._build_verification_prompt(packet, request.instruction)
+            run = self.runtime_service.start_issue_run(
+                workspace_id=workspace_id,
+                workspace_path=Path(packet.workspace.root_path),
+                issue_id=issue_id,
+                runtime=request.runtime,
+                model=model,
+                prompt=prompt,
+                worktree=packet.worktree,
+                runbook_id=request.runbook_id or "verify",
+            )
+            self._record_activity(
+                workspace_id=workspace_id,
+                entity_type="run",
+                entity_id=run.run_id,
+                action="run.queued",
+                summary=f"Queued {request.runtime} verification run for {issue_id}",
+                actor=build_activity_actor("agent", request.runtime, runtime=request.runtime, model=model),
+                issue_id=issue_id,
+                run_id=run.run_id,
+                details={"runtime": request.runtime, "model": model, "runbook_id": request.runbook_id or "verify"},
+            )
+            run_id = run.run_id
+            deadline = time.monotonic() + max(request.timeout_seconds, 1.0)
+            state = run.model_dump(mode="json")
+            while time.monotonic() < deadline:
+                time.sleep(max(request.poll_interval, 0.2))
+                state = self.get_run(workspace_id, run_id)
+                if state["status"] in {"completed", "failed", "cancelled"}:
+                    break
+            if state["status"] not in {"completed", "failed", "cancelled"}:
+                state = self.cancel_run(workspace_id, run_id)
+
+            run = self._load_run_for_verification(workspace_id, run_id)
+            excerpt = self._run_excerpt(run) if run else ""
+            parsed = self._parse_verification_excerpt(excerpt)
+            verification = VerificationRecord(
+                verification_id=hashlib.sha1(f"{workspace_id}:{issue_id}:{run_id}:{utc_now()}".encode("utf-8")).hexdigest()[:16],
+                workspace_id=workspace_id,
+                issue_id=issue_id,
+                run_id=run_id,
+                runtime=request.runtime,
+                model=model,
+                code_checked=self._normalize_verification_state(parsed.get("code_checked")),
+                fixed=self._normalize_verification_state(parsed.get("fixed")),
+                confidence=self._normalize_confidence(parsed.get("confidence")),
+                summary=self._verification_summary_text(parsed, excerpt, run_id, model),
+                evidence=self._normalize_string_list(parsed.get("evidence")),
+                tests=self._normalize_string_list(parsed.get("tests")),
+                actor=build_activity_actor("agent", request.runtime, runtime=request.runtime, model=model),
+                raw_excerpt=excerpt or None,
+            )
+            records.append(verification)
+
+        existing = self.store.list_verifications(workspace_id)
+        self.store.save_verifications(workspace_id, [*existing, *records])
+        for record in records:
+            self._record_activity(
+                workspace_id=workspace_id,
+                entity_type="run",
+                entity_id=record.run_id,
+                action="verification.recorded",
+                summary=f"Recorded verification pass for {issue_id} with {record.model}",
+                actor=record.actor,
+                issue_id=issue_id,
+                run_id=record.run_id,
+                details={
+                    "code_checked": record.code_checked,
+                    "fixed": record.fixed,
+                    "confidence": record.confidence,
+                    "summary": record.summary,
+                },
+            )
+        return self._summarize_verifications(workspace_id, issue_id, records)
+
     def accept_review_run(self, workspace_id: str, run_id: str, request: RunAcceptRequest) -> FixRecord:
         run = self.store.load_run(workspace_id, run_id)
         if not run:
@@ -841,6 +943,7 @@ class TrackerService:
         model: str,
         instruction: Optional[str],
         runbook_id: Optional[str] = None,
+        planning: bool = False,
     ) -> dict:
         packet = self.issue_work(workspace_id, issue_id, runbook_id=runbook_id)
         self.runtime_service.validate_runtime_model(runtime, model)
@@ -854,17 +957,20 @@ class TrackerService:
             prompt=prompt,
             worktree=packet.worktree,
             runbook_id=runbook_id,
+            wait_for_approval=planning,
         )
+        action = "run.planning" if planning else "run.queued"
+        summary = f"Started {runtime} run with planning for {issue_id}" if planning else f"Queued {runtime} run for {issue_id}"
         self._record_activity(
             workspace_id=workspace_id,
             entity_type="run",
             entity_id=run.run_id,
-            action="run.queued",
-            summary=f"Queued {runtime} run for {issue_id}",
+            action=action,
+            summary=summary,
             actor=build_activity_actor("agent", runtime, runtime=runtime, model=model),
             issue_id=issue_id,
             run_id=run.run_id,
-            details={"runtime": runtime, "model": model, "runbook_id": runbook_id},
+            details={"runtime": runtime, "model": model, "runbook_id": runbook_id, "planning": planning},
         )
         return run.model_dump(mode="json")
 
@@ -966,6 +1072,172 @@ class TrackerService:
         )
         return retried.model_dump(mode="json")
 
+    def generate_run_plan(self, workspace_id: str, run_id: str) -> dict:
+        run = self.store.load_run(workspace_id, run_id)
+        if not run:
+            raise FileNotFoundError(run_id)
+        if run.status not in {"queued", "planning"}:
+            raise ValueError(f"Cannot generate plan for run in status {run.status}")
+        packet = self.issue_work(workspace_id, run.issue_id, runbook_id=run.runbook_id)
+        plan_prompt = self._build_planning_prompt(packet)
+        plan_result = self._call_agent_for_plan(run.runtime, run.model, plan_prompt, Path(packet.workspace.root_path))
+        plan = RunPlan(
+            plan_id=f"plan_{uuid.uuid4().hex[:12]}",
+            run_id=run_id,
+            phase="awaiting_approval",
+            steps=plan_result.get("steps", []),
+            summary=plan_result.get("summary", ""),
+            reasoning=plan_result.get("reasoning"),
+            created_at=utc_now(),
+        )
+        updated_run = run.model_copy(update={"status": "planning", "plan": plan})
+        self.store.save_run(updated_run)
+        self._record_activity(
+            workspace_id=workspace_id,
+            entity_type="run",
+            entity_id=run_id,
+            action="run.plan_generated",
+            summary=f"Generated plan for {run.issue_id}",
+            actor=build_activity_actor("agent", run.runtime, runtime=run.runtime, model=run.model),
+            issue_id=run.issue_id,
+            run_id=run_id,
+            details={"plan_id": plan.plan_id, "step_count": len(plan.steps)},
+        )
+        return plan.model_dump(mode="json")
+
+    def get_run_plan(self, workspace_id: str, run_id: str) -> dict:
+        run = self.store.load_run(workspace_id, run_id)
+        if not run:
+            raise FileNotFoundError(run_id)
+        if not run.plan:
+            raise FileNotFoundError(f"No plan found for run {run_id}")
+        return run.plan.model_dump(mode="json")
+
+    def approve_run_plan(self, workspace_id: str, run_id: str, request: PlanApproveRequest) -> dict:
+        run = self.store.load_run(workspace_id, run_id)
+        if not run:
+            raise FileNotFoundError(run_id)
+        if not run.plan:
+            raise FileNotFoundError(f"No plan found for run {run_id}")
+        if run.plan.phase not in {"awaiting_approval", "modified"}:
+            raise ValueError(f"Plan is not awaiting approval (phase: {run.plan.phase})")
+        workspace = self.get_workspace(workspace_id)
+        modified_summary = request.feedback if request.feedback and run.plan.phase == "modified" else None
+        updated_plan = run.plan.model_copy(update={
+            "phase": "approved",
+            "approved_at": utc_now(),
+            "approver": "operator",
+            "feedback": request.feedback if request.feedback else None,
+            "modified_summary": modified_summary,
+        })
+        updated_run = run.model_copy(update={"status": "queued", "plan": updated_plan})
+        self.store.save_run(updated_run)
+        self.runtime_service.start_approved_run(updated_run, Path(workspace.root_path))
+        self._record_activity(
+            workspace_id=workspace_id,
+            entity_type="run",
+            entity_id=run_id,
+            action="run.plan_approved",
+            summary=f"Approved plan for {run.issue_id}",
+            actor=build_activity_actor("operator", "operator"),
+            issue_id=run.issue_id,
+            run_id=run_id,
+            details={"feedback": request.feedback},
+        )
+        return updated_plan.model_dump(mode="json")
+
+    def reject_run_plan(self, workspace_id: str, run_id: str, request: PlanRejectRequest) -> dict:
+        run = self.store.load_run(workspace_id, run_id)
+        if not run:
+            raise FileNotFoundError(run_id)
+        if not run.plan:
+            raise FileNotFoundError(f"No plan found for run {run_id}")
+        updated_plan = run.plan.model_copy(update={
+            "phase": "rejected",
+            "feedback": request.reason,
+        })
+        updated_run = run.model_copy(update={"status": "cancelled", "plan": updated_plan})
+        self.store.save_run(updated_run)
+        self._record_activity(
+            workspace_id=workspace_id,
+            entity_type="run",
+            entity_id=run_id,
+            action="run.plan_rejected",
+            summary=f"Rejected plan for {run.issue_id}: {request.reason}",
+            actor=build_activity_actor("operator", "operator"),
+            issue_id=run.issue_id,
+            run_id=run_id,
+            details={"reason": request.reason},
+        )
+        return updated_plan.model_dump(mode="json")
+
+    def _build_planning_prompt(self, packet: IssueContextPacket) -> str:
+        return f"""You are a bug fixing assistant. Generate a structured plan to address the following issue.
+
+ISSUE: {packet.issue.bug_id}
+Title: {packet.issue.title}
+Severity: {packet.issue.severity}
+Summary: {packet.issue.summary or 'No summary provided'}
+Impact: {packet.issue.impact or 'No impact provided'}
+
+Evidence:
+{chr(10).join(f"  - {e.path}:{e.line} - {e.excerpt}" if e.excerpt else f"  - {e.path}:{e.line}" for e in packet.evidence_bundle[:5])}
+
+Recent fixes for context:
+{chr(10).join(f"  - {f.summary} ({f.status})" for f in packet.recent_fixes[:3])}
+
+Your task is to generate a concise fix plan. Consider:
+1. What files need to be modified
+2. What the actual fix should be
+3. What tests should be added or updated
+4. What risks this fix might introduce
+
+Respond with a JSON object containing:
+{{
+  "summary": "Brief one-line summary of the fix approach",
+  "reasoning": "Brief explanation of why this approach was chosen",
+  "steps": [
+    {{
+      "step_id": "step_1",
+      "description": "What to do in this step",
+      "estimated_impact": "low|medium|high",
+      "files_affected": ["file1.py", "file2.py"],
+      "risks": ["risk1", "risk2"]
+    }}
+  ]
+}}
+"""
+
+    def _call_agent_for_plan(self, runtime: str, model: str, prompt: str, workspace_path: Path) -> dict:
+        settings = self.store.load_settings()
+        if runtime == "codex":
+            codex_bin = self.runtime_service._resolve_binary(settings.codex_bin, "codex") or "codex"
+            command = [codex_bin, "exec", "--json", "--skip-git-repo-check", "-s", "workspace-write", "-C", str(workspace_path), "-m", model, prompt]
+        else:
+            opencode_bin = self.runtime_service._resolve_binary(settings.opencode_bin, "opencode") or "opencode"
+            command = [opencode_bin, "run", "--format", "json", "--dir", str(workspace_path), "-m", model, prompt]
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=60, check=False)
+            output = result.stdout + result.stderr
+            for line in output.splitlines():
+                try:
+                    parsed = json.loads(line.strip())
+                    if isinstance(parsed, dict) and "summary" in parsed:
+                        return parsed
+                except json.JSONDecodeError:
+                    continue
+            text = output.strip()
+            if text.startswith("{") and text.endswith("}"):
+                try:
+                    return json.loads(text)
+                except json.JSONDecodeError:
+                    pass
+            return {"summary": text[:500], "reasoning": None, "steps": []}
+        except subprocess.TimeoutExpired:
+            return {"summary": "Planning timed out", "reasoning": None, "steps": []}
+        except Exception as exc:
+            return {"summary": f"Planning failed: {exc}", "reasoning": None, "steps": []}
+
     def _run_excerpt(self, run: RunRecord) -> str:
         parts: list[str] = []
         if isinstance(run.summary, dict):
@@ -982,6 +1254,18 @@ class TrackerService:
                 parts.append(tail)
         combined = "\n".join(part for part in parts if part).strip()
         return combined[:4000]
+
+    def _load_run_for_verification(self, workspace_id: str, run_id: str) -> Optional[RunRecord]:
+        deadline = time.monotonic() + 2.5
+        last_seen = self.store.load_run(workspace_id, run_id)
+        while time.monotonic() < deadline:
+            current = self.store.load_run(workspace_id, run_id)
+            if current is not None:
+                last_seen = current
+                if current.summary:
+                    return current
+            time.sleep(0.1)
+        return last_seen
 
     def open_terminal(self, workspace_id: str, cols: int, rows: int, terminal_id: Optional[str]) -> dict:
         workspace = self.get_workspace(workspace_id)
@@ -1011,6 +1295,7 @@ class TrackerService:
             fixes=self.store.list_fix_records(workspace_id),
             run_reviews=self.store.list_run_reviews(workspace_id),
             runbooks=self.list_runbooks(workspace_id),
+            verifications=self.store.list_verifications(workspace_id),
             activity=self.store.list_activity(workspace_id),
         )
 
@@ -1317,6 +1602,211 @@ class TrackerService:
     def _slug_runbook_name(self, name: str) -> str:
         slug = re.sub(r"[^a-z0-9]+", "-", name.strip().lower()).strip("-")
         return slug or f"runbook-{hashlib.sha1(name.encode('utf-8')).hexdigest()[:8]}"
+
+    def _default_verification_models(self, runtime: str) -> list[str]:
+        if runtime == "opencode":
+            return ["opencode-go/minimax-m2.7", "opencode-go/glm-5", "opencode-go/kimi-k2.5"]
+        return ["gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex"]
+
+    def _verification_instruction(self, operator_instruction: Optional[str]) -> str:
+        base = (
+            "Verification pass only. Inspect the issue context, then respond with JSON only. "
+            'Schema: {"code_checked":"yes|no|unknown","fixed":"yes|no|unknown","confidence":"high|medium|low","summary":"...","evidence":["..."],"tests":["..."]}. '
+            "Use unknown when you cannot support a definitive claim."
+        )
+        if operator_instruction and operator_instruction.strip():
+            return f"{base}\n\nAdditional operator instruction:\n{operator_instruction.strip()}"
+        return base
+
+    def _normalize_verification_state(self, value) -> str:
+        if isinstance(value, bool):
+            return "yes" if value else "no"
+        normalized = str(value or "").strip().lower()
+        if normalized in {"yes", "true", "checked", "fixed", "pass", "passed"}:
+            return "yes"
+        if normalized in {"no", "false", "not_checked", "not checked", "broken", "failed"}:
+            return "no"
+        return "unknown"
+
+    def _normalize_confidence(self, value) -> str:
+        normalized = str(value or "").strip().lower()
+        if normalized in {"high", "medium", "low"}:
+            return normalized
+        return "low"
+
+    def _normalize_string_list(self, value) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        return [str(item).strip() for item in value if str(item).strip()]
+
+    def _parse_verification_excerpt(self, excerpt: str) -> dict:
+        from_text = self._extract_json_object(excerpt)
+        if self._is_verdict_payload(from_text):
+            return from_text
+
+        text_fragments: list[str] = []
+        for raw_line in excerpt.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if self._is_verdict_payload(payload):
+                return payload
+            for candidate in self._collect_text_candidates(payload):
+                if candidate:
+                    text_fragments.append(candidate)
+                    parsed = self._extract_json_object(candidate)
+                    if self._is_verdict_payload(parsed):
+                        return parsed
+
+        combined = "\n".join(fragment.strip() for fragment in text_fragments if fragment.strip()).strip()
+        heuristics_source = combined or excerpt
+        lower = heuristics_source.lower()
+        if heuristics_source and any(token in lower for token in ("already fixed", "is fixed", '"fixed":"yes"', "looks fixed")):
+            return {
+                "code_checked": "yes",
+                "fixed": "yes",
+                "confidence": "medium",
+                "summary": heuristics_source[:280],
+            }
+        if heuristics_source and any(token in lower for token in ("not fixed", "still broken", "still bypasses", '"fixed":"no"')):
+            return {
+                "code_checked": "yes",
+                "fixed": "no",
+                "confidence": "medium",
+                "summary": heuristics_source[:280],
+            }
+        if any(token in lower for token in ('"tool":"read"', '"tool":"grep"', "callid\":\"read", "<content>", "</content>")):
+            return {
+                "code_checked": "yes",
+                "fixed": "unknown",
+                "confidence": "low",
+                "summary": "Agent inspected repository files but did not emit a structured final verdict.",
+            }
+
+        return {}
+
+    def _extract_json_object(self, text: str) -> dict:
+        cleaned = text.strip()
+        if not cleaned:
+            return {}
+        fence_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", cleaned, re.DOTALL)
+        candidate = fence_match.group(1) if fence_match else None
+        if candidate is None:
+            object_match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+            candidate = object_match.group(0) if object_match else None
+        if not candidate:
+            return {}
+        try:
+            payload = json.loads(candidate)
+        except json.JSONDecodeError:
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    def _is_verdict_payload(self, payload: dict) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        verdict_keys = {"code_checked", "fixed", "confidence", "summary", "evidence", "tests"}
+        return any(key in payload for key in verdict_keys)
+
+    def _collect_text_candidates(self, payload) -> list[str]:
+        candidates: list[str] = []
+        if isinstance(payload, str):
+            stripped = payload.strip()
+            if stripped:
+                candidates.append(stripped)
+            return candidates
+        if isinstance(payload, list):
+            for item in payload:
+                candidates.extend(self._collect_text_candidates(item))
+            return candidates
+        if not isinstance(payload, dict):
+            return candidates
+        direct = payload.get("text")
+        if isinstance(direct, str) and direct.strip():
+            candidates.append(direct.strip())
+        part = payload.get("part")
+        if isinstance(part, dict):
+            text = part.get("text")
+            if isinstance(text, str) and text.strip():
+                candidates.append(text.strip())
+        message = payload.get("message")
+        if isinstance(message, dict):
+            text = message.get("text")
+            if isinstance(text, str) and text.strip():
+                candidates.append(text.strip())
+        for value in payload.values():
+            if isinstance(value, (dict, list)):
+                candidates.extend(self._collect_text_candidates(value))
+        return candidates
+
+    def _build_verification_prompt(self, packet: IssueContextPacket, operator_instruction: Optional[str]) -> str:
+        refs = []
+        for evidence in packet.evidence_bundle[:10]:
+            ref = evidence.path + (f":{evidence.line}" if evidence.line else "")
+            refs.append(f"- {ref}")
+        evidence_lines = "\n".join(refs) or "- Inspect the most likely implementation and test files."
+        issue = packet.issue
+        base = (
+            f"Verify bug {issue.bug_id} in {packet.workspace.root_path}.\n"
+            "Do not modify files.\n"
+            f"Title: {issue.title}\n"
+            f"Summary: {issue.summary or 'No summary provided.'}\n"
+            f"Impact: {issue.impact or 'No impact provided.'}\n"
+            f"Current tracker statuses: doc={issue.doc_status}, code={issue.code_status}, issue={issue.issue_status}.\n"
+            "Inspect the cited implementation and test files, then decide whether the code has actually been checked and whether the bug is fixed right now.\n"
+            "Evidence to inspect:\n"
+            f"{evidence_lines}\n\n"
+            "Return exactly one JSON object and nothing else.\n"
+            'Schema: {"code_checked":"yes|no|unknown","fixed":"yes|no|unknown","confidence":"high|medium|low","summary":"...","evidence":["path:line"],"tests":["command or test file"]}\n'
+            "Use code_checked=yes only if you inspected code or tests. Use fixed=yes only if the current code path clearly closes the reported bug."
+        )
+        if operator_instruction and operator_instruction.strip():
+            return f"{base}\nAdditional operator instruction: {operator_instruction.strip()}"
+        return base
+
+    def _verification_summary_text(self, parsed: dict, excerpt: str, run_id: str, model: str) -> str:
+        summary = str(parsed.get("summary") or "").strip()
+        if summary:
+            return summary
+        return f"Verification run {run_id} ({model}) did not return a structured verdict."
+
+    def _summarize_verifications(
+        self,
+        workspace_id: str,
+        issue_id: str,
+        records: list[VerificationRecord],
+    ) -> VerificationSummary:
+        checked_yes = sum(1 for item in records if item.code_checked == "yes")
+        checked_no = sum(1 for item in records if item.code_checked == "no")
+        checked_unknown = sum(1 for item in records if item.code_checked == "unknown")
+        fixed_yes = sum(1 for item in records if item.fixed == "yes")
+        fixed_no = sum(1 for item in records if item.fixed == "no")
+        fixed_unknown = sum(1 for item in records if item.fixed == "unknown")
+
+        def consensus(yes: int, no: int) -> str:
+            if yes >= 2:
+                return "yes"
+            if no >= 2:
+                return "no"
+            return "unknown"
+
+        return VerificationSummary(
+            workspace_id=workspace_id,
+            issue_id=issue_id,
+            records=records,
+            checked_yes=checked_yes,
+            checked_no=checked_no,
+            checked_unknown=checked_unknown,
+            fixed_yes=fixed_yes,
+            fixed_no=fixed_no,
+            fixed_unknown=fixed_unknown,
+            consensus_code_checked=consensus(checked_yes, checked_no),
+            consensus_fixed=consensus(fixed_yes, fixed_no),
+        )
 
     def _build_prompt(
         self,

@@ -13,6 +13,8 @@ from .models import (
     FixUpdateRequest,
     IssueCreateRequest,
     IssueUpdateRequest,
+    PlanApproveRequest,
+    PlanRejectRequest,
     PromoteSignalRequest,
     RunAcceptRequest,
     RuntimeProbeRequest,
@@ -23,6 +25,7 @@ from .models import (
     TerminalOpenRequest,
     TerminalResizeRequest,
     TerminalWriteRequest,
+    VerifyIssueRequest,
     WorkspaceLoadRequest,
 )
 from .service import TrackerService
@@ -32,7 +35,7 @@ ROOT = Path(__file__).resolve().parents[1]
 STORE = FileStore(ROOT / "data")
 SERVICE = TrackerService(STORE)
 
-app = FastAPI(title="Co Titan Bug Tracker", version="0.1.0")
+app = FastAPI(title="xMustard", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -247,6 +250,17 @@ def list_fixes(
         raise HTTPException(status_code=404, detail="Workspace not found")
 
 
+@app.get("/api/workspaces/{workspace_id}/verifications")
+def list_verifications(
+    workspace_id: str,
+    issue_id: Optional[str] = Query(default=None),
+):
+    try:
+        return [item.model_dump(mode="json") for item in SERVICE.list_verifications(workspace_id, issue_id=issue_id)]
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+
+
 @app.get("/api/workspaces/{workspace_id}/review-queue")
 def review_queue(workspace_id: str):
     try:
@@ -354,6 +368,16 @@ def issue_run(workspace_id: str, issue_id: str, request: RunRequest):
         raise HTTPException(status_code=400, detail=str(exc))
 
 
+@app.post("/api/workspaces/{workspace_id}/issues/{issue_id}/verify")
+def verify_issue(workspace_id: str, issue_id: str, request: VerifyIssueRequest):
+    try:
+        return SERVICE.verify_issue_three_pass(workspace_id, issue_id, request).model_dump(mode="json")
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"Missing resource: {exc}")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
 @app.post("/api/workspaces/{workspace_id}/issues/{issue_id}/fixes")
 def record_fix(workspace_id: str, issue_id: str, request: FixRecordRequest):
     try:
@@ -442,6 +466,46 @@ def accept_run(workspace_id: str, run_id: str, request: RunAcceptRequest):
         return SERVICE.accept_review_run(workspace_id, run_id, request).model_dump(mode="json")
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=f"Missing resource: {exc}")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/workspaces/{workspace_id}/runs/{run_id}/plan")
+def generate_plan(workspace_id: str, run_id: str):
+    try:
+        return SERVICE.generate_run_plan(workspace_id, run_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.get("/api/workspaces/{workspace_id}/runs/{run_id}/plan")
+def get_plan(workspace_id: str, run_id: str):
+    try:
+        return SERVICE.get_run_plan(workspace_id, run_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/workspaces/{workspace_id}/runs/{run_id}/plan/approve")
+def approve_plan(workspace_id: str, run_id: str, request: PlanApproveRequest):
+    try:
+        return SERVICE.approve_run_plan(workspace_id, run_id, request)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/workspaces/{workspace_id}/runs/{run_id}/plan/reject")
+def reject_plan(workspace_id: str, run_id: str, request: PlanRejectRequest):
+    try:
+        return SERVICE.reject_run_plan(workspace_id, run_id, request)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
