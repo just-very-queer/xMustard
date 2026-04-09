@@ -1,7 +1,7 @@
 [project]
-name = "co-titan-bug-tracker-backend"
+name = "xmustard-backend"
 version = "0.1.0"
-description = "Standalone bug tracker control plane for local codebases"
+description = "xMustard - AI-powered bug operations system for local codebases"
 requires-python = ">=3.9"
 dependencies = [
   "fastapi>=0.115,<0.116",
@@ -11,7 +11,7 @@ dependencies = [
 ]
 
 [project.scripts]
-co-titan-bug-tracker = "app.cli:app"
+xmustard = "app.cli:app"
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]

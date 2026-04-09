@@ -31,8 +31,8 @@ export function WorkspaceSidebar({
   return (
     <aside className="left-rail">
       <div className="sidebar-intro">
-        <p className="eyebrow">Co_Titan_Bug_Tracker</p>
-        <h1>Bug tracker</h1>
+        <p className="eyebrow">xMustard</p>
+        <h1>Bug operations</h1>
         <p className="subtle">Load a repo tree, track bug history, and send work to agents.</p>
       </div>
 
