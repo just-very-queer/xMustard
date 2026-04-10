@@ -190,7 +190,7 @@ export function listSignals(
 export function startRun(
   workspaceId: string,
   issueId: string,
-  payload: { runtime: string; model: string; instruction?: string; runbook_id?: string },
+  payload: { runtime: string; model: string; instruction?: string; runbook_id?: string; planning?: boolean },
 ) {
   return request<RunRecord>(`/api/workspaces/${workspaceId}/issues/${issueId}/runs`, {
     method: 'POST',

@@ -361,6 +361,7 @@ def issue_run(workspace_id: str, issue_id: str, request: RunRequest):
             request.model,
             request.instruction,
             request.runbook_id,
+            request.planning,
         )
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=f"Missing resource: {exc}")

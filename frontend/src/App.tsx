@@ -1,6 +1,7 @@
 import { startTransition, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
 import './index.css'
 import {
+  approvePlan,
   cancelRun,
   createIssue,
   closeTerminal,
@@ -9,6 +10,7 @@ import {
   deleteRunbook,
   exportWorkspace,
   acceptRunReview,
+  generatePlan,
   getHealth,
   getCapabilities,
   getSettings,
@@ -35,6 +37,7 @@ import {
   readTerminal,
   readWorktree,
   recordFix,
+  rejectPlan,
   reviewRun,
   retryRun,
   scanWorkspace,
@@ -63,6 +66,7 @@ import type {
   IssueQueueFilters,
   IssueRecord,
   LocalAgentCapabilities,
+  RunPlan,
   RunRecord,
   RuntimeProbeResult,
   SavedIssueView,
@@ -153,6 +157,7 @@ function App() {
   const [runtime, setRuntime] = useState<'codex' | 'opencode'>('codex')
   const [model, setModel] = useState('')
   const [instruction, setInstruction] = useState('')
+  const [planningMode, setPlanningMode] = useState(false)
   const [queryPrompt, setQueryPrompt] = useState('Summarize the current workspace focus and next actions in 5 bullets.')
   const [executionOpen, setExecutionOpen] = useState(false)
   const [selectedRunbookId, setSelectedRunbookId] = useState('fix')
@@ -160,6 +165,7 @@ function App() {
   const [runbookDescriptionDraft, setRunbookDescriptionDraft] = useState('')
   const [runbookTemplateDraft, setRunbookTemplateDraft] = useState('')
   const [logContent, setLogContent] = useState('')
+  const [selectedRunPlan, setSelectedRunPlan] = useState<RunPlan | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const logTimerRef = useRef<number | null>(null)
@@ -750,6 +756,7 @@ function App() {
         model,
         instruction,
         runbook_id: selectedRunbookId || undefined,
+        planning: planningMode,
       })
       setRuns((current) => [run, ...current])
       setSelectedRunId(run.run_id)
@@ -1115,6 +1122,52 @@ function App() {
     }
   }
 
+  async function handleGeneratePlan() {
+    if (!snapshot || !selectedRun) return
+    setLoading(true)
+    try {
+      const plan = await generatePlan(snapshot.workspace.workspace_id, selectedRun.run_id)
+      setSelectedRunPlan(plan)
+      await refreshActivityData(snapshot.workspace.workspace_id)
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : String(nextError))
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  async function handleApprovePlan(feedback?: string) {
+    if (!snapshot || !selectedRun) return
+    setLoading(true)
+    try {
+      await approvePlan(snapshot.workspace.workspace_id, selectedRun.run_id, { feedback })
+      setSelectedRunPlan(null)
+      const updatedRuns = await listRuns(snapshot.workspace.workspace_id)
+      setRuns(updatedRuns)
+      await refreshActivityData(snapshot.workspace.workspace_id)
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : String(nextError))
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  async function handleRejectPlan(reason: string) {
+    if (!snapshot || !selectedRun) return
+    setLoading(true)
+    try {
+      await rejectPlan(snapshot.workspace.workspace_id, selectedRun.run_id, { reason })
+      setSelectedRunPlan(null)
+      const updatedRuns = await listRuns(snapshot.workspace.workspace_id)
+      setRuns(updatedRuns)
+      await refreshActivityData(snapshot.workspace.workspace_id)
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : String(nextError))
+    } finally {
+      setLoading(false)
+    }
+  }
+
   async function handleExport() {
     if (!snapshot) return
     try {
@@ -1447,6 +1500,10 @@ function App() {
                 onPromoteSignal={() => selectedSignal && void handlePromoteSignal(selectedSignal)}
                 onRetryRun={() => void handleRetryRun()}
                 onCancelRun={() => void handleCancelRun()}
+                selectedRunPlan={selectedRunPlan}
+                onGeneratePlan={() => void handleGeneratePlan()}
+                onApprovePlan={(feedback) => void handleApprovePlan(feedback)}
+                onRejectPlan={(reason) => void handleRejectPlan(reason)}
               />
 
               {executionOpen ? (
@@ -1456,6 +1513,7 @@ function App() {
                   runtimeModels={runtimeModels}
                   capabilities={capabilities}
                   instruction={instruction}
+                  planningMode={planningMode}
                   queryPrompt={queryPrompt}
                   issueContextPacket={issueContextPacket}
                   selectedRunbookId={selectedRunbookId}
@@ -1482,6 +1540,7 @@ function App() {
                     }))
                   }}
                   onInstructionChange={setInstruction}
+                  onPlanningModeChange={setPlanningMode}
                   onQueryPromptChange={setQueryPrompt}
                   onSelectedRunbookChange={setSelectedRunbookId}
                   onRunbookNameDraftChange={setRunbookNameDraft}

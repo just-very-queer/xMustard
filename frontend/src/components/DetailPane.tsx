@@ -5,6 +5,7 @@ import type {
   IssueContextPacket,
   IssueDriftDetail,
   IssueRecord,
+  RunPlan,
   RunRecord,
   SourceRecord,
   ViewMode,
@@ -12,6 +13,7 @@ import type {
 import { SummaryCard } from './TrackerPrimitives'
 import { StatusPill, formatDate } from './TrackerPrimitives'
 import { ActivityDigestSummary } from './ActivityDigestSummary'
+import { PlanPreview } from './PlanPreview'
 
 function WorktreeSnapshot({ label, worktree }: { label: string; worktree?: IssueContextPacket['worktree'] | RunRecord['worktree'] }) {
   if (!worktree?.available) return null
@@ -111,6 +113,10 @@ type Props = {
   onPromoteSignal: () => void
   onRetryRun: () => void
   onCancelRun: () => void
+  selectedRunPlan: RunPlan | null
+  onGeneratePlan: () => void
+  onApprovePlan: (feedback?: string) => void
+  onRejectPlan: (reason: string) => void
 }
 
 export function DetailPane({
@@ -176,6 +182,10 @@ export function DetailPane({
   onPromoteSignal,
   onRetryRun,
   onCancelRun,
+  selectedRunPlan,
+  onGeneratePlan,
+  onApprovePlan,
+  onRejectPlan,
 }: Props) {
   return (
     <div className="panel detail-panel">
@@ -713,39 +723,67 @@ export function DetailPane({
             </div>
             <StatusPill tone={selectedRun.status}>{selectedRun.status}</StatusPill>
           </div>
-          <section className="detail-section">
-            <h4>Command</h4>
-            <pre className="prompt-block">{selectedRun.command_preview}</pre>
-          </section>
-          <section className="detail-section">
-            <h4>Live log</h4>
-            <pre className="terminal-block">{logContent || 'Waiting for output...'}</pre>
-          </section>
-          <section className="detail-section">
-            <h4>Run summary</h4>
-            <div className="evidence-row">
-              <span>Session</span>
-              <small>{selectedRun.summary?.session_id ?? 'none'}</small>
-            </div>
-            <div className="evidence-row">
-              <span>Events</span>
-              <small>{selectedRun.summary?.event_count ?? 0}</small>
-            </div>
-            <div className="evidence-row">
-              <span>Tool events</span>
-              <small>{selectedRun.summary?.tool_event_count ?? 0}</small>
-            </div>
-            <div className="evidence-row">
-              <span>Last event</span>
-              <small>{selectedRun.summary?.last_event_type ?? 'unknown'}</small>
-            </div>
-            <div className="evidence-row">
-              <span>Runbook</span>
-              <small>{selectedRun.runbook_id ?? 'none'}</small>
-            </div>
-            <pre className="prompt-block">{selectedRun.summary?.text_excerpt ?? 'No structured text captured yet.'}</pre>
-          </section>
-          <WorktreeSnapshot label="Run provenance" worktree={selectedRun.worktree} />
+
+          {selectedRun.status === 'planning' ? (
+            !selectedRunPlan ? (
+              <section className="detail-section">
+                <h4>Planning</h4>
+                <p className="subtle">This run is waiting for plan approval.</p>
+                <div className="toolbar-row">
+                  <button type="button" onClick={onGeneratePlan} disabled={loading}>
+                    Generate plan
+                  </button>
+                </div>
+              </section>
+            ) : (
+              <PlanPreview
+                plan={selectedRunPlan}
+                loading={loading}
+                onApprove={onApprovePlan}
+                onReject={onRejectPlan}
+              />
+            )
+          ) : (
+            <>
+              <section className="detail-section">
+                <h4>Command</h4>
+                <pre className="prompt-block">{selectedRun.command_preview}</pre>
+              </section>
+              <section className="detail-section">
+                <h4>Live log</h4>
+                <pre className="terminal-block">{logContent || 'Waiting for output...'}</pre>
+              </section>
+              <section className="detail-section">
+                <h4>Run summary</h4>
+                <div className="evidence-row">
+                  <span>Session</span>
+                  <small>{selectedRun.summary?.session_id ?? 'none'}</small>
+                </div>
+                <div className="evidence-row">
+                  <span>Events</span>
+                  <small>{selectedRun.summary?.event_count ?? 0}</small>
+                </div>
+                <div className="evidence-row">
+                  <span>Tool events</span>
+                  <small>{selectedRun.summary?.tool_event_count ?? 0}</small>
+                </div>
+                <div className="evidence-row">
+                  <span>Last event</span>
+                  <small>{selectedRun.summary?.last_event_type ?? 'unknown'}</small>
+                </div>
+                <div className="evidence-row">
+                  <span>Runbook</span>
+                  <small>{selectedRun.runbook_id ?? 'none'}</small>
+                </div>
+                <pre className="prompt-block">{selectedRun.summary?.text_excerpt ?? 'No structured text captured yet.'}</pre>
+              </section>
+            </>
+          )}
+
+          {selectedRun.status !== 'planning' && (
+            <WorktreeSnapshot label="Run provenance" worktree={selectedRun.worktree} />
+          )}
+
           <section className="detail-section">
             <h4>Run history</h4>
             <div className="activity-list">

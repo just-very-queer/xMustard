@@ -429,6 +429,7 @@ class RunRequest(BaseModel):
     model: str
     instruction: Optional[str] = None
     runbook_id: Optional[str] = None
+    planning: bool = False
 
 
 class AgentQueryRequest(BaseModel):

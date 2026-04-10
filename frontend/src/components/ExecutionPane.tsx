@@ -7,6 +7,7 @@ type Props = {
   runtimeModels: RuntimeModel[]
   capabilities: LocalAgentCapabilities | null
   instruction: string
+  planningMode: boolean
   queryPrompt: string
   issueContextPacket: IssueContextPacket | null
   selectedRunbookId: string
@@ -24,6 +25,7 @@ type Props = {
   onRuntimeChange: (value: 'codex' | 'opencode') => void
   onModelChange: (value: string) => void
   onInstructionChange: (value: string) => void
+  onPlanningModeChange: (value: boolean) => void
   onQueryPromptChange: (value: string) => void
   onSelectedRunbookChange: (value: string) => void
   onRunbookNameDraftChange: (value: string) => void
@@ -53,6 +55,7 @@ export function ExecutionPane({
   runtimeModels,
   capabilities,
   instruction,
+  planningMode,
   queryPrompt,
   issueContextPacket,
   selectedRunbookId,
@@ -70,6 +73,7 @@ export function ExecutionPane({
   onRuntimeChange,
   onModelChange,
   onInstructionChange,
+  onPlanningModeChange,
   onQueryPromptChange,
   onSelectedRunbookChange,
   onRunbookNameDraftChange,
@@ -393,6 +397,14 @@ export function ExecutionPane({
         <button type="button" onClick={onRunIssue} disabled={!selectedIssue || !workspaceLoaded || !model || loading}>
           Start issue run
         </button>
+        <label className="checkbox-label">
+          <input
+            type="checkbox"
+            checked={planningMode}
+            onChange={(event) => onPlanningModeChange(event.target.checked)}
+          />
+          Planning mode
+        </label>
         <span className="subtle">{selectedIssue ? `Target ${selectedIssue.bug_id}` : 'Select an issue'}</span>
       </div>
     </div>
