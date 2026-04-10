@@ -6,6 +6,8 @@ import json
 import re
 import subprocess
 import time
+import urllib.request
+import urllib.error
 import uuid
 from pathlib import Path
 from typing import Optional
@@ -28,13 +30,22 @@ from .models import (
     FixDraftSuggestion,
     FixRecordRequest,
     FixUpdateRequest,
+    GitHubIssueImport,
+    GitHubPRCreate,
+    GitHubPRResult,
     ImprovementSuggestion,
+    IntegrationConfig,
+    IntegrationTestRequest,
+    IntegrationTestResult,
     IssueDriftDetail,
     IssueCreateRequest,
     IssueContextPacket,
     IssueQualityScore,
     IssueRecord,
     IssueUpdateRequest,
+    JiraIssueSync,
+    LinearIssueSync,
+    NotificationEvent,
     PatchCritique,
     PlanApproveRequest,
     PlanPhase,
@@ -52,6 +63,7 @@ from .models import (
     ReviewQueueItem,
     SavedIssueView,
     SavedIssueViewRequest,
+    SlackNotification,
     SourceRecord,
     TestSuggestion,
     TriageSuggestion,
@@ -2085,6 +2097,449 @@ Respond with a JSON object containing:
             return PatchCritique.model_validate_json(path.read_text(encoding="utf-8"))
         except Exception:
             return None
+
+    def configure_integration(self, workspace_id: str, provider: str, settings: dict) -> dict:
+        config = IntegrationConfig(
+            config_id=f"int_{uuid.uuid4().hex[:12]}",
+            workspace_id=workspace_id,
+            provider=provider,
+            enabled=True,
+            settings=settings,
+        )
+        self._save_integration_config(config)
+        self._record_activity(
+            workspace_id=workspace_id,
+            entity_type="settings",
+            entity_id=f"integration:{provider}",
+            action="integration.configured",
+            summary=f"Configured {provider} integration",
+            actor=build_activity_actor("operator", "operator"),
+            details={"provider": provider},
+        )
+        return config.model_dump(mode="json")
+
+    def get_integration_configs(self, workspace_id: str) -> list[dict]:
+        configs = self._load_integration_configs(workspace_id)
+        return [c.model_dump(mode="json") for c in configs]
+
+    def test_integration(self, request: IntegrationTestRequest) -> dict:
+        result = self._test_provider(request.provider, request.settings)
+        return result.model_dump(mode="json")
+
+    def import_github_issues(self, workspace_id: str, repo: str, state: str = "open") -> list[dict]:
+        config = self._get_integration_config(workspace_id, "github")
+        token = config.settings.get("token", "") if config else ""
+        headers = {"Accept": "application/vnd.github+json"}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        url = f"https://api.github.com/repos/{repo}/issues?state={state}&per_page=100"
+        req = urllib.request.Request(url, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                issues_data = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.URLError as exc:
+            raise ValueError(f"GitHub API error: {exc}")
+        imports = []
+        for gh_issue in issues_data:
+            if "pull_request" in gh_issue:
+                continue
+            imp = GitHubIssueImport(
+                import_id=f"ghi_{uuid.uuid4().hex[:8]}",
+                workspace_id=workspace_id,
+                github_repo=repo,
+                issue_number=gh_issue["number"],
+                issue_id=f"GH-{gh_issue['number']}",
+                title=gh_issue.get("title", ""),
+                body=gh_issue.get("body"),
+                labels=[l["name"] for l in gh_issue.get("labels", [])],
+                state=gh_issue.get("state", "open"),
+                html_url=gh_issue.get("html_url"),
+            )
+            imports.append(imp)
+            existing = self.store.load_snapshot(workspace_id)
+            if existing:
+                for issue in existing.issues:
+                    if issue.bug_id == imp.issue_id:
+                        break
+                else:
+                    self.create_issue(workspace_id, IssueCreateRequest(
+                        bug_id=imp.issue_id,
+                        title=imp.title,
+                        severity="medium",
+                        summary=imp.body[:500] if imp.body else None,
+                        labels=imp.labels,
+                        source="tracker_issue",
+                    ))
+        self._record_activity(
+            workspace_id=workspace_id,
+            entity_type="workspace",
+            entity_id=workspace_id,
+            action="github.imported",
+            summary=f"Imported {len(imports)} issues from {repo}",
+            actor=build_activity_actor("system", "system"),
+            details={"repo": repo, "count": len(imports)},
+        )
+        return [i.model_dump(mode="json") for i in imports]
+
+    def create_github_pr(self, workspace_id: str, request: GitHubPRCreate) -> dict:
+        config = self._get_integration_config(workspace_id, "github")
+        if not config:
+            raise FileNotFoundError("GitHub integration not configured")
+        token = config.settings.get("token", "")
+        repo = config.settings.get("repo", "")
+        if not token or not repo:
+            raise ValueError("GitHub token and repo must be configured")
+        run = self.store.load_run(workspace_id, request.run_id)
+        pr_title = request.title or (f"Fix: {run.title}" if run else f"Fix for {request.issue_id}")
+        pr_body = request.body or ""
+        if run and isinstance(run.summary, dict):
+            pr_body += f"\n\n**Run Summary:** {run.summary.get('text_excerpt', 'N/A')}"
+        pr_body += f"\n\n**Issue:** {request.issue_id}"
+        data = json.dumps({
+            "title": pr_title,
+            "body": pr_body,
+            "head": request.head_branch,
+            "base": request.base_branch,
+            "draft": request.draft,
+        }).encode("utf-8")
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        }
+        url = f"https://api.github.com/repos/{repo}/pulls"
+        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                pr_data = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            raise ValueError(f"GitHub PR creation failed ({exc.code}): {body[:500]}")
+        result = GitHubPRResult(
+            pr_id=f"pr_{uuid.uuid4().hex[:8]}",
+            workspace_id=workspace_id,
+            run_id=request.run_id,
+            issue_id=request.issue_id,
+            pr_number=pr_data["number"],
+            html_url=pr_data.get("html_url", ""),
+        )
+        self._save_pr_result(result)
+        self._record_activity(
+            workspace_id=workspace_id,
+            entity_type="run",
+            entity_id=request.run_id,
+            action="github.pr_created",
+            summary=f"Created PR #{pr_data['number']} for {request.issue_id}",
+            actor=build_activity_actor("operator", "operator"),
+            issue_id=request.issue_id,
+            run_id=request.run_id,
+            details={"pr_number": pr_data["number"], "html_url": result.html_url},
+        )
+        return result.model_dump(mode="json")
+
+    def send_slack_notification(self, workspace_id: str, event: str, message: Optional[str] = None) -> dict:
+        config = self._get_integration_config(workspace_id, "slack")
+        if not config:
+            raise FileNotFoundError("Slack integration not configured")
+        webhook_url = config.settings.get("webhook_url", "")
+        channel = config.settings.get("channel")
+        if not webhook_url:
+            raise ValueError("Slack webhook_url must be configured")
+        text = message or self._default_slack_message(workspace_id, event)
+        payload = {"text": text}
+        if channel:
+            payload["channel"] = channel
+        notification = SlackNotification(
+            notification_id=f"sn_{uuid.uuid4().hex[:8]}",
+            workspace_id=workspace_id,
+            event=event,
+            channel=channel,
+            webhook_url=webhook_url,
+            message=text,
+            status="pending",
+        )
+        data = json.dumps(payload).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        req = urllib.request.Request(webhook_url, data=data, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                resp.read()
+            notification = notification.model_copy(update={"status": "sent", "sent_at": utc_now()})
+        except urllib.error.URLError as exc:
+            notification = notification.model_copy(update={"status": "failed", "error": str(exc)})
+        self._save_notification(notification)
+        return notification.model_dump(mode="json")
+
+    def sync_issue_to_linear(self, workspace_id: str, issue_id: str) -> dict:
+        config = self._get_integration_config(workspace_id, "linear")
+        if not config:
+            raise FileNotFoundError("Linear integration not configured")
+        api_key = config.settings.get("api_key", "")
+        team_id = config.settings.get("team_id", "")
+        if not api_key or not team_id:
+            raise ValueError("Linear api_key and team_id must be configured")
+        issue = self._get_issue(workspace_id, issue_id)
+        query = {
+            "query": """
+            mutation CreateIssue($title: String!, $teamId: String!, $description: String, $priority: Float) {
+                issueCreate(input: {title: $title, teamId: $teamId, description: $description, priority: $priority}) {
+                    issue { id identifier title url }
+                }
+            }
+            """,
+            "variables": {
+                "title": issue.title,
+                "teamId": team_id,
+                "description": issue.summary or "",
+                "priority": self._severity_to_linear_priority(issue.severity),
+            },
+        }
+        data = json.dumps(query).encode("utf-8")
+        headers = {"Content-Type": "application/json", "Authorization": api_key}
+        req = urllib.request.Request("https://api.linear.app/graphql", data=data, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                result = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.URLError as exc:
+            raise ValueError(f"Linear API error: {exc}")
+        issue_data = result.get("data", {}).get("issueCreate", {}).get("issue", {})
+        sync = LinearIssueSync(
+            sync_id=f"lsync_{uuid.uuid4().hex[:8]}",
+            workspace_id=workspace_id,
+            issue_id=issue_id,
+            linear_id=issue_data.get("id"),
+            linear_team_id=team_id,
+            linear_status=issue_data.get("identifier"),
+            title=issue.title,
+            description=issue.summary,
+            labels=issue.labels,
+            priority=issue.severity,
+        )
+        self._save_linear_sync(sync)
+        self._record_activity(
+            workspace_id=workspace_id,
+            entity_type="issue",
+            entity_id=issue_id,
+            action="linear.synced",
+            summary=f"Synced issue to Linear: {issue_data.get('identifier', 'unknown')}",
+            actor=build_activity_actor("system", "system"),
+            issue_id=issue_id,
+            details={"linear_id": issue_data.get("id")},
+        )
+        return sync.model_dump(mode="json")
+
+    def sync_issue_to_jira(self, workspace_id: str, issue_id: str) -> dict:
+        config = self._get_integration_config(workspace_id, "jira")
+        if not config:
+            raise FileNotFoundError("Jira integration not configured")
+        base_url = config.settings.get("base_url", "")
+        email = config.settings.get("email", "")
+        api_token = config.settings.get("api_token", "")
+        project_key = config.settings.get("project_key", "")
+        if not all([base_url, email, api_token, project_key]):
+            raise ValueError("Jira base_url, email, api_token, and project_key must be configured")
+        issue = self._get_issue(workspace_id, issue_id)
+        import base64
+        creds = base64.b64encode(f"{email}:{api_token}".encode()).decode()
+        fields = {
+            "project": {"key": project_key},
+            "summary": issue.title,
+            "description": {"type": "doc", "version": 1, "content": [{"type": "paragraph", "content": [{"type": "text", "text": issue.summary or ""}]}]},
+            "issuetype": {"name": "Bug"},
+            "labels": issue.labels[:10],
+            "priority": {"name": self._severity_to_jira_priority(issue.severity)},
+        }
+        data = json.dumps({"fields": fields}).encode("utf-8")
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Basic {creds}",
+        }
+        url = f"{base_url.rstrip('/')}/rest/api/3/issue"
+        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                result = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            raise ValueError(f"Jira API error ({exc.code}): {body[:500]}")
+        sync = JiraIssueSync(
+            sync_id=f"jsync_{uuid.uuid4().hex[:8]}",
+            workspace_id=workspace_id,
+            issue_id=issue_id,
+            jira_key=result.get("key"),
+            jira_project=project_key,
+            summary=issue.title,
+            description=issue.summary,
+            labels=issue.labels,
+            priority=issue.severity,
+        )
+        self._save_jira_sync(sync)
+        self._record_activity(
+            workspace_id=workspace_id,
+            entity_type="issue",
+            entity_id=issue_id,
+            action="jira.synced",
+            summary=f"Synced issue to Jira: {result.get('key', 'unknown')}",
+            actor=build_activity_actor("system", "system"),
+            issue_id=issue_id,
+            details={"jira_key": result.get("key")},
+        )
+        return sync.model_dump(mode="json")
+
+    def _save_integration_config(self, config: IntegrationConfig) -> None:
+        cfg_dir = self.store.data_dir / "integrations"
+        cfg_dir.mkdir(parents=True, exist_ok=True)
+        path = cfg_dir / f"{config.workspace_id}_{config.provider}.json"
+        path.write_text(config.model_dump_json(), encoding="utf-8")
+
+    def _load_integration_configs(self, workspace_id: str) -> list[IntegrationConfig]:
+        cfg_dir = self.store.data_dir / "integrations"
+        if not cfg_dir.exists():
+            return []
+        configs = []
+        for f in cfg_dir.glob(f"{workspace_id}_*.json"):
+            try:
+                configs.append(IntegrationConfig.model_validate_json(f.read_text(encoding="utf-8")))
+            except Exception:
+                continue
+        return configs
+
+    def _get_integration_config(self, workspace_id: str, provider: str) -> Optional[IntegrationConfig]:
+        cfg_dir = self.store.data_dir / "integrations"
+        path = cfg_dir / f"{workspace_id}_{provider}.json"
+        if not path.exists():
+            return None
+        try:
+            return IntegrationConfig.model_validate_json(path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+
+    def _test_provider(self, provider: str, settings: dict) -> IntegrationTestResult:
+        if provider == "github":
+            return self._test_github(settings)
+        if provider == "slack":
+            return self._test_slack(settings)
+        if provider == "linear":
+            return self._test_linear(settings)
+        if provider == "jira":
+            return self._test_jira(settings)
+        return IntegrationTestResult(provider=provider, ok=False, message=f"Unknown provider: {provider}")
+
+    def _test_github(self, settings: dict) -> IntegrationTestResult:
+        token = settings.get("token", "")
+        headers = {"Accept": "application/vnd.github+json"}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        try:
+            req = urllib.request.Request("https://api.github.com/user", headers=headers)
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            return IntegrationTestResult(
+                provider="github", ok=True,
+                message=f"Connected as {data.get('login', 'unknown')}",
+                details={"login": data.get("login"), "name": data.get("name")},
+            )
+        except Exception as exc:
+            return IntegrationTestResult(provider="github", ok=False, message=str(exc))
+
+    def _test_slack(self, settings: dict) -> IntegrationTestResult:
+        webhook_url = settings.get("webhook_url", "")
+        if not webhook_url:
+            return IntegrationTestResult(provider="slack", ok=False, message="webhook_url required")
+        try:
+            data = json.dumps({"text": "xMustard integration test"}).encode("utf-8")
+            req = urllib.request.Request(webhook_url, data=data, headers={"Content-Type": "application/json"}, method="POST")
+            with urllib.request.urlopen(req, timeout=10):
+                pass
+            return IntegrationTestResult(provider="slack", ok=True, message="Webhook test sent successfully")
+        except Exception as exc:
+            return IntegrationTestResult(provider="slack", ok=False, message=str(exc))
+
+    def _test_linear(self, settings: dict) -> IntegrationTestResult:
+        api_key = settings.get("api_key", "")
+        if not api_key:
+            return IntegrationTestResult(provider="linear", ok=False, message="api_key required")
+        try:
+            query = {"query": "{ viewer { id name } }"}
+            data = json.dumps(query).encode("utf-8")
+            req = urllib.request.Request("https://api.linear.app/graphql", data=data, headers={"Content-Type": "application/json", "Authorization": api_key}, method="POST")
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                result = json.loads(resp.read().decode("utf-8"))
+            viewer = result.get("data", {}).get("viewer", {})
+            return IntegrationTestResult(
+                provider="linear", ok=True,
+                message=f"Connected as {viewer.get('name', 'unknown')}",
+                details={"name": viewer.get("name")},
+            )
+        except Exception as exc:
+            return IntegrationTestResult(provider="linear", ok=False, message=str(exc))
+
+    def _test_jira(self, settings: dict) -> IntegrationTestResult:
+        base_url = settings.get("base_url", "")
+        email = settings.get("email", "")
+        api_token = settings.get("api_token", "")
+        if not all([base_url, email, api_token]):
+            return IntegrationTestResult(provider="jira", ok=False, message="base_url, email, and api_token required")
+        import base64
+        creds = base64.b64encode(f"{email}:{api_token}".encode()).decode()
+        try:
+            req = urllib.request.Request(
+                f"{base_url.rstrip('/')}/rest/api/3/myself",
+                headers={"Authorization": f"Basic {creds}"},
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            return IntegrationTestResult(
+                provider="jira", ok=True,
+                message=f"Connected as {data.get('displayName', 'unknown')}",
+                details={"displayName": data.get("displayName")},
+            )
+        except Exception as exc:
+            return IntegrationTestResult(provider="jira", ok=False, message=str(exc))
+
+    def _default_slack_message(self, workspace_id: str, event: str) -> str:
+        event_labels = {
+            "run.completed": "Run Completed",
+            "run.failed": "Run Failed",
+            "run.cancelled": "Run Cancelled",
+            "verification.recorded": "Verification Recorded",
+            "fix.applied": "Fix Applied",
+            "plan.approved": "Plan Approved",
+            "plan.rejected": "Plan Rejected",
+        }
+        return f"[xMustard] {event_labels.get(event, event)} (workspace: {workspace_id})"
+
+    def _severity_to_linear_priority(self, severity: str) -> float:
+        mapping = {"critical": 1, "high": 2, "medium": 3, "low": 4}
+        return float(mapping.get(severity, 3))
+
+    def _severity_to_jira_priority(self, severity: str) -> str:
+        mapping = {"critical": "Highest", "high": "High", "medium": "Medium", "low": "Low"}
+        return mapping.get(severity, "Medium")
+
+    def _save_pr_result(self, result: GitHubPRResult) -> None:
+        pr_dir = self.store.data_dir / "pull_requests"
+        pr_dir.mkdir(parents=True, exist_ok=True)
+        path = pr_dir / f"{result.pr_id}.json"
+        path.write_text(result.model_dump_json(), encoding="utf-8")
+
+    def _save_notification(self, notification: SlackNotification) -> None:
+        n_dir = self.store.data_dir / "notifications"
+        n_dir.mkdir(parents=True, exist_ok=True)
+        path = n_dir / f"{notification.notification_id}.json"
+        path.write_text(notification.model_dump_json(), encoding="utf-8")
+
+    def _save_linear_sync(self, sync: LinearIssueSync) -> None:
+        s_dir = self.store.data_dir / "linear_syncs"
+        s_dir.mkdir(parents=True, exist_ok=True)
+        path = s_dir / f"{sync.sync_id}.json"
+        path.write_text(sync.model_dump_json(), encoding="utf-8")
+
+    def _save_jira_sync(self, sync: JiraIssueSync) -> None:
+        s_dir = self.store.data_dir / "jira_syncs"
+        s_dir.mkdir(parents=True, exist_ok=True)
+        path = s_dir / f"{sync.sync_id}.json"
+        path.write_text(sync.model_dump_json(), encoding="utf-8")
 
     def _run_excerpt(self, run: RunRecord) -> str:
         parts: list[str] = []

@@ -10,12 +10,19 @@ import type {
   FixDraftSuggestion,
   FixRecord,
   FixRecordRequest,
+  GitHubIssueImport,
+  GitHubPRCreate,
+  GitHubPRResult,
   ImprovementSuggestion,
+  IntegrationConfig,
+  IntegrationTestResult,
   IssueCreateRequest,
   IssueDriftDetail,
   IssueContextPacket,
   IssueQualityScore,
   IssueUpdateRequest,
+  JiraIssueSync,
+  LinearIssueSync,
   LocalAgentCapabilities,
   PatchCritique,
   PlanApproveRequest,
@@ -30,6 +37,7 @@ import type {
   RunReviewRequest,
   SavedIssueView,
   SavedIssueViewRequest,
+  SlackNotification,
   SourceRecord,
   TestSuggestion,
   TriageSuggestion,
@@ -397,6 +405,56 @@ export function dismissImprovement(workspaceId: string, runId: string, suggestio
   return request<ImprovementSuggestion>(`/api/workspaces/${workspaceId}/runs/${runId}/improvements/${suggestionId}/dismiss`, {
     method: 'POST',
     body: JSON.stringify({ reason }),
+  })
+}
+
+export function configureIntegration(workspaceId: string, provider: string, settings: Record<string, unknown> = {}) {
+  return request<IntegrationConfig>(`/api/workspaces/${workspaceId}/integrations?provider=${provider}`, {
+    method: 'POST',
+    body: JSON.stringify(settings),
+  })
+}
+
+export function getIntegrationConfigs(workspaceId: string) {
+  return request<IntegrationConfig[]>(`/api/workspaces/${workspaceId}/integrations`)
+}
+
+export function testIntegration(provider: string, settings: Record<string, unknown>) {
+  return request<IntegrationTestResult>('/api/integrations/test', {
+    method: 'POST',
+    body: JSON.stringify({ provider, settings }),
+  })
+}
+
+export function importGitHubIssues(workspaceId: string, repo: string, state = 'open') {
+  return request<GitHubIssueImport[]>(`/api/workspaces/${workspaceId}/integrations/github/import?repo=${encodeURIComponent(repo)}&state=${state}`, {
+    method: 'POST',
+  })
+}
+
+export function createGitHubPR(workspaceId: string, payload: GitHubPRCreate) {
+  return request<GitHubPRResult>(`/api/workspaces/${workspaceId}/integrations/github/pr`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+}
+
+export function sendSlackNotification(workspaceId: string, event: string, message?: string) {
+  const params = `event=${encodeURIComponent(event)}${message ? `&message=${encodeURIComponent(message)}` : ''}`
+  return request<SlackNotification>(`/api/workspaces/${workspaceId}/integrations/slack/notify?${params}`, {
+    method: 'POST',
+  })
+}
+
+export function syncIssueToLinear(workspaceId: string, issueId: string) {
+  return request<LinearIssueSync>(`/api/workspaces/${workspaceId}/integrations/linear/sync/${issueId}`, {
+    method: 'POST',
+  })
+}
+
+export function syncIssueToJira(workspaceId: string, issueId: string) {
+  return request<JiraIssueSync>(`/api/workspaces/${workspaceId}/integrations/jira/sync/${issueId}`, {
+    method: 'POST',
   })
 }
 

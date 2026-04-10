@@ -561,3 +561,101 @@ export type PatchCritique = {
   summary: string
   generated_at: string
 }
+
+export type IntegrationConfig = {
+  config_id: string
+  workspace_id: string
+  provider: 'github' | 'slack' | 'linear' | 'jira'
+  enabled: boolean
+  settings: Record<string, unknown>
+  created_at: string
+  updated_at: string
+}
+
+export type GitHubIssueImport = {
+  import_id: string
+  workspace_id: string
+  github_repo: string
+  issue_number: number
+  issue_id: string
+  title: string
+  body?: string | null
+  labels: string[]
+  state: string
+  html_url?: string | null
+  imported_at: string
+}
+
+export type GitHubPRCreate = {
+  workspace_id: string
+  run_id: string
+  issue_id: string
+  head_branch: string
+  base_branch?: string
+  title?: string | null
+  body?: string | null
+  draft?: boolean
+}
+
+export type GitHubPRResult = {
+  pr_id: string
+  workspace_id: string
+  run_id: string
+  issue_id: string
+  pr_number: number
+  html_url: string
+  state: string
+  created_at: string
+}
+
+export type SlackNotification = {
+  notification_id: string
+  workspace_id: string
+  event: string
+  channel?: string | null
+  webhook_url?: string | null
+  message: string
+  status: 'pending' | 'sent' | 'failed'
+  error?: string | null
+  created_at: string
+  sent_at?: string | null
+}
+
+export type LinearIssueSync = {
+  sync_id: string
+  workspace_id: string
+  issue_id: string
+  linear_id?: string | null
+  linear_team_id?: string | null
+  linear_status?: string | null
+  title: string
+  description?: string | null
+  labels: string[]
+  priority?: string | null
+  sync_direction: 'push' | 'pull'
+  synced_at: string
+}
+
+export type JiraIssueSync = {
+  sync_id: string
+  workspace_id: string
+  issue_id: string
+  jira_key?: string | null
+  jira_project?: string | null
+  jira_status?: string | null
+  summary: string
+  description?: string | null
+  labels: string[]
+  priority?: string | null
+  issue_type: string
+  sync_direction: 'push' | 'pull'
+  synced_at: string
+}
+
+export type IntegrationTestResult = {
+  provider: 'github' | 'slack' | 'linear' | 'jira'
+  ok: boolean
+  message: string
+  details: Record<string, unknown>
+  tested_at: string
+}

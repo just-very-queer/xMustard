@@ -742,3 +742,114 @@ class PatchCritique(BaseModel):
 
 class DismissImprovementRequest(BaseModel):
     reason: Optional[str] = None
+
+
+IntegrationProvider = Literal["github", "slack", "linear", "jira"]
+GitHubEventType = Literal["issues", "pull_request", "push"]
+NotificationEvent = Literal[
+    "run.completed", "run.failed", "run.cancelled",
+    "verification.recorded", "fix.applied", "plan.approved", "plan.rejected",
+]
+
+
+class IntegrationConfig(BaseModel):
+    config_id: str
+    workspace_id: str
+    provider: IntegrationProvider
+    enabled: bool = True
+    settings: dict = Field(default_factory=dict)
+    created_at: str = Field(default_factory=utc_now)
+    updated_at: str = Field(default_factory=utc_now)
+
+
+class GitHubIssueImport(BaseModel):
+    import_id: str
+    workspace_id: str
+    github_repo: str
+    issue_number: int
+    issue_id: str
+    title: str
+    body: Optional[str] = None
+    labels: list[str] = Field(default_factory=list)
+    state: str = "open"
+    html_url: Optional[str] = None
+    imported_at: str = Field(default_factory=utc_now)
+
+
+class GitHubPRCreate(BaseModel):
+    workspace_id: str
+    run_id: str
+    issue_id: str
+    head_branch: str
+    base_branch: str = "main"
+    title: Optional[str] = None
+    body: Optional[str] = None
+    draft: bool = False
+
+
+class GitHubPRResult(BaseModel):
+    pr_id: str
+    workspace_id: str
+    run_id: str
+    issue_id: str
+    pr_number: int
+    html_url: str
+    state: str = "open"
+    created_at: str = Field(default_factory=utc_now)
+
+
+class SlackNotification(BaseModel):
+    notification_id: str
+    workspace_id: str
+    event: NotificationEvent
+    channel: Optional[str] = None
+    webhook_url: Optional[str] = None
+    message: str = ""
+    status: Literal["pending", "sent", "failed"] = "pending"
+    error: Optional[str] = None
+    created_at: str = Field(default_factory=utc_now)
+    sent_at: Optional[str] = None
+
+
+class LinearIssueSync(BaseModel):
+    sync_id: str
+    workspace_id: str
+    issue_id: str
+    linear_id: Optional[str] = None
+    linear_team_id: Optional[str] = None
+    linear_status: Optional[str] = None
+    title: str = ""
+    description: Optional[str] = None
+    labels: list[str] = Field(default_factory=list)
+    priority: Optional[str] = None
+    sync_direction: Literal["push", "pull"] = "push"
+    synced_at: str = Field(default_factory=utc_now)
+
+
+class JiraIssueSync(BaseModel):
+    sync_id: str
+    workspace_id: str
+    issue_id: str
+    jira_key: Optional[str] = None
+    jira_project: Optional[str] = None
+    jira_status: Optional[str] = None
+    summary: str = ""
+    description: Optional[str] = None
+    labels: list[str] = Field(default_factory=list)
+    priority: Optional[str] = None
+    issue_type: str = "Bug"
+    sync_direction: Literal["push", "pull"] = "push"
+    synced_at: str = Field(default_factory=utc_now)
+
+
+class IntegrationTestRequest(BaseModel):
+    provider: IntegrationProvider
+    settings: dict = Field(default_factory=dict)
+
+
+class IntegrationTestResult(BaseModel):
+    provider: IntegrationProvider
+    ok: bool
+    message: str = ""
+    details: dict = Field(default_factory=dict)
+    tested_at: str = Field(default_factory=utc_now)
