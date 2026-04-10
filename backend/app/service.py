@@ -18,6 +18,8 @@ from .models import (
     ActivityRollupItem,
     AppSettings,
     CostSummary,
+    CoverageDelta,
+    CoverageResult,
     DuplicateMatch,
     EvidenceRef,
     ExportBundle,
@@ -48,6 +50,7 @@ from .models import (
     SavedIssueView,
     SavedIssueViewRequest,
     SourceRecord,
+    TestSuggestion,
     TriageSuggestion,
     VerificationRecord,
     VerificationSummary,
@@ -1534,6 +1537,308 @@ Respond with a JSON object containing:
             confidence=min(round(confidence, 2), 1.0),
             reasoning="; ".join(reasoning_parts) if reasoning_parts else "No specific triage suggestions",
         )
+
+    def parse_coverage_report(self, workspace_id: str, report_path: str, run_id: Optional[str] = None, issue_id: Optional[str] = None) -> dict:
+        workspace = self.get_workspace(workspace_id)
+        full_path = Path(workspace.root_path) / report_path
+        if not full_path.exists():
+            raise FileNotFoundError(f"Coverage report not found: {report_path}")
+        result = self._parse_coverage_file(full_path, workspace_id, run_id, issue_id)
+        self._save_coverage_result(result)
+        if issue_id:
+            self._record_activity(
+                workspace_id=workspace_id,
+                entity_type="issue",
+                entity_id=issue_id,
+                action="coverage.parsed",
+                summary=f"Parsed coverage report: {result.line_coverage:.1f}% lines",
+                actor=build_activity_actor("system", "system"),
+                issue_id=issue_id,
+                run_id=run_id,
+                details={"line_coverage": result.line_coverage, "files_covered": result.files_covered},
+            )
+        return result.model_dump(mode="json")
+
+    def get_coverage(self, workspace_id: str, issue_id: Optional[str] = None, run_id: Optional[str] = None) -> Optional[dict]:
+        result = self._load_latest_coverage(workspace_id, issue_id, run_id)
+        if not result:
+            return None
+        return result.model_dump(mode="json")
+
+    def get_coverage_delta(self, workspace_id: str, issue_id: str) -> dict:
+        results = self._load_coverage_results(workspace_id, issue_id)
+        if len(results) < 2:
+            baseline = results[0] if results else None
+            return CoverageDelta(
+                workspace_id=workspace_id, issue_id=issue_id,
+                baseline=baseline, current=None,
+                line_delta=baseline.line_coverage if baseline else 0.0,
+            ).model_dump(mode="json")
+        results.sort(key=lambda r: r.created_at)
+        baseline = results[0]
+        current = results[-1]
+        line_delta = round(current.line_coverage - baseline.line_coverage, 2)
+        branch_delta = None
+        if baseline.branch_coverage is not None and current.branch_coverage is not None:
+            branch_delta = round(current.branch_coverage - baseline.branch_coverage, 2)
+        baseline_uncovered = set(baseline.uncovered_files)
+        current_uncovered = set(current.uncovered_files)
+        new_covered = baseline_uncovered - current_uncovered
+        regressed = current_uncovered - baseline_uncovered
+        return CoverageDelta(
+            workspace_id=workspace_id, issue_id=issue_id,
+            baseline=baseline, current=current,
+            line_delta=line_delta, branch_delta=branch_delta,
+            lines_added=max(0, current.lines_covered - baseline.lines_covered),
+            lines_lost=max(0, baseline.lines_covered - current.lines_covered),
+            new_files_covered=sorted(new_covered),
+            files_regressed=sorted(regressed),
+        ).model_dump(mode="json")
+
+    def generate_test_suggestions(self, workspace_id: str, issue_id: str) -> list[dict]:
+        issue = self._get_issue(workspace_id, issue_id)
+        workspace = self.get_workspace(workspace_id)
+        suggestions = self._build_test_suggestions(workspace_id, issue, workspace)
+        self._save_test_suggestions(suggestions)
+        return [s.model_dump(mode="json") for s in suggestions]
+
+    def get_test_suggestions(self, workspace_id: str, issue_id: str) -> list[dict]:
+        suggestions = self._load_test_suggestions(workspace_id, issue_id)
+        return [s.model_dump(mode="json") for s in suggestions]
+
+    def _parse_coverage_file(self, path: Path, workspace_id: str, run_id: Optional[str], issue_id: Optional[str]) -> CoverageResult:
+        content = path.read_text(encoding="utf-8")
+        fmt = "unknown"
+        if path.suffix == ".xml":
+            fmt = "cobertura"
+            return self._parse_cobertura(content, workspace_id, run_id, issue_id, fmt, str(path))
+        if path.suffix == ".json":
+            try:
+                data = json.loads(content)
+                if "coverage" in data or "source_files" in data:
+                    fmt = "istanbul"
+                    return self._parse_istanbul(data, workspace_id, run_id, issue_id, fmt, str(path))
+            except json.JSONDecodeError:
+                pass
+        if path.suffix in (".csv", ".txt", ""):
+            fmt = "lcov"
+            return self._parse_lcov(content, workspace_id, run_id, issue_id, fmt, str(path))
+        return CoverageResult(
+            result_id=f"cov_{uuid.uuid4().hex[:12]}",
+            workspace_id=workspace_id, run_id=run_id, issue_id=issue_id,
+            format=fmt, raw_report_path=str(path),
+        )
+
+    def _parse_cobertura(self, content: str, workspace_id: str, run_id: Optional[str], issue_id: Optional[str], fmt: str, path: str) -> CoverageResult:
+        import xml.etree.ElementTree as ET
+        try:
+            root = ET.fromstring(content)
+        except ET.ParseError:
+            return CoverageResult(result_id=f"cov_{uuid.uuid4().hex[:12]}", workspace_id=workspace_id, run_id=run_id, issue_id=issue_id, format=fmt, raw_report_path=path)
+        line_rate = float(root.attrib.get("line-rate", 0))
+        branch_rate = root.attrib.get("branch-rate")
+        branch_cov = float(branch_rate) if branch_rate else None
+        lines_covered = 0
+        lines_total = 0
+        branches_covered = 0
+        branches_total = 0
+        files_covered = 0
+        files_total = 0
+        uncovered = []
+        for pkg in root.iter("package"):
+            for cls in pkg.iter("class"):
+                files_total += 1
+                fname = cls.attrib.get("filename", "")
+                cls_lines = 0
+                cls_total = 0
+                for line_el in cls.iter("line"):
+                    hits = int(line_el.attrib.get("hits", 0))
+                    cls_total += 1
+                    if hits > 0:
+                        cls_lines += 1
+                lines_covered += cls_lines
+                lines_total += cls_total
+                if cls_lines > 0:
+                    files_covered += 1
+                else:
+                    if fname:
+                        uncovered.append(fname)
+        return CoverageResult(
+            result_id=f"cov_{uuid.uuid4().hex[:12]}",
+            workspace_id=workspace_id, run_id=run_id, issue_id=issue_id,
+            line_coverage=round(line_rate * 100, 2),
+            branch_coverage=round(branch_cov * 100, 2) if branch_cov is not None else None,
+            lines_covered=lines_covered, lines_total=lines_total,
+            branches_covered=branches_covered or None, branches_total=branches_total or None,
+            files_covered=files_covered, files_total=files_total,
+            uncovered_files=uncovered[:50], format=fmt, raw_report_path=path,
+        )
+
+    def _parse_istanbul(self, data: dict, workspace_id: str, run_id: Optional[str], issue_id: Optional[str], fmt: str, path: str) -> CoverageResult:
+        total_lines = 0
+        covered_lines = 0
+        files_covered = 0
+        files_total = 0
+        uncovered = []
+        source_files = data.get("source_files", data.get("coverage", {}))
+        if isinstance(source_files, dict):
+            source_files = [{"path": k, **v} for k, v in source_files.items()]
+        for sf in source_files:
+            files_total += 1
+            fpath = sf.get("path", sf.get("file", ""))
+            s_data = sf.get("s", sf.get("statementMap", {}))
+            if isinstance(s_data, dict):
+                hit_count = sum(1 for v in s_data.values() if (isinstance(v, int) and v > 0) or (isinstance(v, dict) and v.get("executed", False)))
+                total_count = len(s_data)
+                if total_count > 0:
+                    total_lines += total_count
+                    covered_lines += hit_count
+                    if hit_count > 0:
+                        files_covered += 1
+                    else:
+                        uncovered.append(fpath)
+        line_cov = round((covered_lines / total_lines) * 100, 2) if total_lines > 0 else 0.0
+        return CoverageResult(
+            result_id=f"cov_{uuid.uuid4().hex[:12]}",
+            workspace_id=workspace_id, run_id=run_id, issue_id=issue_id,
+            line_coverage=line_cov,
+            lines_covered=covered_lines, lines_total=total_lines,
+            files_covered=files_covered, files_total=files_total,
+            uncovered_files=uncovered[:50], format=fmt, raw_report_path=path,
+        )
+
+    def _parse_lcov(self, content: str, workspace_id: str, run_id: Optional[str], issue_id: Optional[str], fmt: str, path: str) -> CoverageResult:
+        lines_covered = 0
+        lines_total = 0
+        files_covered = 0
+        files_total = 0
+        uncovered = []
+        current_file = ""
+        file_hit = 0
+        file_total = 0
+        for line in content.splitlines():
+            line = line.strip()
+            if line.startswith("SF:"):
+                if current_file:
+                    files_total += 1
+                    lines_covered += file_hit
+                    lines_total += file_total
+                    if file_hit > 0:
+                        files_covered += 1
+                    else:
+                        uncovered.append(current_file)
+                current_file = line[3:]
+                file_hit = 0
+                file_total = 0
+            elif line.startswith("DA:"):
+                parts = line[3:].split(",")
+                if len(parts) >= 2:
+                    file_total += 1
+                    try:
+                        if int(parts[1]) > 0:
+                            file_hit += 1
+                    except ValueError:
+                        pass
+            elif line == "end_of_record":
+                if current_file:
+                    files_total += 1
+                    lines_covered += file_hit
+                    lines_total += file_total
+                    if file_hit > 0:
+                        files_covered += 1
+                    else:
+                        uncovered.append(current_file)
+                current_file = ""
+                file_hit = 0
+                file_total = 0
+        line_cov = round((lines_covered / lines_total) * 100, 2) if lines_total > 0 else 0.0
+        return CoverageResult(
+            result_id=f"cov_{uuid.uuid4().hex[:12]}",
+            workspace_id=workspace_id, run_id=run_id, issue_id=issue_id,
+            line_coverage=line_cov,
+            lines_covered=lines_covered, lines_total=lines_total,
+            files_covered=files_covered, files_total=files_total,
+            uncovered_files=uncovered[:50], format=fmt, raw_report_path=path,
+        )
+
+    def _save_coverage_result(self, result: CoverageResult) -> None:
+        cov_dir = self.store.data_dir / "coverage"
+        cov_dir.mkdir(parents=True, exist_ok=True)
+        path = cov_dir / f"{result.result_id}.json"
+        path.write_text(result.model_dump_json(), encoding="utf-8")
+
+    def _load_coverage_results(self, workspace_id: str, issue_id: Optional[str] = None) -> list[CoverageResult]:
+        cov_dir = self.store.data_dir / "coverage"
+        if not cov_dir.exists():
+            return []
+        results = []
+        for f in cov_dir.glob("*.json"):
+            try:
+                r = CoverageResult.model_validate_json(f.read_text(encoding="utf-8"))
+                if r.workspace_id == workspace_id:
+                    if issue_id is None or r.issue_id == issue_id:
+                        results.append(r)
+            except Exception:
+                continue
+        return results
+
+    def _load_latest_coverage(self, workspace_id: str, issue_id: Optional[str] = None, run_id: Optional[str] = None) -> Optional[CoverageResult]:
+        results = self._load_coverage_results(workspace_id, issue_id)
+        if run_id:
+            results = [r for r in results if r.run_id == run_id]
+        if not results:
+            return None
+        results.sort(key=lambda r: r.created_at, reverse=True)
+        return results[0]
+
+    def _build_test_suggestions(self, workspace_id: str, issue: IssueRecord, workspace: WorkspaceRecord) -> list[TestSuggestion]:
+        suggestions = []
+        for i, ev in enumerate(issue.evidence[:5]):
+            fpath = ev.path
+            parts = fpath.rsplit(".", 1)
+            test_file = f"{parts[0]}.test.{parts[1]}" if len(parts) == 2 else f"{fpath}_test.go"
+            suggestions.append(TestSuggestion(
+                suggestion_id=f"ts_{uuid.uuid4().hex[:8]}",
+                issue_id=issue.bug_id,
+                workspace_id=workspace_id,
+                test_file=test_file,
+                test_description=f"Test coverage for {fpath}:{ev.line}" if ev.line else f"Test coverage for {fpath}",
+                priority="high" if issue.severity in ("critical", "high") else "medium",
+                rationale=f"Evidence found at {fpath}" + (f":{ev.line}" if ev.line else ""),
+            ))
+        if not suggestions:
+            suggestions.append(TestSuggestion(
+                suggestion_id=f"ts_{uuid.uuid4().hex[:8]}",
+                issue_id=issue.bug_id,
+                workspace_id=workspace_id,
+                test_file="test_regression.spec.ts",
+                test_description=f"Regression test for {issue.title}",
+                priority="high",
+                rationale="No evidence-based test suggestions available; generic regression test recommended",
+            ))
+        return suggestions
+
+    def _save_test_suggestions(self, suggestions: list[TestSuggestion]) -> None:
+        if not suggestions:
+            return
+        ts_dir = self.store.data_dir / "test_suggestions"
+        ts_dir.mkdir(parents=True, exist_ok=True)
+        issue_id = suggestions[0].issue_id
+        workspace_id = suggestions[0].workspace_id
+        path = ts_dir / f"{workspace_id}_{issue_id}.json"
+        data = [s.model_dump(mode="json") for s in suggestions]
+        path.write_text(json.dumps(data), encoding="utf-8")
+
+    def _load_test_suggestions(self, workspace_id: str, issue_id: str) -> list[TestSuggestion]:
+        ts_dir = self.store.data_dir / "test_suggestions"
+        path = ts_dir / f"{workspace_id}_{issue_id}.json"
+        if not path.exists():
+            return []
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return [TestSuggestion(**item) for item in data]
+        except Exception:
+            return []
 
     def _run_excerpt(self, run: RunRecord) -> str:
         parts: list[str] = []

@@ -479,6 +479,52 @@ export type TriageSuggestion = {
   calculated_at: string
 }
 
+export type CoverageResult = {
+  result_id: string
+  workspace_id: string
+  run_id?: string | null
+  issue_id?: string | null
+  line_coverage: number
+  branch_coverage?: number | null
+  function_coverage?: number | null
+  lines_covered: number
+  lines_total: number
+  branches_covered?: number | null
+  branches_total?: number | null
+  files_covered: number
+  files_total: number
+  uncovered_files: string[]
+  format: string
+  raw_report_path?: string | null
+  created_at: string
+}
+
+export type CoverageDelta = {
+  workspace_id: string
+  issue_id: string
+  baseline?: CoverageResult | null
+  current?: CoverageResult | null
+  line_delta: number
+  branch_delta?: number | null
+  lines_added: number
+  lines_lost: number
+  new_files_covered: string[]
+  files_regressed: string[]
+  calculated_at: string
+}
+
+export type TestSuggestion = {
+  suggestion_id: string
+  issue_id: string
+  workspace_id: string
+  test_file: string
+  test_description: string
+  priority: 'high' | 'medium' | 'low'
+  rationale: string
+  suggested_code?: string | null
+  created_at: string
+}
+
 export type TreeNode = {
   path: string
   name: string

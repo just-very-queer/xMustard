@@ -663,3 +663,49 @@ class TriageSuggestion(BaseModel):
     confidence: float = 0.0
     reasoning: str = ""
     calculated_at: str = Field(default_factory=utc_now)
+
+
+class CoverageResult(BaseModel):
+    result_id: str
+    workspace_id: str
+    run_id: Optional[str] = None
+    issue_id: Optional[str] = None
+    line_coverage: float = 0.0
+    branch_coverage: Optional[float] = None
+    function_coverage: Optional[float] = None
+    lines_covered: int = 0
+    lines_total: int = 0
+    branches_covered: Optional[int] = None
+    branches_total: Optional[int] = None
+    files_covered: int = 0
+    files_total: int = 0
+    uncovered_files: list[str] = Field(default_factory=list)
+    format: str = "unknown"
+    raw_report_path: Optional[str] = None
+    created_at: str = Field(default_factory=utc_now)
+
+
+class CoverageDelta(BaseModel):
+    workspace_id: str
+    issue_id: str
+    baseline: Optional[CoverageResult] = None
+    current: Optional[CoverageResult] = None
+    line_delta: float = 0.0
+    branch_delta: Optional[float] = None
+    lines_added: int = 0
+    lines_lost: int = 0
+    new_files_covered: list[str] = Field(default_factory=list)
+    files_regressed: list[str] = Field(default_factory=list)
+    calculated_at: str = Field(default_factory=utc_now)
+
+
+class TestSuggestion(BaseModel):
+    suggestion_id: str
+    issue_id: str
+    workspace_id: str
+    test_file: str
+    test_description: str
+    priority: Literal["high", "medium", "low"] = "medium"
+    rationale: str = ""
+    suggested_code: Optional[str] = None
+    created_at: str = Field(default_factory=utc_now)

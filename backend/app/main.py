@@ -572,6 +572,40 @@ def triage_all_issues(workspace_id: str):
         raise HTTPException(status_code=404, detail=str(exc))
 
 
+@app.post("/api/workspaces/{workspace_id}/coverage/parse")
+def parse_coverage_report(workspace_id: str, report_path: str = Query(...), run_id: Optional[str] = Query(default=None), issue_id: Optional[str] = Query(default=None)):
+    try:
+        return SERVICE.parse_coverage_report(workspace_id, report_path, run_id, issue_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
+@app.get("/api/workspaces/{workspace_id}/coverage")
+def get_coverage(workspace_id: str, issue_id: Optional[str] = Query(default=None), run_id: Optional[str] = Query(default=None)):
+    result = SERVICE.get_coverage(workspace_id, issue_id, run_id)
+    if not result:
+        raise HTTPException(status_code=404, detail="No coverage data found")
+    return result
+
+
+@app.get("/api/workspaces/{workspace_id}/issues/{issue_id}/coverage-delta")
+def get_coverage_delta(workspace_id: str, issue_id: str):
+    return SERVICE.get_coverage_delta(workspace_id, issue_id)
+
+
+@app.post("/api/workspaces/{workspace_id}/issues/{issue_id}/test-suggestions")
+def generate_test_suggestions(workspace_id: str, issue_id: str):
+    try:
+        return SERVICE.generate_test_suggestions(workspace_id, issue_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
+@app.get("/api/workspaces/{workspace_id}/issues/{issue_id}/test-suggestions")
+def get_test_suggestions(workspace_id: str, issue_id: str):
+    return SERVICE.get_test_suggestions(workspace_id, issue_id)
+
+
 @app.patch("/api/workspaces/{workspace_id}/fixes/{fix_id}")
 def update_fix(workspace_id: str, fix_id: str, request: FixUpdateRequest):
     try:

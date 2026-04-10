@@ -4,6 +4,8 @@ import type {
   ActivityRecord,
   AppSettings,
   CostSummary,
+  CoverageDelta,
+  CoverageResult,
   DuplicateMatch,
   FixDraftSuggestion,
   FixRecord,
@@ -27,6 +29,7 @@ import type {
   SavedIssueView,
   SavedIssueViewRequest,
   SourceRecord,
+  TestSuggestion,
   TriageSuggestion,
   TreeNode,
   WorktreeStatus,
@@ -342,6 +345,36 @@ export function triageAllIssues(workspaceId: string) {
   return request<TriageSuggestion[]>(`/api/workspaces/${workspaceId}/triage/all`, {
     method: 'POST',
   })
+}
+
+export function parseCoverageReport(workspaceId: string, reportPath: string, runId?: string, issueId?: string) {
+  const params = new URLSearchParams({ report_path: reportPath })
+  if (runId) params.set('run_id', runId)
+  if (issueId) params.set('issue_id', issueId)
+  return request<CoverageResult>(`/api/workspaces/${workspaceId}/coverage/parse?${params}`, {
+    method: 'POST',
+  })
+}
+
+export function getCoverage(workspaceId: string, issueId?: string, runId?: string) {
+  const params = new URLSearchParams()
+  if (issueId) params.set('issue_id', issueId)
+  if (runId) params.set('run_id', runId)
+  return request<CoverageResult>(`/api/workspaces/${workspaceId}/coverage?${params}`)
+}
+
+export function getCoverageDelta(workspaceId: string, issueId: string) {
+  return request<CoverageDelta>(`/api/workspaces/${workspaceId}/issues/${issueId}/coverage-delta`)
+}
+
+export function generateTestSuggestions(workspaceId: string, issueId: string) {
+  return request<TestSuggestion[]>(`/api/workspaces/${workspaceId}/issues/${issueId}/test-suggestions`, {
+    method: 'POST',
+  })
+}
+
+export function getTestSuggestions(workspaceId: string, issueId: string) {
+  return request<TestSuggestion[]>(`/api/workspaces/${workspaceId}/issues/${issueId}/test-suggestions`)
 }
 
 export function promoteSignal(workspaceId: string, signalId: string, severity: string) {
