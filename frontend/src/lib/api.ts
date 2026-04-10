@@ -3,6 +3,7 @@ import type {
   ActivityOverview,
   ActivityRecord,
   AppSettings,
+  CostSummary,
   FixDraftSuggestion,
   FixRecord,
   FixRecordRequest,
@@ -14,6 +15,7 @@ import type {
   PlanApproveRequest,
   PlanRejectRequest,
   RuntimeProbeResult,
+  RunMetrics,
   RunPlan,
   RunRecord,
   RunbookRecord,
@@ -297,6 +299,14 @@ export function rejectPlan(workspaceId: string, runId: string, payload: PlanReje
     method: 'POST',
     body: JSON.stringify(payload),
   })
+}
+
+export function getRunMetrics(workspaceId: string, runId: string) {
+  return request<RunMetrics>(`/api/workspaces/${workspaceId}/runs/${runId}/metrics`)
+}
+
+export function getWorkspaceCostSummary(workspaceId: string) {
+  return request<CostSummary>(`/api/workspaces/${workspaceId}/costs`)
 }
 
 export function promoteSignal(workspaceId: string, signalId: string, severity: string) {

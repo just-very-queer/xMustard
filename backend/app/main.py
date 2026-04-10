@@ -511,6 +511,19 @@ def reject_plan(workspace_id: str, run_id: str, request: PlanRejectRequest):
         raise HTTPException(status_code=400, detail=str(exc))
 
 
+@app.get("/api/workspaces/{workspace_id}/runs/{run_id}/metrics")
+def get_run_metrics(workspace_id: str, run_id: str):
+    try:
+        return SERVICE.get_run_metrics(workspace_id, run_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
+@app.get("/api/workspaces/{workspace_id}/costs")
+def get_workspace_cost_summary(workspace_id: str):
+    return SERVICE.get_workspace_cost_summary(workspace_id)
+
+
 @app.patch("/api/workspaces/{workspace_id}/fixes/{fix_id}")
 def update_fix(workspace_id: str, fix_id: str, request: FixUpdateRequest):
     try:

@@ -17,6 +17,7 @@ from .models import (
     RunReviewRecord,
     RunbookRecord,
     SavedIssueView,
+    VerificationRecord,
     WorkspaceRecord,
     WorkspaceSnapshot,
 )
@@ -95,6 +96,9 @@ class FileStore:
     def runbooks_path(self, workspace_id: str) -> Path:
         return self.workspace_dir(workspace_id) / "runbooks.json"
 
+    def verifications_path(self, workspace_id: str) -> Path:
+        return self.workspace_dir(workspace_id) / "verifications.json"
+
     def activity_path(self, workspace_id: str) -> Path:
         return self.workspace_dir(workspace_id) / "activity.jsonl"
 
@@ -168,6 +172,18 @@ class FileStore:
         ordered = sorted(runbooks, key=lambda item: (item.built_in, item.name.lower(), item.created_at))
         self._write_json(
             self.runbooks_path(workspace_id),
+            [item.model_dump(mode="json") for item in ordered],
+        )
+
+    def list_verifications(self, workspace_id: str) -> list[VerificationRecord]:
+        data = self._read_json(self.verifications_path(workspace_id), [])
+        items = [VerificationRecord.model_validate(item) for item in data]
+        return sorted(items, key=lambda item: item.created_at, reverse=True)
+
+    def save_verifications(self, workspace_id: str, verifications: list[VerificationRecord]) -> None:
+        ordered = sorted(verifications, key=lambda item: item.created_at, reverse=True)
+        self._write_json(
+            self.verifications_path(workspace_id),
             [item.model_dump(mode="json") for item in ordered],
         )
 

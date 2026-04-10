@@ -16,6 +16,7 @@ from .models import (
     RunReviewRequest,
     RunbookUpsertRequest,
     SavedIssueViewRequest,
+    VerifyIssueRequest,
     WorkspaceLoadRequest,
 )
 from .service import TrackerService
@@ -234,6 +235,12 @@ def fixes(workspace_id: str, issue_id: str = typer.Option(default="")) -> None:
     _echo_json(payload)
 
 
+@app.command("verifications")
+def verifications(workspace_id: str, issue_id: str = typer.Option(default="")) -> None:
+    payload = [item.model_dump(mode="json") for item in service.list_verifications(workspace_id, issue_id=issue_id or None)]
+    _echo_json(payload)
+
+
 @app.command("review-queue")
 def review_queue(workspace_id: str) -> None:
     payload = [item.model_dump(mode="json") for item in service.list_review_queue(workspace_id)]
@@ -375,6 +382,32 @@ def fix_record(
 @app.command("fix-draft")
 def fix_draft(workspace_id: str, issue_id: str, run_id: str = typer.Option(...)) -> None:
     payload = service.suggest_fix_draft(workspace_id, issue_id, run_id)
+    _echo_json(payload.model_dump(mode="json"))
+
+
+@app.command("verify-bug")
+def verify_bug(
+    workspace_id: str,
+    issue_id: str,
+    runtime: str = typer.Option(default="opencode"),
+    models: str = typer.Option(default=""),
+    runbook_id: str = typer.Option(default="verify"),
+    instruction: str = typer.Option(default=""),
+    timeout_seconds: float = typer.Option(default=60.0),
+    poll_interval: float = typer.Option(default=2.0),
+) -> None:
+    payload = service.verify_issue_three_pass(
+        workspace_id,
+        issue_id,
+        VerifyIssueRequest(
+            runtime=runtime,
+            models=_split_csv(models),
+            runbook_id=runbook_id or None,
+            instruction=instruction or None,
+            timeout_seconds=timeout_seconds,
+            poll_interval=poll_interval,
+        ),
+    )
     _echo_json(payload.model_dump(mode="json"))
 
 

@@ -7,7 +7,7 @@ from unittest.mock import patch
 from typer.testing import CliRunner
 
 from app import cli as cli_module
-from app.models import RunRecord, RuntimeProbeResult, WorkspaceLoadRequest
+from app.models import RunRecord, RuntimeProbeResult, VerificationSummary, WorkspaceLoadRequest
 from app.service import TrackerService
 from app.store import FileStore
 
@@ -59,6 +59,7 @@ class CliSurfaceTests(unittest.TestCase):
                     (["worktree", workspace_id], lambda payload: self.assertIn("available", payload)),
                     (["issue-context", workspace_id, "P0_25M03_001"], lambda payload: self.assertIn("prompt", payload)),
                     (["issue-drift", workspace_id, "P0_25M03_001"], lambda payload: self.assertEqual(payload["bug_id"], "P0_25M03_001")),
+                    (["verifications", workspace_id], lambda payload: self.assertIsInstance(payload, list)),
                     (["activity-overview", workspace_id], lambda payload: self.assertIn("total_events", payload)),
                 ]
 
@@ -522,6 +523,49 @@ class CliSurfaceTests(unittest.TestCase):
                 severity_change = severity_activity["details"]["before_after"]["severity"]
                 self.assertEqual(severity_change["from"], "P2")
                 self.assertEqual(severity_change["to"], "P1")
+
+    def test_cli_verify_bug_uses_three_pass_summary(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service, workspace_id = self._create_service(tmp_dir)
+            summary = VerificationSummary(
+                workspace_id=workspace_id,
+                issue_id="P0_25M03_001",
+                checked_yes=2,
+                checked_no=1,
+                fixed_yes=2,
+                fixed_no=1,
+                consensus_code_checked="yes",
+                consensus_fixed="yes",
+            )
+
+            with patch.object(cli_module, "service", service):
+                with patch.object(service, "verify_issue_three_pass", return_value=summary) as verify_mock:
+                    result = self.runner.invoke(
+                        cli_module.app,
+                        [
+                            "verify-bug",
+                            workspace_id,
+                            "P0_25M03_001",
+                            "--runtime",
+                            "opencode",
+                            "--models",
+                            "opencode-go/minimax-m2.7,opencode-go/glm-5,opencode-go/kimi-k2.5",
+                            "--timeout-seconds",
+                            "5",
+                            "--poll-interval",
+                            "0.5",
+                        ],
+                    )
+                    self.assertEqual(result.exit_code, 0, msg=result.output)
+                    payload = json.loads(result.stdout)
+                    self.assertEqual(payload["consensus_code_checked"], "yes")
+                    self.assertEqual(payload["consensus_fixed"], "yes")
+                    request = verify_mock.call_args.args[2]
+                    self.assertEqual(request.runtime, "opencode")
+                    self.assertEqual(
+                        request.models,
+                        ["opencode-go/minimax-m2.7", "opencode-go/glm-5", "opencode-go/kimi-k2.5"],
+                    )
 
 
 if __name__ == "__main__":

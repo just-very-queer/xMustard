@@ -415,6 +415,32 @@ export type PlanRejectRequest = {
   reason: string
 }
 
+export type RunMetrics = {
+  run_id: string
+  workspace_id: string
+  input_tokens: number
+  output_tokens: number
+  estimated_cost: number
+  duration_ms: number
+  model: string
+  runtime: 'codex' | 'opencode'
+  calculated_at: string
+}
+
+export type CostSummary = {
+  workspace_id: string
+  total_runs: number
+  total_input_tokens: number
+  total_output_tokens: number
+  total_estimated_cost: number
+  total_duration_ms: number
+  runs_by_status: Record<string, number>
+  cost_by_runtime: Record<string, number>
+  cost_by_model: Record<string, number>
+  period_start?: string | null
+  period_end?: string | null
+}
+
 export type TreeNode = {
   path: string
   name: string

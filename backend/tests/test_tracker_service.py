@@ -13,6 +13,7 @@ from app.models import (
     RunReviewRequest,
     RunbookUpsertRequest,
     SavedIssueViewRequest,
+    VerifyIssueRequest,
     WorktreeStatus,
     WorkspaceLoadRequest,
 )
@@ -232,6 +233,150 @@ class TrackerServiceTests(unittest.TestCase):
             rescanned = service.scan_workspace(snapshot.workspace.workspace_id)
             issue = next(item for item in rescanned.issues if item.bug_id == "P0_25M03_001")
             self.assertEqual(issue.review_ready_count, 0)
+
+    def test_parse_verification_excerpt_reads_json_payload(self):
+        service = TrackerService(FileStore(Path(tempfile.gettempdir()) / "unused-bug-tracker-data"))
+        payload = service._parse_verification_excerpt(
+            """
+            Verification complete.
+            ```json
+            {"code_checked":"yes","fixed":"no","confidence":"high","summary":"Checked the code path.","evidence":["api/src/example.py:12"],"tests":["pytest -q"]}
+            ```
+            """
+        )
+        self.assertEqual(payload["code_checked"], "yes")
+        self.assertEqual(payload["fixed"], "no")
+        self.assertEqual(payload["confidence"], "high")
+        self.assertEqual(payload["evidence"], ["api/src/example.py:12"])
+
+    def test_parse_verification_excerpt_reads_json_from_jsonl_text_event(self):
+        service = TrackerService(FileStore(Path(tempfile.gettempdir()) / "unused-bug-tracker-data"))
+        payload = service._parse_verification_excerpt(
+            '\n'.join(
+                [
+                    '{"type":"step_start","part":{"type":"step-start"}}',
+                    '{"type":"text","part":{"text":"{\\"code_checked\\":\\"yes\\",\\"fixed\\":\\"yes\\",\\"confidence\\":\\"high\\",\\"summary\\":\\"Verified in current code\\",\\"evidence\\":[\\"api/src/example.py:12\\"],\\"tests\\":[\\"pytest -q\\"]}"}}',
+                ]
+            )
+        )
+        self.assertEqual(payload["code_checked"], "yes")
+        self.assertEqual(payload["fixed"], "yes")
+        self.assertEqual(payload["tests"], ["pytest -q"])
+
+    def test_parse_verification_excerpt_marks_code_checked_when_only_tool_reads_exist(self):
+        service = TrackerService(FileStore(Path(tempfile.gettempdir()) / "unused-bug-tracker-data"))
+        payload = service._parse_verification_excerpt(
+            '{"type":"tool_use","part":{"tool":"read","state":{"output":"<content>api/src/example.py</content>"}}}'
+        )
+        self.assertEqual(payload["code_checked"], "yes")
+        self.assertEqual(payload["fixed"], "unknown")
+
+    def test_load_run_for_verification_waits_for_summary(self):
+        service = TrackerService(FileStore(Path(tempfile.gettempdir()) / "unused-bug-tracker-data"))
+        run = RunRecord(
+            run_id="run_wait_summary",
+            workspace_id="ws",
+            issue_id="P0_25M03_001",
+            runtime="opencode",
+            model="opencode-go/minimax-m2.7",
+            status="cancelled",
+            title="opencode:P0_25M03_001",
+            prompt="prompt",
+            command=["opencode", "run"],
+            command_preview="opencode run",
+            log_path=str(Path(tempfile.gettempdir()) / "run_wait_summary.log"),
+            output_path=str(Path(tempfile.gettempdir()) / "run_wait_summary.out.json"),
+            summary=None,
+        )
+        settled = run.model_copy(update={"summary": {"text_excerpt": '{"code_checked":"yes","fixed":"yes","confidence":"high","summary":"settled"}'}})
+        with patch.object(service.store, "load_run", side_effect=[run, run, settled]):
+            with patch("app.service.time.sleep", return_value=None):
+                loaded = service._load_run_for_verification("ws", "run_wait_summary")
+        self.assertIsNotNone(loaded)
+        assert loaded is not None
+        self.assertIsNotNone(loaded.summary)
+
+    def test_verify_issue_three_pass_records_consensus(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "repo"
+            (root / "docs" / "bugs").mkdir(parents=True)
+            (root / "api" / "src").mkdir(parents=True)
+            (root / "docs" / "bugs" / "Bugs_25260323.md").write_text(LEDGER_TEXT, encoding="utf-8")
+            (root / "api" / "src" / "example.py").write_text("print('ok')\n", encoding="utf-8")
+
+            store = FileStore(Path(tmp_dir) / "data")
+            service = TrackerService(store)
+            snapshot = service.load_workspace(WorkspaceLoadRequest(root_path=str(root), auto_scan=True))
+            assert snapshot is not None
+            workspace_id = snapshot.workspace.workspace_id
+
+            run_ids = ["run_verify_1", "run_verify_2", "run_verify_3"]
+            models = ["opencode-go/minimax-m2.7", "opencode-go/glm-5", "opencode-go/kimi-k2.5"]
+            excerpts = [
+                '{"code_checked":"yes","fixed":"yes","confidence":"high","summary":"Verified and fixed","evidence":["api/src/example.py:12"],"tests":["pytest -q"]}',
+                '{"code_checked":"yes","fixed":"yes","confidence":"medium","summary":"Confirmed fix","evidence":["api/src/example.py:12"],"tests":["pytest -q"]}',
+                '{"code_checked":"yes","fixed":"unknown","confidence":"low","summary":"Checked but inconclusive","evidence":["api/src/example.py:12"],"tests":[]}',
+            ]
+
+            for run_id, model, excerpt in zip(run_ids, models, excerpts):
+                run = RunRecord(
+                    run_id=run_id,
+                    workspace_id=workspace_id,
+                    issue_id="P0_25M03_001",
+                    runtime="opencode",
+                    model=model,
+                    status="completed",
+                    title=f"opencode:P0_25M03_001:{model}",
+                    prompt="prompt",
+                    command=["opencode", "run"],
+                    command_preview="opencode run",
+                    log_path=str(store.runs_dir(workspace_id) / f"{run_id}.log"),
+                    output_path=str(store.runs_dir(workspace_id) / f"{run_id}.out.json"),
+                    summary={"text_excerpt": excerpt},
+                )
+                store.save_run(run)
+
+            starts = [
+                RunRecord(
+                    run_id=run_id,
+                    workspace_id=workspace_id,
+                    issue_id="P0_25M03_001",
+                    runtime="opencode",
+                    model=model,
+                    status="queued",
+                    title=f"opencode:P0_25M03_001:{model}",
+                    prompt="prompt",
+                    command=["opencode", "run"],
+                    command_preview="opencode run",
+                    log_path=str(store.runs_dir(workspace_id) / f"{run_id}.log"),
+                    output_path=str(store.runs_dir(workspace_id) / f"{run_id}.out.json"),
+                )
+                for run_id, model in zip(run_ids, models)
+            ]
+
+            with patch.object(service.runtime_service, "validate_runtime_model", return_value=None):
+                with patch.object(service.runtime_service, "start_issue_run", side_effect=starts):
+                    with patch.object(service, "get_run", side_effect=[item.model_dump(mode="json") | {"status": "completed"} for item in starts]):
+                        with patch("app.service.time.sleep", return_value=None):
+                            summary = service.verify_issue_three_pass(
+                                workspace_id,
+                                "P0_25M03_001",
+                                VerifyIssueRequest(
+                                    runtime="opencode",
+                                    models=models,
+                                    timeout_seconds=0.01,
+                                    poll_interval=0.0,
+                                ),
+                            )
+
+            self.assertEqual(len(summary.records), 3)
+            self.assertEqual(summary.checked_yes, 3)
+            self.assertEqual(summary.consensus_code_checked, "yes")
+            self.assertEqual(summary.fixed_yes, 2)
+            self.assertEqual(summary.consensus_fixed, "yes")
+            persisted = service.list_verifications(workspace_id, "P0_25M03_001")
+            self.assertEqual(len(persisted), 3)
+            self.assertEqual(persisted[0].issue_id, "P0_25M03_001")
 
     def test_review_run_dismisses_completed_run_from_review_queue(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

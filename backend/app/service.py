@@ -17,6 +17,7 @@ from .models import (
     ActivityRecord,
     ActivityRollupItem,
     AppSettings,
+    CostSummary,
     EvidenceRef,
     ExportBundle,
     FixRecord,
@@ -33,6 +34,7 @@ from .models import (
     PlanRejectRequest,
     PlanStep,
     PromoteSignalRequest,
+    RunMetrics,
     RunPlan,
     RunRecord,
     RunReviewRecord,
@@ -1237,6 +1239,44 @@ Respond with a JSON object containing:
             return {"summary": "Planning timed out", "reasoning": None, "steps": []}
         except Exception as exc:
             return {"summary": f"Planning failed: {exc}", "reasoning": None, "steps": []}
+
+    def get_run_metrics(self, workspace_id: str, run_id: str) -> dict:
+        metrics = self.runtime_service.load_run_metrics(run_id)
+        if not metrics:
+            raise FileNotFoundError(f"No metrics found for run {run_id}")
+        return metrics.model_dump(mode="json")
+
+    def get_workspace_cost_summary(self, workspace_id: str) -> dict:
+        metrics_list = self.runtime_service.get_workspace_metrics(workspace_id)
+        runs = self.store.list_runs(workspace_id)
+        runs_by_status: dict[str, int] = {}
+        cost_by_runtime: dict[str, float] = {}
+        cost_by_model: dict[str, float] = {}
+        total_input_tokens = 0
+        total_output_tokens = 0
+        total_estimated_cost = 0.0
+        total_duration_ms = 0
+        for m in metrics_list:
+            total_input_tokens += m.input_tokens
+            total_output_tokens += m.output_tokens
+            total_estimated_cost += m.estimated_cost
+            total_duration_ms += m.duration_ms
+            cost_by_runtime[m.runtime] = cost_by_runtime.get(m.runtime, 0.0) + m.estimated_cost
+            cost_by_model[m.model] = cost_by_model.get(m.model, 0.0) + m.estimated_cost
+        for run in runs:
+            status = run.status
+            runs_by_status[status] = runs_by_status.get(status, 0) + 1
+        return CostSummary(
+            workspace_id=workspace_id,
+            total_runs=len(runs),
+            total_input_tokens=total_input_tokens,
+            total_output_tokens=total_output_tokens,
+            total_estimated_cost=round(total_estimated_cost, 6),
+            total_duration_ms=total_duration_ms,
+            runs_by_status=runs_by_status,
+            cost_by_runtime=cost_by_runtime,
+            cost_by_model=cost_by_model,
+        ).model_dump(mode="json")
 
     def _run_excerpt(self, run: RunRecord) -> str:
         parts: list[str] = []

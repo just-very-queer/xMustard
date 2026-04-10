@@ -17,6 +17,7 @@ from .models import (
     ActivityRecord,
     AppSettings,
     LocalAgentCapabilities,
+    RunMetrics,
     RunRecord,
     RuntimeCapabilities,
     RuntimeModel,
@@ -35,6 +36,18 @@ DEFAULT_CODEX_MODELS = [
     "gpt-5.3-codex-spark",
     "gpt-5.2-codex",
 ]
+
+MODEL_PRICING = {
+    "gpt-5.4": {"input_per_1k": 0.01, "output_per_1k": 0.03},
+    "gpt-5.4-mini": {"input_per_1k": 0.005, "output_per_1k": 0.015},
+    "gpt-5.3-codex": {"input_per_1k": 0.02, "output_per_1k": 0.06},
+    "gpt-5.3-codex-spark": {"input_per_1k": 0.015, "output_per_1k": 0.045},
+    "gpt-5.2-codex": {"input_per_1k": 0.025, "output_per_1k": 0.075},
+    "gpt-4o": {"input_per_1k": 0.0025, "output_per_1k": 0.01},
+    "gpt-4o-mini": {"input_per_1k": 0.00015, "output_per_1k": 0.0006},
+    "claude-sonnet-4-5": {"input_per_1k": 0.003, "output_per_1k": 0.015},
+    "claude-opus-4": {"input_per_1k": 0.015, "output_per_1k": 0.075},
+}
 
 
 class RuntimeService:
@@ -378,6 +391,8 @@ class RuntimeService:
                     }
                 )
                 self.store.save_run(final)
+                metrics = self.calculate_run_metrics(final, len(combined_output))
+                self.save_run_metrics(metrics)
                 self._record_run_activity(final, "run.completed" if final_status == "completed" else f"run.{final_status}")
         except Exception as exc:
             failed = run.model_copy(
@@ -389,6 +404,8 @@ class RuntimeService:
                 }
             )
             self.store.save_run(failed)
+            metrics = self.calculate_run_metrics(failed, 0)
+            self.save_run_metrics(metrics)
             log_path.write_text(str(exc), encoding="utf-8")
             self._record_run_activity(failed, "run.failed")
         finally:
@@ -512,3 +529,67 @@ class RuntimeService:
             created_at=utc_now(),
         )
         self.store.append_activity(activity)
+
+    def _estimate_tokens(self, text: str) -> int:
+        return max(1, len(text) // 4)
+
+    def _calculate_cost(self, model: str, input_tokens: int, output_tokens: int) -> float:
+        pricing = MODEL_PRICING.get(model, {"input_per_1k": 0.01, "output_per_1k": 0.03})
+        input_cost = (input_tokens / 1000) * pricing["input_per_1k"]
+        output_cost = (output_tokens / 1000) * pricing["output_per_1k"]
+        return round(input_cost + output_cost, 6)
+
+    def calculate_run_metrics(self, run: RunRecord, output_length: int) -> RunMetrics:
+        input_tokens = self._estimate_tokens(run.prompt)
+        output_tokens = self._estimate_tokens(output_length)
+        duration_ms = 0
+        if run.started_at and run.completed_at:
+            try:
+                from datetime import datetime, timezone
+                start = datetime.fromisoformat(run.started_at.replace("Z", "+00:00"))
+                end = datetime.fromisoformat(run.completed_at.replace("Z", "+00:00"))
+                duration_ms = int((end - start).total_seconds() * 1000)
+            except (ValueError, TypeError):
+                duration_ms = 0
+        cost = self._calculate_cost(run.model, input_tokens, output_tokens)
+        return RunMetrics(
+            run_id=run.run_id,
+            workspace_id=run.workspace_id,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            estimated_cost=cost,
+            duration_ms=duration_ms,
+            model=run.model,
+            runtime=run.runtime,
+            calculated_at=utc_now(),
+        )
+
+    def save_run_metrics(self, metrics: RunMetrics) -> None:
+        metrics_dir = self.store.data_dir / "metrics"
+        metrics_dir.mkdir(parents=True, exist_ok=True)
+        metrics_path = metrics_dir / f"{metrics.run_id}.json"
+        metrics_path.write_text(metrics.model_dump_json(), encoding="utf-8")
+
+    def load_run_metrics(self, run_id: str) -> Optional[RunMetrics]:
+        metrics_dir = self.store.data_dir / "metrics"
+        metrics_path = metrics_dir / f"{run_id}.json"
+        if not metrics_path.exists():
+            return None
+        try:
+            return RunMetrics.model_validate_json(metrics_path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+
+    def get_workspace_metrics(self, workspace_id: str) -> list[RunMetrics]:
+        metrics_dir = self.store.data_dir / "metrics"
+        if not metrics_dir.exists():
+            return []
+        metrics_list = []
+        for metrics_file in metrics_dir.glob("*.json"):
+            try:
+                metrics = RunMetrics.model_validate_json(metrics_file.read_text(encoding="utf-8"))
+                if metrics.workspace_id == workspace_id:
+                    metrics_list.append(metrics)
+            except Exception:
+                continue
+        return metrics_list

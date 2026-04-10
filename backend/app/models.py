@@ -599,3 +599,29 @@ class PlanApproveRequest(BaseModel):
 
 class PlanRejectRequest(BaseModel):
     reason: str
+
+
+class RunMetrics(BaseModel):
+    run_id: str
+    workspace_id: str
+    input_tokens: int = 0
+    output_tokens: int = 0
+    estimated_cost: float = 0.0
+    duration_ms: int = 0
+    model: str
+    runtime: RuntimeKind
+    calculated_at: str = Field(default_factory=utc_now)
+
+
+class CostSummary(BaseModel):
+    workspace_id: str
+    total_runs: int = 0
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
+    total_estimated_cost: float = 0.0
+    total_duration_ms: int = 0
+    runs_by_status: dict[str, int] = Field(default_factory=dict)
+    cost_by_runtime: dict[str, float] = Field(default_factory=dict)
+    cost_by_model: dict[str, float] = Field(default_factory=dict)
+    period_start: Optional[str] = None
+    period_end: Optional[str] = None
