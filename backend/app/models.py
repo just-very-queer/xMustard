@@ -709,3 +709,36 @@ class TestSuggestion(BaseModel):
     rationale: str = ""
     suggested_code: Optional[str] = None
     created_at: str = Field(default_factory=utc_now)
+
+
+class ImprovementSuggestion(BaseModel):
+    suggestion_id: str
+    file_path: str
+    line_start: Optional[int] = None
+    line_end: Optional[int] = None
+    category: Literal["bug_risk", "style", "performance", "maintainability", "security", "testing"] = "maintainability"
+    severity: Literal["high", "medium", "low"] = "medium"
+    description: str = ""
+    suggested_fix: Optional[str] = None
+    dismissed: bool = False
+    dismissed_reason: Optional[str] = None
+
+
+class PatchCritique(BaseModel):
+    critique_id: str
+    workspace_id: str
+    run_id: str
+    issue_id: str
+    overall_quality: Literal["excellent", "good", "acceptable", "needs_work", "poor"] = "acceptable"
+    correctness: float = 0.0
+    completeness: float = 0.0
+    style: float = 0.0
+    safety: float = 0.0
+    issues_found: list[str] = Field(default_factory=list)
+    improvements: list[ImprovementSuggestion] = Field(default_factory=list)
+    summary: str = ""
+    generated_at: str = Field(default_factory=utc_now)
+
+
+class DismissImprovementRequest(BaseModel):
+    reason: Optional[str] = None

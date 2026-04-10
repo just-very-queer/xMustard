@@ -20,6 +20,7 @@ from .models import (
     CostSummary,
     CoverageDelta,
     CoverageResult,
+    DismissImprovementRequest,
     DuplicateMatch,
     EvidenceRef,
     ExportBundle,
@@ -27,12 +28,14 @@ from .models import (
     FixDraftSuggestion,
     FixRecordRequest,
     FixUpdateRequest,
+    ImprovementSuggestion,
     IssueDriftDetail,
     IssueCreateRequest,
     IssueContextPacket,
     IssueQualityScore,
     IssueRecord,
     IssueUpdateRequest,
+    PatchCritique,
     PlanApproveRequest,
     PlanPhase,
     PlanRejectRequest,
@@ -1839,6 +1842,249 @@ Respond with a JSON object containing:
             return [TestSuggestion(**item) for item in data]
         except Exception:
             return []
+
+    def generate_patch_critique(self, workspace_id: str, run_id: str) -> dict:
+        run = self.store.load_run(workspace_id, run_id)
+        if not run:
+            raise FileNotFoundError(run_id)
+        if run.status not in {"completed", "failed"}:
+            raise ValueError(f"Cannot critique run in status {run.status}")
+        workspace = self.get_workspace(workspace_id)
+        output_path = Path(run.output_path)
+        output_text = ""
+        if output_path.exists():
+            output_text = output_path.read_text(encoding="utf-8")
+        improvements = self._analyze_run_output(run, output_text)
+        issues_found = self._detect_patch_issues(run, output_text)
+        correctness = self._score_correctness(run, output_text, issues_found)
+        completeness = self._score_completeness(run, output_text)
+        style = self._score_style(output_text)
+        safety = self._score_safety(run, output_text, issues_found)
+        avg = (correctness + completeness + style + safety) / 4
+        if avg >= 0.85:
+            quality = "excellent"
+        elif avg >= 0.7:
+            quality = "good"
+        elif avg >= 0.5:
+            quality = "acceptable"
+        elif avg >= 0.3:
+            quality = "needs_work"
+        else:
+            quality = "poor"
+        critique = PatchCritique(
+            critique_id=f"crit_{uuid.uuid4().hex[:12]}",
+            workspace_id=workspace_id,
+            run_id=run_id,
+            issue_id=run.issue_id,
+            overall_quality=quality,
+            correctness=round(correctness * 100, 1),
+            completeness=round(completeness * 100, 1),
+            style=round(style * 100, 1),
+            safety=round(safety * 100, 1),
+            issues_found=issues_found,
+            improvements=improvements,
+            summary=self._critique_summary(quality, issues_found, improvements),
+        )
+        self._save_critique(critique)
+        self._record_activity(
+            workspace_id=workspace_id,
+            entity_type="run",
+            entity_id=run_id,
+            action="critique.generated",
+            summary=f"Generated patch critique: {quality}",
+            actor=build_activity_actor("system", "system"),
+            issue_id=run.issue_id,
+            run_id=run_id,
+            details={"quality": quality, "issues": len(issues_found), "improvements": len(improvements)},
+        )
+        return critique.model_dump(mode="json")
+
+    def get_patch_critique(self, workspace_id: str, run_id: str) -> Optional[dict]:
+        critique = self._load_critique(run_id)
+        if not critique:
+            return None
+        return critique.model_dump(mode="json")
+
+    def dismiss_improvement(self, workspace_id: str, run_id: str, suggestion_id: str, request: DismissImprovementRequest) -> dict:
+        critique = self._load_critique(run_id)
+        if not critique:
+            raise FileNotFoundError(f"No critique found for run {run_id}")
+        updated_improvements = []
+        found = False
+        for imp in critique.improvements:
+            if imp.suggestion_id == suggestion_id:
+                updated_improvements.append(imp.model_copy(update={
+                    "dismissed": True,
+                    "dismissed_reason": request.reason,
+                }))
+                found = True
+            else:
+                updated_improvements.append(imp)
+        if not found:
+            raise FileNotFoundError(f"Improvement {suggestion_id} not found")
+        updated = critique.model_copy(update={"improvements": updated_improvements})
+        self._save_critique(updated)
+        return updated.model_dump(mode="json")
+
+    def get_run_improvements(self, workspace_id: str, run_id: str) -> list[dict]:
+        critique = self._load_critique(run_id)
+        if not critique:
+            return []
+        return [imp.model_dump(mode="json") for imp in critique.improvements if not imp.dismissed]
+
+    def _analyze_run_output(self, run: RunRecord, output: str) -> list[ImprovementSuggestion]:
+        improvements: list[ImprovementSuggestion] = []
+        lines = output.splitlines()
+        seen_files: set[str] = set()
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            for pattern in ("TODO", "FIXME", "HACK", "XXX"):
+                if pattern in stripped:
+                    improvements.append(ImprovementSuggestion(
+                        suggestion_id=f"imp_{uuid.uuid4().hex[:8]}",
+                        file_path=self._extract_file_from_line(stripped) or "unknown",
+                        line_start=i + 1,
+                        category="maintainability",
+                        severity="low",
+                        description=f"Found {pattern} comment in generated output",
+                    ))
+            if any(kw in stripped.lower() for kw in ("password", "secret", "api_key", "token")):
+                if "env(" not in stripped and "os.environ" not in stripped and "getenv" not in stripped:
+                    improvements.append(ImprovementSuggestion(
+                        suggestion_id=f"imp_{uuid.uuid4().hex[:8]}",
+                        file_path=self._extract_file_from_line(stripped) or "unknown",
+                        line_start=i + 1,
+                        category="security",
+                        severity="high",
+                        description="Possible hardcoded secret or credential",
+                    ))
+        if run.summary and isinstance(run.summary, dict):
+            tool_events = run.summary.get("tool_event_count", 0)
+            total_events = run.summary.get("event_count", 0)
+            if total_events > 0 and tool_events / total_events > 0.8:
+                improvements.append(ImprovementSuggestion(
+                    suggestion_id=f"imp_{uuid.uuid4().hex[:8]}",
+                    file_path="general",
+                    category="performance",
+                    severity="low",
+                    description="High ratio of tool events to total events - consider reducing tool calls",
+                ))
+        if len(lines) > 2000:
+            improvements.append(ImprovementSuggestion(
+                suggestion_id=f"imp_{uuid.uuid4().hex[:8]}",
+                file_path="general",
+                category="maintainability",
+                severity="medium",
+                description="Output is very large - consider breaking into smaller operations",
+            ))
+        return improvements[:20]
+
+    def _extract_file_from_line(self, line: str) -> Optional[str]:
+        for pattern in (r"([\w/.-]+\.\w+):", r"file[:=]\s*([\w/.-]+\.\w+)", r"([\w/.-]+\.\w+)\s*\|"):
+            m = re.search(pattern, line)
+            if m:
+                return m.group(1)
+        return None
+
+    def _detect_patch_issues(self, run: RunRecord, output: str) -> list[str]:
+        issues: list[str] = []
+        if run.exit_code and run.exit_code != 0:
+            issues.append(f"Run exited with non-zero code: {run.exit_code}")
+        if run.error:
+            issues.append(f"Run had error: {run.error[:200]}")
+        lower = output.lower()
+        if "traceback" in lower:
+            issues.append("Python traceback found in output")
+        if "exception" in lower and "caught" not in lower:
+            issues.append("Uncaught exception detected in output")
+        if "panic" in lower:
+            issues.append("Panic detected in output")
+        if "segmentation fault" in lower or "segfault" in lower:
+            issues.append("Segmentation fault detected")
+        if not output.strip():
+            issues.append("Empty output - no changes generated")
+        return issues
+
+    def _score_correctness(self, run: RunRecord, output: str, issues: list[str]) -> float:
+        score = 1.0
+        if run.exit_code and run.exit_code != 0:
+            score -= 0.3
+        if run.error:
+            score -= 0.2
+        for issue in issues:
+            if "traceback" in issue.lower() or "exception" in issue.lower():
+                score -= 0.15
+            if "empty output" in issue.lower():
+                score -= 0.4
+        return max(0.0, score)
+
+    def _score_completeness(self, run: RunRecord, output: str) -> float:
+        score = 0.0
+        if output.strip():
+            score += 0.3
+        if run.summary and isinstance(run.summary, dict):
+            if run.summary.get("text_excerpt"):
+                score += 0.3
+            if run.summary.get("tool_event_count", 0) > 0:
+                score += 0.2
+            if run.summary.get("event_count", 0) > 3:
+                score += 0.2
+        return min(1.0, score)
+
+    def _score_style(self, output: str) -> float:
+        if not output.strip():
+            return 0.3
+        score = 0.7
+        lines = output.splitlines()
+        if lines:
+            avg_len = sum(len(l) for l in lines) / len(lines)
+            if avg_len > 200:
+                score -= 0.1
+        very_long = sum(1 for l in lines if len(l) > 500)
+        if very_long > 5:
+            score -= 0.15
+        return max(0.0, min(1.0, score))
+
+    def _score_safety(self, run: RunRecord, output: str, issues: list[str]) -> float:
+        score = 1.0
+        lower = output.lower()
+        if any(kw in lower for kw in ("rm -rf", "del /s", "format c:", "drop table", "delete from")):
+            score -= 0.4
+        if any(kw in lower for kw in ("os.system", "subprocess.call", "exec(", "eval(")):
+            score -= 0.2
+        for issue in issues:
+            if "panic" in issue.lower() or "segfault" in issue.lower():
+                score -= 0.3
+        return max(0.0, score)
+
+    def _critique_summary(self, quality: str, issues: list[str], improvements: list[ImprovementSuggestion]) -> str:
+        parts = [f"Overall quality: {quality}"]
+        if issues:
+            parts.append(f"Found {len(issues)} issue(s)")
+        active = [i for i in improvements if not i.dismissed]
+        if active:
+            high = sum(1 for i in active if i.severity == "high")
+            if high:
+                parts.append(f"{high} high-severity improvement(s) suggested")
+        return ". ".join(parts)
+
+    def _save_critique(self, critique: PatchCritique) -> None:
+        crit_dir = self.store.data_dir / "critiques"
+        crit_dir.mkdir(parents=True, exist_ok=True)
+        path = crit_dir / f"{critique.run_id}.json"
+        path.write_text(critique.model_dump_json(), encoding="utf-8")
+
+    def _load_critique(self, run_id: str) -> Optional[PatchCritique]:
+        crit_dir = self.store.data_dir / "critiques"
+        path = crit_dir / f"{run_id}.json"
+        if not path.exists():
+            return None
+        try:
+            return PatchCritique.model_validate_json(path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
 
     def _run_excerpt(self, run: RunRecord) -> str:
         parts: list[str] = []

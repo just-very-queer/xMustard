@@ -10,12 +10,14 @@ import type {
   FixDraftSuggestion,
   FixRecord,
   FixRecordRequest,
+  ImprovementSuggestion,
   IssueCreateRequest,
   IssueDriftDetail,
   IssueContextPacket,
   IssueQualityScore,
   IssueUpdateRequest,
   LocalAgentCapabilities,
+  PatchCritique,
   PlanApproveRequest,
   PlanRejectRequest,
   RuntimeProbeResult,
@@ -375,6 +377,27 @@ export function generateTestSuggestions(workspaceId: string, issueId: string) {
 
 export function getTestSuggestions(workspaceId: string, issueId: string) {
   return request<TestSuggestion[]>(`/api/workspaces/${workspaceId}/issues/${issueId}/test-suggestions`)
+}
+
+export function generatePatchCritique(workspaceId: string, runId: string) {
+  return request<PatchCritique>(`/api/workspaces/${workspaceId}/runs/${runId}/critique`, {
+    method: 'POST',
+  })
+}
+
+export function getPatchCritique(workspaceId: string, runId: string) {
+  return request<PatchCritique>(`/api/workspaces/${workspaceId}/runs/${runId}/critique`)
+}
+
+export function getRunImprovements(workspaceId: string, runId: string) {
+  return request<ImprovementSuggestion[]>(`/api/workspaces/${workspaceId}/runs/${runId}/improvements`)
+}
+
+export function dismissImprovement(workspaceId: string, runId: string, suggestionId: string, reason?: string) {
+  return request<ImprovementSuggestion>(`/api/workspaces/${workspaceId}/runs/${runId}/improvements/${suggestionId}/dismiss`, {
+    method: 'POST',
+    body: JSON.stringify({ reason }),
+  })
 }
 
 export function promoteSignal(workspaceId: string, signalId: string, severity: string) {

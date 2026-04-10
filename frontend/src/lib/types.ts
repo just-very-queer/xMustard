@@ -532,3 +532,32 @@ export type TreeNode = {
   has_children: boolean
   size_bytes?: number | null
 }
+
+export type ImprovementSuggestion = {
+  suggestion_id: string
+  file_path: string
+  line_start?: number | null
+  line_end?: number | null
+  category: 'bug_risk' | 'style' | 'performance' | 'maintainability' | 'security' | 'testing'
+  severity: 'high' | 'medium' | 'low'
+  description: string
+  suggested_fix?: string | null
+  dismissed: boolean
+  dismissed_reason?: string | null
+}
+
+export type PatchCritique = {
+  critique_id: string
+  workspace_id: string
+  run_id: string
+  issue_id: string
+  overall_quality: 'excellent' | 'good' | 'acceptable' | 'needs_work' | 'poor'
+  correctness: number
+  completeness: number
+  style: number
+  safety: number
+  issues_found: string[]
+  improvements: ImprovementSuggestion[]
+  summary: string
+  generated_at: string
+}

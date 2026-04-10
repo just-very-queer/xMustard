@@ -9,6 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from .models import (
     AgentQueryRequest,
     AppSettings,
+    DismissImprovementRequest,
     FixRecordRequest,
     FixUpdateRequest,
     IssueCreateRequest,
@@ -604,6 +605,37 @@ def generate_test_suggestions(workspace_id: str, issue_id: str):
 @app.get("/api/workspaces/{workspace_id}/issues/{issue_id}/test-suggestions")
 def get_test_suggestions(workspace_id: str, issue_id: str):
     return SERVICE.get_test_suggestions(workspace_id, issue_id)
+
+
+@app.post("/api/workspaces/{workspace_id}/runs/{run_id}/critique")
+def generate_patch_critique(workspace_id: str, run_id: str):
+    try:
+        return SERVICE.generate_patch_critique(workspace_id, run_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.get("/api/workspaces/{workspace_id}/runs/{run_id}/critique")
+def get_patch_critique(workspace_id: str, run_id: str):
+    result = SERVICE.get_patch_critique(workspace_id, run_id)
+    if not result:
+        raise HTTPException(status_code=404, detail="No critique found for this run")
+    return result
+
+
+@app.get("/api/workspaces/{workspace_id}/runs/{run_id}/improvements")
+def get_run_improvements(workspace_id: str, run_id: str):
+    return SERVICE.get_run_improvements(workspace_id, run_id)
+
+
+@app.post("/api/workspaces/{workspace_id}/runs/{run_id}/improvements/{suggestion_id}/dismiss")
+def dismiss_improvement(workspace_id: str, run_id: str, suggestion_id: str, request: DismissImprovementRequest):
+    try:
+        return SERVICE.dismiss_improvement(workspace_id, run_id, suggestion_id, request)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
 
 
 @app.patch("/api/workspaces/{workspace_id}/fixes/{fix_id}")
