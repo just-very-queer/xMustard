@@ -441,6 +441,44 @@ export type CostSummary = {
   period_end?: string | null
 }
 
+export type IssueQualityScore = {
+  issue_id: string
+  workspace_id: string
+  overall: number
+  completeness: number
+  clarity: number
+  evidence_quality: number
+  has_repro: boolean
+  has_severity: boolean
+  has_evidence: boolean
+  has_impact: boolean
+  has_summary: boolean
+  title_length: number
+  summary_length: number
+  evidence_count: number
+  suggestions: string[]
+  calculated_at: string
+}
+
+export type DuplicateMatch = {
+  source_id: string
+  target_id: string
+  similarity: number
+  match_type: 'exact' | 'fuzzy' | 'fingerprint'
+  shared_fields: string[]
+}
+
+export type TriageSuggestion = {
+  issue_id: string
+  workspace_id: string
+  suggested_severity?: string | null
+  suggested_labels: string[]
+  suggested_owner?: string | null
+  confidence: number
+  reasoning: string
+  calculated_at: string
+}
+
 export type TreeNode = {
   path: string
   name: string

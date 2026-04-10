@@ -18,6 +18,7 @@ from .models import (
     ActivityRollupItem,
     AppSettings,
     CostSummary,
+    DuplicateMatch,
     EvidenceRef,
     ExportBundle,
     FixRecord,
@@ -27,6 +28,7 @@ from .models import (
     IssueDriftDetail,
     IssueCreateRequest,
     IssueContextPacket,
+    IssueQualityScore,
     IssueRecord,
     IssueUpdateRequest,
     PlanApproveRequest,
@@ -46,6 +48,7 @@ from .models import (
     SavedIssueView,
     SavedIssueViewRequest,
     SourceRecord,
+    TriageSuggestion,
     VerificationRecord,
     VerificationSummary,
     VerifyIssueRequest,
@@ -1277,6 +1280,260 @@ Respond with a JSON object containing:
             cost_by_runtime=cost_by_runtime,
             cost_by_model=cost_by_model,
         ).model_dump(mode="json")
+
+    def score_issue_quality(self, workspace_id: str, issue_id: str) -> dict:
+        issue = self._get_issue(workspace_id, issue_id)
+        score = self._calculate_quality_score(workspace_id, issue)
+        self._save_quality_score(score)
+        return score.model_dump(mode="json")
+
+    def score_all_issues(self, workspace_id: str) -> list[dict]:
+        snapshot = self.store.load_snapshot(workspace_id)
+        if not snapshot:
+            raise FileNotFoundError(workspace_id)
+        results = []
+        for issue in snapshot.issues:
+            score = self._calculate_quality_score(workspace_id, issue)
+            self._save_quality_score(score)
+            results.append(score.model_dump(mode="json"))
+        return results
+
+    def get_issue_quality(self, workspace_id: str, issue_id: str) -> dict:
+        score = self._load_quality_score(workspace_id, issue_id)
+        if not score:
+            return self.score_issue_quality(workspace_id, issue_id)
+        return score.model_dump(mode="json")
+
+    def find_duplicates(self, workspace_id: str, issue_id: str) -> list[dict]:
+        snapshot = self.store.load_snapshot(workspace_id)
+        if not snapshot:
+            raise FileNotFoundError(workspace_id)
+        source = self._get_issue(workspace_id, issue_id)
+        matches: list[DuplicateMatch] = []
+        for candidate in snapshot.issues:
+            if candidate.bug_id == source.bug_id:
+                continue
+            sim = self._compute_similarity(source, candidate)
+            if sim.similarity >= 0.3:
+                matches.append(sim)
+        matches.sort(key=lambda m: m.similarity, reverse=True)
+        return [m.model_dump(mode="json") for m in matches[:10]]
+
+    def triage_issue(self, workspace_id: str, issue_id: str) -> dict:
+        issue = self._get_issue(workspace_id, issue_id)
+        suggestion = self._generate_triage_suggestion(workspace_id, issue)
+        return suggestion.model_dump(mode="json")
+
+    def triage_all_issues(self, workspace_id: str) -> list[dict]:
+        snapshot = self.store.load_snapshot(workspace_id)
+        if not snapshot:
+            raise FileNotFoundError(workspace_id)
+        results = []
+        for issue in snapshot.issues:
+            suggestion = self._generate_triage_suggestion(workspace_id, issue)
+            results.append(suggestion.model_dump(mode="json"))
+        return results
+
+    def _calculate_quality_score(self, workspace_id: str, issue: IssueRecord) -> IssueQualityScore:
+        suggestions: list[str] = []
+        has_repro = bool(issue.summary and len(issue.summary.strip()) > 20)
+        has_severity = bool(issue.severity and issue.severity in {"critical", "high", "medium", "low"})
+        has_evidence = len(issue.evidence) > 0
+        has_impact = bool(issue.impact and len(issue.impact.strip()) > 10)
+        has_summary = bool(issue.summary and len(issue.summary.strip()) > 0)
+        completeness = 0.0
+        if has_severity:
+            completeness += 0.2
+        else:
+            suggestions.append("Add a severity rating")
+        if has_repro:
+            completeness += 0.25
+        else:
+            suggestions.append("Add reproduction steps to the summary (20+ chars)")
+        if has_evidence:
+            completeness += 0.25
+        else:
+            suggestions.append("Add code evidence (file path and line references)")
+        if has_impact:
+            completeness += 0.15
+        else:
+            suggestions.append("Describe the impact of this issue")
+        if has_summary:
+            completeness += 0.15
+        clarity = 0.0
+        title_len = len(issue.title.strip())
+        if title_len >= 10:
+            clarity += 0.3
+        elif title_len >= 5:
+            clarity += 0.15
+        else:
+            suggestions.append("Title is too short - be more descriptive")
+        summary_len = len((issue.summary or "").strip())
+        if summary_len >= 50:
+            clarity += 0.4
+        elif summary_len >= 20:
+            clarity += 0.2
+        else:
+            suggestions.append("Summary needs more detail (50+ chars recommended)")
+        if title_len > 0 and not issue.title.isupper() and not issue.title.islower():
+            clarity += 0.15
+        if len(issue.labels) > 0:
+            clarity += 0.15
+        else:
+            suggestions.append("Add labels to categorize the issue")
+        evidence_quality = 0.0
+        evidence_count = len(issue.evidence)
+        if evidence_count > 0:
+            evidence_quality += min(0.4, evidence_count * 0.1)
+            has_line_refs = any(e.line is not None for e in issue.evidence)
+            if has_line_refs:
+                evidence_quality += 0.3
+            has_excerpts = any(e.excerpt for e in issue.evidence)
+            if has_excerpts:
+                evidence_quality += 0.3
+        else:
+            evidence_quality = 0.0
+        overall = round((completeness * 0.4 + clarity * 0.35 + evidence_quality * 0.25) * 100, 1)
+        return IssueQualityScore(
+            issue_id=issue.bug_id,
+            workspace_id=workspace_id,
+            overall=overall,
+            completeness=round(completeness * 100, 1),
+            clarity=round(clarity * 100, 1),
+            evidence_quality=round(evidence_quality * 100, 1),
+            has_repro=has_repro,
+            has_severity=has_severity,
+            has_evidence=has_evidence,
+            has_impact=has_impact,
+            has_summary=has_summary,
+            title_length=title_len,
+            summary_length=summary_len,
+            evidence_count=evidence_count,
+            suggestions=suggestions,
+        )
+
+    def _save_quality_score(self, score: IssueQualityScore) -> None:
+        scores_dir = self.store.data_dir / "quality_scores"
+        scores_dir.mkdir(parents=True, exist_ok=True)
+        path = scores_dir / f"{score.issue_id}.json"
+        path.write_text(score.model_dump_json(), encoding="utf-8")
+
+    def _load_quality_score(self, workspace_id: str, issue_id: str) -> Optional[IssueQualityScore]:
+        scores_dir = self.store.data_dir / "quality_scores"
+        path = scores_dir / f"{issue_id}.json"
+        if not path.exists():
+            return None
+        try:
+            return IssueQualityScore.model_validate_json(path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+
+    def _get_issue(self, workspace_id: str, issue_id: str) -> IssueRecord:
+        snapshot = self.store.load_snapshot(workspace_id)
+        if not snapshot:
+            raise FileNotFoundError(workspace_id)
+        for issue in snapshot.issues:
+            if issue.bug_id == issue_id:
+                return issue
+        raise FileNotFoundError(f"Issue {issue_id} not found in workspace {workspace_id}")
+
+    def _compute_similarity(self, a: IssueRecord, b: IssueRecord) -> DuplicateMatch:
+        shared: list[str] = []
+        score = 0.0
+        if a.fingerprint and b.fingerprint and a.fingerprint == b.fingerprint:
+            return DuplicateMatch(
+                source_id=a.bug_id, target_id=b.bug_id, similarity=1.0,
+                match_type="fingerprint", shared_fields=["fingerprint"],
+            )
+        if a.title and b.title:
+            title_sim = self._text_similarity(a.title.lower(), b.title.lower())
+            if title_sim > 0.5:
+                score += title_sim * 0.35
+                shared.append("title")
+        if a.summary and b.summary:
+            sum_sim = self._text_similarity(a.summary.lower(), b.summary.lower())
+            if sum_sim > 0.4:
+                score += sum_sim * 0.25
+                shared.append("summary")
+        if a.severity == b.severity and a.severity:
+            score += 0.1
+            shared.append("severity")
+        a_paths = {e.path for e in a.evidence}
+        b_paths = {e.path for e in b.evidence}
+        overlap = a_paths & b_paths
+        if overlap:
+            path_sim = len(overlap) / max(len(a_paths | b_paths), 1)
+            score += path_sim * 0.2
+            shared.append("evidence_paths")
+        a_labels = set(a.labels)
+        b_labels = set(b.labels)
+        label_overlap = a_labels & b_labels
+        if label_overlap:
+            label_sim = len(label_overlap) / max(len(a_labels | b_labels), 1)
+            score += label_sim * 0.1
+            shared.append("labels")
+        match_type = "exact" if score >= 0.95 else "fuzzy"
+        return DuplicateMatch(
+            source_id=a.bug_id, target_id=b.bug_id,
+            similarity=round(min(score, 1.0), 3),
+            match_type=match_type, shared_fields=shared,
+        )
+
+    def _text_similarity(self, a: str, b: str) -> float:
+        if not a or not b:
+            return 0.0
+        a_words = set(a.split())
+        b_words = set(b.split())
+        intersection = a_words & b_words
+        union = a_words | b_words
+        if not union:
+            return 0.0
+        return len(intersection) / len(union)
+
+    def _generate_triage_suggestion(self, workspace_id: str, issue: IssueRecord) -> TriageSuggestion:
+        suggested_severity: Optional[str] = None
+        suggested_labels: list[str] = list(issue.labels)
+        reasoning_parts: list[str] = []
+        confidence = 0.0
+        if not issue.severity or issue.severity == "medium":
+            if issue.impact and any(w in issue.impact.lower() for w in ("crash", "data loss", "security", "rce", "injection")):
+                suggested_severity = "critical"
+                reasoning_parts.append("Impact mentions critical keywords (crash/security/data loss)")
+                confidence += 0.3
+            elif issue.impact and any(w in issue.impact.lower() for w in ("break", "fail", "error", "wrong")):
+                suggested_severity = "high"
+                reasoning_parts.append("Impact mentions functional breakage")
+                confidence += 0.25
+            elif len(issue.evidence) >= 3:
+                suggested_severity = "high"
+                reasoning_parts.append("Multiple evidence references suggest higher severity")
+                confidence += 0.2
+        if "exception_swallow" in str(issue.drift_flags):
+            if "silent-failure" not in suggested_labels:
+                suggested_labels.append("silent-failure")
+            reasoning_parts.append("Exception swallowing detected")
+            confidence += 0.15
+        if any(e.path and e.path.endswith((".test.", "_test.", ".spec.", ".e2e.")) for e in issue.evidence):
+            if "test-related" not in suggested_labels:
+                suggested_labels.append("test-related")
+            reasoning_parts.append("Evidence in test files")
+            confidence += 0.1
+        if issue.source == "verdict":
+            if "verdict-derived" not in suggested_labels:
+                suggested_labels.append("verdict-derived")
+            confidence += 0.1
+        if not suggested_labels and not issue.labels:
+            if "needs-triage" not in suggested_labels:
+                suggested_labels.append("needs-triage")
+            reasoning_parts.append("No labels assigned yet")
+        return TriageSuggestion(
+            issue_id=issue.bug_id,
+            workspace_id=workspace_id,
+            suggested_severity=suggested_severity,
+            suggested_labels=suggested_labels,
+            confidence=min(round(confidence, 2), 1.0),
+            reasoning="; ".join(reasoning_parts) if reasoning_parts else "No specific triage suggestions",
+        )
 
     def _run_excerpt(self, run: RunRecord) -> str:
         parts: list[str] = []

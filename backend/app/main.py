@@ -524,6 +524,54 @@ def get_workspace_cost_summary(workspace_id: str):
     return SERVICE.get_workspace_cost_summary(workspace_id)
 
 
+@app.get("/api/workspaces/{workspace_id}/issues/{issue_id}/quality")
+def get_issue_quality(workspace_id: str, issue_id: str):
+    try:
+        return SERVICE.get_issue_quality(workspace_id, issue_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
+@app.post("/api/workspaces/{workspace_id}/issues/{issue_id}/quality")
+def score_issue_quality(workspace_id: str, issue_id: str):
+    try:
+        return SERVICE.score_issue_quality(workspace_id, issue_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
+@app.post("/api/workspaces/{workspace_id}/quality/score-all")
+def score_all_issues(workspace_id: str):
+    try:
+        return SERVICE.score_all_issues(workspace_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
+@app.get("/api/workspaces/{workspace_id}/issues/{issue_id}/duplicates")
+def find_duplicates(workspace_id: str, issue_id: str):
+    try:
+        return SERVICE.find_duplicates(workspace_id, issue_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
+@app.post("/api/workspaces/{workspace_id}/issues/{issue_id}/triage")
+def triage_issue(workspace_id: str, issue_id: str):
+    try:
+        return SERVICE.triage_issue(workspace_id, issue_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
+@app.post("/api/workspaces/{workspace_id}/triage/all")
+def triage_all_issues(workspace_id: str):
+    try:
+        return SERVICE.triage_all_issues(workspace_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
 @app.patch("/api/workspaces/{workspace_id}/fixes/{fix_id}")
 def update_fix(workspace_id: str, fix_id: str, request: FixUpdateRequest):
     try:

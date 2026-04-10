@@ -625,3 +625,41 @@ class CostSummary(BaseModel):
     cost_by_model: dict[str, float] = Field(default_factory=dict)
     period_start: Optional[str] = None
     period_end: Optional[str] = None
+
+
+class IssueQualityScore(BaseModel):
+    issue_id: str
+    workspace_id: str
+    overall: float = 0.0
+    completeness: float = 0.0
+    clarity: float = 0.0
+    evidence_quality: float = 0.0
+    has_repro: bool = False
+    has_severity: bool = False
+    has_evidence: bool = False
+    has_impact: bool = False
+    has_summary: bool = False
+    title_length: int = 0
+    summary_length: int = 0
+    evidence_count: int = 0
+    suggestions: list[str] = Field(default_factory=list)
+    calculated_at: str = Field(default_factory=utc_now)
+
+
+class DuplicateMatch(BaseModel):
+    source_id: str
+    target_id: str
+    similarity: float
+    match_type: Literal["exact", "fuzzy", "fingerprint"] = "fuzzy"
+    shared_fields: list[str] = Field(default_factory=list)
+
+
+class TriageSuggestion(BaseModel):
+    issue_id: str
+    workspace_id: str
+    suggested_severity: Optional[str] = None
+    suggested_labels: list[str] = Field(default_factory=list)
+    suggested_owner: Optional[str] = None
+    confidence: float = 0.0
+    reasoning: str = ""
+    calculated_at: str = Field(default_factory=utc_now)

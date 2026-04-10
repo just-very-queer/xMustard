@@ -4,12 +4,14 @@ import type {
   ActivityRecord,
   AppSettings,
   CostSummary,
+  DuplicateMatch,
   FixDraftSuggestion,
   FixRecord,
   FixRecordRequest,
   IssueCreateRequest,
   IssueDriftDetail,
   IssueContextPacket,
+  IssueQualityScore,
   IssueUpdateRequest,
   LocalAgentCapabilities,
   PlanApproveRequest,
@@ -25,6 +27,7 @@ import type {
   SavedIssueView,
   SavedIssueViewRequest,
   SourceRecord,
+  TriageSuggestion,
   TreeNode,
   WorktreeStatus,
   WorkspaceSnapshot,
@@ -307,6 +310,38 @@ export function getRunMetrics(workspaceId: string, runId: string) {
 
 export function getWorkspaceCostSummary(workspaceId: string) {
   return request<CostSummary>(`/api/workspaces/${workspaceId}/costs`)
+}
+
+export function getIssueQuality(workspaceId: string, issueId: string) {
+  return request<IssueQualityScore>(`/api/workspaces/${workspaceId}/issues/${issueId}/quality`)
+}
+
+export function scoreIssueQuality(workspaceId: string, issueId: string) {
+  return request<IssueQualityScore>(`/api/workspaces/${workspaceId}/issues/${issueId}/quality`, {
+    method: 'POST',
+  })
+}
+
+export function scoreAllIssues(workspaceId: string) {
+  return request<IssueQualityScore[]>(`/api/workspaces/${workspaceId}/quality/score-all`, {
+    method: 'POST',
+  })
+}
+
+export function findDuplicates(workspaceId: string, issueId: string) {
+  return request<DuplicateMatch[]>(`/api/workspaces/${workspaceId}/issues/${issueId}/duplicates`)
+}
+
+export function triageIssue(workspaceId: string, issueId: string) {
+  return request<TriageSuggestion>(`/api/workspaces/${workspaceId}/issues/${issueId}/triage`, {
+    method: 'POST',
+  })
+}
+
+export function triageAllIssues(workspaceId: string) {
+  return request<TriageSuggestion[]>(`/api/workspaces/${workspaceId}/triage/all`, {
+    method: 'POST',
+  })
 }
 
 export function promoteSignal(workspaceId: string, signalId: string, severity: string) {
