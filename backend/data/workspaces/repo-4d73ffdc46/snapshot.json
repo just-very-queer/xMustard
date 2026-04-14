@@ -101,7 +101,7 @@
       "source_id": "src_f3b8d51c2f",
       "kind": "tracker_issue",
       "label": "tracker_issues.json",
-      "path": "/Users/for_home/Developer/CoTitanMigration/Co_Titan_Bug_Tracker/backend/data/workspaces/repo-4d73ffdc46/tracker_issues.json",
+      "path": "/Users/for_home/Developer/xMustard/backend/data/workspaces/repo-4d73ffdc46/tracker_issues.json",
       "record_count": 1,
       "modified_at": "2026-03-30T19:17:29.042482+00:00",
       "notes": "Tracker-native issue records."
@@ -110,7 +110,7 @@
       "source_id": "src_076d953bee",
       "kind": "fix_record",
       "label": "fix_records.json",
-      "path": "/Users/for_home/Developer/CoTitanMigration/Co_Titan_Bug_Tracker/backend/data/workspaces/repo-4d73ffdc46/fix_records.json",
+      "path": "/Users/for_home/Developer/xMustard/backend/data/workspaces/repo-4d73ffdc46/fix_records.json",
       "record_count": 1,
       "modified_at": "2026-03-30T19:17:29.042504+00:00",
       "notes": "Agent and operator fix history."

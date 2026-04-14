@@ -1,15 +1,19 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useMemo, useState } from 'react'
 
 import { IssueQueueControls } from './IssueQueueControls'
 import { QueuePresetStrip, type QueuePreset } from './QueuePresetStrip'
 import { SavedViewStrip } from './SavedViewStrip'
-import { StatusPill, formatDate } from './TrackerPrimitives'
+import { StatusPill } from './TrackerPrimitives'
 import { WorkspaceActivityPanel } from './WorkspaceActivityPanel'
+import { formatDate } from '../lib/format'
 import type {
   ActivityRecord,
+  CostSummary,
   DiscoverySignal,
   IssueQueueFilters,
+  IssueQualityScore,
   IssueRecord,
+  RunMetrics,
   RunRecord,
   SavedIssueView,
   SourceRecord,
@@ -28,6 +32,9 @@ type Props = {
   treeNodes: TreeNode[]
   treePath: string
   activity: ActivityRecord[]
+  costSummary: CostSummary | null
+  issueQualityById: Record<string, IssueQualityScore>
+  runMetricsById: Record<string, RunMetrics>
   selectedIssueId: string | null
   selectedSignalId: string | null
   selectedRunId: string | null
@@ -107,6 +114,9 @@ export function QueuePane({
   treeNodes,
   treePath,
   activity,
+  costSummary,
+  issueQualityById,
+  runMetricsById,
   selectedIssueId,
   selectedSignalId,
   selectedRunId,
@@ -146,7 +156,7 @@ export function QueuePane({
   onActivityActorKindFilterChange,
   onNavigateTree,
 }: Props) {
-  const [page, setPage] = useState(0)
+  const [pageState, setPageState] = useState({ scope: '', value: 0 })
   const reviewRunIds = useMemo(() => new Set(issueQueue.flatMap((issue) => issue.review_ready_runs)), [issueQueue])
   const reviewRuns = useMemo(
     () => runs.filter((run) => reviewRunIds.has(run.run_id)),
@@ -167,11 +177,16 @@ export function QueuePane({
               ? treeNodes.length
               : activity.length
   const pageCount = Math.max(1, Math.ceil(totalCount / PAGE_SIZE))
-  const currentPage = Math.min(page, pageCount - 1)
+  const paginationScope = `${activeView}:${issueQueue.length}:${reviewRuns.length}:${signalQueue.length}:${runs.length}:${sources.length}:${treeNodes.length}:${activity.length}`
+  const currentPage = pageState.scope === paginationScope ? Math.min(pageState.value, pageCount - 1) : 0
 
-  useEffect(() => {
-    setPage(0)
-  }, [activeView, issueQueue.length, reviewRuns.length, signalQueue.length, runs.length, sources.length, treeNodes.length, activity.length])
+  function updatePage(nextValue: number | ((current: number) => number)) {
+    setPageState((current) => {
+      const currentValue = current.scope === paginationScope ? current.value : 0
+      const resolved = typeof nextValue === 'function' ? nextValue(currentValue) : nextValue
+      return { scope: paginationScope, value: resolved }
+    })
+  }
 
   const pagedIssues = useMemo(
     () => issueQueue.slice(currentPage * PAGE_SIZE, currentPage * PAGE_SIZE + PAGE_SIZE),
@@ -244,6 +259,7 @@ export function QueuePane({
           <div className="queue-table-head">
             <span>ID</span>
             <span>Severity</span>
+            <span>Quality</span>
             <span>Status</span>
             <span>{activeView === 'drift' ? 'Drift' : 'Doc / Code'}</span>
             <span>Title</span>
@@ -258,6 +274,9 @@ export function QueuePane({
               >
                 <strong className="issue-row-id">{issue.bug_id}</strong>
                 <span className={`pill pill-${issue.severity.toLowerCase()}`}>{issue.severity}</span>
+                <span className="issue-row-quality">
+                  {issueQualityById[issue.bug_id] ? `${Math.round(issueQualityById[issue.bug_id].overall)}%` : 'n/a'}
+                </span>
                 <span className={`pill pill-${issue.issue_status}`}>{issue.issue_status}</span>
                 <span className="issue-row-status">
                   {activeView === 'drift'
@@ -355,9 +374,19 @@ export function QueuePane({
               <div className="row-meta">
                 <StatusPill tone={run.status}>{run.status}</StatusPill>
                 <span>{run.model}</span>
+                <span>{runMetricsById[run.run_id] ? `$${runMetricsById[run.run_id].estimated_cost.toFixed(4)}` : 'cost n/a'}</span>
               </div>
             </button>
           ))}
+          {costSummary ? (
+            <div className="evidence-row queue-inline-summary">
+              <span>Workspace total</span>
+              <small>
+                ${costSummary.total_estimated_cost.toFixed(4)} · {costSummary.total_runs} runs ·{' '}
+                {costSummary.total_input_tokens + costSummary.total_output_tokens} tokens
+              </small>
+            </div>
+          ) : null}
         </div>
       ) : null}
 
@@ -436,7 +465,7 @@ export function QueuePane({
             Showing {pageStart}-{pageEnd} of {totalCount}
           </span>
           <div className="toolbar-row">
-            <button type="button" className="ghost-button" onClick={() => setPage((current) => Math.max(0, current - 1))} disabled={currentPage === 0}>
+            <button type="button" className="ghost-button" onClick={() => updatePage((current) => Math.max(0, current - 1))} disabled={currentPage === 0}>
               Prev
             </button>
             <span className="subtle">
@@ -445,7 +474,7 @@ export function QueuePane({
             <button
               type="button"
               className="ghost-button"
-              onClick={() => setPage((current) => Math.min(pageCount - 1, current + 1))}
+              onClick={() => updatePage((current) => Math.min(pageCount - 1, current + 1))}
               disabled={currentPage >= pageCount - 1}
             >
               Next

@@ -1,5 +1,5 @@
-import { formatDate } from './TrackerPrimitives'
-import type { ViewMode, WorkspaceRecord } from '../lib/types'
+import { formatDate } from '../lib/format'
+import type { RepoGuidanceRecord, ViewMode, WorkspaceRecord } from '../lib/types'
 
 type Props = {
   workspacePath: string
@@ -7,6 +7,8 @@ type Props = {
   selectedWorkspaceId?: string | null
   activeView: ViewMode
   loading: boolean
+  workspaceGuidance: RepoGuidanceRecord[]
+  verificationProfileCount: number
   onWorkspacePathChange: (value: string) => void
   onLoadWorkspace: () => void
   onScanWorkspace: () => void
@@ -21,6 +23,8 @@ export function WorkspaceSidebar({
   selectedWorkspaceId,
   activeView,
   loading,
+  workspaceGuidance,
+  verificationProfileCount,
   onWorkspacePathChange,
   onLoadWorkspace,
   onScanWorkspace,
@@ -28,6 +32,11 @@ export function WorkspaceSidebar({
   onChangeView,
   canScan,
 }: Props) {
+  const alwaysOnCount = workspaceGuidance.filter((item) => item.always_on).length
+  const instructionCount = workspaceGuidance.filter((item) =>
+    item.kind === 'agent_instructions' || item.kind === 'conventions',
+  ).length
+
   return (
     <aside className="left-rail">
       <div className="sidebar-intro">
@@ -89,6 +98,49 @@ export function WorkspaceSidebar({
           ))}
         </div>
       </div>
+
+      {selectedWorkspaceId ? (
+        <div className="sidebar-panel guidance-sidebar-panel">
+          <div className="panel-header">
+            <div>
+              <p className="eyebrow">Repo guidance</p>
+              <h4>{workspaceGuidance.length ? 'Guided workspace' : 'Needs setup'}</h4>
+            </div>
+            <span className={`status-chip ${workspaceGuidance.length ? 'status-chip-ok' : 'status-chip-warn'}`}>
+              {workspaceGuidance.length ? `${workspaceGuidance.length} files` : '0 files'}
+            </span>
+          </div>
+          {workspaceGuidance.length ? (
+            <>
+              <p className="subtle">The tracker found repo instructions and will attach them to runs and issue context.</p>
+              <div className="tag-row">
+                <span className="tag">Always on: {alwaysOnCount}</span>
+                <span className="tag">Instructions: {instructionCount}</span>
+                <span className="tag">Verification: {verificationProfileCount}</span>
+              </div>
+              <div className="guidance-sidebar-list">
+                {workspaceGuidance.slice(0, 3).map((item) => (
+                  <div key={item.guidance_id} className="guidance-sidebar-item">
+                    <strong>{item.title}</strong>
+                    <small>{item.path}</small>
+                  </div>
+                ))}
+              </div>
+            </>
+          ) : (
+            <>
+              <p className="subtle">Add one lightweight repo instruction file so runs stop relying on generic defaults.</p>
+              <div className="tag-row">
+                <span className="tag">Recommended: `AGENTS.md`</span>
+                <span className="tag">Optional: `CONVENTIONS.md`</span>
+              </div>
+              <button className="ghost-button" type="button" onClick={() => onChangeView('tree')}>
+                Open repo tree
+              </button>
+            </>
+          )}
+        </div>
+      ) : null}
     </aside>
   )
 }

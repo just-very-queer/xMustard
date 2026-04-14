@@ -1,5 +1,13 @@
 import type { Dispatch, SetStateAction } from 'react'
-import type { AppSettings, IssueContextPacket, LocalAgentCapabilities, RuntimeModel, IssueRecord, RuntimeProbeResult } from '../lib/types'
+import type {
+  AppSettings,
+  IssueContextPacket,
+  LocalAgentCapabilities,
+  RuntimeModel,
+  IssueRecord,
+  RuntimeProbeResult,
+  VerificationProfileRecord,
+} from '../lib/types'
 
 type Props = {
   runtime: 'codex' | 'opencode'
@@ -14,6 +22,17 @@ type Props = {
   runbookNameDraft: string
   runbookDescriptionDraft: string
   runbookTemplateDraft: string
+  verificationProfiles: VerificationProfileRecord[]
+  selectedVerificationProfileId: string
+  verificationProfileNameDraft: string
+  verificationProfileDescriptionDraft: string
+  verificationProfileTestCommandDraft: string
+  verificationProfileCoverageCommandDraft: string
+  verificationProfileCoveragePathDraft: string
+  verificationProfileCoverageFormatDraft: VerificationProfileRecord['coverage_format']
+  verificationProfileRuntimeDraft: string
+  verificationProfileRetryDraft: string
+  verificationProfileSourcePathsDraft: string
   settings: AppSettings | null
   terminalId: string | null
   terminalInput: string
@@ -35,6 +54,19 @@ type Props = {
   onApplySelectedRunbook: () => void
   onSaveRunbook: () => void
   onDeleteRunbook: () => void
+  onSelectedVerificationProfileChange: (value: string) => void
+  onVerificationProfileNameDraftChange: (value: string) => void
+  onVerificationProfileDescriptionDraftChange: (value: string) => void
+  onVerificationProfileTestCommandDraftChange: (value: string) => void
+  onVerificationProfileCoverageCommandDraftChange: (value: string) => void
+  onVerificationProfileCoveragePathDraftChange: (value: string) => void
+  onVerificationProfileCoverageFormatDraftChange: (value: VerificationProfileRecord['coverage_format']) => void
+  onVerificationProfileRuntimeDraftChange: (value: string) => void
+  onVerificationProfileRetryDraftChange: (value: string) => void
+  onVerificationProfileSourcePathsDraftChange: (value: string) => void
+  onApplySelectedVerificationProfile: () => void
+  onSaveVerificationProfile: () => void
+  onDeleteVerificationProfile: () => void
   onSettingsChange: Dispatch<SetStateAction<AppSettings | null>>
   onSaveSettings: () => void
   onRefreshCapabilities: () => void
@@ -62,6 +94,17 @@ export function ExecutionPane({
   runbookNameDraft,
   runbookDescriptionDraft,
   runbookTemplateDraft,
+  verificationProfiles,
+  selectedVerificationProfileId,
+  verificationProfileNameDraft,
+  verificationProfileDescriptionDraft,
+  verificationProfileTestCommandDraft,
+  verificationProfileCoverageCommandDraft,
+  verificationProfileCoveragePathDraft,
+  verificationProfileCoverageFormatDraft,
+  verificationProfileRuntimeDraft,
+  verificationProfileRetryDraft,
+  verificationProfileSourcePathsDraft,
   settings,
   terminalId,
   terminalInput,
@@ -83,6 +126,19 @@ export function ExecutionPane({
   onApplySelectedRunbook,
   onSaveRunbook,
   onDeleteRunbook,
+  onSelectedVerificationProfileChange,
+  onVerificationProfileNameDraftChange,
+  onVerificationProfileDescriptionDraftChange,
+  onVerificationProfileTestCommandDraftChange,
+  onVerificationProfileCoverageCommandDraftChange,
+  onVerificationProfileCoveragePathDraftChange,
+  onVerificationProfileCoverageFormatDraftChange,
+  onVerificationProfileRuntimeDraftChange,
+  onVerificationProfileRetryDraftChange,
+  onVerificationProfileSourcePathsDraftChange,
+  onApplySelectedVerificationProfile,
+  onSaveVerificationProfile,
+  onDeleteVerificationProfile,
   onSettingsChange,
   onSaveSettings,
   onRefreshCapabilities,
@@ -100,6 +156,7 @@ export function ExecutionPane({
     (capabilities?.runtimes ?? []).map((entry) => [entry.runtime, entry.available]),
   )
   const selectedRunbook = issueContextPacket?.available_runbooks.find((item) => item.runbook_id === selectedRunbookId) ?? null
+  const selectedVerificationProfile = verificationProfiles.find((item) => item.profile_id === selectedVerificationProfileId) ?? null
 
   return (
     <div className="panel run-panel">
@@ -292,6 +349,179 @@ export function ExecutionPane({
             </button>
             <button type="button" className="ghost-button" onClick={onDeleteRunbook} disabled={!selectedRunbook || selectedRunbook.built_in || loading}>
               Delete custom runbook
+            </button>
+          </div>
+        </div>
+      </section>
+
+      <section className="detail-section">
+        <h4>Verification profile</h4>
+        <div className="toolbar-row">
+          <label className="detail-section field-stack runbook-picker" htmlFor="selected-verification-profile">
+            <span className="filter-label">Selected profile</span>
+            <select
+              id="selected-verification-profile"
+              name="selected-verification-profile"
+              className="text-input"
+              value={selectedVerificationProfileId}
+              onChange={(event) => onSelectedVerificationProfileChange(event.target.value)}
+            >
+              {verificationProfiles.map((profile) => (
+                <option key={profile.profile_id} value={profile.profile_id}>
+                  {profile.name}
+                </option>
+              ))}
+            </select>
+          </label>
+          <button type="button" className="ghost-button" onClick={onApplySelectedVerificationProfile} disabled={!selectedVerificationProfile}>
+            Load verify instruction
+          </button>
+        </div>
+        {selectedVerificationProfile ? (
+          <>
+            <p className="subtle">
+              {selectedVerificationProfile.description || 'No description set.'}
+              {selectedVerificationProfile.built_in ? ' Built-in profile.' : ' Custom profile.'}
+            </p>
+            <div className="tag-row">
+              <span className="tag">format: {selectedVerificationProfile.coverage_format}</span>
+              <span className="tag">timeout: {selectedVerificationProfile.max_runtime_seconds}s</span>
+              <span className="tag">retries: {selectedVerificationProfile.retry_count}</span>
+            </div>
+          </>
+        ) : (
+          <p className="subtle">No verification profiles are available for this workspace yet.</p>
+        )}
+        <div className="detail-section runbook-editor">
+          <label className="detail-section field-stack" htmlFor="verification-profile-name">
+            <span className="filter-label">Profile name</span>
+            <input
+              id="verification-profile-name"
+              name="verification-profile-name"
+              className="text-input"
+              placeholder="Targeted pytest"
+              value={verificationProfileNameDraft}
+              onChange={(event) => onVerificationProfileNameDraftChange(event.target.value)}
+            />
+          </label>
+          <label className="detail-section field-stack" htmlFor="verification-profile-description">
+            <span className="filter-label">Description</span>
+            <input
+              id="verification-profile-description"
+              name="verification-profile-description"
+              className="text-input"
+              placeholder="When to use this verification profile"
+              value={verificationProfileDescriptionDraft}
+              onChange={(event) => onVerificationProfileDescriptionDraftChange(event.target.value)}
+            />
+          </label>
+          <label className="detail-section field-stack" htmlFor="verification-profile-test-command">
+            <span className="filter-label">Test command</span>
+            <textarea
+              id="verification-profile-test-command"
+              name="verification-profile-test-command"
+              className="text-area"
+              rows={3}
+              placeholder="pytest tests/test_bug.py -q"
+              value={verificationProfileTestCommandDraft}
+              onChange={(event) => onVerificationProfileTestCommandDraftChange(event.target.value)}
+            />
+          </label>
+          <label className="detail-section field-stack" htmlFor="verification-profile-coverage-command">
+            <span className="filter-label">Coverage command</span>
+            <textarea
+              id="verification-profile-coverage-command"
+              name="verification-profile-coverage-command"
+              className="text-area"
+              rows={2}
+              placeholder="coverage run -m pytest && coverage xml"
+              value={verificationProfileCoverageCommandDraft}
+              onChange={(event) => onVerificationProfileCoverageCommandDraftChange(event.target.value)}
+            />
+          </label>
+          <div className="toolbar-row">
+            <label className="detail-section field-stack" htmlFor="verification-profile-coverage-path">
+              <span className="filter-label">Coverage report path</span>
+              <input
+                id="verification-profile-coverage-path"
+                name="verification-profile-coverage-path"
+                className="text-input"
+                placeholder="coverage.xml"
+                value={verificationProfileCoveragePathDraft}
+                onChange={(event) => onVerificationProfileCoveragePathDraftChange(event.target.value)}
+              />
+            </label>
+            <label className="detail-section field-stack" htmlFor="verification-profile-coverage-format">
+              <span className="filter-label">Coverage format</span>
+              <select
+                id="verification-profile-coverage-format"
+                name="verification-profile-coverage-format"
+                className="text-input"
+                value={verificationProfileCoverageFormatDraft}
+                onChange={(event) =>
+                  onVerificationProfileCoverageFormatDraftChange(event.target.value as VerificationProfileRecord['coverage_format'])
+                }
+              >
+                {['unknown', 'cobertura', 'jacoco', 'lcov', 'go'].map((format) => (
+                  <option key={format} value={format}>
+                    {format}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
+          <div className="toolbar-row">
+            <label className="detail-section field-stack" htmlFor="verification-profile-timeout">
+              <span className="filter-label">Timeout seconds</span>
+              <input
+                id="verification-profile-timeout"
+                name="verification-profile-timeout"
+                className="text-input"
+                inputMode="numeric"
+                placeholder="30"
+                value={verificationProfileRuntimeDraft}
+                onChange={(event) => onVerificationProfileRuntimeDraftChange(event.target.value)}
+              />
+            </label>
+            <label className="detail-section field-stack" htmlFor="verification-profile-retries">
+              <span className="filter-label">Retries</span>
+              <input
+                id="verification-profile-retries"
+                name="verification-profile-retries"
+                className="text-input"
+                inputMode="numeric"
+                placeholder="1"
+                value={verificationProfileRetryDraft}
+                onChange={(event) => onVerificationProfileRetryDraftChange(event.target.value)}
+              />
+            </label>
+          </div>
+          <label className="detail-section field-stack" htmlFor="verification-profile-source-paths">
+            <span className="filter-label">Focus paths</span>
+            <input
+              id="verification-profile-source-paths"
+              name="verification-profile-source-paths"
+              className="text-input"
+              placeholder="backend/tests, frontend/src/components"
+              value={verificationProfileSourcePathsDraft}
+              onChange={(event) => onVerificationProfileSourcePathsDraftChange(event.target.value)}
+            />
+          </label>
+          <div className="toolbar-row">
+            <button
+              type="button"
+              onClick={onSaveVerificationProfile}
+              disabled={!workspaceLoaded || loading || !verificationProfileNameDraft.trim() || !verificationProfileTestCommandDraft.trim()}
+            >
+              Save verification profile
+            </button>
+            <button
+              type="button"
+              className="ghost-button"
+              onClick={onDeleteVerificationProfile}
+              disabled={!selectedVerificationProfile || selectedVerificationProfile.built_in || loading}
+            >
+              Delete custom profile
             </button>
           </div>
         </div>

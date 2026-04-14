@@ -15,6 +15,7 @@ from .models import (
     GitHubPRCreate,
     IntegrationTestRequest,
     IssueCreateRequest,
+    IssueContextReplayRequest,
     IssueUpdateRequest,
     PlanApproveRequest,
     PlanRejectRequest,
@@ -25,9 +26,12 @@ from .models import (
     RunbookUpsertRequest,
     RunRequest,
     SavedIssueViewRequest,
+    ThreatModelUpsertRequest,
+    TicketContextUpsertRequest,
     TerminalOpenRequest,
     TerminalResizeRequest,
     TerminalWriteRequest,
+    VerificationProfileUpsertRequest,
     VerifyIssueRequest,
     WorkspaceLoadRequest,
 )
@@ -288,6 +292,31 @@ def save_runbook(workspace_id: str, request: RunbookUpsertRequest):
         raise HTTPException(status_code=404, detail="Workspace not found")
 
 
+@app.get("/api/workspaces/{workspace_id}/verification-profiles")
+def list_verification_profiles(workspace_id: str):
+    try:
+        return [item.model_dump(mode="json") for item in SERVICE.list_verification_profiles(workspace_id)]
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+
+
+@app.post("/api/workspaces/{workspace_id}/verification-profiles")
+def save_verification_profile(workspace_id: str, request: VerificationProfileUpsertRequest):
+    try:
+        return SERVICE.save_verification_profile(workspace_id, request).model_dump(mode="json")
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+
+
+@app.delete("/api/workspaces/{workspace_id}/verification-profiles/{profile_id}")
+def delete_verification_profile(workspace_id: str, profile_id: str):
+    try:
+        SERVICE.delete_verification_profile(workspace_id, profile_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"Missing resource: {exc}")
+    return {"ok": True, "profile_id": profile_id}
+
+
 @app.delete("/api/workspaces/{workspace_id}/runbooks/{runbook_id}")
 def delete_runbook(workspace_id: str, runbook_id: str):
     try:
@@ -338,6 +367,22 @@ def list_tree(workspace_id: str, relative_path: str = Query(default="")):
         raise HTTPException(status_code=404, detail="Workspace not found")
 
 
+@app.get("/api/workspaces/{workspace_id}/guidance")
+def list_guidance(workspace_id: str):
+    try:
+        return [item.model_dump(mode="json") for item in SERVICE.list_workspace_guidance(workspace_id)]
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+
+
+@app.get("/api/workspaces/{workspace_id}/repo-map")
+def read_repo_map(workspace_id: str):
+    try:
+        return SERVICE.read_repo_map(workspace_id).model_dump(mode="json")
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+
+
 @app.get("/api/workspaces/{workspace_id}/issues/{issue_id}/context")
 def issue_context(workspace_id: str, issue_id: str):
     try:
@@ -350,6 +395,76 @@ def issue_context(workspace_id: str, issue_id: str):
 def issue_work(workspace_id: str, issue_id: str, runbook_id: Optional[str] = Query(default=None)):
     try:
         return SERVICE.issue_work(workspace_id, issue_id, runbook_id=runbook_id).model_dump(mode="json")
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"Missing resource: {exc}")
+
+
+@app.get("/api/workspaces/{workspace_id}/issues/{issue_id}/ticket-context")
+def list_ticket_context(workspace_id: str, issue_id: str):
+    try:
+        return [item.model_dump(mode="json") for item in SERVICE.list_ticket_contexts(workspace_id, issue_id)]
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"Missing resource: {exc}")
+
+
+@app.post("/api/workspaces/{workspace_id}/issues/{issue_id}/ticket-context")
+def save_ticket_context(workspace_id: str, issue_id: str, request: TicketContextUpsertRequest):
+    try:
+        return SERVICE.save_ticket_context(workspace_id, issue_id, request).model_dump(mode="json")
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"Missing resource: {exc}")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.delete("/api/workspaces/{workspace_id}/issues/{issue_id}/ticket-context/{context_id}")
+def delete_ticket_context(workspace_id: str, issue_id: str, context_id: str):
+    try:
+        SERVICE.delete_ticket_context(workspace_id, issue_id, context_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"Missing resource: {exc}")
+    return {"ok": True, "context_id": context_id}
+
+
+@app.get("/api/workspaces/{workspace_id}/issues/{issue_id}/threat-models")
+def list_threat_models(workspace_id: str, issue_id: str):
+    try:
+        return [item.model_dump(mode="json") for item in SERVICE.list_threat_models(workspace_id, issue_id)]
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"Missing resource: {exc}")
+
+
+@app.post("/api/workspaces/{workspace_id}/issues/{issue_id}/threat-models")
+def save_threat_model(workspace_id: str, issue_id: str, request: ThreatModelUpsertRequest):
+    try:
+        return SERVICE.save_threat_model(workspace_id, issue_id, request).model_dump(mode="json")
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"Missing resource: {exc}")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.delete("/api/workspaces/{workspace_id}/issues/{issue_id}/threat-models/{threat_model_id}")
+def delete_threat_model(workspace_id: str, issue_id: str, threat_model_id: str):
+    try:
+        SERVICE.delete_threat_model(workspace_id, issue_id, threat_model_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"Missing resource: {exc}")
+    return {"ok": True, "threat_model_id": threat_model_id}
+
+
+@app.get("/api/workspaces/{workspace_id}/issues/{issue_id}/context-replays")
+def list_issue_context_replays(workspace_id: str, issue_id: str):
+    try:
+        return [item.model_dump(mode="json") for item in SERVICE.list_issue_context_replays(workspace_id, issue_id)]
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"Missing resource: {exc}")
+
+
+@app.post("/api/workspaces/{workspace_id}/issues/{issue_id}/context-replays")
+def capture_issue_context_replay(workspace_id: str, issue_id: str, request: IssueContextReplayRequest):
+    try:
+        return SERVICE.capture_issue_context_replay(workspace_id, issue_id, request).model_dump(mode="json")
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=f"Missing resource: {exc}")
 
@@ -424,6 +539,14 @@ def list_runs(workspace_id: str):
 def get_run(workspace_id: str, run_id: str):
     try:
         return SERVICE.get_run(workspace_id, run_id)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+
+@app.get("/api/workspaces/{workspace_id}/runs/{run_id}/insights")
+def get_run_insights(workspace_id: str, run_id: str):
+    try:
+        return SERVICE.get_run_session_insight(workspace_id, run_id)
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="Run not found")
 
@@ -518,6 +641,14 @@ def reject_plan(workspace_id: str, run_id: str, request: PlanRejectRequest):
 def get_run_metrics(workspace_id: str, run_id: str):
     try:
         return SERVICE.get_run_metrics(workspace_id, run_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
+@app.get("/api/workspaces/{workspace_id}/metrics")
+def list_workspace_metrics(workspace_id: str):
+    try:
+        return SERVICE.list_workspace_metrics(workspace_id)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
 

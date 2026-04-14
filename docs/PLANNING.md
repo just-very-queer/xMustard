@@ -1,216 +1,316 @@
-# Planning: xMustard Enhancement Roadmap
+# Planning
 
-## Overview
+This roadmap reflects the current state of xMustard, not the original alpha sketch.
 
-This document outlines the implementation plan for enhancing Co_Titan_Bug_Tracker into **Project xMustard**, incorporating features inspired by 11 leading AI coding agent projects.
+## Current Status
 
-## Phase 1: Foundation (Alpha)
+Estimated implementation progress:
 
-### 1.1 Project Rename
-- [x] Rename project to "xMustard" in all files
-- [x] Update README.md
-- [x] Update ARCHITECTURE.md
-- [ ] Update package.json, pyproject.toml
-- [ ] Update all internal references
+- backend capability: `75-85%`
+- frontend surfacing: `50-60%`
+- overall roadmap: `60-70%`
 
-### 1.2 Branch Creation
-- [x] Created branch: `alpha.test.001.ideation.architecture.o1`
+The main gap is no longer raw backend functionality. The biggest remaining work is productizing the guidance, verification, and evaluation layers more completely.
 
-## Phase 2: Planning Checkpoint System
+## Strategic Direction
 
-Inspired by SWE-agent, AutoCodeRover
+xMustard should compete as an issue-operations system with strong evidence, governance, and workflow fit, not as a generic agent shell.
 
-### 2.1 Plan Generation
-- [ ] Add `planning` field to RunRecord model
-- [ ] Create `/api/runs/{run_id}/plan` endpoint
-- [ ] Implement planning prompt template
-- [ ] Store plan in run record for UI display
+That means the roadmap now optimizes for:
 
-### 2.2 Plan Approval UI
-- [ ] Add plan preview panel in ExecutionPane
-- [ ] Implement Approve/Modify/Cancel buttons
-- [ ] Add plan modification textarea
-- [ ] Connect to backend plan approval endpoint
+- better context quality instead of broader heuristic scanning
+- stronger verification and replay instead of one-off runs
+- clearer trust, security, and compliance artifacts
+- better workflow embedding for ticket systems and team operations
+- an incremental backend migration path away from the current Python-heavy core
 
-### 2.3 Plan-Aware Execution
-- [ ] Modify runtimes.py to wait for plan approval
-- [ ] Add `wait_for_approval` flag to RunRequest
-- [ ] Implement execution resume after approval
+## Implemented Foundations
 
-**Backend files to modify:**
-- `backend/app/models.py` - Add PlanPhase enum, planning fields
-- `backend/app/service.py` - Add plan generation, approval logic
-- `backend/app/runtimes.py` - Add approval gate
-- `backend/app/main.py` - Add plan endpoints
+### Done or largely done
 
-**Frontend files to modify:**
-- `frontend/src/components/ExecutionPane.tsx` - Plan preview UI
-- `frontend/src/lib/api.ts` - Plan approval API calls
-- `frontend/src/lib/types.ts` - Plan types
+- project rename and xMustard product framing
+- workspace loading, snapshots, JSON-backed persistence
+- issue queue, signals, drift, activity, saved views
+- runtime abstraction for local coding agents
+- plan generation, approval, rejection, and planning-gated execution
+- run metrics and workspace cost aggregation
+- issue quality scoring, duplicate detection, and triage suggestions
+- coverage delta, test suggestions, patch critique, and improvement suggestions
+- repo guidance discovery and run insights
 
-## Phase 3: Cost Tracking
+### Recently added
 
-Inspired by OpenHands Metrics, SWE-agent InstanceStats
+- detected guidance files now surface in the UI
+- missing guidance now gets onboarding prompts
+- OpenHands-style `.openhands/microagents/repo.md` files are recognized as repo guidance
+- saved workspace verification profiles now surface in the execution drawer and issue detail
+- issue-level ticket context now attaches upstream links, summaries, and acceptance criteria to issue packets
+- issue-context replay snapshots now capture prompt state for later eval and comparison
+- workspace repo maps now persist structural summaries and ranked related paths for issue packets
 
-### 3.1 Metrics Model
-- [ ] Add `RunMetrics` model to models.py
-- [ ] Add `metrics` field to RunRecord
-- [ ] Update cost_usd calculation in runtimes.py
+## Research-Driven Next Phases
 
-### 3.2 Token Counting
-- [ ] Add token counting to runtime calls
-- [ ] Store prompt/completion token breakdown
-- [ ] Calculate USD cost using model pricing
+## Phase A: Guidance Authoring
 
-### 3.3 Cost Dashboard UI
-- [ ] Create CostSummary component
-- [ ] Add cost column to run list
-- [ ] Display per-issue cost breakdown
-- [ ] Add workspace total cost display
+Inspired by `OpenHands`, `cline`, and `OpenHands Resolver`.
 
-**Backend files to modify:**
-- `backend/app/models.py` - Add RunMetrics
-- `backend/app/runtimes.py` - Add token counting
-- `backend/app/service.py` - Aggregate cost data
+Goal:
 
-**Frontend files to create/modify:**
-- `frontend/src/components/CostSummary.tsx` (new)
-- `frontend/src/components/QueuePane.tsx` - Add cost column
-- `frontend/src/App.tsx` - Add cost tab
+- turn repo guidance from passive discovery into an active setup workflow
 
-## Phase 4: Triage Automation
+Build:
 
-Inspired by trIAge, PR-Agent
+- generate starter `AGENTS.md`
+- generate starter `.openhands/microagents/repo.md`
+- optionally generate `CONVENTIONS.md`
+- show missing or stale guidance health in the workspace
 
-### 4.1 Issue Quality Scoring
-- [ ] Add `IssueQualityScore` model
-- [ ] Implement completeness checker (has repro, severity, evidence?)
-- [ ] Implement clarity scorer (title, description quality)
-- [ ] Calculate overall quality score on scan
+Success looks like:
 
-### 4.2 Duplicate Detection
-- [ ] Add similarity scoring between issues
-- [ ] Implement fingerprinting for exact duplicates
-- [ ] Add "similar issues" suggestions
-- [ ] Display duplicate warnings on create
+- a new workspace can become guidance-ready in one or two clicks
 
-### 4.3 Auto-Triage Suggestions
-- [ ] Severity auto-suggestion based on impact
-- [ ] Label suggestion based on code patterns
-- [ ] Assign to suggested owner based on git blame
+## Phase B: Repo Map And Dynamic Context
 
-**Backend files to modify:**
-- `backend/app/models.py` - Add IssueQualityScore
-- `backend/app/scanners.py` - Add quality scoring
-- `backend/app/service.py` - Add triage methods
+Inspired by `aider` and `pr-agent`.
 
-## Phase 5: Verification Enhancement
+Goal:
 
-Inspired by Qodo Cover
+- reduce prompt noise by attaching structural context instead of raw file volume
 
-### 5.1 Coverage Tracking
-- [ ] Add coverage parsing for common formats (Cobertura, JaCoCo)
-- [ ] Store baseline coverage on workspace load
-- [ ] Run coverage after fix verification
+Build:
 
-### 5.2 Coverage Delta Display
-- [ ] Add `CoverageResult` model
-- [ ] Calculate delta in verification
-- [ ] Display coverage improvement in UI
+- workspace repo map summary
+- top symbols and directories for a bug or run
+- file and symbol relevance ranking for issue context packets
+- dynamic context expansion around touched functions or classes
 
-### 5.3 Test Generation Suggestions
-- [ ] Add suggested tests to FixRecord
-- [ ] Prompt agent to add tests in plan
-- [ ] Track tests_added per issue
+Current state:
 
-**Backend files to modify:**
-- `backend/app/models.py` - Add CoverageResult
-- `backend/app/service.py` - Add coverage methods
-- `backend/app/runtimes.py` - Add coverage run step
+- workspace repo-map summaries now persist top directories, extension mix, and notable files
+- issue packets now carry ranked related paths and structural context in the prompt
+- the issue detail pane now shows repo-map summaries and related paths
 
-## Phase 6: Post-Run Review Artifacts
+Success looks like:
 
-Inspired by PR-Agent
+- lower token use and stronger run quality for the same issues
 
-### 6.1 Patch Critique
-- [ ] Add patch_review field to FixRecord
-- [ ] Generate critique after run completion
-- [ ] Store critique in fix_records.json
+## Phase C: Ticket Context And Acceptance Criteria
 
-### 6.2 Improvement Suggestions
-- [ ] Analyze code for potential improvements
-- [ ] Suggest refactoring opportunities
-- [ ] Add suggestions to verification record
+Inspired by `pr-agent` and `OpenHands Resolver`.
 
-### 6.3 Review UI
-- [ ] Add critique panel to FixRecord display
-- [ ] Show improvement suggestions
-- [ ] Allow dismiss/accept per suggestion
+Goal:
 
-## Phase 7: External Integrations
+- make issue context richer than the local tracker alone
 
-Inspired by OpenHands, PR-Agent
+Build:
 
-### 7.1 GitHub Integration
-- [ ] Add GitHub provider abstraction
-- [ ] Import issues from GitHub
-- [ ] Create PR from accepted fix
+- import or attach ticket acceptance criteria
+- capture linked PR, issue, or incident references
+- show external context in issue packets and run briefs
+- keep imported ticket context inspectable and durable
 
-### 7.2 Slack Integration
-- [ ] Add Slack webhook support
-- [ ] Notify on run completion
-- [ ] Notify on verification success/failure
+Current state:
 
-### 7.3 Linear/Jira Integration
-- [ ] Sync issues bidirectionally
-- [ ] Map status between systems
-- [ ] Preserve labels and metadata
+- durable ticket-context records now exist per issue
+- GitHub imports seed ticket context automatically
+- issue packets and prompts now carry acceptance criteria and links
+- the issue detail pane now supports manual curation and editing
 
-## Implementation Priority
+Success looks like:
 
-| Priority | Feature | Phase | Effort |
-|----------|---------|-------|--------|
-| 1 | Planning checkpoint system | Phase 2 | Medium |
-| 2 | Cost tracking | Phase 3 | Low |
-| 3 | Issue quality scoring | Phase 4 | Medium |
-| 4 | Coverage tracking | Phase 5 | Medium |
-| 5 | Post-run review | Phase 6 | Low |
-| 6 | GitHub integration | Phase 7 | Medium |
+- xMustard can explain not just the bug, but the product expectation the fix is supposed to satisfy
 
-## File Change Summary
+## Phase D: Verification Replay And Checklists
 
-### Backend Changes
+Inspired by `qodo-cover` and `aider`.
 
-| File | Changes |
-|------|---------|
-| `app/models.py` | +RunMetrics, +IssueQualityScore, +CoverageResult, +PlanPhase |
-| `app/service.py` | +plan_generation(), +cost_aggregation(), +triage_methods() |
-| `app/runtimes.py` | +approval_gate(), +token_counting(), +coverage_step() |
-| `app/main.py` | +POST /runs/{id}/plan, +POST /runs/{id}/approve_plan |
-| `app/cli.py` | +plan command, +cost command |
+Goal:
 
-### Frontend Changes
+- make verification reproducible and auditable
 
-| File | Changes |
-|------|---------|
-| `App.tsx` | +CostDashboard tab, +PlanApproval modal |
-| `ExecutionPane.tsx` | +Plan preview, +Approve/Modify buttons |
-| `CostSummary.tsx` | New component |
-| `QueuePane.tsx` | +Cost column, +Quality indicators |
-| `types.ts` | +RunMetrics, +PlanPhase, +CoverageResult |
-| `api.ts` | +plan approval API, +cost API |
+Build:
 
-## Testing
+- verification checklist on runs and fixes
+- optional replay mode for verification runs
+- stored pass or fail outcomes per verification profile
+- profile-level reporting for validation confidence
 
-- [ ] Unit tests for new models
-- [ ] Integration tests for plan approval flow
-- [ ] Integration tests for cost calculation
-- [ ] UI tests for new components
+Current state:
 
-## Documentation
+- issue-context replay capture now exists as the first stored replay artifact
+- prompt snapshots can be saved from the issue detail pane for later comparison
 
-- [x] README.md updated
-- [x] ARCHITECTURE.md updated
-- [ ] PLANNING.md (this file)
-- [ ] FEATURES.md (detailed feature specs)
-- [ ] CHANGELOG.md (version history)
+Success looks like:
+
+- xMustard can reliably answer whether a fix was merely generated or actually validated
+
+## Phase E: Eval And Replay Harness
+
+Inspired by `SWE-agent`, `aider`, and `qodo-cover`.
+
+Goal:
+
+- measure whether xMustard is getting better
+
+Build:
+
+- saved evaluation scenarios
+- replay of issue context generation and run insights
+- regression suite for guidance discovery, planning quality, and verification outcomes
+- workspace-level reporting for cost, success rate, and verification quality
+
+Success looks like:
+
+- product changes can be judged by outcome, not intuition
+
+## Phase F: Threat Modeling And Security Review
+
+Inspired by secure SDLC workflows and enterprise engineering review.
+
+Goal:
+
+- make security reasoning a first-class artifact instead of an afterthought
+
+Build:
+
+- issue-level threat models with assets, trust boundaries, and abuse paths
+- security acceptance criteria attached to ticket context
+- security review artifacts on runs
+- dependency, secret, and auth-risk checkpoints in run review
+
+Current state:
+
+- issue-level threat models can now be saved as durable workspace artifacts
+- threat models are attached to issue context packets and operator prompts
+- the issue detail pane now supports threat-model editing for assets, entry points, abuse cases, and mitigations
+
+Success looks like:
+
+- xMustard can explain not only whether a change works, but whether it changes the system risk profile safely
+
+## Phase G: Confidence And Ticket Compliance
+
+Inspired by `Devin`, `pr-agent`, and `Qodo Merge`.
+
+Goal:
+
+- make the system explicit about how sure it is and whether a change actually satisfies the upstream request
+
+Build:
+
+- run-level confidence scoring
+- verification confidence per saved profile
+- acceptance-criteria compliance review
+- unrelated-change detection and scope warnings
+
+Success looks like:
+
+- runs produce a durable answer to "is this fixed?" and "does this satisfy the ticket?" instead of leaving that implicit
+
+## Phase H: Semantic Retrieval And Issue Intelligence
+
+Inspired by `Linear`, `aider`, and `pr-agent`.
+
+Goal:
+
+- retrieve the right operational context across issues, runs, comments, tickets, and repo structure
+
+Build:
+
+- hybrid semantic and keyword search
+- cross-artifact retrieval across issues, runs, ticket context, and review data
+- better duplicate clustering and owner suggestions
+- context expansion informed by symbol and ticket relationships
+
+Success looks like:
+
+- operators can find the most relevant prior run, ticket, or file without manually hunting through the workspace
+
+## Phase I: Agent Operations, Insights, And Governance
+
+Inspired by `Linear` and `Devin`.
+
+Goal:
+
+- make agents operate like visible teammates inside a governed system
+
+Build:
+
+- agent identity and ownership history on runs
+- success, cost, and verification dashboards by runtime and workflow
+- audit trails for approvals, sync, and execution
+- policy gates for runtime choice, verification requirements, and sensitive workspaces
+
+Success looks like:
+
+- teams can trust and manage xMustard operationally, not just use it as a clever local tool
+
+## Phase J: Review And Export Flows
+
+Inspired by `pr-agent` and `OpenHands Resolver`.
+
+Goal:
+
+- make run output easier to consume outside the app
+
+Build:
+
+- PR-style review packet export
+- human-readable fix brief
+- run acceptance checklist
+- optional provider integrations for GitHub and Linear once internal flows are solid
+
+Success looks like:
+
+- a successful run can become a clean handoff artifact
+
+## Phase K: Backend Migration Away From Python
+
+Goal:
+
+- move the backend core toward a Rust-based implementation without freezing product work or breaking the current UI
+
+Why this is on the roadmap:
+
+- the current Python backend is productive, but long-term performance, packaging, concurrency, and binary distribution would improve with a compiled core
+- repo indexing, semantic retrieval, verification orchestration, and policy-heavy execution are good candidates for Rust services
+
+Migration approach:
+
+- keep the frontend and API contracts stable first
+- isolate domain contracts and persistence formats before rewriting internals
+- migrate the most compute-heavy or reliability-sensitive subsystems first
+- avoid a flag-day rewrite of the entire product
+
+Planned stages:
+
+1. define stable service boundaries for scanning, repo-map generation, search, verification execution, and runtime orchestration
+2. move scanners, repo-map building, and search indexing into a Rust sidecar or library-backed service
+3. move verification execution and artifact generation into Rust for stronger process control
+4. evaluate replacing the FastAPI orchestration layer with a Rust HTTP service once the core subsystems are proven
+
+Success looks like:
+
+- xMustard gains a faster, more portable backend core without losing its existing evidence model or UI velocity
+
+## Priority Order
+
+1. Guidance authoring
+2. Repo map and dynamic context
+3. Ticket context and acceptance criteria
+4. Verification replay and checklists
+5. Eval and replay harness
+6. Threat modeling and security review
+7. Confidence and ticket compliance
+8. Semantic retrieval and issue intelligence
+9. Agent operations, insights, and governance
+10. Review and export flows
+11. Backend migration away from Python
+
+## Docs To Keep In Sync
+
+- `README.md`
+- `docs/ARCHITECTURE.md`
+- `docs/FEATURES.md`
+- `docs/CHANGELOG.md`
+- `docs/RESEARCH_FINDINGS.md`

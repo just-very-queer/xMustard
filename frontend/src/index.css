@@ -115,6 +115,10 @@ button:disabled {
   grid-template-columns: repeat(6, minmax(0, 1fr));
 }
 
+.analysis-summary-grid {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
 .board-grid {
   display: grid;
   gap: 0.9rem;
@@ -343,6 +347,11 @@ h4 {
   background: rgba(116, 99, 76, 0.1);
 }
 
+.tag-warning {
+  background: rgba(191, 145, 53, 0.14);
+  border-color: rgba(191, 145, 53, 0.2);
+}
+
 .text-input,
 .text-area {
   width: 100%;
@@ -457,6 +466,12 @@ h4 {
   display: flex;
   flex-direction: column;
   gap: 0.65rem;
+}
+
+.analysis-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
 }
 
 .activity-entry {
@@ -670,10 +685,57 @@ h4 {
   color: #9d4030;
 }
 
+.status-chip-warn {
+  border-color: rgba(184, 126, 36, 0.28);
+  background: rgba(184, 126, 36, 0.12);
+  color: #88591a;
+}
+
+.guidance-sidebar-panel,
+.guidance-empty-state {
+  background:
+    linear-gradient(180deg, rgba(244, 232, 208, 0.38), rgba(252, 251, 248, 0.9)),
+    #fcfbf8;
+}
+
+.guidance-sidebar-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.guidance-sidebar-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+}
+
+.guidance-sidebar-item {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  padding: 0.62rem 0.7rem;
+  border-radius: 10px;
+  border: 1px solid #e1dbcf;
+  background: rgba(255, 255, 255, 0.68);
+}
+
+.guidance-sidebar-item small {
+  color: #726a5f;
+  word-break: break-word;
+}
+
+.guidance-empty-state {
+  display: flex;
+  flex-direction: column;
+  gap: 0.85rem;
+  border-color: rgba(184, 126, 36, 0.22);
+}
+
 .queue-table-head,
 .issue-table-row {
   display: grid;
-  grid-template-columns: 136px 76px 110px 132px minmax(0, 1fr);
+  grid-template-columns: 136px 76px 84px 110px 132px minmax(0, 1fr);
   gap: 0.7rem;
   align-items: center;
 }
@@ -703,6 +765,17 @@ h4 {
 .issue-row-status {
   color: #554c40;
   font-size: 0.8rem;
+}
+
+.issue-row-quality {
+  font-family: "IBM Plex Mono", "SFMono-Regular", monospace;
+  font-size: 0.78rem;
+  color: #4d453a;
+}
+
+.queue-inline-summary {
+  margin-top: 0.2rem;
+  background: #f1ede6;
 }
 
 .issue-row-title {
@@ -771,6 +844,11 @@ h4 {
   .workspace-focus,
   .agent-dock-header {
     flex-direction: column;
+  }
+
+  .analysis-summary-grid,
+  .summary-grid {
+    grid-template-columns: 1fr 1fr;
   }
 
   .queue-table-head,

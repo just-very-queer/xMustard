@@ -24,6 +24,11 @@ FixStatus = Literal["proposed", "in_review", "applied", "verified", "rejected"]
 RunReviewDisposition = Literal["dismissed", "investigation_only"]
 RunbookScope = Literal["issue", "workspace"]
 VerificationState = Literal["yes", "no", "unknown"]
+GuidanceKind = Literal["agent_instructions", "conventions", "repo_index", "skill", "workspace_overview"]
+CoverageFormat = Literal["unknown", "cobertura", "jacoco", "lcov", "go"]
+TicketProvider = Literal["github", "jira", "linear", "manual", "incident", "other"]
+ThreatModelMethodology = Literal["manual", "stride", "threat_dragon", "pytm", "threagile", "attack_path"]
+ThreatModelStatus = Literal["draft", "reviewed", "accepted"]
 
 
 def utc_now() -> str:
@@ -168,12 +173,37 @@ class SavedIssueView(BaseModel):
 
 class SourceRecord(BaseModel):
     source_id: str
-    kind: Literal["ledger", "verdict_bundle", "scanner", "tracker_issue", "fix_record"]
+    kind: Literal["ledger", "verdict_bundle", "scanner", "tracker_issue", "fix_record", "ticket_context", "threat_model", "repo_map"]
     label: str
     path: str
     record_count: int
     modified_at: Optional[str] = None
     notes: Optional[str] = None
+
+
+class RepoMapDirectoryRecord(BaseModel):
+    path: str
+    file_count: int = 0
+    source_file_count: int = 0
+    test_file_count: int = 0
+
+
+class RepoMapFileRecord(BaseModel):
+    path: str
+    role: Literal["guide", "config", "entry", "test", "source"] = "source"
+    size_bytes: Optional[int] = None
+
+
+class RepoMapSummary(BaseModel):
+    workspace_id: str
+    root_path: str
+    total_files: int = 0
+    source_files: int = 0
+    test_files: int = 0
+    top_extensions: dict[str, int] = Field(default_factory=dict)
+    top_directories: list[RepoMapDirectoryRecord] = Field(default_factory=list)
+    key_files: list[RepoMapFileRecord] = Field(default_factory=list)
+    generated_at: str = Field(default_factory=utc_now)
 
 
 class RuntimeModel(BaseModel):
@@ -298,6 +328,7 @@ class RunRecord(BaseModel):
     error: Optional[str] = None
     runbook_id: Optional[str] = None
     worktree: Optional[WorktreeStatus] = None
+    guidance_paths: list[str] = Field(default_factory=list)
     summary: Optional[dict] = None
     plan: Optional[RunPlan] = None
 
@@ -342,6 +373,71 @@ class RunbookRecord(BaseModel):
     built_in: bool = False
     created_at: str = Field(default_factory=utc_now)
     updated_at: str = Field(default_factory=utc_now)
+
+
+class VerificationProfileRecord(BaseModel):
+    profile_id: str
+    workspace_id: str
+    name: str
+    description: str = ""
+    test_command: str
+    coverage_command: Optional[str] = None
+    coverage_report_path: Optional[str] = None
+    coverage_format: CoverageFormat = "unknown"
+    max_runtime_seconds: int = 30
+    retry_count: int = 1
+    source_paths: list[str] = Field(default_factory=list)
+    built_in: bool = False
+    created_at: str = Field(default_factory=utc_now)
+    updated_at: str = Field(default_factory=utc_now)
+
+
+class TicketContextRecord(BaseModel):
+    context_id: str
+    workspace_id: str
+    issue_id: str
+    provider: TicketProvider = "manual"
+    external_id: Optional[str] = None
+    title: str
+    summary: str = ""
+    acceptance_criteria: list[str] = Field(default_factory=list)
+    links: list[str] = Field(default_factory=list)
+    labels: list[str] = Field(default_factory=list)
+    status: Optional[str] = None
+    source_excerpt: Optional[str] = None
+    created_at: str = Field(default_factory=utc_now)
+    updated_at: str = Field(default_factory=utc_now)
+
+
+class ThreatModelRecord(BaseModel):
+    threat_model_id: str
+    workspace_id: str
+    issue_id: str
+    title: str
+    methodology: ThreatModelMethodology = "manual"
+    summary: str = ""
+    assets: list[str] = Field(default_factory=list)
+    entry_points: list[str] = Field(default_factory=list)
+    trust_boundaries: list[str] = Field(default_factory=list)
+    abuse_cases: list[str] = Field(default_factory=list)
+    mitigations: list[str] = Field(default_factory=list)
+    references: list[str] = Field(default_factory=list)
+    status: ThreatModelStatus = "draft"
+    created_at: str = Field(default_factory=utc_now)
+    updated_at: str = Field(default_factory=utc_now)
+
+
+class IssueContextReplayRecord(BaseModel):
+    replay_id: str
+    workspace_id: str
+    issue_id: str
+    label: str
+    prompt: str
+    tree_focus: list[str] = Field(default_factory=list)
+    guidance_paths: list[str] = Field(default_factory=list)
+    verification_profile_ids: list[str] = Field(default_factory=list)
+    ticket_context_ids: list[str] = Field(default_factory=list)
+    created_at: str = Field(default_factory=utc_now)
 
 
 class ReviewQueueItem(BaseModel):
@@ -405,6 +501,7 @@ class RunPlan(BaseModel):
 
 
 class WorkspaceSnapshot(BaseModel):
+    scanner_version: int = 1
     workspace: WorkspaceRecord
     summary: dict[str, int]
     issues: list[IssueRecord]
@@ -518,6 +615,50 @@ class RunbookUpsertRequest(BaseModel):
     template: str
 
 
+class VerificationProfileUpsertRequest(BaseModel):
+    profile_id: Optional[str] = None
+    name: str
+    description: str = ""
+    test_command: str
+    coverage_command: Optional[str] = None
+    coverage_report_path: Optional[str] = None
+    coverage_format: CoverageFormat = "unknown"
+    max_runtime_seconds: int = 30
+    retry_count: int = 1
+    source_paths: list[str] = Field(default_factory=list)
+
+
+class TicketContextUpsertRequest(BaseModel):
+    context_id: Optional[str] = None
+    provider: TicketProvider = "manual"
+    external_id: Optional[str] = None
+    title: str
+    summary: str = ""
+    acceptance_criteria: list[str] = Field(default_factory=list)
+    links: list[str] = Field(default_factory=list)
+    labels: list[str] = Field(default_factory=list)
+    status: Optional[str] = None
+    source_excerpt: Optional[str] = None
+
+
+class ThreatModelUpsertRequest(BaseModel):
+    threat_model_id: Optional[str] = None
+    title: str
+    methodology: ThreatModelMethodology = "manual"
+    summary: str = ""
+    assets: list[str] = Field(default_factory=list)
+    entry_points: list[str] = Field(default_factory=list)
+    trust_boundaries: list[str] = Field(default_factory=list)
+    abuse_cases: list[str] = Field(default_factory=list)
+    mitigations: list[str] = Field(default_factory=list)
+    references: list[str] = Field(default_factory=list)
+    status: ThreatModelStatus = "draft"
+
+
+class IssueContextReplayRequest(BaseModel):
+    label: Optional[str] = None
+
+
 class VerifyIssueRequest(BaseModel):
     runtime: RuntimeKind = "opencode"
     models: list[str] = Field(default_factory=list)
@@ -548,10 +689,15 @@ class PromoteSignalRequest(BaseModel):
 class ExportBundle(BaseModel):
     workspace: WorkspaceRecord
     snapshot: WorkspaceSnapshot
+    repo_map: Optional[RepoMapSummary] = None
     runs: list[RunRecord]
     fixes: list[FixRecord] = Field(default_factory=list)
     run_reviews: list[RunReviewRecord] = Field(default_factory=list)
     runbooks: list[RunbookRecord] = Field(default_factory=list)
+    verification_profiles: list[VerificationProfileRecord] = Field(default_factory=list)
+    ticket_contexts: list[TicketContextRecord] = Field(default_factory=list)
+    threat_models: list[ThreatModelRecord] = Field(default_factory=list)
+    context_replays: list[IssueContextReplayRecord] = Field(default_factory=list)
     verifications: list[VerificationRecord] = Field(default_factory=list)
     activity: list[ActivityRecord] = Field(default_factory=list)
     exported_at: str = Field(default_factory=utc_now)
@@ -561,13 +707,47 @@ class IssueContextPacket(BaseModel):
     issue: IssueRecord
     workspace: WorkspaceRecord
     tree_focus: list[str] = Field(default_factory=list)
+    related_paths: list[str] = Field(default_factory=list)
     evidence_bundle: list[EvidenceRef] = Field(default_factory=list)
     recent_fixes: list[FixRecord] = Field(default_factory=list)
     recent_activity: list[ActivityRecord] = Field(default_factory=list)
+    guidance: list["RepoGuidanceRecord"] = Field(default_factory=list)
     runbook: list[str] = Field(default_factory=list)
     available_runbooks: list[RunbookRecord] = Field(default_factory=list)
+    available_verification_profiles: list[VerificationProfileRecord] = Field(default_factory=list)
+    ticket_contexts: list[TicketContextRecord] = Field(default_factory=list)
+    threat_models: list[ThreatModelRecord] = Field(default_factory=list)
+    repo_map: Optional[RepoMapSummary] = None
     worktree: Optional[WorktreeStatus] = None
     prompt: str
+
+
+class RepoGuidanceRecord(BaseModel):
+    guidance_id: str
+    workspace_id: str
+    kind: GuidanceKind
+    title: str
+    path: str
+    always_on: bool = False
+    priority: int = 100
+    summary: str = ""
+    excerpt: Optional[str] = None
+    trigger_keywords: list[str] = Field(default_factory=list)
+    updated_at: Optional[str] = None
+
+
+class RunSessionInsight(BaseModel):
+    workspace_id: str
+    run_id: str
+    issue_id: str
+    status: RunStatus
+    headline: str
+    summary: str = ""
+    guidance_used: list[str] = Field(default_factory=list)
+    strengths: list[str] = Field(default_factory=list)
+    risks: list[str] = Field(default_factory=list)
+    recommendations: list[str] = Field(default_factory=list)
+    generated_at: str = Field(default_factory=utc_now)
 
 
 class IssueDriftDetail(BaseModel):

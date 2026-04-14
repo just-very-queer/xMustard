@@ -2,17 +2,104 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import subprocess
+from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from .models import DiscoverySignal, EvidenceRef, IssueRecord, SourceRecord
+from .models import (
+    DiscoverySignal,
+    EvidenceRef,
+    IssueRecord,
+    RepoMapDirectoryRecord,
+    RepoMapFileRecord,
+    RepoMapSummary,
+    SourceRecord,
+)
 
 BUG_HEADER_RE = re.compile(r"^###\s+(P\d_\d{2}M\d{2}_\d{3})\.\s+(.*)$")
 STATUS_RE = re.compile(r"^- Status \(([^)]+)\):\s*(.*)$")
 EVIDENCE_RE = re.compile(r"`([^`:]+)(?::(\d+))?`")
+SCANNER_EXCLUDED_DIR_NAMES = {
+    ".git",
+    ".hg",
+    ".svn",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".turbo",
+    ".next",
+    "node_modules",
+    "dist",
+    "build",
+    "coverage",
+    ".coverage",
+    "tmp",
+    "vendor",
+    "third_party",
+    "research",
+}
+SCANNER_EXCLUDED_RELATIVE_DIRS = {
+    "backend/data",
+    "frontend/dist",
+}
+SCANNABLE_SOURCE_EXTENSIONS = {
+    ".bash",
+    ".c",
+    ".cc",
+    ".cpp",
+    ".cjs",
+    ".cs",
+    ".css",
+    ".go",
+    ".h",
+    ".hpp",
+    ".html",
+    ".java",
+    ".js",
+    ".jsx",
+    ".kt",
+    ".kts",
+    ".mjs",
+    ".php",
+    ".py",
+    ".rb",
+    ".rs",
+    ".scala",
+    ".sh",
+    ".sql",
+    ".swift",
+    ".ts",
+    ".tsx",
+    ".yaml",
+    ".yml",
+    ".zsh",
+}
+SCANNABLE_SOURCE_FILENAMES = {
+    "Dockerfile",
+    "Justfile",
+    "Makefile",
+    "Procfile",
+}
+REPO_MAP_KEY_FILE_PATTERNS: list[tuple[str, str]] = [
+    ("AGENTS.md", "guide"),
+    ("CONVENTIONS.md", "guide"),
+    ("README.md", "guide"),
+    ("pyproject.toml", "config"),
+    ("package.json", "config"),
+    ("tsconfig.json", "config"),
+    ("vite.config.ts", "config"),
+    ("vite.config.js", "config"),
+    ("backend/app/main.py", "entry"),
+    ("backend/app/service.py", "entry"),
+    ("frontend/src/App.tsx", "entry"),
+]
 
 
 def normalize_status(value: str) -> str:
@@ -288,12 +375,73 @@ def normalize_evidence_path(repo_root: Path, raw_path: str) -> Optional[str]:
     return relative
 
 
+def should_ignore_relative_path(relative_path: Path) -> bool:
+    normalized_parts = [part for part in relative_path.as_posix().split("/") if part and part != "."]
+    if not normalized_parts:
+        return False
+    if any(part in SCANNER_EXCLUDED_DIR_NAMES for part in normalized_parts):
+        return True
+    normalized = "/".join(normalized_parts)
+    return any(
+        normalized == excluded or normalized.startswith(f"{excluded}/")
+        for excluded in SCANNER_EXCLUDED_RELATIVE_DIRS
+    )
+
+
+def ripgrep_exclude_globs() -> list[str]:
+    globs: list[str] = []
+    for name in sorted(SCANNER_EXCLUDED_DIR_NAMES):
+        globs.extend(["--glob", f"!**/{name}/**"])
+    for relative_dir in sorted(SCANNER_EXCLUDED_RELATIVE_DIRS):
+        globs.extend(["--glob", f"!{relative_dir}/**"])
+    return globs
+
+
+def should_scan_file(relative_path: Path) -> bool:
+    if should_ignore_relative_path(relative_path):
+        return False
+    if relative_path.name in SCANNABLE_SOURCE_FILENAMES:
+        return True
+    return relative_path.suffix.lower() in SCANNABLE_SOURCE_EXTENSIONS
+
+
+def _content_matches_signal(kind: str, pattern: str, content: str) -> bool:
+    matcher = re.compile(pattern)
+    matches = list(matcher.finditer(content))
+    if not matches:
+        return False
+    if kind != "annotation":
+        return True
+    for match in matches:
+        if match.start() == 0 or content[match.start() - 1].isspace():
+            return True
+    return False
+
+
 def scan_repo_signals(root_path: Path) -> list[DiscoverySignal]:
     commands = [
-        ("annotation", [r"TODO|FIXME|BUG|HACK|XXX"], "P2", "Backlog annotation in code"),
+        (
+            "annotation",
+            [
+                r"(?:#|//|/\*|\*)\s*(?:TODO|FIXME|BUG|HACK|XXX)\b",
+                r"<!--\s*(?:TODO|FIXME|BUG|HACK|XXX)\b",
+            ],
+            "P2",
+            "Backlog annotation in code",
+        ),
         ("exception_swallow", [r"except Exception:\s*(pass|continue|return None|return)"], "P1", "Swallowed generic exception"),
-        ("not_implemented", [r"NotImplementedError|raise NotImplemented"], "P2", "Not implemented code path"),
-        ("test_marker", [r"xfail|skip\(|todo"], "P3", "Deferred or skipped test coverage"),
+        (
+            "not_implemented",
+            [r"^\s*raise\s+NotImplemented(?:Error)?(?:\(|$)", r":\s*raise\s+NotImplemented(?:Error)?(?:\(|$)"],
+            "P2",
+            "Not implemented code path",
+        ),
+        (
+            "test_marker",
+            [r"^\s*@?pytest\.mark\.(?:xfail|skip)\b", r"^\s*@unittest\.skip\b", r"\b(?:it|test)\.skip\("],
+            "P3",
+            "Deferred or skipped test coverage",
+        ),
     ]
     signals: list[DiscoverySignal] = []
     for kind, patterns, severity, default_title in commands:
@@ -316,14 +464,7 @@ def run_ripgrep_signal_scan(
         "rg",
         "-n",
         "--hidden",
-        "--glob",
-        "!.git",
-        "--glob",
-        "!node_modules",
-        "--glob",
-        "!dist",
-        "--glob",
-        "!build",
+        *ripgrep_exclude_globs(),
         pattern,
         str(root_path),
     ]
@@ -345,6 +486,10 @@ def run_ripgrep_signal_scan(
             continue
         line_number = int(line_number_text)
         relative_path = str(Path(file_path).resolve().relative_to(root_path.resolve()))
+        if not should_scan_file(Path(relative_path)):
+            continue
+        if not _content_matches_signal(kind, pattern, content):
+            continue
         fingerprint = hashlib.sha1(f"{kind}:{relative_path}:{line_number}:{content.strip()}".encode("utf-8")).hexdigest()
         signals.append(
             DiscoverySignal(
@@ -382,11 +527,86 @@ def list_tree_nodes(root_path: Path, relative_path: str = "", limit: int = 80) -
 def summarize_tree(root_path: Path) -> dict[str, int]:
     files = 0
     directories = 0
-    for path in root_path.rglob("*"):
-        if ".git" in path.parts or "node_modules" in path.parts or "dist" in path.parts or "build" in path.parts:
-            continue
-        if path.is_dir():
-            directories += 1
-        else:
-            files += 1
+
+    for current_root, dirnames, filenames in os.walk(root_path):
+        relative_root = Path(current_root).resolve().relative_to(root_path.resolve())
+        dirnames[:] = [
+            dirname
+            for dirname in dirnames
+            if not should_ignore_relative_path(relative_root / dirname)
+        ]
+        directories += len(dirnames)
+        files += sum(
+            1
+            for filename in filenames
+            if not should_ignore_relative_path(relative_root / filename)
+        )
     return {"files": files, "directories": directories}
+
+
+def build_repo_map(root_path: Path, workspace_id: str) -> RepoMapSummary:
+    extension_counts: Counter[str] = Counter()
+    top_level: dict[str, dict[str, int]] = defaultdict(lambda: {"file_count": 0, "source_file_count": 0, "test_file_count": 0})
+    key_files: list[RepoMapFileRecord] = []
+    discovered_key_paths: set[str] = set()
+    root_resolved = root_path.resolve()
+    total_files = 0
+    source_files = 0
+    test_files = 0
+
+    for current_root, dirnames, filenames in os.walk(root_path):
+        relative_root = Path(current_root).resolve().relative_to(root_resolved)
+        dirnames[:] = [
+            dirname
+            for dirname in dirnames
+            if not should_ignore_relative_path(relative_root / dirname)
+        ]
+        for filename in filenames:
+            relative_path = (relative_root / filename) if str(relative_root) != "." else Path(filename)
+            if should_ignore_relative_path(relative_path):
+                continue
+            full_path = root_path / relative_path
+            if not full_path.is_file():
+                continue
+            total_files += 1
+            normalized = relative_path.as_posix()
+            lowered = normalized.lower()
+            top_dir = relative_path.parts[0] if len(relative_path.parts) > 1 else "."
+            top_level[top_dir]["file_count"] += 1
+
+            is_source = should_scan_file(relative_path)
+            is_test = "/tests/" in f"/{lowered}/" or lowered.startswith("tests/") or Path(lowered).name.startswith("test_")
+            if is_source:
+                source_files += 1
+                top_level[top_dir]["source_file_count"] += 1
+                extension_counts[relative_path.suffix.lower() or relative_path.name] += 1
+            if is_test:
+                test_files += 1
+                top_level[top_dir]["test_file_count"] += 1
+
+            for pattern, role in REPO_MAP_KEY_FILE_PATTERNS:
+                if normalized == pattern and normalized not in discovered_key_paths:
+                    discovered_key_paths.add(normalized)
+                    key_files.append(RepoMapFileRecord(path=normalized, role=role, size_bytes=full_path.stat().st_size))
+            if is_test and normalized not in discovered_key_paths and len(key_files) < 12:
+                discovered_key_paths.add(normalized)
+                key_files.append(RepoMapFileRecord(path=normalized, role="test", size_bytes=full_path.stat().st_size))
+
+    top_directories = [
+        RepoMapDirectoryRecord(path=path, **stats)
+        for path, stats in sorted(
+            top_level.items(),
+            key=lambda item: (-item[1]["source_file_count"], -item[1]["file_count"], item[0]),
+        )[:8]
+    ]
+
+    return RepoMapSummary(
+        workspace_id=workspace_id,
+        root_path=str(root_path),
+        total_files=total_files,
+        source_files=source_files,
+        test_files=test_files,
+        top_extensions=dict(extension_counts.most_common(8)),
+        top_directories=top_directories,
+        key_files=key_files[:12],
+    )

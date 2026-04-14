@@ -1,8 +1,3 @@
-export function formatDate(value?: string | null) {
-  if (!value) return 'never'
-  return new Date(value).toLocaleString()
-}
-
 export function StatusPill({ children, tone }: { children: string; tone: string }) {
   return <span className={`pill pill-${tone}`}>{children}</span>
 }

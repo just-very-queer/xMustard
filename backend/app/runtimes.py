@@ -206,6 +206,7 @@ class RuntimeService:
         model: str,
         prompt: str,
         worktree: WorktreeStatus | None = None,
+        guidance_paths: list[str] | None = None,
         runbook_id: str | None = None,
         wait_for_approval: bool = False,
     ) -> RunRecord:
@@ -230,6 +231,7 @@ class RuntimeService:
             output_path=str(output_path),
             runbook_id=runbook_id,
             worktree=worktree,
+            guidance_paths=list(guidance_paths or []),
         )
         self.store.save_run(run)
         if not wait_for_approval:
@@ -530,8 +532,12 @@ class RuntimeService:
         )
         self.store.append_activity(activity)
 
-    def _estimate_tokens(self, text: str) -> int:
-        return max(1, len(text) // 4)
+    def _estimate_tokens(self, value: str | int) -> int:
+        if isinstance(value, int):
+            character_count = max(0, value)
+        else:
+            character_count = len(value)
+        return max(1, character_count // 4)
 
     def _calculate_cost(self, model: str, input_tokens: int, output_tokens: int) -> float:
         pricing = MODEL_PRICING.get(model, {"input_per_1k": 0.01, "output_per_1k": 0.03})

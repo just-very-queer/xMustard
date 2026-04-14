@@ -5,14 +5,22 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app.models import (
+    DiscoverySignal,
+    EvidenceRef,
     FixRecordRequest,
+    ImprovementSuggestion,
+    IssueContextReplayRequest,
     IssueCreateRequest,
     IssueUpdateRequest,
+    PatchCritique,
     RunRecord,
     RunAcceptRequest,
     RunReviewRequest,
     RunbookUpsertRequest,
     SavedIssueViewRequest,
+    ThreatModelUpsertRequest,
+    TicketContextUpsertRequest,
+    VerificationProfileUpsertRequest,
     VerifyIssueRequest,
     WorktreeStatus,
     WorkspaceLoadRequest,
@@ -98,6 +106,421 @@ class TrackerServiceTests(unittest.TestCase):
             self.assertEqual(issue.labels, ["ops", "tracking"])
             self.assertEqual(issue.notes, "manual note")
             self.assertTrue(issue.needs_followup)
+
+    def test_load_workspace_rescans_when_cached_snapshot_uses_old_scanner_version(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "repo"
+            (root / "docs" / "bugs").mkdir(parents=True)
+            (root / "api" / "src").mkdir(parents=True)
+            (root / "docs" / "bugs" / "Bugs_25260323.md").write_text(LEDGER_TEXT, encoding="utf-8")
+            (root / "api" / "src" / "example.py").write_text("print('ok')\n", encoding="utf-8")
+
+            store = FileStore(Path(tmp_dir) / "data")
+            service = TrackerService(store)
+            snapshot = service.load_workspace(WorkspaceLoadRequest(root_path=str(root), auto_scan=True))
+            self.assertIsNotNone(snapshot)
+            assert snapshot is not None
+
+            stale_snapshot = snapshot.model_copy(
+                update={
+                    "scanner_version": 0,
+                    "signals": [
+                        DiscoverySignal(
+                            signal_id="sig_legacy",
+                            kind="annotation",
+                            severity="P2",
+                            title="Legacy signal",
+                            summary="Old cached signal",
+                            file_path="legacy.py",
+                            line=1,
+                            evidence=[EvidenceRef(path="legacy.py", line=1, excerpt="# TODO legacy")],
+                            fingerprint="legacy",
+                        )
+                    ],
+                    "summary": {**snapshot.summary, "signals_total": 1},
+                }
+            )
+            store.save_snapshot(stale_snapshot)
+
+            refreshed = service.load_workspace(
+                WorkspaceLoadRequest(
+                    root_path=str(root),
+                    auto_scan=True,
+                    prefer_cached_snapshot=True,
+                )
+            )
+
+            self.assertIsNotNone(refreshed)
+            assert refreshed is not None
+            self.assertEqual(refreshed.scanner_version, service.SCANNER_VERSION)
+            self.assertEqual(refreshed.summary["signals_total"], 0)
+            self.assertFalse(any(signal.file_path == "legacy.py" for signal in refreshed.signals))
+
+    def test_issue_context_includes_repo_guidance_and_prompt_section(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "repo"
+            (root / "docs" / "bugs").mkdir(parents=True)
+            (root / "api" / "src").mkdir(parents=True)
+            (root / ".openhands" / "skills").mkdir(parents=True)
+            (root / ".openhands" / "microagents").mkdir(parents=True)
+            (root / ".agents" / "skills" / "review-helper").mkdir(parents=True)
+            (root / "docs" / "bugs" / "Bugs_25260323.md").write_text(LEDGER_TEXT, encoding="utf-8")
+            (root / "api" / "src" / "example.py").write_text("print('ok')\n", encoding="utf-8")
+            (root / "AGENTS.md").write_text(
+                "# AGENTS\n\n- Run pytest before finalizing.\n- Prefer minimal safe fixes.\n",
+                encoding="utf-8",
+            )
+            (root / ".openhands" / "microagents" / "repo.md").write_text(
+                "---\nname: repo\ntype: repo\n---\n\n# Repository instructions\n\n- Keep the FastAPI backend and React UI in sync.\n- Favor evidence-backed issue workflows over generic chat.\n",
+                encoding="utf-8",
+            )
+            (root / "CONVENTIONS.md").write_text(
+                "# Conventions\n\n- Use type hints.\n",
+                encoding="utf-8",
+            )
+            (root / ".openhands" / "skills" / "bugfix.md").write_text(
+                "---\nname: bugfix\nkeywords: [\"bug\", \"regression\"]\n---\n\n# Bugfix skill\n\n- Reproduce before editing.\n",
+                encoding="utf-8",
+            )
+            (root / ".agents" / "skills" / "review-helper" / "SKILL.md").write_text(
+                "# Review helper\n\n- Summarize risk before approval.\n",
+                encoding="utf-8",
+            )
+
+            store = FileStore(Path(tmp_dir) / "data")
+            service = TrackerService(store)
+            snapshot = service.load_workspace(WorkspaceLoadRequest(root_path=str(root), auto_scan=True))
+            self.assertIsNotNone(snapshot)
+            assert snapshot is not None
+
+            packet = service.build_issue_context(snapshot.workspace.workspace_id, "P0_25M03_001")
+
+            self.assertTrue(any(item.path == "AGENTS.md" and item.always_on for item in packet.guidance))
+            self.assertTrue(any(item.path == ".openhands/microagents/repo.md" and item.always_on for item in packet.guidance))
+            self.assertTrue(any(item.path == ".openhands/skills/bugfix.md" for item in packet.guidance))
+            self.assertTrue(any(item.path == ".agents/skills/review-helper/SKILL.md" for item in packet.guidance))
+            self.assertEqual(sum(1 for item in packet.guidance if item.path == "AGENTS.md"), 1)
+            self.assertIn("Repository guidance:", packet.prompt)
+            self.assertIn("AGENTS.md", packet.prompt)
+            self.assertIn(".openhands/microagents/repo.md", packet.prompt)
+            self.assertIn(".agents/skills/review-helper/SKILL.md", packet.prompt)
+            self.assertIn("CONVENTIONS.md", packet.prompt)
+
+    def test_issue_context_includes_inferred_verification_profiles(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "repo"
+            (root / "docs" / "bugs").mkdir(parents=True)
+            (root / "api" / "src").mkdir(parents=True)
+            (root / "docs" / "bugs" / "Bugs_25260323.md").write_text(LEDGER_TEXT, encoding="utf-8")
+            (root / "api" / "src" / "example.py").write_text("print('ok')\n", encoding="utf-8")
+            (root / "AGENTS.md").write_text(
+                "# AGENTS\n\n- Run pytest --cov=. --cov-report=xml before finalizing.\n",
+                encoding="utf-8",
+            )
+
+            store = FileStore(Path(tmp_dir) / "data")
+            service = TrackerService(store)
+            snapshot = service.load_workspace(WorkspaceLoadRequest(root_path=str(root), auto_scan=True))
+            assert snapshot is not None
+
+            packet = service.build_issue_context(snapshot.workspace.workspace_id, "P0_25M03_001")
+
+            self.assertTrue(packet.available_verification_profiles)
+            self.assertTrue(any("pytest" in item.test_command for item in packet.available_verification_profiles))
+            self.assertIn("Known verification profiles:", packet.prompt)
+            self.assertIn("pytest --cov=. --cov-report=xml", packet.prompt)
+
+    def test_verification_profile_crud(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "repo"
+            (root / "docs" / "bugs").mkdir(parents=True)
+            (root / "api" / "src").mkdir(parents=True)
+            (root / "docs" / "bugs" / "Bugs_25260323.md").write_text(LEDGER_TEXT, encoding="utf-8")
+            (root / "api" / "src" / "example.py").write_text("print('ok')\n", encoding="utf-8")
+
+            store = FileStore(Path(tmp_dir) / "data")
+            service = TrackerService(store)
+            snapshot = service.load_workspace(WorkspaceLoadRequest(root_path=str(root), auto_scan=True))
+            assert snapshot is not None
+
+            saved = service.save_verification_profile(
+                snapshot.workspace.workspace_id,
+                VerificationProfileUpsertRequest(
+                    name="Backend pytest",
+                    description="Project verification commands",
+                    test_command="pytest -q",
+                    coverage_command="pytest --cov=. --cov-report=xml",
+                    coverage_report_path="coverage.xml",
+                    coverage_format="cobertura",
+                    max_runtime_seconds=90,
+                    retry_count=2,
+                    source_paths=["AGENTS.md"],
+                ),
+            )
+
+            profiles = service.list_verification_profiles(snapshot.workspace.workspace_id)
+            self.assertTrue(any(item.profile_id == saved.profile_id for item in profiles))
+            custom = next(item for item in profiles if item.profile_id == saved.profile_id)
+            self.assertEqual(custom.coverage_report_path, "coverage.xml")
+            self.assertEqual(custom.retry_count, 2)
+
+            service.delete_verification_profile(snapshot.workspace.workspace_id, saved.profile_id)
+            remaining = service.list_verification_profiles(snapshot.workspace.workspace_id)
+            self.assertFalse(any(item.profile_id == saved.profile_id for item in remaining))
+
+    def test_ticket_context_crud_and_issue_packet(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "repo"
+            (root / "docs" / "bugs").mkdir(parents=True)
+            (root / "api" / "src").mkdir(parents=True)
+            (root / "docs" / "bugs" / "Bugs_25260323.md").write_text(LEDGER_TEXT, encoding="utf-8")
+            (root / "api" / "src" / "example.py").write_text("print('ok')\n", encoding="utf-8")
+
+            store = FileStore(Path(tmp_dir) / "data")
+            service = TrackerService(store)
+            snapshot = service.load_workspace(WorkspaceLoadRequest(root_path=str(root), auto_scan=True))
+            assert snapshot is not None
+
+            saved = service.save_ticket_context(
+                snapshot.workspace.workspace_id,
+                "P0_25M03_001",
+                TicketContextUpsertRequest(
+                    provider="manual",
+                    title="Customer escalation",
+                    summary="The fix must preserve export compatibility for existing teams.",
+                    acceptance_criteria=[
+                        "Exports keep the previous CSV columns intact",
+                        "The failure no longer appears in the current repro path",
+                    ],
+                    links=["https://tracker.example.com/incidents/123"],
+                    labels=["customer", "export"],
+                    status="open",
+                ),
+            )
+
+            contexts = service.list_ticket_contexts(snapshot.workspace.workspace_id, "P0_25M03_001")
+            self.assertTrue(any(item.context_id == saved.context_id for item in contexts))
+
+            packet = service.build_issue_context(snapshot.workspace.workspace_id, "P0_25M03_001")
+            self.assertEqual(packet.ticket_contexts[0].title, "Customer escalation")
+            self.assertIn("Ticket context:", packet.prompt)
+            self.assertIn("Exports keep the previous CSV columns intact", packet.prompt)
+
+            service.delete_ticket_context(snapshot.workspace.workspace_id, "P0_25M03_001", saved.context_id)
+            self.assertEqual(service.list_ticket_contexts(snapshot.workspace.workspace_id, "P0_25M03_001"), [])
+
+    def test_github_import_creates_ticket_context_with_acceptance_criteria(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "repo"
+            (root / "docs" / "bugs").mkdir(parents=True)
+            (root / "api" / "src").mkdir(parents=True)
+            (root / "docs" / "bugs" / "Bugs_25260323.md").write_text(LEDGER_TEXT, encoding="utf-8")
+            (root / "api" / "src" / "example.py").write_text("print('ok')\n", encoding="utf-8")
+
+            store = FileStore(Path(tmp_dir) / "data")
+            service = TrackerService(store)
+            snapshot = service.load_workspace(WorkspaceLoadRequest(root_path=str(root), auto_scan=True))
+            assert snapshot is not None
+
+            issue_payload = json.dumps(
+                [
+                    {
+                        "number": 123,
+                        "title": "Export bug",
+                        "body": "## Acceptance Criteria\n- Export keeps old columns\n- Repro passes on current branch\n",
+                        "labels": [{"name": "bug"}, {"name": "customer"}],
+                        "state": "open",
+                        "html_url": "https://github.com/acme/repo/issues/123",
+                    }
+                ]
+            ).encode("utf-8")
+
+            class FakeResponse:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, exc_type, exc, tb):
+                    return False
+
+                def read(self):
+                    return issue_payload
+
+            with patch("app.service.urllib.request.urlopen", return_value=FakeResponse()):
+                imports = service.import_github_issues(snapshot.workspace.workspace_id, "acme/repo")
+
+            self.assertEqual(imports[0]["issue_id"], "GH-123")
+            contexts = service.list_ticket_contexts(snapshot.workspace.workspace_id, "GH-123")
+            self.assertEqual(contexts[0].provider, "github")
+            self.assertEqual(contexts[0].external_id, "acme/repo#123")
+            self.assertEqual(
+                contexts[0].acceptance_criteria,
+                ["Export keeps old columns", "Repro passes on current branch"],
+            )
+
+    def test_threat_model_crud_and_issue_packet(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "repo"
+            (root / "docs" / "bugs").mkdir(parents=True)
+            (root / "api" / "src").mkdir(parents=True)
+            (root / "docs" / "bugs" / "Bugs_25260323.md").write_text(LEDGER_TEXT, encoding="utf-8")
+            (root / "api" / "src" / "example.py").write_text("print('ok')\n", encoding="utf-8")
+
+            store = FileStore(Path(tmp_dir) / "data")
+            service = TrackerService(store)
+            snapshot = service.load_workspace(WorkspaceLoadRequest(root_path=str(root), auto_scan=True))
+            assert snapshot is not None
+
+            saved = service.save_threat_model(
+                snapshot.workspace.workspace_id,
+                "P0_25M03_001",
+                ThreatModelUpsertRequest(
+                    title="Export boundary review",
+                    methodology="stride",
+                    summary="The export path crosses an auth boundary and touches customer data.",
+                    assets=["customer export data", "authorization policy"],
+                    entry_points=["POST /exports"],
+                    trust_boundaries=["authenticated user -> export service"],
+                    abuse_cases=["Export another tenant's records"],
+                    mitigations=["Require tenant scoping before export"],
+                    references=["https://owasp.org/www-project-threat-dragon/"],
+                    status="reviewed",
+                ),
+            )
+
+            threat_models = service.list_threat_models(snapshot.workspace.workspace_id, "P0_25M03_001")
+            self.assertTrue(any(item.threat_model_id == saved.threat_model_id for item in threat_models))
+
+            packet = service.build_issue_context(snapshot.workspace.workspace_id, "P0_25M03_001")
+            self.assertEqual(packet.threat_models[0].title, "Export boundary review")
+            self.assertIn("Threat model:", packet.prompt)
+            self.assertIn("Export another tenant's records", packet.prompt)
+
+            exported = service.export_workspace(snapshot.workspace.workspace_id)
+            self.assertEqual(exported.threat_models[0].threat_model_id, saved.threat_model_id)
+
+            service.delete_threat_model(snapshot.workspace.workspace_id, "P0_25M03_001", saved.threat_model_id)
+            self.assertEqual(service.list_threat_models(snapshot.workspace.workspace_id, "P0_25M03_001"), [])
+
+    def test_capture_issue_context_replay_persists_prompt_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "repo"
+            (root / "docs" / "bugs").mkdir(parents=True)
+            (root / "api" / "src").mkdir(parents=True)
+            (root / "docs" / "bugs" / "Bugs_25260323.md").write_text(LEDGER_TEXT, encoding="utf-8")
+            (root / "api" / "src" / "example.py").write_text("print('ok')\n", encoding="utf-8")
+            (root / "AGENTS.md").write_text("# AGENTS\n\n- Run pytest -q before finalizing.\n", encoding="utf-8")
+
+            store = FileStore(Path(tmp_dir) / "data")
+            service = TrackerService(store)
+            snapshot = service.load_workspace(WorkspaceLoadRequest(root_path=str(root), auto_scan=True))
+            assert snapshot is not None
+
+            replay = service.capture_issue_context_replay(
+                snapshot.workspace.workspace_id,
+                "P0_25M03_001",
+                IssueContextReplayRequest(label="baseline"),
+            )
+
+            self.assertEqual(replay.label, "baseline")
+            self.assertIn("You are fixing bug P0_25M03_001", replay.prompt)
+            self.assertEqual(service.list_issue_context_replays(snapshot.workspace.workspace_id, "P0_25M03_001")[0].replay_id, replay.replay_id)
+
+    def test_repo_map_and_related_paths_enrich_tracker_issue_context(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "repo"
+            (root / "docs" / "bugs").mkdir(parents=True)
+            (root / "backend" / "app").mkdir(parents=True)
+            (root / "tests").mkdir(parents=True)
+            (root / "docs" / "bugs" / "Bugs_25260323.md").write_text(LEDGER_TEXT, encoding="utf-8")
+            (root / "backend" / "app" / "main.py").write_text("def export_csv():\n    return 'ok'\n", encoding="utf-8")
+            (root / "tests" / "test_exporter.py").write_text("def test_export_csv():\n    assert True\n", encoding="utf-8")
+            (root / "pyproject.toml").write_text("[project]\nname='repo'\n", encoding="utf-8")
+
+            store = FileStore(Path(tmp_dir) / "data")
+            service = TrackerService(store)
+            snapshot = service.load_workspace(WorkspaceLoadRequest(root_path=str(root), auto_scan=True))
+            assert snapshot is not None
+
+            created = service.create_issue(
+                snapshot.workspace.workspace_id,
+                IssueCreateRequest(
+                    title="Export regression in backend app",
+                    severity="P1",
+                    summary="CSV export fails during the backend flow.",
+                    labels=["export", "backend"],
+                ),
+            )
+
+            repo_map = service.read_repo_map(snapshot.workspace.workspace_id)
+            self.assertTrue(any(item.path == "backend" for item in repo_map.top_directories))
+
+            packet = service.build_issue_context(snapshot.workspace.workspace_id, created.bug_id)
+            self.assertIsNotNone(packet.repo_map)
+            self.assertIn("Structural context:", packet.prompt)
+            self.assertIn("Ranked related paths:", packet.prompt)
+            self.assertTrue(any(path.startswith("backend") or path.startswith("tests") for path in packet.related_paths))
+
+    def test_run_session_insight_reports_guidance_and_review_findings(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "repo"
+            (root / "docs" / "bugs").mkdir(parents=True)
+            (root / "api" / "src").mkdir(parents=True)
+            (root / "docs" / "bugs" / "Bugs_25260323.md").write_text(LEDGER_TEXT, encoding="utf-8")
+            (root / "api" / "src" / "example.py").write_text("print('ok')\n", encoding="utf-8")
+
+            store = FileStore(Path(tmp_dir) / "data")
+            service = TrackerService(store)
+            snapshot = service.load_workspace(WorkspaceLoadRequest(root_path=str(root), auto_scan=True))
+            self.assertIsNotNone(snapshot)
+            assert snapshot is not None
+
+            run = RunRecord(
+                run_id="run_insight_001",
+                workspace_id=snapshot.workspace.workspace_id,
+                issue_id="P0_25M03_001",
+                runtime="codex",
+                model="gpt-5.4-mini",
+                status="completed",
+                title="codex:P0_25M03_001",
+                prompt="prompt",
+                command=["codex", "exec"],
+                command_preview="codex exec",
+                log_path=str(store.runs_dir(snapshot.workspace.workspace_id) / "run_insight_001.log"),
+                output_path=str(store.runs_dir(snapshot.workspace.workspace_id) / "run_insight_001.out.json"),
+                guidance_paths=["AGENTS.md"],
+                summary={"event_count": 10, "tool_event_count": 9, "text_excerpt": "Applied the fix and ran pytest -q"},
+            )
+            store.save_run(run)
+            metrics = service.runtime_service.calculate_run_metrics(run, len("Applied the fix and ran pytest -q"))
+            service.runtime_service.save_run_metrics(metrics)
+            service._save_critique(
+                PatchCritique(
+                    critique_id="crit_001",
+                    workspace_id=snapshot.workspace.workspace_id,
+                    run_id="run_insight_001",
+                    issue_id="P0_25M03_001",
+                    overall_quality="needs_work",
+                    issues_found=["Missing edge-case assertion"],
+                    improvements=[
+                        ImprovementSuggestion(
+                            suggestion_id="imp_001",
+                            file_path="api/src/example.py",
+                            category="testing",
+                            severity="high",
+                            description="Add a regression assertion for the failing branch",
+                        )
+                    ],
+                    summary="Patch mostly works but needs stronger regression coverage.",
+                )
+            )
+
+            insight = service.get_run_session_insight(snapshot.workspace.workspace_id, "run_insight_001")
+
+            self.assertEqual(insight["run_id"], "run_insight_001")
+            self.assertEqual(insight["guidance_used"], ["AGENTS.md"])
+            self.assertTrue(any("high share of events in tool usage" in item for item in insight["risks"]))
+            self.assertTrue(any("high-severity improvement suggestion" in item for item in insight["risks"]))
+            self.assertTrue(any("always-on repo instructions" in item for item in insight["recommendations"]))
 
     def test_fix_record_persists_and_enriches_issue_context(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

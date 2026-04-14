@@ -12,11 +12,16 @@ from .models import (
     ActivityRecord,
     AppSettings,
     FixRecord,
+    IssueContextReplayRecord,
     IssueRecord,
+    RepoMapSummary,
     RunRecord,
     RunReviewRecord,
     RunbookRecord,
+    ThreatModelRecord,
+    TicketContextRecord,
     SavedIssueView,
+    VerificationProfileRecord,
     VerificationRecord,
     WorkspaceRecord,
     WorkspaceSnapshot,
@@ -28,6 +33,7 @@ T = TypeVar("T", bound=BaseModel)
 class FileStore:
     def __init__(self, root: Path) -> None:
         self.root = root
+        self.data_dir = root
         self.root.mkdir(parents=True, exist_ok=True)
         self.workspaces_file = self.root / "workspaces.json"
         self.settings_file = self.root / "settings.json"
@@ -98,6 +104,21 @@ class FileStore:
 
     def verifications_path(self, workspace_id: str) -> Path:
         return self.workspace_dir(workspace_id) / "verifications.json"
+
+    def verification_profiles_path(self, workspace_id: str) -> Path:
+        return self.workspace_dir(workspace_id) / "verification_profiles.json"
+
+    def ticket_contexts_path(self, workspace_id: str) -> Path:
+        return self.workspace_dir(workspace_id) / "ticket_contexts.json"
+
+    def threat_models_path(self, workspace_id: str) -> Path:
+        return self.workspace_dir(workspace_id) / "threat_models.json"
+
+    def context_replays_path(self, workspace_id: str) -> Path:
+        return self.workspace_dir(workspace_id) / "context_replays.json"
+
+    def repo_map_path(self, workspace_id: str) -> Path:
+        return self.workspace_dir(workspace_id) / "repo_map.json"
 
     def activity_path(self, workspace_id: str) -> Path:
         return self.workspace_dir(workspace_id) / "activity.jsonl"
@@ -174,6 +195,63 @@ class FileStore:
             self.runbooks_path(workspace_id),
             [item.model_dump(mode="json") for item in ordered],
         )
+
+    def list_verification_profiles(self, workspace_id: str) -> list[VerificationProfileRecord]:
+        data = self._read_json(self.verification_profiles_path(workspace_id), [])
+        items = [VerificationProfileRecord.model_validate(item) for item in data]
+        return sorted(items, key=lambda item: (item.built_in, item.name.lower(), item.created_at))
+
+    def save_verification_profiles(self, workspace_id: str, profiles: list[VerificationProfileRecord]) -> None:
+        ordered = sorted(profiles, key=lambda item: (item.built_in, item.name.lower(), item.created_at))
+        self._write_json(
+            self.verification_profiles_path(workspace_id),
+            [item.model_dump(mode="json") for item in ordered],
+        )
+
+    def list_ticket_contexts(self, workspace_id: str) -> list[TicketContextRecord]:
+        data = self._read_json(self.ticket_contexts_path(workspace_id), [])
+        items = [TicketContextRecord.model_validate(item) for item in data]
+        return sorted(items, key=lambda item: (item.issue_id, item.provider, item.title.lower(), item.created_at))
+
+    def save_ticket_contexts(self, workspace_id: str, contexts: list[TicketContextRecord]) -> None:
+        ordered = sorted(contexts, key=lambda item: (item.issue_id, item.provider, item.title.lower(), item.created_at))
+        self._write_json(
+            self.ticket_contexts_path(workspace_id),
+            [item.model_dump(mode="json") for item in ordered],
+        )
+
+    def list_threat_models(self, workspace_id: str) -> list[ThreatModelRecord]:
+        data = self._read_json(self.threat_models_path(workspace_id), [])
+        items = [ThreatModelRecord.model_validate(item) for item in data]
+        return sorted(items, key=lambda item: (item.issue_id, item.title.lower(), item.created_at))
+
+    def save_threat_models(self, workspace_id: str, threat_models: list[ThreatModelRecord]) -> None:
+        ordered = sorted(threat_models, key=lambda item: (item.issue_id, item.title.lower(), item.created_at))
+        self._write_json(
+            self.threat_models_path(workspace_id),
+            [item.model_dump(mode="json") for item in ordered],
+        )
+
+    def list_context_replays(self, workspace_id: str) -> list[IssueContextReplayRecord]:
+        data = self._read_json(self.context_replays_path(workspace_id), [])
+        items = [IssueContextReplayRecord.model_validate(item) for item in data]
+        return sorted(items, key=lambda item: item.created_at, reverse=True)
+
+    def save_context_replays(self, workspace_id: str, replays: list[IssueContextReplayRecord]) -> None:
+        ordered = sorted(replays, key=lambda item: item.created_at, reverse=True)
+        self._write_json(
+            self.context_replays_path(workspace_id),
+            [item.model_dump(mode="json") for item in ordered],
+        )
+
+    def load_repo_map(self, workspace_id: str) -> Optional[RepoMapSummary]:
+        path = self.repo_map_path(workspace_id)
+        if not path.exists():
+            return None
+        return RepoMapSummary.model_validate_json(path.read_text(encoding="utf-8"))
+
+    def save_repo_map(self, workspace_id: str, repo_map: RepoMapSummary) -> None:
+        self._write_json(self.repo_map_path(workspace_id), repo_map.model_dump(mode="json"))
 
     def list_verifications(self, workspace_id: str) -> list[VerificationRecord]:
         data = self._read_json(self.verifications_path(workspace_id), [])

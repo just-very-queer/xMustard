@@ -113,12 +113,37 @@ export type ViewMode = 'issues' | 'review' | 'signals' | 'runs' | 'sources' | 'd
 
 export type SourceRecord = {
   source_id: string
-  kind: 'ledger' | 'verdict_bundle' | 'scanner' | 'tracker_issue' | 'fix_record'
+  kind: 'ledger' | 'verdict_bundle' | 'scanner' | 'tracker_issue' | 'fix_record' | 'ticket_context' | 'threat_model' | 'repo_map'
   label: string
   path: string
   record_count: number
   modified_at?: string | null
   notes?: string | null
+}
+
+export type RepoMapDirectoryRecord = {
+  path: string
+  file_count: number
+  source_file_count: number
+  test_file_count: number
+}
+
+export type RepoMapFileRecord = {
+  path: string
+  role: 'guide' | 'config' | 'entry' | 'test' | 'source'
+  size_bytes?: number | null
+}
+
+export type RepoMapSummary = {
+  workspace_id: string
+  root_path: string
+  total_files: number
+  source_files: number
+  test_files: number
+  top_extensions: Record<string, number>
+  top_directories: RepoMapDirectoryRecord[]
+  key_files: RepoMapFileRecord[]
+  generated_at: string
 }
 
 export type RuntimeModel = {
@@ -249,13 +274,33 @@ export type IssueContextPacket = {
   issue: IssueRecord
   workspace: WorkspaceRecord
   tree_focus: string[]
+  related_paths: string[]
   evidence_bundle: EvidenceRef[]
   recent_fixes: FixRecord[]
   recent_activity: ActivityRecord[]
+  guidance: RepoGuidanceRecord[]
   runbook: string[]
   available_runbooks: RunbookRecord[]
+  available_verification_profiles: VerificationProfileRecord[]
+  ticket_contexts: TicketContextRecord[]
+  threat_models: ThreatModelRecord[]
+  repo_map?: RepoMapSummary | null
   worktree?: WorktreeStatus | null
   prompt: string
+}
+
+export type RepoGuidanceRecord = {
+  guidance_id: string
+  workspace_id: string
+  kind: 'agent_instructions' | 'conventions' | 'repo_index' | 'skill' | 'workspace_overview'
+  title: string
+  path: string
+  always_on: boolean
+  priority: number
+  summary: string
+  excerpt?: string | null
+  trigger_keywords: string[]
+  updated_at?: string | null
 }
 
 export type IssueUpdateRequest = {
@@ -328,6 +373,113 @@ export type RunbookUpsertRequest = {
   template: string
 }
 
+export type CoverageFormat = 'unknown' | 'cobertura' | 'jacoco' | 'lcov' | 'go'
+
+export type VerificationProfileRecord = {
+  profile_id: string
+  workspace_id: string
+  name: string
+  description: string
+  test_command: string
+  coverage_command?: string | null
+  coverage_report_path?: string | null
+  coverage_format: CoverageFormat
+  max_runtime_seconds: number
+  retry_count: number
+  source_paths: string[]
+  built_in: boolean
+  created_at: string
+  updated_at: string
+}
+
+export type VerificationProfileUpsertRequest = {
+  profile_id?: string
+  name: string
+  description?: string
+  test_command: string
+  coverage_command?: string | null
+  coverage_report_path?: string | null
+  coverage_format?: CoverageFormat
+  max_runtime_seconds?: number
+  retry_count?: number
+  source_paths?: string[]
+}
+
+export type TicketContextRecord = {
+  context_id: string
+  workspace_id: string
+  issue_id: string
+  provider: 'github' | 'jira' | 'linear' | 'manual' | 'incident' | 'other'
+  external_id?: string | null
+  title: string
+  summary: string
+  acceptance_criteria: string[]
+  links: string[]
+  labels: string[]
+  status?: string | null
+  source_excerpt?: string | null
+  created_at: string
+  updated_at: string
+}
+
+export type TicketContextUpsertRequest = {
+  context_id?: string
+  provider?: 'github' | 'jira' | 'linear' | 'manual' | 'incident' | 'other'
+  external_id?: string | null
+  title: string
+  summary?: string
+  acceptance_criteria?: string[]
+  links?: string[]
+  labels?: string[]
+  status?: string | null
+  source_excerpt?: string | null
+}
+
+export type ThreatModelRecord = {
+  threat_model_id: string
+  workspace_id: string
+  issue_id: string
+  title: string
+  methodology: 'manual' | 'stride' | 'threat_dragon' | 'pytm' | 'threagile' | 'attack_path'
+  summary: string
+  assets: string[]
+  entry_points: string[]
+  trust_boundaries: string[]
+  abuse_cases: string[]
+  mitigations: string[]
+  references: string[]
+  status: 'draft' | 'reviewed' | 'accepted'
+  created_at: string
+  updated_at: string
+}
+
+export type ThreatModelUpsertRequest = {
+  threat_model_id?: string
+  title: string
+  methodology?: ThreatModelRecord['methodology']
+  summary?: string
+  assets?: string[]
+  entry_points?: string[]
+  trust_boundaries?: string[]
+  abuse_cases?: string[]
+  mitigations?: string[]
+  references?: string[]
+  status?: ThreatModelRecord['status']
+}
+
+export type IssueContextReplayRecord = {
+  replay_id: string
+  workspace_id: string
+  issue_id: string
+  label: string
+  prompt: string
+  tree_focus: string[]
+  guidance_paths: string[]
+  verification_profile_ids: string[]
+  ticket_context_ids: string[]
+  created_at: string
+}
+
 export type RunReviewDisposition = 'dismissed' | 'investigation_only'
 
 export type RunReviewRecord = {
@@ -374,6 +526,7 @@ export type RunRecord = {
   pid?: number | null
   error?: string | null
   worktree?: WorktreeStatus | null
+  guidance_paths: string[]
   summary?: {
     runtime: string
     session_id?: string | null
@@ -383,6 +536,20 @@ export type RunRecord = {
     text_excerpt?: string | null
   } | null
   plan?: RunPlan | null
+}
+
+export type RunSessionInsight = {
+  workspace_id: string
+  run_id: string
+  issue_id: string
+  status: 'queued' | 'planning' | 'running' | 'completed' | 'failed' | 'cancelled'
+  headline: string
+  summary: string
+  guidance_used: string[]
+  strengths: string[]
+  risks: string[]
+  recommendations: string[]
+  generated_at: string
 }
 
 export type PlanStep = {

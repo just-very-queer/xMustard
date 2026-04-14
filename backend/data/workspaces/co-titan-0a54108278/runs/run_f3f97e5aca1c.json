@@ -21,8 +21,8 @@
     "Reply with two short bullets about the current workspace."
   ],
   "command_preview": "/opt/homebrew/bin/codex exec --json --skip-git-repo-check -s workspace-write -C /Users/for_home/Developer/CoTitanMigration/Co_Titan -m gpt-5.4-mini 'Reply with two short bullets about the current workspace.'",
-  "log_path": "/Users/for_home/Developer/CoTitanMigration/Co_Titan_Bug_Tracker/backend/data/workspaces/co-titan-0a54108278/runs/run_f3f97e5aca1c.log",
-  "output_path": "/Users/for_home/Developer/CoTitanMigration/Co_Titan_Bug_Tracker/backend/data/workspaces/co-titan-0a54108278/runs/run_f3f97e5aca1c.out.json",
+  "log_path": "/Users/for_home/Developer/xMustard/backend/data/workspaces/co-titan-0a54108278/runs/run_f3f97e5aca1c.log",
+  "output_path": "/Users/for_home/Developer/xMustard/backend/data/workspaces/co-titan-0a54108278/runs/run_f3f97e5aca1c.out.json",
   "created_at": "2026-03-30T18:27:39.467734+00:00",
   "started_at": "2026-03-30T18:27:39.476498Z",
   "completed_at": "2026-03-30T18:27:47.371460Z",

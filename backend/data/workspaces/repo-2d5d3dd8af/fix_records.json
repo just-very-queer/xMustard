@@ -24,7 +24,7 @@
     ],
     "evidence": [
       {
-        "path": "/Users/for_home/Developer/CoTitanMigration/Co_Titan_Bug_Tracker/backend/data/workspaces/repo-2d5d3dd8af/runs/run_smoke_fix.out.json",
+        "path": "/Users/for_home/Developer/xMustard/backend/data/workspaces/repo-2d5d3dd8af/runs/run_smoke_fix.out.json",
         "line": null,
         "excerpt": "Applied fix",
         "normalized_path": null,

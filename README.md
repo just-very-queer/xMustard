@@ -1,36 +1,69 @@
 # xMustard
 
-A standalone bug operations system for local engineering codebases. It is issue-first and run-first: no chat surface, no dependency on legacy Co_Titan UI.
+xMustard is a local, issue-first bug operations system for engineering repositories. It treats bugs, runs, review artifacts, and verification evidence as first-class records instead of burying them inside a chat transcript.
 
-**Project xMustard** is the evolution of Co_Titan_Bug_Tracker, enhanced with insights from 11 leading AI coding agent projects.
+This codebase started as `Co_Titan_Bug_Tracker` and has been evolving using concrete patterns from the research repos under `research/`.
+
+## Product Shape
+
+The current product already supports:
+
+- workspace loading and repo scanning
+- issue queues, discovery signals, drift tracking, and saved views
+- planning-gated agent runs
+- run cost and token metrics
+- triage analysis: quality scoring, duplicate detection, triage suggestions
+- verification artifacts: coverage deltas, test suggestions, patch critique, improvement suggestions
+- issue-level threat models with assets, trust boundaries, abuse cases, and mitigations
+- repository guidance discovery from files like `AGENTS.md`, `CONVENTIONS.md`, `.devin/wiki.json`, `.openhands/skills/*.md`, and `.openhands/microagents/repo.md`
+- run insights that summarize what guidance shaped a run and what risks remain
 
 ## Stack
 
-- `backend/`: Python FastAPI API + Typer CLI + file-backed JSON store
-- `frontend/`: Vite + React + TypeScript UI
-- Runtime bridges for `codex`, `opencode`, and extensible agent runtimes
+- `backend/`: FastAPI API, Typer CLI, JSON-backed persistence
+- `frontend/`: Vite, React, TypeScript
+- runtimes: `codex`, `opencode`, plus room for more runtime adapters
 
-## Core Workflow
+Longer-term platform direction:
 
-1. Load any repository tree into the tracker
-2. Scan bug ledgers, verdict JSON, and codebase heuristics
-3. Triage canonical issues and auto-discovery signals
-4. Generate issue context packets for agent runtimes
-5. Start terminal-backed agent runs with planning checkpoints
-6. Three-pass verification with coverage tracking
-7. Export full workspace snapshots as JSON
+- keep the current product contracts stable while incrementally moving backend-heavy subsystems toward a Rust core
 
-## Key Features (Inspired by Research)
+## Workflow
 
-- **Planning checkpoints**: Agent plans are shown for approval before execution (inspired by SWE-agent, AutoCodeRover)
-- **Cost tracking**: Per-run token usage and cost metrics (inspired by OpenHands, SWE-agent)
-- **Multi-phase verification**: Search → Plan → Fix → Review → Verify pipeline (inspired by AutoCodeRover)
-- **Triage automation**: Issue quality scoring, duplicate detection (inspired by trIAge, PR-Agent)
-- **Post-run artifacts**: Patch critique, suggested improvements (inspired by PR-Agent)
-- **Coverage-driven verification**: Test generation and coverage delta tracking (inspired by Qodo Cover)
-- **Extensible runtimes**: Plug in any agent runtime via configuration (inspired by OpenHands)
+1. Load a repo into a workspace snapshot.
+2. Ingest canonical issues and lightweight discovery signals.
+3. Build an issue context packet with evidence, prior fixes, activity, and repo guidance.
+4. Start a planning run or direct run against a runtime.
+5. Review logs, plans, costs, critique, improvements, and session insights.
+6. Record fixes and verification outcomes with coverage and test suggestions.
 
-## Backend
+## Why The Research Matters
+
+The strongest patterns repeated across the local research repos are:
+
+- repo-specific instructions beat generic prompting
+- dynamic context beats dumping the whole repo
+- verification loops matter more than raw generation speed
+- post-run review artifacts make agent output inspectable
+- benchmark and replay infrastructure keeps the system honest
+
+Those themes now shape both the product and the roadmap.
+
+## Next Strategic Lanes
+
+The strongest gaps still on the roadmap are:
+
+- guidance authoring instead of guidance detection alone
+- symbol-aware repo maps and dynamic context
+- replayable verification and eval harnesses
+- threat modeling, security review, and compliance artifacts
+- semantic retrieval across issues, runs, tickets, and review data
+- governance, insights, and agent operations for team workflows
+- incremental backend migration away from the current Python-heavy core
+
+## Development
+
+Backend:
 
 ```bash
 cd backend
@@ -38,32 +71,7 @@ python3 -m pip install .
 uvicorn app.main:app --reload --port 8042
 ```
 
-CLI examples:
-
-```bash
-cd backend
-python3 -m app.cli health
-python3 -m app.cli capabilities
-python3 -m app.cli runtimes
-python3 -m app.cli models codex
-python3 -m app.cli models opencode
-python3 -m app.cli settings-get
-python3 -m app.cli load-workspace /path/to/repo
-python3 -m app.cli issue-context <workspace-id> P0_25M03_001
-python3 -m app.cli agent-probe <workspace-id> --runtime codex --model gpt-5.4
-python3 -m app.cli agent-query <workspace-id> --runtime codex --model gpt-5.4-mini --prompt "Summarize the top 5 open P0/P1 bugs."
-python3 -m app.cli run-start <workspace-id> P0_25M03_001 --runtime codex --model gpt-5.4-mini --instruction "Validate first, then fix if reproducible."
-```
-
-Root shortcuts:
-
-```bash
-make backend
-make frontend
-make build-ui
-```
-
-## Frontend
+Frontend:
 
 ```bash
 cd frontend
@@ -71,30 +79,33 @@ npm install
 npm run dev
 ```
 
-The Vite app expects the backend at `http://127.0.0.1:8042`.
+Useful checks:
 
-## Research
+```bash
+cd backend
+pytest -q
+PYTHONPYCACHEPREFIX=/tmp/pycache python3 -m compileall app
 
-Reference implementations are cloned under `/research/`:
+cd ../frontend
+npm run lint
+npm run build
+```
 
-| Repo | Key Inspiration |
-|------|----------------|
-| OpenHands | Multi-agent orchestration, WebSocket events, cost tracking |
-| SWE-agent | YAML config, template system, retry loops, trajectory persistence |
-| AutoCodeRover | Two-stage workflow, AST search, multi-patch voting |
-| pr-agent | Command dispatch, PR compression, post-run review |
-| qodo-cover | Coverage-driven verification, record/replay caching |
-| trIAge | Issue triage, duplicate detection, quality scoring |
-| cline | Approval gates, token tracking, MCP support |
-| aider | Terminal-first UX, auto git commits |
-| vulnhuntr | Vulnerability discovery, exploit path tracing |
-| openhands-resolver | Auto-issue resolution patterns |
-| auto-code-rover | Project-structure-aware planning |
+The frontend expects the backend at `http://127.0.0.1:8042`.
 
-## Architecture
+## Research Repos
 
-See [ARCHITECTURE.md](docs/ARCHITECTURE.md) for detailed architecture.
+Reference implementations are available locally under `research/`.
 
-## Planning
+| Repo | Main lesson pulled into xMustard |
+|------|---------------------------------|
+| `OpenHands` | repository instructions, microagents, resolver flows |
+| `aider` | repo map mindset, git-aware coding loop, lint/test verification |
+| `pr-agent` | dynamic context, critique and review summaries |
+| `qodo-cover` | coverage-first verification and record/replay testing |
+| `trIAge` | issue quality and duplicate triage |
+| `cline` | approvals, skills, and repo instruction surfaces |
+| `SWE-agent` | trajectories, reproducible task configs, eval mindset |
+| `auto-code-rover` | structure-aware planning and staged execution |
 
-See [PLANNING.md](docs/PLANNING.md) for implementation roadmap.
+See [docs/RESEARCH_FINDINGS.md](docs/RESEARCH_FINDINGS.md), [docs/RESEARCH_MATRIX.md](docs/RESEARCH_MATRIX.md), [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), and [docs/PLANNING.md](docs/PLANNING.md) for the current synthesis.

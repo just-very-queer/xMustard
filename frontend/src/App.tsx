@@ -1,20 +1,38 @@
-import { startTransition, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
+import { startTransition, useDeferredValue, useEffect, useEffectEvent, useMemo, useRef, useState } from 'react'
 import './index.css'
 import {
   approvePlan,
   cancelRun,
+  captureIssueContextReplay,
   createIssue,
   closeTerminal,
   createSavedView,
   deleteSavedView,
   deleteRunbook,
+  deleteThreatModel,
+  deleteTicketContext,
+  deleteVerificationProfile,
   exportWorkspace,
   acceptRunReview,
+  dismissImprovement,
+  findDuplicates,
   generatePlan,
+  generatePatchCritique,
+  generateTestSuggestions,
   getHealth,
+  getCoverageDelta,
+  getPlan,
+  getPatchCritique,
+  getRunInsights,
+  getIssueQuality,
+  getTestSuggestions,
+  getWorkspaceCostSummary,
+  getRunImprovements,
   getCapabilities,
   getSettings,
   issueWork,
+  listIssueContextReplays,
+  listWorkspaceMetrics,
   listActivity,
   listIssues,
   listRuns,
@@ -22,6 +40,8 @@ import {
   listSignals,
   listSources,
   listTree,
+  listVerificationProfiles,
+  listWorkspaceGuidance,
   listWorkspaces,
   loadWorkspace,
   openTerminal,
@@ -29,6 +49,7 @@ import {
   promoteSignal,
   queryAgent,
   readActivityOverview,
+  readRepoMap,
   readDrift,
   readIssueDrift,
   readSnapshot,
@@ -41,9 +62,15 @@ import {
   reviewRun,
   retryRun,
   scanWorkspace,
+  scoreAllIssues,
+  scoreIssueQuality,
   saveRunbook,
+  saveThreatModel,
+  saveTicketContext,
+  saveVerificationProfile,
   startRun,
   suggestFixDraft,
+  triageIssue,
   updateIssue,
   updateSavedView,
   updateSettings,
@@ -60,18 +87,34 @@ import type {
   ActivityRecord,
   ActivityOverview,
   AppSettings,
+  CostSummary,
+  CoverageDelta,
   DiscoverySignal,
+  DuplicateMatch,
+  ImprovementSuggestion,
+  IssueContextReplayRecord,
   IssueDriftDetail,
   IssueContextPacket,
   IssueQueueFilters,
+  IssueQualityScore,
   IssueRecord,
   LocalAgentCapabilities,
+  PatchCritique,
+  RepoMapSummary,
+  RepoGuidanceRecord,
   RunPlan,
   RunRecord,
+  RunSessionInsight,
   RuntimeProbeResult,
+  RunMetrics,
   SavedIssueView,
   SourceRecord,
+  TestSuggestion,
+  ThreatModelRecord,
+  TicketContextRecord,
   TreeNode,
+  TriageSuggestion,
+  VerificationProfileRecord,
   ViewMode,
   WorktreeStatus,
   WorkspaceRecord,
@@ -105,6 +148,13 @@ function parseLabelDraft(value: string) {
     .filter(Boolean)
 }
 
+function parseLineDraft(value: string) {
+  return value
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+}
+
 function buildInstructionFromRunbook(mode: 'verify' | 'fix' | 'drift', packet: IssueContextPacket | null, issue: IssueRecord | null) {
   const heading =
     mode === 'verify'
@@ -125,6 +175,30 @@ function buildInstructionFromSelectedRunbook(packet: IssueContextPacket | null, 
   if (!runbook) return buildInstructionFromRunbook('fix', packet, issue)
   const scope = issue ? `Focus issue: ${issue.bug_id} ${issue.title}` : 'No issue is currently selected.'
   return `${runbook.name}\n${scope}\n\nRunbook:\n${runbook.template.trim()}`
+}
+
+function buildInstructionFromVerificationProfile(profile: VerificationProfileRecord | null, issue: IssueRecord | null) {
+  if (!profile) return buildInstructionFromRunbook('verify', null, issue)
+  const scope = issue ? `Focus issue: ${issue.bug_id} ${issue.title}` : 'No issue is currently selected.'
+  const lines = [
+    `Verification profile: ${profile.name}`,
+    scope,
+    '',
+    'Run the saved verification workflow and report pass/fail, coverage movement, and any remaining evidence gaps.',
+    `Test command: ${profile.test_command}`,
+  ]
+  if (profile.coverage_command) {
+    lines.push(`Coverage command: ${profile.coverage_command}`)
+  }
+  if (profile.coverage_report_path) {
+    lines.push(`Coverage report path: ${profile.coverage_report_path}`)
+  }
+  if (profile.source_paths.length) {
+    lines.push(`Focus paths: ${profile.source_paths.join(', ')}`)
+  }
+  lines.push(`Retries: ${profile.retry_count}`)
+  lines.push(`Max runtime: ${profile.max_runtime_seconds}s`)
+  return lines.join('\n')
 }
 
 function App() {
@@ -164,6 +238,40 @@ function App() {
   const [runbookNameDraft, setRunbookNameDraft] = useState('')
   const [runbookDescriptionDraft, setRunbookDescriptionDraft] = useState('')
   const [runbookTemplateDraft, setRunbookTemplateDraft] = useState('')
+  const [verificationProfiles, setVerificationProfiles] = useState<VerificationProfileRecord[]>([])
+  const [selectedVerificationProfileId, setSelectedVerificationProfileId] = useState('')
+  const [verificationProfileNameDraft, setVerificationProfileNameDraft] = useState('')
+  const [verificationProfileDescriptionDraft, setVerificationProfileDescriptionDraft] = useState('')
+  const [verificationProfileTestCommandDraft, setVerificationProfileTestCommandDraft] = useState('')
+  const [verificationProfileCoverageCommandDraft, setVerificationProfileCoverageCommandDraft] = useState('')
+  const [verificationProfileCoveragePathDraft, setVerificationProfileCoveragePathDraft] = useState('')
+  const [verificationProfileCoverageFormatDraft, setVerificationProfileCoverageFormatDraft] = useState<VerificationProfileRecord['coverage_format']>('unknown')
+  const [verificationProfileRuntimeDraft, setVerificationProfileRuntimeDraft] = useState('30')
+  const [verificationProfileRetryDraft, setVerificationProfileRetryDraft] = useState('1')
+  const [verificationProfileSourcePathsDraft, setVerificationProfileSourcePathsDraft] = useState('')
+  const [selectedTicketContextId, setSelectedTicketContextId] = useState('')
+  const [ticketContextProviderDraft, setTicketContextProviderDraft] = useState<TicketContextRecord['provider']>('manual')
+  const [ticketContextExternalIdDraft, setTicketContextExternalIdDraft] = useState('')
+  const [ticketContextTitleDraft, setTicketContextTitleDraft] = useState('')
+  const [ticketContextSummaryDraft, setTicketContextSummaryDraft] = useState('')
+  const [ticketContextCriteriaDraft, setTicketContextCriteriaDraft] = useState('')
+  const [ticketContextLinksDraft, setTicketContextLinksDraft] = useState('')
+  const [ticketContextLabelsDraft, setTicketContextLabelsDraft] = useState('')
+  const [ticketContextStatusDraft, setTicketContextStatusDraft] = useState('')
+  const [ticketContextSourceExcerptDraft, setTicketContextSourceExcerptDraft] = useState('')
+  const [selectedThreatModelId, setSelectedThreatModelId] = useState('')
+  const [threatModelTitleDraft, setThreatModelTitleDraft] = useState('')
+  const [threatModelMethodologyDraft, setThreatModelMethodologyDraft] = useState<ThreatModelRecord['methodology']>('manual')
+  const [threatModelSummaryDraft, setThreatModelSummaryDraft] = useState('')
+  const [threatModelAssetsDraft, setThreatModelAssetsDraft] = useState('')
+  const [threatModelEntryPointsDraft, setThreatModelEntryPointsDraft] = useState('')
+  const [threatModelTrustBoundariesDraft, setThreatModelTrustBoundariesDraft] = useState('')
+  const [threatModelAbuseCasesDraft, setThreatModelAbuseCasesDraft] = useState('')
+  const [threatModelMitigationsDraft, setThreatModelMitigationsDraft] = useState('')
+  const [threatModelReferencesDraft, setThreatModelReferencesDraft] = useState('')
+  const [threatModelStatusDraft, setThreatModelStatusDraft] = useState<ThreatModelRecord['status']>('draft')
+  const [issueContextReplays, setIssueContextReplays] = useState<IssueContextReplayRecord[]>([])
+  const [contextReplayLabelDraft, setContextReplayLabelDraft] = useState('')
   const [logContent, setLogContent] = useState('')
   const [selectedRunPlan, setSelectedRunPlan] = useState<RunPlan | null>(null)
   const [loading, setLoading] = useState(false)
@@ -182,11 +290,24 @@ function App() {
   const [runtimeProbeLoading, setRuntimeProbeLoading] = useState(false)
   const [backendHealthy, setBackendHealthy] = useState<boolean | null>(null)
   const [sources, setSources] = useState<SourceRecord[]>([])
+  const [workspaceGuidance, setWorkspaceGuidance] = useState<RepoGuidanceRecord[]>([])
+  const [repoMap, setRepoMap] = useState<RepoMapSummary | null>(null)
   const [activity, setActivity] = useState<ActivityRecord[]>([])
   const [activityOverview, setActivityOverview] = useState<ActivityOverview | null>(null)
   const [worktree, setWorktree] = useState<WorktreeStatus | null>(null)
   const [driftSummary, setDriftSummary] = useState<Record<string, number>>({})
   const [issueDrift, setIssueDrift] = useState<IssueDriftDetail | null>(null)
+  const [issueQuality, setIssueQuality] = useState<IssueQualityScore | null>(null)
+  const [issueQualityById, setIssueQualityById] = useState<Record<string, IssueQualityScore>>({})
+  const [duplicateMatches, setDuplicateMatches] = useState<DuplicateMatch[]>([])
+  const [triageSuggestion, setTriageSuggestion] = useState<TriageSuggestion | null>(null)
+  const [costSummary, setCostSummary] = useState<CostSummary | null>(null)
+  const [runMetricsById, setRunMetricsById] = useState<Record<string, RunMetrics>>({})
+  const [coverageDelta, setCoverageDelta] = useState<CoverageDelta | null>(null)
+  const [testSuggestions, setTestSuggestions] = useState<TestSuggestion[]>([])
+  const [patchCritique, setPatchCritique] = useState<PatchCritique | null>(null)
+  const [runImprovements, setRunImprovements] = useState<ImprovementSuggestion[]>([])
+  const [runInsight, setRunInsight] = useState<RunSessionInsight | null>(null)
   const [issueStatusDraft, setIssueStatusDraft] = useState('open')
   const [issueSeverityDraft, setIssueSeverityDraft] = useState('P2')
   const [issueDocStatusDraft, setIssueDocStatusDraft] = useState('open')
@@ -364,8 +485,31 @@ function App() {
   }, [snapshot])
 
   const activeLiveRun = useMemo(
-    () => runs.find((run) => run.status === 'queued' || run.status === 'running') ?? null,
+    () => runs.find((run) => run.status === 'planning' || run.status === 'queued' || run.status === 'running') ?? null,
     [runs],
+  )
+  const workspaceId = snapshot?.workspace.workspace_id ?? null
+  const selectedIssueBugId = selectedIssue?.bug_id ?? null
+  const selectedIssueUpdatedAt = selectedIssue?.updated_at ?? null
+  const selectedRunRecordId = selectedRun?.run_id ?? null
+  const selectedRunStatus = selectedRun?.status ?? null
+  const selectedRunPlanRecord = selectedRun?.plan ?? null
+  const activeLiveRunId = activeLiveRun?.run_id ?? null
+  const selectedRunMetrics = useMemo(
+    () => (selectedRun ? runMetricsById[selectedRun.run_id] ?? null : null),
+    [runMetricsById, selectedRun],
+  )
+  const selectedVerificationProfile = useMemo(
+    () => verificationProfiles.find((item) => item.profile_id === selectedVerificationProfileId) ?? null,
+    [verificationProfiles, selectedVerificationProfileId],
+  )
+  const selectedTicketContext = useMemo(
+    () => issueContextPacket?.ticket_contexts.find((item) => item.context_id === selectedTicketContextId) ?? null,
+    [issueContextPacket?.ticket_contexts, selectedTicketContextId],
+  )
+  const selectedThreatModel = useMemo(
+    () => issueContextPacket?.threat_models.find((item) => item.threat_model_id === selectedThreatModelId) ?? null,
+    [issueContextPacket?.threat_models, selectedThreatModelId],
   )
 
   async function refreshHealth() {
@@ -406,24 +550,45 @@ function App() {
     })
   }
 
+  async function refreshCostData(workspaceId: string) {
+    const [nextCostSummary, metrics] = await Promise.all([
+      getWorkspaceCostSummary(workspaceId),
+      listWorkspaceMetrics(workspaceId),
+    ])
+    startTransition(() => {
+      setCostSummary(nextCostSummary)
+      setRunMetricsById(Object.fromEntries(metrics.map((metric) => [metric.run_id, metric])))
+    })
+  }
+
   async function refreshWorkspaceData(workspaceId: string) {
-    const [nextRuns, nextSources, nextDriftSummary, nextViews, nextActivity, nextOverview, nextWorktree] = await Promise.all([
+    const [nextRuns, nextSources, nextGuidance, nextRepoMap, nextVerificationProfiles, nextDriftSummary, nextViews, nextActivity, nextOverview, nextWorktree, nextCostSummary, metrics] = await Promise.all([
       listRuns(workspaceId),
       listSources(workspaceId),
+      listWorkspaceGuidance(workspaceId),
+      readRepoMap(workspaceId),
+      listVerificationProfiles(workspaceId),
       readDrift(workspaceId),
       listSavedViews(workspaceId),
       listActivity(workspaceId, { limit: 120 }),
       readActivityOverview(workspaceId, 120),
       readWorktree(workspaceId),
+      getWorkspaceCostSummary(workspaceId),
+      listWorkspaceMetrics(workspaceId),
     ])
     startTransition(() => {
       setRuns(nextRuns)
       setSources(nextSources)
+      setWorkspaceGuidance(nextGuidance)
+      setRepoMap(nextRepoMap)
+      setVerificationProfiles(nextVerificationProfiles)
       setDriftSummary(nextDriftSummary)
       setSavedViews(nextViews)
       setActivity(nextActivity)
       setActivityOverview(nextOverview)
       setWorktree(nextWorktree)
+      setCostSummary(nextCostSummary)
+      setRunMetricsById(Object.fromEntries(metrics.map((metric) => [metric.run_id, metric])))
     })
   }
 
@@ -462,6 +627,14 @@ function App() {
     setSavedViewName('')
     setActiveView(preset.mode)
   }
+
+  const refreshIssueQueueEffect = useEffectEvent(async () => {
+    await refreshIssueQueue()
+  })
+
+  const refreshSignalQueueEffect = useEffectEvent(async () => {
+    await refreshSignalQueue()
+  })
 
   useEffect(() => {
     void (async () => {
@@ -503,34 +676,34 @@ function App() {
   }, [runtime, model, snapshot?.workspace.workspace_id])
 
   useEffect(() => {
-    if (!snapshot?.workspace.workspace_id) return
-    void refreshWorkspaceData(snapshot.workspace.workspace_id).catch((nextError) =>
+    if (!workspaceId) return
+    void refreshWorkspaceData(workspaceId).catch((nextError) =>
       setError(nextError instanceof Error ? nextError.message : String(nextError)),
     )
-  }, [snapshot?.workspace.workspace_id, snapshot?.generated_at])
+  }, [workspaceId, snapshot?.generated_at])
 
   useEffect(() => {
-    if (!snapshot?.workspace.workspace_id) return
+    if (!workspaceId) return
     if (activeView !== 'tree') return
-    void listTree(snapshot.workspace.workspace_id, treePath)
+    void listTree(workspaceId, treePath)
       .then(setTreeNodes)
       .catch((nextError) => setError(nextError instanceof Error ? nextError.message : String(nextError)))
-  }, [snapshot?.workspace.workspace_id, treePath, activeView])
+  }, [workspaceId, treePath, activeView])
 
   useEffect(() => {
-    if (!snapshot?.workspace.workspace_id) return
-    void refreshIssueQueue().catch((nextError) =>
+    if (!workspaceId) return
+    void refreshIssueQueueEffect().catch((nextError) =>
       setError(nextError instanceof Error ? nextError.message : String(nextError)),
     )
-  }, [snapshot?.workspace.workspace_id, snapshot?.generated_at, issueFilters, activeView])
+  }, [workspaceId, snapshot?.generated_at, issueFilters, activeView])
 
   useEffect(() => {
-    if (!snapshot?.workspace.workspace_id) return
+    if (!workspaceId) return
     if (activeView !== 'signals') return
-    void refreshSignalQueue().catch((nextError) =>
+    void refreshSignalQueueEffect().catch((nextError) =>
       setError(nextError instanceof Error ? nextError.message : String(nextError)),
     )
-  }, [snapshot?.workspace.workspace_id, snapshot?.generated_at, signalQuery, activeView])
+  }, [workspaceId, snapshot?.generated_at, signalQuery, activeView])
 
   useEffect(() => {
     setSelectedIssueId((current) => {
@@ -568,14 +741,153 @@ function App() {
   }, [filteredActivity])
 
   useEffect(() => {
-    if (!snapshot?.workspace.workspace_id || !selectedIssue) return
-    void issueWork(snapshot.workspace.workspace_id, selectedIssue.bug_id, selectedRunbookId || undefined)
+    if (!workspaceId || !selectedIssueBugId) return
+    void issueWork(workspaceId, selectedIssueBugId, selectedRunbookId || undefined)
       .then(setIssueContextPacket)
       .catch((nextError) => setError(nextError instanceof Error ? nextError.message : String(nextError)))
-    void readIssueDrift(snapshot.workspace.workspace_id, selectedIssue.bug_id)
+    void readIssueDrift(workspaceId, selectedIssueBugId)
       .then(setIssueDrift)
       .catch((nextError) => setError(nextError instanceof Error ? nextError.message : String(nextError)))
-  }, [snapshot?.workspace.workspace_id, selectedIssue?.bug_id, selectedRunbookId])
+  }, [workspaceId, selectedIssueBugId, selectedRunbookId])
+
+  useEffect(() => {
+    if (!workspaceId || !selectedIssueBugId) {
+      setIssueQuality(null)
+      setDuplicateMatches([])
+      setTriageSuggestion(null)
+      setCoverageDelta(null)
+      setTestSuggestions([])
+      setIssueContextReplays([])
+      return
+    }
+
+    let cancelled = false
+    void (async () => {
+      try {
+        const [qualityResult, duplicatesResult, triageResult, coverageResult, testSuggestionsResult, contextReplaysResult] = await Promise.allSettled([
+          getIssueQuality(workspaceId, selectedIssueBugId),
+          findDuplicates(workspaceId, selectedIssueBugId),
+          triageIssue(workspaceId, selectedIssueBugId),
+          getCoverageDelta(workspaceId, selectedIssueBugId),
+          getTestSuggestions(workspaceId, selectedIssueBugId),
+          listIssueContextReplays(workspaceId, selectedIssueBugId),
+        ])
+        if (cancelled) return
+        if (qualityResult.status === 'fulfilled') {
+          setIssueQuality(qualityResult.value)
+          setIssueQualityById((current) => ({ ...current, [qualityResult.value.issue_id]: qualityResult.value }))
+        } else {
+          setIssueQuality(null)
+        }
+        if (duplicatesResult.status === 'fulfilled') {
+          setDuplicateMatches(duplicatesResult.value)
+        } else {
+          setDuplicateMatches([])
+        }
+        if (triageResult.status === 'fulfilled') {
+          setTriageSuggestion(triageResult.value)
+        } else {
+          setTriageSuggestion(null)
+        }
+        if (coverageResult.status === 'fulfilled') {
+          setCoverageDelta(coverageResult.value)
+        } else {
+          setCoverageDelta(null)
+        }
+        if (testSuggestionsResult.status === 'fulfilled') {
+          setTestSuggestions(testSuggestionsResult.value)
+        } else {
+          setTestSuggestions([])
+        }
+        if (contextReplaysResult.status === 'fulfilled') {
+          setIssueContextReplays(contextReplaysResult.value)
+        } else {
+          setIssueContextReplays([])
+        }
+      } catch (nextError) {
+        if (!cancelled) {
+          setError(nextError instanceof Error ? nextError.message : String(nextError))
+        }
+      }
+    })()
+
+    return () => {
+      cancelled = true
+    }
+  }, [workspaceId, selectedIssueBugId, selectedIssueUpdatedAt])
+
+  useEffect(() => {
+    if (!workspaceId || !selectedRunRecordId || !selectedRunStatus) {
+      setPatchCritique(null)
+      setRunImprovements([])
+      setRunInsight(null)
+      return
+    }
+    if (!['completed', 'failed', 'cancelled', 'running', 'queued', 'planning'].includes(selectedRunStatus)) {
+      setPatchCritique(null)
+      setRunImprovements([])
+      setRunInsight(null)
+      return
+    }
+
+    let cancelled = false
+    void (async () => {
+      const [critiqueResult, improvementsResult, insightResult] = await Promise.allSettled([
+        getPatchCritique(workspaceId, selectedRunRecordId),
+        getRunImprovements(workspaceId, selectedRunRecordId),
+        getRunInsights(workspaceId, selectedRunRecordId),
+      ])
+      if (cancelled) return
+      if (critiqueResult.status === 'fulfilled') {
+        setPatchCritique(critiqueResult.value)
+      } else {
+        setPatchCritique(null)
+      }
+      if (improvementsResult.status === 'fulfilled') {
+        setRunImprovements(improvementsResult.value)
+      } else {
+        setRunImprovements([])
+      }
+      if (insightResult.status === 'fulfilled') {
+        setRunInsight(insightResult.value)
+      } else {
+        setRunInsight(null)
+      }
+    })().catch((nextError) => {
+      if (!cancelled) {
+        setError(nextError instanceof Error ? nextError.message : String(nextError))
+      }
+    })
+
+    return () => {
+      cancelled = true
+    }
+  }, [workspaceId, selectedRunRecordId, selectedRunStatus])
+
+  useEffect(() => {
+    if (!workspaceId) {
+      setIssueQualityById({})
+      return
+    }
+
+    let cancelled = false
+    void scoreAllIssues(workspaceId)
+      .then((scores) => {
+        if (cancelled) return
+        setIssueQualityById(
+          Object.fromEntries(scores.map((score) => [score.issue_id, score])),
+        )
+      })
+      .catch((nextError) => {
+        if (!cancelled) {
+          setError(nextError instanceof Error ? nextError.message : String(nextError))
+        }
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [workspaceId, snapshot?.generated_at])
 
   useEffect(() => {
     if (!selectedIssue) return
@@ -592,7 +904,7 @@ function App() {
     setFixHowDraft('')
     setFixIssueStatusDraft(selectedIssue.issue_status === 'resolved' ? 'resolved' : 'verification')
     setFixRunIdDraft(null)
-  }, [selectedIssue?.bug_id])
+  }, [selectedIssue])
 
   useEffect(() => {
     const selectedRunbook = issueContextPacket?.available_runbooks.find((item) => item.runbook_id === selectedRunbookId) ?? null
@@ -608,16 +920,142 @@ function App() {
   }, [issueContextPacket?.available_runbooks, selectedRunbookId])
 
   useEffect(() => {
+    setSelectedVerificationProfileId((current) =>
+      verificationProfiles.some((item) => item.profile_id === current) ? current : verificationProfiles[0]?.profile_id ?? '',
+    )
+  }, [verificationProfiles])
+
+  useEffect(() => {
+    if (!selectedVerificationProfile) {
+      setVerificationProfileNameDraft('')
+      setVerificationProfileDescriptionDraft('')
+      setVerificationProfileTestCommandDraft('')
+      setVerificationProfileCoverageCommandDraft('')
+      setVerificationProfileCoveragePathDraft('')
+      setVerificationProfileCoverageFormatDraft('unknown')
+      setVerificationProfileRuntimeDraft('30')
+      setVerificationProfileRetryDraft('1')
+      setVerificationProfileSourcePathsDraft('')
+      return
+    }
+    setVerificationProfileNameDraft(selectedVerificationProfile.name)
+    setVerificationProfileDescriptionDraft(selectedVerificationProfile.description)
+    setVerificationProfileTestCommandDraft(selectedVerificationProfile.test_command)
+    setVerificationProfileCoverageCommandDraft(selectedVerificationProfile.coverage_command ?? '')
+    setVerificationProfileCoveragePathDraft(selectedVerificationProfile.coverage_report_path ?? '')
+    setVerificationProfileCoverageFormatDraft(selectedVerificationProfile.coverage_format)
+    setVerificationProfileRuntimeDraft(String(selectedVerificationProfile.max_runtime_seconds))
+    setVerificationProfileRetryDraft(String(selectedVerificationProfile.retry_count))
+    setVerificationProfileSourcePathsDraft(selectedVerificationProfile.source_paths.join(', '))
+  }, [selectedVerificationProfile])
+
+  useEffect(() => {
+    const contexts = issueContextPacket?.ticket_contexts ?? []
+    setSelectedTicketContextId((current) =>
+      contexts.some((item) => item.context_id === current) ? current : '',
+    )
+  }, [issueContextPacket?.ticket_contexts])
+
+  useEffect(() => {
+    if (!selectedTicketContext) {
+      setTicketContextProviderDraft('manual')
+      setTicketContextExternalIdDraft('')
+      setTicketContextTitleDraft('')
+      setTicketContextSummaryDraft('')
+      setTicketContextCriteriaDraft('')
+      setTicketContextLinksDraft('')
+      setTicketContextLabelsDraft('')
+      setTicketContextStatusDraft('')
+      setTicketContextSourceExcerptDraft('')
+      return
+    }
+    setTicketContextProviderDraft(selectedTicketContext.provider)
+    setTicketContextExternalIdDraft(selectedTicketContext.external_id ?? '')
+    setTicketContextTitleDraft(selectedTicketContext.title)
+    setTicketContextSummaryDraft(selectedTicketContext.summary)
+    setTicketContextCriteriaDraft(selectedTicketContext.acceptance_criteria.join('\n'))
+    setTicketContextLinksDraft(selectedTicketContext.links.join('\n'))
+    setTicketContextLabelsDraft(selectedTicketContext.labels.join(', '))
+    setTicketContextStatusDraft(selectedTicketContext.status ?? '')
+    setTicketContextSourceExcerptDraft(selectedTicketContext.source_excerpt ?? '')
+  }, [selectedTicketContext])
+
+  useEffect(() => {
+    const threatModels = issueContextPacket?.threat_models ?? []
+    setSelectedThreatModelId((current) =>
+      threatModels.some((item) => item.threat_model_id === current) ? current : '',
+    )
+  }, [issueContextPacket?.threat_models])
+
+  useEffect(() => {
+    if (!selectedThreatModel) {
+      setThreatModelTitleDraft('')
+      setThreatModelMethodologyDraft('manual')
+      setThreatModelSummaryDraft('')
+      setThreatModelAssetsDraft('')
+      setThreatModelEntryPointsDraft('')
+      setThreatModelTrustBoundariesDraft('')
+      setThreatModelAbuseCasesDraft('')
+      setThreatModelMitigationsDraft('')
+      setThreatModelReferencesDraft('')
+      setThreatModelStatusDraft('draft')
+      return
+    }
+    setThreatModelTitleDraft(selectedThreatModel.title)
+    setThreatModelMethodologyDraft(selectedThreatModel.methodology)
+    setThreatModelSummaryDraft(selectedThreatModel.summary)
+    setThreatModelAssetsDraft(selectedThreatModel.assets.join('\n'))
+    setThreatModelEntryPointsDraft(selectedThreatModel.entry_points.join('\n'))
+    setThreatModelTrustBoundariesDraft(selectedThreatModel.trust_boundaries.join('\n'))
+    setThreatModelAbuseCasesDraft(selectedThreatModel.abuse_cases.join('\n'))
+    setThreatModelMitigationsDraft(selectedThreatModel.mitigations.join('\n'))
+    setThreatModelReferencesDraft(selectedThreatModel.references.join('\n'))
+    setThreatModelStatusDraft(selectedThreatModel.status)
+  }, [selectedThreatModel])
+
+  useEffect(() => {
+    if (!workspaceId || !selectedRunRecordId) {
+      setSelectedRunPlan(null)
+      return
+    }
+    if (selectedRunPlanRecord) {
+      setSelectedRunPlan(selectedRunPlanRecord)
+      return
+    }
+    if (selectedRunStatus !== 'planning') {
+      setSelectedRunPlan(null)
+      return
+    }
+
+    let cancelled = false
+    void getPlan(workspaceId, selectedRunRecordId)
+      .then((plan) => {
+        if (!cancelled) {
+          setSelectedRunPlan(plan)
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setSelectedRunPlan(null)
+        }
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [workspaceId, selectedRunRecordId, selectedRunStatus, selectedRunPlanRecord])
+
+  useEffect(() => {
     if (activeView !== 'runs' && activeView !== 'review') return
-    if (!snapshot?.workspace.workspace_id || !selectedRun) return
+    if (!workspaceId || !selectedRunRecordId) return
     setLogContent('')
     logOffsetRef.current = 0
 
     const poll = async () => {
       try {
         const [runRecord, log] = await Promise.all([
-          readRun(snapshot.workspace.workspace_id, selectedRun.run_id),
-          readRunLog(snapshot.workspace.workspace_id, selectedRun.run_id, logOffsetRef.current),
+          readRun(workspaceId, selectedRunRecordId),
+          readRunLog(workspaceId, selectedRunRecordId, logOffsetRef.current),
         ])
         setRuns((currentRuns) => {
           const next = currentRuns.filter((item) => item.run_id !== runRecord.run_id)
@@ -628,7 +1066,8 @@ function App() {
         }
         logOffsetRef.current = log.offset
         if (runRecord.status === 'completed' || runRecord.status === 'failed' || runRecord.status === 'cancelled') {
-          await refreshActivityData(snapshot.workspace.workspace_id)
+          await refreshActivityData(workspaceId)
+          await refreshCostData(workspaceId)
         }
         if (!log.eof) {
           logTimerRef.current = window.setTimeout(poll, 1200)
@@ -644,20 +1083,21 @@ function App() {
         window.clearTimeout(logTimerRef.current)
       }
     }
-  }, [activeView, snapshot?.workspace.workspace_id, selectedRunId])
+  }, [activeView, workspaceId, selectedRunRecordId])
 
   useEffect(() => {
-    if (!snapshot?.workspace.workspace_id || !activeLiveRun) return
+    if (!workspaceId || !activeLiveRunId) return
 
     const poll = async () => {
       try {
-        const runRecord = await readRun(snapshot.workspace.workspace_id, activeLiveRun.run_id)
+        const runRecord = await readRun(workspaceId, activeLiveRunId)
         setRuns((currentRuns) => {
           const next = currentRuns.filter((item) => item.run_id !== runRecord.run_id)
           return [runRecord, ...next]
         })
         if (runRecord.status === 'completed' || runRecord.status === 'failed' || runRecord.status === 'cancelled') {
-          await refreshActivityData(snapshot.workspace.workspace_id)
+          await refreshActivityData(workspaceId)
+          await refreshCostData(workspaceId)
           return
         }
         runRefreshTimerRef.current = window.setTimeout(poll, 1500)
@@ -672,14 +1112,14 @@ function App() {
         window.clearTimeout(runRefreshTimerRef.current)
       }
     }
-  }, [snapshot?.workspace.workspace_id, activeLiveRun?.run_id])
+  }, [workspaceId, activeLiveRunId])
 
   useEffect(() => {
-    if (!snapshot?.workspace.workspace_id || !terminalId) return
+    if (!workspaceId || !terminalId) return
 
     const poll = async () => {
       try {
-        const log = await readTerminal(terminalId, snapshot.workspace.workspace_id, terminalOffsetRef.current)
+        const log = await readTerminal(terminalId, workspaceId, terminalOffsetRef.current)
         if (log.content) {
           setTerminalOutput((current) => `${current}${log.content}`)
           terminalOffsetRef.current = log.offset
@@ -698,7 +1138,7 @@ function App() {
         window.clearTimeout(terminalTimerRef.current)
       }
     }
-  }, [snapshot?.workspace.workspace_id, terminalId])
+  }, [workspaceId, terminalId])
 
   async function loadWorkspaceState(rootPath: string) {
     setLoading(true)
@@ -718,6 +1158,7 @@ function App() {
       setTreePath('')
       setExecutionOpen(false)
       setSelectedRunId(null)
+      setSelectedVerificationProfileId('')
       setSelectedIssueId(nextSnapshot.issues[0]?.bug_id ?? null)
       setSelectedSignalId(nextSnapshot.signals[0]?.signal_id ?? null)
       setActivityQuery('')
@@ -760,6 +1201,7 @@ function App() {
       })
       setRuns((current) => [run, ...current])
       setSelectedRunId(run.run_id)
+      setSelectedRunPlan(run.plan ?? null)
       setActiveView('runs')
       setExecutionOpen(true)
       setInstruction('')
@@ -782,6 +1224,7 @@ function App() {
       })
       setRuns((current) => [run, ...current])
       setSelectedRunId(run.run_id)
+      setSelectedRunPlan(null)
       setActiveView('runs')
       setExecutionOpen(true)
       await refreshActivityData(snapshot.workspace.workspace_id)
@@ -831,6 +1274,89 @@ function App() {
       await refreshIssueQueue()
       setDriftSummary(await readDrift(snapshot.workspace.workspace_id))
       await refreshActivityData(snapshot.workspace.workspace_id)
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : String(nextError))
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  async function handleRefreshIssueAnalysis() {
+    if (!snapshot || !selectedIssue) return
+    setLoading(true)
+    try {
+      const [quality, duplicates, triage] = await Promise.all([
+        scoreIssueQuality(snapshot.workspace.workspace_id, selectedIssue.bug_id),
+        findDuplicates(snapshot.workspace.workspace_id, selectedIssue.bug_id),
+        triageIssue(snapshot.workspace.workspace_id, selectedIssue.bug_id),
+      ])
+      setIssueQuality(quality)
+      setIssueQualityById((current) => ({ ...current, [quality.issue_id]: quality }))
+      setDuplicateMatches(duplicates)
+      setTriageSuggestion(triage)
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : String(nextError))
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  async function handleGenerateTestSuggestions() {
+    if (!snapshot || !selectedIssue) return
+    setLoading(true)
+    try {
+      const suggestions = await generateTestSuggestions(snapshot.workspace.workspace_id, selectedIssue.bug_id)
+      setTestSuggestions(suggestions)
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : String(nextError))
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  async function handleGeneratePatchCritique() {
+    if (!snapshot || !selectedRun) return
+    setLoading(true)
+    try {
+      const critique = await generatePatchCritique(snapshot.workspace.workspace_id, selectedRun.run_id)
+      setPatchCritique(critique)
+      setRunImprovements(critique.improvements.filter((item) => !item.dismissed))
+      try {
+        setRunInsight(await getRunInsights(snapshot.workspace.workspace_id, selectedRun.run_id))
+      } catch {
+        setRunInsight(null)
+      }
+      await refreshActivityData(snapshot.workspace.workspace_id)
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : String(nextError))
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  async function handleDismissImprovement(suggestionId: string) {
+    if (!snapshot || !selectedRun) return
+    const reason = window.prompt('Dismiss reason (optional):') ?? undefined
+    setLoading(true)
+    try {
+      await dismissImprovement(snapshot.workspace.workspace_id, selectedRun.run_id, suggestionId, reason)
+      const [critiqueResult, improvementsResult] = await Promise.allSettled([
+        getPatchCritique(snapshot.workspace.workspace_id, selectedRun.run_id),
+        getRunImprovements(snapshot.workspace.workspace_id, selectedRun.run_id),
+      ])
+      if (critiqueResult.status === 'fulfilled') {
+        setPatchCritique(critiqueResult.value)
+      }
+      if (improvementsResult.status === 'fulfilled') {
+        setRunImprovements(improvementsResult.value)
+      } else {
+        setRunImprovements([])
+      }
+      try {
+        setRunInsight(await getRunInsights(snapshot.workspace.workspace_id, selectedRun.run_id))
+      } catch {
+        setRunInsight(null)
+      }
     } catch (nextError) {
       setError(nextError instanceof Error ? nextError.message : String(nextError))
     } finally {
@@ -1007,6 +1533,161 @@ function App() {
     }
   }
 
+  function handleApplyVerificationProfile() {
+    setInstruction(buildInstructionFromVerificationProfile(selectedVerificationProfile, selectedIssue))
+    setExecutionOpen(true)
+  }
+
+  async function handleSaveVerificationProfile() {
+    if (!snapshot || !verificationProfileNameDraft.trim() || !verificationProfileTestCommandDraft.trim()) return
+    setLoading(true)
+    try {
+      const saved = await saveVerificationProfile(snapshot.workspace.workspace_id, {
+        profile_id: selectedVerificationProfile?.profile_id || undefined,
+        name: verificationProfileNameDraft.trim(),
+        description: verificationProfileDescriptionDraft.trim(),
+        test_command: verificationProfileTestCommandDraft.trim(),
+        coverage_command: verificationProfileCoverageCommandDraft.trim() || undefined,
+        coverage_report_path: verificationProfileCoveragePathDraft.trim() || undefined,
+        coverage_format: verificationProfileCoverageFormatDraft,
+        max_runtime_seconds: Number.parseInt(verificationProfileRuntimeDraft, 10) || 30,
+        retry_count: Number.parseInt(verificationProfileRetryDraft, 10) || 0,
+        source_paths: parseLabelDraft(verificationProfileSourcePathsDraft),
+      })
+      setVerificationProfiles(await listVerificationProfiles(snapshot.workspace.workspace_id))
+      setSelectedVerificationProfileId(saved.profile_id)
+      if (selectedIssue) {
+        setIssueContextPacket(await issueWork(snapshot.workspace.workspace_id, selectedIssue.bug_id, selectedRunbookId || undefined))
+      }
+      await refreshActivityData(snapshot.workspace.workspace_id)
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : String(nextError))
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  async function handleDeleteVerificationProfile() {
+    if (!snapshot || !selectedVerificationProfile || selectedVerificationProfile.built_in) return
+    setLoading(true)
+    try {
+      await deleteVerificationProfile(snapshot.workspace.workspace_id, selectedVerificationProfile.profile_id)
+      const nextProfiles = await listVerificationProfiles(snapshot.workspace.workspace_id)
+      setVerificationProfiles(nextProfiles)
+      setSelectedVerificationProfileId(nextProfiles[0]?.profile_id ?? '')
+      if (selectedIssue) {
+        setIssueContextPacket(await issueWork(snapshot.workspace.workspace_id, selectedIssue.bug_id, selectedRunbookId || undefined))
+      }
+      await refreshActivityData(snapshot.workspace.workspace_id)
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : String(nextError))
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  async function handleSaveTicketContext() {
+    if (!snapshot || !selectedIssue || !ticketContextTitleDraft.trim()) return
+    setLoading(true)
+    try {
+      const saved = await saveTicketContext(snapshot.workspace.workspace_id, selectedIssue.bug_id, {
+        context_id: selectedTicketContext?.context_id || undefined,
+        provider: ticketContextProviderDraft,
+        external_id: ticketContextExternalIdDraft.trim() || undefined,
+        title: ticketContextTitleDraft.trim(),
+        summary: ticketContextSummaryDraft.trim(),
+        acceptance_criteria: parseLineDraft(ticketContextCriteriaDraft),
+        links: parseLineDraft(ticketContextLinksDraft),
+        labels: parseLabelDraft(ticketContextLabelsDraft),
+        status: ticketContextStatusDraft.trim() || undefined,
+        source_excerpt: ticketContextSourceExcerptDraft.trim() || undefined,
+      })
+      setSelectedTicketContextId(saved.context_id)
+      setIssueContextPacket(await issueWork(snapshot.workspace.workspace_id, selectedIssue.bug_id, selectedRunbookId || undefined))
+      await refreshActivityData(snapshot.workspace.workspace_id)
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : String(nextError))
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  async function handleDeleteTicketContext() {
+    if (!snapshot || !selectedIssue || !selectedTicketContext) return
+    setLoading(true)
+    try {
+      await deleteTicketContext(snapshot.workspace.workspace_id, selectedIssue.bug_id, selectedTicketContext.context_id)
+      setSelectedTicketContextId('')
+      setIssueContextPacket(await issueWork(snapshot.workspace.workspace_id, selectedIssue.bug_id, selectedRunbookId || undefined))
+      await refreshActivityData(snapshot.workspace.workspace_id)
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : String(nextError))
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  async function handleSaveThreatModel() {
+    if (!snapshot || !selectedIssue || !threatModelTitleDraft.trim()) return
+    setLoading(true)
+    try {
+      const saved = await saveThreatModel(snapshot.workspace.workspace_id, selectedIssue.bug_id, {
+        threat_model_id: selectedThreatModel?.threat_model_id || undefined,
+        title: threatModelTitleDraft.trim(),
+        methodology: threatModelMethodologyDraft,
+        summary: threatModelSummaryDraft.trim(),
+        assets: parseLineDraft(threatModelAssetsDraft),
+        entry_points: parseLineDraft(threatModelEntryPointsDraft),
+        trust_boundaries: parseLineDraft(threatModelTrustBoundariesDraft),
+        abuse_cases: parseLineDraft(threatModelAbuseCasesDraft),
+        mitigations: parseLineDraft(threatModelMitigationsDraft),
+        references: parseLineDraft(threatModelReferencesDraft),
+        status: threatModelStatusDraft,
+      })
+      setSelectedThreatModelId(saved.threat_model_id)
+      setIssueContextPacket(await issueWork(snapshot.workspace.workspace_id, selectedIssue.bug_id, selectedRunbookId || undefined))
+      await refreshActivityData(snapshot.workspace.workspace_id)
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : String(nextError))
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  async function handleDeleteThreatModel() {
+    if (!snapshot || !selectedIssue || !selectedThreatModel) return
+    setLoading(true)
+    try {
+      await deleteThreatModel(snapshot.workspace.workspace_id, selectedIssue.bug_id, selectedThreatModel.threat_model_id)
+      setSelectedThreatModelId('')
+      setIssueContextPacket(await issueWork(snapshot.workspace.workspace_id, selectedIssue.bug_id, selectedRunbookId || undefined))
+      await refreshActivityData(snapshot.workspace.workspace_id)
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : String(nextError))
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  async function handleCaptureIssueContextReplay() {
+    if (!snapshot || !selectedIssue) return
+    setLoading(true)
+    try {
+      await captureIssueContextReplay(
+        snapshot.workspace.workspace_id,
+        selectedIssue.bug_id,
+        contextReplayLabelDraft.trim() || undefined,
+      )
+      setIssueContextReplays(await listIssueContextReplays(snapshot.workspace.workspace_id, selectedIssue.bug_id))
+      setContextReplayLabelDraft('')
+      await refreshActivityData(snapshot.workspace.workspace_id)
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : String(nextError))
+    } finally {
+      setLoading(false)
+    }
+  }
+
   function handleUseSelectedRunForFix() {
     if (!snapshot || !selectedIssue || !selectedRun || selectedRun.issue_id !== selectedIssue.bug_id) return
     setLoading(true)
@@ -1114,6 +1795,7 @@ function App() {
       const retriedRun = await retryRun(snapshot.workspace.workspace_id, selectedRun.run_id)
       setRuns((current) => [retriedRun, ...current])
       setSelectedRunId(retriedRun.run_id)
+      setSelectedRunPlan(retriedRun.plan ?? null)
       await refreshActivityData(snapshot.workspace.workspace_id)
     } catch (nextError) {
       setError(nextError instanceof Error ? nextError.message : String(nextError))
@@ -1128,6 +1810,11 @@ function App() {
     try {
       const plan = await generatePlan(snapshot.workspace.workspace_id, selectedRun.run_id)
       setSelectedRunPlan(plan)
+      setRuns((currentRuns) =>
+        currentRuns.map((run) =>
+          run.run_id === selectedRun.run_id ? { ...run, status: 'planning', plan } : run,
+        ),
+      )
       await refreshActivityData(snapshot.workspace.workspace_id)
     } catch (nextError) {
       setError(nextError instanceof Error ? nextError.message : String(nextError))
@@ -1140,8 +1827,8 @@ function App() {
     if (!snapshot || !selectedRun) return
     setLoading(true)
     try {
-      await approvePlan(snapshot.workspace.workspace_id, selectedRun.run_id, { feedback })
-      setSelectedRunPlan(null)
+      const approvedPlan = await approvePlan(snapshot.workspace.workspace_id, selectedRun.run_id, { feedback })
+      setSelectedRunPlan(approvedPlan)
       const updatedRuns = await listRuns(snapshot.workspace.workspace_id)
       setRuns(updatedRuns)
       await refreshActivityData(snapshot.workspace.workspace_id)
@@ -1156,8 +1843,8 @@ function App() {
     if (!snapshot || !selectedRun) return
     setLoading(true)
     try {
-      await rejectPlan(snapshot.workspace.workspace_id, selectedRun.run_id, { reason })
-      setSelectedRunPlan(null)
+      const rejectedPlan = await rejectPlan(snapshot.workspace.workspace_id, selectedRun.run_id, { reason })
+      setSelectedRunPlan(rejectedPlan)
       const updatedRuns = await listRuns(snapshot.workspace.workspace_id)
       setRuns(updatedRuns)
       await refreshActivityData(snapshot.workspace.workspace_id)
@@ -1258,6 +1945,8 @@ function App() {
         selectedWorkspaceId={snapshot?.workspace.workspace_id}
         activeView={activeView}
         loading={loading}
+        workspaceGuidance={workspaceGuidance}
+        verificationProfileCount={verificationProfiles.length}
         onWorkspacePathChange={setWorkspacePath}
         onLoadWorkspace={() => void loadWorkspaceState(workspacePath)}
         onScanWorkspace={() => void handleScan()}
@@ -1272,6 +1961,9 @@ function App() {
           workspacePath={snapshot?.workspace.root_path}
           latestScanAt={snapshot?.workspace.latest_scan_at}
           worktree={worktree}
+          costSummary={costSummary}
+          guidanceCount={workspaceGuidance.length}
+          hasRepoGuidance={workspaceGuidance.length > 0}
           backendHealthy={backendHealthy}
           canExport={Boolean(snapshot)}
           canToggleExecution={Boolean(snapshot && selectedIssue)}
@@ -1314,6 +2006,23 @@ function App() {
           </section>
         ) : (
           <>
+            {!workspaceGuidance.length ? (
+              <section className="guidance-empty-state panel">
+                <div className="detail-section">
+                  <p className="eyebrow">Repo guidance</p>
+                  <h3>This workspace has no repo instructions yet.</h3>
+                  <p className="subtle">
+                    Add an `AGENTS.md` or `CONVENTIONS.md` file so issue prompts and runs inherit project-specific rules instead of generic defaults.
+                  </p>
+                </div>
+                <div className="tag-row">
+                  <span className="tag">Recommended: `AGENTS.md`</span>
+                  <span className="tag">Useful sections: setup, commands, code style, review expectations</span>
+                  <span className="tag">Optional: `.openhands/skills/*.md` or `.devin/wiki.json`</span>
+                </div>
+              </section>
+            ) : null}
+
             <section className="workspace-focus">
               <div>
                 <p className="eyebrow">Current focus</p>
@@ -1331,6 +2040,7 @@ function App() {
                 <span className="tag">Issues: {snapshot.summary.issues_total}</span>
                 <span className="tag">Open: {snapshot.summary.issues_open}</span>
                 <span className="tag">Drift: {snapshot.summary.drift_total}</span>
+                <span className="tag">Guidance: {workspaceGuidance.length}</span>
                 {selectedIssue ? <span className="tag">Issue: {selectedIssue.issue_status}</span> : null}
                 {selectedIssue?.drift_flags.length ? <span className="tag">Drift: {selectedIssue.drift_flags.length}</span> : null}
                 {worktree?.is_git_repo ? <span className="tag">Branch: {worktree.branch ?? 'detached'}</span> : null}
@@ -1380,6 +2090,9 @@ function App() {
                 treeNodes={treeNodes}
                 treePath={treePath}
                 activity={filteredActivity}
+                costSummary={costSummary}
+                issueQualityById={issueQualityById}
+                runMetricsById={runMetricsById}
                 selectedIssueId={selectedIssueId}
                 selectedSignalId={selectedSignalId}
                 selectedRunId={selectedRunId}
@@ -1449,7 +2162,43 @@ function App() {
                 issueActivity={issueActivity}
                 runActivity={runActivity}
                 issueDrift={issueDrift}
+                issueQuality={issueQuality}
+                duplicateMatches={duplicateMatches}
+                triageSuggestion={triageSuggestion}
+                runMetrics={selectedRunMetrics}
+                costSummary={costSummary}
+                coverageDelta={coverageDelta}
+                testSuggestions={testSuggestions}
+                patchCritique={patchCritique}
+                runImprovements={runImprovements}
+                runInsight={runInsight}
                 issueContextPacket={issueContextPacket}
+                workspaceGuidance={workspaceGuidance}
+                repoMap={repoMap}
+                verificationProfiles={verificationProfiles}
+                issueContextReplays={issueContextReplays}
+                contextReplayLabelDraft={contextReplayLabelDraft}
+                selectedTicketContextId={selectedTicketContextId}
+                ticketContextProviderDraft={ticketContextProviderDraft}
+                ticketContextExternalIdDraft={ticketContextExternalIdDraft}
+                ticketContextTitleDraft={ticketContextTitleDraft}
+                ticketContextSummaryDraft={ticketContextSummaryDraft}
+                ticketContextCriteriaDraft={ticketContextCriteriaDraft}
+                ticketContextLinksDraft={ticketContextLinksDraft}
+                ticketContextLabelsDraft={ticketContextLabelsDraft}
+                ticketContextStatusDraft={ticketContextStatusDraft}
+                ticketContextSourceExcerptDraft={ticketContextSourceExcerptDraft}
+                selectedThreatModelId={selectedThreatModelId}
+                threatModelTitleDraft={threatModelTitleDraft}
+                threatModelMethodologyDraft={threatModelMethodologyDraft}
+                threatModelSummaryDraft={threatModelSummaryDraft}
+                threatModelAssetsDraft={threatModelAssetsDraft}
+                threatModelEntryPointsDraft={threatModelEntryPointsDraft}
+                threatModelTrustBoundariesDraft={threatModelTrustBoundariesDraft}
+                threatModelAbuseCasesDraft={threatModelAbuseCasesDraft}
+                threatModelMitigationsDraft={threatModelMitigationsDraft}
+                threatModelReferencesDraft={threatModelReferencesDraft}
+                threatModelStatusDraft={threatModelStatusDraft}
                 issueSeverityDraft={issueSeverityDraft}
                 issueStatusDraft={issueStatusDraft}
                 issueDocStatusDraft={issueDocStatusDraft}
@@ -1477,6 +2226,28 @@ function App() {
                 onIssueStatusChange={setIssueStatusDraft}
                 onIssueDocStatusChange={setIssueDocStatusDraft}
                 onIssueCodeStatusChange={setIssueCodeStatusDraft}
+                onSelectedTicketContextChange={setSelectedTicketContextId}
+                onTicketContextProviderChange={setTicketContextProviderDraft}
+                onTicketContextExternalIdChange={setTicketContextExternalIdDraft}
+                onTicketContextTitleChange={setTicketContextTitleDraft}
+                onTicketContextSummaryChange={setTicketContextSummaryDraft}
+                onTicketContextCriteriaChange={setTicketContextCriteriaDraft}
+                onTicketContextLinksChange={setTicketContextLinksDraft}
+                onTicketContextLabelsChange={setTicketContextLabelsDraft}
+                onTicketContextStatusChange={setTicketContextStatusDraft}
+                onTicketContextSourceExcerptChange={setTicketContextSourceExcerptDraft}
+                onSelectedThreatModelChange={setSelectedThreatModelId}
+                onThreatModelTitleChange={setThreatModelTitleDraft}
+                onThreatModelMethodologyChange={setThreatModelMethodologyDraft}
+                onThreatModelSummaryChange={setThreatModelSummaryDraft}
+                onThreatModelAssetsChange={setThreatModelAssetsDraft}
+                onThreatModelEntryPointsChange={setThreatModelEntryPointsDraft}
+                onThreatModelTrustBoundariesChange={setThreatModelTrustBoundariesDraft}
+                onThreatModelAbuseCasesChange={setThreatModelAbuseCasesDraft}
+                onThreatModelMitigationsChange={setThreatModelMitigationsDraft}
+                onThreatModelReferencesChange={setThreatModelReferencesDraft}
+                onThreatModelStatusChange={setThreatModelStatusDraft}
+                onContextReplayLabelChange={setContextReplayLabelDraft}
                 onIssueLabelsChange={setIssueLabelsDraft}
                 onIssueNotesChange={setIssueNotesDraft}
                 onIssueFollowupChange={setIssueFollowupDraft}
@@ -1498,6 +2269,15 @@ function App() {
                 onDismissRunReview={() => void handleReviewRun('dismissed')}
                 onMarkRunInvestigationOnly={() => void handleReviewRun('investigation_only')}
                 onPromoteSignal={() => selectedSignal && void handlePromoteSignal(selectedSignal)}
+                onRefreshIssueAnalysis={() => void handleRefreshIssueAnalysis()}
+                onGenerateTestSuggestions={() => void handleGenerateTestSuggestions()}
+                onGeneratePatchCritique={() => void handleGeneratePatchCritique()}
+                onDismissImprovement={(suggestionId) => void handleDismissImprovement(suggestionId)}
+                onSaveTicketContext={() => void handleSaveTicketContext()}
+                onDeleteTicketContext={() => void handleDeleteTicketContext()}
+                onSaveThreatModel={() => void handleSaveThreatModel()}
+                onDeleteThreatModel={() => void handleDeleteThreatModel()}
+                onCaptureIssueContextReplay={() => void handleCaptureIssueContextReplay()}
                 onRetryRun={() => void handleRetryRun()}
                 onCancelRun={() => void handleCancelRun()}
                 selectedRunPlan={selectedRunPlan}
@@ -1520,6 +2300,17 @@ function App() {
                   runbookNameDraft={runbookNameDraft}
                   runbookDescriptionDraft={runbookDescriptionDraft}
                   runbookTemplateDraft={runbookTemplateDraft}
+                  verificationProfiles={verificationProfiles}
+                  selectedVerificationProfileId={selectedVerificationProfileId}
+                  verificationProfileNameDraft={verificationProfileNameDraft}
+                  verificationProfileDescriptionDraft={verificationProfileDescriptionDraft}
+                  verificationProfileTestCommandDraft={verificationProfileTestCommandDraft}
+                  verificationProfileCoverageCommandDraft={verificationProfileCoverageCommandDraft}
+                  verificationProfileCoveragePathDraft={verificationProfileCoveragePathDraft}
+                  verificationProfileCoverageFormatDraft={verificationProfileCoverageFormatDraft}
+                  verificationProfileRuntimeDraft={verificationProfileRuntimeDraft}
+                  verificationProfileRetryDraft={verificationProfileRetryDraft}
+                  verificationProfileSourcePathsDraft={verificationProfileSourcePathsDraft}
                   settings={settings}
                   terminalId={terminalId}
                   terminalInput={terminalInput}
@@ -1550,6 +2341,19 @@ function App() {
                   onApplySelectedRunbook={handleApplySelectedRunbook}
                   onSaveRunbook={() => void handleSaveRunbook()}
                   onDeleteRunbook={() => void handleDeleteRunbook()}
+                  onSelectedVerificationProfileChange={setSelectedVerificationProfileId}
+                  onVerificationProfileNameDraftChange={setVerificationProfileNameDraft}
+                  onVerificationProfileDescriptionDraftChange={setVerificationProfileDescriptionDraft}
+                  onVerificationProfileTestCommandDraftChange={setVerificationProfileTestCommandDraft}
+                  onVerificationProfileCoverageCommandDraftChange={setVerificationProfileCoverageCommandDraft}
+                  onVerificationProfileCoveragePathDraftChange={setVerificationProfileCoveragePathDraft}
+                  onVerificationProfileCoverageFormatDraftChange={setVerificationProfileCoverageFormatDraft}
+                  onVerificationProfileRuntimeDraftChange={setVerificationProfileRuntimeDraft}
+                  onVerificationProfileRetryDraftChange={setVerificationProfileRetryDraft}
+                  onVerificationProfileSourcePathsDraftChange={setVerificationProfileSourcePathsDraft}
+                  onApplySelectedVerificationProfile={handleApplyVerificationProfile}
+                  onSaveVerificationProfile={() => void handleSaveVerificationProfile()}
+                  onDeleteVerificationProfile={() => void handleDeleteVerificationProfile()}
                   onSettingsChange={setSettings}
                   onSaveSettings={() => void handleSaveSettings()}
                   onRefreshCapabilities={() => void handleRefreshCapabilities()}

@@ -2,221 +2,175 @@
 
 ## Product Model
 
-xMustard treats bugs as structured operational records with a clear lifecycle:
+xMustard is an issue-operations system, not a general-purpose agent chat. The product centers on durable records:
 
-```
-Issue Created → Triaged → Investigating → In Progress → Verification → Resolved
-                                ↓
-                          Partial Fix (drift detected)
-```
+- issues
+- signals
+- runs
+- plans
+- fixes
+- verifications
+- review artifacts
+- repository guidance
 
-### Core Entities
+## Runtime Model
 
-- **Issues**: Canonical bugs from ledgers, verdicts, promoted signals, or manual entry
-- **Signals**: Unpromoted discovery findings from code scans (TODO/FIXME/BUG annotations, swallowed exceptions)
-- **Runs**: Terminal-backed agent jobs attached to an issue
-- **Context Packets**: Deterministic issue bundles used to seed agent runs
-- **Fix Records**: Proposed/accepted fixes from agent runs
-- **Verifications**: Three-pass verification results with coverage data
+The agent runtime is replaceable. The tracker owns state, evidence, and review history; the runtime only executes work.
 
-## Backend Design
+Current runtime pattern:
 
-### Directory Structure
+- build an issue context packet
+- attach repo guidance
+- optionally generate a plan
+- stream run logs
+- persist metrics and artifacts
+- generate a run insight summary
 
-```
-backend/
-├── app/
-│   ├── main.py          # FastAPI app (535 lines) - all API endpoints
-│   ├── models.py        # Pydantic models (568 lines) - all data structures
-│   ├── service.py       # TrackerService (1200+ lines) - core business logic
-│   ├── store.py         # FileStore (248 lines) - JSON file persistence
-│   ├── cli.py           # Typer CLI (695 lines) - command-line interface
-│   ├── scanners.py      # Bug ledger/verdict parsing (392 lines)
-│   ├── runtimes.py      # RuntimeService (498 lines) - agent execution
-│   └── terminal.py      # TerminalService - PTY management
-├── data/
-│   ├── workspaces.json     # Workspace registry
-│   ├── settings.json       # App settings
-│   └── workspaces/
-│       └── <workspace-id>/
-│           ├── snapshot.json
-│           ├── tracker_issues.json
-│           ├── fix_records.json
-│           ├── verifications.json
-│           ├── runs/
-│           │   ├── run_<id>.json      # Run metadata
-│           │   ├── run_<id>.log       # Run output
-│           │   └── run_<id>.out.json  # Structured output
-│           ├── terminals/
-│           └── activity.jsonl          # Audit log
-```
+This separation matters for the long-term platform plan:
 
-### Workspace State
+- xMustard should be able to swap runtime adapters, search/indexing engines, and eventually backend implementation language without changing the product model
 
-- Workspace state stored as JSON under `backend/data/workspaces/<workspace-id>/`
-- Scanners ingest:
-  - `docs/bugs/Bugs_*.md`
-  - `Bugs_*_verdicts.json`
-  - Code annotations and heuristic grep signals
-- Drift flags computed from partial fixes, missing evidence, missing verification tests
+## Backend Shape
 
-### Agent Runtime Abstraction
+`backend/app/` contains the core system:
 
-Inspired by OpenHands and SWE-agent, runtimes are abstracted:
+- `models.py`: Pydantic models for issues, runs, guidance, metrics, critique, and verification artifacts
+- `service.py`: orchestration logic for workspace loading, context building, triage analysis, runs, and review data
+- `runtimes.py`: runtime launch and metric calculation
+- `scanners.py`: canonical issue ingestion and low-noise discovery scanning
+- `main.py`: FastAPI endpoints
+- `cli.py`: Typer CLI
+- `store.py`: file-backed persistence
 
-```python
-RuntimeKind = Literal["codex", "opencode", "openhands", "custom"]
+Workspace data lives under `backend/data/workspaces/<workspace-id>/`.
 
-class RuntimeService:
-    def detect_runtimes() -> list[RuntimeCapabilities]
-    def probe_runtime(workspace_id, runtime, model) -> RuntimeProbeResult
-    def start_run(issue_id, runtime, model, instruction) -> RunRecord
-    def get_run_log(run_id) -> str
-```
+## Guidance Layer
 
-Current implementations:
-- `codex exec --json`
-- `opencode run --format json`
+The guidance layer is one of the most important additions to the architecture.
 
-### New: Planning Checkpoint System
+Inputs:
 
-Inspired by SWE-agent's trajectory hooks and AutoCodeRover's phase system:
+- top-level instruction files such as `AGENTS.md`
+- repo conventions files
+- repo index files such as `.devin/wiki.json`
+- skill and microagent files from OpenHands, Cline, or similar setups
 
-```
-User triggers run
-    ↓
-[PLANNING] Agent generates plan
-    ↓
-User approves/modifies plan
-    ↓
-[EXECUTION] Agent executes plan
-    ↓
-[REVIEW] User reviews changes
-    ↓
-[VERIFICATION] Tests run, coverage measured
-    ↓
-[ACCEPT/DISCARD] Fix record created
-```
+Processing:
 
-### New: Cost Tracking
+- discover supported guidance files
+- summarize them into structured `RepoGuidanceRecord` entries
+- attach them to issue context packets
+- store `guidance_paths` on runs
+- surface them in run insights and the UI
 
-Inspired by OpenHands Metrics and SWE-agent InstanceStats:
+Why it exists:
 
-```python
-class RunMetrics(BaseModel):
-    tokens_used: int = 0
-    prompt_tokens: int = 0
-    completion_tokens: int = 0
-    cost_usd: float = 0.0
-    duration_ms: int = 0
-    model: str
-```
+- it shifts the system from generic repo scanning toward repo-specific, inspectable context
 
-### New: Triage Automation
+## Context Building
 
-Inspired by trIAge and PR-Agent:
+Issue context packets are currently composed from:
 
-```python
-class IssueQualityScore(BaseModel):
-    completeness: float      # Has repro steps, severity, evidence?
-    clarity: float          # Clear title, description?
-    duplication_score: float # Similarity to existing issues
-    priority_score: float   # Impact vs urgency matrix
-```
+- issue data
+- evidence
+- repo-map summary and ranked related paths
+- recent fixes
+- recent issue activity
+- runbooks
+- worktree status
+- repository guidance
 
-### New: Coverage Verification
+The repo-map layer now adds early structural context such as:
 
-Inspired by Qodo Cover:
+- top directories
+- notable files
+- ranked related paths for an issue
 
-```python
-class CoverageResult(BaseModel):
-    before_coverage: float
-    after_coverage: float
-    delta: float
-    tests_added: list[str]
-    tests_passed: list[str]
-```
+The next architectural step is to deepen that with:
 
-## UI Design
+- symbol summaries
+- enclosing function or class context
 
-### Layout
+## Review And Verification Layer
 
-- Dense left-nav and queue-first navigation inspired by Linear Next
-- Detail panels for issue metadata, evidence, and runtime operations
-- Execution pane for agent runs with log streaming
-- Activity panel with event history and summaries
+The tracker stores artifacts after execution, not just before it.
 
-### New: Run Progress View
+Current artifacts:
 
-Inspired by SWE-agent's trajectory view:
+- run metrics and workspace cost summaries
+- patch critique
+- improvement suggestions
+- coverage deltas
+- test suggestions
+- run insights
+- issue-context replay snapshots
 
-```
-┌─ Run Progress ─────────────────────────────────┐
-│ ● Planning (current)                            │
-│ ○ Execution                                     │
-│ ○ Review                                        │
-│ ○ Verification                                  │
-├────────────────────────────────────────────────┤
-│ Plan Preview:                                   │
-│ 1. Search for authenticate_user function        │
-│ 2. Add null check for token expiry             │
-│ 3. Add test case                               │
-├────────────────────────────────────────────────┤
-│ [Approve] [Modify] [Cancel]                    │
-└────────────────────────────────────────────────┘
-```
+This is the beginning of a review system shaped more like PR review than plain terminal logging.
 
-### New: Cost Dashboard
+## Security And Trust Layer
 
-Inspired by OpenHands metrics dashboard:
+The next architectural layer should make trust explicit instead of implied.
 
-```
-┌─ Run Costs ────────────────────────────────────┐
-│ Total this session: $2.47                      │
-│ Tokens: 145,230 (12,450 prompt / 132,780 comp) │
-├────────────────────────────────────────────────┤
-│ P0_25M03_001    $0.82   ████████████          │
-│ P1_25M03_002    $0.54   ████████              │
-│ P2_25M03_003    $1.11   ████████████████      │
-└────────────────────────────────────────────────┘
-```
+Planned additions:
 
-## Integration Patterns
+- threat-model records linked to issues and runs
+- security acceptance criteria attached to ticket context
+- confidence scoring for fixes and verification outcomes
+- audit trails for approvals, execution, sync, and policy decisions
 
-### Agent Runtime Integration
+This layer is important if xMustard is going to compete as an operational system rather than a developer toy.
 
-Inspired by OpenHands plugin system:
+## Retrieval And Intelligence Layer
 
-```python
-# Runtime discovery
-runtimes = service.runtime_service.detect_runtimes()
-# Returns available runtimes with binary paths and models
+The next major context upgrade is not "scan more files." It is "retrieve better evidence."
 
-# Runtime probe (health check)
-probe = service.probe_runtime(workspace_id, "codex", "gpt-5.4")
-# Verifies runtime is accessible and model is available
-```
+Planned additions:
 
-### External Tool Integration
+- symbol-aware repo maps
+- hybrid semantic and keyword retrieval across issues, runs, ticket context, and review artifacts
+- context ranking that combines issue evidence, ticket intent, and structural repo data
 
-Inspired by PR-Agent's git providers:
+This is the path toward stronger dynamic context and better operator trust.
 
-- **GitHub**: Issue import, PR creation for fixes
-- **Slack**: Run completion notifications
-- **Linear/Jira**: Issue sync
+## Frontend Shape
 
-## Security
+The frontend is a queue-first operational UI:
 
-### Approval Gates
+- sidebar for workspace selection and guidance health
+- topbar for workspace health, cost, and guidance status
+- queue panes for issues, runs, review items, signals, activity, and sources
+- detail pane for issue context, review artifacts, verification, and repo guidance
+- optional execution drawer for live runtime interaction
 
-Inspired by cline's approval system:
+## Architectural Gaps
 
-- Planning checkpoint requires user approval before execution
-- High-cost runs (> $5) require explicit confirmation
-- File modification limits configurable per workspace
+The biggest remaining gaps are:
 
-### Audit Trail
+- symbol-aware repo map and dynamic context
+- threat modeling, confidence, and security review artifacts
+- semantic retrieval across operational records
+- agent governance, auditability, and team-level insights
+- replay and evaluation harnesses
+- export-oriented review packets
+- deeper Jira and Linear ticket context ingestion
 
-- All operations logged to `activity.jsonl`
-- Run trajectories persisted for replay and debugging
-- Cost records maintained for budget tracking
+These gaps matter more than adding more heuristic scanning.
+
+## Backend Migration Strategy
+
+The current backend is Python-first, but the long-term architecture should support a Rust-based core.
+
+Why:
+
+- repo indexing and retrieval will become more compute-heavy
+- verification execution and process control benefit from stronger systems primitives
+- a compiled backend is a better fit for long-term portability and packaging
+
+Recommended migration path:
+
+1. keep the HTTP and frontend contracts stable
+2. isolate scanning, repo-map generation, retrieval, and verification execution behind clear service boundaries
+3. reimplement those subsystems in Rust first, either as sidecars or library-backed services
+4. migrate orchestration last, only after the data model and operational workflows are proven
+
+This should be an incremental replacement strategy, not a rewrite that pauses product work.

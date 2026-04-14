@@ -21,8 +21,8 @@
     "Reply with exactly {\"status\":\"ok\"}"
   ],
   "command_preview": "/opt/homebrew/bin/codex exec --json --skip-git-repo-check -s workspace-write -C /Users/for_home/Developer/CoTitanMigration/Co_Titan -m gpt-5.4-mini 'Reply with exactly {\"status\":\"ok\"}'",
-  "log_path": "/Users/for_home/Developer/CoTitanMigration/Co_Titan_Bug_Tracker/backend/data/workspaces/co-titan-0a54108278/runs/run_b874350b2178.log",
-  "output_path": "/Users/for_home/Developer/CoTitanMigration/Co_Titan_Bug_Tracker/backend/data/workspaces/co-titan-0a54108278/runs/run_b874350b2178.out.json",
+  "log_path": "/Users/for_home/Developer/xMustard/backend/data/workspaces/co-titan-0a54108278/runs/run_b874350b2178.log",
+  "output_path": "/Users/for_home/Developer/xMustard/backend/data/workspaces/co-titan-0a54108278/runs/run_b874350b2178.out.json",
   "created_at": "2026-03-30T18:56:04.931734+00:00",
   "started_at": null,
   "completed_at": "2026-03-30T18:56:05.367790Z",

@@ -1,19 +1,105 @@
 import type {
   ActivityRecord,
   ActivityOverview,
+  CostSummary,
+  CoverageDelta,
   DiscoverySignal,
+  DuplicateMatch,
+  ImprovementSuggestion,
+  IssueContextReplayRecord,
   IssueContextPacket,
   IssueDriftDetail,
+  IssueQualityScore,
   IssueRecord,
+  PatchCritique,
+  RepoMapSummary,
+  RepoGuidanceRecord,
+  RunMetrics,
   RunPlan,
   RunRecord,
+  RunSessionInsight,
   SourceRecord,
+  TestSuggestion,
+  ThreatModelRecord,
+  TicketContextRecord,
+  TriageSuggestion,
+  VerificationProfileRecord,
   ViewMode,
 } from '../lib/types'
-import { SummaryCard } from './TrackerPrimitives'
-import { StatusPill, formatDate } from './TrackerPrimitives'
+import { SummaryCard, StatusPill } from './TrackerPrimitives'
+import { formatDate } from '../lib/format'
 import { ActivityDigestSummary } from './ActivityDigestSummary'
+import { CostSummaryPanel } from './CostSummary'
 import { PlanPreview } from './PlanPreview'
+
+function qualityAccent(score?: number | null) {
+  if (score === null || score === undefined) return 'sand'
+  if (score >= 80) return 'green'
+  if (score >= 55) return 'amber'
+  return 'red'
+}
+
+function confidenceTone(confidence?: number | null) {
+  if (confidence === null || confidence === undefined) return 'unknown'
+  if (confidence >= 0.75) return 'fixed'
+  if (confidence >= 0.45) return 'running'
+  return 'failed'
+}
+
+function deltaAccent(delta?: number | null) {
+  if (delta === null || delta === undefined) return 'sand'
+  if (delta > 0) return 'green'
+  if (delta < 0) return 'red'
+  return 'sand'
+}
+
+function guidanceTone(kind: RepoGuidanceRecord['kind']) {
+  if (kind === 'agent_instructions') return 'codex'
+  if (kind === 'conventions') return 'blue'
+  if (kind === 'skill') return 'green'
+  if (kind === 'repo_index') return 'amber'
+  return 'sand'
+}
+
+function GuidanceList({
+  guidance,
+  emptyLabel,
+}: {
+  guidance: RepoGuidanceRecord[]
+  emptyLabel: string
+}) {
+  if (!guidance.length) {
+    return <p className="subtle">{emptyLabel}</p>
+  }
+  return (
+    <div className="activity-list">
+      {guidance.map((item) => (
+        <div key={item.guidance_id} className="activity-entry">
+          <div className="activity-entry-top">
+            <strong>{item.title}</strong>
+            <small>{item.path}</small>
+          </div>
+          <div className="row-meta">
+            <StatusPill tone={guidanceTone(item.kind)}>{item.kind.replace(/_/g, ' ')}</StatusPill>
+            <span className="tag">{item.always_on ? 'always-on' : 'optional'}</span>
+            {item.updated_at ? <span className="tag">{formatDate(item.updated_at)}</span> : null}
+          </div>
+          <p>{item.summary || 'No guidance summary available.'}</p>
+          {item.trigger_keywords.length ? (
+            <div className="tag-row">
+              {item.trigger_keywords.map((keyword) => (
+                <span key={`${item.guidance_id}-${keyword}`} className="tag">
+                  {keyword}
+                </span>
+              ))}
+            </div>
+          ) : null}
+          {item.excerpt ? <pre className="detail-mini-block">{item.excerpt}</pre> : null}
+        </div>
+      ))}
+    </div>
+  )
+}
 
 function WorktreeSnapshot({ label, worktree }: { label: string; worktree?: IssueContextPacket['worktree'] | RunRecord['worktree'] }) {
   if (!worktree?.available) return null
@@ -62,7 +148,43 @@ type Props = {
   issueActivity: ActivityRecord[]
   runActivity: ActivityRecord[]
   issueDrift: IssueDriftDetail | null
+  issueQuality: IssueQualityScore | null
+  duplicateMatches: DuplicateMatch[]
+  triageSuggestion: TriageSuggestion | null
+  runMetrics: RunMetrics | null
+  costSummary: CostSummary | null
+  coverageDelta: CoverageDelta | null
+  testSuggestions: TestSuggestion[]
+  patchCritique: PatchCritique | null
+  runImprovements: ImprovementSuggestion[]
+  runInsight: RunSessionInsight | null
   issueContextPacket: IssueContextPacket | null
+  workspaceGuidance: RepoGuidanceRecord[]
+  repoMap: RepoMapSummary | null
+  verificationProfiles: VerificationProfileRecord[]
+  issueContextReplays: IssueContextReplayRecord[]
+  contextReplayLabelDraft: string
+  selectedTicketContextId: string
+  ticketContextProviderDraft: TicketContextRecord['provider']
+  ticketContextExternalIdDraft: string
+  ticketContextTitleDraft: string
+  ticketContextSummaryDraft: string
+  ticketContextCriteriaDraft: string
+  ticketContextLinksDraft: string
+  ticketContextLabelsDraft: string
+  ticketContextStatusDraft: string
+  ticketContextSourceExcerptDraft: string
+  selectedThreatModelId: string
+  threatModelTitleDraft: string
+  threatModelMethodologyDraft: ThreatModelRecord['methodology']
+  threatModelSummaryDraft: string
+  threatModelAssetsDraft: string
+  threatModelEntryPointsDraft: string
+  threatModelTrustBoundariesDraft: string
+  threatModelAbuseCasesDraft: string
+  threatModelMitigationsDraft: string
+  threatModelReferencesDraft: string
+  threatModelStatusDraft: ThreatModelRecord['status']
   issueSeverityDraft: string
   issueStatusDraft: string
   issueDocStatusDraft: string
@@ -90,6 +212,28 @@ type Props = {
   onIssueStatusChange: (value: string) => void
   onIssueDocStatusChange: (value: string) => void
   onIssueCodeStatusChange: (value: string) => void
+  onSelectedTicketContextChange: (value: string) => void
+  onTicketContextProviderChange: (value: TicketContextRecord['provider']) => void
+  onTicketContextExternalIdChange: (value: string) => void
+  onTicketContextTitleChange: (value: string) => void
+  onTicketContextSummaryChange: (value: string) => void
+  onTicketContextCriteriaChange: (value: string) => void
+  onTicketContextLinksChange: (value: string) => void
+  onTicketContextLabelsChange: (value: string) => void
+  onTicketContextStatusChange: (value: string) => void
+  onTicketContextSourceExcerptChange: (value: string) => void
+  onSelectedThreatModelChange: (value: string) => void
+  onThreatModelTitleChange: (value: string) => void
+  onThreatModelMethodologyChange: (value: ThreatModelRecord['methodology']) => void
+  onThreatModelSummaryChange: (value: string) => void
+  onThreatModelAssetsChange: (value: string) => void
+  onThreatModelEntryPointsChange: (value: string) => void
+  onThreatModelTrustBoundariesChange: (value: string) => void
+  onThreatModelAbuseCasesChange: (value: string) => void
+  onThreatModelMitigationsChange: (value: string) => void
+  onThreatModelReferencesChange: (value: string) => void
+  onThreatModelStatusChange: (value: ThreatModelRecord['status']) => void
+  onContextReplayLabelChange: (value: string) => void
   onIssueLabelsChange: (value: string) => void
   onIssueNotesChange: (value: string) => void
   onIssueFollowupChange: (value: boolean) => void
@@ -111,6 +255,15 @@ type Props = {
   onDismissRunReview: () => void
   onMarkRunInvestigationOnly: () => void
   onPromoteSignal: () => void
+  onRefreshIssueAnalysis: () => void
+  onGenerateTestSuggestions: () => void
+  onGeneratePatchCritique: () => void
+  onDismissImprovement: (suggestionId: string) => void
+  onSaveTicketContext: () => void
+  onDeleteTicketContext: () => void
+  onSaveThreatModel: () => void
+  onDeleteThreatModel: () => void
+  onCaptureIssueContextReplay: () => void
   onRetryRun: () => void
   onCancelRun: () => void
   selectedRunPlan: RunPlan | null
@@ -131,7 +284,43 @@ export function DetailPane({
   issueActivity,
   runActivity,
   issueDrift,
+  issueQuality,
+  duplicateMatches,
+  triageSuggestion,
+  runMetrics,
+  costSummary,
+  coverageDelta,
+  testSuggestions,
+  patchCritique,
+  runImprovements,
+  runInsight,
   issueContextPacket,
+  workspaceGuidance,
+  repoMap,
+  verificationProfiles,
+  issueContextReplays,
+  contextReplayLabelDraft,
+  selectedTicketContextId,
+  ticketContextProviderDraft,
+  ticketContextExternalIdDraft,
+  ticketContextTitleDraft,
+  ticketContextSummaryDraft,
+  ticketContextCriteriaDraft,
+  ticketContextLinksDraft,
+  ticketContextLabelsDraft,
+  ticketContextStatusDraft,
+  ticketContextSourceExcerptDraft,
+  selectedThreatModelId,
+  threatModelTitleDraft,
+  threatModelMethodologyDraft,
+  threatModelSummaryDraft,
+  threatModelAssetsDraft,
+  threatModelEntryPointsDraft,
+  threatModelTrustBoundariesDraft,
+  threatModelAbuseCasesDraft,
+  threatModelMitigationsDraft,
+  threatModelReferencesDraft,
+  threatModelStatusDraft,
   issueSeverityDraft,
   issueStatusDraft,
   issueDocStatusDraft,
@@ -159,6 +348,28 @@ export function DetailPane({
   onIssueStatusChange,
   onIssueDocStatusChange,
   onIssueCodeStatusChange,
+  onSelectedTicketContextChange,
+  onTicketContextProviderChange,
+  onTicketContextExternalIdChange,
+  onTicketContextTitleChange,
+  onTicketContextSummaryChange,
+  onTicketContextCriteriaChange,
+  onTicketContextLinksChange,
+  onTicketContextLabelsChange,
+  onTicketContextStatusChange,
+  onTicketContextSourceExcerptChange,
+  onSelectedThreatModelChange,
+  onThreatModelTitleChange,
+  onThreatModelMethodologyChange,
+  onThreatModelSummaryChange,
+  onThreatModelAssetsChange,
+  onThreatModelEntryPointsChange,
+  onThreatModelTrustBoundariesChange,
+  onThreatModelAbuseCasesChange,
+  onThreatModelMitigationsChange,
+  onThreatModelReferencesChange,
+  onThreatModelStatusChange,
+  onContextReplayLabelChange,
   onIssueLabelsChange,
   onIssueNotesChange,
   onIssueFollowupChange,
@@ -180,6 +391,15 @@ export function DetailPane({
   onDismissRunReview,
   onMarkRunInvestigationOnly,
   onPromoteSignal,
+  onRefreshIssueAnalysis,
+  onGenerateTestSuggestions,
+  onGeneratePatchCritique,
+  onDismissImprovement,
+  onSaveTicketContext,
+  onDeleteTicketContext,
+  onSaveThreatModel,
+  onDeleteThreatModel,
+  onCaptureIssueContextReplay,
   onRetryRun,
   onCancelRun,
   selectedRunPlan,
@@ -187,6 +407,11 @@ export function DetailPane({
   onApprovePlan,
   onRejectPlan,
 }: Props) {
+  const selectedTicketContext =
+    issueContextPacket?.ticket_contexts.find((item) => item.context_id === selectedTicketContextId) ?? null
+  const selectedThreatModel =
+    issueContextPacket?.threat_models.find((item) => item.threat_model_id === selectedThreatModelId) ?? null
+
   return (
     <div className="panel detail-panel">
       {(activeView === 'issues' || activeView === 'drift' || activeView === 'review') && selectedIssue ? (
@@ -266,6 +491,116 @@ export function DetailPane({
                 ))
               ) : (
                 <span className="subtle">No drift flags.</span>
+              )}
+            </div>
+          </section>
+
+          <section className="detail-section">
+            <div className="panel-header">
+              <div>
+                <h4>Issue analysis</h4>
+                <p className="subtle">Quality, likely duplicates, and triage guidance from the backend analysis endpoints.</p>
+              </div>
+              <button type="button" className="ghost-button" onClick={onRefreshIssueAnalysis} disabled={loading}>
+                Refresh analysis
+              </button>
+            </div>
+            <div className="summary-grid analysis-summary-grid">
+              <SummaryCard
+                label="Quality"
+                value={issueQuality ? `${issueQuality.overall}%` : 'n/a'}
+                accent={qualityAccent(issueQuality?.overall)}
+              />
+              <SummaryCard
+                label="Completeness"
+                value={issueQuality ? `${issueQuality.completeness}%` : 'n/a'}
+                accent={qualityAccent(issueQuality?.completeness)}
+              />
+              <SummaryCard
+                label="Clarity"
+                value={issueQuality ? `${issueQuality.clarity}%` : 'n/a'}
+                accent={qualityAccent(issueQuality?.clarity)}
+              />
+              <SummaryCard
+                label="Evidence"
+                value={issueQuality ? `${issueQuality.evidence_quality}%` : 'n/a'}
+                accent={qualityAccent(issueQuality?.evidence_quality)}
+              />
+            </div>
+            {issueQuality ? (
+              <>
+                <div className="tag-row">
+                  <span className="tag">evidence refs: {issueQuality.evidence_count}</span>
+                  <span className="tag">title chars: {issueQuality.title_length}</span>
+                  <span className="tag">summary chars: {issueQuality.summary_length}</span>
+                  <span className="tag">{issueQuality.has_repro ? 'has repro' : 'missing repro'}</span>
+                  <span className="tag">{issueQuality.has_impact ? 'has impact' : 'missing impact'}</span>
+                </div>
+                {issueQuality.suggestions.length ? (
+                  <div className="analysis-list">
+                    {issueQuality.suggestions.map((suggestion) => (
+                      <div key={suggestion} className="evidence-row">
+                        <span>{suggestion}</span>
+                        <small>quality suggestion</small>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="subtle">No quality suggestions right now.</p>
+                )}
+              </>
+            ) : (
+              <p className="subtle">Issue analysis has not loaded yet.</p>
+            )}
+            <div className="toolbar-row">
+              <StatusPill
+                tone={confidenceTone(triageSuggestion?.confidence)}
+              >{`triage confidence ${triageSuggestion ? `${Math.round(triageSuggestion.confidence * 100)}%` : 'n/a'}`}</StatusPill>
+              {triageSuggestion?.suggested_severity ? (
+                <span className="tag">suggested severity: {triageSuggestion.suggested_severity}</span>
+              ) : null}
+              {triageSuggestion?.suggested_owner ? (
+                <span className="tag">suggested owner: {triageSuggestion.suggested_owner}</span>
+              ) : null}
+            </div>
+            {triageSuggestion ? (
+              <>
+                <p>{triageSuggestion.reasoning || 'No triage reasoning available.'}</p>
+                {triageSuggestion.suggested_labels.length ? (
+                  <div className="tag-row">
+                    {triageSuggestion.suggested_labels.map((label) => (
+                      <span key={label} className="tag">
+                        {label}
+                      </span>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="subtle">No label suggestions were generated.</p>
+                )}
+              </>
+            ) : (
+              <p className="subtle">No triage suggestion loaded.</p>
+            )}
+            <div className="activity-list">
+              {duplicateMatches.length ? (
+                duplicateMatches.slice(0, 5).map((match) => (
+                  <div key={`${match.source_id}-${match.target_id}`} className="activity-entry">
+                    <div className="activity-entry-top">
+                      <strong>{match.target_id}</strong>
+                      <small>{Math.round(match.similarity * 100)}% match</small>
+                    </div>
+                    <div className="row-meta">
+                      <span className="tag">{match.match_type}</span>
+                      {match.shared_fields.map((field) => (
+                        <span key={field} className="tag">
+                          {field}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                ))
+              ) : (
+                <p className="subtle">No meaningful duplicates detected.</p>
               )}
             </div>
           </section>
@@ -407,6 +742,517 @@ export function DetailPane({
             <div className="evidence-row">
               <span>Review-ready runs</span>
               <small>{selectedIssue.review_ready_runs.length ? selectedIssue.review_ready_runs.join(', ') : 'none'}</small>
+            </div>
+          </section>
+
+          <section className="detail-section">
+            <div className="panel-header">
+              <div>
+                <h4>Coverage and tests</h4>
+                <p className="subtle">Verification depth for this issue, plus suggested regression tests.</p>
+              </div>
+              <button type="button" className="ghost-button" onClick={onGenerateTestSuggestions} disabled={loading}>
+                Generate tests
+              </button>
+            </div>
+            {coverageDelta ? (
+              <>
+                <div className="summary-grid analysis-summary-grid">
+                  <SummaryCard
+                    label="Baseline"
+                    value={coverageDelta.baseline ? `${coverageDelta.baseline.line_coverage}%` : 'n/a'}
+                    accent="sand"
+                  />
+                  <SummaryCard
+                    label="Current"
+                    value={coverageDelta.current ? `${coverageDelta.current.line_coverage}%` : 'n/a'}
+                    accent="blue"
+                  />
+                  <SummaryCard
+                    label="Line delta"
+                    value={`${coverageDelta.line_delta > 0 ? '+' : ''}${coverageDelta.line_delta}%`}
+                    accent={deltaAccent(coverageDelta.line_delta)}
+                  />
+                  <SummaryCard
+                    label="Covered lines"
+                    value={`${coverageDelta.lines_added > 0 ? '+' : ''}${coverageDelta.lines_added} / -${coverageDelta.lines_lost}`}
+                    accent={deltaAccent(coverageDelta.lines_added - coverageDelta.lines_lost)}
+                  />
+                </div>
+                <div className="tag-row">
+                  {coverageDelta.new_files_covered.slice(0, 6).map((file) => (
+                    <span key={file} className="tag">
+                      covered: {file}
+                    </span>
+                  ))}
+                  {coverageDelta.files_regressed.slice(0, 6).map((file) => (
+                    <span key={file} className="tag tag-warning">
+                      regressed: {file}
+                    </span>
+                  ))}
+                </div>
+              </>
+            ) : (
+              <p className="subtle">No coverage delta recorded yet for this issue.</p>
+            )}
+            <div className="activity-list">
+              {testSuggestions.length ? (
+                testSuggestions.map((suggestion) => (
+                  <div key={suggestion.suggestion_id} className="activity-entry">
+                    <div className="activity-entry-top">
+                      <strong>{suggestion.test_file}</strong>
+                      <small>{suggestion.priority}</small>
+                    </div>
+                    <p>{suggestion.test_description}</p>
+                    <div className="row-meta">
+                      <span className="tag">{suggestion.priority}</span>
+                      <span className="tag">{formatDate(suggestion.created_at)}</span>
+                    </div>
+                    <small>{suggestion.rationale}</small>
+                  </div>
+                ))
+              ) : (
+                <p className="subtle">No saved test suggestions yet.</p>
+              )}
+            </div>
+          </section>
+
+          <section className="detail-section">
+            <div className="panel-header">
+              <div>
+                <h4>Verification profiles</h4>
+                <p className="subtle">Saved repo-specific commands for fast, repeatable issue verification.</p>
+              </div>
+              <span className="tag">{verificationProfiles.length} profiles</span>
+            </div>
+            <div className="activity-list">
+              {verificationProfiles.length ? (
+                verificationProfiles.map((profile) => (
+                  <div key={profile.profile_id} className="activity-entry">
+                    <div className="activity-entry-top">
+                      <strong>{profile.name}</strong>
+                      <small>{profile.built_in ? 'built-in' : 'custom'}</small>
+                    </div>
+                    <p>{profile.description || 'No description set.'}</p>
+                    <div className="row-meta">
+                      <span className="tag">{profile.coverage_format}</span>
+                      <span className="tag">{profile.max_runtime_seconds}s</span>
+                      <span className="tag">retries {profile.retry_count}</span>
+                    </div>
+                    <pre className="detail-mini-block">{profile.test_command}</pre>
+                    {profile.coverage_command ? <pre className="detail-mini-block">{profile.coverage_command}</pre> : null}
+                    {profile.source_paths.length ? (
+                      <div className="tag-row">
+                        {profile.source_paths.map((path) => (
+                          <span key={`${profile.profile_id}-${path}`} className="tag">
+                            {path}
+                          </span>
+                        ))}
+                      </div>
+                    ) : null}
+                  </div>
+                ))
+              ) : (
+                <p className="subtle">No verification profiles recorded for this workspace yet.</p>
+              )}
+            </div>
+          </section>
+
+          <section className="detail-section">
+            <div className="panel-header">
+              <div>
+                <h4>Structural context</h4>
+                <p className="subtle">Repo-map summary and ranked paths that help the agent localize this bug.</p>
+              </div>
+              {repoMap ? <span className="tag">{repoMap.source_files} source files</span> : null}
+            </div>
+            {issueContextPacket?.related_paths?.length ? (
+              <div className="tag-row">
+                {issueContextPacket.related_paths.map((path) => (
+                  <span key={`related-${path}`} className="tag">
+                    {path}
+                  </span>
+                ))}
+              </div>
+            ) : (
+              <p className="subtle">No ranked related paths recorded yet.</p>
+            )}
+            {repoMap ? (
+              <>
+                <div className="summary-grid analysis-summary-grid">
+                  <SummaryCard label="Files" value={repoMap.total_files} accent="sand" />
+                  <SummaryCard label="Source" value={repoMap.source_files} accent="blue" />
+                  <SummaryCard label="Tests" value={repoMap.test_files} accent="green" />
+                  <SummaryCard label="Exts" value={Object.keys(repoMap.top_extensions).length} accent="amber" />
+                </div>
+                <div className="activity-list">
+                  {repoMap.top_directories.map((directory) => (
+                    <div key={directory.path} className="activity-entry">
+                      <div className="activity-entry-top">
+                        <strong>{directory.path}</strong>
+                        <small>{directory.file_count} files</small>
+                      </div>
+                      <div className="row-meta">
+                        <span className="tag">source {directory.source_file_count}</span>
+                        <span className="tag">tests {directory.test_file_count}</span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+                {repoMap.key_files.length ? (
+                  <div className="tag-row">
+                    {repoMap.key_files.map((file) => (
+                      <span key={`key-${file.path}`} className="tag">
+                        {file.role}: {file.path}
+                      </span>
+                    ))}
+                  </div>
+                ) : null}
+              </>
+            ) : (
+              <p className="subtle">No repo map loaded for this workspace yet.</p>
+            )}
+          </section>
+
+          <section className="detail-section">
+            <div className="panel-header">
+              <div>
+                <h4>Ticket context</h4>
+                <p className="subtle">Acceptance criteria, upstream links, and product intent attached to this issue.</p>
+              </div>
+              <span className="tag">{issueContextPacket?.ticket_contexts.length ?? 0} linked</span>
+            </div>
+            <div className="toolbar-row">
+              <label className="detail-section field-stack runbook-picker" htmlFor="ticket-context-select">
+                <span className="filter-label">Selected context</span>
+                <select
+                  id="ticket-context-select"
+                  name="ticket-context-select"
+                  className="text-input"
+                  value={selectedTicketContextId}
+                  onChange={(event) => onSelectedTicketContextChange(event.target.value)}
+                >
+                  <option value="">New ticket context</option>
+                  {(issueContextPacket?.ticket_contexts ?? []).map((context) => (
+                    <option key={context.context_id} value={context.context_id}>
+                      {context.title}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              {selectedTicketContext ? (
+                <div className="tag-row">
+                  <span className="tag">{selectedTicketContext.provider}</span>
+                  {selectedTicketContext.external_id ? <span className="tag">{selectedTicketContext.external_id}</span> : null}
+                  {selectedTicketContext.status ? <span className="tag">{selectedTicketContext.status}</span> : null}
+                </div>
+              ) : (
+                <span className="subtle">Use this form to attach an upstream issue, incident, or acceptance brief.</span>
+              )}
+            </div>
+            <div className="detail-section runbook-editor">
+              <div className="toolbar-row">
+                <label className="detail-section field-stack" htmlFor="ticket-context-provider">
+                  <span className="filter-label">Provider</span>
+                  <select
+                    id="ticket-context-provider"
+                    name="ticket-context-provider"
+                    className="text-input"
+                    value={ticketContextProviderDraft}
+                    onChange={(event) => onTicketContextProviderChange(event.target.value as TicketContextRecord['provider'])}
+                  >
+                    {['manual', 'github', 'jira', 'linear', 'incident', 'other'].map((provider) => (
+                      <option key={provider} value={provider}>
+                        {provider}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className="detail-section field-stack" htmlFor="ticket-context-external-id">
+                  <span className="filter-label">External id</span>
+                  <input
+                    id="ticket-context-external-id"
+                    name="ticket-context-external-id"
+                    className="text-input"
+                    placeholder="PROJ-123 or repo#123"
+                    value={ticketContextExternalIdDraft}
+                    onChange={(event) => onTicketContextExternalIdChange(event.target.value)}
+                  />
+                </label>
+              </div>
+              <label className="detail-section field-stack" htmlFor="ticket-context-title">
+                <span className="filter-label">Title</span>
+                <input
+                  id="ticket-context-title"
+                  name="ticket-context-title"
+                  className="text-input"
+                  placeholder="Customer escalation or upstream bug title"
+                  value={ticketContextTitleDraft}
+                  onChange={(event) => onTicketContextTitleChange(event.target.value)}
+                />
+              </label>
+              <label className="detail-section field-stack" htmlFor="ticket-context-summary">
+                <span className="filter-label">Summary</span>
+                <textarea
+                  id="ticket-context-summary"
+                  name="ticket-context-summary"
+                  className="text-area"
+                  rows={4}
+                  placeholder="What the upstream ticket says this issue should accomplish."
+                  value={ticketContextSummaryDraft}
+                  onChange={(event) => onTicketContextSummaryChange(event.target.value)}
+                />
+              </label>
+              <label className="detail-section field-stack" htmlFor="ticket-context-criteria">
+                <span className="filter-label">Acceptance criteria</span>
+                <textarea
+                  id="ticket-context-criteria"
+                  name="ticket-context-criteria"
+                  className="text-area"
+                  rows={4}
+                  placeholder={'One criterion per line'}
+                  value={ticketContextCriteriaDraft}
+                  onChange={(event) => onTicketContextCriteriaChange(event.target.value)}
+                />
+              </label>
+              <div className="toolbar-row">
+                <label className="detail-section field-stack" htmlFor="ticket-context-links">
+                  <span className="filter-label">Links</span>
+                  <textarea
+                    id="ticket-context-links"
+                    name="ticket-context-links"
+                    className="text-area"
+                    rows={3}
+                    placeholder={'One URL per line'}
+                    value={ticketContextLinksDraft}
+                    onChange={(event) => onTicketContextLinksChange(event.target.value)}
+                  />
+                </label>
+                <label className="detail-section field-stack" htmlFor="ticket-context-status">
+                  <span className="filter-label">Status</span>
+                  <input
+                    id="ticket-context-status"
+                    name="ticket-context-status"
+                    className="text-input"
+                    placeholder="open, synced, verified"
+                    value={ticketContextStatusDraft}
+                    onChange={(event) => onTicketContextStatusChange(event.target.value)}
+                  />
+                </label>
+              </div>
+              <label className="detail-section field-stack" htmlFor="ticket-context-labels">
+                <span className="filter-label">Labels</span>
+                <input
+                  id="ticket-context-labels"
+                  name="ticket-context-labels"
+                  className="text-input"
+                  placeholder="customer, export"
+                  value={ticketContextLabelsDraft}
+                  onChange={(event) => onTicketContextLabelsChange(event.target.value)}
+                />
+              </label>
+              <label className="detail-section field-stack" htmlFor="ticket-context-excerpt">
+                <span className="filter-label">Source excerpt</span>
+                <textarea
+                  id="ticket-context-excerpt"
+                  name="ticket-context-excerpt"
+                  className="text-area"
+                  rows={3}
+                  placeholder="Relevant upstream text to keep with this issue."
+                  value={ticketContextSourceExcerptDraft}
+                  onChange={(event) => onTicketContextSourceExcerptChange(event.target.value)}
+                />
+              </label>
+              <div className="toolbar-row">
+                <button type="button" onClick={onSaveTicketContext} disabled={loading || !ticketContextTitleDraft.trim()}>
+                  Save ticket context
+                </button>
+                <button type="button" className="ghost-button" onClick={onDeleteTicketContext} disabled={loading || !selectedTicketContext}>
+                  Delete ticket context
+                </button>
+              </div>
+            </div>
+          </section>
+
+          <section className="detail-section">
+            <div className="panel-header">
+              <div>
+                <h4>Threat model</h4>
+                <p className="subtle">Assets, trust boundaries, abuse cases, and mitigations attached to this issue.</p>
+              </div>
+              <span className="tag">{issueContextPacket?.threat_models.length ?? 0} linked</span>
+            </div>
+            <div className="toolbar-row">
+              <label className="detail-section field-stack runbook-picker" htmlFor="threat-model-select">
+                <span className="filter-label">Selected model</span>
+                <select
+                  id="threat-model-select"
+                  name="threat-model-select"
+                  className="text-input"
+                  value={selectedThreatModelId}
+                  onChange={(event) => onSelectedThreatModelChange(event.target.value)}
+                >
+                  <option value="">New threat model</option>
+                  {(issueContextPacket?.threat_models ?? []).map((model) => (
+                    <option key={model.threat_model_id} value={model.threat_model_id}>
+                      {model.title}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              {selectedThreatModel ? (
+                <div className="tag-row">
+                  <span className="tag">{selectedThreatModel.methodology}</span>
+                  <span className="tag">{selectedThreatModel.status}</span>
+                </div>
+              ) : (
+                <span className="subtle">Use this to capture exploit paths, trust boundaries, and mitigations before or after a run.</span>
+              )}
+            </div>
+            <div className="detail-section runbook-editor">
+              <div className="toolbar-row">
+                <label className="detail-section field-stack" htmlFor="threat-model-title">
+                  <span className="filter-label">Title</span>
+                  <input
+                    id="threat-model-title"
+                    name="threat-model-title"
+                    className="text-input"
+                    placeholder="Export authorization boundary"
+                    value={threatModelTitleDraft}
+                    onChange={(event) => onThreatModelTitleChange(event.target.value)}
+                  />
+                </label>
+                <label className="detail-section field-stack" htmlFor="threat-model-methodology">
+                  <span className="filter-label">Methodology</span>
+                  <select
+                    id="threat-model-methodology"
+                    name="threat-model-methodology"
+                    className="text-input"
+                    value={threatModelMethodologyDraft}
+                    onChange={(event) => onThreatModelMethodologyChange(event.target.value as ThreatModelRecord['methodology'])}
+                  >
+                    {['manual', 'stride', 'threat_dragon', 'pytm', 'threagile', 'attack_path'].map((method) => (
+                      <option key={method} value={method}>
+                        {method}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className="detail-section field-stack" htmlFor="threat-model-status">
+                  <span className="filter-label">Status</span>
+                  <select
+                    id="threat-model-status"
+                    name="threat-model-status"
+                    className="text-input"
+                    value={threatModelStatusDraft}
+                    onChange={(event) => onThreatModelStatusChange(event.target.value as ThreatModelRecord['status'])}
+                  >
+                    {['draft', 'reviewed', 'accepted'].map((status) => (
+                      <option key={status} value={status}>
+                        {status}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              </div>
+              <label className="detail-section field-stack" htmlFor="threat-model-summary">
+                <span className="filter-label">Summary</span>
+                <textarea
+                  id="threat-model-summary"
+                  name="threat-model-summary"
+                  className="text-area"
+                  rows={3}
+                  placeholder="What security-sensitive path this issue touches."
+                  value={threatModelSummaryDraft}
+                  onChange={(event) => onThreatModelSummaryChange(event.target.value)}
+                />
+              </label>
+              <div className="toolbar-row">
+                <label className="detail-section field-stack" htmlFor="threat-model-assets">
+                  <span className="filter-label">Assets</span>
+                  <textarea
+                    id="threat-model-assets"
+                    name="threat-model-assets"
+                    className="text-area"
+                    rows={3}
+                    placeholder={'One asset per line'}
+                    value={threatModelAssetsDraft}
+                    onChange={(event) => onThreatModelAssetsChange(event.target.value)}
+                  />
+                </label>
+                <label className="detail-section field-stack" htmlFor="threat-model-entry-points">
+                  <span className="filter-label">Entry points</span>
+                  <textarea
+                    id="threat-model-entry-points"
+                    name="threat-model-entry-points"
+                    className="text-area"
+                    rows={3}
+                    placeholder={'One entry point per line'}
+                    value={threatModelEntryPointsDraft}
+                    onChange={(event) => onThreatModelEntryPointsChange(event.target.value)}
+                  />
+                </label>
+              </div>
+              <div className="toolbar-row">
+                <label className="detail-section field-stack" htmlFor="threat-model-trust-boundaries">
+                  <span className="filter-label">Trust boundaries</span>
+                  <textarea
+                    id="threat-model-trust-boundaries"
+                    name="threat-model-trust-boundaries"
+                    className="text-area"
+                    rows={3}
+                    placeholder={'One boundary per line'}
+                    value={threatModelTrustBoundariesDraft}
+                    onChange={(event) => onThreatModelTrustBoundariesChange(event.target.value)}
+                  />
+                </label>
+                <label className="detail-section field-stack" htmlFor="threat-model-abuse-cases">
+                  <span className="filter-label">Abuse cases</span>
+                  <textarea
+                    id="threat-model-abuse-cases"
+                    name="threat-model-abuse-cases"
+                    className="text-area"
+                    rows={3}
+                    placeholder={'One abuse case per line'}
+                    value={threatModelAbuseCasesDraft}
+                    onChange={(event) => onThreatModelAbuseCasesChange(event.target.value)}
+                  />
+                </label>
+              </div>
+              <div className="toolbar-row">
+                <label className="detail-section field-stack" htmlFor="threat-model-mitigations">
+                  <span className="filter-label">Mitigations</span>
+                  <textarea
+                    id="threat-model-mitigations"
+                    name="threat-model-mitigations"
+                    className="text-area"
+                    rows={3}
+                    placeholder={'One mitigation per line'}
+                    value={threatModelMitigationsDraft}
+                    onChange={(event) => onThreatModelMitigationsChange(event.target.value)}
+                  />
+                </label>
+                <label className="detail-section field-stack" htmlFor="threat-model-references">
+                  <span className="filter-label">References</span>
+                  <textarea
+                    id="threat-model-references"
+                    name="threat-model-references"
+                    className="text-area"
+                    rows={3}
+                    placeholder={'One reference or URL per line'}
+                    value={threatModelReferencesDraft}
+                    onChange={(event) => onThreatModelReferencesChange(event.target.value)}
+                  />
+                </label>
+              </div>
+              <div className="toolbar-row">
+                <button type="button" onClick={onSaveThreatModel} disabled={loading || !threatModelTitleDraft.trim()}>
+                  Save threat model
+                </button>
+                <button type="button" className="ghost-button" onClick={onDeleteThreatModel} disabled={loading || !selectedThreatModel}>
+                  Delete threat model
+                </button>
+              </div>
             </div>
           </section>
 
@@ -616,8 +1462,70 @@ export function DetailPane({
               </section>
 
               <section className="detail-section">
+                <div className="panel-header">
+                  <div>
+                    <h4>Repository guidance</h4>
+                    <p className="subtle">Always-on instructions and optional skills discovered in this repo.</p>
+                  </div>
+                  <div className="row-meta">
+                    <span className="tag">{issueContextPacket?.guidance.length ?? 0} attached</span>
+                  </div>
+                </div>
+                <GuidanceList
+                  guidance={issueContextPacket?.guidance ?? []}
+                  emptyLabel="No repository guidance files were attached to this issue context."
+                />
+              </section>
+
+              <section className="detail-section">
                 <h4>Agent context</h4>
                 <pre className="prompt-block">{issueContextPacket?.prompt ?? 'Loading context packet...'}</pre>
+              </section>
+
+              <section className="detail-section">
+                <div className="panel-header">
+                  <div>
+                    <h4>Context replays</h4>
+                    <p className="subtle">Saved prompt snapshots for future eval and replay comparisons.</p>
+                  </div>
+                  <span className="tag">{issueContextReplays.length} saved</span>
+                </div>
+                <div className="toolbar-row">
+                  <label className="detail-section field-stack" htmlFor="context-replay-label">
+                    <span className="filter-label">Replay label</span>
+                    <input
+                      id="context-replay-label"
+                      name="context-replay-label"
+                      className="text-input"
+                      placeholder="baseline prompt"
+                      value={contextReplayLabelDraft}
+                      onChange={(event) => onContextReplayLabelChange(event.target.value)}
+                    />
+                  </label>
+                  <button type="button" onClick={onCaptureIssueContextReplay} disabled={loading}>
+                    Capture replay
+                  </button>
+                </div>
+                <div className="activity-list">
+                  {issueContextReplays.length ? (
+                    issueContextReplays.map((replay) => (
+                      <div key={replay.replay_id} className="activity-entry">
+                        <div className="activity-entry-top">
+                          <strong>{replay.label}</strong>
+                          <small>{formatDate(replay.created_at)}</small>
+                        </div>
+                        <div className="row-meta">
+                          <span className="tag">focus {replay.tree_focus.length}</span>
+                          <span className="tag">guidance {replay.guidance_paths.length}</span>
+                          <span className="tag">profiles {replay.verification_profile_ids.length}</span>
+                        </div>
+                        <pre className="detail-mini-block">{replay.prompt}</pre>
+                      </div>
+                    ))
+                  ) : (
+                    <p className="subtle">No prompt snapshots saved for this issue yet.</p>
+                  )}
+                </div>
               </section>
 
               {activeView === 'issues' ? (
@@ -775,7 +1683,166 @@ export function DetailPane({
                   <span>Runbook</span>
                   <small>{selectedRun.runbook_id ?? 'none'}</small>
                 </div>
+                <div className="evidence-row">
+                  <span>Guidance files</span>
+                  <small>{selectedRun.guidance_paths.length ? selectedRun.guidance_paths.join(', ') : 'none attached'}</small>
+                </div>
                 <pre className="prompt-block">{selectedRun.summary?.text_excerpt ?? 'No structured text captured yet.'}</pre>
+              </section>
+              <section className="detail-section">
+                <div className="panel-header">
+                  <div>
+                    <h4>Run insights</h4>
+                    <p className="subtle">Session-style review for repo context usage, risks, and next steps.</p>
+                  </div>
+                  {runInsight ? <span className="tag">{formatDate(runInsight.generated_at)}</span> : null}
+                </div>
+                {runInsight ? (
+                  <>
+                    <p>{runInsight.summary}</p>
+                    <div className="tag-row">
+                      <span className="tag">headline: {runInsight.headline}</span>
+                      {runInsight.guidance_used.map((path) => (
+                        <span key={`insight-${path}`} className="tag">
+                          {path}
+                        </span>
+                      ))}
+                    </div>
+                    <div className="summary-grid analysis-summary-grid">
+                      <SummaryCard label="Strengths" value={runInsight.strengths.length} accent="green" />
+                      <SummaryCard label="Risks" value={runInsight.risks.length} accent="red" />
+                      <SummaryCard label="Recommendations" value={runInsight.recommendations.length} accent="amber" />
+                      <SummaryCard label="Guidance used" value={runInsight.guidance_used.length} accent="blue" />
+                    </div>
+                    <div className="analysis-list">
+                      {runInsight.strengths.length ? (
+                        runInsight.strengths.map((item) => (
+                          <div key={`strength-${item}`} className="evidence-row">
+                            <span>{item}</span>
+                            <small>strength</small>
+                          </div>
+                        ))
+                      ) : (
+                        <p className="subtle">No strengths captured for this run yet.</p>
+                      )}
+                    </div>
+                    <div className="analysis-list">
+                      {runInsight.risks.length ? (
+                        runInsight.risks.map((item) => (
+                          <div key={`risk-${item}`} className="evidence-row">
+                            <span>{item}</span>
+                            <small>risk</small>
+                          </div>
+                        ))
+                      ) : (
+                        <p className="subtle">No notable risks captured.</p>
+                      )}
+                    </div>
+                    <div className="analysis-list">
+                      {runInsight.recommendations.length ? (
+                        runInsight.recommendations.map((item) => (
+                          <div key={`rec-${item}`} className="evidence-row">
+                            <span>{item}</span>
+                            <small>recommendation</small>
+                          </div>
+                        ))
+                      ) : (
+                        <p className="subtle">No recommendations available.</p>
+                      )}
+                    </div>
+                  </>
+                ) : (
+                  <p className="subtle">No run insight generated yet.</p>
+                )}
+              </section>
+              <section className="detail-section">
+                <h4>Run metrics</h4>
+                {runMetrics ? (
+                  <>
+                    <div className="summary-grid analysis-summary-grid">
+                      <SummaryCard label="Cost" value={`$${runMetrics.estimated_cost.toFixed(4)}`} accent="amber" />
+                      <SummaryCard label="Input" value={runMetrics.input_tokens} accent="blue" />
+                      <SummaryCard label="Output" value={runMetrics.output_tokens} accent="green" />
+                      <SummaryCard label="Duration" value={`${(runMetrics.duration_ms / 1000).toFixed(1)}s`} accent="sand" />
+                    </div>
+                    <div className="tag-row">
+                      <span className="tag">{runMetrics.runtime}</span>
+                      <span className="tag">{runMetrics.model}</span>
+                      <span className="tag">calculated {formatDate(runMetrics.calculated_at)}</span>
+                    </div>
+                  </>
+                ) : (
+                  <p className="subtle">No run metrics captured yet.</p>
+                )}
+              </section>
+              <CostSummaryPanel summary={costSummary} />
+              <section className="detail-section">
+                <div className="panel-header">
+                  <div>
+                    <h4>Patch critique</h4>
+                    <p className="subtle">Post-run review artifacts generated from the stored run output.</p>
+                  </div>
+                  {selectedRun.status === 'completed' || selectedRun.status === 'failed' ? (
+                    <button type="button" className="ghost-button" onClick={onGeneratePatchCritique} disabled={loading}>
+                      Generate critique
+                    </button>
+                  ) : null}
+                </div>
+                {patchCritique ? (
+                  <>
+                    <div className="summary-grid analysis-summary-grid">
+                      <SummaryCard label="Quality" value={patchCritique.overall_quality} accent="amber" />
+                      <SummaryCard label="Correctness" value={`${patchCritique.correctness}%`} accent={qualityAccent(patchCritique.correctness)} />
+                      <SummaryCard label="Completeness" value={`${patchCritique.completeness}%`} accent={qualityAccent(patchCritique.completeness)} />
+                      <SummaryCard label="Safety" value={`${patchCritique.safety}%`} accent={qualityAccent(patchCritique.safety)} />
+                    </div>
+                    <p>{patchCritique.summary || 'No critique summary available.'}</p>
+                    {patchCritique.issues_found.length ? (
+                      <div className="analysis-list">
+                        {patchCritique.issues_found.map((issue) => (
+                          <div key={issue} className="evidence-row">
+                            <span>{issue}</span>
+                            <small>critique issue</small>
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <p className="subtle">No critique issues were detected.</p>
+                    )}
+                  </>
+                ) : (
+                  <p className="subtle">No patch critique generated yet.</p>
+                )}
+                <div className="activity-list">
+                  {runImprovements.length ? (
+                    runImprovements.map((improvement) => (
+                      <div key={improvement.suggestion_id} className="activity-entry">
+                        <div className="activity-entry-top">
+                          <strong>{improvement.description}</strong>
+                          <small>{improvement.file_path}</small>
+                        </div>
+                        <div className="row-meta">
+                          <span className="tag">{improvement.category}</span>
+                          <span className="tag">{improvement.severity}</span>
+                          {improvement.line_start ? <span className="tag">line {improvement.line_start}</span> : null}
+                        </div>
+                        {improvement.suggested_fix ? <p>{improvement.suggested_fix}</p> : null}
+                        <div className="toolbar-row">
+                          <button
+                            type="button"
+                            className="ghost-button"
+                            onClick={() => onDismissImprovement(improvement.suggestion_id)}
+                            disabled={loading}
+                          >
+                            Dismiss suggestion
+                          </button>
+                        </div>
+                      </div>
+                    ))
+                  ) : (
+                    <p className="subtle">No active improvement suggestions.</p>
+                  )}
+                </div>
               </section>
             </>
           )}
@@ -980,6 +2047,19 @@ export function DetailPane({
                 <span className="subtle">No drift summary loaded.</span>
               )}
             </div>
+          </section>
+          <section className="detail-section">
+            <div className="panel-header">
+              <div>
+                <h4>Repository guidance</h4>
+                <p className="subtle">Discovered agent instructions, conventions, and optional skills for this workspace.</p>
+              </div>
+              <span className="tag">{workspaceGuidance.length} files</span>
+            </div>
+            <GuidanceList
+              guidance={workspaceGuidance}
+              emptyLabel="No repository guidance files were discovered for this workspace."
+            />
           </section>
         </>
       ) : null}

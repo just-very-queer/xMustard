@@ -1,6 +1,6 @@
 import type { CSSProperties } from 'react'
 
-import { formatDate } from './TrackerPrimitives'
+import { formatDate } from '../lib/format'
 import type { ActivityRecord } from '../lib/types'
 
 type EntityTypeFilter = ActivityRecord['entity_type'] | 'all'

@@ -17,6 +17,7 @@ import type {
   IntegrationConfig,
   IntegrationTestResult,
   IssueCreateRequest,
+  IssueContextReplayRecord,
   IssueDriftDetail,
   IssueContextPacket,
   IssueQualityScore,
@@ -27,10 +28,13 @@ import type {
   PatchCritique,
   PlanApproveRequest,
   PlanRejectRequest,
+  RepoMapSummary,
+  RepoGuidanceRecord,
   RuntimeProbeResult,
   RunMetrics,
   RunPlan,
   RunRecord,
+  RunSessionInsight,
   RunbookRecord,
   RunbookUpsertRequest,
   RunReviewRecord,
@@ -40,8 +44,14 @@ import type {
   SlackNotification,
   SourceRecord,
   TestSuggestion,
+  ThreatModelRecord,
+  ThreatModelUpsertRequest,
+  TicketContextRecord,
+  TicketContextUpsertRequest,
   TriageSuggestion,
   TreeNode,
+  VerificationProfileRecord,
+  VerificationProfileUpsertRequest,
   WorktreeStatus,
   WorkspaceSnapshot,
   WorkspaceRecord,
@@ -116,6 +126,14 @@ export function listTree(workspaceId: string, relativePath = '') {
   return request<TreeNode[]>(`/api/workspaces/${workspaceId}/tree?${query.toString()}`)
 }
 
+export function listWorkspaceGuidance(workspaceId: string) {
+  return request<RepoGuidanceRecord[]>(`/api/workspaces/${workspaceId}/guidance`)
+}
+
+export function readRepoMap(workspaceId: string) {
+  return request<RepoMapSummary>(`/api/workspaces/${workspaceId}/repo-map`)
+}
+
 export function issueContext(workspaceId: string, issueId: string) {
   return request<IssueContextPacket>(`/api/workspaces/${workspaceId}/issues/${issueId}/context`)
 }
@@ -124,6 +142,57 @@ export function issueWork(workspaceId: string, issueId: string, runbookId?: stri
   const query = new URLSearchParams()
   if (runbookId) query.set('runbook_id', runbookId)
   return request<IssueContextPacket>(`/api/workspaces/${workspaceId}/issues/${issueId}/work?${query.toString()}`)
+}
+
+export function listTicketContext(workspaceId: string, issueId: string) {
+  return request<TicketContextRecord[]>(`/api/workspaces/${workspaceId}/issues/${issueId}/ticket-context`)
+}
+
+export function saveTicketContext(workspaceId: string, issueId: string, payload: TicketContextUpsertRequest) {
+  return request<TicketContextRecord>(`/api/workspaces/${workspaceId}/issues/${issueId}/ticket-context`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+}
+
+export function deleteTicketContext(workspaceId: string, issueId: string, contextId: string) {
+  return request<{ ok: boolean; context_id: string }>(
+    `/api/workspaces/${workspaceId}/issues/${issueId}/ticket-context/${contextId}`,
+    {
+      method: 'DELETE',
+    },
+  )
+}
+
+export function listThreatModels(workspaceId: string, issueId: string) {
+  return request<ThreatModelRecord[]>(`/api/workspaces/${workspaceId}/issues/${issueId}/threat-models`)
+}
+
+export function saveThreatModel(workspaceId: string, issueId: string, payload: ThreatModelUpsertRequest) {
+  return request<ThreatModelRecord>(`/api/workspaces/${workspaceId}/issues/${issueId}/threat-models`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+}
+
+export function deleteThreatModel(workspaceId: string, issueId: string, threatModelId: string) {
+  return request<{ ok: boolean; threat_model_id: string }>(
+    `/api/workspaces/${workspaceId}/issues/${issueId}/threat-models/${threatModelId}`,
+    {
+      method: 'DELETE',
+    },
+  )
+}
+
+export function listIssueContextReplays(workspaceId: string, issueId: string) {
+  return request<IssueContextReplayRecord[]>(`/api/workspaces/${workspaceId}/issues/${issueId}/context-replays`)
+}
+
+export function captureIssueContextReplay(workspaceId: string, issueId: string, label?: string) {
+  return request<IssueContextReplayRecord>(`/api/workspaces/${workspaceId}/issues/${issueId}/context-replays`, {
+    method: 'POST',
+    body: JSON.stringify({ label }),
+  })
 }
 
 export function listIssues(
@@ -244,6 +313,10 @@ export function readRun(workspaceId: string, runId: string) {
   return request<RunRecord>(`/api/workspaces/${workspaceId}/runs/${runId}`)
 }
 
+export function getRunInsights(workspaceId: string, runId: string) {
+  return request<RunSessionInsight>(`/api/workspaces/${workspaceId}/runs/${runId}/insights`)
+}
+
 export function cancelRun(workspaceId: string, runId: string) {
   return request<RunRecord>(`/api/workspaces/${workspaceId}/runs/${runId}/cancel`, {
     method: 'POST',
@@ -287,6 +360,26 @@ export function deleteRunbook(workspaceId: string, runbookId: string) {
   })
 }
 
+export function listVerificationProfiles(workspaceId: string) {
+  return request<VerificationProfileRecord[]>(`/api/workspaces/${workspaceId}/verification-profiles`)
+}
+
+export function saveVerificationProfile(workspaceId: string, payload: VerificationProfileUpsertRequest) {
+  return request<VerificationProfileRecord>(`/api/workspaces/${workspaceId}/verification-profiles`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+}
+
+export function deleteVerificationProfile(workspaceId: string, profileId: string) {
+  return request<{ ok: boolean; profile_id: string }>(
+    `/api/workspaces/${workspaceId}/verification-profiles/${profileId}`,
+    {
+      method: 'DELETE',
+    },
+  )
+}
+
 export function readRunLog(workspaceId: string, runId: string, offset = 0) {
   return request<{ offset: number; content: string; eof: boolean }>(
     `/api/workspaces/${workspaceId}/runs/${runId}/log?offset=${offset}`,
@@ -319,6 +412,10 @@ export function rejectPlan(workspaceId: string, runId: string, payload: PlanReje
 
 export function getRunMetrics(workspaceId: string, runId: string) {
   return request<RunMetrics>(`/api/workspaces/${workspaceId}/runs/${runId}/metrics`)
+}
+
+export function listWorkspaceMetrics(workspaceId: string) {
+  return request<RunMetrics[]>(`/api/workspaces/${workspaceId}/metrics`)
 }
 
 export function getWorkspaceCostSummary(workspaceId: string) {

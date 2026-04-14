@@ -1,11 +1,14 @@
-import type { WorktreeStatus } from '../lib/types'
-import { formatDate } from './TrackerPrimitives'
+import type { CostSummary, WorktreeStatus } from '../lib/types'
+import { formatDate } from '../lib/format'
 
 type Props = {
   workspaceName?: string | null
   workspacePath?: string | null
   latestScanAt?: string | null
   worktree?: WorktreeStatus | null
+  costSummary?: CostSummary | null
+  guidanceCount?: number
+  hasRepoGuidance?: boolean
   backendHealthy?: boolean | null
   canExport: boolean
   canToggleExecution?: boolean
@@ -19,6 +22,9 @@ export function AppTopbar({
   workspacePath,
   latestScanAt,
   worktree,
+  costSummary,
+  guidanceCount,
+  hasRepoGuidance,
   backendHealthy,
   canExport,
   canToggleExecution,
@@ -39,12 +45,18 @@ export function AppTopbar({
             API {backendHealthy ? 'up' : 'down'}
           </span>
         ) : null}
+        {workspaceName ? (
+          <span className={`status-chip ${hasRepoGuidance ? 'status-chip-ok' : 'status-chip-warn'}`}>
+            {hasRepoGuidance ? `Repo guidance ${guidanceCount ?? 0}` : 'Add AGENTS.md'}
+          </span>
+        ) : null}
         {worktree?.is_git_repo ? (
           <span className="subtle">
             {worktree.branch ?? 'detached'} · {worktree.dirty_files} dirty
             {worktree.ahead || worktree.behind ? ` · +${worktree.ahead}/-${worktree.behind}` : ''}
           </span>
         ) : null}
+        {costSummary ? <span className="subtle">Run cost ${costSummary.total_estimated_cost.toFixed(4)}</span> : null}
         {latestScanAt ? <span className="subtle">Last scan {formatDate(latestScanAt)}</span> : null}
         {canToggleExecution ? (
           <button className="ghost-button" onClick={onToggleExecution}>

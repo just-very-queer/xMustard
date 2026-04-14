@@ -34,6 +34,8 @@ from .models import (
     GitHubPRCreate,
     GitHubPRResult,
     ImprovementSuggestion,
+    IssueContextReplayRecord,
+    IssueContextReplayRequest,
     IntegrationConfig,
     IntegrationTestRequest,
     IntegrationTestResult,
@@ -52,6 +54,7 @@ from .models import (
     PlanRejectRequest,
     PlanStep,
     PromoteSignalRequest,
+    RepoGuidanceRecord,
     RunMetrics,
     RunPlan,
     RunRecord,
@@ -59,14 +62,22 @@ from .models import (
     RunReviewRequest,
     RunAcceptRequest,
     RunbookRecord,
+    RunSessionInsight,
     RunbookUpsertRequest,
     ReviewQueueItem,
+    RepoMapSummary,
     SavedIssueView,
     SavedIssueViewRequest,
     SlackNotification,
     SourceRecord,
+    ThreatModelRecord,
+    ThreatModelUpsertRequest,
+    TicketContextRecord,
+    TicketContextUpsertRequest,
     TestSuggestion,
     TriageSuggestion,
+    VerificationProfileRecord,
+    VerificationProfileUpsertRequest,
     VerificationRecord,
     VerificationSummary,
     VerifyIssueRequest,
@@ -81,6 +92,7 @@ from .runtimes import RuntimeService
 from .scanners import (
     apply_verdicts,
     build_source_records,
+    build_repo_map,
     latest_bug_ledger,
     list_tree_nodes,
     parse_ledger,
@@ -93,6 +105,10 @@ from .terminal import TerminalService
 
 
 class TrackerService:
+    MAX_CACHED_SNAPSHOT_BYTES = 25 * 1024 * 1024
+    SCANNER_VERSION = 2
+    GUIDANCE_LIMIT = 6
+
     def __init__(self, store: FileStore) -> None:
         self.store = store
         self.runtime_service = RuntimeService(store)
@@ -112,8 +128,12 @@ class TrackerService:
         if workspace_id in existing:
             workspace = existing[workspace_id].model_copy(update={"updated_at": utc_now(), "name": workspace.name, "root_path": root_path})
         self.store.save_workspace(workspace)
-        cached_snapshot = self.store.load_snapshot(workspace_id)
-        if cached_snapshot and request.prefer_cached_snapshot:
+        snapshot_path = self.store.snapshot_path(workspace_id)
+        snapshot_is_oversized = snapshot_path.exists() and snapshot_path.stat().st_size > self.MAX_CACHED_SNAPSHOT_BYTES
+        cached_snapshot = None if snapshot_is_oversized else self.store.load_snapshot(workspace_id)
+        if cached_snapshot and cached_snapshot.scanner_version != self.SCANNER_VERSION:
+            cached_snapshot = None
+        if cached_snapshot and request.prefer_cached_snapshot and not snapshot_is_oversized:
             return cached_snapshot.model_copy(update={"workspace": workspace.model_copy(update={"latest_scan_at": cached_snapshot.workspace.latest_scan_at})})
         if request.auto_scan:
             return self.scan_workspace(workspace_id)
@@ -138,6 +158,9 @@ class TrackerService:
         fixes = self.store.list_fix_records(workspace_id)
         run_reviews = self.store.list_run_reviews(workspace_id)
         runbooks = self.list_runbooks(workspace_id)
+        verification_profiles = self.list_verification_profiles(workspace_id)
+        ticket_contexts = self.list_ticket_contexts(workspace_id)
+        threat_models = self.list_threat_models(workspace_id)
 
         issues: list[IssueRecord] = parse_ledger(ledger_path) if ledger_path else []
         if verdict_paths and issues:
@@ -149,7 +172,20 @@ class TrackerService:
         issues = self._apply_issue_drift(root, issues)
         signals = scan_repo_signals(root)
         sources = build_source_records(ledger_path, issues, verdict_paths, signals)
-        sources.extend(self._build_tracker_sources(workspace_id, tracker_issues, fixes, runbooks, run_reviews))
+        repo_map = build_repo_map(root, workspace_id)
+        self.store.save_repo_map(workspace_id, repo_map)
+        sources.extend(
+            self._build_tracker_sources(
+                workspace_id,
+                tracker_issues,
+                fixes,
+                runbooks,
+                run_reviews,
+                verification_profiles,
+                ticket_contexts,
+                threat_models,
+            )
+        )
         drift_summary = self._build_drift_summary(issues)
         runtimes = self.runtime_service.detect_runtimes()
         tree_summary = summarize_tree(root)
@@ -166,10 +202,14 @@ class TrackerService:
             "tracker_issues_total": len(tracker_issues),
             "fixes_total": len(fixes),
             "runbooks_total": len(runbooks),
+            "ticket_contexts_total": len(ticket_contexts),
+            "threat_models_total": len(threat_models),
+            "repo_map_files": repo_map.total_files,
             "tree_files": tree_summary["files"],
             "tree_directories": tree_summary["directories"],
         }
         snapshot = WorkspaceSnapshot(
+            scanner_version=self.SCANNER_VERSION,
             workspace=workspace.model_copy(update={"latest_scan_at": utc_now(), "updated_at": utc_now()}),
             summary=summary,
             issues=issues,
@@ -699,6 +739,244 @@ class TrackerService:
             details={"runbook_id": runbook_id},
         )
 
+    def list_verification_profiles(self, workspace_id: str) -> list[VerificationProfileRecord]:
+        workspace = self.get_workspace(workspace_id)
+        saved = {item.profile_id: item for item in self.store.list_verification_profiles(workspace_id)}
+        merged = {item.profile_id: item for item in self._default_verification_profiles(workspace)}
+        merged.update(saved)
+        return sorted(merged.values(), key=lambda item: (item.built_in, item.name.lower(), item.created_at))
+
+    def save_verification_profile(self, workspace_id: str, request: VerificationProfileUpsertRequest) -> VerificationProfileRecord:
+        self.get_workspace(workspace_id)
+        existing = [item for item in self.store.list_verification_profiles(workspace_id) if item.profile_id != request.profile_id]
+        profile_id = request.profile_id or self._slug_runbook_name(request.name)
+        now = utc_now()
+        profile = VerificationProfileRecord(
+            profile_id=profile_id,
+            workspace_id=workspace_id,
+            name=request.name.strip(),
+            description=request.description.strip(),
+            test_command=request.test_command.strip(),
+            coverage_command=request.coverage_command.strip() if request.coverage_command else None,
+            coverage_report_path=request.coverage_report_path.strip() if request.coverage_report_path else None,
+            coverage_format=request.coverage_format,
+            max_runtime_seconds=max(1, int(request.max_runtime_seconds)),
+            retry_count=max(0, int(request.retry_count)),
+            source_paths=[item.strip() for item in request.source_paths if item.strip()][:8],
+            built_in=False,
+            updated_at=now,
+        )
+        existing.append(profile)
+        self.store.save_verification_profiles(workspace_id, existing)
+        self._record_activity(
+            workspace_id=workspace_id,
+            entity_type="settings",
+            entity_id=f"verification-profile:{profile_id}",
+            action="verification_profile.saved",
+            summary=f"Saved verification profile {profile.name}",
+            actor=build_activity_actor("operator", "operator"),
+            details={"profile_id": profile_id, "coverage_format": profile.coverage_format},
+        )
+        return profile
+
+    def delete_verification_profile(self, workspace_id: str, profile_id: str) -> None:
+        self.get_workspace(workspace_id)
+        existing = self.store.list_verification_profiles(workspace_id)
+        remaining = [item for item in existing if item.profile_id != profile_id]
+        if len(remaining) == len(existing):
+            raise FileNotFoundError(profile_id)
+        self.store.save_verification_profiles(workspace_id, remaining)
+        self._record_activity(
+            workspace_id=workspace_id,
+            entity_type="settings",
+            entity_id=f"verification-profile:{profile_id}",
+            action="verification_profile.deleted",
+            summary=f"Deleted verification profile {profile_id}",
+            actor=build_activity_actor("operator", "operator"),
+            details={"profile_id": profile_id},
+        )
+
+    def list_ticket_contexts(self, workspace_id: str, issue_id: Optional[str] = None) -> list[TicketContextRecord]:
+        self.get_workspace(workspace_id)
+        items = self.store.list_ticket_contexts(workspace_id)
+        if issue_id:
+            items = [item for item in items if item.issue_id == issue_id]
+        return items
+
+    def save_ticket_context(
+        self,
+        workspace_id: str,
+        issue_id: str,
+        request: TicketContextUpsertRequest,
+        *,
+        actor: Optional[ActivityActor] = None,
+        action: str = "ticket_context.saved",
+    ) -> TicketContextRecord:
+        self._get_issue_from_snapshot(workspace_id, issue_id)
+        existing = self.store.list_ticket_contexts(workspace_id)
+        context_id = request.context_id or self._slug_runbook_name(f"{request.provider}-{request.external_id or request.title}")
+        previous = next((item for item in existing if item.context_id == context_id), None)
+        now = utc_now()
+        record = TicketContextRecord(
+            context_id=context_id,
+            workspace_id=workspace_id,
+            issue_id=issue_id,
+            provider=request.provider,
+            external_id=request.external_id.strip() if request.external_id else None,
+            title=request.title.strip(),
+            summary=request.summary.strip(),
+            acceptance_criteria=self._normalize_text_list(request.acceptance_criteria, limit=12),
+            links=self._normalize_text_list(request.links, limit=8),
+            labels=self._normalize_text_list(request.labels, limit=12),
+            status=request.status.strip() if request.status else None,
+            source_excerpt=request.source_excerpt.strip() if request.source_excerpt else None,
+            created_at=previous.created_at if previous else now,
+            updated_at=now,
+        )
+        remaining = [item for item in existing if item.context_id != context_id]
+        remaining.append(record)
+        self.store.save_ticket_contexts(workspace_id, remaining)
+        self._record_activity(
+            workspace_id=workspace_id,
+            entity_type="issue",
+            entity_id=issue_id,
+            action=action,
+            summary=f"Saved ticket context {record.title}",
+            actor=actor or build_activity_actor("operator", "operator"),
+            issue_id=issue_id,
+            details={"context_id": context_id, "provider": record.provider, "external_id": record.external_id},
+        )
+        return record
+
+    def delete_ticket_context(self, workspace_id: str, issue_id: str, context_id: str) -> None:
+        self._get_issue_from_snapshot(workspace_id, issue_id)
+        existing = self.store.list_ticket_contexts(workspace_id)
+        remaining = [item for item in existing if item.context_id != context_id]
+        if len(remaining) == len(existing):
+            raise FileNotFoundError(context_id)
+        self.store.save_ticket_contexts(workspace_id, remaining)
+        self._record_activity(
+            workspace_id=workspace_id,
+            entity_type="issue",
+            entity_id=issue_id,
+            action="ticket_context.deleted",
+            summary=f"Deleted ticket context {context_id}",
+            actor=build_activity_actor("operator", "operator"),
+            issue_id=issue_id,
+            details={"context_id": context_id},
+        )
+
+    def list_threat_models(self, workspace_id: str, issue_id: Optional[str] = None) -> list[ThreatModelRecord]:
+        self.get_workspace(workspace_id)
+        items = self.store.list_threat_models(workspace_id)
+        if issue_id:
+            items = [item for item in items if item.issue_id == issue_id]
+        return items
+
+    def save_threat_model(
+        self,
+        workspace_id: str,
+        issue_id: str,
+        request: ThreatModelUpsertRequest,
+        *,
+        actor: Optional[ActivityActor] = None,
+        action: str = "threat_model.saved",
+    ) -> ThreatModelRecord:
+        self._get_issue_from_snapshot(workspace_id, issue_id)
+        existing = self.store.list_threat_models(workspace_id)
+        threat_model_id = request.threat_model_id or self._slug_runbook_name(f"threat-{request.methodology}-{request.title}")
+        previous = next((item for item in existing if item.threat_model_id == threat_model_id), None)
+        now = utc_now()
+        record = ThreatModelRecord(
+            threat_model_id=threat_model_id,
+            workspace_id=workspace_id,
+            issue_id=issue_id,
+            title=request.title.strip(),
+            methodology=request.methodology,
+            summary=request.summary.strip(),
+            assets=self._normalize_text_list(request.assets, limit=12),
+            entry_points=self._normalize_text_list(request.entry_points, limit=12),
+            trust_boundaries=self._normalize_text_list(request.trust_boundaries, limit=12),
+            abuse_cases=self._normalize_text_list(request.abuse_cases, limit=12),
+            mitigations=self._normalize_text_list(request.mitigations, limit=12),
+            references=self._normalize_text_list(request.references, limit=12),
+            status=request.status,
+            created_at=previous.created_at if previous else now,
+            updated_at=now,
+        )
+        remaining = [item for item in existing if item.threat_model_id != threat_model_id]
+        remaining.append(record)
+        self.store.save_threat_models(workspace_id, remaining)
+        self._record_activity(
+            workspace_id=workspace_id,
+            entity_type="issue",
+            entity_id=issue_id,
+            action=action,
+            summary=f"Saved threat model {record.title}",
+            actor=actor or build_activity_actor("operator", "operator"),
+            issue_id=issue_id,
+            details={"threat_model_id": threat_model_id, "methodology": record.methodology, "status": record.status},
+        )
+        return record
+
+    def delete_threat_model(self, workspace_id: str, issue_id: str, threat_model_id: str) -> None:
+        self._get_issue_from_snapshot(workspace_id, issue_id)
+        existing = self.store.list_threat_models(workspace_id)
+        remaining = [item for item in existing if item.threat_model_id != threat_model_id]
+        if len(remaining) == len(existing):
+            raise FileNotFoundError(threat_model_id)
+        self.store.save_threat_models(workspace_id, remaining)
+        self._record_activity(
+            workspace_id=workspace_id,
+            entity_type="issue",
+            entity_id=issue_id,
+            action="threat_model.deleted",
+            summary=f"Deleted threat model {threat_model_id}",
+            actor=build_activity_actor("operator", "operator"),
+            issue_id=issue_id,
+            details={"threat_model_id": threat_model_id},
+        )
+
+    def list_issue_context_replays(self, workspace_id: str, issue_id: Optional[str] = None) -> list[IssueContextReplayRecord]:
+        self.get_workspace(workspace_id)
+        items = self.store.list_context_replays(workspace_id)
+        if issue_id:
+            items = [item for item in items if item.issue_id == issue_id]
+        return items
+
+    def capture_issue_context_replay(
+        self,
+        workspace_id: str,
+        issue_id: str,
+        request: IssueContextReplayRequest,
+    ) -> IssueContextReplayRecord:
+        packet = self.build_issue_context(workspace_id, issue_id)
+        replay = IssueContextReplayRecord(
+            replay_id=f"ctx_{uuid.uuid4().hex[:12]}",
+            workspace_id=workspace_id,
+            issue_id=issue_id,
+            label=(request.label or f"{issue_id} context replay").strip(),
+            prompt=packet.prompt,
+            tree_focus=packet.tree_focus[:12],
+            guidance_paths=[item.path for item in packet.guidance],
+            verification_profile_ids=[item.profile_id for item in packet.available_verification_profiles[:8]],
+            ticket_context_ids=[item.context_id for item in packet.ticket_contexts[:8]],
+        )
+        replays = self.store.list_context_replays(workspace_id)
+        replays.append(replay)
+        self.store.save_context_replays(workspace_id, replays)
+        self._record_activity(
+            workspace_id=workspace_id,
+            entity_type="issue",
+            entity_id=issue_id,
+            action="context_replay.captured",
+            summary=f"Captured issue context replay {replay.label}",
+            actor=build_activity_actor("operator", "operator"),
+            issue_id=issue_id,
+            details={"replay_id": replay.replay_id},
+        )
+        return replay
+
     def list_review_queue(self, workspace_id: str) -> list[ReviewQueueItem]:
         snapshot = self.store.load_snapshot(workspace_id)
         if not snapshot:
@@ -745,6 +1023,7 @@ class TrackerService:
                 model=model,
                 prompt=prompt,
                 worktree=packet.worktree,
+                guidance_paths=[item.path for item in packet.guidance],
                 runbook_id=request.runbook_id or "verify",
             )
             self._record_activity(
@@ -863,6 +1142,19 @@ class TrackerService:
         workspace = self.get_workspace(workspace_id)
         return list_tree_nodes(Path(workspace.root_path), relative_path)
 
+    def list_workspace_guidance(self, workspace_id: str) -> list[RepoGuidanceRecord]:
+        workspace = self.get_workspace(workspace_id)
+        return self._collect_workspace_guidance(Path(workspace.root_path), workspace_id)
+
+    def read_repo_map(self, workspace_id: str) -> RepoMapSummary:
+        workspace = self.get_workspace(workspace_id)
+        cached = self.store.load_repo_map(workspace_id)
+        if cached:
+            return cached
+        repo_map = build_repo_map(Path(workspace.root_path), workspace_id)
+        self.store.save_repo_map(workspace_id, repo_map)
+        return repo_map
+
     def build_issue_context(self, workspace_id: str, issue_id: str) -> IssueContextPacket:
         snapshot = self.store.load_snapshot(workspace_id)
         if not snapshot:
@@ -878,19 +1170,43 @@ class TrackerService:
                 tree_focus.append(focus_path)
         default_runbook = self._resolve_runbook(workspace_id, "fix")
         runbooks = self.list_runbooks(workspace_id)
+        verification_profiles = self.list_verification_profiles(workspace_id)
+        ticket_contexts = self.list_ticket_contexts(workspace_id, issue_id=issue_id)
+        threat_models = self.list_threat_models(workspace_id, issue_id=issue_id)
+        repo_map = self.read_repo_map(workspace_id)
+        related_paths = self._rank_related_paths(issue, tree_focus, ticket_contexts, repo_map)
         runbook = self._render_runbook_steps(default_runbook.template)
         recent_fixes = self.list_fixes(workspace_id, issue_id=issue_id)[:5]
         recent_activity = [item for item in self.list_activity(workspace_id, issue_id=issue_id, limit=16) if item.entity_type == "issue"][:8]
-        prompt = self._build_prompt(snapshot.workspace, issue, tree_focus, recent_fixes, recent_activity)
+        guidance = self.list_workspace_guidance(workspace_id)[:self.GUIDANCE_LIMIT]
+        prompt = self._build_prompt(
+            snapshot.workspace,
+            issue,
+            tree_focus,
+            recent_fixes,
+            recent_activity,
+            guidance,
+            verification_profiles,
+            ticket_contexts,
+            threat_models,
+            related_paths,
+            repo_map,
+        )
         return IssueContextPacket(
             issue=issue,
             workspace=snapshot.workspace,
             tree_focus=tree_focus[:12],
+            related_paths=related_paths,
             evidence_bundle=evidence_bundle[:20],
             recent_fixes=recent_fixes,
             recent_activity=recent_activity,
+            guidance=guidance,
             runbook=runbook,
             available_runbooks=runbooks,
+            available_verification_profiles=verification_profiles,
+            ticket_contexts=ticket_contexts,
+            threat_models=threat_models,
+            repo_map=repo_map,
             worktree=self.read_worktree_status(workspace_id),
             prompt=prompt,
         )
@@ -979,6 +1295,7 @@ class TrackerService:
             model=model,
             prompt=prompt,
             worktree=packet.worktree,
+            guidance_paths=[item.path for item in packet.guidance],
             runbook_id=runbook_id,
             wait_for_approval=planning,
         )
@@ -1016,6 +1333,7 @@ class TrackerService:
         trimmed_prompt = prompt.strip()
         if not trimmed_prompt:
             raise ValueError("Prompt is required")
+        guidance = self.list_workspace_guidance(workspace_id)[:self.GUIDANCE_LIMIT]
         self.runtime_service.validate_runtime_model(runtime, model)
         run = self.runtime_service.start_issue_run(
             workspace_id=workspace_id,
@@ -1023,8 +1341,9 @@ class TrackerService:
             issue_id="workspace-query",
             runtime=runtime,
             model=model,
-            prompt=trimmed_prompt,
+            prompt=self._apply_guidance_to_prompt(trimmed_prompt, guidance),
             worktree=self.read_worktree_status(workspace_id),
+            guidance_paths=[item.path for item in guidance],
         )
         self._record_activity(
             workspace_id=workspace_id,
@@ -1080,6 +1399,7 @@ class TrackerService:
             model=run.model,
             prompt=run.prompt,
             worktree=worktree,
+            guidance_paths=run.guidance_paths,
             runbook_id=run.runbook_id,
         )
         self._record_activity(
@@ -1094,6 +1414,76 @@ class TrackerService:
             details={"previous_run_id": run.run_id, "runtime": run.runtime, "model": run.model},
         )
         return retried.model_dump(mode="json")
+
+    def get_run_session_insight(self, workspace_id: str, run_id: str) -> dict:
+        self.get_workspace(workspace_id)
+        run = self.store.load_run(workspace_id, run_id)
+        if not run:
+            raise FileNotFoundError(run_id)
+
+        critique = self._load_critique(run_id)
+        metrics = self.runtime_service.load_run_metrics(run_id)
+        strengths: list[str] = []
+        risks: list[str] = []
+        recommendations: list[str] = []
+
+        if run.status == "completed":
+            strengths.append("Run completed successfully.")
+        elif run.status == "failed":
+            risks.append("Run failed before completing successfully.")
+        elif run.status == "cancelled":
+            risks.append("Run was cancelled before completion.")
+        else:
+            risks.append(f"Run is still {run.status}.")
+
+        if run.guidance_paths:
+            strengths.append(f"Run included repository guidance from {len(run.guidance_paths)} file(s).")
+        else:
+            risks.append("No repository guidance was attached to this run.")
+            recommendations.append("Add AGENTS.md, CONVENTIONS.md, or reusable skills so runs start with stable repository context.")
+
+        excerpt = None
+        if run.summary and isinstance(run.summary, dict):
+            total_events = run.summary.get("event_count", 0)
+            tool_events = run.summary.get("tool_event_count", 0)
+            excerpt = run.summary.get("text_excerpt")
+            if total_events and tool_events / max(total_events, 1) > 0.8:
+                risks.append("The run spent a high share of events in tool usage.")
+                recommendations.append("Move repeated workflow guidance into always-on repo instructions or reusable skills to reduce tool churn.")
+
+        if metrics and metrics.duration_ms > 0:
+            strengths.append(f"Captured runtime metrics for cost and duration ({metrics.duration_ms} ms).")
+        else:
+            recommendations.append("Persist run metrics consistently so cost and duration trends can be reviewed later.")
+
+        if critique:
+            if critique.overall_quality in {"excellent", "good"} and not critique.issues_found:
+                strengths.append("Patch critique did not find correctness issues.")
+            for item in critique.issues_found[:3]:
+                risks.append(item)
+            high_severity = [item for item in critique.improvements if not item.dismissed and item.severity == "high"]
+            if high_severity:
+                risks.append(f"{len(high_severity)} high-severity improvement suggestion(s) remain open.")
+                recommendations.append("Review the open high-severity improvement suggestions before treating the run as production-ready.")
+        elif run.status == "completed":
+            recommendations.append("Generate a critique for completed runs so review feedback is preserved as an artifact.")
+
+        if not excerpt:
+            recommendations.append("Capture a concise final summary in the run output so session review is easier.")
+
+        insight = RunSessionInsight(
+            workspace_id=workspace_id,
+            run_id=run_id,
+            issue_id=run.issue_id,
+            status=run.status,
+            headline=self._draft_summary_from_excerpt(excerpt or "", run.issue_id, run.run_id),
+            summary=critique.summary if critique and critique.summary else excerpt or f"Run {run.run_id} for {run.issue_id} is {run.status}.",
+            guidance_used=run.guidance_paths,
+            strengths=self._dedupe_text(strengths),
+            risks=self._dedupe_text(risks),
+            recommendations=self._dedupe_text(recommendations),
+        )
+        return insight.model_dump(mode="json")
 
     def generate_run_plan(self, workspace_id: str, run_id: str) -> dict:
         run = self.store.load_run(workspace_id, run_id)
@@ -1267,6 +1657,11 @@ Respond with a JSON object containing:
             raise FileNotFoundError(f"No metrics found for run {run_id}")
         return metrics.model_dump(mode="json")
 
+    def list_workspace_metrics(self, workspace_id: str) -> list[dict]:
+        self.get_workspace(workspace_id)
+        metrics_list = self.runtime_service.get_workspace_metrics(workspace_id)
+        return [metrics.model_dump(mode="json") for metrics in metrics_list]
+
     def get_workspace_cost_summary(self, workspace_id: str) -> dict:
         metrics_list = self.runtime_service.get_workspace_metrics(workspace_id)
         runs = self.store.list_runs(workspace_id)
@@ -1355,7 +1750,8 @@ Respond with a JSON object containing:
     def _calculate_quality_score(self, workspace_id: str, issue: IssueRecord) -> IssueQualityScore:
         suggestions: list[str] = []
         has_repro = bool(issue.summary and len(issue.summary.strip()) > 20)
-        has_severity = bool(issue.severity and issue.severity in {"critical", "high", "medium", "low"})
+        normalized_severity = (issue.severity or "").strip().lower()
+        has_severity = normalized_severity in {"p0", "p1", "p2", "p3", "critical", "high", "medium", "low"}
         has_evidence = len(issue.evidence) > 0
         has_impact = bool(issue.impact and len(issue.impact.strip()) > 10)
         has_summary = bool(issue.summary and len(issue.summary.strip()) > 0)
@@ -2170,6 +2566,23 @@ Respond with a JSON object containing:
                         labels=imp.labels,
                         source="tracker_issue",
                     ))
+            self._save_imported_ticket_context(
+                workspace_id,
+                imp.issue_id,
+                TicketContextUpsertRequest(
+                    context_id=f"github-{imp.issue_number}",
+                    provider="github",
+                    external_id=f"{repo}#{imp.issue_number}",
+                    title=imp.title,
+                    summary=(imp.body or "")[:1600],
+                    acceptance_criteria=self._parse_acceptance_criteria(imp.body),
+                    labels=imp.labels,
+                    links=[imp.html_url] if imp.html_url else [],
+                    status=imp.state,
+                    source_excerpt=(imp.body or "")[:500] or None,
+                ),
+                actor=build_activity_actor("system", "system"),
+            )
         self._record_activity(
             workspace_id=workspace_id,
             entity_type="workspace",
@@ -2316,6 +2729,21 @@ Respond with a JSON object containing:
             priority=issue.severity,
         )
         self._save_linear_sync(sync)
+        self._save_imported_ticket_context(
+            workspace_id,
+            issue_id,
+            TicketContextUpsertRequest(
+                context_id=f"linear-{issue_data.get('id') or issue_id}",
+                provider="linear",
+                external_id=issue_data.get("identifier") or issue_data.get("id"),
+                title=issue.title,
+                summary=issue.summary or "",
+                labels=issue.labels,
+                links=[issue_data.get("url")] if issue_data.get("url") else [],
+                status="synced",
+            ),
+            actor=build_activity_actor("system", "system"),
+        )
         self._record_activity(
             workspace_id=workspace_id,
             entity_type="issue",
@@ -2374,6 +2802,22 @@ Respond with a JSON object containing:
             priority=issue.severity,
         )
         self._save_jira_sync(sync)
+        jira_browse_url = f"{base_url.rstrip('/')}/browse/{result.get('key')}" if result.get("key") else None
+        self._save_imported_ticket_context(
+            workspace_id,
+            issue_id,
+            TicketContextUpsertRequest(
+                context_id=f"jira-{result.get('key') or issue_id}",
+                provider="jira",
+                external_id=result.get("key"),
+                title=issue.title,
+                summary=issue.summary or "",
+                labels=issue.labels,
+                links=[jira_browse_url] if jira_browse_url else [],
+                status="synced",
+            ),
+            actor=build_activity_actor("system", "system"),
+        )
         self._record_activity(
             workspace_id=workspace_id,
             entity_type="issue",
@@ -2594,10 +3038,15 @@ Respond with a JSON object containing:
         return ExportBundle(
             workspace=workspace,
             snapshot=snapshot,
+            repo_map=self.read_repo_map(workspace_id),
             runs=self.store.list_runs(workspace_id),
             fixes=self.store.list_fix_records(workspace_id),
             run_reviews=self.store.list_run_reviews(workspace_id),
             runbooks=self.list_runbooks(workspace_id),
+            verification_profiles=self.list_verification_profiles(workspace_id),
+            ticket_contexts=self.list_ticket_contexts(workspace_id),
+            threat_models=self.list_threat_models(workspace_id),
+            context_replays=self.list_issue_context_replays(workspace_id),
             verifications=self.store.list_verifications(workspace_id),
             activity=self.store.list_activity(workspace_id),
         )
@@ -2787,6 +3236,9 @@ Respond with a JSON object containing:
         fixes: list[FixRecord],
         runbooks: list[RunbookRecord],
         run_reviews: list[RunReviewRecord],
+        verification_profiles: list[VerificationProfileRecord],
+        ticket_contexts: list[TicketContextRecord],
+        threat_models: list[ThreatModelRecord],
     ) -> list[SourceRecord]:
         sources: list[SourceRecord] = []
         tracker_path = self.store.tracker_issues_path(workspace_id)
@@ -2841,6 +3293,58 @@ Respond with a JSON object containing:
                     notes="Run review dispositions and review audit history.",
                 )
             )
+        profile_path = self.store.verification_profiles_path(workspace_id)
+        if profile_path.exists():
+            sources.append(
+                SourceRecord(
+                    source_id=f"src_{hashlib.sha1(str(profile_path).encode('utf-8')).hexdigest()[:10]}",
+                    kind="fix_record",
+                    label=profile_path.name,
+                    path=str(profile_path),
+                    record_count=len(verification_profiles),
+                    modified_at=utc_now(),
+                    notes="Workspace verification profiles and saved test commands.",
+                )
+            )
+        ticket_context_path = self.store.ticket_contexts_path(workspace_id)
+        if ticket_context_path.exists():
+            sources.append(
+                SourceRecord(
+                    source_id=f"src_{hashlib.sha1(str(ticket_context_path).encode('utf-8')).hexdigest()[:10]}",
+                    kind="ticket_context",
+                    label=ticket_context_path.name,
+                    path=str(ticket_context_path),
+                    record_count=len(ticket_contexts),
+                    modified_at=utc_now(),
+                    notes="Imported and curated upstream ticket context with acceptance criteria.",
+                )
+            )
+        threat_model_path = self.store.threat_models_path(workspace_id)
+        if threat_model_path.exists():
+            sources.append(
+                SourceRecord(
+                    source_id=f"src_{hashlib.sha1(str(threat_model_path).encode('utf-8')).hexdigest()[:10]}",
+                    kind="threat_model",
+                    label=threat_model_path.name,
+                    path=str(threat_model_path),
+                    record_count=len(threat_models),
+                    modified_at=utc_now(),
+                    notes="Issue-level threat models with assets, trust boundaries, abuse paths, and mitigations.",
+                )
+            )
+        repo_map_path = self.store.repo_map_path(workspace_id)
+        if repo_map_path.exists():
+            sources.append(
+                SourceRecord(
+                    source_id=f"src_{hashlib.sha1(str(repo_map_path).encode('utf-8')).hexdigest()[:10]}",
+                    kind="repo_map",
+                    label=repo_map_path.name,
+                    path=str(repo_map_path),
+                    record_count=1,
+                    modified_at=utc_now(),
+                    notes="Workspace structural repo map and notable files.",
+                )
+            )
         return sources
 
     def _default_runbooks(self, workspace_id: str) -> list[RunbookRecord]:
@@ -2881,6 +3385,24 @@ Respond with a JSON object containing:
                 built_in=True,
             )
             for runbook_id, name, description, template in defaults
+        ]
+
+    def _default_verification_profiles(self, workspace: WorkspaceRecord) -> list[VerificationProfileRecord]:
+        root = Path(workspace.root_path)
+        guidance = self._collect_workspace_guidance(root, workspace.workspace_id)
+        inferred = self._infer_verification_profiles_from_guidance(workspace.workspace_id, guidance, root)
+        if inferred:
+            return inferred
+        return [
+            VerificationProfileRecord(
+                profile_id="manual-check",
+                workspace_id=workspace.workspace_id,
+                name="Manual verification",
+                description="Fallback profile when no repo-specific test command could be inferred yet.",
+                test_command="Document the exact command or test flow required for this repo.",
+                built_in=True,
+                source_paths=[],
+            )
         ]
 
     def _resolve_runbook(self, workspace_id: str, runbook_id: str) -> RunbookRecord:
@@ -2941,6 +3463,17 @@ Respond with a JSON object containing:
         if not isinstance(value, list):
             return []
         return [str(item).strip() for item in value if str(item).strip()]
+
+    def _normalize_text_list(self, values: list[str], limit: int = 12) -> list[str]:
+        normalized: list[str] = []
+        for value in values:
+            item = str(value).strip()
+            if not item or item in normalized:
+                continue
+            normalized.append(item)
+            if len(normalized) >= limit:
+                break
+        return normalized
 
     def _parse_verification_excerpt(self, excerpt: str) -> dict:
         from_text = self._extract_json_object(excerpt)
@@ -3118,6 +3651,12 @@ Respond with a JSON object containing:
         tree_focus: list[str],
         recent_fixes: list[FixRecord],
         recent_activity: list[ActivityRecord],
+        guidance: list[RepoGuidanceRecord],
+        verification_profiles: list[VerificationProfileRecord],
+        ticket_contexts: list[TicketContextRecord],
+        threat_models: list[ThreatModelRecord],
+        related_paths: list[str],
+        repo_map: RepoMapSummary,
     ) -> str:
         evidence_lines = []
         for evidence in issue.evidence[:8] + issue.verification_evidence[:8]:
@@ -3139,6 +3678,48 @@ Respond with a JSON object containing:
                 history_lines.append(f"- {entry.created_at}: {', '.join(fragments)}")
             else:
                 history_lines.append(f"- {entry.created_at}: {entry.summary}")
+        guidance_lines = []
+        for item in guidance[:self.GUIDANCE_LIMIT]:
+            mode = "always-on" if item.always_on else "optional"
+            guidance_lines.append(f"- {item.path} [{item.kind}, {mode}]: {item.summary or item.title}")
+        verification_lines = []
+        for profile in verification_profiles[:4]:
+            coverage_bits = []
+            if profile.coverage_command:
+                coverage_bits.append(f"coverage command: {profile.coverage_command}")
+            if profile.coverage_report_path:
+                coverage_bits.append(f"report: {profile.coverage_report_path}")
+            if profile.coverage_format != "unknown":
+                coverage_bits.append(f"format: {profile.coverage_format}")
+            coverage_summary = f" ({'; '.join(coverage_bits)})" if coverage_bits else ""
+            verification_lines.append(f"- {profile.name}: {profile.test_command}{coverage_summary}")
+        ticket_lines = []
+        for context in ticket_contexts[:4]:
+            header_bits = [context.provider]
+            if context.external_id:
+                header_bits.append(context.external_id)
+            if context.status:
+                header_bits.append(context.status)
+            criteria = "; ".join(context.acceptance_criteria[:3]) or "No acceptance criteria recorded."
+            ticket_lines.append(
+                f"- {context.title} [{' / '.join(header_bits)}]: {context.summary or 'No summary.'} "
+                f"Acceptance criteria: {criteria}"
+            )
+        threat_lines = []
+        for threat_model in threat_models[:3]:
+            assets = ", ".join(threat_model.assets[:3]) or "No assets listed."
+            abuse_cases = "; ".join(threat_model.abuse_cases[:2]) or "No abuse cases listed."
+            mitigations = "; ".join(threat_model.mitigations[:2]) or "No mitigations listed."
+            threat_lines.append(
+                f"- {threat_model.title} [{threat_model.methodology} / {threat_model.status}]: "
+                f"{threat_model.summary or 'No summary.'} Assets: {assets}. Abuse cases: {abuse_cases}. "
+                f"Mitigations: {mitigations}"
+            )
+        repo_dir_lines = [
+            f"- {item.path}: {item.source_file_count} source files, {item.test_file_count} test files"
+            for item in repo_map.top_directories[:5]
+        ]
+        related_lines = "\n".join(f"- {path}" for path in related_paths[:8]) or "- No related paths ranked yet."
         return (
             f"You are fixing bug {issue.bug_id} in workspace {workspace.root_path}.\n"
             f"Title: {issue.title}\n"
@@ -3151,6 +3732,12 @@ Respond with a JSON object containing:
             f"Evidence references:\n{chr(10).join(evidence_lines) if evidence_lines else '- None listed.'}\n\n"
             f"Recent issue history:\n{chr(10).join(history_lines) if history_lines else '- No recent issue history.'}\n\n"
             f"Prior fix history:\n{chr(10).join(fix_lines) if fix_lines else '- No prior fixes recorded.'}\n\n"
+            f"Ticket context:\n{chr(10).join(ticket_lines) if ticket_lines else '- No linked ticket context recorded.'}\n\n"
+            f"Threat model:\n{chr(10).join(threat_lines) if threat_lines else '- No threat model recorded yet.'}\n\n"
+            f"Structural context:\n{chr(10).join(repo_dir_lines) if repo_dir_lines else '- No repo map available.'}\n\n"
+            f"Ranked related paths:\n{related_lines}\n\n"
+            f"Repository guidance:\n{chr(10).join(guidance_lines) if guidance_lines else '- No repository guidance files were found.'}\n\n"
+            f"Known verification profiles:\n{chr(10).join(verification_lines) if verification_lines else '- No verification profiles configured yet.'}\n\n"
             f"Priority files:\n{focus_lines}\n\n"
             "Required workflow:\n"
             "1. Reproduce or validate the bug against the current code.\n"
@@ -3159,6 +3746,237 @@ Respond with a JSON object containing:
             "4. Record exact files changed, tests run, and how the fix works back into the tracker.\n"
             "Return a concise engineering result, not a conversation."
         )
+
+    def _apply_guidance_to_prompt(self, prompt: str, guidance: list[RepoGuidanceRecord]) -> str:
+        if not guidance:
+            return prompt
+        lines = [f"- {item.path}: {item.summary or item.title}" for item in guidance[:self.GUIDANCE_LIMIT]]
+        return f"Repository guidance to respect:\n{chr(10).join(lines)}\n\n{prompt}"
+
+    def _collect_workspace_guidance(self, root: Path, workspace_id: str) -> list[RepoGuidanceRecord]:
+        candidates: list[tuple[Path, str, bool, int]] = []
+        root_resolved = root.resolve()
+        for name, kind, always_on, priority in [
+            ("AGENTS.md", "agent_instructions", True, 10),
+            ("agents.md", "agent_instructions", True, 10),
+            ("CLAUDE.md", "agent_instructions", True, 12),
+            ("GEMINI.md", "agent_instructions", True, 12),
+            (".openhands/microagents/repo.md", "agent_instructions", True, 14),
+            ("CONVENTIONS.md", "conventions", True, 20),
+            (".clinerules", "conventions", True, 22),
+            (".devin/wiki.json", "repo_index", True, 25),
+            ("README.md", "workspace_overview", False, 60),
+        ]:
+            candidate = root / name
+            if candidate.exists() and candidate.is_file():
+                candidates.append((candidate, kind, always_on, priority))
+        for pattern, priority in [
+            (".openhands/microagents/**/*.md", 28),
+            (".openhands/skills/*.md", 30),
+            (".openhands/skills/**/*.md", 30),
+            (".agents/skills/*.md", 32),
+            (".agents/skills/**/*.md", 32),
+            (".cursor/rules/*.mdc", 34),
+        ]:
+            candidates.extend((path, "skill", False, priority) for path in sorted(root.glob(pattern)) if path.is_file())
+
+        items: list[RepoGuidanceRecord] = []
+        seen_paths: set[str] = set()
+        for path, kind, always_on, priority in candidates:
+            resolved_path = path.resolve()
+            resolved_key = str(resolved_path).lower()
+            if resolved_key in seen_paths:
+                continue
+            seen_paths.add(resolved_key)
+            items.append(self._build_guidance_record(workspace_id, root_resolved, resolved_path, kind, always_on, priority))
+        return sorted(items, key=lambda item: (item.priority, item.path.lower()))
+
+    def _build_guidance_record(
+        self,
+        workspace_id: str,
+        root: Path,
+        path: Path,
+        kind: str,
+        always_on: bool,
+        priority: int,
+    ) -> RepoGuidanceRecord:
+        relative_path = str(path.relative_to(root))
+        text = path.read_text(encoding="utf-8", errors="ignore")
+        summary, excerpt, trigger_keywords = self._summarize_guidance_text(path, kind, text)
+        title = self._guidance_title_from_text(path, text)
+        guidance_id = f"guide_{hashlib.sha1(f'{workspace_id}:{relative_path}'.encode('utf-8')).hexdigest()[:12]}"
+        updated_at = utc_now()
+        try:
+            updated_at = __import__("datetime").datetime.fromtimestamp(path.stat().st_mtime, tz=__import__("datetime").timezone.utc).isoformat()
+        except OSError:
+            pass
+        return RepoGuidanceRecord(
+            guidance_id=guidance_id,
+            workspace_id=workspace_id,
+            kind=kind,
+            title=title,
+            path=relative_path,
+            always_on=always_on,
+            priority=priority,
+            summary=summary,
+            excerpt=excerpt,
+            trigger_keywords=trigger_keywords,
+            updated_at=updated_at,
+        )
+
+    def _guidance_title_from_text(self, path: Path, text: str) -> str:
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if line.startswith("#"):
+                return line.lstrip("#").strip()
+        return path.name
+
+    def _summarize_guidance_text(self, path: Path, kind: str, text: str) -> tuple[str, Optional[str], list[str]]:
+        if path.suffix == ".json":
+            return self._summarize_guidance_json(text)
+
+        summary_lines: list[str] = []
+        trigger_keywords: list[str] = []
+        in_frontmatter = False
+        seen_frontmatter = False
+        in_code_fence = False
+
+        for index, raw_line in enumerate(text.splitlines()):
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line == "---" and index == 0:
+                in_frontmatter = True
+                seen_frontmatter = True
+                continue
+            if in_frontmatter and line == "---":
+                in_frontmatter = False
+                continue
+            if line.startswith("```"):
+                in_code_fence = not in_code_fence
+                continue
+            if in_frontmatter:
+                if line.startswith("keywords:"):
+                    trigger_keywords.extend(self._extract_inline_keywords(line))
+                continue
+            if in_code_fence:
+                continue
+            if line.startswith("#"):
+                continue
+            normalized = line.lstrip("-*").strip()
+            if re.match(r"^\d+\.", normalized):
+                normalized = re.sub(r"^\d+\.\s*", "", normalized)
+            if normalized and normalized not in summary_lines:
+                summary_lines.append(normalized)
+            if len(summary_lines) >= 4:
+                break
+
+        if kind == "skill" and seen_frontmatter and not trigger_keywords:
+            trigger_keywords = self._extract_keyword_block(text)
+        excerpt = "\n".join(summary_lines[:4])[:600] or None
+        summary = " ".join(summary_lines[:3])[:280] if summary_lines else f"Repository guidance from {path.name}"
+        return summary, excerpt, trigger_keywords[:8]
+
+    def _summarize_guidance_json(self, text: str) -> tuple[str, Optional[str], list[str]]:
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            compact = " ".join(line.strip() for line in text.splitlines() if line.strip())[:280]
+            return compact or "Repository index configuration", None, []
+        if not isinstance(payload, dict):
+            compact = json.dumps(payload)[:280]
+            return compact or "Repository index configuration", compact[:600] if compact else None, []
+
+        include = payload.get("include") or payload.get("includes") or payload.get("include_paths") or []
+        exclude = payload.get("exclude") or payload.get("excludes") or payload.get("exclude_paths") or []
+        summary_parts: list[str] = []
+        if payload.get("description"):
+            summary_parts.append(str(payload["description"]))
+        if isinstance(include, list) and include:
+            summary_parts.append(f"Includes {', '.join(str(item) for item in include[:4])}")
+        if isinstance(exclude, list) and exclude:
+            summary_parts.append(f"Excludes {', '.join(str(item) for item in exclude[:4])}")
+        excerpt = json.dumps(payload, indent=2)[:600]
+        return ". ".join(summary_parts)[:280] or "Repository index configuration", excerpt, []
+
+    def _extract_inline_keywords(self, line: str) -> list[str]:
+        match = re.search(r"\[(.*?)\]", line)
+        if not match:
+            return []
+        return [item.strip().strip("'\"") for item in match.group(1).split(",") if item.strip()]
+
+    def _extract_keyword_block(self, text: str) -> list[str]:
+        match = re.search(r"keywords:\s*\[(.*?)\]", text, flags=re.IGNORECASE | re.DOTALL)
+        if not match:
+            return []
+        return [item.strip().strip("'\"") for item in match.group(1).split(",") if item.strip()]
+
+    def _dedupe_text(self, items: list[str]) -> list[str]:
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for item in items:
+            normalized = item.strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            ordered.append(normalized)
+        return ordered[:6]
+
+    def _context_tokens(self, issue: IssueRecord, ticket_contexts: list[TicketContextRecord]) -> list[str]:
+        text_parts = [
+            issue.title,
+            issue.summary or "",
+            issue.impact or "",
+            " ".join(issue.labels),
+        ]
+        for context in ticket_contexts[:4]:
+            text_parts.extend(
+                [
+                    context.title,
+                    context.summary,
+                    " ".join(context.labels),
+                    " ".join(context.acceptance_criteria),
+                ]
+            )
+        tokens = re.findall(r"[a-z0-9_./-]{3,}", " ".join(text_parts).lower())
+        stop_words = {"the", "and", "for", "with", "that", "this", "from", "issue", "bug", "current", "branch"}
+        ordered: list[str] = []
+        for token in tokens:
+            if token in stop_words or token in ordered:
+                continue
+            ordered.append(token)
+        return ordered[:24]
+
+    def _rank_related_paths(
+        self,
+        issue: IssueRecord,
+        tree_focus: list[str],
+        ticket_contexts: list[TicketContextRecord],
+        repo_map: RepoMapSummary,
+    ) -> list[str]:
+        candidates = list(tree_focus)
+        candidates.extend(item.path for item in repo_map.key_files)
+        candidates.extend(item.path for item in repo_map.top_directories)
+        tokens = self._context_tokens(issue, ticket_contexts)
+        scored: dict[str, int] = {}
+        for path in candidates:
+            if not path:
+                continue
+            score = 0
+            lowered = path.lower()
+            if path in tree_focus:
+                score += 6
+            for token in tokens:
+                if token in lowered:
+                    score += 2
+            if lowered.endswith((".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".rs", ".java")):
+                score += 1
+            if "test" in lowered:
+                score += 1
+            if score > 0:
+                scored[path] = max(scored.get(path, 0), score)
+        ordered = [path for path, _ in sorted(scored.items(), key=lambda item: (-item[1], item[0]))]
+        return ordered[:8]
 
     def _draft_summary_from_excerpt(self, excerpt: str, issue_id: str, run_id: str) -> str:
         for raw_line in excerpt.splitlines():
@@ -3183,6 +4001,147 @@ Respond with a JSON object containing:
                 seen.add(command)
                 commands.append(command[:220])
         return commands[:6]
+
+    def _extract_coverage_report_path(self, text: str) -> Optional[str]:
+        patterns = [
+            r"(--cov-report=xml:?([^\s]+)?)",
+            r"(coverage(?:/[\w./-]+)?\.xml)",
+            r"(coverage\.info)",
+            r"(build/reports/jacoco/test/jacocoTestReport\.(?:csv|xml))",
+            r"(target/site/jacoco/jacoco\.(?:csv|xml))",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text, flags=re.IGNORECASE)
+            if not match:
+                continue
+            groups = [item for item in match.groups() if item]
+            if pattern.startswith("(--cov-report") and len(groups) > 1:
+                report_target = groups[1]
+                return report_target if report_target and report_target != "xml" else "coverage.xml"
+            return groups[-1]
+        return None
+
+    def _infer_coverage_format(self, command: str, report_path: Optional[str]) -> str:
+        haystack = f"{command} {report_path or ''}".lower()
+        if "jacoco" in haystack:
+            return "jacoco"
+        if "lcov" in haystack or (report_path or "").endswith(".info"):
+            return "lcov"
+        if "go test -cover" in haystack or "coverprofile" in haystack:
+            return "go"
+        if "cov-report=xml" in haystack or (report_path or "").endswith(".xml"):
+            return "cobertura"
+        return "unknown"
+
+    def _verification_profile_name(self, command: str) -> str:
+        normalized = command.lower()
+        if "pytest" in normalized:
+            return "Pytest verification"
+        if "npm run test:coverage" in normalized or "vitest" in normalized or "jest" in normalized:
+            return "JavaScript coverage"
+        if "npm test" in normalized or "pnpm test" in normalized or "yarn test" in normalized:
+            return "JavaScript tests"
+        if "cargo test" in normalized:
+            return "Cargo tests"
+        if "go test" in normalized:
+            return "Go verification"
+        return "Repository verification"
+
+    def _parse_acceptance_criteria(self, text: Optional[str]) -> list[str]:
+        if not text:
+            return []
+        lines = text.splitlines()
+        criteria: list[str] = []
+        collecting = False
+        for raw_line in lines:
+            line = raw_line.strip()
+            if re.match(r"^#{1,6}\s+", line):
+                heading = re.sub(r"^#{1,6}\s+", "", line).strip().lower()
+                if "acceptance" in heading and "criteria" in heading:
+                    collecting = True
+                    continue
+                if collecting and criteria:
+                    break
+                collecting = False
+            if not collecting:
+                continue
+            bullet = re.match(r"^(?:[-*]\s+(?:\[[ xX]\]\s+)?)?(.*)$", line)
+            numbered = re.match(r"^\d+\.\s+(.*)$", line)
+            value = ""
+            if numbered:
+                value = numbered.group(1).strip()
+            elif bullet:
+                value = bullet.group(1).strip()
+            if value:
+                criteria.append(value)
+            elif criteria:
+                break
+        if criteria:
+            return self._normalize_text_list(criteria, limit=10)
+
+        checklist_items: list[str] = []
+        for raw_line in lines:
+            match = re.match(r"^\s*[-*]\s+\[(?: |x|X)\]\s+(.*)$", raw_line)
+            if match:
+                checklist_items.append(match.group(1).strip())
+        return self._normalize_text_list(checklist_items, limit=10)
+
+    def _save_imported_ticket_context(
+        self,
+        workspace_id: str,
+        issue_id: str,
+        request: TicketContextUpsertRequest,
+        *,
+        actor: Optional[ActivityActor] = None,
+    ) -> TicketContextRecord:
+        context_id = request.context_id or self._slug_runbook_name(f"{request.provider}-{request.external_id or request.title}")
+        return self.save_ticket_context(
+            workspace_id,
+            issue_id,
+            request.model_copy(update={"context_id": context_id}),
+            actor=actor or build_activity_actor("system", "system"),
+            action="ticket_context.synced",
+        )
+
+    def _infer_verification_profiles_from_guidance(
+        self,
+        workspace_id: str,
+        guidance: list[RepoGuidanceRecord],
+        root: Path,
+    ) -> list[VerificationProfileRecord]:
+        profiles: list[VerificationProfileRecord] = []
+        seen_commands: set[str] = set()
+        for item in guidance:
+            candidate_path = root / item.path
+            if not candidate_path.exists() or not candidate_path.is_file():
+                continue
+            text = candidate_path.read_text(encoding="utf-8", errors="ignore")
+            for command in self._extract_test_commands(text):
+                normalized_command = " ".join(command.split())
+                if normalized_command in seen_commands:
+                    continue
+                seen_commands.add(normalized_command)
+                report_path = self._extract_coverage_report_path(text) or self._extract_coverage_report_path(normalized_command)
+                coverage_format = self._infer_coverage_format(normalized_command, report_path)
+                coverage_command = normalized_command if coverage_format != "unknown" or report_path else None
+                profile_id = self._slug_runbook_name(f"inferred-{normalized_command}")
+                profiles.append(
+                    VerificationProfileRecord(
+                        profile_id=profile_id,
+                        workspace_id=workspace_id,
+                        name=self._verification_profile_name(normalized_command),
+                        description=f"Inferred from {item.path}.",
+                        test_command=normalized_command,
+                        coverage_command=coverage_command,
+                        coverage_report_path=report_path,
+                        coverage_format=coverage_format,
+                        max_runtime_seconds=60,
+                        retry_count=1,
+                        source_paths=[item.path],
+                        built_in=True,
+                    )
+                )
+        return profiles[:6]
 
     def _extract_changed_files(self, text: str) -> list[str]:
         pattern = re.compile(r"\b(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\.(?:py|ts|tsx|js|jsx|go|rs|md|json|yaml|yml|css)\b")
