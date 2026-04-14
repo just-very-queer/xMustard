@@ -15,3 +15,14 @@ backend/data/workspaces/*/runs/*.out.json
 backend/data/workspaces/*/terminals/*.log
 
 research/
+
+# Rust build artifacts
+rust-core/target/
+
+# OS files
+.DS_Store
+*.pyc
+__pycache__/
+node_modules/
+*.egg-info/
+.env
