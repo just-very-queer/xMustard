@@ -21,6 +21,7 @@ from app.models import (
     ThreatModelUpsertRequest,
     TicketContextUpsertRequest,
     VerificationProfileUpsertRequest,
+    VerificationProfileRunRequest,
     VerifyIssueRequest,
     WorktreeStatus,
     WorkspaceLoadRequest,
@@ -267,6 +268,64 @@ class TrackerServiceTests(unittest.TestCase):
             service.delete_verification_profile(snapshot.workspace.workspace_id, saved.profile_id)
             remaining = service.list_verification_profiles(snapshot.workspace.workspace_id)
             self.assertFalse(any(item.profile_id == saved.profile_id for item in remaining))
+
+    def test_running_verification_profile_persists_coverage_and_activity(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "repo"
+            (root / "docs" / "bugs").mkdir(parents=True)
+            (root / "api" / "src").mkdir(parents=True)
+            (root / "docs" / "bugs" / "Bugs_25260323.md").write_text(LEDGER_TEXT, encoding="utf-8")
+            (root / "api" / "src" / "example.py").write_text("print('ok')\n", encoding="utf-8")
+
+            store = FileStore(Path(tmp_dir) / "data")
+            service = TrackerService(store)
+            snapshot = service.load_workspace(WorkspaceLoadRequest(root_path=str(root), auto_scan=True))
+            assert snapshot is not None
+
+            profile = service.save_verification_profile(
+                snapshot.workspace.workspace_id,
+                VerificationProfileUpsertRequest(
+                    name="Backend pytest",
+                    description="Project verification commands",
+                    test_command="printf 'tests ok\\n'",
+                    coverage_command="printf 'SF:src/app.py\\nDA:1,1\\nDA:2,0\\nend_of_record\\n' > coverage.info",
+                    coverage_report_path="coverage.info",
+                    coverage_format="lcov",
+                    max_runtime_seconds=10,
+                    retry_count=1,
+                    source_paths=["AGENTS.md"],
+                ),
+            )
+
+            result = service.run_issue_verification_profile(
+                snapshot.workspace.workspace_id,
+                "P0_25M03_001",
+                profile.profile_id,
+                VerificationProfileRunRequest(run_id="manual-verification-run"),
+            )
+
+            self.assertTrue(result.success)
+            self.assertEqual(result.attempt_count, 1)
+            self.assertIsNotNone(result.coverage_result)
+            assert result.coverage_result is not None
+            self.assertEqual(result.coverage_result.format, "lcov")
+
+            coverage = service.get_coverage(
+                snapshot.workspace.workspace_id,
+                issue_id="P0_25M03_001",
+                run_id="manual-verification-run",
+            )
+            self.assertIsNotNone(coverage)
+            assert coverage is not None
+            self.assertEqual(coverage["line_coverage"], result.coverage_result.line_coverage)
+
+            updated_issue = service._get_issue(snapshot.workspace.workspace_id, "P0_25M03_001")
+            self.assertIn("printf 'tests ok\\n'", updated_issue.tests_passed)
+            self.assertTrue(any(item.path == "coverage.info" for item in updated_issue.verification_evidence))
+
+            activity = service.list_activity(snapshot.workspace.workspace_id, issue_id="P0_25M03_001")
+            self.assertTrue(any(item.action == "verification.profile_run" for item in activity))
+            self.assertTrue(any(item.action == "coverage.parsed" for item in activity))
 
     def test_ticket_context_crud_and_issue_packet(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

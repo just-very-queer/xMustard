@@ -1,0 +1,17 @@
+.DS_Store
+backend/.DS_Store
+*.pyc
+
+frontend/node_modules/
+frontend/dist/
+
+backend/.pytest_cache/
+backend/__pycache__/
+backend/data/quality_scores/
+backend/data/workspaces/*/
+backend/data/workspaces/*/runs/*.json
+backend/data/workspaces/*/runs/*.log
+backend/data/workspaces/*/runs/*.out.json
+backend/data/workspaces/*/terminals/*.log
+
+research/

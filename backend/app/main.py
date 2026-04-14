@@ -31,6 +31,7 @@ from .models import (
     TerminalOpenRequest,
     TerminalResizeRequest,
     TerminalWriteRequest,
+    VerificationProfileRunRequest,
     VerificationProfileUpsertRequest,
     VerifyIssueRequest,
     WorkspaceLoadRequest,
@@ -315,6 +316,19 @@ def delete_verification_profile(workspace_id: str, profile_id: str):
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=f"Missing resource: {exc}")
     return {"ok": True, "profile_id": profile_id}
+
+
+@app.post("/api/workspaces/{workspace_id}/issues/{issue_id}/verification-profiles/{profile_id}/run")
+def run_verification_profile_for_issue(
+    workspace_id: str,
+    issue_id: str,
+    profile_id: str,
+    request: VerificationProfileRunRequest,
+):
+    try:
+        return SERVICE.run_issue_verification_profile(workspace_id, issue_id, profile_id, request).model_dump(mode="json")
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"Missing resource: {exc}")
 
 
 @app.delete("/api/workspaces/{workspace_id}/runbooks/{runbook_id}")

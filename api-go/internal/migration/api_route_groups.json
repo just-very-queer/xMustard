@@ -1,0 +1,121 @@
+[
+  {
+    "group": "settings_and_runtime",
+    "current_owner": "backend/app/main.py + backend/app/runtimes.py",
+    "target_owner": "api-go + rust-core",
+    "notes": "Health, settings, runtime capabilities, and runtime probe flows.",
+    "endpoints": [
+      "/api/health",
+      "/api/runtimes",
+      "/api/settings",
+      "/api/agent/capabilities",
+      "/api/workspaces/{workspace_id}/agent/probe"
+    ]
+  },
+  {
+    "group": "workspace_snapshot",
+    "current_owner": "backend/app/main.py + backend/app/service.py",
+    "target_owner": "api-go",
+    "notes": "Workspace loading, snapshots, activity, sources, tree, guidance, and export.",
+    "endpoints": [
+      "/api/workspaces",
+      "/api/workspaces/load",
+      "/api/workspaces/{workspace_id}/snapshot",
+      "/api/workspaces/{workspace_id}/activity",
+      "/api/workspaces/{workspace_id}/activity/overview",
+      "/api/workspaces/{workspace_id}/sources",
+      "/api/workspaces/{workspace_id}/tree",
+      "/api/workspaces/{workspace_id}/guidance",
+      "/api/workspaces/{workspace_id}/repo-map",
+      "/api/workspaces/{workspace_id}/export"
+    ]
+  },
+  {
+    "group": "issues_and_signals",
+    "current_owner": "backend/app/main.py + backend/app/service.py + backend/app/scanners.py",
+    "target_owner": "api-go + rust-core",
+    "notes": "Issue CRUD, signals, drift, quality scoring, duplicate detection, triage, and signal promotion.",
+    "endpoints": [
+      "/api/workspaces/{workspace_id}/issues",
+      "/api/workspaces/{workspace_id}/issues/{issue_id}",
+      "/api/workspaces/{workspace_id}/issues/{issue_id}/drift",
+      "/api/workspaces/{workspace_id}/signals",
+      "/api/workspaces/{workspace_id}/drift",
+      "/api/workspaces/{workspace_id}/issues/{issue_id}/quality",
+      "/api/workspaces/{workspace_id}/issues/{issue_id}/duplicates",
+      "/api/workspaces/{workspace_id}/issues/{issue_id}/triage",
+      "/api/workspaces/{workspace_id}/triage/all",
+      "/api/workspaces/{workspace_id}/signals/{signal_id}/promote"
+    ]
+  },
+  {
+    "group": "issue_context_and_artifacts",
+    "current_owner": "backend/app/main.py + backend/app/service.py",
+    "target_owner": "api-go + rust-core",
+    "notes": "Issue context packets, runbooks, verification profiles, ticket context, threat models, and replay records. The Go shell now owns context, work, verification-profile execution, verification profile CRUD, ticket context CRUD, threat-model CRUD, and context replay CRUD against the existing tracker artifacts.",
+    "endpoints": [
+      "/api/workspaces/{workspace_id}/runbooks",
+      "/api/workspaces/{workspace_id}/verification-profiles",
+      "/api/workspaces/{workspace_id}/issues/{issue_id}/verification-profiles/{profile_id}/run",
+      "/api/workspaces/{workspace_id}/issues/{issue_id}/context",
+      "/api/workspaces/{workspace_id}/issues/{issue_id}/work",
+      "/api/workspaces/{workspace_id}/issues/{issue_id}/ticket-context",
+      "/api/workspaces/{workspace_id}/issues/{issue_id}/threat-models",
+      "/api/workspaces/{workspace_id}/issues/{issue_id}/context-replays"
+    ]
+  },
+  {
+    "group": "runs_and_review",
+    "current_owner": "backend/app/main.py + backend/app/service.py + backend/app/runtimes.py",
+    "target_owner": "api-go + rust-core",
+    "notes": "Run launch, logs, planning, metrics, critique, improvements, fixes, and verification runs.",
+    "endpoints": [
+      "/api/workspaces/{workspace_id}/issues/{issue_id}/runs",
+      "/api/workspaces/{workspace_id}/issues/{issue_id}/verify",
+      "/api/workspaces/{workspace_id}/issues/{issue_id}/fixes",
+      "/api/workspaces/{workspace_id}/issues/{issue_id}/fix-draft",
+      "/api/workspaces/{workspace_id}/agent/query",
+      "/api/workspaces/{workspace_id}/runs",
+      "/api/workspaces/{workspace_id}/runs/{run_id}",
+      "/api/workspaces/{workspace_id}/runs/{run_id}/insights",
+      "/api/workspaces/{workspace_id}/runs/{run_id}/log",
+      "/api/workspaces/{workspace_id}/runs/{run_id}/cancel",
+      "/api/workspaces/{workspace_id}/runs/{run_id}/retry",
+      "/api/workspaces/{workspace_id}/runs/{run_id}/review",
+      "/api/workspaces/{workspace_id}/runs/{run_id}/accept",
+      "/api/workspaces/{workspace_id}/runs/{run_id}/plan",
+      "/api/workspaces/{workspace_id}/runs/{run_id}/plan/approve",
+      "/api/workspaces/{workspace_id}/runs/{run_id}/plan/reject",
+      "/api/workspaces/{workspace_id}/runs/{run_id}/metrics",
+      "/api/workspaces/{workspace_id}/metrics",
+      "/api/workspaces/{workspace_id}/costs",
+      "/api/workspaces/{workspace_id}/coverage/parse",
+      "/api/workspaces/{workspace_id}/coverage",
+      "/api/workspaces/{workspace_id}/issues/{issue_id}/coverage-delta",
+      "/api/workspaces/{workspace_id}/issues/{issue_id}/test-suggestions",
+      "/api/workspaces/{workspace_id}/runs/{run_id}/critique",
+      "/api/workspaces/{workspace_id}/runs/{run_id}/improvements",
+      "/api/workspaces/{workspace_id}/fixes/{fix_id}"
+    ]
+  },
+  {
+    "group": "integrations_and_terminal",
+    "current_owner": "backend/app/main.py + backend/app/service.py + backend/app/terminal.py",
+    "target_owner": "api-go",
+    "notes": "Provider integrations and local terminal session transport.",
+    "endpoints": [
+      "/api/workspaces/{workspace_id}/integrations",
+      "/api/integrations/test",
+      "/api/workspaces/{workspace_id}/integrations/github/import",
+      "/api/workspaces/{workspace_id}/integrations/github/pr",
+      "/api/workspaces/{workspace_id}/integrations/slack/notify",
+      "/api/workspaces/{workspace_id}/integrations/linear/sync/{issue_id}",
+      "/api/workspaces/{workspace_id}/integrations/jira/sync/{issue_id}",
+      "/api/terminal/open",
+      "/api/terminal/{terminal_id}/write",
+      "/api/terminal/{terminal_id}/resize",
+      "/api/terminal/{terminal_id}/read",
+      "/api/terminal/{terminal_id}"
+    ]
+  }
+]

@@ -419,6 +419,10 @@ def _content_matches_signal(kind: str, pattern: str, content: str) -> bool:
 
 
 def scan_repo_signals(root_path: Path) -> list[DiscoverySignal]:
+    if os.environ.get("XMUSTARD_USE_RUST_SCANNER") in {"1", "true", "TRUE", "yes", "on"}:
+        rust_signals = _scan_repo_signals_via_rust(root_path)
+        if rust_signals is not None:
+            return rust_signals
     commands = [
         (
             "annotation",
@@ -451,6 +455,47 @@ def scan_repo_signals(root_path: Path) -> list[DiscoverySignal]:
     for signal in signals:
         deduped[signal.fingerprint] = signal
     return list(sorted(deduped.values(), key=lambda item: (item.severity, item.file_path, item.line)))
+
+
+def _scan_repo_signals_via_rust(root_path: Path) -> Optional[list[DiscoverySignal]]:
+    repo_root = Path(__file__).resolve().parents[2]
+    rust_core_dir = repo_root / "rust-core"
+    if not rust_core_dir.exists():
+        return None
+
+    explicit_bin = os.environ.get("XMUSTARD_RUST_CORE_BIN")
+    if explicit_bin:
+        command = [explicit_bin, "scan-signals", str(root_path)]
+        cwd = repo_root
+    else:
+        command = ["cargo", "run", "--quiet", "--bin", "xmustard-core", "--", "scan-signals", str(root_path)]
+        cwd = rust_core_dir
+
+    try:
+        completed = subprocess.run(command, capture_output=True, text=True, check=False, cwd=cwd)
+    except FileNotFoundError:
+        return None
+
+    if completed.returncode != 0:
+        return None
+
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError:
+        return None
+
+    if not isinstance(payload, list):
+        return None
+
+    signals: list[DiscoverySignal] = []
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        try:
+            signals.append(DiscoverySignal.model_validate(item))
+        except Exception:
+            continue
+    return signals
 
 
 def run_ripgrep_signal_scan(
@@ -545,6 +590,10 @@ def summarize_tree(root_path: Path) -> dict[str, int]:
 
 
 def build_repo_map(root_path: Path, workspace_id: str) -> RepoMapSummary:
+    if os.environ.get("XMUSTARD_USE_RUST_REPOMAP") in {"1", "true", "TRUE", "yes", "on"}:
+        rust_repo_map = _build_repo_map_via_rust(root_path, workspace_id)
+        if rust_repo_map is not None:
+            return rust_repo_map
     extension_counts: Counter[str] = Counter()
     top_level: dict[str, dict[str, int]] = defaultdict(lambda: {"file_count": 0, "source_file_count": 0, "test_file_count": 0})
     key_files: list[RepoMapFileRecord] = []
@@ -610,3 +659,49 @@ def build_repo_map(root_path: Path, workspace_id: str) -> RepoMapSummary:
         top_directories=top_directories,
         key_files=key_files[:12],
     )
+
+
+def _build_repo_map_via_rust(root_path: Path, workspace_id: str) -> Optional[RepoMapSummary]:
+    repo_root = Path(__file__).resolve().parents[2]
+    rust_core_dir = repo_root / "rust-core"
+    if not rust_core_dir.exists():
+        return None
+
+    explicit_bin = os.environ.get("XMUSTARD_RUST_CORE_BIN")
+    if explicit_bin:
+        command = [explicit_bin, "build-repo-map", workspace_id, str(root_path)]
+        cwd = repo_root
+    else:
+        command = [
+            "cargo",
+            "run",
+            "--quiet",
+            "--bin",
+            "xmustard-core",
+            "--",
+            "build-repo-map",
+            workspace_id,
+            str(root_path),
+        ]
+        cwd = rust_core_dir
+
+    try:
+        completed = subprocess.run(command, capture_output=True, text=True, check=False, cwd=cwd)
+    except FileNotFoundError:
+        return None
+
+    if completed.returncode != 0:
+        return None
+
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError:
+        return None
+
+    if not isinstance(payload, dict):
+        return None
+
+    try:
+        return RepoMapSummary.model_validate(payload)
+    except Exception:
+        return None

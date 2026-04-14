@@ -14,11 +14,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   - agent operations, insights, and governance
   - incremental backend migration away from Python toward a Rust-based core
 - `docs/FEATURES.md`, `docs/ARCHITECTURE.md`, and `README.md` now reflect that xMustard is moving toward stronger trust, retrieval, governance, and backend-platform planning instead of simply expanding UI surface area
+- backend migration planning now explicitly tracks a Rust core plus a possible Go API shell instead of assuming the HTTP layer must stay in Python until the very end
 
 ### Added
 - Issue-level threat model artifacts with backend CRUD, prompt integration, export support, and issue detail editing
 - Research notes now include external security/trust references such as OWASP Threat Dragon, OWASP pytm, Semgrep Code, GitHub code scanning, and Vulnhuntr patterns
 - Workspace metadata under `backend/data/` now points the self-workspace at `/Users/for_home/Developer/xMustard`
+- `.gitignore` coverage for local mirrors, generated run logs, and OS junk
+- initial migration working note in `docs/MIGRATION_RUST_GO.md`
+- initial `rust-core/` scaffolding for scanner, repo-map, verification, and contract boundaries
+- initial `api-go/` scaffolding for the future HTTP/API shell
+- route-group migration inventory parity test in `backend/tests/test_api_route_inventory.py`
+- Rust scanner CLI plus Python parity and adapter-path tests
+- Rust repo-map CLI plus Python parity and adapter-path tests
+- Rust coverage parsers for LCOV, Cobertura, and Istanbul plus Python parity and adapter-path tests
+- Rust verification command runner plus Python parity and adapter-path tests
+- Rust verification profile runner with retries and optional coverage artifact parsing
+- Go migration endpoints for scanner, repo-map, and generic coverage parsing
+- Go migration endpoint for verification command execution
+- Go migration endpoint for verification profile execution
+- issue-level verification profile execution endpoint and tracker persistence for coverage/activity artifacts
+- Go API shell support for the issue-level verification profile run workflow with snapshot/activity/coverage writes
+- Go API shell support for coverage parse, latest coverage lookup, and coverage delta from persisted tracker artifacts
+- Go API shell support for verification profile list/save/delete with persisted settings activity
+- Go API shell support for ticket-context list/save/delete with persisted issue activity
+- Go API shell support for threat-model list/save/delete with persisted issue activity
+- Go API shell support for issue-context packet reads, issue-work packet reads with runbook selection, and issue-context replay list/capture against persisted tracker artifacts
 
 ## [0.2.0] - 2026-04-14
 

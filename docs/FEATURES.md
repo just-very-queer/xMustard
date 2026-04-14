@@ -295,13 +295,13 @@ Expected impact:
 
 ## F15: Backend Migration To Rust
 
-The backend should move toward a compiled core over time, without breaking the current UI or evidence model.
+The backend should move toward a compiled core over time, without breaking the current UI or evidence model. The current experiment in this repo is a Rust core paired with a possible Go API shell.
 
 Planned behavior:
 
 - preserve the current API and data contracts while isolating domain services
 - migrate scanning, repo-map generation, search, and verification execution first
-- evaluate replacing the Python orchestration layer after the core services are stable
+- evaluate replacing the Python orchestration layer with Go or Rust after the core services are stable
 
 Expected impact:
 

@@ -405,6 +405,34 @@ export type VerificationProfileUpsertRequest = {
   source_paths?: string[]
 }
 
+export type VerificationProfileRunRequest = {
+  run_id?: string | null
+}
+
+export type VerificationCommandResult = {
+  command: string
+  cwd: string
+  exit_code?: number | null
+  success: boolean
+  timed_out: boolean
+  duration_ms: number
+  stdout_excerpt: string
+  stderr_excerpt: string
+  created_at: string
+}
+
+export type VerificationProfileExecutionResult = {
+  profile_id: string
+  workspace_id: string
+  attempts: VerificationCommandResult[]
+  attempt_count: number
+  success: boolean
+  coverage_command_result?: VerificationCommandResult | null
+  coverage_result?: CoverageResult | null
+  coverage_report_path?: string | null
+  created_at: string
+}
+
 export type TicketContextRecord = {
   context_id: string
   workspace_id: string

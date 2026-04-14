@@ -287,7 +287,7 @@ Planned stages:
 1. define stable service boundaries for scanning, repo-map generation, search, verification execution, and runtime orchestration
 2. move scanners, repo-map building, and search indexing into a Rust sidecar or library-backed service
 3. move verification execution and artifact generation into Rust for stronger process control
-4. evaluate replacing the FastAPI orchestration layer with a Rust HTTP service once the core subsystems are proven
+4. evaluate replacing the FastAPI orchestration layer with a Go API shell or Rust HTTP service once the core subsystems are proven
 
 Success looks like:
 

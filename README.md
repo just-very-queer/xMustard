@@ -22,11 +22,13 @@ The current product already supports:
 
 - `backend/`: FastAPI API, Typer CLI, JSON-backed persistence
 - `frontend/`: Vite, React, TypeScript
+- `rust-core/`: experimental Rust core for scanner, repo-map, and verification migration work
+- `api-go/`: experimental Go HTTP shell for future API migration work
 - runtimes: `codex`, `opencode`, plus room for more runtime adapters
 
 Longer-term platform direction:
 
-- keep the current product contracts stable while incrementally moving backend-heavy subsystems toward a Rust core
+- keep the current product contracts stable while incrementally moving backend-heavy subsystems toward a Rust core and evaluating a Go API shell for the HTTP layer
 
 ## Workflow
 
@@ -109,3 +111,5 @@ Reference implementations are available locally under `research/`.
 | `auto-code-rover` | structure-aware planning and staged execution |
 
 See [docs/RESEARCH_FINDINGS.md](docs/RESEARCH_FINDINGS.md), [docs/RESEARCH_MATRIX.md](docs/RESEARCH_MATRIX.md), [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), and [docs/PLANNING.md](docs/PLANNING.md) for the current synthesis.
+
+Migration work now also has a dedicated working note in [docs/MIGRATION_RUST_GO.md](docs/MIGRATION_RUST_GO.md).

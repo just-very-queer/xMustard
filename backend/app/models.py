@@ -392,6 +392,30 @@ class VerificationProfileRecord(BaseModel):
     updated_at: str = Field(default_factory=utc_now)
 
 
+class VerificationCommandResult(BaseModel):
+    command: str
+    cwd: str
+    exit_code: Optional[int] = None
+    success: bool = False
+    timed_out: bool = False
+    duration_ms: int = 0
+    stdout_excerpt: str = ""
+    stderr_excerpt: str = ""
+    created_at: str = Field(default_factory=utc_now)
+
+
+class VerificationProfileExecutionResult(BaseModel):
+    profile_id: str
+    workspace_id: str
+    attempts: list[VerificationCommandResult] = Field(default_factory=list)
+    attempt_count: int = 0
+    success: bool = False
+    coverage_command_result: Optional[VerificationCommandResult] = None
+    coverage_result: Optional["CoverageResult"] = None
+    coverage_report_path: Optional[str] = None
+    created_at: str = Field(default_factory=utc_now)
+
+
 class TicketContextRecord(BaseModel):
     context_id: str
     workspace_id: str
@@ -666,6 +690,10 @@ class VerifyIssueRequest(BaseModel):
     instruction: Optional[str] = None
     timeout_seconds: float = 60.0
     poll_interval: float = 2.0
+
+
+class VerificationProfileRunRequest(BaseModel):
+    run_id: Optional[str] = None
 
 
 class SavedIssueViewRequest(BaseModel):

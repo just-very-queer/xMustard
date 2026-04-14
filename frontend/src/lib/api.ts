@@ -51,6 +51,8 @@ import type {
   TriageSuggestion,
   TreeNode,
   VerificationProfileRecord,
+  VerificationProfileExecutionResult,
+  VerificationProfileRunRequest,
   VerificationProfileUpsertRequest,
   WorktreeStatus,
   WorkspaceSnapshot,
@@ -376,6 +378,21 @@ export function deleteVerificationProfile(workspaceId: string, profileId: string
     `/api/workspaces/${workspaceId}/verification-profiles/${profileId}`,
     {
       method: 'DELETE',
+    },
+  )
+}
+
+export function runVerificationProfileForIssue(
+  workspaceId: string,
+  issueId: string,
+  profileId: string,
+  payload: VerificationProfileRunRequest = {},
+) {
+  return request<VerificationProfileExecutionResult>(
+    `/api/workspaces/${workspaceId}/issues/${issueId}/verification-profiles/${profileId}/run`,
+    {
+      method: 'POST',
+      body: JSON.stringify(payload),
     },
   )
 }

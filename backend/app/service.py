@@ -3,8 +3,10 @@ from __future__ import annotations
 from collections import Counter
 import hashlib
 import json
+import os
 import re
 import subprocess
+import tempfile
 import time
 import urllib.request
 import urllib.error
@@ -78,8 +80,11 @@ from .models import (
     TriageSuggestion,
     VerificationProfileRecord,
     VerificationProfileUpsertRequest,
+    VerificationCommandResult,
     VerificationRecord,
+    VerificationProfileExecutionResult,
     VerificationSummary,
+    VerificationProfileRunRequest,
     VerifyIssueRequest,
     WorktreeStatus,
     WorkspaceLoadRequest,
@@ -795,6 +800,90 @@ class TrackerService:
             actor=build_activity_actor("operator", "operator"),
             details={"profile_id": profile_id},
         )
+
+    def run_issue_verification_profile(
+        self,
+        workspace_id: str,
+        issue_id: str,
+        profile_id: str,
+        request: VerificationProfileRunRequest,
+    ) -> VerificationProfileExecutionResult:
+        workspace = self.get_workspace(workspace_id)
+        issue = self._get_issue(workspace_id, issue_id)
+        profile = self._resolve_verification_profile(workspace_id, profile_id)
+        execution = self._execute_verification_profile(
+            Path(workspace.root_path),
+            profile,
+            request.run_id,
+            issue_id,
+        )
+
+        if execution.coverage_result is not None:
+            self._save_coverage_result(execution.coverage_result)
+            self._record_activity(
+                workspace_id=workspace_id,
+                entity_type="issue",
+                entity_id=issue_id,
+                action="coverage.parsed",
+                summary=f"Parsed coverage report: {execution.coverage_result.line_coverage:.1f}% lines",
+                actor=build_activity_actor("system", "system"),
+                issue_id=issue_id,
+                run_id=request.run_id,
+                details={
+                    "profile_id": profile.profile_id,
+                    "line_coverage": execution.coverage_result.line_coverage,
+                    "files_covered": execution.coverage_result.files_covered,
+                },
+            )
+
+        verification_evidence = list(issue.verification_evidence)
+        if execution.coverage_report_path:
+            report_path = Path(execution.coverage_report_path)
+            try:
+                relative_path = str(report_path.resolve().relative_to(Path(workspace.root_path).resolve()))
+            except ValueError:
+                relative_path = str(report_path)
+            coverage_excerpt = None
+            if execution.coverage_result is not None:
+                coverage_excerpt = (
+                    f"coverage {execution.coverage_result.line_coverage:.2f}% "
+                    f"({execution.coverage_result.lines_covered}/{execution.coverage_result.lines_total} lines)"
+                )
+            verification_evidence.append(EvidenceRef(path=relative_path, excerpt=coverage_excerpt))
+
+        tests_passed = list(issue.tests_passed)
+        if execution.success:
+            tests_passed = self._normalize_text_list([*tests_passed, profile.test_command], limit=24)
+
+        updated_issue = self._normalize_issue_evidence(
+            Path(workspace.root_path),
+            issue.model_copy(
+                update={
+                    "tests_passed": tests_passed,
+                    "verification_evidence": verification_evidence,
+                    "updated_at": utc_now(),
+                }
+            ),
+        )
+        self._persist_issue_snapshot_record(workspace_id, updated_issue)
+
+        self._record_activity(
+            workspace_id=workspace_id,
+            entity_type="issue",
+            entity_id=issue_id,
+            action="verification.profile_run",
+            summary=f"Ran verification profile {profile.name} ({'passed' if execution.success else 'failed'})",
+            actor=build_activity_actor("system", "system"),
+            issue_id=issue_id,
+            run_id=request.run_id,
+            details={
+                "profile_id": profile.profile_id,
+                "attempt_count": execution.attempt_count,
+                "success": execution.success,
+                "coverage_report_path": execution.coverage_report_path,
+            },
+        )
+        return execution
 
     def list_ticket_contexts(self, workspace_id: str, issue_id: Optional[str] = None) -> list[TicketContextRecord]:
         self.get_workspace(workspace_id)
@@ -1851,6 +1940,19 @@ Respond with a JSON object containing:
                 return issue
         raise FileNotFoundError(f"Issue {issue_id} not found in workspace {workspace_id}")
 
+    def _persist_issue_snapshot_record(self, workspace_id: str, issue: IssueRecord) -> None:
+        snapshot = self.store.load_snapshot(workspace_id)
+        if not snapshot:
+            raise FileNotFoundError(workspace_id)
+        updated_snapshot = snapshot.model_copy(
+            update={"issues": [issue if item.bug_id == issue.bug_id else item for item in snapshot.issues]}
+        )
+        self.store.save_snapshot(updated_snapshot)
+        if issue.source == "tracker" or self._tracked_issue_exists(workspace_id, issue.bug_id):
+            self._persist_tracked_issue(workspace_id, issue)
+        else:
+            self._persist_issue_override(workspace_id, issue)
+
     def _compute_similarity(self, a: IssueRecord, b: IssueRecord) -> DuplicateMatch:
         shared: list[str] = []
         score = 0.0
@@ -2018,6 +2120,10 @@ Respond with a JSON object containing:
         return [s.model_dump(mode="json") for s in suggestions]
 
     def _parse_coverage_file(self, path: Path, workspace_id: str, run_id: Optional[str], issue_id: Optional[str]) -> CoverageResult:
+        if os.environ.get("XMUSTARD_USE_RUST_COVERAGE") in {"1", "true", "TRUE", "yes", "on"}:
+            rust_result = self._parse_coverage_file_via_rust(path, workspace_id, run_id, issue_id)
+            if rust_result is not None:
+                return rust_result
         content = path.read_text(encoding="utf-8")
         fmt = "unknown"
         if path.suffix == ".xml":
@@ -2031,7 +2137,7 @@ Respond with a JSON object containing:
                     return self._parse_istanbul(data, workspace_id, run_id, issue_id, fmt, str(path))
             except json.JSONDecodeError:
                 pass
-        if path.suffix in (".csv", ".txt", ""):
+        if path.suffix in (".csv", ".txt", ".info", ""):
             fmt = "lcov"
             return self._parse_lcov(content, workspace_id, run_id, issue_id, fmt, str(path))
         return CoverageResult(
@@ -2039,6 +2145,281 @@ Respond with a JSON object containing:
             workspace_id=workspace_id, run_id=run_id, issue_id=issue_id,
             format=fmt, raw_report_path=str(path),
         )
+
+    def _parse_coverage_file_via_rust(
+        self,
+        path: Path,
+        workspace_id: str,
+        run_id: Optional[str],
+        issue_id: Optional[str],
+    ) -> Optional[CoverageResult]:
+        repo_root = Path(__file__).resolve().parents[2]
+        rust_core_dir = repo_root / "rust-core"
+        if not rust_core_dir.exists():
+            return None
+
+        explicit_bin = os.environ.get("XMUSTARD_RUST_CORE_BIN")
+        if explicit_bin:
+            command = [explicit_bin, "parse-coverage", workspace_id, str(path)]
+            if run_id:
+                command.append(run_id)
+            if issue_id:
+                command.append(issue_id)
+            cwd = repo_root
+        else:
+            command = ["cargo", "run", "--quiet", "--bin", "xmustard-core", "--", "parse-coverage", workspace_id, str(path)]
+            if run_id:
+                command.append(run_id)
+            if issue_id:
+                command.append(issue_id)
+            cwd = rust_core_dir
+
+        try:
+            completed = subprocess.run(command, capture_output=True, text=True, check=False, cwd=cwd)
+        except FileNotFoundError:
+            return None
+
+        if completed.returncode != 0:
+            return None
+
+        try:
+            payload = json.loads(completed.stdout)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(payload, dict):
+            return None
+
+        try:
+            return CoverageResult.model_validate(payload)
+        except Exception:
+            return None
+
+    def _run_verification_command(
+        self,
+        workspace_root: Path,
+        command: str,
+        timeout_seconds: int,
+    ) -> VerificationCommandResult:
+        timeout_seconds = max(1, int(timeout_seconds))
+        if os.environ.get("XMUSTARD_USE_RUST_VERIFICATION") in {"1", "true", "TRUE", "yes", "on"}:
+            rust_result = self._run_verification_command_via_rust(workspace_root, command, timeout_seconds)
+            if rust_result is not None:
+                return rust_result
+
+        started = time.perf_counter()
+        try:
+            completed = subprocess.run(
+                ["/bin/sh", "-lc", command],
+                capture_output=True,
+                text=True,
+                check=False,
+                cwd=workspace_root,
+                timeout=timeout_seconds,
+            )
+            return VerificationCommandResult(
+                command=command,
+                cwd=str(workspace_root.resolve()),
+                exit_code=completed.returncode,
+                success=completed.returncode == 0,
+                timed_out=False,
+                duration_ms=int((time.perf_counter() - started) * 1000),
+                stdout_excerpt=self._truncate_command_excerpt(completed.stdout),
+                stderr_excerpt=self._truncate_command_excerpt(completed.stderr),
+            )
+        except subprocess.TimeoutExpired as exc:
+            return VerificationCommandResult(
+                command=command,
+                cwd=str(workspace_root.resolve()),
+                exit_code=None,
+                success=False,
+                timed_out=True,
+                duration_ms=int((time.perf_counter() - started) * 1000),
+                stdout_excerpt=self._truncate_command_excerpt(exc.stdout or ""),
+                stderr_excerpt=self._truncate_command_excerpt(exc.stderr or ""),
+            )
+
+    def _run_verification_command_via_rust(
+        self,
+        workspace_root: Path,
+        command: str,
+        timeout_seconds: int,
+    ) -> Optional[VerificationCommandResult]:
+        repo_root = Path(__file__).resolve().parents[2]
+        rust_core_dir = repo_root / "rust-core"
+        if not rust_core_dir.exists():
+            return None
+
+        explicit_bin = os.environ.get("XMUSTARD_RUST_CORE_BIN")
+        if explicit_bin:
+            command_line = [explicit_bin, "run-verification-command", str(workspace_root), str(timeout_seconds), command]
+            cwd = repo_root
+        else:
+            command_line = [
+                "cargo",
+                "run",
+                "--quiet",
+                "--bin",
+                "xmustard-core",
+                "--",
+                "run-verification-command",
+                str(workspace_root),
+                str(timeout_seconds),
+                command,
+            ]
+            cwd = rust_core_dir
+
+        try:
+            completed = subprocess.run(command_line, capture_output=True, text=True, check=False, cwd=cwd)
+        except FileNotFoundError:
+            return None
+
+        if completed.returncode != 0:
+            return None
+
+        try:
+            payload = json.loads(completed.stdout)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(payload, dict):
+            return None
+
+        try:
+            return VerificationCommandResult.model_validate(payload)
+        except Exception:
+            return None
+
+    def _truncate_command_excerpt(self, text: str, limit: int = 4000) -> str:
+        if len(text) <= limit:
+            return text
+        omitted = len(text) - limit
+        return f"{text[:limit]}\n...[truncated {omitted} chars]"
+
+    def _execute_verification_profile(
+        self,
+        workspace_root: Path,
+        profile: VerificationProfileRecord,
+        run_id: Optional[str] = None,
+        issue_id: Optional[str] = None,
+    ) -> VerificationProfileExecutionResult:
+        if os.environ.get("XMUSTARD_USE_RUST_VERIFICATION") in {"1", "true", "TRUE", "yes", "on"}:
+            rust_result = self._execute_verification_profile_via_rust(workspace_root, profile, run_id, issue_id)
+            if rust_result is not None:
+                return rust_result
+
+        attempts: list[VerificationCommandResult] = []
+        max_attempts = max(1, int(profile.retry_count) + 1)
+        for _ in range(max_attempts):
+            attempt = self._run_verification_command(workspace_root, profile.test_command, profile.max_runtime_seconds)
+            attempts.append(attempt)
+            if attempt.success:
+                break
+
+        coverage_command_result: Optional[VerificationCommandResult] = None
+        coverage_result: Optional[CoverageResult] = None
+        resolved_report_path = self._resolve_verification_report_path(workspace_root, profile.coverage_report_path)
+
+        if attempts and attempts[-1].success and profile.coverage_command:
+            coverage_command_result = self._run_verification_command(
+                workspace_root,
+                profile.coverage_command,
+                profile.max_runtime_seconds,
+            )
+
+        coverage_ready = attempts and attempts[-1].success
+        if coverage_command_result is not None:
+            coverage_ready = coverage_ready and coverage_command_result.success
+
+        if coverage_ready and resolved_report_path and resolved_report_path.exists():
+            coverage_result = self._parse_coverage_file(
+                resolved_report_path,
+                profile.workspace_id,
+                run_id,
+                issue_id,
+            )
+
+        return VerificationProfileExecutionResult(
+            profile_id=profile.profile_id,
+            workspace_id=profile.workspace_id,
+            attempts=attempts,
+            attempt_count=len(attempts),
+            success=bool(attempts and attempts[-1].success and (coverage_command_result is None or coverage_command_result.success)),
+            coverage_command_result=coverage_command_result,
+            coverage_result=coverage_result,
+            coverage_report_path=str(resolved_report_path) if resolved_report_path else None,
+        )
+
+    def _execute_verification_profile_via_rust(
+        self,
+        workspace_root: Path,
+        profile: VerificationProfileRecord,
+        run_id: Optional[str],
+        issue_id: Optional[str],
+    ) -> Optional[VerificationProfileExecutionResult]:
+        repo_root = Path(__file__).resolve().parents[2]
+        rust_core_dir = repo_root / "rust-core"
+        if not rust_core_dir.exists():
+            return None
+
+        with tempfile.NamedTemporaryFile("w", suffix=".json", encoding="utf-8", delete=False) as handle:
+            profile_path = Path(handle.name)
+            json.dump(profile.model_dump(mode="json"), handle)
+
+        try:
+            explicit_bin = os.environ.get("XMUSTARD_RUST_CORE_BIN")
+            if explicit_bin:
+                command_line = [explicit_bin, "run-verification-profile", str(workspace_root), str(profile_path)]
+                if run_id:
+                    command_line.append(run_id)
+                if issue_id:
+                    command_line.append(issue_id)
+                cwd = repo_root
+            else:
+                command_line = [
+                    "cargo",
+                    "run",
+                    "--quiet",
+                    "--bin",
+                    "xmustard-core",
+                    "--",
+                    "run-verification-profile",
+                    str(workspace_root),
+                    str(profile_path),
+                ]
+                if run_id:
+                    command_line.append(run_id)
+                if issue_id:
+                    command_line.append(issue_id)
+                cwd = rust_core_dir
+
+            try:
+                completed = subprocess.run(command_line, capture_output=True, text=True, check=False, cwd=cwd)
+            except FileNotFoundError:
+                return None
+
+            if completed.returncode != 0:
+                return None
+
+            try:
+                payload = json.loads(completed.stdout)
+            except json.JSONDecodeError:
+                return None
+            if not isinstance(payload, dict):
+                return None
+
+            try:
+                return VerificationProfileExecutionResult.model_validate(payload)
+            except Exception:
+                return None
+        finally:
+            profile_path.unlink(missing_ok=True)
+
+    def _resolve_verification_report_path(self, workspace_root: Path, report_path: Optional[str]) -> Optional[Path]:
+        if not report_path:
+            return None
+        candidate = Path(report_path)
+        if candidate.is_absolute():
+            return candidate
+        return workspace_root / candidate
 
     def _parse_cobertura(self, content: str, workspace_id: str, run_id: Optional[str], issue_id: Optional[str], fmt: str, path: str) -> CoverageResult:
         import xml.etree.ElementTree as ET
@@ -3410,6 +3791,12 @@ Respond with a JSON object containing:
             if runbook.runbook_id == runbook_id:
                 return runbook
         raise FileNotFoundError(runbook_id)
+
+    def _resolve_verification_profile(self, workspace_id: str, profile_id: str) -> VerificationProfileRecord:
+        for profile in self.list_verification_profiles(workspace_id):
+            if profile.profile_id == profile_id:
+                return profile
+        raise FileNotFoundError(profile_id)
 
     def _render_runbook_steps(self, template: str) -> list[str]:
         steps: list[str] = []

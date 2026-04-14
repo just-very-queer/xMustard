@@ -158,7 +158,7 @@ These gaps matter more than adding more heuristic scanning.
 
 ## Backend Migration Strategy
 
-The current backend is Python-first, but the long-term architecture should support a Rust-based core.
+The current backend is Python-first, but the long-term architecture should support a Rust-based core and may move the HTTP shell to Go once the service boundaries are stable.
 
 Why:
 
@@ -171,6 +171,8 @@ Recommended migration path:
 1. keep the HTTP and frontend contracts stable
 2. isolate scanning, repo-map generation, retrieval, and verification execution behind clear service boundaries
 3. reimplement those subsystems in Rust first, either as sidecars or library-backed services
-4. migrate orchestration last, only after the data model and operational workflows are proven
+4. migrate orchestration last, either into a thin Go API shell or a Rust HTTP service, only after the data model and operational workflows are proven
 
 This should be an incremental replacement strategy, not a rewrite that pauses product work.
+
+The repo now includes early scaffolding under `rust-core/` and `api-go/` so this migration direction has a concrete starting point.
