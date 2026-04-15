@@ -22,13 +22,42 @@ The current product already supports:
 
 - `backend/`: FastAPI API, Typer CLI, JSON-backed persistence
 - `frontend/`: Vite, React, TypeScript
-- `rust-core/`: experimental Rust core for scanner, repo-map, and verification migration work
-- `api-go/`: experimental Go HTTP shell for future API migration work
+- `rust-core/`: compiled core for scanner, repo-map, coverage, and verification migration work
+- `api-go/`: Go API shell that now owns a large share of the live HTTP surface
 - runtimes: `codex`, `opencode`, plus room for more runtime adapters
 
 Longer-term platform direction:
 
 - keep the current product contracts stable while incrementally moving backend-heavy subsystems toward a Rust core and evaluating a Go API shell for the HTTP layer
+
+## Migration Status
+
+The migration is active, not hypothetical anymore.
+
+Rust currently owns or supports:
+
+- signal scanning
+- repo-map generation
+- coverage parsing
+- verification command execution
+- verification profile execution
+
+The Go shell now owns most day-to-day app flows, including:
+
+- workspace list/load/scan/snapshot/activity/sources/tree/guidance/repo-map/export/worktree
+- issue reads and mutations
+- issue context/work/replays
+- verification profiles, coverage, ticket context, and threat models
+- run creation, workspace query runs, run reads, review flows, plans, metrics, critique, and improvements
+- runtime/settings routes and terminal transport
+
+The main remaining migration slice is provider integrations:
+
+- integration config and test
+- GitHub import and PR creation
+- Slack notifications
+- Linear sync
+- Jira sync
 
 ## Workflow
 

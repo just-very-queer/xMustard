@@ -89,12 +89,14 @@ func writeIssueContextFixture(t *testing.T, withRunbook bool) (string, string, s
 
 	snapshotPath := filepath.Join(dataDir, "workspaces", workspaceID, "snapshot.json")
 	if err := writeJSON(snapshotPath, workspaceSnapshot{
+		ScannerVersion: 1,
 		Workspace: workspaceRecord{
 			WorkspaceID:  workspaceID,
 			Name:         "repo",
 			RootPath:     repoRoot,
 			LatestScanAt: stringPtr("2026-04-14T10:00:00Z"),
 		},
+		Summary: map[string]int{"issues": 1, "signals": 1},
 		Issues: []issueRecord{
 			{
 				BugID:       issueID,
@@ -122,6 +124,38 @@ func writeIssueContextFixture(t *testing.T, withRunbook bool) (string, string, s
 				UpdatedAt:        "2026-04-14T10:00:00Z",
 			},
 		},
+		Signals: []discoverySignal{
+			{
+				SignalID: "signal-1",
+				Kind:     "todo",
+				Severity: "P2",
+				Title:    "Scanner hint",
+				Summary:  "Potential export issue",
+				FilePath: "src/app.py",
+				Line:     1,
+				Evidence: []evidenceRef{{Path: "src/app.py", Line: intPtr(1)}},
+				Tags:     []string{"scanner"},
+			},
+		},
+		Sources: []sourceRecord{
+			{
+				SourceID:    "src-ledger",
+				Kind:        "ledger",
+				Label:       "Bug ledger",
+				Path:        "docs/bugs/Bugs_25260323.md",
+				RecordCount: 1,
+			},
+		},
+		DriftSummary: map[string]int{"missing_verification_tests": 1},
+		Runtimes: []runtimeCapabilities{
+			{
+				Runtime:   "codex",
+				Available: true,
+				Models:    []runtimeModel{{Runtime: "codex", ID: "gpt-5.4"}},
+			},
+		},
+		LatestLedger: stringPtr("docs/bugs/Bugs_25260323.md"),
+		GeneratedAt:  "2026-04-14T10:00:00Z",
 	}); err != nil {
 		t.Fatalf("write snapshot: %v", err)
 	}
@@ -277,4 +311,8 @@ func containsVerificationCommand(items []rustcore.VerificationProfileInput, comm
 		}
 	}
 	return false
+}
+
+func intPtr(value int) *int {
+	return &value
 }

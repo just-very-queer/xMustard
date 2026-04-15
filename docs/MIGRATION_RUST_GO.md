@@ -170,6 +170,12 @@ That boundary work is now live for three concrete slices:
 - The Go API shell now owns issue-context packet reads at `/api/workspaces/{workspace_id}/issues/{issue_id}/context`.
 - The Go API shell now owns issue-work packet reads at `/api/workspaces/{workspace_id}/issues/{issue_id}/work`, including runbook selection.
 - The Go API shell now owns issue-context replay list/capture against `context_replays.json`, including replay activity records.
+- The Go API shell now owns workspace snapshot reads, activity feeds, activity overview, sources, tree browsing, guidance discovery, and repo-map reads against the existing workspace artifacts.
+- The Go API shell now owns issue queue reads, issue drift reads, signal queue reads, and workspace drift summary reads from the persisted workspace snapshot.
+- The Go API shell now owns issue create/update plus saved-view list/create/update/delete against `snapshot.json`, `tracker_issues.json`, `issue_overrides.json`, and `saved_views.json`, including matching activity ledger entries.
+- The Go API shell now owns runtime listing, settings reads/writes, local agent capability reads, and workspace runtime probe flows while preserving the existing `settings.json` contract and runtime model validation behavior.
+- The Go API shell now owns issue-run creation, workspace query runs, run listing, run detail reads, run log reads, live run cancel/retry, run plan generate/read/approve/reject, run review submission, run acceptance, run insights, run metrics, workspace metrics, cost summaries, critique generation/read, improvement listing/dismissal, fix listing, fix recording, fix-draft generation, verification listing, and review-queue reads against the persisted run and tracker artifacts.
+- The Go API shell now owns workspace listing, fresh and cached workspace load, explicit workspace scan, worktree reads, export bundle reads, and terminal open/write/resize/read/close transport against the existing workspace registry and terminal log layout.
 - Python parity tests now compare live Python behavior against the Rust outputs for:
   - signal scanning
   - repo-map summaries
@@ -182,6 +188,6 @@ That boundary work is now live for three concrete slices:
 ## Recommended Next Build Order
 
 1. Add coverage delta and artifact persistence helpers on the Rust side where it simplifies process control.
-2. Expand the Go shell from issue-context artifacts into broader snapshot, issue CRUD, and run/review route groups.
+2. Migrate the remaining provider integration surfaces to Go.
 3. Migrate FastAPI route groups to Go one surface at a time.
 4. Delete Python implementations only after route and artifact parity are verified.

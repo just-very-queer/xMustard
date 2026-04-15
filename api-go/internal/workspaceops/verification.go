@@ -15,8 +15,17 @@ import (
 )
 
 type workspaceSnapshot struct {
-	Workspace workspaceRecord `json:"workspace"`
-	Issues    []issueRecord   `json:"issues"`
+	ScannerVersion int                   `json:"scanner_version"`
+	Workspace      workspaceRecord       `json:"workspace"`
+	Summary        map[string]int        `json:"summary"`
+	Issues         []issueRecord         `json:"issues"`
+	Signals        []discoverySignal     `json:"signals"`
+	Sources        []sourceRecord        `json:"sources"`
+	DriftSummary   map[string]int        `json:"drift_summary"`
+	Runtimes       []runtimeCapabilities `json:"runtimes"`
+	LatestLedger   *string               `json:"latest_ledger"`
+	LatestVerdicts *string               `json:"latest_verdicts"`
+	GeneratedAt    string                `json:"generated_at"`
 }
 
 type workspaceRecord struct {
@@ -24,6 +33,8 @@ type workspaceRecord struct {
 	Name         string  `json:"name"`
 	RootPath     string  `json:"root_path"`
 	LatestScanAt *string `json:"latest_scan_at"`
+	CreatedAt    *string `json:"created_at,omitempty"`
+	UpdatedAt    *string `json:"updated_at,omitempty"`
 }
 
 type issueRecord struct {
@@ -49,6 +60,7 @@ type issueRecord struct {
 	NeedsFollowup        bool          `json:"needs_followup"`
 	ReviewReadyCount     int           `json:"review_ready_count"`
 	ReviewReadyRuns      []string      `json:"review_ready_runs"`
+	Fingerprint          *string       `json:"fingerprint"`
 	UpdatedAt            string        `json:"updated_at"`
 }
 

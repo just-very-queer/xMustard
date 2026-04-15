@@ -1,9 +1,9 @@
 [
   {
     "group": "settings_and_runtime",
-    "current_owner": "backend/app/main.py + backend/app/runtimes.py",
+    "current_owner": "api-go + rust-core",
     "target_owner": "api-go + rust-core",
-    "notes": "Health, settings, runtime capabilities, and runtime probe flows.",
+    "notes": "Health, settings, runtime capabilities, and runtime probe flows. The Go shell now owns runtime listing, settings reads/writes, local agent capability reads, and workspace runtime probe flows while preserving the existing settings.json contract and runtime model validation rules.",
     "endpoints": [
       "/api/health",
       "/api/runtimes",
@@ -14,9 +14,9 @@
   },
   {
     "group": "workspace_snapshot",
-    "current_owner": "backend/app/main.py + backend/app/service.py",
+    "current_owner": "api-go",
     "target_owner": "api-go",
-    "notes": "Workspace loading, snapshots, activity, sources, tree, guidance, and export.",
+    "notes": "Workspace loading, snapshots, activity, sources, tree, guidance, and export. The Go shell now owns workspace listing, fresh and cached workspace load, explicit workspace scan, snapshot reads, activity feeds, activity overview, sources, worktree reads, tree browsing, guidance discovery, repo-map reads, export bundle reads, and saved-view CRUD against the existing tracker workspace artifacts.",
     "endpoints": [
       "/api/workspaces",
       "/api/workspaces/load",
@@ -24,6 +24,8 @@
       "/api/workspaces/{workspace_id}/activity",
       "/api/workspaces/{workspace_id}/activity/overview",
       "/api/workspaces/{workspace_id}/sources",
+      "/api/workspaces/{workspace_id}/worktree",
+      "/api/workspaces/{workspace_id}/scan",
       "/api/workspaces/{workspace_id}/tree",
       "/api/workspaces/{workspace_id}/guidance",
       "/api/workspaces/{workspace_id}/repo-map",
@@ -34,7 +36,7 @@
     "group": "issues_and_signals",
     "current_owner": "backend/app/main.py + backend/app/service.py + backend/app/scanners.py",
     "target_owner": "api-go + rust-core",
-    "notes": "Issue CRUD, signals, drift, quality scoring, duplicate detection, triage, and signal promotion.",
+    "notes": "Issue CRUD, signals, drift, quality scoring, duplicate detection, triage, and signal promotion. The Go shell now owns issue queue reads, single-issue reads, issue create/update, issue drift reads, signal queue reads, and workspace drift summary reads from the persisted workspace snapshot.",
     "endpoints": [
       "/api/workspaces/{workspace_id}/issues",
       "/api/workspaces/{workspace_id}/issues/{issue_id}",
@@ -68,7 +70,7 @@
     "group": "runs_and_review",
     "current_owner": "backend/app/main.py + backend/app/service.py + backend/app/runtimes.py",
     "target_owner": "api-go + rust-core",
-    "notes": "Run launch, logs, planning, metrics, critique, improvements, fixes, and verification runs.",
+    "notes": "Run launch, logs, planning, metrics, critique, improvements, fixes, and verification runs. The Go shell now owns issue-run creation, workspace query runs, run listing, run detail reads, run log reads, live run cancel/retry, run plan generate/read/approve/reject, run review submission, run acceptance, run insights, run metrics, workspace metrics, cost summaries, critique generation/read, improvement listing/dismissal, fix listing, fix recording, fix-draft generation, verification listing, and review-queue reads against the persisted tracker and run artifacts.",
     "endpoints": [
       "/api/workspaces/{workspace_id}/issues/{issue_id}/runs",
       "/api/workspaces/{workspace_id}/issues/{issue_id}/verify",
@@ -102,7 +104,7 @@
     "group": "integrations_and_terminal",
     "current_owner": "backend/app/main.py + backend/app/service.py + backend/app/terminal.py",
     "target_owner": "api-go",
-    "notes": "Provider integrations and local terminal session transport.",
+    "notes": "Provider integrations and local terminal session transport. The Go shell now owns terminal open/write/resize/read/close transport against the existing workspace log layout, while provider integration config/sync routes remain on Python.",
     "endpoints": [
       "/api/workspaces/{workspace_id}/integrations",
       "/api/integrations/test",
