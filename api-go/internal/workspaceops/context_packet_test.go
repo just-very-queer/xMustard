@@ -51,6 +51,9 @@ func TestBuildIssueContextPacketBuildsFrontendShapeFromArtifacts(t *testing.T) {
 	if len(packet.ThreatModels) != 1 || packet.ThreatModels[0].ThreatModelID != "threat-1" {
 		t.Fatalf("unexpected threat models: %#v", packet.ThreatModels)
 	}
+	if len(packet.BrowserDumps) != 1 || packet.BrowserDumps[0].DumpID != "browser-1" {
+		t.Fatalf("unexpected browser dumps: %#v", packet.BrowserDumps)
+	}
 	if packet.RepoMap == nil || len(packet.RelatedPaths) == 0 {
 		t.Fatalf("expected repo map and related paths, got repo_map=%#v related=%#v", packet.RepoMap, packet.RelatedPaths)
 	}
@@ -62,6 +65,9 @@ func TestBuildIssueContextPacketBuildsFrontendShapeFromArtifacts(t *testing.T) {
 	}
 	if !strings.Contains(packet.Prompt, "Ticket context:") || !strings.Contains(packet.Prompt, "Threat model:") {
 		t.Fatalf("prompt missing context sections:\n%s", packet.Prompt)
+	}
+	if !strings.Contains(packet.Prompt, "Browser context:") || !strings.Contains(packet.Prompt, "/api/export") {
+		t.Fatalf("prompt missing browser context sections:\n%s", packet.Prompt)
 	}
 }
 
@@ -232,6 +238,28 @@ func writeIssueContextFixture(t *testing.T, withRunbook bool) (string, string, s
 		},
 	}); err != nil {
 		t.Fatalf("write threat models: %v", err)
+	}
+
+	if err := writeJSON(filepath.Join(dataDir, "workspaces", workspaceID, "browser_dumps.json"), []BrowserDumpRecord{
+		{
+			DumpID:          "browser-1",
+			WorkspaceID:     workspaceID,
+			IssueID:         issueID,
+			Source:          "mcp-chrome",
+			Label:           "Export page failure",
+			PageURL:         stringPtr("https://app.example.test/api/export"),
+			PageTitle:       stringPtr("Export"),
+			Summary:         "The export request fails after clicking submit.",
+			DOMSnapshot:     "<button>Export</button><div role=\"alert\">Request failed</div>",
+			ConsoleMessages: []string{"TypeError: failed to fetch"},
+			NetworkRequests: []string{"POST /api/export 500"},
+			ScreenshotPath:  stringPtr("artifacts/export-failure.png"),
+			Notes:           stringPtr("Captured after reproducing the button click failure."),
+			CreatedAt:       "2026-04-14T10:01:00Z",
+			UpdatedAt:       "2026-04-14T10:02:00Z",
+		},
+	}); err != nil {
+		t.Fatalf("write browser dumps: %v", err)
 	}
 
 	activityPath := filepath.Join(dataDir, "workspaces", workspaceID, "activity.jsonl")

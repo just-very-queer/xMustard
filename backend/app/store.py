@@ -11,6 +11,7 @@ from pydantic import BaseModel, ValidationError
 from .models import (
     ActivityRecord,
     AppSettings,
+    BrowserDumpRecord,
     FixRecord,
     IssueContextReplayRecord,
     IssueRecord,
@@ -116,6 +117,9 @@ class FileStore:
 
     def context_replays_path(self, workspace_id: str) -> Path:
         return self.workspace_dir(workspace_id) / "context_replays.json"
+
+    def browser_dumps_path(self, workspace_id: str) -> Path:
+        return self.workspace_dir(workspace_id) / "browser_dumps.json"
 
     def repo_map_path(self, workspace_id: str) -> Path:
         return self.workspace_dir(workspace_id) / "repo_map.json"
@@ -241,6 +245,18 @@ class FileStore:
         ordered = sorted(replays, key=lambda item: item.created_at, reverse=True)
         self._write_json(
             self.context_replays_path(workspace_id),
+            [item.model_dump(mode="json") for item in ordered],
+        )
+
+    def list_browser_dumps(self, workspace_id: str) -> list[BrowserDumpRecord]:
+        data = self._read_json(self.browser_dumps_path(workspace_id), [])
+        items = [BrowserDumpRecord.model_validate(item) for item in data]
+        return sorted(items, key=lambda item: item.updated_at, reverse=True)
+
+    def save_browser_dumps(self, workspace_id: str, dumps: list[BrowserDumpRecord]) -> None:
+        ordered = sorted(dumps, key=lambda item: item.updated_at, reverse=True)
+        self._write_json(
+            self.browser_dumps_path(workspace_id),
             [item.model_dump(mode="json") for item in ordered],
         )
 

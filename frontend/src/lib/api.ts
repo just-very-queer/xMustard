@@ -3,6 +3,8 @@ import type {
   ActivityOverview,
   ActivityRecord,
   AppSettings,
+  BrowserDumpRecord,
+  BrowserDumpUpsertRequest,
   CostSummary,
   CoverageDelta,
   CoverageResult,
@@ -195,6 +197,26 @@ export function captureIssueContextReplay(workspaceId: string, issueId: string, 
     method: 'POST',
     body: JSON.stringify({ label }),
   })
+}
+
+export function listBrowserDumps(workspaceId: string, issueId: string) {
+  return request<BrowserDumpRecord[]>(`/api/workspaces/${workspaceId}/issues/${issueId}/browser-dumps`)
+}
+
+export function saveBrowserDump(workspaceId: string, issueId: string, payload: BrowserDumpUpsertRequest) {
+  return request<BrowserDumpRecord>(`/api/workspaces/${workspaceId}/issues/${issueId}/browser-dumps`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+}
+
+export function deleteBrowserDump(workspaceId: string, issueId: string, dumpId: string) {
+  return request<{ ok: boolean; dump_id: string }>(
+    `/api/workspaces/${workspaceId}/issues/${issueId}/browser-dumps/${dumpId}`,
+    {
+      method: 'DELETE',
+    },
+  )
 }
 
 export function listIssues(

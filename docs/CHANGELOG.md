@@ -39,6 +39,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Go API shell support for verification profile list/save/delete with persisted settings activity
 - Go API shell support for ticket-context list/save/delete with persisted issue activity
 - Go API shell support for threat-model list/save/delete with persisted issue activity
+- Go API shell support for browser-dump list/save/delete with persisted issue activity plus issue-context/export inclusion
 - Go API shell support for issue-context packet reads, issue-work packet reads with runbook selection, and issue-context replay list/capture against persisted tracker artifacts
 - Go API shell support for workspace snapshot reads, activity feeds, activity overview, sources, tree browsing, guidance discovery, and repo-map reads against persisted workspace artifacts
 - Go API shell support for issue queue reads, issue drift reads, signal queue reads, and workspace drift summary reads against persisted workspace snapshots
@@ -47,6 +48,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Go API shell support for runtime listing, settings reads/writes, local agent capability reads, workspace runtime probe flows, issue-run creation, and workspace query runs against the existing settings and run artifact contracts
 - Go API shell support for workspace listing, cached workspace load, worktree reads, export bundle reads, and terminal open/write/resize/read/close transport against the existing workspace registry and terminal log contracts
 - Go API shell support for fresh workspace scan/load and explicit `/scan` snapshot rebuilds using Rust-backed signal and repo-map generation plus Go-side tracker artifact assembly
+- Python CLI parity expansion for verification profiles, ticket context, threat models, context replays, plan/metrics/coverage/critique flows, integrations, repo inspection, and terminal transport
+- Durable browser-dump artifacts for MCP/manual browser debugging context, now attached to issue context packets and export bundles
 
 ## [0.2.0] - 2026-04-14
 

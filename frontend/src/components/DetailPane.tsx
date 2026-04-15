@@ -1,6 +1,7 @@
 import type {
   ActivityRecord,
   ActivityOverview,
+  BrowserDumpRecord,
   CostSummary,
   CoverageDelta,
   DiscoverySignal,
@@ -185,6 +186,17 @@ type Props = {
   threatModelMitigationsDraft: string
   threatModelReferencesDraft: string
   threatModelStatusDraft: ThreatModelRecord['status']
+  selectedBrowserDumpId: string
+  browserDumpSourceDraft: BrowserDumpRecord['source']
+  browserDumpLabelDraft: string
+  browserDumpPageUrlDraft: string
+  browserDumpPageTitleDraft: string
+  browserDumpSummaryDraft: string
+  browserDumpDomSnapshotDraft: string
+  browserDumpConsoleDraft: string
+  browserDumpNetworkDraft: string
+  browserDumpScreenshotPathDraft: string
+  browserDumpNotesDraft: string
   issueSeverityDraft: string
   issueStatusDraft: string
   issueDocStatusDraft: string
@@ -233,6 +245,17 @@ type Props = {
   onThreatModelMitigationsChange: (value: string) => void
   onThreatModelReferencesChange: (value: string) => void
   onThreatModelStatusChange: (value: ThreatModelRecord['status']) => void
+  onSelectedBrowserDumpChange: (value: string) => void
+  onBrowserDumpSourceChange: (value: BrowserDumpRecord['source']) => void
+  onBrowserDumpLabelChange: (value: string) => void
+  onBrowserDumpPageUrlChange: (value: string) => void
+  onBrowserDumpPageTitleChange: (value: string) => void
+  onBrowserDumpSummaryChange: (value: string) => void
+  onBrowserDumpDomSnapshotChange: (value: string) => void
+  onBrowserDumpConsoleChange: (value: string) => void
+  onBrowserDumpNetworkChange: (value: string) => void
+  onBrowserDumpScreenshotPathChange: (value: string) => void
+  onBrowserDumpNotesChange: (value: string) => void
   onContextReplayLabelChange: (value: string) => void
   onIssueLabelsChange: (value: string) => void
   onIssueNotesChange: (value: string) => void
@@ -263,6 +286,8 @@ type Props = {
   onDeleteTicketContext: () => void
   onSaveThreatModel: () => void
   onDeleteThreatModel: () => void
+  onSaveBrowserDump: () => void
+  onDeleteBrowserDump: () => void
   onCaptureIssueContextReplay: () => void
   onRetryRun: () => void
   onCancelRun: () => void
@@ -321,6 +346,17 @@ export function DetailPane({
   threatModelMitigationsDraft,
   threatModelReferencesDraft,
   threatModelStatusDraft,
+  selectedBrowserDumpId,
+  browserDumpSourceDraft,
+  browserDumpLabelDraft,
+  browserDumpPageUrlDraft,
+  browserDumpPageTitleDraft,
+  browserDumpSummaryDraft,
+  browserDumpDomSnapshotDraft,
+  browserDumpConsoleDraft,
+  browserDumpNetworkDraft,
+  browserDumpScreenshotPathDraft,
+  browserDumpNotesDraft,
   issueSeverityDraft,
   issueStatusDraft,
   issueDocStatusDraft,
@@ -369,6 +405,17 @@ export function DetailPane({
   onThreatModelMitigationsChange,
   onThreatModelReferencesChange,
   onThreatModelStatusChange,
+  onSelectedBrowserDumpChange,
+  onBrowserDumpSourceChange,
+  onBrowserDumpLabelChange,
+  onBrowserDumpPageUrlChange,
+  onBrowserDumpPageTitleChange,
+  onBrowserDumpSummaryChange,
+  onBrowserDumpDomSnapshotChange,
+  onBrowserDumpConsoleChange,
+  onBrowserDumpNetworkChange,
+  onBrowserDumpScreenshotPathChange,
+  onBrowserDumpNotesChange,
   onContextReplayLabelChange,
   onIssueLabelsChange,
   onIssueNotesChange,
@@ -399,6 +446,8 @@ export function DetailPane({
   onDeleteTicketContext,
   onSaveThreatModel,
   onDeleteThreatModel,
+  onSaveBrowserDump,
+  onDeleteBrowserDump,
   onCaptureIssueContextReplay,
   onRetryRun,
   onCancelRun,
@@ -411,6 +460,8 @@ export function DetailPane({
     issueContextPacket?.ticket_contexts.find((item) => item.context_id === selectedTicketContextId) ?? null
   const selectedThreatModel =
     issueContextPacket?.threat_models.find((item) => item.threat_model_id === selectedThreatModelId) ?? null
+  const selectedBrowserDump =
+    issueContextPacket?.browser_dumps.find((item) => item.dump_id === selectedBrowserDumpId) ?? null
 
   return (
     <div className="panel detail-panel">
@@ -1253,6 +1304,205 @@ export function DetailPane({
                   Delete threat model
                 </button>
               </div>
+            </div>
+          </section>
+
+          <section className="detail-section">
+            <div className="panel-header">
+              <div>
+                <h4>Browser dumps</h4>
+                <p className="subtle">Saved DOM, console, and network snapshots that keep browser bugs reproducible across agents.</p>
+              </div>
+              <span className="tag">{issueContextPacket?.browser_dumps.length ?? 0} linked</span>
+            </div>
+            <div className="toolbar-row">
+              <label className="detail-section field-stack runbook-picker" htmlFor="browser-dump-select">
+                <span className="filter-label">Selected dump</span>
+                <select
+                  id="browser-dump-select"
+                  name="browser-dump-select"
+                  className="text-input"
+                  value={selectedBrowserDumpId}
+                  onChange={(event) => onSelectedBrowserDumpChange(event.target.value)}
+                >
+                  <option value="">New browser dump</option>
+                  {(issueContextPacket?.browser_dumps ?? []).map((dump) => (
+                    <option key={dump.dump_id} value={dump.dump_id}>
+                      {dump.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              {selectedBrowserDump ? (
+                <div className="tag-row">
+                  <span className="tag">{selectedBrowserDump.source}</span>
+                  {selectedBrowserDump.page_title ? <span className="tag">{selectedBrowserDump.page_title}</span> : null}
+                  {selectedBrowserDump.page_url ? <span className="tag">{selectedBrowserDump.page_url}</span> : null}
+                </div>
+              ) : (
+                <span className="subtle">Capture browser state from MCP, Playwright, or manual notes and keep it attached to the issue context.</span>
+              )}
+            </div>
+            <div className="detail-section runbook-editor">
+              <div className="toolbar-row">
+                <label className="detail-section field-stack" htmlFor="browser-dump-source">
+                  <span className="filter-label">Source</span>
+                  <select
+                    id="browser-dump-source"
+                    name="browser-dump-source"
+                    className="text-input"
+                    value={browserDumpSourceDraft}
+                    onChange={(event) => onBrowserDumpSourceChange(event.target.value as BrowserDumpRecord['source'])}
+                  >
+                    {['manual', 'mcp-chrome', 'playwright', 'other'].map((source) => (
+                      <option key={source} value={source}>
+                        {source}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className="detail-section field-stack" htmlFor="browser-dump-label">
+                  <span className="filter-label">Label</span>
+                  <input
+                    id="browser-dump-label"
+                    name="browser-dump-label"
+                    className="text-input"
+                    placeholder="checkout failure on confirm"
+                    value={browserDumpLabelDraft}
+                    onChange={(event) => onBrowserDumpLabelChange(event.target.value)}
+                  />
+                </label>
+              </div>
+              <div className="toolbar-row">
+                <label className="detail-section field-stack" htmlFor="browser-dump-page-title">
+                  <span className="filter-label">Page title</span>
+                  <input
+                    id="browser-dump-page-title"
+                    name="browser-dump-page-title"
+                    className="text-input"
+                    placeholder="Checkout confirmation"
+                    value={browserDumpPageTitleDraft}
+                    onChange={(event) => onBrowserDumpPageTitleChange(event.target.value)}
+                  />
+                </label>
+                <label className="detail-section field-stack" htmlFor="browser-dump-page-url">
+                  <span className="filter-label">Page URL</span>
+                  <input
+                    id="browser-dump-page-url"
+                    name="browser-dump-page-url"
+                    className="text-input"
+                    placeholder="https://app.example.test/orders/123"
+                    value={browserDumpPageUrlDraft}
+                    onChange={(event) => onBrowserDumpPageUrlChange(event.target.value)}
+                  />
+                </label>
+              </div>
+              <label className="detail-section field-stack" htmlFor="browser-dump-summary">
+                <span className="filter-label">Summary</span>
+                <textarea
+                  id="browser-dump-summary"
+                  name="browser-dump-summary"
+                  className="text-area"
+                  rows={3}
+                  placeholder="What the operator saw and why this snapshot matters."
+                  value={browserDumpSummaryDraft}
+                  onChange={(event) => onBrowserDumpSummaryChange(event.target.value)}
+                />
+              </label>
+              <label className="detail-section field-stack" htmlFor="browser-dump-dom">
+                <span className="filter-label">DOM snapshot</span>
+                <textarea
+                  id="browser-dump-dom"
+                  name="browser-dump-dom"
+                  className="text-area"
+                  rows={6}
+                  placeholder="Relevant DOM excerpt, HTML dump, or accessibility tree text."
+                  value={browserDumpDomSnapshotDraft}
+                  onChange={(event) => onBrowserDumpDomSnapshotChange(event.target.value)}
+                />
+              </label>
+              <div className="toolbar-row">
+                <label className="detail-section field-stack" htmlFor="browser-dump-console">
+                  <span className="filter-label">Console messages</span>
+                  <textarea
+                    id="browser-dump-console"
+                    name="browser-dump-console"
+                    className="text-area"
+                    rows={4}
+                    placeholder={'One console line per row'}
+                    value={browserDumpConsoleDraft}
+                    onChange={(event) => onBrowserDumpConsoleChange(event.target.value)}
+                  />
+                </label>
+                <label className="detail-section field-stack" htmlFor="browser-dump-network">
+                  <span className="filter-label">Network requests</span>
+                  <textarea
+                    id="browser-dump-network"
+                    name="browser-dump-network"
+                    className="text-area"
+                    rows={4}
+                    placeholder={'One request per row'}
+                    value={browserDumpNetworkDraft}
+                    onChange={(event) => onBrowserDumpNetworkChange(event.target.value)}
+                  />
+                </label>
+              </div>
+              <div className="toolbar-row">
+                <label className="detail-section field-stack" htmlFor="browser-dump-screenshot-path">
+                  <span className="filter-label">Screenshot path</span>
+                  <input
+                    id="browser-dump-screenshot-path"
+                    name="browser-dump-screenshot-path"
+                    className="text-input"
+                    placeholder="artifacts/checkout-confirmation.png"
+                    value={browserDumpScreenshotPathDraft}
+                    onChange={(event) => onBrowserDumpScreenshotPathChange(event.target.value)}
+                  />
+                </label>
+                <label className="detail-section field-stack" htmlFor="browser-dump-notes">
+                  <span className="filter-label">Notes</span>
+                  <textarea
+                    id="browser-dump-notes"
+                    name="browser-dump-notes"
+                    className="text-area"
+                    rows={3}
+                    placeholder="Extra operator notes, browser version, or repro detail."
+                    value={browserDumpNotesDraft}
+                    onChange={(event) => onBrowserDumpNotesChange(event.target.value)}
+                  />
+                </label>
+              </div>
+              <div className="toolbar-row">
+                <button type="button" onClick={onSaveBrowserDump} disabled={loading || !browserDumpLabelDraft.trim()}>
+                  Save browser dump
+                </button>
+                <button type="button" className="ghost-button" onClick={onDeleteBrowserDump} disabled={loading || !selectedBrowserDump}>
+                  Delete browser dump
+                </button>
+              </div>
+            </div>
+            <div className="activity-list">
+              {(issueContextPacket?.browser_dumps ?? []).length ? (
+                (issueContextPacket?.browser_dumps ?? []).map((dump) => (
+                  <div key={dump.dump_id} className="activity-entry">
+                    <div className="activity-entry-top">
+                      <strong>{dump.label}</strong>
+                      <small>{formatDate(dump.updated_at)}</small>
+                    </div>
+                    <div className="row-meta">
+                      <span className="tag">{dump.source}</span>
+                      {dump.page_title ? <span className="tag">{dump.page_title}</span> : null}
+                      <span className="tag">console {dump.console_messages.length}</span>
+                      <span className="tag">network {dump.network_requests.length}</span>
+                    </div>
+                    <p>{dump.summary || 'No summary recorded.'}</p>
+                    {dump.notes ? <pre className="detail-mini-block">{dump.notes}</pre> : null}
+                    {dump.dom_snapshot ? <pre className="detail-mini-block">{dump.dom_snapshot}</pre> : null}
+                  </div>
+                ))
+              ) : (
+                <p className="subtle">No browser dumps saved for this issue yet.</p>
+              )}
             </div>
           </section>
 

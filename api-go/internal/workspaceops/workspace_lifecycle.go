@@ -38,6 +38,7 @@ type ExportBundle struct {
 	VerificationProfiles []verificationProfileRecord `json:"verification_profiles"`
 	TicketContexts       []TicketContextRecord       `json:"ticket_contexts"`
 	ThreatModels         []ThreatModelRecord         `json:"threat_models"`
+	BrowserDumps         []BrowserDumpRecord         `json:"browser_dumps"`
 	ContextReplays       []IssueContextReplayRecord  `json:"context_replays"`
 	Verifications        []verificationRecord        `json:"verifications"`
 	Activity             []activityRecord            `json:"activity"`
@@ -213,6 +214,10 @@ func ExportWorkspace(dataDir string, workspaceID string) (*ExportBundle, error) 
 	if err != nil {
 		return nil, err
 	}
+	browserDumps, err := loadBrowserDumps(dataDir, workspaceID)
+	if err != nil {
+		return nil, err
+	}
 	contextReplays, err := loadContextReplays(dataDir, workspaceID)
 	if err != nil {
 		return nil, err
@@ -237,6 +242,7 @@ func ExportWorkspace(dataDir string, workspaceID string) (*ExportBundle, error) 
 		VerificationProfiles: verificationProfiles,
 		TicketContexts:       ticketContexts,
 		ThreatModels:         threatModels,
+		BrowserDumps:         browserDumps,
 		ContextReplays:       contextReplays,
 		Verifications:        verifications,
 		Activity:             activity,

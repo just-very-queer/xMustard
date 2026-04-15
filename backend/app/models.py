@@ -29,6 +29,7 @@ CoverageFormat = Literal["unknown", "cobertura", "jacoco", "lcov", "go"]
 TicketProvider = Literal["github", "jira", "linear", "manual", "incident", "other"]
 ThreatModelMethodology = Literal["manual", "stride", "threat_dragon", "pytm", "threagile", "attack_path"]
 ThreatModelStatus = Literal["draft", "reviewed", "accepted"]
+BrowserDumpSource = Literal["mcp-chrome", "manual", "playwright", "other"]
 
 
 def utc_now() -> str:
@@ -464,6 +465,24 @@ class IssueContextReplayRecord(BaseModel):
     created_at: str = Field(default_factory=utc_now)
 
 
+class BrowserDumpRecord(BaseModel):
+    dump_id: str
+    workspace_id: str
+    issue_id: str
+    source: BrowserDumpSource = "mcp-chrome"
+    label: str
+    page_url: Optional[str] = None
+    page_title: Optional[str] = None
+    summary: str = ""
+    dom_snapshot: str = ""
+    console_messages: list[str] = Field(default_factory=list)
+    network_requests: list[str] = Field(default_factory=list)
+    screenshot_path: Optional[str] = None
+    notes: Optional[str] = None
+    created_at: str = Field(default_factory=utc_now)
+    updated_at: str = Field(default_factory=utc_now)
+
+
 class ReviewQueueItem(BaseModel):
     run: RunRecord
     issue: IssueRecord
@@ -683,6 +702,20 @@ class IssueContextReplayRequest(BaseModel):
     label: Optional[str] = None
 
 
+class BrowserDumpUpsertRequest(BaseModel):
+    dump_id: Optional[str] = None
+    source: BrowserDumpSource = "mcp-chrome"
+    label: str
+    page_url: Optional[str] = None
+    page_title: Optional[str] = None
+    summary: str = ""
+    dom_snapshot: str = ""
+    console_messages: list[str] = Field(default_factory=list)
+    network_requests: list[str] = Field(default_factory=list)
+    screenshot_path: Optional[str] = None
+    notes: Optional[str] = None
+
+
 class VerifyIssueRequest(BaseModel):
     runtime: RuntimeKind = "opencode"
     models: list[str] = Field(default_factory=list)
@@ -726,6 +759,7 @@ class ExportBundle(BaseModel):
     ticket_contexts: list[TicketContextRecord] = Field(default_factory=list)
     threat_models: list[ThreatModelRecord] = Field(default_factory=list)
     context_replays: list[IssueContextReplayRecord] = Field(default_factory=list)
+    browser_dumps: list[BrowserDumpRecord] = Field(default_factory=list)
     verifications: list[VerificationRecord] = Field(default_factory=list)
     activity: list[ActivityRecord] = Field(default_factory=list)
     exported_at: str = Field(default_factory=utc_now)
@@ -745,6 +779,7 @@ class IssueContextPacket(BaseModel):
     available_verification_profiles: list[VerificationProfileRecord] = Field(default_factory=list)
     ticket_contexts: list[TicketContextRecord] = Field(default_factory=list)
     threat_models: list[ThreatModelRecord] = Field(default_factory=list)
+    browser_dumps: list[BrowserDumpRecord] = Field(default_factory=list)
     repo_map: Optional[RepoMapSummary] = None
     worktree: Optional[WorktreeStatus] = None
     prompt: str

@@ -7,6 +7,7 @@ import {
   createIssue,
   closeTerminal,
   createSavedView,
+  deleteBrowserDump,
   deleteSavedView,
   deleteRunbook,
   deleteThreatModel,
@@ -65,6 +66,7 @@ import {
   scoreAllIssues,
   scoreIssueQuality,
   saveRunbook,
+  saveBrowserDump,
   saveThreatModel,
   saveTicketContext,
   saveVerificationProfile,
@@ -87,6 +89,7 @@ import type {
   ActivityRecord,
   ActivityOverview,
   AppSettings,
+  BrowserDumpRecord,
   CostSummary,
   CoverageDelta,
   DiscoverySignal,
@@ -270,6 +273,17 @@ function App() {
   const [threatModelMitigationsDraft, setThreatModelMitigationsDraft] = useState('')
   const [threatModelReferencesDraft, setThreatModelReferencesDraft] = useState('')
   const [threatModelStatusDraft, setThreatModelStatusDraft] = useState<ThreatModelRecord['status']>('draft')
+  const [selectedBrowserDumpId, setSelectedBrowserDumpId] = useState('')
+  const [browserDumpSourceDraft, setBrowserDumpSourceDraft] = useState<BrowserDumpRecord['source']>('manual')
+  const [browserDumpLabelDraft, setBrowserDumpLabelDraft] = useState('')
+  const [browserDumpPageUrlDraft, setBrowserDumpPageUrlDraft] = useState('')
+  const [browserDumpPageTitleDraft, setBrowserDumpPageTitleDraft] = useState('')
+  const [browserDumpSummaryDraft, setBrowserDumpSummaryDraft] = useState('')
+  const [browserDumpDomSnapshotDraft, setBrowserDumpDomSnapshotDraft] = useState('')
+  const [browserDumpConsoleDraft, setBrowserDumpConsoleDraft] = useState('')
+  const [browserDumpNetworkDraft, setBrowserDumpNetworkDraft] = useState('')
+  const [browserDumpScreenshotPathDraft, setBrowserDumpScreenshotPathDraft] = useState('')
+  const [browserDumpNotesDraft, setBrowserDumpNotesDraft] = useState('')
   const [issueContextReplays, setIssueContextReplays] = useState<IssueContextReplayRecord[]>([])
   const [contextReplayLabelDraft, setContextReplayLabelDraft] = useState('')
   const [logContent, setLogContent] = useState('')
@@ -510,6 +524,10 @@ function App() {
   const selectedThreatModel = useMemo(
     () => issueContextPacket?.threat_models.find((item) => item.threat_model_id === selectedThreatModelId) ?? null,
     [issueContextPacket?.threat_models, selectedThreatModelId],
+  )
+  const selectedBrowserDump = useMemo(
+    () => issueContextPacket?.browser_dumps.find((item) => item.dump_id === selectedBrowserDumpId) ?? null,
+    [issueContextPacket?.browser_dumps, selectedBrowserDumpId],
   )
 
   async function refreshHealth() {
@@ -1012,6 +1030,39 @@ function App() {
     setThreatModelReferencesDraft(selectedThreatModel.references.join('\n'))
     setThreatModelStatusDraft(selectedThreatModel.status)
   }, [selectedThreatModel])
+
+  useEffect(() => {
+    const browserDumps = issueContextPacket?.browser_dumps ?? []
+    setSelectedBrowserDumpId((current) =>
+      browserDumps.some((item) => item.dump_id === current) ? current : '',
+    )
+  }, [issueContextPacket?.browser_dumps])
+
+  useEffect(() => {
+    if (!selectedBrowserDump) {
+      setBrowserDumpSourceDraft('manual')
+      setBrowserDumpLabelDraft('')
+      setBrowserDumpPageUrlDraft('')
+      setBrowserDumpPageTitleDraft('')
+      setBrowserDumpSummaryDraft('')
+      setBrowserDumpDomSnapshotDraft('')
+      setBrowserDumpConsoleDraft('')
+      setBrowserDumpNetworkDraft('')
+      setBrowserDumpScreenshotPathDraft('')
+      setBrowserDumpNotesDraft('')
+      return
+    }
+    setBrowserDumpSourceDraft(selectedBrowserDump.source)
+    setBrowserDumpLabelDraft(selectedBrowserDump.label)
+    setBrowserDumpPageUrlDraft(selectedBrowserDump.page_url ?? '')
+    setBrowserDumpPageTitleDraft(selectedBrowserDump.page_title ?? '')
+    setBrowserDumpSummaryDraft(selectedBrowserDump.summary)
+    setBrowserDumpDomSnapshotDraft(selectedBrowserDump.dom_snapshot)
+    setBrowserDumpConsoleDraft(selectedBrowserDump.console_messages.join('\n'))
+    setBrowserDumpNetworkDraft(selectedBrowserDump.network_requests.join('\n'))
+    setBrowserDumpScreenshotPathDraft(selectedBrowserDump.screenshot_path ?? '')
+    setBrowserDumpNotesDraft(selectedBrowserDump.notes ?? '')
+  }, [selectedBrowserDump])
 
   useEffect(() => {
     if (!workspaceId || !selectedRunRecordId) {
@@ -1669,6 +1720,48 @@ function App() {
     }
   }
 
+  async function handleSaveBrowserDump() {
+    if (!snapshot || !selectedIssue || !browserDumpLabelDraft.trim()) return
+    setLoading(true)
+    try {
+      const saved = await saveBrowserDump(snapshot.workspace.workspace_id, selectedIssue.bug_id, {
+        dump_id: selectedBrowserDump?.dump_id || undefined,
+        source: browserDumpSourceDraft,
+        label: browserDumpLabelDraft.trim(),
+        page_url: browserDumpPageUrlDraft.trim() || undefined,
+        page_title: browserDumpPageTitleDraft.trim() || undefined,
+        summary: browserDumpSummaryDraft.trim() || undefined,
+        dom_snapshot: browserDumpDomSnapshotDraft,
+        console_messages: parseLineDraft(browserDumpConsoleDraft),
+        network_requests: parseLineDraft(browserDumpNetworkDraft),
+        screenshot_path: browserDumpScreenshotPathDraft.trim() || undefined,
+        notes: browserDumpNotesDraft.trim() || undefined,
+      })
+      setSelectedBrowserDumpId(saved.dump_id)
+      setIssueContextPacket(await issueWork(snapshot.workspace.workspace_id, selectedIssue.bug_id, selectedRunbookId || undefined))
+      await refreshActivityData(snapshot.workspace.workspace_id)
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : String(nextError))
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  async function handleDeleteBrowserDump() {
+    if (!snapshot || !selectedIssue || !selectedBrowserDump) return
+    setLoading(true)
+    try {
+      await deleteBrowserDump(snapshot.workspace.workspace_id, selectedIssue.bug_id, selectedBrowserDump.dump_id)
+      setSelectedBrowserDumpId('')
+      setIssueContextPacket(await issueWork(snapshot.workspace.workspace_id, selectedIssue.bug_id, selectedRunbookId || undefined))
+      await refreshActivityData(snapshot.workspace.workspace_id)
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : String(nextError))
+    } finally {
+      setLoading(false)
+    }
+  }
+
   async function handleCaptureIssueContextReplay() {
     if (!snapshot || !selectedIssue) return
     setLoading(true)
@@ -2199,6 +2292,17 @@ function App() {
                 threatModelMitigationsDraft={threatModelMitigationsDraft}
                 threatModelReferencesDraft={threatModelReferencesDraft}
                 threatModelStatusDraft={threatModelStatusDraft}
+                selectedBrowserDumpId={selectedBrowserDumpId}
+                browserDumpSourceDraft={browserDumpSourceDraft}
+                browserDumpLabelDraft={browserDumpLabelDraft}
+                browserDumpPageUrlDraft={browserDumpPageUrlDraft}
+                browserDumpPageTitleDraft={browserDumpPageTitleDraft}
+                browserDumpSummaryDraft={browserDumpSummaryDraft}
+                browserDumpDomSnapshotDraft={browserDumpDomSnapshotDraft}
+                browserDumpConsoleDraft={browserDumpConsoleDraft}
+                browserDumpNetworkDraft={browserDumpNetworkDraft}
+                browserDumpScreenshotPathDraft={browserDumpScreenshotPathDraft}
+                browserDumpNotesDraft={browserDumpNotesDraft}
                 issueSeverityDraft={issueSeverityDraft}
                 issueStatusDraft={issueStatusDraft}
                 issueDocStatusDraft={issueDocStatusDraft}
@@ -2247,6 +2351,17 @@ function App() {
                 onThreatModelMitigationsChange={setThreatModelMitigationsDraft}
                 onThreatModelReferencesChange={setThreatModelReferencesDraft}
                 onThreatModelStatusChange={setThreatModelStatusDraft}
+                onSelectedBrowserDumpChange={setSelectedBrowserDumpId}
+                onBrowserDumpSourceChange={setBrowserDumpSourceDraft}
+                onBrowserDumpLabelChange={setBrowserDumpLabelDraft}
+                onBrowserDumpPageUrlChange={setBrowserDumpPageUrlDraft}
+                onBrowserDumpPageTitleChange={setBrowserDumpPageTitleDraft}
+                onBrowserDumpSummaryChange={setBrowserDumpSummaryDraft}
+                onBrowserDumpDomSnapshotChange={setBrowserDumpDomSnapshotDraft}
+                onBrowserDumpConsoleChange={setBrowserDumpConsoleDraft}
+                onBrowserDumpNetworkChange={setBrowserDumpNetworkDraft}
+                onBrowserDumpScreenshotPathChange={setBrowserDumpScreenshotPathDraft}
+                onBrowserDumpNotesChange={setBrowserDumpNotesDraft}
                 onContextReplayLabelChange={setContextReplayLabelDraft}
                 onIssueLabelsChange={setIssueLabelsDraft}
                 onIssueNotesChange={setIssueNotesDraft}
@@ -2277,6 +2392,8 @@ function App() {
                 onDeleteTicketContext={() => void handleDeleteTicketContext()}
                 onSaveThreatModel={() => void handleSaveThreatModel()}
                 onDeleteThreatModel={() => void handleDeleteThreatModel()}
+                onSaveBrowserDump={() => void handleSaveBrowserDump()}
+                onDeleteBrowserDump={() => void handleDeleteBrowserDump()}
                 onCaptureIssueContextReplay={() => void handleCaptureIssueContextReplay()}
                 onRetryRun={() => void handleRetryRun()}
                 onCancelRun={() => void handleCancelRun()}

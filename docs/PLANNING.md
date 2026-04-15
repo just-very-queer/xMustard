@@ -46,6 +46,7 @@ That means the roadmap now optimizes for:
 - saved workspace verification profiles now surface in the execution drawer and issue detail
 - issue-level ticket context now attaches upstream links, summaries, and acceptance criteria to issue packets
 - issue-context replay snapshots now capture prompt state for later eval and comparison
+- issue-level browser dumps now capture MCP/manual browser state for shared UI debugging context
 - workspace repo maps now persist structural summaries and ranked related paths for issue packets
 
 ## Research-Driven Next Phases
@@ -139,6 +140,7 @@ Current state:
 
 - issue-context replay capture now exists as the first stored replay artifact
 - prompt snapshots can be saved from the issue detail pane for later comparison
+- browser dumps can now be saved as durable issue artifacts and included in issue context packets
 
 Success looks like:
 

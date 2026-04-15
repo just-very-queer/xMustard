@@ -21,6 +21,8 @@ from .models import (
     ActivityRecord,
     ActivityRollupItem,
     AppSettings,
+    BrowserDumpRecord,
+    BrowserDumpUpsertRequest,
     CostSummary,
     CoverageDelta,
     CoverageResult,
@@ -1066,6 +1068,77 @@ class TrackerService:
         )
         return replay
 
+    def list_browser_dumps(self, workspace_id: str, issue_id: Optional[str] = None) -> list[BrowserDumpRecord]:
+        self.get_workspace(workspace_id)
+        items = self.store.list_browser_dumps(workspace_id)
+        if issue_id:
+            items = [item for item in items if item.issue_id == issue_id]
+        return items
+
+    def save_browser_dump(
+        self,
+        workspace_id: str,
+        issue_id: str,
+        request: BrowserDumpUpsertRequest,
+        *,
+        actor: Optional[ActivityActor] = None,
+        action: str = "browser_dump.saved",
+    ) -> BrowserDumpRecord:
+        self._get_issue_from_snapshot(workspace_id, issue_id)
+        existing = self.store.list_browser_dumps(workspace_id)
+        dump_id = request.dump_id or self._slug_runbook_name(f"browser-{request.label}")
+        previous = next((item for item in existing if item.dump_id == dump_id), None)
+        now = utc_now()
+        record = BrowserDumpRecord(
+            dump_id=dump_id,
+            workspace_id=workspace_id,
+            issue_id=issue_id,
+            source=request.source,
+            label=request.label.strip(),
+            page_url=request.page_url.strip() if request.page_url else None,
+            page_title=request.page_title.strip() if request.page_title else None,
+            summary=request.summary.strip(),
+            dom_snapshot=request.dom_snapshot.strip(),
+            console_messages=self._normalize_text_list(request.console_messages, limit=20),
+            network_requests=self._normalize_text_list(request.network_requests, limit=20),
+            screenshot_path=request.screenshot_path.strip() if request.screenshot_path else None,
+            notes=request.notes.strip() if request.notes else None,
+            created_at=previous.created_at if previous else now,
+            updated_at=now,
+        )
+        remaining = [item for item in existing if item.dump_id != dump_id]
+        remaining.append(record)
+        self.store.save_browser_dumps(workspace_id, remaining)
+        self._record_activity(
+            workspace_id=workspace_id,
+            entity_type="issue",
+            entity_id=issue_id,
+            action=action,
+            summary=f"Saved browser dump {record.label}",
+            actor=actor or build_activity_actor("operator", "operator"),
+            issue_id=issue_id,
+            details={"dump_id": dump_id, "source": record.source, "page_url": record.page_url},
+        )
+        return record
+
+    def delete_browser_dump(self, workspace_id: str, issue_id: str, dump_id: str) -> None:
+        self._get_issue_from_snapshot(workspace_id, issue_id)
+        existing = self.store.list_browser_dumps(workspace_id)
+        remaining = [item for item in existing if item.dump_id != dump_id]
+        if len(remaining) == len(existing):
+            raise FileNotFoundError(dump_id)
+        self.store.save_browser_dumps(workspace_id, remaining)
+        self._record_activity(
+            workspace_id=workspace_id,
+            entity_type="issue",
+            entity_id=issue_id,
+            action="browser_dump.deleted",
+            summary=f"Deleted browser dump {dump_id}",
+            actor=build_activity_actor("operator", "operator"),
+            issue_id=issue_id,
+            details={"dump_id": dump_id},
+        )
+
     def list_review_queue(self, workspace_id: str) -> list[ReviewQueueItem]:
         snapshot = self.store.load_snapshot(workspace_id)
         if not snapshot:
@@ -1262,6 +1335,7 @@ class TrackerService:
         verification_profiles = self.list_verification_profiles(workspace_id)
         ticket_contexts = self.list_ticket_contexts(workspace_id, issue_id=issue_id)
         threat_models = self.list_threat_models(workspace_id, issue_id=issue_id)
+        browser_dumps = self.list_browser_dumps(workspace_id, issue_id=issue_id)
         repo_map = self.read_repo_map(workspace_id)
         related_paths = self._rank_related_paths(issue, tree_focus, ticket_contexts, repo_map)
         runbook = self._render_runbook_steps(default_runbook.template)
@@ -1278,6 +1352,7 @@ class TrackerService:
             verification_profiles,
             ticket_contexts,
             threat_models,
+            browser_dumps,
             related_paths,
             repo_map,
         )
@@ -1295,6 +1370,7 @@ class TrackerService:
             available_verification_profiles=verification_profiles,
             ticket_contexts=ticket_contexts,
             threat_models=threat_models,
+            browser_dumps=browser_dumps,
             repo_map=repo_map,
             worktree=self.read_worktree_status(workspace_id),
             prompt=prompt,
@@ -3428,6 +3504,7 @@ Respond with a JSON object containing:
             ticket_contexts=self.list_ticket_contexts(workspace_id),
             threat_models=self.list_threat_models(workspace_id),
             context_replays=self.list_issue_context_replays(workspace_id),
+            browser_dumps=self.list_browser_dumps(workspace_id),
             verifications=self.store.list_verifications(workspace_id),
             activity=self.store.list_activity(workspace_id),
         )
@@ -4042,6 +4119,7 @@ Respond with a JSON object containing:
         verification_profiles: list[VerificationProfileRecord],
         ticket_contexts: list[TicketContextRecord],
         threat_models: list[ThreatModelRecord],
+        browser_dumps: list[BrowserDumpRecord],
         related_paths: list[str],
         repo_map: RepoMapSummary,
     ) -> str:
@@ -4102,6 +4180,21 @@ Respond with a JSON object containing:
                 f"{threat_model.summary or 'No summary.'} Assets: {assets}. Abuse cases: {abuse_cases}. "
                 f"Mitigations: {mitigations}"
             )
+        browser_lines = []
+        for browser_dump in browser_dumps[:3]:
+            page_bits = []
+            if browser_dump.page_title:
+                page_bits.append(browser_dump.page_title)
+            if browser_dump.page_url:
+                page_bits.append(browser_dump.page_url)
+            page_summary = " | ".join(page_bits) if page_bits else "No page metadata recorded."
+            console_excerpt = "; ".join(browser_dump.console_messages[:2]) or "No console messages recorded."
+            network_excerpt = "; ".join(browser_dump.network_requests[:2]) or "No network requests recorded."
+            dom_excerpt = browser_dump.dom_snapshot[:220].replace("\n", " ").strip() if browser_dump.dom_snapshot else "No DOM snapshot recorded."
+            browser_lines.append(
+                f"- {browser_dump.label} [{browser_dump.source}]: {browser_dump.summary or page_summary}. "
+                f"Console: {console_excerpt}. Network: {network_excerpt}. DOM excerpt: {dom_excerpt}"
+            )
         repo_dir_lines = [
             f"- {item.path}: {item.source_file_count} source files, {item.test_file_count} test files"
             for item in repo_map.top_directories[:5]
@@ -4121,6 +4214,7 @@ Respond with a JSON object containing:
             f"Prior fix history:\n{chr(10).join(fix_lines) if fix_lines else '- No prior fixes recorded.'}\n\n"
             f"Ticket context:\n{chr(10).join(ticket_lines) if ticket_lines else '- No linked ticket context recorded.'}\n\n"
             f"Threat model:\n{chr(10).join(threat_lines) if threat_lines else '- No threat model recorded yet.'}\n\n"
+            f"Browser context:\n{chr(10).join(browser_lines) if browser_lines else '- No browser dumps recorded yet.'}\n\n"
             f"Structural context:\n{chr(10).join(repo_dir_lines) if repo_dir_lines else '- No repo map available.'}\n\n"
             f"Ranked related paths:\n{related_lines}\n\n"
             f"Repository guidance:\n{chr(10).join(guidance_lines) if guidance_lines else '- No repository guidance files were found.'}\n\n"

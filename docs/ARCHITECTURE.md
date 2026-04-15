@@ -73,6 +73,7 @@ Issue context packets are currently composed from:
 
 - issue data
 - evidence
+- browser dumps for browser-based repros and UI state capture
 - repo-map summary and ranked related paths
 - recent fixes
 - recent issue activity
@@ -104,6 +105,7 @@ Current artifacts:
 - test suggestions
 - run insights
 - issue-context replay snapshots
+- browser dumps captured from MCP/manual browser inspection
 
 This is the beginning of a review system shaped more like PR review than plain terminal logging.
 

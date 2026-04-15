@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app.models import (
+    BrowserDumpUpsertRequest,
     DiscoverySignal,
     EvidenceRef,
     FixRecordRequest,
@@ -367,6 +368,50 @@ class TrackerServiceTests(unittest.TestCase):
 
             service.delete_ticket_context(snapshot.workspace.workspace_id, "P0_25M03_001", saved.context_id)
             self.assertEqual(service.list_ticket_contexts(snapshot.workspace.workspace_id, "P0_25M03_001"), [])
+
+    def test_browser_dump_crud_and_issue_packet(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "repo"
+            (root / "docs" / "bugs").mkdir(parents=True)
+            (root / "api" / "src").mkdir(parents=True)
+            (root / "docs" / "bugs" / "Bugs_25260323.md").write_text(LEDGER_TEXT, encoding="utf-8")
+            (root / "api" / "src" / "example.py").write_text("print('ok')\n", encoding="utf-8")
+
+            store = FileStore(Path(tmp_dir) / "data")
+            service = TrackerService(store)
+            snapshot = service.load_workspace(WorkspaceLoadRequest(root_path=str(root), auto_scan=True))
+            assert snapshot is not None
+
+            saved = service.save_browser_dump(
+                snapshot.workspace.workspace_id,
+                "P0_25M03_001",
+                BrowserDumpUpsertRequest(
+                    source="mcp-chrome",
+                    label="Checkout page dump",
+                    page_url="http://localhost:3000/checkout",
+                    page_title="Checkout",
+                    summary="The browser shows an unhandled state after submit.",
+                    dom_snapshot="button disabled=true\nerror banner visible\ncart total stale",
+                    console_messages=["TypeError: Cannot read properties of undefined"],
+                    network_requests=["POST /api/checkout -> 500"],
+                    screenshot_path="artifacts/checkout.png",
+                    notes="Captured from MCP chrome devtools snapshot",
+                ),
+            )
+
+            dumps = service.list_browser_dumps(snapshot.workspace.workspace_id, "P0_25M03_001")
+            self.assertTrue(any(item.dump_id == saved.dump_id for item in dumps))
+
+            packet = service.build_issue_context(snapshot.workspace.workspace_id, "P0_25M03_001")
+            self.assertEqual(packet.browser_dumps[0].label, "Checkout page dump")
+            self.assertIn("Browser context:", packet.prompt)
+            self.assertIn("POST /api/checkout -> 500", packet.prompt)
+
+            export = service.export_workspace(snapshot.workspace.workspace_id)
+            self.assertEqual(export.browser_dumps[0].dump_id, saved.dump_id)
+
+            service.delete_browser_dump(snapshot.workspace.workspace_id, "P0_25M03_001", saved.dump_id)
+            self.assertEqual(service.list_browser_dumps(snapshot.workspace.workspace_id, "P0_25M03_001"), [])
 
     def test_github_import_creates_ticket_context_with_acceptance_criteria(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

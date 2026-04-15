@@ -1849,6 +1849,85 @@ func main() {
 			"context_id": contextID,
 		})
 	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/issues/{issue_id}/browser-dumps", func(w http.ResponseWriter, r *http.Request) {
+		workspaceID := r.PathValue("workspace_id")
+		issueID := r.PathValue("issue_id")
+		result, err := workspaceops.ListBrowserDumps(
+			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
+			workspaceID,
+			issueID,
+		)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				writeJSON(w, http.StatusNotFound, map[string]any{
+					"error": "Missing resource",
+				})
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"error": err.Error(),
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	})
+	mux.HandleFunc("POST /api/workspaces/{workspace_id}/issues/{issue_id}/browser-dumps", func(w http.ResponseWriter, r *http.Request) {
+		workspaceID := r.PathValue("workspace_id")
+		issueID := r.PathValue("issue_id")
+		var request workspaceops.BrowserDumpUpsertRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{
+				"error": "invalid JSON body",
+			})
+			return
+		}
+		result, err := workspaceops.SaveBrowserDump(
+			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
+			workspaceID,
+			issueID,
+			request,
+		)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				writeJSON(w, http.StatusNotFound, map[string]any{
+					"error": "Missing resource",
+				})
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"error": err.Error(),
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	})
+	mux.HandleFunc("DELETE /api/workspaces/{workspace_id}/issues/{issue_id}/browser-dumps/{dump_id}", func(w http.ResponseWriter, r *http.Request) {
+		workspaceID := r.PathValue("workspace_id")
+		issueID := r.PathValue("issue_id")
+		dumpID := r.PathValue("dump_id")
+		err := workspaceops.DeleteBrowserDump(
+			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
+			workspaceID,
+			issueID,
+			dumpID,
+		)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				writeJSON(w, http.StatusNotFound, map[string]any{
+					"error": "Missing resource",
+				})
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"error": err.Error(),
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":      true,
+			"dump_id": dumpID,
+		})
+	})
 	mux.HandleFunc("GET /api/workspaces/{workspace_id}/issues/{issue_id}/context-replays", func(w http.ResponseWriter, r *http.Request) {
 		workspaceID := r.PathValue("workspace_id")
 		issueID := r.PathValue("issue_id")

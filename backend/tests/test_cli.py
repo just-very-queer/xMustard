@@ -7,7 +7,7 @@ from unittest.mock import patch
 from typer.testing import CliRunner
 
 from app import cli as cli_module
-from app.models import RunRecord, RuntimeProbeResult, VerificationSummary, WorkspaceLoadRequest
+from app.models import DiscoverySignal, EvidenceRef, RunRecord, RuntimeProbeResult, VerificationSummary, WorkspaceLoadRequest
 from app.service import TrackerService
 from app.store import FileStore
 
@@ -566,6 +566,330 @@ class CliSurfaceTests(unittest.TestCase):
                         request.models,
                         ["opencode-go/minimax-m2.7", "opencode-go/glm-5", "opencode-go/kimi-k2.5"],
                     )
+
+    def test_cli_analysis_and_signal_commands(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service, workspace_id = self._create_service(tmp_dir)
+            service.create_issue(
+                workspace_id,
+                cli_module.IssueCreateRequest(
+                    bug_id="P0_25M03_002",
+                    title="Example bug follow-up",
+                    severity="P0",
+                    summary="Example summary with follow-up wording for duplicate detection coverage.",
+                    impact="Example impact still breaks behavior.",
+                    labels=["cli", "duplicate"],
+                ),
+            )
+            snapshot = service.read_snapshot(workspace_id)
+            assert snapshot is not None
+            signal = DiscoverySignal(
+                signal_id="sig_cli_001",
+                kind="not_implemented",
+                severity="P2",
+                title="Signal promoted issue",
+                summary="Scanner discovered a follow-up investigation site.",
+                file_path="api/src/example.py",
+                line=12,
+                evidence=[EvidenceRef(path="api/src/example.py", line=12, excerpt="print('ok')")],
+                tags=["scanner", "cli"],
+                fingerprint="fp_sig_cli_001",
+            )
+            service.store.save_snapshot(snapshot.model_copy(update={"signals": [*snapshot.signals, signal]}))
+
+            with patch.object(cli_module, "service", service):
+                result = self.runner.invoke(cli_module.app, ["quality-score", workspace_id, "P0_25M03_001"])
+                self.assertEqual(result.exit_code, 0, msg=result.output)
+                quality = json.loads(result.stdout)
+                self.assertEqual(quality["issue_id"], "P0_25M03_001")
+
+                result = self.runner.invoke(cli_module.app, ["quality-get", workspace_id, "P0_25M03_001"])
+                self.assertEqual(result.exit_code, 0, msg=result.output)
+                self.assertEqual(json.loads(result.stdout)["issue_id"], "P0_25M03_001")
+
+                result = self.runner.invoke(cli_module.app, ["quality-score-all", workspace_id])
+                self.assertEqual(result.exit_code, 0, msg=result.output)
+                self.assertGreaterEqual(len(json.loads(result.stdout)), 2)
+
+                result = self.runner.invoke(cli_module.app, ["duplicates", workspace_id, "P0_25M03_001"])
+                self.assertEqual(result.exit_code, 0, msg=result.output)
+                duplicates = json.loads(result.stdout)
+                self.assertTrue(any(item["target_id"] == "P0_25M03_002" for item in duplicates))
+
+                result = self.runner.invoke(cli_module.app, ["triage-issue", workspace_id, "P0_25M03_001"])
+                self.assertEqual(result.exit_code, 0, msg=result.output)
+                self.assertEqual(json.loads(result.stdout)["issue_id"], "P0_25M03_001")
+
+                result = self.runner.invoke(cli_module.app, ["triage-all", workspace_id])
+                self.assertEqual(result.exit_code, 0, msg=result.output)
+                triage_all = json.loads(result.stdout)
+                self.assertTrue(any(item["issue_id"] == "P0_25M03_001" for item in triage_all))
+
+                result = self.runner.invoke(cli_module.app, ["test-suggestions-generate", workspace_id, "P0_25M03_001"])
+                self.assertEqual(result.exit_code, 0, msg=result.output)
+                generated = json.loads(result.stdout)
+                self.assertTrue(generated)
+                self.assertEqual(generated[0]["issue_id"], "P0_25M03_001")
+
+                result = self.runner.invoke(cli_module.app, ["test-suggestions", workspace_id, "P0_25M03_001"])
+                self.assertEqual(result.exit_code, 0, msg=result.output)
+                self.assertTrue(json.loads(result.stdout))
+
+                result = self.runner.invoke(
+                    cli_module.app,
+                    [
+                        "signal-promote",
+                        workspace_id,
+                        "sig_cli_001",
+                        "--severity",
+                        "P1",
+                        "--labels",
+                        "cli,promoted",
+                    ],
+                )
+                self.assertEqual(result.exit_code, 0, msg=result.output)
+                promoted_snapshot = json.loads(result.stdout)
+                promoted_issue = next(item for item in promoted_snapshot["issues"] if item["title"] == "Signal promoted issue")
+                self.assertEqual(promoted_issue["issue_status"], "triaged")
+                promoted_signal = next(item for item in promoted_snapshot["signals"] if item["signal_id"] == "sig_cli_001")
+                self.assertEqual(promoted_signal["promoted_bug_id"], promoted_issue["bug_id"])
+
+    def test_cli_integration_commands(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service, workspace_id = self._create_service(tmp_dir)
+
+            with patch.object(cli_module, "service", service):
+                result = self.runner.invoke(
+                    cli_module.app,
+                    [
+                        "integration-configure",
+                        workspace_id,
+                        "github",
+                        "--setting",
+                        "repo=owner/example",
+                        "--setting",
+                        "token=abc123",
+                    ],
+                )
+                self.assertEqual(result.exit_code, 0, msg=result.output)
+                config = json.loads(result.stdout)
+                self.assertEqual(config["provider"], "github")
+                self.assertEqual(config["settings"]["repo"], "owner/example")
+
+                result = self.runner.invoke(cli_module.app, ["integrations", workspace_id])
+                self.assertEqual(result.exit_code, 0, msg=result.output)
+                integrations = json.loads(result.stdout)
+                self.assertTrue(any(item["provider"] == "github" for item in integrations))
+
+                with patch.object(service, "test_integration", return_value={"provider": "github", "ok": True, "message": "ok"}) as test_mock:
+                    result = self.runner.invoke(
+                        cli_module.app,
+                        [
+                            "integration-test",
+                            "github",
+                            "--settings-json",
+                            '{"token":"abc123","repo":"owner/example"}',
+                        ],
+                    )
+                    self.assertEqual(result.exit_code, 0, msg=result.output)
+                    self.assertTrue(json.loads(result.stdout)["ok"])
+                    request = test_mock.call_args.args[0]
+                    self.assertEqual(request.provider, "github")
+                    self.assertEqual(request.settings["repo"], "owner/example")
+
+                with patch.object(service, "import_github_issues", return_value=[{"issue_id": "GH-1"}]):
+                    result = self.runner.invoke(cli_module.app, ["github-import", workspace_id, "owner/example"])
+                    self.assertEqual(result.exit_code, 0, msg=result.output)
+                    self.assertEqual(json.loads(result.stdout)[0]["issue_id"], "GH-1")
+
+                with patch.object(service, "create_github_pr", return_value={"pr_number": 17, "html_url": "https://example.test/pr/17"}) as pr_mock:
+                    result = self.runner.invoke(
+                        cli_module.app,
+                        [
+                            "github-pr",
+                            workspace_id,
+                            "run_cli_001",
+                            "P0_25M03_001",
+                            "feature/cli-flow",
+                            "--base-branch",
+                            "main",
+                            "--title",
+                            "CLI PR",
+                            "--body",
+                            "Ready for review",
+                            "--draft",
+                        ],
+                    )
+                    self.assertEqual(result.exit_code, 0, msg=result.output)
+                    self.assertEqual(json.loads(result.stdout)["pr_number"], 17)
+                    request = pr_mock.call_args.args[1]
+                    self.assertEqual(request.head_branch, "feature/cli-flow")
+                    self.assertTrue(request.draft)
+
+                with patch.object(service, "send_slack_notification", return_value={"status": "sent", "event": "run.completed"}):
+                    result = self.runner.invoke(
+                        cli_module.app,
+                        ["slack-notify", workspace_id, "run.completed", "--message", "CLI finished"],
+                    )
+                    self.assertEqual(result.exit_code, 0, msg=result.output)
+                    self.assertEqual(json.loads(result.stdout)["status"], "sent")
+
+                with patch.object(service, "sync_issue_to_linear", return_value={"issue_id": "P0_25M03_001", "linear_id": "LIN-1"}):
+                    result = self.runner.invoke(cli_module.app, ["linear-sync", workspace_id, "P0_25M03_001"])
+                    self.assertEqual(result.exit_code, 0, msg=result.output)
+                    self.assertEqual(json.loads(result.stdout)["linear_id"], "LIN-1")
+
+                with patch.object(service, "sync_issue_to_jira", return_value={"issue_id": "P0_25M03_001", "jira_key": "JIRA-1"}):
+                    result = self.runner.invoke(cli_module.app, ["jira-sync", workspace_id, "P0_25M03_001"])
+                    self.assertEqual(result.exit_code, 0, msg=result.output)
+                    self.assertEqual(json.loads(result.stdout)["jira_key"], "JIRA-1")
+
+    def test_cli_extended_parity_commands(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service, workspace_id = self._create_service(tmp_dir)
+
+            with patch.object(cli_module, "service", service):
+                result = self.runner.invoke(cli_module.app, ["workspaces"])
+                self.assertEqual(result.exit_code, 0, msg=result.output)
+                self.assertTrue(any(item["workspace_id"] == workspace_id for item in json.loads(result.stdout)))
+
+                result = self.runner.invoke(cli_module.app, ["tree", workspace_id])
+                self.assertEqual(result.exit_code, 0, msg=result.output)
+                self.assertTrue(any(item["path"] == "api" for item in json.loads(result.stdout)))
+
+                result = self.runner.invoke(cli_module.app, ["repo-map", workspace_id])
+                self.assertEqual(result.exit_code, 0, msg=result.output)
+                self.assertEqual(json.loads(result.stdout)["workspace_id"], workspace_id)
+
+                result = self.runner.invoke(
+                    cli_module.app,
+                    [
+                        "verification-profile-save",
+                        workspace_id,
+                        "--name",
+                        "CLI Verify",
+                        "--test-command",
+                        "pytest -q",
+                        "--coverage-command",
+                        "pytest --cov=. --cov-report=xml",
+                        "--coverage-report-path",
+                        "coverage.xml",
+                        "--coverage-format",
+                        "cobertura",
+                    ],
+                )
+                self.assertEqual(result.exit_code, 0, msg=result.output)
+                profile = json.loads(result.stdout)
+                self.assertEqual(profile["name"], "CLI Verify")
+
+                result = self.runner.invoke(cli_module.app, ["verification-profiles", workspace_id])
+                self.assertEqual(result.exit_code, 0, msg=result.output)
+                self.assertTrue(any(item["profile_id"] == profile["profile_id"] for item in json.loads(result.stdout)))
+
+                result = self.runner.invoke(
+                    cli_module.app,
+                    [
+                        "ticket-context-save",
+                        workspace_id,
+                        "P0_25M03_001",
+                        "--title",
+                        "Browser bug ticket",
+                        "--acceptance-criteria",
+                        "render works,error banner gone",
+                    ],
+                )
+                self.assertEqual(result.exit_code, 0, msg=result.output)
+                context_payload = json.loads(result.stdout)
+                self.assertEqual(context_payload["title"], "Browser bug ticket")
+
+                result = self.runner.invoke(
+                    cli_module.app,
+                    [
+                        "threat-model-save",
+                        workspace_id,
+                        "P0_25M03_001",
+                        "--title",
+                        "Checkout threat review",
+                        "--assets",
+                        "payment data,cart state",
+                    ],
+                )
+                self.assertEqual(result.exit_code, 0, msg=result.output)
+                threat_payload = json.loads(result.stdout)
+                self.assertEqual(threat_payload["title"], "Checkout threat review")
+
+                result = self.runner.invoke(
+                    cli_module.app,
+                    ["context-replay-capture", workspace_id, "P0_25M03_001", "--label", "cli replay"],
+                )
+                self.assertEqual(result.exit_code, 0, msg=result.output)
+                replay_payload = json.loads(result.stdout)
+                self.assertEqual(replay_payload["label"], "cli replay")
+
+                result = self.runner.invoke(
+                    cli_module.app,
+                    [
+                        "browser-dump-save",
+                        workspace_id,
+                        "P0_25M03_001",
+                        "--label",
+                        "Checkout dump",
+                        "--page-url",
+                        "http://localhost:3000/checkout",
+                        "--summary",
+                        "UI is stuck after submit",
+                        "--dom-snapshot",
+                        "checkout error visible",
+                        "--console-message",
+                        "TypeError: boom",
+                        "--network-request",
+                        "POST /api/checkout -> 500",
+                    ],
+                )
+                self.assertEqual(result.exit_code, 0, msg=result.output)
+                browser_dump = json.loads(result.stdout)
+                self.assertEqual(browser_dump["label"], "Checkout dump")
+
+                result = self.runner.invoke(cli_module.app, ["browser-dumps", workspace_id, "P0_25M03_001"])
+                self.assertEqual(result.exit_code, 0, msg=result.output)
+                self.assertTrue(any(item["dump_id"] == browser_dump["dump_id"] for item in json.loads(result.stdout)))
+
+                with patch.object(service, "generate_run_plan", return_value={"plan_id": "plan_1", "phase": "awaiting_approval"}):
+                    result = self.runner.invoke(cli_module.app, ["plan-generate", workspace_id, "run_123"])
+                    self.assertEqual(result.exit_code, 0, msg=result.output)
+                    self.assertEqual(json.loads(result.stdout)["phase"], "awaiting_approval")
+
+                with patch.object(service, "approve_run_plan", return_value={"plan_id": "plan_1", "phase": "approved"}) as approve_mock:
+                    result = self.runner.invoke(
+                        cli_module.app,
+                        ["plan-approve", workspace_id, "run_123", "--feedback", "ship it"],
+                    )
+                    self.assertEqual(result.exit_code, 0, msg=result.output)
+                    self.assertEqual(json.loads(result.stdout)["phase"], "approved")
+                    self.assertEqual(approve_mock.call_args.args[2].feedback, "ship it")
+
+                with patch.object(service, "parse_coverage_report", return_value={"line_coverage": 91.2, "workspace_id": workspace_id}):
+                    result = self.runner.invoke(
+                        cli_module.app,
+                        ["coverage-parse", workspace_id, "--report-path", "coverage.xml", "--issue-id", "P0_25M03_001"],
+                    )
+                    self.assertEqual(result.exit_code, 0, msg=result.output)
+                    self.assertEqual(json.loads(result.stdout)["line_coverage"], 91.2)
+
+                with patch.object(service, "get_patch_critique", return_value={"overall_quality": "good"}):
+                    result = self.runner.invoke(cli_module.app, ["critique-get", workspace_id, "run_123"])
+                    self.assertEqual(result.exit_code, 0, msg=result.output)
+                    self.assertEqual(json.loads(result.stdout)["overall_quality"], "good")
+
+                with patch.object(service, "open_terminal", return_value={"terminal_id": "term_1", "pid": 1234}):
+                    result = self.runner.invoke(cli_module.app, ["terminal-open", workspace_id])
+                    self.assertEqual(result.exit_code, 0, msg=result.output)
+                    self.assertEqual(json.loads(result.stdout)["terminal_id"], "term_1")
+
+                with patch.object(service, "terminal_read", return_value={"terminal_id": "term_1", "content": "ok", "offset": 2, "eof": False}):
+                    result = self.runner.invoke(cli_module.app, ["terminal-read", workspace_id, "term_1"])
+                    self.assertEqual(result.exit_code, 0, msg=result.output)
+                    self.assertEqual(json.loads(result.stdout)["content"], "ok")
 
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from .models import (
     AgentQueryRequest,
     AppSettings,
+    BrowserDumpUpsertRequest,
     DismissImprovementRequest,
     FixRecordRequest,
     FixUpdateRequest,
@@ -481,6 +482,33 @@ def capture_issue_context_replay(workspace_id: str, issue_id: str, request: Issu
         return SERVICE.capture_issue_context_replay(workspace_id, issue_id, request).model_dump(mode="json")
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=f"Missing resource: {exc}")
+
+
+@app.get("/api/workspaces/{workspace_id}/issues/{issue_id}/browser-dumps")
+def list_browser_dumps(workspace_id: str, issue_id: str):
+    try:
+        return [item.model_dump(mode="json") for item in SERVICE.list_browser_dumps(workspace_id, issue_id)]
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"Missing resource: {exc}")
+
+
+@app.post("/api/workspaces/{workspace_id}/issues/{issue_id}/browser-dumps")
+def save_browser_dump(workspace_id: str, issue_id: str, request: BrowserDumpUpsertRequest):
+    try:
+        return SERVICE.save_browser_dump(workspace_id, issue_id, request).model_dump(mode="json")
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"Missing resource: {exc}")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.delete("/api/workspaces/{workspace_id}/issues/{issue_id}/browser-dumps/{dump_id}")
+def delete_browser_dump(workspace_id: str, issue_id: str, dump_id: str):
+    try:
+        SERVICE.delete_browser_dump(workspace_id, issue_id, dump_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"Missing resource: {exc}")
+    return {"ok": True, "dump_id": dump_id}
 
 
 @app.post("/api/workspaces/{workspace_id}/issues/{issue_id}/runs")

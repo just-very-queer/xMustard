@@ -84,6 +84,7 @@ type IssueContextPacket struct {
 	AvailableVerificationProfiles []rustcore.VerificationProfileInput `json:"available_verification_profiles"`
 	TicketContexts                []TicketContextRecord               `json:"ticket_contexts"`
 	ThreatModels                  []ThreatModelRecord                 `json:"threat_models"`
+	BrowserDumps                  []BrowserDumpRecord                 `json:"browser_dumps"`
 	RepoMap                       *rustcore.RepoMapSummary            `json:"repo_map,omitempty"`
 	Worktree                      *WorktreeStatus                     `json:"worktree,omitempty"`
 	Prompt                        string                              `json:"prompt"`
@@ -138,6 +139,10 @@ func BuildIssueContextPacket(dataDir string, workspaceID string, issueID string)
 	if err != nil {
 		return nil, err
 	}
+	browserDumps, err := ListBrowserDumps(dataDir, workspaceID, issueID)
+	if err != nil {
+		return nil, err
+	}
 	repoMap, err := loadOrBuildRepoMap(dataDir, workspaceID, snapshot.Workspace.RootPath)
 	if err != nil {
 		return nil, err
@@ -174,6 +179,7 @@ func BuildIssueContextPacket(dataDir string, workspaceID string, issueID string)
 		AvailableVerificationProfiles: verificationProfiles,
 		TicketContexts:                ticketContexts,
 		ThreatModels:                  threatModels,
+		BrowserDumps:                  browserDumps,
 		RepoMap:                       repoMap,
 		Worktree:                      worktree,
 	}
@@ -187,6 +193,7 @@ func BuildIssueContextPacket(dataDir string, workspaceID string, issueID string)
 		packet.AvailableVerificationProfiles,
 		packet.TicketContexts,
 		packet.ThreatModels,
+		packet.BrowserDumps,
 		packet.RelatedPaths,
 		packet.RepoMap,
 	)
@@ -691,6 +698,7 @@ func buildIssueContextPrompt(
 	verificationProfiles []rustcore.VerificationProfileInput,
 	ticketContexts []TicketContextRecord,
 	threatModels []ThreatModelRecord,
+	browserDumps []BrowserDumpRecord,
 	relatedPaths []string,
 	repoMap *rustcore.RepoMapSummary,
 ) string {
@@ -839,6 +847,41 @@ func buildIssueContextPrompt(
 		threatLines = append(threatLines, "- No threat model recorded yet.")
 	}
 
+	browserLines := []string{}
+	for _, item := range browserDumps[:min(len(browserDumps), 3)] {
+		pageBits := []string{}
+		if item.PageTitle != nil && strings.TrimSpace(*item.PageTitle) != "" {
+			pageBits = append(pageBits, *item.PageTitle)
+		}
+		if item.PageURL != nil && strings.TrimSpace(*item.PageURL) != "" {
+			pageBits = append(pageBits, *item.PageURL)
+		}
+		pageSummary := "No page metadata recorded."
+		if len(pageBits) > 0 {
+			pageSummary = strings.Join(pageBits, " — ")
+		}
+		consoleExcerpt := "No console messages recorded."
+		if len(item.ConsoleMessages) > 0 {
+			consoleExcerpt = strings.Join(item.ConsoleMessages[:min(len(item.ConsoleMessages), 2)], "; ")
+		}
+		networkExcerpt := "No network requests recorded."
+		if len(item.NetworkRequests) > 0 {
+			networkExcerpt = strings.Join(item.NetworkRequests[:min(len(item.NetworkRequests), 2)], "; ")
+		}
+		domExcerpt := "No DOM snapshot recorded."
+		if strings.TrimSpace(item.DOMSnapshot) != "" {
+			domExcerpt = strings.TrimSpace(strings.ReplaceAll(item.DOMSnapshot[:min(len(item.DOMSnapshot), 220)], "\n", " "))
+		}
+		summary := item.Summary
+		if strings.TrimSpace(summary) == "" {
+			summary = pageSummary
+		}
+		browserLines = append(browserLines, "- "+item.Label+" ["+item.Source+"]: "+summary+". Page: "+pageSummary+". Console: "+consoleExcerpt+". Network: "+networkExcerpt+". DOM: "+domExcerpt)
+	}
+	if len(browserLines) == 0 {
+		browserLines = append(browserLines, "- No browser dumps recorded yet.")
+	}
+
 	repoDirLines := []string{}
 	if repoMap != nil {
 		for _, item := range repoMap.TopDirectories[:min(len(repoMap.TopDirectories), 5)] {
@@ -880,6 +923,7 @@ func buildIssueContextPrompt(
 		"Prior fix history:\n" + strings.Join(fixLines, "\n") + "\n\n" +
 		"Ticket context:\n" + strings.Join(ticketLines, "\n") + "\n\n" +
 		"Threat model:\n" + strings.Join(threatLines, "\n") + "\n\n" +
+		"Browser context:\n" + strings.Join(browserLines, "\n") + "\n\n" +
 		"Structural context:\n" + strings.Join(repoDirLines, "\n") + "\n\n" +
 		"Ranked related paths:\n" + relatedLines + "\n\n" +
 		"Repository guidance:\n" + strings.Join(guidanceLines, "\n") + "\n\n" +

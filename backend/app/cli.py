@@ -8,14 +8,26 @@ from typing import Optional
 import typer
 
 from .models import (
+    BrowserDumpUpsertRequest,
+    DismissImprovementRequest,
     FixRecordRequest,
     FixUpdateRequest,
+    GitHubPRCreate,
+    IntegrationTestRequest,
+    IssueContextReplayRequest,
     IssueCreateRequest,
     IssueUpdateRequest,
+    PlanApproveRequest,
+    PlanRejectRequest,
+    PromoteSignalRequest,
     RunAcceptRequest,
     RunReviewRequest,
     RunbookUpsertRequest,
     SavedIssueViewRequest,
+    ThreatModelUpsertRequest,
+    TicketContextUpsertRequest,
+    VerificationProfileRunRequest,
+    VerificationProfileUpsertRequest,
     VerifyIssueRequest,
     WorkspaceLoadRequest,
 )
@@ -35,8 +47,53 @@ def _split_csv(value: str) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
+def _normalize_newlines(value: str) -> str:
+    return value.replace("\\n", "\n")
+
+
+def _read_text_input(value: str, file_path: str = "") -> str:
+    if file_path:
+        return Path(file_path).read_text(encoding="utf-8")
+    return _normalize_newlines(value)
+
+
+def _parse_json_value(value: str):
+    normalized = value.strip()
+    if not normalized:
+        return ""
+    try:
+        return json.loads(normalized)
+    except json.JSONDecodeError:
+        return value
+
+
+def _parse_settings(settings: list[str], settings_json: str = "") -> dict:
+    payload: dict = {}
+    if settings_json:
+        try:
+            parsed = json.loads(settings_json)
+        except json.JSONDecodeError as exc:
+            raise typer.BadParameter(f"Invalid --settings-json: {exc}") from exc
+        if not isinstance(parsed, dict):
+            raise typer.BadParameter("--settings-json must decode to an object")
+        payload.update(parsed)
+    for item in settings:
+        if "=" not in item:
+            raise typer.BadParameter(f"Invalid --setting value '{item}'. Expected key=value.")
+        key, raw_value = item.split("=", 1)
+        key = key.strip()
+        if not key:
+            raise typer.BadParameter(f"Invalid --setting value '{item}'. Key must not be empty.")
+        payload[key] = _parse_json_value(raw_value)
+    return payload
+
+
 def _is_final_run_status(status: str) -> bool:
     return status in {"completed", "failed", "cancelled"}
+
+
+def _echo_ok(**payload) -> None:
+    _echo_json({"ok": True, **payload})
 
 
 @app.command("health")
@@ -49,9 +106,26 @@ def capabilities() -> None:
     _echo_json(service.runtime_service.local_agent_capabilities().model_dump(mode="json"))
 
 
+@app.command("workspaces")
+def workspaces() -> None:
+    _echo_json([item.model_dump(mode="json") for item in service.list_workspaces()])
+
+
 @app.command("load-workspace")
-def load_workspace(root_path: str, name: str = typer.Option(default="")) -> None:
-    snapshot = service.load_workspace(WorkspaceLoadRequest(root_path=root_path, name=name or None, auto_scan=True))
+def load_workspace(
+    root_path: str,
+    name: str = typer.Option(default=""),
+    auto_scan: bool = typer.Option(default=True),
+    prefer_cached_snapshot: bool = typer.Option(default=True),
+) -> None:
+    snapshot = service.load_workspace(
+        WorkspaceLoadRequest(
+            root_path=root_path,
+            name=name or None,
+            auto_scan=auto_scan,
+            prefer_cached_snapshot=prefer_cached_snapshot,
+        )
+    )
     _echo_json(snapshot.model_dump(mode="json"))
 
 
@@ -229,6 +303,26 @@ def signals(
     _echo_json(payload)
 
 
+@app.command("signal-promote")
+def signal_promote(
+    workspace_id: str,
+    signal_id: str,
+    title: str = typer.Option(default=""),
+    severity: str = typer.Option(default=""),
+    labels: str = typer.Option(default=""),
+) -> None:
+    payload = service.promote_signal(
+        workspace_id,
+        signal_id,
+        PromoteSignalRequest(
+            title=title or None,
+            severity=severity or None,
+            labels=_split_csv(labels),
+        ),
+    )
+    _echo_json(payload.model_dump(mode="json"))
+
+
 @app.command("fixes")
 def fixes(workspace_id: str, issue_id: str = typer.Option(default="")) -> None:
     payload = [item.model_dump(mode="json") for item in service.list_fixes(workspace_id, issue_id=issue_id or None)]
@@ -282,6 +376,66 @@ def runbook_delete(workspace_id: str, runbook_id: str) -> None:
     _echo_json({"ok": True, "runbook_id": runbook_id})
 
 
+@app.command("verification-profiles")
+def verification_profiles(workspace_id: str) -> None:
+    payload = [item.model_dump(mode="json") for item in service.list_verification_profiles(workspace_id)]
+    _echo_json(payload)
+
+
+@app.command("verification-profile-save")
+def verification_profile_save(
+    workspace_id: str,
+    name: str = typer.Option(...),
+    test_command: str = typer.Option(...),
+    profile_id: str = typer.Option(default=""),
+    description: str = typer.Option(default=""),
+    coverage_command: str = typer.Option(default=""),
+    coverage_report_path: str = typer.Option(default=""),
+    coverage_format: str = typer.Option(default="unknown"),
+    max_runtime_seconds: int = typer.Option(default=30),
+    retry_count: int = typer.Option(default=1),
+    source_paths: str = typer.Option(default=""),
+) -> None:
+    payload = service.save_verification_profile(
+        workspace_id,
+        VerificationProfileUpsertRequest(
+            profile_id=profile_id or None,
+            name=name,
+            description=description,
+            test_command=_normalize_newlines(test_command),
+            coverage_command=_normalize_newlines(coverage_command) or None,
+            coverage_report_path=coverage_report_path or None,
+            coverage_format=coverage_format,
+            max_runtime_seconds=max_runtime_seconds,
+            retry_count=retry_count,
+            source_paths=_split_csv(source_paths),
+        ),
+    )
+    _echo_json(payload.model_dump(mode="json"))
+
+
+@app.command("verification-profile-delete")
+def verification_profile_delete(workspace_id: str, profile_id: str) -> None:
+    service.delete_verification_profile(workspace_id, profile_id)
+    _echo_ok(profile_id=profile_id)
+
+
+@app.command("verification-profile-run")
+def verification_profile_run(
+    workspace_id: str,
+    issue_id: str,
+    profile_id: str,
+    run_id: str = typer.Option(default=""),
+) -> None:
+    payload = service.run_issue_verification_profile(
+        workspace_id,
+        issue_id,
+        profile_id,
+        VerificationProfileRunRequest(run_id=run_id or None),
+    )
+    _echo_json(payload.model_dump(mode="json"))
+
+
 @app.command("sources")
 def sources(workspace_id: str) -> None:
     payload = [item.model_dump(mode="json") for item in service.read_sources(workspace_id)]
@@ -293,9 +447,54 @@ def drift(workspace_id: str) -> None:
     _echo_json(service.read_drift(workspace_id))
 
 
+@app.command("quality-get")
+def quality_get(workspace_id: str, issue_id: str) -> None:
+    _echo_json(service.get_issue_quality(workspace_id, issue_id))
+
+
+@app.command("quality-score")
+def quality_score(workspace_id: str, issue_id: str) -> None:
+    _echo_json(service.score_issue_quality(workspace_id, issue_id))
+
+
+@app.command("quality-score-all")
+def quality_score_all(workspace_id: str) -> None:
+    _echo_json(service.score_all_issues(workspace_id))
+
+
+@app.command("duplicates")
+def duplicates(workspace_id: str, issue_id: str) -> None:
+    _echo_json(service.find_duplicates(workspace_id, issue_id))
+
+
+@app.command("triage-issue")
+def triage_issue(workspace_id: str, issue_id: str) -> None:
+    _echo_json(service.triage_issue(workspace_id, issue_id))
+
+
+@app.command("triage-all")
+def triage_all(workspace_id: str) -> None:
+    _echo_json(service.triage_all_issues(workspace_id))
+
+
 @app.command("worktree")
 def worktree(workspace_id: str) -> None:
     _echo_json(service.read_worktree_status(workspace_id).model_dump(mode="json"))
+
+
+@app.command("tree")
+def tree(workspace_id: str, relative_path: str = typer.Option(default="")) -> None:
+    _echo_json(service.list_tree(workspace_id, relative_path))
+
+
+@app.command("guidance")
+def guidance(workspace_id: str) -> None:
+    _echo_json([item.model_dump(mode="json") for item in service.list_workspace_guidance(workspace_id)])
+
+
+@app.command("repo-map")
+def repo_map(workspace_id: str) -> None:
+    _echo_json(service.read_repo_map(workspace_id).model_dump(mode="json"))
 
 
 @app.command("issue-context")
@@ -310,6 +509,165 @@ def issue_work(
     runbook_id: str = typer.Option(default=""),
 ) -> None:
     _echo_json(service.issue_work(workspace_id, issue_id, runbook_id=runbook_id or None).model_dump(mode="json"))
+
+
+@app.command("ticket-contexts")
+def ticket_contexts(workspace_id: str, issue_id: str) -> None:
+    _echo_json([item.model_dump(mode="json") for item in service.list_ticket_contexts(workspace_id, issue_id)])
+
+
+@app.command("ticket-context-save")
+def ticket_context_save(
+    workspace_id: str,
+    issue_id: str,
+    title: str = typer.Option(...),
+    provider: str = typer.Option(default="manual"),
+    context_id: str = typer.Option(default=""),
+    external_id: str = typer.Option(default=""),
+    summary: str = typer.Option(default=""),
+    acceptance_criteria: str = typer.Option(default=""),
+    links: str = typer.Option(default=""),
+    labels: str = typer.Option(default=""),
+    status: str = typer.Option(default=""),
+    source_excerpt: str = typer.Option(default=""),
+) -> None:
+    payload = service.save_ticket_context(
+        workspace_id,
+        issue_id,
+        TicketContextUpsertRequest(
+            context_id=context_id or None,
+            provider=provider,
+            external_id=external_id or None,
+            title=title,
+            summary=_normalize_newlines(summary),
+            acceptance_criteria=_split_csv(acceptance_criteria),
+            links=_split_csv(links),
+            labels=_split_csv(labels),
+            status=status or None,
+            source_excerpt=_normalize_newlines(source_excerpt) or None,
+        ),
+    )
+    _echo_json(payload.model_dump(mode="json"))
+
+
+@app.command("ticket-context-delete")
+def ticket_context_delete(workspace_id: str, issue_id: str, context_id: str) -> None:
+    service.delete_ticket_context(workspace_id, issue_id, context_id)
+    _echo_ok(context_id=context_id)
+
+
+@app.command("threat-models")
+def threat_models(workspace_id: str, issue_id: str) -> None:
+    _echo_json([item.model_dump(mode="json") for item in service.list_threat_models(workspace_id, issue_id)])
+
+
+@app.command("threat-model-save")
+def threat_model_save(
+    workspace_id: str,
+    issue_id: str,
+    title: str = typer.Option(...),
+    methodology: str = typer.Option(default="manual"),
+    threat_model_id: str = typer.Option(default=""),
+    summary: str = typer.Option(default=""),
+    assets: str = typer.Option(default=""),
+    entry_points: str = typer.Option(default=""),
+    trust_boundaries: str = typer.Option(default=""),
+    abuse_cases: str = typer.Option(default=""),
+    mitigations: str = typer.Option(default=""),
+    references: str = typer.Option(default=""),
+    status: str = typer.Option(default="draft"),
+) -> None:
+    payload = service.save_threat_model(
+        workspace_id,
+        issue_id,
+        ThreatModelUpsertRequest(
+            threat_model_id=threat_model_id or None,
+            title=title,
+            methodology=methodology,
+            summary=_normalize_newlines(summary),
+            assets=_split_csv(assets),
+            entry_points=_split_csv(entry_points),
+            trust_boundaries=_split_csv(trust_boundaries),
+            abuse_cases=_split_csv(abuse_cases),
+            mitigations=_split_csv(mitigations),
+            references=_split_csv(references),
+            status=status,
+        ),
+    )
+    _echo_json(payload.model_dump(mode="json"))
+
+
+@app.command("threat-model-delete")
+def threat_model_delete(workspace_id: str, issue_id: str, threat_model_id: str) -> None:
+    service.delete_threat_model(workspace_id, issue_id, threat_model_id)
+    _echo_ok(threat_model_id=threat_model_id)
+
+
+@app.command("context-replays")
+def context_replays(workspace_id: str, issue_id: str) -> None:
+    _echo_json([item.model_dump(mode="json") for item in service.list_issue_context_replays(workspace_id, issue_id)])
+
+
+@app.command("context-replay-capture")
+def context_replay_capture(
+    workspace_id: str,
+    issue_id: str,
+    label: str = typer.Option(default=""),
+) -> None:
+    payload = service.capture_issue_context_replay(
+        workspace_id,
+        issue_id,
+        IssueContextReplayRequest(label=label or None),
+    )
+    _echo_json(payload.model_dump(mode="json"))
+
+
+@app.command("browser-dumps")
+def browser_dumps(workspace_id: str, issue_id: str) -> None:
+    _echo_json([item.model_dump(mode="json") for item in service.list_browser_dumps(workspace_id, issue_id)])
+
+
+@app.command("browser-dump-save")
+def browser_dump_save(
+    workspace_id: str,
+    issue_id: str,
+    label: str = typer.Option(...),
+    source: str = typer.Option(default="mcp-chrome"),
+    dump_id: str = typer.Option(default=""),
+    page_url: str = typer.Option(default=""),
+    page_title: str = typer.Option(default=""),
+    summary: str = typer.Option(default=""),
+    dom_snapshot: str = typer.Option(default=""),
+    dom_snapshot_file: str = typer.Option(default=""),
+    console_message: list[str] = typer.Option([], "--console-message"),
+    network_request: list[str] = typer.Option([], "--network-request"),
+    screenshot_path: str = typer.Option(default=""),
+    notes: str = typer.Option(default=""),
+) -> None:
+    payload = service.save_browser_dump(
+        workspace_id,
+        issue_id,
+        BrowserDumpUpsertRequest(
+            dump_id=dump_id or None,
+            source=source,
+            label=label,
+            page_url=page_url or None,
+            page_title=page_title or None,
+            summary=_normalize_newlines(summary),
+            dom_snapshot=_read_text_input(dom_snapshot, dom_snapshot_file),
+            console_messages=[_normalize_newlines(item) for item in console_message],
+            network_requests=[_normalize_newlines(item) for item in network_request],
+            screenshot_path=screenshot_path or None,
+            notes=_normalize_newlines(notes) or None,
+        ),
+    )
+    _echo_json(payload.model_dump(mode="json"))
+
+
+@app.command("browser-dump-delete")
+def browser_dump_delete(workspace_id: str, issue_id: str, dump_id: str) -> None:
+    service.delete_browser_dump(workspace_id, issue_id, dump_id)
+    _echo_ok(dump_id=dump_id)
 
 
 @app.command("issue-drift")
@@ -411,6 +769,43 @@ def verify_bug(
     _echo_json(payload.model_dump(mode="json"))
 
 
+@app.command("test-suggestions")
+def test_suggestions(workspace_id: str, issue_id: str) -> None:
+    _echo_json(service.get_test_suggestions(workspace_id, issue_id))
+
+
+@app.command("test-suggestions-generate")
+def test_suggestions_generate(workspace_id: str, issue_id: str) -> None:
+    _echo_json(service.generate_test_suggestions(workspace_id, issue_id))
+
+
+@app.command("coverage-parse")
+def coverage_parse(
+    workspace_id: str,
+    report_path: str = typer.Option(...),
+    run_id: str = typer.Option(default=""),
+    issue_id: str = typer.Option(default=""),
+) -> None:
+    _echo_json(service.parse_coverage_report(workspace_id, report_path, run_id or None, issue_id or None))
+
+
+@app.command("coverage-get")
+def coverage_get(
+    workspace_id: str,
+    issue_id: str = typer.Option(default=""),
+    run_id: str = typer.Option(default=""),
+) -> None:
+    payload = service.get_coverage(workspace_id, issue_id or None, run_id or None)
+    if payload is None:
+        raise typer.BadParameter("No coverage data found for the requested filters")
+    _echo_json(payload)
+
+
+@app.command("coverage-delta")
+def coverage_delta(workspace_id: str, issue_id: str) -> None:
+    _echo_json(service.get_coverage_delta(workspace_id, issue_id))
+
+
 @app.command("fix-update")
 def fix_update(
     workspace_id: str,
@@ -431,6 +826,41 @@ def fix_update(
     _echo_json(payload.model_dump(mode="json"))
 
 
+@app.command("critique-generate")
+def critique_generate(workspace_id: str, run_id: str) -> None:
+    _echo_json(service.generate_patch_critique(workspace_id, run_id))
+
+
+@app.command("critique-get")
+def critique_get(workspace_id: str, run_id: str) -> None:
+    payload = service.get_patch_critique(workspace_id, run_id)
+    if payload is None:
+        raise typer.BadParameter(f"No critique found for run: {run_id}")
+    _echo_json(payload)
+
+
+@app.command("improvements")
+def improvements(workspace_id: str, run_id: str) -> None:
+    _echo_json(service.get_run_improvements(workspace_id, run_id))
+
+
+@app.command("improvement-dismiss")
+def improvement_dismiss(
+    workspace_id: str,
+    run_id: str,
+    suggestion_id: str,
+    reason: str = typer.Option(default=""),
+) -> None:
+    _echo_json(
+        service.dismiss_improvement(
+            workspace_id,
+            run_id,
+            suggestion_id,
+            DismissImprovementRequest(reason=reason or None),
+        )
+    )
+
+
 @app.command("run-start")
 def run_start(
     workspace_id: str,
@@ -439,6 +869,7 @@ def run_start(
     model: str = typer.Option(...),
     instruction: str = typer.Option(default=""),
     runbook_id: str = typer.Option(default=""),
+    planning: bool = typer.Option(default=False),
 ) -> None:
     payload = service.start_issue_run(
         workspace_id,
@@ -447,6 +878,7 @@ def run_start(
         model,
         instruction or None,
         runbook_id or None,
+        planning,
     )
     _echo_json(payload)
 
@@ -480,6 +912,11 @@ def run_get(workspace_id: str, run_id: str) -> None:
     _echo_json(service.get_run(workspace_id, run_id))
 
 
+@app.command("run-insights")
+def run_insights(workspace_id: str, run_id: str) -> None:
+    _echo_json(service.get_run_session_insight(workspace_id, run_id))
+
+
 @app.command("run-log")
 def run_log(workspace_id: str, run_id: str, offset: int = typer.Option(default=0)) -> None:
     _echo_json(service.read_run_log(workspace_id, run_id, offset))
@@ -508,6 +945,30 @@ def run_cancel(workspace_id: str, run_id: str) -> None:
 @app.command("run-retry")
 def run_retry(workspace_id: str, run_id: str) -> None:
     _echo_json(service.retry_run(workspace_id, run_id))
+
+
+@app.command("plan-generate")
+def plan_generate(workspace_id: str, run_id: str) -> None:
+    _echo_json(service.generate_run_plan(workspace_id, run_id))
+
+
+@app.command("plan-get")
+def plan_get(workspace_id: str, run_id: str) -> None:
+    _echo_json(service.get_run_plan(workspace_id, run_id))
+
+
+@app.command("plan-approve")
+def plan_approve(
+    workspace_id: str,
+    run_id: str,
+    feedback: str = typer.Option(default=""),
+) -> None:
+    _echo_json(service.approve_run_plan(workspace_id, run_id, PlanApproveRequest(feedback=feedback or None)))
+
+
+@app.command("plan-reject")
+def plan_reject(workspace_id: str, run_id: str, reason: str = typer.Option(...)) -> None:
+    _echo_json(service.reject_run_plan(workspace_id, run_id, PlanRejectRequest(reason=reason)))
 
 
 @app.command("run-review")
@@ -541,6 +1002,21 @@ def review_accept(
         RunAcceptRequest(issue_status=issue_status or None, notes=notes or None),
     )
     _echo_json(payload.model_dump(mode="json"))
+
+
+@app.command("run-metrics")
+def run_metrics(workspace_id: str, run_id: str) -> None:
+    _echo_json(service.get_run_metrics(workspace_id, run_id))
+
+
+@app.command("workspace-metrics")
+def workspace_metrics(workspace_id: str) -> None:
+    _echo_json(service.list_workspace_metrics(workspace_id))
+
+
+@app.command("costs")
+def costs(workspace_id: str) -> None:
+    _echo_json(service.get_workspace_cost_summary(workspace_id))
 
 
 @app.command("views")
@@ -615,6 +1091,125 @@ def view_update(
 def view_delete(workspace_id: str, view_id: str) -> None:
     service.delete_saved_view(workspace_id, view_id)
     _echo_json({"ok": True, "view_id": view_id})
+
+
+@app.command("integrations")
+def integrations(workspace_id: str) -> None:
+    _echo_json(service.get_integration_configs(workspace_id))
+
+
+@app.command("integration-configure")
+def integration_configure(
+    workspace_id: str,
+    provider: str,
+    setting: list[str] = typer.Option([], "--setting"),
+    settings_json: str = typer.Option("", "--settings-json"),
+) -> None:
+    _echo_json(service.configure_integration(workspace_id, provider, _parse_settings(setting, settings_json)))
+
+
+@app.command("integration-test")
+def integration_test(
+    provider: str,
+    setting: list[str] = typer.Option([], "--setting"),
+    settings_json: str = typer.Option("", "--settings-json"),
+) -> None:
+    payload = service.test_integration(
+        IntegrationTestRequest(
+            provider=provider,
+            settings=_parse_settings(setting, settings_json),
+        )
+    )
+    _echo_json(payload)
+
+
+@app.command("github-import")
+def github_import(workspace_id: str, repo: str, state: str = typer.Option(default="open")) -> None:
+    _echo_json(service.import_github_issues(workspace_id, repo, state=state))
+
+
+@app.command("github-pr")
+def github_pr(
+    workspace_id: str,
+    run_id: str,
+    issue_id: str,
+    head_branch: str,
+    base_branch: str = typer.Option(default="main"),
+    title: str = typer.Option(default=""),
+    body: str = typer.Option(default=""),
+    draft: bool = typer.Option(default=False),
+) -> None:
+    _echo_json(
+        service.create_github_pr(
+            workspace_id,
+            GitHubPRCreate(
+                workspace_id=workspace_id,
+                run_id=run_id,
+                issue_id=issue_id,
+                head_branch=head_branch,
+                base_branch=base_branch,
+                title=title or None,
+                body=body or None,
+                draft=draft,
+            ),
+        )
+    )
+
+
+@app.command("slack-notify")
+def slack_notify(workspace_id: str, event: str, message: str = typer.Option(default="")) -> None:
+    _echo_json(service.send_slack_notification(workspace_id, event, message=message or None))
+
+
+@app.command("linear-sync")
+def linear_sync(workspace_id: str, issue_id: str) -> None:
+    _echo_json(service.sync_issue_to_linear(workspace_id, issue_id))
+
+
+@app.command("jira-sync")
+def jira_sync(workspace_id: str, issue_id: str) -> None:
+    _echo_json(service.sync_issue_to_jira(workspace_id, issue_id))
+
+
+@app.command("terminal-open")
+def terminal_open(
+    workspace_id: str,
+    cols: int = typer.Option(default=120),
+    rows: int = typer.Option(default=36),
+    terminal_id: str = typer.Option(default=""),
+) -> None:
+    _echo_json(service.open_terminal(workspace_id, cols, rows, terminal_id or None))
+
+
+@app.command("terminal-write")
+def terminal_write(terminal_id: str, data: str = typer.Option(...)) -> None:
+    service.terminal_write(terminal_id, _normalize_newlines(data))
+    _echo_ok(terminal_id=terminal_id)
+
+
+@app.command("terminal-resize")
+def terminal_resize(
+    terminal_id: str,
+    cols: int = typer.Option(...),
+    rows: int = typer.Option(...),
+) -> None:
+    service.terminal_resize(terminal_id, cols, rows)
+    _echo_ok(terminal_id=terminal_id)
+
+
+@app.command("terminal-read")
+def terminal_read(
+    workspace_id: str,
+    terminal_id: str,
+    offset: int = typer.Option(default=0),
+) -> None:
+    _echo_json(service.terminal_read(workspace_id, terminal_id, offset))
+
+
+@app.command("terminal-close")
+def terminal_close(terminal_id: str) -> None:
+    service.terminal_close(terminal_id)
+    _echo_ok(terminal_id=terminal_id)
 
 
 @app.command("smoke")

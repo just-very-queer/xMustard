@@ -284,6 +284,7 @@ export type IssueContextPacket = {
   available_verification_profiles: VerificationProfileRecord[]
   ticket_contexts: TicketContextRecord[]
   threat_models: ThreatModelRecord[]
+  browser_dumps: BrowserDumpRecord[]
   repo_map?: RepoMapSummary | null
   worktree?: WorktreeStatus | null
   prompt: string
@@ -506,6 +507,38 @@ export type IssueContextReplayRecord = {
   verification_profile_ids: string[]
   ticket_context_ids: string[]
   created_at: string
+}
+
+export type BrowserDumpRecord = {
+  dump_id: string
+  workspace_id: string
+  issue_id: string
+  source: 'mcp-chrome' | 'manual' | 'playwright' | 'other'
+  label: string
+  page_url?: string | null
+  page_title?: string | null
+  summary: string
+  dom_snapshot: string
+  console_messages: string[]
+  network_requests: string[]
+  screenshot_path?: string | null
+  notes?: string | null
+  created_at: string
+  updated_at: string
+}
+
+export type BrowserDumpUpsertRequest = {
+  dump_id?: string
+  source?: BrowserDumpRecord['source']
+  label: string
+  page_url?: string | null
+  page_title?: string | null
+  summary?: string
+  dom_snapshot?: string
+  console_messages?: string[]
+  network_requests?: string[]
+  screenshot_path?: string | null
+  notes?: string | null
 }
 
 export type RunReviewDisposition = 'dismissed' | 'investigation_only'

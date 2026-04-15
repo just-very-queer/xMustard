@@ -15,6 +15,7 @@ The current product already supports:
 - triage analysis: quality scoring, duplicate detection, triage suggestions
 - verification artifacts: coverage deltas, test suggestions, patch critique, improvement suggestions
 - issue-level threat models with assets, trust boundaries, abuse cases, and mitigations
+- issue-level browser dumps for MCP/manual browser-state capture and shared UI debugging context
 - repository guidance discovery from files like `AGENTS.md`, `CONVENTIONS.md`, `.devin/wiki.json`, `.openhands/skills/*.md`, and `.openhands/microagents/repo.md`
 - run insights that summarize what guidance shaped a run and what risks remain
 
@@ -50,6 +51,12 @@ The Go shell now owns most day-to-day app flows, including:
 - verification profiles, coverage, ticket context, and threat models
 - run creation, workspace query runs, run reads, review flows, plans, metrics, critique, and improvements
 - runtime/settings routes and terminal transport
+
+The Python CLI now mirrors the tracker and review surface much more closely too, including:
+
+- verification profiles, ticket context, threat models, context replays, and browser dumps
+- plan, metrics, coverage, critique, and improvement flows
+- integrations, tree/guidance/repo-map inspection, and terminal transport
 
 The main remaining migration slice is provider integrations:
 

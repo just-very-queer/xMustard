@@ -55,6 +55,9 @@ func TestWorkspaceLifecycleListLoadExportAndWorktree(t *testing.T) {
 	if exported.Workspace.WorkspaceID != workspaceID || exported.Snapshot.Workspace.WorkspaceID != workspaceID {
 		t.Fatalf("unexpected export payload: %#v", exported)
 	}
+	if len(exported.BrowserDumps) != 1 || exported.BrowserDumps[0].DumpID != "browser-1" {
+		t.Fatalf("expected exported browser dumps, got %#v", exported.BrowserDumps)
+	}
 	if exported.ExportedAt == "" {
 		t.Fatalf("expected export timestamp")
 	}
