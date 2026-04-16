@@ -648,6 +648,152 @@ fn resolve_report_path(workspace_root: &Path, report_path: Option<&str>) -> Opti
     Some(workspace_root.join(candidate))
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MigrationVerificationResult {
+    pub risks: Vec<String>,
+    pub recommended_contract: String,
+    pub unix_constraints: Vec<String>,
+}
+
+pub fn run_migration_verification(
+    workspace_root: &Path,
+    command: &str,
+    timeout_seconds: u64,
+) -> Result<MigrationVerificationResult, std::io::Error> {
+    let mut shell_cmd = if cfg!(target_os = "windows") {
+        let mut cmd = Command::new("cmd");
+        cmd.arg("/C").arg(command);
+        cmd
+    } else {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-lc").arg(command);
+        cmd
+    };
+
+    let resolved_cwd = workspace_root.canonicalize().unwrap_or_else(|_| workspace_root.to_path_buf());
+    let started_at = Instant::now();
+    let timeout = Duration::from_secs(timeout_seconds.max(1));
+
+    let mut child = shell_cmd
+        .current_dir(&resolved_cwd)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    loop {
+        if let Some(status) = child.try_wait()? {
+            let output = child.wait_with_output()?;
+            let exit_code = status.code();
+            let success = status.success();
+            let elapsed = started_at.elapsed();
+            return Ok(build_migration_result(
+                command,
+                &resolved_cwd,
+                exit_code,
+                success,
+                false,
+                elapsed,
+                String::from_utf8_lossy(&output.stdout).as_ref(),
+                String::from_utf8_lossy(&output.stderr).as_ref(),
+            ));
+        }
+
+        if started_at.elapsed() >= timeout {
+            let _ = child.kill();
+            let output = child.wait_with_output()?;
+            let elapsed = started_at.elapsed();
+            return Ok(build_migration_result(
+                command,
+                &resolved_cwd,
+                output.status.code(),
+                false,
+                true,
+                elapsed,
+                String::from_utf8_lossy(&output.stdout).as_ref(),
+                String::from_utf8_lossy(&output.stderr).as_ref(),
+            ));
+        }
+
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn build_migration_result(
+    command: &str,
+    cwd: &Path,
+    exit_code: Option<i32>,
+    success: bool,
+    timed_out: bool,
+    duration: Duration,
+    stdout: &str,
+    stderr: &str,
+) -> MigrationVerificationResult {
+    let mut risks = Vec::new();
+
+    if timed_out {
+        risks.push("verification_timed_out".to_string());
+    }
+
+    if !success && !timed_out {
+        if let Some(code) = exit_code {
+            risks.push(format!("exit_code_{}", code));
+        }
+    }
+
+    let stderr_lower = stderr.to_lowercase();
+    if stderr_lower.contains("error") || stderr_lower.contains("failed") {
+        risks.push("stderr_indicates_failure".to_string());
+    }
+
+    let stdout_trunc = truncate_excerpt(stdout, 2000);
+    let stderr_trunc = truncate_excerpt(stderr, 2000);
+
+    if stdout_trunc.len() > 1800 || stderr_trunc.len() > 1800 {
+        risks.push("excessive_output_may_mask_issues".to_string());
+    }
+
+    let recommended_contract = format!(
+        r#"{{"command":"{}","cwd":"{}","exit_code":{:?},"success":{},"timed_out":{},"duration_ms":{},"stdout_excerpt":"{}","stderr_excerpt":"{}"}}"#,
+        command,
+        cwd.to_string_lossy(),
+        exit_code,
+        success,
+        timed_out,
+        duration.as_millis().min(u128::from(u64::MAX)) as u64,
+        escape_json(&stdout_trunc),
+        escape_excerpt(&stderr_trunc),
+    );
+
+    let mut unix_constraints = Vec::new();
+    unix_constraints.push("timeout_seconds_required".to_string());
+    unix_constraints.push("cwd_must_exist".to_string());
+    unix_constraints.push("command_string_passed_to_shell".to_string());
+
+    if cfg!(target_os = "windows") {
+        unix_constraints.push("windows_cmd_shell_syntax".to_string());
+    } else {
+        unix_constraints.push("posix_shell_syntax".to_string());
+    }
+
+    MigrationVerificationResult {
+        risks,
+        recommended_contract,
+        unix_constraints,
+    }
+}
+
+fn escape_json(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
+}
+
+fn escape_excerpt(s: &str) -> String {
+    escape_json(s)
+}
+
 fn empty_coverage_result(
     workspace_id: &str,
     run_id: Option<&str>,
@@ -679,8 +825,8 @@ fn empty_coverage_result(
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_cobertura_content, parse_istanbul_content, parse_lcov_content, run_verification_command,
-        run_verification_profile, RustVerificationProfileInput,
+        parse_cobertura_content, parse_istanbul_content, parse_lcov_content, run_migration_verification,
+        run_verification_command, run_verification_profile, RustVerificationProfileInput,
     };
     use chrono::Utc;
     use tempfile::TempDir;
@@ -813,5 +959,38 @@ mod tests {
         assert!(result.coverage_command_result.as_ref().is_some_and(|item| item.success));
         assert_eq!(result.coverage_result.as_ref().map(|item| item.format.as_str()), Some("lcov"));
         assert_eq!(result.coverage_result.as_ref().map(|item| item.lines_covered), Some(1));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn runs_migration_verification_and_returns_contract() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let result = run_migration_verification(temp_dir.path(), "printf 'ok\\n'", 2).expect("should run");
+
+        assert!(result.risks.is_empty());
+        assert!(result.recommended_contract.contains("\"success\":true"));
+        assert!(result.recommended_contract.contains("exit_code\":"));
+        assert!(result.unix_constraints.contains(&"timeout_seconds_required".to_string()));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn migration_verification_captures_failure_risks() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let result = run_migration_verification(temp_dir.path(), "printf 'error\\n' 1>&2; exit 1", 2).expect("should run");
+
+        assert!(result.risks.contains(&"exit_code_1".to_string()));
+        assert!(result.risks.contains(&"stderr_indicates_failure".to_string()));
+        assert!(result.recommended_contract.contains("\"success\":false"));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn migration_verification_marks_timeout_risk() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let result = run_migration_verification(temp_dir.path(), "sleep 3", 1).expect("should run");
+
+        assert!(result.risks.contains(&"verification_timed_out".to_string()));
+        assert!(result.recommended_contract.contains("\"timed_out\":true"));
     }
 }
