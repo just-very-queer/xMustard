@@ -16,7 +16,7 @@
     "group": "workspace_snapshot",
     "current_owner": "api-go",
     "target_owner": "api-go",
-    "notes": "Workspace loading, snapshots, activity, sources, tree, guidance, and export. The Go shell now owns workspace listing, fresh and cached workspace load, explicit workspace scan, snapshot reads, activity feeds, activity overview, sources, worktree reads, tree browsing, guidance discovery, repo-map reads, export bundle reads, and saved-view CRUD against the existing tracker workspace artifacts.",
+    "notes": "Workspace loading, snapshots, activity, sources, tree, guidance, repo config, and export. The Go shell now owns workspace listing, fresh and cached workspace load, explicit workspace scan, snapshot reads, activity feeds, activity overview, sources, worktree reads, tree browsing, guidance discovery, repo-config reads, repo-map reads, export bundle reads, and saved-view CRUD against the existing tracker workspace artifacts.",
     "endpoints": [
       "/api/workspaces",
       "/api/workspaces/load",
@@ -28,6 +28,8 @@
       "/api/workspaces/{workspace_id}/scan",
       "/api/workspaces/{workspace_id}/tree",
       "/api/workspaces/{workspace_id}/guidance",
+      "/api/workspaces/{workspace_id}/repo-config",
+      "/api/workspaces/{workspace_id}/repo-config/health",
       "/api/workspaces/{workspace_id}/repo-map",
       "/api/workspaces/{workspace_id}/export"
     ]
@@ -54,17 +56,23 @@
     "group": "issue_context_and_artifacts",
     "current_owner": "backend/app/main.py + backend/app/service.py",
     "target_owner": "api-go + rust-core",
-    "notes": "Issue context packets, runbooks, verification profiles, ticket context, threat models, browser dumps, and replay records. The Go shell now owns runbook CRUD, context, work, verification-profile execution, verification profile CRUD, ticket context CRUD, threat-model CRUD, browser-dump CRUD, and context replay CRUD against the existing tracker artifacts.",
+    "notes": "Issue context packets, runbooks, verification profiles, ticket context, threat models, browser dumps, replay records, and eval scenarios. The Go shell now owns runbook CRUD, context, work, verification-profile execution, verification profile CRUD, verification profile history/report reads, eval scenario CRUD/report/replay reads, ticket context CRUD, threat-model CRUD, browser-dump CRUD, and context replay CRUD against the existing tracker artifacts.",
     "endpoints": [
       "/api/workspaces/{workspace_id}/runbooks",
       "/api/workspaces/{workspace_id}/verification-profiles",
+      "/api/workspaces/{workspace_id}/verification-profile-history",
+      "/api/workspaces/{workspace_id}/verification-profile-reports",
+      "/api/workspaces/{workspace_id}/eval-scenarios",
+      "/api/workspaces/{workspace_id}/eval-report",
+      "/api/workspaces/{workspace_id}/issues/{issue_id}/eval-scenarios/replay",
       "/api/workspaces/{workspace_id}/issues/{issue_id}/verification-profiles/{profile_id}/run",
       "/api/workspaces/{workspace_id}/issues/{issue_id}/context",
       "/api/workspaces/{workspace_id}/issues/{issue_id}/work",
       "/api/workspaces/{workspace_id}/issues/{issue_id}/ticket-context",
       "/api/workspaces/{workspace_id}/issues/{issue_id}/threat-models",
       "/api/workspaces/{workspace_id}/issues/{issue_id}/browser-dumps",
-      "/api/workspaces/{workspace_id}/issues/{issue_id}/context-replays"
+      "/api/workspaces/{workspace_id}/issues/{issue_id}/context-replays",
+      "/api/workspaces/{workspace_id}/issues/{issue_id}/context-replays/{replay_id}/compare"
     ]
   },
   {

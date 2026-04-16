@@ -58,6 +58,8 @@ Inputs:
 Processing:
 
 - discover supported guidance files
+- report workspace guidance health
+- generate starter guidance files for common instruction surfaces
 - summarize them into structured `RepoGuidanceRecord` entries
 - attach them to issue context packets
 - store `guidance_paths` on runs

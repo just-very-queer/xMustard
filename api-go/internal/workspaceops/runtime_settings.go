@@ -6,8 +6,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
+
+	"xmustard/api-go/internal/rustcore"
 )
 
 type RuntimeModel struct {
@@ -54,11 +57,13 @@ type RuntimeProbeResult struct {
 }
 
 type RunRequest struct {
-	Runtime     string  `json:"runtime"`
-	Model       string  `json:"model"`
-	Instruction *string `json:"instruction"`
-	RunbookID   *string `json:"runbook_id"`
-	Planning    bool    `json:"planning"`
+	Runtime           string  `json:"runtime"`
+	Model             string  `json:"model"`
+	Instruction       *string `json:"instruction"`
+	RunbookID         *string `json:"runbook_id"`
+	EvalScenarioID    *string `json:"eval_scenario_id"`
+	EvalReplayBatchID *string `json:"eval_replay_batch_id"`
+	Planning          bool    `json:"planning"`
 }
 
 type AgentQueryRequest struct {
@@ -240,7 +245,7 @@ func ProbeRuntime(dataDir string, workspaceID string, runtime string, model stri
 }
 
 func StartIssueRun(dataDir string, workspaceID string, issueID string, request RunRequest) (*runRecord, error) {
-	packet, err := BuildIssueWorkPacket(dataDir, workspaceID, issueID, firstNonEmptyPtr(request.RunbookID))
+	packet, scenario, err := buildIssueWorkPacketForRun(dataDir, workspaceID, issueID, request)
 	if err != nil {
 		return nil, err
 	}
@@ -257,33 +262,48 @@ func StartIssueRun(dataDir string, workspaceID string, issueID string, request R
 	}
 	runID := "run_" + hashID(workspaceID, issueID, nowUTC())[:12]
 	run := &runRecord{
-		RunID:          runID,
-		WorkspaceID:    workspaceID,
-		IssueID:        issueID,
-		Runtime:        request.Runtime,
-		Model:          request.Model,
-		Status:         map[bool]string{true: "planning", false: "queued"}[request.Planning],
-		Title:          request.Runtime + ":" + issueID,
-		Prompt:         prompt,
-		Command:        command,
-		CommandPreview: shellPreview(command),
-		LogPath:        filepath.Join(dataDir, "workspaces", workspaceID, "runs", runID+".log"),
-		OutputPath:     filepath.Join(dataDir, "workspaces", workspaceID, "runs", runID+".out.json"),
-		CreatedAt:      nowUTC(),
-		RunbookID:      trimOptional(request.RunbookID),
-		Worktree:       packet.Worktree,
-		GuidancePaths:  guidancePaths(packet.Guidance),
+		RunID:             runID,
+		WorkspaceID:       workspaceID,
+		IssueID:           issueID,
+		Runtime:           request.Runtime,
+		Model:             request.Model,
+		Status:            map[bool]string{true: "planning", false: "queued"}[request.Planning],
+		Title:             request.Runtime + ":" + issueID,
+		Prompt:            prompt,
+		Command:           command,
+		CommandPreview:    shellPreview(command),
+		LogPath:           filepath.Join(dataDir, "workspaces", workspaceID, "runs", runID+".log"),
+		OutputPath:        filepath.Join(dataDir, "workspaces", workspaceID, "runs", runID+".out.json"),
+		CreatedAt:         nowUTC(),
+		RunbookID:         trimOptional(request.RunbookID),
+		EvalScenarioID:    trimOptional(request.EvalScenarioID),
+		EvalReplayBatchID: trimOptional(request.EvalReplayBatchID),
+		Worktree:          packet.Worktree,
+		GuidancePaths:     guidancePaths(packet.Guidance),
 	}
 	if err := saveRunRecord(dataDir, *run); err != nil {
 		return nil, err
+	}
+	if scenario != nil {
+		if err := recordEvalScenarioRun(dataDir, workspaceID, *scenario, runID); err != nil {
+			return nil, err
+		}
 	}
 	if !request.Planning {
 		startManagedRun(dataDir, *run, packet.Workspace.RootPath)
 	}
 	action := map[bool]string{true: "run.planning", false: "run.queued"}[request.Planning]
+	evalSuffix := ""
+	if request.EvalScenarioID != nil && strings.TrimSpace(*request.EvalScenarioID) != "" {
+		evalSuffix = " via eval scenario " + strings.TrimSpace(*request.EvalScenarioID)
+	}
+	batchSuffix := ""
+	if request.EvalReplayBatchID != nil && strings.TrimSpace(*request.EvalReplayBatchID) != "" {
+		batchSuffix = " in replay batch " + strings.TrimSpace(*request.EvalReplayBatchID)
+	}
 	summary := map[bool]string{
-		true:  fmt.Sprintf("Started %s run with planning for %s", request.Runtime, issueID),
-		false: fmt.Sprintf("Queued %s run for %s", request.Runtime, issueID),
+		true:  fmt.Sprintf("Started %s run with planning for %s%s%s", request.Runtime, issueID, evalSuffix, batchSuffix),
+		false: fmt.Sprintf("Queued %s run for %s%s%s", request.Runtime, issueID, evalSuffix, batchSuffix),
 	}[request.Planning]
 	if err := appendRunActivityWithActor(
 		dataDir,
@@ -300,11 +320,187 @@ func StartIssueRun(dataDir string, workspaceID string, issueID string, request R
 			Key:     "agent:" + request.Runtime + ":" + request.Model,
 			Label:   request.Runtime + ":" + request.Model,
 		},
-		map[string]any{"runtime": request.Runtime, "model": request.Model, "runbook_id": request.RunbookID, "planning": request.Planning},
+		map[string]any{"runtime": request.Runtime, "model": request.Model, "runbook_id": request.RunbookID, "planning": request.Planning, "eval_scenario_id": request.EvalScenarioID, "eval_replay_batch_id": request.EvalReplayBatchID},
 	); err != nil {
 		return nil, err
 	}
 	return run, nil
+}
+
+func buildIssueWorkPacketForRun(
+	dataDir string,
+	workspaceID string,
+	issueID string,
+	request RunRequest,
+) (*IssueContextPacket, *EvalScenarioRecord, error) {
+	if request.EvalScenarioID == nil || strings.TrimSpace(*request.EvalScenarioID) == "" {
+		packet, err := BuildIssueWorkPacket(dataDir, workspaceID, issueID, firstNonEmptyPtr(request.RunbookID))
+		return packet, nil, err
+	}
+	scenarioID := strings.TrimSpace(*request.EvalScenarioID)
+	scenarios, err := loadEvalScenarios(dataDir, workspaceID)
+	if err != nil {
+		return nil, nil, err
+	}
+	var scenario *EvalScenarioRecord
+	for idx := range scenarios {
+		if scenarios[idx].ScenarioID == scenarioID {
+			scenario = &scenarios[idx]
+			break
+		}
+	}
+	if scenario == nil {
+		return nil, nil, os.ErrNotExist
+	}
+	if scenario.IssueID != issueID {
+		return nil, nil, fmt.Errorf("eval scenario %s does not belong to issue %s", scenarioID, issueID)
+	}
+	packet, err := BuildIssueContextPacket(dataDir, workspaceID, issueID)
+	if err != nil {
+		return nil, nil, err
+	}
+	packet = applyEvalScenarioToPacket(packet, *scenario)
+	if runbookID := firstNonEmptyPtr(request.RunbookID); runbookID != "" {
+		runbook, err := resolveRunbook(dataDir, workspaceID, runbookID)
+		if err != nil {
+			return nil, nil, err
+		}
+		packet.Runbook = renderRunbookSteps(runbook.Template)
+		packet.Prompt = packet.Prompt + "\n\nSelected runbook: " + runbook.Name + "\n" + strings.TrimSpace(runbook.Template)
+	}
+	return packet, scenario, nil
+}
+
+func applyEvalScenarioToPacket(packet *IssueContextPacket, scenario EvalScenarioRecord) *IssueContextPacket {
+	guidance := packet.Guidance
+	if len(scenario.GuidancePaths) > 0 {
+		lookup := map[string]RepoGuidanceRecord{}
+		for _, item := range packet.Guidance {
+			lookup[item.Path] = item
+		}
+		guidance = []RepoGuidanceRecord{}
+		for _, path := range scenario.GuidancePaths {
+			if item, ok := lookup[path]; ok {
+				guidance = append(guidance, item)
+			}
+		}
+	}
+	verificationProfiles := packet.AvailableVerificationProfiles
+	if len(scenario.VerificationProfileIDs) > 0 {
+		lookup := map[string]rustcore.VerificationProfileInput{}
+		for _, item := range packet.AvailableVerificationProfiles {
+			lookup[item.ProfileID] = item
+		}
+		verificationProfiles = []rustcore.VerificationProfileInput{}
+		for _, profileID := range scenario.VerificationProfileIDs {
+			if item, ok := lookup[profileID]; ok {
+				verificationProfiles = append(verificationProfiles, item)
+			}
+		}
+	}
+	ticketContexts := packet.TicketContexts
+	if len(scenario.TicketContextIDs) > 0 {
+		lookup := map[string]TicketContextRecord{}
+		for _, item := range packet.TicketContexts {
+			lookup[item.ContextID] = item
+		}
+		ticketContexts = []TicketContextRecord{}
+		for _, contextID := range scenario.TicketContextIDs {
+			if item, ok := lookup[contextID]; ok {
+				ticketContexts = append(ticketContexts, item)
+			}
+		}
+	}
+	browserDumps := packet.BrowserDumps
+	if len(scenario.BrowserDumpIDs) > 0 {
+		lookup := map[string]BrowserDumpRecord{}
+		for _, item := range packet.BrowserDumps {
+			lookup[item.DumpID] = item
+		}
+		browserDumps = []BrowserDumpRecord{}
+		for _, dumpID := range scenario.BrowserDumpIDs {
+			if item, ok := lookup[dumpID]; ok {
+				browserDumps = append(browserDumps, item)
+			}
+		}
+	}
+	summaryLines := []string{
+		"Evaluation scenario: " + scenario.Name,
+		"Scenario id: " + scenario.ScenarioID,
+	}
+	if scenario.Description != nil && strings.TrimSpace(*scenario.Description) != "" {
+		summaryLines = append(summaryLines, "Description: "+strings.TrimSpace(*scenario.Description))
+	}
+	if scenario.Notes != nil && strings.TrimSpace(*scenario.Notes) != "" {
+		summaryLines = append(summaryLines, "Notes: "+strings.TrimSpace(*scenario.Notes))
+	}
+	if len(scenario.GuidancePaths) > 0 {
+		summaryLines = append(summaryLines, "Pinned guidance: "+strings.Join(scenario.GuidancePaths, ", "))
+	}
+	if len(scenario.TicketContextIDs) > 0 {
+		summaryLines = append(summaryLines, "Pinned ticket context: "+strings.Join(scenario.TicketContextIDs, ", "))
+	}
+	if len(scenario.VerificationProfileIDs) > 0 {
+		summaryLines = append(summaryLines, "Pinned verification profiles: "+strings.Join(scenario.VerificationProfileIDs, ", "))
+	}
+	if len(scenario.BrowserDumpIDs) > 0 {
+		summaryLines = append(summaryLines, "Pinned browser dumps: "+strings.Join(scenario.BrowserDumpIDs, ", "))
+	}
+	packet.Guidance = guidance
+	packet.AvailableVerificationProfiles = verificationProfiles
+	packet.TicketContexts = ticketContexts
+	packet.BrowserDumps = browserDumps
+	packet.Prompt = strings.Join(summaryLines, "\n") + "\n\n" + buildIssueContextPrompt(
+		packet.Workspace,
+		packet.Issue,
+		packet.TreeFocus,
+		packet.RecentFixes,
+		packet.RecentActivity,
+		guidance,
+		verificationProfiles,
+		ticketContexts,
+		packet.ThreatModels,
+		browserDumps,
+		packet.RelatedPaths,
+		packet.RepoMap,
+		packet.DynamicContext,
+		packet.RepoConfig,
+		packet.MatchedPathInstructions,
+	)
+	return packet
+}
+
+func recordEvalScenarioRun(dataDir string, workspaceID string, scenario EvalScenarioRecord, runID string) error {
+	if slices.Contains(scenario.RunIDs, runID) {
+		return nil
+	}
+	scenarios, err := loadEvalScenarios(dataDir, workspaceID)
+	if err != nil {
+		return err
+	}
+	updated := scenario
+	updated.RunIDs = append(append([]string{}, scenario.RunIDs...), runID)
+	updated.UpdatedAt = nowUTC()
+	next := make([]EvalScenarioRecord, 0, len(scenarios))
+	for _, item := range scenarios {
+		if item.ScenarioID == scenario.ScenarioID {
+			next = append(next, updated)
+			continue
+		}
+		next = append(next, item)
+	}
+	if err := saveEvalScenarios(dataDir, workspaceID, next); err != nil {
+		return err
+	}
+	return appendIssueActivity(
+		dataDir,
+		workspaceID,
+		scenario.IssueID,
+		runID,
+		"eval_scenario.executed",
+		"Queued fresh run for eval scenario "+scenario.Name,
+		map[string]any{"scenario_id": scenario.ScenarioID, "run_id": runID},
+	)
 }
 
 func StartAgentQuery(dataDir string, workspaceID string, request AgentQueryRequest) (*runRecord, error) {

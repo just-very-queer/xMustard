@@ -270,6 +270,78 @@ export type FixRecord = {
   recorded_at: string
 }
 
+export type RepoMapSymbolRecord = {
+  path: string
+  symbol: string
+  kind: 'function' | 'class' | 'method' | 'type' | 'module'
+  line_start?: number | null
+  line_end?: number | null
+  enclosing_scope?: string | null
+  reason?: string | null
+  score: number
+}
+
+export type RelatedContextRecord = {
+  artifact_type: 'ticket_context' | 'threat_model' | 'browser_dump' | 'fix_record' | 'activity' | 'run'
+  artifact_id: string
+  title: string
+  path?: string | null
+  reason?: string | null
+  matched_terms: string[]
+  score: number
+}
+
+export type DynamicContextBundle = {
+  symbol_context: RepoMapSymbolRecord[]
+  related_context: RelatedContextRecord[]
+}
+
+export type RepoMCPServerRecord = {
+  name: string
+  description: string
+  usage: string
+}
+
+export type RepoPathInstructionRecord = {
+  instruction_id: string
+  path: string
+  instructions: string
+  title?: string | null
+  source_path: string
+}
+
+export type RepoPathInstructionMatch = {
+  instruction_id: string
+  path: string
+  title?: string | null
+  instructions: string
+  source_path: string
+  matched_paths: string[]
+}
+
+export type RepoConfigRecord = {
+  workspace_id: string
+  source_path?: string | null
+  description: string
+  path_filters: string[]
+  path_instructions: RepoPathInstructionRecord[]
+  code_guidelines: string[]
+  mcp_servers: RepoMCPServerRecord[]
+  loaded_at: string
+}
+
+export type RepoConfigHealth = {
+  workspace_id: string
+  status: 'missing' | 'configured'
+  source_path?: string | null
+  summary: string
+  path_instruction_count: number
+  path_filter_count: number
+  code_guideline_count: number
+  mcp_server_count: number
+  loaded_at: string
+}
+
 export type IssueContextPacket = {
   issue: IssueRecord
   workspace: WorkspaceRecord
@@ -286,6 +358,9 @@ export type IssueContextPacket = {
   threat_models: ThreatModelRecord[]
   browser_dumps: BrowserDumpRecord[]
   repo_map?: RepoMapSummary | null
+  dynamic_context?: DynamicContextBundle | null
+  repo_config?: RepoConfigRecord | null
+  matched_path_instructions: RepoPathInstructionMatch[]
   worktree?: WorktreeStatus | null
   prompt: string
 }
@@ -302,6 +377,45 @@ export type RepoGuidanceRecord = {
   excerpt?: string | null
   trigger_keywords: string[]
   updated_at?: string | null
+}
+
+export type GuidanceStarterRecord = {
+  template_id: 'agents' | 'openhands_repo' | 'conventions'
+  title: string
+  path: string
+  description: string
+  recommended: boolean
+  exists: boolean
+  stale: boolean
+}
+
+export type RepoGuidanceHealth = {
+  workspace_id: string
+  status: 'healthy' | 'partial' | 'missing' | 'stale'
+  summary: string
+  guidance_count: number
+  always_on_count: number
+  instruction_count: number
+  present_files: string[]
+  missing_files: string[]
+  stale_files: string[]
+  recommended_files: string[]
+  starters: GuidanceStarterRecord[]
+  generated_at: string
+}
+
+export type GuidanceStarterRequest = {
+  template_id: 'agents' | 'openhands_repo' | 'conventions'
+  overwrite?: boolean
+}
+
+export type GuidanceStarterResult = {
+  workspace_id: string
+  template_id: 'agents' | 'openhands_repo' | 'conventions'
+  path: string
+  created: boolean
+  overwritten: boolean
+  generated_at: string
 }
 
 export type IssueUpdateRequest = {
@@ -388,6 +502,7 @@ export type VerificationProfileRecord = {
   max_runtime_seconds: number
   retry_count: number
   source_paths: string[]
+  checklist_items: string[]
   built_in: boolean
   created_at: string
   updated_at: string
@@ -404,6 +519,7 @@ export type VerificationProfileUpsertRequest = {
   max_runtime_seconds?: number
   retry_count?: number
   source_paths?: string[]
+  checklist_items?: string[]
 }
 
 export type VerificationProfileRunRequest = {
@@ -422,16 +538,63 @@ export type VerificationCommandResult = {
   created_at: string
 }
 
+export type VerificationChecklistResult = {
+  item_id: string
+  title: string
+  kind: 'system' | 'custom'
+  passed: boolean
+  details?: string | null
+}
+
 export type VerificationProfileExecutionResult = {
+  execution_id: string
   profile_id: string
   workspace_id: string
+  profile_name: string
+  issue_id?: string | null
+  run_id?: string | null
   attempts: VerificationCommandResult[]
   attempt_count: number
   success: boolean
   coverage_command_result?: VerificationCommandResult | null
   coverage_result?: CoverageResult | null
+  checklist_results: VerificationChecklistResult[]
+  confidence: 'high' | 'medium' | 'low'
   coverage_report_path?: string | null
   created_at: string
+}
+
+export type VerificationProfileDimensionSummary = {
+  key: string
+  label: string
+  total_runs: number
+  success_runs: number
+  failed_runs: number
+  success_rate: number
+  last_run_at?: string | null
+}
+
+export type VerificationProfileReport = {
+  profile_id: string
+  workspace_id: string
+  profile_name: string
+  built_in: boolean
+  issue_id?: string | null
+  total_runs: number
+  success_runs: number
+  failed_runs: number
+  success_rate: number
+  confidence_counts: Record<string, number>
+  avg_attempt_count: number
+  checklist_pass_rate: number
+  last_run_at?: string | null
+  last_issue_id?: string | null
+  last_run_id?: string | null
+  last_confidence?: 'high' | 'medium' | 'low' | null
+  last_success?: boolean | null
+  runtime_breakdown: VerificationProfileDimensionSummary[]
+  model_breakdown: VerificationProfileDimensionSummary[]
+  branch_breakdown: VerificationProfileDimensionSummary[]
 }
 
 export type TicketContextRecord = {
@@ -506,7 +669,34 @@ export type IssueContextReplayRecord = {
   guidance_paths: string[]
   verification_profile_ids: string[]
   ticket_context_ids: string[]
+  browser_dump_ids: string[]
   created_at: string
+}
+
+export type IssueContextReplayComparison = {
+  replay: IssueContextReplayRecord
+  current_prompt: string
+  current_tree_focus: string[]
+  current_guidance_paths: string[]
+  current_verification_profile_ids: string[]
+  current_ticket_context_ids: string[]
+  current_browser_dump_ids: string[]
+  prompt_changed: boolean
+  changed: boolean
+  saved_prompt_length: number
+  current_prompt_length: number
+  added_tree_focus: string[]
+  removed_tree_focus: string[]
+  added_guidance_paths: string[]
+  removed_guidance_paths: string[]
+  added_verification_profile_ids: string[]
+  removed_verification_profile_ids: string[]
+  added_ticket_context_ids: string[]
+  removed_ticket_context_ids: string[]
+  added_browser_dump_ids: string[]
+  removed_browser_dump_ids: string[]
+  summary: string
+  compared_at: string
 }
 
 export type BrowserDumpRecord = {
@@ -574,6 +764,8 @@ export type RunRecord = {
   model: string
   status: string
   runbook_id?: string | null
+  eval_scenario_id?: string | null
+  eval_replay_batch_id?: string | null
   title: string
   prompt: string
   command: string[]
@@ -610,7 +802,24 @@ export type RunSessionInsight = {
   strengths: string[]
   risks: string[]
   recommendations: string[]
+  acceptance_review?: AcceptanceCriteriaReview | null
+  scope_warnings: ScopeWarning[]
   generated_at: string
+}
+
+export type AcceptanceCriteriaReview = {
+  status: 'met' | 'partial' | 'not_met' | 'unknown'
+  criteria: string[]
+  matched: string[]
+  missing: string[]
+  notes: string[]
+}
+
+export type ScopeWarning = {
+  kind: 'unrelated_change' | 'scope_drift'
+  message: string
+  paths: string[]
+  severity: 'low' | 'medium' | 'high'
 }
 
 export type PlanStep = {
@@ -787,7 +996,256 @@ export type PatchCritique = {
   issues_found: string[]
   improvements: ImprovementSuggestion[]
   summary: string
+  acceptance_review?: AcceptanceCriteriaReview | null
+  scope_warnings: ScopeWarning[]
   generated_at: string
+}
+
+export type EvalScenarioRecord = {
+  scenario_id: string
+  workspace_id: string
+  issue_id: string
+  name: string
+  description?: string | null
+  baseline_replay_id?: string | null
+  guidance_paths: string[]
+  ticket_context_ids: string[]
+  verification_profile_ids: string[]
+  run_ids: string[]
+  browser_dump_ids: string[]
+  notes?: string | null
+  created_at: string
+  updated_at: string
+}
+
+export type EvalScenarioUpsertRequest = {
+  scenario_id?: string
+  name: string
+  issue_id: string
+  description?: string | null
+  baseline_replay_id?: string | null
+  guidance_paths?: string[]
+  ticket_context_ids?: string[]
+  verification_profile_ids?: string[]
+  run_ids?: string[]
+  browser_dump_ids?: string[]
+  notes?: string | null
+}
+
+export type EvalScenarioVariantDiff = {
+  selected_guidance_paths: string[]
+  current_guidance_paths: string[]
+  added_guidance_paths: string[]
+  removed_guidance_paths: string[]
+  selected_ticket_context_ids: string[]
+  current_ticket_context_ids: string[]
+  added_ticket_context_ids: string[]
+  removed_ticket_context_ids: string[]
+  changed: boolean
+  summary: string
+}
+
+export type EvalScenarioReport = {
+  scenario: EvalScenarioRecord
+  baseline_replay?: IssueContextReplayRecord | null
+  latest_replay_comparison?: IssueContextReplayComparison | null
+  variant_diff?: EvalScenarioVariantDiff | null
+  comparison_to_baseline?: EvalScenarioBaselineComparison | null
+  latest_fresh_run?: EvalFreshRunSummary | null
+  fresh_comparison_to_baseline?: EvalFreshExecutionComparison | null
+  verification_profile_reports: VerificationProfileReport[]
+  run_metrics: RunMetrics[]
+  total_estimated_cost: number
+  avg_duration_ms: number
+  success_runs: number
+  failed_runs: number
+  verification_success_rate: number
+  summary: string
+}
+
+export type EvalScenarioBaselineComparison = {
+  compared_to_scenario_id: string
+  compared_to_name: string
+  guidance_only_in_scenario: string[]
+  guidance_only_in_baseline: string[]
+  ticket_context_only_in_scenario: string[]
+  ticket_context_only_in_baseline: string[]
+  browser_dump_only_in_scenario: string[]
+  browser_dump_only_in_baseline: string[]
+  verification_profile_only_in_scenario: string[]
+  verification_profile_only_in_baseline: string[]
+  verification_profile_deltas: EvalScenarioVerificationProfileDelta[]
+  success_runs_delta: number
+  failed_runs_delta: number
+  verification_success_rate_delta: number
+  avg_duration_ms_delta: number
+  total_estimated_cost_delta: number
+  preferred: 'scenario' | 'baseline' | 'tie'
+  preferred_scenario_id?: string | null
+  preferred_scenario_name?: string | null
+  preference_reasons: string[]
+  summary: string
+}
+
+export type EvalScenarioVerificationProfileDelta = {
+  profile_id: string
+  profile_name: string
+  present_in_scenario: boolean
+  present_in_baseline: boolean
+  scenario_total_runs: number
+  baseline_total_runs: number
+  total_runs_delta: number
+  scenario_success_rate: number
+  baseline_success_rate: number
+  success_rate_delta: number
+  scenario_checklist_pass_rate: number
+  baseline_checklist_pass_rate: number
+  checklist_pass_rate_delta: number
+  scenario_avg_attempt_count: number
+  baseline_avg_attempt_count: number
+  avg_attempt_count_delta: number
+  scenario_confidence_counts: Record<string, number>
+  baseline_confidence_counts: Record<string, number>
+  preferred: 'scenario' | 'baseline' | 'tie'
+  summary: string
+}
+
+export type EvalFreshRunSummary = {
+  scenario_id: string
+  scenario_name: string
+  run_id: string
+  status: string
+  runtime: 'codex' | 'opencode'
+  model: string
+  created_at: string
+  estimated_cost: number
+  duration_ms: number
+  command_preview?: string | null
+  planning: boolean
+}
+
+export type EvalFreshExecutionComparison = {
+  compared_to_scenario_id: string
+  compared_to_name: string
+  scenario_status: string
+  baseline_status: string
+  estimated_cost_delta: number
+  duration_ms_delta: number
+  preferred: 'scenario' | 'baseline' | 'tie'
+  preferred_scenario_id?: string | null
+  preferred_scenario_name?: string | null
+  preference_reasons: string[]
+  summary: string
+}
+
+export type EvalFreshReplayRankingEntry = {
+  rank: number
+  scenario_id: string
+  scenario_name: string
+  latest_fresh_run: EvalFreshRunSummary
+  pairwise_wins: number
+  pairwise_losses: number
+  pairwise_ties: number
+  preference_reasons: string[]
+  summary: string
+}
+
+export type EvalFreshReplayRanking = {
+  issue_id: string
+  baseline_scenario_id?: string | null
+  baseline_scenario_name?: string | null
+  ranked_scenarios: EvalFreshReplayRankingEntry[]
+  summary: string
+}
+
+export type EvalFreshReplayTrendEntry = {
+  scenario_id: string
+  scenario_name: string
+  current_rank: number
+  previous_rank?: number | null
+  movement: 'up' | 'down' | 'same' | 'new'
+  latest_fresh_run: EvalFreshRunSummary
+  previous_fresh_run?: EvalFreshRunSummary | null
+  summary: string
+}
+
+export type EvalFreshReplayTrend = {
+  issue_id: string
+  latest_batch_id?: string | null
+  previous_batch_id?: string | null
+  entries: EvalFreshReplayTrendEntry[]
+  summary: string
+}
+
+export type EvalReplayBatchRecord = {
+  batch_id: string
+  workspace_id: string
+  issue_id: string
+  runtime: 'codex' | 'opencode'
+  model: string
+  scenario_ids: string[]
+  queued_run_ids: string[]
+  instruction?: string | null
+  runbook_id?: string | null
+  planning: boolean
+  created_at: string
+}
+
+export type EvalVariantRollup = {
+  variant_kind: 'guidance' | 'ticket_context'
+  variant_key: string
+  label: string
+  selected_values: string[]
+  scenario_ids: string[]
+  scenario_names: string[]
+  scenario_count: number
+  run_count: number
+  success_runs: number
+  failed_runs: number
+  total_estimated_cost: number
+  avg_duration_ms: number
+  verification_success_rate: number
+  runtime_breakdown: VerificationProfileDimensionSummary[]
+  model_breakdown: VerificationProfileDimensionSummary[]
+  summary: string
+}
+
+export type EvalWorkspaceReport = {
+  workspace_id: string
+  scenario_count: number
+  run_count: number
+  success_runs: number
+  failed_runs: number
+  total_estimated_cost: number
+  total_duration_ms: number
+  verification_success_rate: number
+  cost_summary?: CostSummary | null
+  scenario_reports: EvalScenarioReport[]
+  replay_batches: EvalReplayBatchRecord[]
+  fresh_replay_rankings: EvalFreshReplayRanking[]
+  fresh_replay_trends: EvalFreshReplayTrend[]
+  guidance_variant_rollups: EvalVariantRollup[]
+  ticket_context_variant_rollups: EvalVariantRollup[]
+  generated_at: string
+}
+
+export type EvalScenarioReplayRequest = {
+  runtime: 'codex' | 'opencode'
+  model: string
+  scenario_ids?: string[]
+  instruction?: string | null
+  runbook_id?: string | null
+  planning?: boolean
+}
+
+export type EvalScenarioReplayResult = {
+  workspace_id: string
+  issue_id: string
+  runtime: 'codex' | 'opencode'
+  model: string
+  batch_id?: string | null
+  scenario_ids: string[]
+  queued_runs: RunRecord[]
 }
 
 export type IntegrationConfig = {

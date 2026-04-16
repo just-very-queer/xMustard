@@ -17,6 +17,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - backend migration planning now explicitly tracks a Rust core plus a possible Go API shell instead of assuming the HTTP layer must stay in Python until the very end
 
 ### Added
+- repo-native `.xmustard.yaml` support for path-specific instructions, code-guideline references, MCP/browser-context hints, and issue-context prompt attachment
+- Go parity for `.xmustard.yaml` repo-config reads and issue-context prompt attachment, including matched path instructions inside Go-built issue packets
 - Issue-level threat model artifacts with backend CRUD, prompt integration, export support, and issue detail editing
 - Research notes now include external security/trust references such as OWASP Threat Dragon, OWASP pytm, Semgrep Code, GitHub code scanning, and Vulnhuntr patterns
 - Workspace metadata under `backend/data/` now points the self-workspace at `/Users/for_home/Developer/xMustard`
@@ -51,6 +53,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Go API shell support for fresh workspace scan/load and explicit `/scan` snapshot rebuilds using Rust-backed signal and repo-map generation plus Go-side tracker artifact assembly
 - Python CLI parity expansion for verification profiles, ticket context, threat models, context replays, plan/metrics/coverage/critique flows, integrations, repo inspection, and terminal transport
 - Durable browser-dump artifacts for MCP/manual browser debugging context, now attached to issue context packets and export bundles
+- Guidance authoring workflow with starter generation for `AGENTS.md`, `.openhands/microagents/repo.md`, and `CONVENTIONS.md`, plus workspace guidance health reporting
+- Issue-context replay comparison across prompt content, tree focus, guidance, verification profiles, ticket contexts, and browser dumps, now surfaced in the API, CLI, and issue detail UI
+- Verification-profile checklist items, confidence scoring, and durable per-profile execution history, now surfaced in Python, Go, CLI, and the issue detail UI
+- Verification-profile reports now break execution history down by runtime, model, and branch, with matching Go API ownership and issue detail UI summaries
+- Dynamic issue context now includes symbol ranking and retrieval-backed related artifacts from ticket context, threat models, browser dumps, fixes, and activity
+- Eval scenarios and workspace eval reports now correlate replay drift, verification success, and run metrics through the Python API and CLI
+- Eval scenarios now persist saved guidance-path and ticket-context variant selections, and eval reports now expose current-vs-saved variant drift summaries across both Python and Go
+- Eval workspace reports now group outcomes by saved guidance sets and ticket-context sets with unique-run rollups, deterministic Go parity, and selected-value/cost detail surfaced in the UI
+- Eval scenario reports now include baseline-aware comparisons for the same issue, surfacing guidance/ticket/browser/profile deltas and weighted preference reasons without adding new eval routes
+- Eval baseline comparisons now include per-profile verification history deltas across saved variants, including runs, success rate, checklist pass rate, attempt count, and confidence-count changes in both Python and Go
+- Saved eval scenarios can now launch fresh queued runs through the normal issue-run flow, with scenario overlays applied to prompt context and new run IDs appended back into the scenario record
+- Eval scenarios can now be batch replayed per issue, and eval reports now include each scenario's latest fresh run plus fresh execution comparisons back to the issue baseline scenario
+- Eval workspace reports now rank fresh replay outcomes across all saved scenarios for an issue, using pairwise fresh-run wins/losses/ties plus deterministic cost and duration tie-breaks in both Python and Go
+- Eval workspace reports now show fresh replay rank movement versus the previous fresh replay snapshot for each scenario across Python, Go, and the UI
+- Eval replay batches now persist as durable artifacts, and batch-backed trend comparisons now prefer latest-batch vs previous-batch movement before falling back to per-scenario fresh history
+- Replay trend views now expose explicit latest-batch and previous-batch ids, making batch history inspectable across Python, Go, and the UI
+- The Go API shell now owns eval scenario CRUD and workspace eval-report reads, with route registration moved into a dedicated registrar instead of extending the main HTTP mux tree inline
+- Run insights and patch critique now include acceptance-criteria review plus scope/unrelated-change warnings derived from ticket context and worktree state
 
 ## [0.2.0] - 2026-04-14
 

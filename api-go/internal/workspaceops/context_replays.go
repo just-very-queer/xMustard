@@ -31,7 +31,34 @@ type IssueContextReplayRecord struct {
 	GuidancePaths          []string `json:"guidance_paths"`
 	VerificationProfileIDs []string `json:"verification_profile_ids"`
 	TicketContextIDs       []string `json:"ticket_context_ids"`
+	BrowserDumpIDs         []string `json:"browser_dump_ids"`
 	CreatedAt              string   `json:"created_at"`
+}
+
+type IssueContextReplayComparison struct {
+	Replay                         IssueContextReplayRecord `json:"replay"`
+	CurrentPrompt                  string                   `json:"current_prompt"`
+	CurrentTreeFocus               []string                 `json:"current_tree_focus"`
+	CurrentGuidancePaths           []string                 `json:"current_guidance_paths"`
+	CurrentVerificationProfileIDs  []string                 `json:"current_verification_profile_ids"`
+	CurrentTicketContextIDs        []string                 `json:"current_ticket_context_ids"`
+	CurrentBrowserDumpIDs          []string                 `json:"current_browser_dump_ids"`
+	PromptChanged                  bool                     `json:"prompt_changed"`
+	Changed                        bool                     `json:"changed"`
+	SavedPromptLength              int                      `json:"saved_prompt_length"`
+	CurrentPromptLength            int                      `json:"current_prompt_length"`
+	AddedTreeFocus                 []string                 `json:"added_tree_focus"`
+	RemovedTreeFocus               []string                 `json:"removed_tree_focus"`
+	AddedGuidancePaths             []string                 `json:"added_guidance_paths"`
+	RemovedGuidancePaths           []string                 `json:"removed_guidance_paths"`
+	AddedVerificationProfileIDs    []string                 `json:"added_verification_profile_ids"`
+	RemovedVerificationProfileIDs  []string                 `json:"removed_verification_profile_ids"`
+	AddedTicketContextIDs          []string                 `json:"added_ticket_context_ids"`
+	RemovedTicketContextIDs        []string                 `json:"removed_ticket_context_ids"`
+	AddedBrowserDumpIDs            []string                 `json:"added_browser_dump_ids"`
+	RemovedBrowserDumpIDs          []string                 `json:"removed_browser_dump_ids"`
+	Summary                        string                   `json:"summary"`
+	ComparedAt                     string                   `json:"compared_at"`
 }
 
 const replayGuidanceLimit = 6
@@ -74,6 +101,7 @@ func CaptureIssueContextReplay(dataDir string, workspaceID string, issueID strin
 		GuidancePaths:          guidancePaths(packet.Guidance),
 		VerificationProfileIDs: verificationProfileIDs(packet.AvailableVerificationProfiles),
 		TicketContextIDs:       ticketContextIDs(packet.TicketContexts),
+		BrowserDumpIDs:         browserDumpIDs(packet.BrowserDumps),
 		CreatedAt:              nowUTC(),
 	}
 
@@ -97,6 +125,84 @@ func CaptureIssueContextReplay(dataDir string, workspaceID string, issueID strin
 		return nil, err
 	}
 	return &record, nil
+}
+
+func CompareIssueContextReplay(dataDir string, workspaceID string, issueID string, replayID string) (*IssueContextReplayComparison, error) {
+	packet, err := BuildIssueContextPacket(dataDir, workspaceID, issueID)
+	if err != nil {
+		return nil, err
+	}
+	replays, err := ListIssueContextReplays(dataDir, workspaceID, issueID)
+	if err != nil {
+		return nil, err
+	}
+	var replay *IssueContextReplayRecord
+	for idx := range replays {
+		if replays[idx].ReplayID == replayID {
+			replay = &replays[idx]
+			break
+		}
+	}
+	if replay == nil {
+		return nil, os.ErrNotExist
+	}
+
+	currentTreeFocus := append([]string{}, packet.TreeFocus[:min(len(packet.TreeFocus), 12)]...)
+	currentGuidancePaths := guidancePaths(packet.Guidance)
+	currentVerificationProfileIDs := verificationProfileIDs(packet.AvailableVerificationProfiles)
+	currentTicketContextIDs := ticketContextIDs(packet.TicketContexts)
+	currentBrowserDumpIDs := browserDumpIDs(packet.BrowserDumps)
+
+	addedTreeFocus, removedTreeFocus := diffOrderedStrings(replay.TreeFocus, currentTreeFocus)
+	addedGuidancePaths, removedGuidancePaths := diffOrderedStrings(replay.GuidancePaths, currentGuidancePaths)
+	addedVerificationProfileIDs, removedVerificationProfileIDs := diffOrderedStrings(replay.VerificationProfileIDs, currentVerificationProfileIDs)
+	addedTicketContextIDs, removedTicketContextIDs := diffOrderedStrings(replay.TicketContextIDs, currentTicketContextIDs)
+	addedBrowserDumpIDs, removedBrowserDumpIDs := diffOrderedStrings(replay.BrowserDumpIDs, currentBrowserDumpIDs)
+	promptChanged := replay.Prompt != packet.Prompt
+	changed := promptChanged ||
+		len(addedTreeFocus) > 0 || len(removedTreeFocus) > 0 ||
+		len(addedGuidancePaths) > 0 || len(removedGuidancePaths) > 0 ||
+		len(addedVerificationProfileIDs) > 0 || len(removedVerificationProfileIDs) > 0 ||
+		len(addedTicketContextIDs) > 0 || len(removedTicketContextIDs) > 0 ||
+		len(addedBrowserDumpIDs) > 0 || len(removedBrowserDumpIDs) > 0
+
+	return &IssueContextReplayComparison{
+		Replay:                        *replay,
+		CurrentPrompt:                 packet.Prompt,
+		CurrentTreeFocus:              currentTreeFocus,
+		CurrentGuidancePaths:          currentGuidancePaths,
+		CurrentVerificationProfileIDs: currentVerificationProfileIDs,
+		CurrentTicketContextIDs:       currentTicketContextIDs,
+		CurrentBrowserDumpIDs:         currentBrowserDumpIDs,
+		PromptChanged:                 promptChanged,
+		Changed:                       changed,
+		SavedPromptLength:             len(replay.Prompt),
+		CurrentPromptLength:           len(packet.Prompt),
+		AddedTreeFocus:                addedTreeFocus,
+		RemovedTreeFocus:              removedTreeFocus,
+		AddedGuidancePaths:            addedGuidancePaths,
+		RemovedGuidancePaths:          removedGuidancePaths,
+		AddedVerificationProfileIDs:   addedVerificationProfileIDs,
+		RemovedVerificationProfileIDs: removedVerificationProfileIDs,
+		AddedTicketContextIDs:         addedTicketContextIDs,
+		RemovedTicketContextIDs:       removedTicketContextIDs,
+		AddedBrowserDumpIDs:           addedBrowserDumpIDs,
+		RemovedBrowserDumpIDs:         removedBrowserDumpIDs,
+		Summary: replayComparisonSummary(
+			promptChanged,
+			addedTreeFocus,
+			removedTreeFocus,
+			addedGuidancePaths,
+			removedGuidancePaths,
+			addedVerificationProfileIDs,
+			removedVerificationProfileIDs,
+			addedTicketContextIDs,
+			removedTicketContextIDs,
+			addedBrowserDumpIDs,
+			removedBrowserDumpIDs,
+		),
+		ComparedAt: nowUTC(),
+	}, nil
 }
 
 func loadContextReplays(dataDir string, workspaceID string) ([]IssueContextReplayRecord, error) {
@@ -132,6 +238,77 @@ func saveContextReplays(dataDir string, workspaceID string, items []IssueContext
 	})
 	path := filepath.Join(dataDir, "workspaces", workspaceID, "context_replays.json")
 	return writeJSON(path, items)
+}
+
+func diffOrderedStrings(previous []string, current []string) ([]string, []string) {
+	previousSet := make(map[string]struct{}, len(previous))
+	currentSet := make(map[string]struct{}, len(current))
+	for _, item := range previous {
+		previousSet[item] = struct{}{}
+	}
+	for _, item := range current {
+		currentSet[item] = struct{}{}
+	}
+	added := make([]string, 0, len(current))
+	for _, item := range current {
+		if _, exists := previousSet[item]; !exists {
+			added = append(added, item)
+		}
+	}
+	removed := make([]string, 0, len(previous))
+	for _, item := range previous {
+		if _, exists := currentSet[item]; !exists {
+			removed = append(removed, item)
+		}
+	}
+	return added, removed
+}
+
+func replayComparisonSummary(
+	promptChanged bool,
+	addedTreeFocus []string,
+	removedTreeFocus []string,
+	addedGuidancePaths []string,
+	removedGuidancePaths []string,
+	addedVerificationProfileIDs []string,
+	removedVerificationProfileIDs []string,
+	addedTicketContextIDs []string,
+	removedTicketContextIDs []string,
+	addedBrowserDumpIDs []string,
+	removedBrowserDumpIDs []string,
+) string {
+	if !promptChanged &&
+		len(addedTreeFocus) == 0 && len(removedTreeFocus) == 0 &&
+		len(addedGuidancePaths) == 0 && len(removedGuidancePaths) == 0 &&
+		len(addedVerificationProfileIDs) == 0 && len(removedVerificationProfileIDs) == 0 &&
+		len(addedTicketContextIDs) == 0 && len(removedTicketContextIDs) == 0 &&
+		len(addedBrowserDumpIDs) == 0 && len(removedBrowserDumpIDs) == 0 {
+		return "No issue-context drift detected since this replay."
+	}
+
+	changes := make([]string, 0, 10)
+	if promptChanged {
+		changes = append(changes, "prompt changed")
+	}
+	for _, item := range []struct {
+		label   string
+		added   []string
+		removed []string
+	}{
+		{label: "tree focus", added: addedTreeFocus, removed: removedTreeFocus},
+		{label: "guidance", added: addedGuidancePaths, removed: removedGuidancePaths},
+		{label: "verification profiles", added: addedVerificationProfileIDs, removed: removedVerificationProfileIDs},
+		{label: "ticket contexts", added: addedTicketContextIDs, removed: removedTicketContextIDs},
+		{label: "browser dumps", added: addedBrowserDumpIDs, removed: removedBrowserDumpIDs},
+	} {
+		if len(item.added) > 0 {
+			changes = append(changes, fmt.Sprintf("+%d %s", len(item.added), item.label))
+		}
+		if len(item.removed) > 0 {
+			changes = append(changes, fmt.Sprintf("-%d %s", len(item.removed), item.label))
+		}
+	}
+	return "Context drift since this replay: " + strings.Join(changes, ", ") + "."
 }
 
 func listReplayActivity(dataDir string, workspaceID string, issueID string, limit int) ([]activityRecord, error) {
@@ -505,6 +682,17 @@ func ticketContextIDs(items []TicketContextRecord) []string {
 	ids := make([]string, 0, min(len(items), 8))
 	for _, item := range items {
 		ids = append(ids, item.ContextID)
+		if len(ids) >= 8 {
+			break
+		}
+	}
+	return ids
+}
+
+func browserDumpIDs(items []BrowserDumpRecord) []string {
+	ids := make([]string, 0, min(len(items), 8))
+	for _, item := range items {
+		ids = append(ids, item.DumpID)
 		if len(ids) >= 8 {
 			break
 		}

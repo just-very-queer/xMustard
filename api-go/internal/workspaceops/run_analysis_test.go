@@ -17,7 +17,7 @@ func TestRunAnalysisReadsMetricsAndCostSummary(t *testing.T) {
 		Model:          "gpt-5.4-mini",
 		Status:         "completed",
 		Title:          "codex:P0_25M03_001",
-		Prompt:         "prompt",
+		Prompt:         "Keep old columns remain stable and ensure export works end to end.",
 		Command:        []string{"codex", "exec"},
 		CommandPreview: "codex exec",
 		LogPath:        filepath.Join(repoRoot, "run-metrics.log"),
@@ -70,7 +70,7 @@ func TestGeneratePatchCritiquePersistsArtifactAndInsightReadsIt(t *testing.T) {
 	dataDir, workspaceID, issueID, repoRoot := writeIssueContextFixture(t, false)
 
 	outputPath := filepath.Join(repoRoot, "run-critique.out.json")
-	output := "src/app.py: TODO tighten export schema\npanic while patching\n"
+	output := "src/app.py: TODO tighten export schema so old columns remain\nexport works end to end after the patch\npanic while patching\n"
 	if err := os.WriteFile(outputPath, []byte(output), 0o644); err != nil {
 		t.Fatalf("write output: %v", err)
 	}
@@ -83,13 +83,18 @@ func TestGeneratePatchCritiquePersistsArtifactAndInsightReadsIt(t *testing.T) {
 		Model:          "gpt-5.4-mini",
 		Status:         "failed",
 		Title:          "codex:P0_25M03_001",
-		Prompt:         "prompt",
+		Prompt:         "Keep old columns remain stable and ensure export works end to end.",
 		Command:        []string{"codex", "exec"},
 		CommandPreview: "codex exec",
 		LogPath:        filepath.Join(repoRoot, "run-critique.log"),
 		OutputPath:     outputPath,
 		CreatedAt:      "2026-04-14T10:06:00Z",
 		ExitCode:       intPtr(1),
+		Worktree: &WorktreeStatus{
+			Available:  true,
+			IsGitRepo:  true,
+			DirtyPaths: []string{"src/app.py", "docs/notes.md"},
+		},
 		Summary: map[string]any{
 			"text_excerpt":     "Investigated panic in src/app.py",
 			"event_count":      10,
@@ -120,6 +125,9 @@ func TestGeneratePatchCritiquePersistsArtifactAndInsightReadsIt(t *testing.T) {
 	if critique.RunID != "run-critique" || len(critique.Improvements) == 0 || len(critique.IssuesFound) == 0 {
 		t.Fatalf("unexpected critique: %#v", critique)
 	}
+	if critique.AcceptanceReview.Status != "met" || len(critique.ScopeWarnings) == 0 {
+		t.Fatalf("expected acceptance review and scope warnings on critique, got %#v", critique)
+	}
 
 	stored, err := GetPatchCritique(dataDir, workspaceID, "run-critique")
 	if err != nil {
@@ -127,6 +135,9 @@ func TestGeneratePatchCritiquePersistsArtifactAndInsightReadsIt(t *testing.T) {
 	}
 	if stored.CritiqueID != critique.CritiqueID {
 		t.Fatalf("stored critique mismatch: %#v vs %#v", stored, critique)
+	}
+	if stored.AcceptanceReview.Status != "met" || len(stored.ScopeWarnings) == 0 {
+		t.Fatalf("stored critique missing compliance details: %#v", stored)
 	}
 
 	improvements, err := GetRunImprovements(dataDir, workspaceID, "run-critique")
@@ -143,6 +154,12 @@ func TestGeneratePatchCritiquePersistsArtifactAndInsightReadsIt(t *testing.T) {
 	}
 	if insight.RunID != "run-critique" || len(insight.Risks) == 0 || len(insight.Recommendations) == 0 {
 		t.Fatalf("unexpected insight: %#v", insight)
+	}
+	if insight.AcceptanceReview.Status != "met" {
+		t.Fatalf("expected met acceptance review, got %#v", insight.AcceptanceReview)
+	}
+	if len(insight.ScopeWarnings) == 0 || insight.ScopeWarnings[0].Kind == "" {
+		t.Fatalf("expected scope warnings, got %#v", insight.ScopeWarnings)
 	}
 
 	content, err := os.ReadFile(filepath.Join(dataDir, "workspaces", workspaceID, "activity.jsonl"))
@@ -195,6 +212,18 @@ func TestDismissImprovementUpdatesCritiqueArtifact(t *testing.T) {
 				Description:  "Add regression test",
 			},
 		},
+		AcceptanceReview: AcceptanceCriteriaReview{
+			Status:   "partial",
+			Criteria: []string{"Old columns remain"},
+			Missing:  []string{"Old columns remain"},
+		},
+		ScopeWarnings: []ScopeWarning{
+			{
+				Kind:     "scope_drift",
+				Message:  "Issue drift flags remain open.",
+				Severity: "medium",
+			},
+		},
 		Summary:     "Overall quality: acceptable",
 		GeneratedAt: "2026-04-14T10:09:00Z",
 	}); err != nil {
@@ -209,6 +238,9 @@ func TestDismissImprovementUpdatesCritiqueArtifact(t *testing.T) {
 	}
 	if len(updated.Improvements) != 1 || !updated.Improvements[0].Dismissed {
 		t.Fatalf("improvement not dismissed: %#v", updated)
+	}
+	if updated.AcceptanceReview.Status != "partial" || len(updated.ScopeWarnings) != 1 {
+		t.Fatalf("dismiss should preserve critique compliance fields: %#v", updated)
 	}
 
 	items, err := GetRunImprovements(dataDir, workspaceID, "run-dismiss")

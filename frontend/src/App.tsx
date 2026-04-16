@@ -4,6 +4,7 @@ import {
   approvePlan,
   cancelRun,
   captureIssueContextReplay,
+  compareIssueContextReplay,
   createIssue,
   closeTerminal,
   createSavedView,
@@ -16,11 +17,14 @@ import {
   exportWorkspace,
   acceptRunReview,
   dismissImprovement,
+  getEvalReport,
   findDuplicates,
+  generateGuidanceStarter,
   generatePlan,
   generatePatchCritique,
   generateTestSuggestions,
   getHealth,
+  getWorkspaceGuidanceHealth,
   getCoverageDelta,
   getPlan,
   getPatchCritique,
@@ -33,8 +37,11 @@ import {
   getSettings,
   issueWork,
   listIssueContextReplays,
+  listVerificationProfileHistory,
+  listVerificationProfileReports,
   listWorkspaceMetrics,
   listActivity,
+  listEvalScenarios,
   listIssues,
   listRuns,
   listSavedViews,
@@ -59,6 +66,7 @@ import {
   readTerminal,
   readWorktree,
   recordFix,
+  replayEvalScenarios,
   rejectPlan,
   reviewRun,
   retryRun,
@@ -94,7 +102,10 @@ import type {
   CoverageDelta,
   DiscoverySignal,
   DuplicateMatch,
+  EvalScenarioRecord,
+  EvalWorkspaceReport,
   ImprovementSuggestion,
+  IssueContextReplayComparison,
   IssueContextReplayRecord,
   IssueDriftDetail,
   IssueContextPacket,
@@ -105,6 +116,7 @@ import type {
   PatchCritique,
   RepoMapSummary,
   RepoGuidanceRecord,
+  RepoGuidanceHealth,
   RunPlan,
   RunRecord,
   RunSessionInsight,
@@ -117,7 +129,9 @@ import type {
   TicketContextRecord,
   TreeNode,
   TriageSuggestion,
+  VerificationProfileExecutionResult,
   VerificationProfileRecord,
+  VerificationProfileReport,
   ViewMode,
   WorktreeStatus,
   WorkspaceRecord,
@@ -252,6 +266,11 @@ function App() {
   const [verificationProfileRuntimeDraft, setVerificationProfileRuntimeDraft] = useState('30')
   const [verificationProfileRetryDraft, setVerificationProfileRetryDraft] = useState('1')
   const [verificationProfileSourcePathsDraft, setVerificationProfileSourcePathsDraft] = useState('')
+  const [verificationProfileChecklistDraft, setVerificationProfileChecklistDraft] = useState('')
+  const [verificationProfileHistory, setVerificationProfileHistory] = useState<VerificationProfileExecutionResult[]>([])
+  const [verificationProfileReports, setVerificationProfileReports] = useState<VerificationProfileReport[]>([])
+  const [evalScenarios, setEvalScenarios] = useState<EvalScenarioRecord[]>([])
+  const [evalReport, setEvalReport] = useState<EvalWorkspaceReport | null>(null)
   const [selectedTicketContextId, setSelectedTicketContextId] = useState('')
   const [ticketContextProviderDraft, setTicketContextProviderDraft] = useState<TicketContextRecord['provider']>('manual')
   const [ticketContextExternalIdDraft, setTicketContextExternalIdDraft] = useState('')
@@ -286,6 +305,8 @@ function App() {
   const [browserDumpNotesDraft, setBrowserDumpNotesDraft] = useState('')
   const [issueContextReplays, setIssueContextReplays] = useState<IssueContextReplayRecord[]>([])
   const [contextReplayLabelDraft, setContextReplayLabelDraft] = useState('')
+  const [selectedContextReplayId, setSelectedContextReplayId] = useState('')
+  const [contextReplayComparison, setContextReplayComparison] = useState<IssueContextReplayComparison | null>(null)
   const [logContent, setLogContent] = useState('')
   const [selectedRunPlan, setSelectedRunPlan] = useState<RunPlan | null>(null)
   const [loading, setLoading] = useState(false)
@@ -305,6 +326,7 @@ function App() {
   const [backendHealthy, setBackendHealthy] = useState<boolean | null>(null)
   const [sources, setSources] = useState<SourceRecord[]>([])
   const [workspaceGuidance, setWorkspaceGuidance] = useState<RepoGuidanceRecord[]>([])
+  const [guidanceHealth, setGuidanceHealth] = useState<RepoGuidanceHealth | null>(null)
   const [repoMap, setRepoMap] = useState<RepoMapSummary | null>(null)
   const [activity, setActivity] = useState<ActivityRecord[]>([])
   const [activityOverview, setActivityOverview] = useState<ActivityOverview | null>(null)
@@ -530,6 +552,11 @@ function App() {
     [issueContextPacket?.browser_dumps, selectedBrowserDumpId],
   )
 
+  useEffect(() => {
+    setSelectedContextReplayId('')
+    setContextReplayComparison(null)
+  }, [selectedIssueBugId, workspaceId])
+
   async function refreshHealth() {
     try {
       const result = await getHealth()
@@ -580,10 +607,11 @@ function App() {
   }
 
   async function refreshWorkspaceData(workspaceId: string) {
-    const [nextRuns, nextSources, nextGuidance, nextRepoMap, nextVerificationProfiles, nextDriftSummary, nextViews, nextActivity, nextOverview, nextWorktree, nextCostSummary, metrics] = await Promise.all([
+    const [nextRuns, nextSources, nextGuidance, nextGuidanceHealth, nextRepoMap, nextVerificationProfiles, nextDriftSummary, nextViews, nextActivity, nextOverview, nextWorktree, nextCostSummary, metrics] = await Promise.all([
       listRuns(workspaceId),
       listSources(workspaceId),
       listWorkspaceGuidance(workspaceId),
+      getWorkspaceGuidanceHealth(workspaceId),
       readRepoMap(workspaceId),
       listVerificationProfiles(workspaceId),
       readDrift(workspaceId),
@@ -598,6 +626,7 @@ function App() {
       setRuns(nextRuns)
       setSources(nextSources)
       setWorkspaceGuidance(nextGuidance)
+      setGuidanceHealth(nextGuidanceHealth)
       setRepoMap(nextRepoMap)
       setVerificationProfiles(nextVerificationProfiles)
       setDriftSummary(nextDriftSummary)
@@ -776,19 +805,38 @@ function App() {
       setCoverageDelta(null)
       setTestSuggestions([])
       setIssueContextReplays([])
+      setVerificationProfileHistory([])
+      setVerificationProfileReports([])
+      setEvalScenarios([])
+      setEvalReport(null)
       return
     }
 
     let cancelled = false
     void (async () => {
       try {
-        const [qualityResult, duplicatesResult, triageResult, coverageResult, testSuggestionsResult, contextReplaysResult] = await Promise.allSettled([
+        const [
+          qualityResult,
+          duplicatesResult,
+          triageResult,
+          coverageResult,
+          testSuggestionsResult,
+          contextReplaysResult,
+          verificationHistoryResult,
+          verificationReportsResult,
+          evalScenariosResult,
+          evalReportResult,
+        ] = await Promise.allSettled([
           getIssueQuality(workspaceId, selectedIssueBugId),
           findDuplicates(workspaceId, selectedIssueBugId),
           triageIssue(workspaceId, selectedIssueBugId),
           getCoverageDelta(workspaceId, selectedIssueBugId),
           getTestSuggestions(workspaceId, selectedIssueBugId),
           listIssueContextReplays(workspaceId, selectedIssueBugId),
+          listVerificationProfileHistory(workspaceId, { issue_id: selectedIssueBugId }),
+          listVerificationProfileReports(workspaceId, { issue_id: selectedIssueBugId }),
+          listEvalScenarios(workspaceId, { issue_id: selectedIssueBugId }),
+          getEvalReport(workspaceId),
         ])
         if (cancelled) return
         if (qualityResult.status === 'fulfilled') {
@@ -821,6 +869,26 @@ function App() {
           setIssueContextReplays(contextReplaysResult.value)
         } else {
           setIssueContextReplays([])
+        }
+        if (verificationHistoryResult.status === 'fulfilled') {
+          setVerificationProfileHistory(verificationHistoryResult.value)
+        } else {
+          setVerificationProfileHistory([])
+        }
+        if (verificationReportsResult.status === 'fulfilled') {
+          setVerificationProfileReports(verificationReportsResult.value)
+        } else {
+          setVerificationProfileReports([])
+        }
+        if (evalScenariosResult.status === 'fulfilled') {
+          setEvalScenarios(evalScenariosResult.value)
+        } else {
+          setEvalScenarios([])
+        }
+        if (evalReportResult.status === 'fulfilled') {
+          setEvalReport(evalReportResult.value)
+        } else {
+          setEvalReport(null)
         }
       } catch (nextError) {
         if (!cancelled) {
@@ -954,6 +1022,7 @@ function App() {
       setVerificationProfileRuntimeDraft('30')
       setVerificationProfileRetryDraft('1')
       setVerificationProfileSourcePathsDraft('')
+      setVerificationProfileChecklistDraft('')
       return
     }
     setVerificationProfileNameDraft(selectedVerificationProfile.name)
@@ -965,6 +1034,7 @@ function App() {
     setVerificationProfileRuntimeDraft(String(selectedVerificationProfile.max_runtime_seconds))
     setVerificationProfileRetryDraft(String(selectedVerificationProfile.retry_count))
     setVerificationProfileSourcePathsDraft(selectedVerificationProfile.source_paths.join(', '))
+    setVerificationProfileChecklistDraft(selectedVerificationProfile.checklist_items.join('\n'))
   }, [selectedVerificationProfile])
 
   useEffect(() => {
@@ -1239,6 +1309,27 @@ function App() {
     }
   }
 
+  async function handleGenerateGuidanceStarter(templateId: 'agents' | 'openhands_repo' | 'conventions') {
+    if (!snapshot) return
+    const candidate = guidanceHealth?.starters.find((item) => item.template_id === templateId)
+    const shouldOverwrite = candidate?.exists
+      ? window.confirm(`${candidate.path} already exists. Replace it with a fresh starter?`)
+      : false
+    if (candidate?.exists && !shouldOverwrite) return
+    setLoading(true)
+    try {
+      await generateGuidanceStarter(snapshot.workspace.workspace_id, {
+        template_id: templateId,
+        overwrite: shouldOverwrite,
+      })
+      await refreshWorkspaceData(snapshot.workspace.workspace_id)
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : String(nextError))
+    } finally {
+      setLoading(false)
+    }
+  }
+
   async function handleRunIssue() {
     if (!snapshot || !selectedIssue || !model) return
     setLoading(true)
@@ -1257,6 +1348,63 @@ function App() {
       setExecutionOpen(true)
       setInstruction('')
       await refreshActivityData(snapshot.workspace.workspace_id)
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : String(nextError))
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  async function handleRunEvalScenario(scenarioId: string) {
+    if (!snapshot || !selectedIssue || !model) return
+    setLoading(true)
+    try {
+      const run = await startRun(snapshot.workspace.workspace_id, selectedIssue.bug_id, {
+        runtime,
+        model,
+        instruction,
+        runbook_id: selectedRunbookId || undefined,
+        eval_scenario_id: scenarioId,
+        planning: planningMode,
+      })
+      setRuns((current) => [run, ...current])
+      setSelectedRunId(run.run_id)
+      setSelectedRunPlan(run.plan ?? null)
+      setActiveView('runs')
+      setExecutionOpen(true)
+      setInstruction('')
+      await refreshActivityData(snapshot.workspace.workspace_id)
+      setEvalScenarios(await listEvalScenarios(snapshot.workspace.workspace_id, { issue_id: selectedIssue.bug_id }))
+      setEvalReport(await getEvalReport(snapshot.workspace.workspace_id))
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : String(nextError))
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  async function handleReplayAllEvalScenarios() {
+    if (!snapshot || !selectedIssue || !model) return
+    setLoading(true)
+    try {
+      const result = await replayEvalScenarios(snapshot.workspace.workspace_id, selectedIssue.bug_id, {
+        runtime,
+        model,
+        instruction,
+        runbook_id: selectedRunbookId || undefined,
+        planning: planningMode,
+      })
+      setRuns((current) => [...result.queued_runs, ...current])
+      if (result.queued_runs[0]) {
+        setSelectedRunId(result.queued_runs[0].run_id)
+        setSelectedRunPlan(result.queued_runs[0].plan ?? null)
+      }
+      setActiveView('runs')
+      setExecutionOpen(true)
+      setInstruction('')
+      await refreshActivityData(snapshot.workspace.workspace_id)
+      setEvalScenarios(await listEvalScenarios(snapshot.workspace.workspace_id, { issue_id: selectedIssue.bug_id }))
+      setEvalReport(await getEvalReport(snapshot.workspace.workspace_id))
     } catch (nextError) {
       setError(nextError instanceof Error ? nextError.message : String(nextError))
     } finally {
@@ -1604,6 +1752,7 @@ function App() {
         max_runtime_seconds: Number.parseInt(verificationProfileRuntimeDraft, 10) || 30,
         retry_count: Number.parseInt(verificationProfileRetryDraft, 10) || 0,
         source_paths: parseLabelDraft(verificationProfileSourcePathsDraft),
+        checklist_items: parseLineDraft(verificationProfileChecklistDraft),
       })
       setVerificationProfiles(await listVerificationProfiles(snapshot.workspace.workspace_id))
       setSelectedVerificationProfileId(saved.profile_id)
@@ -1766,14 +1915,33 @@ function App() {
     if (!snapshot || !selectedIssue) return
     setLoading(true)
     try {
-      await captureIssueContextReplay(
+      const replay = await captureIssueContextReplay(
         snapshot.workspace.workspace_id,
         selectedIssue.bug_id,
         contextReplayLabelDraft.trim() || undefined,
       )
       setIssueContextReplays(await listIssueContextReplays(snapshot.workspace.workspace_id, selectedIssue.bug_id))
+      setSelectedContextReplayId(replay.replay_id)
+      setContextReplayComparison(
+        await compareIssueContextReplay(snapshot.workspace.workspace_id, selectedIssue.bug_id, replay.replay_id),
+      )
       setContextReplayLabelDraft('')
       await refreshActivityData(snapshot.workspace.workspace_id)
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : String(nextError))
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  async function handleCompareIssueContextReplay(replayId: string) {
+    if (!snapshot || !selectedIssue) return
+    setLoading(true)
+    try {
+      setSelectedContextReplayId(replayId)
+      setContextReplayComparison(
+        await compareIssueContextReplay(snapshot.workspace.workspace_id, selectedIssue.bug_id, replayId),
+      )
     } catch (nextError) {
       setError(nextError instanceof Error ? nextError.message : String(nextError))
     } finally {
@@ -2039,10 +2207,12 @@ function App() {
         activeView={activeView}
         loading={loading}
         workspaceGuidance={workspaceGuidance}
+        guidanceHealth={guidanceHealth}
         verificationProfileCount={verificationProfiles.length}
         onWorkspacePathChange={setWorkspacePath}
         onLoadWorkspace={() => void loadWorkspaceState(workspacePath)}
         onScanWorkspace={() => void handleScan()}
+        onGenerateGuidanceStarter={(templateId) => void handleGenerateGuidanceStarter(templateId)}
         onSelectWorkspace={(rootPath) => void loadWorkspaceState(rootPath)}
         onChangeView={setActiveView}
         canScan={Boolean(snapshot)}
@@ -2057,6 +2227,7 @@ function App() {
           costSummary={costSummary}
           guidanceCount={workspaceGuidance.length}
           hasRepoGuidance={workspaceGuidance.length > 0}
+          guidanceHealth={guidanceHealth}
           backendHealthy={backendHealthy}
           canExport={Boolean(snapshot)}
           canToggleExecution={Boolean(snapshot && selectedIssue)}
@@ -2112,6 +2283,17 @@ function App() {
                   <span className="tag">Recommended: `AGENTS.md`</span>
                   <span className="tag">Useful sections: setup, commands, code style, review expectations</span>
                   <span className="tag">Optional: `.openhands/skills/*.md` or `.devin/wiki.json`</span>
+                </div>
+                <div className="toolbar-row">
+                  <button type="button" onClick={() => void handleGenerateGuidanceStarter('agents')} disabled={loading}>
+                    Generate AGENTS.md
+                  </button>
+                  <button type="button" className="ghost-button" onClick={() => void handleGenerateGuidanceStarter('openhands_repo')} disabled={loading}>
+                    Generate repo microagent
+                  </button>
+                  <button type="button" className="ghost-button" onClick={() => void handleGenerateGuidanceStarter('conventions')} disabled={loading}>
+                    Generate CONVENTIONS.md
+                  </button>
                 </div>
               </section>
             ) : null}
@@ -2269,8 +2451,14 @@ function App() {
                 workspaceGuidance={workspaceGuidance}
                 repoMap={repoMap}
                 verificationProfiles={verificationProfiles}
+                verificationProfileHistory={verificationProfileHistory}
+                verificationProfileReports={verificationProfileReports}
+                evalScenarios={evalScenarios}
+                evalReport={evalReport}
                 issueContextReplays={issueContextReplays}
                 contextReplayLabelDraft={contextReplayLabelDraft}
+                selectedContextReplayId={selectedContextReplayId}
+                contextReplayComparison={contextReplayComparison}
                 selectedTicketContextId={selectedTicketContextId}
                 ticketContextProviderDraft={ticketContextProviderDraft}
                 ticketContextExternalIdDraft={ticketContextExternalIdDraft}
@@ -2363,6 +2551,7 @@ function App() {
                 onBrowserDumpScreenshotPathChange={setBrowserDumpScreenshotPathDraft}
                 onBrowserDumpNotesChange={setBrowserDumpNotesDraft}
                 onContextReplayLabelChange={setContextReplayLabelDraft}
+                onSelectContextReplay={setSelectedContextReplayId}
                 onIssueLabelsChange={setIssueLabelsDraft}
                 onIssueNotesChange={setIssueNotesDraft}
                 onIssueFollowupChange={setIssueFollowupDraft}
@@ -2395,6 +2584,9 @@ function App() {
                 onSaveBrowserDump={() => void handleSaveBrowserDump()}
                 onDeleteBrowserDump={() => void handleDeleteBrowserDump()}
                 onCaptureIssueContextReplay={() => void handleCaptureIssueContextReplay()}
+                onCompareIssueContextReplay={(replayId) => void handleCompareIssueContextReplay(replayId)}
+                onRunEvalScenario={(scenarioId) => void handleRunEvalScenario(scenarioId)}
+                onReplayAllEvalScenarios={() => void handleReplayAllEvalScenarios()}
                 onRetryRun={() => void handleRetryRun()}
                 onCancelRun={() => void handleCancelRun()}
                 selectedRunPlan={selectedRunPlan}
@@ -2428,6 +2620,7 @@ function App() {
                   verificationProfileRuntimeDraft={verificationProfileRuntimeDraft}
                   verificationProfileRetryDraft={verificationProfileRetryDraft}
                   verificationProfileSourcePathsDraft={verificationProfileSourcePathsDraft}
+                  verificationProfileChecklistDraft={verificationProfileChecklistDraft}
                   settings={settings}
                   terminalId={terminalId}
                   terminalInput={terminalInput}
@@ -2468,6 +2661,7 @@ function App() {
                   onVerificationProfileRuntimeDraftChange={setVerificationProfileRuntimeDraft}
                   onVerificationProfileRetryDraftChange={setVerificationProfileRetryDraft}
                   onVerificationProfileSourcePathsDraftChange={setVerificationProfileSourcePathsDraft}
+                  onVerificationProfileChecklistDraftChange={setVerificationProfileChecklistDraft}
                   onApplySelectedVerificationProfile={handleApplyVerificationProfile}
                   onSaveVerificationProfile={() => void handleSaveVerificationProfile()}
                   onDeleteVerificationProfile={() => void handleDeleteVerificationProfile()}

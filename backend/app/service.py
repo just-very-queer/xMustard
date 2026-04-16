@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from fnmatch import fnmatch
 import hashlib
 import json
 import os
@@ -14,8 +15,10 @@ import uuid
 from pathlib import Path
 from typing import Optional
 from urllib.parse import quote
+import yaml
 
 from .models import (
+    AcceptanceCriteriaReview,
     ActivityActor,
     ActivityOverview,
     ActivityRecord,
@@ -26,9 +29,27 @@ from .models import (
     CostSummary,
     CoverageDelta,
     CoverageResult,
+    DynamicContextBundle,
     DismissImprovementRequest,
     DuplicateMatch,
     EvidenceRef,
+    EvalScenarioRecord,
+    EvalScenarioBaselineComparison,
+    EvalFreshExecutionComparison,
+    EvalFreshReplayRanking,
+    EvalFreshReplayRankingEntry,
+    EvalFreshReplayTrend,
+    EvalFreshReplayTrendEntry,
+    EvalFreshRunSummary,
+    EvalReplayBatchRecord,
+    EvalScenarioReplayRequest,
+    EvalScenarioReplayResult,
+    EvalScenarioReport,
+    EvalScenarioUpsertRequest,
+    EvalScenarioVerificationProfileDelta,
+    EvalVariantRollup,
+    EvalScenarioVariantDiff,
+    EvalWorkspaceReport,
     ExportBundle,
     FixRecord,
     FixDraftSuggestion,
@@ -37,7 +58,11 @@ from .models import (
     GitHubIssueImport,
     GitHubPRCreate,
     GitHubPRResult,
+    GuidanceStarterRecord,
+    GuidanceStarterRequest,
+    GuidanceStarterResult,
     ImprovementSuggestion,
+    IssueContextReplayComparison,
     IssueContextReplayRecord,
     IssueContextReplayRequest,
     IntegrationConfig,
@@ -58,7 +83,13 @@ from .models import (
     PlanRejectRequest,
     PlanStep,
     PromoteSignalRequest,
+    RepoGuidanceHealth,
     RepoGuidanceRecord,
+    RepoConfigHealth,
+    RepoConfigRecord,
+    RepoMCPServerRecord,
+    RepoPathInstructionMatch,
+    RepoPathInstructionRecord,
     RunMetrics,
     RunPlan,
     RunRecord,
@@ -68,7 +99,10 @@ from .models import (
     RunbookRecord,
     RunSessionInsight,
     RunbookUpsertRequest,
+    ScopeWarning,
     ReviewQueueItem,
+    RelatedContextRecord,
+    RepoMapSymbolRecord,
     RepoMapSummary,
     SavedIssueView,
     SavedIssueViewRequest,
@@ -80,7 +114,10 @@ from .models import (
     TicketContextUpsertRequest,
     TestSuggestion,
     TriageSuggestion,
+    VerificationChecklistResult,
+    VerificationProfileDimensionSummary,
     VerificationProfileRecord,
+    VerificationProfileReport,
     VerificationProfileUpsertRequest,
     VerificationCommandResult,
     VerificationRecord,
@@ -115,6 +152,9 @@ class TrackerService:
     MAX_CACHED_SNAPSHOT_BYTES = 25 * 1024 * 1024
     SCANNER_VERSION = 2
     GUIDANCE_LIMIT = 6
+    GUIDANCE_STARTER_MARKER = "xmustard:starter-template"
+    GUIDANCE_PLACEHOLDER_MARKER = "TODO(xmustard)"
+    REPO_CONFIG_CANDIDATES = (".xmustard.yaml", ".xmustard.yml", ".xmustard.json")
 
     def __init__(self, store: FileStore) -> None:
         self.store = store
@@ -770,6 +810,7 @@ class TrackerService:
             max_runtime_seconds=max(1, int(request.max_runtime_seconds)),
             retry_count=max(0, int(request.retry_count)),
             source_paths=[item.strip() for item in request.source_paths if item.strip()][:8],
+            checklist_items=self._normalize_text_list(request.checklist_items, limit=12),
             built_in=False,
             updated_at=now,
         )
@@ -785,6 +826,125 @@ class TrackerService:
             details={"profile_id": profile_id, "coverage_format": profile.coverage_format},
         )
         return profile
+
+    def list_verification_profile_history(
+        self,
+        workspace_id: str,
+        profile_id: Optional[str] = None,
+        issue_id: Optional[str] = None,
+    ) -> list[VerificationProfileExecutionResult]:
+        self.get_workspace(workspace_id)
+        items = self.store.list_verification_profile_history(workspace_id)
+        if profile_id:
+            items = [item for item in items if item.profile_id == profile_id]
+        if issue_id:
+            items = [item for item in items if item.issue_id == issue_id]
+        return items
+
+    def list_verification_profile_reports(
+        self,
+        workspace_id: str,
+        issue_id: Optional[str] = None,
+    ) -> list[VerificationProfileReport]:
+        profiles = self.list_verification_profiles(workspace_id)
+        history = self.list_verification_profile_history(workspace_id, issue_id=issue_id)
+        run_lookup: dict[str, Optional[RunRecord]] = {}
+        for item in history:
+            if item.run_id and item.run_id not in run_lookup:
+                run_lookup[item.run_id] = self.store.load_run(workspace_id, item.run_id)
+        history_by_profile: dict[str, list[VerificationProfileExecutionResult]] = {}
+        for item in history:
+            history_by_profile.setdefault(item.profile_id, []).append(item)
+
+        reports: list[VerificationProfileReport] = []
+        for profile in profiles:
+            records = history_by_profile.get(profile.profile_id, [])
+            total_runs = len(records)
+            success_runs = sum(1 for item in records if item.success)
+            failed_runs = total_runs - success_runs
+            confidence_counts = {
+                "high": sum(1 for item in records if item.confidence == "high"),
+                "medium": sum(1 for item in records if item.confidence == "medium"),
+                "low": sum(1 for item in records if item.confidence == "low"),
+            }
+            avg_attempt_count = round(sum(item.attempt_count for item in records) / total_runs, 2) if total_runs else 0.0
+            checklist_total = sum(len(item.checklist_results) for item in records)
+            checklist_passed = sum(sum(1 for result in item.checklist_results if result.passed) for item in records)
+            latest = records[0] if records else None
+            reports.append(
+                VerificationProfileReport(
+                    profile_id=profile.profile_id,
+                    workspace_id=workspace_id,
+                    profile_name=profile.name,
+                    built_in=profile.built_in,
+                    issue_id=issue_id,
+                    total_runs=total_runs,
+                    success_runs=success_runs,
+                    failed_runs=failed_runs,
+                    success_rate=round((success_runs / total_runs) * 100, 1) if total_runs else 0.0,
+                    confidence_counts=confidence_counts,
+                    avg_attempt_count=avg_attempt_count,
+                    checklist_pass_rate=round((checklist_passed / checklist_total) * 100, 1) if checklist_total else 0.0,
+                    last_run_at=latest.created_at if latest else None,
+                    last_issue_id=latest.issue_id if latest else None,
+                    last_run_id=latest.run_id if latest else None,
+                    last_confidence=latest.confidence if latest else None,
+                    last_success=latest.success if latest else None,
+                    runtime_breakdown=self._build_verification_dimension_breakdown(
+                        records,
+                        run_lookup,
+                        lambda item, run: (
+                            (run.runtime, run.runtime) if run is not None else ("manual", "manual")
+                        ),
+                    ),
+                    model_breakdown=self._build_verification_dimension_breakdown(
+                        records,
+                        run_lookup,
+                        lambda item, run: (
+                            (run.model, run.model) if run is not None else ("manual", "manual")
+                        ),
+                    ),
+                    branch_breakdown=self._build_verification_dimension_breakdown(
+                        records,
+                        run_lookup,
+                        lambda item, run: (
+                            (run.worktree.branch, run.worktree.branch)
+                            if run is not None and run.worktree and run.worktree.branch
+                            else ("unknown", "unknown")
+                        ),
+                    ),
+                )
+            )
+        return reports
+
+    def _build_verification_dimension_breakdown(
+        self,
+        records: list[VerificationProfileExecutionResult],
+        run_lookup: dict[str, Optional[RunRecord]],
+        resolver,
+    ) -> list[VerificationProfileDimensionSummary]:
+        buckets: dict[str, VerificationProfileDimensionSummary] = {}
+        for item in records:
+            run = run_lookup.get(item.run_id) if item.run_id else None
+            key, label = resolver(item, run)
+            key = key or "unknown"
+            label = label or key
+            current = buckets.get(key)
+            if current is None:
+                current = VerificationProfileDimensionSummary(key=key, label=label)
+                buckets[key] = current
+            current.total_runs += 1
+            if item.success:
+                current.success_runs += 1
+            else:
+                current.failed_runs += 1
+            current.success_rate = round((current.success_runs / current.total_runs) * 100, 1)
+            if current.last_run_at is None or item.created_at > current.last_run_at:
+                current.last_run_at = item.created_at
+        return sorted(
+            buckets.values(),
+            key=lambda item: (-item.total_runs, item.label.lower(), item.key),
+        )
 
     def delete_verification_profile(self, workspace_id: str, profile_id: str) -> None:
         self.get_workspace(workspace_id)
@@ -819,6 +979,15 @@ class TrackerService:
             request.run_id,
             issue_id,
         )
+        execution = execution.model_copy(
+            update={
+                "profile_name": profile.name,
+                "issue_id": issue_id,
+                "run_id": request.run_id,
+                "checklist_results": self._build_verification_checklist_results(profile, execution),
+            }
+        )
+        execution = execution.model_copy(update={"confidence": self._score_verification_execution_confidence(execution)})
 
         if execution.coverage_result is not None:
             self._save_coverage_result(execution.coverage_result)
@@ -837,6 +1006,9 @@ class TrackerService:
                     "files_covered": execution.coverage_result.files_covered,
                 },
             )
+        history = self.store.list_verification_profile_history(workspace_id)
+        history.append(execution)
+        self.store.save_verification_profile_history(workspace_id, history)
 
         verification_evidence = list(issue.verification_evidence)
         if execution.coverage_report_path:
@@ -882,6 +1054,8 @@ class TrackerService:
                 "profile_id": profile.profile_id,
                 "attempt_count": execution.attempt_count,
                 "success": execution.success,
+                "confidence": execution.confidence,
+                "checklist_results": [item.model_dump(mode="json") for item in execution.checklist_results],
                 "coverage_report_path": execution.coverage_report_path,
             },
         )
@@ -1052,6 +1226,7 @@ class TrackerService:
             guidance_paths=[item.path for item in packet.guidance],
             verification_profile_ids=[item.profile_id for item in packet.available_verification_profiles[:8]],
             ticket_context_ids=[item.context_id for item in packet.ticket_contexts[:8]],
+            browser_dump_ids=[item.dump_id for item in packet.browser_dumps[:8]],
         )
         replays = self.store.list_context_replays(workspace_id)
         replays.append(replay)
@@ -1067,6 +1242,90 @@ class TrackerService:
             details={"replay_id": replay.replay_id},
         )
         return replay
+
+    def compare_issue_context_replay(
+        self,
+        workspace_id: str,
+        issue_id: str,
+        replay_id: str,
+    ) -> IssueContextReplayComparison:
+        packet = self.build_issue_context(workspace_id, issue_id)
+        replay = next((item for item in self.list_issue_context_replays(workspace_id, issue_id) if item.replay_id == replay_id), None)
+        if replay is None:
+            raise FileNotFoundError(replay_id)
+
+        current_tree_focus = packet.tree_focus[:12]
+        current_guidance_paths = [item.path for item in packet.guidance]
+        current_verification_profile_ids = [item.profile_id for item in packet.available_verification_profiles[:8]]
+        current_ticket_context_ids = [item.context_id for item in packet.ticket_contexts[:8]]
+        current_browser_dump_ids = [item.dump_id for item in packet.browser_dumps[:8]]
+
+        added_tree_focus, removed_tree_focus = self._diff_ordered_strings(replay.tree_focus, current_tree_focus)
+        added_guidance_paths, removed_guidance_paths = self._diff_ordered_strings(replay.guidance_paths, current_guidance_paths)
+        added_verification_profile_ids, removed_verification_profile_ids = self._diff_ordered_strings(
+            replay.verification_profile_ids,
+            current_verification_profile_ids,
+        )
+        added_ticket_context_ids, removed_ticket_context_ids = self._diff_ordered_strings(
+            replay.ticket_context_ids,
+            current_ticket_context_ids,
+        )
+        added_browser_dump_ids, removed_browser_dump_ids = self._diff_ordered_strings(
+            replay.browser_dump_ids,
+            current_browser_dump_ids,
+        )
+        prompt_changed = replay.prompt != packet.prompt
+        changed = prompt_changed or any(
+            (
+                added_tree_focus,
+                removed_tree_focus,
+                added_guidance_paths,
+                removed_guidance_paths,
+                added_verification_profile_ids,
+                removed_verification_profile_ids,
+                added_ticket_context_ids,
+                removed_ticket_context_ids,
+                added_browser_dump_ids,
+                removed_browser_dump_ids,
+            )
+        )
+
+        return IssueContextReplayComparison(
+            replay=replay,
+            current_prompt=packet.prompt,
+            current_tree_focus=current_tree_focus,
+            current_guidance_paths=current_guidance_paths,
+            current_verification_profile_ids=current_verification_profile_ids,
+            current_ticket_context_ids=current_ticket_context_ids,
+            current_browser_dump_ids=current_browser_dump_ids,
+            prompt_changed=prompt_changed,
+            changed=changed,
+            saved_prompt_length=len(replay.prompt),
+            current_prompt_length=len(packet.prompt),
+            added_tree_focus=added_tree_focus,
+            removed_tree_focus=removed_tree_focus,
+            added_guidance_paths=added_guidance_paths,
+            removed_guidance_paths=removed_guidance_paths,
+            added_verification_profile_ids=added_verification_profile_ids,
+            removed_verification_profile_ids=removed_verification_profile_ids,
+            added_ticket_context_ids=added_ticket_context_ids,
+            removed_ticket_context_ids=removed_ticket_context_ids,
+            added_browser_dump_ids=added_browser_dump_ids,
+            removed_browser_dump_ids=removed_browser_dump_ids,
+            summary=self._summarize_context_replay_comparison(
+                prompt_changed=prompt_changed,
+                added_tree_focus=added_tree_focus,
+                removed_tree_focus=removed_tree_focus,
+                added_guidance_paths=added_guidance_paths,
+                removed_guidance_paths=removed_guidance_paths,
+                added_verification_profile_ids=added_verification_profile_ids,
+                removed_verification_profile_ids=removed_verification_profile_ids,
+                added_ticket_context_ids=added_ticket_context_ids,
+                removed_ticket_context_ids=removed_ticket_context_ids,
+                added_browser_dump_ids=added_browser_dump_ids,
+                removed_browser_dump_ids=removed_browser_dump_ids,
+            ),
+        )
 
     def list_browser_dumps(self, workspace_id: str, issue_id: Optional[str] = None) -> list[BrowserDumpRecord]:
         self.get_workspace(workspace_id)
@@ -1137,6 +1396,186 @@ class TrackerService:
             actor=build_activity_actor("operator", "operator"),
             issue_id=issue_id,
             details={"dump_id": dump_id},
+        )
+
+    def list_eval_scenarios(self, workspace_id: str, issue_id: Optional[str] = None) -> list[EvalScenarioRecord]:
+        self.get_workspace(workspace_id)
+        items = self.store.list_eval_scenarios(workspace_id)
+        if issue_id:
+            items = [item for item in items if item.issue_id == issue_id]
+        return items
+
+    def _get_eval_scenario(self, workspace_id: str, scenario_id: str) -> EvalScenarioRecord:
+        scenario = next(
+            (item for item in self.store.list_eval_scenarios(workspace_id) if item.scenario_id == scenario_id),
+            None,
+        )
+        if scenario is None:
+            raise FileNotFoundError(scenario_id)
+        return scenario
+
+    def save_eval_scenario(self, workspace_id: str, request: EvalScenarioUpsertRequest) -> EvalScenarioRecord:
+        self._get_issue_from_snapshot(workspace_id, request.issue_id)
+        existing = self.store.list_eval_scenarios(workspace_id)
+        scenario_id = request.scenario_id or self._slug_runbook_name(f"eval-{request.name}")
+        previous = next((item for item in existing if item.scenario_id == scenario_id), None)
+        now = utc_now()
+        record = EvalScenarioRecord(
+            scenario_id=scenario_id,
+            workspace_id=workspace_id,
+            issue_id=request.issue_id,
+            name=request.name.strip(),
+            description=request.description.strip() if request.description else None,
+            baseline_replay_id=request.baseline_replay_id.strip() if request.baseline_replay_id else None,
+            guidance_paths=self._normalize_text_list(request.guidance_paths, limit=12),
+            ticket_context_ids=self._normalize_text_list(request.ticket_context_ids, limit=12),
+            verification_profile_ids=self._normalize_text_list(request.verification_profile_ids, limit=12),
+            run_ids=self._normalize_text_list(request.run_ids, limit=24),
+            browser_dump_ids=self._normalize_text_list(request.browser_dump_ids, limit=12),
+            notes=request.notes.strip() if request.notes else None,
+            created_at=previous.created_at if previous else now,
+            updated_at=now,
+        )
+        remaining = [item for item in existing if item.scenario_id != scenario_id]
+        remaining.append(record)
+        self.store.save_eval_scenarios(workspace_id, remaining)
+        self._record_activity(
+            workspace_id=workspace_id,
+            entity_type="issue",
+            entity_id=request.issue_id,
+            action="eval_scenario.saved",
+            summary=f"Saved eval scenario {record.name}",
+            actor=build_activity_actor("operator", "operator"),
+            issue_id=request.issue_id,
+            details={"scenario_id": record.scenario_id, "baseline_replay_id": record.baseline_replay_id},
+        )
+        return record
+
+    def delete_eval_scenario(self, workspace_id: str, scenario_id: str) -> None:
+        self.get_workspace(workspace_id)
+        existing = self.store.list_eval_scenarios(workspace_id)
+        scenario = next((item for item in existing if item.scenario_id == scenario_id), None)
+        if not scenario:
+            raise FileNotFoundError(scenario_id)
+        remaining = [item for item in existing if item.scenario_id != scenario_id]
+        self.store.save_eval_scenarios(workspace_id, remaining)
+        self._record_activity(
+            workspace_id=workspace_id,
+            entity_type="issue",
+            entity_id=scenario.issue_id,
+            action="eval_scenario.deleted",
+            summary=f"Deleted eval scenario {scenario.name}",
+            actor=build_activity_actor("operator", "operator"),
+            issue_id=scenario.issue_id,
+            details={"scenario_id": scenario_id},
+        )
+
+    def get_eval_report(self, workspace_id: str, scenario_id: Optional[str] = None) -> EvalWorkspaceReport:
+        self.get_workspace(workspace_id)
+        scenarios = self.list_eval_scenarios(workspace_id)
+        if scenario_id:
+            scenarios = [item for item in scenarios if item.scenario_id == scenario_id]
+            if not scenarios:
+                raise FileNotFoundError(scenario_id)
+
+        scenario_reports = [self._build_eval_scenario_report(workspace_id, scenario) for scenario in scenarios]
+        scenario_reports = self._attach_eval_baseline_comparisons(workspace_id, scenario_reports)
+        scenario_reports = self._attach_eval_fresh_comparisons(scenario_reports)
+        run_count = sum(len(item.run_metrics) for item in scenario_reports)
+        success_runs = sum(item.success_runs for item in scenario_reports)
+        failed_runs = sum(item.failed_runs for item in scenario_reports)
+        total_estimated_cost = round(sum(item.total_estimated_cost for item in scenario_reports), 4)
+        total_duration_ms = sum(sum(metric.duration_ms for metric in item.run_metrics) for item in scenario_reports)
+        profile_runs = sum(
+            sum(profile.total_runs for profile in item.verification_profile_reports)
+            for item in scenario_reports
+        )
+        successful_profile_runs = sum(
+            sum(profile.success_runs for profile in item.verification_profile_reports)
+            for item in scenario_reports
+        )
+        replay_batches = self.store.list_eval_replay_batches(workspace_id)
+        fresh_replay_rankings = self._build_eval_fresh_replay_rankings(scenario_reports)
+        return EvalWorkspaceReport(
+            workspace_id=workspace_id,
+            scenario_count=len(scenario_reports),
+            run_count=run_count,
+            success_runs=success_runs,
+            failed_runs=failed_runs,
+            total_estimated_cost=total_estimated_cost,
+            total_duration_ms=total_duration_ms,
+            verification_success_rate=round((successful_profile_runs / profile_runs) * 100, 1) if profile_runs else 0.0,
+            cost_summary=CostSummary.model_validate(self.get_workspace_cost_summary(workspace_id)),
+            scenario_reports=scenario_reports,
+            replay_batches=replay_batches,
+            fresh_replay_rankings=fresh_replay_rankings,
+            fresh_replay_trends=self._build_eval_fresh_replay_trends(
+                workspace_id,
+                scenarios,
+                scenario_reports,
+                fresh_replay_rankings,
+                replay_batches,
+            ),
+            guidance_variant_rollups=self._build_eval_variant_rollups(workspace_id, scenarios, "guidance"),
+            ticket_context_variant_rollups=self._build_eval_variant_rollups(workspace_id, scenarios, "ticket_context"),
+        )
+
+    def replay_eval_scenarios(
+        self,
+        workspace_id: str,
+        issue_id: str,
+        request: EvalScenarioReplayRequest,
+    ) -> EvalScenarioReplayResult:
+        self._get_issue_from_snapshot(workspace_id, issue_id)
+        scenarios = self.list_eval_scenarios(workspace_id, issue_id=issue_id)
+        if request.scenario_ids:
+            allowed = set(request.scenario_ids)
+            scenarios = [item for item in scenarios if item.scenario_id in allowed]
+        if not scenarios:
+            raise FileNotFoundError(issue_id)
+        batch_id = f"evalbatch_{uuid.uuid4().hex[:12]}"
+        queued_runs = [
+            RunRecord.model_validate(
+                self.start_issue_run(
+                    workspace_id,
+                    issue_id,
+                    request.runtime,
+                    request.model,
+                    request.instruction,
+                    request.runbook_id,
+                    scenario.scenario_id,
+                    batch_id,
+                    request.planning,
+                )
+            )
+            for scenario in scenarios
+        ]
+        self.store.save_eval_replay_batches(
+            workspace_id,
+            [
+                *self.store.list_eval_replay_batches(workspace_id),
+                EvalReplayBatchRecord(
+                    batch_id=batch_id,
+                    workspace_id=workspace_id,
+                    issue_id=issue_id,
+                    runtime=request.runtime,
+                    model=request.model,
+                    scenario_ids=[item.scenario_id for item in scenarios],
+                    queued_run_ids=[item.run_id for item in queued_runs],
+                    instruction=request.instruction,
+                    runbook_id=request.runbook_id,
+                    planning=request.planning,
+                ),
+            ],
+        )
+        return EvalScenarioReplayResult(
+            workspace_id=workspace_id,
+            issue_id=issue_id,
+            runtime=request.runtime,
+            model=request.model,
+            batch_id=batch_id,
+            scenario_ids=[item.scenario_id for item in scenarios],
+            queued_runs=queued_runs,
         )
 
     def list_review_queue(self, workspace_id: str) -> list[ReviewQueueItem]:
@@ -1300,6 +1739,26 @@ class TrackerService:
             }
         )
 
+    def eval_issue_work(
+        self,
+        workspace_id: str,
+        scenario_id: str,
+        runbook_id: Optional[str] = None,
+    ) -> IssueContextPacket:
+        scenario = self._get_eval_scenario(workspace_id, scenario_id)
+        packet = self.build_issue_context(workspace_id, scenario.issue_id)
+        packet = self._apply_eval_scenario_to_packet(packet, scenario)
+        if not runbook_id:
+            return packet
+        runbook = self._resolve_runbook(workspace_id, runbook_id)
+        selected_steps = self._render_runbook_steps(runbook.template)
+        return packet.model_copy(
+            update={
+                "runbook": selected_steps,
+                "prompt": f"{packet.prompt}\n\nSelected runbook: {runbook.name}\n{runbook.template.strip()}",
+            }
+        )
+
     def list_tree(self, workspace_id: str, relative_path: str = "") -> list[dict]:
         workspace = self.get_workspace(workspace_id)
         return list_tree_nodes(Path(workspace.root_path), relative_path)
@@ -1307,6 +1766,96 @@ class TrackerService:
     def list_workspace_guidance(self, workspace_id: str) -> list[RepoGuidanceRecord]:
         workspace = self.get_workspace(workspace_id)
         return self._collect_workspace_guidance(Path(workspace.root_path), workspace_id)
+
+    def get_workspace_guidance_health(self, workspace_id: str) -> RepoGuidanceHealth:
+        workspace = self.get_workspace(workspace_id)
+        root = Path(workspace.root_path)
+        guidance = self._collect_workspace_guidance(root, workspace_id)
+        present_files = [item.path for item in guidance]
+        starters: list[GuidanceStarterRecord] = []
+        stale_files: list[str] = []
+        missing_files: list[str] = []
+
+        for starter in self._guidance_starter_specs(workspace):
+            candidate_path = root / starter["path"]
+            exists = candidate_path.exists()
+            stale = exists and self._guidance_file_is_stale(candidate_path)
+            starters.append(
+                GuidanceStarterRecord(
+                    template_id=starter["template_id"],
+                    title=starter["title"],
+                    path=starter["path"],
+                    description=starter["description"],
+                    recommended=starter["recommended"],
+                    exists=exists,
+                    stale=stale,
+                )
+            )
+            if stale:
+                stale_files.append(starter["path"])
+            if starter["recommended"] and not exists:
+                missing_files.append(starter["path"])
+
+        instruction_count = sum(1 for item in guidance if item.kind in {"agent_instructions", "conventions"})
+        always_on_count = sum(1 for item in guidance if item.always_on)
+        recommended_files = [item.path for item in starters if item.recommended]
+
+        if stale_files:
+            status = "stale"
+            summary = "Starter guidance exists but still contains xMustard placeholders that should be customized."
+        elif not guidance:
+            status = "missing"
+            summary = "No repository guidance files were found. Generate a starter AGENTS.md to ground issue context and runs."
+        elif missing_files:
+            status = "partial"
+            summary = "Guidance is present, but the recommended starter set is incomplete."
+        else:
+            status = "healthy"
+            summary = "Repository guidance is present and ready to shape issue context and runs."
+
+        return RepoGuidanceHealth(
+            workspace_id=workspace_id,
+            status=status,
+            summary=summary,
+            guidance_count=len(guidance),
+            always_on_count=always_on_count,
+            instruction_count=instruction_count,
+            present_files=present_files,
+            missing_files=missing_files,
+            stale_files=stale_files,
+            recommended_files=recommended_files,
+            starters=starters,
+        )
+
+    def generate_guidance_starter(self, workspace_id: str, request: GuidanceStarterRequest) -> GuidanceStarterResult:
+        workspace = self.get_workspace(workspace_id)
+        root = Path(workspace.root_path)
+        spec = next((item for item in self._guidance_starter_specs(workspace) if item["template_id"] == request.template_id), None)
+        if spec is None:
+            raise ValueError(f"Unknown guidance starter template: {request.template_id}")
+        relative_path = str(spec["path"])
+        content = str(spec["content"])
+        path = root / relative_path
+        existed_before = path.exists()
+        if existed_before and not request.overwrite:
+            raise FileExistsError(relative_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        self._record_activity(
+            workspace_id=workspace_id,
+            entity_type="workspace",
+            entity_id=workspace_id,
+            action="guidance.starter_generated",
+            summary=f"Generated guidance starter {relative_path}",
+            actor=build_activity_actor("operator", "operator"),
+            details={"template_id": request.template_id, "path": relative_path, "overwrite": request.overwrite},
+        )
+        return GuidanceStarterResult(
+            workspace_id=workspace_id,
+            template_id=request.template_id,
+            path=relative_path,
+            overwritten=existed_before and request.overwrite,
+        )
 
     def read_repo_map(self, workspace_id: str) -> RepoMapSummary:
         workspace = self.get_workspace(workspace_id)
@@ -1316,6 +1865,117 @@ class TrackerService:
         repo_map = build_repo_map(Path(workspace.root_path), workspace_id)
         self.store.save_repo_map(workspace_id, repo_map)
         return repo_map
+
+    def read_workspace_repo_config(self, workspace_id: str) -> RepoConfigRecord:
+        workspace = self.get_workspace(workspace_id)
+        root = Path(workspace.root_path)
+        for relative_path in self.REPO_CONFIG_CANDIDATES:
+            candidate = root / relative_path
+            if candidate.is_file():
+                return self._load_repo_config_from_path(workspace_id, root, candidate)
+        return RepoConfigRecord(workspace_id=workspace_id)
+
+    def get_workspace_repo_config_health(self, workspace_id: str) -> RepoConfigHealth:
+        config = self.read_workspace_repo_config(workspace_id)
+        if not config.source_path:
+            return RepoConfigHealth(
+                workspace_id=workspace_id,
+                status="missing",
+                summary="No .xmustard config was found. Add one to define path-specific instructions, filters, and MCP/browser context guidance.",
+            )
+        summary_parts = [f"Loaded {config.source_path}"]
+        if config.path_instructions:
+            summary_parts.append(f"{len(config.path_instructions)} path instruction(s)")
+        if config.path_filters:
+            summary_parts.append(f"{len(config.path_filters)} path filter(s)")
+        if config.mcp_servers:
+            summary_parts.append(f"{len(config.mcp_servers)} MCP server hint(s)")
+        return RepoConfigHealth(
+            workspace_id=workspace_id,
+            status="configured",
+            source_path=config.source_path,
+            summary=". ".join(summary_parts) + ".",
+            path_instruction_count=len(config.path_instructions),
+            path_filter_count=len(config.path_filters),
+            code_guideline_count=len(config.code_guidelines),
+            mcp_server_count=len(config.mcp_servers),
+        )
+
+    def _load_repo_config_from_path(self, workspace_id: str, root: Path, path: Path) -> RepoConfigRecord:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+        payload: object
+        if path.suffix == ".json":
+            payload = json.loads(text or "{}")
+        else:
+            payload = yaml.safe_load(text) or {}
+        if not isinstance(payload, dict):
+            raise ValueError(f"Invalid xMustard repo config in {path.name}: top-level value must be an object")
+        reviews = payload.get("reviews") if isinstance(payload.get("reviews"), dict) else {}
+        instructions = reviews.get("path_instructions") if isinstance(reviews, dict) and isinstance(reviews.get("path_instructions"), list) else []
+        filters = reviews.get("path_filters") if isinstance(reviews, dict) and isinstance(reviews.get("path_filters"), list) else []
+        raw_guidelines = payload.get("code_guidelines") or payload.get("guidance") or []
+        if isinstance(raw_guidelines, str):
+            code_guidelines = [raw_guidelines]
+        elif isinstance(raw_guidelines, list):
+            code_guidelines = raw_guidelines
+        else:
+            code_guidelines = []
+        raw_mcp_servers = payload.get("mcp_servers") or []
+        mcp_servers = raw_mcp_servers if isinstance(raw_mcp_servers, list) else []
+        source_path = str(path.relative_to(root))
+        return RepoConfigRecord(
+            workspace_id=workspace_id,
+            source_path=source_path,
+            description=str(payload.get("description") or payload.get("repository") or "").strip(),
+            path_filters=[str(item).strip() for item in filters if str(item).strip()],
+            path_instructions=[
+                RepoPathInstructionRecord(
+                    instruction_id="cfg_"
+                    + hashlib.sha1(
+                        f"{workspace_id}:{source_path}:{index}:{str(entry.get('path') or '').strip()}".encode("utf-8")
+                    ).hexdigest()[:12],
+                    path=str(entry.get("path") or "").strip(),
+                    instructions=str(entry.get("instructions") or "").strip(),
+                    title=str(entry.get("title") or "").strip() or None,
+                    source_path=source_path,
+                )
+                for index, entry in enumerate(instructions)
+                if isinstance(entry, dict) and str(entry.get("path") or "").strip() and str(entry.get("instructions") or "").strip()
+            ],
+            code_guidelines=[str(item).strip() for item in code_guidelines if str(item).strip()],
+            mcp_servers=[
+                RepoMCPServerRecord(
+                    name=str(item.get("name") or "").strip(),
+                    description=str(item.get("description") or "").strip(),
+                    usage=str(item.get("usage") or "").strip(),
+                )
+                for item in mcp_servers
+                if isinstance(item, dict) and str(item.get("name") or "").strip()
+            ],
+        )
+
+    def _match_repo_path_instructions(
+        self,
+        config: RepoConfigRecord,
+        candidate_paths: list[str],
+    ) -> list[RepoPathInstructionMatch]:
+        matches: list[RepoPathInstructionMatch] = []
+        ordered_paths = self._dedupe_text(candidate_paths)
+        for item in config.path_instructions:
+            matched_paths = [path for path in ordered_paths if fnmatch(path, item.path)]
+            if not matched_paths:
+                continue
+            matches.append(
+                RepoPathInstructionMatch(
+                    instruction_id=item.instruction_id,
+                    path=item.path,
+                    title=item.title,
+                    instructions=item.instructions,
+                    source_path=item.source_path,
+                    matched_paths=matched_paths[:6],
+                )
+            )
+        return matches[:6]
 
     def build_issue_context(self, workspace_id: str, issue_id: str) -> IssueContextPacket:
         snapshot = self.store.load_snapshot(workspace_id)
@@ -1337,10 +1997,26 @@ class TrackerService:
         threat_models = self.list_threat_models(workspace_id, issue_id=issue_id)
         browser_dumps = self.list_browser_dumps(workspace_id, issue_id=issue_id)
         repo_map = self.read_repo_map(workspace_id)
+        repo_config = self.read_workspace_repo_config(workspace_id)
         related_paths = self._rank_related_paths(issue, tree_focus, ticket_contexts, repo_map)
-        runbook = self._render_runbook_steps(default_runbook.template)
+        matched_path_instructions = self._match_repo_path_instructions(
+            repo_config,
+            [*tree_focus, *related_paths, *(item.normalized_path or item.path for item in evidence_bundle)],
+        )
         recent_fixes = self.list_fixes(workspace_id, issue_id=issue_id)[:5]
         recent_activity = [item for item in self.list_activity(workspace_id, issue_id=issue_id, limit=16) if item.entity_type == "issue"][:8]
+        dynamic_context = self._build_dynamic_context(
+            snapshot.workspace,
+            issue,
+            tree_focus,
+            ticket_contexts,
+            threat_models,
+            browser_dumps,
+            recent_fixes,
+            recent_activity,
+            related_paths,
+        )
+        runbook = self._render_runbook_steps(default_runbook.template)
         guidance = self.list_workspace_guidance(workspace_id)[:self.GUIDANCE_LIMIT]
         prompt = self._build_prompt(
             snapshot.workspace,
@@ -1355,6 +2031,9 @@ class TrackerService:
             browser_dumps,
             related_paths,
             repo_map,
+            dynamic_context,
+            repo_config,
+            matched_path_instructions,
         )
         return IssueContextPacket(
             issue=issue,
@@ -1372,9 +2051,66 @@ class TrackerService:
             threat_models=threat_models,
             browser_dumps=browser_dumps,
             repo_map=repo_map,
+            dynamic_context=dynamic_context,
+            repo_config=repo_config,
+            matched_path_instructions=matched_path_instructions,
             worktree=self.read_worktree_status(workspace_id),
             prompt=prompt,
         )
+
+    def _diff_ordered_strings(self, previous: list[str], current: list[str]) -> tuple[list[str], list[str]]:
+        previous_set = set(previous)
+        current_set = set(current)
+        added = [item for item in current if item not in previous_set]
+        removed = [item for item in previous if item not in current_set]
+        return added, removed
+
+    def _summarize_context_replay_comparison(
+        self,
+        *,
+        prompt_changed: bool,
+        added_tree_focus: list[str],
+        removed_tree_focus: list[str],
+        added_guidance_paths: list[str],
+        removed_guidance_paths: list[str],
+        added_verification_profile_ids: list[str],
+        removed_verification_profile_ids: list[str],
+        added_ticket_context_ids: list[str],
+        removed_ticket_context_ids: list[str],
+        added_browser_dump_ids: list[str],
+        removed_browser_dump_ids: list[str],
+    ) -> str:
+        if not prompt_changed and not any(
+            (
+                added_tree_focus,
+                removed_tree_focus,
+                added_guidance_paths,
+                removed_guidance_paths,
+                added_verification_profile_ids,
+                removed_verification_profile_ids,
+                added_ticket_context_ids,
+                removed_ticket_context_ids,
+                added_browser_dump_ids,
+                removed_browser_dump_ids,
+            )
+        ):
+            return "No issue-context drift detected since this replay."
+
+        changes: list[str] = []
+        if prompt_changed:
+            changes.append("prompt changed")
+        for label, added, removed in (
+            ("tree focus", added_tree_focus, removed_tree_focus),
+            ("guidance", added_guidance_paths, removed_guidance_paths),
+            ("verification profiles", added_verification_profile_ids, removed_verification_profile_ids),
+            ("ticket contexts", added_ticket_context_ids, removed_ticket_context_ids),
+            ("browser dumps", added_browser_dump_ids, removed_browser_dump_ids),
+        ):
+            if added:
+                changes.append(f"+{len(added)} {label}")
+            if removed:
+                changes.append(f"-{len(removed)} {label}")
+        return f"Context drift since this replay: {', '.join(changes)}."
 
     def read_worktree_status(self, workspace_id: str) -> WorktreeStatus:
         workspace = self.get_workspace(workspace_id)
@@ -1447,9 +2183,15 @@ class TrackerService:
         model: str,
         instruction: Optional[str],
         runbook_id: Optional[str] = None,
+        eval_scenario_id: Optional[str] = None,
+        eval_replay_batch_id: Optional[str] = None,
         planning: bool = False,
     ) -> dict:
-        packet = self.issue_work(workspace_id, issue_id, runbook_id=runbook_id)
+        packet = (
+            self.eval_issue_work(workspace_id, eval_scenario_id, runbook_id=runbook_id)
+            if eval_scenario_id
+            else self.issue_work(workspace_id, issue_id, runbook_id=runbook_id)
+        )
         self.runtime_service.validate_runtime_model(runtime, model)
         prompt = packet.prompt if not instruction else f"{packet.prompt}\n\nAdditional operator instruction:\n{instruction.strip()}"
         run = self.runtime_service.start_issue_run(
@@ -1462,10 +2204,20 @@ class TrackerService:
             worktree=packet.worktree,
             guidance_paths=[item.path for item in packet.guidance],
             runbook_id=runbook_id,
+            eval_scenario_id=eval_scenario_id,
+            eval_replay_batch_id=eval_replay_batch_id,
             wait_for_approval=planning,
         )
+        if eval_scenario_id:
+            self._record_eval_scenario_run(workspace_id, eval_scenario_id, run.run_id)
         action = "run.planning" if planning else "run.queued"
-        summary = f"Started {runtime} run with planning for {issue_id}" if planning else f"Queued {runtime} run for {issue_id}"
+        eval_summary = f" via eval scenario {eval_scenario_id}" if eval_scenario_id else ""
+        batch_summary = f" in replay batch {eval_replay_batch_id}" if eval_replay_batch_id else ""
+        summary = (
+            f"Started {runtime} run with planning for {issue_id}{eval_summary}{batch_summary}"
+            if planning
+            else f"Queued {runtime} run for {issue_id}{eval_summary}{batch_summary}"
+        )
         self._record_activity(
             workspace_id=workspace_id,
             entity_type="run",
@@ -1475,7 +2227,14 @@ class TrackerService:
             actor=build_activity_actor("agent", runtime, runtime=runtime, model=model),
             issue_id=issue_id,
             run_id=run.run_id,
-            details={"runtime": runtime, "model": model, "runbook_id": runbook_id, "planning": planning},
+            details={
+                "runtime": runtime,
+                "model": model,
+                "runbook_id": runbook_id,
+                "planning": planning,
+                "eval_scenario_id": eval_scenario_id,
+                "eval_replay_batch_id": eval_replay_batch_id,
+            },
         )
         return run.model_dump(mode="json")
 
@@ -1588,6 +2347,8 @@ class TrackerService:
 
         critique = self._load_critique(run_id)
         metrics = self.runtime_service.load_run_metrics(run_id)
+        packet = self.build_issue_context(workspace_id, run.issue_id)
+        excerpt_text = ""
         strengths: list[str] = []
         risks: list[str] = []
         recommendations: list[str] = []
@@ -1612,6 +2373,7 @@ class TrackerService:
             total_events = run.summary.get("event_count", 0)
             tool_events = run.summary.get("tool_event_count", 0)
             excerpt = run.summary.get("text_excerpt")
+            excerpt_text = excerpt or ""
             if total_events and tool_events / max(total_events, 1) > 0.8:
                 risks.append("The run spent a high share of events in tool usage.")
                 recommendations.append("Move repeated workflow guidance into always-on repo instructions or reusable skills to reduce tool churn.")
@@ -1636,6 +2398,18 @@ class TrackerService:
         if not excerpt:
             recommendations.append("Capture a concise final summary in the run output so session review is easier.")
 
+        acceptance_review = self._build_acceptance_review(packet, run, excerpt_text)
+        scope_warnings = self._build_scope_warnings(packet, run)
+        if acceptance_review.status == "met":
+            strengths.append("Ticket acceptance criteria appear satisfied by the recorded run outcome.")
+        elif acceptance_review.status == "partial":
+            risks.append("Only part of the recorded acceptance criteria is reflected in the run evidence.")
+            recommendations.append("Review the missing acceptance criteria before treating the run as ready.")
+        elif acceptance_review.status == "not_met":
+            risks.append("Recorded run evidence does not yet satisfy the linked acceptance criteria.")
+        for warning in scope_warnings:
+            risks.append(warning.message)
+
         insight = RunSessionInsight(
             workspace_id=workspace_id,
             run_id=run_id,
@@ -1647,6 +2421,8 @@ class TrackerService:
             strengths=self._dedupe_text(strengths),
             risks=self._dedupe_text(risks),
             recommendations=self._dedupe_text(recommendations),
+            acceptance_review=acceptance_review,
+            scope_warnings=scope_warnings,
         )
         return insight.model_dump(mode="json")
 
@@ -2497,6 +3273,73 @@ Respond with a JSON object containing:
             return candidate
         return workspace_root / candidate
 
+    def _build_verification_checklist_results(
+        self,
+        profile: VerificationProfileRecord,
+        execution: VerificationProfileExecutionResult,
+    ) -> list[VerificationChecklistResult]:
+        latest_attempt = execution.attempts[-1] if execution.attempts else None
+        coverage_available = bool(
+            execution.coverage_result is not None
+            or (execution.coverage_command_result is not None and execution.coverage_command_result.success)
+        )
+        results = [
+            VerificationChecklistResult(
+                item_id="system:test-command",
+                title="Verification command passes",
+                kind="system",
+                passed=execution.success,
+                details=(
+                    "Latest verification attempt succeeded."
+                    if execution.success
+                    else latest_attempt.stderr_excerpt[:240] if latest_attempt and latest_attempt.stderr_excerpt else "Verification command failed."
+                ),
+            )
+        ]
+        if profile.coverage_command or profile.coverage_report_path:
+            results.append(
+                VerificationChecklistResult(
+                    item_id="system:coverage-artifact",
+                    title="Coverage artifact is produced",
+                    kind="system",
+                    passed=coverage_available,
+                    details=(
+                        execution.coverage_report_path
+                        if coverage_available and execution.coverage_report_path
+                        else "No coverage artifact was produced."
+                    ),
+                )
+            )
+        if profile.checklist_items:
+            for index, item in enumerate(profile.checklist_items, start=1):
+                normalized = item.lower()
+                if "coverage" in normalized:
+                    passed = coverage_available
+                    details = "Coverage data was captured." if passed else "Coverage data is still missing."
+                else:
+                    passed = execution.success
+                    details = "Verification completed successfully." if passed else "Verification did not complete cleanly."
+                results.append(
+                    VerificationChecklistResult(
+                        item_id=f"custom:{index}",
+                        title=item,
+                        kind="custom",
+                        passed=passed,
+                        details=details,
+                    )
+                )
+        return results
+
+    def _score_verification_execution_confidence(self, execution: VerificationProfileExecutionResult) -> str:
+        if not execution.success:
+            return "low"
+        failed_items = [item for item in execution.checklist_results if not item.passed]
+        if failed_items:
+            return "medium"
+        if execution.attempt_count <= 1:
+            return "high"
+        return "medium"
+
     def _parse_cobertura(self, content: str, workspace_id: str, run_id: Optional[str], issue_id: Optional[str], fmt: str, path: str) -> CoverageResult:
         import xml.etree.ElementTree as ET
         try:
@@ -2715,6 +3558,7 @@ Respond with a JSON object containing:
         if run.status not in {"completed", "failed"}:
             raise ValueError(f"Cannot critique run in status {run.status}")
         workspace = self.get_workspace(workspace_id)
+        packet = self.build_issue_context(workspace_id, run.issue_id)
         output_path = Path(run.output_path)
         output_text = ""
         if output_path.exists():
@@ -2749,6 +3593,8 @@ Respond with a JSON object containing:
             issues_found=issues_found,
             improvements=improvements,
             summary=self._critique_summary(quality, issues_found, improvements),
+            acceptance_review=self._build_acceptance_review(packet, run, output_text),
+            scope_warnings=self._build_scope_warnings(packet, run),
         )
         self._save_critique(critique)
         self._record_activity(
@@ -3501,10 +4347,12 @@ Respond with a JSON object containing:
             run_reviews=self.store.list_run_reviews(workspace_id),
             runbooks=self.list_runbooks(workspace_id),
             verification_profiles=self.list_verification_profiles(workspace_id),
+            verification_profile_history=self.list_verification_profile_history(workspace_id),
             ticket_contexts=self.list_ticket_contexts(workspace_id),
             threat_models=self.list_threat_models(workspace_id),
             context_replays=self.list_issue_context_replays(workspace_id),
             browser_dumps=self.list_browser_dumps(workspace_id),
+            eval_scenarios=self.list_eval_scenarios(workspace_id),
             verifications=self.store.list_verifications(workspace_id),
             activity=self.store.list_activity(workspace_id),
         )
@@ -4122,6 +4970,9 @@ Respond with a JSON object containing:
         browser_dumps: list[BrowserDumpRecord],
         related_paths: list[str],
         repo_map: RepoMapSummary,
+        dynamic_context: Optional[DynamicContextBundle],
+        repo_config: Optional[RepoConfigRecord],
+        matched_path_instructions: list[RepoPathInstructionMatch],
     ) -> str:
         evidence_lines = []
         for evidence in issue.evidence[:8] + issue.verification_evidence[:8]:
@@ -4195,11 +5046,41 @@ Respond with a JSON object containing:
                 f"- {browser_dump.label} [{browser_dump.source}]: {browser_dump.summary or page_summary}. "
                 f"Console: {console_excerpt}. Network: {network_excerpt}. DOM excerpt: {dom_excerpt}"
             )
+        repo_config_lines = []
+        if repo_config:
+            if repo_config.description:
+                repo_config_lines.append(f"- Description: {repo_config.description}")
+            if repo_config.code_guidelines:
+                repo_config_lines.append(f"- Code guidelines: {', '.join(repo_config.code_guidelines[:6])}")
+            if repo_config.path_filters:
+                repo_config_lines.append(f"- Path filters: {', '.join(repo_config.path_filters[:6])}")
+            for server in repo_config.mcp_servers[:3]:
+                detail = server.description or server.usage or "Configured MCP context source."
+                repo_config_lines.append(f"- MCP {server.name}: {detail}")
         repo_dir_lines = [
             f"- {item.path}: {item.source_file_count} source files, {item.test_file_count} test files"
             for item in repo_map.top_directories[:5]
         ]
         related_lines = "\n".join(f"- {path}" for path in related_paths[:8]) or "- No related paths ranked yet."
+        path_instruction_lines = []
+        for item in matched_path_instructions[:6]:
+            label = item.title or item.path
+            path_instruction_lines.append(
+                f"- {label} [{', '.join(item.matched_paths[:4])}]: {item.instructions}"
+            )
+        symbol_lines = []
+        related_artifact_lines = []
+        if dynamic_context:
+            for symbol in dynamic_context.symbol_context[:6]:
+                location = f"{symbol.path}:{symbol.line_start}" if symbol.line_start else symbol.path
+                scope = f" in {symbol.enclosing_scope}" if symbol.enclosing_scope else ""
+                reason = f" ({symbol.reason})" if symbol.reason else ""
+                symbol_lines.append(f"- {symbol.kind} {symbol.symbol}{scope} @ {location}{reason}")
+            for item in dynamic_context.related_context[:6]:
+                matched = f" matches {', '.join(item.matched_terms[:3])}" if item.matched_terms else ""
+                reason = f" {item.reason}" if item.reason else ""
+                path = f" [{item.path}]" if item.path else ""
+                related_artifact_lines.append(f"- {item.artifact_type} {item.title}{path}:{reason}{matched}".rstrip(":"))
         return (
             f"You are fixing bug {issue.bug_id} in workspace {workspace.root_path}.\n"
             f"Title: {issue.title}\n"
@@ -4215,8 +5096,12 @@ Respond with a JSON object containing:
             f"Ticket context:\n{chr(10).join(ticket_lines) if ticket_lines else '- No linked ticket context recorded.'}\n\n"
             f"Threat model:\n{chr(10).join(threat_lines) if threat_lines else '- No threat model recorded yet.'}\n\n"
             f"Browser context:\n{chr(10).join(browser_lines) if browser_lines else '- No browser dumps recorded yet.'}\n\n"
+            f"Repo config:\n{chr(10).join(repo_config_lines) if repo_config_lines else '- No .xmustard config loaded.'}\n\n"
+            f"Path-specific guidance:\n{chr(10).join(path_instruction_lines) if path_instruction_lines else '- No path-specific instructions matched the current issue paths.'}\n\n"
             f"Structural context:\n{chr(10).join(repo_dir_lines) if repo_dir_lines else '- No repo map available.'}\n\n"
             f"Ranked related paths:\n{related_lines}\n\n"
+            f"Symbol context:\n{chr(10).join(symbol_lines) if symbol_lines else '- No symbol context ranked yet.'}\n\n"
+            f"Related artifacts:\n{chr(10).join(related_artifact_lines) if related_artifact_lines else '- No related artifacts ranked yet.'}\n\n"
             f"Repository guidance:\n{chr(10).join(guidance_lines) if guidance_lines else '- No repository guidance files were found.'}\n\n"
             f"Known verification profiles:\n{chr(10).join(verification_lines) if verification_lines else '- No verification profiles configured yet.'}\n\n"
             f"Priority files:\n{focus_lines}\n\n"
@@ -4271,6 +5156,111 @@ Respond with a JSON object containing:
             seen_paths.add(resolved_key)
             items.append(self._build_guidance_record(workspace_id, root_resolved, resolved_path, kind, always_on, priority))
         return sorted(items, key=lambda item: (item.priority, item.path.lower()))
+
+    def _guidance_starter_specs(self, workspace: WorkspaceRecord) -> list[dict[str, object]]:
+        root = Path(workspace.root_path)
+        checks = self._suggest_workspace_checks(root)
+        check_lines = "\n".join(f"- `{command}`" for command in checks) or f"- `{self.GUIDANCE_PLACEHOLDER_MARKER}: add the commands that prove a change is safe in this repo.`"
+        starter_block = self.GUIDANCE_PLACEHOLDER_MARKER
+        return [
+            {
+                "template_id": "agents",
+                "title": "AGENTS.md",
+                "path": "AGENTS.md",
+                "description": "Always-on repo instructions for local agents and issue-context prompts.",
+                "recommended": True,
+                "content": (
+                    f"# AGENTS.md instructions for {root}\n\n"
+                    f"<!-- {self.GUIDANCE_STARTER_MARKER}:agents -->\n\n"
+                    "# Repository Guide\n\n"
+                    f"This repository contains `{workspace.name}`. Use this file to keep bug work issue-first, evidence-first, and repo-specific.\n\n"
+                    "## Product Focus\n\n"
+                    "- keep issue context grounded in concrete evidence\n"
+                    "- prefer minimal safe fixes over broad refactors\n"
+                    "- record verification evidence and changed files after each fix\n\n"
+                    "## Preferred Checks\n\n"
+                    f"{check_lines}\n\n"
+                    "## Local Conventions\n\n"
+                    f"- `{starter_block}: replace this line with the repo's most important code style or architecture rule.`\n"
+                    f"- `{starter_block}: add any review or testing expectations that should always shape agent runs.`\n"
+                ),
+            },
+            {
+                "template_id": "openhands_repo",
+                "title": "OpenHands repo microagent",
+                "path": ".openhands/microagents/repo.md",
+                "description": "Short repo-scoped microagent instructions for planning and execution flows.",
+                "recommended": True,
+                "content": (
+                    "---\n"
+                    "name: repo\n"
+                    "type: repo\n"
+                    "---\n\n"
+                    f"<!-- {self.GUIDANCE_STARTER_MARKER}:openhands_repo -->\n\n"
+                    f"# Repository instructions for {workspace.name}\n\n"
+                    "- keep changes scoped to the current bug unless the evidence forces broader work\n"
+                    "- verify the issue before and after editing when a safe check exists\n"
+                    f"- `{starter_block}: add the repo-specific paths, services, or subsystems agents should inspect first.`\n"
+                    f"- `{starter_block}: add any hard constraints for risky areas, external APIs, auth, or data handling.`\n"
+                ),
+            },
+            {
+                "template_id": "conventions",
+                "title": "CONVENTIONS.md",
+                "path": "CONVENTIONS.md",
+                "description": "Shared engineering conventions for style, structure, and review defaults.",
+                "recommended": False,
+                "content": (
+                    f"# Conventions\n\n"
+                    f"<!-- {self.GUIDANCE_STARTER_MARKER}:conventions -->\n\n"
+                    "## Code\n\n"
+                    f"- `{starter_block}: describe the preferred module or component structure.`\n"
+                    f"- `{starter_block}: describe any naming, typing, or test-location rule that matters in this repo.`\n\n"
+                    "## Reviews\n\n"
+                    "- keep backend and frontend contracts in sync when both sides change\n"
+                    "- record verification steps alongside code changes\n"
+                    f"- `{starter_block}: add the repo's review expectations for migration, security, or performance-sensitive work.`\n"
+                ),
+            },
+        ]
+
+    def _suggest_workspace_checks(self, root: Path) -> list[str]:
+        commands: list[str] = []
+        if (root / "backend").is_dir():
+            commands.extend(
+                [
+                    "cd backend && pytest -q",
+                    "cd backend && PYTHONPYCACHEPREFIX=/tmp/pycache python3 -m compileall app",
+                ]
+            )
+        if (root / "frontend").is_dir():
+            commands.extend(
+                [
+                    "cd frontend && npm run lint",
+                    "cd frontend && npm run build",
+                ]
+            )
+        if (root / "api-go").is_dir():
+            commands.extend(
+                [
+                    "cd api-go && go test ./...",
+                    "cd api-go && go build ./cmd/xmustard-api",
+                ]
+            )
+        if (root / "rust-core").is_dir():
+            commands.append("cd rust-core && cargo test")
+        deduped: list[str] = []
+        for command in commands:
+            if command not in deduped:
+                deduped.append(command)
+        return deduped
+
+    def _guidance_file_is_stale(self, path: Path) -> bool:
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            return False
+        return self.GUIDANCE_PLACEHOLDER_MARKER in text
 
     def _build_guidance_record(
         self,
@@ -4458,6 +5448,1220 @@ Respond with a JSON object containing:
                 scored[path] = max(scored.get(path, 0), score)
         ordered = [path for path, _ in sorted(scored.items(), key=lambda item: (-item[1], item[0]))]
         return ordered[:8]
+
+    def _build_dynamic_context(
+        self,
+        workspace: WorkspaceRecord,
+        issue: IssueRecord,
+        tree_focus: list[str],
+        ticket_contexts: list[TicketContextRecord],
+        threat_models: list[ThreatModelRecord],
+        browser_dumps: list[BrowserDumpRecord],
+        recent_fixes: list[FixRecord],
+        recent_activity: list[ActivityRecord],
+        related_paths: list[str],
+    ) -> DynamicContextBundle:
+        tokens = self._context_tokens(issue, ticket_contexts)
+        symbol_context = self._extract_symbol_context(Path(workspace.root_path), [*tree_focus, *related_paths], tokens)
+        related_context = self._rank_related_artifacts(
+            issue,
+            ticket_contexts,
+            threat_models,
+            browser_dumps,
+            recent_fixes,
+            recent_activity,
+            tokens,
+        )
+        return DynamicContextBundle(
+            symbol_context=symbol_context,
+            related_context=related_context,
+        )
+
+    def _extract_symbol_context(self, root: Path, candidate_paths: list[str], tokens: list[str]) -> list[RepoMapSymbolRecord]:
+        symbols: list[RepoMapSymbolRecord] = []
+        seen: set[tuple[str, str]] = set()
+        for path in self._dedupe_text(candidate_paths)[:10]:
+            file_path = root / path
+            if not file_path.is_file():
+                continue
+            if file_path.suffix.lower() not in {".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".rs", ".java"}:
+                continue
+            try:
+                lines = file_path.read_text(encoding="utf-8").splitlines()
+            except OSError:
+                continue
+            current_scope: Optional[str] = None
+            for index, raw_line in enumerate(lines, start=1):
+                line = raw_line.strip()
+                kind = None
+                symbol_name = None
+                if match := re.match(r"class\s+([A-Za-z_][A-Za-z0-9_]*)", line):
+                    kind = "class"
+                    symbol_name = match.group(1)
+                    current_scope = symbol_name
+                elif match := re.match(r"def\s+([A-Za-z_][A-Za-z0-9_]*)", line):
+                    kind = "method" if current_scope else "function"
+                    symbol_name = match.group(1)
+                elif match := re.match(r"func\s+(?:\([^)]+\)\s*)?([A-Za-z_][A-Za-z0-9_]*)", line):
+                    kind = "method" if "(" in line.split("{", 1)[0] else "function"
+                    symbol_name = match.group(1)
+                elif match := re.match(r"fn\s+([A-Za-z_][A-Za-z0-9_]*)", line):
+                    kind = "function"
+                    symbol_name = match.group(1)
+                elif match := re.match(r"(?:export\s+)?function\s+([A-Za-z_][A-Za-z0-9_]*)", line):
+                    kind = "function"
+                    symbol_name = match.group(1)
+                elif match := re.match(r"(?:const|let|var)\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:async\s*)?\(", line):
+                    kind = "function"
+                    symbol_name = match.group(1)
+                elif match := re.match(r"struct\s+([A-Za-z_][A-Za-z0-9_]*)", line):
+                    kind = "type"
+                    symbol_name = match.group(1)
+                    current_scope = symbol_name
+                if not symbol_name or not kind:
+                    continue
+                symbol_key = (path, symbol_name)
+                if symbol_key in seen:
+                    continue
+                lowered = f"{path.lower()} {symbol_name.lower()}"
+                matched_terms = [token for token in tokens[:12] if token in lowered]
+                score = len(matched_terms) * 2
+                if path in candidate_paths[:4]:
+                    score += 2
+                if score <= 0:
+                    continue
+                seen.add(symbol_key)
+                symbols.append(
+                    RepoMapSymbolRecord(
+                        path=path,
+                        symbol=symbol_name,
+                        kind=kind,
+                        line_start=index,
+                        enclosing_scope=current_scope if current_scope != symbol_name else None,
+                        reason=f"Matches {', '.join(matched_terms[:3])}" if matched_terms else "Near ranked focus files.",
+                        score=score,
+                    )
+                )
+        symbols.sort(key=lambda item: (-item.score, item.path, item.symbol))
+        return symbols[:8]
+
+    def _rank_related_artifacts(
+        self,
+        issue: IssueRecord,
+        ticket_contexts: list[TicketContextRecord],
+        threat_models: list[ThreatModelRecord],
+        browser_dumps: list[BrowserDumpRecord],
+        recent_fixes: list[FixRecord],
+        recent_activity: list[ActivityRecord],
+        tokens: list[str],
+    ) -> list[RelatedContextRecord]:
+        records: list[RelatedContextRecord] = []
+        issue_terms = set(tokens[:12])
+
+        def matched_terms(*parts: str) -> list[str]:
+            haystack = " ".join(parts).lower()
+            return [token for token in issue_terms if token in haystack][:4]
+
+        for item in ticket_contexts[:4]:
+            matches = matched_terms(item.title, item.summary, " ".join(item.acceptance_criteria))
+            if matches:
+                records.append(
+                    RelatedContextRecord(
+                        artifact_type="ticket_context",
+                        artifact_id=item.context_id,
+                        title=item.title,
+                        path="ticket_contexts.json",
+                        reason="Shares acceptance-criteria or ticket language with the current issue.",
+                        matched_terms=matches,
+                        score=len(matches) * 2 + 2,
+                    )
+                )
+        for item in threat_models[:3]:
+            matches = matched_terms(item.title, item.summary, " ".join(item.assets), " ".join(item.abuse_cases))
+            if matches:
+                records.append(
+                    RelatedContextRecord(
+                        artifact_type="threat_model",
+                        artifact_id=item.threat_model_id,
+                        title=item.title,
+                        path="threat_models.json",
+                        reason="Touches the same assets or abuse language as the issue context.",
+                        matched_terms=matches,
+                        score=len(matches) * 2 + 1,
+                    )
+                )
+        for item in browser_dumps[:3]:
+            matches = matched_terms(item.label, item.summary, item.page_title or "", item.page_url or "", item.dom_snapshot[:240])
+            if matches:
+                records.append(
+                    RelatedContextRecord(
+                        artifact_type="browser_dump",
+                        artifact_id=item.dump_id,
+                        title=item.label,
+                        path="browser_dumps.json",
+                        reason="Captures a browser-state repro that overlaps with the current issue terms.",
+                        matched_terms=matches,
+                        score=len(matches) * 2 + 1,
+                    )
+                )
+        for item in recent_fixes[:4]:
+            matches = matched_terms(item.summary, item.how or "", " ".join(item.changed_files))
+            if matches:
+                records.append(
+                    RelatedContextRecord(
+                        artifact_type="fix_record",
+                        artifact_id=item.fix_id,
+                        title=item.summary,
+                        path="fix_records.json",
+                        reason="Previous fix history overlaps with this issue's files or terms.",
+                        matched_terms=matches,
+                        score=len(matches) * 2 + 1,
+                    )
+                )
+        for item in recent_activity[:4]:
+            matches = matched_terms(item.summary)
+            if matches:
+                records.append(
+                    RelatedContextRecord(
+                        artifact_type="activity",
+                        artifact_id=item.activity_id,
+                        title=item.summary,
+                        path="activity.jsonl",
+                        reason="Recent issue activity mentions the same issue language.",
+                        matched_terms=matches,
+                        score=len(matches) * 2,
+                    )
+                )
+        records.sort(key=lambda item: (-item.score, item.artifact_type, item.title.lower()))
+        return records[:8]
+
+    def _build_acceptance_review(self, packet: IssueContextPacket, run: RunRecord, text: str) -> AcceptanceCriteriaReview:
+        criteria = []
+        for context in packet.ticket_contexts[:4]:
+            criteria.extend(context.acceptance_criteria[:4])
+        criteria = self._normalize_text_list(criteria, limit=12)
+        if not criteria:
+            return AcceptanceCriteriaReview(
+                status="unknown",
+                criteria=[],
+                notes=["No ticket acceptance criteria are linked to this issue."],
+            )
+        corpus = " ".join(
+            [
+                run.title,
+                run.prompt,
+                text,
+                " ".join(packet.issue.tests_passed),
+                packet.issue.summary or "",
+                packet.issue.impact or "",
+            ]
+        ).lower()
+        matched: list[str] = []
+        missing: list[str] = []
+        for criterion in criteria:
+            criterion_tokens = [
+                token for token in re.findall(r"[a-z0-9_./-]{3,}", criterion.lower())
+                if token not in {"the", "and", "for", "with", "that", "this", "from"}
+            ]
+            matched_count = sum(1 for token in criterion_tokens[:6] if token in corpus)
+            threshold = max(1, min(2, len(criterion_tokens)))
+            if matched_count >= threshold:
+                matched.append(criterion)
+            else:
+                missing.append(criterion)
+        status = "met" if matched and not missing else "partial" if matched else "not_met"
+        notes = []
+        if packet.issue.tests_passed:
+            notes.append(f"Tracker already records {len(packet.issue.tests_passed)} passing test command(s).")
+        if packet.issue.verification_evidence:
+            notes.append(f"Tracker already carries {len(packet.issue.verification_evidence)} verification evidence reference(s).")
+        return AcceptanceCriteriaReview(
+            status=status,
+            criteria=criteria,
+            matched=matched,
+            missing=missing,
+            notes=notes[:4],
+        )
+
+    def _build_scope_warnings(self, packet: IssueContextPacket, run: RunRecord) -> list[ScopeWarning]:
+        warnings: list[ScopeWarning] = []
+        related_paths = packet.related_paths or packet.tree_focus
+        dirty_paths = list(run.worktree.dirty_paths) if run.worktree and run.worktree.dirty_paths else []
+        unrelated = [
+            path for path in dirty_paths
+            if not self._matches_related_path(path, related_paths)
+        ]
+        if unrelated:
+            warnings.append(
+                ScopeWarning(
+                    kind="unrelated_change",
+                    message=f"{len(unrelated)} worktree path(s) do not match the issue's ranked focus.",
+                    paths=unrelated[:8],
+                    severity="high" if len(unrelated) > 3 else "medium",
+                )
+            )
+        drift_flags = [flag for flag in packet.issue.drift_flags if "review" not in flag.lower()]
+        if drift_flags:
+            warnings.append(
+                ScopeWarning(
+                    kind="scope_drift",
+                    message=f"Issue drift flags remain open: {', '.join(drift_flags[:3])}.",
+                    paths=related_paths[:6],
+                    severity="medium",
+                )
+            )
+        return warnings
+
+    def _matches_related_path(self, candidate: str, related_paths: list[str]) -> bool:
+        lowered = candidate.lower().strip()
+        for path in related_paths[:12]:
+            expected = path.lower().strip()
+            if not expected:
+                continue
+            if lowered == expected or lowered.startswith(expected + "/") or expected.startswith(lowered + "/"):
+                return True
+            if Path(lowered).name == Path(expected).name:
+                return True
+        return False
+
+    def _build_eval_scenario_report(self, workspace_id: str, scenario: EvalScenarioRecord) -> EvalScenarioReport:
+        replays = self.list_issue_context_replays(workspace_id, issue_id=scenario.issue_id)
+        baseline_replay = next((item for item in replays if item.replay_id == scenario.baseline_replay_id), None)
+        latest_replay_comparison = None
+        if baseline_replay is not None:
+            latest_replay_comparison = self.compare_issue_context_replay(workspace_id, scenario.issue_id, baseline_replay.replay_id)
+        packet = self.build_issue_context(workspace_id, scenario.issue_id)
+        variant_diff = self._build_eval_variant_diff(scenario, packet)
+        verification_reports = self.list_verification_profile_reports(workspace_id, issue_id=scenario.issue_id)
+        if scenario.verification_profile_ids:
+            verification_reports = [
+                item for item in verification_reports if item.profile_id in set(scenario.verification_profile_ids)
+            ]
+        selected_runs = self._select_eval_runs(workspace_id, scenario)
+        run_metrics = self._load_eval_run_metrics(selected_runs)
+        latest_fresh_run = self._build_eval_fresh_run_summary(scenario, selected_runs, run_metrics)
+        success_runs = sum(1 for run in selected_runs if run.status == "completed")
+        failed_runs = sum(1 for run in selected_runs if run.status == "failed")
+        total_cost = round(sum(item.estimated_cost for item in run_metrics), 4)
+        avg_duration = int(sum(item.duration_ms for item in run_metrics) / len(run_metrics)) if run_metrics else 0
+        verification_total = sum(item.total_runs for item in verification_reports)
+        verification_success = sum(item.success_runs for item in verification_reports)
+        summary_parts = [
+            f"{success_runs} successful run(s)",
+            f"{failed_runs} failed run(s)",
+            f"{len(verification_reports)} verification profile report(s)",
+        ]
+        if latest_replay_comparison:
+            summary_parts.append(latest_replay_comparison.summary)
+        return EvalScenarioReport(
+            scenario=scenario,
+            baseline_replay=baseline_replay,
+            latest_replay_comparison=latest_replay_comparison,
+            variant_diff=variant_diff,
+            verification_profile_reports=verification_reports,
+            latest_fresh_run=latest_fresh_run,
+            run_metrics=run_metrics,
+            total_estimated_cost=total_cost,
+            avg_duration_ms=avg_duration,
+            success_runs=success_runs,
+            failed_runs=failed_runs,
+            verification_success_rate=round((verification_success / verification_total) * 100, 1) if verification_total else 0.0,
+            summary="; ".join([*summary_parts, *( [variant_diff.summary] if variant_diff and variant_diff.summary else [] )]),
+        )
+
+    def _attach_eval_baseline_comparisons(
+        self,
+        workspace_id: str,
+        reports: list[EvalScenarioReport],
+    ) -> list[EvalScenarioReport]:
+        baselines: dict[str, EvalScenarioReport] = {}
+        for report in reports:
+            current = baselines.get(report.scenario.issue_id)
+            if current is None or self._eval_baseline_sort_key(report) < self._eval_baseline_sort_key(current):
+                baselines[report.scenario.issue_id] = report
+        return [
+            report.model_copy(
+                update={
+                    "comparison_to_baseline": self._build_eval_scenario_baseline_comparison(
+                        workspace_id,
+                        report,
+                        baselines.get(report.scenario.issue_id),
+                    )
+                }
+            )
+            for report in reports
+        ]
+
+    def _attach_eval_fresh_comparisons(self, reports: list[EvalScenarioReport]) -> list[EvalScenarioReport]:
+        baselines: dict[str, EvalScenarioReport] = {}
+        for report in reports:
+            current = baselines.get(report.scenario.issue_id)
+            if current is None or self._eval_baseline_sort_key(report) < self._eval_baseline_sort_key(current):
+                baselines[report.scenario.issue_id] = report
+        return [
+            report.model_copy(
+                update={
+                    "fresh_comparison_to_baseline": self._build_eval_fresh_execution_comparison(
+                        report,
+                        baselines.get(report.scenario.issue_id),
+                    )
+                }
+            )
+            for report in reports
+        ]
+
+    def _eval_baseline_sort_key(self, report: EvalScenarioReport) -> tuple[int, str, str]:
+        return (
+            0 if report.scenario.baseline_replay_id else 1,
+            report.scenario.created_at,
+            report.scenario.scenario_id,
+        )
+
+    def _eval_fresh_status_rank(self, status: str) -> int:
+        return {
+            "completed": 4,
+            "running": 3,
+            "queued": 2,
+            "planning": 1,
+            "failed": 0,
+            "cancelled": -1,
+        }.get(status, -1)
+
+    def _build_eval_fresh_run_summary(
+        self,
+        scenario: EvalScenarioRecord,
+        runs: list[RunRecord],
+        metrics: list[RunMetrics],
+    ) -> Optional[EvalFreshRunSummary]:
+        summaries = self._build_eval_fresh_run_summaries(scenario, runs, metrics)
+        return summaries[0] if summaries else None
+
+    def _build_eval_fresh_run_summaries(
+        self,
+        scenario: EvalScenarioRecord,
+        runs: list[RunRecord],
+        metrics: list[RunMetrics],
+    ) -> list[EvalFreshRunSummary]:
+        if not runs:
+            return []
+        metric_lookup = {item.run_id: item for item in metrics}
+        ordered_runs = sorted(runs, key=lambda item: (item.created_at, item.run_id), reverse=True)
+        return [
+            EvalFreshRunSummary(
+                scenario_id=scenario.scenario_id,
+                scenario_name=scenario.name,
+                run_id=run.run_id,
+                status=run.status,
+                runtime=run.runtime,
+                model=run.model,
+                created_at=run.created_at,
+                estimated_cost=metric_lookup[run.run_id].estimated_cost if run.run_id in metric_lookup else 0.0,
+                duration_ms=metric_lookup[run.run_id].duration_ms if run.run_id in metric_lookup else 0,
+                command_preview=run.command_preview,
+                planning=run.status == "planning",
+            )
+            for run in ordered_runs
+        ]
+
+    def _build_eval_fresh_execution_comparison(
+        self,
+        report: EvalScenarioReport,
+        baseline: Optional[EvalScenarioReport],
+    ) -> Optional[EvalFreshExecutionComparison]:
+        if baseline is None or baseline.scenario.scenario_id == report.scenario.scenario_id:
+            return None
+        if report.latest_fresh_run is None or baseline.latest_fresh_run is None:
+            return None
+        scenario_rank = self._eval_fresh_status_rank(report.latest_fresh_run.status)
+        baseline_rank = self._eval_fresh_status_rank(baseline.latest_fresh_run.status)
+        cost_delta = round(report.latest_fresh_run.estimated_cost - baseline.latest_fresh_run.estimated_cost, 4)
+        duration_delta = report.latest_fresh_run.duration_ms - baseline.latest_fresh_run.duration_ms
+        preferred = "tie"
+        preferred_scenario_id: Optional[str] = None
+        preferred_scenario_name: Optional[str] = None
+        preference_reasons: list[str] = []
+        if scenario_rank > baseline_rank:
+            preferred = "scenario"
+            preferred_scenario_id = report.scenario.scenario_id
+            preferred_scenario_name = report.scenario.name
+            preference_reasons.append("better fresh run status")
+        elif scenario_rank < baseline_rank:
+            preferred = "baseline"
+            preferred_scenario_id = baseline.scenario.scenario_id
+            preferred_scenario_name = baseline.scenario.name
+            preference_reasons.append("better fresh run status")
+        else:
+            if cost_delta < 0:
+                preferred = "scenario"
+                preferred_scenario_id = report.scenario.scenario_id
+                preferred_scenario_name = report.scenario.name
+                preference_reasons.append("lower fresh run cost")
+            elif cost_delta > 0:
+                preferred = "baseline"
+                preferred_scenario_id = baseline.scenario.scenario_id
+                preferred_scenario_name = baseline.scenario.name
+                preference_reasons.append("lower fresh run cost")
+            if duration_delta < 0:
+                if preferred == "tie":
+                    preferred = "scenario"
+                    preferred_scenario_id = report.scenario.scenario_id
+                    preferred_scenario_name = report.scenario.name
+                preference_reasons.append("faster fresh run")
+            elif duration_delta > 0:
+                if preferred == "tie":
+                    preferred = "baseline"
+                    preferred_scenario_id = baseline.scenario.scenario_id
+                    preferred_scenario_name = baseline.scenario.name
+                if preferred == "baseline":
+                    preference_reasons.append("faster fresh run")
+        summary_parts = [
+            f"Latest fresh run vs {baseline.scenario.name}",
+            f"status {report.latest_fresh_run.status} vs {baseline.latest_fresh_run.status}",
+        ]
+        if cost_delta:
+            summary_parts.append(f"{cost_delta:+.4f} cost")
+        if duration_delta:
+            summary_parts.append(f"{duration_delta:+d}ms duration")
+        if preferred_scenario_name:
+            summary_parts.append(f"preferred: {preferred_scenario_name}")
+        return EvalFreshExecutionComparison(
+            compared_to_scenario_id=baseline.scenario.scenario_id,
+            compared_to_name=baseline.scenario.name,
+            scenario_status=report.latest_fresh_run.status,
+            baseline_status=baseline.latest_fresh_run.status,
+            estimated_cost_delta=cost_delta,
+            duration_ms_delta=duration_delta,
+            preferred=preferred,
+            preferred_scenario_id=preferred_scenario_id,
+            preferred_scenario_name=preferred_scenario_name,
+            preference_reasons=preference_reasons,
+            summary="; ".join(summary_parts),
+        )
+
+    def _build_eval_fresh_replay_rankings(
+        self,
+        reports: list[EvalScenarioReport],
+    ) -> list[EvalFreshReplayRanking]:
+        grouped: dict[str, list[EvalScenarioReport]] = {}
+        for report in reports:
+            if report.latest_fresh_run is None:
+                continue
+            grouped.setdefault(report.scenario.issue_id, []).append(report)
+        rankings: list[EvalFreshReplayRanking] = []
+        for issue_id in sorted(grouped):
+            fresh_reports = grouped[issue_id]
+            if len(fresh_reports) < 2:
+                continue
+            baseline = min(fresh_reports, key=self._eval_baseline_sort_key)
+            scored_entries = []
+            for report in fresh_reports:
+                wins = 0
+                losses = 0
+                ties = 0
+                reasons: list[str] = []
+                for other in fresh_reports:
+                    if other.scenario.scenario_id == report.scenario.scenario_id:
+                        continue
+                    comparison = self._build_eval_fresh_execution_comparison(report, other)
+                    if comparison is None:
+                        continue
+                    if comparison.preferred == "scenario":
+                        wins += 1
+                        reasons.extend(comparison.preference_reasons)
+                    elif comparison.preferred == "baseline":
+                        losses += 1
+                    else:
+                        ties += 1
+                latest = report.latest_fresh_run
+                assert latest is not None
+                deduped_reasons = list(dict.fromkeys(reasons))
+                scored_entries.append(
+                    (
+                        report,
+                        wins,
+                        losses,
+                        ties,
+                        deduped_reasons,
+                        (
+                            -wins,
+                            losses,
+                            -self._eval_fresh_status_rank(latest.status),
+                            latest.estimated_cost,
+                            latest.duration_ms,
+                            report.scenario.created_at,
+                            report.scenario.scenario_id,
+                        ),
+                    )
+                )
+            scored_entries.sort(key=lambda item: item[5])
+            ranked_scenarios: list[EvalFreshReplayRankingEntry] = []
+            for rank, (report, wins, losses, ties, reasons, _) in enumerate(scored_entries, start=1):
+                latest = report.latest_fresh_run
+                assert latest is not None
+                summary_parts = [
+                    f"{wins} pairwise win(s)",
+                    f"{losses} loss(es)",
+                    f"{ties} tie(s)",
+                    f"status {latest.status}",
+                    f"${latest.estimated_cost:.4f} estimated cost",
+                    f"{latest.duration_ms}ms duration",
+                ]
+                if reasons:
+                    summary_parts.append(f"reasons: {', '.join(reasons[:3])}")
+                ranked_scenarios.append(
+                    EvalFreshReplayRankingEntry(
+                        rank=rank,
+                        scenario_id=report.scenario.scenario_id,
+                        scenario_name=report.scenario.name,
+                        latest_fresh_run=latest,
+                        pairwise_wins=wins,
+                        pairwise_losses=losses,
+                        pairwise_ties=ties,
+                        preference_reasons=reasons,
+                        summary="; ".join(summary_parts),
+                    )
+                )
+            top = ranked_scenarios[0]
+            ranking_summary = (
+                f"Top fresh replay: {top.scenario_name} ranked 1/{len(ranked_scenarios)} "
+                f"with {top.pairwise_wins} pairwise win(s)"
+            )
+            if baseline.scenario.scenario_id != top.scenario_id:
+                ranking_summary += f"; baseline remains {baseline.scenario.name}"
+            rankings.append(
+                EvalFreshReplayRanking(
+                    issue_id=issue_id,
+                    baseline_scenario_id=baseline.scenario.scenario_id,
+                    baseline_scenario_name=baseline.scenario.name,
+                    ranked_scenarios=ranked_scenarios,
+                    summary=ranking_summary,
+                )
+            )
+        return rankings
+
+    def _build_eval_fresh_replay_trends(
+        self,
+        workspace_id: str,
+        scenarios: list[EvalScenarioRecord],
+        reports: list[EvalScenarioReport],
+        rankings: list[EvalFreshReplayRanking],
+        replay_batches: list[EvalReplayBatchRecord],
+    ) -> list[EvalFreshReplayTrend]:
+        issue_batches: dict[str, list[EvalReplayBatchRecord]] = {}
+        for batch in replay_batches:
+            issue_batches.setdefault(batch.issue_id, []).append(batch)
+        trends: list[EvalFreshReplayTrend] = []
+        batch_driven_issues: set[str] = set()
+        for issue_id, batches in issue_batches.items():
+            ordered_batches = sorted(batches, key=lambda item: item.created_at, reverse=True)
+            if len(ordered_batches) < 2:
+                continue
+            latest_batch = ordered_batches[0]
+            previous_batch = ordered_batches[1]
+            latest_ranking = self._build_eval_batch_ranking(workspace_id, issue_id, latest_batch, reports)
+            previous_ranking = self._build_eval_batch_ranking(workspace_id, issue_id, previous_batch, reports)
+            if latest_ranking is None or previous_ranking is None:
+                continue
+            previous_entries = {entry.scenario_id: entry for entry in previous_ranking.ranked_scenarios}
+            entries: list[EvalFreshReplayTrendEntry] = []
+            moved_count = 0
+            for entry in latest_ranking.ranked_scenarios:
+                previous_entry = previous_entries.get(entry.scenario_id)
+                previous_rank = previous_entry.rank if previous_entry else None
+                if previous_rank is None:
+                    movement = "new"
+                elif entry.rank < previous_rank:
+                    movement = "up"
+                elif entry.rank > previous_rank:
+                    movement = "down"
+                else:
+                    movement = "same"
+                if movement in {"up", "down"}:
+                    moved_count += 1
+                entries.append(
+                    EvalFreshReplayTrendEntry(
+                        scenario_id=entry.scenario_id,
+                        scenario_name=entry.scenario_name,
+                        current_rank=entry.rank,
+                        previous_rank=previous_rank,
+                        movement=movement,
+                        latest_fresh_run=entry.latest_fresh_run,
+                        previous_fresh_run=previous_entry.latest_fresh_run if previous_entry else None,
+                        summary="; ".join(
+                            [
+                                f"current rank {entry.rank}",
+                                *( [f"previous rank {previous_rank}"] if previous_rank is not None else [] ),
+                                f"movement {movement}",
+                                f"latest batch {latest_batch.batch_id}",
+                                f"previous batch {previous_batch.batch_id}",
+                            ]
+                        ),
+                    )
+                )
+            if entries:
+                batch_driven_issues.add(issue_id)
+                trends.append(
+                    EvalFreshReplayTrend(
+                        issue_id=issue_id,
+                        latest_batch_id=latest_batch.batch_id,
+                        previous_batch_id=previous_batch.batch_id,
+                        entries=entries,
+                        summary=(
+                            f"{moved_count} scenario(s) changed rank between replay batches {previous_batch.batch_id} and {latest_batch.batch_id}"
+                            if moved_count
+                            else f"Replay batch ranks are unchanged between {previous_batch.batch_id} and {latest_batch.batch_id}"
+                        ),
+                    )
+                )
+
+        report_lookup = {item.scenario.scenario_id: item for item in reports}
+        previous_reports: list[EvalScenarioReport] = []
+        previous_run_lookup: dict[str, EvalFreshRunSummary] = {}
+        for scenario in scenarios:
+            report = report_lookup.get(scenario.scenario_id)
+            if report is None:
+                continue
+            runs = self._select_eval_runs(workspace_id, scenario)
+            metrics = self._load_eval_run_metrics(runs)
+            fresh_runs = self._build_eval_fresh_run_summaries(scenario, runs, metrics)
+            if len(fresh_runs) < 2:
+                continue
+            previous_run_lookup[scenario.scenario_id] = fresh_runs[1]
+            previous_reports.append(report.model_copy(update={"latest_fresh_run": fresh_runs[1]}))
+        previous_rankings = self._build_eval_fresh_replay_rankings(previous_reports)
+        previous_lookup = {
+            ranking.issue_id: {entry.scenario_id: entry for entry in ranking.ranked_scenarios}
+            for ranking in previous_rankings
+        }
+        for ranking in rankings:
+            if ranking.issue_id in batch_driven_issues:
+                continue
+            previous_entries = previous_lookup.get(ranking.issue_id, {})
+            if not previous_entries:
+                continue
+            entries: list[EvalFreshReplayTrendEntry] = []
+            for entry in ranking.ranked_scenarios:
+                previous_entry = previous_entries.get(entry.scenario_id)
+                previous_rank = previous_entry.rank if previous_entry else None
+                if previous_rank is None:
+                    movement = "new"
+                elif entry.rank < previous_rank:
+                    movement = "up"
+                elif entry.rank > previous_rank:
+                    movement = "down"
+                else:
+                    movement = "same"
+                summary_parts = [f"current rank {entry.rank}"]
+                if previous_rank is not None:
+                    summary_parts.append(f"previous rank {previous_rank}")
+                summary_parts.append(f"movement {movement}")
+                entries.append(
+                    EvalFreshReplayTrendEntry(
+                        scenario_id=entry.scenario_id,
+                        scenario_name=entry.scenario_name,
+                        current_rank=entry.rank,
+                        previous_rank=previous_rank,
+                        movement=movement,
+                        latest_fresh_run=entry.latest_fresh_run,
+                        previous_fresh_run=previous_run_lookup.get(entry.scenario_id),
+                        summary="; ".join(summary_parts),
+                    )
+                )
+            if not entries:
+                continue
+            moved = [item for item in entries if item.movement in {"up", "down"}]
+            summary = (
+                f"{len(moved)} scenario(s) changed rank since the previous fresh replay snapshot"
+                if moved else
+                "Fresh replay ranks are unchanged from the previous snapshot"
+            )
+            trends.append(
+                EvalFreshReplayTrend(
+                    issue_id=ranking.issue_id,
+                    latest_batch_id=None,
+                    previous_batch_id=None,
+                    entries=entries,
+                    summary=summary,
+                )
+            )
+        return trends
+
+    def _build_eval_batch_ranking(
+        self,
+        workspace_id: str,
+        issue_id: str,
+        batch: EvalReplayBatchRecord,
+        reports: list[EvalScenarioReport],
+    ) -> Optional[EvalFreshReplayRanking]:
+        report_lookup = {
+            item.scenario.scenario_id: item for item in reports if item.scenario.issue_id == issue_id
+        }
+        runs = {item.run_id: item for item in self.store.list_runs(workspace_id)}
+        metric_lookup = {
+            run_id: self.runtime_service.load_run_metrics(run_id)
+            for run_id in batch.queued_run_ids
+        }
+        batch_reports: list[EvalScenarioReport] = []
+        for scenario_id in batch.scenario_ids:
+            report = report_lookup.get(scenario_id)
+            run = next(
+                (
+                    runs[run_id]
+                    for run_id in batch.queued_run_ids
+                    if run_id in runs and runs[run_id].eval_scenario_id == scenario_id
+                ),
+                None,
+            )
+            if report is None or run is None:
+                continue
+            metric = metric_lookup.get(run.run_id)
+            latest = EvalFreshRunSummary(
+                scenario_id=scenario_id,
+                scenario_name=report.scenario.name,
+                run_id=run.run_id,
+                status=run.status,
+                runtime=run.runtime,
+                model=run.model,
+                created_at=run.created_at,
+                estimated_cost=metric.estimated_cost if metric else 0.0,
+                duration_ms=metric.duration_ms if metric else 0,
+                command_preview=run.command_preview,
+                planning=run.status == "planning",
+            )
+            batch_reports.append(report.model_copy(update={"latest_fresh_run": latest}))
+        if len(batch_reports) < 2:
+            return None
+        ranking = self._build_eval_fresh_replay_rankings(batch_reports)
+        return next((item for item in ranking if item.issue_id == issue_id), None)
+
+    def _build_eval_scenario_baseline_comparison(
+        self,
+        workspace_id: str,
+        report: EvalScenarioReport,
+        baseline: Optional[EvalScenarioReport],
+    ) -> Optional[EvalScenarioBaselineComparison]:
+        if baseline is None or baseline.scenario.scenario_id == report.scenario.scenario_id:
+            return None
+        issue = self._get_issue_from_snapshot(workspace_id, report.scenario.issue_id)
+        guidance_only_in_scenario = sorted(set(report.scenario.guidance_paths) - set(baseline.scenario.guidance_paths))
+        guidance_only_in_baseline = sorted(set(baseline.scenario.guidance_paths) - set(report.scenario.guidance_paths))
+        ticket_only_in_scenario = sorted(set(report.scenario.ticket_context_ids) - set(baseline.scenario.ticket_context_ids))
+        ticket_only_in_baseline = sorted(set(baseline.scenario.ticket_context_ids) - set(report.scenario.ticket_context_ids))
+        browser_only_in_scenario = sorted(set(report.scenario.browser_dump_ids) - set(baseline.scenario.browser_dump_ids))
+        browser_only_in_baseline = sorted(set(baseline.scenario.browser_dump_ids) - set(report.scenario.browser_dump_ids))
+        profile_only_in_scenario = sorted(
+            set(report.scenario.verification_profile_ids) - set(baseline.scenario.verification_profile_ids)
+        )
+        profile_only_in_baseline = sorted(
+            set(baseline.scenario.verification_profile_ids) - set(report.scenario.verification_profile_ids)
+        )
+        verification_profile_deltas = self._build_eval_verification_profile_deltas(report, baseline)
+        success_delta = report.success_runs - baseline.success_runs
+        failed_delta = report.failed_runs - baseline.failed_runs
+        verification_delta = round(report.verification_success_rate - baseline.verification_success_rate, 1)
+        duration_delta = report.avg_duration_ms - baseline.avg_duration_ms
+        cost_delta = round(report.total_estimated_cost - baseline.total_estimated_cost, 4)
+        scenario_score = 0
+        baseline_score = 0
+        scenario_reasons: list[str] = []
+        baseline_reasons: list[str] = []
+        for metric, weight, scenario_wins, baseline_wins in [
+            ("more successful runs", 2, success_delta > 0, success_delta < 0),
+            ("fewer failed runs", 2, failed_delta < 0, failed_delta > 0),
+            ("higher verification confidence", 2, verification_delta > 0, verification_delta < 0),
+            ("lower estimated cost", 1, cost_delta < 0, cost_delta > 0),
+            ("faster average duration", 1, duration_delta < 0, duration_delta > 0),
+        ]:
+            if scenario_wins:
+                scenario_score += weight
+                scenario_reasons.append(metric)
+            elif baseline_wins:
+                baseline_score += weight
+                baseline_reasons.append(metric)
+        preferred = "tie"
+        preferred_scenario_id: Optional[str] = None
+        preferred_scenario_name: Optional[str] = None
+        preference_reasons: list[str] = []
+        if scenario_score > baseline_score:
+            preferred = "scenario"
+            preferred_scenario_id = report.scenario.scenario_id
+            preferred_scenario_name = report.scenario.name
+            preference_reasons = scenario_reasons
+        elif baseline_score > scenario_score:
+            preferred = "baseline"
+            preferred_scenario_id = baseline.scenario.scenario_id
+            preferred_scenario_name = baseline.scenario.name
+            preference_reasons = baseline_reasons
+        summary_parts = [f"Compared to baseline {baseline.scenario.name}"]
+        if success_delta:
+            summary_parts.append(f"{success_delta:+d} successful run(s)")
+        if failed_delta:
+            summary_parts.append(f"{failed_delta:+d} failed run(s)")
+        if verification_delta:
+            summary_parts.append(f"{verification_delta:+.1f}% verification")
+        if cost_delta:
+            summary_parts.append(f"{cost_delta:+.4f} cost")
+        if duration_delta:
+            summary_parts.append(f"{duration_delta:+d}ms duration")
+        if verification_profile_deltas:
+            summary_parts.append(f"{len(verification_profile_deltas)} verification profile comparison(s)")
+        if preferred != "tie" and preferred_scenario_name:
+            summary_parts.append(f"preferred: {preferred_scenario_name}")
+        if issue.title:
+            summary_parts.append(f"issue: {issue.title}")
+        return EvalScenarioBaselineComparison(
+            compared_to_scenario_id=baseline.scenario.scenario_id,
+            compared_to_name=baseline.scenario.name,
+            guidance_only_in_scenario=guidance_only_in_scenario,
+            guidance_only_in_baseline=guidance_only_in_baseline,
+            ticket_context_only_in_scenario=ticket_only_in_scenario,
+            ticket_context_only_in_baseline=ticket_only_in_baseline,
+            browser_dump_only_in_scenario=browser_only_in_scenario,
+            browser_dump_only_in_baseline=browser_only_in_baseline,
+            verification_profile_only_in_scenario=profile_only_in_scenario,
+            verification_profile_only_in_baseline=profile_only_in_baseline,
+            verification_profile_deltas=verification_profile_deltas,
+            success_runs_delta=success_delta,
+            failed_runs_delta=failed_delta,
+            verification_success_rate_delta=verification_delta,
+            avg_duration_ms_delta=duration_delta,
+            total_estimated_cost_delta=cost_delta,
+            preferred=preferred,
+            preferred_scenario_id=preferred_scenario_id,
+            preferred_scenario_name=preferred_scenario_name,
+            preference_reasons=preference_reasons,
+            summary="; ".join(summary_parts),
+        )
+
+    def _build_eval_verification_profile_deltas(
+        self,
+        report: EvalScenarioReport,
+        baseline: EvalScenarioReport,
+    ) -> list[EvalScenarioVerificationProfileDelta]:
+        scenario_reports = {item.profile_id: item for item in report.verification_profile_reports}
+        baseline_reports = {item.profile_id: item for item in baseline.verification_profile_reports}
+        deltas: list[EvalScenarioVerificationProfileDelta] = []
+        for profile_id in sorted(set(scenario_reports) | set(baseline_reports)):
+            scenario_item = scenario_reports.get(profile_id)
+            baseline_item = baseline_reports.get(profile_id)
+            profile_name = (
+                scenario_item.profile_name if scenario_item is not None else baseline_item.profile_name if baseline_item is not None else profile_id
+            )
+            scenario_total_runs = scenario_item.total_runs if scenario_item is not None else 0
+            baseline_total_runs = baseline_item.total_runs if baseline_item is not None else 0
+            scenario_success_rate = scenario_item.success_rate if scenario_item is not None else 0.0
+            baseline_success_rate = baseline_item.success_rate if baseline_item is not None else 0.0
+            scenario_checklist_pass_rate = scenario_item.checklist_pass_rate if scenario_item is not None else 0.0
+            baseline_checklist_pass_rate = baseline_item.checklist_pass_rate if baseline_item is not None else 0.0
+            scenario_avg_attempt_count = scenario_item.avg_attempt_count if scenario_item is not None else 0.0
+            baseline_avg_attempt_count = baseline_item.avg_attempt_count if baseline_item is not None else 0.0
+            success_rate_delta = round(scenario_success_rate - baseline_success_rate, 1)
+            checklist_pass_rate_delta = round(scenario_checklist_pass_rate - baseline_checklist_pass_rate, 1)
+            avg_attempt_count_delta = round(scenario_avg_attempt_count - baseline_avg_attempt_count, 2)
+            preferred = "tie"
+            if success_rate_delta > 0 or checklist_pass_rate_delta > 0 or avg_attempt_count_delta < 0:
+                preferred = "scenario"
+            elif success_rate_delta < 0 or checklist_pass_rate_delta < 0 or avg_attempt_count_delta > 0:
+                preferred = "baseline"
+            summary_parts = [profile_name]
+            if scenario_total_runs - baseline_total_runs:
+                summary_parts.append(f"{scenario_total_runs - baseline_total_runs:+d} run(s)")
+            if success_rate_delta:
+                summary_parts.append(f"{success_rate_delta:+.1f}% success")
+            if checklist_pass_rate_delta:
+                summary_parts.append(f"{checklist_pass_rate_delta:+.1f}% checklist")
+            if avg_attempt_count_delta:
+                summary_parts.append(f"{avg_attempt_count_delta:+.2f} attempts")
+            deltas.append(
+                EvalScenarioVerificationProfileDelta(
+                    profile_id=profile_id,
+                    profile_name=profile_name,
+                    present_in_scenario=scenario_item is not None,
+                    present_in_baseline=baseline_item is not None,
+                    scenario_total_runs=scenario_total_runs,
+                    baseline_total_runs=baseline_total_runs,
+                    total_runs_delta=scenario_total_runs - baseline_total_runs,
+                    scenario_success_rate=scenario_success_rate,
+                    baseline_success_rate=baseline_success_rate,
+                    success_rate_delta=success_rate_delta,
+                    scenario_checklist_pass_rate=scenario_checklist_pass_rate,
+                    baseline_checklist_pass_rate=baseline_checklist_pass_rate,
+                    checklist_pass_rate_delta=checklist_pass_rate_delta,
+                    scenario_avg_attempt_count=scenario_avg_attempt_count,
+                    baseline_avg_attempt_count=baseline_avg_attempt_count,
+                    avg_attempt_count_delta=avg_attempt_count_delta,
+                    scenario_confidence_counts=dict(scenario_item.confidence_counts) if scenario_item is not None else {},
+                    baseline_confidence_counts=dict(baseline_item.confidence_counts) if baseline_item is not None else {},
+                    preferred=preferred,
+                    summary="; ".join(summary_parts),
+                )
+            )
+        return deltas
+
+    def _apply_eval_scenario_to_packet(
+        self,
+        packet: IssueContextPacket,
+        scenario: EvalScenarioRecord,
+    ) -> IssueContextPacket:
+        guidance = packet.guidance
+        if scenario.guidance_paths:
+            guidance_lookup = {item.path: item for item in packet.guidance}
+            guidance = [guidance_lookup[path] for path in scenario.guidance_paths if path in guidance_lookup]
+        verification_profiles = packet.available_verification_profiles
+        if scenario.verification_profile_ids:
+            profile_lookup = {item.profile_id: item for item in packet.available_verification_profiles}
+            verification_profiles = [
+                profile_lookup[profile_id]
+                for profile_id in scenario.verification_profile_ids
+                if profile_id in profile_lookup
+            ]
+        ticket_contexts = packet.ticket_contexts
+        if scenario.ticket_context_ids:
+            ticket_lookup = {item.context_id: item for item in packet.ticket_contexts}
+            ticket_contexts = [
+                ticket_lookup[context_id]
+                for context_id in scenario.ticket_context_ids
+                if context_id in ticket_lookup
+            ]
+        browser_dumps = packet.browser_dumps
+        if scenario.browser_dump_ids:
+            dump_lookup = {item.dump_id: item for item in packet.browser_dumps}
+            browser_dumps = [dump_lookup[dump_id] for dump_id in scenario.browser_dump_ids if dump_id in dump_lookup]
+        scenario_prompt = self._build_prompt(
+            packet.workspace,
+            packet.issue,
+            packet.tree_focus,
+            packet.recent_fixes,
+            packet.recent_activity,
+            guidance,
+            verification_profiles,
+            ticket_contexts,
+            packet.threat_models,
+            browser_dumps,
+            packet.related_paths,
+            packet.repo_map,
+            packet.dynamic_context,
+            packet.repo_config,
+            packet.matched_path_instructions,
+        )
+        summary_lines = [
+            f"Evaluation scenario: {scenario.name}",
+            f"Scenario id: {scenario.scenario_id}",
+        ]
+        if scenario.description:
+            summary_lines.append(f"Description: {scenario.description}")
+        if scenario.notes:
+            summary_lines.append(f"Notes: {scenario.notes}")
+        if scenario.guidance_paths:
+            summary_lines.append(f"Pinned guidance: {', '.join(scenario.guidance_paths)}")
+        if scenario.ticket_context_ids:
+            summary_lines.append(f"Pinned ticket context: {', '.join(scenario.ticket_context_ids)}")
+        if scenario.verification_profile_ids:
+            summary_lines.append(f"Pinned verification profiles: {', '.join(scenario.verification_profile_ids)}")
+        if scenario.browser_dump_ids:
+            summary_lines.append(f"Pinned browser dumps: {', '.join(scenario.browser_dump_ids)}")
+        return packet.model_copy(
+            update={
+                "guidance": guidance,
+                "available_verification_profiles": verification_profiles,
+                "ticket_contexts": ticket_contexts,
+                "browser_dumps": browser_dumps,
+                "prompt": f"{chr(10).join(summary_lines)}\n\n{scenario_prompt}",
+            }
+        )
+
+    def _record_eval_scenario_run(self, workspace_id: str, scenario_id: str, run_id: str) -> None:
+        scenarios = self.store.list_eval_scenarios(workspace_id)
+        target = next((item for item in scenarios if item.scenario_id == scenario_id), None)
+        if target is None:
+            raise FileNotFoundError(scenario_id)
+        if run_id in target.run_ids:
+            return
+        updated = target.model_copy(update={"run_ids": [*target.run_ids, run_id], "updated_at": utc_now()})
+        self.store.save_eval_scenarios(
+            workspace_id,
+            [updated if item.scenario_id == scenario_id else item for item in scenarios],
+        )
+        self._record_activity(
+            workspace_id=workspace_id,
+            entity_type="issue",
+            entity_id=target.issue_id,
+            action="eval_scenario.executed",
+            summary=f"Queued fresh run for eval scenario {target.name}",
+            actor=build_activity_actor("operator", "operator"),
+            issue_id=target.issue_id,
+            run_id=run_id,
+            details={"scenario_id": scenario_id, "run_id": run_id},
+        )
+
+    def _select_eval_runs(self, workspace_id: str, scenario: EvalScenarioRecord) -> list[RunRecord]:
+        selected_runs = []
+        allowed_ids = set(scenario.run_ids)
+        for run in self.store.list_runs(workspace_id):
+            if run.issue_id != scenario.issue_id:
+                continue
+            if allowed_ids and run.run_id not in allowed_ids:
+                continue
+            selected_runs.append(run)
+        return selected_runs
+
+    def _load_eval_run_metrics(self, runs: list[RunRecord]) -> list[RunMetrics]:
+        metrics = []
+        for run in runs:
+            item = self.runtime_service.load_run_metrics(run.run_id)
+            if item:
+                metrics.append(item)
+        return metrics
+
+    def _build_eval_variant_diff(self, scenario: EvalScenarioRecord, packet: IssueContextPacket) -> EvalScenarioVariantDiff:
+        current_guidance_paths = [item.path for item in packet.guidance[:8]]
+        current_ticket_context_ids = [item.context_id for item in packet.ticket_contexts[:8]]
+        added_guidance_paths, removed_guidance_paths = self._diff_ordered_strings(scenario.guidance_paths, current_guidance_paths)
+        added_ticket_context_ids, removed_ticket_context_ids = self._diff_ordered_strings(
+            scenario.ticket_context_ids,
+            current_ticket_context_ids,
+        )
+        changed = bool(
+            added_guidance_paths
+            or removed_guidance_paths
+            or added_ticket_context_ids
+            or removed_ticket_context_ids
+        )
+        summary_parts = []
+        if added_guidance_paths or removed_guidance_paths:
+            summary_parts.append(
+                f"guidance +{len(added_guidance_paths)} / -{len(removed_guidance_paths)}"
+            )
+        if added_ticket_context_ids or removed_ticket_context_ids:
+            summary_parts.append(
+                f"ticket context +{len(added_ticket_context_ids)} / -{len(removed_ticket_context_ids)}"
+            )
+        if not summary_parts:
+            summary_parts.append("saved guidance and ticket-context variants still match the current issue packet")
+        return EvalScenarioVariantDiff(
+            selected_guidance_paths=scenario.guidance_paths,
+            current_guidance_paths=current_guidance_paths,
+            added_guidance_paths=added_guidance_paths,
+            removed_guidance_paths=removed_guidance_paths,
+            selected_ticket_context_ids=scenario.ticket_context_ids,
+            current_ticket_context_ids=current_ticket_context_ids,
+            added_ticket_context_ids=added_ticket_context_ids,
+            removed_ticket_context_ids=removed_ticket_context_ids,
+            changed=changed,
+            summary="; ".join(summary_parts),
+        )
+
+    def _build_eval_variant_rollups(
+        self,
+        workspace_id: str,
+        scenarios: list[EvalScenarioRecord],
+        variant_kind: str,
+    ) -> list[EvalVariantRollup]:
+        buckets: dict[str, EvalVariantRollup] = {}
+        bucket_runs: dict[str, list[RunRecord]] = {}
+        bucket_metric_count: dict[str, int] = {}
+        bucket_total_duration: dict[str, int] = {}
+        bucket_verification_total: dict[str, int] = {}
+        bucket_verification_success: dict[str, int] = {}
+        bucket_verification_keys: dict[str, set[tuple[str, str]]] = {}
+        for scenario in scenarios:
+            selected_values = scenario.guidance_paths if variant_kind == "guidance" else scenario.ticket_context_ids
+            variant_key = "|".join(selected_values) if selected_values else "__default__"
+            current = buckets.get(variant_key)
+            if current is None:
+                current = EvalVariantRollup(
+                    variant_kind=variant_kind,
+                    variant_key=variant_key,
+                    label=self._format_eval_variant_label(variant_kind, selected_values),
+                    selected_values=list(selected_values),
+                )
+                buckets[variant_key] = current
+                bucket_runs[variant_key] = []
+                bucket_metric_count[variant_key] = 0
+                bucket_total_duration[variant_key] = 0
+                bucket_verification_total[variant_key] = 0
+                bucket_verification_success[variant_key] = 0
+                bucket_verification_keys[variant_key] = set()
+            current.scenario_ids.append(scenario.scenario_id)
+            current.scenario_names.append(scenario.name)
+            current.scenario_count += 1
+            selected_runs = self._dedupe_eval_runs(self._select_eval_runs(workspace_id, scenario))
+            run_metrics = self._load_eval_run_metrics(selected_runs)
+            bucket_runs[variant_key] = self._dedupe_eval_runs([*bucket_runs[variant_key], *selected_runs])
+            current.run_count = len(bucket_runs[variant_key])
+            current.success_runs = sum(1 for run in bucket_runs[variant_key] if run.status == "completed")
+            current.failed_runs = sum(1 for run in bucket_runs[variant_key] if run.status == "failed")
+            current.total_estimated_cost = round(current.total_estimated_cost + sum(item.estimated_cost for item in run_metrics), 4)
+            bucket_metric_count[variant_key] += len(run_metrics)
+            bucket_total_duration[variant_key] += sum(item.duration_ms for item in run_metrics)
+            metric_count = bucket_metric_count[variant_key]
+            current.avg_duration_ms = int(bucket_total_duration[variant_key] / metric_count) if metric_count else 0
+            verification_reports = self.list_verification_profile_reports(workspace_id, issue_id=scenario.issue_id)
+            if scenario.verification_profile_ids:
+                verification_reports = [
+                    item for item in verification_reports if item.profile_id in set(scenario.verification_profile_ids)
+                ]
+            new_reports = [
+                item
+                for item in verification_reports
+                if (scenario.issue_id, item.profile_id) not in bucket_verification_keys[variant_key]
+            ]
+            bucket_verification_keys[variant_key].update((scenario.issue_id, item.profile_id) for item in new_reports)
+            bucket_verification_total[variant_key] += sum(item.total_runs for item in new_reports)
+            bucket_verification_success[variant_key] += sum(item.success_runs for item in new_reports)
+            current.verification_success_rate = round(
+                (bucket_verification_success[variant_key] / bucket_verification_total[variant_key]) * 100,
+                1,
+            ) if bucket_verification_total[variant_key] else 0.0
+            current.runtime_breakdown = self._build_eval_run_dimension_breakdown(
+                bucket_runs[variant_key],
+                lambda run: (run.runtime or "unknown", run.runtime or "unknown"),
+            )
+            current.model_breakdown = self._build_eval_run_dimension_breakdown(
+                bucket_runs[variant_key],
+                lambda run: (run.model or "unknown", run.model or "unknown"),
+            )
+            current.summary = (
+                f"{current.scenario_count} scenario(s); "
+                f"{current.success_runs} successful run(s); "
+                f"{current.failed_runs} failed run(s); "
+                f"verification {current.verification_success_rate}%"
+            )
+        return sorted(buckets.values(), key=lambda item: (-item.scenario_count, item.label.lower(), item.variant_key))
+
+    def _dedupe_eval_runs(self, runs: list[RunRecord]) -> list[RunRecord]:
+        ordered: dict[str, RunRecord] = {}
+        for run in runs:
+            ordered[run.run_id] = run
+        return list(ordered.values())
+
+    def _build_eval_run_dimension_breakdown(self, runs: list[RunRecord], resolver) -> list[VerificationProfileDimensionSummary]:
+        buckets: dict[str, VerificationProfileDimensionSummary] = {}
+        for run in runs:
+            key, label = resolver(run)
+            key = key or "unknown"
+            label = label or key
+            current = buckets.get(key)
+            if current is None:
+                current = VerificationProfileDimensionSummary(key=key, label=label)
+                buckets[key] = current
+            current.total_runs += 1
+            if run.status == "completed":
+                current.success_runs += 1
+            elif run.status == "failed":
+                current.failed_runs += 1
+            current.success_rate = round((current.success_runs / current.total_runs) * 100, 1) if current.total_runs else 0.0
+            if current.last_run_at is None or run.created_at > current.last_run_at:
+                current.last_run_at = run.created_at
+        return sorted(buckets.values(), key=lambda item: (-item.total_runs, item.label.lower(), item.key))
+
+    def _format_eval_variant_label(self, variant_kind: str, selected_values: list[str]) -> str:
+        if not selected_values:
+            return "Current defaults" if variant_kind == "guidance" else "Current ticket context"
+        preview = ", ".join(selected_values[:3])
+        if len(selected_values) > 3:
+            preview += f" +{len(selected_values) - 3} more"
+        return preview
 
     def _draft_summary_from_excerpt(self, excerpt: str, issue_id: str, run_id: str) -> str:
         for raw_line in excerpt.splitlines():

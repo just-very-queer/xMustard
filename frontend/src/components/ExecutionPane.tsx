@@ -33,6 +33,7 @@ type Props = {
   verificationProfileRuntimeDraft: string
   verificationProfileRetryDraft: string
   verificationProfileSourcePathsDraft: string
+  verificationProfileChecklistDraft: string
   settings: AppSettings | null
   terminalId: string | null
   terminalInput: string
@@ -64,6 +65,7 @@ type Props = {
   onVerificationProfileRuntimeDraftChange: (value: string) => void
   onVerificationProfileRetryDraftChange: (value: string) => void
   onVerificationProfileSourcePathsDraftChange: (value: string) => void
+  onVerificationProfileChecklistDraftChange: (value: string) => void
   onApplySelectedVerificationProfile: () => void
   onSaveVerificationProfile: () => void
   onDeleteVerificationProfile: () => void
@@ -105,6 +107,7 @@ export function ExecutionPane({
   verificationProfileRuntimeDraft,
   verificationProfileRetryDraft,
   verificationProfileSourcePathsDraft,
+  verificationProfileChecklistDraft,
   settings,
   terminalId,
   terminalInput,
@@ -136,6 +139,7 @@ export function ExecutionPane({
   onVerificationProfileRuntimeDraftChange,
   onVerificationProfileRetryDraftChange,
   onVerificationProfileSourcePathsDraftChange,
+  onVerificationProfileChecklistDraftChange,
   onApplySelectedVerificationProfile,
   onSaveVerificationProfile,
   onDeleteVerificationProfile,
@@ -388,6 +392,15 @@ export function ExecutionPane({
               <span className="tag">timeout: {selectedVerificationProfile.max_runtime_seconds}s</span>
               <span className="tag">retries: {selectedVerificationProfile.retry_count}</span>
             </div>
+            {selectedVerificationProfile.checklist_items.length ? (
+              <div className="tag-row">
+                {selectedVerificationProfile.checklist_items.map((item) => (
+                  <span key={`${selectedVerificationProfile.profile_id}-${item}`} className="tag">
+                    checklist: {item}
+                  </span>
+                ))}
+              </div>
+            ) : null}
           </>
         ) : (
           <p className="subtle">No verification profiles are available for this workspace yet.</p>
@@ -505,6 +518,18 @@ export function ExecutionPane({
               placeholder="backend/tests, frontend/src/components"
               value={verificationProfileSourcePathsDraft}
               onChange={(event) => onVerificationProfileSourcePathsDraftChange(event.target.value)}
+            />
+          </label>
+          <label className="detail-section field-stack" htmlFor="verification-profile-checklist">
+            <span className="filter-label">Checklist items</span>
+            <textarea
+              id="verification-profile-checklist"
+              name="verification-profile-checklist"
+              className="text-area"
+              rows={3}
+              placeholder="One checklist item per line"
+              value={verificationProfileChecklistDraft}
+              onChange={(event) => onVerificationProfileChecklistDraftChange(event.target.value)}
             />
           </label>
           <div className="toolbar-row">

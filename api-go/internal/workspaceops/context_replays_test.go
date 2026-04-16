@@ -22,7 +22,7 @@ func TestCaptureAndListIssueContextReplaysPersistArtifacts(t *testing.T) {
 	if replay.Prompt == "" || len(replay.TreeFocus) == 0 || len(replay.GuidancePaths) == 0 {
 		t.Fatalf("replay missing context fields: %#v", replay)
 	}
-	if len(replay.VerificationProfileIDs) == 0 || len(replay.TicketContextIDs) != 1 {
+	if len(replay.VerificationProfileIDs) == 0 || len(replay.TicketContextIDs) != 1 || len(replay.BrowserDumpIDs) != 1 {
 		t.Fatalf("replay missing linked artifact ids: %#v", replay)
 	}
 
@@ -48,6 +48,45 @@ func TestCaptureAndListIssueContextReplaysPersistArtifacts(t *testing.T) {
 	}
 	if !containsContextReplayAction(content, "context_replay.captured") {
 		t.Fatalf("missing context replay activity entry: %s", string(content))
+	}
+}
+
+func TestCompareIssueContextReplayReportsDrift(t *testing.T) {
+	dataDir, workspaceID, issueID, _ := writeIssueContextFixture(t, false)
+
+	replay, err := CaptureIssueContextReplay(dataDir, workspaceID, issueID, IssueContextReplayRequest{
+		Label: stringPtr("Baseline replay"),
+	})
+	if err != nil {
+		t.Fatalf("capture replay: %v", err)
+	}
+
+	if _, err := SaveTicketContext(dataDir, workspaceID, issueID, TicketContextUpsertRequest{
+		Title:   "Late customer update",
+		Summary: "New evidence after the baseline replay.",
+	}); err != nil {
+		t.Fatalf("save ticket context: %v", err)
+	}
+	if _, err := SaveBrowserDump(dataDir, workspaceID, issueID, BrowserDumpUpsertRequest{
+		Label:       "Later browser dump",
+		Summary:     stringPtr("The UI has drifted from the baseline replay."),
+		DOMSnapshot: stringPtr("button disabled forever"),
+	}); err != nil {
+		t.Fatalf("save browser dump: %v", err)
+	}
+
+	comparison, err := CompareIssueContextReplay(dataDir, workspaceID, issueID, replay.ReplayID)
+	if err != nil {
+		t.Fatalf("compare replay: %v", err)
+	}
+	if !comparison.Changed || !comparison.PromptChanged {
+		t.Fatalf("expected drift in replay comparison: %#v", comparison)
+	}
+	if len(comparison.AddedTicketContextIDs) == 0 || len(comparison.AddedBrowserDumpIDs) == 0 {
+		t.Fatalf("expected added ticket context and browser dump ids: %#v", comparison)
+	}
+	if comparison.Summary == "" {
+		t.Fatalf("expected non-empty summary")
 	}
 }
 

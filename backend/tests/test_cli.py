@@ -36,6 +36,17 @@ class CliSurfaceTests(unittest.TestCase):
         (root / "api" / "src").mkdir(parents=True)
         (root / "docs" / "bugs" / "Bugs_25260323.md").write_text(LEDGER_TEXT, encoding="utf-8")
         (root / "api" / "src" / "example.py").write_text("print('ok')\n", encoding="utf-8")
+        (root / ".xmustard.yaml").write_text(
+            """
+description: CLI fixture repo
+reviews:
+  path_instructions:
+    - path: "api/src/**"
+      instructions: Check API behavior carefully.
+""".strip()
+            + "\n",
+            encoding="utf-8",
+        )
 
         store = FileStore(Path(tmp_dir) / "data")
         service = TrackerService(store)
@@ -761,6 +772,25 @@ class CliSurfaceTests(unittest.TestCase):
                 self.assertEqual(result.exit_code, 0, msg=result.output)
                 self.assertEqual(json.loads(result.stdout)["workspace_id"], workspace_id)
 
+                result = self.runner.invoke(cli_module.app, ["guidance-health", workspace_id])
+                self.assertEqual(result.exit_code, 0, msg=result.output)
+                self.assertEqual(json.loads(result.stdout)["workspace_id"], workspace_id)
+
+                result = self.runner.invoke(cli_module.app, ["repo-config", workspace_id])
+                self.assertEqual(result.exit_code, 0, msg=result.output)
+                self.assertEqual(json.loads(result.stdout)["source_path"], ".xmustard.yaml")
+
+                result = self.runner.invoke(cli_module.app, ["repo-config-health", workspace_id])
+                self.assertEqual(result.exit_code, 0, msg=result.output)
+                self.assertEqual(json.loads(result.stdout)["status"], "configured")
+
+                result = self.runner.invoke(
+                    cli_module.app,
+                    ["guidance-generate", workspace_id, "--template-id", "agents"],
+                )
+                self.assertEqual(result.exit_code, 0, msg=result.output)
+                self.assertEqual(json.loads(result.stdout)["path"], "AGENTS.md")
+
                 result = self.runner.invoke(
                     cli_module.app,
                     [
@@ -776,15 +806,30 @@ class CliSurfaceTests(unittest.TestCase):
                         "coverage.xml",
                         "--coverage-format",
                         "cobertura",
+                        "--checklist-items",
+                        "Coverage artifact is produced,Regression command passes",
                     ],
                 )
                 self.assertEqual(result.exit_code, 0, msg=result.output)
                 profile = json.loads(result.stdout)
                 self.assertEqual(profile["name"], "CLI Verify")
+                self.assertEqual(profile["checklist_items"], ["Coverage artifact is produced", "Regression command passes"])
 
                 result = self.runner.invoke(cli_module.app, ["verification-profiles", workspace_id])
                 self.assertEqual(result.exit_code, 0, msg=result.output)
                 self.assertTrue(any(item["profile_id"] == profile["profile_id"] for item in json.loads(result.stdout)))
+
+                result = self.runner.invoke(
+                    cli_module.app,
+                    ["verification-profile-history", workspace_id, "--profile-id", profile["profile_id"]],
+                )
+                self.assertEqual(result.exit_code, 0, msg=result.output)
+                self.assertEqual(json.loads(result.stdout), [])
+
+                result = self.runner.invoke(cli_module.app, ["verification-profile-reports", workspace_id])
+                self.assertEqual(result.exit_code, 0, msg=result.output)
+                reports_payload = json.loads(result.stdout)
+                self.assertTrue(any(item["profile_id"] == profile["profile_id"] for item in reports_payload))
 
                 result = self.runner.invoke(
                     cli_module.app,
@@ -825,6 +870,14 @@ class CliSurfaceTests(unittest.TestCase):
                 self.assertEqual(result.exit_code, 0, msg=result.output)
                 replay_payload = json.loads(result.stdout)
                 self.assertEqual(replay_payload["label"], "cli replay")
+
+                result = self.runner.invoke(
+                    cli_module.app,
+                    ["context-replay-compare", workspace_id, "P0_25M03_001", replay_payload["replay_id"]],
+                )
+                self.assertEqual(result.exit_code, 0, msg=result.output)
+                comparison_payload = json.loads(result.stdout)
+                self.assertEqual(comparison_payload["replay"]["replay_id"], replay_payload["replay_id"])
 
                 result = self.runner.invoke(
                     cli_module.app,

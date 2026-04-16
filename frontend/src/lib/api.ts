@@ -9,13 +9,21 @@ import type {
   CoverageDelta,
   CoverageResult,
   DuplicateMatch,
+  EvalScenarioRecord,
+  EvalScenarioReplayRequest,
+  EvalScenarioReplayResult,
+  EvalScenarioUpsertRequest,
+  EvalWorkspaceReport,
   FixDraftSuggestion,
   FixRecord,
   FixRecordRequest,
   GitHubIssueImport,
   GitHubPRCreate,
   GitHubPRResult,
+  GuidanceStarterRequest,
+  GuidanceStarterResult,
   ImprovementSuggestion,
+  IssueContextReplayComparison,
   IntegrationConfig,
   IntegrationTestResult,
   IssueCreateRequest,
@@ -31,7 +39,10 @@ import type {
   PlanApproveRequest,
   PlanRejectRequest,
   RepoMapSummary,
+  RepoConfigHealth,
+  RepoConfigRecord,
   RepoGuidanceRecord,
+  RepoGuidanceHealth,
   RuntimeProbeResult,
   RunMetrics,
   RunPlan,
@@ -54,6 +65,7 @@ import type {
   TreeNode,
   VerificationProfileRecord,
   VerificationProfileExecutionResult,
+  VerificationProfileReport,
   VerificationProfileRunRequest,
   VerificationProfileUpsertRequest,
   WorktreeStatus,
@@ -134,6 +146,25 @@ export function listWorkspaceGuidance(workspaceId: string) {
   return request<RepoGuidanceRecord[]>(`/api/workspaces/${workspaceId}/guidance`)
 }
 
+export function getWorkspaceGuidanceHealth(workspaceId: string) {
+  return request<RepoGuidanceHealth>(`/api/workspaces/${workspaceId}/guidance/health`)
+}
+
+export function generateGuidanceStarter(workspaceId: string, payload: GuidanceStarterRequest) {
+  return request<GuidanceStarterResult>(`/api/workspaces/${workspaceId}/guidance/starters`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+}
+
+export function readRepoConfig(workspaceId: string) {
+  return request<RepoConfigRecord>(`/api/workspaces/${workspaceId}/repo-config`)
+}
+
+export function readRepoConfigHealth(workspaceId: string) {
+  return request<RepoConfigHealth>(`/api/workspaces/${workspaceId}/repo-config/health`)
+}
+
 export function readRepoMap(workspaceId: string) {
   return request<RepoMapSummary>(`/api/workspaces/${workspaceId}/repo-map`)
 }
@@ -196,6 +227,46 @@ export function captureIssueContextReplay(workspaceId: string, issueId: string, 
   return request<IssueContextReplayRecord>(`/api/workspaces/${workspaceId}/issues/${issueId}/context-replays`, {
     method: 'POST',
     body: JSON.stringify({ label }),
+  })
+}
+
+export function compareIssueContextReplay(workspaceId: string, issueId: string, replayId: string) {
+  return request<IssueContextReplayComparison>(
+    `/api/workspaces/${workspaceId}/issues/${issueId}/context-replays/${replayId}/compare`,
+  )
+}
+
+export function listEvalScenarios(workspaceId: string, params: { issue_id?: string } = {}) {
+  const search = new URLSearchParams()
+  if (params.issue_id) search.set('issue_id', params.issue_id)
+  const suffix = search.toString() ? `?${search.toString()}` : ''
+  return request<EvalScenarioRecord[]>(`/api/workspaces/${workspaceId}/eval-scenarios${suffix}`)
+}
+
+export function saveEvalScenario(workspaceId: string, payload: EvalScenarioUpsertRequest) {
+  return request<EvalScenarioRecord>(`/api/workspaces/${workspaceId}/eval-scenarios`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+}
+
+export function deleteEvalScenario(workspaceId: string, scenarioId: string) {
+  return request<{ ok: boolean; scenario_id: string }>(`/api/workspaces/${workspaceId}/eval-scenarios/${scenarioId}`, {
+    method: 'DELETE',
+  })
+}
+
+export function getEvalReport(workspaceId: string, params: { scenario_id?: string } = {}) {
+  const search = new URLSearchParams()
+  if (params.scenario_id) search.set('scenario_id', params.scenario_id)
+  const suffix = search.toString() ? `?${search.toString()}` : ''
+  return request<EvalWorkspaceReport>(`/api/workspaces/${workspaceId}/eval-report${suffix}`)
+}
+
+export function replayEvalScenarios(workspaceId: string, issueId: string, payload: EvalScenarioReplayRequest) {
+  return request<EvalScenarioReplayResult>(`/api/workspaces/${workspaceId}/issues/${issueId}/eval-scenarios/replay`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
   })
 }
 
@@ -301,7 +372,7 @@ export function listSignals(
 export function startRun(
   workspaceId: string,
   issueId: string,
-  payload: { runtime: string; model: string; instruction?: string; runbook_id?: string; planning?: boolean },
+  payload: { runtime: string; model: string; instruction?: string; runbook_id?: string; eval_scenario_id?: string; planning?: boolean },
 ) {
   return request<RunRecord>(`/api/workspaces/${workspaceId}/issues/${issueId}/runs`, {
     method: 'POST',
@@ -386,6 +457,21 @@ export function deleteRunbook(workspaceId: string, runbookId: string) {
 
 export function listVerificationProfiles(workspaceId: string) {
   return request<VerificationProfileRecord[]>(`/api/workspaces/${workspaceId}/verification-profiles`)
+}
+
+export function listVerificationProfileHistory(workspaceId: string, params: { profile_id?: string; issue_id?: string } = {}) {
+  const search = new URLSearchParams()
+  if (params.profile_id) search.set('profile_id', params.profile_id)
+  if (params.issue_id) search.set('issue_id', params.issue_id)
+  const suffix = search.toString() ? `?${search.toString()}` : ''
+  return request<VerificationProfileExecutionResult[]>(`/api/workspaces/${workspaceId}/verification-profile-history${suffix}`)
+}
+
+export function listVerificationProfileReports(workspaceId: string, params: { issue_id?: string } = {}) {
+  const search = new URLSearchParams()
+  if (params.issue_id) search.set('issue_id', params.issue_id)
+  const suffix = search.toString() ? `?${search.toString()}` : ''
+  return request<VerificationProfileReport[]>(`/api/workspaces/${workspaceId}/verification-profile-reports${suffix}`)
 }
 
 export function saveVerificationProfile(workspaceId: string, payload: VerificationProfileUpsertRequest) {

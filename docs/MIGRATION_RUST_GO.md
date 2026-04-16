@@ -172,12 +172,18 @@ That boundary work is now live for three concrete slices:
 - The Go API shell now owns issue-context packet reads at `/api/workspaces/{workspace_id}/issues/{issue_id}/context`.
 - The Go API shell now owns issue-work packet reads at `/api/workspaces/{workspace_id}/issues/{issue_id}/work`, including runbook selection.
 - The Go API shell now owns issue-context replay list/capture against `context_replays.json`, including replay activity records.
+- The Go API shell now owns eval scenario list/save/delete plus workspace eval-report reads against `eval_scenarios.json`, reusing replay comparison, verification profile reports, and persisted run metrics from the existing tracker artifacts.
+- The Go API shell now matches the richer eval-report contract for saved guidance/ticket-context variants and workspace-level variant rollups, including runtime/model breakdowns per guidance set or ticket-context set.
+- The Go API shell now owns issue-scoped eval-scenario replay requests too, so batch replays and fresh-vs-baseline eval reporting stay on the Go side once scenarios are launched.
 - The Go API shell now owns workspace snapshot reads, activity feeds, activity overview, sources, tree browsing, guidance discovery, and repo-map reads against the existing workspace artifacts.
 - The Go API shell now owns issue queue reads, issue drift reads, signal queue reads, and workspace drift summary reads from the persisted workspace snapshot.
 - The Go API shell now owns issue create/update plus saved-view list/create/update/delete against `snapshot.json`, `tracker_issues.json`, `issue_overrides.json`, and `saved_views.json`, including matching activity ledger entries.
 - The Go API shell now owns runtime listing, settings reads/writes, local agent capability reads, and workspace runtime probe flows while preserving the existing `settings.json` contract and runtime model validation behavior.
 - The Go API shell now owns issue-run creation, workspace query runs, run listing, run detail reads, run log reads, live run cancel/retry, run plan generate/read/approve/reject, run review submission, run acceptance, run insights, run metrics, workspace metrics, cost summaries, critique generation/read, improvement listing/dismissal, fix listing, fix recording, fix-draft generation, verification listing, and review-queue reads against the persisted run and tracker artifacts.
+- Verification profile checklist items and durable verification-profile history now persist through both Python and Go API paths, with confidence scoring attached to each saved execution record.
+- The Go API shell now owns verification-profile report reads, including runtime, model, and branch breakdowns that match the richer Python report shape.
 - The Go API shell now owns workspace listing, fresh and cached workspace load, explicit workspace scan, worktree reads, export bundle reads, and terminal open/write/resize/read/close transport against the existing workspace registry and terminal log layout.
+- The Go API shell now owns repo-config reads at `/api/workspaces/{workspace_id}/repo-config` and `/api/workspaces/{workspace_id}/repo-config/health`, and issue-context packets built in Go now include `.xmustard.yaml` path instructions and MCP/browser-context hints.
 - Python parity tests now compare live Python behavior against the Rust outputs for:
   - signal scanning
   - repo-map summaries

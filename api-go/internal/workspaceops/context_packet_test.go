@@ -57,6 +57,15 @@ func TestBuildIssueContextPacketBuildsFrontendShapeFromArtifacts(t *testing.T) {
 	if packet.RepoMap == nil || len(packet.RelatedPaths) == 0 {
 		t.Fatalf("expected repo map and related paths, got repo_map=%#v related=%#v", packet.RepoMap, packet.RelatedPaths)
 	}
+	if packet.DynamicContext == nil || len(packet.DynamicContext.SymbolContext) == 0 || len(packet.DynamicContext.RelatedContext) == 0 {
+		t.Fatalf("expected dynamic context bundle, got %#v", packet.DynamicContext)
+	}
+	if packet.RepoConfig == nil || packet.RepoConfig.SourcePath == nil || *packet.RepoConfig.SourcePath != ".xmustard.yaml" {
+		t.Fatalf("expected repo config, got %#v", packet.RepoConfig)
+	}
+	if len(packet.MatchedPathInstructions) != 1 || len(packet.MatchedPathInstructions[0].MatchedPaths) == 0 || packet.MatchedPathInstructions[0].MatchedPaths[0] != "src/app.py" {
+		t.Fatalf("expected matched path instructions, got %#v", packet.MatchedPathInstructions)
+	}
 	if packet.Worktree == nil || !packet.Worktree.Available || packet.Worktree.IsGitRepo {
 		t.Fatalf("expected non-git worktree status, got %#v", packet.Worktree)
 	}
@@ -68,6 +77,24 @@ func TestBuildIssueContextPacketBuildsFrontendShapeFromArtifacts(t *testing.T) {
 	}
 	if !strings.Contains(packet.Prompt, "Browser context:") || !strings.Contains(packet.Prompt, "/api/export") {
 		t.Fatalf("prompt missing browser context sections:\n%s", packet.Prompt)
+	}
+	if !strings.Contains(packet.Prompt, "Symbol context:") || !strings.Contains(packet.Prompt, "Related artifacts:") {
+		t.Fatalf("prompt missing dynamic context sections:\n%s", packet.Prompt)
+	}
+	if !strings.Contains(packet.Prompt, "Repo config:") || !strings.Contains(packet.Prompt, "Path-specific guidance:") || !strings.Contains(packet.Prompt, "browser-dump") {
+		t.Fatalf("prompt missing repo config sections:\n%s", packet.Prompt)
+	}
+}
+
+func TestGetWorkspaceRepoConfigHealthReportsConfigured(t *testing.T) {
+	dataDir, workspaceID, _, _ := writeIssueContextFixture(t, false)
+
+	health, err := GetWorkspaceRepoConfigHealth(dataDir, workspaceID)
+	if err != nil {
+		t.Fatalf("get repo config health: %v", err)
+	}
+	if health.Status != "configured" || health.PathInstructionCount != 1 || health.MCPServerCount != 1 {
+		t.Fatalf("unexpected repo config health: %#v", health)
 	}
 }
 
@@ -86,7 +113,11 @@ func writeIssueContextFixture(t *testing.T, withRunbook bool) (string, string, s
 	if err := os.WriteFile(filepath.Join(repoRoot, "AGENTS.md"), []byte("# AGENTS\n\n- Run pytest --cov=. --cov-report=xml before finalizing.\n"), 0o644); err != nil {
 		t.Fatalf("write AGENTS: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(repoRoot, "src", "app.py"), []byte("print('ok')\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(repoRoot, ".xmustard.yaml"), []byte("description: Export-heavy service with browser-based regressions.\ncode_guidelines:\n  - Keep API and UI contracts aligned.\nmcp_servers:\n  - name: browser-dump\n    description: Browser MCP snapshots for UI regressions.\nreviews:\n  path_instructions:\n    - path: \"src/**\"\n      title: \"Source focus\"\n      instructions: |\n        Check validation, response-shape compatibility, and regression coverage.\n  path_filters:\n    - \"!dist/**\"\n"), 0o644); err != nil {
+		t.Fatalf("write .xmustard.yaml: %v", err)
+	}
+	source := "class ExportService:\n    def export_summary(self):\n        return 'ok'\n"
+	if err := os.WriteFile(filepath.Join(repoRoot, "src", "app.py"), []byte(source), 0o644); err != nil {
 		t.Fatalf("write source file: %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(repoRoot, "src", "feature_test.py"), []byte("def test_ok():\n    assert True\n"), 0o644); err != nil {

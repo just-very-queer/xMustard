@@ -1,4 +1,4 @@
-import type { CostSummary, WorktreeStatus } from '../lib/types'
+import type { CostSummary, RepoGuidanceHealth, WorktreeStatus } from '../lib/types'
 import { formatDate } from '../lib/format'
 
 type Props = {
@@ -9,6 +9,7 @@ type Props = {
   costSummary?: CostSummary | null
   guidanceCount?: number
   hasRepoGuidance?: boolean
+  guidanceHealth?: RepoGuidanceHealth | null
   backendHealthy?: boolean | null
   canExport: boolean
   canToggleExecution?: boolean
@@ -25,6 +26,7 @@ export function AppTopbar({
   costSummary,
   guidanceCount,
   hasRepoGuidance,
+  guidanceHealth,
   backendHealthy,
   canExport,
   canToggleExecution,
@@ -46,8 +48,18 @@ export function AppTopbar({
           </span>
         ) : null}
         {workspaceName ? (
-          <span className={`status-chip ${hasRepoGuidance ? 'status-chip-ok' : 'status-chip-warn'}`}>
-            {hasRepoGuidance ? `Repo guidance ${guidanceCount ?? 0}` : 'Add AGENTS.md'}
+          <span
+            className={`status-chip ${
+              guidanceHealth?.status === 'healthy'
+                ? 'status-chip-ok'
+                : guidanceHealth?.status === 'missing'
+                  ? 'status-chip-bad'
+                  : hasRepoGuidance
+                    ? 'status-chip-warn'
+                    : 'status-chip-warn'
+            }`}
+          >
+            {guidanceHealth ? `Guidance ${guidanceHealth.status}` : hasRepoGuidance ? `Repo guidance ${guidanceCount ?? 0}` : 'Add AGENTS.md'}
           </span>
         ) : null}
         {worktree?.is_git_repo ? (

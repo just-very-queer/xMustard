@@ -26,3 +26,6 @@ __pycache__/
 node_modules/
 *.egg-info/
 .env
+
+# Go binaries
+api-go/xmustard-api

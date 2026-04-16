@@ -38,6 +38,7 @@ func TestVerificationProfileCrudPersistsArtifacts(t *testing.T) {
 		MaxRuntimeSeconds:  90,
 		RetryCount:         2,
 		SourcePaths:        []string{"AGENTS.md"},
+		ChecklistItems:     []string{"Coverage artifact is produced", "Regression command passes"},
 		CoverageCommand:    stringPtr("pytest --cov=. --cov-report=xml"),
 		CoverageReportPath: stringPtr("coverage.xml"),
 	})
@@ -46,6 +47,9 @@ func TestVerificationProfileCrudPersistsArtifacts(t *testing.T) {
 	}
 	if saved.ProfileID != "backend-pytest" {
 		t.Fatalf("unexpected profile id: %s", saved.ProfileID)
+	}
+	if len(saved.ChecklistItems) != 2 {
+		t.Fatalf("expected checklist items on saved profile: %#v", saved)
 	}
 
 	profiles, err := ListVerificationProfiles(dataDir, workspaceID)

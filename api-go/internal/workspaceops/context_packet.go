@@ -70,6 +70,32 @@ type RunbookRecord struct {
 	UpdatedAt   string `json:"updated_at"`
 }
 
+type RepoMapSymbolRecord struct {
+	Path           string  `json:"path"`
+	Symbol         string  `json:"symbol"`
+	Kind           string  `json:"kind"`
+	LineStart      *int    `json:"line_start,omitempty"`
+	LineEnd        *int    `json:"line_end,omitempty"`
+	EnclosingScope *string `json:"enclosing_scope,omitempty"`
+	Reason         *string `json:"reason,omitempty"`
+	Score          int     `json:"score"`
+}
+
+type RelatedContextRecord struct {
+	ArtifactType string   `json:"artifact_type"`
+	ArtifactID   string   `json:"artifact_id"`
+	Title        string   `json:"title"`
+	Path         *string  `json:"path,omitempty"`
+	Reason       *string  `json:"reason,omitempty"`
+	MatchedTerms []string `json:"matched_terms"`
+	Score        int      `json:"score"`
+}
+
+type DynamicContextBundle struct {
+	SymbolContext  []RepoMapSymbolRecord  `json:"symbol_context"`
+	RelatedContext []RelatedContextRecord `json:"related_context"`
+}
+
 type IssueContextPacket struct {
 	Issue                         issueRecord                         `json:"issue"`
 	Workspace                     workspaceRecord                     `json:"workspace"`
@@ -86,6 +112,9 @@ type IssueContextPacket struct {
 	ThreatModels                  []ThreatModelRecord                 `json:"threat_models"`
 	BrowserDumps                  []BrowserDumpRecord                 `json:"browser_dumps"`
 	RepoMap                       *rustcore.RepoMapSummary            `json:"repo_map,omitempty"`
+	DynamicContext                *DynamicContextBundle               `json:"dynamic_context,omitempty"`
+	RepoConfig                    *RepoConfigRecord                   `json:"repo_config,omitempty"`
+	MatchedPathInstructions       []RepoPathInstructionMatch          `json:"matched_path_instructions"`
 	Worktree                      *WorktreeStatus                     `json:"worktree,omitempty"`
 	Prompt                        string                              `json:"prompt"`
 }
@@ -143,12 +172,27 @@ func BuildIssueContextPacket(dataDir string, workspaceID string, issueID string)
 	if err != nil {
 		return nil, err
 	}
+	repoConfig, err := ReadWorkspaceRepoConfig(dataDir, workspaceID)
+	if err != nil {
+		return nil, err
+	}
 	repoMap, err := loadOrBuildRepoMap(dataDir, workspaceID, snapshot.Workspace.RootPath)
 	if err != nil {
 		return nil, err
 	}
 
 	relatedPaths := rankRelatedPathsForIssue(*issue, treeFocus, ticketContexts, repoMap)
+	evidencePaths := make([]string, 0, len(evidenceBundle))
+	for _, item := range evidenceBundle {
+		if item.NormalizedPath != nil && strings.TrimSpace(*item.NormalizedPath) != "" {
+			evidencePaths = append(evidencePaths, *item.NormalizedPath)
+			continue
+		}
+		if strings.TrimSpace(item.Path) != "" {
+			evidencePaths = append(evidencePaths, item.Path)
+		}
+	}
+	matchedPathInstructions := matchRepoPathInstructions(repoConfig, append(append([]string{}, treeFocus...), append(relatedPaths, evidencePaths...)...))
 	recentFixes, err := loadFixRecords(dataDir, workspaceID, issueID)
 	if err != nil {
 		return nil, err
@@ -164,6 +208,7 @@ func BuildIssueContextPacket(dataDir string, workspaceID string, issueID string)
 		recentActivity = recentActivity[:8]
 	}
 	worktree := readWorktreeStatus(snapshot.Workspace.RootPath)
+	dynamicContext := buildDynamicContext(snapshot.Workspace, *issue, treeFocus, ticketContexts, threatModels, browserDumps, recentFixes, recentActivity, relatedPaths)
 
 	packet := &IssueContextPacket{
 		Issue:                         *issue,
@@ -181,6 +226,9 @@ func BuildIssueContextPacket(dataDir string, workspaceID string, issueID string)
 		ThreatModels:                  threatModels,
 		BrowserDumps:                  browserDumps,
 		RepoMap:                       repoMap,
+		DynamicContext:                dynamicContext,
+		RepoConfig:                    repoConfig,
+		MatchedPathInstructions:       matchedPathInstructions,
 		Worktree:                      worktree,
 	}
 	packet.Prompt = buildIssueContextPrompt(
@@ -196,6 +244,9 @@ func BuildIssueContextPacket(dataDir string, workspaceID string, issueID string)
 		packet.BrowserDumps,
 		packet.RelatedPaths,
 		packet.RepoMap,
+		packet.DynamicContext,
+		packet.RepoConfig,
+		packet.MatchedPathInstructions,
 	)
 	return packet, nil
 }
@@ -688,6 +739,259 @@ func rankRelatedPathsForIssue(
 	return ordered
 }
 
+func buildDynamicContext(
+	workspace workspaceRecord,
+	issue issueRecord,
+	treeFocus []string,
+	ticketContexts []TicketContextRecord,
+	threatModels []ThreatModelRecord,
+	browserDumps []BrowserDumpRecord,
+	recentFixes []FixRecord,
+	recentActivity []activityRecord,
+	relatedPaths []string,
+) *DynamicContextBundle {
+	tokens := contextTokens(issue, ticketContexts)
+	symbols := extractSymbolContext(workspace.RootPath, append(append([]string{}, treeFocus...), relatedPaths...), tokens)
+	related := rankRelatedArtifacts(ticketContexts, threatModels, browserDumps, recentFixes, recentActivity, tokens)
+	if len(symbols) == 0 && len(related) == 0 {
+		return nil
+	}
+	return &DynamicContextBundle{
+		SymbolContext:  symbols,
+		RelatedContext: related,
+	}
+}
+
+func extractSymbolContext(root string, candidatePaths []string, tokens []string) []RepoMapSymbolRecord {
+	results := []RepoMapSymbolRecord{}
+	seen := map[string]struct{}{}
+	deduped := dedupeText(candidatePaths)
+	classRe := regexp.MustCompile(`^class\s+([A-Za-z_][A-Za-z0-9_]*)`)
+	defRe := regexp.MustCompile(`^def\s+([A-Za-z_][A-Za-z0-9_]*)`)
+	goFuncRe := regexp.MustCompile(`^func\s+(?:\([^)]+\)\s*)?([A-Za-z_][A-Za-z0-9_]*)`)
+	rustFnRe := regexp.MustCompile(`^fn\s+([A-Za-z_][A-Za-z0-9_]*)`)
+	jsFuncRe := regexp.MustCompile(`^(?:export\s+)?function\s+([A-Za-z_][A-Za-z0-9_]*)`)
+	varFuncRe := regexp.MustCompile(`^(?:const|let|var)\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:async\s*)?\(`)
+	structRe := regexp.MustCompile(`^struct\s+([A-Za-z_][A-Za-z0-9_]*)`)
+	for _, relPath := range deduped[:min(len(deduped), 10)] {
+		absPath := filepath.Join(root, relPath)
+		info, err := os.Stat(absPath)
+		if err != nil || info.IsDir() {
+			continue
+		}
+		ext := strings.ToLower(filepath.Ext(relPath))
+		if !slices.Contains([]string{".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".rs", ".java"}, ext) {
+			continue
+		}
+		content, err := os.ReadFile(absPath)
+		if err != nil {
+			continue
+		}
+		lines := strings.Split(string(content), "\n")
+		var currentScope *string
+		for index, raw := range lines {
+			line := strings.TrimSpace(raw)
+			kind := ""
+			symbol := ""
+			switch {
+			case classRe.MatchString(line):
+				symbol = classRe.FindStringSubmatch(line)[1]
+				kind = "class"
+				value := symbol
+				currentScope = &value
+			case defRe.MatchString(line):
+				symbol = defRe.FindStringSubmatch(line)[1]
+				kind = "function"
+				if currentScope != nil {
+					kind = "method"
+				}
+			case goFuncRe.MatchString(line):
+				symbol = goFuncRe.FindStringSubmatch(line)[1]
+				kind = "function"
+			case rustFnRe.MatchString(line):
+				symbol = rustFnRe.FindStringSubmatch(line)[1]
+				kind = "function"
+			case jsFuncRe.MatchString(line):
+				symbol = jsFuncRe.FindStringSubmatch(line)[1]
+				kind = "function"
+			case varFuncRe.MatchString(line):
+				symbol = varFuncRe.FindStringSubmatch(line)[1]
+				kind = "function"
+			case structRe.MatchString(line):
+				symbol = structRe.FindStringSubmatch(line)[1]
+				kind = "type"
+			}
+			if symbol == "" || kind == "" {
+				continue
+			}
+			key := relPath + "::" + symbol
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			lowered := strings.ToLower(relPath + " " + symbol)
+			score := 0
+			matches := []string{}
+			for _, token := range tokens[:min(len(tokens), 12)] {
+				if strings.Contains(lowered, token) {
+					score += 2
+					matches = append(matches, token)
+				}
+			}
+			for _, focusPath := range candidatePaths[:min(len(candidatePaths), 4)] {
+				if relPath == focusPath {
+					score += 2
+					break
+				}
+			}
+			if score <= 0 {
+				continue
+			}
+			seen[key] = struct{}{}
+			lineNumber := index + 1
+			var reason *string
+			if len(matches) > 0 {
+				value := "Matches " + strings.Join(matches[:min(len(matches), 3)], ", ")
+				reason = &value
+			} else {
+				value := "Near ranked focus files."
+				reason = &value
+			}
+			results = append(results, RepoMapSymbolRecord{
+				Path:           relPath,
+				Symbol:         symbol,
+				Kind:           kind,
+				LineStart:      &lineNumber,
+				EnclosingScope: currentScope,
+				Reason:         reason,
+				Score:          score,
+			})
+		}
+	}
+	slices.SortFunc(results, func(a, b RepoMapSymbolRecord) int {
+		if a.Score != b.Score {
+			if a.Score > b.Score {
+				return -1
+			}
+			return 1
+		}
+		if a.Path != b.Path {
+			if a.Path < b.Path {
+				return -1
+			}
+			return 1
+		}
+		if a.Symbol < b.Symbol {
+			return -1
+		}
+		if a.Symbol > b.Symbol {
+			return 1
+		}
+		return 0
+	})
+	return results[:min(len(results), 8)]
+}
+
+func rankRelatedArtifacts(
+	ticketContexts []TicketContextRecord,
+	threatModels []ThreatModelRecord,
+	browserDumps []BrowserDumpRecord,
+	recentFixes []FixRecord,
+	recentActivity []activityRecord,
+	tokens []string,
+) []RelatedContextRecord {
+	termSet := map[string]struct{}{}
+	for _, token := range tokens[:min(len(tokens), 12)] {
+		termSet[token] = struct{}{}
+	}
+	matchTerms := func(parts ...string) []string {
+		haystack := strings.ToLower(strings.Join(parts, " "))
+		matches := []string{}
+		for token := range termSet {
+			if strings.Contains(haystack, token) {
+				matches = append(matches, token)
+			}
+		}
+		slices.Sort(matches)
+		return matches[:min(len(matches), 4)]
+	}
+	records := []RelatedContextRecord{}
+	for _, item := range ticketContexts[:min(len(ticketContexts), 4)] {
+		matches := matchTerms(item.Title, item.Summary, strings.Join(item.AcceptanceCriteria, " "))
+		if len(matches) == 0 {
+			continue
+		}
+		reason := "Shares acceptance-criteria or ticket language with the current issue."
+		path := "ticket_contexts.json"
+		records = append(records, RelatedContextRecord{ArtifactType: "ticket_context", ArtifactID: item.ContextID, Title: item.Title, Path: &path, Reason: &reason, MatchedTerms: matches, Score: len(matches)*2 + 2})
+	}
+	for _, item := range threatModels[:min(len(threatModels), 3)] {
+		matches := matchTerms(item.Title, item.Summary, strings.Join(item.Assets, " "), strings.Join(item.AbuseCases, " "))
+		if len(matches) == 0 {
+			continue
+		}
+		reason := "Touches the same assets or abuse language as the issue context."
+		path := "threat_models.json"
+		records = append(records, RelatedContextRecord{ArtifactType: "threat_model", ArtifactID: item.ThreatModelID, Title: item.Title, Path: &path, Reason: &reason, MatchedTerms: matches, Score: len(matches)*2 + 1})
+	}
+	for _, item := range browserDumps[:min(len(browserDumps), 3)] {
+		pageURL := ""
+		if item.PageURL != nil {
+			pageURL = *item.PageURL
+		}
+		pageTitle := ""
+		if item.PageTitle != nil {
+			pageTitle = *item.PageTitle
+		}
+		matches := matchTerms(item.Label, item.Summary, pageTitle, pageURL, item.DOMSnapshot)
+		if len(matches) == 0 {
+			continue
+		}
+		reason := "Captures a browser-state repro that overlaps with the current issue terms."
+		path := "browser_dumps.json"
+		records = append(records, RelatedContextRecord{ArtifactType: "browser_dump", ArtifactID: item.DumpID, Title: item.Label, Path: &path, Reason: &reason, MatchedTerms: matches, Score: len(matches)*2 + 1})
+	}
+	for _, item := range recentFixes[:min(len(recentFixes), 4)] {
+		matches := matchTerms(item.Summary, strings.Join(item.ChangedFiles, " "))
+		if len(matches) == 0 {
+			continue
+		}
+		reason := "Previous fix history overlaps with this issue's files or terms."
+		path := "fix_records.json"
+		records = append(records, RelatedContextRecord{ArtifactType: "fix_record", ArtifactID: item.FixID, Title: item.Summary, Path: &path, Reason: &reason, MatchedTerms: matches, Score: len(matches)*2 + 1})
+	}
+	for _, item := range recentActivity[:min(len(recentActivity), 4)] {
+		matches := matchTerms(item.Summary)
+		if len(matches) == 0 {
+			continue
+		}
+		reason := "Recent issue activity mentions the same issue language."
+		path := "activity.jsonl"
+		records = append(records, RelatedContextRecord{ArtifactType: "activity", ArtifactID: item.ActivityID, Title: item.Summary, Path: &path, Reason: &reason, MatchedTerms: matches, Score: len(matches) * 2})
+	}
+	slices.SortFunc(records, func(a, b RelatedContextRecord) int {
+		if a.Score != b.Score {
+			if a.Score > b.Score {
+				return -1
+			}
+			return 1
+		}
+		if a.ArtifactType != b.ArtifactType {
+			if a.ArtifactType < b.ArtifactType {
+				return -1
+			}
+			return 1
+		}
+		if strings.ToLower(a.Title) < strings.ToLower(b.Title) {
+			return -1
+		}
+		if strings.ToLower(a.Title) > strings.ToLower(b.Title) {
+			return 1
+		}
+		return 0
+	})
+	return records[:min(len(records), 8)]
+}
+
 func buildIssueContextPrompt(
 	workspace workspaceRecord,
 	issue issueRecord,
@@ -701,6 +1005,9 @@ func buildIssueContextPrompt(
 	browserDumps []BrowserDumpRecord,
 	relatedPaths []string,
 	repoMap *rustcore.RepoMapSummary,
+	dynamicContext *DynamicContextBundle,
+	repoConfig *RepoConfigRecord,
+	matchedPathInstructions []RepoPathInstructionMatch,
 ) string {
 	evidenceLines := make([]string, 0, min(len(issue.Evidence)+len(issue.VerificationEvidence), 16))
 	for _, evidence := range append(append([]evidenceRef{}, issue.Evidence[:min(len(issue.Evidence), 8)]...), issue.VerificationEvidence[:min(len(issue.VerificationEvidence), 8)]...) {
@@ -882,6 +1189,26 @@ func buildIssueContextPrompt(
 		browserLines = append(browserLines, "- No browser dumps recorded yet.")
 	}
 
+	repoConfigLines := []string{}
+	if repoConfig != nil {
+		if strings.TrimSpace(repoConfig.Description) != "" {
+			repoConfigLines = append(repoConfigLines, "- Description: "+repoConfig.Description)
+		}
+		if len(repoConfig.CodeGuidelines) > 0 {
+			repoConfigLines = append(repoConfigLines, "- Code guidelines: "+strings.Join(repoConfig.CodeGuidelines[:min(len(repoConfig.CodeGuidelines), 6)], ", "))
+		}
+		if len(repoConfig.PathFilters) > 0 {
+			repoConfigLines = append(repoConfigLines, "- Path filters: "+strings.Join(repoConfig.PathFilters[:min(len(repoConfig.PathFilters), 6)], ", "))
+		}
+		for _, item := range repoConfig.MCPServers[:min(len(repoConfig.MCPServers), 3)] {
+			detail := firstNonEmptyRepoConfig(item.Description, item.Usage, "Configured MCP context source.")
+			repoConfigLines = append(repoConfigLines, "- MCP "+item.Name+": "+detail)
+		}
+	}
+	if len(repoConfigLines) == 0 {
+		repoConfigLines = append(repoConfigLines, "- No .xmustard config loaded.")
+	}
+
 	repoDirLines := []string{}
 	if repoMap != nil {
 		for _, item := range repoMap.TopDirectories[:min(len(repoMap.TopDirectories), 5)] {
@@ -899,6 +1226,60 @@ func buildIssueContextPrompt(
 			items = append(items, "- "+path)
 		}
 		relatedLines = strings.Join(items, "\n")
+	}
+
+	symbolLines := []string{}
+	relatedArtifactLines := []string{}
+	if dynamicContext != nil {
+		for _, item := range dynamicContext.SymbolContext[:min(len(dynamicContext.SymbolContext), 6)] {
+			location := item.Path
+			if item.LineStart != nil {
+				location = fmt.Sprintf("%s:%d", item.Path, *item.LineStart)
+			}
+			scope := ""
+			if item.EnclosingScope != nil && strings.TrimSpace(*item.EnclosingScope) != "" {
+				scope = " in " + *item.EnclosingScope
+			}
+			reason := ""
+			if item.Reason != nil && strings.TrimSpace(*item.Reason) != "" {
+				reason = " (" + *item.Reason + ")"
+			}
+			symbolLines = append(symbolLines, "- "+item.Kind+" "+item.Symbol+scope+" @ "+location+reason)
+		}
+		for _, item := range dynamicContext.RelatedContext[:min(len(dynamicContext.RelatedContext), 6)] {
+			matched := ""
+			if len(item.MatchedTerms) > 0 {
+				matched = " matches " + strings.Join(item.MatchedTerms[:min(len(item.MatchedTerms), 3)], ", ")
+			}
+			reason := ""
+			if item.Reason != nil && strings.TrimSpace(*item.Reason) != "" {
+				reason = " " + strings.TrimSpace(*item.Reason)
+			}
+			path := ""
+			if item.Path != nil && strings.TrimSpace(*item.Path) != "" {
+				path = " [" + *item.Path + "]"
+			}
+			line := "- " + item.ArtifactType + " " + item.Title + path + ":" + reason + matched
+			relatedArtifactLines = append(relatedArtifactLines, strings.TrimRight(line, ":"))
+		}
+	}
+	if len(symbolLines) == 0 {
+		symbolLines = append(symbolLines, "- No symbol context ranked yet.")
+	}
+	if len(relatedArtifactLines) == 0 {
+		relatedArtifactLines = append(relatedArtifactLines, "- No related artifacts ranked yet.")
+	}
+
+	pathInstructionLines := []string{}
+	for _, item := range matchedPathInstructions[:min(len(matchedPathInstructions), 6)] {
+		label := item.Path
+		if item.Title != nil && strings.TrimSpace(*item.Title) != "" {
+			label = *item.Title
+		}
+		pathInstructionLines = append(pathInstructionLines, "- "+label+" ["+strings.Join(item.MatchedPaths[:min(len(item.MatchedPaths), 4)], ", ")+"]: "+item.Instructions)
+	}
+	if len(pathInstructionLines) == 0 {
+		pathInstructionLines = append(pathInstructionLines, "- No path-specific instructions matched the current issue paths.")
 	}
 
 	summary := firstNonEmptyPtr(issue.Summary)
@@ -924,8 +1305,12 @@ func buildIssueContextPrompt(
 		"Ticket context:\n" + strings.Join(ticketLines, "\n") + "\n\n" +
 		"Threat model:\n" + strings.Join(threatLines, "\n") + "\n\n" +
 		"Browser context:\n" + strings.Join(browserLines, "\n") + "\n\n" +
+		"Repo config:\n" + strings.Join(repoConfigLines, "\n") + "\n\n" +
+		"Path-specific guidance:\n" + strings.Join(pathInstructionLines, "\n") + "\n\n" +
 		"Structural context:\n" + strings.Join(repoDirLines, "\n") + "\n\n" +
 		"Ranked related paths:\n" + relatedLines + "\n\n" +
+		"Symbol context:\n" + strings.Join(symbolLines, "\n") + "\n\n" +
+		"Related artifacts:\n" + strings.Join(relatedArtifactLines, "\n") + "\n\n" +
 		"Repository guidance:\n" + strings.Join(guidanceLines, "\n") + "\n\n" +
 		"Known verification profiles:\n" + strings.Join(verificationLines, "\n") + "\n\n" +
 		"Priority files:\n" + focusLines + "\n\n" +

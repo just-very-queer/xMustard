@@ -85,29 +85,31 @@ type treeNode struct {
 }
 
 type runRecord struct {
-	RunID          string          `json:"run_id"`
-	WorkspaceID    string          `json:"workspace_id"`
-	IssueID        string          `json:"issue_id"`
-	Runtime        string          `json:"runtime"`
-	Model          string          `json:"model"`
-	Status         string          `json:"status"`
-	Title          string          `json:"title"`
-	Prompt         string          `json:"prompt"`
-	Command        []string        `json:"command"`
-	CommandPreview string          `json:"command_preview"`
-	LogPath        string          `json:"log_path"`
-	OutputPath     string          `json:"output_path"`
-	CreatedAt      string          `json:"created_at"`
-	StartedAt      *string         `json:"started_at,omitempty"`
-	CompletedAt    *string         `json:"completed_at,omitempty"`
-	ExitCode       *int            `json:"exit_code,omitempty"`
-	PID            *int            `json:"pid,omitempty"`
-	Error          *string         `json:"error,omitempty"`
-	RunbookID      *string         `json:"runbook_id,omitempty"`
-	Worktree       *WorktreeStatus `json:"worktree,omitempty"`
-	GuidancePaths  []string        `json:"guidance_paths"`
-	Summary        map[string]any  `json:"summary,omitempty"`
-	Plan           *RunPlan        `json:"plan,omitempty"`
+	RunID             string          `json:"run_id"`
+	WorkspaceID       string          `json:"workspace_id"`
+	IssueID           string          `json:"issue_id"`
+	Runtime           string          `json:"runtime"`
+	Model             string          `json:"model"`
+	Status            string          `json:"status"`
+	Title             string          `json:"title"`
+	Prompt            string          `json:"prompt"`
+	Command           []string        `json:"command"`
+	CommandPreview    string          `json:"command_preview"`
+	LogPath           string          `json:"log_path"`
+	OutputPath        string          `json:"output_path"`
+	CreatedAt         string          `json:"created_at"`
+	StartedAt         *string         `json:"started_at,omitempty"`
+	CompletedAt       *string         `json:"completed_at,omitempty"`
+	ExitCode          *int            `json:"exit_code,omitempty"`
+	PID               *int            `json:"pid,omitempty"`
+	Error             *string         `json:"error,omitempty"`
+	RunbookID         *string         `json:"runbook_id,omitempty"`
+	EvalScenarioID    *string         `json:"eval_scenario_id,omitempty"`
+	EvalReplayBatchID *string         `json:"eval_replay_batch_id,omitempty"`
+	Worktree          *WorktreeStatus `json:"worktree,omitempty"`
+	GuidancePaths     []string        `json:"guidance_paths"`
+	Summary           map[string]any  `json:"summary,omitempty"`
+	Plan              *RunPlan        `json:"plan,omitempty"`
 }
 
 func ReadWorkspaceSnapshot(dataDir string, workspaceID string) (*workspaceSnapshot, error) {

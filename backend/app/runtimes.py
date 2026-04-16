@@ -208,6 +208,8 @@ class RuntimeService:
         worktree: WorktreeStatus | None = None,
         guidance_paths: list[str] | None = None,
         runbook_id: str | None = None,
+        eval_scenario_id: str | None = None,
+        eval_replay_batch_id: str | None = None,
         wait_for_approval: bool = False,
     ) -> RunRecord:
         run_id = f"run_{uuid.uuid4().hex[:12]}"
@@ -230,6 +232,8 @@ class RuntimeService:
             log_path=str(log_path),
             output_path=str(output_path),
             runbook_id=runbook_id,
+            eval_scenario_id=eval_scenario_id,
+            eval_replay_batch_id=eval_replay_batch_id,
             worktree=worktree,
             guidance_paths=list(guidance_paths or []),
         )

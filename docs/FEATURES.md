@@ -86,10 +86,25 @@ What is already present:
 - per-workspace verification profiles with saved test and coverage commands
 - verification profile editing and instruction loading in the execution drawer
 
+Current state:
+
+- replayable verification runs now record pass or fail history per profile
+- confidence scoring and verification checklist results are now attached to profile runs
+- profile reports now break verification history down by runtime, model, and branch
+- saved eval scenarios now correlate replay drift, guidance/ticket-context variant drift, verification reports, and run metrics into workspace eval reports
+- workspace eval reports now group outcomes by saved guidance sets and ticket-context sets, including runtime/model rollups for comparing context variants without double-counting duplicated runs
+- scenario reports now compare saved variants to the issue baseline scenario, surfacing input deltas and a weighted preference summary across outcome quality, cost, and speed
+- baseline comparisons now also break verification history down per saved profile, including success/checklist/attempt deltas and confidence-count differences between variants
+- saved eval scenarios can now trigger fresh queued runs using their pinned context selections, and those new runs are written back into scenario history automatically
+- saved eval scenario batches can now be replayed in one action, and eval reports now surface the latest fresh run plus fresh-vs-baseline execution deltas per scenario
+- workspace eval reports now add a fresh replay ranking block that orders all latest scenario replays for the issue by pairwise outcome strength, cost, and speed
+- workspace eval reports now add fresh replay trend entries that compare each scenario's current rank to its previous fresh replay snapshot
+- replay batches now persist as durable tracker artifacts, and trend entries now use latest-batch vs previous-batch movement when replay history exists
+- replay trend entries now expose explicit latest-batch and previous-batch ids, making experiment history inspectable in the UI and API
+
 Next improvement:
 
-- replayable verification runs and pass or fail recording per profile
-- confidence scoring and verification checklists attached to runs
+- add multi-batch summaries and longer-running experiment timelines so teams can compare more than the latest two replay sessions
 
 ## F6: Repository Guidance
 
@@ -103,6 +118,12 @@ Currently supported:
 - `GEMINI.md`
 - `CONVENTIONS.md`
 - `.clinerules`
+
+Current state:
+
+- starter guidance generation and health checks now cover the always-on repo instruction files
+- `.xmustard.yaml` can now define path-specific instructions, path filters, code-guideline references, and MCP/browser-context hints
+- matched path instructions now attach directly to issue context packets and agent prompts using the issue's ranked paths
 - `.devin/wiki.json`
 - `.openhands/microagents/repo.md`
 - `.openhands/microagents/**/*.md`
@@ -119,10 +140,12 @@ What is already present:
 - UI for viewing guidance
 - onboarding warning when no guidance is found
 - run metadata showing which guidance shaped execution
+- starter guidance generation for `AGENTS.md`, `.openhands/microagents/repo.md`, and `CONVENTIONS.md`
+- workspace guidance health that reports missing and stale starter guidance
 
 Next improvement:
 
-- generate starter guidance files directly from the workspace
+- guided customization flows that turn starter content into repo-specific instructions without leaving the app
 
 ## F7: Run Insights
 
@@ -187,7 +210,8 @@ Planned behavior:
 Current state:
 
 - issue-context prompt snapshots can now be captured and stored per issue
-- replay records include tree focus, guidance paths, linked ticket context, and verification-profile references
+- replay records include tree focus, guidance paths, linked ticket context, verification-profile references, and browser-dump references
+- saved replays can now be compared against the current issue-context packet to show prompt drift and added or removed context artifacts
 
 ## F10: Ticket Context And Acceptance Criteria
 
@@ -260,6 +284,11 @@ Expected impact:
 - better operator trust in review artifacts
 - stronger product fit for issue-driven engineering teams
 
+Current state:
+
+- run insights now include acceptance-criteria review and scope warnings derived from ticket context and worktree drift
+- patch critique now carries the same compliance summary for stored run output
+
 ## F13: Semantic Retrieval And Issue Intelligence
 
 Inspired by the hybrid search and context retrieval direction used by tools like Linear.
@@ -269,6 +298,11 @@ Planned behavior:
 - hybrid semantic and keyword retrieval across issues, runs, ticket context, comments, and review artifacts
 - better clustering of related issues and prior runs
 - retrieval that uses ticket context and repo-map structure together
+
+Current state:
+
+- issue packets now attach lexical, artifact-backed related context from ticket contexts, threat models, browser dumps, fixes, and recent activity
+- symbol-aware dynamic context now highlights likely functions, classes, and methods around ranked focus paths
 
 Expected impact:
 

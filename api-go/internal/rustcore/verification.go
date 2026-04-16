@@ -33,21 +33,36 @@ type VerificationProfileInput struct {
 	MaxRuntimeSeconds  int64    `json:"max_runtime_seconds"`
 	RetryCount         int64    `json:"retry_count"`
 	SourcePaths        []string `json:"source_paths"`
+	ChecklistItems     []string `json:"checklist_items"`
 	BuiltIn            bool     `json:"built_in"`
 	CreatedAt          string   `json:"created_at"`
 	UpdatedAt          string   `json:"updated_at"`
 }
 
+type VerificationChecklistResult struct {
+	ItemID  string  `json:"item_id"`
+	Title   string  `json:"title"`
+	Kind    string  `json:"kind"`
+	Passed  bool    `json:"passed"`
+	Details *string `json:"details,omitempty"`
+}
+
 type VerificationProfileResult struct {
-	ProfileID             string                      `json:"profile_id"`
-	WorkspaceID           string                      `json:"workspace_id"`
-	Attempts              []VerificationCommandResult `json:"attempts"`
-	AttemptCount          int                         `json:"attempt_count"`
-	Success               bool                        `json:"success"`
-	CoverageCommandResult *VerificationCommandResult  `json:"coverage_command_result"`
-	CoverageResult        *CoverageResult             `json:"coverage_result"`
-	CoverageReportPath    *string                     `json:"coverage_report_path"`
-	CreatedAt             string                      `json:"created_at"`
+	ProfileID             string                        `json:"profile_id"`
+	WorkspaceID           string                        `json:"workspace_id"`
+	ExecutionID           string                        `json:"execution_id"`
+	ProfileName           string                        `json:"profile_name"`
+	IssueID               *string                       `json:"issue_id,omitempty"`
+	RunID                 *string                       `json:"run_id,omitempty"`
+	Attempts              []VerificationCommandResult   `json:"attempts"`
+	AttemptCount          int                           `json:"attempt_count"`
+	Success               bool                          `json:"success"`
+	CoverageCommandResult *VerificationCommandResult    `json:"coverage_command_result"`
+	CoverageResult        *CoverageResult               `json:"coverage_result"`
+	ChecklistResults      []VerificationChecklistResult `json:"checklist_results"`
+	Confidence            string                        `json:"confidence"`
+	CoverageReportPath    *string                       `json:"coverage_report_path"`
+	CreatedAt             string                        `json:"created_at"`
 }
 
 func RunVerificationCommand(ctx context.Context, workspaceRoot string, timeoutSeconds int, command string) (*VerificationCommandResult, error) {

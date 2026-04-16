@@ -2,6 +2,7 @@ package workspaceops
 
 import (
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -110,6 +111,61 @@ func TestStartIssueRunAndWorkspaceQueryPersistRunArtifacts(t *testing.T) {
 	}
 	waitForRunStatus(t, dataDir, workspaceID, queryRun.RunID, "completed")
 	waitForRunCleanup(t, queryRun.RunID)
+}
+
+func TestStartIssueRunWithEvalScenarioPersistsScenarioRun(t *testing.T) {
+	dataDir, workspaceID, issueID, _ := writeIssueContextFixture(t, false)
+	opencodeBin := writeFakeOpencode(t)
+	if _, err := UpdateSettings(dataDir, AppSettings{
+		LocalAgentType: "opencode",
+		OpencodeBin:    &opencodeBin,
+		OpencodeModel:  stringPtr("fake/test-model"),
+	}); err != nil {
+		t.Fatalf("update settings: %v", err)
+	}
+	if _, err := SaveVerificationProfile(dataDir, workspaceID, VerificationProfileUpsertRequest{
+		ProfileID:   stringPtr("backend-pytest"),
+		Name:        "Backend pytest",
+		Description: "Backend verification",
+		TestCommand: "pytest -q",
+	}); err != nil {
+		t.Fatalf("save verification profile: %v", err)
+	}
+	scenario, err := SaveEvalScenario(dataDir, workspaceID, EvalScenarioUpsertRequest{
+		Name:                   "Eval fresh execution",
+		IssueID:                issueID,
+		GuidancePaths:          []string{"AGENTS.md"},
+		VerificationProfileIDs: []string{"backend-pytest"},
+	})
+	if err != nil {
+		t.Fatalf("save eval scenario: %v", err)
+	}
+
+	run, err := StartIssueRun(dataDir, workspaceID, issueID, RunRequest{
+		Runtime:        "opencode",
+		Model:          "fake/test-model",
+		Instruction:    stringPtr("Focus on export regression"),
+		EvalScenarioID: &scenario.ScenarioID,
+	})
+	if err != nil {
+		t.Fatalf("start eval scenario run: %v", err)
+	}
+	if run.EvalScenarioID == nil || *run.EvalScenarioID != scenario.ScenarioID {
+		t.Fatalf("expected eval scenario on run: %#v", run)
+	}
+	if !strings.Contains(run.Prompt, "Evaluation scenario: Eval fresh execution") {
+		t.Fatalf("expected eval scenario prompt overlay: %#v", run.Prompt)
+	}
+	waitForRunStatus(t, dataDir, workspaceID, run.RunID, "completed")
+	waitForRunCleanup(t, run.RunID)
+	scenarios, err := ListEvalScenarios(dataDir, workspaceID, issueID)
+	if err != nil {
+		t.Fatalf("list eval scenarios: %v", err)
+	}
+	updated := scenarios[0]
+	if !slices.Contains(updated.RunIDs, run.RunID) {
+		t.Fatalf("expected run to be recorded on eval scenario: %#v", updated)
+	}
 }
 
 func TestStartIssueRunRejectsUnavailableRuntimeModel(t *testing.T) {

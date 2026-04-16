@@ -10,17 +10,19 @@ import (
 )
 
 type RunSessionInsight struct {
-	WorkspaceID     string   `json:"workspace_id"`
-	RunID           string   `json:"run_id"`
-	IssueID         string   `json:"issue_id"`
-	Status          string   `json:"status"`
-	Headline        string   `json:"headline"`
-	Summary         string   `json:"summary"`
-	GuidanceUsed    []string `json:"guidance_used"`
-	Strengths       []string `json:"strengths"`
-	Risks           []string `json:"risks"`
-	Recommendations []string `json:"recommendations"`
-	GeneratedAt     string   `json:"generated_at"`
+	WorkspaceID      string                   `json:"workspace_id"`
+	RunID            string                   `json:"run_id"`
+	IssueID          string                   `json:"issue_id"`
+	Status           string                   `json:"status"`
+	Headline         string                   `json:"headline"`
+	Summary          string                   `json:"summary"`
+	GuidanceUsed     []string                 `json:"guidance_used"`
+	Strengths        []string                 `json:"strengths"`
+	Risks            []string                 `json:"risks"`
+	Recommendations  []string                 `json:"recommendations"`
+	AcceptanceReview AcceptanceCriteriaReview `json:"acceptance_review"`
+	ScopeWarnings    []ScopeWarning           `json:"scope_warnings"`
+	GeneratedAt      string                   `json:"generated_at"`
 }
 
 type PlanStep struct {
@@ -85,19 +87,36 @@ type ImprovementSuggestion struct {
 }
 
 type PatchCritique struct {
-	CritiqueID     string                  `json:"critique_id"`
-	WorkspaceID    string                  `json:"workspace_id"`
-	RunID          string                  `json:"run_id"`
-	IssueID        string                  `json:"issue_id"`
-	OverallQuality string                  `json:"overall_quality"`
-	Correctness    float64                 `json:"correctness"`
-	Completeness   float64                 `json:"completeness"`
-	Style          float64                 `json:"style"`
-	Safety         float64                 `json:"safety"`
-	IssuesFound    []string                `json:"issues_found"`
-	Improvements   []ImprovementSuggestion `json:"improvements"`
-	Summary        string                  `json:"summary"`
-	GeneratedAt    string                  `json:"generated_at"`
+	CritiqueID       string                   `json:"critique_id"`
+	WorkspaceID      string                   `json:"workspace_id"`
+	RunID            string                   `json:"run_id"`
+	IssueID          string                   `json:"issue_id"`
+	OverallQuality   string                   `json:"overall_quality"`
+	Correctness      float64                  `json:"correctness"`
+	Completeness     float64                  `json:"completeness"`
+	Style            float64                  `json:"style"`
+	Safety           float64                  `json:"safety"`
+	IssuesFound      []string                 `json:"issues_found"`
+	Improvements     []ImprovementSuggestion  `json:"improvements"`
+	AcceptanceReview AcceptanceCriteriaReview `json:"acceptance_review"`
+	ScopeWarnings    []ScopeWarning           `json:"scope_warnings"`
+	Summary          string                   `json:"summary"`
+	GeneratedAt      string                   `json:"generated_at"`
+}
+
+type AcceptanceCriteriaReview struct {
+	Status   string   `json:"status"`
+	Criteria []string `json:"criteria"`
+	Matched  []string `json:"matched,omitempty"`
+	Missing  []string `json:"missing,omitempty"`
+	Notes    []string `json:"notes,omitempty"`
+}
+
+type ScopeWarning struct {
+	Kind     string   `json:"kind"`
+	Message  string   `json:"message"`
+	Paths    []string `json:"paths,omitempty"`
+	Severity string   `json:"severity"`
 }
 
 type DismissImprovementRequest struct {
@@ -112,6 +131,7 @@ func GetRunSessionInsight(dataDir string, workspaceID string, runID string) (*Ru
 
 	critique, _ := loadPatchCritique(dataDir, runID)
 	metrics, _ := loadRunMetrics(dataDir, runID)
+	packet, _ := BuildIssueContextPacket(dataDir, workspaceID, run.IssueID)
 
 	strengths := []string{}
 	risks := []string{}
@@ -182,18 +202,39 @@ func GetRunSessionInsight(dataDir string, workspaceID string, runID string) (*Ru
 		summary = fmt.Sprintf("Run %s for %s is %s.", run.RunID, run.IssueID, run.Status)
 	}
 
+	acceptanceReview := buildAcceptanceReview(packet, run, excerpt)
+	scopeWarnings := buildScopeWarnings(packet, run)
+	switch acceptanceReview.Status {
+	case "met":
+		strengths = append(strengths, "Linked acceptance criteria appear to be covered by the run output and tracker evidence.")
+	case "partial":
+		risks = append(risks, "Only part of the linked acceptance criteria appears covered.")
+		recommendations = append(recommendations, "Review the missing ticket acceptance criteria before marking the issue done.")
+	case "not_met":
+		risks = append(risks, "Linked acceptance criteria are not reflected in the run output yet.")
+		recommendations = append(recommendations, "Bring the run output, tests, or verification evidence in line with the recorded ticket acceptance criteria.")
+	}
+	for _, warning := range scopeWarnings {
+		risks = append(risks, warning.Message)
+		if warning.Kind == "unrelated_change" {
+			recommendations = append(recommendations, "Trim unrelated worktree changes or split them into a separate issue/fix record.")
+		}
+	}
+
 	return &RunSessionInsight{
-		WorkspaceID:     workspaceID,
-		RunID:           runID,
-		IssueID:         run.IssueID,
-		Status:          run.Status,
-		Headline:        draftSummaryFromExcerpt(excerpt, run.IssueID, run.RunID),
-		Summary:         summary,
-		GuidanceUsed:    append([]string{}, run.GuidancePaths...),
-		Strengths:       dedupeText(strengths),
-		Risks:           dedupeText(risks),
-		Recommendations: dedupeText(recommendations),
-		GeneratedAt:     nowUTC(),
+		WorkspaceID:      workspaceID,
+		RunID:            runID,
+		IssueID:          run.IssueID,
+		Status:           run.Status,
+		Headline:         draftSummaryFromExcerpt(excerpt, run.IssueID, run.RunID),
+		Summary:          summary,
+		GuidanceUsed:     append([]string{}, run.GuidancePaths...),
+		Strengths:        dedupeText(strengths),
+		Risks:            dedupeText(risks),
+		Recommendations:  dedupeText(recommendations),
+		AcceptanceReview: acceptanceReview,
+		ScopeWarnings:    scopeWarnings,
+		GeneratedAt:      nowUTC(),
 	}, nil
 }
 
@@ -315,6 +356,7 @@ func GeneratePatchCritique(dataDir string, workspaceID string, runID string) (*P
 			outputText = string(content)
 		}
 	}
+	packet, _ := BuildIssueContextPacket(dataDir, workspaceID, run.IssueID)
 	improvements := analyzeRunOutput(run, outputText)
 	issuesFound := detectPatchIssues(run, outputText)
 	correctness := scoreCorrectness(run, outputText, issuesFound)
@@ -334,19 +376,21 @@ func GeneratePatchCritique(dataDir string, workspaceID string, runID string) (*P
 		quality = "needs_work"
 	}
 	critique := PatchCritique{
-		CritiqueID:     "crit_" + hashID(workspaceID, runID, nowUTC())[:12],
-		WorkspaceID:    workspaceID,
-		RunID:          runID,
-		IssueID:        run.IssueID,
-		OverallQuality: quality,
-		Correctness:    roundPercent(correctness),
-		Completeness:   roundPercent(completeness),
-		Style:          roundPercent(style),
-		Safety:         roundPercent(safety),
-		IssuesFound:    issuesFound,
-		Improvements:   improvements,
-		Summary:        critiqueSummary(quality, issuesFound, improvements),
-		GeneratedAt:    nowUTC(),
+		CritiqueID:       "crit_" + hashID(workspaceID, runID, nowUTC())[:12],
+		WorkspaceID:      workspaceID,
+		RunID:            runID,
+		IssueID:          run.IssueID,
+		OverallQuality:   quality,
+		Correctness:      roundPercent(correctness),
+		Completeness:     roundPercent(completeness),
+		Style:            roundPercent(style),
+		Safety:           roundPercent(safety),
+		IssuesFound:      issuesFound,
+		Improvements:     improvements,
+		AcceptanceReview: buildAcceptanceReview(packet, run, outputText),
+		ScopeWarnings:    buildScopeWarnings(packet, run),
+		Summary:          critiqueSummary(quality, issuesFound, improvements),
+		GeneratedAt:      nowUTC(),
 	}
 	if err := savePatchCritique(dataDir, critique); err != nil {
 		return nil, err
@@ -709,6 +753,156 @@ func dedupeText(items []string) []string {
 		result = append(result, trimmed)
 	}
 	return result
+}
+
+func buildAcceptanceReview(packet *IssueContextPacket, run *runRecord, text string) AcceptanceCriteriaReview {
+	if packet == nil {
+		return AcceptanceCriteriaReview{
+			Status:   "unknown",
+			Criteria: []string{},
+			Notes:    []string{"No issue context packet was available for acceptance review."},
+		}
+	}
+	criteria := []string{}
+	for _, item := range packet.TicketContexts[:min(len(packet.TicketContexts), 4)] {
+		criteria = append(criteria, item.AcceptanceCriteria[:min(len(item.AcceptanceCriteria), 4)]...)
+	}
+	criteria = dedupeText(criteria)
+	if len(criteria) > 12 {
+		criteria = criteria[:12]
+	}
+	if len(criteria) == 0 {
+		return AcceptanceCriteriaReview{
+			Status:   "unknown",
+			Criteria: []string{},
+			Notes:    []string{"No ticket acceptance criteria are linked to this issue."},
+		}
+	}
+
+	corpusParts := []string{
+		run.Title,
+		run.Prompt,
+		text,
+		strings.Join(packet.Issue.TestsPassed, " "),
+		firstNonEmptyPtr(packet.Issue.Summary),
+		firstNonEmptyPtr(packet.Issue.Impact),
+	}
+	corpus := strings.ToLower(strings.Join(corpusParts, " "))
+	tokenPattern := regexp.MustCompile(`[a-z0-9_./-]{3,}`)
+	stopWords := map[string]struct{}{
+		"the": {}, "and": {}, "for": {}, "with": {}, "that": {}, "this": {}, "from": {},
+	}
+	matched := []string{}
+	missing := []string{}
+	for _, criterion := range criteria {
+		tokens := []string{}
+		for _, token := range tokenPattern.FindAllString(strings.ToLower(criterion), -1) {
+			if _, stop := stopWords[token]; stop {
+				continue
+			}
+			tokens = append(tokens, token)
+		}
+		if len(tokens) > 6 {
+			tokens = tokens[:6]
+		}
+		matchCount := 0
+		for _, token := range tokens {
+			if strings.Contains(corpus, token) {
+				matchCount++
+			}
+		}
+		threshold := 1
+		if len(tokens) >= 2 {
+			threshold = 2
+		}
+		if matchCount >= threshold {
+			matched = append(matched, criterion)
+		} else {
+			missing = append(missing, criterion)
+		}
+	}
+	status := "not_met"
+	if len(matched) > 0 && len(missing) == 0 {
+		status = "met"
+	} else if len(matched) > 0 {
+		status = "partial"
+	}
+	notes := []string{}
+	if len(packet.Issue.TestsPassed) > 0 {
+		notes = append(notes, fmt.Sprintf("Tracker already records %d passing test command(s).", len(packet.Issue.TestsPassed)))
+	}
+	if len(packet.Issue.VerificationEvidence) > 0 {
+		notes = append(notes, fmt.Sprintf("Tracker already carries %d verification evidence reference(s).", len(packet.Issue.VerificationEvidence)))
+	}
+	return AcceptanceCriteriaReview{
+		Status:   status,
+		Criteria: criteria,
+		Matched:  matched,
+		Missing:  missing,
+		Notes:    notes[:min(len(notes), 4)],
+	}
+}
+
+func buildScopeWarnings(packet *IssueContextPacket, run *runRecord) []ScopeWarning {
+	if packet == nil {
+		return []ScopeWarning{}
+	}
+	relatedPaths := append([]string{}, packet.RelatedPaths...)
+	if len(relatedPaths) == 0 {
+		relatedPaths = append([]string{}, packet.TreeFocus...)
+	}
+	dirtyPaths := []string{}
+	if run.Worktree != nil && len(run.Worktree.DirtyPaths) > 0 {
+		dirtyPaths = append([]string{}, run.Worktree.DirtyPaths...)
+	}
+	warnings := []ScopeWarning{}
+	unrelated := []string{}
+	for _, path := range dirtyPaths {
+		if !matchesRelatedPath(path, relatedPaths) {
+			unrelated = append(unrelated, path)
+		}
+	}
+	if len(unrelated) > 0 {
+		severity := "medium"
+		if len(unrelated) > 3 {
+			severity = "high"
+		}
+		warnings = append(warnings, ScopeWarning{
+			Kind:     "unrelated_change",
+			Message:  fmt.Sprintf("%d worktree path(s) do not match the issue's ranked focus.", len(unrelated)),
+			Paths:    unrelated[:min(len(unrelated), 8)],
+			Severity: severity,
+		})
+	}
+	driftFlags := []string{}
+	for _, flag := range packet.Issue.DriftFlags {
+		if !strings.Contains(strings.ToLower(flag), "review") {
+			driftFlags = append(driftFlags, flag)
+		}
+	}
+	if len(driftFlags) > 0 {
+		warnings = append(warnings, ScopeWarning{
+			Kind:     "scope_drift",
+			Message:  "Issue drift flags remain open: " + strings.Join(driftFlags[:min(len(driftFlags), 3)], ", ") + ".",
+			Paths:    relatedPaths[:min(len(relatedPaths), 6)],
+			Severity: "medium",
+		})
+	}
+	return warnings
+}
+
+func matchesRelatedPath(candidate string, relatedPaths []string) bool {
+	normalized := strings.TrimSpace(strings.TrimPrefix(filepath.Clean(candidate), "./"))
+	for _, item := range relatedPaths {
+		focus := strings.TrimSpace(strings.TrimPrefix(filepath.Clean(item), "./"))
+		if focus == "" {
+			continue
+		}
+		if normalized == focus || strings.HasPrefix(normalized, focus+"/") || strings.HasPrefix(focus, normalized+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 func intFromAny(value any) (int, bool) {

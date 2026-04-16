@@ -16,7 +16,22 @@ The current product already supports:
 - verification artifacts: coverage deltas, test suggestions, patch critique, improvement suggestions
 - issue-level threat models with assets, trust boundaries, abuse cases, and mitigations
 - issue-level browser dumps for MCP/manual browser-state capture and shared UI debugging context
+- issue-context replay comparison so saved prompt snapshots can be diffed against the current issue packet
+- verification profile checklists, confidence scoring, durable per-profile run history, and report breakdowns by runtime, model, and branch
+- dynamic symbol context and retrieval-backed related artifacts inside issue packets
+- saved eval scenarios and workspace eval reports that correlate replay drift, run metrics, and verification outcomes
+- workspace eval variant comparisons that now show selected guidance/ticket values, cost, and unique-run rollups across context variants
+- baseline-aware eval scenario comparisons that explain how each saved variant differs from the issue baseline on inputs, outcomes, cost, and speed
+- per-profile verification history deltas inside eval baseline comparisons, so saved context variants can be compared on success/checklist/confidence behavior instead of only aggregate verification percentages
+- fresh scenario execution from the eval pane, using pinned context selections and writing new runs back into the saved scenario automatically
+- batch replay of saved eval scenarios for one issue, with fresh-run summaries and fresh-vs-baseline execution deltas shown inside the eval report
+- workspace eval reports now rank fresh replay outcomes across all saved scenarios for the same issue, using pairwise fresh-run comparisons instead of only baseline pairs
+- workspace eval reports now show fresh replay rank movement versus the previous fresh run for each scenario, so context experiments can be compared over time
+- replay batches are now persisted explicitly, and fresh replay trend views now compare the latest batch against the previous batch when batch history exists
+- fresh replay trend views now prefer explicit replay-batch history over ad hoc previous-run inference, so experiment comparisons are inspectable and durable
 - repository guidance discovery from files like `AGENTS.md`, `CONVENTIONS.md`, `.devin/wiki.json`, `.openhands/skills/*.md`, and `.openhands/microagents/repo.md`
+- starter guidance generation and guidance health for `AGENTS.md`, `.openhands/microagents/repo.md`, and `CONVENTIONS.md`
+- repo-native `.xmustard.yaml` config support for path-specific instructions, code-guideline references, and MCP/browser-context hints that attach directly to issue packets
 - run insights that summarize what guidance shaped a run and what risks remain
 
 ## Stack
@@ -92,10 +107,10 @@ Those themes now shape both the product and the roadmap.
 The strongest gaps still on the roadmap are:
 
 - guidance authoring instead of guidance detection alone
-- symbol-aware repo maps and dynamic context
-- replayable verification and eval harnesses
-- threat modeling, security review, and compliance artifacts
-- semantic retrieval across issues, runs, tickets, and review data
+- deeper symbol-aware repo maps beyond packet-level dynamic context
+- broader eval and replay harness automation beyond saved scenarios and reporting
+- threat modeling, security review, and compliance artifacts beyond current run-level acceptance review
+- semantic retrieval beyond the current lexical artifact-ranking layer
 - governance, insights, and agent operations for team workflows
 - incremental backend migration away from the current Python-heavy core
 

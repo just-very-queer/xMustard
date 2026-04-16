@@ -1,5 +1,5 @@
 import { formatDate } from '../lib/format'
-import type { RepoGuidanceRecord, ViewMode, WorkspaceRecord } from '../lib/types'
+import type { RepoGuidanceHealth, RepoGuidanceRecord, ViewMode, WorkspaceRecord } from '../lib/types'
 
 type Props = {
   workspacePath: string
@@ -8,10 +8,12 @@ type Props = {
   activeView: ViewMode
   loading: boolean
   workspaceGuidance: RepoGuidanceRecord[]
+  guidanceHealth: RepoGuidanceHealth | null
   verificationProfileCount: number
   onWorkspacePathChange: (value: string) => void
   onLoadWorkspace: () => void
   onScanWorkspace: () => void
+  onGenerateGuidanceStarter: (templateId: 'agents' | 'openhands_repo' | 'conventions') => void
   onSelectWorkspace: (rootPath: string) => void
   onChangeView: (view: ViewMode) => void
   canScan: boolean
@@ -24,10 +26,12 @@ export function WorkspaceSidebar({
   activeView,
   loading,
   workspaceGuidance,
+  guidanceHealth,
   verificationProfileCount,
   onWorkspacePathChange,
   onLoadWorkspace,
   onScanWorkspace,
+  onGenerateGuidanceStarter,
   onSelectWorkspace,
   onChangeView,
   canScan,
@@ -36,6 +40,9 @@ export function WorkspaceSidebar({
   const instructionCount = workspaceGuidance.filter((item) =>
     item.kind === 'agent_instructions' || item.kind === 'conventions',
   ).length
+  const starterTemplates = guidanceHealth?.starters ?? []
+  const guidanceTone =
+    guidanceHealth?.status === 'healthy' ? 'status-chip-ok' : guidanceHealth?.status === 'missing' ? 'status-chip-bad' : 'status-chip-warn'
 
   return (
     <aside className="left-rail">
@@ -104,19 +111,21 @@ export function WorkspaceSidebar({
           <div className="panel-header">
             <div>
               <p className="eyebrow">Repo guidance</p>
-              <h4>{workspaceGuidance.length ? 'Guided workspace' : 'Needs setup'}</h4>
+              <h4>{guidanceHealth?.status === 'healthy' ? 'Guided workspace' : workspaceGuidance.length ? 'Needs attention' : 'Needs setup'}</h4>
             </div>
-            <span className={`status-chip ${workspaceGuidance.length ? 'status-chip-ok' : 'status-chip-warn'}`}>
-              {workspaceGuidance.length ? `${workspaceGuidance.length} files` : '0 files'}
+            <span className={`status-chip ${guidanceTone}`}>
+              {guidanceHealth ? guidanceHealth.status : workspaceGuidance.length ? `${workspaceGuidance.length} files` : '0 files'}
             </span>
           </div>
           {workspaceGuidance.length ? (
             <>
-              <p className="subtle">The tracker found repo instructions and will attach them to runs and issue context.</p>
+              <p className="subtle">{guidanceHealth?.summary ?? 'The tracker found repo instructions and will attach them to runs and issue context.'}</p>
               <div className="tag-row">
                 <span className="tag">Always on: {alwaysOnCount}</span>
                 <span className="tag">Instructions: {instructionCount}</span>
                 <span className="tag">Verification: {verificationProfileCount}</span>
+                {guidanceHealth?.missing_files.length ? <span className="tag">Missing: {guidanceHealth.missing_files.length}</span> : null}
+                {guidanceHealth?.stale_files.length ? <span className="tag">Stale: {guidanceHealth.stale_files.length}</span> : null}
               </div>
               <div className="guidance-sidebar-list">
                 {workspaceGuidance.slice(0, 3).map((item) => (
@@ -126,17 +135,31 @@ export function WorkspaceSidebar({
                   </div>
                 ))}
               </div>
+              {starterTemplates.length ? (
+                <div className="sidebar-actions">
+                  {starterTemplates.filter((item) => !item.exists || item.stale).slice(0, 2).map((item) => (
+                    <button key={item.template_id} className="ghost-button" type="button" onClick={() => onGenerateGuidanceStarter(item.template_id)}>
+                      {item.exists ? `Refresh ${item.title}` : `Add ${item.title}`}
+                    </button>
+                  ))}
+                </div>
+              ) : null}
             </>
           ) : (
             <>
-              <p className="subtle">Add one lightweight repo instruction file so runs stop relying on generic defaults.</p>
+              <p className="subtle">{guidanceHealth?.summary ?? 'Add one lightweight repo instruction file so runs stop relying on generic defaults.'}</p>
               <div className="tag-row">
                 <span className="tag">Recommended: `AGENTS.md`</span>
                 <span className="tag">Optional: `CONVENTIONS.md`</span>
               </div>
-              <button className="ghost-button" type="button" onClick={() => onChangeView('tree')}>
-                Open repo tree
-              </button>
+              <div className="sidebar-actions">
+                <button type="button" onClick={() => onGenerateGuidanceStarter('agents')}>
+                  Add AGENTS.md
+                </button>
+                <button className="ghost-button" type="button" onClick={() => onGenerateGuidanceStarter('openhands_repo')}>
+                  Add repo microagent
+                </button>
+              </div>
             </>
           )}
         </div>

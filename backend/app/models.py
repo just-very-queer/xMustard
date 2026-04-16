@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import uuid
 from typing import Literal, Optional
 
 from pydantic import BaseModel, Field, model_validator
@@ -25,6 +26,8 @@ RunReviewDisposition = Literal["dismissed", "investigation_only"]
 RunbookScope = Literal["issue", "workspace"]
 VerificationState = Literal["yes", "no", "unknown"]
 GuidanceKind = Literal["agent_instructions", "conventions", "repo_index", "skill", "workspace_overview"]
+GuidanceHealthStatus = Literal["healthy", "partial", "missing", "stale"]
+GuidanceStarterTemplate = Literal["agents", "openhands_repo", "conventions"]
 CoverageFormat = Literal["unknown", "cobertura", "jacoco", "lcov", "go"]
 TicketProvider = Literal["github", "jira", "linear", "manual", "incident", "other"]
 ThreatModelMethodology = Literal["manual", "stride", "threat_dragon", "pytm", "threagile", "attack_path"]
@@ -328,6 +331,8 @@ class RunRecord(BaseModel):
     pid: Optional[int] = None
     error: Optional[str] = None
     runbook_id: Optional[str] = None
+    eval_scenario_id: Optional[str] = None
+    eval_replay_batch_id: Optional[str] = None
     worktree: Optional[WorktreeStatus] = None
     guidance_paths: list[str] = Field(default_factory=list)
     summary: Optional[dict] = None
@@ -388,6 +393,7 @@ class VerificationProfileRecord(BaseModel):
     max_runtime_seconds: int = 30
     retry_count: int = 1
     source_paths: list[str] = Field(default_factory=list)
+    checklist_items: list[str] = Field(default_factory=list)
     built_in: bool = False
     created_at: str = Field(default_factory=utc_now)
     updated_at: str = Field(default_factory=utc_now)
@@ -405,16 +411,63 @@ class VerificationCommandResult(BaseModel):
     created_at: str = Field(default_factory=utc_now)
 
 
+class VerificationChecklistResult(BaseModel):
+    item_id: str
+    title: str
+    kind: Literal["system", "custom"] = "custom"
+    passed: bool = False
+    details: Optional[str] = None
+
+
 class VerificationProfileExecutionResult(BaseModel):
+    execution_id: str = Field(default_factory=lambda: f"vpr_{uuid.uuid4().hex[:12]}")
     profile_id: str
     workspace_id: str
+    profile_name: str = ""
+    issue_id: Optional[str] = None
+    run_id: Optional[str] = None
     attempts: list[VerificationCommandResult] = Field(default_factory=list)
     attempt_count: int = 0
     success: bool = False
     coverage_command_result: Optional[VerificationCommandResult] = None
     coverage_result: Optional["CoverageResult"] = None
+    checklist_results: list[VerificationChecklistResult] = Field(default_factory=list)
+    confidence: Literal["high", "medium", "low"] = "low"
     coverage_report_path: Optional[str] = None
     created_at: str = Field(default_factory=utc_now)
+
+
+class VerificationProfileReport(BaseModel):
+    profile_id: str
+    workspace_id: str
+    profile_name: str
+    built_in: bool = False
+    issue_id: Optional[str] = None
+    total_runs: int = 0
+    success_runs: int = 0
+    failed_runs: int = 0
+    success_rate: float = 0.0
+    confidence_counts: dict[str, int] = Field(default_factory=dict)
+    avg_attempt_count: float = 0.0
+    checklist_pass_rate: float = 0.0
+    last_run_at: Optional[str] = None
+    last_issue_id: Optional[str] = None
+    last_run_id: Optional[str] = None
+    last_confidence: Optional[Literal["high", "medium", "low"]] = None
+    last_success: Optional[bool] = None
+    runtime_breakdown: list["VerificationProfileDimensionSummary"] = Field(default_factory=list)
+    model_breakdown: list["VerificationProfileDimensionSummary"] = Field(default_factory=list)
+    branch_breakdown: list["VerificationProfileDimensionSummary"] = Field(default_factory=list)
+
+
+class VerificationProfileDimensionSummary(BaseModel):
+    key: str
+    label: str
+    total_runs: int = 0
+    success_runs: int = 0
+    failed_runs: int = 0
+    success_rate: float = 0.0
+    last_run_at: Optional[str] = None
 
 
 class TicketContextRecord(BaseModel):
@@ -462,7 +515,34 @@ class IssueContextReplayRecord(BaseModel):
     guidance_paths: list[str] = Field(default_factory=list)
     verification_profile_ids: list[str] = Field(default_factory=list)
     ticket_context_ids: list[str] = Field(default_factory=list)
+    browser_dump_ids: list[str] = Field(default_factory=list)
     created_at: str = Field(default_factory=utc_now)
+
+
+class IssueContextReplayComparison(BaseModel):
+    replay: IssueContextReplayRecord
+    current_prompt: str
+    current_tree_focus: list[str] = Field(default_factory=list)
+    current_guidance_paths: list[str] = Field(default_factory=list)
+    current_verification_profile_ids: list[str] = Field(default_factory=list)
+    current_ticket_context_ids: list[str] = Field(default_factory=list)
+    current_browser_dump_ids: list[str] = Field(default_factory=list)
+    prompt_changed: bool = False
+    changed: bool = False
+    saved_prompt_length: int = 0
+    current_prompt_length: int = 0
+    added_tree_focus: list[str] = Field(default_factory=list)
+    removed_tree_focus: list[str] = Field(default_factory=list)
+    added_guidance_paths: list[str] = Field(default_factory=list)
+    removed_guidance_paths: list[str] = Field(default_factory=list)
+    added_verification_profile_ids: list[str] = Field(default_factory=list)
+    removed_verification_profile_ids: list[str] = Field(default_factory=list)
+    added_ticket_context_ids: list[str] = Field(default_factory=list)
+    removed_ticket_context_ids: list[str] = Field(default_factory=list)
+    added_browser_dump_ids: list[str] = Field(default_factory=list)
+    removed_browser_dump_ids: list[str] = Field(default_factory=list)
+    summary: str
+    compared_at: str = Field(default_factory=utc_now)
 
 
 class BrowserDumpRecord(BaseModel):
@@ -569,6 +649,8 @@ class RunRequest(BaseModel):
     model: str
     instruction: Optional[str] = None
     runbook_id: Optional[str] = None
+    eval_scenario_id: Optional[str] = None
+    eval_replay_batch_id: Optional[str] = None
     planning: bool = False
 
 
@@ -658,6 +740,20 @@ class RunbookUpsertRequest(BaseModel):
     template: str
 
 
+class GuidanceStarterRequest(BaseModel):
+    template_id: GuidanceStarterTemplate
+    overwrite: bool = False
+
+
+class GuidanceStarterResult(BaseModel):
+    workspace_id: str
+    template_id: GuidanceStarterTemplate
+    path: str
+    created: bool = True
+    overwritten: bool = False
+    generated_at: str = Field(default_factory=utc_now)
+
+
 class VerificationProfileUpsertRequest(BaseModel):
     profile_id: Optional[str] = None
     name: str
@@ -669,6 +765,7 @@ class VerificationProfileUpsertRequest(BaseModel):
     max_runtime_seconds: int = 30
     retry_count: int = 1
     source_paths: list[str] = Field(default_factory=list)
+    checklist_items: list[str] = Field(default_factory=list)
 
 
 class TicketContextUpsertRequest(BaseModel):
@@ -729,6 +826,20 @@ class VerificationProfileRunRequest(BaseModel):
     run_id: Optional[str] = None
 
 
+class EvalScenarioUpsertRequest(BaseModel):
+    scenario_id: Optional[str] = None
+    name: str
+    issue_id: str
+    description: Optional[str] = None
+    baseline_replay_id: Optional[str] = None
+    guidance_paths: list[str] = Field(default_factory=list)
+    ticket_context_ids: list[str] = Field(default_factory=list)
+    verification_profile_ids: list[str] = Field(default_factory=list)
+    run_ids: list[str] = Field(default_factory=list)
+    browser_dump_ids: list[str] = Field(default_factory=list)
+    notes: Optional[str] = None
+
+
 class SavedIssueViewRequest(BaseModel):
     name: str
     query: str = ""
@@ -756,13 +867,87 @@ class ExportBundle(BaseModel):
     run_reviews: list[RunReviewRecord] = Field(default_factory=list)
     runbooks: list[RunbookRecord] = Field(default_factory=list)
     verification_profiles: list[VerificationProfileRecord] = Field(default_factory=list)
+    verification_profile_history: list[VerificationProfileExecutionResult] = Field(default_factory=list)
     ticket_contexts: list[TicketContextRecord] = Field(default_factory=list)
     threat_models: list[ThreatModelRecord] = Field(default_factory=list)
     context_replays: list[IssueContextReplayRecord] = Field(default_factory=list)
     browser_dumps: list[BrowserDumpRecord] = Field(default_factory=list)
+    eval_scenarios: list["EvalScenarioRecord"] = Field(default_factory=list)
     verifications: list[VerificationRecord] = Field(default_factory=list)
     activity: list[ActivityRecord] = Field(default_factory=list)
     exported_at: str = Field(default_factory=utc_now)
+
+
+class RepoMapSymbolRecord(BaseModel):
+    path: str
+    symbol: str
+    kind: Literal["function", "class", "method", "type", "module"] = "function"
+    line_start: Optional[int] = None
+    line_end: Optional[int] = None
+    enclosing_scope: Optional[str] = None
+    reason: Optional[str] = None
+    score: int = 0
+
+
+class RelatedContextRecord(BaseModel):
+    artifact_type: Literal["ticket_context", "threat_model", "browser_dump", "fix_record", "activity", "run"]
+    artifact_id: str
+    title: str
+    path: Optional[str] = None
+    reason: Optional[str] = None
+    matched_terms: list[str] = Field(default_factory=list)
+    score: int = 0
+
+
+class DynamicContextBundle(BaseModel):
+    symbol_context: list[RepoMapSymbolRecord] = Field(default_factory=list)
+    related_context: list[RelatedContextRecord] = Field(default_factory=list)
+
+
+class RepoMCPServerRecord(BaseModel):
+    name: str
+    description: str = ""
+    usage: str = ""
+
+
+class RepoPathInstructionRecord(BaseModel):
+    instruction_id: str
+    path: str
+    instructions: str
+    title: Optional[str] = None
+    source_path: str
+
+
+class RepoPathInstructionMatch(BaseModel):
+    instruction_id: str
+    path: str
+    title: Optional[str] = None
+    instructions: str
+    source_path: str
+    matched_paths: list[str] = Field(default_factory=list)
+
+
+class RepoConfigRecord(BaseModel):
+    workspace_id: str
+    source_path: Optional[str] = None
+    description: str = ""
+    path_filters: list[str] = Field(default_factory=list)
+    path_instructions: list[RepoPathInstructionRecord] = Field(default_factory=list)
+    code_guidelines: list[str] = Field(default_factory=list)
+    mcp_servers: list[RepoMCPServerRecord] = Field(default_factory=list)
+    loaded_at: str = Field(default_factory=utc_now)
+
+
+class RepoConfigHealth(BaseModel):
+    workspace_id: str
+    status: Literal["missing", "configured"] = "missing"
+    source_path: Optional[str] = None
+    summary: str
+    path_instruction_count: int = 0
+    path_filter_count: int = 0
+    code_guideline_count: int = 0
+    mcp_server_count: int = 0
+    loaded_at: str = Field(default_factory=utc_now)
 
 
 class IssueContextPacket(BaseModel):
@@ -781,6 +966,9 @@ class IssueContextPacket(BaseModel):
     threat_models: list[ThreatModelRecord] = Field(default_factory=list)
     browser_dumps: list[BrowserDumpRecord] = Field(default_factory=list)
     repo_map: Optional[RepoMapSummary] = None
+    dynamic_context: Optional[DynamicContextBundle] = None
+    repo_config: Optional[RepoConfigRecord] = None
+    matched_path_instructions: list[RepoPathInstructionMatch] = Field(default_factory=list)
     worktree: Optional[WorktreeStatus] = None
     prompt: str
 
@@ -799,6 +987,31 @@ class RepoGuidanceRecord(BaseModel):
     updated_at: Optional[str] = None
 
 
+class GuidanceStarterRecord(BaseModel):
+    template_id: GuidanceStarterTemplate
+    title: str
+    path: str
+    description: str
+    recommended: bool = True
+    exists: bool = False
+    stale: bool = False
+
+
+class RepoGuidanceHealth(BaseModel):
+    workspace_id: str
+    status: GuidanceHealthStatus
+    summary: str
+    guidance_count: int = 0
+    always_on_count: int = 0
+    instruction_count: int = 0
+    present_files: list[str] = Field(default_factory=list)
+    missing_files: list[str] = Field(default_factory=list)
+    stale_files: list[str] = Field(default_factory=list)
+    recommended_files: list[str] = Field(default_factory=list)
+    starters: list[GuidanceStarterRecord] = Field(default_factory=list)
+    generated_at: str = Field(default_factory=utc_now)
+
+
 class RunSessionInsight(BaseModel):
     workspace_id: str
     run_id: str
@@ -810,6 +1023,8 @@ class RunSessionInsight(BaseModel):
     strengths: list[str] = Field(default_factory=list)
     risks: list[str] = Field(default_factory=list)
     recommendations: list[str] = Field(default_factory=list)
+    acceptance_review: Optional["AcceptanceCriteriaReview"] = None
+    scope_warnings: list["ScopeWarning"] = Field(default_factory=list)
     generated_at: str = Field(default_factory=utc_now)
 
 
@@ -980,7 +1195,257 @@ class PatchCritique(BaseModel):
     issues_found: list[str] = Field(default_factory=list)
     improvements: list[ImprovementSuggestion] = Field(default_factory=list)
     summary: str = ""
+    acceptance_review: Optional["AcceptanceCriteriaReview"] = None
+    scope_warnings: list["ScopeWarning"] = Field(default_factory=list)
     generated_at: str = Field(default_factory=utc_now)
+
+
+class AcceptanceCriteriaReview(BaseModel):
+    status: Literal["met", "partial", "not_met", "unknown"] = "unknown"
+    criteria: list[str] = Field(default_factory=list)
+    matched: list[str] = Field(default_factory=list)
+    missing: list[str] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
+
+
+class ScopeWarning(BaseModel):
+    kind: Literal["unrelated_change", "scope_drift"] = "scope_drift"
+    message: str
+    paths: list[str] = Field(default_factory=list)
+    severity: Literal["low", "medium", "high"] = "medium"
+
+
+class EvalScenarioRecord(BaseModel):
+    scenario_id: str
+    workspace_id: str
+    issue_id: str
+    name: str
+    description: Optional[str] = None
+    baseline_replay_id: Optional[str] = None
+    guidance_paths: list[str] = Field(default_factory=list)
+    ticket_context_ids: list[str] = Field(default_factory=list)
+    verification_profile_ids: list[str] = Field(default_factory=list)
+    run_ids: list[str] = Field(default_factory=list)
+    browser_dump_ids: list[str] = Field(default_factory=list)
+    notes: Optional[str] = None
+    created_at: str = Field(default_factory=utc_now)
+    updated_at: str = Field(default_factory=utc_now)
+
+
+class EvalReplayBatchRecord(BaseModel):
+    batch_id: str
+    workspace_id: str
+    issue_id: str
+    runtime: RuntimeKind
+    model: str
+    scenario_ids: list[str] = Field(default_factory=list)
+    queued_run_ids: list[str] = Field(default_factory=list)
+    instruction: Optional[str] = None
+    runbook_id: Optional[str] = None
+    planning: bool = False
+    created_at: str = Field(default_factory=utc_now)
+
+
+class EvalScenarioVariantDiff(BaseModel):
+    selected_guidance_paths: list[str] = Field(default_factory=list)
+    current_guidance_paths: list[str] = Field(default_factory=list)
+    added_guidance_paths: list[str] = Field(default_factory=list)
+    removed_guidance_paths: list[str] = Field(default_factory=list)
+    selected_ticket_context_ids: list[str] = Field(default_factory=list)
+    current_ticket_context_ids: list[str] = Field(default_factory=list)
+    added_ticket_context_ids: list[str] = Field(default_factory=list)
+    removed_ticket_context_ids: list[str] = Field(default_factory=list)
+    changed: bool = False
+    summary: str = ""
+
+
+class EvalVariantRollup(BaseModel):
+    variant_kind: Literal["guidance", "ticket_context"] = "guidance"
+    variant_key: str
+    label: str
+    selected_values: list[str] = Field(default_factory=list)
+    scenario_ids: list[str] = Field(default_factory=list)
+    scenario_names: list[str] = Field(default_factory=list)
+    scenario_count: int = 0
+    run_count: int = 0
+    success_runs: int = 0
+    failed_runs: int = 0
+    total_estimated_cost: float = 0.0
+    avg_duration_ms: int = 0
+    verification_success_rate: float = 0.0
+    runtime_breakdown: list["VerificationProfileDimensionSummary"] = Field(default_factory=list)
+    model_breakdown: list["VerificationProfileDimensionSummary"] = Field(default_factory=list)
+    summary: str = ""
+
+
+class EvalScenarioReport(BaseModel):
+    scenario: EvalScenarioRecord
+    baseline_replay: Optional[IssueContextReplayRecord] = None
+    latest_replay_comparison: Optional[IssueContextReplayComparison] = None
+    variant_diff: Optional[EvalScenarioVariantDiff] = None
+    comparison_to_baseline: Optional["EvalScenarioBaselineComparison"] = None
+    latest_fresh_run: Optional["EvalFreshRunSummary"] = None
+    fresh_comparison_to_baseline: Optional["EvalFreshExecutionComparison"] = None
+    verification_profile_reports: list[VerificationProfileReport] = Field(default_factory=list)
+    run_metrics: list[RunMetrics] = Field(default_factory=list)
+    total_estimated_cost: float = 0.0
+    avg_duration_ms: int = 0
+    success_runs: int = 0
+    failed_runs: int = 0
+    verification_success_rate: float = 0.0
+    summary: str = ""
+
+
+class EvalScenarioBaselineComparison(BaseModel):
+    compared_to_scenario_id: str
+    compared_to_name: str
+    guidance_only_in_scenario: list[str] = Field(default_factory=list)
+    guidance_only_in_baseline: list[str] = Field(default_factory=list)
+    ticket_context_only_in_scenario: list[str] = Field(default_factory=list)
+    ticket_context_only_in_baseline: list[str] = Field(default_factory=list)
+    browser_dump_only_in_scenario: list[str] = Field(default_factory=list)
+    browser_dump_only_in_baseline: list[str] = Field(default_factory=list)
+    verification_profile_only_in_scenario: list[str] = Field(default_factory=list)
+    verification_profile_only_in_baseline: list[str] = Field(default_factory=list)
+    verification_profile_deltas: list["EvalScenarioVerificationProfileDelta"] = Field(default_factory=list)
+    success_runs_delta: int = 0
+    failed_runs_delta: int = 0
+    verification_success_rate_delta: float = 0.0
+    avg_duration_ms_delta: int = 0
+    total_estimated_cost_delta: float = 0.0
+    preferred: Literal["scenario", "baseline", "tie"] = "tie"
+    preferred_scenario_id: Optional[str] = None
+    preferred_scenario_name: Optional[str] = None
+    preference_reasons: list[str] = Field(default_factory=list)
+    summary: str = ""
+
+
+class EvalScenarioVerificationProfileDelta(BaseModel):
+    profile_id: str
+    profile_name: str
+    present_in_scenario: bool = False
+    present_in_baseline: bool = False
+    scenario_total_runs: int = 0
+    baseline_total_runs: int = 0
+    total_runs_delta: int = 0
+    scenario_success_rate: float = 0.0
+    baseline_success_rate: float = 0.0
+    success_rate_delta: float = 0.0
+    scenario_checklist_pass_rate: float = 0.0
+    baseline_checklist_pass_rate: float = 0.0
+    checklist_pass_rate_delta: float = 0.0
+    scenario_avg_attempt_count: float = 0.0
+    baseline_avg_attempt_count: float = 0.0
+    avg_attempt_count_delta: float = 0.0
+    scenario_confidence_counts: dict[str, int] = Field(default_factory=dict)
+    baseline_confidence_counts: dict[str, int] = Field(default_factory=dict)
+    preferred: Literal["scenario", "baseline", "tie"] = "tie"
+    summary: str = ""
+
+
+class EvalFreshRunSummary(BaseModel):
+    scenario_id: str
+    scenario_name: str
+    run_id: str
+    status: RunStatus
+    runtime: RuntimeKind
+    model: str
+    created_at: str
+    estimated_cost: float = 0.0
+    duration_ms: int = 0
+    command_preview: Optional[str] = None
+    planning: bool = False
+
+
+class EvalFreshExecutionComparison(BaseModel):
+    compared_to_scenario_id: str
+    compared_to_name: str
+    scenario_status: RunStatus
+    baseline_status: RunStatus
+    estimated_cost_delta: float = 0.0
+    duration_ms_delta: int = 0
+    preferred: Literal["scenario", "baseline", "tie"] = "tie"
+    preferred_scenario_id: Optional[str] = None
+    preferred_scenario_name: Optional[str] = None
+    preference_reasons: list[str] = Field(default_factory=list)
+    summary: str = ""
+
+
+class EvalFreshReplayRankingEntry(BaseModel):
+    rank: int = 0
+    scenario_id: str
+    scenario_name: str
+    latest_fresh_run: EvalFreshRunSummary
+    pairwise_wins: int = 0
+    pairwise_losses: int = 0
+    pairwise_ties: int = 0
+    preference_reasons: list[str] = Field(default_factory=list)
+    summary: str = ""
+
+
+class EvalFreshReplayRanking(BaseModel):
+    issue_id: str
+    baseline_scenario_id: Optional[str] = None
+    baseline_scenario_name: Optional[str] = None
+    ranked_scenarios: list[EvalFreshReplayRankingEntry] = Field(default_factory=list)
+    summary: str = ""
+
+
+class EvalFreshReplayTrendEntry(BaseModel):
+    scenario_id: str
+    scenario_name: str
+    current_rank: int = 0
+    previous_rank: Optional[int] = None
+    movement: Literal["up", "down", "same", "new"] = "new"
+    latest_fresh_run: EvalFreshRunSummary
+    previous_fresh_run: Optional[EvalFreshRunSummary] = None
+    summary: str = ""
+
+
+class EvalFreshReplayTrend(BaseModel):
+    issue_id: str
+    latest_batch_id: Optional[str] = None
+    previous_batch_id: Optional[str] = None
+    entries: list[EvalFreshReplayTrendEntry] = Field(default_factory=list)
+    summary: str = ""
+
+
+class EvalWorkspaceReport(BaseModel):
+    workspace_id: str
+    scenario_count: int = 0
+    run_count: int = 0
+    success_runs: int = 0
+    failed_runs: int = 0
+    total_estimated_cost: float = 0.0
+    total_duration_ms: int = 0
+    verification_success_rate: float = 0.0
+    cost_summary: Optional[CostSummary] = None
+    scenario_reports: list[EvalScenarioReport] = Field(default_factory=list)
+    replay_batches: list[EvalReplayBatchRecord] = Field(default_factory=list)
+    fresh_replay_rankings: list[EvalFreshReplayRanking] = Field(default_factory=list)
+    fresh_replay_trends: list[EvalFreshReplayTrend] = Field(default_factory=list)
+    guidance_variant_rollups: list[EvalVariantRollup] = Field(default_factory=list)
+    ticket_context_variant_rollups: list[EvalVariantRollup] = Field(default_factory=list)
+    generated_at: str = Field(default_factory=utc_now)
+
+
+class EvalScenarioReplayRequest(BaseModel):
+    runtime: RuntimeKind
+    model: str
+    scenario_ids: list[str] = Field(default_factory=list)
+    instruction: Optional[str] = None
+    runbook_id: Optional[str] = None
+    planning: bool = False
+
+
+class EvalScenarioReplayResult(BaseModel):
+    workspace_id: str
+    issue_id: str
+    runtime: RuntimeKind
+    model: str
+    batch_id: Optional[str] = None
+    scenario_ids: list[str] = Field(default_factory=list)
+    queued_runs: list[RunRecord] = Field(default_factory=list)
 
 
 class DismissImprovementRequest(BaseModel):

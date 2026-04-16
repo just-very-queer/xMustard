@@ -43,9 +43,14 @@ That means the roadmap now optimizes for:
 - detected guidance files now surface in the UI
 - missing guidance now gets onboarding prompts
 - OpenHands-style `.openhands/microagents/repo.md` files are recognized as repo guidance
+- starter guidance files can now be generated for `AGENTS.md`, `.openhands/microagents/repo.md`, and `CONVENTIONS.md`
+- workspace guidance health now reports missing and stale starter guidance
+- repo-native `.xmustard.yaml` configuration now adds path-scoped instructions and MCP/browser-context hints directly into issue packets
 - saved workspace verification profiles now surface in the execution drawer and issue detail
+- verification profiles now carry reusable checklist items plus durable pass or fail history with confidence scores
+- verification profile reporting now compares execution history by runtime, model, and branch
 - issue-level ticket context now attaches upstream links, summaries, and acceptance criteria to issue packets
-- issue-context replay snapshots now capture prompt state for later eval and comparison
+- issue-context replay snapshots now capture prompt state, linked browser dumps, and replay-to-current drift comparisons for later eval work
 - issue-level browser dumps now capture MCP/manual browser state for shared UI debugging context
 - workspace repo maps now persist structural summaries and ranked related paths for issue packets
 
@@ -89,6 +94,7 @@ Current state:
 
 - workspace repo-map summaries now persist top directories, extension mix, and notable files
 - issue packets now carry ranked related paths and structural context in the prompt
+- issue packets now carry dynamic symbol context and retrieval-backed related artifacts without requiring embeddings infrastructure
 - the issue detail pane now shows repo-map summaries and related paths
 
 Success looks like:
@@ -161,6 +167,20 @@ Build:
 - regression suite for guidance discovery, planning quality, and verification outcomes
 - workspace-level reporting for cost, success rate, and verification quality
 
+Current state:
+
+- saved eval scenarios can now pin an issue, baseline replay, guidance paths, ticket contexts, verification profiles, browser dumps, and runs
+- workspace eval reports now correlate replay drift, current-vs-saved guidance/ticket-context variants, run metrics, cost, and verification success per scenario
+- workspace eval reports now also group outcomes by saved guidance sets and ticket-context sets, including runtime/model rollups per variant with unique-run aggregation and explicit selected-value summaries
+- each scenario report can now compare itself to the baseline scenario for the same issue, including guidance/ticket/browser/profile deltas plus weighted outcome-vs-cost preference reasons
+- baseline scenario comparisons now include per-profile verification history deltas for runs, success rate, checklist pass rate, attempts, and confidence mix
+- saved eval scenarios can now launch fresh issue runs through the normal runtime queue while pinning their stored guidance, ticket context, verification profiles, and browser dumps back into execution
+- saved eval scenarios can now be batch replayed for an issue, and eval reports now attach each scenario's latest fresh run plus a fresh-vs-baseline execution comparison after those replays land
+- workspace eval reports now also rank all fresh replay outcomes for the same issue, so larger scenario clusters can be compared directly instead of only against the baseline scenario
+- workspace eval reports now show which scenarios moved up, down, or held steady versus their previous fresh replay snapshot
+- replay batches are now stored as first-class artifacts, and fresh replay movement now compares the latest batch to the previous batch when that history exists
+- replay trend views now surface latest-batch and previous-batch identifiers directly, so experiment movement is attributable to a concrete replay session instead of only inferred run order
+
 Success looks like:
 
 - product changes can be judged by outcome, not intuition
@@ -205,6 +225,11 @@ Build:
 - acceptance-criteria compliance review
 - unrelated-change detection and scope warnings
 
+Current state:
+
+- run insights now derive acceptance-criteria review and scope warnings from ticket context, worktree paths, and issue drift
+- patch critique now carries the same compliance and scope-review summary for stored run output
+
 Success looks like:
 
 - runs produce a durable answer to "is this fixed?" and "does this satisfy the ticket?" instead of leaving that implicit
@@ -223,6 +248,11 @@ Build:
 - cross-artifact retrieval across issues, runs, ticket context, and review data
 - better duplicate clustering and owner suggestions
 - context expansion informed by symbol and ticket relationships
+
+Current state:
+
+- issue packets now rank related operational artifacts such as ticket context, threat models, browser dumps, fixes, and recent activity
+- retrieval remains lexical and artifact-backed for now, but it already feeds prompts and the issue detail pane
 
 Success looks like:
 

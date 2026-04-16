@@ -12,6 +12,8 @@ from .models import (
     ActivityRecord,
     AppSettings,
     BrowserDumpRecord,
+    EvalReplayBatchRecord,
+    EvalScenarioRecord,
     FixRecord,
     IssueContextReplayRecord,
     IssueRecord,
@@ -23,6 +25,7 @@ from .models import (
     TicketContextRecord,
     SavedIssueView,
     VerificationProfileRecord,
+    VerificationProfileExecutionResult,
     VerificationRecord,
     WorkspaceRecord,
     WorkspaceSnapshot,
@@ -109,6 +112,9 @@ class FileStore:
     def verification_profiles_path(self, workspace_id: str) -> Path:
         return self.workspace_dir(workspace_id) / "verification_profiles.json"
 
+    def verification_profile_history_path(self, workspace_id: str) -> Path:
+        return self.workspace_dir(workspace_id) / "verification_profile_history.json"
+
     def ticket_contexts_path(self, workspace_id: str) -> Path:
         return self.workspace_dir(workspace_id) / "ticket_contexts.json"
 
@@ -120,6 +126,12 @@ class FileStore:
 
     def browser_dumps_path(self, workspace_id: str) -> Path:
         return self.workspace_dir(workspace_id) / "browser_dumps.json"
+
+    def eval_scenarios_path(self, workspace_id: str) -> Path:
+        return self.workspace_dir(workspace_id) / "eval_scenarios.json"
+
+    def eval_replay_batches_path(self, workspace_id: str) -> Path:
+        return self.workspace_dir(workspace_id) / "eval_replay_batches.json"
 
     def repo_map_path(self, workspace_id: str) -> Path:
         return self.workspace_dir(workspace_id) / "repo_map.json"
@@ -212,6 +224,18 @@ class FileStore:
             [item.model_dump(mode="json") for item in ordered],
         )
 
+    def list_verification_profile_history(self, workspace_id: str) -> list[VerificationProfileExecutionResult]:
+        data = self._read_json(self.verification_profile_history_path(workspace_id), [])
+        items = [VerificationProfileExecutionResult.model_validate(item) for item in data]
+        return sorted(items, key=lambda item: item.created_at, reverse=True)
+
+    def save_verification_profile_history(self, workspace_id: str, history: list[VerificationProfileExecutionResult]) -> None:
+        ordered = sorted(history, key=lambda item: item.created_at, reverse=True)
+        self._write_json(
+            self.verification_profile_history_path(workspace_id),
+            [item.model_dump(mode="json") for item in ordered],
+        )
+
     def list_ticket_contexts(self, workspace_id: str) -> list[TicketContextRecord]:
         data = self._read_json(self.ticket_contexts_path(workspace_id), [])
         items = [TicketContextRecord.model_validate(item) for item in data]
@@ -257,6 +281,30 @@ class FileStore:
         ordered = sorted(dumps, key=lambda item: item.updated_at, reverse=True)
         self._write_json(
             self.browser_dumps_path(workspace_id),
+            [item.model_dump(mode="json") for item in ordered],
+        )
+
+    def list_eval_scenarios(self, workspace_id: str) -> list[EvalScenarioRecord]:
+        data = self._read_json(self.eval_scenarios_path(workspace_id), [])
+        items = [EvalScenarioRecord.model_validate(item) for item in data]
+        return sorted(items, key=lambda item: (item.issue_id, item.updated_at, item.name.lower()), reverse=False)
+
+    def save_eval_scenarios(self, workspace_id: str, scenarios: list[EvalScenarioRecord]) -> None:
+        ordered = sorted(scenarios, key=lambda item: (item.issue_id, item.name.lower(), item.created_at))
+        self._write_json(
+            self.eval_scenarios_path(workspace_id),
+            [item.model_dump(mode="json") for item in ordered],
+        )
+
+    def list_eval_replay_batches(self, workspace_id: str) -> list[EvalReplayBatchRecord]:
+        data = self._read_json(self.eval_replay_batches_path(workspace_id), [])
+        items = [EvalReplayBatchRecord.model_validate(item) for item in data]
+        return sorted(items, key=lambda item: item.created_at, reverse=True)
+
+    def save_eval_replay_batches(self, workspace_id: str, batches: list[EvalReplayBatchRecord]) -> None:
+        ordered = sorted(batches, key=lambda item: item.created_at, reverse=True)
+        self._write_json(
+            self.eval_replay_batches_path(workspace_id),
             [item.model_dump(mode="json") for item in ordered],
         )
 

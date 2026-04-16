@@ -11,9 +11,12 @@ from .models import (
     AppSettings,
     BrowserDumpUpsertRequest,
     DismissImprovementRequest,
+    EvalScenarioReplayRequest,
+    EvalScenarioUpsertRequest,
     FixRecordRequest,
     FixUpdateRequest,
     GitHubPRCreate,
+    GuidanceStarterRequest,
     IntegrationTestRequest,
     IssueCreateRequest,
     IssueContextReplayRequest,
@@ -302,6 +305,81 @@ def list_verification_profiles(workspace_id: str):
         raise HTTPException(status_code=404, detail="Workspace not found")
 
 
+@app.get("/api/workspaces/{workspace_id}/verification-profile-history")
+def list_verification_profile_history(
+    workspace_id: str,
+    profile_id: Optional[str] = Query(default=None),
+    issue_id: Optional[str] = Query(default=None),
+):
+    try:
+        return [
+            item.model_dump(mode="json")
+            for item in SERVICE.list_verification_profile_history(workspace_id, profile_id=profile_id, issue_id=issue_id)
+        ]
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+
+
+@app.get("/api/workspaces/{workspace_id}/verification-profile-reports")
+def list_verification_profile_reports(
+    workspace_id: str,
+    issue_id: Optional[str] = Query(default=None),
+):
+    try:
+        return [item.model_dump(mode="json") for item in SERVICE.list_verification_profile_reports(workspace_id, issue_id=issue_id)]
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+
+
+@app.get("/api/workspaces/{workspace_id}/eval-scenarios")
+def list_eval_scenarios(
+    workspace_id: str,
+    issue_id: Optional[str] = Query(default=None),
+):
+    try:
+        return [item.model_dump(mode="json") for item in SERVICE.list_eval_scenarios(workspace_id, issue_id=issue_id)]
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+
+
+@app.post("/api/workspaces/{workspace_id}/eval-scenarios")
+def save_eval_scenario(workspace_id: str, request: EvalScenarioUpsertRequest):
+    try:
+        return SERVICE.save_eval_scenario(workspace_id, request).model_dump(mode="json")
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
+@app.delete("/api/workspaces/{workspace_id}/eval-scenarios/{scenario_id}")
+def delete_eval_scenario(workspace_id: str, scenario_id: str):
+    try:
+        SERVICE.delete_eval_scenario(workspace_id, scenario_id)
+        return {"ok": True, "scenario_id": scenario_id}
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Eval scenario not found")
+
+
+@app.get("/api/workspaces/{workspace_id}/eval-report")
+def get_eval_report(
+    workspace_id: str,
+    scenario_id: Optional[str] = Query(default=None),
+):
+    try:
+        return SERVICE.get_eval_report(workspace_id, scenario_id=scenario_id).model_dump(mode="json")
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
+@app.post("/api/workspaces/{workspace_id}/issues/{issue_id}/eval-scenarios/replay")
+def replay_eval_scenarios(workspace_id: str, issue_id: str, request: EvalScenarioReplayRequest):
+    try:
+        return SERVICE.replay_eval_scenarios(workspace_id, issue_id, request).model_dump(mode="json")
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
 @app.post("/api/workspaces/{workspace_id}/verification-profiles")
 def save_verification_profile(workspace_id: str, request: VerificationProfileUpsertRequest):
     try:
@@ -388,6 +466,46 @@ def list_guidance(workspace_id: str):
         return [item.model_dump(mode="json") for item in SERVICE.list_workspace_guidance(workspace_id)]
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="Workspace not found")
+
+
+@app.get("/api/workspaces/{workspace_id}/guidance/health")
+def guidance_health(workspace_id: str):
+    try:
+        return SERVICE.get_workspace_guidance_health(workspace_id).model_dump(mode="json")
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+
+
+@app.post("/api/workspaces/{workspace_id}/guidance/starters")
+def generate_guidance_starter(workspace_id: str, request: GuidanceStarterRequest):
+    try:
+        return SERVICE.generate_guidance_starter(workspace_id, request).model_dump(mode="json")
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"Missing resource: {exc}")
+    except FileExistsError as exc:
+        raise HTTPException(status_code=409, detail=f"Starter already exists: {exc}")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.get("/api/workspaces/{workspace_id}/repo-config")
+def read_repo_config(workspace_id: str):
+    try:
+        return SERVICE.read_workspace_repo_config(workspace_id).model_dump(mode="json")
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.get("/api/workspaces/{workspace_id}/repo-config/health")
+def read_repo_config_health(workspace_id: str):
+    try:
+        return SERVICE.get_workspace_repo_config_health(workspace_id).model_dump(mode="json")
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 @app.get("/api/workspaces/{workspace_id}/repo-map")
@@ -484,6 +602,14 @@ def capture_issue_context_replay(workspace_id: str, issue_id: str, request: Issu
         raise HTTPException(status_code=404, detail=f"Missing resource: {exc}")
 
 
+@app.get("/api/workspaces/{workspace_id}/issues/{issue_id}/context-replays/{replay_id}/compare")
+def compare_issue_context_replay(workspace_id: str, issue_id: str, replay_id: str):
+    try:
+        return SERVICE.compare_issue_context_replay(workspace_id, issue_id, replay_id).model_dump(mode="json")
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"Missing resource: {exc}")
+
+
 @app.get("/api/workspaces/{workspace_id}/issues/{issue_id}/browser-dumps")
 def list_browser_dumps(workspace_id: str, issue_id: str):
     try:
@@ -521,6 +647,8 @@ def issue_run(workspace_id: str, issue_id: str, request: RunRequest):
             request.model,
             request.instruction,
             request.runbook_id,
+            request.eval_scenario_id,
+            request.eval_replay_batch_id,
             request.planning,
         )
     except FileNotFoundError as exc:

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"time"
 
 	"xmustard/api-go/internal/rustcore"
@@ -98,6 +99,10 @@ type activityActor struct {
 	Label   string  `json:"label"`
 }
 
+func verificationProfileHistoryPath(dataDir string, workspaceID string) string {
+	return filepath.Join(dataDir, "workspaces", workspaceID, "verification_profile_history.json")
+}
+
 func RunIssueVerificationProfile(
 	ctx context.Context,
 	dataDir string,
@@ -143,6 +148,17 @@ func RunIssueVerificationProfile(
 	result, err := rustcore.RunVerificationProfile(ctx, snapshot.Workspace.RootPath, *profile, runID, issueID)
 	if err != nil {
 		return nil, err
+	}
+	result.ProfileName = profile.Name
+	result.IssueID = &issueID
+	if runID != "" {
+		result.RunID = &runID
+	}
+	result.ChecklistResults = buildVerificationChecklistResults(*profile, result)
+	result.Confidence = scoreVerificationResultConfidence(result)
+	if result.ExecutionID == "" {
+		sum := sha1.Sum([]byte(fmt.Sprintf("%s:%s:%s:%s", workspaceID, issueID, profile.ProfileID, nowUTC())))
+		result.ExecutionID = "vpr_" + hex.EncodeToString(sum[:])[:12]
 	}
 
 	if result.CoverageResult != nil {
@@ -191,6 +207,14 @@ func RunIssueVerificationProfile(
 	if err := writeJSON(snapshotPath, snapshot); err != nil {
 		return nil, fmt.Errorf("save snapshot: %w", err)
 	}
+	history, err := loadVerificationProfileHistory(dataDir, workspaceID)
+	if err != nil {
+		return nil, err
+	}
+	history = append(history, *result)
+	if err := saveVerificationProfileHistory(dataDir, workspaceID, history); err != nil {
+		return nil, err
+	}
 
 	if err := appendActivity(dataDir, workspaceID, issueID, runID, "verification.profile_run",
 		fmt.Sprintf("Ran verification profile %s (%s)", profile.Name, map[bool]string{true: "passed", false: "failed"}[result.Success]),
@@ -198,6 +222,8 @@ func RunIssueVerificationProfile(
 			"profile_id":           profile.ProfileID,
 			"attempt_count":        result.AttemptCount,
 			"success":              result.Success,
+			"confidence":           result.Confidence,
+			"checklist_results":    result.ChecklistResults,
 			"coverage_report_path": result.CoverageReportPath,
 		},
 	); err != nil {
@@ -205,6 +231,144 @@ func RunIssueVerificationProfile(
 	}
 
 	return result, nil
+}
+
+func ListVerificationProfileHistory(dataDir string, workspaceID string, profileID string, issueID string) ([]rustcore.VerificationProfileResult, error) {
+	if _, err := loadSnapshot(dataDir, workspaceID); err != nil {
+		return nil, err
+	}
+	items, err := loadVerificationProfileHistory(dataDir, workspaceID)
+	if err != nil {
+		return nil, err
+	}
+	filtered := make([]rustcore.VerificationProfileResult, 0, len(items))
+	for _, item := range items {
+		if profileID != "" && item.ProfileID != profileID {
+			continue
+		}
+		if issueID != "" && (item.IssueID == nil || *item.IssueID != issueID) {
+			continue
+		}
+		filtered = append(filtered, item)
+	}
+	return filtered, nil
+}
+
+func loadVerificationProfileHistory(dataDir string, workspaceID string) ([]rustcore.VerificationProfileResult, error) {
+	path := verificationProfileHistoryPath(dataDir, workspaceID)
+	var items []rustcore.VerificationProfileResult
+	if err := readJSON(path, &items); err != nil {
+		if os.IsNotExist(err) {
+			return []rustcore.VerificationProfileResult{}, nil
+		}
+		return nil, err
+	}
+	slices.SortFunc(items, func(a, b rustcore.VerificationProfileResult) int {
+		if a.CreatedAt > b.CreatedAt {
+			return -1
+		}
+		if a.CreatedAt < b.CreatedAt {
+			return 1
+		}
+		return 0
+	})
+	return items, nil
+}
+
+func saveVerificationProfileHistory(dataDir string, workspaceID string, items []rustcore.VerificationProfileResult) error {
+	slices.SortFunc(items, func(a, b rustcore.VerificationProfileResult) int {
+		if a.CreatedAt > b.CreatedAt {
+			return -1
+		}
+		if a.CreatedAt < b.CreatedAt {
+			return 1
+		}
+		return 0
+	})
+	return writeJSON(verificationProfileHistoryPath(dataDir, workspaceID), items)
+}
+
+func buildVerificationChecklistResults(profile verificationProfileRecord, result *rustcore.VerificationProfileResult) []rustcore.VerificationChecklistResult {
+	coverageAvailable := result.CoverageResult != nil || (result.CoverageCommandResult != nil && result.CoverageCommandResult.Success)
+	results := []rustcore.VerificationChecklistResult{
+		{
+			ItemID: "system:test-command",
+			Title:  "Verification command passes",
+			Kind:   "system",
+			Passed: result.Success,
+		},
+	}
+	if len(result.Attempts) > 0 {
+		if result.Success {
+			details := "Latest verification attempt succeeded."
+			results[0].Details = &details
+		} else if latest := result.Attempts[len(result.Attempts)-1]; latest.StderrExcerpt != "" {
+			details := latest.StderrExcerpt
+			results[0].Details = &details
+		}
+	}
+	if profile.CoverageCommand != nil || profile.CoverageReportPath != nil {
+		var details *string
+		if coverageAvailable {
+			if result.CoverageReportPath != nil {
+				detail := *result.CoverageReportPath
+				details = &detail
+			}
+		} else {
+			detail := "No coverage artifact was produced."
+			details = &detail
+		}
+		results = append(results, rustcore.VerificationChecklistResult{
+			ItemID:  "system:coverage-artifact",
+			Title:   "Coverage artifact is produced",
+			Kind:    "system",
+			Passed:  coverageAvailable,
+			Details: details,
+		})
+	}
+	for idx, item := range profile.ChecklistItems {
+		passed := result.Success
+		detailText := "Verification completed successfully."
+		if containsCoverageWord(item) {
+			passed = coverageAvailable
+			if coverageAvailable {
+				detailText = "Coverage data was captured."
+			} else {
+				detailText = "Coverage data is still missing."
+			}
+		} else if !passed {
+			detailText = "Verification did not complete cleanly."
+		}
+		details := detailText
+		results = append(results, rustcore.VerificationChecklistResult{
+			ItemID:  fmt.Sprintf("custom:%d", idx+1),
+			Title:   item,
+			Kind:    "custom",
+			Passed:  passed,
+			Details: &details,
+		})
+	}
+	return results
+}
+
+func scoreVerificationResultConfidence(result *rustcore.VerificationProfileResult) string {
+	if !result.Success {
+		return "low"
+	}
+	for _, item := range result.ChecklistResults {
+		if !item.Passed {
+			return "medium"
+		}
+	}
+	if result.AttemptCount <= 1 {
+		return "high"
+	}
+	return "medium"
+}
+
+func containsCoverageWord(value string) bool {
+	lower := strings.ToLower(value)
+	return strings.Contains(lower, "coverage")
 }
 
 func readJSON(path string, target any) error {

@@ -6,7 +6,10 @@ import type {
   CoverageDelta,
   DiscoverySignal,
   DuplicateMatch,
+  EvalScenarioRecord,
+  EvalWorkspaceReport,
   ImprovementSuggestion,
+  IssueContextReplayComparison,
   IssueContextReplayRecord,
   IssueContextPacket,
   IssueDriftDetail,
@@ -25,6 +28,8 @@ import type {
   TicketContextRecord,
   TriageSuggestion,
   VerificationProfileRecord,
+  VerificationProfileExecutionResult,
+  VerificationProfileReport,
   ViewMode,
 } from '../lib/types'
 import { SummaryCard, StatusPill } from './TrackerPrimitives'
@@ -38,6 +43,33 @@ function qualityAccent(score?: number | null) {
   if (score >= 80) return 'green'
   if (score >= 55) return 'amber'
   return 'red'
+}
+
+function replayDeltaBlock(label: string, added: string[], removed: string[]) {
+  if (!added.length && !removed.length) return null
+  return (
+    <div className="field-stack">
+      <span className="filter-label">{label}</span>
+      {added.length ? <div className="detail-mini-block">Added: {added.join(', ')}</div> : null}
+      {removed.length ? <div className="detail-mini-block">Removed: {removed.join(', ')}</div> : null}
+    </div>
+  )
+}
+
+function dimensionSummaryTags(
+  label: string,
+  items: VerificationProfileReport['runtime_breakdown'],
+) {
+  if (!items.length) return null
+  return (
+    <div className="tag-row">
+      {items.slice(0, 3).map((item) => (
+        <span key={`${label}-${item.key}`} className="tag">
+          {label}: {item.label} ({item.success_rate}% / {item.total_runs})
+        </span>
+      ))}
+    </div>
+  )
 }
 
 function confidenceTone(confidence?: number | null) {
@@ -59,6 +91,13 @@ function guidanceTone(kind: RepoGuidanceRecord['kind']) {
   if (kind === 'conventions') return 'blue'
   if (kind === 'skill') return 'green'
   if (kind === 'repo_index') return 'amber'
+  return 'sand'
+}
+
+function acceptanceTone(status?: 'met' | 'partial' | 'not_met' | 'unknown' | null) {
+  if (status === 'met') return 'green'
+  if (status === 'partial') return 'amber'
+  if (status === 'not_met') return 'red'
   return 'sand'
 }
 
@@ -163,8 +202,14 @@ type Props = {
   workspaceGuidance: RepoGuidanceRecord[]
   repoMap: RepoMapSummary | null
   verificationProfiles: VerificationProfileRecord[]
+  verificationProfileHistory: VerificationProfileExecutionResult[]
+  verificationProfileReports: VerificationProfileReport[]
+  evalScenarios: EvalScenarioRecord[]
+  evalReport: EvalWorkspaceReport | null
   issueContextReplays: IssueContextReplayRecord[]
   contextReplayLabelDraft: string
+  selectedContextReplayId: string
+  contextReplayComparison: IssueContextReplayComparison | null
   selectedTicketContextId: string
   ticketContextProviderDraft: TicketContextRecord['provider']
   ticketContextExternalIdDraft: string
@@ -257,6 +302,7 @@ type Props = {
   onBrowserDumpScreenshotPathChange: (value: string) => void
   onBrowserDumpNotesChange: (value: string) => void
   onContextReplayLabelChange: (value: string) => void
+  onSelectContextReplay: (value: string) => void
   onIssueLabelsChange: (value: string) => void
   onIssueNotesChange: (value: string) => void
   onIssueFollowupChange: (value: boolean) => void
@@ -289,6 +335,9 @@ type Props = {
   onSaveBrowserDump: () => void
   onDeleteBrowserDump: () => void
   onCaptureIssueContextReplay: () => void
+  onCompareIssueContextReplay: (replayId: string) => void
+  onRunEvalScenario: (scenarioId: string) => void
+  onReplayAllEvalScenarios: () => void
   onRetryRun: () => void
   onCancelRun: () => void
   selectedRunPlan: RunPlan | null
@@ -323,8 +372,14 @@ export function DetailPane({
   workspaceGuidance,
   repoMap,
   verificationProfiles,
+  verificationProfileHistory,
+  verificationProfileReports,
+  evalScenarios,
+  evalReport,
   issueContextReplays,
   contextReplayLabelDraft,
+  selectedContextReplayId,
+  contextReplayComparison,
   selectedTicketContextId,
   ticketContextProviderDraft,
   ticketContextExternalIdDraft,
@@ -417,6 +472,7 @@ export function DetailPane({
   onBrowserDumpScreenshotPathChange,
   onBrowserDumpNotesChange,
   onContextReplayLabelChange,
+  onSelectContextReplay,
   onIssueLabelsChange,
   onIssueNotesChange,
   onIssueFollowupChange,
@@ -449,6 +505,9 @@ export function DetailPane({
   onSaveBrowserDump,
   onDeleteBrowserDump,
   onCaptureIssueContextReplay,
+  onCompareIssueContextReplay,
+  onRunEvalScenario,
+  onReplayAllEvalScenarios,
   onRetryRun,
   onCancelRun,
   selectedRunPlan,
@@ -878,31 +937,90 @@ export function DetailPane({
             </div>
             <div className="activity-list">
               {verificationProfiles.length ? (
-                verificationProfiles.map((profile) => (
-                  <div key={profile.profile_id} className="activity-entry">
-                    <div className="activity-entry-top">
-                      <strong>{profile.name}</strong>
-                      <small>{profile.built_in ? 'built-in' : 'custom'}</small>
-                    </div>
-                    <p>{profile.description || 'No description set.'}</p>
-                    <div className="row-meta">
-                      <span className="tag">{profile.coverage_format}</span>
-                      <span className="tag">{profile.max_runtime_seconds}s</span>
-                      <span className="tag">retries {profile.retry_count}</span>
-                    </div>
-                    <pre className="detail-mini-block">{profile.test_command}</pre>
-                    {profile.coverage_command ? <pre className="detail-mini-block">{profile.coverage_command}</pre> : null}
-                    {profile.source_paths.length ? (
-                      <div className="tag-row">
-                        {profile.source_paths.map((path) => (
-                          <span key={`${profile.profile_id}-${path}`} className="tag">
-                            {path}
-                          </span>
-                        ))}
+                verificationProfiles.map((profile) => {
+                  const profileReport = verificationProfileReports.find((item) => item.profile_id === profile.profile_id)
+                  return (
+                    <div key={profile.profile_id} className="activity-entry">
+                      <div className="activity-entry-top">
+                        <strong>{profile.name}</strong>
+                        <small>{profile.built_in ? 'built-in' : 'custom'}</small>
                       </div>
-                    ) : null}
-                  </div>
-                ))
+                      <p>{profile.description || 'No description set.'}</p>
+                      <div className="row-meta">
+                        <span className="tag">{profile.coverage_format}</span>
+                        <span className="tag">{profile.max_runtime_seconds}s</span>
+                        <span className="tag">retries {profile.retry_count}</span>
+                        {profileReport ? <span className="tag">success {profileReport.success_rate}%</span> : null}
+                      </div>
+                      {profileReport ? (
+                        <>
+                          <div className="tag-row">
+                            <span className="tag">runs {profileReport.total_runs}</span>
+                            <span className="tag">avg attempts {profileReport.avg_attempt_count}</span>
+                            <span className="tag">checklist {profileReport.checklist_pass_rate}%</span>
+                            <span className="tag">high {profileReport.confidence_counts.high ?? 0}</span>
+                            <span className="tag">medium {profileReport.confidence_counts.medium ?? 0}</span>
+                            <span className="tag">low {profileReport.confidence_counts.low ?? 0}</span>
+                          </div>
+                          {dimensionSummaryTags('runtime', profileReport.runtime_breakdown)}
+                          {dimensionSummaryTags('model', profileReport.model_breakdown)}
+                          {dimensionSummaryTags('branch', profileReport.branch_breakdown)}
+                        </>
+                      ) : null}
+                      <pre className="detail-mini-block">{profile.test_command}</pre>
+                      {profile.coverage_command ? <pre className="detail-mini-block">{profile.coverage_command}</pre> : null}
+                      {profile.checklist_items.length ? (
+                        <div className="tag-row">
+                          {profile.checklist_items.map((item) => (
+                            <span key={`${profile.profile_id}-checklist-${item}`} className="tag">
+                              checklist: {item}
+                            </span>
+                          ))}
+                        </div>
+                      ) : null}
+                      {profile.source_paths.length ? (
+                        <div className="tag-row">
+                          {profile.source_paths.map((path) => (
+                            <span key={`${profile.profile_id}-${path}`} className="tag">
+                              {path}
+                            </span>
+                          ))}
+                        </div>
+                      ) : null}
+                      {verificationProfileHistory.filter((item) => item.profile_id === profile.profile_id).length ? (
+                        <div className="activity-list">
+                          {verificationProfileHistory
+                            .filter((item) => item.profile_id === profile.profile_id)
+                            .slice(0, 3)
+                            .map((item) => (
+                              <div key={item.execution_id} className="activity-entry">
+                                <div className="activity-entry-top">
+                                  <strong>{item.success ? 'Passed' : 'Failed'}</strong>
+                                  <small>{formatDate(item.created_at)}</small>
+                                </div>
+                                <div className="row-meta">
+                                  <span className="tag">confidence {item.confidence}</span>
+                                  <span className="tag">attempts {item.attempt_count}</span>
+                                  {item.run_id ? <span className="tag">run {item.run_id}</span> : null}
+                                </div>
+                                {item.checklist_results.length ? (
+                                  <div className="tag-row">
+                                    {item.checklist_results.map((check) => (
+                                      <span key={`${item.execution_id}-${check.item_id}`} className={`tag ${check.passed ? '' : 'tag-warning'}`}>
+                                        {check.passed ? 'pass' : 'gap'}: {check.title}
+                                      </span>
+                                    ))}
+                                  </div>
+                                ) : null}
+                              </div>
+                            ))}
+                        </div>
+                      ) : (
+                        <p className="subtle">No verification history for this profile yet.</p>
+                      )}
+                    </div>
+                  )
+                })
               ) : (
                 <p className="subtle">No verification profiles recorded for this workspace yet.</p>
               )}
@@ -963,6 +1081,409 @@ export function DetailPane({
             ) : (
               <p className="subtle">No repo map loaded for this workspace yet.</p>
             )}
+          </section>
+
+          <section className="detail-section">
+            <div className="panel-header">
+              <div>
+                <h4>Dynamic context</h4>
+                <p className="subtle">Structure-aware symbols and related artifacts ranked from the current issue packet.</p>
+              </div>
+            </div>
+            {issueContextPacket?.dynamic_context?.symbol_context?.length ? (
+              <div className="activity-list">
+                {issueContextPacket.dynamic_context.symbol_context.map((item) => (
+                  <div key={`${item.path}-${item.symbol}-${item.line_start ?? 'na'}`} className="activity-entry">
+                    <div className="activity-entry-top">
+                      <strong>{item.symbol}</strong>
+                      <small>{item.path}</small>
+                    </div>
+                    <div className="row-meta">
+                      <span className="tag">{item.kind}</span>
+                      <span className="tag">score {item.score}</span>
+                      {item.line_start ? <span className="tag">line {item.line_start}</span> : null}
+                      {item.enclosing_scope ? <span className="tag">scope {item.enclosing_scope}</span> : null}
+                    </div>
+                    <p>{item.reason ?? 'No ranking reason recorded.'}</p>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="subtle">No symbol context ranked yet.</p>
+            )}
+            {issueContextPacket?.dynamic_context?.related_context?.length ? (
+              <div className="activity-list">
+                {issueContextPacket.dynamic_context.related_context.map((item) => (
+                  <div key={`${item.artifact_type}-${item.artifact_id}`} className="activity-entry">
+                    <div className="activity-entry-top">
+                      <strong>{item.title}</strong>
+                      <small>{item.artifact_type}</small>
+                    </div>
+                    <div className="row-meta">
+                      <span className="tag">score {item.score}</span>
+                      {item.path ? <span className="tag">{item.path}</span> : null}
+                      {item.matched_terms.map((term) => (
+                        <span key={`${item.artifact_id}-${term}`} className="tag">
+                          {term}
+                        </span>
+                      ))}
+                    </div>
+                    <p>{item.reason ?? 'No retrieval reason recorded.'}</p>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="subtle">No related artifacts ranked yet.</p>
+            )}
+          </section>
+
+          <section className="detail-section">
+            {(() => {
+              const changedVariantCount = evalReport?.scenario_reports.filter((item) => item.variant_diff?.changed).length ?? 0
+              const freshReplayRankings = (evalReport?.fresh_replay_rankings ?? []).filter(
+                (item) => item.issue_id === selectedIssue?.bug_id,
+              )
+              const freshReplayTrends = (evalReport?.fresh_replay_trends ?? []).filter(
+                (item) => item.issue_id === selectedIssue?.bug_id,
+              )
+              const guidanceVariantRollups = evalReport?.guidance_variant_rollups ?? []
+              const ticketVariantRollups = evalReport?.ticket_context_variant_rollups ?? []
+              return (
+                <>
+            <div className="panel-header">
+              <div>
+                <h4>Eval scenarios</h4>
+                <p className="subtle">Saved replay/evaluation presets and the latest workspace-level report slices for this issue.</p>
+              </div>
+              <div className="toolbar-row">
+                <button type="button" className="ghost-button" onClick={onReplayAllEvalScenarios} disabled={loading || !evalScenarios.length}>
+                  Run all scenarios
+                </button>
+                <div className="tag-row">
+                <span className="tag">{evalScenarios.length} scenarios</span>
+                <span className="tag">variants {changedVariantCount} changed</span>
+                </div>
+              </div>
+            </div>
+            {evalScenarios.length ? (
+              <div className="activity-list">
+                {evalScenarios.map((scenario) => {
+                  const report = evalReport?.scenario_reports.find((item) => item.scenario.scenario_id === scenario.scenario_id)
+                  return (
+                    <div key={scenario.scenario_id} className="activity-entry">
+                      <div className="activity-entry-top">
+                        <strong>{scenario.name}</strong>
+                        <small>{scenario.baseline_replay_id ?? 'no baseline replay'}</small>
+                      </div>
+                      <div className="toolbar-row">
+                        <button type="button" className="ghost-button" onClick={() => onRunEvalScenario(scenario.scenario_id)} disabled={loading}>
+                          Run scenario
+                        </button>
+                      </div>
+                      <p>{scenario.description || scenario.notes || 'No eval scenario notes recorded.'}</p>
+                      <div className="row-meta">
+                        <span className="tag">guidance {scenario.guidance_paths.length}</span>
+                        <span className="tag">ticket context {scenario.ticket_context_ids.length}</span>
+                        <span className="tag">runs {scenario.run_ids.length}</span>
+                        <span className="tag">profiles {scenario.verification_profile_ids.length}</span>
+                        <span className="tag">browser dumps {scenario.browser_dump_ids.length}</span>
+                      </div>
+                      {report ? (
+                        <>
+                          <div className="tag-row">
+                            <span className="tag">success {report.success_runs}</span>
+                            <span className="tag">failed {report.failed_runs}</span>
+                            <span className="tag">verification {report.verification_success_rate}%</span>
+                            <span className="tag">avg duration {report.avg_duration_ms}ms</span>
+                            <span className="tag">cost ${report.total_estimated_cost.toFixed(4)}</span>
+                          </div>
+                          {report.latest_fresh_run ? (
+                            <>
+                              <div className="tag-row">
+                                <span className="tag">fresh run {report.latest_fresh_run.run_id}</span>
+                                <span className="tag">fresh status {report.latest_fresh_run.status}</span>
+                                <span className="tag">fresh cost ${report.latest_fresh_run.estimated_cost.toFixed(4)}</span>
+                                <span className="tag">fresh duration {report.latest_fresh_run.duration_ms}ms</span>
+                              </div>
+                              {report.fresh_comparison_to_baseline ? (
+                                <>
+                                  <div className="tag-row">
+                                    <span className="tag">fresh vs {report.fresh_comparison_to_baseline.compared_to_name}</span>
+                                    <span className="tag">preferred {report.fresh_comparison_to_baseline.preferred}</span>
+                                    <span className="tag">
+                                      cost {report.fresh_comparison_to_baseline.estimated_cost_delta >= 0 ? '+' : ''}{report.fresh_comparison_to_baseline.estimated_cost_delta.toFixed(4)}
+                                    </span>
+                                    <span className="tag">
+                                      duration {report.fresh_comparison_to_baseline.duration_ms_delta >= 0 ? '+' : ''}{report.fresh_comparison_to_baseline.duration_ms_delta}ms
+                                    </span>
+                                  </div>
+                                  <p className="subtle">{report.fresh_comparison_to_baseline.summary}</p>
+                                </>
+                              ) : null}
+                            </>
+                          ) : null}
+                          <p>{report.summary}</p>
+                          {report.variant_diff ? (
+                            <>
+                              <div className="tag-row">
+                                <span className="tag">
+                                  variant {report.variant_diff.changed ? 'changed' : 'matched'}
+                                </span>
+                                <span className="tag">
+                                  guidance +{report.variant_diff.added_guidance_paths.length} / -{report.variant_diff.removed_guidance_paths.length}
+                                </span>
+                                <span className="tag">
+                                  ticket +{report.variant_diff.added_ticket_context_ids.length} / -{report.variant_diff.removed_ticket_context_ids.length}
+                                </span>
+                              </div>
+                              <p>{report.variant_diff.summary}</p>
+                            </>
+                          ) : null}
+                          {report.comparison_to_baseline ? (
+                            <>
+                              <div className="tag-row">
+                                <span className="tag">vs {report.comparison_to_baseline.compared_to_name}</span>
+                                <span className="tag">preferred {report.comparison_to_baseline.preferred}</span>
+                                <span className="tag">
+                                  success {report.comparison_to_baseline.success_runs_delta >= 0 ? '+' : ''}{report.comparison_to_baseline.success_runs_delta}
+                                </span>
+                                <span className="tag">
+                                  verification {report.comparison_to_baseline.verification_success_rate_delta >= 0 ? '+' : ''}{report.comparison_to_baseline.verification_success_rate_delta}%
+                                </span>
+                                <span className="tag">
+                                  cost {report.comparison_to_baseline.total_estimated_cost_delta >= 0 ? '+' : ''}{report.comparison_to_baseline.total_estimated_cost_delta.toFixed(4)}
+                                </span>
+                              </div>
+                              {report.comparison_to_baseline.preference_reasons.length ? (
+                                <p className="subtle">
+                                  Preferred reasons: {report.comparison_to_baseline.preference_reasons.join(', ')}
+                                </p>
+                              ) : null}
+                              <p>{report.comparison_to_baseline.summary}</p>
+                              {report.comparison_to_baseline.verification_profile_deltas.length ? (
+                                <div className="detail-subsection">
+                                  <div className="panel-header">
+                                    <div>
+                                      <h5>Verification profile deltas</h5>
+                                      <p className="subtle">How saved verification history differs from the issue baseline scenario.</p>
+                                    </div>
+                                  </div>
+                                  <div className="activity-list">
+                                    {report.comparison_to_baseline.verification_profile_deltas.map((item) => (
+                                      <div key={`${scenario.scenario_id}-verify-delta-${item.profile_id}`} className="activity-entry">
+                                        <div className="activity-entry-top">
+                                          <strong>{item.profile_name}</strong>
+                                          <small>preferred {item.preferred}</small>
+                                        </div>
+                                        <div className="tag-row">
+                                          <span className="tag">runs {item.total_runs_delta >= 0 ? '+' : ''}{item.total_runs_delta}</span>
+                                          <span className="tag">success {item.success_rate_delta >= 0 ? '+' : ''}{item.success_rate_delta}%</span>
+                                          <span className="tag">checklist {item.checklist_pass_rate_delta >= 0 ? '+' : ''}{item.checklist_pass_rate_delta}%</span>
+                                          <span className="tag">attempts {item.avg_attempt_count_delta >= 0 ? '+' : ''}{item.avg_attempt_count_delta}</span>
+                                        </div>
+                                        <p className="subtle">
+                                          Scenario confidence {Object.entries(item.scenario_confidence_counts).map(([key, value]) => `${key}:${value}`).join(', ') || 'none'}
+                                        </p>
+                                        <p className="subtle">
+                                          Baseline confidence {Object.entries(item.baseline_confidence_counts).map(([key, value]) => `${key}:${value}`).join(', ') || 'none'}
+                                        </p>
+                                        <p>{item.summary}</p>
+                                      </div>
+                                    ))}
+                                  </div>
+                                </div>
+                              ) : null}
+                            </>
+                          ) : null}
+                        </>
+                      ) : null}
+                    </div>
+                  )
+                })}
+              </div>
+            ) : (
+              <p className="subtle">No eval scenarios saved for this issue yet.</p>
+            )}
+            {freshReplayRankings.length ? (
+              <details className="detail-disclosure">
+                <summary>Fresh replay ranking</summary>
+                <div className="activity-list">
+                  {freshReplayRankings.map((ranking) => (
+                    <div key={`fresh-ranking-${ranking.issue_id}`} className="activity-entry">
+                      <div className="activity-entry-top">
+                        <strong>{ranking.baseline_scenario_name ? `Baseline ${ranking.baseline_scenario_name}` : 'Fresh replay cluster'}</strong>
+                        <small>{ranking.ranked_scenarios.length} scenarios ranked</small>
+                      </div>
+                      <p>{ranking.summary}</p>
+                      <div className="activity-list">
+                        {ranking.ranked_scenarios.map((entry) => (
+                          <div key={`fresh-ranking-entry-${entry.scenario_id}`} className="activity-entry">
+                            <div className="activity-entry-top">
+                              <strong>#{entry.rank} {entry.scenario_name}</strong>
+                              <small>{entry.latest_fresh_run.run_id}</small>
+                            </div>
+                            <div className="tag-row">
+                              <span className="tag">status {entry.latest_fresh_run.status}</span>
+                              <span className="tag">wins {entry.pairwise_wins}</span>
+                              <span className="tag">losses {entry.pairwise_losses}</span>
+                              <span className="tag">ties {entry.pairwise_ties}</span>
+                              <span className="tag">cost ${entry.latest_fresh_run.estimated_cost.toFixed(4)}</span>
+                              <span className="tag">duration {entry.latest_fresh_run.duration_ms}ms</span>
+                            </div>
+                            {entry.preference_reasons.length ? (
+                              <p className="subtle">Preference reasons: {entry.preference_reasons.join(', ')}</p>
+                            ) : null}
+                            <p>{entry.summary}</p>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </details>
+            ) : null}
+            {freshReplayTrends.length ? (
+              <details className="detail-disclosure">
+                <summary>Fresh replay trend</summary>
+                <div className="activity-list">
+                  {freshReplayTrends.map((trend) => (
+                    <div key={`fresh-trend-${trend.issue_id}`} className="activity-entry">
+                      <div className="activity-entry-top">
+                        <strong>Replay movement</strong>
+                        <small>{trend.entries.length} scenarios tracked</small>
+                      </div>
+                      <div className="tag-row">
+                        {trend.latest_batch_id ? <span className="tag">latest batch {trend.latest_batch_id}</span> : null}
+                        {trend.previous_batch_id ? <span className="tag">previous batch {trend.previous_batch_id}</span> : null}
+                      </div>
+                      <p>{trend.summary}</p>
+                      <div className="activity-list">
+                        {trend.entries.map((entry) => (
+                          <div key={`fresh-trend-entry-${entry.scenario_id}`} className="activity-entry">
+                            <div className="activity-entry-top">
+                              <strong>{entry.scenario_name}</strong>
+                              <small>{entry.latest_fresh_run.run_id}</small>
+                            </div>
+                            <div className="tag-row">
+                              <span className="tag">movement {entry.movement}</span>
+                              <span className="tag">current rank {entry.current_rank}</span>
+                              {entry.previous_rank != null ? (
+                                <span className="tag">previous rank {entry.previous_rank}</span>
+                              ) : null}
+                              <span className="tag">status {entry.latest_fresh_run.status}</span>
+                            </div>
+                            {entry.previous_fresh_run ? (
+                              <p className="subtle">
+                                Previous run {entry.previous_fresh_run.run_id} cost ${entry.previous_fresh_run.estimated_cost.toFixed(4)} duration {entry.previous_fresh_run.duration_ms}ms
+                              </p>
+                            ) : null}
+                            <p>{entry.summary}</p>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </details>
+            ) : null}
+            {guidanceVariantRollups.length || ticketVariantRollups.length ? (
+              <details className="detail-disclosure">
+                <summary>Variant comparison</summary>
+                {guidanceVariantRollups.length ? (
+                  <div className="detail-subsection">
+                    <div className="panel-header">
+                      <div>
+                        <h5>Guidance sets</h5>
+                        <p className="subtle">Outcome rollups grouped by saved guidance-path selections.</p>
+                      </div>
+                    </div>
+                    <div className="activity-list">
+                      {guidanceVariantRollups.map((item) => (
+                        <div key={`guidance-${item.variant_key}`} className="activity-entry">
+                          <div className="activity-entry-top">
+                            <strong>{item.label}</strong>
+                            <small>{item.scenario_count} scenarios</small>
+                          </div>
+                          <div className="tag-row">
+                            <span className="tag">success {item.success_runs}</span>
+                            <span className="tag">failed {item.failed_runs}</span>
+                            <span className="tag">verification {item.verification_success_rate}%</span>
+                            <span className="tag">avg duration {item.avg_duration_ms}ms</span>
+                            <span className="tag">cost ${item.total_estimated_cost.toFixed(4)}</span>
+                          </div>
+                          <p className="subtle">
+                            {item.selected_values.length
+                              ? `Selected guidance: ${item.selected_values.join(', ')}`
+                              : 'Selected guidance: current defaults'}
+                          </p>
+                          <div className="tag-row">
+                            {item.runtime_breakdown.slice(0, 3).map((bucket) => (
+                              <span key={`guidance-runtime-${item.variant_key}-${bucket.key}`} className="tag">
+                                runtime {bucket.label} {bucket.total_runs}
+                              </span>
+                            ))}
+                            {item.model_breakdown.slice(0, 3).map((bucket) => (
+                              <span key={`guidance-model-${item.variant_key}-${bucket.key}`} className="tag">
+                                model {bucket.label} {bucket.total_runs}
+                              </span>
+                            ))}
+                          </div>
+                          <p>{item.summary}</p>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ) : null}
+                {ticketVariantRollups.length ? (
+                  <div className="detail-subsection">
+                    <div className="panel-header">
+                      <div>
+                        <h5>Ticket-context sets</h5>
+                        <p className="subtle">Outcome rollups grouped by saved ticket-context selections.</p>
+                      </div>
+                    </div>
+                    <div className="activity-list">
+                      {ticketVariantRollups.map((item) => (
+                        <div key={`ticket-${item.variant_key}`} className="activity-entry">
+                          <div className="activity-entry-top">
+                            <strong>{item.label}</strong>
+                            <small>{item.scenario_count} scenarios</small>
+                          </div>
+                          <div className="tag-row">
+                            <span className="tag">success {item.success_runs}</span>
+                            <span className="tag">failed {item.failed_runs}</span>
+                            <span className="tag">verification {item.verification_success_rate}%</span>
+                            <span className="tag">avg duration {item.avg_duration_ms}ms</span>
+                            <span className="tag">cost ${item.total_estimated_cost.toFixed(4)}</span>
+                          </div>
+                          <p className="subtle">
+                            {item.selected_values.length
+                              ? `Selected ticket context: ${item.selected_values.join(', ')}`
+                              : 'Selected ticket context: current defaults'}
+                          </p>
+                          <div className="tag-row">
+                            {item.runtime_breakdown.slice(0, 3).map((bucket) => (
+                              <span key={`ticket-runtime-${item.variant_key}-${bucket.key}`} className="tag">
+                                runtime {bucket.label} {bucket.total_runs}
+                              </span>
+                            ))}
+                            {item.model_breakdown.slice(0, 3).map((bucket) => (
+                              <span key={`ticket-model-${item.variant_key}-${bucket.key}`} className="tag">
+                                model {bucket.label} {bucket.total_runs}
+                              </span>
+                            ))}
+                          </div>
+                          <p>{item.summary}</p>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ) : null}
+              </details>
+            ) : null}
+                </>
+              )
+            })()}
           </section>
 
           <section className="detail-section">
@@ -1728,6 +2249,40 @@ export function DetailPane({
               </section>
 
               <section className="detail-section">
+                <div className="panel-header">
+                  <div>
+                    <h4>Path instructions</h4>
+                    <p className="subtle">Repo-config rules matched against the issue’s ranked paths, similar to scoped review instructions.</p>
+                  </div>
+                  <div className="row-meta">
+                    <span className="tag">{issueContextPacket?.matched_path_instructions.length ?? 0} matched</span>
+                    {issueContextPacket?.repo_config?.source_path ? <span className="tag">{issueContextPacket.repo_config.source_path}</span> : null}
+                  </div>
+                </div>
+                {issueContextPacket?.matched_path_instructions?.length ? (
+                  <div className="activity-list">
+                    {issueContextPacket.matched_path_instructions.map((item) => (
+                      <div key={item.instruction_id} className="activity-entry">
+                        <div className="activity-header">
+                          <strong>{item.title || item.path}</strong>
+                          <div className="row-meta">
+                            {item.matched_paths.map((path) => (
+                              <span key={`${item.instruction_id}-${path}`} className="tag">
+                                {path}
+                              </span>
+                            ))}
+                          </div>
+                        </div>
+                        <p>{item.instructions}</p>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="subtle">No `.xmustard` path instructions matched the current issue packet.</p>
+                )}
+              </section>
+
+              <section className="detail-section">
                 <h4>Agent context</h4>
                 <pre className="prompt-block">{issueContextPacket?.prompt ?? 'Loading context packet...'}</pre>
               </section>
@@ -1768,6 +2323,19 @@ export function DetailPane({
                           <span className="tag">focus {replay.tree_focus.length}</span>
                           <span className="tag">guidance {replay.guidance_paths.length}</span>
                           <span className="tag">profiles {replay.verification_profile_ids.length}</span>
+                          <span className="tag">browser {replay.browser_dump_ids.length}</span>
+                        </div>
+                        <div className="toolbar-row">
+                          <button
+                            type="button"
+                            className={selectedContextReplayId === replay.replay_id ? 'secondary' : ''}
+                            onClick={() => onSelectContextReplay(replay.replay_id)}
+                          >
+                            Select
+                          </button>
+                          <button type="button" onClick={() => onCompareIssueContextReplay(replay.replay_id)} disabled={loading}>
+                            Compare
+                          </button>
                         </div>
                         <pre className="detail-mini-block">{replay.prompt}</pre>
                       </div>
@@ -1776,6 +2344,51 @@ export function DetailPane({
                     <p className="subtle">No prompt snapshots saved for this issue yet.</p>
                   )}
                 </div>
+                {contextReplayComparison && selectedContextReplayId === contextReplayComparison.replay.replay_id ? (
+                  <div className="detail-section field-stack">
+                    <div className="panel-header">
+                      <div>
+                        <h4>Replay comparison</h4>
+                        <p className="subtle">{contextReplayComparison.summary}</p>
+                      </div>
+                      <div className="row-meta">
+                        <span className={`status-pill ${contextReplayComparison.changed ? 'amber' : 'green'}`}>
+                          {contextReplayComparison.changed ? 'Drift detected' : 'No drift'}
+                        </span>
+                      </div>
+                    </div>
+                    <div className="row-meta">
+                      <span className="tag">saved prompt {contextReplayComparison.saved_prompt_length} chars</span>
+                      <span className="tag">current prompt {contextReplayComparison.current_prompt_length} chars</span>
+                      {contextReplayComparison.prompt_changed ? <span className="tag">prompt changed</span> : null}
+                    </div>
+                    {replayDeltaBlock(
+                      'Tree focus',
+                      contextReplayComparison.added_tree_focus,
+                      contextReplayComparison.removed_tree_focus,
+                    )}
+                    {replayDeltaBlock(
+                      'Guidance paths',
+                      contextReplayComparison.added_guidance_paths,
+                      contextReplayComparison.removed_guidance_paths,
+                    )}
+                    {replayDeltaBlock(
+                      'Verification profiles',
+                      contextReplayComparison.added_verification_profile_ids,
+                      contextReplayComparison.removed_verification_profile_ids,
+                    )}
+                    {replayDeltaBlock(
+                      'Ticket contexts',
+                      contextReplayComparison.added_ticket_context_ids,
+                      contextReplayComparison.removed_ticket_context_ids,
+                    )}
+                    {replayDeltaBlock(
+                      'Browser dumps',
+                      contextReplayComparison.added_browser_dump_ids,
+                      contextReplayComparison.removed_browser_dump_ids,
+                    )}
+                  </div>
+                ) : null}
               </section>
 
               {activeView === 'issues' ? (
@@ -1964,6 +2577,41 @@ export function DetailPane({
                       <SummaryCard label="Recommendations" value={runInsight.recommendations.length} accent="amber" />
                       <SummaryCard label="Guidance used" value={runInsight.guidance_used.length} accent="blue" />
                     </div>
+                    {runInsight.acceptance_review ? (
+                      <>
+                        <div className="tag-row">
+                          <span className="tag">acceptance {runInsight.acceptance_review.status}</span>
+                          <StatusPill tone={acceptanceTone(runInsight.acceptance_review.status)}>
+                            {runInsight.acceptance_review.status}
+                          </StatusPill>
+                          {runInsight.scope_warnings.map((warning) => (
+                            <span key={`${warning.kind}-${warning.message}`} className="tag">
+                              {warning.kind}: {warning.severity}
+                            </span>
+                          ))}
+                        </div>
+                        <div className="analysis-list">
+                          {runInsight.acceptance_review.matched.map((item) => (
+                            <div key={`acceptance-match-${item}`} className="evidence-row">
+                              <span>{item}</span>
+                              <small>matched criterion</small>
+                            </div>
+                          ))}
+                          {runInsight.acceptance_review.missing.map((item) => (
+                            <div key={`acceptance-missing-${item}`} className="evidence-row">
+                              <span>{item}</span>
+                              <small>missing criterion</small>
+                            </div>
+                          ))}
+                          {runInsight.scope_warnings.map((warning) => (
+                            <div key={`scope-${warning.kind}-${warning.message}`} className="evidence-row">
+                              <span>{warning.message}</span>
+                              <small>{warning.paths.join(', ') || warning.severity}</small>
+                            </div>
+                          ))}
+                        </div>
+                      </>
+                    ) : null}
                     <div className="analysis-list">
                       {runInsight.strengths.length ? (
                         runInsight.strengths.map((item) => (
@@ -2047,6 +2695,26 @@ export function DetailPane({
                       <SummaryCard label="Safety" value={`${patchCritique.safety}%`} accent={qualityAccent(patchCritique.safety)} />
                     </div>
                     <p>{patchCritique.summary || 'No critique summary available.'}</p>
+                    {patchCritique.acceptance_review ? (
+                      <div className="analysis-list">
+                        <div className="evidence-row">
+                          <span>Acceptance review</span>
+                          <small>{patchCritique.acceptance_review.status}</small>
+                        </div>
+                        {patchCritique.acceptance_review.missing.map((item) => (
+                          <div key={`critique-missing-${item}`} className="evidence-row">
+                            <span>{item}</span>
+                            <small>missing criterion</small>
+                          </div>
+                        ))}
+                        {patchCritique.scope_warnings.map((warning) => (
+                          <div key={`critique-scope-${warning.kind}-${warning.message}`} className="evidence-row">
+                            <span>{warning.message}</span>
+                            <small>{warning.paths.join(', ') || warning.severity}</small>
+                          </div>
+                        ))}
+                      </div>
+                    ) : null}
                     {patchCritique.issues_found.length ? (
                       <div className="analysis-list">
                         {patchCritique.issues_found.map((issue) => (

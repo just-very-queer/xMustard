@@ -10,9 +10,12 @@ import typer
 from .models import (
     BrowserDumpUpsertRequest,
     DismissImprovementRequest,
+    EvalScenarioReplayRequest,
+    EvalScenarioUpsertRequest,
     FixRecordRequest,
     FixUpdateRequest,
     GitHubPRCreate,
+    GuidanceStarterRequest,
     IntegrationTestRequest,
     IssueContextReplayRequest,
     IssueCreateRequest,
@@ -382,6 +385,35 @@ def verification_profiles(workspace_id: str) -> None:
     _echo_json(payload)
 
 
+@app.command("verification-profile-history")
+def verification_profile_history(
+    workspace_id: str,
+    profile_id: str = typer.Option(default=""),
+    issue_id: str = typer.Option(default=""),
+) -> None:
+    payload = [
+        item.model_dump(mode="json")
+        for item in service.list_verification_profile_history(
+            workspace_id,
+            profile_id=profile_id or None,
+            issue_id=issue_id or None,
+        )
+    ]
+    _echo_json(payload)
+
+
+@app.command("verification-profile-reports")
+def verification_profile_reports(
+    workspace_id: str,
+    issue_id: str = typer.Option(default=""),
+) -> None:
+    payload = [
+        item.model_dump(mode="json")
+        for item in service.list_verification_profile_reports(workspace_id, issue_id=issue_id or None)
+    ]
+    _echo_json(payload)
+
+
 @app.command("verification-profile-save")
 def verification_profile_save(
     workspace_id: str,
@@ -395,6 +427,7 @@ def verification_profile_save(
     max_runtime_seconds: int = typer.Option(default=30),
     retry_count: int = typer.Option(default=1),
     source_paths: str = typer.Option(default=""),
+    checklist_items: str = typer.Option(default=""),
 ) -> None:
     payload = service.save_verification_profile(
         workspace_id,
@@ -409,6 +442,7 @@ def verification_profile_save(
             max_runtime_seconds=max_runtime_seconds,
             retry_count=retry_count,
             source_paths=_split_csv(source_paths),
+            checklist_items=_split_csv(checklist_items),
         ),
     )
     _echo_json(payload.model_dump(mode="json"))
@@ -490,6 +524,34 @@ def tree(workspace_id: str, relative_path: str = typer.Option(default="")) -> No
 @app.command("guidance")
 def guidance(workspace_id: str) -> None:
     _echo_json([item.model_dump(mode="json") for item in service.list_workspace_guidance(workspace_id)])
+
+
+@app.command("guidance-health")
+def guidance_health(workspace_id: str) -> None:
+    _echo_json(service.get_workspace_guidance_health(workspace_id).model_dump(mode="json"))
+
+
+@app.command("guidance-generate")
+def guidance_generate(
+    workspace_id: str,
+    template_id: str = typer.Option(..., help="agents | openhands_repo | conventions"),
+    overwrite: bool = typer.Option(default=False),
+) -> None:
+    payload = service.generate_guidance_starter(
+        workspace_id,
+        GuidanceStarterRequest(template_id=template_id, overwrite=overwrite),
+    )
+    _echo_json(payload.model_dump(mode="json"))
+
+
+@app.command("repo-config")
+def repo_config(workspace_id: str) -> None:
+    _echo_json(service.read_workspace_repo_config(workspace_id).model_dump(mode="json"))
+
+
+@app.command("repo-config-health")
+def repo_config_health(workspace_id: str) -> None:
+    _echo_json(service.get_workspace_repo_config_health(workspace_id).model_dump(mode="json"))
 
 
 @app.command("repo-map")
@@ -620,6 +682,88 @@ def context_replay_capture(
         IssueContextReplayRequest(label=label or None),
     )
     _echo_json(payload.model_dump(mode="json"))
+
+
+@app.command("context-replay-compare")
+def context_replay_compare(workspace_id: str, issue_id: str, replay_id: str) -> None:
+    _echo_json(service.compare_issue_context_replay(workspace_id, issue_id, replay_id).model_dump(mode="json"))
+
+
+@app.command("eval-scenarios")
+def eval_scenarios(workspace_id: str, issue_id: str = typer.Option(default="")) -> None:
+    _echo_json([item.model_dump(mode="json") for item in service.list_eval_scenarios(workspace_id, issue_id or None)])
+
+
+@app.command("eval-scenario-save")
+def eval_scenario_save(
+    workspace_id: str,
+    issue_id: str = typer.Option(...),
+    name: str = typer.Option(...),
+    scenario_id: str = typer.Option(default=""),
+    description: str = typer.Option(default=""),
+    baseline_replay_id: str = typer.Option(default=""),
+    guidance_paths: str = typer.Option(default=""),
+    ticket_context_ids: str = typer.Option(default=""),
+    verification_profile_ids: str = typer.Option(default=""),
+    run_ids: str = typer.Option(default=""),
+    browser_dump_ids: str = typer.Option(default=""),
+    notes: str = typer.Option(default=""),
+) -> None:
+    payload = service.save_eval_scenario(
+        workspace_id,
+        EvalScenarioUpsertRequest(
+            scenario_id=scenario_id or None,
+            issue_id=issue_id,
+            name=name,
+            description=_normalize_newlines(description) or None,
+            baseline_replay_id=baseline_replay_id or None,
+            guidance_paths=_split_csv(guidance_paths),
+            ticket_context_ids=_split_csv(ticket_context_ids),
+            verification_profile_ids=_split_csv(verification_profile_ids),
+            run_ids=_split_csv(run_ids),
+            browser_dump_ids=_split_csv(browser_dump_ids),
+            notes=_normalize_newlines(notes) or None,
+        ),
+    )
+    _echo_json(payload.model_dump(mode="json"))
+
+
+@app.command("eval-scenario-delete")
+def eval_scenario_delete(workspace_id: str, scenario_id: str) -> None:
+    service.delete_eval_scenario(workspace_id, scenario_id)
+    _echo_ok(scenario_id=scenario_id)
+
+
+@app.command("eval-report")
+def eval_report(workspace_id: str, scenario_id: str = typer.Option(default="")) -> None:
+    _echo_json(service.get_eval_report(workspace_id, scenario_id or None).model_dump(mode="json"))
+
+
+@app.command("eval-scenario-replay")
+def eval_scenario_replay(
+    workspace_id: str,
+    issue_id: str,
+    runtime: str = typer.Option(...),
+    model: str = typer.Option(...),
+    scenario_ids: str = typer.Option(default=""),
+    instruction: str = typer.Option(default=""),
+    runbook_id: str = typer.Option(default=""),
+    planning: bool = typer.Option(default=False),
+) -> None:
+    _echo_json(
+        service.replay_eval_scenarios(
+            workspace_id,
+            issue_id,
+            EvalScenarioReplayRequest(
+                runtime=runtime,
+                model=model,
+                scenario_ids=_split_csv(scenario_ids),
+                instruction=_normalize_newlines(instruction) or None,
+                runbook_id=runbook_id or None,
+                planning=planning,
+            ),
+        ).model_dump(mode="json")
+    )
 
 
 @app.command("browser-dumps")
@@ -869,6 +1013,7 @@ def run_start(
     model: str = typer.Option(...),
     instruction: str = typer.Option(default=""),
     runbook_id: str = typer.Option(default=""),
+    eval_scenario_id: str = typer.Option(default=""),
     planning: bool = typer.Option(default=False),
 ) -> None:
     payload = service.start_issue_run(
@@ -878,6 +1023,8 @@ def run_start(
         model,
         instruction or None,
         runbook_id or None,
+        eval_scenario_id or None,
+        None,
         planning,
     )
     _echo_json(payload)
