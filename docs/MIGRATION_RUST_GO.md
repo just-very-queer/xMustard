@@ -167,6 +167,7 @@ That boundary work is now live for three concrete slices:
 - The Go API shell now owns verification profile list/save/delete against `verification_profiles.json`, including settings activity records and a built-in fallback profile.
 - The Go API shell now owns ticket-context list/save/delete against `ticket_contexts.json`, including issue-scoped activity records.
 - The Go API shell now owns threat-model list/save/delete against `threat_models.json`, including issue-scoped activity records.
+- The Go API shell now owns runbook list/save/delete against `runbooks.json`, including settings activity records.
 - The Go API shell now owns browser-dump list/save/delete against `browser_dumps.json`, including issue-scoped activity records and export/context inclusion.
 - The Go API shell now owns issue-context packet reads at `/api/workspaces/{workspace_id}/issues/{issue_id}/context`.
 - The Go API shell now owns issue-work packet reads at `/api/workspaces/{workspace_id}/issues/{issue_id}/work`, including runbook selection.

@@ -39,6 +39,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Go API shell support for verification profile list/save/delete with persisted settings activity
 - Go API shell support for ticket-context list/save/delete with persisted issue activity
 - Go API shell support for threat-model list/save/delete with persisted issue activity
+- Go API shell support for runbook list/save/delete with persisted settings activity
 - Go API shell support for browser-dump list/save/delete with persisted issue activity plus issue-context/export inclusion
 - Go API shell support for issue-context packet reads, issue-work packet reads with runbook selection, and issue-context replay list/capture against persisted tracker artifacts
 - Go API shell support for workspace snapshot reads, activity feeds, activity overview, sources, tree browsing, guidance discovery, and repo-map reads against persisted workspace artifacts
