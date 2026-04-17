@@ -64,6 +64,7 @@
       "/api/workspaces/{workspace_id}/verification-profile-reports",
       "/api/workspaces/{workspace_id}/eval-scenarios",
       "/api/workspaces/{workspace_id}/eval-report",
+      "/api/workspaces/{workspace_id}/vulnerability-report",
       "/api/workspaces/{workspace_id}/issues/{issue_id}/eval-scenarios/replay",
       "/api/workspaces/{workspace_id}/issues/{issue_id}/verification-profiles/{profile_id}/run",
       "/api/workspaces/{workspace_id}/issues/{issue_id}/context",

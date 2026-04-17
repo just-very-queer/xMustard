@@ -921,6 +921,11 @@ def vulnerability_report(workspace_id: str, issue_id: str) -> None:
     _echo_json(service.get_vulnerability_finding_report(workspace_id, issue_id).model_dump(mode="json"))
 
 
+@app.command("workspace-vulnerability-report")
+def workspace_vulnerability_report(workspace_id: str) -> None:
+    _echo_json(service.get_workspace_vulnerability_report(workspace_id).model_dump(mode="json"))
+
+
 @app.command("issue-drift")
 def issue_drift(workspace_id: str, issue_id: str) -> None:
     _echo_json(service.read_issue_drift(workspace_id, issue_id).model_dump(mode="json"))

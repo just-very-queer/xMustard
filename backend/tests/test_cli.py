@@ -989,6 +989,12 @@ reviews:
                 self.assertGreaterEqual(report_payload["total_findings"], 2)
                 self.assertEqual(report_payload["latest_scan_batch_id"], "semgrep-batch-cli")
 
+                result = self.runner.invoke(cli_module.app, ["workspace-vulnerability-report", workspace_id])
+                self.assertEqual(result.exit_code, 0, msg=result.output)
+                workspace_report_payload = json.loads(result.stdout)
+                self.assertGreaterEqual(workspace_report_payload["total_findings"], 2)
+                self.assertEqual(workspace_report_payload["latest_scan_batch_id"], "semgrep-batch-cli")
+
                 result = self.runner.invoke(
                     cli_module.app,
                     ["vulnerability-finding-delete", workspace_id, "P0_25M03_001", finding_payload["finding_id"]],

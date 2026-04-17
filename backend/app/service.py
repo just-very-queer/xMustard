@@ -130,6 +130,8 @@ from .models import (
     VulnerabilityFindingUpsertRequest,
     VulnerabilityImportBatchSummary,
     VulnerabilityImportRequest,
+    WorkspaceVulnerabilityIssueRollup,
+    WorkspaceVulnerabilityReport,
     WorktreeStatus,
     WorkspaceLoadRequest,
     WorkspaceRecord,
@@ -1470,6 +1472,87 @@ class TrackerService:
             batches=batch_summaries,
             active_items=active_items[:12],
             resolved_items=resolved_items[:12],
+            summary=summary,
+        )
+
+    def get_workspace_vulnerability_report(self, workspace_id: str) -> WorkspaceVulnerabilityReport:
+        snapshot = self.read_snapshot(workspace_id)
+        if snapshot is None:
+            raise FileNotFoundError(workspace_id)
+        findings = self.list_vulnerability_findings(workspace_id)
+        counts_by_severity = dict(sorted(Counter(item.severity for item in findings).items()))
+        counts_by_lifecycle = dict(sorted(Counter(item.lifecycle_state for item in findings).items()))
+        counts_by_source = dict(sorted(Counter(item.source for item in findings).items()))
+        active_items = [item for item in findings if item.lifecycle_state != "resolved"]
+        resolved_items = [item for item in findings if item.lifecycle_state == "resolved"]
+
+        issue_lookup = {item.bug_id: item for item in snapshot.issues}
+        issue_rollups: list[WorkspaceVulnerabilityIssueRollup] = []
+        for issue_id, issue_findings in sorted(
+            ((issue_id, [item for item in findings if item.issue_id == issue_id]) for issue_id in {item.issue_id for item in findings}),
+            key=lambda pair: pair[0],
+        ):
+            active_count = sum(1 for item in issue_findings if item.lifecycle_state != "resolved")
+            resolved_count = sum(1 for item in issue_findings if item.lifecycle_state == "resolved")
+            critical_count = sum(1 for item in issue_findings if item.severity == "critical" and item.lifecycle_state != "resolved")
+            regressed_count = sum(1 for item in issue_findings if item.lifecycle_state == "regressed")
+            issue_rollups.append(
+                WorkspaceVulnerabilityIssueRollup(
+                    issue_id=issue_id,
+                    issue_title=issue_lookup.get(issue_id).title if issue_lookup.get(issue_id) else issue_id,
+                    active_findings=active_count,
+                    resolved_findings=resolved_count,
+                    critical_findings=critical_count,
+                    regressed_findings=regressed_count,
+                )
+            )
+        issue_rollups.sort(key=lambda item: (-item.active_findings, -item.regressed_findings, -item.critical_findings, item.issue_id))
+
+        batch_events = [item for item in self.store.list_activity(workspace_id) if item.action == "vulnerability_findings.imported"]
+        batch_summaries: list[VulnerabilityImportBatchSummary] = []
+        seen_batch_ids: set[str] = set()
+        for event in sorted(batch_events, key=lambda item: item.created_at, reverse=True):
+            details = event.details if isinstance(event.details, dict) else {}
+            batch_id = str(details.get("scan_batch_id") or "").strip()
+            if not batch_id or batch_id in seen_batch_ids:
+                continue
+            seen_batch_ids.add(batch_id)
+            batch_summaries.append(
+                VulnerabilityImportBatchSummary(
+                    scan_batch_id=batch_id,
+                    source=str(details.get("source") or "other"),
+                    tool_version=str(details.get("tool_version") or "").strip() or None,
+                    imported_at=str(details.get("imported_at") or event.created_at),
+                    imported_count=int(details.get("count") or 0),
+                    new_count=int(details.get("new") or 0),
+                    existing_count=int(details.get("existing") or 0),
+                    resolved_count=int(details.get("resolved") or 0),
+                    regressed_count=int(details.get("regressed") or 0),
+                    summary=event.summary,
+                )
+            )
+
+        latest_batch_id = batch_summaries[0].scan_batch_id if batch_summaries else None
+        latest_imported_at = batch_summaries[0].imported_at if batch_summaries else None
+        summary = (
+            f"{len(active_items)} active vulnerability finding(s), {len(resolved_items)} resolved, "
+            f"across {len(issue_rollups)} issue(s) and {len(batch_summaries)} import batch(es)."
+        )
+        return WorkspaceVulnerabilityReport(
+            workspace_id=workspace_id,
+            total_findings=len(findings),
+            active_findings=len(active_items),
+            resolved_findings=len(resolved_items),
+            counts_by_severity=counts_by_severity,
+            counts_by_lifecycle=counts_by_lifecycle,
+            counts_by_source=counts_by_source,
+            latest_scan_batch_id=latest_batch_id,
+            latest_imported_at=latest_imported_at,
+            batches=batch_summaries,
+            top_issues=issue_rollups[:10],
+            recent_regressed_items=[item for item in findings if item.lifecycle_state == "regressed"][:12],
+            recent_resolved_items=resolved_items[:12],
+            active_items=active_items[:20],
             summary=summary,
         )
 

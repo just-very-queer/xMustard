@@ -1304,6 +1304,197 @@ reviews:
             self.assertTrue(any(item.title == "Dangerous eval use" for item in report.active_items))
             self.assertTrue(any(item.title == "Dangerous subprocess shell execution" for item in report.resolved_items))
 
+    def test_get_workspace_vulnerability_report_aggregates_across_issues(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "repo"
+            (root / "docs" / "bugs").mkdir(parents=True)
+            (root / "api" / "src").mkdir(parents=True)
+            (root / "docs" / "bugs" / "Bugs_25260323.md").write_text(LEDGER_TEXT, encoding="utf-8")
+            (root / "api" / "src" / "example.py").write_text("print('ok')\n", encoding="utf-8")
+
+            store = FileStore(Path(tmp_dir) / "data")
+            service = TrackerService(store)
+            snapshot = service.load_workspace(WorkspaceLoadRequest(root_path=str(root), auto_scan=True))
+            assert snapshot is not None
+
+            service.create_issue(
+                snapshot.workspace.workspace_id,
+                IssueCreateRequest(
+                    bug_id="P1_25M03_002",
+                    title="Secondary security bug",
+                    severity="P1",
+                    summary="Another issue for workspace rollup coverage.",
+                    impact="Cross-issue vulnerability dashboard coverage.",
+                ),
+            )
+
+            service.import_vulnerability_findings(
+                snapshot.workspace.workspace_id,
+                "P0_25M03_001",
+                VulnerabilityImportRequest(
+                    source="semgrep-json",
+                    payload=json.dumps(
+                        {
+                            "results": [
+                                {
+                                    "check_id": "python.lang.security.audit.eval-use",
+                                    "path": "api/src/example.py",
+                                    "start": {"line": 80},
+                                    "extra": {
+                                        "severity": "ERROR",
+                                        "message": "eval executes attacker-controlled expressions.",
+                                        "metadata": {"title": "Dangerous eval use", "cwe": ["CWE-95"]},
+                                    },
+                                },
+                                {
+                                    "check_id": "python.lang.security.audit.tempfile.mktemp",
+                                    "path": "api/src/example.py",
+                                    "start": {"line": 44},
+                                    "extra": {
+                                        "severity": "WARNING",
+                                        "message": "mktemp creates predictable temporary files.",
+                                        "metadata": {"title": "Predictable temporary file", "cwe": ["CWE-377"]},
+                                    },
+                                },
+                            ]
+                        }
+                    ),
+                    scan_batch_id="semgrep-batch-1",
+                    tool_version="semgrep/1.73.0",
+                    imported_at="2026-01-02T03:04:05+00:00",
+                ),
+            )
+            service.import_vulnerability_findings(
+                snapshot.workspace.workspace_id,
+                "P0_25M03_001",
+                VulnerabilityImportRequest(
+                    source="semgrep-json",
+                    payload=json.dumps(
+                        {
+                            "results": [
+                                {
+                                    "check_id": "python.lang.security.audit.tempfile.mktemp",
+                                    "path": "api/src/example.py",
+                                    "start": {"line": 44},
+                                    "extra": {
+                                        "severity": "WARNING",
+                                        "message": "mktemp creates predictable temporary files.",
+                                        "metadata": {"title": "Predictable temporary file", "cwe": ["CWE-377"]},
+                                    },
+                                },
+                                {
+                                    "check_id": "python.lang.security.audit.subprocess-shell-true",
+                                    "path": "api/src/example.py",
+                                    "start": {"line": 12},
+                                    "extra": {
+                                        "severity": "ERROR",
+                                        "message": "Shell execution reaches untrusted input.",
+                                        "metadata": {"title": "Dangerous subprocess shell execution", "cwe": ["CWE-78"]},
+                                    },
+                                },
+                            ]
+                        }
+                    ),
+                    scan_batch_id="semgrep-batch-2",
+                    tool_version="semgrep/1.74.0",
+                    imported_at="2026-01-03T03:04:05+00:00",
+                ),
+            )
+            service.import_vulnerability_findings(
+                snapshot.workspace.workspace_id,
+                "P1_25M03_002",
+                VulnerabilityImportRequest(
+                    source="trivy-json",
+                    payload=json.dumps(
+                        {
+                            "ArtifactName": "repo",
+                            "Results": [
+                                {
+                                    "Target": "api/src/example.py",
+                                    "Class": "lang-pkgs",
+                                    "Type": "pip",
+                                    "Vulnerabilities": [
+                                        {
+                                            "VulnerabilityID": "CVE-2026-4444",
+                                            "PkgName": "jinja2",
+                                            "InstalledVersion": "3.0.0",
+                                            "FixedVersion": "3.1.5",
+                                            "Severity": "CRITICAL",
+                                            "Title": "Jinja2 sandbox escape",
+                                            "Description": "Template rendering can escape the sandbox under crafted input.",
+                                            "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2026-4444",
+                                            "References": ["https://nvd.nist.gov/vuln/detail/CVE-2026-4444"],
+                                            "CweIDs": ["CWE-79"],
+                                            "Status": "affected"
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    ),
+                    scan_batch_id="trivy-batch-1",
+                    tool_version="trivy/0.51.0",
+                    imported_at="2026-01-04T03:04:05+00:00",
+                ),
+            )
+            service.import_vulnerability_findings(
+                snapshot.workspace.workspace_id,
+                "P0_25M03_001",
+                VulnerabilityImportRequest(
+                    source="semgrep-json",
+                    payload=json.dumps(
+                        {
+                            "results": [
+                                {
+                                    "check_id": "python.lang.security.audit.eval-use",
+                                    "path": "api/src/example.py",
+                                    "start": {"line": 80},
+                                    "extra": {
+                                        "severity": "ERROR",
+                                        "message": "eval executes attacker-controlled expressions.",
+                                        "metadata": {"title": "Dangerous eval use", "cwe": ["CWE-95"]},
+                                    },
+                                },
+                                {
+                                    "check_id": "python.lang.security.audit.tempfile.mktemp",
+                                    "path": "api/src/example.py",
+                                    "start": {"line": 44},
+                                    "extra": {
+                                        "severity": "WARNING",
+                                        "message": "mktemp creates predictable temporary files.",
+                                        "metadata": {"title": "Predictable temporary file", "cwe": ["CWE-377"]},
+                                    },
+                                },
+                            ]
+                        }
+                    ),
+                    scan_batch_id="semgrep-batch-3",
+                    tool_version="semgrep/1.75.0",
+                    imported_at="2026-01-05T03:04:05+00:00",
+                ),
+            )
+
+            report = service.get_workspace_vulnerability_report(snapshot.workspace.workspace_id)
+            self.assertEqual(report.total_findings, 4)
+            self.assertEqual(report.active_findings, 3)
+            self.assertEqual(report.resolved_findings, 1)
+            self.assertEqual(report.counts_by_lifecycle["resolved"], 1)
+            self.assertEqual(report.counts_by_lifecycle["existing"], 1)
+            self.assertEqual(report.counts_by_lifecycle["new"], 1)
+            self.assertEqual(report.counts_by_lifecycle["regressed"], 1)
+            self.assertEqual(report.counts_by_severity["critical"], 1)
+            self.assertEqual(report.counts_by_severity["high"], 2)
+            self.assertEqual(report.counts_by_severity["medium"], 1)
+            self.assertEqual(report.counts_by_source["semgrep-json"], 3)
+            self.assertEqual(report.counts_by_source["trivy-json"], 1)
+            self.assertEqual(report.latest_scan_batch_id, "semgrep-batch-3")
+            self.assertEqual(report.latest_imported_at, "2026-01-05T03:04:05+00:00")
+            self.assertEqual(len(report.batches), 4)
+            self.assertEqual(report.top_issues[0].issue_id, "P0_25M03_001")
+            self.assertEqual(report.top_issues[0].active_findings, 2)
+            self.assertTrue(any(item.title == "Dangerous subprocess shell execution" for item in report.recent_resolved_items))
+            self.assertTrue(any(item.title == "Dangerous eval use" for item in report.recent_regressed_items))
+
     def test_capture_issue_context_replay_persists_prompt_snapshot(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir) / "repo"

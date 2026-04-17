@@ -655,6 +655,14 @@ def read_vulnerability_finding_report(workspace_id: str, issue_id: str):
         raise HTTPException(status_code=404, detail=f"Missing resource: {exc}")
 
 
+@app.get("/api/workspaces/{workspace_id}/vulnerability-report")
+def read_workspace_vulnerability_report(workspace_id: str):
+    try:
+        return SERVICE.get_workspace_vulnerability_report(workspace_id).model_dump(mode="json")
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"Missing resource: {exc}")
+
+
 @app.post("/api/workspaces/{workspace_id}/issues/{issue_id}/vulnerability-findings")
 def save_vulnerability_finding(workspace_id: str, issue_id: str, request: VulnerabilityFindingUpsertRequest):
     try:

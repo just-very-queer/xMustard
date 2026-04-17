@@ -626,6 +626,33 @@ class VulnerabilityFindingReport(BaseModel):
     summary: str = ""
 
 
+class WorkspaceVulnerabilityIssueRollup(BaseModel):
+    issue_id: str
+    issue_title: str
+    active_findings: int = 0
+    resolved_findings: int = 0
+    critical_findings: int = 0
+    regressed_findings: int = 0
+
+
+class WorkspaceVulnerabilityReport(BaseModel):
+    workspace_id: str
+    total_findings: int = 0
+    active_findings: int = 0
+    resolved_findings: int = 0
+    counts_by_severity: dict[str, int] = Field(default_factory=dict)
+    counts_by_lifecycle: dict[str, int] = Field(default_factory=dict)
+    counts_by_source: dict[str, int] = Field(default_factory=dict)
+    latest_scan_batch_id: Optional[str] = None
+    latest_imported_at: Optional[str] = None
+    batches: list[VulnerabilityImportBatchSummary] = Field(default_factory=list)
+    top_issues: list[WorkspaceVulnerabilityIssueRollup] = Field(default_factory=list)
+    recent_regressed_items: list[VulnerabilityFindingRecord] = Field(default_factory=list)
+    recent_resolved_items: list[VulnerabilityFindingRecord] = Field(default_factory=list)
+    active_items: list[VulnerabilityFindingRecord] = Field(default_factory=list)
+    summary: str = ""
+
+
 class ReviewQueueItem(BaseModel):
     run: RunRecord
     issue: IssueRecord
