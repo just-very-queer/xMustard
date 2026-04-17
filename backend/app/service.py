@@ -126,7 +126,9 @@ from .models import (
     VerificationProfileRunRequest,
     VerifyIssueRequest,
     VulnerabilityFindingRecord,
+    VulnerabilityFindingReport,
     VulnerabilityFindingUpsertRequest,
+    VulnerabilityImportBatchSummary,
     VulnerabilityImportRequest,
     WorktreeStatus,
     WorkspaceLoadRequest,
@@ -1412,6 +1414,65 @@ class TrackerService:
         severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
         return sorted(items, key=lambda item: (severity_order.get(item.severity, 99), item.title.lower(), item.created_at))
 
+    def get_vulnerability_finding_report(self, workspace_id: str, issue_id: str) -> VulnerabilityFindingReport:
+        self._get_issue_from_snapshot(workspace_id, issue_id)
+        findings = self.list_vulnerability_findings(workspace_id, issue_id)
+        counts_by_severity = dict(sorted(Counter(item.severity for item in findings).items()))
+        counts_by_lifecycle = dict(sorted(Counter(item.lifecycle_state for item in findings).items()))
+        counts_by_source = dict(sorted(Counter(item.source for item in findings).items()))
+        active_items = [item for item in findings if item.lifecycle_state != "resolved"]
+        resolved_items = [item for item in findings if item.lifecycle_state == "resolved"]
+
+        batch_events = [
+            item for item in self.store.list_activity(workspace_id)
+            if item.issue_id == issue_id and item.action == "vulnerability_findings.imported"
+        ]
+        batch_summaries: list[VulnerabilityImportBatchSummary] = []
+        seen_batch_ids: set[str] = set()
+        for event in sorted(batch_events, key=lambda item: item.created_at, reverse=True):
+            details = event.details if isinstance(event.details, dict) else {}
+            batch_id = str(details.get("scan_batch_id") or "").strip()
+            if not batch_id or batch_id in seen_batch_ids:
+                continue
+            seen_batch_ids.add(batch_id)
+            batch_summaries.append(
+                VulnerabilityImportBatchSummary(
+                    scan_batch_id=batch_id,
+                    source=str(details.get("source") or "other"),
+                    tool_version=str(details.get("tool_version") or "").strip() or None,
+                    imported_at=str(details.get("imported_at") or event.created_at),
+                    imported_count=int(details.get("count") or 0),
+                    new_count=int(details.get("new") or 0),
+                    existing_count=int(details.get("existing") or 0),
+                    resolved_count=int(details.get("resolved") or 0),
+                    regressed_count=int(details.get("regressed") or 0),
+                    summary=event.summary,
+                )
+            )
+
+        latest_batch_id = batch_summaries[0].scan_batch_id if batch_summaries else None
+        latest_imported_at = batch_summaries[0].imported_at if batch_summaries else None
+        summary = (
+            f"{len(active_items)} active vulnerability finding(s), {len(resolved_items)} resolved, "
+            f"across {len(batch_summaries)} recorded import batch(es)."
+        )
+        return VulnerabilityFindingReport(
+            workspace_id=workspace_id,
+            issue_id=issue_id,
+            total_findings=len(findings),
+            active_findings=len(active_items),
+            resolved_findings=len(resolved_items),
+            counts_by_severity=counts_by_severity,
+            counts_by_lifecycle=counts_by_lifecycle,
+            counts_by_source=counts_by_source,
+            latest_scan_batch_id=latest_batch_id,
+            latest_imported_at=latest_imported_at,
+            batches=batch_summaries,
+            active_items=active_items[:12],
+            resolved_items=resolved_items[:12],
+            summary=summary,
+        )
+
     def save_vulnerability_finding(
         self,
         workspace_id: str,
@@ -1794,6 +1855,7 @@ class TrackerService:
                 "count": len(imported),
                 "scan_batch_id": batch_id,
                 "tool_version": tool_version,
+                "imported_at": batch_timestamp,
                 "auto_resolve_missing": auto_resolve_missing,
                 **lifecycle_counts,
             },

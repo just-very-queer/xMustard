@@ -1194,6 +1194,116 @@ reviews:
             self.assertIn("regressed", packet.prompt)
             self.assertIn("resolved", packet.prompt)
 
+    def test_get_vulnerability_finding_report_summarizes_batches(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "repo"
+            (root / "docs" / "bugs").mkdir(parents=True)
+            (root / "api" / "src").mkdir(parents=True)
+            (root / "docs" / "bugs" / "Bugs_25260323.md").write_text(LEDGER_TEXT, encoding="utf-8")
+            (root / "api" / "src" / "example.py").write_text("print('ok')\n", encoding="utf-8")
+
+            store = FileStore(Path(tmp_dir) / "data")
+            service = TrackerService(store)
+            snapshot = service.load_workspace(WorkspaceLoadRequest(root_path=str(root), auto_scan=True))
+            assert snapshot is not None
+
+            service.import_vulnerability_findings(
+                snapshot.workspace.workspace_id,
+                "P0_25M03_001",
+                VulnerabilityImportRequest(
+                    source="semgrep-json",
+                    payload=json.dumps(
+                        {
+                            "results": [
+                                {
+                                    "check_id": "python.lang.security.audit.subprocess-shell-true",
+                                    "path": "api/src/example.py",
+                                    "start": {"line": 12},
+                                    "extra": {
+                                        "severity": "ERROR",
+                                        "message": "Shell execution reaches untrusted input.",
+                                        "metadata": {"title": "Dangerous subprocess shell execution", "cwe": ["CWE-78"]},
+                                    },
+                                },
+                                {
+                                    "check_id": "python.lang.security.audit.tempfile.mktemp",
+                                    "path": "api/src/example.py",
+                                    "start": {"line": 44},
+                                    "extra": {
+                                        "severity": "WARNING",
+                                        "message": "mktemp creates predictable temporary files.",
+                                        "metadata": {"title": "Predictable temporary file", "cwe": ["CWE-377"]},
+                                    },
+                                },
+                            ]
+                        }
+                    ),
+                    scan_batch_id="semgrep-batch-1",
+                    tool_version="semgrep/1.72.0",
+                ),
+            )
+
+            service.import_vulnerability_findings(
+                snapshot.workspace.workspace_id,
+                "P0_25M03_001",
+                VulnerabilityImportRequest(
+                    source="semgrep-json",
+                    payload=json.dumps(
+                        {
+                            "results": [
+                                {
+                                    "check_id": "python.lang.security.audit.tempfile.mktemp",
+                                    "path": "api/src/example.py",
+                                    "start": {"line": 44},
+                                    "extra": {
+                                        "severity": "WARNING",
+                                        "message": "mktemp creates predictable temporary files.",
+                                        "metadata": {"title": "Predictable temporary file", "cwe": ["CWE-377"]},
+                                    },
+                                },
+                                {
+                                    "check_id": "python.lang.security.audit.eval-use",
+                                    "path": "api/src/example.py",
+                                    "start": {"line": 80},
+                                    "extra": {
+                                        "severity": "ERROR",
+                                        "message": "eval executes attacker-controlled expressions.",
+                                        "metadata": {"title": "Dangerous eval use", "cwe": ["CWE-95"]},
+                                    },
+                                },
+                            ]
+                        }
+                    ),
+                    scan_batch_id="semgrep-batch-2",
+                    tool_version="semgrep/1.73.0",
+                    imported_at="2026-01-02T03:04:05+00:00",
+                ),
+            )
+
+            report = service.get_vulnerability_finding_report(snapshot.workspace.workspace_id, "P0_25M03_001")
+            self.assertEqual(report.total_findings, 3)
+            self.assertEqual(report.active_findings, 2)
+            self.assertEqual(report.resolved_findings, 1)
+            self.assertEqual(report.counts_by_lifecycle["resolved"], 1)
+            self.assertEqual(report.counts_by_lifecycle["existing"], 1)
+            self.assertEqual(report.counts_by_lifecycle["new"], 1)
+            self.assertEqual(report.counts_by_severity["high"], 2)
+            self.assertEqual(report.counts_by_severity["medium"], 1)
+            self.assertEqual(report.counts_by_source["semgrep-json"], 3)
+            self.assertEqual(report.latest_scan_batch_id, "semgrep-batch-2")
+            self.assertEqual(report.latest_imported_at, "2026-01-02T03:04:05+00:00")
+            self.assertEqual(len(report.batches), 2)
+            latest_batch = report.batches[0]
+            self.assertEqual(latest_batch.scan_batch_id, "semgrep-batch-2")
+            self.assertEqual(latest_batch.imported_at, "2026-01-02T03:04:05+00:00")
+            self.assertEqual(latest_batch.imported_count, 2)
+            self.assertEqual(latest_batch.resolved_count, 1)
+            self.assertEqual(latest_batch.existing_count, 1)
+            self.assertEqual(latest_batch.new_count, 1)
+            self.assertEqual(latest_batch.tool_version, "semgrep/1.73.0")
+            self.assertTrue(any(item.title == "Dangerous eval use" for item in report.active_items))
+            self.assertTrue(any(item.title == "Dangerous subprocess shell execution" for item in report.resolved_items))
+
     def test_capture_issue_context_replay_persists_prompt_snapshot(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir) / "repo"

@@ -72,6 +72,7 @@
       "/api/workspaces/{workspace_id}/issues/{issue_id}/threat-models",
       "/api/workspaces/{workspace_id}/issues/{issue_id}/browser-dumps",
       "/api/workspaces/{workspace_id}/issues/{issue_id}/vulnerability-findings",
+      "/api/workspaces/{workspace_id}/issues/{issue_id}/vulnerability-report",
       "/api/workspaces/{workspace_id}/issues/{issue_id}/vulnerability-findings/import",
       "/api/workspaces/{workspace_id}/issues/{issue_id}/context-replays",
       "/api/workspaces/{workspace_id}/issues/{issue_id}/context-replays/{replay_id}/compare"
