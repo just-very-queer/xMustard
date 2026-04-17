@@ -32,6 +32,8 @@ from .models import (
     SavedIssueViewRequest,
     ThreatModelUpsertRequest,
     TicketContextUpsertRequest,
+    VulnerabilityFindingUpsertRequest,
+    VulnerabilityImportRequest,
     TerminalOpenRequest,
     TerminalResizeRequest,
     TerminalWriteRequest,
@@ -635,6 +637,43 @@ def delete_browser_dump(workspace_id: str, issue_id: str, dump_id: str):
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=f"Missing resource: {exc}")
     return {"ok": True, "dump_id": dump_id}
+
+
+@app.get("/api/workspaces/{workspace_id}/issues/{issue_id}/vulnerability-findings")
+def list_vulnerability_findings(workspace_id: str, issue_id: str):
+    try:
+        return [item.model_dump(mode="json") for item in SERVICE.list_vulnerability_findings(workspace_id, issue_id)]
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"Missing resource: {exc}")
+
+
+@app.post("/api/workspaces/{workspace_id}/issues/{issue_id}/vulnerability-findings")
+def save_vulnerability_finding(workspace_id: str, issue_id: str, request: VulnerabilityFindingUpsertRequest):
+    try:
+        return SERVICE.save_vulnerability_finding(workspace_id, issue_id, request).model_dump(mode="json")
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"Missing resource: {exc}")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/workspaces/{workspace_id}/issues/{issue_id}/vulnerability-findings/import")
+def import_vulnerability_findings(workspace_id: str, issue_id: str, request: VulnerabilityImportRequest):
+    try:
+        return [item.model_dump(mode="json") for item in SERVICE.import_vulnerability_findings(workspace_id, issue_id, request)]
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"Missing resource: {exc}")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.delete("/api/workspaces/{workspace_id}/issues/{issue_id}/vulnerability-findings/{finding_id}")
+def delete_vulnerability_finding(workspace_id: str, issue_id: str, finding_id: str):
+    try:
+        SERVICE.delete_vulnerability_finding(workspace_id, issue_id, finding_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"Missing resource: {exc}")
+    return {"ok": True, "finding_id": finding_id}
 
 
 @app.post("/api/workspaces/{workspace_id}/issues/{issue_id}/runs")
