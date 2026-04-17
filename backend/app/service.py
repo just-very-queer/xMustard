@@ -1434,6 +1434,17 @@ class TrackerService:
             source=request.source,
             severity=request.severity,
             status=request.status,
+            lifecycle_state=request.lifecycle_state,
+            scan_batch_id=request.scan_batch_id.strip() if request.scan_batch_id else (previous.scan_batch_id if previous else None),
+            tool_version=request.tool_version.strip() if request.tool_version else (previous.tool_version if previous else None),
+            first_seen_at=request.first_seen_at or (previous.first_seen_at if previous else now),
+            last_seen_at=request.last_seen_at or (previous.last_seen_at if previous else None),
+            resolved_at=(
+                None
+                if request.lifecycle_state in {"new", "existing", "regressed"}
+                else request.resolved_at if request.resolved_at is not None else (previous.resolved_at if previous else None)
+            ),
+            import_count=max(request.import_count, previous.import_count if previous else 0),
             title=request.title.strip(),
             summary=request.summary.strip(),
             rule_id=request.rule_id.strip() if request.rule_id else None,
@@ -1485,6 +1496,11 @@ class TrackerService:
         workspace_id: str,
         issue_id: str,
         payload: str,
+        *,
+        scan_batch_id: Optional[str] = None,
+        tool_version: Optional[str] = None,
+        imported_at: Optional[str] = None,
+        auto_resolve_missing: bool = True,
     ) -> list[VulnerabilityFindingRecord]:
         self._get_issue_from_snapshot(workspace_id, issue_id)
         try:
@@ -1494,7 +1510,7 @@ class TrackerService:
         if not isinstance(sarif, dict):
             raise ValueError("SARIF payload must decode to an object")
 
-        imported: list[VulnerabilityFindingRecord] = []
+        requests: list[VulnerabilityFindingUpsertRequest] = []
         runs = sarif.get("runs") if isinstance(sarif.get("runs"), list) else []
         for run in runs:
             if not isinstance(run, dict):
@@ -1509,34 +1525,30 @@ class TrackerService:
             }
             results = run.get("results") if isinstance(run.get("results"), list) else []
             for result in results:
-                if not isinstance(result, dict):
-                    continue
-                imported.append(
-                    self.save_vulnerability_finding(
-                        workspace_id,
-                        issue_id,
-                        self._build_sarif_vulnerability_request(scanner, result, rule_lookup),
-                        actor=build_activity_actor("system", "system"),
-                        action="vulnerability_finding.imported",
-                    )
-                )
-        self._record_activity(
-            workspace_id=workspace_id,
-            entity_type="issue",
-            entity_id=issue_id,
-            action="vulnerability_findings.imported",
-            summary=f"Imported {len(imported)} vulnerability finding(s) from SARIF",
-            actor=build_activity_actor("system", "system"),
-            issue_id=issue_id,
-            details={"source": "sarif", "count": len(imported)},
+                if isinstance(result, dict):
+                    requests.append(self._build_sarif_vulnerability_request(scanner, result, rule_lookup))
+        return self._persist_vulnerability_import_batch(
+            workspace_id,
+            issue_id,
+            source="sarif",
+            import_label="SARIF",
+            requests=requests,
+            scan_batch_id=scan_batch_id,
+            tool_version=tool_version,
+            imported_at=imported_at,
+            auto_resolve_missing=auto_resolve_missing,
         )
-        return imported
 
     def import_nessus_vulnerability_findings(
         self,
         workspace_id: str,
         issue_id: str,
         payload: str,
+        *,
+        scan_batch_id: Optional[str] = None,
+        tool_version: Optional[str] = None,
+        imported_at: Optional[str] = None,
+        auto_resolve_missing: bool = True,
     ) -> list[VulnerabilityFindingRecord]:
         self._get_issue_from_snapshot(workspace_id, issue_id)
         try:
@@ -1546,34 +1558,29 @@ class TrackerService:
         if not isinstance(nessus, dict):
             raise ValueError("Nessus payload must decode to an object")
 
-        imported: list[VulnerabilityFindingRecord] = []
-        for item in self._extract_nessus_items(nessus):
-            imported.append(
-                self.save_vulnerability_finding(
-                    workspace_id,
-                    issue_id,
-                    self._build_nessus_vulnerability_request(item),
-                    actor=build_activity_actor("system", "system"),
-                    action="vulnerability_finding.imported",
-                )
-            )
-        self._record_activity(
-            workspace_id=workspace_id,
-            entity_type="issue",
-            entity_id=issue_id,
-            action="vulnerability_findings.imported",
-            summary=f"Imported {len(imported)} vulnerability finding(s) from Nessus JSON",
-            actor=build_activity_actor("system", "system"),
-            issue_id=issue_id,
-            details={"source": "nessus-json", "count": len(imported)},
+        requests = [self._build_nessus_vulnerability_request(item) for item in self._extract_nessus_items(nessus)]
+        return self._persist_vulnerability_import_batch(
+            workspace_id,
+            issue_id,
+            source="nessus-json",
+            import_label="Nessus JSON",
+            requests=requests,
+            scan_batch_id=scan_batch_id,
+            tool_version=tool_version,
+            imported_at=imported_at,
+            auto_resolve_missing=auto_resolve_missing,
         )
-        return imported
 
     def import_semgrep_vulnerability_findings(
         self,
         workspace_id: str,
         issue_id: str,
         payload: str,
+        *,
+        scan_batch_id: Optional[str] = None,
+        tool_version: Optional[str] = None,
+        imported_at: Optional[str] = None,
+        auto_resolve_missing: bool = True,
     ) -> list[VulnerabilityFindingRecord]:
         self._get_issue_from_snapshot(workspace_id, issue_id)
         try:
@@ -1583,37 +1590,33 @@ class TrackerService:
         if not isinstance(semgrep, dict):
             raise ValueError("Semgrep payload must decode to an object")
 
-        imported: list[VulnerabilityFindingRecord] = []
-        results = semgrep.get("results") if isinstance(semgrep.get("results"), list) else []
-        for result in results:
-            if not isinstance(result, dict):
-                continue
-            imported.append(
-                self.save_vulnerability_finding(
-                    workspace_id,
-                    issue_id,
-                    self._build_semgrep_vulnerability_request(result),
-                    actor=build_activity_actor("system", "system"),
-                    action="vulnerability_finding.imported",
-                )
-            )
-        self._record_activity(
-            workspace_id=workspace_id,
-            entity_type="issue",
-            entity_id=issue_id,
-            action="vulnerability_findings.imported",
-            summary=f"Imported {len(imported)} vulnerability finding(s) from Semgrep JSON",
-            actor=build_activity_actor("system", "system"),
-            issue_id=issue_id,
-            details={"source": "semgrep-json", "count": len(imported)},
+        requests = [
+            self._build_semgrep_vulnerability_request(result)
+            for result in (semgrep.get("results") if isinstance(semgrep.get("results"), list) else [])
+            if isinstance(result, dict)
+        ]
+        return self._persist_vulnerability_import_batch(
+            workspace_id,
+            issue_id,
+            source="semgrep-json",
+            import_label="Semgrep JSON",
+            requests=requests,
+            scan_batch_id=scan_batch_id,
+            tool_version=tool_version,
+            imported_at=imported_at,
+            auto_resolve_missing=auto_resolve_missing,
         )
-        return imported
 
     def import_trivy_vulnerability_findings(
         self,
         workspace_id: str,
         issue_id: str,
         payload: str,
+        *,
+        scan_batch_id: Optional[str] = None,
+        tool_version: Optional[str] = None,
+        imported_at: Optional[str] = None,
+        auto_resolve_missing: bool = True,
     ) -> list[VulnerabilityFindingRecord]:
         self._get_issue_from_snapshot(workspace_id, issue_id)
         try:
@@ -1623,7 +1626,7 @@ class TrackerService:
         if not isinstance(trivy, dict):
             raise ValueError("Trivy payload must decode to an object")
 
-        imported: list[VulnerabilityFindingRecord] = []
+        requests: list[VulnerabilityFindingUpsertRequest] = []
         results = trivy.get("Results") if isinstance(trivy.get("Results"), list) else []
         for result in results:
             if not isinstance(result, dict):
@@ -1634,39 +1637,172 @@ class TrackerService:
                 if not isinstance(items, list):
                     continue
                 for item in items:
-                    if not isinstance(item, dict):
-                        continue
-                    imported.append(
-                        self.save_vulnerability_finding(
-                            workspace_id,
-                            issue_id,
-                            self._build_trivy_vulnerability_request(item, target=target, category=key),
-                            actor=build_activity_actor("system", "system"),
-                            action="vulnerability_finding.imported",
-                        )
-                    )
+                    if isinstance(item, dict):
+                        requests.append(self._build_trivy_vulnerability_request(item, target=target, category=key))
+        return self._persist_vulnerability_import_batch(
+            workspace_id,
+            issue_id,
+            source="trivy-json",
+            import_label="Trivy JSON",
+            requests=requests,
+            scan_batch_id=scan_batch_id,
+            tool_version=tool_version,
+            imported_at=imported_at,
+            auto_resolve_missing=auto_resolve_missing,
+        )
+
+    def import_vulnerability_findings(self, workspace_id: str, issue_id: str, request: VulnerabilityImportRequest) -> list[VulnerabilityFindingRecord]:
+        if request.source == "sarif":
+            return self.import_sarif_vulnerability_findings(
+                workspace_id,
+                issue_id,
+                request.payload,
+                scan_batch_id=request.scan_batch_id,
+                tool_version=request.tool_version,
+                imported_at=request.imported_at,
+                auto_resolve_missing=request.auto_resolve_missing,
+            )
+        if request.source == "nessus-json":
+            return self.import_nessus_vulnerability_findings(
+                workspace_id,
+                issue_id,
+                request.payload,
+                scan_batch_id=request.scan_batch_id,
+                tool_version=request.tool_version,
+                imported_at=request.imported_at,
+                auto_resolve_missing=request.auto_resolve_missing,
+            )
+        if request.source == "semgrep-json":
+            return self.import_semgrep_vulnerability_findings(
+                workspace_id,
+                issue_id,
+                request.payload,
+                scan_batch_id=request.scan_batch_id,
+                tool_version=request.tool_version,
+                imported_at=request.imported_at,
+                auto_resolve_missing=request.auto_resolve_missing,
+            )
+        if request.source == "trivy-json":
+            return self.import_trivy_vulnerability_findings(
+                workspace_id,
+                issue_id,
+                request.payload,
+                scan_batch_id=request.scan_batch_id,
+                tool_version=request.tool_version,
+                imported_at=request.imported_at,
+                auto_resolve_missing=request.auto_resolve_missing,
+            )
+        raise ValueError(f"Unsupported vulnerability import source: {request.source}")
+
+    def _persist_vulnerability_import_batch(
+        self,
+        workspace_id: str,
+        issue_id: str,
+        *,
+        source: str,
+        import_label: str,
+        requests: list[VulnerabilityFindingUpsertRequest],
+        scan_batch_id: Optional[str] = None,
+        tool_version: Optional[str] = None,
+        imported_at: Optional[str] = None,
+        auto_resolve_missing: bool = True,
+    ) -> list[VulnerabilityFindingRecord]:
+        batch_timestamp = imported_at or utc_now()
+        batch_id = (scan_batch_id or self._generate_vulnerability_scan_batch_id(source, issue_id, batch_timestamp)).strip()
+        existing_records = self.store.list_vulnerability_findings(workspace_id)
+        source_records = [item for item in existing_records if item.issue_id == issue_id and item.source == source]
+        existing_by_id = {item.finding_id: item for item in source_records}
+        imported: list[VulnerabilityFindingRecord] = []
+        seen_ids: set[str] = set()
+        lifecycle_counts = {"new": 0, "existing": 0, "resolved": 0, "regressed": 0}
+
+        for request in requests:
+            preview = request.finding_id or self._slug_runbook_name(f"vuln-{request.scanner}-{request.title}")
+            previous = existing_by_id.get(preview)
+            lifecycle_state = "new"
+            if previous:
+                lifecycle_state = "regressed" if previous.lifecycle_state == "resolved" or previous.resolved_at else "existing"
+            enriched_request = request.model_copy(
+                update={
+                    "lifecycle_state": lifecycle_state,
+                    "scan_batch_id": batch_id,
+                    "tool_version": tool_version or previous.tool_version if previous else tool_version,
+                    "first_seen_at": previous.first_seen_at if previous and previous.first_seen_at else batch_timestamp,
+                    "last_seen_at": batch_timestamp,
+                    "resolved_at": None,
+                    "import_count": (previous.import_count if previous else 0) + 1,
+                }
+            )
+            record = self.save_vulnerability_finding(
+                workspace_id,
+                issue_id,
+                enriched_request,
+                actor=build_activity_actor("system", "system"),
+                action="vulnerability_finding.imported",
+            )
+            imported.append(record)
+            seen_ids.add(record.finding_id)
+            lifecycle_counts[lifecycle_state] += 1
+            existing_by_id[record.finding_id] = record
+
+        if auto_resolve_missing:
+            for previous in source_records:
+                if previous.finding_id in seen_ids or previous.lifecycle_state == "resolved":
+                    continue
+                self.save_vulnerability_finding(
+                    workspace_id,
+                    issue_id,
+                    VulnerabilityFindingUpsertRequest(
+                        finding_id=previous.finding_id,
+                        scanner=previous.scanner,
+                        source=previous.source,
+                        severity=previous.severity,
+                        status=previous.status,
+                        lifecycle_state="resolved",
+                        scan_batch_id=batch_id,
+                        tool_version=tool_version or previous.tool_version,
+                        first_seen_at=previous.first_seen_at or previous.created_at,
+                        last_seen_at=batch_timestamp,
+                        resolved_at=batch_timestamp,
+                        import_count=previous.import_count,
+                        title=previous.title,
+                        summary=previous.summary,
+                        rule_id=previous.rule_id,
+                        location_path=previous.location_path,
+                        location_line=previous.location_line,
+                        cwe_ids=previous.cwe_ids,
+                        cve_ids=previous.cve_ids,
+                        references=previous.references,
+                        evidence=previous.evidence,
+                        raw_payload=previous.raw_payload,
+                    ),
+                    actor=build_activity_actor("system", "system"),
+                    action="vulnerability_finding.resolved",
+                )
+                lifecycle_counts["resolved"] += 1
+
         self._record_activity(
             workspace_id=workspace_id,
             entity_type="issue",
             entity_id=issue_id,
             action="vulnerability_findings.imported",
-            summary=f"Imported {len(imported)} vulnerability finding(s) from Trivy JSON",
+            summary=f"Imported {len(imported)} vulnerability finding(s) from {import_label}",
             actor=build_activity_actor("system", "system"),
             issue_id=issue_id,
-            details={"source": "trivy-json", "count": len(imported)},
+            details={
+                "source": source,
+                "count": len(imported),
+                "scan_batch_id": batch_id,
+                "tool_version": tool_version,
+                "auto_resolve_missing": auto_resolve_missing,
+                **lifecycle_counts,
+            },
         )
         return imported
 
-    def import_vulnerability_findings(self, workspace_id: str, issue_id: str, request: VulnerabilityImportRequest) -> list[VulnerabilityFindingRecord]:
-        if request.source == "sarif":
-            return self.import_sarif_vulnerability_findings(workspace_id, issue_id, request.payload)
-        if request.source == "nessus-json":
-            return self.import_nessus_vulnerability_findings(workspace_id, issue_id, request.payload)
-        if request.source == "semgrep-json":
-            return self.import_semgrep_vulnerability_findings(workspace_id, issue_id, request.payload)
-        if request.source == "trivy-json":
-            return self.import_trivy_vulnerability_findings(workspace_id, issue_id, request.payload)
-        raise ValueError(f"Unsupported vulnerability import source: {request.source}")
+    def _generate_vulnerability_scan_batch_id(self, source: str, issue_id: str, imported_at: str) -> str:
+        seed = "|".join([source.strip().lower(), issue_id.strip().lower(), imported_at.strip()])
+        return f"vb_{hashlib.sha1(seed.encode('utf-8')).hexdigest()[:12]}"
 
     def _normalize_vulnerability_severity(self, value) -> str:
         if isinstance(value, (int, float)):
@@ -5687,7 +5823,7 @@ Respond with a JSON object containing:
             rule_summary = " | ".join(rule_bits) if rule_bits else "No rule or taxonomy ids recorded."
             evidence_summary = "; ".join(finding.evidence[:2]) or "No scanner evidence recorded."
             vulnerability_lines.append(
-                f"- {finding.title} [{finding.scanner} / {finding.source} / {finding.severity} / {finding.status}]: "
+                f"- {finding.title} [{finding.scanner} / {finding.source} / {finding.severity} / {finding.status} / {finding.lifecycle_state}]: "
                 f"{finding.summary or 'No summary.'} Location: {location}. IDs: {rule_summary}. Evidence: {evidence_summary}"
             )
         repo_config_lines = []

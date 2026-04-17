@@ -36,6 +36,7 @@ BrowserDumpSource = Literal["mcp-chrome", "manual", "playwright", "other"]
 VulnerabilityFindingSource = Literal["manual", "nessus-json", "sarif", "semgrep-json", "trivy-json", "other"]
 VulnerabilitySeverity = Literal["critical", "high", "medium", "low", "info"]
 VulnerabilityStatus = Literal["open", "triaged", "fixing", "fixed", "verified", "closed"]
+VulnerabilityLifecycleState = Literal["new", "existing", "resolved", "regressed"]
 
 
 def utc_now() -> str:
@@ -574,6 +575,13 @@ class VulnerabilityFindingRecord(BaseModel):
     source: VulnerabilityFindingSource = "manual"
     severity: VulnerabilitySeverity = "medium"
     status: VulnerabilityStatus = "open"
+    lifecycle_state: VulnerabilityLifecycleState = "new"
+    scan_batch_id: Optional[str] = None
+    tool_version: Optional[str] = None
+    first_seen_at: Optional[str] = None
+    last_seen_at: Optional[str] = None
+    resolved_at: Optional[str] = None
+    import_count: int = 0
     title: str
     summary: str = ""
     rule_id: Optional[str] = None
@@ -844,6 +852,13 @@ class VulnerabilityFindingUpsertRequest(BaseModel):
     source: VulnerabilityFindingSource = "manual"
     severity: VulnerabilitySeverity = "medium"
     status: VulnerabilityStatus = "open"
+    lifecycle_state: VulnerabilityLifecycleState = "new"
+    scan_batch_id: Optional[str] = None
+    tool_version: Optional[str] = None
+    first_seen_at: Optional[str] = None
+    last_seen_at: Optional[str] = None
+    resolved_at: Optional[str] = None
+    import_count: int = 0
     title: str
     summary: str = ""
     rule_id: Optional[str] = None
@@ -859,6 +874,10 @@ class VulnerabilityFindingUpsertRequest(BaseModel):
 class VulnerabilityImportRequest(BaseModel):
     source: VulnerabilityFindingSource
     payload: str
+    scan_batch_id: Optional[str] = None
+    tool_version: Optional[str] = None
+    imported_at: Optional[str] = None
+    auto_resolve_missing: bool = True
 
 
 class VerifyIssueRequest(BaseModel):
