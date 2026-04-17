@@ -27,6 +27,7 @@ from .models import (
     VerificationProfileRecord,
     VerificationProfileExecutionResult,
     VerificationRecord,
+    VulnerabilityFindingRecord,
     WorkspaceRecord,
     WorkspaceSnapshot,
 )
@@ -126,6 +127,9 @@ class FileStore:
 
     def browser_dumps_path(self, workspace_id: str) -> Path:
         return self.workspace_dir(workspace_id) / "browser_dumps.json"
+
+    def vulnerability_findings_path(self, workspace_id: str) -> Path:
+        return self.workspace_dir(workspace_id) / "vulnerability_findings.json"
 
     def eval_scenarios_path(self, workspace_id: str) -> Path:
         return self.workspace_dir(workspace_id) / "eval_scenarios.json"
@@ -281,6 +285,18 @@ class FileStore:
         ordered = sorted(dumps, key=lambda item: item.updated_at, reverse=True)
         self._write_json(
             self.browser_dumps_path(workspace_id),
+            [item.model_dump(mode="json") for item in ordered],
+        )
+
+    def list_vulnerability_findings(self, workspace_id: str) -> list[VulnerabilityFindingRecord]:
+        data = self._read_json(self.vulnerability_findings_path(workspace_id), [])
+        items = [VulnerabilityFindingRecord.model_validate(item) for item in data]
+        return sorted(items, key=lambda item: (item.issue_id, item.severity, item.title.lower(), item.created_at))
+
+    def save_vulnerability_findings(self, workspace_id: str, findings: list[VulnerabilityFindingRecord]) -> None:
+        ordered = sorted(findings, key=lambda item: (item.issue_id, item.severity, item.title.lower(), item.created_at))
+        self._write_json(
+            self.vulnerability_findings_path(workspace_id),
             [item.model_dump(mode="json") for item in ordered],
         )
 

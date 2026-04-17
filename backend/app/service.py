@@ -125,6 +125,9 @@ from .models import (
     VerificationSummary,
     VerificationProfileRunRequest,
     VerifyIssueRequest,
+    VulnerabilityFindingRecord,
+    VulnerabilityFindingUpsertRequest,
+    VulnerabilityImportRequest,
     WorktreeStatus,
     WorkspaceLoadRequest,
     WorkspaceRecord,
@@ -208,6 +211,7 @@ class TrackerService:
         verification_profiles = self.list_verification_profiles(workspace_id)
         ticket_contexts = self.list_ticket_contexts(workspace_id)
         threat_models = self.list_threat_models(workspace_id)
+        vulnerability_findings = self.list_vulnerability_findings(workspace_id)
 
         issues: list[IssueRecord] = parse_ledger(ledger_path) if ledger_path else []
         if verdict_paths and issues:
@@ -231,6 +235,7 @@ class TrackerService:
                 verification_profiles,
                 ticket_contexts,
                 threat_models,
+                vulnerability_findings,
             )
         )
         drift_summary = self._build_drift_summary(issues)
@@ -251,6 +256,7 @@ class TrackerService:
             "runbooks_total": len(runbooks),
             "ticket_contexts_total": len(ticket_contexts),
             "threat_models_total": len(threat_models),
+            "vulnerability_findings_total": len(vulnerability_findings),
             "repo_map_files": repo_map.total_files,
             "tree_files": tree_summary["files"],
             "tree_directories": tree_summary["directories"],
@@ -1398,6 +1404,565 @@ class TrackerService:
             details={"dump_id": dump_id},
         )
 
+    def list_vulnerability_findings(self, workspace_id: str, issue_id: Optional[str] = None) -> list[VulnerabilityFindingRecord]:
+        self.get_workspace(workspace_id)
+        items = self.store.list_vulnerability_findings(workspace_id)
+        if issue_id:
+            items = [item for item in items if item.issue_id == issue_id]
+        severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+        return sorted(items, key=lambda item: (severity_order.get(item.severity, 99), item.title.lower(), item.created_at))
+
+    def save_vulnerability_finding(
+        self,
+        workspace_id: str,
+        issue_id: str,
+        request: VulnerabilityFindingUpsertRequest,
+        *,
+        actor: Optional[ActivityActor] = None,
+        action: str = "vulnerability_finding.saved",
+    ) -> VulnerabilityFindingRecord:
+        self._get_issue_from_snapshot(workspace_id, issue_id)
+        existing = self.store.list_vulnerability_findings(workspace_id)
+        finding_id = request.finding_id or self._slug_runbook_name(f"vuln-{request.scanner}-{request.title}")
+        previous = next((item for item in existing if item.finding_id == finding_id and item.issue_id == issue_id), None)
+        now = utc_now()
+        record = VulnerabilityFindingRecord(
+            finding_id=finding_id,
+            workspace_id=workspace_id,
+            issue_id=issue_id,
+            scanner=request.scanner.strip(),
+            source=request.source,
+            severity=request.severity,
+            status=request.status,
+            title=request.title.strip(),
+            summary=request.summary.strip(),
+            rule_id=request.rule_id.strip() if request.rule_id else None,
+            location_path=request.location_path.strip() if request.location_path else None,
+            location_line=request.location_line,
+            cwe_ids=self._normalize_text_list(request.cwe_ids, limit=12),
+            cve_ids=self._normalize_text_list(request.cve_ids, limit=12),
+            references=self._normalize_text_list(request.references, limit=12),
+            evidence=self._normalize_text_list(request.evidence, limit=12),
+            raw_payload=request.raw_payload.strip() if request.raw_payload else None,
+            created_at=previous.created_at if previous else now,
+            updated_at=now,
+        )
+        remaining = [item for item in existing if not (item.finding_id == finding_id and item.issue_id == issue_id)]
+        remaining.append(record)
+        self.store.save_vulnerability_findings(workspace_id, remaining)
+        self._record_activity(
+            workspace_id=workspace_id,
+            entity_type="issue",
+            entity_id=issue_id,
+            action=action,
+            summary=f"Saved vulnerability finding {record.title}",
+            actor=actor or build_activity_actor("operator", "operator"),
+            issue_id=issue_id,
+            details={"finding_id": finding_id, "scanner": record.scanner, "severity": record.severity, "status": record.status},
+        )
+        return record
+
+    def delete_vulnerability_finding(self, workspace_id: str, issue_id: str, finding_id: str) -> None:
+        self._get_issue_from_snapshot(workspace_id, issue_id)
+        existing = self.store.list_vulnerability_findings(workspace_id)
+        remaining = [item for item in existing if not (item.finding_id == finding_id and item.issue_id == issue_id)]
+        if len(remaining) == len(existing):
+            raise FileNotFoundError(finding_id)
+        self.store.save_vulnerability_findings(workspace_id, remaining)
+        self._record_activity(
+            workspace_id=workspace_id,
+            entity_type="issue",
+            entity_id=issue_id,
+            action="vulnerability_finding.deleted",
+            summary=f"Deleted vulnerability finding {finding_id}",
+            actor=build_activity_actor("operator", "operator"),
+            issue_id=issue_id,
+            details={"finding_id": finding_id},
+        )
+
+    def import_sarif_vulnerability_findings(
+        self,
+        workspace_id: str,
+        issue_id: str,
+        payload: str,
+    ) -> list[VulnerabilityFindingRecord]:
+        self._get_issue_from_snapshot(workspace_id, issue_id)
+        try:
+            sarif = json.loads(payload)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid SARIF payload: {exc}")
+        if not isinstance(sarif, dict):
+            raise ValueError("SARIF payload must decode to an object")
+
+        imported: list[VulnerabilityFindingRecord] = []
+        runs = sarif.get("runs") if isinstance(sarif.get("runs"), list) else []
+        for run in runs:
+            if not isinstance(run, dict):
+                continue
+            driver = ((run.get("tool") or {}).get("driver") or {}) if isinstance(run.get("tool"), dict) else {}
+            scanner = str(driver.get("name") or "sarif").strip() or "sarif"
+            rules = driver.get("rules") if isinstance(driver.get("rules"), list) else []
+            rule_lookup = {
+                str(rule.get("id")): rule
+                for rule in rules
+                if isinstance(rule, dict) and rule.get("id")
+            }
+            results = run.get("results") if isinstance(run.get("results"), list) else []
+            for result in results:
+                if not isinstance(result, dict):
+                    continue
+                imported.append(
+                    self.save_vulnerability_finding(
+                        workspace_id,
+                        issue_id,
+                        self._build_sarif_vulnerability_request(scanner, result, rule_lookup),
+                        actor=build_activity_actor("system", "system"),
+                        action="vulnerability_finding.imported",
+                    )
+                )
+        self._record_activity(
+            workspace_id=workspace_id,
+            entity_type="issue",
+            entity_id=issue_id,
+            action="vulnerability_findings.imported",
+            summary=f"Imported {len(imported)} vulnerability finding(s) from SARIF",
+            actor=build_activity_actor("system", "system"),
+            issue_id=issue_id,
+            details={"source": "sarif", "count": len(imported)},
+        )
+        return imported
+
+    def import_nessus_vulnerability_findings(
+        self,
+        workspace_id: str,
+        issue_id: str,
+        payload: str,
+    ) -> list[VulnerabilityFindingRecord]:
+        self._get_issue_from_snapshot(workspace_id, issue_id)
+        try:
+            nessus = json.loads(payload)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid Nessus payload: {exc}")
+        if not isinstance(nessus, dict):
+            raise ValueError("Nessus payload must decode to an object")
+
+        imported: list[VulnerabilityFindingRecord] = []
+        for item in self._extract_nessus_items(nessus):
+            imported.append(
+                self.save_vulnerability_finding(
+                    workspace_id,
+                    issue_id,
+                    self._build_nessus_vulnerability_request(item),
+                    actor=build_activity_actor("system", "system"),
+                    action="vulnerability_finding.imported",
+                )
+            )
+        self._record_activity(
+            workspace_id=workspace_id,
+            entity_type="issue",
+            entity_id=issue_id,
+            action="vulnerability_findings.imported",
+            summary=f"Imported {len(imported)} vulnerability finding(s) from Nessus JSON",
+            actor=build_activity_actor("system", "system"),
+            issue_id=issue_id,
+            details={"source": "nessus-json", "count": len(imported)},
+        )
+        return imported
+
+    def import_vulnerability_findings(self, workspace_id: str, issue_id: str, request: VulnerabilityImportRequest) -> list[VulnerabilityFindingRecord]:
+        if request.source == "sarif":
+            return self.import_sarif_vulnerability_findings(workspace_id, issue_id, request.payload)
+        if request.source == "nessus-json":
+            return self.import_nessus_vulnerability_findings(workspace_id, issue_id, request.payload)
+        if request.source == "semgrep-json":
+            return self.import_semgrep_vulnerability_findings(workspace_id, issue_id, request.payload)
+        if request.source == "trivy-json":
+            return self.import_trivy_vulnerability_findings(workspace_id, issue_id, request.payload)
+        raise ValueError(f"Unsupported vulnerability import source: {request.source}")
+
+    def import_semgrep_vulnerability_findings(
+        self,
+        workspace_id: str,
+        issue_id: str,
+        payload: str,
+    ) -> list[VulnerabilityFindingRecord]:
+        self._get_issue_from_snapshot(workspace_id, issue_id)
+        try:
+            semgrep = json.loads(payload)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid Semgrep payload: {exc}")
+        if not isinstance(semgrep, dict):
+            raise ValueError("Semgrep payload must decode to an object")
+
+        imported: list[VulnerabilityFindingRecord] = []
+        for item in self._extract_semgrep_items(semgrep):
+            imported.append(
+                self.save_vulnerability_finding(
+                    workspace_id,
+                    issue_id,
+                    self._build_semgrep_vulnerability_request(item),
+                    actor=build_activity_actor("system", "system"),
+                    action="vulnerability_finding.imported",
+                )
+            )
+        self._record_activity(
+            workspace_id=workspace_id,
+            entity_type="issue",
+            entity_id=issue_id,
+            action="vulnerability_findings.imported",
+            summary=f"Imported {len(imported)} vulnerability finding(s) from Semgrep JSON",
+            actor=build_activity_actor("system", "system"),
+            issue_id=issue_id,
+            details={"source": "semgrep-json", "count": len(imported)},
+        )
+        return imported
+
+    def import_trivy_vulnerability_findings(
+        self,
+        workspace_id: str,
+        issue_id: str,
+        payload: str,
+    ) -> list[VulnerabilityFindingRecord]:
+        self._get_issue_from_snapshot(workspace_id, issue_id)
+        try:
+            trivy = json.loads(payload)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid Trivy payload: {exc}")
+        if not isinstance(trivy, dict):
+            raise ValueError("Trivy payload must decode to an object")
+
+        imported: list[VulnerabilityFindingRecord] = []
+        for item in self._extract_trivy_items(trivy):
+            imported.append(
+                self.save_vulnerability_finding(
+                    workspace_id,
+                    issue_id,
+                    self._build_trivy_vulnerability_request(item),
+                    actor=build_activity_actor("system", "system"),
+                    action="vulnerability_finding.imported",
+                )
+            )
+        self._record_activity(
+            workspace_id=workspace_id,
+            entity_type="issue",
+            entity_id=issue_id,
+            action="vulnerability_findings.imported",
+            summary=f"Imported {len(imported)} vulnerability finding(s) from Trivy JSON",
+            actor=build_activity_actor("system", "system"),
+            issue_id=issue_id,
+            details={"source": "trivy-json", "count": len(imported)},
+        )
+        return imported
+
+    def _normalize_vulnerability_severity(self, value) -> str:
+        if isinstance(value, (int, float)):
+            numeric = float(value)
+            if numeric >= 4:
+                return "critical"
+            if numeric >= 3:
+                return "high"
+            if numeric >= 2:
+                return "medium"
+            if numeric >= 1:
+                return "low"
+            return "info"
+        text = str(value or "").strip().lower()
+        if text in {"critical", "crit", "4", "very-high"}:
+            return "critical"
+        if text in {"high", "error", "3", "important"}:
+            return "high"
+        if text in {"medium", "moderate", "warning", "warn", "2"}:
+            return "medium"
+        if text in {"low", "note", "1"}:
+            return "low"
+        return "info"
+
+    def _extract_vulnerability_taxonomy_ids(self, values: list[str]) -> tuple[list[str], list[str]]:
+        cwe_ids: list[str] = []
+        cve_ids: list[str] = []
+        for raw in values:
+            text = str(raw or "")
+            for cwe in re.findall(r"CWE-\d+", text, flags=re.IGNORECASE):
+                normalized = cwe.upper()
+                if normalized not in cwe_ids:
+                    cwe_ids.append(normalized)
+            for cve in re.findall(r"CVE-\d{4}-\d+", text, flags=re.IGNORECASE):
+                normalized = cve.upper()
+                if normalized not in cve_ids:
+                    cve_ids.append(normalized)
+        return cwe_ids[:12], cve_ids[:12]
+
+    def _stable_vulnerability_finding_id(
+        self,
+        source: str,
+        scanner: str,
+        rule_id: Optional[str],
+        title: str,
+        location_path: Optional[str],
+        location_line: Optional[int],
+    ) -> str:
+        seed = "|".join(
+            [
+                source.strip().lower(),
+                scanner.strip().lower(),
+                (rule_id or "").strip().lower(),
+                title.strip().lower(),
+                (location_path or "").strip().lower(),
+                str(location_line or ""),
+            ]
+        )
+        return f"vf_{hashlib.sha1(seed.encode('utf-8')).hexdigest()[:12]}"
+
+    def _build_sarif_vulnerability_request(
+        self,
+        scanner: str,
+        result: dict,
+        rule_lookup: dict[str, dict],
+    ) -> VulnerabilityFindingUpsertRequest:
+        rule_id = str(result.get("ruleId") or result.get("rule_id") or "").strip() or None
+        rule = rule_lookup.get(rule_id or "", {}) if isinstance(rule_lookup, dict) else {}
+        message = ((result.get("message") or {}).get("text") if isinstance(result.get("message"), dict) else None) or ""
+        short_description = ((rule.get("shortDescription") or {}).get("text") if isinstance(rule.get("shortDescription"), dict) else None) or ""
+        help_uri = str(rule.get("helpUri") or rule.get("help_uri") or "").strip() or None
+        properties = result.get("properties") if isinstance(result.get("properties"), dict) else {}
+        if not properties and isinstance(rule.get("properties"), dict):
+            properties = rule.get("properties")
+        tags = properties.get("tags") if isinstance(properties.get("tags"), list) else []
+        location_path = None
+        location_line = None
+        locations = result.get("locations") if isinstance(result.get("locations"), list) else []
+        if locations:
+            first_location = locations[0] if isinstance(locations[0], dict) else {}
+            physical = first_location.get("physicalLocation") if isinstance(first_location.get("physicalLocation"), dict) else {}
+            artifact = physical.get("artifactLocation") if isinstance(physical.get("artifactLocation"), dict) else {}
+            region = physical.get("region") if isinstance(physical.get("region"), dict) else {}
+            location_path = str(artifact.get("uri") or artifact.get("uriBaseId") or "").strip() or None
+            location_line = region.get("startLine") if isinstance(region.get("startLine"), int) else None
+        severity = self._normalize_vulnerability_severity(
+            properties.get("security-severity") or result.get("level") or properties.get("problem.severity")
+        )
+        cwe_ids, cve_ids = self._extract_vulnerability_taxonomy_ids([*tags, rule_id or "", message, short_description])
+        title = short_description or rule_id or message or "SARIF finding"
+        return VulnerabilityFindingUpsertRequest(
+            finding_id=self._stable_vulnerability_finding_id("sarif", scanner, rule_id, title, location_path, location_line),
+            scanner=scanner,
+            source="sarif",
+            severity=severity,
+            status="open",
+            title=title,
+            summary=message.strip(),
+            rule_id=rule_id,
+            location_path=location_path,
+            location_line=location_line,
+            cwe_ids=cwe_ids,
+            cve_ids=cve_ids,
+            references=[item for item in [help_uri] if item],
+            evidence=[item for item in [message.strip()] if item],
+            raw_payload=json.dumps(result, sort_keys=True),
+        )
+
+    def _extract_nessus_items(self, payload: dict) -> list[dict]:
+        items: list[dict] = []
+        for key in ("findings", "vulnerabilities", "issues", "results"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                items.extend(item for item in value if isinstance(item, dict))
+        report_hosts = payload.get("ReportHost")
+        if isinstance(report_hosts, list):
+            for host in report_hosts:
+                if not isinstance(host, dict):
+                    continue
+                report_items = host.get("ReportItem")
+                if isinstance(report_items, list):
+                    for item in report_items:
+                        if isinstance(item, dict):
+                            enriched = dict(item)
+                            if host.get("name") and not enriched.get("host"):
+                                enriched["host"] = host.get("name")
+                            items.append(enriched)
+        hosts = payload.get("hosts")
+        if isinstance(hosts, list):
+            for host in hosts:
+                if not isinstance(host, dict):
+                    continue
+                for key in ("findings", "items", "report_items", "vulnerabilities"):
+                    value = host.get(key)
+                    if isinstance(value, list):
+                        for item in value:
+                            if isinstance(item, dict):
+                                enriched = dict(item)
+                                if host.get("host") and not enriched.get("host"):
+                                    enriched["host"] = host.get("host")
+                                items.append(enriched)
+        return items
+
+    def _extract_semgrep_items(self, payload: dict) -> list[dict]:
+        items: list[dict] = []
+        for key in ("results", "findings"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                for item in value:
+                    if isinstance(item, dict):
+                        items.append(item)
+        return items
+
+    def _extract_trivy_items(self, payload: dict) -> list[dict]:
+        items: list[dict] = []
+        results = payload.get("Results") if isinstance(payload.get("Results"), list) else payload.get("results")
+        if isinstance(results, list):
+            for result in results:
+                if not isinstance(result, dict):
+                    continue
+                vulnerabilities = result.get("Vulnerabilities") if isinstance(result.get("Vulnerabilities"), list) else result.get("vulnerabilities")
+                if not isinstance(vulnerabilities, list):
+                    continue
+                for vulnerability in vulnerabilities:
+                    if not isinstance(vulnerability, dict):
+                        continue
+                    enriched = dict(vulnerability)
+                    for key in ("Target", "Class", "Type", "ArtifactName"):
+                        if result.get(key) and not enriched.get(key):
+                            enriched[key] = result.get(key)
+                    items.append(enriched)
+        return items
+
+    def _build_nessus_vulnerability_request(self, item: dict) -> VulnerabilityFindingUpsertRequest:
+        plugin_id = item.get("plugin_id") or item.get("pluginID") or item.get("pluginId")
+        plugin_name = str(item.get("plugin_name") or item.get("pluginName") or item.get("name") or item.get("synopsis") or "Nessus finding").strip()
+        summary = str(item.get("synopsis") or item.get("description") or item.get("plugin_output") or item.get("output") or "").strip()
+        severity = self._normalize_vulnerability_severity(item.get("risk_factor") or item.get("severity"))
+        location_path = str(item.get("path") or item.get("file") or item.get("uri") or "").strip() or None
+        location_line = item.get("line") if isinstance(item.get("line"), int) else None
+        references = item.get("see_also") or item.get("references") or []
+        if not isinstance(references, list):
+            references = [str(references)] if references else []
+        taxonomy_inputs = []
+        for key in ("cwe", "cwe_ids", "cve", "cves"):
+            value = item.get(key)
+            if isinstance(value, list):
+                taxonomy_inputs.extend(str(v) for v in value)
+            elif value:
+                taxonomy_inputs.append(str(value))
+        cwe_ids, cve_ids = self._extract_vulnerability_taxonomy_ids(taxonomy_inputs)
+        rule_id = f"plugin-{plugin_id}" if plugin_id is not None else None
+        evidence_parts = [
+            str(item.get("plugin_output") or "").strip(),
+            str(item.get("description") or "").strip(),
+            str(item.get("solution") or "").strip(),
+        ]
+        return VulnerabilityFindingUpsertRequest(
+            finding_id=self._stable_vulnerability_finding_id("nessus-json", "nessus", rule_id, plugin_name, location_path, location_line),
+            scanner="nessus",
+            source="nessus-json",
+            severity=severity,
+            status="open",
+            title=plugin_name,
+            summary=summary,
+            rule_id=rule_id,
+            location_path=location_path,
+            location_line=location_line,
+            cwe_ids=cwe_ids,
+            cve_ids=cve_ids,
+            references=self._normalize_text_list([str(item) for item in references], limit=12),
+            evidence=self._normalize_text_list([part for part in evidence_parts if part], limit=12),
+            raw_payload=json.dumps(item, sort_keys=True),
+        )
+
+    def _build_semgrep_vulnerability_request(self, item: dict) -> VulnerabilityFindingUpsertRequest:
+        extra = item.get("extra") if isinstance(item.get("extra"), dict) else {}
+        metadata = extra.get("metadata") if isinstance(extra.get("metadata"), dict) else {}
+        rule_id = str(item.get("check_id") or item.get("rule_id") or item.get("id") or "").strip() or None
+        title = str(metadata.get("title") or rule_id or extra.get("message") or item.get("message") or "Semgrep finding").strip()
+        summary = str(extra.get("message") or item.get("message") or metadata.get("description") or "").strip()
+        severity = self._normalize_vulnerability_severity(extra.get("severity") or item.get("severity") or metadata.get("severity"))
+        location_path = str(item.get("path") or item.get("file") or "").strip() or None
+        start = item.get("start") if isinstance(item.get("start"), dict) else {}
+        location_line = start.get("line") if isinstance(start.get("line"), int) else item.get("line") if isinstance(item.get("line"), int) else None
+        references: list[str] = []
+        for candidate in (metadata.get("references"), item.get("references")):
+            if isinstance(candidate, list):
+                references.extend(str(value) for value in candidate if str(value).strip())
+            elif candidate:
+                references.append(str(candidate))
+        taxonomy_inputs: list[str] = [rule_id or "", title, summary]
+        for key in ("cwe", "cwe_ids", "cve", "cves"):
+            value = metadata.get(key)
+            if isinstance(value, list):
+                taxonomy_inputs.extend(str(entry) for entry in value)
+            elif value:
+                taxonomy_inputs.append(str(value))
+        cwe_ids, cve_ids = self._extract_vulnerability_taxonomy_ids(taxonomy_inputs)
+        evidence_parts = [
+            str(extra.get("lines") or "").strip(),
+            str(metadata.get("impact") or "").strip(),
+            str(item.get("path") or "").strip(),
+        ]
+        return VulnerabilityFindingUpsertRequest(
+            finding_id=self._stable_vulnerability_finding_id("semgrep-json", "semgrep", rule_id, title, location_path, location_line),
+            scanner="semgrep",
+            source="semgrep-json",
+            severity=severity,
+            status="open",
+            title=title,
+            summary=summary,
+            rule_id=rule_id,
+            location_path=location_path,
+            location_line=location_line,
+            cwe_ids=cwe_ids,
+            cve_ids=cve_ids,
+            references=self._normalize_text_list(references, limit=12),
+            evidence=self._normalize_text_list([part for part in evidence_parts if part], limit=12),
+            raw_payload=json.dumps(item, sort_keys=True),
+        )
+
+    def _build_trivy_vulnerability_request(self, item: dict) -> VulnerabilityFindingUpsertRequest:
+        vuln_id = str(item.get("VulnerabilityID") or item.get("vulnerability_id") or item.get("ID") or item.get("Name") or "").strip() or None
+        title = str(item.get("Title") or item.get("PkgName") or vuln_id or "Trivy finding").strip()
+        summary = str(item.get("Description") or item.get("DescriptionText") or item.get("InstalledTitle") or "").strip()
+        severity = self._normalize_vulnerability_severity(item.get("Severity") or item.get("severity"))
+        location_path = str(item.get("PkgPath") or item.get("Target") or item.get("FilePath") or item.get("Path") or "").strip() or None
+        location_line = item.get("Line") if isinstance(item.get("Line"), int) else item.get("line") if isinstance(item.get("line"), int) else None
+        references: list[str] = []
+        for candidate in (item.get("PrimaryURL"), item.get("References"), item.get("references")):
+            if isinstance(candidate, list):
+                references.extend(str(value) for value in candidate if str(value).strip())
+            elif candidate:
+                references.append(str(candidate))
+        taxonomy_inputs: list[str] = [vuln_id or "", title, summary]
+        for key in ("CweIDs", "cwe_ids", "CVEIDs", "cves"):
+            value = item.get(key)
+            if isinstance(value, list):
+                taxonomy_inputs.extend(str(entry) for entry in value)
+            elif value:
+                taxonomy_inputs.append(str(value))
+        cwe_ids, cve_ids = self._extract_vulnerability_taxonomy_ids(taxonomy_inputs)
+        package_name = str(item.get("PkgName") or item.get("PackageName") or "").strip()
+        installed_version = str(item.get("InstalledVersion") or "").strip()
+        fixed_version = str(item.get("FixedVersion") or "").strip()
+        evidence_parts = [
+            package_name,
+            f"Installed: {installed_version}" if installed_version else "",
+            f"Fixed: {fixed_version}" if fixed_version else "",
+            str(item.get("Target") or "").strip(),
+        ]
+        return VulnerabilityFindingUpsertRequest(
+            finding_id=self._stable_vulnerability_finding_id("trivy-json", "trivy", vuln_id, title, location_path, location_line),
+            scanner="trivy",
+            source="trivy-json",
+            severity=severity,
+            status="open",
+            title=title,
+            summary=summary,
+            rule_id=vuln_id,
+            location_path=location_path,
+            location_line=location_line,
+            cwe_ids=cwe_ids,
+            cve_ids=cve_ids,
+            references=self._normalize_text_list(references, limit=12),
+            evidence=self._normalize_text_list([part for part in evidence_parts if part], limit=12),
+            raw_payload=json.dumps(item, sort_keys=True),
+        )
+
     def list_eval_scenarios(self, workspace_id: str, issue_id: Optional[str] = None) -> list[EvalScenarioRecord]:
         self.get_workspace(workspace_id)
         items = self.store.list_eval_scenarios(workspace_id)
@@ -1996,9 +2561,10 @@ class TrackerService:
         ticket_contexts = self.list_ticket_contexts(workspace_id, issue_id=issue_id)
         threat_models = self.list_threat_models(workspace_id, issue_id=issue_id)
         browser_dumps = self.list_browser_dumps(workspace_id, issue_id=issue_id)
+        vulnerability_findings = self.list_vulnerability_findings(workspace_id, issue_id=issue_id)
         repo_map = self.read_repo_map(workspace_id)
         repo_config = self.read_workspace_repo_config(workspace_id)
-        related_paths = self._rank_related_paths(issue, tree_focus, ticket_contexts, repo_map)
+        related_paths = self._rank_related_paths(issue, tree_focus, ticket_contexts, vulnerability_findings, repo_map)
         matched_path_instructions = self._match_repo_path_instructions(
             repo_config,
             [*tree_focus, *related_paths, *(item.normalized_path or item.path for item in evidence_bundle)],
@@ -2012,6 +2578,7 @@ class TrackerService:
             ticket_contexts,
             threat_models,
             browser_dumps,
+            vulnerability_findings,
             recent_fixes,
             recent_activity,
             related_paths,
@@ -2029,6 +2596,7 @@ class TrackerService:
             ticket_contexts,
             threat_models,
             browser_dumps,
+            vulnerability_findings,
             related_paths,
             repo_map,
             dynamic_context,
@@ -2050,6 +2618,7 @@ class TrackerService:
             ticket_contexts=ticket_contexts,
             threat_models=threat_models,
             browser_dumps=browser_dumps,
+            vulnerability_findings=vulnerability_findings,
             repo_map=repo_map,
             dynamic_context=dynamic_context,
             repo_config=repo_config,
@@ -4352,6 +4921,7 @@ Respond with a JSON object containing:
             threat_models=self.list_threat_models(workspace_id),
             context_replays=self.list_issue_context_replays(workspace_id),
             browser_dumps=self.list_browser_dumps(workspace_id),
+            vulnerability_findings=self.list_vulnerability_findings(workspace_id),
             eval_scenarios=self.list_eval_scenarios(workspace_id),
             verifications=self.store.list_verifications(workspace_id),
             activity=self.store.list_activity(workspace_id),
@@ -4545,6 +5115,7 @@ Respond with a JSON object containing:
         verification_profiles: list[VerificationProfileRecord],
         ticket_contexts: list[TicketContextRecord],
         threat_models: list[ThreatModelRecord],
+        vulnerability_findings: list[VulnerabilityFindingRecord],
     ) -> list[SourceRecord]:
         sources: list[SourceRecord] = []
         tracker_path = self.store.tracker_issues_path(workspace_id)
@@ -4636,6 +5207,19 @@ Respond with a JSON object containing:
                     record_count=len(threat_models),
                     modified_at=utc_now(),
                     notes="Issue-level threat models with assets, trust boundaries, abuse paths, and mitigations.",
+                )
+            )
+        vulnerability_findings_path = self.store.vulnerability_findings_path(workspace_id)
+        if vulnerability_findings_path.exists():
+            sources.append(
+                SourceRecord(
+                    source_id=f"src_{hashlib.sha1(str(vulnerability_findings_path).encode('utf-8')).hexdigest()[:10]}",
+                    kind="fix_record",
+                    label=vulnerability_findings_path.name,
+                    path=str(vulnerability_findings_path),
+                    record_count=len(vulnerability_findings),
+                    modified_at=utc_now(),
+                    notes="Normalized vulnerability findings imported from scanners and linked to issues.",
                 )
             )
         repo_map_path = self.store.repo_map_path(workspace_id)
@@ -4968,6 +5552,7 @@ Respond with a JSON object containing:
         ticket_contexts: list[TicketContextRecord],
         threat_models: list[ThreatModelRecord],
         browser_dumps: list[BrowserDumpRecord],
+        vulnerability_findings: list[VulnerabilityFindingRecord],
         related_paths: list[str],
         repo_map: RepoMapSummary,
         dynamic_context: Optional[DynamicContextBundle],
@@ -5046,6 +5631,24 @@ Respond with a JSON object containing:
                 f"- {browser_dump.label} [{browser_dump.source}]: {browser_dump.summary or page_summary}. "
                 f"Console: {console_excerpt}. Network: {network_excerpt}. DOM excerpt: {dom_excerpt}"
             )
+        vulnerability_lines = []
+        for finding in vulnerability_findings[:4]:
+            location = finding.location_path or "No file location recorded."
+            if finding.location_line:
+                location = f"{location}:{finding.location_line}"
+            rule_bits = []
+            if finding.rule_id:
+                rule_bits.append(finding.rule_id)
+            if finding.cwe_ids:
+                rule_bits.append(", ".join(finding.cwe_ids[:3]))
+            if finding.cve_ids:
+                rule_bits.append(", ".join(finding.cve_ids[:2]))
+            rule_summary = " | ".join(rule_bits) if rule_bits else "No rule or taxonomy ids recorded."
+            evidence_summary = "; ".join(finding.evidence[:2]) or "No scanner evidence recorded."
+            vulnerability_lines.append(
+                f"- {finding.title} [{finding.scanner} / {finding.source} / {finding.severity} / {finding.status}]: "
+                f"{finding.summary or 'No summary.'} Location: {location}. IDs: {rule_summary}. Evidence: {evidence_summary}"
+            )
         repo_config_lines = []
         if repo_config:
             if repo_config.description:
@@ -5095,6 +5698,7 @@ Respond with a JSON object containing:
             f"Prior fix history:\n{chr(10).join(fix_lines) if fix_lines else '- No prior fixes recorded.'}\n\n"
             f"Ticket context:\n{chr(10).join(ticket_lines) if ticket_lines else '- No linked ticket context recorded.'}\n\n"
             f"Threat model:\n{chr(10).join(threat_lines) if threat_lines else '- No threat model recorded yet.'}\n\n"
+            f"Vulnerability findings:\n{chr(10).join(vulnerability_lines) if vulnerability_lines else '- No vulnerability findings recorded yet.'}\n\n"
             f"Browser context:\n{chr(10).join(browser_lines) if browser_lines else '- No browser dumps recorded yet.'}\n\n"
             f"Repo config:\n{chr(10).join(repo_config_lines) if repo_config_lines else '- No .xmustard config loaded.'}\n\n"
             f"Path-specific guidance:\n{chr(10).join(path_instruction_lines) if path_instruction_lines else '- No path-specific instructions matched the current issue paths.'}\n\n"
@@ -5393,7 +5997,12 @@ Respond with a JSON object containing:
             ordered.append(normalized)
         return ordered[:6]
 
-    def _context_tokens(self, issue: IssueRecord, ticket_contexts: list[TicketContextRecord]) -> list[str]:
+    def _context_tokens(
+        self,
+        issue: IssueRecord,
+        ticket_contexts: list[TicketContextRecord],
+        vulnerability_findings: Optional[list[VulnerabilityFindingRecord]] = None,
+    ) -> list[str]:
         text_parts = [
             issue.title,
             issue.summary or "",
@@ -5407,6 +6016,19 @@ Respond with a JSON object containing:
                     context.summary,
                     " ".join(context.labels),
                     " ".join(context.acceptance_criteria),
+                ]
+            )
+        for finding in (vulnerability_findings or [])[:4]:
+            text_parts.extend(
+                [
+                    finding.title,
+                    finding.summary,
+                    finding.scanner,
+                    finding.rule_id or "",
+                    " ".join(finding.cwe_ids),
+                    " ".join(finding.cve_ids),
+                    finding.location_path or "",
+                    " ".join(finding.evidence),
                 ]
             )
         tokens = re.findall(r"[a-z0-9_./-]{3,}", " ".join(text_parts).lower())
@@ -5423,12 +6045,16 @@ Respond with a JSON object containing:
         issue: IssueRecord,
         tree_focus: list[str],
         ticket_contexts: list[TicketContextRecord],
+        vulnerability_findings: list[VulnerabilityFindingRecord],
         repo_map: RepoMapSummary,
     ) -> list[str]:
         candidates = list(tree_focus)
         candidates.extend(item.path for item in repo_map.key_files)
         candidates.extend(item.path for item in repo_map.top_directories)
-        tokens = self._context_tokens(issue, ticket_contexts)
+        for finding in vulnerability_findings[:6]:
+            if finding.location_path:
+                candidates.append(finding.location_path)
+        tokens = self._context_tokens(issue, ticket_contexts, vulnerability_findings)
         scored: dict[str, int] = {}
         for path in candidates:
             if not path:
@@ -5457,17 +6083,19 @@ Respond with a JSON object containing:
         ticket_contexts: list[TicketContextRecord],
         threat_models: list[ThreatModelRecord],
         browser_dumps: list[BrowserDumpRecord],
+        vulnerability_findings: list[VulnerabilityFindingRecord],
         recent_fixes: list[FixRecord],
         recent_activity: list[ActivityRecord],
         related_paths: list[str],
     ) -> DynamicContextBundle:
-        tokens = self._context_tokens(issue, ticket_contexts)
+        tokens = self._context_tokens(issue, ticket_contexts, vulnerability_findings)
         symbol_context = self._extract_symbol_context(Path(workspace.root_path), [*tree_focus, *related_paths], tokens)
         related_context = self._rank_related_artifacts(
             issue,
             ticket_contexts,
             threat_models,
             browser_dumps,
+            vulnerability_findings,
             recent_fixes,
             recent_activity,
             tokens,
@@ -5551,6 +6179,7 @@ Respond with a JSON object containing:
         ticket_contexts: list[TicketContextRecord],
         threat_models: list[ThreatModelRecord],
         browser_dumps: list[BrowserDumpRecord],
+        vulnerability_findings: list[VulnerabilityFindingRecord],
         recent_fixes: list[FixRecord],
         recent_activity: list[ActivityRecord],
         tokens: list[str],
@@ -5602,6 +6231,29 @@ Respond with a JSON object containing:
                         reason="Captures a browser-state repro that overlaps with the current issue terms.",
                         matched_terms=matches,
                         score=len(matches) * 2 + 1,
+                    )
+                )
+        for item in vulnerability_findings[:4]:
+            matches = matched_terms(
+                item.title,
+                item.summary,
+                item.scanner,
+                item.rule_id or "",
+                item.location_path or "",
+                " ".join(item.cwe_ids),
+                " ".join(item.cve_ids),
+                " ".join(item.evidence),
+            )
+            if matches:
+                records.append(
+                    RelatedContextRecord(
+                        artifact_type="vulnerability_finding",
+                        artifact_id=item.finding_id,
+                        title=item.title,
+                        path="vulnerability_findings.json",
+                        reason="Scanner evidence overlaps with the current issue language or files.",
+                        matched_terms=matches,
+                        score=len(matches) * 2 + 2,
                     )
                 )
         for item in recent_fixes[:4]:
@@ -6438,6 +7090,7 @@ Respond with a JSON object containing:
             ticket_contexts,
             packet.threat_models,
             browser_dumps,
+            packet.vulnerability_findings,
             packet.related_paths,
             packet.repo_map,
             packet.dynamic_context,

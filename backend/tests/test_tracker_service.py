@@ -30,6 +30,8 @@ from app.models import (
     VerificationChecklistResult,
     VerificationProfileRunRequest,
     VerifyIssueRequest,
+    VulnerabilityFindingUpsertRequest,
+    VulnerabilityImportRequest,
     WorktreeStatus,
     WorkspaceLoadRequest,
 )
@@ -647,6 +649,291 @@ reviews:
 
             service.delete_threat_model(snapshot.workspace.workspace_id, "P0_25M03_001", saved.threat_model_id)
             self.assertEqual(service.list_threat_models(snapshot.workspace.workspace_id, "P0_25M03_001"), [])
+
+    def test_vulnerability_finding_crud_and_issue_packet(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "repo"
+            (root / "docs" / "bugs").mkdir(parents=True)
+            (root / "api" / "src").mkdir(parents=True)
+            (root / "docs" / "bugs" / "Bugs_25260323.md").write_text(LEDGER_TEXT, encoding="utf-8")
+            (root / "api" / "src" / "example.py").write_text("print('ok')\n", encoding="utf-8")
+
+            store = FileStore(Path(tmp_dir) / "data")
+            service = TrackerService(store)
+            snapshot = service.load_workspace(WorkspaceLoadRequest(root_path=str(root), auto_scan=True))
+            assert snapshot is not None
+
+            saved = service.save_vulnerability_finding(
+                snapshot.workspace.workspace_id,
+                "P0_25M03_001",
+                VulnerabilityFindingUpsertRequest(
+                    title="Tenant export authorization bypass",
+                    scanner="nessus",
+                    source="nessus-json",
+                    severity="high",
+                    summary="Export endpoint may allow cross-tenant record access.",
+                    rule_id="plugin-12345",
+                    status="open",
+                    location_path="api/src/example.py",
+                    location_line=12,
+                    cwe_ids=["CWE-639"],
+                    cve_ids=["CVE-2026-0001"],
+                    references=["https://cwe.mitre.org/data/definitions/639.html"],
+                    evidence=["Plugin output shows missing tenant scoping on export."],
+                    raw_payload='{"plugin_id": 12345}',
+                ),
+            )
+
+            findings = service.list_vulnerability_findings(snapshot.workspace.workspace_id, "P0_25M03_001")
+            self.assertTrue(any(item.finding_id == saved.finding_id for item in findings))
+
+            packet = service.build_issue_context(snapshot.workspace.workspace_id, "P0_25M03_001")
+            self.assertEqual(packet.vulnerability_findings[0].title, "Tenant export authorization bypass")
+            self.assertIn("Vulnerability findings:", packet.prompt)
+            self.assertIn("CWE-639", packet.prompt)
+
+            exported = service.export_workspace(snapshot.workspace.workspace_id)
+            self.assertEqual(exported.vulnerability_findings[0].finding_id, saved.finding_id)
+
+            service.delete_vulnerability_finding(snapshot.workspace.workspace_id, "P0_25M03_001", saved.finding_id)
+            self.assertEqual(service.list_vulnerability_findings(snapshot.workspace.workspace_id, "P0_25M03_001"), [])
+
+    def test_import_sarif_vulnerability_findings_normalizes_and_dedupes(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "repo"
+            (root / "docs" / "bugs").mkdir(parents=True)
+            (root / "api" / "src").mkdir(parents=True)
+            (root / "docs" / "bugs" / "Bugs_25260323.md").write_text(LEDGER_TEXT, encoding="utf-8")
+            (root / "api" / "src" / "example.py").write_text("print('ok')\n", encoding="utf-8")
+
+            store = FileStore(Path(tmp_dir) / "data")
+            service = TrackerService(store)
+            snapshot = service.load_workspace(WorkspaceLoadRequest(root_path=str(root), auto_scan=True))
+            assert snapshot is not None
+
+            sarif_payload = json.dumps(
+                {
+                    "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+                    "runs": [
+                        {
+                            "tool": {
+                                "driver": {
+                                    "name": "CodeQL",
+                                    "rules": [
+                                        {
+                                            "id": "py/path-injection",
+                                            "shortDescription": {"text": "Path injection"},
+                                            "helpUri": "https://example.com/rules/path-injection",
+                                            "properties": {"tags": ["security", "external/cwe/cwe-022", "CVE-2026-1111"]},
+                                        }
+                                    ],
+                                }
+                            },
+                            "results": [
+                                {
+                                    "ruleId": "py/path-injection",
+                                    "level": "error",
+                                    "message": {"text": "User-controlled path reaches file open."},
+                                    "locations": [
+                                        {
+                                            "physicalLocation": {
+                                                "artifactLocation": {"uri": "api/src/example.py"},
+                                                "region": {"startLine": 12},
+                                            }
+                                        }
+                                    ],
+                                }
+                            ],
+                        }
+                    ],
+                }
+            )
+
+            imported = service.import_sarif_vulnerability_findings(
+                snapshot.workspace.workspace_id,
+                "P0_25M03_001",
+                sarif_payload,
+            )
+            self.assertEqual(len(imported), 1)
+            self.assertEqual(imported[0].scanner, "CodeQL")
+            self.assertEqual(imported[0].source, "sarif")
+            self.assertEqual(imported[0].severity, "high")
+            self.assertEqual(imported[0].location_path, "api/src/example.py")
+            self.assertIn("CWE-022", imported[0].cwe_ids)
+            self.assertIn("CVE-2026-1111", imported[0].cve_ids)
+
+            imported_again = service.import_sarif_vulnerability_findings(
+                snapshot.workspace.workspace_id,
+                "P0_25M03_001",
+                sarif_payload,
+            )
+            self.assertEqual(imported_again[0].finding_id, imported[0].finding_id)
+            findings = service.list_vulnerability_findings(snapshot.workspace.workspace_id, "P0_25M03_001")
+            self.assertEqual(len(findings), 1)
+
+    def test_import_nessus_vulnerability_findings_normalizes_and_persists(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "repo"
+            (root / "docs" / "bugs").mkdir(parents=True)
+            (root / "api" / "src").mkdir(parents=True)
+            (root / "docs" / "bugs" / "Bugs_25260323.md").write_text(LEDGER_TEXT, encoding="utf-8")
+            (root / "api" / "src" / "example.py").write_text("print('ok')\n", encoding="utf-8")
+
+            store = FileStore(Path(tmp_dir) / "data")
+            service = TrackerService(store)
+            snapshot = service.load_workspace(WorkspaceLoadRequest(root_path=str(root), auto_scan=True))
+            assert snapshot is not None
+
+            nessus_payload = json.dumps(
+                {
+                    "findings": [
+                        {
+                            "plugin_id": 12345,
+                            "plugin_name": "Export endpoint tenant scoping",
+                            "risk_factor": "Critical",
+                            "synopsis": "Export endpoint may leak another tenant's data.",
+                            "description": "Tenant scoping is not enforced before export.",
+                            "plugin_output": "Observed export request completing without tenant validation.",
+                            "cve": ["CVE-2026-2222"],
+                            "cwe": ["CWE-639"],
+                            "see_also": ["https://www.tenable.com/plugins/nessus/12345"],
+                            "path": "api/src/example.py",
+                            "line": 12,
+                        }
+                    ]
+                }
+            )
+
+            imported = service.import_nessus_vulnerability_findings(
+                snapshot.workspace.workspace_id,
+                "P0_25M03_001",
+                nessus_payload,
+            )
+            self.assertEqual(len(imported), 1)
+            finding = imported[0]
+            self.assertEqual(finding.scanner, "nessus")
+            self.assertEqual(finding.source, "nessus-json")
+            self.assertEqual(finding.severity, "critical")
+            self.assertEqual(finding.rule_id, "plugin-12345")
+            self.assertEqual(finding.location_path, "api/src/example.py")
+            self.assertIn("CWE-639", finding.cwe_ids)
+            self.assertIn("CVE-2026-2222", finding.cve_ids)
+
+            packet = service.build_issue_context(snapshot.workspace.workspace_id, "P0_25M03_001")
+            self.assertIn("Export endpoint tenant scoping", packet.prompt)
+            self.assertTrue(
+                any(item.artifact_type == "vulnerability_finding" for item in (packet.dynamic_context.related_context if packet.dynamic_context else []))
+            )
+
+    def test_import_semgrep_vulnerability_findings_normalizes_and_persists(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "repo"
+            (root / "docs" / "bugs").mkdir(parents=True)
+            (root / "api" / "src").mkdir(parents=True)
+            (root / "docs" / "bugs" / "Bugs_25260323.md").write_text(LEDGER_TEXT, encoding="utf-8")
+            (root / "api" / "src" / "example.py").write_text("print('ok')\n", encoding="utf-8")
+
+            store = FileStore(Path(tmp_dir) / "data")
+            service = TrackerService(store)
+            snapshot = service.load_workspace(WorkspaceLoadRequest(root_path=str(root), auto_scan=True))
+            assert snapshot is not None
+
+            semgrep_payload = json.dumps(
+                {
+                    "results": [
+                        {
+                            "check_id": "python.lang.security.audit.dangerous-subprocess-use",
+                            "path": "api/src/example.py",
+                            "start": {"line": 12},
+                            "extra": {
+                                "message": "Shell command execution may allow injection.",
+                                "severity": "ERROR",
+                                "lines": "subprocess.run(user_input, shell=True)",
+                                "metadata": {
+                                    "title": "Dangerous subprocess use",
+                                    "references": ["https://semgrep.dev/docs/cheat-sheets/python-command-injection/"],
+                                    "cwe": ["CWE-78"],
+                                },
+                            },
+                        }
+                    ]
+                }
+            )
+
+            imported = service.import_vulnerability_findings(
+                snapshot.workspace.workspace_id,
+                "P0_25M03_001",
+                VulnerabilityImportRequest(source="semgrep-json", payload=semgrep_payload),
+            )
+            self.assertEqual(len(imported), 1)
+            finding = imported[0]
+            self.assertEqual(finding.scanner, "semgrep")
+            self.assertEqual(finding.source, "semgrep-json")
+            self.assertEqual(finding.severity, "high")
+            self.assertEqual(finding.location_path, "api/src/example.py")
+            self.assertIn("CWE-78", finding.cwe_ids)
+            self.assertIn("Shell command execution may allow injection.", finding.summary)
+
+            packet = service.build_issue_context(snapshot.workspace.workspace_id, "P0_25M03_001")
+            self.assertIn("Dangerous subprocess use", packet.prompt)
+
+    def test_import_trivy_vulnerability_findings_normalizes_and_persists(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "repo"
+            (root / "docs" / "bugs").mkdir(parents=True)
+            (root / "api" / "src").mkdir(parents=True)
+            (root / "docs" / "bugs" / "Bugs_25260323.md").write_text(LEDGER_TEXT, encoding="utf-8")
+            (root / "api" / "src" / "example.py").write_text("print('ok')\n", encoding="utf-8")
+
+            store = FileStore(Path(tmp_dir) / "data")
+            service = TrackerService(store)
+            snapshot = service.load_workspace(WorkspaceLoadRequest(root_path=str(root), auto_scan=True))
+            assert snapshot is not None
+
+            trivy_payload = json.dumps(
+                {
+                    "ArtifactName": "repo",
+                    "Results": [
+                        {
+                            "Target": "api/src/example.py",
+                            "Type": "python",
+                            "Vulnerabilities": [
+                                {
+                                    "VulnerabilityID": "CVE-2026-3333",
+                                    "PkgName": "example-lib",
+                                    "InstalledVersion": "1.0.0",
+                                    "FixedVersion": "1.0.1",
+                                    "Severity": "CRITICAL",
+                                    "Title": "Example library remote code execution",
+                                    "Description": "A vulnerable package version is present in the scanned target.",
+                                    "PrimaryURL": "https://example.com/CVE-2026-3333",
+                                    "References": ["https://nvd.nist.gov/vuln/detail/CVE-2026-3333"],
+                                    "CweIDs": ["CWE-94"],
+                                }
+                            ],
+                        }
+                    ],
+                }
+            )
+
+            imported = service.import_vulnerability_findings(
+                snapshot.workspace.workspace_id,
+                "P0_25M03_001",
+                VulnerabilityImportRequest(source="trivy-json", payload=trivy_payload),
+            )
+            self.assertEqual(len(imported), 1)
+            finding = imported[0]
+            self.assertEqual(finding.scanner, "trivy")
+            self.assertEqual(finding.source, "trivy-json")
+            self.assertEqual(finding.severity, "critical")
+            self.assertEqual(finding.rule_id, "CVE-2026-3333")
+            self.assertEqual(finding.location_path, "api/src/example.py")
+            self.assertIn("CWE-94", finding.cwe_ids)
+            self.assertIn("CVE-2026-3333", finding.cve_ids)
+            self.assertIn("example-lib", finding.evidence[0])
+
+            packet = service.build_issue_context(snapshot.workspace.workspace_id, "P0_25M03_001")
+            self.assertIn("Example library remote code execution", packet.prompt)
 
     def test_capture_issue_context_replay_persists_prompt_snapshot(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

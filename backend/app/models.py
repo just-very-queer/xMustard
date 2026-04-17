@@ -33,6 +33,9 @@ TicketProvider = Literal["github", "jira", "linear", "manual", "incident", "othe
 ThreatModelMethodology = Literal["manual", "stride", "threat_dragon", "pytm", "threagile", "attack_path"]
 ThreatModelStatus = Literal["draft", "reviewed", "accepted"]
 BrowserDumpSource = Literal["mcp-chrome", "manual", "playwright", "other"]
+VulnerabilityFindingSource = Literal["manual", "nessus-json", "sarif", "semgrep-json", "trivy-json", "other"]
+VulnerabilitySeverity = Literal["critical", "high", "medium", "low", "info"]
+VulnerabilityStatus = Literal["open", "triaged", "fixing", "fixed", "verified", "closed"]
 
 
 def utc_now() -> str:
@@ -563,6 +566,28 @@ class BrowserDumpRecord(BaseModel):
     updated_at: str = Field(default_factory=utc_now)
 
 
+class VulnerabilityFindingRecord(BaseModel):
+    finding_id: str
+    workspace_id: str
+    issue_id: str
+    scanner: str
+    source: VulnerabilityFindingSource = "manual"
+    severity: VulnerabilitySeverity = "medium"
+    status: VulnerabilityStatus = "open"
+    title: str
+    summary: str = ""
+    rule_id: Optional[str] = None
+    location_path: Optional[str] = None
+    location_line: Optional[int] = None
+    cwe_ids: list[str] = Field(default_factory=list)
+    cve_ids: list[str] = Field(default_factory=list)
+    references: list[str] = Field(default_factory=list)
+    evidence: list[str] = Field(default_factory=list)
+    raw_payload: Optional[str] = None
+    created_at: str = Field(default_factory=utc_now)
+    updated_at: str = Field(default_factory=utc_now)
+
+
 class ReviewQueueItem(BaseModel):
     run: RunRecord
     issue: IssueRecord
@@ -813,6 +838,29 @@ class BrowserDumpUpsertRequest(BaseModel):
     notes: Optional[str] = None
 
 
+class VulnerabilityFindingUpsertRequest(BaseModel):
+    finding_id: Optional[str] = None
+    scanner: str
+    source: VulnerabilityFindingSource = "manual"
+    severity: VulnerabilitySeverity = "medium"
+    status: VulnerabilityStatus = "open"
+    title: str
+    summary: str = ""
+    rule_id: Optional[str] = None
+    location_path: Optional[str] = None
+    location_line: Optional[int] = None
+    cwe_ids: list[str] = Field(default_factory=list)
+    cve_ids: list[str] = Field(default_factory=list)
+    references: list[str] = Field(default_factory=list)
+    evidence: list[str] = Field(default_factory=list)
+    raw_payload: Optional[str] = None
+
+
+class VulnerabilityImportRequest(BaseModel):
+    source: VulnerabilityFindingSource
+    payload: str
+
+
 class VerifyIssueRequest(BaseModel):
     runtime: RuntimeKind = "opencode"
     models: list[str] = Field(default_factory=list)
@@ -872,6 +920,7 @@ class ExportBundle(BaseModel):
     threat_models: list[ThreatModelRecord] = Field(default_factory=list)
     context_replays: list[IssueContextReplayRecord] = Field(default_factory=list)
     browser_dumps: list[BrowserDumpRecord] = Field(default_factory=list)
+    vulnerability_findings: list[VulnerabilityFindingRecord] = Field(default_factory=list)
     eval_scenarios: list["EvalScenarioRecord"] = Field(default_factory=list)
     verifications: list[VerificationRecord] = Field(default_factory=list)
     activity: list[ActivityRecord] = Field(default_factory=list)
@@ -890,7 +939,7 @@ class RepoMapSymbolRecord(BaseModel):
 
 
 class RelatedContextRecord(BaseModel):
-    artifact_type: Literal["ticket_context", "threat_model", "browser_dump", "fix_record", "activity", "run"]
+    artifact_type: Literal["ticket_context", "threat_model", "browser_dump", "vulnerability_finding", "fix_record", "activity", "run"]
     artifact_id: str
     title: str
     path: Optional[str] = None
@@ -965,6 +1014,7 @@ class IssueContextPacket(BaseModel):
     ticket_contexts: list[TicketContextRecord] = Field(default_factory=list)
     threat_models: list[ThreatModelRecord] = Field(default_factory=list)
     browser_dumps: list[BrowserDumpRecord] = Field(default_factory=list)
+    vulnerability_findings: list[VulnerabilityFindingRecord] = Field(default_factory=list)
     repo_map: Optional[RepoMapSummary] = None
     dynamic_context: Optional[DynamicContextBundle] = None
     repo_config: Optional[RepoConfigRecord] = None
