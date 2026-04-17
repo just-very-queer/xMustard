@@ -32,6 +32,8 @@ from .models import (
     VerificationProfileRunRequest,
     VerificationProfileUpsertRequest,
     VerifyIssueRequest,
+    VulnerabilityFindingUpsertRequest,
+    VulnerabilityImportRequest,
     WorkspaceLoadRequest,
 )
 from .service import TrackerService
@@ -812,6 +814,111 @@ def browser_dump_save(
 def browser_dump_delete(workspace_id: str, issue_id: str, dump_id: str) -> None:
     service.delete_browser_dump(workspace_id, issue_id, dump_id)
     _echo_ok(dump_id=dump_id)
+
+
+@app.command("vulnerability-findings")
+def vulnerability_findings(workspace_id: str, issue_id: str) -> None:
+    _echo_json([item.model_dump(mode="json") for item in service.list_vulnerability_findings(workspace_id, issue_id)])
+
+
+@app.command("vulnerability-finding-save")
+def vulnerability_finding_save(
+    workspace_id: str,
+    issue_id: str,
+    title: str = typer.Option(...),
+    scanner: str = typer.Option(...),
+    source: str = typer.Option(default="manual"),
+    finding_id: str = typer.Option(default=""),
+    severity: str = typer.Option(default="medium"),
+    status: str = typer.Option(default="open"),
+    lifecycle_state: str = typer.Option(default="new"),
+    summary: str = typer.Option(default=""),
+    rule_id: str = typer.Option(default=""),
+    location_path: str = typer.Option(default=""),
+    location_line: int = typer.Option(default=0),
+    cwe_ids: str = typer.Option(default=""),
+    cve_ids: str = typer.Option(default=""),
+    references: str = typer.Option(default=""),
+    evidence: str = typer.Option(default=""),
+    raw_payload: str = typer.Option(default=""),
+    raw_payload_file: str = typer.Option(default=""),
+    scan_batch_id: str = typer.Option(default=""),
+    tool_version: str = typer.Option(default=""),
+    first_seen_at: str = typer.Option(default=""),
+    last_seen_at: str = typer.Option(default=""),
+    resolved_at: str = typer.Option(default=""),
+    import_count: int = typer.Option(default=0),
+) -> None:
+    payload = service.save_vulnerability_finding(
+        workspace_id,
+        issue_id,
+        VulnerabilityFindingUpsertRequest(
+            finding_id=finding_id or None,
+            scanner=scanner,
+            source=source,
+            severity=severity,
+            status=status,
+            lifecycle_state=lifecycle_state,
+            scan_batch_id=scan_batch_id or None,
+            tool_version=tool_version or None,
+            first_seen_at=first_seen_at or None,
+            last_seen_at=last_seen_at or None,
+            resolved_at=resolved_at or None,
+            import_count=import_count,
+            title=title,
+            summary=_normalize_newlines(summary),
+            rule_id=rule_id or None,
+            location_path=location_path or None,
+            location_line=location_line or None,
+            cwe_ids=_split_csv(cwe_ids),
+            cve_ids=_split_csv(cve_ids),
+            references=_split_csv(references),
+            evidence=_split_csv(evidence),
+            raw_payload=_read_text_input(raw_payload, raw_payload_file) or None,
+        ),
+    )
+    _echo_json(payload.model_dump(mode="json"))
+
+
+@app.command("vulnerability-finding-import")
+def vulnerability_finding_import(
+    workspace_id: str,
+    issue_id: str,
+    source: str = typer.Option(...),
+    payload: str = typer.Option(default=""),
+    payload_file: str = typer.Option(default=""),
+    scan_batch_id: str = typer.Option(default=""),
+    tool_version: str = typer.Option(default=""),
+    imported_at: str = typer.Option(default=""),
+    auto_resolve_missing: bool = typer.Option(default=True),
+) -> None:
+    request_payload = _read_text_input(payload, payload_file)
+    if not request_payload:
+        raise typer.BadParameter("Provide --payload or --payload-file")
+    payload = service.import_vulnerability_findings(
+        workspace_id,
+        issue_id,
+        VulnerabilityImportRequest(
+            source=source,
+            payload=request_payload,
+            scan_batch_id=scan_batch_id or None,
+            tool_version=tool_version or None,
+            imported_at=imported_at or None,
+            auto_resolve_missing=auto_resolve_missing,
+        ),
+    )
+    _echo_json([item.model_dump(mode="json") for item in payload])
+
+
+@app.command("vulnerability-finding-delete")
+def vulnerability_finding_delete(workspace_id: str, issue_id: str, finding_id: str) -> None:
+    service.delete_vulnerability_finding(workspace_id, issue_id, finding_id)
+    _echo_ok(finding_id=finding_id)
+
+
+@app.command("vulnerability-report")
+def vulnerability_report(workspace_id: str, issue_id: str) -> None:
+    _echo_json(service.get_vulnerability_finding_report(workspace_id, issue_id).model_dump(mode="json"))
 
 
 @app.command("issue-drift")

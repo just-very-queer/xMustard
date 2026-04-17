@@ -907,6 +907,95 @@ reviews:
                 self.assertEqual(result.exit_code, 0, msg=result.output)
                 self.assertTrue(any(item["dump_id"] == browser_dump["dump_id"] for item in json.loads(result.stdout)))
 
+                result = self.runner.invoke(
+                    cli_module.app,
+                    [
+                        "vulnerability-finding-save",
+                        workspace_id,
+                        "P0_25M03_001",
+                        "--title",
+                        "Tenant export authorization bypass",
+                        "--scanner",
+                        "nessus",
+                        "--source",
+                        "nessus-json",
+                        "--severity",
+                        "high",
+                        "--summary",
+                        "Export endpoint may allow cross-tenant record access.",
+                        "--rule-id",
+                        "plugin-12345",
+                        "--location-path",
+                        "api/src/example.py",
+                        "--location-line",
+                        "12",
+                        "--cwe-ids",
+                        "CWE-639",
+                        "--cve-ids",
+                        "CVE-2026-0001",
+                        "--references",
+                        "https://cwe.mitre.org/data/definitions/639.html",
+                        "--evidence",
+                        "Plugin output shows missing tenant scoping on export.",
+                    ],
+                )
+                self.assertEqual(result.exit_code, 0, msg=result.output)
+                finding_payload = json.loads(result.stdout)
+                self.assertEqual(finding_payload["title"], "Tenant export authorization bypass")
+
+                result = self.runner.invoke(cli_module.app, ["vulnerability-findings", workspace_id, "P0_25M03_001"])
+                self.assertEqual(result.exit_code, 0, msg=result.output)
+                listed_findings = json.loads(result.stdout)
+                self.assertTrue(any(item["finding_id"] == finding_payload["finding_id"] for item in listed_findings))
+
+                result = self.runner.invoke(
+                    cli_module.app,
+                    [
+                        "vulnerability-finding-import",
+                        workspace_id,
+                        "P0_25M03_001",
+                        "--source",
+                        "semgrep-json",
+                        "--payload",
+                        json.dumps(
+                            {
+                                "results": [
+                                    {
+                                        "check_id": "python.lang.security.audit.eval-use",
+                                        "path": "api/src/example.py",
+                                        "start": {"line": 80},
+                                        "extra": {
+                                            "severity": "ERROR",
+                                            "message": "eval executes attacker-controlled expressions.",
+                                            "metadata": {"title": "Dangerous eval use", "cwe": ["CWE-95"]},
+                                        },
+                                    }
+                                ]
+                            }
+                        ),
+                        "--scan-batch-id",
+                        "semgrep-batch-cli",
+                        "--tool-version",
+                        "semgrep/1.73.0",
+                    ],
+                )
+                self.assertEqual(result.exit_code, 0, msg=result.output)
+                imported_payload = json.loads(result.stdout)
+                self.assertEqual(imported_payload[0]["scan_batch_id"], "semgrep-batch-cli")
+
+                result = self.runner.invoke(cli_module.app, ["vulnerability-report", workspace_id, "P0_25M03_001"])
+                self.assertEqual(result.exit_code, 0, msg=result.output)
+                report_payload = json.loads(result.stdout)
+                self.assertGreaterEqual(report_payload["total_findings"], 2)
+                self.assertEqual(report_payload["latest_scan_batch_id"], "semgrep-batch-cli")
+
+                result = self.runner.invoke(
+                    cli_module.app,
+                    ["vulnerability-finding-delete", workspace_id, "P0_25M03_001", finding_payload["finding_id"]],
+                )
+                self.assertEqual(result.exit_code, 0, msg=result.output)
+                self.assertEqual(json.loads(result.stdout)["finding_id"], finding_payload["finding_id"])
+
                 with patch.object(service, "generate_run_plan", return_value={"plan_id": "plan_1", "phase": "awaiting_approval"}):
                     result = self.runner.invoke(cli_module.app, ["plan-generate", workspace_id, "run_123"])
                     self.assertEqual(result.exit_code, 0, msg=result.output)
