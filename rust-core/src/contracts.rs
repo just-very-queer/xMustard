@@ -241,17 +241,18 @@ pub fn planned_agent_surfaces() -> Vec<AgentSurface> {
 
 pub fn next_removable_python_boundary() -> PythonBoundaryCutline {
     PythonBoundaryCutline {
-        boundary_id: "external_integrations_gateway",
-        current_owner: "backend/app/main.py + backend/app/service.py",
-        target_owner: "api-go plugin registry + webhook/event sink",
-        rust_role: "Export review bundles and durable event payloads without taking chat-app auth or HTTP fanout concerns into the core.",
-        python_modules: vec!["backend/app/main.py", "backend/app/service.py"],
-        why_next: "It is the last major external-agent and chat-app seam still modeled as Python-specific routes instead of an explicit protocol surface.",
-        first_slice: "Serve plugin manifest and event-subscription inventory from Go, then re-home provider test/sync routes behind manifest IDs instead of ad hoc Python handlers.",
+        boundary_id: "runtime_and_terminal_process_plane",
+        current_owner: "backend/app/runtimes.py + backend/app/terminal.py + backend/app/service.py",
+        target_owner: "api-go terminal/runtime shell + rust-core managed process runner",
+        rust_role: "Own process-safe execution, bounded output capture, timeout/cancellation, and structured run summaries for long-lived agent and verification work.",
+        python_modules: vec!["backend/app/runtimes.py", "backend/app/terminal.py", "backend/app/service.py"],
+        why_next: "Python is no longer the external integrations gateway on the live request path, but runtime/process/session behavior and PTY terminal fidelity still depend on Python-owned implementations.",
+        first_slice: "Port PTY terminal semantics and runtime argument parsing parity into Go, then move managed execution/log summarization behind a Rust command boundary instead of duplicating subprocess control in Python and Go.",
         removable_when: vec![
-            "Go owns plugin manifest discovery, auth/config records, and webhook registration.",
-            "Go owns inbound and outbound integration routes for GitHub, Slack, Jira, and Linear.",
-            "Python no longer brokers external agent or chat-app callbacks on the request path.",
+            "Go owns PTY-backed terminal open/write/read/resize/close semantics with parity to the current Python broker.",
+            "Go matches Python runtime model parsing and codex/opencode argument sanitization behavior.",
+            "Rust owns the managed process runner for long-lived execution, bounded buffering, timeout, cancellation, and structured summaries.",
+            "Python no longer handles runtime launch, probe, query, or terminal request paths.",
         ],
     }
 }
@@ -307,9 +308,9 @@ mod tests {
     }
 
     #[test]
-    fn next_python_cutline_targets_integrations_gateway() {
+    fn next_python_cutline_targets_runtime_and_terminal_plane() {
         let cutline = next_removable_python_boundary();
-        assert_eq!(cutline.boundary_id, "external_integrations_gateway");
-        assert_eq!(cutline.target_owner, "api-go plugin registry + webhook/event sink");
+        assert_eq!(cutline.boundary_id, "runtime_and_terminal_process_plane");
+        assert_eq!(cutline.target_owner, "api-go terminal/runtime shell + rust-core managed process runner");
     }
 }

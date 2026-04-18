@@ -20,7 +20,7 @@ func TestReadArchitectureContract(t *testing.T) {
 	if len(contract.AgentSurfaces) != 3 {
 		t.Fatalf("expected three agent surfaces, got %#v", contract.AgentSurfaces)
 	}
-	if contract.NextRemovablePythonBoundary.BoundaryID != "external_integrations_gateway" {
+	if contract.NextRemovablePythonBoundary.BoundaryID != "runtime_and_terminal_process_plane" {
 		t.Fatalf("unexpected python cutline: %#v", contract.NextRemovablePythonBoundary)
 	}
 }
