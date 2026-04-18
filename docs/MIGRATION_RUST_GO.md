@@ -150,10 +150,11 @@ That boundary work is now live for three concrete slices:
   - `/api/migration/plan`
   - `/api/migration/agent-surfaces`
   - `/api/agent/surfaces`
-- The next removable Python ownership boundary is now explicit:
+- The first completed Python request-path cutline is now explicit:
   - `external_integrations_gateway`
-  - current owner: `backend/app/main.py` + `backend/app/service.py`
-  - target owner: Go plugin registry + webhook/event sink surfaces
+  - former Python request-path owner: `backend/app/main.py`
+  - current owner: Go plugin registry + webhook/event sink surfaces
+  - compatibility logic can remain in `backend/app/service.py` and `backend/app/cli.py` until later non-request-path cleanup
 - Rust owns `scan-signals` in `rust-core/src/scanner.rs`
 - Rust owns `build-repo-map` in `rust-core/src/repomap.rs`
 - Rust owns coverage parsing for LCOV, Cobertura, and Istanbul in `rust-core/src/verification.rs`
@@ -198,6 +199,7 @@ That boundary work is now live for three concrete slices:
 - The Go API shell now owns workspace listing, fresh and cached workspace load, explicit workspace scan, worktree reads, export bundle reads, and terminal open/write/resize/read/close transport against the existing workspace registry and terminal log layout.
 - The Go API shell now owns the `external_integrations_gateway` cutline too: plugin-manifest-backed integration config/test routes, GitHub issue import + PR creation, Slack notifications, and Linear/Jira issue sync now persist through Go while keeping ticket-context/activity artifacts and the existing `backend/data/integrations/` compatibility layout.
 - The Go API shell now owns repo-config reads at `/api/workspaces/{workspace_id}/repo-config` and `/api/workspaces/{workspace_id}/repo-config/health`, and issue-context packets built in Go now include `.xmustard.yaml` path instructions and MCP/browser-context hints.
+- FastAPI no longer registers the integration config/test/sync HTTP handlers in `backend/app/main.py`, so the external integrations gateway now leaves Python on the live request path while preserving the same route paths through Go.
 - Python parity tests now compare live Python behavior against the Rust outputs for:
   - signal scanning
   - repo-map summaries

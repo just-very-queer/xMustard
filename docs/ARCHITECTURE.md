@@ -43,6 +43,7 @@ The no-Python target architecture now treats those surfaces as stable protocol s
 - Go owns the control-plane and API shell for all three surfaces
 - Rust owns retrieval, repo-map, process/runtime, verification, and store-critical helpers behind those surfaces
 - Python is not part of the steady-state request path once migration is complete
+- The external integrations gateway is already cut over on the request path: Go serves the existing `/api/.../integrations*` contract and FastAPI no longer registers that route family
 
 ## Backend Shape
 
@@ -195,3 +196,5 @@ Recommended migration path:
 This should be an incremental replacement strategy, not a rewrite that pauses product work.
 
 The repo now includes concrete scaffolding under `rust-core/` and `api-go/`, including a Rust-owned architecture contract and Go-served agent-surface inventory, so this migration direction has a real control-plane seam instead of only roadmap prose.
+
+The first completed Python request-path cutline is the external integrations gateway: the Go shell owns integration config/test/sync routes, while any remaining Python integration code is compatibility debt rather than live HTTP ownership.
