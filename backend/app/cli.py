@@ -29,6 +29,8 @@ from .models import (
     SavedIssueViewRequest,
     ThreatModelUpsertRequest,
     TicketContextUpsertRequest,
+    VulnerabilityFindingUpsertRequest,
+    VulnerabilityImportRequest,
     VerificationProfileRunRequest,
     VerificationProfileUpsertRequest,
     VerifyIssueRequest,
@@ -812,6 +814,158 @@ def browser_dump_save(
 def browser_dump_delete(workspace_id: str, issue_id: str, dump_id: str) -> None:
     service.delete_browser_dump(workspace_id, issue_id, dump_id)
     _echo_ok(dump_id=dump_id)
+
+
+@app.command("vulnerability-findings")
+def vulnerability_findings(workspace_id: str, issue_id: str) -> None:
+    _echo_json([item.model_dump(mode="json") for item in service.list_vulnerability_findings(workspace_id, issue_id)])
+
+
+@app.command("vulnerability-finding-save")
+def vulnerability_finding_save(
+    workspace_id: str,
+    issue_id: str,
+    title: str = typer.Option(...),
+    scanner: str = typer.Option(...),
+    source: str = typer.Option(default="manual"),
+    severity: str = typer.Option(default="medium"),
+    status: str = typer.Option(default="open"),
+    finding_id: str = typer.Option(default=""),
+    summary: str = typer.Option(default=""),
+    rule_id: str = typer.Option(default=""),
+    location_path: str = typer.Option(default=""),
+    location_line: int = typer.Option(default=0),
+    cwe_id: list[str] = typer.Option([], "--cwe-id"),
+    cve_id: list[str] = typer.Option([], "--cve-id"),
+    reference: list[str] = typer.Option([], "--reference"),
+    evidence: list[str] = typer.Option([], "--evidence"),
+    threat_model_id: list[str] = typer.Option([], "--threat-model-id"),
+    raw_payload: str = typer.Option(default=""),
+) -> None:
+    payload = service.save_vulnerability_finding(
+        workspace_id,
+        issue_id,
+        VulnerabilityFindingUpsertRequest(
+            finding_id=finding_id or None,
+            scanner=scanner,
+            source=source,
+            severity=severity,
+            status=status,
+            title=title,
+            summary=_normalize_newlines(summary),
+            rule_id=rule_id or None,
+            location_path=location_path or None,
+            location_line=location_line or None,
+            cwe_ids=[item.strip() for item in cwe_id if item.strip()],
+            cve_ids=[item.strip() for item in cve_id if item.strip()],
+            references=[_normalize_newlines(item) for item in reference if item.strip()],
+            evidence=[_normalize_newlines(item) for item in evidence if item.strip()],
+            threat_model_ids=[item.strip() for item in threat_model_id if item.strip()],
+            raw_payload=_normalize_newlines(raw_payload) or None,
+        ),
+    )
+    _echo_json(payload.model_dump(mode="json"))
+
+
+@app.command("vulnerability-findings-import")
+def vulnerability_findings_import(
+    workspace_id: str,
+    issue_id: str,
+    source: str = typer.Option(...),
+    payload: str = typer.Option(default=""),
+    payload_file: str = typer.Option(default=""),
+) -> None:
+    imported = service.import_vulnerability_findings(
+        workspace_id,
+        issue_id,
+        VulnerabilityImportRequest(
+            source=source,
+            payload=_read_text_input(payload, payload_file),
+        ),
+    )
+    _echo_json([item.model_dump(mode="json") for item in imported])
+
+
+@app.command("vulnerability-import-batches")
+def vulnerability_import_batches(workspace_id: str, issue_id: str) -> None:
+    payload = [item.model_dump(mode="json") for item in service.list_vulnerability_import_batches(workspace_id, issue_id)]
+    _echo_json(payload)
+
+
+@app.command("vulnerability-finding-delete")
+def vulnerability_finding_delete(workspace_id: str, issue_id: str, finding_id: str) -> None:
+    service.delete_vulnerability_finding(workspace_id, issue_id, finding_id)
+    _echo_ok(finding_id=finding_id)
+
+
+@app.command("vulnerability-report")
+def vulnerability_report(
+    workspace_id: str,
+    issue_id: str,
+    format: str = typer.Option(default="json"),
+    output: str = typer.Option(default=""),
+) -> None:
+    selected_format = format.strip().lower() or "json"
+    if selected_format == "markdown":
+        payload = service.render_vulnerability_finding_report_markdown(workspace_id, issue_id)
+        if output:
+            Path(output).write_text(payload, encoding="utf-8")
+            typer.echo(output)
+            return
+        typer.echo(payload)
+        return
+    report = service.get_vulnerability_finding_report(workspace_id, issue_id).model_dump(mode="json")
+    if output:
+        Path(output).write_text(json.dumps(report, indent=2), encoding="utf-8")
+        typer.echo(output)
+        return
+    _echo_json(report)
+
+
+@app.command("workspace-vulnerability-report")
+def workspace_vulnerability_report(
+    workspace_id: str,
+    format: str = typer.Option(default="json"),
+    output: str = typer.Option(default=""),
+) -> None:
+    selected_format = format.strip().lower() or "json"
+    if selected_format == "markdown":
+        payload = service.render_workspace_vulnerability_report_markdown(workspace_id)
+        if output:
+            Path(output).write_text(payload, encoding="utf-8")
+            typer.echo(output)
+            return
+        typer.echo(payload)
+        return
+    report = service.get_workspace_vulnerability_report(workspace_id).model_dump(mode="json")
+    if output:
+        Path(output).write_text(json.dumps(report, indent=2), encoding="utf-8")
+        typer.echo(output)
+        return
+    _echo_json(report)
+
+
+@app.command("workspace-security-review-bundle")
+def workspace_security_review_bundle(
+    workspace_id: str,
+    format: str = typer.Option(default="json"),
+    output: str = typer.Option(default=""),
+) -> None:
+    selected_format = format.strip().lower() or "json"
+    if selected_format == "markdown":
+        payload = service.render_workspace_security_review_bundle_markdown(workspace_id)
+        if output:
+            Path(output).write_text(payload, encoding="utf-8")
+            typer.echo(output)
+            return
+        typer.echo(payload)
+        return
+    bundle = service.get_workspace_security_review_bundle(workspace_id).model_dump(mode="json")
+    if output:
+        Path(output).write_text(json.dumps(bundle, indent=2), encoding="utf-8")
+        typer.echo(output)
+        return
+    _echo_json(bundle)
 
 
 @app.command("issue-drift")

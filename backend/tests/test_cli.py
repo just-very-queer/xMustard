@@ -865,6 +865,182 @@ reviews:
 
                 result = self.runner.invoke(
                     cli_module.app,
+                    [
+                        "vulnerability-finding-save",
+                        workspace_id,
+                        "P0_25M03_001",
+                        "--title",
+                        "Checkout authz bypass",
+                        "--scanner",
+                        "semgrep",
+                        "--source",
+                        "semgrep-json",
+                        "--severity",
+                        "high",
+                        "--status",
+                        "triaged",
+                        "--summary",
+                        "Checkout export flow lacks tenant authorization.",
+                        "--rule-id",
+                        "python.checkout.authz",
+                        "--location-path",
+                        "api/src/example.py",
+                        "--location-line",
+                        "12",
+                        "--cwe-id",
+                        "CWE-639",
+                        "--evidence",
+                        "Semgrep matched a missing tenant guard.",
+                        "--threat-model-id",
+                        threat_payload["threat_model_id"],
+                    ],
+                )
+                self.assertEqual(result.exit_code, 0, msg=result.output)
+                vulnerability_payload = json.loads(result.stdout)
+                self.assertEqual(vulnerability_payload["title"], "Checkout authz bypass")
+                self.assertEqual(vulnerability_payload["threat_model_ids"], [threat_payload["threat_model_id"]])
+
+                result = self.runner.invoke(cli_module.app, ["vulnerability-findings", workspace_id, "P0_25M03_001"])
+                self.assertEqual(result.exit_code, 0, msg=result.output)
+                findings_payload = json.loads(result.stdout)
+                self.assertTrue(any(item["finding_id"] == vulnerability_payload["finding_id"] for item in findings_payload))
+
+                result = self.runner.invoke(cli_module.app, ["vulnerability-report", workspace_id, "P0_25M03_001"])
+                self.assertEqual(result.exit_code, 0, msg=result.output)
+                report_payload = json.loads(result.stdout)
+                self.assertEqual(report_payload["total_findings"], 1)
+                self.assertEqual(report_payload["linked_threat_models"][0]["threat_model_id"], threat_payload["threat_model_id"])
+
+                result = self.runner.invoke(
+                    cli_module.app,
+                    ["vulnerability-report", workspace_id, "P0_25M03_001", "--format", "markdown"],
+                )
+                self.assertEqual(result.exit_code, 0, msg=result.output)
+                self.assertIn("# Vulnerability Report", result.stdout)
+                self.assertIn("Checkout threat review", result.stdout)
+
+                result = self.runner.invoke(cli_module.app, ["workspace-vulnerability-report", workspace_id])
+                self.assertEqual(result.exit_code, 0, msg=result.output)
+                workspace_report_payload = json.loads(result.stdout)
+                self.assertEqual(workspace_report_payload["total_findings"], 1)
+                self.assertEqual(workspace_report_payload["issue_rollups"][0]["issue_id"], "P0_25M03_001")
+
+                result = self.runner.invoke(
+                    cli_module.app,
+                    ["workspace-vulnerability-report", workspace_id, "--format", "markdown"],
+                )
+                self.assertEqual(result.exit_code, 0, msg=result.output)
+                self.assertIn("# Workspace Vulnerability Report", result.stdout)
+
+                result = self.runner.invoke(cli_module.app, ["workspace-security-review-bundle", workspace_id])
+                self.assertEqual(result.exit_code, 0, msg=result.output)
+                security_bundle_payload = json.loads(result.stdout)
+                self.assertEqual(security_bundle_payload["total_findings"], 1)
+                self.assertEqual(security_bundle_payload["top_findings"][0]["title"], "Checkout authz bypass")
+
+                result = self.runner.invoke(
+                    cli_module.app,
+                    [
+                        "vulnerability-findings-import",
+                        workspace_id,
+                        "P0_25M03_001",
+                        "--source",
+                        "sarif",
+                        "--payload",
+                        json.dumps(
+                            {
+                                "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+                                "runs": [
+                                    {
+                                        "tool": {"driver": {"name": "CodeQL", "rules": [{"id": "py/path-injection"}]}},
+                                        "results": [
+                                            {
+                                                "ruleId": "py/path-injection",
+                                                "level": "error",
+                                                "message": {"text": "User-controlled path reaches file open."},
+                                                "locations": [
+                                                    {
+                                                        "physicalLocation": {
+                                                            "artifactLocation": {"uri": "api/src/example.py"},
+                                                            "region": {"startLine": 12},
+                                                        }
+                                                    }
+                                                ],
+                                            }
+                                        ],
+                                    }
+                                ],
+                            }
+                        ),
+                    ],
+                )
+                self.assertEqual(result.exit_code, 0, msg=result.output)
+                imported_payload = json.loads(result.stdout)
+                self.assertEqual(len(imported_payload), 1)
+
+                result = self.runner.invoke(cli_module.app, ["vulnerability-import-batches", workspace_id, "P0_25M03_001"])
+                self.assertEqual(result.exit_code, 0, msg=result.output)
+                batch_payload = json.loads(result.stdout)
+                self.assertEqual(len(batch_payload), 1)
+                self.assertEqual(batch_payload[0]["source"], "sarif")
+                self.assertEqual(batch_payload[0]["scanner"], "CodeQL")
+                self.assertEqual(batch_payload[0]["summary_counts"]["new"], 1)
+                self.assertEqual(batch_payload[0]["finding_ids"], [imported_payload[0]["finding_id"]])
+
+                result = self.runner.invoke(
+                    cli_module.app,
+                    [
+                        "vulnerability-findings-import",
+                        workspace_id,
+                        "P0_25M03_001",
+                        "--source",
+                        "sarif",
+                        "--payload",
+                        json.dumps(
+                            {
+                                "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+                                "runs": [
+                                    {
+                                        "tool": {"driver": {"name": "CodeQL", "rules": [{"id": "py/path-injection"}]}},
+                                        "results": [
+                                            {
+                                                "ruleId": "py/path-injection",
+                                                "level": "error",
+                                                "message": {"text": "User-controlled path reaches file open."},
+                                                "locations": [
+                                                    {
+                                                        "physicalLocation": {
+                                                            "artifactLocation": {"uri": "api/src/example.py"},
+                                                            "region": {"startLine": 12},
+                                                        }
+                                                    }
+                                                ],
+                                            }
+                                        ],
+                                    }
+                                ],
+                            }
+                        ),
+                    ],
+                )
+                self.assertEqual(result.exit_code, 0, msg=result.output)
+
+                result = self.runner.invoke(cli_module.app, ["vulnerability-import-batches", workspace_id, "P0_25M03_001"])
+                self.assertEqual(result.exit_code, 0, msg=result.output)
+                repeated_batch_payload = json.loads(result.stdout)
+                self.assertEqual(len(repeated_batch_payload), 2)
+                self.assertEqual(repeated_batch_payload[0]["summary_counts"]["new"], 0)
+                self.assertEqual(repeated_batch_payload[0]["summary_counts"]["existing"], 1)
+
+                result = self.runner.invoke(
+                    cli_module.app,
+                    ["workspace-security-review-bundle", workspace_id, "--format", "markdown"],
+                )
+                self.assertEqual(result.exit_code, 0, msg=result.output)
+                self.assertIn("# Workspace Security Review Bundle", result.stdout)
+
+                result = self.runner.invoke(
+                    cli_module.app,
                     ["context-replay-capture", workspace_id, "P0_25M03_001", "--label", "cli replay"],
                 )
                 self.assertEqual(result.exit_code, 0, msg=result.output)

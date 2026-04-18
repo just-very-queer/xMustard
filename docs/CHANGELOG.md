@@ -17,6 +17,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - backend migration planning now explicitly tracks a Rust core plus a possible Go API shell instead of assuming the HTTP layer must stay in Python until the very end
 
 ### Added
+- issue-level vulnerability import batch persistence via `vulnerability_import_batches.json`, including source/scanner provenance, imported finding ids, payload hash, and lifecycle summary counts for `new` / `existing` / `resolved` / `regressed`
+- issue-level vulnerability import batch inspection through Python service, FastAPI route `/api/workspaces/{workspace_id}/issues/{issue_id}/vulnerability-import-batches`, and matching CLI command `vulnerability-import-batches`
+- vulnerability import activity now records the durable import batch id alongside SARIF and Nessus imports
 - repo-native `.xmustard.yaml` support for path-specific instructions, code-guideline references, MCP/browser-context hints, and issue-context prompt attachment
 - Go parity for `.xmustard.yaml` repo-config reads and issue-context prompt attachment, including matched path instructions inside Go-built issue packets
 - Issue-level threat model artifacts with backend CRUD, prompt integration, export support, and issue detail editing

@@ -667,6 +667,30 @@ def import_vulnerability_findings(workspace_id: str, issue_id: str, request: Vul
         raise HTTPException(status_code=400, detail=str(exc))
 
 
+@app.get("/api/workspaces/{workspace_id}/issues/{issue_id}/vulnerability-import-batches")
+def list_vulnerability_import_batches(workspace_id: str, issue_id: str):
+    try:
+        return [item.model_dump(mode="json") for item in SERVICE.list_vulnerability_import_batches(workspace_id, issue_id)]
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"Missing resource: {exc}")
+
+
+@app.get("/api/workspaces/{workspace_id}/issues/{issue_id}/vulnerability-report")
+def get_vulnerability_report(workspace_id: str, issue_id: str, format: str = Query(default="json")):
+    try:
+        selected_format = format.strip().lower() or "json"
+        if selected_format == "markdown":
+            return {
+                "format": "markdown",
+                "content": SERVICE.render_vulnerability_finding_report_markdown(workspace_id, issue_id),
+            }
+        return SERVICE.get_vulnerability_finding_report(workspace_id, issue_id).model_dump(mode="json")
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"Missing resource: {exc}")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
 @app.delete("/api/workspaces/{workspace_id}/issues/{issue_id}/vulnerability-findings/{finding_id}")
 def delete_vulnerability_finding(workspace_id: str, issue_id: str, finding_id: str):
     try:
@@ -1002,6 +1026,38 @@ def export_workspace(workspace_id: str):
         return SERVICE.export_workspace(workspace_id).model_dump(mode="json")
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="Workspace not found")
+
+
+@app.get("/api/workspaces/{workspace_id}/vulnerability-report")
+def get_workspace_vulnerability_report(workspace_id: str, format: str = Query(default="json")):
+    try:
+        selected_format = format.strip().lower() or "json"
+        if selected_format == "markdown":
+            return {
+                "format": "markdown",
+                "content": SERVICE.render_workspace_vulnerability_report_markdown(workspace_id),
+            }
+        return SERVICE.get_workspace_vulnerability_report(workspace_id).model_dump(mode="json")
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"Missing resource: {exc}")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.get("/api/workspaces/{workspace_id}/security-review-bundle")
+def get_workspace_security_review_bundle(workspace_id: str, format: str = Query(default="json")):
+    try:
+        selected_format = format.strip().lower() or "json"
+        if selected_format == "markdown":
+            return {
+                "format": "markdown",
+                "content": SERVICE.render_workspace_security_review_bundle_markdown(workspace_id),
+            }
+        return SERVICE.get_workspace_security_review_bundle(workspace_id).model_dump(mode="json")
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"Missing resource: {exc}")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 @app.post("/api/workspaces/{workspace_id}/integrations")

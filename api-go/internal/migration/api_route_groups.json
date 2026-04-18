@@ -31,7 +31,9 @@
       "/api/workspaces/{workspace_id}/repo-config",
       "/api/workspaces/{workspace_id}/repo-config/health",
       "/api/workspaces/{workspace_id}/repo-map",
-      "/api/workspaces/{workspace_id}/export"
+      "/api/workspaces/{workspace_id}/export",
+      "/api/workspaces/{workspace_id}/vulnerability-report",
+      "/api/workspaces/{workspace_id}/security-review-bundle"
     ]
   },
   {
@@ -73,6 +75,8 @@
       "/api/workspaces/{workspace_id}/issues/{issue_id}/browser-dumps",
       "/api/workspaces/{workspace_id}/issues/{issue_id}/vulnerability-findings",
       "/api/workspaces/{workspace_id}/issues/{issue_id}/vulnerability-findings/import",
+      "/api/workspaces/{workspace_id}/issues/{issue_id}/vulnerability-import-batches",
+      "/api/workspaces/{workspace_id}/issues/{issue_id}/vulnerability-report",
       "/api/workspaces/{workspace_id}/issues/{issue_id}/context-replays",
       "/api/workspaces/{workspace_id}/issues/{issue_id}/context-replays/{replay_id}/compare"
     ]

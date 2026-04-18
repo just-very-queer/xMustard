@@ -28,6 +28,7 @@ from .models import (
     VerificationProfileExecutionResult,
     VerificationRecord,
     VulnerabilityFindingRecord,
+    VulnerabilityImportBatchRecord,
     WorkspaceRecord,
     WorkspaceSnapshot,
 )
@@ -130,6 +131,9 @@ class FileStore:
 
     def vulnerability_findings_path(self, workspace_id: str) -> Path:
         return self.workspace_dir(workspace_id) / "vulnerability_findings.json"
+
+    def vulnerability_import_batches_path(self, workspace_id: str) -> Path:
+        return self.workspace_dir(workspace_id) / "vulnerability_import_batches.json"
 
     def eval_scenarios_path(self, workspace_id: str) -> Path:
         return self.workspace_dir(workspace_id) / "eval_scenarios.json"
@@ -297,6 +301,18 @@ class FileStore:
         ordered = sorted(findings, key=lambda item: (item.issue_id, item.severity, item.title.lower(), item.created_at))
         self._write_json(
             self.vulnerability_findings_path(workspace_id),
+            [item.model_dump(mode="json") for item in ordered],
+        )
+
+    def list_vulnerability_import_batches(self, workspace_id: str) -> list[VulnerabilityImportBatchRecord]:
+        data = self._read_json(self.vulnerability_import_batches_path(workspace_id), [])
+        items = [VulnerabilityImportBatchRecord.model_validate(item) for item in data]
+        return sorted(items, key=lambda item: item.created_at, reverse=True)
+
+    def save_vulnerability_import_batches(self, workspace_id: str, batches: list[VulnerabilityImportBatchRecord]) -> None:
+        ordered = sorted(batches, key=lambda item: item.created_at, reverse=True)
+        self._write_json(
+            self.vulnerability_import_batches_path(workspace_id),
             [item.model_dump(mode="json") for item in ordered],
         )
 

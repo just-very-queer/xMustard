@@ -126,12 +126,18 @@ from .models import (
     VerificationProfileRunRequest,
     VerifyIssueRequest,
     VulnerabilityFindingRecord,
+    VulnerabilityFindingReport,
+    VulnerabilityFindingReportItem,
     VulnerabilityFindingUpsertRequest,
+    VulnerabilityImportBatchRecord,
     VulnerabilityImportRequest,
     WorktreeStatus,
     WorkspaceLoadRequest,
     WorkspaceRecord,
+    WorkspaceSecurityReviewBundle,
     WorkspaceSnapshot,
+    WorkspaceVulnerabilityIssueRollup,
+    WorkspaceVulnerabilityReport,
     build_activity_actor,
     utc_now,
 )
@@ -1412,6 +1418,52 @@ class TrackerService:
         severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
         return sorted(items, key=lambda item: (severity_order.get(item.severity, 99), item.title.lower(), item.created_at))
 
+    def list_vulnerability_import_batches(self, workspace_id: str, issue_id: Optional[str] = None) -> list[VulnerabilityImportBatchRecord]:
+        self.get_workspace(workspace_id)
+        items = self.store.list_vulnerability_import_batches(workspace_id)
+        if issue_id:
+            items = [item for item in items if item.issue_id == issue_id]
+        return items
+
+    def _record_vulnerability_import_batch(
+        self,
+        workspace_id: str,
+        issue_id: str,
+        source: str,
+        payload: str,
+        previous_by_id: dict[str, VulnerabilityFindingRecord],
+        imported: list[VulnerabilityFindingRecord],
+    ) -> VulnerabilityImportBatchRecord:
+        scanner = imported[0].scanner if imported else str(source)
+        closed_statuses = {"fixed", "verified", "closed"}
+        summary_counts = {"new": 0, "existing": 0, "resolved": 0, "regressed": 0}
+        for finding in imported:
+            previous = previous_by_id.get(finding.finding_id)
+            if previous is None:
+                summary_counts["new"] += 1
+                continue
+            if previous.status in closed_statuses and finding.status not in closed_statuses:
+                summary_counts["regressed"] += 1
+            elif previous.status not in closed_statuses and finding.status in closed_statuses:
+                summary_counts["resolved"] += 1
+            else:
+                summary_counts["existing"] += 1
+        batch = VulnerabilityImportBatchRecord(
+            batch_id=f"vuln_import_{uuid.uuid4().hex[:12]}",
+            workspace_id=workspace_id,
+            issue_id=issue_id,
+            source=source,
+            scanner=scanner,
+            finding_ids=[finding.finding_id for finding in imported],
+            total_findings=len(imported),
+            summary_counts=summary_counts,
+            payload_sha256=hashlib.sha256(payload.encode("utf-8")).hexdigest() if payload else None,
+        )
+        batches = self.store.list_vulnerability_import_batches(workspace_id)
+        batches.append(batch)
+        self.store.save_vulnerability_import_batches(workspace_id, batches)
+        return batch
+
     def save_vulnerability_finding(
         self,
         workspace_id: str,
@@ -1422,6 +1474,15 @@ class TrackerService:
         action: str = "vulnerability_finding.saved",
     ) -> VulnerabilityFindingRecord:
         self._get_issue_from_snapshot(workspace_id, issue_id)
+        linked_threat_model_ids = self._normalize_text_list(request.threat_model_ids, limit=12)
+        if linked_threat_model_ids:
+            valid_threat_model_ids = {
+                item.threat_model_id
+                for item in self.list_threat_models(workspace_id, issue_id=issue_id)
+            }
+            missing_threat_model_ids = [item for item in linked_threat_model_ids if item not in valid_threat_model_ids]
+            if missing_threat_model_ids:
+                raise ValueError(f"Unknown threat model ids: {', '.join(missing_threat_model_ids)}")
         existing = self.store.list_vulnerability_findings(workspace_id)
         finding_id = request.finding_id or self._slug_runbook_name(f"vuln-{request.scanner}-{request.title}")
         previous = next((item for item in existing if item.finding_id == finding_id and item.issue_id == issue_id), None)
@@ -1443,6 +1504,7 @@ class TrackerService:
             cve_ids=self._normalize_text_list(request.cve_ids, limit=12),
             references=self._normalize_text_list(request.references, limit=12),
             evidence=self._normalize_text_list(request.evidence, limit=12),
+            threat_model_ids=linked_threat_model_ids,
             raw_payload=request.raw_payload.strip() if request.raw_payload else None,
             created_at=previous.created_at if previous else now,
             updated_at=now,
@@ -1458,7 +1520,13 @@ class TrackerService:
             summary=f"Saved vulnerability finding {record.title}",
             actor=actor or build_activity_actor("operator", "operator"),
             issue_id=issue_id,
-            details={"finding_id": finding_id, "scanner": record.scanner, "severity": record.severity, "status": record.status},
+            details={
+                "finding_id": finding_id,
+                "scanner": record.scanner,
+                "severity": record.severity,
+                "status": record.status,
+                "threat_model_ids": record.threat_model_ids,
+            },
         )
         return record
 
@@ -1480,6 +1548,282 @@ class TrackerService:
             details={"finding_id": finding_id},
         )
 
+    def get_vulnerability_finding_report(self, workspace_id: str, issue_id: str) -> VulnerabilityFindingReport:
+        self._get_issue_from_snapshot(workspace_id, issue_id)
+        findings = self.list_vulnerability_findings(workspace_id, issue_id)
+        threat_models = self.list_threat_models(workspace_id, issue_id=issue_id)
+        threat_model_lookup = {item.threat_model_id: item for item in threat_models}
+        linked_threat_models: list[ThreatModelRecord] = []
+        seen_linked_threat_models: set[str] = set()
+        report_findings: list[VulnerabilityFindingReportItem] = []
+        severity_counts: Counter[str] = Counter()
+        status_counts: Counter[str] = Counter()
+        for finding in findings:
+            severity_counts[finding.severity] += 1
+            status_counts[finding.status] += 1
+            linked_titles: list[str] = []
+            for threat_model_id in finding.threat_model_ids:
+                linked = threat_model_lookup.get(threat_model_id)
+                if not linked:
+                    continue
+                linked_titles.append(linked.title)
+                if threat_model_id not in seen_linked_threat_models:
+                    linked_threat_models.append(linked)
+                    seen_linked_threat_models.add(threat_model_id)
+            report_findings.append(
+                VulnerabilityFindingReportItem(
+                    finding_id=finding.finding_id,
+                    scanner=finding.scanner,
+                    source=finding.source,
+                    severity=finding.severity,
+                    status=finding.status,
+                    title=finding.title,
+                    summary=finding.summary,
+                    rule_id=finding.rule_id,
+                    location_path=finding.location_path,
+                    location_line=finding.location_line,
+                    cwe_ids=list(finding.cwe_ids),
+                    cve_ids=list(finding.cve_ids),
+                    references=list(finding.references),
+                    evidence=list(finding.evidence),
+                    threat_model_ids=list(finding.threat_model_ids),
+                    linked_threat_model_titles=linked_titles,
+                    created_at=finding.created_at,
+                    updated_at=finding.updated_at,
+                )
+            )
+        return VulnerabilityFindingReport(
+            workspace_id=workspace_id,
+            issue_id=issue_id,
+            total_findings=len(report_findings),
+            by_severity=dict(severity_counts),
+            by_status=dict(status_counts),
+            linked_threat_models=linked_threat_models,
+            findings=report_findings,
+        )
+
+    def render_vulnerability_finding_report_markdown(self, workspace_id: str, issue_id: str) -> str:
+        report = self.get_vulnerability_finding_report(workspace_id, issue_id)
+        issue = self._get_issue_from_snapshot(workspace_id, issue_id)
+        severity_summary = ", ".join(f"{key}: {value}" for key, value in sorted(report.by_severity.items())) or "none"
+        status_summary = ", ".join(f"{key}: {value}" for key, value in sorted(report.by_status.items())) or "none"
+        lines = [
+            f"# Vulnerability Report — {issue_id}",
+            "",
+            f"- Issue: {issue.title}",
+            f"- Total findings: {report.total_findings}",
+            f"- Severity summary: {severity_summary}",
+            f"- Status summary: {status_summary}",
+            "",
+            "## Linked Threat Models",
+        ]
+        if report.linked_threat_models:
+            for threat_model in report.linked_threat_models:
+                lines.append(
+                    f"- {threat_model.title} ({threat_model.threat_model_id}) — {threat_model.summary or 'No summary.'}"
+                )
+        else:
+            lines.append("- None linked")
+        lines.extend(["", "## Findings"])
+        if not report.findings:
+            lines.append("- No vulnerability findings recorded.")
+            return "\n".join(lines)
+        for finding in report.findings:
+            lines.extend(
+                [
+                    f"### {finding.title}",
+                    f"- Severity: {finding.severity}",
+                    f"- Status: {finding.status}",
+                    f"- Scanner: {finding.scanner} ({finding.source})",
+                    f"- Rule: {finding.rule_id or 'n/a'}",
+                    f"- Location: {f'{finding.location_path}:{finding.location_line}' if finding.location_path and finding.location_line else (finding.location_path or 'n/a')}",
+                    f"- CWEs: {', '.join(finding.cwe_ids) if finding.cwe_ids else 'none'}",
+                    f"- CVEs: {', '.join(finding.cve_ids) if finding.cve_ids else 'none'}",
+                    f"- Linked threat models: {', '.join(finding.linked_threat_model_titles) if finding.linked_threat_model_titles else 'none'}",
+                    f"- Summary: {finding.summary or 'No summary.'}",
+                    f"- Evidence: {'; '.join(finding.evidence) if finding.evidence else 'none'}",
+                    "",
+                ]
+            )
+        return "\n".join(lines).rstrip()
+
+    def get_workspace_vulnerability_report(self, workspace_id: str) -> WorkspaceVulnerabilityReport:
+        snapshot = self.get_workspace(workspace_id)
+        findings = self.list_vulnerability_findings(workspace_id)
+        issues = {item.bug_id: item for item in self.list_issues(workspace_id)}
+        threat_models = self.list_threat_models(workspace_id)
+        threat_model_lookup = {item.threat_model_id: item for item in threat_models}
+        severity_counts: Counter[str] = Counter()
+        status_counts: Counter[str] = Counter()
+        source_counts: Counter[str] = Counter()
+        linked_threat_model_ids: set[str] = set()
+        per_issue: dict[str, dict[str, object]] = {}
+        closed_statuses = {"fixed", "verified", "closed"}
+        vulnerability_severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+        for finding in findings:
+            severity_counts[finding.severity] += 1
+            status_counts[finding.status] += 1
+            source_counts[finding.source] += 1
+            bucket = per_issue.setdefault(
+                finding.issue_id,
+                {
+                    "total_findings": 0,
+                    "open_findings": 0,
+                    "linked_threat_models": set(),
+                    "scanners": set(),
+                    "highest_finding_severity_rank": 99,
+                },
+            )
+            bucket["total_findings"] = int(bucket["total_findings"]) + 1
+            bucket["highest_finding_severity_rank"] = min(
+                int(bucket["highest_finding_severity_rank"]),
+                vulnerability_severity_order.get(finding.severity, 99),
+            )
+            if finding.status not in closed_statuses:
+                bucket["open_findings"] = int(bucket["open_findings"]) + 1
+            scanners = bucket["scanners"]
+            assert isinstance(scanners, set)
+            scanners.add(finding.scanner)
+            linked_bucket = bucket["linked_threat_models"]
+            assert isinstance(linked_bucket, set)
+            for threat_model_id in finding.threat_model_ids:
+                if threat_model_id in threat_model_lookup:
+                    linked_bucket.add(threat_model_id)
+                    linked_threat_model_ids.add(threat_model_id)
+        issue_rollups: list[WorkspaceVulnerabilityIssueRollup] = []
+        issue_sort_keys: dict[str, tuple[int, int, int, str]] = {}
+        linked_threat_models = [threat_model_lookup[item] for item in sorted(linked_threat_model_ids) if item in threat_model_lookup]
+        severity_names = [name for name, _rank in sorted(vulnerability_severity_order.items(), key=lambda item: item[1])]
+        for issue_id, bucket in per_issue.items():
+            issue = issues.get(issue_id)
+            linked_ids = bucket["linked_threat_models"]
+            scanners = bucket["scanners"]
+            highest_rank = int(bucket["highest_finding_severity_rank"])
+            assert isinstance(linked_ids, set)
+            assert isinstance(scanners, set)
+            issue_rollups.append(
+                WorkspaceVulnerabilityIssueRollup(
+                    issue_id=issue_id,
+                    title=issue.title if issue else issue_id,
+                    issue_severity=issue.severity if issue else "unknown",
+                    highest_vulnerability_severity=severity_names[highest_rank] if highest_rank < len(severity_names) else "info",
+                    total_findings=int(bucket["total_findings"]),
+                    open_findings=int(bucket["open_findings"]),
+                    linked_threat_models=len(linked_ids),
+                    scanners=sorted(scanners),
+                )
+            )
+            issue_sort_keys[issue_id] = (
+                -int(bucket["open_findings"]),
+                highest_rank,
+                -int(bucket["total_findings"]),
+                issue_id,
+            )
+        issue_rollups.sort(key=lambda item: issue_sort_keys[item.issue_id])
+        return WorkspaceVulnerabilityReport(
+            workspace_id=snapshot.workspace_id,
+            total_findings=len(findings),
+            by_severity=dict(severity_counts),
+            by_status=dict(status_counts),
+            by_source=dict(source_counts),
+            linked_threat_models_total=len(linked_threat_model_ids),
+            linked_threat_models=linked_threat_models,
+            issue_rollups=issue_rollups,
+        )
+
+    def render_workspace_vulnerability_report_markdown(self, workspace_id: str) -> str:
+        report = self.get_workspace_vulnerability_report(workspace_id)
+        severity_summary = ", ".join(f"{key}: {value}" for key, value in sorted(report.by_severity.items())) or "none"
+        status_summary = ", ".join(f"{key}: {value}" for key, value in sorted(report.by_status.items())) or "none"
+        source_summary = ", ".join(f"{key}: {value}" for key, value in sorted(report.by_source.items())) or "none"
+        lines = [
+            f"# Workspace Vulnerability Report — {workspace_id}",
+            "",
+            f"- Total findings: {report.total_findings}",
+            f"- Severity summary: {severity_summary}",
+            f"- Status summary: {status_summary}",
+            f"- Source summary: {source_summary}",
+            f"- Linked threat models total: {report.linked_threat_models_total}",
+            "",
+            "## Issue Rollups",
+        ]
+        if not report.issue_rollups:
+            lines.append("- No vulnerability findings recorded.")
+        for rollup in report.issue_rollups:
+            lines.append(
+                f"- {rollup.issue_id} [issue={rollup.issue_severity} / vulnerability={rollup.highest_vulnerability_severity}] {rollup.title}: total={rollup.total_findings}, open={rollup.open_findings}, linked-threat-models={rollup.linked_threat_models}, scanners={', '.join(rollup.scanners) if rollup.scanners else 'none'}"
+            )
+        if report.linked_threat_models:
+            lines.extend(["", "## Linked Threat Models"])
+            for threat_model in report.linked_threat_models:
+                lines.append(f"- {threat_model.title} ({threat_model.threat_model_id})")
+        return "\n".join(lines).rstrip()
+
+    def get_workspace_security_review_bundle(self, workspace_id: str) -> WorkspaceSecurityReviewBundle:
+        report = self.get_workspace_vulnerability_report(workspace_id)
+        open_statuses = {"open", "triaged", "fixing"}
+        open_findings = sum(report.by_status.get(status, 0) for status in open_statuses)
+        issue_reports = [
+            self.get_vulnerability_finding_report(workspace_id, rollup.issue_id)
+            for rollup in report.issue_rollups
+        ]
+        top_findings: list[VulnerabilityFindingReportItem] = []
+        for issue_report in issue_reports:
+            top_findings.extend(issue_report.findings)
+        severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+        status_order = {"open": 0, "triaged": 1, "fixing": 2, "fixed": 3, "verified": 4, "closed": 5}
+        top_findings = sorted(
+            top_findings,
+            key=lambda item: (
+                severity_order.get(item.severity, 99),
+                status_order.get(item.status, 99),
+                item.title.lower(),
+            ),
+        )[:5]
+        recent_activity = self.list_activity(workspace_id, limit=8)
+        return WorkspaceSecurityReviewBundle(
+            workspace_id=workspace_id,
+            total_findings=report.total_findings,
+            open_findings=open_findings,
+            linked_threat_models=report.linked_threat_models,
+            top_findings=top_findings,
+            issue_rollups=report.issue_rollups,
+            recent_activity=recent_activity,
+        )
+
+    def render_workspace_security_review_bundle_markdown(self, workspace_id: str) -> str:
+        bundle = self.get_workspace_security_review_bundle(workspace_id)
+        lines = [
+            f"# Workspace Security Review Bundle — {workspace_id}",
+            "",
+            f"- Total findings: {bundle.total_findings}",
+            f"- Open findings: {bundle.open_findings}",
+            f"- Linked threat models: {len(bundle.linked_threat_models)}",
+            "",
+            "## Top Findings",
+        ]
+        if not bundle.top_findings:
+            lines.append("- No vulnerability findings recorded.")
+        for finding in bundle.top_findings:
+            lines.append(
+                f"- {finding.title} [{finding.severity} / {finding.status}] — {finding.summary or 'No summary.'}"
+            )
+        if bundle.linked_threat_models:
+            lines.extend(["", "## Linked Threat Models"])
+            for threat_model in bundle.linked_threat_models:
+                lines.append(f"- {threat_model.title} ({threat_model.threat_model_id})")
+        if bundle.issue_rollups:
+            lines.extend(["", "## Issue Rollups"])
+            for rollup in bundle.issue_rollups:
+                lines.append(
+                    f"- {rollup.issue_id} [issue={rollup.issue_severity} / vulnerability={rollup.highest_vulnerability_severity}] {rollup.title}: total={rollup.total_findings}, open={rollup.open_findings}"
+                )
+        if bundle.recent_activity:
+            lines.extend(["", "## Recent Activity"])
+            for activity in bundle.recent_activity[:6]:
+                lines.append(f"- {activity.action}: {activity.summary}")
+        return "\n".join(lines).rstrip()
+
     def import_sarif_vulnerability_findings(
         self,
         workspace_id: str,
@@ -1494,6 +1838,10 @@ class TrackerService:
         if not isinstance(sarif, dict):
             raise ValueError("SARIF payload must decode to an object")
 
+        previous_by_id = {
+            item.finding_id: item
+            for item in self.list_vulnerability_findings(workspace_id, issue_id)
+        }
         imported: list[VulnerabilityFindingRecord] = []
         runs = sarif.get("runs") if isinstance(sarif.get("runs"), list) else []
         for run in runs:
@@ -1520,6 +1868,14 @@ class TrackerService:
                         action="vulnerability_finding.imported",
                     )
                 )
+        batch = self._record_vulnerability_import_batch(
+            workspace_id,
+            issue_id,
+            "sarif",
+            payload,
+            previous_by_id,
+            imported,
+        )
         self._record_activity(
             workspace_id=workspace_id,
             entity_type="issue",
@@ -1528,7 +1884,7 @@ class TrackerService:
             summary=f"Imported {len(imported)} vulnerability finding(s) from SARIF",
             actor=build_activity_actor("system", "system"),
             issue_id=issue_id,
-            details={"source": "sarif", "count": len(imported)},
+            details={"source": "sarif", "count": len(imported), "batch_id": batch.batch_id},
         )
         return imported
 
@@ -1546,6 +1902,10 @@ class TrackerService:
         if not isinstance(nessus, dict):
             raise ValueError("Nessus payload must decode to an object")
 
+        previous_by_id = {
+            item.finding_id: item
+            for item in self.list_vulnerability_findings(workspace_id, issue_id)
+        }
         imported: list[VulnerabilityFindingRecord] = []
         for item in self._extract_nessus_items(nessus):
             imported.append(
@@ -1557,6 +1917,14 @@ class TrackerService:
                     action="vulnerability_finding.imported",
                 )
             )
+        batch = self._record_vulnerability_import_batch(
+            workspace_id,
+            issue_id,
+            "nessus-json",
+            payload,
+            previous_by_id,
+            imported,
+        )
         self._record_activity(
             workspace_id=workspace_id,
             entity_type="issue",
@@ -1565,95 +1933,7 @@ class TrackerService:
             summary=f"Imported {len(imported)} vulnerability finding(s) from Nessus JSON",
             actor=build_activity_actor("system", "system"),
             issue_id=issue_id,
-            details={"source": "nessus-json", "count": len(imported)},
-        )
-        return imported
-
-    def import_semgrep_vulnerability_findings(
-        self,
-        workspace_id: str,
-        issue_id: str,
-        payload: str,
-    ) -> list[VulnerabilityFindingRecord]:
-        self._get_issue_from_snapshot(workspace_id, issue_id)
-        try:
-            semgrep = json.loads(payload)
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"Invalid Semgrep payload: {exc}")
-        if not isinstance(semgrep, dict):
-            raise ValueError("Semgrep payload must decode to an object")
-
-        imported: list[VulnerabilityFindingRecord] = []
-        results = semgrep.get("results") if isinstance(semgrep.get("results"), list) else []
-        for result in results:
-            if not isinstance(result, dict):
-                continue
-            imported.append(
-                self.save_vulnerability_finding(
-                    workspace_id,
-                    issue_id,
-                    self._build_semgrep_vulnerability_request(result),
-                    actor=build_activity_actor("system", "system"),
-                    action="vulnerability_finding.imported",
-                )
-            )
-        self._record_activity(
-            workspace_id=workspace_id,
-            entity_type="issue",
-            entity_id=issue_id,
-            action="vulnerability_findings.imported",
-            summary=f"Imported {len(imported)} vulnerability finding(s) from Semgrep JSON",
-            actor=build_activity_actor("system", "system"),
-            issue_id=issue_id,
-            details={"source": "semgrep-json", "count": len(imported)},
-        )
-        return imported
-
-    def import_trivy_vulnerability_findings(
-        self,
-        workspace_id: str,
-        issue_id: str,
-        payload: str,
-    ) -> list[VulnerabilityFindingRecord]:
-        self._get_issue_from_snapshot(workspace_id, issue_id)
-        try:
-            trivy = json.loads(payload)
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"Invalid Trivy payload: {exc}")
-        if not isinstance(trivy, dict):
-            raise ValueError("Trivy payload must decode to an object")
-
-        imported: list[VulnerabilityFindingRecord] = []
-        results = trivy.get("Results") if isinstance(trivy.get("Results"), list) else []
-        for result in results:
-            if not isinstance(result, dict):
-                continue
-            target = str(result.get("Target") or result.get("target") or "").strip() or None
-            for key in ("Vulnerabilities", "Misconfigurations", "Secrets"):
-                items = result.get(key)
-                if not isinstance(items, list):
-                    continue
-                for item in items:
-                    if not isinstance(item, dict):
-                        continue
-                    imported.append(
-                        self.save_vulnerability_finding(
-                            workspace_id,
-                            issue_id,
-                            self._build_trivy_vulnerability_request(item, target=target, category=key),
-                            actor=build_activity_actor("system", "system"),
-                            action="vulnerability_finding.imported",
-                        )
-                    )
-        self._record_activity(
-            workspace_id=workspace_id,
-            entity_type="issue",
-            entity_id=issue_id,
-            action="vulnerability_findings.imported",
-            summary=f"Imported {len(imported)} vulnerability finding(s) from Trivy JSON",
-            actor=build_activity_actor("system", "system"),
-            issue_id=issue_id,
-            details={"source": "trivy-json", "count": len(imported)},
+            details={"source": "nessus-json", "count": len(imported), "batch_id": batch.batch_id},
         )
         return imported
 
@@ -1662,25 +1942,21 @@ class TrackerService:
             return self.import_sarif_vulnerability_findings(workspace_id, issue_id, request.payload)
         if request.source == "nessus-json":
             return self.import_nessus_vulnerability_findings(workspace_id, issue_id, request.payload)
-        if request.source == "semgrep-json":
-            return self.import_semgrep_vulnerability_findings(workspace_id, issue_id, request.payload)
-        if request.source == "trivy-json":
-            return self.import_trivy_vulnerability_findings(workspace_id, issue_id, request.payload)
         raise ValueError(f"Unsupported vulnerability import source: {request.source}")
 
     def _normalize_vulnerability_severity(self, value) -> str:
         if isinstance(value, (int, float)):
             numeric = float(value)
-            if numeric >= 7:
-                return "critical"
             if numeric >= 4:
+                return "critical"
+            if numeric >= 3:
                 return "high"
-            if numeric >= 1:
+            if numeric >= 2:
                 return "medium"
-            return "low"
+            if numeric >= 1:
+                return "low"
+            return "info"
         text = str(value or "").strip().lower()
-        if re.fullmatch(r"\d+(?:\.\d+)?", text):
-            return self._normalize_vulnerability_severity(float(text))
         if text in {"critical", "crit", "4", "very-high"}:
             return "critical"
         if text in {"high", "error", "3", "important"}:
@@ -1848,158 +2124,6 @@ class TrackerService:
             cwe_ids=cwe_ids,
             cve_ids=cve_ids,
             references=self._normalize_text_list([str(item) for item in references], limit=12),
-            evidence=self._normalize_text_list([part for part in evidence_parts if part], limit=12),
-            raw_payload=json.dumps(item, sort_keys=True),
-        )
-
-    def _build_semgrep_vulnerability_request(self, result: dict) -> VulnerabilityFindingUpsertRequest:
-        extra = result.get("extra") if isinstance(result.get("extra"), dict) else {}
-        metadata = extra.get("metadata") if isinstance(extra.get("metadata"), dict) else {}
-        check_id = str(result.get("check_id") or result.get("checkId") or result.get("rule_id") or "").strip() or None
-        title = str(metadata.get("title") or extra.get("message") or check_id or "Semgrep finding").strip()
-        summary = str(extra.get("message") or metadata.get("description") or metadata.get("impact") or "").strip()
-        severity = self._normalize_vulnerability_severity(extra.get("severity") or metadata.get("severity"))
-        location_path = str(result.get("path") or extra.get("path") or "").strip() or None
-        start = result.get("start") if isinstance(result.get("start"), dict) else {}
-        location_line = start.get("line") if isinstance(start.get("line"), int) else None
-        metadata_references = metadata.get("references")
-        if not isinstance(metadata_references, list):
-            metadata_references = [metadata_references] if metadata_references else []
-        taxonomy_inputs: list[str] = []
-        for key in ("cwe", "cve", "owasp", "owasp-top-ten"):
-            value = metadata.get(key)
-            if isinstance(value, list):
-                taxonomy_inputs.extend(str(item) for item in value)
-            elif value:
-                taxonomy_inputs.append(str(value))
-        taxonomy_inputs.extend([check_id or "", title, summary, *[str(item) for item in metadata_references]])
-        cwe_ids, cve_ids = self._extract_vulnerability_taxonomy_ids(taxonomy_inputs)
-        evidence_parts = [
-            str(extra.get("message") or "").strip(),
-            str(extra.get("lines") or "").strip(),
-            str(metadata.get("description") or "").strip(),
-            str(metadata.get("impact") or "").strip(),
-            str(metadata.get("fix") or "").strip(),
-        ]
-        references = [
-            *[str(item) for item in metadata_references],
-            str(metadata.get("source") or "").strip(),
-            str(metadata.get("shortlink") or "").strip(),
-        ]
-        return VulnerabilityFindingUpsertRequest(
-            finding_id=self._stable_vulnerability_finding_id("semgrep-json", "semgrep", check_id, title, location_path, location_line),
-            scanner="semgrep",
-            source="semgrep-json",
-            severity=severity,
-            status="open",
-            title=title,
-            summary=summary,
-            rule_id=check_id,
-            location_path=location_path,
-            location_line=location_line,
-            cwe_ids=cwe_ids,
-            cve_ids=cve_ids,
-            references=self._normalize_text_list([item for item in references if item], limit=12),
-            evidence=self._normalize_text_list([part for part in evidence_parts if part], limit=12),
-            raw_payload=json.dumps(result, sort_keys=True),
-        )
-
-    def _build_trivy_vulnerability_request(
-        self,
-        item: dict,
-        *,
-        target: Optional[str],
-        category: str,
-    ) -> VulnerabilityFindingUpsertRequest:
-        category_key = category.strip().lower()
-        cause_metadata = item.get("CauseMetadata") if isinstance(item.get("CauseMetadata"), dict) else {}
-        location_path = (
-            str(cause_metadata.get("Resource") or item.get("Target") or target or "").strip()
-            or None
-        )
-        location_line = cause_metadata.get("StartLine") if isinstance(cause_metadata.get("StartLine"), int) else None
-        if location_line is None:
-            location = item.get("Location") if isinstance(item.get("Location"), dict) else {}
-            location_line = location.get("StartLine") if isinstance(location.get("StartLine"), int) else None
-
-        references = item.get("References") or item.get("references") or item.get("URLs") or []
-        if not isinstance(references, list):
-            references = [references] if references else []
-        primary_url = str(item.get("PrimaryURL") or item.get("primaryURL") or "").strip()
-        datasource = item.get("DataSource") if isinstance(item.get("DataSource"), dict) else {}
-        datasource_url = str(datasource.get("URL") or "").strip()
-
-        if category_key == "misconfigurations":
-            rule_id = str(item.get("ID") or item.get("AVDID") or item.get("RuleID") or "").strip() or None
-            title = str(item.get("Title") or item.get("Message") or rule_id or "Trivy misconfiguration").strip()
-            summary = str(item.get("Description") or item.get("Message") or "").strip()
-            severity = self._normalize_vulnerability_severity(item.get("Severity") or item.get("severity"))
-            taxonomy_inputs = [
-                rule_id or "",
-                title,
-                summary,
-                *[str(item) for item in references],
-                primary_url,
-                datasource_url,
-            ]
-            evidence_parts = [
-                str(item.get("Message") or "").strip(),
-                str(item.get("Resolution") or "").strip(),
-                str(item.get("Query") or "").strip(),
-            ]
-        elif category_key == "secrets":
-            rule_id = str(item.get("RuleID") or item.get("ID") or "").strip() or None
-            title = str(item.get("Title") or rule_id or "Trivy secret").strip()
-            summary = str(item.get("Description") or item.get("Message") or "").strip()
-            severity = self._normalize_vulnerability_severity(item.get("Severity") or item.get("severity") or "high")
-            taxonomy_inputs = [rule_id or "", title, summary, *[str(item) for item in references], primary_url, datasource_url]
-            evidence_parts = [
-                str(item.get("Match") or "").strip(),
-                str(item.get("Code") or "").strip(),
-                str(item.get("Message") or "").strip(),
-            ]
-        else:
-            vulnerability_id = str(item.get("VulnerabilityID") or item.get("vulnerabilityID") or item.get("ID") or "").strip() or None
-            package_name = str(item.get("PkgName") or item.get("PkgID") or "").strip()
-            installed_version = str(item.get("InstalledVersion") or "").strip()
-            rule_id_parts = [part for part in [vulnerability_id, package_name, installed_version] if part]
-            rule_id = ":".join(rule_id_parts) or vulnerability_id
-            title = str(item.get("Title") or vulnerability_id or item.get("PkgName") or "Trivy vulnerability").strip()
-            summary = str(item.get("Description") or item.get("Title") or "").strip()
-            severity = self._normalize_vulnerability_severity(item.get("Severity") or item.get("severity"))
-            taxonomy_inputs = [
-                vulnerability_id or "",
-                title,
-                summary,
-                str(item.get("CweIDs") or "").strip(),
-                str(item.get("CVSS") or "").strip(),
-                *[str(item) for item in references],
-                primary_url,
-                datasource_url,
-            ]
-            evidence_parts = [
-                f"Package: {item.get('PkgName')}" if item.get("PkgName") else "",
-                f"Installed version: {item.get('InstalledVersion')}" if item.get("InstalledVersion") else "",
-                f"Fixed version: {item.get('FixedVersion')}" if item.get("FixedVersion") else "",
-                str(item.get("Status") or "").strip(),
-                str(item.get("Layer") or "").strip(),
-            ]
-
-        cwe_ids, cve_ids = self._extract_vulnerability_taxonomy_ids(taxonomy_inputs)
-        return VulnerabilityFindingUpsertRequest(
-            finding_id=self._stable_vulnerability_finding_id("trivy-json", "trivy", rule_id, title, location_path, location_line),
-            scanner="trivy",
-            source="trivy-json",
-            severity=severity,
-            status="open",
-            title=title,
-            summary=summary,
-            rule_id=rule_id,
-            location_path=location_path,
-            location_line=location_line,
-            cwe_ids=cwe_ids,
-            cve_ids=cve_ids,
-            references=self._normalize_text_list([*map(str, references), primary_url, datasource_url], limit=12),
             evidence=self._normalize_text_list([part for part in evidence_parts if part], limit=12),
             raw_payload=json.dumps(item, sort_keys=True),
         )
@@ -5673,6 +5797,7 @@ Respond with a JSON object containing:
                 f"Console: {console_excerpt}. Network: {network_excerpt}. DOM excerpt: {dom_excerpt}"
             )
         vulnerability_lines = []
+        threat_model_lookup = {item.threat_model_id: item.title for item in threat_models}
         for finding in vulnerability_findings[:4]:
             location = finding.location_path or "No file location recorded."
             if finding.location_line:
@@ -5686,9 +5811,15 @@ Respond with a JSON object containing:
                 rule_bits.append(", ".join(finding.cve_ids[:2]))
             rule_summary = " | ".join(rule_bits) if rule_bits else "No rule or taxonomy ids recorded."
             evidence_summary = "; ".join(finding.evidence[:2]) or "No scanner evidence recorded."
+            linked_threat_models = [threat_model_lookup[item] for item in finding.threat_model_ids if item in threat_model_lookup]
+            linkage_summary = (
+                f" Linked threat models: {', '.join(linked_threat_models)}."
+                if linked_threat_models
+                else ""
+            )
             vulnerability_lines.append(
                 f"- {finding.title} [{finding.scanner} / {finding.source} / {finding.severity} / {finding.status}]: "
-                f"{finding.summary or 'No summary.'} Location: {location}. IDs: {rule_summary}. Evidence: {evidence_summary}"
+                f"{finding.summary or 'No summary.'} Location: {location}. IDs: {rule_summary}. Evidence: {evidence_summary}.{linkage_summary}"
             )
         repo_config_lines = []
         if repo_config:

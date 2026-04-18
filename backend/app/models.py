@@ -583,6 +583,7 @@ class VulnerabilityFindingRecord(BaseModel):
     cve_ids: list[str] = Field(default_factory=list)
     references: list[str] = Field(default_factory=list)
     evidence: list[str] = Field(default_factory=list)
+    threat_model_ids: list[str] = Field(default_factory=list)
     raw_payload: Optional[str] = None
     created_at: str = Field(default_factory=utc_now)
     updated_at: str = Field(default_factory=utc_now)
@@ -853,12 +854,92 @@ class VulnerabilityFindingUpsertRequest(BaseModel):
     cve_ids: list[str] = Field(default_factory=list)
     references: list[str] = Field(default_factory=list)
     evidence: list[str] = Field(default_factory=list)
+    threat_model_ids: list[str] = Field(default_factory=list)
     raw_payload: Optional[str] = None
 
 
 class VulnerabilityImportRequest(BaseModel):
     source: VulnerabilityFindingSource
     payload: str
+
+
+class VulnerabilityImportBatchRecord(BaseModel):
+    batch_id: str
+    workspace_id: str
+    issue_id: str
+    source: VulnerabilityFindingSource
+    scanner: str
+    finding_ids: list[str] = Field(default_factory=list)
+    total_findings: int = 0
+    summary_counts: dict[str, int] = Field(default_factory=dict)
+    payload_sha256: Optional[str] = None
+    created_at: str = Field(default_factory=utc_now)
+
+
+class VulnerabilityFindingReportItem(BaseModel):
+    finding_id: str
+    scanner: str
+    source: VulnerabilityFindingSource
+    severity: VulnerabilitySeverity
+    status: VulnerabilityStatus
+    title: str
+    summary: str = ""
+    rule_id: Optional[str] = None
+    location_path: Optional[str] = None
+    location_line: Optional[int] = None
+    cwe_ids: list[str] = Field(default_factory=list)
+    cve_ids: list[str] = Field(default_factory=list)
+    references: list[str] = Field(default_factory=list)
+    evidence: list[str] = Field(default_factory=list)
+    threat_model_ids: list[str] = Field(default_factory=list)
+    linked_threat_model_titles: list[str] = Field(default_factory=list)
+    created_at: str = Field(default_factory=utc_now)
+    updated_at: str = Field(default_factory=utc_now)
+
+
+class VulnerabilityFindingReport(BaseModel):
+    workspace_id: str
+    issue_id: str
+    total_findings: int = 0
+    by_severity: dict[str, int] = Field(default_factory=dict)
+    by_status: dict[str, int] = Field(default_factory=dict)
+    linked_threat_models: list[ThreatModelRecord] = Field(default_factory=list)
+    findings: list[VulnerabilityFindingReportItem] = Field(default_factory=list)
+    generated_at: str = Field(default_factory=utc_now)
+
+
+class WorkspaceVulnerabilityIssueRollup(BaseModel):
+    issue_id: str
+    title: str
+    issue_severity: str
+    highest_vulnerability_severity: VulnerabilitySeverity = "info"
+    total_findings: int = 0
+    open_findings: int = 0
+    linked_threat_models: int = 0
+    scanners: list[str] = Field(default_factory=list)
+
+
+class WorkspaceVulnerabilityReport(BaseModel):
+    workspace_id: str
+    total_findings: int = 0
+    by_severity: dict[str, int] = Field(default_factory=dict)
+    by_status: dict[str, int] = Field(default_factory=dict)
+    by_source: dict[str, int] = Field(default_factory=dict)
+    linked_threat_models_total: int = 0
+    linked_threat_models: list[ThreatModelRecord] = Field(default_factory=list)
+    issue_rollups: list[WorkspaceVulnerabilityIssueRollup] = Field(default_factory=list)
+    generated_at: str = Field(default_factory=utc_now)
+
+
+class WorkspaceSecurityReviewBundle(BaseModel):
+    workspace_id: str
+    total_findings: int = 0
+    open_findings: int = 0
+    linked_threat_models: list[ThreatModelRecord] = Field(default_factory=list)
+    top_findings: list[VulnerabilityFindingReportItem] = Field(default_factory=list)
+    issue_rollups: list[WorkspaceVulnerabilityIssueRollup] = Field(default_factory=list)
+    recent_activity: list[ActivityRecord] = Field(default_factory=list)
+    generated_at: str = Field(default_factory=utc_now)
 
 
 class VerifyIssueRequest(BaseModel):

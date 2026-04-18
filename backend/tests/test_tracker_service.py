@@ -31,7 +31,6 @@ from app.models import (
     VerificationProfileRunRequest,
     VerifyIssueRequest,
     VulnerabilityFindingUpsertRequest,
-    VulnerabilityImportRequest,
     WorktreeStatus,
     WorkspaceLoadRequest,
 )
@@ -762,48 +761,6 @@ reviews:
             self.assertIn("CWE-022", imported[0].cwe_ids)
             self.assertIn("CVE-2026-1111", imported[0].cve_ids)
 
-            sarif_numeric_payload = json.dumps(
-                {
-                    "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
-                    "runs": [
-                        {
-                            "tool": {
-                                "driver": {
-                                    "name": "CodeQL",
-                                    "rules": [
-                                        {
-                                            "id": "py/path-injection",
-                                            "shortDescription": {"text": "Path injection"},
-                                            "properties": {"security-severity": "8.5"},
-                                        }
-                                    ],
-                                }
-                            },
-                            "results": [
-                                {
-                                    "ruleId": "py/path-injection",
-                                    "message": {"text": "Numeric severity example."},
-                                    "locations": [
-                                        {
-                                            "physicalLocation": {
-                                                "artifactLocation": {"uri": "api/src/example.py"},
-                                                "region": {"startLine": 12},
-                                            }
-                                        }
-                                    ],
-                                }
-                            ],
-                        }
-                    ],
-                }
-            )
-            numeric_import = service.import_sarif_vulnerability_findings(
-                snapshot.workspace.workspace_id,
-                "P0_25M03_001",
-                sarif_numeric_payload,
-            )
-            self.assertEqual(numeric_import[0].severity, "critical")
-
             imported_again = service.import_sarif_vulnerability_findings(
                 snapshot.workspace.workspace_id,
                 "P0_25M03_001",
@@ -867,7 +824,7 @@ reviews:
                 any(item.artifact_type == "vulnerability_finding" for item in (packet.dynamic_context.related_context if packet.dynamic_context else []))
             )
 
-    def test_import_semgrep_vulnerability_findings_normalizes_and_dispatches(self):
+    def test_vulnerability_import_batches_are_recorded_with_lifecycle_summaries(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir) / "repo"
             (root / "docs" / "bugs").mkdir(parents=True)
@@ -879,63 +836,67 @@ reviews:
             service = TrackerService(store)
             snapshot = service.load_workspace(WorkspaceLoadRequest(root_path=str(root), auto_scan=True))
             assert snapshot is not None
+            workspace_id = snapshot.workspace.workspace_id
+            issue_id = "P0_25M03_001"
 
-            semgrep_payload = json.dumps(
+            sarif_payload = json.dumps(
                 {
-                    "version": "1.70.0",
-                    "results": [
+                    "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+                    "runs": [
                         {
-                            "check_id": "python.flask.security.audit.xss.template-autoescape-disabled",
-                            "path": "api/src/example.py",
-                            "start": {"line": 12, "col": 1},
-                            "extra": {
-                                "severity": "ERROR",
-                                "message": "Template autoescape is disabled on untrusted input.",
-                                "lines": "render_template_string(user_input)",
-                                "metadata": {
-                                    "title": "Template autoescape disabled",
-                                    "description": "User input is rendered without escaping.",
-                                    "impact": "Can lead to reflected XSS.",
-                                    "cwe": ["CWE-79: Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')"],
-                                    "cve": ["CVE-2026-3333"],
-                                    "references": ["https://semgrep.dev/r/python.flask.security.audit.xss.template-autoescape-disabled"],
-                                    "source": "https://semgrep.dev",
-                                    "shortlink": "https://sg.run/autoescape",
-                                },
+                            "tool": {
+                                "driver": {
+                                    "name": "CodeQL",
+                                    "rules": [
+                                        {
+                                            "id": "py/path-injection",
+                                            "shortDescription": {"text": "Path injection"},
+                                        }
+                                    ],
+                                }
                             },
+                            "results": [
+                                {
+                                    "ruleId": "py/path-injection",
+                                    "level": "error",
+                                    "message": {"text": "User-controlled path reaches file open."},
+                                    "locations": [
+                                        {
+                                            "physicalLocation": {
+                                                "artifactLocation": {"uri": "api/src/example.py"},
+                                                "region": {"startLine": 12},
+                                            }
+                                        }
+                                    ],
+                                }
+                            ],
                         }
                     ],
                 }
             )
 
-            imported = service.import_semgrep_vulnerability_findings(
-                snapshot.workspace.workspace_id,
-                "P0_25M03_001",
-                semgrep_payload,
-            )
+            imported = service.import_sarif_vulnerability_findings(workspace_id, issue_id, sarif_payload)
             self.assertEqual(len(imported), 1)
-            finding = imported[0]
-            self.assertEqual(finding.scanner, "semgrep")
-            self.assertEqual(finding.source, "semgrep-json")
-            self.assertEqual(finding.severity, "high")
-            self.assertEqual(finding.rule_id, "python.flask.security.audit.xss.template-autoescape-disabled")
-            self.assertEqual(finding.location_path, "api/src/example.py")
-            self.assertEqual(finding.location_line, 12)
-            self.assertIn("CWE-79", finding.cwe_ids)
-            self.assertIn("CVE-2026-3333", finding.cve_ids)
-            self.assertTrue(any("render_template_string" in item for item in finding.evidence))
-            self.assertTrue(any("semgrep.dev" in item for item in finding.references))
 
-            imported_again = service.import_vulnerability_findings(
-                snapshot.workspace.workspace_id,
-                "P0_25M03_001",
-                VulnerabilityImportRequest(source="semgrep-json", payload=semgrep_payload),
-            )
-            self.assertEqual(imported_again[0].finding_id, finding.finding_id)
-            findings = service.list_vulnerability_findings(snapshot.workspace.workspace_id, "P0_25M03_001")
-            self.assertEqual(len(findings), 1)
+            first_batch = service.list_vulnerability_import_batches(workspace_id, issue_id)
+            self.assertEqual(len(first_batch), 1)
+            self.assertEqual(first_batch[0].source, "sarif")
+            self.assertEqual(first_batch[0].scanner, "CodeQL")
+            self.assertEqual(first_batch[0].finding_ids, [imported[0].finding_id])
+            self.assertEqual(first_batch[0].summary_counts["new"], 1)
+            self.assertEqual(first_batch[0].summary_counts["existing"], 0)
 
-    def test_import_trivy_vulnerability_findings_normalizes_and_dispatches(self):
+            imported_again = service.import_sarif_vulnerability_findings(workspace_id, issue_id, sarif_payload)
+            self.assertEqual(imported_again[0].finding_id, imported[0].finding_id)
+
+            batches = service.list_vulnerability_import_batches(workspace_id, issue_id)
+            self.assertEqual(len(batches), 2)
+            latest = batches[0]
+            self.assertEqual(latest.summary_counts["new"], 0)
+            self.assertEqual(latest.summary_counts["existing"], 1)
+            self.assertEqual(latest.finding_ids, [imported[0].finding_id])
+
+    def test_vulnerability_report_links_threat_models_and_renders_markdown(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir) / "repo"
             (root / "docs" / "bugs").mkdir(parents=True)
@@ -947,95 +908,216 @@ reviews:
             service = TrackerService(store)
             snapshot = service.load_workspace(WorkspaceLoadRequest(root_path=str(root), auto_scan=True))
             assert snapshot is not None
+            workspace_id = snapshot.workspace.workspace_id
+            issue_id = "P0_25M03_001"
 
-            trivy_payload = json.dumps(
-                {
-                    "ArtifactName": "repo",
-                    "Results": [
-                        {
-                            "Target": "api/src/example.py",
-                            "Class": "lang-pkgs",
-                            "Type": "pip",
-                            "Vulnerabilities": [
-                                {
-                                    "VulnerabilityID": "CVE-2026-4444",
-                                    "PkgName": "jinja2",
-                                    "InstalledVersion": "3.0.0",
-                                    "FixedVersion": "3.1.5",
-                                    "Severity": "CRITICAL",
-                                    "Title": "Jinja2 sandbox escape",
-                                    "Description": "Template rendering can escape the sandbox under crafted input.",
-                                    "PrimaryURL": "https://avd.aquasec.com/nvd/cve-2026-4444",
-                                    "References": [
-                                        "https://nvd.nist.gov/vuln/detail/CVE-2026-4444",
-                                        "https://cwe.mitre.org/data/definitions/79.html"
-                                    ],
-                                    "CweIDs": ["CWE-79"],
-                                    "Status": "affected"
-                                }
-                            ]
-                        }
-                    ]
-                }
+            threat_model = service.save_threat_model(
+                workspace_id,
+                issue_id,
+                ThreatModelUpsertRequest(
+                    title="Export boundary review",
+                    summary="Cross-tenant export is the key trust-boundary risk.",
+                    assets=["customer export data"],
+                    trust_boundaries=["tenant scoped caller -> export service"],
+                    abuse_cases=["Attacker exports another tenant's records"],
+                    mitigations=["Enforce tenant ownership before export"],
+                ),
             )
 
-            imported = service.import_vulnerability_findings(
-                snapshot.workspace.workspace_id,
+            service.save_vulnerability_finding(
+                workspace_id,
+                issue_id,
+                VulnerabilityFindingUpsertRequest(
+                    title="Tenant export authorization bypass",
+                    scanner="semgrep",
+                    source="semgrep-json",
+                    severity="high",
+                    status="triaged",
+                    summary="The export path lacks tenant authorization enforcement.",
+                    rule_id="python.export.authz",
+                    location_path="api/src/example.py",
+                    location_line=12,
+                    cwe_ids=["CWE-639"],
+                    evidence=["Semgrep flagged export flow without tenant check."],
+                    references=["https://semgrep.dev/r/python.export.authz"],
+                    threat_model_ids=[threat_model.threat_model_id],
+                ),
+            )
+
+            report = service.get_vulnerability_finding_report(workspace_id, issue_id)
+            self.assertEqual(report.issue_id, issue_id)
+            self.assertEqual(report.total_findings, 1)
+            self.assertEqual(report.by_severity["high"], 1)
+            self.assertEqual(report.by_status["triaged"], 1)
+            self.assertEqual(report.linked_threat_models[0].threat_model_id, threat_model.threat_model_id)
+            self.assertEqual(report.findings[0].threat_model_ids, [threat_model.threat_model_id])
+            self.assertEqual(report.findings[0].linked_threat_model_titles, ["Export boundary review"])
+
+            packet = service.build_issue_context(workspace_id, issue_id)
+            self.assertIn("Linked threat models: Export boundary review", packet.prompt)
+
+            markdown = service.render_vulnerability_finding_report_markdown(workspace_id, issue_id)
+            self.assertIn("# Vulnerability Report", markdown)
+            self.assertIn("Tenant export authorization bypass", markdown)
+            self.assertIn("Export boundary review", markdown)
+            self.assertIn("CWE-639", markdown)
+
+    def test_workspace_vulnerability_report_aggregates_across_issues(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "repo"
+            (root / "docs" / "bugs").mkdir(parents=True)
+            (root / "api" / "src").mkdir(parents=True)
+            (root / "docs" / "bugs" / "Bugs_25260323.md").write_text(LEDGER_TEXT, encoding="utf-8")
+            (root / "api" / "src" / "example.py").write_text("print('ok')\n", encoding="utf-8")
+
+            store = FileStore(Path(tmp_dir) / "data")
+            service = TrackerService(store)
+            snapshot = service.load_workspace(WorkspaceLoadRequest(root_path=str(root), auto_scan=True))
+            assert snapshot is not None
+            workspace_id = snapshot.workspace.workspace_id
+
+            created = service.create_issue(
+                workspace_id,
+                IssueCreateRequest(
+                    title="Secondary export regression",
+                    severity="P1",
+                    summary="Another workflow leaks export data.",
+                    labels=["export"],
+                ),
+            )
+
+            threat_model = service.save_threat_model(
+                workspace_id,
                 "P0_25M03_001",
-                VulnerabilityImportRequest(source="trivy-json", payload=trivy_payload),
+                ThreatModelUpsertRequest(
+                    title="Workspace export threat model",
+                    summary="Export flows cross trust boundaries.",
+                    assets=["customer export data"],
+                    trust_boundaries=["tenant -> export service"],
+                ),
             )
-            self.assertEqual(len(imported), 1)
-            finding = imported[0]
-            self.assertEqual(finding.scanner, "trivy")
-            self.assertEqual(finding.source, "trivy-json")
-            self.assertEqual(finding.severity, "critical")
-            self.assertEqual(finding.rule_id, "CVE-2026-4444:jinja2:3.0.0")
-            self.assertEqual(finding.location_path, "api/src/example.py")
-            self.assertIn("CWE-79", finding.cwe_ids)
-            self.assertIn("CVE-2026-4444", finding.cve_ids)
-            self.assertTrue(any("Package: jinja2" == item for item in finding.evidence))
-            self.assertTrue(any("Fixed version: 3.1.5" == item for item in finding.evidence))
-            self.assertTrue(any("nvd.nist.gov" in item for item in finding.references))
 
-            trivy_collision_payload = json.dumps(
-                {
-                    "ArtifactName": "repo",
-                    "Results": [
-                        {
-                            "Target": "api/src/example.py",
-                            "Vulnerabilities": [
-                                {
-                                    "VulnerabilityID": "CVE-2026-4444",
-                                    "PkgName": "jinja2",
-                                    "InstalledVersion": "3.0.0",
-                                    "Severity": "CRITICAL",
-                                    "Title": "Jinja2 sandbox escape",
-                                },
-                                {
-                                    "VulnerabilityID": "CVE-2026-4444",
-                                    "PkgName": "markupsafe",
-                                    "InstalledVersion": "2.0.0",
-                                    "Severity": "CRITICAL",
-                                    "Title": "Jinja2 sandbox escape",
-                                },
-                            ]
-                        }
-                    ]
-                }
-            )
-            collision_imports = service.import_trivy_vulnerability_findings(
-                snapshot.workspace.workspace_id,
+            service.save_vulnerability_finding(
+                workspace_id,
                 "P0_25M03_001",
-                trivy_collision_payload,
+                VulnerabilityFindingUpsertRequest(
+                    title="Primary export bypass",
+                    scanner="semgrep",
+                    source="semgrep-json",
+                    severity="high",
+                    status="triaged",
+                    summary="Primary export path lacks tenant authz.",
+                    threat_model_ids=[threat_model.threat_model_id],
+                ),
             )
-            self.assertEqual(len(collision_imports), 2)
-            self.assertNotEqual(collision_imports[0].finding_id, collision_imports[1].finding_id)
+            service.save_vulnerability_finding(
+                workspace_id,
+                created.bug_id,
+                VulnerabilityFindingUpsertRequest(
+                    title="Secondary export bypass",
+                    scanner="nessus",
+                    source="nessus-json",
+                    severity="critical",
+                    status="open",
+                    summary="Second export path is exposed.",
+                ),
+            )
 
-            packet = service.build_issue_context(snapshot.workspace.workspace_id, "P0_25M03_001")
-            self.assertIn("Jinja2 sandbox escape", packet.prompt)
-            self.assertTrue(
-                any(item.artifact_type == "vulnerability_finding" for item in (packet.dynamic_context.related_context if packet.dynamic_context else []))
+            report = service.get_workspace_vulnerability_report(workspace_id)
+            self.assertEqual(report.workspace_id, workspace_id)
+            self.assertEqual(report.total_findings, 2)
+            self.assertEqual(report.by_severity["critical"], 1)
+            self.assertEqual(report.by_severity["high"], 1)
+            self.assertEqual(report.by_status["open"], 1)
+            self.assertEqual(report.by_status["triaged"], 1)
+            self.assertEqual(report.by_source["nessus-json"], 1)
+            self.assertEqual(report.by_source["semgrep-json"], 1)
+            self.assertEqual(report.linked_threat_models_total, 1)
+            self.assertEqual(report.issue_rollups[0].issue_id, created.bug_id)
+            self.assertEqual(report.issue_rollups[0].open_findings, 1)
+            self.assertEqual(report.issue_rollups[1].issue_id, "P0_25M03_001")
+            self.assertEqual(report.issue_rollups[1].linked_threat_models, 1)
+
+            markdown = service.render_workspace_vulnerability_report_markdown(workspace_id)
+            self.assertIn("# Workspace Vulnerability Report", markdown)
+            self.assertIn(created.bug_id, markdown)
+            self.assertIn("Workspace export threat model", markdown)
+
+    def test_workspace_security_review_bundle_collects_top_findings_and_handoff_markdown(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "repo"
+            (root / "docs" / "bugs").mkdir(parents=True)
+            (root / "api" / "src").mkdir(parents=True)
+            (root / "docs" / "bugs" / "Bugs_25260323.md").write_text(LEDGER_TEXT, encoding="utf-8")
+            (root / "api" / "src" / "example.py").write_text("print('ok')\n", encoding="utf-8")
+
+            store = FileStore(Path(tmp_dir) / "data")
+            service = TrackerService(store)
+            snapshot = service.load_workspace(WorkspaceLoadRequest(root_path=str(root), auto_scan=True))
+            assert snapshot is not None
+            workspace_id = snapshot.workspace.workspace_id
+
+            created = service.create_issue(
+                workspace_id,
+                IssueCreateRequest(
+                    title="Background export regression",
+                    severity="P1",
+                    summary="A second export flow is leaking data.",
+                    labels=["export", "security"],
+                ),
             )
+            threat_model = service.save_threat_model(
+                workspace_id,
+                "P0_25M03_001",
+                ThreatModelUpsertRequest(
+                    title="Security handoff threat model",
+                    summary="Export flows cross a trust boundary.",
+                    assets=["customer export data"],
+                    trust_boundaries=["tenant -> export service"],
+                ),
+            )
+            service.save_vulnerability_finding(
+                workspace_id,
+                "P0_25M03_001",
+                VulnerabilityFindingUpsertRequest(
+                    title="Primary export authz bypass",
+                    scanner="semgrep",
+                    source="semgrep-json",
+                    severity="critical",
+                    status="open",
+                    summary="Primary export path lacks tenant authorization.",
+                    threat_model_ids=[threat_model.threat_model_id],
+                    evidence=["Missing tenant guard in export path."],
+                ),
+            )
+            service.save_vulnerability_finding(
+                workspace_id,
+                created.bug_id,
+                VulnerabilityFindingUpsertRequest(
+                    title="Secondary export authz bypass",
+                    scanner="nessus",
+                    source="nessus-json",
+                    severity="high",
+                    status="triaged",
+                    summary="Secondary export path is externally reachable.",
+                    evidence=["Scanner reached export endpoint without authz."],
+                ),
+            )
+
+            bundle = service.get_workspace_security_review_bundle(workspace_id)
+            self.assertEqual(bundle.workspace_id, workspace_id)
+            self.assertEqual(bundle.total_findings, 2)
+            self.assertEqual(bundle.open_findings, 2)
+            self.assertEqual(bundle.top_findings[0].title, "Primary export authz bypass")
+            self.assertEqual(bundle.linked_threat_models[0].threat_model_id, threat_model.threat_model_id)
+            self.assertEqual(bundle.issue_rollups[0].issue_id, "P0_25M03_001")
+            self.assertTrue(bundle.recent_activity)
+
+            markdown = service.render_workspace_security_review_bundle_markdown(workspace_id)
+            self.assertIn("# Workspace Security Review Bundle", markdown)
+            self.assertIn("Primary export authz bypass", markdown)
+            self.assertIn("Security handoff threat model", markdown)
+            self.assertIn("Recent Activity", markdown)
 
     def test_capture_issue_context_replay_persists_prompt_snapshot(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
