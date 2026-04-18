@@ -43,10 +43,11 @@ type terminalSession struct {
 	terminalID  string
 	workspaceID string
 	process     *exec.Cmd
-	stdin       io.WriteCloser
+	pty         *os.File
 	logPath     string
 	mu          sync.RWMutex
 	closed      bool
+	closeOnce   sync.Once
 }
 
 type synchronizedLogWriter struct {
@@ -73,6 +74,11 @@ func OpenTerminal(dataDir string, request TerminalOpenRequest) (*TerminalSession
 	if err != nil {
 		return nil, err
 	}
+	ptyHandle, replicaHandle, err := openTerminalPTY(request.Cols, request.Rows)
+	if err != nil {
+		_ = logHandle.Close()
+		return nil, err
+	}
 
 	shell := os.Getenv("SHELL")
 	if strings.TrimSpace(shell) == "" {
@@ -84,48 +90,29 @@ func OpenTerminal(dataDir string, request TerminalOpenRequest) (*TerminalSession
 	}
 	cmd := exec.Command(shell, "-l")
 	cmd.Dir = workspace.RootPath
-
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		_ = logHandle.Close()
-		return nil, err
-	}
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		_ = stdin.Close()
-		_ = logHandle.Close()
-		return nil, err
-	}
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		_ = stdin.Close()
-		_ = logHandle.Close()
-		return nil, err
-	}
+	configureTerminalCommand(cmd, replicaHandle)
 	if err := cmd.Start(); err != nil {
-		_ = stdin.Close()
+		_ = replicaHandle.Close()
+		_ = ptyHandle.Close()
 		_ = logHandle.Close()
 		return nil, err
 	}
+	_ = replicaHandle.Close()
 
 	session := &terminalSession{
 		terminalID:  terminalID,
 		workspaceID: request.WorkspaceID,
 		process:     cmd,
-		stdin:       stdin,
+		pty:         ptyHandle,
 		logPath:     logPath,
 	}
 	terminalSessions.Store(terminalID, session)
 
 	writer := &synchronizedLogWriter{file: logHandle}
-	go pumpTerminalStream(stdout, writer)
-	go pumpTerminalStream(stderr, writer)
+	go pumpTerminalStream(session, writer)
 	go func() {
 		_ = cmd.Wait()
 		session.markClosed()
-		terminalSessions.Delete(terminalID)
-		_ = stdin.Close()
-		_ = logHandle.Close()
 	}()
 
 	return &TerminalSessionRecord{
@@ -139,19 +126,16 @@ func WriteTerminal(terminalID string, data string) error {
 	if err != nil {
 		return err
 	}
-	if strings.TrimSpace(data) == "" && data != "\n" {
-		return nil
-	}
-	_, err = io.WriteString(session.stdin, data)
+	_, err = io.WriteString(session.pty, data)
 	return err
 }
 
 func ResizeTerminal(terminalID string, cols int, rows int) error {
-	_, err := requireTerminalSession(terminalID)
+	session, err := requireTerminalSession(terminalID)
 	if err != nil {
 		return err
 	}
-	return nil
+	return resizeTerminalPTY(session.pty, cols, rows)
 }
 
 func CloseTerminal(terminalID string) error {
@@ -161,10 +145,8 @@ func CloseTerminal(terminalID string) error {
 	}
 	session.markClosed()
 	terminalSessions.Delete(terminalID)
-	if session.process.Process != nil {
-		_ = session.process.Process.Kill()
-	}
-	_ = session.stdin.Close()
+	terminateTerminalProcess(session.process)
+	session.closePTY()
 	return nil
 }
 
@@ -226,8 +208,10 @@ func requireTerminalSession(terminalID string) (*terminalSession, error) {
 	return session, nil
 }
 
-func pumpTerminalStream(reader io.Reader, writer io.Writer) {
-	_, _ = io.Copy(writer, reader)
+func pumpTerminalStream(session *terminalSession, writer io.WriteCloser) {
+	defer writer.Close()
+	defer session.closePTY()
+	_, _ = io.Copy(writer, session.pty)
 }
 
 func (session *terminalSession) markClosed() {
@@ -242,8 +226,27 @@ func (session *terminalSession) isClosed() bool {
 	return session.closed
 }
 
+func (session *terminalSession) closePTY() {
+	session.closeOnce.Do(func() {
+		if session.pty != nil {
+			_ = session.pty.Close()
+		}
+	})
+}
+
 func (writer *synchronizedLogWriter) Write(payload []byte) (int, error) {
 	writer.mu.Lock()
 	defer writer.mu.Unlock()
 	return writer.file.Write(payload)
+}
+
+func (writer *synchronizedLogWriter) Close() error {
+	writer.mu.Lock()
+	defer writer.mu.Unlock()
+	if writer.file == nil {
+		return nil
+	}
+	err := writer.file.Close()
+	writer.file = nil
+	return err
 }

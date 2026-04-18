@@ -4,5 +4,6 @@ go 1.26.0
 
 require (
 	github.com/bmatcuk/doublestar/v4 v4.9.1
+	golang.org/x/sys v0.38.0
 	gopkg.in/yaml.v3 v3.0.1
 )

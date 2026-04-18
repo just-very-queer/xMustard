@@ -246,12 +246,11 @@ pub fn next_removable_python_boundary() -> PythonBoundaryCutline {
         target_owner: "api-go terminal/runtime shell + rust-core managed process runner",
         rust_role: "Own process-safe execution, bounded output capture, timeout/cancellation, and structured run summaries for long-lived agent and verification work.",
         python_modules: vec!["backend/app/runtimes.py", "backend/app/terminal.py", "backend/app/service.py"],
-        why_next: "Python is no longer the external integrations gateway on the live request path, but runtime/process/session behavior and PTY terminal fidelity still depend on Python-owned implementations.",
-        first_slice: "Port PTY terminal semantics and runtime argument parsing parity into Go, then move managed execution/log summarization behind a Rust command boundary instead of duplicating subprocess control in Python and Go.",
+        why_next: "Python is no longer the external integrations gateway on the live request path, and Go now covers runtime argument parsing plus PTY terminal fidelity. The remaining gap is managed execution and run summarization, which still duplicate subprocess control across Python and Go.",
+        first_slice: "Move managed execution, bounded buffering, timeout/cancellation, and structured run summarization behind a Rust command boundary instead of continuing to duplicate long-lived subprocess control in Python and Go.",
         removable_when: vec![
-            "Go owns PTY-backed terminal open/write/read/resize/close semantics with parity to the current Python broker.",
-            "Go matches Python runtime model parsing and codex/opencode argument sanitization behavior.",
             "Rust owns the managed process runner for long-lived execution, bounded buffering, timeout, cancellation, and structured summaries.",
+            "Go delegates managed runs to the Rust command boundary instead of keeping duplicate subprocess control in run_control.go.",
             "Python no longer handles runtime launch, probe, query, or terminal request paths.",
         ],
     }
@@ -312,5 +311,7 @@ mod tests {
         let cutline = next_removable_python_boundary();
         assert_eq!(cutline.boundary_id, "runtime_and_terminal_process_plane");
         assert_eq!(cutline.target_owner, "api-go terminal/runtime shell + rust-core managed process runner");
+        assert!(cutline.why_next.contains("Go now covers runtime argument parsing plus PTY terminal fidelity"));
+        assert!(cutline.first_slice.contains("Move managed execution"));
     }
 }
