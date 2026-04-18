@@ -79,9 +79,9 @@ Rust owns:
 - verification execution and parsing
 - log/event shaping that should survive agent/runtime swaps
 
-## Next removable Python boundary
+## Initial next removable Python boundary
 
-The next Python boundary to remove is:
+At ADR acceptance time, the next Python boundary to remove was:
 
 - `external_integrations_gateway`
 
@@ -102,6 +102,26 @@ First slice after this ADR:
 1. Serve plugin manifest and agent-surface inventory from Go.
 2. Re-home provider test/sync routes behind manifest ids instead of Python-only route logic.
 3. Keep Rust focused on durable event/review payloads, not chat-app auth fanout.
+
+## Boundary update
+
+The `external_integrations_gateway` cutline is now complete on the request path in this worktree.
+
+Current request-path owner:
+- `api-go/cmd/xmustard-api/integration_routes.go`
+
+Former Python request-path owner:
+- `backend/app/main.py`
+
+Python compatibility code that can be cleaned up later without changing live route ownership:
+- `backend/app/service.py`
+- `backend/app/cli.py`
+
+What landed to complete the cutover:
+
+1. Go serves the existing integration config/test/sync route family with manifest-backed ownership.
+2. FastAPI no longer registers those integration HTTP handlers.
+3. The external route contract stays stable while Python leaves that live request surface.
 
 ## Implementation slice landed with this ADR
 

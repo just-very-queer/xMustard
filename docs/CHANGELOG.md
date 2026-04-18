@@ -15,7 +15,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   - incremental backend migration away from Python toward a Rust-based core
 - `docs/FEATURES.md`, `docs/ARCHITECTURE.md`, and `README.md` now reflect that xMustard is moving toward stronger trust, retrieval, governance, and backend-platform planning instead of simply expanding UI surface area
 - backend migration planning now explicitly tracks a Rust core plus a possible Go API shell instead of assuming the HTTP layer must stay in Python until the very end
-- the no-Python migration target now has a durable architecture contract, explicit three-surface agent model, and a named next Python cutline for external integrations/plugin routing
+- the no-Python migration target now has a durable architecture contract, explicit three-surface agent model, and a completed `external_integrations_gateway` cutover on the FastAPI request path
+- FastAPI no longer registers the integration config/test/sync endpoints, leaving those existing route paths under Go ownership while Python retains only non-request-path compatibility helpers
 
 ### Added
 - ADR `docs/plans/2026-04-18-no-python-control-plane-adr.md` locking in the no-Python target architecture: Go control-plane shell, Rust runtime/retrieval/store core, sub-500MB steady-state target, and the three agent surfaces (`works with agents`, `works within agents`, `commands agents`)

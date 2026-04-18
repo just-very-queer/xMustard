@@ -15,9 +15,7 @@ from .models import (
     EvalScenarioUpsertRequest,
     FixRecordRequest,
     FixUpdateRequest,
-    GitHubPRCreate,
     GuidanceStarterRequest,
-    IntegrationTestRequest,
     IssueCreateRequest,
     IssueContextReplayRequest,
     IssueUpdateRequest,
@@ -1056,69 +1054,6 @@ def get_workspace_security_review_bundle(workspace_id: str, format: str = Query(
         return SERVICE.get_workspace_security_review_bundle(workspace_id).model_dump(mode="json")
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=f"Missing resource: {exc}")
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-
-
-@app.post("/api/workspaces/{workspace_id}/integrations")
-def configure_integration(workspace_id: str, provider: str = Query(...), settings: dict = {}):
-    return SERVICE.configure_integration(workspace_id, provider, settings)
-
-
-@app.get("/api/workspaces/{workspace_id}/integrations")
-def get_integration_configs(workspace_id: str):
-    return SERVICE.get_integration_configs(workspace_id)
-
-
-@app.post("/api/integrations/test")
-def test_integration(request: IntegrationTestRequest):
-    return SERVICE.test_integration(request)
-
-
-@app.post("/api/workspaces/{workspace_id}/integrations/github/import")
-def import_github_issues(workspace_id: str, repo: str = Query(...), state: str = Query(default="open")):
-    try:
-        return SERVICE.import_github_issues(workspace_id, repo, state)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-
-
-@app.post("/api/workspaces/{workspace_id}/integrations/github/pr")
-def create_github_pr(workspace_id: str, request: GitHubPRCreate):
-    try:
-        return SERVICE.create_github_pr(workspace_id, request)
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc))
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-
-
-@app.post("/api/workspaces/{workspace_id}/integrations/slack/notify")
-def send_slack_notification(workspace_id: str, event: str = Query(...), message: Optional[str] = Query(default=None)):
-    try:
-        return SERVICE.send_slack_notification(workspace_id, event, message)
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc))
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-
-
-@app.post("/api/workspaces/{workspace_id}/integrations/linear/sync/{issue_id}")
-def sync_issue_to_linear(workspace_id: str, issue_id: str):
-    try:
-        return SERVICE.sync_issue_to_linear(workspace_id, issue_id)
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc))
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-
-
-@app.post("/api/workspaces/{workspace_id}/integrations/jira/sync/{issue_id}")
-def sync_issue_to_jira(workspace_id: str, issue_id: str):
-    try:
-        return SERVICE.sync_issue_to_jira(workspace_id, issue_id)
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
