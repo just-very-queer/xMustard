@@ -152,6 +152,46 @@ fn main() {
                 }
             }
         }
+        "run-managed-command" => {
+            let Some(workspace_root) = args.next() else {
+                eprintln!(
+                    "usage: xmustard-core run-managed-command <workspace_root> <timeout_seconds> <program> [args...]"
+                );
+                std::process::exit(2);
+            };
+            let Some(timeout_seconds) = args.next() else {
+                eprintln!(
+                    "usage: xmustard-core run-managed-command <workspace_root> <timeout_seconds> <program> [args...]"
+                );
+                std::process::exit(2);
+            };
+            let Some(program) = args.next() else {
+                eprintln!(
+                    "usage: xmustard-core run-managed-command <workspace_root> <timeout_seconds> <program> [args...]"
+                );
+                std::process::exit(2);
+            };
+            let timeout_seconds = timeout_seconds.parse::<u64>().unwrap_or(30);
+            let mut command_args = vec![program];
+            command_args.extend(args);
+            match xmustard_core::verification::run_managed_command(
+                &PathBuf::from(&workspace_root),
+                &command_args,
+                timeout_seconds,
+            ) {
+                Ok(result) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&result)
+                            .expect("managed command result should serialize")
+                    );
+                }
+                Err(err) => {
+                    eprintln!("run-managed-command failed: {err}");
+                    std::process::exit(1);
+                }
+            }
+        }
         "run-verification-profile" => {
             let Some(workspace_root) = args.next() else {
                 eprintln!(
