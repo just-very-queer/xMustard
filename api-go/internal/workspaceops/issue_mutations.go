@@ -27,6 +27,7 @@ type IssueCreateRequest struct {
 	Severity      string   `json:"severity"`
 	Summary       *string  `json:"summary"`
 	Impact        *string  `json:"impact"`
+	Source        *string  `json:"source"`
 	IssueStatus   string   `json:"issue_status"`
 	DocStatus     string   `json:"doc_status"`
 	CodeStatus    string   `json:"code_status"`
@@ -99,7 +100,7 @@ func CreateIssue(dataDir string, workspaceID string, request IssueCreateRequest)
 		Title:                strings.TrimSpace(request.Title),
 		Severity:             strings.ToUpper(strings.TrimSpace(request.Severity)),
 		IssueStatus:          fallbackString(strings.TrimSpace(request.IssueStatus), "open"),
-		Source:               "tracker",
+		Source:               fallbackString(strings.TrimSpace(firstNonEmptyPtr(request.Source)), "tracker"),
 		SourceDoc:            trimOptional(request.SourceDoc),
 		DocStatus:            "open",
 		CodeStatus:           "unknown",
@@ -138,7 +139,7 @@ func CreateIssue(dataDir string, workspaceID string, request IssueCreateRequest)
 		"",
 		"issue.created",
 		"Created tracker issue "+bugID,
-		map[string]any{"source": "tracker", "severity": issue.Severity, "title": issue.Title},
+		map[string]any{"source": issue.Source, "severity": issue.Severity, "title": issue.Title},
 	); err != nil {
 		return nil, err
 	}

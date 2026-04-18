@@ -129,9 +129,9 @@
   },
   {
     "group": "integrations_and_terminal",
-    "current_owner": "backend/app/main.py + backend/app/service.py + backend/app/terminal.py",
+    "current_owner": "api-go",
     "target_owner": "api-go",
-    "notes": "Provider integrations and local terminal session transport. The Go shell now owns terminal open/write/resize/read/close transport against the existing workspace log layout, while provider integration config/sync routes remain on Python.",
+    "notes": "Provider integrations and local terminal session transport. The Go shell now owns plugin-manifest-backed integration config/test/sync routes plus terminal open/write/resize/read/close transport against the existing workspace log layout and activity artifacts.",
     "endpoints": [
       "/api/workspaces/{workspace_id}/integrations",
       "/api/integrations/test",

@@ -196,6 +196,7 @@ That boundary work is now live for three concrete slices:
 - Verification profile checklist items and durable verification-profile history now persist through both Python and Go API paths, with confidence scoring attached to each saved execution record.
 - The Go API shell now owns verification-profile report reads, including runtime, model, and branch breakdowns that match the richer Python report shape.
 - The Go API shell now owns workspace listing, fresh and cached workspace load, explicit workspace scan, worktree reads, export bundle reads, and terminal open/write/resize/read/close transport against the existing workspace registry and terminal log layout.
+- The Go API shell now owns the `external_integrations_gateway` cutline too: plugin-manifest-backed integration config/test routes, GitHub issue import + PR creation, Slack notifications, and Linear/Jira issue sync now persist through Go while keeping ticket-context/activity artifacts and the existing `backend/data/integrations/` compatibility layout.
 - The Go API shell now owns repo-config reads at `/api/workspaces/{workspace_id}/repo-config` and `/api/workspaces/{workspace_id}/repo-config/health`, and issue-context packets built in Go now include `.xmustard.yaml` path instructions and MCP/browser-context hints.
 - Python parity tests now compare live Python behavior against the Rust outputs for:
   - signal scanning
@@ -209,6 +210,6 @@ That boundary work is now live for three concrete slices:
 ## Recommended Next Build Order
 
 1. Add coverage delta and artifact persistence helpers on the Rust side where it simplifies process control.
-2. Migrate the remaining provider integration surfaces to Go.
+2. Extend the Go plugin registry into webhook/event fanout and manifest-first provider callbacks.
 3. Migrate FastAPI route groups to Go one surface at a time.
 4. Delete Python implementations only after route and artifact parity are verified.

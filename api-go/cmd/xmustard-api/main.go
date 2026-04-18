@@ -62,12 +62,7 @@ func main() {
 			})
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{
-			"design_version":                 contract.DesignVersion,
-			"steady_state_runtime_budget_mb": contract.SteadyStateRuntimeBudgetMB,
-			"agent_surfaces":                 contract.AgentSurfaces,
-			"next_removable_python_boundary": contract.NextRemovablePythonBoundary,
-		})
+		writeJSON(w, http.StatusOK, buildAgentSurfacesPayload(contract))
 	})
 	mux.HandleFunc("/api/migration/routes", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -309,15 +304,7 @@ func main() {
 			})
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{
-			"design_version":                 contract.DesignVersion,
-			"control_plane_owner":            contract.ControlPlaneOwner,
-			"core_owner":                     contract.CoreOwner,
-			"python_end_state":               contract.PythonEndState,
-			"steady_state_runtime_budget_mb": contract.SteadyStateRuntimeBudgetMB,
-			"agent_surfaces":                 contract.AgentSurfaces,
-			"next_removable_python_boundary": contract.NextRemovablePythonBoundary,
-		})
+		writeJSON(w, http.StatusOK, buildAgentSurfacesPayload(contract))
 	})
 	mux.HandleFunc("POST /api/workspaces/{workspace_id}/agent/probe", func(w http.ResponseWriter, r *http.Request) {
 		workspaceID := r.PathValue("workspace_id")
@@ -1804,6 +1791,7 @@ func main() {
 	})
 	registerEvalRoutes(mux, envDefault("XMUSTARD_DATA_DIR", "../backend/data"))
 	registerRepoConfigRoutes(mux, envDefault("XMUSTARD_DATA_DIR", "../backend/data"))
+	registerIntegrationRoutes(mux, envDefault("XMUSTARD_DATA_DIR", "../backend/data"))
 	mux.HandleFunc("POST /api/workspaces/{workspace_id}/verification-profiles", func(w http.ResponseWriter, r *http.Request) {
 		workspaceID := r.PathValue("workspace_id")
 		var request workspaceops.VerificationProfileUpsertRequest

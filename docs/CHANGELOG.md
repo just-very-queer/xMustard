@@ -21,6 +21,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - ADR `docs/plans/2026-04-18-no-python-control-plane-adr.md` locking in the no-Python target architecture: Go control-plane shell, Rust runtime/retrieval/store core, sub-500MB steady-state target, and the three agent surfaces (`works with agents`, `works within agents`, `commands agents`)
 - Rust-owned architecture contract in `rust-core/src/contracts.rs` plus `xmustard-core describe-architecture`
 - Go-served architecture and agent-surface inventory endpoints at `/api/migration/plan`, `/api/migration/agent-surfaces`, and `/api/agent/surfaces`
+- Go-owned plugin-manifest registry plus provider integration config/test/sync routes for GitHub, Slack, Linear, and Jira, including durable activity and ticket-context artifacts behind the existing integration endpoints
 - issue-level vulnerability import batch persistence via `vulnerability_import_batches.json`, including source/scanner provenance, imported finding ids, payload hash, and lifecycle summary counts for `new` / `existing` / `resolved` / `regressed`
 - issue-level vulnerability import batch inspection through Python service, FastAPI route `/api/workspaces/{workspace_id}/issues/{issue_id}/vulnerability-import-batches`, and matching CLI command `vulnerability-import-batches`
 - vulnerability import activity now records the durable import batch id alongside SARIF and Nessus imports
