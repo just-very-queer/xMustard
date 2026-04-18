@@ -200,6 +200,13 @@ fn main() {
                 }
             }
         }
+        "describe-architecture" => {
+            println!(
+                "{}",
+                serde_json::to_string(&xmustard_core::contracts::no_python_architecture_contract())
+                    .expect("architecture contract should serialize")
+            );
+        }
         _ => {
             eprintln!("unknown command: {command}");
             std::process::exit(2);

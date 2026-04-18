@@ -15,8 +15,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   - incremental backend migration away from Python toward a Rust-based core
 - `docs/FEATURES.md`, `docs/ARCHITECTURE.md`, and `README.md` now reflect that xMustard is moving toward stronger trust, retrieval, governance, and backend-platform planning instead of simply expanding UI surface area
 - backend migration planning now explicitly tracks a Rust core plus a possible Go API shell instead of assuming the HTTP layer must stay in Python until the very end
+- the no-Python migration target now has a durable architecture contract, explicit three-surface agent model, and a named next Python cutline for external integrations/plugin routing
 
 ### Added
+- ADR `docs/plans/2026-04-18-no-python-control-plane-adr.md` locking in the no-Python target architecture: Go control-plane shell, Rust runtime/retrieval/store core, sub-500MB steady-state target, and the three agent surfaces (`works with agents`, `works within agents`, `commands agents`)
+- Rust-owned architecture contract in `rust-core/src/contracts.rs` plus `xmustard-core describe-architecture`
+- Go-served architecture and agent-surface inventory endpoints at `/api/migration/plan`, `/api/migration/agent-surfaces`, and `/api/agent/surfaces`
 - issue-level vulnerability import batch persistence via `vulnerability_import_batches.json`, including source/scanner provenance, imported finding ids, payload hash, and lifecycle summary counts for `new` / `existing` / `resolved` / `regressed`
 - issue-level vulnerability import batch inspection through Python service, FastAPI route `/api/workspaces/{workspace_id}/issues/{issue_id}/vulnerability-import-batches`, and matching CLI command `vulnerability-import-batches`
 - vulnerability import activity now records the durable import batch id alongside SARIF and Nessus imports

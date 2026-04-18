@@ -17,13 +17,6 @@ import (
 	"xmustard/api-go/internal/workspaceops"
 )
 
-type subsystemBoundary struct {
-	Name         string `json:"name"`
-	CurrentOwner string `json:"current_owner"`
-	TargetOwner  string `json:"target_owner"`
-	Notes        string `json:"notes"`
-}
-
 type verificationRunRequest struct {
 	WorkspaceRoot  string `json:"workspace_root"`
 	Command        string `json:"command"`
@@ -46,36 +39,34 @@ func main() {
 		})
 	})
 	mux.HandleFunc("/api/migration/plan", func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+		defer cancel()
+
+		contract, err := rustcore.ReadArchitectureContract(ctx)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"error": err.Error(),
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, contract)
+	})
+	mux.HandleFunc("/api/migration/agent-surfaces", func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+		defer cancel()
+
+		contract, err := rustcore.ReadArchitectureContract(ctx)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"error": err.Error(),
+			})
+			return
+		}
 		writeJSON(w, http.StatusOK, map[string]any{
-			"status":     "draft",
-			"http_shell": "go",
-			"core":       "rust",
-			"boundaries": []subsystemBoundary{
-				{
-					Name:         "scanner",
-					CurrentOwner: "python",
-					TargetOwner:  "rust-core",
-					Notes:        "Port repo scanning, ledger ingestion, and signal detection first.",
-				},
-				{
-					Name:         "repo_map",
-					CurrentOwner: "python",
-					TargetOwner:  "rust-core",
-					Notes:        "Port structural summaries and path ranking next.",
-				},
-				{
-					Name:         "verification",
-					CurrentOwner: "python",
-					TargetOwner:  "rust-core",
-					Notes:        "Move process-heavy verification orchestration into the compiled core.",
-				},
-				{
-					Name:         "http_api",
-					CurrentOwner: "python",
-					TargetOwner:  "api-go",
-					Notes:        "Replace FastAPI route groups only after contract parity is tested.",
-				},
-			},
+			"design_version":                 contract.DesignVersion,
+			"steady_state_runtime_budget_mb": contract.SteadyStateRuntimeBudgetMB,
+			"agent_surfaces":                 contract.AgentSurfaces,
+			"next_removable_python_boundary": contract.NextRemovablePythonBoundary,
 		})
 	})
 	mux.HandleFunc("/api/migration/routes", func(w http.ResponseWriter, r *http.Request) {
@@ -306,6 +297,27 @@ func main() {
 			return
 		}
 		writeJSON(w, http.StatusOK, result)
+	})
+	mux.HandleFunc("GET /api/agent/surfaces", func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+		defer cancel()
+
+		contract, err := rustcore.ReadArchitectureContract(ctx)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"error": err.Error(),
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"design_version":                 contract.DesignVersion,
+			"control_plane_owner":            contract.ControlPlaneOwner,
+			"core_owner":                     contract.CoreOwner,
+			"python_end_state":               contract.PythonEndState,
+			"steady_state_runtime_budget_mb": contract.SteadyStateRuntimeBudgetMB,
+			"agent_surfaces":                 contract.AgentSurfaces,
+			"next_removable_python_boundary": contract.NextRemovablePythonBoundary,
+		})
 	})
 	mux.HandleFunc("POST /api/workspaces/{workspace_id}/agent/probe", func(w http.ResponseWriter, r *http.Request) {
 		workspaceID := r.PathValue("workspace_id")

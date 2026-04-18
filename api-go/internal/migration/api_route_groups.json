@@ -1,5 +1,17 @@
 [
   {
+    "group": "migration_and_architecture",
+    "current_owner": "api-go + rust-core",
+    "target_owner": "api-go + rust-core",
+    "notes": "Architecture contract, route inventory, and explicit agent-surface protocol metadata. Rust owns the durable no-Python migration contract and Go serves it to operators, plugins, and migration tooling.",
+    "endpoints": [
+      "/api/migration/plan",
+      "/api/migration/routes",
+      "/api/migration/agent-surfaces",
+      "/api/agent/surfaces"
+    ]
+  },
+  {
     "group": "settings_and_runtime",
     "current_owner": "api-go + rust-core",
     "target_owner": "api-go + rust-core",

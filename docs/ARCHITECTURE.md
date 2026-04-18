@@ -30,6 +30,20 @@ This separation matters for the long-term platform plan:
 
 - xMustard should be able to swap runtime adapters, search/indexing engines, and eventually backend implementation language without changing the product model
 
+## Agent Surfaces
+
+xMustard should keep three explicit agent surfaces and avoid collapsing them into one generic "agent platform" abstraction:
+
+- works with agents: plugin manifests, webhooks, chat-app callbacks, export bundles, and event sinks for external systems
+- works within agents: repo guidance, issue context packets, browser/context evidence, and replay packets that can travel inside an agent session
+- commands agents: governed run launch, plan approval, runtime process control, verification execution, and review artifacts
+
+The no-Python target architecture now treats those surfaces as stable protocol seams:
+
+- Go owns the control-plane and API shell for all three surfaces
+- Rust owns retrieval, repo-map, process/runtime, verification, and store-critical helpers behind those surfaces
+- Python is not part of the steady-state request path once migration is complete
+
 ## Backend Shape
 
 `backend/app/` contains the core system:
@@ -162,7 +176,7 @@ These gaps matter more than adding more heuristic scanning.
 
 ## Backend Migration Strategy
 
-The current backend is Python-first, but the long-term architecture should support a Rust-based core and may move the HTTP shell to Go once the service boundaries are stable.
+The current backend is Python-first, but the no-Python target architecture is now explicit: Go is the control-plane shell and Rust is the long-lived core for runtime/retrieval/store-critical logic.
 
 Why:
 
@@ -175,8 +189,9 @@ Recommended migration path:
 1. keep the HTTP and frontend contracts stable
 2. isolate scanning, repo-map generation, retrieval, and verification execution behind clear service boundaries
 3. reimplement those subsystems in Rust first, either as sidecars or library-backed services
-4. migrate orchestration last, either into a thin Go API shell or a Rust HTTP service, only after the data model and operational workflows are proven
+4. move control-plane and agent/plugin protocol ownership into the Go API shell
+5. remove Python from the steady-state request path only after route and artifact parity are proven
 
 This should be an incremental replacement strategy, not a rewrite that pauses product work.
 
-The repo now includes early scaffolding under `rust-core/` and `api-go/` so this migration direction has a concrete starting point.
+The repo now includes concrete scaffolding under `rust-core/` and `api-go/`, including a Rust-owned architecture contract and Go-served agent-surface inventory, so this migration direction has a real control-plane seam instead of only roadmap prose.

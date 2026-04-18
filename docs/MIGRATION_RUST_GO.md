@@ -141,6 +141,19 @@ The first implementation goal is not parity. It is boundary clarity.
 
 That boundary work is now live for three concrete slices:
 
+- Rust now owns a durable no-Python architecture contract in `rust-core/src/contracts.rs`, including the three agent surfaces:
+  - works with agents
+  - works within agents
+  - commands agents
+- Rust exposes that contract through `xmustard-core describe-architecture`
+- Go now serves the same contract through:
+  - `/api/migration/plan`
+  - `/api/migration/agent-surfaces`
+  - `/api/agent/surfaces`
+- The next removable Python ownership boundary is now explicit:
+  - `external_integrations_gateway`
+  - current owner: `backend/app/main.py` + `backend/app/service.py`
+  - target owner: Go plugin registry + webhook/event sink surfaces
 - Rust owns `scan-signals` in `rust-core/src/scanner.rs`
 - Rust owns `build-repo-map` in `rust-core/src/repomap.rs`
 - Rust owns coverage parsing for LCOV, Cobertura, and Istanbul in `rust-core/src/verification.rs`
