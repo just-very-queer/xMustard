@@ -168,6 +168,11 @@ func IsIntegrationValidationError(err error) bool {
 
 var integrationHTTPClient = &http.Client{Timeout: 15 * time.Second}
 
+var integrationCoreRoutes = []string{
+	"/api/workspaces/{workspace_id}/integrations",
+	"/api/integrations/test",
+}
+
 var integrationPluginManifests = []AgentPluginManifest{
 	{
 		ManifestID:         "github_bridge_v1",
@@ -234,6 +239,31 @@ var integrationPluginManifests = []AgentPluginManifest{
 
 func ListIntegrationManifests() []AgentPluginManifest {
 	return slices.Clone(integrationPluginManifests)
+}
+
+func IntegrationCapabilityRoutes() []string {
+	routes := make([]string, 0, len(integrationPluginManifests))
+	seen := map[string]struct{}{}
+	for _, manifest := range integrationPluginManifests {
+		for _, route := range manifest.CapabilityRoutes {
+			route = strings.TrimSpace(route)
+			if route == "" {
+				continue
+			}
+			if _, exists := seen[route]; exists {
+				continue
+			}
+			seen[route] = struct{}{}
+			routes = append(routes, route)
+		}
+	}
+	return routes
+}
+
+func IntegrationInventoryRoutes() []string {
+	routes := append([]string{}, integrationCoreRoutes...)
+	routes = append(routes, IntegrationCapabilityRoutes()...)
+	return routes
 }
 
 func ConfigureIntegration(dataDir string, workspaceID string, provider string, settings map[string]any) (*IntegrationConfig, error) {

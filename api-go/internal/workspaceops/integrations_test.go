@@ -6,9 +6,36 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
+
+func TestIntegrationInventoryRoutesStayAlignedWithManifestCapabilities(t *testing.T) {
+	wantCapabilityRoutes := []string{
+		"/api/workspaces/{workspace_id}/integrations/github/import",
+		"/api/workspaces/{workspace_id}/integrations/github/pr",
+		"/api/workspaces/{workspace_id}/integrations/slack/notify",
+		"/api/workspaces/{workspace_id}/integrations/linear/sync/{issue_id}",
+		"/api/workspaces/{workspace_id}/integrations/jira/sync/{issue_id}",
+	}
+	if got := IntegrationCapabilityRoutes(); !slices.Equal(got, wantCapabilityRoutes) {
+		t.Fatalf("unexpected capability routes: %#v", got)
+	}
+
+	wantInventoryRoutes := []string{
+		"/api/workspaces/{workspace_id}/integrations",
+		"/api/integrations/test",
+		"/api/workspaces/{workspace_id}/integrations/github/import",
+		"/api/workspaces/{workspace_id}/integrations/github/pr",
+		"/api/workspaces/{workspace_id}/integrations/slack/notify",
+		"/api/workspaces/{workspace_id}/integrations/linear/sync/{issue_id}",
+		"/api/workspaces/{workspace_id}/integrations/jira/sync/{issue_id}",
+	}
+	if got := IntegrationInventoryRoutes(); !slices.Equal(got, wantInventoryRoutes) {
+		t.Fatalf("unexpected integration inventory routes: %#v", got)
+	}
+}
 
 func TestIntegrationRegistryPersistsManifestBackedConfigs(t *testing.T) {
 	dataDir, workspaceID, _ := seedIntegrationWorkspace(t)

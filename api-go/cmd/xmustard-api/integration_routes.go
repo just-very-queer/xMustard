@@ -12,8 +12,65 @@ import (
 	"xmustard/api-go/internal/workspaceops"
 )
 
+type integrationRouteSpec struct {
+	Method string
+	Path   string
+}
+
+func (spec integrationRouteSpec) Pattern() string {
+	return spec.Method + " " + spec.Path
+}
+
+var (
+	configureIntegrationRoute = integrationRouteSpec{
+		Method: http.MethodPost,
+		Path:   "/api/workspaces/{workspace_id}/integrations",
+	}
+	listIntegrationConfigsRoute = integrationRouteSpec{
+		Method: http.MethodGet,
+		Path:   "/api/workspaces/{workspace_id}/integrations",
+	}
+	testIntegrationRoute = integrationRouteSpec{
+		Method: http.MethodPost,
+		Path:   "/api/integrations/test",
+	}
+	importGitHubIssuesRoute = integrationRouteSpec{
+		Method: http.MethodPost,
+		Path:   "/api/workspaces/{workspace_id}/integrations/github/import",
+	}
+	createGitHubPRRoute = integrationRouteSpec{
+		Method: http.MethodPost,
+		Path:   "/api/workspaces/{workspace_id}/integrations/github/pr",
+	}
+	sendSlackNotificationRoute = integrationRouteSpec{
+		Method: http.MethodPost,
+		Path:   "/api/workspaces/{workspace_id}/integrations/slack/notify",
+	}
+	syncIssueToLinearRoute = integrationRouteSpec{
+		Method: http.MethodPost,
+		Path:   "/api/workspaces/{workspace_id}/integrations/linear/sync/{issue_id}",
+	}
+	syncIssueToJiraRoute = integrationRouteSpec{
+		Method: http.MethodPost,
+		Path:   "/api/workspaces/{workspace_id}/integrations/jira/sync/{issue_id}",
+	}
+)
+
+func listIntegrationRouteSpecs() []integrationRouteSpec {
+	return []integrationRouteSpec{
+		configureIntegrationRoute,
+		listIntegrationConfigsRoute,
+		testIntegrationRoute,
+		importGitHubIssuesRoute,
+		createGitHubPRRoute,
+		sendSlackNotificationRoute,
+		syncIssueToLinearRoute,
+		syncIssueToJiraRoute,
+	}
+}
+
 func registerIntegrationRoutes(mux *http.ServeMux, dataDir string) {
-	mux.HandleFunc("POST /api/workspaces/{workspace_id}/integrations", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(configureIntegrationRoute.Pattern(), func(w http.ResponseWriter, r *http.Request) {
 		workspaceID := r.PathValue("workspace_id")
 		provider := strings.TrimSpace(r.URL.Query().Get("provider"))
 		settings := map[string]any{}
@@ -28,7 +85,7 @@ func registerIntegrationRoutes(mux *http.ServeMux, dataDir string) {
 		writeJSON(w, http.StatusOK, result)
 	})
 
-	mux.HandleFunc("GET /api/workspaces/{workspace_id}/integrations", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(listIntegrationConfigsRoute.Pattern(), func(w http.ResponseWriter, r *http.Request) {
 		workspaceID := r.PathValue("workspace_id")
 		result, err := workspaceops.GetIntegrationConfigs(dataDir, workspaceID)
 		if writeIntegrationError(w, err) {
@@ -37,7 +94,7 @@ func registerIntegrationRoutes(mux *http.ServeMux, dataDir string) {
 		writeJSON(w, http.StatusOK, result)
 	})
 
-	mux.HandleFunc("POST /api/integrations/test", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(testIntegrationRoute.Pattern(), func(w http.ResponseWriter, r *http.Request) {
 		var request workspaceops.IntegrationTestRequest
 		if !decodeJSONBody(w, r, &request) {
 			return
@@ -45,7 +102,7 @@ func registerIntegrationRoutes(mux *http.ServeMux, dataDir string) {
 		writeJSON(w, http.StatusOK, workspaceops.TestIntegration(request))
 	})
 
-	mux.HandleFunc("POST /api/workspaces/{workspace_id}/integrations/github/import", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(importGitHubIssuesRoute.Pattern(), func(w http.ResponseWriter, r *http.Request) {
 		workspaceID := r.PathValue("workspace_id")
 		result, err := workspaceops.ImportGitHubIssues(dataDir, workspaceID, r.URL.Query().Get("repo"), r.URL.Query().Get("state"))
 		if writeIntegrationError(w, err) {
@@ -54,7 +111,7 @@ func registerIntegrationRoutes(mux *http.ServeMux, dataDir string) {
 		writeJSON(w, http.StatusOK, result)
 	})
 
-	mux.HandleFunc("POST /api/workspaces/{workspace_id}/integrations/github/pr", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(createGitHubPRRoute.Pattern(), func(w http.ResponseWriter, r *http.Request) {
 		workspaceID := r.PathValue("workspace_id")
 		var request workspaceops.GitHubPRCreate
 		if !decodeJSONBody(w, r, &request) {
@@ -68,7 +125,7 @@ func registerIntegrationRoutes(mux *http.ServeMux, dataDir string) {
 		writeJSON(w, http.StatusOK, result)
 	})
 
-	mux.HandleFunc("POST /api/workspaces/{workspace_id}/integrations/slack/notify", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(sendSlackNotificationRoute.Pattern(), func(w http.ResponseWriter, r *http.Request) {
 		workspaceID := r.PathValue("workspace_id")
 		event := strings.TrimSpace(r.URL.Query().Get("event"))
 		message := strings.TrimSpace(r.URL.Query().Get("message"))
@@ -79,7 +136,7 @@ func registerIntegrationRoutes(mux *http.ServeMux, dataDir string) {
 		writeJSON(w, http.StatusOK, result)
 	})
 
-	mux.HandleFunc("POST /api/workspaces/{workspace_id}/integrations/linear/sync/{issue_id}", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(syncIssueToLinearRoute.Pattern(), func(w http.ResponseWriter, r *http.Request) {
 		workspaceID := r.PathValue("workspace_id")
 		issueID := r.PathValue("issue_id")
 		result, err := workspaceops.SyncIssueToLinear(dataDir, workspaceID, issueID)
@@ -89,7 +146,7 @@ func registerIntegrationRoutes(mux *http.ServeMux, dataDir string) {
 		writeJSON(w, http.StatusOK, result)
 	})
 
-	mux.HandleFunc("POST /api/workspaces/{workspace_id}/integrations/jira/sync/{issue_id}", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(syncIssueToJiraRoute.Pattern(), func(w http.ResponseWriter, r *http.Request) {
 		workspaceID := r.PathValue("workspace_id")
 		issueID := r.PathValue("issue_id")
 		result, err := workspaceops.SyncIssueToJira(dataDir, workspaceID, issueID)
