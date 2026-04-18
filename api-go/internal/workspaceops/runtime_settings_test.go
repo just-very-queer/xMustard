@@ -56,6 +56,46 @@ func TestSettingsAndCapabilitiesUsePersistedConfig(t *testing.T) {
 	}
 }
 
+func TestProbeRuntimeReturnsExitCodeAndFallbackOutputOnFailure(t *testing.T) {
+	dataDir, workspaceID, _, _ := writeIssueContextFixture(t, false)
+	opencodeBin := writeExecutableScript(t, "opencode", `#!/bin/sh
+if [ "$1" = "models" ]; then
+  echo "fake/test-model"
+  exit 0
+fi
+if [ "$1" = "run" ]; then
+  echo "probe failed on stderr" >&2
+  exit 7
+fi
+echo "unknown command" >&2
+exit 1
+`)
+	if _, err := UpdateSettings(dataDir, AppSettings{
+		LocalAgentType: "opencode",
+		OpencodeBin:    &opencodeBin,
+		OpencodeModel:  stringPtr("fake/test-model"),
+	}); err != nil {
+		t.Fatalf("update settings: %v", err)
+	}
+
+	probe, err := ProbeRuntime(dataDir, workspaceID, "opencode", "fake/test-model")
+	if err != nil {
+		t.Fatalf("probe runtime failure path: %v", err)
+	}
+	if probe.OK {
+		t.Fatalf("expected failed probe: %#v", probe)
+	}
+	if probe.ExitCode == nil || *probe.ExitCode != 7 {
+		t.Fatalf("expected exit code 7, got %#v", probe)
+	}
+	if probe.Error == nil || !strings.Contains(*probe.Error, "probe failed on stderr") {
+		t.Fatalf("expected probe error summary, got %#v", probe)
+	}
+	if probe.OutputExcerpt == nil || !strings.Contains(*probe.OutputExcerpt, "probe failed on stderr") {
+		t.Fatalf("expected probe output excerpt, got %#v", probe)
+	}
+}
+
 func TestStartIssueRunAndWorkspaceQueryPersistRunArtifacts(t *testing.T) {
 	dataDir, workspaceID, issueID, _ := writeIssueContextFixture(t, false)
 	opencodeBin := writeFakeOpencode(t)

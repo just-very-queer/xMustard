@@ -1,10 +1,8 @@
 package workspaceops
 
 import (
-	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -183,11 +181,7 @@ func ProbeRuntime(dataDir string, workspaceID string, runtime string, model stri
 		return nil, err
 	}
 	started := time.Now()
-	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, command[0], command[1:]...)
-	cmd.Dir = snapshot.Workspace.RootPath
-	output, err := cmd.CombinedOutput()
+	execution := runCommandWithTimeout(snapshot.Workspace.RootPath, 45*time.Second, command)
 	durationMS := int(time.Since(started).Milliseconds())
 	commandPreview := shellPreview(command)
 	runtimes, _ := DetectRuntimes(dataDir)
@@ -209,35 +203,28 @@ func ProbeRuntime(dataDir string, workspaceID string, runtime string, model stri
 	if runtimeEntry != nil {
 		result.BinaryPath = runtimeEntry.BinaryPath
 	}
-	combinedOutput := strings.TrimSpace(string(output))
-	if ctx.Err() == context.DeadlineExceeded {
-		result.OK = false
-		result.OutputExcerpt = optionalExcerpt(combinedOutput)
-		result.Error = optionalString("Probe timed out after 45 seconds")
-		return result, nil
-	}
-	if exitErr, ok := err.(*exec.ExitError); ok {
-		exitCode := exitErr.ExitCode()
-		result.ExitCode = &exitCode
-	} else if err == nil {
-		exitCode := 0
-		result.ExitCode = &exitCode
-	}
+	result.ExitCode = execution.ExitCode
+	combinedOutput := execution.Output
 	summary := summarizeRunOutput(runtime, combinedOutput)
 	excerpt := summaryString(summary, "text_excerpt")
 	if strings.TrimSpace(excerpt) == "" {
-		excerpt = combinedOutput
+		excerpt = fallbackCommandSummary("Runtime probe", execution, 0)
 	}
 	result.OutputExcerpt = optionalExcerpt(excerpt)
-	result.OK = err == nil
-	if err != nil {
+	if execution.TimedOut {
+		result.OK = false
+		result.Error = optionalString("Probe timed out after 45 seconds")
+		return result, nil
+	}
+	result.OK = execution.Err == nil
+	if execution.Err != nil {
 		errText := excerpt
 		if strings.TrimSpace(errText) == "" {
-			errText = "Runtime probe failed"
+			errText = fallbackCommandSummary("Runtime probe", execution, 0)
 		}
 		result.Error = &errText
 	}
-	if err == nil && result.ExitCode == nil {
+	if execution.Err == nil && result.ExitCode == nil {
 		exitCode := 0
 		result.ExitCode = &exitCode
 	}

@@ -3,10 +3,55 @@ package workspaceops
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestParseOpencodeModelsOutputMatchesPythonExpectations(t *testing.T) {
+	models := parseOpencodeModelsOutput("opencode-go/minimax-m2.7\ninvalid token here\n* opencode-go/kimi-k2.5\nopencode-go/glm-5 extra\n")
+	expected := []string{"opencode-go/minimax-m2.7", "opencode-go/kimi-k2.5", "opencode-go/glm-5"}
+	if !slices.Equal(models, expected) {
+		t.Fatalf("unexpected parsed models: %#v", models)
+	}
+}
+
+func TestParseOpencodeModelsOutputAcceptsJSONArray(t *testing.T) {
+	models := parseOpencodeModelsOutput(`["opencode-go/minimax-m2.7","invalid token","opencode-go/minimax-m2.7","opencode-go/kimi-k2.5"]`)
+	expected := []string{"opencode-go/minimax-m2.7", "opencode-go/kimi-k2.5"}
+	if !slices.Equal(models, expected) {
+		t.Fatalf("unexpected parsed models from json: %#v", models)
+	}
+}
+
+func TestSanitizeCodexArgsMatchesPythonExpectations(t *testing.T) {
+	sanitized, err := sanitizeCodexArgs("--approval-mode full-auto -m gpt-5.2 --sandbox-mode read-only --profile bugfix --json")
+	if err != nil {
+		t.Fatalf("sanitize codex args: %v", err)
+	}
+	expected := []string{"--profile", "bugfix"}
+	if !slices.Equal(sanitized, expected) {
+		t.Fatalf("unexpected sanitized args: %#v", sanitized)
+	}
+}
+
+func TestSanitizeCodexArgsPreservesQuotedValuesAndBlocksEqualsFlags(t *testing.T) {
+	sanitized, err := sanitizeCodexArgs(`--profile "bug fix" --model=gpt-5.2 --cwd=/tmp/repo --approval-mode=full-auto --sandbox read-only --config=fast`)
+	if err != nil {
+		t.Fatalf("sanitize codex args with quotes: %v", err)
+	}
+	expected := []string{"--profile", "bug fix", "--config=fast"}
+	if !slices.Equal(sanitized, expected) {
+		t.Fatalf("unexpected sanitized args with quotes: %#v", sanitized)
+	}
+}
+
+func TestSanitizeCodexArgsRejectsUnclosedQuotes(t *testing.T) {
+	if _, err := sanitizeCodexArgs(`--profile "bug fix`); err == nil {
+		t.Fatalf("expected unclosed quote error")
+	}
+}
 
 func TestRetryRunStartsManagedProcessAndCompletes(t *testing.T) {
 	dataDir, workspaceID, issueID, repoRoot := writeIssueContextFixture(t, false)
@@ -200,10 +245,60 @@ func TestGenerateAndApprovePlanThenRejectPlan(t *testing.T) {
 	}
 }
 
+func TestCallAgentForPlanReturnsProcessOutputOnFailure(t *testing.T) {
+	dataDir, _, _, repoRoot := writeIssueContextFixture(t, false)
+	opencodeBin := writeExecutableScript(t, "opencode", `#!/bin/sh
+if [ "$1" = "run" ]; then
+  echo "planning failed on stderr" >&2
+  exit 9
+fi
+echo "unknown command" >&2
+exit 1
+`)
+	if err := writeJSON(filepath.Join(dataDir, "settings.json"), appSettings{
+		LocalAgentType: "opencode",
+		OpencodeBin:    &opencodeBin,
+	}); err != nil {
+		t.Fatalf("write settings: %v", err)
+	}
+
+	plan, err := callAgentForPlan(dataDir, "opencode", "fake/test-model", repoRoot, "Generate a structured plan")
+	if err != nil {
+		t.Fatalf("call agent for plan: %v", err)
+	}
+	if plan.Summary != "planning failed on stderr" {
+		t.Fatalf("unexpected fallback summary: %#v", plan)
+	}
+}
+
+func TestCallAgentForPlanReturnsExitCodeWhenProcessFailsSilently(t *testing.T) {
+	dataDir, _, _, repoRoot := writeIssueContextFixture(t, false)
+	opencodeBin := writeExecutableScript(t, "opencode", `#!/bin/sh
+if [ "$1" = "run" ]; then
+  exit 5
+fi
+echo "unknown command" >&2
+exit 1
+`)
+	if err := writeJSON(filepath.Join(dataDir, "settings.json"), appSettings{
+		LocalAgentType: "opencode",
+		OpencodeBin:    &opencodeBin,
+	}); err != nil {
+		t.Fatalf("write settings: %v", err)
+	}
+
+	plan, err := callAgentForPlan(dataDir, "opencode", "fake/test-model", repoRoot, "Generate a structured plan")
+	if err != nil {
+		t.Fatalf("call agent for plan: %v", err)
+	}
+	if plan.Summary != "Planning failed with exit code 5" {
+		t.Fatalf("unexpected silent failure summary: %#v", plan)
+	}
+}
+
 func writeFakeOpencode(t *testing.T) string {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "opencode")
-	content := `#!/bin/sh
+	return writeExecutableScript(t, "opencode", `#!/bin/sh
 if [ "$1" = "models" ]; then
   echo "fake/test-model"
   exit 0
@@ -233,7 +328,12 @@ if [ "$1" = "run" ]; then
 fi
 echo "unknown command"
 exit 1
-`
+`)
+}
+
+func writeExecutableScript(t *testing.T, name string, content string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), name)
 	if err := os.WriteFile(path, []byte(content), 0o755); err != nil {
 		t.Fatalf("write fake opencode: %v", err)
 	}

@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -26,6 +27,8 @@ var defaultCodexModels = []string{
 	"gpt-5.3-codex-spark",
 	"gpt-5.2-codex",
 }
+
+var opencodeModelTokenPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]*(/[A-Za-z0-9][A-Za-z0-9._:-]*)+$`)
 
 type appSettings struct {
 	LocalAgentType string  `json:"local_agent_type"`
@@ -478,7 +481,10 @@ func buildRuntimeCommand(dataDir string, runtime string, model string, workspace
 		if codexBin == "" {
 			return nil, fmt.Errorf("runtime %s is not available", runtime)
 		}
-		args := sanitizeCodexArgs(firstNonEmptyPtr(settings.CodexArgs))
+		args, err := sanitizeCodexArgs(firstNonEmptyPtr(settings.CodexArgs))
+		if err != nil {
+			return nil, err
+		}
 		return append([]string{
 			codexBin,
 			"exec",
@@ -515,21 +521,7 @@ func detectOpencodeModels(binary string) []string {
 	if err != nil {
 		return nil
 	}
-	items := []string{}
-	seen := map[string]struct{}{}
-	for _, rawLine := range strings.Split(strings.TrimSpace(string(output)), "\n") {
-		line := strings.TrimSpace(strings.TrimLeft(rawLine, "-* "))
-		if line == "" {
-			continue
-		}
-		token := strings.Fields(line)[0]
-		if _, exists := seen[token]; exists {
-			continue
-		}
-		seen[token] = struct{}{}
-		items = append(items, token)
-	}
-	return items
+	return parseOpencodeModelsOutput(string(output))
 }
 
 func resolveBinary(configuredValue *string, defaultName string) string {
@@ -550,8 +542,64 @@ func resolveBinary(configuredValue *string, defaultName string) string {
 	return resolved
 }
 
-func sanitizeCodexArgs(raw string) []string {
-	fields := strings.Fields(raw)
+func parseOpencodeModelsOutput(output string) []string {
+	normalized := []string{}
+	seen := map[string]struct{}{}
+	push := func(candidate string) {
+		token := strings.TrimSpace(strings.Trim(candidate, ","))
+		if token == "" {
+			return
+		}
+		if !opencodeModelTokenPattern.MatchString(token) {
+			return
+		}
+		if _, exists := seen[token]; exists {
+			return
+		}
+		seen[token] = struct{}{}
+		normalized = append(normalized, token)
+	}
+
+	stripped := strings.TrimSpace(output)
+	if stripped == "" {
+		return []string{}
+	}
+	if strings.HasPrefix(stripped, "[") {
+		var payload any
+		if err := json.Unmarshal([]byte(stripped), &payload); err == nil {
+			if items, ok := payload.([]any); ok {
+				for _, item := range items {
+					if text, ok := item.(string); ok {
+						push(text)
+					}
+				}
+				return normalized
+			}
+		}
+	}
+
+	for _, rawLine := range strings.Split(output, "\n") {
+		line := strings.TrimSpace(rawLine)
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "-") || strings.HasPrefix(line, "*") {
+			line = strings.TrimSpace(line[1:])
+		}
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		push(fields[0])
+	}
+	return normalized
+}
+
+func sanitizeCodexArgs(raw string) ([]string, error) {
+	fields, err := splitShellArgs(raw)
+	if err != nil {
+		return nil, err
+	}
 	blockedWithValue := map[string]struct{}{
 		"-m": {}, "--model": {}, "-C": {}, "--cd": {}, "--cwd": {}, "-s": {}, "--sandbox": {}, "--sandbox-mode": {},
 		"-a": {}, "--ask-for-approval": {}, "--approval-mode": {},
@@ -571,9 +619,12 @@ func sanitizeCodexArgs(raw string) []string {
 		if _, blocked := blockedExact[field]; blocked {
 			continue
 		}
+		if hasBlockedFlagValue(field, blockedWithValue) {
+			continue
+		}
 		result = append(result, field)
 	}
-	return result
+	return result, nil
 }
 
 type planCommandResult struct {
@@ -587,12 +638,8 @@ func callAgentForPlan(dataDir string, runtime string, model string, workspacePat
 	if err != nil {
 		return nil, err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-	command := exec.CommandContext(ctx, commandArgs[0], commandArgs[1:]...)
-	command.Dir = workspacePath
-	output, _ := command.CombinedOutput()
-	text := strings.TrimSpace(string(output))
+	execution := runCommandWithTimeout(workspacePath, 60*time.Second, commandArgs)
+	text := execution.Output
 	for _, line := range strings.Split(text, "\n") {
 		if parsed, ok := parsePlanJSON(strings.TrimSpace(line)); ok {
 			return parsed, nil
@@ -601,15 +648,142 @@ func callAgentForPlan(dataDir string, runtime string, model string, workspacePat
 	if parsed, ok := parsePlanJSON(text); ok {
 		return parsed, nil
 	}
-	summary := text
-	if summary == "" {
-		if ctx.Err() == context.DeadlineExceeded {
-			summary = "Planning timed out"
-		} else {
-			summary = "Planning produced no structured output"
+	summary := fallbackCommandSummary("Planning", execution, 500)
+	return &planCommandResult{Summary: summary, Steps: []PlanStep{}}, nil
+}
+
+type commandRunResult struct {
+	Output   string
+	ExitCode *int
+	TimedOut bool
+	Err      error
+}
+
+func runCommandWithTimeout(dir string, timeout time.Duration, commandArgs []string) *commandRunResult {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	command := exec.CommandContext(ctx, commandArgs[0], commandArgs[1:]...)
+	command.Dir = dir
+	output, err := command.CombinedOutput()
+	result := &commandRunResult{
+		Output:   strings.TrimSpace(string(output)),
+		TimedOut: errors.Is(ctx.Err(), context.DeadlineExceeded),
+		Err:      err,
+	}
+	if !result.TimedOut && command.ProcessState != nil {
+		exitCode := command.ProcessState.ExitCode()
+		result.ExitCode = &exitCode
+	}
+	if !result.TimedOut && result.ExitCode == nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			exitCode := exitErr.ExitCode()
+			result.ExitCode = &exitCode
+		} else if err == nil {
+			exitCode := 0
+			result.ExitCode = &exitCode
 		}
 	}
-	return &planCommandResult{Summary: summary, Steps: []PlanStep{}}, nil
+	return result
+}
+
+func fallbackCommandSummary(action string, result *commandRunResult, limit int) string {
+	text := strings.TrimSpace(result.Output)
+	if text != "" {
+		if limit > 0 && len(text) > limit {
+			text = strings.TrimSpace(text[:limit])
+		}
+		return text
+	}
+	if result.TimedOut {
+		return action + " timed out"
+	}
+	if result.ExitCode != nil {
+		return fmt.Sprintf("%s failed with exit code %d", action, *result.ExitCode)
+	}
+	if result.Err != nil {
+		return fmt.Sprintf("%s failed: %v", action, result.Err)
+	}
+	return action + " produced no structured output"
+}
+
+func splitShellArgs(raw string) ([]string, error) {
+	args := []string{}
+	var current strings.Builder
+	tokenStarted := false
+	inSingle := false
+	inDouble := false
+	escaped := false
+
+	flush := func() {
+		if tokenStarted {
+			args = append(args, current.String())
+			current.Reset()
+			tokenStarted = false
+		}
+	}
+
+	for i := 0; i < len(raw); i++ {
+		ch := raw[i]
+		if escaped {
+			current.WriteByte(ch)
+			tokenStarted = true
+			escaped = false
+			continue
+		}
+		switch {
+		case inSingle:
+			if ch == '\'' {
+				inSingle = false
+				continue
+			}
+			current.WriteByte(ch)
+			tokenStarted = true
+		case inDouble:
+			switch ch {
+			case '"':
+				inDouble = false
+			case '\\':
+				escaped = true
+			default:
+				current.WriteByte(ch)
+				tokenStarted = true
+			}
+		default:
+			switch ch {
+			case ' ', '\t', '\n', '\r':
+				flush()
+			case '\'':
+				inSingle = true
+				tokenStarted = true
+			case '"':
+				inDouble = true
+				tokenStarted = true
+			case '\\':
+				escaped = true
+				tokenStarted = true
+			default:
+				current.WriteByte(ch)
+				tokenStarted = true
+			}
+		}
+	}
+	if escaped {
+		return nil, fmt.Errorf("unterminated escape sequence in codex args")
+	}
+	if inSingle || inDouble {
+		return nil, fmt.Errorf("unclosed quote in codex args")
+	}
+	flush()
+	return args, nil
+}
+
+func hasBlockedFlagValue(arg string, blockedWithValue map[string]struct{}) bool {
+	for flag := range blockedWithValue {
+		if strings.HasPrefix(arg, flag+"=") {
+			return true
+		}
+	}
+	return false
 }
 
 func parsePlanJSON(text string) (*planCommandResult, bool) {
