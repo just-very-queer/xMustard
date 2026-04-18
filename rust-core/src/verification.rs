@@ -53,7 +53,7 @@ pub struct RustCoverageResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RustVerificationCommandResult {
+pub struct RustManagedCommandResult {
     pub command: String,
     pub cwd: String,
     pub exit_code: Option<i32>,
@@ -64,6 +64,11 @@ pub struct RustVerificationCommandResult {
     pub stderr_excerpt: String,
     pub created_at: String,
 }
+
+pub type RustVerificationCommandResult = RustManagedCommandResult;
+
+const VERIFICATION_COMMAND_EXCERPT_LIMIT: usize = 4_000;
+const MANAGED_COMMAND_EXCERPT_LIMIT: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RustVerificationProfileInput {
@@ -96,28 +101,64 @@ pub struct RustVerificationProfileResult {
     pub created_at: String,
 }
 
+pub fn run_managed_command(
+    workspace_root: &Path,
+    command_args: &[String],
+    timeout_seconds: u64,
+) -> Result<RustManagedCommandResult, std::io::Error> {
+    let Some(program) = command_args.first() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "managed command args cannot be empty",
+        ));
+    };
+    let display_command = format_command_preview(command_args);
+    run_managed_command_with_program(
+        workspace_root,
+        &display_command,
+        program,
+        &command_args[1..],
+        timeout_seconds,
+        MANAGED_COMMAND_EXCERPT_LIMIT,
+    )
+}
+
 pub fn run_verification_command(
     workspace_root: &Path,
     command: &str,
     timeout_seconds: u64,
 ) -> Result<RustVerificationCommandResult, std::io::Error> {
-    let mut shell_command = if cfg!(target_os = "windows") {
-        let mut cmd = Command::new("cmd");
-        cmd.arg("/C").arg(command);
-        cmd
-    } else {
-        let mut cmd = Command::new("sh");
-        cmd.arg("-lc").arg(command);
-        cmd
-    };
+    let command_args = verification_shell_command_args(command);
+    let program = command_args
+        .first()
+        .expect("verification shell command should always include a program");
+    run_managed_command_with_program(
+        workspace_root,
+        command,
+        program,
+        &command_args[1..],
+        timeout_seconds,
+        VERIFICATION_COMMAND_EXCERPT_LIMIT,
+    )
+}
 
+fn run_managed_command_with_program(
+    workspace_root: &Path,
+    display_command: &str,
+    program: &str,
+    args: &[String],
+    timeout_seconds: u64,
+    excerpt_limit: usize,
+) -> Result<RustManagedCommandResult, std::io::Error> {
+    let mut managed_command = Command::new(program);
+    managed_command.args(args);
     let resolved_cwd = workspace_root
         .canonicalize()
         .unwrap_or_else(|_| workspace_root.to_path_buf());
     let started_at = Instant::now();
     let timeout = Duration::from_secs(timeout_seconds.max(1));
 
-    let mut child = shell_command
+    let mut child = managed_command
         .current_dir(&resolved_cwd)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -126,8 +167,8 @@ pub fn run_verification_command(
     loop {
         if child.try_wait()?.is_some() {
             let output = child.wait_with_output()?;
-            return Ok(build_verification_result(
-                command,
+            return Ok(build_managed_command_result(
+                display_command,
                 &resolved_cwd,
                 output.status.code(),
                 output.status.success(),
@@ -135,14 +176,15 @@ pub fn run_verification_command(
                 started_at.elapsed(),
                 String::from_utf8_lossy(&output.stdout).as_ref(),
                 String::from_utf8_lossy(&output.stderr).as_ref(),
+                excerpt_limit,
             ));
         }
 
         if started_at.elapsed() >= timeout {
             let _ = child.kill();
             let output = child.wait_with_output()?;
-            return Ok(build_verification_result(
-                command,
+            return Ok(build_managed_command_result(
+                display_command,
                 &resolved_cwd,
                 output.status.code(),
                 false,
@@ -150,6 +192,7 @@ pub fn run_verification_command(
                 started_at.elapsed(),
                 String::from_utf8_lossy(&output.stdout).as_ref(),
                 String::from_utf8_lossy(&output.stderr).as_ref(),
+                excerpt_limit,
             ));
         }
 
@@ -608,7 +651,7 @@ fn round_percent(value: f64) -> f64 {
     (value * 100.0).round() / 100.0
 }
 
-fn build_verification_result(
+fn build_managed_command_result(
     command: &str,
     cwd: &Path,
     exit_code: Option<i32>,
@@ -617,17 +660,30 @@ fn build_verification_result(
     duration: Duration,
     stdout: &str,
     stderr: &str,
-) -> RustVerificationCommandResult {
-    RustVerificationCommandResult {
+    excerpt_limit: usize,
+) -> RustManagedCommandResult {
+    RustManagedCommandResult {
         command: command.to_string(),
         cwd: cwd.to_string_lossy().to_string(),
         exit_code,
         success,
         timed_out,
         duration_ms: duration.as_millis().min(u128::from(u64::MAX)) as u64,
-        stdout_excerpt: truncate_excerpt(stdout, 4000),
-        stderr_excerpt: truncate_excerpt(stderr, 4000),
+        stdout_excerpt: truncate_excerpt(stdout, excerpt_limit),
+        stderr_excerpt: truncate_excerpt(stderr, excerpt_limit),
         created_at: Utc::now().to_rfc3339(),
+    }
+}
+
+fn format_command_preview(command_args: &[String]) -> String {
+    command_args.join(" ")
+}
+
+fn verification_shell_command_args(command: &str) -> Vec<String> {
+    if cfg!(target_os = "windows") {
+        vec!["cmd".to_string(), "/C".to_string(), command.to_string()]
+    } else {
+        vec!["sh".to_string(), "-lc".to_string(), command.to_string()]
     }
 }
 
@@ -825,8 +881,9 @@ fn empty_coverage_result(
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_cobertura_content, parse_istanbul_content, parse_lcov_content, run_migration_verification,
-        run_verification_command, run_verification_profile, RustVerificationProfileInput,
+        parse_cobertura_content, parse_istanbul_content, parse_lcov_content, run_managed_command,
+        run_migration_verification, run_verification_command, run_verification_profile,
+        RustVerificationProfileInput,
     };
     use chrono::Utc;
     use tempfile::TempDir;
@@ -887,6 +944,36 @@ mod tests {
         assert_eq!(result.files_covered, 1);
         assert_eq!(result.files_total, 2);
         assert_eq!(result.uncovered_files, vec!["src/empty.ts".to_string()]);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn runs_managed_command_with_direct_argv() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let command_args = vec![
+            "sh".to_string(),
+            "-lc".to_string(),
+            "printf '%s|%s\\n' \"$1\" \"$2\"".to_string(),
+            "ignored-script-name".to_string(),
+            "one two".to_string(),
+            "three".to_string(),
+        ];
+
+        let result = run_managed_command(temp_dir.path(), &command_args, 2).expect("command should run");
+
+        assert!(result.success);
+        assert!(!result.timed_out);
+        assert_eq!(result.exit_code, Some(0));
+        assert_eq!(result.stdout_excerpt, "one two|three\n");
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn rejects_empty_managed_command_args() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let err = run_managed_command(temp_dir.path(), &[], 2).expect_err("empty command args should fail");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
 
     #[cfg(not(target_os = "windows"))]

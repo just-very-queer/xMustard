@@ -15,6 +15,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"xmustard/api-go/internal/rustcore"
 )
 
 var activeRunProcesses sync.Map
@@ -29,6 +31,10 @@ var defaultCodexModels = []string{
 }
 
 var opencodeModelTokenPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]*(/[A-Za-z0-9][A-Za-z0-9._:-]*)+$`)
+
+var runManagedPlanningCommand = rustcore.RunManagedCommand
+var planningCommandTimeout = 60 * time.Second
+var planningRustCoreBuffer = 5 * time.Second
 
 type appSettings struct {
 	LocalAgentType string  `json:"local_agent_type"`
@@ -638,7 +644,7 @@ func callAgentForPlan(dataDir string, runtime string, model string, workspacePat
 	if err != nil {
 		return nil, err
 	}
-	execution := runCommandWithTimeout(workspacePath, 60*time.Second, commandArgs)
+	execution := runPlanningCommand(workspacePath, planningCommandTimeout, commandArgs)
 	text := execution.Output
 	for _, line := range strings.Split(text, "\n") {
 		if parsed, ok := parsePlanJSON(strings.TrimSpace(line)); ok {
@@ -650,6 +656,22 @@ func callAgentForPlan(dataDir string, runtime string, model string, workspacePat
 	}
 	summary := fallbackCommandSummary("Planning", execution, 500)
 	return &planCommandResult{Summary: summary, Steps: []PlanStep{}}, nil
+}
+
+func runPlanningCommand(workspacePath string, timeout time.Duration, commandArgs []string) *commandRunResult {
+	ctxTimeout := timeout + planningRustCoreBuffer
+	if ctxTimeout < timeout {
+		ctxTimeout = timeout
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), ctxTimeout)
+	defer cancel()
+
+	result, err := runManagedPlanningCommand(ctx, workspacePath, durationSeconds(timeout), commandArgs)
+	if err != nil {
+		return runCommandWithTimeout(workspacePath, timeout, commandArgs)
+	}
+	return managedCommandResultToRunResult(result)
 }
 
 type commandRunResult struct {
@@ -684,6 +706,41 @@ func runCommandWithTimeout(dir string, timeout time.Duration, commandArgs []stri
 		}
 	}
 	return result
+}
+
+func managedCommandResultToRunResult(result *rustcore.ManagedCommandResult) *commandRunResult {
+	return &commandRunResult{
+		Output:   combineCommandOutput(result.StdoutExcerpt, result.StderrExcerpt),
+		ExitCode: result.ExitCode,
+		TimedOut: result.TimedOut,
+	}
+}
+
+func combineCommandOutput(stdout string, stderr string) string {
+	stdout = strings.TrimSpace(stdout)
+	stderr = strings.TrimSpace(stderr)
+	switch {
+	case stdout == "":
+		return stderr
+	case stderr == "":
+		return stdout
+	default:
+		return stdout + "\n" + stderr
+	}
+}
+
+func durationSeconds(timeout time.Duration) int {
+	if timeout <= 0 {
+		return 1
+	}
+	seconds := int(timeout / time.Second)
+	if timeout%time.Second != 0 {
+		seconds++
+	}
+	if seconds < 1 {
+		return 1
+	}
+	return seconds
 }
 
 func fallbackCommandSummary(action string, result *commandRunResult, limit int) string {

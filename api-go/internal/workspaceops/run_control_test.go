@@ -1,12 +1,16 @@
 package workspaceops
 
 import (
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
 	"time"
+
+	"xmustard/api-go/internal/rustcore"
 )
 
 func TestParseOpencodeModelsOutputMatchesPythonExpectations(t *testing.T) {
@@ -293,6 +297,40 @@ exit 1
 	}
 	if plan.Summary != "Planning failed with exit code 5" {
 		t.Fatalf("unexpected silent failure summary: %#v", plan)
+	}
+}
+
+func TestCallAgentForPlanFallsBackToLocalExecutionWhenRustCoreBridgeFails(t *testing.T) {
+	dataDir, _, _, repoRoot := writeIssueContextFixture(t, false)
+	opencodeBin := writeExecutableScript(t, "opencode", `#!/bin/sh
+if [ "$1" = "run" ]; then
+  echo "planning failed on stderr" >&2
+  exit 9
+fi
+echo "unknown command" >&2
+exit 1
+`)
+	if err := writeJSON(filepath.Join(dataDir, "settings.json"), appSettings{
+		LocalAgentType: "opencode",
+		OpencodeBin:    &opencodeBin,
+	}); err != nil {
+		t.Fatalf("write settings: %v", err)
+	}
+
+	original := runManagedPlanningCommand
+	runManagedPlanningCommand = func(ctx context.Context, workspaceRoot string, timeoutSeconds int, commandArgs []string) (*rustcore.ManagedCommandResult, error) {
+		return nil, errors.New("bridge unavailable")
+	}
+	defer func() {
+		runManagedPlanningCommand = original
+	}()
+
+	plan, err := callAgentForPlan(dataDir, "opencode", "fake/test-model", repoRoot, "Generate a structured plan")
+	if err != nil {
+		t.Fatalf("call agent for plan with fallback: %v", err)
+	}
+	if plan.Summary != "planning failed on stderr" {
+		t.Fatalf("unexpected fallback summary after rustcore failure: %#v", plan)
 	}
 }
 
