@@ -1433,10 +1433,17 @@ class TrackerService:
         payload: str,
         previous_by_id: dict[str, VulnerabilityFindingRecord],
         imported: list[VulnerabilityFindingRecord],
+        *,
+        scanner_scope: Optional[set[str]] = None,
     ) -> VulnerabilityImportBatchRecord:
         scanner = imported[0].scanner if imported else str(source)
         closed_statuses = {"fixed", "verified", "closed"}
         summary_counts = {"new": 0, "existing": 0, "resolved": 0, "regressed": 0}
+        imported_ids = {finding.finding_id for finding in imported}
+        if scanner_scope is None:
+            normalized_scanner_scope = {scanner.strip()} if scanner and scanner.strip() else set()
+        else:
+            normalized_scanner_scope = {str(item).strip() for item in scanner_scope if str(item).strip()}
         for finding in imported:
             previous = previous_by_id.get(finding.finding_id)
             if previous is None:
@@ -1448,6 +1455,38 @@ class TrackerService:
                 summary_counts["resolved"] += 1
             else:
                 summary_counts["existing"] += 1
+        for previous in previous_by_id.values():
+            if previous.finding_id in imported_ids or previous.status in closed_statuses:
+                continue
+            if previous.source != source:
+                continue
+            if normalized_scanner_scope and previous.scanner not in normalized_scanner_scope:
+                continue
+            self.save_vulnerability_finding(
+                workspace_id,
+                issue_id,
+                VulnerabilityFindingUpsertRequest(
+                    finding_id=previous.finding_id,
+                    scanner=previous.scanner,
+                    source=previous.source,
+                    severity=previous.severity,
+                    status="closed",
+                    title=previous.title,
+                    summary=previous.summary,
+                    rule_id=previous.rule_id,
+                    location_path=previous.location_path,
+                    location_line=previous.location_line,
+                    cwe_ids=list(previous.cwe_ids),
+                    cve_ids=list(previous.cve_ids),
+                    references=list(previous.references),
+                    evidence=list(previous.evidence),
+                    threat_model_ids=list(previous.threat_model_ids),
+                    raw_payload=previous.raw_payload,
+                ),
+                actor=build_activity_actor("system", "system"),
+                action="vulnerability_finding.reconciled",
+            )
+            summary_counts["resolved"] += 1
         batch = VulnerabilityImportBatchRecord(
             batch_id=f"vuln_import_{uuid.uuid4().hex[:12]}",
             workspace_id=workspace_id,
@@ -1843,12 +1882,14 @@ class TrackerService:
             for item in self.list_vulnerability_findings(workspace_id, issue_id)
         }
         imported: list[VulnerabilityFindingRecord] = []
+        scanner_scope: set[str] = set()
         runs = sarif.get("runs") if isinstance(sarif.get("runs"), list) else []
         for run in runs:
             if not isinstance(run, dict):
                 continue
             driver = ((run.get("tool") or {}).get("driver") or {}) if isinstance(run.get("tool"), dict) else {}
             scanner = str(driver.get("name") or "sarif").strip() or "sarif"
+            scanner_scope.add(scanner)
             rules = driver.get("rules") if isinstance(driver.get("rules"), list) else []
             rule_lookup = {
                 str(rule.get("id")): rule
@@ -1875,6 +1916,7 @@ class TrackerService:
             payload,
             previous_by_id,
             imported,
+            scanner_scope=scanner_scope,
         )
         self._record_activity(
             workspace_id=workspace_id,
@@ -1924,6 +1966,7 @@ class TrackerService:
             payload,
             previous_by_id,
             imported,
+            scanner_scope={"nessus"},
         )
         self._record_activity(
             workspace_id=workspace_id,

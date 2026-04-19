@@ -896,6 +896,186 @@ reviews:
             self.assertEqual(latest.summary_counts["existing"], 1)
             self.assertEqual(latest.finding_ids, [imported[0].finding_id])
 
+    def test_vulnerability_import_batches_close_missing_findings_on_reimport(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "repo"
+            (root / "docs" / "bugs").mkdir(parents=True)
+            (root / "api" / "src").mkdir(parents=True)
+            (root / "docs" / "bugs" / "Bugs_25260323.md").write_text(LEDGER_TEXT, encoding="utf-8")
+            (root / "api" / "src" / "example.py").write_text("print('ok')\n", encoding="utf-8")
+
+            store = FileStore(Path(tmp_dir) / "data")
+            service = TrackerService(store)
+            snapshot = service.load_workspace(WorkspaceLoadRequest(root_path=str(root), auto_scan=True))
+            assert snapshot is not None
+            workspace_id = snapshot.workspace.workspace_id
+            issue_id = "P0_25M03_001"
+
+            payload_with_finding = json.dumps(
+                {
+                    "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+                    "runs": [
+                        {
+                            "tool": {
+                                "driver": {
+                                    "name": "CodeQL",
+                                    "rules": [{"id": "py/path-injection", "shortDescription": {"text": "Path injection"}}],
+                                }
+                            },
+                            "results": [
+                                {
+                                    "ruleId": "py/path-injection",
+                                    "level": "error",
+                                    "message": {"text": "User-controlled path reaches file open."},
+                                    "locations": [
+                                        {
+                                            "physicalLocation": {
+                                                "artifactLocation": {"uri": "api/src/example.py"},
+                                                "region": {"startLine": 12},
+                                            }
+                                        }
+                                    ],
+                                }
+                            ],
+                        }
+                    ],
+                }
+            )
+            empty_payload = json.dumps(
+                {
+                    "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+                    "runs": [
+                        {
+                            "tool": {"driver": {"name": "CodeQL", "rules": []}},
+                            "results": [],
+                        }
+                    ],
+                }
+            )
+
+            imported = service.import_sarif_vulnerability_findings(workspace_id, issue_id, payload_with_finding)
+            self.assertEqual(len(imported), 1)
+            self.assertEqual(imported[0].status, "open")
+
+            second_import = service.import_sarif_vulnerability_findings(workspace_id, issue_id, empty_payload)
+            self.assertEqual(second_import, [])
+
+            batches = service.list_vulnerability_import_batches(workspace_id, issue_id)
+            self.assertEqual(len(batches), 2)
+            latest = batches[0]
+            self.assertEqual(latest.total_findings, 0)
+            self.assertEqual(latest.finding_ids, [])
+            self.assertEqual(latest.summary_counts["new"], 0)
+            self.assertEqual(latest.summary_counts["existing"], 0)
+            self.assertEqual(latest.summary_counts["resolved"], 1)
+            self.assertEqual(latest.summary_counts["regressed"], 0)
+
+            findings = service.list_vulnerability_findings(workspace_id, issue_id)
+            self.assertEqual(len(findings), 1)
+            self.assertEqual(findings[0].finding_id, imported[0].finding_id)
+            self.assertEqual(findings[0].status, "closed")
+
+    def test_vulnerability_import_reconciliation_does_not_close_other_sources(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "repo"
+            (root / "docs" / "bugs").mkdir(parents=True)
+            (root / "api" / "src").mkdir(parents=True)
+            (root / "docs" / "bugs" / "Bugs_25260323.md").write_text(LEDGER_TEXT, encoding="utf-8")
+            (root / "api" / "src" / "example.py").write_text("print('ok')\n", encoding="utf-8")
+
+            store = FileStore(Path(tmp_dir) / "data")
+            service = TrackerService(store)
+            snapshot = service.load_workspace(WorkspaceLoadRequest(root_path=str(root), auto_scan=True))
+            assert snapshot is not None
+            workspace_id = snapshot.workspace.workspace_id
+            issue_id = "P0_25M03_001"
+
+            manual = service.save_vulnerability_finding(
+                workspace_id,
+                issue_id,
+                VulnerabilityFindingUpsertRequest(
+                    title="Manual export review note",
+                    scanner="operator",
+                    source="manual",
+                    severity="medium",
+                    status="open",
+                    summary="Operator-tracked vulnerability should not be reconciled by SARIF imports.",
+                ),
+            )
+
+            empty_payload = json.dumps(
+                {
+                    "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+                    "runs": [
+                        {
+                            "tool": {"driver": {"name": "CodeQL", "rules": []}},
+                            "results": [],
+                        }
+                    ],
+                }
+            )
+            service.import_sarif_vulnerability_findings(workspace_id, issue_id, empty_payload)
+
+            findings = {item.finding_id: item for item in service.list_vulnerability_findings(workspace_id, issue_id)}
+            self.assertIn(manual.finding_id, findings)
+            self.assertEqual(findings[manual.finding_id].status, "open")
+
+    def test_vulnerability_import_reconciliation_closes_same_source_when_sarif_has_no_runs(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "repo"
+            (root / "docs" / "bugs").mkdir(parents=True)
+            (root / "api" / "src").mkdir(parents=True)
+            (root / "docs" / "bugs" / "Bugs_25260323.md").write_text(LEDGER_TEXT, encoding="utf-8")
+            (root / "api" / "src" / "example.py").write_text("print('ok')\n", encoding="utf-8")
+
+            store = FileStore(Path(tmp_dir) / "data")
+            service = TrackerService(store)
+            snapshot = service.load_workspace(WorkspaceLoadRequest(root_path=str(root), auto_scan=True))
+            assert snapshot is not None
+            workspace_id = snapshot.workspace.workspace_id
+            issue_id = "P0_25M03_001"
+
+            payload_with_finding = json.dumps(
+                {
+                    "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+                    "runs": [
+                        {
+                            "tool": {
+                                "driver": {
+                                    "name": "CodeQL",
+                                    "rules": [{"id": "py/path-injection", "shortDescription": {"text": "Path injection"}}],
+                                }
+                            },
+                            "results": [
+                                {
+                                    "ruleId": "py/path-injection",
+                                    "level": "error",
+                                    "message": {"text": "User-controlled path reaches file open."},
+                                    "locations": [
+                                        {
+                                            "physicalLocation": {
+                                                "artifactLocation": {"uri": "api/src/example.py"},
+                                                "region": {"startLine": 12},
+                                            }
+                                        }
+                                    ],
+                                }
+                            ],
+                        }
+                    ],
+                }
+            )
+            no_runs_payload = json.dumps({"$schema": "https://json.schemastore.org/sarif-2.1.0.json", "runs": []})
+
+            imported = service.import_sarif_vulnerability_findings(workspace_id, issue_id, payload_with_finding)
+            self.assertEqual(len(imported), 1)
+            service.import_sarif_vulnerability_findings(workspace_id, issue_id, no_runs_payload)
+
+            findings = service.list_vulnerability_findings(workspace_id, issue_id)
+            self.assertEqual(len(findings), 1)
+            self.assertEqual(findings[0].finding_id, imported[0].finding_id)
+            self.assertEqual(findings[0].status, "closed")
+
     def test_vulnerability_report_links_threat_models_and_renders_markdown(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir) / "repo"
