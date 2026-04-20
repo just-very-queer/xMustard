@@ -184,6 +184,7 @@ export function WorkspaceActivityPanel({
             >
               <option value="all">All entities</option>
               <option value="issue">Issue</option>
+              <option value="fix">Fix</option>
               <option value="run">Run</option>
               <option value="view">View</option>
               <option value="signal">Signal</option>

@@ -305,7 +305,7 @@ export function listIssues(
 ) {
   const query = new URLSearchParams()
   Object.entries(params).forEach(([key, value]) => {
-    if (value === undefined || value === '' || value === false) return
+    if (value === undefined || value === '') return
     query.set(key, Array.isArray(value) ? value.join(',') : String(value))
   })
   return request<WorkspaceSnapshot['issues']>(`/api/workspaces/${workspaceId}/issues?${query.toString()}`)

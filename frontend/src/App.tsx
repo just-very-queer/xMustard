@@ -576,7 +576,7 @@ function App() {
       source: nextFilters.sources,
       label: nextFilters.labels,
       drift_only: effectiveDrift,
-      needs_followup: nextFilters.needs_followup === true ? true : undefined,
+      needs_followup: nextFilters.needs_followup,
       review_ready_only: nextFilters.review_ready_only,
     })
     setIssueQueue(issues)
@@ -788,13 +788,39 @@ function App() {
   }, [filteredActivity])
 
   useEffect(() => {
-    if (!workspaceId || !selectedIssueBugId) return
+    if (!workspaceId || !selectedIssueBugId) {
+      setIssueContextPacket(null)
+      setIssueDrift(null)
+      return
+    }
+
+    let cancelled = false
     void issueWork(workspaceId, selectedIssueBugId, selectedRunbookId || undefined)
-      .then(setIssueContextPacket)
-      .catch((nextError) => setError(nextError instanceof Error ? nextError.message : String(nextError)))
+      .then((packet) => {
+        if (!cancelled) {
+          setIssueContextPacket(packet)
+        }
+      })
+      .catch((nextError) => {
+        if (!cancelled) {
+          setError(nextError instanceof Error ? nextError.message : String(nextError))
+        }
+      })
     void readIssueDrift(workspaceId, selectedIssueBugId)
-      .then(setIssueDrift)
-      .catch((nextError) => setError(nextError instanceof Error ? nextError.message : String(nextError)))
+      .then((drift) => {
+        if (!cancelled) {
+          setIssueDrift(drift)
+        }
+      })
+      .catch((nextError) => {
+        if (!cancelled) {
+          setError(nextError instanceof Error ? nextError.message : String(nextError))
+        }
+      })
+
+    return () => {
+      cancelled = true
+    }
   }, [workspaceId, selectedIssueBugId, selectedRunbookId])
 
   useEffect(() => {
@@ -991,6 +1017,14 @@ function App() {
     setFixIssueStatusDraft(selectedIssue.issue_status === 'resolved' ? 'resolved' : 'verification')
     setFixRunIdDraft(null)
   }, [selectedIssue])
+
+  useEffect(() => {
+    const runbooks = issueContextPacket?.available_runbooks ?? []
+    setSelectedRunbookId((current) => {
+      if (runbooks.some((item) => item.runbook_id === current)) return current
+      return runbooks[0]?.runbook_id ?? 'fix'
+    })
+  }, [issueContextPacket?.available_runbooks])
 
   useEffect(() => {
     const selectedRunbook = issueContextPacket?.available_runbooks.find((item) => item.runbook_id === selectedRunbookId) ?? null
@@ -2361,6 +2395,7 @@ function App() {
                 issueQueue={issueQueue}
                 signalQueue={signalQueue}
                 runs={runs}
+                reviewRuns={reviewRuns}
                 sources={sources}
                 treeNodes={treeNodes}
                 treePath={treePath}

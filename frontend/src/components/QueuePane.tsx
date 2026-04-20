@@ -28,6 +28,7 @@ type Props = {
   issueQueue: IssueRecord[]
   signalQueue: DiscoverySignal[]
   runs: RunRecord[]
+  reviewRuns: RunRecord[]
   sources: SourceRecord[]
   treeNodes: TreeNode[]
   treePath: string
@@ -110,6 +111,7 @@ export function QueuePane({
   issueQueue,
   signalQueue,
   runs,
+  reviewRuns,
   sources,
   treeNodes,
   treePath,
@@ -157,11 +159,6 @@ export function QueuePane({
   onNavigateTree,
 }: Props) {
   const [pageState, setPageState] = useState({ scope: '', value: 0 })
-  const reviewRunIds = useMemo(() => new Set(issueQueue.flatMap((issue) => issue.review_ready_runs)), [issueQueue])
-  const reviewRuns = useMemo(
-    () => runs.filter((run) => reviewRunIds.has(run.run_id)),
-    [reviewRunIds, runs],
-  )
   const totalCount =
     activeView === 'issues' || activeView === 'drift'
       ? issueQueue.length
