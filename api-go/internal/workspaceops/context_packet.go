@@ -96,6 +96,21 @@ type DynamicContextBundle struct {
 	RelatedContext []RelatedContextRecord `json:"related_context"`
 }
 
+type ContextDecisionRecord struct {
+	DecisionType string   `json:"decision_type"`
+	ItemKey      string   `json:"item_key"`
+	Title        string   `json:"title"`
+	Path         *string  `json:"path,omitempty"`
+	Symbol       *string  `json:"symbol,omitempty"`
+	ArtifactType *string  `json:"artifact_type,omitempty"`
+	ArtifactID   *string  `json:"artifact_id,omitempty"`
+	Included     bool     `json:"included"`
+	Score        int      `json:"score"`
+	Reason       string   `json:"reason"`
+	MatchedTerms []string `json:"matched_terms"`
+	Source       string   `json:"source"`
+}
+
 type IssueContextPacket struct {
 	Issue                         issueRecord                         `json:"issue"`
 	Workspace                     workspaceRecord                     `json:"workspace"`
@@ -113,6 +128,7 @@ type IssueContextPacket struct {
 	BrowserDumps                  []BrowserDumpRecord                 `json:"browser_dumps"`
 	RepoMap                       *rustcore.RepoMapSummary            `json:"repo_map,omitempty"`
 	DynamicContext                *DynamicContextBundle               `json:"dynamic_context,omitempty"`
+	ContextDecisions              []ContextDecisionRecord             `json:"context_decisions"`
 	RepoConfig                    *RepoConfigRecord                   `json:"repo_config,omitempty"`
 	MatchedPathInstructions       []RepoPathInstructionMatch          `json:"matched_path_instructions"`
 	Worktree                      *WorktreeStatus                     `json:"worktree,omitempty"`
@@ -181,7 +197,7 @@ func BuildIssueContextPacket(dataDir string, workspaceID string, issueID string)
 		return nil, err
 	}
 
-	relatedPaths := rankRelatedPathsForIssue(*issue, treeFocus, ticketContexts, repoMap)
+	relatedPaths, pathDecisions := rankRelatedPathsForIssue(*issue, treeFocus, ticketContexts, repoMap)
 	evidencePaths := make([]string, 0, len(evidenceBundle))
 	for _, item := range evidenceBundle {
 		if item.NormalizedPath != nil && strings.TrimSpace(*item.NormalizedPath) != "" {
@@ -208,7 +224,8 @@ func BuildIssueContextPacket(dataDir string, workspaceID string, issueID string)
 		recentActivity = recentActivity[:8]
 	}
 	worktree := readWorktreeStatus(snapshot.Workspace.RootPath)
-	dynamicContext := buildDynamicContext(snapshot.Workspace, *issue, treeFocus, ticketContexts, threatModels, browserDumps, recentFixes, recentActivity, relatedPaths)
+	dynamicContext, dynamicDecisions := buildDynamicContext(snapshot.Workspace, *issue, treeFocus, ticketContexts, threatModels, browserDumps, recentFixes, recentActivity, relatedPaths)
+	contextDecisions := append(pathDecisions, dynamicDecisions...)
 
 	packet := &IssueContextPacket{
 		Issue:                         *issue,
@@ -227,6 +244,7 @@ func BuildIssueContextPacket(dataDir string, workspaceID string, issueID string)
 		BrowserDumps:                  browserDumps,
 		RepoMap:                       repoMap,
 		DynamicContext:                dynamicContext,
+		ContextDecisions:              contextDecisions,
 		RepoConfig:                    repoConfig,
 		MatchedPathInstructions:       matchedPathInstructions,
 		Worktree:                      worktree,
@@ -245,6 +263,7 @@ func BuildIssueContextPacket(dataDir string, workspaceID string, issueID string)
 		packet.RelatedPaths,
 		packet.RepoMap,
 		packet.DynamicContext,
+		packet.ContextDecisions,
 		packet.RepoConfig,
 		packet.MatchedPathInstructions,
 	)
@@ -673,12 +692,20 @@ func contextTokens(issue issueRecord, ticketContexts []TicketContextRecord) []st
 	return ordered
 }
 
+type scoredPathDecision struct {
+	Path         string
+	Score        int
+	Reason       string
+	MatchedTerms []string
+	Source       string
+}
+
 func rankRelatedPathsForIssue(
 	issue issueRecord,
 	treeFocus []string,
 	ticketContexts []TicketContextRecord,
 	repoMap *rustcore.RepoMapSummary,
-) []string {
+) ([]string, []ContextDecisionRecord) {
 	candidates := append([]string{}, treeFocus...)
 	if repoMap != nil {
 		for _, item := range repoMap.KeyFiles {
@@ -689,54 +716,97 @@ func rankRelatedPathsForIssue(
 		}
 	}
 	tokens := contextTokens(issue, ticketContexts)
-	scored := map[string]int{}
+	scored := map[string]scoredPathDecision{}
 	for _, path := range candidates {
 		if path == "" {
 			continue
 		}
-		score := 0
 		lowered := strings.ToLower(path)
+		score := 0
+		reasons := []string{}
+		matches := []string{}
+		source := "repo_map"
 		if slices.Contains(treeFocus, path) {
 			score += 6
+			reasons = append(reasons, "direct issue tree focus")
+			source = "tree_focus"
 		}
 		for _, token := range tokens {
 			if strings.Contains(lowered, token) {
 				score += 2
+				matches = append(matches, token)
 			}
+		}
+		if len(matches) > 0 {
+			reasons = append(reasons, "matches issue/ticket terms: "+strings.Join(matches[:min(len(matches), 4)], ", "))
 		}
 		if strings.HasSuffix(lowered, ".py") || strings.HasSuffix(lowered, ".ts") || strings.HasSuffix(lowered, ".tsx") || strings.HasSuffix(lowered, ".js") || strings.HasSuffix(lowered, ".jsx") || strings.HasSuffix(lowered, ".go") || strings.HasSuffix(lowered, ".rs") || strings.HasSuffix(lowered, ".java") {
 			score++
+			reasons = append(reasons, "source file candidate")
 		}
 		if strings.Contains(lowered, "test") {
 			score++
+			reasons = append(reasons, "test coverage path")
 		}
-		if score > 0 && score > scored[path] {
-			scored[path] = score
+		if score <= 0 {
+			continue
+		}
+		decision := scoredPathDecision{
+			Path:         path,
+			Score:        score,
+			Reason:       strings.Join(dedupeText(reasons), "; "),
+			MatchedTerms: dedupeText(matches),
+			Source:       source,
+		}
+		if current, ok := scored[path]; !ok || decision.Score > current.Score {
+			scored[path] = decision
 		}
 	}
-	ordered := make([]string, 0, len(scored))
-	for path := range scored {
-		ordered = append(ordered, path)
+	ordered := make([]scoredPathDecision, 0, len(scored))
+	for _, item := range scored {
+		ordered = append(ordered, item)
 	}
-	slices.SortFunc(ordered, func(a, b string) int {
-		if scored[a] != scored[b] {
-			if scored[a] > scored[b] {
+	slices.SortFunc(ordered, func(a, b scoredPathDecision) int {
+		if a.Score != b.Score {
+			if a.Score > b.Score {
 				return -1
 			}
 			return 1
 		}
-		if a < b {
+		if a.Path < b.Path {
 			return -1
 		}
-		if a > b {
+		if a.Path > b.Path {
 			return 1
 		}
 		return 0
 	})
-	if len(ordered) > 8 {
-		ordered = ordered[:8]
+	const pathLimit = 8
+	includedPaths := make([]string, 0, min(len(ordered), pathLimit))
+	decisions := make([]ContextDecisionRecord, 0, len(ordered))
+	for index, item := range ordered {
+		path := item.Path
+		included := index < pathLimit
+		reason := item.Reason
+		if !included {
+			reason += "; omitted because higher-ranked paths filled the context packet"
+		}
+		decisions = append(decisions, ContextDecisionRecord{
+			DecisionType: "related_path",
+			ItemKey:      item.Path,
+			Title:        item.Path,
+			Path:         &path,
+			Included:     included,
+			Score:        item.Score,
+			Reason:       reason,
+			MatchedTerms: item.MatchedTerms,
+			Source:       item.Source,
+		})
+		if included {
+			includedPaths = append(includedPaths, item.Path)
+		}
 	}
-	return ordered
+	return includedPaths, decisions
 }
 
 func buildDynamicContext(
@@ -749,20 +819,21 @@ func buildDynamicContext(
 	recentFixes []FixRecord,
 	recentActivity []activityRecord,
 	relatedPaths []string,
-) *DynamicContextBundle {
+) (*DynamicContextBundle, []ContextDecisionRecord) {
 	tokens := contextTokens(issue, ticketContexts)
-	symbols := extractSymbolContext(workspace.RootPath, append(append([]string{}, treeFocus...), relatedPaths...), tokens)
-	related := rankRelatedArtifacts(ticketContexts, threatModels, browserDumps, recentFixes, recentActivity, tokens)
+	symbols, symbolDecisions := extractSymbolContext(workspace.RootPath, append(append([]string{}, treeFocus...), relatedPaths...), tokens)
+	related, artifactDecisions := rankRelatedArtifacts(ticketContexts, threatModels, browserDumps, recentFixes, recentActivity, tokens)
+	decisions := append(symbolDecisions, artifactDecisions...)
 	if len(symbols) == 0 && len(related) == 0 {
-		return nil
+		return nil, decisions
 	}
 	return &DynamicContextBundle{
 		SymbolContext:  symbols,
 		RelatedContext: related,
-	}
+	}, decisions
 }
 
-func extractSymbolContext(root string, candidatePaths []string, tokens []string) []RepoMapSymbolRecord {
+func extractSymbolContext(root string, candidatePaths []string, tokens []string) ([]RepoMapSymbolRecord, []ContextDecisionRecord) {
 	results := []RepoMapSymbolRecord{}
 	seen := map[string]struct{}{}
 	deduped := dedupeText(candidatePaths)
@@ -888,7 +959,32 @@ func extractSymbolContext(root string, candidatePaths []string, tokens []string)
 		}
 		return 0
 	})
-	return results[:min(len(results), 8)]
+	const symbolLimit = 8
+	included := results[:min(len(results), symbolLimit)]
+	decisions := make([]ContextDecisionRecord, 0, len(results))
+	for index, item := range results {
+		path := item.Path
+		symbol := item.Symbol
+		reason := "Ranked from issue-relevant symbols."
+		if item.Reason != nil && strings.TrimSpace(*item.Reason) != "" {
+			reason = strings.TrimSpace(*item.Reason)
+		}
+		if index >= symbolLimit {
+			reason += "; omitted because higher-ranked symbols filled the context packet"
+		}
+		decisions = append(decisions, ContextDecisionRecord{
+			DecisionType: "symbol",
+			ItemKey:      item.Path + "::" + item.Symbol,
+			Title:        item.Symbol,
+			Path:         &path,
+			Symbol:       &symbol,
+			Included:     index < symbolLimit,
+			Score:        item.Score,
+			Reason:       reason,
+			Source:       "symbol_extraction",
+		})
+	}
+	return included, decisions
 }
 
 func rankRelatedArtifacts(
@@ -898,7 +994,7 @@ func rankRelatedArtifacts(
 	recentFixes []FixRecord,
 	recentActivity []activityRecord,
 	tokens []string,
-) []RelatedContextRecord {
+) ([]RelatedContextRecord, []ContextDecisionRecord) {
 	termSet := map[string]struct{}{}
 	for _, token := range tokens[:min(len(tokens), 12)] {
 		termSet[token] = struct{}{}
@@ -989,7 +1085,34 @@ func rankRelatedArtifacts(
 		}
 		return 0
 	})
-	return records[:min(len(records), 8)]
+	const artifactLimit = 8
+	included := records[:min(len(records), artifactLimit)]
+	decisions := make([]ContextDecisionRecord, 0, len(records))
+	for index, item := range records {
+		reason := "Related artifact retrieved for issue context."
+		if item.Reason != nil && strings.TrimSpace(*item.Reason) != "" {
+			reason = strings.TrimSpace(*item.Reason)
+		}
+		if index >= artifactLimit {
+			reason += "; omitted because higher-ranked artifacts filled the context packet"
+		}
+		artifactType := item.ArtifactType
+		artifactID := item.ArtifactID
+		decisions = append(decisions, ContextDecisionRecord{
+			DecisionType: "related_artifact",
+			ItemKey:      item.ArtifactType + "::" + item.ArtifactID,
+			Title:        item.Title,
+			Path:         item.Path,
+			ArtifactType: &artifactType,
+			ArtifactID:   &artifactID,
+			Included:     index < artifactLimit,
+			Score:        item.Score,
+			Reason:       reason,
+			MatchedTerms: item.MatchedTerms,
+			Source:       item.ArtifactType,
+		})
+	}
+	return included, decisions
 }
 
 func buildIssueContextPrompt(
@@ -1006,6 +1129,7 @@ func buildIssueContextPrompt(
 	relatedPaths []string,
 	repoMap *rustcore.RepoMapSummary,
 	dynamicContext *DynamicContextBundle,
+	contextDecisions []ContextDecisionRecord,
 	repoConfig *RepoConfigRecord,
 	matchedPathInstructions []RepoPathInstructionMatch,
 ) string {
@@ -1282,6 +1406,32 @@ func buildIssueContextPrompt(
 		pathInstructionLines = append(pathInstructionLines, "- No path-specific instructions matched the current issue paths.")
 	}
 
+	includedDecisionLines := []string{}
+	omittedDecisionLines := []string{}
+	for _, item := range contextDecisions[:min(len(contextDecisions), 12)] {
+		line := "- [included] " + item.DecisionType + " " + item.Title + " (score " + fmt.Sprintf("%d", item.Score) + ")"
+		if !item.Included {
+			line = "- [omitted] " + item.DecisionType + " " + item.Title + " (score " + fmt.Sprintf("%d", item.Score) + ")"
+		}
+		if strings.TrimSpace(item.Reason) != "" {
+			line += ": " + item.Reason
+		}
+		if len(item.MatchedTerms) > 0 {
+			line += " [matches: " + strings.Join(item.MatchedTerms[:min(len(item.MatchedTerms), 4)], ", ") + "]"
+		}
+		if item.Included {
+			includedDecisionLines = append(includedDecisionLines, line)
+		} else {
+			omittedDecisionLines = append(omittedDecisionLines, line)
+		}
+	}
+	if len(includedDecisionLines) == 0 {
+		includedDecisionLines = append(includedDecisionLines, "- No explicit included-context decisions recorded.")
+	}
+	if len(omittedDecisionLines) == 0 {
+		omittedDecisionLines = append(omittedDecisionLines, "- No omitted-context alternatives recorded.")
+	}
+
 	summary := firstNonEmptyPtr(issue.Summary)
 	if summary == "" {
 		summary = "No summary supplied."
@@ -1311,6 +1461,7 @@ func buildIssueContextPrompt(
 		"Ranked related paths:\n" + relatedLines + "\n\n" +
 		"Symbol context:\n" + strings.Join(symbolLines, "\n") + "\n\n" +
 		"Related artifacts:\n" + strings.Join(relatedArtifactLines, "\n") + "\n\n" +
+		"Context decisions:\nIncluded:\n" + strings.Join(includedDecisionLines, "\n") + "\n\nOmitted:\n" + strings.Join(omittedDecisionLines, "\n") + "\n\n" +
 		"Repository guidance:\n" + strings.Join(guidanceLines, "\n") + "\n\n" +
 		"Known verification profiles:\n" + strings.Join(verificationLines, "\n") + "\n\n" +
 		"Priority files:\n" + focusLines + "\n\n" +

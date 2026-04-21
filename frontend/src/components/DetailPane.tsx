@@ -1135,6 +1135,43 @@ export function DetailPane({
             ) : (
               <p className="subtle">No related artifacts ranked yet.</p>
             )}
+            {issueContextPacket?.context_decisions?.length ? (
+              <div className="detail-section field-stack" style={{ marginTop: '1rem' }}>
+                <div className="panel-header">
+                  <div>
+                    <h5>Context decisions</h5>
+                    <p className="subtle">Included and omitted context candidates with the recorded why behind each selection.</p>
+                  </div>
+                  <div className="row-meta">
+                    <span className="tag">included {issueContextPacket.context_decisions.filter((item) => item.included).length}</span>
+                    <span className="tag">omitted {issueContextPacket.context_decisions.filter((item) => !item.included).length}</span>
+                  </div>
+                </div>
+                <div className="activity-list">
+                  {issueContextPacket.context_decisions.map((item) => (
+                    <div key={item.item_key} className="activity-entry">
+                      <div className="activity-entry-top">
+                        <strong>{item.title}</strong>
+                        <small>{item.decision_type}</small>
+                      </div>
+                      <div className="row-meta">
+                        <span className={`status-pill ${item.included ? 'green' : 'amber'}`}>{item.included ? 'included' : 'omitted'}</span>
+                        <span className="tag">score {item.score}</span>
+                        <span className="tag">source {item.source}</span>
+                        {item.path ? <span className="tag">{item.path}</span> : null}
+                        {item.symbol ? <span className="tag">symbol {item.symbol}</span> : null}
+                        {item.matched_terms.map((term) => (
+                          <span key={`${item.item_key}-${term}`} className="tag">
+                            {term}
+                          </span>
+                        ))}
+                      </div>
+                      <p>{item.reason}</p>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ) : null}
           </section>
 
           <section className="detail-section">

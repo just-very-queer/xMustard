@@ -86,6 +86,73 @@ func TestBuildIssueContextPacketBuildsFrontendShapeFromArtifacts(t *testing.T) {
 	}
 }
 
+func TestIssueContextPacketIncludesContextDecisionsForIncludedAndOmittedItems(t *testing.T) {
+	dataDir, workspaceID, issueID, repoRoot := writeIssueContextFixture(t, false)
+
+	for _, relPath := range []string{
+		"src/export_summary.py",
+		"src/export_worker.py",
+		"src/export_controller.py",
+		"src/export_presenter.py",
+		"src/export_formatter.py",
+		"src/export_pipeline.py",
+		"src/export_queue.py",
+		"src/export_metrics.py",
+		"src/export_retry.py",
+		"src/export_legacy.py",
+	} {
+		if err := os.WriteFile(filepath.Join(repoRoot, relPath), []byte("def export_value():\n    return 'ok'\n"), 0o644); err != nil {
+			t.Fatalf("write extra source %s: %v", relPath, err)
+		}
+	}
+
+	repoMapPath := filepath.Join(dataDir, "workspaces", workspaceID, "repo_map.json")
+	var repoMap rustcore.RepoMapSummary
+	if err := readJSON(repoMapPath, &repoMap); err != nil {
+		t.Fatalf("read repo map: %v", err)
+	}
+	repoMap.TotalFiles = 12
+	repoMap.SourceFiles = 11
+	repoMap.KeyFiles = append(repoMap.KeyFiles,
+		rustcore.RepoMapFileRecord{Path: "src/export_summary.py", Role: "source"},
+		rustcore.RepoMapFileRecord{Path: "src/export_worker.py", Role: "source"},
+		rustcore.RepoMapFileRecord{Path: "src/export_controller.py", Role: "source"},
+		rustcore.RepoMapFileRecord{Path: "src/export_presenter.py", Role: "source"},
+		rustcore.RepoMapFileRecord{Path: "src/export_formatter.py", Role: "source"},
+		rustcore.RepoMapFileRecord{Path: "src/export_pipeline.py", Role: "source"},
+		rustcore.RepoMapFileRecord{Path: "src/export_queue.py", Role: "source"},
+		rustcore.RepoMapFileRecord{Path: "src/export_metrics.py", Role: "source"},
+		rustcore.RepoMapFileRecord{Path: "src/export_retry.py", Role: "source"},
+		rustcore.RepoMapFileRecord{Path: "src/export_legacy.py", Role: "source"},
+	)
+	if err := writeJSON(repoMapPath, repoMap); err != nil {
+		t.Fatalf("write repo map: %v", err)
+	}
+
+	packet, err := BuildIssueContextPacket(dataDir, workspaceID, issueID)
+	if err != nil {
+		t.Fatalf("build issue context packet: %v", err)
+	}
+	if len(packet.ContextDecisions) == 0 {
+		t.Fatalf("expected context decisions, got %#v", packet.ContextDecisions)
+	}
+	included := 0
+	omitted := 0
+	for _, item := range packet.ContextDecisions {
+		if item.Included {
+			included++
+		} else {
+			omitted++
+		}
+	}
+	if included == 0 || omitted == 0 {
+		t.Fatalf("expected both included and omitted decisions, got included=%d omitted=%d %#v", included, omitted, packet.ContextDecisions)
+	}
+	if !strings.Contains(packet.Prompt, "Context decisions:") {
+		t.Fatalf("prompt missing context decision summary:\n%s", packet.Prompt)
+	}
+}
+
 func TestGetWorkspaceRepoConfigHealthReportsConfigured(t *testing.T) {
 	dataDir, workspaceID, _, _ := writeIssueContextFixture(t, false)
 

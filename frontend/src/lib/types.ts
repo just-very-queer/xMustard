@@ -296,6 +296,21 @@ export type DynamicContextBundle = {
   related_context: RelatedContextRecord[]
 }
 
+export type ContextDecisionRecord = {
+  decision_type: 'related_path' | 'symbol' | 'related_artifact'
+  item_key: string
+  title: string
+  path?: string | null
+  symbol?: string | null
+  artifact_type?: string | null
+  artifact_id?: string | null
+  included: boolean
+  score: number
+  reason: string
+  matched_terms: string[]
+  source: string
+}
+
 export type RepoMCPServerRecord = {
   name: string
   description: string
@@ -359,6 +374,7 @@ export type IssueContextPacket = {
   browser_dumps: BrowserDumpRecord[]
   repo_map?: RepoMapSummary | null
   dynamic_context?: DynamicContextBundle | null
+  context_decisions: ContextDecisionRecord[]
   repo_config?: RepoConfigRecord | null
   matched_path_instructions: RepoPathInstructionMatch[]
   worktree?: WorktreeStatus | null
