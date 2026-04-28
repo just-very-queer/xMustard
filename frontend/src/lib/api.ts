@@ -299,13 +299,13 @@ export function listIssues(
     source?: string[]
     label?: string[]
     drift_only?: boolean
-    needs_followup?: boolean
+    needs_followup?: boolean | null
     review_ready_only?: boolean
   } = {},
 ) {
   const query = new URLSearchParams()
   Object.entries(params).forEach(([key, value]) => {
-    if (value === undefined || value === '') return
+    if (value === undefined || value === '' || value === null) return
     query.set(key, Array.isArray(value) ? value.join(',') : String(value))
   })
   return request<WorkspaceSnapshot['issues']>(`/api/workspaces/${workspaceId}/issues?${query.toString()}`)
