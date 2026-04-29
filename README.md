@@ -162,5 +162,6 @@ Reference implementations are available locally under `research/`.
 | `auto-code-rover` | structure-aware planning and staged execution |
 
 See [docs/RESEARCH_FINDINGS.md](docs/RESEARCH_FINDINGS.md), [docs/RESEARCH_MATRIX.md](docs/RESEARCH_MATRIX.md), [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), and [docs/PLANNING.md](docs/PLANNING.md) for the current synthesis.
+The current research-to-build frontier is summarized in [docs/FRONTIER.md](docs/FRONTIER.md).
 
 Migration work now also has a dedicated working note in [docs/MIGRATION_RUST_GO.md](docs/MIGRATION_RUST_GO.md).

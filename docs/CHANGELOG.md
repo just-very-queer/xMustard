@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Changed
+- `docs/RESEARCH_FINDINGS.md` and `docs/RESEARCH_MATRIX.md` now reflect shipped guidance, eval, verification, vulnerability, and Go/Rust migration work instead of treating those lanes as still missing.
 - `docs/PLANNING.md` now tracks the next strategic lanes more explicitly:
   - threat modeling and security review
   - confidence and ticket compliance
@@ -19,6 +20,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - FastAPI no longer registers the integration config/test/sync endpoints, leaving those existing route paths under Go ownership while Python retains only non-request-path compatibility helpers
 
 ### Added
+- Research frontier map in `docs/FRONTIER.md`, turning the local research synthesis into current build lanes for retrieval, symbol-aware context, eval timelines, security review depth, policy records, and review packet export.
 - ADR `docs/plans/2026-04-18-no-python-control-plane-adr.md` locking in the no-Python target architecture: Go control-plane shell, Rust runtime/retrieval/store core, sub-500MB steady-state target, and the three agent surfaces (`works with agents`, `works within agents`, `commands agents`)
 - Rust-owned architecture contract in `rust-core/src/contracts.rs` plus `xmustard-core describe-architecture`
 - Go-served architecture and agent-surface inventory endpoints at `/api/migration/plan`, `/api/migration/agent-surfaces`, and `/api/agent/surfaces`
