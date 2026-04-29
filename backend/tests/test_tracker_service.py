@@ -823,6 +823,7 @@ reviews:
             self.assertTrue(
                 any(item.artifact_type == "vulnerability_finding" for item in (packet.dynamic_context.related_context if packet.dynamic_context else []))
             )
+            self.assertTrue(any(item.source_id.startswith("vulnerability_finding:") for item in packet.retrieval_ledger))
 
     def test_vulnerability_import_batches_are_recorded_with_lifecycle_summaries(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -1247,11 +1248,15 @@ reviews:
             self.assertIn("Ranked related paths:", packet.prompt)
             self.assertIn("Symbol context:", packet.prompt)
             self.assertIn("Related artifacts:", packet.prompt)
+            self.assertIn("Retrieval ledger:", packet.prompt)
             self.assertTrue(any(path.startswith("backend") or path.startswith("tests") for path in packet.related_paths))
             self.assertIsNotNone(packet.dynamic_context)
             assert packet.dynamic_context is not None
             self.assertTrue(packet.dynamic_context.symbol_context)
             self.assertTrue(packet.dynamic_context.related_context)
+            self.assertTrue(packet.retrieval_ledger)
+            self.assertTrue(any(item.source_type == "symbol" for item in packet.retrieval_ledger))
+            self.assertTrue(any(item.source_type == "artifact" for item in packet.retrieval_ledger))
 
     def test_run_session_insight_reports_guidance_and_review_findings(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

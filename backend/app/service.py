@@ -30,6 +30,7 @@ from .models import (
     CoverageDelta,
     CoverageResult,
     DynamicContextBundle,
+    ContextRetrievalLedgerEntry,
     DismissImprovementRequest,
     DuplicateMatch,
     EvidenceRef,
@@ -2736,6 +2737,7 @@ class TrackerService:
         )
         recent_fixes = self.list_fixes(workspace_id, issue_id=issue_id)[:5]
         recent_activity = [item for item in self.list_activity(workspace_id, issue_id=issue_id, limit=16) if item.entity_type == "issue"][:8]
+        guidance = self.list_workspace_guidance(workspace_id)[:self.GUIDANCE_LIMIT]
         dynamic_context = self._build_dynamic_context(
             snapshot.workspace,
             issue,
@@ -2748,8 +2750,16 @@ class TrackerService:
             recent_activity,
             related_paths,
         )
+        retrieval_ledger = self._build_context_retrieval_ledger(
+            issue,
+            tree_focus,
+            evidence_bundle,
+            related_paths,
+            guidance,
+            dynamic_context,
+            matched_path_instructions,
+        )
         runbook = self._render_runbook_steps(default_runbook.template)
-        guidance = self.list_workspace_guidance(workspace_id)[:self.GUIDANCE_LIMIT]
         prompt = self._build_prompt(
             snapshot.workspace,
             issue,
@@ -2765,6 +2775,7 @@ class TrackerService:
             related_paths,
             repo_map,
             dynamic_context,
+            retrieval_ledger,
             repo_config,
             matched_path_instructions,
         )
@@ -2786,6 +2797,7 @@ class TrackerService:
             vulnerability_findings=vulnerability_findings,
             repo_map=repo_map,
             dynamic_context=dynamic_context,
+            retrieval_ledger=retrieval_ledger,
             repo_config=repo_config,
             matched_path_instructions=matched_path_instructions,
             worktree=self.read_worktree_status(workspace_id),
@@ -5721,6 +5733,7 @@ Respond with a JSON object containing:
         related_paths: list[str],
         repo_map: RepoMapSummary,
         dynamic_context: Optional[DynamicContextBundle],
+        retrieval_ledger: list[ContextRetrievalLedgerEntry],
         repo_config: Optional[RepoConfigRecord],
         matched_path_instructions: list[RepoPathInstructionMatch],
     ) -> str:
@@ -5856,6 +5869,13 @@ Respond with a JSON object containing:
                 reason = f" {item.reason}" if item.reason else ""
                 path = f" [{item.path}]" if item.path else ""
                 related_artifact_lines.append(f"- {item.artifact_type} {item.title}{path}:{reason}{matched}".rstrip(":"))
+        retrieval_lines = []
+        for item in retrieval_ledger[:10]:
+            path = f" [{item.path}]" if item.path else ""
+            matches = f" matches {', '.join(item.matched_terms[:3])}" if item.matched_terms else ""
+            retrieval_lines.append(
+                f"- {item.source_type} {item.title}{path}: {item.reason}{matches} (score {item.score})"
+            )
         return (
             f"You are fixing bug {issue.bug_id} in workspace {workspace.root_path}.\n"
             f"Title: {issue.title}\n"
@@ -5878,6 +5898,7 @@ Respond with a JSON object containing:
             f"Ranked related paths:\n{related_lines}\n\n"
             f"Symbol context:\n{chr(10).join(symbol_lines) if symbol_lines else '- No symbol context ranked yet.'}\n\n"
             f"Related artifacts:\n{chr(10).join(related_artifact_lines) if related_artifact_lines else '- No related artifacts ranked yet.'}\n\n"
+            f"Retrieval ledger:\n{chr(10).join(retrieval_lines) if retrieval_lines else '- No retrieval ledger entries recorded yet.'}\n\n"
             f"Repository guidance:\n{chr(10).join(guidance_lines) if guidance_lines else '- No repository guidance files were found.'}\n\n"
             f"Known verification profiles:\n{chr(10).join(verification_lines) if verification_lines else '- No verification profiles configured yet.'}\n\n"
             f"Priority files:\n{focus_lines}\n\n"
@@ -6276,6 +6297,125 @@ Respond with a JSON object containing:
             symbol_context=symbol_context,
             related_context=related_context,
         )
+
+    def _build_context_retrieval_ledger(
+        self,
+        issue: IssueRecord,
+        tree_focus: list[str],
+        evidence_bundle: list[EvidenceRef],
+        related_paths: list[str],
+        guidance: list[RepoGuidanceRecord],
+        dynamic_context: Optional[DynamicContextBundle],
+        matched_path_instructions: list[RepoPathInstructionMatch],
+    ) -> list[ContextRetrievalLedgerEntry]:
+        tokens = self._context_tokens(issue, [])
+        entries: list[ContextRetrievalLedgerEntry] = []
+        seen: set[tuple[str, str]] = set()
+
+        def matches_for(*parts: str) -> list[str]:
+            haystack = " ".join(part for part in parts if part).lower()
+            return [token for token in tokens[:12] if token in haystack][:4]
+
+        def push(entry: ContextRetrievalLedgerEntry) -> None:
+            key = (entry.source_type, entry.source_id)
+            if key in seen:
+                return
+            seen.add(key)
+            entries.append(entry)
+
+        for index, evidence in enumerate(evidence_bundle[:8]):
+            path = evidence.normalized_path or evidence.path
+            ref = path + (f":{evidence.line}" if evidence.line else "")
+            push(
+                ContextRetrievalLedgerEntry(
+                    entry_id=f"evidence:{index}:{path}",
+                    source_type="evidence",
+                    source_id=ref,
+                    title=ref,
+                    path=path,
+                    reason="Direct evidence attached to the issue.",
+                    matched_terms=matches_for(path, evidence.excerpt or ""),
+                    score=12 - index,
+                )
+            )
+
+        focus_set = set(tree_focus)
+        for index, path in enumerate(related_paths[:8]):
+            matched_terms = matches_for(path)
+            reason = "Direct evidence path." if path in focus_set else "Ranked from repo-map paths and issue terms."
+            push(
+                ContextRetrievalLedgerEntry(
+                    entry_id=f"related_path:{path}",
+                    source_type="related_path",
+                    source_id=path,
+                    title=path,
+                    path=path,
+                    reason=reason,
+                    matched_terms=matched_terms,
+                    score=max(1, 10 - index + len(matched_terms)),
+                )
+            )
+
+        if dynamic_context:
+            for symbol in dynamic_context.symbol_context[:8]:
+                source_id = f"{symbol.path}:{symbol.symbol}:{symbol.line_start or 0}"
+                push(
+                    ContextRetrievalLedgerEntry(
+                        entry_id=f"symbol:{source_id}",
+                        source_type="symbol",
+                        source_id=source_id,
+                        title=f"{symbol.kind} {symbol.symbol}",
+                        path=symbol.path,
+                        reason=symbol.reason or "Ranked from symbol names near issue-related files.",
+                        matched_terms=matches_for(symbol.path, symbol.symbol, symbol.enclosing_scope or ""),
+                        score=symbol.score,
+                    )
+                )
+            for artifact in dynamic_context.related_context[:8]:
+                push(
+                    ContextRetrievalLedgerEntry(
+                        entry_id=f"artifact:{artifact.artifact_type}:{artifact.artifact_id}",
+                        source_type="artifact",
+                        source_id=f"{artifact.artifact_type}:{artifact.artifact_id}",
+                        title=artifact.title,
+                        path=artifact.path,
+                        reason=artifact.reason or "Ranked from related operational artifacts.",
+                        matched_terms=artifact.matched_terms,
+                        score=artifact.score,
+                    )
+                )
+
+        for index, item in enumerate(guidance[: self.GUIDANCE_LIMIT]):
+            push(
+                ContextRetrievalLedgerEntry(
+                    entry_id=f"guidance:{item.path}",
+                    source_type="guidance",
+                    source_id=item.path,
+                    title=item.title or item.path,
+                    path=item.path,
+                    reason="Repository guidance selected for the issue prompt.",
+                    matched_terms=matches_for(item.path, item.title, item.summary),
+                    score=max(1, 6 - index),
+                )
+            )
+
+        for index, item in enumerate(matched_path_instructions[:6]):
+            label = item.title or item.path
+            push(
+                ContextRetrievalLedgerEntry(
+                    entry_id=f"path_instruction:{item.instruction_id}",
+                    source_type="path_instruction",
+                    source_id=item.instruction_id,
+                    title=label,
+                    path=item.source_path,
+                    reason="Path-specific instruction matched ranked issue files.",
+                    matched_terms=matches_for(item.path, " ".join(item.matched_paths), item.instructions),
+                    score=max(1, 8 - index),
+                )
+            )
+
+        entries.sort(key=lambda item: (-item.score, item.source_type, item.title.lower()))
+        return entries[:32]
 
     def _extract_symbol_context(self, root: Path, candidate_paths: list[str], tokens: list[str]) -> list[RepoMapSymbolRecord]:
         symbols: list[RepoMapSymbolRecord] = []

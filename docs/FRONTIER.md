@@ -50,11 +50,11 @@ Research pull:
 Current xMustard state:
 
 - issue packets already rank related operational artifacts such as ticket context, threat models, browser dumps, fixes, and recent activity
+- issue packets include a retrieval ledger that explains selected evidence, related paths, symbols, artifacts, guidance, and path-specific instructions
 - retrieval is lexical and artifact-backed, which is inspectable but limited
 
 Next artifact:
 
-- create a retrieval ledger per issue packet that lists each selected artifact, match reason, source type, and confidence
 - add hybrid ranking hooks without requiring embeddings infrastructure on day one
 - use retrieval results to improve duplicate warnings and owner suggestions
 
@@ -129,11 +129,11 @@ Next artifact:
 
 ## Near-Term Build Order
 
-1. Retrieval ledger for issue context packets.
-2. Multi-batch eval timeline summaries.
-3. Vulnerability disposition and risk-acceptance fields.
-4. Workspace runtime and verification policy records.
-5. Exportable issue review packet.
+1. Multi-batch eval timeline summaries.
+2. Vulnerability disposition and risk-acceptance fields.
+3. Workspace runtime and verification policy records.
+4. Exportable issue review packet.
+5. Hybrid ranking hooks for duplicate warnings and owner suggestions.
 
 This order favors inspectability first: operators should be able to explain why a run had its
 context, why an eval moved, why a security finding is accepted or suppressed, and why a runtime

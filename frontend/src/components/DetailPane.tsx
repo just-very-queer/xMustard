@@ -1135,6 +1135,33 @@ export function DetailPane({
             ) : (
               <p className="subtle">No related artifacts ranked yet.</p>
             )}
+            {issueContextPacket?.retrieval_ledger?.length ? (
+              <>
+                <h5>Retrieval ledger</h5>
+                <div className="activity-list">
+                  {issueContextPacket.retrieval_ledger.slice(0, 10).map((item) => (
+                    <div key={item.entry_id} className="activity-entry">
+                      <div className="activity-entry-top">
+                        <strong>{item.title}</strong>
+                        <small>{item.source_type}</small>
+                      </div>
+                      <div className="row-meta">
+                        <span className="tag">score {item.score}</span>
+                        {item.path ? <span className="tag">{item.path}</span> : null}
+                        {item.matched_terms.map((term) => (
+                          <span key={`${item.entry_id}-${term}`} className="tag">
+                            {term}
+                          </span>
+                        ))}
+                      </div>
+                      <p>{item.reason}</p>
+                    </div>
+                  ))}
+                </div>
+              </>
+            ) : (
+              <p className="subtle">No retrieval ledger recorded yet.</p>
+            )}
           </section>
 
           <section className="detail-section">

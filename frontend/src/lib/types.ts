@@ -282,11 +282,22 @@ export type RepoMapSymbolRecord = {
 }
 
 export type RelatedContextRecord = {
-  artifact_type: 'ticket_context' | 'threat_model' | 'browser_dump' | 'fix_record' | 'activity' | 'run'
+  artifact_type: 'ticket_context' | 'threat_model' | 'browser_dump' | 'vulnerability_finding' | 'fix_record' | 'activity' | 'run'
   artifact_id: string
   title: string
   path?: string | null
   reason?: string | null
+  matched_terms: string[]
+  score: number
+}
+
+export type ContextRetrievalLedgerEntry = {
+  entry_id: string
+  source_type: 'evidence' | 'related_path' | 'symbol' | 'artifact' | 'guidance' | 'path_instruction'
+  source_id: string
+  title: string
+  path?: string | null
+  reason: string
   matched_terms: string[]
   score: number
 }
@@ -342,6 +353,29 @@ export type RepoConfigHealth = {
   loaded_at: string
 }
 
+export type VulnerabilityFindingRecord = {
+  finding_id: string
+  workspace_id: string
+  issue_id: string
+  scanner: string
+  source: 'manual' | 'sarif' | 'nessus-json' | 'semgrep-json' | 'trivy-json'
+  severity: 'critical' | 'high' | 'medium' | 'low' | 'info'
+  status: 'open' | 'triaged' | 'fixed' | 'accepted' | 'false_positive'
+  title: string
+  summary: string
+  rule_id?: string | null
+  location_path?: string | null
+  location_line?: number | null
+  cwe_ids: string[]
+  cve_ids: string[]
+  references: string[]
+  evidence: string[]
+  threat_model_ids: string[]
+  raw_payload?: string | null
+  created_at: string
+  updated_at: string
+}
+
 export type IssueContextPacket = {
   issue: IssueRecord
   workspace: WorkspaceRecord
@@ -357,8 +391,10 @@ export type IssueContextPacket = {
   ticket_contexts: TicketContextRecord[]
   threat_models: ThreatModelRecord[]
   browser_dumps: BrowserDumpRecord[]
+  vulnerability_findings: VulnerabilityFindingRecord[]
   repo_map?: RepoMapSummary | null
   dynamic_context?: DynamicContextBundle | null
+  retrieval_ledger: ContextRetrievalLedgerEntry[]
   repo_config?: RepoConfigRecord | null
   matched_path_instructions: RepoPathInstructionMatch[]
   worktree?: WorktreeStatus | null

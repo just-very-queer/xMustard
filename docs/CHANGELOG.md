@@ -21,6 +21,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 - Research frontier map in `docs/FRONTIER.md`, turning the local research synthesis into current build lanes for retrieval, symbol-aware context, eval timelines, security review depth, policy records, and review packet export.
+- Issue context packets now include a retrieval ledger that explains selected evidence, related paths, symbols, related artifacts, guidance, and path-specific instructions in both Python and Go context builders, with the ledger surfaced in the issue detail UI and prompt.
 - ADR `docs/plans/2026-04-18-no-python-control-plane-adr.md` locking in the no-Python target architecture: Go control-plane shell, Rust runtime/retrieval/store core, sub-500MB steady-state target, and the three agent surfaces (`works with agents`, `works within agents`, `commands agents`)
 - Rust-owned architecture contract in `rust-core/src/contracts.rs` plus `xmustard-core describe-architecture`
 - Go-served architecture and agent-surface inventory endpoints at `/api/migration/plan`, `/api/migration/agent-surfaces`, and `/api/agent/surfaces`

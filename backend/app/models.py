@@ -1029,6 +1029,17 @@ class RelatedContextRecord(BaseModel):
     score: int = 0
 
 
+class ContextRetrievalLedgerEntry(BaseModel):
+    entry_id: str
+    source_type: Literal["evidence", "related_path", "symbol", "artifact", "guidance", "path_instruction"]
+    source_id: str
+    title: str
+    path: Optional[str] = None
+    reason: str
+    matched_terms: list[str] = Field(default_factory=list)
+    score: int = 0
+
+
 class DynamicContextBundle(BaseModel):
     symbol_context: list[RepoMapSymbolRecord] = Field(default_factory=list)
     related_context: list[RelatedContextRecord] = Field(default_factory=list)
@@ -1098,6 +1109,7 @@ class IssueContextPacket(BaseModel):
     vulnerability_findings: list[VulnerabilityFindingRecord] = Field(default_factory=list)
     repo_map: Optional[RepoMapSummary] = None
     dynamic_context: Optional[DynamicContextBundle] = None
+    retrieval_ledger: list[ContextRetrievalLedgerEntry] = Field(default_factory=list)
     repo_config: Optional[RepoConfigRecord] = None
     matched_path_instructions: list[RepoPathInstructionMatch] = Field(default_factory=list)
     worktree: Optional[WorktreeStatus] = None

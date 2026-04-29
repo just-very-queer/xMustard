@@ -437,6 +437,15 @@ func applyEvalScenarioToPacket(packet *IssueContextPacket, scenario EvalScenario
 	packet.AvailableVerificationProfiles = verificationProfiles
 	packet.TicketContexts = ticketContexts
 	packet.BrowserDumps = browserDumps
+	packet.RetrievalLedger = buildContextRetrievalLedger(
+		packet.Issue,
+		packet.TreeFocus,
+		packet.EvidenceBundle,
+		packet.RelatedPaths,
+		guidance,
+		packet.DynamicContext,
+		packet.MatchedPathInstructions,
+	)
 	packet.Prompt = strings.Join(summaryLines, "\n") + "\n\n" + buildIssueContextPrompt(
 		packet.Workspace,
 		packet.Issue,
@@ -451,6 +460,7 @@ func applyEvalScenarioToPacket(packet *IssueContextPacket, scenario EvalScenario
 		packet.RelatedPaths,
 		packet.RepoMap,
 		packet.DynamicContext,
+		packet.RetrievalLedger,
 		packet.RepoConfig,
 		packet.MatchedPathInstructions,
 	)
