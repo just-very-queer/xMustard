@@ -227,7 +227,7 @@ Current CLI-first tranche:
 4. preserve exact `--path` selection for agents that already know the files they want indexed
 5. make the next follow-up the durable read path: context packets and CLI queries should prefer stored semantic rows when they are fresh
 
-Phase 2 live status on 2026-05-01:
+Phase 2 live status on 2026-05-02:
 
 - `semantic-index plan`, `run`, and `status` exist, and plan output now carries a retrieval ledger for selected paths.
 - Local Postgres is configured for xMustard, the schema is bootstrapped, and MustardCoPilot semantic index runs now persist and read back Postgres rows.
@@ -237,6 +237,7 @@ Phase 2 live status on 2026-05-01:
 - `sg` / `ast-grep` is installed locally; semantic-search returns ast-grep matches, and Postgres semantic query/match persistence has been proven live.
 - Final closeout validation is still not a clean `fresh` proof: the target MustardCoPilot worktree has 189 dirty files, so scoped semantic status is `dirty_provisional`, not clean `fresh`. Postgres and `sg` are no longer blockers.
 - Sixth-hundred closeout audit update: broad key-files `semantic-index status` is still `stale` because the stored key-files fingerprint no longer matches current selected path/hash inputs while MustardCoPilot remains dirty. Stored-path and changed-code surfaces still return `dirty_provisional` where their scoped baseline matches.
+- Seventh-hundred closeout audit update: MustardCoPilot still has exactly 189 dirty files, broad key-files `semantic-index status` remains `stale`, scoped `path-symbols` / `code-explainer` use `stored_semantic` with `dirty_provisional`, `changed-symbols` returns 635 stored semantic symbols, `impact` reports 321 changed files and 635 changed symbols with confidence `high`, `repo-context` still has 32 retrieval-ledger entries and 0 plan links, `retrieval-search` returns 5 hits, and `semantic-search` returns 5 live `ast_grep` matches.
 - Missing richer run anchors, accepted-fix anchors, and plan links are absent MustardCoPilot workspace history, not proven product gaps: existing run records have no saved plans or ownership files, and the workspace has no accepted fix records.
 - Blunt status: Phase 2 is closed as live-validated but dirty/stale provisional. It is not a clean `fresh` closeout until MustardCoPilot is clean and `fresh` can be proven.
 

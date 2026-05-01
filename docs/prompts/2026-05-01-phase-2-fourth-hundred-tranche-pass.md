@@ -256,6 +256,19 @@ Validation evidence from this pass:
 - Targeted backend verification: `93 passed`.
 - Compile verification: `PYTHONPYCACHEPREFIX=/tmp/pycache .venv/bin/python -m compileall app` passed.
 
+Seventh-hundred final audit update on 2026-05-02:
+
+- MustardCoPilot is still dirty with 189 `git status --short` entries, so no clean `fresh` status was claimed.
+- Default key-files `semantic-index status` remains `stale` with Postgres configured, `current_dirty_files: 189`, key-files baseline present, 20 file rows, 58 symbol rows, and `ast_grep_available=true`.
+- Scoped stored-path reads still work: `path-symbols` and `code-explainer` on `src/features/git/utils/pullRequestReviewCommands.ts` use `stored_semantic` and report `dirty_provisional`.
+- Changed-code surfaces still work provisionally: `changed-symbols` returns 635 stored semantic symbols, `impact` reports 321 changed files and 635 changed symbols with confidence `high`, and `repo-context` reports `dirty_provisional` through its semantic-status payload.
+- `changed-since-last-run` and `changed-since-last-accepted-fix` still have no baseline run or accepted-fix anchor in this workspace; both report 321 changed files and 0 changed symbols from the fallback surface.
+- `repo-context` still reports 8 run targets, 32 retrieval-ledger entries, and 0 plan links.
+- `retrieval-search` for `pull request review` returns 5 hits and 5 retrieval-ledger entries.
+- `semantic-search` through live `sg` / `ast-grep` returns 5 TypeScript function matches.
+- No product truth bug appeared in the final sweep, so no code patch or backend test rerun was needed.
+- Blunt status: Phase 2 is closed as live-validated but dirty/stale provisional. The only remaining blocker to a clean `fresh` claim is the dirty target MustardCoPilot worktree.
+
 ## Copy-Paste Prompt
 
 Use this in the next execution chat:
