@@ -293,7 +293,7 @@ export type RelatedContextRecord = {
 
 export type ContextRetrievalLedgerEntry = {
   entry_id: string
-  source_type: 'evidence' | 'related_path' | 'symbol' | 'artifact' | 'guidance' | 'path_instruction'
+  source_type: 'evidence' | 'related_path' | 'symbol' | 'semantic_match' | 'artifact' | 'guidance' | 'path_instruction'
   source_id: string
   title: string
   path?: string | null
@@ -302,8 +302,57 @@ export type ContextRetrievalLedgerEntry = {
   score: number
 }
 
+export type SemanticPatternMatchRecord = {
+  path: string
+  language?: string | null
+  line_start?: number | null
+  line_end?: number | null
+  column_start?: number | null
+  column_end?: number | null
+  matched_text: string
+  context_lines?: string | null
+  meta_variables: string[]
+  reason?: string | null
+  score: number
+}
+
+export type SemanticQueryMaterializationRecord = {
+  query_ref: string
+  workspace_id: string
+  issue_id?: string | null
+  run_id?: string | null
+  source: 'adhoc_tool' | 'issue_context'
+  reason?: string | null
+  pattern: string
+  language?: string | null
+  path_glob?: string | null
+  engine: 'ast_grep' | 'none'
+  match_count: number
+  truncated: boolean
+  error?: string | null
+}
+
+export type SemanticMatchMaterializationRecord = {
+  query_ref: string
+  workspace_id: string
+  path: string
+  language?: string | null
+  line_start?: number | null
+  line_end?: number | null
+  column_start?: number | null
+  column_end?: number | null
+  matched_text: string
+  context_lines?: string | null
+  meta_variables: string[]
+  reason?: string | null
+  score: number
+}
+
 export type DynamicContextBundle = {
   symbol_context: RepoMapSymbolRecord[]
+  semantic_matches: SemanticPatternMatchRecord[]
+  semantic_queries: SemanticQueryMaterializationRecord[]
+  semantic_match_rows: SemanticMatchMaterializationRecord[]
   related_context: RelatedContextRecord[]
 }
 
@@ -351,29 +400,6 @@ export type RepoConfigHealth = {
   code_guideline_count: number
   mcp_server_count: number
   loaded_at: string
-}
-
-export type VulnerabilityFindingRecord = {
-  finding_id: string
-  workspace_id: string
-  issue_id: string
-  scanner: string
-  source: 'manual' | 'sarif' | 'nessus-json' | 'semgrep-json' | 'trivy-json'
-  severity: 'critical' | 'high' | 'medium' | 'low' | 'info'
-  status: 'open' | 'triaged' | 'fixed' | 'accepted' | 'false_positive'
-  title: string
-  summary: string
-  rule_id?: string | null
-  location_path?: string | null
-  location_line?: number | null
-  cwe_ids: string[]
-  cve_ids: string[]
-  references: string[]
-  evidence: string[]
-  threat_model_ids: string[]
-  raw_payload?: string | null
-  created_at: string
-  updated_at: string
 }
 
 export type IssueContextPacket = {
@@ -765,6 +791,29 @@ export type BrowserDumpUpsertRequest = {
   network_requests?: string[]
   screenshot_path?: string | null
   notes?: string | null
+}
+
+export type VulnerabilityFindingRecord = {
+  finding_id: string
+  workspace_id: string
+  issue_id: string
+  scanner: string
+  source: 'manual' | 'semgrep' | 'codeql' | 'snyk' | 'osv_scanner' | 'grype' | 'trivy' | 'other'
+  severity: 'critical' | 'high' | 'medium' | 'low' | 'info'
+  status: 'open' | 'accepted' | 'fixed' | 'dismissed'
+  title: string
+  summary: string
+  rule_id?: string | null
+  location_path?: string | null
+  location_line?: number | null
+  cwe_ids: string[]
+  cve_ids: string[]
+  references: string[]
+  evidence: string[]
+  threat_model_ids: string[]
+  raw_payload?: string | null
+  created_at: string
+  updated_at: string
 }
 
 export type RunReviewDisposition = 'dismissed' | 'investigation_only'

@@ -790,7 +790,9 @@ func buildContextRetrievalLedger(
 	entries := []ContextRetrievalLedgerEntry{}
 	seen := map[string]struct{}{}
 	focusSet := map[string]struct{}{}
-	ptr := func(value string) *string { return &value }
+	ptr := func(value string) *string {
+		return &value
+	}
 	atLeastOne := func(value int) int {
 		if value < 1 {
 			return 1
@@ -800,6 +802,7 @@ func buildContextRetrievalLedger(
 	for _, path := range treeFocus {
 		focusSet[path] = struct{}{}
 	}
+
 	matchTerms := func(parts ...string) []string {
 		haystack := strings.ToLower(strings.Join(parts, " "))
 		matches := []string{}
@@ -843,6 +846,7 @@ func buildContextRetrievalLedger(
 			Score:        12 - idx,
 		})
 	}
+
 	for idx, path := range relatedPaths[:min(len(relatedPaths), 8)] {
 		matches := matchTerms(path)
 		reason := "Ranked from repo-map paths and issue terms."
@@ -854,12 +858,13 @@ func buildContextRetrievalLedger(
 			SourceType:   "related_path",
 			SourceID:     path,
 			Title:        path,
-			Path:         ptr(path),
+			Path:         stringPtr(path),
 			Reason:       reason,
 			MatchedTerms: matches,
 			Score:        atLeastOne(10 - idx + len(matches)),
 		})
 	}
+
 	if dynamicContext != nil {
 		for _, symbol := range dynamicContext.SymbolContext[:min(len(dynamicContext.SymbolContext), 8)] {
 			line := 0
@@ -904,6 +909,7 @@ func buildContextRetrievalLedger(
 			})
 		}
 	}
+
 	for idx, item := range guidance[:min(len(guidance), replayGuidanceLimit)] {
 		push(ContextRetrievalLedgerEntry{
 			EntryID:      "guidance:" + item.Path,
@@ -916,6 +922,7 @@ func buildContextRetrievalLedger(
 			Score:        atLeastOne(6 - idx),
 		})
 	}
+
 	for idx, item := range matchedPathInstructions[:min(len(matchedPathInstructions), 6)] {
 		title := item.Path
 		if item.Title != nil && strings.TrimSpace(*item.Title) != "" {
@@ -932,6 +939,7 @@ func buildContextRetrievalLedger(
 			Score:        atLeastOne(8 - idx),
 		})
 	}
+
 	slices.SortFunc(entries, func(a, b ContextRetrievalLedgerEntry) int {
 		if a.Score != b.Score {
 			if a.Score > b.Score {

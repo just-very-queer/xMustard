@@ -17,6 +17,7 @@ const SCANNER_EXCLUDED_DIR_NAMES: &[&str] = &[
     ".ruff_cache",
     ".turbo",
     ".next",
+    "target",
     "node_modules",
     "dist",
     "build",
@@ -51,6 +52,30 @@ const REPO_MAP_KEY_FILE_PATTERNS: &[(&str, &str)] = &[
     ("backend/app/service.py", "entry"),
     ("frontend/src/App.tsx", "entry"),
 ];
+
+fn repo_map_file_role(relative_path: &str) -> Option<&'static str> {
+    if let Some((_, role)) = REPO_MAP_KEY_FILE_PATTERNS
+        .iter()
+        .find(|(pattern, _)| relative_path == *pattern)
+    {
+        return Some(role);
+    }
+    let lowered = relative_path.to_lowercase();
+    let is_test = lowered.contains("/tests/")
+        || lowered.starts_with("tests/")
+        || PathBuf::from(&lowered)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| name.starts_with("test_"))
+            .unwrap_or(false);
+    if is_test {
+        return Some("test");
+    }
+    if should_scan_file(relative_path) {
+        return Some("source");
+    }
+    None
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RepoMapMilestone {
@@ -136,8 +161,10 @@ pub fn build_repo_map(
             continue;
         }
 
+        let Some(role) = repo_map_file_role(&relative) else {
+            continue;
+        };
         total_files += 1;
-        let lowered = relative.to_lowercase();
         let top_dir = relative
             .split('/')
             .next()
@@ -146,13 +173,7 @@ pub fn build_repo_map(
             .to_string();
 
         let is_source = should_scan_file(&relative);
-        let is_test = lowered.contains("/tests/")
-            || lowered.starts_with("tests/")
-            || PathBuf::from(&lowered)
-                .file_name()
-                .and_then(|name| name.to_str())
-                .map(|name| name.starts_with("test_"))
-                .unwrap_or(false);
+        let is_test = role == "test";
 
         {
             let entry = top_level.entry(top_dir).or_insert(RustRepoMapDirectoryRecord {
@@ -327,5 +348,26 @@ mod tests {
         assert_eq!(summary.test_files, 1);
         assert!(summary.key_files.iter().any(|item| item.path == "AGENTS.md"));
         assert!(summary.top_directories.iter().any(|item| item.path == "src"));
+    }
+
+    #[test]
+    fn repomap_counts_only_repo_understanding_relevant_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+
+        write(&root.join("README.md"), "# readme\n");
+        write(&root.join("src/app.py"), "print('ok')\n");
+        write(&root.join("tests/test_app.py"), "def test_ok():\n    assert True\n");
+        write(&root.join("docs/notes.txt"), "not indexed\n");
+        write(&root.join("assets/logo.png"), "png");
+        write(&root.join("target/debug.bin"), "bin");
+
+        let summary = build_repo_map(root, "workspace-2").unwrap();
+
+        assert_eq!(summary.total_files, 3);
+        assert_eq!(summary.source_files, 2);
+        assert_eq!(summary.test_files, 1);
+        assert!(summary.key_files.iter().any(|item| item.path == "README.md"));
+        assert!(summary.key_files.iter().any(|item| item.path == "tests/test_app.py"));
     }
 }

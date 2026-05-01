@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import time
@@ -26,7 +27,10 @@ from .models import (
     AppSettings,
     BrowserDumpRecord,
     BrowserDumpUpsertRequest,
+    CodeExplainerResult,
     CostSummary,
+    RepoChangeRecord,
+    RepoChangeSummary,
     CoverageDelta,
     CoverageResult,
     DynamicContextBundle,
@@ -62,6 +66,8 @@ from .models import (
     GuidanceStarterRecord,
     GuidanceStarterRequest,
     GuidanceStarterResult,
+    ImpactPathRecord,
+    ImpactReport,
     ImprovementSuggestion,
     IssueContextReplayComparison,
     IssueContextReplayRecord,
@@ -69,6 +75,9 @@ from .models import (
     IntegrationConfig,
     IntegrationTestRequest,
     IntegrationTestResult,
+    IngestionDependencyRecord,
+    IngestionPhaseRecord,
+    IngestionPipelinePlan,
     IssueDriftDetail,
     IssueCreateRequest,
     IssueContextPacket,
@@ -79,16 +88,33 @@ from .models import (
     LinearIssueSync,
     NotificationEvent,
     PatchCritique,
+    PathSymbolsResult,
+    PlanFileAttachment,
     PlanApproveRequest,
     PlanPhase,
     PlanRejectRequest,
+    PlanRevision,
     PlanStep,
+    PlanTrackingUpdateRequest,
+    PostgresBootstrapResult,
+    PostgresPathMaterializationRequest,
+    PostgresSemanticMaterializationResult,
+    PostgresSemanticSearchMaterializationRequest,
+    PostgresWorkspaceSemanticMaterializationRequest,
+    PostgresWorkspaceSemanticMaterializationResult,
     PromoteSignalRequest,
     RepoGuidanceHealth,
     RepoGuidanceRecord,
     RepoConfigHealth,
     RepoConfigRecord,
+    RepoContextActivityLink,
+    RepoContextFixLink,
+    RepoContextPlanLink,
+    RepoContextRecord,
+    RepoContextTargetLink,
     RepoMCPServerRecord,
+    RepoTargetRecord,
+    RepoToolState,
     RepoPathInstructionMatch,
     RepoPathInstructionRecord,
     RunMetrics,
@@ -98,11 +124,20 @@ from .models import (
     RunReviewRequest,
     RunAcceptRequest,
     RunbookRecord,
+    SemanticIndexBaselineRecord,
+    SemanticIndexPlan,
+    SemanticIndexPathSelection,
+    SemanticIndexRunResult,
+    SemanticIndexStatus,
     RunSessionInsight,
     RunbookUpsertRequest,
     ScopeWarning,
+    SemanticMatchMaterializationRecord,
     ReviewQueueItem,
     RelatedContextRecord,
+    RetrievalSearchHit,
+    RetrievalSearchResult,
+    ChangedSymbolRecord,
     RepoMapSymbolRecord,
     RepoMapSummary,
     SavedIssueView,
@@ -115,6 +150,11 @@ from .models import (
     TicketContextUpsertRequest,
     TestSuggestion,
     TriageSuggestion,
+    SemanticPatternQueryResult,
+    SemanticPatternMatchRecord,
+    SemanticQueryMaterializationRecord,
+    FileSymbolSummaryMaterializationRecord,
+    SymbolMaterializationRecord,
     VerificationChecklistResult,
     VerificationProfileDimensionSummary,
     VerificationProfileRecord,
@@ -142,6 +182,18 @@ from .models import (
     build_activity_actor,
     utc_now,
 )
+from .postgres import (
+    bootstrap_schema,
+    build_schema_plan,
+    materialize_path_symbols,
+    materialize_semantic_search,
+    persist_semantic_index_baseline,
+    read_file_symbol_summary,
+    read_latest_semantic_index_baseline,
+    read_semantic_matches,
+    read_symbols_for_path,
+    render_schema_sql,
+)
 from .runtimes import RuntimeService
 from .scanners import (
     apply_verdicts,
@@ -150,10 +202,12 @@ from .scanners import (
     latest_bug_ledger,
     list_tree_nodes,
     parse_ledger,
+    repo_map_file_role,
     scan_repo_signals,
     summarize_tree,
     verdict_bundles,
 )
+from .semantic import ast_grep_available, detect_ast_grep_language, extract_path_symbols, run_ast_grep_query, tree_sitter_available
 from .store import FileStore
 from .terminal import TerminalService
 
@@ -748,6 +802,489 @@ class TrackerService:
 
     def update_settings(self, settings: AppSettings) -> AppSettings:
         return self.store.save_settings(settings)
+
+    def read_postgres_schema_plan(self):
+        settings = self.store.load_settings()
+        return build_schema_plan(Path(__file__).resolve().parents[1], settings.postgres_dsn, settings.postgres_schema)
+
+    def render_postgres_schema_sql(self, schema: Optional[str] = None) -> str:
+        settings = self.store.load_settings()
+        rendered, _ = render_schema_sql(
+            Path(__file__).resolve().parents[1],
+            schema or settings.postgres_schema,
+        )
+        return rendered
+
+    def bootstrap_postgres_schema(
+        self,
+        dsn: Optional[str] = None,
+        schema: Optional[str] = None,
+    ) -> PostgresBootstrapResult:
+        settings = self.store.load_settings()
+        target_dsn = (dsn or settings.postgres_dsn or "").strip()
+        target_schema = (schema or settings.postgres_schema).strip()
+        result = bootstrap_schema(
+            Path(__file__).resolve().parents[1],
+            target_dsn,
+            target_schema,
+        )
+        self._record_activity(
+            workspace_id="global",
+            entity_type="settings",
+            entity_id="postgres",
+            action="postgres.bootstrap",
+            summary=f"Applied Postgres schema bootstrap for schema {result.schema_name}",
+            actor=build_activity_actor("operator", "operator"),
+            details={
+                "schema_name": result.schema_name,
+                "statement_count": result.statement_count,
+                "dsn_redacted": result.dsn_redacted,
+            },
+        )
+        return result
+
+    def materialize_path_symbols_to_postgres(
+        self,
+        workspace_id: str,
+        relative_path: str,
+        *,
+        dsn: Optional[str] = None,
+        schema: Optional[str] = None,
+        record_activity: bool = True,
+    ) -> PostgresSemanticMaterializationResult:
+        workspace = self.get_workspace(workspace_id)
+        settings = self.store.load_settings()
+        target_dsn = (dsn or settings.postgres_dsn or "").strip()
+        target_schema = (schema or settings.postgres_schema).strip()
+        path_symbols = self.read_path_symbols(workspace_id, relative_path)
+        if path_symbols.file_summary_row is None:
+            raise ValueError(f"No symbol summary is available for {relative_path}")
+        result = materialize_path_symbols(
+            target_dsn,
+            target_schema,
+            workspace_id=workspace.workspace_id,
+            workspace_name=workspace.name,
+            workspace_root=workspace.root_path,
+            relative_path=path_symbols.path,
+            file_summary_row=path_symbols.file_summary_row,
+            symbol_rows=path_symbols.symbol_rows,
+        )
+        if record_activity:
+            self._record_activity(
+                workspace_id=workspace_id,
+                entity_type="workspace",
+                entity_id=workspace_id,
+                action="postgres.materialize.path_symbols",
+                summary=f"Materialized parser-backed symbol rows for {path_symbols.path}",
+                actor=build_activity_actor("system", "xmustard"),
+                details={
+                    "path": path_symbols.path,
+                    "schema_name": result.schema_name,
+                    "symbol_rows": result.symbol_rows,
+                    "summary_rows": result.summary_rows,
+                },
+            )
+        return result
+
+    def materialize_semantic_search_to_postgres(
+        self,
+        workspace_id: str,
+        pattern: str,
+        *,
+        language: Optional[str] = None,
+        path_glob: Optional[str] = None,
+        limit: int = 50,
+        dsn: Optional[str] = None,
+        schema: Optional[str] = None,
+    ) -> PostgresSemanticMaterializationResult:
+        workspace = self.get_workspace(workspace_id)
+        settings = self.store.load_settings()
+        target_dsn = (dsn or settings.postgres_dsn or "").strip()
+        target_schema = (schema or settings.postgres_schema).strip()
+        search_result = self.search_semantic_pattern(
+            workspace_id,
+            pattern,
+            language=language,
+            path_glob=path_glob,
+            limit=limit,
+        )
+        if search_result.query_row is None:
+            raise ValueError("Semantic search did not produce a storage-ready query row")
+        result = materialize_semantic_search(
+            target_dsn,
+            target_schema,
+            workspace_id=workspace.workspace_id,
+            workspace_name=workspace.name,
+            workspace_root=workspace.root_path,
+            query_row=search_result.query_row,
+            match_rows=search_result.match_rows,
+        )
+        self._record_activity(
+            workspace_id=workspace_id,
+            entity_type="workspace",
+            entity_id=workspace_id,
+            action="postgres.materialize.semantic_search",
+            summary=f"Materialized semantic search query for pattern {pattern}",
+            actor=build_activity_actor("system", "xmustard"),
+            details={
+                "pattern": pattern,
+                "schema_name": result.schema_name,
+                "query_rows": result.query_rows,
+                "match_rows": result.match_rows,
+                "engine": search_result.engine,
+            },
+        )
+        return result
+
+    def materialize_workspace_symbols_to_postgres(
+        self,
+        workspace_id: str,
+        *,
+        strategy: str = "key_files",
+        paths: Optional[list[str]] = None,
+        limit: int = 12,
+        surface: str = "cli",
+        dsn: Optional[str] = None,
+        schema: Optional[str] = None,
+    ) -> PostgresWorkspaceSemanticMaterializationResult:
+        workspace = self.get_workspace(workspace_id)
+        settings = self.store.load_settings()
+        target_dsn = (dsn or settings.postgres_dsn or "").strip()
+        target_schema = (schema or settings.postgres_schema).strip()
+        requested_paths = self._semantic_materialization_paths(
+            workspace_id,
+            strategy=strategy,
+            paths=paths or [],
+            limit=limit,
+            surface=surface,
+        )
+        materialized_paths: list[str] = []
+        skipped_paths: list[str] = []
+        file_rows = 0
+        symbol_rows = 0
+        summary_rows = 0
+        redacted_dsn: Optional[str] = None
+        for relative_path in requested_paths:
+            try:
+                result = self.materialize_path_symbols_to_postgres(
+                    workspace_id,
+                    relative_path,
+                    dsn=target_dsn,
+                    schema=target_schema,
+                    record_activity=False,
+                )
+            except (FileNotFoundError, ValueError):
+                skipped_paths.append(relative_path)
+                continue
+            materialized_paths.extend(result.materialized_paths)
+            file_rows += result.file_rows
+            symbol_rows += result.symbol_rows
+            summary_rows += result.summary_rows
+            redacted_dsn = result.dsn_redacted
+        batch_result = PostgresWorkspaceSemanticMaterializationResult(
+            applied=bool(materialized_paths),
+            dsn_redacted=redacted_dsn,
+            schema_name=target_schema,
+            workspace_id=workspace_id,
+            strategy="paths" if strategy == "paths" else "key_files",
+            requested_paths=requested_paths,
+            materialized_paths=self._dedupe_text(materialized_paths),
+            skipped_paths=self._dedupe_text(skipped_paths),
+            file_rows=file_rows,
+            symbol_rows=symbol_rows,
+            summary_rows=summary_rows,
+            message=(
+                f"Materialized parser-backed symbol rows for {len(materialized_paths)} paths "
+                f"using strategy '{strategy}' into Postgres schema '{target_schema}'."
+            ),
+        )
+        self._record_activity(
+            workspace_id=workspace_id,
+            entity_type="workspace",
+            entity_id=workspace_id,
+            action="postgres.materialize.workspace_symbols",
+            summary=f"Materialized workspace symbol batch for {len(batch_result.materialized_paths)} paths",
+            actor=build_activity_actor("system", "xmustard"),
+            details={
+                "strategy": batch_result.strategy,
+                "surface": surface,
+                "schema_name": batch_result.schema_name,
+                "requested_paths": batch_result.requested_paths,
+                "materialized_paths": batch_result.materialized_paths,
+                "skipped_paths": batch_result.skipped_paths,
+                "symbol_rows": batch_result.symbol_rows,
+                "summary_rows": batch_result.summary_rows,
+            },
+        )
+        return batch_result
+
+    def plan_semantic_index(
+        self,
+        workspace_id: str,
+        *,
+        surface: str = "cli",
+        strategy: str = "key_files",
+        paths: Optional[list[str]] = None,
+        limit: int = 12,
+        dsn: Optional[str] = None,
+    ) -> SemanticIndexPlan:
+        workspace = self.get_workspace(workspace_id)
+        settings = self.store.load_settings()
+        normalized_surface = self._normalize_semantic_surface(surface)
+        blockers: list[str] = []
+        warnings: list[str] = []
+        selected_paths: list[str] = []
+        try:
+            selected_paths = self._semantic_materialization_paths(
+                workspace_id,
+                strategy=strategy,
+                paths=paths or [],
+                limit=limit,
+                surface=normalized_surface,
+            )
+        except ValueError as exc:
+            blockers.append(str(exc))
+
+        postgres_configured = bool((dsn or settings.postgres_dsn or "").strip())
+        if not postgres_configured:
+            blockers.append("Postgres DSN is not configured; run with --dsn or save a Postgres setting before applying.")
+        if not tree_sitter_available():
+            blockers.append("tree-sitter language pack is not available.")
+        if not selected_paths:
+            blockers.append("No semantic index paths were selected.")
+        if not ast_grep_available():
+            warnings.append("ast-grep binary is unavailable; symbol indexing can run, but semantic pattern matches remain blocked.")
+
+        run_targets = self.list_run_targets(workspace_id)
+        verify_targets = self.list_verify_targets(workspace_id)
+        root = Path(workspace.root_path)
+        worktree = self.read_worktree_status(workspace_id)
+        selected_path_details = [
+            self._semantic_index_path_selection(root, path, normalized_surface)
+            for path in selected_paths
+        ]
+        index_fingerprint = self._semantic_index_fingerprint(
+            workspace_id,
+            normalized_surface,
+            selected_path_details,
+            worktree.head_sha,
+        )
+        next_actions = [
+            "Run semantic-index run after reviewing selected_paths.",
+            "Use --path for exact files when the surface selector is too broad.",
+            "Install sg before expecting semantic-search match materialization.",
+        ]
+        if worktree.dirty_files:
+            warnings.append("Worktree has dirty files; this semantic index baseline should be treated as provisional.")
+        if not postgres_configured:
+            next_actions.insert(0, "Configure Postgres or pass --dsn for this run.")
+        retrieval_ledger = [
+            ContextRetrievalLedgerEntry(
+                entry_id=f"semantic_index_path:{item.path}",
+                source_type="semantic_index_path",
+                source_id=item.path,
+                title=item.path,
+                path=item.path,
+                reason=item.reason,
+                matched_terms=self._semantic_index_matched_terms(item.path, item.reason, normalized_surface),
+                score=item.score,
+            )
+            for item in selected_path_details
+        ]
+        return SemanticIndexPlan(
+            workspace_id=workspace_id,
+            root_path=workspace.root_path,
+            surface=normalized_surface,
+            strategy="paths" if strategy == "paths" else "key_files",
+            requested_paths=self._dedupe_text(paths or []),
+            selected_paths=selected_paths,
+            selected_path_details=selected_path_details,
+            head_sha=worktree.head_sha,
+            dirty_files=worktree.dirty_files,
+            worktree_dirty=bool(worktree.dirty_files),
+            index_fingerprint=index_fingerprint,
+            postgres_configured=postgres_configured,
+            postgres_schema=settings.postgres_schema,
+            tree_sitter_available=tree_sitter_available(),
+            ast_grep_available=ast_grep_available(),
+            run_target_count=len(run_targets),
+            verify_target_count=len(verify_targets),
+            retrieval_ledger=retrieval_ledger,
+            blockers=self._dedupe_text(blockers),
+            warnings=self._dedupe_text(warnings),
+            next_actions=next_actions,
+            can_run=not blockers,
+        )
+
+    def run_semantic_index(
+        self,
+        workspace_id: str,
+        *,
+        surface: str = "cli",
+        strategy: str = "key_files",
+        paths: Optional[list[str]] = None,
+        limit: int = 12,
+        dsn: Optional[str] = None,
+        schema: Optional[str] = None,
+        dry_run: bool = False,
+    ) -> SemanticIndexRunResult:
+        plan = self.plan_semantic_index(
+            workspace_id,
+            surface=surface,
+            strategy=strategy,
+            paths=paths or [],
+            limit=limit,
+            dsn=dsn,
+        )
+        if dry_run:
+            return SemanticIndexRunResult(
+                workspace_id=workspace_id,
+                surface=plan.surface,
+                dry_run=True,
+                plan=plan,
+                message=f"Semantic index dry run selected {len(plan.selected_paths)} paths for surface '{plan.surface}'.",
+            )
+        materialization = self.materialize_workspace_symbols_to_postgres(
+            workspace_id,
+            strategy="paths",
+            paths=plan.selected_paths,
+            limit=limit,
+            surface=plan.surface,
+            dsn=dsn,
+            schema=schema,
+        )
+        self._persist_semantic_index_baseline(
+            workspace_id,
+            plan,
+            materialization,
+            dsn=dsn,
+            schema=schema,
+        )
+        return SemanticIndexRunResult(
+            workspace_id=workspace_id,
+            surface=plan.surface,
+            dry_run=False,
+            plan=plan,
+            materialization=materialization,
+            message=f"Semantic index materialized {len(materialization.materialized_paths)} paths for surface '{plan.surface}'.",
+        )
+
+    def read_semantic_index_status(
+        self,
+        workspace_id: str,
+        *,
+        surface: str = "cli",
+        strategy: str = "key_files",
+        paths: Optional[list[str]] = None,
+        limit: int = 12,
+        dsn: Optional[str] = None,
+        schema: Optional[str] = None,
+    ) -> SemanticIndexStatus:
+        workspace = self.get_workspace(workspace_id)
+        settings = self.store.load_settings()
+        target_dsn = (dsn or settings.postgres_dsn or "").strip()
+        target_schema = (schema or settings.postgres_schema).strip()
+        normalized_surface = self._normalize_semantic_surface(surface)
+        plan = self.plan_semantic_index(
+            workspace_id,
+            surface=normalized_surface,
+            strategy=strategy,
+            paths=paths or [],
+            limit=limit,
+            dsn=target_dsn or None,
+        )
+        warnings = list(plan.warnings)
+        stale_reasons: list[str] = []
+        if not target_dsn:
+            return SemanticIndexStatus(
+                workspace_id=workspace_id,
+                surface=plan.surface,
+                status="blocked",
+                postgres_configured=False,
+                postgres_schema=target_schema,
+                current_fingerprint=plan.index_fingerprint,
+                current_head_sha=plan.head_sha,
+                current_dirty_files=plan.dirty_files,
+                stale_reasons=["Postgres DSN is not configured; no semantic baseline can be read."],
+                warnings=warnings,
+            )
+        try:
+            baseline = read_latest_semantic_index_baseline(
+                target_dsn,
+                target_schema,
+                workspace_id=workspace.workspace_id,
+                surface=normalized_surface,
+                strategy=plan.strategy,
+            )
+        except RuntimeError as exc:
+            return SemanticIndexStatus(
+                workspace_id=workspace_id,
+                surface=plan.surface,
+                status="blocked",
+                postgres_configured=True,
+                postgres_schema=target_schema,
+                current_fingerprint=plan.index_fingerprint,
+                current_head_sha=plan.head_sha,
+                current_dirty_files=plan.dirty_files,
+                stale_reasons=[str(exc)],
+                warnings=warnings,
+            )
+        if baseline is None:
+            return SemanticIndexStatus(
+                workspace_id=workspace_id,
+                surface=plan.surface,
+                status="no_baseline",
+                postgres_configured=True,
+                postgres_schema=target_schema,
+                current_fingerprint=plan.index_fingerprint,
+                current_head_sha=plan.head_sha,
+                current_dirty_files=plan.dirty_files,
+                stale_reasons=["No stored semantic index baseline exists for this workspace and surface."],
+                warnings=warnings,
+            )
+        fingerprint_match = bool(plan.index_fingerprint and plan.index_fingerprint == baseline.index_fingerprint)
+        baseline_covers_plan = self._semantic_baseline_covers_plan(plan, baseline)
+        semantic_inputs_match = fingerprint_match or baseline_covers_plan
+        if plan.head_sha != baseline.head_sha:
+            stale_reasons.append("HEAD SHA differs from the stored semantic baseline.")
+        if not semantic_inputs_match:
+            stale_reasons.append("Selected path hashes or baseline inputs differ from the stored semantic baseline.")
+        if plan.dirty_files:
+            stale_reasons.append("Worktree has dirty files, so freshness is provisional until the tree is clean or re-indexed.")
+        status = "fresh" if semantic_inputs_match and not plan.dirty_files else "stale"
+        if plan.dirty_files and semantic_inputs_match:
+            status = "dirty_provisional"
+        return SemanticIndexStatus(
+            workspace_id=workspace_id,
+            surface=plan.surface,
+            status=status,
+            postgres_configured=True,
+            postgres_schema=target_schema,
+            current_fingerprint=plan.index_fingerprint,
+            current_head_sha=plan.head_sha,
+            current_dirty_files=plan.dirty_files,
+            baseline=baseline,
+            fingerprint_match=semantic_inputs_match,
+            stale_reasons=self._dedupe_text(stale_reasons),
+            warnings=warnings,
+        )
+
+    def _semantic_baseline_covers_plan(
+        self,
+        plan: SemanticIndexPlan,
+        baseline: SemanticIndexBaselineRecord,
+    ) -> bool:
+        if plan.head_sha != baseline.head_sha:
+            return False
+        if not plan.selected_path_details:
+            return False
+        baseline_hashes = {item.path: item.sha256 for item in baseline.selected_path_details if item.sha256}
+        if not baseline_hashes:
+            return False
+        return all(
+            item.sha256 and baseline_hashes.get(item.path) == item.sha256
+            for item in plan.selected_path_details
+        )
 
     def list_runbooks(self, workspace_id: str) -> list[RunbookRecord]:
         self.get_workspace(workspace_id)
@@ -2731,10 +3268,7 @@ class TrackerService:
         repo_map = self.read_repo_map(workspace_id)
         repo_config = self.read_workspace_repo_config(workspace_id)
         related_paths = self._rank_related_paths(issue, tree_focus, ticket_contexts, vulnerability_findings, repo_map)
-        matched_path_instructions = self._match_repo_path_instructions(
-            repo_config,
-            [*tree_focus, *related_paths, *(item.normalized_path or item.path for item in evidence_bundle)],
-        )
+        semantic_status = self._best_effort_semantic_status(workspace_id, [*tree_focus, *related_paths])
         recent_fixes = self.list_fixes(workspace_id, issue_id=issue_id)[:5]
         recent_activity = [item for item in self.list_activity(workspace_id, issue_id=issue_id, limit=16) if item.entity_type == "issue"][:8]
         guidance = self.list_workspace_guidance(workspace_id)[:self.GUIDANCE_LIMIT]
@@ -2749,6 +3283,13 @@ class TrackerService:
             recent_fixes,
             recent_activity,
             related_paths,
+            repo_map,
+        )
+        semantic_paths = [item.path for item in dynamic_context.semantic_matches if item.path]
+        related_paths = self._dedupe_text([*related_paths, *semantic_paths])[:8]
+        matched_path_instructions = self._match_repo_path_instructions(
+            repo_config,
+            [*tree_focus, *related_paths, *(item.normalized_path or item.path for item in evidence_bundle)],
         )
         retrieval_ledger = self._build_context_retrieval_ledger(
             issue,
@@ -2775,6 +3316,7 @@ class TrackerService:
             related_paths,
             repo_map,
             dynamic_context,
+            semantic_status,
             retrieval_ledger,
             repo_config,
             matched_path_instructions,
@@ -2782,6 +3324,7 @@ class TrackerService:
         return IssueContextPacket(
             issue=issue,
             workspace=snapshot.workspace,
+            semantic_status=semantic_status,
             tree_focus=tree_focus[:12],
             related_paths=related_paths,
             evidence_bundle=evidence_bundle[:20],
@@ -2920,6 +3463,2065 @@ class TrackerService:
             behind=behind,
             dirty_paths=dirty_paths[:20],
         )
+
+    def read_repo_tool_state(self, workspace_id: str) -> RepoToolState:
+        workspace = self.get_workspace(workspace_id)
+        snapshot = self.store.load_snapshot(workspace_id)
+        return RepoToolState(
+            workspace=workspace,
+            snapshot_summary=dict(snapshot.summary) if snapshot else {},
+            worktree=self.read_worktree_status(workspace_id),
+            repo_map=self.store.load_repo_map(workspace_id),
+            activity_overview=self.read_activity_overview(workspace_id, limit=200),
+            recent_activity=self.list_activity(workspace_id, limit=10),
+            repo_config_health=self.get_workspace_repo_config_health(workspace_id),
+            guidance_health=self.get_workspace_guidance_health(workspace_id),
+        )
+
+    def read_ingestion_plan(self, workspace_id: str) -> IngestionPipelinePlan:
+        workspace = self.get_workspace(workspace_id)
+        snapshot = self.store.load_snapshot(workspace_id)
+        repo_map = self.store.load_repo_map(workspace_id)
+        settings = self.get_settings()
+        postgres_configured = bool((settings.postgres_dsn or "").strip())
+        postgres_schema = settings.postgres_schema
+        tree_sitter_runtime_available = tree_sitter_available()
+        ast_grep_is_available = ast_grep_available()
+        tree_sitter_on_demand_available = tree_sitter_runtime_available and repo_map is not None
+        ast_grep_on_demand_available = repo_map is not None
+
+        run_targets = self.list_run_targets(workspace_id) if snapshot else []
+        verify_targets = self.list_verify_targets(workspace_id) if snapshot else []
+
+        phases: list[IngestionPhaseRecord] = []
+
+        repo_scan_dependencies = [
+            IngestionDependencyRecord(
+                dependency_id="workspace_loaded",
+                kind="workspace",
+                label="Workspace snapshot exists",
+                satisfied=snapshot is not None,
+                detail="A scanned workspace snapshot is required before semantic ingestion can build on repo state.",
+            )
+        ]
+        phases.append(
+            IngestionPhaseRecord(
+                phase_id="repo_scan",
+                label="Repository scan",
+                description="Load the workspace snapshot, issue records, signals, worktree, and high-level tree summary.",
+                implementation_state="implemented",
+                delivery_state="complete" if snapshot else "blocked",
+                dependencies=repo_scan_dependencies,
+                blockers=[] if snapshot else ["Run a workspace scan before semantic ingestion phases can build on repo state."],
+                outputs=["workspace snapshot", "issue inventory", "signal inventory", "worktree status"],
+                evidence=[
+                    f"issues_total={snapshot.summary.get('issues_total', 0)}" if snapshot else "snapshot missing",
+                    f"scanner_version={snapshot.scanner_version}" if snapshot else "scanner unavailable",
+                ],
+            )
+        )
+
+        repo_map_dependencies = [
+            IngestionDependencyRecord(
+                dependency_id="repo_scan_output",
+                kind="artifact",
+                label="Repo scan output",
+                satisfied=snapshot is not None,
+                detail="Repo map generation depends on a scanned workspace snapshot.",
+            )
+        ]
+        phases.append(
+            IngestionPhaseRecord(
+                phase_id="repo_map",
+                label="Repo map",
+                description="Materialize key files, top directories, and source-aware repo shape for downstream indexing.",
+                implementation_state="implemented",
+                delivery_state="complete" if repo_map else "blocked",
+                dependencies=repo_map_dependencies,
+                blockers=[] if repo_map else ["Repo map has not been generated for this workspace yet."],
+                outputs=["key files", "top directories", "source extension counts"],
+                evidence=[
+                    f"total_files={repo_map.total_files}" if repo_map else "repo map missing",
+                    f"source_files={repo_map.source_files}" if repo_map else "source totals unavailable",
+                ],
+            )
+        )
+
+        runtime_dependencies = [
+            IngestionDependencyRecord(
+                dependency_id="repo_scan_for_targets",
+                kind="artifact",
+                label="Workspace scan",
+                satisfied=snapshot is not None,
+                detail="Run and verify target discovery is attached to the scanned workspace state.",
+            )
+        ]
+        phases.append(
+            IngestionPhaseRecord(
+                phase_id="runtime_discovery",
+                label="Runtime discovery",
+                description="Discover run, build, test, lint, and verification targets that explain how to execute the repo.",
+                implementation_state="implemented",
+                delivery_state="complete" if snapshot else "blocked",
+                dependencies=runtime_dependencies,
+                blockers=[] if snapshot else ["Workspace scan must complete before runtime discovery can report targets."],
+                outputs=["run targets", "verify targets"],
+                evidence=[
+                    f"run_targets={len(run_targets)}",
+                    f"verify_targets={len(verify_targets)}",
+                ],
+            )
+        )
+
+        tree_sitter_dependencies = [
+            IngestionDependencyRecord(
+                dependency_id="repo_map_available",
+                kind="artifact",
+                label="Repo map available",
+                satisfied=repo_map is not None,
+                detail="Parser-backed indexing should start from the cleaned repo-map boundary.",
+            ),
+            IngestionDependencyRecord(
+                dependency_id="tree_sitter_on_demand_surface",
+                kind="implementation",
+                label="On-demand symbol extraction surface implemented",
+                satisfied=tree_sitter_on_demand_available,
+                detail="path-symbols, code-explainer, and issue-context symbol ranking already use parser-backed extraction when the runtime is available.",
+            ),
+            IngestionDependencyRecord(
+                dependency_id="postgres_configured",
+                kind="setting",
+                label="Postgres configured",
+                satisfied=postgres_configured,
+                detail="Symbol tables and parser outputs should land in Postgres-backed storage.",
+            ),
+            IngestionDependencyRecord(
+                dependency_id="tree_sitter_library",
+                kind="tool",
+                label="tree-sitter language pack installed",
+                satisfied=tree_sitter_runtime_available,
+                detail="Install the Python tree-sitter language pack before enabling parser-backed extraction.",
+            ),
+        ]
+        tree_sitter_blockers = [
+            dependency.label
+            for dependency in tree_sitter_dependencies
+            if not dependency.satisfied and dependency.dependency_id != "tree_sitter_on_demand_surface"
+        ]
+        phases.append(
+            IngestionPhaseRecord(
+                phase_id="tree_sitter_index",
+                label="tree-sitter indexing",
+                description="Extract symbols, enclosing scopes, and structure-aware file summaries for semantic context.",
+                implementation_state="partial" if tree_sitter_on_demand_available else "planned",
+                delivery_state="ready" if not tree_sitter_blockers else "blocked",
+                dependencies=tree_sitter_dependencies,
+                blockers=tree_sitter_blockers,
+                outputs=["symbols", "scope ranges", "file-to-symbol summaries"],
+                evidence=[
+                    "On-demand parser-backed symbol extraction already feeds path-symbols and code-explainer."
+                    if tree_sitter_on_demand_available
+                    else "Parser-backed symbol extraction has not landed yet.",
+                    "Storage-ready file symbol summary and symbol row previews can now be generated on-demand."
+                    if tree_sitter_on_demand_available
+                    else "No storage-ready parser-backed row builders yet.",
+                    "Ad hoc and workspace-batch Postgres materialization helpers exist for parser-backed symbol rows."
+                    if tree_sitter_on_demand_available
+                    else "No Postgres symbol materialization helpers yet.",
+                    "Durable symbol materialization into Postgres is the next tree-sitter step.",
+                ],
+            )
+        )
+
+        ast_grep_dependencies = [
+            IngestionDependencyRecord(
+                dependency_id="repo_map_available_for_patterns",
+                kind="artifact",
+                label="Repo map available",
+                satisfied=repo_map is not None,
+                detail="Semantic pattern search should operate over the same cleaned repo boundary.",
+            ),
+            IngestionDependencyRecord(
+                dependency_id="ast_grep_surface",
+                kind="implementation",
+                label="Semantic-search surface implemented",
+                satisfied=ast_grep_on_demand_available,
+                detail="semantic-search exists now and issue-context can consume semantic matches when the sg binary is available.",
+            ),
+            IngestionDependencyRecord(
+                dependency_id="postgres_configured_for_patterns",
+                kind="setting",
+                label="Postgres configured",
+                satisfied=postgres_configured,
+                detail="Pattern matches and rule results should be queryable from Postgres-backed storage.",
+            ),
+            IngestionDependencyRecord(
+                dependency_id="ast_grep_binary",
+                kind="tool",
+                label="ast-grep binary installed",
+                satisfied=ast_grep_is_available,
+                detail="Install the sg binary before semantic pattern search can run locally.",
+            ),
+        ]
+        ast_grep_blockers = [
+            dependency.label
+            for dependency in ast_grep_dependencies
+            if not dependency.satisfied and dependency.dependency_id != "ast_grep_surface"
+        ]
+        phases.append(
+            IngestionPhaseRecord(
+                phase_id="ast_grep_rules",
+                label="ast-grep rules",
+                description="Run semantic code queries and rule-backed pattern checks for issue-shaped retrieval and impact hints.",
+                implementation_state="partial" if ast_grep_on_demand_available else "planned",
+                delivery_state="ready" if not ast_grep_blockers else "blocked",
+                dependencies=ast_grep_dependencies,
+                blockers=ast_grep_blockers,
+                outputs=["pattern matches", "rule hits", "structural search seeds"],
+                evidence=[
+                    "semantic-search tool surface implemented and issue-context aware.",
+                    "Storage-ready semantic query and match row previews can now be generated on-demand.",
+                    "ast-grep available" if ast_grep_is_available else "ast-grep unavailable",
+                    "Durable semantic query and match materialization is still pending.",
+                ],
+            )
+        )
+
+        lsp_dependencies = [
+            IngestionDependencyRecord(
+                dependency_id="semantic_core_first",
+                kind="implementation",
+                label="tree-sitter and ast-grep tranche landed",
+                satisfied=False,
+                detail="LSP enrichment should build on the structural semantic core rather than bypassing it.",
+            ),
+            IngestionDependencyRecord(
+                dependency_id="postgres_configured_for_lsp",
+                kind="setting",
+                label="Postgres configured",
+                satisfied=postgres_configured,
+                detail="LSP diagnostics and symbol links should be persisted alongside the semantic graph.",
+            ),
+        ]
+        phases.append(
+            IngestionPhaseRecord(
+                phase_id="lsp_enrichment",
+                label="LSP enrichment",
+                description="Attach live definitions, references, workspace symbols, and diagnostics through a workspace LSP manager.",
+                implementation_state="planned",
+                delivery_state="blocked",
+                dependencies=lsp_dependencies,
+                blockers=["Awaiting workspace LSP manager implementation."],
+                outputs=["definitions", "references", "diagnostics", "workspace symbols"],
+                evidence=["Planned after structural semantic indexing is in place."],
+            )
+        )
+
+        search_dependencies = [
+            IngestionDependencyRecord(
+                dependency_id="postgres_configured_for_search",
+                kind="setting",
+                label="Postgres configured",
+                satisfied=postgres_configured,
+                detail="Hybrid retrieval starts from Postgres-backed lexical and artifact indexes.",
+            ),
+            IngestionDependencyRecord(
+                dependency_id="symbol_materialization",
+                kind="implementation",
+                label="Symbol and edge materialization landed",
+                satisfied=False,
+                detail="Search quality depends on symbols and structural edges being materialized first.",
+            ),
+        ]
+        search_blockers = ["Depends on symbol and edge materialization before hybrid retrieval can be trusted."]
+        if not postgres_configured:
+            search_blockers.insert(0, "Postgres configured")
+        phases.append(
+            IngestionPhaseRecord(
+                phase_id="search_materialization",
+                label="Search materialization",
+                description="Build lexical, structural, and later semantic retrieval surfaces over repo and artifact state.",
+                implementation_state="planned",
+                delivery_state="blocked",
+                dependencies=search_dependencies,
+                blockers=search_blockers,
+                outputs=["search indexes", "retrieval ledger inputs", "impact retrieval seeds"],
+                evidence=[f"postgres_schema={postgres_schema}"],
+            )
+        )
+
+        ready_phase_ids = [
+            phase.phase_id
+            for phase in phases
+            if phase.delivery_state == "ready"
+        ]
+        blocked_phase_ids = [
+            phase.phase_id
+            for phase in phases
+            if phase.delivery_state == "blocked"
+        ]
+        next_phase_id = ready_phase_ids[0] if ready_phase_ids else None
+        completed_phase_count = sum(1 for phase in phases if phase.delivery_state == "complete")
+        return IngestionPipelinePlan(
+            workspace_id=workspace_id,
+            root_path=workspace.root_path,
+            postgres_configured=postgres_configured,
+            postgres_schema=postgres_schema,
+            phases=phases,
+            completed_phase_count=completed_phase_count,
+            ready_phase_ids=ready_phase_ids,
+            blocked_phase_ids=blocked_phase_ids,
+            next_phase_id=next_phase_id,
+        )
+
+    def read_change_summary(self, workspace_id: str, base_ref: str = "HEAD") -> RepoChangeSummary:
+        workspace = self.get_workspace(workspace_id)
+        root = Path(workspace.root_path)
+        worktree = self.read_worktree_status(workspace_id)
+        summary = RepoChangeSummary(
+            workspace_id=workspace_id,
+            base_ref=base_ref,
+            is_git_repo=worktree.is_git_repo,
+            branch=worktree.branch,
+            head_sha=worktree.head_sha,
+            dirty_files=worktree.dirty_files,
+        )
+        if not worktree.available or not worktree.is_git_repo:
+            return summary
+
+        changed: dict[tuple[str, str], RepoChangeRecord] = {}
+        self._collect_since_ref_changes(root, base_ref, changed)
+        self._collect_working_tree_changes(root, changed)
+        summary.changed_files = sorted(changed.values(), key=lambda item: (item.path, item.scope, item.status))
+        return summary
+
+    def read_changed_symbols(self, workspace_id: str, base_ref: str = "HEAD") -> list[ChangedSymbolRecord]:
+        impact = self.read_impact(workspace_id, base_ref=base_ref)
+        return impact.changed_symbols
+
+    def read_changes_since_last_run(self, workspace_id: str) -> RepoChangeSummary:
+        runs = self.store.list_runs(workspace_id)
+        for run in runs:
+            if run.worktree and run.worktree.head_sha:
+                return self.read_change_summary(workspace_id, base_ref=run.worktree.head_sha)
+        return self.read_change_summary(workspace_id, base_ref="HEAD")
+
+    def read_changes_since_last_accepted_fix(self, workspace_id: str) -> RepoChangeSummary:
+        fixes = self.store.list_fix_records(workspace_id)
+        for fix in fixes:
+            if fix.worktree and fix.worktree.head_sha:
+                return self.read_change_summary(workspace_id, base_ref=fix.worktree.head_sha)
+        return self.read_change_summary(workspace_id, base_ref="HEAD")
+
+    def read_impact(self, workspace_id: str, base_ref: str = "HEAD") -> ImpactReport:
+        workspace = self.get_workspace(workspace_id)
+        root = Path(workspace.root_path)
+        change_summary = self.read_change_summary(workspace_id, base_ref=base_ref)
+        changed_paths = self._dedupe_ordered_text(
+            [item.path for item in change_summary.changed_files if item.status != "deleted"]
+        )
+        semantic_status = self._best_effort_semantic_status(workspace_id, changed_paths)
+        changed_symbols = self._derive_changed_symbols(workspace_id, change_summary.changed_files, semantic_status)
+        likely_affected_files = self._rank_impact_paths(
+            root,
+            changed_paths,
+            changed_symbols,
+            want_tests=False,
+        )
+        likely_affected_tests = self._rank_impact_paths(
+            root,
+            changed_paths,
+            changed_symbols,
+            want_tests=True,
+        )
+        warnings = list(semantic_status.warnings) if semantic_status else []
+        if semantic_status and semantic_status.status not in {"fresh", "dirty_provisional"}:
+            warnings.extend(semantic_status.stale_reasons[:3])
+        if not changed_paths:
+            warnings.append("No changed files were detected from the current git comparison surface.")
+        if changed_paths and not changed_symbols:
+            warnings.append("Changed files were detected, but no symbol-level impact could be derived from the current floor.")
+        derivation_summary, confidence = self._impact_derivation_summary(
+            changed_paths,
+            changed_symbols,
+            likely_affected_files,
+            likely_affected_tests,
+            semantic_status,
+        )
+        return ImpactReport(
+            workspace_id=workspace_id,
+            base_ref=base_ref,
+            semantic_status=semantic_status,
+            changed_files=change_summary.changed_files,
+            changed_symbols=changed_symbols,
+            likely_affected_files=likely_affected_files,
+            likely_affected_tests=likely_affected_tests,
+            derivation_summary=derivation_summary,
+            confidence=confidence,
+            warnings=self._dedupe_text(warnings),
+        )
+
+    def read_repo_context(self, workspace_id: str, base_ref: str = "HEAD") -> RepoContextRecord:
+        impact = self.read_impact(workspace_id, base_ref=base_ref)
+        changed_paths = {item.path for item in impact.changed_files}
+        affected_paths = {item.path for item in [*impact.likely_affected_files, *impact.likely_affected_tests]}
+        reference_paths = changed_paths | affected_paths
+        plan_links = self._build_repo_context_plan_links(workspace_id, reference_paths)
+        recent_activity = self._build_repo_context_activity_links(workspace_id, reference_paths)
+        latest_fix = self._build_repo_context_latest_fix(workspace_id, reference_paths)
+        retrieval_ledger = self._build_repo_context_retrieval_ledger(
+            impact,
+            plan_links,
+            recent_activity,
+            latest_fix,
+        )
+        return RepoContextRecord(
+            workspace_id=workspace_id,
+            base_ref=base_ref,
+            semantic_status=impact.semantic_status,
+            impact=impact,
+            run_targets=self._build_repo_context_target_links(
+                self.list_run_targets(workspace_id),
+                changed_paths=changed_paths,
+                affected_paths=affected_paths,
+                target_kind="run",
+            ),
+            verify_targets=self._build_repo_context_target_links(
+                self.list_verify_targets(workspace_id),
+                changed_paths=changed_paths,
+                affected_paths=affected_paths,
+                target_kind="verify",
+            ),
+            plan_links=plan_links,
+            recent_activity=recent_activity,
+            latest_accepted_fix=latest_fix,
+            retrieval_ledger=retrieval_ledger,
+        )
+
+    def list_run_targets(self, workspace_id: str) -> list[RepoTargetRecord]:
+        workspace = self.get_workspace(workspace_id)
+        root = Path(workspace.root_path)
+        targets = self._discover_targets(root, include_verify=False)
+        return sorted(targets, key=lambda item: (item.kind, item.label, item.command))
+
+    def list_verify_targets(self, workspace_id: str) -> list[RepoTargetRecord]:
+        workspace = self.get_workspace(workspace_id)
+        root = Path(workspace.root_path)
+        targets = self._discover_targets(root, include_verify=True)
+        profile_targets = [
+            RepoTargetRecord(
+                target_id=f"verify-profile-{profile.profile_id}",
+                kind="verify",
+                label=f"verification profile: {profile.name}",
+                command=profile.test_command,
+                source="verification_profile",
+                source_path="verification_profiles.json",
+                confidence=95,
+            )
+            for profile in self.list_verification_profiles(workspace_id)
+        ]
+        deduped = self._dedupe_targets([*targets, *profile_targets])
+        return sorted(deduped, key=lambda item: (item.kind, item.label, item.command))
+
+    def read_path_symbols(self, workspace_id: str, relative_path: str) -> PathSymbolsResult:
+        workspace = self.get_workspace(workspace_id)
+        root = Path(workspace.root_path).resolve()
+        normalized, path = self._resolve_workspace_file(root, relative_path)
+        semantic_status = self._best_effort_semantic_status(workspace_id, [normalized])
+        stored = self._read_fresh_stored_path_symbols(workspace_id, normalized, semantic_status=semantic_status)
+        if stored is not None:
+            return stored
+        content = path.read_text(encoding="utf-8", errors="ignore")
+        symbols, symbol_source, parser_language = self._extract_path_symbol_records(Path(normalized), content)
+        file_summary_row, symbol_rows = self._build_symbol_materialization_rows(
+            workspace_id,
+            normalized,
+            symbols,
+            symbol_source,
+            parser_language,
+        )
+        return PathSymbolsResult(
+            workspace_id=workspace_id,
+            path=normalized,
+            symbol_source=symbol_source,
+            parser_language=parser_language,
+            evidence_source="on_demand_parser",
+            selection_reason=self._fallback_selection_reason(semantic_status),
+            semantic_status=semantic_status,
+            symbols=[
+                item.model_copy(update={"evidence_source": "on_demand_parser"})
+                for item in symbols[:24]
+            ],
+            file_summary_row=file_summary_row,
+            symbol_rows=symbol_rows[:24],
+            warnings=self._semantic_consumer_warnings(semantic_status, using_stored=False),
+        )
+
+    def search_semantic_pattern(
+        self,
+        workspace_id: str,
+        pattern: str,
+        *,
+        language: Optional[str] = None,
+        path_glob: Optional[str] = None,
+        limit: int = 50,
+    ) -> SemanticPatternQueryResult:
+        workspace = self.get_workspace(workspace_id)
+        root = Path(workspace.root_path).resolve()
+        matches, binary_path, error, truncated = run_ast_grep_query(
+            root,
+            pattern,
+            language=language or None,
+            path_glob=path_glob or None,
+            limit=max(1, min(limit, 200)),
+        )
+        query_row = self._build_semantic_query_row(
+            workspace_id,
+            pattern,
+            language=language or None,
+            path_glob=path_glob or None,
+            engine="ast_grep" if binary_path else "none",
+            match_count=len(matches),
+            truncated=truncated,
+            error=error,
+            source="adhoc_tool",
+        )
+        match_rows = self._build_semantic_match_rows(workspace_id, query_row.query_ref, matches)
+        return SemanticPatternQueryResult(
+            workspace_id=workspace_id,
+            pattern=pattern,
+            language=language or None,
+            path_glob=path_glob or None,
+            engine="ast_grep" if binary_path else "none",
+            binary_path=binary_path,
+            match_count=len(matches),
+            truncated=truncated,
+            matches=matches,
+            query_row=query_row,
+            match_rows=match_rows,
+            error=error,
+        )
+
+    def read_stored_semantic_matches(
+        self,
+        workspace_id: str,
+        *,
+        path: Optional[str] = None,
+        limit: int = 50,
+    ) -> list[SemanticMatchMaterializationRecord]:
+        settings = self.store.load_settings()
+        target_dsn = (settings.postgres_dsn or "").strip()
+        if not target_dsn:
+            return []
+        try:
+            return read_semantic_matches(
+                target_dsn,
+                settings.postgres_schema,
+                workspace_id=workspace_id,
+                path=path,
+                limit=limit,
+            )
+        except (RuntimeError, ValueError):
+            return []
+
+    def search_retrieval(
+        self,
+        workspace_id: str,
+        query: str,
+        *,
+        limit: int = 12,
+    ) -> RetrievalSearchResult:
+        workspace = self.get_workspace(workspace_id)
+        root = Path(workspace.root_path)
+        tokens = self._query_tokens(query)
+        normalized_limit = max(1, min(limit, 50))
+        hits: list[RetrievalSearchHit] = []
+        seen: set[tuple[str, str, str]] = set()
+
+        def push(hit: RetrievalSearchHit) -> None:
+            key = (hit.source_type, hit.path, hit.title)
+            if key in seen:
+                return
+            seen.add(key)
+            hits.append(hit)
+
+        repo_map = self.store.load_repo_map(workspace_id)
+        if repo_map:
+            for file_record in repo_map.key_files:
+                haystack = f"{file_record.path} {file_record.role}".lower()
+                matched_terms = [token for token in tokens[:10] if token in haystack]
+                if not matched_terms:
+                    continue
+                push(
+                    RetrievalSearchHit(
+                        path=file_record.path,
+                        source_type="lexical_hit",
+                        title=file_record.path,
+                        reason=f"Key repo-map path matched query terms: {', '.join(matched_terms[:4])}.",
+                        matched_terms=matched_terms,
+                        score=6 + len(matched_terms),
+                    )
+                )
+
+        for relative_path in self._semantic_materialization_source_candidates(root, limit=80):
+            candidate = root / relative_path
+            try:
+                content = candidate.read_text(encoding="utf-8", errors="ignore")[:30000].lower()
+            except OSError:
+                continue
+            haystack = f"{relative_path.lower()} {content}"
+            matched_terms = [token for token in tokens[:10] if token in haystack]
+            if not matched_terms:
+                continue
+            push(
+                RetrievalSearchHit(
+                    path=relative_path,
+                    source_type="lexical_hit",
+                    title=relative_path,
+                    reason=f"File path or content matched query terms: {', '.join(matched_terms[:4])}.",
+                    matched_terms=matched_terms,
+                    score=4 + len(matched_terms),
+                )
+            )
+
+        for path in self._dedupe_text([hit.path for hit in hits[:20]]):
+            try:
+                symbols = self.read_path_symbols(workspace_id, path)
+            except (FileNotFoundError, ValueError):
+                continue
+            for symbol in symbols.symbols[:12]:
+                haystack = f"{symbol.symbol} {symbol.kind} {symbol.enclosing_scope or ''}".lower()
+                matched_terms = [token for token in tokens[:10] if token in haystack]
+                if not matched_terms:
+                    continue
+                push(
+                    RetrievalSearchHit(
+                        path=symbol.path,
+                        source_type="stored_symbol" if symbols.evidence_source == "stored_semantic" else "structural_hit",
+                        title=f"{symbol.kind} {symbol.symbol}",
+                        reason=f"Parser symbol matched query terms: {', '.join(matched_terms[:4])}; {symbols.selection_reason}",
+                        matched_terms=matched_terms,
+                        score=9 + len(matched_terms),
+                    )
+                )
+
+        for match in self.read_stored_semantic_matches(workspace_id, limit=50):
+            haystack = f"{match.path} {match.matched_text} {match.context_lines or ''}".lower()
+            matched_terms = [token for token in tokens[:10] if token in haystack]
+            if not matched_terms:
+                continue
+            push(
+                RetrievalSearchHit(
+                    path=match.path,
+                    source_type="stored_semantic_match",
+                    title=match.matched_text[:80],
+                    reason=f"Stored semantic match replay matched query terms: {', '.join(matched_terms[:4])}.",
+                    matched_terms=matched_terms,
+                    score=10 + match.score + len(matched_terms),
+                )
+            )
+
+        hits.sort(key=lambda item: (-item.score, item.source_type, item.path, item.title))
+        hits = hits[:normalized_limit]
+        ledger = [
+            ContextRetrievalLedgerEntry(
+                entry_id=f"retrieval:{index}:{hit.source_type}:{hit.path}:{hashlib.sha1(hit.title.encode('utf-8')).hexdigest()[:8]}",
+                source_type=hit.source_type,
+                source_id=f"{hit.source_type}:{hit.path}:{hit.title}",
+                title=hit.title,
+                path=hit.path,
+                reason=hit.reason,
+                matched_terms=hit.matched_terms,
+                score=hit.score,
+            )
+            for index, hit in enumerate(hits)
+        ]
+        warnings = []
+        if not self.store.load_settings().postgres_dsn:
+            warnings.append("Postgres DSN is not configured; stored semantic match replay is unavailable.")
+        if not ast_grep_available():
+            warnings.append("sg is unavailable; retrieval is limited to lexical and parser-backed structural evidence.")
+        return RetrievalSearchResult(
+            workspace_id=workspace_id,
+            query=query,
+            hits=hits,
+            retrieval_ledger=ledger,
+            warnings=warnings,
+        )
+
+    def _query_tokens(self, query: str) -> list[str]:
+        return [
+            token
+            for token in self._dedupe_text(re.findall(r"[A-Za-z0-9_]{3,}", query.lower()))
+            if token not in {"the", "and", "for", "with", "from", "that", "this"}
+        ][:16]
+
+    def explain_path(self, workspace_id: str, relative_path: str) -> CodeExplainerResult:
+        workspace = self.get_workspace(workspace_id)
+        root = Path(workspace.root_path).resolve()
+        normalized, path = self._resolve_workspace_file(root, relative_path)
+        content = path.read_text(encoding="utf-8", errors="ignore")
+        line_count = len(content.splitlines())
+        import_count = self._count_imports(path, content)
+        semantic_status = self._best_effort_semantic_status(workspace_id, [normalized])
+        stored = self._read_fresh_stored_path_symbols(workspace_id, normalized, semantic_status=semantic_status)
+        if stored is not None:
+            symbol_records = stored.symbols
+            symbol_source = stored.symbol_source
+            parser_language = stored.parser_language
+            evidence_source = stored.evidence_source
+            selection_reason = stored.selection_reason
+            warnings = stored.warnings
+        else:
+            symbol_records, symbol_source, parser_language = self._extract_path_symbol_records(Path(normalized), content)
+            evidence_source = "on_demand_parser"
+            selection_reason = self._fallback_selection_reason(semantic_status)
+            warnings = self._semantic_consumer_warnings(semantic_status, using_stored=False)
+        symbols = [item.symbol for item in symbol_records[:12]]
+        role = self._infer_file_role(root, path)
+        summary = self._build_path_summary(normalized, role, line_count, import_count, symbols)
+        hints = self._build_path_hints(normalized, role)
+        return CodeExplainerResult(
+            workspace_id=workspace_id,
+            path=normalized,
+            role=role,
+            line_count=line_count,
+            import_count=import_count,
+            detected_symbols=symbols[:8],
+            symbol_source=symbol_source,
+            parser_language=parser_language,
+            evidence_source=evidence_source,
+            selection_reason=selection_reason,
+            semantic_status=semantic_status,
+            summary=summary,
+            hints=hints,
+            warnings=warnings,
+        )
+
+    def _resolve_workspace_file(self, root: Path, relative_path: str) -> tuple[str, Path]:
+        normalized = relative_path.strip().lstrip("./")
+        path = (root / normalized).resolve()
+        if not path.exists() or root not in [path, *path.parents]:
+            raise FileNotFoundError(relative_path)
+        if path.is_dir():
+            raise ValueError("Path explainer expects a file path, not a directory")
+        return path.relative_to(root).as_posix(), path
+
+    def _semantic_materialization_paths(
+        self,
+        workspace_id: str,
+        *,
+        strategy: str,
+        paths: list[str],
+        limit: int,
+        surface: str = "cli",
+    ) -> list[str]:
+        if strategy not in {"key_files", "paths"}:
+            raise ValueError(f"Unknown semantic materialization strategy: {strategy}")
+        normalized_surface = self._normalize_semantic_surface(surface)
+        normalized_limit = max(1, min(limit, 100))
+        if strategy == "paths":
+            return self._dedupe_ordered_text(
+                [item.strip().lstrip("./") for item in paths if item.strip()],
+                limit=normalized_limit,
+            )
+        workspace = self.get_workspace(workspace_id)
+        repo_map = self.store.load_repo_map(workspace_id)
+        if not repo_map:
+            raise ValueError("Repo map is required before workspace semantic materialization can select candidate files.")
+        root = Path(workspace.root_path)
+        prioritized = []
+        for item in repo_map.key_files:
+            if item.role == "test":
+                continue
+            if not self._semantic_materialization_is_indexable_source(item.path):
+                continue
+            prioritized.append(item.path)
+        prioritized.extend(self._semantic_materialization_target_seeds(workspace_id, normalized_surface))
+        prioritized.extend(self._semantic_materialization_source_candidates(root, limit=max(normalized_limit * 6, 40)))
+        ranked = [
+            path
+            for path in sorted(
+                self._dedupe_ordered_text(prioritized),
+                key=lambda path: (-self._semantic_materialization_path_score(path, surface=normalized_surface), path),
+            )
+            if (root / path).is_file() and self._semantic_materialization_is_indexable_source(path)
+        ]
+        return ranked[:normalized_limit]
+
+    def _normalize_semantic_surface(self, surface: str) -> str:
+        normalized = (surface or "cli").strip().lower()
+        if normalized not in {"cli", "web", "all"}:
+            raise ValueError(f"Unknown semantic index surface: {surface}")
+        return normalized
+
+    def _semantic_materialization_target_seeds(self, workspace_id: str, surface: str) -> list[str]:
+        if surface == "web":
+            return []
+        seeds: list[str] = []
+        for target in [*self.list_run_targets(workspace_id), *self.list_verify_targets(workspace_id)]:
+            if target.source_path:
+                seeds.append(target.source_path)
+            command = target.command.lower()
+            if "python" in command:
+                seeds.extend(["main.py", "cli.py", "__main__.py"])
+            if "typer" in command or "click" in command:
+                seeds.extend(["cli.py", "commands.py"])
+        return seeds
+
+    def _semantic_materialization_source_candidates(self, root: Path, limit: int = 60) -> list[str]:
+        candidates: list[str] = []
+        rg_bin = shutil.which("rg")
+        if rg_bin:
+            try:
+                completed = subprocess.run(
+                    [rg_bin, "--files", str(root)],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+            except FileNotFoundError:
+                completed = None
+            if completed and completed.returncode == 0:
+                for raw_line in completed.stdout.splitlines():
+                    candidate = raw_line.strip()
+                    if not candidate:
+                        continue
+                    candidate_path = Path(candidate)
+                    if candidate_path.is_absolute():
+                        try:
+                            relative = candidate_path.resolve().relative_to(root.resolve()).as_posix()
+                        except ValueError:
+                            continue
+                    else:
+                        relative = candidate.lstrip("./")
+                    role = repo_map_file_role(Path(relative))
+                    if role in {"source", "config", "guide"} and self._semantic_materialization_is_indexable_source(relative):
+                        candidates.append(relative)
+                    if len(candidates) >= limit:
+                        break
+                return candidates
+
+        for path in root.rglob("*"):
+            if not path.is_file():
+                continue
+            try:
+                relative = path.relative_to(root).as_posix()
+            except ValueError:
+                continue
+            role = repo_map_file_role(Path(relative))
+            if role in {"source", "config", "guide"} and self._semantic_materialization_is_indexable_source(relative):
+                candidates.append(relative)
+            if len(candidates) >= limit:
+                break
+        return candidates
+
+    def _semantic_materialization_is_indexable_source(self, relative_path: str) -> bool:
+        suffix = Path(relative_path.lower()).suffix
+        return suffix in {
+            ".py",
+            ".ts",
+            ".tsx",
+            ".js",
+            ".jsx",
+            ".go",
+            ".rs",
+            ".java",
+            ".kt",
+            ".swift",
+            ".c",
+            ".cc",
+            ".cpp",
+            ".h",
+            ".hpp",
+            ".cs",
+            ".rb",
+            ".php",
+        }
+
+    def _semantic_index_path_selection(self, root: Path, relative_path: str, surface: str) -> SemanticIndexPathSelection:
+        path = root / relative_path
+        sha256: Optional[str] = None
+        if path.is_file():
+            try:
+                sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
+            except OSError:
+                sha256 = None
+        role = repo_map_file_role(Path(relative_path))
+        score = self._semantic_materialization_path_score(relative_path, surface=surface)
+        reason_parts = [f"{role} file", f"score {score}"]
+        lowered = relative_path.lower()
+        if surface in {"cli", "all"} and any(marker in lowered for marker in ("cli", "runtime", "server", "agent", "command", "terminal")):
+            reason_parts.append("matches CLI/runtime surface markers")
+        if surface == "web" and any(marker in lowered for marker in ("frontend/", "web/", "ui/", "src/app", "src/pages", "src/components")):
+            reason_parts.append("matches web surface markers")
+        if ".test." in lowered or ".spec." in lowered or "/tests/" in f"/{lowered}/":
+            reason_parts.append("test-like path received a ranking penalty")
+        return SemanticIndexPathSelection(
+            path=relative_path,
+            role=role,
+            score=score,
+            reason="; ".join(reason_parts),
+            sha256=sha256,
+        )
+
+    def _semantic_index_matched_terms(self, relative_path: str, reason: str, surface: str) -> list[str]:
+        haystack = f"{relative_path} {reason}".lower()
+        terms = ["cli", "runtime", "server", "agent", "command", "test", "config", "entry", "source"]
+        if surface == "web":
+            terms.extend(["frontend", "web", "ui"])
+        return [term for term in terms if term in haystack][:6]
+
+    def _semantic_index_fingerprint(
+        self,
+        workspace_id: str,
+        surface: str,
+        selections: list[SemanticIndexPathSelection],
+        head_sha: Optional[str],
+    ) -> str:
+        payload = {
+            "workspace_id": workspace_id,
+            "surface": surface,
+            "head_sha": head_sha,
+            "paths": [
+                {
+                    "path": item.path,
+                    "sha256": item.sha256,
+                }
+                for item in selections
+            ],
+        }
+        return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+
+    def _persist_semantic_index_baseline(
+        self,
+        workspace_id: str,
+        plan: SemanticIndexPlan,
+        materialization: PostgresWorkspaceSemanticMaterializationResult,
+        *,
+        dsn: Optional[str],
+        schema: Optional[str],
+    ) -> Optional[SemanticIndexBaselineRecord]:
+        workspace = self.get_workspace(workspace_id)
+        settings = self.store.load_settings()
+        target_dsn = (dsn or settings.postgres_dsn or "").strip()
+        target_schema = (schema or settings.postgres_schema).strip()
+        if not target_dsn or not plan.index_fingerprint:
+            return None
+        baseline = SemanticIndexBaselineRecord(
+            index_run_id=f"semidx_{uuid.uuid4().hex}",
+            workspace_id=workspace_id,
+            surface=plan.surface,
+            strategy=plan.strategy,
+            index_fingerprint=plan.index_fingerprint,
+            head_sha=plan.head_sha,
+            dirty_files=plan.dirty_files,
+            worktree_dirty=plan.worktree_dirty,
+            selected_paths=plan.selected_paths,
+            selected_path_details=plan.selected_path_details,
+            materialized_paths=materialization.materialized_paths,
+            file_rows=materialization.file_rows,
+            symbol_rows=materialization.symbol_rows,
+            summary_rows=materialization.summary_rows,
+            postgres_schema=target_schema,
+            tree_sitter_available=plan.tree_sitter_available,
+            ast_grep_available=plan.ast_grep_available,
+        )
+        persisted = persist_semantic_index_baseline(
+            target_dsn,
+            target_schema,
+            baseline=baseline,
+            workspace_name=workspace.name,
+            workspace_root=workspace.root_path,
+        )
+        self._record_activity(
+            workspace_id=workspace_id,
+            entity_type="workspace",
+            entity_id=workspace_id,
+            action="semantic_index.baseline.persist",
+            summary=f"Persisted semantic index baseline for surface '{plan.surface}'",
+            actor=build_activity_actor("system", "xmustard"),
+            details={
+                "index_run_id": persisted.index_run_id,
+                "surface": persisted.surface,
+                "strategy": persisted.strategy,
+                "index_fingerprint": persisted.index_fingerprint,
+                "materialized_paths": persisted.materialized_paths,
+                "symbol_rows": persisted.symbol_rows,
+                "summary_rows": persisted.summary_rows,
+                "schema_name": persisted.postgres_schema,
+            },
+        )
+        return persisted
+
+    def _semantic_materialization_path_score(self, relative_path: str, *, surface: str = "cli") -> int:
+        lowered = relative_path.lower()
+        name = Path(lowered).name
+        score = 0
+
+        role = repo_map_file_role(Path(relative_path))
+        if role == "entry":
+            score += 80
+        elif role == "source":
+            score += 60
+        elif role == "config":
+            score += 30
+        elif role == "guide":
+            score += 20
+        elif role == "test":
+            score -= 80
+
+        preferred_prefixes = (
+            "backend/",
+            "api/",
+            "cmd/",
+            "cli/",
+            "scripts/",
+            "src/",
+        )
+        if lowered.startswith(preferred_prefixes):
+            score += 35
+
+        cli_markers = (
+            "cli.py",
+            "__main__.py",
+            "/main.py",
+            "/service.py",
+            "/commands/",
+            "/command/",
+            "/bin/",
+        )
+        if surface in {"cli", "all"} and any(marker in lowered for marker in cli_markers):
+            score += 25
+
+        cli_domain_markers = ("cli", "terminal", "runtime", "server", "agent", "command")
+        if surface in {"cli", "all"} and any(marker in lowered for marker in cli_domain_markers):
+            score += 12
+
+        web_markers = ("frontend/", "web/", "ui/", "src/app", "src/pages", "src/components")
+        if surface == "web" and any(marker in lowered for marker in web_markers):
+            score += 32
+
+        if name in {"pyproject.toml", "package.json", "cargo.toml", "makefile", "justfile", "readme.md", "agents.md"}:
+            score += 18
+
+        if "/tests/" in f"/{lowered}/" or name.startswith("test_") or ".test." in name or ".spec." in name:
+            score -= 60
+
+        if lowered.endswith((".md", ".json", ".toml", ".yaml", ".yml")):
+            score += 5
+
+        return score
+
+    def _build_symbol_materialization_rows(
+        self,
+        workspace_id: str,
+        relative_path: str,
+        symbols: list[RepoMapSymbolRecord],
+        symbol_source: str,
+        parser_language: Optional[str],
+    ) -> tuple[FileSymbolSummaryMaterializationRecord, list[SymbolMaterializationRecord]]:
+        path = Path(relative_path)
+        language = parser_language or detect_ast_grep_language(path)
+        symbol_rows = [
+            SymbolMaterializationRecord(
+                workspace_id=workspace_id,
+                path=relative_path,
+                symbol=item.symbol,
+                kind=item.kind,
+                language=language,
+                line_start=item.line_start,
+                line_end=item.line_end,
+                enclosing_scope=item.enclosing_scope,
+            )
+            for item in symbols
+        ]
+        summary_row = FileSymbolSummaryMaterializationRecord(
+            workspace_id=workspace_id,
+            path=relative_path,
+            language=language,
+            parser_language=parser_language,
+            symbol_source=symbol_source if symbol_source in {"tree_sitter", "regex", "none"} else "none",
+            symbol_count=len(symbols),
+            summary_json={
+                "top_symbols": [item.symbol for item in symbols[:8]],
+                "symbol_kinds": dict(Counter(item.kind for item in symbols)),
+                "enclosing_scopes": sorted({item.enclosing_scope for item in symbols if item.enclosing_scope}),
+            },
+        )
+        return summary_row, symbol_rows
+
+    def _read_fresh_stored_path_symbols(
+        self,
+        workspace_id: str,
+        relative_path: str,
+        *,
+        semantic_status: Optional[SemanticIndexStatus] = None,
+    ) -> Optional[PathSymbolsResult]:
+        settings = self.store.load_settings()
+        target_dsn = (settings.postgres_dsn or "").strip()
+        target_schema = settings.postgres_schema.strip()
+        if not target_dsn:
+            return None
+        status = semantic_status or self._best_effort_semantic_status(workspace_id, [relative_path])
+        if status is None:
+            return None
+        if status.status not in {"fresh", "dirty_provisional"}:
+            return None
+        try:
+            summary = read_file_symbol_summary(
+                target_dsn,
+                target_schema,
+                workspace_id=workspace_id,
+                relative_path=relative_path,
+            )
+            symbol_rows = read_symbols_for_path(
+                target_dsn,
+                target_schema,
+                workspace_id=workspace_id,
+                relative_path=relative_path,
+                limit=100,
+            )
+        except (RuntimeError, ValueError):
+            return None
+        if summary is None or not symbol_rows:
+            return None
+        symbols = [
+            RepoMapSymbolRecord(
+                path=row.path,
+                symbol=row.symbol,
+                kind=row.kind,
+                line_start=row.line_start,
+                line_end=row.line_end,
+                enclosing_scope=row.enclosing_scope,
+            )
+            for row in symbol_rows
+        ]
+        return PathSymbolsResult(
+            workspace_id=workspace_id,
+            path=relative_path,
+            symbol_source=summary.symbol_source,
+            parser_language=summary.parser_language,
+            evidence_source="stored_semantic",
+            selection_reason=self._stored_selection_reason(status),
+            semantic_status=status,
+            symbols=[
+                item.model_copy(update={"evidence_source": "stored_semantic"})
+                for item in symbols[:24]
+            ],
+            file_summary_row=summary,
+            symbol_rows=symbol_rows[:24],
+            warnings=self._semantic_consumer_warnings(status, using_stored=True),
+        )
+
+    def _semantic_query_ref(
+        self,
+        workspace_id: str,
+        source: str,
+        pattern: str,
+        language: Optional[str],
+        path_glob: Optional[str],
+        issue_id: Optional[str],
+        run_id: Optional[str],
+        reason: Optional[str],
+    ) -> str:
+        digest = hashlib.sha1(
+            "|".join(
+                [
+                    workspace_id,
+                    source,
+                    issue_id or "",
+                    run_id or "",
+                    language or "",
+                    path_glob or "",
+                    pattern,
+                    reason or "",
+                ]
+            ).encode("utf-8")
+        ).hexdigest()[:16]
+        return f"semanticq_{digest}"
+
+    def _build_semantic_query_row(
+        self,
+        workspace_id: str,
+        pattern: str,
+        *,
+        language: Optional[str],
+        path_glob: Optional[str],
+        engine: str,
+        match_count: int,
+        truncated: bool,
+        error: Optional[str],
+        source: str,
+        reason: Optional[str] = None,
+        issue_id: Optional[str] = None,
+        run_id: Optional[str] = None,
+    ) -> SemanticQueryMaterializationRecord:
+        normalized_engine = "ast_grep" if engine == "ast_grep" else "none"
+        normalized_source = "issue_context" if source == "issue_context" else "adhoc_tool"
+        return SemanticQueryMaterializationRecord(
+            query_ref=self._semantic_query_ref(workspace_id, normalized_source, pattern, language, path_glob, issue_id, run_id, reason),
+            workspace_id=workspace_id,
+            issue_id=issue_id,
+            run_id=run_id,
+            source=normalized_source,
+            reason=reason,
+            pattern=pattern,
+            language=language,
+            path_glob=path_glob,
+            engine=normalized_engine,
+            match_count=match_count,
+            truncated=truncated,
+            error=error,
+        )
+
+    def _build_semantic_match_rows(
+        self,
+        workspace_id: str,
+        query_ref: str,
+        matches: list[SemanticPatternMatchRecord],
+    ) -> list[SemanticMatchMaterializationRecord]:
+        return [
+            SemanticMatchMaterializationRecord(
+                query_ref=query_ref,
+                workspace_id=workspace_id,
+                path=item.path,
+                language=item.language,
+                line_start=item.line_start,
+                line_end=item.line_end,
+                column_start=item.column_start,
+                column_end=item.column_end,
+                matched_text=item.matched_text,
+                context_lines=item.context_lines,
+                meta_variables=item.meta_variables,
+                reason=item.reason,
+                score=item.score,
+            )
+            for item in matches
+        ]
+
+    def _collect_since_ref_changes(
+        self,
+        root: Path,
+        base_ref: str,
+        changed: dict[tuple[str, str], RepoChangeRecord],
+    ) -> None:
+        try:
+            completed = subprocess.run(
+                ["git", "-C", str(root), "diff", "--name-status", "--find-renames", base_ref, "--"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except FileNotFoundError:
+            return
+        if completed.returncode != 0:
+            return
+        for raw_line in completed.stdout.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            parts = line.split("\t")
+            code = parts[0]
+            status = self._map_git_diff_status(code[:1])
+            previous_path = None
+            path = parts[-1]
+            if code.startswith("R") and len(parts) >= 3:
+                previous_path = parts[1]
+                path = parts[2]
+            changed[(path, "since_ref")] = RepoChangeRecord(
+                path=path,
+                status=status,
+                scope="since_ref",
+                previous_path=previous_path,
+            )
+
+    def _collect_working_tree_changes(
+        self,
+        root: Path,
+        changed: dict[tuple[str, str], RepoChangeRecord],
+    ) -> None:
+        try:
+            completed = subprocess.run(
+                ["git", "-C", str(root), "status", "--porcelain"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except FileNotFoundError:
+            return
+        if completed.returncode != 0:
+            return
+        for raw_line in completed.stdout.splitlines():
+            if not raw_line:
+                continue
+            if raw_line.startswith("?? "):
+                path = raw_line[3:].strip()
+                changed[(path, "working_tree")] = RepoChangeRecord(
+                    path=path,
+                    status="untracked",
+                    scope="working_tree",
+                    unstaged=True,
+                )
+                continue
+            if len(raw_line) < 4:
+                continue
+            xy = raw_line[:2]
+            remainder = raw_line[3:].strip()
+            previous_path = None
+            path = remainder
+            if " -> " in remainder:
+                previous_path, path = [item.strip() for item in remainder.split(" -> ", 1)]
+            staged = xy[0] not in {" ", "."}
+            unstaged = xy[1] not in {" ", "."}
+            status = self._map_porcelain_status(xy, previous_path is not None)
+            changed[(path, "working_tree")] = RepoChangeRecord(
+                path=path,
+                status=status,
+                scope="working_tree",
+                previous_path=previous_path,
+                staged=staged,
+                unstaged=unstaged,
+            )
+
+    def _best_effort_semantic_status(
+        self,
+        workspace_id: str,
+        candidate_paths: list[str],
+    ) -> Optional[SemanticIndexStatus]:
+        normalized_paths = self._dedupe_text(
+            [
+                path
+                for path in candidate_paths
+                if path and Path(path).suffix.lower() in {".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".rs", ".java"}
+            ]
+        )
+        try:
+            return self.read_semantic_index_status(
+                workspace_id,
+                strategy="paths",
+                paths=normalized_paths[:12],
+            )
+        except (FileNotFoundError, RuntimeError, ValueError):
+            return None
+
+    def _stored_selection_reason(self, status: Optional[SemanticIndexStatus]) -> str:
+        if status and status.status == "dirty_provisional":
+            return "Using stored semantic symbol rows because the semantic baseline still matches, but the worktree is dirty so freshness is provisional."
+        return "Using stored semantic symbol rows because the semantic baseline is fresh."
+
+    def _fallback_selection_reason(self, status: Optional[SemanticIndexStatus]) -> str:
+        if status is None:
+            return "Falling back to on-demand parser extraction because semantic freshness could not be read."
+        if status.status == "blocked":
+            return "Falling back to on-demand parser extraction because semantic storage is blocked."
+        if status.status == "no_baseline":
+            return "Falling back to on-demand parser extraction because no semantic baseline exists yet."
+        if status.status == "stale":
+            return "Falling back to on-demand parser extraction because the stored semantic baseline is stale."
+        return "Falling back to on-demand parser extraction for this path."
+
+    def _semantic_consumer_warnings(
+        self,
+        status: Optional[SemanticIndexStatus],
+        *,
+        using_stored: bool,
+    ) -> list[str]:
+        warnings: list[str] = []
+        if status:
+            warnings.extend(status.warnings)
+            if not using_stored:
+                warnings.extend(status.stale_reasons[:3])
+            elif status.status == "dirty_provisional":
+                warnings.append("Stored semantic rows are being used, but the worktree is dirty so freshness is provisional.")
+        return self._dedupe_text(warnings)
+
+    def _derive_changed_symbols(
+        self,
+        workspace_id: str,
+        changed_files: list[RepoChangeRecord],
+        semantic_status: Optional[SemanticIndexStatus],
+    ) -> list[ChangedSymbolRecord]:
+        change_details: dict[str, dict[str, list[str]]] = {}
+        for item in changed_files:
+            if item.status == "deleted":
+                continue
+            payload = change_details.setdefault(item.path, {"scopes": [], "statuses": []})
+            if item.scope not in payload["scopes"]:
+                payload["scopes"].append(item.scope)
+            if item.status not in payload["statuses"]:
+                payload["statuses"].append(item.status)
+
+        records: list[ChangedSymbolRecord] = []
+        for path, payload in change_details.items():
+            if Path(path).suffix.lower() not in {".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".rs", ".java"}:
+                continue
+            try:
+                symbols = self.read_path_symbols(workspace_id, path)
+            except (FileNotFoundError, ValueError):
+                continue
+            for item in symbols.symbols[:12]:
+                records.append(
+                    ChangedSymbolRecord(
+                        path=item.path,
+                        symbol=item.symbol,
+                        kind=item.kind,
+                        line_start=item.line_start,
+                        line_end=item.line_end,
+                        evidence_source=symbols.evidence_source,
+                        semantic_status=semantic_status.status if semantic_status else None,
+                        selection_reason=symbols.selection_reason,
+                        change_scopes=list(payload["scopes"]),
+                        change_statuses=list(payload["statuses"]),
+                    )
+                )
+        return records
+
+    def _rank_impact_paths(
+        self,
+        root: Path,
+        changed_paths: list[str],
+        changed_symbols: list[ChangedSymbolRecord],
+        *,
+        want_tests: bool,
+    ) -> list[ImpactPathRecord]:
+        changed_set = set(changed_paths)
+        symbol_terms = [item.symbol.lower() for item in changed_symbols[:12] if item.symbol]
+        stem_terms = [Path(path).stem.lower() for path in changed_paths if Path(path).stem]
+        ignored_dirs = {".git", "node_modules", "dist", "build", "target", ".venv", "venv", "__pycache__"}
+        ranked: list[ImpactPathRecord] = []
+        seen: set[str] = set()
+        for candidate in root.rglob("*"):
+            if not candidate.is_file():
+                continue
+            relative = candidate.relative_to(root).as_posix()
+            if relative in changed_set or relative in seen:
+                continue
+            if any(part in ignored_dirs for part in Path(relative).parts):
+                continue
+            is_test = self._is_test_like_path(relative)
+            if want_tests != is_test:
+                continue
+            if candidate.suffix.lower() not in {".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".rs", ".java"}:
+                continue
+            lowered_path = relative.lower()
+            score = 0
+            reasons: list[str] = []
+            if any(Path(path).parent.as_posix() == Path(relative).parent.as_posix() for path in changed_paths):
+                score += 2
+                reasons.append("shares a directory with changed files")
+            matched_stems = [term for term in stem_terms[:6] if term and term in lowered_path]
+            if matched_stems:
+                score += min(3, len(matched_stems) + 1)
+                reasons.append(f"path overlaps changed file names: {', '.join(matched_stems[:3])}")
+            content_excerpt = ""
+            try:
+                content_excerpt = candidate.read_text(encoding="utf-8", errors="ignore")[:20000].lower()
+            except OSError:
+                content_excerpt = ""
+            matched_symbols = [term for term in symbol_terms[:6] if term and (term in lowered_path or term in content_excerpt)]
+            if matched_symbols:
+                score += min(5, len(matched_symbols) + 1)
+                reasons.append(f"mentions changed symbols: {', '.join(matched_symbols[:3])}")
+            if score <= 0:
+                continue
+            derivation_source = "hybrid" if matched_symbols and (matched_stems or any(Path(path).parent.as_posix() == Path(relative).parent.as_posix() for path in changed_paths)) else "structural" if matched_symbols else "lexical"
+            seen.add(relative)
+            ranked.append(
+                ImpactPathRecord(
+                    path=relative,
+                    reason="; ".join(reasons),
+                    derivation_source=derivation_source,
+                    score=score,
+                )
+            )
+        ranked.sort(key=lambda item: (-item.score, item.path))
+        return ranked[:8]
+
+    def _impact_derivation_summary(
+        self,
+        changed_paths: list[str],
+        changed_symbols: list[ChangedSymbolRecord],
+        likely_files: list[ImpactPathRecord],
+        likely_tests: list[ImpactPathRecord],
+        semantic_status: Optional[SemanticIndexStatus],
+    ) -> tuple[str, str]:
+        sources = sorted({item.evidence_source for item in changed_symbols})
+        derived = len(likely_files) + len(likely_tests)
+        status = semantic_status.status if semantic_status else "unknown"
+        if changed_symbols and derived and status in {"fresh", "dirty_provisional"}:
+            confidence = "high"
+        elif changed_symbols or derived:
+            confidence = "medium"
+        else:
+            confidence = "low"
+        summary = (
+            f"Derived from {len(changed_paths)} changed file(s), {len(changed_symbols)} changed symbol(s), "
+            f"and {derived} lexical/structural candidate(s); semantic_status={status}; "
+            f"symbol_sources={', '.join(sources) if sources else 'none'}."
+        )
+        return summary, confidence
+
+    def _build_repo_context_retrieval_ledger(
+        self,
+        impact: ImpactReport,
+        plan_links: list[RepoContextPlanLink],
+        recent_activity: list[RepoContextActivityLink],
+        latest_fix: Optional[RepoContextFixLink],
+    ) -> list[ContextRetrievalLedgerEntry]:
+        entries: list[ContextRetrievalLedgerEntry] = []
+        for index, change in enumerate(impact.changed_files[:10]):
+            entries.append(
+                ContextRetrievalLedgerEntry(
+                    entry_id=f"repo_context:changed_file:{change.scope}:{change.path}",
+                    source_type="lexical_hit",
+                    source_id=change.path,
+                    title=change.path,
+                    path=change.path,
+                    reason=f"Changed file selected from git {change.scope} status {change.status}.",
+                    matched_terms=[change.status, change.scope],
+                    score=max(1, 20 - index),
+                )
+            )
+        for index, symbol in enumerate(impact.changed_symbols[:10]):
+            source_type = "stored_symbol" if symbol.evidence_source == "stored_semantic" else "on_demand_symbol"
+            entries.append(
+                ContextRetrievalLedgerEntry(
+                    entry_id=f"repo_context:symbol:{symbol.path}:{symbol.symbol}:{symbol.line_start or 0}",
+                    source_type=source_type,
+                    source_id=f"{symbol.path}:{symbol.symbol}",
+                    title=f"{symbol.kind} {symbol.symbol}",
+                    path=symbol.path,
+                    reason=symbol.selection_reason or "Changed symbol selected from parser-backed file context.",
+                    matched_terms=[symbol.symbol],
+                    score=max(1, 16 - index),
+                )
+            )
+        for index, item in enumerate([*impact.likely_affected_files, *impact.likely_affected_tests][:10]):
+            entries.append(
+                ContextRetrievalLedgerEntry(
+                    entry_id=f"repo_context:impact:{item.path}",
+                    source_type="structural_hit" if item.derivation_source in {"structural", "hybrid"} else "lexical_hit",
+                    source_id=item.path,
+                    title=item.path,
+                    path=item.path,
+                    reason=f"{item.reason}; derivation_source={item.derivation_source}",
+                    matched_terms=[],
+                    score=item.score,
+                )
+            )
+        for index, plan in enumerate(plan_links[:6]):
+            entries.append(
+                ContextRetrievalLedgerEntry(
+                    entry_id=f"repo_context:plan:{plan.run_id}",
+                    source_type="artifact",
+                    source_id=f"run_plan:{plan.run_id}",
+                    title=f"plan {plan.run_id}",
+                    path=plan.attached_files[0] if plan.attached_files else None,
+                    reason=plan.reason,
+                    matched_terms=plan.attached_files[:4],
+                    score=max(1, plan.score + 8 - index),
+                )
+            )
+        if latest_fix:
+            entries.append(
+                ContextRetrievalLedgerEntry(
+                    entry_id=f"repo_context:fix:{latest_fix.fix_id}",
+                    source_type="artifact",
+                    source_id=f"fix:{latest_fix.fix_id}",
+                    title=latest_fix.summary,
+                    path=latest_fix.changed_files[0] if latest_fix.changed_files else None,
+                    reason=latest_fix.reason,
+                    matched_terms=latest_fix.changed_files[:4],
+                    score=9,
+                )
+            )
+        for index, activity in enumerate(recent_activity[:6]):
+            entries.append(
+                ContextRetrievalLedgerEntry(
+                    entry_id=f"repo_context:activity:{activity.action}:{activity.created_at}",
+                    source_type="artifact",
+                    source_id=f"activity:{activity.action}:{activity.created_at}",
+                    title=activity.summary,
+                    reason=activity.reason,
+                    matched_terms=[activity.action],
+                    score=max(1, activity.score + 4 - index),
+                )
+            )
+        entries.sort(key=lambda item: (-item.score, item.source_type, item.title.lower()))
+        return entries[:32]
+
+    def _build_repo_context_target_links(
+        self,
+        targets: list[RepoTargetRecord],
+        *,
+        changed_paths: set[str],
+        affected_paths: set[str],
+        target_kind: str,
+    ) -> list[RepoContextTargetLink]:
+        links: list[RepoContextTargetLink] = []
+        lowered_paths = [path.lower() for path in [*changed_paths, *affected_paths]]
+        for item in targets[:12]:
+            command = item.command.lower()
+            score = item.confidence
+            reasons = ["discovered executable target for the current workspace"]
+            matched_paths = [path for path in lowered_paths[:6] if path and Path(path).stem.lower() in command]
+            if matched_paths:
+                score += 3
+                reasons.append(f"command name overlaps changed or affected paths: {', '.join(Path(path).name for path in matched_paths[:3])}")
+            if target_kind == "verify" and item.kind in {"test", "lint", "verify"}:
+                score += 2
+                reasons.append("verification target is directly usable for regression proof")
+            links.append(
+                RepoContextTargetLink(
+                    target=item,
+                    reason="; ".join(reasons),
+                    score=score,
+                )
+            )
+        links.sort(key=lambda item: (-item.score, item.target.label, item.target.command))
+        return links[:8]
+
+    def _build_repo_context_plan_links(
+        self,
+        workspace_id: str,
+        reference_paths: set[str],
+    ) -> list[RepoContextPlanLink]:
+        links: list[RepoContextPlanLink] = []
+        for run in self.store.list_runs(workspace_id):
+            if not run.plan:
+                continue
+            step_files = [
+                file_path
+                for step in run.plan.steps
+                for file_path in step.files_affected
+                if file_path
+            ]
+            attached_files = self._dedupe_text(
+                [item.path for item in run.plan.attached_files]
+                + step_files
+                + list(run.plan.dirty_paths)
+            )
+            overlap = sorted(reference_paths.intersection(attached_files))
+            score = len(overlap) * 3
+            reasons: list[str] = []
+            if overlap:
+                reasons.append(f"plan files overlap current change context: {', '.join(overlap[:3])}")
+            elif attached_files:
+                score += 1
+                reasons.append(f"plan has {len(attached_files)} attached or step-owned file(s) for ownership traceability")
+            if run.plan.owner_label:
+                score += 1
+                reasons.append(f"owner tracked as {run.plan.owner_label}")
+            if run.plan.ownership_mode:
+                reasons.append(f"ownership mode is {run.plan.ownership_mode}")
+            if not reasons:
+                continue
+            links.append(
+                RepoContextPlanLink(
+                    run_id=run.run_id,
+                    issue_id=run.issue_id,
+                    status=run.status,
+                    phase=run.plan.phase,
+                    ownership_mode=run.plan.ownership_mode,
+                    owner_label=run.plan.owner_label,
+                    attached_files=attached_files,
+                    reason="; ".join(reasons),
+                    score=score,
+                )
+            )
+        links.sort(key=lambda item: (-item.score, item.run_id))
+        return links[:6]
+
+    def _build_repo_context_activity_links(
+        self,
+        workspace_id: str,
+        reference_paths: set[str],
+    ) -> list[RepoContextActivityLink]:
+        links: list[RepoContextActivityLink] = []
+        for entry in self.list_activity(workspace_id, limit=20):
+            details = entry.details if isinstance(entry.details, dict) else {}
+            touched_paths = self._dedupe_text(
+                self._normalize_string_list(details.get("changed_files"))
+                + self._normalize_string_list(details.get("attached_files"))
+            )
+            overlap = sorted(reference_paths.intersection(touched_paths))
+            reason = "recent repo activity"
+            score = 1
+            if overlap:
+                reason = f"recent activity touched current change context: {', '.join(overlap[:3])}"
+                score += len(overlap) * 2
+            elif entry.issue_id or entry.run_id:
+                reason = "recent tracked issue or run activity may explain the current repo state"
+            links.append(
+                RepoContextActivityLink(
+                    action=entry.action,
+                    summary=entry.summary,
+                    issue_id=entry.issue_id,
+                    run_id=entry.run_id,
+                    created_at=entry.created_at,
+                    reason=reason,
+                    score=score,
+                )
+            )
+        links.sort(key=lambda item: (-item.score, item.created_at), reverse=False)
+        return list(reversed(links[:8]))
+
+    def _build_repo_context_latest_fix(
+        self,
+        workspace_id: str,
+        reference_paths: set[str],
+    ) -> Optional[RepoContextFixLink]:
+        fixes = self.store.list_fix_records(workspace_id)
+        if not fixes:
+            return None
+        for fix in fixes:
+            overlap = sorted(reference_paths.intersection(set(fix.changed_files)))
+            if overlap:
+                return RepoContextFixLink(
+                    fix_id=fix.fix_id,
+                    issue_id=fix.issue_id,
+                    run_id=fix.run_id,
+                    summary=fix.summary,
+                    changed_files=fix.changed_files,
+                    tests_run=fix.tests_run,
+                    recorded_at=fix.recorded_at,
+                    reason=f"latest accepted fix overlaps current change context: {', '.join(overlap[:3])}",
+                )
+        latest = fixes[0]
+        return RepoContextFixLink(
+            fix_id=latest.fix_id,
+            issue_id=latest.issue_id,
+            run_id=latest.run_id,
+            summary=latest.summary,
+            changed_files=latest.changed_files,
+            tests_run=latest.tests_run,
+            recorded_at=latest.recorded_at,
+            reason="latest accepted fix recorded for this workspace",
+        )
+
+    def _is_test_like_path(self, path: str) -> bool:
+        lowered = path.lower()
+        name = Path(lowered).name
+        return (
+            "/tests/" in f"/{lowered}/"
+            or "/__tests__/" in f"/{lowered}/"
+            or name.startswith("test_")
+            or ".test." in name
+            or ".spec." in name
+        )
+
+    def _discover_targets(self, root: Path, include_verify: bool) -> list[RepoTargetRecord]:
+        targets: list[RepoTargetRecord] = []
+        targets.extend(self._discover_make_targets(root, include_verify=include_verify))
+        targets.extend(self._discover_package_targets(root, include_verify=include_verify))
+        targets.extend(self._discover_docker_targets(root))
+        return self._dedupe_targets(targets)
+
+    def _discover_make_targets(self, root: Path, include_verify: bool) -> list[RepoTargetRecord]:
+        makefile = root / "Makefile"
+        if not makefile.exists():
+            return []
+        targets: list[RepoTargetRecord] = []
+        pattern = re.compile(r"^([A-Za-z0-9_.-]+):")
+        for line in makefile.read_text(encoding="utf-8", errors="ignore").splitlines():
+            match = pattern.match(line)
+            if not match:
+                continue
+            target_name = match.group(1)
+            if target_name.startswith("."):
+                continue
+            kind = self._categorize_target_name(target_name)
+            if kind == "verify" and not include_verify:
+                continue
+            if not include_verify and kind in {"test", "lint", "verify"}:
+                continue
+            if include_verify and kind not in {"test", "lint", "verify", "build"}:
+                continue
+            targets.append(
+                RepoTargetRecord(
+                    target_id=f"make-{target_name}",
+                    kind=kind,
+                    label=f"make {target_name}",
+                    command=f"make {target_name}",
+                    source="makefile",
+                    source_path="Makefile",
+                    confidence=80,
+                )
+            )
+        return targets
+
+    def _discover_package_targets(self, root: Path, include_verify: bool) -> list[RepoTargetRecord]:
+        targets: list[RepoTargetRecord] = []
+        for manifest in self._iter_candidate_package_json(root):
+            try:
+                payload = json.loads(manifest.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            scripts = payload.get("scripts") if isinstance(payload, dict) else None
+            if not isinstance(scripts, dict):
+                continue
+            prefix = manifest.parent.relative_to(root).as_posix()
+            run_prefix = f"cd {prefix} && " if prefix not in {"", "."} else ""
+            for name, command in scripts.items():
+                if not isinstance(command, str):
+                    continue
+                kind = self._categorize_target_name(name)
+                if kind == "verify" and not include_verify:
+                    continue
+                if not include_verify and kind in {"test", "lint", "verify"}:
+                    continue
+                if include_verify and kind not in {"test", "lint", "verify", "build"}:
+                    continue
+                label_prefix = prefix if prefix not in {"", "."} else manifest.name
+                targets.append(
+                    RepoTargetRecord(
+                        target_id=f"pkg-{hashlib.sha1(f'{manifest}:{name}'.encode('utf-8')).hexdigest()[:12]}",
+                        kind=kind,
+                        label=f"{label_prefix}:{name}",
+                        command=f"{run_prefix}npm run {name}",
+                        source="package_json",
+                        source_path=manifest.relative_to(root).as_posix(),
+                        confidence=85,
+                    )
+                )
+        return targets
+
+    def _discover_docker_targets(self, root: Path) -> list[RepoTargetRecord]:
+        targets: list[RepoTargetRecord] = []
+        for candidate in ("docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml"):
+            path = root / candidate
+            if not path.exists():
+                continue
+            targets.append(
+                RepoTargetRecord(
+                    target_id=f"docker-{candidate}",
+                    kind="service",
+                    label=f"docker compose up ({candidate})",
+                    command=f"docker compose -f {candidate} up",
+                    source="docker_compose",
+                    source_path=candidate,
+                    confidence=75,
+                )
+            )
+        return targets
+
+    def _iter_candidate_package_json(self, root: Path) -> list[Path]:
+        candidates: list[Path] = []
+        queue = [root]
+        max_depth = 2
+        excluded = {
+            ".git",
+            "node_modules",
+            "dist",
+            "build",
+            "coverage",
+            "research",
+            "__pycache__",
+            ".venv",
+            "venv",
+        }
+        while queue:
+            current = queue.pop(0)
+            depth = len(current.relative_to(root).parts)
+            package_json = current / "package.json"
+            if package_json.exists():
+                candidates.append(package_json)
+            if depth >= max_depth:
+                continue
+            try:
+                children = sorted([item for item in current.iterdir() if item.is_dir()], key=lambda item: item.name)
+            except OSError:
+                continue
+            for child in children:
+                if child.name in excluded:
+                    continue
+                queue.append(child)
+        return candidates
+
+    def _dedupe_targets(self, targets: list[RepoTargetRecord]) -> list[RepoTargetRecord]:
+        deduped: dict[tuple[str, str], RepoTargetRecord] = {}
+        for target in targets:
+            key = (target.kind, target.command)
+            existing = deduped.get(key)
+            if not existing or target.confidence > existing.confidence:
+                deduped[key] = target
+        return list(deduped.values())
+
+    def _categorize_target_name(self, name: str) -> str:
+        lowered = name.lower()
+        if any(token in lowered for token in ("test", "pytest", "spec", "check")):
+            return "test"
+        if "lint" in lowered or "format" in lowered or lowered == "fmt":
+            return "lint"
+        if "build" in lowered or "compile" in lowered:
+            return "build"
+        if any(token in lowered for token in ("dev", "serve", "start", "run", "backend", "frontend")):
+            return "dev"
+        if "verify" in lowered or "validate" in lowered:
+            return "verify"
+        return "other"
+
+    def _map_git_diff_status(self, code: str) -> str:
+        return {
+            "M": "modified",
+            "A": "added",
+            "D": "deleted",
+            "R": "renamed",
+            "C": "copied",
+        }.get(code, "unknown")
+
+    def _map_porcelain_status(self, xy: str, renamed: bool) -> str:
+        if renamed:
+            return "renamed"
+        if "A" in xy:
+            return "added"
+        if "D" in xy:
+            return "deleted"
+        if "M" in xy:
+            return "modified"
+        return "unknown"
+
+    def _infer_file_role(self, root: Path, path: Path) -> str:
+        relative = path.relative_to(root).as_posix()
+        name = path.name.lower()
+        if name in {"agents.md", "conventions.md", "readme.md"}:
+            return "guide"
+        if relative.startswith("docs/") or name.endswith(".md"):
+            return "doc"
+        if name in {"package.json", "pyproject.toml", "cargo.toml", "makefile", "dockerfile"} or name.endswith(
+            (".yaml", ".yml", ".json", ".toml")
+        ):
+            return "config"
+        if any(part in {"test", "tests", "__tests__"} for part in path.parts) or re.search(r"test_", name):
+            return "test"
+        if any(part in {"src", "app", "api"} for part in path.parts):
+            return "source"
+        if path.suffix.lower() in {".png", ".jpg", ".jpeg", ".gif", ".svg"}:
+            return "asset"
+        return "unknown"
+
+    def _extract_top_symbols(self, path: Path, content: str) -> list[str]:
+        records, _symbol_source, _parser_language = self._extract_path_symbol_records(path, content)
+        return [item.symbol for item in records[:12]]
+
+    def _extract_path_symbol_records(
+        self,
+        path: Path,
+        content: str,
+    ) -> tuple[list[RepoMapSymbolRecord], str, Optional[str]]:
+        relative_path = Path(path.name) if path.is_absolute() else path
+        tree_sitter_symbols, symbol_source, parser_language = extract_path_symbols(relative_path, content)
+        if tree_sitter_symbols:
+            return tree_sitter_symbols, symbol_source, parser_language
+        regex_symbols = self._extract_regex_symbol_records(relative_path, content)
+        if regex_symbols:
+            return regex_symbols, "regex", parser_language
+        return [], "none", parser_language
+
+    def _extract_regex_symbol_records(self, path: Path, content: str) -> list[RepoMapSymbolRecord]:
+        records: list[RepoMapSymbolRecord] = []
+        seen: set[tuple[str, str, int, str]] = set()
+        current_scope: Optional[str] = None
+        for index, raw_line in enumerate(content.splitlines(), start=1):
+            line = raw_line.strip()
+            kind = None
+            symbol_name = None
+            if match := re.match(r"class\s+([A-Za-z_][A-Za-z0-9_]*)", line):
+                kind = "class"
+                symbol_name = match.group(1)
+                current_scope = symbol_name
+            elif match := re.match(r"(?:async\s+def|def)\s+([A-Za-z_][A-Za-z0-9_]*)", line):
+                kind = "method" if current_scope and raw_line.startswith((" ", "\t")) else "function"
+                symbol_name = match.group(1)
+            elif match := re.match(r"func\s+(?:\([^)]+\)\s*)?([A-Za-z_][A-Za-z0-9_]*)", line):
+                kind = "method" if "(" in line.split("{", 1)[0] else "function"
+                symbol_name = match.group(1)
+            elif match := re.match(r"(?:pub\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)", line):
+                kind = "function"
+                symbol_name = match.group(1)
+            elif match := re.match(r"(?:export\s+)?function\s+([A-Za-z_][A-Za-z0-9_]*)", line):
+                kind = "function"
+                symbol_name = match.group(1)
+            elif match := re.match(r"(?:export\s+)?class\s+([A-Za-z_][A-Za-z0-9_]*)", line):
+                kind = "class"
+                symbol_name = match.group(1)
+                current_scope = symbol_name
+            elif match := re.match(r"(?:export\s+)?interface\s+([A-Za-z_][A-Za-z0-9_]*)", line):
+                kind = "type"
+                symbol_name = match.group(1)
+                current_scope = symbol_name
+            elif match := re.match(r"(?:export\s+)?type\s+([A-Za-z_][A-Za-z0-9_]*)", line):
+                kind = "type"
+                symbol_name = match.group(1)
+            elif match := re.match(r"(?:const|let|var)\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:async\s*)?\(", line):
+                kind = "function"
+                symbol_name = match.group(1)
+            elif match := re.match(r"(?:pub\s+)?(?:struct|enum|trait)\s+([A-Za-z_][A-Za-z0-9_]*)", line):
+                kind = "type"
+                symbol_name = match.group(1)
+                current_scope = symbol_name
+            if not symbol_name or not kind:
+                continue
+            enclosing_scope = current_scope if current_scope != symbol_name and kind in {"function", "method"} else None
+            record_key = (path.as_posix(), symbol_name, index, kind)
+            if record_key in seen:
+                continue
+            seen.add(record_key)
+            records.append(
+                RepoMapSymbolRecord(
+                    path=path.as_posix(),
+                    symbol=symbol_name,
+                    kind=kind,
+                    line_start=index,
+                    line_end=index,
+                    enclosing_scope=enclosing_scope,
+                )
+            )
+        return records[:32]
+
+    def _count_imports(self, path: Path, content: str) -> int:
+        suffix = path.suffix.lower()
+        if suffix == ".py":
+            return len(re.findall(r"^(?:from\s+\S+\s+import|import\s+\S+)", content, flags=re.MULTILINE))
+        if suffix in {".ts", ".tsx", ".js", ".jsx"}:
+            return len(re.findall(r"^\s*import\s+", content, flags=re.MULTILINE))
+        if suffix == ".go":
+            return len(re.findall(r'^\s*import\s+(?:\(|")', content, flags=re.MULTILINE))
+        if suffix == ".rs":
+            return len(re.findall(r"^\s*use\s+", content, flags=re.MULTILINE))
+        return 0
+
+    def _build_path_summary(
+        self,
+        relative_path: str,
+        role: str,
+        line_count: int,
+        import_count: int,
+        symbols: list[str],
+    ) -> str:
+        summary = f"{relative_path} looks like a {role} file with {line_count} line(s)"
+        if import_count:
+            summary += f", importing {import_count} dependency reference(s)"
+        if symbols:
+            summary += f". Top-level symbols include {', '.join(symbols[:4])}"
+        else:
+            summary += ". No obvious top-level symbols were detected"
+        return summary + "."
+
+    def _build_path_hints(self, relative_path: str, role: str) -> list[str]:
+        hints: list[str] = []
+        if role == "test":
+            hints.append("Use this file to understand current verification coverage and expected behavior.")
+        elif role == "config":
+            hints.append("Check this file when figuring out how to run, build, or configure the workspace.")
+        elif role == "guide":
+            hints.append("Treat this as repo guidance that should shape runtime and editing behavior.")
+        elif role == "source":
+            hints.append("This is likely part of the code path that an agent may need to inspect or edit.")
+        if relative_path.startswith("docs/"):
+            hints.append("This path may contain supporting implementation or workflow context rather than live runtime code.")
+        return hints
 
     def start_issue_run(
         self,
@@ -3181,15 +5783,31 @@ class TrackerService:
         packet = self.issue_work(workspace_id, run.issue_id, runbook_id=run.runbook_id)
         plan_prompt = self._build_planning_prompt(packet)
         plan_result = self._call_agent_for_plan(run.runtime, run.model, plan_prompt, Path(packet.workspace.root_path))
+        steps = [item if isinstance(item, PlanStep) else PlanStep.model_validate(item) for item in plan_result.get("steps", [])]
+        worktree = self.read_worktree_status(workspace_id)
+        attached_files = self._build_plan_file_attachments(
+            Path(packet.workspace.root_path),
+            [path for step in steps for path in step.files_affected],
+            source="step",
+        )
         plan = RunPlan(
             plan_id=f"plan_{uuid.uuid4().hex[:12]}",
             run_id=run_id,
             phase="awaiting_approval",
-            steps=plan_result.get("steps", []),
+            steps=steps,
             summary=plan_result.get("summary", ""),
             reasoning=plan_result.get("reasoning"),
+            version=1,
+            ownership_mode="agent",
+            branch=worktree.branch,
+            head_sha=worktree.head_sha,
+            dirty_paths=worktree.dirty_paths[:24],
+            attached_files=attached_files,
             created_at=utc_now(),
+            updated_at=utc_now(),
+            revisions=[],
         )
+        plan = plan.model_copy(update={"revisions": [self._build_plan_revision(plan, worktree)]})
         updated_run = run.model_copy(update={"status": "planning", "plan": plan})
         self.store.save_run(updated_run)
         self._record_activity(
@@ -3201,7 +5819,13 @@ class TrackerService:
             actor=build_activity_actor("agent", run.runtime, runtime=run.runtime, model=run.model),
             issue_id=run.issue_id,
             run_id=run_id,
-            details={"plan_id": plan.plan_id, "step_count": len(plan.steps)},
+            details={
+                "plan_id": plan.plan_id,
+                "step_count": len(plan.steps),
+                "version": plan.version,
+                "attached_files": [item.path for item in plan.attached_files],
+                "head_sha": plan.head_sha,
+            },
         )
         return plan.model_dump(mode="json")
 
@@ -3223,13 +5847,26 @@ class TrackerService:
             raise ValueError(f"Plan is not awaiting approval (phase: {run.plan.phase})")
         workspace = self.get_workspace(workspace_id)
         modified_summary = request.feedback if request.feedback and run.plan.phase == "modified" else None
+        worktree = self.read_worktree_status(workspace_id)
         updated_plan = run.plan.model_copy(update={
             "phase": "approved",
+            "version": run.plan.version + 1,
+            "ownership_mode": "shared",
             "approved_at": utc_now(),
             "approver": "operator",
             "feedback": request.feedback if request.feedback else None,
             "modified_summary": modified_summary,
+            "branch": worktree.branch,
+            "head_sha": worktree.head_sha,
+            "dirty_paths": worktree.dirty_paths[:24],
+            "updated_at": utc_now(),
         })
+        updated_plan = updated_plan.model_copy(
+            update={
+                "revisions": run.plan.revisions
+                + [self._build_plan_revision(updated_plan, worktree, feedback=request.feedback or None)]
+            }
+        )
         updated_run = run.model_copy(update={"status": "queued", "plan": updated_plan})
         self.store.save_run(updated_run)
         self.runtime_service.start_approved_run(updated_run, Path(workspace.root_path))
@@ -3242,7 +5879,12 @@ class TrackerService:
             actor=build_activity_actor("operator", "operator"),
             issue_id=run.issue_id,
             run_id=run_id,
-            details={"feedback": request.feedback},
+            details={
+                "feedback": request.feedback,
+                "version": updated_plan.version,
+                "ownership_mode": updated_plan.ownership_mode,
+                "head_sha": updated_plan.head_sha,
+            },
         )
         return updated_plan.model_dump(mode="json")
 
@@ -3252,10 +5894,22 @@ class TrackerService:
             raise FileNotFoundError(run_id)
         if not run.plan:
             raise FileNotFoundError(f"No plan found for run {run_id}")
+        worktree = self.read_worktree_status(workspace_id)
         updated_plan = run.plan.model_copy(update={
             "phase": "rejected",
+            "version": run.plan.version + 1,
             "feedback": request.reason,
+            "branch": worktree.branch,
+            "head_sha": worktree.head_sha,
+            "dirty_paths": worktree.dirty_paths[:24],
+            "updated_at": utc_now(),
         })
+        updated_plan = updated_plan.model_copy(
+            update={
+                "revisions": run.plan.revisions
+                + [self._build_plan_revision(updated_plan, worktree, feedback=request.reason)]
+            }
+        )
         updated_run = run.model_copy(update={"status": "cancelled", "plan": updated_plan})
         self.store.save_run(updated_run)
         self._record_activity(
@@ -3267,9 +5921,127 @@ class TrackerService:
             actor=build_activity_actor("operator", "operator"),
             issue_id=run.issue_id,
             run_id=run_id,
-            details={"reason": request.reason},
+            details={"reason": request.reason, "version": updated_plan.version, "head_sha": updated_plan.head_sha},
         )
         return updated_plan.model_dump(mode="json")
+
+    def update_run_plan_tracking(self, workspace_id: str, run_id: str, request: PlanTrackingUpdateRequest) -> dict:
+        run = self.store.load_run(workspace_id, run_id)
+        if not run:
+            raise FileNotFoundError(run_id)
+        if not run.plan:
+            raise FileNotFoundError(f"No plan found for run {run_id}")
+        workspace = self.get_workspace(workspace_id)
+        worktree = self.read_worktree_status(workspace_id)
+        if request.replace_attachments:
+            attached_files = self._build_plan_file_attachments(
+                Path(workspace.root_path),
+                request.attached_files,
+                source="manual",
+            )
+        else:
+            attached_files = self._merge_plan_file_attachments(
+                Path(workspace.root_path),
+                run.plan.attached_files,
+                request.attached_files,
+            )
+        updated_plan = run.plan.model_copy(
+            update={
+                "version": run.plan.version + 1,
+                "ownership_mode": request.ownership_mode or run.plan.ownership_mode,
+                "owner_label": request.owner_label if request.owner_label is not None else run.plan.owner_label,
+                "attached_files": attached_files,
+                "feedback": request.feedback if request.feedback else run.plan.feedback,
+                "branch": worktree.branch,
+                "head_sha": worktree.head_sha,
+                "dirty_paths": worktree.dirty_paths[:24],
+                "updated_at": utc_now(),
+            }
+        )
+        updated_plan = updated_plan.model_copy(
+            update={
+                "revisions": run.plan.revisions
+                + [self._build_plan_revision(updated_plan, worktree, feedback=request.feedback or None)]
+            }
+        )
+        updated_run = run.model_copy(update={"plan": updated_plan})
+        self.store.save_run(updated_run)
+        self._record_activity(
+            workspace_id=workspace_id,
+            entity_type="run",
+            entity_id=run_id,
+            action="run.plan_tracking_updated",
+            summary=f"Updated plan tracking for {run.issue_id}",
+            actor=build_activity_actor("operator", "operator"),
+            issue_id=run.issue_id,
+            run_id=run_id,
+            details={
+                "version": updated_plan.version,
+                "ownership_mode": updated_plan.ownership_mode,
+                "owner_label": updated_plan.owner_label,
+                "attached_files": [item.path for item in updated_plan.attached_files],
+            },
+        )
+        return updated_plan.model_dump(mode="json")
+
+    def _build_plan_file_attachments(
+        self,
+        root: Path,
+        paths: list[str],
+        *,
+        source: str,
+    ) -> list[PlanFileAttachment]:
+        attachments: list[PlanFileAttachment] = []
+        seen: set[str] = set()
+        for raw_path in paths:
+            normalized = raw_path.strip()
+            if normalized.startswith("./"):
+                normalized = normalized[2:]
+            normalized = normalized.lstrip("/")
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            attachments.append(
+                PlanFileAttachment(
+                    path=normalized,
+                    source=source,
+                    exists=(root / normalized).exists(),
+                )
+            )
+        return attachments
+
+    def _merge_plan_file_attachments(
+        self,
+        root: Path,
+        existing: list[PlanFileAttachment],
+        new_paths: list[str],
+    ) -> list[PlanFileAttachment]:
+        merged: dict[str, PlanFileAttachment] = {item.path: item for item in existing}
+        for item in self._build_plan_file_attachments(root, new_paths, source="manual"):
+            merged[item.path] = item
+        return sorted(merged.values(), key=lambda item: item.path)
+
+    def _build_plan_revision(
+        self,
+        plan: RunPlan,
+        worktree: WorktreeStatus,
+        *,
+        feedback: Optional[str] = None,
+    ) -> PlanRevision:
+        return PlanRevision(
+            revision_id=f"planrev_{uuid.uuid4().hex[:12]}",
+            version=plan.version,
+            phase=plan.phase,
+            summary=plan.summary,
+            feedback=feedback,
+            ownership_mode=plan.ownership_mode,
+            owner_label=plan.owner_label,
+            branch=worktree.branch,
+            head_sha=worktree.head_sha,
+            dirty_paths=worktree.dirty_paths[:24],
+            attached_files=plan.attached_files,
+            created_at=utc_now(),
+        )
 
     def _build_planning_prompt(self, packet: IssueContextPacket) -> str:
         return f"""You are a bug fixing assistant. Generate a structured plan to address the following issue.
@@ -3291,6 +6063,7 @@ Your task is to generate a concise fix plan. Consider:
 2. What the actual fix should be
 3. What tests should be added or updated
 4. What risks this fix might introduce
+5. Which concrete repo-relative files should be attached to the plan for ownership and version tracking
 
 Respond with a JSON object containing:
 {{
@@ -5733,6 +8506,7 @@ Respond with a JSON object containing:
         related_paths: list[str],
         repo_map: RepoMapSummary,
         dynamic_context: Optional[DynamicContextBundle],
+        semantic_status: Optional[SemanticIndexStatus],
         retrieval_ledger: list[ContextRetrievalLedgerEntry],
         repo_config: Optional[RepoConfigRecord],
         matched_path_instructions: list[RepoPathInstructionMatch],
@@ -5856,7 +8630,15 @@ Respond with a JSON object containing:
             path_instruction_lines.append(
                 f"- {label} [{', '.join(item.matched_paths[:4])}]: {item.instructions}"
             )
+        semantic_status_lines = []
+        if semantic_status:
+            semantic_status_lines.append(f"- status: {semantic_status.status}")
+            if semantic_status.stale_reasons:
+                semantic_status_lines.extend(f"- reason: {item}" for item in semantic_status.stale_reasons[:3])
+            if semantic_status.warnings:
+                semantic_status_lines.extend(f"- warning: {item}" for item in semantic_status.warnings[:3])
         symbol_lines = []
+        semantic_match_lines = []
         related_artifact_lines = []
         if dynamic_context:
             for symbol in dynamic_context.symbol_context[:6]:
@@ -5864,6 +8646,12 @@ Respond with a JSON object containing:
                 scope = f" in {symbol.enclosing_scope}" if symbol.enclosing_scope else ""
                 reason = f" ({symbol.reason})" if symbol.reason else ""
                 symbol_lines.append(f"- {symbol.kind} {symbol.symbol}{scope} @ {location}{reason}")
+            for match in dynamic_context.semantic_matches[:6]:
+                location = f"{match.path}:{match.line_start}" if match.line_start else match.path
+                reason = f" ({match.reason})" if match.reason else ""
+                semantic_match_lines.append(
+                    f"- {location} [{match.language or 'unknown'}]{reason}: {match.matched_text[:120]}"
+                )
             for item in dynamic_context.related_context[:6]:
                 matched = f" matches {', '.join(item.matched_terms[:3])}" if item.matched_terms else ""
                 reason = f" {item.reason}" if item.reason else ""
@@ -5894,9 +8682,11 @@ Respond with a JSON object containing:
             f"Browser context:\n{chr(10).join(browser_lines) if browser_lines else '- No browser dumps recorded yet.'}\n\n"
             f"Repo config:\n{chr(10).join(repo_config_lines) if repo_config_lines else '- No .xmustard config loaded.'}\n\n"
             f"Path-specific guidance:\n{chr(10).join(path_instruction_lines) if path_instruction_lines else '- No path-specific instructions matched the current issue paths.'}\n\n"
+            f"Semantic freshness:\n{chr(10).join(semantic_status_lines) if semantic_status_lines else '- Semantic freshness has not been read for this issue context.'}\n\n"
             f"Structural context:\n{chr(10).join(repo_dir_lines) if repo_dir_lines else '- No repo map available.'}\n\n"
             f"Ranked related paths:\n{related_lines}\n\n"
             f"Symbol context:\n{chr(10).join(symbol_lines) if symbol_lines else '- No symbol context ranked yet.'}\n\n"
+            f"Semantic matches:\n{chr(10).join(semantic_match_lines) if semantic_match_lines else '- No semantic pattern matches ranked yet.'}\n\n"
             f"Related artifacts:\n{chr(10).join(related_artifact_lines) if related_artifact_lines else '- No related artifacts ranked yet.'}\n\n"
             f"Retrieval ledger:\n{chr(10).join(retrieval_lines) if retrieval_lines else '- No retrieval ledger entries recorded yet.'}\n\n"
             f"Repository guidance:\n{chr(10).join(guidance_lines) if guidance_lines else '- No repository guidance files were found.'}\n\n"
@@ -6180,6 +8970,9 @@ Respond with a JSON object containing:
         return [item.strip().strip("'\"") for item in match.group(1).split(",") if item.strip()]
 
     def _dedupe_text(self, items: list[str]) -> list[str]:
+        return self._dedupe_ordered_text(items, limit=6)
+
+    def _dedupe_ordered_text(self, items: list[str], limit: Optional[int] = None) -> list[str]:
         seen: set[str] = set()
         ordered: list[str] = []
         for item in items:
@@ -6188,7 +8981,9 @@ Respond with a JSON object containing:
                 continue
             seen.add(normalized)
             ordered.append(normalized)
-        return ordered[:6]
+            if limit is not None and len(ordered) >= limit:
+                break
+        return ordered
 
     def _context_tokens(
         self,
@@ -6280,9 +9075,18 @@ Respond with a JSON object containing:
         recent_fixes: list[FixRecord],
         recent_activity: list[ActivityRecord],
         related_paths: list[str],
+        repo_map: RepoMapSummary,
     ) -> DynamicContextBundle:
         tokens = self._context_tokens(issue, ticket_contexts, vulnerability_findings)
-        symbol_context = self._extract_symbol_context(Path(workspace.root_path), [*tree_focus, *related_paths], tokens)
+        symbol_context = self._extract_symbol_context(workspace.workspace_id, Path(workspace.root_path), [*tree_focus, *related_paths], tokens)
+        semantic_matches, semantic_queries, semantic_match_rows = self._collect_semantic_matches(
+            workspace.workspace_id,
+            Path(workspace.root_path),
+            issue,
+            tokens,
+            [*tree_focus, *related_paths],
+            repo_map,
+        )
         related_context = self._rank_related_artifacts(
             issue,
             ticket_contexts,
@@ -6295,8 +9099,173 @@ Respond with a JSON object containing:
         )
         return DynamicContextBundle(
             symbol_context=symbol_context,
+            semantic_matches=semantic_matches,
+            semantic_queries=semantic_queries,
+            semantic_match_rows=semantic_match_rows,
             related_context=related_context,
         )
+
+    def _collect_semantic_matches(
+        self,
+        workspace_id: str,
+        root: Path,
+        issue: IssueRecord,
+        tokens: list[str],
+        candidate_paths: list[str],
+        repo_map: RepoMapSummary,
+    ) -> tuple[
+        list[SemanticPatternMatchRecord],
+        list[SemanticQueryMaterializationRecord],
+        list[SemanticMatchMaterializationRecord],
+    ]:
+        if not ast_grep_available():
+            return [], [], []
+
+        queries = self._derive_semantic_patterns(tokens, candidate_paths, repo_map)
+        matches: list[SemanticPatternMatchRecord] = []
+        query_rows: list[SemanticQueryMaterializationRecord] = []
+        match_rows: list[SemanticMatchMaterializationRecord] = []
+        seen: set[tuple[str, Optional[int], str]] = set()
+        for pattern, language, path_glob, reason in queries:
+            found, _binary_path, error, truncated = run_ast_grep_query(
+                root,
+                pattern,
+                language=language,
+                path_glob=path_glob,
+                limit=6,
+            )
+            query_row = self._build_semantic_query_row(
+                workspace_id,
+                pattern,
+                language=language,
+                path_glob=path_glob,
+                engine="ast_grep",
+                match_count=len(found),
+                truncated=truncated,
+                error=error,
+                source="issue_context",
+                reason=reason,
+                issue_id=issue.bug_id,
+            )
+            query_rows.append(query_row)
+            if error:
+                continue
+            query_match_buffer: list[SemanticPatternMatchRecord] = []
+            for item in found:
+                key = (item.path, item.line_start, item.matched_text)
+                if key in seen:
+                    continue
+                seen.add(key)
+                lowered = f"{item.path.lower()} {item.matched_text.lower()} {(item.context_lines or '').lower()}"
+                matched_terms = [token for token in tokens[:12] if token in lowered]
+                score = max(3, len(matched_terms) * 2 + (2 if item.path in candidate_paths[:4] else 0))
+                matches.append(
+                    item.model_copy(
+                        update={
+                            "reason": reason,
+                            "score": score,
+                        }
+                    )
+                )
+                query_match_buffer.append(
+                    item.model_copy(
+                        update={
+                            "reason": reason,
+                            "score": score,
+                        }
+                    )
+                )
+                if len(matches) >= 8:
+                    break
+            match_rows.extend(self._build_semantic_match_rows(workspace_id, query_row.query_ref, query_match_buffer))
+            if len(matches) >= 8:
+                break
+            if truncated:
+                continue
+        matches.sort(key=lambda item: (-item.score, item.path, item.line_start or 0))
+        match_rows.sort(key=lambda item: (-item.score, item.path, item.line_start or 0))
+        return matches[:8], query_rows, match_rows[:8]
+
+    def _derive_semantic_patterns(
+        self,
+        tokens: list[str],
+        candidate_paths: list[str],
+        repo_map: RepoMapSummary,
+    ) -> list[tuple[str, str, Optional[str], str]]:
+        identifier_tokens = [
+            token
+            for token in tokens
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{2,}", token)
+            and token not in {"export", "backend", "frontend", "render", "error", "issue"}
+        ]
+        if not identifier_tokens:
+            return []
+
+        language_paths: dict[str, str] = {}
+        for path in candidate_paths[:8]:
+            language = detect_ast_grep_language(Path(path))
+            if language and language not in language_paths:
+                language_paths[language] = path
+        if not language_paths:
+            extension_languages = {
+                ".py": "python",
+                ".ts": "typescript",
+                ".tsx": "tsx",
+                ".js": "javascript",
+                ".go": "go",
+                ".rs": "rust",
+            }
+            for extension, _count in repo_map.top_extensions.items():
+                language = extension_languages.get(extension)
+                if language and language not in language_paths:
+                    language_paths[language] = f"repo map extension {extension}"
+        queries: list[tuple[str, str, Optional[str], str]] = []
+        seen: set[tuple[str, str]] = set()
+        for language, sample_path in language_paths.items():
+            glob = self._ast_grep_glob_for_language(language)
+            for name in identifier_tokens[:4]:
+                for pattern, reason in self._semantic_patterns_for_name(language, name):
+                    key = (language, pattern)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    queries.append((pattern, language, glob, f"{reason} near {sample_path}"))
+                    if len(queries) >= 8:
+                        return queries
+        return queries
+
+    def _semantic_patterns_for_name(self, language: str, name: str) -> list[tuple[str, str]]:
+        if language == "python":
+            if name[:1].isupper():
+                return [(f"class {name}: $$$BODY", f"Semantic class lookup for {name}")]
+            return [(f"def {name}($$$ARGS): $$$BODY", f"Semantic function lookup for {name}")]
+        if language in {"typescript", "tsx", "javascript"}:
+            if name[:1].isupper():
+                return [(f"class {name} {{ $$$BODY }}", f"Semantic class lookup for {name}")]
+            return [
+                (f"function {name}($$$ARGS) {{ $$$BODY }}", f"Semantic function lookup for {name}"),
+                (f"const {name} = ($$$ARGS) => $$$BODY", f"Semantic arrow-function lookup for {name}"),
+            ]
+        if language == "go":
+            if name[:1].isupper():
+                return [(f"type {name} struct {{ $$$BODY }}", f"Semantic type lookup for {name}")]
+            return [(f"func {name}($$$ARGS) {{ $$$BODY }}", f"Semantic function lookup for {name}")]
+        if language == "rust":
+            if name[:1].isupper():
+                return [(f"struct {name} {{ $$$BODY }}", f"Semantic type lookup for {name}")]
+            return [(f"fn {name}($$$ARGS) {{ $$$BODY }}", f"Semantic function lookup for {name}")]
+        return []
+
+    def _ast_grep_glob_for_language(self, language: str) -> Optional[str]:
+        mapping = {
+            "python": "**/*.py",
+            "typescript": "**/*.ts",
+            "tsx": "**/*.tsx",
+            "javascript": "**/*.js",
+            "go": "**/*.go",
+            "rust": "**/*.rs",
+        }
+        return mapping.get(language)
 
     def _build_context_retrieval_ledger(
         self,
@@ -6359,16 +9328,31 @@ Respond with a JSON object containing:
         if dynamic_context:
             for symbol in dynamic_context.symbol_context[:8]:
                 source_id = f"{symbol.path}:{symbol.symbol}:{symbol.line_start or 0}"
+                symbol_source_type = "stored_symbol" if symbol.evidence_source == "stored_semantic" else "on_demand_symbol"
                 push(
                     ContextRetrievalLedgerEntry(
                         entry_id=f"symbol:{source_id}",
-                        source_type="symbol",
+                        source_type=symbol_source_type,
                         source_id=source_id,
                         title=f"{symbol.kind} {symbol.symbol}",
                         path=symbol.path,
                         reason=symbol.reason or "Ranked from symbol names near issue-related files.",
                         matched_terms=matches_for(symbol.path, symbol.symbol, symbol.enclosing_scope or ""),
                         score=symbol.score,
+                    )
+                )
+            for match in dynamic_context.semantic_matches[:8]:
+                source_id = f"{match.path}:{match.line_start or 0}:{match.column_start or 0}:{hashlib.sha1(match.matched_text.encode('utf-8')).hexdigest()[:10]}"
+                push(
+                    ContextRetrievalLedgerEntry(
+                        entry_id=f"semantic_match:{source_id}",
+                        source_type="semantic_match",
+                        source_id=source_id,
+                        title=(match.matched_text[:72] + ("..." if len(match.matched_text) > 72 else "")),
+                        path=match.path,
+                        reason=match.reason or "Matched a semantic pattern derived from issue terms.",
+                        matched_terms=matches_for(match.path, match.matched_text, match.context_lines or ""),
+                        score=match.score,
                     )
                 )
             for artifact in dynamic_context.related_context[:8]:
@@ -6417,9 +9401,15 @@ Respond with a JSON object containing:
         entries.sort(key=lambda item: (-item.score, item.source_type, item.title.lower()))
         return entries[:32]
 
-    def _extract_symbol_context(self, root: Path, candidate_paths: list[str], tokens: list[str]) -> list[RepoMapSymbolRecord]:
+    def _extract_symbol_context(
+        self,
+        workspace_id: str,
+        root: Path,
+        candidate_paths: list[str],
+        tokens: list[str],
+    ) -> list[RepoMapSymbolRecord]:
         symbols: list[RepoMapSymbolRecord] = []
-        seen: set[tuple[str, str]] = set()
+        seen: set[tuple[str, str, Optional[int], str]] = set()
         for path in self._dedupe_text(candidate_paths)[:10]:
             file_path = root / path
             if not file_path.is_file():
@@ -6427,43 +9417,14 @@ Respond with a JSON object containing:
             if file_path.suffix.lower() not in {".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".rs", ".java"}:
                 continue
             try:
-                lines = file_path.read_text(encoding="utf-8").splitlines()
-            except OSError:
+                path_symbols = self.read_path_symbols(workspace_id, path)
+            except (FileNotFoundError, OSError, ValueError):
                 continue
-            current_scope: Optional[str] = None
-            for index, raw_line in enumerate(lines, start=1):
-                line = raw_line.strip()
-                kind = None
-                symbol_name = None
-                if match := re.match(r"class\s+([A-Za-z_][A-Za-z0-9_]*)", line):
-                    kind = "class"
-                    symbol_name = match.group(1)
-                    current_scope = symbol_name
-                elif match := re.match(r"def\s+([A-Za-z_][A-Za-z0-9_]*)", line):
-                    kind = "method" if current_scope else "function"
-                    symbol_name = match.group(1)
-                elif match := re.match(r"func\s+(?:\([^)]+\)\s*)?([A-Za-z_][A-Za-z0-9_]*)", line):
-                    kind = "method" if "(" in line.split("{", 1)[0] else "function"
-                    symbol_name = match.group(1)
-                elif match := re.match(r"fn\s+([A-Za-z_][A-Za-z0-9_]*)", line):
-                    kind = "function"
-                    symbol_name = match.group(1)
-                elif match := re.match(r"(?:export\s+)?function\s+([A-Za-z_][A-Za-z0-9_]*)", line):
-                    kind = "function"
-                    symbol_name = match.group(1)
-                elif match := re.match(r"(?:const|let|var)\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:async\s*)?\(", line):
-                    kind = "function"
-                    symbol_name = match.group(1)
-                elif match := re.match(r"struct\s+([A-Za-z_][A-Za-z0-9_]*)", line):
-                    kind = "type"
-                    symbol_name = match.group(1)
-                    current_scope = symbol_name
-                if not symbol_name or not kind:
-                    continue
-                symbol_key = (path, symbol_name)
+            for record in path_symbols.symbols[:20]:
+                symbol_key = (record.path, record.symbol, record.line_start, record.kind)
                 if symbol_key in seen:
                     continue
-                lowered = f"{path.lower()} {symbol_name.lower()}"
+                lowered = f"{record.path.lower()} {record.symbol.lower()} {(record.enclosing_scope or '').lower()}"
                 matched_terms = [token for token in tokens[:12] if token in lowered]
                 score = len(matched_terms) * 2
                 if path in candidate_paths[:4]:
@@ -6472,14 +9433,16 @@ Respond with a JSON object containing:
                     continue
                 seen.add(symbol_key)
                 symbols.append(
-                    RepoMapSymbolRecord(
-                        path=path,
-                        symbol=symbol_name,
-                        kind=kind,
-                        line_start=index,
-                        enclosing_scope=current_scope if current_scope != symbol_name else None,
-                        reason=f"Matches {', '.join(matched_terms[:3])}" if matched_terms else "Near ranked focus files.",
-                        score=score,
+                    record.model_copy(
+                        update={
+                            "reason": (
+                                f"Matches {', '.join(matched_terms[:3])}; {path_symbols.selection_reason.lower()}"
+                                if matched_terms
+                                else path_symbols.selection_reason
+                            ),
+                            "evidence_source": path_symbols.evidence_source,
+                            "score": score,
+                        }
                     )
                 )
         symbols.sort(key=lambda item: (-item.score, item.path, item.symbol))
@@ -7406,6 +10369,8 @@ Respond with a JSON object containing:
             packet.related_paths,
             packet.repo_map,
             packet.dynamic_context,
+            packet.semantic_status,
+            packet.retrieval_ledger,
             packet.repo_config,
             packet.matched_path_instructions,
         )

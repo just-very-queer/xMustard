@@ -21,6 +21,11 @@ from .models import (
     IssueUpdateRequest,
     PlanApproveRequest,
     PlanRejectRequest,
+    PlanTrackingUpdateRequest,
+    PostgresBootstrapRequest,
+    PostgresPathMaterializationRequest,
+    PostgresSemanticSearchMaterializationRequest,
+    PostgresWorkspaceSemanticMaterializationRequest,
     PromoteSignalRequest,
     RunAcceptRequest,
     RuntimeProbeRequest,
@@ -82,6 +87,26 @@ def get_settings():
 @app.post("/api/settings")
 def update_settings(settings: AppSettings):
     return SERVICE.update_settings(settings).model_dump(mode="json")
+
+
+@app.get("/api/postgres/plan")
+def postgres_plan():
+    return SERVICE.read_postgres_schema_plan().model_dump(mode="json")
+
+
+@app.get("/api/postgres/render")
+def postgres_render(schema: Optional[str] = Query(default=None)):
+    return {"sql": SERVICE.render_postgres_schema_sql(schema=schema)}
+
+
+@app.post("/api/postgres/bootstrap")
+def postgres_bootstrap(request: PostgresBootstrapRequest):
+    try:
+        return SERVICE.bootstrap_postgres_schema(dsn=request.dsn, schema=request.schema_name).model_dump(mode="json")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 @app.get("/api/agent/capabilities")
@@ -441,6 +466,142 @@ def read_worktree(workspace_id: str):
         return SERVICE.read_worktree_status(workspace_id).model_dump(mode="json")
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="Workspace not found")
+
+
+@app.get("/api/workspaces/{workspace_id}/repo-state")
+def read_repo_state(workspace_id: str):
+    try:
+        return SERVICE.read_repo_tool_state(workspace_id).model_dump(mode="json")
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+
+
+@app.get("/api/workspaces/{workspace_id}/ingestion-plan")
+def read_ingestion_plan(workspace_id: str):
+    try:
+        return SERVICE.read_ingestion_plan(workspace_id).model_dump(mode="json")
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+
+
+@app.get("/api/workspaces/{workspace_id}/changes")
+def read_changes(workspace_id: str, base_ref: str = Query(default="HEAD")):
+    try:
+        return SERVICE.read_change_summary(workspace_id, base_ref=base_ref).model_dump(mode="json")
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+
+
+@app.get("/api/workspaces/{workspace_id}/run-targets")
+def list_run_targets(workspace_id: str):
+    try:
+        return [item.model_dump(mode="json") for item in SERVICE.list_run_targets(workspace_id)]
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+
+
+@app.get("/api/workspaces/{workspace_id}/verify-targets")
+def list_verify_targets(workspace_id: str):
+    try:
+        return [item.model_dump(mode="json") for item in SERVICE.list_verify_targets(workspace_id)]
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+
+
+@app.get("/api/workspaces/{workspace_id}/explain-path")
+def explain_path(workspace_id: str, path: str = Query(...)):
+    try:
+        return SERVICE.explain_path(workspace_id, path).model_dump(mode="json")
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Path not found")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.get("/api/workspaces/{workspace_id}/path-symbols")
+def path_symbols(workspace_id: str, path: str = Query(...)):
+    try:
+        return SERVICE.read_path_symbols(workspace_id, path).model_dump(mode="json")
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Path not found")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/workspaces/{workspace_id}/path-symbols/materialize")
+def materialize_path_symbols(workspace_id: str, request: PostgresPathMaterializationRequest):
+    try:
+        return SERVICE.materialize_path_symbols_to_postgres(
+            workspace_id,
+            request.path,
+            dsn=request.dsn,
+            schema=request.schema_name,
+        ).model_dump(mode="json")
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Path not found")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/api/workspaces/{workspace_id}/semantic-index/materialize")
+def materialize_workspace_semantic_index(workspace_id: str, request: PostgresWorkspaceSemanticMaterializationRequest):
+    try:
+        return SERVICE.materialize_workspace_symbols_to_postgres(
+            workspace_id,
+            strategy=request.strategy,
+            paths=request.paths,
+            limit=request.limit,
+            dsn=request.dsn,
+            schema=request.schema_name,
+        ).model_dump(mode="json")
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/workspaces/{workspace_id}/semantic-search")
+def semantic_search(
+    workspace_id: str,
+    pattern: str = Query(...),
+    language: Optional[str] = Query(default=None),
+    path_glob: Optional[str] = Query(default=None),
+    limit: int = Query(default=50),
+):
+    try:
+        return SERVICE.search_semantic_pattern(
+            workspace_id,
+            pattern,
+            language=language,
+            path_glob=path_glob,
+            limit=limit,
+        ).model_dump(mode="json")
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+
+
+@app.post("/api/workspaces/{workspace_id}/semantic-search/materialize")
+def materialize_semantic_search(workspace_id: str, request: PostgresSemanticSearchMaterializationRequest):
+    try:
+        return SERVICE.materialize_semantic_search_to_postgres(
+            workspace_id,
+            request.pattern,
+            language=request.language,
+            path_glob=request.path_glob,
+            limit=request.limit,
+            dsn=request.dsn,
+            schema=request.schema_name,
+        ).model_dump(mode="json")
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 @app.post("/api/workspaces/{workspace_id}/scan")
@@ -862,6 +1023,16 @@ def approve_plan(workspace_id: str, run_id: str, request: PlanApproveRequest):
 def reject_plan(workspace_id: str, run_id: str, request: PlanRejectRequest):
     try:
         return SERVICE.reject_run_plan(workspace_id, run_id, request)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.patch("/api/workspaces/{workspace_id}/runs/{run_id}/plan/tracking")
+def update_plan_tracking(workspace_id: str, run_id: str, request: PlanTrackingUpdateRequest):
+    try:
+        return SERVICE.update_run_plan_tracking(workspace_id, run_id, request)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     except ValueError as exc:

@@ -290,6 +290,33 @@ class ScannerTests(unittest.TestCase):
             sorted((item.path, item.role) for item in rust_backed_summary.key_files),
         )
 
+    def test_build_repo_map_counts_only_repo_understanding_relevant_files(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            workspace_id = "workspace-3"
+            (root / "src").mkdir()
+            (root / "tests").mkdir()
+            (root / "docs").mkdir()
+            (root / "target").mkdir()
+            (root / "assets").mkdir()
+
+            (root / "README.md").write_text("# readme\n", encoding="utf-8")
+            (root / "src" / "app.py").write_text("print('ok')\n", encoding="utf-8")
+            (root / "tests" / "test_app.py").write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+            (root / "docs" / "notes.txt").write_text("not indexed\n", encoding="utf-8")
+            (root / "assets" / "logo.png").write_bytes(b"png")
+            (root / "target" / "debug.bin").write_bytes(b"bin")
+
+            summary = build_repo_map(root, workspace_id)
+
+        self.assertEqual(summary.total_files, 3)
+        self.assertEqual(summary.source_files, 2)
+        self.assertEqual(summary.test_files, 1)
+        self.assertEqual(
+            sorted((item.path, item.role) for item in summary.key_files),
+            [("README.md", "guide"), ("tests/test_app.py", "test")],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

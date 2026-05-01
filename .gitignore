@@ -15,6 +15,7 @@ backend/data/workspaces/*/runs/*.out.json
 backend/data/workspaces/*/terminals/*.log
 
 research/
+archive/
 
 # Rust build artifacts
 rust-core/target/

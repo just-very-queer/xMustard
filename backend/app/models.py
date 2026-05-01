@@ -19,6 +19,7 @@ IssueStatus = Literal[
 IssueSource = Literal["ledger", "verdict", "manual", "signal", "tracker"]
 RunStatus = Literal["queued", "planning", "running", "completed", "failed", "cancelled"]
 PlanPhase = Literal["pending", "generating", "awaiting_approval", "approved", "modified", "rejected", "executing"]
+PlanOwnershipMode = Literal["agent", "operator", "shared"]
 SignalKind = Literal["annotation", "exception_swallow", "not_implemented", "test_marker"]
 RuntimeKind = Literal["codex", "opencode"]
 FixStatus = Literal["proposed", "in_review", "applied", "verified", "rejected"]
@@ -36,6 +37,17 @@ BrowserDumpSource = Literal["mcp-chrome", "manual", "playwright", "other"]
 VulnerabilityFindingSource = Literal["manual", "nessus-json", "sarif", "semgrep-json", "trivy-json", "other"]
 VulnerabilitySeverity = Literal["critical", "high", "medium", "low", "info"]
 VulnerabilityStatus = Literal["open", "triaged", "fixing", "fixed", "verified", "closed"]
+IngestionPhaseId = Literal[
+    "repo_scan",
+    "repo_map",
+    "runtime_discovery",
+    "tree_sitter_index",
+    "ast_grep_rules",
+    "lsp_enrichment",
+    "search_materialization",
+]
+IngestionDeliveryState = Literal["complete", "ready", "blocked"]
+IngestionImplementationState = Literal["implemented", "partial", "planned"]
 
 
 def utc_now() -> str:
@@ -233,6 +245,391 @@ class AppSettings(BaseModel):
     codex_args: Optional[str] = None
     codex_model: Optional[str] = None
     opencode_model: Optional[str] = None
+    postgres_dsn: Optional[str] = None
+    postgres_schema: str = "xmustard"
+
+
+class PostgresSchemaPlan(BaseModel):
+    configured: bool = False
+    dsn_redacted: Optional[str] = None
+    schema_name: str = "xmustard"
+    sql_path: str
+    statement_count: int = 0
+    table_names: list[str] = Field(default_factory=list)
+    semantic_table_names: list[str] = Field(default_factory=list)
+    ops_memory_table_names: list[str] = Field(default_factory=list)
+    search_document_tables: list[str] = Field(default_factory=list)
+    generated_at: str = Field(default_factory=utc_now)
+
+
+class PostgresBootstrapRequest(BaseModel):
+    dsn: Optional[str] = None
+    schema_name: Optional[str] = None
+
+
+class PostgresBootstrapResult(BaseModel):
+    applied: bool = False
+    dsn_redacted: Optional[str] = None
+    schema_name: str = "xmustard"
+    sql_path: str
+    statement_count: int = 0
+    table_names: list[str] = Field(default_factory=list)
+    semantic_table_names: list[str] = Field(default_factory=list)
+    search_document_tables: list[str] = Field(default_factory=list)
+    message: str
+    generated_at: str = Field(default_factory=utc_now)
+
+
+class PostgresPathMaterializationRequest(BaseModel):
+    path: str
+    dsn: Optional[str] = None
+    schema_name: Optional[str] = None
+
+
+class PostgresSemanticSearchMaterializationRequest(BaseModel):
+    pattern: str
+    language: Optional[str] = None
+    path_glob: Optional[str] = None
+    limit: int = 50
+    dsn: Optional[str] = None
+    schema_name: Optional[str] = None
+
+
+class PostgresWorkspaceSemanticMaterializationRequest(BaseModel):
+    strategy: Literal["key_files", "paths"] = "key_files"
+    paths: list[str] = Field(default_factory=list)
+    limit: int = 12
+    dsn: Optional[str] = None
+    schema_name: Optional[str] = None
+
+
+class SemanticIndexPathSelection(BaseModel):
+    path: str
+    role: Literal["guide", "config", "entry", "test", "source", "doc", "asset", "unknown"] = "unknown"
+    score: int = 0
+    reason: str = ""
+    sha256: Optional[str] = None
+
+
+class SemanticIndexPlan(BaseModel):
+    workspace_id: str
+    root_path: str
+    surface: Literal["cli", "web", "all"] = "cli"
+    strategy: Literal["key_files", "paths"] = "key_files"
+    requested_paths: list[str] = Field(default_factory=list)
+    selected_paths: list[str] = Field(default_factory=list)
+    selected_path_details: list[SemanticIndexPathSelection] = Field(default_factory=list)
+    head_sha: Optional[str] = None
+    dirty_files: int = 0
+    worktree_dirty: bool = False
+    index_fingerprint: Optional[str] = None
+    postgres_configured: bool = False
+    postgres_schema: str = "xmustard"
+    tree_sitter_available: bool = False
+    ast_grep_available: bool = False
+    run_target_count: int = 0
+    verify_target_count: int = 0
+    retrieval_ledger: list["ContextRetrievalLedgerEntry"] = Field(default_factory=list)
+    blockers: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    next_actions: list[str] = Field(default_factory=list)
+    can_run: bool = False
+    generated_at: str = Field(default_factory=utc_now)
+
+
+class PostgresSemanticMaterializationResult(BaseModel):
+    applied: bool = False
+    dsn_redacted: Optional[str] = None
+    schema_name: str = "xmustard"
+    workspace_id: str
+    source: Literal["path_symbols", "semantic_search"] = "path_symbols"
+    target: str
+    materialized_paths: list[str] = Field(default_factory=list)
+    file_rows: int = 0
+    symbol_rows: int = 0
+    summary_rows: int = 0
+    query_rows: int = 0
+    match_rows: int = 0
+    message: str
+    generated_at: str = Field(default_factory=utc_now)
+
+
+class PostgresWorkspaceSemanticMaterializationResult(BaseModel):
+    applied: bool = False
+    dsn_redacted: Optional[str] = None
+    schema_name: str = "xmustard"
+    workspace_id: str
+    strategy: Literal["key_files", "paths"] = "key_files"
+    requested_paths: list[str] = Field(default_factory=list)
+    materialized_paths: list[str] = Field(default_factory=list)
+    skipped_paths: list[str] = Field(default_factory=list)
+    file_rows: int = 0
+    symbol_rows: int = 0
+    summary_rows: int = 0
+    message: str
+    generated_at: str = Field(default_factory=utc_now)
+
+
+class SemanticIndexRunResult(BaseModel):
+    workspace_id: str
+    surface: Literal["cli", "web", "all"] = "cli"
+    dry_run: bool = False
+    plan: SemanticIndexPlan
+    materialization: Optional[PostgresWorkspaceSemanticMaterializationResult] = None
+    message: str
+    generated_at: str = Field(default_factory=utc_now)
+
+
+class SemanticIndexBaselineRecord(BaseModel):
+    index_run_id: str
+    workspace_id: str
+    surface: Literal["cli", "web", "all"] = "cli"
+    strategy: Literal["key_files", "paths"] = "key_files"
+    index_fingerprint: str
+    head_sha: Optional[str] = None
+    dirty_files: int = 0
+    worktree_dirty: bool = False
+    selected_paths: list[str] = Field(default_factory=list)
+    selected_path_details: list[SemanticIndexPathSelection] = Field(default_factory=list)
+    materialized_paths: list[str] = Field(default_factory=list)
+    file_rows: int = 0
+    symbol_rows: int = 0
+    summary_rows: int = 0
+    postgres_schema: str = "xmustard"
+    tree_sitter_available: bool = False
+    ast_grep_available: bool = False
+    created_at: str = Field(default_factory=utc_now)
+
+
+class SemanticIndexStatus(BaseModel):
+    workspace_id: str
+    surface: Literal["cli", "web", "all"] = "cli"
+    status: Literal["fresh", "stale", "dirty_provisional", "no_baseline", "blocked"] = "no_baseline"
+    postgres_configured: bool = False
+    postgres_schema: str = "xmustard"
+    current_fingerprint: Optional[str] = None
+    current_head_sha: Optional[str] = None
+    current_dirty_files: int = 0
+    baseline: Optional[SemanticIndexBaselineRecord] = None
+    fingerprint_match: bool = False
+    stale_reasons: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    generated_at: str = Field(default_factory=utc_now)
+
+
+class IngestionDependencyRecord(BaseModel):
+    dependency_id: str
+    kind: Literal["workspace", "artifact", "setting", "tool", "implementation"] = "artifact"
+    label: str
+    satisfied: bool = False
+    detail: Optional[str] = None
+
+
+class IngestionPhaseRecord(BaseModel):
+    phase_id: IngestionPhaseId
+    label: str
+    description: str
+    implementation_state: IngestionImplementationState = "planned"
+    delivery_state: IngestionDeliveryState = "blocked"
+    dependencies: list[IngestionDependencyRecord] = Field(default_factory=list)
+    blockers: list[str] = Field(default_factory=list)
+    outputs: list[str] = Field(default_factory=list)
+    evidence: list[str] = Field(default_factory=list)
+
+
+class IngestionPipelinePlan(BaseModel):
+    workspace_id: str
+    root_path: str
+    postgres_configured: bool = False
+    postgres_schema: str = "xmustard"
+    phases: list[IngestionPhaseRecord] = Field(default_factory=list)
+    completed_phase_count: int = 0
+    ready_phase_ids: list[IngestionPhaseId] = Field(default_factory=list)
+    blocked_phase_ids: list[IngestionPhaseId] = Field(default_factory=list)
+    next_phase_id: Optional[IngestionPhaseId] = None
+    generated_at: str = Field(default_factory=utc_now)
+
+
+class RepoChangeRecord(BaseModel):
+    path: str
+    status: Literal["modified", "added", "deleted", "renamed", "copied", "untracked", "unknown"] = "unknown"
+    scope: Literal["since_ref", "working_tree"] = "working_tree"
+    previous_path: Optional[str] = None
+    staged: bool = False
+    unstaged: bool = False
+
+
+class RepoChangeSummary(BaseModel):
+    workspace_id: str
+    base_ref: str = "HEAD"
+    is_git_repo: bool = False
+    branch: Optional[str] = None
+    head_sha: Optional[str] = None
+    dirty_files: int = 0
+    changed_files: list[RepoChangeRecord] = Field(default_factory=list)
+    generated_at: str = Field(default_factory=utc_now)
+
+
+class ChangedSymbolRecord(BaseModel):
+    path: str
+    symbol: str
+    kind: Literal["function", "class", "method", "type", "module"] = "function"
+    line_start: Optional[int] = None
+    line_end: Optional[int] = None
+    evidence_source: Literal["stored_semantic", "on_demand_parser"] = "on_demand_parser"
+    semantic_status: Optional[Literal["fresh", "stale", "dirty_provisional", "no_baseline", "blocked"]] = None
+    selection_reason: str = ""
+    change_scopes: list[Literal["since_ref", "working_tree"]] = Field(default_factory=list)
+    change_statuses: list[str] = Field(default_factory=list)
+
+
+class ImpactPathRecord(BaseModel):
+    path: str
+    reason: str
+    derivation_source: Literal["lexical", "structural", "hybrid"] = "lexical"
+    score: int = 0
+
+
+class ImpactReport(BaseModel):
+    workspace_id: str
+    base_ref: str = "HEAD"
+    semantic_status: Optional["SemanticIndexStatus"] = None
+    changed_files: list[RepoChangeRecord] = Field(default_factory=list)
+    changed_symbols: list[ChangedSymbolRecord] = Field(default_factory=list)
+    likely_affected_files: list[ImpactPathRecord] = Field(default_factory=list)
+    likely_affected_tests: list[ImpactPathRecord] = Field(default_factory=list)
+    derivation_summary: str = ""
+    confidence: Literal["low", "medium", "high"] = "low"
+    warnings: list[str] = Field(default_factory=list)
+    generated_at: str = Field(default_factory=utc_now)
+
+
+class RepoTargetRecord(BaseModel):
+    target_id: str
+    kind: Literal["dev", "run", "build", "test", "lint", "verify", "service", "other"] = "other"
+    label: str
+    command: str
+    source: Literal["package_json", "makefile", "docker_compose", "verification_profile", "heuristic"] = "heuristic"
+    source_path: str
+    confidence: int = 50
+
+
+class CodeExplainerResult(BaseModel):
+    workspace_id: str
+    path: str
+    role: Literal["guide", "config", "entry", "test", "source", "doc", "asset", "unknown"] = "unknown"
+    line_count: int = 0
+    import_count: int = 0
+    detected_symbols: list[str] = Field(default_factory=list)
+    symbol_source: Literal["tree_sitter", "regex", "none"] = "none"
+    parser_language: Optional[str] = None
+    evidence_source: Literal["stored_semantic", "on_demand_parser"] = "on_demand_parser"
+    selection_reason: str = ""
+    semantic_status: Optional["SemanticIndexStatus"] = None
+    summary: str
+    hints: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    generated_at: str = Field(default_factory=utc_now)
+
+
+class PathSymbolsResult(BaseModel):
+    workspace_id: str
+    path: str
+    symbol_source: Literal["tree_sitter", "regex", "none"] = "none"
+    parser_language: Optional[str] = None
+    evidence_source: Literal["stored_semantic", "on_demand_parser"] = "on_demand_parser"
+    selection_reason: str = ""
+    semantic_status: Optional["SemanticIndexStatus"] = None
+    symbols: list["RepoMapSymbolRecord"] = Field(default_factory=list)
+    file_summary_row: Optional["FileSymbolSummaryMaterializationRecord"] = None
+    symbol_rows: list["SymbolMaterializationRecord"] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    generated_at: str = Field(default_factory=utc_now)
+
+
+class SemanticPatternMatchRecord(BaseModel):
+    path: str
+    language: Optional[str] = None
+    line_start: Optional[int] = None
+    line_end: Optional[int] = None
+    column_start: Optional[int] = None
+    column_end: Optional[int] = None
+    matched_text: str
+    context_lines: Optional[str] = None
+    meta_variables: list[str] = Field(default_factory=list)
+    reason: Optional[str] = None
+    score: int = 0
+
+
+class FileSymbolSummaryMaterializationRecord(BaseModel):
+    workspace_id: str
+    path: str
+    language: Optional[str] = None
+    parser_language: Optional[str] = None
+    symbol_source: Literal["tree_sitter", "regex", "none"] = "none"
+    symbol_count: int = 0
+    summary_json: dict = Field(default_factory=dict)
+
+
+class SymbolMaterializationRecord(BaseModel):
+    workspace_id: str
+    path: str
+    symbol: str
+    kind: Literal["function", "class", "method", "type", "module"] = "function"
+    language: Optional[str] = None
+    line_start: Optional[int] = None
+    line_end: Optional[int] = None
+    enclosing_scope: Optional[str] = None
+    signature_text: Optional[str] = None
+    symbol_text: Optional[str] = None
+
+
+class SemanticQueryMaterializationRecord(BaseModel):
+    query_ref: str
+    workspace_id: str
+    issue_id: Optional[str] = None
+    run_id: Optional[str] = None
+    source: Literal["adhoc_tool", "issue_context"] = "adhoc_tool"
+    reason: Optional[str] = None
+    pattern: str
+    language: Optional[str] = None
+    path_glob: Optional[str] = None
+    engine: Literal["ast_grep", "none"] = "none"
+    match_count: int = 0
+    truncated: bool = False
+    error: Optional[str] = None
+
+
+class SemanticMatchMaterializationRecord(BaseModel):
+    query_ref: str
+    workspace_id: str
+    path: str
+    language: Optional[str] = None
+    line_start: Optional[int] = None
+    line_end: Optional[int] = None
+    column_start: Optional[int] = None
+    column_end: Optional[int] = None
+    matched_text: str
+    context_lines: Optional[str] = None
+    meta_variables: list[str] = Field(default_factory=list)
+    reason: Optional[str] = None
+    score: int = 0
+
+
+class SemanticPatternQueryResult(BaseModel):
+    workspace_id: str
+    pattern: str
+    language: Optional[str] = None
+    path_glob: Optional[str] = None
+    engine: Literal["ast_grep", "none"] = "none"
+    binary_path: Optional[str] = None
+    match_count: int = 0
+    truncated: bool = False
+    matches: list[SemanticPatternMatchRecord] = Field(default_factory=list)
+    query_row: Optional[SemanticQueryMaterializationRecord] = None
+    match_rows: list[SemanticMatchMaterializationRecord] = Field(default_factory=list)
+    error: Optional[str] = None
+    generated_at: str = Field(default_factory=utc_now)
 
 
 class ActivityActor(BaseModel):
@@ -291,6 +688,18 @@ class ActivityOverview(BaseModel):
     top_actions: list[ActivityRollupItem] = Field(default_factory=list)
     top_entities: list[ActivityRollupItem] = Field(default_factory=list)
     most_recent_at: Optional[str] = None
+
+
+class RepoToolState(BaseModel):
+    workspace: WorkspaceRecord
+    snapshot_summary: dict[str, int] = Field(default_factory=dict)
+    worktree: WorktreeStatus = Field(default_factory=WorktreeStatus)
+    repo_map: Optional[RepoMapSummary] = None
+    activity_overview: Optional[ActivityOverview] = None
+    recent_activity: list[ActivityRecord] = Field(default_factory=list)
+    repo_config_health: Optional["RepoConfigHealth"] = None
+    guidance_health: Optional["RepoGuidanceHealth"] = None
+    generated_at: str = Field(default_factory=utc_now)
 
 
 class LocalAgentCapabilities(BaseModel):
@@ -635,6 +1044,28 @@ class PlanStep(BaseModel):
     risks: list[str] = Field(default_factory=list)
 
 
+class PlanFileAttachment(BaseModel):
+    path: str
+    source: Literal["step", "manual", "observed"] = "step"
+    note: Optional[str] = None
+    exists: Optional[bool] = None
+
+
+class PlanRevision(BaseModel):
+    revision_id: str
+    version: int = 1
+    phase: PlanPhase = "pending"
+    summary: str = ""
+    feedback: Optional[str] = None
+    ownership_mode: PlanOwnershipMode = "agent"
+    owner_label: Optional[str] = None
+    branch: Optional[str] = None
+    head_sha: Optional[str] = None
+    dirty_paths: list[str] = Field(default_factory=list)
+    attached_files: list[PlanFileAttachment] = Field(default_factory=list)
+    created_at: str = Field(default_factory=utc_now)
+
+
 class RunPlan(BaseModel):
     plan_id: str
     run_id: str
@@ -642,7 +1073,16 @@ class RunPlan(BaseModel):
     steps: list[PlanStep] = Field(default_factory=list)
     summary: str = ""
     reasoning: Optional[str] = None
+    version: int = 1
+    ownership_mode: PlanOwnershipMode = "agent"
+    owner_label: Optional[str] = None
+    branch: Optional[str] = None
+    head_sha: Optional[str] = None
+    dirty_paths: list[str] = Field(default_factory=list)
+    attached_files: list[PlanFileAttachment] = Field(default_factory=list)
+    revisions: list[PlanRevision] = Field(default_factory=list)
     created_at: str = Field(default_factory=utc_now)
+    updated_at: str = Field(default_factory=utc_now)
     approved_at: Optional[str] = None
     approver: Optional[str] = None
     feedback: Optional[str] = None
@@ -1015,6 +1455,7 @@ class RepoMapSymbolRecord(BaseModel):
     line_start: Optional[int] = None
     line_end: Optional[int] = None
     enclosing_scope: Optional[str] = None
+    evidence_source: Literal["stored_semantic", "on_demand_parser"] = "on_demand_parser"
     reason: Optional[str] = None
     score: int = 0
 
@@ -1031,7 +1472,20 @@ class RelatedContextRecord(BaseModel):
 
 class ContextRetrievalLedgerEntry(BaseModel):
     entry_id: str
-    source_type: Literal["evidence", "related_path", "symbol", "artifact", "guidance", "path_instruction"]
+    source_type: Literal[
+        "evidence",
+        "related_path",
+        "stored_symbol",
+        "on_demand_symbol",
+        "semantic_match",
+        "stored_semantic_match",
+        "semantic_index_path",
+        "lexical_hit",
+        "structural_hit",
+        "artifact",
+        "guidance",
+        "path_instruction",
+    ]
     source_id: str
     title: str
     path: Optional[str] = None
@@ -1040,8 +1494,29 @@ class ContextRetrievalLedgerEntry(BaseModel):
     score: int = 0
 
 
+class RetrievalSearchHit(BaseModel):
+    path: str
+    source_type: Literal["lexical_hit", "structural_hit", "stored_symbol", "stored_semantic_match"] = "lexical_hit"
+    title: str
+    reason: str
+    matched_terms: list[str] = Field(default_factory=list)
+    score: int = 0
+
+
+class RetrievalSearchResult(BaseModel):
+    workspace_id: str
+    query: str
+    hits: list[RetrievalSearchHit] = Field(default_factory=list)
+    retrieval_ledger: list[ContextRetrievalLedgerEntry] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    generated_at: str = Field(default_factory=utc_now)
+
+
 class DynamicContextBundle(BaseModel):
     symbol_context: list[RepoMapSymbolRecord] = Field(default_factory=list)
+    semantic_matches: list[SemanticPatternMatchRecord] = Field(default_factory=list)
+    semantic_queries: list[SemanticQueryMaterializationRecord] = Field(default_factory=list)
+    semantic_match_rows: list[SemanticMatchMaterializationRecord] = Field(default_factory=list)
     related_context: list[RelatedContextRecord] = Field(default_factory=list)
 
 
@@ -1094,6 +1569,7 @@ class RepoConfigHealth(BaseModel):
 class IssueContextPacket(BaseModel):
     issue: IssueRecord
     workspace: WorkspaceRecord
+    semantic_status: Optional[SemanticIndexStatus] = None
     tree_focus: list[str] = Field(default_factory=list)
     related_paths: list[str] = Field(default_factory=list)
     evidence_bundle: list[EvidenceRef] = Field(default_factory=list)
@@ -1114,6 +1590,59 @@ class IssueContextPacket(BaseModel):
     matched_path_instructions: list[RepoPathInstructionMatch] = Field(default_factory=list)
     worktree: Optional[WorktreeStatus] = None
     prompt: str
+
+
+class RepoContextTargetLink(BaseModel):
+    target: RepoTargetRecord
+    reason: str
+    score: int = 0
+
+
+class RepoContextPlanLink(BaseModel):
+    run_id: str
+    issue_id: str
+    status: RunStatus
+    phase: Optional[PlanPhase] = None
+    ownership_mode: Optional[PlanOwnershipMode] = None
+    owner_label: Optional[str] = None
+    attached_files: list[str] = Field(default_factory=list)
+    reason: str
+    score: int = 0
+
+
+class RepoContextActivityLink(BaseModel):
+    action: str
+    summary: str
+    issue_id: Optional[str] = None
+    run_id: Optional[str] = None
+    created_at: str
+    reason: str
+    score: int = 0
+
+
+class RepoContextFixLink(BaseModel):
+    fix_id: str
+    issue_id: str
+    run_id: Optional[str] = None
+    summary: str
+    changed_files: list[str] = Field(default_factory=list)
+    tests_run: list[str] = Field(default_factory=list)
+    recorded_at: str
+    reason: str
+
+
+class RepoContextRecord(BaseModel):
+    workspace_id: str
+    base_ref: str = "HEAD"
+    semantic_status: Optional[SemanticIndexStatus] = None
+    impact: ImpactReport
+    run_targets: list[RepoContextTargetLink] = Field(default_factory=list)
+    verify_targets: list[RepoContextTargetLink] = Field(default_factory=list)
+    plan_links: list[RepoContextPlanLink] = Field(default_factory=list)
+    recent_activity: list[RepoContextActivityLink] = Field(default_factory=list)
+    latest_accepted_fix: Optional[RepoContextFixLink] = None
+    retrieval_ledger: list[ContextRetrievalLedgerEntry] = Field(default_factory=list)
+    generated_at: str = Field(default_factory=utc_now)
 
 
 class RepoGuidanceRecord(BaseModel):
@@ -1200,6 +1729,14 @@ class PlanApproveRequest(BaseModel):
 
 class PlanRejectRequest(BaseModel):
     reason: str
+
+
+class PlanTrackingUpdateRequest(BaseModel):
+    ownership_mode: Optional[PlanOwnershipMode] = None
+    owner_label: Optional[str] = None
+    attached_files: list[str] = Field(default_factory=list)
+    replace_attachments: bool = False
+    feedback: Optional[str] = None
 
 
 class RunMetrics(BaseModel):

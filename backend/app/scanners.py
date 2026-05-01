@@ -35,6 +35,7 @@ SCANNER_EXCLUDED_DIR_NAMES = {
     ".ruff_cache",
     ".turbo",
     ".next",
+    "target",
     "node_modules",
     "dist",
     "build",
@@ -100,6 +101,7 @@ REPO_MAP_KEY_FILE_PATTERNS: list[tuple[str, str]] = [
     ("backend/app/service.py", "entry"),
     ("frontend/src/App.tsx", "entry"),
 ]
+REPO_MAP_KEY_FILE_LOOKUP = {pattern: role for pattern, role in REPO_MAP_KEY_FILE_PATTERNS}
 
 
 def normalize_status(value: str) -> str:
@@ -405,6 +407,20 @@ def should_scan_file(relative_path: Path) -> bool:
     return relative_path.suffix.lower() in SCANNABLE_SOURCE_EXTENSIONS
 
 
+def repo_map_file_role(relative_path: Path) -> Optional[str]:
+    normalized = relative_path.as_posix()
+    role = REPO_MAP_KEY_FILE_LOOKUP.get(normalized)
+    if role:
+        return role
+    lowered = normalized.lower()
+    is_test = "/tests/" in f"/{lowered}/" or lowered.startswith("tests/") or Path(lowered).name.startswith("test_")
+    if is_test:
+        return "test"
+    if should_scan_file(relative_path):
+        return "source"
+    return None
+
+
 def _content_matches_signal(kind: str, pattern: str, content: str) -> bool:
     matcher = re.compile(pattern)
     matches = list(matcher.finditer(content))
@@ -617,14 +633,16 @@ def build_repo_map(root_path: Path, workspace_id: str) -> RepoMapSummary:
             full_path = root_path / relative_path
             if not full_path.is_file():
                 continue
-            total_files += 1
             normalized = relative_path.as_posix()
-            lowered = normalized.lower()
+            role = repo_map_file_role(relative_path)
+            if role is None:
+                continue
+            total_files += 1
             top_dir = relative_path.parts[0] if len(relative_path.parts) > 1 else "."
             top_level[top_dir]["file_count"] += 1
 
             is_source = should_scan_file(relative_path)
-            is_test = "/tests/" in f"/{lowered}/" or lowered.startswith("tests/") or Path(lowered).name.startswith("test_")
+            is_test = role == "test"
             if is_source:
                 source_files += 1
                 top_level[top_dir]["source_file_count"] += 1
@@ -633,10 +651,10 @@ def build_repo_map(root_path: Path, workspace_id: str) -> RepoMapSummary:
                 test_files += 1
                 top_level[top_dir]["test_file_count"] += 1
 
-            for pattern, role in REPO_MAP_KEY_FILE_PATTERNS:
+            for pattern, file_role in REPO_MAP_KEY_FILE_PATTERNS:
                 if normalized == pattern and normalized not in discovered_key_paths:
                     discovered_key_paths.add(normalized)
-                    key_files.append(RepoMapFileRecord(path=normalized, role=role, size_bytes=full_path.stat().st_size))
+                    key_files.append(RepoMapFileRecord(path=normalized, role=file_role, size_bytes=full_path.stat().st_size))
             if is_test and normalized not in discovered_key_paths and len(key_files) < 12:
                 discovered_key_paths.add(normalized)
                 key_files.append(RepoMapFileRecord(path=normalized, role="test", size_bytes=full_path.stat().st_size))
