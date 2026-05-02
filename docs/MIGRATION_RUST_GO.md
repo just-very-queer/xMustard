@@ -211,7 +211,13 @@ That boundary work is now live for three concrete slices:
 - The Go API shell now owns the `external_integrations_gateway` cutline too: plugin-manifest-backed integration config/test routes, GitHub issue import + PR creation, Slack notifications, and Linear/Jira issue sync now persist through Go while keeping ticket-context/activity artifacts and the existing `backend/data/integrations/` compatibility layout.
 - The Go API shell now owns repo-config reads at `/api/workspaces/{workspace_id}/repo-config` and `/api/workspaces/{workspace_id}/repo-config/health`, and issue-context packets built in Go now include `.xmustard.yaml` path instructions and MCP/browser-context hints.
 - FastAPI no longer registers the integration config/test/sync HTTP handlers in `backend/app/main.py`, so the external integrations gateway now leaves Python on the live request path while preserving the same route paths through Go.
-- Python still owns the live FastAPI semantic-search and Postgres semantic materialization routes; do not treat those request paths as Go-owned until handlers actually move.
+- The Go API shell now also owns the live semantic-search and Postgres semantic materialization request paths:
+  - `/api/workspaces/{workspace_id}/path-symbols/materialize`
+  - `/api/workspaces/{workspace_id}/semantic-index/materialize`
+  - `/api/workspaces/{workspace_id}/semantic-search`
+  - `/api/workspaces/{workspace_id}/semantic-search/materialize`
+- FastAPI no longer registers those semantic-search/materialization HTTP handlers in `backend/app/main.py`, so Python is no longer the live request-path owner for this route group.
+- Python still owns CLI compatibility, semantic baseline persistence/readback, and compatibility helpers behind `TrackerService`; do not mistake that for a full Python exit.
 - Python parity tests now compare live Python behavior against the Rust outputs for:
   - signal scanning
   - repo-map summaries

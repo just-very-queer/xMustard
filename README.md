@@ -25,8 +25,9 @@ The first Phase 3 authority cuts are already landed:
 - Rust owns semantic impact calculation, changed-symbol extraction, provenance, and affected file/test ranking
 - Rust owns on-demand `path-symbols` extraction, the code-explainer semantic substrate, and storage-ready symbol materialization rows consumed by Go delivery and Python compatibility fallback
 - Go now also owns the Postgres foundation delivery slice for settings-backed schema plan/render/bootstrap
+- Go now owns the live semantic-search plus Postgres semantic materialization HTTP slice for `path-symbols/materialize`, `semantic-index/materialize`, and `semantic-search/materialize`
 
-Completion audit truth on 2026-05-02: xMustard is still mixed-mode, not Python-exited. Go and Rust own real shipped slices, but Python still remains in the authority path for FastAPI semantic-search/materialization routes, the Typer `semantic-index` and operator CLI surface, `TrackerService` compatibility assembly, and semantic baseline/materialization helpers.
+Completion audit truth on 2026-05-02: xMustard is still mixed-mode, not Python-exited. Go and Rust own real shipped slices, but Python still remains in the authority path through the Typer `semantic-index` and operator CLI surface, `TrackerService` compatibility assembly, and semantic baseline/materialization helpers.
 
 ## What xMustard Is
 
@@ -74,6 +75,7 @@ Phase 3 work now includes:
 - Rust-owned on-demand path-symbol extraction consumed by Go `path-symbols` delivery
 - Rust-owned code-explainer substrate for `explain-path`, including path role, line/import counts, detected symbols, summary, hints, and provenance
 - Rust-owned file-symbol summary and symbol-row shaping for on-demand `path-symbols`, so Python compatibility no longer has to shape those Postgres-ready rows when stored semantic state is absent
+- Go-owned semantic-search and semantic materialization delivery for the live HTTP paths that write path-symbol, workspace semantic-index batch, and semantic-search rows into Postgres
 - a durable Python exit map to track what still belongs in Python temporarily and what should move next
 
 ## What This Repo Is Becoming
@@ -117,6 +119,8 @@ cd backend
 python3 -m pip install .
 uvicorn app.main:app --reload --port 8042
 ```
+
+The Python shell is now compatibility-only for the remaining Python routes and CLI workflows. The Go-owned Postgres foundation and semantic materialization/search HTTP surfaces are served from `api-go`, not `backend/app/main.py`.
 
 Frontend setup:
 

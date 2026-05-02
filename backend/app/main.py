@@ -22,10 +22,6 @@ from .models import (
     PlanApproveRequest,
     PlanRejectRequest,
     PlanTrackingUpdateRequest,
-    PostgresBootstrapRequest,
-    PostgresPathMaterializationRequest,
-    PostgresSemanticSearchMaterializationRequest,
-    PostgresWorkspaceSemanticMaterializationRequest,
     PromoteSignalRequest,
     RunAcceptRequest,
     RuntimeProbeRequest,
@@ -87,26 +83,6 @@ def get_settings():
 @app.post("/api/settings")
 def update_settings(settings: AppSettings):
     return SERVICE.update_settings(settings).model_dump(mode="json")
-
-
-@app.get("/api/postgres/plan")
-def postgres_plan():
-    return SERVICE.read_postgres_schema_plan().model_dump(mode="json")
-
-
-@app.get("/api/postgres/render")
-def postgres_render(schema: Optional[str] = Query(default=None)):
-    return {"sql": SERVICE.render_postgres_schema_sql(schema=schema)}
-
-
-@app.post("/api/postgres/bootstrap")
-def postgres_bootstrap(request: PostgresBootstrapRequest):
-    try:
-        return SERVICE.bootstrap_postgres_schema(dsn=request.dsn, schema=request.schema_name).model_dump(mode="json")
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    except RuntimeError as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
 
 
 @app.get("/api/agent/capabilities")
@@ -526,82 +502,6 @@ def path_symbols(workspace_id: str, path: str = Query(...)):
         raise HTTPException(status_code=404, detail="Path not found")
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
-
-
-@app.post("/api/workspaces/{workspace_id}/path-symbols/materialize")
-def materialize_path_symbols(workspace_id: str, request: PostgresPathMaterializationRequest):
-    try:
-        return SERVICE.materialize_path_symbols_to_postgres(
-            workspace_id,
-            request.path,
-            dsn=request.dsn,
-            schema=request.schema_name,
-        ).model_dump(mode="json")
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="Path not found")
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    except RuntimeError as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-
-@app.post("/api/workspaces/{workspace_id}/semantic-index/materialize")
-def materialize_workspace_semantic_index(workspace_id: str, request: PostgresWorkspaceSemanticMaterializationRequest):
-    try:
-        return SERVICE.materialize_workspace_symbols_to_postgres(
-            workspace_id,
-            strategy=request.strategy,
-            paths=request.paths,
-            limit=request.limit,
-            dsn=request.dsn,
-            schema=request.schema_name,
-        ).model_dump(mode="json")
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="Workspace not found")
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    except RuntimeError as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-
-@app.get("/api/workspaces/{workspace_id}/semantic-search")
-def semantic_search(
-    workspace_id: str,
-    pattern: str = Query(...),
-    language: Optional[str] = Query(default=None),
-    path_glob: Optional[str] = Query(default=None),
-    limit: int = Query(default=50),
-):
-    try:
-        return SERVICE.search_semantic_pattern(
-            workspace_id,
-            pattern,
-            language=language,
-            path_glob=path_glob,
-            limit=limit,
-        ).model_dump(mode="json")
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="Workspace not found")
-
-
-@app.post("/api/workspaces/{workspace_id}/semantic-search/materialize")
-def materialize_semantic_search(workspace_id: str, request: PostgresSemanticSearchMaterializationRequest):
-    try:
-        return SERVICE.materialize_semantic_search_to_postgres(
-            workspace_id,
-            request.pattern,
-            language=request.language,
-            path_glob=request.path_glob,
-            limit=request.limit,
-            dsn=request.dsn,
-            schema=request.schema_name,
-        ).model_dump(mode="json")
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="Workspace not found")
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    except RuntimeError as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
 
 
 @app.post("/api/workspaces/{workspace_id}/scan")

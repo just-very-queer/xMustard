@@ -6,7 +6,7 @@ Phase 2 is complete for xMustard. External validation workspace dirtiness is not
 
 This map is grounded in the current repository shape: Python still carries the compatibility CLI and much of the orchestration brain, Go already owns a large API delivery shell, Rust owns repo-map/scanner/verification primitives, and Postgres is the durable semantic storage direction.
 
-Completion-pass audit truth on 2026-05-02: xMustard is still in mixed mode. Python remains in the shipped authority path through FastAPI semantic-search/materialization routes, the Typer `semantic-index` and operator CLI surface, `TrackerService` orchestration, and semantic baseline/materialization helpers.
+Completion-pass audit truth on 2026-05-02: xMustard is still in mixed mode. Python remains in the shipped authority path through the Typer `semantic-index` and operator CLI surface, `TrackerService` orchestration, and semantic baseline/materialization helpers.
 
 ## Inventory Buckets
 
@@ -122,7 +122,21 @@ This completion pass moved the first Postgres foundation delivery slice into Go:
   - `POST /api/postgres/bootstrap`
 - Go settings now round-trip `postgres_dsn` and `postgres_schema`, so the foundation endpoints no longer need Python to read or write their configuration contract.
 
-This is not full Postgres ownership exit. Python still owns semantic row materialization, semantic baseline persistence/readback, and the FastAPI request paths that expose those helpers.
+This is not full Postgres ownership exit. Python still owns semantic baseline persistence/readback and compatibility helpers around semantic state.
+
+## Phase 3 FastAPI Semantic Route Reduction Landed
+
+This completion pass moved the remaining live FastAPI semantic-search and semantic materialization route group into Go:
+
+- `api-go/cmd/xmustard-api/main.go` now serves:
+  - `GET /api/workspaces/{workspace_id}/semantic-search`
+  - `POST /api/workspaces/{workspace_id}/path-symbols/materialize`
+  - `POST /api/workspaces/{workspace_id}/semantic-index/materialize`
+  - `POST /api/workspaces/{workspace_id}/semantic-search/materialize`
+- `api-go/internal/workspaceops/semantic_materialization.go` now owns ast-grep query delivery, Rust-backed path-symbol row delivery, workspace symbol batch materialization, semantic-search row shaping, and Postgres writes for that HTTP slice.
+- `backend/app/main.py` no longer registers those handlers, so Python is off the live request path for this route group.
+
+This is still not a full Python exit. Python continues to own the compatibility CLI, `TrackerService` orchestration, and semantic baseline persistence/readback helpers.
 
 ## Phase 3 Boundary
 

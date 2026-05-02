@@ -63,9 +63,9 @@
   },
   {
     "group": "workspace_semantic_materialization",
-    "current_owner": "backend/app/main.py + backend/app/service.py",
+    "current_owner": "api-go + rust-core",
     "target_owner": "api-go + rust-core",
-    "notes": "Semantic-search delivery and Postgres materialization hooks. Python still owns the live FastAPI request path for semantic-search, path-symbol materialization, and semantic-index materialization while the Go and Rust boundaries are still incomplete for this slice.",
+    "notes": "Semantic-search delivery and Postgres materialization hooks. The Go shell now owns the live request path for semantic-search, path-symbol materialization, workspace semantic-index batch materialization, and semantic-search materialization, while Rust supplies path-symbol row payloads and semantic meaning. Python remains only as CLI and baseline-helper compatibility code for this slice.",
     "endpoints": [
       "/api/workspaces/{workspace_id}/path-symbols/materialize",
       "/api/workspaces/{workspace_id}/semantic-index/materialize",

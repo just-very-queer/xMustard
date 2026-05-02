@@ -125,15 +125,40 @@ type PathSymbolRecord struct {
 }
 
 type PathSymbolsResult struct {
-	WorkspaceID     string             `json:"workspace_id"`
-	Path            string             `json:"path"`
-	SymbolSource    string             `json:"symbol_source"`
-	ParserLanguage  *string            `json:"parser_language,omitempty"`
-	EvidenceSource  string             `json:"evidence_source"`
-	SelectionReason string             `json:"selection_reason"`
-	Symbols         []PathSymbolRecord `json:"symbols"`
-	Warnings        []string           `json:"warnings"`
-	GeneratedAt     string             `json:"generated_at"`
+	WorkspaceID     string                                  `json:"workspace_id"`
+	Path            string                                  `json:"path"`
+	SymbolSource    string                                  `json:"symbol_source"`
+	ParserLanguage  *string                                 `json:"parser_language,omitempty"`
+	EvidenceSource  string                                  `json:"evidence_source"`
+	SelectionReason string                                  `json:"selection_reason"`
+	Symbols         []PathSymbolRecord                      `json:"symbols"`
+	FileSummaryRow  *FileSymbolSummaryMaterializationRecord `json:"file_summary_row,omitempty"`
+	SymbolRows      []SymbolMaterializationRecord           `json:"symbol_rows,omitempty"`
+	Warnings        []string                                `json:"warnings"`
+	GeneratedAt     string                                  `json:"generated_at"`
+}
+
+type FileSymbolSummaryMaterializationRecord struct {
+	WorkspaceID    string         `json:"workspace_id"`
+	Path           string         `json:"path"`
+	Language       *string        `json:"language,omitempty"`
+	ParserLanguage *string        `json:"parser_language,omitempty"`
+	SymbolSource   string         `json:"symbol_source"`
+	SymbolCount    int            `json:"symbol_count"`
+	SummaryJSON    map[string]any `json:"summary_json"`
+}
+
+type SymbolMaterializationRecord struct {
+	WorkspaceID    string  `json:"workspace_id"`
+	Path           string  `json:"path"`
+	Symbol         string  `json:"symbol"`
+	Kind           string  `json:"kind"`
+	Language       *string `json:"language,omitempty"`
+	LineStart      *int    `json:"line_start,omitempty"`
+	LineEnd        *int    `json:"line_end,omitempty"`
+	EnclosingScope *string `json:"enclosing_scope,omitempty"`
+	SignatureText  *string `json:"signature_text,omitempty"`
+	SymbolText     *string `json:"symbol_text,omitempty"`
 }
 
 type CodeExplainerResult struct {
@@ -445,6 +470,8 @@ func ReadPathSymbols(dataDir string, workspaceID string, relativePath string) (*
 		EvidenceSource:  rustResult.EvidenceSource,
 		SelectionReason: rustResult.SelectionReason,
 		Symbols:         convertRustPathSymbols(rustResult.Symbols),
+		FileSummaryRow:  convertRustFileSummaryRow(rustResult.FileSummaryRow),
+		SymbolRows:      convertRustSymbolRows(rustResult.SymbolRows),
 		Warnings:        rustResult.Warnings,
 		GeneratedAt:     rustResult.GeneratedAt,
 	}, nil
@@ -985,6 +1012,40 @@ func convertRustPathSymbols(items []rustcore.PathSymbolRecord) []PathSymbolRecor
 			EvidenceSource: item.EvidenceSource,
 			Reason:         item.Reason,
 			Score:          item.Score,
+		})
+	}
+	return out
+}
+
+func convertRustFileSummaryRow(item *rustcore.FileSymbolSummaryMaterializationRecord) *FileSymbolSummaryMaterializationRecord {
+	if item == nil {
+		return nil
+	}
+	return &FileSymbolSummaryMaterializationRecord{
+		WorkspaceID:    item.WorkspaceID,
+		Path:           item.Path,
+		Language:       item.Language,
+		ParserLanguage: item.ParserLanguage,
+		SymbolSource:   item.SymbolSource,
+		SymbolCount:    item.SymbolCount,
+		SummaryJSON:    item.SummaryJSON,
+	}
+}
+
+func convertRustSymbolRows(items []rustcore.SymbolMaterializationRecord) []SymbolMaterializationRecord {
+	out := make([]SymbolMaterializationRecord, 0, len(items))
+	for _, item := range items {
+		out = append(out, SymbolMaterializationRecord{
+			WorkspaceID:    item.WorkspaceID,
+			Path:           item.Path,
+			Symbol:         item.Symbol,
+			Kind:           item.Kind,
+			Language:       item.Language,
+			LineStart:      item.LineStart,
+			LineEnd:        item.LineEnd,
+			EnclosingScope: item.EnclosingScope,
+			SignatureText:  item.SignatureText,
+			SymbolText:     item.SymbolText,
 		})
 	}
 	return out
