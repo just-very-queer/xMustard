@@ -193,6 +193,7 @@ That boundary work is now live for three concrete slices:
 - The Go API shell now owns issue queue reads, issue drift reads, signal queue reads, and workspace drift summary reads from the persisted workspace snapshot.
 - The Go API shell now owns issue create/update plus saved-view list/create/update/delete against `snapshot.json`, `tracker_issues.json`, `issue_overrides.json`, and `saved_views.json`, including matching activity ledger entries.
 - The Go API shell now owns runtime listing, settings reads/writes, local agent capability reads, and workspace runtime probe flows while preserving the existing `settings.json` contract and runtime model validation behavior.
+- The Go API shell now owns Postgres schema plan/render/bootstrap too, including the persisted `postgres_dsn` and `postgres_schema` settings fields needed to drive those endpoints without re-entering Python for foundation delivery.
 - The Go API shell now owns issue-run creation, workspace query runs, run listing, run detail reads, run log reads, live run cancel/retry, run plan generate/read/approve/reject, run review submission, run acceptance, run insights, run metrics, workspace metrics, cost summaries, critique generation/read, improvement listing/dismissal, fix listing, fix recording, fix-draft generation, verification listing, and review-queue reads against the persisted run and tracker artifacts.
 - Verification profile checklist items and durable verification-profile history now persist through both Python and Go API paths, with confidence scoring attached to each saved execution record.
 - The Go API shell now owns verification-profile report reads, including runtime, model, and branch breakdowns that match the richer Python report shape.
@@ -210,6 +211,7 @@ That boundary work is now live for three concrete slices:
 - The Go API shell now owns the `external_integrations_gateway` cutline too: plugin-manifest-backed integration config/test routes, GitHub issue import + PR creation, Slack notifications, and Linear/Jira issue sync now persist through Go while keeping ticket-context/activity artifacts and the existing `backend/data/integrations/` compatibility layout.
 - The Go API shell now owns repo-config reads at `/api/workspaces/{workspace_id}/repo-config` and `/api/workspaces/{workspace_id}/repo-config/health`, and issue-context packets built in Go now include `.xmustard.yaml` path instructions and MCP/browser-context hints.
 - FastAPI no longer registers the integration config/test/sync HTTP handlers in `backend/app/main.py`, so the external integrations gateway now leaves Python on the live request path while preserving the same route paths through Go.
+- Python still owns the live FastAPI semantic-search and Postgres semantic materialization routes; do not treat those request paths as Go-owned until handlers actually move.
 - Python parity tests now compare live Python behavior against the Rust outputs for:
   - signal scanning
   - repo-map summaries

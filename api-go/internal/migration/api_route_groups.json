@@ -29,9 +29,9 @@
   },
   {
     "group": "workspace_snapshot",
-    "current_owner": "api-go",
+    "current_owner": "api-go + rust-core",
     "target_owner": "api-go",
-    "notes": "Workspace loading, snapshots, activity, sources, tree, guidance, repo config, repo-intelligence planning, structural symbol reads, semantic pattern queries, semantic Postgres materialization hooks, and export. The Go shell now owns workspace listing, fresh and cached workspace load, explicit workspace scan, snapshot reads, activity feeds, activity overview, sources, worktree reads, repo-state and ingestion-plan reads, change reads, run/verify target reads, impact reads, repo-context reads, retrieval-search reads, explain-path, path-symbol, path-symbol materialization, workspace semantic-index materialization, semantic-search reads, semantic-search materialization, tree browsing, guidance discovery, repo-config reads, repo-map reads, export bundle reads, and saved-view CRUD against the existing tracker workspace artifacts.",
+    "notes": "Workspace loading, snapshots, activity, sources, tree, guidance, repo config, repo-intelligence reads, and export. The Go shell now owns workspace listing, fresh and cached workspace load, explicit workspace scan, snapshot reads, activity feeds, activity overview, sources, worktree reads, repo-state and ingestion-plan reads, change reads, run/verify target reads, impact reads, repo-context reads, retrieval-search reads, explain-path, path-symbols, tree browsing, guidance discovery, repo-config reads, repo-map reads, export bundle reads, and saved-view CRUD against the existing tracker workspace artifacts.",
     "endpoints": [
       "/api/workspaces",
       "/api/workspaces/load",
@@ -50,10 +50,6 @@
       "/api/workspaces/{workspace_id}/retrieval-search",
       "/api/workspaces/{workspace_id}/explain-path",
       "/api/workspaces/{workspace_id}/path-symbols",
-      "/api/workspaces/{workspace_id}/path-symbols/materialize",
-      "/api/workspaces/{workspace_id}/semantic-index/materialize",
-      "/api/workspaces/{workspace_id}/semantic-search",
-      "/api/workspaces/{workspace_id}/semantic-search/materialize",
       "/api/workspaces/{workspace_id}/scan",
       "/api/workspaces/{workspace_id}/tree",
       "/api/workspaces/{workspace_id}/guidance",
@@ -63,6 +59,18 @@
       "/api/workspaces/{workspace_id}/export",
       "/api/workspaces/{workspace_id}/vulnerability-report",
       "/api/workspaces/{workspace_id}/security-review-bundle"
+    ]
+  },
+  {
+    "group": "workspace_semantic_materialization",
+    "current_owner": "backend/app/main.py + backend/app/service.py",
+    "target_owner": "api-go + rust-core",
+    "notes": "Semantic-search delivery and Postgres materialization hooks. Python still owns the live FastAPI request path for semantic-search, path-symbol materialization, and semantic-index materialization while the Go and Rust boundaries are still incomplete for this slice.",
+    "endpoints": [
+      "/api/workspaces/{workspace_id}/path-symbols/materialize",
+      "/api/workspaces/{workspace_id}/semantic-index/materialize",
+      "/api/workspaces/{workspace_id}/semantic-search",
+      "/api/workspaces/{workspace_id}/semantic-search/materialize"
     ]
   },
   {

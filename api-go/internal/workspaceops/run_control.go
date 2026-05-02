@@ -43,6 +43,8 @@ type appSettings struct {
 	CodexArgs      *string `json:"codex_args"`
 	CodexModel     *string `json:"codex_model"`
 	OpencodeModel  *string `json:"opencode_model"`
+	PostgresDSN    *string `json:"postgres_dsn"`
+	PostgresSchema string  `json:"postgres_schema"`
 }
 
 type PlanApproveRequest struct {
@@ -435,7 +437,7 @@ func saveRunFailure(dataDir string, run runRecord, err error) {
 
 func loadSettings(dataDir string) (*appSettings, error) {
 	path := filepath.Join(dataDir, "settings.json")
-	settings := &appSettings{LocalAgentType: "codex"}
+	settings := &appSettings{LocalAgentType: "codex", PostgresSchema: "xmustard"}
 	if err := readJSON(path, settings); err != nil {
 		if os.IsNotExist(err) {
 			return settings, nil
@@ -444,6 +446,9 @@ func loadSettings(dataDir string) (*appSettings, error) {
 	}
 	if strings.TrimSpace(settings.LocalAgentType) == "" {
 		settings.LocalAgentType = "codex"
+	}
+	if strings.TrimSpace(settings.PostgresSchema) == "" {
+		settings.PostgresSchema = "xmustard"
 	}
 	return settings, nil
 }

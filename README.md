@@ -24,6 +24,9 @@ The first Phase 3 authority cuts are already landed:
 - Go owns API delivery for `impact`, `repo-context`, and `retrieval-search`
 - Rust owns semantic impact calculation, changed-symbol extraction, provenance, and affected file/test ranking
 - Rust owns on-demand `path-symbols` extraction, the code-explainer semantic substrate, and storage-ready symbol materialization rows consumed by Go delivery and Python compatibility fallback
+- Go now also owns the Postgres foundation delivery slice for settings-backed schema plan/render/bootstrap
+
+Completion audit truth on 2026-05-02: xMustard is still mixed-mode, not Python-exited. Go and Rust own real shipped slices, but Python still remains in the authority path for FastAPI semantic-search/materialization routes, the Typer `semantic-index` and operator CLI surface, `TrackerService` compatibility assembly, and semantic baseline/materialization helpers.
 
 ## What xMustard Is
 
@@ -100,7 +103,14 @@ We are not treating “feature count” as progress. If the system cannot ground
 
 ## Development
 
-Backend setup:
+Go API shell for migrated request surfaces:
+
+```bash
+cd api-go
+XMUSTARD_API_PORT=8042 go run ./cmd/xmustard-api
+```
+
+Python compatibility shell:
 
 ```bash
 cd backend

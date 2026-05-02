@@ -228,6 +228,8 @@ export type AppSettings = {
   codex_args?: string | null
   codex_model?: string | null
   opencode_model?: string | null
+  postgres_dsn?: string | null
+  postgres_schema?: string
 }
 
 export type LocalAgentCapabilities = {

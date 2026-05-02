@@ -281,6 +281,70 @@ func main() {
 		}
 		writeJSON(w, http.StatusOK, result)
 	})
+	mux.HandleFunc("GET /api/postgres/plan", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.GetPostgresSchemaPlan(
+			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
+		)
+		if err != nil {
+			if strings.Contains(strings.ToLower(err.Error()), "postgres schema") {
+				writeJSON(w, http.StatusBadRequest, map[string]any{
+					"error": err.Error(),
+				})
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"error": err.Error(),
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	})
+	mux.HandleFunc("GET /api/postgres/render", func(w http.ResponseWriter, r *http.Request) {
+		sqlText, err := workspaceops.RenderPostgresSchemaSQL(
+			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
+			r.URL.Query().Get("schema"),
+		)
+		if err != nil {
+			if strings.Contains(strings.ToLower(err.Error()), "postgres schema") {
+				writeJSON(w, http.StatusBadRequest, map[string]any{
+					"error": err.Error(),
+				})
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"error": err.Error(),
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"sql": sqlText})
+	})
+	mux.HandleFunc("POST /api/postgres/bootstrap", func(w http.ResponseWriter, r *http.Request) {
+		var request workspaceops.PostgresBootstrapRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{
+				"error": "invalid JSON body",
+			})
+			return
+		}
+		result, err := workspaceops.BootstrapPostgresSchema(
+			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
+			request,
+		)
+		if err != nil {
+			lowered := strings.ToLower(err.Error())
+			if strings.Contains(lowered, "required") || strings.Contains(lowered, "must ") {
+				writeJSON(w, http.StatusBadRequest, map[string]any{
+					"error": err.Error(),
+				})
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"error": err.Error(),
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	})
 	mux.HandleFunc("GET /api/agent/capabilities", func(w http.ResponseWriter, r *http.Request) {
 		result, err := workspaceops.GetLocalAgentCapabilities(
 			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),

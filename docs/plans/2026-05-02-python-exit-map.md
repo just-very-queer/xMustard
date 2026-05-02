@@ -6,6 +6,8 @@ Phase 2 is complete for xMustard. External validation workspace dirtiness is not
 
 This map is grounded in the current repository shape: Python still carries the compatibility CLI and much of the orchestration brain, Go already owns a large API delivery shell, Rust owns repo-map/scanner/verification primitives, and Postgres is the durable semantic storage direction.
 
+Completion-pass audit truth on 2026-05-02: xMustard is still in mixed mode. Python remains in the shipped authority path through FastAPI semantic-search/materialization routes, the Typer `semantic-index` and operator CLI surface, `TrackerService` orchestration, and semantic baseline/materialization helpers.
+
 ## Inventory Buckets
 
 ### Keep In Python Temporarily
@@ -14,7 +16,7 @@ This map is grounded in the current repository shape: Python still carries the c
 |---|---|---|---|---|---|---|
 | `backend/app/cli.py` | Compatibility CLI for issue, run, semantic, retrieval, and tracker commands | Go CLI/API facade plus Rust semantic commands | Existing tests and operator workflows depend on this surface | Breaking local workflows before Go/Rust commands cover them | Go exposes stable delivery endpoints or a CLI wrapper for the same agent-facing reads | Python commands are wrappers only and no caller needs direct `TrackerService` orchestration |
 | `backend/app/store.py` | File-backed compatibility persistence | Go delivery over Postgres/file compatibility during transition | Existing artifacts remain the product record while storage migrates | Artifact shape drift | Go/Postgres reads and writes are contract-tested against existing artifacts | Durable Postgres store is primary and file writes are archival/export only |
-| `backend/app/postgres.py` | Semantic schema bootstrap and materialization helpers | Go migration/bootstrap plus Rust semantic emitters | It is already a bridge around the durable store | Split schema ownership | Go owns schema lifecycle and Rust emits contract rows | Python no longer materializes semantic rows |
+| `backend/app/postgres.py` | Semantic materialization helpers and baseline read/write bridge | Go migration/bootstrap plus Rust semantic emitters | Bootstrap can move sooner than the row bridge, but storage truth still needs one owner | Split schema ownership | Go owns schema lifecycle and Rust emits contract rows | Python no longer materializes semantic rows or reads semantic baselines |
 | `backend/app/runtimes.py` | Legacy runtime adapter and process metadata | Go session/runtime delivery plus Rust process helpers where needed | Runtime surfaces are already partly Go-owned | Process cleanup and terminal behavior regressions | Go owns every live runtime/session request path | Python runtime adapter is unused outside tests |
 
 ### Move To Go Next
@@ -108,6 +110,19 @@ This pass also defined the first diagnostics/LSP-normalized boundary without imp
 - The required field set includes ranges, severity, source kind/name, rule code, fingerprint, and generated timestamp.
 
 This is a contract boundary, not a completed diagnostics runtime. It exists so the later LSP/diagnostics implementation has a Rust-owned shape before any compatibility wrapper can drift into becoming the owner.
+
+## Phase 3 Postgres Foundation Delivery Reduction Landed
+
+This completion pass moved the first Postgres foundation delivery slice into Go:
+
+- `api-go/internal/workspaceops/postgres_foundation.go` now owns settings-backed schema plan/render/bootstrap delivery.
+- `api-go/cmd/xmustard-api/main.go` now serves:
+  - `GET /api/postgres/plan`
+  - `GET /api/postgres/render`
+  - `POST /api/postgres/bootstrap`
+- Go settings now round-trip `postgres_dsn` and `postgres_schema`, so the foundation endpoints no longer need Python to read or write their configuration contract.
+
+This is not full Postgres ownership exit. Python still owns semantic row materialization, semantic baseline persistence/readback, and the FastAPI request paths that expose those helpers.
 
 ## Phase 3 Boundary
 
