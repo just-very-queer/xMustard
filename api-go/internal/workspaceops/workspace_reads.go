@@ -2,6 +2,7 @@ package workspaceops
 
 import (
 	"bufio"
+	"context"
 	"crypto/sha1"
 	"encoding/json"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"time"
 
 	"xmustard/api-go/internal/rustcore"
 )
@@ -239,28 +241,31 @@ func ReadImpact(dataDir string, workspaceID string, baseRef string) (*ImpactRepo
 		return nil, err
 	}
 	changes, warnings := readGoChangeRecords(snapshot.Workspace.RootPath, baseRef)
-	symbols := deriveChangedSymbols(snapshot.Workspace.RootPath, changes)
 	changedPaths := changePaths(changes, false)
-	affectedFiles, affectedTests := rankAffectedPaths(dataDir, workspaceID, snapshot.Workspace.RootPath, changedPaths, symbols)
+	semanticImpact, semanticWarnings, err := readRustSemanticImpact(workspaceID, snapshot.Workspace.RootPath, changes)
+	if err != nil {
+		return nil, err
+	}
+	warnings = append(warnings, semanticWarnings...)
 	confidence := "low"
-	if len(symbols) > 0 && (len(affectedFiles) > 0 || len(affectedTests) > 0) {
+	if len(semanticImpact.ChangedSymbols) > 0 && (len(semanticImpact.LikelyAffectedFiles) > 0 || len(semanticImpact.LikelyAffectedTests) > 0) {
 		confidence = "high"
 	} else if len(changedPaths) > 0 {
 		confidence = "medium"
 	}
 	if len(changedPaths) == 0 {
 		warnings = append(warnings, "No changed files were detected from the current git comparison surface.")
-	} else if len(symbols) == 0 {
-		warnings = append(warnings, "Changed files were detected, but no symbol-level impact could be derived from the Go delivery floor.")
+	} else if len(semanticImpact.ChangedSymbols) == 0 {
+		warnings = append(warnings, "Changed files were detected, but Rust semantic core did not derive symbol-level impact.")
 	}
 	return &ImpactReport{
 		WorkspaceID:         workspaceID,
 		BaseRef:             baseRef,
 		ChangedFiles:        changes,
-		ChangedSymbols:      symbols,
-		LikelyAffectedFiles: affectedFiles,
-		LikelyAffectedTests: affectedTests,
-		DerivationSummary:   impactSummary(changedPaths, symbols, affectedFiles, affectedTests),
+		ChangedSymbols:      convertRustChangedSymbols(semanticImpact.ChangedSymbols),
+		LikelyAffectedFiles: convertRustImpactPaths(semanticImpact.LikelyAffectedFiles),
+		LikelyAffectedTests: convertRustImpactPaths(semanticImpact.LikelyAffectedTests),
+		DerivationSummary:   impactSummary(changedPaths, semanticImpact),
 		Confidence:          confidence,
 		Warnings:            dedupeStrings(warnings, 24),
 		GeneratedAt:         nowUTC(),
@@ -341,13 +346,19 @@ func SearchRetrieval(dataDir string, workspaceID string, query string, limit int
 		}
 		pushContentHit(snapshot.Workspace.RootPath, path, tokens, push)
 	}
+	structuralChanges := []RepoChangeRecord{}
 	for _, path := range dedupeStrings(hitPaths(hits), 24) {
-		for _, symbol := range extractSymbolsFromFile(snapshot.Workspace.RootPath, path) {
-			matched := matchedTerms(strings.ToLower(symbol.Symbol+" "+symbol.Kind), tokens)
-			if len(matched) == 0 {
-				continue
+		structuralChanges = append(structuralChanges, RepoChangeRecord{Path: path, Status: "context", Scope: "retrieval_search"})
+	}
+	if len(structuralChanges) > 0 {
+		if semanticImpact, _, err := readRustSemanticImpact(workspaceID, snapshot.Workspace.RootPath, structuralChanges); err == nil {
+			for _, symbol := range convertRustChangedSymbols(semanticImpact.ChangedSymbols) {
+				matched := matchedTerms(strings.ToLower(symbol.Symbol+" "+symbol.Kind), tokens)
+				if len(matched) == 0 {
+					continue
+				}
+				push(RetrievalSearchHit{Path: symbol.Path, SourceType: "structural_hit", Title: symbol.Kind + " " + symbol.Symbol, Reason: "Rust semantic-core symbol matched query terms: " + strings.Join(matched[:min(len(matched), 4)], ", ") + ".", MatchedTerms: matched, Score: 9 + len(matched)})
 			}
-			push(RetrievalSearchHit{Path: symbol.Path, SourceType: "structural_hit", Title: symbol.Kind + " " + symbol.Symbol, Reason: "Parser-lite symbol matched query terms: " + strings.Join(matched[:min(len(matched), 4)], ", ") + ".", MatchedTerms: matched, Score: 9 + len(matched)})
 		}
 	}
 	slices.SortFunc(hits, func(a, b RetrievalSearchHit) int {
@@ -367,7 +378,7 @@ func SearchRetrieval(dataDir string, workspaceID string, query string, limit int
 		Query:           query,
 		Hits:            hits,
 		RetrievalLedger: retrievalLedgerFromHits(hits),
-		Warnings:        []string{"Go delivery owns this read path; stored semantic-match replay still belongs to the Python compatibility/Postgres semantic tranche."},
+		Warnings:        []string{"Go delivery owns this read path; structural hits are derived through the Rust semantic-core contract."},
 		GeneratedAt:     nowUTC(),
 	}, nil
 }
@@ -811,137 +822,57 @@ func gitStatusName(code string) string {
 	}
 }
 
-func deriveChangedSymbols(rootPath string, changes []RepoChangeRecord) []ChangedSymbolRecord {
-	symbols := []ChangedSymbolRecord{}
-	seen := map[string]int{}
+func readRustSemanticImpact(workspaceID string, rootPath string, changes []RepoChangeRecord) (*rustcore.SemanticImpactReport, []string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	rustChanges := make([]rustcore.RepoChangeRecord, 0, len(changes))
 	for _, change := range changes {
-		if change.Status == "deleted" {
-			continue
-		}
-		for _, symbol := range extractSymbolsFromFile(rootPath, change.Path) {
-			key := symbol.Path + "\x00" + symbol.Symbol + "\x00" + symbol.Kind
-			index, ok := seen[key]
-			if ok {
-				symbols[index].ChangeScopes = dedupeStrings(append(symbols[index].ChangeScopes, change.Scope), 8)
-				symbols[index].ChangeStatuses = dedupeStrings(append(symbols[index].ChangeStatuses, change.Status), 8)
-				continue
-			}
-			symbol.ChangeScopes = []string{change.Scope}
-			symbol.ChangeStatuses = []string{change.Status}
-			seen[key] = len(symbols)
-			symbols = append(symbols, symbol)
-		}
+		rustChanges = append(rustChanges, rustcore.RepoChangeRecord{
+			Path:         change.Path,
+			Status:       change.Status,
+			Scope:        change.Scope,
+			PreviousPath: change.PreviousPath,
+			Staged:       change.Staged,
+			Unstaged:     change.Unstaged,
+		})
 	}
-	return symbols
-}
-
-var goSymbolPatterns = []*regexp.Regexp{
-	regexp.MustCompile(`^\s*def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(`),
-	regexp.MustCompile(`^\s*class\s+([A-Za-z_][A-Za-z0-9_]*)\b`),
-	regexp.MustCompile(`^\s*func\s+(?:\([^)]+\)\s*)?([A-Za-z_][A-Za-z0-9_]*)\s*\(`),
-	regexp.MustCompile(`^\s*(?:export\s+)?(?:function|class|interface|type)\s+([A-Za-z_][A-Za-z0-9_]*)\b`),
-}
-
-func extractSymbolsFromFile(rootPath string, relativePath string) []ChangedSymbolRecord {
-	content, err := os.ReadFile(filepath.Join(rootPath, filepath.FromSlash(relativePath)))
+	report, err := rustcore.BuildSemanticImpact(ctx, workspaceID, rootPath, rustChanges)
 	if err != nil {
-		return []ChangedSymbolRecord{}
+		return nil, nil, err
 	}
-	lines := strings.Split(string(content), "\n")
-	out := []ChangedSymbolRecord{}
-	for index, line := range lines {
-		for _, pattern := range goSymbolPatterns {
-			match := pattern.FindStringSubmatch(line)
-			if len(match) < 2 {
-				continue
-			}
-			kind := "function"
-			trimmed := strings.TrimSpace(line)
-			if strings.HasPrefix(trimmed, "class ") || strings.Contains(trimmed, " class ") {
-				kind = "class"
-			} else if strings.HasPrefix(trimmed, "type ") || strings.Contains(trimmed, " type ") || strings.HasPrefix(trimmed, "interface ") {
-				kind = "type"
-			}
-			lineNo := index + 1
-			out = append(out, ChangedSymbolRecord{
-				Path:            filepath.ToSlash(relativePath),
-				Symbol:          match[1],
-				Kind:            kind,
-				LineStart:       &lineNo,
-				LineEnd:         &lineNo,
-				EvidenceSource:  "on_demand_parser",
-				SelectionReason: "Go delivery extracted symbols directly from the changed path.",
-			})
-			break
-		}
-		if len(out) >= 24 {
-			break
-		}
+	return report, report.Warnings, nil
+}
+
+func convertRustChangedSymbols(items []rustcore.ChangedSymbolRecord) []ChangedSymbolRecord {
+	out := make([]ChangedSymbolRecord, 0, len(items))
+	for _, item := range items {
+		out = append(out, ChangedSymbolRecord{
+			Path:            item.Path,
+			Symbol:          item.Symbol,
+			Kind:            item.Kind,
+			LineStart:       item.LineStart,
+			LineEnd:         item.LineEnd,
+			EvidenceSource:  item.EvidenceSource,
+			SemanticStatus:  item.SemanticStatus,
+			SelectionReason: item.SelectionReason,
+			ChangeScopes:    item.ChangeScopes,
+			ChangeStatuses:  item.ChangeStatuses,
+		})
 	}
 	return out
 }
 
-func rankAffectedPaths(dataDir string, workspaceID string, rootPath string, changedPaths []string, symbols []ChangedSymbolRecord) ([]ImpactPathRecord, []ImpactPathRecord) {
-	repoMap, _ := loadOrBuildRepoMap(dataDir, workspaceID, rootPath)
-	tokens := []string{}
-	for _, path := range changedPaths {
-		tokens = append(tokens, pathTokens(path)...)
+func convertRustImpactPaths(items []rustcore.ImpactPathRecord) []ImpactPathRecord {
+	out := make([]ImpactPathRecord, 0, len(items))
+	for _, item := range items {
+		out = append(out, ImpactPathRecord{
+			Path:             item.Path,
+			Reason:           item.Reason,
+			DerivationSource: item.DerivationSource,
+			Score:            item.Score,
+		})
 	}
-	for _, symbol := range symbols {
-		tokens = append(tokens, strings.ToLower(symbol.Symbol))
-	}
-	tokens = dedupeStrings(tokens, 32)
-	files := []ImpactPathRecord{}
-	tests := []ImpactPathRecord{}
-	seen := map[string]struct{}{}
-	if repoMap != nil {
-		for _, item := range repoMap.KeyFiles {
-			if _, ok := seen[item.Path]; ok {
-				continue
-			}
-			if containsString(changedPaths, item.Path) {
-				continue
-			}
-			score := pathScore(item.Path, tokens)
-			if score == 0 {
-				continue
-			}
-			seen[item.Path] = struct{}{}
-			record := ImpactPathRecord{Path: item.Path, Reason: "Path matched changed-file or symbol terms.", DerivationSource: "lexical", Score: score}
-			if item.Role == "test" || strings.Contains(strings.ToLower(item.Path), "test") {
-				tests = append(tests, record)
-			} else {
-				files = append(files, record)
-			}
-		}
-	}
-	for _, path := range candidateSourcePaths(rootPath, 120) {
-		if _, ok := seen[path]; ok || containsString(changedPaths, path) {
-			continue
-		}
-		score := pathScore(path, tokens)
-		if score == 0 {
-			continue
-		}
-		record := ImpactPathRecord{Path: path, Reason: "Path matched changed-file or symbol terms.", DerivationSource: "lexical", Score: score}
-		if strings.Contains(strings.ToLower(path), "test") || strings.HasSuffix(strings.ToLower(path), ".spec.ts") {
-			tests = append(tests, record)
-		} else {
-			files = append(files, record)
-		}
-	}
-	sortImpactPaths(files)
-	sortImpactPaths(tests)
-	return files[:min(len(files), 10)], tests[:min(len(tests), 10)]
-}
-
-func sortImpactPaths(items []ImpactPathRecord) {
-	slices.SortFunc(items, func(a, b ImpactPathRecord) int {
-		if a.Score != b.Score {
-			return b.Score - a.Score
-		}
-		return strings.Compare(a.Path, b.Path)
-	})
+	return out
 }
 
 func changePaths(changes []RepoChangeRecord, includeDeleted bool) []string {
@@ -955,8 +886,8 @@ func changePaths(changes []RepoChangeRecord, includeDeleted bool) []string {
 	return dedupeStrings(paths, 128)
 }
 
-func impactSummary(paths []string, symbols []ChangedSymbolRecord, files []ImpactPathRecord, tests []ImpactPathRecord) string {
-	return fmt.Sprintf("Go delivery derived %d changed file(s), %d changed symbol(s), %d likely affected file(s), and %d likely affected test(s).", len(paths), len(symbols), len(files), len(tests))
+func impactSummary(paths []string, semanticImpact *rustcore.SemanticImpactReport) string {
+	return fmt.Sprintf("Go delivery consumed Rust semantic-core output for %d changed file(s), %d changed symbol(s), %d likely affected file(s), and %d likely affected test(s).", len(paths), len(semanticImpact.ChangedSymbols), len(semanticImpact.LikelyAffectedFiles), len(semanticImpact.LikelyAffectedTests))
 }
 
 func buildGoPlanLinks(dataDir string, workspaceID string, referencePaths map[string]struct{}) []RepoContextPlanLink {
@@ -1118,11 +1049,6 @@ func retrievalLedgerFromHits(hits []RetrievalSearchHit) []ContextRetrievalLedger
 	return out
 }
 
-func pathTokens(path string) []string {
-	re := regexp.MustCompile(`[A-Za-z0-9_]{3,}`)
-	return re.FindAllString(strings.ToLower(strings.ReplaceAll(path, "/", " ")), -1)
-}
-
 func matchedTerms(haystack string, tokens []string) []string {
 	out := []string{}
 	for _, token := range tokens {
@@ -1131,17 +1057,6 @@ func matchedTerms(haystack string, tokens []string) []string {
 		}
 	}
 	return out
-}
-
-func pathScore(path string, tokens []string) int {
-	score := 0
-	lower := strings.ToLower(path)
-	for _, token := range tokens {
-		if strings.Contains(lower, token) {
-			score += 3
-		}
-	}
-	return score
 }
 
 func hitPaths(hits []RetrievalSearchHit) []string {
@@ -1178,15 +1093,6 @@ func joinDetails(details map[string]any) string {
 		parts = append(parts, key, fmt.Sprint(value))
 	}
 	return strings.Join(parts, " ")
-}
-
-func containsString(items []string, needle string) bool {
-	for _, item := range items {
-		if item == needle {
-			return true
-		}
-	}
-	return false
 }
 
 func shortHash(value string) string {

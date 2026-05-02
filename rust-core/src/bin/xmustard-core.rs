@@ -52,6 +52,58 @@ fn main() {
                 }
             }
         }
+        "semantic-impact" => {
+            let Some(workspace_id) = args.next() else {
+                eprintln!(
+                    "usage: xmustard-core semantic-impact <workspace_id> <root_path> <changes_json_path>"
+                );
+                std::process::exit(2);
+            };
+            let Some(root) = args.next() else {
+                eprintln!(
+                    "usage: xmustard-core semantic-impact <workspace_id> <root_path> <changes_json_path>"
+                );
+                std::process::exit(2);
+            };
+            let Some(changes_json_path) = args.next() else {
+                eprintln!(
+                    "usage: xmustard-core semantic-impact <workspace_id> <root_path> <changes_json_path>"
+                );
+                std::process::exit(2);
+            };
+            let changes_content = match fs::read_to_string(&changes_json_path) {
+                Ok(content) => content,
+                Err(err) => {
+                    eprintln!("semantic-impact failed to read changes: {err}");
+                    std::process::exit(1);
+                }
+            };
+            let changes = match serde_json::from_str::<Vec<xmustard_core::repomap::RustRepoChangeRecord>>(&changes_content) {
+                Ok(changes) => changes,
+                Err(err) => {
+                    eprintln!("semantic-impact failed to decode changes: {err}");
+                    std::process::exit(1);
+                }
+            };
+            let root_path = PathBuf::from(root);
+            match xmustard_core::repomap::build_semantic_impact(
+                &root_path,
+                &workspace_id,
+                &changes,
+            ) {
+                Ok(report) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&report)
+                            .expect("semantic impact result should serialize")
+                    );
+                }
+                Err(err) => {
+                    eprintln!("semantic-impact failed: {err}");
+                    std::process::exit(1);
+                }
+            }
+        }
         "parse-coverage-lcov" => {
             let Some(workspace_id) = args.next() else {
                 eprintln!(

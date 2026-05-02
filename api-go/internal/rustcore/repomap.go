@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
 )
 
@@ -31,6 +32,45 @@ type RepoMapSummary struct {
 	TopDirectories []RepoMapDirectoryRecord `json:"top_directories"`
 	KeyFiles       []RepoMapFileRecord      `json:"key_files"`
 	GeneratedAt    string                   `json:"generated_at"`
+}
+
+type RepoChangeRecord struct {
+	Path         string  `json:"path"`
+	Status       string  `json:"status"`
+	Scope        string  `json:"scope"`
+	PreviousPath *string `json:"previous_path,omitempty"`
+	Staged       bool    `json:"staged"`
+	Unstaged     bool    `json:"unstaged"`
+}
+
+type ChangedSymbolRecord struct {
+	Path            string   `json:"path"`
+	Symbol          string   `json:"symbol"`
+	Kind            string   `json:"kind"`
+	LineStart       *int     `json:"line_start,omitempty"`
+	LineEnd         *int     `json:"line_end,omitempty"`
+	EvidenceSource  string   `json:"evidence_source"`
+	SemanticStatus  *string  `json:"semantic_status,omitempty"`
+	SelectionReason string   `json:"selection_reason"`
+	ChangeScopes    []string `json:"change_scopes"`
+	ChangeStatuses  []string `json:"change_statuses"`
+}
+
+type ImpactPathRecord struct {
+	Path             string `json:"path"`
+	Reason           string `json:"reason"`
+	DerivationSource string `json:"derivation_source"`
+	Score            int    `json:"score"`
+}
+
+type SemanticImpactReport struct {
+	WorkspaceID         string                `json:"workspace_id"`
+	ChangedSymbols      []ChangedSymbolRecord `json:"changed_symbols"`
+	LikelyAffectedFiles []ImpactPathRecord    `json:"likely_affected_files"`
+	LikelyAffectedTests []ImpactPathRecord    `json:"likely_affected_tests"`
+	DerivationSource    string                `json:"derivation_source"`
+	Warnings            []string              `json:"warnings"`
+	GeneratedAt         string                `json:"generated_at"`
 }
 
 func BuildRepoMap(ctx context.Context, workspaceID string, repoRoot string) (*RepoMapSummary, error) {
@@ -62,4 +102,50 @@ func BuildRepoMap(ctx context.Context, workspaceID string, repoRoot string) (*Re
 		return nil, fmt.Errorf("decode rust-core repo-map: %w", err)
 	}
 	return &summary, nil
+}
+
+func BuildSemanticImpact(ctx context.Context, workspaceID string, repoRoot string, changes []RepoChangeRecord) (*SemanticImpactReport, error) {
+	changesFile, err := os.CreateTemp("", "xmustard-semantic-impact-*.json")
+	if err != nil {
+		return nil, fmt.Errorf("create semantic impact change file: %w", err)
+	}
+	changesPath := changesFile.Name()
+	defer os.Remove(changesPath)
+	if err := json.NewEncoder(changesFile).Encode(changes); err != nil {
+		changesFile.Close()
+		return nil, fmt.Errorf("write semantic impact changes: %w", err)
+	}
+	if err := changesFile.Close(); err != nil {
+		return nil, fmt.Errorf("close semantic impact changes: %w", err)
+	}
+
+	cmd := exec.CommandContext(
+		ctx,
+		"cargo",
+		"run",
+		"--quiet",
+		"--bin",
+		"xmustard-core",
+		"--",
+		"semantic-impact",
+		workspaceID,
+		repoRoot,
+		changesPath,
+	)
+	cmd.Dir = rustCoreDir()
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("rust-core semantic-impact failed: %w: %s", err, stderr.String())
+	}
+
+	var report SemanticImpactReport
+	if err := json.Unmarshal(stdout.Bytes(), &report); err != nil {
+		return nil, fmt.Errorf("decode rust-core semantic impact: %w", err)
+	}
+	return &report, nil
 }

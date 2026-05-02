@@ -53,6 +53,17 @@ The Go implementation reads workspace snapshots, git state, repo-map artifacts, 
 
 This does shrink Python authority at the API delivery boundary. It does not yet retire Python semantic ranking. The next high-value Rust tranche is to move richer symbol extraction and impact ranking behind a Rust contract so Go can consume that instead of the current Go parser-lite fallback.
 
+## Phase 3 Authority Reduction Landed
+
+The next Phase 3 slice moved the first semantic-impact authority into Rust:
+
+- `rust-core/src/repomap.rs` now emits a `RustSemanticImpactReport` with changed symbols, symbol provenance, likely affected files, and likely affected tests.
+- `xmustard-core semantic-impact` exposes that contract as JSON.
+- `api-go/internal/rustcore/repomap.go` invokes the Rust command and decodes the typed contract.
+- `api-go/internal/workspaceops/workspace_reads.go` now consumes Rust semantic-core output for impact reports and structural retrieval hits.
+
+This keeps the split honest: Go owns request shaping and response delivery, Rust owns semantic meaning, and Python is not part of the new authority path.
+
 ## Phase 3 Boundary
 
 Phase 3 LSP/diagnostics should follow this ownership split:

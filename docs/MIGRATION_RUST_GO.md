@@ -198,6 +198,8 @@ That boundary work is now live for three concrete slices:
 - The Go API shell now owns verification-profile report reads, including runtime, model, and branch breakdowns that match the richer Python report shape.
 - The Go API shell now owns workspace listing, fresh and cached workspace load, explicit workspace scan, worktree reads, export bundle reads, and terminal open/write/resize/read/close transport against the existing workspace registry and terminal log layout.
 - The Go API shell now owns the first repo-intelligence read tranche for `/api/workspaces/{workspace_id}/impact`, `/api/workspaces/{workspace_id}/repo-context`, and `/api/workspaces/{workspace_id}/retrieval-search`, deriving delivery payloads from workspace artifacts, git state, repo-map records, activity, run plans, and fix records without calling Python service methods.
+- Rust now owns the first semantic-impact contract in `rust-core/src/repomap.rs`: changed-symbol extraction, symbol evidence provenance, and likely affected file/test ranking are emitted through `xmustard-core semantic-impact`.
+- Go repo-intelligence reads now consume the Rust semantic-impact contract for impact reports and structural retrieval hits; Go remains the delivery shell and no longer carries the parser-lite changed-symbol or impact-ranking authority for these paths.
 - The Go API shell now owns the `external_integrations_gateway` cutline too: plugin-manifest-backed integration config/test routes, GitHub issue import + PR creation, Slack notifications, and Linear/Jira issue sync now persist through Go while keeping ticket-context/activity artifacts and the existing `backend/data/integrations/` compatibility layout.
 - The Go API shell now owns repo-config reads at `/api/workspaces/{workspace_id}/repo-config` and `/api/workspaces/{workspace_id}/repo-config/health`, and issue-context packets built in Go now include `.xmustard.yaml` path instructions and MCP/browser-context hints.
 - FastAPI no longer registers the integration config/test/sync HTTP handlers in `backend/app/main.py`, so the external integrations gateway now leaves Python on the live request path while preserving the same route paths through Go.
@@ -212,7 +214,7 @@ That boundary work is now live for three concrete slices:
 
 ## Recommended Next Build Order
 
-1. Move richer symbol extraction and impact ranking into Rust so Go repo-intelligence reads can consume a semantic-core contract instead of parser-lite delivery fallbacks.
+1. Expand the Rust semantic-impact contract toward stored semantic rows, diagnostics normalization, and later tree-sitter/LSP-backed extraction.
 2. Add coverage delta and artifact persistence helpers on the Rust side where it simplifies process control.
 3. Extend the Go plugin registry into webhook/event fanout and manifest-first provider callbacks.
 4. Migrate FastAPI route groups to Go one surface at a time.
