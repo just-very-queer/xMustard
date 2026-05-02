@@ -1629,6 +1629,48 @@ func main() {
 		}
 		writeJSON(w, http.StatusOK, result)
 	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/path-symbols", func(w http.ResponseWriter, r *http.Request) {
+		workspaceID := r.PathValue("workspace_id")
+		result, err := workspaceops.ReadPathSymbols(
+			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
+			workspaceID,
+			r.URL.Query().Get("path"),
+		)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				writeJSON(w, http.StatusNotFound, map[string]any{
+					"error": "Workspace or path not found",
+				})
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"error": err.Error(),
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/explain-path", func(w http.ResponseWriter, r *http.Request) {
+		workspaceID := r.PathValue("workspace_id")
+		result, err := workspaceops.ExplainPath(
+			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
+			workspaceID,
+			r.URL.Query().Get("path"),
+		)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				writeJSON(w, http.StatusNotFound, map[string]any{
+					"error": "Workspace or path not found",
+				})
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"error": err.Error(),
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	})
 	mux.HandleFunc("GET /api/workspaces/{workspace_id}/repo-map", func(w http.ResponseWriter, r *http.Request) {
 		workspaceID := r.PathValue("workspace_id")
 		result, err := workspaceops.ReadWorkspaceRepoMap(

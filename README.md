@@ -67,6 +67,7 @@ Phase 3 work now includes:
 
 - Go-owned repo-intelligence read delivery for `impact`, `repo-context`, and `retrieval-search`
 - Rust-owned semantic-impact generation consumed by Go delivery
+- Rust-owned on-demand path-symbol extraction consumed by Go `path-symbols` and `explain-path` delivery
 - a durable Python exit map to track what still belongs in Python temporarily and what should move next
 
 ## What This Repo Is Becoming

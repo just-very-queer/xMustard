@@ -64,6 +64,17 @@ The next Phase 3 slice moved the first semantic-impact authority into Rust:
 
 This keeps the split honest: Go owns request shaping and response delivery, Rust owns semantic meaning, and Python is not part of the new authority path.
 
+## Phase 3 Path-Symbol Authority Reduction Landed
+
+This pass moved the first single-path semantic ownership cut toward Rust:
+
+- `rust-core/src/repomap.rs` now emits a `RustPathSymbolsResult` contract for on-demand path-symbol extraction.
+- `xmustard-core path-symbols` exposes that contract as JSON.
+- `api-go/internal/rustcore/repomap.go` invokes the Rust command and decodes the typed path-symbol contract.
+- `api-go/internal/workspaceops/workspace_reads.go` serves Go `path-symbols` and `explain-path` delivery from Rust semantic-core output.
+
+This does not delete Python CLI compatibility yet. It does move the path-symbol/code-explainer meaning surface in the target Go API lane away from Python and keeps Go as delivery, Rust as meaning, and Postgres as the durable semantic storage direction.
+
 ## Phase 3 Boundary
 
 Phase 3 LSP/diagnostics should follow this ownership split:

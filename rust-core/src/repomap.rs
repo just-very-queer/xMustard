@@ -139,6 +139,32 @@ pub struct RustChangedSymbolRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustPathSymbolRecord {
+    pub path: String,
+    pub symbol: String,
+    pub kind: String,
+    pub line_start: Option<usize>,
+    pub line_end: Option<usize>,
+    pub enclosing_scope: Option<String>,
+    pub evidence_source: String,
+    pub reason: Option<String>,
+    pub score: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustPathSymbolsResult {
+    pub workspace_id: String,
+    pub path: String,
+    pub symbol_source: String,
+    pub parser_language: Option<String>,
+    pub evidence_source: String,
+    pub selection_reason: String,
+    pub symbols: Vec<RustPathSymbolRecord>,
+    pub warnings: Vec<String>,
+    pub generated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RustImpactPathRecord {
     pub path: String,
     pub reason: String,
@@ -343,6 +369,60 @@ pub fn build_semantic_impact(
     })
 }
 
+pub fn extract_path_symbols(
+    root_path: &Path,
+    workspace_id: &str,
+    relative_path: &str,
+) -> Result<RustPathSymbolsResult, std::io::Error> {
+    let normalized = relative_path.trim_start_matches("./").replace('\\', "/");
+    let path = root_path.join(&normalized);
+    let metadata = fs::metadata(&path)?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path-symbols expects a file path",
+        ));
+    }
+    let parser_language = semantic_language_for_path(&normalized);
+    let mut warnings = Vec::new();
+    if !should_scan_file(&normalized) {
+        warnings.push(
+            "Rust semantic core does not treat this path as an indexable source file.".to_string(),
+        );
+    }
+    let symbols = extract_symbols_from_file(root_path, &normalized)
+        .into_iter()
+        .take(32)
+        .map(|item| RustPathSymbolRecord {
+            path: item.path,
+            symbol: item.symbol,
+            kind: item.kind,
+            line_start: item.line_start,
+            line_end: item.line_end,
+            enclosing_scope: None,
+            evidence_source: "rust_semantic_core".to_string(),
+            reason: Some(
+                "Rust semantic core extracted this symbol from the requested path.".to_string(),
+            ),
+            score: 10,
+        })
+        .collect::<Vec<_>>();
+    if symbols.is_empty() && should_scan_file(&normalized) {
+        warnings.push("Rust semantic core found no top-level symbols in this path.".to_string());
+    }
+    Ok(RustPathSymbolsResult {
+        workspace_id: workspace_id.to_string(),
+        path: normalized,
+        symbol_source: if symbols.is_empty() { "none" } else { "regex" }.to_string(),
+        parser_language,
+        evidence_source: "rust_semantic_core".to_string(),
+        selection_reason: "Go delivery consumed Rust semantic-core path symbols on demand.".to_string(),
+        symbols,
+        warnings,
+        generated_at: Utc::now().to_rfc3339(),
+    })
+}
+
 fn should_skip_entry(root_path: &Path, entry: &DirEntry) -> bool {
     if entry.depth() == 0 {
         return false;
@@ -392,6 +472,25 @@ fn should_scan_file(relative_path: &str) -> bool {
     }
     let ext = path.extension().and_then(|value| value.to_str()).unwrap_or_default();
     SCANNABLE_SOURCE_EXTENSIONS.contains(&format!(".{ext}").as_str())
+}
+
+fn semantic_language_for_path(relative_path: &str) -> Option<String> {
+    let path = PathBuf::from(relative_path);
+    let ext = path.extension().and_then(|value| value.to_str()).unwrap_or_default();
+    match ext {
+        "py" => Some("python".to_string()),
+        "ts" => Some("typescript".to_string()),
+        "tsx" => Some("tsx".to_string()),
+        "js" | "jsx" => Some("javascript".to_string()),
+        "go" => Some("go".to_string()),
+        "rs" => Some("rust".to_string()),
+        "java" => Some("java".to_string()),
+        "sh" | "bash" => Some("bash".to_string()),
+        "html" => Some("html".to_string()),
+        "css" => Some("css".to_string()),
+        "yaml" | "yml" => Some("yaml".to_string()),
+        _ => None,
+    }
 }
 
 fn derive_changed_symbols(
@@ -707,5 +806,32 @@ mod tests {
             .iter()
             .any(|item| item.path == "tests/test_export.py"));
         assert_eq!(report.derivation_source, "rust_semantic_core");
+    }
+
+    #[test]
+    fn path_symbols_extracts_requested_file_symbols() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+
+        write(
+            &root.join("src/app.rs"),
+            "pub struct Runner {}\n\npub fn launch_runner() {}\n",
+        );
+
+        let result = super::extract_path_symbols(root, "workspace-4", "src/app.rs").unwrap();
+
+        assert_eq!(result.workspace_id, "workspace-4");
+        assert_eq!(result.path, "src/app.rs");
+        assert_eq!(result.symbol_source, "regex");
+        assert_eq!(result.parser_language.as_deref(), Some("rust"));
+        assert!(result
+            .symbols
+            .iter()
+            .any(|item| item.symbol == "Runner" && item.kind == "type"));
+        assert!(result
+            .symbols
+            .iter()
+            .any(|item| item.symbol == "launch_runner" && item.kind == "function"));
+        assert_eq!(result.evidence_source, "rust_semantic_core");
     }
 }

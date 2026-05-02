@@ -119,6 +119,22 @@ func TestGoRepoIntelligenceReadsImpactContextAndRetrieval(t *testing.T) {
 	if len(retrieval.Hits) == 0 || len(retrieval.RetrievalLedger) == 0 {
 		t.Fatalf("expected retrieval hits and ledger, got %#v", retrieval)
 	}
+
+	pathSymbols, err := ReadPathSymbols(dataDir, workspaceID, "src/app.py")
+	if err != nil {
+		t.Fatalf("read path symbols: %v", err)
+	}
+	if pathSymbols.EvidenceSource != "rust_semantic_core" || len(pathSymbols.Symbols) == 0 {
+		t.Fatalf("expected Rust path symbols, got %#v", pathSymbols)
+	}
+
+	explainer, err := ExplainPath(dataDir, workspaceID, "src/app.py")
+	if err != nil {
+		t.Fatalf("explain path: %v", err)
+	}
+	if explainer.EvidenceSource != "rust_semantic_core" || len(explainer.DetectedSymbols) == 0 {
+		t.Fatalf("expected Rust-backed path explanation, got %#v", explainer)
+	}
 }
 
 func runGit(t *testing.T, repoRoot string, args ...string) {

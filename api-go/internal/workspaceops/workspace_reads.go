@@ -112,6 +112,47 @@ type ChangedSymbolRecord struct {
 	ChangeStatuses  []string `json:"change_statuses"`
 }
 
+type PathSymbolRecord struct {
+	Path           string  `json:"path"`
+	Symbol         string  `json:"symbol"`
+	Kind           string  `json:"kind"`
+	LineStart      *int    `json:"line_start,omitempty"`
+	LineEnd        *int    `json:"line_end,omitempty"`
+	EnclosingScope *string `json:"enclosing_scope,omitempty"`
+	EvidenceSource string  `json:"evidence_source"`
+	Reason         *string `json:"reason,omitempty"`
+	Score          int     `json:"score"`
+}
+
+type PathSymbolsResult struct {
+	WorkspaceID     string             `json:"workspace_id"`
+	Path            string             `json:"path"`
+	SymbolSource    string             `json:"symbol_source"`
+	ParserLanguage  *string            `json:"parser_language,omitempty"`
+	EvidenceSource  string             `json:"evidence_source"`
+	SelectionReason string             `json:"selection_reason"`
+	Symbols         []PathSymbolRecord `json:"symbols"`
+	Warnings        []string           `json:"warnings"`
+	GeneratedAt     string             `json:"generated_at"`
+}
+
+type CodeExplainerResult struct {
+	WorkspaceID     string   `json:"workspace_id"`
+	Path            string   `json:"path"`
+	Role            string   `json:"role"`
+	LineCount       int      `json:"line_count"`
+	ImportCount     int      `json:"import_count"`
+	DetectedSymbols []string `json:"detected_symbols"`
+	SymbolSource    string   `json:"symbol_source"`
+	ParserLanguage  *string  `json:"parser_language,omitempty"`
+	EvidenceSource  string   `json:"evidence_source"`
+	SelectionReason string   `json:"selection_reason"`
+	Summary         string   `json:"summary"`
+	Hints           []string `json:"hints"`
+	Warnings        []string `json:"warnings"`
+	GeneratedAt     string   `json:"generated_at"`
+}
+
 type ImpactPathRecord struct {
 	Path             string `json:"path"`
 	Reason           string `json:"reason"`
@@ -379,6 +420,74 @@ func SearchRetrieval(dataDir string, workspaceID string, query string, limit int
 		Hits:            hits,
 		RetrievalLedger: retrievalLedgerFromHits(hits),
 		Warnings:        []string{"Go delivery owns this read path; structural hits are derived through the Rust semantic-core contract."},
+		GeneratedAt:     nowUTC(),
+	}, nil
+}
+
+func ReadPathSymbols(dataDir string, workspaceID string, relativePath string) (*PathSymbolsResult, error) {
+	snapshot, err := loadSnapshot(dataDir, workspaceID)
+	if err != nil {
+		return nil, err
+	}
+	normalized, err := normalizeWorkspaceFile(snapshot.Workspace.RootPath, relativePath)
+	if err != nil {
+		return nil, err
+	}
+	rustResult, err := readRustPathSymbols(workspaceID, snapshot.Workspace.RootPath, normalized)
+	if err != nil {
+		return nil, err
+	}
+	return &PathSymbolsResult{
+		WorkspaceID:     workspaceID,
+		Path:            rustResult.Path,
+		SymbolSource:    rustResult.SymbolSource,
+		ParserLanguage:  rustResult.ParserLanguage,
+		EvidenceSource:  rustResult.EvidenceSource,
+		SelectionReason: rustResult.SelectionReason,
+		Symbols:         convertRustPathSymbols(rustResult.Symbols),
+		Warnings:        rustResult.Warnings,
+		GeneratedAt:     rustResult.GeneratedAt,
+	}, nil
+}
+
+func ExplainPath(dataDir string, workspaceID string, relativePath string) (*CodeExplainerResult, error) {
+	snapshot, err := loadSnapshot(dataDir, workspaceID)
+	if err != nil {
+		return nil, err
+	}
+	normalized, err := normalizeWorkspaceFile(snapshot.Workspace.RootPath, relativePath)
+	if err != nil {
+		return nil, err
+	}
+	content, err := os.ReadFile(filepath.Join(snapshot.Workspace.RootPath, normalized))
+	if err != nil {
+		return nil, err
+	}
+	symbols, err := ReadPathSymbols(dataDir, workspaceID, normalized)
+	if err != nil {
+		return nil, err
+	}
+	detected := []string{}
+	for _, symbol := range symbols.Symbols[:min(len(symbols.Symbols), 8)] {
+		detected = append(detected, symbol.Symbol)
+	}
+	role := inferGoFileRole(normalized)
+	lineCount := len(strings.Split(string(content), "\n"))
+	importCount := countGoImports(string(content))
+	return &CodeExplainerResult{
+		WorkspaceID:     workspaceID,
+		Path:            normalized,
+		Role:            role,
+		LineCount:       lineCount,
+		ImportCount:     importCount,
+		DetectedSymbols: detected,
+		SymbolSource:    symbols.SymbolSource,
+		ParserLanguage:  symbols.ParserLanguage,
+		EvidenceSource:  symbols.EvidenceSource,
+		SelectionReason: symbols.SelectionReason,
+		Summary:         buildGoPathSummary(normalized, role, lineCount, importCount, detected),
+		Hints:           buildGoPathHints(normalized, role),
+		Warnings:        symbols.Warnings,
 		GeneratedAt:     nowUTC(),
 	}, nil
 }
@@ -843,6 +952,12 @@ func readRustSemanticImpact(workspaceID string, rootPath string, changes []RepoC
 	return report, report.Warnings, nil
 }
 
+func readRustPathSymbols(workspaceID string, rootPath string, relativePath string) (*rustcore.PathSymbolsResult, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	return rustcore.ExtractPathSymbols(ctx, workspaceID, rootPath, relativePath)
+}
+
 func convertRustChangedSymbols(items []rustcore.ChangedSymbolRecord) []ChangedSymbolRecord {
 	out := make([]ChangedSymbolRecord, 0, len(items))
 	for _, item := range items {
@@ -862,6 +977,24 @@ func convertRustChangedSymbols(items []rustcore.ChangedSymbolRecord) []ChangedSy
 	return out
 }
 
+func convertRustPathSymbols(items []rustcore.PathSymbolRecord) []PathSymbolRecord {
+	out := make([]PathSymbolRecord, 0, len(items))
+	for _, item := range items {
+		out = append(out, PathSymbolRecord{
+			Path:           item.Path,
+			Symbol:         item.Symbol,
+			Kind:           item.Kind,
+			LineStart:      item.LineStart,
+			LineEnd:        item.LineEnd,
+			EnclosingScope: item.EnclosingScope,
+			EvidenceSource: item.EvidenceSource,
+			Reason:         item.Reason,
+			Score:          item.Score,
+		})
+	}
+	return out
+}
+
 func convertRustImpactPaths(items []rustcore.ImpactPathRecord) []ImpactPathRecord {
 	out := make([]ImpactPathRecord, 0, len(items))
 	for _, item := range items {
@@ -873,6 +1006,92 @@ func convertRustImpactPaths(items []rustcore.ImpactPathRecord) []ImpactPathRecor
 		})
 	}
 	return out
+}
+
+func normalizeWorkspaceFile(rootPath string, relativePath string) (string, error) {
+	normalized := strings.TrimPrefix(strings.TrimSpace(relativePath), "./")
+	if normalized == "" {
+		return "", fmt.Errorf("path is required")
+	}
+	root := filepath.Clean(rootPath)
+	target := filepath.Clean(filepath.Join(root, normalized))
+	rel, err := filepath.Rel(root, target)
+	if err != nil || strings.HasPrefix(rel, "..") || filepath.IsAbs(rel) {
+		return "", fmt.Errorf("path escapes workspace root")
+	}
+	info, err := os.Stat(target)
+	if err != nil {
+		return "", err
+	}
+	if info.IsDir() {
+		return "", fmt.Errorf("path explainer expects a file path, not a directory")
+	}
+	return filepath.ToSlash(rel), nil
+}
+
+func inferGoFileRole(path string) string {
+	lower := strings.ToLower(path)
+	base := filepath.Base(lower)
+	switch {
+	case base == "readme.md" || base == "agents.md" || strings.HasSuffix(lower, ".md"):
+		return "guide"
+	case strings.Contains(lower, "test") || strings.HasSuffix(lower, "_test.go") || strings.HasSuffix(lower, ".spec.ts"):
+		return "test"
+	case strings.HasSuffix(lower, ".json") || strings.HasSuffix(lower, ".toml") || strings.HasSuffix(lower, ".yaml") || strings.HasSuffix(lower, ".yml"):
+		return "config"
+	case strings.Contains(lower, "main.") || strings.Contains(lower, "app."):
+		return "entry"
+	case strings.HasSuffix(lower, ".py") || strings.HasSuffix(lower, ".go") || strings.HasSuffix(lower, ".rs") || strings.HasSuffix(lower, ".ts") || strings.HasSuffix(lower, ".tsx") || strings.HasSuffix(lower, ".js") || strings.HasSuffix(lower, ".jsx"):
+		return "source"
+	default:
+		return "unknown"
+	}
+}
+
+func countGoImports(content string) int {
+	count := 0
+	inBlock := false
+	for _, raw := range strings.Split(content, "\n") {
+		line := strings.TrimSpace(raw)
+		if strings.HasPrefix(line, "import (") || strings.HasPrefix(line, "use ") {
+			inBlock = strings.HasPrefix(line, "import (")
+			count++
+			continue
+		}
+		if inBlock {
+			if line == ")" {
+				inBlock = false
+				continue
+			}
+			if line != "" {
+				count++
+			}
+			continue
+		}
+		if strings.HasPrefix(line, "import ") || strings.HasPrefix(line, "from ") || strings.HasPrefix(line, "require(") {
+			count++
+		}
+	}
+	return count
+}
+
+func buildGoPathSummary(path string, role string, lineCount int, importCount int, symbols []string) string {
+	summary := fmt.Sprintf("%s is a %s file with %d line(s) and %d import/use statement(s).", path, role, lineCount, importCount)
+	if len(symbols) > 0 {
+		summary += " Rust semantic-core detected symbols: " + strings.Join(symbols[:min(len(symbols), 6)], ", ") + "."
+	}
+	return summary
+}
+
+func buildGoPathHints(path string, role string) []string {
+	hints := []string{"Go delivered this path explanation from Rust semantic-core path symbols."}
+	if role == "test" {
+		hints = append(hints, "Treat this as verification evidence before changing nearby source paths.")
+	}
+	if strings.Contains(path, "service") || strings.Contains(path, "workspace") {
+		hints = append(hints, "Check callers before changing this operational surface.")
+	}
+	return hints
 }
 
 func changePaths(changes []RepoChangeRecord, includeDeleted bool) []string {
