@@ -97,6 +97,23 @@ type PathSymbolsResult struct {
 	GeneratedAt     string             `json:"generated_at"`
 }
 
+type CodeExplainerResult struct {
+	WorkspaceID     string   `json:"workspace_id"`
+	Path            string   `json:"path"`
+	Role            string   `json:"role"`
+	LineCount       int      `json:"line_count"`
+	ImportCount     int      `json:"import_count"`
+	DetectedSymbols []string `json:"detected_symbols"`
+	SymbolSource    string   `json:"symbol_source"`
+	ParserLanguage  *string  `json:"parser_language,omitempty"`
+	EvidenceSource  string   `json:"evidence_source"`
+	SelectionReason string   `json:"selection_reason"`
+	Summary         string   `json:"summary"`
+	Hints           []string `json:"hints"`
+	Warnings        []string `json:"warnings"`
+	GeneratedAt     string   `json:"generated_at"`
+}
+
 func BuildRepoMap(ctx context.Context, workspaceID string, repoRoot string) (*RepoMapSummary, error) {
 	cmd := exec.CommandContext(
 		ctx,
@@ -202,6 +219,38 @@ func ExtractPathSymbols(ctx context.Context, workspaceID string, repoRoot string
 	var result PathSymbolsResult
 	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
 		return nil, fmt.Errorf("decode rust-core path symbols: %w", err)
+	}
+	return &result, nil
+}
+
+func ExplainPath(ctx context.Context, workspaceID string, repoRoot string, relativePath string) (*CodeExplainerResult, error) {
+	cmd := exec.CommandContext(
+		ctx,
+		"cargo",
+		"run",
+		"--quiet",
+		"--bin",
+		"xmustard-core",
+		"--",
+		"explain-path",
+		workspaceID,
+		repoRoot,
+		relativePath,
+	)
+	cmd.Dir = rustCoreDir()
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("rust-core explain-path failed: %w: %s", err, stderr.String())
+	}
+
+	var result CodeExplainerResult
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		return nil, fmt.Errorf("decode rust-core path explainer: %w", err)
 	}
 	return &result, nil
 }

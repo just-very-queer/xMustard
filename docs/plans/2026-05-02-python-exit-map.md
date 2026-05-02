@@ -75,6 +75,29 @@ This pass moved the first single-path semantic ownership cut toward Rust:
 
 This does not delete Python CLI compatibility yet. It does move the path-symbol/code-explainer meaning surface in the target Go API lane away from Python and keeps Go as delivery, Rust as meaning, and Postgres as the durable semantic storage direction.
 
+## Phase 3 Code-Explainer Substrate Reduction Landed
+
+This pass moved the next code-explainer ownership slice into Rust:
+
+- `rust-core/src/repomap.rs` now emits a `RustCodeExplainerResult` contract with path role, line/import counts, detected symbols, summary, hints, evidence source, and selection reason.
+- `xmustard-core explain-path` exposes that contract as JSON.
+- `api-go/internal/rustcore/repomap.go` invokes the Rust command and decodes the typed code-explainer contract.
+- `api-go/internal/workspaceops/workspace_reads.go` now serves `explain-path` by forwarding Rust semantic-core output instead of reading the file and assembling the semantic explanation in Go.
+
+This is still a narrow slice: Python compatibility commands and Postgres materialization helpers remain. The real authority reduction is that the target Go API lane no longer owns code-explainer semantic substrate locally, and Python is not reopened as the meaning owner for this path.
+
+## Phase 3 Diagnostics Contract Boundary Landed
+
+This pass also defined the first diagnostics/LSP-normalized boundary without implementing Python-first LSP:
+
+- `rust-core/src/contracts.rs` now exposes `diagnostics.normalized.v1`.
+- Rust is the owner for diagnostic meaning and normalization.
+- Go is the delivery owner.
+- Postgres `diagnostics` is the durable row target.
+- The required field set includes ranges, severity, source kind/name, rule code, fingerprint, and generated timestamp.
+
+This is a contract boundary, not a completed diagnostics runtime. It exists so the later LSP/diagnostics implementation has a Rust-owned shape before any compatibility wrapper can drift into becoming the owner.
+
 ## Phase 3 Boundary
 
 Phase 3 LSP/diagnostics should follow this ownership split:

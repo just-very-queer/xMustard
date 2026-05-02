@@ -19,10 +19,11 @@ Phase 3 is now the Python-exit and ownership-shift phase:
 - Postgres should remain the durable semantic state layer
 - Python should keep shrinking toward compatibility-only status until it can be deleted slice by slice
 
-The first two real Phase 3 cuts are already landed:
+The first Phase 3 authority cuts are already landed:
 
 - Go owns API delivery for `impact`, `repo-context`, and `retrieval-search`
 - Rust owns semantic impact calculation, changed-symbol extraction, provenance, and affected file/test ranking
+- Rust owns on-demand `path-symbols` extraction and the code-explainer semantic substrate consumed by Go delivery
 
 ## What xMustard Is
 
@@ -67,7 +68,8 @@ Phase 3 work now includes:
 
 - Go-owned repo-intelligence read delivery for `impact`, `repo-context`, and `retrieval-search`
 - Rust-owned semantic-impact generation consumed by Go delivery
-- Rust-owned on-demand path-symbol extraction consumed by Go `path-symbols` and `explain-path` delivery
+- Rust-owned on-demand path-symbol extraction consumed by Go `path-symbols` delivery
+- Rust-owned code-explainer substrate for `explain-path`, including path role, line/import counts, detected symbols, summary, hints, and provenance
 - a durable Python exit map to track what still belongs in Python temporarily and what should move next
 
 ## What This Repo Is Becoming

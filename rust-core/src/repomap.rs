@@ -165,6 +165,24 @@ pub struct RustPathSymbolsResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustCodeExplainerResult {
+    pub workspace_id: String,
+    pub path: String,
+    pub role: String,
+    pub line_count: usize,
+    pub import_count: usize,
+    pub detected_symbols: Vec<String>,
+    pub symbol_source: String,
+    pub parser_language: Option<String>,
+    pub evidence_source: String,
+    pub selection_reason: String,
+    pub summary: String,
+    pub hints: Vec<String>,
+    pub warnings: Vec<String>,
+    pub generated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RustImpactPathRecord {
     pub path: String,
     pub reason: String,
@@ -419,6 +437,42 @@ pub fn extract_path_symbols(
         selection_reason: "Go delivery consumed Rust semantic-core path symbols on demand.".to_string(),
         symbols,
         warnings,
+        generated_at: Utc::now().to_rfc3339(),
+    })
+}
+
+pub fn explain_path(
+    root_path: &Path,
+    workspace_id: &str,
+    relative_path: &str,
+) -> Result<RustCodeExplainerResult, std::io::Error> {
+    let symbols = extract_path_symbols(root_path, workspace_id, relative_path)?;
+    let content = fs::read_to_string(root_path.join(&symbols.path))?;
+    let role = repo_map_file_role(&symbols.path)
+        .unwrap_or("source")
+        .to_string();
+    let line_count = content.lines().count();
+    let import_count = count_import_like_lines(&content);
+    let detected_symbols = symbols
+        .symbols
+        .iter()
+        .take(8)
+        .map(|item| item.symbol.clone())
+        .collect::<Vec<_>>();
+    Ok(RustCodeExplainerResult {
+        workspace_id: workspace_id.to_string(),
+        path: symbols.path.clone(),
+        role: role.clone(),
+        line_count,
+        import_count,
+        detected_symbols: detected_symbols.clone(),
+        symbol_source: symbols.symbol_source,
+        parser_language: symbols.parser_language,
+        evidence_source: symbols.evidence_source,
+        selection_reason: "Rust semantic core owns code-explainer semantic substrate; Go only delivers this contract.".to_string(),
+        summary: build_path_explainer_summary(&symbols.path, &role, line_count, import_count, &detected_symbols),
+        hints: build_path_explainer_hints(&symbols.path, &role),
+        warnings: symbols.warnings,
         generated_at: Utc::now().to_rfc3339(),
     })
 }
@@ -706,6 +760,61 @@ fn sort_impact_paths(items: &mut [RustImpactPathRecord]) {
     });
 }
 
+fn count_import_like_lines(content: &str) -> usize {
+    content
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            trimmed.starts_with("import ")
+                || trimmed.starts_with("from ")
+                || trimmed.starts_with("use ")
+                || trimmed.starts_with("mod ")
+                || trimmed.starts_with("require(")
+                || trimmed.starts_with("const ")
+                    && trimmed.contains("require(")
+        })
+        .count()
+}
+
+fn build_path_explainer_summary(
+    path: &str,
+    role: &str,
+    line_count: usize,
+    import_count: usize,
+    symbols: &[String],
+) -> String {
+    let mut summary = format!(
+        "{path} is a {role} file with {line_count} line(s) and {import_count} import/reference line(s)."
+    );
+    if !symbols.is_empty() {
+        summary.push_str(&format!(
+            " Rust semantic core detected symbols: {}.",
+            symbols
+                .iter()
+                .take(6)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    summary
+}
+
+fn build_path_explainer_hints(path: &str, role: &str) -> Vec<String> {
+    let mut hints = vec![
+        "Rust semantic core owns this path explanation contract; Go delivery only forwards it."
+            .to_string(),
+    ];
+    if role == "test" || path.to_lowercase().contains("test") {
+        hints.push("Treat this as verification context before modifying runtime code.".to_string());
+    } else if path.ends_with(".md") || path.ends_with(".yaml") || path.ends_with(".yml") {
+        hints.push("Treat this as guidance/config context and check whether code agrees.".to_string());
+    } else {
+        hints.push("Use detected symbols as the first review anchors for this file.".to_string());
+    }
+    hints
+}
+
 fn push_unique(items: &mut Vec<String>, value: String, limit: usize) {
     if value.trim().is_empty() || items.iter().any(|item| item == &value) {
         return;
@@ -833,5 +942,31 @@ mod tests {
             .iter()
             .any(|item| item.symbol == "launch_runner" && item.kind == "function"));
         assert_eq!(result.evidence_source, "rust_semantic_core");
+    }
+
+    #[test]
+    fn explain_path_returns_rust_owned_code_explainer_contract() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+
+        write(
+            &root.join("src/app.py"),
+            "import os\n\nclass ExportService:\n    def export_summary(self):\n        return os.getcwd()\n",
+        );
+
+        let result = super::explain_path(root, "workspace-5", "src/app.py").unwrap();
+
+        assert_eq!(result.workspace_id, "workspace-5");
+        assert_eq!(result.path, "src/app.py");
+        assert_eq!(result.role, "source");
+        assert_eq!(result.import_count, 1);
+        assert!(result
+            .detected_symbols
+            .iter()
+            .any(|item| item == "ExportService"));
+        assert_eq!(result.evidence_source, "rust_semantic_core");
+        assert!(result
+            .selection_reason
+            .contains("code-explainer semantic substrate"));
     }
 }

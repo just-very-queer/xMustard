@@ -44,6 +44,18 @@ pub struct PythonBoundaryCutline {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiagnosticContract {
+    pub contract_id: &'static str,
+    pub owner: &'static str,
+    pub delivery_owner: &'static str,
+    pub durable_store: &'static str,
+    pub required_fields: Vec<&'static str>,
+    pub normalized_severities: Vec<&'static str>,
+    pub source_kinds: Vec<&'static str>,
+    pub notes: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ArchitectureContract {
     pub design_version: &'static str,
     pub steady_state_runtime_budget_mb: u16,
@@ -52,6 +64,7 @@ pub struct ArchitectureContract {
     pub python_end_state: &'static str,
     pub boundaries: Vec<SubsystemBoundary>,
     pub agent_surfaces: Vec<AgentSurface>,
+    pub diagnostics_contract: DiagnosticContract,
     pub next_removable_python_boundary: PythonBoundaryCutline,
 }
 
@@ -256,6 +269,33 @@ pub fn next_removable_python_boundary() -> PythonBoundaryCutline {
     }
 }
 
+pub fn diagnostics_contract_v1() -> DiagnosticContract {
+    DiagnosticContract {
+        contract_id: "diagnostics.normalized.v1",
+        owner: "rust-core",
+        delivery_owner: "api-go",
+        durable_store: "postgres.diagnostics",
+        required_fields: vec![
+            "workspace_id",
+            "path",
+            "range_start_line",
+            "range_start_column",
+            "range_end_line",
+            "range_end_column",
+            "severity",
+            "message",
+            "source_kind",
+            "source_name",
+            "rule_code",
+            "fingerprint",
+            "generated_at",
+        ],
+        normalized_severities: vec!["error", "warning", "info", "hint"],
+        source_kinds: vec!["lsp", "compiler", "test", "scanner", "manual"],
+        notes: "Rust normalizes diagnostic meaning from LSP/compiler/scanner inputs; Go delivers it; Postgres persists baselines and replayable rows. Python must not become the first LSP diagnostics owner.",
+    }
+}
+
 pub fn no_python_architecture_contract() -> ArchitectureContract {
     ArchitectureContract {
         design_version: "2026-04-18.no-python-control-plane",
@@ -265,13 +305,17 @@ pub fn no_python_architecture_contract() -> ArchitectureContract {
         python_end_state: "No Python service remains on the steady-state request path; Python is tolerated only as temporary migration tooling until deleted.",
         boundaries: planned_boundaries(),
         agent_surfaces: planned_agent_surfaces(),
+        diagnostics_contract: diagnostics_contract_v1(),
         next_removable_python_boundary: next_removable_python_boundary(),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{next_removable_python_boundary, no_python_architecture_contract, planned_boundaries};
+    use super::{
+        diagnostics_contract_v1, next_removable_python_boundary, no_python_architecture_contract,
+        planned_boundaries,
+    };
 
     #[test]
     fn boundaries_cover_core_migration_targets() {
@@ -313,5 +357,17 @@ mod tests {
         assert_eq!(cutline.target_owner, "api-go terminal/runtime shell + rust-core managed process runner");
         assert!(cutline.why_next.contains("Go now covers runtime argument parsing plus PTY terminal fidelity"));
         assert!(cutline.first_slice.contains("Move managed execution"));
+    }
+
+    #[test]
+    fn diagnostics_contract_sets_lsp_normalized_boundary() {
+        let contract = diagnostics_contract_v1();
+        assert_eq!(contract.contract_id, "diagnostics.normalized.v1");
+        assert_eq!(contract.owner, "rust-core");
+        assert_eq!(contract.delivery_owner, "api-go");
+        assert_eq!(contract.durable_store, "postgres.diagnostics");
+        assert!(contract.required_fields.contains(&"fingerprint"));
+        assert!(contract.normalized_severities.contains(&"warning"));
+        assert!(contract.source_kinds.contains(&"lsp"));
     }
 }

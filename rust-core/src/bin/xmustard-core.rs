@@ -135,6 +135,37 @@ fn main() {
                 }
             }
         }
+        "explain-path" => {
+            let Some(workspace_id) = args.next() else {
+                eprintln!("usage: xmustard-core explain-path <workspace_id> <root_path> <relative_path>");
+                std::process::exit(2);
+            };
+            let Some(root) = args.next() else {
+                eprintln!("usage: xmustard-core explain-path <workspace_id> <root_path> <relative_path>");
+                std::process::exit(2);
+            };
+            let Some(relative_path) = args.next() else {
+                eprintln!("usage: xmustard-core explain-path <workspace_id> <root_path> <relative_path>");
+                std::process::exit(2);
+            };
+            match xmustard_core::repomap::explain_path(
+                &PathBuf::from(root),
+                &workspace_id,
+                &relative_path,
+            ) {
+                Ok(result) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&result)
+                            .expect("path explainer result should serialize")
+                    );
+                }
+                Err(err) => {
+                    eprintln!("explain-path failed: {err}");
+                    std::process::exit(1);
+                }
+            }
+        }
         "parse-coverage-lcov" => {
             let Some(workspace_id) = args.next() else {
                 eprintln!(

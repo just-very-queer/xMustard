@@ -459,36 +459,25 @@ func ExplainPath(dataDir string, workspaceID string, relativePath string) (*Code
 	if err != nil {
 		return nil, err
 	}
-	content, err := os.ReadFile(filepath.Join(snapshot.Workspace.RootPath, normalized))
+	rustResult, err := readRustPathExplanation(workspaceID, snapshot.Workspace.RootPath, normalized)
 	if err != nil {
 		return nil, err
 	}
-	symbols, err := ReadPathSymbols(dataDir, workspaceID, normalized)
-	if err != nil {
-		return nil, err
-	}
-	detected := []string{}
-	for _, symbol := range symbols.Symbols[:min(len(symbols.Symbols), 8)] {
-		detected = append(detected, symbol.Symbol)
-	}
-	role := inferGoFileRole(normalized)
-	lineCount := len(strings.Split(string(content), "\n"))
-	importCount := countGoImports(string(content))
 	return &CodeExplainerResult{
-		WorkspaceID:     workspaceID,
-		Path:            normalized,
-		Role:            role,
-		LineCount:       lineCount,
-		ImportCount:     importCount,
-		DetectedSymbols: detected,
-		SymbolSource:    symbols.SymbolSource,
-		ParserLanguage:  symbols.ParserLanguage,
-		EvidenceSource:  symbols.EvidenceSource,
-		SelectionReason: symbols.SelectionReason,
-		Summary:         buildGoPathSummary(normalized, role, lineCount, importCount, detected),
-		Hints:           buildGoPathHints(normalized, role),
-		Warnings:        symbols.Warnings,
-		GeneratedAt:     nowUTC(),
+		WorkspaceID:     rustResult.WorkspaceID,
+		Path:            rustResult.Path,
+		Role:            rustResult.Role,
+		LineCount:       rustResult.LineCount,
+		ImportCount:     rustResult.ImportCount,
+		DetectedSymbols: rustResult.DetectedSymbols,
+		SymbolSource:    rustResult.SymbolSource,
+		ParserLanguage:  rustResult.ParserLanguage,
+		EvidenceSource:  rustResult.EvidenceSource,
+		SelectionReason: rustResult.SelectionReason,
+		Summary:         rustResult.Summary,
+		Hints:           rustResult.Hints,
+		Warnings:        rustResult.Warnings,
+		GeneratedAt:     rustResult.GeneratedAt,
 	}, nil
 }
 
@@ -956,6 +945,12 @@ func readRustPathSymbols(workspaceID string, rootPath string, relativePath strin
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 	return rustcore.ExtractPathSymbols(ctx, workspaceID, rootPath, relativePath)
+}
+
+func readRustPathExplanation(workspaceID string, rootPath string, relativePath string) (*rustcore.CodeExplainerResult, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	return rustcore.ExplainPath(ctx, workspaceID, rootPath, relativePath)
 }
 
 func convertRustChangedSymbols(items []rustcore.ChangedSymbolRecord) []ChangedSymbolRecord {
