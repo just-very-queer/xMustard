@@ -858,7 +858,7 @@ func buildContextRetrievalLedger(
 			SourceType:   "related_path",
 			SourceID:     path,
 			Title:        path,
-			Path:         stringPtr(path),
+			Path:         ptr(path),
 			Reason:       reason,
 			MatchedTerms: matches,
 			Score:        atLeastOne(10 - idx + len(matches)),

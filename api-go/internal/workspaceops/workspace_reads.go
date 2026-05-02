@@ -2,9 +2,13 @@ package workspaceops
 
 import (
 	"bufio"
+	"crypto/sha1"
 	"encoding/json"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 
@@ -84,6 +88,120 @@ type treeNode struct {
 	SizeBytes   *int64 `json:"size_bytes,omitempty"`
 }
 
+type RepoChangeRecord struct {
+	Path         string  `json:"path"`
+	Status       string  `json:"status"`
+	Scope        string  `json:"scope"`
+	PreviousPath *string `json:"previous_path,omitempty"`
+	Staged       bool    `json:"staged"`
+	Unstaged     bool    `json:"unstaged"`
+}
+
+type ChangedSymbolRecord struct {
+	Path            string   `json:"path"`
+	Symbol          string   `json:"symbol"`
+	Kind            string   `json:"kind"`
+	LineStart       *int     `json:"line_start,omitempty"`
+	LineEnd         *int     `json:"line_end,omitempty"`
+	EvidenceSource  string   `json:"evidence_source"`
+	SemanticStatus  *string  `json:"semantic_status,omitempty"`
+	SelectionReason string   `json:"selection_reason"`
+	ChangeScopes    []string `json:"change_scopes"`
+	ChangeStatuses  []string `json:"change_statuses"`
+}
+
+type ImpactPathRecord struct {
+	Path             string `json:"path"`
+	Reason           string `json:"reason"`
+	DerivationSource string `json:"derivation_source"`
+	Score            int    `json:"score"`
+}
+
+type ImpactReport struct {
+	WorkspaceID         string                `json:"workspace_id"`
+	BaseRef             string                `json:"base_ref"`
+	SemanticStatus      any                   `json:"semantic_status,omitempty"`
+	ChangedFiles        []RepoChangeRecord    `json:"changed_files"`
+	ChangedSymbols      []ChangedSymbolRecord `json:"changed_symbols"`
+	LikelyAffectedFiles []ImpactPathRecord    `json:"likely_affected_files"`
+	LikelyAffectedTests []ImpactPathRecord    `json:"likely_affected_tests"`
+	DerivationSummary   string                `json:"derivation_summary"`
+	Confidence          string                `json:"confidence"`
+	Warnings            []string              `json:"warnings"`
+	GeneratedAt         string                `json:"generated_at"`
+}
+
+type RetrievalSearchHit struct {
+	Path         string   `json:"path"`
+	SourceType   string   `json:"source_type"`
+	Title        string   `json:"title"`
+	Reason       string   `json:"reason"`
+	MatchedTerms []string `json:"matched_terms"`
+	Score        int      `json:"score"`
+}
+
+type RetrievalSearchResult struct {
+	WorkspaceID     string                        `json:"workspace_id"`
+	Query           string                        `json:"query"`
+	Hits            []RetrievalSearchHit          `json:"hits"`
+	RetrievalLedger []ContextRetrievalLedgerEntry `json:"retrieval_ledger"`
+	Warnings        []string                      `json:"warnings"`
+	GeneratedAt     string                        `json:"generated_at"`
+}
+
+type RepoContextTargetLink struct {
+	Target any    `json:"target"`
+	Reason string `json:"reason"`
+	Score  int    `json:"score"`
+}
+
+type RepoContextPlanLink struct {
+	RunID         string   `json:"run_id"`
+	IssueID       string   `json:"issue_id"`
+	Status        string   `json:"status"`
+	Phase         *string  `json:"phase,omitempty"`
+	OwnershipMode *string  `json:"ownership_mode,omitempty"`
+	OwnerLabel    *string  `json:"owner_label,omitempty"`
+	AttachedFiles []string `json:"attached_files"`
+	Reason        string   `json:"reason"`
+	Score         int      `json:"score"`
+}
+
+type RepoContextActivityLink struct {
+	Action    string  `json:"action"`
+	Summary   string  `json:"summary"`
+	IssueID   *string `json:"issue_id,omitempty"`
+	RunID     *string `json:"run_id,omitempty"`
+	CreatedAt string  `json:"created_at"`
+	Reason    string  `json:"reason"`
+	Score     int     `json:"score"`
+}
+
+type RepoContextFixLink struct {
+	FixID        string   `json:"fix_id"`
+	IssueID      string   `json:"issue_id"`
+	RunID        *string  `json:"run_id,omitempty"`
+	Summary      string   `json:"summary"`
+	ChangedFiles []string `json:"changed_files"`
+	TestsRun     []string `json:"tests_run"`
+	RecordedAt   string   `json:"recorded_at"`
+	Reason       string   `json:"reason"`
+}
+
+type RepoContextRecord struct {
+	WorkspaceID       string                        `json:"workspace_id"`
+	BaseRef           string                        `json:"base_ref"`
+	SemanticStatus    any                           `json:"semantic_status,omitempty"`
+	Impact            *ImpactReport                 `json:"impact"`
+	RunTargets        []RepoContextTargetLink       `json:"run_targets"`
+	VerifyTargets     []RepoContextTargetLink       `json:"verify_targets"`
+	PlanLinks         []RepoContextPlanLink         `json:"plan_links"`
+	RecentActivity    []RepoContextActivityLink     `json:"recent_activity"`
+	LatestAcceptedFix *RepoContextFixLink           `json:"latest_accepted_fix,omitempty"`
+	RetrievalLedger   []ContextRetrievalLedgerEntry `json:"retrieval_ledger"`
+	GeneratedAt       string                        `json:"generated_at"`
+}
+
 type runRecord struct {
 	RunID             string          `json:"run_id"`
 	WorkspaceID       string          `json:"workspace_id"`
@@ -110,6 +228,148 @@ type runRecord struct {
 	GuidancePaths     []string        `json:"guidance_paths"`
 	Summary           map[string]any  `json:"summary,omitempty"`
 	Plan              *RunPlan        `json:"plan,omitempty"`
+}
+
+func ReadImpact(dataDir string, workspaceID string, baseRef string) (*ImpactReport, error) {
+	if strings.TrimSpace(baseRef) == "" {
+		baseRef = "HEAD"
+	}
+	snapshot, err := loadSnapshot(dataDir, workspaceID)
+	if err != nil {
+		return nil, err
+	}
+	changes, warnings := readGoChangeRecords(snapshot.Workspace.RootPath, baseRef)
+	symbols := deriveChangedSymbols(snapshot.Workspace.RootPath, changes)
+	changedPaths := changePaths(changes, false)
+	affectedFiles, affectedTests := rankAffectedPaths(dataDir, workspaceID, snapshot.Workspace.RootPath, changedPaths, symbols)
+	confidence := "low"
+	if len(symbols) > 0 && (len(affectedFiles) > 0 || len(affectedTests) > 0) {
+		confidence = "high"
+	} else if len(changedPaths) > 0 {
+		confidence = "medium"
+	}
+	if len(changedPaths) == 0 {
+		warnings = append(warnings, "No changed files were detected from the current git comparison surface.")
+	} else if len(symbols) == 0 {
+		warnings = append(warnings, "Changed files were detected, but no symbol-level impact could be derived from the Go delivery floor.")
+	}
+	return &ImpactReport{
+		WorkspaceID:         workspaceID,
+		BaseRef:             baseRef,
+		ChangedFiles:        changes,
+		ChangedSymbols:      symbols,
+		LikelyAffectedFiles: affectedFiles,
+		LikelyAffectedTests: affectedTests,
+		DerivationSummary:   impactSummary(changedPaths, symbols, affectedFiles, affectedTests),
+		Confidence:          confidence,
+		Warnings:            dedupeStrings(warnings, 24),
+		GeneratedAt:         nowUTC(),
+	}, nil
+}
+
+func ReadRepoContext(dataDir string, workspaceID string, baseRef string) (*RepoContextRecord, error) {
+	impact, err := ReadImpact(dataDir, workspaceID, baseRef)
+	if err != nil {
+		return nil, err
+	}
+	referencePaths := map[string]struct{}{}
+	for _, path := range changePaths(impact.ChangedFiles, true) {
+		referencePaths[path] = struct{}{}
+	}
+	for _, item := range impact.LikelyAffectedFiles {
+		referencePaths[item.Path] = struct{}{}
+	}
+	for _, item := range impact.LikelyAffectedTests {
+		referencePaths[item.Path] = struct{}{}
+	}
+	planLinks := buildGoPlanLinks(dataDir, workspaceID, referencePaths)
+	activityLinks := buildGoActivityLinks(dataDir, workspaceID, referencePaths)
+	latestFix := buildGoLatestFix(dataDir, workspaceID, referencePaths)
+	ledger := buildRepoContextLedger(impact, planLinks, activityLinks, latestFix)
+	return &RepoContextRecord{
+		WorkspaceID:       workspaceID,
+		BaseRef:           impact.BaseRef,
+		Impact:            impact,
+		RunTargets:        []RepoContextTargetLink{},
+		VerifyTargets:     []RepoContextTargetLink{},
+		PlanLinks:         planLinks,
+		RecentActivity:    activityLinks,
+		LatestAcceptedFix: latestFix,
+		RetrievalLedger:   ledger,
+		GeneratedAt:       nowUTC(),
+	}, nil
+}
+
+func SearchRetrieval(dataDir string, workspaceID string, query string, limit int) (*RetrievalSearchResult, error) {
+	snapshot, err := loadSnapshot(dataDir, workspaceID)
+	if err != nil {
+		return nil, err
+	}
+	if limit <= 0 || limit > 50 {
+		limit = 12
+	}
+	tokens := queryTokens(query)
+	hits := []RetrievalSearchHit{}
+	seen := map[string]struct{}{}
+	push := func(hit RetrievalSearchHit) {
+		key := hit.SourceType + "\x00" + hit.Path + "\x00" + hit.Title
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		hits = append(hits, hit)
+	}
+	repoMap, err := loadOrBuildRepoMap(dataDir, workspaceID, snapshot.Workspace.RootPath)
+	if err == nil && repoMap != nil {
+		for _, file := range repoMap.KeyFiles {
+			matched := matchedTerms(strings.ToLower(file.Path+" "+file.Role), tokens)
+			if len(matched) == 0 {
+				continue
+			}
+			push(RetrievalSearchHit{Path: file.Path, SourceType: "lexical_hit", Title: file.Path, Reason: "Key repo-map path matched query terms: " + strings.Join(matched[:min(len(matched), 4)], ", ") + ".", MatchedTerms: matched, Score: 6 + len(matched)})
+		}
+		for _, file := range repoMap.KeyFiles {
+			if len(hits) >= limit {
+				break
+			}
+			pushContentHit(snapshot.Workspace.RootPath, file.Path, tokens, push)
+		}
+	}
+	for _, path := range candidateSourcePaths(snapshot.Workspace.RootPath, 80) {
+		if len(hits) >= limit*3 {
+			break
+		}
+		pushContentHit(snapshot.Workspace.RootPath, path, tokens, push)
+	}
+	for _, path := range dedupeStrings(hitPaths(hits), 24) {
+		for _, symbol := range extractSymbolsFromFile(snapshot.Workspace.RootPath, path) {
+			matched := matchedTerms(strings.ToLower(symbol.Symbol+" "+symbol.Kind), tokens)
+			if len(matched) == 0 {
+				continue
+			}
+			push(RetrievalSearchHit{Path: symbol.Path, SourceType: "structural_hit", Title: symbol.Kind + " " + symbol.Symbol, Reason: "Parser-lite symbol matched query terms: " + strings.Join(matched[:min(len(matched), 4)], ", ") + ".", MatchedTerms: matched, Score: 9 + len(matched)})
+		}
+	}
+	slices.SortFunc(hits, func(a, b RetrievalSearchHit) int {
+		if a.Score != b.Score {
+			return b.Score - a.Score
+		}
+		if a.SourceType != b.SourceType {
+			return strings.Compare(a.SourceType, b.SourceType)
+		}
+		return strings.Compare(a.Path+a.Title, b.Path+b.Title)
+	})
+	if len(hits) > limit {
+		hits = hits[:limit]
+	}
+	return &RetrievalSearchResult{
+		WorkspaceID:     workspaceID,
+		Query:           query,
+		Hits:            hits,
+		RetrievalLedger: retrievalLedgerFromHits(hits),
+		Warnings:        []string{"Go delivery owns this read path; stored semantic-match replay still belongs to the Python compatibility/Postgres semantic tranche."},
+		GeneratedAt:     nowUTC(),
+	}, nil
 }
 
 func ReadWorkspaceSnapshot(dataDir string, workspaceID string) (*workspaceSnapshot, error) {
@@ -466,4 +726,470 @@ func listRuns(dataDir string, workspaceID string) ([]runRecord, error) {
 		return 0
 	})
 	return runs, nil
+}
+
+func readGoChangeRecords(rootPath string, baseRef string) ([]RepoChangeRecord, []string) {
+	warnings := []string{}
+	if _, err := os.Stat(filepath.Join(rootPath, ".git")); err != nil {
+		return []RepoChangeRecord{}, []string{"Workspace is not a git repository; Go impact reads cannot derive changed files."}
+	}
+	records := map[string]RepoChangeRecord{}
+	diffCmd := exec.Command("git", "-C", rootPath, "diff", "--name-status", baseRef+"...HEAD")
+	if output, err := diffCmd.Output(); err == nil {
+		for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
+			if strings.TrimSpace(line) == "" {
+				continue
+			}
+			parts := strings.Fields(line)
+			if len(parts) < 2 {
+				continue
+			}
+			status := gitStatusName(parts[0])
+			path := parts[len(parts)-1]
+			var previous *string
+			if strings.HasPrefix(parts[0], "R") && len(parts) >= 3 {
+				value := parts[1]
+				previous = &value
+			}
+			records["since_ref:"+path] = RepoChangeRecord{Path: path, Status: status, Scope: "since_ref", PreviousPath: previous}
+		}
+	} else {
+		warnings = append(warnings, "Git base-ref comparison failed for "+baseRef+"; working-tree changes are still reported.")
+	}
+	statusCmd := exec.Command("git", "-C", rootPath, "status", "--porcelain=v1")
+	if output, err := statusCmd.Output(); err == nil {
+		for _, raw := range strings.Split(strings.TrimRight(string(output), "\n"), "\n") {
+			if len(raw) < 4 {
+				continue
+			}
+			code := raw[:2]
+			path := strings.TrimSpace(raw[3:])
+			if strings.Contains(path, " -> ") {
+				path = strings.TrimSpace(path[strings.LastIndex(path, " -> ")+4:])
+			}
+			status := gitStatusName(strings.TrimSpace(code))
+			if strings.HasPrefix(code, "??") {
+				status = "untracked"
+			}
+			records["working_tree:"+path] = RepoChangeRecord{
+				Path:     path,
+				Status:   status,
+				Scope:    "working_tree",
+				Staged:   code[0] != ' ' && code[0] != '?',
+				Unstaged: code[1] != ' ',
+			}
+		}
+	} else {
+		warnings = append(warnings, "Git working-tree status failed; Go impact reads may be incomplete.")
+	}
+	items := make([]RepoChangeRecord, 0, len(records))
+	for _, item := range records {
+		items = append(items, item)
+	}
+	slices.SortFunc(items, func(a, b RepoChangeRecord) int {
+		return strings.Compare(a.Path+a.Scope+a.Status, b.Path+b.Scope+b.Status)
+	})
+	return items, warnings
+}
+
+func gitStatusName(code string) string {
+	switch {
+	case strings.HasPrefix(code, "A"):
+		return "added"
+	case strings.HasPrefix(code, "D"):
+		return "deleted"
+	case strings.HasPrefix(code, "R"):
+		return "renamed"
+	case strings.HasPrefix(code, "C"):
+		return "copied"
+	case strings.Contains(code, "M"):
+		return "modified"
+	case strings.Contains(code, "?"):
+		return "untracked"
+	default:
+		return "unknown"
+	}
+}
+
+func deriveChangedSymbols(rootPath string, changes []RepoChangeRecord) []ChangedSymbolRecord {
+	symbols := []ChangedSymbolRecord{}
+	seen := map[string]int{}
+	for _, change := range changes {
+		if change.Status == "deleted" {
+			continue
+		}
+		for _, symbol := range extractSymbolsFromFile(rootPath, change.Path) {
+			key := symbol.Path + "\x00" + symbol.Symbol + "\x00" + symbol.Kind
+			index, ok := seen[key]
+			if ok {
+				symbols[index].ChangeScopes = dedupeStrings(append(symbols[index].ChangeScopes, change.Scope), 8)
+				symbols[index].ChangeStatuses = dedupeStrings(append(symbols[index].ChangeStatuses, change.Status), 8)
+				continue
+			}
+			symbol.ChangeScopes = []string{change.Scope}
+			symbol.ChangeStatuses = []string{change.Status}
+			seen[key] = len(symbols)
+			symbols = append(symbols, symbol)
+		}
+	}
+	return symbols
+}
+
+var goSymbolPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`^\s*def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(`),
+	regexp.MustCompile(`^\s*class\s+([A-Za-z_][A-Za-z0-9_]*)\b`),
+	regexp.MustCompile(`^\s*func\s+(?:\([^)]+\)\s*)?([A-Za-z_][A-Za-z0-9_]*)\s*\(`),
+	regexp.MustCompile(`^\s*(?:export\s+)?(?:function|class|interface|type)\s+([A-Za-z_][A-Za-z0-9_]*)\b`),
+}
+
+func extractSymbolsFromFile(rootPath string, relativePath string) []ChangedSymbolRecord {
+	content, err := os.ReadFile(filepath.Join(rootPath, filepath.FromSlash(relativePath)))
+	if err != nil {
+		return []ChangedSymbolRecord{}
+	}
+	lines := strings.Split(string(content), "\n")
+	out := []ChangedSymbolRecord{}
+	for index, line := range lines {
+		for _, pattern := range goSymbolPatterns {
+			match := pattern.FindStringSubmatch(line)
+			if len(match) < 2 {
+				continue
+			}
+			kind := "function"
+			trimmed := strings.TrimSpace(line)
+			if strings.HasPrefix(trimmed, "class ") || strings.Contains(trimmed, " class ") {
+				kind = "class"
+			} else if strings.HasPrefix(trimmed, "type ") || strings.Contains(trimmed, " type ") || strings.HasPrefix(trimmed, "interface ") {
+				kind = "type"
+			}
+			lineNo := index + 1
+			out = append(out, ChangedSymbolRecord{
+				Path:            filepath.ToSlash(relativePath),
+				Symbol:          match[1],
+				Kind:            kind,
+				LineStart:       &lineNo,
+				LineEnd:         &lineNo,
+				EvidenceSource:  "on_demand_parser",
+				SelectionReason: "Go delivery extracted symbols directly from the changed path.",
+			})
+			break
+		}
+		if len(out) >= 24 {
+			break
+		}
+	}
+	return out
+}
+
+func rankAffectedPaths(dataDir string, workspaceID string, rootPath string, changedPaths []string, symbols []ChangedSymbolRecord) ([]ImpactPathRecord, []ImpactPathRecord) {
+	repoMap, _ := loadOrBuildRepoMap(dataDir, workspaceID, rootPath)
+	tokens := []string{}
+	for _, path := range changedPaths {
+		tokens = append(tokens, pathTokens(path)...)
+	}
+	for _, symbol := range symbols {
+		tokens = append(tokens, strings.ToLower(symbol.Symbol))
+	}
+	tokens = dedupeStrings(tokens, 32)
+	files := []ImpactPathRecord{}
+	tests := []ImpactPathRecord{}
+	seen := map[string]struct{}{}
+	if repoMap != nil {
+		for _, item := range repoMap.KeyFiles {
+			if _, ok := seen[item.Path]; ok {
+				continue
+			}
+			if containsString(changedPaths, item.Path) {
+				continue
+			}
+			score := pathScore(item.Path, tokens)
+			if score == 0 {
+				continue
+			}
+			seen[item.Path] = struct{}{}
+			record := ImpactPathRecord{Path: item.Path, Reason: "Path matched changed-file or symbol terms.", DerivationSource: "lexical", Score: score}
+			if item.Role == "test" || strings.Contains(strings.ToLower(item.Path), "test") {
+				tests = append(tests, record)
+			} else {
+				files = append(files, record)
+			}
+		}
+	}
+	for _, path := range candidateSourcePaths(rootPath, 120) {
+		if _, ok := seen[path]; ok || containsString(changedPaths, path) {
+			continue
+		}
+		score := pathScore(path, tokens)
+		if score == 0 {
+			continue
+		}
+		record := ImpactPathRecord{Path: path, Reason: "Path matched changed-file or symbol terms.", DerivationSource: "lexical", Score: score}
+		if strings.Contains(strings.ToLower(path), "test") || strings.HasSuffix(strings.ToLower(path), ".spec.ts") {
+			tests = append(tests, record)
+		} else {
+			files = append(files, record)
+		}
+	}
+	sortImpactPaths(files)
+	sortImpactPaths(tests)
+	return files[:min(len(files), 10)], tests[:min(len(tests), 10)]
+}
+
+func sortImpactPaths(items []ImpactPathRecord) {
+	slices.SortFunc(items, func(a, b ImpactPathRecord) int {
+		if a.Score != b.Score {
+			return b.Score - a.Score
+		}
+		return strings.Compare(a.Path, b.Path)
+	})
+}
+
+func changePaths(changes []RepoChangeRecord, includeDeleted bool) []string {
+	paths := []string{}
+	for _, item := range changes {
+		if !includeDeleted && item.Status == "deleted" {
+			continue
+		}
+		paths = append(paths, item.Path)
+	}
+	return dedupeStrings(paths, 128)
+}
+
+func impactSummary(paths []string, symbols []ChangedSymbolRecord, files []ImpactPathRecord, tests []ImpactPathRecord) string {
+	return fmt.Sprintf("Go delivery derived %d changed file(s), %d changed symbol(s), %d likely affected file(s), and %d likely affected test(s).", len(paths), len(symbols), len(files), len(tests))
+}
+
+func buildGoPlanLinks(dataDir string, workspaceID string, referencePaths map[string]struct{}) []RepoContextPlanLink {
+	runs, err := listRuns(dataDir, workspaceID)
+	if err != nil {
+		return []RepoContextPlanLink{}
+	}
+	out := []RepoContextPlanLink{}
+	for _, run := range runs {
+		if run.Plan == nil {
+			continue
+		}
+		attached := []string{}
+		for _, step := range run.Plan.Steps {
+			for _, path := range step.FilesAffected {
+				if pathMatchesReference(path, referencePaths) {
+					attached = append(attached, path)
+				}
+			}
+		}
+		attached = dedupeStrings(attached, 24)
+		if len(attached) == 0 {
+			continue
+		}
+		phase := run.Plan.Phase
+		out = append(out, RepoContextPlanLink{RunID: run.RunID, IssueID: run.IssueID, Status: run.Status, Phase: &phase, AttachedFiles: attached, Reason: "Run plan references changed or affected paths.", Score: 8 + len(attached)})
+		if len(out) >= 8 {
+			break
+		}
+	}
+	return out
+}
+
+func buildGoActivityLinks(dataDir string, workspaceID string, referencePaths map[string]struct{}) []RepoContextActivityLink {
+	activity, err := ListWorkspaceActivity(dataDir, workspaceID, "", "", 80)
+	if err != nil {
+		return []RepoContextActivityLink{}
+	}
+	out := []RepoContextActivityLink{}
+	for _, item := range activity {
+		haystack := strings.ToLower(item.Summary + " " + joinDetails(item.Details))
+		if !textMatchesReferences(haystack, referencePaths) {
+			continue
+		}
+		out = append(out, RepoContextActivityLink{Action: item.Action, Summary: item.Summary, IssueID: item.IssueID, RunID: item.RunID, CreatedAt: item.CreatedAt, Reason: "Activity mentions a changed or affected path.", Score: 5})
+		if len(out) >= 8 {
+			break
+		}
+	}
+	return out
+}
+
+func buildGoLatestFix(dataDir string, workspaceID string, referencePaths map[string]struct{}) *RepoContextFixLink {
+	fixes, err := loadFixRecords(dataDir, workspaceID, "")
+	if err != nil {
+		return nil
+	}
+	for _, fix := range fixes {
+		for _, path := range fix.ChangedFiles {
+			if !pathMatchesReference(path, referencePaths) {
+				continue
+			}
+			return &RepoContextFixLink{FixID: fix.FixID, IssueID: fix.IssueID, RunID: fix.RunID, Summary: fix.Summary, ChangedFiles: fix.ChangedFiles, TestsRun: fix.TestsRun, RecordedAt: fix.RecordedAt, Reason: "Latest accepted fix touched changed or affected paths."}
+		}
+	}
+	return nil
+}
+
+func buildRepoContextLedger(impact *ImpactReport, plans []RepoContextPlanLink, activity []RepoContextActivityLink, fix *RepoContextFixLink) []ContextRetrievalLedgerEntry {
+	out := []ContextRetrievalLedgerEntry{}
+	for index, change := range impact.ChangedFiles[:min(len(impact.ChangedFiles), 10)] {
+		path := change.Path
+		out = append(out, ContextRetrievalLedgerEntry{EntryID: fmt.Sprintf("go_repo_context:change:%d:%s", index, shortHash(path)), SourceType: "lexical_hit", SourceID: "change:" + path, Title: change.Status + " " + path, Path: &path, Reason: "Changed file included by Go impact delivery.", Score: 8})
+	}
+	for index, symbol := range impact.ChangedSymbols[:min(len(impact.ChangedSymbols), 10)] {
+		path := symbol.Path
+		out = append(out, ContextRetrievalLedgerEntry{EntryID: fmt.Sprintf("go_repo_context:symbol:%d:%s", index, shortHash(symbol.Symbol)), SourceType: "structural_hit", SourceID: "symbol:" + path + ":" + symbol.Symbol, Title: symbol.Kind + " " + symbol.Symbol, Path: &path, Reason: "Changed symbol included by Go impact delivery.", MatchedTerms: []string{strings.ToLower(symbol.Symbol)}, Score: 10})
+	}
+	for index, plan := range plans[:min(len(plans), 5)] {
+		out = append(out, ContextRetrievalLedgerEntry{EntryID: fmt.Sprintf("go_repo_context:plan:%d:%s", index, plan.RunID), SourceType: "artifact", SourceID: "run_plan:" + plan.RunID, Title: "Run plan " + plan.RunID, Reason: plan.Reason, MatchedTerms: plan.AttachedFiles, Score: plan.Score})
+	}
+	for index, item := range activity[:min(len(activity), 5)] {
+		out = append(out, ContextRetrievalLedgerEntry{EntryID: fmt.Sprintf("go_repo_context:activity:%d:%s", index, shortHash(item.Summary)), SourceType: "artifact", SourceID: "activity:" + item.Action, Title: item.Summary, Reason: item.Reason, Score: item.Score})
+	}
+	if fix != nil {
+		out = append(out, ContextRetrievalLedgerEntry{EntryID: "go_repo_context:fix:" + fix.FixID, SourceType: "artifact", SourceID: "fix:" + fix.FixID, Title: fix.Summary, Reason: fix.Reason, MatchedTerms: fix.ChangedFiles, Score: 9})
+	}
+	return out
+}
+
+func queryTokens(query string) []string {
+	re := regexp.MustCompile(`[A-Za-z0-9_]{3,}`)
+	raw := re.FindAllString(strings.ToLower(query), -1)
+	out := []string{}
+	stop := map[string]struct{}{"the": {}, "and": {}, "for": {}, "with": {}, "from": {}, "that": {}, "this": {}}
+	for _, item := range raw {
+		if _, found := stop[item]; !found {
+			out = append(out, item)
+		}
+	}
+	deduped := dedupeStrings(out, 16)
+	return deduped[:min(len(deduped), 16)]
+}
+
+func candidateSourcePaths(rootPath string, limit int) []string {
+	out := []string{}
+	_ = filepath.WalkDir(rootPath, func(path string, entry os.DirEntry, err error) error {
+		if err != nil || len(out) >= limit {
+			return nil
+		}
+		name := entry.Name()
+		if entry.IsDir() {
+			if strings.HasPrefix(name, ".") || name == "node_modules" || name == "target" || name == "dist" || name == "__pycache__" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !isTextSource(name) {
+			return nil
+		}
+		rel, err := filepath.Rel(rootPath, path)
+		if err == nil {
+			out = append(out, filepath.ToSlash(rel))
+		}
+		return nil
+	})
+	return out
+}
+
+func isTextSource(name string) bool {
+	ext := strings.ToLower(filepath.Ext(name))
+	switch ext {
+	case ".go", ".py", ".ts", ".tsx", ".js", ".jsx", ".rs", ".md", ".json", ".yaml", ".yml", ".toml":
+		return true
+	default:
+		return false
+	}
+}
+
+func pushContentHit(rootPath string, relativePath string, tokens []string, push func(RetrievalSearchHit)) {
+	content, err := os.ReadFile(filepath.Join(rootPath, filepath.FromSlash(relativePath)))
+	if err != nil {
+		return
+	}
+	haystack := strings.ToLower(relativePath + " " + string(content[:min(len(content), 30000)]))
+	matched := matchedTerms(haystack, tokens)
+	if len(matched) == 0 {
+		return
+	}
+	push(RetrievalSearchHit{Path: relativePath, SourceType: "lexical_hit", Title: relativePath, Reason: "File path or content matched query terms: " + strings.Join(matched[:min(len(matched), 4)], ", ") + ".", MatchedTerms: matched, Score: 4 + len(matched)})
+}
+
+func retrievalLedgerFromHits(hits []RetrievalSearchHit) []ContextRetrievalLedgerEntry {
+	out := make([]ContextRetrievalLedgerEntry, 0, len(hits))
+	for index, hit := range hits {
+		path := hit.Path
+		out = append(out, ContextRetrievalLedgerEntry{EntryID: fmt.Sprintf("go_retrieval:%d:%s:%s", index, hit.SourceType, shortHash(hit.Title)), SourceType: hit.SourceType, SourceID: hit.SourceType + ":" + hit.Path + ":" + hit.Title, Title: hit.Title, Path: &path, Reason: hit.Reason, MatchedTerms: hit.MatchedTerms, Score: hit.Score})
+	}
+	return out
+}
+
+func pathTokens(path string) []string {
+	re := regexp.MustCompile(`[A-Za-z0-9_]{3,}`)
+	return re.FindAllString(strings.ToLower(strings.ReplaceAll(path, "/", " ")), -1)
+}
+
+func matchedTerms(haystack string, tokens []string) []string {
+	out := []string{}
+	for _, token := range tokens {
+		if strings.Contains(haystack, token) {
+			out = append(out, token)
+		}
+	}
+	return out
+}
+
+func pathScore(path string, tokens []string) int {
+	score := 0
+	lower := strings.ToLower(path)
+	for _, token := range tokens {
+		if strings.Contains(lower, token) {
+			score += 3
+		}
+	}
+	return score
+}
+
+func hitPaths(hits []RetrievalSearchHit) []string {
+	out := make([]string, 0, len(hits))
+	for _, hit := range hits {
+		out = append(out, hit.Path)
+	}
+	return out
+}
+
+func pathMatchesReference(path string, references map[string]struct{}) bool {
+	lower := strings.ToLower(path)
+	for reference := range references {
+		ref := strings.ToLower(reference)
+		if lower == ref || strings.Contains(lower, ref) || strings.Contains(ref, lower) {
+			return true
+		}
+	}
+	return false
+}
+
+func textMatchesReferences(text string, references map[string]struct{}) bool {
+	for reference := range references {
+		if strings.Contains(text, strings.ToLower(reference)) {
+			return true
+		}
+	}
+	return false
+}
+
+func joinDetails(details map[string]any) string {
+	parts := []string{}
+	for key, value := range details {
+		parts = append(parts, key, fmt.Sprint(value))
+	}
+	return strings.Join(parts, " ")
+}
+
+func containsString(items []string, needle string) bool {
+	for _, item := range items {
+		if item == needle {
+			return true
+		}
+	}
+	return false
+}
+
+func shortHash(value string) string {
+	sum := sha1.Sum([]byte(value))
+	return fmt.Sprintf("%x", sum)[:8]
 }

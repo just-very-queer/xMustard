@@ -31,7 +31,7 @@
     "group": "workspace_snapshot",
     "current_owner": "api-go",
     "target_owner": "api-go",
-    "notes": "Workspace loading, snapshots, activity, sources, tree, guidance, repo config, repo-intelligence planning, structural symbol reads, semantic pattern queries, semantic Postgres materialization hooks, and export. The Go shell now owns workspace listing, fresh and cached workspace load, explicit workspace scan, snapshot reads, activity feeds, activity overview, sources, worktree reads, repo-state and ingestion-plan reads, change reads, run/verify target reads, explain-path, path-symbol, path-symbol materialization, workspace semantic-index materialization, semantic-search reads, semantic-search materialization, tree browsing, guidance discovery, repo-config reads, repo-map reads, export bundle reads, and saved-view CRUD against the existing tracker workspace artifacts.",
+    "notes": "Workspace loading, snapshots, activity, sources, tree, guidance, repo config, repo-intelligence planning, structural symbol reads, semantic pattern queries, semantic Postgres materialization hooks, and export. The Go shell now owns workspace listing, fresh and cached workspace load, explicit workspace scan, snapshot reads, activity feeds, activity overview, sources, worktree reads, repo-state and ingestion-plan reads, change reads, run/verify target reads, impact reads, repo-context reads, retrieval-search reads, explain-path, path-symbol, path-symbol materialization, workspace semantic-index materialization, semantic-search reads, semantic-search materialization, tree browsing, guidance discovery, repo-config reads, repo-map reads, export bundle reads, and saved-view CRUD against the existing tracker workspace artifacts.",
     "endpoints": [
       "/api/workspaces",
       "/api/workspaces/load",
@@ -45,6 +45,9 @@
       "/api/workspaces/{workspace_id}/changes",
       "/api/workspaces/{workspace_id}/run-targets",
       "/api/workspaces/{workspace_id}/verify-targets",
+      "/api/workspaces/{workspace_id}/impact",
+      "/api/workspaces/{workspace_id}/repo-context",
+      "/api/workspaces/{workspace_id}/retrieval-search",
       "/api/workspaces/{workspace_id}/explain-path",
       "/api/workspaces/{workspace_id}/path-symbols",
       "/api/workspaces/{workspace_id}/path-symbols/materialize",

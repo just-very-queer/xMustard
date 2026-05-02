@@ -1,6 +1,11 @@
 package workspaceops
 
-import "testing"
+import (
+	"os"
+	"os/exec"
+	"path/filepath"
+	"testing"
+)
 
 func TestWorkspaceReadHelpersReturnSnapshotArtifacts(t *testing.T) {
 	dataDir, workspaceID, issueID, _ := writeIssueContextFixture(t, false)
@@ -75,5 +80,51 @@ func TestReadActivityOverviewMatchesTrackerRollups(t *testing.T) {
 	}
 	if overview.MostRecentAt == nil || *overview.MostRecentAt != "2026-04-14T10:03:00Z" {
 		t.Fatalf("unexpected most recent activity timestamp: %#v", overview.MostRecentAt)
+	}
+}
+
+func TestGoRepoIntelligenceReadsImpactContextAndRetrieval(t *testing.T) {
+	dataDir, workspaceID, _, repoRoot := writeIssueContextFixture(t, false)
+
+	runGit(t, repoRoot, "init")
+	runGit(t, repoRoot, "add", ".")
+	runGit(t, repoRoot, "-c", "user.name=xmustard", "-c", "user.email=xmustard@example.com", "commit", "-m", "fixture")
+	if err := os.WriteFile(filepath.Join(repoRoot, "src", "app.py"), []byte("class ExportService:\n    def export_summary(self):\n        return 'changed'\n"), 0o644); err != nil {
+		t.Fatalf("modify source: %v", err)
+	}
+
+	impact, err := ReadImpact(dataDir, workspaceID, "HEAD")
+	if err != nil {
+		t.Fatalf("read impact: %v", err)
+	}
+	if len(impact.ChangedFiles) == 0 || len(impact.ChangedSymbols) == 0 {
+		t.Fatalf("expected changed files and symbols, got %#v", impact)
+	}
+	if impact.Confidence == "low" {
+		t.Fatalf("expected useful confidence, got %#v", impact)
+	}
+
+	context, err := ReadRepoContext(dataDir, workspaceID, "HEAD")
+	if err != nil {
+		t.Fatalf("read repo context: %v", err)
+	}
+	if context.Impact == nil || len(context.RetrievalLedger) == 0 || context.LatestAcceptedFix == nil {
+		t.Fatalf("expected impact, ledger, and fix link, got %#v", context)
+	}
+
+	retrieval, err := SearchRetrieval(dataDir, workspaceID, "export summary", 5)
+	if err != nil {
+		t.Fatalf("search retrieval: %v", err)
+	}
+	if len(retrieval.Hits) == 0 || len(retrieval.RetrievalLedger) == 0 {
+		t.Fatalf("expected retrieval hits and ledger, got %#v", retrieval)
+	}
+}
+
+func runGit(t *testing.T, repoRoot string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", append([]string{"-C", repoRoot}, args...)...)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %v failed: %v\n%s", args, err, output)
 	}
 }
