@@ -476,7 +476,7 @@ class ChangedSymbolRecord(BaseModel):
     kind: Literal["function", "class", "method", "type", "module"] = "function"
     line_start: Optional[int] = None
     line_end: Optional[int] = None
-    evidence_source: Literal["stored_semantic", "on_demand_parser"] = "on_demand_parser"
+    evidence_source: Literal["stored_semantic", "on_demand_parser", "rust_semantic_core"] = "on_demand_parser"
     semantic_status: Optional[Literal["fresh", "stale", "dirty_provisional", "no_baseline", "blocked"]] = None
     selection_reason: str = ""
     change_scopes: list[Literal["since_ref", "working_tree"]] = Field(default_factory=list)
@@ -523,7 +523,7 @@ class CodeExplainerResult(BaseModel):
     detected_symbols: list[str] = Field(default_factory=list)
     symbol_source: Literal["tree_sitter", "regex", "none"] = "none"
     parser_language: Optional[str] = None
-    evidence_source: Literal["stored_semantic", "on_demand_parser"] = "on_demand_parser"
+    evidence_source: Literal["stored_semantic", "on_demand_parser", "rust_semantic_core"] = "on_demand_parser"
     selection_reason: str = ""
     semantic_status: Optional["SemanticIndexStatus"] = None
     summary: str
@@ -537,7 +537,7 @@ class PathSymbolsResult(BaseModel):
     path: str
     symbol_source: Literal["tree_sitter", "regex", "none"] = "none"
     parser_language: Optional[str] = None
-    evidence_source: Literal["stored_semantic", "on_demand_parser"] = "on_demand_parser"
+    evidence_source: Literal["stored_semantic", "on_demand_parser", "rust_semantic_core"] = "on_demand_parser"
     selection_reason: str = ""
     semantic_status: Optional["SemanticIndexStatus"] = None
     symbols: list["RepoMapSymbolRecord"] = Field(default_factory=list)
@@ -1455,7 +1455,7 @@ class RepoMapSymbolRecord(BaseModel):
     line_start: Optional[int] = None
     line_end: Optional[int] = None
     enclosing_scope: Optional[str] = None
-    evidence_source: Literal["stored_semantic", "on_demand_parser"] = "on_demand_parser"
+    evidence_source: Literal["stored_semantic", "on_demand_parser", "rust_semantic_core"] = "on_demand_parser"
     reason: Optional[str] = None
     score: int = 0
 

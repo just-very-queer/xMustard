@@ -10,6 +10,8 @@ from app import cli as cli_module
 from app.models import (
     DiscoverySignal,
     EvidenceRef,
+    FileSymbolSummaryMaterializationRecord,
+    PathSymbolsResult,
     PostgresSemanticMaterializationResult,
     PostgresWorkspaceSemanticMaterializationResult,
     PostgresBootstrapResult,
@@ -19,6 +21,7 @@ from app.models import (
     SemanticPatternMatchRecord,
     RunRecord,
     RuntimeProbeResult,
+    SymbolMaterializationRecord,
     VerificationSummary,
     WorkspaceLoadRequest,
 )
@@ -184,20 +187,59 @@ reviews:
     def test_cli_path_symbols_reports_tree_sitter_metadata(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             service, workspace_id = self._create_service(tmp_dir)
-            fake_symbols = [
-                RepoMapSymbolRecord(path="api/src/example.py", symbol="ApiHandler", kind="class", line_start=1, line_end=3),
-                RepoMapSymbolRecord(
+            rust_result = PathSymbolsResult(
+                workspace_id=workspace_id,
+                path="api/src/example.py",
+                symbol_source="tree_sitter",
+                parser_language="python",
+                evidence_source="rust_semantic_core",
+                selection_reason="Rust semantic core produced on-demand path symbols for the requested file.",
+                symbols=[
+                    RepoMapSymbolRecord(path="api/src/example.py", symbol="ApiHandler", kind="class", line_start=1, line_end=3, evidence_source="rust_semantic_core"),
+                    RepoMapSymbolRecord(
+                        path="api/src/example.py",
+                        symbol="render_payload",
+                        kind="method",
+                        line_start=2,
+                        line_end=3,
+                        enclosing_scope="ApiHandler",
+                        evidence_source="rust_semantic_core",
+                    ),
+                ],
+                file_summary_row=FileSymbolSummaryMaterializationRecord(
+                    workspace_id=workspace_id,
                     path="api/src/example.py",
-                    symbol="render_payload",
-                    kind="method",
-                    line_start=2,
-                    line_end=3,
-                    enclosing_scope="ApiHandler",
+                    language="python",
+                    parser_language="python",
+                    symbol_source="tree_sitter",
+                    symbol_count=2,
+                    summary_json={"top_symbols": ["ApiHandler", "render_payload"]},
                 ),
-            ]
+                symbol_rows=[
+                    SymbolMaterializationRecord(
+                        workspace_id=workspace_id,
+                        path="api/src/example.py",
+                        symbol="ApiHandler",
+                        kind="class",
+                        language="python",
+                        line_start=1,
+                        line_end=3,
+                    ),
+                    SymbolMaterializationRecord(
+                        workspace_id=workspace_id,
+                        path="api/src/example.py",
+                        symbol="render_payload",
+                        kind="method",
+                        language="python",
+                        line_start=2,
+                        line_end=3,
+                        enclosing_scope="ApiHandler",
+                    ),
+                ],
+            )
 
             with patch.object(cli_module, "service", service):
-                with patch("app.service.extract_path_symbols", return_value=(fake_symbols, "tree_sitter", "python")):
+                with patch.object(service, "_read_path_symbols_via_rust", return_value=rust_result):
                     result = self.runner.invoke(cli_module.app, ["path-symbols", workspace_id, "--path", "api/src/example.py"])
 
             self.assertEqual(result.exit_code, 0, msg=result.output)

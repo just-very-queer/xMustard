@@ -3931,6 +3931,14 @@ class TrackerService:
         stored = self._read_fresh_stored_path_symbols(workspace_id, normalized, semantic_status=semantic_status)
         if stored is not None:
             return stored
+        rust_result = self._read_path_symbols_via_rust(
+            workspace_id,
+            root,
+            normalized,
+            semantic_status=semantic_status,
+        )
+        if rust_result is not None:
+            return rust_result
         content = path.read_text(encoding="utf-8", errors="ignore")
         symbols, symbol_source, parser_language = self._extract_path_symbol_records(Path(normalized), content)
         file_summary_row, symbol_rows = self._build_symbol_materialization_rows(
@@ -4021,7 +4029,7 @@ class TrackerService:
                 path=path,
                 limit=limit,
             )
-        except (RuntimeError, ValueError):
+        except Exception:
             return []
 
     def search_retrieval(
@@ -4160,23 +4168,53 @@ class TrackerService:
         workspace = self.get_workspace(workspace_id)
         root = Path(workspace.root_path).resolve()
         normalized, path = self._resolve_workspace_file(root, relative_path)
-        content = path.read_text(encoding="utf-8", errors="ignore")
-        line_count = len(content.splitlines())
-        import_count = self._count_imports(path, content)
         semantic_status = self._best_effort_semantic_status(workspace_id, [normalized])
         stored = self._read_fresh_stored_path_symbols(workspace_id, normalized, semantic_status=semantic_status)
         if stored is not None:
+            content = path.read_text(encoding="utf-8", errors="ignore")
+            line_count = len(content.splitlines())
+            import_count = self._count_imports(path, content)
             symbol_records = stored.symbols
             symbol_source = stored.symbol_source
             parser_language = stored.parser_language
             evidence_source = stored.evidence_source
             selection_reason = stored.selection_reason
             warnings = stored.warnings
-        else:
-            symbol_records, symbol_source, parser_language = self._extract_path_symbol_records(Path(normalized), content)
-            evidence_source = "on_demand_parser"
-            selection_reason = self._fallback_selection_reason(semantic_status)
-            warnings = self._semantic_consumer_warnings(semantic_status, using_stored=False)
+            symbols = [item.symbol for item in symbol_records[:12]]
+            role = self._infer_file_role(root, path)
+            summary = self._build_path_summary(normalized, role, line_count, import_count, symbols)
+            hints = self._build_path_hints(normalized, role)
+            return CodeExplainerResult(
+                workspace_id=workspace_id,
+                path=normalized,
+                role=role,
+                line_count=line_count,
+                import_count=import_count,
+                detected_symbols=symbols[:8],
+                symbol_source=symbol_source,
+                parser_language=parser_language,
+                evidence_source=evidence_source,
+                selection_reason=selection_reason,
+                semantic_status=semantic_status,
+                summary=summary,
+                hints=hints,
+                warnings=warnings,
+            )
+        rust_result = self._explain_path_via_rust(
+            workspace_id,
+            root,
+            normalized,
+            semantic_status=semantic_status,
+        )
+        if rust_result is not None:
+            return rust_result
+        content = path.read_text(encoding="utf-8", errors="ignore")
+        line_count = len(content.splitlines())
+        import_count = self._count_imports(path, content)
+        symbol_records, symbol_source, parser_language = self._extract_path_symbol_records(Path(normalized), content)
+        evidence_source = "on_demand_parser"
+        selection_reason = self._fallback_selection_reason(semantic_status)
+        warnings = self._semantic_consumer_warnings(semantic_status, using_stored=False)
         symbols = [item.symbol for item in symbol_records[:12]]
         role = self._infer_file_role(root, path)
         summary = self._build_path_summary(normalized, role, line_count, import_count, symbols)
@@ -4802,7 +4840,7 @@ class TrackerService:
                 strategy="paths",
                 paths=normalized_paths[:12],
             )
-        except (FileNotFoundError, RuntimeError, ValueError):
+        except Exception:
             return None
 
     def _stored_selection_reason(self, status: Optional[SemanticIndexStatus]) -> str:
@@ -4835,6 +4873,117 @@ class TrackerService:
             elif status.status == "dirty_provisional":
                 warnings.append("Stored semantic rows are being used, but the worktree is dirty so freshness is provisional.")
         return self._dedupe_text(warnings)
+
+    def _run_rust_core_json_command(
+        self,
+        command_name: str,
+        *args: str,
+    ) -> Optional[dict]:
+        repo_root = Path(__file__).resolve().parents[2]
+        rust_core_dir = repo_root / "rust-core"
+        if not rust_core_dir.exists():
+            return None
+
+        explicit_bin = os.environ.get("XMUSTARD_RUST_CORE_BIN")
+        if explicit_bin:
+            command_line = [explicit_bin, command_name, *args]
+            cwd = repo_root
+        else:
+            command_line = [
+                "cargo",
+                "run",
+                "--quiet",
+                "--bin",
+                "xmustard-core",
+                "--",
+                command_name,
+                *args,
+            ]
+            cwd = rust_core_dir
+
+        try:
+            completed = subprocess.run(command_line, capture_output=True, text=True, check=False, cwd=cwd)
+        except FileNotFoundError:
+            return None
+
+        if completed.returncode != 0:
+            return None
+
+        try:
+            payload = json.loads(completed.stdout)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        return payload
+
+    def _read_path_symbols_via_rust(
+        self,
+        workspace_id: str,
+        root: Path,
+        relative_path: str,
+        *,
+        semantic_status: Optional[SemanticIndexStatus] = None,
+    ) -> Optional[PathSymbolsResult]:
+        payload = self._run_rust_core_json_command(
+            "path-symbols",
+            workspace_id,
+            str(root),
+            relative_path,
+        )
+        if payload is None:
+            return None
+        try:
+            result = PathSymbolsResult.model_validate(payload)
+        except Exception:
+            return None
+        selection_reason = self._fallback_selection_reason(semantic_status)
+        if result.selection_reason:
+            selection_reason = f"{selection_reason} {result.selection_reason}".strip()
+        return result.model_copy(
+            update={
+                "selection_reason": selection_reason,
+                "semantic_status": semantic_status,
+                "symbols": result.symbols[:24],
+                "symbol_rows": result.symbol_rows[:24],
+                "warnings": self._dedupe_text(
+                    [*result.warnings, *self._semantic_consumer_warnings(semantic_status, using_stored=False)]
+                ),
+            }
+        )
+
+    def _explain_path_via_rust(
+        self,
+        workspace_id: str,
+        root: Path,
+        relative_path: str,
+        *,
+        semantic_status: Optional[SemanticIndexStatus] = None,
+    ) -> Optional[CodeExplainerResult]:
+        payload = self._run_rust_core_json_command(
+            "explain-path",
+            workspace_id,
+            str(root),
+            relative_path,
+        )
+        if payload is None:
+            return None
+        try:
+            result = CodeExplainerResult.model_validate(payload)
+        except Exception:
+            return None
+        selection_reason = self._fallback_selection_reason(semantic_status)
+        if result.selection_reason:
+            selection_reason = f"{selection_reason} {result.selection_reason}".strip()
+        return result.model_copy(
+            update={
+                "selection_reason": selection_reason,
+                "semantic_status": semantic_status,
+                "warnings": self._dedupe_text(
+                    [*result.warnings, *self._semantic_consumer_warnings(semantic_status, using_stored=False)]
+                ),
+            }
+        )
 
     def _derive_changed_symbols(
         self,

@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 from app.models import (
     BrowserDumpUpsertRequest,
+    CodeExplainerResult,
     DiscoverySignal,
     EvidenceRef,
     EvalScenarioUpsertRequest,
@@ -2995,7 +2996,7 @@ class RuntimeSummaryTests(unittest.TestCase):
             ):
                 result = service.read_path_symbols(snapshot.workspace.workspace_id, "api/src/example.py")
 
-            self.assertEqual(result.evidence_source, "on_demand_parser")
+            self.assertEqual(result.evidence_source, "rust_semantic_core")
             self.assertIn("blocked", result.selection_reason.lower())
             self.assertTrue(any("Postgres DSN is not configured" in item for item in result.warnings))
 
@@ -3436,7 +3437,7 @@ class RuntimeSummaryTests(unittest.TestCase):
             self.assertTrue(any("On-demand parser-backed symbol extraction" in item for item in phases["tree_sitter_index"].evidence))
             self.assertTrue(any(item.startswith("total_files=") for item in phases["repo_map"].evidence))
 
-    def test_path_symbols_and_explainer_use_tree_sitter_records(self):
+    def test_path_symbols_and_explainer_prefer_rust_semantic_contracts_when_stored_rows_are_absent(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir) / "repo"
             (root / "docs" / "bugs").mkdir(parents=True)
@@ -3452,24 +3453,86 @@ class RuntimeSummaryTests(unittest.TestCase):
             snapshot = service.load_workspace(WorkspaceLoadRequest(root_path=str(root), auto_scan=True))
             assert snapshot is not None
 
-            fake_symbols = [
-                RepoMapSymbolRecord(path="api/src/example.py", symbol="ApiHandler", kind="class", line_start=1, line_end=3),
-                RepoMapSymbolRecord(
+            rust_path_symbols = PathSymbolsResult(
+                workspace_id=snapshot.workspace.workspace_id,
+                path="api/src/example.py",
+                symbol_source="tree_sitter",
+                parser_language="python",
+                evidence_source="rust_semantic_core",
+                selection_reason="Rust semantic core produced on-demand path symbols for the requested file.",
+                symbols=[
+                    RepoMapSymbolRecord(
+                        path="api/src/example.py",
+                        symbol="ApiHandler",
+                        kind="class",
+                        line_start=1,
+                        line_end=3,
+                        evidence_source="rust_semantic_core",
+                    ),
+                    RepoMapSymbolRecord(
+                        path="api/src/example.py",
+                        symbol="render_payload",
+                        kind="method",
+                        line_start=2,
+                        line_end=3,
+                        enclosing_scope="ApiHandler",
+                        evidence_source="rust_semantic_core",
+                    ),
+                ],
+                file_summary_row=FileSymbolSummaryMaterializationRecord(
+                    workspace_id=snapshot.workspace.workspace_id,
                     path="api/src/example.py",
-                    symbol="render_payload",
-                    kind="method",
-                    line_start=2,
-                    line_end=3,
-                    enclosing_scope="ApiHandler",
+                    language="python",
+                    parser_language="python",
+                    symbol_source="tree_sitter",
+                    symbol_count=2,
+                    summary_json={"top_symbols": ["ApiHandler", "render_payload"]},
                 ),
-            ]
+                symbol_rows=[
+                    SymbolMaterializationRecord(
+                        workspace_id=snapshot.workspace.workspace_id,
+                        path="api/src/example.py",
+                        symbol="ApiHandler",
+                        kind="class",
+                        language="python",
+                        line_start=1,
+                        line_end=3,
+                    ),
+                    SymbolMaterializationRecord(
+                        workspace_id=snapshot.workspace.workspace_id,
+                        path="api/src/example.py",
+                        symbol="render_payload",
+                        kind="method",
+                        language="python",
+                        line_start=2,
+                        line_end=3,
+                        enclosing_scope="ApiHandler",
+                    ),
+                ],
+            )
+            rust_explainer = CodeExplainerResult(
+                workspace_id=snapshot.workspace.workspace_id,
+                path="api/src/example.py",
+                role="source",
+                line_count=3,
+                import_count=0,
+                detected_symbols=["ApiHandler", "render_payload"],
+                symbol_source="tree_sitter",
+                parser_language="python",
+                evidence_source="rust_semantic_core",
+                selection_reason="Rust semantic core owns code-explainer semantic substrate for this path.",
+                summary="api/src/example.py looks like a source file with 3 line(s). Top-level symbols include ApiHandler, render_payload.",
+                hints=["This is likely part of the code path that an agent may need to inspect or edit."],
+            )
 
-            with patch("app.service.extract_path_symbols", return_value=(fake_symbols, "tree_sitter", "python")):
-                result = service.read_path_symbols(snapshot.workspace.workspace_id, "api/src/example.py")
-                explained = service.explain_path(snapshot.workspace.workspace_id, "api/src/example.py")
+            with patch.object(service, "_read_path_symbols_via_rust", return_value=rust_path_symbols):
+                with patch.object(service, "_explain_path_via_rust", return_value=rust_explainer):
+                    result = service.read_path_symbols(snapshot.workspace.workspace_id, "api/src/example.py")
+                    explained = service.explain_path(snapshot.workspace.workspace_id, "api/src/example.py")
 
             self.assertEqual(result.symbol_source, "tree_sitter")
             self.assertEqual(result.parser_language, "python")
+            self.assertEqual(result.evidence_source, "rust_semantic_core")
             self.assertEqual([item.symbol for item in result.symbols], ["ApiHandler", "render_payload"])
             self.assertEqual(result.symbols[1].enclosing_scope, "ApiHandler")
             self.assertIsNotNone(result.file_summary_row)
@@ -3479,6 +3542,7 @@ class RuntimeSummaryTests(unittest.TestCase):
             self.assertEqual([item.symbol for item in result.symbol_rows], ["ApiHandler", "render_payload"])
             self.assertEqual(explained.symbol_source, "tree_sitter")
             self.assertEqual(explained.parser_language, "python")
+            self.assertEqual(explained.evidence_source, "rust_semantic_core")
             self.assertIn("render_payload", explained.detected_symbols)
 
     def test_path_symbols_prefers_fresh_stored_postgres_rows(self):
@@ -3544,13 +3608,13 @@ class RuntimeSummaryTests(unittest.TestCase):
             with patch("app.service.read_latest_semantic_index_baseline", return_value=baseline):
                 with patch("app.service.read_file_symbol_summary", return_value=stored_summary):
                     with patch("app.service.read_symbols_for_path", return_value=stored_symbols):
-                        with patch("app.service.extract_path_symbols") as extract_mock:
+                        with patch.object(service, "_read_path_symbols_via_rust") as rust_mock:
                             result = service.read_path_symbols(snapshot.workspace.workspace_id, "api/src/example.py")
 
             self.assertEqual([item.symbol for item in result.symbols], ["stored_symbol"])
             self.assertEqual(result.symbol_source, "tree_sitter")
             self.assertEqual(result.file_summary_row, stored_summary)
-            extract_mock.assert_not_called()
+            rust_mock.assert_not_called()
 
     def test_code_explainer_prefers_fresh_stored_postgres_symbols(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -3614,14 +3678,14 @@ class RuntimeSummaryTests(unittest.TestCase):
             with patch("app.service.read_latest_semantic_index_baseline", return_value=baseline):
                 with patch("app.service.read_file_symbol_summary", return_value=stored_summary):
                     with patch("app.service.read_symbols_for_path", return_value=stored_symbols):
-                        with patch("app.service.extract_path_symbols") as extract_mock:
+                        with patch.object(service, "_explain_path_via_rust") as rust_mock:
                             result = service.explain_path(snapshot.workspace.workspace_id, "api/src/example.py")
 
             self.assertEqual(result.symbol_source, "tree_sitter")
             self.assertEqual(result.parser_language, "python")
             self.assertEqual(result.detected_symbols, ["stored_symbol"])
             self.assertNotIn("local_symbol", result.detected_symbols)
-            extract_mock.assert_not_called()
+            rust_mock.assert_not_called()
 
     def test_semantic_search_returns_ast_grep_matches(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

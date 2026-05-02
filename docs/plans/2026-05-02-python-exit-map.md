@@ -86,6 +86,17 @@ This pass moved the next code-explainer ownership slice into Rust:
 
 This is still a narrow slice: Python compatibility commands and Postgres materialization helpers remain. The real authority reduction is that the target Go API lane no longer owns code-explainer semantic substrate locally, and Python is not reopened as the meaning owner for this path.
 
+## Phase 3 Compatibility Semantic Row Reduction Landed
+
+This pass moved the next compatibility-only semantic seam toward Rust too:
+
+- `rust-core/src/repomap.rs` now emits storage-ready `file_summary_row` and `symbol_rows` inside the `path-symbols` contract.
+- `backend/app/service.py` now prefers Rust `path-symbols` and Rust `explain-path` for on-demand compatibility reads whenever stored semantic rows are not fresh.
+- Python keeps the stored-semantic read path and a last-resort local parser fallback, but it is no longer the default owner for on-demand code-explainer substrate or symbol-row shaping in the compatibility lane.
+- Best-effort semantic consumers now degrade cleanly when Postgres semantic tables are absent, instead of treating missing optional semantic storage as a fatal read-path dependency.
+
+This is still not full Python deletion. `backend/app/postgres.py` remains the compatibility writer into durable state, and Python still owns the last-resort fallback if the Rust command is unavailable. The authority cut is that Rust now defines both the on-demand semantic meaning and the on-demand storage-ready row shape for this slice.
+
 ## Phase 3 Diagnostics Contract Boundary Landed
 
 This pass also defined the first diagnostics/LSP-normalized boundary without implementing Python-first LSP:

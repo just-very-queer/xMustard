@@ -23,7 +23,7 @@ The first Phase 3 authority cuts are already landed:
 
 - Go owns API delivery for `impact`, `repo-context`, and `retrieval-search`
 - Rust owns semantic impact calculation, changed-symbol extraction, provenance, and affected file/test ranking
-- Rust owns on-demand `path-symbols` extraction and the code-explainer semantic substrate consumed by Go delivery
+- Rust owns on-demand `path-symbols` extraction, the code-explainer semantic substrate, and storage-ready symbol materialization rows consumed by Go delivery and Python compatibility fallback
 
 ## What xMustard Is
 
@@ -70,6 +70,7 @@ Phase 3 work now includes:
 - Rust-owned semantic-impact generation consumed by Go delivery
 - Rust-owned on-demand path-symbol extraction consumed by Go `path-symbols` delivery
 - Rust-owned code-explainer substrate for `explain-path`, including path role, line/import counts, detected symbols, summary, hints, and provenance
+- Rust-owned file-symbol summary and symbol-row shaping for on-demand `path-symbols`, so Python compatibility no longer has to shape those Postgres-ready rows when stored semantic state is absent
 - a durable Python exit map to track what still belongs in Python temporarily and what should move next
 
 ## What This Repo Is Becoming

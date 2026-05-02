@@ -1,7 +1,7 @@
 use chrono::Utc;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use walkdir::{DirEntry, WalkDir};
@@ -152,6 +152,31 @@ pub struct RustPathSymbolRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustFileSymbolSummaryMaterializationRecord {
+    pub workspace_id: String,
+    pub path: String,
+    pub language: Option<String>,
+    pub parser_language: Option<String>,
+    pub symbol_source: String,
+    pub symbol_count: usize,
+    pub summary_json: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustSymbolMaterializationRecord {
+    pub workspace_id: String,
+    pub path: String,
+    pub symbol: String,
+    pub kind: String,
+    pub language: Option<String>,
+    pub line_start: Option<usize>,
+    pub line_end: Option<usize>,
+    pub enclosing_scope: Option<String>,
+    pub signature_text: Option<String>,
+    pub symbol_text: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RustPathSymbolsResult {
     pub workspace_id: String,
     pub path: String,
@@ -160,6 +185,8 @@ pub struct RustPathSymbolsResult {
     pub evidence_source: String,
     pub selection_reason: String,
     pub symbols: Vec<RustPathSymbolRecord>,
+    pub file_summary_row: RustFileSymbolSummaryMaterializationRecord,
+    pub symbol_rows: Vec<RustSymbolMaterializationRecord>,
     pub warnings: Vec<String>,
     pub generated_at: String,
 }
@@ -425,17 +452,33 @@ pub fn extract_path_symbols(
             score: 10,
         })
         .collect::<Vec<_>>();
+    let symbol_source = if symbols.is_empty() { "none" } else { "regex" }.to_string();
+    let file_summary_row = build_file_symbol_summary(
+        workspace_id,
+        &normalized,
+        parser_language.as_ref(),
+        &symbol_source,
+        &symbols,
+    );
+    let symbol_rows = build_symbol_materialization_rows(
+        workspace_id,
+        &normalized,
+        parser_language.as_ref(),
+        &symbols,
+    );
     if symbols.is_empty() && should_scan_file(&normalized) {
         warnings.push("Rust semantic core found no top-level symbols in this path.".to_string());
     }
     Ok(RustPathSymbolsResult {
         workspace_id: workspace_id.to_string(),
         path: normalized,
-        symbol_source: if symbols.is_empty() { "none" } else { "regex" }.to_string(),
+        symbol_source,
         parser_language,
         evidence_source: "rust_semantic_core".to_string(),
-        selection_reason: "Go delivery consumed Rust semantic-core path symbols on demand.".to_string(),
+        selection_reason: "Rust semantic core produced on-demand path symbols for the requested file.".to_string(),
         symbols,
+        file_summary_row,
+        symbol_rows,
         warnings,
         generated_at: Utc::now().to_rfc3339(),
     })
@@ -469,7 +512,7 @@ pub fn explain_path(
         symbol_source: symbols.symbol_source,
         parser_language: symbols.parser_language,
         evidence_source: symbols.evidence_source,
-        selection_reason: "Rust semantic core owns code-explainer semantic substrate; Go only delivers this contract.".to_string(),
+        selection_reason: "Rust semantic core owns code-explainer semantic substrate for this path.".to_string(),
         summary: build_path_explainer_summary(&symbols.path, &role, line_count, import_count, &detected_symbols),
         hints: build_path_explainer_hints(&symbols.path, &role),
         warnings: symbols.warnings,
@@ -544,6 +587,85 @@ fn semantic_language_for_path(relative_path: &str) -> Option<String> {
         "css" => Some("css".to_string()),
         "yaml" | "yml" => Some("yaml".to_string()),
         _ => None,
+    }
+}
+
+fn build_file_symbol_summary(
+    workspace_id: &str,
+    relative_path: &str,
+    parser_language: Option<&String>,
+    symbol_source: &str,
+    symbols: &[RustPathSymbolRecord],
+) -> RustFileSymbolSummaryMaterializationRecord {
+    let mut symbol_kinds = BTreeMap::new();
+    for item in symbols {
+        let entry = symbol_kinds
+            .entry(item.kind.clone())
+            .or_insert_with(|| serde_json::Value::from(0_u64));
+        if let Some(current) = entry.as_u64() {
+            *entry = serde_json::Value::from(current + 1);
+        }
+    }
+    let top_symbols = symbols
+        .iter()
+        .take(8)
+        .map(|item| serde_json::Value::from(item.symbol.clone()))
+        .collect::<Vec<_>>();
+    let enclosing_scopes = symbols
+        .iter()
+        .filter_map(|item| item.enclosing_scope.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(serde_json::Value::from)
+        .collect::<Vec<_>>();
+    let mut summary_json = BTreeMap::new();
+    summary_json.insert("top_symbols".to_string(), serde_json::Value::from(top_symbols));
+    summary_json.insert(
+        "symbol_kinds".to_string(),
+        serde_json::Value::Object(symbol_kinds.into_iter().collect()),
+    );
+    summary_json.insert(
+        "enclosing_scopes".to_string(),
+        serde_json::Value::from(enclosing_scopes),
+    );
+    RustFileSymbolSummaryMaterializationRecord {
+        workspace_id: workspace_id.to_string(),
+        path: relative_path.to_string(),
+        language: parser_language.cloned(),
+        parser_language: parser_language.cloned(),
+        symbol_source: normalize_symbol_source(symbol_source),
+        symbol_count: symbols.len(),
+        summary_json,
+    }
+}
+
+fn build_symbol_materialization_rows(
+    workspace_id: &str,
+    relative_path: &str,
+    parser_language: Option<&String>,
+    symbols: &[RustPathSymbolRecord],
+) -> Vec<RustSymbolMaterializationRecord> {
+    symbols
+        .iter()
+        .map(|item| RustSymbolMaterializationRecord {
+            workspace_id: workspace_id.to_string(),
+            path: relative_path.to_string(),
+            symbol: item.symbol.clone(),
+            kind: item.kind.clone(),
+            language: parser_language.cloned(),
+            line_start: item.line_start,
+            line_end: item.line_end,
+            enclosing_scope: item.enclosing_scope.clone(),
+            signature_text: None,
+            symbol_text: None,
+        })
+        .collect()
+}
+
+fn normalize_symbol_source(symbol_source: &str) -> String {
+    match symbol_source {
+        "tree_sitter" | "regex" | "none" => symbol_source.to_string(),
+        _ => "none".to_string(),
     }
 }
 
@@ -942,6 +1064,14 @@ mod tests {
             .iter()
             .any(|item| item.symbol == "launch_runner" && item.kind == "function"));
         assert_eq!(result.evidence_source, "rust_semantic_core");
+        assert_eq!(result.file_summary_row.symbol_source, "regex");
+        assert_eq!(result.file_summary_row.symbol_count, 2);
+        assert_eq!(
+            result.file_summary_row.summary_json.get("top_symbols").unwrap(),
+            &serde_json::json!(["Runner", "launch_runner"])
+        );
+        assert_eq!(result.symbol_rows.len(), 2);
+        assert_eq!(result.symbol_rows[0].symbol, "Runner");
     }
 
     #[test]
