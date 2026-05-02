@@ -12,6 +12,13 @@ The point is not to become another tracker. The point is to give an agent a trus
 
 Current development focus is the CLI semantic-runtime layer. The web UI exists, but the active product trench is making the backend and CLI good enough to serve tools like MustardCoPilot.
 
+Phase 3 is now the Python-exit and ownership-shift phase:
+
+- Go should own API delivery and request shaping
+- Rust should own semantic meaning, symbol extraction, impact ranking, and diagnostics normalization
+- Postgres should remain the durable semantic state layer
+- Python should keep shrinking toward compatibility-only status until it can be deleted slice by slice
+
 ## What xMustard Is
 
 xMustard combines two things that usually live in separate products:
@@ -119,6 +126,8 @@ The strongest patterns pulled from local research work are:
 - replay and eval infrastructure keep the system honest
 
 The biggest current frontier is making stored semantic truth and ops memory work together cleanly enough that another runtime can consume xMustard as a reliable tool.
+
+Phase 3 starts from a simpler rule than the earlier closeout loops: external validation workspaces can help prove tool consumption, but they do not define whether xMustard itself is complete. The next real bar is reducing Python authority in shipped request paths and semantic-core logic, not reopening Phase 2 status arguments.
 
 Phase 2 final closeout truth on 2026-05-02: the implementation surfaces are live and Phase 2 is complete for xMustard itself. The CLI semantic-runtime layer is in place: `semantic-index`, `path-symbols`, `code-explainer`, `changed-symbols`, `changed-since-last-run`, `changed-since-last-accepted-fix`, `impact`, `repo-context`, `retrieval-search`, and `semantic-search` all exist, and the Postgres plus `ast-grep` semantic path is proven live.
 
