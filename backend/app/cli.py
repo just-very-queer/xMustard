@@ -114,32 +114,9 @@ def _echo_ok(**payload) -> None:
     _echo_json({"ok": True, **payload})
 
 
-def _run_go_semantic_index(action: str, workspace_id: str, *, surface: str, strategy: str, paths: list[str], limit: int, dsn: Optional[str] = None, schema: Optional[str] = None, dry_run: bool = False):
+def _run_go_ops(args: list[str]) -> str:
     api_go_dir = Path(__file__).resolve().parents[2] / "api-go"
-    command = [
-        "go",
-        "run",
-        "./cmd/xmustard-ops",
-        "semantic-index",
-        action,
-        workspace_id,
-        "--data-dir",
-        str(store.root),
-        "--surface",
-        surface,
-        "--strategy",
-        strategy,
-        "--limit",
-        str(limit),
-    ]
-    for item in paths:
-        command.extend(["--path", item])
-    if dsn:
-        command.extend(["--dsn", dsn])
-    if schema:
-        command.extend(["--schema", schema])
-    if dry_run:
-        command.append("--dry-run")
+    command = ["go", "run", "./cmd/xmustard-ops", *args, "--data-dir", str(service.store.root)]
     try:
         completed = subprocess.run(
             command,
@@ -149,17 +126,57 @@ def _run_go_semantic_index(action: str, workspace_id: str, *, surface: str, stra
             check=False,
         )
     except FileNotFoundError as exc:
-        typer.echo(f"go semantic-index {action} failed: {exc}", err=True)
+        typer.echo(f"go xmustard-ops failed: {exc}", err=True)
         raise typer.Exit(code=1) from exc
     if completed.returncode != 0:
-        message = completed.stderr.strip() or completed.stdout.strip() or f"go semantic-index {action} failed"
+        message = completed.stderr.strip() or completed.stdout.strip() or "go xmustard-ops failed"
         typer.echo(message, err=True)
         raise typer.Exit(code=1)
+    return completed.stdout
+
+
+def _run_go_ops_json(args: list[str]):
+    stdout = _run_go_ops(args)
     try:
-        return json.loads(completed.stdout)
+        return json.loads(stdout)
     except json.JSONDecodeError as exc:
-        typer.echo(f"Invalid JSON from Go semantic-index {action}: {exc}", err=True)
+        typer.echo(f"Invalid JSON from Go xmustard-ops: {exc}", err=True)
         raise typer.Exit(code=1) from exc
+
+
+def _run_go_postgres_json(action: str, flags: Optional[list[str]] = None):
+    return _run_go_ops_json(["postgres", action, *(flags or [])])
+
+
+def _run_go_postgres_text(action: str, flags: Optional[list[str]] = None) -> str:
+    return _run_go_ops(["postgres", action, *(flags or [])])
+
+
+def _run_go_workspace_json(action: str, workspace_id: str, flags: Optional[list[str]] = None):
+    return _run_go_ops_json(["workspace", action, workspace_id, *(flags or [])])
+
+
+def _run_go_semantic_index(action: str, workspace_id: str, *, surface: str, strategy: str, paths: list[str], limit: int, dsn: Optional[str] = None, schema: Optional[str] = None, dry_run: bool = False):
+    args = [
+        "semantic-index",
+        action,
+        workspace_id,
+        "--surface",
+        surface,
+        "--strategy",
+        strategy,
+        "--limit",
+        str(limit),
+    ]
+    for item in paths:
+        args.extend(["--path", item])
+    if dsn:
+        args.extend(["--dsn", dsn])
+    if schema:
+        args.extend(["--schema", schema])
+    if dry_run:
+        args.append("--dry-run")
+    return _run_go_ops_json(args)
 
 
 @app.command("health")
@@ -258,7 +275,7 @@ def settings_set(
 
 @app.command("postgres-plan")
 def postgres_plan() -> None:
-    _echo_json(service.read_postgres_schema_plan().model_dump(mode="json"))
+    _echo_json(_run_go_postgres_json("plan"))
 
 
 @app.command("postgres-render")
@@ -266,7 +283,10 @@ def postgres_render(
     schema: str = typer.Option(default=""),
     output: str = typer.Option(default=""),
 ) -> None:
-    payload = service.render_postgres_schema_sql(schema=schema or None)
+    flags = []
+    if schema:
+        flags.extend(["--schema", schema])
+    payload = _run_go_postgres_text("render", flags)
     if output:
         Path(output).write_text(payload, encoding="utf-8")
         typer.echo(output)
@@ -279,7 +299,12 @@ def postgres_bootstrap(
     dsn: str = typer.Option(default=""),
     schema: str = typer.Option(default=""),
 ) -> None:
-    _echo_json(service.bootstrap_postgres_schema(dsn=dsn or None, schema=schema or None).model_dump(mode="json"))
+    flags = []
+    if dsn:
+        flags.extend(["--dsn", dsn])
+    if schema:
+        flags.extend(["--schema", schema])
+    _echo_json(_run_go_postgres_json("bootstrap", flags))
 
 
 @app.command("export")
@@ -713,17 +738,17 @@ def changed_since_last_accepted_fix(workspace_id: str) -> None:
 
 @app.command("impact")
 def impact(workspace_id: str, base_ref: str = typer.Option(default="HEAD")) -> None:
-    _echo_json(service.read_impact(workspace_id, base_ref=base_ref).model_dump(mode="json"))
+    _echo_json(_run_go_workspace_json("impact", workspace_id, ["--base-ref", base_ref]))
 
 
 @app.command("repo-context")
 def repo_context(workspace_id: str, base_ref: str = typer.Option(default="HEAD")) -> None:
-    _echo_json(service.read_repo_context(workspace_id, base_ref=base_ref).model_dump(mode="json"))
+    _echo_json(_run_go_workspace_json("repo-context", workspace_id, ["--base-ref", base_ref]))
 
 
 @app.command("retrieval-search")
 def retrieval_search(workspace_id: str, query: str = typer.Option(...), limit: int = typer.Option(default=12)) -> None:
-    _echo_json(service.search_retrieval(workspace_id, query, limit=limit).model_dump(mode="json"))
+    _echo_json(_run_go_workspace_json("retrieval-search", workspace_id, ["--query", query, "--limit", str(limit)]))
 
 
 @app.command("run-targets")
@@ -738,12 +763,12 @@ def verify_targets(workspace_id: str) -> None:
 
 @app.command("code-explainer")
 def code_explainer(workspace_id: str, path: str = typer.Option(...)) -> None:
-    _echo_json(service.explain_path(workspace_id, path).model_dump(mode="json"))
+    _echo_json(_run_go_workspace_json("explain-path", workspace_id, ["--path", path]))
 
 
 @app.command("path-symbols")
 def path_symbols(workspace_id: str, path: str = typer.Option(...)) -> None:
-    _echo_json(service.read_path_symbols(workspace_id, path).model_dump(mode="json"))
+    _echo_json(_run_go_workspace_json("path-symbols", workspace_id, ["--path", path]))
 
 
 @app.command("postgres-materialize-path")
@@ -753,14 +778,12 @@ def postgres_materialize_path(
     dsn: str = typer.Option(default=""),
     schema: str = typer.Option(default=""),
 ) -> None:
-    _echo_json(
-        service.materialize_path_symbols_to_postgres(
-            workspace_id,
-            path,
-            dsn=dsn or None,
-            schema=schema or None,
-        ).model_dump(mode="json")
-    )
+    flags = ["--path", path]
+    if dsn:
+        flags.extend(["--dsn", dsn])
+    if schema:
+        flags.extend(["--schema", schema])
+    _echo_json(_run_go_workspace_json("postgres-materialize-path", workspace_id, flags))
 
 
 @app.command("postgres-materialize-workspace-symbols")
@@ -772,17 +795,14 @@ def postgres_materialize_workspace_symbols(
     dsn: str = typer.Option(default=""),
     schema: str = typer.Option(default=""),
 ) -> None:
-    _echo_json(
-        service.materialize_workspace_symbols_to_postgres(
-            workspace_id,
-            strategy=strategy,
-            paths=path,
-            limit=limit,
-            surface="cli",
-            dsn=dsn or None,
-            schema=schema or None,
-        ).model_dump(mode="json")
-    )
+    flags = ["--strategy", strategy, "--limit", str(limit)]
+    for item in path:
+        flags.extend(["--select-path", item])
+    if dsn:
+        flags.extend(["--dsn", dsn])
+    if schema:
+        flags.extend(["--schema", schema])
+    _echo_json(_run_go_workspace_json("postgres-materialize-workspace-symbols", workspace_id, flags))
 
 
 @app.command("semantic-search")
@@ -793,15 +813,12 @@ def semantic_search(
     path_glob: str = typer.Option(default=""),
     limit: int = typer.Option(default=50),
 ) -> None:
-    _echo_json(
-        service.search_semantic_pattern(
-            workspace_id,
-            pattern,
-            language=language or None,
-            path_glob=path_glob or None,
-            limit=limit,
-        ).model_dump(mode="json")
-    )
+    flags = ["--pattern", pattern, "--limit", str(limit)]
+    if language:
+        flags.extend(["--language", language])
+    if path_glob:
+        flags.extend(["--path-glob", path_glob])
+    _echo_json(_run_go_workspace_json("semantic-search", workspace_id, flags))
 
 
 @app.command("postgres-materialize-semantic-search")
@@ -814,17 +831,16 @@ def postgres_materialize_semantic_search(
     dsn: str = typer.Option(default=""),
     schema: str = typer.Option(default=""),
 ) -> None:
-    _echo_json(
-        service.materialize_semantic_search_to_postgres(
-            workspace_id,
-            pattern,
-            language=language or None,
-            path_glob=path_glob or None,
-            limit=limit,
-            dsn=dsn or None,
-            schema=schema or None,
-        ).model_dump(mode="json")
-    )
+    flags = ["--pattern", pattern, "--limit", str(limit)]
+    if language:
+        flags.extend(["--language", language])
+    if path_glob:
+        flags.extend(["--path-glob", path_glob])
+    if dsn:
+        flags.extend(["--dsn", dsn])
+    if schema:
+        flags.extend(["--schema", schema])
+    _echo_json(_run_go_workspace_json("postgres-materialize-semantic-search", workspace_id, flags))
 
 
 @app.command("tree")

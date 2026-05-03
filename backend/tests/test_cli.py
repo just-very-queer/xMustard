@@ -129,6 +129,36 @@ reviews:
             with patch.object(cli_module, "service", service):
                 with patch("app.service.tree_sitter_available", return_value=True):
                     with patch("app.service.shutil.which", return_value="/opt/homebrew/bin/sg"):
+                        def fake_go_workspace(action: str, workspace_id_arg: str, flags=None):
+                            self.assertEqual(workspace_id_arg, workspace_id)
+                            if action == "path-symbols":
+                                return {
+                                    "workspace_id": workspace_id,
+                                    "path": "api/src/example.py",
+                                    "symbol_source": "tree_sitter",
+                                    "parser_language": "python",
+                                    "evidence_source": "rust_semantic_core",
+                                    "selection_reason": "Rust semantic core produced on-demand path symbols for the requested file.",
+                                    "symbols": [{"path": "api/src/example.py", "symbol": "render_payload", "kind": "function"}],
+                                    "warnings": [],
+                                }
+                            if action == "impact":
+                                return {"workspace_id": workspace_id, "derivation_summary": "Rust-backed impact report", "warnings": []}
+                            if action == "repo-context":
+                                return {"workspace_id": workspace_id, "retrieval_ledger": []}
+                            if action == "retrieval-search":
+                                return {"workspace_id": workspace_id, "query": "render payload", "hits": [], "retrieval_ledger": []}
+                            if action == "semantic-search":
+                                return {"workspace_id": workspace_id, "pattern": "def $A():", "match_count": 1, "matches": []}
+                            if action == "explain-path":
+                                return {
+                                    "workspace_id": workspace_id,
+                                    "path": "api/src/example.py",
+                                    "detected_symbols": ["render_payload"],
+                                    "warnings": [],
+                                }
+                            raise AssertionError(f"unexpected Go workspace action: {action}")
+
                         checks = [
                             (["repo-state", workspace_id], lambda payload: self.assertEqual(payload["workspace"]["workspace_id"], workspace_id)),
                             (
@@ -178,11 +208,12 @@ reviews:
                             ),
                         ]
 
-                        for argv, validator in checks:
-                            result = self.runner.invoke(cli_module.app, argv)
-                            self.assertEqual(result.exit_code, 0, msg=result.output)
-                            payload = json.loads(result.stdout)
-                            validator(payload)
+                        with patch.object(cli_module, "_run_go_workspace_json", side_effect=fake_go_workspace):
+                            for argv, validator in checks:
+                                result = self.runner.invoke(cli_module.app, argv)
+                                self.assertEqual(result.exit_code, 0, msg=result.output)
+                                payload = json.loads(result.stdout)
+                                validator(payload)
 
     def test_cli_path_symbols_reports_tree_sitter_metadata(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -239,11 +270,12 @@ reviews:
             )
 
             with patch.object(cli_module, "service", service):
-                with patch.object(service, "_read_path_symbols_via_rust", return_value=rust_result):
+                with patch.object(cli_module, "_run_go_workspace_json", return_value=rust_result.model_dump(mode="json")) as go_mock:
                     result = self.runner.invoke(cli_module.app, ["path-symbols", workspace_id, "--path", "api/src/example.py"])
 
             self.assertEqual(result.exit_code, 0, msg=result.output)
             payload = json.loads(result.stdout)
+            go_mock.assert_called_once_with("path-symbols", workspace_id, ["--path", "api/src/example.py"])
             self.assertEqual(payload["symbol_source"], "tree_sitter")
             self.assertEqual(payload["parser_language"], "python")
             self.assertEqual(payload["symbols"][1]["enclosing_scope"], "ApiHandler")
@@ -253,25 +285,33 @@ reviews:
     def test_cli_semantic_search_reports_matches(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             service, workspace_id = self._create_service(tmp_dir)
-            fake_matches = [
-                SemanticPatternMatchRecord(
-                    path="api/src/example.py",
-                    language="python",
-                    line_start=1,
-                    line_end=1,
-                    column_start=1,
-                    column_end=19,
-                    matched_text="def render_payload():",
-                    context_lines="def render_payload():",
-                    meta_variables=["A"],
-                )
-            ]
+            fake_payload = {
+                "workspace_id": workspace_id,
+                "pattern": "def $A():",
+                "language": "python",
+                "engine": "ast_grep",
+                "binary_path": "/opt/homebrew/bin/sg",
+                "match_count": 1,
+                "truncated": False,
+                "matches": [
+                    {
+                        "path": "api/src/example.py",
+                        "language": "python",
+                        "line_start": 1,
+                        "line_end": 1,
+                        "column_start": 1,
+                        "column_end": 19,
+                        "matched_text": "def render_payload():",
+                        "context_lines": "def render_payload():",
+                        "meta_variables": ["A"],
+                    }
+                ],
+                "query_row": {"query_ref": "semanticq_test", "source": "adhoc_tool"},
+                "match_rows": [{"query_ref": "semanticq_test"}],
+            }
 
             with patch.object(cli_module, "service", service):
-                with patch(
-                    "app.service.run_ast_grep_query",
-                    return_value=(fake_matches, "/opt/homebrew/bin/sg", None, False),
-                ):
+                with patch.object(cli_module, "_run_go_workspace_json", return_value=fake_payload) as go_mock:
                     result = self.runner.invoke(
                         cli_module.app,
                         ["semantic-search", workspace_id, "--pattern", "def $A():", "--language", "python"],
@@ -279,6 +319,11 @@ reviews:
 
             self.assertEqual(result.exit_code, 0, msg=result.output)
             payload = json.loads(result.stdout)
+            go_mock.assert_called_once_with(
+                "semantic-search",
+                workspace_id,
+                ["--pattern", "def $A():", "--limit", "50", "--language", "python"],
+            )
             self.assertEqual(payload["engine"], "ast_grep")
             self.assertEqual(payload["match_count"], 1)
             self.assertEqual(payload["matches"][0]["meta_variables"], ["A"])
@@ -290,20 +335,20 @@ reviews:
             service, workspace_id = self._create_service(tmp_dir)
 
             with patch.object(cli_module, "service", service):
-                with patch.object(service, "materialize_path_symbols_to_postgres") as path_materialize_mock:
-                    path_materialize_mock.return_value = PostgresSemanticMaterializationResult(
-                        applied=True,
-                        dsn_redacted="postgresql://xmustard:***@localhost:5432/xmustard",
-                        schema_name="agent_context",
-                        workspace_id=workspace_id,
-                        source="path_symbols",
-                        target="api/src/example.py",
-                        materialized_paths=["api/src/example.py"],
-                        file_rows=1,
-                        symbol_rows=1,
-                        summary_rows=1,
-                        message="ok",
-                    )
+                with patch.object(cli_module, "_run_go_workspace_json") as path_materialize_mock:
+                    path_materialize_mock.return_value = {
+                        "applied": True,
+                        "dsn_redacted": "postgresql://xmustard:***@localhost:5432/xmustard",
+                        "schema_name": "agent_context",
+                        "workspace_id": workspace_id,
+                        "source": "path_symbols",
+                        "target": "api/src/example.py",
+                        "materialized_paths": ["api/src/example.py"],
+                        "file_rows": 1,
+                        "symbol_rows": 1,
+                        "summary_rows": 1,
+                        "message": "ok",
+                    }
                     result = self.runner.invoke(
                         cli_module.app,
                         ["postgres-materialize-path", workspace_id, "--path", "api/src/example.py"],
@@ -312,26 +357,25 @@ reviews:
                     payload = json.loads(result.stdout)
                     self.assertTrue(payload["applied"])
                     path_materialize_mock.assert_called_once_with(
+                        "postgres-materialize-path",
                         workspace_id,
-                        "api/src/example.py",
-                        dsn=None,
-                        schema=None,
+                        ["--path", "api/src/example.py"],
                     )
 
-                with patch.object(service, "materialize_workspace_symbols_to_postgres") as workspace_materialize_mock:
-                    workspace_materialize_mock.return_value = PostgresWorkspaceSemanticMaterializationResult(
-                        applied=True,
-                        dsn_redacted="postgresql://xmustard:***@localhost:5432/xmustard",
-                        schema_name="agent_context",
-                        workspace_id=workspace_id,
-                        strategy="paths",
-                        requested_paths=["api/src/example.py"],
-                        materialized_paths=["api/src/example.py"],
-                        file_rows=1,
-                        symbol_rows=1,
-                        summary_rows=1,
-                        message="ok",
-                    )
+                with patch.object(cli_module, "_run_go_workspace_json") as workspace_materialize_mock:
+                    workspace_materialize_mock.return_value = {
+                        "applied": True,
+                        "dsn_redacted": "postgresql://xmustard:***@localhost:5432/xmustard",
+                        "schema_name": "agent_context",
+                        "workspace_id": workspace_id,
+                        "strategy": "paths",
+                        "requested_paths": ["api/src/example.py"],
+                        "materialized_paths": ["api/src/example.py"],
+                        "file_rows": 1,
+                        "symbol_rows": 1,
+                        "summary_rows": 1,
+                        "message": "ok",
+                    }
                     result = self.runner.invoke(
                         cli_module.app,
                         [
@@ -347,13 +391,9 @@ reviews:
                     payload = json.loads(result.stdout)
                     self.assertTrue(payload["applied"])
                     workspace_materialize_mock.assert_called_once_with(
+                        "postgres-materialize-workspace-symbols",
                         workspace_id,
-                        strategy="paths",
-                        paths=["api/src/example.py"],
-                        limit=12,
-                        surface="cli",
-                        dsn=None,
-                        schema=None,
+                        ["--strategy", "paths", "--limit", "12", "--select-path", "api/src/example.py"],
                     )
 
                 with patch.object(cli_module, "_run_go_semantic_index") as semantic_plan_mock:
@@ -445,20 +485,20 @@ reviews:
                         schema="agent_context",
                     )
 
-                with patch.object(service, "materialize_semantic_search_to_postgres") as search_materialize_mock:
-                    search_materialize_mock.return_value = PostgresSemanticMaterializationResult(
-                        applied=True,
-                        dsn_redacted="postgresql://xmustard:***@localhost:5432/xmustard",
-                        schema_name="agent_context",
-                        workspace_id=workspace_id,
-                        source="semantic_search",
-                        target="def $A():",
-                        materialized_paths=["api/src/example.py"],
-                        file_rows=1,
-                        query_rows=1,
-                        match_rows=1,
-                        message="ok",
-                    )
+                with patch.object(cli_module, "_run_go_workspace_json") as search_materialize_mock:
+                    search_materialize_mock.return_value = {
+                        "applied": True,
+                        "dsn_redacted": "postgresql://xmustard:***@localhost:5432/xmustard",
+                        "schema_name": "agent_context",
+                        "workspace_id": workspace_id,
+                        "source": "semantic_search",
+                        "target": "def $A():",
+                        "materialized_paths": ["api/src/example.py"],
+                        "file_rows": 1,
+                        "query_rows": 1,
+                        "match_rows": 1,
+                        "message": "ok",
+                    }
                     result = self.runner.invoke(
                         cli_module.app,
                         [
@@ -474,13 +514,9 @@ reviews:
                     payload = json.loads(result.stdout)
                     self.assertTrue(payload["applied"])
                     search_materialize_mock.assert_called_once_with(
+                        "postgres-materialize-semantic-search",
                         workspace_id,
-                        "def $A():",
-                        language="python",
-                        path_glob=None,
-                        limit=50,
-                        dsn=None,
-                        schema=None,
+                        ["--pattern", "def $A():", "--limit", "50", "--language", "python"],
                     )
 
     def test_cli_postgres_commands_cover_plan_render_and_bootstrap(self):
@@ -496,33 +532,44 @@ reviews:
             )
 
             with patch.object(cli_module, "service", service):
-                result = self.runner.invoke(cli_module.app, ["postgres-plan"])
-                self.assertEqual(result.exit_code, 0, msg=result.output)
-                plan = json.loads(result.stdout)
-                self.assertTrue(plan["configured"])
-                self.assertEqual(plan["schema_name"], "agent_context")
-                self.assertIn("workspaces", plan["table_names"])
-                self.assertIn("semantic_matches", plan["semantic_table_names"])
-                self.assertIn("run_plans", plan["ops_memory_table_names"])
+                with patch.object(cli_module, "_run_go_postgres_json") as plan_mock:
+                    plan_mock.return_value = {
+                        "configured": True,
+                        "schema_name": "agent_context",
+                        "table_names": ["workspaces"],
+                        "semantic_table_names": ["semantic_matches"],
+                        "ops_memory_table_names": ["run_plans"],
+                    }
+                    result = self.runner.invoke(cli_module.app, ["postgres-plan"])
+                    self.assertEqual(result.exit_code, 0, msg=result.output)
+                    plan = json.loads(result.stdout)
+                    self.assertTrue(plan["configured"])
+                    self.assertEqual(plan["schema_name"], "agent_context")
+                    self.assertIn("workspaces", plan["table_names"])
+                    self.assertIn("semantic_matches", plan["semantic_table_names"])
+                    self.assertIn("run_plans", plan["ops_memory_table_names"])
+                    plan_mock.assert_called_once_with("plan")
 
-                result = self.runner.invoke(cli_module.app, ["postgres-render"])
-                self.assertEqual(result.exit_code, 0, msg=result.output)
-                self.assertIn("create schema if not exists agent_context;", result.stdout.lower())
+                with patch.object(cli_module, "_run_go_postgres_text", return_value="create schema if not exists agent_context;\n") as render_mock:
+                    result = self.runner.invoke(cli_module.app, ["postgres-render"])
+                    self.assertEqual(result.exit_code, 0, msg=result.output)
+                    self.assertIn("create schema if not exists agent_context;", result.stdout.lower())
+                    render_mock.assert_called_once_with("render", [])
 
-                with patch.object(service, "bootstrap_postgres_schema") as bootstrap_mock:
-                    bootstrap_mock.return_value = PostgresBootstrapResult(
-                        applied=True,
-                        dsn_redacted="postgresql://xmustard:***@localhost:5432/xmustard",
-                        schema_name="agent_context",
-                        sql_path="/tmp/schema.sql",
-                        statement_count=12,
-                        message="Applied repo cockpit foundation schema to Postgres schema 'agent_context'.",
-                    )
+                with patch.object(cli_module, "_run_go_postgres_json") as bootstrap_mock:
+                    bootstrap_mock.return_value = {
+                        "applied": True,
+                        "dsn_redacted": "postgresql://xmustard:***@localhost:5432/xmustard",
+                        "schema_name": "agent_context",
+                        "sql_path": "/tmp/schema.sql",
+                        "statement_count": 12,
+                        "message": "Applied repo cockpit foundation schema to Postgres schema 'agent_context'.",
+                    }
                     result = self.runner.invoke(cli_module.app, ["postgres-bootstrap"])
                     self.assertEqual(result.exit_code, 0, msg=result.output)
                     payload = json.loads(result.stdout)
                     self.assertTrue(payload["applied"])
-                    bootstrap_mock.assert_called_once_with(dsn=None, schema=None)
+                    bootstrap_mock.assert_called_once_with("bootstrap", [])
 
     def test_cli_agent_and_run_commands_cover_main_integration_flow(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

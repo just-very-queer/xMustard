@@ -6,7 +6,7 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from app import main as app_main
-from app.models import IssueUpdateRequest, RepoMapSymbolRecord, RunRecord, SavedIssueViewRequest, SemanticPatternMatchRecord, WorkspaceLoadRequest
+from app.models import IssueUpdateRequest, PathSymbolsResult, RepoMapSymbolRecord, RunRecord, SavedIssueViewRequest, WorkspaceLoadRequest
 from app.service import TrackerService
 from app.store import FileStore
 
@@ -186,9 +186,18 @@ class ActivityLedgerTests(unittest.TestCase):
                     enclosing_scope="ApiHandler",
                 ),
             ]
+            rust_result = PathSymbolsResult(
+                workspace_id=workspace_id,
+                path="api/src/example.py",
+                symbol_source="tree_sitter",
+                parser_language="python",
+                evidence_source="rust_semantic_core",
+                selection_reason="Rust semantic core produced on-demand path symbols for the requested file.",
+                symbols=fake_symbols,
+            )
 
             with patch.object(app_main, "SERVICE", service):
-                with patch("app.service.extract_path_symbols", return_value=(fake_symbols, "tree_sitter", "python")):
+                with patch.object(service, "_read_path_symbols_via_rust", return_value=rust_result):
                     with TestClient(app_main.app) as client:
                         response = client.get(
                             f"/api/workspaces/{workspace_id}/path-symbols",
@@ -201,39 +210,18 @@ class ActivityLedgerTests(unittest.TestCase):
             self.assertEqual(payload["parser_language"], "python")
             self.assertEqual(payload["symbols"][1]["enclosing_scope"], "ApiHandler")
 
-    def test_semantic_search_api_returns_match_payload(self):
+    def test_fastapi_semantic_search_route_is_not_registered_after_go_cutover(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             service, workspace_id = self._create_service(tmp_dir)
-            fake_matches = [
-                SemanticPatternMatchRecord(
-                    path="api/src/example.py",
-                    language="python",
-                    line_start=1,
-                    line_end=1,
-                    column_start=1,
-                    column_end=19,
-                    matched_text="def render_payload():",
-                    context_lines="def render_payload():",
-                    meta_variables=["A"],
-                )
-            ]
 
             with patch.object(app_main, "SERVICE", service):
-                with patch(
-                    "app.service.run_ast_grep_query",
-                    return_value=(fake_matches, "/opt/homebrew/bin/sg", None, False),
-                ):
-                    with TestClient(app_main.app) as client:
-                        response = client.get(
-                            f"/api/workspaces/{workspace_id}/semantic-search",
-                            params={"pattern": "def $A():", "language": "python"},
-                        )
+                with TestClient(app_main.app) as client:
+                    response = client.get(
+                        f"/api/workspaces/{workspace_id}/semantic-search",
+                        params={"pattern": "def $A():", "language": "python"},
+                    )
 
-            self.assertEqual(response.status_code, 200)
-            payload = response.json()
-            self.assertEqual(payload["engine"], "ast_grep")
-            self.assertEqual(payload["match_count"], 1)
-            self.assertEqual(payload["matches"][0]["meta_variables"], ["A"])
+            self.assertEqual(response.status_code, 404)
 
 
 if __name__ == "__main__":

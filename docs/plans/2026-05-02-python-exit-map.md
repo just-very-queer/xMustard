@@ -6,7 +6,7 @@ Phase 2 is complete for xMustard. External validation workspace dirtiness is not
 
 This map is grounded in the current repository shape: Python still carries the compatibility CLI and much of the orchestration brain, Go already owns a large API delivery shell, Rust owns repo-map/scanner/verification primitives, and Postgres is the durable semantic storage direction.
 
-Completion-pass audit truth on 2026-05-03: xMustard is still in mixed mode. The shipped `semantic-index` operator flow now delegates to Go `xmustard-ops`, but Python remains in the shipped authority path through the broader compatibility CLI shell, `TrackerService` orchestration, and non-delegated semantic baseline/materialization helpers.
+Completion-pass audit truth on 2026-05-03: xMustard is still in mixed mode. The shipped `semantic-index`, repo-intelligence, path-symbol/explainer, semantic-search, Postgres foundation, and semantic materialization CLI slices now delegate to Go `xmustard-ops`, but Python remains in shipped authority through remaining FastAPI routes, broad Typer compatibility commands, `TrackerService` orchestration, and non-delegated semantic baseline/materialization helpers.
 
 ## Inventory Buckets
 
@@ -16,14 +16,14 @@ Completion-pass audit truth on 2026-05-03: xMustard is still in mixed mode. The 
 |---|---|---|---|---|---|---|
 | `backend/app/cli.py` | Compatibility CLI for issue, run, semantic, retrieval, and tracker commands | Go CLI/API facade plus Rust semantic commands | Existing tests and operator workflows depend on this surface | Breaking local workflows before Go/Rust commands cover them | Go exposes stable delivery endpoints or a CLI wrapper for the same agent-facing reads | Python commands are wrappers only and no caller needs direct `TrackerService` orchestration |
 | `backend/app/store.py` | File-backed compatibility persistence | Go delivery over Postgres/file compatibility during transition | Existing artifacts remain the product record while storage migrates | Artifact shape drift | Go/Postgres reads and writes are contract-tested against existing artifacts | Durable Postgres store is primary and file writes are archival/export only |
-| `backend/app/postgres.py` | Semantic materialization helpers and baseline read/write bridge | Go migration/bootstrap plus Rust semantic emitters | Bootstrap can move sooner than the row bridge, but storage truth still needs one owner | Split schema ownership | Go owns schema lifecycle and Rust emits contract rows | Python no longer materializes semantic rows or reads semantic baselines |
+| `backend/app/postgres.py` | Compatibility semantic materialization helpers and baseline read/write bridge | Go migration/bootstrap plus Rust semantic emitters | Go now owns the shipped CLI/API materialization slices, but storage truth still needs one owner | Split schema ownership | Go owns schema lifecycle and Rust emits contract rows | Python no longer materializes semantic rows or reads semantic baselines |
 | `backend/app/runtimes.py` | Legacy runtime adapter and process metadata | Go session/runtime delivery plus Rust process helpers where needed | Runtime surfaces are already partly Go-owned | Process cleanup and terminal behavior regressions | Go owns every live runtime/session request path | Python runtime adapter is unused outside tests |
 
 ### Move To Go Next
 
 | File/module | Current authority | Target owner | Why | Migration risk | Cutover condition | Deletion condition |
 |---|---|---|---|---|---|---|
-| `backend/app/service.py` repo-context/impact/retrieval reads | Agent-facing repo intelligence assembly | Go delivery | These are request/response shaping surfaces and should not require Python as product brain | Contract drift with existing Pydantic JSON | Go endpoints return impact, repo-context, and retrieval-search payloads from workspace artifacts/git/repo-map | Python methods are compatibility CLI wrappers or removed |
+| `backend/app/service.py` repo-context/impact/retrieval reads | Legacy compatibility implementation | Go delivery | These are request/response shaping surfaces and should not require Python as product brain | Contract drift with existing Pydantic JSON | Go endpoints and CLI wrappers return impact, repo-context, and retrieval-search payloads from workspace artifacts/git/repo-map | Python methods are test-only compatibility or removed |
 | `backend/app/main.py` repo-intelligence routes | FastAPI route owner | Go API | Go already owns adjacent workspace, repo-map, context, run, and verification surfaces | Route parity gaps | Go route inventory and handlers cover `/impact`, `/repo-context`, `/retrieval-search` | FastAPI no longer registers these read handlers |
 | `backend/app/service.py` runtime/session delivery | Mixed orchestration and artifact assembly | Go delivery | Go already owns run creation, terminal transport, runtime settings, probe flows | Long-running process cleanup | Go is the only live request path for runtime/session endpoints | Python runtime/session methods are not called by API or CLI |
 
@@ -147,6 +147,17 @@ This follow-up pass removed one of the last blunt operator seams from Python:
 - `backend/app/cli.py` keeps the same Typer commands, but they now delegate to `go run ./cmd/xmustard-ops ...` instead of calling `TrackerService.plan_semantic_index(...)`, `run_semantic_index(...)`, or `read_semantic_index_status(...)` directly.
 
 This is a real authority cut, but not a full Python exit. `TrackerService` still contains compatibility implementations for this slice, and the rest of the operator shell is still mostly Python.
+
+## Phase 3 Compatibility CLI Delegation Expansion Landed
+
+This completion pass widened `xmustard-ops` so Python is no longer the CLI authority for surfaces that already had Go delivery:
+
+- `api-go/cmd/xmustard-ops/main.go` now exposes `postgres plan/render/bootstrap`.
+- `api-go/cmd/xmustard-ops/main.go` now exposes workspace actions for `impact`, `repo-context`, `retrieval-search`, `path-symbols`, `explain-path`, `semantic-search`, `postgres-materialize-path`, `postgres-materialize-workspace-symbols`, and `postgres-materialize-semantic-search`.
+- `backend/app/cli.py` keeps the old Typer command names, but those commands now shell to `go run ./cmd/xmustard-ops ... --data-dir <backend data dir>` instead of calling `TrackerService` or `backend/app/postgres.py` directly.
+- CLI tests now assert Go delegation for these migrated slices rather than mocking Python service methods as the implementation owner.
+
+This shrinks the compatibility shell, but it does not make Python disposable. `backend/app/main.py` still registers `path-symbols` and `explain-path`, many Typer commands still call `TrackerService`, and `TrackerService` still carries compatibility implementations for semantic status, stored semantic reads, fallback parser paths, context packet assembly, runs, runtime/session behavior, issue workflows, and persistence glue.
 
 ## Phase 3 Boundary
 
