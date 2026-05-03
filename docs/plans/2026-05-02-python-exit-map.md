@@ -6,7 +6,7 @@ Phase 2 is complete for xMustard. External validation workspace dirtiness is not
 
 This map is grounded in the current repository shape: Python still carries the compatibility CLI and much of the orchestration brain, Go already owns a large API delivery shell, Rust owns repo-map/scanner/verification primitives, and Postgres is the durable semantic storage direction.
 
-Completion-pass audit truth on 2026-05-03: xMustard is still in mixed mode. The shipped `semantic-index`, repo-intelligence, changed-symbols, path-symbol/explainer, semantic-search, Postgres foundation, and semantic materialization CLI slices now delegate to Go `xmustard-ops`, and FastAPI no longer registers the single-path `path-symbols`/`explain-path` HTTP reads. The public `TrackerService` compatibility methods for Postgres foundation, Postgres semantic materialization, and semantic-index plan/run/status now delegate to Go too. Python remains in shipped authority through remaining FastAPI routes, broad Typer compatibility commands, `TrackerService` orchestration outside those migrated slices, and stored-semantic compatibility reads.
+Completion-pass audit truth on 2026-05-03: xMustard is still in mixed mode. The shipped `semantic-index`, repo-intelligence, changed-symbols, path-symbol/explainer, semantic-search, Postgres foundation, and semantic materialization CLI slices now delegate to Go `xmustard-ops`, and FastAPI no longer registers the single-path `path-symbols`/`explain-path` HTTP reads. The public `TrackerService` compatibility methods for Postgres foundation, Postgres semantic materialization, semantic-index plan/run/status, repo-intelligence reads, path symbols, explainer, semantic search, and retrieval now delegate to Go too. Python remains in shipped authority through remaining FastAPI routes, broad Typer compatibility commands, `TrackerService` orchestration outside those migrated slices, and issue-context semantic pattern derivation.
 
 ## Inventory Buckets
 
@@ -93,11 +93,11 @@ This is still a narrow slice: Python compatibility commands and Postgres materia
 This pass moved the next compatibility-only semantic seam toward Rust too:
 
 - `rust-core/src/repomap.rs` now emits storage-ready `file_summary_row` and `symbol_rows` inside the `path-symbols` contract.
-- `backend/app/service.py` now prefers Rust `path-symbols` and Rust `explain-path` for on-demand compatibility reads whenever stored semantic rows are not fresh.
-- Python keeps the stored-semantic read path and a last-resort local parser fallback, but it is no longer the default owner for on-demand code-explainer substrate or symbol-row shaping in the compatibility lane.
-- Best-effort semantic consumers now degrade cleanly when Postgres semantic tables are absent, instead of treating missing optional semantic storage as a fatal read-path dependency.
+- `backend/app/service.py` now delegates public `path-symbols` and `explain-path` compatibility reads to Go, which uses Rust semantic-core output.
+- The old Python stored-semantic read path and last-resort Rust/local parser compatibility helpers were removed from `TrackerService`; the shipped compatibility shell no longer reopens Python as the symbol/explainer authority.
+- Best-effort issue-context semantic status still delegates to the Go semantic-index status path, while issue-context-specific pattern derivation remains Python-owned until that broader packet surface is moved.
 
-This is still not full Python deletion. `backend/app/postgres.py` remains the compatibility writer into durable state, and Python still owns the last-resort fallback if the Rust command is unavailable. The authority cut is that Rust now defines both the on-demand semantic meaning and the on-demand storage-ready row shape for this slice.
+This is still not full Python deletion. `backend/app/postgres.py` remains as a test-covered compatibility module, but `TrackerService` no longer imports it for the migrated shipped paths. The authority cut is that Rust now defines the on-demand semantic meaning and storage-ready row shape, while Go owns delivery and materialization.
 
 ## Phase 3 Diagnostics Contract Boundary Landed
 
@@ -136,7 +136,7 @@ This completion pass moved the remaining live FastAPI semantic-search and semant
 - `api-go/internal/workspaceops/semantic_materialization.go` now owns ast-grep query delivery, Rust-backed path-symbol row delivery, workspace symbol batch materialization, semantic-search row shaping, and Postgres writes for that HTTP slice.
 - `backend/app/main.py` no longer registers those handlers, so Python is off the live request path for this route group.
 
-This is still not a full Python exit. Python continues to own the broader compatibility CLI, `TrackerService` orchestration, and non-delegated semantic baseline/materialization helpers even though the shipped `semantic-index` operator path now delegates to Go.
+This is still not a full Python exit. Python continues to own the broader compatibility CLI and `TrackerService` orchestration outside the migrated semantic-index slice, even though the shipped `semantic-index` operator path now delegates to Go.
 
 ## Phase 3 Semantic-Index CLI Reduction Landed
 
@@ -146,7 +146,7 @@ This follow-up pass removed one of the last blunt operator seams from Python:
 - `api-go/cmd/xmustard-ops/main.go` now exposes `semantic-index plan`, `semantic-index run`, and `semantic-index status` as a Go-owned ops surface.
 - `backend/app/cli.py` keeps the same Typer commands, but they now delegate to `go run ./cmd/xmustard-ops ...` instead of calling `TrackerService.plan_semantic_index(...)`, `run_semantic_index(...)`, or `read_semantic_index_status(...)` directly.
 
-This is a real authority cut, but not a full Python exit. `TrackerService` still contains compatibility implementations for this slice, and the rest of the operator shell is still mostly Python.
+This is a real authority cut, but not a full Python exit. `TrackerService` now forwards this slice to Go, and the rest of the operator shell is still partly Python for non-migrated commands.
 
 ## Phase 3 Compatibility CLI Delegation Expansion Landed
 
@@ -157,7 +157,7 @@ This completion pass widened `xmustard-ops` so Python is no longer the CLI autho
 - `backend/app/cli.py` keeps the old Typer command names, but those commands now shell to `go run ./cmd/xmustard-ops ... --data-dir <backend data dir>` instead of calling `TrackerService` or `backend/app/postgres.py` directly.
 - CLI tests now assert Go delegation for these migrated slices rather than mocking Python service methods as the implementation owner.
 
-This shrinks the compatibility shell, but it does not make Python disposable. Many Typer commands still call `TrackerService`, and `TrackerService` still carries compatibility implementations for semantic status, stored semantic reads, fallback parser paths, context packet assembly, runs, runtime/session behavior, issue workflows, and persistence glue.
+This shrinks the compatibility shell, but it does not make Python disposable. Many Typer commands still call `TrackerService`, and `TrackerService` still carries compatibility implementations for context packet assembly, issue-context semantic pattern derivation, runs, runtime/session behavior, issue workflows, and persistence glue.
 
 ## Phase 3 Single-Path Semantic HTTP And Changed-Symbols CLI Reduction Landed
 
@@ -178,7 +178,7 @@ The final completion cut narrowed `TrackerService` for the already-migrated Post
 - `TrackerService.read_postgres_schema_plan(...)`, `render_postgres_schema_sql(...)`, and `bootstrap_postgres_schema(...)` now call Go `xmustard-ops postgres plan/render/bootstrap`.
 - `TrackerService.materialize_path_symbols_to_postgres(...)`, `materialize_workspace_symbols_to_postgres(...)`, and `materialize_semantic_search_to_postgres(...)` now call Go `xmustard-ops workspace ...` materialization actions.
 - `TrackerService.plan_semantic_index(...)`, `run_semantic_index(...)`, and `read_semantic_index_status(...)` now call Go `xmustard-ops semantic-index ...`.
-- The older Python helpers remain in the file as compatibility residue for stored semantic reads and tests, but they are no longer the public `TrackerService` authority for those migrated operations.
+- The older Python helpers for stored semantic reads, semantic-index path selection/baseline persistence, path-symbol/explainer Rust fallback, changed-symbol derivation, and repo-context impact ranking were removed from `TrackerService`; tests that need direct Postgres compatibility coverage keep using `backend/app/postgres.py`.
 
 This is the Phase 3 landing point: Go owns shipped delivery and operator control for repo-intelligence, semantic-index, semantic-search, and Postgres semantic materialization; Rust owns the migrated semantic meaning contracts; Python is no longer the live authority for those intended Phase 3 paths.
 

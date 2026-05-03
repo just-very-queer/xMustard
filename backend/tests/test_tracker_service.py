@@ -2977,7 +2977,7 @@ class RuntimeSummaryTests(unittest.TestCase):
             self.assertTrue(status.fingerprint_match)
             self.assertGreater(status.current_dirty_files, 0)
 
-    def test_path_symbols_falls_back_with_semantic_warning_when_status_is_blocked(self):
+    def test_path_symbols_delegates_to_go_workspace_ops(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir) / "repo"
             (root / "api" / "src").mkdir(parents=True)
@@ -2990,23 +2990,35 @@ class RuntimeSummaryTests(unittest.TestCase):
             snapshot = service.load_workspace(WorkspaceLoadRequest(root_path=str(root), auto_scan=True))
             assert snapshot is not None
 
-            with patch.object(
-                service,
-                "read_semantic_index_status",
-                return_value=SemanticIndexStatus(
-                    workspace_id=snapshot.workspace.workspace_id,
-                    surface="cli",
-                    status="blocked",
-                    stale_reasons=["Postgres DSN is not configured; no semantic baseline can be read."],
-                ),
-            ):
+            go_payload = {
+                "workspace_id": snapshot.workspace.workspace_id,
+                "path": "api/src/example.py",
+                "symbol_source": "tree_sitter",
+                "parser_language": "python",
+                "evidence_source": "rust_semantic_core",
+                "selection_reason": "Rust semantic core produced on-demand path symbols for the requested file.",
+                "symbols": [
+                    {
+                        "path": "api/src/example.py",
+                        "symbol": "render_payload",
+                        "kind": "function",
+                        "evidence_source": "rust_semantic_core",
+                    }
+                ],
+                "warnings": [],
+            }
+            with patch.object(service, "_run_go_workspace_json", return_value=go_payload) as go_mock:
                 result = service.read_path_symbols(snapshot.workspace.workspace_id, "api/src/example.py")
 
             self.assertEqual(result.evidence_source, "rust_semantic_core")
-            self.assertIn("blocked", result.selection_reason.lower())
-            self.assertTrue(any("Postgres DSN is not configured" in item for item in result.warnings))
+            self.assertEqual(result.symbols[0].symbol, "render_payload")
+            go_mock.assert_called_once_with(
+                "path-symbols",
+                snapshot.workspace.workspace_id,
+                ["--path", "api/src/example.py"],
+            )
 
-    def test_path_symbols_uses_stored_rows_when_semantic_status_is_fresh(self):
+    def test_path_symbols_keeps_postgres_settings_out_of_python_authority(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir) / "repo"
             (root / "api" / "src").mkdir(parents=True)
@@ -3024,47 +3036,29 @@ class RuntimeSummaryTests(unittest.TestCase):
                 )
             )
 
-            with patch.object(
-                service,
-                "read_semantic_index_status",
-                return_value=SemanticIndexStatus(
-                    workspace_id=snapshot.workspace.workspace_id,
-                    surface="cli",
-                    status="fresh",
-                ),
-            ):
-                with patch(
-                    "app.service.read_file_symbol_summary",
-                    return_value=FileSymbolSummaryMaterializationRecord(
-                        workspace_id=snapshot.workspace.workspace_id,
-                        path="api/src/example.py",
-                        language="python",
-                        parser_language="python",
-                        symbol_source="tree_sitter",
-                        symbol_count=1,
-                        summary_json={"top_symbols": ["render_payload"]},
-                    ),
-                ):
-                    with patch(
-                        "app.service.read_symbols_for_path",
-                        return_value=[
-                            SymbolMaterializationRecord(
-                                workspace_id=snapshot.workspace.workspace_id,
-                                path="api/src/example.py",
-                                symbol="render_payload",
-                                kind="function",
-                                language="python",
-                                line_start=1,
-                                line_end=2,
-                            )
-                        ],
-                    ):
-                        result = service.read_path_symbols(snapshot.workspace.workspace_id, "api/src/example.py")
+            go_payload = {
+                "workspace_id": snapshot.workspace.workspace_id,
+                "path": "api/src/example.py",
+                "symbol_source": "tree_sitter",
+                "parser_language": "python",
+                "evidence_source": "rust_semantic_core",
+                "selection_reason": "Go delivery over Rust semantic-core output.",
+                "symbols": [
+                    {
+                        "path": "api/src/example.py",
+                        "symbol": "render_payload",
+                        "kind": "function",
+                        "evidence_source": "rust_semantic_core",
+                    }
+                ],
+                "warnings": [],
+            }
+            with patch.object(service, "_run_go_workspace_json", return_value=go_payload) as go_mock:
+                result = service.read_path_symbols(snapshot.workspace.workspace_id, "api/src/example.py")
 
-            self.assertEqual(result.evidence_source, "stored_semantic")
-            self.assertEqual(result.semantic_status.status, "fresh")
-            self.assertIn("stored semantic symbol rows", result.selection_reason.lower())
-            self.assertEqual(result.symbols[0].evidence_source, "stored_semantic")
+            self.assertEqual(result.evidence_source, "rust_semantic_core")
+            self.assertEqual(result.symbols[0].evidence_source, "rust_semantic_core")
+            go_mock.assert_called_once()
 
     def test_issue_context_reports_semantic_freshness_and_stored_symbol_provenance(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -3102,33 +3096,7 @@ class RuntimeSummaryTests(unittest.TestCase):
                     status="fresh",
                 ),
             ):
-                with patch(
-                    "app.service.read_file_symbol_summary",
-                    return_value=FileSymbolSummaryMaterializationRecord(
-                        workspace_id=snapshot.workspace.workspace_id,
-                        path="api/src/example.py",
-                        language="python",
-                        parser_language="python",
-                        symbol_source="tree_sitter",
-                        symbol_count=1,
-                        summary_json={"top_symbols": ["render_payload"]},
-                    ),
-                ):
-                    with patch(
-                        "app.service.read_symbols_for_path",
-                        return_value=[
-                            SymbolMaterializationRecord(
-                                workspace_id=snapshot.workspace.workspace_id,
-                                path="api/src/example.py",
-                                symbol="render_payload",
-                                kind="function",
-                                language="python",
-                                line_start=1,
-                                line_end=2,
-                            )
-                        ],
-                    ):
-                        packet = service.build_issue_context(snapshot.workspace.workspace_id, created.bug_id)
+                packet = service.build_issue_context(snapshot.workspace.workspace_id, created.bug_id)
 
             self.assertIsNotNone(packet.semantic_status)
             self.assertEqual(packet.semantic_status.status, "fresh")
@@ -3531,10 +3499,19 @@ class RuntimeSummaryTests(unittest.TestCase):
                 hints=["This is likely part of the code path that an agent may need to inspect or edit."],
             )
 
-            with patch.object(service, "_read_path_symbols_via_rust", return_value=rust_path_symbols):
-                with patch.object(service, "_explain_path_via_rust", return_value=rust_explainer):
-                    result = service.read_path_symbols(snapshot.workspace.workspace_id, "api/src/example.py")
-                    explained = service.explain_path(snapshot.workspace.workspace_id, "api/src/example.py")
+            def fake_go_workspace(action: str, workspace_id_arg: str, flags=None):
+                self.assertEqual(workspace_id_arg, snapshot.workspace.workspace_id)
+                if action == "path-symbols":
+                    self.assertEqual(flags, ["--path", "api/src/example.py"])
+                    return rust_path_symbols.model_dump(mode="json")
+                if action == "explain-path":
+                    self.assertEqual(flags, ["--path", "api/src/example.py"])
+                    return rust_explainer.model_dump(mode="json")
+                raise AssertionError(f"unexpected Go workspace action: {action}")
+
+            with patch.object(service, "_run_go_workspace_json", side_effect=fake_go_workspace) as go_mock:
+                result = service.read_path_symbols(snapshot.workspace.workspace_id, "api/src/example.py")
+                explained = service.explain_path(snapshot.workspace.workspace_id, "api/src/example.py")
 
             self.assertEqual(result.symbol_source, "tree_sitter")
             self.assertEqual(result.parser_language, "python")
@@ -3550,8 +3527,9 @@ class RuntimeSummaryTests(unittest.TestCase):
             self.assertEqual(explained.parser_language, "python")
             self.assertEqual(explained.evidence_source, "rust_semantic_core")
             self.assertIn("render_payload", explained.detected_symbols)
+            self.assertEqual(go_mock.call_count, 2)
 
-    def test_path_symbols_prefers_fresh_stored_postgres_rows(self):
+    def test_path_symbols_returns_storage_ready_rows_from_go(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir) / "repo"
             (root / "docs" / "bugs").mkdir(parents=True)
@@ -3572,50 +3550,62 @@ class RuntimeSummaryTests(unittest.TestCase):
                     }
                 )
             )
-            stored_summary = FileSymbolSummaryMaterializationRecord(
-                workspace_id=snapshot.workspace.workspace_id,
-                path="api/src/example.py",
-                language="python",
-                parser_language="python",
-                symbol_source="tree_sitter",
-                symbol_count=1,
-                summary_json={"top_symbols": ["stored_symbol"]},
-            )
-            stored_symbols = [
-                SymbolMaterializationRecord(
-                    workspace_id=snapshot.workspace.workspace_id,
-                    path="api/src/example.py",
-                    symbol="stored_symbol",
-                    kind="function",
-                    language="python",
-                    line_start=1,
-                    line_end=2,
-                )
-            ]
 
-            with patch.object(
-                service,
-                "read_semantic_index_status",
-                return_value=SemanticIndexStatus(
-                    workspace_id=snapshot.workspace.workspace_id,
-                    surface="cli",
-                    status="fresh",
-                    postgres_configured=True,
-                    postgres_schema="agent_context",
-                    fingerprint_match=True,
-                ),
-            ):
-                with patch("app.service.read_file_symbol_summary", return_value=stored_summary):
-                    with patch("app.service.read_symbols_for_path", return_value=stored_symbols):
-                        with patch.object(service, "_read_path_symbols_via_rust") as rust_mock:
-                            result = service.read_path_symbols(snapshot.workspace.workspace_id, "api/src/example.py")
+            go_payload = {
+                "workspace_id": snapshot.workspace.workspace_id,
+                "path": "api/src/example.py",
+                "symbol_source": "tree_sitter",
+                "parser_language": "python",
+                "evidence_source": "rust_semantic_core",
+                "selection_reason": "Rust semantic core produced storage-ready rows.",
+                "symbols": [
+                    {
+                        "path": "api/src/example.py",
+                        "symbol": "render_payload",
+                        "kind": "function",
+                        "line_start": 1,
+                        "line_end": 2,
+                        "evidence_source": "rust_semantic_core",
+                    }
+                ],
+                "file_summary_row": {
+                    "workspace_id": snapshot.workspace.workspace_id,
+                    "path": "api/src/example.py",
+                    "language": "python",
+                    "parser_language": "python",
+                    "symbol_source": "tree_sitter",
+                    "symbol_count": 1,
+                    "summary_json": {"top_symbols": ["render_payload"]},
+                },
+                "symbol_rows": [
+                    {
+                        "workspace_id": snapshot.workspace.workspace_id,
+                        "path": "api/src/example.py",
+                        "symbol": "render_payload",
+                        "kind": "function",
+                        "language": "python",
+                        "line_start": 1,
+                        "line_end": 2,
+                    }
+                ],
+                "warnings": [],
+            }
+            with patch.object(service, "_run_go_workspace_json", return_value=go_payload) as go_mock:
+                result = service.read_path_symbols(snapshot.workspace.workspace_id, "api/src/example.py")
 
-            self.assertEqual([item.symbol for item in result.symbols], ["stored_symbol"])
+            self.assertEqual([item.symbol for item in result.symbols], ["render_payload"])
             self.assertEqual(result.symbol_source, "tree_sitter")
-            self.assertEqual(result.file_summary_row, stored_summary)
-            rust_mock.assert_not_called()
+            self.assertIsNotNone(result.file_summary_row)
+            assert result.file_summary_row is not None
+            self.assertEqual(result.file_summary_row.summary_json["top_symbols"], ["render_payload"])
+            self.assertEqual([item.symbol for item in result.symbol_rows], ["render_payload"])
+            go_mock.assert_called_once_with(
+                "path-symbols",
+                snapshot.workspace.workspace_id,
+                ["--path", "api/src/example.py"],
+            )
 
-    def test_code_explainer_prefers_fresh_stored_postgres_symbols(self):
+    def test_code_explainer_delegates_to_go(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir) / "repo"
             (root / "docs" / "bugs").mkdir(parents=True)
@@ -3635,49 +3625,33 @@ class RuntimeSummaryTests(unittest.TestCase):
                     }
                 )
             )
-            stored_summary = FileSymbolSummaryMaterializationRecord(
-                workspace_id=snapshot.workspace.workspace_id,
-                path="api/src/example.py",
-                language="python",
-                parser_language="python",
-                symbol_source="tree_sitter",
-                symbol_count=1,
-                summary_json={"top_symbols": ["stored_symbol"]},
-            )
-            stored_symbols = [
-                SymbolMaterializationRecord(
-                    workspace_id=snapshot.workspace.workspace_id,
-                    path="api/src/example.py",
-                    symbol="stored_symbol",
-                    kind="function",
-                    language="python",
-                    line_start=1,
-                    line_end=2,
-                )
-            ]
 
-            with patch.object(
-                service,
-                "read_semantic_index_status",
-                return_value=SemanticIndexStatus(
-                    workspace_id=snapshot.workspace.workspace_id,
-                    surface="cli",
-                    status="fresh",
-                    postgres_configured=True,
-                    postgres_schema="agent_context",
-                    fingerprint_match=True,
-                ),
-            ):
-                with patch("app.service.read_file_symbol_summary", return_value=stored_summary):
-                    with patch("app.service.read_symbols_for_path", return_value=stored_symbols):
-                        with patch.object(service, "_explain_path_via_rust") as rust_mock:
-                            result = service.explain_path(snapshot.workspace.workspace_id, "api/src/example.py")
+            go_payload = {
+                "workspace_id": snapshot.workspace.workspace_id,
+                "path": "api/src/example.py",
+                "role": "source",
+                "line_count": 2,
+                "import_count": 0,
+                "detected_symbols": ["local_symbol"],
+                "symbol_source": "tree_sitter",
+                "parser_language": "python",
+                "evidence_source": "rust_semantic_core",
+                "selection_reason": "Go delivery over Rust code-explainer substrate.",
+                "summary": "api/src/example.py looks like a source file.",
+                "hints": [],
+                "warnings": [],
+            }
+            with patch.object(service, "_run_go_workspace_json", return_value=go_payload) as go_mock:
+                result = service.explain_path(snapshot.workspace.workspace_id, "api/src/example.py")
 
             self.assertEqual(result.symbol_source, "tree_sitter")
             self.assertEqual(result.parser_language, "python")
-            self.assertEqual(result.detected_symbols, ["stored_symbol"])
-            self.assertNotIn("local_symbol", result.detected_symbols)
-            rust_mock.assert_not_called()
+            self.assertEqual(result.detected_symbols, ["local_symbol"])
+            go_mock.assert_called_once_with(
+                "explain-path",
+                snapshot.workspace.workspace_id,
+                ["--path", "api/src/example.py"],
+            )
 
     def test_semantic_search_returns_ast_grep_matches(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -3695,24 +3669,57 @@ class RuntimeSummaryTests(unittest.TestCase):
             snapshot = service.load_workspace(WorkspaceLoadRequest(root_path=str(root), auto_scan=True))
             assert snapshot is not None
 
-            fake_matches = [
-                SemanticPatternMatchRecord(
-                    path="api/src/example.py",
-                    language="python",
-                    line_start=1,
-                    line_end=1,
-                    column_start=1,
-                    column_end=19,
-                    matched_text="def render_payload():",
-                    context_lines="def render_payload():",
-                    meta_variables=[],
-                )
-            ]
+            go_payload = {
+                "workspace_id": snapshot.workspace.workspace_id,
+                "pattern": "def $A():",
+                "language": "python",
+                "path_glob": "api/src/**/*.py",
+                "engine": "ast_grep",
+                "binary_path": "/opt/homebrew/bin/sg",
+                "match_count": 1,
+                "truncated": False,
+                "matches": [
+                    {
+                        "path": "api/src/example.py",
+                        "language": "python",
+                        "line_start": 1,
+                        "line_end": 1,
+                        "column_start": 1,
+                        "column_end": 19,
+                        "matched_text": "def render_payload():",
+                        "context_lines": "def render_payload():",
+                        "meta_variables": [],
+                    }
+                ],
+                "query_row": {
+                    "query_ref": "semanticq_fixture",
+                    "workspace_id": snapshot.workspace.workspace_id,
+                    "source": "adhoc_tool",
+                    "pattern": "def $A():",
+                    "language": "python",
+                    "path_glob": "api/src/**/*.py",
+                    "engine": "ast_grep",
+                    "match_count": 1,
+                    "truncated": False,
+                },
+                "match_rows": [
+                    {
+                        "query_ref": "semanticq_fixture",
+                        "workspace_id": snapshot.workspace.workspace_id,
+                        "path": "api/src/example.py",
+                        "language": "python",
+                        "line_start": 1,
+                        "line_end": 1,
+                        "column_start": 1,
+                        "column_end": 19,
+                        "matched_text": "def render_payload():",
+                        "context_lines": "def render_payload():",
+                        "meta_variables": [],
+                    }
+                ],
+            }
 
-            with patch(
-                "app.service.run_ast_grep_query",
-                return_value=(fake_matches, "/opt/homebrew/bin/sg", None, False),
-            ):
+            with patch.object(service, "_run_go_workspace_json", return_value=go_payload) as go_mock:
                 result = service.search_semantic_pattern(
                     snapshot.workspace.workspace_id,
                     "def $A():",
@@ -3733,6 +3740,11 @@ class RuntimeSummaryTests(unittest.TestCase):
             self.assertEqual(len(result.match_rows), 1)
             self.assertEqual(result.match_rows[0].query_ref, result.query_row.query_ref)
             self.assertEqual(result.match_rows[0].path, "api/src/example.py")
+            go_mock.assert_called_once_with(
+                "semantic-search",
+                snapshot.workspace.workspace_id,
+                ["--pattern", "def $A():", "--limit", "50", "--language", "python", "--path-glob", "api/src/**/*.py"],
+            )
 
     def test_semantic_search_reports_missing_ast_grep(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -3747,10 +3759,27 @@ class RuntimeSummaryTests(unittest.TestCase):
             snapshot = service.load_workspace(WorkspaceLoadRequest(root_path=str(root), auto_scan=True))
             assert snapshot is not None
 
-            with patch(
-                "app.service.run_ast_grep_query",
-                return_value=([], None, "ast-grep binary is not installed on this machine.", False),
-            ):
+            go_payload = {
+                "workspace_id": snapshot.workspace.workspace_id,
+                "pattern": "print($A)",
+                "engine": "none",
+                "match_count": 0,
+                "truncated": False,
+                "matches": [],
+                "query_row": {
+                    "query_ref": "semanticq_fixture_missing",
+                    "workspace_id": snapshot.workspace.workspace_id,
+                    "source": "adhoc_tool",
+                    "pattern": "print($A)",
+                    "engine": "none",
+                    "match_count": 0,
+                    "truncated": False,
+                    "error": "ast-grep binary is not installed on this machine.",
+                },
+                "match_rows": [],
+                "error": "ast-grep binary is not installed on this machine.",
+            }
+            with patch.object(service, "_run_go_workspace_json", return_value=go_payload) as go_mock:
                 result = service.search_semantic_pattern(snapshot.workspace.workspace_id, "print($A)")
 
             self.assertEqual(result.engine, "none")
@@ -3760,6 +3789,11 @@ class RuntimeSummaryTests(unittest.TestCase):
             assert result.query_row is not None
             self.assertEqual(result.query_row.engine, "none")
             self.assertEqual(result.query_row.error, "ast-grep binary is not installed on this machine.")
+            go_mock.assert_called_once_with(
+                "semantic-search",
+                snapshot.workspace.workspace_id,
+                ["--pattern", "print($A)", "--limit", "50"],
+            )
 
 
 class FileStoreRunTests(unittest.TestCase):

@@ -235,8 +235,8 @@ That boundary work is now live for three concrete slices:
 - The Python Typer CLI keeps the old command names for compatibility, but those commands now delegate to `go run ./cmd/xmustard-ops ...` for the migrated workspace/Postgres/semantic surfaces instead of calling `TrackerService` as the authority.
 - FastAPI no longer registers `GET /api/workspaces/{workspace_id}/path-symbols` or `GET /api/workspaces/{workspace_id}/explain-path`; those single-path semantic reads are Go HTTP delivery over Rust semantic-core output.
 - Python no longer exposes a public `TrackerService.read_changed_symbols(...)` CLI authority seam; the compatibility CLI delegates `changed-symbols` to Go, which derives it from Rust-backed impact.
-- Public `TrackerService` compatibility methods for Postgres foundation, Postgres semantic materialization, and semantic-index plan/run/status now delegate to Go `xmustard-ops`; the remaining Python semantic helpers are compatibility residue for stored semantic reads and non-migrated orchestration, not the authority path for those Phase 3 operations.
-- Python still owns broader CLI compatibility, remaining FastAPI routes, `TrackerService` compatibility assembly outside the migrated slices, and stored-semantic compatibility reads; do not mistake Phase 3 for a full Python exit.
+- Public `TrackerService` compatibility methods for Postgres foundation, Postgres semantic materialization, semantic-index plan/run/status, repo-intelligence reads, path symbols, explainer, semantic search, and retrieval now delegate to Go `xmustard-ops`; the old Python private helpers for those migrated slices have been removed from `TrackerService`.
+- Python still owns broader CLI compatibility, remaining FastAPI routes, `TrackerService` compatibility assembly outside the migrated slices, issue-context semantic pattern derivation, and persistence glue; do not mistake Phase 3 for a full Python exit.
 - Python parity tests now compare live Python behavior against the Rust outputs for:
   - signal scanning
   - repo-map summaries
