@@ -97,10 +97,8 @@ from .models import (
     PlanStep,
     PlanTrackingUpdateRequest,
     PostgresBootstrapResult,
-    PostgresPathMaterializationRequest,
+    PostgresSchemaPlan,
     PostgresSemanticMaterializationResult,
-    PostgresSemanticSearchMaterializationRequest,
-    PostgresWorkspaceSemanticMaterializationRequest,
     PostgresWorkspaceSemanticMaterializationResult,
     PromoteSignalRequest,
     RepoGuidanceHealth,
@@ -183,16 +181,11 @@ from .models import (
     utc_now,
 )
 from .postgres import (
-    bootstrap_schema,
-    build_schema_plan,
-    materialize_path_symbols,
-    materialize_semantic_search,
     persist_semantic_index_baseline,
     read_file_symbol_summary,
     read_latest_semantic_index_baseline,
     read_semantic_matches,
     read_symbols_for_path,
-    render_schema_sql,
 )
 from .runtimes import RuntimeService
 from .scanners import (
@@ -803,45 +796,92 @@ class TrackerService:
     def update_settings(self, settings: AppSettings) -> AppSettings:
         return self.store.save_settings(settings)
 
-    def read_postgres_schema_plan(self):
-        settings = self.store.load_settings()
-        return build_schema_plan(Path(__file__).resolve().parents[1], settings.postgres_dsn, settings.postgres_schema)
+    def _run_go_ops(self, args: list[str]) -> str:
+        api_go_dir = Path(__file__).resolve().parents[2] / "api-go"
+        command = ["go", "run", "./cmd/xmustard-ops", *args, "--data-dir", str(self.store.root)]
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=api_go_dir,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError(f"go xmustard-ops failed: {exc}") from exc
+        if completed.returncode != 0:
+            message = completed.stderr.strip() or completed.stdout.strip() or "go xmustard-ops failed"
+            raise RuntimeError(message)
+        return completed.stdout
+
+    def _run_go_ops_json(self, args: list[str]):
+        stdout = self._run_go_ops(args)
+        try:
+            return json.loads(stdout)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"Invalid JSON from Go xmustard-ops: {exc}") from exc
+
+    def _run_go_postgres_json(self, action: str, flags: Optional[list[str]] = None):
+        return self._run_go_ops_json(["postgres", action, *(flags or [])])
+
+    def _run_go_postgres_text(self, action: str, flags: Optional[list[str]] = None) -> str:
+        return self._run_go_ops(["postgres", action, *(flags or [])])
+
+    def _run_go_workspace_json(self, action: str, workspace_id: str, flags: Optional[list[str]] = None):
+        return self._run_go_ops_json(["workspace", action, workspace_id, *(flags or [])])
+
+    def _run_go_semantic_index_json(
+        self,
+        action: str,
+        workspace_id: str,
+        *,
+        surface: str = "cli",
+        strategy: str = "key_files",
+        paths: Optional[list[str]] = None,
+        limit: int = 12,
+        dsn: Optional[str] = None,
+        schema: Optional[str] = None,
+        dry_run: bool = False,
+    ):
+        args = [
+            "semantic-index",
+            action,
+            workspace_id,
+            "--surface",
+            surface,
+            "--strategy",
+            strategy,
+            "--limit",
+            str(limit),
+        ]
+        for item in paths or []:
+            args.extend(["--path", item])
+        if dsn:
+            args.extend(["--dsn", dsn])
+        if schema:
+            args.extend(["--schema", schema])
+        if dry_run:
+            args.append("--dry-run")
+        return self._run_go_ops_json(args)
+
+    def read_postgres_schema_plan(self) -> PostgresSchemaPlan:
+        return PostgresSchemaPlan.model_validate(self._run_go_postgres_json("plan"))
 
     def render_postgres_schema_sql(self, schema: Optional[str] = None) -> str:
-        settings = self.store.load_settings()
-        rendered, _ = render_schema_sql(
-            Path(__file__).resolve().parents[1],
-            schema or settings.postgres_schema,
-        )
-        return rendered
+        flags = ["--schema", schema] if schema else []
+        return self._run_go_postgres_text("render", flags)
 
     def bootstrap_postgres_schema(
         self,
         dsn: Optional[str] = None,
         schema: Optional[str] = None,
     ) -> PostgresBootstrapResult:
-        settings = self.store.load_settings()
-        target_dsn = (dsn or settings.postgres_dsn or "").strip()
-        target_schema = (schema or settings.postgres_schema).strip()
-        result = bootstrap_schema(
-            Path(__file__).resolve().parents[1],
-            target_dsn,
-            target_schema,
-        )
-        self._record_activity(
-            workspace_id="global",
-            entity_type="settings",
-            entity_id="postgres",
-            action="postgres.bootstrap",
-            summary=f"Applied Postgres schema bootstrap for schema {result.schema_name}",
-            actor=build_activity_actor("operator", "operator"),
-            details={
-                "schema_name": result.schema_name,
-                "statement_count": result.statement_count,
-                "dsn_redacted": result.dsn_redacted,
-            },
-        )
-        return result
+        flags: list[str] = []
+        if dsn:
+            flags.extend(["--dsn", dsn])
+        if schema:
+            flags.extend(["--schema", schema])
+        return PostgresBootstrapResult.model_validate(self._run_go_postgres_json("bootstrap", flags))
 
     def materialize_path_symbols_to_postgres(
         self,
@@ -852,39 +892,14 @@ class TrackerService:
         schema: Optional[str] = None,
         record_activity: bool = True,
     ) -> PostgresSemanticMaterializationResult:
-        workspace = self.get_workspace(workspace_id)
-        settings = self.store.load_settings()
-        target_dsn = (dsn or settings.postgres_dsn or "").strip()
-        target_schema = (schema or settings.postgres_schema).strip()
-        path_symbols = self.read_path_symbols(workspace_id, relative_path)
-        if path_symbols.file_summary_row is None:
-            raise ValueError(f"No symbol summary is available for {relative_path}")
-        result = materialize_path_symbols(
-            target_dsn,
-            target_schema,
-            workspace_id=workspace.workspace_id,
-            workspace_name=workspace.name,
-            workspace_root=workspace.root_path,
-            relative_path=path_symbols.path,
-            file_summary_row=path_symbols.file_summary_row,
-            symbol_rows=path_symbols.symbol_rows,
+        flags = ["--path", relative_path]
+        if dsn:
+            flags.extend(["--dsn", dsn])
+        if schema:
+            flags.extend(["--schema", schema])
+        return PostgresSemanticMaterializationResult.model_validate(
+            self._run_go_workspace_json("postgres-materialize-path", workspace_id, flags)
         )
-        if record_activity:
-            self._record_activity(
-                workspace_id=workspace_id,
-                entity_type="workspace",
-                entity_id=workspace_id,
-                action="postgres.materialize.path_symbols",
-                summary=f"Materialized parser-backed symbol rows for {path_symbols.path}",
-                actor=build_activity_actor("system", "xmustard"),
-                details={
-                    "path": path_symbols.path,
-                    "schema_name": result.schema_name,
-                    "symbol_rows": result.symbol_rows,
-                    "summary_rows": result.summary_rows,
-                },
-            )
-        return result
 
     def materialize_semantic_search_to_postgres(
         self,
@@ -897,44 +912,18 @@ class TrackerService:
         dsn: Optional[str] = None,
         schema: Optional[str] = None,
     ) -> PostgresSemanticMaterializationResult:
-        workspace = self.get_workspace(workspace_id)
-        settings = self.store.load_settings()
-        target_dsn = (dsn or settings.postgres_dsn or "").strip()
-        target_schema = (schema or settings.postgres_schema).strip()
-        search_result = self.search_semantic_pattern(
-            workspace_id,
-            pattern,
-            language=language,
-            path_glob=path_glob,
-            limit=limit,
+        flags = ["--pattern", pattern, "--limit", str(limit)]
+        if language:
+            flags.extend(["--language", language])
+        if path_glob:
+            flags.extend(["--path-glob", path_glob])
+        if dsn:
+            flags.extend(["--dsn", dsn])
+        if schema:
+            flags.extend(["--schema", schema])
+        return PostgresSemanticMaterializationResult.model_validate(
+            self._run_go_workspace_json("postgres-materialize-semantic-search", workspace_id, flags)
         )
-        if search_result.query_row is None:
-            raise ValueError("Semantic search did not produce a storage-ready query row")
-        result = materialize_semantic_search(
-            target_dsn,
-            target_schema,
-            workspace_id=workspace.workspace_id,
-            workspace_name=workspace.name,
-            workspace_root=workspace.root_path,
-            query_row=search_result.query_row,
-            match_rows=search_result.match_rows,
-        )
-        self._record_activity(
-            workspace_id=workspace_id,
-            entity_type="workspace",
-            entity_id=workspace_id,
-            action="postgres.materialize.semantic_search",
-            summary=f"Materialized semantic search query for pattern {pattern}",
-            actor=build_activity_actor("system", "xmustard"),
-            details={
-                "pattern": pattern,
-                "schema_name": result.schema_name,
-                "query_rows": result.query_rows,
-                "match_rows": result.match_rows,
-                "engine": search_result.engine,
-            },
-        )
-        return result
 
     def materialize_workspace_symbols_to_postgres(
         self,
@@ -947,76 +936,16 @@ class TrackerService:
         dsn: Optional[str] = None,
         schema: Optional[str] = None,
     ) -> PostgresWorkspaceSemanticMaterializationResult:
-        workspace = self.get_workspace(workspace_id)
-        settings = self.store.load_settings()
-        target_dsn = (dsn or settings.postgres_dsn or "").strip()
-        target_schema = (schema or settings.postgres_schema).strip()
-        requested_paths = self._semantic_materialization_paths(
-            workspace_id,
-            strategy=strategy,
-            paths=paths or [],
-            limit=limit,
-            surface=surface,
+        flags = ["--strategy", strategy, "--limit", str(limit)]
+        for item in paths or []:
+            flags.extend(["--select-path", item])
+        if dsn:
+            flags.extend(["--dsn", dsn])
+        if schema:
+            flags.extend(["--schema", schema])
+        return PostgresWorkspaceSemanticMaterializationResult.model_validate(
+            self._run_go_workspace_json("postgres-materialize-workspace-symbols", workspace_id, flags)
         )
-        materialized_paths: list[str] = []
-        skipped_paths: list[str] = []
-        file_rows = 0
-        symbol_rows = 0
-        summary_rows = 0
-        redacted_dsn: Optional[str] = None
-        for relative_path in requested_paths:
-            try:
-                result = self.materialize_path_symbols_to_postgres(
-                    workspace_id,
-                    relative_path,
-                    dsn=target_dsn,
-                    schema=target_schema,
-                    record_activity=False,
-                )
-            except (FileNotFoundError, ValueError):
-                skipped_paths.append(relative_path)
-                continue
-            materialized_paths.extend(result.materialized_paths)
-            file_rows += result.file_rows
-            symbol_rows += result.symbol_rows
-            summary_rows += result.summary_rows
-            redacted_dsn = result.dsn_redacted
-        batch_result = PostgresWorkspaceSemanticMaterializationResult(
-            applied=bool(materialized_paths),
-            dsn_redacted=redacted_dsn,
-            schema_name=target_schema,
-            workspace_id=workspace_id,
-            strategy="paths" if strategy == "paths" else "key_files",
-            requested_paths=requested_paths,
-            materialized_paths=self._dedupe_text(materialized_paths),
-            skipped_paths=self._dedupe_text(skipped_paths),
-            file_rows=file_rows,
-            symbol_rows=symbol_rows,
-            summary_rows=summary_rows,
-            message=(
-                f"Materialized parser-backed symbol rows for {len(materialized_paths)} paths "
-                f"using strategy '{strategy}' into Postgres schema '{target_schema}'."
-            ),
-        )
-        self._record_activity(
-            workspace_id=workspace_id,
-            entity_type="workspace",
-            entity_id=workspace_id,
-            action="postgres.materialize.workspace_symbols",
-            summary=f"Materialized workspace symbol batch for {len(batch_result.materialized_paths)} paths",
-            actor=build_activity_actor("system", "xmustard"),
-            details={
-                "strategy": batch_result.strategy,
-                "surface": surface,
-                "schema_name": batch_result.schema_name,
-                "requested_paths": batch_result.requested_paths,
-                "materialized_paths": batch_result.materialized_paths,
-                "skipped_paths": batch_result.skipped_paths,
-                "symbol_rows": batch_result.symbol_rows,
-                "summary_rows": batch_result.summary_rows,
-            },
-        )
-        return batch_result
 
     def plan_semantic_index(
         self,
@@ -1028,92 +957,16 @@ class TrackerService:
         limit: int = 12,
         dsn: Optional[str] = None,
     ) -> SemanticIndexPlan:
-        workspace = self.get_workspace(workspace_id)
-        settings = self.store.load_settings()
-        normalized_surface = self._normalize_semantic_surface(surface)
-        blockers: list[str] = []
-        warnings: list[str] = []
-        selected_paths: list[str] = []
-        try:
-            selected_paths = self._semantic_materialization_paths(
+        return SemanticIndexPlan.model_validate(
+            self._run_go_semantic_index_json(
+                "plan",
                 workspace_id,
+                surface=surface,
                 strategy=strategy,
                 paths=paths or [],
                 limit=limit,
-                surface=normalized_surface,
+                dsn=dsn,
             )
-        except ValueError as exc:
-            blockers.append(str(exc))
-
-        postgres_configured = bool((dsn or settings.postgres_dsn or "").strip())
-        if not postgres_configured:
-            blockers.append("Postgres DSN is not configured; run with --dsn or save a Postgres setting before applying.")
-        if not tree_sitter_available():
-            blockers.append("tree-sitter language pack is not available.")
-        if not selected_paths:
-            blockers.append("No semantic index paths were selected.")
-        if not ast_grep_available():
-            warnings.append("ast-grep binary is unavailable; symbol indexing can run, but semantic pattern matches remain blocked.")
-
-        run_targets = self.list_run_targets(workspace_id)
-        verify_targets = self.list_verify_targets(workspace_id)
-        root = Path(workspace.root_path)
-        worktree = self.read_worktree_status(workspace_id)
-        selected_path_details = [
-            self._semantic_index_path_selection(root, path, normalized_surface)
-            for path in selected_paths
-        ]
-        index_fingerprint = self._semantic_index_fingerprint(
-            workspace_id,
-            normalized_surface,
-            selected_path_details,
-            worktree.head_sha,
-        )
-        next_actions = [
-            "Run semantic-index run after reviewing selected_paths.",
-            "Use --path for exact files when the surface selector is too broad.",
-            "Install sg before expecting semantic-search match materialization.",
-        ]
-        if worktree.dirty_files:
-            warnings.append("Worktree has dirty files; this semantic index baseline should be treated as provisional.")
-        if not postgres_configured:
-            next_actions.insert(0, "Configure Postgres or pass --dsn for this run.")
-        retrieval_ledger = [
-            ContextRetrievalLedgerEntry(
-                entry_id=f"semantic_index_path:{item.path}",
-                source_type="semantic_index_path",
-                source_id=item.path,
-                title=item.path,
-                path=item.path,
-                reason=item.reason,
-                matched_terms=self._semantic_index_matched_terms(item.path, item.reason, normalized_surface),
-                score=item.score,
-            )
-            for item in selected_path_details
-        ]
-        return SemanticIndexPlan(
-            workspace_id=workspace_id,
-            root_path=workspace.root_path,
-            surface=normalized_surface,
-            strategy="paths" if strategy == "paths" else "key_files",
-            requested_paths=self._dedupe_text(paths or []),
-            selected_paths=selected_paths,
-            selected_path_details=selected_path_details,
-            head_sha=worktree.head_sha,
-            dirty_files=worktree.dirty_files,
-            worktree_dirty=bool(worktree.dirty_files),
-            index_fingerprint=index_fingerprint,
-            postgres_configured=postgres_configured,
-            postgres_schema=settings.postgres_schema,
-            tree_sitter_available=tree_sitter_available(),
-            ast_grep_available=ast_grep_available(),
-            run_target_count=len(run_targets),
-            verify_target_count=len(verify_targets),
-            retrieval_ledger=retrieval_ledger,
-            blockers=self._dedupe_text(blockers),
-            warnings=self._dedupe_text(warnings),
-            next_actions=next_actions,
-            can_run=not blockers,
         )
 
     def run_semantic_index(
@@ -1128,45 +981,18 @@ class TrackerService:
         schema: Optional[str] = None,
         dry_run: bool = False,
     ) -> SemanticIndexRunResult:
-        plan = self.plan_semantic_index(
-            workspace_id,
-            surface=surface,
-            strategy=strategy,
-            paths=paths or [],
-            limit=limit,
-            dsn=dsn,
-        )
-        if dry_run:
-            return SemanticIndexRunResult(
-                workspace_id=workspace_id,
-                surface=plan.surface,
-                dry_run=True,
-                plan=plan,
-                message=f"Semantic index dry run selected {len(plan.selected_paths)} paths for surface '{plan.surface}'.",
+        return SemanticIndexRunResult.model_validate(
+            self._run_go_semantic_index_json(
+                "run",
+                workspace_id,
+                surface=surface,
+                strategy=strategy,
+                paths=paths or [],
+                limit=limit,
+                dsn=dsn,
+                schema=schema,
+                dry_run=dry_run,
             )
-        materialization = self.materialize_workspace_symbols_to_postgres(
-            workspace_id,
-            strategy="paths",
-            paths=plan.selected_paths,
-            limit=limit,
-            surface=plan.surface,
-            dsn=dsn,
-            schema=schema,
-        )
-        self._persist_semantic_index_baseline(
-            workspace_id,
-            plan,
-            materialization,
-            dsn=dsn,
-            schema=schema,
-        )
-        return SemanticIndexRunResult(
-            workspace_id=workspace_id,
-            surface=plan.surface,
-            dry_run=False,
-            plan=plan,
-            materialization=materialization,
-            message=f"Semantic index materialized {len(materialization.materialized_paths)} paths for surface '{plan.surface}'.",
         )
 
     def read_semantic_index_status(
@@ -1180,93 +1006,17 @@ class TrackerService:
         dsn: Optional[str] = None,
         schema: Optional[str] = None,
     ) -> SemanticIndexStatus:
-        workspace = self.get_workspace(workspace_id)
-        settings = self.store.load_settings()
-        target_dsn = (dsn or settings.postgres_dsn or "").strip()
-        target_schema = (schema or settings.postgres_schema).strip()
-        normalized_surface = self._normalize_semantic_surface(surface)
-        plan = self.plan_semantic_index(
-            workspace_id,
-            surface=normalized_surface,
-            strategy=strategy,
-            paths=paths or [],
-            limit=limit,
-            dsn=target_dsn or None,
-        )
-        warnings = list(plan.warnings)
-        stale_reasons: list[str] = []
-        if not target_dsn:
-            return SemanticIndexStatus(
-                workspace_id=workspace_id,
-                surface=plan.surface,
-                status="blocked",
-                postgres_configured=False,
-                postgres_schema=target_schema,
-                current_fingerprint=plan.index_fingerprint,
-                current_head_sha=plan.head_sha,
-                current_dirty_files=plan.dirty_files,
-                stale_reasons=["Postgres DSN is not configured; no semantic baseline can be read."],
-                warnings=warnings,
+        return SemanticIndexStatus.model_validate(
+            self._run_go_semantic_index_json(
+                "status",
+                workspace_id,
+                surface=surface,
+                strategy=strategy,
+                paths=paths or [],
+                limit=limit,
+                dsn=dsn,
+                schema=schema,
             )
-        try:
-            baseline = read_latest_semantic_index_baseline(
-                target_dsn,
-                target_schema,
-                workspace_id=workspace.workspace_id,
-                surface=normalized_surface,
-                strategy=plan.strategy,
-            )
-        except RuntimeError as exc:
-            return SemanticIndexStatus(
-                workspace_id=workspace_id,
-                surface=plan.surface,
-                status="blocked",
-                postgres_configured=True,
-                postgres_schema=target_schema,
-                current_fingerprint=plan.index_fingerprint,
-                current_head_sha=plan.head_sha,
-                current_dirty_files=plan.dirty_files,
-                stale_reasons=[str(exc)],
-                warnings=warnings,
-            )
-        if baseline is None:
-            return SemanticIndexStatus(
-                workspace_id=workspace_id,
-                surface=plan.surface,
-                status="no_baseline",
-                postgres_configured=True,
-                postgres_schema=target_schema,
-                current_fingerprint=plan.index_fingerprint,
-                current_head_sha=plan.head_sha,
-                current_dirty_files=plan.dirty_files,
-                stale_reasons=["No stored semantic index baseline exists for this workspace and surface."],
-                warnings=warnings,
-            )
-        fingerprint_match = bool(plan.index_fingerprint and plan.index_fingerprint == baseline.index_fingerprint)
-        baseline_covers_plan = self._semantic_baseline_covers_plan(plan, baseline)
-        semantic_inputs_match = fingerprint_match or baseline_covers_plan
-        if plan.head_sha != baseline.head_sha:
-            stale_reasons.append("HEAD SHA differs from the stored semantic baseline.")
-        if not semantic_inputs_match:
-            stale_reasons.append("Selected path hashes or baseline inputs differ from the stored semantic baseline.")
-        if plan.dirty_files:
-            stale_reasons.append("Worktree has dirty files, so freshness is provisional until the tree is clean or re-indexed.")
-        status = "fresh" if semantic_inputs_match and not plan.dirty_files else "stale"
-        if plan.dirty_files and semantic_inputs_match:
-            status = "dirty_provisional"
-        return SemanticIndexStatus(
-            workspace_id=workspace_id,
-            surface=plan.surface,
-            status=status,
-            postgres_configured=True,
-            postgres_schema=target_schema,
-            current_fingerprint=plan.index_fingerprint,
-            current_head_sha=plan.head_sha,
-            current_dirty_files=plan.dirty_files,
-            baseline=baseline,
-            fingerprint_match=semantic_inputs_match,
-            stale_reasons=self._dedupe_text(stale_reasons),
-            warnings=warnings,
         )
 
     def _semantic_baseline_covers_plan(

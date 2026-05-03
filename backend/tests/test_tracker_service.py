@@ -2470,7 +2470,19 @@ class RuntimeSummaryTests(unittest.TestCase):
                 )
             )
 
-            plan = service.read_postgres_schema_plan()
+            go_plan = {
+                "configured": True,
+                "dsn_redacted": "postgresql://xmustard:***@localhost:5432/xmustard",
+                "schema_name": "agent_context",
+                "sql_path": "/tmp/schema.sql",
+                "statement_count": 12,
+                "table_names": ["workspaces", "symbols", "semantic_matches", "run_plans"],
+                "semantic_table_names": ["symbols", "semantic_matches"],
+                "ops_memory_table_names": ["run_plans"],
+                "search_document_tables": ["run_plans"],
+            }
+            with patch.object(service, "_run_go_postgres_json", return_value=go_plan) as go_plan_mock:
+                plan = service.read_postgres_schema_plan()
             self.assertTrue(plan.configured)
             self.assertEqual(plan.schema_name, "agent_context")
             self.assertIn("workspaces", plan.table_names)
@@ -2479,28 +2491,34 @@ class RuntimeSummaryTests(unittest.TestCase):
             self.assertIn("run_plans", plan.ops_memory_table_names)
             self.assertIn("run_plans", plan.search_document_tables)
             self.assertGreater(plan.statement_count, 10)
+            go_plan_mock.assert_called_once_with("plan")
 
-            rendered_sql = service.render_postgres_schema_sql()
+            rendered_payload = (
+                "create schema if not exists agent_context;\n"
+                "create table if not exists agent_context.workspaces(id text);\n"
+                "create table if not exists agent_context.semantic_matches(id text);\n"
+                "create table if not exists agent_context.run_plans(id text);\n"
+            )
+            with patch.object(service, "_run_go_postgres_text", return_value=rendered_payload) as render_mock:
+                rendered_sql = service.render_postgres_schema_sql()
             self.assertIn("create schema if not exists agent_context;", rendered_sql.lower())
             self.assertIn("agent_context.workspaces", rendered_sql)
             self.assertIn("agent_context.semantic_matches", rendered_sql)
             self.assertIn("agent_context.run_plans", rendered_sql)
+            render_mock.assert_called_once_with("render", [])
 
-            with patch("app.service.bootstrap_schema") as bootstrap_mock:
-                bootstrap_mock.return_value = PostgresBootstrapResult(
-                    applied=True,
-                    dsn_redacted="postgresql://xmustard:***@localhost:5432/xmustard",
-                    schema_name="agent_context",
-                    sql_path="/tmp/schema.sql",
-                    statement_count=12,
-                    message="Applied repo cockpit foundation schema to Postgres schema 'agent_context'.",
-                )
+            go_bootstrap = {
+                "applied": True,
+                "dsn_redacted": "postgresql://xmustard:***@localhost:5432/xmustard",
+                "schema_name": "agent_context",
+                "sql_path": "/tmp/schema.sql",
+                "statement_count": 12,
+                "message": "Applied repo cockpit foundation schema to Postgres schema 'agent_context'.",
+            }
+            with patch.object(service, "_run_go_postgres_json", return_value=go_bootstrap) as bootstrap_mock:
                 result = service.bootstrap_postgres_schema()
                 self.assertTrue(result.applied)
-                bootstrap_mock.assert_called_once()
-                _, used_dsn, used_schema = bootstrap_mock.call_args.args
-                self.assertEqual(used_dsn, "postgresql://xmustard:secret@localhost:5432/xmustard")
-                self.assertEqual(used_schema, "agent_context")
+                bootstrap_mock.assert_called_once_with("bootstrap", [])
 
     def test_postgres_materialization_surfaces_follow_settings(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -2524,125 +2542,66 @@ class RuntimeSummaryTests(unittest.TestCase):
                 )
             )
 
-            file_summary_row = FileSymbolSummaryMaterializationRecord(
-                workspace_id=snapshot.workspace.workspace_id,
-                path="api/src/example.py",
-                language="python",
-                parser_language="python",
-                symbol_source="tree_sitter",
-                symbol_count=1,
-                summary_json={"top_symbols": ["render_payload"]},
-            )
-            symbol_rows = [
-                SymbolMaterializationRecord(
-                    workspace_id=snapshot.workspace.workspace_id,
-                    path="api/src/example.py",
-                    symbol="render_payload",
-                    kind="function",
-                    language="python",
-                    line_start=1,
-                    line_end=2,
+            path_payload = {
+                "applied": True,
+                "dsn_redacted": "postgresql://xmustard:***@localhost:5432/xmustard",
+                "schema_name": "agent_context",
+                "workspace_id": snapshot.workspace.workspace_id,
+                "source": "path_symbols",
+                "target": "api/src/example.py",
+                "materialized_paths": ["api/src/example.py"],
+                "file_rows": 1,
+                "symbol_rows": 1,
+                "summary_rows": 1,
+                "message": "ok",
+            }
+            with patch.object(service, "_run_go_workspace_json", return_value=path_payload) as path_materialize_mock:
+                result = service.materialize_path_symbols_to_postgres(
+                    snapshot.workspace.workspace_id,
+                    "api/src/example.py",
                 )
-            ]
-            with patch.object(
-                service,
-                "read_path_symbols",
-                return_value=PathSymbolsResult(
-                    workspace_id=snapshot.workspace.workspace_id,
-                    path="api/src/example.py",
-                    symbol_source="tree_sitter",
-                    parser_language="python",
-                    symbols=[],
-                    file_summary_row=file_summary_row,
-                    symbol_rows=symbol_rows,
-                ),
-            ):
-                with patch("app.service.materialize_path_symbols") as path_materialize_mock:
-                    path_materialize_mock.return_value = PostgresSemanticMaterializationResult(
-                        applied=True,
-                        dsn_redacted="postgresql://xmustard:***@localhost:5432/xmustard",
-                        schema_name="agent_context",
-                        workspace_id=snapshot.workspace.workspace_id,
-                        source="path_symbols",
-                        target="api/src/example.py",
-                        materialized_paths=["api/src/example.py"],
-                        file_rows=1,
-                        symbol_rows=1,
-                        summary_rows=1,
-                        message="ok",
-                    )
-                    result = service.materialize_path_symbols_to_postgres(
-                        snapshot.workspace.workspace_id,
-                        "api/src/example.py",
-                    )
-                    self.assertTrue(result.applied)
-                    used_dsn, used_schema = path_materialize_mock.call_args.args[:2]
-                    self.assertEqual(used_dsn, "postgresql://xmustard:secret@localhost:5432/xmustard")
-                    self.assertEqual(used_schema, "agent_context")
+                self.assertTrue(result.applied)
+                path_materialize_mock.assert_called_once_with(
+                    "postgres-materialize-path",
+                    snapshot.workspace.workspace_id,
+                    ["--path", "api/src/example.py"],
+                )
 
-            query_row = SemanticQueryMaterializationRecord(
-                query_ref="semanticq_fixture",
-                workspace_id=snapshot.workspace.workspace_id,
-                source="adhoc_tool",
-                pattern="def $A():",
-                language="python",
-                path_glob="api/src/**/*.py",
-                engine="ast_grep",
-                match_count=1,
-            )
-            match_rows = [
-                SemanticMatchMaterializationRecord(
-                    query_ref="semanticq_fixture",
-                    workspace_id=snapshot.workspace.workspace_id,
-                    path="api/src/example.py",
-                    language="python",
-                    line_start=1,
-                    line_end=1,
-                    column_start=1,
-                    column_end=19,
-                    matched_text="def render_payload():",
-                )
-            ]
-            with patch.object(
-                service,
-                "search_semantic_pattern",
-                return_value=SemanticPatternQueryResult(
-                    workspace_id=snapshot.workspace.workspace_id,
-                    pattern="def $A():",
+            search_payload = {
+                "applied": True,
+                "dsn_redacted": "postgresql://xmustard:***@localhost:5432/xmustard",
+                "schema_name": "agent_context",
+                "workspace_id": snapshot.workspace.workspace_id,
+                "source": "semantic_search",
+                "target": "def $A():",
+                "materialized_paths": ["api/src/example.py"],
+                "file_rows": 1,
+                "query_rows": 1,
+                "match_rows": 1,
+                "message": "ok",
+            }
+            with patch.object(service, "_run_go_workspace_json", return_value=search_payload) as search_materialize_mock:
+                result = service.materialize_semantic_search_to_postgres(
+                    snapshot.workspace.workspace_id,
+                    "def $A():",
                     language="python",
                     path_glob="api/src/**/*.py",
-                    engine="ast_grep",
-                    binary_path="/opt/homebrew/bin/sg",
-                    match_count=1,
-                    matches=[],
-                    query_row=query_row,
-                    match_rows=match_rows,
-                ),
-            ):
-                with patch("app.service.materialize_semantic_search") as search_materialize_mock:
-                    search_materialize_mock.return_value = PostgresSemanticMaterializationResult(
-                        applied=True,
-                        dsn_redacted="postgresql://xmustard:***@localhost:5432/xmustard",
-                        schema_name="agent_context",
-                        workspace_id=snapshot.workspace.workspace_id,
-                        source="semantic_search",
-                        target="def $A():",
-                        materialized_paths=["api/src/example.py"],
-                        file_rows=1,
-                        query_rows=1,
-                        match_rows=1,
-                        message="ok",
-                    )
-                    result = service.materialize_semantic_search_to_postgres(
-                        snapshot.workspace.workspace_id,
+                )
+                self.assertTrue(result.applied)
+                search_materialize_mock.assert_called_once_with(
+                    "postgres-materialize-semantic-search",
+                    snapshot.workspace.workspace_id,
+                    [
+                        "--pattern",
                         "def $A():",
-                        language="python",
-                        path_glob="api/src/**/*.py",
-                    )
-                    self.assertTrue(result.applied)
-                    used_dsn, used_schema = search_materialize_mock.call_args.args[:2]
-                    self.assertEqual(used_dsn, "postgresql://xmustard:secret@localhost:5432/xmustard")
-                    self.assertEqual(used_schema, "agent_context")
+                        "--limit",
+                        "50",
+                        "--language",
+                        "python",
+                        "--path-glob",
+                        "api/src/**/*.py",
+                    ],
+                )
 
     def test_workspace_symbol_materialization_batches_key_files(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -2667,35 +2626,21 @@ class RuntimeSummaryTests(unittest.TestCase):
                 )
             )
 
-            with patch.object(service, "materialize_path_symbols_to_postgres") as materialize_path_mock:
-                materialize_path_mock.side_effect = [
-                    PostgresSemanticMaterializationResult(
-                        applied=True,
-                        dsn_redacted="postgresql://xmustard:***@localhost:5432/xmustard",
-                        schema_name="agent_context",
-                        workspace_id=snapshot.workspace.workspace_id,
-                        source="path_symbols",
-                        target="api/src/example.py",
-                        materialized_paths=["api/src/example.py"],
-                        file_rows=1,
-                        symbol_rows=1,
-                        summary_rows=1,
-                        message="ok",
-                    ),
-                    PostgresSemanticMaterializationResult(
-                        applied=True,
-                        dsn_redacted="postgresql://xmustard:***@localhost:5432/xmustard",
-                        schema_name="agent_context",
-                        workspace_id=snapshot.workspace.workspace_id,
-                        source="path_symbols",
-                        target="api/src/worker.py",
-                        materialized_paths=["api/src/worker.py"],
-                        file_rows=1,
-                        symbol_rows=1,
-                        summary_rows=1,
-                        message="ok",
-                    ),
-                ]
+            go_payload = {
+                "applied": True,
+                "dsn_redacted": "postgresql://xmustard:***@localhost:5432/xmustard",
+                "schema_name": "agent_context",
+                "workspace_id": snapshot.workspace.workspace_id,
+                "strategy": "paths",
+                "requested_paths": ["api/src/example.py", "api/src/worker.py"],
+                "materialized_paths": ["api/src/example.py", "api/src/worker.py"],
+                "skipped_paths": [],
+                "file_rows": 2,
+                "symbol_rows": 2,
+                "summary_rows": 2,
+                "message": "ok",
+            }
+            with patch.object(service, "_run_go_workspace_json", return_value=go_payload) as materialize_mock:
                 result = service.materialize_workspace_symbols_to_postgres(
                     snapshot.workspace.workspace_id,
                     strategy="paths",
@@ -2707,12 +2652,20 @@ class RuntimeSummaryTests(unittest.TestCase):
             self.assertEqual(result.strategy, "paths")
             self.assertEqual(result.materialized_paths, ["api/src/example.py", "api/src/worker.py"])
             self.assertEqual(result.symbol_rows, 2)
-            self.assertEqual(materialize_path_mock.call_count, 2)
-            first_call = materialize_path_mock.call_args_list[0]
-            self.assertEqual(first_call.args[:2], (snapshot.workspace.workspace_id, "api/src/example.py"))
-            self.assertEqual(first_call.kwargs["dsn"], "postgresql://xmustard:secret@localhost:5432/xmustard")
-            self.assertEqual(first_call.kwargs["schema"], "agent_context")
-            self.assertFalse(first_call.kwargs["record_activity"])
+            materialize_mock.assert_called_once_with(
+                "postgres-materialize-workspace-symbols",
+                snapshot.workspace.workspace_id,
+                [
+                    "--strategy",
+                    "paths",
+                    "--limit",
+                    "10",
+                    "--select-path",
+                    "api/src/example.py",
+                    "--select-path",
+                    "api/src/worker.py",
+                ],
+            )
 
     def test_semantic_index_plan_prefers_cli_surface_candidates(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -2790,41 +2743,60 @@ class RuntimeSummaryTests(unittest.TestCase):
             snapshot = service.load_workspace(WorkspaceLoadRequest(root_path=str(root), auto_scan=True))
             assert snapshot is not None
 
-            materialization = PostgresWorkspaceSemanticMaterializationResult(
-                applied=True,
-                dsn_redacted="postgresql://xmustard:***@localhost:5432/xmustard",
-                schema_name="agent_context",
-                workspace_id=snapshot.workspace.workspace_id,
-                strategy="paths",
-                requested_paths=["api/src/example.py"],
-                materialized_paths=["api/src/example.py"],
-                file_rows=1,
-                symbol_rows=1,
-                summary_rows=1,
-                message="ok",
-            )
-            with patch.object(service, "materialize_workspace_symbols_to_postgres", return_value=materialization):
-                with patch("app.service.persist_semantic_index_baseline") as persist_mock:
-                    persist_mock.side_effect = lambda *args, **kwargs: kwargs["baseline"]
-                    result = service.run_semantic_index(
-                        snapshot.workspace.workspace_id,
-                        strategy="paths",
-                        paths=["api/src/example.py"],
-                        dsn="postgresql://xmustard:secret@localhost:5432/xmustard",
-                        schema="agent_context",
-                    )
+            go_payload = {
+                "workspace_id": snapshot.workspace.workspace_id,
+                "surface": "cli",
+                "dry_run": False,
+                "plan": {
+                    "workspace_id": snapshot.workspace.workspace_id,
+                    "root_path": str(root),
+                    "surface": "cli",
+                    "strategy": "paths",
+                    "requested_paths": ["api/src/example.py"],
+                    "selected_paths": ["api/src/example.py"],
+                    "index_fingerprint": "fixture_fingerprint",
+                    "postgres_configured": True,
+                    "postgres_schema": "agent_context",
+                    "can_run": True,
+                },
+                "materialization": {
+                    "applied": True,
+                    "dsn_redacted": "postgresql://xmustard:***@localhost:5432/xmustard",
+                    "schema_name": "agent_context",
+                    "workspace_id": snapshot.workspace.workspace_id,
+                    "strategy": "paths",
+                    "requested_paths": ["api/src/example.py"],
+                    "materialized_paths": ["api/src/example.py"],
+                    "file_rows": 1,
+                    "symbol_rows": 1,
+                    "summary_rows": 1,
+                    "message": "ok",
+                },
+                "message": "ok",
+            }
+            with patch.object(service, "_run_go_semantic_index_json", return_value=go_payload) as go_run_mock:
+                result = service.run_semantic_index(
+                    snapshot.workspace.workspace_id,
+                    strategy="paths",
+                    paths=["api/src/example.py"],
+                    dsn="postgresql://xmustard:secret@localhost:5432/xmustard",
+                    schema="agent_context",
+                )
 
             self.assertFalse(result.dry_run)
             self.assertEqual(result.materialization.symbol_rows, 1)
-            persist_mock.assert_called_once()
-            baseline = persist_mock.call_args.kwargs["baseline"]
-            self.assertEqual(baseline.workspace_id, snapshot.workspace.workspace_id)
-            self.assertEqual(baseline.surface, "cli")
-            self.assertEqual(baseline.strategy, "paths")
-            self.assertEqual(baseline.selected_paths, ["api/src/example.py"])
-            self.assertEqual(baseline.materialized_paths, ["api/src/example.py"])
-            self.assertEqual(baseline.symbol_rows, 1)
-            self.assertEqual(baseline.index_fingerprint, result.plan.index_fingerprint)
+            self.assertEqual(result.plan.index_fingerprint, "fixture_fingerprint")
+            go_run_mock.assert_called_once_with(
+                "run",
+                snapshot.workspace.workspace_id,
+                surface="cli",
+                strategy="paths",
+                paths=["api/src/example.py"],
+                limit=12,
+                dsn="postgresql://xmustard:secret@localhost:5432/xmustard",
+                schema="agent_context",
+                dry_run=False,
+            )
 
     def test_semantic_index_status_reports_no_baseline(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -2839,7 +2811,15 @@ class RuntimeSummaryTests(unittest.TestCase):
             snapshot = service.load_workspace(WorkspaceLoadRequest(root_path=str(root), auto_scan=True))
             assert snapshot is not None
 
-            with patch("app.service.read_latest_semantic_index_baseline", return_value=None):
+            go_status = {
+                "workspace_id": snapshot.workspace.workspace_id,
+                "surface": "cli",
+                "status": "no_baseline",
+                "postgres_configured": True,
+                "postgres_schema": "agent_context",
+                "stale_reasons": ["No stored semantic index baseline exists for this workspace and surface."],
+            }
+            with patch.object(service, "_run_go_semantic_index_json", return_value=go_status):
                 status = service.read_semantic_index_status(
                     snapshot.workspace.workspace_id,
                     strategy="paths",
@@ -2884,7 +2864,15 @@ class RuntimeSummaryTests(unittest.TestCase):
                 postgres_schema="agent_context",
             )
 
-            with patch("app.service.read_latest_semantic_index_baseline", return_value=baseline):
+            fresh_status = {
+                "workspace_id": snapshot.workspace.workspace_id,
+                "surface": "cli",
+                "status": "fresh",
+                "postgres_configured": True,
+                "postgres_schema": "agent_context",
+                "fingerprint_match": True,
+            }
+            with patch.object(service, "_run_go_semantic_index_json", return_value=fresh_status):
                 fresh = service.read_semantic_index_status(
                     snapshot.workspace.workspace_id,
                     strategy="paths",
@@ -2896,7 +2884,16 @@ class RuntimeSummaryTests(unittest.TestCase):
             self.assertTrue(fresh.fingerprint_match)
 
             indexed_path.write_text("def render_payload():\n    return False\n", encoding="utf-8")
-            with patch("app.service.read_latest_semantic_index_baseline", return_value=baseline):
+            stale_status = {
+                "workspace_id": snapshot.workspace.workspace_id,
+                "surface": "cli",
+                "status": "stale",
+                "postgres_configured": True,
+                "postgres_schema": "agent_context",
+                "fingerprint_match": False,
+                "stale_reasons": ["Selected path hashes or baseline inputs differ from the stored semantic baseline."],
+            }
+            with patch.object(service, "_run_go_semantic_index_json", return_value=stale_status):
                 stale = service.read_semantic_index_status(
                     snapshot.workspace.workspace_id,
                     strategy="paths",
@@ -2958,7 +2955,16 @@ class RuntimeSummaryTests(unittest.TestCase):
             )
             (root / "scratch.py").write_text("print('dirty')\n", encoding="utf-8")
 
-            with patch("app.service.read_latest_semantic_index_baseline", return_value=baseline):
+            go_status = {
+                "workspace_id": snapshot.workspace.workspace_id,
+                "surface": "cli",
+                "status": "dirty_provisional",
+                "postgres_configured": True,
+                "postgres_schema": "agent_context",
+                "current_dirty_files": 1,
+                "fingerprint_match": True,
+            }
+            with patch.object(service, "_run_go_semantic_index_json", return_value=go_status):
                 status = service.read_semantic_index_status(
                     snapshot.workspace.workspace_id,
                     strategy="paths",
@@ -3566,24 +3572,6 @@ class RuntimeSummaryTests(unittest.TestCase):
                     }
                 )
             )
-            plan = service.plan_semantic_index(
-                snapshot.workspace.workspace_id,
-                strategy="paths",
-                paths=["api/src/example.py"],
-                dsn="postgresql://xmustard:secret@localhost:5432/xmustard",
-            )
-            baseline = SemanticIndexBaselineRecord(
-                index_run_id="semidx_fixture",
-                workspace_id=snapshot.workspace.workspace_id,
-                surface="cli",
-                strategy="paths",
-                index_fingerprint=plan.index_fingerprint,
-                head_sha=plan.head_sha,
-                selected_paths=plan.selected_paths,
-                selected_path_details=plan.selected_path_details,
-                materialized_paths=plan.selected_paths,
-                postgres_schema="agent_context",
-            )
             stored_summary = FileSymbolSummaryMaterializationRecord(
                 workspace_id=snapshot.workspace.workspace_id,
                 path="api/src/example.py",
@@ -3605,7 +3593,18 @@ class RuntimeSummaryTests(unittest.TestCase):
                 )
             ]
 
-            with patch("app.service.read_latest_semantic_index_baseline", return_value=baseline):
+            with patch.object(
+                service,
+                "read_semantic_index_status",
+                return_value=SemanticIndexStatus(
+                    workspace_id=snapshot.workspace.workspace_id,
+                    surface="cli",
+                    status="fresh",
+                    postgres_configured=True,
+                    postgres_schema="agent_context",
+                    fingerprint_match=True,
+                ),
+            ):
                 with patch("app.service.read_file_symbol_summary", return_value=stored_summary):
                     with patch("app.service.read_symbols_for_path", return_value=stored_symbols):
                         with patch.object(service, "_read_path_symbols_via_rust") as rust_mock:
@@ -3636,24 +3635,6 @@ class RuntimeSummaryTests(unittest.TestCase):
                     }
                 )
             )
-            plan = service.plan_semantic_index(
-                snapshot.workspace.workspace_id,
-                strategy="paths",
-                paths=["api/src/example.py"],
-                dsn="postgresql://xmustard:secret@localhost:5432/xmustard",
-            )
-            baseline = SemanticIndexBaselineRecord(
-                index_run_id="semidx_fixture",
-                workspace_id=snapshot.workspace.workspace_id,
-                surface="cli",
-                strategy="paths",
-                index_fingerprint=plan.index_fingerprint,
-                head_sha=plan.head_sha,
-                selected_paths=plan.selected_paths,
-                selected_path_details=plan.selected_path_details,
-                materialized_paths=plan.selected_paths,
-                postgres_schema="agent_context",
-            )
             stored_summary = FileSymbolSummaryMaterializationRecord(
                 workspace_id=snapshot.workspace.workspace_id,
                 path="api/src/example.py",
@@ -3675,7 +3656,18 @@ class RuntimeSummaryTests(unittest.TestCase):
                 )
             ]
 
-            with patch("app.service.read_latest_semantic_index_baseline", return_value=baseline):
+            with patch.object(
+                service,
+                "read_semantic_index_status",
+                return_value=SemanticIndexStatus(
+                    workspace_id=snapshot.workspace.workspace_id,
+                    surface="cli",
+                    status="fresh",
+                    postgres_configured=True,
+                    postgres_schema="agent_context",
+                    fingerprint_match=True,
+                ),
+            ):
                 with patch("app.service.read_file_symbol_summary", return_value=stored_summary):
                     with patch("app.service.read_symbols_for_path", return_value=stored_symbols):
                         with patch.object(service, "_explain_path_via_rust") as rust_mock:

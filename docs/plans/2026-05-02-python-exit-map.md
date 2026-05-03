@@ -6,7 +6,7 @@ Phase 2 is complete for xMustard. External validation workspace dirtiness is not
 
 This map is grounded in the current repository shape: Python still carries the compatibility CLI and much of the orchestration brain, Go already owns a large API delivery shell, Rust owns repo-map/scanner/verification primitives, and Postgres is the durable semantic storage direction.
 
-Completion-pass audit truth on 2026-05-03: xMustard is still in mixed mode. The shipped `semantic-index`, repo-intelligence, changed-symbols, path-symbol/explainer, semantic-search, Postgres foundation, and semantic materialization CLI slices now delegate to Go `xmustard-ops`, and FastAPI no longer registers the single-path `path-symbols`/`explain-path` HTTP reads. Python remains in shipped authority through remaining FastAPI routes, broad Typer compatibility commands, `TrackerService` orchestration, and non-delegated semantic baseline/materialization helpers.
+Completion-pass audit truth on 2026-05-03: xMustard is still in mixed mode. The shipped `semantic-index`, repo-intelligence, changed-symbols, path-symbol/explainer, semantic-search, Postgres foundation, and semantic materialization CLI slices now delegate to Go `xmustard-ops`, and FastAPI no longer registers the single-path `path-symbols`/`explain-path` HTTP reads. The public `TrackerService` compatibility methods for Postgres foundation, Postgres semantic materialization, and semantic-index plan/run/status now delegate to Go too. Python remains in shipped authority through remaining FastAPI routes, broad Typer compatibility commands, `TrackerService` orchestration outside those migrated slices, and stored-semantic compatibility reads.
 
 ## Inventory Buckets
 
@@ -170,6 +170,17 @@ This completion pass removed the stale Python request and CLI ownership left aro
 - `backend/app/service.py` no longer exposes `read_changed_symbols(...)` as a public compatibility authority seam.
 
 The ownership moved here is narrow but real: Go is the only shipped HTTP owner for `path-symbols` and `explain-path`, Rust remains the semantic meaning owner behind those reads, and CLI `changed-symbols` now comes from Go/Rust impact instead of Python service assembly.
+
+## Phase 3 TrackerService Compatibility Delegation Landed
+
+The final completion cut narrowed `TrackerService` for the already-migrated Postgres and semantic-index slices:
+
+- `TrackerService.read_postgres_schema_plan(...)`, `render_postgres_schema_sql(...)`, and `bootstrap_postgres_schema(...)` now call Go `xmustard-ops postgres plan/render/bootstrap`.
+- `TrackerService.materialize_path_symbols_to_postgres(...)`, `materialize_workspace_symbols_to_postgres(...)`, and `materialize_semantic_search_to_postgres(...)` now call Go `xmustard-ops workspace ...` materialization actions.
+- `TrackerService.plan_semantic_index(...)`, `run_semantic_index(...)`, and `read_semantic_index_status(...)` now call Go `xmustard-ops semantic-index ...`.
+- The older Python helpers remain in the file as compatibility residue for stored semantic reads and tests, but they are no longer the public `TrackerService` authority for those migrated operations.
+
+This is the Phase 3 landing point: Go owns shipped delivery and operator control for repo-intelligence, semantic-index, semantic-search, and Postgres semantic materialization; Rust owns the migrated semantic meaning contracts; Python is no longer the live authority for those intended Phase 3 paths.
 
 ## Phase 3 Boundary
 
