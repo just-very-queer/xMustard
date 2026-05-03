@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 import json
-import re
 import signal
 import shlex
 import shutil
@@ -15,12 +14,10 @@ from typing import Optional
 
 from .models import (
     ActivityRecord,
-    AppSettings,
     LocalAgentCapabilities,
     RunMetrics,
     RunRecord,
     RuntimeCapabilities,
-    RuntimeModel,
     RuntimeProbeResult,
     WorktreeStatus,
     build_activity_actor,
@@ -28,14 +25,6 @@ from .models import (
 )
 from .store import FileStore
 
-
-DEFAULT_CODEX_MODELS = [
-    "gpt-5.4",
-    "gpt-5.4-mini",
-    "gpt-5.3-codex",
-    "gpt-5.3-codex-spark",
-    "gpt-5.2-codex",
-]
 
 MODEL_PRICING = {
     "gpt-5.4": {"input_per_1k": 0.01, "output_per_1k": 0.03},
@@ -51,46 +40,22 @@ MODEL_PRICING = {
 
 
 class RuntimeService:
-    OPENCODE_MODEL_CACHE_TTL_SECONDS = 15.0
     RUNTIME_CAPABILITIES_CACHE_TTL_SECONDS = 10.0
 
     def __init__(self, store: FileStore) -> None:
         self.store = store
         self.processes: dict[str, subprocess.Popen] = {}
-        self._opencode_model_cache: dict[str, tuple[float, list[str]]] = {}
         self._runtime_capabilities_cache: Optional[tuple[str, float, list[RuntimeCapabilities]]] = None
 
     def detect_runtimes(self) -> list[RuntimeCapabilities]:
         settings = self.store.load_settings()
-        cache_key = "|".join(
-            [
-                settings.local_agent_type,
-                settings.codex_bin or "",
-                settings.opencode_bin or "",
-            ]
-        )
+        cache_key = settings.model_dump_json()
         now = time.monotonic()
         cached = self._runtime_capabilities_cache
         if cached and cached[0] == cache_key and cached[1] > now:
             return [item.model_copy() for item in cached[2]]
-        codex_bin = self._resolve_binary(settings.codex_bin, "codex")
-        opencode_bin = self._resolve_binary(settings.opencode_bin, "opencode")
-        runtimes = [
-            RuntimeCapabilities(
-                runtime="codex",
-                available=bool(codex_bin),
-                binary_path=codex_bin,
-                models=[RuntimeModel(runtime="codex", id=model) for model in DEFAULT_CODEX_MODELS],
-                notes="Uses codex exec JSON streaming for issue runs.",
-            ),
-            RuntimeCapabilities(
-                runtime="opencode",
-                available=bool(opencode_bin),
-                binary_path=opencode_bin,
-                models=[RuntimeModel(runtime="opencode", id=model) for model in self._opencode_models()],
-                notes="Uses opencode run JSON streaming and supports local OpenCode providers.",
-            ),
-        ]
+        payload = self._run_go_runtime_json("runtimes")
+        runtimes = [RuntimeCapabilities.model_validate(item) for item in payload]
         self._runtime_capabilities_cache = (
             cache_key,
             now + self.RUNTIME_CAPABILITIES_CACHE_TTL_SECONDS,
@@ -99,70 +64,37 @@ class RuntimeService:
         return runtimes
 
     def local_agent_capabilities(self) -> LocalAgentCapabilities:
-        settings = self.store.load_settings()
-        return LocalAgentCapabilities(
-            selected_runtime=settings.local_agent_type,
-            supports_live_subscribe=settings.local_agent_type == "codex",
-            supports_terminal=True,
-            runtimes=self.detect_runtimes(),
-        )
+        return LocalAgentCapabilities.model_validate(self._run_go_runtime_json("capabilities"))
 
-    def _opencode_models(self) -> list[str]:
-        settings = self.store.load_settings()
-        opencode_bin = self._resolve_binary(settings.opencode_bin, "opencode")
-        if not opencode_bin:
-            return []
-        cache_entry = self._opencode_model_cache.get(opencode_bin)
-        now = time.monotonic()
-        if cache_entry and cache_entry[0] > now:
-            return list(cache_entry[1])
+    def _run_go_runtime_json(self, action: str, flags: Optional[list[str]] = None):
+        api_go_dir = Path(__file__).resolve().parents[2] / "api-go"
+        command = [
+            "go",
+            "run",
+            "./cmd/xmustard-ops",
+            "runtime",
+            action,
+            *(flags or []),
+            "--data-dir",
+            str(self.store.root.resolve()),
+        ]
         try:
-            completed = subprocess.run([opencode_bin, "models"], capture_output=True, text=True, check=False)
-        except FileNotFoundError:
-            return []
+            completed = subprocess.run(
+                command,
+                cwd=api_go_dir,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError(f"go xmustard-ops runtime {action} failed: {exc}") from exc
         if completed.returncode != 0:
-            return []
-        models = self._parse_opencode_models_output(completed.stdout)
-        self._opencode_model_cache[opencode_bin] = (now + self.OPENCODE_MODEL_CACHE_TTL_SECONDS, models)
-        return models
-
-    def _parse_opencode_models_output(self, output: str) -> list[str]:
-        normalized: list[str] = []
-        seen: set[str] = set()
-        model_pattern = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]*(/[A-Za-z0-9][A-Za-z0-9._:-]*)+$")
-
-        def push(candidate: str) -> None:
-            token = candidate.strip().strip(",")
-            if not token or token in seen:
-                return
-            if model_pattern.match(token):
-                seen.add(token)
-                normalized.append(token)
-
-        stripped = output.strip()
-        if not stripped:
-            return []
-
-        if stripped.startswith("["):
-            try:
-                payload = json.loads(stripped)
-            except json.JSONDecodeError:
-                payload = None
-            if isinstance(payload, list):
-                for item in payload:
-                    if isinstance(item, str):
-                        push(item)
-                return normalized
-
-        for raw_line in output.splitlines():
-            line = raw_line.strip()
-            if not line:
-                continue
-            if line.startswith(("-", "*")):
-                line = line[1:].strip()
-            token = line.split()[0]
-            push(token)
-        return normalized
+            message = completed.stderr.strip() or completed.stdout.strip() or f"go xmustard-ops runtime {action} failed"
+            raise RuntimeError(message)
+        try:
+            return json.loads(completed.stdout)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"Invalid JSON from Go xmustard-ops runtime {action}: {exc}") from exc
 
     def _sanitize_codex_args(self, raw_args: str) -> list[str]:
         args = shlex.split(raw_args or "")
@@ -299,56 +231,9 @@ class RuntimeService:
             raise ValueError(f"Model {model} is not available for runtime {runtime}")
 
     def probe_runtime(self, workspace_path: Path, runtime: str, model: str) -> RuntimeProbeResult:
-        self.validate_runtime_model(runtime, model)
-        runtimes = {entry.runtime: entry for entry in self.detect_runtimes()}
-        runtime_entry = runtimes[runtime]
-        prompt = (
-            "Reply with JSON only: "
-            + json.dumps({"status": "ok", "runtime": runtime, "model": model})
-        )
-        command = self._build_command(runtime, model, workspace_path, prompt)
-        started = time.monotonic()
-        try:
-            completed = subprocess.run(
-                command,
-                cwd=str(workspace_path),
-                capture_output=True,
-                text=True,
-                timeout=45,
-                check=False,
-                env={**os.environ},
-            )
-        except subprocess.TimeoutExpired as exc:
-            excerpt = ((exc.stdout or "") + (exc.stderr or "")).strip() or None
-            return RuntimeProbeResult(
-                runtime=runtime,
-                model=model,
-                ok=False,
-                available=runtime_entry.available,
-                duration_ms=int((time.monotonic() - started) * 1000),
-                binary_path=runtime_entry.binary_path,
-                command_preview=" ".join(shlex.quote(part) for part in command),
-                output_excerpt=excerpt[:1400] if excerpt else None,
-                error="Probe timed out after 45 seconds",
-            )
-
-        combined_output = ((completed.stdout or "") + (completed.stderr or "")).strip()
-        summary = self._summarize_run_output(runtime, combined_output)
-        excerpt = summary.get("text_excerpt") or combined_output or None
-        if excerpt and len(excerpt) > 1400:
-            excerpt = excerpt[:1400].rstrip() + "..."
-        return RuntimeProbeResult(
-            runtime=runtime,
-            model=model,
-            ok=completed.returncode == 0,
-            available=runtime_entry.available,
-            duration_ms=int((time.monotonic() - started) * 1000),
-            exit_code=completed.returncode,
-            binary_path=runtime_entry.binary_path,
-            command_preview=" ".join(shlex.quote(part) for part in command),
-            output_excerpt=excerpt,
-            error=None if completed.returncode == 0 else excerpt or "Runtime probe failed",
-        )
+        workspace_id = self.store.workspace_id_for_path(str(workspace_path.resolve()))
+        payload = self._run_go_runtime_json("probe", [workspace_id, "--runtime", runtime, "--model", model])
+        return RuntimeProbeResult.model_validate(payload)
 
     def _run_process(self, run: RunRecord, workspace_path: Path) -> None:
         persisted = self.store.load_run(run.workspace_id, run.run_id)

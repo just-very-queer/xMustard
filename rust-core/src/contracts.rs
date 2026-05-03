@@ -259,12 +259,12 @@ pub fn next_removable_python_boundary() -> PythonBoundaryCutline {
         target_owner: "api-go terminal/runtime shell + rust-core managed process runner",
         rust_role: "Own process-safe execution, bounded output capture, timeout/cancellation, and structured run summaries for long-lived agent and verification work.",
         python_modules: vec!["backend/app/runtimes.py", "backend/app/terminal.py", "backend/app/service.py"],
-        why_next: "Python is no longer the external integrations gateway on the live request path, Python compatibility runtime discovery/probe delegates to Go, and Go now covers runtime argument parsing plus PTY terminal fidelity. The remaining gap is managed execution and run summarization, which still duplicate subprocess control across Python and Go.",
-        first_slice: "Move managed execution, bounded buffering, timeout/cancellation, and structured run summarization behind a Rust command boundary instead of continuing to duplicate long-lived subprocess control in Python and Go.",
+        why_next: "Python is no longer the external integrations gateway on the live request path, Python compatibility runtime discovery, probe, and model validation delegate to Go, and Go now covers runtime argument parsing plus PTY terminal fidelity. The remaining Python gap is exact managed-run/session authority: run IDs, command previews, process identity, log/output ownership, status transitions, cancellation, summaries, metrics, and terminal session state.",
+        first_slice: "Expose a long-lived Go managed-run/session contract for Python compatibility before deleting RuntimeService or TerminalService: run/session IDs, workspace ID, log offsets, process PID/group, cancellation semantics, timeout policy, final summary, and durable artifact paths. Do not route terminal or async run lifecycle through one-shot xmustard-ops commands because their in-memory sessions die with the process.",
         removable_when: vec![
             "Rust owns the managed process runner for long-lived execution, bounded buffering, timeout, cancellation, and structured summaries.",
             "Go delegates managed runs to the Rust command boundary instead of keeping duplicate subprocess control in run_control.go.",
-            "Python no longer handles runtime launch, probe, query, or terminal request paths.",
+            "Python no longer handles runtime launch, query, retry, cancellation, run-log reads, plan-approved launch, or terminal request paths.",
         ],
     }
 }
@@ -356,7 +356,7 @@ mod tests {
         assert_eq!(cutline.boundary_id, "runtime_and_terminal_process_plane");
         assert_eq!(cutline.target_owner, "api-go terminal/runtime shell + rust-core managed process runner");
         assert!(cutline.why_next.contains("Go now covers runtime argument parsing plus PTY terminal fidelity"));
-        assert!(cutline.first_slice.contains("Move managed execution"));
+        assert!(cutline.first_slice.contains("long-lived Go managed-run/session contract"));
     }
 
     #[test]

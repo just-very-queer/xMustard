@@ -2273,41 +2273,32 @@ class RuntimeSummaryTests(unittest.TestCase):
 
         self.assertEqual(sanitized, ["--profile", "bugfix"])
 
-    def test_opencode_model_parsing_and_cache(self):
-        temp_dir = tempfile.mkdtemp()
-        store = FileStore(Path(temp_dir) / "data")
-        binary = Path(temp_dir) / "opencode"
-        binary.write_text("", encoding="utf-8")
-        store.save_settings(store.load_settings().model_copy(update={"opencode_bin": str(binary)}))
-        runtime_service = RuntimeService(store)
-
-        completed = __import__("subprocess").CompletedProcess(
-            args=[str(binary), "models"],
-            returncode=0,
-            stdout="opencode-go/minimax-m2.7\ninvalid token here\n* opencode-go/kimi-k2.5\nopencode-go/glm-5 extra\n",
-            stderr="",
-        )
-
-        with patch("app.runtimes.subprocess.run", return_value=completed) as mocked_run:
-            first = runtime_service._opencode_models()
-            second = runtime_service._opencode_models()
-
-        self.assertEqual(first, ["opencode-go/minimax-m2.7", "opencode-go/kimi-k2.5", "opencode-go/glm-5"])
-        self.assertEqual(second, first)
-        self.assertEqual(mocked_run.call_count, 1)
-
     def test_detect_runtimes_uses_runtime_capability_cache(self):
         runtime_service = RuntimeService(FileStore(Path(tempfile.mkdtemp()) / "data"))
+        payload = [
+            {
+                "runtime": "codex",
+                "available": True,
+                "binary_path": "/tmp/codex",
+                "models": [{"runtime": "codex", "id": "gpt-5.4"}],
+                "notes": "Uses codex exec JSON streaming for issue runs.",
+            },
+            {
+                "runtime": "opencode",
+                "available": True,
+                "binary_path": "/tmp/opencode",
+                "models": [{"runtime": "opencode", "id": "opencode-go/minimax-m2.7"}],
+                "notes": "Uses opencode run JSON streaming and supports local OpenCode providers.",
+            },
+        ]
 
-        with patch.object(runtime_service, "_resolve_binary", side_effect=["/tmp/codex", "/tmp/opencode"]) as mocked_resolve:
-            with patch.object(runtime_service, "_opencode_models", return_value=["opencode-go/minimax-m2.7"]) as mocked_models:
-                first = runtime_service.detect_runtimes()
-                second = runtime_service.detect_runtimes()
+        with patch.object(runtime_service, "_run_go_runtime_json", return_value=payload) as mocked_go:
+            first = runtime_service.detect_runtimes()
+            second = runtime_service.detect_runtimes()
 
         self.assertEqual([item.runtime for item in first], ["codex", "opencode"])
         self.assertEqual([item.runtime for item in second], ["codex", "opencode"])
-        self.assertEqual(mocked_models.call_count, 1)
-        self.assertEqual(mocked_resolve.call_count, 2)
+        self.assertEqual(mocked_go.call_count, 1)
 
     def test_start_issue_run_with_eval_scenario_records_fresh_run(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
