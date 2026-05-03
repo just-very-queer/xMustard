@@ -217,7 +217,8 @@ That boundary work is now live for three concrete slices:
   - `/api/workspaces/{workspace_id}/semantic-search`
   - `/api/workspaces/{workspace_id}/semantic-search/materialize`
 - FastAPI no longer registers those semantic-search/materialization HTTP handlers in `backend/app/main.py`, so Python is no longer the live request-path owner for this route group.
-- Python still owns CLI compatibility, semantic baseline persistence/readback, and compatibility helpers behind `TrackerService`; do not mistake that for a full Python exit.
+- The `semantic-index` operator flow now runs through the Go `xmustard-ops` binary for plan/run/status plus baseline freshness/persistence, so Python is no longer the authority path for that shipped CLI slice.
+- Python still owns broader CLI compatibility, `TrackerService` compatibility assembly, and non-delegated semantic baseline/materialization helpers; do not mistake that for a full Python exit.
 - Python parity tests now compare live Python behavior against the Rust outputs for:
   - signal scanning
   - repo-map summaries

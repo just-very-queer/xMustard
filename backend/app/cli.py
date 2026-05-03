@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+import subprocess
 import time
 from typing import Optional
 
@@ -111,6 +112,54 @@ def _is_final_run_status(status: str) -> bool:
 
 def _echo_ok(**payload) -> None:
     _echo_json({"ok": True, **payload})
+
+
+def _run_go_semantic_index(action: str, workspace_id: str, *, surface: str, strategy: str, paths: list[str], limit: int, dsn: Optional[str] = None, schema: Optional[str] = None, dry_run: bool = False):
+    api_go_dir = Path(__file__).resolve().parents[2] / "api-go"
+    command = [
+        "go",
+        "run",
+        "./cmd/xmustard-ops",
+        "semantic-index",
+        action,
+        workspace_id,
+        "--data-dir",
+        str(store.root),
+        "--surface",
+        surface,
+        "--strategy",
+        strategy,
+        "--limit",
+        str(limit),
+    ]
+    for item in paths:
+        command.extend(["--path", item])
+    if dsn:
+        command.extend(["--dsn", dsn])
+    if schema:
+        command.extend(["--schema", schema])
+    if dry_run:
+        command.append("--dry-run")
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=api_go_dir,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        typer.echo(f"go semantic-index {action} failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    if completed.returncode != 0:
+        message = completed.stderr.strip() or completed.stdout.strip() or f"go semantic-index {action} failed"
+        typer.echo(message, err=True)
+        raise typer.Exit(code=1)
+    try:
+        return json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        typer.echo(f"Invalid JSON from Go semantic-index {action}: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
 
 
 @app.command("health")
@@ -580,14 +629,15 @@ def semantic_index_plan(
     dsn: str = typer.Option("", "--dsn"),
 ) -> None:
     _echo_json(
-        service.plan_semantic_index(
+        _run_go_semantic_index(
+            "plan",
             workspace_id,
             surface=surface,
             strategy=strategy,
             paths=path,
             limit=limit,
             dsn=dsn or None,
-        ).model_dump(mode="json")
+        )
     )
 
 
@@ -603,7 +653,8 @@ def semantic_index_run(
     dry_run: bool = typer.Option(False, "--dry-run"),
 ) -> None:
     _echo_json(
-        service.run_semantic_index(
+        _run_go_semantic_index(
+            "run",
             workspace_id,
             surface=surface,
             strategy=strategy,
@@ -612,7 +663,7 @@ def semantic_index_run(
             dsn=dsn or None,
             schema=schema or None,
             dry_run=dry_run,
-        ).model_dump(mode="json")
+        )
     )
 
 
@@ -627,7 +678,8 @@ def semantic_index_status(
     schema: str = typer.Option("", "--schema"),
 ) -> None:
     _echo_json(
-        service.read_semantic_index_status(
+        _run_go_semantic_index(
+            "status",
             workspace_id,
             surface=surface,
             strategy=strategy,
@@ -635,7 +687,7 @@ def semantic_index_status(
             limit=limit,
             dsn=dsn or None,
             schema=schema or None,
-        ).model_dump(mode="json")
+        )
     )
 
 

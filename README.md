@@ -27,7 +27,7 @@ The first Phase 3 authority cuts are already landed:
 - Go now also owns the Postgres foundation delivery slice for settings-backed schema plan/render/bootstrap
 - Go now owns the live semantic-search plus Postgres semantic materialization HTTP slice for `path-symbols/materialize`, `semantic-index/materialize`, and `semantic-search/materialize`
 
-Completion audit truth on 2026-05-02: xMustard is still mixed-mode, not Python-exited. Go and Rust own real shipped slices, but Python still remains in the authority path through the Typer `semantic-index` and operator CLI surface, `TrackerService` compatibility assembly, and semantic baseline/materialization helpers.
+Completion audit truth on 2026-05-03: xMustard is still mixed-mode, not Python-exited. Go and Rust own real shipped slices, and the `semantic-index` operator flow now delegates to the Go `xmustard-ops` owner path, but Python still remains in shipped authority through the broader compatibility CLI shell, `TrackerService` compatibility assembly, and non-delegated semantic/Postgres helpers.
 
 ## What xMustard Is
 

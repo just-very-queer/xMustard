@@ -356,23 +356,23 @@ reviews:
                         schema=None,
                     )
 
-                with patch.object(service, "plan_semantic_index") as semantic_plan_mock:
-                    semantic_plan_mock.return_value = SemanticIndexPlan(
-                        workspace_id=workspace_id,
-                        root_path=str(Path(tmp_dir) / "repo"),
-                        surface="cli",
-                        strategy="paths",
-                        requested_paths=["api/src/example.py"],
-                        selected_paths=["api/src/example.py"],
-                        postgres_configured=True,
-                        postgres_schema="agent_context",
-                        tree_sitter_available=True,
-                        ast_grep_available=False,
-                        run_target_count=1,
-                        verify_target_count=1,
-                        warnings=["ast-grep binary is unavailable"],
-                        can_run=True,
-                    )
+                with patch.object(cli_module, "_run_go_semantic_index") as semantic_plan_mock:
+                    semantic_plan_mock.return_value = {
+                        "workspace_id": workspace_id,
+                        "root_path": str(Path(tmp_dir) / "repo"),
+                        "surface": "cli",
+                        "strategy": "paths",
+                        "requested_paths": ["api/src/example.py"],
+                        "selected_paths": ["api/src/example.py"],
+                        "postgres_configured": True,
+                        "postgres_schema": "agent_context",
+                        "tree_sitter_available": False,
+                        "ast_grep_available": False,
+                        "run_target_count": 1,
+                        "verify_target_count": 1,
+                        "warnings": ["ast-grep binary is unavailable"],
+                        "can_run": True,
+                    }
                     result = self.runner.invoke(
                         cli_module.app,
                         [
@@ -393,6 +393,7 @@ reviews:
                     payload = json.loads(result.stdout)
                     self.assertEqual(payload["surface"], "cli")
                     semantic_plan_mock.assert_called_once_with(
+                        "plan",
                         workspace_id,
                         surface="cli",
                         strategy="paths",
@@ -401,16 +402,16 @@ reviews:
                         dsn="postgresql://xmustard:secret@localhost:5432/xmustard",
                     )
 
-                with patch.object(service, "read_semantic_index_status") as semantic_status_mock:
-                    semantic_status_mock.return_value = SemanticIndexStatus(
-                        workspace_id=workspace_id,
-                        surface="cli",
-                        status="fresh",
-                        postgres_configured=True,
-                        postgres_schema="agent_context",
-                        current_fingerprint="fp_cli",
-                        fingerprint_match=True,
-                    )
+                with patch.object(cli_module, "_run_go_semantic_index") as semantic_status_mock:
+                    semantic_status_mock.return_value = {
+                        "workspace_id": workspace_id,
+                        "surface": "cli",
+                        "status": "fresh",
+                        "postgres_configured": True,
+                        "postgres_schema": "agent_context",
+                        "current_fingerprint": "fp_cli",
+                        "fingerprint_match": True,
+                    }
                     result = self.runner.invoke(
                         cli_module.app,
                         [
@@ -434,6 +435,7 @@ reviews:
                     self.assertEqual(payload["status"], "fresh")
                     self.assertTrue(payload["fingerprint_match"])
                     semantic_status_mock.assert_called_once_with(
+                        "status",
                         workspace_id,
                         surface="cli",
                         strategy="paths",
