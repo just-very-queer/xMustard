@@ -182,6 +182,18 @@ The final completion cut narrowed `TrackerService` for the already-migrated Post
 
 This is the Phase 3 landing point: Go owns shipped delivery and operator control for repo-intelligence, semantic-index, semantic-search, and Postgres semantic materialization; Rust owns the migrated semantic meaning contracts; Python is no longer the live authority for those intended Phase 3 paths.
 
+## Phase 3 Runtime Probe Process Reduction Landed
+
+This pass started the `runtime_and_terminal_process_plane` cutline named by the Rust architecture contract:
+
+- Go already owned runtime listing, settings, local-agent capabilities, runtime probe routes, run control routes, and terminal transport on the target API path.
+- Rust already exposed `run-managed-command` with timeout-aware bounded output capture.
+- `api-go/internal/workspaceops/runtime_settings.go` now runs bounded runtime probes through the Rust managed-command boundary instead of using the Go-local subprocess helper as the default executor.
+- `api-go/internal/workspaceops/run_control.go` keeps a local subprocess fallback only when the Rust bridge itself is unavailable, and managed nonzero exits now propagate as failed command results.
+- The remaining Go-owned long-lived process paths were hardened while they wait for a Rust session contract: run cancellation now signals the managed run process group, and terminal close now tears down known child processes before terminating the terminal process group.
+
+This is a real but narrow authority cut. It does not complete the runtime/session exit, because `startManagedRun(...)` still owns long-lived run launch, log streaming, PID tracking, and cancellation in Go, and `backend/app/runtimes.py` / `backend/app/terminal.py` still exist for the Python compatibility server. The exact next cutline is a Rust managed-run/session contract that exposes durable run IDs, streamed log chunks or append-only log ownership, process identity, cancellation, timeout policy, and final structured summary. Until that exists, replacing Go long-lived run control with the current synchronous Rust command would lose live cancel and terminal/run-log behavior.
+
 ## Phase 3 Boundary
 
 Phase 3 LSP/diagnostics should follow this ownership split:

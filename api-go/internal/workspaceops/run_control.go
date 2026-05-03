@@ -32,7 +32,7 @@ var defaultCodexModels = []string{
 
 var opencodeModelTokenPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]*(/[A-Za-z0-9][A-Za-z0-9._:-]*)+$`)
 
-var runManagedPlanningCommand = rustcore.RunManagedCommand
+var runManagedCommand = rustcore.RunManagedCommand
 var planningCommandTimeout = 60 * time.Second
 var planningRustCoreBuffer = 5 * time.Second
 
@@ -63,14 +63,17 @@ func CancelRun(dataDir string, workspaceID string, runID string) (*runRecord, er
 	cancelledRunIDs.Store(runID, struct{}{})
 	if processValue, ok := activeRunProcesses.Load(runID); ok {
 		if cmd, ok := processValue.(*exec.Cmd); ok && cmd.Process != nil {
-			_ = cmd.Process.Signal(syscall.SIGTERM)
+			terminateManagedRunCommand(cmd)
 		}
 	} else if run.PID != nil && *run.PID > 0 {
 		process, findErr := os.FindProcess(*run.PID)
 		if findErr == nil && process != nil {
-			signalErr := process.Signal(syscall.SIGTERM)
+			signalErr := signalManagedRunPID(*run.PID)
 			if signalErr != nil && !errors.Is(signalErr, os.ErrProcessDone) {
-				return nil, signalErr
+				signalErr = process.Signal(syscall.SIGTERM)
+				if signalErr != nil && !errors.Is(signalErr, os.ErrProcessDone) {
+					return nil, signalErr
+				}
 			}
 		}
 	}
@@ -334,6 +337,7 @@ func runManagedProcess(dataDir string, run runRecord, workspaceRoot string) {
 	command := exec.Command(run.Command[0], run.Command[1:]...)
 	command.Dir = workspaceRoot
 	command.Stdin = nil
+	configureManagedRunCommand(command)
 	var output strings.Builder
 	multi := io.MultiWriter(logHandle, &output)
 	command.Stdout = multi
@@ -402,6 +406,27 @@ func runManagedProcess(dataDir string, run runRecord, workspaceRoot string) {
 	)
 	activeRunProcesses.Delete(run.RunID)
 	cancelledRunIDs.Delete(run.RunID)
+}
+
+func configureManagedRunCommand(command *exec.Cmd) {
+	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+}
+
+func terminateManagedRunCommand(command *exec.Cmd) {
+	if command == nil || command.Process == nil {
+		return
+	}
+	if err := signalManagedRunPID(command.Process.Pid); err == nil || errors.Is(err, os.ErrProcessDone) {
+		return
+	}
+	_ = command.Process.Signal(syscall.SIGTERM)
+}
+
+func signalManagedRunPID(pid int) error {
+	if pid <= 0 {
+		return os.ErrProcessDone
+	}
+	return syscall.Kill(-pid, syscall.SIGTERM)
 }
 
 func saveRunFailure(dataDir string, run runRecord, err error) {
@@ -664,6 +689,10 @@ func callAgentForPlan(dataDir string, runtime string, model string, workspacePat
 }
 
 func runPlanningCommand(workspacePath string, timeout time.Duration, commandArgs []string) *commandRunResult {
+	return runManagedCommandWithFallback(workspacePath, timeout, commandArgs)
+}
+
+func runManagedCommandWithFallback(workspacePath string, timeout time.Duration, commandArgs []string) *commandRunResult {
 	ctxTimeout := timeout + planningRustCoreBuffer
 	if ctxTimeout < timeout {
 		ctxTimeout = timeout
@@ -672,7 +701,7 @@ func runPlanningCommand(workspacePath string, timeout time.Duration, commandArgs
 	ctx, cancel := context.WithTimeout(context.Background(), ctxTimeout)
 	defer cancel()
 
-	result, err := runManagedPlanningCommand(ctx, workspacePath, durationSeconds(timeout), commandArgs)
+	result, err := runManagedCommand(ctx, workspacePath, durationSeconds(timeout), commandArgs)
 	if err != nil {
 		return runCommandWithTimeout(workspacePath, timeout, commandArgs)
 	}
@@ -714,10 +743,15 @@ func runCommandWithTimeout(dir string, timeout time.Duration, commandArgs []stri
 }
 
 func managedCommandResultToRunResult(result *rustcore.ManagedCommandResult) *commandRunResult {
+	var err error
+	if !result.Success && !result.TimedOut {
+		err = fmt.Errorf("managed command failed")
+	}
 	return &commandRunResult{
 		Output:   combineCommandOutput(result.StdoutExcerpt, result.StderrExcerpt),
 		ExitCode: result.ExitCode,
 		TimedOut: result.TimedOut,
+		Err:      err,
 	}
 }
 

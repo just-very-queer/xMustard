@@ -187,7 +187,7 @@ func ProbeRuntime(dataDir string, workspaceID string, runtime string, model stri
 		return nil, err
 	}
 	started := time.Now()
-	execution := runCommandWithTimeout(snapshot.Workspace.RootPath, 45*time.Second, command)
+	execution := runManagedCommandWithFallback(snapshot.Workspace.RootPath, 45*time.Second, command)
 	durationMS := int(time.Since(started).Milliseconds())
 	commandPreview := shellPreview(command)
 	runtimes, _ := DetectRuntimes(dataDir)

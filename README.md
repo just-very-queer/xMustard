@@ -28,6 +28,7 @@ The first Phase 3 authority cuts are already landed:
 - Go now owns the live semantic-search plus Postgres semantic materialization HTTP slice for `path-symbols/materialize`, `semantic-index/materialize`, and `semantic-search/materialize`
 - The Python Typer CLI now delegates the shipped Go-owned repo-intelligence, changed-symbols, path-symbol/explainer, semantic-search, Postgres foundation, and semantic materialization surfaces through `api-go/cmd/xmustard-ops` instead of reopening `TrackerService` for those commands
 - FastAPI no longer registers the single-path `path-symbols` and `explain-path` routes now owned by Go delivery over Rust semantic-core output
+- Go runtime probes now use Rust `run-managed-command` for bounded execution by default, and Go-owned cancellation/terminal close paths tear down process groups more reliably; long-lived run launch/cancel/log streaming remains a mixed-mode runtime boundary until Rust has a managed-run/session contract
 
 Completion audit truth on 2026-05-03: xMustard is still mixed-mode, not Python-exited. Go and Rust own the shipped Phase 3 semantic/Postgres/repo-intelligence slices, and the Python compatibility shell no longer imports Postgres helpers or keeps private semantic implementations for those migrated surfaces. Python still remains in shipped authority through remaining FastAPI routes, broad Typer compatibility commands, `TrackerService` orchestration outside the migrated slices, issue-context semantic pattern derivation, and persistence glue.
 

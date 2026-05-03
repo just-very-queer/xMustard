@@ -1,10 +1,13 @@
 package workspaceops
 
 import (
+	"context"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
+
+	"xmustard/api-go/internal/rustcore"
 )
 
 func TestSettingsAndCapabilitiesUsePersistedConfig(t *testing.T) {
@@ -93,6 +96,57 @@ exit 1
 	}
 	if probe.OutputExcerpt == nil || !strings.Contains(*probe.OutputExcerpt, "probe failed on stderr") {
 		t.Fatalf("expected probe output excerpt, got %#v", probe)
+	}
+}
+
+func TestProbeRuntimeUsesRustManagedCommandBoundary(t *testing.T) {
+	dataDir, workspaceID, _, repoRoot := writeIssueContextFixture(t, false)
+	opencodeBin := writeFakeOpencode(t)
+	if _, err := UpdateSettings(dataDir, AppSettings{
+		LocalAgentType: "opencode",
+		OpencodeBin:    &opencodeBin,
+		OpencodeModel:  stringPtr("fake/test-model"),
+	}); err != nil {
+		t.Fatalf("update settings: %v", err)
+	}
+
+	original := runManagedCommand
+	called := false
+	runManagedCommand = func(ctx context.Context, workspaceRoot string, timeoutSeconds int, commandArgs []string) (*rustcore.ManagedCommandResult, error) {
+		called = true
+		if workspaceRoot != repoRoot {
+			t.Fatalf("unexpected managed workspace root: %s", workspaceRoot)
+		}
+		if timeoutSeconds != 45 {
+			t.Fatalf("unexpected managed timeout: %d", timeoutSeconds)
+		}
+		if len(commandArgs) == 0 || commandArgs[0] != opencodeBin {
+			t.Fatalf("unexpected managed command args: %#v", commandArgs)
+		}
+		exitCode := 0
+		return &rustcore.ManagedCommandResult{
+			Command:       strings.Join(commandArgs, " "),
+			Cwd:           workspaceRoot,
+			ExitCode:      &exitCode,
+			Success:       true,
+			TimedOut:      false,
+			StdoutExcerpt: `{"type":"message","text":"managed probe ok"}`,
+			CreatedAt:     "2026-05-03T00:00:00Z",
+		}, nil
+	}
+	defer func() {
+		runManagedCommand = original
+	}()
+
+	probe, err := ProbeRuntime(dataDir, workspaceID, "opencode", "fake/test-model")
+	if err != nil {
+		t.Fatalf("probe runtime: %v", err)
+	}
+	if !called {
+		t.Fatalf("expected probe to use rust managed command bridge")
+	}
+	if !probe.OK || probe.OutputExcerpt == nil || !strings.Contains(*probe.OutputExcerpt, "managed probe ok") {
+		t.Fatalf("unexpected managed probe result: %#v", probe)
 	}
 }
 
