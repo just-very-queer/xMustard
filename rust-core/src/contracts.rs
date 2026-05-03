@@ -259,7 +259,7 @@ pub fn next_removable_python_boundary() -> PythonBoundaryCutline {
         target_owner: "api-go terminal/runtime shell + rust-core managed process runner",
         rust_role: "Own process-safe execution, bounded output capture, timeout/cancellation, and structured run summaries for long-lived agent and verification work.",
         python_modules: vec!["backend/app/runtimes.py", "backend/app/terminal.py", "backend/app/service.py"],
-        why_next: "Python is no longer the external integrations gateway on the live request path, and Go now covers runtime argument parsing plus PTY terminal fidelity. The remaining gap is managed execution and run summarization, which still duplicate subprocess control across Python and Go.",
+        why_next: "Python is no longer the external integrations gateway on the live request path, Python compatibility runtime discovery/probe delegates to Go, and Go now covers runtime argument parsing plus PTY terminal fidelity. The remaining gap is managed execution and run summarization, which still duplicate subprocess control across Python and Go.",
         first_slice: "Move managed execution, bounded buffering, timeout/cancellation, and structured run summarization behind a Rust command boundary instead of continuing to duplicate long-lived subprocess control in Python and Go.",
         removable_when: vec![
             "Rust owns the managed process runner for long-lived execution, bounded buffering, timeout, cancellation, and structured summaries.",

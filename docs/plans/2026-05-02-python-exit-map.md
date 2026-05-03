@@ -194,6 +194,17 @@ This pass started the `runtime_and_terminal_process_plane` cutline named by the 
 
 This is a real but narrow authority cut. It does not complete the runtime/session exit, because `startManagedRun(...)` still owns long-lived run launch, log streaming, PID tracking, and cancellation in Go, and `backend/app/runtimes.py` / `backend/app/terminal.py` still exist for the Python compatibility server. The exact next cutline is a Rust managed-run/session contract that exposes durable run IDs, streamed log chunks or append-only log ownership, process identity, cancellation, timeout policy, and final structured summary. Until that exists, replacing Go long-lived run control with the current synchronous Rust command would lose live cancel and terminal/run-log behavior.
 
+## Phase 3 Runtime Discovery Compatibility Reduction Landed
+
+This follow-up pass removed one still-live Python runtime authority seam without pretending the session plane is solved:
+
+- `api-go/cmd/xmustard-ops/main.go` now exposes `runtime capabilities`, `runtime runtimes`, `runtime models`, and `runtime probe`.
+- Python CLI `capabilities`, `runtimes`, `models`, and `agent-probe` now delegate to Go `xmustard-ops runtime ...` instead of calling `RuntimeService` directly.
+- FastAPI compatibility routes for runtime listing, local-agent capabilities, and runtime probe now call `TrackerService` methods that delegate to Go, so compatibility HTTP no longer reopens Python as the runtime discovery/probe owner.
+- Runtime probe execution still goes through Go and prefers the Rust `run-managed-command` boundary.
+
+This is intentionally not a terminal/session rewrite. Python still owns compatibility server behavior for long-lived issue runs, workspace-query runs, plan-agent subprocess calls, run logs/cancel/retry wrappers, and terminal PTY lifecycle through `backend/app/runtimes.py`, `backend/app/terminal.py`, and `backend/app/service.py`. The next real boundary remains the Rust managed-run/session contract; after that exists, Go can stop carrying local long-lived subprocess control and Python can stop carrying compatibility runtime/session control.
+
 ## Phase 3 Boundary
 
 Phase 3 LSP/diagnostics should follow this ownership split:

@@ -152,6 +152,10 @@ def _run_go_postgres_text(action: str, flags: Optional[list[str]] = None) -> str
     return _run_go_ops(["postgres", action, *(flags or [])])
 
 
+def _run_go_runtime_json(action: str, flags: Optional[list[str]] = None):
+    return _run_go_ops_json(["runtime", action, *(flags or [])])
+
+
 def _run_go_workspace_json(action: str, workspace_id: str, flags: Optional[list[str]] = None):
     return _run_go_ops_json(["workspace", action, workspace_id, *(flags or [])])
 
@@ -186,7 +190,7 @@ def health() -> None:
 
 @app.command("capabilities")
 def capabilities() -> None:
-    _echo_json(service.runtime_service.local_agent_capabilities().model_dump(mode="json"))
+    _echo_json(_run_go_runtime_json("capabilities"))
 
 
 @app.command("workspaces")
@@ -228,17 +232,12 @@ def snapshot(workspace_id: str) -> None:
 
 @app.command("runtimes")
 def runtimes() -> None:
-    payload = [item.model_dump(mode="json") for item in service.runtime_service.detect_runtimes()]
-    _echo_json(payload)
+    _echo_json(_run_go_runtime_json("runtimes"))
 
 
 @app.command("models")
 def models(runtime: str) -> None:
-    runtimes = {item.runtime: item for item in service.runtime_service.detect_runtimes()}
-    entry = runtimes.get(runtime)
-    if not entry:
-        raise typer.BadParameter(f"Unknown runtime: {runtime}")
-    _echo_json([item.model_dump(mode="json") for item in entry.models])
+    _echo_json(_run_go_runtime_json("models", [runtime]))
 
 
 @app.command("settings-get")
@@ -1515,7 +1514,7 @@ def agent_probe(
     runtime: str = typer.Option(...),
     model: str = typer.Option(...),
 ) -> None:
-    _echo_json(service.probe_runtime(workspace_id, runtime, model))
+    _echo_json(_run_go_runtime_json("probe", [workspace_id, "--runtime", runtime, "--model", model]))
 
 
 @app.command("agent-query")
@@ -1874,7 +1873,7 @@ def smoke(
     settle_seconds: float = typer.Option(default=2.0),
 ) -> None:
     health_payload = {"status": "ok"}
-    capabilities_payload = service.runtime_service.local_agent_capabilities().model_dump(mode="json")
+    capabilities_payload = _run_go_runtime_json("capabilities")
     snapshot_payload = service.read_snapshot(workspace_id)
     if not snapshot_payload:
         raise typer.BadParameter(f"Snapshot not found for workspace: {workspace_id}")
