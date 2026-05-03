@@ -27,6 +27,8 @@ func main() {
 		fatalUsage("usage: xmustard-ops <semantic-index|postgres|runtime|workspace> ...")
 	}
 	switch args[0] {
+	case "diagnostics":
+		runDiagnostics(args[1:])
 	case "semantic-index":
 		runSemanticIndex(args[1:])
 	case "postgres":
@@ -36,8 +38,62 @@ func main() {
 	case "workspace":
 		runWorkspace(args[1:])
 	default:
-		fatalUsage("usage: xmustard-ops <semantic-index|postgres|runtime|workspace> ...")
+		fatalUsage("usage: xmustard-ops <diagnostics|semantic-index|postgres|runtime|workspace> ...")
 	}
+}
+
+func runDiagnostics(args []string) {
+	if len(args) < 2 {
+		fatalUsage("usage: xmustard-ops diagnostics <plan|run|status|read> <workspace_id> [flags]")
+	}
+	action := args[0]
+	workspaceID := strings.TrimSpace(args[1])
+	if workspaceID == "" {
+		fatalUsage("workspace_id is required")
+	}
+	fs := flag.NewFlagSet("xmustard-ops diagnostics", flag.ExitOnError)
+	dataDir := fs.String("data-dir", envDefault("XMUSTARD_DATA_DIR", "../backend/data"), "xMustard data directory")
+	inputPath := fs.String("input-path", "", "LSP publishDiagnostics JSON file")
+	sourceKind := fs.String("source-kind", "lsp", "lsp | compiler | test | scanner | manual")
+	sourceName := fs.String("source-name", "", "diagnostic source name, e.g. pyright or typescript-language-server")
+	dsn := fs.String("dsn", "", "Postgres DSN override")
+	schema := fs.String("schema", "", "Postgres schema override")
+	dryRun := fs.Bool("dry-run", false, "plan without applying")
+	if err := fs.Parse(args[2:]); err != nil {
+		fatal(err.Error())
+	}
+	request := workspaceops.DiagnosticsRequest{
+		InputPath:  *inputPath,
+		SourceKind: *sourceKind,
+		SourceName: *sourceName,
+		DryRun:     *dryRun,
+	}
+	if strings.TrimSpace(*dsn) != "" {
+		value := strings.TrimSpace(*dsn)
+		request.DSN = &value
+	}
+	if strings.TrimSpace(*schema) != "" {
+		value := strings.TrimSpace(*schema)
+		request.SchemaName = &value
+	}
+
+	var (
+		payload any
+		err     error
+	)
+	switch action {
+	case "plan":
+		payload, err = workspaceops.PlanDiagnostics(*dataDir, workspaceID, request)
+	case "run":
+		payload, err = workspaceops.RunDiagnostics(*dataDir, workspaceID, request)
+	case "status":
+		payload, err = workspaceops.ReadDiagnosticsStatus(*dataDir, workspaceID)
+	case "read":
+		payload, err = workspaceops.ReadDiagnostics(*dataDir, workspaceID)
+	default:
+		fatalUsage("usage: xmustard-ops diagnostics <plan|run|status|read> <workspace_id> [flags]")
+	}
+	writeJSON(payload, err)
 }
 
 func runSemanticIndex(args []string) {
