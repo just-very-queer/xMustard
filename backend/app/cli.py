@@ -116,7 +116,7 @@ def _echo_ok(**payload) -> None:
 
 def _run_go_ops(args: list[str]) -> str:
     api_go_dir = Path(__file__).resolve().parents[2] / "api-go"
-    command = ["go", "run", "./cmd/xmustard-ops", *args, "--data-dir", str(service.store.root)]
+    command = ["go", "run", "./cmd/xmustard-ops", *args, "--data-dir", str(service.store.root.resolve())]
     try:
         completed = subprocess.run(
             command,

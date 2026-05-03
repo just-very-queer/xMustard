@@ -998,7 +998,7 @@ func convertRustChangedSymbols(items []rustcore.ChangedSymbolRecord) []ChangedSy
 			LineStart:       item.LineStart,
 			LineEnd:         item.LineEnd,
 			EvidenceSource:  item.EvidenceSource,
-			SemanticStatus:  item.SemanticStatus,
+			SemanticStatus:  normalizeSemanticStatus(item.SemanticStatus),
 			SelectionReason: item.SelectionReason,
 			ChangeScopes:    item.ChangeScopes,
 			ChangeStatuses:  item.ChangeStatuses,
@@ -1065,11 +1065,34 @@ func convertRustImpactPaths(items []rustcore.ImpactPathRecord) []ImpactPathRecor
 		out = append(out, ImpactPathRecord{
 			Path:             item.Path,
 			Reason:           item.Reason,
-			DerivationSource: item.DerivationSource,
+			DerivationSource: normalizeImpactDerivationSource(item.DerivationSource),
 			Score:            item.Score,
 		})
 	}
 	return out
+}
+
+func normalizeSemanticStatus(status *string) *string {
+	if status == nil {
+		return nil
+	}
+	switch strings.TrimSpace(*status) {
+	case "fresh", "stale", "dirty_provisional", "no_baseline", "blocked":
+		return status
+	default:
+		return nil
+	}
+}
+
+func normalizeImpactDerivationSource(source string) string {
+	switch strings.TrimSpace(source) {
+	case "lexical", "structural", "hybrid":
+		return source
+	case "rust_semantic_core", "tree_sitter", "regex":
+		return "structural"
+	default:
+		return "lexical"
+	}
 }
 
 func normalizeWorkspaceFile(rootPath string, relativePath string) (string, error) {
@@ -1243,7 +1266,7 @@ func buildRepoContextLedger(impact *ImpactReport, plans []RepoContextPlanLink, a
 	out := []ContextRetrievalLedgerEntry{}
 	for index, change := range impact.ChangedFiles[:min(len(impact.ChangedFiles), 10)] {
 		path := change.Path
-		out = append(out, ContextRetrievalLedgerEntry{EntryID: fmt.Sprintf("go_repo_context:change:%d:%s", index, shortHash(path)), SourceType: "lexical_hit", SourceID: "change:" + path, Title: change.Status + " " + path, Path: &path, Reason: "Changed file included by Go impact delivery.", Score: 8})
+		out = append(out, ContextRetrievalLedgerEntry{EntryID: fmt.Sprintf("go_repo_context:change:%d:%s", index, shortHash(path)), SourceType: "lexical_hit", SourceID: "change:" + path, Title: change.Status + " " + path, Path: &path, Reason: "Changed file included by Go impact delivery.", MatchedTerms: []string{}, Score: 8})
 	}
 	for index, symbol := range impact.ChangedSymbols[:min(len(impact.ChangedSymbols), 10)] {
 		path := symbol.Path
@@ -1253,7 +1276,7 @@ func buildRepoContextLedger(impact *ImpactReport, plans []RepoContextPlanLink, a
 		out = append(out, ContextRetrievalLedgerEntry{EntryID: fmt.Sprintf("go_repo_context:plan:%d:%s", index, plan.RunID), SourceType: "artifact", SourceID: "run_plan:" + plan.RunID, Title: "Run plan " + plan.RunID, Reason: plan.Reason, MatchedTerms: plan.AttachedFiles, Score: plan.Score})
 	}
 	for index, item := range activity[:min(len(activity), 5)] {
-		out = append(out, ContextRetrievalLedgerEntry{EntryID: fmt.Sprintf("go_repo_context:activity:%d:%s", index, shortHash(item.Summary)), SourceType: "artifact", SourceID: "activity:" + item.Action, Title: item.Summary, Reason: item.Reason, Score: item.Score})
+		out = append(out, ContextRetrievalLedgerEntry{EntryID: fmt.Sprintf("go_repo_context:activity:%d:%s", index, shortHash(item.Summary)), SourceType: "artifact", SourceID: "activity:" + item.Action, Title: item.Summary, Reason: item.Reason, MatchedTerms: []string{}, Score: item.Score})
 	}
 	if fix != nil {
 		out = append(out, ContextRetrievalLedgerEntry{EntryID: "go_repo_context:fix:" + fix.FixID, SourceType: "artifact", SourceID: "fix:" + fix.FixID, Title: fix.Summary, Reason: fix.Reason, MatchedTerms: fix.ChangedFiles, Score: 9})

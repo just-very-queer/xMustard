@@ -189,16 +189,8 @@ from .postgres import (
 )
 from .runtimes import RuntimeService
 from .scanners import (
-    apply_verdicts,
-    build_source_records,
-    build_repo_map,
-    latest_bug_ledger,
     list_tree_nodes,
-    parse_ledger,
     repo_map_file_role,
-    scan_repo_signals,
-    summarize_tree,
-    verdict_bundles,
 )
 from .semantic import ast_grep_available, detect_ast_grep_language, extract_path_symbols, run_ast_grep_query, tree_sitter_available
 from .store import FileStore
@@ -254,82 +246,7 @@ class TrackerService:
         return workspace
 
     def scan_workspace(self, workspace_id: str) -> WorkspaceSnapshot:
-        workspace = self.get_workspace(workspace_id)
-        root = Path(workspace.root_path)
-        ledger_path = latest_bug_ledger(root)
-        verdict_paths = verdict_bundles(root)
-        tracker_issues = self.store.list_tracker_issues(workspace_id)
-        fixes = self.store.list_fix_records(workspace_id)
-        run_reviews = self.store.list_run_reviews(workspace_id)
-        runbooks = self.list_runbooks(workspace_id)
-        verification_profiles = self.list_verification_profiles(workspace_id)
-        ticket_contexts = self.list_ticket_contexts(workspace_id)
-        threat_models = self.list_threat_models(workspace_id)
-        vulnerability_findings = self.list_vulnerability_findings(workspace_id)
-
-        issues: list[IssueRecord] = parse_ledger(ledger_path) if ledger_path else []
-        if verdict_paths and issues:
-            issues = apply_verdicts(issues, verdict_paths, root)
-        issues = self._merge_tracker_issues(issues, tracker_issues)
-        issues = self._apply_issue_overrides(workspace_id, issues)
-        issues = self._annotate_review_ready(issues, self.store.list_runs(workspace_id), fixes, run_reviews)
-        issues = [self._normalize_issue_evidence(root, issue) for issue in issues]
-        issues = self._apply_issue_drift(root, issues)
-        signals = scan_repo_signals(root)
-        sources = build_source_records(ledger_path, issues, verdict_paths, signals)
-        repo_map = build_repo_map(root, workspace_id)
-        self.store.save_repo_map(workspace_id, repo_map)
-        sources.extend(
-            self._build_tracker_sources(
-                workspace_id,
-                tracker_issues,
-                fixes,
-                runbooks,
-                run_reviews,
-                verification_profiles,
-                ticket_contexts,
-                threat_models,
-                vulnerability_findings,
-            )
-        )
-        drift_summary = self._build_drift_summary(issues)
-        runtimes = self.runtime_service.detect_runtimes()
-        tree_summary = summarize_tree(root)
-        summary = {
-            "issues_total": len(issues),
-            "issues_fixed": sum(1 for issue in issues if issue.code_status == "fixed" or issue.doc_status == "fixed"),
-            "issues_open": sum(1 for issue in issues if issue.issue_status in {"open", "partial"}),
-            "review_ready_total": sum(1 for issue in issues if issue.review_ready_count > 0),
-            "review_queue_total": sum(issue.review_ready_count for issue in issues),
-            "signals_total": len(signals),
-            "signals_promoted": sum(1 for signal in signals if signal.promoted_bug_id),
-            "drift_total": sum(len(issue.drift_flags) for issue in issues),
-            "sources_total": len(sources),
-            "tracker_issues_total": len(tracker_issues),
-            "fixes_total": len(fixes),
-            "runbooks_total": len(runbooks),
-            "ticket_contexts_total": len(ticket_contexts),
-            "threat_models_total": len(threat_models),
-            "vulnerability_findings_total": len(vulnerability_findings),
-            "repo_map_files": repo_map.total_files,
-            "tree_files": tree_summary["files"],
-            "tree_directories": tree_summary["directories"],
-        }
-        snapshot = WorkspaceSnapshot(
-            scanner_version=self.SCANNER_VERSION,
-            workspace=workspace.model_copy(update={"latest_scan_at": utc_now(), "updated_at": utc_now()}),
-            summary=summary,
-            issues=issues,
-            signals=signals,
-            sources=sources,
-            drift_summary=drift_summary,
-            runtimes=runtimes,
-            latest_ledger=str(ledger_path) if ledger_path else None,
-            latest_verdicts=str(verdict_paths[-1]) if verdict_paths else None,
-        )
-        self.store.save_workspace(snapshot.workspace)
-        self.store.save_snapshot(snapshot)
-        return snapshot
+        return WorkspaceSnapshot.model_validate(self._run_go_workspace_json("scan", workspace_id))
 
     def read_snapshot(self, workspace_id: str) -> Optional[WorkspaceSnapshot]:
         return self.store.load_snapshot(workspace_id)
@@ -798,7 +715,7 @@ class TrackerService:
 
     def _run_go_ops(self, args: list[str]) -> str:
         api_go_dir = Path(__file__).resolve().parents[2] / "api-go"
-        command = ["go", "run", "./cmd/xmustard-ops", *args, "--data-dir", str(self.store.root)]
+        command = ["go", "run", "./cmd/xmustard-ops", *args, "--data-dir", str(self.store.root.resolve())]
         try:
             completed = subprocess.run(
                 command,
@@ -2876,13 +2793,7 @@ class TrackerService:
         )
 
     def read_repo_map(self, workspace_id: str) -> RepoMapSummary:
-        workspace = self.get_workspace(workspace_id)
-        cached = self.store.load_repo_map(workspace_id)
-        if cached:
-            return cached
-        repo_map = build_repo_map(Path(workspace.root_path), workspace_id)
-        self.store.save_repo_map(workspace_id, repo_map)
-        return repo_map
+        return RepoMapSummary.model_validate(self._run_go_workspace_json("repo-map", workspace_id))
 
     def read_workspace_repo_config(self, workspace_id: str) -> RepoConfigRecord:
         workspace = self.get_workspace(workspace_id)
@@ -3560,88 +3471,13 @@ class TrackerService:
         return self.read_change_summary(workspace_id, base_ref="HEAD")
 
     def read_impact(self, workspace_id: str, base_ref: str = "HEAD") -> ImpactReport:
-        workspace = self.get_workspace(workspace_id)
-        root = Path(workspace.root_path)
-        change_summary = self.read_change_summary(workspace_id, base_ref=base_ref)
-        changed_paths = self._dedupe_ordered_text(
-            [item.path for item in change_summary.changed_files if item.status != "deleted"]
-        )
-        semantic_status = self._best_effort_semantic_status(workspace_id, changed_paths)
-        changed_symbols = self._derive_changed_symbols(workspace_id, change_summary.changed_files, semantic_status)
-        likely_affected_files = self._rank_impact_paths(
-            root,
-            changed_paths,
-            changed_symbols,
-            want_tests=False,
-        )
-        likely_affected_tests = self._rank_impact_paths(
-            root,
-            changed_paths,
-            changed_symbols,
-            want_tests=True,
-        )
-        warnings = list(semantic_status.warnings) if semantic_status else []
-        if semantic_status and semantic_status.status not in {"fresh", "dirty_provisional"}:
-            warnings.extend(semantic_status.stale_reasons[:3])
-        if not changed_paths:
-            warnings.append("No changed files were detected from the current git comparison surface.")
-        if changed_paths and not changed_symbols:
-            warnings.append("Changed files were detected, but no symbol-level impact could be derived from the current floor.")
-        derivation_summary, confidence = self._impact_derivation_summary(
-            changed_paths,
-            changed_symbols,
-            likely_affected_files,
-            likely_affected_tests,
-            semantic_status,
-        )
-        return ImpactReport(
-            workspace_id=workspace_id,
-            base_ref=base_ref,
-            semantic_status=semantic_status,
-            changed_files=change_summary.changed_files,
-            changed_symbols=changed_symbols,
-            likely_affected_files=likely_affected_files,
-            likely_affected_tests=likely_affected_tests,
-            derivation_summary=derivation_summary,
-            confidence=confidence,
-            warnings=self._dedupe_text(warnings),
+        return ImpactReport.model_validate(
+            self._run_go_workspace_json("impact", workspace_id, ["--base-ref", base_ref])
         )
 
     def read_repo_context(self, workspace_id: str, base_ref: str = "HEAD") -> RepoContextRecord:
-        impact = self.read_impact(workspace_id, base_ref=base_ref)
-        changed_paths = {item.path for item in impact.changed_files}
-        affected_paths = {item.path for item in [*impact.likely_affected_files, *impact.likely_affected_tests]}
-        reference_paths = changed_paths | affected_paths
-        plan_links = self._build_repo_context_plan_links(workspace_id, reference_paths)
-        recent_activity = self._build_repo_context_activity_links(workspace_id, reference_paths)
-        latest_fix = self._build_repo_context_latest_fix(workspace_id, reference_paths)
-        retrieval_ledger = self._build_repo_context_retrieval_ledger(
-            impact,
-            plan_links,
-            recent_activity,
-            latest_fix,
-        )
-        return RepoContextRecord(
-            workspace_id=workspace_id,
-            base_ref=base_ref,
-            semantic_status=impact.semantic_status,
-            impact=impact,
-            run_targets=self._build_repo_context_target_links(
-                self.list_run_targets(workspace_id),
-                changed_paths=changed_paths,
-                affected_paths=affected_paths,
-                target_kind="run",
-            ),
-            verify_targets=self._build_repo_context_target_links(
-                self.list_verify_targets(workspace_id),
-                changed_paths=changed_paths,
-                affected_paths=affected_paths,
-                target_kind="verify",
-            ),
-            plan_links=plan_links,
-            recent_activity=recent_activity,
-            latest_accepted_fix=latest_fix,
-            retrieval_ledger=retrieval_ledger,
+        return RepoContextRecord.model_validate(
+            self._run_go_workspace_json("repo-context", workspace_id, ["--base-ref", base_ref])
         )
 
     def list_run_targets(self, workspace_id: str) -> list[RepoTargetRecord]:
@@ -3670,45 +3506,8 @@ class TrackerService:
         return sorted(deduped, key=lambda item: (item.kind, item.label, item.command))
 
     def read_path_symbols(self, workspace_id: str, relative_path: str) -> PathSymbolsResult:
-        workspace = self.get_workspace(workspace_id)
-        root = Path(workspace.root_path).resolve()
-        normalized, path = self._resolve_workspace_file(root, relative_path)
-        semantic_status = self._best_effort_semantic_status(workspace_id, [normalized])
-        stored = self._read_fresh_stored_path_symbols(workspace_id, normalized, semantic_status=semantic_status)
-        if stored is not None:
-            return stored
-        rust_result = self._read_path_symbols_via_rust(
-            workspace_id,
-            root,
-            normalized,
-            semantic_status=semantic_status,
-        )
-        if rust_result is not None:
-            return rust_result
-        content = path.read_text(encoding="utf-8", errors="ignore")
-        symbols, symbol_source, parser_language = self._extract_path_symbol_records(Path(normalized), content)
-        file_summary_row, symbol_rows = self._build_symbol_materialization_rows(
-            workspace_id,
-            normalized,
-            symbols,
-            symbol_source,
-            parser_language,
-        )
-        return PathSymbolsResult(
-            workspace_id=workspace_id,
-            path=normalized,
-            symbol_source=symbol_source,
-            parser_language=parser_language,
-            evidence_source="on_demand_parser",
-            selection_reason=self._fallback_selection_reason(semantic_status),
-            semantic_status=semantic_status,
-            symbols=[
-                item.model_copy(update={"evidence_source": "on_demand_parser"})
-                for item in symbols[:24]
-            ],
-            file_summary_row=file_summary_row,
-            symbol_rows=symbol_rows[:24],
-            warnings=self._semantic_consumer_warnings(semantic_status, using_stored=False),
+        return PathSymbolsResult.model_validate(
+            self._run_go_workspace_json("path-symbols", workspace_id, ["--path", relative_path])
         )
 
     def search_semantic_pattern(
@@ -3720,40 +3519,13 @@ class TrackerService:
         path_glob: Optional[str] = None,
         limit: int = 50,
     ) -> SemanticPatternQueryResult:
-        workspace = self.get_workspace(workspace_id)
-        root = Path(workspace.root_path).resolve()
-        matches, binary_path, error, truncated = run_ast_grep_query(
-            root,
-            pattern,
-            language=language or None,
-            path_glob=path_glob or None,
-            limit=max(1, min(limit, 200)),
-        )
-        query_row = self._build_semantic_query_row(
-            workspace_id,
-            pattern,
-            language=language or None,
-            path_glob=path_glob or None,
-            engine="ast_grep" if binary_path else "none",
-            match_count=len(matches),
-            truncated=truncated,
-            error=error,
-            source="adhoc_tool",
-        )
-        match_rows = self._build_semantic_match_rows(workspace_id, query_row.query_ref, matches)
-        return SemanticPatternQueryResult(
-            workspace_id=workspace_id,
-            pattern=pattern,
-            language=language or None,
-            path_glob=path_glob or None,
-            engine="ast_grep" if binary_path else "none",
-            binary_path=binary_path,
-            match_count=len(matches),
-            truncated=truncated,
-            matches=matches,
-            query_row=query_row,
-            match_rows=match_rows,
-            error=error,
+        flags = ["--pattern", pattern, "--limit", str(limit)]
+        if language:
+            flags.extend(["--language", language])
+        if path_glob:
+            flags.extend(["--path-glob", path_glob])
+        return SemanticPatternQueryResult.model_validate(
+            self._run_go_workspace_json("semantic-search", workspace_id, flags)
         )
 
     def read_stored_semantic_matches(
@@ -3785,122 +3557,8 @@ class TrackerService:
         *,
         limit: int = 12,
     ) -> RetrievalSearchResult:
-        workspace = self.get_workspace(workspace_id)
-        root = Path(workspace.root_path)
-        tokens = self._query_tokens(query)
-        normalized_limit = max(1, min(limit, 50))
-        hits: list[RetrievalSearchHit] = []
-        seen: set[tuple[str, str, str]] = set()
-
-        def push(hit: RetrievalSearchHit) -> None:
-            key = (hit.source_type, hit.path, hit.title)
-            if key in seen:
-                return
-            seen.add(key)
-            hits.append(hit)
-
-        repo_map = self.store.load_repo_map(workspace_id)
-        if repo_map:
-            for file_record in repo_map.key_files:
-                haystack = f"{file_record.path} {file_record.role}".lower()
-                matched_terms = [token for token in tokens[:10] if token in haystack]
-                if not matched_terms:
-                    continue
-                push(
-                    RetrievalSearchHit(
-                        path=file_record.path,
-                        source_type="lexical_hit",
-                        title=file_record.path,
-                        reason=f"Key repo-map path matched query terms: {', '.join(matched_terms[:4])}.",
-                        matched_terms=matched_terms,
-                        score=6 + len(matched_terms),
-                    )
-                )
-
-        for relative_path in self._semantic_materialization_source_candidates(root, limit=80):
-            candidate = root / relative_path
-            try:
-                content = candidate.read_text(encoding="utf-8", errors="ignore")[:30000].lower()
-            except OSError:
-                continue
-            haystack = f"{relative_path.lower()} {content}"
-            matched_terms = [token for token in tokens[:10] if token in haystack]
-            if not matched_terms:
-                continue
-            push(
-                RetrievalSearchHit(
-                    path=relative_path,
-                    source_type="lexical_hit",
-                    title=relative_path,
-                    reason=f"File path or content matched query terms: {', '.join(matched_terms[:4])}.",
-                    matched_terms=matched_terms,
-                    score=4 + len(matched_terms),
-                )
-            )
-
-        for path in self._dedupe_text([hit.path for hit in hits[:20]]):
-            try:
-                symbols = self.read_path_symbols(workspace_id, path)
-            except (FileNotFoundError, ValueError):
-                continue
-            for symbol in symbols.symbols[:12]:
-                haystack = f"{symbol.symbol} {symbol.kind} {symbol.enclosing_scope or ''}".lower()
-                matched_terms = [token for token in tokens[:10] if token in haystack]
-                if not matched_terms:
-                    continue
-                push(
-                    RetrievalSearchHit(
-                        path=symbol.path,
-                        source_type="stored_symbol" if symbols.evidence_source == "stored_semantic" else "structural_hit",
-                        title=f"{symbol.kind} {symbol.symbol}",
-                        reason=f"Parser symbol matched query terms: {', '.join(matched_terms[:4])}; {symbols.selection_reason}",
-                        matched_terms=matched_terms,
-                        score=9 + len(matched_terms),
-                    )
-                )
-
-        for match in self.read_stored_semantic_matches(workspace_id, limit=50):
-            haystack = f"{match.path} {match.matched_text} {match.context_lines or ''}".lower()
-            matched_terms = [token for token in tokens[:10] if token in haystack]
-            if not matched_terms:
-                continue
-            push(
-                RetrievalSearchHit(
-                    path=match.path,
-                    source_type="stored_semantic_match",
-                    title=match.matched_text[:80],
-                    reason=f"Stored semantic match replay matched query terms: {', '.join(matched_terms[:4])}.",
-                    matched_terms=matched_terms,
-                    score=10 + match.score + len(matched_terms),
-                )
-            )
-
-        hits.sort(key=lambda item: (-item.score, item.source_type, item.path, item.title))
-        hits = hits[:normalized_limit]
-        ledger = [
-            ContextRetrievalLedgerEntry(
-                entry_id=f"retrieval:{index}:{hit.source_type}:{hit.path}:{hashlib.sha1(hit.title.encode('utf-8')).hexdigest()[:8]}",
-                source_type=hit.source_type,
-                source_id=f"{hit.source_type}:{hit.path}:{hit.title}",
-                title=hit.title,
-                path=hit.path,
-                reason=hit.reason,
-                matched_terms=hit.matched_terms,
-                score=hit.score,
-            )
-            for index, hit in enumerate(hits)
-        ]
-        warnings = []
-        if not self.store.load_settings().postgres_dsn:
-            warnings.append("Postgres DSN is not configured; stored semantic match replay is unavailable.")
-        if not ast_grep_available():
-            warnings.append("sg is unavailable; retrieval is limited to lexical and parser-backed structural evidence.")
-        return RetrievalSearchResult(
-            workspace_id=workspace_id,
-            query=query,
-            hits=hits,
-            retrieval_ledger=ledger,
-            warnings=warnings,
+        return RetrievalSearchResult.model_validate(
+            self._run_go_workspace_json("retrieval-search", workspace_id, ["--query", query, "--limit", str(limit)])
         )
 
     def _query_tokens(self, query: str) -> list[str]:
@@ -3911,75 +3569,8 @@ class TrackerService:
         ][:16]
 
     def explain_path(self, workspace_id: str, relative_path: str) -> CodeExplainerResult:
-        workspace = self.get_workspace(workspace_id)
-        root = Path(workspace.root_path).resolve()
-        normalized, path = self._resolve_workspace_file(root, relative_path)
-        semantic_status = self._best_effort_semantic_status(workspace_id, [normalized])
-        stored = self._read_fresh_stored_path_symbols(workspace_id, normalized, semantic_status=semantic_status)
-        if stored is not None:
-            content = path.read_text(encoding="utf-8", errors="ignore")
-            line_count = len(content.splitlines())
-            import_count = self._count_imports(path, content)
-            symbol_records = stored.symbols
-            symbol_source = stored.symbol_source
-            parser_language = stored.parser_language
-            evidence_source = stored.evidence_source
-            selection_reason = stored.selection_reason
-            warnings = stored.warnings
-            symbols = [item.symbol for item in symbol_records[:12]]
-            role = self._infer_file_role(root, path)
-            summary = self._build_path_summary(normalized, role, line_count, import_count, symbols)
-            hints = self._build_path_hints(normalized, role)
-            return CodeExplainerResult(
-                workspace_id=workspace_id,
-                path=normalized,
-                role=role,
-                line_count=line_count,
-                import_count=import_count,
-                detected_symbols=symbols[:8],
-                symbol_source=symbol_source,
-                parser_language=parser_language,
-                evidence_source=evidence_source,
-                selection_reason=selection_reason,
-                semantic_status=semantic_status,
-                summary=summary,
-                hints=hints,
-                warnings=warnings,
-            )
-        rust_result = self._explain_path_via_rust(
-            workspace_id,
-            root,
-            normalized,
-            semantic_status=semantic_status,
-        )
-        if rust_result is not None:
-            return rust_result
-        content = path.read_text(encoding="utf-8", errors="ignore")
-        line_count = len(content.splitlines())
-        import_count = self._count_imports(path, content)
-        symbol_records, symbol_source, parser_language = self._extract_path_symbol_records(Path(normalized), content)
-        evidence_source = "on_demand_parser"
-        selection_reason = self._fallback_selection_reason(semantic_status)
-        warnings = self._semantic_consumer_warnings(semantic_status, using_stored=False)
-        symbols = [item.symbol for item in symbol_records[:12]]
-        role = self._infer_file_role(root, path)
-        summary = self._build_path_summary(normalized, role, line_count, import_count, symbols)
-        hints = self._build_path_hints(normalized, role)
-        return CodeExplainerResult(
-            workspace_id=workspace_id,
-            path=normalized,
-            role=role,
-            line_count=line_count,
-            import_count=import_count,
-            detected_symbols=symbols[:8],
-            symbol_source=symbol_source,
-            parser_language=parser_language,
-            evidence_source=evidence_source,
-            selection_reason=selection_reason,
-            semantic_status=semantic_status,
-            summary=summary,
-            hints=hints,
-            warnings=warnings,
+        return CodeExplainerResult.model_validate(
+            self._run_go_workspace_json("explain-path", workspace_id, ["--path", relative_path])
         )
 
     def _resolve_workspace_file(self, root: Path, relative_path: str) -> tuple[str, Path]:

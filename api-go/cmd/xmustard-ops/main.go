@@ -163,12 +163,16 @@ func runWorkspace(args []string) {
 		err     error
 	)
 	switch action {
+	case "scan":
+		payload, err = workspaceops.ScanWorkspace(*dataDir, workspaceID)
 	case "changed-symbols":
 		payload, err = workspaceops.ReadChangedSymbols(*dataDir, workspaceID, *baseRef)
 	case "impact":
 		payload, err = workspaceops.ReadImpact(*dataDir, workspaceID, *baseRef)
 	case "repo-context":
 		payload, err = workspaceops.ReadRepoContext(*dataDir, workspaceID, *baseRef)
+	case "repo-map":
+		payload, err = workspaceops.ReadWorkspaceRepoMap(*dataDir, workspaceID)
 	case "retrieval-search":
 		payload, err = workspaceops.SearchRetrieval(*dataDir, workspaceID, *query, *limit)
 	case "path-symbols":
@@ -209,7 +213,7 @@ func runWorkspace(args []string) {
 			SchemaName: optionalFlagString(*schema),
 		})
 	default:
-		fatalUsage("usage: xmustard-ops workspace <changed-symbols|impact|repo-context|retrieval-search|path-symbols|explain-path|semantic-search|postgres-materialize-path|postgres-materialize-workspace-symbols|postgres-materialize-semantic-search|semantic-index-materialize> <workspace_id> [flags]")
+		fatalUsage("usage: xmustard-ops workspace <scan|repo-map|changed-symbols|impact|repo-context|retrieval-search|path-symbols|explain-path|semantic-search|postgres-materialize-path|postgres-materialize-workspace-symbols|postgres-materialize-semantic-search|semantic-index-materialize> <workspace_id> [flags]")
 	}
 	writeJSON(payload, err)
 }
