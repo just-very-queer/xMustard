@@ -723,7 +723,7 @@ def changes(workspace_id: str, base_ref: str = typer.Option(default="HEAD")) -> 
 
 @app.command("changed-symbols")
 def changed_symbols(workspace_id: str, base_ref: str = typer.Option(default="HEAD")) -> None:
-    _echo_json([item.model_dump(mode="json") for item in service.read_changed_symbols(workspace_id, base_ref=base_ref)])
+    _echo_json(_run_go_workspace_json("changed-symbols", workspace_id, ["--base-ref", base_ref]))
 
 
 @app.command("changed-since-last-run")

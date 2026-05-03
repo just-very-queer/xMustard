@@ -219,6 +219,7 @@ That boundary work is now live for three concrete slices:
 - FastAPI no longer registers those semantic-search/materialization HTTP handlers in `backend/app/main.py`, so Python is no longer the live request-path owner for this route group.
 - The `semantic-index` operator flow now runs through the Go `xmustard-ops` binary for plan/run/status plus baseline freshness/persistence, so Python is no longer the authority path for that shipped CLI slice.
 - The Go `xmustard-ops` binary now also exposes shipped workspace and Postgres actions for:
+  - `workspace changed-symbols`
   - `postgres plan`
   - `postgres render`
   - `postgres bootstrap`
@@ -232,6 +233,8 @@ That boundary work is now live for three concrete slices:
   - `workspace postgres-materialize-workspace-symbols`
   - `workspace postgres-materialize-semantic-search`
 - The Python Typer CLI keeps the old command names for compatibility, but those commands now delegate to `go run ./cmd/xmustard-ops ...` for the migrated workspace/Postgres/semantic surfaces instead of calling `TrackerService` as the authority.
+- FastAPI no longer registers `GET /api/workspaces/{workspace_id}/path-symbols` or `GET /api/workspaces/{workspace_id}/explain-path`; those single-path semantic reads are Go HTTP delivery over Rust semantic-core output.
+- Python no longer exposes a public `TrackerService.read_changed_symbols(...)` CLI authority seam; the compatibility CLI delegates `changed-symbols` to Go, which derives it from Rust-backed impact.
 - Python still owns broader CLI compatibility, remaining FastAPI routes, `TrackerService` compatibility assembly, and non-delegated semantic baseline/materialization helpers; do not mistake that for a full Python exit.
 - Python parity tests now compare live Python behavior against the Rust outputs for:
   - signal scanning

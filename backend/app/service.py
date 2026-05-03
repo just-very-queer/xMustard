@@ -3795,10 +3795,6 @@ class TrackerService:
         summary.changed_files = sorted(changed.values(), key=lambda item: (item.path, item.scope, item.status))
         return summary
 
-    def read_changed_symbols(self, workspace_id: str, base_ref: str = "HEAD") -> list[ChangedSymbolRecord]:
-        impact = self.read_impact(workspace_id, base_ref=base_ref)
-        return impact.changed_symbols
-
     def read_changes_since_last_run(self, workspace_id: str) -> RepoChangeSummary:
         runs = self.store.list_runs(workspace_id)
         for run in runs:

@@ -104,6 +104,14 @@ func TestGoRepoIntelligenceReadsImpactContextAndRetrieval(t *testing.T) {
 		t.Fatalf("expected useful confidence, got %#v", impact)
 	}
 
+	changedSymbols, err := ReadChangedSymbols(dataDir, workspaceID, "HEAD")
+	if err != nil {
+		t.Fatalf("read changed symbols: %v", err)
+	}
+	if len(changedSymbols) == 0 || changedSymbols[0].EvidenceSource != "rust_semantic_core" {
+		t.Fatalf("expected Rust-backed changed symbols, got %#v", changedSymbols)
+	}
+
 	context, err := ReadRepoContext(dataDir, workspaceID, "HEAD")
 	if err != nil {
 		t.Fatalf("read repo context: %v", err)

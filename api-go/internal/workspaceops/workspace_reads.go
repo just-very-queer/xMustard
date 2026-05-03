@@ -338,6 +338,14 @@ func ReadImpact(dataDir string, workspaceID string, baseRef string) (*ImpactRepo
 	}, nil
 }
 
+func ReadChangedSymbols(dataDir string, workspaceID string, baseRef string) ([]ChangedSymbolRecord, error) {
+	impact, err := ReadImpact(dataDir, workspaceID, baseRef)
+	if err != nil {
+		return nil, err
+	}
+	return impact.ChangedSymbols, nil
+}
+
 func ReadRepoContext(dataDir string, workspaceID string, baseRef string) (*RepoContextRecord, error) {
 	impact, err := ReadImpact(dataDir, workspaceID, baseRef)
 	if err != nil {

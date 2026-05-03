@@ -6,7 +6,7 @@ Phase 2 is complete for xMustard. External validation workspace dirtiness is not
 
 This map is grounded in the current repository shape: Python still carries the compatibility CLI and much of the orchestration brain, Go already owns a large API delivery shell, Rust owns repo-map/scanner/verification primitives, and Postgres is the durable semantic storage direction.
 
-Completion-pass audit truth on 2026-05-03: xMustard is still in mixed mode. The shipped `semantic-index`, repo-intelligence, path-symbol/explainer, semantic-search, Postgres foundation, and semantic materialization CLI slices now delegate to Go `xmustard-ops`, but Python remains in shipped authority through remaining FastAPI routes, broad Typer compatibility commands, `TrackerService` orchestration, and non-delegated semantic baseline/materialization helpers.
+Completion-pass audit truth on 2026-05-03: xMustard is still in mixed mode. The shipped `semantic-index`, repo-intelligence, changed-symbols, path-symbol/explainer, semantic-search, Postgres foundation, and semantic materialization CLI slices now delegate to Go `xmustard-ops`, and FastAPI no longer registers the single-path `path-symbols`/`explain-path` HTTP reads. Python remains in shipped authority through remaining FastAPI routes, broad Typer compatibility commands, `TrackerService` orchestration, and non-delegated semantic baseline/materialization helpers.
 
 ## Inventory Buckets
 
@@ -157,7 +157,19 @@ This completion pass widened `xmustard-ops` so Python is no longer the CLI autho
 - `backend/app/cli.py` keeps the old Typer command names, but those commands now shell to `go run ./cmd/xmustard-ops ... --data-dir <backend data dir>` instead of calling `TrackerService` or `backend/app/postgres.py` directly.
 - CLI tests now assert Go delegation for these migrated slices rather than mocking Python service methods as the implementation owner.
 
-This shrinks the compatibility shell, but it does not make Python disposable. `backend/app/main.py` still registers `path-symbols` and `explain-path`, many Typer commands still call `TrackerService`, and `TrackerService` still carries compatibility implementations for semantic status, stored semantic reads, fallback parser paths, context packet assembly, runs, runtime/session behavior, issue workflows, and persistence glue.
+This shrinks the compatibility shell, but it does not make Python disposable. Many Typer commands still call `TrackerService`, and `TrackerService` still carries compatibility implementations for semantic status, stored semantic reads, fallback parser paths, context packet assembly, runs, runtime/session behavior, issue workflows, and persistence glue.
+
+## Phase 3 Single-Path Semantic HTTP And Changed-Symbols CLI Reduction Landed
+
+This completion pass removed the stale Python request and CLI ownership left around the already-migrated single-path semantic reads:
+
+- `backend/app/main.py` no longer registers `GET /api/workspaces/{workspace_id}/path-symbols`.
+- `backend/app/main.py` no longer registers `GET /api/workspaces/{workspace_id}/explain-path`.
+- `api-go/cmd/xmustard-ops/main.go` now exposes `workspace changed-symbols`.
+- `backend/app/cli.py` now delegates `changed-symbols` to Go instead of calling `TrackerService`.
+- `backend/app/service.py` no longer exposes `read_changed_symbols(...)` as a public compatibility authority seam.
+
+The ownership moved here is narrow but real: Go is the only shipped HTTP owner for `path-symbols` and `explain-path`, Rust remains the semantic meaning owner behind those reads, and CLI `changed-symbols` now comes from Go/Rust impact instead of Python service assembly.
 
 ## Phase 3 Boundary
 

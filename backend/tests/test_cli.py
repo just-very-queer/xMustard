@@ -144,6 +144,8 @@ reviews:
                                 }
                             if action == "impact":
                                 return {"workspace_id": workspace_id, "derivation_summary": "Rust-backed impact report", "warnings": []}
+                            if action == "changed-symbols":
+                                return [{"path": "api/src/example.py", "symbol": "render_payload", "kind": "function"}]
                             if action == "repo-context":
                                 return {"workspace_id": workspace_id, "retrieval_ledger": []}
                             if action == "retrieval-search":
@@ -176,7 +178,7 @@ reviews:
                             ),
                             (
                                 ["changed-symbols", workspace_id],
-                                lambda payload: self.assertIsInstance(payload, list),
+                                lambda payload: self.assertEqual(payload[0]["symbol"], "render_payload"),
                             ),
                             (
                                 ["changed-since-last-run", workspace_id],

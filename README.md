@@ -26,9 +26,10 @@ The first Phase 3 authority cuts are already landed:
 - Rust owns on-demand `path-symbols` extraction, the code-explainer semantic substrate, and storage-ready symbol materialization rows consumed by Go delivery and Python compatibility fallback
 - Go now also owns the Postgres foundation delivery slice for settings-backed schema plan/render/bootstrap
 - Go now owns the live semantic-search plus Postgres semantic materialization HTTP slice for `path-symbols/materialize`, `semantic-index/materialize`, and `semantic-search/materialize`
-- The Python Typer CLI now delegates the shipped Go-owned repo-intelligence, path-symbol/explainer, semantic-search, Postgres foundation, and semantic materialization surfaces through `api-go/cmd/xmustard-ops` instead of reopening `TrackerService` for those commands
+- The Python Typer CLI now delegates the shipped Go-owned repo-intelligence, changed-symbols, path-symbol/explainer, semantic-search, Postgres foundation, and semantic materialization surfaces through `api-go/cmd/xmustard-ops` instead of reopening `TrackerService` for those commands
+- FastAPI no longer registers the single-path `path-symbols` and `explain-path` routes now owned by Go delivery over Rust semantic-core output
 
-Completion audit truth on 2026-05-03: xMustard is still mixed-mode, not Python-exited. Go and Rust own real shipped slices, and several CLI routes now delegate to the Go `xmustard-ops` owner path, but Python still remains in shipped authority through remaining FastAPI routes, broad Typer compatibility commands, `TrackerService` orchestration, and non-delegated semantic/Postgres helpers.
+Completion audit truth on 2026-05-03: xMustard is still mixed-mode, not Python-exited. Go and Rust own real shipped slices, and the Python compatibility shell is thinner for repo-intelligence and single-path semantic reads, but Python still remains in shipped authority through remaining FastAPI routes, broad Typer compatibility commands, `TrackerService` orchestration, and non-delegated semantic/Postgres helpers.
 
 ## What xMustard Is
 
@@ -77,7 +78,7 @@ Phase 3 work now includes:
 - Rust-owned code-explainer substrate for `explain-path`, including path role, line/import counts, detected symbols, summary, hints, and provenance
 - Rust-owned file-symbol summary and symbol-row shaping for on-demand `path-symbols`, so Python compatibility no longer has to shape those Postgres-ready rows when stored semantic state is absent
 - Go-owned semantic-search and semantic materialization delivery for the live HTTP paths that write path-symbol, workspace semantic-index batch, and semantic-search rows into Postgres
-- Go-owned CLI delivery for the same migrated repo-intelligence and semantic/Postgres surfaces via `xmustard-ops`, with Python retaining the old command names as a compatibility shell
+- Go-owned CLI delivery for the same migrated repo-intelligence, changed-symbols, and semantic/Postgres surfaces via `xmustard-ops`, with Python retaining the old command names as a compatibility shell
 - a durable Python exit map to track what still belongs in Python temporarily and what should move next
 
 ## What This Repo Is Becoming
@@ -122,7 +123,7 @@ python3 -m pip install .
 uvicorn app.main:app --reload --port 8042
 ```
 
-The Python shell is compatibility-only for the routes and CLI workflows that have been delegated, but it is not gone. Several FastAPI routes and many Typer commands still call `TrackerService`; treat the repo as mixed-mode until those paths are moved or deleted with replacement proof.
+The Python shell is compatibility-only for the routes and CLI workflows that have been delegated, but it is not gone. Several FastAPI routes and many Typer commands still call `TrackerService`; treat the repo as mixed-mode until those paths are moved or deleted with replacement proof. In particular, `path-symbols`, `explain-path`, and `changed-symbols` no longer need Python as their shipped delivery owner.
 
 Frontend setup:
 

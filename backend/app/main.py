@@ -484,26 +484,6 @@ def list_verify_targets(workspace_id: str):
         raise HTTPException(status_code=404, detail="Workspace not found")
 
 
-@app.get("/api/workspaces/{workspace_id}/explain-path")
-def explain_path(workspace_id: str, path: str = Query(...)):
-    try:
-        return SERVICE.explain_path(workspace_id, path).model_dump(mode="json")
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="Path not found")
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-
-
-@app.get("/api/workspaces/{workspace_id}/path-symbols")
-def path_symbols(workspace_id: str, path: str = Query(...)):
-    try:
-        return SERVICE.read_path_symbols(workspace_id, path).model_dump(mode="json")
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="Path not found")
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-
-
 @app.post("/api/workspaces/{workspace_id}/scan")
 def scan_workspace(workspace_id: str):
     try:
