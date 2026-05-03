@@ -193,13 +193,53 @@ That boundary work is now live for three concrete slices:
 - The Go API shell now owns issue queue reads, issue drift reads, signal queue reads, and workspace drift summary reads from the persisted workspace snapshot.
 - The Go API shell now owns issue create/update plus saved-view list/create/update/delete against `snapshot.json`, `tracker_issues.json`, `issue_overrides.json`, and `saved_views.json`, including matching activity ledger entries.
 - The Go API shell now owns runtime listing, settings reads/writes, local agent capability reads, and workspace runtime probe flows while preserving the existing `settings.json` contract and runtime model validation behavior.
+- The Go API shell now owns Postgres schema plan/render/bootstrap too, including the persisted `postgres_dsn` and `postgres_schema` settings fields needed to drive those endpoints without re-entering Python for foundation delivery.
 - The Go API shell now owns issue-run creation, workspace query runs, run listing, run detail reads, run log reads, live run cancel/retry, run plan generate/read/approve/reject, run review submission, run acceptance, run insights, run metrics, workspace metrics, cost summaries, critique generation/read, improvement listing/dismissal, fix listing, fix recording, fix-draft generation, verification listing, and review-queue reads against the persisted run and tracker artifacts.
 - Verification profile checklist items and durable verification-profile history now persist through both Python and Go API paths, with confidence scoring attached to each saved execution record.
 - The Go API shell now owns verification-profile report reads, including runtime, model, and branch breakdowns that match the richer Python report shape.
 - The Go API shell now owns workspace listing, fresh and cached workspace load, explicit workspace scan, worktree reads, export bundle reads, and terminal open/write/resize/read/close transport against the existing workspace registry and terminal log layout.
+- Runtime probes now execute through the Rust `run-managed-command` boundary from Go by default, with Go-local subprocess execution retained only as a bridge-unavailable fallback for that bounded probe slice.
+- Go-owned run cancellation and terminal close now terminate process groups/known child processes more reliably while the long-lived Rust managed-run/session contract is still missing.
+- The Go API shell now owns the first repo-intelligence read tranche for `/api/workspaces/{workspace_id}/impact`, `/api/workspaces/{workspace_id}/repo-context`, and `/api/workspaces/{workspace_id}/retrieval-search`, deriving delivery payloads from workspace artifacts, git state, repo-map records, activity, run plans, and fix records without calling Python service methods.
+- Rust now owns the first semantic-impact contract in `rust-core/src/repomap.rs`: changed-symbol extraction, symbol evidence provenance, and likely affected file/test ranking are emitted through `xmustard-core semantic-impact`.
+- Go repo-intelligence reads now consume the Rust semantic-impact contract for impact reports and structural retrieval hits; Go remains the delivery shell and no longer carries the parser-lite changed-symbol or impact-ranking authority for these paths.
+- Rust now owns the first on-demand path-symbol contract in `rust-core/src/repomap.rs`, exposed through `xmustard-core path-symbols`.
+- Go now serves `path-symbols` from Rust semantic-core output, moving single-path symbol meaning out of Python.
+- Rust now owns the first code-explainer semantic substrate in `rust-core/src/repomap.rs`, exposed through `xmustard-core explain-path`: path role, line/import counts, detected symbols, summary, hints, evidence source, and selection reason are emitted by Rust.
+- Go now serves `explain-path` by forwarding the Rust typed contract, so Go stays the delivery shell while code-explainer meaning moves out of Python and out of Go-local assembly.
+- Rust `path-symbols` now also emits storage-ready `file_summary_row` and `symbol_rows` payloads, so on-demand semantic row shaping is no longer a Python-only responsibility when stored semantic baselines are absent.
+- Python compatibility `path-symbols` and `code-explainer` now prefer Rust on-demand contracts first and only fall back to local parser shaping if the Rust command is unavailable, keeping Python on a compatibility-only seam instead of a default meaning-owner seam.
+- Rust now defines the first normalized diagnostics contract boundary in `rust-core/src/contracts.rs`: Rust owns diagnostic meaning/normalization, Go owns delivery, and Postgres owns durable `diagnostics` rows.
 - The Go API shell now owns the `external_integrations_gateway` cutline too: plugin-manifest-backed integration config/test routes, GitHub issue import + PR creation, Slack notifications, and Linear/Jira issue sync now persist through Go while keeping ticket-context/activity artifacts and the existing `backend/data/integrations/` compatibility layout.
 - The Go API shell now owns repo-config reads at `/api/workspaces/{workspace_id}/repo-config` and `/api/workspaces/{workspace_id}/repo-config/health`, and issue-context packets built in Go now include `.xmustard.yaml` path instructions and MCP/browser-context hints.
 - FastAPI no longer registers the integration config/test/sync HTTP handlers in `backend/app/main.py`, so the external integrations gateway now leaves Python on the live request path while preserving the same route paths through Go.
+- The Go API shell now also owns the live semantic-search and Postgres semantic materialization request paths:
+  - `/api/workspaces/{workspace_id}/path-symbols/materialize`
+  - `/api/workspaces/{workspace_id}/semantic-index/materialize`
+  - `/api/workspaces/{workspace_id}/semantic-search`
+  - `/api/workspaces/{workspace_id}/semantic-search/materialize`
+- FastAPI no longer registers those semantic-search/materialization HTTP handlers in `backend/app/main.py`, so Python is no longer the live request-path owner for this route group.
+- The `semantic-index` operator flow now runs through the Go `xmustard-ops` binary for plan/run/status plus baseline freshness/persistence, so Python is no longer the authority path for that shipped CLI slice.
+- The Go `xmustard-ops` binary now also exposes shipped workspace and Postgres actions for:
+  - `workspace changed-symbols`
+  - `postgres plan`
+  - `postgres render`
+  - `postgres bootstrap`
+  - `workspace impact`
+  - `workspace repo-context`
+  - `workspace retrieval-search`
+  - `workspace path-symbols`
+  - `workspace explain-path`
+  - `workspace semantic-search`
+  - `workspace postgres-materialize-path`
+  - `workspace postgres-materialize-workspace-symbols`
+  - `workspace postgres-materialize-semantic-search`
+- The Python Typer CLI keeps the old command names for compatibility, but those commands now delegate to `go run ./cmd/xmustard-ops ...` for the migrated workspace/Postgres/semantic surfaces instead of calling `TrackerService` as the authority.
+- FastAPI no longer registers `GET /api/workspaces/{workspace_id}/path-symbols` or `GET /api/workspaces/{workspace_id}/explain-path`; those single-path semantic reads are Go HTTP delivery over Rust semantic-core output.
+- Python no longer exposes a public `TrackerService.read_changed_symbols(...)` CLI authority seam; the compatibility CLI delegates `changed-symbols` to Go, which derives it from Rust-backed impact.
+- Public `TrackerService` compatibility methods for Postgres foundation, Postgres semantic materialization, semantic-index plan/run/status, repo-intelligence reads, path symbols, explainer, semantic search, and retrieval now delegate to Go `xmustard-ops`; the old Python private helpers for those migrated slices have been removed from `TrackerService`.
+- The remaining runtime/session cutline is exact: Go still owns long-lived issue/workspace-query process launch, live log writing, PID tracking, retry/cancel, and run summary persistence; Rust needs a managed-run/session contract before that can move without regressing cancellation and streamed run-log behavior.
+- Python still owns broader CLI compatibility, remaining FastAPI routes, `TrackerService` compatibility assembly outside the migrated slices, issue-context semantic pattern derivation, and persistence glue; do not mistake Phase 3 for a full Python exit.
 - Python parity tests now compare live Python behavior against the Rust outputs for:
   - signal scanning
   - repo-map summaries
@@ -211,7 +251,8 @@ That boundary work is now live for three concrete slices:
 
 ## Recommended Next Build Order
 
-1. Add coverage delta and artifact persistence helpers on the Rust side where it simplifies process control.
-2. Extend the Go plugin registry into webhook/event fanout and manifest-first provider callbacks.
-3. Migrate FastAPI route groups to Go one surface at a time.
-4. Delete Python implementations only after route and artifact parity are verified.
+1. Expand the Rust semantic contracts toward stored semantic rows, diagnostics normalization, and later tree-sitter/LSP-backed extraction.
+2. Add coverage delta and artifact persistence helpers on the Rust side where it simplifies process control.
+3. Extend the Go plugin registry into webhook/event fanout and manifest-first provider callbacks.
+4. Migrate FastAPI route groups to Go one surface at a time.
+5. Delete Python implementations only after route and artifact parity are verified.

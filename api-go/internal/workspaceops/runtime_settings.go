@@ -31,6 +31,8 @@ type AppSettings struct {
 	CodexArgs      *string `json:"codex_args,omitempty"`
 	CodexModel     *string `json:"codex_model,omitempty"`
 	OpencodeModel  *string `json:"opencode_model,omitempty"`
+	PostgresDSN    *string `json:"postgres_dsn,omitempty"`
+	PostgresSchema string  `json:"postgres_schema"`
 }
 
 type LocalAgentCapabilities struct {
@@ -89,6 +91,8 @@ func GetSettings(dataDir string) (*AppSettings, error) {
 		CodexArgs:      settings.CodexArgs,
 		CodexModel:     settings.CodexModel,
 		OpencodeModel:  settings.OpencodeModel,
+		PostgresDSN:    settings.PostgresDSN,
+		PostgresSchema: settings.PostgresSchema,
 	}, nil
 }
 
@@ -100,6 +104,8 @@ func UpdateSettings(dataDir string, settings AppSettings) (*AppSettings, error) 
 		CodexArgs:      trimOptional(settings.CodexArgs),
 		CodexModel:     trimOptional(settings.CodexModel),
 		OpencodeModel:  trimOptional(settings.OpencodeModel),
+		PostgresDSN:    trimOptional(settings.PostgresDSN),
+		PostgresSchema: fallbackString(strings.TrimSpace(settings.PostgresSchema), "xmustard"),
 	}
 	if err := writeJSON(filepath.Join(dataDir, "settings.json"), next); err != nil {
 		return nil, err
@@ -181,7 +187,7 @@ func ProbeRuntime(dataDir string, workspaceID string, runtime string, model stri
 		return nil, err
 	}
 	started := time.Now()
-	execution := runCommandWithTimeout(snapshot.Workspace.RootPath, 45*time.Second, command)
+	execution := runManagedCommandWithFallback(snapshot.Workspace.RootPath, 45*time.Second, command)
 	durationMS := int(time.Since(started).Milliseconds())
 	commandPreview := shellPreview(command)
 	runtimes, _ := DetectRuntimes(dataDir)
@@ -437,6 +443,15 @@ func applyEvalScenarioToPacket(packet *IssueContextPacket, scenario EvalScenario
 	packet.AvailableVerificationProfiles = verificationProfiles
 	packet.TicketContexts = ticketContexts
 	packet.BrowserDumps = browserDumps
+	packet.RetrievalLedger = buildContextRetrievalLedger(
+		packet.Issue,
+		packet.TreeFocus,
+		packet.EvidenceBundle,
+		packet.RelatedPaths,
+		guidance,
+		packet.DynamicContext,
+		packet.MatchedPathInstructions,
+	)
 	packet.Prompt = strings.Join(summaryLines, "\n") + "\n\n" + buildIssueContextPrompt(
 		packet.Workspace,
 		packet.Issue,
@@ -451,6 +466,7 @@ func applyEvalScenarioToPacket(packet *IssueContextPacket, scenario EvalScenario
 		packet.RelatedPaths,
 		packet.RepoMap,
 		packet.DynamicContext,
+		packet.RetrievalLedger,
 		packet.RepoConfig,
 		packet.MatchedPathInstructions,
 	)

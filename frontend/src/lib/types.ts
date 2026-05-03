@@ -228,6 +228,8 @@ export type AppSettings = {
   codex_args?: string | null
   codex_model?: string | null
   opencode_model?: string | null
+  postgres_dsn?: string | null
+  postgres_schema?: string
 }
 
 export type LocalAgentCapabilities = {
@@ -282,7 +284,7 @@ export type RepoMapSymbolRecord = {
 }
 
 export type RelatedContextRecord = {
-  artifact_type: 'ticket_context' | 'threat_model' | 'browser_dump' | 'fix_record' | 'activity' | 'run'
+  artifact_type: 'ticket_context' | 'threat_model' | 'browser_dump' | 'vulnerability_finding' | 'fix_record' | 'activity' | 'run'
   artifact_id: string
   title: string
   path?: string | null
@@ -291,8 +293,68 @@ export type RelatedContextRecord = {
   score: number
 }
 
+export type ContextRetrievalLedgerEntry = {
+  entry_id: string
+  source_type: 'evidence' | 'related_path' | 'symbol' | 'semantic_match' | 'artifact' | 'guidance' | 'path_instruction'
+  source_id: string
+  title: string
+  path?: string | null
+  reason: string
+  matched_terms: string[]
+  score: number
+}
+
+export type SemanticPatternMatchRecord = {
+  path: string
+  language?: string | null
+  line_start?: number | null
+  line_end?: number | null
+  column_start?: number | null
+  column_end?: number | null
+  matched_text: string
+  context_lines?: string | null
+  meta_variables: string[]
+  reason?: string | null
+  score: number
+}
+
+export type SemanticQueryMaterializationRecord = {
+  query_ref: string
+  workspace_id: string
+  issue_id?: string | null
+  run_id?: string | null
+  source: 'adhoc_tool' | 'issue_context'
+  reason?: string | null
+  pattern: string
+  language?: string | null
+  path_glob?: string | null
+  engine: 'ast_grep' | 'none'
+  match_count: number
+  truncated: boolean
+  error?: string | null
+}
+
+export type SemanticMatchMaterializationRecord = {
+  query_ref: string
+  workspace_id: string
+  path: string
+  language?: string | null
+  line_start?: number | null
+  line_end?: number | null
+  column_start?: number | null
+  column_end?: number | null
+  matched_text: string
+  context_lines?: string | null
+  meta_variables: string[]
+  reason?: string | null
+  score: number
+}
+
 export type DynamicContextBundle = {
   symbol_context: RepoMapSymbolRecord[]
+  semantic_matches: SemanticPatternMatchRecord[]
+  semantic_queries: SemanticQueryMaterializationRecord[]
+  semantic_match_rows: SemanticMatchMaterializationRecord[]
   related_context: RelatedContextRecord[]
 }
 
@@ -357,8 +419,10 @@ export type IssueContextPacket = {
   ticket_contexts: TicketContextRecord[]
   threat_models: ThreatModelRecord[]
   browser_dumps: BrowserDumpRecord[]
+  vulnerability_findings: VulnerabilityFindingRecord[]
   repo_map?: RepoMapSummary | null
   dynamic_context?: DynamicContextBundle | null
+  retrieval_ledger: ContextRetrievalLedgerEntry[]
   repo_config?: RepoConfigRecord | null
   matched_path_instructions: RepoPathInstructionMatch[]
   worktree?: WorktreeStatus | null
@@ -729,6 +793,29 @@ export type BrowserDumpUpsertRequest = {
   network_requests?: string[]
   screenshot_path?: string | null
   notes?: string | null
+}
+
+export type VulnerabilityFindingRecord = {
+  finding_id: string
+  workspace_id: string
+  issue_id: string
+  scanner: string
+  source: 'manual' | 'semgrep' | 'codeql' | 'snyk' | 'osv_scanner' | 'grype' | 'trivy' | 'other'
+  severity: 'critical' | 'high' | 'medium' | 'low' | 'info'
+  status: 'open' | 'accepted' | 'fixed' | 'dismissed'
+  title: string
+  summary: string
+  rule_id?: string | null
+  location_path?: string | null
+  location_line?: number | null
+  cwe_ids: string[]
+  cve_ids: string[]
+  references: string[]
+  evidence: string[]
+  threat_model_ids: string[]
+  raw_payload?: string | null
+  created_at: string
+  updated_at: string
 }
 
 export type RunReviewDisposition = 'dismissed' | 'investigation_only'

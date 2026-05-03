@@ -317,12 +317,12 @@ exit 1
 		t.Fatalf("write settings: %v", err)
 	}
 
-	original := runManagedPlanningCommand
-	runManagedPlanningCommand = func(ctx context.Context, workspaceRoot string, timeoutSeconds int, commandArgs []string) (*rustcore.ManagedCommandResult, error) {
+	original := runManagedCommand
+	runManagedCommand = func(ctx context.Context, workspaceRoot string, timeoutSeconds int, commandArgs []string) (*rustcore.ManagedCommandResult, error) {
 		return nil, errors.New("bridge unavailable")
 	}
 	defer func() {
-		runManagedPlanningCommand = original
+		runManagedCommand = original
 	}()
 
 	plan, err := callAgentForPlan(dataDir, "opencode", "fake/test-model", repoRoot, "Generate a structured plan")

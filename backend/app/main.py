@@ -21,6 +21,7 @@ from .models import (
     IssueUpdateRequest,
     PlanApproveRequest,
     PlanRejectRequest,
+    PlanTrackingUpdateRequest,
     PromoteSignalRequest,
     RunAcceptRequest,
     RuntimeProbeRequest,
@@ -439,6 +440,46 @@ def read_drift(workspace_id: str):
 def read_worktree(workspace_id: str):
     try:
         return SERVICE.read_worktree_status(workspace_id).model_dump(mode="json")
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+
+
+@app.get("/api/workspaces/{workspace_id}/repo-state")
+def read_repo_state(workspace_id: str):
+    try:
+        return SERVICE.read_repo_tool_state(workspace_id).model_dump(mode="json")
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+
+
+@app.get("/api/workspaces/{workspace_id}/ingestion-plan")
+def read_ingestion_plan(workspace_id: str):
+    try:
+        return SERVICE.read_ingestion_plan(workspace_id).model_dump(mode="json")
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+
+
+@app.get("/api/workspaces/{workspace_id}/changes")
+def read_changes(workspace_id: str, base_ref: str = Query(default="HEAD")):
+    try:
+        return SERVICE.read_change_summary(workspace_id, base_ref=base_ref).model_dump(mode="json")
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+
+
+@app.get("/api/workspaces/{workspace_id}/run-targets")
+def list_run_targets(workspace_id: str):
+    try:
+        return [item.model_dump(mode="json") for item in SERVICE.list_run_targets(workspace_id)]
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+
+
+@app.get("/api/workspaces/{workspace_id}/verify-targets")
+def list_verify_targets(workspace_id: str):
+    try:
+        return [item.model_dump(mode="json") for item in SERVICE.list_verify_targets(workspace_id)]
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="Workspace not found")
 
@@ -862,6 +903,16 @@ def approve_plan(workspace_id: str, run_id: str, request: PlanApproveRequest):
 def reject_plan(workspace_id: str, run_id: str, request: PlanRejectRequest):
     try:
         return SERVICE.reject_run_plan(workspace_id, run_id, request)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.patch("/api/workspaces/{workspace_id}/runs/{run_id}/plan/tracking")
+def update_plan_tracking(workspace_id: str, run_id: str, request: PlanTrackingUpdateRequest):
+    try:
+        return SERVICE.update_run_plan_tracking(workspace_id, run_id, request)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     except ValueError as exc:

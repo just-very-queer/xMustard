@@ -60,6 +60,9 @@ func TestBuildIssueContextPacketBuildsFrontendShapeFromArtifacts(t *testing.T) {
 	if packet.DynamicContext == nil || len(packet.DynamicContext.SymbolContext) == 0 || len(packet.DynamicContext.RelatedContext) == 0 {
 		t.Fatalf("expected dynamic context bundle, got %#v", packet.DynamicContext)
 	}
+	if len(packet.RetrievalLedger) == 0 || !hasRetrievalSource(packet.RetrievalLedger, "symbol") || !hasRetrievalSource(packet.RetrievalLedger, "artifact") {
+		t.Fatalf("expected retrieval ledger with symbol and artifact entries, got %#v", packet.RetrievalLedger)
+	}
 	if packet.RepoConfig == nil || packet.RepoConfig.SourcePath == nil || *packet.RepoConfig.SourcePath != ".xmustard.yaml" {
 		t.Fatalf("expected repo config, got %#v", packet.RepoConfig)
 	}
@@ -80,6 +83,9 @@ func TestBuildIssueContextPacketBuildsFrontendShapeFromArtifacts(t *testing.T) {
 	}
 	if !strings.Contains(packet.Prompt, "Symbol context:") || !strings.Contains(packet.Prompt, "Related artifacts:") {
 		t.Fatalf("prompt missing dynamic context sections:\n%s", packet.Prompt)
+	}
+	if !strings.Contains(packet.Prompt, "Retrieval ledger:") {
+		t.Fatalf("prompt missing retrieval ledger section:\n%s", packet.Prompt)
 	}
 	if !strings.Contains(packet.Prompt, "Repo config:") || !strings.Contains(packet.Prompt, "Path-specific guidance:") || !strings.Contains(packet.Prompt, "browser-dump") {
 		t.Fatalf("prompt missing repo config sections:\n%s", packet.Prompt)
@@ -366,6 +372,15 @@ func writeIssueContextFixture(t *testing.T, withRunbook bool) (string, string, s
 func containsVerificationCommand(items []rustcore.VerificationProfileInput, command string) bool {
 	for _, item := range items {
 		if strings.Contains(item.TestCommand, command) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasRetrievalSource(items []ContextRetrievalLedgerEntry, sourceType string) bool {
+	for _, item := range items {
+		if item.SourceType == sourceType {
 			return true
 		}
 	}

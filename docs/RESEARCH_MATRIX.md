@@ -29,7 +29,12 @@ xMustard status:
 
 - guidance discovery exists
 - onboarding warning exists
-- guided file generation does not exist yet
+- starter generation exists for `AGENTS.md`, `.openhands/microagents/repo.md`, and `CONVENTIONS.md`
+- guidance health can report missing and stale starter surfaces
+
+Remaining gap:
+
+- guided customization should help operators turn starter files into repo-specific instructions without leaving the app
 
 ### 2. Repo map and structural context
 
@@ -42,7 +47,8 @@ xMustard status:
 
 - issue context packets exist
 - structural repo maps and ranked related paths exist
-- symbol ranking and enclosing-scope context do not exist yet
+- symbol ranking and retrieval-backed related artifacts exist
+- enclosing-scope context and inspectable "why this symbol/file" explanations are still shallow
 
 ### 3. Replay and eval infrastructure
 
@@ -57,7 +63,13 @@ Seen in:
 xMustard status:
 
 - activity and run artifacts exist
-- replayable eval scenarios are still missing
+- issue-context replays exist
+- saved eval scenarios exist
+- fresh replay batches, baseline comparisons, and rank movement reports exist
+
+Remaining gap:
+
+- multi-batch scenario timelines and movement explanations are still thin
 
 ### 4. Verification profiles
 
@@ -70,7 +82,11 @@ xMustard status:
 
 - coverage/test suggestion artifacts exist
 - saved per-workspace verification commands exist
-- replayable verification outcomes are still missing
+- replayable profile outcomes, checklist results, confidence scoring, and runtime/model/branch reports exist
+
+Remaining gap:
+
+- longer-running verification confidence trends should be tied more directly to eval timelines and review packets
 
 ### 5. Provider-style review packets
 
@@ -82,7 +98,11 @@ Seen in:
 xMustard status:
 
 - critique and improvements exist
-- export-ready review packets and PR-style handoff are still missing
+- run insights, ticket context, threat models, verification records, fixes, and export bundles exist
+
+Remaining gap:
+
+- a first-class PR-style issue review packet should combine these artifacts into one handoff
 
 ### 6. Threat modeling and exploitability review
 
@@ -98,13 +118,19 @@ xMustard status:
 
 - issue-level threat models now exist as durable artifacts
 - prompts can now carry assets, trust boundaries, abuse cases, and mitigations
-- deeper security review automation and exploitability scoring are still missing
+- vulnerability findings, import batches, lifecycle summaries, and issue-level security reporting exist in the backend lane
+
+Remaining gap:
+
+- deeper analyst disposition, exploitability, risk acceptance, suppression, verification linkage, and exportable security review packets are still missing
 
 ## Recommended Build Order
 
-1. Starter guidance generation
-2. Repo map and dynamic context
-3. Threat-model depth and security review
-4. Verification profiles and replay
-5. Eval and replay harness
-6. Review packet export
+1. Retrieval ledger and symbol-aware dynamic context
+2. Multi-batch eval and verification timelines
+3. Threat-model, vulnerability, and security-review depth
+4. Runtime, verification, and budget policy records
+5. Review packet export
+6. Guided guidance customization
+
+For a build-oriented version of this list, see [docs/FRONTIER.md](./FRONTIER.md).

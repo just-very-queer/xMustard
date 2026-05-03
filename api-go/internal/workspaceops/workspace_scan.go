@@ -85,6 +85,7 @@ func ScanWorkspace(dataDir string, workspaceID string) (*workspaceSnapshot, erro
 	issues = annotateReviewReady(issues, runs, fixes, runReviews)
 	issues = normalizeIssueEvidence(root, issues)
 	issues = applyIssueDrift(root, issues)
+	issues = normalizeIssueSlices(issues)
 
 	rustSignals, err := rustcore.ScanSignals(context.Background(), root)
 	if err != nil {
@@ -150,6 +151,33 @@ func ScanWorkspace(dataDir string, workspaceID string) (*workspaceSnapshot, erro
 		return nil, err
 	}
 	return snapshot, nil
+}
+
+func normalizeIssueSlices(issues []issueRecord) []issueRecord {
+	for idx := range issues {
+		if issues[idx].Evidence == nil {
+			issues[idx].Evidence = []evidenceRef{}
+		}
+		if issues[idx].VerificationEvidence == nil {
+			issues[idx].VerificationEvidence = []evidenceRef{}
+		}
+		if issues[idx].TestsAdded == nil {
+			issues[idx].TestsAdded = []string{}
+		}
+		if issues[idx].TestsPassed == nil {
+			issues[idx].TestsPassed = []string{}
+		}
+		if issues[idx].DriftFlags == nil {
+			issues[idx].DriftFlags = []string{}
+		}
+		if issues[idx].Labels == nil {
+			issues[idx].Labels = []string{}
+		}
+		if issues[idx].ReviewReadyRuns == nil {
+			issues[idx].ReviewReadyRuns = []string{}
+		}
+	}
+	return issues
 }
 
 func latestBugLedger(root string) string {

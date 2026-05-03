@@ -145,6 +145,59 @@ class ActivityLedgerTests(unittest.TestCase):
             self.assertEqual(export_payload["activity"][0]["run_id"], "run_test_001")
             self.assertEqual(export_payload["activity"][0]["issue_id"], "P0_25M03_001")
 
+    def test_ingestion_plan_api_exposes_phase_readiness(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service, workspace_id = self._create_service(tmp_dir)
+            root = Path(service.get_workspace(workspace_id).root_path)
+            (root / "package.json").write_text('{"name":"fixture","scripts":{"dev":"vite","test":"vitest run"}}', encoding="utf-8")
+            (root / "Makefile").write_text("backend:\n\tpython3 -m uvicorn app.main:app\n", encoding="utf-8")
+            service.update_settings(
+                service.get_settings().model_copy(
+                    update={
+                        "postgres_dsn": "postgresql://xmustard:secret@localhost:5432/xmustard",
+                        "postgres_schema": "agent_context",
+                    }
+                )
+            )
+
+            with patch.object(app_main, "SERVICE", service):
+                with patch("app.service.tree_sitter_available", return_value=True):
+                    with patch("app.service.shutil.which", return_value="/opt/homebrew/bin/sg"):
+                        with TestClient(app_main.app) as client:
+                            response = client.get(f"/api/workspaces/{workspace_id}/ingestion-plan")
+
+            self.assertEqual(response.status_code, 200)
+            payload = response.json()
+            self.assertEqual(payload["next_phase_id"], "tree_sitter_index")
+            self.assertIn("tree_sitter_index", payload["ready_phase_ids"])
+            self.assertIn("search_materialization", payload["blocked_phase_ids"])
+
+    def test_fastapi_path_symbols_route_is_not_registered_after_go_cutover(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service, workspace_id = self._create_service(tmp_dir)
+
+            with patch.object(app_main, "SERVICE", service):
+                with TestClient(app_main.app) as client:
+                    response = client.get(
+                        f"/api/workspaces/{workspace_id}/path-symbols",
+                        params={"path": "api/src/example.py"},
+                    )
+
+            self.assertEqual(response.status_code, 404)
+
+    def test_fastapi_semantic_search_route_is_not_registered_after_go_cutover(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service, workspace_id = self._create_service(tmp_dir)
+
+            with patch.object(app_main, "SERVICE", service):
+                with TestClient(app_main.app) as client:
+                    response = client.get(
+                        f"/api/workspaces/{workspace_id}/semantic-search",
+                        params={"pattern": "def $A():", "language": "python"},
+                    )
+
+            self.assertEqual(response.status_code, 404)
+
 
 if __name__ == "__main__":
     unittest.main()

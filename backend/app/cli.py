@@ -1,7 +1,6 @@
-from __future__ import annotations
-
 import json
 from pathlib import Path
+import subprocess
 import time
 from typing import Optional
 
@@ -22,6 +21,7 @@ from .models import (
     IssueUpdateRequest,
     PlanApproveRequest,
     PlanRejectRequest,
+    PlanTrackingUpdateRequest,
     PromoteSignalRequest,
     RunAcceptRequest,
     RunReviewRequest,
@@ -40,6 +40,8 @@ from .service import TrackerService
 from .store import FileStore
 
 app = typer.Typer(add_completion=False, no_args_is_help=True)
+semantic_index_app = typer.Typer(add_completion=False, no_args_is_help=True)
+app.add_typer(semantic_index_app, name="semantic-index")
 store = FileStore(Path(__file__).resolve().parents[1] / "data")
 service = TrackerService(store)
 
@@ -72,6 +74,17 @@ def _parse_json_value(value: str):
         return value
 
 
+def _parse_optional_bool(value: str) -> Optional[bool]:
+    normalized = value.strip().lower()
+    if not normalized:
+        return None
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    raise typer.BadParameter("expected true or false")
+
+
 def _parse_settings(settings: list[str], settings_json: str = "") -> dict:
     payload: dict = {}
     if settings_json:
@@ -101,6 +114,71 @@ def _echo_ok(**payload) -> None:
     _echo_json({"ok": True, **payload})
 
 
+def _run_go_ops(args: list[str]) -> str:
+    api_go_dir = Path(__file__).resolve().parents[2] / "api-go"
+    command = ["go", "run", "./cmd/xmustard-ops", *args, "--data-dir", str(service.store.root.resolve())]
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=api_go_dir,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        typer.echo(f"go xmustard-ops failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    if completed.returncode != 0:
+        message = completed.stderr.strip() or completed.stdout.strip() or "go xmustard-ops failed"
+        typer.echo(message, err=True)
+        raise typer.Exit(code=1)
+    return completed.stdout
+
+
+def _run_go_ops_json(args: list[str]):
+    stdout = _run_go_ops(args)
+    try:
+        return json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        typer.echo(f"Invalid JSON from Go xmustard-ops: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+
+def _run_go_postgres_json(action: str, flags: Optional[list[str]] = None):
+    return _run_go_ops_json(["postgres", action, *(flags or [])])
+
+
+def _run_go_postgres_text(action: str, flags: Optional[list[str]] = None) -> str:
+    return _run_go_ops(["postgres", action, *(flags or [])])
+
+
+def _run_go_workspace_json(action: str, workspace_id: str, flags: Optional[list[str]] = None):
+    return _run_go_ops_json(["workspace", action, workspace_id, *(flags or [])])
+
+
+def _run_go_semantic_index(action: str, workspace_id: str, *, surface: str, strategy: str, paths: list[str], limit: int, dsn: Optional[str] = None, schema: Optional[str] = None, dry_run: bool = False):
+    args = [
+        "semantic-index",
+        action,
+        workspace_id,
+        "--surface",
+        surface,
+        "--strategy",
+        strategy,
+        "--limit",
+        str(limit),
+    ]
+    for item in paths:
+        args.extend(["--path", item])
+    if dsn:
+        args.extend(["--dsn", dsn])
+    if schema:
+        args.extend(["--schema", schema])
+    if dry_run:
+        args.append("--dry-run")
+    return _run_go_ops_json(args)
+
+
 @app.command("health")
 def health() -> None:
     _echo_json({"status": "ok"})
@@ -120,8 +198,8 @@ def workspaces() -> None:
 def load_workspace(
     root_path: str,
     name: str = typer.Option(default=""),
-    auto_scan: bool = typer.Option(default=True),
-    prefer_cached_snapshot: bool = typer.Option(default=True),
+    auto_scan: bool = typer.Option(True, "--auto-scan"),
+    prefer_cached_snapshot: bool = typer.Option(True, "--prefer-cached-snapshot"),
 ) -> None:
     snapshot = service.load_workspace(
         WorkspaceLoadRequest(
@@ -176,6 +254,8 @@ def settings_set(
     codex_args: str = typer.Option(default=""),
     codex_model: str = typer.Option(default=""),
     opencode_model: str = typer.Option(default=""),
+    postgres_dsn: str = typer.Option(default=""),
+    postgres_schema: str = typer.Option(default="xmustard"),
 ) -> None:
     current = service.get_settings()
     updated = current.model_copy(
@@ -186,9 +266,45 @@ def settings_set(
             "codex_args": codex_args or None,
             "codex_model": codex_model or None,
             "opencode_model": opencode_model or None,
+            "postgres_dsn": postgres_dsn or None,
+            "postgres_schema": postgres_schema,
         }
     )
     _echo_json(service.update_settings(updated).model_dump(mode="json"))
+
+
+@app.command("postgres-plan")
+def postgres_plan() -> None:
+    _echo_json(_run_go_postgres_json("plan"))
+
+
+@app.command("postgres-render")
+def postgres_render(
+    schema: str = typer.Option(default=""),
+    output: str = typer.Option(default=""),
+) -> None:
+    flags = []
+    if schema:
+        flags.extend(["--schema", schema])
+    payload = _run_go_postgres_text("render", flags)
+    if output:
+        Path(output).write_text(payload, encoding="utf-8")
+        typer.echo(output)
+        return
+    typer.echo(payload)
+
+
+@app.command("postgres-bootstrap")
+def postgres_bootstrap(
+    dsn: str = typer.Option(default=""),
+    schema: str = typer.Option(default=""),
+) -> None:
+    flags = []
+    if dsn:
+        flags.extend(["--dsn", dsn])
+    if schema:
+        flags.extend(["--schema", schema])
+    _echo_json(_run_go_postgres_json("bootstrap", flags))
 
 
 @app.command("export")
@@ -235,10 +351,10 @@ def issues(
     issue_status: str = typer.Option(default=""),
     source: str = typer.Option(default=""),
     label: str = typer.Option(default=""),
-    drift_only: bool = typer.Option(default=False),
-    needs_followup: bool = typer.Option(default=False),
-    followup_only: bool = typer.Option(default=False),
-    review_ready_only: bool = typer.Option(default=False),
+    drift_only: bool = typer.Option(False, "--drift-only"),
+    needs_followup: bool = typer.Option(False, "--needs-followup"),
+    followup_only: bool = typer.Option(False, "--followup-only"),
+    review_ready_only: bool = typer.Option(False, "--review-ready-only"),
 ) -> None:
     payload = [
         item.model_dump(mode="json")
@@ -269,7 +385,7 @@ def issue_create(
     labels: str = typer.Option(default=""),
     notes: str = typer.Option(default=""),
     source_doc: str = typer.Option(default=""),
-    needs_followup: bool = typer.Option(default=False),
+    needs_followup: bool = typer.Option(False, "--needs-followup"),
 ) -> None:
     payload = service.create_issue(
         workspace_id,
@@ -294,7 +410,7 @@ def signals(
     workspace_id: str,
     q: str = typer.Option(default=""),
     severity: str = typer.Option(default=""),
-    promoted: Optional[bool] = typer.Option(default=None),
+    promoted: str = typer.Option(default=""),
 ) -> None:
     payload = [
         item.model_dump(mode="json")
@@ -302,7 +418,7 @@ def signals(
             workspace_id,
             query=q,
             severity=severity or None,
-            promoted=promoted,
+            promoted=_parse_optional_bool(promoted),
         )
     ]
     _echo_json(payload)
@@ -518,6 +634,215 @@ def worktree(workspace_id: str) -> None:
     _echo_json(service.read_worktree_status(workspace_id).model_dump(mode="json"))
 
 
+@app.command("repo-state")
+def repo_state(workspace_id: str) -> None:
+    _echo_json(service.read_repo_tool_state(workspace_id).model_dump(mode="json"))
+
+
+@app.command("ingestion-plan")
+def ingestion_plan(workspace_id: str) -> None:
+    _echo_json(service.read_ingestion_plan(workspace_id).model_dump(mode="json"))
+
+
+@semantic_index_app.command("plan")
+def semantic_index_plan(
+    workspace_id: str,
+    surface: str = typer.Option("cli", "--surface", help="cli | web | all"),
+    strategy: str = typer.Option("key_files", "--strategy", help="key_files | paths"),
+    path: list[str] = typer.Option([], "--path"),
+    limit: int = typer.Option(12, "--limit"),
+    dsn: str = typer.Option("", "--dsn"),
+) -> None:
+    _echo_json(
+        _run_go_semantic_index(
+            "plan",
+            workspace_id,
+            surface=surface,
+            strategy=strategy,
+            paths=path,
+            limit=limit,
+            dsn=dsn or None,
+        )
+    )
+
+
+@semantic_index_app.command("run")
+def semantic_index_run(
+    workspace_id: str,
+    surface: str = typer.Option("cli", "--surface", help="cli | web | all"),
+    strategy: str = typer.Option("key_files", "--strategy", help="key_files | paths"),
+    path: list[str] = typer.Option([], "--path"),
+    limit: int = typer.Option(12, "--limit"),
+    dsn: str = typer.Option("", "--dsn"),
+    schema: str = typer.Option("", "--schema"),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+) -> None:
+    _echo_json(
+        _run_go_semantic_index(
+            "run",
+            workspace_id,
+            surface=surface,
+            strategy=strategy,
+            paths=path,
+            limit=limit,
+            dsn=dsn or None,
+            schema=schema or None,
+            dry_run=dry_run,
+        )
+    )
+
+
+@semantic_index_app.command("status")
+def semantic_index_status(
+    workspace_id: str,
+    surface: str = typer.Option("cli", "--surface", help="cli | web | all"),
+    strategy: str = typer.Option("key_files", "--strategy", help="key_files | paths"),
+    path: list[str] = typer.Option([], "--path"),
+    limit: int = typer.Option(12, "--limit"),
+    dsn: str = typer.Option("", "--dsn"),
+    schema: str = typer.Option("", "--schema"),
+) -> None:
+    _echo_json(
+        _run_go_semantic_index(
+            "status",
+            workspace_id,
+            surface=surface,
+            strategy=strategy,
+            paths=path,
+            limit=limit,
+            dsn=dsn or None,
+            schema=schema or None,
+        )
+    )
+
+
+@app.command("changes")
+def changes(workspace_id: str, base_ref: str = typer.Option(default="HEAD")) -> None:
+    _echo_json(service.read_change_summary(workspace_id, base_ref=base_ref).model_dump(mode="json"))
+
+
+@app.command("changed-symbols")
+def changed_symbols(workspace_id: str, base_ref: str = typer.Option(default="HEAD")) -> None:
+    _echo_json(_run_go_workspace_json("changed-symbols", workspace_id, ["--base-ref", base_ref]))
+
+
+@app.command("changed-since-last-run")
+def changed_since_last_run(workspace_id: str) -> None:
+    _echo_json(service.read_changes_since_last_run(workspace_id).model_dump(mode="json"))
+
+
+@app.command("changed-since-last-accepted-fix")
+def changed_since_last_accepted_fix(workspace_id: str) -> None:
+    _echo_json(service.read_changes_since_last_accepted_fix(workspace_id).model_dump(mode="json"))
+
+
+@app.command("impact")
+def impact(workspace_id: str, base_ref: str = typer.Option(default="HEAD")) -> None:
+    _echo_json(_run_go_workspace_json("impact", workspace_id, ["--base-ref", base_ref]))
+
+
+@app.command("repo-context")
+def repo_context(workspace_id: str, base_ref: str = typer.Option(default="HEAD")) -> None:
+    _echo_json(_run_go_workspace_json("repo-context", workspace_id, ["--base-ref", base_ref]))
+
+
+@app.command("retrieval-search")
+def retrieval_search(workspace_id: str, query: str = typer.Option(...), limit: int = typer.Option(default=12)) -> None:
+    _echo_json(_run_go_workspace_json("retrieval-search", workspace_id, ["--query", query, "--limit", str(limit)]))
+
+
+@app.command("run-targets")
+def run_targets(workspace_id: str) -> None:
+    _echo_json([item.model_dump(mode="json") for item in service.list_run_targets(workspace_id)])
+
+
+@app.command("verify-targets")
+def verify_targets(workspace_id: str) -> None:
+    _echo_json([item.model_dump(mode="json") for item in service.list_verify_targets(workspace_id)])
+
+
+@app.command("code-explainer")
+def code_explainer(workspace_id: str, path: str = typer.Option(...)) -> None:
+    _echo_json(_run_go_workspace_json("explain-path", workspace_id, ["--path", path]))
+
+
+@app.command("path-symbols")
+def path_symbols(workspace_id: str, path: str = typer.Option(...)) -> None:
+    _echo_json(_run_go_workspace_json("path-symbols", workspace_id, ["--path", path]))
+
+
+@app.command("postgres-materialize-path")
+def postgres_materialize_path(
+    workspace_id: str,
+    path: str = typer.Option(...),
+    dsn: str = typer.Option(default=""),
+    schema: str = typer.Option(default=""),
+) -> None:
+    flags = ["--path", path]
+    if dsn:
+        flags.extend(["--dsn", dsn])
+    if schema:
+        flags.extend(["--schema", schema])
+    _echo_json(_run_go_workspace_json("postgres-materialize-path", workspace_id, flags))
+
+
+@app.command("postgres-materialize-workspace-symbols")
+def postgres_materialize_workspace_symbols(
+    workspace_id: str,
+    strategy: str = typer.Option(default="key_files"),
+    path: list[str] = typer.Option(default=[]),
+    limit: int = typer.Option(default=12),
+    dsn: str = typer.Option(default=""),
+    schema: str = typer.Option(default=""),
+) -> None:
+    flags = ["--strategy", strategy, "--limit", str(limit)]
+    for item in path:
+        flags.extend(["--select-path", item])
+    if dsn:
+        flags.extend(["--dsn", dsn])
+    if schema:
+        flags.extend(["--schema", schema])
+    _echo_json(_run_go_workspace_json("postgres-materialize-workspace-symbols", workspace_id, flags))
+
+
+@app.command("semantic-search")
+def semantic_search(
+    workspace_id: str,
+    pattern: str = typer.Option(...),
+    language: str = typer.Option(default=""),
+    path_glob: str = typer.Option(default=""),
+    limit: int = typer.Option(default=50),
+) -> None:
+    flags = ["--pattern", pattern, "--limit", str(limit)]
+    if language:
+        flags.extend(["--language", language])
+    if path_glob:
+        flags.extend(["--path-glob", path_glob])
+    _echo_json(_run_go_workspace_json("semantic-search", workspace_id, flags))
+
+
+@app.command("postgres-materialize-semantic-search")
+def postgres_materialize_semantic_search(
+    workspace_id: str,
+    pattern: str = typer.Option(...),
+    language: str = typer.Option(default=""),
+    path_glob: str = typer.Option(default=""),
+    limit: int = typer.Option(default=50),
+    dsn: str = typer.Option(default=""),
+    schema: str = typer.Option(default=""),
+) -> None:
+    flags = ["--pattern", pattern, "--limit", str(limit)]
+    if language:
+        flags.extend(["--language", language])
+    if path_glob:
+        flags.extend(["--path-glob", path_glob])
+    if dsn:
+        flags.extend(["--dsn", dsn])
+    if schema:
+        flags.extend(["--schema", schema])
+    _echo_json(_run_go_workspace_json("postgres-materialize-semantic-search", workspace_id, flags))
+
+
 @app.command("tree")
 def tree(workspace_id: str, relative_path: str = typer.Option(default="")) -> None:
     _echo_json(service.list_tree(workspace_id, relative_path))
@@ -537,7 +862,7 @@ def guidance_health(workspace_id: str) -> None:
 def guidance_generate(
     workspace_id: str,
     template_id: str = typer.Option(..., help="agents | openhands_repo | conventions"),
-    overwrite: bool = typer.Option(default=False),
+    overwrite: bool = typer.Option(False, "--overwrite"),
 ) -> None:
     payload = service.generate_guidance_starter(
         workspace_id,
@@ -750,7 +1075,7 @@ def eval_scenario_replay(
     scenario_ids: str = typer.Option(default=""),
     instruction: str = typer.Option(default=""),
     runbook_id: str = typer.Option(default=""),
-    planning: bool = typer.Option(default=False),
+    planning: bool = typer.Option(False, "--planning"),
 ) -> None:
     _echo_json(
         service.replay_eval_scenarios(
@@ -983,7 +1308,7 @@ def issue_update(
     code_status: str = typer.Option(default=""),
     labels: str = typer.Option(default=""),
     notes: str = typer.Option(default=""),
-    needs_followup: bool = typer.Option(default=False),
+    needs_followup: bool = typer.Option(False, "--needs-followup"),
 ) -> None:
     payload = service.update_issue(
         workspace_id,
@@ -1168,7 +1493,7 @@ def run_start(
     instruction: str = typer.Option(default=""),
     runbook_id: str = typer.Option(default=""),
     eval_scenario_id: str = typer.Option(default=""),
-    planning: bool = typer.Option(default=False),
+    planning: bool = typer.Option(False, "--planning"),
 ) -> None:
     payload = service.start_issue_run(
         workspace_id,
@@ -1272,6 +1597,31 @@ def plan_reject(workspace_id: str, run_id: str, reason: str = typer.Option(...))
     _echo_json(service.reject_run_plan(workspace_id, run_id, PlanRejectRequest(reason=reason)))
 
 
+@app.command("plan-track")
+def plan_track(
+    workspace_id: str,
+    run_id: str,
+    ownership_mode: str = typer.Option(default=""),
+    owner_label: str = typer.Option(default=""),
+    attached_file: list[str] = typer.Option(default=[]),
+    replace_attachments: bool = typer.Option(False, "--replace-attachments"),
+    feedback: str = typer.Option(default=""),
+) -> None:
+    _echo_json(
+        service.update_run_plan_tracking(
+            workspace_id,
+            run_id,
+            PlanTrackingUpdateRequest(
+                ownership_mode=ownership_mode or None,
+                owner_label=owner_label or None,
+                attached_files=attached_file,
+                replace_attachments=replace_attachments,
+                feedback=feedback or None,
+            ),
+        )
+    )
+
+
 @app.command("run-review")
 def run_review(
     workspace_id: str,
@@ -1335,9 +1685,9 @@ def view_save(
     issue_status: str = typer.Option(default=""),
     source: str = typer.Option(default=""),
     label: str = typer.Option(default=""),
-    drift_only: bool = typer.Option(default=False),
-    followup_only: bool = typer.Option(default=False),
-    review_ready_only: bool = typer.Option(default=False),
+    drift_only: bool = typer.Option(False, "--drift-only"),
+    followup_only: bool = typer.Option(False, "--followup-only"),
+    review_ready_only: bool = typer.Option(False, "--review-ready-only"),
 ) -> None:
     payload = service.create_saved_view(
         workspace_id,
@@ -1366,9 +1716,9 @@ def view_update(
     issue_status: str = typer.Option(default=""),
     source: str = typer.Option(default=""),
     label: str = typer.Option(default=""),
-    drift_only: bool = typer.Option(default=False),
-    followup_only: bool = typer.Option(default=False),
-    review_ready_only: bool = typer.Option(default=False),
+    drift_only: bool = typer.Option(False, "--drift-only"),
+    followup_only: bool = typer.Option(False, "--followup-only"),
+    review_ready_only: bool = typer.Option(False, "--review-ready-only"),
 ) -> None:
     payload = service.update_saved_view(
         workspace_id,
@@ -1438,7 +1788,7 @@ def github_pr(
     base_branch: str = typer.Option(default="main"),
     title: str = typer.Option(default=""),
     body: str = typer.Option(default=""),
-    draft: bool = typer.Option(default=False),
+    draft: bool = typer.Option(False, "--draft"),
 ) -> None:
     _echo_json(
         service.create_github_pr(

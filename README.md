@@ -1,122 +1,122 @@
 # xMustard
 
-xMustard is a local, issue-first bug operations system for engineering repositories. It treats bugs, runs, review artifacts, and verification evidence as first-class records instead of burying them inside a chat transcript.
+xMustard is a local repo-intelligence and operational-memory tool for coding agents.
 
-This codebase started as `Co_Titan_Bug_Tracker` and has been evolving using concrete patterns from the research repos under `research/`.
+The point is not to become another tracker. The point is to give an agent a trustworthy answer to:
 
-## Product Shape
+- what changed
+- what matters
+- what is already known
+- how to run and verify the repo
+- what plan or prior run owns the current work
 
-The current product already supports:
+Current development focus is the CLI semantic-runtime layer. The web UI exists, but the active product trench is making the backend and CLI good enough to serve tools like MustardCoPilot.
+
+Phase 3 is now the Python-exit and ownership-shift phase:
+
+- Go should own API delivery and request shaping
+- Rust should own semantic meaning, symbol extraction, impact ranking, and diagnostics normalization
+- Postgres should remain the durable semantic state layer
+- Python should keep shrinking toward compatibility-only status until it can be deleted slice by slice
+
+The first Phase 3 authority cuts are already landed:
+
+- Go owns API delivery for `impact`, `repo-context`, and `retrieval-search`
+- Rust owns semantic impact calculation, changed-symbol extraction, provenance, and affected file/test ranking
+- Rust owns on-demand `path-symbols` extraction, the code-explainer semantic substrate, and storage-ready symbol materialization rows consumed by Go delivery and Python compatibility fallback
+- Go now also owns the Postgres foundation delivery slice for settings-backed schema plan/render/bootstrap
+- Go now owns the live semantic-search plus Postgres semantic materialization HTTP slice for `path-symbols/materialize`, `semantic-index/materialize`, and `semantic-search/materialize`
+- The Python Typer CLI now delegates the shipped Go-owned repo-intelligence, changed-symbols, path-symbol/explainer, semantic-search, Postgres foundation, and semantic materialization surfaces through `api-go/cmd/xmustard-ops` instead of reopening `TrackerService` for those commands
+- FastAPI no longer registers the single-path `path-symbols` and `explain-path` routes now owned by Go delivery over Rust semantic-core output
+- Go runtime probes now use Rust `run-managed-command` for bounded execution by default, and Go-owned cancellation/terminal close paths tear down process groups more reliably; long-lived run launch/cancel/log streaming remains a mixed-mode runtime boundary until Rust has a managed-run/session contract
+
+Completion audit truth on 2026-05-03: xMustard is still mixed-mode, not Python-exited. Go and Rust own the shipped Phase 3 semantic/Postgres/repo-intelligence slices, and the Python compatibility shell no longer imports Postgres helpers or keeps private semantic implementations for those migrated surfaces. Python still remains in shipped authority through remaining FastAPI routes, broad Typer compatibility commands, `TrackerService` orchestration outside the migrated slices, issue-context semantic pattern derivation, and persistence glue.
+
+## What xMustard Is
+
+xMustard combines two things that usually live in separate products:
+
+- semantic repo intelligence: repo state, file and symbol context, semantic indexing, structural search, and runtime discovery
+- ops memory: issues, plans, runs, verification profiles, threat models, ticket context, activity history, and review artifacts
+
+That combination is the moat. Repo-only intelligence without durable memory is too shallow. Tracker-only memory without repo truth is too noisy.
+
+## What Exists Today
+
+The current codebase already has working surfaces for:
 
 - workspace loading and repo scanning
-- issue queues, discovery signals, drift tracking, and saved views
-- planning-gated agent runs
-- run cost and token metrics
-- triage analysis: quality scoring, duplicate detection, triage suggestions
-- verification artifacts: coverage deltas, test suggestions, patch critique, improvement suggestions
-- issue-level threat models with assets, trust boundaries, abuse cases, and mitigations
-- issue-level browser dumps for MCP/manual browser-state capture and shared UI debugging context
-- issue-context replay comparison so saved prompt snapshots can be diffed against the current issue packet
-- verification profile checklists, confidence scoring, durable per-profile run history, and report breakdowns by runtime, model, and branch
-- dynamic symbol context and retrieval-backed related artifacts inside issue packets
-- saved eval scenarios and workspace eval reports that correlate replay drift, run metrics, and verification outcomes
-- workspace eval variant comparisons that now show selected guidance/ticket values, cost, and unique-run rollups across context variants
-- baseline-aware eval scenario comparisons that explain how each saved variant differs from the issue baseline on inputs, outcomes, cost, and speed
-- per-profile verification history deltas inside eval baseline comparisons, so saved context variants can be compared on success/checklist/confidence behavior instead of only aggregate verification percentages
-- fresh scenario execution from the eval pane, using pinned context selections and writing new runs back into the saved scenario automatically
-- batch replay of saved eval scenarios for one issue, with fresh-run summaries and fresh-vs-baseline execution deltas shown inside the eval report
-- workspace eval reports now rank fresh replay outcomes across all saved scenarios for the same issue, using pairwise fresh-run comparisons instead of only baseline pairs
-- workspace eval reports now show fresh replay rank movement versus the previous fresh run for each scenario, so context experiments can be compared over time
-- replay batches are now persisted explicitly, and fresh replay trend views now compare the latest batch against the previous batch when batch history exists
-- fresh replay trend views now prefer explicit replay-batch history over ad hoc previous-run inference, so experiment comparisons are inspectable and durable
-- repository guidance discovery from files like `AGENTS.md`, `CONVENTIONS.md`, `.devin/wiki.json`, `.openhands/skills/*.md`, and `.openhands/microagents/repo.md`
-- starter guidance generation and guidance health for `AGENTS.md`, `.openhands/microagents/repo.md`, and `CONVENTIONS.md`
-- repo-native `.xmustard.yaml` config support for path-specific instructions, code-guideline references, and MCP/browser-context hints that attach directly to issue packets
-- run insights that summarize what guidance shaped a run and what risks remain
+- worktree state: branch, head, dirty paths, staged and untracked state
+- issue records, signals, critiques, improvements, and review artifacts
+- plan tracking with ownership, revision history, and attached files
+- verification profiles and verification history
+- ticket context, threat models, vulnerability records, and browser dumps
+- terminal transport and runtime launching
+- issue-context packets and replay artifacts
+- repo guidance discovery from files like `AGENTS.md` and repo-native config
+- CLI surfaces for repo state, changes, run targets, verify targets, changed symbols, impact, repo context, code explainer, path symbols, and semantic index planning
 
-## Stack
+Phase 2 work now also includes:
 
-- `backend/`: FastAPI API, Typer CLI, JSON-backed persistence
-- `frontend/`: Vite, React, TypeScript
-- `rust-core/`: compiled core for scanner, repo-map, coverage, and verification migration work
-- `api-go/`: Go API shell that now owns a large share of the live HTTP surface
-- runtimes: `codex`, `opencode`, plus room for more runtime adapters
+- `semantic-index plan`
+- `semantic-index run`
+- `semantic-index status`
+- durable semantic index baseline storage in Postgres
+- stored symbol and semantic row read paths
+- freshness states such as `fresh`, `stale`, `dirty_provisional`, `no_baseline`, and `blocked`
+- provenance-aware symbol evidence in `path-symbols` and `code-explainer`
+- `changed-symbols`, `changed-since-last-run`, and `changed-since-last-accepted-fix`
+- `impact`, `repo-context`, and `retrieval-search`
+- retrieval-ledger output and stronger derivation metadata across the CLI context surfaces
+- live Postgres-backed semantic indexing and readback
+- live `ast-grep` semantic search and semantic match persistence
 
-Longer-term platform direction:
+Phase 3 work now includes:
 
-- keep the current product contracts stable while incrementally moving backend-heavy subsystems toward a Rust core and evaluating a Go API shell for the HTTP layer
+- Go-owned repo-intelligence read delivery for `impact`, `repo-context`, and `retrieval-search`
+- Rust-owned semantic-impact generation consumed by Go delivery
+- Rust-owned on-demand path-symbol extraction consumed by Go `path-symbols` delivery
+- Rust-owned code-explainer substrate for `explain-path`, including path role, line/import counts, detected symbols, summary, hints, and provenance
+- Rust-owned file-symbol summary and symbol-row shaping for on-demand `path-symbols`, so Python compatibility no longer has to shape those Postgres-ready rows when stored semantic state is absent
+- Go-owned semantic-search and semantic materialization delivery for the live HTTP paths that write path-symbol, workspace semantic-index batch, and semantic-search rows into Postgres
+- Go-owned CLI delivery for the same migrated repo-intelligence, changed-symbols, and semantic/Postgres surfaces via `xmustard-ops`, with Python retaining the old command names as a compatibility shell
+- a durable Python exit map to track what still belongs in Python temporarily and what should move next
 
-## Migration Status
+## What This Repo Is Becoming
 
-The migration is active, not hypothetical anymore.
+The near-term target is a CLI-first agent cockpit for a single repo.
 
-Rust currently owns or supports:
+Phase 2 is done only when xMustard can answer, through typed CLI and backend surfaces:
 
-- signal scanning
-- repo-map generation
-- coverage parsing
-- verification command execution
-- verification profile execution
+- what changed since the last useful baseline
+- which symbols and files matter
+- whether semantic state is trustworthy
+- what commands run the project
+- what verification targets matter
+- what plans, fixes, and runs are connected to the current change
 
-The Go shell now owns most day-to-day app flows, including:
+We are not treating “feature count” as progress. If the system cannot ground an agent in repo reality, the work is not finished.
 
-- workspace list/load/scan/snapshot/activity/sources/tree/guidance/repo-map/export/worktree
-- issue reads and mutations
-- issue context/work/replays
-- verification profiles, coverage, ticket context, and threat models
-- run creation, workspace query runs, run reads, review flows, plans, metrics, critique, and improvements
-- runtime/settings routes and terminal transport
+## Repo Layout
 
-The Python CLI now mirrors the tracker and review surface much more closely too, including:
-
-- verification profiles, ticket context, threat models, context replays, and browser dumps
-- plan, metrics, coverage, critique, and improvement flows
-- integrations, tree/guidance/repo-map inspection, and terminal transport
-
-The main remaining migration slice is provider integrations:
-
-- integration config and test
-- GitHub import and PR creation
-- Slack notifications
-- Linear sync
-- Jira sync
-
-## Workflow
-
-1. Load a repo into a workspace snapshot.
-2. Ingest canonical issues and lightweight discovery signals.
-3. Build an issue context packet with evidence, prior fixes, activity, and repo guidance.
-4. Start a planning run or direct run against a runtime.
-5. Review logs, plans, costs, critique, improvements, and session insights.
-6. Record fixes and verification outcomes with coverage and test suggestions.
-
-## Why The Research Matters
-
-The strongest patterns repeated across the local research repos are:
-
-- repo-specific instructions beat generic prompting
-- dynamic context beats dumping the whole repo
-- verification loops matter more than raw generation speed
-- post-run review artifacts make agent output inspectable
-- benchmark and replay infrastructure keeps the system honest
-
-Those themes now shape both the product and the roadmap.
-
-## Next Strategic Lanes
-
-The strongest gaps still on the roadmap are:
-
-- guidance authoring instead of guidance detection alone
-- deeper symbol-aware repo maps beyond packet-level dynamic context
-- broader eval and replay harness automation beyond saved scenarios and reporting
-- threat modeling, security review, and compliance artifacts beyond current run-level acceptance review
-- semantic retrieval beyond the current lexical artifact-ranking layer
-- governance, insights, and agent operations for team workflows
-- incremental backend migration away from the current Python-heavy core
+- `backend/`: FastAPI app, Typer CLI, models, scanners, runtimes, persistence, and semantic-index work
+- `backend/tests/`: backend regression coverage
+- `frontend/`: React and TypeScript UI surface
+- `api-go/`: Go HTTP shell and migration surface
+- `rust-core/`: Rust acceleration and parity work for repo intelligence and verification
+- `research/`: local reference repos used for product and architecture study; ignored from git
+- `docs/`: local planning and handoff notes; ignored from git
 
 ## Development
 
-Backend:
+Go API shell for migrated request surfaces:
+
+```bash
+cd api-go
+XMUSTARD_API_PORT=8042 go run ./cmd/xmustard-api
+```
+
+Python compatibility shell:
 
 ```bash
 cd backend
@@ -124,7 +124,9 @@ python3 -m pip install .
 uvicorn app.main:app --reload --port 8042
 ```
 
-Frontend:
+The Python shell is compatibility-only for the routes and CLI workflows that have been delegated, but it is not gone. Several FastAPI routes and many Typer commands still call `TrackerService`; treat the repo as mixed-mode until those paths are moved or deleted with replacement proof. In particular, `path-symbols`, `explain-path`, and `changed-symbols` no longer need Python as their shipped delivery owner.
+
+Frontend setup:
 
 ```bash
 cd frontend
@@ -132,7 +134,7 @@ npm install
 npm run dev
 ```
 
-Useful checks:
+Core checks:
 
 ```bash
 cd backend
@@ -146,21 +148,20 @@ npm run build
 
 The frontend expects the backend at `http://127.0.0.1:8042`.
 
-## Research Repos
+## Research Direction
 
-Reference implementations are available locally under `research/`.
+The strongest patterns pulled from local research work are:
 
-| Repo | Main lesson pulled into xMustard |
-|------|---------------------------------|
-| `OpenHands` | repository instructions, microagents, resolver flows |
-| `aider` | repo map mindset, git-aware coding loop, lint/test verification |
-| `pr-agent` | dynamic context, critique and review summaries |
-| `qodo-cover` | coverage-first verification and record/replay testing |
-| `trIAge` | issue quality and duplicate triage |
-| `cline` | approvals, skills, and repo instruction surfaces |
-| `SWE-agent` | trajectories, reproducible task configs, eval mindset |
-| `auto-code-rover` | structure-aware planning and staged execution |
+- repo-specific instructions beat generic prompting
+- semantic retrieval beats blind file dumps
+- verification loops matter more than raw generation speed
+- post-run review artifacts make agent output inspectable
+- replay and eval infrastructure keep the system honest
 
-See [docs/RESEARCH_FINDINGS.md](docs/RESEARCH_FINDINGS.md), [docs/RESEARCH_MATRIX.md](docs/RESEARCH_MATRIX.md), [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), and [docs/PLANNING.md](docs/PLANNING.md) for the current synthesis.
+The biggest current frontier is making stored semantic truth and ops memory work together cleanly enough that another runtime can consume xMustard as a reliable tool.
 
-Migration work now also has a dedicated working note in [docs/MIGRATION_RUST_GO.md](docs/MIGRATION_RUST_GO.md).
+Phase 3 starts from a simpler rule than the earlier closeout loops: external validation workspaces can help prove tool consumption, but they do not define whether xMustard itself is complete. The next real bar is reducing Python authority in shipped request paths and semantic-core logic, not reopening Phase 2 status arguments.
+
+Phase 2 final closeout truth on 2026-05-02: the implementation surfaces are live and Phase 2 is complete for xMustard itself. The CLI semantic-runtime layer is in place: `semantic-index`, `path-symbols`, `code-explainer`, `changed-symbols`, `changed-since-last-run`, `changed-since-last-accepted-fix`, `impact`, `repo-context`, `retrieval-search`, and `semantic-search` all exist, and the Postgres plus `ast-grep` semantic path is proven live.
+
+MustardCoPilot was added to xMustard as a workspace for live validation, not merged into this repo. That external workspace was useful for proving tool consumption, but its dirty worktree is not a gating condition for Phase 2 completion. The real closeout hiccup was procedural: we let external validation status act like a product-completion requirement. That dependency is now dropped. Optional downstream validation can stay dirty, stale, or provisional without changing the fact that xMustard Phase 2 is done.

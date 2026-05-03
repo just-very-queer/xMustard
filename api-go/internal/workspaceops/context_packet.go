@@ -91,6 +91,17 @@ type RelatedContextRecord struct {
 	Score        int      `json:"score"`
 }
 
+type ContextRetrievalLedgerEntry struct {
+	EntryID      string   `json:"entry_id"`
+	SourceType   string   `json:"source_type"`
+	SourceID     string   `json:"source_id"`
+	Title        string   `json:"title"`
+	Path         *string  `json:"path,omitempty"`
+	Reason       string   `json:"reason"`
+	MatchedTerms []string `json:"matched_terms"`
+	Score        int      `json:"score"`
+}
+
 type DynamicContextBundle struct {
 	SymbolContext  []RepoMapSymbolRecord  `json:"symbol_context"`
 	RelatedContext []RelatedContextRecord `json:"related_context"`
@@ -113,6 +124,7 @@ type IssueContextPacket struct {
 	BrowserDumps                  []BrowserDumpRecord                 `json:"browser_dumps"`
 	RepoMap                       *rustcore.RepoMapSummary            `json:"repo_map,omitempty"`
 	DynamicContext                *DynamicContextBundle               `json:"dynamic_context,omitempty"`
+	RetrievalLedger               []ContextRetrievalLedgerEntry       `json:"retrieval_ledger"`
 	RepoConfig                    *RepoConfigRecord                   `json:"repo_config,omitempty"`
 	MatchedPathInstructions       []RepoPathInstructionMatch          `json:"matched_path_instructions"`
 	Worktree                      *WorktreeStatus                     `json:"worktree,omitempty"`
@@ -209,6 +221,7 @@ func BuildIssueContextPacket(dataDir string, workspaceID string, issueID string)
 	}
 	worktree := readWorktreeStatus(snapshot.Workspace.RootPath)
 	dynamicContext := buildDynamicContext(snapshot.Workspace, *issue, treeFocus, ticketContexts, threatModels, browserDumps, recentFixes, recentActivity, relatedPaths)
+	retrievalLedger := buildContextRetrievalLedger(*issue, treeFocus, evidenceBundle, relatedPaths, guidance, dynamicContext, matchedPathInstructions)
 
 	packet := &IssueContextPacket{
 		Issue:                         *issue,
@@ -227,6 +240,7 @@ func BuildIssueContextPacket(dataDir string, workspaceID string, issueID string)
 		BrowserDumps:                  browserDumps,
 		RepoMap:                       repoMap,
 		DynamicContext:                dynamicContext,
+		RetrievalLedger:               retrievalLedger,
 		RepoConfig:                    repoConfig,
 		MatchedPathInstructions:       matchedPathInstructions,
 		Worktree:                      worktree,
@@ -245,6 +259,7 @@ func BuildIssueContextPacket(dataDir string, workspaceID string, issueID string)
 		packet.RelatedPaths,
 		packet.RepoMap,
 		packet.DynamicContext,
+		packet.RetrievalLedger,
 		packet.RepoConfig,
 		packet.MatchedPathInstructions,
 	)
@@ -762,6 +777,193 @@ func buildDynamicContext(
 	}
 }
 
+func buildContextRetrievalLedger(
+	issue issueRecord,
+	treeFocus []string,
+	evidenceBundle []evidenceRef,
+	relatedPaths []string,
+	guidance []RepoGuidanceRecord,
+	dynamicContext *DynamicContextBundle,
+	matchedPathInstructions []RepoPathInstructionMatch,
+) []ContextRetrievalLedgerEntry {
+	tokens := contextTokens(issue, nil)
+	entries := []ContextRetrievalLedgerEntry{}
+	seen := map[string]struct{}{}
+	focusSet := map[string]struct{}{}
+	ptr := func(value string) *string {
+		return &value
+	}
+	atLeastOne := func(value int) int {
+		if value < 1 {
+			return 1
+		}
+		return value
+	}
+	for _, path := range treeFocus {
+		focusSet[path] = struct{}{}
+	}
+
+	matchTerms := func(parts ...string) []string {
+		haystack := strings.ToLower(strings.Join(parts, " "))
+		matches := []string{}
+		for _, token := range tokens[:min(len(tokens), 12)] {
+			if strings.Contains(haystack, token) {
+				matches = append(matches, token)
+			}
+		}
+		return matches[:min(len(matches), 4)]
+	}
+	push := func(entry ContextRetrievalLedgerEntry) {
+		key := entry.SourceType + "\x00" + entry.SourceID
+		if _, exists := seen[key]; exists {
+			return
+		}
+		seen[key] = struct{}{}
+		entries = append(entries, entry)
+	}
+
+	for idx, evidence := range evidenceBundle[:min(len(evidenceBundle), 8)] {
+		path := evidence.Path
+		if evidence.NormalizedPath != nil && strings.TrimSpace(*evidence.NormalizedPath) != "" {
+			path = *evidence.NormalizedPath
+		}
+		ref := path
+		if evidence.Line != nil {
+			ref = fmt.Sprintf("%s:%d", path, *evidence.Line)
+		}
+		excerpt := ""
+		if evidence.Excerpt != nil {
+			excerpt = *evidence.Excerpt
+		}
+		push(ContextRetrievalLedgerEntry{
+			EntryID:      fmt.Sprintf("evidence:%d:%s", idx, path),
+			SourceType:   "evidence",
+			SourceID:     ref,
+			Title:        ref,
+			Path:         ptr(path),
+			Reason:       "Direct evidence attached to the issue.",
+			MatchedTerms: matchTerms(path, excerpt),
+			Score:        12 - idx,
+		})
+	}
+
+	for idx, path := range relatedPaths[:min(len(relatedPaths), 8)] {
+		matches := matchTerms(path)
+		reason := "Ranked from repo-map paths and issue terms."
+		if _, ok := focusSet[path]; ok {
+			reason = "Direct evidence path."
+		}
+		push(ContextRetrievalLedgerEntry{
+			EntryID:      "related_path:" + path,
+			SourceType:   "related_path",
+			SourceID:     path,
+			Title:        path,
+			Path:         ptr(path),
+			Reason:       reason,
+			MatchedTerms: matches,
+			Score:        atLeastOne(10 - idx + len(matches)),
+		})
+	}
+
+	if dynamicContext != nil {
+		for _, symbol := range dynamicContext.SymbolContext[:min(len(dynamicContext.SymbolContext), 8)] {
+			line := 0
+			if symbol.LineStart != nil {
+				line = *symbol.LineStart
+			}
+			sourceID := fmt.Sprintf("%s:%s:%d", symbol.Path, symbol.Symbol, line)
+			reason := "Ranked from symbol names near issue-related files."
+			if symbol.Reason != nil && strings.TrimSpace(*symbol.Reason) != "" {
+				reason = *symbol.Reason
+			}
+			scope := ""
+			if symbol.EnclosingScope != nil {
+				scope = *symbol.EnclosingScope
+			}
+			push(ContextRetrievalLedgerEntry{
+				EntryID:      "symbol:" + sourceID,
+				SourceType:   "symbol",
+				SourceID:     sourceID,
+				Title:        symbol.Kind + " " + symbol.Symbol,
+				Path:         ptr(symbol.Path),
+				Reason:       reason,
+				MatchedTerms: matchTerms(symbol.Path, symbol.Symbol, scope),
+				Score:        symbol.Score,
+			})
+		}
+		for _, artifact := range dynamicContext.RelatedContext[:min(len(dynamicContext.RelatedContext), 8)] {
+			reason := "Ranked from related operational artifacts."
+			if artifact.Reason != nil && strings.TrimSpace(*artifact.Reason) != "" {
+				reason = *artifact.Reason
+			}
+			sourceID := artifact.ArtifactType + ":" + artifact.ArtifactID
+			push(ContextRetrievalLedgerEntry{
+				EntryID:      "artifact:" + sourceID,
+				SourceType:   "artifact",
+				SourceID:     sourceID,
+				Title:        artifact.Title,
+				Path:         artifact.Path,
+				Reason:       reason,
+				MatchedTerms: artifact.MatchedTerms,
+				Score:        artifact.Score,
+			})
+		}
+	}
+
+	for idx, item := range guidance[:min(len(guidance), replayGuidanceLimit)] {
+		push(ContextRetrievalLedgerEntry{
+			EntryID:      "guidance:" + item.Path,
+			SourceType:   "guidance",
+			SourceID:     item.Path,
+			Title:        firstNonEmpty(item.Title, item.Path),
+			Path:         ptr(item.Path),
+			Reason:       "Repository guidance selected for the issue prompt.",
+			MatchedTerms: matchTerms(item.Path, item.Title, item.Summary),
+			Score:        atLeastOne(6 - idx),
+		})
+	}
+
+	for idx, item := range matchedPathInstructions[:min(len(matchedPathInstructions), 6)] {
+		title := item.Path
+		if item.Title != nil && strings.TrimSpace(*item.Title) != "" {
+			title = *item.Title
+		}
+		push(ContextRetrievalLedgerEntry{
+			EntryID:      "path_instruction:" + item.InstructionID,
+			SourceType:   "path_instruction",
+			SourceID:     item.InstructionID,
+			Title:        title,
+			Path:         ptr(item.SourcePath),
+			Reason:       "Path-specific instruction matched ranked issue files.",
+			MatchedTerms: matchTerms(item.Path, strings.Join(item.MatchedPaths, " "), item.Instructions),
+			Score:        atLeastOne(8 - idx),
+		})
+	}
+
+	slices.SortFunc(entries, func(a, b ContextRetrievalLedgerEntry) int {
+		if a.Score != b.Score {
+			if a.Score > b.Score {
+				return -1
+			}
+			return 1
+		}
+		if a.SourceType != b.SourceType {
+			if a.SourceType < b.SourceType {
+				return -1
+			}
+			return 1
+		}
+		if strings.ToLower(a.Title) < strings.ToLower(b.Title) {
+			return -1
+		}
+		if strings.ToLower(a.Title) > strings.ToLower(b.Title) {
+			return 1
+		}
+		return 0
+	})
+	return entries[:min(len(entries), 32)]
+}
+
 func extractSymbolContext(root string, candidatePaths []string, tokens []string) []RepoMapSymbolRecord {
 	results := []RepoMapSymbolRecord{}
 	seen := map[string]struct{}{}
@@ -1006,6 +1208,7 @@ func buildIssueContextPrompt(
 	relatedPaths []string,
 	repoMap *rustcore.RepoMapSummary,
 	dynamicContext *DynamicContextBundle,
+	retrievalLedger []ContextRetrievalLedgerEntry,
 	repoConfig *RepoConfigRecord,
 	matchedPathInstructions []RepoPathInstructionMatch,
 ) string {
@@ -1269,6 +1472,24 @@ func buildIssueContextPrompt(
 	if len(relatedArtifactLines) == 0 {
 		relatedArtifactLines = append(relatedArtifactLines, "- No related artifacts ranked yet.")
 	}
+	retrievalLines := []string{}
+	for _, item := range retrievalLedger[:min(len(retrievalLedger), 10)] {
+		path := ""
+		if item.Path != nil && strings.TrimSpace(*item.Path) != "" {
+			path = " [" + *item.Path + "]"
+		}
+		matched := ""
+		if len(item.MatchedTerms) > 0 {
+			matched = " matches " + strings.Join(item.MatchedTerms[:min(len(item.MatchedTerms), 3)], ", ")
+		}
+		retrievalLines = append(
+			retrievalLines,
+			fmt.Sprintf("- %s %s%s: %s%s (score %d)", item.SourceType, item.Title, path, item.Reason, matched, item.Score),
+		)
+	}
+	if len(retrievalLines) == 0 {
+		retrievalLines = append(retrievalLines, "- No retrieval ledger entries recorded yet.")
+	}
 
 	pathInstructionLines := []string{}
 	for _, item := range matchedPathInstructions[:min(len(matchedPathInstructions), 6)] {
@@ -1311,6 +1532,7 @@ func buildIssueContextPrompt(
 		"Ranked related paths:\n" + relatedLines + "\n\n" +
 		"Symbol context:\n" + strings.Join(symbolLines, "\n") + "\n\n" +
 		"Related artifacts:\n" + strings.Join(relatedArtifactLines, "\n") + "\n\n" +
+		"Retrieval ledger:\n" + strings.Join(retrievalLines, "\n") + "\n\n" +
 		"Repository guidance:\n" + strings.Join(guidanceLines, "\n") + "\n\n" +
 		"Known verification profiles:\n" + strings.Join(verificationLines, "\n") + "\n\n" +
 		"Priority files:\n" + focusLines + "\n\n" +

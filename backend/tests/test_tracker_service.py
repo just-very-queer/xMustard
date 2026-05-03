@@ -6,10 +6,12 @@ from unittest.mock import patch
 
 from app.models import (
     BrowserDumpUpsertRequest,
+    CodeExplainerResult,
     DiscoverySignal,
     EvidenceRef,
     EvalScenarioUpsertRequest,
     EvalReplayBatchRecord,
+    FileSymbolSummaryMaterializationRecord,
     FixRecordRequest,
     ImprovementSuggestion,
     GuidanceStarterRequest,
@@ -17,6 +19,22 @@ from app.models import (
     IssueCreateRequest,
     IssueUpdateRequest,
     PatchCritique,
+    PathSymbolsResult,
+    PlanFileAttachment,
+    PlanApproveRequest,
+    PlanStep,
+    PlanTrackingUpdateRequest,
+    PostgresBootstrapResult,
+    PostgresSemanticMaterializationResult,
+    PostgresWorkspaceSemanticMaterializationResult,
+    RepoMapSymbolRecord,
+    RunPlan,
+    SemanticIndexBaselineRecord,
+    SemanticIndexStatus,
+    SemanticPatternMatchRecord,
+    SemanticPatternQueryResult,
+    SemanticQueryMaterializationRecord,
+    SemanticMatchMaterializationRecord,
     RunRecord,
     RunAcceptRequest,
     RunMetrics,
@@ -33,6 +51,7 @@ from app.models import (
     VulnerabilityFindingUpsertRequest,
     WorktreeStatus,
     WorkspaceLoadRequest,
+    SymbolMaterializationRecord,
 )
 from app.runtimes import RuntimeService
 from app.service import TrackerService
@@ -823,6 +842,7 @@ reviews:
             self.assertTrue(
                 any(item.artifact_type == "vulnerability_finding" for item in (packet.dynamic_context.related_context if packet.dynamic_context else []))
             )
+            self.assertTrue(any(item.source_id.startswith("vulnerability_finding:") for item in packet.retrieval_ledger))
 
     def test_vulnerability_import_batches_are_recorded_with_lifecycle_summaries(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -1247,11 +1267,75 @@ reviews:
             self.assertIn("Ranked related paths:", packet.prompt)
             self.assertIn("Symbol context:", packet.prompt)
             self.assertIn("Related artifacts:", packet.prompt)
+            self.assertIn("Retrieval ledger:", packet.prompt)
             self.assertTrue(any(path.startswith("backend") or path.startswith("tests") for path in packet.related_paths))
             self.assertIsNotNone(packet.dynamic_context)
             assert packet.dynamic_context is not None
             self.assertTrue(packet.dynamic_context.symbol_context)
             self.assertTrue(packet.dynamic_context.related_context)
+            self.assertTrue(packet.retrieval_ledger)
+            self.assertTrue(any(item.source_type in {"stored_symbol", "on_demand_symbol"} for item in packet.retrieval_ledger))
+            self.assertTrue(any(item.source_type == "artifact" for item in packet.retrieval_ledger))
+
+    def test_issue_context_includes_semantic_matches_when_ast_grep_hits(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "repo"
+            (root / "docs" / "bugs").mkdir(parents=True)
+            (root / "api" / "src").mkdir(parents=True)
+            (root / "docs" / "bugs" / "Bugs_25260323.md").write_text(LEDGER_TEXT, encoding="utf-8")
+            (root / "api" / "src" / "example.py").write_text(
+                "def render_payload():\n    return {'status': 'ok'}\n",
+                encoding="utf-8",
+            )
+
+            store = FileStore(Path(tmp_dir) / "data")
+            service = TrackerService(store)
+            snapshot = service.load_workspace(WorkspaceLoadRequest(root_path=str(root), auto_scan=True))
+            assert snapshot is not None
+
+            created = service.create_issue(
+                snapshot.workspace.workspace_id,
+                IssueCreateRequest(
+                    title="render_payload export regression",
+                    severity="P1",
+                    summary="render_payload fails during CSV export.",
+                    labels=["export", "backend"],
+                ),
+            )
+
+            fake_matches = [
+                SemanticPatternMatchRecord(
+                    path="api/src/example.py",
+                    language="python",
+                    line_start=1,
+                    line_end=1,
+                    column_start=1,
+                    column_end=21,
+                    matched_text="def render_payload():",
+                    context_lines="def render_payload():",
+                    meta_variables=[],
+                )
+            ]
+
+            with patch("app.service.ast_grep_available", return_value=True):
+                with patch(
+                    "app.service.run_ast_grep_query",
+                    return_value=(fake_matches, "/opt/homebrew/bin/sg", None, False),
+                ):
+                    packet = service.build_issue_context(snapshot.workspace.workspace_id, created.bug_id)
+
+            assert packet.dynamic_context is not None
+            self.assertTrue(packet.dynamic_context.semantic_matches)
+            self.assertEqual(packet.dynamic_context.semantic_matches[0].path, "api/src/example.py")
+            self.assertTrue(packet.dynamic_context.semantic_queries)
+            self.assertTrue(packet.dynamic_context.semantic_match_rows)
+            self.assertEqual(packet.dynamic_context.semantic_queries[0].source, "issue_context")
+            self.assertEqual(
+                packet.dynamic_context.semantic_match_rows[0].query_ref,
+                packet.dynamic_context.semantic_queries[0].query_ref,
+            )
+            self.assertIn("Semantic matches:", packet.prompt)
+            self.assertTrue(any(item.source_type == "semantic_match" for item in packet.retrieval_ledger))
 
     def test_run_session_insight_reports_guidance_and_review_findings(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -2292,6 +2376,1424 @@ class RuntimeSummaryTests(unittest.TestCase):
                 if item.scenario_id == scenario.scenario_id
             )
             self.assertIn("run_eval_exec_001", updated.run_ids)
+
+    def test_repo_tool_surfaces_cover_state_targets_changes_and_explainer(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "repo"
+            (root / "docs" / "bugs").mkdir(parents=True)
+            (root / "api" / "src").mkdir(parents=True)
+            (root / "frontend").mkdir(parents=True)
+            (root / "docs" / "bugs" / "Bugs_25260323.md").write_text(LEDGER_TEXT, encoding="utf-8")
+            source_file = root / "api" / "src" / "example.py"
+            source_file.write_text("import json\n\ndef render_payload():\n    return {'status': 'ok'}\n", encoding="utf-8")
+            (root / "package.json").write_text(
+                json.dumps({"name": "fixture", "scripts": {"dev": "vite", "build": "vite build", "test": "vitest run"}}),
+                encoding="utf-8",
+            )
+            (root / "Makefile").write_text("backend:\n\tpython3 -m uvicorn app.main:app\nlint:\n\techo lint\n", encoding="utf-8")
+            (root / "docker-compose.yml").write_text("services:\n  api:\n    image: example\n", encoding="utf-8")
+
+            __import__("subprocess").run(["git", "-C", str(root), "init"], check=True, capture_output=True)
+            __import__("subprocess").run(["git", "-C", str(root), "add", "."], check=True, capture_output=True)
+            __import__("subprocess").run(
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "-c",
+                    "user.name=xmustard",
+                    "-c",
+                    "user.email=xmustard@example.com",
+                    "commit",
+                    "-m",
+                    "initial",
+                ],
+                check=True,
+                capture_output=True,
+            )
+
+            store = FileStore(Path(tmp_dir) / "data")
+            service = TrackerService(store)
+            snapshot = service.load_workspace(WorkspaceLoadRequest(root_path=str(root), auto_scan=True))
+            assert snapshot is not None
+
+            service.save_verification_profile(
+                snapshot.workspace.workspace_id,
+                VerificationProfileUpsertRequest(
+                    profile_id="backend-pytest",
+                    name="Backend pytest",
+                    test_command="pytest -q",
+                ),
+            )
+
+            source_file.write_text("import json\n\ndef render_payload():\n    return {'status': 'changed'}\n", encoding="utf-8")
+
+            repo_state = service.read_repo_tool_state(snapshot.workspace.workspace_id)
+            self.assertEqual(repo_state.workspace.workspace_id, snapshot.workspace.workspace_id)
+            self.assertIn("issues_total", repo_state.snapshot_summary)
+
+            run_targets = service.list_run_targets(snapshot.workspace.workspace_id)
+            self.assertTrue(any(item.command == "npm run dev" for item in run_targets))
+            self.assertTrue(any(item.command == "make backend" for item in run_targets))
+
+            verify_targets = service.list_verify_targets(snapshot.workspace.workspace_id)
+            self.assertTrue(any(item.command == "pytest -q" for item in verify_targets))
+            self.assertTrue(any(item.command == "npm run test" for item in verify_targets))
+
+            changes = service.read_change_summary(snapshot.workspace.workspace_id)
+            self.assertTrue(any(item.path == "api/src/example.py" for item in changes.changed_files))
+
+            explained = service.explain_path(snapshot.workspace.workspace_id, "api/src/example.py")
+            self.assertEqual(explained.role, "source")
+            self.assertIn("render_payload", explained.detected_symbols)
+            self.assertIn("api/src/example.py", explained.summary)
+
+    def test_postgres_schema_plan_and_bootstrap_follow_settings(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "repo"
+            (root / "docs" / "bugs").mkdir(parents=True)
+            (root / "api").mkdir(parents=True)
+            (root / "docs" / "bugs" / "Bugs_25260323.md").write_text(LEDGER_TEXT, encoding="utf-8")
+            (root / "api" / "main.py").write_text("print('ok')\n", encoding="utf-8")
+
+            store = FileStore(Path(tmp_dir) / "data")
+            service = TrackerService(store)
+            snapshot = service.load_workspace(WorkspaceLoadRequest(root_path=str(root), auto_scan=True))
+            assert snapshot is not None
+
+            service.update_settings(
+                service.get_settings().model_copy(
+                    update={
+                        "postgres_dsn": "postgresql://xmustard:secret@localhost:5432/xmustard",
+                        "postgres_schema": "agent_context",
+                    }
+                )
+            )
+
+            go_plan = {
+                "configured": True,
+                "dsn_redacted": "postgresql://xmustard:***@localhost:5432/xmustard",
+                "schema_name": "agent_context",
+                "sql_path": "/tmp/schema.sql",
+                "statement_count": 12,
+                "table_names": ["workspaces", "symbols", "semantic_matches", "run_plans"],
+                "semantic_table_names": ["symbols", "semantic_matches"],
+                "ops_memory_table_names": ["run_plans"],
+                "search_document_tables": ["run_plans"],
+            }
+            with patch.object(service, "_run_go_postgres_json", return_value=go_plan) as go_plan_mock:
+                plan = service.read_postgres_schema_plan()
+            self.assertTrue(plan.configured)
+            self.assertEqual(plan.schema_name, "agent_context")
+            self.assertIn("workspaces", plan.table_names)
+            self.assertIn("symbols", plan.table_names)
+            self.assertIn("semantic_matches", plan.semantic_table_names)
+            self.assertIn("run_plans", plan.ops_memory_table_names)
+            self.assertIn("run_plans", plan.search_document_tables)
+            self.assertGreater(plan.statement_count, 10)
+            go_plan_mock.assert_called_once_with("plan")
+
+            rendered_payload = (
+                "create schema if not exists agent_context;\n"
+                "create table if not exists agent_context.workspaces(id text);\n"
+                "create table if not exists agent_context.semantic_matches(id text);\n"
+                "create table if not exists agent_context.run_plans(id text);\n"
+            )
+            with patch.object(service, "_run_go_postgres_text", return_value=rendered_payload) as render_mock:
+                rendered_sql = service.render_postgres_schema_sql()
+            self.assertIn("create schema if not exists agent_context;", rendered_sql.lower())
+            self.assertIn("agent_context.workspaces", rendered_sql)
+            self.assertIn("agent_context.semantic_matches", rendered_sql)
+            self.assertIn("agent_context.run_plans", rendered_sql)
+            render_mock.assert_called_once_with("render", [])
+
+            go_bootstrap = {
+                "applied": True,
+                "dsn_redacted": "postgresql://xmustard:***@localhost:5432/xmustard",
+                "schema_name": "agent_context",
+                "sql_path": "/tmp/schema.sql",
+                "statement_count": 12,
+                "message": "Applied repo cockpit foundation schema to Postgres schema 'agent_context'.",
+            }
+            with patch.object(service, "_run_go_postgres_json", return_value=go_bootstrap) as bootstrap_mock:
+                result = service.bootstrap_postgres_schema()
+                self.assertTrue(result.applied)
+                bootstrap_mock.assert_called_once_with("bootstrap", [])
+
+    def test_postgres_materialization_surfaces_follow_settings(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "repo"
+            (root / "docs" / "bugs").mkdir(parents=True)
+            (root / "api" / "src").mkdir(parents=True)
+            (root / "docs" / "bugs" / "Bugs_25260323.md").write_text(LEDGER_TEXT, encoding="utf-8")
+            (root / "api" / "src" / "example.py").write_text("def render_payload():\n    return {'status': 'ok'}\n", encoding="utf-8")
+
+            store = FileStore(Path(tmp_dir) / "data")
+            service = TrackerService(store)
+            snapshot = service.load_workspace(WorkspaceLoadRequest(root_path=str(root), auto_scan=True))
+            assert snapshot is not None
+
+            service.update_settings(
+                service.get_settings().model_copy(
+                    update={
+                        "postgres_dsn": "postgresql://xmustard:secret@localhost:5432/xmustard",
+                        "postgres_schema": "agent_context",
+                    }
+                )
+            )
+
+            path_payload = {
+                "applied": True,
+                "dsn_redacted": "postgresql://xmustard:***@localhost:5432/xmustard",
+                "schema_name": "agent_context",
+                "workspace_id": snapshot.workspace.workspace_id,
+                "source": "path_symbols",
+                "target": "api/src/example.py",
+                "materialized_paths": ["api/src/example.py"],
+                "file_rows": 1,
+                "symbol_rows": 1,
+                "summary_rows": 1,
+                "message": "ok",
+            }
+            with patch.object(service, "_run_go_workspace_json", return_value=path_payload) as path_materialize_mock:
+                result = service.materialize_path_symbols_to_postgres(
+                    snapshot.workspace.workspace_id,
+                    "api/src/example.py",
+                )
+                self.assertTrue(result.applied)
+                path_materialize_mock.assert_called_once_with(
+                    "postgres-materialize-path",
+                    snapshot.workspace.workspace_id,
+                    ["--path", "api/src/example.py"],
+                )
+
+            search_payload = {
+                "applied": True,
+                "dsn_redacted": "postgresql://xmustard:***@localhost:5432/xmustard",
+                "schema_name": "agent_context",
+                "workspace_id": snapshot.workspace.workspace_id,
+                "source": "semantic_search",
+                "target": "def $A():",
+                "materialized_paths": ["api/src/example.py"],
+                "file_rows": 1,
+                "query_rows": 1,
+                "match_rows": 1,
+                "message": "ok",
+            }
+            with patch.object(service, "_run_go_workspace_json", return_value=search_payload) as search_materialize_mock:
+                result = service.materialize_semantic_search_to_postgres(
+                    snapshot.workspace.workspace_id,
+                    "def $A():",
+                    language="python",
+                    path_glob="api/src/**/*.py",
+                )
+                self.assertTrue(result.applied)
+                search_materialize_mock.assert_called_once_with(
+                    "postgres-materialize-semantic-search",
+                    snapshot.workspace.workspace_id,
+                    [
+                        "--pattern",
+                        "def $A():",
+                        "--limit",
+                        "50",
+                        "--language",
+                        "python",
+                        "--path-glob",
+                        "api/src/**/*.py",
+                    ],
+                )
+
+    def test_workspace_symbol_materialization_batches_key_files(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "repo"
+            (root / "docs" / "bugs").mkdir(parents=True)
+            (root / "api" / "src").mkdir(parents=True)
+            (root / "docs" / "bugs" / "Bugs_25260323.md").write_text(LEDGER_TEXT, encoding="utf-8")
+            (root / "api" / "src" / "example.py").write_text("def render_payload():\n    return {'status': 'ok'}\n", encoding="utf-8")
+            (root / "api" / "src" / "worker.py").write_text("def run_worker():\n    return True\n", encoding="utf-8")
+
+            store = FileStore(Path(tmp_dir) / "data")
+            service = TrackerService(store)
+            snapshot = service.load_workspace(WorkspaceLoadRequest(root_path=str(root), auto_scan=True))
+            assert snapshot is not None
+
+            service.update_settings(
+                service.get_settings().model_copy(
+                    update={
+                        "postgres_dsn": "postgresql://xmustard:secret@localhost:5432/xmustard",
+                        "postgres_schema": "agent_context",
+                    }
+                )
+            )
+
+            go_payload = {
+                "applied": True,
+                "dsn_redacted": "postgresql://xmustard:***@localhost:5432/xmustard",
+                "schema_name": "agent_context",
+                "workspace_id": snapshot.workspace.workspace_id,
+                "strategy": "paths",
+                "requested_paths": ["api/src/example.py", "api/src/worker.py"],
+                "materialized_paths": ["api/src/example.py", "api/src/worker.py"],
+                "skipped_paths": [],
+                "file_rows": 2,
+                "symbol_rows": 2,
+                "summary_rows": 2,
+                "message": "ok",
+            }
+            with patch.object(service, "_run_go_workspace_json", return_value=go_payload) as materialize_mock:
+                result = service.materialize_workspace_symbols_to_postgres(
+                    snapshot.workspace.workspace_id,
+                    strategy="paths",
+                    paths=["api/src/example.py", "api/src/worker.py"],
+                    limit=10,
+                )
+
+            self.assertTrue(result.applied)
+            self.assertEqual(result.strategy, "paths")
+            self.assertEqual(result.materialized_paths, ["api/src/example.py", "api/src/worker.py"])
+            self.assertEqual(result.symbol_rows, 2)
+            materialize_mock.assert_called_once_with(
+                "postgres-materialize-workspace-symbols",
+                snapshot.workspace.workspace_id,
+                [
+                    "--strategy",
+                    "paths",
+                    "--limit",
+                    "10",
+                    "--select-path",
+                    "api/src/example.py",
+                    "--select-path",
+                    "api/src/worker.py",
+                ],
+            )
+
+    def test_semantic_index_plan_prefers_cli_surface_candidates(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "repo"
+            (root / "backend" / "app").mkdir(parents=True)
+            (root / "frontend" / "src").mkdir(parents=True)
+            (root / "backend" / "app" / "cli.py").write_text("def run_cli():\n    return True\n", encoding="utf-8")
+            (root / "backend" / "app" / "service.py").write_text("def serve():\n    return True\n", encoding="utf-8")
+            (root / "frontend" / "src" / "App.tsx").write_text("export function App() { return null }\n", encoding="utf-8")
+            (root / "package.json").write_text('{"scripts":{"dev":"vite","cli":"python -m backend.app.cli"}}\n', encoding="utf-8")
+            (root / "docs" / "bugs").mkdir(parents=True)
+            (root / "docs" / "bugs" / "Bugs_25260323.md").write_text(LEDGER_TEXT, encoding="utf-8")
+
+            store = FileStore(Path(tmp_dir) / "data")
+            service = TrackerService(store)
+            snapshot = service.load_workspace(WorkspaceLoadRequest(root_path=str(root), auto_scan=True))
+            assert snapshot is not None
+            service.update_settings(
+                service.get_settings().model_copy(
+                    update={
+                        "postgres_dsn": "postgresql://xmustard:secret@localhost:5432/xmustard",
+                        "postgres_schema": "agent_context",
+                    }
+                )
+            )
+
+            plan = service.plan_semantic_index(snapshot.workspace.workspace_id, surface="cli", limit=3)
+
+            self.assertEqual(plan.surface, "cli")
+            self.assertIn("backend/app/cli.py", plan.selected_paths)
+            cli_detail = next(item for item in plan.selected_path_details if item.path == "backend/app/cli.py")
+            self.assertIn("CLI/runtime surface markers", cli_detail.reason)
+            self.assertIsNotNone(cli_detail.sha256)
+            self.assertIsNotNone(plan.index_fingerprint)
+            self.assertTrue(plan.postgres_configured)
+            self.assertGreaterEqual(plan.run_target_count, 1)
+            self.assertTrue(any(item.source_type == "semantic_index_path" for item in plan.retrieval_ledger))
+
+    def test_semantic_index_run_dry_run_returns_plan_without_materializing(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "repo"
+            (root / "api" / "src").mkdir(parents=True)
+            (root / "docs" / "bugs").mkdir(parents=True)
+            (root / "api" / "src" / "example.py").write_text("def render_payload():\n    return True\n", encoding="utf-8")
+            (root / "docs" / "bugs" / "Bugs_25260323.md").write_text(LEDGER_TEXT, encoding="utf-8")
+
+            store = FileStore(Path(tmp_dir) / "data")
+            service = TrackerService(store)
+            snapshot = service.load_workspace(WorkspaceLoadRequest(root_path=str(root), auto_scan=True))
+            assert snapshot is not None
+
+            with patch.object(service, "materialize_workspace_symbols_to_postgres") as materialize_mock:
+                result = service.run_semantic_index(
+                    snapshot.workspace.workspace_id,
+                    strategy="paths",
+                    paths=["api/src/example.py"],
+                    dry_run=True,
+                    dsn="postgresql://xmustard:secret@localhost:5432/xmustard",
+                )
+
+            self.assertTrue(result.dry_run)
+            self.assertEqual(result.plan.selected_paths, ["api/src/example.py"])
+            materialize_mock.assert_not_called()
+
+    def test_semantic_index_run_persists_postgres_baseline_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "repo"
+            (root / "api" / "src").mkdir(parents=True)
+            (root / "docs" / "bugs").mkdir(parents=True)
+            (root / "api" / "src" / "example.py").write_text("def render_payload():\n    return True\n", encoding="utf-8")
+            (root / "docs" / "bugs" / "Bugs_25260323.md").write_text(LEDGER_TEXT, encoding="utf-8")
+
+            store = FileStore(Path(tmp_dir) / "data")
+            service = TrackerService(store)
+            snapshot = service.load_workspace(WorkspaceLoadRequest(root_path=str(root), auto_scan=True))
+            assert snapshot is not None
+
+            go_payload = {
+                "workspace_id": snapshot.workspace.workspace_id,
+                "surface": "cli",
+                "dry_run": False,
+                "plan": {
+                    "workspace_id": snapshot.workspace.workspace_id,
+                    "root_path": str(root),
+                    "surface": "cli",
+                    "strategy": "paths",
+                    "requested_paths": ["api/src/example.py"],
+                    "selected_paths": ["api/src/example.py"],
+                    "index_fingerprint": "fixture_fingerprint",
+                    "postgres_configured": True,
+                    "postgres_schema": "agent_context",
+                    "can_run": True,
+                },
+                "materialization": {
+                    "applied": True,
+                    "dsn_redacted": "postgresql://xmustard:***@localhost:5432/xmustard",
+                    "schema_name": "agent_context",
+                    "workspace_id": snapshot.workspace.workspace_id,
+                    "strategy": "paths",
+                    "requested_paths": ["api/src/example.py"],
+                    "materialized_paths": ["api/src/example.py"],
+                    "file_rows": 1,
+                    "symbol_rows": 1,
+                    "summary_rows": 1,
+                    "message": "ok",
+                },
+                "message": "ok",
+            }
+            with patch.object(service, "_run_go_semantic_index_json", return_value=go_payload) as go_run_mock:
+                result = service.run_semantic_index(
+                    snapshot.workspace.workspace_id,
+                    strategy="paths",
+                    paths=["api/src/example.py"],
+                    dsn="postgresql://xmustard:secret@localhost:5432/xmustard",
+                    schema="agent_context",
+                )
+
+            self.assertFalse(result.dry_run)
+            self.assertEqual(result.materialization.symbol_rows, 1)
+            self.assertEqual(result.plan.index_fingerprint, "fixture_fingerprint")
+            go_run_mock.assert_called_once_with(
+                "run",
+                snapshot.workspace.workspace_id,
+                surface="cli",
+                strategy="paths",
+                paths=["api/src/example.py"],
+                limit=12,
+                dsn="postgresql://xmustard:secret@localhost:5432/xmustard",
+                schema="agent_context",
+                dry_run=False,
+            )
+
+    def test_semantic_index_status_reports_no_baseline(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "repo"
+            (root / "api" / "src").mkdir(parents=True)
+            (root / "docs" / "bugs").mkdir(parents=True)
+            (root / "api" / "src" / "example.py").write_text("def render_payload():\n    return True\n", encoding="utf-8")
+            (root / "docs" / "bugs" / "Bugs_25260323.md").write_text(LEDGER_TEXT, encoding="utf-8")
+
+            store = FileStore(Path(tmp_dir) / "data")
+            service = TrackerService(store)
+            snapshot = service.load_workspace(WorkspaceLoadRequest(root_path=str(root), auto_scan=True))
+            assert snapshot is not None
+
+            go_status = {
+                "workspace_id": snapshot.workspace.workspace_id,
+                "surface": "cli",
+                "status": "no_baseline",
+                "postgres_configured": True,
+                "postgres_schema": "agent_context",
+                "stale_reasons": ["No stored semantic index baseline exists for this workspace and surface."],
+            }
+            with patch.object(service, "_run_go_semantic_index_json", return_value=go_status):
+                status = service.read_semantic_index_status(
+                    snapshot.workspace.workspace_id,
+                    strategy="paths",
+                    paths=["api/src/example.py"],
+                    dsn="postgresql://xmustard:secret@localhost:5432/xmustard",
+                    schema="agent_context",
+                )
+
+            self.assertEqual(status.status, "no_baseline")
+            self.assertTrue(status.postgres_configured)
+            self.assertIn("No stored semantic index baseline", status.stale_reasons[0])
+
+    def test_semantic_index_status_detects_fresh_and_stale_fingerprint(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "repo"
+            (root / "api" / "src").mkdir(parents=True)
+            (root / "docs" / "bugs").mkdir(parents=True)
+            indexed_path = root / "api" / "src" / "example.py"
+            indexed_path.write_text("def render_payload():\n    return True\n", encoding="utf-8")
+            (root / "docs" / "bugs" / "Bugs_25260323.md").write_text(LEDGER_TEXT, encoding="utf-8")
+
+            store = FileStore(Path(tmp_dir) / "data")
+            service = TrackerService(store)
+            snapshot = service.load_workspace(WorkspaceLoadRequest(root_path=str(root), auto_scan=True))
+            assert snapshot is not None
+            plan = service.plan_semantic_index(
+                snapshot.workspace.workspace_id,
+                strategy="paths",
+                paths=["api/src/example.py"],
+                dsn="postgresql://xmustard:secret@localhost:5432/xmustard",
+            )
+            baseline = SemanticIndexBaselineRecord(
+                index_run_id="semidx_fixture",
+                workspace_id=snapshot.workspace.workspace_id,
+                surface="cli",
+                strategy="paths",
+                index_fingerprint=plan.index_fingerprint,
+                head_sha=plan.head_sha,
+                selected_paths=plan.selected_paths,
+                selected_path_details=plan.selected_path_details,
+                materialized_paths=plan.selected_paths,
+                postgres_schema="agent_context",
+            )
+
+            fresh_status = {
+                "workspace_id": snapshot.workspace.workspace_id,
+                "surface": "cli",
+                "status": "fresh",
+                "postgres_configured": True,
+                "postgres_schema": "agent_context",
+                "fingerprint_match": True,
+            }
+            with patch.object(service, "_run_go_semantic_index_json", return_value=fresh_status):
+                fresh = service.read_semantic_index_status(
+                    snapshot.workspace.workspace_id,
+                    strategy="paths",
+                    paths=["api/src/example.py"],
+                    dsn="postgresql://xmustard:secret@localhost:5432/xmustard",
+                    schema="agent_context",
+                )
+            self.assertEqual(fresh.status, "fresh")
+            self.assertTrue(fresh.fingerprint_match)
+
+            indexed_path.write_text("def render_payload():\n    return False\n", encoding="utf-8")
+            stale_status = {
+                "workspace_id": snapshot.workspace.workspace_id,
+                "surface": "cli",
+                "status": "stale",
+                "postgres_configured": True,
+                "postgres_schema": "agent_context",
+                "fingerprint_match": False,
+                "stale_reasons": ["Selected path hashes or baseline inputs differ from the stored semantic baseline."],
+            }
+            with patch.object(service, "_run_go_semantic_index_json", return_value=stale_status):
+                stale = service.read_semantic_index_status(
+                    snapshot.workspace.workspace_id,
+                    strategy="paths",
+                    paths=["api/src/example.py"],
+                    dsn="postgresql://xmustard:secret@localhost:5432/xmustard",
+                    schema="agent_context",
+                )
+            self.assertEqual(stale.status, "stale")
+            self.assertFalse(stale.fingerprint_match)
+            self.assertIn("Selected path hashes", " ".join(stale.stale_reasons))
+
+    def test_semantic_index_status_reports_dirty_provisional_when_baseline_matches(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "repo"
+            (root / "api" / "src").mkdir(parents=True)
+            (root / "docs" / "bugs").mkdir(parents=True)
+            (root / "api" / "src" / "example.py").write_text("def render_payload():\n    return True\n", encoding="utf-8")
+            (root / "docs" / "bugs" / "Bugs_25260323.md").write_text(LEDGER_TEXT, encoding="utf-8")
+            __import__("subprocess").run(["git", "-C", str(root), "init"], check=True, capture_output=True)
+            __import__("subprocess").run(["git", "-C", str(root), "add", "."], check=True, capture_output=True)
+            __import__("subprocess").run(
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "-c",
+                    "user.name=xmustard",
+                    "-c",
+                    "user.email=xmustard@example.com",
+                    "commit",
+                    "-m",
+                    "fixture",
+                ],
+                check=True,
+                capture_output=True,
+            )
+
+            store = FileStore(Path(tmp_dir) / "data")
+            service = TrackerService(store)
+            snapshot = service.load_workspace(WorkspaceLoadRequest(root_path=str(root), auto_scan=True))
+            assert snapshot is not None
+            plan = service.plan_semantic_index(
+                snapshot.workspace.workspace_id,
+                strategy="paths",
+                paths=["api/src/example.py"],
+                dsn="postgresql://xmustard:secret@localhost:5432/xmustard",
+            )
+            baseline = SemanticIndexBaselineRecord(
+                index_run_id="semidx_fixture",
+                workspace_id=snapshot.workspace.workspace_id,
+                surface="cli",
+                strategy="paths",
+                index_fingerprint=plan.index_fingerprint,
+                head_sha=plan.head_sha,
+                selected_paths=plan.selected_paths,
+                selected_path_details=plan.selected_path_details,
+                materialized_paths=plan.selected_paths,
+                postgres_schema="agent_context",
+            )
+            (root / "scratch.py").write_text("print('dirty')\n", encoding="utf-8")
+
+            go_status = {
+                "workspace_id": snapshot.workspace.workspace_id,
+                "surface": "cli",
+                "status": "dirty_provisional",
+                "postgres_configured": True,
+                "postgres_schema": "agent_context",
+                "current_dirty_files": 1,
+                "fingerprint_match": True,
+            }
+            with patch.object(service, "_run_go_semantic_index_json", return_value=go_status):
+                status = service.read_semantic_index_status(
+                    snapshot.workspace.workspace_id,
+                    strategy="paths",
+                    paths=["api/src/example.py"],
+                    dsn="postgresql://xmustard:secret@localhost:5432/xmustard",
+                    schema="agent_context",
+                )
+
+            self.assertEqual(status.status, "dirty_provisional")
+            self.assertTrue(status.fingerprint_match)
+            self.assertGreater(status.current_dirty_files, 0)
+
+    def test_path_symbols_delegates_to_go_workspace_ops(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "repo"
+            (root / "api" / "src").mkdir(parents=True)
+            (root / "docs" / "bugs").mkdir(parents=True)
+            (root / "api" / "src" / "example.py").write_text("def render_payload():\n    return True\n", encoding="utf-8")
+            (root / "docs" / "bugs" / "Bugs_25260323.md").write_text(LEDGER_TEXT, encoding="utf-8")
+
+            store = FileStore(Path(tmp_dir) / "data")
+            service = TrackerService(store)
+            snapshot = service.load_workspace(WorkspaceLoadRequest(root_path=str(root), auto_scan=True))
+            assert snapshot is not None
+
+            go_payload = {
+                "workspace_id": snapshot.workspace.workspace_id,
+                "path": "api/src/example.py",
+                "symbol_source": "tree_sitter",
+                "parser_language": "python",
+                "evidence_source": "rust_semantic_core",
+                "selection_reason": "Rust semantic core produced on-demand path symbols for the requested file.",
+                "symbols": [
+                    {
+                        "path": "api/src/example.py",
+                        "symbol": "render_payload",
+                        "kind": "function",
+                        "evidence_source": "rust_semantic_core",
+                    }
+                ],
+                "warnings": [],
+            }
+            with patch.object(service, "_run_go_workspace_json", return_value=go_payload) as go_mock:
+                result = service.read_path_symbols(snapshot.workspace.workspace_id, "api/src/example.py")
+
+            self.assertEqual(result.evidence_source, "rust_semantic_core")
+            self.assertEqual(result.symbols[0].symbol, "render_payload")
+            go_mock.assert_called_once_with(
+                "path-symbols",
+                snapshot.workspace.workspace_id,
+                ["--path", "api/src/example.py"],
+            )
+
+    def test_path_symbols_keeps_postgres_settings_out_of_python_authority(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "repo"
+            (root / "api" / "src").mkdir(parents=True)
+            (root / "docs" / "bugs").mkdir(parents=True)
+            (root / "api" / "src" / "example.py").write_text("def render_payload():\n    return True\n", encoding="utf-8")
+            (root / "docs" / "bugs" / "Bugs_25260323.md").write_text(LEDGER_TEXT, encoding="utf-8")
+
+            store = FileStore(Path(tmp_dir) / "data")
+            service = TrackerService(store)
+            snapshot = service.load_workspace(WorkspaceLoadRequest(root_path=str(root), auto_scan=True))
+            assert snapshot is not None
+            service.update_settings(
+                service.get_settings().model_copy(
+                    update={"postgres_dsn": "postgresql://xmustard:secret@localhost:5432/xmustard"}
+                )
+            )
+
+            go_payload = {
+                "workspace_id": snapshot.workspace.workspace_id,
+                "path": "api/src/example.py",
+                "symbol_source": "tree_sitter",
+                "parser_language": "python",
+                "evidence_source": "rust_semantic_core",
+                "selection_reason": "Go delivery over Rust semantic-core output.",
+                "symbols": [
+                    {
+                        "path": "api/src/example.py",
+                        "symbol": "render_payload",
+                        "kind": "function",
+                        "evidence_source": "rust_semantic_core",
+                    }
+                ],
+                "warnings": [],
+            }
+            with patch.object(service, "_run_go_workspace_json", return_value=go_payload) as go_mock:
+                result = service.read_path_symbols(snapshot.workspace.workspace_id, "api/src/example.py")
+
+            self.assertEqual(result.evidence_source, "rust_semantic_core")
+            self.assertEqual(result.symbols[0].evidence_source, "rust_semantic_core")
+            go_mock.assert_called_once()
+
+    def test_issue_context_reports_semantic_freshness_and_stored_symbol_provenance(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "repo"
+            (root / "docs" / "bugs").mkdir(parents=True)
+            (root / "api" / "src").mkdir(parents=True)
+            (root / "docs" / "bugs" / "Bugs_25260323.md").write_text(LEDGER_TEXT, encoding="utf-8")
+            (root / "api" / "src" / "example.py").write_text("def render_payload():\n    return {'status': 'ok'}\n", encoding="utf-8")
+
+            store = FileStore(Path(tmp_dir) / "data")
+            service = TrackerService(store)
+            snapshot = service.load_workspace(WorkspaceLoadRequest(root_path=str(root), auto_scan=True))
+            assert snapshot is not None
+            created = service.create_issue(
+                snapshot.workspace.workspace_id,
+                IssueCreateRequest(
+                    title="render_payload regression",
+                    severity="P1",
+                    summary="render_payload fails during export in api/src/example.py.",
+                    labels=["export"],
+                ),
+            )
+            service.update_settings(
+                service.get_settings().model_copy(
+                    update={"postgres_dsn": "postgresql://xmustard:secret@localhost:5432/xmustard"}
+                )
+            )
+
+            with patch.object(
+                service,
+                "read_semantic_index_status",
+                return_value=SemanticIndexStatus(
+                    workspace_id=snapshot.workspace.workspace_id,
+                    surface="cli",
+                    status="fresh",
+                ),
+            ):
+                packet = service.build_issue_context(snapshot.workspace.workspace_id, created.bug_id)
+
+            self.assertIsNotNone(packet.semantic_status)
+            self.assertEqual(packet.semantic_status.status, "fresh")
+            self.assertIn("Semantic freshness:", packet.prompt)
+
+    def test_impact_and_repo_context_surface_changed_symbols_tests_and_plan_links(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "repo"
+            (root / "api" / "src").mkdir(parents=True)
+            (root / "tests").mkdir(parents=True)
+            (root / "docs" / "bugs").mkdir(parents=True)
+            (root / "docs" / "bugs" / "Bugs_25260323.md").write_text(LEDGER_TEXT, encoding="utf-8")
+            source_path = root / "api" / "src" / "example.py"
+            source_path.write_text("def render_payload():\n    return True\n", encoding="utf-8")
+            (root / "tests" / "test_render_payload.py").write_text(
+                "from api.src.example import render_payload\n\ndef test_render_payload():\n    assert render_payload()\n",
+                encoding="utf-8",
+            )
+            __import__("subprocess").run(["git", "-C", str(root), "init"], check=True, capture_output=True)
+            __import__("subprocess").run(["git", "-C", str(root), "add", "."], check=True, capture_output=True)
+            __import__("subprocess").run(
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "-c",
+                    "user.name=xmustard",
+                    "-c",
+                    "user.email=xmustard@example.com",
+                    "commit",
+                    "-m",
+                    "fixture",
+                ],
+                check=True,
+                capture_output=True,
+            )
+            source_path.write_text("def render_payload():\n    return False\n", encoding="utf-8")
+
+            store = FileStore(Path(tmp_dir) / "data")
+            service = TrackerService(store)
+            snapshot = service.load_workspace(WorkspaceLoadRequest(root_path=str(root), auto_scan=True))
+            assert snapshot is not None
+
+            run = RunRecord(
+                run_id="run_ctx_001",
+                workspace_id=snapshot.workspace.workspace_id,
+                issue_id="P0_25M03_001",
+                runtime="codex",
+                model="gpt-5.4-mini",
+                status="planning",
+                title="context fixture",
+                prompt="prompt",
+                command=["codex", "exec"],
+                command_preview="codex exec",
+                log_path=str(store.runs_dir(snapshot.workspace.workspace_id) / "run_ctx_001.log"),
+                output_path=str(store.runs_dir(snapshot.workspace.workspace_id) / "run_ctx_001.out"),
+                plan=RunPlan(
+                    plan_id="plan_ctx_001",
+                    run_id="run_ctx_001",
+                    phase="awaiting_approval",
+                    steps=[
+                        PlanStep(
+                            step_id="step_1",
+                            description="Update render payload path",
+                            files_affected=["api/src/example.py"],
+                        )
+                    ],
+                    summary="Touch the changed API file",
+                    ownership_mode="shared",
+                    owner_label="operator",
+                    attached_files=[PlanFileAttachment(path="api/src/example.py", source="manual", exists=True)],
+                ),
+            )
+            store.save_run(run)
+            service.record_fix(
+                snapshot.workspace.workspace_id,
+                "P0_25M03_001",
+                FixRecordRequest(
+                    summary="Updated render payload path",
+                    changed_files=["api/src/example.py"],
+                    tests_run=["pytest -q tests/test_render_payload.py"],
+                ),
+            )
+
+            impact = service.read_impact(snapshot.workspace.workspace_id)
+            repo_context = service.read_repo_context(snapshot.workspace.workspace_id)
+
+            self.assertTrue(any(item.symbol == "render_payload" for item in impact.changed_symbols))
+            self.assertTrue(any(item.path == "tests/test_render_payload.py" for item in impact.likely_affected_tests))
+            self.assertIn("changed file", impact.derivation_summary)
+            self.assertIn(impact.confidence, {"medium", "high"})
+            self.assertTrue(repo_context.plan_links)
+            self.assertIsNotNone(repo_context.latest_accepted_fix)
+            self.assertTrue(repo_context.retrieval_ledger)
+            self.assertTrue(any(item.source_type in {"lexical_hit", "structural_hit"} for item in repo_context.retrieval_ledger))
+
+            retrieval = service.search_retrieval(snapshot.workspace.workspace_id, "render payload", limit=5)
+            self.assertTrue(retrieval.hits)
+            self.assertTrue(retrieval.retrieval_ledger)
+
+    def test_delta_commands_use_last_run_and_accepted_fix_heads(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "repo"
+            (root / "api" / "src").mkdir(parents=True)
+            (root / "docs" / "bugs").mkdir(parents=True)
+            (root / "docs" / "bugs" / "Bugs_25260323.md").write_text(LEDGER_TEXT, encoding="utf-8")
+            source_path = root / "api" / "src" / "example.py"
+            source_path.write_text("def render_payload():\n    return True\n", encoding="utf-8")
+            __import__("subprocess").run(["git", "-C", str(root), "init"], check=True, capture_output=True)
+            __import__("subprocess").run(["git", "-C", str(root), "add", "."], check=True, capture_output=True)
+            __import__("subprocess").run(
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "-c",
+                    "user.name=xmustard",
+                    "-c",
+                    "user.email=xmustard@example.com",
+                    "commit",
+                    "-m",
+                    "fixture",
+                ],
+                check=True,
+                capture_output=True,
+            )
+            head_sha = __import__("subprocess").check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
+
+            store = FileStore(Path(tmp_dir) / "data")
+            service = TrackerService(store)
+            snapshot = service.load_workspace(WorkspaceLoadRequest(root_path=str(root), auto_scan=True))
+            assert snapshot is not None
+            run = RunRecord(
+                run_id="run_delta_001",
+                workspace_id=snapshot.workspace.workspace_id,
+                issue_id="P0_25M03_001",
+                runtime="codex",
+                model="gpt-5.4-mini",
+                status="completed",
+                title="delta fixture",
+                prompt="prompt",
+                command=["codex", "exec"],
+                command_preview="codex exec",
+                log_path=str(store.runs_dir(snapshot.workspace.workspace_id) / "run_delta_001.log"),
+                output_path=str(store.runs_dir(snapshot.workspace.workspace_id) / "run_delta_001.out"),
+                worktree=WorktreeStatus(available=True, is_git_repo=True, head_sha=head_sha),
+            )
+            store.save_run(run)
+            service.record_fix(
+                snapshot.workspace.workspace_id,
+                "P0_25M03_001",
+                FixRecordRequest(summary="Accepted delta fixture", run_id=run.run_id, changed_files=["api/src/example.py"]),
+            )
+            source_path.write_text("def render_payload():\n    return False\n", encoding="utf-8")
+
+            since_run = service.read_changes_since_last_run(snapshot.workspace.workspace_id)
+            since_fix = service.read_changes_since_last_accepted_fix(snapshot.workspace.workspace_id)
+
+            self.assertEqual(since_run.base_ref, head_sha)
+            self.assertEqual(since_fix.base_ref, head_sha)
+            self.assertTrue(any(item.path == "api/src/example.py" for item in since_run.changed_files))
+
+    def test_run_plan_tracking_captures_versions_files_and_ownership(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "repo"
+            (root / "docs" / "bugs").mkdir(parents=True)
+            (root / "api" / "src").mkdir(parents=True)
+            (root / "docs").mkdir(exist_ok=True)
+            (root / "docs" / "bugs" / "Bugs_25260323.md").write_text(LEDGER_TEXT, encoding="utf-8")
+            (root / "api" / "src" / "example.py").write_text("print('ok')\n", encoding="utf-8")
+            (root / "README.md").write_text("# fixture\n", encoding="utf-8")
+            (root / "docs" / "plan-note.md").write_text("tracked note\n", encoding="utf-8")
+
+            __import__("subprocess").run(["git", "-C", str(root), "init"], check=True, capture_output=True)
+            __import__("subprocess").run(["git", "-C", str(root), "add", "."], check=True, capture_output=True)
+            __import__("subprocess").run(
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "-c",
+                    "user.name=xmustard",
+                    "-c",
+                    "user.email=xmustard@example.com",
+                    "commit",
+                    "-m",
+                    "initial",
+                ],
+                check=True,
+                capture_output=True,
+            )
+
+            store = FileStore(Path(tmp_dir) / "data")
+            service = TrackerService(store)
+            snapshot = service.load_workspace(WorkspaceLoadRequest(root_path=str(root), auto_scan=True))
+            assert snapshot is not None
+
+            run = RunRecord(
+                run_id="run_plan_tracking_001",
+                workspace_id=snapshot.workspace.workspace_id,
+                issue_id="P0_25M03_001",
+                runtime="codex",
+                model="gpt-5.4-mini",
+                status="queued",
+                title="codex:P0_25M03_001",
+                prompt="prompt",
+                command=["codex", "exec"],
+                command_preview="codex exec",
+                log_path=str(store.runs_dir(snapshot.workspace.workspace_id) / "run_plan_tracking_001.log"),
+                output_path=str(store.runs_dir(snapshot.workspace.workspace_id) / "run_plan_tracking_001.out.json"),
+            )
+            store.save_run(run)
+
+            with patch.object(
+                service,
+                "_call_agent_for_plan",
+                return_value={
+                    "summary": "Patch the API and document the behavior.",
+                    "reasoning": "The bug is isolated to the API response path.",
+                    "steps": [
+                        {
+                            "step_id": "step_1",
+                            "description": "Update the API response helper.",
+                            "estimated_impact": "medium",
+                            "files_affected": ["api/src/example.py", "README.md"],
+                            "risks": ["Potential response shape drift"],
+                        }
+                    ],
+                },
+            ):
+                generated = service.generate_run_plan(snapshot.workspace.workspace_id, run.run_id)
+
+            self.assertEqual(generated["version"], 1)
+            self.assertEqual(generated["ownership_mode"], "agent")
+            self.assertEqual(len(generated["revisions"]), 1)
+            self.assertTrue(any(item["path"] == "api/src/example.py" for item in generated["attached_files"]))
+            self.assertIsNotNone(generated["head_sha"])
+
+            tracked = service.update_run_plan_tracking(
+                snapshot.workspace.workspace_id,
+                run.run_id,
+                PlanTrackingUpdateRequest(
+                    ownership_mode="shared",
+                    owner_label="mustard team",
+                    attached_files=["docs/plan-note.md"],
+                    feedback="Operator claimed the plan and attached the note.",
+                ),
+            )
+            self.assertEqual(tracked["version"], 2)
+            self.assertEqual(tracked["ownership_mode"], "shared")
+            self.assertEqual(tracked["owner_label"], "mustard team")
+            self.assertEqual(len(tracked["revisions"]), 2)
+            self.assertTrue(any(item["path"] == "docs/plan-note.md" for item in tracked["attached_files"]))
+
+            with patch.object(service.runtime_service, "start_approved_run") as start_approved_run:
+                approved = service.approve_run_plan(
+                    snapshot.workspace.workspace_id,
+                    run.run_id,
+                    PlanApproveRequest(feedback="Looks good."),
+                )
+            self.assertEqual(approved["phase"], "approved")
+            self.assertEqual(approved["version"], 3)
+            self.assertEqual(len(approved["revisions"]), 3)
+            start_approved_run.assert_called_once()
+
+    def test_ingestion_plan_reports_completed_ready_and_blocked_phases(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "repo"
+            (root / "docs" / "bugs").mkdir(parents=True)
+            (root / "api" / "src").mkdir(parents=True)
+            (root / "docs" / "bugs" / "Bugs_25260323.md").write_text(LEDGER_TEXT, encoding="utf-8")
+            (root / "api" / "src" / "example.py").write_text("def render_payload():\n    return {'status': 'ok'}\n", encoding="utf-8")
+            (root / "package.json").write_text(
+                json.dumps({"name": "fixture", "scripts": {"dev": "vite", "test": "vitest run"}}),
+                encoding="utf-8",
+            )
+            (root / "Makefile").write_text("backend:\n\tpython3 -m uvicorn app.main:app\n", encoding="utf-8")
+
+            store = FileStore(Path(tmp_dir) / "data")
+            service = TrackerService(store)
+            snapshot = service.load_workspace(WorkspaceLoadRequest(root_path=str(root), auto_scan=True))
+            assert snapshot is not None
+            service.update_settings(
+                service.get_settings().model_copy(
+                    update={
+                        "postgres_dsn": "postgresql://xmustard:secret@localhost:5432/xmustard",
+                        "postgres_schema": "agent_context",
+                    }
+                )
+            )
+
+            with patch("app.service.tree_sitter_available", return_value=True):
+                with patch("app.service.shutil.which", return_value="/opt/homebrew/bin/sg"):
+                    plan = service.read_ingestion_plan(snapshot.workspace.workspace_id)
+
+            self.assertEqual(plan.completed_phase_count, 3)
+            self.assertEqual(plan.next_phase_id, "tree_sitter_index")
+            self.assertIn("tree_sitter_index", plan.ready_phase_ids)
+            self.assertIn("ast_grep_rules", plan.ready_phase_ids)
+            self.assertIn("lsp_enrichment", plan.blocked_phase_ids)
+            self.assertIn("search_materialization", plan.blocked_phase_ids)
+
+            phases = {item.phase_id: item for item in plan.phases}
+            self.assertEqual(phases["repo_scan"].delivery_state, "complete")
+            self.assertEqual(phases["repo_map"].delivery_state, "complete")
+            self.assertEqual(phases["runtime_discovery"].delivery_state, "complete")
+            self.assertEqual(phases["tree_sitter_index"].implementation_state, "partial")
+            self.assertEqual(phases["tree_sitter_index"].delivery_state, "ready")
+            self.assertEqual(phases["ast_grep_rules"].implementation_state, "partial")
+            self.assertEqual(phases["ast_grep_rules"].delivery_state, "ready")
+            self.assertEqual(phases["lsp_enrichment"].implementation_state, "planned")
+            self.assertTrue(any("On-demand parser-backed symbol extraction" in item for item in phases["tree_sitter_index"].evidence))
+            self.assertTrue(any(item.startswith("total_files=") for item in phases["repo_map"].evidence))
+
+    def test_path_symbols_and_explainer_prefer_rust_semantic_contracts_when_stored_rows_are_absent(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "repo"
+            (root / "docs" / "bugs").mkdir(parents=True)
+            (root / "api" / "src").mkdir(parents=True)
+            (root / "docs" / "bugs" / "Bugs_25260323.md").write_text(LEDGER_TEXT, encoding="utf-8")
+            (root / "api" / "src" / "example.py").write_text(
+                "class ApiHandler:\n    def render_payload(self):\n        return {'status': 'ok'}\n",
+                encoding="utf-8",
+            )
+
+            store = FileStore(Path(tmp_dir) / "data")
+            service = TrackerService(store)
+            snapshot = service.load_workspace(WorkspaceLoadRequest(root_path=str(root), auto_scan=True))
+            assert snapshot is not None
+
+            rust_path_symbols = PathSymbolsResult(
+                workspace_id=snapshot.workspace.workspace_id,
+                path="api/src/example.py",
+                symbol_source="tree_sitter",
+                parser_language="python",
+                evidence_source="rust_semantic_core",
+                selection_reason="Rust semantic core produced on-demand path symbols for the requested file.",
+                symbols=[
+                    RepoMapSymbolRecord(
+                        path="api/src/example.py",
+                        symbol="ApiHandler",
+                        kind="class",
+                        line_start=1,
+                        line_end=3,
+                        evidence_source="rust_semantic_core",
+                    ),
+                    RepoMapSymbolRecord(
+                        path="api/src/example.py",
+                        symbol="render_payload",
+                        kind="method",
+                        line_start=2,
+                        line_end=3,
+                        enclosing_scope="ApiHandler",
+                        evidence_source="rust_semantic_core",
+                    ),
+                ],
+                file_summary_row=FileSymbolSummaryMaterializationRecord(
+                    workspace_id=snapshot.workspace.workspace_id,
+                    path="api/src/example.py",
+                    language="python",
+                    parser_language="python",
+                    symbol_source="tree_sitter",
+                    symbol_count=2,
+                    summary_json={"top_symbols": ["ApiHandler", "render_payload"]},
+                ),
+                symbol_rows=[
+                    SymbolMaterializationRecord(
+                        workspace_id=snapshot.workspace.workspace_id,
+                        path="api/src/example.py",
+                        symbol="ApiHandler",
+                        kind="class",
+                        language="python",
+                        line_start=1,
+                        line_end=3,
+                    ),
+                    SymbolMaterializationRecord(
+                        workspace_id=snapshot.workspace.workspace_id,
+                        path="api/src/example.py",
+                        symbol="render_payload",
+                        kind="method",
+                        language="python",
+                        line_start=2,
+                        line_end=3,
+                        enclosing_scope="ApiHandler",
+                    ),
+                ],
+            )
+            rust_explainer = CodeExplainerResult(
+                workspace_id=snapshot.workspace.workspace_id,
+                path="api/src/example.py",
+                role="source",
+                line_count=3,
+                import_count=0,
+                detected_symbols=["ApiHandler", "render_payload"],
+                symbol_source="tree_sitter",
+                parser_language="python",
+                evidence_source="rust_semantic_core",
+                selection_reason="Rust semantic core owns code-explainer semantic substrate for this path.",
+                summary="api/src/example.py looks like a source file with 3 line(s). Top-level symbols include ApiHandler, render_payload.",
+                hints=["This is likely part of the code path that an agent may need to inspect or edit."],
+            )
+
+            def fake_go_workspace(action: str, workspace_id_arg: str, flags=None):
+                self.assertEqual(workspace_id_arg, snapshot.workspace.workspace_id)
+                if action == "path-symbols":
+                    self.assertEqual(flags, ["--path", "api/src/example.py"])
+                    return rust_path_symbols.model_dump(mode="json")
+                if action == "explain-path":
+                    self.assertEqual(flags, ["--path", "api/src/example.py"])
+                    return rust_explainer.model_dump(mode="json")
+                raise AssertionError(f"unexpected Go workspace action: {action}")
+
+            with patch.object(service, "_run_go_workspace_json", side_effect=fake_go_workspace) as go_mock:
+                result = service.read_path_symbols(snapshot.workspace.workspace_id, "api/src/example.py")
+                explained = service.explain_path(snapshot.workspace.workspace_id, "api/src/example.py")
+
+            self.assertEqual(result.symbol_source, "tree_sitter")
+            self.assertEqual(result.parser_language, "python")
+            self.assertEqual(result.evidence_source, "rust_semantic_core")
+            self.assertEqual([item.symbol for item in result.symbols], ["ApiHandler", "render_payload"])
+            self.assertEqual(result.symbols[1].enclosing_scope, "ApiHandler")
+            self.assertIsNotNone(result.file_summary_row)
+            assert result.file_summary_row is not None
+            self.assertEqual(result.file_summary_row.symbol_source, "tree_sitter")
+            self.assertEqual(result.file_summary_row.summary_json["top_symbols"], ["ApiHandler", "render_payload"])
+            self.assertEqual([item.symbol for item in result.symbol_rows], ["ApiHandler", "render_payload"])
+            self.assertEqual(explained.symbol_source, "tree_sitter")
+            self.assertEqual(explained.parser_language, "python")
+            self.assertEqual(explained.evidence_source, "rust_semantic_core")
+            self.assertIn("render_payload", explained.detected_symbols)
+            self.assertEqual(go_mock.call_count, 2)
+
+    def test_path_symbols_returns_storage_ready_rows_from_go(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "repo"
+            (root / "docs" / "bugs").mkdir(parents=True)
+            (root / "api" / "src").mkdir(parents=True)
+            indexed_path = root / "api" / "src" / "example.py"
+            indexed_path.write_text("def render_payload():\n    return {'status': 'ok'}\n", encoding="utf-8")
+            (root / "docs" / "bugs" / "Bugs_25260323.md").write_text(LEDGER_TEXT, encoding="utf-8")
+
+            store = FileStore(Path(tmp_dir) / "data")
+            service = TrackerService(store)
+            snapshot = service.load_workspace(WorkspaceLoadRequest(root_path=str(root), auto_scan=True))
+            assert snapshot is not None
+            service.update_settings(
+                service.get_settings().model_copy(
+                    update={
+                        "postgres_dsn": "postgresql://xmustard:secret@localhost:5432/xmustard",
+                        "postgres_schema": "agent_context",
+                    }
+                )
+            )
+
+            go_payload = {
+                "workspace_id": snapshot.workspace.workspace_id,
+                "path": "api/src/example.py",
+                "symbol_source": "tree_sitter",
+                "parser_language": "python",
+                "evidence_source": "rust_semantic_core",
+                "selection_reason": "Rust semantic core produced storage-ready rows.",
+                "symbols": [
+                    {
+                        "path": "api/src/example.py",
+                        "symbol": "render_payload",
+                        "kind": "function",
+                        "line_start": 1,
+                        "line_end": 2,
+                        "evidence_source": "rust_semantic_core",
+                    }
+                ],
+                "file_summary_row": {
+                    "workspace_id": snapshot.workspace.workspace_id,
+                    "path": "api/src/example.py",
+                    "language": "python",
+                    "parser_language": "python",
+                    "symbol_source": "tree_sitter",
+                    "symbol_count": 1,
+                    "summary_json": {"top_symbols": ["render_payload"]},
+                },
+                "symbol_rows": [
+                    {
+                        "workspace_id": snapshot.workspace.workspace_id,
+                        "path": "api/src/example.py",
+                        "symbol": "render_payload",
+                        "kind": "function",
+                        "language": "python",
+                        "line_start": 1,
+                        "line_end": 2,
+                    }
+                ],
+                "warnings": [],
+            }
+            with patch.object(service, "_run_go_workspace_json", return_value=go_payload) as go_mock:
+                result = service.read_path_symbols(snapshot.workspace.workspace_id, "api/src/example.py")
+
+            self.assertEqual([item.symbol for item in result.symbols], ["render_payload"])
+            self.assertEqual(result.symbol_source, "tree_sitter")
+            self.assertIsNotNone(result.file_summary_row)
+            assert result.file_summary_row is not None
+            self.assertEqual(result.file_summary_row.summary_json["top_symbols"], ["render_payload"])
+            self.assertEqual([item.symbol for item in result.symbol_rows], ["render_payload"])
+            go_mock.assert_called_once_with(
+                "path-symbols",
+                snapshot.workspace.workspace_id,
+                ["--path", "api/src/example.py"],
+            )
+
+    def test_code_explainer_delegates_to_go(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "repo"
+            (root / "docs" / "bugs").mkdir(parents=True)
+            (root / "api" / "src").mkdir(parents=True)
+            (root / "api" / "src" / "example.py").write_text("def local_symbol():\n    return {'status': 'ok'}\n", encoding="utf-8")
+            (root / "docs" / "bugs" / "Bugs_25260323.md").write_text(LEDGER_TEXT, encoding="utf-8")
+
+            store = FileStore(Path(tmp_dir) / "data")
+            service = TrackerService(store)
+            snapshot = service.load_workspace(WorkspaceLoadRequest(root_path=str(root), auto_scan=True))
+            assert snapshot is not None
+            service.update_settings(
+                service.get_settings().model_copy(
+                    update={
+                        "postgres_dsn": "postgresql://xmustard:secret@localhost:5432/xmustard",
+                        "postgres_schema": "agent_context",
+                    }
+                )
+            )
+
+            go_payload = {
+                "workspace_id": snapshot.workspace.workspace_id,
+                "path": "api/src/example.py",
+                "role": "source",
+                "line_count": 2,
+                "import_count": 0,
+                "detected_symbols": ["local_symbol"],
+                "symbol_source": "tree_sitter",
+                "parser_language": "python",
+                "evidence_source": "rust_semantic_core",
+                "selection_reason": "Go delivery over Rust code-explainer substrate.",
+                "summary": "api/src/example.py looks like a source file.",
+                "hints": [],
+                "warnings": [],
+            }
+            with patch.object(service, "_run_go_workspace_json", return_value=go_payload) as go_mock:
+                result = service.explain_path(snapshot.workspace.workspace_id, "api/src/example.py")
+
+            self.assertEqual(result.symbol_source, "tree_sitter")
+            self.assertEqual(result.parser_language, "python")
+            self.assertEqual(result.detected_symbols, ["local_symbol"])
+            go_mock.assert_called_once_with(
+                "explain-path",
+                snapshot.workspace.workspace_id,
+                ["--path", "api/src/example.py"],
+            )
+
+    def test_semantic_search_returns_ast_grep_matches(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "repo"
+            (root / "docs" / "bugs").mkdir(parents=True)
+            (root / "api" / "src").mkdir(parents=True)
+            (root / "docs" / "bugs" / "Bugs_25260323.md").write_text(LEDGER_TEXT, encoding="utf-8")
+            (root / "api" / "src" / "example.py").write_text(
+                "def render_payload():\n    return {'status': 'ok'}\n",
+                encoding="utf-8",
+            )
+
+            store = FileStore(Path(tmp_dir) / "data")
+            service = TrackerService(store)
+            snapshot = service.load_workspace(WorkspaceLoadRequest(root_path=str(root), auto_scan=True))
+            assert snapshot is not None
+
+            go_payload = {
+                "workspace_id": snapshot.workspace.workspace_id,
+                "pattern": "def $A():",
+                "language": "python",
+                "path_glob": "api/src/**/*.py",
+                "engine": "ast_grep",
+                "binary_path": "/opt/homebrew/bin/sg",
+                "match_count": 1,
+                "truncated": False,
+                "matches": [
+                    {
+                        "path": "api/src/example.py",
+                        "language": "python",
+                        "line_start": 1,
+                        "line_end": 1,
+                        "column_start": 1,
+                        "column_end": 19,
+                        "matched_text": "def render_payload():",
+                        "context_lines": "def render_payload():",
+                        "meta_variables": [],
+                    }
+                ],
+                "query_row": {
+                    "query_ref": "semanticq_fixture",
+                    "workspace_id": snapshot.workspace.workspace_id,
+                    "source": "adhoc_tool",
+                    "pattern": "def $A():",
+                    "language": "python",
+                    "path_glob": "api/src/**/*.py",
+                    "engine": "ast_grep",
+                    "match_count": 1,
+                    "truncated": False,
+                },
+                "match_rows": [
+                    {
+                        "query_ref": "semanticq_fixture",
+                        "workspace_id": snapshot.workspace.workspace_id,
+                        "path": "api/src/example.py",
+                        "language": "python",
+                        "line_start": 1,
+                        "line_end": 1,
+                        "column_start": 1,
+                        "column_end": 19,
+                        "matched_text": "def render_payload():",
+                        "context_lines": "def render_payload():",
+                        "meta_variables": [],
+                    }
+                ],
+            }
+
+            with patch.object(service, "_run_go_workspace_json", return_value=go_payload) as go_mock:
+                result = service.search_semantic_pattern(
+                    snapshot.workspace.workspace_id,
+                    "def $A():",
+                    language="python",
+                    path_glob="api/src/**/*.py",
+                )
+
+            self.assertEqual(result.engine, "ast_grep")
+            self.assertEqual(result.binary_path, "/opt/homebrew/bin/sg")
+            self.assertEqual(result.match_count, 1)
+            self.assertEqual(result.matches[0].path, "api/src/example.py")
+            self.assertEqual(result.matches[0].line_start, 1)
+            self.assertEqual(result.language, "python")
+            self.assertIsNotNone(result.query_row)
+            assert result.query_row is not None
+            self.assertEqual(result.query_row.source, "adhoc_tool")
+            self.assertEqual(result.query_row.match_count, 1)
+            self.assertEqual(len(result.match_rows), 1)
+            self.assertEqual(result.match_rows[0].query_ref, result.query_row.query_ref)
+            self.assertEqual(result.match_rows[0].path, "api/src/example.py")
+            go_mock.assert_called_once_with(
+                "semantic-search",
+                snapshot.workspace.workspace_id,
+                ["--pattern", "def $A():", "--limit", "50", "--language", "python", "--path-glob", "api/src/**/*.py"],
+            )
+
+    def test_semantic_search_reports_missing_ast_grep(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "repo"
+            (root / "docs" / "bugs").mkdir(parents=True)
+            (root / "api").mkdir(parents=True)
+            (root / "docs" / "bugs" / "Bugs_25260323.md").write_text(LEDGER_TEXT, encoding="utf-8")
+            (root / "api" / "main.py").write_text("print('ok')\n", encoding="utf-8")
+
+            store = FileStore(Path(tmp_dir) / "data")
+            service = TrackerService(store)
+            snapshot = service.load_workspace(WorkspaceLoadRequest(root_path=str(root), auto_scan=True))
+            assert snapshot is not None
+
+            go_payload = {
+                "workspace_id": snapshot.workspace.workspace_id,
+                "pattern": "print($A)",
+                "engine": "none",
+                "match_count": 0,
+                "truncated": False,
+                "matches": [],
+                "query_row": {
+                    "query_ref": "semanticq_fixture_missing",
+                    "workspace_id": snapshot.workspace.workspace_id,
+                    "source": "adhoc_tool",
+                    "pattern": "print($A)",
+                    "engine": "none",
+                    "match_count": 0,
+                    "truncated": False,
+                    "error": "ast-grep binary is not installed on this machine.",
+                },
+                "match_rows": [],
+                "error": "ast-grep binary is not installed on this machine.",
+            }
+            with patch.object(service, "_run_go_workspace_json", return_value=go_payload) as go_mock:
+                result = service.search_semantic_pattern(snapshot.workspace.workspace_id, "print($A)")
+
+            self.assertEqual(result.engine, "none")
+            self.assertEqual(result.match_count, 0)
+            self.assertIn("not installed", result.error or "")
+            self.assertIsNotNone(result.query_row)
+            assert result.query_row is not None
+            self.assertEqual(result.query_row.engine, "none")
+            self.assertEqual(result.query_row.error, "ast-grep binary is not installed on this machine.")
+            go_mock.assert_called_once_with(
+                "semantic-search",
+                snapshot.workspace.workspace_id,
+                ["--pattern", "print($A)", "--limit", "50"],
+            )
 
 
 class FileStoreRunTests(unittest.TestCase):

@@ -281,6 +281,70 @@ func main() {
 		}
 		writeJSON(w, http.StatusOK, result)
 	})
+	mux.HandleFunc("GET /api/postgres/plan", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.GetPostgresSchemaPlan(
+			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
+		)
+		if err != nil {
+			if strings.Contains(strings.ToLower(err.Error()), "postgres schema") {
+				writeJSON(w, http.StatusBadRequest, map[string]any{
+					"error": err.Error(),
+				})
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"error": err.Error(),
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	})
+	mux.HandleFunc("GET /api/postgres/render", func(w http.ResponseWriter, r *http.Request) {
+		sqlText, err := workspaceops.RenderPostgresSchemaSQL(
+			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
+			r.URL.Query().Get("schema"),
+		)
+		if err != nil {
+			if strings.Contains(strings.ToLower(err.Error()), "postgres schema") {
+				writeJSON(w, http.StatusBadRequest, map[string]any{
+					"error": err.Error(),
+				})
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"error": err.Error(),
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"sql": sqlText})
+	})
+	mux.HandleFunc("POST /api/postgres/bootstrap", func(w http.ResponseWriter, r *http.Request) {
+		var request workspaceops.PostgresBootstrapRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{
+				"error": "invalid JSON body",
+			})
+			return
+		}
+		result, err := workspaceops.BootstrapPostgresSchema(
+			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
+			request,
+		)
+		if err != nil {
+			lowered := strings.ToLower(err.Error())
+			if strings.Contains(lowered, "required") || strings.Contains(lowered, "must ") {
+				writeJSON(w, http.StatusBadRequest, map[string]any{
+					"error": err.Error(),
+				})
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"error": err.Error(),
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	})
 	mux.HandleFunc("GET /api/agent/capabilities", func(w http.ResponseWriter, r *http.Request) {
 		result, err := workspaceops.GetLocalAgentCapabilities(
 			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
@@ -1554,6 +1618,246 @@ func main() {
 			if errors.Is(err, os.ErrNotExist) {
 				writeJSON(w, http.StatusNotFound, map[string]any{
 					"error": "Workspace not found",
+				})
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"error": err.Error(),
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/impact", func(w http.ResponseWriter, r *http.Request) {
+		workspaceID := r.PathValue("workspace_id")
+		result, err := workspaceops.ReadImpact(
+			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
+			workspaceID,
+			r.URL.Query().Get("base_ref"),
+		)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				writeJSON(w, http.StatusNotFound, map[string]any{
+					"error": "Workspace not found",
+				})
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"error": err.Error(),
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/repo-context", func(w http.ResponseWriter, r *http.Request) {
+		workspaceID := r.PathValue("workspace_id")
+		result, err := workspaceops.ReadRepoContext(
+			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
+			workspaceID,
+			r.URL.Query().Get("base_ref"),
+		)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				writeJSON(w, http.StatusNotFound, map[string]any{
+					"error": "Workspace not found",
+				})
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"error": err.Error(),
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/retrieval-search", func(w http.ResponseWriter, r *http.Request) {
+		workspaceID := r.PathValue("workspace_id")
+		limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+		result, err := workspaceops.SearchRetrieval(
+			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
+			workspaceID,
+			r.URL.Query().Get("query"),
+			limit,
+		)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				writeJSON(w, http.StatusNotFound, map[string]any{
+					"error": "Workspace not found",
+				})
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"error": err.Error(),
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/path-symbols", func(w http.ResponseWriter, r *http.Request) {
+		workspaceID := r.PathValue("workspace_id")
+		result, err := workspaceops.ReadPathSymbols(
+			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
+			workspaceID,
+			r.URL.Query().Get("path"),
+		)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				writeJSON(w, http.StatusNotFound, map[string]any{
+					"error": "Workspace or path not found",
+				})
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"error": err.Error(),
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	})
+	mux.HandleFunc("POST /api/workspaces/{workspace_id}/path-symbols/materialize", func(w http.ResponseWriter, r *http.Request) {
+		workspaceID := r.PathValue("workspace_id")
+		var request workspaceops.PostgresPathMaterializationRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{
+				"error": "invalid JSON body",
+			})
+			return
+		}
+		result, err := workspaceops.MaterializePathSymbolsToPostgres(
+			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
+			workspaceID,
+			request,
+		)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				writeJSON(w, http.StatusNotFound, map[string]any{
+					"error": "Workspace or path not found",
+				})
+				return
+			}
+			if errors.Is(err, workspaceops.ErrInvalidSemanticRequest) {
+				writeJSON(w, http.StatusBadRequest, map[string]any{
+					"error": err.Error(),
+				})
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"error": err.Error(),
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	})
+	mux.HandleFunc("POST /api/workspaces/{workspace_id}/semantic-index/materialize", func(w http.ResponseWriter, r *http.Request) {
+		workspaceID := r.PathValue("workspace_id")
+		var request workspaceops.PostgresWorkspaceSemanticMaterializationRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{
+				"error": "invalid JSON body",
+			})
+			return
+		}
+		result, err := workspaceops.MaterializeWorkspaceSymbolsToPostgres(
+			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
+			workspaceID,
+			request,
+		)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				writeJSON(w, http.StatusNotFound, map[string]any{
+					"error": "Workspace not found",
+				})
+				return
+			}
+			if errors.Is(err, workspaceops.ErrInvalidSemanticRequest) {
+				writeJSON(w, http.StatusBadRequest, map[string]any{
+					"error": err.Error(),
+				})
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"error": err.Error(),
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/explain-path", func(w http.ResponseWriter, r *http.Request) {
+		workspaceID := r.PathValue("workspace_id")
+		result, err := workspaceops.ExplainPath(
+			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
+			workspaceID,
+			r.URL.Query().Get("path"),
+		)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				writeJSON(w, http.StatusNotFound, map[string]any{
+					"error": "Workspace or path not found",
+				})
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"error": err.Error(),
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/semantic-search", func(w http.ResponseWriter, r *http.Request) {
+		workspaceID := r.PathValue("workspace_id")
+		limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+		result, err := workspaceops.SearchSemanticPattern(
+			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
+			workspaceID,
+			r.URL.Query().Get("pattern"),
+			r.URL.Query().Get("language"),
+			r.URL.Query().Get("path_glob"),
+			limit,
+		)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				writeJSON(w, http.StatusNotFound, map[string]any{
+					"error": "Workspace not found",
+				})
+				return
+			}
+			if errors.Is(err, workspaceops.ErrInvalidSemanticRequest) {
+				writeJSON(w, http.StatusBadRequest, map[string]any{
+					"error": err.Error(),
+				})
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"error": err.Error(),
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	})
+	mux.HandleFunc("POST /api/workspaces/{workspace_id}/semantic-search/materialize", func(w http.ResponseWriter, r *http.Request) {
+		workspaceID := r.PathValue("workspace_id")
+		var request workspaceops.PostgresSemanticSearchMaterializationRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{
+				"error": "invalid JSON body",
+			})
+			return
+		}
+		result, err := workspaceops.MaterializeSemanticSearchToPostgres(
+			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
+			workspaceID,
+			request,
+		)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				writeJSON(w, http.StatusNotFound, map[string]any{
+					"error": "Workspace not found",
+				})
+				return
+			}
+			if errors.Is(err, workspaceops.ErrInvalidSemanticRequest) {
+				writeJSON(w, http.StatusBadRequest, map[string]any{
+					"error": err.Error(),
 				})
 				return
 			}

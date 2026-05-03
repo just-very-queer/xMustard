@@ -1,6 +1,7 @@
 use chrono::Utc;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use walkdir::{DirEntry, WalkDir};
@@ -17,6 +18,7 @@ const SCANNER_EXCLUDED_DIR_NAMES: &[&str] = &[
     ".ruff_cache",
     ".turbo",
     ".next",
+    "target",
     "node_modules",
     "dist",
     "build",
@@ -52,6 +54,30 @@ const REPO_MAP_KEY_FILE_PATTERNS: &[(&str, &str)] = &[
     ("frontend/src/App.tsx", "entry"),
 ];
 
+fn repo_map_file_role(relative_path: &str) -> Option<&'static str> {
+    if let Some((_, role)) = REPO_MAP_KEY_FILE_PATTERNS
+        .iter()
+        .find(|(pattern, _)| relative_path == *pattern)
+    {
+        return Some(role);
+    }
+    let lowered = relative_path.to_lowercase();
+    let is_test = lowered.contains("/tests/")
+        || lowered.starts_with("tests/")
+        || PathBuf::from(&lowered)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| name.starts_with("test_"))
+            .unwrap_or(false);
+    if is_test {
+        return Some("test");
+    }
+    if should_scan_file(relative_path) {
+        return Some("source");
+    }
+    None
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RepoMapMilestone {
     pub name: &'static str,
@@ -83,6 +109,122 @@ pub struct RustRepoMapSummary {
     pub top_extensions: BTreeMap<String, usize>,
     pub top_directories: Vec<RustRepoMapDirectoryRecord>,
     pub key_files: Vec<RustRepoMapFileRecord>,
+    pub generated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustRepoChangeRecord {
+    pub path: String,
+    pub status: String,
+    pub scope: String,
+    pub previous_path: Option<String>,
+    #[serde(default)]
+    pub staged: bool,
+    #[serde(default)]
+    pub unstaged: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustChangedSymbolRecord {
+    pub path: String,
+    pub symbol: String,
+    pub kind: String,
+    pub line_start: Option<usize>,
+    pub line_end: Option<usize>,
+    pub evidence_source: String,
+    pub semantic_status: Option<String>,
+    pub selection_reason: String,
+    pub change_scopes: Vec<String>,
+    pub change_statuses: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustPathSymbolRecord {
+    pub path: String,
+    pub symbol: String,
+    pub kind: String,
+    pub line_start: Option<usize>,
+    pub line_end: Option<usize>,
+    pub enclosing_scope: Option<String>,
+    pub evidence_source: String,
+    pub reason: Option<String>,
+    pub score: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustFileSymbolSummaryMaterializationRecord {
+    pub workspace_id: String,
+    pub path: String,
+    pub language: Option<String>,
+    pub parser_language: Option<String>,
+    pub symbol_source: String,
+    pub symbol_count: usize,
+    pub summary_json: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustSymbolMaterializationRecord {
+    pub workspace_id: String,
+    pub path: String,
+    pub symbol: String,
+    pub kind: String,
+    pub language: Option<String>,
+    pub line_start: Option<usize>,
+    pub line_end: Option<usize>,
+    pub enclosing_scope: Option<String>,
+    pub signature_text: Option<String>,
+    pub symbol_text: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustPathSymbolsResult {
+    pub workspace_id: String,
+    pub path: String,
+    pub symbol_source: String,
+    pub parser_language: Option<String>,
+    pub evidence_source: String,
+    pub selection_reason: String,
+    pub symbols: Vec<RustPathSymbolRecord>,
+    pub file_summary_row: RustFileSymbolSummaryMaterializationRecord,
+    pub symbol_rows: Vec<RustSymbolMaterializationRecord>,
+    pub warnings: Vec<String>,
+    pub generated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustCodeExplainerResult {
+    pub workspace_id: String,
+    pub path: String,
+    pub role: String,
+    pub line_count: usize,
+    pub import_count: usize,
+    pub detected_symbols: Vec<String>,
+    pub symbol_source: String,
+    pub parser_language: Option<String>,
+    pub evidence_source: String,
+    pub selection_reason: String,
+    pub summary: String,
+    pub hints: Vec<String>,
+    pub warnings: Vec<String>,
+    pub generated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustImpactPathRecord {
+    pub path: String,
+    pub reason: String,
+    pub derivation_source: String,
+    pub score: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustSemanticImpactReport {
+    pub workspace_id: String,
+    pub changed_symbols: Vec<RustChangedSymbolRecord>,
+    pub likely_affected_files: Vec<RustImpactPathRecord>,
+    pub likely_affected_tests: Vec<RustImpactPathRecord>,
+    pub derivation_source: String,
+    pub warnings: Vec<String>,
     pub generated_at: String,
 }
 
@@ -136,8 +278,10 @@ pub fn build_repo_map(
             continue;
         }
 
+        let Some(role) = repo_map_file_role(&relative) else {
+            continue;
+        };
         total_files += 1;
-        let lowered = relative.to_lowercase();
         let top_dir = relative
             .split('/')
             .next()
@@ -146,13 +290,7 @@ pub fn build_repo_map(
             .to_string();
 
         let is_source = should_scan_file(&relative);
-        let is_test = lowered.contains("/tests/")
-            || lowered.starts_with("tests/")
-            || PathBuf::from(&lowered)
-                .file_name()
-                .and_then(|name| name.to_str())
-                .map(|name| name.starts_with("test_"))
-                .unwrap_or(false);
+        let is_test = role == "test";
 
         {
             let entry = top_level.entry(top_dir).or_insert(RustRepoMapDirectoryRecord {
@@ -245,6 +383,143 @@ pub fn build_repo_map(
     })
 }
 
+pub fn build_semantic_impact(
+    root_path: &Path,
+    workspace_id: &str,
+    changes: &[RustRepoChangeRecord],
+) -> Result<RustSemanticImpactReport, std::io::Error> {
+    let symbols = derive_changed_symbols(root_path, changes);
+    let changed_paths = changes
+        .iter()
+        .filter(|item| item.status != "deleted")
+        .map(|item| item.path.clone())
+        .collect::<Vec<_>>();
+    let (affected_files, affected_tests) =
+        rank_affected_paths(root_path, &changed_paths, &symbols)?;
+    let mut warnings = Vec::new();
+    if !changed_paths.is_empty() && symbols.is_empty() {
+        warnings.push(
+            "Rust semantic core did not derive symbol-level context for the changed paths."
+                .to_string(),
+        );
+    }
+    Ok(RustSemanticImpactReport {
+        workspace_id: workspace_id.to_string(),
+        changed_symbols: symbols,
+        likely_affected_files: affected_files,
+        likely_affected_tests: affected_tests,
+        derivation_source: "rust_semantic_core".to_string(),
+        warnings,
+        generated_at: Utc::now().to_rfc3339(),
+    })
+}
+
+pub fn extract_path_symbols(
+    root_path: &Path,
+    workspace_id: &str,
+    relative_path: &str,
+) -> Result<RustPathSymbolsResult, std::io::Error> {
+    let normalized = relative_path.trim_start_matches("./").replace('\\', "/");
+    let path = root_path.join(&normalized);
+    let metadata = fs::metadata(&path)?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path-symbols expects a file path",
+        ));
+    }
+    let parser_language = semantic_language_for_path(&normalized);
+    let mut warnings = Vec::new();
+    if !should_scan_file(&normalized) {
+        warnings.push(
+            "Rust semantic core does not treat this path as an indexable source file.".to_string(),
+        );
+    }
+    let symbols = extract_symbols_from_file(root_path, &normalized)
+        .into_iter()
+        .take(32)
+        .map(|item| RustPathSymbolRecord {
+            path: item.path,
+            symbol: item.symbol,
+            kind: item.kind,
+            line_start: item.line_start,
+            line_end: item.line_end,
+            enclosing_scope: None,
+            evidence_source: "rust_semantic_core".to_string(),
+            reason: Some(
+                "Rust semantic core extracted this symbol from the requested path.".to_string(),
+            ),
+            score: 10,
+        })
+        .collect::<Vec<_>>();
+    let symbol_source = if symbols.is_empty() { "none" } else { "regex" }.to_string();
+    let file_summary_row = build_file_symbol_summary(
+        workspace_id,
+        &normalized,
+        parser_language.as_ref(),
+        &symbol_source,
+        &symbols,
+    );
+    let symbol_rows = build_symbol_materialization_rows(
+        workspace_id,
+        &normalized,
+        parser_language.as_ref(),
+        &symbols,
+    );
+    if symbols.is_empty() && should_scan_file(&normalized) {
+        warnings.push("Rust semantic core found no top-level symbols in this path.".to_string());
+    }
+    Ok(RustPathSymbolsResult {
+        workspace_id: workspace_id.to_string(),
+        path: normalized,
+        symbol_source,
+        parser_language,
+        evidence_source: "rust_semantic_core".to_string(),
+        selection_reason: "Rust semantic core produced on-demand path symbols for the requested file.".to_string(),
+        symbols,
+        file_summary_row,
+        symbol_rows,
+        warnings,
+        generated_at: Utc::now().to_rfc3339(),
+    })
+}
+
+pub fn explain_path(
+    root_path: &Path,
+    workspace_id: &str,
+    relative_path: &str,
+) -> Result<RustCodeExplainerResult, std::io::Error> {
+    let symbols = extract_path_symbols(root_path, workspace_id, relative_path)?;
+    let content = fs::read_to_string(root_path.join(&symbols.path))?;
+    let role = repo_map_file_role(&symbols.path)
+        .unwrap_or("source")
+        .to_string();
+    let line_count = content.lines().count();
+    let import_count = count_import_like_lines(&content);
+    let detected_symbols = symbols
+        .symbols
+        .iter()
+        .take(8)
+        .map(|item| item.symbol.clone())
+        .collect::<Vec<_>>();
+    Ok(RustCodeExplainerResult {
+        workspace_id: workspace_id.to_string(),
+        path: symbols.path.clone(),
+        role: role.clone(),
+        line_count,
+        import_count,
+        detected_symbols: detected_symbols.clone(),
+        symbol_source: symbols.symbol_source,
+        parser_language: symbols.parser_language,
+        evidence_source: symbols.evidence_source,
+        selection_reason: "Rust semantic core owns code-explainer semantic substrate for this path.".to_string(),
+        summary: build_path_explainer_summary(&symbols.path, &role, line_count, import_count, &detected_symbols),
+        hints: build_path_explainer_hints(&symbols.path, &role),
+        warnings: symbols.warnings,
+        generated_at: Utc::now().to_rfc3339(),
+    })
+}
+
 fn should_skip_entry(root_path: &Path, entry: &DirEntry) -> bool {
     if entry.depth() == 0 {
         return false;
@@ -296,6 +571,381 @@ fn should_scan_file(relative_path: &str) -> bool {
     SCANNABLE_SOURCE_EXTENSIONS.contains(&format!(".{ext}").as_str())
 }
 
+fn semantic_language_for_path(relative_path: &str) -> Option<String> {
+    let path = PathBuf::from(relative_path);
+    let ext = path.extension().and_then(|value| value.to_str()).unwrap_or_default();
+    match ext {
+        "py" => Some("python".to_string()),
+        "ts" => Some("typescript".to_string()),
+        "tsx" => Some("tsx".to_string()),
+        "js" | "jsx" => Some("javascript".to_string()),
+        "go" => Some("go".to_string()),
+        "rs" => Some("rust".to_string()),
+        "java" => Some("java".to_string()),
+        "sh" | "bash" => Some("bash".to_string()),
+        "html" => Some("html".to_string()),
+        "css" => Some("css".to_string()),
+        "yaml" | "yml" => Some("yaml".to_string()),
+        _ => None,
+    }
+}
+
+fn build_file_symbol_summary(
+    workspace_id: &str,
+    relative_path: &str,
+    parser_language: Option<&String>,
+    symbol_source: &str,
+    symbols: &[RustPathSymbolRecord],
+) -> RustFileSymbolSummaryMaterializationRecord {
+    let mut symbol_kinds = BTreeMap::new();
+    for item in symbols {
+        let entry = symbol_kinds
+            .entry(item.kind.clone())
+            .or_insert_with(|| serde_json::Value::from(0_u64));
+        if let Some(current) = entry.as_u64() {
+            *entry = serde_json::Value::from(current + 1);
+        }
+    }
+    let top_symbols = symbols
+        .iter()
+        .take(8)
+        .map(|item| serde_json::Value::from(item.symbol.clone()))
+        .collect::<Vec<_>>();
+    let enclosing_scopes = symbols
+        .iter()
+        .filter_map(|item| item.enclosing_scope.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(serde_json::Value::from)
+        .collect::<Vec<_>>();
+    let mut summary_json = BTreeMap::new();
+    summary_json.insert("top_symbols".to_string(), serde_json::Value::from(top_symbols));
+    summary_json.insert(
+        "symbol_kinds".to_string(),
+        serde_json::Value::Object(symbol_kinds.into_iter().collect()),
+    );
+    summary_json.insert(
+        "enclosing_scopes".to_string(),
+        serde_json::Value::from(enclosing_scopes),
+    );
+    RustFileSymbolSummaryMaterializationRecord {
+        workspace_id: workspace_id.to_string(),
+        path: relative_path.to_string(),
+        language: parser_language.cloned(),
+        parser_language: parser_language.cloned(),
+        symbol_source: normalize_symbol_source(symbol_source),
+        symbol_count: symbols.len(),
+        summary_json,
+    }
+}
+
+fn build_symbol_materialization_rows(
+    workspace_id: &str,
+    relative_path: &str,
+    parser_language: Option<&String>,
+    symbols: &[RustPathSymbolRecord],
+) -> Vec<RustSymbolMaterializationRecord> {
+    symbols
+        .iter()
+        .map(|item| RustSymbolMaterializationRecord {
+            workspace_id: workspace_id.to_string(),
+            path: relative_path.to_string(),
+            symbol: item.symbol.clone(),
+            kind: item.kind.clone(),
+            language: parser_language.cloned(),
+            line_start: item.line_start,
+            line_end: item.line_end,
+            enclosing_scope: item.enclosing_scope.clone(),
+            signature_text: None,
+            symbol_text: None,
+        })
+        .collect()
+}
+
+fn normalize_symbol_source(symbol_source: &str) -> String {
+    match symbol_source {
+        "tree_sitter" | "regex" | "none" => symbol_source.to_string(),
+        _ => "none".to_string(),
+    }
+}
+
+fn derive_changed_symbols(
+    root_path: &Path,
+    changes: &[RustRepoChangeRecord],
+) -> Vec<RustChangedSymbolRecord> {
+    let mut symbols: Vec<RustChangedSymbolRecord> = Vec::new();
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    for change in changes {
+        if change.status == "deleted" {
+            continue;
+        }
+        for mut symbol in extract_symbols_from_file(root_path, &change.path) {
+            let key = format!("{}\0{}\0{}", symbol.path, symbol.symbol, symbol.kind);
+            if let Some(index) = seen.get(&key).copied() {
+                push_unique(&mut symbols[index].change_scopes, change.scope.clone(), 8);
+                push_unique(
+                    &mut symbols[index].change_statuses,
+                    change.status.clone(),
+                    8,
+                );
+                continue;
+            }
+            symbol.change_scopes = vec![change.scope.clone()];
+            symbol.change_statuses = vec![change.status.clone()];
+            seen.insert(key, symbols.len());
+            symbols.push(symbol);
+        }
+    }
+    symbols
+}
+
+fn extract_symbols_from_file(root_path: &Path, relative_path: &str) -> Vec<RustChangedSymbolRecord> {
+    if !should_scan_file(relative_path) {
+        return Vec::new();
+    }
+    let content = match fs::read_to_string(root_path.join(relative_path)) {
+        Ok(value) => value,
+        Err(_) => return Vec::new(),
+    };
+    let patterns = [
+        (Regex::new(r"^\s*def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(").unwrap(), "function"),
+        (Regex::new(r"^\s*class\s+([A-Za-z_][A-Za-z0-9_]*)\b").unwrap(), "class"),
+        (
+            Regex::new(r"^\s*func\s+(?:\([^)]+\)\s*)?([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+                .unwrap(),
+            "function",
+        ),
+        (
+            Regex::new(r"^\s*(?:export\s+)?function\s+([A-Za-z_][A-Za-z0-9_]*)\b").unwrap(),
+            "function",
+        ),
+        (
+            Regex::new(r"^\s*(?:export\s+)?class\s+([A-Za-z_][A-Za-z0-9_]*)\b").unwrap(),
+            "class",
+        ),
+        (
+            Regex::new(r"^\s*(?:export\s+)?(?:interface|type)\s+([A-Za-z_][A-Za-z0-9_]*)\b")
+                .unwrap(),
+            "type",
+        ),
+        (
+            Regex::new(r"^\s*(?:pub\s+)?(?:struct|enum|trait)\s+([A-Za-z_][A-Za-z0-9_]*)\b")
+                .unwrap(),
+            "type",
+        ),
+        (
+            Regex::new(r"^\s*(?:pub\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(").unwrap(),
+            "function",
+        ),
+    ];
+    let mut out = Vec::new();
+    for (index, line) in content.lines().enumerate() {
+        for (pattern, kind) in &patterns {
+            let Some(captures) = pattern.captures(line) else {
+                continue;
+            };
+            let Some(symbol) = captures.get(1) else {
+                continue;
+            };
+            let line_no = index + 1;
+            out.push(RustChangedSymbolRecord {
+                path: relative_path.replace('\\', "/"),
+                symbol: symbol.as_str().to_string(),
+                kind: (*kind).to_string(),
+                line_start: Some(line_no),
+                line_end: Some(line_no),
+                evidence_source: "rust_semantic_core".to_string(),
+                semantic_status: Some("on_demand".to_string()),
+                selection_reason:
+                    "Rust semantic core extracted this symbol from a changed path.".to_string(),
+                change_scopes: Vec::new(),
+                change_statuses: Vec::new(),
+            });
+            break;
+        }
+        if out.len() >= 48 {
+            break;
+        }
+    }
+    out
+}
+
+fn rank_affected_paths(
+    root_path: &Path,
+    changed_paths: &[String],
+    symbols: &[RustChangedSymbolRecord],
+) -> Result<(Vec<RustImpactPathRecord>, Vec<RustImpactPathRecord>), std::io::Error> {
+    let mut tokens = Vec::new();
+    for path in changed_paths {
+        tokens.extend(path_tokens(path));
+    }
+    for symbol in symbols {
+        push_unique(&mut tokens, symbol.symbol.to_lowercase(), 64);
+    }
+    let mut files = Vec::new();
+    let mut tests = Vec::new();
+    let changed: HashSet<&str> = changed_paths.iter().map(|item| item.as_str()).collect();
+    for path in candidate_source_paths(root_path, 180) {
+        if changed.contains(path.as_str()) {
+            continue;
+        }
+        let score = path_score(&path, &tokens);
+        if score == 0 {
+            continue;
+        }
+        let is_test = repo_map_file_role(&path) == Some("test")
+            || path.to_lowercase().contains("test")
+            || path.to_lowercase().ends_with(".spec.ts");
+        let record = RustImpactPathRecord {
+            path,
+            reason: "Rust semantic core matched path terms and changed-symbol terms.".to_string(),
+            derivation_source: "rust_semantic_core".to_string(),
+            score,
+        };
+        if is_test {
+            tests.push(record);
+        } else {
+            files.push(record);
+        }
+    }
+    sort_impact_paths(&mut files);
+    sort_impact_paths(&mut tests);
+    files.truncate(10);
+    tests.truncate(10);
+    Ok((files, tests))
+}
+
+fn candidate_source_paths(root_path: &Path, limit: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let walker = WalkDir::new(root_path)
+        .into_iter()
+        .filter_entry(|entry| !should_skip_entry(root_path, entry));
+    for entry in walker {
+        if out.len() >= limit {
+            break;
+        }
+        let Ok(entry) = entry else {
+            continue;
+        };
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let Some(relative) = relative_path(root_path, entry.path()) else {
+            continue;
+        };
+        if should_scan_file(&relative) {
+            out.push(relative);
+        }
+    }
+    out
+}
+
+fn path_tokens(path: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    for ch in path.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            current.push(ch.to_ascii_lowercase());
+        } else {
+            if current.len() >= 3 {
+                push_unique(&mut out, current.clone(), 16);
+            }
+            current.clear();
+        }
+    }
+    if current.len() >= 3 {
+        push_unique(&mut out, current, 16);
+    }
+    out
+}
+
+fn path_score(path: &str, tokens: &[String]) -> i32 {
+    let lower = path.to_lowercase();
+    let mut score = 0;
+    for token in tokens {
+        if token.len() >= 3 && lower.contains(token) {
+            score += 2;
+        }
+    }
+    if repo_map_file_role(path) == Some("test") {
+        score += 1;
+    }
+    score
+}
+
+fn sort_impact_paths(items: &mut [RustImpactPathRecord]) {
+    items.sort_by(|left, right| {
+        right
+            .score
+            .cmp(&left.score)
+            .then(left.path.cmp(&right.path))
+    });
+}
+
+fn count_import_like_lines(content: &str) -> usize {
+    content
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            trimmed.starts_with("import ")
+                || trimmed.starts_with("from ")
+                || trimmed.starts_with("use ")
+                || trimmed.starts_with("mod ")
+                || trimmed.starts_with("require(")
+                || trimmed.starts_with("const ")
+                    && trimmed.contains("require(")
+        })
+        .count()
+}
+
+fn build_path_explainer_summary(
+    path: &str,
+    role: &str,
+    line_count: usize,
+    import_count: usize,
+    symbols: &[String],
+) -> String {
+    let mut summary = format!(
+        "{path} is a {role} file with {line_count} line(s) and {import_count} import/reference line(s)."
+    );
+    if !symbols.is_empty() {
+        summary.push_str(&format!(
+            " Rust semantic core detected symbols: {}.",
+            symbols
+                .iter()
+                .take(6)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    summary
+}
+
+fn build_path_explainer_hints(path: &str, role: &str) -> Vec<String> {
+    let mut hints = vec![
+        "Rust semantic core owns this path explanation contract; Go delivery only forwards it."
+            .to_string(),
+    ];
+    if role == "test" || path.to_lowercase().contains("test") {
+        hints.push("Treat this as verification context before modifying runtime code.".to_string());
+    } else if path.ends_with(".md") || path.ends_with(".yaml") || path.ends_with(".yml") {
+        hints.push("Treat this as guidance/config context and check whether code agrees.".to_string());
+    } else {
+        hints.push("Use detected symbols as the first review anchors for this file.".to_string());
+    }
+    hints
+}
+
+fn push_unique(items: &mut Vec<String>, value: String, limit: usize) {
+    if value.trim().is_empty() || items.iter().any(|item| item == &value) {
+        return;
+    }
+    if items.len() < limit {
+        items.push(value);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::build_repo_map;
@@ -327,5 +977,126 @@ mod tests {
         assert_eq!(summary.test_files, 1);
         assert!(summary.key_files.iter().any(|item| item.path == "AGENTS.md"));
         assert!(summary.top_directories.iter().any(|item| item.path == "src"));
+    }
+
+    #[test]
+    fn repomap_counts_only_repo_understanding_relevant_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+
+        write(&root.join("README.md"), "# readme\n");
+        write(&root.join("src/app.py"), "print('ok')\n");
+        write(&root.join("tests/test_app.py"), "def test_ok():\n    assert True\n");
+        write(&root.join("docs/notes.txt"), "not indexed\n");
+        write(&root.join("assets/logo.png"), "png");
+        write(&root.join("target/debug.bin"), "bin");
+
+        let summary = build_repo_map(root, "workspace-2").unwrap();
+
+        assert_eq!(summary.total_files, 3);
+        assert_eq!(summary.source_files, 2);
+        assert_eq!(summary.test_files, 1);
+        assert!(summary.key_files.iter().any(|item| item.path == "README.md"));
+        assert!(summary.key_files.iter().any(|item| item.path == "tests/test_app.py"));
+    }
+
+    #[test]
+    fn semantic_impact_extracts_symbols_and_ranks_related_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+
+        write(
+            &root.join("src/app.py"),
+            "class ExportService:\n    def export_summary(self):\n        return 'ok'\n",
+        );
+        write(
+            &root.join("tests/test_export.py"),
+            "def test_export_summary():\n    assert True\n",
+        );
+
+        let report = super::build_semantic_impact(
+            root,
+            "workspace-3",
+            &[super::RustRepoChangeRecord {
+                path: "src/app.py".to_string(),
+                status: "modified".to_string(),
+                scope: "working_tree".to_string(),
+                previous_path: None,
+                staged: false,
+                unstaged: true,
+            }],
+        )
+        .unwrap();
+
+        assert!(report
+            .changed_symbols
+            .iter()
+            .any(|item| item.symbol == "ExportService"));
+        assert!(report
+            .likely_affected_tests
+            .iter()
+            .any(|item| item.path == "tests/test_export.py"));
+        assert_eq!(report.derivation_source, "rust_semantic_core");
+    }
+
+    #[test]
+    fn path_symbols_extracts_requested_file_symbols() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+
+        write(
+            &root.join("src/app.rs"),
+            "pub struct Runner {}\n\npub fn launch_runner() {}\n",
+        );
+
+        let result = super::extract_path_symbols(root, "workspace-4", "src/app.rs").unwrap();
+
+        assert_eq!(result.workspace_id, "workspace-4");
+        assert_eq!(result.path, "src/app.rs");
+        assert_eq!(result.symbol_source, "regex");
+        assert_eq!(result.parser_language.as_deref(), Some("rust"));
+        assert!(result
+            .symbols
+            .iter()
+            .any(|item| item.symbol == "Runner" && item.kind == "type"));
+        assert!(result
+            .symbols
+            .iter()
+            .any(|item| item.symbol == "launch_runner" && item.kind == "function"));
+        assert_eq!(result.evidence_source, "rust_semantic_core");
+        assert_eq!(result.file_summary_row.symbol_source, "regex");
+        assert_eq!(result.file_summary_row.symbol_count, 2);
+        assert_eq!(
+            result.file_summary_row.summary_json.get("top_symbols").unwrap(),
+            &serde_json::json!(["Runner", "launch_runner"])
+        );
+        assert_eq!(result.symbol_rows.len(), 2);
+        assert_eq!(result.symbol_rows[0].symbol, "Runner");
+    }
+
+    #[test]
+    fn explain_path_returns_rust_owned_code_explainer_contract() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+
+        write(
+            &root.join("src/app.py"),
+            "import os\n\nclass ExportService:\n    def export_summary(self):\n        return os.getcwd()\n",
+        );
+
+        let result = super::explain_path(root, "workspace-5", "src/app.py").unwrap();
+
+        assert_eq!(result.workspace_id, "workspace-5");
+        assert_eq!(result.path, "src/app.py");
+        assert_eq!(result.role, "source");
+        assert_eq!(result.import_count, 1);
+        assert!(result
+            .detected_symbols
+            .iter()
+            .any(|item| item == "ExportService"));
+        assert_eq!(result.evidence_source, "rust_semantic_core");
+        assert!(result
+            .selection_reason
+            .contains("code-explainer semantic substrate"));
     }
 }

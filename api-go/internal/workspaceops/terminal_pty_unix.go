@@ -16,6 +16,8 @@ import (
 	"errors"
 	"os"
 	"os/exec"
+	"strconv"
+	"strings"
 	"syscall"
 
 	"golang.org/x/sys/unix"
@@ -74,6 +76,12 @@ func terminateTerminalProcess(cmd *exec.Cmd) {
 	if cmd == nil || cmd.Process == nil {
 		return
 	}
+	for _, childPID := range collectTerminalChildPIDs(cmd.Process.Pid) {
+		if pgid, err := unix.Getpgid(childPID); err == nil {
+			_ = unix.Kill(-pgid, unix.SIGTERM)
+		}
+		_ = unix.Kill(childPID, unix.SIGTERM)
+	}
 	pgid, err := unix.Getpgid(cmd.Process.Pid)
 	if err == nil {
 		_ = unix.Kill(-pgid, unix.SIGTERM)
@@ -83,6 +91,27 @@ func terminateTerminalProcess(cmd *exec.Cmd) {
 		return
 	}
 	_ = cmd.Process.Signal(unix.SIGTERM)
+}
+
+func collectTerminalChildPIDs(parentPID int) []int {
+	output, err := exec.Command("pgrep", "-P", strconv.Itoa(parentPID)).Output()
+	if err != nil {
+		return nil
+	}
+	pids := []int{}
+	for _, line := range strings.Split(string(output), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		pid, err := strconv.Atoi(line)
+		if err != nil || pid <= 0 {
+			continue
+		}
+		pids = append(pids, collectTerminalChildPIDs(pid)...)
+		pids = append(pids, pid)
+	}
+	return pids
 }
 
 func normalizeTerminalDimension(value int, fallback int) int {

@@ -153,15 +153,21 @@ What xMustard should do:
 - issue-level ticket context with acceptance criteria
 - issue-level threat models
 - issue-context replay snapshots
+- saved eval scenarios, fresh replay batches, baseline comparisons, and replay trend movement
 - workspace repo-map summaries with ranked related paths
 - repo guidance discovery
+- starter guidance generation and guidance health for `AGENTS.md`, `.openhands/microagents/repo.md`, and `CONVENTIONS.md`
+- repo-native `.xmustard.yaml` path instructions and MCP/browser-context hints
 - run insights and review summaries
+- Go/Rust migration boundaries for scanner, repo-map, verification, runtime, API, and integration surfaces
 
 ## Highest-Value Next Steps
 
-1. Add starter-file generation for `AGENTS.md`, `CONVENTIONS.md`, or `.openhands/microagents/repo.md`.
-2. Deepen the repo map with symbol summaries and enclosing-scope context inspired by Aider and PR-Agent.
-3. Deepen the threat-model lane with security review signals, confidence, and policy checkpoints.
-4. Add eval and replay workflows for issue contexts, runs, and verification outcomes.
-5. Add provider-grade review/export flows for GitHub or PR-style consumption.
-6. Add stronger ticket sync depth for Jira and Linear, including richer acceptance criteria import.
+1. Add a retrieval ledger for issue context packets, so selected files, symbols, guidance, and operational artifacts carry inspectable match reasons.
+2. Deepen the repo map with enclosing-scope context and symbol-level explanations inspired by Aider and PR-Agent.
+3. Extend eval reporting from latest-vs-previous replay batches into longer multi-batch timelines with movement explanations.
+4. Deepen the security lane with vulnerability disposition, exploitability, risk acceptance, verification linkage, and exportable security review packets.
+5. Add workspace policy records for runtime choice, required verification, budget warnings, and sensitive-workspace controls.
+6. Add provider-grade review/export packets for GitHub, Linear, Jira, and human PR-style consumption.
+
+See [docs/FRONTIER.md](./FRONTIER.md) for the current research-to-build frontier map.
