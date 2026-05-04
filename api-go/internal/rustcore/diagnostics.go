@@ -36,6 +36,45 @@ type DiagnosticsBatch struct {
 	GeneratedAt     string                 `json:"generated_at"`
 }
 
+type DiagnosticSymbolCandidate struct {
+	SymbolID       int64   `json:"symbol_id"`
+	Path           string  `json:"path"`
+	Symbol         string  `json:"symbol"`
+	Kind           string  `json:"kind"`
+	Language       *string `json:"language,omitempty"`
+	LineStart      *int    `json:"line_start,omitempty"`
+	LineEnd        *int    `json:"line_end,omitempty"`
+	EnclosingScope *string `json:"enclosing_scope,omitempty"`
+	SignatureText  *string `json:"signature_text,omitempty"`
+}
+
+type DiagnosticLinkedSymbol struct {
+	SymbolID        int64   `json:"symbol_id"`
+	Path            string  `json:"path"`
+	Symbol          string  `json:"symbol"`
+	Kind            string  `json:"kind"`
+	Language        *string `json:"language,omitempty"`
+	LineStart       *int    `json:"line_start,omitempty"`
+	LineEnd         *int    `json:"line_end,omitempty"`
+	EnclosingScope  *string `json:"enclosing_scope,omitempty"`
+	SignatureText   *string `json:"signature_text,omitempty"`
+	LinkStrategy    string  `json:"link_strategy"`
+	EvidenceSource  string  `json:"evidence_source"`
+	SelectionReason string  `json:"selection_reason"`
+}
+
+type DiagnosticSymbolLinkResult struct {
+	WorkspaceID           string                  `json:"workspace_id"`
+	Path                  string                  `json:"path"`
+	DiagnosticFingerprint string                  `json:"diagnostic_fingerprint"`
+	LinkedSymbol          *DiagnosticLinkedSymbol `json:"linked_symbol,omitempty"`
+	CandidateCount        int                     `json:"candidate_count"`
+	EvidenceSource        string                  `json:"evidence_source"`
+	SelectionReason       string                  `json:"selection_reason"`
+	Warnings              []string                `json:"warnings"`
+	GeneratedAt           string                  `json:"generated_at"`
+}
+
 func NormalizeDiagnostics(ctx context.Context, workspaceID string, repoRoot string, inputJSONPath string, sourceKind string, sourceName string) (*DiagnosticsBatch, error) {
 	cmd := exec.CommandContext(
 		ctx,
@@ -85,4 +124,65 @@ func NormalizeDiagnosticsPayload(ctx context.Context, workspaceID string, repoRo
 		return nil, fmt.Errorf("close live diagnostics payload: %w", err)
 	}
 	return NormalizeDiagnostics(ctx, workspaceID, repoRoot, inputPath, sourceKind, sourceName)
+}
+
+func LinkDiagnosticSymbol(
+	ctx context.Context,
+	workspaceID string,
+	diagnosticPath string,
+	startLine int,
+	endLine int,
+	diagnosticFingerprint string,
+	candidates []DiagnosticSymbolCandidate,
+) (*DiagnosticSymbolLinkResult, error) {
+	payload, err := json.Marshal(candidates)
+	if err != nil {
+		return nil, fmt.Errorf("encode diagnostic symbol candidates: %w", err)
+	}
+	inputFile, err := os.CreateTemp("", "xmustard-diagnostic-symbol-candidates-*.json")
+	if err != nil {
+		return nil, fmt.Errorf("create diagnostic symbol candidates temp file: %w", err)
+	}
+	inputPath := inputFile.Name()
+	defer os.Remove(inputPath)
+	if _, err := inputFile.Write(payload); err != nil {
+		inputFile.Close()
+		return nil, fmt.Errorf("write diagnostic symbol candidates: %w", err)
+	}
+	if err := inputFile.Close(); err != nil {
+		return nil, fmt.Errorf("close diagnostic symbol candidates: %w", err)
+	}
+
+	cmd := exec.CommandContext(
+		ctx,
+		"cargo",
+		"run",
+		"--quiet",
+		"--bin",
+		"xmustard-core",
+		"--",
+		"link-diagnostic-symbol",
+		workspaceID,
+		diagnosticPath,
+		fmt.Sprintf("%d", startLine),
+		fmt.Sprintf("%d", endLine),
+		diagnosticFingerprint,
+		inputPath,
+	)
+	cmd.Dir = rustCoreDir()
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("rust-core link-diagnostic-symbol failed: %w: %s", err, stderr.String())
+	}
+
+	var result DiagnosticSymbolLinkResult
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		return nil, fmt.Errorf("decode rust-core diagnostic symbol link: %w", err)
+	}
+	return &result, nil
 }

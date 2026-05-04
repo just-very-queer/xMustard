@@ -201,6 +201,66 @@ fn main() {
                 }
             }
         }
+        "link-diagnostic-symbol" => {
+            let Some(workspace_id) = args.next() else {
+                eprintln!("usage: xmustard-core link-diagnostic-symbol <workspace_id> <diagnostic_path> <start_line> <end_line> <diagnostic_fingerprint> <candidates_json_path>");
+                std::process::exit(2);
+            };
+            let Some(diagnostic_path) = args.next() else {
+                eprintln!("usage: xmustard-core link-diagnostic-symbol <workspace_id> <diagnostic_path> <start_line> <end_line> <diagnostic_fingerprint> <candidates_json_path>");
+                std::process::exit(2);
+            };
+            let Some(start_line_raw) = args.next() else {
+                eprintln!("usage: xmustard-core link-diagnostic-symbol <workspace_id> <diagnostic_path> <start_line> <end_line> <diagnostic_fingerprint> <candidates_json_path>");
+                std::process::exit(2);
+            };
+            let Some(end_line_raw) = args.next() else {
+                eprintln!("usage: xmustard-core link-diagnostic-symbol <workspace_id> <diagnostic_path> <start_line> <end_line> <diagnostic_fingerprint> <candidates_json_path>");
+                std::process::exit(2);
+            };
+            let Some(diagnostic_fingerprint) = args.next() else {
+                eprintln!("usage: xmustard-core link-diagnostic-symbol <workspace_id> <diagnostic_path> <start_line> <end_line> <diagnostic_fingerprint> <candidates_json_path>");
+                std::process::exit(2);
+            };
+            let Some(candidates_json_path) = args.next() else {
+                eprintln!("usage: xmustard-core link-diagnostic-symbol <workspace_id> <diagnostic_path> <start_line> <end_line> <diagnostic_fingerprint> <candidates_json_path>");
+                std::process::exit(2);
+            };
+            let start_line = match start_line_raw.parse::<usize>() {
+                Ok(value) => value,
+                Err(err) => {
+                    eprintln!("link-diagnostic-symbol invalid start_line: {err}");
+                    std::process::exit(2);
+                }
+            };
+            let end_line = match end_line_raw.parse::<usize>() {
+                Ok(value) => value,
+                Err(err) => {
+                    eprintln!("link-diagnostic-symbol invalid end_line: {err}");
+                    std::process::exit(2);
+                }
+            };
+            match xmustard_core::diagnostics::link_diagnostic_symbol_file(
+                &workspace_id,
+                &diagnostic_path,
+                start_line,
+                end_line,
+                &diagnostic_fingerprint,
+                &PathBuf::from(candidates_json_path),
+            ) {
+                Ok(result) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&result)
+                            .expect("diagnostic symbol link result should serialize")
+                    );
+                }
+                Err(err) => {
+                    eprintln!("link-diagnostic-symbol failed: {err}");
+                    std::process::exit(1);
+                }
+            }
+        }
         "normalize-lsp-definition" => {
             let Some(workspace_id) = args.next() else {
                 eprintln!(

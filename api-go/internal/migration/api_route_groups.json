@@ -81,7 +81,7 @@
     "group": "workspace_diagnostics",
     "current_owner": "api-go + rust-core",
     "target_owner": "api-go + rust-core",
-    "notes": "Diagnostics status, durable baseline reads/runs, and live LSP diagnostics reads. Go owns delivery, active LSP session capture, and explicit Postgres baseline actions; Rust owns diagnostic normalization and semantic meaning.",
+    "notes": "Diagnostics status, durable baseline reads/runs, and live LSP diagnostics reads. Go owns delivery, active LSP session capture, explicit Postgres baseline actions, and durable symbol-candidate retrieval; Rust owns diagnostic normalization, semantic meaning, and conservative durable-baseline diagnostic-to-symbol link decisions. Live diagnostic-to-symbol linking is not claimed without readiness metadata.",
     "endpoints": [
       "/api/workspaces/{workspace_id}/diagnostics/status",
       "/api/workspaces/{workspace_id}/diagnostics",

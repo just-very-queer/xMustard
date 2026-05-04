@@ -35,6 +35,48 @@ pub struct RustDiagnosticsBatch {
     pub generated_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustDiagnosticSymbolCandidate {
+    pub symbol_id: i64,
+    pub path: String,
+    pub symbol: String,
+    pub kind: String,
+    pub language: Option<String>,
+    pub line_start: Option<usize>,
+    pub line_end: Option<usize>,
+    pub enclosing_scope: Option<String>,
+    pub signature_text: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustDiagnosticLinkedSymbol {
+    pub symbol_id: i64,
+    pub path: String,
+    pub symbol: String,
+    pub kind: String,
+    pub language: Option<String>,
+    pub line_start: Option<usize>,
+    pub line_end: Option<usize>,
+    pub enclosing_scope: Option<String>,
+    pub signature_text: Option<String>,
+    pub link_strategy: String,
+    pub evidence_source: String,
+    pub selection_reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustDiagnosticSymbolLinkResult {
+    pub workspace_id: String,
+    pub path: String,
+    pub diagnostic_fingerprint: String,
+    pub linked_symbol: Option<RustDiagnosticLinkedSymbol>,
+    pub candidate_count: usize,
+    pub evidence_source: String,
+    pub selection_reason: String,
+    pub warnings: Vec<String>,
+    pub generated_at: String,
+}
+
 pub fn normalize_diagnostics_file(
     workspace_id: &str,
     root_path: &Path,
@@ -56,6 +98,62 @@ pub fn normalize_diagnostics_file(
         source_kind,
         source_name,
     ))
+}
+
+pub fn link_diagnostic_symbol_file(
+    workspace_id: &str,
+    diagnostic_path: &str,
+    start_line: usize,
+    end_line: usize,
+    diagnostic_fingerprint: &str,
+    candidates_path: &Path,
+) -> Result<RustDiagnosticSymbolLinkResult, std::io::Error> {
+    let content = fs::read_to_string(candidates_path)?;
+    let payload = serde_json::from_str::<Value>(&content).map_err(|err| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("decode diagnostic symbol candidates JSON: {err}"),
+        )
+    })?;
+    Ok(link_diagnostic_symbol_payload(
+        workspace_id,
+        diagnostic_path,
+        start_line,
+        end_line,
+        diagnostic_fingerprint,
+        &payload,
+    ))
+}
+
+pub fn link_diagnostic_symbol_payload(
+    workspace_id: &str,
+    diagnostic_path: &str,
+    start_line: usize,
+    end_line: usize,
+    diagnostic_fingerprint: &str,
+    payload: &Value,
+) -> RustDiagnosticSymbolLinkResult {
+    let generated_at = Utc::now().to_rfc3339();
+    let mut warnings = Vec::new();
+    let candidates = diagnostic_symbol_candidates(payload, &mut warnings);
+    let linked_symbol = choose_diagnostic_symbol_link(diagnostic_path, start_line, end_line, &candidates);
+    let selection_reason = if linked_symbol.is_some() {
+        "Rust selected a conservative diagnostic-to-symbol link from durable diagnostic and symbol rows.".to_string()
+    } else {
+        "Rust left the diagnostic unlinked because durable symbol candidates did not produce one unambiguous conservative match.".to_string()
+    };
+
+    RustDiagnosticSymbolLinkResult {
+        workspace_id: workspace_id.to_string(),
+        path: diagnostic_path.trim().to_string(),
+        diagnostic_fingerprint: diagnostic_fingerprint.trim().to_string(),
+        linked_symbol,
+        candidate_count: candidates.len(),
+        evidence_source: "rust_diagnostic_symbol_link".to_string(),
+        selection_reason,
+        warnings,
+        generated_at,
+    }
 }
 
 pub fn normalize_diagnostics_payload(
@@ -143,6 +241,116 @@ pub fn normalize_diagnostics_payload(
         severity_counts,
         warnings,
         generated_at,
+    }
+}
+
+fn diagnostic_symbol_candidates(
+    payload: &Value,
+    warnings: &mut Vec<String>,
+) -> Vec<RustDiagnosticSymbolCandidate> {
+    let items = if let Some(items) = payload.get("candidates").and_then(Value::as_array) {
+        items
+    } else if let Some(items) = payload.as_array() {
+        items
+    } else {
+        warnings.push("No diagnostic symbol candidate array was provided.".to_string());
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for item in items {
+        match serde_json::from_value::<RustDiagnosticSymbolCandidate>(item.clone()) {
+            Ok(candidate) => out.push(candidate),
+            Err(err) => warnings.push(format!("Skipped invalid diagnostic symbol candidate: {err}")),
+        }
+    }
+    out
+}
+
+fn choose_diagnostic_symbol_link(
+    diagnostic_path: &str,
+    start_line: usize,
+    end_line: usize,
+    candidates: &[RustDiagnosticSymbolCandidate],
+) -> Option<RustDiagnosticLinkedSymbol> {
+    let path = diagnostic_path.trim();
+    let exact: Vec<&RustDiagnosticSymbolCandidate> = candidates
+        .iter()
+        .filter(|item| item.path == path && item.line_start == Some(start_line))
+        .collect();
+    if exact.len() == 1 {
+        return Some(candidate_link(
+            exact[0],
+            "diagnostic_start_line_exact_symbol_anchor",
+            "The diagnostic starts on exactly one durable symbol anchor line.",
+        ));
+    }
+    if exact.len() > 1 {
+        return None;
+    }
+
+    let normalized_end = end_line.max(start_line);
+    let mut enclosing: Vec<&RustDiagnosticSymbolCandidate> = candidates
+        .iter()
+        .filter(|item| {
+            item.path == path
+                && item
+                    .line_start
+                    .zip(item.line_end)
+                    .map(|(symbol_start, symbol_end)| {
+                        symbol_start <= start_line && symbol_end >= normalized_end
+                    })
+                    .unwrap_or(false)
+        })
+        .collect();
+    if enclosing.is_empty() {
+        return None;
+    }
+    enclosing.sort_by_key(|item| {
+        let start = item.line_start.unwrap_or(usize::MAX);
+        let end = item.line_end.unwrap_or(usize::MAX);
+        end.saturating_sub(start)
+    });
+    let best_span = enclosing[0]
+        .line_start
+        .zip(enclosing[0].line_end)
+        .map(|(start, end)| end.saturating_sub(start));
+    let narrowest: Vec<&RustDiagnosticSymbolCandidate> = enclosing
+        .into_iter()
+        .filter(|item| {
+            item.line_start
+                .zip(item.line_end)
+                .map(|(start, end)| Some(end.saturating_sub(start)) == best_span)
+                .unwrap_or(false)
+        })
+        .collect();
+    if narrowest.len() == 1 {
+        return Some(candidate_link(
+            narrowest[0],
+            "diagnostic_range_unique_narrowest_symbol",
+            "The diagnostic range is enclosed by exactly one narrowest durable symbol range.",
+        ));
+    }
+    None
+}
+
+fn candidate_link(
+    candidate: &RustDiagnosticSymbolCandidate,
+    strategy: &str,
+    reason: &str,
+) -> RustDiagnosticLinkedSymbol {
+    RustDiagnosticLinkedSymbol {
+        symbol_id: candidate.symbol_id,
+        path: candidate.path.clone(),
+        symbol: candidate.symbol.clone(),
+        kind: candidate.kind.clone(),
+        language: candidate.language.clone(),
+        line_start: candidate.line_start,
+        line_end: candidate.line_end,
+        enclosing_scope: candidate.enclosing_scope.clone(),
+        signature_text: candidate.signature_text.clone(),
+        link_strategy: strategy.to_string(),
+        evidence_source: "rust_diagnostic_symbol_link".to_string(),
+        selection_reason: reason.to_string(),
     }
 }
 
@@ -313,5 +521,118 @@ mod tests {
         assert_eq!(item.source_kind, "lsp");
         assert_eq!(item.source_name, "typescript-language-server");
         assert!(!item.fingerprint.is_empty());
+    }
+
+    #[test]
+    fn links_diagnostic_to_unique_exact_symbol_anchor() {
+        let payload = json!([
+            {
+                "symbol_id": 21,
+                "path": "src/app.py",
+                "symbol": "ExportService",
+                "kind": "class",
+                "language": "python",
+                "line_start": 1,
+                "line_end": 12,
+                "enclosing_scope": null,
+                "signature_text": "class ExportService:"
+            }
+        ]);
+
+        let result = super::link_diagnostic_symbol_payload(
+            "workspace-1",
+            "src/app.py",
+            1,
+            1,
+            "diagfp",
+            &payload,
+        );
+
+        let link = result.linked_symbol.expect("expected linked symbol");
+        assert_eq!(link.symbol, "ExportService");
+        assert_eq!(link.link_strategy, "diagnostic_start_line_exact_symbol_anchor");
+        assert_eq!(link.evidence_source, "rust_diagnostic_symbol_link");
+    }
+
+    #[test]
+    fn links_diagnostic_to_unique_narrowest_enclosing_symbol() {
+        let payload = json!([
+            {
+                "symbol_id": 21,
+                "path": "src/app.py",
+                "symbol": "ExportService",
+                "kind": "class",
+                "language": "python",
+                "line_start": 1,
+                "line_end": 20,
+                "enclosing_scope": null,
+                "signature_text": "class ExportService:"
+            },
+            {
+                "symbol_id": 22,
+                "path": "src/app.py",
+                "symbol": "run",
+                "kind": "method",
+                "language": "python",
+                "line_start": 5,
+                "line_end": 8,
+                "enclosing_scope": "ExportService",
+                "signature_text": "def run(self):"
+            }
+        ]);
+
+        let result = super::link_diagnostic_symbol_payload(
+            "workspace-1",
+            "src/app.py",
+            6,
+            6,
+            "diagfp",
+            &payload,
+        );
+
+        let link = result.linked_symbol.expect("expected linked symbol");
+        assert_eq!(link.symbol, "run");
+        assert_eq!(link.link_strategy, "diagnostic_range_unique_narrowest_symbol");
+    }
+
+    #[test]
+    fn refuses_ambiguous_symbol_links() {
+        let payload = json!([
+            {
+                "symbol_id": 21,
+                "path": "src/app.py",
+                "symbol": "ExportService",
+                "kind": "class",
+                "language": "python",
+                "line_start": 1,
+                "line_end": 5,
+                "enclosing_scope": null,
+                "signature_text": null
+            },
+            {
+                "symbol_id": 22,
+                "path": "src/app.py",
+                "symbol": "ExportFactory",
+                "kind": "class",
+                "language": "python",
+                "line_start": 1,
+                "line_end": 5,
+                "enclosing_scope": null,
+                "signature_text": null
+            }
+        ]);
+
+        let result = super::link_diagnostic_symbol_payload(
+            "workspace-1",
+            "src/app.py",
+            1,
+            1,
+            "diagfp",
+            &payload,
+        );
+
+        assert!(result.linked_symbol.is_none());
+        assert_eq!(result.candidate_count, 2);
+        assert!(result.selection_reason.contains("unambiguous"));
     }
 }

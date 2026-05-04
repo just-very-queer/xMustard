@@ -35,16 +35,18 @@ type WorkspaceSymbolsResult struct {
 }
 
 type DiagnosticLinkedSymbol struct {
-	SymbolID       int64   `json:"symbol_id"`
-	Path           string  `json:"path"`
-	Symbol         string  `json:"symbol"`
-	Kind           string  `json:"kind"`
-	Language       *string `json:"language,omitempty"`
-	LineStart      *int    `json:"line_start,omitempty"`
-	LineEnd        *int    `json:"line_end,omitempty"`
-	EnclosingScope *string `json:"enclosing_scope,omitempty"`
-	SignatureText  *string `json:"signature_text,omitempty"`
-	LinkStrategy   string  `json:"link_strategy"`
+	SymbolID        int64   `json:"symbol_id"`
+	Path            string  `json:"path"`
+	Symbol          string  `json:"symbol"`
+	Kind            string  `json:"kind"`
+	Language        *string `json:"language,omitempty"`
+	LineStart       *int    `json:"line_start,omitempty"`
+	LineEnd         *int    `json:"line_end,omitempty"`
+	EnclosingScope  *string `json:"enclosing_scope,omitempty"`
+	SignatureText   *string `json:"signature_text,omitempty"`
+	LinkStrategy    string  `json:"link_strategy"`
+	EvidenceSource  string  `json:"evidence_source"`
+	SelectionReason string  `json:"selection_reason"`
 }
 
 func ReadWorkspaceSymbols(dataDir string, workspaceID string, query string, limit int) (*WorkspaceSymbolsResult, error) {
@@ -171,58 +173,61 @@ func readWorkspaceSymbolRows(dsn string, schema string, workspaceID string, quer
 	return rows, nil
 }
 
-func findBestDiagnosticSymbolLink(ctx context.Context, connection semanticMaterializationConn, schema string, workspaceID string, relativePath string, startLine int, endLine int) (*DiagnosticLinkedSymbol, error) {
-	_ = endLine
+func findBestDiagnosticSymbolLink(ctx context.Context, connection semanticMaterializationConn, schema string, workspaceID string, relativePath string, startLine int, endLine int, diagnosticFingerprint string) (*DiagnosticLinkedSymbol, error) {
 	var payload []byte
 	err := connection.QueryRow(
 		ctx,
 		fmt.Sprintf(`
-			select coalesce((
-				select case
-					when jsonb_array_length(matches) = 1
-						then jsonb_set(matches->0, '{link_strategy}', '"diagnostic_start_line_exact_symbol_anchor"'::jsonb, true)
-					else 'null'::jsonb
-				end
-				from (
-					select coalesce(jsonb_agg(jsonb_build_object(
-						'symbol_id', s.symbol_id,
-						'path', s.path,
-						'symbol', s.symbol,
-						'kind', s.kind,
-						'language', s.language,
-						'line_start', s.line_start,
-						'line_end', s.line_end,
-						'enclosing_scope', s.enclosing_scope,
-						'signature_text', s.signature_text
-					) order by s.symbol), '[]'::jsonb) as matches
-					from (
-						select s.symbol_id, s.path, s.symbol, s.kind, s.language, s.line_start, s.line_end, s.enclosing_scope, s.signature_text
-						from %s.symbols s
-						where s.workspace_id = $1
-						  and s.path = $2
-						  and s.line_start is not null
-						  and s.line_start = $3
-						order by s.symbol asc
-						limit 2
-					) s
-				) candidates
-			), 'null'::jsonb)
+			select coalesce(jsonb_agg(jsonb_build_object(
+				'symbol_id', candidate.symbol_id,
+				'path', candidate.path,
+				'symbol', candidate.symbol,
+				'kind', candidate.kind,
+				'language', candidate.language,
+				'line_start', candidate.line_start,
+				'line_end', candidate.line_end,
+				'enclosing_scope', candidate.enclosing_scope,
+				'signature_text', candidate.signature_text
+			) order by coalesce(candidate.line_start, 2147483647), coalesce(candidate.line_end, 2147483647), candidate.symbol), '[]'::jsonb)
+			from (
+				select s.symbol_id, s.path, s.symbol, s.kind, s.language, s.line_start, s.line_end, s.enclosing_scope, s.signature_text
+				from %s.symbols s
+				where s.workspace_id = $1
+				  and s.path = $2
+				  and s.line_start is not null
+				  and (
+					s.line_start = $3
+					or (s.line_end is not null and s.line_start <= $3 and s.line_end >= $4)
+				  )
+				order by coalesce(s.line_start, 2147483647), coalesce(s.line_end, 2147483647), s.symbol
+				limit 50
+			) candidate
 		`, schema),
 		workspaceID,
 		relativePath,
 		startLine,
+		endLine,
 	).Scan(&payload)
 	if err != nil {
-		return nil, fmt.Errorf("read diagnostic symbol link: %w", err)
+		return nil, fmt.Errorf("read diagnostic symbol candidates: %w", err)
 	}
-	if strings.TrimSpace(string(payload)) == "null" || len(payload) == 0 {
+	var candidates []rustcore.DiagnosticSymbolCandidate
+	if len(payload) > 0 {
+		if err := json.Unmarshal(payload, &candidates); err != nil {
+			return nil, fmt.Errorf("decode diagnostic symbol candidates: %w", err)
+		}
+	}
+	if len(candidates) == 0 {
 		return nil, nil
 	}
-	var link DiagnosticLinkedSymbol
-	if err := json.Unmarshal(payload, &link); err != nil {
-		return nil, fmt.Errorf("decode diagnostic symbol link: %w", err)
+	linkResult, err := rustcore.LinkDiagnosticSymbol(ctx, workspaceID, relativePath, startLine, endLine, diagnosticFingerprint, candidates)
+	if err != nil {
+		return nil, err
 	}
-	return &link, nil
+	if linkResult.LinkedSymbol == nil {
+		return nil, nil
+	}
+	return convertRustDiagnosticLinkedSymbol(linkResult.LinkedSymbol), nil
 }
 
 func normalizeWorkspaceSymbolLimit(limit int) int {
@@ -251,4 +256,24 @@ func convertRustDocumentSymbols(items []rustcore.DocumentSymbolRecord) []PathSym
 		})
 	}
 	return out
+}
+
+func convertRustDiagnosticLinkedSymbol(item *rustcore.DiagnosticLinkedSymbol) *DiagnosticLinkedSymbol {
+	if item == nil {
+		return nil
+	}
+	return &DiagnosticLinkedSymbol{
+		SymbolID:        item.SymbolID,
+		Path:            item.Path,
+		Symbol:          item.Symbol,
+		Kind:            item.Kind,
+		Language:        item.Language,
+		LineStart:       item.LineStart,
+		LineEnd:         item.LineEnd,
+		EnclosingScope:  item.EnclosingScope,
+		SignatureText:   item.SignatureText,
+		LinkStrategy:    item.LinkStrategy,
+		EvidenceSource:  item.EvidenceSource,
+		SelectionReason: item.SelectionReason,
+	}
 }

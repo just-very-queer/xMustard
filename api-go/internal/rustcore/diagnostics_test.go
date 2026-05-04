@@ -44,4 +44,36 @@ func TestNormalizeDiagnosticsPayload(t *testing.T) {
 	if result.DiagnosticCount != 1 || result.Diagnostics[0].Path != "src/app.py" {
 		t.Fatalf("unexpected diagnostics result: %#v", result)
 	}
+	if result.Diagnostics[0].RangeStartLine != 1 || result.Diagnostics[0].RangeStartColumn != 9 || result.Diagnostics[0].Fingerprint == "" {
+		t.Fatalf("expected linkable one-based diagnostic coordinates, got %#v", result.Diagnostics[0])
+	}
+}
+
+func TestLinkDiagnosticSymbolUsesRustContract(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	lineStart := 1
+	lineEnd := 10
+	signature := "class ExportService:"
+	result, err := LinkDiagnosticSymbol(ctx, "workspace-1", "src/app.py", 1, 1, "diagfp", []DiagnosticSymbolCandidate{
+		{
+			SymbolID:      21,
+			Path:          "src/app.py",
+			Symbol:        "ExportService",
+			Kind:          "class",
+			LineStart:     &lineStart,
+			LineEnd:       &lineEnd,
+			SignatureText: &signature,
+		},
+	})
+	if err != nil {
+		t.Fatalf("link diagnostic symbol: %v", err)
+	}
+	if result.LinkedSymbol == nil || result.LinkedSymbol.Symbol != "ExportService" {
+		t.Fatalf("expected Rust-linked symbol, got %#v", result)
+	}
+	if result.EvidenceSource != "rust_diagnostic_symbol_link" || result.LinkedSymbol.LinkStrategy != "diagnostic_start_line_exact_symbol_anchor" {
+		t.Fatalf("expected Rust link provenance, got %#v", result)
+	}
 }

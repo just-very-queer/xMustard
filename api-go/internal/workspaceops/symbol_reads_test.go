@@ -158,15 +158,15 @@ func TestReadDiagnosticsDecoratesRowsWithConservativeSymbolLinks(t *testing.T) {
 			"generated_at":       "2026-05-04T00:00:00Z",
 		},
 	})
-	linkJSON, _ := json.Marshal(map[string]any{
-		"symbol_id":     21,
-		"path":          "src/app.py",
-		"symbol":        "ExportService",
-		"kind":          "class",
-		"line_start":    1,
-		"line_end":      1,
-		"link_strategy": "diagnostic_start_line_exact_symbol_anchor",
-	})
+	candidatesJSON, _ := json.Marshal([]map[string]any{{
+		"symbol_id":      21,
+		"path":           "src/app.py",
+		"symbol":         "ExportService",
+		"kind":           "class",
+		"line_start":     1,
+		"line_end":       1,
+		"signature_text": "class ExportService:",
+	}})
 
 	fakeConn := &fakeSemanticConn{
 		queryRows: []pgx.Row{
@@ -185,7 +185,7 @@ func TestReadDiagnosticsDecoratesRowsWithConservativeSymbolLinks(t *testing.T) {
 				"2026-05-04T00:00:00Z",
 			),
 			fakeSemanticJSONRow(diagnosticsJSON),
-			fakeSemanticJSONRow(linkJSON),
+			fakeSemanticJSONRow(candidatesJSON),
 		},
 	}
 	restore := stubSemanticPostgresConnection(fakeConn)
@@ -200,6 +200,9 @@ func TestReadDiagnosticsDecoratesRowsWithConservativeSymbolLinks(t *testing.T) {
 	}
 	if result.Diagnostics[0].LinkedSymbol == nil || result.Diagnostics[0].LinkedSymbol.Symbol != "ExportService" {
 		t.Fatalf("expected conservative symbol link, got %#v", result.Diagnostics[0])
+	}
+	if result.Diagnostics[0].LinkedSymbol.LinkStrategy != "diagnostic_start_line_exact_symbol_anchor" || result.Diagnostics[0].LinkedSymbol.EvidenceSource != "rust_diagnostic_symbol_link" {
+		t.Fatalf("expected Rust-owned link provenance, got %#v", result.Diagnostics[0].LinkedSymbol)
 	}
 }
 
@@ -250,7 +253,7 @@ func TestReadDiagnosticsLeavesUnmatchedRowsUnlinked(t *testing.T) {
 				"2026-05-04T00:00:00Z",
 			),
 			fakeSemanticJSONRow(diagnosticsJSON),
-			fakeSemanticJSONRow([]byte("null")),
+			fakeSemanticJSONRow([]byte("[]")),
 		},
 	}
 	restore := stubSemanticPostgresConnection(fakeConn)
@@ -265,5 +268,88 @@ func TestReadDiagnosticsLeavesUnmatchedRowsUnlinked(t *testing.T) {
 	}
 	if result.Diagnostics[0].LinkedSymbol != nil {
 		t.Fatalf("expected unmatched diagnostic to stay unlinked, got %#v", result.Diagnostics[0])
+	}
+}
+
+func TestReadDiagnosticsLeavesAmbiguousSymbolMatchesUnlinked(t *testing.T) {
+	dataDir, workspaceID, _, _ := writeIssueContextFixture(t, false)
+	dsn := "postgresql://xmustard:secret@localhost:5432/xmustard"
+	if err := writeJSON(filepath.Join(dataDir, "settings.json"), appSettings{
+		LocalAgentType: "codex",
+		PostgresDSN:    &dsn,
+		PostgresSchema: "xmustard",
+	}); err != nil {
+		t.Fatalf("write settings: %v", err)
+	}
+
+	countsJSON, _ := json.Marshal(map[string]int{"error": 1})
+	diagnosticsJSON, _ := json.Marshal([]map[string]any{
+		{
+			"workspace_id":       workspaceID,
+			"diagnostic_run_id":  "diag_fixture",
+			"path":               "src/app.py",
+			"range_start_line":   1,
+			"range_start_column": 1,
+			"range_end_line":     1,
+			"range_end_column":   5,
+			"severity":           "error",
+			"message":            "Ambiguous diagnostic.",
+			"source_kind":        "lsp",
+			"source_name":        "pyright",
+			"fingerprint":        "diagfp3",
+			"generated_at":       "2026-05-04T00:00:00Z",
+		},
+	})
+	candidatesJSON, _ := json.Marshal([]map[string]any{
+		{
+			"symbol_id":  21,
+			"path":       "src/app.py",
+			"symbol":     "ExportService",
+			"kind":       "class",
+			"line_start": 1,
+			"line_end":   5,
+		},
+		{
+			"symbol_id":  22,
+			"path":       "src/app.py",
+			"symbol":     "ExportFactory",
+			"kind":       "class",
+			"line_start": 1,
+			"line_end":   5,
+		},
+	})
+
+	fakeConn := &fakeSemanticConn{
+		queryRows: []pgx.Row{
+			fakeSemanticBaselineRowValues(
+				"diag_fixture",
+				"lsp",
+				"pyright",
+				"batchfp",
+				(*string)(nil),
+				0,
+				false,
+				1,
+				countsJSON,
+				"diagnostics.json",
+				"xmustard",
+				"2026-05-04T00:00:00Z",
+			),
+			fakeSemanticJSONRow(diagnosticsJSON),
+			fakeSemanticJSONRow(candidatesJSON),
+		},
+	}
+	restore := stubSemanticPostgresConnection(fakeConn)
+	defer restore()
+
+	result, err := ReadDiagnostics(dataDir, workspaceID)
+	if err != nil {
+		t.Fatalf("read diagnostics: %v", err)
+	}
+	if len(result.Diagnostics) != 1 {
+		t.Fatalf("expected one diagnostic row, got %#v", result)
+	}
+	if result.Diagnostics[0].LinkedSymbol != nil {
+		t.Fatalf("expected ambiguous diagnostic to stay unlinked, got %#v", result.Diagnostics[0])
 	}
 }

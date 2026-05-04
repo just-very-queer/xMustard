@@ -50,6 +50,8 @@ pub struct DiagnosticContract {
     pub delivery_owner: &'static str,
     pub durable_store: &'static str,
     pub required_fields: Vec<&'static str>,
+    pub optional_link_fields: Vec<&'static str>,
+    pub link_strategies: Vec<&'static str>,
     pub normalized_severities: Vec<&'static str>,
     pub source_kinds: Vec<&'static str>,
     pub notes: &'static str,
@@ -290,9 +292,24 @@ pub fn diagnostics_contract_v1() -> DiagnosticContract {
             "fingerprint",
             "generated_at",
         ],
+        optional_link_fields: vec![
+            "linked_symbol.symbol_id",
+            "linked_symbol.path",
+            "linked_symbol.symbol",
+            "linked_symbol.kind",
+            "linked_symbol.line_start",
+            "linked_symbol.line_end",
+            "linked_symbol.link_strategy",
+            "linked_symbol.evidence_source",
+            "linked_symbol.selection_reason",
+        ],
+        link_strategies: vec![
+            "diagnostic_start_line_exact_symbol_anchor",
+            "diagnostic_range_unique_narrowest_symbol",
+        ],
         normalized_severities: vec!["error", "warning", "info", "hint"],
         source_kinds: vec!["lsp", "compiler", "test", "scanner", "manual"],
-        notes: "Rust normalizes diagnostic meaning from LSP/compiler/scanner inputs; Go delivers it; Postgres persists baselines and replayable rows. Python must not become the first LSP diagnostics owner.",
+        notes: "Rust normalizes diagnostic meaning from LSP/compiler/scanner inputs and owns conservative diagnostic-to-symbol link decisions over durable symbol candidates; Go delivers it; Postgres persists baselines and replayable rows. Live LSP links still require explicit readiness metadata before being claimed. Python must not become the first LSP diagnostics owner.",
     }
 }
 
@@ -367,6 +384,16 @@ mod tests {
         assert_eq!(contract.delivery_owner, "api-go");
         assert_eq!(contract.durable_store, "postgres.diagnostics");
         assert!(contract.required_fields.contains(&"fingerprint"));
+        assert!(
+            contract
+                .optional_link_fields
+                .contains(&"linked_symbol.link_strategy")
+        );
+        assert!(
+            contract
+                .link_strategies
+                .contains(&"diagnostic_start_line_exact_symbol_anchor")
+        );
         assert!(contract.normalized_severities.contains(&"warning"));
         assert!(contract.source_kinds.contains(&"lsp"));
     }

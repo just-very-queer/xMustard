@@ -545,7 +545,7 @@ func readDiagnosticRows(dsn string, schema string, workspaceID string, runID str
 		}
 	}
 	for idx := range rows {
-		link, err := findBestDiagnosticSymbolLink(ctx, connection, schema, workspaceID, rows[idx].Path, rows[idx].RangeStartLine, rows[idx].RangeEndLine)
+		link, err := findBestDiagnosticSymbolLink(ctx, connection, schema, workspaceID, rows[idx].Path, rows[idx].RangeStartLine, rows[idx].RangeEndLine, rows[idx].Fingerprint)
 		if err != nil {
 			return nil, err
 		}
