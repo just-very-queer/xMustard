@@ -315,6 +315,8 @@ func runWorkspace(args []string) {
 		payload, err = workspaceops.FindReferences(*dataDir, workspaceID, *path, *line, *column, *includeDeclaration)
 	case "workspace-symbols":
 		payload, err = workspaceops.ReadWorkspaceSymbols(*dataDir, workspaceID, *query, *limit)
+	case "live-workspace-symbols":
+		payload, err = workspaceops.LSPWorkspaceSymbols(*dataDir, workspaceID, *language, *query, *limit)
 	case "explain-path":
 		payload, err = workspaceops.ExplainPath(*dataDir, workspaceID, *path)
 	case "semantic-search":
@@ -351,7 +353,7 @@ func runWorkspace(args []string) {
 			SchemaName: optionalFlagString(*schema),
 		})
 	default:
-		fatalUsage("usage: xmustard-ops workspace <scan|repo-map|changed-symbols|impact|repo-context|retrieval-search|path-symbols|document-symbols|go-to-definition|references|workspace-symbols|explain-path|semantic-search|postgres-materialize-path|postgres-materialize-workspace-symbols|postgres-materialize-semantic-search|semantic-index-materialize> <workspace_id> [flags]")
+		fatalUsage("usage: xmustard-ops workspace <scan|repo-map|changed-symbols|impact|repo-context|retrieval-search|path-symbols|document-symbols|go-to-definition|references|workspace-symbols|live-workspace-symbols|explain-path|semantic-search|postgres-materialize-path|postgres-materialize-workspace-symbols|postgres-materialize-semantic-search|semantic-index-materialize> <workspace_id> [flags]")
 	}
 	writeJSON(payload, err)
 }

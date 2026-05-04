@@ -201,6 +201,38 @@ func LSPDocumentSymbols(dataDir string, workspaceID string, relativePath string)
 	)
 }
 
+func LSPWorkspaceSymbols(dataDir string, workspaceID string, language string, query string, limit int) (*rustcore.LSPWorkspaceSymbolsResult, error) {
+	workspace, err := getWorkspaceRecord(dataDir, workspaceID)
+	if err != nil {
+		return nil, err
+	}
+	config, err := resolveLSPServerForLanguage(workspace.RootPath, language)
+	if err != nil {
+		return nil, err
+	}
+	session, err := acquireLSPSession(dataDir, workspaceID, workspace.RootPath, config)
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	payload, err := session.workspaceSymbols(ctx, query)
+	if err != nil {
+		releaseLSPSession(workspaceID, config.ServerID, session)
+		return nil, err
+	}
+	return rustcore.NormalizeLSPWorkspaceSymbols(
+		ctx,
+		workspaceID,
+		workspace.RootPath,
+		query,
+		normalizeWorkspaceSymbolLimit(limit),
+		config.ServerID,
+		payload,
+	)
+}
+
 func acquireLSPSession(dataDir string, workspaceID string, rootPath string, config *lspServerConfig) (*lspSession, error) {
 	key := lspSessionKey{WorkspaceID: workspaceID, ServerID: config.ServerID}
 	lspSessionsMu.Lock()
@@ -331,6 +363,16 @@ func (session *lspSession) documentSymbols(ctx context.Context, absolutePath str
 	})
 }
 
+func (session *lspSession) workspaceSymbols(ctx context.Context, query string) (json.RawMessage, error) {
+	session.touch()
+	if err := session.ensureInitialized(ctx); err != nil {
+		return nil, err
+	}
+	return session.request(ctx, "workspace/symbol", map[string]any{
+		"query": strings.TrimSpace(query),
+	})
+}
+
 func (session *lspSession) references(ctx context.Context, absolutePath string, line int, column int, includeDeclaration bool) (json.RawMessage, error) {
 	session.touch()
 	if err := session.ensureInitialized(ctx); err != nil {
@@ -405,6 +447,9 @@ func (session *lspSession) ensureInitialized(ctx context.Context) error {
 						"valueSet": []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26},
 					},
 				},
+			},
+			"workspace": map[string]any{
+				"symbol": map[string]any{},
 			},
 		},
 		"clientInfo": map[string]any{
@@ -827,6 +872,30 @@ func defaultResolveLSPServerForPath(rootPath string, relativePath string) (*lspS
 		}, nil
 	}
 	return nil, fmt.Errorf("%w: no LSP server mapping for %s", ErrInvalidSemanticRequest, extension)
+}
+
+func resolveLSPServerForLanguage(rootPath string, language string) (*lspServerConfig, error) {
+	normalized := strings.ToLower(strings.TrimSpace(language))
+	if normalized == "" {
+		return nil, fmt.Errorf("%w: language is required for live LSP workspace symbols", ErrInvalidSemanticRequest)
+	}
+	hints := map[string]string{
+		"python":     ".py",
+		"py":         ".py",
+		"typescript": ".ts",
+		"ts":         ".ts",
+		"javascript": ".js",
+		"js":         ".js",
+		"go":         ".go",
+		"golang":     ".go",
+		"rust":       ".rs",
+		"rs":         ".rs",
+	}
+	extension, ok := hints[normalized]
+	if !ok {
+		return nil, fmt.Errorf("%w: no LSP server mapping for language %s", ErrInvalidSemanticRequest, language)
+	}
+	return resolveLSPServerForPath(rootPath, "workspace"+extension)
 }
 
 func containsString(items []string, target string) bool {

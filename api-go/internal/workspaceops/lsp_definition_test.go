@@ -96,6 +96,33 @@ func TestLspDefinitionAndReferencesReuseWorkspaceScopedSession(t *testing.T) {
 	}
 }
 
+func TestLspDefinitionAndWorkspaceSymbolsReuseWorkspaceScopedSession(t *testing.T) {
+	defer closeAllLSPSessions()
+	dataDir, workspaceID, _, repoRoot := writeIssueContextFixture(t, false)
+	logPath := filepath.Join(t.TempDir(), "fake-lsp.log")
+	restore := stubLSPServerResolver(t, repoRoot, logPath)
+	defer restore()
+
+	if _, err := GoToDefinition(dataDir, workspaceID, "src/app.py", 1, 7); err != nil {
+		t.Fatalf("go-to-definition: %v", err)
+	}
+	symbols, err := LSPWorkspaceSymbols(dataDir, workspaceID, "python", "Only", 10)
+	if err != nil {
+		t.Fatalf("workspace-symbols: %v", err)
+	}
+	if symbols.EvidenceSource != "rust_lsp_workspace_symbols" || symbols.SymbolSource != "lsp" {
+		t.Fatalf("expected LSP workspace-symbols evidence, got %#v", symbols)
+	}
+
+	methods := readFakeLSPMethods(t, logPath)
+	if countMethod(methods, "initialize") != 1 {
+		t.Fatalf("expected one initialize for reused session, got %#v", methods)
+	}
+	if countMethod(methods, "textDocument/definition") != 1 || countMethod(methods, "workspace/symbol") != 1 {
+		t.Fatalf("expected definition + workspace/symbol traffic, got %#v", methods)
+	}
+}
+
 func TestLspLiveDiagnosticsUseWorkspaceScopedSession(t *testing.T) {
 	defer closeAllLSPSessions()
 	dataDir, workspaceID, _, repoRoot := writeIssueContextFixture(t, false)
@@ -202,6 +229,31 @@ func TestLspReferencesDoesNotRequirePostgresOrMaterializedSymbols(t *testing.T) 
 	}
 }
 
+func TestLspWorkspaceSymbolsDoesNotRequirePostgresOrMaterializedSymbols(t *testing.T) {
+	defer closeAllLSPSessions()
+	dataDir, workspaceID, _, repoRoot := writeIssueContextFixture(t, false)
+	logPath := filepath.Join(t.TempDir(), "fake-lsp.log")
+	restore := stubLSPServerResolver(t, repoRoot, logPath)
+	defer restore()
+
+	originalConnect := connectSemanticPostgres
+	connectSemanticPostgres = func(ctx context.Context, dsn string) (semanticMaterializationConn, error) {
+		t.Fatalf("unexpected Postgres connect in live LSP workspace-symbols path")
+		return nil, nil
+	}
+	defer func() {
+		connectSemanticPostgres = originalConnect
+	}()
+
+	result, err := LSPWorkspaceSymbols(dataDir, workspaceID, "python", "Only", 5)
+	if err != nil {
+		t.Fatalf("workspace-symbols: %v", err)
+	}
+	if len(result.Symbols) != 2 || result.Symbols[0].Symbol != "OnlyFromWorkspaceLSP" {
+		t.Fatalf("unexpected workspace symbols: %#v", result)
+	}
+}
+
 func TestLspDefinitionReturnsExplicitUnavailableWhenServerBootstrapFails(t *testing.T) {
 	defer closeAllLSPSessions()
 	dataDir, workspaceID, _, _ := writeIssueContextFixture(t, false)
@@ -223,6 +275,32 @@ func TestLspDefinitionReturnsExplicitUnavailableWhenServerBootstrapFails(t *test
 	}
 	if !strings.Contains(err.Error(), "LSP unavailable") {
 		t.Fatalf("expected explicit LSP unavailable error, got %v", err)
+	}
+}
+
+func TestLspWorkspaceSymbolsSmokeWithFakeServer(t *testing.T) {
+	defer closeAllLSPSessions()
+	dataDir, workspaceID, _, repoRoot := writeIssueContextFixture(t, false)
+	logPath := filepath.Join(t.TempDir(), "fake-lsp.log")
+	restore := stubLSPServerResolver(t, repoRoot, logPath)
+	defer restore()
+
+	result, err := LSPWorkspaceSymbols(dataDir, workspaceID, "python", "Only", 5)
+	if err != nil {
+		t.Fatalf("workspace-symbols: %v", err)
+	}
+	if result.EvidenceSource != "rust_lsp_workspace_symbols" || result.SourceName != "fake-pyright" || result.SymbolSource != "lsp" {
+		t.Fatalf("expected Rust-normalized LSP workspace symbols, got %#v", result)
+	}
+	if len(result.Symbols) != 2 || result.Symbols[0].Symbol != "OnlyFromWorkspaceLSP" || result.Symbols[1].Path != "src/workspace.py" {
+		t.Fatalf("unexpected workspace symbols: %#v", result)
+	}
+	methods := readFakeLSPMethods(t, logPath)
+	if countMethod(methods, "initialize") != 1 || countMethod(methods, "workspace/symbol") != 1 {
+		t.Fatalf("expected initialize + workspace/symbol traffic, got %#v", methods)
+	}
+	if countMethod(methods, "textDocument/documentSymbol") != 0 {
+		t.Fatalf("workspace symbols should not use documentSymbol fallback, got %#v", methods)
 	}
 }
 
@@ -401,9 +479,10 @@ func runFakeLSPServer(logPath string) error {
 		case "initialize":
 			if err := writeFakeLSPResponse(writer, message["id"], map[string]any{
 				"capabilities": map[string]any{
-					"definitionProvider":     true,
-					"documentSymbolProvider": true,
-					"referencesProvider":     true,
+					"definitionProvider":      true,
+					"documentSymbolProvider":  true,
+					"referencesProvider":      true,
+					"workspaceSymbolProvider": true,
 				},
 			}); err != nil {
 				return err
@@ -487,6 +566,35 @@ func runFakeLSPServer(logPath string) error {
 								"start": map[string]any{"line": 1, "character": 8},
 								"end":   map[string]any{"line": 1, "character": 11},
 							},
+						},
+					},
+				},
+			}
+			if err := writeFakeLSPResponse(writer, message["id"], response); err != nil {
+				return err
+			}
+		case "workspace/symbol":
+			response := []map[string]any{
+				{
+					"name":          "OnlyFromWorkspaceLSP",
+					"kind":          5,
+					"containerName": "src.app",
+					"location": map[string]any{
+						"uri": fileURL(filepath.Join(repoRoot, "src", "app.py")),
+						"range": map[string]any{
+							"start": map[string]any{"line": 0, "character": 0},
+							"end":   map[string]any{"line": 3, "character": 0},
+						},
+					},
+				},
+				{
+					"name": "WorkspaceHelper",
+					"kind": 12,
+					"location": map[string]any{
+						"uri": fileURL(filepath.Join(repoRoot, "src", "workspace.py")),
+						"range": map[string]any{
+							"start": map[string]any{"line": 5, "character": 2},
+							"end":   map[string]any{"line": 5, "character": 15},
 						},
 					},
 				},

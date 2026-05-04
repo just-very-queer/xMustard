@@ -6,6 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 const MAX_NORMALIZED_REFERENCES: usize = 200;
+const MAX_NORMALIZED_WORKSPACE_SYMBOLS: usize = 200;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RustDefinitionLocation {
@@ -81,6 +82,33 @@ pub struct RustDocumentSymbolsResult {
     pub evidence_source: String,
     pub selection_reason: String,
     pub symbols: Vec<RustDocumentSymbolRecord>,
+    pub warnings: Vec<String>,
+    pub generated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustWorkspaceSymbolRecord {
+    pub path: String,
+    pub symbol: String,
+    pub kind: String,
+    pub line_start: Option<usize>,
+    pub line_end: Option<usize>,
+    pub enclosing_scope: Option<String>,
+    pub evidence_source: String,
+    pub reason: Option<String>,
+    pub score: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustWorkspaceSymbolsResult {
+    pub workspace_id: String,
+    pub query: String,
+    pub limit: usize,
+    pub symbol_source: String,
+    pub source_name: String,
+    pub evidence_source: String,
+    pub selection_reason: String,
+    pub symbols: Vec<RustWorkspaceSymbolRecord>,
     pub warnings: Vec<String>,
     pub generated_at: String,
 }
@@ -325,6 +353,94 @@ pub fn normalize_document_symbols_payload(
     }
 }
 
+pub fn normalize_workspace_symbols_file(
+    workspace_id: &str,
+    root_path: &Path,
+    query: &str,
+    limit: usize,
+    source_name: &str,
+    input_path: &Path,
+) -> Result<RustWorkspaceSymbolsResult, std::io::Error> {
+    let content = fs::read_to_string(input_path)?;
+    let payload = serde_json::from_str::<Value>(&content).map_err(|err| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("decode LSP workspace-symbols JSON: {err}"),
+        )
+    })?;
+    Ok(normalize_workspace_symbols_payload(
+        workspace_id,
+        root_path,
+        query,
+        limit,
+        source_name,
+        &payload,
+    ))
+}
+
+pub fn normalize_workspace_symbols_payload(
+    workspace_id: &str,
+    root_path: &Path,
+    query: &str,
+    limit: usize,
+    source_name: &str,
+    payload: &Value,
+) -> RustWorkspaceSymbolsResult {
+    let generated_at = Utc::now().to_rfc3339();
+    let source_name = normalize_source_name(source_name);
+    let normalized_limit = normalize_workspace_symbol_limit(limit);
+    let mut warnings = Vec::new();
+    let mut symbols = Vec::new();
+
+    match payload {
+        Value::Null => warnings.push("LSP server returned no workspace symbols.".to_string()),
+        Value::Array(items) => {
+            for item in items {
+                if symbols.len() >= normalized_limit {
+                    warnings.push(format!(
+                        "Truncated LSP workspace symbols to {normalized_limit} in-workspace results."
+                    ));
+                    break;
+                }
+                if symbols.len() >= MAX_NORMALIZED_WORKSPACE_SYMBOLS {
+                    warnings.push(format!(
+                        "Truncated LSP workspace symbols to {MAX_NORMALIZED_WORKSPACE_SYMBOLS} in-workspace results."
+                    ));
+                    break;
+                }
+                if let Some(symbol) = workspace_symbol_record(root_path, item, &mut warnings) {
+                    symbols.push(symbol);
+                }
+            }
+        }
+        _ => {
+            warnings.push("Skipped unexpected non-array LSP workspace-symbols payload.".to_string())
+        }
+    }
+
+    if symbols.is_empty() {
+        warnings.push(
+            "No in-workspace symbols were normalized from the LSP workspace/symbol response."
+                .to_string(),
+        );
+    }
+
+    RustWorkspaceSymbolsResult {
+        workspace_id: workspace_id.to_string(),
+        query: query.trim().to_string(),
+        limit: normalized_limit,
+        symbol_source: "lsp".to_string(),
+        source_name,
+        evidence_source: "rust_lsp_workspace_symbols".to_string(),
+        selection_reason:
+            "Rust normalized live LSP workspace/symbol output from a Go-managed workspace session."
+                .to_string(),
+        symbols,
+        warnings,
+        generated_at,
+    }
+}
+
 fn collect_document_symbol(
     root_path: &Path,
     relative_path: &str,
@@ -431,6 +547,88 @@ fn lsp_symbol_kind(value: u64) -> &'static str {
 }
 
 fn document_symbol_score(payload: &Value, enclosing_scope: Option<&str>) -> usize {
+    let base = if enclosing_scope.is_none() { 95 } else { 85 };
+    match payload.get("kind").and_then(Value::as_u64) {
+        Some(5) | Some(12) | Some(6) => base + 5,
+        _ => base,
+    }
+}
+
+fn workspace_symbol_record(
+    root_path: &Path,
+    payload: &Value,
+    warnings: &mut Vec<String>,
+) -> Option<RustWorkspaceSymbolRecord> {
+    let Some(name) = payload
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+    else {
+        warnings.push("Skipped LSP workspace symbol without a name.".to_string());
+        return None;
+    };
+    let Some(location) = payload.get("location") else {
+        warnings.push(format!(
+            "Skipped LSP workspace symbol '{name}' without a location."
+        ));
+        return None;
+    };
+    let Some(uri_value) = location
+        .get("uri")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+    else {
+        warnings.push(format!(
+            "Skipped LSP workspace symbol '{name}' without a location URI."
+        ));
+        return None;
+    };
+    let path = match normalize_file_uri(root_path, uri_value) {
+        Ok(Some(path)) => path,
+        Ok(None) => {
+            warnings.push(format!(
+                "Skipped LSP workspace symbol outside workspace root: {uri_value}"
+            ));
+            return None;
+        }
+        Err(err) => {
+            warnings.push(err);
+            return None;
+        }
+    };
+    let range = location.get("range").unwrap_or(&Value::Null);
+    let start = lsp_position(range.get("start"));
+    let end = lsp_position(range.get("end"));
+    let line_start = if range.is_null() { None } else { Some(start.0) };
+    let line_end = if range.is_null() { None } else { Some(end.0) };
+    let enclosing_scope = payload
+        .get("containerName")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_string);
+    let kind = payload
+        .get("kind")
+        .and_then(Value::as_u64)
+        .map(lsp_symbol_kind)
+        .unwrap_or("function")
+        .to_string();
+    Some(RustWorkspaceSymbolRecord {
+        path,
+        symbol: name.to_string(),
+        kind,
+        line_start,
+        line_end,
+        enclosing_scope: enclosing_scope.clone(),
+        evidence_source: "rust_lsp_workspace_symbol".to_string(),
+        reason: Some("live LSP workspace/symbol result".to_string()),
+        score: workspace_symbol_score(payload, enclosing_scope.as_deref()),
+    })
+}
+
+fn workspace_symbol_score(payload: &Value, enclosing_scope: Option<&str>) -> usize {
     let base = if enclosing_scope.is_none() { 95 } else { 85 };
     match payload.get("kind").and_then(Value::as_u64) {
         Some(5) | Some(12) | Some(6) => base + 5,
@@ -578,6 +776,14 @@ fn normalize_coordinate(value: usize) -> usize {
     if value == 0 { 1 } else { value }
 }
 
+fn normalize_workspace_symbol_limit(value: usize) -> usize {
+    if value == 0 {
+        50
+    } else {
+        value.min(MAX_NORMALIZED_WORKSPACE_SYMBOLS)
+    }
+}
+
 fn normalize_source_name(value: &str) -> String {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -590,9 +796,9 @@ fn normalize_source_name(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        RustDefinitionLocation, RustDocumentSymbolRecord, RustReferenceLocation,
         normalize_definition_payload, normalize_document_symbols_payload,
-        normalize_references_payload,
+        normalize_references_payload, normalize_workspace_symbols_payload, RustDefinitionLocation,
+        RustDocumentSymbolRecord, RustReferenceLocation, RustWorkspaceSymbolRecord,
     };
     use serde_json::json;
     use std::path::Path;
@@ -931,5 +1137,107 @@ mod tests {
                 .iter()
                 .any(|item| item.contains("No in-workspace document symbols"))
         );
+    }
+
+    #[test]
+    fn normalizes_workspace_symbols_from_live_lsp_response() {
+        let root = Path::new("/repo");
+        let payload = json!([
+            {
+                "name": "ExportService",
+                "kind": 5,
+                "containerName": "src.app",
+                "location": {
+                    "uri": "file:///repo/src/app.py",
+                    "range": {
+                        "start": {"line": 0, "character": 0},
+                        "end": {"line": 9, "character": 0}
+                    }
+                }
+            },
+            {
+                "name": "helper",
+                "kind": 12,
+                "location": {
+                    "uri": "file:///repo/src/helper.py"
+                }
+            }
+        ]);
+
+        let result = normalize_workspace_symbols_payload(
+            "workspace-1",
+            root,
+            "Export",
+            25,
+            "pyright",
+            &payload,
+        );
+
+        assert_eq!(result.workspace_id, "workspace-1");
+        assert_eq!(result.query, "Export");
+        assert_eq!(result.limit, 25);
+        assert_eq!(result.symbol_source, "lsp");
+        assert_eq!(result.source_name, "pyright");
+        assert_eq!(result.evidence_source, "rust_lsp_workspace_symbols");
+        assert_eq!(
+            result.symbols,
+            vec![
+                RustWorkspaceSymbolRecord {
+                    path: "src/app.py".to_string(),
+                    symbol: "ExportService".to_string(),
+                    kind: "class".to_string(),
+                    line_start: Some(1),
+                    line_end: Some(10),
+                    enclosing_scope: Some("src.app".to_string()),
+                    evidence_source: "rust_lsp_workspace_symbol".to_string(),
+                    reason: Some("live LSP workspace/symbol result".to_string()),
+                    score: 90,
+                },
+                RustWorkspaceSymbolRecord {
+                    path: "src/helper.py".to_string(),
+                    symbol: "helper".to_string(),
+                    kind: "function".to_string(),
+                    line_start: None,
+                    line_end: None,
+                    enclosing_scope: None,
+                    evidence_source: "rust_lsp_workspace_symbol".to_string(),
+                    reason: Some("live LSP workspace/symbol result".to_string()),
+                    score: 100,
+                },
+            ]
+        );
+        assert!(result.warnings.is_empty());
+    }
+
+    #[test]
+    fn workspace_symbols_reject_non_lsp_materialized_rows() {
+        let root = Path::new("/repo");
+        let payload = json!([
+            {
+                "symbol_id": 21,
+                "path": "src/app.py",
+                "symbol": "ExportService",
+                "kind": "class"
+            }
+        ]);
+
+        let result = normalize_workspace_symbols_payload(
+            "workspace-1",
+            root,
+            "Export",
+            10,
+            "pyright",
+            &payload,
+        );
+
+        assert!(result.symbols.is_empty());
+        assert!(result
+            .warnings
+            .iter()
+            .any(|item| item.contains("without a name")));
+        assert!(result
+            .warnings
+            .iter()
+            .any(|item| item.contains("No in-workspace symbols")));
     }
 }

@@ -410,6 +410,58 @@ fn main() {
                 }
             }
         }
+        "normalize-lsp-workspace-symbols" => {
+            let Some(workspace_id) = args.next() else {
+                eprintln!("usage: xmustard-core normalize-lsp-workspace-symbols <workspace_id> <root_path> <query> <limit> <source_name> <input_json_path>");
+                std::process::exit(2);
+            };
+            let Some(root) = args.next() else {
+                eprintln!("usage: xmustard-core normalize-lsp-workspace-symbols <workspace_id> <root_path> <query> <limit> <source_name> <input_json_path>");
+                std::process::exit(2);
+            };
+            let Some(query) = args.next() else {
+                eprintln!("usage: xmustard-core normalize-lsp-workspace-symbols <workspace_id> <root_path> <query> <limit> <source_name> <input_json_path>");
+                std::process::exit(2);
+            };
+            let Some(limit_raw) = args.next() else {
+                eprintln!("usage: xmustard-core normalize-lsp-workspace-symbols <workspace_id> <root_path> <query> <limit> <source_name> <input_json_path>");
+                std::process::exit(2);
+            };
+            let Some(source_name) = args.next() else {
+                eprintln!("usage: xmustard-core normalize-lsp-workspace-symbols <workspace_id> <root_path> <query> <limit> <source_name> <input_json_path>");
+                std::process::exit(2);
+            };
+            let Some(input_json_path) = args.next() else {
+                eprintln!("usage: xmustard-core normalize-lsp-workspace-symbols <workspace_id> <root_path> <query> <limit> <source_name> <input_json_path>");
+                std::process::exit(2);
+            };
+            let limit = match limit_raw.parse::<usize>() {
+                Ok(value) => value,
+                Err(err) => {
+                    eprintln!("normalize-lsp-workspace-symbols invalid limit: {err}");
+                    std::process::exit(2);
+                }
+            };
+            match xmustard_core::lsp::normalize_workspace_symbols_file(
+                &workspace_id,
+                &PathBuf::from(root),
+                &query,
+                limit,
+                &source_name,
+                &PathBuf::from(input_json_path),
+            ) {
+                Ok(result) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&result).expect("LSP workspace-symbols result should serialize")
+                    );
+                }
+                Err(err) => {
+                    eprintln!("normalize-lsp-workspace-symbols failed: {err}");
+                    std::process::exit(1);
+                }
+            }
+        }
         "parse-coverage-lcov" => {
             let Some(workspace_id) = args.next() else {
                 eprintln!(
