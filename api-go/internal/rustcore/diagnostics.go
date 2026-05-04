@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
 )
 
@@ -67,4 +68,21 @@ func NormalizeDiagnostics(ctx context.Context, workspaceID string, repoRoot stri
 		return nil, fmt.Errorf("decode rust-core diagnostics: %w", err)
 	}
 	return &result, nil
+}
+
+func NormalizeDiagnosticsPayload(ctx context.Context, workspaceID string, repoRoot string, payload []byte, sourceKind string, sourceName string) (*DiagnosticsBatch, error) {
+	inputFile, err := os.CreateTemp("", "xmustard-live-diagnostics-*.json")
+	if err != nil {
+		return nil, fmt.Errorf("create live diagnostics temp file: %w", err)
+	}
+	inputPath := inputFile.Name()
+	defer os.Remove(inputPath)
+	if _, err := inputFile.Write(payload); err != nil {
+		inputFile.Close()
+		return nil, fmt.Errorf("write live diagnostics payload: %w", err)
+	}
+	if err := inputFile.Close(); err != nil {
+		return nil, fmt.Errorf("close live diagnostics payload: %w", err)
+	}
+	return NormalizeDiagnostics(ctx, workspaceID, repoRoot, inputPath, sourceKind, sourceName)
 }

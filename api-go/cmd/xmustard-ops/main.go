@@ -24,7 +24,7 @@ func (s *stringSliceFlag) Set(value string) error {
 func main() {
 	args := os.Args[1:]
 	if len(args) == 0 {
-		fatalUsage("usage: xmustard-ops <semantic-index|postgres|runtime|workspace> ...")
+		fatalUsage("usage: xmustard-ops <diagnostics|semantic-index|postgres|runtime|workspace> ...")
 	}
 	switch args[0] {
 	case "diagnostics":
@@ -44,7 +44,7 @@ func main() {
 
 func runDiagnostics(args []string) {
 	if len(args) < 2 {
-		fatalUsage("usage: xmustard-ops diagnostics <plan|run|status|read> <workspace_id> [flags]")
+		fatalUsage("usage: xmustard-ops diagnostics <plan|run|status|read|live> <workspace_id> [flags]")
 	}
 	action := args[0]
 	workspaceID := strings.TrimSpace(args[1])
@@ -56,6 +56,7 @@ func runDiagnostics(args []string) {
 	inputPath := fs.String("input-path", "", "LSP publishDiagnostics JSON file")
 	sourceKind := fs.String("source-kind", "lsp", "lsp | compiler | test | scanner | manual")
 	sourceName := fs.String("source-name", "", "diagnostic source name, e.g. pyright or typescript-language-server")
+	path := fs.String("path", "", "relative workspace path for live LSP diagnostics")
 	dsn := fs.String("dsn", "", "Postgres DSN override")
 	schema := fs.String("schema", "", "Postgres schema override")
 	dryRun := fs.Bool("dry-run", false, "plan without applying")
@@ -90,8 +91,10 @@ func runDiagnostics(args []string) {
 		payload, err = workspaceops.ReadDiagnosticsStatus(*dataDir, workspaceID)
 	case "read":
 		payload, err = workspaceops.ReadDiagnostics(*dataDir, workspaceID)
+	case "live":
+		payload, err = workspaceops.ReadLiveDiagnostics(*dataDir, workspaceID, *path)
 	default:
-		fatalUsage("usage: xmustard-ops diagnostics <plan|run|status|read> <workspace_id> [flags]")
+		fatalUsage("usage: xmustard-ops diagnostics <plan|run|status|read|live> <workspace_id> [flags]")
 	}
 	writeJSON(payload, err)
 }

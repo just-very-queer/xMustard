@@ -96,6 +96,62 @@ func TestLspDefinitionAndReferencesReuseWorkspaceScopedSession(t *testing.T) {
 	}
 }
 
+func TestLspLiveDiagnosticsUseWorkspaceScopedSession(t *testing.T) {
+	defer closeAllLSPSessions()
+	dataDir, workspaceID, _, repoRoot := writeIssueContextFixture(t, false)
+	logPath := filepath.Join(t.TempDir(), "fake-lsp.log")
+	restore := stubLSPServerResolver(t, repoRoot, logPath)
+	defer restore()
+
+	result, err := ReadLiveDiagnostics(dataDir, workspaceID, "src/app.py")
+	if err != nil {
+		t.Fatalf("live diagnostics: %v", err)
+	}
+	if result.SourceKind != "lsp" || result.SourceName != "fake-pyright" {
+		t.Fatalf("expected live LSP diagnostics source, got %#v", result)
+	}
+	if result.DiagnosticCount != 1 {
+		t.Fatalf("expected one live diagnostic, got %#v", result)
+	}
+	diagnostic := result.Diagnostics[0]
+	if diagnostic.Path != "src/app.py" || diagnostic.Severity != "error" || diagnostic.RuleCode == nil || *diagnostic.RuleCode != "XMUSTARD_FAKE" {
+		t.Fatalf("unexpected live diagnostic: %#v", diagnostic)
+	}
+
+	methods := readFakeLSPMethods(t, logPath)
+	if countMethod(methods, "initialize") != 1 || countMethod(methods, "textDocument/didOpen") != 1 {
+		t.Fatalf("expected initialize + didOpen session traffic, got %#v", methods)
+	}
+	if countMethod(methods, "textDocument/definition") != 0 || countMethod(methods, "textDocument/documentSymbol") != 0 || countMethod(methods, "textDocument/references") != 0 {
+		t.Fatalf("live diagnostics should not masquerade as request/response symbol traffic, got %#v", methods)
+	}
+}
+
+func TestLspLiveDiagnosticsDoNotRequirePostgresOrMaterializedSymbols(t *testing.T) {
+	defer closeAllLSPSessions()
+	dataDir, workspaceID, _, repoRoot := writeIssueContextFixture(t, false)
+	logPath := filepath.Join(t.TempDir(), "fake-lsp.log")
+	restore := stubLSPServerResolver(t, repoRoot, logPath)
+	defer restore()
+
+	originalConnect := connectSemanticPostgres
+	connectSemanticPostgres = func(ctx context.Context, dsn string) (semanticMaterializationConn, error) {
+		t.Fatalf("unexpected Postgres connect in live LSP diagnostics path")
+		return nil, nil
+	}
+	defer func() {
+		connectSemanticPostgres = originalConnect
+	}()
+
+	result, err := ReadLiveDiagnostics(dataDir, workspaceID, "src/app.py")
+	if err != nil {
+		t.Fatalf("live diagnostics: %v", err)
+	}
+	if result.DiagnosticCount != 1 || result.Diagnostics[0].SourceName != "fake-pyright" {
+		t.Fatalf("expected fake LSP diagnostic, got %#v", result)
+	}
+}
+
 func TestLspDefinitionDoesNotRequirePostgresOrMaterializedSymbols(t *testing.T) {
 	defer closeAllLSPSessions()
 	dataDir, workspaceID, _, repoRoot := writeIssueContextFixture(t, false)
@@ -352,7 +408,26 @@ func runFakeLSPServer(logPath string) error {
 			}); err != nil {
 				return err
 			}
-		case "initialized", "textDocument/didOpen", "textDocument/didChange":
+		case "initialized":
+			continue
+		case "textDocument/didOpen", "textDocument/didChange":
+			if err := writeFakeLSPNotification(writer, "textDocument/publishDiagnostics", map[string]any{
+				"uri": fileURL(filepath.Join(repoRoot, "src", "app.py")),
+				"diagnostics": []map[string]any{
+					{
+						"range": map[string]any{
+							"start": map[string]any{"line": 0, "character": 6},
+							"end":   map[string]any{"line": 0, "character": 19},
+						},
+						"severity": 1,
+						"code":     "XMUSTARD_FAKE",
+						"source":   "fake-pyright",
+						"message":  "Fake live diagnostic from publishDiagnostics.",
+					},
+				},
+			}); err != nil {
+				return err
+			}
 			continue
 		case "textDocument/definition":
 			response := []map[string]any{
@@ -440,6 +515,22 @@ func writeFakeLSPResponse(writer io.Writer, id any, result any) error {
 		"jsonrpc": "2.0",
 		"id":      id,
 		"result":  result,
+	})
+	if err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(writer, "Content-Length: %d\r\n\r\n", len(payload)); err != nil {
+		return err
+	}
+	_, err = writer.Write(payload)
+	return err
+}
+
+func writeFakeLSPNotification(writer io.Writer, method string, params any) error {
+	payload, err := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"method":  method,
+		"params":  params,
 	})
 	if err != nil {
 		return err

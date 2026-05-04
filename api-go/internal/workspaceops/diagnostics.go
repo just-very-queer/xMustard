@@ -119,6 +119,35 @@ type DiagnosticsReadResult struct {
 
 type DiagnosticsBatch = rustcore.DiagnosticsBatch
 
+func ReadLiveDiagnostics(dataDir string, workspaceID string, relativePath string) (*DiagnosticsBatch, error) {
+	workspace, err := getWorkspaceRecord(dataDir, workspaceID)
+	if err != nil {
+		return nil, err
+	}
+	normalized, err := normalizeWorkspaceFile(workspace.RootPath, relativePath)
+	if err != nil {
+		return nil, err
+	}
+	config, err := resolveLSPServerForPath(workspace.RootPath, normalized)
+	if err != nil {
+		return nil, err
+	}
+	session, err := acquireLSPSession(dataDir, workspaceID, workspace.RootPath, config)
+	if err != nil {
+		return nil, err
+	}
+	absolutePath := filepath.Join(workspace.RootPath, filepath.FromSlash(normalized))
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	payload, err := session.liveDiagnostics(ctx, absolutePath)
+	if err != nil {
+		releaseLSPSession(workspaceID, config.ServerID, session)
+		return nil, err
+	}
+	return rustcore.NormalizeDiagnosticsPayload(ctx, workspaceID, workspace.RootPath, payload, "lsp", config.ServerID)
+}
+
 func PlanDiagnostics(dataDir string, workspaceID string, request DiagnosticsRequest) (*DiagnosticsPlan, error) {
 	workspace, err := getWorkspaceRecord(dataDir, workspaceID)
 	if err != nil {

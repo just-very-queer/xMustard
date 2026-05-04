@@ -44,8 +44,11 @@ type lspSession struct {
 	stateMu sync.Mutex
 	initMu  sync.Mutex
 	docMu   sync.Mutex
+	diagMu  sync.Mutex
 
 	openDocuments map[string]int
+	diagnostics   map[string]json.RawMessage
+	diagWaiters   map[string][]chan json.RawMessage
 
 	pendingMu sync.Mutex
 	pending   map[int64]chan lspResponseEnvelope
@@ -287,6 +290,8 @@ func startLSPSession(dataDir string, workspaceID string, rootPath string, config
 		lastUsedAt:    time.Now().UTC(),
 		nextRequestID: 1,
 		openDocuments: map[string]int{},
+		diagnostics:   map[string]json.RawMessage{},
+		diagWaiters:   map[string][]chan json.RawMessage{},
 		pending:       map[int64]chan lspResponseEnvelope{},
 		done:          make(chan struct{}),
 	}
@@ -345,6 +350,25 @@ func (session *lspSession) references(ctx context.Context, absolutePath string, 
 			"includeDeclaration": includeDeclaration,
 		},
 	})
+}
+
+func (session *lspSession) liveDiagnostics(ctx context.Context, absolutePath string) (json.RawMessage, error) {
+	session.touch()
+	if err := session.ensureInitialized(ctx); err != nil {
+		return nil, err
+	}
+	uri := fileURIForPath(absolutePath)
+	session.clearDiagnostics(uri)
+	if err := session.syncDocument(absolutePath); err != nil {
+		return nil, err
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	payload, err := session.waitForDiagnostics(waitCtx, uri)
+	if err != nil {
+		return nil, fmt.Errorf("%w: no live diagnostics published by %s for %s", ErrInvalidSemanticRequest, session.config.ServerID, filepath.Base(absolutePath))
+	}
+	return payload, nil
 }
 
 func (session *lspSession) ensureInitialized(ctx context.Context) error {
@@ -519,6 +543,10 @@ func (session *lspSession) readLoop() {
 			}
 			continue
 		}
+		if incoming.Method == "textDocument/publishDiagnostics" && len(incoming.ID) == 0 {
+			session.recordDiagnostics(incoming.Params)
+			continue
+		}
 		if len(incoming.ID) == 0 {
 			continue
 		}
@@ -576,6 +604,69 @@ func (session *lspSession) nextID() int64 {
 	session.nextRequestID++
 	session.lastUsedAt = time.Now().UTC()
 	return id
+}
+
+func (session *lspSession) recordDiagnostics(payload json.RawMessage) {
+	var body struct {
+		URI string `json:"uri"`
+	}
+	if err := json.Unmarshal(payload, &body); err != nil || strings.TrimSpace(body.URI) == "" {
+		return
+	}
+	uri := strings.TrimSpace(body.URI)
+	copied := append(json.RawMessage(nil), payload...)
+
+	session.diagMu.Lock()
+	session.diagnostics[uri] = copied
+	waiters := session.diagWaiters[uri]
+	delete(session.diagWaiters, uri)
+	session.diagMu.Unlock()
+
+	for _, waiter := range waiters {
+		waiter <- copied
+		close(waiter)
+	}
+}
+
+func (session *lspSession) clearDiagnostics(uri string) {
+	session.diagMu.Lock()
+	delete(session.diagnostics, uri)
+	session.diagMu.Unlock()
+}
+
+func (session *lspSession) waitForDiagnostics(ctx context.Context, uri string) (json.RawMessage, error) {
+	session.diagMu.Lock()
+	if payload, ok := session.diagnostics[uri]; ok {
+		copied := append(json.RawMessage(nil), payload...)
+		session.diagMu.Unlock()
+		return copied, nil
+	}
+	waiter := make(chan json.RawMessage, 1)
+	session.diagWaiters[uri] = append(session.diagWaiters[uri], waiter)
+	session.diagMu.Unlock()
+
+	select {
+	case payload := <-waiter:
+		return append(json.RawMessage(nil), payload...), nil
+	case <-ctx.Done():
+		session.diagMu.Lock()
+		waiters := session.diagWaiters[uri]
+		for idx, item := range waiters {
+			if item == waiter {
+				waiters = append(waiters[:idx], waiters[idx+1:]...)
+				break
+			}
+		}
+		if len(waiters) == 0 {
+			delete(session.diagWaiters, uri)
+		} else {
+			session.diagWaiters[uri] = waiters
+		}
+		session.diagMu.Unlock()
+		return nil, ctx.Err()
+	case <-session.done:
+		return nil, session.currentLoopErr()
+	}
 }
 
 func (session *lspSession) touch() {

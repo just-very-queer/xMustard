@@ -78,6 +78,18 @@
     ]
   },
   {
+    "group": "workspace_diagnostics",
+    "current_owner": "api-go + rust-core",
+    "target_owner": "api-go + rust-core",
+    "notes": "Diagnostics status, durable baseline reads/runs, and live LSP diagnostics reads. Go owns delivery, active LSP session capture, and explicit Postgres baseline actions; Rust owns diagnostic normalization and semantic meaning.",
+    "endpoints": [
+      "/api/workspaces/{workspace_id}/diagnostics/status",
+      "/api/workspaces/{workspace_id}/diagnostics",
+      "/api/workspaces/{workspace_id}/diagnostics/live",
+      "/api/workspaces/{workspace_id}/diagnostics/run"
+    ]
+  },
+  {
     "group": "issues_and_signals",
     "current_owner": "backend/app/main.py + backend/app/service.py + backend/app/scanners.py",
     "target_owner": "api-go + rust-core",
