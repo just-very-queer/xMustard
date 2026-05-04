@@ -31,7 +31,7 @@
     "group": "workspace_snapshot",
     "current_owner": "api-go + rust-core",
     "target_owner": "api-go",
-    "notes": "Workspace loading, snapshots, activity, sources, tree, guidance, repo config, repo-intelligence reads, and export. The Go shell now owns workspace listing, fresh and cached workspace load, explicit workspace scan, snapshot reads, activity feeds, activity overview, sources, worktree reads, repo-state and ingestion-plan reads, change reads, run/verify target reads, impact reads, repo-context reads, retrieval-search reads, explain-path, path-symbols, document-symbols, tree browsing, guidance discovery, repo-config reads, repo-map reads, export bundle reads, and saved-view CRUD against the existing tracker workspace artifacts.",
+    "notes": "Workspace loading, snapshots, activity, sources, tree, guidance, repo config, repo-intelligence reads, and export. The Go shell now owns workspace listing, fresh and cached workspace load, explicit workspace scan, snapshot reads, activity feeds, activity overview, sources, worktree reads, repo-state and ingestion-plan reads, change reads, run/verify target reads, impact reads, repo-context reads, retrieval-search reads, explain-path, path-symbols, document-symbols, go-to-definition, tree browsing, guidance discovery, repo-config reads, repo-map reads, export bundle reads, and saved-view CRUD against the existing tracker workspace artifacts.",
     "endpoints": [
       "/api/workspaces",
       "/api/workspaces/load",
@@ -51,6 +51,7 @@
       "/api/workspaces/{workspace_id}/explain-path",
       "/api/workspaces/{workspace_id}/path-symbols",
       "/api/workspaces/{workspace_id}/document-symbols",
+      "/api/workspaces/{workspace_id}/go-to-definition",
       "/api/workspaces/{workspace_id}/scan",
       "/api/workspaces/{workspace_id}/tree",
       "/api/workspaces/{workspace_id}/guidance",

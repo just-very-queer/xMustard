@@ -201,6 +201,85 @@ fn main() {
                 }
             }
         }
+        "normalize-lsp-definition" => {
+            let Some(workspace_id) = args.next() else {
+                eprintln!(
+                    "usage: xmustard-core normalize-lsp-definition <workspace_id> <root_path> <relative_path> <line> <column> <source_name> <input_json_path>"
+                );
+                std::process::exit(2);
+            };
+            let Some(root) = args.next() else {
+                eprintln!(
+                    "usage: xmustard-core normalize-lsp-definition <workspace_id> <root_path> <relative_path> <line> <column> <source_name> <input_json_path>"
+                );
+                std::process::exit(2);
+            };
+            let Some(relative_path) = args.next() else {
+                eprintln!(
+                    "usage: xmustard-core normalize-lsp-definition <workspace_id> <root_path> <relative_path> <line> <column> <source_name> <input_json_path>"
+                );
+                std::process::exit(2);
+            };
+            let Some(line_raw) = args.next() else {
+                eprintln!(
+                    "usage: xmustard-core normalize-lsp-definition <workspace_id> <root_path> <relative_path> <line> <column> <source_name> <input_json_path>"
+                );
+                std::process::exit(2);
+            };
+            let Some(column_raw) = args.next() else {
+                eprintln!(
+                    "usage: xmustard-core normalize-lsp-definition <workspace_id> <root_path> <relative_path> <line> <column> <source_name> <input_json_path>"
+                );
+                std::process::exit(2);
+            };
+            let Some(source_name) = args.next() else {
+                eprintln!(
+                    "usage: xmustard-core normalize-lsp-definition <workspace_id> <root_path> <relative_path> <line> <column> <source_name> <input_json_path>"
+                );
+                std::process::exit(2);
+            };
+            let Some(input_json_path) = args.next() else {
+                eprintln!(
+                    "usage: xmustard-core normalize-lsp-definition <workspace_id> <root_path> <relative_path> <line> <column> <source_name> <input_json_path>"
+                );
+                std::process::exit(2);
+            };
+            let line = match line_raw.parse::<usize>() {
+                Ok(value) => value,
+                Err(err) => {
+                    eprintln!("normalize-lsp-definition invalid line: {err}");
+                    std::process::exit(2);
+                }
+            };
+            let column = match column_raw.parse::<usize>() {
+                Ok(value) => value,
+                Err(err) => {
+                    eprintln!("normalize-lsp-definition invalid column: {err}");
+                    std::process::exit(2);
+                }
+            };
+            match xmustard_core::lsp::normalize_definition_file(
+                &workspace_id,
+                &PathBuf::from(root),
+                &relative_path,
+                line,
+                column,
+                &source_name,
+                &PathBuf::from(input_json_path),
+            ) {
+                Ok(result) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&result)
+                            .expect("LSP definition result should serialize")
+                    );
+                }
+                Err(err) => {
+                    eprintln!("normalize-lsp-definition failed: {err}");
+                    std::process::exit(1);
+                }
+            }
+        }
         "parse-coverage-lcov" => {
             let Some(workspace_id) = args.next() else {
                 eprintln!(
