@@ -770,6 +770,23 @@ def path_symbols(workspace_id: str, path: str = typer.Option(...)) -> None:
     _echo_json(_run_go_workspace_json("path-symbols", workspace_id, ["--path", path]))
 
 
+@app.command("document-symbols")
+def document_symbols(workspace_id: str, path: str = typer.Option(...)) -> None:
+    _echo_json(_run_go_workspace_json("document-symbols", workspace_id, ["--path", path]))
+
+
+@app.command("workspace-symbols")
+def workspace_symbols(
+    workspace_id: str,
+    query: str = typer.Option(default=""),
+    limit: int = typer.Option(default=50),
+) -> None:
+    flags = ["--limit", str(limit)]
+    if query:
+        flags.extend(["--query", query])
+    _echo_json(_run_go_workspace_json("workspace-symbols", workspace_id, flags))
+
+
 @app.command("postgres-materialize-path")
 def postgres_materialize_path(
     workspace_id: str,

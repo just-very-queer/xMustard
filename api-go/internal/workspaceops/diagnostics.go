@@ -90,22 +90,23 @@ type DiagnosticRun struct {
 }
 
 type DiagnosticRecord struct {
-	WorkspaceID      string  `json:"workspace_id"`
-	DiagnosticRunID  string  `json:"diagnostic_run_id"`
-	Path             string  `json:"path"`
-	RangeStartLine   int     `json:"range_start_line"`
-	RangeStartColumn int     `json:"range_start_column"`
-	RangeEndLine     int     `json:"range_end_line"`
-	RangeEndColumn   int     `json:"range_end_column"`
-	Severity         string  `json:"severity"`
-	Message          string  `json:"message"`
-	SourceKind       string  `json:"source_kind"`
-	SourceName       string  `json:"source_name"`
-	RuleCode         *string `json:"rule_code,omitempty"`
-	Fingerprint      string  `json:"fingerprint"`
-	HeadSHA          *string `json:"head_sha,omitempty"`
-	ContentHash      *string `json:"content_hash,omitempty"`
-	GeneratedAt      string  `json:"generated_at"`
+	WorkspaceID      string                  `json:"workspace_id"`
+	DiagnosticRunID  string                  `json:"diagnostic_run_id"`
+	Path             string                  `json:"path"`
+	RangeStartLine   int                     `json:"range_start_line"`
+	RangeStartColumn int                     `json:"range_start_column"`
+	RangeEndLine     int                     `json:"range_end_line"`
+	RangeEndColumn   int                     `json:"range_end_column"`
+	Severity         string                  `json:"severity"`
+	Message          string                  `json:"message"`
+	SourceKind       string                  `json:"source_kind"`
+	SourceName       string                  `json:"source_name"`
+	RuleCode         *string                 `json:"rule_code,omitempty"`
+	Fingerprint      string                  `json:"fingerprint"`
+	HeadSHA          *string                 `json:"head_sha,omitempty"`
+	ContentHash      *string                 `json:"content_hash,omitempty"`
+	LinkedSymbol     *DiagnosticLinkedSymbol `json:"linked_symbol,omitempty"`
+	GeneratedAt      string                  `json:"generated_at"`
 }
 
 type DiagnosticsReadResult struct {
@@ -513,6 +514,13 @@ func readDiagnosticRows(dsn string, schema string, workspaceID string, runID str
 		if err := json.Unmarshal(payload, &rows); err != nil {
 			return nil, fmt.Errorf("decode diagnostic rows: %w", err)
 		}
+	}
+	for idx := range rows {
+		link, err := findBestDiagnosticSymbolLink(ctx, connection, schema, workspaceID, rows[idx].Path, rows[idx].RangeStartLine, rows[idx].RangeEndLine)
+		if err != nil {
+			return nil, err
+		}
+		rows[idx].LinkedSymbol = link
 	}
 	return rows, nil
 }
