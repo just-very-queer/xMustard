@@ -182,6 +182,16 @@ The final completion cut narrowed `TrackerService` for the already-migrated Post
 
 This is the Phase 3 landing point: Go owns shipped delivery and operator control for repo-intelligence, semantic-index, semantic-search, and Postgres semantic materialization; Rust owns the migrated semantic meaning contracts; Python is no longer the live authority for those intended Phase 3 paths.
 
+## Important Naming Note
+
+This file tracks the migration tranche that we informally called "Phase 3" while reducing Python authority.
+
+That is not the same thing as the original roadmap's Phase 3 in `docs/plans/2026-04-29-repo-cockpit-tool-plan.md`.
+
+- This file covers the semantic/Postgres/repo-intelligence ownership shift.
+- The original roadmap Phase 3 is still the LSP and diagnostics phase.
+- Treat this file as a migration ledger, not as proof that LSP/diagnostics is complete.
+
 ## Phase 3 Runtime Probe Process Reduction Landed
 
 This pass started the `runtime_and_terminal_process_plane` cutline named by the Rust architecture contract:
