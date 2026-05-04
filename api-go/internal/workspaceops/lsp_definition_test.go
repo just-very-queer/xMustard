@@ -42,6 +42,33 @@ func TestLspDefinitionUsesWorkspaceScopedSession(t *testing.T) {
 	}
 }
 
+func TestLspDefinitionAndDocumentSymbolsReuseWorkspaceScopedSession(t *testing.T) {
+	defer closeAllLSPSessions()
+	dataDir, workspaceID, _, repoRoot := writeIssueContextFixture(t, false)
+	logPath := filepath.Join(t.TempDir(), "fake-lsp.log")
+	restore := stubLSPServerResolver(t, repoRoot, logPath)
+	defer restore()
+
+	if _, err := GoToDefinition(dataDir, workspaceID, "src/app.py", 1, 7); err != nil {
+		t.Fatalf("go-to-definition: %v", err)
+	}
+	symbols, err := ReadDocumentSymbols(dataDir, workspaceID, "src/app.py")
+	if err != nil {
+		t.Fatalf("document-symbols: %v", err)
+	}
+	if symbols.EvidenceSource != "rust_lsp_document_symbols" {
+		t.Fatalf("expected LSP document-symbols evidence, got %#v", symbols)
+	}
+
+	methods := readFakeLSPMethods(t, logPath)
+	if countMethod(methods, "initialize") != 1 {
+		t.Fatalf("expected one initialize for reused session, got %#v", methods)
+	}
+	if countMethod(methods, "textDocument/definition") != 1 || countMethod(methods, "textDocument/documentSymbol") != 1 {
+		t.Fatalf("expected definition + documentSymbol traffic, got %#v", methods)
+	}
+}
+
 func TestLspDefinitionDoesNotRequirePostgresOrMaterializedSymbols(t *testing.T) {
 	defer closeAllLSPSessions()
 	dataDir, workspaceID, _, repoRoot := writeIssueContextFixture(t, false)
@@ -240,7 +267,8 @@ func runFakeLSPServer(logPath string) error {
 		case "initialize":
 			if err := writeFakeLSPResponse(writer, message["id"], map[string]any{
 				"capabilities": map[string]any{
-					"definitionProvider": true,
+					"definitionProvider":     true,
+					"documentSymbolProvider": true,
 				},
 			}); err != nil {
 				return err
@@ -254,6 +282,38 @@ func runFakeLSPServer(logPath string) error {
 					"range": map[string]any{
 						"start": map[string]any{"line": 2, "character": 0},
 						"end":   map[string]any{"line": 4, "character": 12},
+					},
+				},
+			}
+			if err := writeFakeLSPResponse(writer, message["id"], response); err != nil {
+				return err
+			}
+		case "textDocument/documentSymbol":
+			response := []map[string]any{
+				{
+					"name": "OnlyFromLSP",
+					"kind": 5,
+					"range": map[string]any{
+						"start": map[string]any{"line": 0, "character": 0},
+						"end":   map[string]any{"line": 3, "character": 0},
+					},
+					"selectionRange": map[string]any{
+						"start": map[string]any{"line": 0, "character": 6},
+						"end":   map[string]any{"line": 0, "character": 17},
+					},
+					"children": []map[string]any{
+						{
+							"name": "run",
+							"kind": 6,
+							"range": map[string]any{
+								"start": map[string]any{"line": 1, "character": 4},
+								"end":   map[string]any{"line": 2, "character": 8},
+							},
+							"selectionRange": map[string]any{
+								"start": map[string]any{"line": 1, "character": 8},
+								"end":   map[string]any{"line": 1, "character": 11},
+							},
+						},
 					},
 				},
 			}

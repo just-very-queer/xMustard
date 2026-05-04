@@ -121,6 +121,42 @@ func GoToDefinition(dataDir string, workspaceID string, relativePath string, lin
 	)
 }
 
+func LSPDocumentSymbols(dataDir string, workspaceID string, relativePath string) (*rustcore.DocumentSymbolsResult, error) {
+	workspace, err := getWorkspaceRecord(dataDir, workspaceID)
+	if err != nil {
+		return nil, err
+	}
+	normalized, err := normalizeWorkspaceFile(workspace.RootPath, relativePath)
+	if err != nil {
+		return nil, err
+	}
+	config, err := resolveLSPServerForPath(workspace.RootPath, normalized)
+	if err != nil {
+		return nil, err
+	}
+	session, err := acquireLSPSession(dataDir, workspaceID, workspace.RootPath, config)
+	if err != nil {
+		return nil, err
+	}
+	absolutePath := filepath.Join(workspace.RootPath, filepath.FromSlash(normalized))
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	payload, err := session.documentSymbols(ctx, absolutePath)
+	if err != nil {
+		releaseLSPSession(workspaceID, config.ServerID, session)
+		return nil, err
+	}
+	return rustcore.NormalizeLSPDocumentSymbols(
+		ctx,
+		workspaceID,
+		workspace.RootPath,
+		normalized,
+		config.ServerID,
+		payload,
+	)
+}
+
 func acquireLSPSession(dataDir string, workspaceID string, rootPath string, config *lspServerConfig) (*lspSession, error) {
 	key := lspSessionKey{WorkspaceID: workspaceID, ServerID: config.ServerID}
 	lspSessionsMu.Lock()
@@ -235,6 +271,20 @@ func (session *lspSession) goToDefinition(ctx context.Context, absolutePath stri
 	})
 }
 
+func (session *lspSession) documentSymbols(ctx context.Context, absolutePath string) (json.RawMessage, error) {
+	session.touch()
+	if err := session.ensureInitialized(ctx); err != nil {
+		return nil, err
+	}
+	if err := session.syncDocument(absolutePath); err != nil {
+		return nil, err
+	}
+	uri := fileURIForPath(absolutePath)
+	return session.request(ctx, "textDocument/documentSymbol", map[string]any{
+		"textDocument": map[string]any{"uri": uri},
+	})
+}
+
 func (session *lspSession) ensureInitialized(ctx context.Context) error {
 	session.stateMu.Lock()
 	if session.initialized {
@@ -261,6 +311,12 @@ func (session *lspSession) ensureInitialized(ctx context.Context) error {
 			"textDocument": map[string]any{
 				"definition": map[string]any{
 					"linkSupport": true,
+				},
+				"documentSymbol": map[string]any{
+					"hierarchicalDocumentSymbolSupport": true,
+					"symbolKind": map[string]any{
+						"valueSet": []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26},
+					},
 				},
 			},
 		},

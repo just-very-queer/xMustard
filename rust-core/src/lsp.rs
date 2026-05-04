@@ -33,6 +33,32 @@ pub struct RustDefinitionResult {
     pub generated_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustDocumentSymbolRecord {
+    pub path: String,
+    pub symbol: String,
+    pub kind: String,
+    pub line_start: Option<usize>,
+    pub line_end: Option<usize>,
+    pub enclosing_scope: Option<String>,
+    pub evidence_source: String,
+    pub reason: Option<String>,
+    pub score: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustDocumentSymbolsResult {
+    pub workspace_id: String,
+    pub path: String,
+    pub symbol_source: String,
+    pub parser_language: Option<String>,
+    pub evidence_source: String,
+    pub selection_reason: String,
+    pub symbols: Vec<RustDocumentSymbolRecord>,
+    pub warnings: Vec<String>,
+    pub generated_at: String,
+}
+
 pub fn normalize_definition_file(
     workspace_id: &str,
     root_path: &Path,
@@ -112,6 +138,194 @@ pub fn normalize_definition_payload(
         definitions,
         warnings,
         generated_at,
+    }
+}
+
+pub fn normalize_document_symbols_file(
+    workspace_id: &str,
+    root_path: &Path,
+    relative_path: &str,
+    source_name: &str,
+    input_path: &Path,
+) -> Result<RustDocumentSymbolsResult, std::io::Error> {
+    let content = fs::read_to_string(input_path)?;
+    let payload = serde_json::from_str::<Value>(&content).map_err(|err| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("decode LSP document-symbols JSON: {err}"),
+        )
+    })?;
+    Ok(normalize_document_symbols_payload(
+        workspace_id,
+        root_path,
+        relative_path,
+        source_name,
+        &payload,
+    ))
+}
+
+pub fn normalize_document_symbols_payload(
+    workspace_id: &str,
+    root_path: &Path,
+    relative_path: &str,
+    source_name: &str,
+    payload: &Value,
+) -> RustDocumentSymbolsResult {
+    let generated_at = Utc::now().to_rfc3339();
+    let source_name = normalize_source_name(source_name);
+    let mut warnings = Vec::new();
+    let mut symbols = Vec::new();
+
+    match payload {
+        Value::Null => warnings.push("LSP server returned no document symbols.".to_string()),
+        Value::Array(items) => {
+            for item in items {
+                collect_document_symbol(
+                    root_path,
+                    relative_path,
+                    item,
+                    None,
+                    &mut warnings,
+                    &mut symbols,
+                );
+            }
+        }
+        _ => {
+            warnings.push("Skipped unexpected non-array LSP document-symbols payload.".to_string())
+        }
+    }
+
+    if symbols.is_empty() {
+        warnings.push(
+            "No in-workspace document symbols were normalized from the LSP response.".to_string(),
+        );
+    }
+
+    RustDocumentSymbolsResult {
+        workspace_id: workspace_id.to_string(),
+        path: relative_path.trim().to_string(),
+        symbol_source: "lsp".to_string(),
+        parser_language: None,
+        evidence_source: "rust_lsp_document_symbols".to_string(),
+        selection_reason: format!(
+            "Rust normalized live LSP documentSymbol output from a Go-managed {source_name} workspace session."
+        ),
+        symbols,
+        warnings,
+        generated_at,
+    }
+}
+
+fn collect_document_symbol(
+    root_path: &Path,
+    relative_path: &str,
+    payload: &Value,
+    enclosing_scope: Option<String>,
+    warnings: &mut Vec<String>,
+    symbols: &mut Vec<RustDocumentSymbolRecord>,
+) {
+    let Some(name) = payload
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+    else {
+        warnings.push("Skipped LSP document symbol without a name.".to_string());
+        return;
+    };
+
+    if let Some(path) = document_symbol_path(root_path, relative_path, payload, warnings) {
+        let range = document_symbol_range(payload);
+        let kind = payload
+            .get("kind")
+            .and_then(Value::as_u64)
+            .map(lsp_symbol_kind)
+            .unwrap_or("function")
+            .to_string();
+        let reason = Some("live LSP documentSymbol result".to_string());
+        symbols.push(RustDocumentSymbolRecord {
+            path,
+            symbol: name.to_string(),
+            kind,
+            line_start: Some(range.0.0),
+            line_end: Some(range.1.0),
+            enclosing_scope: enclosing_scope.clone(),
+            evidence_source: "rust_lsp_document_symbol".to_string(),
+            reason,
+            score: document_symbol_score(payload, enclosing_scope.as_deref()),
+        });
+    }
+
+    if let Some(children) = payload.get("children").and_then(Value::as_array) {
+        for child in children {
+            collect_document_symbol(
+                root_path,
+                relative_path,
+                child,
+                Some(name.to_string()),
+                warnings,
+                symbols,
+            );
+        }
+    }
+}
+
+fn document_symbol_path(
+    root_path: &Path,
+    relative_path: &str,
+    payload: &Value,
+    warnings: &mut Vec<String>,
+) -> Option<String> {
+    if let Some(uri_value) = payload
+        .get("location")
+        .and_then(|location| location.get("uri"))
+        .and_then(Value::as_str)
+    {
+        return match normalize_file_uri(root_path, uri_value) {
+            Ok(Some(path)) => Some(path),
+            Ok(None) => {
+                warnings.push(format!(
+                    "Skipped LSP document symbol outside workspace root: {uri_value}"
+                ));
+                None
+            }
+            Err(err) => {
+                warnings.push(err);
+                None
+            }
+        };
+    }
+    Some(relative_path.trim().to_string())
+}
+
+fn document_symbol_range(payload: &Value) -> ((usize, usize), (usize, usize)) {
+    let range = payload
+        .get("location")
+        .and_then(|location| location.get("range"))
+        .or_else(|| payload.get("range"))
+        .unwrap_or(&Value::Null);
+    (
+        lsp_position(range.get("start")),
+        lsp_position(range.get("end")),
+    )
+}
+
+fn lsp_symbol_kind(value: u64) -> &'static str {
+    match value {
+        2 => "module",
+        5 => "class",
+        6 => "method",
+        11 | 23 | 26 => "type",
+        12 => "function",
+        _ => "function",
+    }
+}
+
+fn document_symbol_score(payload: &Value, enclosing_scope: Option<&str>) -> usize {
+    let base = if enclosing_scope.is_none() { 95 } else { 85 };
+    match payload.get("kind").and_then(Value::as_u64) {
+        Some(5) | Some(12) | Some(6) => base + 5,
+        _ => base,
     }
 }
 
@@ -211,7 +425,11 @@ fn lsp_position(value: Option<&Value>) -> (usize, usize) {
 }
 
 fn normalize_coordinate(value: usize) -> usize {
-    if value == 0 { 1 } else { value }
+    if value == 0 {
+        1
+    } else {
+        value
+    }
 }
 
 fn normalize_source_name(value: &str) -> String {
@@ -225,7 +443,10 @@ fn normalize_source_name(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{RustDefinitionLocation, normalize_definition_payload};
+    use super::{
+        normalize_definition_payload, normalize_document_symbols_payload, RustDefinitionLocation,
+        RustDocumentSymbolRecord,
+    };
     use serde_json::json;
     use std::path::Path;
 
@@ -323,17 +544,141 @@ mod tests {
         );
 
         assert_eq!(result.definition_count, 0);
-        assert!(
-            result
-                .warnings
-                .iter()
-                .any(|item| item.contains("without a URI"))
+        assert!(result
+            .warnings
+            .iter()
+            .any(|item| item.contains("without a URI")));
+        assert!(result
+            .warnings
+            .iter()
+            .any(|item| item.contains("No in-workspace definition locations")));
+    }
+
+    #[test]
+    fn normalizes_document_symbols_from_live_lsp_response() {
+        let root = Path::new("/repo");
+        let payload = json!([
+            {
+                "name": "ExportService",
+                "kind": 5,
+                "range": {
+                    "start": {"line": 0, "character": 0},
+                    "end": {"line": 9, "character": 0}
+                },
+                "selectionRange": {
+                    "start": {"line": 0, "character": 6},
+                    "end": {"line": 0, "character": 19}
+                },
+                "children": [
+                    {
+                        "name": "run",
+                        "kind": 6,
+                        "range": {
+                            "start": {"line": 2, "character": 4},
+                            "end": {"line": 4, "character": 8}
+                        },
+                        "selectionRange": {
+                            "start": {"line": 2, "character": 8},
+                            "end": {"line": 2, "character": 11}
+                        }
+                    }
+                ]
+            },
+            {
+                "name": "helper",
+                "kind": 12,
+                "location": {
+                    "uri": "file:///repo/src/app.py",
+                    "range": {
+                        "start": {"line": 11, "character": 0},
+                        "end": {"line": 12, "character": 3}
+                    }
+                }
+            }
+        ]);
+
+        let result = normalize_document_symbols_payload(
+            "workspace-1",
+            root,
+            "src/app.py",
+            "pyright",
+            &payload,
         );
-        assert!(
-            result
-                .warnings
-                .iter()
-                .any(|item| item.contains("No in-workspace definition locations"))
+
+        assert_eq!(result.workspace_id, "workspace-1");
+        assert_eq!(result.path, "src/app.py");
+        assert_eq!(result.symbol_source, "lsp");
+        assert_eq!(result.evidence_source, "rust_lsp_document_symbols");
+        assert_eq!(result.symbols.len(), 3);
+        assert_eq!(
+            result.symbols,
+            vec![
+                RustDocumentSymbolRecord {
+                    path: "src/app.py".to_string(),
+                    symbol: "ExportService".to_string(),
+                    kind: "class".to_string(),
+                    line_start: Some(1),
+                    line_end: Some(10),
+                    enclosing_scope: None,
+                    evidence_source: "rust_lsp_document_symbol".to_string(),
+                    reason: Some("live LSP documentSymbol result".to_string()),
+                    score: 100,
+                },
+                RustDocumentSymbolRecord {
+                    path: "src/app.py".to_string(),
+                    symbol: "run".to_string(),
+                    kind: "method".to_string(),
+                    line_start: Some(3),
+                    line_end: Some(5),
+                    enclosing_scope: Some("ExportService".to_string()),
+                    evidence_source: "rust_lsp_document_symbol".to_string(),
+                    reason: Some("live LSP documentSymbol result".to_string()),
+                    score: 90,
+                },
+                RustDocumentSymbolRecord {
+                    path: "src/app.py".to_string(),
+                    symbol: "helper".to_string(),
+                    kind: "function".to_string(),
+                    line_start: Some(12),
+                    line_end: Some(13),
+                    enclosing_scope: None,
+                    evidence_source: "rust_lsp_document_symbol".to_string(),
+                    reason: Some("live LSP documentSymbol result".to_string()),
+                    score: 100,
+                },
+            ]
         );
+        assert!(result.warnings.is_empty());
+    }
+
+    #[test]
+    fn document_symbols_reject_non_lsp_materialized_rows() {
+        let root = Path::new("/repo");
+        let payload = json!([
+            {
+                "symbol_id": 21,
+                "path": "src/app.py",
+                "symbol": "ExportService",
+                "kind": "class"
+            }
+        ]);
+
+        let result = normalize_document_symbols_payload(
+            "workspace-1",
+            root,
+            "src/app.py",
+            "pyright",
+            &payload,
+        );
+
+        assert!(result.symbols.is_empty());
+        assert!(result
+            .warnings
+            .iter()
+            .any(|item| item.contains("without a name")));
+        assert!(result
+            .warnings
+            .iter()
+            .any(|item| item.contains("No in-workspace document symbols")));
     }
 }

@@ -1,7 +1,9 @@
 package workspaceops
 
 import (
+	"context"
 	"encoding/json"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -55,15 +57,75 @@ func TestReadWorkspaceSymbolsReadsMaterializedRows(t *testing.T) {
 	}
 }
 
-func TestReadDocumentSymbolsAliasesPathSymbols(t *testing.T) {
-	dataDir, workspaceID, _, _ := writeIssueContextFixture(t, false)
+func TestLspDocumentSymbolsSmokeWithFakeServer(t *testing.T) {
+	defer closeAllLSPSessions()
+	dataDir, workspaceID, _, repoRoot := writeIssueContextFixture(t, false)
+	logPath := filepath.Join(t.TempDir(), "fake-lsp.log")
+	restore := stubLSPServerResolver(t, repoRoot, logPath)
+	defer restore()
 
 	result, err := ReadDocumentSymbols(dataDir, workspaceID, "src/app.py")
 	if err != nil {
 		t.Fatalf("read document symbols: %v", err)
 	}
-	if result.EvidenceSource != "rust_semantic_core" || len(result.Symbols) == 0 {
-		t.Fatalf("expected Rust-backed document symbols, got %#v", result)
+	if result.EvidenceSource != "rust_lsp_document_symbols" || result.SymbolSource != "lsp" {
+		t.Fatalf("expected Rust-normalized LSP document symbols, got %#v", result)
+	}
+	if len(result.Symbols) != 2 || result.Symbols[0].Symbol != "OnlyFromLSP" || result.Symbols[1].EnclosingScope == nil {
+		t.Fatalf("unexpected document symbols: %#v", result)
+	}
+	methods := readFakeLSPMethods(t, logPath)
+	if countMethod(methods, "initialize") != 1 || countMethod(methods, "textDocument/documentSymbol") != 1 {
+		t.Fatalf("expected initialize + documentSymbol traffic, got %#v", methods)
+	}
+}
+
+func TestLspDocumentSymbolsDoesNotRequirePostgresOrMaterializedSymbols(t *testing.T) {
+	defer closeAllLSPSessions()
+	dataDir, workspaceID, _, repoRoot := writeIssueContextFixture(t, false)
+	logPath := filepath.Join(t.TempDir(), "fake-lsp.log")
+	restore := stubLSPServerResolver(t, repoRoot, logPath)
+	defer restore()
+
+	originalConnect := connectSemanticPostgres
+	connectSemanticPostgres = func(ctx context.Context, dsn string) (semanticMaterializationConn, error) {
+		t.Fatalf("unexpected Postgres connect in live LSP document-symbols path")
+		return nil, nil
+	}
+	defer func() {
+		connectSemanticPostgres = originalConnect
+	}()
+
+	result, err := ReadDocumentSymbols(dataDir, workspaceID, "src/app.py")
+	if err != nil {
+		t.Fatalf("read document symbols: %v", err)
+	}
+	if len(result.Symbols) == 0 || result.Symbols[0].Symbol != "OnlyFromLSP" {
+		t.Fatalf("expected fake LSP symbols, got %#v", result)
+	}
+}
+
+func TestReadDocumentSymbolsUsesLSPResponseNotStaticParsing(t *testing.T) {
+	defer closeAllLSPSessions()
+	dataDir, workspaceID, _, repoRoot := writeIssueContextFixture(t, false)
+	if err := os.WriteFile(filepath.Join(repoRoot, "src", "app.py"), []byte("value = 1\n"), 0o644); err != nil {
+		t.Fatalf("rewrite fixture file: %v", err)
+	}
+	logPath := filepath.Join(t.TempDir(), "fake-lsp.log")
+	restore := stubLSPServerResolver(t, repoRoot, logPath)
+	defer restore()
+
+	result, err := ReadDocumentSymbols(dataDir, workspaceID, "src/app.py")
+	if err != nil {
+		t.Fatalf("read document symbols: %v", err)
+	}
+	if len(result.Symbols) != 2 || result.Symbols[0].Symbol != "OnlyFromLSP" {
+		t.Fatalf("expected symbol only available from fake LSP response, got %#v", result)
+	}
+	for _, symbol := range result.Symbols {
+		if symbol.EvidenceSource != "rust_lsp_document_symbol" {
+			t.Fatalf("expected LSP symbol evidence, got %#v", result.Symbols)
+		}
 	}
 }
 

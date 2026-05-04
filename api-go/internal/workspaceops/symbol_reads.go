@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"xmustard/api-go/internal/rustcore"
 )
 
 type MaterializedSymbolRecord struct {
@@ -80,7 +82,21 @@ func ReadWorkspaceSymbols(dataDir string, workspaceID string, query string, limi
 }
 
 func ReadDocumentSymbols(dataDir string, workspaceID string, relativePath string) (*PathSymbolsResult, error) {
-	return ReadPathSymbols(dataDir, workspaceID, relativePath)
+	result, err := LSPDocumentSymbols(dataDir, workspaceID, relativePath)
+	if err != nil {
+		return nil, err
+	}
+	return &PathSymbolsResult{
+		WorkspaceID:     result.WorkspaceID,
+		Path:            result.Path,
+		SymbolSource:    result.SymbolSource,
+		ParserLanguage:  result.ParserLanguage,
+		EvidenceSource:  result.EvidenceSource,
+		SelectionReason: result.SelectionReason,
+		Symbols:         convertRustDocumentSymbols(result.Symbols),
+		Warnings:        result.Warnings,
+		GeneratedAt:     result.GeneratedAt,
+	}, nil
 }
 
 func readWorkspaceSymbolRows(dsn string, schema string, workspaceID string, query string, limit int) ([]MaterializedSymbolRecord, error) {
@@ -217,4 +233,22 @@ func normalizeWorkspaceSymbolLimit(limit int) int {
 		return 200
 	}
 	return limit
+}
+
+func convertRustDocumentSymbols(items []rustcore.DocumentSymbolRecord) []PathSymbolRecord {
+	out := make([]PathSymbolRecord, 0, len(items))
+	for _, item := range items {
+		out = append(out, PathSymbolRecord{
+			Path:           item.Path,
+			Symbol:         item.Symbol,
+			Kind:           item.Kind,
+			LineStart:      item.LineStart,
+			LineEnd:        item.LineEnd,
+			EnclosingScope: item.EnclosingScope,
+			EvidenceSource: item.EvidenceSource,
+			Reason:         item.Reason,
+			Score:          item.Score,
+		})
+	}
+	return out
 }

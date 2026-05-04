@@ -35,6 +35,30 @@ type DefinitionResult struct {
 	GeneratedAt     string               `json:"generated_at"`
 }
 
+type DocumentSymbolRecord struct {
+	Path           string  `json:"path"`
+	Symbol         string  `json:"symbol"`
+	Kind           string  `json:"kind"`
+	LineStart      *int    `json:"line_start,omitempty"`
+	LineEnd        *int    `json:"line_end,omitempty"`
+	EnclosingScope *string `json:"enclosing_scope,omitempty"`
+	EvidenceSource string  `json:"evidence_source"`
+	Reason         *string `json:"reason,omitempty"`
+	Score          int     `json:"score"`
+}
+
+type DocumentSymbolsResult struct {
+	WorkspaceID     string                 `json:"workspace_id"`
+	Path            string                 `json:"path"`
+	SymbolSource    string                 `json:"symbol_source"`
+	ParserLanguage  *string                `json:"parser_language,omitempty"`
+	EvidenceSource  string                 `json:"evidence_source"`
+	SelectionReason string                 `json:"selection_reason"`
+	Symbols         []DocumentSymbolRecord `json:"symbols"`
+	Warnings        []string               `json:"warnings"`
+	GeneratedAt     string                 `json:"generated_at"`
+}
+
 func NormalizeLSPDefinition(
 	ctx context.Context,
 	workspaceID string,
@@ -90,6 +114,61 @@ func NormalizeLSPDefinition(
 	var result DefinitionResult
 	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
 		return nil, fmt.Errorf("decode rust-core LSP definition result: %w", err)
+	}
+	return &result, nil
+}
+
+func NormalizeLSPDocumentSymbols(
+	ctx context.Context,
+	workspaceID string,
+	repoRoot string,
+	relativePath string,
+	sourceName string,
+	payload []byte,
+) (*DocumentSymbolsResult, error) {
+	inputFile, err := os.CreateTemp("", "xmustard-lsp-document-symbols-*.json")
+	if err != nil {
+		return nil, fmt.Errorf("create LSP document-symbols temp file: %w", err)
+	}
+	inputPath := inputFile.Name()
+	defer os.Remove(inputPath)
+	if _, err := inputFile.Write(payload); err != nil {
+		inputFile.Close()
+		return nil, fmt.Errorf("write LSP document-symbols payload: %w", err)
+	}
+	if err := inputFile.Close(); err != nil {
+		return nil, fmt.Errorf("close LSP document-symbols payload: %w", err)
+	}
+
+	cmd := exec.CommandContext(
+		ctx,
+		"cargo",
+		"run",
+		"--quiet",
+		"--bin",
+		"xmustard-core",
+		"--",
+		"normalize-lsp-document-symbols",
+		workspaceID,
+		repoRoot,
+		relativePath,
+		sourceName,
+		inputPath,
+	)
+	cmd.Dir = rustCoreDir()
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("rust-core normalize-lsp-document-symbols failed: %w: %s", err, stderr.String())
+	}
+
+	var result DocumentSymbolsResult
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		return nil, fmt.Errorf("decode rust-core LSP document-symbols result: %w", err)
 	}
 	return &result, nil
 }
