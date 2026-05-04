@@ -2,6 +2,7 @@ package workspaceops
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -110,9 +111,10 @@ func TestMaterializeSemanticSearchToPostgresWritesQueryAndMatches(t *testing.T) 
 }
 
 type fakeSemanticConn struct {
-	queryIDs []int64
-	querySQL []string
-	execSQL  []string
+	queryIDs  []int64
+	queryRows []pgx.Row
+	querySQL  []string
+	execSQL   []string
 }
 
 func (f *fakeSemanticConn) Exec(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
@@ -123,11 +125,14 @@ func (f *fakeSemanticConn) Exec(_ context.Context, sql string, _ ...any) (pgconn
 func (f *fakeSemanticConn) QueryRow(_ context.Context, sql string, _ ...any) pgx.Row {
 	f.querySQL = append(f.querySQL, sql)
 	index := len(f.querySQL) - 1
+	if index < len(f.queryRows) {
+		return f.queryRows[index]
+	}
 	id := int64(index + 1)
 	if index < len(f.queryIDs) {
 		id = f.queryIDs[index]
 	}
-	return fakeSemanticRow{id: id}
+	return fakeSemanticRow{values: []any{id}}
 }
 
 func (f *fakeSemanticConn) Close(context.Context) error {
@@ -135,17 +140,79 @@ func (f *fakeSemanticConn) Close(context.Context) error {
 }
 
 type fakeSemanticRow struct {
-	id int64
+	values []any
+	err    error
 }
 
 func (f fakeSemanticRow) Scan(dest ...any) error {
-	if len(dest) == 0 {
-		return nil
+	if f.err != nil {
+		return f.err
 	}
-	if target, ok := dest[0].(*int64); ok {
-		*target = f.id
+	if len(dest) != len(f.values) {
+		return errors.New("scan arity mismatch")
+	}
+	for idx, target := range dest {
+		switch typed := target.(type) {
+		case *int64:
+			*typed = f.values[idx].(int64)
+		case *string:
+			*typed = f.values[idx].(string)
+		case **string:
+			value, _ := f.values[idx].(*string)
+			*typed = value
+		case *int:
+			*typed = f.values[idx].(int)
+		case *bool:
+			*typed = f.values[idx].(bool)
+		case *[]byte:
+			*typed = f.values[idx].([]byte)
+		default:
+			return errors.New("unsupported scan target")
+		}
 	}
 	return nil
+}
+
+func fakeSemanticJSONRow(payload ...[]byte) fakeSemanticRow {
+	values := make([]any, 0, len(payload))
+	for _, item := range payload {
+		values = append(values, item)
+	}
+	return fakeSemanticRow{values: values}
+}
+
+func fakeSemanticStringRow(values ...string) fakeSemanticRow {
+	out := make([]any, 0, len(values))
+	for _, item := range values {
+		out = append(out, item)
+	}
+	return fakeSemanticRow{values: out}
+}
+
+func fakeSemanticBaselineRowValues(values ...any) fakeSemanticRow {
+	return fakeSemanticRow{values: values}
+}
+
+func fakeSemanticNoRows() fakeSemanticRow {
+	return fakeSemanticRow{err: pgx.ErrNoRows}
+}
+
+func containsSQL(items []string, want string) bool {
+	for _, item := range items {
+		if strings.Contains(item, want) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsSubstring(items []string, want string) bool {
+	for _, item := range items {
+		if strings.Contains(item, want) {
+			return true
+		}
+	}
+	return false
 }
 
 func stubSemanticPostgresConnection(connection semanticMaterializationConn) func() {
@@ -168,13 +235,4 @@ func installFakeAstGrep(t *testing.T, repoRoot string) {
 	}
 	oldPath := os.Getenv("PATH")
 	t.Setenv("PATH", tempDir+string(os.PathListSeparator)+oldPath)
-}
-
-func containsSubstring(items []string, want string) bool {
-	for _, item := range items {
-		if strings.Contains(item, want) {
-			return true
-		}
-	}
-	return false
 }

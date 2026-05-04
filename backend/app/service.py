@@ -696,6 +696,12 @@ class TrackerService:
     def update_settings(self, settings: AppSettings) -> AppSettings:
         return self.store.save_settings(settings)
 
+    def detect_runtimes(self) -> list[dict]:
+        return self._run_go_runtime_json("runtimes")
+
+    def local_agent_capabilities(self) -> dict:
+        return self._run_go_runtime_json("capabilities")
+
     def _run_go_ops(self, args: list[str]) -> str:
         api_go_dir = Path(__file__).resolve().parents[2] / "api-go"
         command = ["go", "run", "./cmd/xmustard-ops", *args, "--data-dir", str(self.store.root.resolve())]
@@ -726,6 +732,9 @@ class TrackerService:
 
     def _run_go_postgres_text(self, action: str, flags: Optional[list[str]] = None) -> str:
         return self._run_go_ops(["postgres", action, *(flags or [])])
+
+    def _run_go_runtime_json(self, action: str, flags: Optional[list[str]] = None):
+        return self._run_go_ops_json(["runtime", action, *(flags or [])])
 
     def _run_go_workspace_json(self, action: str, workspace_id: str, flags: Optional[list[str]] = None):
         return self._run_go_ops_json(["workspace", action, workspace_id, *(flags or [])])
@@ -4104,8 +4113,14 @@ class TrackerService:
         return run.model_dump(mode="json")
 
     def probe_runtime(self, workspace_id: str, runtime: str, model: str) -> dict:
-        workspace = self.get_workspace(workspace_id)
-        result = self.runtime_service.probe_runtime(Path(workspace.root_path), runtime, model)
+        self.get_workspace(workspace_id)
+        try:
+            result = self._run_go_runtime_json("probe", [workspace_id, "--runtime", runtime, "--model", model])
+        except RuntimeError as exc:
+            message = str(exc)
+            if "not available" in message.lower() or "not exist" in message.lower():
+                raise FileNotFoundError(message) from exc
+            raise ValueError(message) from exc
         self._record_activity(
             workspace_id=workspace_id,
             entity_type="settings",
@@ -4113,9 +4128,9 @@ class TrackerService:
             action="runtime.probed",
             summary=f"Probed {runtime} runtime with {model}",
             actor=build_activity_actor("operator", "operator"),
-            details={"runtime": runtime, "model": model, "ok": result.ok, "exit_code": result.exit_code},
+            details={"runtime": runtime, "model": model, "ok": result.get("ok"), "exit_code": result.get("exit_code")},
         )
-        return result.model_dump(mode="json")
+        return result
 
     def start_agent_query(self, workspace_id: str, runtime: str, model: str, prompt: str) -> dict:
         workspace = self.get_workspace(workspace_id)

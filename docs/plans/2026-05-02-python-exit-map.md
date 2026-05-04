@@ -182,6 +182,16 @@ The final completion cut narrowed `TrackerService` for the already-migrated Post
 
 This is the Phase 3 landing point: Go owns shipped delivery and operator control for repo-intelligence, semantic-index, semantic-search, and Postgres semantic materialization; Rust owns the migrated semantic meaning contracts; Python is no longer the live authority for those intended Phase 3 paths.
 
+## Important Naming Note
+
+This file tracks the migration tranche that we informally called "Phase 3" while reducing Python authority.
+
+That is not the same thing as the original roadmap's Phase 3 in `docs/plans/2026-04-29-repo-cockpit-tool-plan.md`.
+
+- This file covers the semantic/Postgres/repo-intelligence ownership shift.
+- The original roadmap Phase 3 is still the LSP and diagnostics phase.
+- Treat this file as a migration ledger, not as proof that LSP/diagnostics is complete.
+
 ## Phase 3 Runtime Probe Process Reduction Landed
 
 This pass started the `runtime_and_terminal_process_plane` cutline named by the Rust architecture contract:
@@ -193,6 +203,17 @@ This pass started the `runtime_and_terminal_process_plane` cutline named by the 
 - The remaining Go-owned long-lived process paths were hardened while they wait for a Rust session contract: run cancellation now signals the managed run process group, and terminal close now tears down known child processes before terminating the terminal process group.
 
 This is a real but narrow authority cut. It does not complete the runtime/session exit, because `startManagedRun(...)` still owns long-lived run launch, log streaming, PID tracking, and cancellation in Go, and `backend/app/runtimes.py` / `backend/app/terminal.py` still exist for the Python compatibility server. The exact next cutline is a Rust managed-run/session contract that exposes durable run IDs, streamed log chunks or append-only log ownership, process identity, cancellation, timeout policy, and final structured summary. Until that exists, replacing Go long-lived run control with the current synchronous Rust command would lose live cancel and terminal/run-log behavior.
+
+## Phase 3 Runtime Discovery Compatibility Reduction Landed
+
+This follow-up pass removed one still-live Python runtime authority seam without pretending the session plane is solved:
+
+- `api-go/cmd/xmustard-ops/main.go` now exposes `runtime capabilities`, `runtime runtimes`, `runtime models`, and `runtime probe`.
+- Python CLI `capabilities`, `runtimes`, `models`, and `agent-probe` now delegate to Go `xmustard-ops runtime ...` instead of calling `RuntimeService` directly.
+- FastAPI compatibility routes for runtime listing, local-agent capabilities, and runtime probe now call `TrackerService` methods that delegate to Go, so compatibility HTTP no longer reopens Python as the runtime discovery/probe owner.
+- Runtime probe execution still goes through Go and prefers the Rust `run-managed-command` boundary.
+
+This is intentionally not a terminal/session rewrite. Python still owns compatibility server behavior for long-lived issue runs, workspace-query runs, plan-agent subprocess calls, run logs/cancel/retry wrappers, and terminal PTY lifecycle through `backend/app/runtimes.py`, `backend/app/terminal.py`, and `backend/app/service.py`. The next real boundary remains the Rust managed-run/session contract; after that exists, Go can stop carrying local long-lived subprocess control and Python can stop carrying compatibility runtime/session control.
 
 ## Phase 3 Boundary
 

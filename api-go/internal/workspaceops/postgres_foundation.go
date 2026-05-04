@@ -31,6 +31,7 @@ var semanticTableNames = map[string]struct{}{
 	"semantic_queries":      {},
 	"semantic_matches":      {},
 	"semantic_index_runs":   {},
+	"diagnostic_runs":       {},
 	"diagnostics":           {},
 }
 

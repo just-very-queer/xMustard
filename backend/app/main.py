@@ -72,7 +72,7 @@ def _split_csv(value: Optional[str]) -> Optional[list[str]]:
 
 @app.get("/api/runtimes")
 def runtimes():
-    return [item.model_dump(mode="json") for item in SERVICE.runtime_service.detect_runtimes()]
+    return SERVICE.detect_runtimes()
 
 
 @app.get("/api/settings")
@@ -87,7 +87,7 @@ def update_settings(settings: AppSettings):
 
 @app.get("/api/agent/capabilities")
 def local_agent_capabilities():
-    return SERVICE.runtime_service.local_agent_capabilities().model_dump(mode="json")
+    return SERVICE.local_agent_capabilities()
 
 
 @app.post("/api/workspaces/{workspace_id}/agent/probe")

@@ -76,9 +76,17 @@ reviews:
             service, workspace_id = self._create_service(tmp_dir)
 
             with patch.object(cli_module, "service", service):
+                with patch.object(
+                    cli_module,
+                    "_run_go_runtime_json",
+                    return_value={"selected_runtime": "codex", "supports_terminal": True, "runtimes": []},
+                ):
+                    result = self.runner.invoke(cli_module.app, ["capabilities"])
+                    self.assertEqual(result.exit_code, 0, msg=result.output)
+                    self.assertIn("runtimes", json.loads(result.stdout))
+
                 checks = [
                     (["health"], lambda payload: self.assertEqual(payload["status"], "ok")),
-                    (["capabilities"], lambda payload: self.assertIn("runtimes", payload)),
                     (["snapshot", workspace_id], lambda payload: self.assertEqual(payload["workspace"]["workspace_id"], workspace_id)),
                     (["issues", workspace_id], lambda payload: self.assertEqual(payload[0]["bug_id"], "P0_25M03_001")),
                     (["signals", workspace_id], lambda payload: self.assertIsInstance(payload, list)),
@@ -96,6 +104,42 @@ reviews:
                     self.assertEqual(result.exit_code, 0, msg=result.output)
                     payload = json.loads(result.stdout)
                     validator(payload)
+
+    def test_cli_runtime_commands_delegate_to_go_ops(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service, workspace_id = self._create_service(tmp_dir)
+
+            runtime_payloads = {
+                "capabilities": {"selected_runtime": "codex", "supports_terminal": True, "runtimes": []},
+                "runtimes": [{"runtime": "codex", "available": True, "models": []}],
+                "models": [{"runtime": "codex", "id": "gpt-5.4-mini"}],
+                "probe": {"runtime": "codex", "model": "gpt-5.4-mini", "ok": True, "available": True},
+            }
+
+            with patch.object(cli_module, "service", service):
+                with patch.object(cli_module, "_run_go_runtime_json") as runtime_mock:
+                    runtime_mock.side_effect = lambda action, flags=None: runtime_payloads[action]
+
+                    result = self.runner.invoke(cli_module.app, ["runtimes"])
+                    self.assertEqual(result.exit_code, 0, msg=result.output)
+                    self.assertEqual(json.loads(result.stdout)[0]["runtime"], "codex")
+                    runtime_mock.assert_called_with("runtimes")
+
+                    result = self.runner.invoke(cli_module.app, ["models", "codex"])
+                    self.assertEqual(result.exit_code, 0, msg=result.output)
+                    self.assertEqual(json.loads(result.stdout)[0]["id"], "gpt-5.4-mini")
+                    runtime_mock.assert_called_with("models", ["codex"])
+
+                    result = self.runner.invoke(
+                        cli_module.app,
+                        ["agent-probe", workspace_id, "--runtime", "codex", "--model", "gpt-5.4-mini"],
+                    )
+                    self.assertEqual(result.exit_code, 0, msg=result.output)
+                    self.assertTrue(json.loads(result.stdout)["ok"])
+                    runtime_mock.assert_called_with(
+                        "probe",
+                        [workspace_id, "--runtime", "codex", "--model", "gpt-5.4-mini"],
+                    )
 
     def test_cli_repo_tool_commands_cover_first_tranche_surfaces(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -593,26 +637,30 @@ reviews:
             service.store.save_run(run)
             Path(run.log_path).write_text("line one\nline two\n", encoding="utf-8")
 
-            probe = RuntimeProbeResult(
-                runtime="codex",
-                model="gpt-5.4-mini",
-                ok=True,
-                available=True,
-                binary_path="/opt/homebrew/bin/codex",
-                command_preview="codex exec",
-                duration_ms=123,
-                exit_code=0,
-                output_excerpt='{"status":"ok"}',
-            )
+            probe = {
+                "runtime": "codex",
+                "model": "gpt-5.4-mini",
+                "ok": True,
+                "available": True,
+                "binary_path": "/opt/homebrew/bin/codex",
+                "command_preview": "codex exec",
+                "duration_ms": 123,
+                "exit_code": 0,
+                "output_excerpt": '{"status":"ok"}',
+            }
 
             with patch.object(cli_module, "service", service):
-                with patch.object(service, "probe_runtime", return_value=probe.model_dump(mode="json")):
+                with patch.object(cli_module, "_run_go_runtime_json", return_value=probe) as probe_mock:
                     result = self.runner.invoke(
                         cli_module.app,
                         ["agent-probe", workspace_id, "--runtime", "codex", "--model", "gpt-5.4-mini"],
                     )
                     self.assertEqual(result.exit_code, 0, msg=result.output)
                     self.assertTrue(json.loads(result.stdout)["ok"])
+                    probe_mock.assert_called_once_with(
+                        "probe",
+                        [workspace_id, "--runtime", "codex", "--model", "gpt-5.4-mini"],
+                    )
 
                 with patch.object(service, "start_agent_query", return_value=run.model_dump(mode="json")):
                     result = self.runner.invoke(
@@ -721,48 +769,53 @@ reviews:
                 self.assertEqual(result.exit_code, 0, msg=result.output)
                 self.assertEqual(json.loads(result.stdout)["status"], "completed")
 
-                with patch.object(service, "probe_runtime", return_value=probe.model_dump(mode="json")):
-                    with patch.object(service, "start_agent_query", return_value=query_run.model_dump(mode="json")):
-                        with patch.object(service, "start_issue_run", return_value=issue_run.model_dump(mode="json")):
-                            with patch.object(
-                                service,
-                                "get_run",
-                                side_effect=[
-                                    query_run.model_dump(mode="json"),
-                                    issue_run.model_dump(mode="json"),
-                                ],
-                            ):
+                with patch.object(
+                    cli_module,
+                    "_run_go_runtime_json",
+                    return_value={"selected_runtime": "codex", "supports_terminal": True, "runtimes": []},
+                ):
+                    with patch.object(service, "probe_runtime", return_value=probe.model_dump(mode="json")):
+                        with patch.object(service, "start_agent_query", return_value=query_run.model_dump(mode="json")):
+                            with patch.object(service, "start_issue_run", return_value=issue_run.model_dump(mode="json")):
                                 with patch.object(
                                     service,
-                                    "read_run_log",
+                                    "get_run",
                                     side_effect=[
-                                        {"offset": 0, "content": "", "eof": False},
-                                        {"offset": 0, "content": "", "eof": False},
+                                        query_run.model_dump(mode="json"),
+                                        issue_run.model_dump(mode="json"),
                                     ],
                                 ):
                                     with patch.object(
                                         service,
-                                        "cancel_run",
+                                        "read_run_log",
                                         side_effect=[
-                                            query_run.model_dump(mode="json") | {"status": "cancelled"},
-                                            issue_run.model_dump(mode="json") | {"status": "cancelled"},
+                                            {"offset": 0, "content": "", "eof": False},
+                                            {"offset": 0, "content": "", "eof": False},
                                         ],
                                     ):
-                                        with patch("app.cli.time.sleep", return_value=None):
-                                            result = self.runner.invoke(
-                                                cli_module.app,
-                                                [
-                                                    "smoke",
-                                                    workspace_id,
-                                                    "P0_25M03_001",
-                                                    "--runtime",
-                                                    "codex",
-                                                    "--model",
-                                                    "gpt-5.4-mini",
-                                                    "--settle-seconds",
-                                                    "0",
-                                                ],
-                                            )
+                                        with patch.object(
+                                            service,
+                                            "cancel_run",
+                                            side_effect=[
+                                                query_run.model_dump(mode="json") | {"status": "cancelled"},
+                                                issue_run.model_dump(mode="json") | {"status": "cancelled"},
+                                            ],
+                                        ):
+                                            with patch("app.cli.time.sleep", return_value=None):
+                                                result = self.runner.invoke(
+                                                    cli_module.app,
+                                                    [
+                                                        "smoke",
+                                                        workspace_id,
+                                                        "P0_25M03_001",
+                                                        "--runtime",
+                                                        "codex",
+                                                        "--model",
+                                                        "gpt-5.4-mini",
+                                                        "--settle-seconds",
+                                                        "0",
+                                                    ],
+                                                )
                 self.assertEqual(result.exit_code, 0, msg=result.output)
                 payload = json.loads(result.stdout)
                 self.assertTrue(payload["probe"]["ok"])

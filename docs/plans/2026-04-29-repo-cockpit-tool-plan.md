@@ -248,6 +248,13 @@ Phase 2 live status on 2026-05-02:
 
 ## Phase 3: LSP And Diagnostics
 
+Phase naming correction:
+
+- The thing we later called "Phase 3" in the migration stream was not this original LSP phase.
+- It became a Python-exit / ownership-shift tranche for semantic, Postgres, and repo-intelligence surfaces.
+- That scoped migration target is effectively done in `docs/plans/2026-05-02-python-exit-map.md`.
+- This original Phase 3 remains the LSP and diagnostics phase and is still not done.
+
 Goal:
 
 - give agents live language-server intelligence

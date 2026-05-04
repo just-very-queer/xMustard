@@ -38,6 +38,7 @@ SEMANTIC_TABLES = {
     "semantic_queries",
     "semantic_matches",
     "semantic_index_runs",
+    "diagnostic_runs",
     "diagnostics",
 }
 OPS_MEMORY_TABLES = {

@@ -166,6 +166,41 @@ fn main() {
                 }
             }
         }
+        "normalize-diagnostics" => {
+            let Some(workspace_id) = args.next() else {
+                eprintln!("usage: xmustard-core normalize-diagnostics <workspace_id> <root_path> <input_json_path> <source_kind> <source_name>");
+                std::process::exit(2);
+            };
+            let Some(root) = args.next() else {
+                eprintln!("usage: xmustard-core normalize-diagnostics <workspace_id> <root_path> <input_json_path> <source_kind> <source_name>");
+                std::process::exit(2);
+            };
+            let Some(input_json_path) = args.next() else {
+                eprintln!("usage: xmustard-core normalize-diagnostics <workspace_id> <root_path> <input_json_path> <source_kind> <source_name>");
+                std::process::exit(2);
+            };
+            let source_kind = args.next().unwrap_or_else(|| "lsp".to_string());
+            let source_name = args.next().unwrap_or_else(|| "unknown".to_string());
+            match xmustard_core::diagnostics::normalize_diagnostics_file(
+                &workspace_id,
+                &PathBuf::from(root),
+                &PathBuf::from(input_json_path),
+                &source_kind,
+                &source_name,
+            ) {
+                Ok(result) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&result)
+                            .expect("diagnostics result should serialize")
+                    );
+                }
+                Err(err) => {
+                    eprintln!("normalize-diagnostics failed: {err}");
+                    std::process::exit(1);
+                }
+            }
+        }
         "parse-coverage-lcov" => {
             let Some(workspace_id) = args.next() else {
                 eprintln!(

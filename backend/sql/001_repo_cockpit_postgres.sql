@@ -246,19 +246,64 @@ create table if not exists {{schema}}.issue_artifacts (
     updated_at timestamptz not null default now()
 );
 
+create table if not exists {{schema}}.diagnostic_runs (
+    diagnostic_run_id text primary key,
+    workspace_id text not null references {{schema}}.workspaces(workspace_id) on delete cascade,
+    source_kind text not null default 'lsp',
+    source_name text not null,
+    batch_fingerprint text not null,
+    head_sha text,
+    dirty_files integer not null default 0,
+    worktree_dirty boolean not null default false,
+    diagnostic_count integer not null default 0,
+    severity_counts_json jsonb not null default '{}'::jsonb,
+    input_path text not null default '',
+    postgres_schema text not null default 'xmustard',
+    created_at timestamptz not null default now()
+);
+
 create table if not exists {{schema}}.diagnostics (
     diagnostic_id bigserial primary key,
+    diagnostic_run_id text references {{schema}}.diagnostic_runs(diagnostic_run_id) on delete cascade,
     workspace_id text not null references {{schema}}.workspaces(workspace_id) on delete cascade,
+    file_id bigint references {{schema}}.files(file_id) on delete set null,
     path text not null,
-    source text not null,
+    range_start_line integer not null default 1,
+    range_start_column integer not null default 1,
+    range_end_line integer not null default 1,
+    range_end_column integer not null default 1,
+    source text not null default 'lsp',
     severity text not null,
     code text,
     message text not null,
     line_start integer,
     line_end integer,
+    source_kind text not null default 'lsp',
+    source_name text not null,
+    rule_code text,
+    fingerprint text not null,
+    head_sha text,
+    content_hash text,
     symbol_id bigint references {{schema}}.symbols(symbol_id) on delete set null,
-    observed_at timestamptz not null default now()
+    observed_at timestamptz not null default now(),
+    generated_at timestamptz not null default now(),
+    unique (workspace_id, diagnostic_run_id, fingerprint)
 );
+
+alter table {{schema}}.diagnostics add column if not exists diagnostic_run_id text;
+alter table {{schema}}.diagnostics add column if not exists file_id bigint;
+alter table {{schema}}.diagnostics add column if not exists range_start_line integer;
+alter table {{schema}}.diagnostics add column if not exists range_start_column integer;
+alter table {{schema}}.diagnostics add column if not exists range_end_line integer;
+alter table {{schema}}.diagnostics add column if not exists range_end_column integer;
+alter table {{schema}}.diagnostics add column if not exists source_kind text;
+alter table {{schema}}.diagnostics add column if not exists source_name text;
+alter table {{schema}}.diagnostics add column if not exists rule_code text;
+alter table {{schema}}.diagnostics add column if not exists fingerprint text;
+alter table {{schema}}.diagnostics add column if not exists head_sha text;
+alter table {{schema}}.diagnostics add column if not exists content_hash text;
+alter table {{schema}}.diagnostics add column if not exists generated_at timestamptz;
+alter table {{schema}}.diagnostics alter column source set default 'lsp';
 
 create index if not exists workspaces_root_path_idx on {{schema}}.workspaces(root_path);
 create index if not exists workspace_snapshots_workspace_id_idx on {{schema}}.workspace_snapshots(workspace_id, generated_at desc);
@@ -271,12 +316,15 @@ create index if not exists semantic_queries_workspace_idx on {{schema}}.semantic
 create index if not exists semantic_matches_workspace_path_idx on {{schema}}.semantic_matches(workspace_id, path, matched_at desc);
 create index if not exists semantic_matches_query_idx on {{schema}}.semantic_matches(query_id);
 create index if not exists semantic_index_runs_workspace_surface_idx on {{schema}}.semantic_index_runs(workspace_id, surface, created_at desc);
+create index if not exists diagnostic_runs_workspace_idx on {{schema}}.diagnostic_runs(workspace_id, created_at desc);
 create index if not exists activity_events_workspace_idx on {{schema}}.activity_events(workspace_id, created_at desc);
 create index if not exists run_records_workspace_idx on {{schema}}.run_records(workspace_id, created_at desc);
 create index if not exists run_plans_workspace_idx on {{schema}}.run_plans(workspace_id, issue_id, updated_at desc);
 create index if not exists run_plan_revisions_plan_idx on {{schema}}.run_plan_revisions(plan_id, version desc);
 create index if not exists verification_runs_workspace_idx on {{schema}}.verification_runs(workspace_id, created_at desc);
-create index if not exists diagnostics_workspace_path_idx on {{schema}}.diagnostics(workspace_id, path, observed_at desc);
+create index if not exists diagnostics_workspace_generated_path_idx on {{schema}}.diagnostics(workspace_id, path, generated_at desc);
+create index if not exists diagnostics_workspace_fingerprint_idx on {{schema}}.diagnostics(workspace_id, fingerprint);
+create unique index if not exists diagnostics_workspace_run_fingerprint_idx on {{schema}}.diagnostics(workspace_id, diagnostic_run_id, fingerprint);
 
 -- Text search foundation. BM25-capable ranking can be layered on top of this Postgres
 -- text-search substrate using the search stack we adopt next.

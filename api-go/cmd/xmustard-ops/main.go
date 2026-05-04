@@ -24,18 +24,76 @@ func (s *stringSliceFlag) Set(value string) error {
 func main() {
 	args := os.Args[1:]
 	if len(args) == 0 {
-		fatalUsage("usage: xmustard-ops <semantic-index|postgres|workspace> ...")
+		fatalUsage("usage: xmustard-ops <semantic-index|postgres|runtime|workspace> ...")
 	}
 	switch args[0] {
+	case "diagnostics":
+		runDiagnostics(args[1:])
 	case "semantic-index":
 		runSemanticIndex(args[1:])
 	case "postgres":
 		runPostgres(args[1:])
+	case "runtime":
+		runRuntime(args[1:])
 	case "workspace":
 		runWorkspace(args[1:])
 	default:
-		fatalUsage("usage: xmustard-ops <semantic-index|postgres|workspace> ...")
+		fatalUsage("usage: xmustard-ops <diagnostics|semantic-index|postgres|runtime|workspace> ...")
 	}
+}
+
+func runDiagnostics(args []string) {
+	if len(args) < 2 {
+		fatalUsage("usage: xmustard-ops diagnostics <plan|run|status|read> <workspace_id> [flags]")
+	}
+	action := args[0]
+	workspaceID := strings.TrimSpace(args[1])
+	if workspaceID == "" {
+		fatalUsage("workspace_id is required")
+	}
+	fs := flag.NewFlagSet("xmustard-ops diagnostics", flag.ExitOnError)
+	dataDir := fs.String("data-dir", envDefault("XMUSTARD_DATA_DIR", "../backend/data"), "xMustard data directory")
+	inputPath := fs.String("input-path", "", "LSP publishDiagnostics JSON file")
+	sourceKind := fs.String("source-kind", "lsp", "lsp | compiler | test | scanner | manual")
+	sourceName := fs.String("source-name", "", "diagnostic source name, e.g. pyright or typescript-language-server")
+	dsn := fs.String("dsn", "", "Postgres DSN override")
+	schema := fs.String("schema", "", "Postgres schema override")
+	dryRun := fs.Bool("dry-run", false, "plan without applying")
+	if err := fs.Parse(args[2:]); err != nil {
+		fatal(err.Error())
+	}
+	request := workspaceops.DiagnosticsRequest{
+		InputPath:  *inputPath,
+		SourceKind: *sourceKind,
+		SourceName: *sourceName,
+		DryRun:     *dryRun,
+	}
+	if strings.TrimSpace(*dsn) != "" {
+		value := strings.TrimSpace(*dsn)
+		request.DSN = &value
+	}
+	if strings.TrimSpace(*schema) != "" {
+		value := strings.TrimSpace(*schema)
+		request.SchemaName = &value
+	}
+
+	var (
+		payload any
+		err     error
+	)
+	switch action {
+	case "plan":
+		payload, err = workspaceops.PlanDiagnostics(*dataDir, workspaceID, request)
+	case "run":
+		payload, err = workspaceops.RunDiagnostics(*dataDir, workspaceID, request)
+	case "status":
+		payload, err = workspaceops.ReadDiagnosticsStatus(*dataDir, workspaceID)
+	case "read":
+		payload, err = workspaceops.ReadDiagnostics(*dataDir, workspaceID)
+	default:
+		fatalUsage("usage: xmustard-ops diagnostics <plan|run|status|read> <workspace_id> [flags]")
+	}
+	writeJSON(payload, err)
 }
 
 func runSemanticIndex(args []string) {
@@ -131,6 +189,72 @@ func runPostgres(args []string) {
 	writeJSON(payload, err)
 }
 
+func runRuntime(args []string) {
+	if len(args) < 1 {
+		fatalUsage("usage: xmustard-ops runtime <capabilities|runtimes|models|probe> [args] [flags]")
+	}
+	action := args[0]
+	switch action {
+	case "capabilities", "runtimes":
+		fs := flag.NewFlagSet("xmustard-ops runtime "+action, flag.ExitOnError)
+		dataDir := fs.String("data-dir", envDefault("XMUSTARD_DATA_DIR", "../backend/data"), "xMustard data directory")
+		if err := fs.Parse(args[1:]); err != nil {
+			fatal(err.Error())
+		}
+		if action == "capabilities" {
+			writeJSON(workspaceops.GetLocalAgentCapabilities(*dataDir))
+			return
+		}
+		writeJSON(workspaceops.DetectRuntimes(*dataDir))
+	case "models":
+		if len(args) < 2 {
+			fatalUsage("usage: xmustard-ops runtime models <runtime> [flags]")
+		}
+		runtimeName := strings.TrimSpace(args[1])
+		if runtimeName == "" {
+			fatalUsage("runtime is required")
+		}
+		fs := flag.NewFlagSet("xmustard-ops runtime models", flag.ExitOnError)
+		dataDir := fs.String("data-dir", envDefault("XMUSTARD_DATA_DIR", "../backend/data"), "xMustard data directory")
+		if err := fs.Parse(args[2:]); err != nil {
+			fatal(err.Error())
+		}
+		runtimes, err := workspaceops.DetectRuntimes(*dataDir)
+		if err != nil {
+			writeJSON(nil, err)
+			return
+		}
+		for _, entry := range runtimes {
+			if entry.Runtime == runtimeName {
+				writeJSON(entry.Models, nil)
+				return
+			}
+		}
+		fatal("unknown runtime: " + runtimeName)
+	case "probe":
+		if len(args) < 2 {
+			fatalUsage("usage: xmustard-ops runtime probe <workspace_id> --runtime <runtime> --model <model> [flags]")
+		}
+		workspaceID := strings.TrimSpace(args[1])
+		if workspaceID == "" {
+			fatalUsage("workspace_id is required")
+		}
+		fs := flag.NewFlagSet("xmustard-ops runtime probe", flag.ExitOnError)
+		dataDir := fs.String("data-dir", envDefault("XMUSTARD_DATA_DIR", "../backend/data"), "xMustard data directory")
+		runtimeName := fs.String("runtime", "", "runtime id")
+		model := fs.String("model", "", "runtime model id")
+		if err := fs.Parse(args[2:]); err != nil {
+			fatal(err.Error())
+		}
+		if strings.TrimSpace(*runtimeName) == "" || strings.TrimSpace(*model) == "" {
+			fatalUsage("usage: xmustard-ops runtime probe <workspace_id> --runtime <runtime> --model <model> [flags]")
+		}
+		writeJSON(workspaceops.ProbeRuntime(*dataDir, workspaceID, *runtimeName, *model))
+	default:
+		fatalUsage("usage: xmustard-ops runtime <capabilities|runtimes|models|probe> [args] [flags]")
+	}
+}
+
 func runWorkspace(args []string) {
 	if len(args) < 2 {
 		fatalUsage("usage: xmustard-ops workspace <action> <workspace_id> [flags]")
@@ -177,6 +301,10 @@ func runWorkspace(args []string) {
 		payload, err = workspaceops.SearchRetrieval(*dataDir, workspaceID, *query, *limit)
 	case "path-symbols":
 		payload, err = workspaceops.ReadPathSymbols(*dataDir, workspaceID, *path)
+	case "document-symbols":
+		payload, err = workspaceops.ReadDocumentSymbols(*dataDir, workspaceID, *path)
+	case "workspace-symbols":
+		payload, err = workspaceops.ReadWorkspaceSymbols(*dataDir, workspaceID, *query, *limit)
 	case "explain-path":
 		payload, err = workspaceops.ExplainPath(*dataDir, workspaceID, *path)
 	case "semantic-search":
@@ -213,7 +341,7 @@ func runWorkspace(args []string) {
 			SchemaName: optionalFlagString(*schema),
 		})
 	default:
-		fatalUsage("usage: xmustard-ops workspace <scan|repo-map|changed-symbols|impact|repo-context|retrieval-search|path-symbols|explain-path|semantic-search|postgres-materialize-path|postgres-materialize-workspace-symbols|postgres-materialize-semantic-search|semantic-index-materialize> <workspace_id> [flags]")
+		fatalUsage("usage: xmustard-ops workspace <scan|repo-map|changed-symbols|impact|repo-context|retrieval-search|path-symbols|document-symbols|workspace-symbols|explain-path|semantic-search|postgres-materialize-path|postgres-materialize-workspace-symbols|postgres-materialize-semantic-search|semantic-index-materialize> <workspace_id> [flags]")
 	}
 	writeJSON(payload, err)
 }
