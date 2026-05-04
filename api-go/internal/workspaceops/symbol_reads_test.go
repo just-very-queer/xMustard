@@ -142,6 +142,13 @@ func TestReadDiagnosticsDecoratesRowsWithConservativeSymbolLinks(t *testing.T) {
 	}
 
 	countsJSON, _ := json.Marshal(map[string]int{"error": 1})
+	semanticBaselineJSON, _ := json.Marshal(map[string]any{
+		"index_run_id":      "semidx_fixture",
+		"index_fingerprint": "semfp",
+		"surface":           "cli",
+		"strategy":          "paths",
+		"covered_paths":     []string{"src/app.py"},
+	})
 	diagnosticsJSON, _ := json.Marshal([]map[string]any{
 		{
 			"workspace_id":       workspaceID,
@@ -169,6 +176,21 @@ func TestReadDiagnosticsDecoratesRowsWithConservativeSymbolLinks(t *testing.T) {
 				"evidence_source":  "rust_diagnostic_symbol_link",
 				"selection_reason": "The diagnostic starts on exactly one durable symbol anchor line.",
 			},
+			"link_context": map[string]any{
+				"candidate_count":  1,
+				"evidence_source":  "rust_diagnostic_symbol_link",
+				"selection_reason": "The diagnostic starts on exactly one durable symbol anchor line.",
+				"candidates": []map[string]any{{
+					"symbol_id":      21,
+					"path":           "src/app.py",
+					"symbol":         "ExportService",
+					"kind":           "class",
+					"line_start":     1,
+					"line_end":       1,
+					"signature_text": "class ExportService:",
+				}},
+				"generated_at": "2026-05-04T00:00:00Z",
+			},
 			"generated_at": "2026-05-04T00:00:00Z",
 		},
 	})
@@ -180,6 +202,7 @@ func TestReadDiagnosticsDecoratesRowsWithConservativeSymbolLinks(t *testing.T) {
 				"lsp",
 				"pyright",
 				"batchfp",
+				semanticBaselineJSON,
 				(*string)(nil),
 				0,
 				false,
@@ -195,15 +218,21 @@ func TestReadDiagnosticsDecoratesRowsWithConservativeSymbolLinks(t *testing.T) {
 	restore := stubSemanticPostgresConnection(fakeConn)
 	defer restore()
 
-	result, err := ReadDiagnostics(dataDir, workspaceID)
+	result, err := ReadDiagnostics(dataDir, workspaceID, "diag_fixture")
 	if err != nil {
 		t.Fatalf("read diagnostics: %v", err)
 	}
 	if len(result.Diagnostics) != 1 {
 		t.Fatalf("expected one diagnostic row, got %#v", result)
 	}
+	if result.Baseline == nil || result.Baseline.SemanticBaseline == nil || result.Baseline.SemanticBaseline.IndexRunID != "semidx_fixture" {
+		t.Fatalf("expected historical semantic baseline anchor, got %#v", result.Baseline)
+	}
 	if result.Diagnostics[0].LinkedSymbol == nil || result.Diagnostics[0].LinkedSymbol.Symbol != "ExportService" {
 		t.Fatalf("expected conservative symbol link, got %#v", result.Diagnostics[0])
+	}
+	if result.Diagnostics[0].LinkContext == nil || result.Diagnostics[0].LinkContext.CandidateCount != 1 {
+		t.Fatalf("expected archived link context, got %#v", result.Diagnostics[0])
 	}
 	if result.Diagnostics[0].LinkedSymbol.LinkStrategy != "diagnostic_start_line_exact_symbol_anchor" || result.Diagnostics[0].LinkedSymbol.EvidenceSource != "rust_diagnostic_symbol_link" {
 		t.Fatalf("expected Rust-owned link provenance, got %#v", result.Diagnostics[0].LinkedSymbol)
@@ -251,6 +280,7 @@ func TestReadDiagnosticsLeavesUnmatchedRowsUnlinked(t *testing.T) {
 				"lsp",
 				"pyright",
 				"batchfp",
+				[]byte("{}"),
 				(*string)(nil),
 				0,
 				false,
@@ -266,7 +296,7 @@ func TestReadDiagnosticsLeavesUnmatchedRowsUnlinked(t *testing.T) {
 	restore := stubSemanticPostgresConnection(fakeConn)
 	defer restore()
 
-	result, err := ReadDiagnostics(dataDir, workspaceID)
+	result, err := ReadDiagnostics(dataDir, workspaceID, "diag_fixture")
 	if err != nil {
 		t.Fatalf("read diagnostics: %v", err)
 	}
@@ -278,6 +308,9 @@ func TestReadDiagnosticsLeavesUnmatchedRowsUnlinked(t *testing.T) {
 	}
 	if result.Diagnostics[0].LinkStatus != "evaluated_unlinked" {
 		t.Fatalf("expected persisted evaluated_unlinked status, got %#v", result.Diagnostics[0])
+	}
+	if result.Diagnostics[0].LinkContext != nil {
+		t.Fatalf("expected no archived link context in this fixture, got %#v", result.Diagnostics[0].LinkContext)
 	}
 }
 
@@ -319,6 +352,7 @@ func TestReadDiagnosticsLeavesAmbiguousSymbolMatchesUnlinked(t *testing.T) {
 				"lsp",
 				"pyright",
 				"batchfp",
+				[]byte("{}"),
 				(*string)(nil),
 				0,
 				false,
@@ -334,7 +368,7 @@ func TestReadDiagnosticsLeavesAmbiguousSymbolMatchesUnlinked(t *testing.T) {
 	restore := stubSemanticPostgresConnection(fakeConn)
 	defer restore()
 
-	result, err := ReadDiagnostics(dataDir, workspaceID)
+	result, err := ReadDiagnostics(dataDir, workspaceID, "diag_fixture")
 	if err != nil {
 		t.Fatalf("read diagnostics: %v", err)
 	}
@@ -346,6 +380,9 @@ func TestReadDiagnosticsLeavesAmbiguousSymbolMatchesUnlinked(t *testing.T) {
 	}
 	if result.Diagnostics[0].LinkStatus != "symbols_unavailable" {
 		t.Fatalf("expected persisted symbols_unavailable status, got %#v", result.Diagnostics[0])
+	}
+	if result.Diagnostics[0].LinkContext != nil {
+		t.Fatalf("expected missing archived link context when symbols were unavailable, got %#v", result.Diagnostics[0].LinkContext)
 	}
 	if len(result.Warnings) != 1 || !strings.Contains(result.Warnings[0], "durable link replay is unavailable") {
 		t.Fatalf("expected readiness warning, got %#v", result.Warnings)

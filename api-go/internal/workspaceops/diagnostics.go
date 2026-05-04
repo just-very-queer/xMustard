@@ -81,19 +81,49 @@ type DiagnosticsStatus struct {
 }
 
 type DiagnosticRun struct {
-	DiagnosticRunID  string         `json:"diagnostic_run_id"`
-	WorkspaceID      string         `json:"workspace_id"`
-	SourceKind       string         `json:"source_kind"`
-	SourceName       string         `json:"source_name"`
-	BatchFingerprint string         `json:"batch_fingerprint"`
-	HeadSHA          *string        `json:"head_sha,omitempty"`
-	DirtyFiles       int            `json:"dirty_files"`
-	WorktreeDirty    bool           `json:"worktree_dirty"`
-	DiagnosticCount  int            `json:"diagnostic_count"`
-	SeverityCounts   map[string]int `json:"severity_counts"`
-	InputPath        string         `json:"input_path"`
-	PostgresSchema   string         `json:"postgres_schema"`
-	CreatedAt        string         `json:"created_at"`
+	DiagnosticRunID  string                      `json:"diagnostic_run_id"`
+	WorkspaceID      string                      `json:"workspace_id"`
+	SourceKind       string                      `json:"source_kind"`
+	SourceName       string                      `json:"source_name"`
+	BatchFingerprint string                      `json:"batch_fingerprint"`
+	SemanticBaseline *DiagnosticSemanticBaseline `json:"semantic_baseline,omitempty"`
+	HeadSHA          *string                     `json:"head_sha,omitempty"`
+	DirtyFiles       int                         `json:"dirty_files"`
+	WorktreeDirty    bool                        `json:"worktree_dirty"`
+	DiagnosticCount  int                         `json:"diagnostic_count"`
+	SeverityCounts   map[string]int              `json:"severity_counts"`
+	InputPath        string                      `json:"input_path"`
+	PostgresSchema   string                      `json:"postgres_schema"`
+	CreatedAt        string                      `json:"created_at"`
+}
+
+type DiagnosticSemanticBaseline struct {
+	IndexRunID       string   `json:"index_run_id"`
+	IndexFingerprint string   `json:"index_fingerprint"`
+	Surface          string   `json:"surface"`
+	Strategy         string   `json:"strategy"`
+	CoveredPaths     []string `json:"covered_paths"`
+}
+
+type DiagnosticLinkCandidate struct {
+	SymbolID       int64   `json:"symbol_id"`
+	Path           string  `json:"path"`
+	Symbol         string  `json:"symbol"`
+	Kind           string  `json:"kind"`
+	Language       *string `json:"language,omitempty"`
+	LineStart      *int    `json:"line_start,omitempty"`
+	LineEnd        *int    `json:"line_end,omitempty"`
+	EnclosingScope *string `json:"enclosing_scope,omitempty"`
+	SignatureText  *string `json:"signature_text,omitempty"`
+}
+
+type DiagnosticLinkContext struct {
+	CandidateCount  int                       `json:"candidate_count"`
+	Candidates      []DiagnosticLinkCandidate `json:"candidates"`
+	EvidenceSource  string                    `json:"evidence_source"`
+	SelectionReason string                    `json:"selection_reason"`
+	Warnings        []string                  `json:"warnings"`
+	GeneratedAt     string                    `json:"generated_at"`
 }
 
 type DiagnosticRecord struct {
@@ -114,6 +144,7 @@ type DiagnosticRecord struct {
 	ContentHash      *string                 `json:"content_hash,omitempty"`
 	LinkStatus       string                  `json:"link_status"`
 	LinkedSymbol     *DiagnosticLinkedSymbol `json:"linked_symbol,omitempty"`
+	LinkContext      *DiagnosticLinkContext  `json:"link_context,omitempty"`
 	GeneratedAt      string                  `json:"generated_at"`
 }
 
@@ -355,7 +386,7 @@ func ReadDiagnosticsStatus(dataDir string, workspaceID string) (*DiagnosticsStat
 	}, nil
 }
 
-func ReadDiagnostics(dataDir string, workspaceID string) (*DiagnosticsReadResult, error) {
+func ReadDiagnostics(dataDir string, workspaceID string, diagnosticRunID string) (*DiagnosticsReadResult, error) {
 	if _, err := getWorkspaceRecord(dataDir, workspaceID); err != nil {
 		return nil, err
 	}
@@ -371,9 +402,20 @@ func ReadDiagnostics(dataDir string, workspaceID string) (*DiagnosticsReadResult
 	if targetDSN == "" {
 		return nil, fmt.Errorf("%w: Postgres DSN is required to read diagnostics", ErrInvalidDiagnosticsRequest)
 	}
-	baseline, err := readLatestDiagnosticRun(targetDSN, schema, workspaceID)
-	if err != nil {
-		return nil, err
+	var baseline *DiagnosticRun
+	if strings.TrimSpace(diagnosticRunID) != "" {
+		baseline, err = readDiagnosticRunByID(targetDSN, schema, workspaceID, diagnosticRunID)
+		if err != nil {
+			return nil, err
+		}
+		if baseline == nil {
+			return nil, fmt.Errorf("%w: diagnostics run not found: %s", ErrInvalidDiagnosticsRequest, strings.TrimSpace(diagnosticRunID))
+		}
+	} else {
+		baseline, err = readLatestDiagnosticRun(targetDSN, schema, workspaceID)
+		if err != nil {
+			return nil, err
+		}
 	}
 	if baseline == nil {
 		return &DiagnosticsReadResult{WorkspaceID: workspaceID, Diagnostics: []DiagnosticRecord{}, Warnings: []string{"No diagnostics baseline has been materialized."}, GeneratedAt: nowUTC()}, nil
@@ -386,7 +428,7 @@ func ReadDiagnostics(dataDir string, workspaceID string) (*DiagnosticsReadResult
 		WorkspaceID: workspaceID,
 		Baseline:    baseline,
 		Diagnostics: diagnostics,
-		Warnings:    diagnosticReplayWarnings(diagnostics),
+		Warnings:    diagnosticReplayWarnings(baseline, diagnostics),
 		GeneratedAt: nowUTC(),
 	}, nil
 }
@@ -407,14 +449,28 @@ func persistDiagnosticsBaseline(dsn string, schema string, plan *DiagnosticsPlan
 	if err != nil {
 		return nil, 0, fmt.Errorf("encode diagnostic severity counts: %w", err)
 	}
+	semanticBaseline, err := resolveDiagnosticSemanticBaseline(ctx, connection, schema, plan.WorkspaceID, plan.HeadSHA, diagnosticPaths(plan.NormalizedBatch.Diagnostics))
+	if err != nil {
+		return nil, 0, err
+	}
+	var semanticBaselineJSON *string
+	if semanticBaseline != nil {
+		payload, err := json.Marshal(semanticBaseline)
+		if err != nil {
+			return nil, 0, fmt.Errorf("encode diagnostic semantic baseline: %w", err)
+		}
+		value := string(payload)
+		semanticBaselineJSON = &value
+	}
 	if _, err := connection.Exec(
 		ctx,
-		fmt.Sprintf("insert into %s.diagnostic_runs (diagnostic_run_id, workspace_id, source_kind, source_name, batch_fingerprint, head_sha, dirty_files, worktree_dirty, diagnostic_count, severity_counts_json, input_path, postgres_schema) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11, $12)", schema),
+		fmt.Sprintf("insert into %s.diagnostic_runs (diagnostic_run_id, workspace_id, source_kind, source_name, batch_fingerprint, semantic_baseline_json, head_sha, dirty_files, worktree_dirty, diagnostic_count, severity_counts_json, input_path, postgres_schema) values ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10, $11::jsonb, $12, $13)", schema),
 		runID,
 		plan.WorkspaceID,
 		plan.SourceKind,
 		plan.SourceName,
 		firstNonEmptyPtr(plan.BatchFingerprint),
+		semanticBaselineJSON,
 		plan.HeadSHA,
 		plan.DirtyFiles,
 		plan.WorktreeDirty,
@@ -448,9 +504,18 @@ func persistDiagnosticsBaseline(dsn string, schema string, plan *DiagnosticsPlan
 			value := string(payload)
 			linkedSymbolJSON = &value
 		}
+		var linkContextJSON *string
+		if linkState.LinkContext != nil {
+			payload, err := json.Marshal(linkState.LinkContext)
+			if err != nil {
+				return nil, 0, fmt.Errorf("encode diagnostic link context: %w", err)
+			}
+			value := string(payload)
+			linkContextJSON = &value
+		}
 		if _, err := connection.Exec(
 			ctx,
-			fmt.Sprintf("insert into %s.diagnostics (diagnostic_run_id, workspace_id, file_id, path, range_start_line, range_start_column, range_end_line, range_end_column, severity, message, source_kind, source_name, rule_code, fingerprint, head_sha, content_hash, symbol_id, link_status, linked_symbol_json, generated_at) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19::jsonb, $20::timestamptz) on conflict (workspace_id, diagnostic_run_id, fingerprint) do update set message = excluded.message, severity = excluded.severity, symbol_id = excluded.symbol_id, link_status = excluded.link_status, linked_symbol_json = excluded.linked_symbol_json, generated_at = excluded.generated_at", schema),
+			fmt.Sprintf("insert into %s.diagnostics (diagnostic_run_id, workspace_id, file_id, path, range_start_line, range_start_column, range_end_line, range_end_column, severity, message, source_kind, source_name, rule_code, fingerprint, head_sha, content_hash, symbol_id, link_status, linked_symbol_json, link_context_json, generated_at) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19::jsonb, $20::jsonb, $21::timestamptz) on conflict (workspace_id, diagnostic_run_id, fingerprint) do update set message = excluded.message, severity = excluded.severity, symbol_id = excluded.symbol_id, link_status = excluded.link_status, linked_symbol_json = excluded.linked_symbol_json, link_context_json = excluded.link_context_json, generated_at = excluded.generated_at", schema),
 			runID,
 			row.WorkspaceID,
 			fileID,
@@ -470,6 +535,7 @@ func persistDiagnosticsBaseline(dsn string, schema string, plan *DiagnosticsPlan
 			linkState.SymbolID,
 			linkState.Status,
 			linkedSymbolJSON,
+			linkContextJSON,
 			row.GeneratedAt,
 		); err != nil {
 			return nil, 0, fmt.Errorf("insert diagnostic row: %w", err)
@@ -482,6 +548,7 @@ func persistDiagnosticsBaseline(dsn string, schema string, plan *DiagnosticsPlan
 		SourceKind:       plan.SourceKind,
 		SourceName:       plan.SourceName,
 		BatchFingerprint: firstNonEmptyPtr(plan.BatchFingerprint),
+		SemanticBaseline: semanticBaseline,
 		HeadSHA:          plan.HeadSHA,
 		DirtyFiles:       plan.DirtyFiles,
 		WorktreeDirty:    plan.WorktreeDirty,
@@ -494,6 +561,14 @@ func persistDiagnosticsBaseline(dsn string, schema string, plan *DiagnosticsPlan
 }
 
 func readLatestDiagnosticRun(dsn string, schema string, workspaceID string) (*DiagnosticRun, error) {
+	return readDiagnosticRun(dsn, schema, workspaceID, "")
+}
+
+func readDiagnosticRunByID(dsn string, schema string, workspaceID string, runID string) (*DiagnosticRun, error) {
+	return readDiagnosticRun(dsn, schema, workspaceID, strings.TrimSpace(runID))
+}
+
+func readDiagnosticRun(dsn string, schema string, workspaceID string, targetRunID string) (*DiagnosticRun, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	connection, err := connectSemanticPostgres(ctx, dsn)
@@ -502,24 +577,28 @@ func readLatestDiagnosticRun(dsn string, schema string, workspaceID string) (*Di
 	}
 	defer connection.Close(context.Background())
 	var (
-		runID       string
-		sourceKind  string
-		sourceName  string
-		fingerprint string
-		headSHA     *string
-		dirtyFiles  int
-		dirty       bool
-		count       int
-		countsJSON  []byte
-		inputPath   string
-		pgSchema    string
-		createdAt   string
+		runID                string
+		sourceKind           string
+		sourceName           string
+		fingerprint          string
+		semanticBaselineJSON []byte
+		headSHA              *string
+		dirtyFiles           int
+		dirty                bool
+		count                int
+		countsJSON           []byte
+		inputPath            string
+		pgSchema             string
+		createdAt            string
 	)
-	err = connection.QueryRow(
-		ctx,
-		fmt.Sprintf("select diagnostic_run_id, source_kind, source_name, batch_fingerprint, head_sha, dirty_files, worktree_dirty, diagnostic_count, severity_counts_json, input_path, postgres_schema, created_at::text from %s.diagnostic_runs where workspace_id = $1 order by created_at desc limit 1", schema),
-		workspaceID,
-	).Scan(&runID, &sourceKind, &sourceName, &fingerprint, &headSHA, &dirtyFiles, &dirty, &count, &countsJSON, &inputPath, &pgSchema, &createdAt)
+	query := fmt.Sprintf("select diagnostic_run_id, source_kind, source_name, batch_fingerprint, coalesce(semantic_baseline_json, '{}'::jsonb), head_sha, dirty_files, worktree_dirty, diagnostic_count, severity_counts_json, input_path, postgres_schema, created_at::text from %s.diagnostic_runs where workspace_id = $1", schema)
+	args := []any{workspaceID}
+	if targetRunID != "" {
+		query += " and diagnostic_run_id = $2"
+		args = append(args, targetRunID)
+	}
+	query += " order by created_at desc limit 1"
+	err = connection.QueryRow(ctx, query, args...).Scan(&runID, &sourceKind, &sourceName, &fingerprint, &semanticBaselineJSON, &headSHA, &dirtyFiles, &dirty, &count, &countsJSON, &inputPath, &pgSchema, &createdAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
@@ -528,12 +607,17 @@ func readLatestDiagnosticRun(dsn string, schema string, workspaceID string) (*Di
 	}
 	counts := map[string]int{}
 	_ = json.Unmarshal(countsJSON, &counts)
+	semanticBaseline, err := decodeDiagnosticSemanticBaseline(semanticBaselineJSON)
+	if err != nil {
+		return nil, fmt.Errorf("decode diagnostic semantic baseline: %w", err)
+	}
 	return &DiagnosticRun{
 		DiagnosticRunID:  runID,
 		WorkspaceID:      workspaceID,
 		SourceKind:       sourceKind,
 		SourceName:       sourceName,
 		BatchFingerprint: fingerprint,
+		SemanticBaseline: semanticBaseline,
 		HeadSHA:          headSHA,
 		DirtyFiles:       dirtyFiles,
 		WorktreeDirty:    dirty,
@@ -556,7 +640,7 @@ func readDiagnosticRows(dsn string, schema string, workspaceID string, runID str
 	var payload []byte
 	err = connection.QueryRow(
 		ctx,
-		fmt.Sprintf("select coalesce(jsonb_agg(jsonb_build_object('workspace_id', workspace_id, 'diagnostic_run_id', diagnostic_run_id, 'path', path, 'range_start_line', range_start_line, 'range_start_column', range_start_column, 'range_end_line', range_end_line, 'range_end_column', range_end_column, 'severity', severity, 'message', message, 'source_kind', source_kind, 'source_name', source_name, 'rule_code', rule_code, 'fingerprint', fingerprint, 'head_sha', head_sha, 'content_hash', content_hash, 'link_status', coalesce(link_status, 'unevaluated'), 'linked_symbol', linked_symbol_json, 'generated_at', generated_at::text) order by severity, path), '[]'::jsonb) from %s.diagnostics where workspace_id = $1 and diagnostic_run_id = $2", schema),
+		fmt.Sprintf("select coalesce(jsonb_agg(jsonb_build_object('workspace_id', workspace_id, 'diagnostic_run_id', diagnostic_run_id, 'path', path, 'range_start_line', range_start_line, 'range_start_column', range_start_column, 'range_end_line', range_end_line, 'range_end_column', range_end_column, 'severity', severity, 'message', message, 'source_kind', source_kind, 'source_name', source_name, 'rule_code', rule_code, 'fingerprint', fingerprint, 'head_sha', head_sha, 'content_hash', content_hash, 'link_status', coalesce(link_status, 'unevaluated'), 'linked_symbol', linked_symbol_json, 'link_context', link_context_json, 'generated_at', generated_at::text) order by severity, path), '[]'::jsonb) from %s.diagnostics where workspace_id = $1 and diagnostic_run_id = $2", schema),
 		workspaceID,
 		runID,
 	).Scan(&payload)
@@ -634,6 +718,7 @@ type diagnosticLinkPersistence struct {
 	Status       string
 	SymbolID     *int64
 	LinkedSymbol *DiagnosticLinkedSymbol
+	LinkContext  *DiagnosticLinkContext
 }
 
 func resolveDiagnosticLinkPersistence(ctx context.Context, connection semanticMaterializationConn, schema string, workspaceID string, relativePath string, startLine int, endLine int, diagnosticFingerprint string) (*diagnosticLinkPersistence, error) {
@@ -644,25 +729,33 @@ func resolveDiagnosticLinkPersistence(ctx context.Context, connection semanticMa
 	if !ready {
 		return &diagnosticLinkPersistence{Status: diagnosticLinkStatusSymbolsUnavailable}, nil
 	}
-	link, err := findBestDiagnosticSymbolLink(ctx, connection, schema, workspaceID, relativePath, startLine, endLine, diagnosticFingerprint)
+	linkContext, link, err := findBestDiagnosticSymbolLink(ctx, connection, schema, workspaceID, relativePath, startLine, endLine, diagnosticFingerprint)
 	if err != nil {
 		return nil, err
 	}
 	if link == nil {
-		return &diagnosticLinkPersistence{Status: diagnosticLinkStatusEvaluatedUnlinked}, nil
+		return &diagnosticLinkPersistence{
+			Status:      diagnosticLinkStatusEvaluatedUnlinked,
+			LinkContext: linkContext,
+		}, nil
 	}
 	symbolID := link.SymbolID
 	return &diagnosticLinkPersistence{
 		Status:       diagnosticLinkStatusLinked,
 		SymbolID:     &symbolID,
 		LinkedSymbol: link,
+		LinkContext:  linkContext,
 	}, nil
 }
 
-func diagnosticReplayWarnings(rows []DiagnosticRecord) []string {
+func diagnosticReplayWarnings(baseline *DiagnosticRun, rows []DiagnosticRecord) []string {
 	legacy := 0
 	unavailable := 0
+	archivedLinkContext := 0
 	for _, row := range rows {
+		if row.LinkContext != nil {
+			archivedLinkContext++
+		}
 		switch row.LinkStatus {
 		case diagnosticLinkStatusUnevaluated:
 			legacy++
@@ -677,5 +770,112 @@ func diagnosticReplayWarnings(rows []DiagnosticRecord) []string {
 	if unavailable > 0 {
 		warnings = append(warnings, fmt.Sprintf("%d diagnostic row(s) were stored before materialized symbols were available, so durable link replay is unavailable.", unavailable))
 	}
+	if archivedLinkContext > 0 && baseline != nil && baseline.SemanticBaseline == nil {
+		warnings = append(warnings, "Diagnostic rows include archived link context, but this run was not anchored to a stored semantic baseline.")
+	}
 	return warnings
+}
+
+type diagnosticSemanticBaselineCandidate struct {
+	IndexRunID        string   `json:"index_run_id"`
+	IndexFingerprint  string   `json:"index_fingerprint"`
+	Surface           string   `json:"surface"`
+	Strategy          string   `json:"strategy"`
+	MaterializedPaths []string `json:"materialized_paths"`
+}
+
+func resolveDiagnosticSemanticBaseline(ctx context.Context, connection semanticMaterializationConn, schema string, workspaceID string, headSHA *string, paths []string) (*DiagnosticSemanticBaseline, error) {
+	if len(paths) == 0 {
+		return nil, nil
+	}
+	var payload []byte
+	if err := connection.QueryRow(
+		ctx,
+		fmt.Sprintf(`
+			select coalesce(jsonb_agg(jsonb_build_object(
+				'index_run_id', candidate.index_run_id,
+				'index_fingerprint', candidate.index_fingerprint,
+				'surface', candidate.surface,
+				'strategy', candidate.strategy,
+				'materialized_paths', candidate.materialized_paths_json
+			) order by candidate.created_at desc), '[]'::jsonb)
+			from (
+				select index_run_id, index_fingerprint, surface, strategy, materialized_paths_json, created_at
+				from %s.semantic_index_runs
+				where workspace_id = $1 and head_sha is not distinct from $2
+				order by created_at desc
+				limit 16
+			) candidate
+		`, schema),
+		workspaceID,
+		headSHA,
+	).Scan(&payload); err != nil {
+		return nil, fmt.Errorf("read diagnostic semantic baseline candidates: %w", err)
+	}
+	candidates := []diagnosticSemanticBaselineCandidate{}
+	if len(payload) > 0 {
+		if err := json.Unmarshal(payload, &candidates); err != nil {
+			return nil, fmt.Errorf("decode diagnostic semantic baseline candidates: %w", err)
+		}
+	}
+	needed := map[string]struct{}{}
+	for _, item := range paths {
+		needed[item] = struct{}{}
+	}
+	for _, candidate := range candidates {
+		covered := []string{}
+		seen := map[string]struct{}{}
+		for _, path := range candidate.MaterializedPaths {
+			if _, ok := needed[path]; !ok {
+				continue
+			}
+			if _, ok := seen[path]; ok {
+				continue
+			}
+			seen[path] = struct{}{}
+			covered = append(covered, path)
+		}
+		if len(covered) != len(needed) {
+			continue
+		}
+		return &DiagnosticSemanticBaseline{
+			IndexRunID:       candidate.IndexRunID,
+			IndexFingerprint: candidate.IndexFingerprint,
+			Surface:          candidate.Surface,
+			Strategy:         candidate.Strategy,
+			CoveredPaths:     covered,
+		}, nil
+	}
+	return nil, nil
+}
+
+func diagnosticPaths(rows []rustcore.NormalizedDiagnostic) []string {
+	seen := map[string]struct{}{}
+	paths := []string{}
+	for _, row := range rows {
+		if row.Path == "" {
+			continue
+		}
+		if _, ok := seen[row.Path]; ok {
+			continue
+		}
+		seen[row.Path] = struct{}{}
+		paths = append(paths, row.Path)
+	}
+	return paths
+}
+
+func decodeDiagnosticSemanticBaseline(payload []byte) (*DiagnosticSemanticBaseline, error) {
+	trimmed := strings.TrimSpace(string(payload))
+	if trimmed == "" || trimmed == "null" || trimmed == "{}" {
+		return nil, nil
+	}
+	var baseline DiagnosticSemanticBaseline
+	if err := json.Unmarshal(payload, &baseline); err != nil {
+		return nil, err
+	}
+	if baseline.IndexRunID == "" {
+		return nil, nil
+	}
+	return &baseline, nil
 }

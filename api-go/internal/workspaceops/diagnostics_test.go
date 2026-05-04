@@ -42,8 +42,19 @@ func TestRunDiagnosticsNormalizesWithRustAndPersistsRows(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal symbol candidates: %v", err)
 	}
+	semanticBaselineJSON, err := json.Marshal([]map[string]any{{
+		"index_run_id":       "semidx_fixture",
+		"index_fingerprint":  "semfp",
+		"surface":            "cli",
+		"strategy":           "paths",
+		"materialized_paths": []string{"src/app.py"},
+	}})
+	if err != nil {
+		t.Fatalf("marshal semantic baseline candidates: %v", err)
+	}
 	fakeConn := &fakeSemanticConn{
 		queryRows: []pgx.Row{
+			fakeSemanticJSONRow(semanticBaselineJSON),
 			fakeSemanticBaselineRowValues(int64(21)),
 			fakeSemanticBaselineRowValues(true),
 			fakeSemanticJSONRow(candidatesJSON),
@@ -71,8 +82,14 @@ func TestRunDiagnosticsNormalizesWithRustAndPersistsRows(t *testing.T) {
 	if !containsSubstring(fakeConn.execSQL, "insert into xmustard.diagnostic_runs") || !containsSubstring(fakeConn.execSQL, "insert into xmustard.diagnostics") {
 		t.Fatalf("expected diagnostic run and row writes, got %#v", fakeConn.execSQL)
 	}
+	if !containsSubstring(fakeConn.execSQL, "semantic_baseline_json") || !containsSubstring(fakeConn.execSQL, "link_context_json") {
+		t.Fatalf("expected historical semantic replay columns, got %#v", fakeConn.execSQL)
+	}
 	if !containsSubstring(fakeConn.execSQL, "link_status") || !containsSubstring(fakeConn.execSQL, "linked_symbol_json") || !containsSubstring(fakeConn.execSQL, "symbol_id") {
 		t.Fatalf("expected durable diagnostic link replay columns, got %#v", fakeConn.execSQL)
+	}
+	if result.Baseline.SemanticBaseline == nil || result.Baseline.SemanticBaseline.IndexRunID != "semidx_fixture" {
+		t.Fatalf("expected persisted semantic baseline anchor, got %#v", result.Baseline)
 	}
 	activityPath := filepath.Join(dataDir, "workspaces", workspaceID, "activity.jsonl")
 	activityContent, err := os.ReadFile(activityPath)

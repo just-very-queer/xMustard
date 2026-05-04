@@ -1674,6 +1674,7 @@ func main() {
 		result, err := workspaceops.ReadDiagnostics(
 			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
 			workspaceID,
+			r.URL.Query().Get("diagnostic_run_id"),
 		)
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {

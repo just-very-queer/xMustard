@@ -57,6 +57,7 @@ func runDiagnostics(args []string) {
 	sourceKind := fs.String("source-kind", "lsp", "lsp | compiler | test | scanner | manual")
 	sourceName := fs.String("source-name", "", "diagnostic source name, e.g. pyright or typescript-language-server")
 	path := fs.String("path", "", "relative workspace path for live LSP diagnostics")
+	diagnosticRunID := fs.String("diagnostic-run-id", "", "historical diagnostics run id for durable reads")
 	dsn := fs.String("dsn", "", "Postgres DSN override")
 	schema := fs.String("schema", "", "Postgres schema override")
 	dryRun := fs.Bool("dry-run", false, "plan without applying")
@@ -90,7 +91,7 @@ func runDiagnostics(args []string) {
 	case "status":
 		payload, err = workspaceops.ReadDiagnosticsStatus(*dataDir, workspaceID)
 	case "read":
-		payload, err = workspaceops.ReadDiagnostics(*dataDir, workspaceID)
+		payload, err = workspaceops.ReadDiagnostics(*dataDir, workspaceID, *diagnosticRunID)
 	case "live":
 		payload, err = workspaceops.ReadLiveDiagnostics(*dataDir, workspaceID, *path)
 	default:

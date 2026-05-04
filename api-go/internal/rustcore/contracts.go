@@ -54,6 +54,7 @@ type DiagnosticContract struct {
 	DurableStore         string   `json:"durable_store"`
 	RequiredFields       []string `json:"required_fields"`
 	OptionalLinkFields   []string `json:"optional_link_fields"`
+	OptionalReplayFields []string `json:"optional_replay_fields"`
 	LinkReadinessStates  []string `json:"link_readiness_states"`
 	LinkStrategies       []string `json:"link_strategies"`
 	NormalizedSeverities []string `json:"normalized_severities"`

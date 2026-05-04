@@ -23,6 +23,9 @@ func TestReadArchitectureContract(t *testing.T) {
 	if contract.DiagnosticsContract.ContractID != "diagnostics.normalized.v1" || len(contract.DiagnosticsContract.LinkReadinessStates) == 0 {
 		t.Fatalf("expected diagnostics contract with readiness states, got %#v", contract.DiagnosticsContract)
 	}
+	if len(contract.DiagnosticsContract.OptionalReplayFields) == 0 {
+		t.Fatalf("expected diagnostics replay fields in contract, got %#v", contract.DiagnosticsContract)
+	}
 	if contract.NextRemovablePythonBoundary.BoundaryID != "runtime_and_terminal_process_plane" {
 		t.Fatalf("unexpected python cutline: %#v", contract.NextRemovablePythonBoundary)
 	}

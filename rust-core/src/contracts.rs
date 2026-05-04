@@ -51,6 +51,7 @@ pub struct DiagnosticContract {
     pub durable_store: &'static str,
     pub required_fields: Vec<&'static str>,
     pub optional_link_fields: Vec<&'static str>,
+    pub optional_replay_fields: Vec<&'static str>,
     pub link_readiness_states: Vec<&'static str>,
     pub link_strategies: Vec<&'static str>,
     pub normalized_severities: Vec<&'static str>,
@@ -311,6 +312,17 @@ pub fn diagnostics_contract_v1() -> DiagnosticContract {
             "linked_symbol.evidence_source",
             "linked_symbol.selection_reason",
         ],
+        optional_replay_fields: vec![
+            "semantic_baseline.index_run_id",
+            "semantic_baseline.index_fingerprint",
+            "semantic_baseline.surface",
+            "semantic_baseline.strategy",
+            "semantic_baseline.covered_paths",
+            "link_context.candidate_count",
+            "link_context.evidence_source",
+            "link_context.selection_reason",
+            "link_context.candidates",
+        ],
         link_readiness_states: vec![
             "unevaluated",
             "symbols_unavailable",
@@ -323,7 +335,7 @@ pub fn diagnostics_contract_v1() -> DiagnosticContract {
         ],
         normalized_severities: vec!["error", "warning", "info", "hint"],
         source_kinds: vec!["lsp", "compiler", "test", "scanner", "manual"],
-        notes: "Rust normalizes diagnostic meaning from LSP/compiler/scanner inputs and owns conservative diagnostic-to-symbol link decisions over durable symbol candidates; Go delivers it; Postgres persists baselines plus replayable link state. Durable replay claims require persisted link_status readiness metadata and, when linked, a stored linked_symbol snapshot. Python must not become the first LSP diagnostics owner.",
+        notes: "Rust normalizes diagnostic meaning from LSP/compiler/scanner inputs and owns conservative diagnostic-to-symbol link decisions over durable symbol candidates; Go delivers it; Postgres persists baselines plus replayable link state. Honest historical replay claims require persisted link_status readiness metadata, a stored linked_symbol snapshot when linked, and archived link_context candidate slices plus a semantic_baseline reference when that baseline identity is available. Python must not become the first LSP diagnostics owner.",
     }
 }
 

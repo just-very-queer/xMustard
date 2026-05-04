@@ -173,7 +173,7 @@ func readWorkspaceSymbolRows(dsn string, schema string, workspaceID string, quer
 	return rows, nil
 }
 
-func findBestDiagnosticSymbolLink(ctx context.Context, connection semanticMaterializationConn, schema string, workspaceID string, relativePath string, startLine int, endLine int, diagnosticFingerprint string) (*DiagnosticLinkedSymbol, error) {
+func findBestDiagnosticSymbolLink(ctx context.Context, connection semanticMaterializationConn, schema string, workspaceID string, relativePath string, startLine int, endLine int, diagnosticFingerprint string) (*DiagnosticLinkContext, *DiagnosticLinkedSymbol, error) {
 	var payload []byte
 	err := connection.QueryRow(
 		ctx,
@@ -209,25 +209,30 @@ func findBestDiagnosticSymbolLink(ctx context.Context, connection semanticMateri
 		endLine,
 	).Scan(&payload)
 	if err != nil {
-		return nil, fmt.Errorf("read diagnostic symbol candidates: %w", err)
+		return nil, nil, fmt.Errorf("read diagnostic symbol candidates: %w", err)
 	}
 	var candidates []rustcore.DiagnosticSymbolCandidate
 	if len(payload) > 0 {
 		if err := json.Unmarshal(payload, &candidates); err != nil {
-			return nil, fmt.Errorf("decode diagnostic symbol candidates: %w", err)
+			return nil, nil, fmt.Errorf("decode diagnostic symbol candidates: %w", err)
 		}
-	}
-	if len(candidates) == 0 {
-		return nil, nil
 	}
 	linkResult, err := rustcore.LinkDiagnosticSymbol(ctx, workspaceID, relativePath, startLine, endLine, diagnosticFingerprint, candidates)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
+	}
+	linkContext := &DiagnosticLinkContext{
+		CandidateCount:  linkResult.CandidateCount,
+		Candidates:      convertRustDiagnosticLinkCandidates(candidates),
+		EvidenceSource:  linkResult.EvidenceSource,
+		SelectionReason: linkResult.SelectionReason,
+		Warnings:        append([]string{}, linkResult.Warnings...),
+		GeneratedAt:     linkResult.GeneratedAt,
 	}
 	if linkResult.LinkedSymbol == nil {
-		return nil, nil
+		return linkContext, nil, nil
 	}
-	return convertRustDiagnosticLinkedSymbol(linkResult.LinkedSymbol), nil
+	return linkContext, convertRustDiagnosticLinkedSymbol(linkResult.LinkedSymbol), nil
 }
 
 func hasMaterializedSymbolSummary(ctx context.Context, connection semanticMaterializationConn, schema string, workspaceID string, relativePath string) (bool, error) {
@@ -290,4 +295,22 @@ func convertRustDiagnosticLinkedSymbol(item *rustcore.DiagnosticLinkedSymbol) *D
 		EvidenceSource:  item.EvidenceSource,
 		SelectionReason: item.SelectionReason,
 	}
+}
+
+func convertRustDiagnosticLinkCandidates(items []rustcore.DiagnosticSymbolCandidate) []DiagnosticLinkCandidate {
+	out := make([]DiagnosticLinkCandidate, 0, len(items))
+	for _, item := range items {
+		out = append(out, DiagnosticLinkCandidate{
+			SymbolID:       item.SymbolID,
+			Path:           item.Path,
+			Symbol:         item.Symbol,
+			Kind:           item.Kind,
+			Language:       item.Language,
+			LineStart:      item.LineStart,
+			LineEnd:        item.LineEnd,
+			EnclosingScope: item.EnclosingScope,
+			SignatureText:  item.SignatureText,
+		})
+	}
+	return out
 }

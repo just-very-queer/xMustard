@@ -252,6 +252,7 @@ create table if not exists {{schema}}.diagnostic_runs (
     source_kind text not null default 'lsp',
     source_name text not null,
     batch_fingerprint text not null,
+    semantic_baseline_json jsonb,
     head_sha text,
     dirty_files integer not null default 0,
     worktree_dirty boolean not null default false,
@@ -287,11 +288,13 @@ create table if not exists {{schema}}.diagnostics (
     symbol_id bigint references {{schema}}.symbols(symbol_id) on delete set null,
     link_status text not null default 'unevaluated',
     linked_symbol_json jsonb,
+    link_context_json jsonb,
     observed_at timestamptz not null default now(),
     generated_at timestamptz not null default now(),
     unique (workspace_id, diagnostic_run_id, fingerprint)
 );
 
+alter table {{schema}}.diagnostic_runs add column if not exists semantic_baseline_json jsonb;
 alter table {{schema}}.diagnostics add column if not exists diagnostic_run_id text;
 alter table {{schema}}.diagnostics add column if not exists file_id bigint;
 alter table {{schema}}.diagnostics add column if not exists range_start_line integer;
@@ -306,6 +309,7 @@ alter table {{schema}}.diagnostics add column if not exists head_sha text;
 alter table {{schema}}.diagnostics add column if not exists content_hash text;
 alter table {{schema}}.diagnostics add column if not exists link_status text default 'unevaluated';
 alter table {{schema}}.diagnostics add column if not exists linked_symbol_json jsonb;
+alter table {{schema}}.diagnostics add column if not exists link_context_json jsonb;
 alter table {{schema}}.diagnostics add column if not exists generated_at timestamptz;
 update {{schema}}.diagnostics set link_status = 'unevaluated' where link_status is null;
 alter table {{schema}}.diagnostics alter column link_status set default 'unevaluated';
