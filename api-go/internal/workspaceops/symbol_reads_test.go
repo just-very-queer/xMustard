@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
@@ -155,18 +156,22 @@ func TestReadDiagnosticsDecoratesRowsWithConservativeSymbolLinks(t *testing.T) {
 			"source_kind":        "lsp",
 			"source_name":        "pyright",
 			"fingerprint":        "diagfp",
-			"generated_at":       "2026-05-04T00:00:00Z",
+			"link_status":        "linked",
+			"linked_symbol": map[string]any{
+				"symbol_id":        21,
+				"path":             "src/app.py",
+				"symbol":           "ExportService",
+				"kind":             "class",
+				"line_start":       1,
+				"line_end":         1,
+				"signature_text":   "class ExportService:",
+				"link_strategy":    "diagnostic_start_line_exact_symbol_anchor",
+				"evidence_source":  "rust_diagnostic_symbol_link",
+				"selection_reason": "The diagnostic starts on exactly one durable symbol anchor line.",
+			},
+			"generated_at": "2026-05-04T00:00:00Z",
 		},
 	})
-	candidatesJSON, _ := json.Marshal([]map[string]any{{
-		"symbol_id":      21,
-		"path":           "src/app.py",
-		"symbol":         "ExportService",
-		"kind":           "class",
-		"line_start":     1,
-		"line_end":       1,
-		"signature_text": "class ExportService:",
-	}})
 
 	fakeConn := &fakeSemanticConn{
 		queryRows: []pgx.Row{
@@ -185,7 +190,6 @@ func TestReadDiagnosticsDecoratesRowsWithConservativeSymbolLinks(t *testing.T) {
 				"2026-05-04T00:00:00Z",
 			),
 			fakeSemanticJSONRow(diagnosticsJSON),
-			fakeSemanticJSONRow(candidatesJSON),
 		},
 	}
 	restore := stubSemanticPostgresConnection(fakeConn)
@@ -203,6 +207,9 @@ func TestReadDiagnosticsDecoratesRowsWithConservativeSymbolLinks(t *testing.T) {
 	}
 	if result.Diagnostics[0].LinkedSymbol.LinkStrategy != "diagnostic_start_line_exact_symbol_anchor" || result.Diagnostics[0].LinkedSymbol.EvidenceSource != "rust_diagnostic_symbol_link" {
 		t.Fatalf("expected Rust-owned link provenance, got %#v", result.Diagnostics[0].LinkedSymbol)
+	}
+	if len(fakeConn.querySQL) != 2 {
+		t.Fatalf("expected durable replay read without candidate relinking, got %#v", fakeConn.querySQL)
 	}
 }
 
@@ -232,6 +239,7 @@ func TestReadDiagnosticsLeavesUnmatchedRowsUnlinked(t *testing.T) {
 			"source_kind":        "lsp",
 			"source_name":        "pyright",
 			"fingerprint":        "diagfp2",
+			"link_status":        "evaluated_unlinked",
 			"generated_at":       "2026-05-04T00:00:00Z",
 		},
 	})
@@ -253,7 +261,6 @@ func TestReadDiagnosticsLeavesUnmatchedRowsUnlinked(t *testing.T) {
 				"2026-05-04T00:00:00Z",
 			),
 			fakeSemanticJSONRow(diagnosticsJSON),
-			fakeSemanticJSONRow([]byte("[]")),
 		},
 	}
 	restore := stubSemanticPostgresConnection(fakeConn)
@@ -268,6 +275,9 @@ func TestReadDiagnosticsLeavesUnmatchedRowsUnlinked(t *testing.T) {
 	}
 	if result.Diagnostics[0].LinkedSymbol != nil {
 		t.Fatalf("expected unmatched diagnostic to stay unlinked, got %#v", result.Diagnostics[0])
+	}
+	if result.Diagnostics[0].LinkStatus != "evaluated_unlinked" {
+		t.Fatalf("expected persisted evaluated_unlinked status, got %#v", result.Diagnostics[0])
 	}
 }
 
@@ -297,25 +307,8 @@ func TestReadDiagnosticsLeavesAmbiguousSymbolMatchesUnlinked(t *testing.T) {
 			"source_kind":        "lsp",
 			"source_name":        "pyright",
 			"fingerprint":        "diagfp3",
+			"link_status":        "symbols_unavailable",
 			"generated_at":       "2026-05-04T00:00:00Z",
-		},
-	})
-	candidatesJSON, _ := json.Marshal([]map[string]any{
-		{
-			"symbol_id":  21,
-			"path":       "src/app.py",
-			"symbol":     "ExportService",
-			"kind":       "class",
-			"line_start": 1,
-			"line_end":   5,
-		},
-		{
-			"symbol_id":  22,
-			"path":       "src/app.py",
-			"symbol":     "ExportFactory",
-			"kind":       "class",
-			"line_start": 1,
-			"line_end":   5,
 		},
 	})
 
@@ -336,7 +329,6 @@ func TestReadDiagnosticsLeavesAmbiguousSymbolMatchesUnlinked(t *testing.T) {
 				"2026-05-04T00:00:00Z",
 			),
 			fakeSemanticJSONRow(diagnosticsJSON),
-			fakeSemanticJSONRow(candidatesJSON),
 		},
 	}
 	restore := stubSemanticPostgresConnection(fakeConn)
@@ -351,5 +343,11 @@ func TestReadDiagnosticsLeavesAmbiguousSymbolMatchesUnlinked(t *testing.T) {
 	}
 	if result.Diagnostics[0].LinkedSymbol != nil {
 		t.Fatalf("expected ambiguous diagnostic to stay unlinked, got %#v", result.Diagnostics[0])
+	}
+	if result.Diagnostics[0].LinkStatus != "symbols_unavailable" {
+		t.Fatalf("expected persisted symbols_unavailable status, got %#v", result.Diagnostics[0])
+	}
+	if len(result.Warnings) != 1 || !strings.Contains(result.Warnings[0], "durable link replay is unavailable") {
+		t.Fatalf("expected readiness warning, got %#v", result.Warnings)
 	}
 }

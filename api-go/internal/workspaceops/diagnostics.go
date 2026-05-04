@@ -19,6 +19,13 @@ import (
 
 var ErrInvalidDiagnosticsRequest = errors.New("invalid diagnostics request")
 
+const (
+	diagnosticLinkStatusUnevaluated        = "unevaluated"
+	diagnosticLinkStatusSymbolsUnavailable = "symbols_unavailable"
+	diagnosticLinkStatusEvaluatedUnlinked  = "evaluated_unlinked"
+	diagnosticLinkStatusLinked             = "linked"
+)
+
 type DiagnosticsRequest struct {
 	InputPath  string  `json:"input_path"`
 	SourceKind string  `json:"source_kind"`
@@ -105,6 +112,7 @@ type DiagnosticRecord struct {
 	Fingerprint      string                  `json:"fingerprint"`
 	HeadSHA          *string                 `json:"head_sha,omitempty"`
 	ContentHash      *string                 `json:"content_hash,omitempty"`
+	LinkStatus       string                  `json:"link_status"`
 	LinkedSymbol     *DiagnosticLinkedSymbol `json:"linked_symbol,omitempty"`
 	GeneratedAt      string                  `json:"generated_at"`
 }
@@ -378,6 +386,7 @@ func ReadDiagnostics(dataDir string, workspaceID string) (*DiagnosticsReadResult
 		WorkspaceID: workspaceID,
 		Baseline:    baseline,
 		Diagnostics: diagnostics,
+		Warnings:    diagnosticReplayWarnings(diagnostics),
 		GeneratedAt: nowUTC(),
 	}, nil
 }
@@ -426,9 +435,22 @@ func persistDiagnosticsBaseline(dsn string, schema string, plan *DiagnosticsPlan
 		if err != nil {
 			return nil, 0, err
 		}
+		linkState, err := resolveDiagnosticLinkPersistence(ctx, connection, schema, plan.WorkspaceID, row.Path, row.RangeStartLine, row.RangeEndLine, row.Fingerprint)
+		if err != nil {
+			return nil, 0, err
+		}
+		var linkedSymbolJSON *string
+		if linkState.LinkedSymbol != nil {
+			payload, err := json.Marshal(linkState.LinkedSymbol)
+			if err != nil {
+				return nil, 0, fmt.Errorf("encode linked diagnostic symbol: %w", err)
+			}
+			value := string(payload)
+			linkedSymbolJSON = &value
+		}
 		if _, err := connection.Exec(
 			ctx,
-			fmt.Sprintf("insert into %s.diagnostics (diagnostic_run_id, workspace_id, file_id, path, range_start_line, range_start_column, range_end_line, range_end_column, severity, message, source_kind, source_name, rule_code, fingerprint, head_sha, content_hash, generated_at) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17::timestamptz) on conflict (workspace_id, diagnostic_run_id, fingerprint) do update set message = excluded.message, severity = excluded.severity, generated_at = excluded.generated_at", schema),
+			fmt.Sprintf("insert into %s.diagnostics (diagnostic_run_id, workspace_id, file_id, path, range_start_line, range_start_column, range_end_line, range_end_column, severity, message, source_kind, source_name, rule_code, fingerprint, head_sha, content_hash, symbol_id, link_status, linked_symbol_json, generated_at) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19::jsonb, $20::timestamptz) on conflict (workspace_id, diagnostic_run_id, fingerprint) do update set message = excluded.message, severity = excluded.severity, symbol_id = excluded.symbol_id, link_status = excluded.link_status, linked_symbol_json = excluded.linked_symbol_json, generated_at = excluded.generated_at", schema),
 			runID,
 			row.WorkspaceID,
 			fileID,
@@ -445,6 +467,9 @@ func persistDiagnosticsBaseline(dsn string, schema string, plan *DiagnosticsPlan
 			row.Fingerprint,
 			plan.HeadSHA,
 			contentHash,
+			linkState.SymbolID,
+			linkState.Status,
+			linkedSymbolJSON,
 			row.GeneratedAt,
 		); err != nil {
 			return nil, 0, fmt.Errorf("insert diagnostic row: %w", err)
@@ -531,7 +556,7 @@ func readDiagnosticRows(dsn string, schema string, workspaceID string, runID str
 	var payload []byte
 	err = connection.QueryRow(
 		ctx,
-		fmt.Sprintf("select coalesce(jsonb_agg(jsonb_build_object('workspace_id', workspace_id, 'diagnostic_run_id', diagnostic_run_id, 'path', path, 'range_start_line', range_start_line, 'range_start_column', range_start_column, 'range_end_line', range_end_line, 'range_end_column', range_end_column, 'severity', severity, 'message', message, 'source_kind', source_kind, 'source_name', source_name, 'rule_code', rule_code, 'fingerprint', fingerprint, 'head_sha', head_sha, 'content_hash', content_hash, 'generated_at', generated_at::text) order by severity, path), '[]'::jsonb) from %s.diagnostics where workspace_id = $1 and diagnostic_run_id = $2", schema),
+		fmt.Sprintf("select coalesce(jsonb_agg(jsonb_build_object('workspace_id', workspace_id, 'diagnostic_run_id', diagnostic_run_id, 'path', path, 'range_start_line', range_start_line, 'range_start_column', range_start_column, 'range_end_line', range_end_line, 'range_end_column', range_end_column, 'severity', severity, 'message', message, 'source_kind', source_kind, 'source_name', source_name, 'rule_code', rule_code, 'fingerprint', fingerprint, 'head_sha', head_sha, 'content_hash', content_hash, 'link_status', coalesce(link_status, 'unevaluated'), 'linked_symbol', linked_symbol_json, 'generated_at', generated_at::text) order by severity, path), '[]'::jsonb) from %s.diagnostics where workspace_id = $1 and diagnostic_run_id = $2", schema),
 		workspaceID,
 		runID,
 	).Scan(&payload)
@@ -545,11 +570,9 @@ func readDiagnosticRows(dsn string, schema string, workspaceID string, runID str
 		}
 	}
 	for idx := range rows {
-		link, err := findBestDiagnosticSymbolLink(ctx, connection, schema, workspaceID, rows[idx].Path, rows[idx].RangeStartLine, rows[idx].RangeEndLine, rows[idx].Fingerprint)
-		if err != nil {
-			return nil, err
+		if strings.TrimSpace(rows[idx].LinkStatus) == "" {
+			rows[idx].LinkStatus = diagnosticLinkStatusUnevaluated
 		}
-		rows[idx].LinkedSymbol = link
 	}
 	return rows, nil
 }
@@ -605,4 +628,54 @@ func diagnosticsBatchFingerprint(workspaceID string, sourceKind string, sourceNa
 		hasher.Write([]byte(item.Fingerprint))
 	}
 	return hex.EncodeToString(hasher.Sum(nil))
+}
+
+type diagnosticLinkPersistence struct {
+	Status       string
+	SymbolID     *int64
+	LinkedSymbol *DiagnosticLinkedSymbol
+}
+
+func resolveDiagnosticLinkPersistence(ctx context.Context, connection semanticMaterializationConn, schema string, workspaceID string, relativePath string, startLine int, endLine int, diagnosticFingerprint string) (*diagnosticLinkPersistence, error) {
+	ready, err := hasMaterializedSymbolSummary(ctx, connection, schema, workspaceID, relativePath)
+	if err != nil {
+		return nil, err
+	}
+	if !ready {
+		return &diagnosticLinkPersistence{Status: diagnosticLinkStatusSymbolsUnavailable}, nil
+	}
+	link, err := findBestDiagnosticSymbolLink(ctx, connection, schema, workspaceID, relativePath, startLine, endLine, diagnosticFingerprint)
+	if err != nil {
+		return nil, err
+	}
+	if link == nil {
+		return &diagnosticLinkPersistence{Status: diagnosticLinkStatusEvaluatedUnlinked}, nil
+	}
+	symbolID := link.SymbolID
+	return &diagnosticLinkPersistence{
+		Status:       diagnosticLinkStatusLinked,
+		SymbolID:     &symbolID,
+		LinkedSymbol: link,
+	}, nil
+}
+
+func diagnosticReplayWarnings(rows []DiagnosticRecord) []string {
+	legacy := 0
+	unavailable := 0
+	for _, row := range rows {
+		switch row.LinkStatus {
+		case diagnosticLinkStatusUnevaluated:
+			legacy++
+		case diagnosticLinkStatusSymbolsUnavailable:
+			unavailable++
+		}
+	}
+	warnings := []string{}
+	if legacy > 0 {
+		warnings = append(warnings, fmt.Sprintf("%d diagnostic row(s) predate durable link replay and remain link_status=unevaluated.", legacy))
+	}
+	if unavailable > 0 {
+		warnings = append(warnings, fmt.Sprintf("%d diagnostic row(s) were stored before materialized symbols were available, so durable link replay is unavailable.", unavailable))
+	}
+	return warnings
 }

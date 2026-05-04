@@ -51,6 +51,7 @@ pub struct DiagnosticContract {
     pub durable_store: &'static str,
     pub required_fields: Vec<&'static str>,
     pub optional_link_fields: Vec<&'static str>,
+    pub link_readiness_states: Vec<&'static str>,
     pub link_strategies: Vec<&'static str>,
     pub normalized_severities: Vec<&'static str>,
     pub source_kinds: Vec<&'static str>,
@@ -180,7 +181,11 @@ pub fn planned_agent_surfaces() -> Vec<AgentSurface> {
                     direction: "outbound",
                     owned_by: "api-go + rust-core",
                     purpose: "Deliver issue facts, evidence, repo-map retrieval, runbooks, and verification profiles into an agent session.",
-                    payloads: vec!["issue_context_packet", "repo_map_summary", "related_artifacts"],
+                    payloads: vec![
+                        "issue_context_packet",
+                        "repo_map_summary",
+                        "related_artifacts",
+                    ],
                 },
                 AgentProtocol {
                     protocol_id: "context_replay_packet_v1",
@@ -234,16 +239,15 @@ pub fn planned_agent_surfaces() -> Vec<AgentSurface> {
                     direction: "bidirectional",
                     owned_by: "rust-core",
                     purpose: "Run process control, log streaming, and durable execution artifacts through a systems-safe runtime boundary.",
-                    payloads: vec!["run_log", "terminal_chunk", "run_metrics", "verification_result"],
+                    payloads: vec![
+                        "run_log",
+                        "terminal_chunk",
+                        "run_metrics",
+                        "verification_result",
+                    ],
                 },
             ],
-            durable_artifacts: vec![
-                "runs/*.json",
-                "plans",
-                "critique",
-                "fixes",
-                "verifications",
-            ],
+            durable_artifacts: vec!["runs/*.json", "plans", "critique", "fixes", "verifications"],
             example_endpoints: vec![
                 "/api/workspaces/{workspace_id}/issues/{issue_id}/runs",
                 "/api/workspaces/{workspace_id}/agent/query",
@@ -260,7 +264,11 @@ pub fn next_removable_python_boundary() -> PythonBoundaryCutline {
         current_owner: "backend/app/runtimes.py + backend/app/terminal.py + backend/app/service.py",
         target_owner: "api-go terminal/runtime shell + rust-core managed process runner",
         rust_role: "Own process-safe execution, bounded output capture, timeout/cancellation, and structured run summaries for long-lived agent and verification work.",
-        python_modules: vec!["backend/app/runtimes.py", "backend/app/terminal.py", "backend/app/service.py"],
+        python_modules: vec![
+            "backend/app/runtimes.py",
+            "backend/app/terminal.py",
+            "backend/app/service.py",
+        ],
         why_next: "Python is no longer the external integrations gateway on the live request path, Python compatibility runtime discovery, probe, and model validation delegate to Go, and Go now covers runtime argument parsing plus PTY terminal fidelity. The remaining Python gap is exact managed-run/session authority: run IDs, command previews, process identity, log/output ownership, status transitions, cancellation, summaries, metrics, and terminal session state.",
         first_slice: "Expose a long-lived Go managed-run/session contract for Python compatibility before deleting RuntimeService or TerminalService: run/session IDs, workspace ID, log offsets, process PID/group, cancellation semantics, timeout policy, final summary, and durable artifact paths. Do not route terminal or async run lifecycle through one-shot xmustard-ops commands because their in-memory sessions die with the process.",
         removable_when: vec![
@@ -303,13 +311,19 @@ pub fn diagnostics_contract_v1() -> DiagnosticContract {
             "linked_symbol.evidence_source",
             "linked_symbol.selection_reason",
         ],
+        link_readiness_states: vec![
+            "unevaluated",
+            "symbols_unavailable",
+            "evaluated_unlinked",
+            "linked",
+        ],
         link_strategies: vec![
             "diagnostic_start_line_exact_symbol_anchor",
             "diagnostic_range_unique_narrowest_symbol",
         ],
         normalized_severities: vec!["error", "warning", "info", "hint"],
         source_kinds: vec!["lsp", "compiler", "test", "scanner", "manual"],
-        notes: "Rust normalizes diagnostic meaning from LSP/compiler/scanner inputs and owns conservative diagnostic-to-symbol link decisions over durable symbol candidates; Go delivers it; Postgres persists baselines and replayable rows. Live LSP links still require explicit readiness metadata before being claimed. Python must not become the first LSP diagnostics owner.",
+        notes: "Rust normalizes diagnostic meaning from LSP/compiler/scanner inputs and owns conservative diagnostic-to-symbol link decisions over durable symbol candidates; Go delivers it; Postgres persists baselines plus replayable link state. Durable replay claims require persisted link_status readiness metadata and, when linked, a stored linked_symbol snapshot. Python must not become the first LSP diagnostics owner.",
     }
 }
 
@@ -371,9 +385,20 @@ mod tests {
     fn next_python_cutline_targets_runtime_and_terminal_plane() {
         let cutline = next_removable_python_boundary();
         assert_eq!(cutline.boundary_id, "runtime_and_terminal_process_plane");
-        assert_eq!(cutline.target_owner, "api-go terminal/runtime shell + rust-core managed process runner");
-        assert!(cutline.why_next.contains("Go now covers runtime argument parsing plus PTY terminal fidelity"));
-        assert!(cutline.first_slice.contains("long-lived Go managed-run/session contract"));
+        assert_eq!(
+            cutline.target_owner,
+            "api-go terminal/runtime shell + rust-core managed process runner"
+        );
+        assert!(
+            cutline
+                .why_next
+                .contains("Go now covers runtime argument parsing plus PTY terminal fidelity")
+        );
+        assert!(
+            cutline
+                .first_slice
+                .contains("long-lived Go managed-run/session contract")
+        );
     }
 
     #[test]
@@ -388,6 +413,11 @@ mod tests {
             contract
                 .optional_link_fields
                 .contains(&"linked_symbol.link_strategy")
+        );
+        assert!(
+            contract
+                .link_readiness_states
+                .contains(&"evaluated_unlinked")
         );
         assert!(
             contract

@@ -1,10 +1,13 @@
 package workspaceops
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/jackc/pgx/v5"
 )
 
 func TestRunDiagnosticsNormalizesWithRustAndPersistsRows(t *testing.T) {
@@ -27,7 +30,25 @@ func TestRunDiagnosticsNormalizesWithRustAndPersistsRows(t *testing.T) {
 		t.Fatalf("write diagnostics input: %v", err)
 	}
 
-	fakeConn := &fakeSemanticConn{queryIDs: []int64{21}}
+	candidatesJSON, err := json.Marshal([]map[string]any{{
+		"symbol_id":      21,
+		"path":           "src/app.py",
+		"symbol":         "ExportService",
+		"kind":           "class",
+		"line_start":     1,
+		"line_end":       1,
+		"signature_text": "class ExportService:",
+	}})
+	if err != nil {
+		t.Fatalf("marshal symbol candidates: %v", err)
+	}
+	fakeConn := &fakeSemanticConn{
+		queryRows: []pgx.Row{
+			fakeSemanticBaselineRowValues(int64(21)),
+			fakeSemanticBaselineRowValues(true),
+			fakeSemanticJSONRow(candidatesJSON),
+		},
+	}
 	restore := stubSemanticPostgresConnection(fakeConn)
 	defer restore()
 
@@ -49,6 +70,9 @@ func TestRunDiagnosticsNormalizesWithRustAndPersistsRows(t *testing.T) {
 	}
 	if !containsSubstring(fakeConn.execSQL, "insert into xmustard.diagnostic_runs") || !containsSubstring(fakeConn.execSQL, "insert into xmustard.diagnostics") {
 		t.Fatalf("expected diagnostic run and row writes, got %#v", fakeConn.execSQL)
+	}
+	if !containsSubstring(fakeConn.execSQL, "link_status") || !containsSubstring(fakeConn.execSQL, "linked_symbol_json") || !containsSubstring(fakeConn.execSQL, "symbol_id") {
+		t.Fatalf("expected durable diagnostic link replay columns, got %#v", fakeConn.execSQL)
 	}
 	activityPath := filepath.Join(dataDir, "workspaces", workspaceID, "activity.jsonl")
 	activityContent, err := os.ReadFile(activityPath)

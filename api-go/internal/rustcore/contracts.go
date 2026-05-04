@@ -47,6 +47,20 @@ type PythonBoundaryCutline struct {
 	RemovableWhen []string `json:"removable_when"`
 }
 
+type DiagnosticContract struct {
+	ContractID           string   `json:"contract_id"`
+	Owner                string   `json:"owner"`
+	DeliveryOwner        string   `json:"delivery_owner"`
+	DurableStore         string   `json:"durable_store"`
+	RequiredFields       []string `json:"required_fields"`
+	OptionalLinkFields   []string `json:"optional_link_fields"`
+	LinkReadinessStates  []string `json:"link_readiness_states"`
+	LinkStrategies       []string `json:"link_strategies"`
+	NormalizedSeverities []string `json:"normalized_severities"`
+	SourceKinds          []string `json:"source_kinds"`
+	Notes                string   `json:"notes"`
+}
+
 type ArchitectureContract struct {
 	DesignVersion               string                `json:"design_version"`
 	SteadyStateRuntimeBudgetMB  int                   `json:"steady_state_runtime_budget_mb"`
@@ -55,6 +69,7 @@ type ArchitectureContract struct {
 	PythonEndState              string                `json:"python_end_state"`
 	Boundaries                  []SubsystemBoundary   `json:"boundaries"`
 	AgentSurfaces               []AgentSurface        `json:"agent_surfaces"`
+	DiagnosticsContract         DiagnosticContract    `json:"diagnostics_contract"`
 	NextRemovablePythonBoundary PythonBoundaryCutline `json:"next_removable_python_boundary"`
 }
 

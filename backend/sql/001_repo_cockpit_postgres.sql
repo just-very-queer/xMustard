@@ -285,6 +285,8 @@ create table if not exists {{schema}}.diagnostics (
     head_sha text,
     content_hash text,
     symbol_id bigint references {{schema}}.symbols(symbol_id) on delete set null,
+    link_status text not null default 'unevaluated',
+    linked_symbol_json jsonb,
     observed_at timestamptz not null default now(),
     generated_at timestamptz not null default now(),
     unique (workspace_id, diagnostic_run_id, fingerprint)
@@ -302,7 +304,12 @@ alter table {{schema}}.diagnostics add column if not exists rule_code text;
 alter table {{schema}}.diagnostics add column if not exists fingerprint text;
 alter table {{schema}}.diagnostics add column if not exists head_sha text;
 alter table {{schema}}.diagnostics add column if not exists content_hash text;
+alter table {{schema}}.diagnostics add column if not exists link_status text default 'unevaluated';
+alter table {{schema}}.diagnostics add column if not exists linked_symbol_json jsonb;
 alter table {{schema}}.diagnostics add column if not exists generated_at timestamptz;
+update {{schema}}.diagnostics set link_status = 'unevaluated' where link_status is null;
+alter table {{schema}}.diagnostics alter column link_status set default 'unevaluated';
+alter table {{schema}}.diagnostics alter column link_status set not null;
 alter table {{schema}}.diagnostics alter column source set default 'lsp';
 
 create index if not exists workspaces_root_path_idx on {{schema}}.workspaces(root_path);

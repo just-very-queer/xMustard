@@ -230,6 +230,20 @@ func findBestDiagnosticSymbolLink(ctx context.Context, connection semanticMateri
 	return convertRustDiagnosticLinkedSymbol(linkResult.LinkedSymbol), nil
 }
 
+func hasMaterializedSymbolSummary(ctx context.Context, connection semanticMaterializationConn, schema string, workspaceID string, relativePath string) (bool, error) {
+	var ready bool
+	err := connection.QueryRow(
+		ctx,
+		fmt.Sprintf("select exists(select 1 from %s.file_symbol_summaries where workspace_id = $1 and path = $2)", schema),
+		workspaceID,
+		relativePath,
+	).Scan(&ready)
+	if err != nil {
+		return false, fmt.Errorf("read diagnostic symbol readiness: %w", err)
+	}
+	return ready, nil
+}
+
 func normalizeWorkspaceSymbolLimit(limit int) int {
 	if limit <= 0 {
 		return 50

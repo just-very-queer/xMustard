@@ -20,6 +20,9 @@ func TestReadArchitectureContract(t *testing.T) {
 	if len(contract.AgentSurfaces) != 3 {
 		t.Fatalf("expected three agent surfaces, got %#v", contract.AgentSurfaces)
 	}
+	if contract.DiagnosticsContract.ContractID != "diagnostics.normalized.v1" || len(contract.DiagnosticsContract.LinkReadinessStates) == 0 {
+		t.Fatalf("expected diagnostics contract with readiness states, got %#v", contract.DiagnosticsContract)
+	}
 	if contract.NextRemovablePythonBoundary.BoundaryID != "runtime_and_terminal_process_plane" {
 		t.Fatalf("unexpected python cutline: %#v", contract.NextRemovablePythonBoundary)
 	}
