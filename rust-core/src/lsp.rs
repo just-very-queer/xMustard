@@ -5,6 +5,8 @@ use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+const MAX_NORMALIZED_REFERENCES: usize = 200;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RustDefinitionLocation {
     pub path: String,
@@ -29,6 +31,30 @@ pub struct RustDefinitionResult {
     pub selection_reason: String,
     pub definition_count: usize,
     pub definitions: Vec<RustDefinitionLocation>,
+    pub warnings: Vec<String>,
+    pub generated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustReferenceLocation {
+    pub path: String,
+    pub line_start: usize,
+    pub column_start: usize,
+    pub line_end: usize,
+    pub column_end: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustReferencesResult {
+    pub workspace_id: String,
+    pub path: String,
+    pub line: usize,
+    pub column: usize,
+    pub source_name: String,
+    pub evidence_source: String,
+    pub selection_reason: String,
+    pub reference_count: usize,
+    pub references: Vec<RustReferenceLocation>,
     pub warnings: Vec<String>,
     pub generated_at: String,
 }
@@ -136,6 +162,89 @@ pub fn normalize_definition_payload(
                 .to_string(),
         definition_count: definitions.len(),
         definitions,
+        warnings,
+        generated_at,
+    }
+}
+
+pub fn normalize_references_file(
+    workspace_id: &str,
+    root_path: &Path,
+    relative_path: &str,
+    line: usize,
+    column: usize,
+    source_name: &str,
+    input_path: &Path,
+) -> Result<RustReferencesResult, std::io::Error> {
+    let content = fs::read_to_string(input_path)?;
+    let payload = serde_json::from_str::<Value>(&content).map_err(|err| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("decode LSP references JSON: {err}"),
+        )
+    })?;
+    Ok(normalize_references_payload(
+        workspace_id,
+        root_path,
+        relative_path,
+        line,
+        column,
+        source_name,
+        &payload,
+    ))
+}
+
+pub fn normalize_references_payload(
+    workspace_id: &str,
+    root_path: &Path,
+    relative_path: &str,
+    line: usize,
+    column: usize,
+    source_name: &str,
+    payload: &Value,
+) -> RustReferencesResult {
+    let generated_at = Utc::now().to_rfc3339();
+    let source_name = normalize_source_name(source_name);
+    let mut warnings = Vec::new();
+    let mut references = Vec::new();
+
+    match payload {
+        Value::Null => warnings.push("LSP server returned no reference locations.".to_string()),
+        Value::Array(items) => {
+            for item in items {
+                if references.len() >= MAX_NORMALIZED_REFERENCES {
+                    warnings.push(format!(
+                        "Truncated LSP references to {MAX_NORMALIZED_REFERENCES} in-workspace locations."
+                    ));
+                    break;
+                }
+                if let Some(location) = reference_location(root_path, item, &mut warnings) {
+                    references.push(location);
+                }
+            }
+        }
+        _ => warnings.push("Skipped unexpected non-array LSP references payload.".to_string()),
+    }
+
+    if references.is_empty() {
+        warnings.push(
+            "No in-workspace reference locations were normalized from the LSP response."
+                .to_string(),
+        );
+    }
+
+    RustReferencesResult {
+        workspace_id: workspace_id.to_string(),
+        path: relative_path.trim().to_string(),
+        line: normalize_coordinate(line),
+        column: normalize_coordinate(column),
+        source_name,
+        evidence_source: "rust_lsp_references".to_string(),
+        selection_reason:
+            "Rust normalized live LSP references output from a Go-managed workspace session."
+                .to_string(),
+        reference_count: references.len(),
+        references,
         warnings,
         generated_at,
     }
@@ -389,10 +498,51 @@ fn definition_location(
     })
 }
 
+fn reference_location(
+    root_path: &Path,
+    payload: &Value,
+    warnings: &mut Vec<String>,
+) -> Option<RustReferenceLocation> {
+    let uri_value = payload
+        .get("uri")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|item| !item.is_empty());
+    let Some(uri_value) = uri_value else {
+        warnings.push("Skipped LSP reference item without a URI.".to_string());
+        return None;
+    };
+
+    let path = match normalize_file_uri(root_path, uri_value) {
+        Ok(Some(path)) => path,
+        Ok(None) => {
+            warnings.push(format!(
+                "Skipped LSP reference outside workspace root: {uri_value}"
+            ));
+            return None;
+        }
+        Err(err) => {
+            warnings.push(err);
+            return None;
+        }
+    };
+
+    let range = payload.get("range").unwrap_or(&Value::Null);
+    let start = lsp_position(range.get("start"));
+    let end = lsp_position(range.get("end"));
+    Some(RustReferenceLocation {
+        path,
+        line_start: start.0,
+        column_start: start.1,
+        line_end: end.0,
+        column_end: end.1,
+    })
+}
+
 fn normalize_file_uri(root_path: &Path, value: &str) -> Result<Option<String>, String> {
     let Some(raw_path) = value.strip_prefix("file://") else {
         return Err(format!(
-            "Unsupported non-file definition URI '{value}' returned by LSP server."
+            "Unsupported non-file LSP URI '{value}' returned by LSP server."
         ));
     };
     let decoded = percent_decode_str(raw_path)
@@ -425,11 +575,7 @@ fn lsp_position(value: Option<&Value>) -> (usize, usize) {
 }
 
 fn normalize_coordinate(value: usize) -> usize {
-    if value == 0 {
-        1
-    } else {
-        value
-    }
+    if value == 0 { 1 } else { value }
 }
 
 fn normalize_source_name(value: &str) -> String {
@@ -444,8 +590,9 @@ fn normalize_source_name(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_definition_payload, normalize_document_symbols_payload, RustDefinitionLocation,
-        RustDocumentSymbolRecord,
+        RustDefinitionLocation, RustDocumentSymbolRecord, RustReferenceLocation,
+        normalize_definition_payload, normalize_document_symbols_payload,
+        normalize_references_payload,
     };
     use serde_json::json;
     use std::path::Path;
@@ -544,14 +691,114 @@ mod tests {
         );
 
         assert_eq!(result.definition_count, 0);
-        assert!(result
-            .warnings
-            .iter()
-            .any(|item| item.contains("without a URI")));
-        assert!(result
-            .warnings
-            .iter()
-            .any(|item| item.contains("No in-workspace definition locations")));
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|item| item.contains("without a URI"))
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|item| item.contains("No in-workspace definition locations"))
+        );
+    }
+
+    #[test]
+    fn normalizes_references_from_lsp_response() {
+        let root = Path::new("/repo");
+        let payload = json!([
+            {
+                "uri": "file:///repo/src/app.py",
+                "range": {
+                    "start": {"line": 1, "character": 4},
+                    "end": {"line": 1, "character": 13}
+                }
+            },
+            {
+                "uri": "file:///repo/src/service.py",
+                "range": {
+                    "start": {"line": 8, "character": 2},
+                    "end": {"line": 8, "character": 11}
+                }
+            }
+        ]);
+
+        let result = normalize_references_payload(
+            "workspace-1",
+            root,
+            "src/app.py",
+            2,
+            7,
+            "pyright",
+            &payload,
+        );
+
+        assert_eq!(result.workspace_id, "workspace-1");
+        assert_eq!(result.path, "src/app.py");
+        assert_eq!(result.line, 2);
+        assert_eq!(result.column, 7);
+        assert_eq!(result.source_name, "pyright");
+        assert_eq!(result.evidence_source, "rust_lsp_references");
+        assert_eq!(result.reference_count, 2);
+        assert_eq!(
+            result.references,
+            vec![
+                RustReferenceLocation {
+                    path: "src/app.py".to_string(),
+                    line_start: 2,
+                    column_start: 5,
+                    line_end: 2,
+                    column_end: 14,
+                },
+                RustReferenceLocation {
+                    path: "src/service.py".to_string(),
+                    line_start: 9,
+                    column_start: 3,
+                    line_end: 9,
+                    column_end: 12,
+                },
+            ]
+        );
+        assert!(result.warnings.is_empty());
+    }
+
+    #[test]
+    fn references_contract_rejects_symbol_materialization_payloads() {
+        let root = Path::new("/repo");
+        let payload = json!([
+            {
+                "symbol_id": 21,
+                "path": "src/app.py",
+                "symbol": "ExportService",
+                "kind": "class"
+            }
+        ]);
+
+        let result = normalize_references_payload(
+            "workspace-1",
+            root,
+            "src/app.py",
+            1,
+            1,
+            "pyright",
+            &payload,
+        );
+
+        assert_eq!(result.reference_count, 0);
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|item| item.contains("without a URI"))
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|item| item.contains("No in-workspace reference locations"))
+        );
     }
 
     #[test]
@@ -672,13 +919,17 @@ mod tests {
         );
 
         assert!(result.symbols.is_empty());
-        assert!(result
-            .warnings
-            .iter()
-            .any(|item| item.contains("without a name")));
-        assert!(result
-            .warnings
-            .iter()
-            .any(|item| item.contains("No in-workspace document symbols")));
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|item| item.contains("without a name"))
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|item| item.contains("No in-workspace document symbols"))
+        );
     }
 }

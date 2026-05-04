@@ -69,6 +69,33 @@ func TestLspDefinitionAndDocumentSymbolsReuseWorkspaceScopedSession(t *testing.T
 	}
 }
 
+func TestLspDefinitionAndReferencesReuseWorkspaceScopedSession(t *testing.T) {
+	defer closeAllLSPSessions()
+	dataDir, workspaceID, _, repoRoot := writeIssueContextFixture(t, false)
+	logPath := filepath.Join(t.TempDir(), "fake-lsp.log")
+	restore := stubLSPServerResolver(t, repoRoot, logPath)
+	defer restore()
+
+	if _, err := GoToDefinition(dataDir, workspaceID, "src/app.py", 1, 7); err != nil {
+		t.Fatalf("go-to-definition: %v", err)
+	}
+	refs, err := FindReferences(dataDir, workspaceID, "src/app.py", 1, 7, true)
+	if err != nil {
+		t.Fatalf("references: %v", err)
+	}
+	if refs.EvidenceSource != "rust_lsp_references" {
+		t.Fatalf("expected LSP references evidence, got %#v", refs)
+	}
+
+	methods := readFakeLSPMethods(t, logPath)
+	if countMethod(methods, "initialize") != 1 {
+		t.Fatalf("expected one initialize for reused session, got %#v", methods)
+	}
+	if countMethod(methods, "textDocument/definition") != 1 || countMethod(methods, "textDocument/references") != 1 {
+		t.Fatalf("expected definition + references traffic, got %#v", methods)
+	}
+}
+
 func TestLspDefinitionDoesNotRequirePostgresOrMaterializedSymbols(t *testing.T) {
 	defer closeAllLSPSessions()
 	dataDir, workspaceID, _, repoRoot := writeIssueContextFixture(t, false)
@@ -94,6 +121,31 @@ func TestLspDefinitionDoesNotRequirePostgresOrMaterializedSymbols(t *testing.T) 
 	}
 }
 
+func TestLspReferencesDoesNotRequirePostgresOrMaterializedSymbols(t *testing.T) {
+	defer closeAllLSPSessions()
+	dataDir, workspaceID, _, repoRoot := writeIssueContextFixture(t, false)
+	logPath := filepath.Join(t.TempDir(), "fake-lsp.log")
+	restore := stubLSPServerResolver(t, repoRoot, logPath)
+	defer restore()
+
+	originalConnect := connectSemanticPostgres
+	connectSemanticPostgres = func(ctx context.Context, dsn string) (semanticMaterializationConn, error) {
+		t.Fatalf("unexpected Postgres connect in live LSP references path")
+		return nil, nil
+	}
+	defer func() {
+		connectSemanticPostgres = originalConnect
+	}()
+
+	result, err := FindReferences(dataDir, workspaceID, "src/app.py", 1, 7, true)
+	if err != nil {
+		t.Fatalf("references: %v", err)
+	}
+	if result.ReferenceCount != 2 || result.References[0].Path != "src/app.py" {
+		t.Fatalf("unexpected references result: %#v", result)
+	}
+}
+
 func TestLspDefinitionReturnsExplicitUnavailableWhenServerBootstrapFails(t *testing.T) {
 	defer closeAllLSPSessions()
 	dataDir, workspaceID, _, _ := writeIssueContextFixture(t, false)
@@ -115,6 +167,32 @@ func TestLspDefinitionReturnsExplicitUnavailableWhenServerBootstrapFails(t *test
 	}
 	if !strings.Contains(err.Error(), "LSP unavailable") {
 		t.Fatalf("expected explicit LSP unavailable error, got %v", err)
+	}
+}
+
+func TestLspReferencesSmokeWithFakeServer(t *testing.T) {
+	defer closeAllLSPSessions()
+	dataDir, workspaceID, _, repoRoot := writeIssueContextFixture(t, false)
+	logPath := filepath.Join(t.TempDir(), "fake-lsp.log")
+	restore := stubLSPServerResolver(t, repoRoot, logPath)
+	defer restore()
+
+	result, err := FindReferences(dataDir, workspaceID, "src/app.py", 1, 7, true)
+	if err != nil {
+		t.Fatalf("references: %v", err)
+	}
+	if result.EvidenceSource != "rust_lsp_references" || result.SourceName != "fake-pyright" {
+		t.Fatalf("expected Rust-normalized LSP references, got %#v", result)
+	}
+	if result.ReferenceCount != 2 {
+		t.Fatalf("expected two references, got %#v", result)
+	}
+	if result.References[1].LineStart != 6 || result.References[1].ColumnStart != 3 {
+		t.Fatalf("unexpected reference location: %#v", result.References[1])
+	}
+	methods := readFakeLSPMethods(t, logPath)
+	if countMethod(methods, "initialize") != 1 || countMethod(methods, "textDocument/references") != 1 {
+		t.Fatalf("expected initialize + references traffic, got %#v", methods)
 	}
 }
 
@@ -269,6 +347,7 @@ func runFakeLSPServer(logPath string) error {
 				"capabilities": map[string]any{
 					"definitionProvider":     true,
 					"documentSymbolProvider": true,
+					"referencesProvider":     true,
 				},
 			}); err != nil {
 				return err
@@ -282,6 +361,26 @@ func runFakeLSPServer(logPath string) error {
 					"range": map[string]any{
 						"start": map[string]any{"line": 2, "character": 0},
 						"end":   map[string]any{"line": 4, "character": 12},
+					},
+				},
+			}
+			if err := writeFakeLSPResponse(writer, message["id"], response); err != nil {
+				return err
+			}
+		case "textDocument/references":
+			response := []map[string]any{
+				{
+					"uri": fileURL(filepath.Join(repoRoot, "src", "app.py")),
+					"range": map[string]any{
+						"start": map[string]any{"line": 0, "character": 6},
+						"end":   map[string]any{"line": 0, "character": 19},
+					},
+				},
+				{
+					"uri": fileURL(filepath.Join(repoRoot, "src", "references.py")),
+					"range": map[string]any{
+						"start": map[string]any{"line": 5, "character": 2},
+						"end":   map[string]any{"line": 5, "character": 15},
 					},
 				},
 			}

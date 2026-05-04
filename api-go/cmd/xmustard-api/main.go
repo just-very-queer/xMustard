@@ -1846,6 +1846,49 @@ func main() {
 		}
 		writeJSON(w, http.StatusOK, result)
 	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/references", func(w http.ResponseWriter, r *http.Request) {
+		workspaceID := r.PathValue("workspace_id")
+		line, _ := strconv.Atoi(r.URL.Query().Get("line"))
+		column, _ := strconv.Atoi(r.URL.Query().Get("column"))
+		includeDeclaration := true
+		if raw := strings.TrimSpace(r.URL.Query().Get("include_declaration")); raw != "" {
+			parsed, err := strconv.ParseBool(raw)
+			if err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]any{
+					"error": "include_declaration must be a boolean",
+				})
+				return
+			}
+			includeDeclaration = parsed
+		}
+		result, err := workspaceops.FindReferences(
+			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
+			workspaceID,
+			r.URL.Query().Get("path"),
+			line,
+			column,
+			includeDeclaration,
+		)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				writeJSON(w, http.StatusNotFound, map[string]any{
+					"error": "Workspace or path not found",
+				})
+				return
+			}
+			if errors.Is(err, workspaceops.ErrInvalidSemanticRequest) {
+				writeJSON(w, http.StatusBadRequest, map[string]any{
+					"error": err.Error(),
+				})
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"error": err.Error(),
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	})
 	mux.HandleFunc("GET /api/workspaces/{workspace_id}/workspace-symbols", func(w http.ResponseWriter, r *http.Request) {
 		workspaceID := r.PathValue("workspace_id")
 		limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))

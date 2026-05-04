@@ -274,6 +274,7 @@ func runWorkspace(args []string) {
 	path := fs.String("path", "", "relative workspace path")
 	line := fs.Int("line", 1, "1-based file line")
 	column := fs.Int("column", 1, "1-based file column")
+	includeDeclaration := fs.Bool("include-declaration", true, "include declaration location in LSP references")
 	strategy := fs.String("strategy", "key_files", "key_files | paths")
 	limit := fs.Int("limit", 12, "result or path selection limit")
 	dsn := fs.String("dsn", "", "Postgres DSN override")
@@ -307,6 +308,8 @@ func runWorkspace(args []string) {
 		payload, err = workspaceops.ReadDocumentSymbols(*dataDir, workspaceID, *path)
 	case "go-to-definition":
 		payload, err = workspaceops.GoToDefinition(*dataDir, workspaceID, *path, *line, *column)
+	case "references":
+		payload, err = workspaceops.FindReferences(*dataDir, workspaceID, *path, *line, *column, *includeDeclaration)
 	case "workspace-symbols":
 		payload, err = workspaceops.ReadWorkspaceSymbols(*dataDir, workspaceID, *query, *limit)
 	case "explain-path":
@@ -345,7 +348,7 @@ func runWorkspace(args []string) {
 			SchemaName: optionalFlagString(*schema),
 		})
 	default:
-		fatalUsage("usage: xmustard-ops workspace <scan|repo-map|changed-symbols|impact|repo-context|retrieval-search|path-symbols|document-symbols|go-to-definition|workspace-symbols|explain-path|semantic-search|postgres-materialize-path|postgres-materialize-workspace-symbols|postgres-materialize-semantic-search|semantic-index-materialize> <workspace_id> [flags]")
+		fatalUsage("usage: xmustard-ops workspace <scan|repo-map|changed-symbols|impact|repo-context|retrieval-search|path-symbols|document-symbols|go-to-definition|references|workspace-symbols|explain-path|semantic-search|postgres-materialize-path|postgres-materialize-workspace-symbols|postgres-materialize-semantic-search|semantic-index-materialize> <workspace_id> [flags]")
 	}
 	writeJSON(payload, err)
 }

@@ -121,6 +121,47 @@ func GoToDefinition(dataDir string, workspaceID string, relativePath string, lin
 	)
 }
 
+func FindReferences(dataDir string, workspaceID string, relativePath string, line int, column int, includeDeclaration bool) (*rustcore.ReferencesResult, error) {
+	if line < 1 || column < 1 {
+		return nil, fmt.Errorf("%w: line and column must be >= 1", ErrInvalidSemanticRequest)
+	}
+	workspace, err := getWorkspaceRecord(dataDir, workspaceID)
+	if err != nil {
+		return nil, err
+	}
+	normalized, err := normalizeWorkspaceFile(workspace.RootPath, relativePath)
+	if err != nil {
+		return nil, err
+	}
+	config, err := resolveLSPServerForPath(workspace.RootPath, normalized)
+	if err != nil {
+		return nil, err
+	}
+	session, err := acquireLSPSession(dataDir, workspaceID, workspace.RootPath, config)
+	if err != nil {
+		return nil, err
+	}
+	absolutePath := filepath.Join(workspace.RootPath, filepath.FromSlash(normalized))
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	payload, err := session.references(ctx, absolutePath, line, column, includeDeclaration)
+	if err != nil {
+		releaseLSPSession(workspaceID, config.ServerID, session)
+		return nil, err
+	}
+	return rustcore.NormalizeLSPReferences(
+		ctx,
+		workspaceID,
+		workspace.RootPath,
+		normalized,
+		line,
+		column,
+		config.ServerID,
+		payload,
+	)
+}
+
 func LSPDocumentSymbols(dataDir string, workspaceID string, relativePath string) (*rustcore.DocumentSymbolsResult, error) {
 	workspace, err := getWorkspaceRecord(dataDir, workspaceID)
 	if err != nil {
@@ -285,6 +326,27 @@ func (session *lspSession) documentSymbols(ctx context.Context, absolutePath str
 	})
 }
 
+func (session *lspSession) references(ctx context.Context, absolutePath string, line int, column int, includeDeclaration bool) (json.RawMessage, error) {
+	session.touch()
+	if err := session.ensureInitialized(ctx); err != nil {
+		return nil, err
+	}
+	if err := session.syncDocument(absolutePath); err != nil {
+		return nil, err
+	}
+	uri := fileURIForPath(absolutePath)
+	return session.request(ctx, "textDocument/references", map[string]any{
+		"textDocument": map[string]any{"uri": uri},
+		"position": map[string]any{
+			"line":      line - 1,
+			"character": column - 1,
+		},
+		"context": map[string]any{
+			"includeDeclaration": includeDeclaration,
+		},
+	})
+}
+
 func (session *lspSession) ensureInitialized(ctx context.Context) error {
 	session.stateMu.Lock()
 	if session.initialized {
@@ -312,6 +374,7 @@ func (session *lspSession) ensureInitialized(ctx context.Context) error {
 				"definition": map[string]any{
 					"linkSupport": true,
 				},
+				"references": map[string]any{},
 				"documentSymbol": map[string]any{
 					"hierarchicalDocumentSymbolSupport": true,
 					"symbolKind": map[string]any{

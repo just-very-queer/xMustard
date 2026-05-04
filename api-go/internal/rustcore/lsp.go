@@ -35,6 +35,28 @@ type DefinitionResult struct {
 	GeneratedAt     string               `json:"generated_at"`
 }
 
+type ReferenceLocation struct {
+	Path        string `json:"path"`
+	LineStart   int    `json:"line_start"`
+	ColumnStart int    `json:"column_start"`
+	LineEnd     int    `json:"line_end"`
+	ColumnEnd   int    `json:"column_end"`
+}
+
+type ReferencesResult struct {
+	WorkspaceID     string              `json:"workspace_id"`
+	Path            string              `json:"path"`
+	Line            int                 `json:"line"`
+	Column          int                 `json:"column"`
+	SourceName      string              `json:"source_name"`
+	EvidenceSource  string              `json:"evidence_source"`
+	SelectionReason string              `json:"selection_reason"`
+	ReferenceCount  int                 `json:"reference_count"`
+	References      []ReferenceLocation `json:"references"`
+	Warnings        []string            `json:"warnings"`
+	GeneratedAt     string              `json:"generated_at"`
+}
+
 type DocumentSymbolRecord struct {
 	Path           string  `json:"path"`
 	Symbol         string  `json:"symbol"`
@@ -114,6 +136,65 @@ func NormalizeLSPDefinition(
 	var result DefinitionResult
 	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
 		return nil, fmt.Errorf("decode rust-core LSP definition result: %w", err)
+	}
+	return &result, nil
+}
+
+func NormalizeLSPReferences(
+	ctx context.Context,
+	workspaceID string,
+	repoRoot string,
+	relativePath string,
+	line int,
+	column int,
+	sourceName string,
+	payload []byte,
+) (*ReferencesResult, error) {
+	inputFile, err := os.CreateTemp("", "xmustard-lsp-references-*.json")
+	if err != nil {
+		return nil, fmt.Errorf("create LSP references temp file: %w", err)
+	}
+	inputPath := inputFile.Name()
+	defer os.Remove(inputPath)
+	if _, err := inputFile.Write(payload); err != nil {
+		inputFile.Close()
+		return nil, fmt.Errorf("write LSP references payload: %w", err)
+	}
+	if err := inputFile.Close(); err != nil {
+		return nil, fmt.Errorf("close LSP references payload: %w", err)
+	}
+
+	cmd := exec.CommandContext(
+		ctx,
+		"cargo",
+		"run",
+		"--quiet",
+		"--bin",
+		"xmustard-core",
+		"--",
+		"normalize-lsp-references",
+		workspaceID,
+		repoRoot,
+		relativePath,
+		fmt.Sprintf("%d", line),
+		fmt.Sprintf("%d", column),
+		sourceName,
+		inputPath,
+	)
+	cmd.Dir = rustCoreDir()
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("rust-core normalize-lsp-references failed: %w: %s", err, stderr.String())
+	}
+
+	var result ReferencesResult
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		return nil, fmt.Errorf("decode rust-core LSP references result: %w", err)
 	}
 	return &result, nil
 }
