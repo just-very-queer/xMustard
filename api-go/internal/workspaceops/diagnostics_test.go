@@ -62,6 +62,17 @@ func TestRunDiagnosticsNormalizesWithRustAndPersistsRows(t *testing.T) {
 	}
 	restore := stubSemanticPostgresConnection(fakeConn)
 	defer restore()
+	originalResolve := resolveLSPServerForPath
+	resolveLSPServerForPath = func(rootPath string, relativePath string) (*lspServerConfig, error) {
+		return &lspServerConfig{
+			ServerID:   "pyright",
+			LanguageID: "python",
+			Command:    []string{"/usr/local/bin/pyright-langserver", "--stdio"},
+		}, nil
+	}
+	defer func() {
+		resolveLSPServerForPath = originalResolve
+	}()
 
 	result, err := RunDiagnostics(dataDir, workspaceID, DiagnosticsRequest{
 		InputPath:  "diagnostics.json",
@@ -101,7 +112,7 @@ func TestRunDiagnosticsNormalizesWithRustAndPersistsRows(t *testing.T) {
 	if bytes, ok := runArgs[7].(int); !ok || bytes <= 0 {
 		t.Fatalf("expected raw payload byte count, got %#v", runArgs[7])
 	}
-	if provenance, ok := runArgs[8].(*string); !ok || provenance == nil || !strings.Contains(*provenance, `"server_id":"pyright"`) || !strings.Contains(*provenance, `"source_mode":"input_file"`) {
+	if provenance, ok := runArgs[8].(*string); !ok || provenance == nil || !strings.Contains(*provenance, `"server_id":"pyright"`) || !strings.Contains(*provenance, `"source_mode":"input_file"`) || !strings.Contains(*provenance, `"server_command":["/usr/local/bin/pyright-langserver","--stdio"]`) || !strings.Contains(*provenance, `"provenance_level":"resolved_lsp_command"`) {
 		t.Fatalf("expected archived server provenance, got %#v", runArgs[8])
 	}
 	if contract, ok := runArgs[9].(string); !ok || contract != "diagnostics.normalized.v1" {
@@ -143,5 +154,92 @@ func TestDiagnosticsStatusBlocksWithoutPostgres(t *testing.T) {
 	}
 	if status.Status != "blocked" || status.PostgresConfigured {
 		t.Fatalf("expected blocked status without Postgres, got %#v", status)
+	}
+}
+
+func TestReadDiagnosticsWarnsWhenLegacyReplayArchiveLacksResolvedServerProvenance(t *testing.T) {
+	dataDir, workspaceID, _, _ := writeIssueContextFixture(t, false)
+	dsn := "postgresql://xmustard:secret@localhost:5432/xmustard"
+	if err := writeJSON(filepath.Join(dataDir, "settings.json"), appSettings{
+		LocalAgentType: "codex",
+		PostgresDSN:    &dsn,
+		PostgresSchema: "xmustard",
+	}); err != nil {
+		t.Fatalf("write settings: %v", err)
+	}
+
+	countsJSON, _ := json.Marshal(map[string]int{"error": 1})
+	diagnosticsJSON, _ := json.Marshal([]map[string]any{
+		{
+			"workspace_id":       workspaceID,
+			"diagnostic_run_id":  "diag_fixture",
+			"path":               "src/app.py",
+			"range_start_line":   1,
+			"range_start_column": 1,
+			"range_end_line":     1,
+			"range_end_column":   5,
+			"severity":           "error",
+			"message":            "Legacy diagnostic.",
+			"source_kind":        "lsp",
+			"source_name":        "pyright",
+			"fingerprint":        "diagfp4",
+			"link_status":        "evaluated_unlinked",
+			"generated_at":       "2026-05-04T00:00:00Z",
+		},
+	})
+	rawPayloadJSON, _ := json.Marshal(map[string]any{
+		"diagnostics": []map[string]any{{
+			"message": "Legacy diagnostic.",
+		}},
+	})
+	serverProvenanceJSON, _ := json.Marshal(map[string]any{
+		"source_mode": "input_file",
+		"server_id":   "pyright",
+		"input_path":  "diagnostics.json",
+	})
+	replayWarningsJSON, _ := json.Marshal([]string{})
+	sha := "fixturepayloadsha256"
+	fakeConn := &fakeSemanticConn{
+		queryRows: []pgx.Row{
+			fakeSemanticBaselineRowValues(
+				"diag_fixture",
+				"lsp",
+				"pyright",
+				"batchfp",
+				rawPayloadJSON,
+				&sha,
+				123,
+				serverProvenanceJSON,
+				"diagnostics.normalized.v1",
+				(*string)(nil),
+				replayWarningsJSON,
+				[]byte("{}"),
+				(*string)(nil),
+				0,
+				false,
+				1,
+				countsJSON,
+				"diagnostics.json",
+				"xmustard",
+				"2026-05-04T00:00:00Z",
+			),
+			fakeSemanticJSONRow(diagnosticsJSON),
+		},
+	}
+	restore := stubSemanticPostgresConnection(fakeConn)
+	defer restore()
+
+	result, err := ReadDiagnostics(dataDir, workspaceID, "diag_fixture")
+	if err != nil {
+		t.Fatalf("read diagnostics: %v", err)
+	}
+	if result.Baseline == nil || result.Baseline.ReplayArchive == nil {
+		t.Fatalf("expected replay archive, got %#v", result)
+	}
+	if result.Baseline.ReplayArchive.ReplayReadiness != "raw_payload_archived_with_provenance_warnings" {
+		t.Fatalf("expected downgraded legacy replay readiness, got %#v", result.Baseline.ReplayArchive)
+	}
+	if len(result.Warnings) == 0 || !strings.Contains(strings.Join(result.Warnings, "\n"), "does not prove complete server provenance") {
+		t.Fatalf("expected surfaced replay provenance warning, got %#v", result.Warnings)
 	}
 }

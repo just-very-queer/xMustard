@@ -179,6 +179,9 @@ pub fn archive_diagnostics_payload(
     {
         warnings.push("LSP server provenance is missing server_id; replay can show the payload but not the exact server identity.".to_string());
     }
+    if source_kind == "lsp" && !server_provenance_has_command(&server_provenance) {
+        warnings.push("LSP server provenance does not include a resolved server command; replay can name the server_id but cannot prove which executable produced the payload.".to_string());
+    }
     let replay_readiness = if warnings.is_empty() {
         "raw_payload_and_server_provenance_archived"
     } else {
@@ -195,6 +198,17 @@ pub fn archive_diagnostics_payload(
         replay_readiness: replay_readiness.to_string(),
         warnings,
         generated_at,
+    }
+}
+
+fn server_provenance_has_command(server_provenance: &Value) -> bool {
+    match server_provenance.get("server_command") {
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|item| !item.trim().is_empty()),
+        Some(Value::String(item)) => !item.trim().is_empty(),
+        _ => false,
     }
 }
 
@@ -647,6 +661,7 @@ mod tests {
             json!({
                 "source_mode": "input_file",
                 "server_id": "typescript-language-server",
+                "server_command": ["/usr/local/bin/typescript-language-server", "--stdio"],
                 "language_id": "typescript",
                 "input_path": "diagnostics.json"
             }),
@@ -663,6 +678,45 @@ mod tests {
             "raw_payload_and_server_provenance_archived"
         );
         assert!(archive.warnings.is_empty());
+    }
+
+    #[test]
+    fn warns_when_lsp_server_command_is_missing() {
+        let payload = json!({
+            "uri": "file:///tmp/project/src/app.ts",
+            "diagnostics": [{
+                "range": {
+                    "start": {"line": 1, "character": 4},
+                    "end": {"line": 1, "character": 12}
+                },
+                "severity": 1,
+                "message": "Cannot find name 'thing'."
+            }]
+        });
+        let raw = serde_json::to_vec(&payload).unwrap();
+        let archive = super::archive_diagnostics_payload(
+            "workspace-1",
+            &raw,
+            payload,
+            "lsp",
+            "pyright",
+            json!({
+                "source_mode": "input_file",
+                "server_id": "pyright",
+                "input_path": "diagnostics.json"
+            }),
+        );
+
+        assert_eq!(
+            archive.replay_readiness,
+            "raw_payload_archived_with_provenance_warnings"
+        );
+        assert!(
+            archive
+                .warnings
+                .iter()
+                .any(|item| item.contains("resolved server command"))
+        );
     }
 
     #[test]

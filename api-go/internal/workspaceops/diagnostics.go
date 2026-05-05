@@ -242,7 +242,7 @@ func PlanDiagnostics(dataDir string, workspaceID string, request DiagnosticsRequ
 			warnings = append(warnings, batch.Warnings...)
 			value := diagnosticsBatchFingerprint(workspaceID, sourceKind, sourceName, batch.Diagnostics, worktree.HeadSHA)
 			fingerprint = &value
-			archive, err := rustcore.ArchiveDiagnosticsPayload(ctx, workspaceID, inputPath, sourceKind, sourceName, diagnosticServerProvenance(sourceKind, sourceName, inputPath))
+			archive, err := rustcore.ArchiveDiagnosticsPayload(ctx, workspaceID, inputPath, sourceKind, sourceName, diagnosticServerProvenance(workspace.RootPath, sourceKind, sourceName, inputPath, batch))
 			if err != nil {
 				blockers = append(blockers, err.Error())
 			} else {
@@ -681,7 +681,7 @@ func readDiagnosticRun(dsn string, schema string, workspaceID string, targetRunI
 	if err != nil {
 		return nil, fmt.Errorf("decode diagnostic semantic baseline: %w", err)
 	}
-	replayArchive, err := decodeDiagnosticReplayArchive(rawPayloadJSON, rawPayloadSHA256, rawPayloadBytes, serverProvenanceJSON, normalizationContract, replayReadiness, replayWarningsJSON)
+	replayArchive, err := decodeDiagnosticReplayArchive(sourceKind, rawPayloadJSON, rawPayloadSHA256, rawPayloadBytes, serverProvenanceJSON, normalizationContract, replayReadiness, replayWarningsJSON)
 	if err != nil {
 		return nil, fmt.Errorf("decode diagnostic replay archive: %w", err)
 	}
@@ -842,6 +842,9 @@ func diagnosticReplayWarnings(baseline *DiagnosticRun, rows []DiagnosticRecord) 
 	if baseline != nil && baseline.ReplayArchive == nil {
 		warnings = append(warnings, "Diagnostics run predates raw payload archive and cannot fully replay the original diagnostic source payload.")
 	}
+	if baseline != nil && baseline.ReplayArchive != nil {
+		warnings = append(warnings, baseline.ReplayArchive.Warnings...)
+	}
 	if legacy > 0 {
 		warnings = append(warnings, fmt.Sprintf("%d diagnostic row(s) predate durable link replay and remain link_status=unevaluated.", legacy))
 	}
@@ -851,7 +854,7 @@ func diagnosticReplayWarnings(baseline *DiagnosticRun, rows []DiagnosticRecord) 
 	if archivedLinkContext > 0 && baseline != nil && baseline.SemanticBaseline == nil {
 		warnings = append(warnings, "Diagnostic rows include archived link context, but this run was not anchored to a stored semantic baseline.")
 	}
-	return warnings
+	return dedupeSemanticStrings(warnings)
 }
 
 type diagnosticSemanticBaselineCandidate struct {
@@ -943,14 +946,32 @@ func diagnosticPaths(rows []rustcore.NormalizedDiagnostic) []string {
 	return paths
 }
 
-func diagnosticServerProvenance(sourceKind string, sourceName string, inputPath string) map[string]any {
-	return map[string]any{
+func diagnosticServerProvenance(rootPath string, sourceKind string, sourceName string, inputPath string, batch *DiagnosticsBatch) map[string]any {
+	provenance := map[string]any{
 		"source_mode":            "input_file",
 		"source_kind":            normalizeDiagnosticSourceKind(sourceKind),
 		"server_id":              strings.TrimSpace(sourceName),
 		"input_path":             inputPath,
 		"normalization_contract": "diagnostics.normalized.v1",
 	}
+	if normalizeDiagnosticSourceKind(sourceKind) != "lsp" {
+		return provenance
+	}
+	primaryPath := diagnosticPrimaryPath(batch)
+	if primaryPath == "" {
+		provenance["provenance_level"] = "declared_server_id_only"
+		return provenance
+	}
+	config, err := resolveLSPServerForPath(rootPath, primaryPath)
+	if err != nil {
+		provenance["provenance_level"] = "declared_server_id_only"
+		return provenance
+	}
+	provenance["provenance_level"] = "resolved_lsp_command"
+	provenance["language_id"] = config.LanguageID
+	provenance["server_command"] = append([]string{}, config.Command...)
+	provenance["resolved_from_path"] = primaryPath
+	return provenance
 }
 
 func diagnosticsReplayArchiveFromRust(archive *rustcore.DiagnosticsReplayArchive) *DiagnosticReplayArchive {
@@ -969,7 +990,7 @@ func diagnosticsReplayArchiveFromRust(archive *rustcore.DiagnosticsReplayArchive
 	}
 }
 
-func decodeDiagnosticReplayArchive(rawPayloadJSON []byte, rawPayloadSHA256 *string, rawPayloadBytes int, serverProvenanceJSON []byte, normalizationContract string, replayReadiness *string, replayWarningsJSON []byte) (*DiagnosticReplayArchive, error) {
+func decodeDiagnosticReplayArchive(sourceKind string, rawPayloadJSON []byte, rawPayloadSHA256 *string, rawPayloadBytes int, serverProvenanceJSON []byte, normalizationContract string, replayReadiness *string, replayWarningsJSON []byte) (*DiagnosticReplayArchive, error) {
 	if rawPayloadSHA256 == nil || strings.TrimSpace(*rawPayloadSHA256) == "" {
 		return nil, nil
 	}
@@ -996,7 +1017,12 @@ func decodeDiagnosticReplayArchive(rawPayloadJSON []byte, rawPayloadSHA256 *stri
 		readiness = strings.TrimSpace(*replayReadiness)
 	}
 	if readiness == "" {
-		readiness = "raw_payload_and_server_provenance_archived"
+		if diagnosticArchiveHasSufficientServerProvenance(sourceKind, serverProvenance) {
+			readiness = "raw_payload_and_server_provenance_archived"
+		} else {
+			readiness = "raw_payload_archived_with_provenance_warnings"
+			warnings = append(warnings, "Diagnostics replay archive predates persisted replay_readiness and does not prove complete server provenance.")
+		}
 	}
 	if strings.TrimSpace(normalizationContract) == "" {
 		normalizationContract = "diagnostics.normalized.v1"
@@ -1010,6 +1036,48 @@ func decodeDiagnosticReplayArchive(rawPayloadJSON []byte, rawPayloadSHA256 *stri
 		ReplayReadiness:       readiness,
 		Warnings:              warnings,
 	}, nil
+}
+
+func diagnosticArchiveHasSufficientServerProvenance(sourceKind string, provenance map[string]any) bool {
+	if len(provenance) == 0 {
+		return false
+	}
+	serverID, _ := provenance["server_id"].(string)
+	if strings.TrimSpace(serverID) == "" {
+		return false
+	}
+	if normalizeDiagnosticSourceKind(sourceKind) != "lsp" {
+		return true
+	}
+	switch typed := provenance["server_command"].(type) {
+	case []any:
+		for _, item := range typed {
+			if text, ok := item.(string); ok && strings.TrimSpace(text) != "" {
+				return true
+			}
+		}
+	case []string:
+		for _, item := range typed {
+			if strings.TrimSpace(item) != "" {
+				return true
+			}
+		}
+	case string:
+		return strings.TrimSpace(typed) != ""
+	}
+	return false
+}
+
+func diagnosticPrimaryPath(batch *DiagnosticsBatch) string {
+	if batch == nil {
+		return ""
+	}
+	for _, item := range batch.Diagnostics {
+		if strings.TrimSpace(item.Path) != "" {
+			return item.Path
+		}
+	}
+	return ""
 }
 
 func decodeDiagnosticSemanticBaseline(payload []byte) (*DiagnosticSemanticBaseline, error) {
