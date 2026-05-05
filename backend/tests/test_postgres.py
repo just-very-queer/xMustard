@@ -70,6 +70,16 @@ class _FakeConnection:
 
 
 class PostgresMaterializationTests(unittest.TestCase):
+    def test_schema_sql_includes_diagnostics_archive_columns(self):
+        sql_path = Path(__file__).resolve().parents[1] / "sql" / "001_repo_cockpit_postgres.sql"
+        sql = sql_path.read_text(encoding="utf-8").lower()
+
+        self.assertIn("raw_payload_json jsonb", sql)
+        self.assertIn("raw_payload_sha256 text", sql)
+        self.assertIn("server_provenance_json jsonb", sql)
+        self.assertIn("normalization_contract text not null default 'diagnostics.normalized.v1'", sql)
+        self.assertIn("replay_readiness text", sql)
+
     def test_materialize_path_symbols_executes_summary_and_symbol_writes(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir) / "repo"

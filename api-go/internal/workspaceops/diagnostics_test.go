@@ -85,8 +85,30 @@ func TestRunDiagnosticsNormalizesWithRustAndPersistsRows(t *testing.T) {
 	if !containsSubstring(fakeConn.execSQL, "semantic_baseline_json") || !containsSubstring(fakeConn.execSQL, "link_context_json") {
 		t.Fatalf("expected historical semantic replay columns, got %#v", fakeConn.execSQL)
 	}
+	if !containsSubstring(fakeConn.execSQL, "raw_payload_json") || !containsSubstring(fakeConn.execSQL, "raw_payload_sha256") || !containsSubstring(fakeConn.execSQL, "server_provenance_json") {
+		t.Fatalf("expected raw payload archive and provenance columns, got %#v", fakeConn.execSQL)
+	}
 	if !containsSubstring(fakeConn.execSQL, "link_status") || !containsSubstring(fakeConn.execSQL, "linked_symbol_json") || !containsSubstring(fakeConn.execSQL, "symbol_id") {
 		t.Fatalf("expected durable diagnostic link replay columns, got %#v", fakeConn.execSQL)
+	}
+	runArgs := diagnosticRunInsertArgs(t, fakeConn)
+	if rawPayload, ok := runArgs[5].(*string); !ok || rawPayload == nil || !strings.Contains(*rawPayload, "Example LSP diagnostic.") {
+		t.Fatalf("expected archived raw diagnostic payload, got %#v", runArgs[5])
+	}
+	if sha, ok := runArgs[6].(string); !ok || len(sha) != 64 {
+		t.Fatalf("expected raw payload sha256, got %#v", runArgs[6])
+	}
+	if bytes, ok := runArgs[7].(int); !ok || bytes <= 0 {
+		t.Fatalf("expected raw payload byte count, got %#v", runArgs[7])
+	}
+	if provenance, ok := runArgs[8].(*string); !ok || provenance == nil || !strings.Contains(*provenance, `"server_id":"pyright"`) || !strings.Contains(*provenance, `"source_mode":"input_file"`) {
+		t.Fatalf("expected archived server provenance, got %#v", runArgs[8])
+	}
+	if contract, ok := runArgs[9].(string); !ok || contract != "diagnostics.normalized.v1" {
+		t.Fatalf("expected normalization contract, got %#v", runArgs[9])
+	}
+	if readiness, ok := runArgs[10].(string); !ok || readiness != "raw_payload_and_server_provenance_archived" {
+		t.Fatalf("expected archive replay readiness, got %#v", runArgs[10])
 	}
 	if result.Baseline.SemanticBaseline == nil || result.Baseline.SemanticBaseline.IndexRunID != "semidx_fixture" {
 		t.Fatalf("expected persisted semantic baseline anchor, got %#v", result.Baseline)
@@ -99,6 +121,17 @@ func TestRunDiagnosticsNormalizesWithRustAndPersistsRows(t *testing.T) {
 	if !strings.Contains(string(activityContent), "postgres.materialize.diagnostics") {
 		t.Fatalf("expected diagnostics activity, got %s", activityContent)
 	}
+}
+
+func diagnosticRunInsertArgs(t *testing.T, fakeConn *fakeSemanticConn) []any {
+	t.Helper()
+	for idx, sql := range fakeConn.execSQL {
+		if strings.Contains(sql, "insert into xmustard.diagnostic_runs") {
+			return fakeConn.execArgs[idx]
+		}
+	}
+	t.Fatalf("missing diagnostic run insert: %#v", fakeConn.execSQL)
+	return nil
 }
 
 func TestDiagnosticsStatusBlocksWithoutPostgres(t *testing.T) {

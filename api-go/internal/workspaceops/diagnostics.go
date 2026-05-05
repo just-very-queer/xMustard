@@ -36,25 +36,26 @@ type DiagnosticsRequest struct {
 }
 
 type DiagnosticsPlan struct {
-	WorkspaceID        string            `json:"workspace_id"`
-	RootPath           string            `json:"root_path"`
-	InputPath          string            `json:"input_path"`
-	SourceKind         string            `json:"source_kind"`
-	SourceName         string            `json:"source_name"`
-	DiagnosticCount    int               `json:"diagnostic_count"`
-	SeverityCounts     map[string]int    `json:"severity_counts"`
-	HeadSHA            *string           `json:"head_sha,omitempty"`
-	DirtyFiles         int               `json:"dirty_files"`
-	WorktreeDirty      bool              `json:"worktree_dirty"`
-	BatchFingerprint   *string           `json:"batch_fingerprint,omitempty"`
-	PostgresConfigured bool              `json:"postgres_configured"`
-	PostgresSchema     string            `json:"postgres_schema"`
-	Blockers           []string          `json:"blockers"`
-	Warnings           []string          `json:"warnings"`
-	NextActions        []string          `json:"next_actions"`
-	CanRun             bool              `json:"can_run"`
-	GeneratedAt        string            `json:"generated_at"`
-	NormalizedBatch    *DiagnosticsBatch `json:"normalized_batch,omitempty"`
+	WorkspaceID        string                   `json:"workspace_id"`
+	RootPath           string                   `json:"root_path"`
+	InputPath          string                   `json:"input_path"`
+	SourceKind         string                   `json:"source_kind"`
+	SourceName         string                   `json:"source_name"`
+	DiagnosticCount    int                      `json:"diagnostic_count"`
+	SeverityCounts     map[string]int           `json:"severity_counts"`
+	HeadSHA            *string                  `json:"head_sha,omitempty"`
+	DirtyFiles         int                      `json:"dirty_files"`
+	WorktreeDirty      bool                     `json:"worktree_dirty"`
+	BatchFingerprint   *string                  `json:"batch_fingerprint,omitempty"`
+	ReplayArchive      *DiagnosticReplayArchive `json:"replay_archive,omitempty"`
+	PostgresConfigured bool                     `json:"postgres_configured"`
+	PostgresSchema     string                   `json:"postgres_schema"`
+	Blockers           []string                 `json:"blockers"`
+	Warnings           []string                 `json:"warnings"`
+	NextActions        []string                 `json:"next_actions"`
+	CanRun             bool                     `json:"can_run"`
+	GeneratedAt        string                   `json:"generated_at"`
+	NormalizedBatch    *DiagnosticsBatch        `json:"normalized_batch,omitempty"`
 }
 
 type DiagnosticsRunResult struct {
@@ -86,6 +87,7 @@ type DiagnosticRun struct {
 	SourceKind       string                      `json:"source_kind"`
 	SourceName       string                      `json:"source_name"`
 	BatchFingerprint string                      `json:"batch_fingerprint"`
+	ReplayArchive    *DiagnosticReplayArchive    `json:"replay_archive,omitempty"`
 	SemanticBaseline *DiagnosticSemanticBaseline `json:"semantic_baseline,omitempty"`
 	HeadSHA          *string                     `json:"head_sha,omitempty"`
 	DirtyFiles       int                         `json:"dirty_files"`
@@ -95,6 +97,17 @@ type DiagnosticRun struct {
 	InputPath        string                      `json:"input_path"`
 	PostgresSchema   string                      `json:"postgres_schema"`
 	CreatedAt        string                      `json:"created_at"`
+}
+
+type DiagnosticReplayArchive struct {
+	RawPayload            any            `json:"raw_payload,omitempty"`
+	RawPayloadSHA256      string         `json:"raw_payload_sha256"`
+	RawPayloadBytes       int            `json:"raw_payload_bytes"`
+	ServerProvenance      map[string]any `json:"server_provenance"`
+	NormalizationContract string         `json:"normalization_contract"`
+	ReplayReadiness       string         `json:"replay_readiness"`
+	Warnings              []string       `json:"warnings"`
+	GeneratedAt           string         `json:"generated_at"`
 }
 
 type DiagnosticSemanticBaseline struct {
@@ -218,6 +231,7 @@ func PlanDiagnostics(dataDir string, workspaceID string, request DiagnosticsRequ
 	worktree := readWorktreeStatus(workspace.RootPath)
 	var batch *DiagnosticsBatch
 	var fingerprint *string
+	var replayArchive *DiagnosticReplayArchive
 	if inputErr == nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
@@ -228,6 +242,13 @@ func PlanDiagnostics(dataDir string, workspaceID string, request DiagnosticsRequ
 			warnings = append(warnings, batch.Warnings...)
 			value := diagnosticsBatchFingerprint(workspaceID, sourceKind, sourceName, batch.Diagnostics, worktree.HeadSHA)
 			fingerprint = &value
+			archive, err := rustcore.ArchiveDiagnosticsPayload(ctx, workspaceID, inputPath, sourceKind, sourceName, diagnosticServerProvenance(sourceKind, sourceName, inputPath))
+			if err != nil {
+				blockers = append(blockers, err.Error())
+			} else {
+				replayArchive = diagnosticsReplayArchiveFromRust(archive)
+				warnings = append(warnings, archive.Warnings...)
+			}
 		}
 	}
 	if worktree.DirtyFiles > 0 {
@@ -256,6 +277,7 @@ func PlanDiagnostics(dataDir string, workspaceID string, request DiagnosticsRequ
 		DirtyFiles:         worktree.DirtyFiles,
 		WorktreeDirty:      worktree.DirtyFiles > 0,
 		BatchFingerprint:   fingerprint,
+		ReplayArchive:      replayArchive,
 		PostgresConfigured: targetDSN != "",
 		PostgresSchema:     targetSchema,
 		Blockers:           dedupeSemanticStrings(blockers),
@@ -462,14 +484,54 @@ func persistDiagnosticsBaseline(dsn string, schema string, plan *DiagnosticsPlan
 		value := string(payload)
 		semanticBaselineJSON = &value
 	}
+	var (
+		rawPayloadJSON        *string
+		serverProvenanceJSON  *string
+		replayWarningsJSON    *string
+		rawPayloadSHA256      string
+		rawPayloadBytes       int
+		normalizationContract string
+		replayReadiness       string
+	)
+	if plan.ReplayArchive != nil {
+		rawPayloadSHA256 = plan.ReplayArchive.RawPayloadSHA256
+		rawPayloadBytes = plan.ReplayArchive.RawPayloadBytes
+		normalizationContract = plan.ReplayArchive.NormalizationContract
+		replayReadiness = plan.ReplayArchive.ReplayReadiness
+		if payload, err := json.Marshal(plan.ReplayArchive.RawPayload); err != nil {
+			return nil, 0, fmt.Errorf("encode diagnostic raw replay payload: %w", err)
+		} else {
+			value := string(payload)
+			rawPayloadJSON = &value
+		}
+		if payload, err := json.Marshal(plan.ReplayArchive.ServerProvenance); err != nil {
+			return nil, 0, fmt.Errorf("encode diagnostic server provenance: %w", err)
+		} else {
+			value := string(payload)
+			serverProvenanceJSON = &value
+		}
+		if payload, err := json.Marshal(plan.ReplayArchive.Warnings); err != nil {
+			return nil, 0, fmt.Errorf("encode diagnostic replay warnings: %w", err)
+		} else {
+			value := string(payload)
+			replayWarningsJSON = &value
+		}
+	}
 	if _, err := connection.Exec(
 		ctx,
-		fmt.Sprintf("insert into %s.diagnostic_runs (diagnostic_run_id, workspace_id, source_kind, source_name, batch_fingerprint, semantic_baseline_json, head_sha, dirty_files, worktree_dirty, diagnostic_count, severity_counts_json, input_path, postgres_schema) values ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10, $11::jsonb, $12, $13)", schema),
+		fmt.Sprintf("insert into %s.diagnostic_runs (diagnostic_run_id, workspace_id, source_kind, source_name, batch_fingerprint, raw_payload_json, raw_payload_sha256, raw_payload_bytes, server_provenance_json, normalization_contract, replay_readiness, replay_warnings_json, semantic_baseline_json, head_sha, dirty_files, worktree_dirty, diagnostic_count, severity_counts_json, input_path, postgres_schema) values ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9::jsonb, $10, $11, $12::jsonb, $13::jsonb, $14, $15, $16, $17, $18::jsonb, $19, $20)", schema),
 		runID,
 		plan.WorkspaceID,
 		plan.SourceKind,
 		plan.SourceName,
 		firstNonEmptyPtr(plan.BatchFingerprint),
+		rawPayloadJSON,
+		rawPayloadSHA256,
+		rawPayloadBytes,
+		serverProvenanceJSON,
+		normalizationContract,
+		replayReadiness,
+		replayWarningsJSON,
 		semanticBaselineJSON,
 		plan.HeadSHA,
 		plan.DirtyFiles,
@@ -548,6 +610,7 @@ func persistDiagnosticsBaseline(dsn string, schema string, plan *DiagnosticsPlan
 		SourceKind:       plan.SourceKind,
 		SourceName:       plan.SourceName,
 		BatchFingerprint: firstNonEmptyPtr(plan.BatchFingerprint),
+		ReplayArchive:    plan.ReplayArchive,
 		SemanticBaseline: semanticBaseline,
 		HeadSHA:          plan.HeadSHA,
 		DirtyFiles:       plan.DirtyFiles,
@@ -577,28 +640,35 @@ func readDiagnosticRun(dsn string, schema string, workspaceID string, targetRunI
 	}
 	defer connection.Close(context.Background())
 	var (
-		runID                string
-		sourceKind           string
-		sourceName           string
-		fingerprint          string
-		semanticBaselineJSON []byte
-		headSHA              *string
-		dirtyFiles           int
-		dirty                bool
-		count                int
-		countsJSON           []byte
-		inputPath            string
-		pgSchema             string
-		createdAt            string
+		runID                 string
+		sourceKind            string
+		sourceName            string
+		fingerprint           string
+		rawPayloadJSON        []byte
+		rawPayloadSHA256      *string
+		rawPayloadBytes       int
+		serverProvenanceJSON  []byte
+		normalizationContract string
+		replayReadiness       *string
+		replayWarningsJSON    []byte
+		semanticBaselineJSON  []byte
+		headSHA               *string
+		dirtyFiles            int
+		dirty                 bool
+		count                 int
+		countsJSON            []byte
+		inputPath             string
+		pgSchema              string
+		createdAt             string
 	)
-	query := fmt.Sprintf("select diagnostic_run_id, source_kind, source_name, batch_fingerprint, coalesce(semantic_baseline_json, '{}'::jsonb), head_sha, dirty_files, worktree_dirty, diagnostic_count, severity_counts_json, input_path, postgres_schema, created_at::text from %s.diagnostic_runs where workspace_id = $1", schema)
+	query := fmt.Sprintf("select diagnostic_run_id, source_kind, source_name, batch_fingerprint, coalesce(raw_payload_json, 'null'::jsonb), raw_payload_sha256, coalesce(raw_payload_bytes, 0), coalesce(server_provenance_json, '{}'::jsonb), coalesce(normalization_contract, 'diagnostics.normalized.v1'), replay_readiness, coalesce(replay_warnings_json, '[]'::jsonb), coalesce(semantic_baseline_json, '{}'::jsonb), head_sha, dirty_files, worktree_dirty, diagnostic_count, severity_counts_json, input_path, postgres_schema, created_at::text from %s.diagnostic_runs where workspace_id = $1", schema)
 	args := []any{workspaceID}
 	if targetRunID != "" {
 		query += " and diagnostic_run_id = $2"
 		args = append(args, targetRunID)
 	}
 	query += " order by created_at desc limit 1"
-	err = connection.QueryRow(ctx, query, args...).Scan(&runID, &sourceKind, &sourceName, &fingerprint, &semanticBaselineJSON, &headSHA, &dirtyFiles, &dirty, &count, &countsJSON, &inputPath, &pgSchema, &createdAt)
+	err = connection.QueryRow(ctx, query, args...).Scan(&runID, &sourceKind, &sourceName, &fingerprint, &rawPayloadJSON, &rawPayloadSHA256, &rawPayloadBytes, &serverProvenanceJSON, &normalizationContract, &replayReadiness, &replayWarningsJSON, &semanticBaselineJSON, &headSHA, &dirtyFiles, &dirty, &count, &countsJSON, &inputPath, &pgSchema, &createdAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
@@ -611,12 +681,17 @@ func readDiagnosticRun(dsn string, schema string, workspaceID string, targetRunI
 	if err != nil {
 		return nil, fmt.Errorf("decode diagnostic semantic baseline: %w", err)
 	}
+	replayArchive, err := decodeDiagnosticReplayArchive(rawPayloadJSON, rawPayloadSHA256, rawPayloadBytes, serverProvenanceJSON, normalizationContract, replayReadiness, replayWarningsJSON)
+	if err != nil {
+		return nil, fmt.Errorf("decode diagnostic replay archive: %w", err)
+	}
 	return &DiagnosticRun{
 		DiagnosticRunID:  runID,
 		WorkspaceID:      workspaceID,
 		SourceKind:       sourceKind,
 		SourceName:       sourceName,
 		BatchFingerprint: fingerprint,
+		ReplayArchive:    replayArchive,
 		SemanticBaseline: semanticBaseline,
 		HeadSHA:          headSHA,
 		DirtyFiles:       dirtyFiles,
@@ -764,6 +839,9 @@ func diagnosticReplayWarnings(baseline *DiagnosticRun, rows []DiagnosticRecord) 
 		}
 	}
 	warnings := []string{}
+	if baseline != nil && baseline.ReplayArchive == nil {
+		warnings = append(warnings, "Diagnostics run predates raw payload archive and cannot fully replay the original diagnostic source payload.")
+	}
 	if legacy > 0 {
 		warnings = append(warnings, fmt.Sprintf("%d diagnostic row(s) predate durable link replay and remain link_status=unevaluated.", legacy))
 	}
@@ -863,6 +941,75 @@ func diagnosticPaths(rows []rustcore.NormalizedDiagnostic) []string {
 		paths = append(paths, row.Path)
 	}
 	return paths
+}
+
+func diagnosticServerProvenance(sourceKind string, sourceName string, inputPath string) map[string]any {
+	return map[string]any{
+		"source_mode":            "input_file",
+		"source_kind":            normalizeDiagnosticSourceKind(sourceKind),
+		"server_id":              strings.TrimSpace(sourceName),
+		"input_path":             inputPath,
+		"normalization_contract": "diagnostics.normalized.v1",
+	}
+}
+
+func diagnosticsReplayArchiveFromRust(archive *rustcore.DiagnosticsReplayArchive) *DiagnosticReplayArchive {
+	if archive == nil {
+		return nil
+	}
+	return &DiagnosticReplayArchive{
+		RawPayload:            archive.RawPayload,
+		RawPayloadSHA256:      archive.RawPayloadSHA256,
+		RawPayloadBytes:       archive.RawPayloadBytes,
+		ServerProvenance:      archive.ServerProvenance,
+		NormalizationContract: "diagnostics.normalized.v1",
+		ReplayReadiness:       archive.ReplayReadiness,
+		Warnings:              archive.Warnings,
+		GeneratedAt:           archive.GeneratedAt,
+	}
+}
+
+func decodeDiagnosticReplayArchive(rawPayloadJSON []byte, rawPayloadSHA256 *string, rawPayloadBytes int, serverProvenanceJSON []byte, normalizationContract string, replayReadiness *string, replayWarningsJSON []byte) (*DiagnosticReplayArchive, error) {
+	if rawPayloadSHA256 == nil || strings.TrimSpace(*rawPayloadSHA256) == "" {
+		return nil, nil
+	}
+	var rawPayload any
+	if len(rawPayloadJSON) > 0 {
+		if err := json.Unmarshal(rawPayloadJSON, &rawPayload); err != nil {
+			return nil, err
+		}
+	}
+	serverProvenance := map[string]any{}
+	if len(serverProvenanceJSON) > 0 {
+		if err := json.Unmarshal(serverProvenanceJSON, &serverProvenance); err != nil {
+			return nil, err
+		}
+	}
+	warnings := []string{}
+	if len(replayWarningsJSON) > 0 {
+		if err := json.Unmarshal(replayWarningsJSON, &warnings); err != nil {
+			return nil, err
+		}
+	}
+	readiness := ""
+	if replayReadiness != nil {
+		readiness = strings.TrimSpace(*replayReadiness)
+	}
+	if readiness == "" {
+		readiness = "raw_payload_and_server_provenance_archived"
+	}
+	if strings.TrimSpace(normalizationContract) == "" {
+		normalizationContract = "diagnostics.normalized.v1"
+	}
+	return &DiagnosticReplayArchive{
+		RawPayload:            rawPayload,
+		RawPayloadSHA256:      strings.TrimSpace(*rawPayloadSHA256),
+		RawPayloadBytes:       rawPayloadBytes,
+		ServerProvenance:      serverProvenance,
+		NormalizationContract: normalizationContract,
+		ReplayReadiness:       readiness,
+		Warnings:              warnings,
+	}, nil
 }
 
 func decodeDiagnosticSemanticBaseline(payload []byte) (*DiagnosticSemanticBaseline, error) {

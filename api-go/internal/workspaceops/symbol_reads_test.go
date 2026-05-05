@@ -197,21 +197,7 @@ func TestReadDiagnosticsDecoratesRowsWithConservativeSymbolLinks(t *testing.T) {
 
 	fakeConn := &fakeSemanticConn{
 		queryRows: []pgx.Row{
-			fakeSemanticBaselineRowValues(
-				"diag_fixture",
-				"lsp",
-				"pyright",
-				"batchfp",
-				semanticBaselineJSON,
-				(*string)(nil),
-				0,
-				false,
-				1,
-				countsJSON,
-				"diagnostics.json",
-				"xmustard",
-				"2026-05-04T00:00:00Z",
-			),
+			fakeDiagnosticBaselineReadRow(semanticBaselineJSON, countsJSON),
 			fakeSemanticJSONRow(diagnosticsJSON),
 		},
 	}
@@ -227,6 +213,12 @@ func TestReadDiagnosticsDecoratesRowsWithConservativeSymbolLinks(t *testing.T) {
 	}
 	if result.Baseline == nil || result.Baseline.SemanticBaseline == nil || result.Baseline.SemanticBaseline.IndexRunID != "semidx_fixture" {
 		t.Fatalf("expected historical semantic baseline anchor, got %#v", result.Baseline)
+	}
+	if result.Baseline.ReplayArchive == nil || result.Baseline.ReplayArchive.RawPayloadSHA256 != "fixturepayloadsha256" {
+		t.Fatalf("expected archived raw diagnostic replay payload, got %#v", result.Baseline)
+	}
+	if result.Baseline.ReplayArchive.ServerProvenance["server_id"] != "pyright" {
+		t.Fatalf("expected archived server provenance, got %#v", result.Baseline.ReplayArchive)
 	}
 	if result.Diagnostics[0].LinkedSymbol == nil || result.Diagnostics[0].LinkedSymbol.Symbol != "ExportService" {
 		t.Fatalf("expected conservative symbol link, got %#v", result.Diagnostics[0])
@@ -275,21 +267,7 @@ func TestReadDiagnosticsLeavesUnmatchedRowsUnlinked(t *testing.T) {
 
 	fakeConn := &fakeSemanticConn{
 		queryRows: []pgx.Row{
-			fakeSemanticBaselineRowValues(
-				"diag_fixture",
-				"lsp",
-				"pyright",
-				"batchfp",
-				[]byte("{}"),
-				(*string)(nil),
-				0,
-				false,
-				1,
-				countsJSON,
-				"diagnostics.json",
-				"xmustard",
-				"2026-05-04T00:00:00Z",
-			),
+			fakeDiagnosticBaselineReadRow([]byte("{}"), countsJSON),
 			fakeSemanticJSONRow(diagnosticsJSON),
 		},
 	}
@@ -347,21 +325,7 @@ func TestReadDiagnosticsLeavesAmbiguousSymbolMatchesUnlinked(t *testing.T) {
 
 	fakeConn := &fakeSemanticConn{
 		queryRows: []pgx.Row{
-			fakeSemanticBaselineRowValues(
-				"diag_fixture",
-				"lsp",
-				"pyright",
-				"batchfp",
-				[]byte("{}"),
-				(*string)(nil),
-				0,
-				false,
-				1,
-				countsJSON,
-				"diagnostics.json",
-				"xmustard",
-				"2026-05-04T00:00:00Z",
-			),
+			fakeDiagnosticBaselineReadRow([]byte("{}"), countsJSON),
 			fakeSemanticJSONRow(diagnosticsJSON),
 		},
 	}
@@ -387,4 +351,42 @@ func TestReadDiagnosticsLeavesAmbiguousSymbolMatchesUnlinked(t *testing.T) {
 	if len(result.Warnings) != 1 || !strings.Contains(result.Warnings[0], "durable link replay is unavailable") {
 		t.Fatalf("expected readiness warning, got %#v", result.Warnings)
 	}
+}
+
+func fakeDiagnosticBaselineReadRow(semanticBaselineJSON []byte, countsJSON []byte) fakeSemanticRow {
+	rawPayloadJSON, _ := json.Marshal(map[string]any{
+		"diagnostics": []map[string]any{{
+			"message": "Example LSP diagnostic.",
+		}},
+	})
+	serverProvenanceJSON, _ := json.Marshal(map[string]any{
+		"source_mode": "input_file",
+		"server_id":   "pyright",
+		"input_path":  "diagnostics.json",
+	})
+	replayWarningsJSON, _ := json.Marshal([]string{})
+	sha := "fixturepayloadsha256"
+	readiness := "raw_payload_and_server_provenance_archived"
+	return fakeSemanticBaselineRowValues(
+		"diag_fixture",
+		"lsp",
+		"pyright",
+		"batchfp",
+		rawPayloadJSON,
+		&sha,
+		123,
+		serverProvenanceJSON,
+		"diagnostics.normalized.v1",
+		&readiness,
+		replayWarningsJSON,
+		semanticBaselineJSON,
+		(*string)(nil),
+		0,
+		false,
+		1,
+		countsJSON,
+		"diagnostics.json",
+		"xmustard",
+		"2026-05-04T00:00:00Z",
+	)
 }

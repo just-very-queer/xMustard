@@ -252,6 +252,13 @@ create table if not exists {{schema}}.diagnostic_runs (
     source_kind text not null default 'lsp',
     source_name text not null,
     batch_fingerprint text not null,
+    raw_payload_json jsonb,
+    raw_payload_sha256 text,
+    raw_payload_bytes integer not null default 0,
+    server_provenance_json jsonb,
+    normalization_contract text not null default 'diagnostics.normalized.v1',
+    replay_readiness text,
+    replay_warnings_json jsonb not null default '[]'::jsonb,
     semantic_baseline_json jsonb,
     head_sha text,
     dirty_files integer not null default 0,
@@ -294,6 +301,13 @@ create table if not exists {{schema}}.diagnostics (
     unique (workspace_id, diagnostic_run_id, fingerprint)
 );
 
+alter table {{schema}}.diagnostic_runs add column if not exists raw_payload_json jsonb;
+alter table {{schema}}.diagnostic_runs add column if not exists raw_payload_sha256 text;
+alter table {{schema}}.diagnostic_runs add column if not exists raw_payload_bytes integer not null default 0;
+alter table {{schema}}.diagnostic_runs add column if not exists server_provenance_json jsonb;
+alter table {{schema}}.diagnostic_runs add column if not exists normalization_contract text not null default 'diagnostics.normalized.v1';
+alter table {{schema}}.diagnostic_runs add column if not exists replay_readiness text;
+alter table {{schema}}.diagnostic_runs add column if not exists replay_warnings_json jsonb not null default '[]'::jsonb;
 alter table {{schema}}.diagnostic_runs add column if not exists semantic_baseline_json jsonb;
 alter table {{schema}}.diagnostics add column if not exists diagnostic_run_id text;
 alter table {{schema}}.diagnostics add column if not exists file_id bigint;

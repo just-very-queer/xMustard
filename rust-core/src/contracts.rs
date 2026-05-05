@@ -313,6 +313,12 @@ pub fn diagnostics_contract_v1() -> DiagnosticContract {
             "linked_symbol.selection_reason",
         ],
         optional_replay_fields: vec![
+            "diagnostic_run.raw_payload_json",
+            "diagnostic_run.raw_payload_sha256",
+            "diagnostic_run.raw_payload_bytes",
+            "diagnostic_run.server_provenance_json",
+            "diagnostic_run.normalization_contract",
+            "diagnostic_run.replay_readiness",
             "semantic_baseline.index_run_id",
             "semantic_baseline.index_fingerprint",
             "semantic_baseline.surface",
@@ -435,6 +441,16 @@ mod tests {
             contract
                 .link_strategies
                 .contains(&"diagnostic_start_line_exact_symbol_anchor")
+        );
+        assert!(
+            contract
+                .optional_replay_fields
+                .contains(&"diagnostic_run.raw_payload_sha256")
+        );
+        assert!(
+            contract
+                .optional_replay_fields
+                .contains(&"diagnostic_run.server_provenance_json")
         );
         assert!(contract.normalized_severities.contains(&"warning"));
         assert!(contract.source_kinds.contains(&"lsp"));

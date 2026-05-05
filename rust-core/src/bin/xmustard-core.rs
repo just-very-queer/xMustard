@@ -201,6 +201,41 @@ fn main() {
                 }
             }
         }
+        "archive-diagnostics-payload" => {
+            let Some(workspace_id) = args.next() else {
+                eprintln!("usage: xmustard-core archive-diagnostics-payload <workspace_id> <input_json_path> <source_kind> <source_name> <server_provenance_json_path>");
+                std::process::exit(2);
+            };
+            let Some(input_json_path) = args.next() else {
+                eprintln!("usage: xmustard-core archive-diagnostics-payload <workspace_id> <input_json_path> <source_kind> <source_name> <server_provenance_json_path>");
+                std::process::exit(2);
+            };
+            let source_kind = args.next().unwrap_or_else(|| "lsp".to_string());
+            let source_name = args.next().unwrap_or_else(|| "unknown".to_string());
+            let Some(server_provenance_json_path) = args.next() else {
+                eprintln!("usage: xmustard-core archive-diagnostics-payload <workspace_id> <input_json_path> <source_kind> <source_name> <server_provenance_json_path>");
+                std::process::exit(2);
+            };
+            match xmustard_core::diagnostics::archive_diagnostics_payload_file(
+                &workspace_id,
+                &PathBuf::from(input_json_path),
+                &source_kind,
+                &source_name,
+                &PathBuf::from(server_provenance_json_path),
+            ) {
+                Ok(result) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&result)
+                            .expect("diagnostics replay archive should serialize")
+                    );
+                }
+                Err(err) => {
+                    eprintln!("archive-diagnostics-payload failed: {err}");
+                    std::process::exit(1);
+                }
+            }
+        }
         "link-diagnostic-symbol" => {
             let Some(workspace_id) = args.next() else {
                 eprintln!("usage: xmustard-core link-diagnostic-symbol <workspace_id> <diagnostic_path> <start_line> <end_line> <diagnostic_fingerprint> <candidates_json_path>");

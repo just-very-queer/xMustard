@@ -2,6 +2,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha1::{Digest, Sha1};
+use sha2::Sha256;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -31,6 +32,20 @@ pub struct RustDiagnosticsBatch {
     pub diagnostic_count: usize,
     pub diagnostics: Vec<RustNormalizedDiagnostic>,
     pub severity_counts: BTreeMap<String, usize>,
+    pub warnings: Vec<String>,
+    pub generated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustDiagnosticsReplayArchive {
+    pub workspace_id: String,
+    pub source_kind: String,
+    pub source_name: String,
+    pub raw_payload: Value,
+    pub raw_payload_sha256: String,
+    pub raw_payload_bytes: usize,
+    pub server_provenance: Value,
+    pub replay_readiness: String,
     pub warnings: Vec<String>,
     pub generated_at: String,
 }
@@ -100,6 +115,89 @@ pub fn normalize_diagnostics_file(
     ))
 }
 
+pub fn archive_diagnostics_payload_file(
+    workspace_id: &str,
+    input_path: &Path,
+    source_kind: &str,
+    source_name: &str,
+    server_provenance_path: &Path,
+) -> Result<RustDiagnosticsReplayArchive, std::io::Error> {
+    let content = fs::read_to_string(input_path)?;
+    let payload = serde_json::from_str::<Value>(&content).map_err(|err| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("decode diagnostics JSON for replay archive: {err}"),
+        )
+    })?;
+    let provenance_content = fs::read_to_string(server_provenance_path)?;
+    let server_provenance = serde_json::from_str::<Value>(&provenance_content).map_err(|err| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("decode diagnostics server provenance JSON: {err}"),
+        )
+    })?;
+    Ok(archive_diagnostics_payload(
+        workspace_id,
+        content.as_bytes(),
+        payload,
+        source_kind,
+        source_name,
+        server_provenance,
+    ))
+}
+
+pub fn archive_diagnostics_payload(
+    workspace_id: &str,
+    raw_payload_bytes: &[u8],
+    payload: Value,
+    source_kind: &str,
+    source_name: &str,
+    server_provenance: Value,
+) -> RustDiagnosticsReplayArchive {
+    let generated_at = Utc::now().to_rfc3339();
+    let source_kind = normalize_source_kind(source_kind);
+    let source_name = if source_name.trim().is_empty() {
+        "unknown".to_string()
+    } else {
+        source_name.trim().to_string()
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(raw_payload_bytes);
+    let mut warnings = Vec::new();
+    if payload.is_null() {
+        warnings.push("Archived diagnostics payload is null; replay cannot explain historical diagnostics content.".to_string());
+    }
+    if !server_provenance.is_object() {
+        warnings.push("Server provenance is not an object; replay cannot explain the diagnostic capture source cleanly.".to_string());
+    } else if source_kind == "lsp"
+        && server_provenance
+            .get("server_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .is_empty()
+    {
+        warnings.push("LSP server provenance is missing server_id; replay can show the payload but not the exact server identity.".to_string());
+    }
+    let replay_readiness = if warnings.is_empty() {
+        "raw_payload_and_server_provenance_archived"
+    } else {
+        "raw_payload_archived_with_provenance_warnings"
+    };
+    RustDiagnosticsReplayArchive {
+        workspace_id: workspace_id.to_string(),
+        source_kind,
+        source_name,
+        raw_payload: payload,
+        raw_payload_sha256: format!("{:x}", hasher.finalize()),
+        raw_payload_bytes: raw_payload_bytes.len(),
+        server_provenance,
+        replay_readiness: replay_readiness.to_string(),
+        warnings,
+        generated_at,
+    }
+}
+
 pub fn link_diagnostic_symbol_file(
     workspace_id: &str,
     diagnostic_path: &str,
@@ -136,7 +234,8 @@ pub fn link_diagnostic_symbol_payload(
     let generated_at = Utc::now().to_rfc3339();
     let mut warnings = Vec::new();
     let candidates = diagnostic_symbol_candidates(payload, &mut warnings);
-    let linked_symbol = choose_diagnostic_symbol_link(diagnostic_path, start_line, end_line, &candidates);
+    let linked_symbol =
+        choose_diagnostic_symbol_link(diagnostic_path, start_line, end_line, &candidates);
     let selection_reason = if linked_symbol.is_some() {
         "Rust selected a conservative diagnostic-to-symbol link from durable diagnostic and symbol rows.".to_string()
     } else {
@@ -260,7 +359,9 @@ fn diagnostic_symbol_candidates(
     for item in items {
         match serde_json::from_value::<RustDiagnosticSymbolCandidate>(item.clone()) {
             Ok(candidate) => out.push(candidate),
-            Err(err) => warnings.push(format!("Skipped invalid diagnostic symbol candidate: {err}")),
+            Err(err) => warnings.push(format!(
+                "Skipped invalid diagnostic symbol candidate: {err}"
+            )),
         }
     }
     out
@@ -524,6 +625,47 @@ mod tests {
     }
 
     #[test]
+    fn archives_raw_diagnostics_payload_with_server_provenance() {
+        let payload = json!({
+            "uri": "file:///tmp/project/src/app.ts",
+            "diagnostics": [{
+                "range": {
+                    "start": {"line": 1, "character": 4},
+                    "end": {"line": 1, "character": 12}
+                },
+                "severity": 1,
+                "message": "Cannot find name 'thing'."
+            }]
+        });
+        let raw = serde_json::to_vec(&payload).unwrap();
+        let archive = super::archive_diagnostics_payload(
+            "workspace-1",
+            &raw,
+            payload.clone(),
+            "lsp",
+            "typescript-language-server",
+            json!({
+                "source_mode": "input_file",
+                "server_id": "typescript-language-server",
+                "language_id": "typescript",
+                "input_path": "diagnostics.json"
+            }),
+        );
+
+        assert_eq!(archive.workspace_id, "workspace-1");
+        assert_eq!(archive.source_kind, "lsp");
+        assert_eq!(archive.source_name, "typescript-language-server");
+        assert_eq!(archive.raw_payload, payload);
+        assert_eq!(archive.raw_payload_bytes, raw.len());
+        assert_eq!(archive.raw_payload_sha256.len(), 64);
+        assert_eq!(
+            archive.replay_readiness,
+            "raw_payload_and_server_provenance_archived"
+        );
+        assert!(archive.warnings.is_empty());
+    }
+
+    #[test]
     fn links_diagnostic_to_unique_exact_symbol_anchor() {
         let payload = json!([
             {
@@ -550,7 +692,10 @@ mod tests {
 
         let link = result.linked_symbol.expect("expected linked symbol");
         assert_eq!(link.symbol, "ExportService");
-        assert_eq!(link.link_strategy, "diagnostic_start_line_exact_symbol_anchor");
+        assert_eq!(
+            link.link_strategy,
+            "diagnostic_start_line_exact_symbol_anchor"
+        );
         assert_eq!(link.evidence_source, "rust_diagnostic_symbol_link");
     }
 
@@ -592,7 +737,10 @@ mod tests {
 
         let link = result.linked_symbol.expect("expected linked symbol");
         assert_eq!(link.symbol, "run");
-        assert_eq!(link.link_strategy, "diagnostic_range_unique_narrowest_symbol");
+        assert_eq!(
+            link.link_strategy,
+            "diagnostic_range_unique_narrowest_symbol"
+        );
     }
 
     #[test]

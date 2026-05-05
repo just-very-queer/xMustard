@@ -36,6 +36,19 @@ type DiagnosticsBatch struct {
 	GeneratedAt     string                 `json:"generated_at"`
 }
 
+type DiagnosticsReplayArchive struct {
+	WorkspaceID      string         `json:"workspace_id"`
+	SourceKind       string         `json:"source_kind"`
+	SourceName       string         `json:"source_name"`
+	RawPayload       any            `json:"raw_payload"`
+	RawPayloadSHA256 string         `json:"raw_payload_sha256"`
+	RawPayloadBytes  int            `json:"raw_payload_bytes"`
+	ServerProvenance map[string]any `json:"server_provenance"`
+	ReplayReadiness  string         `json:"replay_readiness"`
+	Warnings         []string       `json:"warnings"`
+	GeneratedAt      string         `json:"generated_at"`
+}
+
 type DiagnosticSymbolCandidate struct {
 	SymbolID       int64   `json:"symbol_id"`
 	Path           string  `json:"path"`
@@ -124,6 +137,58 @@ func NormalizeDiagnosticsPayload(ctx context.Context, workspaceID string, repoRo
 		return nil, fmt.Errorf("close live diagnostics payload: %w", err)
 	}
 	return NormalizeDiagnostics(ctx, workspaceID, repoRoot, inputPath, sourceKind, sourceName)
+}
+
+func ArchiveDiagnosticsPayload(ctx context.Context, workspaceID string, inputJSONPath string, sourceKind string, sourceName string, serverProvenance map[string]any) (*DiagnosticsReplayArchive, error) {
+	provenancePayload, err := json.Marshal(serverProvenance)
+	if err != nil {
+		return nil, fmt.Errorf("encode diagnostics server provenance: %w", err)
+	}
+	provenanceFile, err := os.CreateTemp("", "xmustard-diagnostics-server-provenance-*.json")
+	if err != nil {
+		return nil, fmt.Errorf("create diagnostics server provenance temp file: %w", err)
+	}
+	provenancePath := provenanceFile.Name()
+	defer os.Remove(provenancePath)
+	if _, err := provenanceFile.Write(provenancePayload); err != nil {
+		provenanceFile.Close()
+		return nil, fmt.Errorf("write diagnostics server provenance: %w", err)
+	}
+	if err := provenanceFile.Close(); err != nil {
+		return nil, fmt.Errorf("close diagnostics server provenance: %w", err)
+	}
+
+	cmd := exec.CommandContext(
+		ctx,
+		"cargo",
+		"run",
+		"--quiet",
+		"--bin",
+		"xmustard-core",
+		"--",
+		"archive-diagnostics-payload",
+		workspaceID,
+		inputJSONPath,
+		sourceKind,
+		sourceName,
+		provenancePath,
+	)
+	cmd.Dir = rustCoreDir()
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("rust-core archive-diagnostics-payload failed: %w: %s", err, stderr.String())
+	}
+
+	var result DiagnosticsReplayArchive
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		return nil, fmt.Errorf("decode rust-core diagnostics replay archive: %w", err)
+	}
+	return &result, nil
 }
 
 func LinkDiagnosticSymbol(
