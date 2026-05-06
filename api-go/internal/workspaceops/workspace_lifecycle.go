@@ -17,7 +17,7 @@ import (
 
 const (
 	maxCachedSnapshotBytes = 25 * 1024 * 1024
-	scannerVersion         = 2
+	scannerVersion         = 3
 )
 
 type WorkspaceLoadRequest struct {

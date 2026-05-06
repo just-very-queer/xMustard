@@ -24,6 +24,8 @@ type workspaceSnapshot struct {
 	Sources        []sourceRecord        `json:"sources"`
 	DriftSummary   map[string]int        `json:"drift_summary"`
 	Runtimes       []runtimeCapabilities `json:"runtimes"`
+	RunTargets     []RepoTargetRecord    `json:"run_targets"`
+	VerifyTargets  []RepoTargetRecord    `json:"verify_targets"`
 	LatestLedger   *string               `json:"latest_ledger"`
 	LatestVerdicts *string               `json:"latest_verdicts"`
 	GeneratedAt    string                `json:"generated_at"`

@@ -192,6 +192,39 @@ reviews:
                                 return [{"path": "api/src/example.py", "symbol": "render_payload", "kind": "function"}]
                             if action == "repo-context":
                                 return {"workspace_id": workspace_id, "retrieval_ledger": []}
+                            if action == "run-targets":
+                                return [
+                                    {
+                                        "target_id": "pkg-dev",
+                                        "kind": "dev",
+                                        "label": "package.json:dev",
+                                        "command": "npm run dev",
+                                        "source": "package_json",
+                                        "source_path": "package.json",
+                                        "confidence": 85,
+                                    },
+                                    {
+                                        "target_id": "make-backend",
+                                        "kind": "dev",
+                                        "label": "make backend",
+                                        "command": "make backend",
+                                        "source": "makefile",
+                                        "source_path": "Makefile",
+                                        "confidence": 80,
+                                    },
+                                ]
+                            if action == "verify-targets":
+                                return [
+                                    {
+                                        "target_id": "verify-profile-backend-pytest",
+                                        "kind": "verify",
+                                        "label": "verification profile: Backend pytest",
+                                        "command": "pytest -q",
+                                        "source": "verification_profile",
+                                        "source_path": "verification_profiles.json",
+                                        "confidence": 95,
+                                    }
+                                ]
                             if action == "retrieval-search":
                                 return {"workspace_id": workspace_id, "query": "render payload", "hits": [], "retrieval_ledger": []}
                             if action == "semantic-search":
@@ -255,11 +288,12 @@ reviews:
                         ]
 
                         with patch.object(cli_module, "_run_go_workspace_json", side_effect=fake_go_workspace):
-                            for argv, validator in checks:
-                                result = self.runner.invoke(cli_module.app, argv)
-                                self.assertEqual(result.exit_code, 0, msg=result.output)
-                                payload = json.loads(result.stdout)
-                                validator(payload)
+                            with patch.object(service, "_run_go_workspace_json", side_effect=fake_go_workspace):
+                                for argv, validator in checks:
+                                    result = self.runner.invoke(cli_module.app, argv)
+                                    self.assertEqual(result.exit_code, 0, msg=result.output)
+                                    payload = json.loads(result.stdout)
+                                    validator(payload)
 
     def test_cli_path_symbols_reports_tree_sitter_metadata(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

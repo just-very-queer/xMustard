@@ -497,11 +497,18 @@ func semanticIndexTargetSeeds(repoRoot string, workspaceID string, surface strin
 }
 
 func semanticDiscoverTargets(repoRoot string, includeVerify bool) []semanticRepoTarget {
-	targets := []semanticRepoTarget{}
-	targets = append(targets, semanticDiscoverMakeTargets(repoRoot, includeVerify)...)
-	targets = append(targets, semanticDiscoverPackageTargets(repoRoot, includeVerify)...)
-	targets = append(targets, semanticDiscoverDockerTargets(repoRoot)...)
-	return dedupeSemanticTargets(targets)
+	repoTargets := discoverManifestTargets(repoRoot, includeVerify)
+	targets := make([]semanticRepoTarget, 0, len(repoTargets))
+	for _, item := range repoTargets {
+		targets = append(targets, semanticRepoTarget{
+			Kind:       item.Kind,
+			Label:      item.Label,
+			Command:    item.Command,
+			SourcePath: item.SourcePath,
+			Confidence: item.Confidence,
+		})
+	}
+	return targets
 }
 
 func semanticDiscoverMakeTargets(repoRoot string, includeVerify bool) []semanticRepoTarget {

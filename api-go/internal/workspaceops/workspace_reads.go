@@ -351,6 +351,14 @@ func ReadRepoContext(dataDir string, workspaceID string, baseRef string) (*RepoC
 	if err != nil {
 		return nil, err
 	}
+	runTargets, err := ReadRunTargets(dataDir, workspaceID)
+	if err != nil {
+		return nil, err
+	}
+	verifyTargets, err := ReadVerifyTargets(dataDir, workspaceID)
+	if err != nil {
+		return nil, err
+	}
 	referencePaths := map[string]struct{}{}
 	for _, path := range changePaths(impact.ChangedFiles, true) {
 		referencePaths[path] = struct{}{}
@@ -369,8 +377,8 @@ func ReadRepoContext(dataDir string, workspaceID string, baseRef string) (*RepoC
 		WorkspaceID:       workspaceID,
 		BaseRef:           impact.BaseRef,
 		Impact:            impact,
-		RunTargets:        []RepoContextTargetLink{},
-		VerifyTargets:     []RepoContextTargetLink{},
+		RunTargets:        buildRepoContextTargetLinks(runTargets, "Run"),
+		VerifyTargets:     buildRepoContextTargetLinks(verifyTargets, "Verification"),
 		PlanLinks:         planLinks,
 		RecentActivity:    activityLinks,
 		LatestAcceptedFix: latestFix,

@@ -182,7 +182,7 @@ from .terminal import TerminalService
 
 class TrackerService:
     MAX_CACHED_SNAPSHOT_BYTES = 25 * 1024 * 1024
-    SCANNER_VERSION = 2
+    SCANNER_VERSION = 3
     GUIDANCE_LIMIT = 6
     GUIDANCE_STARTER_MARKER = "xmustard:starter-template"
     GUIDANCE_PLACEHOLDER_MARKER = "TODO(xmustard)"
@@ -3460,29 +3460,39 @@ class TrackerService:
         )
 
     def list_run_targets(self, workspace_id: str) -> list[RepoTargetRecord]:
-        workspace = self.get_workspace(workspace_id)
-        root = Path(workspace.root_path)
-        targets = self._discover_targets(root, include_verify=False)
-        return sorted(targets, key=lambda item: (item.kind, item.label, item.command))
+        self.get_workspace(workspace_id)
+        try:
+            payload = self._run_go_workspace_json("run-targets", workspace_id)
+            return [RepoTargetRecord.model_validate(item) for item in payload]
+        except Exception:
+            workspace = self.get_workspace(workspace_id)
+            root = Path(workspace.root_path)
+            targets = self._discover_targets(root, include_verify=False)
+            return sorted(targets, key=lambda item: (item.kind, item.label, item.command))
 
     def list_verify_targets(self, workspace_id: str) -> list[RepoTargetRecord]:
-        workspace = self.get_workspace(workspace_id)
-        root = Path(workspace.root_path)
-        targets = self._discover_targets(root, include_verify=True)
-        profile_targets = [
-            RepoTargetRecord(
-                target_id=f"verify-profile-{profile.profile_id}",
-                kind="verify",
-                label=f"verification profile: {profile.name}",
-                command=profile.test_command,
-                source="verification_profile",
-                source_path="verification_profiles.json",
-                confidence=95,
-            )
-            for profile in self.list_verification_profiles(workspace_id)
-        ]
-        deduped = self._dedupe_targets([*targets, *profile_targets])
-        return sorted(deduped, key=lambda item: (item.kind, item.label, item.command))
+        self.get_workspace(workspace_id)
+        try:
+            payload = self._run_go_workspace_json("verify-targets", workspace_id)
+            return [RepoTargetRecord.model_validate(item) for item in payload]
+        except Exception:
+            workspace = self.get_workspace(workspace_id)
+            root = Path(workspace.root_path)
+            targets = self._discover_targets(root, include_verify=True)
+            profile_targets = [
+                RepoTargetRecord(
+                    target_id=f"verify-profile-{profile.profile_id}",
+                    kind="verify",
+                    label=f"verification profile: {profile.name}",
+                    command=profile.test_command,
+                    source="verification_profile",
+                    source_path="verification_profiles.json",
+                    confidence=95,
+                )
+                for profile in self.list_verification_profiles(workspace_id)
+            ]
+            deduped = self._dedupe_targets([*targets, *profile_targets])
+            return sorted(deduped, key=lambda item: (item.kind, item.label, item.command))
 
     def read_path_symbols(self, workspace_id: str, relative_path: str) -> PathSymbolsResult:
         return PathSymbolsResult.model_validate(

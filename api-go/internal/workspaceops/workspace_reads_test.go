@@ -85,6 +85,26 @@ func TestReadActivityOverviewMatchesTrackerRollups(t *testing.T) {
 
 func TestGoRepoIntelligenceReadsImpactContextAndRetrieval(t *testing.T) {
 	dataDir, workspaceID, _, repoRoot := writeIssueContextFixture(t, false)
+	if err := os.WriteFile(filepath.Join(repoRoot, "package.json"), []byte(`{"scripts":{"dev":"vite","test":"vitest run"}}`), 0o644); err != nil {
+		t.Fatalf("write package.json: %v", err)
+	}
+	if err := saveVerificationProfiles(dataDir, workspaceID, []verificationProfileRecord{
+		{
+			ProfileID:         "backend-pytest",
+			WorkspaceID:       workspaceID,
+			Name:              "Backend pytest",
+			Description:       "Saved verification command",
+			TestCommand:       "pytest -q",
+			CoverageFormat:    "unknown",
+			MaxRuntimeSeconds: 60,
+			RetryCount:        1,
+			BuiltIn:           false,
+			CreatedAt:         nowUTC(),
+			UpdatedAt:         nowUTC(),
+		},
+	}); err != nil {
+		t.Fatalf("save verification profiles: %v", err)
+	}
 
 	runGit(t, repoRoot, "init")
 	runGit(t, repoRoot, "add", ".")
@@ -118,6 +138,9 @@ func TestGoRepoIntelligenceReadsImpactContextAndRetrieval(t *testing.T) {
 	}
 	if context.Impact == nil || len(context.RetrievalLedger) == 0 || context.LatestAcceptedFix == nil {
 		t.Fatalf("expected impact, ledger, and fix link, got %#v", context)
+	}
+	if len(context.RunTargets) == 0 || len(context.VerifyTargets) == 0 {
+		t.Fatalf("expected repo context targets, got %#v", context)
 	}
 
 	retrieval, err := SearchRetrieval(dataDir, workspaceID, "export summary", 5)

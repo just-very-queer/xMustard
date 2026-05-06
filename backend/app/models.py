@@ -1098,6 +1098,8 @@ class WorkspaceSnapshot(BaseModel):
     sources: list[SourceRecord] = Field(default_factory=list)
     drift_summary: dict[str, int] = Field(default_factory=dict)
     runtimes: list[RuntimeCapabilities]
+    run_targets: list["RepoTargetRecord"] = Field(default_factory=list)
+    verify_targets: list["RepoTargetRecord"] = Field(default_factory=list)
     latest_ledger: Optional[str] = None
     latest_verdicts: Optional[str] = None
     generated_at: str = Field(default_factory=utc_now)
