@@ -3328,8 +3328,8 @@ class TrackerService:
                 dependency_id="semantic_core_first",
                 kind="implementation",
                 label="tree-sitter and ast-grep tranche landed",
-                satisfied=False,
-                detail="LSP enrichment should build on the structural semantic core rather than bypassing it.",
+                satisfied=True,
+                detail="The structural semantic tranche already landed, so live LSP reads and durable diagnostics build on that floor instead of bypassing it.",
             ),
             IngestionDependencyRecord(
                 dependency_id="postgres_configured_for_lsp",
@@ -3344,12 +3344,16 @@ class TrackerService:
                 phase_id="lsp_enrichment",
                 label="LSP enrichment",
                 description="Attach live definitions, references, workspace symbols, and diagnostics through a workspace LSP manager.",
-                implementation_state="planned",
-                delivery_state="blocked",
+                implementation_state="implemented",
+                delivery_state="complete" if postgres_configured else "blocked",
                 dependencies=lsp_dependencies,
-                blockers=["Awaiting workspace LSP manager implementation."],
+                blockers=[] if postgres_configured else ["Configure Postgres so diagnostics baselines can persist and link to durable repo/run state."],
                 outputs=["definitions", "references", "diagnostics", "workspace symbols"],
-                evidence=["Planned after structural semantic indexing is in place."],
+                evidence=[
+                    "Go-owned workspace LSP routes now serve go-to-definition, references, document symbols, workspace symbols, and live diagnostics.",
+                    "Diagnostics baselines now persist run linkage, semantic baseline anchors, replay payload provenance, and durable symbol-link context.",
+                    "Rust owns diagnostics normalization and conservative diagnostic-to-symbol link decisions behind the Go delivery surface.",
+                ],
             )
         )
 

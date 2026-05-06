@@ -3383,12 +3383,12 @@ class RuntimeSummaryTests(unittest.TestCase):
                 with patch("app.service.shutil.which", return_value="/opt/homebrew/bin/sg"):
                     plan = service.read_ingestion_plan(snapshot.workspace.workspace_id)
 
-            self.assertEqual(plan.completed_phase_count, 3)
+            self.assertEqual(plan.completed_phase_count, 4)
             self.assertEqual(plan.next_phase_id, "tree_sitter_index")
             self.assertIn("tree_sitter_index", plan.ready_phase_ids)
             self.assertIn("ast_grep_rules", plan.ready_phase_ids)
-            self.assertIn("lsp_enrichment", plan.blocked_phase_ids)
             self.assertIn("search_materialization", plan.blocked_phase_ids)
+            self.assertNotIn("lsp_enrichment", plan.blocked_phase_ids)
 
             phases = {item.phase_id: item for item in plan.phases}
             self.assertEqual(phases["repo_scan"].delivery_state, "complete")
@@ -3398,7 +3398,9 @@ class RuntimeSummaryTests(unittest.TestCase):
             self.assertEqual(phases["tree_sitter_index"].delivery_state, "ready")
             self.assertEqual(phases["ast_grep_rules"].implementation_state, "partial")
             self.assertEqual(phases["ast_grep_rules"].delivery_state, "ready")
-            self.assertEqual(phases["lsp_enrichment"].implementation_state, "planned")
+            self.assertEqual(phases["lsp_enrichment"].implementation_state, "implemented")
+            self.assertEqual(phases["lsp_enrichment"].delivery_state, "complete")
+            self.assertTrue(any("go-to-definition" in item for item in phases["lsp_enrichment"].evidence))
             self.assertTrue(any("On-demand parser-backed symbol extraction" in item for item in phases["tree_sitter_index"].evidence))
             self.assertTrue(any(item.startswith("total_files=") for item in phases["repo_map"].evidence))
 

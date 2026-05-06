@@ -332,7 +332,7 @@ func RunDiagnostics(dataDir string, workspaceID string, request DiagnosticsReque
 		return nil, err
 	}
 	targetDSN := strings.TrimSpace(firstConfiguredString(request.DSN, settings.PostgresDSN))
-	baseline, rows, err := persistDiagnosticsBaseline(targetDSN, plan.PostgresSchema, plan)
+	baseline, rows, err := persistDiagnosticsBaseline(dataDir, targetDSN, plan.PostgresSchema, plan)
 	if err != nil {
 		return nil, err
 	}
@@ -472,7 +472,7 @@ func ReadDiagnostics(dataDir string, workspaceID string, diagnosticRunID string)
 	}, nil
 }
 
-func persistDiagnosticsBaseline(dsn string, schema string, plan *DiagnosticsPlan) (*DiagnosticRun, int, error) {
+func persistDiagnosticsBaseline(dataDir string, dsn string, schema string, plan *DiagnosticsPlan) (*DiagnosticRun, int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	connection, err := connectSemanticPostgres(ctx, dsn)
@@ -481,6 +481,9 @@ func persistDiagnosticsBaseline(dsn string, schema string, plan *DiagnosticsPlan
 	}
 	defer connection.Close(context.Background())
 	if err := upsertSemanticWorkspace(ctx, connection, schema, plan.WorkspaceID, filepath.Base(plan.RootPath), plan.RootPath); err != nil {
+		return nil, 0, err
+	}
+	if err := upsertDiagnosticLinkedRun(ctx, connection, dataDir, schema, plan.WorkspaceID, trimOptional(plan.RunID)); err != nil {
 		return nil, 0, err
 	}
 	runID := "diag_" + hashID(plan.WorkspaceID, firstNonEmptyPtr(plan.BatchFingerprint), nowUTC())[:12]
@@ -642,6 +645,56 @@ func persistDiagnosticsBaseline(dsn string, schema string, plan *DiagnosticsPlan
 		PostgresSchema:   plan.PostgresSchema,
 		CreatedAt:        nowUTC(),
 	}, inserted, nil
+}
+
+func upsertDiagnosticLinkedRun(ctx context.Context, connection semanticMaterializationConn, dataDir string, schema string, workspaceID string, runID *string) error {
+	if runID == nil || strings.TrimSpace(*runID) == "" {
+		return nil
+	}
+	run, err := loadRun(dataDir, workspaceID, strings.TrimSpace(*runID))
+	if err != nil {
+		return fmt.Errorf("load linked run for diagnostics baseline: %w", err)
+	}
+	guidancePathsJSON, err := json.Marshal(run.GuidancePaths)
+	if err != nil {
+		return fmt.Errorf("encode linked run guidance paths: %w", err)
+	}
+	var worktreeJSON *string
+	if run.Worktree != nil {
+		payload, err := json.Marshal(run.Worktree)
+		if err != nil {
+			return fmt.Errorf("encode linked run worktree: %w", err)
+		}
+		value := string(payload)
+		worktreeJSON = &value
+	}
+	startedAt := trimOptional(run.StartedAt)
+	completedAt := trimOptional(run.CompletedAt)
+	_, err = connection.Exec(
+		ctx,
+		fmt.Sprintf(
+			"insert into %s.run_records (run_id, workspace_id, issue_id, runtime, model, status, title, prompt, command_preview, worktree_json, guidance_paths_json, started_at, completed_at, created_at) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11::jsonb, $12::timestamptz, $13::timestamptz, $14::timestamptz) on conflict (run_id) do update set workspace_id = excluded.workspace_id, issue_id = excluded.issue_id, runtime = excluded.runtime, model = excluded.model, status = excluded.status, title = excluded.title, prompt = excluded.prompt, command_preview = excluded.command_preview, worktree_json = excluded.worktree_json, guidance_paths_json = excluded.guidance_paths_json, started_at = excluded.started_at, completed_at = excluded.completed_at, created_at = excluded.created_at",
+			schema,
+		),
+		run.RunID,
+		run.WorkspaceID,
+		run.IssueID,
+		run.Runtime,
+		run.Model,
+		run.Status,
+		run.Title,
+		run.Prompt,
+		run.CommandPreview,
+		worktreeJSON,
+		string(guidancePathsJSON),
+		startedAt,
+		completedAt,
+		run.CreatedAt,
+	)
+	if err != nil {
+		return fmt.Errorf("upsert linked run record: %w", err)
+	}
+	return nil
 }
 
 func readLatestDiagnosticRun(dsn string, schema string, workspaceID string) (*DiagnosticRun, error) {

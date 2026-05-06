@@ -110,6 +110,9 @@ func TestRunDiagnosticsNormalizesWithRustAndPersistsRows(t *testing.T) {
 	if !containsSubstring(fakeConn.execSQL, "insert into xmustard.diagnostic_runs") || !containsSubstring(fakeConn.execSQL, "insert into xmustard.diagnostics") {
 		t.Fatalf("expected diagnostic run and row writes, got %#v", fakeConn.execSQL)
 	}
+	if !containsSubstring(fakeConn.execSQL, "insert into xmustard.run_records") {
+		t.Fatalf("expected linked run record upsert before diagnostics linkage, got %#v", fakeConn.execSQL)
+	}
 	if !containsSubstring(fakeConn.execSQL, "issue_id") || !containsSubstring(fakeConn.execSQL, "run_id") {
 		t.Fatalf("expected durable issue/run linkage columns, got %#v", fakeConn.execSQL)
 	}
