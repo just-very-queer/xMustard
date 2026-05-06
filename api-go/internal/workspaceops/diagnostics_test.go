@@ -12,6 +12,22 @@ import (
 
 func TestRunDiagnosticsNormalizesWithRustAndPersistsRows(t *testing.T) {
 	dataDir, workspaceID, _, repoRoot := writeIssueContextFixture(t, false)
+	runID := "run-123"
+	runPath := filepath.Join(dataDir, "workspaces", workspaceID, "runs", runID+".json")
+	if err := writeJSON(runPath, runRecord{
+		RunID:       runID,
+		WorkspaceID: workspaceID,
+		IssueID:     "P0_25M03_001",
+		Runtime:     "codex",
+		Model:       "gpt-5.4",
+		Status:      "completed",
+		Title:       "codex:P0_25M03_001",
+		Prompt:      "fix it",
+		Command:     []string{"codex", "exec"},
+		CreatedAt:   "2026-05-04T00:00:00Z",
+	}); err != nil {
+		t.Fatalf("write run fixture: %v", err)
+	}
 	inputPath := filepath.Join(repoRoot, "diagnostics.json")
 	payload := `{
 		"path": "src/app.py",
@@ -78,6 +94,7 @@ func TestRunDiagnosticsNormalizesWithRustAndPersistsRows(t *testing.T) {
 		InputPath:  "diagnostics.json",
 		SourceKind: "lsp",
 		SourceName: "pyright",
+		RunID:      optionalString(runID),
 		DSN:        optionalString("postgres://user:secret@example.com/xmustard"),
 		SchemaName: optionalString("xmustard"),
 	})
@@ -93,6 +110,9 @@ func TestRunDiagnosticsNormalizesWithRustAndPersistsRows(t *testing.T) {
 	if !containsSubstring(fakeConn.execSQL, "insert into xmustard.diagnostic_runs") || !containsSubstring(fakeConn.execSQL, "insert into xmustard.diagnostics") {
 		t.Fatalf("expected diagnostic run and row writes, got %#v", fakeConn.execSQL)
 	}
+	if !containsSubstring(fakeConn.execSQL, "issue_id") || !containsSubstring(fakeConn.execSQL, "run_id") {
+		t.Fatalf("expected durable issue/run linkage columns, got %#v", fakeConn.execSQL)
+	}
 	if !containsSubstring(fakeConn.execSQL, "semantic_baseline_json") || !containsSubstring(fakeConn.execSQL, "link_context_json") {
 		t.Fatalf("expected historical semantic replay columns, got %#v", fakeConn.execSQL)
 	}
@@ -103,23 +123,32 @@ func TestRunDiagnosticsNormalizesWithRustAndPersistsRows(t *testing.T) {
 		t.Fatalf("expected durable diagnostic link replay columns, got %#v", fakeConn.execSQL)
 	}
 	runArgs := diagnosticRunInsertArgs(t, fakeConn)
-	if rawPayload, ok := runArgs[5].(*string); !ok || rawPayload == nil || !strings.Contains(*rawPayload, "Example LSP diagnostic.") {
-		t.Fatalf("expected archived raw diagnostic payload, got %#v", runArgs[5])
+	if issueArg, ok := runArgs[2].(*string); !ok || issueArg == nil || *issueArg != "P0_25M03_001" {
+		t.Fatalf("expected derived issue linkage, got %#v", runArgs[2])
 	}
-	if sha, ok := runArgs[6].(string); !ok || len(sha) != 64 {
-		t.Fatalf("expected raw payload sha256, got %#v", runArgs[6])
+	if linkedRunArg, ok := runArgs[3].(*string); !ok || linkedRunArg == nil || *linkedRunArg != runID {
+		t.Fatalf("expected run linkage, got %#v", runArgs[3])
 	}
-	if bytes, ok := runArgs[7].(int); !ok || bytes <= 0 {
-		t.Fatalf("expected raw payload byte count, got %#v", runArgs[7])
+	if rawPayload, ok := runArgs[7].(*string); !ok || rawPayload == nil || !strings.Contains(*rawPayload, "Example LSP diagnostic.") {
+		t.Fatalf("expected archived raw diagnostic payload, got %#v", runArgs[7])
 	}
-	if provenance, ok := runArgs[8].(*string); !ok || provenance == nil || !strings.Contains(*provenance, `"server_id":"pyright"`) || !strings.Contains(*provenance, `"source_mode":"input_file"`) || !strings.Contains(*provenance, `"server_command":["/usr/local/bin/pyright-langserver","--stdio"]`) || !strings.Contains(*provenance, `"provenance_level":"resolved_lsp_command"`) {
-		t.Fatalf("expected archived server provenance, got %#v", runArgs[8])
+	if sha, ok := runArgs[8].(string); !ok || len(sha) != 64 {
+		t.Fatalf("expected raw payload sha256, got %#v", runArgs[8])
 	}
-	if contract, ok := runArgs[9].(string); !ok || contract != "diagnostics.normalized.v1" {
-		t.Fatalf("expected normalization contract, got %#v", runArgs[9])
+	if bytes, ok := runArgs[9].(int); !ok || bytes <= 0 {
+		t.Fatalf("expected raw payload byte count, got %#v", runArgs[9])
 	}
-	if readiness, ok := runArgs[10].(string); !ok || readiness != "raw_payload_and_server_provenance_archived" {
-		t.Fatalf("expected archive replay readiness, got %#v", runArgs[10])
+	if provenance, ok := runArgs[10].(*string); !ok || provenance == nil || !strings.Contains(*provenance, `"server_id":"pyright"`) || !strings.Contains(*provenance, `"source_mode":"input_file"`) || !strings.Contains(*provenance, `"server_command":["/usr/local/bin/pyright-langserver","--stdio"]`) || !strings.Contains(*provenance, `"provenance_level":"resolved_lsp_command"`) {
+		t.Fatalf("expected archived server provenance, got %#v", runArgs[10])
+	}
+	if contract, ok := runArgs[11].(string); !ok || contract != "diagnostics.normalized.v1" {
+		t.Fatalf("expected normalization contract, got %#v", runArgs[11])
+	}
+	if readiness, ok := runArgs[12].(string); !ok || readiness != "raw_payload_and_server_provenance_archived" {
+		t.Fatalf("expected archive replay readiness, got %#v", runArgs[12])
+	}
+	if result.Baseline.RunID == nil || *result.Baseline.RunID != runID || result.Baseline.IssueID == nil || *result.Baseline.IssueID != "P0_25M03_001" {
+		t.Fatalf("expected persisted run and issue linkage, got %#v", result.Baseline)
 	}
 	if result.Baseline.SemanticBaseline == nil || result.Baseline.SemanticBaseline.IndexRunID != "semidx_fixture" {
 		t.Fatalf("expected persisted semantic baseline anchor, got %#v", result.Baseline)
@@ -131,6 +160,43 @@ func TestRunDiagnosticsNormalizesWithRustAndPersistsRows(t *testing.T) {
 	}
 	if !strings.Contains(string(activityContent), "postgres.materialize.diagnostics") {
 		t.Fatalf("expected diagnostics activity, got %s", activityContent)
+	}
+}
+
+func TestPlanDiagnosticsRejectsIssueMismatchForLinkedRun(t *testing.T) {
+	dataDir, workspaceID, _, _ := writeIssueContextFixture(t, false)
+	runID := "run-123"
+	runPath := filepath.Join(dataDir, "workspaces", workspaceID, "runs", runID+".json")
+	if err := writeJSON(runPath, runRecord{
+		RunID:       runID,
+		WorkspaceID: workspaceID,
+		IssueID:     "P0_25M03_001",
+		Runtime:     "codex",
+		Model:       "gpt-5.4",
+		Status:      "completed",
+		Title:       "codex:P0_25M03_001",
+		Prompt:      "fix it",
+		Command:     []string{"codex", "exec"},
+		CreatedAt:   "2026-05-04T00:00:00Z",
+	}); err != nil {
+		t.Fatalf("write run fixture: %v", err)
+	}
+
+	plan, err := PlanDiagnostics(dataDir, workspaceID, DiagnosticsRequest{
+		InputPath:  "missing.json",
+		SourceKind: "lsp",
+		SourceName: "pyright",
+		IssueID:    optionalString("OTHER_ISSUE"),
+		RunID:      optionalString(runID),
+	})
+	if err != nil {
+		t.Fatalf("plan diagnostics: %v", err)
+	}
+	if plan.CanRun {
+		t.Fatalf("expected mismatch blocker, got %#v", plan)
+	}
+	if !strings.Contains(strings.Join(plan.Blockers, "\n"), "does not match run") {
+		t.Fatalf("expected mismatch blocker, got %#v", plan.Blockers)
 	}
 }
 
@@ -203,6 +269,8 @@ func TestReadDiagnosticsWarnsWhenLegacyReplayArchiveLacksResolvedServerProvenanc
 		queryRows: []pgx.Row{
 			fakeSemanticBaselineRowValues(
 				"diag_fixture",
+				(*string)(nil),
+				(*string)(nil),
 				"lsp",
 				"pyright",
 				"batchfp",

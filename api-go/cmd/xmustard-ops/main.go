@@ -56,6 +56,8 @@ func runDiagnostics(args []string) {
 	inputPath := fs.String("input-path", "", "LSP publishDiagnostics JSON file")
 	sourceKind := fs.String("source-kind", "lsp", "lsp | compiler | test | scanner | manual")
 	sourceName := fs.String("source-name", "", "diagnostic source name, e.g. pyright or typescript-language-server")
+	issueID := fs.String("issue-id", "", "optional issue id to anchor the diagnostics baseline")
+	runID := fs.String("run-id", "", "optional run id to anchor the diagnostics baseline")
 	path := fs.String("path", "", "relative workspace path for live LSP diagnostics")
 	diagnosticRunID := fs.String("diagnostic-run-id", "", "historical diagnostics run id for durable reads")
 	dsn := fs.String("dsn", "", "Postgres DSN override")
@@ -69,6 +71,14 @@ func runDiagnostics(args []string) {
 		SourceKind: *sourceKind,
 		SourceName: *sourceName,
 		DryRun:     *dryRun,
+	}
+	if strings.TrimSpace(*issueID) != "" {
+		value := strings.TrimSpace(*issueID)
+		request.IssueID = &value
+	}
+	if strings.TrimSpace(*runID) != "" {
+		value := strings.TrimSpace(*runID)
+		request.RunID = &value
 	}
 	if strings.TrimSpace(*dsn) != "" {
 		value := strings.TrimSpace(*dsn)

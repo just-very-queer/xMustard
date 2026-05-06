@@ -30,6 +30,8 @@ type DiagnosticsRequest struct {
 	InputPath  string  `json:"input_path"`
 	SourceKind string  `json:"source_kind"`
 	SourceName string  `json:"source_name"`
+	IssueID    *string `json:"issue_id,omitempty"`
+	RunID      *string `json:"run_id,omitempty"`
 	DSN        *string `json:"dsn,omitempty"`
 	SchemaName *string `json:"schema_name,omitempty"`
 	DryRun     bool    `json:"dry_run"`
@@ -41,6 +43,8 @@ type DiagnosticsPlan struct {
 	InputPath          string                   `json:"input_path"`
 	SourceKind         string                   `json:"source_kind"`
 	SourceName         string                   `json:"source_name"`
+	IssueID            *string                  `json:"issue_id,omitempty"`
+	RunID              *string                  `json:"run_id,omitempty"`
 	DiagnosticCount    int                      `json:"diagnostic_count"`
 	SeverityCounts     map[string]int           `json:"severity_counts"`
 	HeadSHA            *string                  `json:"head_sha,omitempty"`
@@ -84,6 +88,8 @@ type DiagnosticsStatus struct {
 type DiagnosticRun struct {
 	DiagnosticRunID  string                      `json:"diagnostic_run_id"`
 	WorkspaceID      string                      `json:"workspace_id"`
+	IssueID          *string                     `json:"issue_id,omitempty"`
+	RunID            *string                     `json:"run_id,omitempty"`
 	SourceKind       string                      `json:"source_kind"`
 	SourceName       string                      `json:"source_name"`
 	BatchFingerprint string                      `json:"batch_fingerprint"`
@@ -224,6 +230,10 @@ func PlanDiagnostics(dataDir string, workspaceID string, request DiagnosticsRequ
 	if targetDSN == "" {
 		blockers = append(blockers, "Postgres DSN is not configured; diagnostics need durable baseline storage.")
 	}
+	issueID, runID, runLinkErr := resolveDiagnosticsRunLink(dataDir, workspaceID, request.IssueID, request.RunID)
+	if runLinkErr != nil {
+		blockers = append(blockers, runLinkErr.Error())
+	}
 	inputPath, inputErr := resolveDiagnosticsInputPath(workspace.RootPath, request.InputPath)
 	if inputErr != nil {
 		blockers = append(blockers, inputErr.Error())
@@ -254,6 +264,9 @@ func PlanDiagnostics(dataDir string, workspaceID string, request DiagnosticsRequ
 	if worktree.DirtyFiles > 0 {
 		warnings = append(warnings, "Worktree has dirty files; this diagnostics baseline should be treated as provisional.")
 	}
+	if runID == nil {
+		warnings = append(warnings, "No run_id was provided; this diagnostics baseline will be linked to repo state but not a durable run record.")
+	}
 	nextActions := []string{
 		"Run diagnostics run after reviewing the normalized diagnostics count and source provenance.",
 		"Feed LSP publishDiagnostics JSON into --input-path for the first bounded Phase 3 ingestion path.",
@@ -271,6 +284,8 @@ func PlanDiagnostics(dataDir string, workspaceID string, request DiagnosticsRequ
 		InputPath:          inputPath,
 		SourceKind:         sourceKind,
 		SourceName:         sourceName,
+		IssueID:            issueID,
+		RunID:              runID,
 		DiagnosticCount:    diagnosticsBatchCount(batch),
 		SeverityCounts:     counts,
 		HeadSHA:            worktree.HeadSHA,
@@ -332,6 +347,8 @@ func RunDiagnostics(dataDir string, workspaceID string, request DiagnosticsReque
 			"schema_name":       plan.PostgresSchema,
 			"diagnostic_rows":   rows,
 			"batch_fingerprint": firstNonEmptyPtr(plan.BatchFingerprint),
+			"issue_id":          trimOptional(plan.IssueID),
+			"run_id":            trimOptional(plan.RunID),
 		},
 	); err != nil {
 		return nil, err
@@ -519,9 +536,11 @@ func persistDiagnosticsBaseline(dsn string, schema string, plan *DiagnosticsPlan
 	}
 	if _, err := connection.Exec(
 		ctx,
-		fmt.Sprintf("insert into %s.diagnostic_runs (diagnostic_run_id, workspace_id, source_kind, source_name, batch_fingerprint, raw_payload_json, raw_payload_sha256, raw_payload_bytes, server_provenance_json, normalization_contract, replay_readiness, replay_warnings_json, semantic_baseline_json, head_sha, dirty_files, worktree_dirty, diagnostic_count, severity_counts_json, input_path, postgres_schema) values ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9::jsonb, $10, $11, $12::jsonb, $13::jsonb, $14, $15, $16, $17, $18::jsonb, $19, $20)", schema),
+		fmt.Sprintf("insert into %s.diagnostic_runs (diagnostic_run_id, workspace_id, issue_id, run_id, source_kind, source_name, batch_fingerprint, raw_payload_json, raw_payload_sha256, raw_payload_bytes, server_provenance_json, normalization_contract, replay_readiness, replay_warnings_json, semantic_baseline_json, head_sha, dirty_files, worktree_dirty, diagnostic_count, severity_counts_json, input_path, postgres_schema) values ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11::jsonb, $12, $13, $14::jsonb, $15::jsonb, $16, $17, $18, $19, $20::jsonb, $21, $22)", schema),
 		runID,
 		plan.WorkspaceID,
+		trimOptional(plan.IssueID),
+		trimOptional(plan.RunID),
 		plan.SourceKind,
 		plan.SourceName,
 		firstNonEmptyPtr(plan.BatchFingerprint),
@@ -607,6 +626,8 @@ func persistDiagnosticsBaseline(dsn string, schema string, plan *DiagnosticsPlan
 	return &DiagnosticRun{
 		DiagnosticRunID:  runID,
 		WorkspaceID:      plan.WorkspaceID,
+		IssueID:          trimOptional(plan.IssueID),
+		RunID:            trimOptional(plan.RunID),
 		SourceKind:       plan.SourceKind,
 		SourceName:       plan.SourceName,
 		BatchFingerprint: firstNonEmptyPtr(plan.BatchFingerprint),
@@ -641,6 +662,8 @@ func readDiagnosticRun(dsn string, schema string, workspaceID string, targetRunI
 	defer connection.Close(context.Background())
 	var (
 		runID                 string
+		issueID               *string
+		linkedRunID           *string
 		sourceKind            string
 		sourceName            string
 		fingerprint           string
@@ -661,14 +684,14 @@ func readDiagnosticRun(dsn string, schema string, workspaceID string, targetRunI
 		pgSchema              string
 		createdAt             string
 	)
-	query := fmt.Sprintf("select diagnostic_run_id, source_kind, source_name, batch_fingerprint, coalesce(raw_payload_json, 'null'::jsonb), raw_payload_sha256, coalesce(raw_payload_bytes, 0), coalesce(server_provenance_json, '{}'::jsonb), coalesce(normalization_contract, 'diagnostics.normalized.v1'), replay_readiness, coalesce(replay_warnings_json, '[]'::jsonb), coalesce(semantic_baseline_json, '{}'::jsonb), head_sha, dirty_files, worktree_dirty, diagnostic_count, severity_counts_json, input_path, postgres_schema, created_at::text from %s.diagnostic_runs where workspace_id = $1", schema)
+	query := fmt.Sprintf("select diagnostic_run_id, issue_id, run_id, source_kind, source_name, batch_fingerprint, coalesce(raw_payload_json, 'null'::jsonb), raw_payload_sha256, coalesce(raw_payload_bytes, 0), coalesce(server_provenance_json, '{}'::jsonb), coalesce(normalization_contract, 'diagnostics.normalized.v1'), replay_readiness, coalesce(replay_warnings_json, '[]'::jsonb), coalesce(semantic_baseline_json, '{}'::jsonb), head_sha, dirty_files, worktree_dirty, diagnostic_count, severity_counts_json, input_path, postgres_schema, created_at::text from %s.diagnostic_runs where workspace_id = $1", schema)
 	args := []any{workspaceID}
 	if targetRunID != "" {
 		query += " and diagnostic_run_id = $2"
 		args = append(args, targetRunID)
 	}
 	query += " order by created_at desc limit 1"
-	err = connection.QueryRow(ctx, query, args...).Scan(&runID, &sourceKind, &sourceName, &fingerprint, &rawPayloadJSON, &rawPayloadSHA256, &rawPayloadBytes, &serverProvenanceJSON, &normalizationContract, &replayReadiness, &replayWarningsJSON, &semanticBaselineJSON, &headSHA, &dirtyFiles, &dirty, &count, &countsJSON, &inputPath, &pgSchema, &createdAt)
+	err = connection.QueryRow(ctx, query, args...).Scan(&runID, &issueID, &linkedRunID, &sourceKind, &sourceName, &fingerprint, &rawPayloadJSON, &rawPayloadSHA256, &rawPayloadBytes, &serverProvenanceJSON, &normalizationContract, &replayReadiness, &replayWarningsJSON, &semanticBaselineJSON, &headSHA, &dirtyFiles, &dirty, &count, &countsJSON, &inputPath, &pgSchema, &createdAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
@@ -688,6 +711,8 @@ func readDiagnosticRun(dsn string, schema string, workspaceID string, targetRunI
 	return &DiagnosticRun{
 		DiagnosticRunID:  runID,
 		WorkspaceID:      workspaceID,
+		IssueID:          trimOptional(issueID),
+		RunID:            trimOptional(linkedRunID),
 		SourceKind:       sourceKind,
 		SourceName:       sourceName,
 		BatchFingerprint: fingerprint,
@@ -769,6 +794,40 @@ func diagnosticsBatchCount(batch *DiagnosticsBatch) int {
 		return 0
 	}
 	return batch.DiagnosticCount
+}
+
+func resolveDiagnosticsRunLink(dataDir string, workspaceID string, issueID *string, runID *string) (*string, *string, error) {
+	linkedIssueID := trimOptional(issueID)
+	linkedRunID := trimOptional(runID)
+	if linkedRunID != nil {
+		run, err := loadRun(dataDir, workspaceID, *linkedRunID)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil, nil, fmt.Errorf("%w: run not found: %s", ErrInvalidDiagnosticsRequest, *linkedRunID)
+			}
+			return nil, nil, err
+		}
+		runIssueID := strings.TrimSpace(run.IssueID)
+		if linkedIssueID != nil && runIssueID != "" && *linkedIssueID != runIssueID {
+			return nil, nil, fmt.Errorf("%w: issue_id %s does not match run %s issue %s", ErrInvalidDiagnosticsRequest, *linkedIssueID, *linkedRunID, runIssueID)
+		}
+		if runIssueID != "" {
+			linkedIssueID = &runIssueID
+		}
+	}
+	if linkedIssueID == nil {
+		return nil, linkedRunID, nil
+	}
+	snapshot, err := loadSnapshot(dataDir, workspaceID)
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, issue := range snapshot.Issues {
+		if issue.BugID == *linkedIssueID {
+			return linkedIssueID, linkedRunID, nil
+		}
+	}
+	return nil, nil, fmt.Errorf("%w: issue not found: %s", ErrInvalidDiagnosticsRequest, *linkedIssueID)
 }
 
 func diagnosticsBatchFingerprint(workspaceID string, sourceKind string, sourceName string, diagnostics []rustcore.NormalizedDiagnostic, headSHA *string) string {

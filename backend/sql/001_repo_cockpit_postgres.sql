@@ -249,6 +249,8 @@ create table if not exists {{schema}}.issue_artifacts (
 create table if not exists {{schema}}.diagnostic_runs (
     diagnostic_run_id text primary key,
     workspace_id text not null references {{schema}}.workspaces(workspace_id) on delete cascade,
+    issue_id text,
+    run_id text references {{schema}}.run_records(run_id) on delete set null,
     source_kind text not null default 'lsp',
     source_name text not null,
     batch_fingerprint text not null,
@@ -309,6 +311,8 @@ alter table {{schema}}.diagnostic_runs add column if not exists normalization_co
 alter table {{schema}}.diagnostic_runs add column if not exists replay_readiness text;
 alter table {{schema}}.diagnostic_runs add column if not exists replay_warnings_json jsonb not null default '[]'::jsonb;
 alter table {{schema}}.diagnostic_runs add column if not exists semantic_baseline_json jsonb;
+alter table {{schema}}.diagnostic_runs add column if not exists issue_id text;
+alter table {{schema}}.diagnostic_runs add column if not exists run_id text references {{schema}}.run_records(run_id) on delete set null;
 alter table {{schema}}.diagnostics add column if not exists diagnostic_run_id text;
 alter table {{schema}}.diagnostics add column if not exists file_id bigint;
 alter table {{schema}}.diagnostics add column if not exists range_start_line integer;
@@ -342,6 +346,7 @@ create index if not exists semantic_matches_workspace_path_idx on {{schema}}.sem
 create index if not exists semantic_matches_query_idx on {{schema}}.semantic_matches(query_id);
 create index if not exists semantic_index_runs_workspace_surface_idx on {{schema}}.semantic_index_runs(workspace_id, surface, created_at desc);
 create index if not exists diagnostic_runs_workspace_idx on {{schema}}.diagnostic_runs(workspace_id, created_at desc);
+create index if not exists diagnostic_runs_workspace_run_idx on {{schema}}.diagnostic_runs(workspace_id, run_id, created_at desc);
 create index if not exists activity_events_workspace_idx on {{schema}}.activity_events(workspace_id, created_at desc);
 create index if not exists run_records_workspace_idx on {{schema}}.run_records(workspace_id, created_at desc);
 create index if not exists run_plans_workspace_idx on {{schema}}.run_plans(workspace_id, issue_id, updated_at desc);

@@ -369,6 +369,8 @@ func fakeDiagnosticBaselineReadRow(semanticBaselineJSON []byte, countsJSON []byt
 	readiness := "raw_payload_and_server_provenance_archived"
 	return fakeSemanticBaselineRowValues(
 		"diag_fixture",
+		(*string)(nil),
+		(*string)(nil),
 		"lsp",
 		"pyright",
 		"batchfp",
