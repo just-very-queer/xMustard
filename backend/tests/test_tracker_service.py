@@ -26,6 +26,9 @@ from app.models import (
     PostgresBootstrapResult,
     PostgresSemanticMaterializationResult,
     PostgresWorkspaceSemanticMaterializationResult,
+    RepoMapDirectoryRecord,
+    RepoMapFileRecord,
+    RepoMapSummary,
     RepoMapSymbolRecord,
     RunPlan,
     SemanticIndexBaselineRecord,
@@ -3391,6 +3394,89 @@ class RuntimeSummaryTests(unittest.TestCase):
                 self.assertFalse(hasattr(service, attr), msg=attr)
 
             self.assertTrue(hasattr(service, "_read_go_path_symbols"))
+
+    def test_issue_context_keeps_go_project_truth_reads_out_of_python_symbol_bridge(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "repo"
+            (root / "docs" / "bugs").mkdir(parents=True)
+            (root / "api" / "src").mkdir(parents=True)
+            (root / "docs" / "bugs" / "Bugs_25260323.md").write_text(LEDGER_TEXT, encoding="utf-8")
+            (root / "api" / "src" / "example.py").write_text("def render_payload():\n    return {'status': 'ok'}\n", encoding="utf-8")
+
+            store = FileStore(Path(tmp_dir) / "data")
+            service = TrackerService(store)
+            snapshot = service.load_workspace(WorkspaceLoadRequest(root_path=str(root), auto_scan=True))
+            assert snapshot is not None
+
+            created = service.create_issue(
+                snapshot.workspace.workspace_id,
+                IssueCreateRequest(
+                    title="render_payload regression",
+                    severity="P1",
+                    summary="render_payload fails in api/src/example.py.",
+                    labels=["export"],
+                ),
+            )
+
+            repo_map = RepoMapSummary(
+                workspace_id=snapshot.workspace.workspace_id,
+                root_path=str(root),
+                total_files=1,
+                source_files=1,
+                top_extensions={".py": 1},
+                top_directories=[
+                    RepoMapDirectoryRecord(
+                        path="api",
+                        file_count=1,
+                        source_file_count=1,
+                        test_file_count=0,
+                    )
+                ],
+                key_files=[RepoMapFileRecord(path="api/src/example.py", role="source")],
+            )
+            go_payload = {
+                "workspace_id": snapshot.workspace.workspace_id,
+                "path": "api/src/example.py",
+                "symbol_source": "tree_sitter",
+                "parser_language": "python",
+                "evidence_source": "rust_semantic_core",
+                "selection_reason": "Rust semantic core produced on-demand path symbols for the requested file.",
+                "symbols": [
+                    {
+                        "path": "api/src/example.py",
+                        "symbol": "render_payload",
+                        "kind": "function",
+                        "line_start": 1,
+                        "line_end": 2,
+                        "evidence_source": "rust_semantic_core",
+                    }
+                ],
+                "warnings": [],
+            }
+            go_actions: list[tuple[str, tuple[str, ...]]] = []
+
+            def fake_go_workspace(action: str, workspace_id_arg: str, flags=None):
+                go_actions.append((action, tuple(flags or [])))
+                self.assertEqual(workspace_id_arg, snapshot.workspace.workspace_id)
+                self.assertEqual(action, "path-symbols")
+                return go_payload
+
+            with patch.object(service, "read_repo_map", return_value=repo_map):
+                with patch.object(service, "_run_go_workspace_json", side_effect=fake_go_workspace):
+                    with patch("app.service.ast_grep_available", return_value=False):
+                        packet = service.build_issue_context(snapshot.workspace.workspace_id, created.bug_id)
+
+            self.assertTrue(packet.dynamic_context)
+            assert packet.dynamic_context is not None
+            self.assertEqual([item.symbol for item in packet.dynamic_context.symbol_context], ["render_payload"])
+            self.assertTrue(go_actions)
+            self.assertTrue(all(action == "path-symbols" for action, _flags in go_actions))
+            self.assertFalse(
+                any(
+                    action in {"run-targets", "verify-targets", "project-info", "verification-outcomes", "repo-context"}
+                    for action, _flags in go_actions
+                )
+            )
 
     def test_path_symbols_prefer_rust_semantic_contracts_when_stored_rows_are_absent(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

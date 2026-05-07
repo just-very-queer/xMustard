@@ -3132,6 +3132,8 @@ class TrackerService:
         )
 
     def _read_go_path_symbols(self, workspace_id: str, relative_path: str) -> PathSymbolsResult:
+        # Keep this private bridge narrow: issue-context symbol ranking still needs
+        # canonical Rust-backed per-path symbols until Go owns ranked symbol bundles.
         return PathSymbolsResult.model_validate(
             self._run_go_workspace_json("path-symbols", workspace_id, ["--path", relative_path])
         )
