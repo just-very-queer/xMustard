@@ -27,7 +27,6 @@ from .models import (
     AppSettings,
     BrowserDumpRecord,
     BrowserDumpUpsertRequest,
-    CodeExplainerResult,
     CostSummary,
     RepoChangeRecord,
     RepoChangeSummary,
@@ -74,9 +73,6 @@ from .models import (
     IntegrationConfig,
     IntegrationTestRequest,
     IntegrationTestResult,
-    IngestionDependencyRecord,
-    IngestionPhaseRecord,
-    IngestionPipelinePlan,
     IssueDriftDetail,
     IssueCreateRequest,
     IssueContextPacket,
@@ -99,16 +95,12 @@ from .models import (
     PostgresSchemaPlan,
     PostgresSemanticMaterializationResult,
     PostgresWorkspaceSemanticMaterializationResult,
-    ProjectInfoRecord,
     PromoteSignalRequest,
     RepoGuidanceHealth,
     RepoGuidanceRecord,
     RepoConfigHealth,
     RepoConfigRecord,
-    RepoContextRecord,
     RepoMCPServerRecord,
-    RepoTargetRecord,
-    RepoToolState,
     RepoPathInstructionMatch,
     RepoPathInstructionRecord,
     RunMetrics,
@@ -127,8 +119,6 @@ from .models import (
     SemanticMatchMaterializationRecord,
     ReviewQueueItem,
     RelatedContextRecord,
-    RetrievalSearchHit,
-    RetrievalSearchResult,
     RepoMapSymbolRecord,
     RepoMapSummary,
     SavedIssueView,
@@ -150,7 +140,6 @@ from .models import (
     VerificationProfileReport,
     VerificationProfileUpsertRequest,
     VerificationCommandResult,
-    VerificationOutcomeRegistry,
     VerificationRecord,
     VerificationProfileExecutionResult,
     VerificationSummary,
@@ -177,7 +166,7 @@ from .scanners import (
     list_tree_nodes,
     repo_map_file_role,
 )
-from .semantic import ast_grep_available, detect_ast_grep_language, extract_path_symbols, run_ast_grep_query, tree_sitter_available
+from .semantic import ast_grep_available, detect_ast_grep_language, extract_path_symbols, run_ast_grep_query
 from .store import FileStore
 from .terminal import TerminalService
 
@@ -3102,320 +3091,6 @@ class TrackerService:
             dirty_paths=dirty_paths[:20],
         )
 
-    def read_repo_tool_state(self, workspace_id: str) -> RepoToolState:
-        workspace = self.get_workspace(workspace_id)
-        snapshot = self.store.load_snapshot(workspace_id)
-        return RepoToolState(
-            workspace=workspace,
-            snapshot_summary=dict(snapshot.summary) if snapshot else {},
-            worktree=self.read_worktree_status(workspace_id),
-            repo_map=self.store.load_repo_map(workspace_id),
-            activity_overview=self.read_activity_overview(workspace_id, limit=200),
-            recent_activity=self.list_activity(workspace_id, limit=10),
-            repo_config_health=self.get_workspace_repo_config_health(workspace_id),
-            guidance_health=self.get_workspace_guidance_health(workspace_id),
-        )
-
-    def read_ingestion_plan(self, workspace_id: str) -> IngestionPipelinePlan:
-        workspace = self.get_workspace(workspace_id)
-        snapshot = self.store.load_snapshot(workspace_id)
-        repo_map = self.store.load_repo_map(workspace_id)
-        settings = self.get_settings()
-        postgres_configured = bool((settings.postgres_dsn or "").strip())
-        postgres_schema = settings.postgres_schema
-        tree_sitter_runtime_available = tree_sitter_available()
-        ast_grep_is_available = ast_grep_available()
-        tree_sitter_on_demand_available = tree_sitter_runtime_available and repo_map is not None
-        ast_grep_on_demand_available = repo_map is not None
-
-        run_targets = self.list_run_targets(workspace_id) if snapshot else []
-        verify_targets = self.list_verify_targets(workspace_id) if snapshot else []
-
-        phases: list[IngestionPhaseRecord] = []
-
-        repo_scan_dependencies = [
-            IngestionDependencyRecord(
-                dependency_id="workspace_loaded",
-                kind="workspace",
-                label="Workspace snapshot exists",
-                satisfied=snapshot is not None,
-                detail="A scanned workspace snapshot is required before semantic ingestion can build on repo state.",
-            )
-        ]
-        phases.append(
-            IngestionPhaseRecord(
-                phase_id="repo_scan",
-                label="Repository scan",
-                description="Load the workspace snapshot, issue records, signals, worktree, and high-level tree summary.",
-                implementation_state="implemented",
-                delivery_state="complete" if snapshot else "blocked",
-                dependencies=repo_scan_dependencies,
-                blockers=[] if snapshot else ["Run a workspace scan before semantic ingestion phases can build on repo state."],
-                outputs=["workspace snapshot", "issue inventory", "signal inventory", "worktree status"],
-                evidence=[
-                    f"issues_total={snapshot.summary.get('issues_total', 0)}" if snapshot else "snapshot missing",
-                    f"scanner_version={snapshot.scanner_version}" if snapshot else "scanner unavailable",
-                ],
-            )
-        )
-
-        repo_map_dependencies = [
-            IngestionDependencyRecord(
-                dependency_id="repo_scan_output",
-                kind="artifact",
-                label="Repo scan output",
-                satisfied=snapshot is not None,
-                detail="Repo map generation depends on a scanned workspace snapshot.",
-            )
-        ]
-        phases.append(
-            IngestionPhaseRecord(
-                phase_id="repo_map",
-                label="Repo map",
-                description="Materialize key files, top directories, and source-aware repo shape for downstream indexing.",
-                implementation_state="implemented",
-                delivery_state="complete" if repo_map else "blocked",
-                dependencies=repo_map_dependencies,
-                blockers=[] if repo_map else ["Repo map has not been generated for this workspace yet."],
-                outputs=["key files", "top directories", "source extension counts"],
-                evidence=[
-                    f"total_files={repo_map.total_files}" if repo_map else "repo map missing",
-                    f"source_files={repo_map.source_files}" if repo_map else "source totals unavailable",
-                ],
-            )
-        )
-
-        runtime_dependencies = [
-            IngestionDependencyRecord(
-                dependency_id="repo_scan_for_targets",
-                kind="artifact",
-                label="Workspace scan",
-                satisfied=snapshot is not None,
-                detail="Run and verify target discovery is attached to the scanned workspace state.",
-            )
-        ]
-        phases.append(
-            IngestionPhaseRecord(
-                phase_id="runtime_discovery",
-                label="Runtime discovery",
-                description="Discover run, build, test, lint, and verification targets that explain how to execute the repo.",
-                implementation_state="implemented",
-                delivery_state="complete" if snapshot else "blocked",
-                dependencies=runtime_dependencies,
-                blockers=[] if snapshot else ["Workspace scan must complete before runtime discovery can report targets."],
-                outputs=["run targets", "verify targets"],
-                evidence=[
-                    f"run_targets={len(run_targets)}",
-                    f"verify_targets={len(verify_targets)}",
-                ],
-            )
-        )
-
-        tree_sitter_dependencies = [
-            IngestionDependencyRecord(
-                dependency_id="repo_map_available",
-                kind="artifact",
-                label="Repo map available",
-                satisfied=repo_map is not None,
-                detail="Parser-backed indexing should start from the cleaned repo-map boundary.",
-            ),
-            IngestionDependencyRecord(
-                dependency_id="tree_sitter_on_demand_surface",
-                kind="implementation",
-                label="On-demand symbol extraction surface implemented",
-                satisfied=tree_sitter_on_demand_available,
-                detail="path-symbols, code-explainer, and issue-context symbol ranking already use parser-backed extraction when the runtime is available.",
-            ),
-            IngestionDependencyRecord(
-                dependency_id="postgres_configured",
-                kind="setting",
-                label="Postgres configured",
-                satisfied=postgres_configured,
-                detail="Symbol tables and parser outputs should land in Postgres-backed storage.",
-            ),
-            IngestionDependencyRecord(
-                dependency_id="tree_sitter_library",
-                kind="tool",
-                label="tree-sitter language pack installed",
-                satisfied=tree_sitter_runtime_available,
-                detail="Install the Python tree-sitter language pack before enabling parser-backed extraction.",
-            ),
-        ]
-        tree_sitter_blockers = [
-            dependency.label
-            for dependency in tree_sitter_dependencies
-            if not dependency.satisfied and dependency.dependency_id != "tree_sitter_on_demand_surface"
-        ]
-        phases.append(
-            IngestionPhaseRecord(
-                phase_id="tree_sitter_index",
-                label="tree-sitter indexing",
-                description="Extract symbols, enclosing scopes, and structure-aware file summaries for semantic context.",
-                implementation_state="partial" if tree_sitter_on_demand_available else "planned",
-                delivery_state="ready" if not tree_sitter_blockers else "blocked",
-                dependencies=tree_sitter_dependencies,
-                blockers=tree_sitter_blockers,
-                outputs=["symbols", "scope ranges", "file-to-symbol summaries"],
-                evidence=[
-                    "On-demand parser-backed symbol extraction already feeds path-symbols and code-explainer."
-                    if tree_sitter_on_demand_available
-                    else "Parser-backed symbol extraction has not landed yet.",
-                    "Storage-ready file symbol summary and symbol row previews can now be generated on-demand."
-                    if tree_sitter_on_demand_available
-                    else "No storage-ready parser-backed row builders yet.",
-                    "Ad hoc and workspace-batch Postgres materialization helpers exist for parser-backed symbol rows."
-                    if tree_sitter_on_demand_available
-                    else "No Postgres symbol materialization helpers yet.",
-                    "Durable symbol materialization into Postgres is the next tree-sitter step.",
-                ],
-            )
-        )
-
-        ast_grep_dependencies = [
-            IngestionDependencyRecord(
-                dependency_id="repo_map_available_for_patterns",
-                kind="artifact",
-                label="Repo map available",
-                satisfied=repo_map is not None,
-                detail="Semantic pattern search should operate over the same cleaned repo boundary.",
-            ),
-            IngestionDependencyRecord(
-                dependency_id="ast_grep_surface",
-                kind="implementation",
-                label="Semantic-search surface implemented",
-                satisfied=ast_grep_on_demand_available,
-                detail="semantic-search exists now and issue-context can consume semantic matches when the sg binary is available.",
-            ),
-            IngestionDependencyRecord(
-                dependency_id="postgres_configured_for_patterns",
-                kind="setting",
-                label="Postgres configured",
-                satisfied=postgres_configured,
-                detail="Pattern matches and rule results should be queryable from Postgres-backed storage.",
-            ),
-            IngestionDependencyRecord(
-                dependency_id="ast_grep_binary",
-                kind="tool",
-                label="ast-grep binary installed",
-                satisfied=ast_grep_is_available,
-                detail="Install the sg binary before semantic pattern search can run locally.",
-            ),
-        ]
-        ast_grep_blockers = [
-            dependency.label
-            for dependency in ast_grep_dependencies
-            if not dependency.satisfied and dependency.dependency_id != "ast_grep_surface"
-        ]
-        phases.append(
-            IngestionPhaseRecord(
-                phase_id="ast_grep_rules",
-                label="ast-grep rules",
-                description="Run semantic code queries and rule-backed pattern checks for issue-shaped retrieval and impact hints.",
-                implementation_state="partial" if ast_grep_on_demand_available else "planned",
-                delivery_state="ready" if not ast_grep_blockers else "blocked",
-                dependencies=ast_grep_dependencies,
-                blockers=ast_grep_blockers,
-                outputs=["pattern matches", "rule hits", "structural search seeds"],
-                evidence=[
-                    "semantic-search tool surface implemented and issue-context aware.",
-                    "Storage-ready semantic query and match row previews can now be generated on-demand.",
-                    "ast-grep available" if ast_grep_is_available else "ast-grep unavailable",
-                    "Durable semantic query and match materialization is still pending.",
-                ],
-            )
-        )
-
-        lsp_dependencies = [
-            IngestionDependencyRecord(
-                dependency_id="semantic_core_first",
-                kind="implementation",
-                label="tree-sitter and ast-grep tranche landed",
-                satisfied=True,
-                detail="The structural semantic tranche already landed, so live LSP reads and durable diagnostics build on that floor instead of bypassing it.",
-            ),
-            IngestionDependencyRecord(
-                dependency_id="postgres_configured_for_lsp",
-                kind="setting",
-                label="Postgres configured",
-                satisfied=postgres_configured,
-                detail="LSP diagnostics and symbol links should be persisted alongside the semantic graph.",
-            ),
-        ]
-        phases.append(
-            IngestionPhaseRecord(
-                phase_id="lsp_enrichment",
-                label="LSP enrichment",
-                description="Attach live definitions, references, workspace symbols, and diagnostics through a workspace LSP manager.",
-                implementation_state="implemented",
-                delivery_state="complete" if postgres_configured else "blocked",
-                dependencies=lsp_dependencies,
-                blockers=[] if postgres_configured else ["Configure Postgres so diagnostics baselines can persist and link to durable repo/run state."],
-                outputs=["definitions", "references", "diagnostics", "workspace symbols"],
-                evidence=[
-                    "Go-owned workspace LSP routes now serve go-to-definition, references, document symbols, workspace symbols, and live diagnostics.",
-                    "Diagnostics baselines now persist run linkage, semantic baseline anchors, replay payload provenance, and durable symbol-link context.",
-                    "Rust owns diagnostics normalization and conservative diagnostic-to-symbol link decisions behind the Go delivery surface.",
-                ],
-            )
-        )
-
-        search_dependencies = [
-            IngestionDependencyRecord(
-                dependency_id="postgres_configured_for_search",
-                kind="setting",
-                label="Postgres configured",
-                satisfied=postgres_configured,
-                detail="Hybrid retrieval starts from Postgres-backed lexical and artifact indexes.",
-            ),
-            IngestionDependencyRecord(
-                dependency_id="symbol_materialization",
-                kind="implementation",
-                label="Symbol and edge materialization landed",
-                satisfied=False,
-                detail="Search quality depends on symbols and structural edges being materialized first.",
-            ),
-        ]
-        search_blockers = ["Depends on symbol and edge materialization before hybrid retrieval can be trusted."]
-        if not postgres_configured:
-            search_blockers.insert(0, "Postgres configured")
-        phases.append(
-            IngestionPhaseRecord(
-                phase_id="search_materialization",
-                label="Search materialization",
-                description="Build lexical, structural, and later semantic retrieval surfaces over repo and artifact state.",
-                implementation_state="planned",
-                delivery_state="blocked",
-                dependencies=search_dependencies,
-                blockers=search_blockers,
-                outputs=["search indexes", "retrieval ledger inputs", "impact retrieval seeds"],
-                evidence=[f"postgres_schema={postgres_schema}"],
-            )
-        )
-
-        ready_phase_ids = [
-            phase.phase_id
-            for phase in phases
-            if phase.delivery_state == "ready"
-        ]
-        blocked_phase_ids = [
-            phase.phase_id
-            for phase in phases
-            if phase.delivery_state == "blocked"
-        ]
-        next_phase_id = ready_phase_ids[0] if ready_phase_ids else None
-        completed_phase_count = sum(1 for phase in phases if phase.delivery_state == "complete")
-        return IngestionPipelinePlan(
-            workspace_id=workspace_id,
-            root_path=workspace.root_path,
-            postgres_configured=postgres_configured,
-            postgres_schema=postgres_schema,
-            phases=phases,
-            completed_phase_count=completed_phase_count,
-            ready_phase_ids=ready_phase_ids,
-            blocked_phase_ids=blocked_phase_ids,
-            next_phase_id=next_phase_id,
-        )
-
     def read_change_summary(self, workspace_id: str, base_ref: str = "HEAD") -> RepoChangeSummary:
         workspace = self.get_workspace(workspace_id)
         root = Path(workspace.root_path)
@@ -3456,57 +3131,7 @@ class TrackerService:
             self._run_go_workspace_json("impact", workspace_id, ["--base-ref", base_ref])
         )
 
-    def read_repo_context(self, workspace_id: str, base_ref: str = "HEAD") -> RepoContextRecord:
-        return RepoContextRecord.model_validate(
-            self._run_go_workspace_json("repo-context", workspace_id, ["--base-ref", base_ref])
-        )
-
-    def read_project_info(self, workspace_id: str) -> ProjectInfoRecord:
-        return ProjectInfoRecord.model_validate(
-            self._run_go_workspace_json("project-info", workspace_id)
-        )
-
-    def read_verification_outcomes(self, workspace_id: str) -> VerificationOutcomeRegistry:
-        return VerificationOutcomeRegistry.model_validate(
-            self._run_go_workspace_json("verification-outcomes", workspace_id)
-        )
-
-    def list_run_targets(self, workspace_id: str) -> list[RepoTargetRecord]:
-        self.get_workspace(workspace_id)
-        try:
-            payload = self._run_go_workspace_json("run-targets", workspace_id)
-            return [RepoTargetRecord.model_validate(item) for item in payload]
-        except Exception:
-            workspace = self.get_workspace(workspace_id)
-            root = Path(workspace.root_path)
-            targets = self._discover_targets(root, include_verify=False)
-            return sorted(targets, key=lambda item: (item.kind, item.label, item.command))
-
-    def list_verify_targets(self, workspace_id: str) -> list[RepoTargetRecord]:
-        self.get_workspace(workspace_id)
-        try:
-            payload = self._run_go_workspace_json("verify-targets", workspace_id)
-            return [RepoTargetRecord.model_validate(item) for item in payload]
-        except Exception:
-            workspace = self.get_workspace(workspace_id)
-            root = Path(workspace.root_path)
-            targets = self._discover_targets(root, include_verify=True)
-            profile_targets = [
-                RepoTargetRecord(
-                    target_id=f"verify-profile-{profile.profile_id}",
-                    kind="verify",
-                    label=f"verification profile: {profile.name}",
-                    command=profile.test_command,
-                    source="verification_profile",
-                    source_path="verification_profiles.json",
-                    confidence=95,
-                )
-                for profile in self.list_verification_profiles(workspace_id)
-            ]
-            deduped = self._dedupe_targets([*targets, *profile_targets])
-            return sorted(deduped, key=lambda item: (item.kind, item.label, item.command))
-
-    def read_path_symbols(self, workspace_id: str, relative_path: str) -> PathSymbolsResult:
+    def _read_go_path_symbols(self, workspace_id: str, relative_path: str) -> PathSymbolsResult:
         return PathSymbolsResult.model_validate(
             self._run_go_workspace_json("path-symbols", workspace_id, ["--path", relative_path])
         )
@@ -3529,28 +3154,12 @@ class TrackerService:
             self._run_go_workspace_json("semantic-search", workspace_id, flags)
         )
 
-    def search_retrieval(
-        self,
-        workspace_id: str,
-        query: str,
-        *,
-        limit: int = 12,
-    ) -> RetrievalSearchResult:
-        return RetrievalSearchResult.model_validate(
-            self._run_go_workspace_json("retrieval-search", workspace_id, ["--query", query, "--limit", str(limit)])
-        )
-
     def _query_tokens(self, query: str) -> list[str]:
         return [
             token
             for token in self._dedupe_text(re.findall(r"[A-Za-z0-9_]{3,}", query.lower()))
             if token not in {"the", "and", "for", "with", "from", "that", "this"}
         ][:16]
-
-    def explain_path(self, workspace_id: str, relative_path: str) -> CodeExplainerResult:
-        return CodeExplainerResult.model_validate(
-            self._run_go_workspace_json("explain-path", workspace_id, ["--path", relative_path])
-        )
 
     def _resolve_workspace_file(self, root: Path, relative_path: str) -> tuple[str, Path]:
         normalized = relative_path.strip().lstrip("./")
@@ -3762,157 +3371,6 @@ class TrackerService:
             or ".test." in name
             or ".spec." in name
         )
-
-    def _discover_targets(self, root: Path, include_verify: bool) -> list[RepoTargetRecord]:
-        targets: list[RepoTargetRecord] = []
-        targets.extend(self._discover_make_targets(root, include_verify=include_verify))
-        targets.extend(self._discover_package_targets(root, include_verify=include_verify))
-        targets.extend(self._discover_docker_targets(root))
-        return self._dedupe_targets(targets)
-
-    def _discover_make_targets(self, root: Path, include_verify: bool) -> list[RepoTargetRecord]:
-        makefile = root / "Makefile"
-        if not makefile.exists():
-            return []
-        targets: list[RepoTargetRecord] = []
-        pattern = re.compile(r"^([A-Za-z0-9_.-]+):")
-        for line in makefile.read_text(encoding="utf-8", errors="ignore").splitlines():
-            match = pattern.match(line)
-            if not match:
-                continue
-            target_name = match.group(1)
-            if target_name.startswith("."):
-                continue
-            kind = self._categorize_target_name(target_name)
-            if kind == "verify" and not include_verify:
-                continue
-            if not include_verify and kind in {"test", "lint", "verify"}:
-                continue
-            if include_verify and kind not in {"test", "lint", "verify", "build"}:
-                continue
-            targets.append(
-                RepoTargetRecord(
-                    target_id=f"make-{target_name}",
-                    kind=kind,
-                    label=f"make {target_name}",
-                    command=f"make {target_name}",
-                    source="makefile",
-                    source_path="Makefile",
-                    confidence=80,
-                )
-            )
-        return targets
-
-    def _discover_package_targets(self, root: Path, include_verify: bool) -> list[RepoTargetRecord]:
-        targets: list[RepoTargetRecord] = []
-        for manifest in self._iter_candidate_package_json(root):
-            try:
-                payload = json.loads(manifest.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                continue
-            scripts = payload.get("scripts") if isinstance(payload, dict) else None
-            if not isinstance(scripts, dict):
-                continue
-            prefix = manifest.parent.relative_to(root).as_posix()
-            run_prefix = f"cd {prefix} && " if prefix not in {"", "."} else ""
-            for name, command in scripts.items():
-                if not isinstance(command, str):
-                    continue
-                kind = self._categorize_target_name(name)
-                if kind == "verify" and not include_verify:
-                    continue
-                if not include_verify and kind in {"test", "lint", "verify"}:
-                    continue
-                if include_verify and kind not in {"test", "lint", "verify", "build"}:
-                    continue
-                label_prefix = prefix if prefix not in {"", "."} else manifest.name
-                targets.append(
-                    RepoTargetRecord(
-                        target_id=f"pkg-{hashlib.sha1(f'{manifest}:{name}'.encode('utf-8')).hexdigest()[:12]}",
-                        kind=kind,
-                        label=f"{label_prefix}:{name}",
-                        command=f"{run_prefix}npm run {name}",
-                        source="package_json",
-                        source_path=manifest.relative_to(root).as_posix(),
-                        confidence=85,
-                    )
-                )
-        return targets
-
-    def _discover_docker_targets(self, root: Path) -> list[RepoTargetRecord]:
-        targets: list[RepoTargetRecord] = []
-        for candidate in ("docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml"):
-            path = root / candidate
-            if not path.exists():
-                continue
-            targets.append(
-                RepoTargetRecord(
-                    target_id=f"docker-{candidate}",
-                    kind="service",
-                    label=f"docker compose up ({candidate})",
-                    command=f"docker compose -f {candidate} up",
-                    source="docker_compose",
-                    source_path=candidate,
-                    confidence=75,
-                )
-            )
-        return targets
-
-    def _iter_candidate_package_json(self, root: Path) -> list[Path]:
-        candidates: list[Path] = []
-        queue = [root]
-        max_depth = 2
-        excluded = {
-            ".git",
-            "node_modules",
-            "dist",
-            "build",
-            "coverage",
-            "research",
-            "__pycache__",
-            ".venv",
-            "venv",
-        }
-        while queue:
-            current = queue.pop(0)
-            depth = len(current.relative_to(root).parts)
-            package_json = current / "package.json"
-            if package_json.exists():
-                candidates.append(package_json)
-            if depth >= max_depth:
-                continue
-            try:
-                children = sorted([item for item in current.iterdir() if item.is_dir()], key=lambda item: item.name)
-            except OSError:
-                continue
-            for child in children:
-                if child.name in excluded:
-                    continue
-                queue.append(child)
-        return candidates
-
-    def _dedupe_targets(self, targets: list[RepoTargetRecord]) -> list[RepoTargetRecord]:
-        deduped: dict[tuple[str, str], RepoTargetRecord] = {}
-        for target in targets:
-            key = (target.kind, target.command)
-            existing = deduped.get(key)
-            if not existing or target.confidence > existing.confidence:
-                deduped[key] = target
-        return list(deduped.values())
-
-    def _categorize_target_name(self, name: str) -> str:
-        lowered = name.lower()
-        if any(token in lowered for token in ("test", "pytest", "spec", "check")):
-            return "test"
-        if "lint" in lowered or "format" in lowered or lowered == "fmt":
-            return "lint"
-        if "build" in lowered or "compile" in lowered:
-            return "build"
-        if any(token in lowered for token in ("dev", "serve", "start", "run", "backend", "frontend")):
-            return "dev"
-        if "verify" in lowered or "validate" in lowered:
-            return "verify"
-        return "other"
 
     def _map_git_diff_status(self, code: str) -> str:
         return {
@@ -7975,7 +7433,7 @@ Respond with a JSON object containing:
             if file_path.suffix.lower() not in {".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".rs", ".java"}:
                 continue
             try:
-                path_symbols = self.read_path_symbols(workspace_id, path)
+                path_symbols = self._read_go_path_symbols(workspace_id, path)
             except (FileNotFoundError, OSError, ValueError):
                 continue
             for record in path_symbols.symbols[:20]:

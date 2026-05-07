@@ -417,39 +417,6 @@ class SemanticIndexStatus(BaseModel):
     generated_at: str = Field(default_factory=utc_now)
 
 
-class IngestionDependencyRecord(BaseModel):
-    dependency_id: str
-    kind: Literal["workspace", "artifact", "setting", "tool", "implementation"] = "artifact"
-    label: str
-    satisfied: bool = False
-    detail: Optional[str] = None
-
-
-class IngestionPhaseRecord(BaseModel):
-    phase_id: IngestionPhaseId
-    label: str
-    description: str
-    implementation_state: IngestionImplementationState = "planned"
-    delivery_state: IngestionDeliveryState = "blocked"
-    dependencies: list[IngestionDependencyRecord] = Field(default_factory=list)
-    blockers: list[str] = Field(default_factory=list)
-    outputs: list[str] = Field(default_factory=list)
-    evidence: list[str] = Field(default_factory=list)
-
-
-class IngestionPipelinePlan(BaseModel):
-    workspace_id: str
-    root_path: str
-    postgres_configured: bool = False
-    postgres_schema: str = "xmustard"
-    phases: list[IngestionPhaseRecord] = Field(default_factory=list)
-    completed_phase_count: int = 0
-    ready_phase_ids: list[IngestionPhaseId] = Field(default_factory=list)
-    blocked_phase_ids: list[IngestionPhaseId] = Field(default_factory=list)
-    next_phase_id: Optional[IngestionPhaseId] = None
-    generated_at: str = Field(default_factory=utc_now)
-
-
 class RepoChangeRecord(BaseModel):
     path: str
     status: Literal["modified", "added", "deleted", "renamed", "copied", "untracked", "unknown"] = "unknown"
@@ -521,12 +488,6 @@ class RepoTargetRecord(BaseModel):
 ProjectInfoVerdict = Literal["declared", "runtime_observed", "config_backed", "inferred_needs_review", "unavailable"]
 ProjectInfoSourceKind = Literal["package_json", "makefile", "docker_compose", "verification_profile", "pyproject_toml", "cargo_toml", "runtime_probe"]
 ProjectInfoEvidenceType = Literal["manifest_file", "saved_config", "declared_command", "derived_command", "entry_file", "runtime_binary_lookup", "compose_service"]
-VerificationObservationKind = Literal["none", "verification_profile_execution"]
-VerificationOutcomeState = Literal["success", "failure", "unknown"]
-VerificationOutcomeStatus = Literal["passed", "failed", "never_observed"]
-VerificationMatchBasis = Literal["none", "profile_id_exact"]
-
-
 class ProjectInfoProvenance(BaseModel):
     source_kind: ProjectInfoSourceKind
     source_file: Optional[str] = None
@@ -606,68 +567,6 @@ class ProjectInfoRecord(BaseModel):
     root_path: str
     static_truth: ProjectInfoStaticTruth
     runtime_truth: ProjectInfoRuntimeTruth
-    generated_at: str = Field(default_factory=utc_now)
-
-
-class VerificationOutcomeEvidenceRef(BaseModel):
-    kind: str
-    path: Optional[str] = None
-    artifact_id: Optional[str] = None
-    created_at: Optional[str] = None
-    summary: Optional[str] = None
-
-
-class ObservedVerificationOutcome(BaseModel):
-    observation_kind: VerificationObservationKind = "none"
-    match_basis: VerificationMatchBasis = "none"
-    state: VerificationOutcomeState = "unknown"
-    last_status: VerificationOutcomeStatus = "never_observed"
-    last_run_at: Optional[str] = None
-    command_executed: Optional[str] = None
-    cwd: Optional[str] = None
-    exit_code: Optional[int] = None
-    timed_out: Optional[bool] = None
-    run_id: Optional[str] = None
-    verification_id: Optional[str] = None
-    issue_id: Optional[str] = None
-    execution_id: Optional[str] = None
-    coverage_result_id: Optional[str] = None
-    coverage_report_path: Optional[str] = None
-    branch: Optional[str] = None
-    head_sha: Optional[str] = None
-    observed_truth_source: str = "none"
-    evidence_refs: list[VerificationOutcomeEvidenceRef] = Field(default_factory=list)
-    reason: Optional[str] = None
-
-
-class VerificationOutcomeRecord(BaseModel):
-    target: RepoTargetRecord
-    observed: ObservedVerificationOutcome
-
-
-class VerificationOutcomeRegistry(BaseModel):
-    workspace_id: str
-    root_path: str
-    items: list[VerificationOutcomeRecord] = Field(default_factory=list)
-    warnings: list[str] = Field(default_factory=list)
-    generated_at: str = Field(default_factory=utc_now)
-
-
-class CodeExplainerResult(BaseModel):
-    workspace_id: str
-    path: str
-    role: Literal["guide", "config", "entry", "test", "source", "doc", "asset", "unknown"] = "unknown"
-    line_count: int = 0
-    import_count: int = 0
-    detected_symbols: list[str] = Field(default_factory=list)
-    symbol_source: Literal["tree_sitter", "regex", "none"] = "none"
-    parser_language: Optional[str] = None
-    evidence_source: Literal["stored_semantic", "on_demand_parser", "rust_semantic_core"] = "on_demand_parser"
-    selection_reason: str = ""
-    semantic_status: Optional["SemanticIndexStatus"] = None
-    summary: str
-    hints: list[str] = Field(default_factory=list)
-    warnings: list[str] = Field(default_factory=list)
     generated_at: str = Field(default_factory=utc_now)
 
 
@@ -827,18 +726,6 @@ class ActivityOverview(BaseModel):
     top_actions: list[ActivityRollupItem] = Field(default_factory=list)
     top_entities: list[ActivityRollupItem] = Field(default_factory=list)
     most_recent_at: Optional[str] = None
-
-
-class RepoToolState(BaseModel):
-    workspace: WorkspaceRecord
-    snapshot_summary: dict[str, int] = Field(default_factory=dict)
-    worktree: WorktreeStatus = Field(default_factory=WorktreeStatus)
-    repo_map: Optional[RepoMapSummary] = None
-    activity_overview: Optional[ActivityOverview] = None
-    recent_activity: list[ActivityRecord] = Field(default_factory=list)
-    repo_config_health: Optional["RepoConfigHealth"] = None
-    guidance_health: Optional["RepoGuidanceHealth"] = None
-    generated_at: str = Field(default_factory=utc_now)
 
 
 class LocalAgentCapabilities(BaseModel):
@@ -1636,24 +1523,6 @@ class ContextRetrievalLedgerEntry(BaseModel):
     score: int = 0
 
 
-class RetrievalSearchHit(BaseModel):
-    path: str
-    source_type: Literal["lexical_hit", "structural_hit", "stored_symbol", "stored_semantic_match"] = "lexical_hit"
-    title: str
-    reason: str
-    matched_terms: list[str] = Field(default_factory=list)
-    score: int = 0
-
-
-class RetrievalSearchResult(BaseModel):
-    workspace_id: str
-    query: str
-    hits: list[RetrievalSearchHit] = Field(default_factory=list)
-    retrieval_ledger: list[ContextRetrievalLedgerEntry] = Field(default_factory=list)
-    warnings: list[str] = Field(default_factory=list)
-    generated_at: str = Field(default_factory=utc_now)
-
-
 class DynamicContextBundle(BaseModel):
     symbol_context: list[RepoMapSymbolRecord] = Field(default_factory=list)
     semantic_matches: list[SemanticPatternMatchRecord] = Field(default_factory=list)
@@ -1732,59 +1601,6 @@ class IssueContextPacket(BaseModel):
     matched_path_instructions: list[RepoPathInstructionMatch] = Field(default_factory=list)
     worktree: Optional[WorktreeStatus] = None
     prompt: str
-
-
-class RepoContextTargetLink(BaseModel):
-    target: RepoTargetRecord
-    reason: str
-    score: int = 0
-
-
-class RepoContextPlanLink(BaseModel):
-    run_id: str
-    issue_id: str
-    status: RunStatus
-    phase: Optional[PlanPhase] = None
-    ownership_mode: Optional[PlanOwnershipMode] = None
-    owner_label: Optional[str] = None
-    attached_files: list[str] = Field(default_factory=list)
-    reason: str
-    score: int = 0
-
-
-class RepoContextActivityLink(BaseModel):
-    action: str
-    summary: str
-    issue_id: Optional[str] = None
-    run_id: Optional[str] = None
-    created_at: str
-    reason: str
-    score: int = 0
-
-
-class RepoContextFixLink(BaseModel):
-    fix_id: str
-    issue_id: str
-    run_id: Optional[str] = None
-    summary: str
-    changed_files: list[str] = Field(default_factory=list)
-    tests_run: list[str] = Field(default_factory=list)
-    recorded_at: str
-    reason: str
-
-
-class RepoContextRecord(BaseModel):
-    workspace_id: str
-    base_ref: str = "HEAD"
-    semantic_status: Optional[SemanticIndexStatus] = None
-    impact: ImpactReport
-    run_targets: list[RepoContextTargetLink] = Field(default_factory=list)
-    verify_targets: list[RepoContextTargetLink] = Field(default_factory=list)
-    plan_links: list[RepoContextPlanLink] = Field(default_factory=list)
-    recent_activity: list[RepoContextActivityLink] = Field(default_factory=list)
-    latest_accepted_fix: Optional[RepoContextFixLink] = None
-    retrieval_ledger: list[ContextRetrievalLedgerEntry] = Field(default_factory=list)
-    generated_at: str = Field(default_factory=utc_now)
 
 
 class RepoGuidanceRecord(BaseModel):

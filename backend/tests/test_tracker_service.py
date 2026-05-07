@@ -6,7 +6,6 @@ from unittest.mock import patch
 
 from app.models import (
     BrowserDumpUpsertRequest,
-    CodeExplainerResult,
     DiscoverySignal,
     EvidenceRef,
     EvalScenarioUpsertRequest,
@@ -2368,7 +2367,7 @@ class RuntimeSummaryTests(unittest.TestCase):
             )
             self.assertIn("run_eval_exec_001", updated.run_ids)
 
-    def test_repo_tool_surfaces_cover_state_targets_changes_and_explainer(self):
+    def test_workspace_scan_keeps_go_owned_project_truth_in_snapshot(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir) / "repo"
             (root / "docs" / "bugs").mkdir(parents=True)
@@ -2436,11 +2435,7 @@ class RuntimeSummaryTests(unittest.TestCase):
 
             source_file.write_text("import json\n\ndef render_payload():\n    return {'status': 'changed'}\n", encoding="utf-8")
 
-            repo_state = service.read_repo_tool_state(snapshot.workspace.workspace_id)
-            self.assertEqual(repo_state.workspace.workspace_id, snapshot.workspace.workspace_id)
-            self.assertIn("issues_total", repo_state.snapshot_summary)
-
-            run_targets = service.list_run_targets(snapshot.workspace.workspace_id)
+            run_targets = snapshot.run_targets
             self.assertTrue(any(item.command == "npm run dev" for item in run_targets))
             self.assertTrue(any(item.command == "make backend" for item in run_targets))
             pyproject_target = next(item for item in run_targets if item.command == "cd backend && python3 -m app.cli")
@@ -2453,7 +2448,7 @@ class RuntimeSummaryTests(unittest.TestCase):
             self.assertEqual(cargo_target.working_dir, "rust-core")
             self.assertEqual(cargo_target.entry_path, "rust-core/src/bin/fixture-core.rs")
 
-            verify_targets = service.list_verify_targets(snapshot.workspace.workspace_id)
+            verify_targets = snapshot.verify_targets
             self.assertTrue(any(item.command == "pytest -q" for item in verify_targets))
             self.assertTrue(any(item.command == "npm run test" for item in verify_targets))
             cargo_verify_target = next(item for item in verify_targets if item.command == "cd rust-core && cargo test")
@@ -2461,7 +2456,8 @@ class RuntimeSummaryTests(unittest.TestCase):
             self.assertEqual(cargo_verify_target.working_dir, "rust-core")
             self.assertIn("cargo test", cargo_verify_target.reason or "")
 
-            project_info = service.read_project_info(snapshot.workspace.workspace_id)
+            assert snapshot.project_info is not None
+            project_info = snapshot.project_info
             self.assertTrue(any(item.command == "npm run dev" for item in project_info.static_truth.run_targets))
             self.assertTrue(any(item.command == "pytest -q" for item in project_info.static_truth.verify_targets))
             self.assertTrue(any(item.name == "api" for item in project_info.static_truth.services))
@@ -2471,11 +2467,6 @@ class RuntimeSummaryTests(unittest.TestCase):
 
             changes = service.read_change_summary(snapshot.workspace.workspace_id)
             self.assertTrue(any(item.path == "api/src/example.py" for item in changes.changed_files))
-
-            explained = service.explain_path(snapshot.workspace.workspace_id, "api/src/example.py")
-            self.assertEqual(explained.role, "source")
-            self.assertIn("render_payload", explained.detected_symbols)
-            self.assertIn("api/src/example.py", explained.summary)
 
     def test_postgres_schema_plan_and_bootstrap_follow_settings(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -3037,7 +3028,7 @@ class RuntimeSummaryTests(unittest.TestCase):
                 "warnings": [],
             }
             with patch.object(service, "_run_go_workspace_json", return_value=go_payload) as go_mock:
-                result = service.read_path_symbols(snapshot.workspace.workspace_id, "api/src/example.py")
+                result = service._read_go_path_symbols(snapshot.workspace.workspace_id, "api/src/example.py")
 
             self.assertEqual(result.evidence_source, "rust_semantic_core")
             self.assertEqual(result.symbols[0].symbol, "render_payload")
@@ -3083,7 +3074,7 @@ class RuntimeSummaryTests(unittest.TestCase):
                 "warnings": [],
             }
             with patch.object(service, "_run_go_workspace_json", return_value=go_payload) as go_mock:
-                result = service.read_path_symbols(snapshot.workspace.workspace_id, "api/src/example.py")
+                result = service._read_go_path_symbols(snapshot.workspace.workspace_id, "api/src/example.py")
 
             self.assertEqual(result.evidence_source, "rust_semantic_core")
             self.assertEqual(result.symbols[0].evidence_source, "rust_semantic_core")
@@ -3131,7 +3122,7 @@ class RuntimeSummaryTests(unittest.TestCase):
             self.assertEqual(packet.semantic_status.status, "fresh")
             self.assertIn("Semantic freshness:", packet.prompt)
 
-    def test_impact_and_repo_context_surface_changed_symbols_tests_and_plan_links(self):
+    def test_impact_surface_reports_changed_symbols_and_tests(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir) / "repo"
             (root / "api" / "src").mkdir(parents=True)
@@ -3211,20 +3202,10 @@ class RuntimeSummaryTests(unittest.TestCase):
             )
 
             impact = service.read_impact(snapshot.workspace.workspace_id)
-            repo_context = service.read_repo_context(snapshot.workspace.workspace_id)
-
             self.assertTrue(any(item.symbol == "render_payload" for item in impact.changed_symbols))
             self.assertTrue(any(item.path == "tests/test_render_payload.py" for item in impact.likely_affected_tests))
             self.assertIn("changed file", impact.derivation_summary)
             self.assertIn(impact.confidence, {"medium", "high"})
-            self.assertTrue(repo_context.plan_links)
-            self.assertIsNotNone(repo_context.latest_accepted_fix)
-            self.assertTrue(repo_context.retrieval_ledger)
-            self.assertTrue(any(item.source_type in {"lexical_hit", "structural_hit"} for item in repo_context.retrieval_ledger))
-
-            retrieval = service.search_retrieval(snapshot.workspace.workspace_id, "render payload", limit=5)
-            self.assertTrue(retrieval.hits)
-            self.assertTrue(retrieval.retrieval_ledger)
 
     def test_delta_commands_use_last_run_and_accepted_fix_heads(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -3391,58 +3372,27 @@ class RuntimeSummaryTests(unittest.TestCase):
             self.assertEqual(len(approved["revisions"]), 3)
             start_approved_run.assert_called_once()
 
-    def test_ingestion_plan_reports_completed_ready_and_blocked_phases(self):
+    def test_python_repo_truth_shims_are_retired(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
-            root = Path(tmp_dir) / "repo"
-            (root / "docs" / "bugs").mkdir(parents=True)
-            (root / "api" / "src").mkdir(parents=True)
-            (root / "docs" / "bugs" / "Bugs_25260323.md").write_text(LEDGER_TEXT, encoding="utf-8")
-            (root / "api" / "src" / "example.py").write_text("def render_payload():\n    return {'status': 'ok'}\n", encoding="utf-8")
-            (root / "package.json").write_text(
-                json.dumps({"name": "fixture", "scripts": {"dev": "vite", "test": "vitest run"}}),
-                encoding="utf-8",
-            )
-            (root / "Makefile").write_text("backend:\n\tpython3 -m uvicorn app.main:app\n", encoding="utf-8")
+            service = TrackerService(FileStore(Path(tmp_dir) / "data"))
 
-            store = FileStore(Path(tmp_dir) / "data")
-            service = TrackerService(store)
-            snapshot = service.load_workspace(WorkspaceLoadRequest(root_path=str(root), auto_scan=True))
-            assert snapshot is not None
-            service.update_settings(
-                service.get_settings().model_copy(
-                    update={
-                        "postgres_dsn": "postgresql://xmustard:secret@localhost:5432/xmustard",
-                        "postgres_schema": "agent_context",
-                    }
-                )
-            )
+            for attr in [
+                "read_repo_tool_state",
+                "read_ingestion_plan",
+                "list_run_targets",
+                "list_verify_targets",
+                "read_repo_context",
+                "read_project_info",
+                "read_verification_outcomes",
+                "search_retrieval",
+                "read_path_symbols",
+                "explain_path",
+            ]:
+                self.assertFalse(hasattr(service, attr), msg=attr)
 
-            with patch("app.service.tree_sitter_available", return_value=True):
-                with patch("app.service.shutil.which", return_value="/opt/homebrew/bin/sg"):
-                    plan = service.read_ingestion_plan(snapshot.workspace.workspace_id)
+            self.assertTrue(hasattr(service, "_read_go_path_symbols"))
 
-            self.assertEqual(plan.completed_phase_count, 4)
-            self.assertEqual(plan.next_phase_id, "tree_sitter_index")
-            self.assertIn("tree_sitter_index", plan.ready_phase_ids)
-            self.assertIn("ast_grep_rules", plan.ready_phase_ids)
-            self.assertIn("search_materialization", plan.blocked_phase_ids)
-            self.assertNotIn("lsp_enrichment", plan.blocked_phase_ids)
-
-            phases = {item.phase_id: item for item in plan.phases}
-            self.assertEqual(phases["repo_scan"].delivery_state, "complete")
-            self.assertEqual(phases["repo_map"].delivery_state, "complete")
-            self.assertEqual(phases["runtime_discovery"].delivery_state, "complete")
-            self.assertEqual(phases["tree_sitter_index"].implementation_state, "partial")
-            self.assertEqual(phases["tree_sitter_index"].delivery_state, "ready")
-            self.assertEqual(phases["ast_grep_rules"].implementation_state, "partial")
-            self.assertEqual(phases["ast_grep_rules"].delivery_state, "ready")
-            self.assertEqual(phases["lsp_enrichment"].implementation_state, "implemented")
-            self.assertEqual(phases["lsp_enrichment"].delivery_state, "complete")
-            self.assertTrue(any("go-to-definition" in item for item in phases["lsp_enrichment"].evidence))
-            self.assertTrue(any("On-demand parser-backed symbol extraction" in item for item in phases["tree_sitter_index"].evidence))
-            self.assertTrue(any(item.startswith("total_files=") for item in phases["repo_map"].evidence))
-
-    def test_path_symbols_and_explainer_prefer_rust_semantic_contracts_when_stored_rows_are_absent(self):
+    def test_path_symbols_prefer_rust_semantic_contracts_when_stored_rows_are_absent(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir) / "repo"
             (root / "docs" / "bugs").mkdir(parents=True)
@@ -3515,34 +3465,15 @@ class RuntimeSummaryTests(unittest.TestCase):
                     ),
                 ],
             )
-            rust_explainer = CodeExplainerResult(
-                workspace_id=snapshot.workspace.workspace_id,
-                path="api/src/example.py",
-                role="source",
-                line_count=3,
-                import_count=0,
-                detected_symbols=["ApiHandler", "render_payload"],
-                symbol_source="tree_sitter",
-                parser_language="python",
-                evidence_source="rust_semantic_core",
-                selection_reason="Rust semantic core owns code-explainer semantic substrate for this path.",
-                summary="api/src/example.py looks like a source file with 3 line(s). Top-level symbols include ApiHandler, render_payload.",
-                hints=["This is likely part of the code path that an agent may need to inspect or edit."],
-            )
-
             def fake_go_workspace(action: str, workspace_id_arg: str, flags=None):
                 self.assertEqual(workspace_id_arg, snapshot.workspace.workspace_id)
                 if action == "path-symbols":
                     self.assertEqual(flags, ["--path", "api/src/example.py"])
                     return rust_path_symbols.model_dump(mode="json")
-                if action == "explain-path":
-                    self.assertEqual(flags, ["--path", "api/src/example.py"])
-                    return rust_explainer.model_dump(mode="json")
                 raise AssertionError(f"unexpected Go workspace action: {action}")
 
             with patch.object(service, "_run_go_workspace_json", side_effect=fake_go_workspace) as go_mock:
-                result = service.read_path_symbols(snapshot.workspace.workspace_id, "api/src/example.py")
-                explained = service.explain_path(snapshot.workspace.workspace_id, "api/src/example.py")
+                result = service._read_go_path_symbols(snapshot.workspace.workspace_id, "api/src/example.py")
 
             self.assertEqual(result.symbol_source, "tree_sitter")
             self.assertEqual(result.parser_language, "python")
@@ -3554,11 +3485,7 @@ class RuntimeSummaryTests(unittest.TestCase):
             self.assertEqual(result.file_summary_row.symbol_source, "tree_sitter")
             self.assertEqual(result.file_summary_row.summary_json["top_symbols"], ["ApiHandler", "render_payload"])
             self.assertEqual([item.symbol for item in result.symbol_rows], ["ApiHandler", "render_payload"])
-            self.assertEqual(explained.symbol_source, "tree_sitter")
-            self.assertEqual(explained.parser_language, "python")
-            self.assertEqual(explained.evidence_source, "rust_semantic_core")
-            self.assertIn("render_payload", explained.detected_symbols)
-            self.assertEqual(go_mock.call_count, 2)
+            self.assertEqual(go_mock.call_count, 1)
 
     def test_path_symbols_returns_storage_ready_rows_from_go(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -3622,7 +3549,7 @@ class RuntimeSummaryTests(unittest.TestCase):
                 "warnings": [],
             }
             with patch.object(service, "_run_go_workspace_json", return_value=go_payload) as go_mock:
-                result = service.read_path_symbols(snapshot.workspace.workspace_id, "api/src/example.py")
+                result = service._read_go_path_symbols(snapshot.workspace.workspace_id, "api/src/example.py")
 
             self.assertEqual([item.symbol for item in result.symbols], ["render_payload"])
             self.assertEqual(result.symbol_source, "tree_sitter")
@@ -3632,54 +3559,6 @@ class RuntimeSummaryTests(unittest.TestCase):
             self.assertEqual([item.symbol for item in result.symbol_rows], ["render_payload"])
             go_mock.assert_called_once_with(
                 "path-symbols",
-                snapshot.workspace.workspace_id,
-                ["--path", "api/src/example.py"],
-            )
-
-    def test_code_explainer_delegates_to_go(self):
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            root = Path(tmp_dir) / "repo"
-            (root / "docs" / "bugs").mkdir(parents=True)
-            (root / "api" / "src").mkdir(parents=True)
-            (root / "api" / "src" / "example.py").write_text("def local_symbol():\n    return {'status': 'ok'}\n", encoding="utf-8")
-            (root / "docs" / "bugs" / "Bugs_25260323.md").write_text(LEDGER_TEXT, encoding="utf-8")
-
-            store = FileStore(Path(tmp_dir) / "data")
-            service = TrackerService(store)
-            snapshot = service.load_workspace(WorkspaceLoadRequest(root_path=str(root), auto_scan=True))
-            assert snapshot is not None
-            service.update_settings(
-                service.get_settings().model_copy(
-                    update={
-                        "postgres_dsn": "postgresql://xmustard:secret@localhost:5432/xmustard",
-                        "postgres_schema": "agent_context",
-                    }
-                )
-            )
-
-            go_payload = {
-                "workspace_id": snapshot.workspace.workspace_id,
-                "path": "api/src/example.py",
-                "role": "source",
-                "line_count": 2,
-                "import_count": 0,
-                "detected_symbols": ["local_symbol"],
-                "symbol_source": "tree_sitter",
-                "parser_language": "python",
-                "evidence_source": "rust_semantic_core",
-                "selection_reason": "Go delivery over Rust code-explainer substrate.",
-                "summary": "api/src/example.py looks like a source file.",
-                "hints": [],
-                "warnings": [],
-            }
-            with patch.object(service, "_run_go_workspace_json", return_value=go_payload) as go_mock:
-                result = service.explain_path(snapshot.workspace.workspace_id, "api/src/example.py")
-
-            self.assertEqual(result.symbol_source, "tree_sitter")
-            self.assertEqual(result.parser_language, "python")
-            self.assertEqual(result.detected_symbols, ["local_symbol"])
-            go_mock.assert_called_once_with(
-                "explain-path",
                 snapshot.workspace.workspace_id,
                 ["--path", "api/src/example.py"],
             )
