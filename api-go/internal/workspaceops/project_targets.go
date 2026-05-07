@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 )
 
@@ -19,6 +20,9 @@ type RepoTargetRecord struct {
 	SourcePath string  `json:"source_path"`
 	Confidence int     `json:"confidence"`
 	ProfileID  *string `json:"profile_id,omitempty"`
+	WorkingDir string  `json:"working_dir,omitempty"`
+	EntryPath  *string `json:"entry_path,omitempty"`
+	Reason     *string `json:"reason,omitempty"`
 }
 
 func ReadRunTargets(dataDir string, workspaceID string) ([]RepoTargetRecord, error) {
@@ -67,6 +71,8 @@ func discoverManifestTargets(repoRoot string, includeVerify bool) []RepoTargetRe
 	targets := []RepoTargetRecord{}
 	targets = append(targets, discoverMakeTargets(repoRoot, includeVerify)...)
 	targets = append(targets, discoverPackageTargets(repoRoot, includeVerify)...)
+	targets = append(targets, discoverPyprojectTargets(repoRoot, includeVerify)...)
+	targets = append(targets, discoverCargoTargets(repoRoot, includeVerify)...)
 	targets = append(targets, discoverDockerTargets(repoRoot)...)
 	return dedupeRepoTargets(targets)
 }
@@ -100,6 +106,7 @@ func discoverMakeTargets(repoRoot string, includeVerify bool) []RepoTargetRecord
 			Source:     "makefile",
 			SourcePath: "Makefile",
 			Confidence: 80,
+			Reason:     optionalStringPtr(fmt.Sprintf("Make target '%s' is declared in Makefile.", name)),
 		})
 	}
 	return targets
@@ -142,8 +149,104 @@ func discoverPackageTargets(repoRoot string, includeVerify bool) []RepoTargetRec
 				Source:     "package_json",
 				SourcePath: manifestPath,
 				Confidence: 85,
+				WorkingDir: normalizeWorkingDir(repoRoot, filepath.Dir(manifest)),
+				Reason:     optionalStringPtr(fmt.Sprintf("package.json script '%s' is declared in %s.", name, manifestPath)),
 			})
 		}
+	}
+	return targets
+}
+
+func discoverPyprojectTargets(repoRoot string, includeVerify bool) []RepoTargetRecord {
+	if includeVerify {
+		return []RepoTargetRecord{}
+	}
+	targets := []RepoTargetRecord{}
+	for _, manifest := range candidatePyprojectFiles(repoRoot) {
+		scripts, err := readPyprojectScripts(manifest)
+		if err != nil {
+			continue
+		}
+		manifestPath := normalizeRepoPath(repoRoot, manifest)
+		workingDir := normalizeWorkingDir(repoRoot, filepath.Dir(manifest))
+		labelPrefix := workingDir
+		if labelPrefix == "" {
+			labelPrefix = filepath.Base(manifest)
+		}
+		for name, target := range scripts {
+			moduleName, ok := parsePythonScriptModuleTarget(target)
+			if !ok {
+				continue
+			}
+			entryFile := filepath.Join(filepath.Dir(manifest), filepath.FromSlash(strings.ReplaceAll(moduleName, ".", "/")+".py"))
+			if !pythonModuleSupportsDashM(entryFile) {
+				continue
+			}
+			entryPath := normalizeRepoPath(repoRoot, entryFile)
+			command := "python3 -m " + moduleName
+			reason := fmt.Sprintf("PEP 621 script '%s' in %s points to %s, and %s supports python -m.", name, manifestPath, target, entryPath)
+			targets = append(targets, RepoTargetRecord{
+				TargetID:   "pyproject-" + hashID(manifestPath, name, moduleName),
+				Kind:       "run",
+				Label:      labelPrefix + ":" + name,
+				Command:    prefixCommandWithWorkingDir(workingDir, command),
+				Source:     "pyproject_toml",
+				SourcePath: manifestPath,
+				Confidence: 92,
+				WorkingDir: workingDir,
+				EntryPath:  &entryPath,
+				Reason:     &reason,
+			})
+		}
+	}
+	return targets
+}
+
+func discoverCargoTargets(repoRoot string, includeVerify bool) []RepoTargetRecord {
+	targets := []RepoTargetRecord{}
+	for _, manifest := range candidateCargoTomlFiles(repoRoot) {
+		info, err := readCargoManifest(manifest)
+		if err != nil {
+			continue
+		}
+		manifestPath := normalizeRepoPath(repoRoot, manifest)
+		workingDir := normalizeWorkingDir(repoRoot, filepath.Dir(manifest))
+		labelPrefix := workingDir
+		if labelPrefix == "" {
+			labelPrefix = filepath.Base(manifest)
+		}
+		if !includeVerify {
+			for _, bin := range info.Bins {
+				entryPath := normalizeRepoPath(repoRoot, bin.Path)
+				command := "cargo run --bin " + bin.Name
+				reason := fmt.Sprintf("Cargo package in %s exposes binary '%s' at %s.", manifestPath, bin.Name, entryPath)
+				targets = append(targets, RepoTargetRecord{
+					TargetID:   "cargo-bin-" + hashID(manifestPath, bin.Name, entryPath),
+					Kind:       "run",
+					Label:      labelPrefix + ":" + bin.Name,
+					Command:    prefixCommandWithWorkingDir(workingDir, command),
+					Source:     "cargo_toml",
+					SourcePath: manifestPath,
+					Confidence: 90,
+					WorkingDir: workingDir,
+					EntryPath:  &entryPath,
+					Reason:     &reason,
+				})
+			}
+			continue
+		}
+		reason := fmt.Sprintf("Cargo package in %s supports cargo test for workspace-local verification.", manifestPath)
+		targets = append(targets, RepoTargetRecord{
+			TargetID:   "cargo-test-" + hashID(manifestPath, workingDir),
+			Kind:       "test",
+			Label:      labelPrefix + ":cargo test",
+			Command:    prefixCommandWithWorkingDir(workingDir, "cargo test"),
+			Source:     "cargo_toml",
+			SourcePath: manifestPath,
+			Confidence: 88,
+			WorkingDir: workingDir,
+			Reason:     &reason,
+		})
 	}
 	return targets
 }
@@ -163,6 +266,7 @@ func discoverDockerTargets(repoRoot string) []RepoTargetRecord {
 			Source:     "docker_compose",
 			SourcePath: candidate,
 			Confidence: 75,
+			Reason:     optionalStringPtr(fmt.Sprintf("Compose file %s is present at the workspace root.", candidate)),
 		})
 	}
 	return targets
@@ -172,7 +276,14 @@ func dedupeRepoTargets(targets []RepoTargetRecord) []RepoTargetRecord {
 	deduped := map[string]RepoTargetRecord{}
 	order := []string{}
 	for _, target := range targets {
-		key := target.Kind + "|" + target.Command
+		key := strings.Join([]string{
+			target.Kind,
+			target.Command,
+			target.SourcePath,
+			target.WorkingDir,
+			firstOptionalString(target.EntryPath),
+			firstOptionalString(target.ProfileID),
+		}, "|")
 		existing, ok := deduped[key]
 		if !ok {
 			deduped[key] = target
@@ -224,9 +335,13 @@ func targetKindIncluded(kind string, includeVerify bool) bool {
 func buildRepoContextTargetLinks(targets []RepoTargetRecord, kindLabel string) []RepoContextTargetLink {
 	links := make([]RepoContextTargetLink, 0, len(targets))
 	for _, target := range targets {
+		reason := fmt.Sprintf("%s target discovered from %s.", kindLabel, target.SourcePath)
+		if target.Reason != nil && strings.TrimSpace(*target.Reason) != "" {
+			reason = *target.Reason
+		}
 		links = append(links, RepoContextTargetLink{
 			Target: target,
-			Reason: fmt.Sprintf("%s target discovered from %s.", kindLabel, target.SourcePath),
+			Reason: reason,
 			Score:  target.Confidence,
 		})
 	}
@@ -245,7 +360,309 @@ func mergeVerificationProfileTargets(targets []RepoTargetRecord, profiles []veri
 			SourcePath: "verification_profiles.json",
 			Confidence: 95,
 			ProfileID:  &profile.ProfileID,
+			Reason:     optionalStringPtr(fmt.Sprintf("Operator-saved verification profile '%s'.", profile.Name)),
 		})
 	}
 	return dedupeRepoTargets(merged)
+}
+
+type cargoManifestInfo struct {
+	PackageName string
+	Bins        []cargoBinInfo
+}
+
+type cargoBinInfo struct {
+	Name string
+	Path string
+}
+
+func candidatePyprojectFiles(repoRoot string) []string {
+	return candidateManifestFiles(repoRoot, "pyproject.toml", map[string]struct{}{
+		".git": {}, "node_modules": {}, "dist": {}, "build": {}, "coverage": {}, "research": {}, "__pycache__": {}, ".venv": {}, "venv": {},
+	})
+}
+
+func candidateCargoTomlFiles(repoRoot string) []string {
+	return candidateManifestFiles(repoRoot, "Cargo.toml", map[string]struct{}{
+		".git": {}, "node_modules": {}, "dist": {}, "build": {}, "coverage": {}, "research": {}, "__pycache__": {}, ".venv": {}, "venv": {}, "target": {},
+	})
+}
+
+func candidateManifestFiles(repoRoot string, manifestName string, excluded map[string]struct{}) []string {
+	candidates := []string{}
+	queue := []string{repoRoot}
+	maxDepth := 2
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+		relative, _ := filepath.Rel(repoRoot, current)
+		depth := 0
+		if relative != "." {
+			depth = len(strings.Split(filepath.ToSlash(relative), "/"))
+		}
+		manifestPath := filepath.Join(current, manifestName)
+		if _, err := os.Stat(manifestPath); err == nil {
+			candidates = append(candidates, manifestPath)
+		}
+		if depth >= maxDepth {
+			continue
+		}
+		entries, err := os.ReadDir(current)
+		if err != nil {
+			continue
+		}
+		for _, entry := range entries {
+			if !entry.IsDir() {
+				continue
+			}
+			if _, skip := excluded[entry.Name()]; skip {
+				continue
+			}
+			queue = append(queue, filepath.Join(current, entry.Name()))
+		}
+	}
+	slices.Sort(candidates)
+	return candidates
+}
+
+func readPyprojectScripts(manifestPath string) (map[string]string, error) {
+	content, err := os.ReadFile(manifestPath)
+	if err != nil {
+		return nil, err
+	}
+	scripts := map[string]string{}
+	section := ""
+	for _, raw := range strings.Split(string(content), "\n") {
+		line := strings.TrimSpace(stripTOMLInlineComment(raw))
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+			section = strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(line, "["), "]"))
+			continue
+		}
+		if section != "project.scripts" {
+			continue
+		}
+		key, value, ok := parseTOMLKeyValue(line)
+		if !ok {
+			continue
+		}
+		scripts[key] = value
+	}
+	return scripts, nil
+}
+
+func readCargoManifest(manifestPath string) (cargoManifestInfo, error) {
+	content, err := os.ReadFile(manifestPath)
+	if err != nil {
+		return cargoManifestInfo{}, err
+	}
+	info := cargoManifestInfo{}
+	section := ""
+	currentBin := cargoBinInfo{}
+	appendCurrentBin := func() {
+		if currentBin.Name == "" || currentBin.Path == "" {
+			currentBin = cargoBinInfo{}
+			return
+		}
+		currentBin.Path = filepath.Clean(filepath.Join(filepath.Dir(manifestPath), filepath.FromSlash(currentBin.Path)))
+		info.Bins = append(info.Bins, currentBin)
+		currentBin = cargoBinInfo{}
+	}
+	for _, raw := range strings.Split(string(content), "\n") {
+		line := strings.TrimSpace(stripTOMLInlineComment(raw))
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "[[") && strings.HasSuffix(line, "]]") {
+			appendCurrentBin()
+			section = strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(line, "[["), "]]"))
+			continue
+		}
+		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+			appendCurrentBin()
+			section = strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(line, "["), "]"))
+			continue
+		}
+		key, value, ok := parseTOMLKeyValue(line)
+		if !ok {
+			continue
+		}
+		switch section {
+		case "package":
+			if key == "name" {
+				info.PackageName = value
+			}
+		case "bin":
+			switch key {
+			case "name":
+				currentBin.Name = value
+			case "path":
+				currentBin.Path = value
+			}
+		}
+	}
+	appendCurrentBin()
+	info.Bins = append(info.Bins, discoverCargoConventionBins(manifestPath, info.PackageName)...)
+	info.Bins = dedupeCargoBins(info.Bins)
+	return info, nil
+}
+
+func discoverCargoConventionBins(manifestPath string, packageName string) []cargoBinInfo {
+	manifestDir := filepath.Dir(manifestPath)
+	bins := []cargoBinInfo{}
+	if packageName != "" {
+		mainPath := filepath.Join(manifestDir, "src", "main.rs")
+		if _, err := os.Stat(mainPath); err == nil {
+			bins = append(bins, cargoBinInfo{Name: packageName, Path: mainPath})
+		}
+	}
+	pattern := filepath.Join(manifestDir, "src", "bin", "*.rs")
+	matches, _ := filepath.Glob(pattern)
+	for _, match := range matches {
+		name := strings.TrimSuffix(filepath.Base(match), filepath.Ext(match))
+		if name == "" {
+			continue
+		}
+		bins = append(bins, cargoBinInfo{Name: name, Path: match})
+	}
+	return bins
+}
+
+func dedupeCargoBins(items []cargoBinInfo) []cargoBinInfo {
+	seen := map[string]cargoBinInfo{}
+	order := []string{}
+	for _, item := range items {
+		key := item.Name + "|" + filepath.Clean(item.Path)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = item
+		order = append(order, key)
+	}
+	out := make([]cargoBinInfo, 0, len(order))
+	for _, key := range order {
+		out = append(out, seen[key])
+	}
+	return out
+}
+
+func parsePythonScriptModuleTarget(raw string) (string, bool) {
+	module, _, found := strings.Cut(raw, ":")
+	module = strings.TrimSpace(module)
+	if !found || module == "" {
+		return "", false
+	}
+	return module, true
+}
+
+func pythonModuleSupportsDashM(path string) bool {
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	text := string(content)
+	return strings.Contains(text, `if __name__ == "__main__"`) || strings.Contains(text, "if __name__ == '__main__'")
+}
+
+func stripTOMLInlineComment(line string) string {
+	var builder strings.Builder
+	inSingle := false
+	inDouble := false
+	escaped := false
+	for _, r := range line {
+		switch r {
+		case '\\':
+			if inDouble {
+				escaped = !escaped
+			}
+			builder.WriteRune(r)
+			continue
+		case '"':
+			if !inSingle && !escaped {
+				inDouble = !inDouble
+			}
+		case '\'':
+			if !inDouble {
+				inSingle = !inSingle
+			}
+		case '#':
+			if !inSingle && !inDouble {
+				return builder.String()
+			}
+		}
+		builder.WriteRune(r)
+		escaped = false
+	}
+	return builder.String()
+}
+
+func parseTOMLKeyValue(line string) (string, string, bool) {
+	index := strings.Index(line, "=")
+	if index < 0 {
+		return "", "", false
+	}
+	key := strings.TrimSpace(line[:index])
+	value := strings.TrimSpace(line[index+1:])
+	if key == "" || value == "" {
+		return "", "", false
+	}
+	decoded, ok := decodeTOMLString(value)
+	if !ok {
+		return "", "", false
+	}
+	return key, decoded, true
+}
+
+func decodeTOMLString(value string) (string, bool) {
+	if len(value) >= 2 && strings.HasPrefix(value, `"`) && strings.HasSuffix(value, `"`) {
+		decoded, err := strconv.Unquote(value)
+		if err != nil {
+			return "", false
+		}
+		return decoded, true
+	}
+	if len(value) >= 2 && strings.HasPrefix(value, "'") && strings.HasSuffix(value, "'") {
+		return value[1 : len(value)-1], true
+	}
+	return "", false
+}
+
+func normalizeWorkingDir(repoRoot string, absDir string) string {
+	normalized := normalizeRepoPath(repoRoot, absDir)
+	if normalized == "." {
+		return ""
+	}
+	return normalized
+}
+
+func normalizeRepoPath(repoRoot string, absPath string) string {
+	relative, err := filepath.Rel(repoRoot, absPath)
+	if err != nil {
+		return filepath.ToSlash(filepath.Clean(absPath))
+	}
+	return filepath.ToSlash(relative)
+}
+
+func prefixCommandWithWorkingDir(workingDir string, command string) string {
+	if strings.TrimSpace(workingDir) == "" || workingDir == "." {
+		return command
+	}
+	return "cd " + workingDir + " && " + command
+}
+
+func optionalStringPtr(value string) *string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil
+	}
+	return &value
+}
+
+func firstOptionalString(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return strings.TrimSpace(*value)
 }

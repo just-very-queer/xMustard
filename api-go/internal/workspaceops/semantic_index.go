@@ -111,6 +111,7 @@ type semanticRepoTarget struct {
 	Command    string
 	SourcePath string
 	Confidence int
+	EntryPath  *string
 }
 
 func PlanSemanticIndex(dataDir string, workspaceID string, request SemanticIndexRequest) (*SemanticIndexPlan, error) {
@@ -485,6 +486,10 @@ func semanticIndexTargetSeeds(repoRoot string, workspaceID string, surface strin
 		if target.SourcePath != "" {
 			seeds = append(seeds, target.SourcePath)
 		}
+		if target.EntryPath != nil && strings.TrimSpace(*target.EntryPath) != "" {
+			seeds = append(seeds, *target.EntryPath)
+			continue
+		}
 		command := strings.ToLower(target.Command)
 		if strings.Contains(command, "python") {
 			seeds = append(seeds, "main.py", "cli.py", "__main__.py")
@@ -506,6 +511,7 @@ func semanticDiscoverTargets(repoRoot string, includeVerify bool) []semanticRepo
 			Command:    item.Command,
 			SourcePath: item.SourcePath,
 			Confidence: item.Confidence,
+			EntryPath:  item.EntryPath,
 		})
 	}
 	return targets

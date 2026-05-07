@@ -3,6 +3,7 @@ package workspaceops
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -62,6 +63,62 @@ func TestReadRunTargetsAndVerifyTargetsUseManifestDiscoveryAndSavedProfiles(t *t
 	}
 }
 
+func TestReadRunTargetsAndVerifyTargetsDiscoverPyprojectAndCargoEntrypoints(t *testing.T) {
+	dataDir, workspaceID, repoRoot := writeSemanticIndexFixture(t)
+
+	if err := os.WriteFile(filepath.Join(repoRoot, "backend", "pyproject.toml"), []byte("[project]\nname = \"fixture-backend\"\n[project.scripts]\nxmustard = \"app.cli:app\"\n"), 0o644); err != nil {
+		t.Fatalf("write backend pyproject.toml: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, "backend", "app", "cli.py"), []byte("def app():\n    return True\n\nif __name__ == \"__main__\":\n    app()\n"), 0o644); err != nil {
+		t.Fatalf("rewrite backend cli.py: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(repoRoot, "rust-core", "src", "bin"), 0o755); err != nil {
+		t.Fatalf("mkdir rust-core/src/bin: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, "rust-core", "Cargo.toml"), []byte("[package]\nname = \"fixture-core\"\nversion = \"0.1.0\"\nedition = \"2024\"\n"), 0o644); err != nil {
+		t.Fatalf("write rust-core Cargo.toml: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, "rust-core", "src", "bin", "fixture-core.rs"), []byte("fn main() {}\n"), 0o644); err != nil {
+		t.Fatalf("write rust binary: %v", err)
+	}
+
+	runTargets, err := ReadRunTargets(dataDir, workspaceID)
+	if err != nil {
+		t.Fatalf("read run targets: %v", err)
+	}
+	verifyTargets, err := ReadVerifyTargets(dataDir, workspaceID)
+	if err != nil {
+		t.Fatalf("read verify targets: %v", err)
+	}
+
+	pythonTarget := findTargetByCommand(runTargets, "cd backend && python3 -m app.cli")
+	if pythonTarget == nil {
+		t.Fatalf("expected pyproject python entrypoint in run targets: %#v", runTargets)
+	}
+	if pythonTarget.Source != "pyproject_toml" || pythonTarget.WorkingDir != "backend" || pythonTarget.EntryPath == nil || *pythonTarget.EntryPath != "backend/app/cli.py" {
+		t.Fatalf("unexpected pyproject target provenance: %#v", pythonTarget)
+	}
+	if pythonTarget.Reason == nil || !strings.Contains(*pythonTarget.Reason, "PEP 621 script") {
+		t.Fatalf("expected pyproject reason, got %#v", pythonTarget)
+	}
+
+	rustRunTarget := findTargetByCommand(runTargets, "cd rust-core && cargo run --bin fixture-core")
+	if rustRunTarget == nil {
+		t.Fatalf("expected cargo run target in run targets: %#v", runTargets)
+	}
+	if rustRunTarget.Source != "cargo_toml" || rustRunTarget.WorkingDir != "rust-core" || rustRunTarget.EntryPath == nil || *rustRunTarget.EntryPath != "rust-core/src/bin/fixture-core.rs" {
+		t.Fatalf("unexpected cargo run provenance: %#v", rustRunTarget)
+	}
+
+	rustVerifyTarget := findTargetByCommand(verifyTargets, "cd rust-core && cargo test")
+	if rustVerifyTarget == nil {
+		t.Fatalf("expected cargo test verify target in verify targets: %#v", verifyTargets)
+	}
+	if rustVerifyTarget.Source != "cargo_toml" || rustVerifyTarget.Reason == nil || !strings.Contains(*rustVerifyTarget.Reason, "cargo test") {
+		t.Fatalf("unexpected cargo verify provenance: %#v", rustVerifyTarget)
+	}
+}
+
 func TestSemanticDiscoverTargetsUsesSharedManifestDiscovery(t *testing.T) {
 	_, _, repoRoot := writeSemanticIndexFixture(t)
 
@@ -103,4 +160,13 @@ func hasSemanticTarget(targets []semanticRepoTarget, command string, sourcePath 
 		}
 	}
 	return false
+}
+
+func findTargetByCommand(targets []RepoTargetRecord, command string) *RepoTargetRecord {
+	for idx := range targets {
+		if targets[idx].Command == command {
+			return &targets[idx]
+		}
+	}
+	return nil
 }

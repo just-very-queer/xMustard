@@ -509,9 +509,13 @@ class RepoTargetRecord(BaseModel):
     kind: Literal["dev", "run", "build", "test", "lint", "verify", "service", "other"] = "other"
     label: str
     command: str
-    source: Literal["package_json", "makefile", "docker_compose", "verification_profile", "heuristic"] = "heuristic"
+    source: Literal["package_json", "makefile", "docker_compose", "verification_profile", "pyproject_toml", "cargo_toml", "heuristic"] = "heuristic"
     source_path: str
     confidence: int = 50
+    profile_id: Optional[str] = None
+    working_dir: Optional[str] = None
+    entry_path: Optional[str] = None
+    reason: Optional[str] = None
 
 
 class CodeExplainerResult(BaseModel):

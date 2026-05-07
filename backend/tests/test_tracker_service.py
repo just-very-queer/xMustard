@@ -2383,6 +2383,21 @@ class RuntimeSummaryTests(unittest.TestCase):
             )
             (root / "Makefile").write_text("backend:\n\tpython3 -m uvicorn app.main:app\nlint:\n\techo lint\n", encoding="utf-8")
             (root / "docker-compose.yml").write_text("services:\n  api:\n    image: example\n", encoding="utf-8")
+            (root / "backend" / "app").mkdir(parents=True)
+            (root / "backend" / "pyproject.toml").write_text(
+                "[project]\nname='fixture-backend'\n[project.scripts]\nxmustard='app.cli:app'\n",
+                encoding="utf-8",
+            )
+            (root / "backend" / "app" / "cli.py").write_text(
+                "def app():\n    return True\n\nif __name__ == \"__main__\":\n    app()\n",
+                encoding="utf-8",
+            )
+            (root / "rust-core" / "src" / "bin").mkdir(parents=True)
+            (root / "rust-core" / "Cargo.toml").write_text(
+                "[package]\nname='fixture-core'\nversion='0.1.0'\nedition='2024'\n",
+                encoding="utf-8",
+            )
+            (root / "rust-core" / "src" / "bin" / "fixture-core.rs").write_text("fn main() {}\n", encoding="utf-8")
 
             __import__("subprocess").run(["git", "-C", str(root), "init"], check=True, capture_output=True)
             __import__("subprocess").run(["git", "-C", str(root), "add", "."], check=True, capture_output=True)
@@ -2426,10 +2441,23 @@ class RuntimeSummaryTests(unittest.TestCase):
             run_targets = service.list_run_targets(snapshot.workspace.workspace_id)
             self.assertTrue(any(item.command == "npm run dev" for item in run_targets))
             self.assertTrue(any(item.command == "make backend" for item in run_targets))
+            pyproject_target = next(item for item in run_targets if item.command == "cd backend && python3 -m app.cli")
+            self.assertEqual(pyproject_target.source, "pyproject_toml")
+            self.assertEqual(pyproject_target.working_dir, "backend")
+            self.assertEqual(pyproject_target.entry_path, "backend/app/cli.py")
+            self.assertIn("PEP 621 script", pyproject_target.reason or "")
+            cargo_target = next(item for item in run_targets if item.command == "cd rust-core && cargo run --bin fixture-core")
+            self.assertEqual(cargo_target.source, "cargo_toml")
+            self.assertEqual(cargo_target.working_dir, "rust-core")
+            self.assertEqual(cargo_target.entry_path, "rust-core/src/bin/fixture-core.rs")
 
             verify_targets = service.list_verify_targets(snapshot.workspace.workspace_id)
             self.assertTrue(any(item.command == "pytest -q" for item in verify_targets))
             self.assertTrue(any(item.command == "npm run test" for item in verify_targets))
+            cargo_verify_target = next(item for item in verify_targets if item.command == "cd rust-core && cargo test")
+            self.assertEqual(cargo_verify_target.source, "cargo_toml")
+            self.assertEqual(cargo_verify_target.working_dir, "rust-core")
+            self.assertIn("cargo test", cargo_verify_target.reason or "")
 
             changes = service.read_change_summary(snapshot.workspace.workspace_id)
             self.assertTrue(any(item.path == "api/src/example.py" for item in changes.changed_files))

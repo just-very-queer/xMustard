@@ -88,6 +88,24 @@ func TestGoRepoIntelligenceReadsImpactContextAndRetrieval(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(repoRoot, "package.json"), []byte(`{"scripts":{"dev":"vite","test":"vitest run"}}`), 0o644); err != nil {
 		t.Fatalf("write package.json: %v", err)
 	}
+	if err := os.MkdirAll(filepath.Join(repoRoot, "backend", "app"), 0o755); err != nil {
+		t.Fatalf("mkdir backend/app: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, "backend", "pyproject.toml"), []byte("[project]\nname = \"fixture-backend\"\n[project.scripts]\nxmustard = \"app.cli:app\"\n"), 0o644); err != nil {
+		t.Fatalf("write backend pyproject.toml: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, "backend", "app", "cli.py"), []byte("def app():\n    return True\n\nif __name__ == \"__main__\":\n    app()\n"), 0o644); err != nil {
+		t.Fatalf("write backend cli.py: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(repoRoot, "rust-core", "src", "bin"), 0o755); err != nil {
+		t.Fatalf("mkdir rust-core/src/bin: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, "rust-core", "Cargo.toml"), []byte("[package]\nname = \"fixture-core\"\nversion = \"0.1.0\"\nedition = \"2024\"\n"), 0o644); err != nil {
+		t.Fatalf("write rust-core Cargo.toml: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, "rust-core", "src", "bin", "fixture-core.rs"), []byte("fn main() {}\n"), 0o644); err != nil {
+		t.Fatalf("write rust-core bin: %v", err)
+	}
 	if err := saveVerificationProfiles(dataDir, workspaceID, []verificationProfileRecord{
 		{
 			ProfileID:         "backend-pytest",
@@ -142,6 +160,15 @@ func TestGoRepoIntelligenceReadsImpactContextAndRetrieval(t *testing.T) {
 	if len(context.RunTargets) == 0 || len(context.VerifyTargets) == 0 {
 		t.Fatalf("expected repo context targets, got %#v", context)
 	}
+	if !repoContextHasCommand(context.RunTargets, "cd backend && python3 -m app.cli") {
+		t.Fatalf("expected pyproject repo-context target, got %#v", context.RunTargets)
+	}
+	if !repoContextHasCommand(context.RunTargets, "cd rust-core && cargo run --bin fixture-core") {
+		t.Fatalf("expected cargo repo-context run target, got %#v", context.RunTargets)
+	}
+	if !repoContextHasCommand(context.VerifyTargets, "cd rust-core && cargo test") {
+		t.Fatalf("expected cargo repo-context verify target, got %#v", context.VerifyTargets)
+	}
 
 	retrieval, err := SearchRetrieval(dataDir, workspaceID, "export summary", 5)
 	if err != nil {
@@ -174,4 +201,20 @@ func runGit(t *testing.T, repoRoot string, args ...string) {
 	if output, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("git %v failed: %v\n%s", args, err, output)
 	}
+}
+
+func repoContextHasCommand(items []RepoContextTargetLink, command string) bool {
+	for _, item := range items {
+		switch target := item.Target.(type) {
+		case RepoTargetRecord:
+			if target.Command == command {
+				return true
+			}
+		case map[string]any:
+			if value, ok := target["command"].(string); ok && value == command {
+				return true
+			}
+		}
+	}
+	return false
 }
