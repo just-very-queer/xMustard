@@ -175,112 +175,15 @@ reviews:
                     with patch("app.service.shutil.which", return_value="/opt/homebrew/bin/sg"):
                         def fake_go_workspace(action: str, workspace_id_arg: str, flags=None):
                             self.assertEqual(workspace_id_arg, workspace_id)
-                            if action == "path-symbols":
-                                return {
-                                    "workspace_id": workspace_id,
-                                    "path": "api/src/example.py",
-                                    "symbol_source": "tree_sitter",
-                                    "parser_language": "python",
-                                    "evidence_source": "rust_semantic_core",
-                                    "selection_reason": "Rust semantic core produced on-demand path symbols for the requested file.",
-                                    "symbols": [{"path": "api/src/example.py", "symbol": "render_payload", "kind": "function"}],
-                                    "warnings": [],
-                                }
                             if action == "impact":
                                 return {"workspace_id": workspace_id, "derivation_summary": "Rust-backed impact report", "warnings": []}
                             if action == "changed-symbols":
                                 return [{"path": "api/src/example.py", "symbol": "render_payload", "kind": "function"}]
-                            if action == "repo-context":
-                                return {"workspace_id": workspace_id, "retrieval_ledger": []}
-                            if action == "project-info":
-                                return {
-                                    "workspace_id": workspace_id,
-                                    "root_path": str(root),
-                                    "static_truth": {
-                                        "manifests": [
-                                            {
-                                                "manifest_kind": "package_json",
-                                                "path": "package.json",
-                                                "verdict": "declared",
-                                                "provenance": {
-                                                    "source_kind": "package_json",
-                                                    "source_file": "package.json",
-                                                    "evidence_type": "manifest_file",
-                                                    "evidence": [{"path": "package.json", "normalized_path": "package.json"}],
-                                                    "confidence": 100,
-                                                },
-                                            }
-                                        ],
-                                        "runtimes": [],
-                                        "entrypoints": [],
-                                        "run_targets": [],
-                                        "verify_targets": [],
-                                        "services": [],
-                                        "warnings": [],
-                                    },
-                                    "runtime_truth": {"runtimes": [], "warnings": []},
-                                }
-                            if action == "run-targets":
-                                return [
-                                    {
-                                        "target_id": "pkg-dev",
-                                        "kind": "dev",
-                                        "label": "package.json:dev",
-                                        "command": "npm run dev",
-                                        "source": "package_json",
-                                        "source_path": "package.json",
-                                        "confidence": 85,
-                                    },
-                                    {
-                                        "target_id": "make-backend",
-                                        "kind": "dev",
-                                        "label": "make backend",
-                                        "command": "make backend",
-                                        "source": "makefile",
-                                        "source_path": "Makefile",
-                                        "confidence": 80,
-                                    },
-                                ]
-                            if action == "verify-targets":
-                                return [
-                                    {
-                                        "target_id": "verify-profile-backend-pytest",
-                                        "kind": "verify",
-                                        "label": "verification profile: Backend pytest",
-                                        "command": "pytest -q",
-                                        "source": "verification_profile",
-                                        "source_path": "verification_profiles.json",
-                                        "confidence": 95,
-                                    }
-                                ]
-                            if action == "retrieval-search":
-                                return {"workspace_id": workspace_id, "query": "render payload", "hits": [], "retrieval_ledger": []}
                             if action == "semantic-search":
                                 return {"workspace_id": workspace_id, "pattern": "def $A():", "match_count": 1, "matches": []}
-                            if action == "explain-path":
-                                return {
-                                    "workspace_id": workspace_id,
-                                    "path": "api/src/example.py",
-                                    "detected_symbols": ["render_payload"],
-                                    "warnings": [],
-                                }
                             raise AssertionError(f"unexpected Go workspace action: {action}")
 
                         checks = [
-                            (["repo-state", workspace_id], lambda payload: self.assertEqual(payload["workspace"]["workspace_id"], workspace_id)),
-                            (
-                                ["ingestion-plan", workspace_id],
-                                lambda payload: (
-                                    self.assertEqual(payload["next_phase_id"], "tree_sitter_index"),
-                                    self.assertIn("ast_grep_rules", payload["ready_phase_ids"]),
-                                ),
-                            ),
-                            (["run-targets", workspace_id], lambda payload: self.assertTrue(any(item["command"] == "npm run dev" for item in payload))),
-                            (["verify-targets", workspace_id], lambda payload: self.assertTrue(any(item["command"] == "pytest -q" for item in payload))),
-                            (
-                                ["path-symbols", workspace_id, "--path", "api/src/example.py"],
-                                lambda payload: self.assertIn("symbols", payload),
-                            ),
                             (
                                 ["changed-symbols", workspace_id],
                                 lambda payload: self.assertEqual(payload[0]["symbol"], "render_payload"),
@@ -298,24 +201,8 @@ reviews:
                                 lambda payload: self.assertIn("derivation_summary", payload),
                             ),
                             (
-                                ["repo-context", workspace_id],
-                                lambda payload: self.assertIn("retrieval_ledger", payload),
-                            ),
-                            (
-                                ["project-info", workspace_id],
-                                lambda payload: self.assertEqual(payload["static_truth"]["manifests"][0]["path"], "package.json"),
-                            ),
-                            (
-                                ["retrieval-search", workspace_id, "--query", "render payload"],
-                                lambda payload: self.assertIn("retrieval_ledger", payload),
-                            ),
-                            (
                                 ["semantic-search", workspace_id, "--pattern", "def $A():", "--language", "python"],
                                 lambda payload: self.assertIn("match_count", payload),
-                            ),
-                            (
-                                ["code-explainer", workspace_id, "--path", "api/src/example.py"],
-                                lambda payload: self.assertIn("render_payload", payload["detected_symbols"]),
                             ),
                         ]
 
@@ -327,72 +214,27 @@ reviews:
                                     payload = json.loads(result.stdout)
                                     validator(payload)
 
-    def test_cli_path_symbols_reports_tree_sitter_metadata(self):
+    def test_cli_repo_truth_commands_are_retired_from_python_shell(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             service, workspace_id = self._create_service(tmp_dir)
-            rust_result = PathSymbolsResult(
-                workspace_id=workspace_id,
-                path="api/src/example.py",
-                symbol_source="tree_sitter",
-                parser_language="python",
-                evidence_source="rust_semantic_core",
-                selection_reason="Rust semantic core produced on-demand path symbols for the requested file.",
-                symbols=[
-                    RepoMapSymbolRecord(path="api/src/example.py", symbol="ApiHandler", kind="class", line_start=1, line_end=3, evidence_source="rust_semantic_core"),
-                    RepoMapSymbolRecord(
-                        path="api/src/example.py",
-                        symbol="render_payload",
-                        kind="method",
-                        line_start=2,
-                        line_end=3,
-                        enclosing_scope="ApiHandler",
-                        evidence_source="rust_semantic_core",
-                    ),
-                ],
-                file_summary_row=FileSymbolSummaryMaterializationRecord(
-                    workspace_id=workspace_id,
-                    path="api/src/example.py",
-                    language="python",
-                    parser_language="python",
-                    symbol_source="tree_sitter",
-                    symbol_count=2,
-                    summary_json={"top_symbols": ["ApiHandler", "render_payload"]},
-                ),
-                symbol_rows=[
-                    SymbolMaterializationRecord(
-                        workspace_id=workspace_id,
-                        path="api/src/example.py",
-                        symbol="ApiHandler",
-                        kind="class",
-                        language="python",
-                        line_start=1,
-                        line_end=3,
-                    ),
-                    SymbolMaterializationRecord(
-                        workspace_id=workspace_id,
-                        path="api/src/example.py",
-                        symbol="render_payload",
-                        kind="method",
-                        language="python",
-                        line_start=2,
-                        line_end=3,
-                        enclosing_scope="ApiHandler",
-                    ),
-                ],
-            )
-
             with patch.object(cli_module, "service", service):
-                with patch.object(cli_module, "_run_go_workspace_json", return_value=rust_result.model_dump(mode="json")) as go_mock:
-                    result = self.runner.invoke(cli_module.app, ["path-symbols", workspace_id, "--path", "api/src/example.py"])
+                retired_argv = [
+                    ["repo-state", workspace_id],
+                    ["ingestion-plan", workspace_id],
+                    ["run-targets", workspace_id],
+                    ["verify-targets", workspace_id],
+                    ["repo-context", workspace_id],
+                    ["project-info", workspace_id],
+                    ["verification-outcomes", workspace_id],
+                    ["retrieval-search", workspace_id, "--query", "render payload"],
+                    ["code-explainer", workspace_id, "--path", "api/src/example.py"],
+                    ["path-symbols", workspace_id, "--path", "api/src/example.py"],
+                ]
 
-            self.assertEqual(result.exit_code, 0, msg=result.output)
-            payload = json.loads(result.stdout)
-            go_mock.assert_called_once_with("path-symbols", workspace_id, ["--path", "api/src/example.py"])
-            self.assertEqual(payload["symbol_source"], "tree_sitter")
-            self.assertEqual(payload["parser_language"], "python")
-            self.assertEqual(payload["symbols"][1]["enclosing_scope"], "ApiHandler")
-            self.assertEqual(payload["file_summary_row"]["symbol_source"], "tree_sitter")
-            self.assertEqual(payload["symbol_rows"][1]["symbol"], "render_payload")
+                for argv in retired_argv:
+                    result = self.runner.invoke(cli_module.app, argv)
+                    self.assertNotEqual(result.exit_code, 0, msg=result.output)
+                    self.assertIn("No such command", result.output)
 
     def test_cli_semantic_search_reports_matches(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

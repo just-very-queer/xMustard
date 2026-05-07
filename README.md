@@ -101,7 +101,7 @@ python3 -m pip install .
 uvicorn app.main:app --reload --port 8042
 ```
 
-The Python shell is compatibility-only for the routes and CLI workflows that have been delegated, but it is not gone. Several FastAPI routes and many Typer commands still call `TrackerService`; treat the repo as mixed-mode until those paths are moved or deleted with replacement proof. In particular, `path-symbols`, `explain-path`, and `changed-symbols` no longer need Python as their shipped delivery owner.
+The Python shell is compatibility-only for the remaining tracker-era surfaces, but workspace/project-truth delivery now belongs on `api-go` and `xmustard-ops`. Treat the repo as mixed-mode for issue/runs compatibility, not as a parallel Python front door for repo-state, ingestion-plan, target discovery, or Rust-backed workspace truth reads.
 
 Frontend setup:
 

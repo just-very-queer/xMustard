@@ -495,6 +495,86 @@ func main() {
 		}
 		writeJSON(w, http.StatusOK, result)
 	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/repo-state", func(w http.ResponseWriter, r *http.Request) {
+		workspaceID := r.PathValue("workspace_id")
+		result, err := workspaceops.ReadRepoToolState(
+			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
+			workspaceID,
+		)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				writeJSON(w, http.StatusNotFound, map[string]any{
+					"error": "Workspace not found",
+				})
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"error": err.Error(),
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/ingestion-plan", func(w http.ResponseWriter, r *http.Request) {
+		workspaceID := r.PathValue("workspace_id")
+		result, err := workspaceops.ReadIngestionPlan(
+			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
+			workspaceID,
+		)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				writeJSON(w, http.StatusNotFound, map[string]any{
+					"error": "Workspace not found",
+				})
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"error": err.Error(),
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/run-targets", func(w http.ResponseWriter, r *http.Request) {
+		workspaceID := r.PathValue("workspace_id")
+		result, err := workspaceops.ReadRunTargets(
+			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
+			workspaceID,
+		)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				writeJSON(w, http.StatusNotFound, map[string]any{
+					"error": "Workspace not found",
+				})
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"error": err.Error(),
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/verify-targets", func(w http.ResponseWriter, r *http.Request) {
+		workspaceID := r.PathValue("workspace_id")
+		result, err := workspaceops.ReadVerifyTargets(
+			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
+			workspaceID,
+		)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				writeJSON(w, http.StatusNotFound, map[string]any{
+					"error": "Workspace not found",
+				})
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"error": err.Error(),
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	})
 	mux.HandleFunc("POST /api/workspaces/{workspace_id}/issues/{issue_id}/runs", func(w http.ResponseWriter, r *http.Request) {
 		workspaceID := r.PathValue("workspace_id")
 		issueID := r.PathValue("issue_id")

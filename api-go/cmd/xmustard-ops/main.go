@@ -306,6 +306,10 @@ func runWorkspace(args []string) {
 	switch action {
 	case "scan":
 		payload, err = workspaceops.ScanWorkspace(*dataDir, workspaceID)
+	case "repo-state":
+		payload, err = workspaceops.ReadRepoToolState(*dataDir, workspaceID)
+	case "ingestion-plan":
+		payload, err = workspaceops.ReadIngestionPlan(*dataDir, workspaceID)
 	case "run-targets":
 		payload, err = workspaceops.ReadRunTargets(*dataDir, workspaceID)
 	case "verify-targets":
@@ -372,7 +376,7 @@ func runWorkspace(args []string) {
 			SchemaName: optionalFlagString(*schema),
 		})
 	default:
-		fatalUsage("usage: xmustard-ops workspace <scan|run-targets|verify-targets|project-info|verification-outcomes|repo-map|changed-symbols|impact|repo-context|retrieval-search|path-symbols|document-symbols|go-to-definition|references|workspace-symbols|live-workspace-symbols|explain-path|semantic-search|postgres-materialize-path|postgres-materialize-workspace-symbols|postgres-materialize-semantic-search|semantic-index-materialize> <workspace_id> [flags]")
+		fatalUsage("usage: xmustard-ops workspace <scan|repo-state|ingestion-plan|run-targets|verify-targets|project-info|verification-outcomes|repo-map|changed-symbols|impact|repo-context|retrieval-search|path-symbols|document-symbols|go-to-definition|references|workspace-symbols|live-workspace-symbols|explain-path|semantic-search|postgres-materialize-path|postgres-materialize-workspace-symbols|postgres-materialize-semantic-search|semantic-index-materialize> <workspace_id> [flags]")
 	}
 	writeJSON(payload, err)
 }

@@ -633,16 +633,6 @@ def worktree(workspace_id: str) -> None:
     _echo_json(service.read_worktree_status(workspace_id).model_dump(mode="json"))
 
 
-@app.command("repo-state")
-def repo_state(workspace_id: str) -> None:
-    _echo_json(service.read_repo_tool_state(workspace_id).model_dump(mode="json"))
-
-
-@app.command("ingestion-plan")
-def ingestion_plan(workspace_id: str) -> None:
-    _echo_json(service.read_ingestion_plan(workspace_id).model_dump(mode="json"))
-
-
 @semantic_index_app.command("plan")
 def semantic_index_plan(
     workspace_id: str,
@@ -738,46 +728,6 @@ def changed_since_last_accepted_fix(workspace_id: str) -> None:
 @app.command("impact")
 def impact(workspace_id: str, base_ref: str = typer.Option(default="HEAD")) -> None:
     _echo_json(_run_go_workspace_json("impact", workspace_id, ["--base-ref", base_ref]))
-
-
-@app.command("repo-context")
-def repo_context(workspace_id: str, base_ref: str = typer.Option(default="HEAD")) -> None:
-    _echo_json(_run_go_workspace_json("repo-context", workspace_id, ["--base-ref", base_ref]))
-
-
-@app.command("project-info")
-def project_info(workspace_id: str) -> None:
-    _echo_json(_run_go_workspace_json("project-info", workspace_id))
-
-
-@app.command("verification-outcomes")
-def verification_outcomes(workspace_id: str) -> None:
-    _echo_json(_run_go_workspace_json("verification-outcomes", workspace_id))
-
-
-@app.command("retrieval-search")
-def retrieval_search(workspace_id: str, query: str = typer.Option(...), limit: int = typer.Option(default=12)) -> None:
-    _echo_json(_run_go_workspace_json("retrieval-search", workspace_id, ["--query", query, "--limit", str(limit)]))
-
-
-@app.command("run-targets")
-def run_targets(workspace_id: str) -> None:
-    _echo_json([item.model_dump(mode="json") for item in service.list_run_targets(workspace_id)])
-
-
-@app.command("verify-targets")
-def verify_targets(workspace_id: str) -> None:
-    _echo_json([item.model_dump(mode="json") for item in service.list_verify_targets(workspace_id)])
-
-
-@app.command("code-explainer")
-def code_explainer(workspace_id: str, path: str = typer.Option(...)) -> None:
-    _echo_json(_run_go_workspace_json("explain-path", workspace_id, ["--path", path]))
-
-
-@app.command("path-symbols")
-def path_symbols(workspace_id: str, path: str = typer.Option(...)) -> None:
-    _echo_json(_run_go_workspace_json("path-symbols", workspace_id, ["--path", path]))
 
 
 @app.command("document-symbols")

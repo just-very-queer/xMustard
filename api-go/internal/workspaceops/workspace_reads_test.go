@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -80,6 +81,89 @@ func TestReadActivityOverviewMatchesTrackerRollups(t *testing.T) {
 	}
 	if overview.MostRecentAt == nil || *overview.MostRecentAt != "2026-04-14T10:03:00Z" {
 		t.Fatalf("unexpected most recent activity timestamp: %#v", overview.MostRecentAt)
+	}
+}
+
+func TestReadRepoToolStateAggregatesWorkspaceTruth(t *testing.T) {
+	dataDir, workspaceID, _, _ := writeIssueContextFixture(t, false)
+
+	state, err := ReadRepoToolState(dataDir, workspaceID)
+	if err != nil {
+		t.Fatalf("read repo tool state: %v", err)
+	}
+	if state.Workspace.WorkspaceID != workspaceID {
+		t.Fatalf("unexpected workspace: %#v", state.Workspace)
+	}
+	if state.SnapshotSummary["issues"] != 1 || state.SnapshotSummary["signals"] != 1 {
+		t.Fatalf("unexpected snapshot summary: %#v", state.SnapshotSummary)
+	}
+	if state.ActivityOverview == nil || state.ActivityOverview.TotalEvents != 2 {
+		t.Fatalf("unexpected activity overview: %#v", state.ActivityOverview)
+	}
+	if len(state.RecentActivity) != 2 {
+		t.Fatalf("unexpected recent activity: %#v", state.RecentActivity)
+	}
+	if state.RepoConfigHealth == nil || state.RepoConfigHealth.Status != "configured" {
+		t.Fatalf("unexpected repo config health: %#v", state.RepoConfigHealth)
+	}
+	if state.GuidanceHealth == nil || state.GuidanceHealth.Status != "partial" {
+		t.Fatalf("unexpected guidance health: %#v", state.GuidanceHealth)
+	}
+	if state.RepoMap == nil || state.RepoMap.WorkspaceID != workspaceID {
+		t.Fatalf("unexpected repo map: %#v", state.RepoMap)
+	}
+}
+
+func TestReadIngestionPlanReportsConfiguredRuntimeDiscovery(t *testing.T) {
+	dataDir, workspaceID, _, repoRoot := writeIssueContextFixture(t, false)
+	if err := os.WriteFile(filepath.Join(repoRoot, "package.json"), []byte(`{"scripts":{"dev":"vite","test":"vitest run"}}`), 0o644); err != nil {
+		t.Fatalf("write package.json: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, "Makefile"), []byte("backend:\n\tpython3 -m uvicorn app.main:app\n"), 0o644); err != nil {
+		t.Fatalf("write Makefile: %v", err)
+	}
+	if err := saveVerificationProfiles(dataDir, workspaceID, []verificationProfileRecord{
+		{
+			ProfileID:         "backend-pytest",
+			WorkspaceID:       workspaceID,
+			Name:              "Backend pytest",
+			Description:       "Saved verification command",
+			TestCommand:       "pytest -q",
+			CoverageFormat:    "unknown",
+			MaxRuntimeSeconds: 60,
+			RetryCount:        1,
+			BuiltIn:           false,
+			CreatedAt:         nowUTC(),
+			UpdatedAt:         nowUTC(),
+		},
+	}); err != nil {
+		t.Fatalf("save verification profiles: %v", err)
+	}
+	if err := writeJSON(filepath.Join(dataDir, "settings.json"), appSettings{
+		LocalAgentType: "codex",
+		PostgresDSN:    stringPtr("postgresql://xmustard:secret@localhost:5432/xmustard"),
+		PostgresSchema: "agent_context",
+	}); err != nil {
+		t.Fatalf("write settings: %v", err)
+	}
+
+	plan, err := ReadIngestionPlan(dataDir, workspaceID)
+	if err != nil {
+		t.Fatalf("read ingestion plan: %v", err)
+	}
+	if !plan.PostgresConfigured || plan.PostgresSchema != "agent_context" {
+		t.Fatalf("unexpected Postgres config truth: %#v", plan)
+	}
+	repoScan := findIngestionPhase(t, plan.Phases, "repo_scan")
+	if repoScan.DeliveryState != "complete" {
+		t.Fatalf("expected repo_scan complete, got %#v", repoScan)
+	}
+	runtimeDiscovery := findIngestionPhase(t, plan.Phases, "runtime_discovery")
+	if runtimeDiscovery.DeliveryState != "complete" {
+		t.Fatalf("expected runtime_discovery complete, got %#v", runtimeDiscovery)
+	}
+	if !containsEvidence(runtimeDiscovery.Evidence, "run_targets=") || !containsEvidence(runtimeDiscovery.Evidence, "verify_targets=") {
+		t.Fatalf("missing runtime discovery evidence: %#v", runtimeDiscovery)
 	}
 }
 
@@ -214,6 +298,26 @@ func repoContextHasCommand(items []RepoContextTargetLink, command string) bool {
 			if value, ok := target["command"].(string); ok && value == command {
 				return true
 			}
+		}
+	}
+	return false
+}
+
+func findIngestionPhase(t *testing.T, phases []IngestionPhaseRecord, phaseID string) IngestionPhaseRecord {
+	t.Helper()
+	for _, phase := range phases {
+		if phase.PhaseID == phaseID {
+			return phase
+		}
+	}
+	t.Fatalf("missing ingestion phase %q in %#v", phaseID, phases)
+	return IngestionPhaseRecord{}
+}
+
+func containsEvidence(items []string, prefix string) bool {
+	for _, item := range items {
+		if strings.HasPrefix(item, prefix) {
+			return true
 		}
 	}
 	return false

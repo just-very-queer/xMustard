@@ -444,58 +444,10 @@ def read_worktree(workspace_id: str):
         raise HTTPException(status_code=404, detail="Workspace not found")
 
 
-@app.get("/api/workspaces/{workspace_id}/repo-state")
-def read_repo_state(workspace_id: str):
-    try:
-        return SERVICE.read_repo_tool_state(workspace_id).model_dump(mode="json")
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="Workspace not found")
-
-
-@app.get("/api/workspaces/{workspace_id}/ingestion-plan")
-def read_ingestion_plan(workspace_id: str):
-    try:
-        return SERVICE.read_ingestion_plan(workspace_id).model_dump(mode="json")
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="Workspace not found")
-
-
 @app.get("/api/workspaces/{workspace_id}/changes")
 def read_changes(workspace_id: str, base_ref: str = Query(default="HEAD")):
     try:
         return SERVICE.read_change_summary(workspace_id, base_ref=base_ref).model_dump(mode="json")
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="Workspace not found")
-
-
-@app.get("/api/workspaces/{workspace_id}/run-targets")
-def list_run_targets(workspace_id: str):
-    try:
-        return [item.model_dump(mode="json") for item in SERVICE.list_run_targets(workspace_id)]
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="Workspace not found")
-
-
-@app.get("/api/workspaces/{workspace_id}/verify-targets")
-def list_verify_targets(workspace_id: str):
-    try:
-        return [item.model_dump(mode="json") for item in SERVICE.list_verify_targets(workspace_id)]
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="Workspace not found")
-
-
-@app.get("/api/workspaces/{workspace_id}/project-info")
-def read_project_info(workspace_id: str):
-    try:
-        return SERVICE.read_project_info(workspace_id).model_dump(mode="json")
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="Workspace not found")
-
-
-@app.get("/api/workspaces/{workspace_id}/verification-outcomes")
-def read_verification_outcomes(workspace_id: str):
-    try:
-        return SERVICE.read_verification_outcomes(workspace_id).model_dump(mode="json")
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="Workspace not found")
 
