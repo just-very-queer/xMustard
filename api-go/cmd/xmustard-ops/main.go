@@ -310,6 +310,8 @@ func runWorkspace(args []string) {
 		payload, err = workspaceops.ReadRunTargets(*dataDir, workspaceID)
 	case "verify-targets":
 		payload, err = workspaceops.ReadVerifyTargets(*dataDir, workspaceID)
+	case "project-info":
+		payload, err = workspaceops.ReadProjectInfo(*dataDir, workspaceID)
 	case "changed-symbols":
 		payload, err = workspaceops.ReadChangedSymbols(*dataDir, workspaceID, *baseRef)
 	case "impact":
@@ -368,7 +370,7 @@ func runWorkspace(args []string) {
 			SchemaName: optionalFlagString(*schema),
 		})
 	default:
-		fatalUsage("usage: xmustard-ops workspace <scan|run-targets|verify-targets|repo-map|changed-symbols|impact|repo-context|retrieval-search|path-symbols|document-symbols|go-to-definition|references|workspace-symbols|live-workspace-symbols|explain-path|semantic-search|postgres-materialize-path|postgres-materialize-workspace-symbols|postgres-materialize-semantic-search|semantic-index-materialize> <workspace_id> [flags]")
+		fatalUsage("usage: xmustard-ops workspace <scan|run-targets|verify-targets|project-info|repo-map|changed-symbols|impact|repo-context|retrieval-search|path-symbols|document-symbols|go-to-definition|references|workspace-symbols|live-workspace-symbols|explain-path|semantic-search|postgres-materialize-path|postgres-materialize-workspace-symbols|postgres-materialize-semantic-search|semantic-index-materialize> <workspace_id> [flags]")
 	}
 	writeJSON(payload, err)
 }

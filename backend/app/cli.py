@@ -745,6 +745,11 @@ def repo_context(workspace_id: str, base_ref: str = typer.Option(default="HEAD")
     _echo_json(_run_go_workspace_json("repo-context", workspace_id, ["--base-ref", base_ref]))
 
 
+@app.command("project-info")
+def project_info(workspace_id: str) -> None:
+    _echo_json(_run_go_workspace_json("project-info", workspace_id))
+
+
 @app.command("retrieval-search")
 def retrieval_search(workspace_id: str, query: str = typer.Option(...), limit: int = typer.Option(default=12)) -> None:
     _echo_json(_run_go_workspace_json("retrieval-search", workspace_id, ["--query", query, "--limit", str(limit)]))

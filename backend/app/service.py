@@ -99,6 +99,7 @@ from .models import (
     PostgresSchemaPlan,
     PostgresSemanticMaterializationResult,
     PostgresWorkspaceSemanticMaterializationResult,
+    ProjectInfoRecord,
     PromoteSignalRequest,
     RepoGuidanceHealth,
     RepoGuidanceRecord,
@@ -182,7 +183,7 @@ from .terminal import TerminalService
 
 class TrackerService:
     MAX_CACHED_SNAPSHOT_BYTES = 25 * 1024 * 1024
-    SCANNER_VERSION = 4
+    SCANNER_VERSION = 5
     GUIDANCE_LIMIT = 6
     GUIDANCE_STARTER_MARKER = "xmustard:starter-template"
     GUIDANCE_PLACEHOLDER_MARKER = "TODO(xmustard)"
@@ -3457,6 +3458,11 @@ class TrackerService:
     def read_repo_context(self, workspace_id: str, base_ref: str = "HEAD") -> RepoContextRecord:
         return RepoContextRecord.model_validate(
             self._run_go_workspace_json("repo-context", workspace_id, ["--base-ref", base_ref])
+        )
+
+    def read_project_info(self, workspace_id: str) -> ProjectInfoRecord:
+        return ProjectInfoRecord.model_validate(
+            self._run_go_workspace_json("project-info", workspace_id)
         )
 
     def list_run_targets(self, workspace_id: str) -> list[RepoTargetRecord]:

@@ -2422,6 +2422,8 @@ class RuntimeSummaryTests(unittest.TestCase):
             service = TrackerService(store)
             snapshot = service.load_workspace(WorkspaceLoadRequest(root_path=str(root), auto_scan=True))
             assert snapshot is not None
+            self.assertIsNotNone(snapshot.project_info)
+            self.assertTrue(any(item.path == "package.json" for item in snapshot.project_info.static_truth.manifests))
 
             service.save_verification_profile(
                 snapshot.workspace.workspace_id,
@@ -2458,6 +2460,14 @@ class RuntimeSummaryTests(unittest.TestCase):
             self.assertEqual(cargo_verify_target.source, "cargo_toml")
             self.assertEqual(cargo_verify_target.working_dir, "rust-core")
             self.assertIn("cargo test", cargo_verify_target.reason or "")
+
+            project_info = service.read_project_info(snapshot.workspace.workspace_id)
+            self.assertTrue(any(item.command == "npm run dev" for item in project_info.static_truth.run_targets))
+            self.assertTrue(any(item.command == "pytest -q" for item in project_info.static_truth.verify_targets))
+            self.assertTrue(any(item.name == "api" for item in project_info.static_truth.services))
+            runtime_names = {item.runtime for item in project_info.runtime_truth.runtimes}
+            self.assertIn("python3", runtime_names)
+            self.assertIn("cargo", runtime_names)
 
             changes = service.read_change_summary(snapshot.workspace.workspace_id)
             self.assertTrue(any(item.path == "api/src/example.py" for item in changes.changed_files))

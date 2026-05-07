@@ -115,6 +115,7 @@ func ScanWorkspace(dataDir string, workspaceID string) (*workspaceSnapshot, erro
 	}
 	runTargets := discoverRunTargetsForRoot(root)
 	verifyTargets := discoverVerifyTargetsForRoot(root, savedVerificationProfiles)
+	projectInfo := buildProjectInfo(workspaceID, root, runTargets, verifyTargets)
 	treeSummary := summarizeTree(root)
 	now := nowUTC()
 	workspace.LatestScanAt = ptr(now)
@@ -151,6 +152,7 @@ func ScanWorkspace(dataDir string, workspaceID string) (*workspaceSnapshot, erro
 		Runtimes:       toSnapshotRuntimes(runtimes),
 		RunTargets:     runTargets,
 		VerifyTargets:  verifyTargets,
+		ProjectInfo:    projectInfo,
 		LatestLedger:   optionalString(ledgerPath),
 		LatestVerdicts: optionalString(lastString(verdictPaths)),
 		GeneratedAt:    now,

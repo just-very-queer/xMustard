@@ -26,6 +26,7 @@ type workspaceSnapshot struct {
 	Runtimes       []runtimeCapabilities `json:"runtimes"`
 	RunTargets     []RepoTargetRecord    `json:"run_targets"`
 	VerifyTargets  []RepoTargetRecord    `json:"verify_targets"`
+	ProjectInfo    *ProjectInfoRecord    `json:"project_info,omitempty"`
 	LatestLedger   *string               `json:"latest_ledger"`
 	LatestVerdicts *string               `json:"latest_verdicts"`
 	GeneratedAt    string                `json:"generated_at"`

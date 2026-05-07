@@ -484,6 +484,14 @@ def list_verify_targets(workspace_id: str):
         raise HTTPException(status_code=404, detail="Workspace not found")
 
 
+@app.get("/api/workspaces/{workspace_id}/project-info")
+def read_project_info(workspace_id: str):
+    try:
+        return SERVICE.read_project_info(workspace_id).model_dump(mode="json")
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+
+
 @app.post("/api/workspaces/{workspace_id}/scan")
 def scan_workspace(workspace_id: str):
     try:

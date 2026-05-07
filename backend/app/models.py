@@ -518,6 +518,93 @@ class RepoTargetRecord(BaseModel):
     reason: Optional[str] = None
 
 
+ProjectInfoVerdict = Literal["declared", "runtime_observed", "config_backed", "inferred_needs_review", "unavailable"]
+ProjectInfoSourceKind = Literal["package_json", "makefile", "docker_compose", "verification_profile", "pyproject_toml", "cargo_toml", "runtime_probe"]
+ProjectInfoEvidenceType = Literal["manifest_file", "saved_config", "declared_command", "derived_command", "entry_file", "runtime_binary_lookup", "compose_service"]
+
+
+class ProjectInfoProvenance(BaseModel):
+    source_kind: ProjectInfoSourceKind
+    source_file: Optional[str] = None
+    command: Optional[str] = None
+    cwd: Optional[str] = None
+    entry_path: Optional[str] = None
+    evidence_type: ProjectInfoEvidenceType
+    evidence: list[EvidenceRef] = Field(default_factory=list)
+    profile_id: Optional[str] = None
+    confidence: Optional[int] = None
+    reason: Optional[str] = None
+
+
+class ProjectManifestRecord(BaseModel):
+    manifest_kind: Literal["package_json", "makefile", "docker_compose", "pyproject_toml", "cargo_toml"]
+    path: str
+    verdict: ProjectInfoVerdict
+    provenance: ProjectInfoProvenance
+
+
+class ProjectRuntimeRecord(BaseModel):
+    runtime: str
+    source_files: list[str] = Field(default_factory=list)
+    verdict: ProjectInfoVerdict
+    provenance: ProjectInfoProvenance
+
+
+class ProjectObservedRuntimeRecord(BaseModel):
+    runtime: str
+    source_files: list[str] = Field(default_factory=list)
+    available: bool = False
+    binary_path: Optional[str] = None
+    verdict: ProjectInfoVerdict
+    provenance: ProjectInfoProvenance
+
+
+class ProjectEntrypointRecord(BaseModel):
+    kind: Literal["dev", "run", "build", "test", "lint", "verify", "service", "other"] = "other"
+    label: str
+    command: str
+    verdict: ProjectInfoVerdict
+    provenance: ProjectInfoProvenance
+
+
+class ProjectCommandRecord(BaseModel):
+    kind: Literal["dev", "run", "build", "test", "lint", "verify", "service", "other"] = "other"
+    label: str
+    command: str
+    verdict: ProjectInfoVerdict
+    provenance: ProjectInfoProvenance
+
+
+class ProjectServiceRecord(BaseModel):
+    name: str
+    command: str
+    verdict: ProjectInfoVerdict
+    provenance: ProjectInfoProvenance
+
+
+class ProjectInfoStaticTruth(BaseModel):
+    manifests: list[ProjectManifestRecord] = Field(default_factory=list)
+    runtimes: list[ProjectRuntimeRecord] = Field(default_factory=list)
+    entrypoints: list[ProjectEntrypointRecord] = Field(default_factory=list)
+    run_targets: list[ProjectCommandRecord] = Field(default_factory=list)
+    verify_targets: list[ProjectCommandRecord] = Field(default_factory=list)
+    services: list[ProjectServiceRecord] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
+class ProjectInfoRuntimeTruth(BaseModel):
+    runtimes: list[ProjectObservedRuntimeRecord] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
+class ProjectInfoRecord(BaseModel):
+    workspace_id: str
+    root_path: str
+    static_truth: ProjectInfoStaticTruth
+    runtime_truth: ProjectInfoRuntimeTruth
+    generated_at: str = Field(default_factory=utc_now)
+
+
 class CodeExplainerResult(BaseModel):
     workspace_id: str
     path: str
@@ -1104,6 +1191,7 @@ class WorkspaceSnapshot(BaseModel):
     runtimes: list[RuntimeCapabilities]
     run_targets: list["RepoTargetRecord"] = Field(default_factory=list)
     verify_targets: list["RepoTargetRecord"] = Field(default_factory=list)
+    project_info: Optional[ProjectInfoRecord] = None
     latest_ledger: Optional[str] = None
     latest_verdicts: Optional[str] = None
     generated_at: str = Field(default_factory=utc_now)

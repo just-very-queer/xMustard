@@ -192,6 +192,34 @@ reviews:
                                 return [{"path": "api/src/example.py", "symbol": "render_payload", "kind": "function"}]
                             if action == "repo-context":
                                 return {"workspace_id": workspace_id, "retrieval_ledger": []}
+                            if action == "project-info":
+                                return {
+                                    "workspace_id": workspace_id,
+                                    "root_path": str(root),
+                                    "static_truth": {
+                                        "manifests": [
+                                            {
+                                                "manifest_kind": "package_json",
+                                                "path": "package.json",
+                                                "verdict": "declared",
+                                                "provenance": {
+                                                    "source_kind": "package_json",
+                                                    "source_file": "package.json",
+                                                    "evidence_type": "manifest_file",
+                                                    "evidence": [{"path": "package.json", "normalized_path": "package.json"}],
+                                                    "confidence": 100,
+                                                },
+                                            }
+                                        ],
+                                        "runtimes": [],
+                                        "entrypoints": [],
+                                        "run_targets": [],
+                                        "verify_targets": [],
+                                        "services": [],
+                                        "warnings": [],
+                                    },
+                                    "runtime_truth": {"runtimes": [], "warnings": []},
+                                }
                             if action == "run-targets":
                                 return [
                                     {
@@ -272,6 +300,10 @@ reviews:
                             (
                                 ["repo-context", workspace_id],
                                 lambda payload: self.assertIn("retrieval_ledger", payload),
+                            ),
+                            (
+                                ["project-info", workspace_id],
+                                lambda payload: self.assertEqual(payload["static_truth"]["manifests"][0]["path"], "package.json"),
                             ),
                             (
                                 ["retrieval-search", workspace_id, "--query", "render payload"],
