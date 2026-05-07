@@ -150,6 +150,7 @@ from .models import (
     VerificationProfileReport,
     VerificationProfileUpsertRequest,
     VerificationCommandResult,
+    VerificationOutcomeRegistry,
     VerificationRecord,
     VerificationProfileExecutionResult,
     VerificationSummary,
@@ -3463,6 +3464,11 @@ class TrackerService:
     def read_project_info(self, workspace_id: str) -> ProjectInfoRecord:
         return ProjectInfoRecord.model_validate(
             self._run_go_workspace_json("project-info", workspace_id)
+        )
+
+    def read_verification_outcomes(self, workspace_id: str) -> VerificationOutcomeRegistry:
+        return VerificationOutcomeRegistry.model_validate(
+            self._run_go_workspace_json("verification-outcomes", workspace_id)
         )
 
     def list_run_targets(self, workspace_id: str) -> list[RepoTargetRecord]:

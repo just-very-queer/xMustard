@@ -750,6 +750,11 @@ def project_info(workspace_id: str) -> None:
     _echo_json(_run_go_workspace_json("project-info", workspace_id))
 
 
+@app.command("verification-outcomes")
+def verification_outcomes(workspace_id: str) -> None:
+    _echo_json(_run_go_workspace_json("verification-outcomes", workspace_id))
+
+
 @app.command("retrieval-search")
 def retrieval_search(workspace_id: str, query: str = typer.Option(...), limit: int = typer.Option(default=12)) -> None:
     _echo_json(_run_go_workspace_json("retrieval-search", workspace_id, ["--query", query, "--limit", str(limit)]))

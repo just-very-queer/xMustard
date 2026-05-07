@@ -521,6 +521,10 @@ class RepoTargetRecord(BaseModel):
 ProjectInfoVerdict = Literal["declared", "runtime_observed", "config_backed", "inferred_needs_review", "unavailable"]
 ProjectInfoSourceKind = Literal["package_json", "makefile", "docker_compose", "verification_profile", "pyproject_toml", "cargo_toml", "runtime_probe"]
 ProjectInfoEvidenceType = Literal["manifest_file", "saved_config", "declared_command", "derived_command", "entry_file", "runtime_binary_lookup", "compose_service"]
+VerificationObservationKind = Literal["none", "verification_profile_execution"]
+VerificationOutcomeState = Literal["success", "failure", "unknown"]
+VerificationOutcomeStatus = Literal["passed", "failed", "never_observed"]
+VerificationMatchBasis = Literal["none", "profile_id_exact"]
 
 
 class ProjectInfoProvenance(BaseModel):
@@ -602,6 +606,50 @@ class ProjectInfoRecord(BaseModel):
     root_path: str
     static_truth: ProjectInfoStaticTruth
     runtime_truth: ProjectInfoRuntimeTruth
+    generated_at: str = Field(default_factory=utc_now)
+
+
+class VerificationOutcomeEvidenceRef(BaseModel):
+    kind: str
+    path: Optional[str] = None
+    artifact_id: Optional[str] = None
+    created_at: Optional[str] = None
+    summary: Optional[str] = None
+
+
+class ObservedVerificationOutcome(BaseModel):
+    observation_kind: VerificationObservationKind = "none"
+    match_basis: VerificationMatchBasis = "none"
+    state: VerificationOutcomeState = "unknown"
+    last_status: VerificationOutcomeStatus = "never_observed"
+    last_run_at: Optional[str] = None
+    command_executed: Optional[str] = None
+    cwd: Optional[str] = None
+    exit_code: Optional[int] = None
+    timed_out: Optional[bool] = None
+    run_id: Optional[str] = None
+    verification_id: Optional[str] = None
+    issue_id: Optional[str] = None
+    execution_id: Optional[str] = None
+    coverage_result_id: Optional[str] = None
+    coverage_report_path: Optional[str] = None
+    branch: Optional[str] = None
+    head_sha: Optional[str] = None
+    observed_truth_source: str = "none"
+    evidence_refs: list[VerificationOutcomeEvidenceRef] = Field(default_factory=list)
+    reason: Optional[str] = None
+
+
+class VerificationOutcomeRecord(BaseModel):
+    target: RepoTargetRecord
+    observed: ObservedVerificationOutcome
+
+
+class VerificationOutcomeRegistry(BaseModel):
+    workspace_id: str
+    root_path: str
+    items: list[VerificationOutcomeRecord] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
     generated_at: str = Field(default_factory=utc_now)
 
 
