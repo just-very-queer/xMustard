@@ -60,6 +60,12 @@ func TestBuildIssueContextPacketBuildsFrontendShapeFromArtifacts(t *testing.T) {
 	if packet.DynamicContext == nil || len(packet.DynamicContext.SymbolContext) == 0 || len(packet.DynamicContext.RelatedContext) == 0 {
 		t.Fatalf("expected dynamic context bundle, got %#v", packet.DynamicContext)
 	}
+	if packet.DynamicContext.SymbolContext[0].EvidenceSource != "rust_semantic_core" {
+		t.Fatalf("expected issue-context symbols from Rust path-symbols, got %#v", packet.DynamicContext.SymbolContext)
+	}
+	if packet.DynamicContext.SymbolContext[0].LineEnd == nil || packet.DynamicContext.SymbolContext[0].Reason == nil || !strings.Contains(strings.ToLower(*packet.DynamicContext.SymbolContext[0].Reason), "rust") {
+		t.Fatalf("expected ranked Rust path-symbol details in issue context, got %#v", packet.DynamicContext.SymbolContext[0])
+	}
 	if len(packet.RetrievalLedger) == 0 || !hasRetrievalSource(packet.RetrievalLedger, "symbol") || !hasRetrievalSource(packet.RetrievalLedger, "artifact") {
 		t.Fatalf("expected retrieval ledger with symbol and artifact entries, got %#v", packet.RetrievalLedger)
 	}

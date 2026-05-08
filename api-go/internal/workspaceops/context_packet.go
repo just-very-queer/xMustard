@@ -77,6 +77,7 @@ type RepoMapSymbolRecord struct {
 	LineStart      *int    `json:"line_start,omitempty"`
 	LineEnd        *int    `json:"line_end,omitempty"`
 	EnclosingScope *string `json:"enclosing_scope,omitempty"`
+	EvidenceSource string  `json:"evidence_source,omitempty"`
 	Reason         *string `json:"reason,omitempty"`
 	Score          int     `json:"score"`
 }
@@ -220,7 +221,7 @@ func BuildIssueContextPacket(dataDir string, workspaceID string, issueID string)
 		recentActivity = recentActivity[:8]
 	}
 	worktree := readWorktreeStatus(snapshot.Workspace.RootPath)
-	dynamicContext := buildDynamicContext(snapshot.Workspace, *issue, treeFocus, ticketContexts, threatModels, browserDumps, recentFixes, recentActivity, relatedPaths)
+	dynamicContext := buildDynamicContext(dataDir, snapshot.Workspace, *issue, treeFocus, ticketContexts, threatModels, browserDumps, recentFixes, recentActivity, relatedPaths)
 	retrievalLedger := buildContextRetrievalLedger(*issue, treeFocus, evidenceBundle, relatedPaths, guidance, dynamicContext, matchedPathInstructions)
 
 	packet := &IssueContextPacket{
@@ -755,6 +756,7 @@ func rankRelatedPathsForIssue(
 }
 
 func buildDynamicContext(
+	dataDir string,
 	workspace workspaceRecord,
 	issue issueRecord,
 	treeFocus []string,
@@ -766,7 +768,7 @@ func buildDynamicContext(
 	relatedPaths []string,
 ) *DynamicContextBundle {
 	tokens := contextTokens(issue, ticketContexts)
-	symbols := extractSymbolContext(workspace.RootPath, append(append([]string{}, treeFocus...), relatedPaths...), tokens)
+	symbols := extractSymbolContext(dataDir, workspace.WorkspaceID, workspace.RootPath, append(append([]string{}, treeFocus...), relatedPaths...), tokens)
 	related := rankRelatedArtifacts(ticketContexts, threatModels, browserDumps, recentFixes, recentActivity, tokens)
 	if len(symbols) == 0 && len(related) == 0 {
 		return nil
@@ -964,17 +966,10 @@ func buildContextRetrievalLedger(
 	return entries[:min(len(entries), 32)]
 }
 
-func extractSymbolContext(root string, candidatePaths []string, tokens []string) []RepoMapSymbolRecord {
+func extractSymbolContext(dataDir string, workspaceID string, root string, candidatePaths []string, tokens []string) []RepoMapSymbolRecord {
 	results := []RepoMapSymbolRecord{}
 	seen := map[string]struct{}{}
 	deduped := dedupeText(candidatePaths)
-	classRe := regexp.MustCompile(`^class\s+([A-Za-z_][A-Za-z0-9_]*)`)
-	defRe := regexp.MustCompile(`^def\s+([A-Za-z_][A-Za-z0-9_]*)`)
-	goFuncRe := regexp.MustCompile(`^func\s+(?:\([^)]+\)\s*)?([A-Za-z_][A-Za-z0-9_]*)`)
-	rustFnRe := regexp.MustCompile(`^fn\s+([A-Za-z_][A-Za-z0-9_]*)`)
-	jsFuncRe := regexp.MustCompile(`^(?:export\s+)?function\s+([A-Za-z_][A-Za-z0-9_]*)`)
-	varFuncRe := regexp.MustCompile(`^(?:const|let|var)\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:async\s*)?\(`)
-	structRe := regexp.MustCompile(`^struct\s+([A-Za-z_][A-Za-z0-9_]*)`)
 	for _, relPath := range deduped[:min(len(deduped), 10)] {
 		absPath := filepath.Join(root, relPath)
 		info, err := os.Stat(absPath)
@@ -985,52 +980,16 @@ func extractSymbolContext(root string, candidatePaths []string, tokens []string)
 		if !slices.Contains([]string{".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".rs", ".java"}, ext) {
 			continue
 		}
-		content, err := os.ReadFile(absPath)
+		pathSymbols, err := ReadPathSymbols(dataDir, workspaceID, relPath)
 		if err != nil {
 			continue
 		}
-		lines := strings.Split(string(content), "\n")
-		var currentScope *string
-		for index, raw := range lines {
-			line := strings.TrimSpace(raw)
-			kind := ""
-			symbol := ""
-			switch {
-			case classRe.MatchString(line):
-				symbol = classRe.FindStringSubmatch(line)[1]
-				kind = "class"
-				value := symbol
-				currentScope = &value
-			case defRe.MatchString(line):
-				symbol = defRe.FindStringSubmatch(line)[1]
-				kind = "function"
-				if currentScope != nil {
-					kind = "method"
-				}
-			case goFuncRe.MatchString(line):
-				symbol = goFuncRe.FindStringSubmatch(line)[1]
-				kind = "function"
-			case rustFnRe.MatchString(line):
-				symbol = rustFnRe.FindStringSubmatch(line)[1]
-				kind = "function"
-			case jsFuncRe.MatchString(line):
-				symbol = jsFuncRe.FindStringSubmatch(line)[1]
-				kind = "function"
-			case varFuncRe.MatchString(line):
-				symbol = varFuncRe.FindStringSubmatch(line)[1]
-				kind = "function"
-			case structRe.MatchString(line):
-				symbol = structRe.FindStringSubmatch(line)[1]
-				kind = "type"
-			}
-			if symbol == "" || kind == "" {
-				continue
-			}
-			key := relPath + "::" + symbol
+		for _, record := range pathSymbols.Symbols[:min(len(pathSymbols.Symbols), 20)] {
+			key := fmt.Sprintf("%s::%s::%d::%s", record.Path, record.Symbol, intPtrValue(record.LineStart), record.Kind)
 			if _, ok := seen[key]; ok {
 				continue
 			}
-			lowered := strings.ToLower(relPath + " " + symbol)
+			lowered := strings.ToLower(record.Path + " " + record.Symbol + " " + firstNonEmptyPtr(record.EnclosingScope))
 			score := 0
 			matches := []string{}
 			for _, token := range tokens[:min(len(tokens), 12)] {
@@ -1049,22 +1008,23 @@ func extractSymbolContext(root string, candidatePaths []string, tokens []string)
 				continue
 			}
 			seen[key] = struct{}{}
-			lineNumber := index + 1
 			var reason *string
 			if len(matches) > 0 {
-				value := "Matches " + strings.Join(matches[:min(len(matches), 3)], ", ")
+				value := "Matches " + strings.Join(matches[:min(len(matches), 3)], ", ") + "; " + strings.ToLower(pathSymbols.SelectionReason)
 				reason = &value
 			} else {
-				value := "Near ranked focus files."
+				value := pathSymbols.SelectionReason
 				reason = &value
 			}
 			results = append(results, RepoMapSymbolRecord{
-				Path:           relPath,
-				Symbol:         symbol,
-				Kind:           kind,
-				LineStart:      &lineNumber,
-				EnclosingScope: currentScope,
+				Path:           record.Path,
+				Symbol:         record.Symbol,
+				Kind:           record.Kind,
+				LineStart:      record.LineStart,
+				LineEnd:        record.LineEnd,
+				EnclosingScope: record.EnclosingScope,
 				Reason:         reason,
+				EvidenceSource: pathSymbols.EvidenceSource,
 				Score:          score,
 			})
 		}
@@ -1091,6 +1051,13 @@ func extractSymbolContext(root string, candidatePaths []string, tokens []string)
 		return 0
 	})
 	return results[:min(len(results), 8)]
+}
+
+func intPtrValue(value *int) int {
+	if value == nil {
+		return 0
+	}
+	return *value
 }
 
 func rankRelatedArtifacts(
