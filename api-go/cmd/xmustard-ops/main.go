@@ -286,6 +286,7 @@ func runWorkspace(args []string) {
 	language := fs.String("language", "", "semantic language")
 	pathGlob := fs.String("path-glob", "", "path glob")
 	path := fs.String("path", "", "relative workspace path")
+	issueID := fs.String("issue-id", "", "issue id for issue-context reads")
 	line := fs.Int("line", 1, "1-based file line")
 	column := fs.Int("column", 1, "1-based file column")
 	includeDeclaration := fs.Bool("include-declaration", true, "include declaration location in LSP references")
@@ -324,6 +325,15 @@ func runWorkspace(args []string) {
 		payload, err = workspaceops.ReadImpact(*dataDir, workspaceID, *baseRef)
 	case "repo-context":
 		payload, err = workspaceops.ReadRepoContext(*dataDir, workspaceID, *baseRef)
+	case "issue-context":
+		targetIssueID := strings.TrimSpace(*issueID)
+		if targetIssueID == "" {
+			targetIssueID = strings.TrimSpace(*path)
+		}
+		if targetIssueID == "" {
+			fatalUsage("usage: xmustard-ops workspace issue-context <workspace_id> --issue-id <issue_id> [flags]")
+		}
+		payload, err = workspaceops.BuildIssueContextPacket(*dataDir, workspaceID, targetIssueID)
 	case "repo-map":
 		payload, err = workspaceops.ReadWorkspaceRepoMap(*dataDir, workspaceID)
 	case "retrieval-search":
@@ -376,7 +386,7 @@ func runWorkspace(args []string) {
 			SchemaName: optionalFlagString(*schema),
 		})
 	default:
-		fatalUsage("usage: xmustard-ops workspace <scan|repo-state|ingestion-plan|run-targets|verify-targets|project-info|verification-outcomes|repo-map|changed-symbols|impact|repo-context|retrieval-search|path-symbols|document-symbols|go-to-definition|references|workspace-symbols|live-workspace-symbols|explain-path|semantic-search|postgres-materialize-path|postgres-materialize-workspace-symbols|postgres-materialize-semantic-search|semantic-index-materialize> <workspace_id> [flags]")
+		fatalUsage("usage: xmustard-ops workspace <scan|repo-state|ingestion-plan|run-targets|verify-targets|project-info|verification-outcomes|repo-map|changed-symbols|impact|repo-context|issue-context|retrieval-search|path-symbols|document-symbols|go-to-definition|references|workspace-symbols|live-workspace-symbols|explain-path|semantic-search|postgres-materialize-path|postgres-materialize-workspace-symbols|postgres-materialize-semantic-search|semantic-index-materialize> <workspace_id> [flags]")
 	}
 	writeJSON(payload, err)
 }

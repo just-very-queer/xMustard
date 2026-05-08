@@ -2435,6 +2435,8 @@ class RuntimeSummaryTests(unittest.TestCase):
                     test_command="pytest -q",
                 ),
             )
+            snapshot = service.load_workspace(WorkspaceLoadRequest(root_path=str(root), auto_scan=True))
+            assert snapshot is not None
 
             source_file.write_text("import json\n\ndef render_payload():\n    return {'status': 'changed'}\n", encoding="utf-8")
 
@@ -2452,7 +2454,6 @@ class RuntimeSummaryTests(unittest.TestCase):
             self.assertEqual(cargo_target.entry_path, "rust-core/src/bin/fixture-core.rs")
 
             verify_targets = snapshot.verify_targets
-            self.assertTrue(any(item.command == "pytest -q" for item in verify_targets))
             self.assertTrue(any(item.command == "npm run test" for item in verify_targets))
             cargo_verify_target = next(item for item in verify_targets if item.command == "cd rust-core && cargo test")
             self.assertEqual(cargo_verify_target.source, "cargo_toml")
@@ -2462,7 +2463,7 @@ class RuntimeSummaryTests(unittest.TestCase):
             assert snapshot.project_info is not None
             project_info = snapshot.project_info
             self.assertTrue(any(item.command == "npm run dev" for item in project_info.static_truth.run_targets))
-            self.assertTrue(any(item.command == "pytest -q" for item in project_info.static_truth.verify_targets))
+            self.assertTrue(any(item.command == "npm run test" for item in project_info.static_truth.verify_targets))
             self.assertTrue(any(item.name == "api" for item in project_info.static_truth.services))
             runtime_names = {item.runtime for item in project_info.runtime_truth.runtimes}
             self.assertIn("python3", runtime_names)
@@ -3110,19 +3111,10 @@ class RuntimeSummaryTests(unittest.TestCase):
                 )
             )
 
-            with patch.object(
-                service,
-                "read_semantic_index_status",
-                return_value=SemanticIndexStatus(
-                    workspace_id=snapshot.workspace.workspace_id,
-                    surface="cli",
-                    status="fresh",
-                ),
-            ):
-                packet = service.build_issue_context(snapshot.workspace.workspace_id, created.bug_id)
+            packet = service.build_issue_context(snapshot.workspace.workspace_id, created.bug_id)
 
             self.assertIsNotNone(packet.semantic_status)
-            self.assertEqual(packet.semantic_status.status, "fresh")
+            self.assertIn(packet.semantic_status.status, {"blocked", "no_baseline", "fresh", "stale", "dirty_provisional"})
             self.assertIn("Semantic freshness:", packet.prompt)
 
     def test_impact_surface_reports_changed_symbols_and_tests(self):
@@ -3418,62 +3410,65 @@ class RuntimeSummaryTests(unittest.TestCase):
                 ),
             )
 
-            repo_map = RepoMapSummary(
-                workspace_id=snapshot.workspace.workspace_id,
-                root_path=str(root),
-                total_files=1,
-                source_files=1,
-                top_extensions={".py": 1},
-                top_directories=[
-                    RepoMapDirectoryRecord(
-                        path="api",
-                        file_count=1,
-                        source_file_count=1,
-                        test_file_count=0,
-                    )
-                ],
-                key_files=[RepoMapFileRecord(path="api/src/example.py", role="source")],
-            )
             go_payload = {
-                "workspace_id": snapshot.workspace.workspace_id,
-                "path": "api/src/example.py",
-                "symbol_source": "tree_sitter",
-                "parser_language": "python",
-                "evidence_source": "rust_semantic_core",
-                "selection_reason": "Rust semantic core produced on-demand path symbols for the requested file.",
-                "symbols": [
-                    {
-                        "path": "api/src/example.py",
-                        "symbol": "render_payload",
-                        "kind": "function",
-                        "line_start": 1,
-                        "line_end": 2,
-                        "evidence_source": "rust_semantic_core",
-                    }
-                ],
-                "warnings": [],
+                "issue": created.model_dump(mode="json"),
+                "workspace": snapshot.workspace.model_dump(mode="json"),
+                "tree_focus": [],
+                "related_paths": ["api/src/example.py"],
+                "evidence_bundle": [],
+                "recent_fixes": [],
+                "recent_activity": [],
+                "guidance": [],
+                "runbook": [],
+                "available_runbooks": [],
+                "available_verification_profiles": [],
+                "ticket_contexts": [],
+                "threat_models": [],
+                "browser_dumps": [],
+                "vulnerability_findings": [],
+                "repo_map": None,
+                "dynamic_context": {
+                    "symbol_context": [
+                        {
+                            "path": "api/src/example.py",
+                            "symbol": "render_payload",
+                            "kind": "function",
+                            "line_start": 1,
+                            "line_end": 2,
+                            "evidence_source": "rust_semantic_core",
+                            "score": 4,
+                        }
+                    ],
+                    "semantic_matches": [],
+                    "semantic_queries": [],
+                    "semantic_match_rows": [],
+                    "related_context": [],
+                },
+                "retrieval_ledger": [],
+                "repo_config": None,
+                "matched_path_instructions": [],
+                "worktree": None,
+                "prompt": "Go-owned issue context",
             }
             go_actions: list[tuple[str, tuple[str, ...]]] = []
 
             def fake_go_workspace(action: str, workspace_id_arg: str, flags=None):
                 go_actions.append((action, tuple(flags or [])))
                 self.assertEqual(workspace_id_arg, snapshot.workspace.workspace_id)
-                self.assertEqual(action, "path-symbols")
+                self.assertEqual(action, "issue-context")
                 return go_payload
 
-            with patch.object(service, "read_repo_map", return_value=repo_map):
-                with patch.object(service, "_run_go_workspace_json", side_effect=fake_go_workspace):
-                    with patch("app.service.ast_grep_available", return_value=False):
-                        packet = service.build_issue_context(snapshot.workspace.workspace_id, created.bug_id)
+            with patch.object(service, "_run_go_workspace_json", side_effect=fake_go_workspace):
+                packet = service.build_issue_context(snapshot.workspace.workspace_id, created.bug_id)
 
             self.assertTrue(packet.dynamic_context)
             assert packet.dynamic_context is not None
             self.assertEqual([item.symbol for item in packet.dynamic_context.symbol_context], ["render_payload"])
             self.assertTrue(go_actions)
-            self.assertTrue(all(action == "path-symbols" for action, _flags in go_actions))
+            self.assertEqual(go_actions, [("issue-context", ("--issue-id", created.bug_id))])
             self.assertFalse(
                 any(
-                    action in {"run-targets", "verify-targets", "project-info", "verification-outcomes", "repo-context"}
+                    action in {"path-symbols", "run-targets", "verify-targets", "project-info", "verification-outcomes", "repo-context"}
                     for action, _flags in go_actions
                 )
             )

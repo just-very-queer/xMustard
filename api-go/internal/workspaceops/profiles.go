@@ -379,7 +379,19 @@ func loadSavedVerificationProfiles(dataDir string, workspaceID string) ([]rustco
 		}
 		return nil, err
 	}
+	for idx := range profiles {
+		normalizeVerificationProfile(&profiles[idx])
+	}
 	return profiles, nil
+}
+
+func normalizeVerificationProfile(profile *rustcore.VerificationProfileInput) {
+	if profile.SourcePaths == nil {
+		profile.SourcePaths = []string{}
+	}
+	if profile.ChecklistItems == nil {
+		profile.ChecklistItems = []string{}
+	}
 }
 
 func saveVerificationProfiles(dataDir string, workspaceID string, profiles []rustcore.VerificationProfileInput) error {
@@ -422,6 +434,7 @@ func defaultVerificationProfile(workspaceID string) rustcore.VerificationProfile
 		MaxRuntimeSeconds: 30,
 		RetryCount:        1,
 		SourcePaths:       []string{},
+		ChecklistItems:    []string{},
 		BuiltIn:           true,
 		CreatedAt:         now,
 		UpdatedAt:         now,
