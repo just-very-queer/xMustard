@@ -190,6 +190,15 @@ func TestGoRepoIntelligenceReadsImpactContextAndRetrieval(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(repoRoot, "rust-core", "src", "bin", "fixture-core.rs"), []byte("fn main() {}\n"), 0o644); err != nil {
 		t.Fatalf("write rust-core bin: %v", err)
 	}
+	if err := os.MkdirAll(filepath.Join(repoRoot, "api-go", "cmd", "fixture-api"), 0o755); err != nil {
+		t.Fatalf("mkdir api-go/cmd/fixture-api: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, "api-go", "go.mod"), []byte("module fixture/api-go\n\ngo 1.26.0\n"), 0o644); err != nil {
+		t.Fatalf("write api-go go.mod: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, "api-go", "cmd", "fixture-api", "main.go"), []byte("package main\n\nfunc main() {}\n"), 0o644); err != nil {
+		t.Fatalf("write api-go main.go: %v", err)
+	}
 	if err := saveVerificationProfiles(dataDir, workspaceID, []verificationProfileRecord{
 		{
 			ProfileID:         "backend-pytest",
@@ -250,8 +259,14 @@ func TestGoRepoIntelligenceReadsImpactContextAndRetrieval(t *testing.T) {
 	if !repoContextHasCommand(context.RunTargets, "cd rust-core && cargo run --bin fixture-core") {
 		t.Fatalf("expected cargo repo-context run target, got %#v", context.RunTargets)
 	}
+	if !repoContextHasCommand(context.RunTargets, "cd api-go && go run ./cmd/fixture-api") {
+		t.Fatalf("expected go repo-context run target, got %#v", context.RunTargets)
+	}
 	if !repoContextHasCommand(context.VerifyTargets, "cd rust-core && cargo test") {
 		t.Fatalf("expected cargo repo-context verify target, got %#v", context.VerifyTargets)
+	}
+	if !repoContextHasCommand(context.VerifyTargets, "cd api-go && go test ./...") {
+		t.Fatalf("expected go repo-context verify target, got %#v", context.VerifyTargets)
 	}
 
 	retrieval, err := SearchRetrieval(dataDir, workspaceID, "export summary", 5)

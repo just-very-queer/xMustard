@@ -2463,6 +2463,15 @@ class RuntimeSummaryTests(unittest.TestCase):
                 encoding="utf-8",
             )
             (root / "rust-core" / "src" / "bin" / "fixture-core.rs").write_text("fn main() {}\n", encoding="utf-8")
+            (root / "api-go" / "cmd" / "fixture-api").mkdir(parents=True)
+            (root / "api-go" / "go.mod").write_text(
+                "module fixture/api-go\n\ngo 1.26.0\n",
+                encoding="utf-8",
+            )
+            (root / "api-go" / "cmd" / "fixture-api" / "main.go").write_text(
+                "package main\n\nfunc main() {}\n",
+                encoding="utf-8",
+            )
 
             __import__("subprocess").run(["git", "-C", str(root), "init"], check=True, capture_output=True)
             __import__("subprocess").run(["git", "-C", str(root), "add", "."], check=True, capture_output=True)
@@ -2515,6 +2524,10 @@ class RuntimeSummaryTests(unittest.TestCase):
             self.assertEqual(cargo_target.source, "cargo_toml")
             self.assertEqual(cargo_target.working_dir, "rust-core")
             self.assertEqual(cargo_target.entry_path, "rust-core/src/bin/fixture-core.rs")
+            go_target = next(item for item in run_targets if item.command == "cd api-go && go run ./cmd/fixture-api")
+            self.assertEqual(go_target.source, "go_mod")
+            self.assertEqual(go_target.working_dir, "api-go")
+            self.assertEqual(go_target.entry_path, "api-go/cmd/fixture-api/main.go")
 
             verify_targets = snapshot.verify_targets
             self.assertTrue(any(item.command == "npm run test" for item in verify_targets))
@@ -2522,15 +2535,21 @@ class RuntimeSummaryTests(unittest.TestCase):
             self.assertEqual(cargo_verify_target.source, "cargo_toml")
             self.assertEqual(cargo_verify_target.working_dir, "rust-core")
             self.assertIn("cargo test", cargo_verify_target.reason or "")
+            go_verify_target = next(item for item in verify_targets if item.command == "cd api-go && go test ./...")
+            self.assertEqual(go_verify_target.source, "go_mod")
+            self.assertEqual(go_verify_target.working_dir, "api-go")
+            self.assertIn("go test ./...", go_verify_target.reason or "")
 
             assert snapshot.project_info is not None
             project_info = snapshot.project_info
             self.assertTrue(any(item.command == "npm run dev" for item in project_info.static_truth.run_targets))
             self.assertTrue(any(item.command == "npm run test" for item in project_info.static_truth.verify_targets))
+            self.assertTrue(any(item.path == "api-go/go.mod" for item in project_info.static_truth.manifests))
             self.assertTrue(any(item.name == "api" for item in project_info.static_truth.services))
             runtime_names = {item.runtime for item in project_info.runtime_truth.runtimes}
             self.assertIn("python3", runtime_names)
             self.assertIn("cargo", runtime_names)
+            self.assertIn("go", runtime_names)
 
             changes = service.read_change_summary(snapshot.workspace.workspace_id)
             self.assertTrue(any(item.path == "api/src/example.py" for item in changes.changed_files))

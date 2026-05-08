@@ -73,6 +73,7 @@ func discoverManifestTargets(repoRoot string, includeVerify bool) []RepoTargetRe
 	targets = append(targets, discoverPackageTargets(repoRoot, includeVerify)...)
 	targets = append(targets, discoverPyprojectTargets(repoRoot, includeVerify)...)
 	targets = append(targets, discoverCargoTargets(repoRoot, includeVerify)...)
+	targets = append(targets, discoverGoTargets(repoRoot, includeVerify)...)
 	targets = append(targets, discoverDockerTargets(repoRoot)...)
 	return dedupeRepoTargets(targets)
 }
@@ -272,6 +273,62 @@ func discoverDockerTargets(repoRoot string) []RepoTargetRecord {
 	return targets
 }
 
+func discoverGoTargets(repoRoot string, includeVerify bool) []RepoTargetRecord {
+	targets := []RepoTargetRecord{}
+	for _, manifest := range candidateGoModFiles(repoRoot) {
+		manifestPath := normalizeRepoPath(repoRoot, manifest)
+		workingDir := normalizeWorkingDir(repoRoot, filepath.Dir(manifest))
+		labelPrefix := workingDir
+		if labelPrefix == "" {
+			labelPrefix = filepath.Base(manifest)
+		}
+		if includeVerify {
+			reason := fmt.Sprintf("Go module in %s supports go test ./... for workspace-local verification.", manifestPath)
+			targets = append(targets, RepoTargetRecord{
+				TargetID:   "go-test-" + hashID(manifestPath, workingDir),
+				Kind:       "test",
+				Label:      labelPrefix + ":go test",
+				Command:    prefixCommandWithWorkingDir(workingDir, "go test ./..."),
+				Source:     "go_mod",
+				SourcePath: manifestPath,
+				Confidence: 90,
+				WorkingDir: workingDir,
+				Reason:     &reason,
+			})
+			continue
+		}
+		for _, commandPkg := range discoverGoCommandPackages(repoRoot, manifest) {
+			runReason := fmt.Sprintf("Go command package %s is declared by %s and has package main at %s.", commandPkg.PackagePath, manifestPath, commandPkg.EntryPath)
+			targets = append(targets, RepoTargetRecord{
+				TargetID:   "go-run-" + hashID(manifestPath, commandPkg.PackagePath, commandPkg.EntryPath),
+				Kind:       "run",
+				Label:      labelPrefix + ":" + commandPkg.Name,
+				Command:    prefixCommandWithWorkingDir(workingDir, "go run ./"+commandPkg.PackagePath),
+				Source:     "go_mod",
+				SourcePath: manifestPath,
+				Confidence: 91,
+				WorkingDir: workingDir,
+				EntryPath:  &commandPkg.EntryPath,
+				Reason:     &runReason,
+			})
+			buildReason := fmt.Sprintf("Go command package %s is declared by %s and can be built from %s.", commandPkg.PackagePath, manifestPath, commandPkg.EntryPath)
+			targets = append(targets, RepoTargetRecord{
+				TargetID:   "go-build-" + hashID(manifestPath, commandPkg.PackagePath, commandPkg.EntryPath),
+				Kind:       "build",
+				Label:      labelPrefix + ":" + commandPkg.Name + " build",
+				Command:    prefixCommandWithWorkingDir(workingDir, "go build ./"+commandPkg.PackagePath),
+				Source:     "go_mod",
+				SourcePath: manifestPath,
+				Confidence: 89,
+				WorkingDir: workingDir,
+				EntryPath:  &commandPkg.EntryPath,
+				Reason:     &buildReason,
+			})
+		}
+	}
+	return targets
+}
+
 func dedupeRepoTargets(targets []RepoTargetRecord) []RepoTargetRecord {
 	deduped := map[string]RepoTargetRecord{}
 	order := []string{}
@@ -376,6 +433,12 @@ type cargoBinInfo struct {
 	Path string
 }
 
+type goCommandPackageInfo struct {
+	Name        string
+	PackagePath string
+	EntryPath   string
+}
+
 func candidatePyprojectFiles(repoRoot string) []string {
 	return candidateManifestFiles(repoRoot, "pyproject.toml", map[string]struct{}{
 		".git": {}, "node_modules": {}, "dist": {}, "build": {}, "coverage": {}, "research": {}, "__pycache__": {}, ".venv": {}, "venv": {},
@@ -385,6 +448,12 @@ func candidatePyprojectFiles(repoRoot string) []string {
 func candidateCargoTomlFiles(repoRoot string) []string {
 	return candidateManifestFiles(repoRoot, "Cargo.toml", map[string]struct{}{
 		".git": {}, "node_modules": {}, "dist": {}, "build": {}, "coverage": {}, "research": {}, "__pycache__": {}, ".venv": {}, "venv": {}, "target": {},
+	})
+}
+
+func candidateGoModFiles(repoRoot string) []string {
+	return candidateManifestFiles(repoRoot, "go.mod", map[string]struct{}{
+		".git": {}, "node_modules": {}, "dist": {}, "build": {}, "coverage": {}, "research": {}, "__pycache__": {}, ".venv": {}, "venv": {}, "target": {}, "vendor": {},
 	})
 }
 
@@ -546,6 +615,38 @@ func dedupeCargoBins(items []cargoBinInfo) []cargoBinInfo {
 		out = append(out, seen[key])
 	}
 	return out
+}
+
+func discoverGoCommandPackages(repoRoot string, goModPath string) []goCommandPackageInfo {
+	moduleRoot := filepath.Dir(goModPath)
+	cmdRoot := filepath.Join(moduleRoot, "cmd")
+	entries, err := os.ReadDir(cmdRoot)
+	if err != nil {
+		return []goCommandPackageInfo{}
+	}
+	items := []goCommandPackageInfo{}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		mainPath := filepath.Join(cmdRoot, entry.Name(), "main.go")
+		content, err := os.ReadFile(mainPath)
+		if err != nil || !strings.Contains(string(content), "package main") {
+			continue
+		}
+		items = append(items, goCommandPackageInfo{
+			Name:        entry.Name(),
+			PackagePath: filepath.ToSlash(filepath.Join("cmd", entry.Name())),
+			EntryPath:   normalizeRepoPath(repoRoot, mainPath),
+		})
+	}
+	slices.SortFunc(items, func(a, b goCommandPackageInfo) int {
+		if a.PackagePath != b.PackagePath {
+			return strings.Compare(a.PackagePath, b.PackagePath)
+		}
+		return strings.Compare(a.EntryPath, b.EntryPath)
+	})
+	return items
 }
 
 func parsePythonScriptModuleTarget(raw string) (string, bool) {

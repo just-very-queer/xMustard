@@ -476,7 +476,7 @@ class RepoTargetRecord(BaseModel):
     kind: Literal["dev", "run", "build", "test", "lint", "verify", "service", "other"] = "other"
     label: str
     command: str
-    source: Literal["package_json", "makefile", "docker_compose", "verification_profile", "pyproject_toml", "cargo_toml", "heuristic"] = "heuristic"
+    source: Literal["package_json", "makefile", "docker_compose", "verification_profile", "pyproject_toml", "cargo_toml", "go_mod", "heuristic"] = "heuristic"
     source_path: str
     confidence: int = 50
     profile_id: Optional[str] = None
@@ -486,7 +486,7 @@ class RepoTargetRecord(BaseModel):
 
 
 ProjectInfoVerdict = Literal["declared", "runtime_observed", "config_backed", "inferred_needs_review", "unavailable"]
-ProjectInfoSourceKind = Literal["package_json", "makefile", "docker_compose", "verification_profile", "pyproject_toml", "cargo_toml", "runtime_probe"]
+ProjectInfoSourceKind = Literal["package_json", "makefile", "docker_compose", "verification_profile", "pyproject_toml", "cargo_toml", "go_mod", "runtime_probe"]
 ProjectInfoEvidenceType = Literal["manifest_file", "saved_config", "declared_command", "derived_command", "entry_file", "runtime_binary_lookup", "compose_service"]
 class ProjectInfoProvenance(BaseModel):
     source_kind: ProjectInfoSourceKind
@@ -502,7 +502,7 @@ class ProjectInfoProvenance(BaseModel):
 
 
 class ProjectManifestRecord(BaseModel):
-    manifest_kind: Literal["package_json", "makefile", "docker_compose", "pyproject_toml", "cargo_toml"]
+    manifest_kind: Literal["package_json", "makefile", "docker_compose", "pyproject_toml", "cargo_toml", "go_mod"]
     path: str
     verdict: ProjectInfoVerdict
     provenance: ProjectInfoProvenance

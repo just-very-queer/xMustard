@@ -183,6 +183,16 @@ func discoverProjectManifests(repoRoot string) []ProjectManifestRecord {
 			Provenance:   newProjectInfoProvenance("cargo_toml", &relative, nil, nil, nil, "manifest_file", []string{relative}, nil, projectInfoIntPtr(100), optionalStringPtr(reason)),
 		})
 	}
+	for _, manifest := range candidateGoModFiles(repoRoot) {
+		relative := normalizeRepoPath(repoRoot, manifest)
+		reason := "go.mod is present and contributes repo-declared Go module metadata."
+		manifests = append(manifests, ProjectManifestRecord{
+			ManifestKind: "go_mod",
+			Path:         relative,
+			Verdict:      projectInfoVerdictDeclared,
+			Provenance:   newProjectInfoProvenance("go_mod", &relative, nil, nil, nil, "manifest_file", []string{relative}, nil, projectInfoIntPtr(100), optionalStringPtr(reason)),
+		})
+	}
 	for _, candidate := range []string{"docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml"} {
 		path := filepath.Join(repoRoot, candidate)
 		if _, err := os.Stat(path); err != nil {
@@ -238,6 +248,8 @@ func discoverDeclaredProjectRuntimes(manifests []ProjectManifestRecord) []Projec
 			add("python3", manifest.ManifestKind, manifest.Path)
 		case "cargo_toml":
 			add("cargo", manifest.ManifestKind, manifest.Path)
+		case "go_mod":
+			add("go", manifest.ManifestKind, manifest.Path)
 		case "makefile":
 			add("make", manifest.ManifestKind, manifest.Path)
 		case "docker_compose":
@@ -307,10 +319,10 @@ func projectInfoVerdictFromTarget(target RepoTargetRecord) string {
 	switch target.Source {
 	case "verification_profile":
 		return projectInfoVerdictConfigBacked
+	case "go_mod", "pyproject_toml", "cargo_toml":
+		return projectInfoVerdictConfigBacked
 	case "package_json", "makefile":
 		return projectInfoVerdictInferredNeedsReview
-	case "pyproject_toml", "cargo_toml":
-		return projectInfoVerdictConfigBacked
 	default:
 		return projectInfoVerdictDeclared
 	}

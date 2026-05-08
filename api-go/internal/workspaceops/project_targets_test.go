@@ -81,6 +81,15 @@ func TestReadRunTargetsAndVerifyTargetsDiscoverPyprojectAndCargoEntrypoints(t *t
 	if err := os.WriteFile(filepath.Join(repoRoot, "rust-core", "src", "bin", "fixture-core.rs"), []byte("fn main() {}\n"), 0o644); err != nil {
 		t.Fatalf("write rust binary: %v", err)
 	}
+	if err := os.MkdirAll(filepath.Join(repoRoot, "api-go", "cmd", "fixture-api"), 0o755); err != nil {
+		t.Fatalf("mkdir api-go/cmd/fixture-api: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, "api-go", "go.mod"), []byte("module fixture/api-go\n\ngo 1.26.0\n"), 0o644); err != nil {
+		t.Fatalf("write api-go go.mod: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, "api-go", "cmd", "fixture-api", "main.go"), []byte("package main\n\nfunc main() {}\n"), 0o644); err != nil {
+		t.Fatalf("write api-go main.go: %v", err)
+	}
 
 	runTargets, err := ReadRunTargets(dataDir, workspaceID)
 	if err != nil {
@@ -116,6 +125,27 @@ func TestReadRunTargetsAndVerifyTargetsDiscoverPyprojectAndCargoEntrypoints(t *t
 	}
 	if rustVerifyTarget.Source != "cargo_toml" || rustVerifyTarget.Reason == nil || !strings.Contains(*rustVerifyTarget.Reason, "cargo test") {
 		t.Fatalf("unexpected cargo verify provenance: %#v", rustVerifyTarget)
+	}
+
+	goRunTarget := findTargetByCommand(runTargets, "cd api-go && go run ./cmd/fixture-api")
+	if goRunTarget == nil {
+		t.Fatalf("expected go run target in run targets: %#v", runTargets)
+	}
+	if goRunTarget.Source != "go_mod" || goRunTarget.WorkingDir != "api-go" || goRunTarget.EntryPath == nil || *goRunTarget.EntryPath != "api-go/cmd/fixture-api/main.go" {
+		t.Fatalf("unexpected go run provenance: %#v", goRunTarget)
+	}
+
+	goBuildTarget := findTargetByCommand(runTargets, "cd api-go && go build ./cmd/fixture-api")
+	if goBuildTarget == nil || goBuildTarget.Source != "go_mod" {
+		t.Fatalf("expected go build target in run targets: %#v", runTargets)
+	}
+
+	goVerifyTarget := findTargetByCommand(verifyTargets, "cd api-go && go test ./...")
+	if goVerifyTarget == nil {
+		t.Fatalf("expected go test verify target in verify targets: %#v", verifyTargets)
+	}
+	if goVerifyTarget.Source != "go_mod" || goVerifyTarget.Reason == nil || !strings.Contains(*goVerifyTarget.Reason, "go test ./...") {
+		t.Fatalf("unexpected go verify provenance: %#v", goVerifyTarget)
 	}
 }
 

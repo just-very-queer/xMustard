@@ -30,6 +30,15 @@ func TestReadProjectInfoBuildsDeterministicStaticAndRuntimeTruth(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(repoRoot, "rust-core", "src", "bin", "fixture-core.rs"), []byte("fn main() {}\n"), 0o644); err != nil {
 		t.Fatalf("write rust binary: %v", err)
 	}
+	if err := os.MkdirAll(filepath.Join(repoRoot, "api-go", "cmd", "fixture-api"), 0o755); err != nil {
+		t.Fatalf("mkdir api-go/cmd/fixture-api: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, "api-go", "go.mod"), []byte("module fixture/api-go\n\ngo 1.26.0\n"), 0o644); err != nil {
+		t.Fatalf("write api-go go.mod: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, "api-go", "cmd", "fixture-api", "main.go"), []byte("package main\n\nfunc main() {}\n"), 0o644); err != nil {
+		t.Fatalf("write api-go main.go: %v", err)
+	}
 	if err := saveVerificationProfiles(dataDir, workspaceID, []verificationProfileRecord{{
 		ProfileID:         "backend-pytest",
 		WorkspaceID:       workspaceID,
@@ -51,19 +60,19 @@ func TestReadProjectInfoBuildsDeterministicStaticAndRuntimeTruth(t *testing.T) {
 		t.Fatalf("read project info: %v", err)
 	}
 
-	if !projectInfoHasManifest(projectInfo.StaticTruth.Manifests, "package.json") || !projectInfoHasManifest(projectInfo.StaticTruth.Manifests, "backend/pyproject.toml") || !projectInfoHasManifest(projectInfo.StaticTruth.Manifests, "rust-core/Cargo.toml") || !projectInfoHasManifest(projectInfo.StaticTruth.Manifests, "docker-compose.yml") {
+	if !projectInfoHasManifest(projectInfo.StaticTruth.Manifests, "package.json") || !projectInfoHasManifest(projectInfo.StaticTruth.Manifests, "backend/pyproject.toml") || !projectInfoHasManifest(projectInfo.StaticTruth.Manifests, "rust-core/Cargo.toml") || !projectInfoHasManifest(projectInfo.StaticTruth.Manifests, "api-go/go.mod") || !projectInfoHasManifest(projectInfo.StaticTruth.Manifests, "docker-compose.yml") {
 		t.Fatalf("expected manifest inventory, got %#v", projectInfo.StaticTruth.Manifests)
 	}
-	if !projectInfoHasCommand(projectInfo.StaticTruth.RunTargets, "npm run dev") || !projectInfoHasCommand(projectInfo.StaticTruth.RunTargets, "cd backend && python3 -m app.cli") || !projectInfoHasCommand(projectInfo.StaticTruth.VerifyTargets, "pytest -q") {
+	if !projectInfoHasCommand(projectInfo.StaticTruth.RunTargets, "npm run dev") || !projectInfoHasCommand(projectInfo.StaticTruth.RunTargets, "cd backend && python3 -m app.cli") || !projectInfoHasCommand(projectInfo.StaticTruth.RunTargets, "cd api-go && go run ./cmd/fixture-api") || !projectInfoHasCommand(projectInfo.StaticTruth.VerifyTargets, "pytest -q") || !projectInfoHasCommand(projectInfo.StaticTruth.VerifyTargets, "cd api-go && go test ./...") {
 		t.Fatalf("expected target inventory, got run=%#v verify=%#v", projectInfo.StaticTruth.RunTargets, projectInfo.StaticTruth.VerifyTargets)
 	}
-	if !projectInfoHasEntrypoint(projectInfo.StaticTruth.Entrypoints, "backend/app/cli.py") || !projectInfoHasEntrypoint(projectInfo.StaticTruth.Entrypoints, "rust-core/src/bin/fixture-core.rs") {
+	if !projectInfoHasEntrypoint(projectInfo.StaticTruth.Entrypoints, "backend/app/cli.py") || !projectInfoHasEntrypoint(projectInfo.StaticTruth.Entrypoints, "rust-core/src/bin/fixture-core.rs") || !projectInfoHasEntrypoint(projectInfo.StaticTruth.Entrypoints, "api-go/cmd/fixture-api/main.go") {
 		t.Fatalf("expected entrypoints, got %#v", projectInfo.StaticTruth.Entrypoints)
 	}
 	if !projectInfoHasService(projectInfo.StaticTruth.Services, "api") {
 		t.Fatalf("expected compose service, got %#v", projectInfo.StaticTruth.Services)
 	}
-	if !projectInfoHasDeclaredRuntime(projectInfo.StaticTruth.Runtimes, "python3") || !projectInfoHasDeclaredRuntime(projectInfo.StaticTruth.Runtimes, "cargo") || !projectInfoHasObservedRuntime(projectInfo.RuntimeTruth.Runtimes, "npm") {
+	if !projectInfoHasDeclaredRuntime(projectInfo.StaticTruth.Runtimes, "python3") || !projectInfoHasDeclaredRuntime(projectInfo.StaticTruth.Runtimes, "cargo") || !projectInfoHasDeclaredRuntime(projectInfo.StaticTruth.Runtimes, "go") || !projectInfoHasObservedRuntime(projectInfo.RuntimeTruth.Runtimes, "npm") || !projectInfoHasObservedRuntime(projectInfo.RuntimeTruth.Runtimes, "go") {
 		t.Fatalf("expected runtime inventory, got static=%#v runtime=%#v", projectInfo.StaticTruth.Runtimes, projectInfo.RuntimeTruth.Runtimes)
 	}
 	for _, item := range projectInfo.RuntimeTruth.Runtimes {
