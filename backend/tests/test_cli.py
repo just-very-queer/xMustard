@@ -171,43 +171,42 @@ reviews:
             )
 
             with patch.object(cli_module, "service", service):
-                with patch("app.service.tree_sitter_available", return_value=True):
-                    with patch("app.service.shutil.which", return_value="/opt/homebrew/bin/sg"):
-                        def fake_go_workspace(action: str, workspace_id_arg: str, flags=None):
-                            self.assertEqual(workspace_id_arg, workspace_id)
-                            if action == "impact":
-                                return {"workspace_id": workspace_id, "derivation_summary": "Rust-backed impact report", "warnings": []}
-                            if action == "changed-symbols":
-                                return [{"path": "api/src/example.py", "symbol": "render_payload", "kind": "function"}]
-                            if action == "semantic-search":
-                                return {"workspace_id": workspace_id, "pattern": "def $A():", "match_count": 1, "matches": []}
-                            raise AssertionError(f"unexpected Go workspace action: {action}")
+                with patch("app.service.shutil.which", return_value="/opt/homebrew/bin/sg"):
+                    def fake_go_workspace(action: str, workspace_id_arg: str, flags=None):
+                        self.assertEqual(workspace_id_arg, workspace_id)
+                        if action == "impact":
+                            return {"workspace_id": workspace_id, "derivation_summary": "Rust-backed impact report", "warnings": []}
+                        if action == "changed-symbols":
+                            return [{"path": "api/src/example.py", "symbol": "render_payload", "kind": "function"}]
+                        if action == "semantic-search":
+                            return {"workspace_id": workspace_id, "pattern": "def $A():", "match_count": 1, "matches": []}
+                        raise AssertionError(f"unexpected Go workspace action: {action}")
 
-                        checks = [
-                            (
-                                ["changed-symbols", workspace_id],
-                                lambda payload: self.assertEqual(payload[0]["symbol"], "render_payload"),
-                            ),
-                            (
-                                ["changed-since-last-run", workspace_id],
-                                lambda payload: self.assertIn("changed_files", payload),
-                            ),
-                            (
-                                ["changed-since-last-accepted-fix", workspace_id],
-                                lambda payload: self.assertIn("changed_files", payload),
-                            ),
-                            (
-                                ["impact", workspace_id],
-                                lambda payload: self.assertIn("derivation_summary", payload),
-                            ),
-                            (
-                                ["semantic-search", workspace_id, "--pattern", "def $A():", "--language", "python"],
-                                lambda payload: self.assertIn("match_count", payload),
-                            ),
-                        ]
+                    checks = [
+                        (
+                            ["changed-symbols", workspace_id],
+                            lambda payload: self.assertEqual(payload[0]["symbol"], "render_payload"),
+                        ),
+                        (
+                            ["changed-since-last-run", workspace_id],
+                            lambda payload: self.assertIn("changed_files", payload),
+                        ),
+                        (
+                            ["changed-since-last-accepted-fix", workspace_id],
+                            lambda payload: self.assertIn("changed_files", payload),
+                        ),
+                        (
+                            ["impact", workspace_id],
+                            lambda payload: self.assertIn("derivation_summary", payload),
+                        ),
+                        (
+                            ["semantic-search", workspace_id, "--pattern", "def $A():", "--language", "python"],
+                            lambda payload: self.assertIn("match_count", payload),
+                        ),
+                    ]
 
-                        with patch.object(cli_module, "_run_go_workspace_json", side_effect=fake_go_workspace):
-                            with patch.object(service, "_run_go_workspace_json", side_effect=fake_go_workspace):
+                    with patch.object(cli_module, "_run_go_workspace_json", side_effect=fake_go_workspace):
+                        with patch.object(service, "_run_go_workspace_json", side_effect=fake_go_workspace):
                                 for argv, validator in checks:
                                     result = self.runner.invoke(cli_module.app, argv)
                                     self.assertEqual(result.exit_code, 0, msg=result.output)
