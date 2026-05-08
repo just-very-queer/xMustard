@@ -1,11 +1,13 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"xmustard/api-go/internal/workspaceops"
 )
@@ -270,10 +272,48 @@ func runRuntime(args []string) {
 }
 
 func runWorkspace(args []string) {
-	if len(args) < 2 {
-		fatalUsage("usage: xmustard-ops workspace <action> <workspace_id> [flags]")
+	if len(args) < 1 {
+		fatalUsage("usage: xmustard-ops workspace <list|load|scan|repo-state|ingestion-plan|run-targets|verify-targets|project-info|verification-outcomes|verification-profiles|verification-profile-save|verification-profile-run|repo-map|changed-symbols|impact|repo-context|issue-context|retrieval-search|path-symbols|document-symbols|go-to-definition|references|workspace-symbols|live-workspace-symbols|explain-path|semantic-search|postgres-materialize-path|postgres-materialize-workspace-symbols|postgres-materialize-semantic-search|semantic-index-materialize> [workspace_id] [flags]")
 	}
 	action := args[0]
+	switch action {
+	case "list":
+		fs := flag.NewFlagSet("xmustard-ops workspace list", flag.ExitOnError)
+		dataDir := fs.String("data-dir", envDefault("XMUSTARD_DATA_DIR", "../backend/data"), "xMustard data directory")
+		if err := fs.Parse(args[1:]); err != nil {
+			fatal(err.Error())
+		}
+		payload, err := workspaceops.ListWorkspaces(*dataDir)
+		writeJSON(payload, err)
+		return
+	case "load":
+		fs := flag.NewFlagSet("xmustard-ops workspace load", flag.ExitOnError)
+		dataDir := fs.String("data-dir", envDefault("XMUSTARD_DATA_DIR", "../backend/data"), "xMustard data directory")
+		rootPath := fs.String("root-path", "", "workspace root path")
+		name := fs.String("name", "", "workspace name override")
+		autoScan := fs.Bool("auto-scan", true, "scan the workspace after loading it")
+		preferCachedSnapshot := fs.Bool("prefer-cached-snapshot", true, "reuse a current cached snapshot when possible")
+		if err := fs.Parse(args[1:]); err != nil {
+			fatal(err.Error())
+		}
+		if strings.TrimSpace(*rootPath) == "" {
+			fatalUsage("usage: xmustard-ops workspace load --root-path <path> [flags]")
+		}
+		request := workspaceops.WorkspaceLoadRequest{
+			RootPath:             *rootPath,
+			AutoScan:             *autoScan,
+			PreferCachedSnapshot: *preferCachedSnapshot,
+		}
+		if trimmedName := strings.TrimSpace(*name); trimmedName != "" {
+			request.Name = &trimmedName
+		}
+		payload, err := workspaceops.LoadWorkspace(*dataDir, request)
+		writeJSON(payload, err)
+		return
+	}
+	if len(args) < 2 {
+		fatalUsage("usage: xmustard-ops workspace <scan|repo-state|ingestion-plan|run-targets|verify-targets|project-info|verification-outcomes|verification-profiles|verification-profile-save|verification-profile-run|repo-map|changed-symbols|impact|repo-context|issue-context|retrieval-search|path-symbols|document-symbols|go-to-definition|references|workspace-symbols|live-workspace-symbols|explain-path|semantic-search|postgres-materialize-path|postgres-materialize-workspace-symbols|postgres-materialize-semantic-search|semantic-index-materialize> <workspace_id> [flags]")
+	}
 	workspaceID := strings.TrimSpace(args[1])
 	if workspaceID == "" {
 		fatalUsage("workspace_id is required")
@@ -287,6 +327,17 @@ func runWorkspace(args []string) {
 	pathGlob := fs.String("path-glob", "", "path glob")
 	path := fs.String("path", "", "relative workspace path")
 	issueID := fs.String("issue-id", "", "issue id for issue-context reads")
+	profileID := fs.String("profile-id", "", "verification profile id")
+	name := fs.String("name", "", "verification profile name")
+	description := fs.String("description", "", "verification profile description")
+	testCommand := fs.String("test-command", "", "verification profile test command")
+	coverageCommand := fs.String("coverage-command", "", "verification profile coverage command")
+	coverageReportPath := fs.String("coverage-report-path", "", "verification profile coverage report path")
+	coverageFormat := fs.String("coverage-format", "unknown", "verification profile coverage format")
+	maxRuntimeSeconds := fs.Int64("max-runtime-seconds", 30, "verification profile max runtime seconds")
+	retryCount := fs.Int64("retry-count", 1, "verification profile retry count")
+	runID := fs.String("run-id", "", "run id for verification profile execution")
+	timeoutSeconds := fs.Int("timeout-seconds", 125, "verification profile execution timeout in seconds")
 	line := fs.Int("line", 1, "1-based file line")
 	column := fs.Int("column", 1, "1-based file column")
 	includeDeclaration := fs.Bool("include-declaration", true, "include declaration location in LSP references")
@@ -295,7 +346,11 @@ func runWorkspace(args []string) {
 	dsn := fs.String("dsn", "", "Postgres DSN override")
 	schema := fs.String("schema", "", "Postgres schema override")
 	var paths stringSliceFlag
+	var sourcePaths stringSliceFlag
+	var checklistItems stringSliceFlag
 	fs.Var(&paths, "select-path", "exact relative path to include in a workspace materialization batch; may be repeated")
+	fs.Var(&sourcePaths, "source-path", "verification profile source path; may be repeated")
+	fs.Var(&checklistItems, "checklist-item", "verification profile checklist item; may be repeated")
 	if err := fs.Parse(args[2:]); err != nil {
 		fatal(err.Error())
 	}
@@ -319,6 +374,47 @@ func runWorkspace(args []string) {
 		payload, err = workspaceops.ReadProjectInfo(*dataDir, workspaceID)
 	case "verification-outcomes":
 		payload, err = workspaceops.ReadVerificationOutcomes(*dataDir, workspaceID)
+	case "verification-profiles":
+		payload, err = workspaceops.ListVerificationProfiles(*dataDir, workspaceID)
+	case "verification-profile-save":
+		profileName := strings.TrimSpace(*name)
+		command := strings.TrimSpace(*testCommand)
+		if profileName == "" || command == "" {
+			fatalUsage("usage: xmustard-ops workspace verification-profile-save <workspace_id> --name <name> --test-command <command> [flags]")
+		}
+		request := workspaceops.VerificationProfileUpsertRequest{
+			ProfileID:          optionalFlagString(*profileID),
+			Name:               profileName,
+			Description:        strings.TrimSpace(*description),
+			TestCommand:        command,
+			CoverageCommand:    optionalFlagString(*coverageCommand),
+			CoverageReportPath: optionalFlagString(*coverageReportPath),
+			CoverageFormat:     strings.TrimSpace(*coverageFormat),
+			MaxRuntimeSeconds:  *maxRuntimeSeconds,
+			RetryCount:         *retryCount,
+			SourcePaths:        []string(sourcePaths),
+			ChecklistItems:     []string(checklistItems),
+		}
+		payload, err = workspaceops.SaveVerificationProfile(*dataDir, workspaceID, request)
+	case "verification-profile-run":
+		targetIssueID := strings.TrimSpace(*issueID)
+		targetProfileID := strings.TrimSpace(*profileID)
+		if targetIssueID == "" || targetProfileID == "" {
+			fatalUsage("usage: xmustard-ops workspace verification-profile-run <workspace_id> --issue-id <issue_id> --profile-id <profile_id> [flags]")
+		}
+		if *timeoutSeconds < 1 {
+			*timeoutSeconds = 125
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(*timeoutSeconds)*time.Second)
+		defer cancel()
+		payload, err = workspaceops.RunIssueVerificationProfile(
+			ctx,
+			*dataDir,
+			workspaceID,
+			targetIssueID,
+			targetProfileID,
+			strings.TrimSpace(*runID),
+		)
 	case "changed-symbols":
 		payload, err = workspaceops.ReadChangedSymbols(*dataDir, workspaceID, *baseRef)
 	case "impact":
@@ -383,7 +479,7 @@ func runWorkspace(args []string) {
 			SchemaName: optionalFlagString(*schema),
 		})
 	default:
-		fatalUsage("usage: xmustard-ops workspace <scan|repo-state|ingestion-plan|run-targets|verify-targets|project-info|verification-outcomes|repo-map|changed-symbols|impact|repo-context|issue-context|retrieval-search|path-symbols|document-symbols|go-to-definition|references|workspace-symbols|live-workspace-symbols|explain-path|semantic-search|postgres-materialize-path|postgres-materialize-workspace-symbols|postgres-materialize-semantic-search|semantic-index-materialize> <workspace_id> [flags]")
+		fatalUsage("usage: xmustard-ops workspace <list|load|scan|repo-state|ingestion-plan|run-targets|verify-targets|project-info|verification-outcomes|verification-profiles|verification-profile-save|verification-profile-run|repo-map|changed-symbols|impact|repo-context|issue-context|retrieval-search|path-symbols|document-symbols|go-to-definition|references|workspace-symbols|live-workspace-symbols|explain-path|semantic-search|postgres-materialize-path|postgres-materialize-workspace-symbols|postgres-materialize-semantic-search|semantic-index-materialize> [workspace_id] [flags]")
 	}
 	writeJSON(payload, err)
 }
