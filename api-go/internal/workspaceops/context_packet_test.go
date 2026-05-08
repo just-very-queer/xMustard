@@ -108,6 +108,36 @@ func TestBuildIssueContextPacketBuildsFrontendShapeFromArtifacts(t *testing.T) {
 	}
 }
 
+func TestBuildIssueContextPacketNormalizesLegacyReviewReadyRuns(t *testing.T) {
+	dataDir, workspaceID, issueID, repoRoot := writeIssueContextFixture(t, false)
+	installFakeAstGrep(t, repoRoot)
+
+	snapshotPath := filepath.Join(dataDir, "workspaces", workspaceID, "snapshot.json")
+	var snapshot workspaceSnapshot
+	if err := readJSON(snapshotPath, &snapshot); err != nil {
+		t.Fatalf("read snapshot: %v", err)
+	}
+	snapshot.Issues[0].ReviewReadyRuns = nil
+	if err := writeJSON(snapshotPath, snapshot); err != nil {
+		t.Fatalf("write legacy snapshot: %v", err)
+	}
+
+	packet, err := BuildIssueContextPacket(dataDir, workspaceID, issueID)
+	if err != nil {
+		t.Fatalf("build issue context packet: %v", err)
+	}
+	if packet.Issue.ReviewReadyRuns == nil {
+		t.Fatalf("expected legacy review_ready_runs to normalize to an empty slice")
+	}
+	encoded, err := json.Marshal(packet)
+	if err != nil {
+		t.Fatalf("marshal packet: %v", err)
+	}
+	if !strings.Contains(string(encoded), "\"review_ready_runs\":[]") {
+		t.Fatalf("expected normalized review_ready_runs JSON, got %s", encoded)
+	}
+}
+
 func TestGetWorkspaceRepoConfigHealthReportsConfigured(t *testing.T) {
 	dataDir, workspaceID, _, _ := writeIssueContextFixture(t, false)
 

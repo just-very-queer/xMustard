@@ -10,7 +10,6 @@ from app.models import (
     EvidenceRef,
     EvalScenarioUpsertRequest,
     EvalReplayBatchRecord,
-    FileSymbolSummaryMaterializationRecord,
     FixRecordRequest,
     ImprovementSuggestion,
     GuidanceStarterRequest,
@@ -18,7 +17,6 @@ from app.models import (
     IssueCreateRequest,
     IssueUpdateRequest,
     PatchCritique,
-    PathSymbolsResult,
     PlanFileAttachment,
     PlanApproveRequest,
     PlanStep,
@@ -29,14 +27,10 @@ from app.models import (
     RepoMapDirectoryRecord,
     RepoMapFileRecord,
     RepoMapSummary,
-    RepoMapSymbolRecord,
     RunPlan,
     SemanticIndexBaselineRecord,
     SemanticIndexStatus,
-    SemanticPatternMatchRecord,
     SemanticPatternQueryResult,
-    SemanticQueryMaterializationRecord,
-    SemanticMatchMaterializationRecord,
     RunRecord,
     RunAcceptRequest,
     RunMetrics,
@@ -53,7 +47,6 @@ from app.models import (
     VulnerabilityFindingUpsertRequest,
     WorktreeStatus,
     WorkspaceLoadRequest,
-    SymbolMaterializationRecord,
 )
 from app.runtimes import RuntimeService
 from app.service import TrackerService
@@ -1305,26 +1298,96 @@ reviews:
                 ),
             )
 
-            fake_matches = [
-                SemanticPatternMatchRecord(
-                    path="api/src/example.py",
-                    language="python",
-                    line_start=1,
-                    line_end=1,
-                    column_start=1,
-                    column_end=21,
-                    matched_text="def render_payload():",
-                    context_lines="def render_payload():",
-                    meta_variables=[],
-                )
-            ]
+            go_payload = {
+                "issue": created.model_dump(mode="json"),
+                "workspace": snapshot.workspace.model_dump(mode="json"),
+                "tree_focus": ["api/src/example.py"],
+                "related_paths": ["api/src/example.py"],
+                "evidence_bundle": [],
+                "recent_fixes": [],
+                "recent_activity": [],
+                "guidance": [],
+                "runbook": [],
+                "available_runbooks": [],
+                "available_verification_profiles": [],
+                "ticket_contexts": [],
+                "threat_models": [],
+                "browser_dumps": [],
+                "vulnerability_findings": [],
+                "repo_map": None,
+                "dynamic_context": {
+                    "symbol_context": [],
+                    "semantic_matches": [
+                        {
+                            "path": "api/src/example.py",
+                            "language": "python",
+                            "line_start": 1,
+                            "line_end": 1,
+                            "column_start": 1,
+                            "column_end": 21,
+                            "matched_text": "def render_payload():",
+                            "context_lines": "def render_payload():",
+                            "meta_variables": [],
+                            "reason": "Go-owned semantic match",
+                            "score": 4,
+                        }
+                    ],
+                    "semantic_queries": [
+                        {
+                            "query_ref": "semanticq_render_payload",
+                            "workspace_id": snapshot.workspace.workspace_id,
+                            "issue_id": created.bug_id,
+                            "run_id": None,
+                            "source": "issue_context",
+                            "reason": "Go-owned semantic query",
+                            "pattern": "def render_payload($$$ARGS): $$$BODY",
+                            "language": "python",
+                            "path_glob": "**/*.py",
+                            "engine": "ast_grep",
+                            "match_count": 1,
+                            "truncated": False,
+                            "error": None,
+                        }
+                    ],
+                    "semantic_match_rows": [
+                        {
+                            "query_ref": "semanticq_render_payload",
+                            "workspace_id": snapshot.workspace.workspace_id,
+                            "path": "api/src/example.py",
+                            "language": "python",
+                            "line_start": 1,
+                            "line_end": 1,
+                            "column_start": 1,
+                            "column_end": 21,
+                            "matched_text": "def render_payload():",
+                            "context_lines": "def render_payload():",
+                            "meta_variables": [],
+                            "reason": "Go-owned semantic match",
+                            "score": 4,
+                        }
+                    ],
+                    "related_context": [],
+                },
+                "retrieval_ledger": [
+                    {
+                        "entry_id": "semantic_match:api/src/example.py:1:1",
+                        "source_type": "semantic_match",
+                        "source_id": "api/src/example.py:1:1",
+                        "title": "def render_payload():",
+                        "path": "api/src/example.py",
+                        "reason": "Matched a semantic pattern derived from issue terms.",
+                        "matched_terms": ["render_payload"],
+                        "score": 4,
+                    }
+                ],
+                "repo_config": None,
+                "matched_path_instructions": [],
+                "worktree": None,
+                "prompt": "Go-owned issue context\nSemantic matches:\n- def render_payload():",
+            }
 
-            with patch("app.service.ast_grep_available", return_value=True):
-                with patch(
-                    "app.service.run_ast_grep_query",
-                    return_value=(fake_matches, "/opt/homebrew/bin/sg", None, False),
-                ):
-                    packet = service.build_issue_context(snapshot.workspace.workspace_id, created.bug_id)
+            with patch.object(service, "_run_go_workspace_json", return_value=go_payload):
+                packet = service.build_issue_context(snapshot.workspace.workspace_id, created.bug_id)
 
             assert packet.dynamic_context is not None
             self.assertTrue(packet.dynamic_context.semantic_matches)
@@ -3001,89 +3064,6 @@ class RuntimeSummaryTests(unittest.TestCase):
             self.assertTrue(status.fingerprint_match)
             self.assertGreater(status.current_dirty_files, 0)
 
-    def test_path_symbols_delegates_to_go_workspace_ops(self):
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            root = Path(tmp_dir) / "repo"
-            (root / "api" / "src").mkdir(parents=True)
-            (root / "docs" / "bugs").mkdir(parents=True)
-            (root / "api" / "src" / "example.py").write_text("def render_payload():\n    return True\n", encoding="utf-8")
-            (root / "docs" / "bugs" / "Bugs_25260323.md").write_text(LEDGER_TEXT, encoding="utf-8")
-
-            store = FileStore(Path(tmp_dir) / "data")
-            service = TrackerService(store)
-            snapshot = service.load_workspace(WorkspaceLoadRequest(root_path=str(root), auto_scan=True))
-            assert snapshot is not None
-
-            go_payload = {
-                "workspace_id": snapshot.workspace.workspace_id,
-                "path": "api/src/example.py",
-                "symbol_source": "tree_sitter",
-                "parser_language": "python",
-                "evidence_source": "rust_semantic_core",
-                "selection_reason": "Rust semantic core produced on-demand path symbols for the requested file.",
-                "symbols": [
-                    {
-                        "path": "api/src/example.py",
-                        "symbol": "render_payload",
-                        "kind": "function",
-                        "evidence_source": "rust_semantic_core",
-                    }
-                ],
-                "warnings": [],
-            }
-            with patch.object(service, "_run_go_workspace_json", return_value=go_payload) as go_mock:
-                result = service._read_go_path_symbols(snapshot.workspace.workspace_id, "api/src/example.py")
-
-            self.assertEqual(result.evidence_source, "rust_semantic_core")
-            self.assertEqual(result.symbols[0].symbol, "render_payload")
-            go_mock.assert_called_once_with(
-                "path-symbols",
-                snapshot.workspace.workspace_id,
-                ["--path", "api/src/example.py"],
-            )
-
-    def test_path_symbols_keeps_postgres_settings_out_of_python_authority(self):
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            root = Path(tmp_dir) / "repo"
-            (root / "api" / "src").mkdir(parents=True)
-            (root / "docs" / "bugs").mkdir(parents=True)
-            (root / "api" / "src" / "example.py").write_text("def render_payload():\n    return True\n", encoding="utf-8")
-            (root / "docs" / "bugs" / "Bugs_25260323.md").write_text(LEDGER_TEXT, encoding="utf-8")
-
-            store = FileStore(Path(tmp_dir) / "data")
-            service = TrackerService(store)
-            snapshot = service.load_workspace(WorkspaceLoadRequest(root_path=str(root), auto_scan=True))
-            assert snapshot is not None
-            service.update_settings(
-                service.get_settings().model_copy(
-                    update={"postgres_dsn": "postgresql://xmustard:secret@localhost:5432/xmustard"}
-                )
-            )
-
-            go_payload = {
-                "workspace_id": snapshot.workspace.workspace_id,
-                "path": "api/src/example.py",
-                "symbol_source": "tree_sitter",
-                "parser_language": "python",
-                "evidence_source": "rust_semantic_core",
-                "selection_reason": "Go delivery over Rust semantic-core output.",
-                "symbols": [
-                    {
-                        "path": "api/src/example.py",
-                        "symbol": "render_payload",
-                        "kind": "function",
-                        "evidence_source": "rust_semantic_core",
-                    }
-                ],
-                "warnings": [],
-            }
-            with patch.object(service, "_run_go_workspace_json", return_value=go_payload) as go_mock:
-                result = service._read_go_path_symbols(snapshot.workspace.workspace_id, "api/src/example.py")
-
-            self.assertEqual(result.evidence_source, "rust_semantic_core")
-            self.assertEqual(result.symbols[0].evidence_source, "rust_semantic_core")
-            go_mock.assert_called_once()
-
     def test_issue_context_reports_semantic_freshness_and_stored_symbol_provenance(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir) / "repo"
@@ -3385,7 +3365,29 @@ class RuntimeSummaryTests(unittest.TestCase):
             ]:
                 self.assertFalse(hasattr(service, attr), msg=attr)
 
-            self.assertTrue(hasattr(service, "_read_go_path_symbols"))
+    def test_python_issue_context_assembly_helpers_are_retired(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = TrackerService(FileStore(Path(tmp_dir) / "data"))
+
+            self.assertTrue(hasattr(service, "build_issue_context"))
+            for attr in [
+                "_match_repo_path_instructions",
+                "_read_go_path_symbols",
+                "_semantic_query_ref",
+                "_build_semantic_query_row",
+                "_build_semantic_match_rows",
+                "_context_tokens",
+                "_rank_related_paths",
+                "_build_dynamic_context",
+                "_collect_semantic_matches",
+                "_derive_semantic_patterns",
+                "_semantic_patterns_for_name",
+                "_ast_grep_glob_for_language",
+                "_build_context_retrieval_ledger",
+                "_extract_symbol_context",
+                "_rank_related_artifacts",
+            ]:
+                self.assertFalse(hasattr(service, attr), msg=attr)
 
     def test_issue_context_keeps_go_project_truth_reads_out_of_python_symbol_bridge(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -3471,177 +3473,6 @@ class RuntimeSummaryTests(unittest.TestCase):
                     action in {"path-symbols", "run-targets", "verify-targets", "project-info", "verification-outcomes", "repo-context"}
                     for action, _flags in go_actions
                 )
-            )
-
-    def test_path_symbols_prefer_rust_semantic_contracts_when_stored_rows_are_absent(self):
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            root = Path(tmp_dir) / "repo"
-            (root / "docs" / "bugs").mkdir(parents=True)
-            (root / "api" / "src").mkdir(parents=True)
-            (root / "docs" / "bugs" / "Bugs_25260323.md").write_text(LEDGER_TEXT, encoding="utf-8")
-            (root / "api" / "src" / "example.py").write_text(
-                "class ApiHandler:\n    def render_payload(self):\n        return {'status': 'ok'}\n",
-                encoding="utf-8",
-            )
-
-            store = FileStore(Path(tmp_dir) / "data")
-            service = TrackerService(store)
-            snapshot = service.load_workspace(WorkspaceLoadRequest(root_path=str(root), auto_scan=True))
-            assert snapshot is not None
-
-            rust_path_symbols = PathSymbolsResult(
-                workspace_id=snapshot.workspace.workspace_id,
-                path="api/src/example.py",
-                symbol_source="tree_sitter",
-                parser_language="python",
-                evidence_source="rust_semantic_core",
-                selection_reason="Rust semantic core produced on-demand path symbols for the requested file.",
-                symbols=[
-                    RepoMapSymbolRecord(
-                        path="api/src/example.py",
-                        symbol="ApiHandler",
-                        kind="class",
-                        line_start=1,
-                        line_end=3,
-                        evidence_source="rust_semantic_core",
-                    ),
-                    RepoMapSymbolRecord(
-                        path="api/src/example.py",
-                        symbol="render_payload",
-                        kind="method",
-                        line_start=2,
-                        line_end=3,
-                        enclosing_scope="ApiHandler",
-                        evidence_source="rust_semantic_core",
-                    ),
-                ],
-                file_summary_row=FileSymbolSummaryMaterializationRecord(
-                    workspace_id=snapshot.workspace.workspace_id,
-                    path="api/src/example.py",
-                    language="python",
-                    parser_language="python",
-                    symbol_source="tree_sitter",
-                    symbol_count=2,
-                    summary_json={"top_symbols": ["ApiHandler", "render_payload"]},
-                ),
-                symbol_rows=[
-                    SymbolMaterializationRecord(
-                        workspace_id=snapshot.workspace.workspace_id,
-                        path="api/src/example.py",
-                        symbol="ApiHandler",
-                        kind="class",
-                        language="python",
-                        line_start=1,
-                        line_end=3,
-                    ),
-                    SymbolMaterializationRecord(
-                        workspace_id=snapshot.workspace.workspace_id,
-                        path="api/src/example.py",
-                        symbol="render_payload",
-                        kind="method",
-                        language="python",
-                        line_start=2,
-                        line_end=3,
-                        enclosing_scope="ApiHandler",
-                    ),
-                ],
-            )
-            def fake_go_workspace(action: str, workspace_id_arg: str, flags=None):
-                self.assertEqual(workspace_id_arg, snapshot.workspace.workspace_id)
-                if action == "path-symbols":
-                    self.assertEqual(flags, ["--path", "api/src/example.py"])
-                    return rust_path_symbols.model_dump(mode="json")
-                raise AssertionError(f"unexpected Go workspace action: {action}")
-
-            with patch.object(service, "_run_go_workspace_json", side_effect=fake_go_workspace) as go_mock:
-                result = service._read_go_path_symbols(snapshot.workspace.workspace_id, "api/src/example.py")
-
-            self.assertEqual(result.symbol_source, "tree_sitter")
-            self.assertEqual(result.parser_language, "python")
-            self.assertEqual(result.evidence_source, "rust_semantic_core")
-            self.assertEqual([item.symbol for item in result.symbols], ["ApiHandler", "render_payload"])
-            self.assertEqual(result.symbols[1].enclosing_scope, "ApiHandler")
-            self.assertIsNotNone(result.file_summary_row)
-            assert result.file_summary_row is not None
-            self.assertEqual(result.file_summary_row.symbol_source, "tree_sitter")
-            self.assertEqual(result.file_summary_row.summary_json["top_symbols"], ["ApiHandler", "render_payload"])
-            self.assertEqual([item.symbol for item in result.symbol_rows], ["ApiHandler", "render_payload"])
-            self.assertEqual(go_mock.call_count, 1)
-
-    def test_path_symbols_returns_storage_ready_rows_from_go(self):
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            root = Path(tmp_dir) / "repo"
-            (root / "docs" / "bugs").mkdir(parents=True)
-            (root / "api" / "src").mkdir(parents=True)
-            indexed_path = root / "api" / "src" / "example.py"
-            indexed_path.write_text("def render_payload():\n    return {'status': 'ok'}\n", encoding="utf-8")
-            (root / "docs" / "bugs" / "Bugs_25260323.md").write_text(LEDGER_TEXT, encoding="utf-8")
-
-            store = FileStore(Path(tmp_dir) / "data")
-            service = TrackerService(store)
-            snapshot = service.load_workspace(WorkspaceLoadRequest(root_path=str(root), auto_scan=True))
-            assert snapshot is not None
-            service.update_settings(
-                service.get_settings().model_copy(
-                    update={
-                        "postgres_dsn": "postgresql://xmustard:secret@localhost:5432/xmustard",
-                        "postgres_schema": "agent_context",
-                    }
-                )
-            )
-
-            go_payload = {
-                "workspace_id": snapshot.workspace.workspace_id,
-                "path": "api/src/example.py",
-                "symbol_source": "tree_sitter",
-                "parser_language": "python",
-                "evidence_source": "rust_semantic_core",
-                "selection_reason": "Rust semantic core produced storage-ready rows.",
-                "symbols": [
-                    {
-                        "path": "api/src/example.py",
-                        "symbol": "render_payload",
-                        "kind": "function",
-                        "line_start": 1,
-                        "line_end": 2,
-                        "evidence_source": "rust_semantic_core",
-                    }
-                ],
-                "file_summary_row": {
-                    "workspace_id": snapshot.workspace.workspace_id,
-                    "path": "api/src/example.py",
-                    "language": "python",
-                    "parser_language": "python",
-                    "symbol_source": "tree_sitter",
-                    "symbol_count": 1,
-                    "summary_json": {"top_symbols": ["render_payload"]},
-                },
-                "symbol_rows": [
-                    {
-                        "workspace_id": snapshot.workspace.workspace_id,
-                        "path": "api/src/example.py",
-                        "symbol": "render_payload",
-                        "kind": "function",
-                        "language": "python",
-                        "line_start": 1,
-                        "line_end": 2,
-                    }
-                ],
-                "warnings": [],
-            }
-            with patch.object(service, "_run_go_workspace_json", return_value=go_payload) as go_mock:
-                result = service._read_go_path_symbols(snapshot.workspace.workspace_id, "api/src/example.py")
-
-            self.assertEqual([item.symbol for item in result.symbols], ["render_payload"])
-            self.assertEqual(result.symbol_source, "tree_sitter")
-            self.assertIsNotNone(result.file_summary_row)
-            assert result.file_summary_row is not None
-            self.assertEqual(result.file_summary_row.summary_json["top_symbols"], ["render_payload"])
-            self.assertEqual([item.symbol for item in result.symbol_rows], ["render_payload"])
-            go_mock.assert_called_once_with(
-                "path-symbols",
-                snapshot.workspace.workspace_id,
-                ["--path", "api/src/example.py"],
             )
 
     def test_semantic_search_returns_ast_grep_matches(self):

@@ -328,9 +328,6 @@ func runWorkspace(args []string) {
 	case "issue-context":
 		targetIssueID := strings.TrimSpace(*issueID)
 		if targetIssueID == "" {
-			targetIssueID = strings.TrimSpace(*path)
-		}
-		if targetIssueID == "" {
 			fatalUsage("usage: xmustard-ops workspace issue-context <workspace_id> --issue-id <issue_id> [flags]")
 		}
 		payload, err = workspaceops.BuildIssueContextPacket(*dataDir, workspaceID, targetIssueID)
