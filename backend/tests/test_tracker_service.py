@@ -2446,7 +2446,18 @@ class RuntimeSummaryTests(unittest.TestCase):
                 json.dumps({"name": "fixture", "scripts": {"dev": "vite", "build": "vite build", "test": "vitest run"}}),
                 encoding="utf-8",
             )
-            (root / "Makefile").write_text("backend:\n\tpython3 -m uvicorn app.main:app\nlint:\n\techo lint\n", encoding="utf-8")
+            (root / "frontend" / "package.json").write_text(
+                json.dumps({"name": "fixture-ui", "scripts": {"dev": "vite", "test": "vitest run"}}),
+                encoding="utf-8",
+            )
+            (root / "frontend" / "vite.config.ts").write_text(
+                "import { defineConfig } from 'vite'\nexport default defineConfig({ server: { port: 5177, proxy: { '/api': 'http://127.0.0.1:8042' } } })\n",
+                encoding="utf-8",
+            )
+            (root / "Makefile").write_text(
+                "backend:\n\tcd backend && python3 -m uvicorn app.main:app --reload --port 8042\nfrontend:\n\tcd frontend && npm run dev\nlint:\n\techo lint\n",
+                encoding="utf-8",
+            )
             (root / "docker-compose.yml").write_text("services:\n  api:\n    image: example\n", encoding="utf-8")
             (root / "backend" / "app").mkdir(parents=True)
             (root / "backend" / "pyproject.toml").write_text(
@@ -2457,6 +2468,7 @@ class RuntimeSummaryTests(unittest.TestCase):
                 "def app():\n    return True\n\nif __name__ == \"__main__\":\n    app()\n",
                 encoding="utf-8",
             )
+            (root / "backend" / "app" / "main.py").write_text("def app():\n    return True\n", encoding="utf-8")
             (root / "rust-core" / "src" / "bin").mkdir(parents=True)
             (root / "rust-core" / "Cargo.toml").write_text(
                 "[package]\nname='fixture-core'\nversion='0.1.0'\nedition='2024'\n",
@@ -2469,7 +2481,7 @@ class RuntimeSummaryTests(unittest.TestCase):
                 encoding="utf-8",
             )
             (root / "api-go" / "cmd" / "fixture-api" / "main.go").write_text(
-                "package main\n\nfunc main() {}\n",
+                "package main\n\nimport \"os\"\n\nfunc main() {\n    _ = envDefault(\"XMUSTARD_API_PORT\", \"8080\")\n}\n\nfunc envDefault(name string, fallback string) string {\n    value := os.Getenv(name)\n    if value == \"\" {\n        return fallback\n    }\n    return value\n}\n",
                 encoding="utf-8",
             )
 
@@ -2546,6 +2558,17 @@ class RuntimeSummaryTests(unittest.TestCase):
             self.assertTrue(any(item.command == "npm run test" for item in project_info.static_truth.verify_targets))
             self.assertTrue(any(item.path == "api-go/go.mod" for item in project_info.static_truth.manifests))
             self.assertTrue(any(item.name == "api" for item in project_info.static_truth.services))
+            make_backend = next(item for item in project_info.static_truth.run_targets if item.command == "make backend")
+            self.assertEqual(make_backend.provenance.entry_path, "backend/app/main.py")
+            self.assertIn("uvicorn app.main:app --reload --port 8042", make_backend.provenance.declared_command or "")
+            self.assertIn("Declared command sets --port 8042.", make_backend.provenance.config_hints)
+            make_frontend = next(item for item in project_info.static_truth.run_targets if item.command == "make frontend")
+            self.assertEqual(make_frontend.provenance.declared_command, "vite")
+            self.assertIn("frontend/vite.config.ts", make_frontend.provenance.config_files)
+            self.assertIn("Vite dev server port is 5177.", make_frontend.provenance.config_hints)
+            self.assertIn("Vite proxy maps /api to http://127.0.0.1:8042.", make_frontend.provenance.config_hints)
+            go_project_target = next(item for item in project_info.static_truth.run_targets if item.command == "cd api-go && go run ./cmd/fixture-api")
+            self.assertIn("Entrypoint reads env var XMUSTARD_API_PORT with default 8080.", go_project_target.provenance.config_hints)
             runtime_names = {item.runtime for item in project_info.runtime_truth.runtimes}
             self.assertIn("python3", runtime_names)
             self.assertIn("cargo", runtime_names)

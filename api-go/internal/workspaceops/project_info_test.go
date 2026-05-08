@@ -3,23 +3,34 @@ package workspaceops
 import (
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
 )
 
 func TestReadProjectInfoBuildsDeterministicStaticAndRuntimeTruth(t *testing.T) {
 	dataDir, workspaceID, repoRoot := writeSemanticIndexFixture(t)
 
-	if err := os.WriteFile(filepath.Join(repoRoot, "Makefile"), []byte("backend:\n\tpython3 -m uvicorn app.main:app\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(repoRoot, "Makefile"), []byte("backend:\n\tcd backend && python3 -m uvicorn app.main:app --reload --port 8042\nfrontend:\n\tcd frontend && npm run dev\ngo-api:\n\tcd api-go && go run ./cmd/fixture-api\ndev:\n\t@echo use frontend and go-api\n"), 0o644); err != nil {
 		t.Fatalf("write Makefile: %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(repoRoot, "docker-compose.yml"), []byte("services:\n  api:\n    image: busybox\n"), 0o644); err != nil {
 		t.Fatalf("write docker-compose.yml: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, "frontend", "package.json"), []byte("{\"name\":\"fixture-ui\",\"scripts\":{\"dev\":\"vite\",\"test\":\"vitest run\"}}\n"), 0o644); err != nil {
+		t.Fatalf("write frontend package.json: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, "frontend", "vite.config.ts"), []byte("import { defineConfig } from 'vite'\nexport default defineConfig({ server: { port: 5177, proxy: { '/api': 'http://127.0.0.1:8042' } } })\n"), 0o644); err != nil {
+		t.Fatalf("write frontend vite config: %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(repoRoot, "backend", "pyproject.toml"), []byte("[project]\nname = \"fixture-backend\"\n[project.scripts]\nxmustard = \"app.cli:app\"\n"), 0o644); err != nil {
 		t.Fatalf("write backend pyproject.toml: %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(repoRoot, "backend", "app", "cli.py"), []byte("def app():\n    return True\n\nif __name__ == \"__main__\":\n    app()\n"), 0o644); err != nil {
 		t.Fatalf("rewrite backend cli.py: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, "backend", "app", "main.py"), []byte("def app():\n    return True\n"), 0o644); err != nil {
+		t.Fatalf("write backend main.py: %v", err)
 	}
 	if err := os.MkdirAll(filepath.Join(repoRoot, "rust-core", "src", "bin"), 0o755); err != nil {
 		t.Fatalf("mkdir rust-core/src/bin: %v", err)
@@ -36,7 +47,7 @@ func TestReadProjectInfoBuildsDeterministicStaticAndRuntimeTruth(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(repoRoot, "api-go", "go.mod"), []byte("module fixture/api-go\n\ngo 1.26.0\n"), 0o644); err != nil {
 		t.Fatalf("write api-go go.mod: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(repoRoot, "api-go", "cmd", "fixture-api", "main.go"), []byte("package main\n\nfunc main() {}\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(repoRoot, "api-go", "cmd", "fixture-api", "main.go"), []byte("package main\n\nimport \"os\"\n\nfunc main() {\n\t_ = envDefault(\"XMUSTARD_API_PORT\", \"8080\")\n}\n\nfunc envDefault(name string, fallback string) string {\n\tvalue := os.Getenv(name)\n\tif value == \"\" {\n\t\treturn fallback\n\t}\n\treturn value\n}\n"), 0o644); err != nil {
 		t.Fatalf("write api-go main.go: %v", err)
 	}
 	if err := saveVerificationProfiles(dataDir, workspaceID, []verificationProfileRecord{{
@@ -71,6 +82,37 @@ func TestReadProjectInfoBuildsDeterministicStaticAndRuntimeTruth(t *testing.T) {
 	}
 	if !projectInfoHasService(projectInfo.StaticTruth.Services, "api") {
 		t.Fatalf("expected compose service, got %#v", projectInfo.StaticTruth.Services)
+	}
+	frontendTarget := findProjectCommand(projectInfo.StaticTruth.RunTargets, "make frontend")
+	if frontendTarget == nil || frontendTarget.Provenance.DeclaredCommand == nil || *frontendTarget.Provenance.DeclaredCommand != "vite" {
+		t.Fatalf("expected frontend make target declared command, got %#v", frontendTarget)
+	}
+	if !slices.Contains(frontendTarget.Provenance.ConfigFiles, "frontend/vite.config.ts") {
+		t.Fatalf("expected frontend vite config evidence, got %#v", frontendTarget)
+	}
+	if !containsProjectInfoString(frontendTarget.Provenance.ConfigHints, "Vite dev server port is 5177.") || !containsProjectInfoString(frontendTarget.Provenance.ConfigHints, "Vite proxy maps /api to http://127.0.0.1:8042.") {
+		t.Fatalf("expected frontend config hints, got %#v", frontendTarget)
+	}
+	backendTarget := findProjectCommand(projectInfo.StaticTruth.RunTargets, "make backend")
+	if backendTarget == nil || backendTarget.Provenance.EntryPath == nil || *backendTarget.Provenance.EntryPath != "backend/app/main.py" {
+		t.Fatalf("expected backend make target entrypoint, got %#v", backendTarget)
+	}
+	if backendTarget.Provenance.DeclaredCommand == nil || !strings.Contains(*backendTarget.Provenance.DeclaredCommand, "uvicorn app.main:app --reload --port 8042") {
+		t.Fatalf("expected backend declared command, got %#v", backendTarget)
+	}
+	if !containsProjectInfoString(backendTarget.Provenance.ConfigHints, "Declared command sets --port 8042.") {
+		t.Fatalf("expected backend port hint, got %#v", backendTarget)
+	}
+	goTarget := findProjectCommand(projectInfo.StaticTruth.RunTargets, "cd api-go && go run ./cmd/fixture-api")
+	if goTarget == nil || !containsProjectInfoString(goTarget.Provenance.ConfigHints, "Entrypoint reads env var XMUSTARD_API_PORT with default 8080.") {
+		t.Fatalf("expected Go env config hint, got %#v", goTarget)
+	}
+	service := findProjectService(projectInfo.StaticTruth.Services, "api")
+	if service == nil || service.Provenance.ServiceName == nil || *service.Provenance.ServiceName != "api" {
+		t.Fatalf("expected compose service provenance, got %#v", service)
+	}
+	if !containsProjectInfoString(service.Provenance.ConfigHints, "Compose service image: busybox.") {
+		t.Fatalf("expected compose service image hint, got %#v", service)
 	}
 	if !projectInfoHasDeclaredRuntime(projectInfo.StaticTruth.Runtimes, "python3") || !projectInfoHasDeclaredRuntime(projectInfo.StaticTruth.Runtimes, "cargo") || !projectInfoHasDeclaredRuntime(projectInfo.StaticTruth.Runtimes, "go") || !projectInfoHasObservedRuntime(projectInfo.RuntimeTruth.Runtimes, "npm") || !projectInfoHasObservedRuntime(projectInfo.RuntimeTruth.Runtimes, "go") {
 		t.Fatalf("expected runtime inventory, got static=%#v runtime=%#v", projectInfo.StaticTruth.Runtimes, projectInfo.RuntimeTruth.Runtimes)
@@ -120,6 +162,33 @@ func projectInfoHasEntrypoint(items []ProjectEntrypointRecord, entryPath string)
 func projectInfoHasService(items []ProjectServiceRecord, name string) bool {
 	for _, item := range items {
 		if item.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func findProjectCommand(items []ProjectCommandRecord, command string) *ProjectCommandRecord {
+	for idx := range items {
+		if items[idx].Command == command {
+			return &items[idx]
+		}
+	}
+	return nil
+}
+
+func findProjectService(items []ProjectServiceRecord, name string) *ProjectServiceRecord {
+	for idx := range items {
+		if items[idx].Name == name {
+			return &items[idx]
+		}
+	}
+	return nil
+}
+
+func containsProjectInfoString(items []string, expected string) bool {
+	for _, item := range items {
+		if item == expected {
 			return true
 		}
 	}

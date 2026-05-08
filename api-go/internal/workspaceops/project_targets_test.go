@@ -10,7 +10,7 @@ import (
 func TestReadRunTargetsAndVerifyTargetsUseManifestDiscoveryAndSavedProfiles(t *testing.T) {
 	dataDir, workspaceID, repoRoot := writeSemanticIndexFixture(t)
 
-	if err := os.WriteFile(filepath.Join(repoRoot, "Makefile"), []byte("backend:\n\tpython3 -m uvicorn app.main:app\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(repoRoot, "Makefile"), []byte("backend:\n\tpython3 -m uvicorn app.main:app\n\ndev:\n\t@echo choose a target\n"), 0o644); err != nil {
 		t.Fatalf("write Makefile: %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(repoRoot, "docker-compose.yml"), []byte("services:\n  api:\n    image: busybox\n"), 0o644); err != nil {
@@ -52,11 +52,17 @@ func TestReadRunTargetsAndVerifyTargetsUseManifestDiscoveryAndSavedProfiles(t *t
 	if !hasTargetCommand(runTargets, "docker compose -f docker-compose.yml up") {
 		t.Fatalf("expected docker compose target in run targets: %#v", runTargets)
 	}
+	if hasTargetCommand(runTargets, "make dev") {
+		t.Fatalf("did not expect echo-only make target in run targets: %#v", runTargets)
+	}
 	if !hasTargetCommand(verifyTargets, "npm run test") {
 		t.Fatalf("expected npm run test in verify targets: %#v", verifyTargets)
 	}
 	if !hasTargetCommand(verifyTargets, "pytest -q") {
 		t.Fatalf("expected saved verification profile target in verify targets: %#v", verifyTargets)
+	}
+	if hasTargetCommand(verifyTargets, "docker compose -f docker-compose.yml up") {
+		t.Fatalf("did not expect docker compose run target in verify targets: %#v", verifyTargets)
 	}
 	if !hasTargetSourcePath(verifyTargets, "verification_profiles.json") {
 		t.Fatalf("expected verification_profiles.json provenance: %#v", verifyTargets)

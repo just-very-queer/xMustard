@@ -494,6 +494,10 @@ class ProjectInfoProvenance(BaseModel):
     command: Optional[str] = None
     cwd: Optional[str] = None
     entry_path: Optional[str] = None
+    declared_command: Optional[str] = None
+    service_name: Optional[str] = None
+    config_files: list[str] = Field(default_factory=list)
+    config_hints: list[str] = Field(default_factory=list)
     evidence_type: ProjectInfoEvidenceType
     evidence: list[EvidenceRef] = Field(default_factory=list)
     profile_id: Optional[str] = None
@@ -544,6 +548,8 @@ class ProjectServiceRecord(BaseModel):
     name: str
     command: str
     verdict: ProjectInfoVerdict
+    depends_on: list[str] = Field(default_factory=list)
+    profiles: list[str] = Field(default_factory=list)
     provenance: ProjectInfoProvenance
 
 

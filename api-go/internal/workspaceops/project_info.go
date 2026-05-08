@@ -4,7 +4,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -42,16 +44,20 @@ type ProjectInfoRuntimeTruth struct {
 }
 
 type ProjectInfoProvenance struct {
-	SourceKind   string        `json:"source_kind"`
-	SourceFile   *string       `json:"source_file,omitempty"`
-	Command      *string       `json:"command,omitempty"`
-	Cwd          *string       `json:"cwd,omitempty"`
-	EntryPath    *string       `json:"entry_path,omitempty"`
-	EvidenceType string        `json:"evidence_type"`
-	Evidence     []evidenceRef `json:"evidence"`
-	ProfileID    *string       `json:"profile_id,omitempty"`
-	Confidence   *int          `json:"confidence,omitempty"`
-	Reason       *string       `json:"reason,omitempty"`
+	SourceKind      string        `json:"source_kind"`
+	SourceFile      *string       `json:"source_file,omitempty"`
+	Command         *string       `json:"command,omitempty"`
+	Cwd             *string       `json:"cwd,omitempty"`
+	EntryPath       *string       `json:"entry_path,omitempty"`
+	DeclaredCommand *string       `json:"declared_command,omitempty"`
+	ServiceName     *string       `json:"service_name,omitempty"`
+	ConfigFiles     []string      `json:"config_files,omitempty"`
+	ConfigHints     []string      `json:"config_hints,omitempty"`
+	EvidenceType    string        `json:"evidence_type"`
+	Evidence        []evidenceRef `json:"evidence"`
+	ProfileID       *string       `json:"profile_id,omitempty"`
+	Confidence      *int          `json:"confidence,omitempty"`
+	Reason          *string       `json:"reason,omitempty"`
 }
 
 type ProjectManifestRecord struct {
@@ -97,7 +103,18 @@ type ProjectServiceRecord struct {
 	Name       string                `json:"name"`
 	Command    string                `json:"command"`
 	Verdict    string                `json:"verdict"`
+	DependsOn  []string              `json:"depends_on,omitempty"`
+	Profiles   []string              `json:"profiles,omitempty"`
 	Provenance ProjectInfoProvenance `json:"provenance"`
+}
+
+type projectCommandResolution struct {
+	Cwd             *string
+	EntryPath       *string
+	DeclaredCommand *string
+	ServiceName     *string
+	ConfigFiles     []string
+	ConfigHints     []string
 }
 
 func ReadProjectInfo(dataDir string, workspaceID string) (*ProjectInfoRecord, error) {
@@ -126,9 +143,9 @@ func buildProjectInfo(workspaceID string, repoRoot string, runTargets []RepoTarg
 		StaticTruth: ProjectInfoStaticTruth{
 			Manifests:     manifests,
 			Runtimes:      declaredRuntimes,
-			Entrypoints:   buildProjectEntrypoints(runTargets),
-			RunTargets:    buildProjectCommandRecords(runTargets),
-			VerifyTargets: buildProjectCommandRecords(verifyTargets),
+			Entrypoints:   buildProjectEntrypoints(repoRoot, runTargets),
+			RunTargets:    buildProjectCommandRecords(repoRoot, runTargets),
+			VerifyTargets: buildProjectCommandRecords(repoRoot, verifyTargets),
 			Services:      services,
 			Warnings:      warnings,
 		},
@@ -149,7 +166,7 @@ func discoverProjectManifests(repoRoot string) []ProjectManifestRecord {
 			ManifestKind: "package_json",
 			Path:         relative,
 			Verdict:      projectInfoVerdictDeclared,
-			Provenance:   newProjectInfoProvenance("package_json", &relative, nil, nil, nil, "manifest_file", []string{relative}, nil, projectInfoIntPtr(100), optionalStringPtr(reason)),
+			Provenance:   newProjectInfoProvenance("package_json", &relative, nil, nil, nil, nil, nil, nil, nil, "manifest_file", []string{relative}, nil, projectInfoIntPtr(100), optionalStringPtr(reason)),
 		})
 	}
 	makefilePath := filepath.Join(repoRoot, "Makefile")
@@ -160,7 +177,7 @@ func discoverProjectManifests(repoRoot string) []ProjectManifestRecord {
 			ManifestKind: "makefile",
 			Path:         relative,
 			Verdict:      projectInfoVerdictDeclared,
-			Provenance:   newProjectInfoProvenance("makefile", &relative, nil, nil, nil, "manifest_file", []string{relative}, nil, projectInfoIntPtr(100), optionalStringPtr(reason)),
+			Provenance:   newProjectInfoProvenance("makefile", &relative, nil, nil, nil, nil, nil, nil, nil, "manifest_file", []string{relative}, nil, projectInfoIntPtr(100), optionalStringPtr(reason)),
 		})
 	}
 	for _, manifest := range candidatePyprojectFiles(repoRoot) {
@@ -170,7 +187,7 @@ func discoverProjectManifests(repoRoot string) []ProjectManifestRecord {
 			ManifestKind: "pyproject_toml",
 			Path:         relative,
 			Verdict:      projectInfoVerdictDeclared,
-			Provenance:   newProjectInfoProvenance("pyproject_toml", &relative, nil, nil, nil, "manifest_file", []string{relative}, nil, projectInfoIntPtr(100), optionalStringPtr(reason)),
+			Provenance:   newProjectInfoProvenance("pyproject_toml", &relative, nil, nil, nil, nil, nil, nil, nil, "manifest_file", []string{relative}, nil, projectInfoIntPtr(100), optionalStringPtr(reason)),
 		})
 	}
 	for _, manifest := range candidateCargoTomlFiles(repoRoot) {
@@ -180,7 +197,7 @@ func discoverProjectManifests(repoRoot string) []ProjectManifestRecord {
 			ManifestKind: "cargo_toml",
 			Path:         relative,
 			Verdict:      projectInfoVerdictDeclared,
-			Provenance:   newProjectInfoProvenance("cargo_toml", &relative, nil, nil, nil, "manifest_file", []string{relative}, nil, projectInfoIntPtr(100), optionalStringPtr(reason)),
+			Provenance:   newProjectInfoProvenance("cargo_toml", &relative, nil, nil, nil, nil, nil, nil, nil, "manifest_file", []string{relative}, nil, projectInfoIntPtr(100), optionalStringPtr(reason)),
 		})
 	}
 	for _, manifest := range candidateGoModFiles(repoRoot) {
@@ -190,7 +207,7 @@ func discoverProjectManifests(repoRoot string) []ProjectManifestRecord {
 			ManifestKind: "go_mod",
 			Path:         relative,
 			Verdict:      projectInfoVerdictDeclared,
-			Provenance:   newProjectInfoProvenance("go_mod", &relative, nil, nil, nil, "manifest_file", []string{relative}, nil, projectInfoIntPtr(100), optionalStringPtr(reason)),
+			Provenance:   newProjectInfoProvenance("go_mod", &relative, nil, nil, nil, nil, nil, nil, nil, "manifest_file", []string{relative}, nil, projectInfoIntPtr(100), optionalStringPtr(reason)),
 		})
 	}
 	for _, candidate := range []string{"docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml"} {
@@ -204,7 +221,7 @@ func discoverProjectManifests(repoRoot string) []ProjectManifestRecord {
 			ManifestKind: "docker_compose",
 			Path:         relative,
 			Verdict:      projectInfoVerdictDeclared,
-			Provenance:   newProjectInfoProvenance("docker_compose", &relative, nil, nil, nil, "manifest_file", []string{relative}, nil, projectInfoIntPtr(100), optionalStringPtr(reason)),
+			Provenance:   newProjectInfoProvenance("docker_compose", &relative, nil, nil, nil, nil, nil, nil, nil, "manifest_file", []string{relative}, nil, projectInfoIntPtr(100), optionalStringPtr(reason)),
 		})
 	}
 	slices.SortFunc(manifests, func(a, b ProjectManifestRecord) int {
@@ -264,7 +281,7 @@ func discoverDeclaredProjectRuntimes(manifests []ProjectManifestRecord) []Projec
 			Runtime:     runtime,
 			SourceFiles: append([]string{}, seed.sourcePaths...),
 			Verdict:     projectInfoVerdictDeclared,
-			Provenance:  newProjectInfoProvenance(seed.sourceKind, optionalString(sourceFile), optionalString(runtime), nil, nil, "manifest_file", seed.sourcePaths, nil, projectInfoIntPtr(100), optionalStringPtr(reason)),
+			Provenance:  newProjectInfoProvenance(seed.sourceKind, optionalString(sourceFile), optionalString(runtime), nil, nil, nil, nil, nil, nil, "manifest_file", seed.sourcePaths, nil, projectInfoIntPtr(100), optionalStringPtr(reason)),
 		})
 	}
 	slices.SortFunc(runtimes, func(a, b ProjectRuntimeRecord) int {
@@ -273,22 +290,24 @@ func discoverDeclaredProjectRuntimes(manifests []ProjectManifestRecord) []Projec
 	return runtimes
 }
 
-func buildProjectEntrypoints(targets []RepoTargetRecord) []ProjectEntrypointRecord {
+func buildProjectEntrypoints(repoRoot string, targets []RepoTargetRecord) []ProjectEntrypointRecord {
 	items := []ProjectEntrypointRecord{}
 	for _, target := range targets {
-		if target.EntryPath == nil || strings.TrimSpace(*target.EntryPath) == "" {
+		resolution := resolveProjectCommand(repoRoot, target)
+		entryPath := target.EntryPath
+		if resolution.EntryPath != nil {
+			entryPath = resolution.EntryPath
+		}
+		if entryPath == nil || strings.TrimSpace(*entryPath) == "" {
 			continue
 		}
-		verdict := projectInfoVerdictConfigBacked
-		if target.Source == "pyproject_toml" {
-			verdict = projectInfoVerdictInferredNeedsReview
-		}
+		verdict := projectInfoVerdictFromTarget(target, resolution)
 		items = append(items, ProjectEntrypointRecord{
 			Kind:       target.Kind,
 			Label:      target.Label,
 			Command:    target.Command,
 			Verdict:    verdict,
-			Provenance: projectInfoProvenanceFromTarget(target, verdict, "entry_file"),
+			Provenance: projectInfoProvenanceFromTarget(target, resolution, verdict, "entry_file"),
 		})
 	}
 	slices.SortFunc(items, func(a, b ProjectEntrypointRecord) int {
@@ -300,40 +319,46 @@ func buildProjectEntrypoints(targets []RepoTargetRecord) []ProjectEntrypointReco
 	return items
 }
 
-func buildProjectCommandRecords(targets []RepoTargetRecord) []ProjectCommandRecord {
+func buildProjectCommandRecords(repoRoot string, targets []RepoTargetRecord) []ProjectCommandRecord {
 	items := make([]ProjectCommandRecord, 0, len(targets))
 	for _, target := range targets {
-		verdict := projectInfoVerdictFromTarget(target)
+		resolution := resolveProjectCommand(repoRoot, target)
+		verdict := projectInfoVerdictFromTarget(target, resolution)
 		items = append(items, ProjectCommandRecord{
 			Kind:       target.Kind,
 			Label:      target.Label,
 			Command:    target.Command,
 			Verdict:    verdict,
-			Provenance: projectInfoProvenanceFromTarget(target, verdict, projectInfoEvidenceTypeFromTarget(target, verdict)),
+			Provenance: projectInfoProvenanceFromTarget(target, resolution, verdict, projectInfoEvidenceTypeFromTarget(target, resolution, verdict)),
 		})
 	}
 	return items
 }
 
-func projectInfoVerdictFromTarget(target RepoTargetRecord) string {
+func projectInfoVerdictFromTarget(target RepoTargetRecord, resolution projectCommandResolution) string {
 	switch target.Source {
 	case "verification_profile":
 		return projectInfoVerdictConfigBacked
 	case "go_mod", "pyproject_toml", "cargo_toml":
 		return projectInfoVerdictConfigBacked
 	case "package_json", "makefile":
+		if resolution.DeclaredCommand != nil || resolution.EntryPath != nil || len(resolution.ConfigFiles) > 0 || len(resolution.ConfigHints) > 0 {
+			return projectInfoVerdictConfigBacked
+		}
 		return projectInfoVerdictInferredNeedsReview
 	default:
 		return projectInfoVerdictDeclared
 	}
 }
 
-func projectInfoEvidenceTypeFromTarget(target RepoTargetRecord, verdict string) string {
+func projectInfoEvidenceTypeFromTarget(target RepoTargetRecord, resolution projectCommandResolution, verdict string) string {
 	switch {
 	case target.ProfileID != nil:
 		return "saved_config"
-	case target.EntryPath != nil && strings.TrimSpace(*target.EntryPath) != "":
+	case resolution.EntryPath != nil && strings.TrimSpace(*resolution.EntryPath) != "":
 		return "entry_file"
+	case resolution.DeclaredCommand != nil || len(resolution.ConfigFiles) > 0 || len(resolution.ConfigHints) > 0:
+		return "declared_command"
 	case verdict == projectInfoVerdictInferredNeedsReview:
 		return "derived_command"
 	default:
@@ -341,63 +366,97 @@ func projectInfoEvidenceTypeFromTarget(target RepoTargetRecord, verdict string) 
 	}
 }
 
-func projectInfoProvenanceFromTarget(target RepoTargetRecord, verdict string, evidenceType string) ProjectInfoProvenance {
+func projectInfoProvenanceFromTarget(target RepoTargetRecord, resolution projectCommandResolution, verdict string, evidenceType string) ProjectInfoProvenance {
 	sourceFile := optionalString(target.SourcePath)
 	cwd := optionalString(target.WorkingDir)
+	if resolution.Cwd != nil {
+		cwd = resolution.Cwd
+	}
 	command := optionalString(target.Command)
+	entryPath := target.EntryPath
+	if resolution.EntryPath != nil {
+		entryPath = resolution.EntryPath
+	}
 	evidencePaths := []string{}
 	if strings.TrimSpace(target.SourcePath) != "" {
 		evidencePaths = append(evidencePaths, target.SourcePath)
 	}
-	if target.EntryPath != nil && strings.TrimSpace(*target.EntryPath) != "" {
-		evidencePaths = append(evidencePaths, *target.EntryPath)
+	if entryPath != nil && strings.TrimSpace(*entryPath) != "" {
+		evidencePaths = append(evidencePaths, *entryPath)
 	}
+	evidencePaths = append(evidencePaths, resolution.ConfigFiles...)
+	evidencePaths = dedupeStrings(evidencePaths, 12)
 	reason := target.Reason
+	if resolution.DeclaredCommand != nil && verdict == projectInfoVerdictConfigBacked {
+		declaredReason := "Repo files declare the underlying command behind this surfaced target."
+		if target.Reason != nil && strings.TrimSpace(*target.Reason) != "" {
+			declaredReason = strings.TrimSpace(*target.Reason) + " The underlying command is declared directly in repo files."
+		}
+		reason = optionalStringPtr(declaredReason)
+	}
 	confidence := &target.Confidence
 	if verdict == projectInfoVerdictInferredNeedsReview && reason == nil {
 		reason = optionalStringPtr("Command grouping is derived from repo declarations and current target taxonomy, not from a repo-authored runbook.")
 	}
-	return newProjectInfoProvenance(target.Source, sourceFile, command, cwd, target.EntryPath, evidenceType, evidencePaths, target.ProfileID, confidence, reason)
+	return newProjectInfoProvenance(target.Source, sourceFile, command, cwd, entryPath, resolution.DeclaredCommand, resolution.ServiceName, resolution.ConfigFiles, resolution.ConfigHints, evidenceType, evidencePaths, target.ProfileID, confidence, reason)
 }
 
 func discoverDeclaredServices(repoRoot string) ([]ProjectServiceRecord, []string) {
-	type composePayload struct {
-		Services map[string]any `yaml:"services"`
-	}
 	items := []ProjectServiceRecord{}
 	warnings := []string{}
-	for _, candidate := range []string{"docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml"} {
-		path := filepath.Join(repoRoot, candidate)
-		raw, err := os.ReadFile(path)
-		if err != nil {
-			continue
-		}
-		var payload composePayload
-		if err := yaml.Unmarshal(raw, &payload); err != nil {
-			warnings = append(warnings, "Unable to parse declared services from "+candidate+".")
-			continue
-		}
-		names := make([]string, 0, len(payload.Services))
-		for name := range payload.Services {
-			names = append(names, name)
-		}
-		slices.Sort(names)
-		for _, name := range names {
-			command := "docker compose -f " + candidate + " up " + name
-			sourceFile := candidate
+	manifests, manifestWarnings := readComposeManifestServices(repoRoot)
+	warnings = append(warnings, manifestWarnings...)
+	for _, manifest := range manifests {
+		for _, service := range manifest.Services {
+			command := "docker compose -f " + manifest.Path + " up " + service.Name
+			sourceFile := manifest.Path
 			reason := "Service is explicitly declared under the compose file's services map."
+			configFiles := []string{manifest.Path}
+			configHints := []string{}
+			if service.Image != "" {
+				configHints = append(configHints, "Compose service image: "+service.Image+".")
+			}
+			if service.BuildContext != "" {
+				configHints = append(configHints, "Compose service build context: "+service.BuildContext+".")
+				configFiles = append(configFiles, service.BuildContext)
+			}
+			for _, port := range service.Ports {
+				configHints = append(configHints, "Compose service publishes port mapping "+port+".")
+			}
+			for _, envFile := range service.EnvFiles {
+				configHints = append(configHints, "Compose service loads env file "+envFile+".")
+				configFiles = append(configFiles, envFile)
+			}
+			for _, key := range service.EnvironmentKeys {
+				configHints = append(configHints, "Compose service declares environment key "+key+".")
+			}
+			if service.WorkingDir != "" {
+				configHints = append(configHints, "Compose service working_dir is "+service.WorkingDir+".")
+			}
+			if service.Entrypoint != "" {
+				configHints = append(configHints, "Compose service entrypoint is "+service.Entrypoint+".")
+			}
+			if service.Command != "" {
+				configHints = append(configHints, "Compose service command is "+service.Command+".")
+			}
 			items = append(items, ProjectServiceRecord{
-				Name:    name,
-				Command: command,
-				Verdict: projectInfoVerdictDeclared,
+				Name:      service.Name,
+				Command:   command,
+				Verdict:   projectInfoVerdictDeclared,
+				DependsOn: append([]string{}, service.DependsOn...),
+				Profiles:  append([]string{}, service.Profiles...),
 				Provenance: newProjectInfoProvenance(
 					"docker_compose",
 					&sourceFile,
 					&command,
+					optionalString(service.WorkingDir),
 					nil,
 					nil,
+					optionalString(service.Name),
+					dedupeStrings(configFiles, 12),
+					dedupeStrings(configHints, 12),
 					"compose_service",
-					[]string{candidate},
+					dedupeStrings(configFiles, 12),
 					nil,
 					projectInfoIntPtr(100),
 					optionalStringPtr(reason),
@@ -412,6 +471,467 @@ func discoverDeclaredServices(repoRoot string) ([]ProjectServiceRecord, []string
 		return strings.Compare(a.Command, b.Command)
 	})
 	return items, dedupeStrings(warnings, 8)
+}
+
+type composeManifestRecord struct {
+	Path     string
+	Services []composeServiceRecord
+}
+
+type composeServiceRecord struct {
+	Name            string
+	Image           string
+	BuildContext    string
+	Ports           []string
+	EnvFiles        []string
+	EnvironmentKeys []string
+	DependsOn       []string
+	Profiles        []string
+	WorkingDir      string
+	Entrypoint      string
+	Command         string
+}
+
+func resolveProjectCommand(repoRoot string, target RepoTargetRecord) projectCommandResolution {
+	resolution := projectCommandResolution{
+		Cwd:       optionalString(target.WorkingDir),
+		EntryPath: target.EntryPath,
+	}
+	switch target.Source {
+	case "package_json":
+		resolvePackageTarget(repoRoot, target, &resolution)
+	case "makefile":
+		resolveMakeTarget(repoRoot, target, &resolution)
+	case "pyproject_toml":
+		resolvePyprojectTarget(repoRoot, target, &resolution)
+	case "go_mod":
+		resolveGoTarget(repoRoot, target, &resolution)
+	}
+	resolution.ConfigFiles = dedupeStrings(resolution.ConfigFiles, 12)
+	resolution.ConfigHints = dedupeStrings(resolution.ConfigHints, 12)
+	return resolution
+}
+
+func resolvePackageTarget(repoRoot string, target RepoTargetRecord, resolution *projectCommandResolution) {
+	if resolution == nil {
+		return
+	}
+	manifestPath := filepath.Join(repoRoot, filepath.FromSlash(target.SourcePath))
+	scripts, err := readPackageScripts(manifestPath)
+	if err != nil {
+		return
+	}
+	scriptName, ok := packageScriptNameFromCommand(target.Command)
+	if !ok {
+		return
+	}
+	declared, ok := scripts[scriptName]
+	if !ok || strings.TrimSpace(declared) == "" {
+		return
+	}
+	trimmed := strings.TrimSpace(declared)
+	resolution.DeclaredCommand = &trimmed
+	resolution.ConfigFiles = append(resolution.ConfigFiles, target.SourcePath)
+	workingDir := firstNonEmptyProjectString(target.WorkingDir, normalizeWorkingDir(repoRoot, filepath.Dir(manifestPath)))
+	if workingDir != "" {
+		resolution.Cwd = &workingDir
+		if resolution.ServiceName == nil {
+			resolution.ServiceName = optionalString(filepath.Base(workingDir))
+		}
+	}
+	resolveViteHints(repoRoot, workingDir, trimmed, resolution)
+}
+
+func resolveMakeTarget(repoRoot string, target RepoTargetRecord, resolution *projectCommandResolution) {
+	if resolution == nil {
+		return
+	}
+	makeTarget, ok := makeTargetNameFromCommand(target.Command)
+	if !ok {
+		return
+	}
+	recipes, err := readMakeTargetRecipes(filepath.Join(repoRoot, "Makefile"))
+	if err != nil {
+		return
+	}
+	for _, recipe := range recipes {
+		if recipe.Name != makeTarget {
+			continue
+		}
+		executableLines := []string{}
+		for _, line := range recipe.RecipeLines {
+			normalized := strings.TrimSpace(strings.TrimPrefix(line, "@"))
+			if normalized == "" || strings.HasPrefix(normalized, "#") || strings.HasPrefix(normalized, "echo ") || normalized == "echo" {
+				continue
+			}
+			executableLines = append(executableLines, normalized)
+		}
+		if len(executableLines) == 0 {
+			return
+		}
+		joined := strings.Join(executableLines, " && ")
+		resolution.DeclaredCommand = &joined
+		resolution.ConfigFiles = append(resolution.ConfigFiles, "Makefile")
+		serviceName := recipe.Name
+		resolution.ServiceName = &serviceName
+		resolveShellCommand(repoRoot, joined, resolution)
+		return
+	}
+}
+
+func resolvePyprojectTarget(repoRoot string, target RepoTargetRecord, resolution *projectCommandResolution) {
+	if resolution == nil {
+		return
+	}
+	manifestPath := filepath.Join(repoRoot, filepath.FromSlash(target.SourcePath))
+	scripts, err := readPyprojectScripts(manifestPath)
+	if err != nil {
+		return
+	}
+	labelBits := strings.Split(target.Label, ":")
+	if len(labelBits) == 0 {
+		return
+	}
+	scriptName := labelBits[len(labelBits)-1]
+	if declared, ok := scripts[scriptName]; ok && strings.TrimSpace(declared) != "" {
+		trimmed := strings.TrimSpace(declared)
+		resolution.DeclaredCommand = &trimmed
+		resolution.ConfigFiles = append(resolution.ConfigFiles, target.SourcePath)
+	}
+}
+
+func resolveGoTarget(repoRoot string, target RepoTargetRecord, resolution *projectCommandResolution) {
+	if resolution == nil || resolution.EntryPath == nil || strings.TrimSpace(*resolution.EntryPath) == "" {
+		return
+	}
+	entryAbs := filepath.Join(repoRoot, filepath.FromSlash(*resolution.EntryPath))
+	content, err := os.ReadFile(entryAbs)
+	if err != nil {
+		return
+	}
+	pattern := regexp.MustCompile(`envDefault\("([A-Z0-9_]+)",\s*"([^"]+)"\)`)
+	matches := pattern.FindAllStringSubmatch(string(content), -1)
+	for _, match := range matches {
+		if len(match) < 3 {
+			continue
+		}
+		resolution.ConfigHints = append(resolution.ConfigHints, "Entrypoint reads env var "+match[1]+" with default "+match[2]+".")
+	}
+}
+
+func resolveShellCommand(repoRoot string, command string, resolution *projectCommandResolution) {
+	if resolution == nil {
+		return
+	}
+	workingDir, inner := splitShellWorkingDir(command)
+	if workingDir != "" {
+		resolution.Cwd = &workingDir
+		if resolution.ServiceName == nil {
+			resolution.ServiceName = optionalString(filepath.Base(workingDir))
+		}
+	}
+	if inner == "" {
+		inner = command
+	}
+	if port, ok := extractFlagValue(inner, "--port"); ok {
+		resolution.ConfigHints = append(resolution.ConfigHints, "Declared command sets --port "+port+".")
+	}
+	for _, match := range regexp.MustCompile(`([A-Z0-9_]+)=([^\s]+)`).FindAllStringSubmatch(inner, -1) {
+		if len(match) < 3 {
+			continue
+		}
+		resolution.ConfigHints = append(resolution.ConfigHints, "Declared command sets "+match[1]+"="+match[2]+".")
+	}
+	if entryPath, ok := resolvePythonModuleReference(repoRoot, workingDir, inner); ok {
+		resolution.EntryPath = &entryPath
+	}
+	if entryPath, ok := resolveGoRunReference(repoRoot, workingDir, inner); ok {
+		resolution.EntryPath = &entryPath
+	}
+	if scriptName, ok := packageScriptNameFromCommand(inner); ok {
+		target := RepoTargetRecord{
+			Command:    inner,
+			Source:     "package_json",
+			SourcePath: normalizeRepoPath(repoRoot, filepath.Join(repoRoot, workingDir, "package.json")),
+			WorkingDir: workingDir,
+			Label:      workingDir + ":" + scriptName,
+		}
+		resolvePackageTarget(repoRoot, target, resolution)
+	}
+}
+
+func resolvePythonModuleReference(repoRoot string, workingDir string, command string) (string, bool) {
+	modulePattern := regexp.MustCompile(`(?:^|\s)(?:python3?|uvicorn)\s+-m\s+([A-Za-z0-9_\.]+)`)
+	if match := modulePattern.FindStringSubmatch(command); len(match) >= 2 {
+		entry := filepath.Join(repoRoot, workingDir, filepath.FromSlash(strings.ReplaceAll(match[1], ".", "/")+".py"))
+		if _, err := os.Stat(entry); err == nil {
+			return normalizeRepoPath(repoRoot, entry), true
+		}
+	}
+	uvicornPattern := regexp.MustCompile(`uvicorn\s+([A-Za-z0-9_\.]+):[A-Za-z0-9_]+`)
+	if match := uvicornPattern.FindStringSubmatch(command); len(match) >= 2 {
+		entry := filepath.Join(repoRoot, workingDir, filepath.FromSlash(strings.ReplaceAll(match[1], ".", "/")+".py"))
+		if _, err := os.Stat(entry); err == nil {
+			return normalizeRepoPath(repoRoot, entry), true
+		}
+	}
+	return "", false
+}
+
+func resolveGoRunReference(repoRoot string, workingDir string, command string) (string, bool) {
+	pattern := regexp.MustCompile(`go\s+(?:run|build)\s+\./([^\s]+)`)
+	match := pattern.FindStringSubmatch(command)
+	if len(match) < 2 {
+		return "", false
+	}
+	entry := filepath.Join(repoRoot, workingDir, filepath.FromSlash(match[1]), "main.go")
+	if _, err := os.Stat(entry); err != nil {
+		return "", false
+	}
+	return normalizeRepoPath(repoRoot, entry), true
+}
+
+func resolveViteHints(repoRoot string, workingDir string, command string, resolution *projectCommandResolution) {
+	if resolution == nil || !strings.Contains(command, "vite") {
+		return
+	}
+	if workingDir == "" {
+		return
+	}
+	var configPath string
+	for _, candidate := range []string{"vite.config.ts", "vite.config.js", "vite.config.mjs", "vite.config.cjs"} {
+		abs := filepath.Join(repoRoot, filepath.FromSlash(workingDir), candidate)
+		if _, err := os.Stat(abs); err == nil {
+			configPath = normalizeRepoPath(repoRoot, abs)
+			break
+		}
+	}
+	if configPath == "" {
+		return
+	}
+	resolution.ConfigFiles = append(resolution.ConfigFiles, configPath)
+	content, err := os.ReadFile(filepath.Join(repoRoot, filepath.FromSlash(configPath)))
+	if err != nil {
+		return
+	}
+	if match := regexp.MustCompile(`port:\s*(\d+)`).FindStringSubmatch(string(content)); len(match) >= 2 {
+		resolution.ConfigHints = append(resolution.ConfigHints, "Vite dev server port is "+match[1]+".")
+	}
+	proxyPattern := regexp.MustCompile(`['"]([^'"]+)['"]:\s*['"]([^'"]+)['"]`)
+	for _, match := range proxyPattern.FindAllStringSubmatch(string(content), -1) {
+		if len(match) < 3 || !strings.HasPrefix(match[1], "/") {
+			continue
+		}
+		resolution.ConfigHints = append(resolution.ConfigHints, "Vite proxy maps "+match[1]+" to "+match[2]+".")
+	}
+}
+
+func readComposeManifestServices(repoRoot string) ([]composeManifestRecord, []string) {
+	type composePayload struct {
+		Services map[string]composeServicePayload `yaml:"services"`
+	}
+	type composeBuildPayload struct {
+		Context    string `yaml:"context"`
+		Dockerfile string `yaml:"dockerfile"`
+	}
+	manifests := []composeManifestRecord{}
+	warnings := []string{}
+	for _, candidate := range []string{"docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml"} {
+		path := filepath.Join(repoRoot, candidate)
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		var payload composePayload
+		if err := yaml.Unmarshal(raw, &payload); err != nil {
+			warnings = append(warnings, "Unable to parse declared services from "+candidate+".")
+			continue
+		}
+		manifest := composeManifestRecord{Path: candidate}
+		names := make([]string, 0, len(payload.Services))
+		for name := range payload.Services {
+			names = append(names, name)
+		}
+		slices.Sort(names)
+		for _, name := range names {
+			service := payload.Services[name]
+			buildContext := ""
+			switch value := service.Build.(type) {
+			case string:
+				buildContext = strings.TrimSpace(value)
+			case map[string]any:
+				if rawContext, ok := value["context"].(string); ok {
+					buildContext = strings.TrimSpace(rawContext)
+				}
+			case composeBuildPayload:
+				buildContext = strings.TrimSpace(value.Context)
+			}
+			manifest.Services = append(manifest.Services, composeServiceRecord{
+				Name:            name,
+				Image:           strings.TrimSpace(service.Image),
+				BuildContext:    normalizeComposePath(candidate, buildContext),
+				Ports:           append([]string{}, service.Ports...),
+				EnvFiles:        normalizeComposePaths(candidate, stringSliceFromYAML(service.EnvFile)),
+				EnvironmentKeys: environmentKeysFromComposeValue(service.Environment),
+				DependsOn:       dependsOnFromComposeValue(service.DependsOn),
+				Profiles:        append([]string{}, service.Profiles...),
+				WorkingDir:      strings.TrimSpace(service.WorkingDir),
+				Entrypoint:      joinComposeCommand(service.Entrypoint),
+				Command:         joinComposeCommand(service.Command),
+			})
+		}
+		manifests = append(manifests, manifest)
+	}
+	return manifests, dedupeStrings(warnings, 8)
+}
+
+type composeServicePayload struct {
+	Image       string   `yaml:"image"`
+	Build       any      `yaml:"build"`
+	Ports       []string `yaml:"ports"`
+	EnvFile     any      `yaml:"env_file"`
+	Environment any      `yaml:"environment"`
+	DependsOn   any      `yaml:"depends_on"`
+	Profiles    []string `yaml:"profiles"`
+	WorkingDir  string   `yaml:"working_dir"`
+	Entrypoint  any      `yaml:"entrypoint"`
+	Command     any      `yaml:"command"`
+}
+
+func environmentKeysFromComposeValue(value any) []string {
+	keys := []string{}
+	switch typed := value.(type) {
+	case map[string]any:
+		for key := range typed {
+			keys = append(keys, key)
+		}
+	case []any:
+		for _, raw := range typed {
+			item, ok := raw.(string)
+			if !ok {
+				continue
+			}
+			key := item
+			if index := strings.Index(item, "="); index > 0 {
+				key = item[:index]
+			}
+			keys = append(keys, key)
+		}
+	}
+	slices.Sort(keys)
+	return dedupeStrings(keys, 24)
+}
+
+func dependsOnFromComposeValue(value any) []string {
+	items := []string{}
+	switch typed := value.(type) {
+	case map[string]any:
+		for key := range typed {
+			items = append(items, key)
+		}
+	case []any:
+		for _, raw := range typed {
+			if item, ok := raw.(string); ok {
+				items = append(items, item)
+			}
+		}
+	}
+	slices.Sort(items)
+	return dedupeStrings(items, 24)
+}
+
+func joinComposeCommand(value any) string {
+	switch typed := value.(type) {
+	case string:
+		return strings.TrimSpace(typed)
+	case []any:
+		parts := []string{}
+		for _, raw := range typed {
+			if item, ok := raw.(string); ok {
+				parts = append(parts, strings.TrimSpace(item))
+			}
+		}
+		return strings.TrimSpace(strings.Join(parts, " "))
+	default:
+		return ""
+	}
+}
+
+func stringSliceFromYAML(value any) []string {
+	switch typed := value.(type) {
+	case string:
+		return []string{strings.TrimSpace(typed)}
+	case []any:
+		items := []string{}
+		for _, raw := range typed {
+			if item, ok := raw.(string); ok {
+				items = append(items, strings.TrimSpace(item))
+			}
+		}
+		return items
+	default:
+		return []string{}
+	}
+}
+
+func normalizeComposePath(manifestPath string, value string) string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return ""
+	}
+	return filepath.ToSlash(filepath.Clean(filepath.Join(filepath.Dir(manifestPath), filepath.FromSlash(trimmed))))
+}
+
+func normalizeComposePaths(manifestPath string, values []string) []string {
+	items := []string{}
+	manifestDir := filepath.Dir(manifestPath)
+	for _, value := range values {
+		trimmed := strings.TrimSpace(value)
+		if trimmed == "" {
+			continue
+		}
+		items = append(items, filepath.ToSlash(filepath.Clean(filepath.Join(manifestDir, trimmed))))
+	}
+	return dedupeStrings(items, 12)
+}
+
+func packageScriptNameFromCommand(command string) (string, bool) {
+	pattern := regexp.MustCompile(`npm\s+run\s+([A-Za-z0-9:_-]+)`)
+	match := pattern.FindStringSubmatch(command)
+	if len(match) < 2 {
+		return "", false
+	}
+	return match[1], true
+}
+
+func makeTargetNameFromCommand(command string) (string, bool) {
+	pattern := regexp.MustCompile(`^make\s+([A-Za-z0-9_.-]+)$`)
+	match := pattern.FindStringSubmatch(strings.TrimSpace(command))
+	if len(match) < 2 {
+		return "", false
+	}
+	return match[1], true
+}
+
+func splitShellWorkingDir(command string) (string, string) {
+	pattern := regexp.MustCompile(`^cd\s+([^&]+?)\s+&&\s+(.+)$`)
+	match := pattern.FindStringSubmatch(strings.TrimSpace(command))
+	if len(match) < 3 {
+		return "", command
+	}
+	return filepath.ToSlash(strings.TrimSpace(match[1])), strings.TrimSpace(match[2])
+}
+
+func extractFlagValue(command string, flag string) (string, bool) {
+	pattern := regexp.MustCompile(regexp.QuoteMeta(flag) + `(?:=|\s+)(\d+)`)
+	match := pattern.FindStringSubmatch(command)
+	if len(match) < 2 {
+		return "", false
+	}
+	if _, err := strconv.Atoi(match[1]); err != nil {
+		return "", false
+	}
+	return match[1], true
 }
 
 func observeDeclaredProjectRuntimes(items []ProjectRuntimeRecord) []ProjectObservedRuntimeRecord {
@@ -442,6 +962,10 @@ func observeDeclaredProjectRuntimes(items []ProjectRuntimeRecord) []ProjectObser
 				&command,
 				nil,
 				nil,
+				nil,
+				nil,
+				nil,
+				nil,
 				"runtime_binary_lookup",
 				item.SourceFiles,
 				nil,
@@ -453,18 +977,22 @@ func observeDeclaredProjectRuntimes(items []ProjectRuntimeRecord) []ProjectObser
 	return observed
 }
 
-func newProjectInfoProvenance(sourceKind string, sourceFile *string, command *string, cwd *string, entryPath *string, evidenceType string, evidencePaths []string, profileID *string, confidence *int, reason *string) ProjectInfoProvenance {
+func newProjectInfoProvenance(sourceKind string, sourceFile *string, command *string, cwd *string, entryPath *string, declaredCommand *string, serviceName *string, configFiles []string, configHints []string, evidenceType string, evidencePaths []string, profileID *string, confidence *int, reason *string) ProjectInfoProvenance {
 	return ProjectInfoProvenance{
-		SourceKind:   sourceKind,
-		SourceFile:   sourceFile,
-		Command:      command,
-		Cwd:          cwd,
-		EntryPath:    entryPath,
-		EvidenceType: evidenceType,
-		Evidence:     projectEvidenceRefs(evidencePaths),
-		ProfileID:    profileID,
-		Confidence:   confidence,
-		Reason:       reason,
+		SourceKind:      sourceKind,
+		SourceFile:      sourceFile,
+		Command:         command,
+		Cwd:             cwd,
+		EntryPath:       entryPath,
+		DeclaredCommand: declaredCommand,
+		ServiceName:     serviceName,
+		ConfigFiles:     dedupeStrings(configFiles, 12),
+		ConfigHints:     dedupeStrings(configHints, 12),
+		EvidenceType:    evidenceType,
+		Evidence:        projectEvidenceRefs(evidencePaths),
+		ProfileID:       profileID,
+		Confidence:      confidence,
+		Reason:          reason,
 	}
 }
 
@@ -488,6 +1016,15 @@ func firstString(items []string) string {
 	for _, item := range items {
 		if strings.TrimSpace(item) != "" {
 			return item
+		}
+	}
+	return ""
+}
+
+func firstNonEmptyProjectString(items ...string) string {
+	for _, item := range items {
+		if strings.TrimSpace(item) != "" {
+			return strings.TrimSpace(item)
 		}
 	}
 	return ""

@@ -25,6 +25,11 @@ type RepoTargetRecord struct {
 	Reason     *string `json:"reason,omitempty"`
 }
 
+type makeTargetRecipe struct {
+	Name        string
+	RecipeLines []string
+}
+
 func ReadRunTargets(dataDir string, workspaceID string) ([]RepoTargetRecord, error) {
 	if snapshot, err := loadSnapshot(dataDir, workspaceID); err == nil && snapshot != nil && snapshot.ScannerVersion >= scannerVersion {
 		if _, ok := snapshot.Summary["run_targets_total"]; ok {
@@ -74,25 +79,25 @@ func discoverManifestTargets(repoRoot string, includeVerify bool) []RepoTargetRe
 	targets = append(targets, discoverPyprojectTargets(repoRoot, includeVerify)...)
 	targets = append(targets, discoverCargoTargets(repoRoot, includeVerify)...)
 	targets = append(targets, discoverGoTargets(repoRoot, includeVerify)...)
-	targets = append(targets, discoverDockerTargets(repoRoot)...)
+	if !includeVerify {
+		targets = append(targets, discoverDockerTargets(repoRoot)...)
+	}
 	return dedupeRepoTargets(targets)
 }
 
 func discoverMakeTargets(repoRoot string, includeVerify bool) []RepoTargetRecord {
 	makefile := filepath.Join(repoRoot, "Makefile")
-	content, err := os.ReadFile(makefile)
+	recipes, err := readMakeTargetRecipes(makefile)
 	if err != nil {
 		return []RepoTargetRecord{}
 	}
 	targets := []RepoTargetRecord{}
-	pattern := regexp.MustCompile(`^([A-Za-z0-9_.-]+):`)
-	for _, raw := range strings.Split(string(content), "\n") {
-		match := pattern.FindStringSubmatch(raw)
-		if len(match) < 2 {
+	for _, recipe := range recipes {
+		name := recipe.Name
+		if strings.HasPrefix(name, ".") {
 			continue
 		}
-		name := match[1]
-		if strings.HasPrefix(name, ".") {
+		if !makeRecipeHasExecutableCommand(recipe.RecipeLines) {
 			continue
 		}
 		kind := categorizeSemanticTargetName(name)
@@ -520,6 +525,89 @@ func readPyprojectScripts(manifestPath string) (map[string]string, error) {
 		scripts[key] = value
 	}
 	return scripts, nil
+}
+
+func readPackageScripts(manifestPath string) (map[string]string, error) {
+	type packagePayload struct {
+		Scripts map[string]string `json:"scripts"`
+	}
+	content, err := os.ReadFile(manifestPath)
+	if err != nil {
+		return nil, err
+	}
+	var payload packagePayload
+	if err := json.Unmarshal(content, &payload); err != nil {
+		return nil, err
+	}
+	if payload.Scripts == nil {
+		return map[string]string{}, nil
+	}
+	return payload.Scripts, nil
+}
+
+func readMakeTargetRecipes(makefilePath string) ([]makeTargetRecipe, error) {
+	content, err := os.ReadFile(makefilePath)
+	if err != nil {
+		return nil, err
+	}
+	pattern := regexp.MustCompile(`^([A-Za-z0-9_.-]+):`)
+	recipes := []makeTargetRecipe{}
+	var current *makeTargetRecipe
+	flush := func() {
+		if current == nil {
+			return
+		}
+		trimmed := []string{}
+		for _, line := range current.RecipeLines {
+			value := strings.TrimSpace(line)
+			if value == "" {
+				continue
+			}
+			trimmed = append(trimmed, value)
+		}
+		current.RecipeLines = trimmed
+		recipes = append(recipes, *current)
+		current = nil
+	}
+	for _, raw := range strings.Split(string(content), "\n") {
+		if strings.TrimSpace(raw) == "" {
+			if current != nil && len(current.RecipeLines) > 0 {
+				flush()
+			}
+			continue
+		}
+		match := pattern.FindStringSubmatch(raw)
+		if len(match) >= 2 && !strings.HasPrefix(raw, "\t") && !strings.HasPrefix(raw, " ") {
+			flush()
+			current = &makeTargetRecipe{Name: match[1]}
+			continue
+		}
+		if current == nil {
+			continue
+		}
+		if strings.HasPrefix(raw, "\t") || strings.HasPrefix(raw, " ") {
+			current.RecipeLines = append(current.RecipeLines, strings.TrimSpace(raw))
+		}
+	}
+	flush()
+	return recipes, nil
+}
+
+func makeRecipeHasExecutableCommand(lines []string) bool {
+	for _, line := range lines {
+		normalized := strings.TrimSpace(strings.TrimPrefix(line, "@"))
+		if normalized == "" {
+			continue
+		}
+		if strings.HasPrefix(normalized, "#") {
+			continue
+		}
+		if strings.HasPrefix(normalized, "echo ") || normalized == "echo" {
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 func readCargoManifest(manifestPath string) (cargoManifestInfo, error) {
