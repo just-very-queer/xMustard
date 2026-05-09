@@ -37,6 +37,7 @@ type ProjectInfoStaticTruth struct {
 	VerifyTargets        []ProjectCommandRecord             `json:"verify_targets"`
 	Services             []ProjectServiceRecord             `json:"services"`
 	ServiceIdentities    []ProjectServiceIdentityRecord     `json:"service_identities"`
+	ServiceGroups        []ProjectServiceGroupRecord        `json:"service_groups"`
 	ServiceRelationships []ProjectServiceRelationshipRecord `json:"service_relationships"`
 	Warnings             []string                           `json:"warnings"`
 }
@@ -95,14 +96,24 @@ type ProjectEntrypointRecord struct {
 }
 
 type ProjectCommandRecord struct {
-	TargetID         string                `json:"target_id"`
-	Kind             string                `json:"kind"`
-	Label            string                `json:"label"`
-	Command          string                `json:"command"`
-	Verdict          string                `json:"verdict"`
-	OwnerServiceID   *string               `json:"owner_service_id,omitempty"`
-	RelatedTargetIDs []string              `json:"related_target_ids,omitempty"`
-	Provenance       ProjectInfoProvenance `json:"provenance"`
+	TargetID         string                 `json:"target_id"`
+	Kind             string                 `json:"kind"`
+	Label            string                 `json:"label"`
+	Command          string                 `json:"command"`
+	Verdict          string                 `json:"verdict"`
+	OwnerServiceID   *string                `json:"owner_service_id,omitempty"`
+	Ownership        ProjectTargetOwnership `json:"ownership"`
+	RelatedTargetIDs []string               `json:"related_target_ids,omitempty"`
+	Provenance       ProjectInfoProvenance  `json:"provenance"`
+}
+
+type ProjectTargetOwnership struct {
+	Status     string   `json:"status"`
+	MatchBasis string   `json:"match_basis"`
+	ServiceIDs []string `json:"service_ids,omitempty"`
+	ScopeKind  *string  `json:"scope_kind,omitempty"`
+	ScopeKey   *string  `json:"scope_key,omitempty"`
+	Reason     string   `json:"reason"`
 }
 
 type ProjectServiceRecord struct {
@@ -128,7 +139,19 @@ type ProjectServiceIdentityRecord struct {
 	VerifyCommands  []string              `json:"verify_commands,omitempty"`
 	DependsOn       []string              `json:"depends_on,omitempty"`
 	Profiles        []string              `json:"profiles,omitempty"`
+	GroupIDs        []string              `json:"group_ids,omitempty"`
 	Provenance      ProjectInfoProvenance `json:"provenance"`
+}
+
+type ProjectServiceGroupRecord struct {
+	GroupID          string                `json:"group_id"`
+	Name             string                `json:"name"`
+	GroupType        string                `json:"group_type"`
+	Verdict          string                `json:"verdict"`
+	RootDir          *string               `json:"root_dir,omitempty"`
+	ManifestPaths    []string              `json:"manifest_paths,omitempty"`
+	MemberServiceIDs []string              `json:"member_service_ids,omitempty"`
+	Provenance       ProjectInfoProvenance `json:"provenance"`
 }
 
 type ProjectServiceRelationshipRecord struct {
@@ -164,6 +187,7 @@ type resolvedProjectTarget struct {
 	Verdict          string
 	EvidenceType     string
 	OwnerServiceID   *string
+	Ownership        ProjectTargetOwnership
 	RelatedTargetIDs []string
 }
 
@@ -193,7 +217,7 @@ func buildProjectInfo(workspaceID string, repoRoot string, runTargets []RepoTarg
 	services, warnings := discoverDeclaredServices(repoRoot)
 	resolvedRunTargets := resolveProjectTargets(repoRoot, runTargets, savedVerificationProfiles)
 	resolvedVerifyTargets := resolveProjectTargets(repoRoot, verifyTargets, savedVerificationProfiles)
-	serviceIdentities, serviceRelationships, graphWarnings := buildProjectServiceGraph(repoRoot, services, resolvedRunTargets, resolvedVerifyTargets, savedVerificationProfiles)
+	serviceIdentities, serviceGroups, serviceRelationships, graphWarnings := buildProjectServiceGraph(repoRoot, services, resolvedRunTargets, resolvedVerifyTargets, savedVerificationProfiles)
 	warnings = dedupeStrings(append(warnings, graphWarnings...), 12)
 	return &ProjectInfoRecord{
 		WorkspaceID: workspaceID,
@@ -206,6 +230,7 @@ func buildProjectInfo(workspaceID string, repoRoot string, runTargets []RepoTarg
 			VerifyTargets:        buildProjectCommandRecords(resolvedVerifyTargets),
 			Services:             services,
 			ServiceIdentities:    serviceIdentities,
+			ServiceGroups:        serviceGroups,
 			ServiceRelationships: serviceRelationships,
 			Warnings:             warnings,
 		},
@@ -401,6 +426,11 @@ func resolveProjectTargets(repoRoot string, targets []RepoTargetRecord, profiles
 			Resolution:   resolution,
 			Verdict:      verdict,
 			EvidenceType: projectInfoEvidenceTypeFromTarget(target, resolution, verdict),
+			Ownership: ProjectTargetOwnership{
+				Status:     "unowned",
+				MatchBasis: "none",
+				Reason:     "No repo-backed service ownership evidence was found for this target.",
+			},
 		})
 	}
 	return items
@@ -416,6 +446,7 @@ func buildProjectCommandRecords(targets []resolvedProjectTarget) []ProjectComman
 			Command:          target.Target.Command,
 			Verdict:          target.Verdict,
 			OwnerServiceID:   target.OwnerServiceID,
+			Ownership:        target.Ownership,
 			RelatedTargetIDs: append([]string{}, target.RelatedTargetIDs...),
 			Provenance:       projectInfoProvenanceFromTarget(target.Target, target.Resolution, target.Verdict, target.EvidenceType),
 		})
@@ -578,6 +609,7 @@ type projectServiceIdentitySeed struct {
 	VerifyCommands  []string
 	DependsOn       []string
 	Profiles        []string
+	GroupIDs        []string
 	ConfigFiles     []string
 	ConfigHints     []string
 	ListenPorts     []string
@@ -585,13 +617,35 @@ type projectServiceIdentitySeed struct {
 	Reason          string
 }
 
-func buildProjectServiceGraph(repoRoot string, composeServices []ProjectServiceRecord, runTargets []resolvedProjectTarget, verifyTargets []resolvedProjectTarget, profiles []verificationProfileRecord) ([]ProjectServiceIdentityRecord, []ProjectServiceRelationshipRecord, []string) {
+type projectServiceGroupSeed struct {
+	GroupID         string
+	Name            string
+	GroupType       string
+	Verdict         string
+	SourceKind      string
+	SourceFile      string
+	RootDir         *string
+	ManifestPaths   []string
+	ConfigFiles     []string
+	ConfigHints     []string
+	Reason          string
+	MemberManifests []string
+}
+
+type projectWorkspacePackageDependency struct {
+	GroupID            string
+	SourceManifestPath string
+	TargetManifestPath string
+	Reason             string
+}
+
+func buildProjectServiceGraph(repoRoot string, composeServices []ProjectServiceRecord, runTargets []resolvedProjectTarget, verifyTargets []resolvedProjectTarget, profiles []verificationProfileRecord) ([]ProjectServiceIdentityRecord, []ProjectServiceGroupRecord, []ProjectServiceRelationshipRecord, []string) {
 	seeds := map[string]*projectServiceIdentitySeed{}
 	order := []string{}
 	manifestScopeToServiceIDs := map[string][]string{}
 	composeNameToServiceID := map[string]string{}
 	profilesByID := map[string]verificationProfileRecord{}
-	warnings := []string{}
+	groupSeeds, packageDependencyEdges, warnings := discoverProjectServiceGroups(repoRoot)
 	for _, profile := range profiles {
 		if strings.TrimSpace(profile.ProfileID) == "" {
 			continue
@@ -616,6 +670,7 @@ func buildProjectServiceGraph(repoRoot string, composeServices []ProjectServiceR
 		existing.VerifyCommands = dedupeStrings(append(existing.VerifyCommands, seed.VerifyCommands...), 24)
 		existing.DependsOn = dedupeStrings(append(existing.DependsOn, seed.DependsOn...), 24)
 		existing.Profiles = dedupeStrings(append(existing.Profiles, seed.Profiles...), 24)
+		existing.GroupIDs = dedupeStrings(append(existing.GroupIDs, seed.GroupIDs...), 24)
 		existing.ConfigFiles = dedupeStrings(append(existing.ConfigFiles, seed.ConfigFiles...), 24)
 		existing.ConfigHints = dedupeStrings(append(existing.ConfigHints, seed.ConfigHints...), 24)
 		existing.ListenPorts = dedupeStrings(append(existing.ListenPorts, seed.ListenPorts...), 24)
@@ -627,6 +682,20 @@ func buildProjectServiceGraph(repoRoot string, composeServices []ProjectServiceR
 			existing.Reason = seed.Reason
 		}
 		return existing
+	}
+	assignExactOwnership := func(target *resolvedProjectTarget, serviceID string, matchBasis string, scopeKind string, scopeKey string, reason string) {
+		if target == nil {
+			return
+		}
+		target.OwnerServiceID = &serviceID
+		target.Ownership = ProjectTargetOwnership{
+			Status:     "exact",
+			MatchBasis: matchBasis,
+			ServiceIDs: []string{serviceID},
+			ScopeKind:  optionalString(scopeKind),
+			ScopeKey:   optionalString(scopeKey),
+			Reason:     reason,
+		}
 	}
 
 	for _, service := range composeServices {
@@ -658,7 +727,7 @@ func buildProjectServiceGraph(repoRoot string, composeServices []ProjectServiceR
 	}
 
 	for idx := range runTargets {
-		_, manifestScopeKey, _, seed := ensureManifestServiceIdentity(repoRoot, &runTargets[idx], nil)
+		serviceKey, manifestScopeKey, _, seed := ensureManifestServiceIdentity(repoRoot, &runTargets[idx], nil)
 		if seed == nil {
 			continue
 		}
@@ -666,7 +735,7 @@ func buildProjectServiceGraph(repoRoot string, composeServices []ProjectServiceR
 		if seed == nil {
 			continue
 		}
-		runTargets[idx].OwnerServiceID = &seed.ServiceID
+		assignExactOwnership(&runTargets[idx], seed.ServiceID, "manifest_scope", "manifest", serviceKey, "Run target maps to one manifest-backed service identity.")
 		if manifestScopeKey != "" {
 			manifestScopeToServiceIDs[manifestScopeKey] = dedupeStrings(append(manifestScopeToServiceIDs[manifestScopeKey], seed.ServiceID), 12)
 		}
@@ -676,12 +745,21 @@ func buildProjectServiceGraph(repoRoot string, composeServices []ProjectServiceR
 		if verifyTargets[idx].Target.ProfileID != nil {
 			continue
 		}
-		_, manifestScopeKey, _, seed := ensureManifestServiceIdentity(repoRoot, nil, &verifyTargets[idx])
+		serviceKey, manifestScopeKey, _, seed := ensureManifestServiceIdentity(repoRoot, nil, &verifyTargets[idx])
 		if seed == nil {
 			continue
 		}
 		if existingIDs, ok := manifestScopeToServiceIDs[manifestScopeKey]; ok && len(existingIDs) > 0 {
 			if len(existingIDs) > 1 {
+				verifyTargets[idx].Ownership = ProjectTargetOwnership{
+					Status:     "shared_scope",
+					MatchBasis: "manifest_scope",
+					ServiceIDs: append([]string{}, existingIDs...),
+					ScopeKind:  optionalString("manifest"),
+					ScopeKey:   optionalString(manifestScopeKey),
+					Reason:     "Manifest scope spans multiple run services, so a single verification owner cannot be assigned.",
+				}
+				verifyTargets[idx].RelatedTargetIDs = relatedTargetIDsForServiceIDs(seeds, existingIDs, verifyTargets[idx].Target.TargetID)
 				warnings = append(warnings, "Skipped manifest-scoped verification ownership for "+verifyTargets[idx].Target.Command+" because the manifest scope maps to multiple run services.")
 				continue
 			}
@@ -689,7 +767,7 @@ func buildProjectServiceGraph(repoRoot string, composeServices []ProjectServiceR
 				seed.ServiceID = existing.ServiceID
 				existing = addSeed(seed)
 				if existing != nil {
-					verifyTargets[idx].OwnerServiceID = &existing.ServiceID
+					assignExactOwnership(&verifyTargets[idx], existing.ServiceID, "manifest_scope", "manifest", serviceKey, "Verification target maps to one manifest-backed service identity.")
 				}
 			}
 			continue
@@ -701,38 +779,47 @@ func buildProjectServiceGraph(repoRoot string, composeServices []ProjectServiceR
 		if manifestScopeKey != "" {
 			manifestScopeToServiceIDs[manifestScopeKey] = dedupeStrings(append(manifestScopeToServiceIDs[manifestScopeKey], seed.ServiceID), 12)
 		}
-		verifyTargets[idx].OwnerServiceID = &seed.ServiceID
+		assignExactOwnership(&verifyTargets[idx], seed.ServiceID, "manifest_scope", "manifest", serviceKey, "Verification target maps to one manifest-backed service identity.")
 	}
+
 	for idx := range verifyTargets {
 		if verifyTargets[idx].Target.ProfileID == nil {
 			continue
 		}
 		if profile, ok := profilesByID[strings.TrimSpace(*verifyTargets[idx].Target.ProfileID)]; ok {
-			matchedServiceID, warning := matchVerificationProfileToService(repoRoot, profile, seeds)
+			ownership, warning := matchVerificationProfileOwnership(repoRoot, profile, seeds)
 			if warning != "" {
 				warnings = append(warnings, warning)
 			}
-			if matchedServiceID != "" {
-				if seed := seeds[matchedServiceID]; seed != nil {
-					verifyTargets[idx].OwnerServiceID = &matchedServiceID
-					seed.VerifyTargetIDs = dedupeStrings(append(seed.VerifyTargetIDs, verifyTargets[idx].Target.TargetID), 24)
-					seed.VerifyCommands = dedupeStrings(append(seed.VerifyCommands, verifyTargets[idx].Target.Command), 24)
-					seed.Profiles = dedupeStrings(append(seed.Profiles, profile.ProfileID), 24)
+			if ownership.Status != "unowned" {
+				verifyTargets[idx].Ownership = ownership
+				verifyTargets[idx].RelatedTargetIDs = relatedTargetIDsForServiceIDs(seeds, ownership.ServiceIDs, verifyTargets[idx].Target.TargetID)
+				if ownership.Status == "exact" && len(ownership.ServiceIDs) == 1 {
+					assignExactOwnership(&verifyTargets[idx], ownership.ServiceIDs[0], ownership.MatchBasis, firstNonEmptyPtr(ownership.ScopeKind), firstNonEmptyPtr(ownership.ScopeKey), ownership.Reason)
+					if seed := seeds[ownership.ServiceIDs[0]]; seed != nil {
+						seed.VerifyTargetIDs = dedupeStrings(append(seed.VerifyTargetIDs, verifyTargets[idx].Target.TargetID), 24)
+						seed.VerifyCommands = dedupeStrings(append(seed.VerifyCommands, verifyTargets[idx].Target.Command), 24)
+						seed.Profiles = dedupeStrings(append(seed.Profiles, profile.ProfileID), 24)
+					}
 				}
 				continue
 			}
 		}
-		matchedServiceID, matchedTargetIDs := findExactVerificationAlias(runTargets, verifyTargets, verifyTargets[idx].Target.Command)
-		if matchedServiceID == "" {
+		ownership := findExactVerificationAliasOwnership(runTargets, verifyTargets, verifyTargets[idx].Target.Command)
+		if ownership.Status == "unowned" {
 			continue
 		}
-		verifyTargets[idx].OwnerServiceID = &matchedServiceID
-		verifyTargets[idx].RelatedTargetIDs = append([]string{}, matchedTargetIDs...)
-		if seed := seeds[matchedServiceID]; seed != nil {
-			seed.VerifyTargetIDs = dedupeStrings(append(seed.VerifyTargetIDs, verifyTargets[idx].Target.TargetID), 24)
-			seed.VerifyCommands = dedupeStrings(append(seed.VerifyCommands, verifyTargets[idx].Target.Command), 24)
+		verifyTargets[idx].Ownership = ownership
+		verifyTargets[idx].RelatedTargetIDs = relatedTargetIDsForServiceIDs(seeds, ownership.ServiceIDs, verifyTargets[idx].Target.TargetID)
+		if ownership.Status == "exact" && len(ownership.ServiceIDs) == 1 {
+			assignExactOwnership(&verifyTargets[idx], ownership.ServiceIDs[0], ownership.MatchBasis, firstNonEmptyPtr(ownership.ScopeKind), firstNonEmptyPtr(ownership.ScopeKey), ownership.Reason)
+			if seed := seeds[ownership.ServiceIDs[0]]; seed != nil {
+				seed.VerifyTargetIDs = dedupeStrings(append(seed.VerifyTargetIDs, verifyTargets[idx].Target.TargetID), 24)
+				seed.VerifyCommands = dedupeStrings(append(seed.VerifyCommands, verifyTargets[idx].Target.Command), 24)
+			}
 		}
 	}
+
 	for idx := range verifyTargets {
 		if verifyTargets[idx].OwnerServiceID == nil {
 			continue
@@ -835,11 +922,8 @@ func buildProjectServiceGraph(repoRoot string, composeServices []ProjectServiceR
 			if targetSeed == nil {
 				continue
 			}
-			evidencePaths := append([]string{}, seed.ManifestPaths...)
-			evidencePaths = append(evidencePaths, seed.ConfigFiles...)
-			evidencePaths = append(evidencePaths, targetSeed.ManifestPaths...)
-			evidencePaths = append(evidencePaths, targetSeed.ConfigFiles...)
-			evidencePaths = dedupeStrings(evidencePaths, 24)
+			evidencePaths := dedupeStrings(append(append([]string{}, seed.ManifestPaths...), targetSeed.ManifestPaths...), 24)
+			evidencePaths = dedupeStrings(append(append(evidencePaths, seed.ConfigFiles...), targetSeed.ConfigFiles...), 24)
 			reason := "Vite proxy route " + proxyTarget.Route + " targets " + proxyTarget.TargetURL + ", and " + targetSeed.Name + " declares port " + proxyTarget.Port + "."
 			appendRelationship(ProjectServiceRelationshipRecord{
 				RelationshipID:   "vite-proxy-depends-on-" + hashID(serviceID, owners[0], proxyTarget.Route, proxyTarget.Port),
@@ -868,6 +952,51 @@ func buildProjectServiceGraph(repoRoot string, composeServices []ProjectServiceR
 		}
 	}
 
+	serviceIDsByManifest := buildServiceIDsByManifestPath(seeds)
+	serviceGroups := buildProjectServiceGroupRecords(groupSeeds, seeds, serviceIDsByManifest)
+	for _, edge := range packageDependencyEdges {
+		sourceServiceIDs := dedupeStrings(append([]string{}, serviceIDsByManifest[edge.SourceManifestPath]...), 12)
+		targetServiceIDs := dedupeStrings(append([]string{}, serviceIDsByManifest[edge.TargetManifestPath]...), 12)
+		if len(sourceServiceIDs) != 1 || len(targetServiceIDs) != 1 {
+			warnings = append(warnings, "Skipped package-workspace dependency for "+edge.SourceManifestPath+" because the repo evidence does not map both package manifests to exactly one service.")
+			continue
+		}
+		if sourceServiceIDs[0] == targetServiceIDs[0] {
+			continue
+		}
+		sourceSeed := seeds[sourceServiceIDs[0]]
+		targetSeed := seeds[targetServiceIDs[0]]
+		if sourceSeed == nil || targetSeed == nil {
+			continue
+		}
+		evidencePaths := dedupeStrings(append(append([]string{}, sourceSeed.ManifestPaths...), targetSeed.ManifestPaths...), 24)
+		evidencePaths = dedupeStrings(append(append(evidencePaths, sourceSeed.ConfigFiles...), targetSeed.ConfigFiles...), 24)
+		appendRelationship(ProjectServiceRelationshipRecord{
+			RelationshipID:   "package-workspace-depends-on-" + hashID(edge.GroupID, sourceServiceIDs[0], targetServiceIDs[0]),
+			RelationshipType: "package_workspace_depends_on",
+			SourceServiceID:  sourceServiceIDs[0],
+			TargetServiceID:  targetServiceIDs[0],
+			Verdict:          projectInfoVerdictDeclared,
+			Provenance: newProjectInfoProvenance(
+				sourceSeed.SourceKind,
+				optionalString(firstString(sourceSeed.ManifestPaths)),
+				optionalString(firstString(sourceSeed.RunCommands)),
+				sourceSeed.WorkingDir,
+				optionalString(firstString(sourceSeed.EntryPaths)),
+				nil,
+				optionalString(sourceSeed.Name),
+				append([]string{}, sourceSeed.ConfigFiles...),
+				append([]string{}, sourceSeed.ConfigHints...),
+				"service_relationship",
+				evidencePaths,
+				nil,
+				projectInfoIntPtr(100),
+				optionalStringPtr(edge.Reason),
+			),
+		})
+		sourceSeed.DependsOn = dedupeStrings(append(sourceSeed.DependsOn, targetServiceIDs[0]), 12)
+	}
+
 	serviceIdentities := make([]ProjectServiceIdentityRecord, 0, len(order))
 	for _, serviceID := range order {
 		seed := seeds[serviceID]
@@ -892,6 +1021,7 @@ func buildProjectServiceGraph(repoRoot string, composeServices []ProjectServiceR
 			VerifyCommands:  append([]string{}, seed.VerifyCommands...),
 			DependsOn:       append([]string{}, seed.DependsOn...),
 			Profiles:        append([]string{}, seed.Profiles...),
+			GroupIDs:        append([]string{}, seed.GroupIDs...),
 			Provenance: newProjectInfoProvenance(
 				seed.SourceKind,
 				optionalString(seed.SourceFile),
@@ -916,6 +1046,12 @@ func buildProjectServiceGraph(repoRoot string, composeServices []ProjectServiceR
 		}
 		return strings.Compare(a.ServiceID, b.ServiceID)
 	})
+	slices.SortFunc(serviceGroups, func(a, b ProjectServiceGroupRecord) int {
+		if a.Name != b.Name {
+			return strings.Compare(a.Name, b.Name)
+		}
+		return strings.Compare(a.GroupID, b.GroupID)
+	})
 	slices.SortFunc(relationships, func(a, b ProjectServiceRelationshipRecord) int {
 		if a.SourceServiceID != b.SourceServiceID {
 			return strings.Compare(a.SourceServiceID, b.SourceServiceID)
@@ -925,7 +1061,7 @@ func buildProjectServiceGraph(repoRoot string, composeServices []ProjectServiceR
 		}
 		return strings.Compare(a.RelationshipType, b.RelationshipType)
 	})
-	return serviceIdentities, relationships, dedupeStrings(warnings, 12)
+	return serviceIdentities, serviceGroups, relationships, dedupeStrings(warnings, 16)
 }
 
 func ensureManifestServiceIdentity(repoRoot string, runTarget *resolvedProjectTarget, verifyTarget *resolvedProjectTarget) (string, string, string, *projectServiceIdentitySeed) {
@@ -977,27 +1113,253 @@ func ensureManifestServiceIdentity(repoRoot string, runTarget *resolvedProjectTa
 	return serviceKey, manifestScopeKey, serviceID, seed
 }
 
-func findExactVerificationAlias(runTargets []resolvedProjectTarget, verifyTargets []resolvedProjectTarget, command string) (string, []string) {
-	trimmed := strings.TrimSpace(command)
-	if trimmed == "" {
-		return "", nil
-	}
-	for _, item := range verifyTargets {
-		if item.Target.ProfileID != nil || strings.TrimSpace(item.Target.Command) != trimmed || item.OwnerServiceID == nil {
+func buildServiceIDsByManifestPath(seeds map[string]*projectServiceIdentitySeed) map[string][]string {
+	lookup := map[string][]string{}
+	for serviceID, seed := range seeds {
+		if seed == nil {
 			continue
 		}
-		return *item.OwnerServiceID, append([]string{}, item.RelatedTargetIDs...)
-	}
-	for _, item := range runTargets {
-		if strings.TrimSpace(item.Target.Command) != trimmed || item.OwnerServiceID == nil {
-			continue
+		for _, manifestPath := range seed.ManifestPaths {
+			if strings.TrimSpace(manifestPath) == "" {
+				continue
+			}
+			lookup[manifestPath] = dedupeStrings(append(lookup[manifestPath], serviceID), 12)
 		}
-		return *item.OwnerServiceID, nil
 	}
-	return "", nil
+	return lookup
 }
 
-func matchVerificationProfileToService(repoRoot string, profile verificationProfileRecord, seeds map[string]*projectServiceIdentitySeed) (string, string) {
+func relatedTargetIDsForServiceIDs(seeds map[string]*projectServiceIdentitySeed, serviceIDs []string, currentTargetID string) []string {
+	related := []string{}
+	for _, serviceID := range serviceIDs {
+		seed := seeds[serviceID]
+		if seed == nil {
+			continue
+		}
+		related = append(related, seed.RunTargetIDs...)
+		for _, targetID := range seed.VerifyTargetIDs {
+			if targetID == currentTargetID {
+				continue
+			}
+			related = append(related, targetID)
+		}
+	}
+	return dedupeStrings(related, 24)
+}
+
+func buildProjectServiceGroupRecords(groupSeeds []projectServiceGroupSeed, seeds map[string]*projectServiceIdentitySeed, serviceIDsByManifest map[string][]string) []ProjectServiceGroupRecord {
+	items := make([]ProjectServiceGroupRecord, 0, len(groupSeeds))
+	for _, groupSeed := range groupSeeds {
+		memberServiceIDs := []string{}
+		for _, manifestPath := range groupSeed.MemberManifests {
+			memberServiceIDs = append(memberServiceIDs, serviceIDsByManifest[manifestPath]...)
+		}
+		memberServiceIDs = dedupeStrings(memberServiceIDs, 24)
+		for _, serviceID := range memberServiceIDs {
+			if seed := seeds[serviceID]; seed != nil {
+				seed.GroupIDs = dedupeStrings(append(seed.GroupIDs, groupSeed.GroupID), 24)
+			}
+		}
+		evidencePaths := dedupeStrings(append([]string{}, groupSeed.ManifestPaths...), 24)
+		evidencePaths = dedupeStrings(append(evidencePaths, groupSeed.MemberManifests...), 48)
+		evidencePaths = dedupeStrings(append(evidencePaths, groupSeed.ConfigFiles...), 48)
+		items = append(items, ProjectServiceGroupRecord{
+			GroupID:          groupSeed.GroupID,
+			Name:             groupSeed.Name,
+			GroupType:        groupSeed.GroupType,
+			Verdict:          groupSeed.Verdict,
+			RootDir:          groupSeed.RootDir,
+			ManifestPaths:    append([]string{}, groupSeed.MemberManifests...),
+			MemberServiceIDs: memberServiceIDs,
+			Provenance: newProjectInfoProvenance(
+				groupSeed.SourceKind,
+				optionalString(groupSeed.SourceFile),
+				nil,
+				groupSeed.RootDir,
+				nil,
+				nil,
+				optionalString(groupSeed.Name),
+				append([]string{}, groupSeed.ConfigFiles...),
+				append([]string{}, groupSeed.ConfigHints...),
+				"service_group",
+				evidencePaths,
+				nil,
+				projectInfoIntPtr(100),
+				optionalStringPtr(groupSeed.Reason),
+			),
+		})
+	}
+	return items
+}
+
+func discoverProjectServiceGroups(repoRoot string) ([]projectServiceGroupSeed, []projectWorkspacePackageDependency, []string) {
+	groupSeeds := []projectServiceGroupSeed{}
+	dependencies := []projectWorkspacePackageDependency{}
+	warnings := []string{}
+	if seed, edges, warning := discoverPackageWorkspaceGroup(repoRoot); seed != nil {
+		groupSeeds = append(groupSeeds, *seed)
+		dependencies = append(dependencies, edges...)
+		if warning != "" {
+			warnings = append(warnings, warning)
+		}
+	}
+	if seed := discoverGoWorkspaceGroup(repoRoot); seed != nil {
+		groupSeeds = append(groupSeeds, *seed)
+	}
+	return groupSeeds, dependencies, dedupeStrings(warnings, 8)
+}
+
+func discoverPackageWorkspaceGroup(repoRoot string) (*projectServiceGroupSeed, []projectWorkspacePackageDependency, string) {
+	memberManifestFiles := discoverPackageWorkspaceManifestPaths(repoRoot)
+	if len(memberManifestFiles) == 0 {
+		return nil, nil, ""
+	}
+	memberManifestPaths := []string{}
+	for _, manifestFile := range memberManifestFiles {
+		memberManifestPaths = append(memberManifestPaths, normalizeRepoPath(repoRoot, manifestFile))
+	}
+	configFiles := []string{"package.json"}
+	configHints := []string{"Root package.json declares workspace package patterns."}
+	for _, candidate := range []string{"package-lock.json", "pnpm-lock.yaml", "yarn.lock", "turbo.json", "nx.json", "lerna.json"} {
+		if _, err := os.Stat(filepath.Join(repoRoot, candidate)); err == nil {
+			configFiles = append(configFiles, candidate)
+			configHints = append(configHints, "Workspace root also includes "+candidate+".")
+		}
+	}
+	group := &projectServiceGroupSeed{
+		GroupID:         "group:" + hashID("package-workspace", strings.Join(memberManifestPaths, "|")),
+		Name:            filepath.Base(repoRoot) + " package workspace",
+		GroupType:       "package_workspace",
+		Verdict:         projectInfoVerdictDeclared,
+		SourceKind:      "package_json",
+		SourceFile:      "package.json",
+		RootDir:         optionalString(""),
+		ManifestPaths:   []string{"package.json"},
+		ConfigFiles:     dedupeStrings(configFiles, 12),
+		ConfigHints:     dedupeStrings(configHints, 12),
+		Reason:          "Root workspace config declares package workspace members.",
+		MemberManifests: append([]string{}, memberManifestPaths...),
+	}
+	packageNameToManifest := map[string]string{}
+	manifestInfos := map[string]packageManifestInfo{}
+	for _, manifestPath := range memberManifestPaths {
+		info, err := readPackageManifestInfo(filepath.Join(repoRoot, filepath.FromSlash(manifestPath)))
+		if err != nil {
+			continue
+		}
+		manifestInfos[manifestPath] = info
+		if strings.TrimSpace(info.Name) != "" {
+			packageNameToManifest[strings.TrimSpace(info.Name)] = manifestPath
+		}
+	}
+	edges := []projectWorkspacePackageDependency{}
+	for sourceManifestPath, info := range manifestInfos {
+		for dependencyName, rawSpec := range info.Dependencies {
+			spec := strings.TrimSpace(rawSpec)
+			switch {
+			case strings.HasPrefix(spec, "workspace:"):
+				targetManifestPath, ok := packageNameToManifest[dependencyName]
+				if !ok {
+					continue
+				}
+				edges = append(edges, projectWorkspacePackageDependency{
+					GroupID:            group.GroupID,
+					SourceManifestPath: sourceManifestPath,
+					TargetManifestPath: targetManifestPath,
+					Reason:             "Workspace dependency in " + sourceManifestPath + " links " + dependencyName + " with spec " + spec + ".",
+				})
+			case strings.HasPrefix(spec, "file:") || strings.HasPrefix(spec, "link:"):
+				targetManifestPath := resolveWorkspaceLinkedManifestPath(repoRoot, sourceManifestPath, strings.TrimSpace(strings.SplitN(spec, ":", 2)[1]))
+				if targetManifestPath == "" {
+					continue
+				}
+				edges = append(edges, projectWorkspacePackageDependency{
+					GroupID:            group.GroupID,
+					SourceManifestPath: sourceManifestPath,
+					TargetManifestPath: targetManifestPath,
+					Reason:             "Workspace dependency in " + sourceManifestPath + " links a local package via " + spec + ".",
+				})
+			}
+		}
+	}
+	return group, edges, ""
+}
+
+func resolveWorkspaceLinkedManifestPath(repoRoot string, sourceManifestPath string, rawPath string) string {
+	sourceDir := filepath.Join(repoRoot, filepath.FromSlash(filepath.Dir(sourceManifestPath)))
+	targetDir := filepath.Clean(filepath.Join(sourceDir, filepath.FromSlash(rawPath)))
+	manifestPath := filepath.Join(targetDir, "package.json")
+	if _, err := os.Stat(manifestPath); err != nil {
+		return ""
+	}
+	return normalizeRepoPath(repoRoot, manifestPath)
+}
+
+func discoverGoWorkspaceGroup(repoRoot string) *projectServiceGroupSeed {
+	memberManifestFiles := discoverGoWorkspaceModuleManifestPaths(repoRoot)
+	if len(memberManifestFiles) == 0 {
+		return nil
+	}
+	memberManifestPaths := []string{}
+	for _, manifestFile := range memberManifestFiles {
+		memberManifestPaths = append(memberManifestPaths, normalizeRepoPath(repoRoot, manifestFile))
+	}
+	return &projectServiceGroupSeed{
+		GroupID:         "group:" + hashID("go-workspace", strings.Join(memberManifestPaths, "|")),
+		Name:            filepath.Base(repoRoot) + " go workspace",
+		GroupType:       "go_workspace",
+		Verdict:         projectInfoVerdictDeclared,
+		SourceKind:      "go_work",
+		SourceFile:      "go.work",
+		RootDir:         optionalString(""),
+		ManifestPaths:   []string{"go.work"},
+		ConfigFiles:     []string{"go.work"},
+		ConfigHints:     []string{"go.work declares module workspace membership."},
+		Reason:          "go.work declares module workspace members.",
+		MemberManifests: append([]string{}, memberManifestPaths...),
+	}
+}
+
+func findExactVerificationAliasOwnership(runTargets []resolvedProjectTarget, verifyTargets []resolvedProjectTarget, command string) ProjectTargetOwnership {
+	trimmed := strings.TrimSpace(command)
+	if trimmed == "" {
+		return ProjectTargetOwnership{Status: "unowned", MatchBasis: "none", Reason: "No exact verification command alias was found."}
+	}
+	serviceIDs := []string{}
+	for _, item := range verifyTargets {
+		if item.Target.ProfileID != nil || strings.TrimSpace(item.Target.Command) != trimmed {
+			continue
+		}
+		serviceIDs = append(serviceIDs, item.Ownership.ServiceIDs...)
+	}
+	for _, item := range runTargets {
+		if strings.TrimSpace(item.Target.Command) != trimmed {
+			continue
+		}
+		serviceIDs = append(serviceIDs, item.Ownership.ServiceIDs...)
+	}
+	serviceIDs = dedupeStrings(serviceIDs, 12)
+	switch len(serviceIDs) {
+	case 0:
+		return ProjectTargetOwnership{Status: "unowned", MatchBasis: "none", Reason: "No exact verification command alias was found."}
+	case 1:
+		return ProjectTargetOwnership{
+			Status:     "exact",
+			MatchBasis: "exact_command_alias",
+			ServiceIDs: serviceIDs,
+			Reason:     "An existing target already maps this exact command to one service.",
+		}
+	default:
+		return ProjectTargetOwnership{
+			Status:     "ambiguous",
+			MatchBasis: "exact_command_alias",
+			ServiceIDs: serviceIDs,
+			Reason:     "Multiple existing targets map this exact command to different services.",
+		}
+	}
+}
+
+func matchVerificationProfileOwnership(repoRoot string, profile verificationProfileRecord, seeds map[string]*projectServiceIdentitySeed) (ProjectTargetOwnership, string) {
 	type scoredMatch struct {
 		serviceID string
 		score     int
@@ -1032,7 +1394,7 @@ func matchVerificationProfileToService(repoRoot string, profile verificationProf
 		considerPath(*profile.CoverageReportPath)
 	}
 	if len(matches) == 0 {
-		return "", ""
+		return ProjectTargetOwnership{Status: "unowned", MatchBasis: "none", Reason: "Saved verification profile does not resolve to a unique service scope."}, ""
 	}
 	bestServiceID := ""
 	bestScore := -1
@@ -1048,9 +1410,26 @@ func matchVerificationProfileToService(repoRoot string, profile verificationProf
 		}
 	}
 	if len(ties) > 1 {
-		return "", "Saved verification profile " + profile.Name + " references multiple service scopes, so ownership remains unassigned."
+		slices.Sort(ties)
+		return ProjectTargetOwnership{
+			Status:     "ambiguous",
+			MatchBasis: "profile_source_paths",
+			ServiceIDs: ties,
+			Reason:     "Saved verification profile source paths resolve to multiple service scopes.",
+		}, "Saved verification profile " + profile.Name + " references multiple service scopes, so ownership remains unassigned."
 	}
-	return bestServiceID, ""
+	scopeKey := ""
+	if seed := seeds[bestServiceID]; seed != nil {
+		scopeKey = firstString(seed.ManifestPaths)
+	}
+	return ProjectTargetOwnership{
+		Status:     "exact",
+		MatchBasis: "profile_source_paths",
+		ServiceIDs: []string{bestServiceID},
+		ScopeKind:  optionalString("manifest"),
+		ScopeKey:   optionalString(scopeKey),
+		Reason:     "Saved verification profile source paths resolve to one service scope.",
+	}, ""
 }
 
 func scoreServiceSeedForRepoPath(repoPath string, seed *projectServiceIdentitySeed) int {

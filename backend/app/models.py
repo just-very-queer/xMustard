@@ -486,8 +486,8 @@ class RepoTargetRecord(BaseModel):
 
 
 ProjectInfoVerdict = Literal["declared", "runtime_observed", "config_backed", "inferred_needs_review", "unavailable"]
-ProjectInfoSourceKind = Literal["package_json", "makefile", "docker_compose", "verification_profile", "pyproject_toml", "cargo_toml", "go_mod", "runtime_probe"]
-ProjectInfoEvidenceType = Literal["manifest_file", "saved_config", "declared_command", "derived_command", "entry_file", "runtime_binary_lookup", "compose_service", "service_identity", "service_relationship"]
+ProjectInfoSourceKind = Literal["package_json", "makefile", "docker_compose", "verification_profile", "pyproject_toml", "cargo_toml", "go_mod", "go_work", "runtime_probe"]
+ProjectInfoEvidenceType = Literal["manifest_file", "saved_config", "declared_command", "derived_command", "entry_file", "runtime_binary_lookup", "compose_service", "service_identity", "service_group", "service_relationship"]
 class ProjectInfoProvenance(BaseModel):
     source_kind: ProjectInfoSourceKind
     source_file: Optional[str] = None
@@ -543,8 +543,18 @@ class ProjectCommandRecord(BaseModel):
     command: str
     verdict: ProjectInfoVerdict
     owner_service_id: Optional[str] = None
+    ownership: "ProjectTargetOwnership"
     related_target_ids: list[str] = Field(default_factory=list)
     provenance: ProjectInfoProvenance
+
+
+class ProjectTargetOwnership(BaseModel):
+    status: Literal["exact", "ambiguous", "shared_scope", "unowned"] = "unowned"
+    match_basis: str = "none"
+    service_ids: list[str] = Field(default_factory=list)
+    scope_kind: Optional[str] = None
+    scope_key: Optional[str] = None
+    reason: str = ""
 
 
 class ProjectServiceRecord(BaseModel):
@@ -570,12 +580,24 @@ class ProjectServiceIdentityRecord(BaseModel):
     verify_commands: list[str] = Field(default_factory=list)
     depends_on: list[str] = Field(default_factory=list)
     profiles: list[str] = Field(default_factory=list)
+    group_ids: list[str] = Field(default_factory=list)
+    provenance: ProjectInfoProvenance
+
+
+class ProjectServiceGroupRecord(BaseModel):
+    group_id: str
+    name: str
+    group_type: Literal["package_workspace", "go_workspace"]
+    verdict: ProjectInfoVerdict
+    root_dir: Optional[str] = None
+    manifest_paths: list[str] = Field(default_factory=list)
+    member_service_ids: list[str] = Field(default_factory=list)
     provenance: ProjectInfoProvenance
 
 
 class ProjectServiceRelationshipRecord(BaseModel):
     relationship_id: str
-    relationship_type: Literal["compose_depends_on", "vite_proxy_depends_on"]
+    relationship_type: Literal["compose_depends_on", "vite_proxy_depends_on", "package_workspace_depends_on"]
     source_service_id: str
     target_service_id: str
     verdict: ProjectInfoVerdict
@@ -590,6 +612,7 @@ class ProjectInfoStaticTruth(BaseModel):
     verify_targets: list[ProjectCommandRecord] = Field(default_factory=list)
     services: list[ProjectServiceRecord] = Field(default_factory=list)
     service_identities: list[ProjectServiceIdentityRecord] = Field(default_factory=list)
+    service_groups: list[ProjectServiceGroupRecord] = Field(default_factory=list)
     service_relationships: list[ProjectServiceRelationshipRecord] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
 

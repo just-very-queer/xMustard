@@ -669,7 +669,8 @@ func candidatePackageJSONFiles(repoRoot string) []string {
 			queue = append(queue, filepath.Join(current, entry.Name()))
 		}
 	}
-	return candidates
+	candidates = append(candidates, discoverPackageWorkspaceManifestPaths(repoRoot)...)
+	return dedupeStrings(candidates, 48)
 }
 
 func dedupeSemanticTargets(targets []semanticRepoTarget) []semanticRepoTarget {

@@ -30,6 +30,12 @@ type makeTargetRecipe struct {
 	RecipeLines []string
 }
 
+type packageManifestInfo struct {
+	Name         string
+	Scripts      map[string]string
+	Dependencies map[string]string
+}
+
 func ReadRunTargets(dataDir string, workspaceID string) ([]RepoTargetRecord, error) {
 	if snapshot, err := loadSnapshot(dataDir, workspaceID); err == nil && snapshot != nil && snapshot.ScannerVersion >= scannerVersion {
 		if _, ok := snapshot.Summary["run_targets_total"]; ok {
@@ -119,17 +125,10 @@ func discoverMakeTargets(repoRoot string, includeVerify bool) []RepoTargetRecord
 }
 
 func discoverPackageTargets(repoRoot string, includeVerify bool) []RepoTargetRecord {
-	type packagePayload struct {
-		Scripts map[string]any `json:"scripts"`
-	}
 	targets := []RepoTargetRecord{}
 	for _, manifest := range candidatePackageJSONFiles(repoRoot) {
-		content, err := os.ReadFile(manifest)
+		info, err := readPackageManifestInfo(manifest)
 		if err != nil {
-			continue
-		}
-		var payload packagePayload
-		if err := json.Unmarshal(content, &payload); err != nil {
 			continue
 		}
 		prefix := filepath.ToSlash(strings.TrimPrefix(strings.TrimPrefix(filepath.Dir(manifest), repoRoot), string(filepath.Separator)))
@@ -137,7 +136,7 @@ func discoverPackageTargets(repoRoot string, includeVerify bool) []RepoTargetRec
 		if prefix != "" && prefix != "." {
 			runPrefix = "cd " + prefix + " && "
 		}
-		for name := range payload.Scripts {
+		for name := range info.Scripts {
 			kind := categorizeSemanticTargetName(name)
 			if !targetKindIncluded(kind, includeVerify) {
 				continue
@@ -457,9 +456,11 @@ func candidateCargoTomlFiles(repoRoot string) []string {
 }
 
 func candidateGoModFiles(repoRoot string) []string {
-	return candidateManifestFiles(repoRoot, "go.mod", map[string]struct{}{
+	candidates := candidateManifestFiles(repoRoot, "go.mod", map[string]struct{}{
 		".git": {}, "node_modules": {}, "dist": {}, "build": {}, "coverage": {}, "research": {}, "__pycache__": {}, ".venv": {}, "venv": {}, "target": {}, "vendor": {},
 	})
+	candidates = append(candidates, discoverGoWorkspaceModuleManifestPaths(repoRoot)...)
+	return dedupeStrings(candidates, 24)
 }
 
 func candidateManifestFiles(repoRoot string, manifestName string, excluded map[string]struct{}) []string {
@@ -527,22 +528,202 @@ func readPyprojectScripts(manifestPath string) (map[string]string, error) {
 	return scripts, nil
 }
 
-func readPackageScripts(manifestPath string) (map[string]string, error) {
+func readPackageManifestInfo(manifestPath string) (packageManifestInfo, error) {
 	type packagePayload struct {
-		Scripts map[string]string `json:"scripts"`
+		Name                 string            `json:"name"`
+		Scripts              map[string]string `json:"scripts"`
+		Dependencies         map[string]string `json:"dependencies"`
+		DevDependencies      map[string]string `json:"devDependencies"`
+		OptionalDependencies map[string]string `json:"optionalDependencies"`
+		PeerDependencies     map[string]string `json:"peerDependencies"`
+		Workspaces           any               `json:"workspaces"`
 	}
 	content, err := os.ReadFile(manifestPath)
 	if err != nil {
-		return nil, err
+		return packageManifestInfo{}, err
 	}
 	var payload packagePayload
 	if err := json.Unmarshal(content, &payload); err != nil {
+		return packageManifestInfo{}, err
+	}
+	info := packageManifestInfo{
+		Name:         strings.TrimSpace(payload.Name),
+		Scripts:      map[string]string{},
+		Dependencies: map[string]string{},
+	}
+	for key, value := range payload.Scripts {
+		info.Scripts[key] = value
+	}
+	for _, dependencyMap := range []map[string]string{
+		payload.Dependencies,
+		payload.DevDependencies,
+		payload.OptionalDependencies,
+		payload.PeerDependencies,
+	} {
+		for key, value := range dependencyMap {
+			if _, ok := info.Dependencies[key]; !ok {
+				info.Dependencies[key] = value
+			}
+		}
+	}
+	return info, nil
+}
+
+func readPackageScripts(manifestPath string) (map[string]string, error) {
+	info, err := readPackageManifestInfo(manifestPath)
+	if err != nil {
 		return nil, err
 	}
-	if payload.Scripts == nil {
-		return map[string]string{}, nil
+	return info.Scripts, nil
+}
+
+func discoverPackageWorkspaceManifestPaths(repoRoot string) []string {
+	rootManifest := filepath.Join(repoRoot, "package.json")
+	info, err := readPackageManifestInfo(rootManifest)
+	if err != nil {
+		return []string{}
 	}
-	return payload.Scripts, nil
+	patterns := packageWorkspacePatternsFromManifest(rootManifest, info)
+	if len(patterns) == 0 {
+		return []string{}
+	}
+	return resolveWorkspaceManifestPatterns(repoRoot, patterns, "package.json")
+}
+
+func packageWorkspacePatternsFromManifest(manifestPath string, info packageManifestInfo) []string {
+	type packageWorkspacePayload struct {
+		Workspaces any `json:"workspaces"`
+	}
+	content, err := os.ReadFile(manifestPath)
+	if err != nil {
+		return []string{}
+	}
+	var payload packageWorkspacePayload
+	if err := json.Unmarshal(content, &payload); err != nil {
+		return []string{}
+	}
+	return normalizePackageWorkspacePatterns(payload.Workspaces)
+}
+
+func normalizePackageWorkspacePatterns(raw any) []string {
+	switch value := raw.(type) {
+	case []any:
+		items := []string{}
+		for _, entry := range value {
+			text, ok := entry.(string)
+			if !ok {
+				continue
+			}
+			items = append(items, strings.TrimSpace(text))
+		}
+		return dedupeStrings(items, 24)
+	case map[string]any:
+		packages, ok := value["packages"]
+		if !ok {
+			return []string{}
+		}
+		return normalizePackageWorkspacePatterns(packages)
+	default:
+		return []string{}
+	}
+}
+
+func resolveWorkspaceManifestPatterns(repoRoot string, patterns []string, manifestName string) []string {
+	items := []string{}
+	for _, pattern := range patterns {
+		items = append(items, expandWorkspaceManifestPattern(repoRoot, pattern, manifestName)...)
+	}
+	return dedupeStrings(items, 48)
+}
+
+func expandWorkspaceManifestPattern(repoRoot string, pattern string, manifestName string) []string {
+	trimmed := filepath.ToSlash(strings.TrimSpace(pattern))
+	if trimmed == "" || strings.HasPrefix(trimmed, "!") {
+		return []string{}
+	}
+	results := []string{}
+	if strings.Contains(trimmed, "**") {
+		prefix := strings.TrimSuffix(trimmed, "/**")
+		prefix = strings.TrimSuffix(prefix, "/*")
+		base := filepath.Join(repoRoot, filepath.FromSlash(prefix))
+		_ = filepath.WalkDir(base, func(path string, entry os.DirEntry, err error) error {
+			if err != nil || entry == nil {
+				return nil
+			}
+			if entry.IsDir() {
+				switch entry.Name() {
+				case ".git", "node_modules", "dist", "build", "coverage", "research", "__pycache__", ".venv", "venv", "target", "vendor":
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if entry.Name() != manifestName {
+				return nil
+			}
+			results = append(results, path)
+			return nil
+		})
+		return dedupeStrings(results, 48)
+	}
+	globPattern := filepath.Join(repoRoot, filepath.FromSlash(trimmed))
+	matches, _ := filepath.Glob(globPattern)
+	for _, match := range matches {
+		info, err := os.Stat(match)
+		if err != nil {
+			continue
+		}
+		if info.IsDir() {
+			manifestPath := filepath.Join(match, manifestName)
+			if _, err := os.Stat(manifestPath); err == nil {
+				results = append(results, manifestPath)
+			}
+			continue
+		}
+		if filepath.Base(match) == manifestName {
+			results = append(results, match)
+		}
+	}
+	return dedupeStrings(results, 48)
+}
+
+func discoverGoWorkspaceModuleManifestPaths(repoRoot string) []string {
+	goWorkPath := filepath.Join(repoRoot, "go.work")
+	content, err := os.ReadFile(goWorkPath)
+	if err != nil {
+		return []string{}
+	}
+	items := []string{}
+	inUseBlock := false
+	for _, raw := range strings.Split(string(content), "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.HasPrefix(line, "//") {
+			continue
+		}
+		switch {
+		case strings.HasPrefix(line, "use ("):
+			inUseBlock = true
+			continue
+		case inUseBlock && line == ")":
+			inUseBlock = false
+			continue
+		case strings.HasPrefix(line, "use "):
+			line = strings.TrimSpace(strings.TrimPrefix(line, "use "))
+		case !inUseBlock:
+			continue
+		}
+		for _, field := range strings.Fields(line) {
+			trimmed := strings.Trim(field, "\"")
+			if trimmed == "" {
+				continue
+			}
+			moduleRoot := filepath.Clean(filepath.Join(repoRoot, trimmed))
+			manifestPath := filepath.Join(moduleRoot, "go.mod")
+			if _, err := os.Stat(manifestPath); err == nil {
+				items = append(items, manifestPath)
+			}
+		}
+	}
+	return dedupeStrings(items, 24)
 }
 
 func readMakeTargetRecipes(makefilePath string) ([]makeTargetRecipe, error) {

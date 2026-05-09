@@ -236,6 +236,9 @@ func TestReadProjectInfoBuildsNonComposeGoServicesAndServiceScopedProfiles(t *te
 	if goVerify == nil || goVerify.OwnerServiceID != nil {
 		t.Fatalf("expected module-wide go test to remain unowned across multiple Go services, got %#v", goVerify)
 	}
+	if goVerify.Ownership.Status != "shared_scope" || !slices.Contains(goVerify.Ownership.ServiceIDs, *apiRun.OwnerServiceID) || !slices.Contains(goVerify.Ownership.ServiceIDs, *opsRun.OwnerServiceID) {
+		t.Fatalf("expected shared-scope ownership for module-wide go test, got %#v", goVerify)
+	}
 	profileVerify := findProjectCommand(projectInfo.StaticTruth.VerifyTargets, "go test ./cmd/xmustard-api")
 	if profileVerify == nil || profileVerify.OwnerServiceID == nil || *profileVerify.OwnerServiceID != *apiRun.OwnerServiceID {
 		t.Fatalf("expected service-scoped verification profile ownership, got %#v", profileVerify)
@@ -248,6 +251,57 @@ func TestReadProjectInfoBuildsNonComposeGoServicesAndServiceScopedProfiles(t *te
 	}
 	if !containsProjectInfoString(profileVerify.Provenance.ConfigHints, "Saved verification profile source path is api-go/cmd/xmustard-api/main.go.") {
 		t.Fatalf("expected profile source hint, got %#v", profileVerify)
+	}
+}
+
+func TestReadProjectInfoBuildsPackageWorkspaceGroupsAndDependencies(t *testing.T) {
+	dataDir, workspaceID, repoRoot := writeSemanticIndexFixture(t)
+
+	if err := os.MkdirAll(filepath.Join(repoRoot, "apps", "web", "client"), 0o755); err != nil {
+		t.Fatalf("mkdir apps/web/client: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(repoRoot, "apps", "api", "server"), 0o755); err != nil {
+		t.Fatalf("mkdir apps/api/server: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, "package.json"), []byte("{\"name\":\"fixture-root\",\"workspaces\":[\"apps/*/*\"]}\n"), 0o644); err != nil {
+		t.Fatalf("write root package.json: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, "turbo.json"), []byte("{\"tasks\":{\"dev\":{\"dependsOn\":[\"^dev\"]}}}\n"), 0o644); err != nil {
+		t.Fatalf("write turbo.json: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, "apps", "web", "client", "package.json"), []byte("{\"name\":\"@acme/web\",\"scripts\":{\"dev\":\"vite\",\"test\":\"vitest run\"},\"dependencies\":{\"@acme/api\":\"workspace:*\"}}\n"), 0o644); err != nil {
+		t.Fatalf("write web package.json: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, "apps", "api", "server", "package.json"), []byte("{\"name\":\"@acme/api\",\"scripts\":{\"dev\":\"node server.js\",\"test\":\"vitest run\"}}\n"), 0o644); err != nil {
+		t.Fatalf("write api package.json: %v", err)
+	}
+
+	projectInfo, err := ReadProjectInfo(dataDir, workspaceID)
+	if err != nil {
+		t.Fatalf("read project info: %v", err)
+	}
+
+	webRun := findProjectCommand(projectInfo.StaticTruth.RunTargets, "cd apps/web/client && npm run dev")
+	apiRun := findProjectCommand(projectInfo.StaticTruth.RunTargets, "cd apps/api/server && npm run dev")
+	if webRun == nil || apiRun == nil || webRun.OwnerServiceID == nil || apiRun.OwnerServiceID == nil {
+		t.Fatalf("expected deep workspace package run targets, got run=%#v", projectInfo.StaticTruth.RunTargets)
+	}
+	if len(projectInfo.StaticTruth.ServiceGroups) != 1 {
+		t.Fatalf("expected one package workspace group, got %#v", projectInfo.StaticTruth.ServiceGroups)
+	}
+	group := projectInfo.StaticTruth.ServiceGroups[0]
+	if group.GroupType != "package_workspace" || !slices.Contains(group.MemberServiceIDs, *webRun.OwnerServiceID) || !slices.Contains(group.MemberServiceIDs, *apiRun.OwnerServiceID) {
+		t.Fatalf("expected package workspace group membership, got %#v", group)
+	}
+	if !containsProjectInfoString(group.Provenance.ConfigFiles, "turbo.json") {
+		t.Fatalf("expected workspace config evidence to include turbo.json, got %#v", group)
+	}
+	if !projectInfoHasRelationship(projectInfo.StaticTruth.ServiceRelationships, "package_workspace_depends_on", *webRun.OwnerServiceID, *apiRun.OwnerServiceID) {
+		t.Fatalf("expected package workspace dependency relationship, got %#v", projectInfo.StaticTruth.ServiceRelationships)
+	}
+	webService := findProjectServiceIdentityByID(projectInfo.StaticTruth.ServiceIdentities, *webRun.OwnerServiceID)
+	if webService == nil || !slices.Contains(webService.GroupIDs, group.GroupID) {
+		t.Fatalf("expected workspace group linkage on service identity, got %#v", webService)
 	}
 }
 
@@ -303,6 +357,15 @@ func projectInfoHasRelationship(items []ProjectServiceRelationshipRecord, relati
 		}
 	}
 	return false
+}
+
+func findProjectServiceIdentityByID(items []ProjectServiceIdentityRecord, serviceID string) *ProjectServiceIdentityRecord {
+	for idx := range items {
+		if items[idx].ServiceID == serviceID {
+			return &items[idx]
+		}
+	}
+	return nil
 }
 
 func findProjectCommand(items []ProjectCommandRecord, command string) *ProjectCommandRecord {

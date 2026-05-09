@@ -155,6 +155,42 @@ func TestReadRunTargetsAndVerifyTargetsDiscoverPyprojectAndCargoEntrypoints(t *t
 	}
 }
 
+func TestReadRunTargetsAndVerifyTargetsDiscoverDeepWorkspacePackages(t *testing.T) {
+	dataDir, workspaceID, repoRoot := writeSemanticIndexFixture(t)
+
+	if err := os.MkdirAll(filepath.Join(repoRoot, "apps", "web", "client"), 0o755); err != nil {
+		t.Fatalf("mkdir apps/web/client: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(repoRoot, "apps", "api", "server"), 0o755); err != nil {
+		t.Fatalf("mkdir apps/api/server: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, "package.json"), []byte("{\"name\":\"fixture-root\",\"workspaces\":[\"apps/*/*\"]}\n"), 0o644); err != nil {
+		t.Fatalf("write root package.json: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, "apps", "web", "client", "package.json"), []byte("{\"name\":\"@acme/web\",\"scripts\":{\"dev\":\"vite\",\"test\":\"vitest run\"}}\n"), 0o644); err != nil {
+		t.Fatalf("write web package.json: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, "apps", "api", "server", "package.json"), []byte("{\"name\":\"@acme/api\",\"scripts\":{\"dev\":\"node server.js\",\"test\":\"vitest run\"}}\n"), 0o644); err != nil {
+		t.Fatalf("write api package.json: %v", err)
+	}
+
+	runTargets, err := ReadRunTargets(dataDir, workspaceID)
+	if err != nil {
+		t.Fatalf("read run targets: %v", err)
+	}
+	verifyTargets, err := ReadVerifyTargets(dataDir, workspaceID)
+	if err != nil {
+		t.Fatalf("read verify targets: %v", err)
+	}
+
+	if !hasTargetCommand(runTargets, "cd apps/web/client && npm run dev") || !hasTargetCommand(runTargets, "cd apps/api/server && npm run dev") {
+		t.Fatalf("expected deep workspace package run targets: %#v", runTargets)
+	}
+	if !hasTargetCommand(verifyTargets, "cd apps/web/client && npm run test") || !hasTargetCommand(verifyTargets, "cd apps/api/server && npm run test") {
+		t.Fatalf("expected deep workspace package verify targets: %#v", verifyTargets)
+	}
+}
+
 func TestSemanticDiscoverTargetsUsesSharedManifestDiscovery(t *testing.T) {
 	_, _, repoRoot := writeSemanticIndexFixture(t)
 

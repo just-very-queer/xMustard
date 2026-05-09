@@ -2675,8 +2675,12 @@ class RuntimeSummaryTests(unittest.TestCase):
 
             go_verify = next(item for item in project_info.static_truth.verify_targets if item.command == "cd api-go && go test ./...")
             self.assertIsNone(go_verify.owner_service_id)
+            self.assertEqual(go_verify.ownership.status, "shared_scope")
+            self.assertCountEqual(go_verify.ownership.service_ids, [api_run.owner_service_id, ops_run.owner_service_id])
             profile_verify = next(item for item in project_info.static_truth.verify_targets if item.command == "go test ./cmd/xmustard-api")
             self.assertEqual(profile_verify.owner_service_id, api_run.owner_service_id)
+            self.assertEqual(profile_verify.ownership.status, "exact")
+            self.assertEqual(profile_verify.ownership.service_ids, [api_run.owner_service_id])
             self.assertIn(api_run.target_id, profile_verify.related_target_ids)
             self.assertIn("api-go/cmd/xmustard-api/main.go", profile_verify.provenance.config_files)
             self.assertIn(
