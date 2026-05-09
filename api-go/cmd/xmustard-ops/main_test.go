@@ -64,6 +64,9 @@ func TestWorkspaceLoadAndVerificationProfileOperatorLoop(t *testing.T) {
 	if readTargetOwnershipStatus(t, runTargets, "npm run dev") != "exact" {
 		t.Fatalf("expected raw run-target ownership in CLI payload, got %#v", runTargets)
 	}
+	if readTargetTruthSource(t, runTargets, "npm run dev") != "snapshot_scan" {
+		t.Fatalf("expected snapshot scan truth on cached run target, got %#v", runTargets)
+	}
 
 	verifyTargets := runOpsJSON(t, dataDir, "workspace", "verify-targets", workspaceID)
 	if len(asJSONArray(t, verifyTargets)) == 0 {
@@ -71,6 +74,9 @@ func TestWorkspaceLoadAndVerificationProfileOperatorLoop(t *testing.T) {
 	}
 	if readTargetOwnershipStatus(t, verifyTargets, "npm run test") != "exact" {
 		t.Fatalf("expected raw verify-target ownership in CLI payload, got %#v", verifyTargets)
+	}
+	if readTargetTruthSource(t, verifyTargets, "npm run test") != "snapshot_scan" {
+		t.Fatalf("expected snapshot scan truth on cached verify target, got %#v", verifyTargets)
 	}
 
 	verificationOutcomes := runOpsJSON(t, dataDir, "workspace", "verification-outcomes", workspaceID)
@@ -99,6 +105,10 @@ func TestWorkspaceLoadAndVerificationProfileOperatorLoop(t *testing.T) {
 	profiles := runOpsJSON(t, dataDir, "workspace", "verification-profiles", workspaceID)
 	if len(asJSONArray(t, profiles)) < 2 {
 		t.Fatalf("expected built-in and saved verification profiles, got %#v", profiles)
+	}
+	verifyTargetsAfterProfileSave := runOpsJSON(t, dataDir, "workspace", "verify-targets", workspaceID)
+	if readTargetTruthSource(t, verifyTargetsAfterProfileSave, "python3 -m pytest -q backend/tests/test_smoke.py") != "verification_profile_overlay" {
+		t.Fatalf("expected live overlay truth after profile save, got %#v", verifyTargetsAfterProfileSave)
 	}
 
 	profileRun := runOpsJSON(t, dataDir,
@@ -197,6 +207,27 @@ func readTargetOwnershipStatus(t *testing.T, payload any, command string) string
 			t.Fatalf("expected ownership status on raw target %#v", record)
 		}
 		return status
+	}
+	t.Fatalf("missing raw target %q in %#v", command, payload)
+	return ""
+}
+
+func readTargetTruthSource(t *testing.T, payload any, command string) string {
+	t.Helper()
+	for _, raw := range asJSONArray(t, payload) {
+		record, ok := raw.(map[string]any)
+		if !ok {
+			t.Fatalf("expected target record object, got %#v", raw)
+		}
+		value, _ := record["command"].(string)
+		if value != command {
+			continue
+		}
+		truthSource, ok := record["truth_source"].(string)
+		if !ok {
+			t.Fatalf("expected truth_source on raw target %#v", record)
+		}
+		return truthSource
 	}
 	t.Fatalf("missing raw target %q in %#v", command, payload)
 	return ""

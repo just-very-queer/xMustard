@@ -483,6 +483,9 @@ class RepoTargetRecord(BaseModel):
     working_dir: Optional[str] = None
     entry_path: Optional[str] = None
     reason: Optional[str] = None
+    truth_source: Literal["snapshot_scan", "live_discovery", "verification_profile_overlay"] = "live_discovery"
+    truth_generated_at: Optional[str] = None
+    scan_bound: bool = False
     ownership: "ProjectTargetOwnership" = Field(default_factory=lambda: ProjectTargetOwnership(reason=""))
 
 

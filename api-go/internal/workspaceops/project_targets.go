@@ -12,19 +12,28 @@ import (
 )
 
 type RepoTargetRecord struct {
-	TargetID   string                 `json:"target_id"`
-	Kind       string                 `json:"kind"`
-	Label      string                 `json:"label"`
-	Command    string                 `json:"command"`
-	Source     string                 `json:"source"`
-	SourcePath string                 `json:"source_path"`
-	Confidence int                    `json:"confidence"`
-	ProfileID  *string                `json:"profile_id,omitempty"`
-	WorkingDir string                 `json:"working_dir,omitempty"`
-	EntryPath  *string                `json:"entry_path,omitempty"`
-	Reason     *string                `json:"reason,omitempty"`
-	Ownership  ProjectTargetOwnership `json:"ownership"`
+	TargetID         string                 `json:"target_id"`
+	Kind             string                 `json:"kind"`
+	Label            string                 `json:"label"`
+	Command          string                 `json:"command"`
+	Source           string                 `json:"source"`
+	SourcePath       string                 `json:"source_path"`
+	Confidence       int                    `json:"confidence"`
+	ProfileID        *string                `json:"profile_id,omitempty"`
+	WorkingDir       string                 `json:"working_dir,omitempty"`
+	EntryPath        *string                `json:"entry_path,omitempty"`
+	Reason           *string                `json:"reason,omitempty"`
+	TruthSource      string                 `json:"truth_source"`
+	TruthGeneratedAt *string                `json:"truth_generated_at,omitempty"`
+	ScanBound        bool                   `json:"scan_bound"`
+	Ownership        ProjectTargetOwnership `json:"ownership"`
 }
+
+const (
+	repoTargetTruthSourceSnapshotScan               = "snapshot_scan"
+	repoTargetTruthSourceLiveDiscovery              = "live_discovery"
+	repoTargetTruthSourceVerificationProfileOverlay = "verification_profile_overlay"
+)
 
 type makeTargetRecipe struct {
 	Name        string
@@ -40,7 +49,7 @@ type packageManifestInfo struct {
 func ReadRunTargets(dataDir string, workspaceID string) ([]RepoTargetRecord, error) {
 	if snapshot, err := loadSnapshot(dataDir, workspaceID); err == nil && snapshot != nil && snapshot.ScannerVersion >= scannerVersion {
 		if _, ok := snapshot.Summary["run_targets_total"]; ok {
-			return ensureRepoTargetsOwnership(append([]RepoTargetRecord{}, snapshot.RunTargets...)), nil
+			return ensureRepoTargetsOwnership(stampRepoTargetsTruth(append([]RepoTargetRecord{}, snapshot.RunTargets...), repoTargetTruthSourceSnapshotScan, snapshot.GeneratedAt, true)), nil
 		}
 	}
 	workspace, err := getWorkspaceRecord(dataDir, workspaceID)
@@ -52,7 +61,7 @@ func ReadRunTargets(dataDir string, workspaceID string) ([]RepoTargetRecord, err
 		return nil, err
 	}
 	runTargets, _ := discoverProjectTargetsWithOwnership(workspace.RootPath, profiles)
-	return runTargets, nil
+	return stampRepoTargetsTruthIfMissing(runTargets, repoTargetTruthSourceLiveDiscovery, nowUTC(), false), nil
 }
 
 func ReadVerifyTargets(dataDir string, workspaceID string) ([]RepoTargetRecord, error) {
@@ -62,7 +71,8 @@ func ReadVerifyTargets(dataDir string, workspaceID string) ([]RepoTargetRecord, 
 			if profileErr != nil {
 				return nil, profileErr
 			}
-			return ensureRepoTargetsOwnership(mergeVerificationProfileTargets(snapshot.VerifyTargets, profiles)), nil
+			snapshotTargets := stampRepoTargetsTruth(append([]RepoTargetRecord{}, snapshot.VerifyTargets...), repoTargetTruthSourceSnapshotScan, snapshot.GeneratedAt, true)
+			return ensureRepoTargetsOwnership(mergeVerificationProfileTargets(snapshotTargets, profiles)), nil
 		}
 	}
 	workspace, err := getWorkspaceRecord(dataDir, workspaceID)
@@ -74,7 +84,7 @@ func ReadVerifyTargets(dataDir string, workspaceID string) ([]RepoTargetRecord, 
 		return nil, err
 	}
 	_, verifyTargets := discoverProjectTargetsWithOwnership(workspace.RootPath, profiles)
-	return verifyTargets, nil
+	return stampRepoTargetsTruthIfMissing(verifyTargets, repoTargetTruthSourceLiveDiscovery, nowUTC(), false), nil
 }
 
 func discoverRunTargetsForRoot(repoRoot string) []RepoTargetRecord {
@@ -420,15 +430,18 @@ func mergeVerificationProfileTargets(targets []RepoTargetRecord, profiles []veri
 	merged := append([]RepoTargetRecord{}, targets...)
 	for _, profile := range profiles {
 		merged = append(merged, RepoTargetRecord{
-			TargetID:   "verify-profile-" + profile.ProfileID,
-			Kind:       "verify",
-			Label:      "verification profile: " + profile.Name,
-			Command:    profile.TestCommand,
-			Source:     "verification_profile",
-			SourcePath: "verification_profiles.json",
-			Confidence: 95,
-			ProfileID:  &profile.ProfileID,
-			Reason:     optionalStringPtr(fmt.Sprintf("Operator-saved verification profile '%s'.", profile.Name)),
+			TargetID:         "verify-profile-" + profile.ProfileID,
+			Kind:             "verify",
+			Label:            "verification profile: " + profile.Name,
+			Command:          profile.TestCommand,
+			Source:           "verification_profile",
+			SourcePath:       "verification_profiles.json",
+			Confidence:       95,
+			ProfileID:        &profile.ProfileID,
+			Reason:           optionalStringPtr(fmt.Sprintf("Operator-saved verification profile '%s'.", profile.Name)),
+			TruthSource:      repoTargetTruthSourceVerificationProfileOverlay,
+			TruthGeneratedAt: verificationProfileTruthGeneratedAt(profile),
+			ScanBound:        false,
 		})
 	}
 	return dedupeRepoTargets(merged)
@@ -473,6 +486,43 @@ func ensureRepoTargetOwnership(target RepoTargetRecord) RepoTargetRecord {
 		target.Ownership = newUnownedProjectTargetOwnership("No repo-backed service ownership evidence was found for this target.")
 	}
 	return target
+}
+
+func stampRepoTargetsTruth(targets []RepoTargetRecord, truthSource string, truthGeneratedAt string, scanBound bool) []RepoTargetRecord {
+	items := make([]RepoTargetRecord, 0, len(targets))
+	for _, target := range targets {
+		items = append(items, stampRepoTargetTruth(target, truthSource, truthGeneratedAt, scanBound))
+	}
+	return items
+}
+
+func stampRepoTargetsTruthIfMissing(targets []RepoTargetRecord, truthSource string, truthGeneratedAt string, scanBound bool) []RepoTargetRecord {
+	items := make([]RepoTargetRecord, 0, len(targets))
+	for _, target := range targets {
+		if strings.TrimSpace(target.TruthSource) == "" {
+			items = append(items, stampRepoTargetTruth(target, truthSource, truthGeneratedAt, scanBound))
+			continue
+		}
+		items = append(items, target)
+	}
+	return items
+}
+
+func stampRepoTargetTruth(target RepoTargetRecord, truthSource string, truthGeneratedAt string, scanBound bool) RepoTargetRecord {
+	target.TruthSource = strings.TrimSpace(truthSource)
+	target.TruthGeneratedAt = optionalString(truthGeneratedAt)
+	target.ScanBound = scanBound
+	return target
+}
+
+func verificationProfileTruthGeneratedAt(profile verificationProfileRecord) *string {
+	if value := strings.TrimSpace(profile.UpdatedAt); value != "" {
+		return &value
+	}
+	if value := strings.TrimSpace(profile.CreatedAt); value != "" {
+		return &value
+	}
+	return optionalString(nowUTC())
 }
 
 type cargoManifestInfo struct {

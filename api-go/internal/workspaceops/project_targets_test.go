@@ -46,6 +46,9 @@ func TestReadRunTargetsAndVerifyTargetsUseManifestDiscoveryAndSavedProfiles(t *t
 	if !hasTargetCommand(runTargets, "npm run dev") {
 		t.Fatalf("expected npm run dev in run targets: %#v", runTargets)
 	}
+	if !allTargetsHaveTruth(runTargets, repoTargetTruthSourceLiveDiscovery, false) {
+		t.Fatalf("expected live truth on run targets: %#v", runTargets)
+	}
 	if !hasTargetCommand(runTargets, "make backend") {
 		t.Fatalf("expected make backend in run targets: %#v", runTargets)
 	}
@@ -58,14 +61,105 @@ func TestReadRunTargetsAndVerifyTargetsUseManifestDiscoveryAndSavedProfiles(t *t
 	if !hasTargetCommand(verifyTargets, "npm run test") {
 		t.Fatalf("expected npm run test in verify targets: %#v", verifyTargets)
 	}
+	if npmVerify := findTargetByCommand(verifyTargets, "npm run test"); npmVerify == nil || npmVerify.TruthSource != repoTargetTruthSourceLiveDiscovery || npmVerify.ScanBound {
+		t.Fatalf("expected live truth on manifest verify target: %#v", npmVerify)
+	}
 	if !hasTargetCommand(verifyTargets, "pytest -q") {
 		t.Fatalf("expected saved verification profile target in verify targets: %#v", verifyTargets)
+	}
+	if profileVerify := findTargetByCommand(verifyTargets, "pytest -q"); profileVerify == nil || profileVerify.TruthSource != repoTargetTruthSourceVerificationProfileOverlay || profileVerify.ScanBound {
+		t.Fatalf("expected overlay truth on saved profile verify target: %#v", profileVerify)
 	}
 	if hasTargetCommand(verifyTargets, "docker compose -f docker-compose.yml up") {
 		t.Fatalf("did not expect docker compose run target in verify targets: %#v", verifyTargets)
 	}
 	if !hasTargetSourcePath(verifyTargets, "verification_profiles.json") {
 		t.Fatalf("expected verification_profiles.json provenance: %#v", verifyTargets)
+	}
+}
+
+func TestReadRunTargetsAndVerifyTargetsExposeSnapshotTruthAndLiveProfileOverlay(t *testing.T) {
+	dataDir, workspaceID, repoRoot := writeSemanticIndexFixture(t)
+
+	if err := os.WriteFile(filepath.Join(repoRoot, "package.json"), []byte("{\"name\":\"fixture\",\"scripts\":{\"dev\":\"vite\",\"test\":\"vitest run\"}}\n"), 0o644); err != nil {
+		t.Fatalf("write package.json: %v", err)
+	}
+	if err := saveVerificationProfiles(dataDir, workspaceID, []verificationProfileRecord{
+		{
+			ProfileID:         "scan-profile",
+			WorkspaceID:       workspaceID,
+			Name:              "scan profile",
+			Description:       "Persisted at scan time",
+			TestCommand:       "pytest -q tests/test_scan.py",
+			CoverageFormat:    "unknown",
+			MaxRuntimeSeconds: 60,
+			RetryCount:        1,
+			BuiltIn:           false,
+			CreatedAt:         "2026-05-09T10:00:00Z",
+			UpdatedAt:         "2026-05-09T10:00:00Z",
+		},
+	}); err != nil {
+		t.Fatalf("save scan-time verification profiles: %v", err)
+	}
+
+	snapshot, err := ScanWorkspace(dataDir, workspaceID)
+	if err != nil {
+		t.Fatalf("scan workspace: %v", err)
+	}
+
+	if err := saveVerificationProfiles(dataDir, workspaceID, []verificationProfileRecord{
+		{
+			ProfileID:         "scan-profile",
+			WorkspaceID:       workspaceID,
+			Name:              "scan profile",
+			Description:       "Persisted at scan time",
+			TestCommand:       "pytest -q tests/test_scan.py",
+			CoverageFormat:    "unknown",
+			MaxRuntimeSeconds: 60,
+			RetryCount:        1,
+			BuiltIn:           false,
+			CreatedAt:         "2026-05-09T10:00:00Z",
+			UpdatedAt:         "2026-05-09T10:00:00Z",
+		},
+		{
+			ProfileID:         "live-overlay",
+			WorkspaceID:       workspaceID,
+			Name:              "live overlay",
+			Description:       "Added after scan",
+			TestCommand:       "pytest -q tests/test_overlay.py",
+			CoverageFormat:    "unknown",
+			MaxRuntimeSeconds: 60,
+			RetryCount:        1,
+			BuiltIn:           false,
+			CreatedAt:         "2026-05-09T11:00:00Z",
+			UpdatedAt:         "2026-05-09T12:00:00Z",
+		},
+	}); err != nil {
+		t.Fatalf("save live overlay verification profiles: %v", err)
+	}
+
+	runTargets, err := ReadRunTargets(dataDir, workspaceID)
+	if err != nil {
+		t.Fatalf("read run targets: %v", err)
+	}
+	verifyTargets, err := ReadVerifyTargets(dataDir, workspaceID)
+	if err != nil {
+		t.Fatalf("read verify targets: %v", err)
+	}
+
+	runTarget := findTargetByCommand(runTargets, "npm run dev")
+	if runTarget == nil || runTarget.TruthSource != repoTargetTruthSourceSnapshotScan || !runTarget.ScanBound || runTarget.TruthGeneratedAt == nil || *runTarget.TruthGeneratedAt != snapshot.GeneratedAt {
+		t.Fatalf("expected snapshot truth on cached run target, got %#v", runTarget)
+	}
+
+	snapshotVerify := findTargetByCommand(verifyTargets, "npm run test")
+	if snapshotVerify == nil || snapshotVerify.TruthSource != repoTargetTruthSourceSnapshotScan || !snapshotVerify.ScanBound || snapshotVerify.TruthGeneratedAt == nil || *snapshotVerify.TruthGeneratedAt != snapshot.GeneratedAt {
+		t.Fatalf("expected snapshot truth on cached verify target, got %#v", snapshotVerify)
+	}
+
+	overlayVerify := findTargetByCommand(verifyTargets, "pytest -q tests/test_overlay.py")
+	if overlayVerify == nil || overlayVerify.TruthSource != repoTargetTruthSourceVerificationProfileOverlay || overlayVerify.ScanBound || overlayVerify.TruthGeneratedAt == nil || *overlayVerify.TruthGeneratedAt != "2026-05-09T12:00:00Z" {
+		t.Fatalf("expected live overlay truth on post-scan profile target, got %#v", overlayVerify)
 	}
 }
 
@@ -336,4 +430,13 @@ func findTargetByCommand(targets []RepoTargetRecord, command string) *RepoTarget
 		}
 	}
 	return nil
+}
+
+func allTargetsHaveTruth(targets []RepoTargetRecord, truthSource string, scanBound bool) bool {
+	for _, item := range targets {
+		if item.TruthSource != truthSource || item.ScanBound != scanBound || item.TruthGeneratedAt == nil || strings.TrimSpace(*item.TruthGeneratedAt) == "" {
+			return false
+		}
+	}
+	return true
 }

@@ -121,6 +121,8 @@ func ScanWorkspace(dataDir string, workspaceID string) (*workspaceSnapshot, erro
 	verifyTargets = applyProjectCommandOwnership(verifyTargets, projectInfo.StaticTruth.VerifyTargets)
 	treeSummary := summarizeTree(root)
 	now := nowUTC()
+	runTargets = stampRepoTargetsTruth(runTargets, repoTargetTruthSourceSnapshotScan, now, true)
+	verifyTargets = stampRepoTargetsTruth(verifyTargets, repoTargetTruthSourceSnapshotScan, now, true)
 	workspace.LatestScanAt = ptr(now)
 	workspace.UpdatedAt = ptr(now)
 	snapshot := &workspaceSnapshot{
