@@ -207,6 +207,101 @@ func TestSemanticDiscoverTargetsUsesSharedManifestDiscovery(t *testing.T) {
 	}
 }
 
+func TestReadRunTargetsAndVerifyTargetsExposeOwnershipAndCandidateScope(t *testing.T) {
+	dataDir, workspaceID, repoRoot := writeSemanticIndexFixture(t)
+
+	if err := os.WriteFile(filepath.Join(repoRoot, "Makefile"), []byte("frontend:\n\tcd frontend && npm run dev\ngo-api:\n\tcd api-go && XMUSTARD_API_PORT=8042 go run ./cmd/xmustard-api\ngo-ops:\n\tcd api-go && go run ./cmd/xmustard-ops\n"), 0o644); err != nil {
+		t.Fatalf("write Makefile: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, "frontend", "package.json"), []byte("{\"name\":\"fixture-ui\",\"scripts\":{\"dev\":\"vite\",\"test\":\"vitest run\"}}\n"), 0o644); err != nil {
+		t.Fatalf("write frontend package.json: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, "frontend", "vite.config.ts"), []byte("import { defineConfig } from 'vite'\nexport default defineConfig({ server: { port: 5177, proxy: { '/api': 'http://127.0.0.1:8042' } } })\n"), 0o644); err != nil {
+		t.Fatalf("write frontend vite config: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(repoRoot, "api-go", "cmd", "xmustard-api"), 0o755); err != nil {
+		t.Fatalf("mkdir api-go/cmd/xmustard-api: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(repoRoot, "api-go", "cmd", "xmustard-ops"), 0o755); err != nil {
+		t.Fatalf("mkdir api-go/cmd/xmustard-ops: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, "api-go", "go.mod"), []byte("module fixture/api-go\n\ngo 1.26.0\n"), 0o644); err != nil {
+		t.Fatalf("write api-go go.mod: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, "api-go", "cmd", "xmustard-api", "main.go"), []byte("package main\n\nfunc main() {}\n"), 0o644); err != nil {
+		t.Fatalf("write xmustard-api main.go: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, "api-go", "cmd", "xmustard-ops", "main.go"), []byte("package main\n\nfunc main() {}\n"), 0o644); err != nil {
+		t.Fatalf("write xmustard-ops main.go: %v", err)
+	}
+	if err := saveVerificationProfiles(dataDir, workspaceID, []verificationProfileRecord{
+		{
+			ProfileID:         "xmustard-api-smoke",
+			WorkspaceID:       workspaceID,
+			Name:              "xmustard-api smoke",
+			Description:       "Service-scoped verification command",
+			TestCommand:       "go test ./cmd/xmustard-api",
+			CoverageFormat:    "unknown",
+			MaxRuntimeSeconds: 60,
+			RetryCount:        1,
+			SourcePaths:       []string{"api-go/cmd/xmustard-api/main.go"},
+			BuiltIn:           false,
+			CreatedAt:         nowUTC(),
+			UpdatedAt:         nowUTC(),
+		},
+		{
+			ProfileID:         "generic-smoke",
+			WorkspaceID:       workspaceID,
+			Name:              "generic smoke",
+			Description:       "Unscoped verification command",
+			TestCommand:       "pytest -q",
+			CoverageFormat:    "unknown",
+			MaxRuntimeSeconds: 60,
+			RetryCount:        1,
+			BuiltIn:           false,
+			CreatedAt:         nowUTC(),
+			UpdatedAt:         nowUTC(),
+		},
+	}); err != nil {
+		t.Fatalf("save verification profiles: %v", err)
+	}
+
+	runTargets, err := ReadRunTargets(dataDir, workspaceID)
+	if err != nil {
+		t.Fatalf("read run targets: %v", err)
+	}
+	verifyTargets, err := ReadVerifyTargets(dataDir, workspaceID)
+	if err != nil {
+		t.Fatalf("read verify targets: %v", err)
+	}
+
+	frontendRun := findTargetByCommand(runTargets, "make frontend")
+	if frontendRun == nil || frontendRun.Ownership.Status != "exact" || len(frontendRun.Ownership.ServiceIDs) != 1 {
+		t.Fatalf("expected exact raw ownership for make frontend, got %#v", frontendRun)
+	}
+	if frontendRun.Ownership.ScopeKind == nil || *frontendRun.Ownership.ScopeKind != "manifest" || frontendRun.Ownership.ScopeKey == nil || *frontendRun.Ownership.ScopeKey == "" {
+		t.Fatalf("expected candidate scope on frontend raw target, got %#v", frontendRun)
+	}
+
+	goVerify := findTargetByCommand(verifyTargets, "cd api-go && go test ./...")
+	if goVerify == nil || goVerify.Ownership.Status != "shared_scope" || len(goVerify.Ownership.ServiceIDs) != 2 {
+		t.Fatalf("expected shared-scope raw ownership for module-wide go test, got %#v", goVerify)
+	}
+	if goVerify.Ownership.ScopeKind == nil || *goVerify.Ownership.ScopeKind != "manifest" || goVerify.Ownership.ScopeKey == nil || *goVerify.Ownership.ScopeKey == "" {
+		t.Fatalf("expected manifest candidate scope for module-wide go test, got %#v", goVerify)
+	}
+
+	profileVerify := findTargetByCommand(verifyTargets, "go test ./cmd/xmustard-api")
+	if profileVerify == nil || profileVerify.Ownership.Status != "exact" || len(profileVerify.Ownership.ServiceIDs) != 1 {
+		t.Fatalf("expected exact raw ownership for service-scoped verification profile, got %#v", profileVerify)
+	}
+
+	genericVerify := findTargetByCommand(verifyTargets, "pytest -q")
+	if genericVerify == nil || genericVerify.Ownership.Status != "unowned" || len(genericVerify.Ownership.ServiceIDs) != 0 {
+		t.Fatalf("expected unowned raw ownership for generic verification profile, got %#v", genericVerify)
+	}
+}
+
 func hasTargetCommand(targets []RepoTargetRecord, command string) bool {
 	for _, item := range targets {
 		if item.Command == command {

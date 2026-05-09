@@ -12,17 +12,18 @@ import (
 )
 
 type RepoTargetRecord struct {
-	TargetID   string  `json:"target_id"`
-	Kind       string  `json:"kind"`
-	Label      string  `json:"label"`
-	Command    string  `json:"command"`
-	Source     string  `json:"source"`
-	SourcePath string  `json:"source_path"`
-	Confidence int     `json:"confidence"`
-	ProfileID  *string `json:"profile_id,omitempty"`
-	WorkingDir string  `json:"working_dir,omitempty"`
-	EntryPath  *string `json:"entry_path,omitempty"`
-	Reason     *string `json:"reason,omitempty"`
+	TargetID   string                 `json:"target_id"`
+	Kind       string                 `json:"kind"`
+	Label      string                 `json:"label"`
+	Command    string                 `json:"command"`
+	Source     string                 `json:"source"`
+	SourcePath string                 `json:"source_path"`
+	Confidence int                    `json:"confidence"`
+	ProfileID  *string                `json:"profile_id,omitempty"`
+	WorkingDir string                 `json:"working_dir,omitempty"`
+	EntryPath  *string                `json:"entry_path,omitempty"`
+	Reason     *string                `json:"reason,omitempty"`
+	Ownership  ProjectTargetOwnership `json:"ownership"`
 }
 
 type makeTargetRecipe struct {
@@ -39,24 +40,7 @@ type packageManifestInfo struct {
 func ReadRunTargets(dataDir string, workspaceID string) ([]RepoTargetRecord, error) {
 	if snapshot, err := loadSnapshot(dataDir, workspaceID); err == nil && snapshot != nil && snapshot.ScannerVersion >= scannerVersion {
 		if _, ok := snapshot.Summary["run_targets_total"]; ok {
-			return append([]RepoTargetRecord{}, snapshot.RunTargets...), nil
-		}
-	}
-	workspace, err := getWorkspaceRecord(dataDir, workspaceID)
-	if err != nil {
-		return nil, err
-	}
-	return discoverRunTargetsForRoot(workspace.RootPath), nil
-}
-
-func ReadVerifyTargets(dataDir string, workspaceID string) ([]RepoTargetRecord, error) {
-	if snapshot, err := loadSnapshot(dataDir, workspaceID); err == nil && snapshot != nil && snapshot.ScannerVersion >= scannerVersion {
-		if _, ok := snapshot.Summary["verify_targets_total"]; ok {
-			profiles, profileErr := loadSavedVerificationProfiles(dataDir, workspaceID)
-			if profileErr != nil {
-				return nil, profileErr
-			}
-			return mergeVerificationProfileTargets(snapshot.VerifyTargets, profiles), nil
+			return ensureRepoTargetsOwnership(append([]RepoTargetRecord{}, snapshot.RunTargets...)), nil
 		}
 	}
 	workspace, err := getWorkspaceRecord(dataDir, workspaceID)
@@ -67,7 +51,30 @@ func ReadVerifyTargets(dataDir string, workspaceID string) ([]RepoTargetRecord, 
 	if err != nil {
 		return nil, err
 	}
-	return discoverVerifyTargetsForRoot(workspace.RootPath, profiles), nil
+	runTargets, _ := discoverProjectTargetsWithOwnership(workspace.RootPath, profiles)
+	return runTargets, nil
+}
+
+func ReadVerifyTargets(dataDir string, workspaceID string) ([]RepoTargetRecord, error) {
+	if snapshot, err := loadSnapshot(dataDir, workspaceID); err == nil && snapshot != nil && snapshot.ScannerVersion >= scannerVersion {
+		if _, ok := snapshot.Summary["verify_targets_total"]; ok {
+			profiles, profileErr := loadSavedVerificationProfiles(dataDir, workspaceID)
+			if profileErr != nil {
+				return nil, profileErr
+			}
+			return ensureRepoTargetsOwnership(mergeVerificationProfileTargets(snapshot.VerifyTargets, profiles)), nil
+		}
+	}
+	workspace, err := getWorkspaceRecord(dataDir, workspaceID)
+	if err != nil {
+		return nil, err
+	}
+	profiles, err := loadSavedVerificationProfiles(dataDir, workspaceID)
+	if err != nil {
+		return nil, err
+	}
+	_, verifyTargets := discoverProjectTargetsWithOwnership(workspace.RootPath, profiles)
+	return verifyTargets, nil
 }
 
 func discoverRunTargetsForRoot(repoRoot string) []RepoTargetRecord {
@@ -425,6 +432,47 @@ func mergeVerificationProfileTargets(targets []RepoTargetRecord, profiles []veri
 		})
 	}
 	return dedupeRepoTargets(merged)
+}
+
+func discoverProjectTargetsWithOwnership(repoRoot string, profiles []verificationProfileRecord) ([]RepoTargetRecord, []RepoTargetRecord) {
+	runTargets := discoverRunTargetsForRoot(repoRoot)
+	verifyTargets := discoverVerifyTargetsForRoot(repoRoot, profiles)
+	projectInfo := buildProjectInfo("", repoRoot, runTargets, verifyTargets, profiles)
+	return applyProjectCommandOwnership(runTargets, projectInfo.StaticTruth.RunTargets), applyProjectCommandOwnership(verifyTargets, projectInfo.StaticTruth.VerifyTargets)
+}
+
+func applyProjectCommandOwnership(targets []RepoTargetRecord, commands []ProjectCommandRecord) []RepoTargetRecord {
+	commandsByID := map[string]ProjectCommandRecord{}
+	for _, command := range commands {
+		if strings.TrimSpace(command.TargetID) == "" {
+			continue
+		}
+		commandsByID[command.TargetID] = command
+	}
+	items := make([]RepoTargetRecord, 0, len(targets))
+	for _, target := range targets {
+		enriched := target
+		if command, ok := commandsByID[target.TargetID]; ok {
+			enriched.Ownership = command.Ownership
+		}
+		items = append(items, ensureRepoTargetOwnership(enriched))
+	}
+	return items
+}
+
+func ensureRepoTargetsOwnership(targets []RepoTargetRecord) []RepoTargetRecord {
+	items := make([]RepoTargetRecord, 0, len(targets))
+	for _, target := range targets {
+		items = append(items, ensureRepoTargetOwnership(target))
+	}
+	return items
+}
+
+func ensureRepoTargetOwnership(target RepoTargetRecord) RepoTargetRecord {
+	if strings.TrimSpace(target.Ownership.Status) == "" {
+		target.Ownership = newUnownedProjectTargetOwnership("No repo-backed service ownership evidence was found for this target.")
+	}
+	return target
 }
 
 type cargoManifestInfo struct {

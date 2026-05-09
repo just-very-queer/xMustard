@@ -61,10 +61,16 @@ func TestWorkspaceLoadAndVerificationProfileOperatorLoop(t *testing.T) {
 	if len(asJSONArray(t, runTargets)) == 0 {
 		t.Fatalf("expected run targets, got %#v", runTargets)
 	}
+	if readTargetOwnershipStatus(t, runTargets, "npm run dev") != "exact" {
+		t.Fatalf("expected raw run-target ownership in CLI payload, got %#v", runTargets)
+	}
 
 	verifyTargets := runOpsJSON(t, dataDir, "workspace", "verify-targets", workspaceID)
 	if len(asJSONArray(t, verifyTargets)) == 0 {
 		t.Fatalf("expected verify targets, got %#v", verifyTargets)
+	}
+	if readTargetOwnershipStatus(t, verifyTargets, "npm run test") != "exact" {
+		t.Fatalf("expected raw verify-target ownership in CLI payload, got %#v", verifyTargets)
 	}
 
 	verificationOutcomes := runOpsJSON(t, dataDir, "workspace", "verification-outcomes", workspaceID)
@@ -169,6 +175,31 @@ func asJSONArrayAtPath(t *testing.T, payload any, path ...string) []any {
 		t.Fatalf("expected JSON array at %v, got %#v", path, value)
 	}
 	return items
+}
+
+func readTargetOwnershipStatus(t *testing.T, payload any, command string) string {
+	t.Helper()
+	for _, raw := range asJSONArray(t, payload) {
+		record, ok := raw.(map[string]any)
+		if !ok {
+			t.Fatalf("expected target record object, got %#v", raw)
+		}
+		value, _ := record["command"].(string)
+		if value != command {
+			continue
+		}
+		ownership, ok := record["ownership"].(map[string]any)
+		if !ok {
+			t.Fatalf("expected ownership object on raw target %#v", record)
+		}
+		status, ok := ownership["status"].(string)
+		if !ok {
+			t.Fatalf("expected ownership status on raw target %#v", record)
+		}
+		return status
+	}
+	t.Fatalf("missing raw target %q in %#v", command, payload)
+	return ""
 }
 
 func readJSONPathString(t *testing.T, payload any, path ...string) string {

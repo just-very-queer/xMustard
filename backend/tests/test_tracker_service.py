@@ -2551,6 +2551,9 @@ class RuntimeSummaryTests(unittest.TestCase):
             self.assertEqual(go_verify_target.source, "go_mod")
             self.assertEqual(go_verify_target.working_dir, "api-go")
             self.assertIn("go test ./...", go_verify_target.reason or "")
+            self.assertEqual(go_verify_target.ownership.status, "exact")
+            self.assertEqual(go_verify_target.ownership.scope_kind, "manifest")
+            self.assertEqual(len(go_verify_target.ownership.service_ids), 1)
 
             assert snapshot.project_info is not None
             project_info = snapshot.project_info
@@ -2654,6 +2657,18 @@ class RuntimeSummaryTests(unittest.TestCase):
             assert snapshot is not None
             assert snapshot.project_info is not None
             project_info = snapshot.project_info
+
+            raw_frontend_run = next(item for item in snapshot.run_targets if item.command == "make frontend")
+            self.assertEqual(raw_frontend_run.ownership.status, "exact")
+            self.assertEqual(raw_frontend_run.ownership.scope_kind, "manifest")
+            self.assertEqual(len(raw_frontend_run.ownership.service_ids), 1)
+            raw_go_verify = next(item for item in snapshot.verify_targets if item.command == "cd api-go && go test ./...")
+            self.assertEqual(raw_go_verify.ownership.status, "shared_scope")
+            self.assertEqual(raw_go_verify.ownership.scope_kind, "manifest")
+            self.assertEqual(len(raw_go_verify.ownership.service_ids), 2)
+            raw_profile_verify = next(item for item in snapshot.verify_targets if item.command == "go test ./cmd/xmustard-api")
+            self.assertEqual(raw_profile_verify.ownership.status, "exact")
+            self.assertEqual(len(raw_profile_verify.ownership.service_ids), 1)
 
             self.assertEqual(project_info.static_truth.services, [])
             frontend_run = next(item for item in project_info.static_truth.run_targets if item.command == "make frontend")

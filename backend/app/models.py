@@ -483,6 +483,7 @@ class RepoTargetRecord(BaseModel):
     working_dir: Optional[str] = None
     entry_path: Optional[str] = None
     reason: Optional[str] = None
+    ownership: "ProjectTargetOwnership" = Field(default_factory=lambda: ProjectTargetOwnership(reason=""))
 
 
 ProjectInfoVerdict = Literal["declared", "runtime_observed", "config_backed", "inferred_needs_review", "unavailable"]

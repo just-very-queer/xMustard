@@ -167,7 +167,7 @@ from .terminal import TerminalService
 
 class TrackerService:
     MAX_CACHED_SNAPSHOT_BYTES = 25 * 1024 * 1024
-    SCANNER_VERSION = 8
+    SCANNER_VERSION = 9
     GUIDANCE_LIMIT = 6
     GUIDANCE_STARTER_MARKER = "xmustard:starter-template"
     GUIDANCE_PLACEHOLDER_MARKER = "TODO(xmustard)"

@@ -425,11 +425,7 @@ func resolveProjectTargets(repoRoot string, targets []RepoTargetRecord, profiles
 			Resolution:   resolution,
 			Verdict:      verdict,
 			EvidenceType: projectInfoEvidenceTypeFromTarget(target, resolution, verdict),
-			Ownership: ProjectTargetOwnership{
-				Status:     "unowned",
-				MatchBasis: "none",
-				Reason:     "No repo-backed service ownership evidence was found for this target.",
-			},
+			Ownership:    newUnownedProjectTargetOwnership("No repo-backed service ownership evidence was found for this target."),
 		})
 	}
 	return items
@@ -636,6 +632,14 @@ type projectWorkspacePackageDependency struct {
 	SourceManifestPath string
 	TargetManifestPath string
 	Reason             string
+}
+
+func newUnownedProjectTargetOwnership(reason string) ProjectTargetOwnership {
+	return ProjectTargetOwnership{
+		Status:     "unowned",
+		MatchBasis: "none",
+		Reason:     reason,
+	}
 }
 
 func buildProjectServiceGraph(repoRoot string, composeServices []ProjectServiceRecord, runTargets []resolvedProjectTarget, verifyTargets []resolvedProjectTarget, profiles []verificationProfileRecord) ([]ProjectServiceIdentityRecord, []ProjectServiceGroupRecord, []ProjectServiceRelationshipRecord, []string) {
