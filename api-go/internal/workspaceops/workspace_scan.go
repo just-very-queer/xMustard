@@ -115,7 +115,7 @@ func ScanWorkspace(dataDir string, workspaceID string) (*workspaceSnapshot, erro
 	}
 	runTargets := discoverRunTargetsForRoot(root)
 	verifyTargets := discoverVerifyTargetsForRoot(root, savedVerificationProfiles)
-	projectInfo := buildProjectInfo(workspaceID, root, runTargets, verifyTargets)
+	projectInfo := buildProjectInfo(workspaceID, root, runTargets, verifyTargets, savedVerificationProfiles)
 	treeSummary := summarizeTree(root)
 	now := nowUTC()
 	workspace.LatestScanAt = ptr(now)

@@ -2579,6 +2579,111 @@ class RuntimeSummaryTests(unittest.TestCase):
             changes = service.read_change_summary(snapshot.workspace.workspace_id)
             self.assertTrue(any(item.path == "api/src/example.py" for item in changes.changed_files))
 
+    def test_workspace_scan_preserves_non_compose_go_service_split_and_profile_ownership(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "repo"
+            (root / "docs" / "bugs").mkdir(parents=True)
+            (root / "frontend").mkdir(parents=True)
+            (root / "api-go" / "cmd" / "xmustard-api").mkdir(parents=True)
+            (root / "api-go" / "cmd" / "xmustard-ops").mkdir(parents=True)
+            (root / "docs" / "bugs" / "Bugs_25260323.md").write_text(LEDGER_TEXT, encoding="utf-8")
+            (root / "Makefile").write_text(
+                "frontend:\n\tcd frontend && npm run dev\n"
+                "go-api:\n\tcd api-go && XMUSTARD_API_PORT=8042 go run ./cmd/xmustard-api\n"
+                "go-ops:\n\tcd api-go && go run ./cmd/xmustard-ops\n",
+                encoding="utf-8",
+            )
+            (root / "frontend" / "package.json").write_text(
+                "{\"name\":\"fixture-ui\",\"scripts\":{\"dev\":\"vite\",\"test\":\"vitest run\"}}\n",
+                encoding="utf-8",
+            )
+            (root / "frontend" / "vite.config.ts").write_text(
+                "import { defineConfig } from 'vite'\n"
+                "export default defineConfig({ server: { port: 5177, proxy: { '/api': 'http://127.0.0.1:8042' } } })\n",
+                encoding="utf-8",
+            )
+            (root / "api-go" / "go.mod").write_text(
+                "module fixture/api-go\n\ngo 1.26.0\n",
+                encoding="utf-8",
+            )
+            (root / "api-go" / "cmd" / "xmustard-api" / "main.go").write_text(
+                "package main\n\nfunc main() {}\n",
+                encoding="utf-8",
+            )
+            (root / "api-go" / "cmd" / "xmustard-ops" / "main.go").write_text(
+                "package main\n\nfunc main() {}\n",
+                encoding="utf-8",
+            )
+
+            __import__("subprocess").run(["git", "-C", str(root), "init"], check=True, capture_output=True)
+            __import__("subprocess").run(["git", "-C", str(root), "add", "."], check=True, capture_output=True)
+            __import__("subprocess").run(
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "-c",
+                    "user.name=xmustard",
+                    "-c",
+                    "user.email=xmustard@example.com",
+                    "commit",
+                    "-m",
+                    "initial",
+                ],
+                check=True,
+                capture_output=True,
+            )
+
+            store = FileStore(Path(tmp_dir) / "data")
+            service = TrackerService(store)
+            snapshot = service.load_workspace(WorkspaceLoadRequest(root_path=str(root), auto_scan=True))
+            assert snapshot is not None
+
+            service.save_verification_profile(
+                snapshot.workspace.workspace_id,
+                VerificationProfileUpsertRequest(
+                    profile_id="xmustard-api-smoke",
+                    name="xmustard-api smoke",
+                    test_command="go test ./cmd/xmustard-api",
+                    source_paths=["api-go/cmd/xmustard-api/main.go"],
+                ),
+            )
+
+            snapshot = service.scan_workspace(snapshot.workspace.workspace_id)
+            assert snapshot is not None
+            assert snapshot.project_info is not None
+            project_info = snapshot.project_info
+
+            self.assertEqual(project_info.static_truth.services, [])
+            frontend_run = next(item for item in project_info.static_truth.run_targets if item.command == "make frontend")
+            api_run = next(item for item in project_info.static_truth.run_targets if item.command == "make go-api")
+            ops_run = next(item for item in project_info.static_truth.run_targets if item.command == "make go-ops")
+            self.assertIsNotNone(frontend_run.owner_service_id)
+            self.assertIsNotNone(api_run.owner_service_id)
+            self.assertIsNotNone(ops_run.owner_service_id)
+            self.assertNotEqual(api_run.owner_service_id, ops_run.owner_service_id)
+            self.assertTrue(any(item.name == "xmustard-api" for item in project_info.static_truth.service_identities))
+            self.assertTrue(any(item.name == "xmustard-ops" for item in project_info.static_truth.service_identities))
+            self.assertTrue(
+                any(
+                    item.relationship_type == "vite_proxy_depends_on"
+                    and item.source_service_id == frontend_run.owner_service_id
+                    and item.target_service_id == api_run.owner_service_id
+                    for item in project_info.static_truth.service_relationships
+                )
+            )
+
+            go_verify = next(item for item in project_info.static_truth.verify_targets if item.command == "cd api-go && go test ./...")
+            self.assertIsNone(go_verify.owner_service_id)
+            profile_verify = next(item for item in project_info.static_truth.verify_targets if item.command == "go test ./cmd/xmustard-api")
+            self.assertEqual(profile_verify.owner_service_id, api_run.owner_service_id)
+            self.assertIn(api_run.target_id, profile_verify.related_target_ids)
+            self.assertIn("api-go/cmd/xmustard-api/main.go", profile_verify.provenance.config_files)
+            self.assertIn(
+                "Saved verification profile source path is api-go/cmd/xmustard-api/main.go.",
+                profile_verify.provenance.config_hints,
+            )
+
     def test_postgres_schema_plan_and_bootstrap_follow_settings(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir) / "repo"

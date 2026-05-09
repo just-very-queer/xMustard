@@ -83,7 +83,7 @@ func TestReadProjectInfoBuildsDeterministicStaticAndRuntimeTruth(t *testing.T) {
 	if !projectInfoHasService(projectInfo.StaticTruth.Services, "api") {
 		t.Fatalf("expected compose service, got %#v", projectInfo.StaticTruth.Services)
 	}
-	if !projectInfoHasServiceIdentity(projectInfo.StaticTruth.ServiceIdentities, "frontend") || !projectInfoHasServiceIdentity(projectInfo.StaticTruth.ServiceIdentities, "backend") || !projectInfoHasServiceIdentity(projectInfo.StaticTruth.ServiceIdentities, "api-go") {
+	if !projectInfoHasServiceIdentity(projectInfo.StaticTruth.ServiceIdentities, "frontend") || !projectInfoHasServiceIdentity(projectInfo.StaticTruth.ServiceIdentities, "backend") || !projectInfoHasServiceIdentity(projectInfo.StaticTruth.ServiceIdentities, "fixture-api") {
 		t.Fatalf("expected manifest-backed service identities, got %#v", projectInfo.StaticTruth.ServiceIdentities)
 	}
 	frontendTarget := findProjectCommand(projectInfo.StaticTruth.RunTargets, "make frontend")
@@ -162,6 +162,92 @@ func TestReadProjectInfoBuildsDeterministicStaticAndRuntimeTruth(t *testing.T) {
 	}
 	if snapshot.ProjectInfo == nil || !projectInfoHasService(snapshot.ProjectInfo.StaticTruth.Services, "api") {
 		t.Fatalf("expected project info to persist in snapshot, got %#v", snapshot.ProjectInfo)
+	}
+}
+
+func TestReadProjectInfoBuildsNonComposeGoServicesAndServiceScopedProfiles(t *testing.T) {
+	dataDir, workspaceID, repoRoot := writeSemanticIndexFixture(t)
+
+	if err := os.WriteFile(filepath.Join(repoRoot, "Makefile"), []byte("frontend:\n\tcd frontend && npm run dev\ngo-api:\n\tcd api-go && XMUSTARD_API_PORT=8042 go run ./cmd/xmustard-api\ngo-ops:\n\tcd api-go && go run ./cmd/xmustard-ops\n"), 0o644); err != nil {
+		t.Fatalf("write Makefile: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, "frontend", "package.json"), []byte("{\"name\":\"fixture-ui\",\"scripts\":{\"dev\":\"vite\",\"test\":\"vitest run\"}}\n"), 0o644); err != nil {
+		t.Fatalf("write frontend package.json: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, "frontend", "vite.config.ts"), []byte("import { defineConfig } from 'vite'\nexport default defineConfig({ server: { port: 5177, proxy: { '/api': 'http://127.0.0.1:8042' } } })\n"), 0o644); err != nil {
+		t.Fatalf("write frontend vite config: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(repoRoot, "api-go", "cmd", "xmustard-api"), 0o755); err != nil {
+		t.Fatalf("mkdir api-go/cmd/xmustard-api: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(repoRoot, "api-go", "cmd", "xmustard-ops"), 0o755); err != nil {
+		t.Fatalf("mkdir api-go/cmd/xmustard-ops: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, "api-go", "go.mod"), []byte("module fixture/api-go\n\ngo 1.26.0\n"), 0o644); err != nil {
+		t.Fatalf("write api-go go.mod: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, "api-go", "cmd", "xmustard-api", "main.go"), []byte("package main\n\nfunc main() {}\n"), 0o644); err != nil {
+		t.Fatalf("write xmustard-api main.go: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, "api-go", "cmd", "xmustard-ops", "main.go"), []byte("package main\n\nfunc main() {}\n"), 0o644); err != nil {
+		t.Fatalf("write xmustard-ops main.go: %v", err)
+	}
+	if err := saveVerificationProfiles(dataDir, workspaceID, []verificationProfileRecord{{
+		ProfileID:         "xmustard-api-smoke",
+		WorkspaceID:       workspaceID,
+		Name:              "xmustard-api smoke",
+		Description:       "Service-scoped verification command",
+		TestCommand:       "go test ./cmd/xmustard-api",
+		CoverageFormat:    "unknown",
+		MaxRuntimeSeconds: 60,
+		RetryCount:        1,
+		SourcePaths:       []string{"api-go/cmd/xmustard-api/main.go"},
+		BuiltIn:           false,
+		CreatedAt:         nowUTC(),
+		UpdatedAt:         nowUTC(),
+	}}); err != nil {
+		t.Fatalf("save verification profiles: %v", err)
+	}
+
+	projectInfo, err := ReadProjectInfo(dataDir, workspaceID)
+	if err != nil {
+		t.Fatalf("read project info: %v", err)
+	}
+
+	if len(projectInfo.StaticTruth.Services) != 0 {
+		t.Fatalf("expected no compose services, got %#v", projectInfo.StaticTruth.Services)
+	}
+	if !projectInfoHasServiceIdentity(projectInfo.StaticTruth.ServiceIdentities, "frontend") || !projectInfoHasServiceIdentity(projectInfo.StaticTruth.ServiceIdentities, "xmustard-api") || !projectInfoHasServiceIdentity(projectInfo.StaticTruth.ServiceIdentities, "xmustard-ops") {
+		t.Fatalf("expected non-compose service identities, got %#v", projectInfo.StaticTruth.ServiceIdentities)
+	}
+	frontendRun := findProjectCommand(projectInfo.StaticTruth.RunTargets, "make frontend")
+	apiRun := findProjectCommand(projectInfo.StaticTruth.RunTargets, "make go-api")
+	opsRun := findProjectCommand(projectInfo.StaticTruth.RunTargets, "make go-ops")
+	if frontendRun == nil || apiRun == nil || opsRun == nil || frontendRun.OwnerServiceID == nil || apiRun.OwnerServiceID == nil || opsRun.OwnerServiceID == nil {
+		t.Fatalf("expected owned run targets, got frontend=%#v api=%#v ops=%#v", frontendRun, apiRun, opsRun)
+	}
+	if *apiRun.OwnerServiceID == *opsRun.OwnerServiceID {
+		t.Fatalf("expected Go cmd targets to split into distinct services, got api=%#v ops=%#v", apiRun, opsRun)
+	}
+	if !projectInfoHasRelationship(projectInfo.StaticTruth.ServiceRelationships, "vite_proxy_depends_on", *frontendRun.OwnerServiceID, *apiRun.OwnerServiceID) {
+		t.Fatalf("expected frontend proxy to point at xmustard-api, got %#v", projectInfo.StaticTruth.ServiceRelationships)
+	}
+	goVerify := findProjectCommand(projectInfo.StaticTruth.VerifyTargets, "cd api-go && go test ./...")
+	if goVerify == nil || goVerify.OwnerServiceID != nil {
+		t.Fatalf("expected module-wide go test to remain unowned across multiple Go services, got %#v", goVerify)
+	}
+	profileVerify := findProjectCommand(projectInfo.StaticTruth.VerifyTargets, "go test ./cmd/xmustard-api")
+	if profileVerify == nil || profileVerify.OwnerServiceID == nil || *profileVerify.OwnerServiceID != *apiRun.OwnerServiceID {
+		t.Fatalf("expected service-scoped verification profile ownership, got %#v", profileVerify)
+	}
+	if !slices.Contains(profileVerify.RelatedTargetIDs, apiRun.TargetID) {
+		t.Fatalf("expected profile verify target to link xmustard-api run target, got %#v", profileVerify)
+	}
+	if profileVerify.Provenance.ConfigFiles == nil || !containsProjectInfoString(profileVerify.Provenance.ConfigFiles, "api-go/cmd/xmustard-api/main.go") {
+		t.Fatalf("expected profile source path provenance, got %#v", profileVerify)
+	}
+	if !containsProjectInfoString(profileVerify.Provenance.ConfigHints, "Saved verification profile source path is api-go/cmd/xmustard-api/main.go.") {
+		t.Fatalf("expected profile source hint, got %#v", profileVerify)
 	}
 }
 
