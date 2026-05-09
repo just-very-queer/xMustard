@@ -1,6 +1,7 @@
 package workspaceops
 
 import (
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -29,13 +30,15 @@ type ProjectInfoRecord struct {
 }
 
 type ProjectInfoStaticTruth struct {
-	Manifests     []ProjectManifestRecord   `json:"manifests"`
-	Runtimes      []ProjectRuntimeRecord    `json:"runtimes"`
-	Entrypoints   []ProjectEntrypointRecord `json:"entrypoints"`
-	RunTargets    []ProjectCommandRecord    `json:"run_targets"`
-	VerifyTargets []ProjectCommandRecord    `json:"verify_targets"`
-	Services      []ProjectServiceRecord    `json:"services"`
-	Warnings      []string                  `json:"warnings"`
+	Manifests            []ProjectManifestRecord            `json:"manifests"`
+	Runtimes             []ProjectRuntimeRecord             `json:"runtimes"`
+	Entrypoints          []ProjectEntrypointRecord          `json:"entrypoints"`
+	RunTargets           []ProjectCommandRecord             `json:"run_targets"`
+	VerifyTargets        []ProjectCommandRecord             `json:"verify_targets"`
+	Services             []ProjectServiceRecord             `json:"services"`
+	ServiceIdentities    []ProjectServiceIdentityRecord     `json:"service_identities"`
+	ServiceRelationships []ProjectServiceRelationshipRecord `json:"service_relationships"`
+	Warnings             []string                           `json:"warnings"`
 }
 
 type ProjectInfoRuntimeTruth struct {
@@ -92,11 +95,14 @@ type ProjectEntrypointRecord struct {
 }
 
 type ProjectCommandRecord struct {
-	Kind       string                `json:"kind"`
-	Label      string                `json:"label"`
-	Command    string                `json:"command"`
-	Verdict    string                `json:"verdict"`
-	Provenance ProjectInfoProvenance `json:"provenance"`
+	TargetID         string                `json:"target_id"`
+	Kind             string                `json:"kind"`
+	Label            string                `json:"label"`
+	Command          string                `json:"command"`
+	Verdict          string                `json:"verdict"`
+	OwnerServiceID   *string               `json:"owner_service_id,omitempty"`
+	RelatedTargetIDs []string              `json:"related_target_ids,omitempty"`
+	Provenance       ProjectInfoProvenance `json:"provenance"`
 }
 
 type ProjectServiceRecord struct {
@@ -108,6 +114,32 @@ type ProjectServiceRecord struct {
 	Provenance ProjectInfoProvenance `json:"provenance"`
 }
 
+type ProjectServiceIdentityRecord struct {
+	ServiceID       string                `json:"service_id"`
+	Name            string                `json:"name"`
+	IdentityKind    string                `json:"identity_kind"`
+	Verdict         string                `json:"verdict"`
+	WorkingDir      *string               `json:"working_dir,omitempty"`
+	ManifestPaths   []string              `json:"manifest_paths,omitempty"`
+	EntryPaths      []string              `json:"entry_paths,omitempty"`
+	RunTargetIDs    []string              `json:"run_target_ids,omitempty"`
+	VerifyTargetIDs []string              `json:"verify_target_ids,omitempty"`
+	RunCommands     []string              `json:"run_commands,omitempty"`
+	VerifyCommands  []string              `json:"verify_commands,omitempty"`
+	DependsOn       []string              `json:"depends_on,omitempty"`
+	Profiles        []string              `json:"profiles,omitempty"`
+	Provenance      ProjectInfoProvenance `json:"provenance"`
+}
+
+type ProjectServiceRelationshipRecord struct {
+	RelationshipID   string                `json:"relationship_id"`
+	RelationshipType string                `json:"relationship_type"`
+	SourceServiceID  string                `json:"source_service_id"`
+	TargetServiceID  string                `json:"target_service_id"`
+	Verdict          string                `json:"verdict"`
+	Provenance       ProjectInfoProvenance `json:"provenance"`
+}
+
 type projectCommandResolution struct {
 	Cwd             *string
 	EntryPath       *string
@@ -115,6 +147,24 @@ type projectCommandResolution struct {
 	ServiceName     *string
 	ConfigFiles     []string
 	ConfigHints     []string
+	ManifestPaths   []string
+	ListenPorts     []string
+	ProxyTargets    []projectProxyTarget
+}
+
+type projectProxyTarget struct {
+	Route     string
+	TargetURL string
+	Port      string
+}
+
+type resolvedProjectTarget struct {
+	Target           RepoTargetRecord
+	Resolution       projectCommandResolution
+	Verdict          string
+	EvidenceType     string
+	OwnerServiceID   *string
+	RelatedTargetIDs []string
 }
 
 func ReadProjectInfo(dataDir string, workspaceID string) (*ProjectInfoRecord, error) {
@@ -137,17 +187,23 @@ func buildProjectInfo(workspaceID string, repoRoot string, runTargets []RepoTarg
 	manifests := discoverProjectManifests(repoRoot)
 	declaredRuntimes := discoverDeclaredProjectRuntimes(manifests)
 	services, warnings := discoverDeclaredServices(repoRoot)
+	resolvedRunTargets := resolveProjectTargets(repoRoot, runTargets)
+	resolvedVerifyTargets := resolveProjectTargets(repoRoot, verifyTargets)
+	serviceIdentities, serviceRelationships, graphWarnings := buildProjectServiceGraph(repoRoot, services, resolvedRunTargets, resolvedVerifyTargets)
+	warnings = dedupeStrings(append(warnings, graphWarnings...), 12)
 	return &ProjectInfoRecord{
 		WorkspaceID: workspaceID,
 		RootPath:    repoRoot,
 		StaticTruth: ProjectInfoStaticTruth{
-			Manifests:     manifests,
-			Runtimes:      declaredRuntimes,
-			Entrypoints:   buildProjectEntrypoints(repoRoot, runTargets),
-			RunTargets:    buildProjectCommandRecords(repoRoot, runTargets),
-			VerifyTargets: buildProjectCommandRecords(repoRoot, verifyTargets),
-			Services:      services,
-			Warnings:      warnings,
+			Manifests:            manifests,
+			Runtimes:             declaredRuntimes,
+			Entrypoints:          buildProjectEntrypoints(repoRoot, runTargets),
+			RunTargets:           buildProjectCommandRecords(resolvedRunTargets),
+			VerifyTargets:        buildProjectCommandRecords(resolvedVerifyTargets),
+			Services:             services,
+			ServiceIdentities:    serviceIdentities,
+			ServiceRelationships: serviceRelationships,
+			Warnings:             warnings,
 		},
 		RuntimeTruth: ProjectInfoRuntimeTruth{
 			Runtimes: observeDeclaredProjectRuntimes(declaredRuntimes),
@@ -319,17 +375,33 @@ func buildProjectEntrypoints(repoRoot string, targets []RepoTargetRecord) []Proj
 	return items
 }
 
-func buildProjectCommandRecords(repoRoot string, targets []RepoTargetRecord) []ProjectCommandRecord {
-	items := make([]ProjectCommandRecord, 0, len(targets))
+func resolveProjectTargets(repoRoot string, targets []RepoTargetRecord) []resolvedProjectTarget {
+	items := make([]resolvedProjectTarget, 0, len(targets))
 	for _, target := range targets {
 		resolution := resolveProjectCommand(repoRoot, target)
 		verdict := projectInfoVerdictFromTarget(target, resolution)
+		items = append(items, resolvedProjectTarget{
+			Target:       target,
+			Resolution:   resolution,
+			Verdict:      verdict,
+			EvidenceType: projectInfoEvidenceTypeFromTarget(target, resolution, verdict),
+		})
+	}
+	return items
+}
+
+func buildProjectCommandRecords(targets []resolvedProjectTarget) []ProjectCommandRecord {
+	items := make([]ProjectCommandRecord, 0, len(targets))
+	for _, target := range targets {
 		items = append(items, ProjectCommandRecord{
-			Kind:       target.Kind,
-			Label:      target.Label,
-			Command:    target.Command,
-			Verdict:    verdict,
-			Provenance: projectInfoProvenanceFromTarget(target, resolution, verdict, projectInfoEvidenceTypeFromTarget(target, resolution, verdict)),
+			TargetID:         target.Target.TargetID,
+			Kind:             target.Target.Kind,
+			Label:            target.Target.Label,
+			Command:          target.Target.Command,
+			Verdict:          target.Verdict,
+			OwnerServiceID:   target.OwnerServiceID,
+			RelatedTargetIDs: append([]string{}, target.RelatedTargetIDs...),
+			Provenance:       projectInfoProvenanceFromTarget(target.Target, target.Resolution, target.Verdict, target.EvidenceType),
 		})
 	}
 	return items
@@ -384,6 +456,7 @@ func projectInfoProvenanceFromTarget(target RepoTargetRecord, resolution project
 	if entryPath != nil && strings.TrimSpace(*entryPath) != "" {
 		evidencePaths = append(evidencePaths, *entryPath)
 	}
+	evidencePaths = append(evidencePaths, resolution.ManifestPaths...)
 	evidencePaths = append(evidencePaths, resolution.ConfigFiles...)
 	evidencePaths = dedupeStrings(evidencePaths, 12)
 	reason := target.Reason
@@ -473,6 +546,494 @@ func discoverDeclaredServices(repoRoot string) ([]ProjectServiceRecord, []string
 	return items, dedupeStrings(warnings, 8)
 }
 
+type projectServiceIdentitySeed struct {
+	ServiceID       string
+	Name            string
+	IdentityKind    string
+	Verdict         string
+	SourceKind      string
+	SourceFile      string
+	WorkingDir      *string
+	ManifestPaths   []string
+	EntryPaths      []string
+	RunTargetIDs    []string
+	VerifyTargetIDs []string
+	RunCommands     []string
+	VerifyCommands  []string
+	DependsOn       []string
+	Profiles        []string
+	ConfigFiles     []string
+	ConfigHints     []string
+	ListenPorts     []string
+	ProxyTargets    []projectProxyTarget
+	Reason          string
+}
+
+func buildProjectServiceGraph(repoRoot string, composeServices []ProjectServiceRecord, runTargets []resolvedProjectTarget, verifyTargets []resolvedProjectTarget) ([]ProjectServiceIdentityRecord, []ProjectServiceRelationshipRecord, []string) {
+	seeds := map[string]*projectServiceIdentitySeed{}
+	order := []string{}
+	manifestKeyToServiceID := map[string]string{}
+	composeNameToServiceID := map[string]string{}
+	warnings := []string{}
+	addSeed := func(seed *projectServiceIdentitySeed) *projectServiceIdentitySeed {
+		if seed == nil || strings.TrimSpace(seed.ServiceID) == "" {
+			return nil
+		}
+		existing, ok := seeds[seed.ServiceID]
+		if !ok {
+			seeds[seed.ServiceID] = seed
+			order = append(order, seed.ServiceID)
+			return seed
+		}
+		existing.ManifestPaths = dedupeStrings(append(existing.ManifestPaths, seed.ManifestPaths...), 12)
+		existing.EntryPaths = dedupeStrings(append(existing.EntryPaths, seed.EntryPaths...), 12)
+		existing.RunTargetIDs = dedupeStrings(append(existing.RunTargetIDs, seed.RunTargetIDs...), 24)
+		existing.VerifyTargetIDs = dedupeStrings(append(existing.VerifyTargetIDs, seed.VerifyTargetIDs...), 24)
+		existing.RunCommands = dedupeStrings(append(existing.RunCommands, seed.RunCommands...), 24)
+		existing.VerifyCommands = dedupeStrings(append(existing.VerifyCommands, seed.VerifyCommands...), 24)
+		existing.DependsOn = dedupeStrings(append(existing.DependsOn, seed.DependsOn...), 24)
+		existing.Profiles = dedupeStrings(append(existing.Profiles, seed.Profiles...), 24)
+		existing.ConfigFiles = dedupeStrings(append(existing.ConfigFiles, seed.ConfigFiles...), 24)
+		existing.ConfigHints = dedupeStrings(append(existing.ConfigHints, seed.ConfigHints...), 24)
+		existing.ListenPorts = dedupeStrings(append(existing.ListenPorts, seed.ListenPorts...), 24)
+		existing.ProxyTargets = append(existing.ProxyTargets, seed.ProxyTargets...)
+		if existing.WorkingDir == nil && seed.WorkingDir != nil {
+			existing.WorkingDir = seed.WorkingDir
+		}
+		if existing.Reason == "" {
+			existing.Reason = seed.Reason
+		}
+		return existing
+	}
+
+	for _, service := range composeServices {
+		sourceFile := firstNonEmptyPtr(service.Provenance.SourceFile)
+		serviceID := "compose:" + hashID(sourceFile, service.Name)
+		dependsOn := []string{}
+		for _, name := range service.DependsOn {
+			dependsOn = append(dependsOn, "compose:"+hashID(sourceFile, name))
+		}
+		seed := addSeed(&projectServiceIdentitySeed{
+			ServiceID:     serviceID,
+			Name:          service.Name,
+			IdentityKind:  "compose_service",
+			Verdict:       service.Verdict,
+			SourceKind:    "docker_compose",
+			SourceFile:    sourceFile,
+			WorkingDir:    service.Provenance.Cwd,
+			ManifestPaths: conditionalStrings(sourceFile != "", sourceFile),
+			RunCommands:   conditionalStrings(strings.TrimSpace(service.Command) != "", service.Command),
+			DependsOn:     dependsOn,
+			Profiles:      append([]string{}, service.Profiles...),
+			ConfigFiles:   append([]string{}, service.Provenance.ConfigFiles...),
+			ConfigHints:   append([]string{}, service.Provenance.ConfigHints...),
+			Reason:        firstNonEmptyPtr(service.Provenance.Reason),
+		})
+		if seed != nil {
+			composeNameToServiceID[service.Name] = seed.ServiceID
+		}
+	}
+
+	for idx := range runTargets {
+		manifestKey, _, seed := ensureManifestServiceIdentity(repoRoot, &runTargets[idx], nil)
+		if seed == nil {
+			continue
+		}
+		seed = addSeed(seed)
+		if seed == nil {
+			continue
+		}
+		runTargets[idx].OwnerServiceID = &seed.ServiceID
+		if manifestKey != "" {
+			manifestKeyToServiceID[manifestKey] = seed.ServiceID
+		}
+	}
+
+	for idx := range verifyTargets {
+		if verifyTargets[idx].Target.ProfileID != nil {
+			continue
+		}
+		manifestKey, _, seed := ensureManifestServiceIdentity(repoRoot, nil, &verifyTargets[idx])
+		if seed == nil {
+			continue
+		}
+		if existingID, ok := manifestKeyToServiceID[manifestKey]; ok && existingID != "" {
+			if existing := seeds[existingID]; existing != nil {
+				existing = addSeed(seed)
+				if existing != nil {
+					verifyTargets[idx].OwnerServiceID = &existing.ServiceID
+					verifyTargets[idx].RelatedTargetIDs = append([]string{}, existing.RunTargetIDs...)
+				}
+			}
+			continue
+		}
+		seed = addSeed(seed)
+		if seed == nil {
+			continue
+		}
+		if manifestKey != "" {
+			manifestKeyToServiceID[manifestKey] = seed.ServiceID
+		}
+		verifyTargets[idx].OwnerServiceID = &seed.ServiceID
+		verifyTargets[idx].RelatedTargetIDs = append([]string{}, seed.RunTargetIDs...)
+	}
+	for idx := range verifyTargets {
+		if verifyTargets[idx].Target.ProfileID == nil {
+			continue
+		}
+		matchedServiceID, matchedTargetIDs := findExactVerificationAlias(runTargets, verifyTargets, verifyTargets[idx].Target.Command)
+		if matchedServiceID == "" {
+			continue
+		}
+		verifyTargets[idx].OwnerServiceID = &matchedServiceID
+		verifyTargets[idx].RelatedTargetIDs = append([]string{}, matchedTargetIDs...)
+	}
+
+	relationships := []ProjectServiceRelationshipRecord{}
+	relationshipSeen := map[string]struct{}{}
+	appendRelationship := func(item ProjectServiceRelationshipRecord) {
+		if _, ok := relationshipSeen[item.RelationshipID]; ok {
+			return
+		}
+		relationshipSeen[item.RelationshipID] = struct{}{}
+		relationships = append(relationships, item)
+	}
+
+	for _, service := range composeServices {
+		sourceFile := firstNonEmptyPtr(service.Provenance.SourceFile)
+		sourceServiceID := composeNameToServiceID[service.Name]
+		for _, dependencyName := range service.DependsOn {
+			targetServiceID := composeNameToServiceID[dependencyName]
+			if sourceServiceID == "" || targetServiceID == "" {
+				continue
+			}
+			reason := "Compose explicitly declares depends_on: " + service.Name + " -> " + dependencyName + "."
+			appendRelationship(ProjectServiceRelationshipRecord{
+				RelationshipID:   "compose-depends-on-" + hashID(sourceServiceID, targetServiceID),
+				RelationshipType: "compose_depends_on",
+				SourceServiceID:  sourceServiceID,
+				TargetServiceID:  targetServiceID,
+				Verdict:          projectInfoVerdictDeclared,
+				Provenance: newProjectInfoProvenance(
+					"docker_compose",
+					optionalString(sourceFile),
+					optionalString(service.Command),
+					service.Provenance.Cwd,
+					nil,
+					nil,
+					optionalString(service.Name),
+					append([]string{}, service.Provenance.ConfigFiles...),
+					append([]string{}, service.Provenance.ConfigHints...),
+					"service_relationship",
+					append([]string{}, service.Provenance.ConfigFiles...),
+					nil,
+					projectInfoIntPtr(100),
+					optionalStringPtr(reason),
+				),
+			})
+		}
+	}
+
+	portOwners := map[string][]string{}
+	for serviceID, seed := range seeds {
+		if seed == nil {
+			continue
+		}
+		for _, port := range seed.ListenPorts {
+			portOwners[port] = append(portOwners[port], serviceID)
+		}
+	}
+	for port, owners := range portOwners {
+		portOwners[port] = dedupeStrings(owners, 12)
+	}
+	for _, serviceID := range order {
+		seed := seeds[serviceID]
+		if seed == nil {
+			continue
+		}
+		for _, proxyTarget := range seed.ProxyTargets {
+			if proxyTarget.Port == "" {
+				continue
+			}
+			owners := []string{}
+			for _, owner := range portOwners[proxyTarget.Port] {
+				if owner != serviceID {
+					owners = append(owners, owner)
+				}
+			}
+			owners = dedupeStrings(owners, 12)
+			if len(owners) == 0 {
+				continue
+			}
+			if len(owners) > 1 {
+				warnings = append(warnings, "Skipped Vite proxy dependency for service "+seed.Name+" because port "+proxyTarget.Port+" matches multiple services.")
+				continue
+			}
+			targetSeed := seeds[owners[0]]
+			if targetSeed == nil {
+				continue
+			}
+			evidencePaths := append([]string{}, seed.ManifestPaths...)
+			evidencePaths = append(evidencePaths, seed.ConfigFiles...)
+			evidencePaths = append(evidencePaths, targetSeed.ManifestPaths...)
+			evidencePaths = append(evidencePaths, targetSeed.ConfigFiles...)
+			evidencePaths = dedupeStrings(evidencePaths, 24)
+			reason := "Vite proxy route " + proxyTarget.Route + " targets " + proxyTarget.TargetURL + ", and " + targetSeed.Name + " declares port " + proxyTarget.Port + "."
+			appendRelationship(ProjectServiceRelationshipRecord{
+				RelationshipID:   "vite-proxy-depends-on-" + hashID(serviceID, owners[0], proxyTarget.Route, proxyTarget.Port),
+				RelationshipType: "vite_proxy_depends_on",
+				SourceServiceID:  serviceID,
+				TargetServiceID:  owners[0],
+				Verdict:          projectInfoVerdictConfigBacked,
+				Provenance: newProjectInfoProvenance(
+					seed.SourceKind,
+					optionalString(seed.SourceFile),
+					optionalString(firstString(seed.RunCommands)),
+					seed.WorkingDir,
+					optionalString(firstString(seed.EntryPaths)),
+					nil,
+					optionalString(seed.Name),
+					dedupeStrings(append([]string{}, seed.ConfigFiles...), 24),
+					dedupeStrings(append([]string{}, seed.ConfigHints...), 24),
+					"service_relationship",
+					evidencePaths,
+					nil,
+					projectInfoIntPtr(95),
+					optionalStringPtr(reason),
+				),
+			})
+			seed.DependsOn = dedupeStrings(append(seed.DependsOn, owners[0]), 12)
+		}
+	}
+
+	serviceIdentities := make([]ProjectServiceIdentityRecord, 0, len(order))
+	for _, serviceID := range order {
+		seed := seeds[serviceID]
+		if seed == nil {
+			continue
+		}
+		evidencePaths := append([]string{}, seed.ManifestPaths...)
+		evidencePaths = append(evidencePaths, seed.EntryPaths...)
+		evidencePaths = append(evidencePaths, seed.ConfigFiles...)
+		evidencePaths = dedupeStrings(evidencePaths, 24)
+		serviceIdentities = append(serviceIdentities, ProjectServiceIdentityRecord{
+			ServiceID:       seed.ServiceID,
+			Name:            seed.Name,
+			IdentityKind:    seed.IdentityKind,
+			Verdict:         seed.Verdict,
+			WorkingDir:      seed.WorkingDir,
+			ManifestPaths:   append([]string{}, seed.ManifestPaths...),
+			EntryPaths:      append([]string{}, seed.EntryPaths...),
+			RunTargetIDs:    append([]string{}, seed.RunTargetIDs...),
+			VerifyTargetIDs: append([]string{}, seed.VerifyTargetIDs...),
+			RunCommands:     append([]string{}, seed.RunCommands...),
+			VerifyCommands:  append([]string{}, seed.VerifyCommands...),
+			DependsOn:       append([]string{}, seed.DependsOn...),
+			Profiles:        append([]string{}, seed.Profiles...),
+			Provenance: newProjectInfoProvenance(
+				seed.SourceKind,
+				optionalString(seed.SourceFile),
+				optionalString(firstString(seed.RunCommands)),
+				seed.WorkingDir,
+				optionalString(firstString(seed.EntryPaths)),
+				nil,
+				optionalString(seed.Name),
+				append([]string{}, seed.ConfigFiles...),
+				append([]string{}, seed.ConfigHints...),
+				"service_identity",
+				evidencePaths,
+				nil,
+				projectInfoIntPtr(100),
+				optionalStringPtr(seed.Reason),
+			),
+		})
+	}
+	slices.SortFunc(serviceIdentities, func(a, b ProjectServiceIdentityRecord) int {
+		if a.Name != b.Name {
+			return strings.Compare(a.Name, b.Name)
+		}
+		return strings.Compare(a.ServiceID, b.ServiceID)
+	})
+	slices.SortFunc(relationships, func(a, b ProjectServiceRelationshipRecord) int {
+		if a.SourceServiceID != b.SourceServiceID {
+			return strings.Compare(a.SourceServiceID, b.SourceServiceID)
+		}
+		if a.TargetServiceID != b.TargetServiceID {
+			return strings.Compare(a.TargetServiceID, b.TargetServiceID)
+		}
+		return strings.Compare(a.RelationshipType, b.RelationshipType)
+	})
+	return serviceIdentities, relationships, dedupeStrings(warnings, 12)
+}
+
+func ensureManifestServiceIdentity(repoRoot string, runTarget *resolvedProjectTarget, verifyTarget *resolvedProjectTarget) (string, string, *projectServiceIdentitySeed) {
+	var current *resolvedProjectTarget
+	if runTarget != nil {
+		current = runTarget
+	} else {
+		current = verifyTarget
+	}
+	if current == nil {
+		return "", "", nil
+	}
+	manifestPath, workingDir, ok := projectTargetManifestScope(repoRoot, *current)
+	if !ok {
+		return "", "", nil
+	}
+	name := projectManifestServiceName(repoRoot, manifestPath, workingDir, current.Resolution.ServiceName)
+	serviceID := "manifest:" + hashID(manifestPath, workingDir)
+	reason := "Manifest-backed service identity groups commands declared from " + manifestPath + "."
+	entryPaths := []string{}
+	if current.Resolution.EntryPath != nil && strings.TrimSpace(*current.Resolution.EntryPath) != "" {
+		entryPaths = append(entryPaths, strings.TrimSpace(*current.Resolution.EntryPath))
+	}
+	seed := &projectServiceIdentitySeed{
+		ServiceID:     serviceID,
+		Name:          name,
+		IdentityKind:  "manifest_scope",
+		Verdict:       projectInfoVerdictConfigBacked,
+		SourceKind:    current.Target.Source,
+		SourceFile:    manifestPath,
+		WorkingDir:    optionalString(workingDir),
+		ManifestPaths: []string{manifestPath},
+		EntryPaths:    entryPaths,
+		ConfigFiles:   append([]string{}, current.Resolution.ConfigFiles...),
+		ConfigHints:   append([]string{}, current.Resolution.ConfigHints...),
+		ListenPorts:   append([]string{}, current.Resolution.ListenPorts...),
+		ProxyTargets:  append([]projectProxyTarget{}, current.Resolution.ProxyTargets...),
+		Reason:        reason,
+	}
+	if runTarget != nil {
+		seed.RunTargetIDs = []string{current.Target.TargetID}
+		seed.RunCommands = []string{current.Target.Command}
+	} else {
+		seed.VerifyTargetIDs = []string{current.Target.TargetID}
+		seed.VerifyCommands = []string{current.Target.Command}
+	}
+	return manifestPath + "|" + workingDir, serviceID, seed
+}
+
+func findExactVerificationAlias(runTargets []resolvedProjectTarget, verifyTargets []resolvedProjectTarget, command string) (string, []string) {
+	trimmed := strings.TrimSpace(command)
+	if trimmed == "" {
+		return "", nil
+	}
+	for _, item := range verifyTargets {
+		if item.Target.ProfileID != nil || strings.TrimSpace(item.Target.Command) != trimmed || item.OwnerServiceID == nil {
+			continue
+		}
+		return *item.OwnerServiceID, append([]string{}, item.RelatedTargetIDs...)
+	}
+	for _, item := range runTargets {
+		if strings.TrimSpace(item.Target.Command) != trimmed || item.OwnerServiceID == nil {
+			continue
+		}
+		return *item.OwnerServiceID, nil
+	}
+	return "", nil
+}
+
+func projectTargetManifestScope(repoRoot string, target resolvedProjectTarget) (string, string, bool) {
+	workingDir := firstNonEmptyProjectString(firstNonEmptyPtr(target.Resolution.Cwd), target.Target.WorkingDir)
+	manifestPaths := []string{}
+	for _, path := range target.Resolution.ManifestPaths {
+		if strings.TrimSpace(path) != "" {
+			manifestPaths = append(manifestPaths, strings.TrimSpace(path))
+		}
+	}
+	switch target.Target.Source {
+	case "package_json", "pyproject_toml", "cargo_toml", "go_mod":
+		manifestPaths = append(manifestPaths, target.Target.SourcePath)
+	}
+	if len(manifestPaths) == 0 && workingDir != "" {
+		manifestPaths = append(manifestPaths, discoverManifestPathsForWorkingDir(repoRoot, workingDir)...)
+	}
+	manifestPaths = dedupeStrings(manifestPaths, 12)
+	if len(manifestPaths) != 1 {
+		return "", "", false
+	}
+	return manifestPaths[0], workingDir, true
+}
+
+func discoverManifestPathsForWorkingDir(repoRoot string, workingDir string) []string {
+	items := []string{}
+	for _, candidate := range []string{"package.json", "pyproject.toml", "Cargo.toml", "go.mod"} {
+		path := filepath.Join(repoRoot, filepath.FromSlash(workingDir), candidate)
+		if _, err := os.Stat(path); err == nil {
+			items = append(items, normalizeRepoPath(repoRoot, path))
+		}
+	}
+	return dedupeStrings(items, 8)
+}
+
+func projectManifestServiceName(repoRoot string, manifestPath string, workingDir string, serviceName *string) string {
+	if serviceName != nil && strings.TrimSpace(*serviceName) != "" {
+		return strings.TrimSpace(*serviceName)
+	}
+	if strings.TrimSpace(workingDir) != "" {
+		return filepath.Base(filepath.FromSlash(workingDir))
+	}
+	manifestName := filepath.Base(manifestPath)
+	if manifestName != "" && manifestName != "." {
+		return filepath.Base(repoRoot)
+	}
+	return filepath.Base(repoRoot)
+}
+
+func appendWorkingDirManifestHints(repoRoot string, resolution *projectCommandResolution) {
+	if resolution == nil || resolution.Cwd == nil || strings.TrimSpace(*resolution.Cwd) == "" {
+		return
+	}
+	resolution.ManifestPaths = append(resolution.ManifestPaths, discoverManifestPathsForWorkingDir(repoRoot, *resolution.Cwd)...)
+}
+
+func dedupeProjectProxyTargets(items []projectProxyTarget) []projectProxyTarget {
+	seen := map[string]projectProxyTarget{}
+	order := []string{}
+	for _, item := range items {
+		key := item.Route + "|" + item.TargetURL + "|" + item.Port
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = item
+		order = append(order, key)
+	}
+	out := make([]projectProxyTarget, 0, len(order))
+	for _, key := range order {
+		out = append(out, seen[key])
+	}
+	return out
+}
+
+func parseProjectProxyTarget(route string, rawURL string) (projectProxyTarget, bool) {
+	parsed, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil || parsed == nil {
+		return projectProxyTarget{}, false
+	}
+	host := strings.TrimSpace(parsed.Hostname())
+	if host != "127.0.0.1" && host != "localhost" {
+		return projectProxyTarget{}, false
+	}
+	port := strings.TrimSpace(parsed.Port())
+	if port == "" {
+		return projectProxyTarget{}, false
+	}
+	return projectProxyTarget{
+		Route:     strings.TrimSpace(route),
+		TargetURL: strings.TrimSpace(rawURL),
+		Port:      port,
+	}, true
+}
+
+func isManifestSourceKind(sourceKind string) bool {
+	switch sourceKind {
+	case "package_json", "pyproject_toml", "cargo_toml", "go_mod":
+		return true
+	default:
+		return false
+	}
+}
+
 type composeManifestRecord struct {
 	Path     string
 	Services []composeServiceRecord
@@ -504,11 +1065,20 @@ func resolveProjectCommand(repoRoot string, target RepoTargetRecord) projectComm
 		resolveMakeTarget(repoRoot, target, &resolution)
 	case "pyproject_toml":
 		resolvePyprojectTarget(repoRoot, target, &resolution)
+	case "cargo_toml":
+		resolveCargoTarget(repoRoot, target, &resolution)
 	case "go_mod":
 		resolveGoTarget(repoRoot, target, &resolution)
 	}
+	appendWorkingDirManifestHints(repoRoot, &resolution)
+	if isManifestSourceKind(target.Source) && strings.TrimSpace(target.SourcePath) != "" {
+		resolution.ManifestPaths = append(resolution.ManifestPaths, target.SourcePath)
+	}
+	resolution.ManifestPaths = dedupeStrings(resolution.ManifestPaths, 12)
 	resolution.ConfigFiles = dedupeStrings(resolution.ConfigFiles, 12)
 	resolution.ConfigHints = dedupeStrings(resolution.ConfigHints, 12)
+	resolution.ListenPorts = dedupeStrings(resolution.ListenPorts, 12)
+	resolution.ProxyTargets = dedupeProjectProxyTargets(resolution.ProxyTargets)
 	return resolution
 }
 
@@ -531,6 +1101,7 @@ func resolvePackageTarget(repoRoot string, target RepoTargetRecord, resolution *
 	}
 	trimmed := strings.TrimSpace(declared)
 	resolution.DeclaredCommand = &trimmed
+	resolution.ManifestPaths = append(resolution.ManifestPaths, target.SourcePath)
 	resolution.ConfigFiles = append(resolution.ConfigFiles, target.SourcePath)
 	workingDir := firstNonEmptyProjectString(target.WorkingDir, normalizeWorkingDir(repoRoot, filepath.Dir(manifestPath)))
 	if workingDir != "" {
@@ -596,14 +1167,34 @@ func resolvePyprojectTarget(repoRoot string, target RepoTargetRecord, resolution
 	if declared, ok := scripts[scriptName]; ok && strings.TrimSpace(declared) != "" {
 		trimmed := strings.TrimSpace(declared)
 		resolution.DeclaredCommand = &trimmed
+		resolution.ManifestPaths = append(resolution.ManifestPaths, target.SourcePath)
 		resolution.ConfigFiles = append(resolution.ConfigFiles, target.SourcePath)
+	}
+}
+
+func resolveCargoTarget(repoRoot string, target RepoTargetRecord, resolution *projectCommandResolution) {
+	if resolution == nil {
+		return
+	}
+	resolution.ManifestPaths = append(resolution.ManifestPaths, target.SourcePath)
+	manifestPath := filepath.Join(repoRoot, filepath.FromSlash(target.SourcePath))
+	workingDir := firstNonEmptyProjectString(target.WorkingDir, normalizeWorkingDir(repoRoot, filepath.Dir(manifestPath)))
+	if workingDir != "" {
+		resolution.Cwd = &workingDir
+		if resolution.ServiceName == nil {
+			resolution.ServiceName = optionalString(filepath.Base(workingDir))
+		}
 	}
 }
 
 func resolveGoTarget(repoRoot string, target RepoTargetRecord, resolution *projectCommandResolution) {
 	if resolution == nil || resolution.EntryPath == nil || strings.TrimSpace(*resolution.EntryPath) == "" {
+		if resolution != nil {
+			resolution.ManifestPaths = append(resolution.ManifestPaths, target.SourcePath)
+		}
 		return
 	}
+	resolution.ManifestPaths = append(resolution.ManifestPaths, target.SourcePath)
 	entryAbs := filepath.Join(repoRoot, filepath.FromSlash(*resolution.EntryPath))
 	content, err := os.ReadFile(entryAbs)
 	if err != nil {
@@ -634,6 +1225,7 @@ func resolveShellCommand(repoRoot string, command string, resolution *projectCom
 		inner = command
 	}
 	if port, ok := extractFlagValue(inner, "--port"); ok {
+		resolution.ListenPorts = append(resolution.ListenPorts, port)
 		resolution.ConfigHints = append(resolution.ConfigHints, "Declared command sets --port "+port+".")
 	}
 	for _, match := range regexp.MustCompile(`([A-Z0-9_]+)=([^\s]+)`).FindAllStringSubmatch(inner, -1) {
@@ -715,12 +1307,16 @@ func resolveViteHints(repoRoot string, workingDir string, command string, resolu
 		return
 	}
 	if match := regexp.MustCompile(`port:\s*(\d+)`).FindStringSubmatch(string(content)); len(match) >= 2 {
+		resolution.ListenPorts = append(resolution.ListenPorts, match[1])
 		resolution.ConfigHints = append(resolution.ConfigHints, "Vite dev server port is "+match[1]+".")
 	}
 	proxyPattern := regexp.MustCompile(`['"]([^'"]+)['"]:\s*['"]([^'"]+)['"]`)
 	for _, match := range proxyPattern.FindAllStringSubmatch(string(content), -1) {
 		if len(match) < 3 || !strings.HasPrefix(match[1], "/") {
 			continue
+		}
+		if proxyTarget, ok := parseProjectProxyTarget(match[1], match[2]); ok {
+			resolution.ProxyTargets = append(resolution.ProxyTargets, proxyTarget)
 		}
 		resolution.ConfigHints = append(resolution.ConfigHints, "Vite proxy maps "+match[1]+" to "+match[2]+".")
 	}

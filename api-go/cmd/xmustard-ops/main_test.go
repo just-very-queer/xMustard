@@ -53,6 +53,9 @@ func TestWorkspaceLoadAndVerificationProfileOperatorLoop(t *testing.T) {
 	if readJSONPathString(t, projectInfo, "workspace_id") != workspaceID {
 		t.Fatalf("project-info did not return the loaded workspace: %#v", projectInfo)
 	}
+	if len(asJSONArrayAtPath(t, projectInfo, "static_truth", "service_identities")) == 0 {
+		t.Fatalf("expected project-info service identities, got %#v", projectInfo)
+	}
 
 	runTargets := runOpsJSON(t, dataDir, "workspace", "run-targets", workspaceID)
 	if len(asJSONArray(t, runTargets)) == 0 {

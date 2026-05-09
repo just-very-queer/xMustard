@@ -83,9 +83,15 @@ func TestReadProjectInfoBuildsDeterministicStaticAndRuntimeTruth(t *testing.T) {
 	if !projectInfoHasService(projectInfo.StaticTruth.Services, "api") {
 		t.Fatalf("expected compose service, got %#v", projectInfo.StaticTruth.Services)
 	}
+	if !projectInfoHasServiceIdentity(projectInfo.StaticTruth.ServiceIdentities, "frontend") || !projectInfoHasServiceIdentity(projectInfo.StaticTruth.ServiceIdentities, "backend") || !projectInfoHasServiceIdentity(projectInfo.StaticTruth.ServiceIdentities, "api-go") {
+		t.Fatalf("expected manifest-backed service identities, got %#v", projectInfo.StaticTruth.ServiceIdentities)
+	}
 	frontendTarget := findProjectCommand(projectInfo.StaticTruth.RunTargets, "make frontend")
 	if frontendTarget == nil || frontendTarget.Provenance.DeclaredCommand == nil || *frontendTarget.Provenance.DeclaredCommand != "vite" {
 		t.Fatalf("expected frontend make target declared command, got %#v", frontendTarget)
+	}
+	if frontendTarget.OwnerServiceID == nil {
+		t.Fatalf("expected frontend run target owner service, got %#v", frontendTarget)
 	}
 	if !slices.Contains(frontendTarget.Provenance.ConfigFiles, "frontend/vite.config.ts") {
 		t.Fatalf("expected frontend vite config evidence, got %#v", frontendTarget)
@@ -103,9 +109,33 @@ func TestReadProjectInfoBuildsDeterministicStaticAndRuntimeTruth(t *testing.T) {
 	if !containsProjectInfoString(backendTarget.Provenance.ConfigHints, "Declared command sets --port 8042.") {
 		t.Fatalf("expected backend port hint, got %#v", backendTarget)
 	}
+	if backendTarget.OwnerServiceID == nil {
+		t.Fatalf("expected backend run target owner service, got %#v", backendTarget)
+	}
 	goTarget := findProjectCommand(projectInfo.StaticTruth.RunTargets, "cd api-go && go run ./cmd/fixture-api")
 	if goTarget == nil || !containsProjectInfoString(goTarget.Provenance.ConfigHints, "Entrypoint reads env var XMUSTARD_API_PORT with default 8080.") {
 		t.Fatalf("expected Go env config hint, got %#v", goTarget)
+	}
+	if goTarget.OwnerServiceID == nil {
+		t.Fatalf("expected Go run target owner service, got %#v", goTarget)
+	}
+	frontendVerify := findProjectCommand(projectInfo.StaticTruth.VerifyTargets, "cd frontend && npm run test")
+	if frontendVerify == nil || frontendVerify.OwnerServiceID == nil || frontendTarget.OwnerServiceID == nil || *frontendVerify.OwnerServiceID != *frontendTarget.OwnerServiceID {
+		t.Fatalf("expected frontend verify ownership, got %#v", frontendVerify)
+	}
+	if !slices.Contains(frontendVerify.RelatedTargetIDs, frontendTarget.TargetID) {
+		t.Fatalf("expected frontend verify target to link frontend run target, got %#v", frontendVerify)
+	}
+	goVerify := findProjectCommand(projectInfo.StaticTruth.VerifyTargets, "cd api-go && go test ./...")
+	if goVerify == nil || goVerify.OwnerServiceID == nil || goTarget.OwnerServiceID == nil || *goVerify.OwnerServiceID != *goTarget.OwnerServiceID {
+		t.Fatalf("expected Go verify ownership, got %#v", goVerify)
+	}
+	if !slices.Contains(goVerify.RelatedTargetIDs, goTarget.TargetID) {
+		t.Fatalf("expected Go verify target to link Go run target, got %#v", goVerify)
+	}
+	profileVerify := findProjectCommand(projectInfo.StaticTruth.VerifyTargets, "pytest -q")
+	if profileVerify == nil || profileVerify.OwnerServiceID != nil {
+		t.Fatalf("expected saved verification profile to remain unowned, got %#v", profileVerify)
 	}
 	service := findProjectService(projectInfo.StaticTruth.Services, "api")
 	if service == nil || service.Provenance.ServiceName == nil || *service.Provenance.ServiceName != "api" {
@@ -116,6 +146,9 @@ func TestReadProjectInfoBuildsDeterministicStaticAndRuntimeTruth(t *testing.T) {
 	}
 	if !projectInfoHasDeclaredRuntime(projectInfo.StaticTruth.Runtimes, "python3") || !projectInfoHasDeclaredRuntime(projectInfo.StaticTruth.Runtimes, "cargo") || !projectInfoHasDeclaredRuntime(projectInfo.StaticTruth.Runtimes, "go") || !projectInfoHasObservedRuntime(projectInfo.RuntimeTruth.Runtimes, "npm") || !projectInfoHasObservedRuntime(projectInfo.RuntimeTruth.Runtimes, "go") {
 		t.Fatalf("expected runtime inventory, got static=%#v runtime=%#v", projectInfo.StaticTruth.Runtimes, projectInfo.RuntimeTruth.Runtimes)
+	}
+	if !projectInfoHasRelationship(projectInfo.StaticTruth.ServiceRelationships, "vite_proxy_depends_on", *frontendTarget.OwnerServiceID, *backendTarget.OwnerServiceID) {
+		t.Fatalf("expected Vite proxy dependency relationship, got %#v", projectInfo.StaticTruth.ServiceRelationships)
 	}
 	for _, item := range projectInfo.RuntimeTruth.Runtimes {
 		if item.Verdict != projectInfoVerdictRuntimeObserved && item.Verdict != projectInfoVerdictUnavailable {
@@ -162,6 +195,24 @@ func projectInfoHasEntrypoint(items []ProjectEntrypointRecord, entryPath string)
 func projectInfoHasService(items []ProjectServiceRecord, name string) bool {
 	for _, item := range items {
 		if item.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func projectInfoHasServiceIdentity(items []ProjectServiceIdentityRecord, name string) bool {
+	for _, item := range items {
+		if item.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func projectInfoHasRelationship(items []ProjectServiceRelationshipRecord, relationshipType string, sourceServiceID string, targetServiceID string) bool {
+	for _, item := range items {
+		if item.RelationshipType == relationshipType && item.SourceServiceID == sourceServiceID && item.TargetServiceID == targetServiceID {
 			return true
 		}
 	}

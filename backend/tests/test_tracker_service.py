@@ -2558,6 +2558,8 @@ class RuntimeSummaryTests(unittest.TestCase):
             self.assertTrue(any(item.command == "npm run test" for item in project_info.static_truth.verify_targets))
             self.assertTrue(any(item.path == "api-go/go.mod" for item in project_info.static_truth.manifests))
             self.assertTrue(any(item.name == "api" for item in project_info.static_truth.services))
+            self.assertTrue(any(item.name == "frontend" for item in project_info.static_truth.service_identities))
+            self.assertTrue(any(item.relationship_type == "vite_proxy_depends_on" for item in project_info.static_truth.service_relationships))
             make_backend = next(item for item in project_info.static_truth.run_targets if item.command == "make backend")
             self.assertEqual(make_backend.provenance.entry_path, "backend/app/main.py")
             self.assertIn("uvicorn app.main:app --reload --port 8042", make_backend.provenance.declared_command or "")
