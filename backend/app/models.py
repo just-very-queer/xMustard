@@ -486,6 +486,7 @@ class RepoTargetRecord(BaseModel):
 
 
 ProjectInfoVerdict = Literal["declared", "runtime_observed", "config_backed", "inferred_needs_review", "unavailable"]
+ProjectInfoSourceMode = Literal["live", "snapshot"]
 ProjectInfoSourceKind = Literal["package_json", "makefile", "docker_compose", "verification_profile", "pyproject_toml", "cargo_toml", "go_mod", "go_work", "runtime_probe"]
 ProjectInfoEvidenceType = Literal["manifest_file", "saved_config", "declared_command", "derived_command", "entry_file", "runtime_binary_lookup", "compose_service", "service_identity", "service_group", "service_relationship"]
 class ProjectInfoProvenance(BaseModel):
@@ -625,6 +626,7 @@ class ProjectInfoRuntimeTruth(BaseModel):
 class ProjectInfoRecord(BaseModel):
     workspace_id: str
     root_path: str
+    source_mode: ProjectInfoSourceMode = "snapshot"
     static_truth: ProjectInfoStaticTruth
     runtime_truth: ProjectInfoRuntimeTruth
     generated_at: str = Field(default_factory=utc_now)

@@ -2554,6 +2554,7 @@ class RuntimeSummaryTests(unittest.TestCase):
 
             assert snapshot.project_info is not None
             project_info = snapshot.project_info
+            self.assertEqual(project_info.source_mode, "snapshot")
             self.assertTrue(any(item.command == "npm run dev" for item in project_info.static_truth.run_targets))
             self.assertTrue(any(item.command == "npm run test" for item in project_info.static_truth.verify_targets))
             self.assertTrue(any(item.path == "api-go/go.mod" for item in project_info.static_truth.manifests))

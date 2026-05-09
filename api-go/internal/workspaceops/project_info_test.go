@@ -70,6 +70,9 @@ func TestReadProjectInfoBuildsDeterministicStaticAndRuntimeTruth(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read project info: %v", err)
 	}
+	if projectInfo.SourceMode != projectInfoSourceModeLive {
+		t.Fatalf("expected live project info source mode, got %#v", projectInfo.SourceMode)
+	}
 
 	if !projectInfoHasManifest(projectInfo.StaticTruth.Manifests, "package.json") || !projectInfoHasManifest(projectInfo.StaticTruth.Manifests, "backend/pyproject.toml") || !projectInfoHasManifest(projectInfo.StaticTruth.Manifests, "rust-core/Cargo.toml") || !projectInfoHasManifest(projectInfo.StaticTruth.Manifests, "api-go/go.mod") || !projectInfoHasManifest(projectInfo.StaticTruth.Manifests, "docker-compose.yml") {
 		t.Fatalf("expected manifest inventory, got %#v", projectInfo.StaticTruth.Manifests)
@@ -163,6 +166,9 @@ func TestReadProjectInfoBuildsDeterministicStaticAndRuntimeTruth(t *testing.T) {
 	if snapshot.ProjectInfo == nil || !projectInfoHasService(snapshot.ProjectInfo.StaticTruth.Services, "api") {
 		t.Fatalf("expected project info to persist in snapshot, got %#v", snapshot.ProjectInfo)
 	}
+	if snapshot.ProjectInfo.SourceMode != projectInfoSourceModeSnapshot {
+		t.Fatalf("expected snapshot project info source mode, got %#v", snapshot.ProjectInfo.SourceMode)
+	}
 }
 
 func TestReadProjectInfoBuildsNonComposeGoServicesAndServiceScopedProfiles(t *testing.T) {
@@ -212,6 +218,9 @@ func TestReadProjectInfoBuildsNonComposeGoServicesAndServiceScopedProfiles(t *te
 	projectInfo, err := ReadProjectInfo(dataDir, workspaceID)
 	if err != nil {
 		t.Fatalf("read project info: %v", err)
+	}
+	if projectInfo.SourceMode != projectInfoSourceModeLive {
+		t.Fatalf("expected live project info source mode, got %#v", projectInfo.SourceMode)
 	}
 
 	if len(projectInfo.StaticTruth.Services) != 0 {
@@ -280,6 +289,9 @@ func TestReadProjectInfoBuildsPackageWorkspaceGroupsAndDependencies(t *testing.T
 	if err != nil {
 		t.Fatalf("read project info: %v", err)
 	}
+	if projectInfo.SourceMode != projectInfoSourceModeLive {
+		t.Fatalf("expected live project info source mode, got %#v", projectInfo.SourceMode)
+	}
 
 	webRun := findProjectCommand(projectInfo.StaticTruth.RunTargets, "cd apps/web/client && npm run dev")
 	apiRun := findProjectCommand(projectInfo.StaticTruth.RunTargets, "cd apps/api/server && npm run dev")
@@ -302,6 +314,80 @@ func TestReadProjectInfoBuildsPackageWorkspaceGroupsAndDependencies(t *testing.T
 	webService := findProjectServiceIdentityByID(projectInfo.StaticTruth.ServiceIdentities, *webRun.OwnerServiceID)
 	if webService == nil || !slices.Contains(webService.GroupIDs, group.GroupID) {
 		t.Fatalf("expected workspace group linkage on service identity, got %#v", webService)
+	}
+}
+
+func TestReadProjectInfoUsesLiveDiscoveryWhileSnapshotProjectInfoStaysPersisted(t *testing.T) {
+	dataDir, workspaceID, repoRoot := writeSemanticIndexFixture(t)
+
+	if err := os.WriteFile(filepath.Join(repoRoot, "Makefile"), []byte("frontend:\n\tcd frontend && npm run dev\n"), 0o644); err != nil {
+		t.Fatalf("write Makefile: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, "frontend", "package.json"), []byte("{\"name\":\"fixture-ui\",\"scripts\":{\"dev\":\"vite\"}}\n"), 0o644); err != nil {
+		t.Fatalf("write frontend package.json: %v", err)
+	}
+
+	snapshot, err := ScanWorkspace(dataDir, workspaceID)
+	if err != nil {
+		t.Fatalf("scan workspace: %v", err)
+	}
+	if snapshot.ProjectInfo == nil || snapshot.ProjectInfo.SourceMode != projectInfoSourceModeSnapshot {
+		t.Fatalf("expected snapshot project info, got %#v", snapshot.ProjectInfo)
+	}
+	if !projectInfoHasCommand(snapshot.ProjectInfo.StaticTruth.RunTargets, "make frontend") {
+		t.Fatalf("expected persisted snapshot run target, got %#v", snapshot.ProjectInfo.StaticTruth.RunTargets)
+	}
+
+	if err := os.WriteFile(filepath.Join(repoRoot, "Makefile"), []byte("frontend:\n\tcd frontend && npm run dev\nops:\n\tcd api-go && go run ./cmd/xmustard-ops\n"), 0o644); err != nil {
+		t.Fatalf("rewrite Makefile: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(repoRoot, "api-go"), 0o755); err != nil {
+		t.Fatalf("mkdir api-go: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, "api-go", "go.mod"), []byte("module fixture/api-go\n\ngo 1.26.0\n"), 0o644); err != nil {
+		t.Fatalf("write api-go go.mod: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(repoRoot, "api-go", "cmd", "xmustard-ops"), 0o755); err != nil {
+		t.Fatalf("mkdir api-go cmd: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, "api-go", "cmd", "xmustard-ops", "main.go"), []byte("package main\n\nfunc main() {}\n"), 0o644); err != nil {
+		t.Fatalf("write api-go cmd main.go: %v", err)
+	}
+	if _, err := SaveVerificationProfile(dataDir, workspaceID, VerificationProfileUpsertRequest{
+		Name:        "Ops smoke",
+		Description: "Live-only verification profile",
+		TestCommand: "go test ./cmd/xmustard-ops",
+		SourcePaths: []string{"api-go/cmd/xmustard-ops/main.go"},
+	}); err != nil {
+		t.Fatalf("save verification profile: %v", err)
+	}
+
+	liveProjectInfo, err := ReadProjectInfo(dataDir, workspaceID)
+	if err != nil {
+		t.Fatalf("read project info: %v", err)
+	}
+	if liveProjectInfo.SourceMode != projectInfoSourceModeLive {
+		t.Fatalf("expected live project info source mode, got %#v", liveProjectInfo.SourceMode)
+	}
+	if !projectInfoHasCommand(liveProjectInfo.StaticTruth.RunTargets, "make ops") {
+		t.Fatalf("expected live project info to discover new Make target, got %#v", liveProjectInfo.StaticTruth.RunTargets)
+	}
+	if !projectInfoHasCommand(liveProjectInfo.StaticTruth.VerifyTargets, "go test ./cmd/xmustard-ops") {
+		t.Fatalf("expected live project info to discover saved verification profile, got %#v", liveProjectInfo.StaticTruth.VerifyTargets)
+	}
+
+	persistedSnapshot, err := ReadWorkspaceSnapshot(dataDir, workspaceID)
+	if err != nil {
+		t.Fatalf("read workspace snapshot: %v", err)
+	}
+	if persistedSnapshot.ProjectInfo == nil || persistedSnapshot.ProjectInfo.SourceMode != projectInfoSourceModeSnapshot {
+		t.Fatalf("expected persisted snapshot project info, got %#v", persistedSnapshot.ProjectInfo)
+	}
+	if projectInfoHasCommand(persistedSnapshot.ProjectInfo.StaticTruth.RunTargets, "make ops") {
+		t.Fatalf("expected snapshot project info to stay persisted until rescan, got %#v", persistedSnapshot.ProjectInfo.StaticTruth.RunTargets)
+	}
+	if projectInfoHasCommand(persistedSnapshot.ProjectInfo.StaticTruth.VerifyTargets, "go test ./cmd/xmustard-ops") {
+		t.Fatalf("expected snapshot project info to exclude post-scan verification profile, got %#v", persistedSnapshot.ProjectInfo.StaticTruth.VerifyTargets)
 	}
 }
 

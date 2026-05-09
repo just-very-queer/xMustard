@@ -19,11 +19,14 @@ const (
 	projectInfoVerdictConfigBacked        = "config_backed"
 	projectInfoVerdictInferredNeedsReview = "inferred_needs_review"
 	projectInfoVerdictUnavailable         = "unavailable"
+	projectInfoSourceModeLive             = "live"
+	projectInfoSourceModeSnapshot         = "snapshot"
 )
 
 type ProjectInfoRecord struct {
 	WorkspaceID  string                  `json:"workspace_id"`
 	RootPath     string                  `json:"root_path"`
+	SourceMode   string                  `json:"source_mode"`
 	StaticTruth  ProjectInfoStaticTruth  `json:"static_truth"`
 	RuntimeTruth ProjectInfoRuntimeTruth `json:"runtime_truth"`
 	GeneratedAt  string                  `json:"generated_at"`
@@ -196,19 +199,15 @@ func ReadProjectInfo(dataDir string, workspaceID string) (*ProjectInfoRecord, er
 	if err != nil {
 		return nil, err
 	}
-	runTargets, err := ReadRunTargets(dataDir, workspaceID)
-	if err != nil {
-		return nil, err
-	}
-	verifyTargets, err := ReadVerifyTargets(dataDir, workspaceID)
-	if err != nil {
-		return nil, err
-	}
 	savedVerificationProfiles, err := loadSavedVerificationProfiles(dataDir, workspaceID)
 	if err != nil {
 		return nil, err
 	}
-	return buildProjectInfo(workspaceID, workspace.RootPath, runTargets, verifyTargets, savedVerificationProfiles), nil
+	runTargets := discoverRunTargetsForRoot(workspace.RootPath)
+	verifyTargets := discoverVerifyTargetsForRoot(workspace.RootPath, savedVerificationProfiles)
+	projectInfo := buildProjectInfo(workspaceID, workspace.RootPath, runTargets, verifyTargets, savedVerificationProfiles)
+	projectInfo.SourceMode = projectInfoSourceModeLive
+	return projectInfo, nil
 }
 
 func buildProjectInfo(workspaceID string, repoRoot string, runTargets []RepoTargetRecord, verifyTargets []RepoTargetRecord, savedVerificationProfiles []verificationProfileRecord) *ProjectInfoRecord {
