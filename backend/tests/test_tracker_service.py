@@ -2600,11 +2600,13 @@ class RuntimeSummaryTests(unittest.TestCase):
             (root / "frontend").mkdir(parents=True)
             (root / "api-go" / "cmd" / "xmustard-api").mkdir(parents=True)
             (root / "api-go" / "cmd" / "xmustard-ops").mkdir(parents=True)
+            (root / "rust-core" / "src" / "bin").mkdir(parents=True)
             (root / "docs" / "bugs" / "Bugs_25260323.md").write_text(LEDGER_TEXT, encoding="utf-8")
             (root / "Makefile").write_text(
                 "frontend:\n\tcd frontend && npm run dev\n"
                 "go-api:\n\tcd api-go && XMUSTARD_API_PORT=8042 go run ./cmd/xmustard-api\n"
-                "go-ops:\n\tcd api-go && go run ./cmd/xmustard-ops\n",
+                "go-ops:\n\tcd api-go && go run ./cmd/xmustard-ops\n"
+                "migration-check:\n\tcd api-go && go build ./cmd/xmustard-api\n\tcd rust-core && cargo check\n",
                 encoding="utf-8",
             )
             (root / "frontend" / "package.json").write_text(
@@ -2626,6 +2628,14 @@ class RuntimeSummaryTests(unittest.TestCase):
             )
             (root / "api-go" / "cmd" / "xmustard-ops" / "main.go").write_text(
                 "package main\n\nfunc main() {}\n",
+                encoding="utf-8",
+            )
+            (root / "rust-core" / "Cargo.toml").write_text(
+                "[package]\nname='fixture-core'\nversion='0.1.0'\nedition='2024'\n",
+                encoding="utf-8",
+            )
+            (root / "rust-core" / "src" / "bin" / "fixture-core.rs").write_text(
+                "fn main() {}\n",
                 encoding="utf-8",
             )
 
@@ -2669,6 +2679,7 @@ class RuntimeSummaryTests(unittest.TestCase):
             project_info = snapshot.project_info
 
             raw_frontend_run = next(item for item in snapshot.run_targets if item.command == "make frontend")
+            raw_api_run = next(item for item in snapshot.run_targets if item.command == "make go-api")
             self.assertEqual(raw_frontend_run.truth_source, "snapshot_scan")
             self.assertTrue(raw_frontend_run.scan_bound)
             self.assertEqual(raw_frontend_run.freshness_status, "scan_consistent")
@@ -2689,6 +2700,12 @@ class RuntimeSummaryTests(unittest.TestCase):
             self.assertEqual(raw_go_verify.ownership.status, "shared_scope")
             self.assertEqual(raw_go_verify.ownership.scope_kind, "manifest")
             self.assertEqual(len(raw_go_verify.ownership.service_ids), 2)
+            raw_cargo_run = next(item for item in snapshot.run_targets if item.command == "cd rust-core && cargo run --bin fixture-core")
+            self.assertIsNotNone(raw_cargo_run.owner_service_id)
+            raw_migration_check = next(item for item in snapshot.verify_targets if item.command == "make migration-check")
+            self.assertIsNone(raw_migration_check.owner_service_id)
+            self.assertEqual(raw_migration_check.ownership.status, "ambiguous")
+            self.assertCountEqual(raw_migration_check.ownership.service_ids, [raw_api_run.owner_service_id, raw_cargo_run.owner_service_id])
             raw_profile_verify = next(item for item in snapshot.verify_targets if item.command == "go test ./cmd/xmustard-api")
             self.assertEqual(raw_profile_verify.truth_source, "snapshot_scan")
             self.assertTrue(raw_profile_verify.scan_bound)
@@ -2703,9 +2720,11 @@ class RuntimeSummaryTests(unittest.TestCase):
             frontend_run = next(item for item in project_info.static_truth.run_targets if item.command == "make frontend")
             api_run = next(item for item in project_info.static_truth.run_targets if item.command == "make go-api")
             ops_run = next(item for item in project_info.static_truth.run_targets if item.command == "make go-ops")
+            cargo_run = next(item for item in project_info.static_truth.run_targets if item.command == "cd rust-core && cargo run --bin fixture-core")
             self.assertIsNotNone(frontend_run.owner_service_id)
             self.assertIsNotNone(api_run.owner_service_id)
             self.assertIsNotNone(ops_run.owner_service_id)
+            self.assertIsNotNone(cargo_run.owner_service_id)
             self.assertNotEqual(api_run.owner_service_id, ops_run.owner_service_id)
             self.assertTrue(any(item.name == "xmustard-api" for item in project_info.static_truth.service_identities))
             self.assertTrue(any(item.name == "xmustard-ops" for item in project_info.static_truth.service_identities))
@@ -2722,6 +2741,10 @@ class RuntimeSummaryTests(unittest.TestCase):
             self.assertIsNone(go_verify.owner_service_id)
             self.assertEqual(go_verify.ownership.status, "shared_scope")
             self.assertCountEqual(go_verify.ownership.service_ids, [api_run.owner_service_id, ops_run.owner_service_id])
+            migration_check = next(item for item in project_info.static_truth.verify_targets if item.command == "make migration-check")
+            self.assertIsNone(migration_check.owner_service_id)
+            self.assertEqual(migration_check.ownership.status, "ambiguous")
+            self.assertCountEqual(migration_check.ownership.service_ids, [api_run.owner_service_id, cargo_run.owner_service_id])
             profile_verify = next(item for item in project_info.static_truth.verify_targets if item.command == "go test ./cmd/xmustard-api")
             self.assertEqual(profile_verify.owner_service_id, api_run.owner_service_id)
             self.assertEqual(profile_verify.ownership.status, "exact")
@@ -2731,6 +2754,10 @@ class RuntimeSummaryTests(unittest.TestCase):
             self.assertIn(frontend_run.target_id, raw_frontend_verify.related_target_ids)
             self.assertIn(api_run.target_id, raw_go_verify.related_target_ids)
             self.assertIn(ops_run.target_id, raw_go_verify.related_target_ids)
+            self.assertIn(api_run.target_id, raw_migration_check.related_target_ids)
+            self.assertIn(cargo_run.target_id, raw_migration_check.related_target_ids)
+            self.assertIn(api_run.target_id, migration_check.related_target_ids)
+            self.assertIn(cargo_run.target_id, migration_check.related_target_ids)
             self.assertEqual(raw_profile_verify.related_target_ids, profile_verify.related_target_ids)
             self.assertIn(api_run.target_id, profile_verify.related_target_ids)
             self.assertIn("api-go/cmd/xmustard-api/main.go", profile_verify.provenance.config_files)

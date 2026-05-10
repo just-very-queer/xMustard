@@ -176,6 +176,14 @@ type projectCommandResolution struct {
 	ManifestPaths   []string
 	ListenPorts     []string
 	ProxyTargets    []projectProxyTarget
+	CandidateScopes []projectCommandCandidateScope
+}
+
+type projectCommandCandidateScope struct {
+	ManifestPath string
+	WorkingDir   string
+	EntryPath    *string
+	ServiceName  *string
 }
 
 type projectProxyTarget struct {
@@ -646,6 +654,7 @@ func buildProjectServiceGraph(repoRoot string, composeServices []ProjectServiceR
 	seeds := map[string]*projectServiceIdentitySeed{}
 	order := []string{}
 	manifestScopeToServiceIDs := map[string][]string{}
+	serviceKeyToServiceID := map[string]string{}
 	composeNameToServiceID := map[string]string{}
 	profilesByID := map[string]verificationProfileRecord{}
 	groupSeeds, packageDependencyEdges, warnings := discoverProjectServiceGroups(repoRoot)
@@ -739,6 +748,9 @@ func buildProjectServiceGraph(repoRoot string, composeServices []ProjectServiceR
 			continue
 		}
 		assignExactOwnership(&runTargets[idx], seed.ServiceID, "manifest_scope", "manifest", serviceKey, "Run target maps to one manifest-backed service identity.")
+		if serviceKey != "" {
+			serviceKeyToServiceID[serviceKey] = seed.ServiceID
+		}
 		if manifestScopeKey != "" {
 			manifestScopeToServiceIDs[manifestScopeKey] = dedupeStrings(append(manifestScopeToServiceIDs[manifestScopeKey], seed.ServiceID), 12)
 		}
@@ -771,6 +783,9 @@ func buildProjectServiceGraph(repoRoot string, composeServices []ProjectServiceR
 				existing = addSeed(seed)
 				if existing != nil {
 					assignExactOwnership(&verifyTargets[idx], existing.ServiceID, "manifest_scope", "manifest", serviceKey, "Verification target maps to one manifest-backed service identity.")
+					if serviceKey != "" {
+						serviceKeyToServiceID[serviceKey] = existing.ServiceID
+					}
 				}
 			}
 			continue
@@ -783,6 +798,55 @@ func buildProjectServiceGraph(repoRoot string, composeServices []ProjectServiceR
 			manifestScopeToServiceIDs[manifestScopeKey] = dedupeStrings(append(manifestScopeToServiceIDs[manifestScopeKey], seed.ServiceID), 12)
 		}
 		assignExactOwnership(&verifyTargets[idx], seed.ServiceID, "manifest_scope", "manifest", serviceKey, "Verification target maps to one manifest-backed service identity.")
+		if serviceKey != "" {
+			serviceKeyToServiceID[serviceKey] = seed.ServiceID
+		}
+	}
+
+	applyCandidateOwnership := func(target *resolvedProjectTarget) {
+		if target == nil || target.OwnerServiceID != nil || len(target.Ownership.ServiceIDs) > 0 {
+			return
+		}
+		serviceIDs := candidateServiceIDsForTarget(target, serviceKeyToServiceID, manifestScopeToServiceIDs)
+		if len(serviceIDs) == 0 {
+			return
+		}
+		if len(serviceIDs) == 1 {
+			assignExactOwnership(target, serviceIDs[0], "candidate_scope", "manifest", candidateScopeKeyForServiceID(serviceIDs[0], seeds), "Resolved command evidence maps this target to one existing service scope.")
+			return
+		}
+		manifestScopeKeys := candidateManifestScopeKeysForTarget(target)
+		scopeKind := (*string)(nil)
+		scopeKey := (*string)(nil)
+		status := "ambiguous"
+		reason := "Resolved command evidence spans multiple service scopes, so xMustard cannot assign one owner."
+		matchBasis := "candidate_scope"
+		if len(manifestScopeKeys) == 1 {
+			status = "shared_scope"
+			scopeKind = optionalString("manifest")
+			scopeKey = optionalString(manifestScopeKeys[0])
+			reason = "Resolved command evidence stays inside one manifest scope, but that scope maps to multiple services."
+			matchBasis = "manifest_scope"
+		}
+		target.Ownership = ProjectTargetOwnership{
+			Status:     status,
+			MatchBasis: matchBasis,
+			ServiceIDs: serviceIDs,
+			ScopeKind:  scopeKind,
+			ScopeKey:   scopeKey,
+			Reason:     reason,
+		}
+		target.RelatedTargetIDs = dedupeStrings(append(target.RelatedTargetIDs, relatedTargetIDsForServiceIDs(seeds, serviceIDs, target.Target.TargetID)...), 24)
+	}
+
+	for idx := range runTargets {
+		applyCandidateOwnership(&runTargets[idx])
+	}
+	for idx := range verifyTargets {
+		if verifyTargets[idx].Target.ProfileID != nil {
+			continue
+		}
+		applyCandidateOwnership(&verifyTargets[idx])
 	}
 
 	for idx := range verifyTargets {
@@ -1133,6 +1197,65 @@ func ensureManifestServiceIdentity(repoRoot string, runTarget *resolvedProjectTa
 		seed.VerifyCommands = []string{current.Target.Command}
 	}
 	return serviceKey, manifestScopeKey, serviceID, seed
+}
+
+func candidateServiceIDsForTarget(target *resolvedProjectTarget, serviceKeyToServiceID map[string]string, manifestScopeToServiceIDs map[string][]string) []string {
+	if target == nil {
+		return []string{}
+	}
+	serviceIDs := []string{}
+	for _, scope := range dedupeProjectCommandCandidateScopes(target.Resolution.CandidateScopes) {
+		if serviceID := candidateServiceIDForScope(scope, target.Target.Kind, serviceKeyToServiceID); serviceID != "" {
+			serviceIDs = append(serviceIDs, serviceID)
+			continue
+		}
+		manifestScopeKey := projectManifestBaseScopeKey(scope.ManifestPath, scope.WorkingDir)
+		serviceIDs = append(serviceIDs, manifestScopeToServiceIDs[manifestScopeKey]...)
+	}
+	return dedupeStrings(serviceIDs, 12)
+}
+
+func candidateServiceIDForScope(scope projectCommandCandidateScope, targetKind string, serviceKeyToServiceID map[string]string) string {
+	candidateKinds := []string{targetKind}
+	if scope.EntryPath != nil && strings.HasSuffix(scope.ManifestPath, "go.mod") {
+		candidateKinds = append(candidateKinds, "build", "run", "dev", "service", "other")
+	}
+	for _, kind := range dedupeStrings(candidateKinds, 6) {
+		serviceKey := projectManifestServiceScopeKeyForEvidence(scope.ManifestPath, scope.WorkingDir, scope.EntryPath, kind)
+		if serviceID := strings.TrimSpace(serviceKeyToServiceID[serviceKey]); serviceID != "" {
+			return serviceID
+		}
+	}
+	return ""
+}
+
+func candidateManifestScopeKeysForTarget(target *resolvedProjectTarget) []string {
+	if target == nil {
+		return []string{}
+	}
+	keys := []string{}
+	for _, scope := range dedupeProjectCommandCandidateScopes(target.Resolution.CandidateScopes) {
+		if strings.TrimSpace(scope.ManifestPath) == "" {
+			continue
+		}
+		keys = append(keys, projectManifestBaseScopeKey(scope.ManifestPath, scope.WorkingDir))
+	}
+	return dedupeStrings(keys, 12)
+}
+
+func candidateScopeKeyForServiceID(serviceID string, seeds map[string]*projectServiceIdentitySeed) string {
+	seed := seeds[serviceID]
+	if seed == nil {
+		return ""
+	}
+	manifestPath := firstString(seed.ManifestPaths)
+	workingDir := firstNonEmptyPtr(seed.WorkingDir)
+	entryPath := optionalString(firstString(seed.EntryPaths))
+	targetKind := "run"
+	if len(seed.RunTargetIDs) == 0 && len(seed.VerifyTargetIDs) > 0 {
+		targetKind = "test"
+	}
+	return projectManifestServiceScopeKeyForEvidence(manifestPath, workingDir, entryPath, targetKind)
 }
 
 func buildServiceIDsByManifestPath(seeds map[string]*projectServiceIdentitySeed) map[string][]string {
@@ -1497,12 +1620,16 @@ func repoPathPrefixScore(repoPath string, prefix string, base int) int {
 }
 
 func projectManifestServiceScopeKey(target resolvedProjectTarget, manifestPath string, workingDir string) string {
+	return projectManifestServiceScopeKeyForEvidence(manifestPath, workingDir, target.Resolution.EntryPath, target.Target.Kind)
+}
+
+func projectManifestServiceScopeKeyForEvidence(manifestPath string, workingDir string, entryPath *string, targetKind string) string {
 	base := projectManifestBaseScopeKey(manifestPath, workingDir)
 	if strings.HasSuffix(manifestPath, "go.mod") {
-		switch target.Target.Kind {
+		switch targetKind {
 		case "run", "build", "service", "dev", "other":
-			if target.Resolution.EntryPath != nil && strings.TrimSpace(*target.Resolution.EntryPath) != "" {
-				return base + "|" + strings.TrimSpace(*target.Resolution.EntryPath)
+			if entryPath != nil && strings.TrimSpace(*entryPath) != "" {
+				return base + "|" + strings.TrimSpace(*entryPath)
 			}
 		}
 	}
@@ -1514,6 +1641,14 @@ func projectManifestBaseScopeKey(manifestPath string, workingDir string) string 
 }
 
 func projectTargetManifestScope(repoRoot string, target resolvedProjectTarget) (string, string, bool) {
+	candidateScopes := dedupeProjectCommandCandidateScopes(target.Resolution.CandidateScopes)
+	if len(candidateScopes) == 1 {
+		scope := candidateScopes[0]
+		return scope.ManifestPath, scope.WorkingDir, true
+	}
+	if len(candidateScopes) > 1 {
+		return "", "", false
+	}
 	workingDir := firstNonEmptyProjectString(firstNonEmptyPtr(target.Resolution.Cwd), target.Target.WorkingDir)
 	manifestPaths := []string{}
 	for _, path := range target.Resolution.ManifestPaths {
@@ -1565,6 +1700,99 @@ func appendWorkingDirManifestHints(repoRoot string, resolution *projectCommandRe
 		return
 	}
 	resolution.ManifestPaths = append(resolution.ManifestPaths, discoverManifestPathsForWorkingDir(repoRoot, *resolution.Cwd)...)
+}
+
+func appendProjectCommandResolution(resolution *projectCommandResolution, fragment projectCommandResolution) {
+	if resolution == nil {
+		return
+	}
+	if resolution.Cwd == nil {
+		if cwd := firstNonEmptyPtr(fragment.Cwd); cwd != "" {
+			resolution.Cwd = optionalString(cwd)
+		}
+	}
+	if resolution.EntryPath == nil {
+		if entryPath := firstNonEmptyPtr(fragment.EntryPath); entryPath != "" {
+			resolution.EntryPath = optionalString(entryPath)
+		}
+	}
+	if resolution.DeclaredCommand == nil {
+		if declared := firstNonEmptyPtr(fragment.DeclaredCommand); declared != "" {
+			resolution.DeclaredCommand = optionalString(declared)
+		}
+	}
+	if resolution.ServiceName == nil {
+		if serviceName := firstNonEmptyPtr(fragment.ServiceName); serviceName != "" {
+			resolution.ServiceName = optionalString(serviceName)
+		}
+	}
+	resolution.ConfigFiles = dedupeStrings(append(resolution.ConfigFiles, fragment.ConfigFiles...), 24)
+	resolution.ConfigHints = dedupeStrings(append(resolution.ConfigHints, fragment.ConfigHints...), 24)
+	resolution.ManifestPaths = dedupeStrings(append(resolution.ManifestPaths, fragment.ManifestPaths...), 24)
+	resolution.ListenPorts = dedupeStrings(append(resolution.ListenPorts, fragment.ListenPorts...), 24)
+	resolution.ProxyTargets = dedupeProjectProxyTargets(append(resolution.ProxyTargets, fragment.ProxyTargets...))
+	resolution.CandidateScopes = dedupeProjectCommandCandidateScopes(append(resolution.CandidateScopes, fragment.CandidateScopes...))
+}
+
+func projectCommandCandidateScopesFromResolution(repoRoot string, resolution projectCommandResolution) []projectCommandCandidateScope {
+	workingDir := firstNonEmptyPtr(resolution.Cwd)
+	manifestPaths := dedupeStrings(append([]string{}, resolution.ManifestPaths...), 12)
+	if len(manifestPaths) == 0 && workingDir != "" {
+		manifestPaths = discoverManifestPathsForWorkingDir(repoRoot, workingDir)
+	}
+	items := make([]projectCommandCandidateScope, 0, len(manifestPaths))
+	for _, manifestPath := range manifestPaths {
+		manifestPath = strings.TrimSpace(manifestPath)
+		if manifestPath == "" {
+			continue
+		}
+		scopeWorkingDir := workingDir
+		if scopeWorkingDir == "" {
+			scopeWorkingDir = normalizeWorkingDir(repoRoot, filepath.Join(repoRoot, filepath.FromSlash(filepath.Dir(manifestPath))))
+		}
+		items = append(items, projectCommandCandidateScope{
+			ManifestPath: manifestPath,
+			WorkingDir:   scopeWorkingDir,
+			EntryPath:    optionalString(firstNonEmptyPtr(resolution.EntryPath)),
+			ServiceName:  optionalString(firstNonEmptyPtr(resolution.ServiceName)),
+		})
+	}
+	return dedupeProjectCommandCandidateScopes(items)
+}
+
+func dedupeProjectCommandCandidateScopes(items []projectCommandCandidateScope) []projectCommandCandidateScope {
+	seen := map[string]projectCommandCandidateScope{}
+	order := []string{}
+	for _, item := range items {
+		manifestPath := strings.TrimSpace(item.ManifestPath)
+		if manifestPath == "" {
+			continue
+		}
+		key := strings.Join([]string{
+			manifestPath,
+			strings.TrimSpace(item.WorkingDir),
+			firstNonEmptyPtr(item.EntryPath),
+			firstNonEmptyPtr(item.ServiceName),
+		}, "|")
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		item.ManifestPath = manifestPath
+		item.WorkingDir = strings.TrimSpace(item.WorkingDir)
+		if entryPath := firstNonEmptyPtr(item.EntryPath); entryPath != "" {
+			item.EntryPath = optionalString(entryPath)
+		}
+		if serviceName := firstNonEmptyPtr(item.ServiceName); serviceName != "" {
+			item.ServiceName = optionalString(serviceName)
+		}
+		seen[key] = item
+		order = append(order, key)
+	}
+	out := make([]projectCommandCandidateScope, 0, len(order))
+	for _, key := range order {
+		out = append(out, seen[key])
+	}
+	return out
 }
 
 func dedupeProjectProxyTargets(items []projectProxyTarget) []projectProxyTarget {
@@ -1721,11 +1949,28 @@ func resolveMakeTarget(repoRoot string, target RepoTargetRecord, resolution *pro
 			return
 		}
 		joined := strings.Join(executableLines, " && ")
-		resolution.DeclaredCommand = &joined
 		resolution.ConfigFiles = append(resolution.ConfigFiles, "Makefile")
 		serviceName := recipe.Name
 		resolution.ServiceName = &serviceName
-		resolveShellCommand(repoRoot, joined, resolution)
+		for _, executable := range executableLines {
+			segmentResolution := projectCommandResolution{}
+			resolveShellCommand(repoRoot, executable, &segmentResolution)
+			segmentResolution.CandidateScopes = projectCommandCandidateScopesFromResolution(repoRoot, segmentResolution)
+			for _, scope := range segmentResolution.CandidateScopes {
+				if strings.TrimSpace(scope.ManifestPath) == "" {
+					continue
+				}
+				segmentResolution.ManifestPaths = append(segmentResolution.ManifestPaths, scope.ManifestPath)
+			}
+			appendProjectCommandResolution(resolution, segmentResolution)
+		}
+		if len(resolution.CandidateScopes) == 0 {
+			resolveShellCommand(repoRoot, joined, resolution)
+			resolution.CandidateScopes = projectCommandCandidateScopesFromResolution(repoRoot, *resolution)
+		}
+		if len(executableLines) > 1 || resolution.DeclaredCommand == nil {
+			resolution.DeclaredCommand = &joined
+		}
 		return
 	}
 }

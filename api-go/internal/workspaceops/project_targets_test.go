@@ -459,7 +459,7 @@ func TestSemanticDiscoverTargetsUsesSharedManifestDiscovery(t *testing.T) {
 func TestReadRunTargetsAndVerifyTargetsExposeOwnershipAndCandidateScope(t *testing.T) {
 	dataDir, workspaceID, repoRoot := writeSemanticIndexFixture(t)
 
-	if err := os.WriteFile(filepath.Join(repoRoot, "Makefile"), []byte("frontend:\n\tcd frontend && npm run dev\ngo-api:\n\tcd api-go && XMUSTARD_API_PORT=8042 go run ./cmd/xmustard-api\ngo-ops:\n\tcd api-go && go run ./cmd/xmustard-ops\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(repoRoot, "Makefile"), []byte("frontend:\n\tcd frontend && npm run dev\ngo-api:\n\tcd api-go && XMUSTARD_API_PORT=8042 go run ./cmd/xmustard-api\ngo-ops:\n\tcd api-go && go run ./cmd/xmustard-ops\nmigration-check:\n\tcd api-go && go build ./cmd/xmustard-api\n\tcd rust-core && cargo check\n"), 0o644); err != nil {
 		t.Fatalf("write Makefile: %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(repoRoot, "frontend", "package.json"), []byte("{\"name\":\"fixture-ui\",\"scripts\":{\"dev\":\"vite\",\"test\":\"vitest run\"}}\n"), 0o644); err != nil {
@@ -482,6 +482,15 @@ func TestReadRunTargetsAndVerifyTargetsExposeOwnershipAndCandidateScope(t *testi
 	}
 	if err := os.WriteFile(filepath.Join(repoRoot, "api-go", "cmd", "xmustard-ops", "main.go"), []byte("package main\n\nfunc main() {}\n"), 0o644); err != nil {
 		t.Fatalf("write xmustard-ops main.go: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(repoRoot, "rust-core", "src", "bin"), 0o755); err != nil {
+		t.Fatalf("mkdir rust-core/src/bin: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, "rust-core", "Cargo.toml"), []byte("[package]\nname = \"fixture-core\"\nversion = \"0.1.0\"\nedition = \"2024\"\n"), 0o644); err != nil {
+		t.Fatalf("write rust-core Cargo.toml: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, "rust-core", "src", "bin", "fixture-core.rs"), []byte("fn main() {}\n"), 0o644); err != nil {
+		t.Fatalf("write rust-core binary: %v", err)
 	}
 	if err := saveVerificationProfiles(dataDir, workspaceID, []verificationProfileRecord{
 		{
@@ -550,6 +559,23 @@ func TestReadRunTargetsAndVerifyTargetsExposeOwnershipAndCandidateScope(t *testi
 	opsRun := findTargetByCommand(runTargets, "make go-ops")
 	if apiRun == nil || opsRun == nil || !containsTargetID(goVerify.RelatedTargetIDs, apiRun.TargetID) || !containsTargetID(goVerify.RelatedTargetIDs, opsRun.TargetID) {
 		t.Fatalf("expected shared-scope raw verify target to link both Go run targets, goVerify=%#v apiRun=%#v opsRun=%#v", goVerify, apiRun, opsRun)
+	}
+	cargoRun := findTargetByCommand(runTargets, "cd rust-core && cargo run --bin fixture-core")
+	if cargoRun == nil || cargoRun.OwnerServiceID == nil {
+		t.Fatalf("expected exact raw ownership for Cargo run target, got %#v", cargoRun)
+	}
+	migrationCheck := findTargetByCommand(verifyTargets, "make migration-check")
+	if migrationCheck == nil || migrationCheck.OwnerServiceID != nil {
+		t.Fatalf("expected multi-scope raw verify target to avoid a single owner, got %#v", migrationCheck)
+	}
+	if migrationCheck.Ownership.Status != "ambiguous" {
+		t.Fatalf("expected multi-scope raw verify target ownership to stay ambiguous, got %#v", migrationCheck)
+	}
+	if apiRun == nil || apiRun.OwnerServiceID == nil || !containsTargetID(migrationCheck.RelatedTargetIDs, apiRun.TargetID) || !containsTargetID(migrationCheck.RelatedTargetIDs, cargoRun.TargetID) {
+		t.Fatalf("expected multi-scope raw verify target to link both proven run targets, migration=%#v apiRun=%#v cargoRun=%#v", migrationCheck, apiRun, cargoRun)
+	}
+	if !containsTargetID(migrationCheck.Ownership.ServiceIDs, *apiRun.OwnerServiceID) || !containsTargetID(migrationCheck.Ownership.ServiceIDs, *cargoRun.OwnerServiceID) {
+		t.Fatalf("expected multi-scope raw verify target to carry both proven service ids, got %#v", migrationCheck)
 	}
 
 	profileVerify := findTargetByCommand(verifyTargets, "go test ./cmd/xmustard-api")

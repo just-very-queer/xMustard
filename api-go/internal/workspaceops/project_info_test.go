@@ -11,7 +11,7 @@ import (
 func TestReadProjectInfoBuildsDeterministicStaticAndRuntimeTruth(t *testing.T) {
 	dataDir, workspaceID, repoRoot := writeSemanticIndexFixture(t)
 
-	if err := os.WriteFile(filepath.Join(repoRoot, "Makefile"), []byte("backend:\n\tcd backend && python3 -m uvicorn app.main:app --reload --port 8042\nfrontend:\n\tcd frontend && npm run dev\ngo-api:\n\tcd api-go && go run ./cmd/fixture-api\ndev:\n\t@echo use frontend and go-api\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(repoRoot, "Makefile"), []byte("backend:\n\tcd backend && python3 -m uvicorn app.main:app --reload --port 8042\nfrontend:\n\tcd frontend && npm run dev\ngo-api:\n\tcd api-go && go run ./cmd/fixture-api\nmigration-check:\n\tcd api-go && go build ./cmd/fixture-api\n\tcd rust-core && cargo check\ndev:\n\t@echo use frontend and go-api\n"), 0o644); err != nil {
 		t.Fatalf("write Makefile: %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(repoRoot, "docker-compose.yml"), []byte("services:\n  api:\n    image: busybox\n"), 0o644); err != nil {
@@ -121,6 +121,23 @@ func TestReadProjectInfoBuildsDeterministicStaticAndRuntimeTruth(t *testing.T) {
 	}
 	if goTarget.OwnerServiceID == nil {
 		t.Fatalf("expected Go run target owner service, got %#v", goTarget)
+	}
+	cargoTarget := findProjectCommand(projectInfo.StaticTruth.RunTargets, "cd rust-core && cargo run --bin fixture-core")
+	if cargoTarget == nil || cargoTarget.OwnerServiceID == nil {
+		t.Fatalf("expected Cargo run target owner service, got %#v", cargoTarget)
+	}
+	migrationCheck := findProjectCommand(projectInfo.StaticTruth.VerifyTargets, "make migration-check")
+	if migrationCheck == nil || migrationCheck.OwnerServiceID != nil {
+		t.Fatalf("expected multi-scope verify target to avoid a single owner, got %#v", migrationCheck)
+	}
+	if migrationCheck.Ownership.Status != "ambiguous" {
+		t.Fatalf("expected multi-scope verify target ownership to stay ambiguous, got %#v", migrationCheck)
+	}
+	if !slices.Contains(migrationCheck.Ownership.ServiceIDs, *goTarget.OwnerServiceID) || !slices.Contains(migrationCheck.Ownership.ServiceIDs, *cargoTarget.OwnerServiceID) {
+		t.Fatalf("expected multi-scope verify target to carry the proven service subset, got %#v", migrationCheck)
+	}
+	if !slices.Contains(migrationCheck.RelatedTargetIDs, goTarget.TargetID) || !slices.Contains(migrationCheck.RelatedTargetIDs, cargoTarget.TargetID) {
+		t.Fatalf("expected multi-scope verify target to link both owned run targets, got %#v", migrationCheck)
 	}
 	frontendVerify := findProjectCommand(projectInfo.StaticTruth.VerifyTargets, "cd frontend && npm run test")
 	if frontendVerify == nil || frontendVerify.OwnerServiceID == nil || frontendTarget.OwnerServiceID == nil || *frontendVerify.OwnerServiceID != *frontendTarget.OwnerServiceID {
