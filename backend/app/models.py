@@ -489,6 +489,9 @@ class RepoTargetRecord(BaseModel):
     answer_coherence: Literal["scan_bound", "live_discovery", "overlay_augmented", "mixed"] = "live_discovery"
     scan_generated_at: Optional[str] = None
     overlay_applied: bool = False
+    freshness_status: Literal["unknown", "live_read", "overlay_live", "scan_consistent", "scan_stale"] = "unknown"
+    freshness_reason: str = ""
+    freshness_evidence_paths: list[str] = Field(default_factory=list)
     ownership: "ProjectTargetOwnership" = Field(default_factory=lambda: ProjectTargetOwnership(reason=""))
 
 

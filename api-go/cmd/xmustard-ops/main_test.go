@@ -70,6 +70,9 @@ func TestWorkspaceLoadAndVerificationProfileOperatorLoop(t *testing.T) {
 	if readTargetStringField(t, runTargets, "npm run dev", "answer_coherence") != "scan_bound" {
 		t.Fatalf("expected scan-bound answer coherence on cached run target, got %#v", runTargets)
 	}
+	if readTargetStringField(t, runTargets, "npm run dev", "freshness_status") != "scan_consistent" {
+		t.Fatalf("expected scan-consistent freshness on cached run target, got %#v", runTargets)
+	}
 	if readTargetBoolField(t, runTargets, "npm run dev", "overlay_applied") {
 		t.Fatalf("expected no overlay on cached run target, got %#v", runTargets)
 	}
@@ -86,6 +89,9 @@ func TestWorkspaceLoadAndVerificationProfileOperatorLoop(t *testing.T) {
 	}
 	if readTargetStringField(t, verifyTargets, "npm run test", "answer_coherence") != "scan_bound" {
 		t.Fatalf("expected scan-bound answer coherence on cached verify target, got %#v", verifyTargets)
+	}
+	if readTargetStringField(t, verifyTargets, "npm run test", "freshness_status") != "scan_consistent" {
+		t.Fatalf("expected scan-consistent freshness on cached verify target, got %#v", verifyTargets)
 	}
 	if readTargetBoolField(t, verifyTargets, "npm run test", "overlay_applied") {
 		t.Fatalf("expected no overlay on cached verify target, got %#v", verifyTargets)
@@ -124,6 +130,9 @@ func TestWorkspaceLoadAndVerificationProfileOperatorLoop(t *testing.T) {
 	}
 	if readTargetStringField(t, verifyTargetsAfterProfileSave, "python3 -m pytest -q backend/tests/test_smoke.py", "answer_coherence") != "mixed" {
 		t.Fatalf("expected mixed answer coherence after profile save, got %#v", verifyTargetsAfterProfileSave)
+	}
+	if readTargetStringField(t, verifyTargetsAfterProfileSave, "python3 -m pytest -q backend/tests/test_smoke.py", "freshness_status") != "overlay_live" {
+		t.Fatalf("expected overlay-live freshness after profile save, got %#v", verifyTargetsAfterProfileSave)
 	}
 	if !readTargetBoolField(t, verifyTargetsAfterProfileSave, "python3 -m pytest -q backend/tests/test_smoke.py", "overlay_applied") {
 		t.Fatalf("expected overlay_applied on post-scan profile target, got %#v", verifyTargetsAfterProfileSave)

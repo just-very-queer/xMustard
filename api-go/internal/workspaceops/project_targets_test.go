@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestReadRunTargetsAndVerifyTargetsUseManifestDiscoveryAndSavedProfiles(t *testing.T) {
@@ -79,6 +80,9 @@ func TestReadRunTargetsAndVerifyTargetsUseManifestDiscoveryAndSavedProfiles(t *t
 	assertTargetAnswerContext(t, runTargets, "npm run dev", repoTargetAnswerCoherenceLiveDiscovery, "", false)
 	assertTargetAnswerContext(t, verifyTargets, "npm run test", repoTargetAnswerCoherenceOverlayAugmented, "", true)
 	assertTargetAnswerContext(t, verifyTargets, "pytest -q", repoTargetAnswerCoherenceOverlayAugmented, "", true)
+	assertTargetFreshness(t, runTargets, "npm run dev", repoTargetFreshnessStatusLiveRead, "")
+	assertTargetFreshness(t, verifyTargets, "npm run test", repoTargetFreshnessStatusLiveRead, "")
+	assertTargetFreshness(t, verifyTargets, "pytest -q", repoTargetFreshnessStatusOverlayLive, "verification_profiles.json")
 }
 
 func TestReadRunTargetsAndVerifyTargetsExposeSnapshotTruthAndLiveProfileOverlay(t *testing.T) {
@@ -167,6 +171,9 @@ func TestReadRunTargetsAndVerifyTargetsExposeSnapshotTruthAndLiveProfileOverlay(
 	assertTargetAnswerContext(t, runTargets, "npm run dev", repoTargetAnswerCoherenceScanBound, snapshot.GeneratedAt, false)
 	assertTargetAnswerContext(t, verifyTargets, "npm run test", repoTargetAnswerCoherenceMixed, snapshot.GeneratedAt, true)
 	assertTargetAnswerContext(t, verifyTargets, "pytest -q tests/test_overlay.py", repoTargetAnswerCoherenceMixed, snapshot.GeneratedAt, true)
+	assertTargetFreshness(t, runTargets, "npm run dev", repoTargetFreshnessStatusScanConsistent, "")
+	assertTargetFreshness(t, verifyTargets, "npm run test", repoTargetFreshnessStatusScanConsistent, "")
+	assertTargetFreshness(t, verifyTargets, "pytest -q tests/test_overlay.py", repoTargetFreshnessStatusOverlayLive, "verification_profiles.json")
 }
 
 func TestReadVerifyTargetsStaysScanBoundWhenSavedProfilesDidNotChangeAfterScan(t *testing.T) {
@@ -209,6 +216,106 @@ func TestReadVerifyTargetsStaysScanBoundWhenSavedProfilesDidNotChangeAfterScan(t
 	}
 	assertTargetAnswerContext(t, verifyTargets, "npm run test", repoTargetAnswerCoherenceScanBound, snapshot.GeneratedAt, false)
 	assertTargetAnswerContext(t, verifyTargets, "pytest -q tests/test_scan.py", repoTargetAnswerCoherenceScanBound, snapshot.GeneratedAt, false)
+	assertTargetFreshness(t, verifyTargets, "npm run test", repoTargetFreshnessStatusScanConsistent, "")
+	assertTargetFreshness(t, verifyTargets, "pytest -q tests/test_scan.py", repoTargetFreshnessStatusScanConsistent, "")
+}
+
+func TestReadRunTargetsAndVerifyTargetsMarkSnapshotTargetsStaleWhenManifestInventoryChangesAfterScan(t *testing.T) {
+	dataDir, workspaceID, repoRoot := writeSemanticIndexFixture(t)
+
+	snapshot, err := ScanWorkspace(dataDir, workspaceID)
+	if err != nil {
+		t.Fatalf("scan workspace: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, "frontend", "package.json"), []byte("{\"name\":\"fixture-frontend\",\"scripts\":{\"dev\":\"vite\",\"test\":\"vitest run\"}}\n"), 0o644); err != nil {
+		t.Fatalf("write post-scan frontend package.json: %v", err)
+	}
+
+	runTargets, err := ReadRunTargets(dataDir, workspaceID)
+	if err != nil {
+		t.Fatalf("read run targets: %v", err)
+	}
+	verifyTargets, err := ReadVerifyTargets(dataDir, workspaceID)
+	if err != nil {
+		t.Fatalf("read verify targets: %v", err)
+	}
+
+	if hasTargetCommand(runTargets, "cd frontend && npm run dev") {
+		t.Fatalf("did not expect post-scan frontend run target before rescan: %#v", runTargets)
+	}
+	if hasTargetCommand(verifyTargets, "cd frontend && npm run test") {
+		t.Fatalf("did not expect post-scan frontend verify target before rescan: %#v", verifyTargets)
+	}
+	assertTargetAnswerContext(t, runTargets, "npm run dev", repoTargetAnswerCoherenceScanBound, snapshot.GeneratedAt, false)
+	assertTargetAnswerContext(t, verifyTargets, "npm run test", repoTargetAnswerCoherenceScanBound, snapshot.GeneratedAt, false)
+	assertTargetFreshness(t, runTargets, "npm run dev", repoTargetFreshnessStatusScanStale, "frontend/package.json")
+	assertTargetFreshness(t, verifyTargets, "npm run test", repoTargetFreshnessStatusScanStale, "frontend/package.json")
+}
+
+func TestReadVerifyTargetsMarksSnapshotProfileStaleWhenSavedProfileChangesAfterScan(t *testing.T) {
+	dataDir, workspaceID, repoRoot := writeSemanticIndexFixture(t)
+
+	if err := os.WriteFile(filepath.Join(repoRoot, "package.json"), []byte("{\"name\":\"fixture\",\"scripts\":{\"test\":\"vitest run\"}}\n"), 0o644); err != nil {
+		t.Fatalf("write package.json: %v", err)
+	}
+	if err := saveVerificationProfiles(dataDir, workspaceID, []verificationProfileRecord{
+		{
+			ProfileID:         "scan-profile",
+			WorkspaceID:       workspaceID,
+			Name:              "scan profile",
+			Description:       "Persisted at scan time",
+			TestCommand:       "pytest -q tests/test_scan.py",
+			CoverageFormat:    "unknown",
+			MaxRuntimeSeconds: 60,
+			RetryCount:        1,
+			SourcePaths:       []string{"backend/app/cli.py"},
+			BuiltIn:           false,
+			CreatedAt:         nowUTC(),
+			UpdatedAt:         nowUTC(),
+		},
+	}); err != nil {
+		t.Fatalf("save verification profiles: %v", err)
+	}
+
+	snapshot, err := ScanWorkspace(dataDir, workspaceID)
+	if err != nil {
+		t.Fatalf("scan workspace: %v", err)
+	}
+	scanTime, err := time.Parse(time.RFC3339Nano, snapshot.GeneratedAt)
+	if err != nil {
+		t.Fatalf("parse snapshot generated_at: %v", err)
+	}
+	updatedAt := scanTime.Add(2 * time.Minute).UTC().Format(time.RFC3339Nano)
+	if err := saveVerificationProfiles(dataDir, workspaceID, []verificationProfileRecord{
+		{
+			ProfileID:         "scan-profile",
+			WorkspaceID:       workspaceID,
+			Name:              "scan profile",
+			Description:       "Persisted at scan time",
+			TestCommand:       "pytest -q tests/test_scan.py",
+			CoverageFormat:    "unknown",
+			MaxRuntimeSeconds: 60,
+			RetryCount:        1,
+			SourcePaths:       []string{"backend/app/cli.py"},
+			BuiltIn:           false,
+			CreatedAt:         snapshot.GeneratedAt,
+			UpdatedAt:         updatedAt,
+		},
+	}); err != nil {
+		t.Fatalf("rewrite verification profiles: %v", err)
+	}
+
+	verifyTargets, err := ReadVerifyTargets(dataDir, workspaceID)
+	if err != nil {
+		t.Fatalf("read verify targets: %v", err)
+	}
+
+	profileVerify := findTargetByCommand(verifyTargets, "pytest -q tests/test_scan.py")
+	if profileVerify == nil || profileVerify.TruthSource != repoTargetTruthSourceSnapshotScan || !profileVerify.ScanBound {
+		t.Fatalf("expected snapshot-backed profile target after same-command profile update, got %#v", profileVerify)
+	}
+	assertTargetAnswerContext(t, verifyTargets, "pytest -q tests/test_scan.py", repoTargetAnswerCoherenceScanBound, snapshot.GeneratedAt, false)
+	assertTargetFreshness(t, verifyTargets, "pytest -q tests/test_scan.py", repoTargetFreshnessStatusScanStale, "verification_profiles.json")
 }
 
 func TestReadRunTargetsAndVerifyTargetsDiscoverPyprojectAndCargoEntrypoints(t *testing.T) {
@@ -508,4 +615,27 @@ func assertTargetAnswerContext(t *testing.T, targets []RepoTargetRecord, command
 	if target.OverlayApplied != overlayApplied {
 		t.Fatalf("expected overlay_applied=%t for %q, got %#v", overlayApplied, command, target)
 	}
+}
+
+func assertTargetFreshness(t *testing.T, targets []RepoTargetRecord, command string, freshnessStatus string, evidencePath string) {
+	t.Helper()
+	target := findTargetByCommand(targets, command)
+	if target == nil {
+		t.Fatalf("missing target %q in %#v", command, targets)
+	}
+	if target.FreshnessStatus != freshnessStatus {
+		t.Fatalf("expected freshness status %q for %q, got %#v", freshnessStatus, command, target)
+	}
+	if strings.TrimSpace(target.FreshnessReason) == "" {
+		t.Fatalf("expected freshness reason for %q, got %#v", command, target)
+	}
+	if strings.TrimSpace(evidencePath) == "" {
+		return
+	}
+	for _, path := range target.FreshnessPaths {
+		if path == evidencePath {
+			return
+		}
+	}
+	t.Fatalf("expected freshness evidence path %q for %q, got %#v", evidencePath, command, target)
 }

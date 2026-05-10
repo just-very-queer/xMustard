@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type RepoTargetRecord struct {
@@ -29,6 +30,9 @@ type RepoTargetRecord struct {
 	AnswerCoherence  string                 `json:"answer_coherence,omitempty"`
 	ScanGeneratedAt  *string                `json:"scan_generated_at,omitempty"`
 	OverlayApplied   bool                   `json:"overlay_applied"`
+	FreshnessStatus  string                 `json:"freshness_status,omitempty"`
+	FreshnessReason  string                 `json:"freshness_reason,omitempty"`
+	FreshnessPaths   []string               `json:"freshness_evidence_paths,omitempty"`
 	Ownership        ProjectTargetOwnership `json:"ownership"`
 }
 
@@ -40,7 +44,21 @@ const (
 	repoTargetAnswerCoherenceLiveDiscovery          = "live_discovery"
 	repoTargetAnswerCoherenceOverlayAugmented       = "overlay_augmented"
 	repoTargetAnswerCoherenceMixed                  = "mixed"
+	repoTargetFreshnessStatusUnknown                = "unknown"
+	repoTargetFreshnessStatusLiveRead               = "live_read"
+	repoTargetFreshnessStatusOverlayLive            = "overlay_live"
+	repoTargetFreshnessStatusScanConsistent         = "scan_consistent"
+	repoTargetFreshnessStatusScanStale              = "scan_stale"
 )
+
+type repoTargetFreshnessContext struct {
+	ScanGeneratedAt            string
+	ScanTime                   *time.Time
+	ManifestInventoryDiffPaths []string
+	CurrentProfilesByID        map[string]verificationProfileRecord
+	DirtyPaths                 map[string]struct{}
+	RepoRoot                   string
+}
 
 type makeTargetRecipe struct {
 	Name        string
@@ -56,12 +74,13 @@ type packageManifestInfo struct {
 func ReadRunTargets(dataDir string, workspaceID string) ([]RepoTargetRecord, error) {
 	if snapshot, err := loadSnapshot(dataDir, workspaceID); err == nil && snapshot != nil && snapshot.ScannerVersion >= scannerVersion {
 		if _, ok := snapshot.Summary["run_targets_total"]; ok {
-			return annotateRepoTargetsAnswer(
+			targets := annotateRepoTargetsAnswer(
 				ensureRepoTargetsOwnership(stampRepoTargetsTruth(append([]RepoTargetRecord{}, snapshot.RunTargets...), repoTargetTruthSourceSnapshotScan, snapshot.GeneratedAt, true)),
 				repoTargetAnswerCoherenceScanBound,
 				optionalString(snapshot.GeneratedAt),
 				false,
-			), nil
+			)
+			return annotateRepoTargetsFreshness(targets, buildRepoTargetFreshnessContext(snapshot.Workspace.RootPath, snapshot, nil)), nil
 		}
 	}
 	workspace, err := getWorkspaceRecord(dataDir, workspaceID)
@@ -73,12 +92,13 @@ func ReadRunTargets(dataDir string, workspaceID string) ([]RepoTargetRecord, err
 		return nil, err
 	}
 	runTargets, _ := discoverProjectTargetsWithOwnership(workspace.RootPath, profiles)
-	return annotateRepoTargetsAnswer(
+	targets := annotateRepoTargetsAnswer(
 		stampRepoTargetsTruthIfMissing(runTargets, repoTargetTruthSourceLiveDiscovery, nowUTC(), false),
 		repoTargetAnswerCoherenceLiveDiscovery,
 		nil,
 		false,
-	), nil
+	)
+	return annotateRepoTargetsFreshness(targets, buildRepoTargetFreshnessContext(workspace.RootPath, nil, profiles)), nil
 }
 
 func ReadVerifyTargets(dataDir string, workspaceID string) ([]RepoTargetRecord, error) {
@@ -94,12 +114,13 @@ func ReadVerifyTargets(dataDir string, workspaceID string) ([]RepoTargetRecord, 
 			if overlayApplied {
 				coherence = repoTargetAnswerCoherenceMixed
 			}
-			return annotateRepoTargetsAnswer(
+			targets := annotateRepoTargetsAnswer(
 				ensureRepoTargetsOwnership(verifyTargets),
 				coherence,
 				optionalString(snapshot.GeneratedAt),
 				overlayApplied,
-			), nil
+			)
+			return annotateRepoTargetsFreshness(targets, buildRepoTargetFreshnessContext(snapshot.Workspace.RootPath, snapshot, profiles)), nil
 		}
 	}
 	workspace, err := getWorkspaceRecord(dataDir, workspaceID)
@@ -117,7 +138,7 @@ func ReadVerifyTargets(dataDir string, workspaceID string) ([]RepoTargetRecord, 
 	if overlayApplied {
 		coherence = repoTargetAnswerCoherenceOverlayAugmented
 	}
-	return annotateRepoTargetsAnswer(verifyTargets, coherence, nil, overlayApplied), nil
+	return annotateRepoTargetsFreshness(annotateRepoTargetsAnswer(verifyTargets, coherence, nil, overlayApplied), buildRepoTargetFreshnessContext(workspace.RootPath, nil, profiles)), nil
 }
 
 func discoverRunTargetsForRoot(repoRoot string) []RepoTargetRecord {
@@ -532,6 +553,199 @@ func annotateRepoTargetsAnswer(targets []RepoTargetRecord, answerCoherence strin
 		items = append(items, target)
 	}
 	return items
+}
+
+func annotateRepoTargetsFreshness(targets []RepoTargetRecord, ctx repoTargetFreshnessContext) []RepoTargetRecord {
+	items := make([]RepoTargetRecord, 0, len(targets))
+	for _, target := range targets {
+		status, reason, paths := assessRepoTargetFreshness(target, ctx)
+		target.FreshnessStatus = status
+		target.FreshnessReason = reason
+		target.FreshnessPaths = paths
+		items = append(items, target)
+	}
+	return items
+}
+
+func assessRepoTargetFreshness(target RepoTargetRecord, ctx repoTargetFreshnessContext) (string, string, []string) {
+	switch target.TruthSource {
+	case repoTargetTruthSourceLiveDiscovery:
+		return repoTargetFreshnessStatusLiveRead, "Target was discovered from current repo files at read time; no persisted scan-backed target was served.", freshnessEvidencePathsForLiveTarget(target, ctx)
+	case repoTargetTruthSourceVerificationProfileOverlay:
+		reason := "Saved verification profile data was read live and applied after target discovery."
+		if strings.TrimSpace(ctx.ScanGeneratedAt) != "" {
+			reason = fmt.Sprintf("Saved verification profile data was read live after the persisted scan at %s and applied to this answer.", ctx.ScanGeneratedAt)
+		}
+		return repoTargetFreshnessStatusOverlayLive, reason, freshnessEvidencePathsForProfile(target, ctx)
+	case repoTargetTruthSourceSnapshotScan:
+		if ctx.ScanTime == nil || strings.TrimSpace(ctx.ScanGeneratedAt) == "" {
+			return repoTargetFreshnessStatusUnknown, "Target is snapshot-backed, but xMustard could not parse the scan timestamp for freshness checks.", []string{}
+		}
+		reasons := []string{}
+		paths := []string{}
+		if target.Source != "verification_profile" && len(ctx.ManifestInventoryDiffPaths) > 0 {
+			reasons = append(reasons, "workspace manifest inventory changed after the persisted scan")
+			paths = append(paths, ctx.ManifestInventoryDiffPaths...)
+		}
+		if changed := freshnessPathChangedAfterScan(ctx, target.SourcePath); changed != "" {
+			reasons = append(reasons, fmt.Sprintf("%s changed after the persisted scan", changed))
+			paths = append(paths, changed)
+		}
+		if target.EntryPath != nil {
+			if changed := freshnessPathChangedAfterScan(ctx, *target.EntryPath); changed != "" {
+				reasons = append(reasons, fmt.Sprintf("%s changed after the persisted scan", changed))
+				paths = append(paths, changed)
+			}
+		}
+		profileReasons, profilePaths := freshnessVerificationProfileDrift(target, ctx)
+		reasons = append(reasons, profileReasons...)
+		paths = append(paths, profilePaths...)
+		if len(reasons) > 0 {
+			return repoTargetFreshnessStatusScanStale, "Snapshot-backed target may be stale: " + strings.Join(dedupeStrings(reasons, 3), "; ") + ".", dedupeStrings(paths, 6)
+		}
+		return repoTargetFreshnessStatusScanConsistent, fmt.Sprintf("No direct manifest, entrypoint, or saved-profile drift was observed against the persisted scan at %s.", ctx.ScanGeneratedAt), []string{}
+	default:
+		return repoTargetFreshnessStatusUnknown, "xMustard could not classify freshness for this target truth source.", []string{}
+	}
+}
+
+func buildRepoTargetFreshnessContext(repoRoot string, snapshot *workspaceSnapshot, profiles []verificationProfileRecord) repoTargetFreshnessContext {
+	ctx := repoTargetFreshnessContext{
+		CurrentProfilesByID: map[string]verificationProfileRecord{},
+		DirtyPaths:          map[string]struct{}{},
+		RepoRoot:            repoRoot,
+	}
+	for _, profile := range profiles {
+		profileID := strings.TrimSpace(profile.ProfileID)
+		if profileID == "" {
+			continue
+		}
+		ctx.CurrentProfilesByID[profileID] = profile
+	}
+	if worktree := readWorktreeStatus(repoRoot); worktree != nil {
+		for _, path := range worktree.DirtyPaths {
+			normalized := filepath.ToSlash(strings.TrimSpace(path))
+			if normalized == "" {
+				continue
+			}
+			ctx.DirtyPaths[normalized] = struct{}{}
+		}
+	}
+	if snapshot == nil {
+		return ctx
+	}
+	ctx.ScanGeneratedAt = strings.TrimSpace(snapshot.GeneratedAt)
+	ctx.ScanTime = parseRepoTargetFreshnessTime(snapshot.GeneratedAt)
+	if snapshot.ProjectInfo != nil {
+		snapshotPaths := manifestRecordPaths(snapshot.ProjectInfo.StaticTruth.Manifests)
+		currentPaths := manifestRecordPaths(discoverProjectManifests(repoRoot))
+		ctx.ManifestInventoryDiffPaths = manifestInventoryDiffPaths(snapshotPaths, currentPaths)
+	}
+	return ctx
+}
+
+func freshnessEvidencePathsForLiveTarget(target RepoTargetRecord, ctx repoTargetFreshnessContext) []string {
+	paths := []string{}
+	if path := strings.TrimSpace(target.SourcePath); path != "" && path != "verification_profiles.json" {
+		paths = append(paths, filepath.ToSlash(path))
+	}
+	if target.EntryPath != nil {
+		paths = append(paths, filepath.ToSlash(strings.TrimSpace(*target.EntryPath)))
+	}
+	return dedupeStrings(paths, 4)
+}
+
+func freshnessEvidencePathsForProfile(target RepoTargetRecord, ctx repoTargetFreshnessContext) []string {
+	paths := []string{"verification_profiles.json"}
+	if target.ProfileID != nil {
+		if profile, ok := ctx.CurrentProfilesByID[strings.TrimSpace(*target.ProfileID)]; ok {
+			paths = append(paths, profile.SourcePaths...)
+		}
+	}
+	return dedupeStrings(paths, 4)
+}
+
+func freshnessVerificationProfileDrift(target RepoTargetRecord, ctx repoTargetFreshnessContext) ([]string, []string) {
+	if target.Source != "verification_profile" || target.ProfileID == nil {
+		return nil, nil
+	}
+	profileID := strings.TrimSpace(*target.ProfileID)
+	if profileID == "" {
+		return nil, nil
+	}
+	profile, ok := ctx.CurrentProfilesByID[profileID]
+	if !ok {
+		return []string{"saved verification profile is no longer present in current workspace config"}, []string{"verification_profiles.json"}
+	}
+	reasons := []string{}
+	paths := []string{"verification_profiles.json"}
+	if strings.TrimSpace(profile.TestCommand) != "" && strings.TrimSpace(profile.TestCommand) != strings.TrimSpace(target.Command) {
+		reasons = append(reasons, "saved verification profile command no longer matches the snapshot-backed target")
+	}
+	if profileUpdatedAt := parseRepoTargetFreshnessTime(profile.UpdatedAt); profileUpdatedAt != nil && profileUpdatedAt.After(*ctx.ScanTime) {
+		reasons = append(reasons, "saved verification profile was updated after the persisted scan")
+	}
+	paths = append(paths, profile.SourcePaths...)
+	return reasons, dedupeStrings(paths, 4)
+}
+
+func freshnessPathChangedAfterScan(ctx repoTargetFreshnessContext, repoPath string) string {
+	normalized := filepath.ToSlash(strings.TrimSpace(repoPath))
+	if normalized == "" || normalized == "verification_profiles.json" || ctx.ScanTime == nil || strings.TrimSpace(ctx.RepoRoot) == "" {
+		return ""
+	}
+	if _, ok := ctx.DirtyPaths[normalized]; ok {
+		return normalized
+	}
+	info, err := os.Stat(filepath.Join(ctx.RepoRoot, filepath.FromSlash(normalized)))
+	if err != nil {
+		return ""
+	}
+	if info.ModTime().UTC().After(*ctx.ScanTime) {
+		return normalized
+	}
+	return ""
+}
+
+func manifestRecordPaths(items []ProjectManifestRecord) map[string]struct{} {
+	paths := map[string]struct{}{}
+	for _, item := range items {
+		path := filepath.ToSlash(strings.TrimSpace(item.Path))
+		if path == "" {
+			continue
+		}
+		paths[path] = struct{}{}
+	}
+	return paths
+}
+
+func manifestInventoryDiffPaths(left map[string]struct{}, right map[string]struct{}) []string {
+	paths := []string{}
+	for path := range left {
+		if _, ok := right[path]; !ok {
+			paths = append(paths, path)
+		}
+	}
+	for path := range right {
+		if _, ok := left[path]; !ok {
+			paths = append(paths, path)
+		}
+	}
+	slices.Sort(paths)
+	return dedupeStrings(paths, 6)
+}
+
+func parseRepoTargetFreshnessTime(value string) *time.Time {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return nil
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, trimmed)
+	if err != nil {
+		return nil
+	}
+	parsed = parsed.UTC()
+	return &parsed
 }
 
 func repoTargetsIncludeTruthSource(targets []RepoTargetRecord, truthSource string) bool {

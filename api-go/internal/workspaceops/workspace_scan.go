@@ -162,6 +162,9 @@ func ScanWorkspace(dataDir string, workspaceID string) (*workspaceSnapshot, erro
 		LatestVerdicts: optionalString(lastString(verdictPaths)),
 		GeneratedAt:    now,
 	}
+	freshnessContext := buildRepoTargetFreshnessContext(root, snapshot, savedVerificationProfiles)
+	snapshot.RunTargets = annotateRepoTargetsFreshness(snapshot.RunTargets, freshnessContext)
+	snapshot.VerifyTargets = annotateRepoTargetsFreshness(snapshot.VerifyTargets, freshnessContext)
 	if err := saveWorkspaceRecord(dataDir, workspace); err != nil {
 		return nil, err
 	}
