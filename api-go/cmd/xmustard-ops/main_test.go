@@ -64,6 +64,9 @@ func TestWorkspaceLoadAndVerificationProfileOperatorLoop(t *testing.T) {
 	if readTargetOwnershipStatus(t, runTargets, "npm run dev") != "exact" {
 		t.Fatalf("expected raw run-target ownership in CLI payload, got %#v", runTargets)
 	}
+	if readTargetStringField(t, runTargets, "npm run dev", "owner_service_id") == "" {
+		t.Fatalf("expected exact raw owner_service_id in CLI payload, got %#v", runTargets)
+	}
 	if readTargetTruthSource(t, runTargets, "npm run dev") != "snapshot_scan" {
 		t.Fatalf("expected snapshot scan truth on cached run target, got %#v", runTargets)
 	}
@@ -84,6 +87,9 @@ func TestWorkspaceLoadAndVerificationProfileOperatorLoop(t *testing.T) {
 	if readTargetOwnershipStatus(t, verifyTargets, "npm run test") != "exact" {
 		t.Fatalf("expected raw verify-target ownership in CLI payload, got %#v", verifyTargets)
 	}
+	if readTargetStringField(t, verifyTargets, "npm run test", "owner_service_id") == "" {
+		t.Fatalf("expected exact raw verify owner_service_id in CLI payload, got %#v", verifyTargets)
+	}
 	if readTargetTruthSource(t, verifyTargets, "npm run test") != "snapshot_scan" {
 		t.Fatalf("expected snapshot scan truth on cached verify target, got %#v", verifyTargets)
 	}
@@ -95,6 +101,14 @@ func TestWorkspaceLoadAndVerificationProfileOperatorLoop(t *testing.T) {
 	}
 	if readTargetBoolField(t, verifyTargets, "npm run test", "overlay_applied") {
 		t.Fatalf("expected no overlay on cached verify target, got %#v", verifyTargets)
+	}
+	runTargetID := readTargetStringField(t, runTargets, "npm run dev", "target_id")
+	verifyTargetID := readTargetStringField(t, verifyTargets, "npm run test", "target_id")
+	if !readTargetStringArrayContains(t, runTargets, "npm run dev", "related_target_ids", verifyTargetID) {
+		t.Fatalf("expected raw run target to link its related verify target, got %#v", runTargets)
+	}
+	if !readTargetStringArrayContains(t, verifyTargets, "npm run test", "related_target_ids", runTargetID) {
+		t.Fatalf("expected raw verify target to link its related run target, got %#v", verifyTargets)
 	}
 
 	verificationOutcomes := runOpsJSON(t, dataDir, "workspace", "verification-outcomes", workspaceID)
@@ -281,6 +295,33 @@ func readTargetBoolField(t *testing.T, payload any, command string, field string
 			t.Fatalf("expected bool field %q on raw target %#v", field, record)
 		}
 		return enabled
+	}
+	t.Fatalf("missing raw target %q in %#v", command, payload)
+	return false
+}
+
+func readTargetStringArrayContains(t *testing.T, payload any, command string, field string, expected string) bool {
+	t.Helper()
+	for _, raw := range asJSONArray(t, payload) {
+		record, ok := raw.(map[string]any)
+		if !ok {
+			t.Fatalf("expected target record object, got %#v", raw)
+		}
+		value, _ := record["command"].(string)
+		if value != command {
+			continue
+		}
+		items, ok := record[field].([]any)
+		if !ok {
+			t.Fatalf("expected string array field %q on raw target %#v", field, record)
+		}
+		for _, item := range items {
+			text, ok := item.(string)
+			if ok && text == expected {
+				return true
+			}
+		}
+		return false
 	}
 	t.Fatalf("missing raw target %q in %#v", command, payload)
 	return false

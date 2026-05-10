@@ -528,8 +528,15 @@ func TestReadRunTargetsAndVerifyTargetsExposeOwnershipAndCandidateScope(t *testi
 	if frontendRun == nil || frontendRun.Ownership.Status != "exact" || len(frontendRun.Ownership.ServiceIDs) != 1 {
 		t.Fatalf("expected exact raw ownership for make frontend, got %#v", frontendRun)
 	}
+	frontendVerify := findTargetByCommand(verifyTargets, "cd frontend && npm run test")
+	if frontendRun.OwnerServiceID == nil || frontendVerify == nil || frontendVerify.OwnerServiceID == nil || *frontendVerify.OwnerServiceID != *frontendRun.OwnerServiceID {
+		t.Fatalf("expected exact raw owner service linkage for frontend targets, run=%#v verify=%#v", frontendRun, frontendVerify)
+	}
 	if frontendRun.Ownership.ScopeKind == nil || *frontendRun.Ownership.ScopeKind != "manifest" || frontendRun.Ownership.ScopeKey == nil || *frontendRun.Ownership.ScopeKey == "" {
 		t.Fatalf("expected candidate scope on frontend raw target, got %#v", frontendRun)
+	}
+	if !containsTargetID(frontendRun.RelatedTargetIDs, frontendVerify.TargetID) || !containsTargetID(frontendVerify.RelatedTargetIDs, frontendRun.TargetID) {
+		t.Fatalf("expected raw frontend target links to stay inspectable, run=%#v verify=%#v", frontendRun, frontendVerify)
 	}
 
 	goVerify := findTargetByCommand(verifyTargets, "cd api-go && go test ./...")
@@ -539,10 +546,21 @@ func TestReadRunTargetsAndVerifyTargetsExposeOwnershipAndCandidateScope(t *testi
 	if goVerify.Ownership.ScopeKind == nil || *goVerify.Ownership.ScopeKind != "manifest" || goVerify.Ownership.ScopeKey == nil || *goVerify.Ownership.ScopeKey == "" {
 		t.Fatalf("expected manifest candidate scope for module-wide go test, got %#v", goVerify)
 	}
+	apiRun := findTargetByCommand(runTargets, "make go-api")
+	opsRun := findTargetByCommand(runTargets, "make go-ops")
+	if apiRun == nil || opsRun == nil || !containsTargetID(goVerify.RelatedTargetIDs, apiRun.TargetID) || !containsTargetID(goVerify.RelatedTargetIDs, opsRun.TargetID) {
+		t.Fatalf("expected shared-scope raw verify target to link both Go run targets, goVerify=%#v apiRun=%#v opsRun=%#v", goVerify, apiRun, opsRun)
+	}
 
 	profileVerify := findTargetByCommand(verifyTargets, "go test ./cmd/xmustard-api")
 	if profileVerify == nil || profileVerify.Ownership.Status != "exact" || len(profileVerify.Ownership.ServiceIDs) != 1 {
 		t.Fatalf("expected exact raw ownership for service-scoped verification profile, got %#v", profileVerify)
+	}
+	if profileVerify.OwnerServiceID == nil || apiRun == nil || apiRun.OwnerServiceID == nil || *profileVerify.OwnerServiceID != *apiRun.OwnerServiceID {
+		t.Fatalf("expected raw profile verify target to keep the exact Go owner, profile=%#v apiRun=%#v", profileVerify, apiRun)
+	}
+	if !containsTargetID(profileVerify.RelatedTargetIDs, apiRun.TargetID) {
+		t.Fatalf("expected raw profile verify target to link the owned Go run target, got %#v", profileVerify)
 	}
 
 	genericVerify := findTargetByCommand(verifyTargets, "pytest -q")
@@ -572,6 +590,15 @@ func hasTargetSourcePath(targets []RepoTargetRecord, sourcePath string) bool {
 func hasSemanticTarget(targets []semanticRepoTarget, command string, sourcePath string) bool {
 	for _, item := range targets {
 		if item.Command == command && item.SourcePath == sourcePath {
+			return true
+		}
+	}
+	return false
+}
+
+func containsTargetID(items []string, targetID string) bool {
+	for _, item := range items {
+		if item == targetID {
 			return true
 		}
 	}

@@ -492,6 +492,8 @@ class RepoTargetRecord(BaseModel):
     freshness_status: Literal["unknown", "live_read", "overlay_live", "scan_consistent", "scan_stale"] = "unknown"
     freshness_reason: str = ""
     freshness_evidence_paths: list[str] = Field(default_factory=list)
+    owner_service_id: Optional[str] = None
+    related_target_ids: list[str] = Field(default_factory=list)
     ownership: "ProjectTargetOwnership" = Field(default_factory=lambda: ProjectTargetOwnership(reason=""))
 
 

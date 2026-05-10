@@ -33,6 +33,8 @@ type RepoTargetRecord struct {
 	FreshnessStatus  string                 `json:"freshness_status,omitempty"`
 	FreshnessReason  string                 `json:"freshness_reason,omitempty"`
 	FreshnessPaths   []string               `json:"freshness_evidence_paths,omitempty"`
+	OwnerServiceID   *string                `json:"owner_service_id,omitempty"`
+	RelatedTargetIDs []string               `json:"related_target_ids,omitempty"`
 	Ownership        ProjectTargetOwnership `json:"ownership"`
 }
 
@@ -522,6 +524,8 @@ func applyProjectCommandOwnership(targets []RepoTargetRecord, commands []Project
 	for _, target := range targets {
 		enriched := target
 		if command, ok := commandsByID[target.TargetID]; ok {
+			enriched.OwnerServiceID = command.OwnerServiceID
+			enriched.RelatedTargetIDs = append([]string{}, command.RelatedTargetIDs...)
 			enriched.Ownership = command.Ownership
 		}
 		items = append(items, ensureRepoTargetOwnership(enriched))

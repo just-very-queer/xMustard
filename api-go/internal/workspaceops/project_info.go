@@ -841,6 +841,25 @@ func buildProjectServiceGraph(repoRoot string, composeServices []ProjectServiceR
 		verifyTargets[idx].RelatedTargetIDs = dedupeStrings(append(verifyTargets[idx].RelatedTargetIDs, related...), 24)
 	}
 
+	for idx := range runTargets {
+		if len(runTargets[idx].Ownership.ServiceIDs) == 0 {
+			continue
+		}
+		runTargets[idx].RelatedTargetIDs = dedupeStrings(
+			append(runTargets[idx].RelatedTargetIDs, relatedTargetIDsForServiceIDs(seeds, runTargets[idx].Ownership.ServiceIDs, runTargets[idx].Target.TargetID)...),
+			24,
+		)
+	}
+	for idx := range verifyTargets {
+		if len(verifyTargets[idx].Ownership.ServiceIDs) == 0 {
+			continue
+		}
+		verifyTargets[idx].RelatedTargetIDs = dedupeStrings(
+			append(verifyTargets[idx].RelatedTargetIDs, relatedTargetIDsForServiceIDs(seeds, verifyTargets[idx].Ownership.ServiceIDs, verifyTargets[idx].Target.TargetID)...),
+			24,
+		)
+	}
+
 	relationships := []ProjectServiceRelationshipRecord{}
 	relationshipSeen := map[string]struct{}{}
 	appendRelationship := func(item ProjectServiceRelationshipRecord) {
