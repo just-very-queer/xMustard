@@ -67,6 +67,12 @@ func TestWorkspaceLoadAndVerificationProfileOperatorLoop(t *testing.T) {
 	if readTargetTruthSource(t, runTargets, "npm run dev") != "snapshot_scan" {
 		t.Fatalf("expected snapshot scan truth on cached run target, got %#v", runTargets)
 	}
+	if readTargetStringField(t, runTargets, "npm run dev", "answer_coherence") != "scan_bound" {
+		t.Fatalf("expected scan-bound answer coherence on cached run target, got %#v", runTargets)
+	}
+	if readTargetBoolField(t, runTargets, "npm run dev", "overlay_applied") {
+		t.Fatalf("expected no overlay on cached run target, got %#v", runTargets)
+	}
 
 	verifyTargets := runOpsJSON(t, dataDir, "workspace", "verify-targets", workspaceID)
 	if len(asJSONArray(t, verifyTargets)) == 0 {
@@ -77,6 +83,12 @@ func TestWorkspaceLoadAndVerificationProfileOperatorLoop(t *testing.T) {
 	}
 	if readTargetTruthSource(t, verifyTargets, "npm run test") != "snapshot_scan" {
 		t.Fatalf("expected snapshot scan truth on cached verify target, got %#v", verifyTargets)
+	}
+	if readTargetStringField(t, verifyTargets, "npm run test", "answer_coherence") != "scan_bound" {
+		t.Fatalf("expected scan-bound answer coherence on cached verify target, got %#v", verifyTargets)
+	}
+	if readTargetBoolField(t, verifyTargets, "npm run test", "overlay_applied") {
+		t.Fatalf("expected no overlay on cached verify target, got %#v", verifyTargets)
 	}
 
 	verificationOutcomes := runOpsJSON(t, dataDir, "workspace", "verification-outcomes", workspaceID)
@@ -109,6 +121,12 @@ func TestWorkspaceLoadAndVerificationProfileOperatorLoop(t *testing.T) {
 	verifyTargetsAfterProfileSave := runOpsJSON(t, dataDir, "workspace", "verify-targets", workspaceID)
 	if readTargetTruthSource(t, verifyTargetsAfterProfileSave, "python3 -m pytest -q backend/tests/test_smoke.py") != "verification_profile_overlay" {
 		t.Fatalf("expected live overlay truth after profile save, got %#v", verifyTargetsAfterProfileSave)
+	}
+	if readTargetStringField(t, verifyTargetsAfterProfileSave, "python3 -m pytest -q backend/tests/test_smoke.py", "answer_coherence") != "mixed" {
+		t.Fatalf("expected mixed answer coherence after profile save, got %#v", verifyTargetsAfterProfileSave)
+	}
+	if !readTargetBoolField(t, verifyTargetsAfterProfileSave, "python3 -m pytest -q backend/tests/test_smoke.py", "overlay_applied") {
+		t.Fatalf("expected overlay_applied on post-scan profile target, got %#v", verifyTargetsAfterProfileSave)
 	}
 
 	profileRun := runOpsJSON(t, dataDir,
@@ -214,6 +232,11 @@ func readTargetOwnershipStatus(t *testing.T, payload any, command string) string
 
 func readTargetTruthSource(t *testing.T, payload any, command string) string {
 	t.Helper()
+	return readTargetStringField(t, payload, command, "truth_source")
+}
+
+func readTargetStringField(t *testing.T, payload any, command string, field string) string {
+	t.Helper()
 	for _, raw := range asJSONArray(t, payload) {
 		record, ok := raw.(map[string]any)
 		if !ok {
@@ -223,14 +246,35 @@ func readTargetTruthSource(t *testing.T, payload any, command string) string {
 		if value != command {
 			continue
 		}
-		truthSource, ok := record["truth_source"].(string)
+		text, ok := record[field].(string)
 		if !ok {
-			t.Fatalf("expected truth_source on raw target %#v", record)
+			t.Fatalf("expected string field %q on raw target %#v", field, record)
 		}
-		return truthSource
+		return text
 	}
 	t.Fatalf("missing raw target %q in %#v", command, payload)
 	return ""
+}
+
+func readTargetBoolField(t *testing.T, payload any, command string, field string) bool {
+	t.Helper()
+	for _, raw := range asJSONArray(t, payload) {
+		record, ok := raw.(map[string]any)
+		if !ok {
+			t.Fatalf("expected target record object, got %#v", raw)
+		}
+		value, _ := record["command"].(string)
+		if value != command {
+			continue
+		}
+		enabled, ok := record[field].(bool)
+		if !ok {
+			t.Fatalf("expected bool field %q on raw target %#v", field, record)
+		}
+		return enabled
+	}
+	t.Fatalf("missing raw target %q in %#v", command, payload)
+	return false
 }
 
 func readJSONPathString(t *testing.T, payload any, path ...string) string {

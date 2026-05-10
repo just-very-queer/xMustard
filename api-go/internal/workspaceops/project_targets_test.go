@@ -76,6 +76,9 @@ func TestReadRunTargetsAndVerifyTargetsUseManifestDiscoveryAndSavedProfiles(t *t
 	if !hasTargetSourcePath(verifyTargets, "verification_profiles.json") {
 		t.Fatalf("expected verification_profiles.json provenance: %#v", verifyTargets)
 	}
+	assertTargetAnswerContext(t, runTargets, "npm run dev", repoTargetAnswerCoherenceLiveDiscovery, "", false)
+	assertTargetAnswerContext(t, verifyTargets, "npm run test", repoTargetAnswerCoherenceOverlayAugmented, "", true)
+	assertTargetAnswerContext(t, verifyTargets, "pytest -q", repoTargetAnswerCoherenceOverlayAugmented, "", true)
 }
 
 func TestReadRunTargetsAndVerifyTargetsExposeSnapshotTruthAndLiveProfileOverlay(t *testing.T) {
@@ -161,6 +164,51 @@ func TestReadRunTargetsAndVerifyTargetsExposeSnapshotTruthAndLiveProfileOverlay(
 	if overlayVerify == nil || overlayVerify.TruthSource != repoTargetTruthSourceVerificationProfileOverlay || overlayVerify.ScanBound || overlayVerify.TruthGeneratedAt == nil || *overlayVerify.TruthGeneratedAt != "2026-05-09T12:00:00Z" {
 		t.Fatalf("expected live overlay truth on post-scan profile target, got %#v", overlayVerify)
 	}
+	assertTargetAnswerContext(t, runTargets, "npm run dev", repoTargetAnswerCoherenceScanBound, snapshot.GeneratedAt, false)
+	assertTargetAnswerContext(t, verifyTargets, "npm run test", repoTargetAnswerCoherenceMixed, snapshot.GeneratedAt, true)
+	assertTargetAnswerContext(t, verifyTargets, "pytest -q tests/test_overlay.py", repoTargetAnswerCoherenceMixed, snapshot.GeneratedAt, true)
+}
+
+func TestReadVerifyTargetsStaysScanBoundWhenSavedProfilesDidNotChangeAfterScan(t *testing.T) {
+	dataDir, workspaceID, repoRoot := writeSemanticIndexFixture(t)
+
+	if err := os.WriteFile(filepath.Join(repoRoot, "package.json"), []byte("{\"name\":\"fixture\",\"scripts\":{\"test\":\"vitest run\"}}\n"), 0o644); err != nil {
+		t.Fatalf("write package.json: %v", err)
+	}
+	if err := saveVerificationProfiles(dataDir, workspaceID, []verificationProfileRecord{
+		{
+			ProfileID:         "scan-profile",
+			WorkspaceID:       workspaceID,
+			Name:              "scan profile",
+			Description:       "Persisted at scan time",
+			TestCommand:       "pytest -q tests/test_scan.py",
+			CoverageFormat:    "unknown",
+			MaxRuntimeSeconds: 60,
+			RetryCount:        1,
+			BuiltIn:           false,
+			CreatedAt:         "2026-05-09T10:00:00Z",
+			UpdatedAt:         "2026-05-09T10:00:00Z",
+		},
+	}); err != nil {
+		t.Fatalf("save verification profiles: %v", err)
+	}
+
+	snapshot, err := ScanWorkspace(dataDir, workspaceID)
+	if err != nil {
+		t.Fatalf("scan workspace: %v", err)
+	}
+
+	verifyTargets, err := ReadVerifyTargets(dataDir, workspaceID)
+	if err != nil {
+		t.Fatalf("read verify targets: %v", err)
+	}
+
+	profileVerify := findTargetByCommand(verifyTargets, "pytest -q tests/test_scan.py")
+	if profileVerify == nil || profileVerify.TruthSource != repoTargetTruthSourceSnapshotScan || !profileVerify.ScanBound {
+		t.Fatalf("expected unchanged scan-time profile to stay snapshot-bound, got %#v", profileVerify)
+	}
+	assertTargetAnswerContext(t, verifyTargets, "npm run test", repoTargetAnswerCoherenceScanBound, snapshot.GeneratedAt, false)
+	assertTargetAnswerContext(t, verifyTargets, "pytest -q tests/test_scan.py", repoTargetAnswerCoherenceScanBound, snapshot.GeneratedAt, false)
 }
 
 func TestReadRunTargetsAndVerifyTargetsDiscoverPyprojectAndCargoEntrypoints(t *testing.T) {
@@ -439,4 +487,25 @@ func allTargetsHaveTruth(targets []RepoTargetRecord, truthSource string, scanBou
 		}
 	}
 	return true
+}
+
+func assertTargetAnswerContext(t *testing.T, targets []RepoTargetRecord, command string, answerCoherence string, scanGeneratedAt string, overlayApplied bool) {
+	t.Helper()
+	target := findTargetByCommand(targets, command)
+	if target == nil {
+		t.Fatalf("missing target %q in %#v", command, targets)
+	}
+	if target.AnswerCoherence != answerCoherence {
+		t.Fatalf("expected answer coherence %q for %q, got %#v", answerCoherence, command, target)
+	}
+	if strings.TrimSpace(scanGeneratedAt) == "" {
+		if target.ScanGeneratedAt != nil {
+			t.Fatalf("expected no scan_generated_at for %q, got %#v", command, target)
+		}
+	} else if target.ScanGeneratedAt == nil || *target.ScanGeneratedAt != scanGeneratedAt {
+		t.Fatalf("expected scan_generated_at %q for %q, got %#v", scanGeneratedAt, command, target)
+	}
+	if target.OverlayApplied != overlayApplied {
+		t.Fatalf("expected overlay_applied=%t for %q, got %#v", overlayApplied, command, target)
+	}
 }

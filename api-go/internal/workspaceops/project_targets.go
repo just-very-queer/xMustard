@@ -26,6 +26,9 @@ type RepoTargetRecord struct {
 	TruthSource      string                 `json:"truth_source"`
 	TruthGeneratedAt *string                `json:"truth_generated_at,omitempty"`
 	ScanBound        bool                   `json:"scan_bound"`
+	AnswerCoherence  string                 `json:"answer_coherence,omitempty"`
+	ScanGeneratedAt  *string                `json:"scan_generated_at,omitempty"`
+	OverlayApplied   bool                   `json:"overlay_applied"`
 	Ownership        ProjectTargetOwnership `json:"ownership"`
 }
 
@@ -33,6 +36,10 @@ const (
 	repoTargetTruthSourceSnapshotScan               = "snapshot_scan"
 	repoTargetTruthSourceLiveDiscovery              = "live_discovery"
 	repoTargetTruthSourceVerificationProfileOverlay = "verification_profile_overlay"
+	repoTargetAnswerCoherenceScanBound              = "scan_bound"
+	repoTargetAnswerCoherenceLiveDiscovery          = "live_discovery"
+	repoTargetAnswerCoherenceOverlayAugmented       = "overlay_augmented"
+	repoTargetAnswerCoherenceMixed                  = "mixed"
 )
 
 type makeTargetRecipe struct {
@@ -49,7 +56,12 @@ type packageManifestInfo struct {
 func ReadRunTargets(dataDir string, workspaceID string) ([]RepoTargetRecord, error) {
 	if snapshot, err := loadSnapshot(dataDir, workspaceID); err == nil && snapshot != nil && snapshot.ScannerVersion >= scannerVersion {
 		if _, ok := snapshot.Summary["run_targets_total"]; ok {
-			return ensureRepoTargetsOwnership(stampRepoTargetsTruth(append([]RepoTargetRecord{}, snapshot.RunTargets...), repoTargetTruthSourceSnapshotScan, snapshot.GeneratedAt, true)), nil
+			return annotateRepoTargetsAnswer(
+				ensureRepoTargetsOwnership(stampRepoTargetsTruth(append([]RepoTargetRecord{}, snapshot.RunTargets...), repoTargetTruthSourceSnapshotScan, snapshot.GeneratedAt, true)),
+				repoTargetAnswerCoherenceScanBound,
+				optionalString(snapshot.GeneratedAt),
+				false,
+			), nil
 		}
 	}
 	workspace, err := getWorkspaceRecord(dataDir, workspaceID)
@@ -61,7 +73,12 @@ func ReadRunTargets(dataDir string, workspaceID string) ([]RepoTargetRecord, err
 		return nil, err
 	}
 	runTargets, _ := discoverProjectTargetsWithOwnership(workspace.RootPath, profiles)
-	return stampRepoTargetsTruthIfMissing(runTargets, repoTargetTruthSourceLiveDiscovery, nowUTC(), false), nil
+	return annotateRepoTargetsAnswer(
+		stampRepoTargetsTruthIfMissing(runTargets, repoTargetTruthSourceLiveDiscovery, nowUTC(), false),
+		repoTargetAnswerCoherenceLiveDiscovery,
+		nil,
+		false,
+	), nil
 }
 
 func ReadVerifyTargets(dataDir string, workspaceID string) ([]RepoTargetRecord, error) {
@@ -72,7 +89,17 @@ func ReadVerifyTargets(dataDir string, workspaceID string) ([]RepoTargetRecord, 
 				return nil, profileErr
 			}
 			snapshotTargets := stampRepoTargetsTruth(append([]RepoTargetRecord{}, snapshot.VerifyTargets...), repoTargetTruthSourceSnapshotScan, snapshot.GeneratedAt, true)
-			return ensureRepoTargetsOwnership(mergeVerificationProfileTargets(snapshotTargets, profiles)), nil
+			verifyTargets, overlayApplied := mergeVerificationProfileTargets(snapshotTargets, profiles)
+			coherence := repoTargetAnswerCoherenceScanBound
+			if overlayApplied {
+				coherence = repoTargetAnswerCoherenceMixed
+			}
+			return annotateRepoTargetsAnswer(
+				ensureRepoTargetsOwnership(verifyTargets),
+				coherence,
+				optionalString(snapshot.GeneratedAt),
+				overlayApplied,
+			), nil
 		}
 	}
 	workspace, err := getWorkspaceRecord(dataDir, workspaceID)
@@ -84,7 +111,13 @@ func ReadVerifyTargets(dataDir string, workspaceID string) ([]RepoTargetRecord, 
 		return nil, err
 	}
 	_, verifyTargets := discoverProjectTargetsWithOwnership(workspace.RootPath, profiles)
-	return stampRepoTargetsTruthIfMissing(verifyTargets, repoTargetTruthSourceLiveDiscovery, nowUTC(), false), nil
+	verifyTargets = stampRepoTargetsTruthIfMissing(verifyTargets, repoTargetTruthSourceLiveDiscovery, nowUTC(), false)
+	overlayApplied := repoTargetsIncludeTruthSource(verifyTargets, repoTargetTruthSourceVerificationProfileOverlay)
+	coherence := repoTargetAnswerCoherenceLiveDiscovery
+	if overlayApplied {
+		coherence = repoTargetAnswerCoherenceOverlayAugmented
+	}
+	return annotateRepoTargetsAnswer(verifyTargets, coherence, nil, overlayApplied), nil
 }
 
 func discoverRunTargetsForRoot(repoRoot string) []RepoTargetRecord {
@@ -92,7 +125,8 @@ func discoverRunTargetsForRoot(repoRoot string) []RepoTargetRecord {
 }
 
 func discoverVerifyTargetsForRoot(repoRoot string, profiles []verificationProfileRecord) []RepoTargetRecord {
-	return mergeVerificationProfileTargets(discoverManifestTargets(repoRoot, true), profiles)
+	targets, _ := mergeVerificationProfileTargets(discoverManifestTargets(repoRoot, true), profiles)
+	return targets
 }
 
 func discoverManifestTargets(repoRoot string, includeVerify bool) []RepoTargetRecord {
@@ -426,7 +460,7 @@ func buildRepoContextTargetLinks(targets []RepoTargetRecord, kindLabel string) [
 	return links
 }
 
-func mergeVerificationProfileTargets(targets []RepoTargetRecord, profiles []verificationProfileRecord) []RepoTargetRecord {
+func mergeVerificationProfileTargets(targets []RepoTargetRecord, profiles []verificationProfileRecord) ([]RepoTargetRecord, bool) {
 	merged := append([]RepoTargetRecord{}, targets...)
 	for _, profile := range profiles {
 		merged = append(merged, RepoTargetRecord{
@@ -444,7 +478,8 @@ func mergeVerificationProfileTargets(targets []RepoTargetRecord, profiles []veri
 			ScanBound:        false,
 		})
 	}
-	return dedupeRepoTargets(merged)
+	deduped := dedupeRepoTargets(merged)
+	return deduped, repoTargetsIncludeTruthSource(deduped, repoTargetTruthSourceVerificationProfileOverlay)
 }
 
 func discoverProjectTargetsWithOwnership(repoRoot string, profiles []verificationProfileRecord) ([]RepoTargetRecord, []RepoTargetRecord) {
@@ -486,6 +521,26 @@ func ensureRepoTargetOwnership(target RepoTargetRecord) RepoTargetRecord {
 		target.Ownership = newUnownedProjectTargetOwnership("No repo-backed service ownership evidence was found for this target.")
 	}
 	return target
+}
+
+func annotateRepoTargetsAnswer(targets []RepoTargetRecord, answerCoherence string, scanGeneratedAt *string, overlayApplied bool) []RepoTargetRecord {
+	items := make([]RepoTargetRecord, 0, len(targets))
+	for _, target := range targets {
+		target.AnswerCoherence = strings.TrimSpace(answerCoherence)
+		target.ScanGeneratedAt = optionalStringPtr(firstOptionalString(scanGeneratedAt))
+		target.OverlayApplied = overlayApplied
+		items = append(items, target)
+	}
+	return items
+}
+
+func repoTargetsIncludeTruthSource(targets []RepoTargetRecord, truthSource string) bool {
+	for _, target := range targets {
+		if target.TruthSource == truthSource {
+			return true
+		}
+	}
+	return false
 }
 
 func stampRepoTargetsTruth(targets []RepoTargetRecord, truthSource string, truthGeneratedAt string, scanBound bool) []RepoTargetRecord {

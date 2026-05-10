@@ -486,6 +486,9 @@ class RepoTargetRecord(BaseModel):
     truth_source: Literal["snapshot_scan", "live_discovery", "verification_profile_overlay"] = "live_discovery"
     truth_generated_at: Optional[str] = None
     scan_bound: bool = False
+    answer_coherence: Literal["scan_bound", "live_discovery", "overlay_augmented", "mixed"] = "live_discovery"
+    scan_generated_at: Optional[str] = None
+    overlay_applied: bool = False
     ownership: "ProjectTargetOwnership" = Field(default_factory=lambda: ProjectTargetOwnership(reason=""))
 
 
