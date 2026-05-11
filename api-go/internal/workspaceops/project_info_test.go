@@ -280,6 +280,53 @@ func TestReadProjectInfoBuildsNonComposeGoServicesAndServiceScopedProfiles(t *te
 	}
 }
 
+func TestReadProjectInfoSplitsCargoBinServicesByEntrypoint(t *testing.T) {
+	dataDir, workspaceID, repoRoot := writeSemanticIndexFixture(t)
+
+	if err := os.MkdirAll(filepath.Join(repoRoot, "rust-core", "src", "bin"), 0o755); err != nil {
+		t.Fatalf("mkdir rust-core/src/bin: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, "rust-core", "Cargo.toml"), []byte("[package]\nname = \"fixture-core\"\nversion = \"0.1.0\"\nedition = \"2024\"\n"), 0o644); err != nil {
+		t.Fatalf("write rust-core Cargo.toml: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, "rust-core", "src", "bin", "api.rs"), []byte("fn main() {}\n"), 0o644); err != nil {
+		t.Fatalf("write api binary: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, "rust-core", "src", "bin", "worker.rs"), []byte("fn main() {}\n"), 0o644); err != nil {
+		t.Fatalf("write worker binary: %v", err)
+	}
+
+	projectInfo, err := ReadProjectInfo(dataDir, workspaceID)
+	if err != nil {
+		t.Fatalf("read project info: %v", err)
+	}
+
+	apiRun := findProjectCommand(projectInfo.StaticTruth.RunTargets, "cd rust-core && cargo run --bin api")
+	workerRun := findProjectCommand(projectInfo.StaticTruth.RunTargets, "cd rust-core && cargo run --bin worker")
+	if apiRun == nil || workerRun == nil || apiRun.OwnerServiceID == nil || workerRun.OwnerServiceID == nil {
+		t.Fatalf("expected owned Cargo bin run targets, got api=%#v worker=%#v", apiRun, workerRun)
+	}
+	if *apiRun.OwnerServiceID == *workerRun.OwnerServiceID {
+		t.Fatalf("expected Cargo bin targets to split into distinct services, got api=%#v worker=%#v", apiRun, workerRun)
+	}
+	if !projectInfoHasServiceIdentity(projectInfo.StaticTruth.ServiceIdentities, "api") || !projectInfoHasServiceIdentity(projectInfo.StaticTruth.ServiceIdentities, "worker") {
+		t.Fatalf("expected Cargo bin service identities, got %#v", projectInfo.StaticTruth.ServiceIdentities)
+	}
+	cargoVerify := findProjectCommand(projectInfo.StaticTruth.VerifyTargets, "cd rust-core && cargo test")
+	if cargoVerify == nil || cargoVerify.OwnerServiceID != nil {
+		t.Fatalf("expected package-wide Cargo test to avoid a single owner, got %#v", cargoVerify)
+	}
+	if cargoVerify.Ownership.Status != "shared_scope" {
+		t.Fatalf("expected shared-scope Cargo test ownership, got %#v", cargoVerify)
+	}
+	if !slices.Contains(cargoVerify.Ownership.ServiceIDs, *apiRun.OwnerServiceID) || !slices.Contains(cargoVerify.Ownership.ServiceIDs, *workerRun.OwnerServiceID) {
+		t.Fatalf("expected Cargo test to carry both proven service ids, got %#v", cargoVerify)
+	}
+	if !slices.Contains(cargoVerify.RelatedTargetIDs, apiRun.TargetID) || !slices.Contains(cargoVerify.RelatedTargetIDs, workerRun.TargetID) {
+		t.Fatalf("expected Cargo test to link both bin run targets, got %#v", cargoVerify)
+	}
+}
+
 func TestReadProjectInfoBuildsPackageWorkspaceGroupsAndDependencies(t *testing.T) {
 	dataDir, workspaceID, repoRoot := writeSemanticIndexFixture(t)
 

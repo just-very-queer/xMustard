@@ -1625,7 +1625,7 @@ func projectManifestServiceScopeKey(target resolvedProjectTarget, manifestPath s
 
 func projectManifestServiceScopeKeyForEvidence(manifestPath string, workingDir string, entryPath *string, targetKind string) string {
 	base := projectManifestBaseScopeKey(manifestPath, workingDir)
-	if strings.HasSuffix(manifestPath, "go.mod") {
+	if strings.HasSuffix(manifestPath, "go.mod") || strings.HasSuffix(manifestPath, "Cargo.toml") {
 		switch targetKind {
 		case "run", "build", "service", "dev", "other":
 			if entryPath != nil && strings.TrimSpace(*entryPath) != "" {
@@ -2010,6 +2010,11 @@ func resolveCargoTarget(repoRoot string, target RepoTargetRecord, resolution *pr
 			resolution.ServiceName = optionalString(filepath.Base(workingDir))
 		}
 	}
+	if resolution.EntryPath != nil {
+		if serviceName := cargoServiceNameFromEntryPath(*resolution.EntryPath); serviceName != "" {
+			resolution.ServiceName = &serviceName
+		}
+	}
 }
 
 func resolveGoTarget(repoRoot string, target RepoTargetRecord, resolution *projectCommandResolution) {
@@ -2185,6 +2190,18 @@ func goServiceNameFromEntryPath(entryPath string) string {
 	}
 	if strings.Contains(trimmed, "/cmd/") {
 		return filepath.Base(dir)
+	}
+	return ""
+}
+
+func cargoServiceNameFromEntryPath(entryPath string) string {
+	trimmed := filepath.ToSlash(strings.TrimSpace(entryPath))
+	if trimmed == "" {
+		return ""
+	}
+	base := filepath.Base(trimmed)
+	if strings.HasSuffix(base, ".rs") && strings.Contains(trimmed, "/src/bin/") {
+		return strings.TrimSuffix(base, ".rs")
 	}
 	return ""
 }
