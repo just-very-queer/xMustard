@@ -16,7 +16,7 @@ The project is still in active development. The current engineering focus is the
 
 This `README.md` is the public GitHub-facing overview.
 
-Deeper migration notes, tranche prompts, private closeout logs, and working architecture handoff material live in local docs that are not part of the public repository surface. The public README should explain what xMustard is, where it is headed, and how to run it without reading like an internal rollout diary.
+Deeper migration notes, tranche prompts, closeout logs, and working architecture handoff material live in internal-facing repo docs. The public README should explain what xMustard is, where it is headed, and how to run it without reading like an internal rollout diary.
 
 ## What xMustard Is
 
@@ -82,7 +82,7 @@ We are not treating “feature count” as progress. If the system cannot ground
 - `api-go/`: Go HTTP shell and migration surface
 - `rust-core/`: Rust acceleration and parity work for repo intelligence and verification
 - `research/`: local reference repos used for product and architecture study; ignored from git
-- `docs/`: local planning and handoff notes; ignored from git
+- `docs/`: planning, architecture, handoff notes, prompts, and closeout logs
 
 ## Development
 
@@ -136,7 +136,7 @@ The current public direction is:
 - move shipped request paths away from Python over time
 - keep the migration honest: public behavior first, private rollout notes second
 
-If you are reading this on GitHub, treat the README as the public product and architecture overview. The private migration ledger, tranche prompts, and closeout notes are intentionally kept out of the public repo surface.
+If you are reading this on GitHub, treat the README as the public product and architecture overview. The tracked docs include internal-facing migration notes, tranche prompts, and closeout material for code-truth handoffs.
 
 ## Architecture Direction
 

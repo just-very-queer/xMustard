@@ -14,7 +14,7 @@ func TestReadProjectInfoBuildsDeterministicStaticAndRuntimeTruth(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(repoRoot, "Makefile"), []byte("backend:\n\tcd backend && python3 -m uvicorn app.main:app --reload --port 8042\nfrontend:\n\tcd frontend && npm run dev\ngo-api:\n\tcd api-go && go run ./cmd/fixture-api\nmigration-check:\n\tcd api-go && go build ./cmd/fixture-api\n\tcd rust-core && cargo check\ndev:\n\t@echo use frontend and go-api\n"), 0o644); err != nil {
 		t.Fatalf("write Makefile: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(repoRoot, "docker-compose.yml"), []byte("services:\n  api:\n    image: busybox\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(repoRoot, "docker-compose.yml"), []byte("services:\n  api:\n    image: busybox\n    depends_on:\n      - db\n  db:\n    image: postgres:16\n"), 0o644); err != nil {
 		t.Fatalf("write docker-compose.yml: %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(repoRoot, "frontend", "package.json"), []byte("{\"name\":\"fixture-ui\",\"scripts\":{\"dev\":\"vite\",\"test\":\"vitest run\"}}\n"), 0o644); err != nil {
@@ -163,6 +163,14 @@ func TestReadProjectInfoBuildsDeterministicStaticAndRuntimeTruth(t *testing.T) {
 	}
 	if !containsProjectInfoString(service.Provenance.ConfigHints, "Compose service image: busybox.") {
 		t.Fatalf("expected compose service image hint, got %#v", service)
+	}
+	composeAPI := findProjectServiceIdentityByName(projectInfo.StaticTruth.ServiceIdentities, "api")
+	composeDB := findProjectServiceIdentityByName(projectInfo.StaticTruth.ServiceIdentities, "db")
+	if composeAPI == nil || composeDB == nil {
+		t.Fatalf("expected compose service identities, got %#v", projectInfo.StaticTruth.ServiceIdentities)
+	}
+	if !projectInfoHasRelationship(projectInfo.StaticTruth.ServiceRelationships, "compose_depends_on", composeAPI.ServiceID, composeDB.ServiceID) {
+		t.Fatalf("expected compose dependency relationship, got %#v", projectInfo.StaticTruth.ServiceRelationships)
 	}
 	if !projectInfoHasDeclaredRuntime(projectInfo.StaticTruth.Runtimes, "python3") || !projectInfoHasDeclaredRuntime(projectInfo.StaticTruth.Runtimes, "cargo") || !projectInfoHasDeclaredRuntime(projectInfo.StaticTruth.Runtimes, "go") || !projectInfoHasObservedRuntime(projectInfo.RuntimeTruth.Runtimes, "npm") || !projectInfoHasObservedRuntime(projectInfo.RuntimeTruth.Runtimes, "go") {
 		t.Fatalf("expected runtime inventory, got static=%#v runtime=%#v", projectInfo.StaticTruth.Runtimes, projectInfo.RuntimeTruth.Runtimes)
@@ -381,6 +389,59 @@ func TestReadProjectInfoBuildsPackageWorkspaceGroupsAndDependencies(t *testing.T
 	}
 }
 
+func TestReadProjectInfoBuildsGoWorkspaceGroupsFromGoWork(t *testing.T) {
+	dataDir, workspaceID, repoRoot := writeSemanticIndexFixture(t)
+
+	if err := os.MkdirAll(filepath.Join(repoRoot, "services", "api", "cmd", "api"), 0o755); err != nil {
+		t.Fatalf("mkdir api module: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(repoRoot, "tools", "ops", "cmd", "ops"), 0o755); err != nil {
+		t.Fatalf("mkdir ops module: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, "go.work"), []byte("go 1.26.0\n\nuse (\n\t./services/api\n\t./tools/ops\n)\n"), 0o644); err != nil {
+		t.Fatalf("write go.work: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, "services", "api", "go.mod"), []byte("module fixture/services/api\n\ngo 1.26.0\n"), 0o644); err != nil {
+		t.Fatalf("write api go.mod: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, "services", "api", "cmd", "api", "main.go"), []byte("package main\n\nfunc main() {}\n"), 0o644); err != nil {
+		t.Fatalf("write api main.go: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, "tools", "ops", "go.mod"), []byte("module fixture/tools/ops\n\ngo 1.26.0\n"), 0o644); err != nil {
+		t.Fatalf("write ops go.mod: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, "tools", "ops", "cmd", "ops", "main.go"), []byte("package main\n\nfunc main() {}\n"), 0o644); err != nil {
+		t.Fatalf("write ops main.go: %v", err)
+	}
+
+	projectInfo, err := ReadProjectInfo(dataDir, workspaceID)
+	if err != nil {
+		t.Fatalf("read project info: %v", err)
+	}
+
+	apiRun := findProjectCommand(projectInfo.StaticTruth.RunTargets, "cd services/api && go run ./cmd/api")
+	opsRun := findProjectCommand(projectInfo.StaticTruth.RunTargets, "cd tools/ops && go run ./cmd/ops")
+	if apiRun == nil || opsRun == nil || apiRun.OwnerServiceID == nil || opsRun.OwnerServiceID == nil {
+		t.Fatalf("expected go.work module run targets with owners, got %#v", projectInfo.StaticTruth.RunTargets)
+	}
+	var group *ProjectServiceGroupRecord
+	for idx := range projectInfo.StaticTruth.ServiceGroups {
+		if projectInfo.StaticTruth.ServiceGroups[idx].GroupType == "go_workspace" {
+			group = &projectInfo.StaticTruth.ServiceGroups[idx]
+			break
+		}
+	}
+	if group == nil {
+		t.Fatalf("expected go workspace group, got %#v", projectInfo.StaticTruth.ServiceGroups)
+	}
+	if !slices.Contains(group.MemberServiceIDs, *apiRun.OwnerServiceID) || !slices.Contains(group.MemberServiceIDs, *opsRun.OwnerServiceID) {
+		t.Fatalf("expected go workspace group members, got %#v", group)
+	}
+	if !slices.Contains(group.ManifestPaths, "services/api/go.mod") || !slices.Contains(group.ManifestPaths, "tools/ops/go.mod") || !containsProjectInfoString(group.Provenance.ConfigFiles, "go.work") {
+		t.Fatalf("expected go.work evidence on group, got %#v", group)
+	}
+}
+
 func TestReadProjectInfoUsesLiveDiscoveryWhileSnapshotProjectInfoStaysPersisted(t *testing.T) {
 	dataDir, workspaceID, repoRoot := writeSemanticIndexFixture(t)
 
@@ -512,6 +573,15 @@ func projectInfoHasRelationship(items []ProjectServiceRelationshipRecord, relati
 func findProjectServiceIdentityByID(items []ProjectServiceIdentityRecord, serviceID string) *ProjectServiceIdentityRecord {
 	for idx := range items {
 		if items[idx].ServiceID == serviceID {
+			return &items[idx]
+		}
+	}
+	return nil
+}
+
+func findProjectServiceIdentityByName(items []ProjectServiceIdentityRecord, name string) *ProjectServiceIdentityRecord {
+	for idx := range items {
+		if items[idx].Name == name {
 			return &items[idx]
 		}
 	}
