@@ -1298,4 +1298,110 @@ mod tests {
             Err(GoalError::NotFound(_))
         ));
     }
+
+    #[test]
+    fn slop_linter_table() {
+        // Each row calls a public lint function and asserts the expected
+        // finding codes with their mandated severity.
+
+        enum Op {
+            Create { objective: &'static str },
+            Iter { summary: &'static str, objective: &'static str },
+            Evidence { outcome: &'static str },
+        }
+
+        struct Row {
+            name: &'static str,
+            op: Op,
+            want: Vec<(&'static str, SlopSeverity)>,
+        }
+
+        let rows = [
+            // (1) Refusal markers -> Blocking "refusal-marker"
+            Row {
+                name: "refusal-as-an-ai",
+                op: Op::Create { objective: "As an AI, I cannot do this" },
+                want: vec![("refusal-marker", SlopSeverity::Blocking)],
+            },
+            Row {
+                name: "refusal-i-cannot",
+                op: Op::Create { objective: "I cannot help with this task" },
+                want: vec![("refusal-marker", SlopSeverity::Blocking)],
+            },
+            // (2) Placeholder markers -> Warning "placeholder-marker"
+            Row {
+                name: "placeholder-todo",
+                op: Op::Create { objective: "TODO: implement something" },
+                want: vec![("placeholder-marker", SlopSeverity::Warning)],
+            },
+            Row {
+                name: "placeholder-tbd",
+                op: Op::Create { objective: "tbd later discussion" },
+                want: vec![("placeholder-marker", SlopSeverity::Warning)],
+            },
+            Row {
+                name: "placeholder-lorem-ipsum",
+                op: Op::Create { objective: "Lorem ipsum dolor sit" },
+                want: vec![("placeholder-marker", SlopSeverity::Warning)],
+            },
+            // (3) Evidence pass/ok with no command/path/url -> Warning
+            Row {
+                name: "unverifiable-pass",
+                op: Op::Evidence { outcome: "pass" },
+                want: vec![("unverifiable-success", SlopSeverity::Warning)],
+            },
+            Row {
+                name: "unverifiable-ok",
+                op: Op::Evidence { outcome: "ok" },
+                want: vec![("unverifiable-success", SlopSeverity::Warning)],
+            },
+            // (4) Summary equals objective -> Warning
+            Row {
+                name: "summary-echoes-objective",
+                op: Op::Iter { summary: "build the goal cli", objective: "build the goal cli" },
+                want: vec![("summary-echoes-objective", SlopSeverity::Warning)],
+            },
+            // (5) Empty/whitespace required summary -> Blocking
+            Row {
+                name: "empty-required-empty",
+                op: Op::Iter { summary: "", objective: "do the thing" },
+                want: vec![("empty-required", SlopSeverity::Blocking)],
+            },
+            Row {
+                name: "empty-required-whitespace",
+                op: Op::Iter { summary: "   ", objective: "do the thing" },
+                want: vec![("empty-required", SlopSeverity::Blocking)],
+            },
+        ];
+
+        for row in &rows {
+            let findings: Vec<slop::SlopFinding> = match &row.op {
+                Op::Create { objective } => {
+                    slop::lint_create("Test", objective, &[]).findings
+                }
+                Op::Iter { summary, objective } => {
+                    let req = GoalIterationAppendRequest {
+                        summary: summary.to_string(),
+                        ..Default::default()
+                    };
+                    slop::lint_iteration(&req, objective).findings
+                }
+                Op::Evidence { outcome } => {
+                    let ev = GoalEvidence {
+                        kind: "test".to_string(),
+                        outcome: outcome.to_string(),
+                        ..Default::default()
+                    };
+                    slop::lint_evidence("evidence[0]", &ev)
+                }
+            };
+            for (code, severity) in &row.want {
+                assert!(
+                    findings.iter().any(|f| f.code == *code && f.severity == *severity),
+                    "[{}] expected finding ({code}, {severity:?}) not in {findings:?}",
+                    row.name,
+                );
+            }
+        }
+    }
 }
