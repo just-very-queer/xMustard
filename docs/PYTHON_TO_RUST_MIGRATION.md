@@ -40,6 +40,21 @@ the goal cutover (PR #6): Python/Go logic → Rust core → Go delegates via
 4. Go shell delegates to the new Rust command (parity test where a contract exists).
 5. Python module is deleted once parity holds; record here.
 
+## The real gate: `service.py`
+
+Many capabilities (scanner, repo-map, verification, diagnostics, lsp, goals) are
+already implemented in `rust-core` and consumed by the **Go** path. But the
+**Python** `service.py` (8.1k LOC) still `import`s the Python modules directly
+(e.g. `from .scanners import …`, `from .semantic import extract_path_symbols`),
+so those Python files cannot be deleted until `service.py`'s usages are cut over
+to the Rust/Go implementations. Net: the shadows exist; the deletion is gated on
+decomposing `service.py` subsystem-by-subsystem. That decomposition is the bulk
+of the remaining work and spans multiple sessions.
+
 ## Progress log
 
-- _(this session)_ Plan written; `semantic.py` ast-grep search port in progress.
+- _(this session)_ Plan written. `scanners.py` confirmed shadowed by
+  `rust-core/scanner.rs` + `api-go` `ScanSignals`, but still imported by
+  `service.py` (delete-blocked on service.py cutover). `semantic.py` ast-grep
+  search ported to `rust-core/src/semantic.rs` via opencode/deepseek-v4-pro
+  (first verified Python→Rust port).
