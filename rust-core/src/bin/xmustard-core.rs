@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -758,6 +760,9 @@ fn main() {
         "swarm" => {
             run_swarm_command(args);
         }
+        "bench" => {
+            run_bench_command(args);
+        }
         _ => {
             eprintln!("unknown command: {command}");
             std::process::exit(2);
@@ -1031,6 +1036,36 @@ fn run_swarm_command(mut args: impl Iterator<Item = String>) {
         other => {
             eprintln!("unknown swarm subcommand: {other}");
             std::process::exit(2);
+        }
+    }
+}
+
+/// `bench [iterations]` — run the goal/swarm micro-benchmarks against a scratch
+/// dir (default 1000 iterations) and print a JSON timing report.
+fn run_bench_command(mut args: impl Iterator<Item = String>) {
+    use xmustard_core::benchmark;
+
+    let iterations = args
+        .next()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(1000);
+    let scratch = env::temp_dir().join(format!("xm-bench-{}", std::process::id()));
+    if let Err(err) = fs::create_dir_all(&scratch) {
+        eprintln!("bench: failed to create scratch {}: {err}", scratch.display());
+        std::process::exit(1);
+    }
+    let result = benchmark::run(iterations, &scratch);
+    let _ = fs::remove_dir_all(&scratch);
+    match result {
+        Ok(report) => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&report).expect("bench report should serialize")
+            );
+        }
+        Err(err) => {
+            eprintln!("bench: {err}");
+            std::process::exit(1);
         }
     }
 }
