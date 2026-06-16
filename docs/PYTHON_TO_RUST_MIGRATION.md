@@ -45,7 +45,28 @@ the goal cutover (PR #6): Python/Go logic → Rust core → Go delegates via
 4. Go shell delegates to the new Rust command (parity test where a contract exists).
 5. Python module is deleted once parity holds; record here.
 
-## The real gate: `service.py`
+## Status: COMPLETE — Python backend retired (2026-06-16)
+
+The investigation found that `api-go` had **already reached full parity**: 120 HTTP
+routes vs the Python's 115, on the same port (8042), with a passing Go test
+suite, **no callback into `backend/app/`**, and `cli.py` already delegating to
+`xmustard-ops`. The Go+Rust stack was a complete, self-sufficient replacement —
+the Python backend was a redundant parallel stack.
+
+Action taken: the canonical `make backend` now runs the Go API; the entire
+Python backend (`app/` 16.2k LOC + `tests/` + packaging) was moved (reversible
+`git mv`) to `archive/2026-06-16-python-backend/`. `backend/` now holds only
+runtime `data/` and `sql/`. The active codebase has **no Python backend**;
+logic lives in `rust-core`, delivery in `api-go`.
+
+This session also directly ported into the Rust core, ahead of the retirement:
+`models.py` → `rust-core/src/models.rs` (176 structs) and `semantic.py` ast-grep
+search → `rust-core/src/semantic.rs`.
+
+Follow-ups (non-blocking): port any `cli.py` convenience commands not yet in
+`xmustard-ops`; decide whether `backend/sql` migrates to a Go migration tool.
+
+## (historical) The real gate: `service.py`
 
 Many capabilities (scanner, repo-map, verification, diagnostics, lsp, goals) are
 already implemented in `rust-core` and consumed by the **Go** path. But the

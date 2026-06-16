@@ -76,32 +76,28 @@ We are not treating “feature count” as progress. If the system cannot ground
 
 ## Repo Layout
 
-- `backend/`: FastAPI app, Typer CLI, models, scanners, runtimes, persistence, and semantic-index work
-- `backend/tests/`: backend regression coverage
-- `frontend/`: React and TypeScript UI surface
-- `api-go/`: Go HTTP shell and migration surface
-- `rust-core/`: Rust acceleration and parity work for repo intelligence and verification
+- `api-go/`: Go HTTP shell — the backend (120 routes), request shaping, persistence, calling the Rust core
+- `rust-core/`: Rust core — scanner, repo map, verification, diagnostics, lsp, goal/swarm runtime, data models, semantic search
+- `backend/`: runtime data (`data/`) and SQL schema (`sql/`) only; the Python FastAPI/Typer stack was retired to `archive/2026-06-16-python-backend/`
+- `frontend/`: React and TypeScript UI surface (proxies `/api` → `:8042`)
+- `archive/`: retired implementations, including the legacy Python backend
 - `research/`: local reference repos used for product and architecture study; ignored from git
 - `docs/`: planning, architecture, handoff notes, prompts, and closeout logs
 
 ## Development
 
-Go API shell for migrated request surfaces:
+The backend is Go (`api-go`) calling the Rust core (`rust-core`):
 
 ```bash
 cd api-go
-XMUSTARD_API_PORT=8042 go run ./cmd/xmustard-api
+XMUSTARD_API_PORT=8042 go run ./cmd/xmustard-api   # or: make backend
 ```
 
-Python compatibility shell:
-
-```bash
-cd backend
-python3 -m pip install .
-uvicorn app.main:app --reload --port 8042
-```
-
-The Python shell is compatibility-only for the remaining tracker-era surfaces, but workspace/project-truth delivery now belongs on `api-go` and `xmustard-ops`. Treat the repo as mixed-mode for issue/runs compatibility, not as a parallel Python front door for repo-state, ingestion-plan, target discovery, or Rust-backed workspace truth reads.
+The Python FastAPI/Typer backend has been **retired**. Its full surface is
+shadowed by `api-go` (120 routes ≥ the Python's 115, verified by a passing Go
+test suite) plus the Rust core, and `cli.py` already delegated to `xmustard-ops`.
+The source is preserved under `archive/2026-06-16-python-backend/` for reference.
+See `docs/PYTHON_TO_RUST_MIGRATION.md`.
 
 Frontend setup:
 

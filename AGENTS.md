@@ -1,6 +1,6 @@
 # xMustard Repository Guide
 
-This repository contains xMustard, a local bug-operations system for software repositories. It has a Python FastAPI backend in `backend/` and a React TypeScript frontend in `frontend/`.
+This repository contains xMustard, a local bug-operations system for software repositories. The backend is Go (`api-go`, an HTTP shell on :8042) calling a Rust core (`rust-core`), with a React TypeScript frontend in `frontend/`. The original Python FastAPI backend was retired to `archive/2026-06-16-python-backend/` (see `docs/PYTHON_TO_RUST_MIGRATION.md`).
 
 ## What This Repo Is For
 
@@ -18,8 +18,9 @@ This repository contains xMustard, a local bug-operations system for software re
 
 ## Repository Structure
 
-- `backend/app/`: API, models, orchestration, scanners, runtimes, store, and CLI
-- `backend/tests/`: backend regression tests
+- `api-go/`: Go HTTP backend (routes, request shaping, persistence) + `xmustard-ops` CLI
+- `rust-core/`: Rust core — scanner, repo map, verification, diagnostics, lsp, goal/swarm runtime, data models, semantic search
+- `backend/`: runtime `data/` + `sql/` only (Python retired to `archive/`)
 - `frontend/src/`: React app, queue views, detail panes, and shared client types
 - `docs/`: planning, architecture, features, changelog, and research synthesis
 - `research/`: cloned reference repos used to shape the product roadmap
@@ -28,8 +29,9 @@ This repository contains xMustard, a local bug-operations system for software re
 
 Backend work:
 
-- `cd backend && pytest -q`
-- `cd backend && PYTHONPYCACHEPREFIX=/tmp/pycache python3 -m compileall app`
+- `cd api-go && go test ./...`
+- `cd api-go && go build ./...`
+- `cd rust-core && cargo test && cargo clippy`
 
 Frontend work:
 
