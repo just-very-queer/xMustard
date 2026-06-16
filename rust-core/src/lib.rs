@@ -5,6 +5,7 @@
 #![forbid(unsafe_code)]
 
 pub mod benchmark;
+pub mod models;
 pub mod contracts;
 pub mod diagnostics;
 pub mod goalruntime;
