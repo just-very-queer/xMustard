@@ -711,6 +711,15 @@ pub fn list_goals(data_dir: &Path, workspace_id: &str) -> Result<Vec<GoalRecord>
     Ok(goals)
 }
 
+/// List the recorded iterations for a goal, oldest first.
+pub fn list_iterations(
+    data_dir: &Path,
+    workspace_id: &str,
+    goal_id: &str,
+) -> Result<Vec<GoalIterationRecord>> {
+    load_iterations(data_dir, workspace_id, goal_id)
+}
+
 /// Fetch one goal by id.
 pub fn get_goal(data_dir: &Path, workspace_id: &str, goal_id: &str) -> Result<GoalRecord> {
     load_goals(data_dir, workspace_id)?
