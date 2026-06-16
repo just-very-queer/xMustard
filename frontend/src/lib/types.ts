@@ -1432,3 +1432,77 @@ export type IntegrationTestResult = {
   details: Record<string, unknown>
   tested_at: string
 }
+
+export type GoalStatus = 'draft' | 'active' | 'blocked' | 'complete' | 'archived'
+
+export type GoalEvidence = {
+  kind: string
+  label?: string
+  command?: string
+  outcome?: string
+  path?: string
+  url?: string
+  notes?: string
+  created_at?: string
+}
+
+export type GoalIterationRecord = {
+  iteration_id: string
+  goal_id: string
+  role?: string
+  summary: string
+  outcome?: string
+  runtime?: string
+  model?: string
+  files_touched?: string[]
+  evidence?: GoalEvidence[]
+  created_at: string
+}
+
+export type GoalRecord = {
+  goal_id: string
+  workspace_id: string
+  title: string
+  objective: string
+  status: GoalStatus
+  acceptance_criteria?: string[]
+  current_tranche?: string
+  allowed_surface?: string[]
+  verification_commands?: string[]
+  verification_profile_ids?: string[]
+  runtime_preference?: 'manual' | 'codex' | 'opencode' | string
+  preferred_model?: string
+  resumption_notes?: string
+  evidence?: GoalEvidence[]
+  created_at: string
+  updated_at: string
+  completed_at?: string
+}
+
+export type GoalCreateRequest = {
+  title: string
+  objective: string
+  acceptance_criteria?: string[]
+  current_tranche?: string
+  allowed_surface?: string[]
+  verification_commands?: string[]
+  verification_profile_ids?: string[]
+  runtime_preference?: 'manual' | 'codex' | 'opencode' | string
+  preferred_model?: string
+  resumption_notes?: string
+}
+
+export type GoalIterationAppendRequest = {
+  role?: string
+  summary: string
+  outcome?: string
+  runtime?: string
+  model?: string
+  files_touched?: string[]
+  evidence?: GoalEvidence[]
+}
+
+export type GoalStatusUpdateRequest = {
+  status: GoalStatus
+  verification_skipped_reason?: string
+}
