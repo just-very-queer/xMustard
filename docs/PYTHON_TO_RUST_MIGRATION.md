@@ -57,4 +57,8 @@ of the remaining work and spans multiple sessions.
   `rust-core/scanner.rs` + `api-go` `ScanSignals`, but still imported by
   `service.py` (delete-blocked on service.py cutover). `semantic.py` ast-grep
   search ported to `rust-core/src/semantic.rs` via opencode/deepseek-v4-pro
-  (first verified Python→Rust port).
+  (first verified Python→Rust port). `models.py` core records (WorkspaceRecord,
+  WorkspaceSnapshot, AppSettings, IssueRecord, RunRecord, FixRecord,
+  VerificationRecord) ported to `rust-core/src/models.rs` field-for-field as the
+  data-layer foundation (65 tests). Next: remaining `models.py` records →
+  `store.py` → Rust; `main.py`/`postgres.py` → Go.
