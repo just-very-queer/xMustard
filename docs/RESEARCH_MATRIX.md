@@ -134,3 +134,12 @@ Remaining gap:
 6. Guided guidance customization
 
 For a build-oriented version of this list, see [docs/FRONTIER.md](./FRONTIER.md).
+
+## Refresh Note (2026-06-16)
+
+All repos under `research/` were re-pulled on 2026-06-16 and every cited path in
+this matrix was re-verified. The only structural change affecting a citation is
+that `OpenHands` extracted its resolver out of tree; the resolver takeaways now
+reference the standalone `research/openhands-resolver/` repo. See the **Refresh
+Log** in [docs/RESEARCH_FINDINGS.md](./RESEARCH_FINDINGS.md) for the per-repo
+post-refresh commit table.
