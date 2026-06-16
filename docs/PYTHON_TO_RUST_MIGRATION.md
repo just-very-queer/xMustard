@@ -3,7 +3,12 @@
 Goal: retire the Python backend (`backend/app/`, ~16.2k LOC) by moving logic into
 the Rust core (`rust-core`) and the thin Go shell (`api-go`). Per
 `docs/MIGRATION_RUST_GO.md`: **no flag-day rewrite — move ownership by subsystem,
-smallest/most-isolated first, each step parity-verified.** The proven pattern is
+smallest/most-isolated first, each step parity-verified.**
+
+**Direction (operator-confirmed):** eliminate Python by *strength split*, not a
+literal all-Rust rewrite. Business/algorithmic **logic → Rust core**; HTTP
+routes, Postgres, and persistence **→ Go** (calling the Rust core). The working
+`api-go` shell is kept. "No Python" is the end state. The proven pattern is
 the goal cutover (PR #6): Python/Go logic → Rust core → Go delegates via
 `rustcore.Run*Command`, behind a parity test.
 
