@@ -2632,6 +2632,7 @@ function App() {
 
               {executionOpen ? (
                 <ExecutionPane
+                  workspaceId={snapshot?.workspace.workspace_id ?? null}
                   runtime={runtime}
                   model={model}
                   runtimeModels={runtimeModels}

@@ -298,6 +298,13 @@ Done when:
 
 - xMustard can answer how to run and verify the repo without hand-authored markdown
 
+Completion-pass audit on 2026-05-12:
+
+- `project-info` is the richer runtime/config/service graph truth surface. It reports manifests, declared and observed runtimes, entrypoints, run targets, verify targets, compose services, service identities, service groups, and service relationships from Go-owned project discovery.
+- Raw `run-targets` and `verify-targets` stay narrower by design. They carry source, scan/coherence/freshness metadata, ownership status, owner service IDs where exact, and related target IDs without pretending to be a full project graph.
+- Package workspaces, `go.work`, Go `cmd/*` entrypoints, Cargo bin entrypoints, compose `depends_on`, Vite proxy edges, and package workspace dependency edges are represented only when manifest/config/entrypoint evidence is present.
+- Blunt status: Phase 4 is done for the current roadmap target. Remaining improvements should move to Phase 5 retrieval/search/impact or later ergonomics work unless shipped code exposes a concrete runtime/project-discovery blocker.
+
 ## Phase 5: Retrieval, Search, And Impact
 
 Goal:

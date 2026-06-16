@@ -1,6 +1,8 @@
+#![forbid(unsafe_code)]
+
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn main() {
     let mut args = env::args().skip(1);
@@ -752,9 +754,318 @@ fn main() {
                     .expect("architecture contract should serialize")
             );
         }
+        "goal" => {
+            run_goal_command(args);
+        }
+        "swarm" => {
+            run_swarm_command(args);
+        }
+        "bench" => {
+            run_bench_command(args);
+        }
         _ => {
             eprintln!("unknown command: {command}");
             std::process::exit(2);
+        }
+    }
+}
+
+/// Dispatch the `goal` subcommand family over the durable goal runtime.
+/// All read JSON output goes to stdout; markdown projections print verbatim.
+fn run_goal_command(mut args: impl Iterator<Item = String>) {
+    use xmustard_core::goalruntime as goal;
+
+    fn next_or_exit(value: Option<String>, usage: &str) -> String {
+        match value {
+            Some(value) => value,
+            None => {
+                eprintln!("usage: {usage}");
+                std::process::exit(2);
+            }
+        }
+    }
+
+    fn read_json_request<T: serde::de::DeserializeOwned>(path: &str) -> T {
+        let content = match fs::read_to_string(path) {
+            Ok(content) => content,
+            Err(err) => {
+                eprintln!("goal: failed to read request {path}: {err}");
+                std::process::exit(1);
+            }
+        };
+        match serde_json::from_str::<T>(&content) {
+            Ok(value) => value,
+            Err(err) => {
+                eprintln!("goal: failed to decode request {path}: {err}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    fn fail(err: xmustard_core::goalruntime::GoalError) -> ! {
+        eprintln!("goal: {err}");
+        // Exit code 3 marks a guardrail/gate refusal so callers can branch on it.
+        let code = match err {
+            xmustard_core::goalruntime::GoalError::CompletionBlocked(_)
+            | xmustard_core::goalruntime::GoalError::SlopBlocked(_) => 3,
+            xmustard_core::goalruntime::GoalError::NotFound(_) => 4,
+            _ => 1,
+        };
+        std::process::exit(code);
+    }
+
+    fn print_json<T: serde::Serialize>(value: &T) {
+        println!(
+            "{}",
+            serde_json::to_string(value).expect("goal result should serialize")
+        );
+    }
+
+    let Some(sub) = args.next() else {
+        eprintln!(
+            "usage: xmustard-core goal <list|get|create|iterate|status|ledger|context|lint> ..."
+        );
+        std::process::exit(2);
+    };
+
+    match sub.as_str() {
+        "list" => {
+            let data_dir = next_or_exit(args.next(), "xmustard-core goal list <data_dir> <workspace_id>");
+            let workspace_id =
+                next_or_exit(args.next(), "xmustard-core goal list <data_dir> <workspace_id>");
+            match goal::list_goals(Path::new(&data_dir), &workspace_id) {
+                Ok(goals) => print_json(&goals),
+                Err(err) => fail(err),
+            }
+        }
+        "get" => {
+            let data_dir =
+                next_or_exit(args.next(), "xmustard-core goal get <data_dir> <workspace_id> <goal_id>");
+            let workspace_id =
+                next_or_exit(args.next(), "xmustard-core goal get <data_dir> <workspace_id> <goal_id>");
+            let goal_id =
+                next_or_exit(args.next(), "xmustard-core goal get <data_dir> <workspace_id> <goal_id>");
+            match goal::get_goal(Path::new(&data_dir), &workspace_id, &goal_id) {
+                Ok(record) => print_json(&record),
+                Err(err) => fail(err),
+            }
+        }
+        "create" => {
+            let usage = "xmustard-core goal create <data_dir> <workspace_id> <request_json_path>";
+            let data_dir = next_or_exit(args.next(), usage);
+            let workspace_id = next_or_exit(args.next(), usage);
+            let request_path = next_or_exit(args.next(), usage);
+            let request: goal::GoalCreateRequest = read_json_request(&request_path);
+            match goal::create_goal(Path::new(&data_dir), &workspace_id, &request) {
+                Ok((record, report)) => print_json(&serde_json::json!({
+                    "goal": record,
+                    "slop": report,
+                })),
+                Err(err) => fail(err),
+            }
+        }
+        "iterate" => {
+            let usage =
+                "xmustard-core goal iterate <data_dir> <workspace_id> <goal_id> <request_json_path>";
+            let data_dir = next_or_exit(args.next(), usage);
+            let workspace_id = next_or_exit(args.next(), usage);
+            let goal_id = next_or_exit(args.next(), usage);
+            let request_path = next_or_exit(args.next(), usage);
+            let request: goal::GoalIterationAppendRequest = read_json_request(&request_path);
+            match goal::append_iteration(Path::new(&data_dir), &workspace_id, &goal_id, &request) {
+                Ok((record, report)) => print_json(&serde_json::json!({
+                    "iteration": record,
+                    "slop": report,
+                })),
+                Err(err) => fail(err),
+            }
+        }
+        "status" => {
+            let usage =
+                "xmustard-core goal status <data_dir> <workspace_id> <goal_id> <status> [skip_reason]";
+            let data_dir = next_or_exit(args.next(), usage);
+            let workspace_id = next_or_exit(args.next(), usage);
+            let goal_id = next_or_exit(args.next(), usage);
+            let status_raw = next_or_exit(args.next(), usage);
+            let skip_reason = args.next().unwrap_or_default();
+            let status = match goal::GoalStatus::parse(&status_raw) {
+                Ok(status) => status,
+                Err(err) => fail(err),
+            };
+            match goal::update_status(
+                Path::new(&data_dir),
+                &workspace_id,
+                &goal_id,
+                status,
+                &skip_reason,
+            ) {
+                Ok(record) => print_json(&record),
+                Err(err) => fail(err),
+            }
+        }
+        "ledger" => {
+            let usage = "xmustard-core goal ledger <data_dir> <workspace_id> <goal_id>";
+            let data_dir = next_or_exit(args.next(), usage);
+            let workspace_id = next_or_exit(args.next(), usage);
+            let goal_id = next_or_exit(args.next(), usage);
+            match goal::read_ledger(Path::new(&data_dir), &workspace_id, &goal_id) {
+                Ok(markdown) => print!("{markdown}"),
+                Err(err) => fail(err),
+            }
+        }
+        "context" => {
+            let usage = "xmustard-core goal context <data_dir> <workspace_id> <goal_id>";
+            let data_dir = next_or_exit(args.next(), usage);
+            let workspace_id = next_or_exit(args.next(), usage);
+            let goal_id = next_or_exit(args.next(), usage);
+            match goal::build_context_packet(Path::new(&data_dir), &workspace_id, &goal_id) {
+                Ok(packet) => print!("{packet}"),
+                Err(err) => fail(err),
+            }
+        }
+        "lint" => {
+            let usage = "xmustard-core goal lint <data_dir> <workspace_id> <goal_id>";
+            let data_dir = next_or_exit(args.next(), usage);
+            let workspace_id = next_or_exit(args.next(), usage);
+            let goal_id = next_or_exit(args.next(), usage);
+            match goal::lint_goal(Path::new(&data_dir), &workspace_id, &goal_id) {
+                Ok(report) => print_json(&report),
+                Err(err) => fail(err),
+            }
+        }
+        other => {
+            eprintln!("unknown goal subcommand: {other}");
+            std::process::exit(2);
+        }
+    }
+}
+
+/// Dispatch the `swarm` subcommand family: multi-lane orchestration + the
+/// controller gate over a goal.
+fn run_swarm_command(mut args: impl Iterator<Item = String>) {
+    use xmustard_core::goalruntime::GoalError;
+    use xmustard_core::swarm;
+
+    fn need(value: Option<String>, usage: &str) -> String {
+        match value {
+            Some(value) => value,
+            None => {
+                eprintln!("usage: {usage}");
+                std::process::exit(2);
+            }
+        }
+    }
+
+    fn fail(err: GoalError) -> ! {
+        eprintln!("swarm: {err}");
+        let code = match err {
+            GoalError::CompletionBlocked(_) | GoalError::SlopBlocked(_) => 3,
+            GoalError::NotFound(_) => 4,
+            _ => 1,
+        };
+        std::process::exit(code);
+    }
+
+    fn print_json<T: serde::Serialize>(value: &T) {
+        println!(
+            "{}",
+            serde_json::to_string(value).expect("swarm result should serialize")
+        );
+    }
+
+    let Some(sub) = args.next() else {
+        eprintln!("usage: xmustard-core swarm <plan|status|gate|record> ...");
+        std::process::exit(2);
+    };
+
+    match sub.as_str() {
+        "plan" | "status" => {
+            let usage = "xmustard-core swarm plan <data_dir> <workspace_id> <goal_id>";
+            let data_dir = need(args.next(), usage);
+            let workspace_id = need(args.next(), usage);
+            let goal_id = need(args.next(), usage);
+            match swarm::plan(Path::new(&data_dir), &workspace_id, &goal_id) {
+                Ok(plan) => print_json(&plan),
+                Err(err) => fail(err),
+            }
+        }
+        "gate" => {
+            let usage = "xmustard-core swarm gate <data_dir> <workspace_id> <goal_id>";
+            let data_dir = need(args.next(), usage);
+            let workspace_id = need(args.next(), usage);
+            let goal_id = need(args.next(), usage);
+            match swarm::gate(Path::new(&data_dir), &workspace_id, &goal_id) {
+                Ok(gate) => print_json(&gate),
+                Err(err) => fail(err),
+            }
+        }
+        "record" => {
+            let usage =
+                "xmustard-core swarm record <data_dir> <workspace_id> <goal_id> <role> <request_json_path>";
+            let data_dir = need(args.next(), usage);
+            let workspace_id = need(args.next(), usage);
+            let goal_id = need(args.next(), usage);
+            let role_raw = need(args.next(), usage);
+            let request_path = need(args.next(), usage);
+            let role = match swarm::SwarmRole::parse(&role_raw) {
+                Ok(role) => role,
+                Err(err) => fail(err),
+            };
+            let content = match fs::read_to_string(&request_path) {
+                Ok(content) => content,
+                Err(err) => {
+                    eprintln!("swarm: failed to read request {request_path}: {err}");
+                    std::process::exit(1);
+                }
+            };
+            let request = match serde_json::from_str(&content) {
+                Ok(request) => request,
+                Err(err) => {
+                    eprintln!("swarm: failed to decode request {request_path}: {err}");
+                    std::process::exit(1);
+                }
+            };
+            match swarm::record_lane(Path::new(&data_dir), &workspace_id, &goal_id, role, request) {
+                Ok((record, report)) => print_json(&serde_json::json!({
+                    "iteration": record,
+                    "slop": report,
+                })),
+                Err(err) => fail(err),
+            }
+        }
+        other => {
+            eprintln!("unknown swarm subcommand: {other}");
+            std::process::exit(2);
+        }
+    }
+}
+
+/// `bench [iterations]` — run the goal/swarm micro-benchmarks against a scratch
+/// dir (default 1000 iterations) and print a JSON timing report.
+fn run_bench_command(mut args: impl Iterator<Item = String>) {
+    use xmustard_core::benchmark;
+
+    let iterations = args
+        .next()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(1000);
+    let scratch = env::temp_dir().join(format!("xm-bench-{}", std::process::id()));
+    if let Err(err) = fs::create_dir_all(&scratch) {
+        eprintln!("bench: failed to create scratch {}: {err}", scratch.display());
+        std::process::exit(1);
+    }
+    let result = benchmark::run(iterations, &scratch);
+    let _ = fs::remove_dir_all(&scratch);
+    match result {
+        Ok(report) => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&report).expect("bench report should serialize")
+            );
+        }
+        Err(err) => {
+            eprintln!("bench: {err}");
+            std::process::exit(1);
         }
     }
 }

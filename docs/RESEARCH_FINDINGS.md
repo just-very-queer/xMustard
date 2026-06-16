@@ -87,7 +87,7 @@ What xMustard should do:
 Strong examples:
 
 - `research/pr-agent/docs/docs/core-abilities/fetching_ticket_context.md`
-- `research/openhands-resolver/README.md`
+- `research/openhands-resolver/README.md` (canonical resolver home; OpenHands removed its in-tree `openhands/resolver/` during the 2026-06 refresh)
 
 Pattern:
 
@@ -171,3 +171,32 @@ What xMustard should do:
 6. Add provider-grade review/export packets for GitHub, Linear, Jira, and human PR-style consumption.
 
 See [docs/FRONTIER.md](./FRONTIER.md) for the current research-to-build frontier map.
+
+## Refresh Log
+
+Research repos were re-pulled on **2026-06-16** (`git fetch` + `pull --ff-only`,
+non-destructive). All 22 cited evidence paths were re-verified against the new
+checkouts; one stale citation was corrected (OpenHands removed its in-tree
+`openhands/resolver/`, so the resolver finding now points at the standalone
+`research/openhands-resolver/` repo).
+
+Pinned commits after the refresh:
+
+| Repo | Commit | Date | Refresh |
+|------|--------|------|---------|
+| `aider` | `5dc9490` | 2026-05-22 | fast-forwarded |
+| `auto-code-rover` | `585d3e63` | 2025-04-24 | up-to-date (upstream quiet) |
+| `cline` | `81384089` | 2026-06-15 | fast-forwarded |
+| `gitnexus` | `df08ecc3` | 2026-06-15 | fast-forwarded |
+| `openhands-resolver` | `baa2f45` | 2024-11-18 | up-to-date (archived) |
+| `OpenHands` | `f941ba5` | 2026-06-15 | fast-forwarded (resolver extracted) |
+| `pr-agent` | `31d7dd02` | 2026-06-06 | fast-forwarded |
+| `qodo-cover` | `adcf55b` | 2025-06-23 | up-to-date (upstream quiet) |
+| `SWE-agent` | `c53556f` | 2026-06-10 | fast-forwarded |
+| `trIAge` | `5c12e53` | 2023-07-17 | up-to-date (archived) |
+| `vulnhuntr` | `ead88c5` | 2025-02-06 | up-to-date (upstream quiet) |
+
+The repeating patterns above (repo instructions, curated context, verification
+loops, review artifacts, ticket context, eval/replay, security lanes) held
+across the refreshed checkouts; no finding was invalidated by newer upstream
+code.

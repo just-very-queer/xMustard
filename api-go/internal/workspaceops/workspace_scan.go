@@ -115,9 +115,14 @@ func ScanWorkspace(dataDir string, workspaceID string) (*workspaceSnapshot, erro
 	}
 	runTargets := discoverRunTargetsForRoot(root)
 	verifyTargets := discoverVerifyTargetsForRoot(root, savedVerificationProfiles)
-	projectInfo := buildProjectInfo(workspaceID, root, runTargets, verifyTargets)
+	projectInfo := buildProjectInfo(workspaceID, root, runTargets, verifyTargets, savedVerificationProfiles)
+	projectInfo.SourceMode = projectInfoSourceModeSnapshot
+	runTargets = applyProjectCommandOwnership(runTargets, projectInfo.StaticTruth.RunTargets)
+	verifyTargets = applyProjectCommandOwnership(verifyTargets, projectInfo.StaticTruth.VerifyTargets)
 	treeSummary := summarizeTree(root)
 	now := nowUTC()
+	runTargets = stampRepoTargetsTruth(runTargets, repoTargetTruthSourceSnapshotScan, now, true)
+	verifyTargets = stampRepoTargetsTruth(verifyTargets, repoTargetTruthSourceSnapshotScan, now, true)
 	workspace.LatestScanAt = ptr(now)
 	workspace.UpdatedAt = ptr(now)
 	snapshot := &workspaceSnapshot{
@@ -157,6 +162,9 @@ func ScanWorkspace(dataDir string, workspaceID string) (*workspaceSnapshot, erro
 		LatestVerdicts: optionalString(lastString(verdictPaths)),
 		GeneratedAt:    now,
 	}
+	freshnessContext := buildRepoTargetFreshnessContext(root, snapshot, savedVerificationProfiles)
+	snapshot.RunTargets = annotateRepoTargetsFreshness(snapshot.RunTargets, freshnessContext)
+	snapshot.VerifyTargets = annotateRepoTargetsFreshness(snapshot.VerifyTargets, freshnessContext)
 	if err := saveWorkspaceRecord(dataDir, workspace); err != nil {
 		return nil, err
 	}

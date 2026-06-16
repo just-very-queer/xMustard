@@ -20,6 +20,11 @@ import type {
   GitHubIssueImport,
   GitHubPRCreate,
   GitHubPRResult,
+  GoalCreateRequest,
+  GoalIterationAppendRequest,
+  GoalIterationRecord,
+  GoalRecord,
+  GoalStatusUpdateRequest,
   GuidanceStarterRequest,
   GuidanceStarterResult,
   ImprovementSuggestion,
@@ -84,6 +89,14 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     throw new Error(await response.text())
   }
   return response.json() as Promise<T>
+}
+
+async function requestText(path: string): Promise<string> {
+  const response = await fetch(path)
+  if (!response.ok) {
+    throw new Error(await response.text())
+  }
+  return response.text()
 }
 
 export function listWorkspaces() {
@@ -749,4 +762,41 @@ export function closeTerminal(terminalId: string) {
   return request<{ ok: boolean }>(`/api/terminal/${terminalId}`, {
     method: 'DELETE',
   })
+}
+
+export function listGoals(workspaceId: string) {
+  return request<GoalRecord[]>(`/api/workspaces/${workspaceId}/goals`)
+}
+
+export function createGoal(workspaceId: string, payload: GoalCreateRequest) {
+  return request<GoalRecord>(`/api/workspaces/${workspaceId}/goals`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+}
+
+export function getGoal(workspaceId: string, goalId: string) {
+  return request<GoalRecord>(`/api/workspaces/${workspaceId}/goals/${goalId}`)
+}
+
+export function appendGoalIteration(workspaceId: string, goalId: string, payload: GoalIterationAppendRequest) {
+  return request<GoalIterationRecord>(`/api/workspaces/${workspaceId}/goals/${goalId}/iterations`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+}
+
+export function updateGoalStatus(workspaceId: string, goalId: string, payload: GoalStatusUpdateRequest) {
+  return request<GoalRecord>(`/api/workspaces/${workspaceId}/goals/${goalId}/status`, {
+    method: 'PATCH',
+    body: JSON.stringify(payload),
+  })
+}
+
+export function readGoalLedger(workspaceId: string, goalId: string) {
+  return requestText(`/api/workspaces/${workspaceId}/goals/${goalId}/ledger`)
+}
+
+export function readGoalContext(workspaceId: string, goalId: string) {
+  return requestText(`/api/workspaces/${workspaceId}/goals/${goalId}/context`)
 }

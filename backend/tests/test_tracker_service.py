@@ -2446,7 +2446,18 @@ class RuntimeSummaryTests(unittest.TestCase):
                 json.dumps({"name": "fixture", "scripts": {"dev": "vite", "build": "vite build", "test": "vitest run"}}),
                 encoding="utf-8",
             )
-            (root / "Makefile").write_text("backend:\n\tpython3 -m uvicorn app.main:app\nlint:\n\techo lint\n", encoding="utf-8")
+            (root / "frontend" / "package.json").write_text(
+                json.dumps({"name": "fixture-ui", "scripts": {"dev": "vite", "test": "vitest run"}}),
+                encoding="utf-8",
+            )
+            (root / "frontend" / "vite.config.ts").write_text(
+                "import { defineConfig } from 'vite'\nexport default defineConfig({ server: { port: 5177, proxy: { '/api': 'http://127.0.0.1:8042' } } })\n",
+                encoding="utf-8",
+            )
+            (root / "Makefile").write_text(
+                "backend:\n\tcd backend && python3 -m uvicorn app.main:app --reload --port 8042\nfrontend:\n\tcd frontend && npm run dev\nlint:\n\techo lint\n",
+                encoding="utf-8",
+            )
             (root / "docker-compose.yml").write_text("services:\n  api:\n    image: example\n", encoding="utf-8")
             (root / "backend" / "app").mkdir(parents=True)
             (root / "backend" / "pyproject.toml").write_text(
@@ -2457,12 +2468,22 @@ class RuntimeSummaryTests(unittest.TestCase):
                 "def app():\n    return True\n\nif __name__ == \"__main__\":\n    app()\n",
                 encoding="utf-8",
             )
+            (root / "backend" / "app" / "main.py").write_text("def app():\n    return True\n", encoding="utf-8")
             (root / "rust-core" / "src" / "bin").mkdir(parents=True)
             (root / "rust-core" / "Cargo.toml").write_text(
                 "[package]\nname='fixture-core'\nversion='0.1.0'\nedition='2024'\n",
                 encoding="utf-8",
             )
             (root / "rust-core" / "src" / "bin" / "fixture-core.rs").write_text("fn main() {}\n", encoding="utf-8")
+            (root / "api-go" / "cmd" / "fixture-api").mkdir(parents=True)
+            (root / "api-go" / "go.mod").write_text(
+                "module fixture/api-go\n\ngo 1.26.0\n",
+                encoding="utf-8",
+            )
+            (root / "api-go" / "cmd" / "fixture-api" / "main.go").write_text(
+                "package main\n\nimport \"os\"\n\nfunc main() {\n    _ = envDefault(\"XMUSTARD_API_PORT\", \"8080\")\n}\n\nfunc envDefault(name string, fallback string) string {\n    value := os.Getenv(name)\n    if value == \"\" {\n        return fallback\n    }\n    return value\n}\n",
+                encoding="utf-8",
+            )
 
             __import__("subprocess").run(["git", "-C", str(root), "init"], check=True, capture_output=True)
             __import__("subprocess").run(["git", "-C", str(root), "add", "."], check=True, capture_output=True)
@@ -2508,6 +2529,11 @@ class RuntimeSummaryTests(unittest.TestCase):
             self.assertTrue(any(item.command == "make backend" for item in run_targets))
             pyproject_target = next(item for item in run_targets if item.command == "cd backend && python3 -m app.cli")
             self.assertEqual(pyproject_target.source, "pyproject_toml")
+            self.assertEqual(pyproject_target.truth_source, "snapshot_scan")
+            self.assertTrue(pyproject_target.scan_bound)
+            self.assertEqual(pyproject_target.freshness_status, "scan_consistent")
+            self.assertTrue(pyproject_target.freshness_reason)
+            self.assertIsNotNone(pyproject_target.truth_generated_at)
             self.assertEqual(pyproject_target.working_dir, "backend")
             self.assertEqual(pyproject_target.entry_path, "backend/app/cli.py")
             self.assertIn("PEP 621 script", pyproject_target.reason or "")
@@ -2515,6 +2541,10 @@ class RuntimeSummaryTests(unittest.TestCase):
             self.assertEqual(cargo_target.source, "cargo_toml")
             self.assertEqual(cargo_target.working_dir, "rust-core")
             self.assertEqual(cargo_target.entry_path, "rust-core/src/bin/fixture-core.rs")
+            go_target = next(item for item in run_targets if item.command == "cd api-go && go run ./cmd/fixture-api")
+            self.assertEqual(go_target.source, "go_mod")
+            self.assertEqual(go_target.working_dir, "api-go")
+            self.assertEqual(go_target.entry_path, "api-go/cmd/fixture-api/main.go")
 
             verify_targets = snapshot.verify_targets
             self.assertTrue(any(item.command == "npm run test" for item in verify_targets))
@@ -2522,18 +2552,219 @@ class RuntimeSummaryTests(unittest.TestCase):
             self.assertEqual(cargo_verify_target.source, "cargo_toml")
             self.assertEqual(cargo_verify_target.working_dir, "rust-core")
             self.assertIn("cargo test", cargo_verify_target.reason or "")
+            go_verify_target = next(item for item in verify_targets if item.command == "cd api-go && go test ./...")
+            self.assertEqual(go_verify_target.source, "go_mod")
+            self.assertEqual(go_verify_target.truth_source, "snapshot_scan")
+            self.assertTrue(go_verify_target.scan_bound)
+            self.assertEqual(go_verify_target.freshness_status, "scan_consistent")
+            self.assertTrue(go_verify_target.freshness_reason)
+            self.assertIsNotNone(go_verify_target.truth_generated_at)
+            self.assertEqual(go_verify_target.working_dir, "api-go")
+            self.assertIn("go test ./...", go_verify_target.reason or "")
+            self.assertEqual(go_verify_target.ownership.status, "exact")
+            self.assertEqual(go_verify_target.ownership.scope_kind, "manifest")
+            self.assertEqual(len(go_verify_target.ownership.service_ids), 1)
 
             assert snapshot.project_info is not None
             project_info = snapshot.project_info
+            self.assertEqual(project_info.source_mode, "snapshot")
             self.assertTrue(any(item.command == "npm run dev" for item in project_info.static_truth.run_targets))
             self.assertTrue(any(item.command == "npm run test" for item in project_info.static_truth.verify_targets))
+            self.assertTrue(any(item.path == "api-go/go.mod" for item in project_info.static_truth.manifests))
             self.assertTrue(any(item.name == "api" for item in project_info.static_truth.services))
+            self.assertTrue(any(item.name == "frontend" for item in project_info.static_truth.service_identities))
+            self.assertTrue(any(item.relationship_type == "vite_proxy_depends_on" for item in project_info.static_truth.service_relationships))
+            make_backend = next(item for item in project_info.static_truth.run_targets if item.command == "make backend")
+            self.assertEqual(make_backend.provenance.entry_path, "backend/app/main.py")
+            self.assertIn("uvicorn app.main:app --reload --port 8042", make_backend.provenance.declared_command or "")
+            self.assertIn("Declared command sets --port 8042.", make_backend.provenance.config_hints)
+            make_frontend = next(item for item in project_info.static_truth.run_targets if item.command == "make frontend")
+            self.assertEqual(make_frontend.provenance.declared_command, "vite")
+            self.assertIn("frontend/vite.config.ts", make_frontend.provenance.config_files)
+            self.assertIn("Vite dev server port is 5177.", make_frontend.provenance.config_hints)
+            self.assertIn("Vite proxy maps /api to http://127.0.0.1:8042.", make_frontend.provenance.config_hints)
+            go_project_target = next(item for item in project_info.static_truth.run_targets if item.command == "cd api-go && go run ./cmd/fixture-api")
+            self.assertIn("Entrypoint reads env var XMUSTARD_API_PORT with default 8080.", go_project_target.provenance.config_hints)
             runtime_names = {item.runtime for item in project_info.runtime_truth.runtimes}
             self.assertIn("python3", runtime_names)
             self.assertIn("cargo", runtime_names)
+            self.assertIn("go", runtime_names)
 
             changes = service.read_change_summary(snapshot.workspace.workspace_id)
             self.assertTrue(any(item.path == "api/src/example.py" for item in changes.changed_files))
+
+    def test_workspace_scan_preserves_non_compose_go_service_split_and_profile_ownership(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "repo"
+            (root / "docs" / "bugs").mkdir(parents=True)
+            (root / "frontend").mkdir(parents=True)
+            (root / "api-go" / "cmd" / "xmustard-api").mkdir(parents=True)
+            (root / "api-go" / "cmd" / "xmustard-ops").mkdir(parents=True)
+            (root / "rust-core" / "src" / "bin").mkdir(parents=True)
+            (root / "docs" / "bugs" / "Bugs_25260323.md").write_text(LEDGER_TEXT, encoding="utf-8")
+            (root / "Makefile").write_text(
+                "frontend:\n\tcd frontend && npm run dev\n"
+                "go-api:\n\tcd api-go && XMUSTARD_API_PORT=8042 go run ./cmd/xmustard-api\n"
+                "go-ops:\n\tcd api-go && go run ./cmd/xmustard-ops\n"
+                "migration-check:\n\tcd api-go && go build ./cmd/xmustard-api\n\tcd rust-core && cargo check\n",
+                encoding="utf-8",
+            )
+            (root / "frontend" / "package.json").write_text(
+                "{\"name\":\"fixture-ui\",\"scripts\":{\"dev\":\"vite\",\"test\":\"vitest run\"}}\n",
+                encoding="utf-8",
+            )
+            (root / "frontend" / "vite.config.ts").write_text(
+                "import { defineConfig } from 'vite'\n"
+                "export default defineConfig({ server: { port: 5177, proxy: { '/api': 'http://127.0.0.1:8042' } } })\n",
+                encoding="utf-8",
+            )
+            (root / "api-go" / "go.mod").write_text(
+                "module fixture/api-go\n\ngo 1.26.0\n",
+                encoding="utf-8",
+            )
+            (root / "api-go" / "cmd" / "xmustard-api" / "main.go").write_text(
+                "package main\n\nfunc main() {}\n",
+                encoding="utf-8",
+            )
+            (root / "api-go" / "cmd" / "xmustard-ops" / "main.go").write_text(
+                "package main\n\nfunc main() {}\n",
+                encoding="utf-8",
+            )
+            (root / "rust-core" / "Cargo.toml").write_text(
+                "[package]\nname='fixture-core'\nversion='0.1.0'\nedition='2024'\n",
+                encoding="utf-8",
+            )
+            (root / "rust-core" / "src" / "bin" / "fixture-core.rs").write_text(
+                "fn main() {}\n",
+                encoding="utf-8",
+            )
+
+            __import__("subprocess").run(["git", "-C", str(root), "init"], check=True, capture_output=True)
+            __import__("subprocess").run(["git", "-C", str(root), "add", "."], check=True, capture_output=True)
+            __import__("subprocess").run(
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "-c",
+                    "user.name=xmustard",
+                    "-c",
+                    "user.email=xmustard@example.com",
+                    "commit",
+                    "-m",
+                    "initial",
+                ],
+                check=True,
+                capture_output=True,
+            )
+
+            store = FileStore(Path(tmp_dir) / "data")
+            service = TrackerService(store)
+            snapshot = service.load_workspace(WorkspaceLoadRequest(root_path=str(root), auto_scan=True))
+            assert snapshot is not None
+
+            service.save_verification_profile(
+                snapshot.workspace.workspace_id,
+                VerificationProfileUpsertRequest(
+                    profile_id="xmustard-api-smoke",
+                    name="xmustard-api smoke",
+                    test_command="go test ./cmd/xmustard-api",
+                    source_paths=["api-go/cmd/xmustard-api/main.go"],
+                ),
+            )
+
+            snapshot = service.scan_workspace(snapshot.workspace.workspace_id)
+            assert snapshot is not None
+            assert snapshot.project_info is not None
+            project_info = snapshot.project_info
+
+            raw_frontend_run = next(item for item in snapshot.run_targets if item.command == "make frontend")
+            raw_api_run = next(item for item in snapshot.run_targets if item.command == "make go-api")
+            self.assertEqual(raw_frontend_run.truth_source, "snapshot_scan")
+            self.assertTrue(raw_frontend_run.scan_bound)
+            self.assertEqual(raw_frontend_run.freshness_status, "scan_consistent")
+            self.assertTrue(raw_frontend_run.freshness_reason)
+            self.assertIsNotNone(raw_frontend_run.truth_generated_at)
+            self.assertEqual(raw_frontend_run.ownership.status, "exact")
+            self.assertEqual(raw_frontend_run.ownership.scope_kind, "manifest")
+            self.assertEqual(len(raw_frontend_run.ownership.service_ids), 1)
+            self.assertIsNotNone(raw_frontend_run.owner_service_id)
+            raw_frontend_verify = next(item for item in snapshot.verify_targets if item.command == "cd frontend && npm run test")
+            self.assertEqual(raw_frontend_verify.owner_service_id, raw_frontend_run.owner_service_id)
+            raw_go_verify = next(item for item in snapshot.verify_targets if item.command == "cd api-go && go test ./...")
+            self.assertEqual(raw_go_verify.truth_source, "snapshot_scan")
+            self.assertTrue(raw_go_verify.scan_bound)
+            self.assertEqual(raw_go_verify.freshness_status, "scan_consistent")
+            self.assertTrue(raw_go_verify.freshness_reason)
+            self.assertIsNotNone(raw_go_verify.truth_generated_at)
+            self.assertEqual(raw_go_verify.ownership.status, "shared_scope")
+            self.assertEqual(raw_go_verify.ownership.scope_kind, "manifest")
+            self.assertEqual(len(raw_go_verify.ownership.service_ids), 2)
+            raw_cargo_run = next(item for item in snapshot.run_targets if item.command == "cd rust-core && cargo run --bin fixture-core")
+            self.assertIsNotNone(raw_cargo_run.owner_service_id)
+            raw_migration_check = next(item for item in snapshot.verify_targets if item.command == "make migration-check")
+            self.assertIsNone(raw_migration_check.owner_service_id)
+            self.assertEqual(raw_migration_check.ownership.status, "ambiguous")
+            self.assertCountEqual(raw_migration_check.ownership.service_ids, [raw_api_run.owner_service_id, raw_cargo_run.owner_service_id])
+            raw_profile_verify = next(item for item in snapshot.verify_targets if item.command == "go test ./cmd/xmustard-api")
+            self.assertEqual(raw_profile_verify.truth_source, "snapshot_scan")
+            self.assertTrue(raw_profile_verify.scan_bound)
+            self.assertEqual(raw_profile_verify.freshness_status, "scan_consistent")
+            self.assertTrue(raw_profile_verify.freshness_reason)
+            self.assertIsNotNone(raw_profile_verify.truth_generated_at)
+            self.assertEqual(raw_profile_verify.ownership.status, "exact")
+            self.assertEqual(len(raw_profile_verify.ownership.service_ids), 1)
+            self.assertEqual(raw_profile_verify.owner_service_id, raw_profile_verify.ownership.service_ids[0])
+
+            self.assertEqual(project_info.static_truth.services, [])
+            frontend_run = next(item for item in project_info.static_truth.run_targets if item.command == "make frontend")
+            api_run = next(item for item in project_info.static_truth.run_targets if item.command == "make go-api")
+            ops_run = next(item for item in project_info.static_truth.run_targets if item.command == "make go-ops")
+            cargo_run = next(item for item in project_info.static_truth.run_targets if item.command == "cd rust-core && cargo run --bin fixture-core")
+            self.assertIsNotNone(frontend_run.owner_service_id)
+            self.assertIsNotNone(api_run.owner_service_id)
+            self.assertIsNotNone(ops_run.owner_service_id)
+            self.assertIsNotNone(cargo_run.owner_service_id)
+            self.assertNotEqual(api_run.owner_service_id, ops_run.owner_service_id)
+            self.assertTrue(any(item.name == "xmustard-api" for item in project_info.static_truth.service_identities))
+            self.assertTrue(any(item.name == "xmustard-ops" for item in project_info.static_truth.service_identities))
+            self.assertTrue(
+                any(
+                    item.relationship_type == "vite_proxy_depends_on"
+                    and item.source_service_id == frontend_run.owner_service_id
+                    and item.target_service_id == api_run.owner_service_id
+                    for item in project_info.static_truth.service_relationships
+                )
+            )
+
+            go_verify = next(item for item in project_info.static_truth.verify_targets if item.command == "cd api-go && go test ./...")
+            self.assertIsNone(go_verify.owner_service_id)
+            self.assertEqual(go_verify.ownership.status, "shared_scope")
+            self.assertCountEqual(go_verify.ownership.service_ids, [api_run.owner_service_id, ops_run.owner_service_id])
+            migration_check = next(item for item in project_info.static_truth.verify_targets if item.command == "make migration-check")
+            self.assertIsNone(migration_check.owner_service_id)
+            self.assertEqual(migration_check.ownership.status, "ambiguous")
+            self.assertCountEqual(migration_check.ownership.service_ids, [api_run.owner_service_id, cargo_run.owner_service_id])
+            profile_verify = next(item for item in project_info.static_truth.verify_targets if item.command == "go test ./cmd/xmustard-api")
+            self.assertEqual(profile_verify.owner_service_id, api_run.owner_service_id)
+            self.assertEqual(profile_verify.ownership.status, "exact")
+            self.assertEqual(profile_verify.ownership.service_ids, [api_run.owner_service_id])
+            self.assertEqual(raw_frontend_run.owner_service_id, frontend_run.owner_service_id)
+            self.assertIn(raw_frontend_verify.target_id, raw_frontend_run.related_target_ids)
+            self.assertIn(frontend_run.target_id, raw_frontend_verify.related_target_ids)
+            self.assertIn(api_run.target_id, raw_go_verify.related_target_ids)
+            self.assertIn(ops_run.target_id, raw_go_verify.related_target_ids)
+            self.assertIn(api_run.target_id, raw_migration_check.related_target_ids)
+            self.assertIn(cargo_run.target_id, raw_migration_check.related_target_ids)
+            self.assertIn(api_run.target_id, migration_check.related_target_ids)
+            self.assertIn(cargo_run.target_id, migration_check.related_target_ids)
+            self.assertEqual(raw_profile_verify.related_target_ids, profile_verify.related_target_ids)
+            self.assertIn(api_run.target_id, profile_verify.related_target_ids)
+            self.assertIn("api-go/cmd/xmustard-api/main.go", profile_verify.provenance.config_files)
+            self.assertIn(
+                "Saved verification profile source path is api-go/cmd/xmustard-api/main.go.",
+                profile_verify.provenance.config_hints,
+            )
 
     def test_postgres_schema_plan_and_bootstrap_follow_settings(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

@@ -8,8 +8,10 @@ import type {
   RuntimeProbeResult,
   VerificationProfileRecord,
 } from '../lib/types'
+import { GoalPanel } from './GoalPanel'
 
 type Props = {
+  workspaceId: string | null
   runtime: 'codex' | 'opencode'
   model: string
   runtimeModels: RuntimeModel[]
@@ -84,6 +86,7 @@ type Props = {
 }
 
 export function ExecutionPane({
+  workspaceId,
   runtime,
   model,
   runtimeModels,
@@ -230,6 +233,13 @@ export function ExecutionPane({
           </div>
         ) : null}
       </section>
+
+      <GoalPanel
+        workspaceId={workspaceId}
+        runtime={runtime}
+        model={model}
+        verificationProfiles={verificationProfiles}
+      />
 
       <section className="detail-section">
         <h4>Operator instruction</h4>

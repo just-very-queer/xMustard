@@ -24,9 +24,15 @@ func TestWorkspaceLoadAndVerificationProfileOperatorLoop(t *testing.T) {
 		"  - `backend/tests/test_smoke.py:1`\n"+
 		"- Status (2026-03-30): open in the current branch worktree.\n"))
 	mustWriteFile(t, filepath.Join(repoRoot, "backend", "tests", "test_smoke.py"), []byte("def test_smoke():\n    assert True\n"))
-	mustWriteFile(t, filepath.Join(repoRoot, "Makefile"), []byte("test:\n\tpython3 -m pytest -q backend/tests/test_smoke.py\n"))
+	mustWriteFile(t, filepath.Join(repoRoot, "Makefile"), []byte("test:\n\tpython3 -m pytest -q backend/tests/test_smoke.py\nmigration-check:\n\tcd api-go && go build ./cmd/xmustard-api\n\tcd rust-core && cargo check\n"))
 	mustWriteFile(t, filepath.Join(repoRoot, "package.json"), []byte("{\"name\":\"fixture\",\"scripts\":{\"dev\":\"vite\",\"test\":\"vitest run\"}}\n"))
 	mustWriteFile(t, filepath.Join(repoRoot, "pyproject.toml"), []byte("[project]\nname = \"fixture\"\nversion = \"0.1.0\"\n"))
+	mustMkdirAll(t, filepath.Join(repoRoot, "api-go", "cmd", "xmustard-api"))
+	mustWriteFile(t, filepath.Join(repoRoot, "api-go", "go.mod"), []byte("module fixture/api-go\n\ngo 1.26.0\n"))
+	mustWriteFile(t, filepath.Join(repoRoot, "api-go", "cmd", "xmustard-api", "main.go"), []byte("package main\n\nfunc main() {}\n"))
+	mustMkdirAll(t, filepath.Join(repoRoot, "rust-core", "src", "bin"))
+	mustWriteFile(t, filepath.Join(repoRoot, "rust-core", "Cargo.toml"), []byte("[package]\nname = \"fixture-core\"\nversion = \"0.1.0\"\nedition = \"2024\"\n"))
+	mustWriteFile(t, filepath.Join(repoRoot, "rust-core", "src", "bin", "fixture-core.rs"), []byte("fn main() {}\n"))
 
 	load := runOpsJSON(t, dataDir,
 		"workspace", "load",
@@ -53,15 +59,73 @@ func TestWorkspaceLoadAndVerificationProfileOperatorLoop(t *testing.T) {
 	if readJSONPathString(t, projectInfo, "workspace_id") != workspaceID {
 		t.Fatalf("project-info did not return the loaded workspace: %#v", projectInfo)
 	}
+	if len(asJSONArrayAtPath(t, projectInfo, "static_truth", "service_identities")) == 0 {
+		t.Fatalf("expected project-info service identities, got %#v", projectInfo)
+	}
 
 	runTargets := runOpsJSON(t, dataDir, "workspace", "run-targets", workspaceID)
 	if len(asJSONArray(t, runTargets)) == 0 {
 		t.Fatalf("expected run targets, got %#v", runTargets)
 	}
+	if readTargetOwnershipStatus(t, runTargets, "npm run dev") != "exact" {
+		t.Fatalf("expected raw run-target ownership in CLI payload, got %#v", runTargets)
+	}
+	if readTargetStringField(t, runTargets, "npm run dev", "owner_service_id") == "" {
+		t.Fatalf("expected exact raw owner_service_id in CLI payload, got %#v", runTargets)
+	}
+	if readTargetTruthSource(t, runTargets, "npm run dev") != "snapshot_scan" {
+		t.Fatalf("expected snapshot scan truth on cached run target, got %#v", runTargets)
+	}
+	if readTargetStringField(t, runTargets, "npm run dev", "answer_coherence") != "scan_bound" {
+		t.Fatalf("expected scan-bound answer coherence on cached run target, got %#v", runTargets)
+	}
+	if readTargetStringField(t, runTargets, "npm run dev", "freshness_status") != "scan_consistent" {
+		t.Fatalf("expected scan-consistent freshness on cached run target, got %#v", runTargets)
+	}
+	if readTargetBoolField(t, runTargets, "npm run dev", "overlay_applied") {
+		t.Fatalf("expected no overlay on cached run target, got %#v", runTargets)
+	}
+	apiGoRunID := readTargetStringField(t, runTargets, "cd api-go && go run ./cmd/xmustard-api", "target_id")
+	cargoRunID := readTargetStringField(t, runTargets, "cd rust-core && cargo run --bin fixture-core", "target_id")
 
 	verifyTargets := runOpsJSON(t, dataDir, "workspace", "verify-targets", workspaceID)
 	if len(asJSONArray(t, verifyTargets)) == 0 {
 		t.Fatalf("expected verify targets, got %#v", verifyTargets)
+	}
+	if readTargetOwnershipStatus(t, verifyTargets, "npm run test") != "exact" {
+		t.Fatalf("expected raw verify-target ownership in CLI payload, got %#v", verifyTargets)
+	}
+	if readTargetStringField(t, verifyTargets, "npm run test", "owner_service_id") == "" {
+		t.Fatalf("expected exact raw verify owner_service_id in CLI payload, got %#v", verifyTargets)
+	}
+	if readTargetTruthSource(t, verifyTargets, "npm run test") != "snapshot_scan" {
+		t.Fatalf("expected snapshot scan truth on cached verify target, got %#v", verifyTargets)
+	}
+	if readTargetStringField(t, verifyTargets, "npm run test", "answer_coherence") != "scan_bound" {
+		t.Fatalf("expected scan-bound answer coherence on cached verify target, got %#v", verifyTargets)
+	}
+	if readTargetStringField(t, verifyTargets, "npm run test", "freshness_status") != "scan_consistent" {
+		t.Fatalf("expected scan-consistent freshness on cached verify target, got %#v", verifyTargets)
+	}
+	if readTargetBoolField(t, verifyTargets, "npm run test", "overlay_applied") {
+		t.Fatalf("expected no overlay on cached verify target, got %#v", verifyTargets)
+	}
+	if readTargetOwnershipStatus(t, verifyTargets, "make migration-check") != "ambiguous" {
+		t.Fatalf("expected multi-scope raw ownership in CLI verify payload, got %#v", verifyTargets)
+	}
+	if readTargetOptionalStringField(t, verifyTargets, "make migration-check", "owner_service_id") != "" {
+		t.Fatalf("expected multi-scope CLI verify target to avoid owner_service_id, got %#v", verifyTargets)
+	}
+	if !readTargetStringArrayContains(t, verifyTargets, "make migration-check", "related_target_ids", apiGoRunID) || !readTargetStringArrayContains(t, verifyTargets, "make migration-check", "related_target_ids", cargoRunID) {
+		t.Fatalf("expected multi-scope CLI verify target to link both proven run targets, got %#v", verifyTargets)
+	}
+	runTargetID := readTargetStringField(t, runTargets, "npm run dev", "target_id")
+	verifyTargetID := readTargetStringField(t, verifyTargets, "npm run test", "target_id")
+	if !readTargetStringArrayContains(t, runTargets, "npm run dev", "related_target_ids", verifyTargetID) {
+		t.Fatalf("expected raw run target to link its related verify target, got %#v", runTargets)
+	}
+	if !readTargetStringArrayContains(t, verifyTargets, "npm run test", "related_target_ids", runTargetID) {
+		t.Fatalf("expected raw verify target to link its related run target, got %#v", verifyTargets)
 	}
 
 	verificationOutcomes := runOpsJSON(t, dataDir, "workspace", "verification-outcomes", workspaceID)
@@ -90,6 +154,19 @@ func TestWorkspaceLoadAndVerificationProfileOperatorLoop(t *testing.T) {
 	profiles := runOpsJSON(t, dataDir, "workspace", "verification-profiles", workspaceID)
 	if len(asJSONArray(t, profiles)) < 2 {
 		t.Fatalf("expected built-in and saved verification profiles, got %#v", profiles)
+	}
+	verifyTargetsAfterProfileSave := runOpsJSON(t, dataDir, "workspace", "verify-targets", workspaceID)
+	if readTargetTruthSource(t, verifyTargetsAfterProfileSave, "python3 -m pytest -q backend/tests/test_smoke.py") != "verification_profile_overlay" {
+		t.Fatalf("expected live overlay truth after profile save, got %#v", verifyTargetsAfterProfileSave)
+	}
+	if readTargetStringField(t, verifyTargetsAfterProfileSave, "python3 -m pytest -q backend/tests/test_smoke.py", "answer_coherence") != "mixed" {
+		t.Fatalf("expected mixed answer coherence after profile save, got %#v", verifyTargetsAfterProfileSave)
+	}
+	if readTargetStringField(t, verifyTargetsAfterProfileSave, "python3 -m pytest -q backend/tests/test_smoke.py", "freshness_status") != "overlay_live" {
+		t.Fatalf("expected overlay-live freshness after profile save, got %#v", verifyTargetsAfterProfileSave)
+	}
+	if !readTargetBoolField(t, verifyTargetsAfterProfileSave, "python3 -m pytest -q backend/tests/test_smoke.py", "overlay_applied") {
+		t.Fatalf("expected overlay_applied on post-scan profile target, got %#v", verifyTargetsAfterProfileSave)
 	}
 
 	profileRun := runOpsJSON(t, dataDir,
@@ -166,6 +243,130 @@ func asJSONArrayAtPath(t *testing.T, payload any, path ...string) []any {
 		t.Fatalf("expected JSON array at %v, got %#v", path, value)
 	}
 	return items
+}
+
+func readTargetOwnershipStatus(t *testing.T, payload any, command string) string {
+	t.Helper()
+	for _, raw := range asJSONArray(t, payload) {
+		record, ok := raw.(map[string]any)
+		if !ok {
+			t.Fatalf("expected target record object, got %#v", raw)
+		}
+		value, _ := record["command"].(string)
+		if value != command {
+			continue
+		}
+		ownership, ok := record["ownership"].(map[string]any)
+		if !ok {
+			t.Fatalf("expected ownership object on raw target %#v", record)
+		}
+		status, ok := ownership["status"].(string)
+		if !ok {
+			t.Fatalf("expected ownership status on raw target %#v", record)
+		}
+		return status
+	}
+	t.Fatalf("missing raw target %q in %#v", command, payload)
+	return ""
+}
+
+func readTargetTruthSource(t *testing.T, payload any, command string) string {
+	t.Helper()
+	return readTargetStringField(t, payload, command, "truth_source")
+}
+
+func readTargetOptionalStringField(t *testing.T, payload any, command string, field string) string {
+	t.Helper()
+	for _, raw := range asJSONArray(t, payload) {
+		record, ok := raw.(map[string]any)
+		if !ok {
+			t.Fatalf("expected target record object, got %#v", raw)
+		}
+		value, _ := record["command"].(string)
+		if value != command {
+			continue
+		}
+		rawValue, ok := record[field]
+		if !ok || rawValue == nil {
+			return ""
+		}
+		text, ok := rawValue.(string)
+		if !ok {
+			t.Fatalf("expected optional string field %q on raw target %#v", field, record)
+		}
+		return text
+	}
+	t.Fatalf("missing raw target %q in %#v", command, payload)
+	return ""
+}
+
+func readTargetStringField(t *testing.T, payload any, command string, field string) string {
+	t.Helper()
+	for _, raw := range asJSONArray(t, payload) {
+		record, ok := raw.(map[string]any)
+		if !ok {
+			t.Fatalf("expected target record object, got %#v", raw)
+		}
+		value, _ := record["command"].(string)
+		if value != command {
+			continue
+		}
+		text, ok := record[field].(string)
+		if !ok {
+			t.Fatalf("expected string field %q on raw target %#v", field, record)
+		}
+		return text
+	}
+	t.Fatalf("missing raw target %q in %#v", command, payload)
+	return ""
+}
+
+func readTargetBoolField(t *testing.T, payload any, command string, field string) bool {
+	t.Helper()
+	for _, raw := range asJSONArray(t, payload) {
+		record, ok := raw.(map[string]any)
+		if !ok {
+			t.Fatalf("expected target record object, got %#v", raw)
+		}
+		value, _ := record["command"].(string)
+		if value != command {
+			continue
+		}
+		enabled, ok := record[field].(bool)
+		if !ok {
+			t.Fatalf("expected bool field %q on raw target %#v", field, record)
+		}
+		return enabled
+	}
+	t.Fatalf("missing raw target %q in %#v", command, payload)
+	return false
+}
+
+func readTargetStringArrayContains(t *testing.T, payload any, command string, field string, expected string) bool {
+	t.Helper()
+	for _, raw := range asJSONArray(t, payload) {
+		record, ok := raw.(map[string]any)
+		if !ok {
+			t.Fatalf("expected target record object, got %#v", raw)
+		}
+		value, _ := record["command"].(string)
+		if value != command {
+			continue
+		}
+		items, ok := record[field].([]any)
+		if !ok {
+			t.Fatalf("expected string array field %q on raw target %#v", field, record)
+		}
+		for _, item := range items {
+			text, ok := item.(string)
+			if ok && text == expected {
+				return true
+			}
+		}
+		return false
+	}
+	t.Fatalf("missing raw target %q in %#v", command, payload)
+	return false
 }
 
 func readJSONPathString(t *testing.T, payload any, path ...string) string {

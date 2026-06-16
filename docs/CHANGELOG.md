@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Changed
+- Goal logic is now owned solely by the Rust core: `api-go/internal/workspaceops/goals.go` deletes its duplicated implementation (~326 lines) and becomes a thin delivery shim that validates the workspace and delegates create/list/get/iterate/status/ledger/context to `xmustard-core goal` via `rustcore.RunGoalCommand`. One source of truth instead of two parallel implementations; lifecycle + parity tests run the real Rust binary.
 - `docs/RESEARCH_FINDINGS.md` and `docs/RESEARCH_MATRIX.md` now reflect shipped guidance, eval, verification, vulnerability, and Go/Rust migration work instead of treating those lanes as still missing.
 - `docs/PLANNING.md` now tracks the next strategic lanes more explicitly:
   - threat modeling and security review
@@ -20,8 +21,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - FastAPI no longer registers the integration config/test/sync endpoints, leaving those existing route paths under Go ownership while Python retains only non-request-path compatibility helpers
 
 ### Added
+- Rust goal-runtime CLI (`rust-core/src/goalruntime.rs`, `xmustard-core goal create|list|get|iterate|status|ledger|context|lint`): wire-compatible with the Go shell over the same `goals.json`/iterations/ledger files, with a closed `GoalStatus` enum, atomic temp+fsync+rename writes, `#![forbid(unsafe_code)]`, and an anti-AI-slop linter that refuses empty/refusal content and gates completion on verifiable evidence.
+- `/swarm` scaffold in Rust (`rust-core/src/swarm.rs`, `xmustard-core swarm plan|status|gate|record`): role-tagged reader/builder/critic/verifier lanes plus a deterministic controller gate (`accept | block | narrow | complete`) over goal iterations.
+- Benchmark harness (`xmustard-core bench`) and `docs/BENCHMARKS.md`: reproducible goal/swarm throughput + p50/p99 latency, with peak RSS ~15 MB under bulk load (under the 50 MB runtime budget).
+- `TestGoalRustWireParity` (`api-go`): round-trips a goal through both the Go shell and the Rust CLI in both directions, the safety check for moving goal-logic authority to the Rust core.
 - Research frontier map in `docs/FRONTIER.md`, turning the local research synthesis into current build lanes for retrieval, symbol-aware context, eval timelines, security review depth, policy records, and review packet export.
 - Issue context packets now include a retrieval ledger that explains selected evidence, related paths, symbols, related artifacts, guidance, and path-specific instructions in both Python and Go context builders, with the ledger surfaced in the issue detail UI and prompt.
+- Go-owned project truth now covers the Phase 4 runtime/project-discovery closeout: `xmustard-ops` exposes `project-info`, `run-targets`, `verify-targets`, `verification-outcomes`, `verification-profile-save`, and `verification-profile-run`, with raw target ownership, truth-source, coherence, overlay, freshness, and related-target fields.
+- `project-info` now carries richer runtime/config/service graph truth, including package workspaces, `go.work` groups, Go `cmd/*` entrypoints, Cargo bin entrypoints, compose relationships, Vite proxy edges, and package workspace dependency edges only when backed by manifest/config/entrypoint evidence.
+- Cargo bin run targets now split into distinct service identities, while package-wide Cargo verification stays shared-scope and links back to the proven bin run targets.
 - ADR `docs/plans/2026-04-18-no-python-control-plane-adr.md` locking in the no-Python target architecture: Go control-plane shell, Rust runtime/retrieval/store core, sub-500MB steady-state target, and the three agent surfaces (`works with agents`, `works within agents`, `commands agents`)
 - Rust-owned architecture contract in `rust-core/src/contracts.rs` plus `xmustard-core describe-architecture`
 - Go-served architecture and agent-surface inventory endpoints at `/api/migration/plan`, `/api/migration/agent-surfaces`, and `/api/agent/surfaces`
