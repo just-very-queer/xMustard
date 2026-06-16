@@ -90,18 +90,24 @@ Codex and OpenCode are useful worker runtimes. They can inspect code, propose ed
 
 This separation keeps the runtime replaceable. A goal can be worked manually today, with OpenCode tomorrow, and with Codex later, while the proof trail remains in the workspace.
 
-## Implementations
+## Implementation
 
-The goal contract has two wire-compatible owners over the same
-`goals.json` / `goal_iterations/<id>.json` / `goals/<id>.md` files:
+Goal logic has a **single owner: the Rust core**
+(`rust-core/src/goalruntime.rs`, binary `xmustard-core goal …`) over the
+`goals.json` / `goal_iterations/<id>.json` / `goals/<id>.md` files. It is the
+systems-safe authority: closed `GoalStatus` enum, atomic temp+fsync+rename
+writes, `#![forbid(unsafe_code)]`, and an anti-AI-slop linter (`slop` module)
+that refuses empty/refusal objectives and gates completion on verifiable
+evidence.
 
-- **Go shell** (`api-go/internal/workspaceops/goals.go`) — owns the HTTP routes.
-- **Rust core** (`rust-core/src/goalruntime.rs`, binary `xmustard-core goal …`) —
-  the systems-safe owner: closed `GoalStatus` enum, atomic temp+fsync+rename
-  writes, `#![forbid(unsafe_code)]`, and an anti-AI-slop linter (`slop` module)
-  that refuses empty/refusal objectives and gates completion on verifiable
-  evidence. Wire-parity with the Go shell is enforced by
-  `TestGoalRustWireParity`. Benchmarks live in `docs/BENCHMARKS.md`.
+The Go layer (`api-go/internal/workspaceops/goals.go`) is now a thin **delivery
+shim**: it owns the HTTP routes, request shaping, and workspace validation
+(`loadSnapshot`), then delegates create/list/get/iterate/status/ledger/context
+to the Rust CLI through `rustcore.RunGoalCommand`. The duplicated Go
+implementation was deleted — one source of truth, not two. The
+`GoalRecord`/`GoalEvidence`/request types remain in Go as the wire contract, and
+`TestGoalRustWireParity` plus the lifecycle tests run the real Rust binary.
+Benchmarks live in `docs/BENCHMARKS.md`.
 
 ## `/swarm`
 

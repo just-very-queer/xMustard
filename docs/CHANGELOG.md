@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Changed
+- Goal logic is now owned solely by the Rust core: `api-go/internal/workspaceops/goals.go` deletes its duplicated implementation (~326 lines) and becomes a thin delivery shim that validates the workspace and delegates create/list/get/iterate/status/ledger/context to `xmustard-core goal` via `rustcore.RunGoalCommand`. One source of truth instead of two parallel implementations; lifecycle + parity tests run the real Rust binary.
 - `docs/RESEARCH_FINDINGS.md` and `docs/RESEARCH_MATRIX.md` now reflect shipped guidance, eval, verification, vulnerability, and Go/Rust migration work instead of treating those lanes as still missing.
 - `docs/PLANNING.md` now tracks the next strategic lanes more explicitly:
   - threat modeling and security review
