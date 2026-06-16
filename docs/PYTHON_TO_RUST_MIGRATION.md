@@ -24,7 +24,7 @@ the goal cutover (PR #6): Python/Go logic → Rust core → Go delegates via
 | `postgres.py` | 724 | Go (`api-go`) | DB layer already moving to Go |
 | `main.py` | 1120 | Go (`api-go`) | HTTP surface, route-by-route (mostly migrated) |
 | `cli.py` | 1917 | rust-core CLI + `xmustard-ops` | Subcommand-by-subcommand |
-| `models.py` | 2275 | Rust structs / Go types | Wire contract; ported alongside each module |
+| `models.py` | 2275 | Rust structs | **DONE** → `rust-core/src/models.rs` (176 structs, field-for-field, 68 tests) |
 | `service.py` | 8130 | split | Orchestration; much already shadowed (goals, scanner, repomap, verification, diagnostics, lsp). Split by subsystem, port **last** |
 
 ## Order (smallest/isolated → largest/entangled)
