@@ -760,6 +760,37 @@ fn main() {
         "swarm" => {
             run_swarm_command(args);
         }
+        "semantic-search" => {
+            let Some(root) = args.next() else {
+                eprintln!(
+                    "usage: xmustard-core semantic-search <root> <pattern> [language] [path_glob] [limit]"
+                );
+                std::process::exit(2);
+            };
+            let Some(pattern) = args.next() else {
+                eprintln!(
+                    "usage: xmustard-core semantic-search <root> <pattern> [language] [path_glob] [limit]"
+                );
+                std::process::exit(2);
+            };
+            let language = args.next();
+            let path_glob = args.next();
+            let limit = args
+                .next()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(50);
+            let result = xmustard_core::semantic::run_ast_grep_query(
+                &PathBuf::from(root),
+                &pattern,
+                language.as_deref(),
+                path_glob.as_deref(),
+                limit,
+            );
+            println!(
+                "{}",
+                serde_json::to_string(&result).expect("semantic-search result should serialize")
+            );
+        }
         "bench" => {
             run_bench_command(args);
         }
