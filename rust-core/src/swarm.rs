@@ -391,4 +391,101 @@ mod tests {
         assert_eq!(plan.lanes.len(), 4);
         assert_eq!(plan.status, GoalStatus::Draft.as_str());
     }
+
+    fn make_goal(allowed_surface: &[&str]) -> GoalRecord {
+        GoalRecord {
+            goal_id: "g".to_string(),
+            workspace_id: String::new(),
+            title: "test".to_string(),
+            objective: "test".to_string(),
+            status: GoalStatus::Draft,
+            acceptance_criteria: vec![],
+            current_tranche: String::new(),
+            allowed_surface: allowed_surface.iter().map(|s| s.to_string()).collect(),
+            verification_commands: vec![],
+            verification_profile_ids: vec![],
+            runtime_preference: String::new(),
+            preferred_model: String::new(),
+            resumption_notes: String::new(),
+            evidence: vec![],
+            created_at: String::new(),
+            updated_at: String::new(),
+            completed_at: None,
+        }
+    }
+
+    #[test]
+    fn swarm_gate_edge_cases() {
+        // Case 1: Verifier with note evidence (outcome "success", no command/path/url) -> Accept.
+        // The evidence lacks a real anchor so is_verification returns false, and gate_over
+        // does not reach Complete even though a critic lane has reviewed.
+        {
+            let goal = make_goal(&["rust-core/src"]);
+            let critic = GoalIterationRecord {
+                role: "critic".to_string(),
+                summary: "Reviewed the diff, looks good".to_string(),
+                ..Default::default()
+            };
+            let verifier = GoalIterationRecord {
+                role: "verifier".to_string(),
+                summary: "Ran verification pass".to_string(),
+                evidence: vec![GoalEvidence {
+                    kind: String::new(),
+                    outcome: "success".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let gate = gate_over(&goal, &[critic, verifier]);
+            assert_eq!(
+                gate.decision,
+                SwarmDecision::Accept,
+                "verifier with unverifiable note evidence must NOT reach Complete"
+            );
+            assert!(!gate.ready_to_complete);
+        }
+
+        // Case 2: Builder touching a file exactly matching the allowed_surface prefix.
+        // allowed_surface = ["rust-core/src"], touched = "rust-core/src/swarm.rs".
+        // Since "rust-core/src/swarm.rs".starts_with("rust-core/src/") is true,
+        // this is NOT a surface violation and the decision is NOT Narrow.
+        {
+            let goal = make_goal(&["rust-core/src"]);
+            let builder = GoalIterationRecord {
+                role: "builder".to_string(),
+                summary: "Edited swarm.rs inside allowed surface".to_string(),
+                files_touched: vec!["rust-core/src/swarm.rs".to_string()],
+                ..Default::default()
+            };
+            let gate = gate_over(&goal, &[builder]);
+            assert_ne!(
+                gate.decision,
+                SwarmDecision::Narrow,
+                "builder touching file that matches allowed_surface prefix must NOT trigger Narrow"
+            );
+            assert!(
+                gate.surface_violations.is_empty(),
+                "expected no surface violations for file matching allowed_surface prefix"
+            );
+        }
+
+        // Case 3: Both a failure outcome AND an out-of-surface builder edit.
+        // has_block (failure) is checked before surface_violations, so the decision is Block.
+        {
+            let goal = make_goal(&["rust-core/src"]);
+            let builder = GoalIterationRecord {
+                role: "builder".to_string(),
+                summary: "Tried the patch but got a regression".to_string(),
+                outcome: "failed".to_string(),
+                files_touched: vec!["frontend/src/main.ts".to_string()],
+                ..Default::default()
+            };
+            let gate = gate_over(&goal, &[builder]);
+            assert_eq!(
+                gate.decision,
+                SwarmDecision::Block,
+                "failure outcome must take priority over surface violation -> Block, not Narrow"
+            );
+        }
+    }
 }
