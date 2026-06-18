@@ -857,3 +857,42 @@ h4 {
     grid-template-columns: 1fr;
   }
 }
+
+/* --- Cockpit + Kanban (Surface 3) --- */
+.cockpit { padding: 16px; overflow: auto; }
+.cockpit-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+.cockpit-header h2 { margin: 0; font-size: 18px; }
+.cockpit-actions button { margin-left: 8px; border: 1px solid #1f232b; border-radius: 8px; background: #fff; padding: 4px 10px; cursor: pointer; }
+.cockpit-message { background: #fff8e1; border: 1px solid #e0c66b; border-radius: 8px; padding: 6px 10px; margin-bottom: 10px; }
+.cockpit-drift-banner { background: #fdecea; border: 1px solid #e2554a; color: #8a2018; border-radius: 8px; padding: 8px 12px; margin-bottom: 12px; font-weight: 600; }
+.cockpit-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px; }
+.cockpit-pane { background: #fff; border: 1px solid #d9d6cd; border-radius: 10px; padding: 12px; }
+.cockpit-pane h3 { margin: 0 0 8px; font-size: 13px; text-transform: uppercase; letter-spacing: 0.04em; color: #4b4f57; }
+.cockpit-stats, .cockpit-changes, .cockpit-hotspots { list-style: none; margin: 0; padding: 0; font-size: 13px; }
+.cockpit-stats li, .cockpit-changes li, .cockpit-hotspots li { padding: 2px 0; }
+.cockpit-muted { color: #6b6f76; font-size: 12px; }
+.cockpit-weight { display: inline-block; min-width: 28px; font-weight: 700; color: #1f232b; }
+.change-tag { display: inline-block; min-width: 64px; font-size: 11px; border-radius: 6px; padding: 1px 6px; margin-right: 6px; text-align: center; }
+.change-added { background: #e3f4e3; color: #1d6b1d; }
+.change-modified { background: #fdf2d6; color: #8a6d12; }
+.change-deleted { background: #fdecea; color: #8a2018; }
+.cockpit-blast-input { display: flex; gap: 6px; margin-bottom: 8px; }
+.cockpit-blast-input input { flex: 1; border: 1px solid #c9c6bd; border-radius: 8px; padding: 5px 8px; }
+.cockpit-blast-input button { border: 1px solid #1f232b; background: #1f232b; color: #f7f6f2; border-radius: 8px; padding: 5px 12px; cursor: pointer; }
+
+.kanban { padding: 12px; overflow: auto; }
+.kanban-board { display: flex; gap: 12px; align-items: flex-start; }
+.kanban-column { min-width: 240px; max-width: 280px; background: #ecebe5; border-radius: 10px; padding: 8px; }
+.kanban-column-header { display: flex; justify-content: space-between; align-items: center; font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; color: #4b4f57; padding: 2px 4px 8px; }
+.kanban-column-count { background: #d9d6cd; border-radius: 10px; padding: 0 8px; }
+.kanban-column-body { display: flex; flex-direction: column; gap: 8px; }
+.kanban-card { display: flex; flex-direction: column; gap: 2px; text-align: left; background: #fff; border: 1px solid #d9d6cd; border-left: 3px solid #9aa0a8; border-radius: 8px; padding: 8px; cursor: pointer; }
+.kanban-card:hover { border-color: #1f232b; }
+.kanban-card-severity { font-size: 11px; font-weight: 700; color: #6b6f76; }
+.kanban-card-title { font-size: 13px; }
+.kanban-card-id { font-size: 11px; color: #8a8f97; }
+.kanban-card.severity-p0 { border-left-color: #e2554a; }
+.kanban-card.severity-p1 { border-left-color: #e08a2a; }
+.kanban-card.severity-p2 { border-left-color: #d8c14a; }
+.kanban-card.severity-p3 { border-left-color: #6aa06a; }
+.kanban-empty { color: #9aa0a8; font-size: 12px; text-align: center; padding: 8px; }

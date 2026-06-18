@@ -54,6 +54,8 @@ export function WorkspaceSidebar({
 
       <nav className="nav-cluster">
         {[
+          ['cockpit', 'Cockpit'],
+          ['kanban', 'Kanban'],
           ['issues', 'Issues'],
           ['review', 'Review'],
           ['signals', 'Discovery'],

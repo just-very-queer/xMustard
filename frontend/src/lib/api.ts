@@ -800,3 +800,66 @@ export function readGoalLedger(workspaceId: string, goalId: string) {
 export function readGoalContext(workspaceId: string, goalId: string) {
   return requestText(`/api/workspaces/${workspaceId}/goals/${goalId}/context`)
 }
+
+// --- Cockpit: change state + intelligence (Surface 1.C / 3) ---
+
+export type ChangedFile = { path: string; change: string }
+export type DirtySymbol = { path: string; symbol: string; kind: string; change: string }
+export type ChangeSet = {
+  workspace_id: string
+  since: string
+  changed_files: ChangedFile[]
+  dirty_symbols: DirtySymbol[]
+  generated_at: string
+}
+export type DriftReport = {
+  workspace_id: string
+  has_baseline: boolean
+  stale: boolean
+  head_changed: boolean
+  content_changed: boolean
+  sibling_clone: boolean
+  reasons: string[]
+  current_head?: string | null
+  baseline_head?: string | null
+}
+export type Hotspot = { path: string; inbound_weight: number; dependent_count: number }
+export type BlastRadius = {
+  workspace_id: string
+  symbol: string
+  defined_in: string[]
+  referencing_files: string[]
+  referencing_file_count: number
+}
+export type CockpitDashboard = {
+  workspace_id: string
+  issues_total: number
+  issues_by_severity: Record<string, number>
+  issues_by_status: Record<string, number>
+  needs_followup_count: number
+  avg_quality: number
+  low_quality_count: number
+  review_ready_count: number
+  audit_event_count: number
+}
+
+export function getWorkspaceChanges(workspaceId: string) {
+  return request<ChangeSet>(`/api/workspaces/${workspaceId}/changes`)
+}
+export function getWorkspaceDrift(workspaceId: string) {
+  return request<DriftReport>(`/api/workspaces/${workspaceId}/changes/drift`)
+}
+export function indexWorkspace(workspaceId: string) {
+  return request<unknown>(`/api/workspaces/${workspaceId}/index`, { method: 'POST' })
+}
+export function getWorkspaceHotspots(workspaceId: string, limit = 15) {
+  return request<Hotspot[]>(`/api/workspaces/${workspaceId}/hotspots?limit=${limit}`)
+}
+export function getBlastRadius(workspaceId: string, symbol: string) {
+  return request<BlastRadius>(
+    `/api/workspaces/${workspaceId}/blast-radius?symbol=${encodeURIComponent(symbol)}`,
+  )
+}
+export function getCockpitDashboard(workspaceId: string) {
+  return request<CockpitDashboard>(`/api/workspaces/${workspaceId}/dashboard`)
+}

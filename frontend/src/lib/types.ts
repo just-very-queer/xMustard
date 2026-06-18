@@ -109,7 +109,17 @@ export type IssueQueueFilters = {
   review_ready_only: boolean
 }
 
-export type ViewMode = 'issues' | 'review' | 'signals' | 'runs' | 'sources' | 'drift' | 'tree' | 'activity'
+export type ViewMode =
+  | 'issues'
+  | 'review'
+  | 'signals'
+  | 'runs'
+  | 'sources'
+  | 'drift'
+  | 'tree'
+  | 'activity'
+  | 'cockpit'
+  | 'kanban'
 
 export type SourceRecord = {
   source_id: string

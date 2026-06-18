@@ -91,6 +91,8 @@ import { AgentDock } from './components/AgentDock'
 import { DetailPane } from './components/DetailPane'
 import { ExecutionPane } from './components/ExecutionPane'
 import { QueuePane } from './components/QueuePane'
+import { Cockpit } from './components/Cockpit'
+import { KanbanBoard } from './components/KanbanBoard'
 import type { QueuePreset } from './components/QueuePresetStrip'
 import { WorkspaceSidebar } from './components/WorkspaceSidebar'
 import type {
@@ -2390,6 +2392,11 @@ function App() {
             ) : null}
 
             <section className={`board-grid ${executionOpen ? 'board-grid-with-execution' : 'board-grid-focus'}`}>
+              {activeView === 'cockpit' ? (
+                <Cockpit workspaceId={workspaceId ?? ''} />
+              ) : activeView === 'kanban' ? (
+                <KanbanBoard issues={issueQueue} onSelect={setSelectedIssueId} />
+              ) : (
               <QueuePane
                 activeView={activeView}
                 issueQueue={issueQueue}
@@ -2459,6 +2466,7 @@ function App() {
                 onActivityActorKindFilterChange={setActivityActorKindFilter}
                 onNavigateTree={setTreePath}
               />
+              )}
 
               <DetailPane
                 activeView={activeView}
