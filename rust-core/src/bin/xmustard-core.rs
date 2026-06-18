@@ -821,13 +821,6 @@ fn main() {
                 }
             }
         }
-        "describe-architecture" => {
-            println!(
-                "{}",
-                serde_json::to_string(&xmustard_core::contracts::no_python_architecture_contract())
-                    .expect("architecture contract should serialize")
-            );
-        }
         "goal" => {
             run_goal_command(args);
         }

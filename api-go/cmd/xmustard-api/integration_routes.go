@@ -8,7 +8,6 @@ import (
 	"os"
 	"strings"
 
-	"xmustard/api-go/internal/rustcore"
 	"xmustard/api-go/internal/workspaceops"
 )
 
@@ -157,18 +156,6 @@ func registerIntegrationRoutes(mux *http.ServeMux, dataDir string) {
 	})
 }
 
-func buildAgentSurfacesPayload(contract *rustcore.ArchitectureContract) map[string]any {
-	return map[string]any{
-		"design_version":                 contract.DesignVersion,
-		"control_plane_owner":            contract.ControlPlaneOwner,
-		"core_owner":                     contract.CoreOwner,
-		"python_end_state":               contract.PythonEndState,
-		"steady_state_runtime_budget_mb": contract.SteadyStateRuntimeBudgetMB,
-		"agent_surfaces":                 contract.AgentSurfaces,
-		"next_removable_python_boundary": contract.NextRemovablePythonBoundary,
-		"plugin_manifests":               workspaceops.ListIntegrationManifests(),
-	}
-}
 
 func writeIntegrationError(w http.ResponseWriter, err error) bool {
 	if err == nil {

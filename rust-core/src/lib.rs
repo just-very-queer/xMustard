@@ -7,7 +7,6 @@
 pub mod benchmark;
 pub mod changetrack;
 pub mod models;
-pub mod contracts;
 pub mod diagnostics;
 pub mod goalruntime;
 pub mod lsp;

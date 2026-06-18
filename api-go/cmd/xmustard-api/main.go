@@ -13,22 +13,8 @@ import (
 	"strings"
 	"time"
 
-	"xmustard/api-go/internal/rustcore"
 	"xmustard/api-go/internal/workspaceops"
 )
-
-type verificationRunRequest struct {
-	WorkspaceRoot  string `json:"workspace_root"`
-	Command        string `json:"command"`
-	TimeoutSeconds int    `json:"timeout_seconds"`
-}
-
-type verificationProfileRunRequest struct {
-	WorkspaceRoot string                            `json:"workspace_root"`
-	Profile       rustcore.VerificationProfileInput `json:"profile"`
-	RunID         string                            `json:"run_id"`
-	IssueID       string                            `json:"issue_id"`
-}
 
 func main() {
 	// `xmustard-api mint-token <id> [role]` mints a bearer token (local file access,
@@ -57,174 +43,6 @@ func main() {
 			"status":  "ok",
 			"service": "api-go",
 		})
-	})
-	mux.HandleFunc("/api/migration/scan-signals", func(w http.ResponseWriter, r *http.Request) {
-		rootPath := r.URL.Query().Get("root_path")
-		if rootPath == "" {
-			writeJSON(w, http.StatusBadRequest, map[string]any{
-				"error": "missing root_path query parameter",
-			})
-			return
-		}
-		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
-		defer cancel()
-
-		signals, err := rustcore.ScanSignals(ctx, rootPath)
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{
-				"error": err.Error(),
-			})
-			return
-		}
-		writeJSON(w, http.StatusOK, signals)
-	})
-	mux.HandleFunc("/api/migration/repo-map", func(w http.ResponseWriter, r *http.Request) {
-		rootPath := r.URL.Query().Get("root_path")
-		workspaceID := r.URL.Query().Get("workspace_id")
-		if rootPath == "" || workspaceID == "" {
-			writeJSON(w, http.StatusBadRequest, map[string]any{
-				"error": "missing workspace_id or root_path query parameter",
-			})
-			return
-		}
-		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
-		defer cancel()
-
-		summary, err := rustcore.BuildRepoMap(ctx, workspaceID, rootPath)
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{
-				"error": err.Error(),
-			})
-			return
-		}
-		writeJSON(w, http.StatusOK, summary)
-	})
-	mux.HandleFunc("/api/migration/coverage/lcov", func(w http.ResponseWriter, r *http.Request) {
-		reportPath := r.URL.Query().Get("report_path")
-		workspaceID := r.URL.Query().Get("workspace_id")
-		runID := r.URL.Query().Get("run_id")
-		issueID := r.URL.Query().Get("issue_id")
-		if reportPath == "" || workspaceID == "" {
-			writeJSON(w, http.StatusBadRequest, map[string]any{
-				"error": "missing workspace_id or report_path query parameter",
-			})
-			return
-		}
-		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
-		defer cancel()
-
-		result, err := rustcore.ParseLCOVCoverage(ctx, workspaceID, reportPath, runID, issueID)
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{
-				"error": err.Error(),
-			})
-			return
-		}
-		writeJSON(w, http.StatusOK, result)
-	})
-	mux.HandleFunc("/api/migration/coverage", func(w http.ResponseWriter, r *http.Request) {
-		reportPath := r.URL.Query().Get("report_path")
-		workspaceID := r.URL.Query().Get("workspace_id")
-		runID := r.URL.Query().Get("run_id")
-		issueID := r.URL.Query().Get("issue_id")
-		if reportPath == "" || workspaceID == "" {
-			writeJSON(w, http.StatusBadRequest, map[string]any{
-				"error": "missing workspace_id or report_path query parameter",
-			})
-			return
-		}
-		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
-		defer cancel()
-
-		result, err := rustcore.ParseCoverage(ctx, workspaceID, reportPath, runID, issueID)
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{
-				"error": err.Error(),
-			})
-			return
-		}
-		writeJSON(w, http.StatusOK, result)
-	})
-	mux.HandleFunc("/api/migration/verification/run", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{
-				"error": "method not allowed",
-			})
-			return
-		}
-
-		var request verificationRunRequest
-		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]any{
-				"error": "invalid JSON body",
-			})
-			return
-		}
-		if request.WorkspaceRoot == "" || request.Command == "" {
-			writeJSON(w, http.StatusBadRequest, map[string]any{
-				"error": "missing workspace_root or command",
-			})
-			return
-		}
-		if request.TimeoutSeconds < 1 {
-			request.TimeoutSeconds = 30
-		}
-
-		ctx, cancel := context.WithTimeout(r.Context(), time.Duration(request.TimeoutSeconds+5)*time.Second)
-		defer cancel()
-
-		result, err := rustcore.RunVerificationCommand(ctx, request.WorkspaceRoot, request.TimeoutSeconds, request.Command)
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{
-				"error": err.Error(),
-			})
-			return
-		}
-		writeJSON(w, http.StatusOK, result)
-	})
-	mux.HandleFunc("/api/migration/verification/profile-run", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{
-				"error": "method not allowed",
-			})
-			return
-		}
-
-		var request verificationProfileRunRequest
-		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]any{
-				"error": "invalid JSON body",
-			})
-			return
-		}
-		if request.WorkspaceRoot == "" || request.Profile.ProfileID == "" || request.Profile.WorkspaceID == "" || request.Profile.TestCommand == "" {
-			writeJSON(w, http.StatusBadRequest, map[string]any{
-				"error": "missing workspace_root or required profile fields",
-			})
-			return
-		}
-
-		timeoutSeconds := request.Profile.MaxRuntimeSeconds
-		if timeoutSeconds < 1 {
-			timeoutSeconds = 30
-		}
-		ctx, cancel := context.WithTimeout(r.Context(), time.Duration(timeoutSeconds+5)*time.Second)
-		defer cancel()
-
-		result, err := rustcore.RunVerificationProfile(
-			ctx,
-			request.WorkspaceRoot,
-			request.Profile,
-			request.RunID,
-			request.IssueID,
-		)
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{
-				"error": err.Error(),
-			})
-			return
-		}
-		writeJSON(w, http.StatusOK, result)
 	})
 	mux.HandleFunc("GET /api/runtimes", func(w http.ResponseWriter, r *http.Request) {
 		result, err := workspaceops.DetectRuntimes(
@@ -512,19 +330,6 @@ func main() {
 			return
 		}
 		writeJSON(w, http.StatusOK, result)
-	})
-	mux.HandleFunc("GET /api/agent/surfaces", func(w http.ResponseWriter, r *http.Request) {
-		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
-		defer cancel()
-
-		contract, err := rustcore.ReadArchitectureContract(ctx)
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{
-				"error": err.Error(),
-			})
-			return
-		}
-		writeJSON(w, http.StatusOK, buildAgentSurfacesPayload(contract))
 	})
 	mux.HandleFunc("POST /api/workspaces/{workspace_id}/agent/probe", func(w http.ResponseWriter, r *http.Request) {
 		workspaceID := r.PathValue("workspace_id")
