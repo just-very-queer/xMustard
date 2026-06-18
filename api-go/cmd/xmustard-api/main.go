@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -31,6 +32,26 @@ type verificationProfileRunRequest struct {
 }
 
 func main() {
+	// `xmustard-api mint-token <id> [role]` mints a bearer token (local file access,
+	// no server needed) — the bootstrap path for the first admin token.
+	if len(os.Args) > 1 && os.Args[1] == "mint-token" {
+		if len(os.Args) < 3 {
+			fmt.Fprintln(os.Stderr, "usage: xmustard-api mint-token <id> [admin|agent|readonly]")
+			os.Exit(2)
+		}
+		role := "agent"
+		if len(os.Args) > 3 {
+			role = os.Args[3]
+		}
+		raw, err := workspaceops.MintToken(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), os.Args[2], role)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		fmt.Println(raw)
+		return
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{
@@ -262,6 +283,9 @@ func main() {
 		writeJSON(w, http.StatusOK, result)
 	})
 	mux.HandleFunc("POST /api/settings", func(w http.ResponseWriter, r *http.Request) {
+		if !requireRole(w, r, "admin") {
+			return
+		}
 		var request workspaceops.AppSettings
 		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]any{
@@ -281,8 +305,55 @@ func main() {
 		}
 		writeJSON(w, http.StatusOK, result)
 	})
-	// --- OpenAI-compatible providers (Ollama / vLLM / LM Studio / OpenAI / VLM) ---
 	dataDir := func() string { return envDefault("XMUSTARD_DATA_DIR", "../backend/data") }
+	// --- auth: token admin (admin-gated) + whoami ---
+	mux.HandleFunc("GET /api/auth/whoami", func(w http.ResponseWriter, r *http.Request) {
+		if p := principalFromContext(r.Context()); p != nil {
+			writeJSON(w, http.StatusOK, p)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"id": "", "role": "anonymous"})
+	})
+	mux.HandleFunc("GET /api/auth/principals", func(w http.ResponseWriter, r *http.Request) {
+		if !requireRole(w, r, "admin") {
+			return
+		}
+		writeJSON(w, http.StatusOK, workspaceops.ListPrincipals(dataDir()))
+	})
+	mux.HandleFunc("POST /api/auth/tokens", func(w http.ResponseWriter, r *http.Request) {
+		if !requireRole(w, r, "admin") {
+			return
+		}
+		var req struct {
+			ID   string `json:"id"`
+			Role string `json:"role"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON body"})
+			return
+		}
+		raw, err := workspaceops.MintToken(dataDir(), req.ID, req.Role)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"id": req.ID, "token": raw, "note": "store this now; it is not recoverable"})
+	})
+	mux.HandleFunc("DELETE /api/auth/tokens/{id}", func(w http.ResponseWriter, r *http.Request) {
+		if !requireRole(w, r, "admin") {
+			return
+		}
+		if err := workspaceops.RevokeToken(dataDir(), r.PathValue("id")); err != nil {
+			status := http.StatusInternalServerError
+			if errors.Is(err, os.ErrNotExist) {
+				status = http.StatusNotFound
+			}
+			writeJSON(w, status, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"revoked": r.PathValue("id")})
+	})
+	// --- OpenAI-compatible providers (Ollama / vLLM / LM Studio / OpenAI / VLM) ---
 	respond := func(w http.ResponseWriter, err error, result any) {
 		if err != nil {
 			status := http.StatusInternalServerError
@@ -303,6 +374,9 @@ func main() {
 		writeJSON(w, http.StatusOK, result)
 	})
 	mux.HandleFunc("POST /api/providers", func(w http.ResponseWriter, r *http.Request) {
+		if !requireRole(w, r, "admin") {
+			return
+		}
 		var req workspaceops.OpenAIProvider
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON body"})
@@ -316,6 +390,9 @@ func main() {
 		writeJSON(w, http.StatusOK, result)
 	})
 	mux.HandleFunc("DELETE /api/providers/{name}", func(w http.ResponseWriter, r *http.Request) {
+		if !requireRole(w, r, "admin") {
+			return
+		}
 		if err := workspaceops.RemoveOpenAIProvider(dataDir(), r.PathValue("name")); err != nil {
 			status := http.StatusInternalServerError
 			if errors.Is(err, os.ErrNotExist) {
@@ -381,6 +458,9 @@ func main() {
 		respond(w, err, result)
 	})
 	mux.HandleFunc("POST /api/routes", func(w http.ResponseWriter, r *http.Request) {
+		if !requireRole(w, r, "admin") {
+			return
+		}
 		var rule workspaceops.RoutingRule
 		if err := json.NewDecoder(r.Body).Decode(&rule); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON body"})
@@ -3464,6 +3544,13 @@ func main() {
 		if req.Permission == "" {
 			req.Permission = q.Get("permission")
 		}
+		// attribute to the authenticated principal; open-mode callers collapse to one
+		// "anonymous" identity (so the author can't also masquerade as a verifier).
+		if p := principalFromContext(r.Context()); p != nil {
+			req.Source = p.ID
+		} else {
+			req.Source = "anonymous"
+		}
 		result, err := workspaceops.ProposeContext(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), req)
 		issueIntel(w, err, result)
 	})
@@ -3483,6 +3570,15 @@ func main() {
 		}
 		if req.Note == "" {
 			req.Note = q.Get("note")
+		}
+		// The agent identity is the AUTHENTICATED principal, never a caller-asserted
+		// string. In open mode (no auth configured) all unauthenticated callers
+		// collapse to a single "anonymous" identity, so N fabricated agent names
+		// cannot satisfy the multi-agent gate.
+		if p := principalFromContext(r.Context()); p != nil {
+			req.Agent = p.ID
+		} else {
+			req.Agent = "anonymous"
 		}
 		result, err := workspaceops.VerifyContext(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), r.PathValue("entry_id"), req.Agent, req.Approve, req.Note)
 		issueIntel(w, err, result)
@@ -3807,13 +3903,102 @@ func main() {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 	})
 
-	// Bind to loopback by default — the API has no auth layer and makes
-	// server-side requests (providers), so it should not be exposed on all
-	// interfaces unless the operator explicitly opts in via XMUSTARD_API_HOST=0.0.0.0.
+	// Bind to loopback by default. The API makes server-side requests (providers),
+	// so it should not be exposed on all interfaces unless the operator opts in via
+	// XMUSTARD_API_HOST=0.0.0.0 — and if they do, auth tokens must be configured.
 	host := envDefault("XMUSTARD_API_HOST", "127.0.0.1")
+	authMode := strings.ToLower(envDefault("XMUSTARD_AUTH", "auto"))
+	isLoopback := host == "127.0.0.1" || host == "localhost" || host == "::1"
+	tlsCert, tlsKey := os.Getenv("XMUSTARD_API_TLS_CERT"), os.Getenv("XMUSTARD_API_TLS_KEY")
+	hasTLS := tlsCert != "" && tlsKey != ""
+	allowInsecureBind := os.Getenv("XMUSTARD_ALLOW_INSECURE_BIND") == "1"
+	// Fail-closed on a non-loopback bind: it requires real auth AND transport
+	// security. XMUSTARD_AUTH=off no longer satisfies this interlock — disabling
+	// auth and exposing the interface are now separate, deliberate decisions.
+	if !isLoopback {
+		if authMode != "required" && !workspaceops.HasAuthConfigured(dataDir()) {
+			log.Fatal("refusing non-loopback bind without auth; run `xmustard-api mint-token <id> admin` or set XMUSTARD_AUTH=required")
+		}
+		if !hasTLS && !allowInsecureBind {
+			log.Fatal("refusing non-loopback bind without TLS; set XMUSTARD_API_TLS_CERT/KEY, or XMUSTARD_ALLOW_INSECURE_BIND=1 if TLS is terminated by a front proxy")
+		}
+	}
+	var handler http.Handler = mux
+	if authMode != "off" {
+		handler = authMiddleware(dataDir(), authMode, mux)
+		if authMode == "required" || workspaceops.HasAuthConfigured(dataDir()) {
+			log.Printf("auth: ENFORCED (mode=%s, bearer token required)", authMode)
+		} else {
+			log.Printf("auth: open — no tokens configured (mode=%s); unauthenticated callers collapse to one identity. Mint a token to enforce.", authMode)
+		}
+	} else {
+		log.Printf("auth: DISABLED (XMUSTARD_AUTH=off)")
+	}
 	addr := host + ":" + envDefault("XMUSTARD_API_PORT", "8080")
-	log.Printf("xmustard api-go listening on %s", addr)
-	log.Fatal(http.ListenAndServe(addr, mux))
+	log.Printf("xmustard api-go listening on %s (tls=%v)", addr, hasTLS)
+	if hasTLS {
+		log.Fatal(http.ListenAndServeTLS(addr, tlsCert, tlsKey, handler))
+	} else {
+		log.Fatal(http.ListenAndServe(addr, handler))
+	}
+}
+
+// --- auth middleware + principal helpers ---
+
+type ctxKey string
+
+const principalCtxKey ctxKey = "principal"
+
+func principalFromContext(ctx context.Context) *workspaceops.Principal {
+	p, _ := ctx.Value(principalCtxKey).(*workspaceops.Principal)
+	return p
+}
+
+// requireRole enforces a role for an endpoint. In open mode (no auth configured)
+// it allows the operation locally; once auth is configured the middleware has
+// already rejected unauthenticated requests.
+func requireRole(w http.ResponseWriter, r *http.Request, role string) bool {
+	p := principalFromContext(r.Context())
+	if p == nil {
+		if !workspaceops.HasAuthConfigured(envDefault("XMUSTARD_DATA_DIR", "../backend/data")) {
+			return true
+		}
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "authentication required"})
+		return false
+	}
+	if role == "admin" && p.Role != "admin" {
+		writeJSON(w, http.StatusForbidden, map[string]any{"error": "admin role required"})
+		return false
+	}
+	return true
+}
+
+func authMiddleware(dataDir, mode string, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/health" { // health stays public for liveness probes
+			next.ServeHTTP(w, r)
+			return
+		}
+		var principal *workspaceops.Principal
+		if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
+			principal = workspaceops.ResolveToken(dataDir, strings.TrimPrefix(h, "Bearer "))
+		}
+		enforce := mode == "required" || workspaceops.HasAuthConfigured(dataDir)
+		if enforce && principal == nil {
+			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "authentication required: provide Authorization: Bearer <token>"})
+			return
+		}
+		// readonly principals may only read.
+		if principal != nil && principal.Role == "readonly" && r.Method != http.MethodGet {
+			writeJSON(w, http.StatusForbidden, map[string]any{"error": "readonly principal cannot " + r.Method})
+			return
+		}
+		if principal == nil {
+			next.ServeHTTP(w, r)
+			return
+		}
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), principalCtxKey, principal)))
+	})
 }
 
 func envDefault(name string, fallback string) string {

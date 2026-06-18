@@ -98,7 +98,9 @@ func contextDefaults(dataDir string) (bool, int) {
 }
 
 // distinctApprovals counts unique agents that approved (latest verdict per agent).
-func distinctApprovals(verifications []ContextVerification) (approvals, rejections int) {
+// excludeAgent, when non-empty, drops that agent's vote from the tally — used to
+// stop a proposer from self-approving toward a multi-agent threshold.
+func distinctApprovals(verifications []ContextVerification, excludeAgent string) (approvals, rejections int) {
 	latest := map[string]bool{}
 	for _, v := range verifications {
 		agent := strings.TrimSpace(v.Agent)
@@ -107,7 +109,10 @@ func distinctApprovals(verifications []ContextVerification) (approvals, rejectio
 		}
 		latest[agent] = v.Approve
 	}
-	for _, approve := range latest {
+	for agent, approve := range latest {
+		if excludeAgent != "" && strings.EqualFold(agent, excludeAgent) {
+			continue // author's own vote does not count toward a multi-agent gate
+		}
 		if approve {
 			approvals++
 		} else {
@@ -119,7 +124,14 @@ func distinctApprovals(verifications []ContextVerification) (approvals, rejectio
 
 // promote/demote an entry based on its verifications vs its threshold.
 func reconcileEntry(entry *ContextEntry) {
-	approvals, rejections := distinctApprovals(entry.Verifications)
+	// In multi-agent mode (threshold > 1) the author cannot count as one of the
+	// required verifiers; single-agent mode (threshold 1) is the operator opting
+	// out, so the proposer's self-assertion is allowed to promote.
+	exclude := ""
+	if entry.RequiredVerifications > 1 {
+		exclude = entry.Source
+	}
+	approvals, rejections := distinctApprovals(entry.Verifications, exclude)
 	switch {
 	case rejections >= entry.RequiredVerifications && rejections > 0:
 		entry.Status = "rejected"

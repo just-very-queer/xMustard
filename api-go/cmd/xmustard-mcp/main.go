@@ -201,6 +201,12 @@ func callAPI(method, path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	// Each agent runs its own xmustard-mcp; XMUSTARD_API_TOKEN is that agent's
+	// bearer token, so the API resolves a real per-agent identity (and the
+	// multi-agent verification gate counts distinct authenticated principals).
+	if tok := strings.TrimSpace(os.Getenv("XMUSTARD_API_TOKEN")); tok != "" {
+		req.Header.Set("Authorization", "Bearer "+tok)
+	}
 	resp, err := httpClient().Do(req)
 	if err != nil {
 		return "", fmt.Errorf("xmustard API unreachable at %s (%w)", apiBase(), err)

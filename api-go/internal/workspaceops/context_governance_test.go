@@ -145,6 +145,25 @@ func TestContextRejectsPathTraversalID(t *testing.T) {
 	}
 }
 
+func TestProposerCannotSelfApproveMultiAgent(t *testing.T) {
+	dir := t.TempDir()
+	ws := "wsSelf"
+	require := true
+	writeTestSettings(t, dir, appSettings{RequireMultiAgentVerification: &require, ContextVerificationThreshold: 2})
+	e, _ := ProposeContext(dir, ws, ProposeContextRequest{Content: "x", Source: "author"})
+	// author verifies its OWN entry + one other agent — author must not count
+	VerifyContext(dir, ws, e.ID, "author", true, "")
+	got, _ := VerifyContext(dir, ws, e.ID, "other", true, "")
+	if got.Promoted {
+		t.Fatalf("author self-approval must not count toward a 2-distinct gate; got promoted with author+1")
+	}
+	// a second NON-author approval promotes
+	got2, _ := VerifyContext(dir, ws, e.ID, "other2", true, "")
+	if !got2.Promoted {
+		t.Fatalf("two non-author approvals should promote")
+	}
+}
+
 func TestRejectionBlocksPromotion(t *testing.T) {
 	dir := t.TempDir()
 	ws := "ws4"
