@@ -45,6 +45,10 @@ type appSettings struct {
 	OpencodeModel  *string `json:"opencode_model"`
 	PostgresDSN    *string `json:"postgres_dsn"`
 	PostgresSchema string  `json:"postgres_schema"`
+	// Context-governance: whether shared-context entries must be verified by
+	// multiple agents before promotion, and how many distinct approvals are needed.
+	RequireMultiAgentVerification *bool `json:"require_multi_agent_verification,omitempty"`
+	ContextVerificationThreshold  int   `json:"context_verification_threshold,omitempty"`
 }
 
 type PlanApproveRequest struct {

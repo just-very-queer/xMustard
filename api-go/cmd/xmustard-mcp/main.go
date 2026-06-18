@@ -90,6 +90,35 @@ func tools() []tool {
 			func(a map[string]string) (string, string) {
 				return "GET", wsPath(a, "/lsp/document-symbols") + "?path=" + url.QueryEscape(a["path"])
 			}},
+		{"context_active", "The trusted shared context: entries promoted after multi-agent verification (read-only view an agent should ground on).", []string{"workspace_id"},
+			func(a map[string]string) (string, string) { return "GET", wsPath(a, "/context/active") }},
+		{"context_propose", "Propose a context entry for the shared context (pending until verified by enough agents). Pass content; optional title/source.", []string{"workspace_id", "content"},
+			func(a map[string]string) (string, string) {
+				p := wsPath(a, "/context") + "?content=" + url.QueryEscape(a["content"])
+				if a["title"] != "" {
+					p += "&title=" + url.QueryEscape(a["title"])
+				}
+				if a["source"] != "" {
+					p += "&source=" + url.QueryEscape(a["source"])
+				}
+				return "POST", p
+			}},
+		{"context_verify", "Verify (approve/reject) a proposed context entry as an agent; promotes it once the multi-agent threshold is met.", []string{"workspace_id", "entry_id", "agent"},
+			func(a map[string]string) (string, string) {
+				approve := "true"
+				if a["approve"] == "false" {
+					approve = "false"
+				}
+				return "POST", wsPath(a, "/context/"+url.PathEscape(a["entry_id"])+"/verify") + "?agent=" + url.QueryEscape(a["agent"]) + "&approve=" + approve
+			}},
+		{"provider_chat", "Call an OpenAI-compatible provider (Ollama/vLLM/LM Studio/OpenAI) by name with a prompt; optional model. For local/private model access.", []string{"provider", "prompt"},
+			func(a map[string]string) (string, string) {
+				p := "/api/providers/" + url.PathEscape(a["provider"]) + "/chat?prompt=" + url.QueryEscape(a["prompt"])
+				if a["model"] != "" {
+					p += "&model=" + url.QueryEscape(a["model"])
+				}
+				return "POST", p
+			}},
 		{"search_repo", "Hybrid lexical+structural search over the repo's symbols and files.", []string{"workspace_id", "query"},
 			func(a map[string]string) (string, string) {
 				return "GET", wsPath(a, "/search") + "?q=" + url.QueryEscape(a["query"])

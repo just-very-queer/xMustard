@@ -281,6 +281,72 @@ func main() {
 		}
 		writeJSON(w, http.StatusOK, result)
 	})
+	// --- OpenAI-compatible providers (Ollama / vLLM / LM Studio / OpenAI / VLM) ---
+	dataDir := func() string { return envDefault("XMUSTARD_DATA_DIR", "../backend/data") }
+	respond := func(w http.ResponseWriter, err error, result any) {
+		if err != nil {
+			status := http.StatusInternalServerError
+			if errors.Is(err, os.ErrNotExist) {
+				status = http.StatusNotFound
+			}
+			writeJSON(w, status, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	}
+	mux.HandleFunc("GET /api/providers", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.ListOpenAIProviders(dataDir())
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	})
+	mux.HandleFunc("POST /api/providers", func(w http.ResponseWriter, r *http.Request) {
+		var req workspaceops.OpenAIProvider
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON body"})
+			return
+		}
+		result, err := workspaceops.AddOpenAIProvider(dataDir(), req)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	})
+	mux.HandleFunc("DELETE /api/providers/{name}", func(w http.ResponseWriter, r *http.Request) {
+		if err := workspaceops.RemoveOpenAIProvider(dataDir(), r.PathValue("name")); err != nil {
+			status := http.StatusInternalServerError
+			if errors.Is(err, os.ErrNotExist) {
+				status = http.StatusNotFound
+			}
+			writeJSON(w, status, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"removed": r.PathValue("name")})
+	})
+	mux.HandleFunc("GET /api/providers/{name}/models", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.ListProviderModels(dataDir(), r.PathValue("name"))
+		respond(w, err, result)
+	})
+	mux.HandleFunc("POST /api/providers/{name}/probe", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.ProbeOpenAIProvider(dataDir(), r.PathValue("name"))
+		respond(w, err, result)
+	})
+	mux.HandleFunc("POST /api/providers/{name}/chat", func(w http.ResponseWriter, r *http.Request) {
+		var req workspaceops.ChatRequest
+		_ = json.NewDecoder(r.Body).Decode(&req) // body optional; query params support the MCP bridge
+		q := r.URL.Query()
+		if req.Prompt == "" {
+			req.Prompt = q.Get("prompt")
+		}
+		if req.Model == "" {
+			req.Model = q.Get("model")
+		}
+		result, err := workspaceops.OpenAIChat(dataDir(), r.PathValue("name"), req)
+		respond(w, err, result)
+	})
 	mux.HandleFunc("GET /api/postgres/plan", func(w http.ResponseWriter, r *http.Request) {
 		result, err := workspaceops.GetPostgresSchemaPlan(
 			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
@@ -3329,6 +3395,65 @@ func main() {
 			return
 		}
 		result, err := workspaceops.LiveDocumentSymbols(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), path)
+		issueIntel(w, err, result)
+	})
+	// --- context governance: propose / verify / active shared context ---
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/context", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.ListContextEntries(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), r.URL.Query().Get("filter"))
+		issueIntel(w, err, result)
+	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/context/active", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.GetActiveContext(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))
+		issueIntel(w, err, result)
+	})
+	mux.HandleFunc("POST /api/workspaces/{workspace_id}/context", func(w http.ResponseWriter, r *http.Request) {
+		var req workspaceops.ProposeContextRequest
+		_ = json.NewDecoder(r.Body).Decode(&req) // body optional; query params are the MCP-bridge path
+		q := r.URL.Query()
+		if req.Content == "" {
+			req.Content = q.Get("content")
+		}
+		if req.Title == "" {
+			req.Title = q.Get("title")
+		}
+		if req.Source == "" {
+			req.Source = q.Get("source")
+		}
+		if req.Permission == "" {
+			req.Permission = q.Get("permission")
+		}
+		result, err := workspaceops.ProposeContext(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), req)
+		issueIntel(w, err, result)
+	})
+	mux.HandleFunc("POST /api/workspaces/{workspace_id}/context/{entry_id}/verify", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Agent   string `json:"agent"`
+			Approve bool   `json:"approve"`
+			Note    string `json:"note"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req) // body optional; query params are the MCP-bridge path
+		q := r.URL.Query()
+		if req.Agent == "" {
+			req.Agent = q.Get("agent")
+		}
+		if q.Has("approve") {
+			req.Approve = q.Get("approve") != "false"
+		}
+		if req.Note == "" {
+			req.Note = q.Get("note")
+		}
+		result, err := workspaceops.VerifyContext(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), r.PathValue("entry_id"), req.Agent, req.Approve, req.Note)
+		issueIntel(w, err, result)
+	})
+	mux.HandleFunc("PUT /api/workspaces/{workspace_id}/context/{entry_id}", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Content string `json:"content"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON body"})
+			return
+		}
+		result, err := workspaceops.UpdateContextContent(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), r.PathValue("entry_id"), req.Content)
 		issueIntel(w, err, result)
 	})
 	mux.HandleFunc("GET /api/workspaces/{workspace_id}/hotspots", func(w http.ResponseWriter, r *http.Request) {

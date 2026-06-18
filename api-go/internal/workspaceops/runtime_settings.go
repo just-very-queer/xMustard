@@ -33,6 +33,9 @@ type AppSettings struct {
 	OpencodeModel  *string `json:"opencode_model,omitempty"`
 	PostgresDSN    *string `json:"postgres_dsn,omitempty"`
 	PostgresSchema string  `json:"postgres_schema"`
+
+	RequireMultiAgentVerification *bool `json:"require_multi_agent_verification,omitempty"`
+	ContextVerificationThreshold  int   `json:"context_verification_threshold,omitempty"`
 }
 
 type LocalAgentCapabilities struct {
@@ -93,6 +96,9 @@ func GetSettings(dataDir string) (*AppSettings, error) {
 		OpencodeModel:  settings.OpencodeModel,
 		PostgresDSN:    settings.PostgresDSN,
 		PostgresSchema: settings.PostgresSchema,
+
+		RequireMultiAgentVerification: settings.RequireMultiAgentVerification,
+		ContextVerificationThreshold:  settings.ContextVerificationThreshold,
 	}, nil
 }
 
@@ -106,6 +112,9 @@ func UpdateSettings(dataDir string, settings AppSettings) (*AppSettings, error) 
 		OpencodeModel:  trimOptional(settings.OpencodeModel),
 		PostgresDSN:    trimOptional(settings.PostgresDSN),
 		PostgresSchema: fallbackString(strings.TrimSpace(settings.PostgresSchema), "xmustard"),
+
+		RequireMultiAgentVerification: settings.RequireMultiAgentVerification,
+		ContextVerificationThreshold:  settings.ContextVerificationThreshold,
 	}
 	if err := writeJSON(filepath.Join(dataDir, "settings.json"), next); err != nil {
 		return nil, err
