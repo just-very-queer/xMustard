@@ -127,6 +127,30 @@ func tools() []tool {
 				}
 				return "POST", p
 			}},
+		{"run_confidence", "Confidence score + signals for a run (did it likely succeed): tests, diffs, verification.", []string{"workspace_id", "run_id"},
+			func(a map[string]string) (string, string) {
+				return "GET", wsPath(a, "/runs/"+url.PathEscape(a["run_id"])+"/confidence")
+			}},
+		{"run_brief", "Concise brief for a run: what it did, status, key artifacts — the agent handoff summary.", []string{"workspace_id", "run_id"},
+			func(a map[string]string) (string, string) {
+				return "GET", wsPath(a, "/runs/"+url.PathEscape(a["run_id"])+"/brief")
+			}},
+		{"review_packet", "Grounded review packet for an issue: changes, evidence, verification, checklists for a reviewer.", []string{"workspace_id", "issue_id"},
+			func(a map[string]string) (string, string) {
+				return "GET", wsPath(a, "/issues/"+url.PathEscape(a["issue_id"])+"/review-packet")
+			}},
+		{"owner_suggestions", "Suggested owners/reviewers for an issue (from code ownership + history).", []string{"workspace_id", "issue_id"},
+			func(a map[string]string) (string, string) {
+				return "GET", wsPath(a, "/issues/"+url.PathEscape(a["issue_id"])+"/owner-suggestions")
+			}},
+		{"ownership_history", "Ownership history for an issue: who has touched the implicated code over time.", []string{"workspace_id", "issue_id"},
+			func(a map[string]string) (string, string) {
+				return "GET", wsPath(a, "/issues/"+url.PathEscape(a["issue_id"])+"/ownership-history")
+			}},
+		{"eval_timeline", "Multi-batch evaluation timeline for the workspace: scenario movement across replay batches.", []string{"workspace_id"},
+			func(a map[string]string) (string, string) { return "GET", wsPath(a, "/eval-timeline") }},
+		{"agent_identities", "The persistent agent-identity registry: which runtimes/models have acted in this workspace.", []string{"workspace_id"},
+			func(a map[string]string) (string, string) { return "GET", wsPath(a, "/agents") }},
 		{"search_repo", "Hybrid lexical+structural search over the repo's symbols and files.", []string{"workspace_id", "query"},
 			func(a map[string]string) (string, string) {
 				return "GET", wsPath(a, "/search") + "?q=" + url.QueryEscape(a["query"])
