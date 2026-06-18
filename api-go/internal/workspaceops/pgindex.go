@@ -171,7 +171,12 @@ type PostgresSearchHit struct {
 	Score float64 `json:"score"`
 }
 
-// SearchPostgres runs hybrid FTS (ts_rank) + structural (inbound-edge boost) search.
+// SearchPostgres runs hybrid search over the Postgres index, fusing an FTS
+// (ts_rank) lane and a structural (inbound-edge weight) lane with Reciprocal
+// Rank Fusion — the same RRF the in-process search.rs uses, at scale. Each lane
+// ranks the FTS matches independently; the fused score sums 1/(k+rank) over the
+// lanes, so a symbol that both matches the text and lives in a hotspot file
+// outranks one that only matches the text.
 func SearchPostgres(dataDir, workspaceID, query string, limit int) (map[string]any, error) {
 	if limit <= 0 {
 		limit = 25
@@ -184,16 +189,28 @@ func SearchPostgres(dataDir, workspaceID, query string, limit int) (map[string]a
 	}
 	defer conn.Close(ctx)
 
-	// hybrid: FTS rank on the symbol doc + a small boost for symbols in
-	// high-inbound-edge (hotspot) files.
+	// RRF (k=60): rank the FTS matches by ts_rank (lexical lane) and by inbound
+	// edge count (structural lane), then fuse by reciprocal rank.
 	rows, err := conn.Query(ctx, `
-		select s.kind, s.name, s.path,
-		       ts_rank(s.doc, websearch_to_tsquery('simple', $2))
-		         + coalesce((select least(count(*)::float / 50.0, 1.0) from xm_edges e
-		                     where e.workspace_id = s.workspace_id and e.to_path = s.path), 0) as score
-		from xm_symbols s
-		where s.workspace_id = $1 and s.doc @@ websearch_to_tsquery('simple', $2)
-		order by score desc, s.name
+		with matched as (
+		    select s.kind, s.name, s.path,
+		           ts_rank(s.doc, websearch_to_tsquery('simple', $2)) as lex,
+		           coalesce((select count(*) from xm_edges e
+		                     where e.workspace_id = s.workspace_id and e.to_path = s.path), 0) as inbound
+		    from xm_symbols s
+		    where s.workspace_id = $1 and s.doc @@ websearch_to_tsquery('simple', $2)
+		),
+		ranked as (
+		    select kind, name, path, inbound,
+		           rank() over (order by lex desc) as lex_rank,
+		           rank() over (order by inbound desc) as struct_rank
+		    from matched
+		)
+		select kind, name, path,
+		       (1.0 / (60 + lex_rank)
+		        + case when inbound > 0 then 1.0 / (60 + struct_rank) else 0 end) as score
+		from ranked
+		order by score desc, name
 		limit $3`, workspaceID, query, limit)
 	if err != nil {
 		return nil, fmt.Errorf("pg search: %w", err)
