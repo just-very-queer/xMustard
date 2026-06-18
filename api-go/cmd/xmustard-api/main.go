@@ -3683,6 +3683,21 @@ func main() {
 		result, err := workspaceops.SearchIssuesPostgres(r.PathValue("workspace_id"), query, limit)
 		issueIntel(w, err, result)
 	})
+	// --- verification outcomes materialized into Postgres (codex track C1) ---
+	mux.HandleFunc("POST /api/workspaces/{workspace_id}/pg/verifications/materialize", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.MaterializeVerificationsPostgres(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))
+		issueIntel(w, err, result)
+	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/pg/verifications", func(w http.ResponseWriter, r *http.Request) {
+		limit := 50
+		if v := r.URL.Query().Get("limit"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil {
+				limit = n
+			}
+		}
+		result, err := workspaceops.ListVerificationsPostgres(r.PathValue("workspace_id"), r.URL.Query().Get("status"), limit)
+		issueIntel(w, err, result)
+	})
 	// --- ownership, incorporation lineage, session grounding ---
 	mux.HandleFunc("GET /api/workspaces/{workspace_id}/subsystems", func(w http.ResponseWriter, r *http.Request) {
 		result, err := workspaceops.WorkspaceSubsystems(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))
