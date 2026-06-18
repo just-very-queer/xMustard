@@ -76,6 +76,14 @@ func tools() []tool {
 			func(a map[string]string) (string, string) {
 				return "GET", wsPath(a, "/explain-path") + "?path=" + url.QueryEscape(a["path"])
 			}},
+		{"hotspots", "Most-depended-on files (risky to touch) from the symbol graph.", []string{"workspace_id"},
+			func(a map[string]string) (string, string) { return "GET", wsPath(a, "/hotspots") }},
+		{"blast_radius", "What files reference a symbol — the blast radius of changing it.", []string{"workspace_id", "symbol"},
+			func(a map[string]string) (string, string) {
+				return "GET", wsPath(a, "/blast-radius") + "?symbol=" + url.QueryEscape(a["symbol"])
+			}},
+		{"symbol_graph", "The full semantic symbol graph: files, symbols, and reference edges.", []string{"workspace_id"},
+			func(a map[string]string) (string, string) { return "GET", wsPath(a, "/symbol-graph") }},
 	}
 }
 

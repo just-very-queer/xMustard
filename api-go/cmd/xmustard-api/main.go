@@ -3313,6 +3313,30 @@ func main() {
 		result, err := workspaceops.WorkspaceWorkingChanges(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))
 		issueIntel(w, err, result)
 	})
+	// --- semantic symbol graph (intelligence) ---
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/symbol-graph", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.WorkspaceSymbolGraph(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))
+		issueIntel(w, err, result)
+	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/hotspots", func(w http.ResponseWriter, r *http.Request) {
+		limit := 20
+		if v := r.URL.Query().Get("limit"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil {
+				limit = n
+			}
+		}
+		result, err := workspaceops.WorkspaceHotspots(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), limit)
+		issueIntel(w, err, result)
+	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/blast-radius", func(w http.ResponseWriter, r *http.Request) {
+		symbol := r.URL.Query().Get("symbol")
+		if symbol == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "symbol query param required"})
+			return
+		}
+		result, err := workspaceops.SymbolBlastRadius(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), symbol)
+		issueIntel(w, err, result)
+	})
 	// --- run confidence, owner suggestions, ownership, eval timeline, ticket ingest, guidance customization ---
 	mux.HandleFunc("GET /api/workspaces/{workspace_id}/runs/{run_id}/confidence", func(w http.ResponseWriter, r *http.Request) {
 		result, err := workspaceops.ScoreRunConfidence(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), r.PathValue("run_id"))

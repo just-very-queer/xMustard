@@ -797,6 +797,9 @@ fn main() {
         "changetrack" => {
             run_changetrack_command(args);
         }
+        "symbolgraph" => {
+            run_symbolgraph_command(args);
+        }
         _ => {
             eprintln!("unknown command: {command}");
             std::process::exit(2);
@@ -1169,6 +1172,59 @@ fn run_changetrack_command(mut args: impl Iterator<Item = String>) {
         }
         other => {
             eprintln!("unknown changetrack subcommand: {other}");
+            std::process::exit(2);
+        }
+    }
+}
+
+/// `symbolgraph <build|hotspots|blast-radius> ...` — the semantic symbol graph.
+fn run_symbolgraph_command(mut args: impl Iterator<Item = String>) {
+    use xmustard_core::symbolgraph as sg;
+
+    fn need(value: Option<String>, usage: &str) -> String {
+        match value {
+            Some(value) => value,
+            None => {
+                eprintln!("usage: {usage}");
+                std::process::exit(2);
+            }
+        }
+    }
+    fn print_json<T: serde::Serialize>(value: &T) {
+        println!(
+            "{}",
+            serde_json::to_string(value).expect("symbolgraph result should serialize")
+        );
+    }
+
+    let Some(sub) = args.next() else {
+        eprintln!("usage: xmustard-core symbolgraph <build|hotspots|blast-radius> ...");
+        std::process::exit(2);
+    };
+    match sub.as_str() {
+        "build" => {
+            let usage = "xmustard-core symbolgraph build <root> <workspace_id>";
+            let root = need(args.next(), usage);
+            let ws = need(args.next(), usage);
+            print_json(&sg::build_symbol_graph(Path::new(&root), &ws));
+        }
+        "hotspots" => {
+            let usage = "xmustard-core symbolgraph hotspots <root> <workspace_id> [limit]";
+            let root = need(args.next(), usage);
+            let ws = need(args.next(), usage);
+            let limit = args.next().and_then(|v| v.parse::<usize>().ok()).unwrap_or(20);
+            let graph = sg::build_symbol_graph(Path::new(&root), &ws);
+            print_json(&sg::compute_hotspots(&graph, limit));
+        }
+        "blast-radius" => {
+            let usage = "xmustard-core symbolgraph blast-radius <root> <workspace_id> <symbol>";
+            let root = need(args.next(), usage);
+            let ws = need(args.next(), usage);
+            let symbol = need(args.next(), usage);
+            print_json(&sg::blast_radius(Path::new(&root), &ws, &symbol));
+        }
+        other => {
+            eprintln!("unknown symbolgraph subcommand: {other}");
             std::process::exit(2);
         }
     }

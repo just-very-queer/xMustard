@@ -14,5 +14,6 @@ pub mod lsp;
 pub mod repomap;
 pub mod scanner;
 pub mod semantic;
+pub mod symbolgraph;
 pub mod swarm;
 pub mod verification;
