@@ -56,6 +56,176 @@ fn word_set(content: &str) -> HashSet<String> {
         .collect()
 }
 
+/// A symbol definition: where it lives and what kind it is.
+#[derive(Debug, Clone)]
+struct SymbolDef {
+    path: String,
+    kind: String,
+}
+
+/// Test files reference code under test; they get "tests" edges, not "calls".
+fn is_test_file(path: &str) -> bool {
+    let lower = path.to_lowercase();
+    lower.ends_with("_test.go")
+        || lower.ends_with("_test.rs")
+        || lower.ends_with("_test.py")
+        || lower.ends_with(".test.ts")
+        || lower.ends_with(".test.tsx")
+        || lower.ends_with(".test.js")
+        || lower.ends_with(".test.jsx")
+        || lower.ends_with(".spec.ts")
+        || lower.ends_with(".spec.tsx")
+        || lower.ends_with(".spec.js")
+        || lower.starts_with("test_")
+        || lower.contains("/test_")
+        || lower.contains("/tests/")
+        || lower.contains("/__tests__/")
+        || lower.starts_with("tests/")
+        || lower.starts_with("test/")
+}
+
+/// Identifiers that appear on import/use lines — candidates for "imports" edges.
+fn import_candidates(content: &str) -> HashSet<String> {
+    let mut out = HashSet::new();
+    for raw in content.lines() {
+        let line = raw.trim_start();
+        let is_import = line.starts_with("use ")
+            || line.starts_with("import ")
+            || line.starts_with("from ")
+            || line.starts_with("pub use ")
+            || line.starts_with("const ") && line.contains("require(")
+            || line.contains(" require(");
+        if !is_import {
+            continue;
+        }
+        for tok in line.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
+            if tok.len() >= MIN_NAME_LEN {
+                out.insert(tok.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Relative module specifiers (./x, ../y) on import lines — resolved to repo files.
+fn relative_import_specs(content: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for raw in content.lines() {
+        let line = raw.trim_start();
+        if !(line.starts_with("import ")
+            || line.starts_with("export ")
+            || line.contains("require(")
+            || line.starts_with("from "))
+        {
+            continue;
+        }
+        // pull quoted specifiers that look relative
+        for quote in ['\'', '"'] {
+            let mut rest = line;
+            while let Some(start) = rest.find(quote) {
+                let after = &rest[start + 1..];
+                if let Some(end) = after.find(quote) {
+                    let spec = &after[..end];
+                    if spec.starts_with("./") || spec.starts_with("../") {
+                        out.push(spec.to_string());
+                    }
+                    rest = &after[end + 1..];
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Resolve a relative import spec (from `from_path`) to a tracked file path.
+fn resolve_relative_import(from_path: &str, spec: &str, tracked: &HashSet<String>) -> Option<String> {
+    let from_dir = Path::new(from_path).parent().unwrap_or_else(|| Path::new(""));
+    let mut joined = from_dir.to_path_buf();
+    for part in spec.split('/') {
+        match part {
+            "." | "" => {}
+            ".." => {
+                joined.pop();
+            }
+            other => joined.push(other),
+        }
+    }
+    let base = joined.to_string_lossy().replace('\\', "/");
+    let candidates = [
+        base.clone(),
+        format!("{base}.ts"),
+        format!("{base}.tsx"),
+        format!("{base}.js"),
+        format!("{base}.jsx"),
+        format!("{base}/index.ts"),
+        format!("{base}/index.tsx"),
+        format!("{base}/index.js"),
+    ];
+    candidates.into_iter().find(|c| tracked.contains(c))
+}
+
+/// Supertype names declared on inheritance lines — candidates for "inherits" edges.
+/// Covers `extends`/`implements` (TS/JS/Java/PHP), `impl Trait for` (Rust),
+/// and `class X(Base)` (Python).
+fn inheritance_candidates(content: &str) -> HashSet<String> {
+    let mut out = HashSet::new();
+    for raw in content.lines() {
+        let line = raw.trim();
+        // TS/JS/Java: ... extends A implements B, C ...
+        for kw in ["extends ", "implements "] {
+            if let Some(idx) = line.find(kw) {
+                let tail = &line[idx + kw.len()..];
+                for tok in tail.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
+                    if tok.len() >= MIN_NAME_LEN {
+                        out.insert(tok.to_string());
+                    }
+                    // stop at the block start
+                    if tail.starts_with('{') {
+                        break;
+                    }
+                }
+            }
+        }
+        // Rust: impl Trait for Type  -> Trait is the supertype
+        if line.starts_with("impl ")
+            && let Some(for_idx) = line.find(" for ")
+        {
+            let trait_part = &line["impl ".len()..for_idx];
+            for tok in trait_part.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
+                if tok.len() >= MIN_NAME_LEN {
+                    out.insert(tok.to_string());
+                }
+            }
+        }
+        // Python: class X(Base1, Base2):
+        if line.starts_with("class ")
+            && let (Some(open), Some(close)) = (line.find('('), line.find(')'))
+            && close > open
+        {
+            let bases = &line[open + 1..close];
+            for tok in bases.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
+                if tok.len() >= MIN_NAME_LEN {
+                    out.insert(tok.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Classify a code-level reference edge from `from_path` to a symbol of `def_kind`.
+fn reference_edge_kind(from_path: &str, def_kind: &str) -> &'static str {
+    if is_test_file(from_path) {
+        "tests"
+    } else if def_kind == "function" || def_kind == "method" {
+        "calls"
+    } else {
+        "references"
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GraphFileNode {
     pub path: String,
@@ -74,7 +244,7 @@ pub struct GraphSymbolNode {
 pub struct GraphEdge {
     pub from_path: String,
     pub to_path: String,
-    pub kind: String, // "references"
+    pub kind: String, // "imports" | "calls" | "inherits" | "tests" | "references"
     pub weight: usize,
     pub via_symbols: Vec<String>,
 }
@@ -94,10 +264,11 @@ pub struct SymbolGraph {
 /// Build the symbol graph over tracked source files.
 pub fn build_symbol_graph(root: &Path, workspace_id: &str) -> SymbolGraph {
     let files = tracked_source_files(root);
+    let tracked: HashSet<String> = files.iter().cloned().collect();
     let mut file_nodes = Vec::new();
     let mut symbols = Vec::new();
-    // name -> defining path (first definer wins); only distinctive names anchor edges.
-    let mut name_to_def: HashMap<String, String> = HashMap::new();
+    // name -> definition (first definer wins); only distinctive names anchor edges.
+    let mut name_to_def: HashMap<String, SymbolDef> = HashMap::new();
     let mut content_cache: BTreeMap<String, String> = BTreeMap::new();
 
     for rel in &files {
@@ -115,42 +286,87 @@ pub fn build_symbol_graph(root: &Path, workspace_id: &str) -> SymbolGraph {
             });
             let lname = s.symbol.to_lowercase();
             if s.symbol.len() >= MIN_NAME_LEN && !STOPWORD_SYMBOLS.contains(&lname.as_str()) {
-                name_to_def.entry(s.symbol.clone()).or_insert_with(|| rel.clone());
+                name_to_def
+                    .entry(s.symbol.clone())
+                    .or_insert_with(|| SymbolDef { path: rel.clone(), kind: s.kind.clone() });
             }
         }
         content_cache.insert(rel.clone(), content);
     }
 
-    // reference edges: a file that contains a symbol defined in a different file.
-    let mut agg: HashMap<(String, String), (usize, BTreeSet<String>)> = HashMap::new();
+    // Typed edges, aggregated by (from, to, kind): a symbol that is imported AND
+    // called yields both an "imports" and a "calls" edge (distinct relationships).
+    let mut agg: HashMap<(String, String, &'static str), (usize, BTreeSet<String>)> = HashMap::new();
+    let add_edge =
+        |from: &str, to: &str, kind: &'static str, via: &str, agg: &mut HashMap<_, _>| {
+            if from == to {
+                return;
+            }
+            let entry: &mut (usize, BTreeSet<String>) = agg
+                .entry((from.to_string(), to.to_string(), kind))
+                .or_insert((0, BTreeSet::new()));
+            entry.0 += 1;
+            if entry.1.len() < 8 {
+                entry.1.insert(via.to_string());
+            }
+        };
+
     for (path, content) in &content_cache {
+        let imports = import_candidates(content);
+        let inherits = inheritance_candidates(content);
+        // Resolved relative-path imports (TS/JS) — file-level "imports" edges.
+        for spec in relative_import_specs(content) {
+            if let Some(target) = resolve_relative_import(path, &spec, &tracked) {
+                add_edge(path, &target, "imports", &spec, &mut agg);
+            }
+        }
+        // Inheritance: extends/implements/impl-for/class(Base) → "inherits".
+        for name in &inherits {
+            if let Some(def) = name_to_def.get(name) {
+                if &def.path != path {
+                    add_edge(path, &def.path, "inherits", name, &mut agg);
+                }
+            }
+        }
+        // Symbol-level imports: an import/use line naming a symbol defined elsewhere.
+        for name in &imports {
+            if let Some(def) = name_to_def.get(name) {
+                if &def.path != path {
+                    add_edge(path, &def.path, "imports", name, &mut agg);
+                }
+            }
+        }
+        // References across the file body → calls / tests / references (by def kind).
         let words = word_set(content);
         for word in &words {
-            if let Some(def_path) = name_to_def.get(word) {
-                if def_path == path {
+            if inherits.contains(word) {
+                continue; // already captured as a typed inheritance edge
+            }
+            if let Some(def) = name_to_def.get(word) {
+                if &def.path == path {
                     continue;
                 }
-                let entry = agg
-                    .entry((path.clone(), def_path.clone()))
-                    .or_insert((0, BTreeSet::new()));
-                entry.0 += 1;
-                if entry.1.len() < 8 {
-                    entry.1.insert(word.clone());
-                }
+                let kind = reference_edge_kind(path, &def.kind);
+                add_edge(path, &def.path, kind, word, &mut agg);
             }
         }
     }
     let mut edges: Vec<GraphEdge> = agg
         .into_iter()
-        .map(|((from, to), (weight, via))| GraphEdge {
+        .map(|((from, to, kind), (weight, via))| GraphEdge {
             from_path: from,
             to_path: to,
-            kind: "references".to_string(),
+            kind: kind.to_string(),
             weight,
             via_symbols: via.into_iter().collect(),
         })
         .collect();
-    edges.sort_by(|a, b| b.weight.cmp(&a.weight).then(a.from_path.cmp(&b.from_path)));
+    edges.sort_by(|a, b| {
+        b.weight
+            .cmp(&a.weight)
+            .then(a.from_path.cmp(&b.from_path))
+            .then(a.kind.cmp(&b.kind))
+    });
 
     SymbolGraph {
         workspace_id: workspace_id.to_string(),
@@ -172,16 +388,24 @@ pub struct Hotspot {
 }
 
 /// Most-depended-on files (high inbound reference weight) — risky to touch.
+/// `dependent_count` is the number of distinct files that depend on the target,
+/// regardless of how many typed edges connect them.
 pub fn compute_hotspots(graph: &SymbolGraph, limit: usize) -> Vec<Hotspot> {
-    let mut inbound: HashMap<String, (usize, usize)> = HashMap::new();
+    let mut inbound_weight: HashMap<String, usize> = HashMap::new();
+    let mut dependents: HashMap<String, BTreeSet<String>> = HashMap::new();
     for e in &graph.edges {
-        let entry = inbound.entry(e.to_path.clone()).or_insert((0, 0));
-        entry.0 += e.weight;
-        entry.1 += 1;
+        *inbound_weight.entry(e.to_path.clone()).or_insert(0) += e.weight;
+        dependents
+            .entry(e.to_path.clone())
+            .or_default()
+            .insert(e.from_path.clone());
     }
-    let mut out: Vec<Hotspot> = inbound
+    let mut out: Vec<Hotspot> = inbound_weight
         .into_iter()
-        .map(|(path, (w, d))| Hotspot { path, inbound_weight: w, dependent_count: d })
+        .map(|(path, w)| {
+            let d = dependents.get(&path).map(BTreeSet::len).unwrap_or(0);
+            Hotspot { path, inbound_weight: w, dependent_count: d }
+        })
         .collect();
     out.sort_by(|a, b| b.inbound_weight.cmp(&a.inbound_weight).then(a.path.cmp(&b.path)));
     out.truncate(limit);
@@ -267,6 +491,30 @@ mod tests {
         let hot = compute_hotspots(&graph, 5);
         assert_eq!(hot[0].path, "lib.rs", "lib.rs should be the top hotspot: {hot:?}");
         assert!(hot[0].dependent_count >= 2);
+    }
+
+    #[test]
+    fn graph_classifies_edge_kinds() {
+        let repo = git_repo(&[
+            ("core.rs", "pub fn compute_widget() -> i32 { 1 }\npub trait Renderable {}\n"),
+            ("user.rs", "use crate::core::compute_widget;\nfn run() { let _ = compute_widget(); }\n"),
+            ("impl.rs", "struct Panel {}\nimpl Renderable for Panel {}\n"),
+            ("core_test.rs", "fn check() { let _ = compute_widget(); }\n"),
+        ]);
+        let graph = build_symbol_graph(repo.path(), "ws");
+        let has = |from: &str, to: &str, kind: &str| {
+            graph
+                .edges
+                .iter()
+                .any(|e| e.from_path == from && e.to_path == to && e.kind == kind)
+        };
+        // user.rs imports + calls compute_widget from core.rs
+        assert!(has("user.rs", "core.rs", "imports"), "imports edge: {:?}", graph.edges);
+        assert!(has("user.rs", "core.rs", "calls"), "calls edge: {:?}", graph.edges);
+        // impl.rs implements the Renderable trait defined in core.rs
+        assert!(has("impl.rs", "core.rs", "inherits"), "inherits edge: {:?}", graph.edges);
+        // core_test.rs is a test file referencing code under test
+        assert!(has("core_test.rs", "core.rs", "tests"), "tests edge: {:?}", graph.edges);
     }
 
     #[test]

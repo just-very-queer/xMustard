@@ -82,8 +82,10 @@ func tools() []tool {
 			func(a map[string]string) (string, string) {
 				return "GET", wsPath(a, "/blast-radius") + "?symbol=" + url.QueryEscape(a["symbol"])
 			}},
-		{"symbol_graph", "The full semantic symbol graph: files, symbols, and reference edges.", []string{"workspace_id"},
+		{"symbol_graph", "The full semantic symbol graph: files, symbols, and typed edges (imports/calls/inherits/tests/references).", []string{"workspace_id"},
 			func(a map[string]string) (string, string) { return "GET", wsPath(a, "/symbol-graph") }},
+		{"issue_symbol_edges", "Typed issue↔symbol edges: which issues mention or have evidence pointing at which defined symbols.", []string{"workspace_id"},
+			func(a map[string]string) (string, string) { return "GET", wsPath(a, "/issue-symbol-edges") }},
 		{"search_repo", "Hybrid lexical+structural search over the repo's symbols and files.", []string{"workspace_id", "query"},
 			func(a map[string]string) (string, string) {
 				return "GET", wsPath(a, "/search") + "?q=" + url.QueryEscape(a["query"])

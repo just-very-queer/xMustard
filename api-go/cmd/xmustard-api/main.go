@@ -3318,6 +3318,10 @@ func main() {
 		result, err := workspaceops.WorkspaceSymbolGraph(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))
 		issueIntel(w, err, result)
 	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/issue-symbol-edges", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.IssueSymbolEdges(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))
+		issueIntel(w, err, result)
+	})
 	mux.HandleFunc("GET /api/workspaces/{workspace_id}/hotspots", func(w http.ResponseWriter, r *http.Request) {
 		limit := 20
 		if v := r.URL.Query().Get("limit"); v != "" {
