@@ -3292,6 +3292,27 @@ func main() {
 		result, err := workspaceops.BuildWorkspaceDashboard(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))
 		issueIntel(w, err, result)
 	})
+	// --- change state (gitnexus-style change tracking) ---
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/fingerprint", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.WorkspaceFingerprint(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))
+		issueIntel(w, err, result)
+	})
+	mux.HandleFunc("POST /api/workspaces/{workspace_id}/index", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.IndexWorkspace(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))
+		issueIntel(w, err, result)
+	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/changes/drift", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.WorkspaceDrift(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))
+		issueIntel(w, err, result)
+	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/changes/since-index", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.WorkspaceChangesSinceIndex(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))
+		issueIntel(w, err, result)
+	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/changes", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.WorkspaceWorkingChanges(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))
+		issueIntel(w, err, result)
+	})
 	// --- run confidence, owner suggestions, ownership, eval timeline, ticket ingest, guidance customization ---
 	mux.HandleFunc("GET /api/workspaces/{workspace_id}/runs/{run_id}/confidence", func(w http.ResponseWriter, r *http.Request) {
 		result, err := workspaceops.ScoreRunConfidence(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), r.PathValue("run_id"))
