@@ -11,6 +11,7 @@ pub mod contracts;
 pub mod diagnostics;
 pub mod goalruntime;
 pub mod lsp;
+pub mod ownership;
 pub mod repomap;
 pub mod scanner;
 pub mod search;
