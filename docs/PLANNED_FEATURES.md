@@ -3,10 +3,14 @@
 Consolidated from `REPO_COCKPIT_TOOL_ARCHITECTURE.md`, `GITNEXUS_EXTRACTION_MAP.md`,
 `PLANNING.md`, `FRONTIER.md`, `MIGRATION_RUST_GO.md`. Status is grounded in what is
 actually implemented (verified June 2026). As of this pass all three surfaces are
-built and verified end-to-end: the tool (semantic core incl. tree-sitter, change
-tracking, ownership), the MCP context engine (23 tools), the web cockpit/kanban, and
-a Postgres-backed semantic index with FTS hybrid search. Remaining items are depth
-upgrades (full typed graph edges, embeddings/RRF, LSP live sessions, ops-tables-to-Postgres).
+built and verified end-to-end: the tool (semantic core incl. tree-sitter, **typed
+graph edges**, **live LSP sessions**, change tracking, ownership), the MCP context
+engine (27 tools), the web cockpit/kanban, and a Postgres store holding both the
+semantic index and the ops layer with **RRF hybrid search + a model-free embedding
+lane**. The four depth upgrades — typed graph edges, embeddings/RRF fusion, LSP
+live sessions, ops-tables→Postgres — are now done. Remaining work is finer depth
+(neural embeddings, graph-proximity retrieval, persistent LSP sessions with
+impl/type/rename, making Postgres the write path for run_plans/verification_*).
 
 The product is **not** a tracker. It is a **repo cockpit + runtime memory engine**
 with three delivery surfaces over a shared semantic + operational core:
@@ -49,16 +53,16 @@ Legend: ✅ built · 🟡 partial/foundation · ⬜ planned (little/no code)
 - ✅ Structural repo map; 🟡 symbol-aware code maps (tree-sitter backed) + ⬜ enclosing-scope context
 - ✅ tree-sitter symbol extraction (`rust-core/treesitter.rs`, primary engine for Rust/Go/TS/TSX/JS/JSX; regex fallback) — feeds path-symbols, the symbol graph, ownership edges, and the Postgres index
 - ✅ **ast-grep semantic pattern search** (`rust-core/semantic.rs`)
-- 🟡 LSP layer (`rust-core/lsp.rs` normalizes definitions/references/document+workspace symbols/diagnostics) — needs live session mgmt + hover/impl/type/rename
+- ✅ LSP **live sessions** (`rust-core/lsp_session.rs`: spawns rust-analyzer/gopls/typescript-language-server/clangd, runs the initialize/didOpen handshake over stdio JSON-RPC, returns documentSymbol/hover; normalized via `lsp.rs`; graceful when a server isn't installed). `/lsp/document-symbols` + MCP `lsp_document_symbols`; verified live (tsserver, clangd). ⬜ impl/type/rename + persistent (non-per-request) sessions
 - 🟡 Impact analysis (`rust-core` semantic-impact: changed symbols → callers/tests); ⬜ contract-break detection
 - 🟡 Code/subsystem explainers (`rust-core` explain-path); ⬜ "why a failure happened"
-- 🟡 Semantic repo graph (`rust-core/symbolgraph.rs`: files/symbols/reference edges + hotspots + blast radius, tree-sitter backed); ⬜ full callees/imports/inheritance/tests↔code/issue↔symbol edges
+- ✅ Semantic repo graph (`rust-core/symbolgraph.rs`: files/symbols + **typed edges** imports/calls/inherits/tests/references, tree-sitter backed, + hotspots + blast radius; `issue_symbol_edges.go` adds issue↔symbol mentions/evidence edges via MCP `issue_symbol_edges`). Verified live: calls 820 / refs 466 / tests 420 / imports 107. ⬜ deeper data/control-flow edges
 - ✅ Session grounding (`grounding.go` BuildSessionGrounding + MCP `session_grounding` + cockpit banner: changed/dirty-symbols/failed-runs, blocked-by-dirty/failing flags)
 - ✅ Ownership & subsystem model (`rust-core/ownership.rs`: subsystem clusters + cohesion, likely owners from git history, blast radius; surfaced in cockpit + MCP `subsystems`/`owners`)
 
 ### D. Knowledge layer (storage + retrieval — PARTIAL)
-- 🟡 **PostgreSQL as primary store** — semantic index (`xm_files`/`xm_symbols`/`xm_edges`) is materialized + searched live via `workspaceops/pgindex.go` (`/pg/materialize`, `/pg/search`; verified 183 files / 2101 symbols / 1532 edges). ⬜ ops tables (activity_events/run_records/run_plans/verification_*/issue_artifacts) still JSON files.
-- 🟡 Hybrid search: ✅ BM25-style FTS (`to_tsvector`/`websearch_to_tsquery`/`ts_rank`) + structural (edge-count boost) live in Postgres, plus in-memory lexical+structural (`rust-core/search.rs`); ⬜ graph-proximity + embeddings + RRF fusion planned
+- ✅ **PostgreSQL store** — semantic index (`xm_files`/`xm_symbols`/`xm_edges`, `pgindex.go`) AND the ops layer (`xm_runs`/`xm_activity`/`xm_issues`, `pgops.go`: `/pg/ops/materialize`, `/pg/runs`, `/pg/issues/search`, MCP `pg_runs`/`pg_issue_search`) are materialized + queried in Postgres. JSON remains the durable write source; PG is the queryable index. ⬜ make PG the write path (run_plans/verification_* still JSON-only)
+- ✅ Hybrid search with **Reciprocal Rank Fusion**: in-process `rust-core/search.rs` fuses lexical (BM25 idf) + semantic (model-free hashing-trick embedding, char-trigram fuzzy) + structural lanes; Postgres `SearchPostgres` fuses ts_rank + inbound-edge lanes via window-function RRF. ⬜ graph-proximity lane + neural embeddings
 - ✅ Wiki generation (`rust-core/wiki.rs` generate_wiki: overview + per-subsystem pages from the symbol graph; MCP `wiki`); ⬜ incremental/review-first refinement
 
 ### E. Runtime + project discovery
@@ -69,7 +73,7 @@ Legend: ✅ built · 🟡 partial/foundation · ⬜ planned (little/no code)
 ## Surface 2 — MCP context engine (cross-agent memory)
 
 The "better than markdown" shared memory layer. **BUILT — MCP stdio server live.**
-- ✅ **MCP server** (`api-go/cmd/xmustard-mcp`, stdio JSON-RPC 2.0 bridging to the HTTP API) exposing 23 typed tools: `repo_state`, `repo_summary`, `changed_since`, `drift`, `definitions`, `diagnostics`, `impact`, `run_targets`, `verify_targets`, `issue_context_packet`, `recent_failures`, `code_explainer`, `subsystem_explainer`, `hotspots`, `blast_radius`, `symbol_graph`, `search_repo`, `wiki`, `session_grounding`, `subsystems`, `owners`, `lineage`, `pg_search` (all verified end-to-end live)
+- ✅ **MCP server** (`api-go/cmd/xmustard-mcp`, stdio JSON-RPC 2.0 bridging to the HTTP API) exposing 27 typed tools: `repo_state`, `repo_summary`, `changed_since`, `drift`, `definitions`, `diagnostics`, `impact`, `run_targets`, `verify_targets`, `issue_context_packet`, `recent_failures`, `code_explainer`, `subsystem_explainer`, `hotspots`, `blast_radius`, `symbol_graph`, `issue_symbol_edges`, `search_repo`, `wiki`, `session_grounding`, `subsystems`, `owners`, `lineage`, `pg_search`, `pg_runs`, `pg_issue_search`, `lsp_document_symbols` (all verified end-to-end live)
 - ✅ One backend serving CLI + HTTP + **MCP** from the same contracts (CLI = `xmustard-ops`/`xmustard-core`; HTTP = `api-go`; MCP = `xmustard-mcp` over the same REST surface) — the third delivery is now built
 - ✅ Durable cross-agent memory store (goal/swarm runtime + operational memory) exposed over MCP; `session_grounding` provides the agent "re-check on reconnect" signal
 - ✅ User preferences from markdown (`.xmustard.yaml` path instructions, `AGENTS.md`/microagent guidance discovery + health + starter generation)
@@ -90,7 +94,7 @@ The "better than markdown" shared memory layer. **BUILT — MCP stdio server liv
 - ✅ File/symbol fingerprinting + full per-change hashing + incorporation lineage (`rust-core/changetrack.rs`: RepoFingerprint, IndexBaseline, IncorporationEvent append-only chain; `/incorporate` + `/lineage`; verified live: 317 events recorded, lineage replayable)
 - ✅ Change intelligence: changed-since-baseline + working-tree changes with **dirty symbols, not only dirty files** (`changetrack.rs` working_tree_changes / changed_since_baseline; `/changes`, MCP `changed_since`)
 - ✅ Index baseline: stored indexed head SHA + repo fingerprint; **stale-index + sibling-clone drift** surfaced in `/changes/drift`, session-grounding, and the cockpit banner (verified live: stale=true detection)
-- 🟡 Ingestion pipeline *phases* (repo scan → manifest/runtime → ✅ tree-sitter → ✅ ast-grep → 🟡 LSP → ✅ search materialization → ✅ change/impact materialization) — stages built; explicit orchestrated phase graph still needed
+- 🟡 Ingestion pipeline *phases* (repo scan → manifest/runtime → ✅ tree-sitter → ✅ ast-grep → ✅ LSP live → ✅ search materialization → ✅ change/impact materialization) — stages built; explicit orchestrated phase graph still needed
 - 🟡 Shared contract layer across Python/Go/Rust/MCP (`rust-core/contracts.rs`); ✅ Python backend retired → Go (api-go) + Rust (rust-core)
 
 ---
