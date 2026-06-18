@@ -3322,6 +3322,15 @@ func main() {
 		result, err := workspaceops.IssueSymbolEdges(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))
 		issueIntel(w, err, result)
 	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/lsp/document-symbols", func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Query().Get("path")
+		if path == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "path query param required"})
+			return
+		}
+		result, err := workspaceops.LiveDocumentSymbols(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), path)
+		issueIntel(w, err, result)
+	})
 	mux.HandleFunc("GET /api/workspaces/{workspace_id}/hotspots", func(w http.ResponseWriter, r *http.Request) {
 		limit := 20
 		if v := r.URL.Query().Get("limit"); v != "" {

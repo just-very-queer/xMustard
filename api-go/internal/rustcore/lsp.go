@@ -335,3 +335,17 @@ func NormalizeLSPWorkspaceSymbols(
 	}
 	return &result, nil
 }
+
+// RunLspDocumentSymbols runs a LIVE textDocument/documentSymbol session:
+// rust-core spawns the real language server, does the handshake, and returns the
+// normalized symbols. Servers that aren't installed degrade gracefully (the
+// binary prints {"available": false, ...} and exits 0). Uses the fast release
+// binary path (runCore), not `cargo run`.
+func RunLspDocumentSymbols(args ...string) ([]byte, error) {
+	return runCore("lsp-document-symbols", args...)
+}
+
+// RunLspHover runs a LIVE textDocument/hover session.
+func RunLspHover(args ...string) ([]byte, error) {
+	return runCore("lsp-hover", args...)
+}

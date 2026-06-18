@@ -507,6 +507,80 @@ fn main() {
                 }
             }
         }
+        "lsp-document-symbols" => {
+            let usage = "xmustard-core lsp-document-symbols <workspace_id> <root_path> <relative_path> [timeout_secs]";
+            let Some(workspace_id) = args.next() else {
+                eprintln!("usage: {usage}");
+                std::process::exit(2);
+            };
+            let Some(root) = args.next() else {
+                eprintln!("usage: {usage}");
+                std::process::exit(2);
+            };
+            let Some(relative_path) = args.next() else {
+                eprintln!("usage: {usage}");
+                std::process::exit(2);
+            };
+            let timeout = args.next().and_then(|v| v.parse::<u64>().ok()).unwrap_or(45);
+            match xmustard_core::lsp_session::live_document_symbols(
+                &workspace_id,
+                &PathBuf::from(root),
+                &relative_path,
+                timeout,
+            ) {
+                Ok(result) => println!(
+                    "{}",
+                    serde_json::to_string(&result).expect("lsp document-symbols should serialize")
+                ),
+                Err(xmustard_core::lsp_session::LspSessionError::Unavailable(msg)) => {
+                    // graceful degradation (like ast-grep): not installed -> 200 with reason
+                    println!(
+                        "{}",
+                        serde_json::json!({"available": false, "reason": msg, "symbols": []})
+                    );
+                }
+                Err(err) => {
+                    eprintln!("lsp-document-symbols failed: {err}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        "lsp-hover" => {
+            let usage = "xmustard-core lsp-hover <root_path> <relative_path> <line> <character> [timeout_secs]";
+            let Some(root) = args.next() else {
+                eprintln!("usage: {usage}");
+                std::process::exit(2);
+            };
+            let Some(relative_path) = args.next() else {
+                eprintln!("usage: {usage}");
+                std::process::exit(2);
+            };
+            let line = args.next().and_then(|v| v.parse::<u32>().ok());
+            let character = args.next().and_then(|v| v.parse::<u32>().ok());
+            let (Some(line), Some(character)) = (line, character) else {
+                eprintln!("usage: {usage}");
+                std::process::exit(2);
+            };
+            let timeout = args.next().and_then(|v| v.parse::<u64>().ok()).unwrap_or(45);
+            match xmustard_core::lsp_session::live_hover(
+                &PathBuf::from(root),
+                &relative_path,
+                line,
+                character,
+                timeout,
+            ) {
+                Ok(result) => {
+                    println!("{}", serde_json::to_string(&result).expect("lsp hover should serialize"))
+                }
+                Err(xmustard_core::lsp_session::LspSessionError::Unavailable(msg)) => {
+                    println!("{}", serde_json::json!({"available": false, "reason": msg}));
+                }
+                Err(err) => {
+                    eprintln!("lsp-hover failed: {err}");
+                    std::process::exit(1);
+                }
+            }
+        }
         "normalize-lsp-workspace-symbols" => {
             let Some(workspace_id) = args.next() else {
                 eprintln!("usage: xmustard-core normalize-lsp-workspace-symbols <workspace_id> <root_path> <query> <limit> <source_name> <input_json_path>");

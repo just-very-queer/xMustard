@@ -86,6 +86,10 @@ func tools() []tool {
 			func(a map[string]string) (string, string) { return "GET", wsPath(a, "/symbol-graph") }},
 		{"issue_symbol_edges", "Typed issue↔symbol edges: which issues mention or have evidence pointing at which defined symbols.", []string{"workspace_id"},
 			func(a map[string]string) (string, string) { return "GET", wsPath(a, "/issue-symbol-edges") }},
+		{"lsp_document_symbols", "Live LSP document symbols for a file (rust-core spawns the real language server). Degrades gracefully if the server isn't installed.", []string{"workspace_id", "path"},
+			func(a map[string]string) (string, string) {
+				return "GET", wsPath(a, "/lsp/document-symbols") + "?path=" + url.QueryEscape(a["path"])
+			}},
 		{"search_repo", "Hybrid lexical+structural search over the repo's symbols and files.", []string{"workspace_id", "query"},
 			func(a map[string]string) (string, string) {
 				return "GET", wsPath(a, "/search") + "?q=" + url.QueryEscape(a["query"])

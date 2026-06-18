@@ -47,3 +47,18 @@ func SymbolBlastRadius(dataDir, workspaceID, symbol string) (json.RawMessage, er
 	}
 	return json.RawMessage(out), nil
 }
+
+// LiveDocumentSymbols runs a live LSP session (rust-core spawns the language
+// server, runs the handshake, and returns normalized document symbols). Servers
+// that aren't installed degrade gracefully to {"available": false, ...}.
+func LiveDocumentSymbols(dataDir, workspaceID, path string) (json.RawMessage, error) {
+	root, _, err := resolveChangeRoot(dataDir, workspaceID)
+	if err != nil {
+		return nil, err
+	}
+	out, err := rustcore.RunLspDocumentSymbols(workspaceID, root, path)
+	if err != nil {
+		return nil, err
+	}
+	return json.RawMessage(out), nil
+}
