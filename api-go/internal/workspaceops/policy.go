@@ -99,6 +99,12 @@ func SetWorkspacePolicy(dataDir, workspaceID string, policy WorkspacePolicy) (*W
 	if err := writeJSON(policyPath(dataDir, workspaceID), policy); err != nil {
 		return nil, err
 	}
+	_ = recordAuditEventNoGuard(dataDir, workspaceID, AuditEvent{
+		Action:     "policy.update",
+		TargetType: "workspace",
+		TargetID:   workspaceID,
+		Details:    fmt.Sprintf("allowed_runtimes=%v sensitive=%t require_plan_approval=%t", policy.AllowedRuntimes, policy.Sensitive, policy.RequirePlanApproval),
+	})
 	return &policy, nil
 }
 

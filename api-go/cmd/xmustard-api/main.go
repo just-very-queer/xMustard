@@ -3224,6 +3224,39 @@ func main() {
 		result, err := workspaceops.EvaluateRunAgainstPolicy(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), input)
 		issueIntel(w, err, result)
 	})
+	// --- audit log ---
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/audit-log", func(w http.ResponseWriter, r *http.Request) {
+		limit := 0
+		if v := r.URL.Query().Get("limit"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil {
+				limit = n
+			}
+		}
+		result, err := workspaceops.ListAuditEvents(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), limit)
+		issueIntel(w, err, result)
+	})
+	mux.HandleFunc("POST /api/workspaces/{workspace_id}/audit-log", func(w http.ResponseWriter, r *http.Request) {
+		var event workspaceops.AuditEvent
+		if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON body"})
+			return
+		}
+		result, err := workspaceops.RecordAuditEvent(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), event)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				writeJSON(w, http.StatusNotFound, map[string]any{"error": "Workspace not found"})
+				return
+			}
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	})
+	// --- PR-style review packet (FRONTIER Lane 6) ---
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/issues/{issue_id}/review-packet", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.BuildReviewPacket(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), r.PathValue("issue_id"))
+		issueIntel(w, err, result)
+	})
 	mux.HandleFunc("POST /api/terminal/open", func(w http.ResponseWriter, r *http.Request) {
 		var request workspaceops.TerminalOpenRequest
 		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
