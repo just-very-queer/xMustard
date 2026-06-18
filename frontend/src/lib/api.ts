@@ -842,6 +842,32 @@ export type CockpitDashboard = {
   review_ready_count: number
   audit_event_count: number
 }
+export type SessionGrounding = {
+  workspace_id: string
+  changed_files: number
+  dirty_symbols: number
+  recent_failed_runs: string[]
+  blocked_by_dirty_state: boolean
+  blocked_by_failing_verification: boolean
+  summary: string
+  generated_at: string
+}
+export type Subsystem = {
+  name: string
+  file_count: number
+  symbol_count: number
+  internal_edges: number
+  external_edges: number
+  cohesion: number
+}
+export type OwnerCount = { name: string; commits: number }
+export type OwnerSuggestion = {
+  path: string
+  owners: OwnerCount[]
+  generated_at: string
+}
+export type LineageEvent = { path: string; hash: string; head_sha: string; event: string; at: string }
+export type FileLineage = { events: LineageEvent[]; change_count: number }
 
 export function getWorkspaceChanges(workspaceId: string) {
   return request<ChangeSet>(`/api/workspaces/${workspaceId}/changes`)
@@ -862,4 +888,20 @@ export function getBlastRadius(workspaceId: string, symbol: string) {
 }
 export function getCockpitDashboard(workspaceId: string) {
   return request<CockpitDashboard>(`/api/workspaces/${workspaceId}/dashboard`)
+}
+export function getSessionGrounding(workspaceId: string) {
+  return request<SessionGrounding>(`/api/workspaces/${workspaceId}/session-grounding`)
+}
+export function getWorkspaceSubsystems(workspaceId: string) {
+  return request<Subsystem[]>(`/api/workspaces/${workspaceId}/subsystems`)
+}
+export function getFileOwners(workspaceId: string, path: string) {
+  return request<OwnerSuggestion>(
+    `/api/workspaces/${workspaceId}/owners?path=${encodeURIComponent(path)}`,
+  )
+}
+export function getFileLineage(workspaceId: string, path: string) {
+  return request<FileLineage>(
+    `/api/workspaces/${workspaceId}/lineage?path=${encodeURIComponent(path)}`,
+  )
 }

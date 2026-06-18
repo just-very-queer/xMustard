@@ -5,12 +5,20 @@ import {
   getWorkspaceHotspots,
   getBlastRadius,
   getCockpitDashboard,
+  getSessionGrounding,
+  getWorkspaceSubsystems,
+  getFileOwners,
+  getFileLineage,
   indexWorkspace,
   type ChangeSet,
   type DriftReport,
   type Hotspot,
   type BlastRadius,
   type CockpitDashboard,
+  type SessionGrounding,
+  type Subsystem,
+  type OwnerSuggestion,
+  type FileLineage,
 } from '../lib/api'
 
 // Repo cockpit: change state + intelligence inspector. Surfaces the gitnexus-style
@@ -21,8 +29,13 @@ export function Cockpit({ workspaceId }: { workspaceId: string }) {
   const [drift, setDrift] = useState<DriftReport | null>(null)
   const [hotspots, setHotspots] = useState<Hotspot[]>([])
   const [dashboard, setDashboard] = useState<CockpitDashboard | null>(null)
+  const [grounding, setGrounding] = useState<SessionGrounding | null>(null)
+  const [subsystems, setSubsystems] = useState<Subsystem[]>([])
   const [symbol, setSymbol] = useState('')
   const [blast, setBlast] = useState<BlastRadius | null>(null)
+  const [path, setPath] = useState('')
+  const [owners, setOwners] = useState<OwnerSuggestion | null>(null)
+  const [lineage, setLineage] = useState<FileLineage | null>(null)
   const [message, setMessage] = useState('')
   const [loading, setLoading] = useState(false)
 
@@ -31,16 +44,20 @@ export function Cockpit({ workspaceId }: { workspaceId: string }) {
     setLoading(true)
     setMessage('')
     try {
-      const [c, d, h, db] = await Promise.all([
+      const [c, d, h, db, sg, ss] = await Promise.all([
         getWorkspaceChanges(workspaceId).catch(() => null),
         getWorkspaceDrift(workspaceId).catch(() => null),
         getWorkspaceHotspots(workspaceId, 12).catch(() => [] as Hotspot[]),
         getCockpitDashboard(workspaceId).catch(() => null),
+        getSessionGrounding(workspaceId).catch(() => null),
+        getWorkspaceSubsystems(workspaceId).catch(() => [] as Subsystem[]),
       ])
       setChanges(c)
       setDrift(d)
       setHotspots(h ?? [])
       setDashboard(db)
+      setGrounding(sg)
+      setSubsystems((ss ?? []).slice().sort((a, b) => b.file_count - a.file_count))
     } catch (e) {
       setMessage(e instanceof Error ? e.message : String(e))
     } finally {
@@ -57,6 +74,20 @@ export function Cockpit({ workspaceId }: { workspaceId: string }) {
     if (!symbol.trim()) return
     try {
       setBlast(await getBlastRadius(workspaceId, symbol.trim()))
+    } catch (e) {
+      setMessage(e instanceof Error ? e.message : String(e))
+    }
+  }
+
+  async function lookupPath() {
+    if (!path.trim()) return
+    try {
+      const [o, l] = await Promise.all([
+        getFileOwners(workspaceId, path.trim()).catch(() => null),
+        getFileLineage(workspaceId, path.trim()).catch(() => null),
+      ])
+      setOwners(o)
+      setLineage(l)
     } catch (e) {
       setMessage(e instanceof Error ? e.message : String(e))
     }
@@ -93,6 +124,18 @@ export function Cockpit({ workspaceId }: { workspaceId: string }) {
         <div className="cockpit-drift-banner" role="alert">
           ⚠ Index may be stale — {drift.reasons.join('; ')}
           {drift.sibling_clone && ' (sibling-clone drift)'}
+        </div>
+      )}
+
+      {grounding && (
+        <div className="cockpit-grounding" role="status">
+          <strong>Session grounding:</strong> {grounding.summary}
+          {grounding.blocked_by_dirty_state && (
+            <span className="cockpit-blocked"> · blocked by dirty state</span>
+          )}
+          {grounding.blocked_by_failing_verification && (
+            <span className="cockpit-blocked"> · failing verification</span>
+          )}
         </div>
       )}
 
@@ -185,6 +228,61 @@ export function Cockpit({ workspaceId }: { workspaceId: string }) {
                 ))}
               </ul>
             </div>
+          )}
+        </section>
+
+        <section className="cockpit-pane">
+          <h3>Subsystems (cohesion)</h3>
+          {subsystems.length > 0 ? (
+            <ul className="cockpit-subsystems">
+              {subsystems.slice(0, 10).map((s) => (
+                <li key={s.name}>
+                  <span className="cockpit-subsystem-name">{s.name}</span>
+                  <span className="cockpit-cohesion-bar" aria-hidden>
+                    <span
+                      className="cockpit-cohesion-fill"
+                      style={{ width: `${Math.round(Math.max(0, Math.min(1, s.cohesion)) * 100)}%` }}
+                    />
+                  </span>
+                  <span className="cockpit-muted">
+                    {s.file_count}f / {s.symbol_count}s · {(s.cohesion * 100).toFixed(0)}%
+                  </span>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="cockpit-muted">No subsystem clusters.</p>
+          )}
+        </section>
+
+        <section className="cockpit-pane">
+          <h3>Ownership &amp; lineage inspector</h3>
+          <div className="cockpit-blast-input">
+            <input
+              value={path}
+              onChange={(e) => setPath(e.target.value)}
+              placeholder="file path (e.g. rust-core/src/changetrack.rs)"
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') void lookupPath()
+              }}
+            />
+            <button onClick={() => void lookupPath()}>Inspect</button>
+          </div>
+          {owners && (
+            <p>
+              <strong>Owners:</strong>{' '}
+              {owners.owners.length > 0
+                ? owners.owners
+                    .slice(0, 5)
+                    .map((o) => `${o.name} (${o.commits})`)
+                    .join(', ')
+                : '—'}
+            </p>
+          )}
+          {lineage && (
+            <p className="cockpit-muted">
+              Lineage: {lineage.events.length} event(s), {lineage.change_count} change(s) since indexed.
+            </p>
           )}
         </section>
       </div>

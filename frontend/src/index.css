@@ -879,6 +879,13 @@ h4 {
 .cockpit-blast-input { display: flex; gap: 6px; margin-bottom: 8px; }
 .cockpit-blast-input input { flex: 1; border: 1px solid #c9c6bd; border-radius: 8px; padding: 5px 8px; }
 .cockpit-blast-input button { border: 1px solid #1f232b; background: #1f232b; color: #f7f6f2; border-radius: 8px; padding: 5px 12px; cursor: pointer; }
+.cockpit-grounding { background: #eef4fb; border: 1px solid #b8cee6; color: #20486f; border-radius: 8px; padding: 8px 12px; margin-bottom: 12px; font-size: 13px; }
+.cockpit-blocked { color: #8a2018; font-weight: 600; }
+.cockpit-subsystems { list-style: none; margin: 0; padding: 0; font-size: 13px; }
+.cockpit-subsystems li { display: flex; align-items: center; gap: 8px; padding: 3px 0; }
+.cockpit-subsystem-name { min-width: 96px; font-weight: 600; color: #1f232b; }
+.cockpit-cohesion-bar { flex: 1; height: 8px; background: #ecebe5; border-radius: 4px; overflow: hidden; }
+.cockpit-cohesion-fill { display: block; height: 100%; background: #3f7f4f; }
 
 .kanban { padding: 12px; overflow: auto; }
 .kanban-board { display: flex; gap: 12px; align-items: flex-start; }
