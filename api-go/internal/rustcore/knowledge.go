@@ -3,13 +3,10 @@ package rustcore
 import (
 	"bytes"
 	"fmt"
-	"os/exec"
 )
 
 func runCore(sub string, args ...string) ([]byte, error) {
-	full := append([]string{"run", "--quiet", "--bin", "xmustard-core", "--", sub}, args...)
-	cmd := exec.Command("cargo", full...)
-	cmd.Dir = rustCoreDir()
+	cmd := coreCommand(sub, args...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr

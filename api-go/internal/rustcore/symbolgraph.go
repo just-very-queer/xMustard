@@ -3,15 +3,12 @@ package rustcore
 import (
 	"bytes"
 	"fmt"
-	"os/exec"
 )
 
-// RunSymbolgraph runs `xmustard-core symbolgraph <args...>` (the semantic symbol
-// graph: files/symbols/reference edges, hotspots, blast radius).
+// RunSymbolgraph runs `xmustard-core symbolgraph <args...>` (symbol graph,
+// hotspots, blast radius).
 func RunSymbolgraph(args ...string) ([]byte, error) {
-	full := append([]string{"run", "--quiet", "--bin", "xmustard-core", "--", "symbolgraph"}, args...)
-	cmd := exec.Command("cargo", full...)
-	cmd.Dir = rustCoreDir()
+	cmd := coreCommand("symbolgraph", args...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
