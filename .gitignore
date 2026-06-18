@@ -31,3 +31,5 @@ node_modules/
 
 # Go binaries
 api-go/xmustard-api
+api-go/xmustard-mcp
+api-go/xmustard-ops

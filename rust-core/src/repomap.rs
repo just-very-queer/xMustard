@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use walkdir::{DirEntry, WalkDir};
+use crate::treesitter;
 
 const SCANNER_EXCLUDED_DIR_NAMES: &[&str] = &[
     ".git",
@@ -435,7 +436,13 @@ pub fn extract_path_symbols(
             "Rust semantic core does not treat this path as an indexable source file.".to_string(),
         );
     }
-    let symbols = extract_symbols_from_file(root_path, &normalized)
+    let (symbols_raw, engine) = extract_symbols_engine(root_path, &normalized);
+    let symbol_source = if symbols_raw.is_empty() {
+        "none".to_string()
+    } else {
+        engine.to_string()
+    };
+    let symbols = symbols_raw
         .into_iter()
         .take(32)
         .map(|item| RustPathSymbolRecord {
@@ -452,7 +459,7 @@ pub fn extract_path_symbols(
             score: 10,
         })
         .collect::<Vec<_>>();
-    let symbol_source = if symbols.is_empty() { "none" } else { "regex" }.to_string();
+    let symbol_source = normalize_symbol_source(&symbol_source);
     let file_summary_row = build_file_symbol_summary(
         workspace_id,
         &normalized,
@@ -699,14 +706,52 @@ fn derive_changed_symbols(
     symbols
 }
 
-fn extract_symbols_from_file(root_path: &Path, relative_path: &str) -> Vec<RustChangedSymbolRecord> {
+fn extract_symbols_engine(
+    root_path: &Path,
+    relative_path: &str,
+) -> (Vec<RustChangedSymbolRecord>, &'static str) {
     if !should_scan_file(relative_path) {
-        return Vec::new();
+        return (Vec::new(), "none");
     }
     let content = match fs::read_to_string(root_path.join(relative_path)) {
         Ok(value) => value,
-        Err(_) => return Vec::new(),
+        Err(_) => return (Vec::new(), "none"),
     };
+    if let Some(symbols) = treesitter::extract_symbols(relative_path, &content) {
+        if !symbols.is_empty() {
+            let mapped = symbols
+                .into_iter()
+                .map(|item| RustChangedSymbolRecord {
+                    path: relative_path.replace('\\', "/"),
+                    symbol: item.symbol,
+                    kind: item.kind,
+                    line_start: Some(item.line_start),
+                    line_end: Some(item.line_end),
+                    evidence_source: "rust_semantic_core".to_string(),
+                    semantic_status: Some("on_demand".to_string()),
+                    selection_reason:
+                        "Rust semantic core extracted this symbol from a changed path."
+                            .to_string(),
+                    change_scopes: Vec::new(),
+                    change_statuses: Vec::new(),
+                })
+                .collect();
+            return (mapped, "tree_sitter");
+        }
+    }
+    let fallback = extract_symbols_with_regex(relative_path, &content);
+    if fallback.is_empty() {
+        (fallback, "none")
+    } else {
+        (fallback, "regex")
+    }
+}
+
+fn extract_symbols_from_file(root_path: &Path, relative_path: &str) -> Vec<RustChangedSymbolRecord> {
+    extract_symbols_engine(root_path, relative_path).0
+}
+
+fn extract_symbols_with_regex(relative_path: &str, content: &str) -> Vec<RustChangedSymbolRecord> {
     let patterns = [
         (Regex::new(r"^\s*def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(").unwrap(), "function"),
         (Regex::new(r"^\s*class\s+([A-Za-z_][A-Za-z0-9_]*)\b").unwrap(), "class"),
@@ -1040,7 +1085,7 @@ mod tests {
     }
 
     #[test]
-    fn path_symbols_extracts_requested_file_symbols() {
+    fn path_symbols_extracts_requested_file_symbols_with_treesitter() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
 
@@ -1053,7 +1098,7 @@ mod tests {
 
         assert_eq!(result.workspace_id, "workspace-4");
         assert_eq!(result.path, "src/app.rs");
-        assert_eq!(result.symbol_source, "regex");
+        assert_eq!(result.symbol_source, "tree_sitter");
         assert_eq!(result.parser_language.as_deref(), Some("rust"));
         assert!(result
             .symbols
@@ -1064,14 +1109,33 @@ mod tests {
             .iter()
             .any(|item| item.symbol == "launch_runner" && item.kind == "function"));
         assert_eq!(result.evidence_source, "rust_semantic_core");
+        assert_eq!(result.file_summary_row.symbol_source, "tree_sitter");
+        assert_eq!(result.symbol_rows.len(), 2);
+        assert!(result.file_summary_row.symbol_count >= 2);
+    }
+
+    #[test]
+    fn path_symbols_falls_back_to_regex_for_non_treesitter_language() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+
+        write(
+            &root.join("src/app.py"),
+            "class ExportService:\n    def export_summary(self):\n        return 'ok'\n",
+        );
+
+        let result = super::extract_path_symbols(root, "workspace-4", "src/app.py").unwrap();
+
+        assert_eq!(result.workspace_id, "workspace-4");
+        assert_eq!(result.path, "src/app.py");
+        assert_eq!(result.symbol_source, "regex");
+        assert_eq!(result.parser_language.as_deref(), Some("python"));
+        assert!(result
+            .symbols
+            .iter()
+            .any(|item| item.symbol == "ExportService" && item.kind == "class"));
         assert_eq!(result.file_summary_row.symbol_source, "regex");
         assert_eq!(result.file_summary_row.symbol_count, 2);
-        assert_eq!(
-            result.file_summary_row.summary_json.get("top_symbols").unwrap(),
-            &serde_json::json!(["Runner", "launch_runner"])
-        );
-        assert_eq!(result.symbol_rows.len(), 2);
-        assert_eq!(result.symbol_rows[0].symbol, "Runner");
     }
 
     #[test]

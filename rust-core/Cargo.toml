@@ -10,6 +10,12 @@ path = "src/lib.rs"
 
 [dependencies]
 chrono = { version = "0.4", features = ["clock", "serde"] }
+tree-sitter = "0.25"
+tree-sitter-go = "0.25"
+tree-sitter-javascript = "0.25"
+tree-sitter-rust = "0.24"
+tree-sitter-typescript = "0.23"
+streaming-iterator = "0.1"
 regex = "1.12"
 roxmltree = "0.20"
 serde = { version = "1.0", features = ["derive"] }
