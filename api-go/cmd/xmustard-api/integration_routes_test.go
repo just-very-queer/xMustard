@@ -1,21 +1,14 @@
 package main
 
 import (
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"slices"
 	"strings"
 	"testing"
 
-	"xmustard/api-go/internal/migration"
 	"xmustard/api-go/internal/workspaceops"
 )
-
-type apiRouteGroup struct {
-	Group     string   `json:"group"`
-	Endpoints []string `json:"endpoints"`
-}
 
 func TestIntegrationRouteSpecsMatchFrontendContract(t *testing.T) {
 	want := []integrationRouteSpec{
@@ -33,19 +26,10 @@ func TestIntegrationRouteSpecsMatchFrontendContract(t *testing.T) {
 	}
 }
 
-func TestIntegrationRouteInventoryMatchesWorkspaceOpsAndMigrationInventory(t *testing.T) {
+func TestIntegrationRouteInventoryMatchesWorkspaceOps(t *testing.T) {
 	wantInventory := workspaceops.IntegrationInventoryRoutes()
 	if got := uniqueIntegrationRoutePaths(listIntegrationRouteSpecs()); !slices.Equal(got, wantInventory) {
 		t.Fatalf("unexpected api integration inventory paths: %#v", got)
-	}
-
-	var groups []apiRouteGroup
-	if err := json.Unmarshal(migration.APIRouteGroupsJSON, &groups); err != nil {
-		t.Fatalf("decode api route groups: %v", err)
-	}
-	gotMigrationInventory := integrationMigrationInventory(t, groups)
-	if !slices.Equal(gotMigrationInventory, wantInventory) {
-		t.Fatalf("unexpected migration integration inventory: %#v", gotMigrationInventory)
 	}
 }
 
@@ -132,28 +116,3 @@ func uniqueIntegrationRoutePaths(specs []integrationRouteSpec) []string {
 	return paths
 }
 
-func integrationMigrationInventory(t *testing.T, groups []apiRouteGroup) []string {
-	t.Helper()
-
-	wantIntegrationRoutes := workspaceops.IntegrationInventoryRoutes()
-	wantSet := make(map[string]struct{}, len(wantIntegrationRoutes))
-	for _, route := range wantIntegrationRoutes {
-		wantSet[route] = struct{}{}
-	}
-
-	for _, group := range groups {
-		if group.Group != "integrations_and_terminal" {
-			continue
-		}
-		routes := make([]string, 0, len(wantIntegrationRoutes))
-		for _, route := range group.Endpoints {
-			if _, ok := wantSet[route]; ok {
-				routes = append(routes, route)
-			}
-		}
-		return routes
-	}
-
-	t.Fatal("integrations_and_terminal route group not found")
-	return nil
-}

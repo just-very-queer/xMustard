@@ -13,7 +13,6 @@ import (
 	"strings"
 	"time"
 
-	"xmustard/api-go/internal/migration"
 	"xmustard/api-go/internal/rustcore"
 	"xmustard/api-go/internal/workspaceops"
 )
@@ -58,37 +57,6 @@ func main() {
 			"status":  "ok",
 			"service": "api-go",
 		})
-	})
-	mux.HandleFunc("/api/migration/plan", func(w http.ResponseWriter, r *http.Request) {
-		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
-		defer cancel()
-
-		contract, err := rustcore.ReadArchitectureContract(ctx)
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{
-				"error": err.Error(),
-			})
-			return
-		}
-		writeJSON(w, http.StatusOK, contract)
-	})
-	mux.HandleFunc("/api/migration/agent-surfaces", func(w http.ResponseWriter, r *http.Request) {
-		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
-		defer cancel()
-
-		contract, err := rustcore.ReadArchitectureContract(ctx)
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{
-				"error": err.Error(),
-			})
-			return
-		}
-		writeJSON(w, http.StatusOK, buildAgentSurfacesPayload(contract))
-	})
-	mux.HandleFunc("/api/migration/routes", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(migration.APIRouteGroupsJSON)
 	})
 	mux.HandleFunc("/api/migration/scan-signals", func(w http.ResponseWriter, r *http.Request) {
 		rootPath := r.URL.Query().Get("root_path")
