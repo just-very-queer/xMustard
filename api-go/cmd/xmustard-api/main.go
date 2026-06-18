@@ -3257,6 +3257,36 @@ func main() {
 		result, err := workspaceops.BuildReviewPacket(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), r.PathValue("issue_id"))
 		issueIntel(w, err, result)
 	})
+	// --- security review depth (FRONTIER Lane 4) ---
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/security/dispositions", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.ListSecurityDispositions(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))
+		issueIntel(w, err, result)
+	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/security/findings/{finding_id}/disposition", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.GetSecurityDisposition(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), r.PathValue("finding_id"))
+		issueIntel(w, err, result)
+	})
+	mux.HandleFunc("PUT /api/workspaces/{workspace_id}/security/findings/{finding_id}/disposition", func(w http.ResponseWriter, r *http.Request) {
+		var in workspaceops.SecurityDisposition
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON body"})
+			return
+		}
+		result, err := workspaceops.SetSecurityDisposition(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), r.PathValue("finding_id"), in)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				writeJSON(w, http.StatusNotFound, map[string]any{"error": "Workspace not found"})
+				return
+			}
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/security/review-packet", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.BuildSecurityReviewPacket(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))
+		issueIntel(w, err, result)
+	})
 	mux.HandleFunc("POST /api/terminal/open", func(w http.ResponseWriter, r *http.Request) {
 		var request workspaceops.TerminalOpenRequest
 		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
