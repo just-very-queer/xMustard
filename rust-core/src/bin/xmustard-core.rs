@@ -794,6 +794,9 @@ fn main() {
         "bench" => {
             run_bench_command(args);
         }
+        "changetrack" => {
+            run_changetrack_command(args);
+        }
         _ => {
             eprintln!("unknown command: {command}");
             std::process::exit(2);
@@ -1097,6 +1100,76 @@ fn run_bench_command(mut args: impl Iterator<Item = String>) {
         Err(err) => {
             eprintln!("bench: {err}");
             std::process::exit(1);
+        }
+    }
+}
+
+/// `changetrack <fingerprint|index|drift|changed-since|working-changes> ...` —
+/// gitnexus-style repo change tracking.
+fn run_changetrack_command(mut args: impl Iterator<Item = String>) {
+    use xmustard_core::changetrack as ct;
+
+    fn need(value: Option<String>, usage: &str) -> String {
+        match value {
+            Some(value) => value,
+            None => {
+                eprintln!("usage: {usage}");
+                std::process::exit(2);
+            }
+        }
+    }
+    fn print_json<T: serde::Serialize>(value: &T) {
+        println!(
+            "{}",
+            serde_json::to_string(value).expect("changetrack result should serialize")
+        );
+    }
+
+    let Some(sub) = args.next() else {
+        eprintln!("usage: xmustard-core changetrack <fingerprint|index|drift|changed-since|working-changes> ...");
+        std::process::exit(2);
+    };
+    match sub.as_str() {
+        "fingerprint" => {
+            let root = need(args.next(), "xmustard-core changetrack fingerprint <root>");
+            print_json(&ct::compute_fingerprint(Path::new(&root)));
+        }
+        "index" => {
+            let usage = "xmustard-core changetrack index <data_dir> <root> <workspace_id>";
+            let data_dir = need(args.next(), usage);
+            let root = need(args.next(), usage);
+            let ws = need(args.next(), usage);
+            match ct::build_index_baseline(Path::new(&data_dir), Path::new(&root), &ws) {
+                Ok(baseline) => print_json(&baseline),
+                Err(err) => {
+                    eprintln!("changetrack index failed: {err}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        "drift" => {
+            let usage = "xmustard-core changetrack drift <data_dir> <root> <workspace_id>";
+            let data_dir = need(args.next(), usage);
+            let root = need(args.next(), usage);
+            let ws = need(args.next(), usage);
+            print_json(&ct::detect_drift(Path::new(&data_dir), Path::new(&root), &ws));
+        }
+        "changed-since" => {
+            let usage = "xmustard-core changetrack changed-since <data_dir> <root> <workspace_id>";
+            let data_dir = need(args.next(), usage);
+            let root = need(args.next(), usage);
+            let ws = need(args.next(), usage);
+            print_json(&ct::changed_since_baseline(Path::new(&data_dir), Path::new(&root), &ws));
+        }
+        "working-changes" => {
+            let usage = "xmustard-core changetrack working-changes <root> <workspace_id>";
+            let root = need(args.next(), usage);
+            let ws = need(args.next(), usage);
+            print_json(&ct::working_tree_changes(Path::new(&root), &ws));
+        }
+        other => {
+            eprintln!("unknown changetrack subcommand: {other}");
+            std::process::exit(2);
         }
     }
 }
