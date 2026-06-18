@@ -104,9 +104,21 @@ func tools() []tool {
 			func(a map[string]string) (string, string) {
 				return "GET", wsPath(a, "/lineage") + "?path=" + url.QueryEscape(a["path"])
 			}},
-		{"pg_search", "Postgres FTS hybrid search (BM25-style ts_rank + structural) over the index.", []string{"workspace_id", "query"},
+		{"pg_search", "Postgres FTS hybrid search (RRF of ts_rank + structural lanes) over the symbol index.", []string{"workspace_id", "query"},
 			func(a map[string]string) (string, string) {
 				return "GET", wsPath(a, "/pg/search") + "?q=" + url.QueryEscape(a["query"])
+			}},
+		{"pg_runs", "Recent runs from the Postgres ops index (optionally filter by status).", []string{"workspace_id"},
+			func(a map[string]string) (string, string) {
+				p := wsPath(a, "/pg/runs")
+				if s := a["status"]; s != "" {
+					p += "?status=" + url.QueryEscape(s)
+				}
+				return "GET", p
+			}},
+		{"pg_issue_search", "Postgres FTS over the workspace's issues (title/summary/impact/notes).", []string{"workspace_id", "query"},
+			func(a map[string]string) (string, string) {
+				return "GET", wsPath(a, "/pg/issues/search") + "?q=" + url.QueryEscape(a["query"])
 			}},
 	}
 }

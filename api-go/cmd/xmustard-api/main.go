@@ -3381,6 +3381,36 @@ func main() {
 		result, err := workspaceops.SearchPostgres(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), query, limit)
 		issueIntel(w, err, result)
 	})
+	// --- ops layer in Postgres: runs / activity / issues ---
+	mux.HandleFunc("POST /api/workspaces/{workspace_id}/pg/ops/materialize", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.MaterializeOpsPostgres(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))
+		issueIntel(w, err, result)
+	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/pg/runs", func(w http.ResponseWriter, r *http.Request) {
+		limit := 50
+		if v := r.URL.Query().Get("limit"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil {
+				limit = n
+			}
+		}
+		result, err := workspaceops.ListRunsPostgres(r.PathValue("workspace_id"), r.URL.Query().Get("status"), limit)
+		issueIntel(w, err, result)
+	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/pg/issues/search", func(w http.ResponseWriter, r *http.Request) {
+		query := r.URL.Query().Get("q")
+		if query == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "q query param required"})
+			return
+		}
+		limit := 25
+		if v := r.URL.Query().Get("limit"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil {
+				limit = n
+			}
+		}
+		result, err := workspaceops.SearchIssuesPostgres(r.PathValue("workspace_id"), query, limit)
+		issueIntel(w, err, result)
+	})
 	// --- ownership, incorporation lineage, session grounding ---
 	mux.HandleFunc("GET /api/workspaces/{workspace_id}/subsystems", func(w http.ResponseWriter, r *http.Request) {
 		result, err := workspaceops.WorkspaceSubsystems(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))
