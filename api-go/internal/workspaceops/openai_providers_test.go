@@ -103,6 +103,27 @@ func TestOpenAIProviderCRUDAndClient(t *testing.T) {
 	}
 }
 
+func TestProviderRejectsSSRFHosts(t *testing.T) {
+	dir := t.TempDir()
+	for _, bad := range []string{
+		"http://169.254.169.254/v1",   // AWS/GCP/Azure metadata
+		"http://169.254.169.254:80/v1",
+		"http://[fe80::1]/v1",          // link-local IPv6
+		"http://100.100.100.200/v1",    // Alibaba metadata
+	} {
+		if _, err := AddOpenAIProvider(dir, OpenAIProvider{Name: "evil", BaseURL: bad}); err == nil {
+			t.Fatalf("expected SSRF rejection for base_url %q", bad)
+		}
+	}
+	// loopback + RFC1918 ARE allowed — local model servers live there
+	if _, err := AddOpenAIProvider(dir, OpenAIProvider{Name: "local", BaseURL: "http://127.0.0.1:11434/v1"}); err != nil {
+		t.Fatalf("loopback should be allowed (local LLMs): %v", err)
+	}
+	if _, err := AddOpenAIProvider(dir, OpenAIProvider{Name: "lan", BaseURL: "http://192.168.1.50:8000/v1"}); err != nil {
+		t.Fatalf("RFC1918 should be allowed (LAN model server): %v", err)
+	}
+}
+
 func TestVisionRequiresSupportsVision(t *testing.T) {
 	dir := t.TempDir()
 	if _, err := AddOpenAIProvider(dir, OpenAIProvider{

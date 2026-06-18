@@ -105,6 +105,46 @@ func TestReadonlyEntryRejectsEdit(t *testing.T) {
 	}
 }
 
+func TestPerRequestOverrideCannotLoosen(t *testing.T) {
+	dir := t.TempDir()
+	ws := "wsClamp"
+	require := true
+	writeTestSettings(t, dir, appSettings{RequireMultiAgentVerification: &require, ContextVerificationThreshold: 2})
+	// an untrusted proposer tries to self-promote by forcing single-agent mode
+	off := false
+	entry, err := ProposeContext(dir, ws, ProposeContextRequest{Content: "sneaky", Source: "attacker", RequireVerification: &off})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entry.Promoted || entry.Status != "pending" {
+		t.Fatalf("require_verification:false must NOT loosen a multi-agent-required policy; got status=%s promoted=%v", entry.Status, entry.Promoted)
+	}
+	// but it CAN tighten: when global is single-agent, forcing verification keeps it pending
+	disable := false
+	writeTestSettings(t, dir, appSettings{RequireMultiAgentVerification: &disable})
+	on := true
+	e2, _ := ProposeContext(dir, "wsClamp2", ProposeContextRequest{Content: "careful", Source: "a", RequireVerification: &on})
+	if e2.Promoted {
+		t.Fatalf("require_verification:true should tighten even when global is single-agent")
+	}
+}
+
+func TestContextRejectsPathTraversalID(t *testing.T) {
+	dir := t.TempDir()
+	for _, bad := range []string{"../../etc", "..", "a/b", "x\x00y", ""} {
+		if _, err := ProposeContext(dir, bad, ProposeContextRequest{Content: "x", Source: "s"}); err == nil {
+			t.Fatalf("expected rejection for workspace id %q", bad)
+		}
+		if _, err := ListContextEntries(dir, bad, ""); err == nil {
+			t.Fatalf("expected list rejection for workspace id %q", bad)
+		}
+	}
+	// a normal id is accepted
+	if _, err := ListContextEntries(dir, "co-titan_123", ""); err != nil {
+		t.Fatalf("valid id should be accepted: %v", err)
+	}
+}
+
 func TestRejectionBlocksPromotion(t *testing.T) {
 	dir := t.TempDir()
 	ws := "ws4"

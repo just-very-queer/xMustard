@@ -7,13 +7,71 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 )
+
+// SSRF guard. Provider URLs trigger server-side HTTP requests with the operator's
+// bearer key attached, so a malicious base_url could probe internal services or
+// the cloud-metadata endpoint. Loopback and RFC1918 are intentionally ALLOWED —
+// local model servers (Ollama/vLLM/LM Studio) are the whole point and live there —
+// but link-local (incl. 169.254.169.254 metadata) and known metadata IPs are
+// blocked at dial time (after DNS resolution, defeating rebinding), and redirects
+// are not followed.
+var metadataIPs = map[string]struct{}{
+	"169.254.169.254": {}, // AWS/GCP/Azure IMDS
+	"fd00:ec2::254":   {}, // AWS IMDS over IPv6
+	"100.100.100.200": {}, // Alibaba metadata
+}
+
+func blockedHostIP(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	if _, bad := metadataIPs[ip.String()]; bad {
+		return true
+	}
+	return ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified()
+}
+
+var providerHTTPClient = &http.Client{
+	CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse },
+	Transport: &http.Transport{
+		DialContext: (&net.Dialer{
+			Timeout: 30 * time.Second,
+			Control: func(_ string, address string, _ syscall.RawConn) error {
+				host, _, err := net.SplitHostPort(address)
+				if err != nil {
+					host = address
+				}
+				if blockedHostIP(net.ParseIP(host)) {
+					return fmt.Errorf("blocked link-local/metadata address %s", host)
+				}
+				return nil
+			},
+		}).DialContext,
+	},
+}
+
+// rejectBlockedURLHost rejects a base_url whose host is a blocked IP literal
+// (fast feedback at add-time; the dialer Control catches DNS-resolved cases).
+func rejectBlockedURLHost(baseURL string) error {
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		return fmt.Errorf("invalid base_url: %w", err)
+	}
+	if blockedHostIP(net.ParseIP(u.Hostname())) {
+		return fmt.Errorf("base_url host %s is a blocked (link-local/metadata) address", u.Hostname())
+	}
+	return nil
+}
 
 // OpenAI-compatible provider integration. xMustard's local agents are CLIs
 // (codex/opencode); this adds first-class access to any OpenAI-compatible HTTP
@@ -89,6 +147,9 @@ func AddOpenAIProvider(dataDir string, p OpenAIProvider) (*OpenAIProvider, error
 	}
 	if !strings.HasPrefix(p.BaseURL, "http://") && !strings.HasPrefix(p.BaseURL, "https://") {
 		return nil, fmt.Errorf("base_url must be http(s)")
+	}
+	if err := rejectBlockedURLHost(p.BaseURL); err != nil {
+		return nil, err
 	}
 	if p.CreatedAt == "" {
 		p.CreatedAt = nowUTC()
@@ -181,7 +242,7 @@ func ListProviderModels(dataDir, name string) (map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := providerHTTPClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("provider %s unreachable at %s: %w", name, provider.BaseURL, err)
 	}
@@ -301,7 +362,7 @@ func OpenAIChat(dataDir, name string, req ChatRequest) (map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
-	resp, err := http.DefaultClient.Do(httpReq)
+	resp, err := providerHTTPClient.Do(httpReq)
 	if err != nil {
 		return nil, fmt.Errorf("provider %s unreachable at %s: %w", name, provider.BaseURL, err)
 	}

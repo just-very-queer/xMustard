@@ -347,6 +347,48 @@ func main() {
 		result, err := workspaceops.OpenAIChat(dataDir(), r.PathValue("name"), req)
 		respond(w, err, result)
 	})
+	// --- task-typed model routing over the providers ---
+	mux.HandleFunc("POST /api/route", func(w http.ResponseWriter, r *http.Request) {
+		var req workspaceops.RouteRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		q := r.URL.Query()
+		if req.Prompt == "" {
+			req.Prompt = q.Get("prompt")
+		}
+		if q.Has("has_image") {
+			req.HasImage = q.Get("has_image") == "true"
+		}
+		if req.TaskHint == "" {
+			req.TaskHint = q.Get("task_hint")
+		}
+		result, err := workspaceops.RouteModel(dataDir(), req)
+		respond(w, err, result)
+	})
+	mux.HandleFunc("POST /api/route/chat", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			workspaceops.RouteRequest
+			ImageURLs []string `json:"image_urls"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if body.Prompt == "" {
+			body.Prompt = r.URL.Query().Get("prompt")
+		}
+		result, err := workspaceops.RouteAndChat(dataDir(), body.RouteRequest, body.ImageURLs)
+		respond(w, err, result)
+	})
+	mux.HandleFunc("GET /api/routes", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.ListModelRoutes(dataDir())
+		respond(w, err, result)
+	})
+	mux.HandleFunc("POST /api/routes", func(w http.ResponseWriter, r *http.Request) {
+		var rule workspaceops.RoutingRule
+		if err := json.NewDecoder(r.Body).Decode(&rule); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON body"})
+			return
+		}
+		result, err := workspaceops.SetModelRoute(dataDir(), rule)
+		respond(w, err, result)
+	})
 	mux.HandleFunc("GET /api/postgres/plan", func(w http.ResponseWriter, r *http.Request) {
 		result, err := workspaceops.GetPostgresSchemaPlan(
 			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
@@ -3437,7 +3479,7 @@ func main() {
 			req.Agent = q.Get("agent")
 		}
 		if q.Has("approve") {
-			req.Approve = q.Get("approve") != "false"
+			req.Approve = q.Get("approve") == "true" // only a literal "true" approves; anything else is a reject
 		}
 		if req.Note == "" {
 			req.Note = q.Get("note")
@@ -3765,7 +3807,11 @@ func main() {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 	})
 
-	addr := ":" + envDefault("XMUSTARD_API_PORT", "8080")
+	// Bind to loopback by default — the API has no auth layer and makes
+	// server-side requests (providers), so it should not be exposed on all
+	// interfaces unless the operator explicitly opts in via XMUSTARD_API_HOST=0.0.0.0.
+	host := envDefault("XMUSTARD_API_HOST", "127.0.0.1")
+	addr := host + ":" + envDefault("XMUSTARD_API_PORT", "8080")
 	log.Printf("xmustard api-go listening on %s", addr)
 	log.Fatal(http.ListenAndServe(addr, mux))
 }

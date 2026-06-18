@@ -119,6 +119,14 @@ func tools() []tool {
 				}
 				return "POST", p
 			}},
+		{"route_model", "Classify a coding request into a task type and pick the best provider+model (task-typed routing). Returns the routing decision without executing.", []string{"prompt"},
+			func(a map[string]string) (string, string) {
+				p := "/api/route?prompt=" + url.QueryEscape(a["prompt"])
+				if a["task_hint"] != "" {
+					p += "&task_hint=" + url.QueryEscape(a["task_hint"])
+				}
+				return "POST", p
+			}},
 		{"search_repo", "Hybrid lexical+structural search over the repo's symbols and files.", []string{"workspace_id", "query"},
 			func(a map[string]string) (string, string) {
 				return "GET", wsPath(a, "/search") + "?q=" + url.QueryEscape(a["query"])

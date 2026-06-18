@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 )
@@ -47,6 +48,17 @@ type ProposeContextRequest struct {
 	// the entry is promoted immediately (single-agent mode); when true, it needs
 	// the multi-agent threshold. nil → use the workspace/global setting.
 	RequireVerification *bool `json:"require_verification,omitempty"`
+}
+
+// safeIDPattern rejects anything that could escape the data dir or be a path
+// traversal: only alphanumerics, dash, underscore, dot (with ".." rejected).
+var safeIDPattern = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
+
+func validateSafeID(kind, id string) error {
+	if id == "" || strings.Contains(id, "..") || strings.ContainsRune(id, 0) || !safeIDPattern.MatchString(id) {
+		return fmt.Errorf("invalid %s id", kind)
+	}
+	return nil
 }
 
 func contextEntriesPath(dataDir, workspaceID string) string {
@@ -124,6 +136,9 @@ func reconcileEntry(entry *ContextEntry) {
 // ProposeContext creates a pending context entry. In single-agent mode (multi-agent
 // verification not required) it is promoted immediately.
 func ProposeContext(dataDir, workspaceID string, req ProposeContextRequest) (*ContextEntry, error) {
+	if err := validateSafeID("workspace", workspaceID); err != nil {
+		return nil, err
+	}
 	if strings.TrimSpace(req.Content) == "" {
 		return nil, fmt.Errorf("content is required")
 	}
@@ -132,8 +147,13 @@ func ProposeContext(dataDir, workspaceID string, req ProposeContextRequest) (*Co
 		permission = "readonly" // default to the safest permission
 	}
 	requireMulti, threshold := contextDefaults(dataDir)
-	if req.RequireVerification != nil {
-		requireMulti = *req.RequireVerification
+	// A per-request override may only TIGHTEN the gate (force multi-agent ON),
+	// never loosen it. Otherwise an untrusted proposer could pass
+	// require_verification:false to self-promote and poison the shared context
+	// that gets injected into every agent run. Single-agent mode is an operator
+	// SETTING (require_multi_agent_verification), not a per-request choice.
+	if req.RequireVerification != nil && *req.RequireVerification {
+		requireMulti = true
 	}
 	required := threshold
 	if !requireMulti {
@@ -175,6 +195,12 @@ func ProposeContext(dataDir, workspaceID string, req ProposeContextRequest) (*Co
 // approval threshold is now met. Distinct agents only — a single agent cannot
 // satisfy a multi-agent gate by voting twice.
 func VerifyContext(dataDir, workspaceID, entryID, agent string, approve bool, note string) (*ContextEntry, error) {
+	if err := validateSafeID("workspace", workspaceID); err != nil {
+		return nil, err
+	}
+	if err := validateSafeID("entry", entryID); err != nil {
+		return nil, err
+	}
 	agent = strings.TrimSpace(agent)
 	if agent == "" {
 		return nil, fmt.Errorf("agent is required")
@@ -219,6 +245,12 @@ func VerifyContext(dataDir, workspaceID, entryID, agent string, approve bool, no
 // already verified/promoted reject edits — they can only be superseded by a new
 // proposal (this is the "readonly" permission guarantee).
 func UpdateContextContent(dataDir, workspaceID, entryID, content string) (*ContextEntry, error) {
+	if err := validateSafeID("workspace", workspaceID); err != nil {
+		return nil, err
+	}
+	if err := validateSafeID("entry", entryID); err != nil {
+		return nil, err
+	}
 	entries, err := loadContextEntries(dataDir, workspaceID)
 	if err != nil {
 		return nil, err
@@ -251,6 +283,9 @@ func UpdateContextContent(dataDir, workspaceID, entryID, content string) (*Conte
 // ListContextEntries returns entries filtered by status: "" / "all", "pending",
 // "promoted"/"active", "rejected".
 func ListContextEntries(dataDir, workspaceID, filter string) ([]ContextEntry, error) {
+	if err := validateSafeID("workspace", workspaceID); err != nil {
+		return nil, err
+	}
 	entries, err := loadContextEntries(dataDir, workspaceID)
 	if err != nil {
 		return nil, err

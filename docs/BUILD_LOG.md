@@ -47,8 +47,23 @@ entries live in `CHANGELOG.md`; this file keeps the fuller story and verificatio
    [LangChain AI agent frameworks 2026](https://www.langchain.com/resources/ai-agent-frameworks),
    [arXiv 2410.14684 RepoGraph](https://arxiv.org/abs/2410.14684).
 
-### Follow-on (next development)
-The provider layer delivers *access* (config, models, probe, chat, vision) but does not yet route
-full coding runs through these HTTP providers, and context governance is not yet injected into the
-run/issue work packet. Those two integrations — provider-backed runs + task-typed model routing, and
-verified-context-into-prompts — are the next slice.
+### Follow-on (completed same session)
+Both follow-on integrations shipped, designed via a parallel scout workflow and reviewed via an
+adversarial workflow (ultracode):
+- **Task-typed model routing** (`provider_router.go`): a research-grounded 6-type taxonomy
+  (locate / code_edit_patch / multi_step_debug_reason / repo_qa_explain / test_gen_validate /
+  vision_ui_diagnose) → provider+model by rule or capability. `/api/route*` + MCP `route_model`.
+  Verified live (code→coder, vision→vision provider).
+- **Verified-context-into-prompts**: `applyActiveContextToPrompt` injects the multi-agent-approved
+  shared context into both `StartIssueRun` and `StartAgentQuery` prompts.
+
+An adversarial review workflow (3 dimensions × verify) found 13 confirmed issues; the real ones were
+fixed and tested: per-request override can only TIGHTEN the gate (no single-agent bypass), SSRF guard
+on provider URLs (block link-local/metadata, allow loopback/RFC1918), path-traversal validation on
+ids, strict `approve` coercion, and loopback-by-default bind. Remaining: the API has no auth layer, so
+the verification gate trusts caller-asserted agent identity (assumes a trusted local network).
+
+### Still open
+Routing is a *decision/execution* service, not yet a first-class run-execution runtime (full coding
+runs still dispatch to the codex/opencode CLIs); and adding an auth layer would let the multi-agent
+gate trust real principals rather than caller-asserted agent strings.

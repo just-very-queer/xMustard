@@ -5,8 +5,8 @@ import "testing"
 func TestToolsListHasFullSurface(t *testing.T) {
 	res := toolsListResult()
 	list, _ := res["tools"].([]map[string]any)
-	if len(list) != 31 {
-		t.Fatalf("expected 31 tools, got %d", len(list))
+	if len(list) != 32 {
+		t.Fatalf("expected 32 tools, got %d", len(list))
 	}
 	want := map[string]bool{
 		"repo_state": true, "repo_summary": true, "changed_since": true, "drift": true,
@@ -18,6 +18,7 @@ func TestToolsListHasFullSurface(t *testing.T) {
 		"session_grounding": true, "subsystems": true, "owners": true, "lineage": true, "pg_search": true,
 		"pg_runs": true, "pg_issue_search": true, "lsp_document_symbols": true,
 		"context_active": true, "context_propose": true, "context_verify": true, "provider_chat": true,
+		"route_model": true,
 	}
 	for _, tl := range list {
 		delete(want, tl["name"].(string))
