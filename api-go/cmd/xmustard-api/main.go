@@ -3287,6 +3287,11 @@ func main() {
 		result, err := workspaceops.BuildSecurityReviewPacket(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))
 		issueIntel(w, err, result)
 	})
+	// --- operational dashboard ---
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/dashboard", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.BuildWorkspaceDashboard(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))
+		issueIntel(w, err, result)
+	})
 	mux.HandleFunc("POST /api/terminal/open", func(w http.ResponseWriter, r *http.Request) {
 		var request workspaceops.TerminalOpenRequest
 		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
