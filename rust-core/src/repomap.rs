@@ -50,8 +50,6 @@ const REPO_MAP_KEY_FILE_PATTERNS: &[(&str, &str)] = &[
     ("tsconfig.json", "config"),
     ("vite.config.ts", "config"),
     ("vite.config.js", "config"),
-    ("backend/app/main.py", "entry"),
-    ("backend/app/service.py", "entry"),
     ("frontend/src/App.tsx", "entry"),
 ];
 
