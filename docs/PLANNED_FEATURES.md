@@ -46,6 +46,7 @@ Legend: ✅ built · 🟡 partial/foundation · ⬜ planned (little/no code)
 
 ### B. Runtime layer (connects codex/opencode/others)
 - ✅ Runtime abstraction: codex + opencode probe, model validation, capabilities
+- ✅ **OpenAI-compatible providers** (`openai_providers.go`): Ollama / vLLM / LM Studio / OpenAI and **vision (VLM)** models via the OpenAI `/v1` schema — provider CRUD, `/models`, probe, `/chat/completions` with image content parts. Secrets never stored (only the env-var NAME). `/api/providers*` + MCP `provider_chat`. Verified live against a running Ollama (`/v1/models`, probe ok). ⬜ semantic task-typed model routing
 - ✅ Terminal transport (PTY)
 - 🟡 Managed execution: structured run state, bounded output capture, failure provenance, durable summaries, cancellation/timeout (Rust process runner is the next Python cut)
 
@@ -73,9 +74,10 @@ Legend: ✅ built · 🟡 partial/foundation · ⬜ planned (little/no code)
 ## Surface 2 — MCP context engine (cross-agent memory)
 
 The "better than markdown" shared memory layer. **BUILT — MCP stdio server live.**
-- ✅ **MCP server** (`api-go/cmd/xmustard-mcp`, stdio JSON-RPC 2.0 bridging to the HTTP API) exposing 27 typed tools: `repo_state`, `repo_summary`, `changed_since`, `drift`, `definitions`, `diagnostics`, `impact`, `run_targets`, `verify_targets`, `issue_context_packet`, `recent_failures`, `code_explainer`, `subsystem_explainer`, `hotspots`, `blast_radius`, `symbol_graph`, `issue_symbol_edges`, `search_repo`, `wiki`, `session_grounding`, `subsystems`, `owners`, `lineage`, `pg_search`, `pg_runs`, `pg_issue_search`, `lsp_document_symbols` (all verified end-to-end live)
+- ✅ **MCP server** (`api-go/cmd/xmustard-mcp`, stdio JSON-RPC 2.0 bridging to the HTTP API) exposing 31 typed tools — the 27 above plus the context-governance + provider tools: `context_active`, `context_propose`, `context_verify`, `provider_chat` (all verified end-to-end live)
 - ✅ One backend serving CLI + HTTP + **MCP** from the same contracts (CLI = `xmustard-ops`/`xmustard-core`; HTTP = `api-go`; MCP = `xmustard-mcp` over the same REST surface) — the third delivery is now built
 - ✅ Durable cross-agent memory store (goal/swarm runtime + operational memory) exposed over MCP; `session_grounding` provides the agent "re-check on reconnect" signal
+- ✅ **Context governance** (`context_governance.go`): the trust layer for shared context. Agents PROPOSE entries (permission `readonly`/`readwrite`); an entry is promoted into the active shared context only once ≥N **distinct** agents verify it; a `require_multi_agent_verification` toggle (+ per-proposal override) runs it through multiple agents or not; readonly+verified entries reject edits. `/context*` + MCP `context_propose`/`context_verify`/`context_active`. Verified live (HTTP+MCP): 2-distinct-agent promotion, duplicate-vote rejection, readonly enforcement. This is the "context consensus before action" layer the market scout found unaddressed elsewhere (see `docs/research/`).
 - ✅ User preferences from markdown (`.xmustard.yaml` path instructions, `AGENTS.md`/microagent guidance discovery + health + starter generation)
 
 ---
