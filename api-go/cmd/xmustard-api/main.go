@@ -3151,6 +3151,48 @@ func main() {
 		}
 		writeJSON(w, http.StatusOK, result)
 	})
+	// --- issue intelligence: quality, duplicates, triage, test suggestions ---
+	issueIntel := func(w http.ResponseWriter, err error, result any) {
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				writeJSON(w, http.StatusNotFound, map[string]any{"error": "Missing resource"})
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	}
+	handleIssueQuality := func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.ScoreIssueQuality(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), r.PathValue("issue_id"))
+		issueIntel(w, err, result)
+	}
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/issues/{issue_id}/quality", handleIssueQuality)
+	mux.HandleFunc("POST /api/workspaces/{workspace_id}/issues/{issue_id}/quality", handleIssueQuality)
+	mux.HandleFunc("POST /api/workspaces/{workspace_id}/quality/score-all", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.ScoreAllIssueQuality(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))
+		issueIntel(w, err, result)
+	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/issues/{issue_id}/duplicates", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.FindDuplicates(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), r.PathValue("issue_id"))
+		issueIntel(w, err, result)
+	})
+	mux.HandleFunc("POST /api/workspaces/{workspace_id}/issues/{issue_id}/triage", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.TriageIssue(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), r.PathValue("issue_id"))
+		issueIntel(w, err, result)
+	})
+	mux.HandleFunc("POST /api/workspaces/{workspace_id}/triage/all", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.TriageAllIssues(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))
+		issueIntel(w, err, result)
+	})
+	mux.HandleFunc("POST /api/workspaces/{workspace_id}/issues/{issue_id}/test-suggestions", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.GenerateTestSuggestions(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), r.PathValue("issue_id"))
+		issueIntel(w, err, result)
+	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/issues/{issue_id}/test-suggestions", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.ListTestSuggestions(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), r.PathValue("issue_id"))
+		issueIntel(w, err, result)
+	})
 	mux.HandleFunc("POST /api/terminal/open", func(w http.ResponseWriter, r *http.Request) {
 		var request workspaceops.TerminalOpenRequest
 		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
