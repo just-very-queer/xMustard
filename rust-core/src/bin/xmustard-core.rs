@@ -800,6 +800,54 @@ fn main() {
         "symbolgraph" => {
             run_symbolgraph_command(args);
         }
+        "ownership" => {
+            let Some(sub) = args.next() else {
+                eprintln!("usage: xmustard-core ownership <subsystems|owners> ...");
+                std::process::exit(2);
+            };
+            match sub.as_str() {
+                "subsystems" => {
+                    let Some(root) = args.next() else {
+                        eprintln!("usage: xmustard-core ownership subsystems <root> <workspace_id>");
+                        std::process::exit(2);
+                    };
+                    let Some(ws) = args.next() else {
+                        eprintln!("usage: xmustard-core ownership subsystems <root> <workspace_id>");
+                        std::process::exit(2);
+                    };
+                    println!(
+                        "{}",
+                        serde_json::to_string(&xmustard_core::ownership::build_subsystems(
+                            Path::new(&root),
+                            &ws
+                        ))
+                        .expect("subsystems should serialize")
+                    );
+                }
+                "owners" => {
+                    let Some(root) = args.next() else {
+                        eprintln!("usage: xmustard-core ownership owners <root> <path>");
+                        std::process::exit(2);
+                    };
+                    let Some(path) = args.next() else {
+                        eprintln!("usage: xmustard-core ownership owners <root> <path>");
+                        std::process::exit(2);
+                    };
+                    println!(
+                        "{}",
+                        serde_json::to_string(&xmustard_core::ownership::likely_owners(
+                            Path::new(&root),
+                            &path
+                        ))
+                        .expect("owners should serialize")
+                    );
+                }
+                other => {
+                    eprintln!("unknown ownership subcommand: {other}");
+                    std::process::exit(2);
+                }
+            }
+        }
         "search" => {
             let usage = "xmustard-core search <root> <workspace_id> <query> [limit]";
             let Some(root) = args.next() else {
@@ -1206,6 +1254,26 @@ fn run_changetrack_command(mut args: impl Iterator<Item = String>) {
             let root = need(args.next(), usage);
             let ws = need(args.next(), usage);
             print_json(&ct::working_tree_changes(Path::new(&root), &ws));
+        }
+        "incorporate" => {
+            let usage = "xmustard-core changetrack incorporate <data_dir> <root> <workspace_id>";
+            let data_dir = need(args.next(), usage);
+            let root = need(args.next(), usage);
+            let ws = need(args.next(), usage);
+            match ct::record_incorporation(Path::new(&data_dir), Path::new(&root), &ws) {
+                Ok(events) => print_json(&events),
+                Err(err) => {
+                    eprintln!("changetrack incorporate failed: {err}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        "lineage" => {
+            let usage = "xmustard-core changetrack lineage <data_dir> <workspace_id> <path>";
+            let data_dir = need(args.next(), usage);
+            let ws = need(args.next(), usage);
+            let path = need(args.next(), usage);
+            print_json(&ct::file_lineage(Path::new(&data_dir), &ws, &path));
         }
         other => {
             eprintln!("unknown changetrack subcommand: {other}");

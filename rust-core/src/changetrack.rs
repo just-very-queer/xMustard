@@ -7,7 +7,7 @@
 use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -132,6 +132,7 @@ pub fn build_index_baseline(
     workspace_id: &str,
 ) -> std::io::Result<IndexBaseline> {
     let map = file_hash_map(root);
+    let dirty = dirty_paths(root);
     let fingerprint = RepoFingerprint {
         root: root.display().to_string(),
         head_sha: git(root, &["rev-parse", "HEAD"]),
@@ -139,8 +140,8 @@ pub fn build_index_baseline(
         remote_url: git(root, &["remote", "get-url", "origin"]),
         tracked_file_count: map.len(),
         content_hash: content_hash_of(&map),
-        dirty: !dirty_paths(root).is_empty(),
-        dirty_path_count: dirty_paths(root).len(),
+        dirty: !dirty.is_empty(),
+        dirty_path_count: dirty.len(),
         generated_at: now(),
     };
     let baseline = IndexBaseline {
@@ -153,8 +154,7 @@ pub fn build_index_baseline(
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let body = serde_json::to_vec_pretty(&baseline)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let body = serde_json::to_vec_pretty(&baseline).map_err(std::io::Error::other)?;
     fs::write(&path, body)?;
     Ok(baseline)
 }
@@ -365,6 +365,130 @@ pub fn working_tree_changes(root: &Path, workspace_id: &str) -> ChangeSet {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Incorporation lineage: an append-only chain of when each file was first
+// indexed and each time its content changed, with the hash and head SHA at that
+// point. This is the durable "how it was worked" lineage beyond a single diff.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IncorporationEvent {
+    pub path: String,
+    pub hash: String,
+    pub head_sha: Option<String>,
+    pub event: String, // indexed | changed | deleted
+    pub at: String,
+}
+
+fn incorporation_path(data_dir: &Path, workspace_id: &str) -> std::path::PathBuf {
+    workspace_dir_ct(data_dir, workspace_id).join("incorporation.json")
+}
+
+fn workspace_dir_ct(data_dir: &Path, workspace_id: &str) -> std::path::PathBuf {
+    data_dir.join("workspaces").join(workspace_id)
+}
+
+fn load_incorporation(data_dir: &Path, workspace_id: &str) -> Vec<IncorporationEvent> {
+    fs::read(incorporation_path(data_dir, workspace_id))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
+/// Record incorporation events for any newly-added or changed (and deleted)
+/// tracked files since the last recording, appending to the durable lineage.
+/// Returns the events recorded this run.
+pub fn record_incorporation(
+    data_dir: &Path,
+    root: &Path,
+    workspace_id: &str,
+) -> std::io::Result<Vec<IncorporationEvent>> {
+    let mut log = load_incorporation(data_dir, workspace_id);
+    // last known hash per path (events are appended in order).
+    let mut last_hash: BTreeMap<String, String> = BTreeMap::new();
+    let mut known: BTreeSet<String> = BTreeSet::new();
+    for e in &log {
+        if e.event == "deleted" {
+            last_hash.remove(&e.path);
+            known.remove(&e.path);
+        } else {
+            last_hash.insert(e.path.clone(), e.hash.clone());
+            known.insert(e.path.clone());
+        }
+    }
+
+    let current = file_hash_map(root);
+    let head = git(root, &["rev-parse", "HEAD"]);
+    let at = now();
+    let mut new_events = Vec::new();
+    for (path, hash) in &current {
+        match last_hash.get(path) {
+            Some(prev) if prev == hash => {}
+            Some(_) => new_events.push(IncorporationEvent {
+                path: path.clone(),
+                hash: hash.clone(),
+                head_sha: head.clone(),
+                event: "changed".to_string(),
+                at: at.clone(),
+            }),
+            None => new_events.push(IncorporationEvent {
+                path: path.clone(),
+                hash: hash.clone(),
+                head_sha: head.clone(),
+                event: "indexed".to_string(),
+                at: at.clone(),
+            }),
+        }
+    }
+    for path in &known {
+        if !current.contains_key(path) {
+            new_events.push(IncorporationEvent {
+                path: path.clone(),
+                hash: String::new(),
+                head_sha: head.clone(),
+                event: "deleted".to_string(),
+                at: at.clone(),
+            });
+        }
+    }
+
+    if !new_events.is_empty() {
+        log.extend(new_events.clone());
+        let path = incorporation_path(data_dir, workspace_id);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let body = serde_json::to_vec_pretty(&log).map_err(std::io::Error::other)?;
+        fs::write(&path, body)?;
+    }
+    Ok(new_events)
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FileLineage {
+    pub workspace_id: String,
+    pub path: String,
+    pub events: Vec<IncorporationEvent>,
+    pub change_count: usize,
+    pub generated_at: String,
+}
+
+/// The incorporation lineage (event chain) for one file.
+pub fn file_lineage(data_dir: &Path, workspace_id: &str, path: &str) -> FileLineage {
+    let events: Vec<IncorporationEvent> = load_incorporation(data_dir, workspace_id)
+        .into_iter()
+        .filter(|e| e.path == path)
+        .collect();
+    let change_count = events.iter().filter(|e| e.event == "changed").count();
+    FileLineage {
+        workspace_id: workspace_id.to_string(),
+        path: path.to_string(),
+        events,
+        change_count,
+        generated_at: now(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -446,5 +570,30 @@ mod tests {
         assert_eq!(by.get("mod"), Some(&"modified"));
         assert_eq!(by.get("gone"), Some(&"deleted"));
         assert_eq!(by.get("keep"), None);
+    }
+
+    #[test]
+    fn incorporation_lineage_chains_changes() {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        git_init(repo.path());
+        fs::write(repo.path().join("a.rs"), "pub fn one() {}\n").unwrap();
+        git_commit(repo.path());
+
+        // first record -> "indexed"
+        let e1 = record_incorporation(data.path(), repo.path(), "ws").unwrap();
+        assert!(e1.iter().any(|e| e.path == "a.rs" && e.event == "indexed"));
+        // no change -> no new events
+        let e2 = record_incorporation(data.path(), repo.path(), "ws").unwrap();
+        assert!(e2.is_empty());
+        // change + record -> "changed"
+        fs::write(repo.path().join("a.rs"), "pub fn one() {}\npub fn two() {}\n").unwrap();
+        git_commit(repo.path());
+        let e3 = record_incorporation(data.path(), repo.path(), "ws").unwrap();
+        assert!(e3.iter().any(|e| e.path == "a.rs" && e.event == "changed"));
+
+        let lineage = file_lineage(data.path(), "ws", "a.rs");
+        assert_eq!(lineage.events.len(), 2); // indexed + changed
+        assert_eq!(lineage.change_count, 1);
     }
 }

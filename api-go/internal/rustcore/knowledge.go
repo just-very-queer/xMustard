@@ -19,3 +19,6 @@ func runCore(sub string, args ...string) ([]byte, error) {
 // RunSearch runs hybrid repo search; RunWiki generates the repo wiki.
 func RunSearch(args ...string) ([]byte, error) { return runCore("search", args...) }
 func RunWiki(args ...string) ([]byte, error)   { return runCore("wiki", args...) }
+
+// RunOwnership runs the ownership/subsystem model commands.
+func RunOwnership(args ...string) ([]byte, error) { return runCore("ownership", args...) }

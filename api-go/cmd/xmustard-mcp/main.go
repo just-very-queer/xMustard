@@ -90,6 +90,22 @@ func tools() []tool {
 			}},
 		{"wiki", "Generated repo wiki: overview + per-subsystem pages from the symbol graph.", []string{"workspace_id"},
 			func(a map[string]string) (string, string) { return "GET", wsPath(a, "/wiki") }},
+		{"session_grounding", "What changed / what's broken / what's blocked since the indexed baseline.", []string{"workspace_id"},
+			func(a map[string]string) (string, string) { return "GET", wsPath(a, "/session-grounding") }},
+		{"subsystems", "Subsystem/ownership model: clusters, cohesion, file/symbol counts.", []string{"workspace_id"},
+			func(a map[string]string) (string, string) { return "GET", wsPath(a, "/subsystems") }},
+		{"owners", "Likely owners of a file or directory (from git history).", []string{"workspace_id", "path"},
+			func(a map[string]string) (string, string) {
+				return "GET", wsPath(a, "/owners") + "?path=" + url.QueryEscape(a["path"])
+			}},
+		{"lineage", "Incorporation lineage of a file: when indexed and each change, with hashes.", []string{"workspace_id", "path"},
+			func(a map[string]string) (string, string) {
+				return "GET", wsPath(a, "/lineage") + "?path=" + url.QueryEscape(a["path"])
+			}},
+		{"pg_search", "Postgres FTS hybrid search (BM25-style ts_rank + structural) over the index.", []string{"workspace_id", "query"},
+			func(a map[string]string) (string, string) {
+				return "GET", wsPath(a, "/pg/search") + "?q=" + url.QueryEscape(a["query"])
+			}},
 	}
 }
 
