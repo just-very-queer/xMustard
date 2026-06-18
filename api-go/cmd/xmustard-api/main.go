@@ -3337,6 +3337,26 @@ func main() {
 		result, err := workspaceops.SymbolBlastRadius(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), symbol)
 		issueIntel(w, err, result)
 	})
+	// --- knowledge layer: hybrid search + wiki ---
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/search", func(w http.ResponseWriter, r *http.Request) {
+		query := r.URL.Query().Get("q")
+		if query == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "q query param required"})
+			return
+		}
+		limit := 25
+		if v := r.URL.Query().Get("limit"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil {
+				limit = n
+			}
+		}
+		result, err := workspaceops.WorkspaceSearch(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), query, limit)
+		issueIntel(w, err, result)
+	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/wiki", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.WorkspaceWiki(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))
+		issueIntel(w, err, result)
+	})
 	// --- run confidence, owner suggestions, ownership, eval timeline, ticket ingest, guidance customization ---
 	mux.HandleFunc("GET /api/workspaces/{workspace_id}/runs/{run_id}/confidence", func(w http.ResponseWriter, r *http.Request) {
 		result, err := workspaceops.ScoreRunConfidence(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), r.PathValue("run_id"))

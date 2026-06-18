@@ -84,6 +84,12 @@ func tools() []tool {
 			}},
 		{"symbol_graph", "The full semantic symbol graph: files, symbols, and reference edges.", []string{"workspace_id"},
 			func(a map[string]string) (string, string) { return "GET", wsPath(a, "/symbol-graph") }},
+		{"search_repo", "Hybrid lexical+structural search over the repo's symbols and files.", []string{"workspace_id", "query"},
+			func(a map[string]string) (string, string) {
+				return "GET", wsPath(a, "/search") + "?q=" + url.QueryEscape(a["query"])
+			}},
+		{"wiki", "Generated repo wiki: overview + per-subsystem pages from the symbol graph.", []string{"workspace_id"},
+			func(a map[string]string) (string, string) { return "GET", wsPath(a, "/wiki") }},
 	}
 }
 
@@ -148,6 +154,10 @@ func toolsListResult() map[string]any {
 				desc = "the issue/bug id"
 			case "path":
 				desc = "a repo-relative file or directory path"
+			case "query":
+				desc = "the search query"
+			case "symbol":
+				desc = "a symbol name"
 			}
 			props[r] = map[string]any{"type": "string", "description": desc}
 		}

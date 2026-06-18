@@ -800,6 +800,43 @@ fn main() {
         "symbolgraph" => {
             run_symbolgraph_command(args);
         }
+        "search" => {
+            let usage = "xmustard-core search <root> <workspace_id> <query> [limit]";
+            let Some(root) = args.next() else {
+                eprintln!("usage: {usage}");
+                std::process::exit(2);
+            };
+            let Some(ws) = args.next() else {
+                eprintln!("usage: {usage}");
+                std::process::exit(2);
+            };
+            let Some(query) = args.next() else {
+                eprintln!("usage: {usage}");
+                std::process::exit(2);
+            };
+            let limit = args.next().and_then(|v| v.parse::<usize>().ok()).unwrap_or(25);
+            let result = xmustard_core::search::hybrid_search(&PathBuf::from(root), &ws, &query, limit);
+            println!(
+                "{}",
+                serde_json::to_string(&result).expect("search result should serialize")
+            );
+        }
+        "wiki" => {
+            let usage = "xmustard-core wiki <root> <workspace_id>";
+            let Some(root) = args.next() else {
+                eprintln!("usage: {usage}");
+                std::process::exit(2);
+            };
+            let Some(ws) = args.next() else {
+                eprintln!("usage: {usage}");
+                std::process::exit(2);
+            };
+            let result = xmustard_core::wiki::generate_wiki(&PathBuf::from(root), &ws);
+            println!(
+                "{}",
+                serde_json::to_string(&result).expect("wiki result should serialize")
+            );
+        }
         _ => {
             eprintln!("unknown command: {command}");
             std::process::exit(2);
