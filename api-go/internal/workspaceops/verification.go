@@ -412,6 +412,27 @@ func saveCoverageResult(dataDir string, result *rustcore.CoverageResult) error {
 	return writeJSON(path, result)
 }
 
+// writeActivityRecord appends one record to the workspace's activity.jsonl. Every
+// append*Activity helper builds its record and funnels through this single sink
+// instead of repeating the open-append-marshal-write block.
+func writeActivityRecord(dataDir string, workspaceID string, record activityRecord) error {
+	path := filepath.Join(dataDir, "workspaces", workspaceID, "activity.jsonl")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	handle, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	defer handle.Close()
+	payload, err := json.Marshal(record)
+	if err != nil {
+		return err
+	}
+	_, err = handle.Write(append(payload, '\n'))
+	return err
+}
+
 func appendActivity(dataDir string, workspaceID string, issueID string, runID string, action string, summary string, details map[string]any) error {
 	createdAt := nowUTC()
 	record := activityRecord{
@@ -429,25 +450,7 @@ func appendActivity(dataDir string, workspaceID string, issueID string, runID st
 	if runID != "" {
 		record.RunID = &runID
 	}
-
-	path := filepath.Join(dataDir, "workspaces", workspaceID, "activity.jsonl")
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
-	handle, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
-	if err != nil {
-		return err
-	}
-	defer handle.Close()
-
-	payload, err := json.Marshal(record)
-	if err != nil {
-		return err
-	}
-	if _, err := handle.Write(append(payload, '\n')); err != nil {
-		return err
-	}
-	return nil
+	return writeActivityRecord(dataDir, workspaceID, record)
 }
 
 func appendUnique(items []string, value string) []string {
