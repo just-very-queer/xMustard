@@ -2,25 +2,17 @@ package main
 
 import "testing"
 
-func TestToolsListHasFullSurface(t *testing.T) {
+// The MCP surface is deliberately small (see docs/RETHINK.md): governed memory +
+// grounding + narrow retrieval, not a sprawling platform.
+func TestToolsListIsSharpSurface(t *testing.T) {
 	res := toolsListResult()
 	list, _ := res["tools"].([]map[string]any)
-	if len(list) != 39 {
-		t.Fatalf("expected 39 tools, got %d", len(list))
+	if len(list) != 8 {
+		t.Fatalf("expected a sharp 8-tool surface, got %d", len(list))
 	}
 	want := map[string]bool{
-		"repo_state": true, "repo_summary": true, "changed_since": true, "drift": true,
-		"definitions": true, "diagnostics": true, "impact": true, "run_targets": true,
-		"verify_targets": true, "issue_context_packet": true, "recent_failures": true,
-		"code_explainer": true, "subsystem_explainer": true,
-		"hotspots": true, "blast_radius": true, "symbol_graph": true, "issue_symbol_edges": true,
-		"search_repo": true, "wiki": true,
-		"session_grounding": true, "subsystems": true, "owners": true, "lineage": true, "pg_search": true,
-		"pg_runs": true, "pg_issue_search": true, "lsp_document_symbols": true,
-		"context_active": true, "context_propose": true, "context_verify": true, "provider_chat": true,
-		"route_model": true,
-		"run_confidence": true, "run_brief": true, "review_packet": true, "owner_suggestions": true,
-		"ownership_history": true, "eval_timeline": true, "agent_identities": true,
+		"ground": true, "recall": true, "remember": true, "verify": true,
+		"search": true, "explain": true, "impact": true, "diagnostics": true,
 	}
 	for _, tl := range list {
 		delete(want, tl["name"].(string))
@@ -45,7 +37,7 @@ func TestDispatchInitialize(t *testing.T) {
 }
 
 func TestCallToolMissingArg(t *testing.T) {
-	r := callTool("issue_context_packet", map[string]string{"workspace_id": "ws"}) // missing issue_id
+	r := callTool("explain", map[string]string{"workspace_id": "ws"}) // missing path
 	if r["isError"] != true {
 		t.Fatalf("expected isError for missing arg, got %v", r)
 	}
@@ -59,9 +51,9 @@ func TestUnknownMethod(t *testing.T) {
 }
 
 func TestToolURLBuilding(t *testing.T) {
-	tl, ok := toolByName("code_explainer")
+	tl, ok := toolByName("explain")
 	if !ok {
-		t.Fatal("code_explainer missing")
+		t.Fatal("explain missing")
 	}
 	method, path := tl.Build(map[string]string{"workspace_id": "ws1", "path": "src/a.go"})
 	if method != "GET" || path != "/api/workspaces/ws1/explain-path?path=src%2Fa.go" {

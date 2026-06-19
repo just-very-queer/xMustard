@@ -41,150 +41,44 @@ func wsPath(args map[string]string, suffix string) string {
 }
 
 func tools() []tool {
+	// A deliberately SMALL, narrow tool surface (see docs/RETHINK.md). The product's
+	// value is governed runtime memory + grounding — not a 39-tool platform. Large
+	// tool sets bloat the agent's context and cause context rot; the winning agents
+	// use 2-3 tools. The full HTTP API remains; this is the high-signal slice an
+	// agent should actually see.
 	return []tool{
-		{"repo_state", "Current repo state: what repo this is, branch, dirty state, and health.", []string{"workspace_id"},
-			func(a map[string]string) (string, string) { return "GET", wsPath(a, "/repo-state") }},
-		{"repo_summary", "Structural repo map summary (files, directories, key files).", []string{"workspace_id"},
-			func(a map[string]string) (string, string) { return "GET", wsPath(a, "/snapshot") }},
-		{"changed_since", "Uncommitted working-tree changes plus dirty SYMBOLS (not just files).", []string{"workspace_id"},
-			func(a map[string]string) (string, string) { return "GET", wsPath(a, "/changes") }},
-		{"drift", "Stale-index / sibling-clone drift vs the indexed baseline — is the index trustworthy.", []string{"workspace_id"},
-			func(a map[string]string) (string, string) { return "GET", wsPath(a, "/changes/drift") }},
-		{"definitions", "Symbols defined in a file (path-relative).", []string{"workspace_id", "path"},
-			func(a map[string]string) (string, string) {
-				return "GET", wsPath(a, "/path-symbols") + "?path=" + url.QueryEscape(a["path"])
-			}},
-		{"diagnostics", "Normalized diagnostics (errors/warnings) for the workspace.", []string{"workspace_id"},
-			func(a map[string]string) (string, string) { return "GET", wsPath(a, "/diagnostics") }},
-		{"impact", "Likely impact of current changes: changed symbols + affected files/tests.", []string{"workspace_id"},
-			func(a map[string]string) (string, string) { return "GET", wsPath(a, "/changes/since-index") }},
-		{"run_targets", "Detected run/build/test/lint targets for the repo.", []string{"workspace_id"},
-			func(a map[string]string) (string, string) { return "GET", wsPath(a, "/run-targets") }},
-		{"verify_targets", "Detected verification targets for the repo.", []string{"workspace_id"},
-			func(a map[string]string) (string, string) { return "GET", wsPath(a, "/verify-targets") }},
-		{"issue_context_packet", "Full grounded context packet for an issue.", []string{"workspace_id", "issue_id"},
-			func(a map[string]string) (string, string) {
-				return "GET", wsPath(a, "/issues/"+url.PathEscape(a["issue_id"])+"/context")
-			}},
-		{"recent_failures", "Recent runs (inspect for failures) in the workspace.", []string{"workspace_id"},
-			func(a map[string]string) (string, string) { return "GET", wsPath(a, "/runs") }},
-		{"code_explainer", "Explain a file: purpose, role, key symbols, how to run/verify.", []string{"workspace_id", "path"},
-			func(a map[string]string) (string, string) {
-				return "GET", wsPath(a, "/explain-path") + "?path=" + url.QueryEscape(a["path"])
-			}},
-		{"subsystem_explainer", "Explain a subsystem/directory's purpose and structure.", []string{"workspace_id", "path"},
-			func(a map[string]string) (string, string) {
-				return "GET", wsPath(a, "/explain-path") + "?path=" + url.QueryEscape(a["path"])
-			}},
-		{"hotspots", "Most-depended-on files (risky to touch) from the symbol graph.", []string{"workspace_id"},
-			func(a map[string]string) (string, string) { return "GET", wsPath(a, "/hotspots") }},
-		{"blast_radius", "What files reference a symbol — the blast radius of changing it.", []string{"workspace_id", "symbol"},
-			func(a map[string]string) (string, string) {
-				return "GET", wsPath(a, "/blast-radius") + "?symbol=" + url.QueryEscape(a["symbol"])
-			}},
-		{"symbol_graph", "The full semantic symbol graph: files, symbols, and typed edges (imports/calls/inherits/tests/references).", []string{"workspace_id"},
-			func(a map[string]string) (string, string) { return "GET", wsPath(a, "/symbol-graph") }},
-		{"issue_symbol_edges", "Typed issue↔symbol edges: which issues mention or have evidence pointing at which defined symbols.", []string{"workspace_id"},
-			func(a map[string]string) (string, string) { return "GET", wsPath(a, "/issue-symbol-edges") }},
-		{"lsp_document_symbols", "Live LSP document symbols for a file (rust-core spawns the real language server). Degrades gracefully if the server isn't installed.", []string{"workspace_id", "path"},
-			func(a map[string]string) (string, string) {
-				return "GET", wsPath(a, "/lsp/document-symbols") + "?path=" + url.QueryEscape(a["path"])
-			}},
-		{"context_active", "The trusted shared context: entries promoted after multi-agent verification (read-only view an agent should ground on).", []string{"workspace_id"},
+		{"ground", "Orient before acting: what changed / what's stale / what's broken / what's blocked since the indexed baseline, with index-trust (drift) included.", []string{"workspace_id"},
+			func(a map[string]string) (string, string) { return "GET", wsPath(a, "/session-grounding") }},
+		{"recall", "The VERIFIED shared context to trust (entries promoted after multi-agent verification). Ground on this instead of re-deriving facts.", []string{"workspace_id"},
 			func(a map[string]string) (string, string) { return "GET", wsPath(a, "/context/active") }},
-		{"context_propose", "Propose a context entry for the shared context (pending until verified by enough agents). Pass content; optional title/source.", []string{"workspace_id", "content"},
+		{"remember", "Propose a durable memory (fact/decision/gotcha) for the shared context; pending until verified by enough agents. Pass content; optional title.", []string{"workspace_id", "content"},
 			func(a map[string]string) (string, string) {
 				p := wsPath(a, "/context") + "?content=" + url.QueryEscape(a["content"])
 				if a["title"] != "" {
 					p += "&title=" + url.QueryEscape(a["title"])
 				}
-				if a["source"] != "" {
-					p += "&source=" + url.QueryEscape(a["source"])
-				}
 				return "POST", p
 			}},
-		{"context_verify", "Verify (approve/reject) a proposed context entry as an agent; promotes it once the multi-agent threshold is met.", []string{"workspace_id", "entry_id", "agent"},
+		{"verify", "Verify (approve/reject) a peer's proposed memory; it promotes once enough DISTINCT agents approve. Your identity is your auth token; approve defaults true.", []string{"workspace_id", "entry_id"},
 			func(a map[string]string) (string, string) {
 				approve := "true"
 				if a["approve"] == "false" {
 					approve = "false"
 				}
-				return "POST", wsPath(a, "/context/"+url.PathEscape(a["entry_id"])+"/verify") + "?agent=" + url.QueryEscape(a["agent"]) + "&approve=" + approve
+				return "POST", wsPath(a, "/context/"+url.PathEscape(a["entry_id"])+"/verify") + "?approve=" + approve
 			}},
-		{"provider_chat", "Call an OpenAI-compatible provider (Ollama/vLLM/LM Studio/OpenAI) by name with a prompt; optional model. For local/private model access.", []string{"provider", "prompt"},
-			func(a map[string]string) (string, string) {
-				p := "/api/providers/" + url.PathEscape(a["provider"]) + "/chat?prompt=" + url.QueryEscape(a["prompt"])
-				if a["model"] != "" {
-					p += "&model=" + url.QueryEscape(a["model"])
-				}
-				return "POST", p
-			}},
-		{"route_model", "Classify a coding request into a task type and pick the best provider+model (task-typed routing). Returns the routing decision without executing.", []string{"prompt"},
-			func(a map[string]string) (string, string) {
-				p := "/api/route?prompt=" + url.QueryEscape(a["prompt"])
-				if a["task_hint"] != "" {
-					p += "&task_hint=" + url.QueryEscape(a["task_hint"])
-				}
-				return "POST", p
-			}},
-		{"run_confidence", "Confidence score + signals for a run (did it likely succeed): tests, diffs, verification.", []string{"workspace_id", "run_id"},
-			func(a map[string]string) (string, string) {
-				return "GET", wsPath(a, "/runs/"+url.PathEscape(a["run_id"])+"/confidence")
-			}},
-		{"run_brief", "Concise brief for a run: what it did, status, key artifacts — the agent handoff summary.", []string{"workspace_id", "run_id"},
-			func(a map[string]string) (string, string) {
-				return "GET", wsPath(a, "/runs/"+url.PathEscape(a["run_id"])+"/brief")
-			}},
-		{"review_packet", "Grounded review packet for an issue: changes, evidence, verification, checklists for a reviewer.", []string{"workspace_id", "issue_id"},
-			func(a map[string]string) (string, string) {
-				return "GET", wsPath(a, "/issues/"+url.PathEscape(a["issue_id"])+"/review-packet")
-			}},
-		{"owner_suggestions", "Suggested owners/reviewers for an issue (from code ownership + history).", []string{"workspace_id", "issue_id"},
-			func(a map[string]string) (string, string) {
-				return "GET", wsPath(a, "/issues/"+url.PathEscape(a["issue_id"])+"/owner-suggestions")
-			}},
-		{"ownership_history", "Ownership history for an issue: who has touched the implicated code over time.", []string{"workspace_id", "issue_id"},
-			func(a map[string]string) (string, string) {
-				return "GET", wsPath(a, "/issues/"+url.PathEscape(a["issue_id"])+"/ownership-history")
-			}},
-		{"eval_timeline", "Multi-batch evaluation timeline for the workspace: scenario movement across replay batches.", []string{"workspace_id"},
-			func(a map[string]string) (string, string) { return "GET", wsPath(a, "/eval-timeline") }},
-		{"agent_identities", "The persistent agent-identity registry: which runtimes/models have acted in this workspace.", []string{"workspace_id"},
-			func(a map[string]string) (string, string) { return "GET", wsPath(a, "/agents") }},
-		{"search_repo", "Hybrid lexical+structural search over the repo's symbols and files.", []string{"workspace_id", "query"},
+		{"search", "Narrow hybrid code search (lexical + structural) over the repo's symbols and files. Returns relevant slices, not a dump.", []string{"workspace_id", "query"},
 			func(a map[string]string) (string, string) {
 				return "GET", wsPath(a, "/search") + "?q=" + url.QueryEscape(a["query"])
 			}},
-		{"wiki", "Generated repo wiki: overview + per-subsystem pages from the symbol graph.", []string{"workspace_id"},
-			func(a map[string]string) (string, string) { return "GET", wsPath(a, "/wiki") }},
-		{"session_grounding", "What changed / what's broken / what's blocked since the indexed baseline.", []string{"workspace_id"},
-			func(a map[string]string) (string, string) { return "GET", wsPath(a, "/session-grounding") }},
-		{"subsystems", "Subsystem/ownership model: clusters, cohesion, file/symbol counts.", []string{"workspace_id"},
-			func(a map[string]string) (string, string) { return "GET", wsPath(a, "/subsystems") }},
-		{"owners", "Likely owners of a file or directory (from git history).", []string{"workspace_id", "path"},
+		{"explain", "Explain a file or directory: purpose, role, key symbols, and how to run/verify it.", []string{"workspace_id", "path"},
 			func(a map[string]string) (string, string) {
-				return "GET", wsPath(a, "/owners") + "?path=" + url.QueryEscape(a["path"])
+				return "GET", wsPath(a, "/explain-path") + "?path=" + url.QueryEscape(a["path"])
 			}},
-		{"lineage", "Incorporation lineage of a file: when indexed and each change, with hashes.", []string{"workspace_id", "path"},
-			func(a map[string]string) (string, string) {
-				return "GET", wsPath(a, "/lineage") + "?path=" + url.QueryEscape(a["path"])
-			}},
-		{"pg_search", "Postgres FTS hybrid search (RRF of ts_rank + structural lanes) over the symbol index.", []string{"workspace_id", "query"},
-			func(a map[string]string) (string, string) {
-				return "GET", wsPath(a, "/pg/search") + "?q=" + url.QueryEscape(a["query"])
-			}},
-		{"pg_runs", "Recent runs from the Postgres ops index (optionally filter by status).", []string{"workspace_id"},
-			func(a map[string]string) (string, string) {
-				p := wsPath(a, "/pg/runs")
-				if s := a["status"]; s != "" {
-					p += "?status=" + url.QueryEscape(s)
-				}
-				return "GET", p
-			}},
-		{"pg_issue_search", "Postgres FTS over the workspace's issues (title/summary/impact/notes).", []string{"workspace_id", "query"},
-			func(a map[string]string) (string, string) {
-				return "GET", wsPath(a, "/pg/issues/search") + "?q=" + url.QueryEscape(a["query"])
-			}},
+		{"impact", "Likely blast radius of the current changes: changed symbols and the files/tests they affect.", []string{"workspace_id"},
+			func(a map[string]string) (string, string) { return "GET", wsPath(a, "/changes/since-index") }},
+		{"diagnostics", "Current normalized diagnostics (errors/warnings) for the workspace.", []string{"workspace_id"},
+			func(a map[string]string) (string, string) { return "GET", wsPath(a, "/diagnostics") }},
 	}
 }
 
