@@ -210,6 +210,18 @@ func TestDriftOnRecallFlagsStaleMemory(t *testing.T) {
 	}
 }
 
+func TestOverlappingMemorySurfacesConflicts(t *testing.T) {
+	entries := []ContextEntry{
+		{ID: "a", Title: "uses /api", Paths: []string{"server.go"}},
+		{ID: "b", Title: "uses /v2", Paths: []string{"server.go", "router.go"}},
+		{ID: "c", Title: "unrelated", Paths: []string{"db.go"}},
+	}
+	conflicts := overlappingMemory(entries)
+	if len(conflicts) != 1 || conflicts[0].Path != "server.go" || len(conflicts[0].EntryIDs) != 2 {
+		t.Fatalf("expected one server.go conflict between a+b, got %+v", conflicts)
+	}
+}
+
 func TestRejectionBlocksPromotion(t *testing.T) {
 	dir := t.TempDir()
 	ws := "ws4"

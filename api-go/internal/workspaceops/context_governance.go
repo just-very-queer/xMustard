@@ -452,7 +452,40 @@ func GetActiveContext(dataDir, workspaceID string) (map[string]any, error) {
 		"verification_threshold": threshold,
 		"active_count":           len(promoted),
 		"stale_count":            staleCount,
+		"conflicts":              overlappingMemory(promoted),
 		"entries":                promoted,
 		"generated_at":           nowUTC(),
 	}, nil
+}
+
+// MemoryConflict flags a file that 2+ active memories claim something about — the
+// agent should reconcile them before trusting either (lean "conflict detection":
+// path overlap, not proven contradiction).
+type MemoryConflict struct {
+	Path     string   `json:"path"`
+	EntryIDs []string `json:"entry_ids"`
+	Titles   []string `json:"titles"`
+}
+
+func overlappingMemory(entries []ContextEntry) []MemoryConflict {
+	byPath := map[string][]ContextEntry{}
+	for _, e := range entries {
+		for _, p := range e.Paths {
+			byPath[p] = append(byPath[p], e)
+		}
+	}
+	out := []MemoryConflict{}
+	for p, es := range byPath {
+		if len(es) < 2 {
+			continue
+		}
+		c := MemoryConflict{Path: p}
+		for _, e := range es {
+			c.EntryIDs = append(c.EntryIDs, e.ID)
+			c.Titles = append(c.Titles, fallbackString(e.Title, e.ID))
+		}
+		out = append(out, c)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
+	return out
 }
