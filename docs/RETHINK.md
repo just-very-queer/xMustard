@@ -60,10 +60,17 @@ source path. Measure on a real task, not a feature count.
 
 ## Implementation order
 
-1. **Sharpen the MCP surface to ~8 narrow, high-signal tools** (this commit). The
-   backing HTTP endpoints stay; the agent-facing surface gets disciplined.
-2. Drift-on-recall: when `recall`/`ground` runs, re-check memory against the live
-   tree and flag stale entries.
-3. Memory health: staleness + conflict scoring on context entries.
-4. Retire the materialized static index as the default; keep search live + narrow.
-5. Deprecate goal/swarm + ops/eval/security platform surfaces (move to UI-only or remove).
+1. ✅ **Sharpened the MCP surface to 8 narrow tools** (ground, recall, remember,
+   verify, search, explain, impact, diagnostics). Backing HTTP API unchanged.
+2. ✅ **Drift-on-recall**: a memory references the paths it's about; their content
+   hashes are snapshotted at promotion; `recall`/`ground` re-check against the live
+   tree and flag stale entries (`stale_count`, `stale_paths`, `stale_memory`).
+3. ✅ **Memory conflict surfacing**: `recall` reports `conflicts` — files 2+ active
+   memories claim something about — so agents reconcile before trusting.
+4. ⬜ Retire the materialized static index as the default; keep search live + narrow.
+5. ⬜ Deprecate goal/swarm + ops/eval/security platform surfaces (UI-only or remove).
+   (The agent surface is already free of them; this is internal cleanup, deferred —
+   not gutting features without an explicit call.)
+
+The governed-memory moat (propose → multi-agent verify → promote → drift → conflict)
+is delivered and sharp. That is the product; the rest is a future UI's concern.
