@@ -51,11 +51,14 @@ func tools() []tool {
 			func(a map[string]string) (string, string) { return "GET", wsPath(a, "/session-grounding") }},
 		{"recall", "The VERIFIED shared context to trust (entries promoted after multi-agent verification). Ground on this instead of re-deriving facts.", []string{"workspace_id"},
 			func(a map[string]string) (string, string) { return "GET", wsPath(a, "/context/active") }},
-		{"remember", "Propose a durable memory (fact/decision/gotcha) for the shared context; pending until verified by enough agents. Pass content; optional title.", []string{"workspace_id", "content"},
+		{"remember", "Propose a durable memory (fact/decision/gotcha) for the shared context; pending until verified by enough agents. Pass content; optional title and paths (comma-separated files the memory is about, so recall can flag it stale when they change).", []string{"workspace_id", "content"},
 			func(a map[string]string) (string, string) {
 				p := wsPath(a, "/context") + "?content=" + url.QueryEscape(a["content"])
 				if a["title"] != "" {
 					p += "&title=" + url.QueryEscape(a["title"])
+				}
+				if a["paths"] != "" {
+					p += "&paths=" + url.QueryEscape(a["paths"])
 				}
 				return "POST", p
 			}},

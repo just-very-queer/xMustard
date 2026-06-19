@@ -69,6 +69,7 @@ type SessionGrounding struct {
 	RecentFailedRuns             []string        `json:"recent_failed_runs"`
 	BlockedByDirtyState          bool            `json:"blocked_by_dirty_state"`
 	BlockedByFailingVerification bool            `json:"blocked_by_failing_verification"`
+	StaleMemory                  int             `json:"stale_memory"`
 	Summary                      string          `json:"summary"`
 	GeneratedAt                  string          `json:"generated_at"`
 }
@@ -114,7 +115,13 @@ func BuildSessionGrounding(dataDir, workspaceID string) (*SessionGrounding, erro
 		BlockedByFailingVerification: len(failed) > 0,
 		GeneratedAt:                  time.Now().UTC().Format(time.RFC3339),
 	}
-	g.Summary = fmt.Sprintf("%d changed file(s), %d dirty symbol(s), %d failed run(s).",
-		g.ChangedFiles, g.DirtySymbols, len(failed))
+	// stale verified-memory (drift-on-recall) — memory whose referenced files changed.
+	if active, err := GetActiveContext(dataDir, workspaceID); err == nil {
+		if n, ok := active["stale_count"].(int); ok {
+			g.StaleMemory = n
+		}
+	}
+	g.Summary = fmt.Sprintf("%d changed file(s), %d dirty symbol(s), %d failed run(s), %d stale memory.",
+		g.ChangedFiles, g.DirtySymbols, len(failed), g.StaleMemory)
 	return g, nil
 }

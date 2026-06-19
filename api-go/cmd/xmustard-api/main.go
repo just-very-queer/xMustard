@@ -3317,6 +3317,9 @@ func main() {
 		if req.Permission == "" {
 			req.Permission = q.Get("permission")
 		}
+		if len(req.Paths) == 0 && q.Get("paths") != "" {
+			req.Paths = strings.Split(q.Get("paths"), ",")
+		}
 		// attribute to the authenticated principal; open-mode callers collapse to one
 		// "anonymous" identity (so the author can't also masquerade as a verifier).
 		if p := principalFromContext(r.Context()); p != nil {

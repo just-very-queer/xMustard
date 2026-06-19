@@ -1,6 +1,7 @@
 package workspaceops
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -161,6 +162,51 @@ func TestProposerCannotSelfApproveMultiAgent(t *testing.T) {
 	got2, _ := VerifyContext(dir, ws, e.ID, "other2", true, "")
 	if !got2.Promoted {
 		t.Fatalf("two non-author approvals should promote")
+	}
+}
+
+func TestDriftOnRecallFlagsStaleMemory(t *testing.T) {
+	dir := t.TempDir()
+	repo := t.TempDir()
+	ws := "wsDrift"
+	// a workspace snapshot pointing at the repo root, single-agent mode
+	if err := writeJSON(filepath.Join(dir, "workspaces", ws, "snapshot.json"),
+		map[string]any{"workspace": map[string]any{"workspace_id": ws, "root_path": repo}}); err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	disable := false
+	writeTestSettings(t, dir, appSettings{RequireMultiAgentVerification: &disable})
+
+	if err := os.WriteFile(filepath.Join(repo, "api.go"), []byte("v1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	entry, err := ProposeContext(dir, ws, ProposeContextRequest{
+		Content: "the api base is /api", Source: "a", Paths: []string{"api.go"},
+	})
+	if err != nil || !entry.Promoted {
+		t.Fatalf("propose+promote: %v %+v", err, entry)
+	}
+	if len(entry.PathHashes) != 1 {
+		t.Fatalf("expected a path-hash baseline, got %v", entry.PathHashes)
+	}
+
+	// fresh tree → not stale
+	active, _ := GetActiveContext(dir, ws)
+	if active["stale_count"].(int) != 0 {
+		t.Fatalf("expected 0 stale before edit, got %v", active["stale_count"])
+	}
+
+	// edit the referenced file → memory is now stale
+	if err := os.WriteFile(filepath.Join(repo, "api.go"), []byte("v2-changed"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	active, _ = GetActiveContext(dir, ws)
+	if active["stale_count"].(int) != 1 {
+		t.Fatalf("expected 1 stale after edit, got %v", active["stale_count"])
+	}
+	entries := active["entries"].([]ContextEntry)
+	if !entries[0].Stale || len(entries[0].StalePaths) != 1 || entries[0].StalePaths[0] != "api.go" {
+		t.Fatalf("entry not flagged stale: %+v", entries[0])
 	}
 }
 

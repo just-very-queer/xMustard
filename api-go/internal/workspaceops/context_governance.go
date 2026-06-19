@@ -1,6 +1,8 @@
 package workspaceops
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -37,13 +39,22 @@ type ContextEntry struct {
 	RequiredVerifications int                   `json:"required_verifications"`
 	CreatedAt             string                `json:"created_at"`
 	UpdatedAt             string                `json:"updated_at"`
+	// Paths the memory is ABOUT. PathHashes captures their content hash at the
+	// moment the entry was promoted, so recall can detect drift: if a referenced
+	// file changed since the memory was verified, the memory may be stale.
+	Paths      []string          `json:"paths,omitempty"`
+	PathHashes map[string]string `json:"path_hashes,omitempty"`
+	// Stale / StalePaths are computed at read time (drift-on-recall), never stored.
+	Stale      bool     `json:"stale,omitempty"`
+	StalePaths []string `json:"stale_paths,omitempty"`
 }
 
 type ProposeContextRequest struct {
-	Title      string `json:"title"`
-	Content    string `json:"content"`
-	Source     string `json:"source"`
-	Permission string `json:"permission"`
+	Title      string   `json:"title"`
+	Content    string   `json:"content"`
+	Source     string   `json:"source"`
+	Permission string   `json:"permission"`
+	Paths      []string `json:"paths,omitempty"`
 	// RequireVerification overrides the workspace default: when explicitly false,
 	// the entry is promoted immediately (single-agent mode); when true, it needs
 	// the multi-agent threshold. nil → use the workspace/global setting.
@@ -59,6 +70,67 @@ func validateSafeID(kind, id string) error {
 		return fmt.Errorf("invalid %s id", kind)
 	}
 	return nil
+}
+
+// hashFileContent returns the sha256 of a repo-relative file's current content.
+func hashFileContent(root, rel string) (string, bool) {
+	data, err := os.ReadFile(filepath.Join(root, filepath.Clean(rel)))
+	if err != nil {
+		return "", false
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:]), true
+}
+
+// capturePathHashes snapshots the content hash of each referenced path — the
+// "verified-against" baseline that drift-on-recall later compares to.
+func capturePathHashes(root string, paths []string) map[string]string {
+	if root == "" || len(paths) == 0 {
+		return nil
+	}
+	out := map[string]string{}
+	for _, p := range paths {
+		if p = strings.TrimSpace(p); p == "" {
+			continue
+		}
+		if h, ok := hashFileContent(root, p); ok {
+			out[p] = h
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// computeStaleness flags a promoted entry whose referenced files changed since it
+// was verified — so recall never serves silently-stale memory.
+func computeStaleness(root string, entry *ContextEntry) {
+	if root == "" || len(entry.PathHashes) == 0 {
+		return
+	}
+	var stale []string
+	for p, recorded := range entry.PathHashes {
+		cur, ok := hashFileContent(root, p)
+		if !ok || cur != recorded {
+			stale = append(stale, p)
+		}
+	}
+	if len(stale) > 0 {
+		sort.Strings(stale)
+		entry.Stale = true
+		entry.StalePaths = stale
+	}
+}
+
+// contextRoot resolves the workspace repo root (empty if unresolvable; callers
+// degrade gracefully so memory still works without a live tree).
+func contextRoot(dataDir, workspaceID string) string {
+	root, _, err := resolveChangeRoot(dataDir, workspaceID)
+	if err != nil {
+		return ""
+	}
+	return root
 }
 
 func contextEntriesPath(dataDir, workspaceID string) string {
@@ -188,6 +260,7 @@ func ProposeContext(dataDir, workspaceID string, req ProposeContextRequest) (*Co
 		RequiredVerifications: required,
 		CreatedAt:             now,
 		UpdatedAt:             now,
+		Paths:                 cleanPaths(req.Paths),
 	}
 	if !requireMulti {
 		// single-agent mode: the proposer's own assertion promotes it.
@@ -196,6 +269,10 @@ func ProposeContext(dataDir, workspaceID string, req ProposeContextRequest) (*Co
 		})
 	}
 	reconcileEntry(&entry)
+	if entry.Promoted {
+		// snapshot the referenced files so drift-on-recall has a baseline.
+		entry.PathHashes = capturePathHashes(contextRoot(dataDir, workspaceID), entry.Paths)
+	}
 	entries = append(entries, entry)
 	if err := saveContextEntries(dataDir, workspaceID, entries); err != nil {
 		return nil, err
@@ -247,10 +324,35 @@ func VerifyContext(dataDir, workspaceID, entryID, agent string, approve bool, no
 	}
 	entry.UpdatedAt = now
 	reconcileEntry(entry)
+	if entry.Promoted && len(entry.PathHashes) == 0 {
+		// just transitioned to promoted — snapshot referenced files for drift checks.
+		entry.PathHashes = capturePathHashes(contextRoot(dataDir, workspaceID), entry.Paths)
+	}
 	if err := saveContextEntries(dataDir, workspaceID, entries); err != nil {
 		return nil, err
 	}
 	return entry, nil
+}
+
+// cleanPaths trims, drops empties, and de-duplicates referenced paths.
+func cleanPaths(paths []string) []string {
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(paths))
+	for _, p := range paths {
+		p = strings.TrimPrefix(strings.TrimSpace(p), "./")
+		if p == "" {
+			continue
+		}
+		if _, dup := seen[p]; dup {
+			continue
+		}
+		seen[p] = struct{}{}
+		out = append(out, p)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // UpdateContextContent amends an entry's content. Readonly entries that are
@@ -333,13 +435,24 @@ func GetActiveContext(dataDir, workspaceID string) (map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
+	// drift-on-recall: flag entries whose referenced files changed since they were
+	// verified, so an agent never grounds on silently-stale memory.
+	root := contextRoot(dataDir, workspaceID)
+	staleCount := 0
+	for i := range promoted {
+		computeStaleness(root, &promoted[i])
+		if promoted[i].Stale {
+			staleCount++
+		}
+	}
 	requireMulti, threshold := contextDefaults(dataDir)
 	return map[string]any{
-		"workspace_id":             workspaceID,
-		"require_multi_agent":      requireMulti,
-		"verification_threshold":   threshold,
-		"active_count":             len(promoted),
-		"entries":                  promoted,
-		"generated_at":             nowUTC(),
+		"workspace_id":           workspaceID,
+		"require_multi_agent":    requireMulti,
+		"verification_threshold": threshold,
+		"active_count":           len(promoted),
+		"stale_count":            staleCount,
+		"entries":                promoted,
+		"generated_at":           nowUTC(),
 	}, nil
 }
