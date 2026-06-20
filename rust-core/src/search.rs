@@ -117,7 +117,7 @@ pub struct SearchResult {
 
 /// Hybrid lexical + structural search over the repo's symbol graph.
 pub fn hybrid_search(root: &Path, workspace_id: &str, query: &str, limit: usize) -> SearchResult {
-    let graph = symbolgraph::build_symbol_graph(root, workspace_id);
+    let graph = symbolgraph::build_symbol_graph_cached(root, workspace_id);
     let hotspots: HashSet<String> = symbolgraph::compute_hotspots(&graph, 30)
         .into_iter()
         .map(|h| h.path)

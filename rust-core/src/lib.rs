@@ -6,6 +6,7 @@
 
 pub mod benchmark;
 pub mod changetrack;
+pub mod indexcache;
 pub mod models;
 pub mod diagnostics;
 pub mod goalruntime;

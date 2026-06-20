@@ -261,6 +261,20 @@ pub struct SymbolGraph {
     pub generated_at: String,
 }
 
+/// Build the symbol graph, using the warm cache when the repo is unchanged. The
+/// cache key is cheap (git HEAD + dirty-file mtimes), so a warm search loads the
+/// cached graph instead of re-crawling the whole repo. Falls back to a fresh build
+/// (and refreshes the cache) on a miss.
+pub fn build_symbol_graph_cached(root: &Path, workspace_id: &str) -> SymbolGraph {
+    let key = crate::indexcache::cheap_key(root);
+    if let Some(graph) = crate::indexcache::load_cached_graph(root, workspace_id, &key) {
+        return graph;
+    }
+    let graph = build_symbol_graph(root, workspace_id);
+    crate::indexcache::store_cached_graph(root, workspace_id, &key, &graph);
+    graph
+}
+
 /// Build the symbol graph over tracked source files.
 pub fn build_symbol_graph(root: &Path, workspace_id: &str) -> SymbolGraph {
     let files = tracked_source_files(root);
