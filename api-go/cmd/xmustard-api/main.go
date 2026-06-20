@@ -3298,7 +3298,25 @@ func main() {
 		issueIntel(w, err, result)
 	})
 	mux.HandleFunc("GET /api/workspaces/{workspace_id}/context/active", func(w http.ResponseWriter, r *http.Request) {
-		result, err := workspaceops.GetActiveContext(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))
+		dd := envDefault("XMUSTARD_DATA_DIR", "../backend/data")
+		q := r.URL.Query()
+		// ranked recall when a query/paths signal is present; full active set otherwise.
+		if q.Get("query") != "" || q.Get("paths") != "" {
+			var paths []string
+			if q.Get("paths") != "" {
+				paths = strings.Split(q.Get("paths"), ",")
+			}
+			limit := 8
+			if v := q.Get("limit"); v != "" {
+				if n, err := strconv.Atoi(v); err == nil {
+					limit = n
+				}
+			}
+			result, err := workspaceops.RecallContext(dd, r.PathValue("workspace_id"), q.Get("query"), paths, limit)
+			issueIntel(w, err, result)
+			return
+		}
+		result, err := workspaceops.GetActiveContext(dd, r.PathValue("workspace_id"))
 		issueIntel(w, err, result)
 	})
 	mux.HandleFunc("POST /api/workspaces/{workspace_id}/context", func(w http.ResponseWriter, r *http.Request) {

@@ -47,8 +47,19 @@ func tools() []tool {
 	return []tool{
 		{"ground", "Orient before acting: what changed / what's stale / what's broken / what's blocked since the indexed baseline, with index-trust (drift) included.", []string{"workspace_id"},
 			func(a map[string]string) (string, string) { return "GET", wsPath(a, "/session-grounding") }},
-		{"recall", "The VERIFIED shared context to trust (entries promoted after multi-agent verification). Ground on this instead of re-deriving facts.", []string{"workspace_id"},
-			func(a map[string]string) (string, string) { return "GET", wsPath(a, "/context/active") }},
+		{"recall", "The VERIFIED shared context to trust, RANKED to your task: pass a query and/or paths to get the few relevant facts (multi-signal: lexical + path overlap + verification strength), not a dump. No query → recency-ranked top-N.", []string{"workspace_id"},
+			func(a map[string]string) (string, string) {
+				p := wsPath(a, "/context/active")
+				sep := "?"
+				if a["query"] != "" {
+					p += sep + "query=" + url.QueryEscape(a["query"])
+					sep = "&"
+				}
+				if a["paths"] != "" {
+					p += sep + "paths=" + url.QueryEscape(a["paths"])
+				}
+				return "GET", p
+			}},
 		{"remember", "Propose a durable memory (fact/decision/gotcha) for the shared context; pending until verified by enough agents. Pass content; optional title and paths (comma-separated files the memory is about, so recall can flag it stale when they change).", []string{"workspace_id", "content"},
 			func(a map[string]string) (string, string) {
 				p := wsPath(a, "/context") + "?content=" + url.QueryEscape(a["content"])

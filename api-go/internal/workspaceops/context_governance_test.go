@@ -222,6 +222,48 @@ func TestOverlappingMemorySurfacesConflicts(t *testing.T) {
 	}
 }
 
+func TestRecallRanksAndDoesNotDump(t *testing.T) {
+	dir := t.TempDir()
+	ws := "wsRecall"
+	disable := false
+	writeTestSettings(t, dir, appSettings{RequireMultiAgentVerification: &disable})
+
+	// three verified memories on different topics.
+	mk := func(title, content string, paths []string) {
+		if _, err := ProposeContext(dir, ws, ProposeContextRequest{
+			Title: title, Content: content, Source: "a", Paths: paths,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mk("auth", "the bearer token is the agent identity", []string{"auth.go"})
+	mk("search", "search builds the symbol graph live", []string{"search.rs"})
+	mk("misc", "the changelog lives in docs", nil)
+
+	// query about auth returns the auth memory first, and NOT all three.
+	res, err := RecallContext(dir, ws, "how does bearer auth identity work", nil, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res["ranked"] != true {
+		t.Fatalf("expected ranked recall for a query")
+	}
+	entries := res["entries"].([]ContextEntry)
+	if len(entries) == 0 || entries[0].Title != "auth" {
+		t.Fatalf("expected auth memory ranked first, got %+v", entries)
+	}
+	if len(entries) >= 3 {
+		t.Fatalf("recall should NOT dump all 3 memories for a focused query, got %d", len(entries))
+	}
+
+	// path-focused recall returns the search memory.
+	res2, _ := RecallContext(dir, ws, "", []string{"search.rs"}, 5)
+	e2 := res2["entries"].([]ContextEntry)
+	if len(e2) != 1 || e2[0].Title != "search" {
+		t.Fatalf("expected only the search.rs memory by path, got %+v", e2)
+	}
+}
+
 func TestRejectionBlocksPromotion(t *testing.T) {
 	dir := t.TempDir()
 	ws := "ws4"

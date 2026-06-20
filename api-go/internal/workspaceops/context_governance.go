@@ -458,6 +458,132 @@ func GetActiveContext(dataDir, workspaceID string) (map[string]any, error) {
 	}, nil
 }
 
+// RecallContext is ranked, query-aware recall — the fix for "recall dumps every
+// memory." It scores each verified entry by multi-signal relevance (lexical match
+// on title+content, path overlap with the query paths or the current working
+// changes, verification strength, recency, with a stale penalty) and returns the
+// top-N, so an agent grounds on the few facts that matter rather than the whole
+// store. With no query or paths it falls back to recency-ranked top-N.
+func RecallContext(dataDir, workspaceID, query string, paths []string, limit int) (map[string]any, error) {
+	promoted, err := ListContextEntries(dataDir, workspaceID, "promoted")
+	if err != nil {
+		return nil, err
+	}
+	if limit <= 0 {
+		limit = 8
+	}
+	root := contextRoot(dataDir, workspaceID)
+	for i := range promoted {
+		computeStaleness(root, &promoted[i])
+	}
+
+	// path signal: explicit query paths, else the files currently being worked on.
+	focusPaths := cleanPaths(paths)
+	if len(focusPaths) == 0 && query == "" {
+		focusPaths = currentChangedFiles(dataDir, workspaceID)
+	}
+	focusSet := map[string]struct{}{}
+	for _, p := range focusPaths {
+		focusSet[p] = struct{}{}
+	}
+	qtokens := memoryTokens(query)
+
+	type scored struct {
+		entry ContextEntry
+		score float64
+	}
+	ranked := make([]scored, 0, len(promoted))
+	newest := ""
+	for _, e := range promoted {
+		if e.UpdatedAt > newest {
+			newest = e.UpdatedAt
+		}
+	}
+	hasSignal := len(qtokens) > 0 || len(focusSet) > 0
+	for _, e := range promoted {
+		// relevance = the task-match signal (lexical + path overlap). boost = trust
+		// + recency, applied on top but never enough on its own to surface an
+		// irrelevant memory when a query/paths signal is present.
+		relevance := 0.0
+		if len(qtokens) > 0 {
+			etoks := memoryTokens(e.Title + " " + e.Content)
+			for t := range qtokens {
+				if _, ok := etoks[t]; ok {
+					relevance += 1.0
+				}
+			}
+		}
+		for _, p := range e.Paths {
+			if _, ok := focusSet[p]; ok {
+				relevance += 1.5
+			}
+		}
+		boost := 0.0
+		approvals, _ := distinctApprovals(e.Verifications, "")
+		boost += 0.25 * float64(approvals)
+		if e.UpdatedAt == newest && newest != "" {
+			boost += 0.5
+		}
+		if e.Stale {
+			boost -= 1.0
+		}
+		score := boost
+		if hasSignal {
+			// gate on relevance: irrelevant memory is dropped below.
+			if relevance <= 0 {
+				score = -1 // sentinel: filtered out
+			} else {
+				score = relevance + boost
+			}
+		}
+		ranked = append(ranked, scored{e, score})
+	}
+	sort.SliceStable(ranked, func(a, b int) bool {
+		if ranked[a].score != ranked[b].score {
+			return ranked[a].score > ranked[b].score
+		}
+		return ranked[a].entry.UpdatedAt > ranked[b].entry.UpdatedAt
+	})
+	out := make([]ContextEntry, 0, limit)
+	staleCount := 0
+	for _, s := range ranked {
+		if hasSignal && s.score < 0 {
+			continue
+		}
+		if s.entry.Stale {
+			staleCount++
+		}
+		out = append(out, s.entry)
+		if len(out) >= limit {
+			break
+		}
+	}
+	return map[string]any{
+		"workspace_id": workspaceID,
+		"query":        query,
+		"ranked":       hasSignal,
+		"total_active": len(promoted),
+		"returned":     len(out),
+		"stale_count":  staleCount,
+		"conflicts":    overlappingMemory(out),
+		"entries":      out,
+		"generated_at": nowUTC(),
+	}, nil
+}
+
+// memoryTokens lowercases and splits text into a set of word tokens for matching.
+func memoryTokens(text string) map[string]struct{} {
+	out := map[string]struct{}{}
+	for _, tok := range strings.FieldsFunc(strings.ToLower(text), func(r rune) bool {
+		return !(r == '_' || (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9'))
+	}) {
+		if len(tok) >= 3 {
+			out[tok] = struct{}{}
+		}
+	}
+	return out
+}
+
 // MemoryConflict flags a file that two or more active memories reference, so the
 // agent can reconcile them before trusting either. Detection is path-overlap only;
 // it does not compare content for semantic contradictions.
