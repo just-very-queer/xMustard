@@ -230,6 +230,54 @@ type ProviderModel struct {
 	ID string `json:"id"`
 }
 
+// OpenAIEmbeddings POSTs {base}/embeddings and returns one vector per input. Used
+// by the neural search-rerank lane; any OpenAI-compatible embeddings model works
+// (e.g. Ollama's nomic-embed-text), so it stays Python-free.
+func OpenAIEmbeddings(dataDir, name, model string, inputs []string) ([][]float64, error) {
+	if len(inputs) == 0 {
+		return nil, nil
+	}
+	provider, err := findProvider(dataDir, name)
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(model) == "" {
+		model = provider.DefaultModel
+	}
+	body, err := json.Marshal(map[string]any{"model": model, "input": inputs})
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	req, err := provider.httpRequest(ctx, http.MethodPost, "/embeddings", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	resp, err := providerHTTPClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("provider %s unreachable at %s: %w", name, provider.BaseURL, err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("provider %s embeddings -> %d: %s", name, resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+	var parsed struct {
+		Data []struct {
+			Embedding []float64 `json:"embedding"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		return nil, fmt.Errorf("decode embeddings: %w", err)
+	}
+	out := make([][]float64, len(parsed.Data))
+	for i, d := range parsed.Data {
+		out[i] = d.Embedding
+	}
+	return out, nil
+}
+
 // ListProviderModels GETs {base}/models from an OpenAI-compatible endpoint.
 func ListProviderModels(dataDir, name string) (map[string]any, error) {
 	provider, err := findProvider(dataDir, name)

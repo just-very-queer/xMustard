@@ -3402,7 +3402,15 @@ func main() {
 				limit = n
 			}
 		}
-		result, err := workspaceops.WorkspaceSearch(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), query, limit)
+		dd := envDefault("XMUSTARD_DATA_DIR", "../backend/data")
+		var result json.RawMessage
+		var err error
+		if rerank := r.URL.Query().Get("rerank"); rerank != "" {
+			// optional neural lane: ?rerank=<provider>&embed_model=<model>
+			result, err = workspaceops.WorkspaceSearchReranked(dd, r.PathValue("workspace_id"), query, rerank, r.URL.Query().Get("embed_model"), limit)
+		} else {
+			result, err = workspaceops.WorkspaceSearch(dd, r.PathValue("workspace_id"), query, limit)
+		}
 		issueIntel(w, err, result)
 	})
 	mux.HandleFunc("GET /api/workspaces/{workspace_id}/wiki", func(w http.ResponseWriter, r *http.Request) {
