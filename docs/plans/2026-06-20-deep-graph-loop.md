@@ -22,12 +22,13 @@ Checklist (in order; check off as committed):
   (opt-in). Verified live (tsserver): `a.ts→util.ts [calls] via computeTotal`,
   `b.ts→util.ts`, both resolution=lsp.
 
-- [ ] **S3 — Communities / clusters.** Add modularity-based clustering (Leiden, or
-  greedy modularity to start) over the reference-edge graph → `cluster_id` per file,
-  exposed through `explain` (a dir/file's cluster + sibling files) and a clusters
-  view. Generalize `ownership.rs` subsystem grouping beyond top-dir.
-  *DoD:* two tightly-coupled files in different directories land in one cluster;
-  test on a synthetic graph; live cluster summary on this repo.
+- [x] **S3 — Communities / clusters.** `compute_clusters` does label-propagation
+  over the reference-edge graph → file communities that cross directory boundaries
+  (deterministic; `FileCluster{cluster_id,label,files,size}`). `symbolgraph clusters`
+  CLI + Go `WorkspaceClusters`/`PathCluster`; `/clusters` endpoint and `explain` is
+  enriched with the file's cluster. Tested (clusters_span_directories: cross-dir
+  coupled files cluster, unrelated stays out). Live on this repo: 4 clusters; explain
+  attaches `cluster #0 [api-go]`.
 
 - [ ] **S4 — IndexEngine Phase 1: incremental reindex.** On `ground`/`search`, diff
   `file_hashes` vs `index_baseline.json` (changetrack already has per-file SHA) →

@@ -48,6 +48,49 @@ func SymbolBlastRadius(dataDir, workspaceID, symbol string) (json.RawMessage, er
 	return json.RawMessage(out), nil
 }
 
+// FileCluster mirrors rust-core's community-cluster output.
+type FileCluster struct {
+	ClusterID int      `json:"cluster_id"`
+	Label     string   `json:"label"`
+	Files     []string `json:"files"`
+	Size      int      `json:"size"`
+}
+
+// WorkspaceClusters returns the file communities (label-propagation clusters) for
+// the workspace's symbol graph.
+func WorkspaceClusters(dataDir, workspaceID string) ([]FileCluster, error) {
+	root, _, err := resolveChangeRoot(dataDir, workspaceID)
+	if err != nil {
+		return nil, err
+	}
+	out, err := rustcore.RunSymbolgraph("clusters", root, workspaceID)
+	if err != nil {
+		return nil, err
+	}
+	var clusters []FileCluster
+	if err := json.Unmarshal(out, &clusters); err != nil {
+		return nil, err
+	}
+	return clusters, nil
+}
+
+// PathCluster returns the cluster a file belongs to (its functional neighbourhood),
+// for enriching `explain` with where the file sits in the repo's communities.
+func PathCluster(dataDir, workspaceID, path string) (*FileCluster, error) {
+	clusters, err := WorkspaceClusters(dataDir, workspaceID)
+	if err != nil {
+		return nil, err
+	}
+	for i := range clusters {
+		for _, f := range clusters[i].Files {
+			if f == path {
+				return &clusters[i], nil
+			}
+		}
+	}
+	return nil, nil
+}
+
 // LiveDocumentSymbols runs a live LSP session (rust-core spawns the language
 // server, runs the handshake, and returns normalized document symbols). Servers
 // that aren't installed degrade gracefully to {"available": false, ...}.

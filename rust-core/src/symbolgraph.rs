@@ -269,6 +269,101 @@ pub struct SymbolGraph {
     pub generated_at: String,
 }
 
+/// A community of files that reference each other more than the rest of the repo —
+/// a functional cluster that can cross directory boundaries (unlike top-dir
+/// grouping). `label` is the most common directory among members (a readable name).
+#[derive(Debug, Clone, Serialize)]
+pub struct FileCluster {
+    pub cluster_id: usize,
+    pub label: String,
+    pub files: Vec<String>,
+    pub size: usize,
+}
+
+/// Detect file communities by label propagation over the reference-edge graph: each
+/// file starts in its own community and repeatedly adopts the highest-edge-weight
+/// community among its neighbours until stable. Deterministic (files processed in
+/// sorted order, ties broken by smaller community id). Clusters can span directories
+/// — two tightly-coupled files in different folders land together, which top-dir
+/// grouping (ownership.rs) cannot do.
+pub fn compute_clusters(graph: &SymbolGraph) -> Vec<FileCluster> {
+    // undirected weighted adjacency over files.
+    let mut adj: HashMap<String, HashMap<String, usize>> = HashMap::new();
+    for e in &graph.edges {
+        if e.from_path == e.to_path {
+            continue;
+        }
+        *adj.entry(e.from_path.clone()).or_default().entry(e.to_path.clone()).or_insert(0) += e.weight;
+        *adj.entry(e.to_path.clone()).or_default().entry(e.from_path.clone()).or_insert(0) += e.weight;
+    }
+    // every file is a node; isolated files keep their own community.
+    let mut nodes: Vec<String> = graph.files.iter().map(|f| f.path.clone()).collect();
+    nodes.sort();
+    let mut community: HashMap<String, String> =
+        nodes.iter().map(|n| (n.clone(), n.clone())).collect();
+
+    for _ in 0..20 {
+        let mut changed = false;
+        for n in &nodes {
+            let Some(neighbours) = adj.get(n) else { continue };
+            // tally neighbour communities by total edge weight.
+            let mut weight_by_comm: BTreeMap<String, usize> = BTreeMap::new();
+            for (nbr, w) in neighbours {
+                if let Some(c) = community.get(nbr) {
+                    *weight_by_comm.entry(c.clone()).or_insert(0) += *w;
+                }
+            }
+            // pick the heaviest community (ties → smallest id via BTreeMap order).
+            if let Some((best, _)) = weight_by_comm
+                .iter()
+                .max_by(|a, b| a.1.cmp(b.1).then_with(|| b.0.cmp(a.0)))
+                && community.get(n) != Some(best)
+            {
+                community.insert(n.clone(), best.clone());
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    // group files by final community label, then relabel to compact ids by size.
+    let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for n in &nodes {
+        groups.entry(community[n].clone()).or_default().push(n.clone());
+    }
+    let mut clusters: Vec<Vec<String>> = groups.into_values().collect();
+    clusters.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a[0].cmp(&b[0])));
+    clusters
+        .into_iter()
+        .enumerate()
+        .map(|(i, mut files)| {
+            files.sort();
+            FileCluster {
+                cluster_id: i,
+                label: dominant_directory(&files),
+                size: files.len(),
+                files,
+            }
+        })
+        .collect()
+}
+
+// the most common top-level directory among a cluster's files (a readable name).
+fn dominant_directory(files: &[String]) -> String {
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for f in files {
+        let dir = f.split('/').next().unwrap_or("(root)");
+        *counts.entry(dir.to_string()).or_insert(0) += 1;
+    }
+    counts
+        .into_iter()
+        .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)))
+        .map(|(d, _)| d)
+        .unwrap_or_else(|| "(root)".to_string())
+}
+
 /// Upgrade a (lexically-built) graph with scope-resolved CALLS edges from a real
 /// language server. For the most-connected files first, within a bounded budget of
 /// reference calls, it asks the LSP for each callable symbol's references and adds
@@ -643,7 +738,11 @@ mod tests {
     fn git_repo(files: &[(&str, &str)]) -> TempDir {
         let dir = TempDir::new().unwrap();
         for (rel, content) in files {
-            std::fs::write(dir.path().join(rel), content).unwrap();
+            let path = dir.path().join(rel);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(path, content).unwrap();
         }
         for args in [
             vec!["init", "-q"],
@@ -673,6 +772,29 @@ mod tests {
         let hot = compute_hotspots(&graph, 5);
         assert_eq!(hot[0].path, "lib.rs", "lib.rs should be the top hotspot: {hot:?}");
         assert!(hot[0].dependent_count >= 2);
+    }
+
+    #[test]
+    fn clusters_span_directories() {
+        // core/engine.rs and api/handler.rs reference each other heavily (cross-dir);
+        // they should land in one cluster, while an unrelated file stays separate —
+        // which top-directory grouping could never produce.
+        let repo = git_repo(&[
+            ("core/engine.rs", "pub fn run_engine() {}\npub fn engine_step() {}\n"),
+            ("api/handler.rs", "fn handle() { run_engine(); engine_step(); }\npub fn dispatch() {}\n"),
+            ("core/engine_caller.rs", "fn go() { run_engine(); engine_step(); dispatch(); }\n"),
+            ("misc/lonely.rs", "pub fn alone() {}\n"),
+        ]);
+        let graph = build_symbol_graph(repo.path(), "ws");
+        let clusters = compute_clusters(&graph);
+        // find the cluster containing core/engine.rs
+        let eng = clusters.iter().find(|c| c.files.iter().any(|f| f == "core/engine.rs")).unwrap();
+        assert!(
+            eng.files.iter().any(|f| f == "api/handler.rs"),
+            "cross-directory coupled files should cluster together: {clusters:?}"
+        );
+        // the unrelated file is not in that cluster.
+        assert!(!eng.files.iter().any(|f| f == "misc/lonely.rs"));
     }
 
     #[test]

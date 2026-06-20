@@ -2144,6 +2144,21 @@ func main() {
 			})
 			return
 		}
+		// enrich with the file's community cluster (its functional neighbourhood),
+		// so explain answers "where does this file sit in the repo" — best-effort.
+		path := r.URL.Query().Get("path")
+		if cluster, cerr := workspaceops.PathCluster(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), workspaceID, path); cerr == nil && cluster != nil {
+			writeJSON(w, http.StatusOK, map[string]any{"explanation": result, "cluster": cluster})
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/clusters", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.WorkspaceClusters(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
 		writeJSON(w, http.StatusOK, result)
 	})
 	mux.HandleFunc("GET /api/workspaces/{workspace_id}/semantic-search", func(w http.ResponseWriter, r *http.Request) {
