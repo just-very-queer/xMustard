@@ -86,11 +86,25 @@ don't add tools). No Python.
   POST→403, agent POST→200, rotate works, 30-request flood coalesces to one audit
   entry. Committed + pushed.
 
-- [ ] **R5 — Postgres as the write path (C1)** *(large)*. Make `run_plans` and
-  `verification_*` write to Postgres inline on mutation (not just the one-shot
-  `pgops.go`/`pgverify.go` mirrors), keeping JSON as a fallback/export. Schema +
-  inline INSERT/UPDATE on `saveRunRecord` / verification saves.
-  *DoD:* a run plan / verification mutation is queryable in PG immediately, no manual materialize; tested.
+- [x] **R5 — Postgres as the write path (C1)** *(large)*. **DONE.** New
+  `pg_inline.go`: `saveRunRecord` mirrors the run + its plan into PG (xm_runs + new
+  xm_run_plans) and `saveVerificationProfileHistory` re-mirrors verification outcomes,
+  both inline on mutation. JSON stays the durable source of truth; the mirror is
+  strictly best-effort (gated on `XMUSTARD_PG_DSN`, errors logged+swallowed) so PG can
+  never break the JSON write. Read-back via `ListRunPlansPostgres` + `GET /pg/run-plans`.
+  *Adversarial review (workflow, 30 agents, 20 confirmed/plausible) → fixed:*
+  **async background dispatch** (bounded 8-worker pool + `recover` + `PgInlineFlush`)
+  so a slow/black-hole PG never adds latency to the request (was a synchronous 5s/60s
+  connect on the handler path); **delete-by-key + insert** instead of
+  `ON CONFLICT`/unique-index (a pre-existing duplicate row can no longer permanently
+  disable mirroring); **raw nullable pointers** so `completed_at`/`error` are SQL
+  `NULL` not `''` (verified live); **schema ensured once per process** (no per-write
+  DDL churn); `coalesce(phase)` in the read-back. Accepted-as-design: best-effort
+  drift reconciled by `MaterializeOps*`; verification re-materialize is async/off-path.
+  *Tests:* `TestPgInlineDisabledByDefault`, `TestSaveRunRecordSucceedsWhenPgDead`,
+  `TestSaveRunRecordFastWhenPgBlackHole` (returns <1s while the mirror's connect hangs
+  5s), `TestInlineRunPlanQueryableInPg` (live: save run+plan → queryable immediately →
+  upsert-in-place on phase change). Live: NULL columns confirmed. Committed + pushed.
 
 - [ ] **R6 — Deeper data/control-flow edges** *(large)*. Add edge kinds beyond
   imports/calls/inherits/tests/references — e.g. returns / reads / writes / branches —

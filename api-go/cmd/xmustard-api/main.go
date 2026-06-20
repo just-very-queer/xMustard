@@ -3572,6 +3572,16 @@ func main() {
 		result, err := workspaceops.ListRunsPostgres(r.PathValue("workspace_id"), r.URL.Query().Get("status"), limit)
 		issueIntel(w, err, result)
 	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/pg/run-plans", func(w http.ResponseWriter, r *http.Request) {
+		limit := 50
+		if v := r.URL.Query().Get("limit"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil {
+				limit = n
+			}
+		}
+		result, err := workspaceops.ListRunPlansPostgres(r.PathValue("workspace_id"), limit)
+		issueIntel(w, err, result)
+	})
 	mux.HandleFunc("GET /api/workspaces/{workspace_id}/pg/issues/search", func(w http.ResponseWriter, r *http.Request) {
 		query := r.URL.Query().Get("q")
 		if query == "" {

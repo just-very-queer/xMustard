@@ -961,7 +961,14 @@ Respond with a JSON object containing:
 }
 
 func saveRunRecord(dataDir string, run runRecord) error {
-	return writeJSON(filepath.Join(dataDir, "workspaces", run.WorkspaceID, "runs", run.RunID+".json"), run)
+	if err := writeJSON(filepath.Join(dataDir, "workspaces", run.WorkspaceID, "runs", run.RunID+".json"), run); err != nil {
+		return err
+	}
+	// JSON is the source of truth (written above). Mirror into the queryable PG
+	// index inline so run plans/status are queryable immediately — best-effort,
+	// never fails the mutation (no-op unless XMUSTARD_PG_DSN is set).
+	pgInlineUpsertRun(run)
+	return nil
 }
 
 func appendRunActivityWithActor(dataDir string, workspaceID string, issueID string, runID string, action string, summary string, actor activityActor, details map[string]any) error {

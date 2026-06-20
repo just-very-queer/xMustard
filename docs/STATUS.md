@@ -68,7 +68,7 @@ been removed.
 | **Contract-break detection** (A3 remainder) | **DONE** | medium | `changetrack` derives + baselines per-symbol signatures (`IndexBaseline.signatures`), diffs them on modified files → `DirtySymbol.contract_break` + `signature_change` (`params N→M, return x→y`); surfaced in `impact`/`ground` (`contract_breaks`, `broken_contracts`). Live: arity/return change flags, body-only edit doesn't. |
 | **Wiki incrementality** | **DONE** | small–med | `generate_wiki` now uses `build_symbol_graph_cached` (was the last cold-rebuild caller) + a per-subsystem fingerprint page cache (`wiki-<ws>.json`); only changed subsystems re-render (`regenerated_slugs`/`reused_slugs`). Live: edit one file → one subsystem regenerates. |
 | **Auth follow-ons** (A5) | **DONE** | large | Global capped auth-audit log (mint/revoke/rotate/denied); `ExpiresAt` + fail-closed TTL check in `ResolveToken`; `RotateToken` + rotate endpoint; `roleRank` hierarchy with an explicit `agent` gate. Adversarial review (27 agents) → fixed critical token-store race (`tokenStoreMu`), fail-open-on-corrupt (`HasAuthConfigured` fails closed), audit DoS (clip + throttle), TTL overflow. `-race` tests + live. |
-| **Postgres as the write path** (C1) | not-done | large | `saveRunRecord`→`writeJSON` for run_plans; verification to JSON; `pgops.go`/`pgverify.go` are one-shot DELETE+INSERT mirrors, never inline on mutation. |
+| **Postgres as the write path** (C1) | **DONE** | large | `pg_inline.go`: `saveRunRecord` + `saveVerificationProfileHistory` mirror to PG inline on mutation (xm_runs + new xm_run_plans), JSON still source-of-truth. Best-effort async (gated on `XMUSTARD_PG_DSN`). Adversarial review (30 agents) → fixed async-latency, unique-index-fragility, NULL columns. Live round-trip + `-race` tests; `/pg/run-plans` read-back. |
 | **Deeper data/control-flow edges** | not-done | large | Only imports/calls/inherits/tests/references; LSP upgrade also only emits `calls`. No data-flow/control-flow/read-write edges. |
 | **Cockpit UI for providers/routing/tokens** (A4 remainder) | not-done | large | No React components; `api.ts` has only ticket-integration CRUD. Backend endpoints (`/api/providers*`, `/api/route*`, `/api/auth/*`) exist — only the UI is missing. |
 
@@ -99,5 +99,7 @@ polish — none blocks the primary agent use-case.
    fingerprint page cache; only changed subsystems re-render.
 4. ~~Auth A5~~ — **DONE** (R4). Audit log, token expiry/rotation, agent-role gate;
    adversarial-reviewed (critical race + fail-open + audit DoS fixed).
-5. **PG write path / deeper edges / cockpit UI** — remaining large items; PG write
-   path for production durability, cockpit UI for a product surface.
+5. ~~PG write path~~ — **DONE** (R5). Inline best-effort mirror of runs/plans/
+   verifications; adversarial-reviewed (async latency + NULL columns fixed).
+6. **Deeper data/control-flow edges / cockpit UI** — remaining large items; cockpit
+   UI for a product surface.

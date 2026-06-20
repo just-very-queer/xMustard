@@ -288,7 +288,14 @@ func saveVerificationProfileHistory(dataDir string, workspaceID string, items []
 		}
 		return 0
 	})
-	return writeJSON(verificationProfileHistoryPath(dataDir, workspaceID), items)
+	if err := writeJSON(verificationProfileHistoryPath(dataDir, workspaceID), items); err != nil {
+		return err
+	}
+	// Mirror verification outcomes into the queryable PG index inline (best-effort,
+	// no-op unless XMUSTARD_PG_DSN is set) so a verification is queryable in PG
+	// immediately, with JSON remaining the durable source of truth.
+	pgInlineMirrorVerifications(dataDir, workspaceID)
+	return nil
 }
 
 func buildVerificationChecklistResults(profile verificationProfileRecord, result *rustcore.VerificationProfileResult) []rustcore.VerificationChecklistResult {
