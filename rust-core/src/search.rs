@@ -101,6 +101,7 @@ pub struct SearchHit {
     pub kind: String, // "symbol" | "file"
     pub name: String,
     pub path: String,
+    pub line: Option<usize>, // 1-based line of a symbol hit, so the agent jumps to the slice
     pub score: f64,
     pub reason: String,
 }
@@ -168,6 +169,7 @@ pub fn hybrid_search(root: &Path, workspace_id: &str, query: &str, limit: usize)
         kind: &'static str,
         name: String,
         path: String,
+        line: Option<usize>,
         lexical: f64,
         matched: Vec<String>,
         exact: bool,
@@ -200,6 +202,7 @@ pub fn hybrid_search(root: &Path, workspace_id: &str, query: &str, limit: usize)
             kind: "symbol",
             name: sym.name.clone(),
             path: sym.path.clone(),
+            line: sym.line_start,
             lexical,
             matched,
             exact: sym.name.to_lowercase() == query_lc,
@@ -224,6 +227,7 @@ pub fn hybrid_search(root: &Path, workspace_id: &str, query: &str, limit: usize)
             kind: "file",
             name: f.path.clone(),
             path: f.path.clone(),
+            line: None,
             lexical,
             matched: Vec::new(),
             exact: false,
@@ -292,6 +296,7 @@ pub fn hybrid_search(root: &Path, workspace_id: &str, query: &str, limit: usize)
                 kind: c.kind.to_string(),
                 name: c.name.clone(),
                 path: c.path.clone(),
+                line: c.line,
                 score,
                 reason,
             }
@@ -348,6 +353,8 @@ mod tests {
         assert!(res.total >= 1);
         assert_eq!(res.hits[0].name, "compute_widget_total");
         assert_eq!(res.hits[0].reason, "exact symbol match");
+        // a symbol hit carries its line so the agent jumps to the slice, not a dump.
+        assert_eq!(res.hits[0].line, Some(1));
     }
 
     #[test]
