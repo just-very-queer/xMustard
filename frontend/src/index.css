@@ -903,3 +903,25 @@ h4 {
 .kanban-card.severity-p2 { border-left-color: #d8c14a; }
 .kanban-card.severity-p3 { border-left-color: #6aa06a; }
 .kanban-empty { color: #9aa0a8; font-size: 12px; text-align: center; padding: 8px; }
+
+/* governed memory panel */
+.memory-panel { margin-top: 16px; padding: 12px; border: 1px solid #d9d6cd; border-radius: 10px; background: #fff; }
+.memory-header { display: flex; justify-content: space-between; align-items: baseline; }
+.memory-header h3 { margin: 0; font-size: 13px; text-transform: uppercase; letter-spacing: 0.04em; color: #4b4f57; }
+.memory-stats { font-size: 12px; color: #6b6f76; }
+.memory-stale { color: #b4690e; font-style: normal; }
+.memory-conflict { color: #8a2018; font-style: normal; }
+.memory-error { color: #8a2018; font-size: 12px; }
+.memory-compose { display: flex; flex-direction: column; gap: 6px; margin: 8px 0; }
+.memory-compose input, .memory-compose textarea { border: 1px solid #c9c6bd; border-radius: 8px; padding: 5px 8px; font: inherit; }
+.memory-compose button { align-self: flex-start; border: 1px solid #1f232b; background: #1f232b; color: #f7f6f2; border-radius: 8px; padding: 5px 12px; cursor: pointer; }
+.memory-compose button:disabled { opacity: 0.5; cursor: default; }
+.memory-section { margin-top: 8px; }
+.memory-section h4 { margin: 4px 0; font-size: 12px; color: #4b4f57; }
+.memory-section ul { list-style: none; margin: 0; padding: 0; font-size: 13px; }
+.memory-pending { display: flex; justify-content: space-between; gap: 8px; padding: 4px 0; border-bottom: 1px solid #ecebe5; }
+.memory-actions button { margin-left: 4px; border: 1px solid #c9c6bd; background: #f3f2ee; border-radius: 6px; padding: 2px 8px; cursor: pointer; font-size: 12px; }
+.memory-meta { color: #6b6f76; font-size: 12px; }
+.memory-entry { padding: 3px 0; }
+.memory-is-stale { opacity: 0.7; }
+.memory-stale-tag { color: #b4690e; font-size: 11px; font-weight: 600; }

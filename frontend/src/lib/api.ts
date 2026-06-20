@@ -107,6 +107,60 @@ export function getHealth() {
   return request<ApiHealth>('/api/health')
 }
 
+// --- governed runtime memory (the product moat) ---
+
+export interface MemoryEntry {
+  id: string
+  title: string
+  content: string
+  source: string
+  permission: string
+  status: string
+  promoted: boolean
+  required_verifications: number
+  verifications: { agent: string; approve: boolean }[]
+  paths?: string[]
+  stale?: boolean
+  stale_paths?: string[]
+}
+
+export interface ActiveMemory {
+  active_count: number
+  stale_count: number
+  conflicts: { path: string; entry_ids: string[]; titles: string[] }[]
+  entries: MemoryEntry[]
+}
+
+export function getActiveMemory(workspaceId: string) {
+  return request<ActiveMemory>(`/api/workspaces/${workspaceId}/context/active`)
+}
+
+export function listMemory(workspaceId: string, filter = 'all') {
+  return request<MemoryEntry[]>(`/api/workspaces/${workspaceId}/context?filter=${filter}`)
+}
+
+export function proposeMemory(
+  workspaceId: string,
+  body: { content: string; title?: string; paths?: string[]; permission?: string },
+) {
+  return request<MemoryEntry>(`/api/workspaces/${workspaceId}/context`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  })
+}
+
+export function verifyMemory(
+  workspaceId: string,
+  entryId: string,
+  approve: boolean,
+  note = '',
+) {
+  return request<MemoryEntry>(`/api/workspaces/${workspaceId}/context/${entryId}/verify`, {
+    method: 'POST',
+    body: JSON.stringify({ approve, note }),
+  })
+}
+
 export function loadWorkspace(rootPath: string, name?: string) {
   return request<WorkspaceSnapshot>('/api/workspaces/load', {
     method: 'POST',

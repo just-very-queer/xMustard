@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { MemoryPanel } from './MemoryPanel'
 import {
   getWorkspaceChanges,
   getWorkspaceDrift,
@@ -286,6 +287,7 @@ export function Cockpit({ workspaceId }: { workspaceId: string }) {
           )}
         </section>
       </div>
+      <MemoryPanel workspaceId={workspaceId} />
     </div>
   )
 }
