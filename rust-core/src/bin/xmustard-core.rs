@@ -1441,6 +1441,14 @@ fn run_symbolgraph_command(mut args: impl Iterator<Item = String>) {
             let ws = need(args.next(), usage);
             print_json(&sg::build_symbol_graph(Path::new(&root), &ws));
         }
+        "build-lsp" => {
+            let usage = "xmustard-core symbolgraph build-lsp <root> <workspace_id> [budget]";
+            let root = need(args.next(), usage);
+            let ws = need(args.next(), usage);
+            let budget = args.next().and_then(|v| v.parse::<usize>().ok()).unwrap_or(150);
+            let graph = sg::build_symbol_graph(Path::new(&root), &ws);
+            print_json(&sg::upgrade_graph_with_lsp(Path::new(&root), graph, budget));
+        }
         "hotspots" => {
             let usage = "xmustard-core symbolgraph hotspots <root> <workspace_id> [limit]";
             let root = need(args.next(), usage);

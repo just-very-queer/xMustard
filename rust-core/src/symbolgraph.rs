@@ -247,6 +247,14 @@ pub struct GraphEdge {
     pub kind: String, // "imports" | "calls" | "inherits" | "tests" | "references"
     pub weight: usize,
     pub via_symbols: Vec<String>,
+    /// How the edge was resolved: "lexical" (identifier-name matching) or "lsp"
+    /// (a real language-server reference). Defaults to lexical for older caches.
+    #[serde(default = "default_resolution")]
+    pub resolution: String,
+}
+
+fn default_resolution() -> String {
+    "lexical".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -259,6 +267,153 @@ pub struct SymbolGraph {
     pub symbols: Vec<GraphSymbolNode>,
     pub edges: Vec<GraphEdge>,
     pub generated_at: String,
+}
+
+/// Upgrade a (lexically-built) graph with scope-resolved CALLS edges from a real
+/// language server. For the most-connected files first, within a bounded budget of
+/// reference calls, it asks the LSP for each callable symbol's references and adds
+/// `calls` edges (resolution = "lsp") that a language server actually resolved —
+/// not name matches. Degrades to the lexical graph unchanged when no server is
+/// installed or any request fails. Bounded so it never blocks on a huge repo.
+pub fn upgrade_graph_with_lsp(root: &Path, mut graph: SymbolGraph, budget: usize) -> SymbolGraph {
+    use crate::lsp_session::{LspSessionError, LspWorkspaceSession};
+
+    // hard caps so the pass never blocks a large repo: a wall-clock deadline (a hung
+    // server can't run it forever) and a fixed pre-open ceiling (independent of the
+    // reference budget).
+    const MAX_PREOPEN: usize = 300;
+    let phase_deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+
+    // process files by inbound authority (hotspots first) so the budget is spent
+    // where resolution matters most. Dedup with a set to stay O(n).
+    let hot: Vec<String> = compute_hotspots(&graph, graph.files.len())
+        .into_iter()
+        .map(|h| h.path)
+        .collect();
+    let mut seen: HashSet<String> = hot.iter().cloned().collect();
+    let mut ordered: Vec<String> = hot;
+    for f in &graph.files {
+        if seen.insert(f.path.clone()) {
+            ordered.push(f.path.clone());
+        }
+    }
+
+    // files grouped by their language server, so we can pre-open each language's
+    // files before querying (cross-file references need the project loaded).
+    let mut by_lang: std::collections::HashMap<&'static str, Vec<String>> =
+        std::collections::HashMap::new();
+    for f in &graph.files {
+        if let Some(cmd) = crate::lsp_session::server_command_for(&f.path) {
+            by_lang.entry(cmd).or_default().push(f.path.clone());
+        }
+    }
+
+    let mut sessions: std::collections::HashMap<String, Option<LspWorkspaceSession>> =
+        std::collections::HashMap::new();
+    let mut remaining = budget;
+    // collected lsp edges: (from, to) -> via symbols
+    let mut lsp_edges: HashMap<(String, String), BTreeSet<String>> = HashMap::new();
+    let mut lsp_resolved = false;
+
+    'files: for rel in ordered {
+        if remaining == 0 || std::time::Instant::now() >= phase_deadline {
+            break;
+        }
+        let lang = match crate::lsp_session::server_command_for(&rel) {
+            Some(cmd) => cmd,
+            None => continue,
+        };
+        // lazily start one session per language; pre-open that language's files (up
+        // to a fixed cap) so the server has the whole project in view.
+        let session = sessions.entry(lang.to_string()).or_insert_with(|| {
+            let mut s = LspWorkspaceSession::start(root, &rel, 20).ok();
+            if let (Some(sess), Some(paths)) = (s.as_mut(), by_lang.get(lang)) {
+                for p in paths.iter().take(MAX_PREOPEN) {
+                    sess.open(p);
+                }
+            }
+            s
+        });
+        if session.is_none() {
+            continue;
+        }
+
+        let content = match std::fs::read_to_string(root.join(&rel)) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let Some(symbols) = crate::treesitter::extract_symbols(&rel, &content) else { continue };
+        let mut session_died = false;
+        for sym in symbols {
+            if remaining == 0 || std::time::Instant::now() >= phase_deadline {
+                break 'files;
+            }
+            // only callable symbols anchor CALLS edges.
+            if sym.kind != "function" && sym.kind != "method" {
+                continue;
+            }
+            let Some(session) = sessions.get_mut(lang).and_then(|s| s.as_mut()) else { break };
+            let line = (sym.line_start.saturating_sub(1)) as u32;
+            match session.references(&rel, line, sym.name_column as u32) {
+                Ok(refs) => {
+                    remaining -= 1; // only consume budget on a successful call
+                    lsp_resolved = true;
+                    for (ref_path, _) in refs {
+                        if ref_path == rel {
+                            continue;
+                        }
+                        lsp_edges
+                            .entry((ref_path, rel.clone()))
+                            .or_default()
+                            .insert(sym.symbol.clone());
+                    }
+                }
+                // a timeout/disconnect likely corrupts the server: drop the session
+                // so we don't keep querying a broken connection.
+                Err(LspSessionError::Failed(_)) => {
+                    session_died = true;
+                    break;
+                }
+                Err(_) => continue,
+            }
+        }
+        if session_died {
+            sessions.insert(lang.to_string(), None);
+        }
+    }
+
+    if !lsp_resolved {
+        return graph; // no server resolved anything → leave the lexical graph as-is
+    }
+    // merge: an LSP-confirmed call edge supersedes the lexical edge for the same
+    // (from, to) pair regardless of the lexical kind (calls/tests/references), so we
+    // upgrade it in place to a resolved "calls" edge instead of adding a duplicate.
+    for ((from, to), via) in lsp_edges {
+        if let Some(existing) = graph
+            .edges
+            .iter_mut()
+            .find(|e| e.from_path == from && e.to_path == to)
+        {
+            existing.kind = "calls".to_string();
+            existing.resolution = "lsp".to_string();
+            for v in &via {
+                if existing.via_symbols.len() < 8 && !existing.via_symbols.contains(v) {
+                    existing.via_symbols.push(v.clone());
+                }
+            }
+        } else {
+            graph.edges.push(GraphEdge {
+                from_path: from,
+                to_path: to,
+                kind: "calls".to_string(),
+                weight: via.len(),
+                via_symbols: via.into_iter().take(8).collect(),
+                resolution: "lsp".to_string(),
+            });
+        }
+    }
+    graph.edge_count = graph.edges.len();
+    graph
 }
 
 /// Build the symbol graph, using the warm cache when the repo is unchanged. The
@@ -281,8 +436,12 @@ pub fn build_symbol_graph(root: &Path, workspace_id: &str) -> SymbolGraph {
     let tracked: HashSet<String> = files.iter().cloned().collect();
     let mut file_nodes = Vec::new();
     let mut symbols = Vec::new();
-    // name -> definition (first definer wins); only distinctive names anchor edges.
-    let mut name_to_def: HashMap<String, SymbolDef> = HashMap::new();
+    // name -> ALL definitions. A name defined in multiple files is AMBIGUOUS:
+    // lexical matching can't tell which one a reference means, so previously the
+    // first-definer won and every reference was silently misrouted to it. We now
+    // record all definers and skip ambiguous names for edge-anchoring (see
+    // unique_definer) rather than route them wrong.
+    let mut name_to_defs: HashMap<String, Vec<SymbolDef>> = HashMap::new();
     let mut content_cache: BTreeMap<String, String> = BTreeMap::new();
 
     for rel in &files {
@@ -300,13 +459,21 @@ pub fn build_symbol_graph(root: &Path, workspace_id: &str) -> SymbolGraph {
             });
             let lname = s.symbol.to_lowercase();
             if s.symbol.len() >= MIN_NAME_LEN && !STOPWORD_SYMBOLS.contains(&lname.as_str()) {
-                name_to_def
-                    .entry(s.symbol.clone())
-                    .or_insert_with(|| SymbolDef { path: rel.clone(), kind: s.kind.clone() });
+                let defs = name_to_defs.entry(s.symbol.clone()).or_default();
+                if !defs.iter().any(|d| d.path == *rel) {
+                    defs.push(SymbolDef { path: rel.clone(), kind: s.kind.clone() });
+                }
             }
         }
         content_cache.insert(rel.clone(), content);
     }
+    // resolve a name to its single defining file, or None when ambiguous.
+    let unique_definer = |name: &str| -> Option<&SymbolDef> {
+        match name_to_defs.get(name) {
+            Some(defs) if defs.len() == 1 => Some(&defs[0]),
+            _ => None,
+        }
+    };
 
     // Typed edges, aggregated by (from, to, kind): a symbol that is imported AND
     // called yields both an "imports" and a "calls" edge (distinct relationships).
@@ -336,18 +503,18 @@ pub fn build_symbol_graph(root: &Path, workspace_id: &str) -> SymbolGraph {
         }
         // Inheritance: extends/implements/impl-for/class(Base) → "inherits".
         for name in &inherits {
-            if let Some(def) = name_to_def.get(name) {
-                if &def.path != path {
-                    add_edge(path, &def.path, "inherits", name, &mut agg);
-                }
+            if let Some(def) = unique_definer(name)
+                && &def.path != path
+            {
+                add_edge(path, &def.path, "inherits", name, &mut agg);
             }
         }
         // Symbol-level imports: an import/use line naming a symbol defined elsewhere.
         for name in &imports {
-            if let Some(def) = name_to_def.get(name) {
-                if &def.path != path {
-                    add_edge(path, &def.path, "imports", name, &mut agg);
-                }
+            if let Some(def) = unique_definer(name)
+                && &def.path != path
+            {
+                add_edge(path, &def.path, "imports", name, &mut agg);
             }
         }
         // References across the file body → calls / tests / references (by def kind).
@@ -356,7 +523,7 @@ pub fn build_symbol_graph(root: &Path, workspace_id: &str) -> SymbolGraph {
             if inherits.contains(word) {
                 continue; // already captured as a typed inheritance edge
             }
-            if let Some(def) = name_to_def.get(word) {
+            if let Some(def) = unique_definer(word) {
                 if &def.path == path {
                     continue;
                 }
@@ -373,6 +540,7 @@ pub fn build_symbol_graph(root: &Path, workspace_id: &str) -> SymbolGraph {
             kind: kind.to_string(),
             weight,
             via_symbols: via.into_iter().collect(),
+            resolution: "lexical".to_string(),
         })
         .collect();
     edges.sort_by(|a, b| {
@@ -446,10 +614,10 @@ pub fn blast_radius(root: &Path, workspace_id: &str, symbol: &str) -> BlastRadiu
         if word_set(&content).contains(symbol) {
             referencing.insert(rel.clone());
         }
-        if let Ok(result) = repomap::extract_path_symbols(root, workspace_id, rel) {
-            if result.symbols.iter().any(|s| s.symbol == symbol) {
-                defined_in.push(rel.clone());
-            }
+        if let Ok(result) = repomap::extract_path_symbols(root, workspace_id, rel)
+            && result.symbols.iter().any(|s| s.symbol == symbol)
+        {
+            defined_in.push(rel.clone());
         }
     }
     for d in &defined_in {
@@ -505,6 +673,28 @@ mod tests {
         let hot = compute_hotspots(&graph, 5);
         assert_eq!(hot[0].path, "lib.rs", "lib.rs should be the top hotspot: {hot:?}");
         assert!(hot[0].dependent_count >= 2);
+    }
+
+    #[test]
+    fn ambiguous_name_does_not_misroute_edges() {
+        // `handle` is defined in BOTH a.rs and b.rs. The old first-definer-wins
+        // routed every reference to whichever file was scanned first. Now the name
+        // is ambiguous → no lexical edge is anchored on it, so c.rs does not get a
+        // false edge to an arbitrary definer.
+        let repo = git_repo(&[
+            ("a.rs", "pub fn handle_request() {}\n"),
+            ("b.rs", "pub fn handle_request() {}\n"),
+            ("c.rs", "fn run() { handle_request(); }\n"),
+        ]);
+        let graph = build_symbol_graph(repo.path(), "ws");
+        let edges_from_c: Vec<_> =
+            graph.edges.iter().filter(|e| e.from_path == "c.rs").collect();
+        assert!(
+            edges_from_c.is_empty(),
+            "ambiguous handle_request must not anchor a misrouted edge: {edges_from_c:?}"
+        );
+        // a uniquely-defined symbol still resolves.
+        assert!(graph.edges.iter().all(|e| e.resolution == "lexical"));
     }
 
     #[test]

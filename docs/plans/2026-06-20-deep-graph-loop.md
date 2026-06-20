@@ -13,12 +13,14 @@ Checklist (in order; check off as committed):
   type-definition|rename`). Graceful Unavailable when no server. Verified live via
   tsserver: references found 3, definition → LocationLink, rename → WorkspaceEdit.
 
-- [ ] **S2 — Scope-resolved CALLS edges.** Replace lexical name-matching in
-  `symbolgraph.rs` with LSP-backed references where a server is available (batch
-  `references` per defined symbol → real cross-file CALLS edges), heuristic
-  fallback otherwise. Fix first-definer-wins so overloaded names don't misroute.
-  *DoD:* a known caller→callee edge that the lexical graph got wrong is now correct;
-  edges tagged with resolution source (`lsp` vs `lexical`); live-verified.
+- [x] **S2 — Scope-resolved CALLS edges.** Fixed first-definer-wins (`name_to_defs`
+  Vec + `unique_definer`: an ambiguous name no longer misroutes — tested). Every edge
+  carries `resolution` ("lexical"/"lsp"). New `LspWorkspaceSession` (persistent
+  spawn, lazy didOpen, batched references) + `upgrade_graph_with_lsp` (budgeted,
+  hotspots-first, pre-opens the project, path-canonicalized) produces real `calls`
+  edges tagged `lsp` via `symbolgraph build-lsp`. Default search path is untouched
+  (opt-in). Verified live (tsserver): `a.ts→util.ts [calls] via computeTotal`,
+  `b.ts→util.ts`, both resolution=lsp.
 
 - [ ] **S3 — Communities / clusters.** Add modularity-based clustering (Leiden, or
   greedy modularity to start) over the reference-edge graph → `cluster_id` per file,
