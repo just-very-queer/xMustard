@@ -59,6 +59,10 @@ func ExplainRunFailure(dataDir, workspaceID, runID string) (*FailureExplanation,
 	exp.ChangedFiles = currentChangedFiles(dataDir, workspaceID)
 	exp.ImplicatedPaths = intersectMentionedPaths(output, exp.ChangedFiles)
 	exp.Summary = summarizeFailure(exp)
+	// feed the outcome back into ranking: suppress the implicated paths of a failure.
+	if exp.Failed && len(exp.ImplicatedPaths) > 0 {
+		_ = RecordFeedback(dataDir, workspaceID, "run_fail", exp.ImplicatedPaths)
+	}
 	return exp, nil
 }
 

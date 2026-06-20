@@ -26,6 +26,36 @@ func WorkspaceSearch(dataDir, workspaceID, query string, limit int) (json.RawMes
 	return json.RawMessage(out), nil
 }
 
+// WorkspaceSearchWithFeedback runs the live search, fuses the agent-feedback boost
+// into the ranking, and records that the returned paths were retrieved (closing the
+// bidirectional loop). Falls back to the raw result if it can't parse.
+func WorkspaceSearchWithFeedback(dataDir, workspaceID, query string, limit int) (json.RawMessage, error) {
+	raw, err := WorkspaceSearch(dataDir, workspaceID, query, limit)
+	if err != nil {
+		return nil, err
+	}
+	var res searchResult
+	if err := json.Unmarshal(raw, &res); err != nil || len(res.Hits) == 0 {
+		return raw, nil //nolint:nilerr
+	}
+	res.Hits = applyFeedbackToHits(dataDir, workspaceID, res.Hits)
+	// record retrieval for the top results (the slice the agent actually sees).
+	top := res.Hits
+	if len(top) > 8 {
+		top = top[:8]
+	}
+	paths := make([]string, 0, len(top))
+	for _, h := range top {
+		paths = append(paths, h.Path)
+	}
+	_ = RecordFeedback(dataDir, workspaceID, "retrieval", paths)
+	out, merr := json.Marshal(res)
+	if merr != nil {
+		return raw, nil
+	}
+	return out, nil
+}
+
 type searchHit struct {
 	Kind   string  `json:"kind"`
 	Name   string  `json:"name"`

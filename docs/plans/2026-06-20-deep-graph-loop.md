@@ -37,13 +37,14 @@ Checklist (in order; check off as committed):
   `GraphFileNode` at index time. Measured: cold 1.32s → 1-file-edit reindex 0.08s
   (16×); cached build == fresh (tested); authority verification.go=220 live.
 
-- [ ] **S5 — IndexEngine Phase 2: agent-feedback layer.** A feedback segment
-  (`agent_feedback.json` or an `xm_feedback` table) appended from MCP tool calls
-  (search query+returned paths, remember/verify path boosts, run success/fail →
-  boost/suppress touched paths). Fuse a feedback term into search ranking
-  (`…+ 0.10·feedback`); decay by recency. Seed from the retrieval ledger.
-  *DoD:* a path that was verified/used ranks higher on a later search; test the
-  fusion; live before/after on a seeded workspace.
+- [x] **S5 — IndexEngine Phase 2: agent-feedback layer.** `feedback.go`:
+  `agent_feedback.json` segment (`path → retrieval/verify/run_success/run_fail +
+  last_used`). Written from: search (records the returned paths), verify/propose
+  (boosts a memory's paths on promotion), failure explainer (suppresses a failed
+  run's implicated paths). `feedbackBoosts` fuses with recency decay (~30-day
+  half-life, tanh-squashed); `WorkspaceSearchWithFeedback` re-ranks the default
+  search (+0.1·boost). Tested + verified live: verify a memory about auth.go →
+  later "auth" search boosts auth.go symbols (reason `· feedback`).
 
 - [ ] **S6 — IndexEngine Phase 3: symbol-level adjacency for impact.** Precompute
   symbol adjacency from S2's resolved edges; `impact?symbol=` traverses the

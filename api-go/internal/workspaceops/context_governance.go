@@ -270,8 +270,10 @@ func ProposeContext(dataDir, workspaceID string, req ProposeContextRequest) (*Co
 	}
 	reconcileEntry(&entry)
 	if entry.Promoted {
-		// snapshot the referenced files so drift-on-recall has a baseline.
+		// snapshot the referenced files so drift-on-recall has a baseline, and boost
+		// the verified paths in the agent-feedback layer (single-agent immediate promote).
 		entry.PathHashes = capturePathHashes(contextRoot(dataDir, workspaceID), entry.Paths)
+		_ = RecordFeedback(dataDir, workspaceID, "verify", entry.Paths)
 	}
 	entries = append(entries, entry)
 	if err := saveContextEntries(dataDir, workspaceID, entries); err != nil {
@@ -325,8 +327,10 @@ func VerifyContext(dataDir, workspaceID, entryID, agent string, approve bool, no
 	entry.UpdatedAt = now
 	reconcileEntry(entry)
 	if entry.Promoted && len(entry.PathHashes) == 0 {
-		// just transitioned to promoted — snapshot referenced files for drift checks.
+		// just transitioned to promoted — snapshot referenced files for drift checks,
+		// and boost the verified paths in the agent-feedback layer.
 		entry.PathHashes = capturePathHashes(contextRoot(dataDir, workspaceID), entry.Paths)
+		_ = RecordFeedback(dataDir, workspaceID, "verify", entry.Paths)
 	}
 	if err := saveContextEntries(dataDir, workspaceID, entries); err != nil {
 		return nil, err

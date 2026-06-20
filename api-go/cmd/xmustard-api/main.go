@@ -3451,7 +3451,8 @@ func main() {
 			// optional neural lane: ?rerank=<provider>&embed_model=<model>
 			result, err = workspaceops.WorkspaceSearchReranked(dd, r.PathValue("workspace_id"), query, r.URL.Query().Get("rerank"), r.URL.Query().Get("embed_model"), limit)
 		default:
-			result, err = workspaceops.WorkspaceSearch(dd, r.PathValue("workspace_id"), query, limit)
+			// default search fuses the agent-feedback boost and records retrieval.
+			result, err = workspaceops.WorkspaceSearchWithFeedback(dd, r.PathValue("workspace_id"), query, limit)
 		}
 		issueIntel(w, err, result)
 	})
