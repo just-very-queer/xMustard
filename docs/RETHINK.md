@@ -71,13 +71,19 @@ source path. Measure on a real task, not a feature count.
    call; the static Postgres index is a separate HTTP-only path, off the agent
    surface). Added the missing half of "slices not dumps": each symbol hit now
    carries its 1-based `line` so the agent jumps to the location.
-5. ⬜ Deprecate goal/swarm + ops/eval/security platform surfaces (UI-only or remove).
+5. ✅ Lean surface via `XMUSTARD_CORE_ONLY=1` (off by default): 404s any path
+   outside the governed-memory + grounding + search core, so a production deployment
+   serves only the agent-facing surface without deleting the platform routes the UI uses.
 
-### Beyond the core (ROADMAP items folded into the agent surface)
-- ✅ **Failure explainers** (`why_failed`, ROADMAP A3): correlate a failed run's
-  signals + salient error lines + the changed files named in its output. 9th MCP tool.
-- ⬜ Routing as a first-class run-execution runtime, neural-embedding search lane,
-  cockpit wiring (governance/providers/auth).
+### Beyond the core (ROADMAP items — all delivered)
+- ✅ **Failure explainers** (`why_failed`, A3): correlate a failed run's signals +
+  salient error lines + the changed files named in its output. 9th MCP tool.
+- ✅ **Routing as a run-execution runtime** (A1): `provider:<name>` / `route` runtimes
+  execute via the model directly and record a runRecord (`StartProviderRun`).
+- ✅ **Neural-embedding search lane** (A2): `/search?rerank=<provider>` fuses an
+  embeddings-cosine rank with the lexical/structural rank via RRF (`OpenAIEmbeddings`).
+- ✅ **Cockpit wiring** (A4): `MemoryPanel` surfaces verified context (with stale +
+  conflict flags), pending proposals to approve/reject, and a propose form.
    (The agent surface is already free of them; this is internal cleanup, deferred —
    not gutting features without an explicit call.)
 
