@@ -64,7 +64,7 @@ been removed.
 
 | Item | Verdict | Effort | Evidence |
 |------|---------|--------|----------|
-| **Graph-proximity RRF lane** (A2 remainder) | not-done | medium | `search.rs:253-264` fuses only lexical/semantic/structural; `symbol_impact` exists but is never called from search. The "structural" lane is global inbound-popularity, not per-query proximity. |
+| **Graph-proximity RRF lane** (A2 remainder) | **DONE** | medium | `hybrid_search` takes `seed: Option<&str>`, calls `symbol_impact` for BFS distances → `1/(d+1)` 4th `"proximity"` RRF lane; auto-seeds from the top exact match; wired `search?seed=` + MCP `seed` param. Live: `seed=RecordFeedback` re-ranks `feedback.go` neighbours up (lane shows `…+proximity`). |
 | **Contract-break detection** (A3 remainder) | not-done | medium | Nothing snapshots/diffs old-vs-new signatures. `repomap.rs:176` already extracts `signature_text` (foundation) — never baselined or compared. |
 | **Wiki incrementality** | not-done | small–med | `wiki.rs:56` always full-rebuilds (no dirty-file/cache reuse). The ingestion phase-DAG itself IS done (`project_truth.go ReadIngestionPlan`). |
 | **Auth follow-ons** (A5) | not-done | large | `tokenRecord` has no `ExpiresAt`; `ResolveToken` no TTL check; mint/revoke/deny never call `RecordAuditEvent`; `requireRole` only admin vs non-admin. |
@@ -91,9 +91,8 @@ polish — none blocks the primary agent use-case.
 
 ## 5. Highest-Leverage Next Tasks (verified, ranked by value/effort)
 
-1. **Graph-proximity RRF lane** (medium) — thread an optional seed into
-   `hybrid_search`, call `symbol_impact` for BFS distances, add a 4th `rank_by`.
-   The implementation path is fully mapped; best value/effort.
+1. ~~Graph-proximity RRF lane~~ — **DONE** (R1). 4th proximity lane via `symbol_impact`
+   BFS distances + auto-seed + `search?seed=`.
 2. **Contract-break detection** (medium) — `signature_text` is already extracted;
    baseline it and diff old-vs-new on change.
 3. **Wiki incrementality** (small–med) — reuse the per-file symbol cache from S4.

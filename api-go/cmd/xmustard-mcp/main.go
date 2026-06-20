@@ -79,7 +79,7 @@ func tools() []tool {
 				}
 				return "POST", wsPath(a, "/context/"+url.PathEscape(a["entry_id"])+"/verify") + "?approve=" + approve
 			}},
-		{"search", "Narrow code search over the repo, returning relevant slices (path:line), not a dump. Default mode is hybrid (lexical+semantic+structural). Pass mode=pattern to run an ast-grep STRUCTURAL query (query is the pattern, e.g. `$A && $A()`; optional lang).", []string{"workspace_id", "query"},
+		{"search", "Narrow code search over the repo, returning relevant slices (path:line), not a dump. Default mode is hybrid (lexical+semantic+structural+proximity). Pass seed=<symbol> to anchor a graph-PROXIMITY lane that pulls symbols structurally near that symbol up the ranking (auto-seeds from an exact query→symbol match otherwise). Pass mode=pattern to run an ast-grep STRUCTURAL query (query is the pattern, e.g. `$A && $A()`; optional lang).", []string{"workspace_id", "query"},
 			func(a map[string]string) (string, string) {
 				p := wsPath(a, "/search") + "?q=" + url.QueryEscape(a["query"])
 				if a["mode"] != "" {
@@ -87,6 +87,9 @@ func tools() []tool {
 				}
 				if a["lang"] != "" {
 					p += "&lang=" + url.QueryEscape(a["lang"])
+				}
+				if a["seed"] != "" {
+					p += "&seed=" + url.QueryEscape(a["seed"])
 				}
 				return "GET", p
 			}},

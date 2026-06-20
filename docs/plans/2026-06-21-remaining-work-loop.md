@@ -9,14 +9,22 @@ adversarial review workflow on risky slices → commit one slice + push to
 `feat/product-v1` → check the box here → next. Keep the 9-tool MCP surface (enrich,
 don't add tools). No Python.
 
-- [ ] **R1 — Graph-proximity RRF lane** *(medium, best value/effort)*. Thread an
-  optional seed symbol into `rust-core/src/search.rs hybrid_search`; call
-  `symbolgraph::symbol_impact(graph, seed, max_depth)` for BFS distances; map
-  distance→score (e.g. `1/(depth+1)`), store on `Cand`, add a 4th `rank_by`
-  "proximity" lane to the RRF loop (`search.rs:260-268`). Wire `search?seed=` (and/or
-  auto-seed from the top exact hit).
-  *DoD:* a query with a seed re-ranks nearby symbols up; test the lane; live before/after.
-  *Evidence it's open:* `search.rs:253-264` fuses only 3 lanes; `symbol_impact` never called from search.
+- [x] **R1 — Graph-proximity RRF lane** *(medium, best value/effort)*. **DONE.**
+  `hybrid_search` now takes `seed: Option<&str>`; resolves an effective seed
+  (explicit param, else auto-seed from the top exact query→symbol match), calls
+  `symbolgraph::symbol_impact(graph, seed, PROXIMITY_DEPTH=3)`, folds
+  distance→`1/(d+1)` onto each `Cand.proximity` (seed's own file = 1.0), and adds a
+  4th `"proximity"` RRF lane. Wired `search?seed=` through the Go API
+  (`WorkspaceSearch`/`WithFeedback`), the CLI 5th positional arg, and the MCP
+  `search` tool's `seed` param (still 9 tools).
+  *Tests:* `proximity_lane_reranks_graph_neighbour_up` (seed flips graph-near above
+  graph-far), `auto_seed_from_exact_match_activates_proximity` (exact match
+  auto-seeds; unrelated symbol gets no proximity credit) — both green.
+  *Live (this repo):* query `feedback` + `seed=RecordFeedback` → lane reads
+  `lexical+semantic+structural+proximity`, scores 0.048→0.064, `applyFeedbackToHits`
+  (same file as seed) rises rank 6→3, distant `WorkspaceSearchWithFeedback` drops out
+  of top 6. Pure ranking enrichment; only re-ranks the already-matched pool (never
+  widens recall). Committed + pushed.
 
 - [ ] **R2 — Contract-break detection** *(medium)*. Persist `signature_text`
   (already extracted at `repomap.rs:176`) into the change-tracking baseline; on change

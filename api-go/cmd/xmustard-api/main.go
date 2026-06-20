@@ -3467,7 +3467,8 @@ func main() {
 			result, err = workspaceops.WorkspaceSearchReranked(dd, r.PathValue("workspace_id"), query, r.URL.Query().Get("rerank"), r.URL.Query().Get("embed_model"), limit)
 		default:
 			// default search fuses the agent-feedback boost and records retrieval.
-			result, err = workspaceops.WorkspaceSearchWithFeedback(dd, r.PathValue("workspace_id"), query, limit)
+			// optional ?seed=<symbol> activates the graph-proximity lane.
+			result, err = workspaceops.WorkspaceSearchWithFeedback(dd, r.PathValue("workspace_id"), query, r.URL.Query().Get("seed"), limit)
 		}
 		issueIntel(w, err, result)
 	})

@@ -1,9 +1,10 @@
-//! Hybrid repo search (knowledge layer): three retrieval lanes — lexical
+//! Hybrid repo search (knowledge layer): four retrieval lanes — lexical
 //! (BM25-style idf over symbol-name subtokens), semantic (a model-free
-//! hashing-trick embedding with char-trigram fuzziness), and structural (inbound
-//! reference weight from the symbol graph) — fused with Reciprocal Rank Fusion.
-//! This is the in-process retrieval floor; the Postgres tsvector tables in the Go
-//! foundation are the scale path and reuse the same RRF idea.
+//! hashing-trick embedding with char-trigram fuzziness), structural (inbound
+//! reference weight from the symbol graph), and proximity (graph distance to an
+//! optional seed symbol) — fused with Reciprocal Rank Fusion. This is the
+//! in-process retrieval floor; the Postgres tsvector tables in the Go foundation
+//! are the scale path and reuse the same RRF idea.
 
 use chrono::{SecondsFormat, Utc};
 use serde::Serialize;
@@ -115,8 +116,24 @@ pub struct SearchResult {
     pub generated_at: String,
 }
 
-/// Hybrid lexical + structural search over the repo's symbol graph.
-pub fn hybrid_search(root: &Path, workspace_id: &str, query: &str, limit: usize) -> SearchResult {
+/// Distance to the seed (BFS depth over the reference graph) collapses to a
+/// proximity weight: the seed's own file scores 1.0, its direct dependents 0.5,
+/// and so on. `1/(depth+1)` so the lane stays bounded and decays smoothly.
+const PROXIMITY_DEPTH: usize = 3;
+
+/// Hybrid lexical + structural + proximity search over the repo's symbol graph.
+///
+/// `seed` is an optional anchor symbol: when set (or auto-derived from an exact
+/// query→symbol match), graph distance from the seed becomes a 4th RRF lane that
+/// pulls structurally-nearby symbols up. It only re-ranks the already-matched
+/// pool — proximity never widens recall on its own.
+pub fn hybrid_search(
+    root: &Path,
+    workspace_id: &str,
+    query: &str,
+    limit: usize,
+    seed: Option<&str>,
+) -> SearchResult {
     let graph = symbolgraph::build_symbol_graph_cached(root, workspace_id);
     let hotspots: HashSet<String> = symbolgraph::compute_hotspots(&graph, 30)
         .into_iter()
@@ -176,6 +193,7 @@ pub fn hybrid_search(root: &Path, workspace_id: &str, query: &str, limit: usize)
         hotspot: bool,
         emb: f32,
         structural: usize,
+        proximity: f64, // 1/(graph-distance+1) to the seed; 0.0 when no seed/unreachable
     }
     const EMB_GATE: f32 = 0.30; // a pure-semantic hit must clear this to enter the pool
 
@@ -209,6 +227,7 @@ pub fn hybrid_search(root: &Path, workspace_id: &str, query: &str, limit: usize)
             hotspot: hotspots.contains(&sym.path),
             emb,
             structural: *inbound.get(&sym.path).unwrap_or(&0),
+            proximity: 0.0,
         });
     }
     for f in &graph.files {
@@ -234,11 +253,37 @@ pub fn hybrid_search(root: &Path, workspace_id: &str, query: &str, limit: usize)
             hotspot: hotspots.contains(&f.path),
             emb,
             structural: *inbound.get(&f.path).unwrap_or(&0),
+            proximity: 0.0,
         });
     }
 
-    // Reciprocal Rank Fusion across three lanes. Each lane ranks the pool by its
-    // own signal; a candidate's fused score sums 1/(k + rank) over the lanes it
+    // Proximity lane: resolve the seed (explicit, else auto-seed from the top
+    // exact query→symbol match), BFS its blast radius over the reference graph,
+    // and fold distance→weight onto each candidate's defining file.
+    let effective_seed: Option<String> = match seed {
+        Some(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
+        _ => cands.iter().find(|c| c.exact).map(|c| c.name.clone()),
+    };
+    if let Some(seed_name) = &effective_seed {
+        let impact = symbolgraph::symbol_impact(&graph, seed_name, PROXIMITY_DEPTH);
+        let mut prox: HashMap<String, f64> = HashMap::new();
+        for d in &impact.defined_in {
+            prox.insert(d.clone(), 1.0); // the seed's own file: distance 0
+        }
+        for f in &impact.impacted {
+            prox.entry(f.path.clone()).or_insert(1.0 / (f.distance as f64 + 1.0));
+        }
+        if !prox.is_empty() {
+            for c in &mut cands {
+                if let Some(&p) = prox.get(&c.path) {
+                    c.proximity = p;
+                }
+            }
+        }
+    }
+
+    // Reciprocal Rank Fusion across up to four lanes. Each lane ranks the pool by
+    // its own signal; a candidate's fused score sums 1/(k + rank) over the lanes it
     // appears in, so agreement across diverse signals beats one loud signal.
     let rank_by = |key: &dyn Fn(&Cand) -> f64| -> Vec<usize> {
         let mut idxs: Vec<usize> = (0..cands.len()).filter(|&i| key(&cands[i]) > 0.0).collect();
@@ -253,6 +298,7 @@ pub fn hybrid_search(root: &Path, workspace_id: &str, query: &str, limit: usize)
     let lex_rank = rank_by(&|c| c.lexical);
     let emb_rank = rank_by(&|c| c.emb as f64);
     let str_rank = rank_by(&|c| c.structural as f64);
+    let prox_rank = rank_by(&|c| c.proximity);
 
     let k = 60.0f64;
     let mut rrf = vec![0.0f64; cands.len()];
@@ -261,6 +307,7 @@ pub fn hybrid_search(root: &Path, workspace_id: &str, query: &str, limit: usize)
         ("lexical", &lex_rank),
         ("semantic", &emb_rank),
         ("structural", &str_rank),
+        ("proximity", &prox_rank),
     ] {
         for (rank, &i) in ranking.iter().enumerate() {
             rrf[i] += 1.0 / (k + rank as f64 + 1.0);
@@ -349,7 +396,7 @@ mod tests {
             ("a.rs", "pub fn compute_widget_total() {}\npub fn unrelated_thing() {}\n"),
             ("b.rs", "pub fn other_helper() {}\n"),
         ]);
-        let res = hybrid_search(repo.path(), "ws", "compute_widget_total", 10);
+        let res = hybrid_search(repo.path(), "ws", "compute_widget_total", 10, None);
         assert!(res.total >= 1);
         assert_eq!(res.hits[0].name, "compute_widget_total");
         assert_eq!(res.hits[0].reason, "exact symbol match");
@@ -360,9 +407,9 @@ mod tests {
     #[test]
     fn search_token_match_and_empty_query() {
         let repo = git_repo(&[("a.rs", "pub fn widget_factory() {}\n")]);
-        let res = hybrid_search(repo.path(), "ws", "widget", 10);
+        let res = hybrid_search(repo.path(), "ws", "widget", 10, None);
         assert!(res.hits.iter().any(|h| h.name == "widget_factory"));
-        let empty = hybrid_search(repo.path(), "ws", "   ", 10);
+        let empty = hybrid_search(repo.path(), "ws", "   ", 10, None);
         assert_eq!(empty.total, 0);
     }
 
@@ -374,7 +421,7 @@ mod tests {
             ("ui.rs", "pub fn render_dashboard() {}\npub fn save_invoice() {}\n"),
             ("b.rs", "pub fn unrelated_widget() {}\n"),
         ]);
-        let res = hybrid_search(repo.path(), "ws", "dashbord", 10);
+        let res = hybrid_search(repo.path(), "ws", "dashbord", 10, None);
         assert!(
             res.hits.iter().any(|h| h.name == "render_dashboard"),
             "semantic lane should recover the fuzzy match: {:?}",
@@ -385,9 +432,72 @@ mod tests {
     #[test]
     fn rrf_reason_notes_fused_lanes() {
         let repo = git_repo(&[("a.rs", "pub fn compute_widget() {}\n")]);
-        let res = hybrid_search(repo.path(), "ws", "widget", 10);
+        let res = hybrid_search(repo.path(), "ws", "widget", 10, None);
         let hit = res.hits.iter().find(|h| h.name == "compute_widget").unwrap();
         assert!(hit.reason.contains("lexical") || hit.reason.contains("semantic"), "{}", hit.reason);
+    }
+
+    #[test]
+    fn proximity_lane_reranks_graph_neighbour_up() {
+        // Two symbols both match the query "token". Without a seed, the
+        // alphabetically-earlier far symbol wins the name tiebreak. With the seed
+        // `resolve_token`, the near symbol (in a file that calls the seed → graph
+        // distance 1) is pulled above the far one by the proximity lane.
+        let repo = git_repo(&[
+            ("auth.rs", "pub fn resolve_token() {}\n"),
+            ("near.rs", "pub fn zzz_token_near() { resolve_token(); }\n"),
+            ("far.rs", "pub fn aaa_token_far() {}\n"),
+        ]);
+        let pos = |res: &SearchResult, name: &str| {
+            res.hits.iter().position(|h| h.name == name)
+        };
+
+        let plain = hybrid_search(repo.path(), "ws", "token", 10, None);
+        let near_plain = pos(&plain, "zzz_token_near").expect("near present");
+        let far_plain = pos(&plain, "aaa_token_far").expect("far present");
+        // baseline: with no seed, the far symbol is not below the near one.
+        assert!(far_plain < near_plain, "baseline order: {:?}", plain.hits);
+
+        let seeded = hybrid_search(repo.path(), "ws", "token", 10, Some("resolve_token"));
+        let near_seeded = pos(&seeded, "zzz_token_near").expect("near present");
+        let far_seeded = pos(&seeded, "aaa_token_far").expect("far present");
+        assert!(
+            near_seeded < far_seeded,
+            "seed should re-rank the graph-near symbol above the far one: {:?}",
+            seeded.hits
+        );
+        let near_hit = &seeded.hits[near_seeded];
+        assert!(
+            near_hit.reason.contains("proximity"),
+            "near hit should credit the proximity lane: {}",
+            near_hit.reason
+        );
+    }
+
+    #[test]
+    fn auto_seed_from_exact_match_activates_proximity() {
+        // No explicit seed, but the query "token" exactly names a symbol → that
+        // symbol auto-seeds the proximity lane. A caller that also matches "token"
+        // (so it's in the pool) and calls the seed (graph distance 1) is credited
+        // by proximity; an unrelated "token" symbol is not.
+        let repo = git_repo(&[
+            ("auth.rs", "pub fn token() {}\n"),
+            ("caller.rs", "pub fn token_handler() { token(); }\n"),
+            ("far.rs", "pub fn token_orphan() {}\n"),
+        ]);
+        let res = hybrid_search(repo.path(), "ws", "token", 10, None);
+        let handler = res.hits.iter().find(|h| h.name == "token_handler");
+        assert!(
+            handler.map(|h| h.reason.contains("proximity")).unwrap_or(false),
+            "exact-match auto-seed should credit the caller via proximity: {:?}",
+            res.hits
+        );
+        let orphan = res.hits.iter().find(|h| h.name == "token_orphan").unwrap();
+        assert!(
+            !orphan.reason.contains("proximity"),
+            "an unrelated symbol must not get a proximity credit: {}",
+            orphan.reason
+        );
     }
 
     #[test]

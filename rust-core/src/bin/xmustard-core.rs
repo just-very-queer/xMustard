@@ -977,7 +977,7 @@ fn main() {
             }
         }
         "search" => {
-            let usage = "xmustard-core search <root> <workspace_id> <query> [limit]";
+            let usage = "xmustard-core search <root> <workspace_id> <query> [limit] [seed]";
             let Some(root) = args.next() else {
                 eprintln!("usage: {usage}");
                 std::process::exit(2);
@@ -991,7 +991,15 @@ fn main() {
                 std::process::exit(2);
             };
             let limit = args.next().and_then(|v| v.parse::<usize>().ok()).unwrap_or(25);
-            let result = xmustard_core::search::hybrid_search(&PathBuf::from(root), &ws, &query, limit);
+            // optional 5th positional: a seed symbol for the graph-proximity lane.
+            let seed = args.next().filter(|s| !s.trim().is_empty());
+            let result = xmustard_core::search::hybrid_search(
+                &PathBuf::from(root),
+                &ws,
+                &query,
+                limit,
+                seed.as_deref(),
+            );
             println!(
                 "{}",
                 serde_json::to_string(&result).expect("search result should serialize")

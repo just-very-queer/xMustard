@@ -11,7 +11,12 @@ import (
 
 // Knowledge layer delivery: hybrid search + wiki generation over the repo.
 
-func WorkspaceSearch(dataDir, workspaceID, query string, limit int) (json.RawMessage, error) {
+// WorkspaceSearch runs the in-process hybrid search. `seed`, when non-empty, is an
+// anchor symbol that activates the graph-proximity RRF lane (symbols structurally
+// near the seed are pulled up); empty seed keeps the default lexical/semantic/
+// structural fusion (with auto-seeding from an exact query→symbol match inside the
+// core).
+func WorkspaceSearch(dataDir, workspaceID, query string, limit int, seed string) (json.RawMessage, error) {
 	root, _, err := resolveChangeRoot(dataDir, workspaceID)
 	if err != nil {
 		return nil, err
@@ -19,7 +24,12 @@ func WorkspaceSearch(dataDir, workspaceID, query string, limit int) (json.RawMes
 	if limit <= 0 {
 		limit = 25
 	}
-	out, err := rustcore.RunSearch(root, workspaceID, query, strconv.Itoa(limit))
+	coreArgs := []string{root, workspaceID, query, strconv.Itoa(limit)}
+	if seed != "" {
+		// the seed is the CLI's optional 5th positional arg, after limit.
+		coreArgs = append(coreArgs, seed)
+	}
+	out, err := rustcore.RunSearch(coreArgs...)
 	if err != nil {
 		return nil, err
 	}
@@ -29,8 +39,8 @@ func WorkspaceSearch(dataDir, workspaceID, query string, limit int) (json.RawMes
 // WorkspaceSearchWithFeedback runs the live search, fuses the agent-feedback boost
 // into the ranking, and records that the returned paths were retrieved (closing the
 // bidirectional loop). Falls back to the raw result if it can't parse.
-func WorkspaceSearchWithFeedback(dataDir, workspaceID, query string, limit int) (json.RawMessage, error) {
-	raw, err := WorkspaceSearch(dataDir, workspaceID, query, limit)
+func WorkspaceSearchWithFeedback(dataDir, workspaceID, query, seed string, limit int) (json.RawMessage, error) {
+	raw, err := WorkspaceSearch(dataDir, workspaceID, query, limit, seed)
 	if err != nil {
 		return nil, err
 	}
@@ -79,7 +89,7 @@ type searchResult struct {
 // and the embedding-cosine rank. This is the opt-in neural upgrade to the model-free
 // in-process search; default search stays fast and provider-free.
 func WorkspaceSearchReranked(dataDir, workspaceID, query, provider, model string, limit int) (json.RawMessage, error) {
-	raw, err := WorkspaceSearch(dataDir, workspaceID, query, limit*2)
+	raw, err := WorkspaceSearch(dataDir, workspaceID, query, limit*2, "")
 	if err != nil {
 		return nil, err
 	}
