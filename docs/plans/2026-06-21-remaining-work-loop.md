@@ -45,10 +45,22 @@ don't add tools). No Python.
   yields `contract_breaks:1`, `signature_change:"params 1→2, return bool→Result<...>"`;
   a body-only edit yields `0`. Committed + pushed.
 
-- [ ] **R3 — Wiki incrementality** *(small–medium)*. `wiki.rs generate_wiki` always
-  full-rebuilds (`wiki.rs:56`). Reuse the per-file symbol cache (S4) / the warm graph
-  cache so wiki regenerates only the affected subsystem pages on change.
-  *DoD:* editing one file regenerates only its page(s), not the whole wiki; measured.
+- [x] **R3 — Wiki incrementality** *(small–medium)*. **DONE.** Two wins: (1)
+  `generate_wiki` now calls `build_symbol_graph_cached` instead of the cold
+  `build_symbol_graph` — wiki was the *last* consumer doing a full O(repo) graph
+  rebuild on every call; it now rides the S0/S4 warm cache. (2) Per-subsystem page
+  cache: each subsystem page is fingerprinted over its sorted files + per-file symbol
+  sets (`subsystem_fingerprint`) and cached under `.git/xmustard-cache/wiki-<ws>.json`
+  (new `indexcache::{load,store}_wiki_cache_bytes`); on regen, an unchanged
+  fingerprint serves the byte-identical cached page, only changed subsystems
+  re-render. Render order is sorted so the fingerprint↔bytes mapping is sound; stale
+  subsystems drop (cache rebuilt from current slugs). `RepoWiki` now reports
+  `regenerated_slugs` / `reused_slugs` for measurability.
+  *Tests:* `wiki_regenerates_only_changed_subsystem` (cold→all regen; edit core→
+  core regenerates, util reused byte-identical, core page shows the new symbol).
+  *Live:* edit only `core/lib.rs` → `regenerated:[overview, subsystem-core]`,
+  `reused:[subsystem-util]`; warm no-edit run reuses 4/4 subsystem pages. Committed +
+  pushed.
 
 - [ ] **R4 — Auth follow-ons (A5)** *(large)*. (a) Audit log: have mint/revoke and
   authMiddleware-denial call `RecordAuditEvent` (mint/revoke/denied). (b) Token

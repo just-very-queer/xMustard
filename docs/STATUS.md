@@ -66,7 +66,7 @@ been removed.
 |------|---------|--------|----------|
 | **Graph-proximity RRF lane** (A2 remainder) | **DONE** | medium | `hybrid_search` takes `seed: Option<&str>`, calls `symbol_impact` for BFS distances → `1/(d+1)` 4th `"proximity"` RRF lane; auto-seeds from the top exact match; wired `search?seed=` + MCP `seed` param. Live: `seed=RecordFeedback` re-ranks `feedback.go` neighbours up (lane shows `…+proximity`). |
 | **Contract-break detection** (A3 remainder) | **DONE** | medium | `changetrack` derives + baselines per-symbol signatures (`IndexBaseline.signatures`), diffs them on modified files → `DirtySymbol.contract_break` + `signature_change` (`params N→M, return x→y`); surfaced in `impact`/`ground` (`contract_breaks`, `broken_contracts`). Live: arity/return change flags, body-only edit doesn't. |
-| **Wiki incrementality** | not-done | small–med | `wiki.rs:56` always full-rebuilds (no dirty-file/cache reuse). The ingestion phase-DAG itself IS done (`project_truth.go ReadIngestionPlan`). |
+| **Wiki incrementality** | **DONE** | small–med | `generate_wiki` now uses `build_symbol_graph_cached` (was the last cold-rebuild caller) + a per-subsystem fingerprint page cache (`wiki-<ws>.json`); only changed subsystems re-render (`regenerated_slugs`/`reused_slugs`). Live: edit one file → one subsystem regenerates. |
 | **Auth follow-ons** (A5) | not-done | large | `tokenRecord` has no `ExpiresAt`; `ResolveToken` no TTL check; mint/revoke/deny never call `RecordAuditEvent`; `requireRole` only admin vs non-admin. |
 | **Postgres as the write path** (C1) | not-done | large | `saveRunRecord`→`writeJSON` for run_plans; verification to JSON; `pgops.go`/`pgverify.go` are one-shot DELETE+INSERT mirrors, never inline on mutation. |
 | **Deeper data/control-flow edges** | not-done | large | Only imports/calls/inherits/tests/references; LSP upgrade also only emits `calls`. No data-flow/control-flow/read-write edges. |
@@ -95,6 +95,7 @@ polish — none blocks the primary agent use-case.
    BFS distances + auto-seed + `search?seed=`.
 2. ~~Contract-break detection~~ — **DONE** (R2). Baselined per-symbol signatures
    diffed on change → `contract_break` in `impact`/`ground`.
-3. **Wiki incrementality** (small–med) — reuse the per-file symbol cache from S4.
+3. ~~Wiki incrementality~~ — **DONE** (R3). Warm cached graph + per-subsystem
+   fingerprint page cache; only changed subsystems re-render.
 4. **Auth A5 / PG write path / deeper edges / cockpit UI** — all large; sequence
    by need (auth + PG write path for production; cockpit UI for a product surface).

@@ -99,6 +99,24 @@ pub fn store_symbol_cache_bytes(root: &Path, workspace_id: &str, bytes: &[u8]) {
     }
 }
 
+/// Path to the per-workspace wiki page cache (subsystem slug → fingerprinted page).
+pub fn wiki_cache_path(root: &Path, workspace_id: &str) -> PathBuf {
+    cache_dir(root).join(format!("wiki-{workspace_id}.json"))
+}
+
+/// Load the raw wiki-cache bytes (caller deserializes), or None if absent.
+pub fn load_wiki_cache_bytes(root: &Path, workspace_id: &str) -> Option<Vec<u8>> {
+    fs::read(wiki_cache_path(root, workspace_id)).ok()
+}
+
+/// Persist the wiki-cache bytes (best-effort).
+pub fn store_wiki_cache_bytes(root: &Path, workspace_id: &str, bytes: &[u8]) {
+    let dir = cache_dir(root);
+    if fs::create_dir_all(&dir).is_ok() {
+        let _ = fs::write(wiki_cache_path(root, workspace_id), bytes);
+    }
+}
+
 /// Load a cached symbol graph for the current cheap key, if present and valid.
 pub fn load_cached_graph(root: &Path, workspace_id: &str, key: &str) -> Option<SymbolGraph> {
     let path = graph_cache_file(root, workspace_id, key);
