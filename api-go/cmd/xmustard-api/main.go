@@ -3727,8 +3727,15 @@ func main() {
 		}
 	}
 	var handler http.Handler = mux
+	if os.Getenv("XMUSTARD_CORE_ONLY") == "1" {
+		// Lean production surface: expose only the governed-memory + grounding +
+		// search core (the paths the 9 MCP tools + auth use), 404 everything else.
+		// The full platform surface stays available when this is unset (for the UI).
+		handler = coreOnlyMiddleware(handler)
+		log.Printf("surface: CORE_ONLY — platform routes disabled")
+	}
 	if authMode != "off" {
-		handler = authMiddleware(dataDir(), authMode, mux)
+		handler = authMiddleware(dataDir(), authMode, handler)
 		if authMode == "required" || workspaceops.HasAuthConfigured(dataDir()) {
 			log.Printf("auth: ENFORCED (mode=%s, bearer token required)", authMode)
 		} else {
@@ -3774,6 +3781,41 @@ func requireRole(w http.ResponseWriter, r *http.Request, role string) bool {
 		return false
 	}
 	return true
+}
+
+// coreOnlyPaths are the path markers the 9 MCP tools (+ auth/health) use. In
+// CORE_ONLY mode any request whose path lacks one of these gets a 404, so a lean
+// production deployment serves only the governed-memory + grounding + search core.
+var coreOnlyPaths = []string{
+	"/session-grounding", // ground
+	"/context",           // recall / remember / verify
+	"/search",            // search
+	"/explain-path",      // explain
+	"/changes/since-index", // impact
+	"/diagnostics",       // diagnostics
+	"/why-failed",        // why_failed
+}
+
+func isCorePath(p string) bool {
+	if p == "/api/health" || p == "/api/workspaces" || strings.HasPrefix(p, "/api/auth/") {
+		return true
+	}
+	for _, marker := range coreOnlyPaths {
+		if strings.Contains(p, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func coreOnlyMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !isCorePath(r.URL.Path) {
+			writeJSON(w, http.StatusNotFound, map[string]any{"error": "endpoint disabled in CORE_ONLY mode"})
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func authMiddleware(dataDir, mode string, next http.Handler) http.Handler {
