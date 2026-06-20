@@ -58,10 +58,10 @@ Legend: ✅ built · 🟡 partial/foundation · ⬜ planned (little/no code)
 - 🟡 Managed execution: structured run state, bounded output capture, failure provenance, durable summaries, cancellation/timeout (Rust process runner is the next Python cut)
 
 ### C. Semantic intelligence core (Upgrade — MOSTLY BUILT)
-- ✅ Structural repo map; 🟡 symbol-aware code maps (tree-sitter backed) + ⬜ enclosing-scope context
+- ✅ Structural repo map; ✅ symbol-aware code maps (tree-sitter backed) + ✅ enclosing-scope context (`treesitter.rs` walks the parent chain → impl/class/trait/mod)
 - ✅ tree-sitter symbol extraction (`rust-core/treesitter.rs`, primary engine for Rust/Go/TS/TSX/JS/JSX; regex fallback) — feeds path-symbols, the symbol graph, ownership edges, and the Postgres index
 - ✅ **ast-grep semantic pattern search** (`rust-core/semantic.rs`)
-- ✅ LSP **live sessions** (`rust-core/lsp_session.rs`: spawns rust-analyzer/gopls/typescript-language-server/clangd, runs the initialize/didOpen handshake over stdio JSON-RPC, returns documentSymbol/hover; normalized via `lsp.rs`; graceful when a server isn't installed). `/lsp/document-symbols` + MCP `lsp_document_symbols`; verified live (tsserver, clangd). ⬜ impl/type/rename + persistent (non-per-request) sessions
+- ✅ LSP **live sessions** (`rust-core/lsp_session.rs`: spawns rust-analyzer/gopls/typescript-language-server/clangd, runs the initialize/didOpen handshake over stdio JSON-RPC, returns documentSymbol/hover/references/definition/implementation/typeDefinition/rename; persistent `LspWorkspaceSession` for batched references; normalized via `lsp.rs`; graceful when a server isn't installed). `/lsp/document-symbols` + MCP `lsp_document_symbols`; verified live (tsserver, clangd). LSP-resolved CALLS edges feed the symbol graph (`symbolgraph build-lsp`).
 - 🟡 Impact analysis (`rust-core` semantic-impact: changed symbols → callers/tests); ⬜ contract-break detection
 - 🟡 Code/subsystem explainers (`rust-core` explain-path); ⬜ "why a failure happened"
 - ✅ Semantic repo graph (`rust-core/symbolgraph.rs`: files/symbols + **typed edges** imports/calls/inherits/tests/references, tree-sitter backed, + hotspots + blast radius; `issue_symbol_edges.go` adds issue↔symbol mentions/evidence edges via MCP `issue_symbol_edges`). Verified live: calls 820 / refs 466 / tests 420 / imports 107. ⬜ deeper data/control-flow edges

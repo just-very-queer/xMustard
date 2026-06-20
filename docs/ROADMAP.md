@@ -9,36 +9,33 @@ tracks that can proceed in parallel.
 self-contained, pattern-following slices; Claude takes architectural, cross-cutting,
 security-sensitive, and integration-heavy work.
 
+> **Status (verified 2026-06-21):** C2, C3, C4, A1, A3 ✅ done; A2 ✅ neural-embedding
+> rerank done, ⬜ graph-proximity lane remains; A4 ✅ governance MemoryPanel done,
+> ⬜ provider/routing/token UI remains; C1 ⬜ and A5 ⬜ open. The genuinely-open work
+> is tracked in `docs/plans/2026-06-21-remaining-work-loop.md`.
+
 ## Codex track (mechanical, pattern-following — Claude verifies)
 
-- **C1 — Postgres write path for ops** *(in progress)*: make `run_plans` + `verification_*` live in
+- **C1 — Postgres write path for ops** ⬜: make `run_plans` + `verification_*` live in
   Postgres (currently JSON), mirroring the `pgops.go` pattern (schema + materialize + read-back +
   FTS where useful). Endpoints under `/pg/*`. `PLANNED_FEATURES.md` line "make PG the write path".
-- **C2 — LSP impl/type/rename**: extend `rust-core/src/lsp_session.rs` with `textDocument/
-  implementation`, `typeDefinition`, and `rename` request types, following the existing
-  `documentSymbol`/`hover` pattern (CLI subcommands + Go delegators + endpoints). Graceful when the
-  server lacks the capability.
-- **C3 — Enclosing-scope context**: in `rust-core/src/treesitter.rs`, walk each symbol's tree-sitter
-  parent chain to record its enclosing scope (module/impl/class/fn) on `RustPathSymbolRecord.
-  enclosing_scope` (currently always `None`). Bounded, additive, unit-tested.
-- **C4 — Runtime/service-graph discovery**: enrich `project_info` with env-var references,
-  docker/compose services, and the process/service graph (`PLANNED_FEATURES.md` line 71), evidence-
-  gated like the existing target detection.
+- **C2 — LSP impl/type/rename** ✅: `lsp_session.rs` has references/definition/implementation/
+  typeDefinition/rename + a persistent session (S1).
+- **C3 — Enclosing-scope context** ✅: `treesitter.rs` walks the parent chain → enclosing_scope.
+- **C4 — Runtime/service-graph discovery** ✅: `project_info.go buildProjectServiceGraph` builds
+  service identities/groups/relationships + compose + env handling.
 
 ## Claude track (architectural / integration / security)
 
-- **A1 — Routing as a first-class run-execution runtime**: let a run dispatch to an OpenAI-compatible
-  provider (not just the codex/opencode CLIs) — a `provider:<name>` runtime branch in
-  `validateRuntimeModel`/`buildRuntimeCommand` + a managed-run execution path that records a
-  `runRecord` from `RouteAndChat`. Closes "wire routing as a run-execution runtime".
-- **A2 — Neural embeddings + graph-proximity RRF lane**: add an embeddings lane sourced from a
-  provider's `/embeddings` endpoint (reusing the provider layer — no Python), plus a graph-proximity
-  lane (symbol-graph distance) fused into RRF in `search.rs`/`SearchPostgres`.
-- **A3 — Failure explainers**: "why a failure happened" (correlate run output + diagnostics +
-  changed symbols) and contract-break detection in impact analysis.
-- **A4 — Cockpit integration**: surface providers, task-typed routing, context governance
-  (propose/verify/active), and auth (token mgmt, whoami) in the React cockpit.
-- **A5 — Auth follow-ons**: an audit log of auth events (mint/revoke/denied), token expiry/rotation,
+- **A1 — Routing as a first-class run-execution runtime** ✅: `StartProviderRun` —
+  `provider:<name>`/`route` runtimes execute via the model and record a runRecord.
+- **A2 — Neural embeddings + graph-proximity RRF lane** ✅/⬜: neural-embedding rerank
+  (`OpenAIEmbeddings`, `/search?rerank=`) done; ⬜ graph-proximity lane (use `symbol_impact`
+  distances as a 4th RRF lane) remains.
+- **A3 — Failure explainers** ✅: `why_failed` correlates run output + error lines + changed files.
+  ⬜ contract-break detection remains (foundation: `signature_text` already extracted).
+- **A4 — Cockpit integration** ✅/⬜: governance `MemoryPanel` done; ⬜ provider/routing/token UI remains.
+- **A5 — Auth follow-ons** ⬜: audit log of auth events (mint/revoke/denied), token expiry/rotation,
   and finer per-endpoint authz beyond the admin/agent/readonly split.
 
 ## Goal records

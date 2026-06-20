@@ -2,7 +2,7 @@
 
 ## 1. What the Product IS Now
 
-xMustard is a **tiny MCP server for governed runtime memory** — its only job is giving coding agents (Claude Code, opencode, codex, etc.) two things: *grounding* ("what changed / what's stale / what's broken since you last touched this") and *memory with a trust lifecycle* (propose → multi-agent verify → promote, with drift-on-recall so memory never goes silently stale). It exposes exactly **8 MCP tools** (ground, recall, remember, verify, search, explain, impact, diagnostics) backed by a Go API shell (`api-go/`) and a Rust semantic core (`rust-core/`). It deliberately does *not* try to be the agent, the search engine, the eval platform, or the security tracker — those are either cut from the agent surface or deferred to a future UI.
+xMustard is a **tiny MCP server for governed runtime memory** — its only job is giving coding agents (Claude Code, opencode, codex, etc.) two things: *grounding* ("what changed / what's stale / what's broken since you last touched this") and *memory with a trust lifecycle* (propose → multi-agent verify → promote, with drift-on-recall so memory never goes silently stale). It exposes **9 enriched MCP tools** (ground, recall, remember, verify, search, explain, impact, diagnostics, why_failed — several take modes/params, e.g. `search?mode=pattern`, `impact symbol=/from=/to=`, `recall query=`) backed by a Go API shell (`api-go/`) and a Rust semantic core (`rust-core/`). It deliberately does *not* try to be the agent, the search engine, the eval platform, or the security tracker — those are either cut from the agent surface or deferred to a future UI.
 
 ---
 
@@ -57,57 +57,45 @@ xMustard is a **tiny MCP server for governed runtime memory** — its only job i
 
 ## 3. NOT DONE / Remaining Gaps
 
-### RETHINK Steps 4–5 (explicitly open)
-- **Step 4 — Retire materialized static index as default.** `pgindex.go` + `xm_files`/`xm_symbols` Postgres tables still exist as the primary search path. Agents should explore live; the static index should be a fallback, not the source of truth. No code change yet.
-- **Step 5 — Deprecate goal/swarm + ops/eval/security platform surfaces.** The HTTP API still exposes the full ~120-route surface (eval timelines, security disposition, goal/swarm runtime, ops materialization). The agent surface is clean (8 tools), but the HTTP surface is not cleaned up. `RETHINK.md` defers this to "not gutting without explicit call" but it is still open weight.
+Verified against the code on 2026-06-21 (one agent per item, evidence-backed —
+see `docs/plans/2026-06-21-remaining-work-loop.md`). The items below are the
+**genuinely-open** ones; everything previously listed here that is now done has
+been removed.
 
-### Routing as Run-Execution Runtime (ROADMAP A1)
-- Provider routing is a decision/dispatch layer but not a first-class run-execution runtime. Full coding runs still dispatch to the codex/opencode CLIs. `provider:<name>` runtime branch and managed-run execution path recording a `runRecord` from `RouteAndChat` not built.
+| Item | Verdict | Effort | Evidence |
+|------|---------|--------|----------|
+| **Graph-proximity RRF lane** (A2 remainder) | not-done | medium | `search.rs:253-264` fuses only lexical/semantic/structural; `symbol_impact` exists but is never called from search. The "structural" lane is global inbound-popularity, not per-query proximity. |
+| **Contract-break detection** (A3 remainder) | not-done | medium | Nothing snapshots/diffs old-vs-new signatures. `repomap.rs:176` already extracts `signature_text` (foundation) — never baselined or compared. |
+| **Wiki incrementality** | not-done | small–med | `wiki.rs:56` always full-rebuilds (no dirty-file/cache reuse). The ingestion phase-DAG itself IS done (`project_truth.go ReadIngestionPlan`). |
+| **Auth follow-ons** (A5) | not-done | large | `tokenRecord` has no `ExpiresAt`; `ResolveToken` no TTL check; mint/revoke/deny never call `RecordAuditEvent`; `requireRole` only admin vs non-admin. |
+| **Postgres as the write path** (C1) | not-done | large | `saveRunRecord`→`writeJSON` for run_plans; verification to JSON; `pgops.go`/`pgverify.go` are one-shot DELETE+INSERT mirrors, never inline on mutation. |
+| **Deeper data/control-flow edges** | not-done | large | Only imports/calls/inherits/tests/references; LSP upgrade also only emits `calls`. No data-flow/control-flow/read-write edges. |
+| **Cockpit UI for providers/routing/tokens** (A4 remainder) | not-done | large | No React components; `api.ts` has only ticket-integration CRUD. Backend endpoints (`/api/providers*`, `/api/route*`, `/api/auth/*`) exist — only the UI is missing. |
 
-### Neural Embeddings + Graph-Proximity RRF Lane (ROADMAP A2)
-- Search uses a model-free hashing-trick embedding. No neural embeddings via provider `/embeddings` endpoint. No graph-proximity lane in RRF fusion. `search.rs`/`SearchPostgres` RRF stops at lexical + structural.
-
-### Failure Explainers (ROADMAP A3)
-- "Why a failure happened" (correlate run output + diagnostics + changed symbols) not implemented. Contract-break detection in impact analysis not implemented.
-
-### Cockpit Integration of Governance + Providers (ROADMAP A4)
-- React cockpit does not surface context governance (propose/verify/active), provider management, task-typed routing, or token management. HTTP API exists; UI wiring is not done.
-
-### Auth Follow-ons (ROADMAP A5)
-- No audit log of auth events (mint/revoke/denied). No token expiry/rotation. No finer per-endpoint authz beyond the admin/agent/readonly split.
-
-### Postgres Write Path for Ops (ROADMAP C1)
-- `run_plans` and `verification_*` still JSON-only; PG write path not implemented for these.
-
-### LSP impl/type/rename (ROADMAP C2)
-- `lsp_session.rs` supports documentSymbol + hover only. `textDocument/implementation`, `typeDefinition`, `rename` not built.
-
-### Enclosing-Scope Context (ROADMAP C3)
-- `RustPathSymbolRecord.enclosing_scope` always `None`. Tree-sitter parent-chain walk not implemented.
-
-### Stale Docs
-- `PLANNED_FEATURES.md` still describes the "three-surface cockpit" and "27 tools → 31 tools" framing that predates the RETHINK collapse to 8. It says "75–85% backend capability" against the old vision — that estimate is misleading against the current governed-memory thesis.
-- `README.md` still frames xMustard as a "repo cockpit + operational-memory tool" with no mention of the 8-tool MCP surface or the RETHINK direction.
-- `docs/ROADMAP.md` splits work into "codex track / Claude track" — accurate but the A1–A5/C1–C4 items are not cross-referenced to the RETHINK steps.
+### Stale docs (being fixed in this pass)
+- `PLANNED_FEATURES.md` had ⬜ markers for enclosing-scope and LSP impl/type/rename that are now done — corrected.
 
 ---
 
 ## 4. Completion Estimate Against the RETHINK Thesis
 
-**~75% complete** against the governed-memory product.
-
-The core moat (propose → verify → promote → drift-on-recall → conflict-surfacing) is delivered and sharp. The 8-tool MCP surface is live and tested. Auth is hardened. Grounding is real. The gaps are: static index retirement (step 4), HTTP surface cleanup (step 5), neural search upgrade, failure explainers, and cockpit wiring for governance — none of which block the primary agent use-case, but all of which matter for production readiness.
+**~90% complete** against the governed-memory product. Everything in the RETHINK
+plan (steps 1–5) is done; the deep-graph + IndexEngine loop (S1–S6: full LSP,
+scope-resolved CALLS, communities, incremental reindex, agent-feedback ranking,
+symbol-level impact/trace) is done. The 9 enriched MCP tools are live and tested,
+auth is hardened, grounding + drift-on-recall + conflict surfacing are real, and
+the warm index is 20× faster. The remaining 7 items (section 3) are depth/production
+polish — none blocks the primary agent use-case.
 
 ---
 
-## 5. Top 5 Highest-Leverage Next Tasks (Ranked)
+## 5. Highest-Leverage Next Tasks (verified, ranked by value/effort)
 
-1. **Update README.md and PLANNED_FEATURES.md to reflect RETHINK** — Stale docs are the highest-risk item: anyone reading them (including future Claude sessions) gets the wrong picture. `README.md` should describe the 8-tool governed-memory server; `PLANNED_FEATURES.md` should be reconciled or superseded by `RETHINK.md`. No code change required; pure alignment work.
-
-2. **Retire materialized static index as default (RETHINK step 4)** — Make `search` call live tree-sitter/ast-grep exploration first, falling back to the PG index only as a cache. Closes the biggest architectural contradiction in the product: RETHINK says "active exploration beats static indexing" but search still queries a static Postgres index as the primary path. Impact: search quality + eliminates drift between index and live tree.
-
-3. **HTTP surface cleanup (RETHINK step 5)** — The 8-tool MCP surface is clean, but the Go API still wires ~120 routes including eval/swarm/goal/security/ops platform endpoints. Move non-memory, non-grounding routes behind a `X-Feature` flag or a separate `api-go/cmd/xmustard-platform` binary so the MCP-backed paths stay sharp and auditable. Reduces attack surface and cognitive load.
-
-4. **`recall` / `ground` integration test against a live workspace with real file mutations** — The drift-on-recall and conflict-surfacing logic exists and is unit-tested, but there is no end-to-end test that promotes a memory, mutates the referenced file, recalls, and asserts `stale=true`. This is the product's core invariant; it needs an integration test before shipping to real agents.
-
-5. **Routing as a first-class run-execution runtime (ROADMAP A1)** — Provider routing exists as a dispatch decision but runs still shell out to codex/opencode CLIs. Adding a `provider:<name>` runtime branch to `validateRuntimeModel`/`buildRuntimeCommand` lets the tool drive any OpenAI-compatible model directly — making the provider layer actually close the loop and removing the CLI dependency for non-local runtimes.
+1. **Graph-proximity RRF lane** (medium) — thread an optional seed into
+   `hybrid_search`, call `symbol_impact` for BFS distances, add a 4th `rank_by`.
+   The implementation path is fully mapped; best value/effort.
+2. **Contract-break detection** (medium) — `signature_text` is already extracted;
+   baseline it and diff old-vs-new on change.
+3. **Wiki incrementality** (small–med) — reuse the per-file symbol cache from S4.
+4. **Auth A5 / PG write path / deeper edges / cockpit UI** — all large; sequence
+   by need (auth + PG write path for production; cockpit UI for a product surface).
