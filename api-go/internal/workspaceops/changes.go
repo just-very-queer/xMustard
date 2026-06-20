@@ -76,13 +76,14 @@ func WorkspaceChangesSinceIndex(dataDir, workspaceID string) (json.RawMessage, e
 	return json.RawMessage(out), nil
 }
 
-// WorkspaceWorkingChanges returns uncommitted working-tree changes + dirty symbols.
+// WorkspaceWorkingChanges returns uncommitted working-tree changes + dirty symbols,
+// including contract-break flags (vs the index baseline) on modified symbols.
 func WorkspaceWorkingChanges(dataDir, workspaceID string) (json.RawMessage, error) {
-	root, _, err := resolveChangeRoot(dataDir, workspaceID)
+	root, absData, err := resolveChangeRoot(dataDir, workspaceID)
 	if err != nil {
 		return nil, err
 	}
-	out, err := rustcore.RunChangetrack("working-changes", root, workspaceID)
+	out, err := rustcore.RunChangetrack("working-changes", absData, root, workspaceID)
 	if err != nil {
 		return nil, err
 	}

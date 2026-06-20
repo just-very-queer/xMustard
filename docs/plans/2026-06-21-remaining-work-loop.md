@@ -26,12 +26,24 @@ don't add tools). No Python.
   of top 6. Pure ranking enrichment; only re-ranks the already-matched pool (never
   widens recall). Committed + pushed.
 
-- [ ] **R2 — Contract-break detection** *(medium)*. Persist `signature_text`
-  (already extracted at `repomap.rs:176`) into the change-tracking baseline; on change
-  detection, diff baseline vs current signature per symbol; emit a `contract_break`
-  flag on changed symbols (added/removed params, changed return type). Surface in
-  `impact` (and `ground`).
-  *DoD:* changing a function signature flags a contract break; unchanged body does not; tested + live.
+- [x] **R2 — Contract-break detection** *(medium)*. **DONE.** `repomap.rs:176`'s
+  `signature_text` was a declared-but-always-`None` field, so the baseline now
+  derives a real signature (`changetrack::symbol_signature`: decl line up to the
+  body `{`/`;`/`:`, whitespace-normalized) for every function/method and persists it
+  on `IndexBaseline.signatures` (keyed `path\x1fscope\x1fsymbol`, `serde(default)` so
+  pre-R2 baselines still load). On a *modified* file, each symbol's current signature
+  is diffed vs the baseline; a difference sets `DirtySymbol.contract_break` +
+  `signature_change` (`classify_signature_change` → `params N→M, return \`x\`→\`y\``),
+  and `ChangeSet.contract_breaks` counts them. Surfaced in `impact` (since-index) and
+  `ground` (`working_tree_changes` now loads the baseline; `SessionGrounding`
+  exposes `contract_breaks` + `broken_contracts` + the summary line). MCP `impact`
+  and `ground` descriptions updated (still 9 tools).
+  *Tests:* `contract_break_on_signature_change_not_on_body` (arity change breaks,
+  body edit doesn't), `contract_break_surfaces_in_working_tree_changes` (return-type
+  change in the grounding view), baseline test asserts a new symbol is *not* a break.
+  *Live (temp repo):* `auth(token)->bool` → `auth(token, scope)->Result<bool,String>`
+  yields `contract_breaks:1`, `signature_change:"params 1→2, return bool→Result<...>"`;
+  a body-only edit yields `0`. Committed + pushed.
 
 - [ ] **R3 — Wiki incrementality** *(small–medium)*. `wiki.rs generate_wiki` always
   full-rebuilds (`wiki.rs:56`). Reuse the per-file symbol cache (S4) / the warm graph

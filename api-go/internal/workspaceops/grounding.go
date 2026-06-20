@@ -66,6 +66,8 @@ type SessionGrounding struct {
 	Drift                        json.RawMessage `json:"drift"`
 	ChangedFiles                 int             `json:"changed_files"`
 	DirtySymbols                 int             `json:"dirty_symbols"`
+	ContractBreaks               int             `json:"contract_breaks"`
+	BrokenContracts              []string        `json:"broken_contracts,omitempty"`
 	RecentFailedRuns             []string        `json:"recent_failed_runs"`
 	BlockedByDirtyState          bool            `json:"blocked_by_dirty_state"`
 	BlockedByFailingVerification bool            `json:"blocked_by_failing_verification"`
@@ -86,10 +88,22 @@ func BuildSessionGrounding(dataDir, workspaceID string) (*SessionGrounding, erro
 		return nil, err
 	}
 	var changes struct {
-		ChangedFiles []json.RawMessage `json:"changed_files"`
-		DirtySymbols []json.RawMessage `json:"dirty_symbols"`
+		ChangedFiles   []json.RawMessage `json:"changed_files"`
+		ContractBreaks int               `json:"contract_breaks"`
+		DirtySymbols   []struct {
+			Path            string `json:"path"`
+			Symbol          string `json:"symbol"`
+			ContractBreak   bool   `json:"contract_break"`
+			SignatureChange string `json:"signature_change"`
+		} `json:"dirty_symbols"`
 	}
 	_ = json.Unmarshal(changesRaw, &changes)
+	broken := []string{}
+	for _, s := range changes.DirtySymbols {
+		if s.ContractBreak {
+			broken = append(broken, fmt.Sprintf("%s in %s (%s)", s.Symbol, s.Path, s.SignatureChange))
+		}
+	}
 
 	failed := []string{}
 	if runs, err := ListRuns(dataDir, workspaceID); err == nil {
@@ -110,6 +124,8 @@ func BuildSessionGrounding(dataDir, workspaceID string) (*SessionGrounding, erro
 		Drift:                        drift,
 		ChangedFiles:                 len(changes.ChangedFiles),
 		DirtySymbols:                 len(changes.DirtySymbols),
+		ContractBreaks:               changes.ContractBreaks,
+		BrokenContracts:              broken,
 		RecentFailedRuns:             failed,
 		BlockedByDirtyState:          len(changes.ChangedFiles) > 0,
 		BlockedByFailingVerification: len(failed) > 0,
@@ -121,7 +137,7 @@ func BuildSessionGrounding(dataDir, workspaceID string) (*SessionGrounding, erro
 			g.StaleMemory = n
 		}
 	}
-	g.Summary = fmt.Sprintf("%d changed file(s), %d dirty symbol(s), %d failed run(s), %d stale memory.",
-		g.ChangedFiles, g.DirtySymbols, len(failed), g.StaleMemory)
+	g.Summary = fmt.Sprintf("%d changed file(s), %d dirty symbol(s), %d contract break(s), %d failed run(s), %d stale memory.",
+		g.ChangedFiles, g.DirtySymbols, g.ContractBreaks, len(failed), g.StaleMemory)
 	return g, nil
 }

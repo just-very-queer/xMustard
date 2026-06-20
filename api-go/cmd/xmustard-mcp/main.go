@@ -45,7 +45,7 @@ func wsPath(args map[string]string, suffix string) string {
 // method and path it proxies to on the xMustard API.
 func tools() []tool {
 	return []tool{
-		{"ground", "Orient before acting: what changed / what's stale / what's broken / what's blocked since the indexed baseline, with index-trust (drift) included.", []string{"workspace_id"},
+		{"ground", "Orient before acting: what changed / what's stale / what's broken / what's blocked since the indexed baseline, with index-trust (drift) and any contract breaks (changed function signatures vs the baseline) included.", []string{"workspace_id"},
 			func(a map[string]string) (string, string) { return "GET", wsPath(a, "/session-grounding") }},
 		{"recall", "The VERIFIED shared context to trust, RANKED to your task: pass a query and/or paths to get the few relevant facts (multi-signal: lexical + path overlap + verification strength), not a dump. No query → recency-ranked top-N.", []string{"workspace_id"},
 			func(a map[string]string) (string, string) {
@@ -97,7 +97,7 @@ func tools() []tool {
 			func(a map[string]string) (string, string) {
 				return "GET", wsPath(a, "/explain-path") + "?path=" + url.QueryEscape(a["path"])
 			}},
-		{"impact", "Blast radius. No args → impact of the current changes (dirty symbols). symbol= → every file that transitively references that symbol (graph BFS). from= & to= → the shortest dependency path between two symbols.", []string{"workspace_id"},
+		{"impact", "Blast radius. No args → impact of the current changes (dirty symbols, with contract_break flags where a signature changed vs the baseline). symbol= → every file that transitively references that symbol (graph BFS). from= & to= → the shortest dependency path between two symbols.", []string{"workspace_id"},
 			func(a map[string]string) (string, string) {
 				p := wsPath(a, "/changes/since-index")
 				q := ""

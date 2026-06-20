@@ -115,7 +115,123 @@ pub struct IndexBaseline {
     pub workspace_id: String,
     pub fingerprint: RepoFingerprint,
     pub file_hashes: BTreeMap<String, String>,
+    /// Per-symbol declaration signatures captured at index time, keyed by
+    /// `path \x1f scope \x1f symbol`. Diffing a current signature against this is
+    /// how a contract break (changed params / return type) is detected on a
+    /// modified file. `serde(default)` so pre-R2 baselines still load.
+    #[serde(default)]
+    pub signatures: BTreeMap<String, String>,
     pub indexed_at: String,
+}
+
+/// Stable key for a symbol's signature across re-indexes: path + enclosing scope
+/// (so two methods named `new` in different impl blocks don't collide) + name.
+/// Line numbers are deliberately excluded — they shift when code above changes.
+fn signature_key(path: &str, scope: Option<&str>, symbol: &str) -> String {
+    format!("{path}\u{1f}{}\u{1f}{symbol}", scope.unwrap_or(""))
+}
+
+/// Best-effort declaration signature for a symbol: the text from its start line up
+/// to the body opener (`{`) or a terminating `;`/`:`, with whitespace normalized.
+/// This captures the parameter list and return type so a change to either is
+/// detectable, while a change to the body (after `{`) leaves the signature
+/// unchanged — exactly the contract-vs-implementation distinction we want.
+fn symbol_signature(root: &Path, rel_path: &str, line_start: Option<usize>) -> Option<String> {
+    let ls = line_start?; // 1-based
+    if ls == 0 {
+        return None;
+    }
+    let full = fs::read_to_string(root.join(rel_path)).ok()?;
+    let lines: Vec<&str> = full.lines().collect();
+    if ls > lines.len() {
+        return None;
+    }
+    let mut sig = String::new();
+    for line in lines.iter().skip(ls - 1).take(6) {
+        if let Some(idx) = line.find('{') {
+            sig.push_str(&line[..idx]);
+            break; // brace languages: the body starts here, stop before it
+        }
+        sig.push_str(line);
+        sig.push(' ');
+        let t = line.trim_end();
+        if t.ends_with(';') || t.ends_with(':') {
+            break; // bodyless decl (trait method) or python `def ...:`
+        }
+    }
+    let normalized = sig.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
+/// Only function-like symbols carry a "contract" worth diffing.
+fn is_contract_kind(kind: &str) -> bool {
+    matches!(kind, "function" | "method")
+}
+
+/// Classify how two signatures differ, for a concise human reason.
+fn classify_signature_change(old: &str, new: &str) -> String {
+    let param_count = |s: &str| -> Option<usize> {
+        let lp = s.find('(')?;
+        let rp = s.rfind(')')?;
+        if rp <= lp {
+            return None;
+        }
+        let inner = s[lp + 1..rp].trim();
+        if inner.is_empty() {
+            Some(0)
+        } else {
+            Some(inner.split(',').count())
+        }
+    };
+    let return_part = |s: &str| -> String {
+        match s.rfind(')') {
+            Some(rp) => s[rp + 1..].trim().trim_start_matches("->").trim().to_string(),
+            None => String::new(),
+        }
+    };
+    let mut parts = Vec::new();
+    if let (Some(po), Some(pn)) = (param_count(old), param_count(new))
+        && po != pn
+    {
+        parts.push(format!("params {po}→{pn}"));
+    }
+    let (ro, rn) = (return_part(old), return_part(new));
+    if ro != rn {
+        parts.push(format!("return `{ro}`→`{rn}`"));
+    }
+    if parts.is_empty() {
+        "signature changed".to_string()
+    } else {
+        parts.join(", ")
+    }
+}
+
+/// Capture a signature map over all tracked source files for the baseline.
+fn collect_signatures(root: &Path, workspace_id: &str) -> BTreeMap<String, String> {
+    let mut sigs = BTreeMap::new();
+    for path in file_hash_map(root).keys() {
+        if !is_source(path) {
+            continue;
+        }
+        if let Ok(result) = repomap::extract_path_symbols(root, workspace_id, path) {
+            for sym in &result.symbols {
+                if !is_contract_kind(&sym.kind) {
+                    continue;
+                }
+                if let Some(sig) = symbol_signature(root, path, sym.line_start) {
+                    sigs.insert(
+                        signature_key(path, sym.enclosing_scope.as_deref(), &sym.symbol),
+                        sig,
+                    );
+                }
+            }
+        }
+    }
+    sigs
 }
 
 fn baseline_path(data_dir: &Path, workspace_id: &str) -> std::path::PathBuf {
@@ -144,10 +260,12 @@ pub fn build_index_baseline(
         dirty_path_count: dirty.len(),
         generated_at: now(),
     };
+    let signatures = collect_signatures(root, workspace_id);
     let baseline = IndexBaseline {
         workspace_id: workspace_id.to_string(),
         fingerprint,
         file_hashes: map,
+        signatures,
         indexed_at: now(),
     };
     let path = baseline_path(data_dir, workspace_id);
@@ -253,6 +371,14 @@ pub struct DirtySymbol {
     pub symbol: String,
     pub kind: String,
     pub change: String,
+    /// True when this symbol's declaration signature differs from the indexed
+    /// baseline (params or return type changed) — a downstream-caller-breaking
+    /// change, distinct from a body-only edit.
+    #[serde(default)]
+    pub contract_break: bool,
+    /// A concise description of the signature delta, when `contract_break`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature_change: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -261,6 +387,9 @@ pub struct ChangeSet {
     pub since: String,
     pub changed_files: Vec<ChangedFile>,
     pub dirty_symbols: Vec<DirtySymbol>,
+    /// Count of dirty symbols whose signature broke vs the baseline (surfaced
+    /// prominently by `impact`/`ground`).
+    pub contract_breaks: usize,
     pub generated_at: String,
 }
 
@@ -301,7 +430,15 @@ fn diff_hash_maps(
 }
 
 /// Collect symbols in the changed (added/modified) source files, best-effort.
-fn dirty_symbols_for(root: &Path, workspace_id: &str, changed: &[ChangedFile]) -> Vec<DirtySymbol> {
+/// When `baseline_sigs` is provided, each function/method symbol's current
+/// signature is diffed against the baseline to flag contract breaks (only on
+/// `modified` files — an `added` file has no prior contract to break).
+fn dirty_symbols_for(
+    root: &Path,
+    workspace_id: &str,
+    changed: &[ChangedFile],
+    baseline_sigs: Option<&BTreeMap<String, String>>,
+) -> Vec<DirtySymbol> {
     let mut out = Vec::new();
     for cf in changed {
         if cf.change == "deleted" || !is_source(&cf.path) {
@@ -309,11 +446,28 @@ fn dirty_symbols_for(root: &Path, workspace_id: &str, changed: &[ChangedFile]) -
         }
         if let Ok(result) = repomap::extract_path_symbols(root, workspace_id, &cf.path) {
             for sym in result.symbols {
+                let mut contract_break = false;
+                let mut signature_change = None;
+                if cf.change == "modified"
+                    && is_contract_kind(&sym.kind)
+                    && let Some(sigs) = baseline_sigs
+                {
+                    let key = signature_key(&cf.path, sym.enclosing_scope.as_deref(), &sym.symbol);
+                    if let (Some(old), Some(new)) =
+                        (sigs.get(&key), symbol_signature(root, &cf.path, sym.line_start))
+                        && old != &new
+                    {
+                        contract_break = true;
+                        signature_change = Some(classify_signature_change(old, &new));
+                    }
+                }
                 out.push(DirtySymbol {
                     path: cf.path.clone(),
                     symbol: sym.symbol,
                     kind: sym.kind,
                     change: cf.change.clone(),
+                    contract_break,
+                    signature_change,
                 });
             }
         }
@@ -321,28 +475,41 @@ fn dirty_symbols_for(root: &Path, workspace_id: &str, changed: &[ChangedFile]) -
     out
 }
 
+fn count_breaks(symbols: &[DirtySymbol]) -> usize {
+    symbols.iter().filter(|s| s.contract_break).count()
+}
+
 /// Compute what changed since the index baseline, including dirty symbols.
 pub fn changed_since_baseline(data_dir: &Path, root: &Path, workspace_id: &str) -> ChangeSet {
     let current = file_hash_map(root);
-    let changed_files = match load_index_baseline(data_dir, workspace_id) {
+    let baseline = load_index_baseline(data_dir, workspace_id);
+    let changed_files = match &baseline {
         Some(baseline) => diff_hash_maps(&baseline.file_hashes, &current),
         None => current
             .keys()
             .map(|p| ChangedFile { path: p.clone(), change: "added".into() })
             .collect(),
     };
-    let dirty_symbols = dirty_symbols_for(root, workspace_id, &changed_files);
+    let dirty_symbols = dirty_symbols_for(
+        root,
+        workspace_id,
+        &changed_files,
+        baseline.as_ref().map(|b| &b.signatures),
+    );
     ChangeSet {
         workspace_id: workspace_id.to_string(),
         since: "baseline".into(),
-        changed_files,
+        contract_breaks: count_breaks(&dirty_symbols),
         dirty_symbols,
+        changed_files,
         generated_at: now(),
     }
 }
 
 /// Compute uncommitted working-tree changes (git status) + dirty symbols.
-pub fn working_tree_changes(root: &Path, workspace_id: &str) -> ChangeSet {
+/// Loads the index baseline (via `data_dir`) so it can flag contract breaks on
+/// modified files — the session-grounding view an agent sees on reconnect.
+pub fn working_tree_changes(data_dir: &Path, root: &Path, workspace_id: &str) -> ChangeSet {
     let mut changed_files = Vec::new();
     for (code, path) in dirty_paths(root) {
         let change = if code.contains('D') {
@@ -355,12 +522,19 @@ pub fn working_tree_changes(root: &Path, workspace_id: &str) -> ChangeSet {
         changed_files.push(ChangedFile { path, change: change.to_string() });
     }
     changed_files.sort_by(|a, b| a.path.cmp(&b.path));
-    let dirty_symbols = dirty_symbols_for(root, workspace_id, &changed_files);
+    let baseline = load_index_baseline(data_dir, workspace_id);
+    let dirty_symbols = dirty_symbols_for(
+        root,
+        workspace_id,
+        &changed_files,
+        baseline.as_ref().map(|b| &b.signatures),
+    );
     ChangeSet {
         workspace_id: workspace_id.to_string(),
         since: "working-tree".into(),
-        changed_files,
+        contract_breaks: count_breaks(&dirty_symbols),
         dirty_symbols,
+        changed_files,
         generated_at: now(),
     }
 }
@@ -552,6 +726,70 @@ mod tests {
         assert!(cs.changed_files.iter().any(|c| c.path == "a.rs" && c.change == "modified"));
         // dirty symbols include the new function
         assert!(cs.dirty_symbols.iter().any(|s| s.symbol == "two"));
+        // adding a NEW function is not a contract break of an existing symbol.
+        assert_eq!(cs.contract_breaks, 0, "a new symbol is not a break: {:?}", cs.dirty_symbols);
+    }
+
+    #[test]
+    fn contract_break_on_signature_change_not_on_body() {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        git_init(repo.path());
+        fs::write(
+            repo.path().join("m.rs"),
+            "pub fn add(a: u32, b: u32) -> u32 {\n    a + b\n}\npub fn keep(x: u32) -> u32 {\n    x\n}\n",
+        )
+        .unwrap();
+        git_commit(repo.path());
+        let baseline = build_index_baseline(data.path(), repo.path(), "ws").unwrap();
+        assert!(
+            baseline.signatures.values().any(|s| s.contains("fn add")),
+            "baseline should capture the add signature: {:?}",
+            baseline.signatures
+        );
+
+        // change `add`'s arity (a real contract break) but only touch `keep`'s body.
+        fs::write(
+            repo.path().join("m.rs"),
+            "pub fn add(a: u32, b: u32, c: u32) -> u32 {\n    a + b + c\n}\npub fn keep(x: u32) -> u32 {\n    x + 0\n}\n",
+        )
+        .unwrap();
+        git_commit(repo.path());
+
+        let cs = changed_since_baseline(data.path(), repo.path(), "ws");
+        assert_eq!(cs.contract_breaks, 1, "only `add` should break: {:?}", cs.dirty_symbols);
+        let add = cs.dirty_symbols.iter().find(|s| s.symbol == "add").unwrap();
+        assert!(add.contract_break, "add must be flagged: {add:?}");
+        assert!(
+            add.signature_change.as_deref().unwrap_or("").contains("params 2→3"),
+            "reason should name the arity change: {:?}",
+            add.signature_change
+        );
+        let keep = cs.dirty_symbols.iter().find(|s| s.symbol == "keep").unwrap();
+        assert!(!keep.contract_break, "body-only edit is not a break: {keep:?}");
+    }
+
+    #[test]
+    fn contract_break_surfaces_in_working_tree_changes() {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        git_init(repo.path());
+        fs::write(repo.path().join("api.rs"), "pub fn handler(req: u32) -> bool {\n    req > 0\n}\n")
+            .unwrap();
+        git_commit(repo.path());
+        build_index_baseline(data.path(), repo.path(), "ws").unwrap();
+
+        // change the return type WITHOUT committing → working-tree (grounding) view.
+        fs::write(repo.path().join("api.rs"), "pub fn handler(req: u32) -> String {\n    req.to_string()\n}\n")
+            .unwrap();
+        let cs = working_tree_changes(data.path(), repo.path(), "ws");
+        assert_eq!(cs.contract_breaks, 1, "return-type change should break: {:?}", cs.dirty_symbols);
+        let h = cs.dirty_symbols.iter().find(|s| s.symbol == "handler").unwrap();
+        assert!(
+            h.signature_change.as_deref().unwrap_or("").contains("return"),
+            "reason should name the return change: {:?}",
+            h.signature_change
+        );
     }
 
     #[test]

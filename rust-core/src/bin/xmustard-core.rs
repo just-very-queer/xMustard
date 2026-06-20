@@ -1386,10 +1386,11 @@ fn run_changetrack_command(mut args: impl Iterator<Item = String>) {
             print_json(&ct::changed_since_baseline(Path::new(&data_dir), Path::new(&root), &ws));
         }
         "working-changes" => {
-            let usage = "xmustard-core changetrack working-changes <root> <workspace_id>";
+            let usage = "xmustard-core changetrack working-changes <data_dir> <root> <workspace_id>";
+            let data_dir = need(args.next(), usage);
             let root = need(args.next(), usage);
             let ws = need(args.next(), usage);
-            print_json(&ct::working_tree_changes(Path::new(&root), &ws));
+            print_json(&ct::working_tree_changes(Path::new(&data_dir), Path::new(&root), &ws));
         }
         "incorporate" => {
             let usage = "xmustard-core changetrack incorporate <data_dir> <root> <workspace_id>";
