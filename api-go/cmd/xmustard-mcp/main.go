@@ -79,9 +79,16 @@ func tools() []tool {
 				}
 				return "POST", wsPath(a, "/context/"+url.PathEscape(a["entry_id"])+"/verify") + "?approve=" + approve
 			}},
-		{"search", "Narrow hybrid code search (lexical + structural) over the repo's symbols and files. Returns relevant slices, not a dump.", []string{"workspace_id", "query"},
+		{"search", "Narrow code search over the repo, returning relevant slices (path:line), not a dump. Default mode is hybrid (lexical+semantic+structural). Pass mode=pattern to run an ast-grep STRUCTURAL query (query is the pattern, e.g. `$A && $A()`; optional lang).", []string{"workspace_id", "query"},
 			func(a map[string]string) (string, string) {
-				return "GET", wsPath(a, "/search") + "?q=" + url.QueryEscape(a["query"])
+				p := wsPath(a, "/search") + "?q=" + url.QueryEscape(a["query"])
+				if a["mode"] != "" {
+					p += "&mode=" + url.QueryEscape(a["mode"])
+				}
+				if a["lang"] != "" {
+					p += "&lang=" + url.QueryEscape(a["lang"])
+				}
+				return "GET", p
 			}},
 		{"explain", "Explain a file or directory: purpose, role, key symbols, and how to run/verify it.", []string{"workspace_id", "path"},
 			func(a map[string]string) (string, string) {

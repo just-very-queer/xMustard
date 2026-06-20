@@ -3423,10 +3423,19 @@ func main() {
 		dd := envDefault("XMUSTARD_DATA_DIR", "../backend/data")
 		var result json.RawMessage
 		var err error
-		if rerank := r.URL.Query().Get("rerank"); rerank != "" {
+		switch {
+		case r.URL.Query().Get("mode") == "pattern":
+			// structural AST search: the query is an ast-grep pattern (e.g. `$A && $A()`).
+			pat, perr := workspaceops.SearchSemanticPattern(dd, r.PathValue("workspace_id"), query, r.URL.Query().Get("lang"), r.URL.Query().Get("path"), limit)
+			if perr != nil {
+				issueIntel(w, perr, nil)
+				return
+			}
+			result, err = json.Marshal(pat)
+		case r.URL.Query().Get("rerank") != "":
 			// optional neural lane: ?rerank=<provider>&embed_model=<model>
-			result, err = workspaceops.WorkspaceSearchReranked(dd, r.PathValue("workspace_id"), query, rerank, r.URL.Query().Get("embed_model"), limit)
-		} else {
+			result, err = workspaceops.WorkspaceSearchReranked(dd, r.PathValue("workspace_id"), query, r.URL.Query().Get("rerank"), r.URL.Query().Get("embed_model"), limit)
+		default:
 			result, err = workspaceops.WorkspaceSearch(dd, r.PathValue("workspace_id"), query, limit)
 		}
 		issueIntel(w, err, result)
