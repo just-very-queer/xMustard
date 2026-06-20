@@ -10,6 +10,44 @@ pub struct TsSymbol {
     pub kind: String,
     pub line_start: usize,
     pub line_end: usize,
+    /// Name of the nearest enclosing container (impl/class/module/trait/fn), e.g.
+    /// "impl AuthMiddleware" → "AuthMiddleware". None at top level.
+    pub enclosing_scope: Option<String>,
+}
+
+// Container AST node kinds a symbol can be nested INSIDE. Deliberately excludes
+// function/struct/enum/type definitions so a symbol never reports its own
+// definition node as its scope — only true containers (impl/class/trait/module).
+const SCOPE_NODE_KINDS: &[&str] = &[
+    "impl_item",
+    "trait_item",
+    "mod_item",
+    "class_declaration",
+    "interface_declaration",
+    "namespace_declaration",
+];
+
+// Walk up from a node to the nearest enclosing named scope, returning its name
+// (the `name`/`type` child's text). Skips the symbol's own definition node.
+fn enclosing_scope_of(node: tree_sitter::Node, source: &[u8]) -> Option<String> {
+    let mut cur = node.parent();
+    while let Some(n) = cur {
+        if SCOPE_NODE_KINDS.contains(&n.kind()) {
+            // prefer a `name` child, else a `type` child (Rust impl blocks).
+            for field in ["name", "type"] {
+                if let Some(named) = n.child_by_field_name(field) {
+                    if let Ok(text) = named.utf8_text(source) {
+                        let text = text.trim();
+                        if !text.is_empty() {
+                            return Some(text.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        cur = n.parent();
+    }
+    None
 }
 
 struct LanguageConfig {
@@ -62,11 +100,15 @@ pub fn extract_symbols(relative_path: &str, source: &str) -> Option<Vec<TsSymbol
             if !seen.insert((symbol.to_string(), line_start)) {
                 continue;
             }
+            // a symbol is never its own scope (e.g. the `impl Foo` type capture).
+            let enclosing_scope =
+                enclosing_scope_of(capture.node, source.as_bytes()).filter(|s| s != symbol);
             symbols.push(TsSymbol {
                 symbol: symbol.to_string(),
                 kind: kind.to_string(),
                 line_start,
                 line_end,
+                enclosing_scope,
             });
             if symbols.len() >= 64 {
                 return Some(symbols);
@@ -218,6 +260,11 @@ mod tests {
         assert!(list.contains(&("Baz", "type")));
         assert!(list.contains(&("Qux", "type")));
         assert!(list.iter().any(|(name, kind)| *name == "build" && *kind == "method"));
+        // the method inside `impl Bar` carries its enclosing scope; top-level fn does not.
+        let build = symbols.iter().find(|s| s.symbol == "build").unwrap();
+        assert_eq!(build.enclosing_scope.as_deref(), Some("Bar"));
+        let foo = symbols.iter().find(|s| s.symbol == "foo").unwrap();
+        assert_eq!(foo.enclosing_scope, None);
     }
 
     #[test]

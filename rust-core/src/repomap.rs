@@ -130,6 +130,8 @@ pub struct RustChangedSymbolRecord {
     pub kind: String,
     pub line_start: Option<usize>,
     pub line_end: Option<usize>,
+    #[serde(default)]
+    pub enclosing_scope: Option<String>,
     pub evidence_source: String,
     pub semantic_status: Option<String>,
     pub selection_reason: String,
@@ -449,7 +451,7 @@ pub fn extract_path_symbols(
             kind: item.kind,
             line_start: item.line_start,
             line_end: item.line_end,
-            enclosing_scope: None,
+            enclosing_scope: item.enclosing_scope.clone(),
             evidence_source: "rust_semantic_core".to_string(),
             reason: Some(
                 "Rust semantic core extracted this symbol from the requested path.".to_string(),
@@ -725,6 +727,7 @@ fn extract_symbols_engine(
                     kind: item.kind,
                     line_start: Some(item.line_start),
                     line_end: Some(item.line_end),
+                    enclosing_scope: item.enclosing_scope,
                     evidence_source: "rust_semantic_core".to_string(),
                     semantic_status: Some("on_demand".to_string()),
                     selection_reason:
@@ -797,6 +800,7 @@ fn extract_symbols_with_regex(relative_path: &str, content: &str) -> Vec<RustCha
                 kind: (*kind).to_string(),
                 line_start: Some(line_no),
                 line_end: Some(line_no),
+                enclosing_scope: None, // regex fallback has no AST parent chain
                 evidence_source: "rust_semantic_core".to_string(),
                 semantic_status: Some("on_demand".to_string()),
                 selection_reason:
