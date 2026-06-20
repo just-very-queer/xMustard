@@ -3510,6 +3510,10 @@ func main() {
 		result, err := workspaceops.ScoreRunConfidence(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), r.PathValue("run_id"))
 		issueIntel(w, err, result)
 	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/runs/{run_id}/why-failed", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.ExplainRunFailure(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), r.PathValue("run_id"))
+		issueIntel(w, err, result)
+	})
 	mux.HandleFunc("GET /api/workspaces/{workspace_id}/issues/{issue_id}/owner-suggestions", func(w http.ResponseWriter, r *http.Request) {
 		result, err := workspaceops.SuggestIssueOwners(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), r.PathValue("issue_id"))
 		issueIntel(w, err, result)

@@ -80,6 +80,10 @@ func tools() []tool {
 			func(a map[string]string) (string, string) { return "GET", wsPath(a, "/changes/since-index") }},
 		{"diagnostics", "Current normalized diagnostics (errors/warnings) for the workspace.", []string{"workspace_id"},
 			func(a map[string]string) (string, string) { return "GET", wsPath(a, "/diagnostics") }},
+		{"why_failed", "Explain why a run failed: failure signals, salient error lines, and which changed files are implicated.", []string{"workspace_id", "run_id"},
+			func(a map[string]string) (string, string) {
+				return "GET", wsPath(a, "/runs/"+url.PathEscape(a["run_id"])+"/why-failed")
+			}},
 	}
 }
 

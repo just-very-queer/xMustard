@@ -7,12 +7,12 @@ import "testing"
 func TestToolsListIsSharpSurface(t *testing.T) {
 	res := toolsListResult()
 	list, _ := res["tools"].([]map[string]any)
-	if len(list) != 8 {
-		t.Fatalf("expected a sharp 8-tool surface, got %d", len(list))
+	if len(list) != 9 {
+		t.Fatalf("expected a sharp 9-tool surface, got %d", len(list))
 	}
 	want := map[string]bool{
 		"ground": true, "recall": true, "remember": true, "verify": true,
-		"search": true, "explain": true, "impact": true, "diagnostics": true,
+		"search": true, "explain": true, "impact": true, "diagnostics": true, "why_failed": true,
 	}
 	for _, tl := range list {
 		delete(want, tl["name"].(string))
