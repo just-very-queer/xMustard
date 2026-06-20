@@ -94,8 +94,17 @@ func tools() []tool {
 			func(a map[string]string) (string, string) {
 				return "GET", wsPath(a, "/explain-path") + "?path=" + url.QueryEscape(a["path"])
 			}},
-		{"impact", "Likely blast radius of the current changes: changed symbols and the files/tests they affect.", []string{"workspace_id"},
-			func(a map[string]string) (string, string) { return "GET", wsPath(a, "/changes/since-index") }},
+		{"impact", "Blast radius. No args → impact of the current changes (dirty symbols). symbol= → every file that transitively references that symbol (graph BFS). from= & to= → the shortest dependency path between two symbols.", []string{"workspace_id"},
+			func(a map[string]string) (string, string) {
+				p := wsPath(a, "/changes/since-index")
+				q := ""
+				if a["from"] != "" && a["to"] != "" {
+					q = "?from=" + url.QueryEscape(a["from"]) + "&to=" + url.QueryEscape(a["to"])
+				} else if a["symbol"] != "" {
+					q = "?symbol=" + url.QueryEscape(a["symbol"])
+				}
+				return "GET", p + q
+			}},
 		{"diagnostics", "Current normalized diagnostics (errors/warnings) for the workspace.", []string{"workspace_id"},
 			func(a map[string]string) (string, string) { return "GET", wsPath(a, "/diagnostics") }},
 		{"why_failed", "Explain why a run failed: failure signals, salient error lines, and which changed files are implicated.", []string{"workspace_id", "run_id"},

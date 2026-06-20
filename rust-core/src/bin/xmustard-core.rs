@@ -1456,6 +1456,24 @@ fn run_symbolgraph_command(mut args: impl Iterator<Item = String>) {
             let graph = sg::build_symbol_graph_cached(Path::new(&root), &ws);
             print_json(&sg::compute_clusters(&graph));
         }
+        "impact" => {
+            let usage = "xmustard-core symbolgraph impact <root> <workspace_id> <symbol> [max_depth]";
+            let root = need(args.next(), usage);
+            let ws = need(args.next(), usage);
+            let symbol = need(args.next(), usage);
+            let depth = args.next().and_then(|v| v.parse::<usize>().ok()).unwrap_or(4);
+            let graph = sg::build_symbol_graph_cached(Path::new(&root), &ws);
+            print_json(&sg::symbol_impact(&graph, &symbol, depth));
+        }
+        "trace" => {
+            let usage = "xmustard-core symbolgraph trace <root> <workspace_id> <from_symbol> <to_symbol>";
+            let root = need(args.next(), usage);
+            let ws = need(args.next(), usage);
+            let from = need(args.next(), usage);
+            let to = need(args.next(), usage);
+            let graph = sg::build_symbol_graph_cached(Path::new(&root), &ws);
+            print_json(&sg::trace_symbols(&graph, &from, &to));
+        }
         "hotspots" => {
             let usage = "xmustard-core symbolgraph hotspots <root> <workspace_id> [limit]";
             let root = need(args.next(), usage);

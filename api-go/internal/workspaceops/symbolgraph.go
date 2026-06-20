@@ -48,6 +48,36 @@ func SymbolBlastRadius(dataDir, workspaceID, symbol string) (json.RawMessage, er
 	return json.RawMessage(out), nil
 }
 
+// SymbolImpact returns the true blast radius of a symbol — every file that
+// transitively references it (bounded BFS over the precomputed reference graph).
+func SymbolImpact(dataDir, workspaceID, symbol string, maxDepth int) (json.RawMessage, error) {
+	root, _, err := resolveChangeRoot(dataDir, workspaceID)
+	if err != nil {
+		return nil, err
+	}
+	if maxDepth <= 0 {
+		maxDepth = 4
+	}
+	out, err := rustcore.RunSymbolgraph("impact", root, workspaceID, symbol, strconv.Itoa(maxDepth))
+	if err != nil {
+		return nil, err
+	}
+	return json.RawMessage(out), nil
+}
+
+// TraceSymbols returns the shortest dependency path between two symbols.
+func TraceSymbols(dataDir, workspaceID, from, to string) (json.RawMessage, error) {
+	root, _, err := resolveChangeRoot(dataDir, workspaceID)
+	if err != nil {
+		return nil, err
+	}
+	out, err := rustcore.RunSymbolgraph("trace", root, workspaceID, from, to)
+	if err != nil {
+		return nil, err
+	}
+	return json.RawMessage(out), nil
+}
+
 // FileCluster mirrors rust-core's community-cluster output.
 type FileCluster struct {
 	ClusterID int      `json:"cluster_id"`

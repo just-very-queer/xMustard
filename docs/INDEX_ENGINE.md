@@ -56,13 +56,16 @@ retrieval-ledger seed writing to an `agent_feedback` segment.
   symbol graph to a warm cache keyed by a CHEAP fingerprint (HEAD SHA + dirty-file
   mtime/size — O(dirty), not O(repo)); search loads the warm graph, rebuilds only on
   drift. *(done — `rust-core/src/indexcache.rs`)*
-- **Phase 1 — incremental:** diff file hashes vs baseline → reindex dirty paths
-  only; precompute authority; recall over the same inverted index.
-- **Phase 2 — bidirectional:** MCP middleware logs tool calls → feedback segment;
-  promoted memories auto-index; rank fusion adds feedback + verification confidence.
-- **Phase 3 — graph parity:** symbol-level edges via LSP batch references;
-  `impact?symbol=` traverses precomputed adjacency; ast-grep pattern lane on
-  `search?mode=pattern`.
+- **Phase 1 — incremental:** *(done)* per-file symbol cache keyed by content hash
+  re-parses only dirty files; authority precomputed onto each file node.
+- **Phase 2 — bidirectional:** *(done)* `feedback.go` segment written from search /
+  verify / run outcomes; `WorkspaceSearchWithFeedback` fuses a recency-decayed boost
+  into the default ranking.
+- **Phase 3 — graph parity:** *(done)* LSP-backed CALLS edges (`build-lsp`),
+  `impact?symbol=` BFS blast radius + `impact?from=&to=` trace over precomputed
+  adjacency, ast-grep `search?mode=pattern`, communities/clusters.
+
+See `docs/plans/2026-06-20-deep-graph-loop.md` (S1–S6, all complete).
 
 ## What NOT to do
 

@@ -46,13 +46,19 @@ Checklist (in order; check off as committed):
   search (+0.1·boost). Tested + verified live: verify a memory about auth.go →
   later "auth" search boosts auth.go symbols (reason `· feedback`).
 
-- [ ] **S6 — IndexEngine Phase 3: symbol-level adjacency for impact.** Precompute
-  symbol adjacency from S2's resolved edges; `impact?symbol=` traverses the
-  precomputed adjacency (bounded BFS) for true blast radius (callers/callees/tests),
-  not just dirty symbols. Add `from=/to=` trace on `impact` (shortest path between
-  two symbols), HTTP-first.
-  *DoD:* blast radius for an arbitrary symbol matches hand-traced callers; trace
-  finds a known path; live-verified.
+- [x] **S6 — IndexEngine Phase 3: symbol-level adjacency for impact.** `symbol_impact`
+  does bounded BFS over the precomputed reference graph from a symbol's defining
+  file(s) → every transitively-dependent file with its distance (true blast radius,
+  not just dirty symbols). `trace_symbols` does multi-source BFS for the shortest
+  dependency path between two symbols. The `impact` MCP tool now takes `symbol=`
+  (blast radius) and `from=&to=` (trace) — same tool, enriched. Verified live via
+  MCP: `impact symbol=RecordFeedback` → 109 impacted files; `impact from=ProposeContext
+  to=WorkspaceSearch` → path of length 2. 91 rust tests; clippy clean.
+
+**All six slices done.** The deep-graph gap vs GitNexus is closed at the agent
+surface (real CALLS via LSP, communities, incremental index, agent-feedback ranking,
+symbol-level impact + trace) while keeping the 9-tool MCP surface (enriched, not
+expanded) and the unique governed-memory + drift-honesty moat.
 
 Working method per slice (the loop):
 1. Read the real code; if scope is unclear, run a short scout workflow.

@@ -701,6 +701,146 @@ pub struct Hotspot {
     pub dependent_count: usize,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ImpactedFile {
+    pub path: String,
+    pub distance: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SymbolImpact {
+    pub symbol: String,
+    pub defined_in: Vec<String>,
+    pub impacted: Vec<ImpactedFile>,
+    pub impacted_count: usize,
+    pub max_depth: usize,
+    pub generated_at: String,
+}
+
+// files that define a given symbol (by symbol-node match).
+fn files_defining(graph: &SymbolGraph, symbol: &str) -> Vec<String> {
+    let mut set = BTreeSet::new();
+    for s in &graph.symbols {
+        if s.name == symbol {
+            set.insert(s.path.clone());
+        }
+    }
+    set.into_iter().collect()
+}
+
+// reverse adjacency: to_path -> set of files that reference it.
+fn reverse_adjacency(graph: &SymbolGraph) -> HashMap<String, BTreeSet<String>> {
+    let mut rev: HashMap<String, BTreeSet<String>> = HashMap::new();
+    for e in &graph.edges {
+        if e.from_path != e.to_path {
+            rev.entry(e.to_path.clone()).or_default().insert(e.from_path.clone());
+        }
+    }
+    rev
+}
+
+/// True blast radius of a symbol: a bounded breadth-first traversal of the
+/// precomputed reference graph outward from the file(s) defining the symbol — every
+/// file that transitively depends on it, with its distance. This is the symbol-level
+/// `impact?symbol=` answer, not just the dirty-symbols view.
+pub fn symbol_impact(graph: &SymbolGraph, symbol: &str, max_depth: usize) -> SymbolImpact {
+    let defined_in = files_defining(graph, symbol);
+    let rev = reverse_adjacency(graph);
+    let mut visited: BTreeSet<String> = defined_in.iter().cloned().collect();
+    let mut impacted: Vec<ImpactedFile> = Vec::new();
+    let mut frontier: Vec<String> = defined_in.clone();
+    let mut depth = 1;
+    while !frontier.is_empty() && depth <= max_depth {
+        let mut next: BTreeSet<String> = BTreeSet::new();
+        for f in &frontier {
+            if let Some(callers) = rev.get(f) {
+                for c in callers {
+                    if visited.insert(c.clone()) {
+                        next.insert(c.clone());
+                    }
+                }
+            }
+        }
+        for f in &next {
+            impacted.push(ImpactedFile { path: f.clone(), distance: depth });
+        }
+        frontier = next.into_iter().collect();
+        depth += 1;
+    }
+    SymbolImpact {
+        symbol: symbol.to_string(),
+        defined_in,
+        impacted_count: impacted.len(),
+        impacted,
+        max_depth,
+        generated_at: now(),
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SymbolTrace {
+    pub from: String,
+    pub to: String,
+    pub path: Vec<String>,
+    pub length: usize,
+    pub found: bool,
+    pub generated_at: String,
+}
+
+/// Shortest dependency path between two symbols: BFS over the undirected file graph
+/// from a file defining `from` to a file defining `to`. Answers "how does A reach B".
+pub fn trace_symbols(graph: &SymbolGraph, from: &str, to: &str) -> SymbolTrace {
+    let from_files: BTreeSet<String> = files_defining(graph, from).into_iter().collect();
+    let to_files: BTreeSet<String> = files_defining(graph, to).into_iter().collect();
+    // undirected adjacency.
+    let mut adj: HashMap<String, BTreeSet<String>> = HashMap::new();
+    for e in &graph.edges {
+        if e.from_path != e.to_path {
+            adj.entry(e.from_path.clone()).or_default().insert(e.to_path.clone());
+            adj.entry(e.to_path.clone()).or_default().insert(e.from_path.clone());
+        }
+    }
+    // multi-source BFS from all `from` files, tracking predecessors.
+    let mut prev: HashMap<String, String> = HashMap::new();
+    let mut visited: BTreeSet<String> = from_files.iter().cloned().collect();
+    let mut queue: std::collections::VecDeque<String> = from_files.iter().cloned().collect();
+    let mut hit: Option<String> = None;
+    'bfs: while let Some(f) = queue.pop_front() {
+        if to_files.contains(&f) {
+            hit = Some(f);
+            break 'bfs;
+        }
+        if let Some(neighbours) = adj.get(&f) {
+            for n in neighbours {
+                if visited.insert(n.clone()) {
+                    prev.insert(n.clone(), f.clone());
+                    queue.push_back(n.clone());
+                }
+            }
+        }
+    }
+    let mut path = Vec::new();
+    if let Some(end) = hit {
+        let mut cur = end;
+        loop {
+            path.push(cur.clone());
+            match prev.get(&cur) {
+                Some(p) => cur = p.clone(),
+                None => break,
+            }
+        }
+        path.reverse();
+    }
+    SymbolTrace {
+        from: from.to_string(),
+        to: to.to_string(),
+        length: path.len().saturating_sub(1),
+        found: !path.is_empty(),
+        path,
+        generated_at: now(),
+    }
+}
+
 /// Most-depended-on files (high inbound reference weight) — risky to touch.
 /// `dependent_count` is the number of distinct files that depend on the target,
 /// regardless of how many typed edges connect them.
@@ -827,6 +967,25 @@ mod tests {
         // authority is precomputed: lib.rs is referenced by a.rs and b.rs.
         let lib = g2.files.iter().find(|f| f.path == "lib.rs").unwrap();
         assert!(lib.authority >= 2, "lib.rs authority should reflect 2 dependents: {lib:?}");
+    }
+
+    #[test]
+    fn symbol_impact_and_trace_traverse_the_graph() {
+        // chain: core.rs defines `seed`; mid.rs calls seed; top.rs calls a mid symbol.
+        let repo = git_repo(&[
+            ("core.rs", "pub fn seed_value() -> i32 { 1 }\n"),
+            ("mid.rs", "pub fn mid_layer() -> i32 { seed_value() }\n"),
+            ("top.rs", "fn app() { let _ = mid_layer(); }\n"),
+        ]);
+        let graph = build_symbol_graph(repo.path(), "ws");
+        // impact of seed_value reaches mid.rs (distance 1) and top.rs (distance 2).
+        let impact = symbol_impact(&graph, "seed_value", 4);
+        assert!(impact.defined_in.contains(&"core.rs".to_string()));
+        let reached: Vec<&str> = impact.impacted.iter().map(|f| f.path.as_str()).collect();
+        assert!(reached.contains(&"mid.rs"), "impact should reach mid.rs: {impact:?}");
+        // trace from seed_value to mid_layer finds a path.
+        let trace = trace_symbols(&graph, "seed_value", "mid_layer");
+        assert!(trace.found && trace.path.len() >= 2, "trace should find a path: {trace:?}");
     }
 
     #[test]
