@@ -67,8 +67,17 @@ source path. Measure on a real task, not a feature count.
    tree and flag stale entries (`stale_count`, `stale_paths`, `stale_memory`).
 3. ✅ **Memory conflict surfacing**: `recall` reports `conflicts` — files 2+ active
    memories claim something about — so agents reconcile before trusting.
-4. ⬜ Retire the materialized static index as the default; keep search live + narrow.
+4. ✅ Search is already live (builds the symbol graph from the current tree each
+   call; the static Postgres index is a separate HTTP-only path, off the agent
+   surface). Added the missing half of "slices not dumps": each symbol hit now
+   carries its 1-based `line` so the agent jumps to the location.
 5. ⬜ Deprecate goal/swarm + ops/eval/security platform surfaces (UI-only or remove).
+
+### Beyond the core (ROADMAP items folded into the agent surface)
+- ✅ **Failure explainers** (`why_failed`, ROADMAP A3): correlate a failed run's
+  signals + salient error lines + the changed files named in its output. 9th MCP tool.
+- ⬜ Routing as a first-class run-execution runtime, neural-embedding search lane,
+  cockpit wiring (governance/providers/auth).
    (The agent surface is already free of them; this is internal cleanup, deferred —
    not gutting features without an explicit call.)
 
