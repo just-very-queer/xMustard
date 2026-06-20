@@ -47,11 +47,11 @@ pub fn cheap_key(root: &Path) -> String {
             if let Ok(meta) = fs::metadata(root.join(path)) {
                 sig.push(':');
                 sig.push_str(&meta.len().to_string());
-                if let Ok(modified) = meta.modified() {
-                    if let Ok(dur) = modified.duration_since(UNIX_EPOCH) {
-                        sig.push('@');
-                        sig.push_str(&dur.as_millis().to_string());
-                    }
+                if let Ok(modified) = meta.modified()
+                    && let Ok(dur) = modified.duration_since(UNIX_EPOCH)
+                {
+                    sig.push('@');
+                    sig.push_str(&dur.as_millis().to_string());
                 }
             }
         }
@@ -70,6 +70,33 @@ fn cache_dir(root: &Path) -> PathBuf {
 
 fn graph_cache_file(root: &Path, workspace_id: &str, key: &str) -> PathBuf {
     cache_dir(root).join(format!("symbolgraph-{workspace_id}-{key}.json"))
+}
+
+/// sha256 of a tracked file's current content — the per-file key for incremental
+/// reindex (only files whose hash changed need re-parsing).
+pub fn file_hash(root: &Path, rel: &str) -> Option<String> {
+    let bytes = fs::read(root.join(rel)).ok()?;
+    let mut h = Sha256::new();
+    h.update(&bytes);
+    Some(format!("{:x}", h.finalize()))
+}
+
+/// Path to the per-workspace symbol cache (path → (hash, symbols)).
+pub fn symbol_cache_path(root: &Path, workspace_id: &str) -> PathBuf {
+    cache_dir(root).join(format!("symbols-{workspace_id}.json"))
+}
+
+/// Load the raw symbol-cache bytes (caller deserializes), or None if absent.
+pub fn load_symbol_cache_bytes(root: &Path, workspace_id: &str) -> Option<Vec<u8>> {
+    fs::read(symbol_cache_path(root, workspace_id)).ok()
+}
+
+/// Persist the symbol-cache bytes (best-effort).
+pub fn store_symbol_cache_bytes(root: &Path, workspace_id: &str, bytes: &[u8]) {
+    let dir = cache_dir(root);
+    if fs::create_dir_all(&dir).is_ok() {
+        let _ = fs::write(symbol_cache_path(root, workspace_id), bytes);
+    }
 }
 
 /// Load a cached symbol graph for the current cheap key, if present and valid.

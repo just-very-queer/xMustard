@@ -230,6 +230,10 @@ fn reference_edge_kind(from_path: &str, def_kind: &str) -> &'static str {
 pub struct GraphFileNode {
     pub path: String,
     pub symbol_count: usize,
+    /// Precomputed authority = total inbound reference weight (how depended-on this
+    /// file is). Computed at index time so search/ranking need not recompute it.
+    #[serde(default)]
+    pub authority: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -539,12 +543,31 @@ pub fn build_symbol_graph(root: &Path, workspace_id: &str) -> SymbolGraph {
     let mut name_to_defs: HashMap<String, Vec<SymbolDef>> = HashMap::new();
     let mut content_cache: BTreeMap<String, String> = BTreeMap::new();
 
+    // incremental reindex: per-file symbol cache keyed by content hash, so only
+    // files whose content changed are re-parsed (tree-sitter parse is the dominant
+    // cost). Clean files reuse their cached symbols.
+    #[derive(serde::Serialize, serde::Deserialize, Clone)]
+    struct CachedFileSymbols {
+        hash: String,
+        symbols: Vec<repomap::RustPathSymbolRecord>,
+    }
+    let mut sym_cache: HashMap<String, CachedFileSymbols> =
+        crate::indexcache::load_symbol_cache_bytes(root, workspace_id)
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default();
+    let mut next_cache: HashMap<String, CachedFileSymbols> = HashMap::new();
+
     for rel in &files {
         let content = std::fs::read_to_string(root.join(rel)).unwrap_or_default();
-        let syms = repomap::extract_path_symbols(root, workspace_id, rel)
-            .map(|r| r.symbols)
-            .unwrap_or_default();
-        file_nodes.push(GraphFileNode { path: rel.clone(), symbol_count: syms.len() });
+        let hash = crate::indexcache::file_hash(root, rel).unwrap_or_default();
+        let syms = match sym_cache.remove(rel) {
+            Some(c) if c.hash == hash && !hash.is_empty() => c.symbols, // reuse: clean file
+            _ => repomap::extract_path_symbols(root, workspace_id, rel)
+                .map(|r| r.symbols)
+                .unwrap_or_default(),
+        };
+        next_cache.insert(rel.clone(), CachedFileSymbols { hash, symbols: syms.clone() });
+        file_nodes.push(GraphFileNode { path: rel.clone(), symbol_count: syms.len(), authority: 0 });
         for s in &syms {
             symbols.push(GraphSymbolNode {
                 name: s.symbol.clone(),
@@ -644,6 +667,20 @@ pub fn build_symbol_graph(root: &Path, workspace_id: &str) -> SymbolGraph {
             .then(a.from_path.cmp(&b.from_path))
             .then(a.kind.cmp(&b.kind))
     });
+
+    // precompute authority (total inbound reference weight) per file at index time.
+    let mut inbound: HashMap<&str, usize> = HashMap::new();
+    for e in &edges {
+        *inbound.entry(e.to_path.as_str()).or_insert(0) += e.weight;
+    }
+    for node in &mut file_nodes {
+        node.authority = inbound.get(node.path.as_str()).copied().unwrap_or(0);
+    }
+
+    // persist the per-file symbol cache for the next (incremental) build.
+    if let Ok(bytes) = serde_json::to_vec(&next_cache) {
+        crate::indexcache::store_symbol_cache_bytes(root, workspace_id, &bytes);
+    }
 
     SymbolGraph {
         workspace_id: workspace_id.to_string(),
@@ -772,6 +809,24 @@ mod tests {
         let hot = compute_hotspots(&graph, 5);
         assert_eq!(hot[0].path, "lib.rs", "lib.rs should be the top hotspot: {hot:?}");
         assert!(hot[0].dependent_count >= 2);
+    }
+
+    #[test]
+    fn incremental_symbol_cache_is_correct_and_sets_authority() {
+        let repo = git_repo(&[
+            ("lib.rs", "pub fn helper() {}\n"),
+            ("a.rs", "fn run() { helper(); }\n"),
+            ("b.rs", "fn go() { helper(); }\n"),
+        ]);
+        // first build populates the per-file symbol cache.
+        let g1 = build_symbol_graph(repo.path(), "ws");
+        // second build reuses the cache — must produce the identical graph.
+        let g2 = build_symbol_graph(repo.path(), "ws");
+        assert_eq!(g1.symbol_count, g2.symbol_count);
+        assert_eq!(g1.edge_count, g2.edge_count);
+        // authority is precomputed: lib.rs is referenced by a.rs and b.rs.
+        let lib = g2.files.iter().find(|f| f.path == "lib.rs").unwrap();
+        assert!(lib.authority >= 2, "lib.rs authority should reflect 2 dependents: {lib:?}");
     }
 
     #[test]

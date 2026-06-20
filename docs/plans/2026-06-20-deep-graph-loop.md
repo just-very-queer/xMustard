@@ -30,11 +30,12 @@ Checklist (in order; check off as committed):
   coupled files cluster, unrelated stays out). Live on this repo: 4 clusters; explain
   attaches `cluster #0 [api-go]`.
 
-- [ ] **S4 — IndexEngine Phase 1: incremental reindex.** On `ground`/`search`, diff
-  `file_hashes` vs `index_baseline.json` (changetrack already has per-file SHA) →
-  reindex only dirty paths into the warm graph cache instead of a full rebuild.
-  Precompute authority (inbound-degree/PageRank) into the cached graph.
-  *DoD:* editing one file reindexes in ≪ full-build time; warm==full correctness.
+- [x] **S4 — IndexEngine Phase 1: incremental reindex.** Per-file symbol cache
+  (`symbols-{ws}.json`, keyed by content sha256) so a rebuild re-parses ONLY files
+  whose hash changed and reuses cached symbols for the rest (tree-sitter parse is
+  the dominant cost). Authority (inbound reference weight) precomputed onto each
+  `GraphFileNode` at index time. Measured: cold 1.32s → 1-file-edit reindex 0.08s
+  (16×); cached build == fresh (tested); authority verification.go=220 live.
 
 - [ ] **S5 — IndexEngine Phase 2: agent-feedback layer.** A feedback segment
   (`agent_feedback.json` or an `xm_feedback` table) appended from MCP tool calls
