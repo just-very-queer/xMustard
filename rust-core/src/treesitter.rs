@@ -10,6 +10,9 @@ pub struct TsSymbol {
     pub kind: String,
     pub line_start: usize,
     pub line_end: usize,
+    /// 0-based column of the symbol NAME on its start line — the LSP position used
+    /// to resolve references/definition for this symbol.
+    pub name_column: usize,
     /// Name of the nearest enclosing container (impl/class/module/trait/fn), e.g.
     /// "impl AuthMiddleware" → "AuthMiddleware". None at top level.
     pub enclosing_scope: Option<String>,
@@ -97,6 +100,7 @@ pub fn extract_symbols(relative_path: &str, source: &str) -> Option<Vec<TsSymbol
             }
             let line_start = capture.node.start_position().row + 1;
             let line_end = capture.node.end_position().row + 1;
+            let name_column = capture.node.start_position().column;
             if !seen.insert((symbol.to_string(), line_start)) {
                 continue;
             }
@@ -108,6 +112,7 @@ pub fn extract_symbols(relative_path: &str, source: &str) -> Option<Vec<TsSymbol
                 kind: kind.to_string(),
                 line_start,
                 line_end,
+                name_column,
                 enclosing_scope,
             });
             if symbols.len() >= 64 {
