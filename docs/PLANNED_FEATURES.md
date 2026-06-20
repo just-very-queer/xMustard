@@ -1,3 +1,9 @@
+> **Superseded — read [`RETHINK.md`](RETHINK.md) and [`STATUS.md`](STATUS.md) first.**
+> The product is now a tiny governed-runtime-memory MCP server (8 tools), not the
+> three-surface cockpit this file describes. The percentages and tool counts below
+> reflect the older vision and are kept for history. Current status lives in
+> `STATUS.md`; current direction in `RETHINK.md`.
+
 # xMustard — Full Planned Feature List (Three-Surface Vision)
 
 Consolidated from `REPO_COCKPIT_TOOL_ARCHITECTURE.md`, `GITNEXUS_EXTRACTION_MAP.md`,
