@@ -67,7 +67,7 @@ been removed.
 | **Graph-proximity RRF lane** (A2 remainder) | **DONE** | medium | `hybrid_search` takes `seed: Option<&str>`, calls `symbol_impact` for BFS distances → `1/(d+1)` 4th `"proximity"` RRF lane; auto-seeds from the top exact match; wired `search?seed=` + MCP `seed` param. Live: `seed=RecordFeedback` re-ranks `feedback.go` neighbours up (lane shows `…+proximity`). |
 | **Contract-break detection** (A3 remainder) | **DONE** | medium | `changetrack` derives + baselines per-symbol signatures (`IndexBaseline.signatures`), diffs them on modified files → `DirtySymbol.contract_break` + `signature_change` (`params N→M, return x→y`); surfaced in `impact`/`ground` (`contract_breaks`, `broken_contracts`). Live: arity/return change flags, body-only edit doesn't. |
 | **Wiki incrementality** | **DONE** | small–med | `generate_wiki` now uses `build_symbol_graph_cached` (was the last cold-rebuild caller) + a per-subsystem fingerprint page cache (`wiki-<ws>.json`); only changed subsystems re-render (`regenerated_slugs`/`reused_slugs`). Live: edit one file → one subsystem regenerates. |
-| **Auth follow-ons** (A5) | not-done | large | `tokenRecord` has no `ExpiresAt`; `ResolveToken` no TTL check; mint/revoke/deny never call `RecordAuditEvent`; `requireRole` only admin vs non-admin. |
+| **Auth follow-ons** (A5) | **DONE** | large | Global capped auth-audit log (mint/revoke/rotate/denied); `ExpiresAt` + fail-closed TTL check in `ResolveToken`; `RotateToken` + rotate endpoint; `roleRank` hierarchy with an explicit `agent` gate. Adversarial review (27 agents) → fixed critical token-store race (`tokenStoreMu`), fail-open-on-corrupt (`HasAuthConfigured` fails closed), audit DoS (clip + throttle), TTL overflow. `-race` tests + live. |
 | **Postgres as the write path** (C1) | not-done | large | `saveRunRecord`→`writeJSON` for run_plans; verification to JSON; `pgops.go`/`pgverify.go` are one-shot DELETE+INSERT mirrors, never inline on mutation. |
 | **Deeper data/control-flow edges** | not-done | large | Only imports/calls/inherits/tests/references; LSP upgrade also only emits `calls`. No data-flow/control-flow/read-write edges. |
 | **Cockpit UI for providers/routing/tokens** (A4 remainder) | not-done | large | No React components; `api.ts` has only ticket-integration CRUD. Backend endpoints (`/api/providers*`, `/api/route*`, `/api/auth/*`) exist — only the UI is missing. |
@@ -97,5 +97,7 @@ polish — none blocks the primary agent use-case.
    diffed on change → `contract_break` in `impact`/`ground`.
 3. ~~Wiki incrementality~~ — **DONE** (R3). Warm cached graph + per-subsystem
    fingerprint page cache; only changed subsystems re-render.
-4. **Auth A5 / PG write path / deeper edges / cockpit UI** — all large; sequence
-   by need (auth + PG write path for production; cockpit UI for a product surface).
+4. ~~Auth A5~~ — **DONE** (R4). Audit log, token expiry/rotation, agent-role gate;
+   adversarial-reviewed (critical race + fail-open + audit DoS fixed).
+5. **PG write path / deeper edges / cockpit UI** — remaining large items; PG write
+   path for production durability, cockpit UI for a product surface.

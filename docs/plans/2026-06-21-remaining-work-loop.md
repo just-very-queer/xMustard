@@ -62,12 +62,29 @@ don't add tools). No Python.
   `reused:[subsystem-util]`; warm no-edit run reuses 4/4 subsystem pages. Committed +
   pushed.
 
-- [ ] **R4 — Auth follow-ons (A5)** *(large)*. (a) Audit log: have mint/revoke and
-  authMiddleware-denial call `RecordAuditEvent` (mint/revoke/denied). (b) Token
-  expiry/rotation: add `ExpiresAt` to `tokenRecord`, enforce in `ResolveToken`, add a
-  rotate endpoint. (c) Finer authz: a real `agent`-role gate distinct from `readonly`
-  on the right routes.
-  *DoD:* a denied request appears in the audit log; an expired token is rejected; tested.
+- [x] **R4 — Auth follow-ons (A5)** *(large)*. **DONE.** (a) Global capped
+  auth-audit log (`auth_audit.go`): mint/revoke/rotate/denied via `RecordAuthAudit`;
+  authMiddleware records 401 + readonly-403 denials, `requireRole` records role-gate
+  denials; `GET /api/auth/audit` (admin). (b) Token expiry/rotation: `ExpiresAt` on
+  `tokenRecord`, fail-closed `tokenExpired` enforced in `ResolveToken`; `MintTokenTTL`
+  + `RotateToken` + `POST /api/auth/tokens/{id}/rotate`. (c) Real role hierarchy
+  (`roleRank` admin>agent>readonly) with an explicit `agent` gate on `POST /context`,
+  `/context/{id}/verify`, and issue-run launches.
+  *Adversarial review (workflow, 27 agents, 16 confirmed/plausible) → fixed:*
+  **critical** unsynchronized `agent_tokens.json` writes (added `tokenStoreMu` —
+  no more lost-update/revoke-resurrection; `-race` regression test); **high**
+  corrupt token file fails *open* (`HasAuthConfigured` now fails closed); **high**
+  audit DoS (per-field length clip → bounds file; denied-event throttle → bounds
+  write-rate + stops flood evicting mint/revoke history); **medium** huge-TTL int64
+  overflow (TTL upper bound); **medium** non-unique EventIDs (atomic counter);
+  **low** env-token role typos (normalize unknown→readonly), second-precision expiry
+  (now nano). Deferred-as-by-design: env tokens are static (404 on rotate/revoke,
+  documented).
+  *Tests:* `TestTokenExpiry`, `TestRotateToken`, `TestAuthAuditLog`,
+  `TestAuthAuditDeniedThrottle`, `TestAuthAuditFieldClip`,
+  `TestConcurrentTokenStoreNoLostUpdate` (`-race`). *Live:* unauth→401, readonly
+  POST→403, agent POST→200, rotate works, 30-request flood coalesces to one audit
+  entry. Committed + pushed.
 
 - [ ] **R5 — Postgres as the write path (C1)** *(large)*. Make `run_plans` and
   `verification_*` write to Postgres inline on mutation (not just the one-shot

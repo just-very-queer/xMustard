@@ -106,30 +106,66 @@ func main() {
 		}
 		writeJSON(w, http.StatusOK, workspaceops.ListPrincipals(dataDir()))
 	})
+	auditActor := func(r *http.Request) string {
+		if p := principalFromContext(r.Context()); p != nil {
+			return p.ID
+		}
+		return "system"
+	}
 	mux.HandleFunc("POST /api/auth/tokens", func(w http.ResponseWriter, r *http.Request) {
 		if !requireRole(w, r, "admin") {
 			return
 		}
 		var req struct {
-			ID   string `json:"id"`
-			Role string `json:"role"`
+			ID         string `json:"id"`
+			Role       string `json:"role"`
+			TTLSeconds int    `json:"ttl_seconds"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON body"})
 			return
 		}
-		raw, err := workspaceops.MintToken(dataDir(), req.ID, req.Role)
+		raw, err := workspaceops.MintTokenTTL(dataDir(), req.ID, req.Role, req.TTLSeconds)
 		if err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 			return
 		}
+		workspaceops.RecordAuthAudit(dataDir(), workspaceops.AuthAuditEvent{
+			Action: "mint", Actor: auditActor(r), TokenID: req.ID, Role: req.Role,
+			Method: r.Method, Path: r.URL.Path, RemoteAddr: r.RemoteAddr,
+		})
 		writeJSON(w, http.StatusOK, map[string]any{"id": req.ID, "token": raw, "note": "store this now; it is not recoverable"})
+	})
+	mux.HandleFunc("POST /api/auth/tokens/{id}/rotate", func(w http.ResponseWriter, r *http.Request) {
+		if !requireRole(w, r, "admin") {
+			return
+		}
+		var req struct {
+			TTLSeconds int `json:"ttl_seconds"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req) // body optional
+		id := r.PathValue("id")
+		raw, err := workspaceops.RotateToken(dataDir(), id, req.TTLSeconds)
+		if err != nil {
+			status := http.StatusBadRequest
+			if errors.Is(err, os.ErrNotExist) {
+				status = http.StatusNotFound
+			}
+			writeJSON(w, status, map[string]any{"error": err.Error()})
+			return
+		}
+		workspaceops.RecordAuthAudit(dataDir(), workspaceops.AuthAuditEvent{
+			Action: "rotate", Actor: auditActor(r), TokenID: id,
+			Method: r.Method, Path: r.URL.Path, RemoteAddr: r.RemoteAddr,
+		})
+		writeJSON(w, http.StatusOK, map[string]any{"id": id, "token": raw, "note": "old token invalidated; store this now"})
 	})
 	mux.HandleFunc("DELETE /api/auth/tokens/{id}", func(w http.ResponseWriter, r *http.Request) {
 		if !requireRole(w, r, "admin") {
 			return
 		}
-		if err := workspaceops.RevokeToken(dataDir(), r.PathValue("id")); err != nil {
+		id := r.PathValue("id")
+		if err := workspaceops.RevokeToken(dataDir(), id); err != nil {
 			status := http.StatusInternalServerError
 			if errors.Is(err, os.ErrNotExist) {
 				status = http.StatusNotFound
@@ -137,7 +173,23 @@ func main() {
 			writeJSON(w, status, map[string]any{"error": err.Error()})
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"revoked": r.PathValue("id")})
+		workspaceops.RecordAuthAudit(dataDir(), workspaceops.AuthAuditEvent{
+			Action: "revoke", Actor: auditActor(r), TokenID: id,
+			Method: r.Method, Path: r.URL.Path, RemoteAddr: r.RemoteAddr,
+		})
+		writeJSON(w, http.StatusOK, map[string]any{"revoked": id})
+	})
+	mux.HandleFunc("GET /api/auth/audit", func(w http.ResponseWriter, r *http.Request) {
+		if !requireRole(w, r, "admin") {
+			return
+		}
+		limit := 100
+		if v := r.URL.Query().Get("limit"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil {
+				limit = n
+			}
+		}
+		writeJSON(w, http.StatusOK, workspaceops.ListAuthAudit(dataDir(), limit))
 	})
 	// --- OpenAI-compatible providers (Ollama / vLLM / LM Studio / OpenAI / VLM) ---
 	respond := func(w http.ResponseWriter, err error, result any) {
@@ -537,6 +589,9 @@ func main() {
 		writeJSON(w, http.StatusOK, result)
 	})
 	mux.HandleFunc("POST /api/workspaces/{workspace_id}/issues/{issue_id}/runs", func(w http.ResponseWriter, r *http.Request) {
+		if !requireRole(w, r, "agent") { // launching a run is an agent action, not readonly
+			return
+		}
 		workspaceID := r.PathValue("workspace_id")
 		issueID := r.PathValue("issue_id")
 		var request workspaceops.RunRequest
@@ -3350,6 +3405,9 @@ func main() {
 		issueIntel(w, err, result)
 	})
 	mux.HandleFunc("POST /api/workspaces/{workspace_id}/context", func(w http.ResponseWriter, r *http.Request) {
+		if !requireRole(w, r, "agent") { // proposing memory is an agent action, not readonly
+			return
+		}
 		var req workspaceops.ProposeContextRequest
 		_ = json.NewDecoder(r.Body).Decode(&req) // body optional; query params are the MCP-bridge path
 		q := r.URL.Query()
@@ -3379,6 +3437,9 @@ func main() {
 		issueIntel(w, err, result)
 	})
 	mux.HandleFunc("POST /api/workspaces/{workspace_id}/context/{entry_id}/verify", func(w http.ResponseWriter, r *http.Request) {
+		if !requireRole(w, r, "agent") { // verifying/promoting memory is an agent action
+			return
+		}
 		var req struct {
 			Agent   string `json:"agent"`
 			Approve bool   `json:"approve"`
@@ -3823,20 +3884,45 @@ func principalFromContext(ctx context.Context) *workspaceops.Principal {
 	return p
 }
 
-// requireRole enforces a role for an endpoint. In open mode (no auth configured)
-// it allows the operation locally; once auth is configured the middleware has
-// already rejected unauthenticated requests.
+// roleRank orders the role hierarchy: admin > agent > readonly. Used so a gate for
+// "agent" is satisfied by admin too, and "readonly" by everyone authenticated.
+func roleRank(role string) int {
+	switch role {
+	case "admin":
+		return 3
+	case "agent":
+		return 2
+	case "readonly":
+		return 1
+	default:
+		return 0
+	}
+}
+
+// requireRole enforces a minimum role for an endpoint (admin > agent > readonly).
+// In open mode (no auth configured) it allows the operation locally; once auth is
+// configured the middleware has already rejected unauthenticated requests. A denied
+// authenticated request is recorded in the auth-audit log.
 func requireRole(w http.ResponseWriter, r *http.Request, role string) bool {
+	dd := envDefault("XMUSTARD_DATA_DIR", "../backend/data")
 	p := principalFromContext(r.Context())
 	if p == nil {
-		if !workspaceops.HasAuthConfigured(envDefault("XMUSTARD_DATA_DIR", "../backend/data")) {
+		if !workspaceops.HasAuthConfigured(dd) {
 			return true
 		}
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "authentication required"})
 		return false
 	}
-	if role == "admin" && p.Role != "admin" {
-		writeJSON(w, http.StatusForbidden, map[string]any{"error": "admin role required"})
+	if roleRank(p.Role) < roleRank(role) {
+		workspaceops.RecordAuthAudit(dd, workspaceops.AuthAuditEvent{
+			Action:     "denied",
+			Actor:      p.ID,
+			Detail:     role + " role required (have " + p.Role + ")",
+			Method:     r.Method,
+			Path:       r.URL.Path,
+			RemoteAddr: r.RemoteAddr,
+		})
+		writeJSON(w, http.StatusForbidden, map[string]any{"error": role + " role required"})
 		return false
 	}
 	return true
@@ -3846,13 +3932,13 @@ func requireRole(w http.ResponseWriter, r *http.Request, role string) bool {
 // CORE_ONLY mode any request whose path lacks one of these gets a 404, so a lean
 // production deployment serves only the governed-memory + grounding + search core.
 var coreOnlyPaths = []string{
-	"/session-grounding", // ground
-	"/context",           // recall / remember / verify
-	"/search",            // search
-	"/explain-path",      // explain
+	"/session-grounding",   // ground
+	"/context",             // recall / remember / verify
+	"/search",              // search
+	"/explain-path",        // explain
 	"/changes/since-index", // impact
-	"/diagnostics",       // diagnostics
-	"/why-failed",        // why_failed
+	"/diagnostics",         // diagnostics
+	"/why-failed",          // why_failed
 }
 
 func isCorePath(p string) bool {
@@ -3889,11 +3975,27 @@ func authMiddleware(dataDir, mode string, next http.Handler) http.Handler {
 		}
 		enforce := mode == "required" || workspaceops.HasAuthConfigured(dataDir)
 		if enforce && principal == nil {
+			workspaceops.RecordAuthAudit(dataDir, workspaceops.AuthAuditEvent{
+				Action:     "denied",
+				Actor:      "anonymous",
+				Detail:     "missing/invalid/expired bearer token",
+				Method:     r.Method,
+				Path:       r.URL.Path,
+				RemoteAddr: r.RemoteAddr,
+			})
 			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "authentication required: provide Authorization: Bearer <token>"})
 			return
 		}
 		// readonly principals may only read.
 		if principal != nil && principal.Role == "readonly" && r.Method != http.MethodGet {
+			workspaceops.RecordAuthAudit(dataDir, workspaceops.AuthAuditEvent{
+				Action:     "denied",
+				Actor:      principal.ID,
+				Detail:     "readonly principal cannot " + r.Method,
+				Method:     r.Method,
+				Path:       r.URL.Path,
+				RemoteAddr: r.RemoteAddr,
+			})
 			writeJSON(w, http.StatusForbidden, map[string]any{"error": "readonly principal cannot " + r.Method})
 			return
 		}
