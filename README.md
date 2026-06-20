@@ -20,12 +20,90 @@ Deeper migration notes, tranche prompts, closeout logs, and working architecture
 
 ## What xMustard Is
 
-xMustard combines two things that usually live in separate products:
+xMustard is **governed runtime memory for coding agents**: a small MCP server that
+gives any agent (Claude Code, codex, opencode, …) two things and nothing else:
 
-- semantic repo intelligence: repo state, file and symbol context, semantic indexing, structural search, and runtime discovery
-- ops memory: issues, plans, runs, verification profiles, threat models, ticket context, activity history, and review artifacts
+1. **Grounding** — what changed, what's stale, what's broken, and what's blocked
+   since the last baseline, plus the verified facts the agent should trust.
+2. **Memory with a trust lifecycle** — an agent proposes a durable fact; other
+   agents verify it; only then is it promoted into shared context. Promoted memory
+   is re-checked against the live tree on every recall, so it never goes silently
+   stale (drift detection), and overlapping memories are surfaced for reconciliation.
 
-That combination is the moat. Repo-only intelligence without durable memory is too shallow. Tracker-only memory without repo truth is too noisy.
+The agent-facing surface is deliberately **eight tools**, not a platform. Current
+coding-agent research is consistent that large tool sets bloat an agent's context
+and degrade quality; the value is disciplined, governed context, not tool count.
+See [`docs/RETHINK.md`](docs/RETHINK.md).
+
+Under the hood it sits on a Rust semantic core (tree-sitter symbol graph, change
+tracking, hybrid search, live LSP) and a Go HTTP/persistence shell over Postgres.
+That full API stays available for a future UI; the agent only ever sees the eight
+tools.
+
+## Using the MCP tools
+
+`xmustard-mcp` is a stdio MCP server. It speaks JSON-RPC 2.0 over stdin/stdout and
+proxies to the xMustard HTTP API (`XMUSTARD_API_BASE`, default
+`http://127.0.0.1:8042`). Point any MCP client at it.
+
+### Register it (Claude Code example)
+
+```jsonc
+// .mcp.json / client config
+{
+  "mcpServers": {
+    "xmustard": {
+      "command": "xmustard-mcp",
+      "env": {
+        "XMUSTARD_API_BASE": "http://127.0.0.1:8042",
+        "XMUSTARD_API_TOKEN": "xmt_…"   // optional; required when the API enforces auth
+      }
+    }
+  }
+}
+```
+
+Each agent should use its **own** `XMUSTARD_API_TOKEN` (mint one with
+`xmustard-api mint-token <agent-id> agent`). The token *is* the agent's identity:
+the multi-agent verification gate counts distinct authenticated principals, so one
+token cannot impersonate several verifiers.
+
+### The eight tools
+
+All tools take `workspace_id`. The first four are the governed-memory loop; the
+last four are narrow retrieval.
+
+| Tool | Args | What it does |
+|------|------|--------------|
+| `ground` | — | Orientation before acting: changed / stale / broken / blocked since baseline, with index-trust (drift) and stale-memory count. |
+| `recall` | — | The verified shared context to trust. Each entry is re-checked against the live tree; stale ones are flagged, and path-overlap conflicts are listed. |
+| `remember` | `content`, `title?`, `paths?` | Propose a durable memory (fact / decision / gotcha). `paths` are the files it's about, so recall can flag it stale when they change. Pending until verified. |
+| `verify` | `entry_id`, `approve?` | Approve (or reject) a peer's proposed memory; it promotes once enough distinct agents approve. Identity is your auth token. |
+| `search` | `query` | Narrow hybrid (lexical + structural) code search — relevant slices, not a dump. |
+| `explain` | `path` | Explain a file or directory: purpose, key symbols, how to run/verify it. |
+| `impact` | — | Blast radius of the current changes: changed symbols and the files/tests they affect. |
+| `diagnostics` | — | Current normalized errors/warnings for the workspace. |
+
+### A typical session
+
+```text
+ground                       → orient: 3 changed files, 1 stale memory
+recall                       → read the verified facts (skip the stale one)
+search "where is auth"       → find the relevant slice
+explain api-go/.../auth.go   → understand it
+…do the work…
+remember content="auth identity = bearer token" paths="api-go/.../auth.go"
+                             → propose what you learned; peers verify it next
+```
+
+### Quick check from a shell
+
+```bash
+printf '%s\n%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"ground","arguments":{"workspace_id":"my-ws"}}}' \
+  | XMUSTARD_API_BASE=http://127.0.0.1:8042 xmustard-mcp
+```
 
 ## What Exists Today
 
@@ -84,61 +162,50 @@ We are not treating “feature count” as progress. If the system cannot ground
 - `research/`: local reference repos used for product and architecture study; ignored from git
 - `docs/`: planning, architecture, handoff notes, prompts, and closeout logs
 
+## Install
+
+Via Homebrew (builds the Rust core and the three Go binaries —
+`xmustard-api`, `xmustard-mcp`, `xmustard-ops`):
+
+```bash
+brew install --build-from-source ./packaging/homebrew/xmustard.rb
+# or, once tapped:  brew install just-very-queer/tap/xmustard
+```
+
 ## Development
 
-The backend is Go (`api-go`) calling the Rust core (`rust-core`):
+The backend is Go (`api-go`) calling the Rust core (`rust-core`). There is **no
+Python** in the project — it was fully migrated to Go + Rust.
 
 ```bash
-cd api-go
-XMUSTARD_API_PORT=8042 go run ./cmd/xmustard-api   # or: make backend
+make build                                   # rust core (release) + go binaries
+cd api-go && XMUSTARD_API_PORT=8042 go run ./cmd/xmustard-api   # or: make backend
 ```
 
-The Python FastAPI/Typer backend has been **retired**. Its full surface is
-shadowed by `api-go` (120 routes ≥ the Python's 115, verified by a passing Go
-test suite) plus the Rust core, and `cli.py` already delegated to `xmustard-ops`.
-The source is preserved under `archive/2026-06-16-python-backend/` for reference.
-See `docs/PYTHON_TO_RUST_MIGRATION.md`.
-
-Frontend setup:
+Checks:
 
 ```bash
-cd frontend
-npm install
-npm run dev
+cd rust-core && cargo test
+cd api-go && go test ./...
+cd frontend && npm install && npm run lint && npm run build
 ```
 
-Core checks:
-
-```bash
-cd backend
-pytest -q
-PYTHONPYCACHEPREFIX=/tmp/pycache python3 -m compileall app
-
-cd ../frontend
-npm run lint
-npm run build
-```
-
-The frontend expects the backend at `http://127.0.0.1:8042`.
+The frontend (optional, for a future UI) expects the backend at
+`http://127.0.0.1:8042`.
 
 ## Current Status
 
-xMustard is still in development.
+The governed-memory product is built and verified end to end: the eight-tool MCP
+surface, the propose → multi-agent-verify → promote loop, drift-on-recall, conflict
+surfacing, bearer-token auth, and the Rust semantic core (tree-sitter symbol graph,
+change tracking, hybrid search, live LSP). See [`docs/CHANGELOG.md`](docs/CHANGELOG.md)
+and [`docs/RETHINK.md`](docs/RETHINK.md) for what is done and what remains.
 
-The current public direction is:
+## Architecture
 
-- strengthen the CLI/runtime surface first
-- keep repo intelligence and ops memory tightly connected
-- move shipped request paths away from Python over time
-- keep the migration honest: public behavior first, private rollout notes second
-
-If you are reading this on GitHub, treat the README as the public product and architecture overview. The tracked docs include internal-facing migration notes, tranche prompts, and closeout material for code-truth handoffs.
-
-## Architecture Direction
-
-The intended steady-state shape is:
-
-- Go for request delivery and operator-facing control surfaces
-- Rust for semantic meaning, diagnostics normalization, and systems-heavy runtime/process boundaries
-- Postgres for durable semantic and operational state
-- Python reduced to temporary compatibility shims until it can be deleted
+- **Rust core** (`rust-core`) — semantic meaning: tree-sitter symbol graph, change
+  tracking/drift, hybrid search, diagnostics, live LSP, the goal/swarm runtime.
+- **Go shell** (`api-go`) — HTTP API, persistence, auth, and the `xmustard-mcp`
+  stdio server; calls the Rust core for the heavy work.
+- **Postgres** — durable semantic and operational index (JSON files remain the
+  source of truth; Postgres is the queryable materialization).

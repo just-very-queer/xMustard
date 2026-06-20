@@ -40,12 +40,10 @@ func wsPath(args map[string]string, suffix string) string {
 	return "/api/workspaces/" + url.PathEscape(args["workspace_id"]) + suffix
 }
 
+// tools returns the agent-facing MCP tool set: a small, fixed list of governed
+// runtime-memory and grounding tools. Each entry maps a tool name to the HTTP
+// method and path it proxies to on the xMustard API.
 func tools() []tool {
-	// A deliberately SMALL, narrow tool surface (see docs/RETHINK.md). The product's
-	// value is governed runtime memory + grounding — not a 39-tool platform. Large
-	// tool sets bloat the agent's context and cause context rot; the winning agents
-	// use 2-3 tools. The full HTTP API remains; this is the high-signal slice an
-	// agent should actually see.
 	return []tool{
 		{"ground", "Orient before acting: what changed / what's stale / what's broken / what's blocked since the indexed baseline, with index-trust (drift) included.", []string{"workspace_id"},
 			func(a map[string]string) (string, string) { return "GET", wsPath(a, "/session-grounding") }},

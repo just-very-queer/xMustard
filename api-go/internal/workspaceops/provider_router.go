@@ -8,8 +8,7 @@ import (
 
 // Task-typed model routing. The provider layer (openai_providers.go) gives access
 // to many OpenAI-compatible models; this picks WHICH one for a given request based
-// on the coding sub-task — the gap the market scout found unaddressed ("provider
-// routing is latency/cost-blind to task semantics"). Routing is two steps:
+// on the coding sub-task. Routing is two steps:
 //   1. classify the request into a coding sub-task type (+ a model class),
 //   2. resolve that to a concrete provider+model via explicit rules, else by
 //      provider capability (vision → a supports_vision provider, code → a

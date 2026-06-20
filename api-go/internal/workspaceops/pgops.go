@@ -160,8 +160,8 @@ type PostgresRun struct {
 	CreatedAt string `json:"created_at"`
 }
 
-// ListRunsPostgres reads recent runs for a workspace from Postgres (optionally
-// filtered by status), proving the ops layer is queryable from PG, not JSON.
+// ListRunsPostgres reads recent runs for a workspace from Postgres, optionally
+// filtered by status.
 func ListRunsPostgres(workspaceID, status string, limit int) (map[string]any, error) {
 	if limit <= 0 {
 		limit = 50

@@ -3154,7 +3154,7 @@ func main() {
 		result, err := workspaceops.ListTestSuggestions(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), r.PathValue("issue_id"))
 		issueIntel(w, err, result)
 	})
-	// --- workspace policy / governance (FRONTIER Lane 5) ---
+	// --- workspace policy / governance ---
 	mux.HandleFunc("GET /api/workspaces/{workspace_id}/policy", func(w http.ResponseWriter, r *http.Request) {
 		result, err := workspaceops.GetWorkspacePolicy(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))
 		issueIntel(w, err, result)
@@ -3213,12 +3213,12 @@ func main() {
 		}
 		writeJSON(w, http.StatusOK, result)
 	})
-	// --- PR-style review packet (FRONTIER Lane 6) ---
+	// --- PR-style review packet ---
 	mux.HandleFunc("GET /api/workspaces/{workspace_id}/issues/{issue_id}/review-packet", func(w http.ResponseWriter, r *http.Request) {
 		result, err := workspaceops.BuildReviewPacket(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), r.PathValue("issue_id"))
 		issueIntel(w, err, result)
 	})
-	// --- security review depth (FRONTIER Lane 4) ---
+	// --- security review depth ---
 	mux.HandleFunc("GET /api/workspaces/{workspace_id}/security/dispositions", func(w http.ResponseWriter, r *http.Request) {
 		result, err := workspaceops.ListSecurityDispositions(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))
 		issueIntel(w, err, result)
@@ -3459,7 +3459,7 @@ func main() {
 		result, err := workspaceops.SearchIssuesPostgres(r.PathValue("workspace_id"), query, limit)
 		issueIntel(w, err, result)
 	})
-	// --- verification outcomes materialized into Postgres (codex track C1) ---
+	// --- verification outcomes: materialize to Postgres, then query/filter ---
 	mux.HandleFunc("POST /api/workspaces/{workspace_id}/pg/verifications/materialize", func(w http.ResponseWriter, r *http.Request) {
 		result, err := workspaceops.MaterializeVerificationsPostgres(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))
 		issueIntel(w, err, result)
@@ -3703,9 +3703,9 @@ func main() {
 	tlsCert, tlsKey := os.Getenv("XMUSTARD_API_TLS_CERT"), os.Getenv("XMUSTARD_API_TLS_KEY")
 	hasTLS := tlsCert != "" && tlsKey != ""
 	allowInsecureBind := os.Getenv("XMUSTARD_ALLOW_INSECURE_BIND") == "1"
-	// Fail-closed on a non-loopback bind: it requires real auth AND transport
-	// security. XMUSTARD_AUTH=off no longer satisfies this interlock — disabling
-	// auth and exposing the interface are now separate, deliberate decisions.
+	// Fail-closed on a non-loopback bind: requires auth AND transport security.
+	// XMUSTARD_AUTH=off does not satisfy this interlock; disabling auth and exposing
+	// the interface are separate opt-ins.
 	if !isLoopback {
 		if authMode != "required" && !workspaceops.HasAuthConfigured(dataDir()) {
 			log.Fatal("refusing non-loopback bind without auth; run `xmustard-api mint-token <id> admin` or set XMUSTARD_AUTH=required")

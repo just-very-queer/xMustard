@@ -13,12 +13,11 @@ import (
 	"strings"
 )
 
-// Bearer-token auth. The product is self-hosted, so a token-per-principal model is
-// enough to make the multi-agent verification gate trustworthy: each agent gets its
-// OWN token mapped to an identity, and the verify path uses that authenticated
-// identity instead of a caller-asserted string — so one token cannot impersonate N
-// distinct agents. Tokens are stored HASHED at rest (sha256); the raw token is shown
-// once at mint time and is never recoverable.
+// Bearer-token auth for self-hosted deployments. Each principal gets its own token
+// mapped to an identity; the verify path authenticates via that token rather than a
+// caller-asserted string, so one token cannot stand in for multiple distinct
+// identities. Tokens are stored hashed (sha256) at rest; the raw token is returned
+// once at mint time and is not recoverable.
 
 type Principal struct {
 	ID   string `json:"id"`
@@ -64,8 +63,7 @@ func envTokenHashes() map[string]Principal {
 			continue
 		}
 		id, role, tok := strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1]), parts[2]
-		// Reject weak env tokens (online-guessable). Minted tokens are 256-bit;
-		// hold env tokens to a comparable floor so they can't be brute-forced.
+		// Require a minimum token length to resist brute-force guessing.
 		if id == "" || len(strings.TrimSpace(tok)) < 24 {
 			continue
 		}

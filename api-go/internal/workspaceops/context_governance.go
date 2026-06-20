@@ -458,9 +458,9 @@ func GetActiveContext(dataDir, workspaceID string) (map[string]any, error) {
 	}, nil
 }
 
-// MemoryConflict flags a file that 2+ active memories claim something about — the
-// agent should reconcile them before trusting either (lean "conflict detection":
-// path overlap, not proven contradiction).
+// MemoryConflict flags a file that two or more active memories reference, so the
+// agent can reconcile them before trusting either. Detection is path-overlap only;
+// it does not compare content for semantic contradictions.
 type MemoryConflict struct {
 	Path     string   `json:"path"`
 	EntryIDs []string `json:"entry_ids"`

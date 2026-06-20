@@ -7,7 +7,7 @@ import (
 	"xmustard/api-go/internal/rustcore"
 )
 
-// Semantic symbol graph delivery — the cockpit's "intelligence" surface.
+// Build and query the workspace symbol graph via rust-core.
 
 func WorkspaceSymbolGraph(dataDir, workspaceID string) (json.RawMessage, error) {
 	root, _, err := resolveChangeRoot(dataDir, workspaceID)
