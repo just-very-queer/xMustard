@@ -237,7 +237,12 @@ fn request_document(
             "capabilities": {
                 "textDocument": {
                     "documentSymbol": { "hierarchicalDocumentSymbolSupport": true },
-                    "hover": { "contentFormat": ["plaintext", "markdown"] }
+                    "hover": { "contentFormat": ["plaintext", "markdown"] },
+                    "references": {},
+                    "definition": { "linkSupport": true },
+                    "implementation": { "linkSupport": true },
+                    "typeDefinition": { "linkSupport": true },
+                    "rename": { "prepareSupport": true }
                 }
             }
         }
@@ -315,6 +320,118 @@ pub fn live_hover(
     )
 }
 
+// position_request runs any position-based LSP request and returns the raw result.
+fn position_request(
+    method: &str,
+    root: &Path,
+    rel: &str,
+    line: u32,
+    character: u32,
+    extra: Value,
+    timeout_secs: u64,
+) -> Result<Value, LspSessionError> {
+    let mut params = json!({ "position": { "line": line, "character": character } });
+    if let (Value::Object(p), Value::Object(ex)) = (&mut params, &extra) {
+        for (k, v) in ex {
+            p.insert(k.clone(), v.clone());
+        }
+    }
+    request_document(root, rel, method, params, Duration::from_secs(timeout_secs.clamp(2, 120)))
+}
+
+/// `textDocument/references` — all references to the symbol at a position
+/// (includeDeclaration controls whether the definition itself is included). This
+/// is the request the scope-resolved CALLS edge builder (S2) batches per symbol.
+pub fn live_references(
+    root: &Path,
+    rel: &str,
+    line: u32,
+    character: u32,
+    include_declaration: bool,
+    timeout_secs: u64,
+) -> Result<Value, LspSessionError> {
+    position_request(
+        "textDocument/references",
+        root,
+        rel,
+        line,
+        character,
+        json!({ "context": { "includeDeclaration": include_declaration } }),
+        timeout_secs,
+    )
+}
+
+/// `textDocument/definition` — where the symbol at a position is defined.
+pub fn live_definition(
+    root: &Path,
+    rel: &str,
+    line: u32,
+    character: u32,
+    timeout_secs: u64,
+) -> Result<Value, LspSessionError> {
+    position_request("textDocument/definition", root, rel, line, character, json!({}), timeout_secs)
+}
+
+/// `textDocument/implementation` — concrete implementations of an interface/trait
+/// member at a position.
+pub fn live_implementation(
+    root: &Path,
+    rel: &str,
+    line: u32,
+    character: u32,
+    timeout_secs: u64,
+) -> Result<Value, LspSessionError> {
+    position_request(
+        "textDocument/implementation",
+        root,
+        rel,
+        line,
+        character,
+        json!({}),
+        timeout_secs,
+    )
+}
+
+/// `textDocument/typeDefinition` — the type of the symbol at a position.
+pub fn live_type_definition(
+    root: &Path,
+    rel: &str,
+    line: u32,
+    character: u32,
+    timeout_secs: u64,
+) -> Result<Value, LspSessionError> {
+    position_request(
+        "textDocument/typeDefinition",
+        root,
+        rel,
+        line,
+        character,
+        json!({}),
+        timeout_secs,
+    )
+}
+
+/// `textDocument/rename` — the WorkspaceEdit that renames the symbol at a position
+/// to `new_name` (the edit is returned, not applied).
+pub fn live_rename(
+    root: &Path,
+    rel: &str,
+    line: u32,
+    character: u32,
+    new_name: &str,
+    timeout_secs: u64,
+) -> Result<Value, LspSessionError> {
+    position_request(
+        "textDocument/rename",
+        root,
+        rel,
+        line,
+        character,
+        json!({ "newName": new_name }),
+        timeout_secs,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -331,5 +448,32 @@ mod tests {
         assert_eq!(server_for("a.tsx").unwrap().language_id, "typescriptreact");
         assert_eq!(server_for("a.go").unwrap().command, "gopls");
         assert!(server_for("a.txt").is_none());
+    }
+
+    #[test]
+    fn position_requests_degrade_on_unmapped_extension() {
+        // every new position request reports Unavailable for an unsupported file,
+        // so a caller without a language server degrades gracefully.
+        let r = Path::new("/tmp");
+        assert!(matches!(
+            live_references(r, "notes.txt", 0, 0, true, 5).unwrap_err(),
+            LspSessionError::Unavailable(_)
+        ));
+        assert!(matches!(
+            live_definition(r, "notes.txt", 0, 0, 5).unwrap_err(),
+            LspSessionError::Unavailable(_)
+        ));
+        assert!(matches!(
+            live_implementation(r, "notes.txt", 0, 0, 5).unwrap_err(),
+            LspSessionError::Unavailable(_)
+        ));
+        assert!(matches!(
+            live_type_definition(r, "notes.txt", 0, 0, 5).unwrap_err(),
+            LspSessionError::Unavailable(_)
+        ));
+        assert!(matches!(
+            live_rename(r, "notes.txt", 0, 0, "x", 5).unwrap_err(),
+            LspSessionError::Unavailable(_)
+        ));
     }
 }

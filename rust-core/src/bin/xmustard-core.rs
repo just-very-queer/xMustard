@@ -581,6 +581,67 @@ fn main() {
                 }
             }
         }
+        method @ ("lsp-references" | "lsp-definition" | "lsp-implementation"
+        | "lsp-type-definition" | "lsp-rename") => {
+            use xmustard_core::lsp_session::{
+                self, live_definition, live_implementation, live_references, live_rename,
+                live_type_definition, LspSessionError,
+            };
+            let needs_name = method == "lsp-rename";
+            let usage = format!(
+                "xmustard-core {method} <root_path> <relative_path> <line> <character>{} [timeout_secs]",
+                if needs_name { " <new_name>" } else { "" }
+            );
+            let need = |v: Option<String>| match v {
+                Some(value) => value,
+                None => {
+                    eprintln!("usage: {usage}");
+                    std::process::exit(2);
+                }
+            };
+            let root = need(args.next());
+            let relative_path = need(args.next());
+            let line = need(args.next()).parse::<u32>().unwrap_or_else(|_| {
+                eprintln!("usage: {usage}");
+                std::process::exit(2);
+            });
+            let character = need(args.next()).parse::<u32>().unwrap_or_else(|_| {
+                eprintln!("usage: {usage}");
+                std::process::exit(2);
+            });
+            let new_name = if needs_name { need(args.next()) } else { String::new() };
+            let timeout = args.next().and_then(|v| v.parse::<u64>().ok()).unwrap_or(45);
+            let root = PathBuf::from(root);
+            let outcome: Result<serde_json::Value, LspSessionError> = match method {
+                "lsp-references" => {
+                    live_references(&root, &relative_path, line, character, true, timeout)
+                }
+                "lsp-definition" => live_definition(&root, &relative_path, line, character, timeout),
+                "lsp-implementation" => {
+                    live_implementation(&root, &relative_path, line, character, timeout)
+                }
+                "lsp-type-definition" => {
+                    live_type_definition(&root, &relative_path, line, character, timeout)
+                }
+                "lsp-rename" => {
+                    live_rename(&root, &relative_path, line, character, &new_name, timeout)
+                }
+                _ => unreachable!(),
+            };
+            match outcome {
+                Ok(result) => println!(
+                    "{}",
+                    serde_json::to_string(&result).expect("lsp result should serialize")
+                ),
+                Err(lsp_session::LspSessionError::Unavailable(msg)) => {
+                    println!("{}", serde_json::json!({"available": false, "reason": msg}))
+                }
+                Err(err) => {
+                    eprintln!("{method} failed: {err}");
+                    std::process::exit(1);
+                }
+            }
+        }
         "normalize-lsp-workspace-symbols" => {
             let Some(workspace_id) = args.next() else {
                 eprintln!("usage: xmustard-core normalize-lsp-workspace-symbols <workspace_id> <root_path> <query> <limit> <source_name> <input_json_path>");

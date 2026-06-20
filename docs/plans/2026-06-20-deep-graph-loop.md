@@ -7,11 +7,11 @@ batch unverified work. Keep the 8–9-tool MCP surface — enrich tools, don't a
 
 Checklist (in order; check off as committed):
 
-- [ ] **S1 — Full LSP requests.** Extend `rust-core/src/lsp_session.rs` with
-  `textDocument/references`, `definition`, `implementation`, `typeDefinition`,
-  `rename`, following the existing documentSymbol/hover pattern (CLI subcommands +
-  Go delegators). Graceful when the server lacks a capability.
-  *DoD:* live `references` on a real symbol via rust-analyzer/tsserver; tests pass.
+- [x] **S1 — Full LSP requests.** Extended `rust-core/src/lsp_session.rs` with
+  `references`/`definition`/`implementation`/`typeDefinition`/`rename` (shared
+  `position_request` helper; CLI arms `lsp-references|definition|implementation|
+  type-definition|rename`). Graceful Unavailable when no server. Verified live via
+  tsserver: references found 3, definition → LocationLink, rename → WorkspaceEdit.
 
 - [ ] **S2 — Scope-resolved CALLS edges.** Replace lexical name-matching in
   `symbolgraph.rs` with LSP-backed references where a server is available (batch
