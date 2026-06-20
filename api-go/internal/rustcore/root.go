@@ -5,6 +5,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 )
 
 func rustCoreDir() string {
@@ -20,6 +21,16 @@ func rustCoreDir() string {
 // (debug) when it is not present — so heavy commands like symbolgraph/search
 // stay responsive in production.
 func coreCommand(sub string, args ...string) *exec.Cmd {
+	// An installed (e.g. Homebrew) deployment has no source tree, so honor an
+	// explicit path to the xmustard-core binary, or one found on PATH, before
+	// falling back to the source-relative release binary and finally `cargo run`.
+	if bin := strings.TrimSpace(os.Getenv("XMUSTARD_CORE_BIN")); bin != "" {
+		cmd := exec.Command(bin, append([]string{sub}, args...)...)
+		return cmd
+	}
+	if bin, err := exec.LookPath("xmustard-core"); err == nil {
+		return exec.Command(bin, append([]string{sub}, args...)...)
+	}
 	dir := rustCoreDir()
 	bin := filepath.Join(dir, "target", "release", "xmustard-core")
 	if info, err := os.Stat(bin); err == nil && !info.IsDir() {

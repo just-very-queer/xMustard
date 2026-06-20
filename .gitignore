@@ -36,3 +36,6 @@ api-go/xmustard-ops
 
 # downloaded research PDFs (kept on disk, not committed — see docs/research/RESEARCH_INDEX.md)
 docs/research/papers/*.pdf
+
+# make build output
+api-go/bin/
