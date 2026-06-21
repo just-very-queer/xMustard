@@ -373,7 +373,10 @@ func OpenAIChat(dataDir, name string, req ChatRequest) (map[string]any, error) {
 	// Build the user message: plain text, or multimodal parts when images present.
 	images := append([]string{}, req.ImageURLs...)
 	if strings.TrimSpace(req.ImagePath) != "" {
-		dataURL, err := imageFileToDataURL(req.ImagePath)
+		// image_path is confined to the uploads root: an agent must not be able to
+		// make the server read+exfiltrate arbitrary host files (e.g. /etc/passwd,
+		// SSH keys) to a remote provider (XM-NEW-014).
+		dataURL, err := imageFileToDataURL(filepath.Join(dataDir, "uploads"), req.ImagePath)
 		if err != nil {
 			return nil, err
 		}
@@ -443,13 +446,16 @@ func OpenAIChat(dataDir, name string, req ChatRequest) (map[string]any, error) {
 	}, nil
 }
 
-func imageFileToDataURL(path string) (string, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return "", fmt.Errorf("read image %s: %w", path, err)
+// imageFileToDataURL reads a confined, size-capped regular file under `root` and
+// returns a base64 data URL. `rel` must be a workspace-relative path beneath root
+// (no absolute paths, `..` traversal, or symlink escape).
+func imageFileToDataURL(root, rel string) (string, error) {
+	data, ok := readWorkspaceRegularFile(root, rel)
+	if !ok {
+		return "", fmt.Errorf("image must be a regular file under the uploads directory within the size limit")
 	}
 	mime := "image/png"
-	switch strings.ToLower(filepath.Ext(path)) {
+	switch strings.ToLower(filepath.Ext(rel)) {
 	case ".jpg", ".jpeg":
 		mime = "image/jpeg"
 	case ".gif":

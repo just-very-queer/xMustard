@@ -58,11 +58,18 @@ type synchronizedLogWriter struct {
 var terminalSessions sync.Map
 
 func OpenTerminal(dataDir string, request TerminalOpenRequest) (*TerminalSessionRecord, error) {
+	// Validate caller input first: a supplied terminal id must not escape the
+	// terminal log directory via `..`/separators (XM-NEW-012).
+	terminalID := strings.TrimSpace(firstNonEmptyPtr(request.TerminalID))
+	if terminalID != "" {
+		if err := validateSafeID("terminal", terminalID); err != nil {
+			return nil, err
+		}
+	}
 	workspace, err := getWorkspaceRecord(dataDir, request.WorkspaceID)
 	if err != nil {
 		return nil, err
 	}
-	terminalID := strings.TrimSpace(firstNonEmptyPtr(request.TerminalID))
 	if terminalID == "" {
 		terminalID = "term_" + hashID(request.WorkspaceID, nowUTC())[:12]
 	}
