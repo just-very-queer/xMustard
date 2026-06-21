@@ -233,7 +233,47 @@ func LSPWorkspaceSymbols(dataDir string, workspaceID string, language string, qu
 	)
 }
 
+// lspReaperOnce lazily starts the idle-session reaper the first time an LSP session
+// is acquired, so a deployment that never uses LSP pays nothing.
+var lspReaperOnce sync.Once
+
+func startLSPReaper() {
+	lspReaperOnce.Do(func() {
+		go func() {
+			ticker := time.NewTicker(lspSessionIdleTTL)
+			defer ticker.Stop()
+			for range ticker.C {
+				reapIdleLSPSessions()
+			}
+		}()
+	})
+}
+
+// reapIdleLSPSessions closes language-server sessions that have been idle past the
+// TTL. Without this, an abandoned session leaks its child process, readLoop
+// goroutine, and pipe FDs forever (it was only reaped on a *subsequent* acquire to
+// the same key, which may never come) — the invisible RSS budget killer. Idle
+// sessions are removed under the map lock but close()d OFF the lock, since close()
+// does a shutdown handshake + kill + wait and would otherwise stall request handlers.
+func reapIdleLSPSessions() {
+	var toClose []*lspSession
+	lspSessionsMu.Lock()
+	lspSessions.Range(func(k, v any) bool {
+		key, _ := k.(lspSessionKey)
+		if session, ok := v.(*lspSession); ok && session.isIdle() {
+			toClose = append(toClose, session)
+			lspSessions.Delete(key)
+		}
+		return true
+	})
+	lspSessionsMu.Unlock()
+	for _, s := range toClose {
+		s.close()
+	}
+}
+
 func acquireLSPSession(dataDir string, workspaceID string, rootPath string, config *lspServerConfig) (*lspSession, error) {
+	startLSPReaper()
 	key := lspSessionKey{WorkspaceID: workspaceID, ServerID: config.ServerID}
 	lspSessionsMu.Lock()
 	defer lspSessionsMu.Unlock()
