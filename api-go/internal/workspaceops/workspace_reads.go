@@ -548,6 +548,7 @@ func ListWorkspaceActivity(dataDir string, workspaceID string, issueID string, r
 
 	items := []activityRecord{}
 	scanner := bufio.NewScanner(handle)
+	scanner.Buffer(make([]byte, 0, 64*1024), maxActivityLineBytes)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {

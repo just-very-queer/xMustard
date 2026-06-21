@@ -22,6 +22,39 @@ import (
 var activeRunProcesses sync.Map
 var cancelledRunIDs sync.Map
 
+// maxRunOutputBytes caps the in-RAM tail of a managed run's combined output (the
+// full stream still goes to the run's .log file on disk).
+const maxRunOutputBytes = 1 << 20 // 1 MiB
+
+// boundedTail is an io.Writer that retains only the last `max` bytes written while
+// counting the total, so capturing a run's output can't grow the heap unbounded.
+type boundedTail struct {
+	buf       []byte
+	max       int
+	total     int64
+	truncated bool
+}
+
+func (b *boundedTail) Write(p []byte) (int, error) {
+	b.total += int64(len(p))
+	if b.max <= 0 {
+		return len(p), nil
+	}
+	if len(p) >= b.max {
+		b.buf = append(b.buf[:0], p[len(p)-b.max:]...)
+		b.truncated = true
+		return len(p), nil
+	}
+	if len(b.buf)+len(p) > b.max {
+		b.buf = b.buf[len(b.buf)+len(p)-b.max:]
+		b.truncated = true
+	}
+	b.buf = append(b.buf, p...)
+	return len(p), nil
+}
+
+func (b *boundedTail) String() string { return string(b.buf) }
+
 var defaultCodexModels = []string{
 	"gpt-5.4",
 	"gpt-5.4-mini",
@@ -362,8 +395,11 @@ func runManagedProcess(dataDir string, run runRecord, workspaceRoot string) {
 	command.Dir = workspaceRoot
 	command.Stdin = nil
 	configureManagedRunCommand(command)
-	var output strings.Builder
-	multi := io.MultiWriter(logHandle, &output)
+	// The full stream is persisted to the .log file on disk (logHandle); the in-RAM
+	// capture used for the output snapshot + summary is a bounded tail, so a chatty
+	// long-running agent can't grow the API's heap without limit (XM-POST-005).
+	output := &boundedTail{max: maxRunOutputBytes}
+	multi := io.MultiWriter(logHandle, output)
 	command.Stdout = multi
 	command.Stderr = multi
 	if err := command.Start(); err != nil {
@@ -383,6 +419,10 @@ func runManagedProcess(dataDir string, run runRecord, workspaceRoot string) {
 	combinedOutput := output.String()
 	_ = os.WriteFile(run.OutputPath, []byte(combinedOutput), 0o644)
 	summary := summarizeRunOutput(run.Runtime, combinedOutput)
+	// surface the true byte count + whether the in-RAM snapshot was truncated (the
+	// full stream remains in the .log file).
+	summary["output_bytes"] = output.total
+	summary["output_truncated"] = output.truncated
 	persisted, _ = loadRun(dataDir, run.WorkspaceID, run.RunID)
 	finalStatus := "completed"
 	if _, cancelled := cancelledRunIDs.Load(run.RunID); cancelled || (persisted != nil && persisted.Status == "cancelled") {
