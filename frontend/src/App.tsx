@@ -92,6 +92,7 @@ import { DetailPane } from './components/DetailPane'
 import { ExecutionPane } from './components/ExecutionPane'
 import { QueuePane } from './components/QueuePane'
 import { Cockpit } from './components/Cockpit'
+import { AdminPanel } from './components/AdminPanel'
 import { KanbanBoard } from './components/KanbanBoard'
 import type { QueuePreset } from './components/QueuePresetStrip'
 import { WorkspaceSidebar } from './components/WorkspaceSidebar'
@@ -2394,6 +2395,8 @@ function App() {
             <section className={`board-grid ${executionOpen ? 'board-grid-with-execution' : 'board-grid-focus'}`}>
               {activeView === 'cockpit' ? (
                 <Cockpit workspaceId={workspaceId ?? ''} />
+              ) : activeView === 'admin' ? (
+                <AdminPanel />
               ) : activeView === 'kanban' ? (
                 <KanbanBoard issues={issueQueue} onSelect={setSelectedIssueId} />
               ) : (

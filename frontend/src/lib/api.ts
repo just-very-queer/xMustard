@@ -76,6 +76,11 @@ import type {
   WorktreeStatus,
   WorkspaceSnapshot,
   WorkspaceRecord,
+  OpenAIProvider,
+  RoutingRule,
+  AuthPrincipal,
+  MintTokenResult,
+  AuthAuditEvent,
 } from './types'
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -958,4 +963,55 @@ export function getFileLineage(workspaceId: string, path: string) {
   return request<FileLineage>(
     `/api/workspaces/${workspaceId}/lineage?path=${encodeURIComponent(path)}`,
   )
+}
+
+// --- operator admin: providers / routing / tokens (HTTP-only surfaces) ---
+
+export function listProviders() {
+  return request<OpenAIProvider[]>('/api/providers')
+}
+export function addProvider(provider: OpenAIProvider) {
+  return request<OpenAIProvider>('/api/providers', {
+    method: 'POST',
+    body: JSON.stringify(provider),
+  })
+}
+export function removeProvider(name: string) {
+  return request<{ removed: string }>(`/api/providers/${encodeURIComponent(name)}`, {
+    method: 'DELETE',
+  })
+}
+
+export function listRoutingRules() {
+  return request<RoutingRule[]>('/api/routes')
+}
+export function setRoutingRule(rule: RoutingRule) {
+  return request<RoutingRule[]>('/api/routes', {
+    method: 'POST',
+    body: JSON.stringify(rule),
+  })
+}
+
+export function listPrincipals() {
+  return request<AuthPrincipal[]>('/api/auth/principals')
+}
+export function mintToken(id: string, role: string, ttlSeconds = 0) {
+  return request<MintTokenResult>('/api/auth/tokens', {
+    method: 'POST',
+    body: JSON.stringify({ id, role, ttl_seconds: ttlSeconds }),
+  })
+}
+export function rotateToken(id: string, ttlSeconds = 0) {
+  return request<MintTokenResult>(`/api/auth/tokens/${encodeURIComponent(id)}/rotate`, {
+    method: 'POST',
+    body: JSON.stringify({ ttl_seconds: ttlSeconds }),
+  })
+}
+export function revokeToken(id: string) {
+  return request<{ revoked: string }>(`/api/auth/tokens/${encodeURIComponent(id)}`, {
+    method: 'DELETE',
+  })
+}
+export function listAuthAudit(limit = 50) {
+  return request<AuthAuditEvent[]>(`/api/auth/audit?limit=${limit}`)
 }

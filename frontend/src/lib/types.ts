@@ -120,6 +120,49 @@ export type ViewMode =
   | 'activity'
   | 'cockpit'
   | 'kanban'
+  | 'admin'
+
+// --- operator admin: providers / routing / tokens ---
+
+export type OpenAIProvider = {
+  name: string
+  kind: string // ollama | openai | vllm | lmstudio | custom
+  base_url: string
+  api_key_env?: string
+  default_model?: string
+  supports_vision: boolean
+  created_at?: string
+}
+
+export type RoutingRule = {
+  task_type: string
+  provider: string
+  model: string
+}
+
+export type AuthPrincipal = {
+  id: string
+  role: string // admin | agent | readonly
+}
+
+export type MintTokenResult = {
+  id: string
+  token: string
+  note?: string
+}
+
+export type AuthAuditEvent = {
+  event_id: string
+  action: string // mint | revoke | rotate | denied
+  actor: string
+  token_id?: string
+  role?: string
+  detail?: string
+  method?: string
+  path?: string
+  remote_addr?: string
+  created_at: string
+}
 
 export type SourceRecord = {
   source_id: string

@@ -120,12 +120,27 @@ don't add tools). No Python.
   *Live (this repo):* 399 flow edges — branches 239, returns 107, writes 53; e.g.
   `returns: project_info.go → repo_config.go via dedupeStrings`. Committed + pushed.
 
-- [ ] **R7 — Cockpit UI for providers / routing / tokens (A4 remainder)** *(large)*.
-  React components + `api.ts` client for: provider management (the backend
-  `/api/providers*` exists), task-typed routing rules (`/api/route*`), and auth-token
-  management (`/api/auth/*`). tsc + build green.
-  *DoD:* an operator can add a provider, set a routing rule, and mint/revoke a token from the UI.
+- [x] **R7 — Cockpit UI for providers / routing / tokens (A4 remainder)** *(large)*.
+  **DONE.** New `AdminPanel.tsx` (three sections: Providers, Task-typed routing,
+  Tokens &amp; auth) mounted as a new `admin` view (added to `ViewMode`, the
+  `WorkspaceSidebar` nav, and the App render switch). `api.ts` gained typed clients
+  for `/api/providers*` (list/add/remove), `/api/routes` (list/set), and
+  `/api/auth/*` (principals, mint with TTL, rotate, revoke, audit) plus the matching
+  `types.ts` types. Mint/rotate show the raw token once; the auth-audit trail is
+  rendered.
+  *DoD met:* `tsc --noEmit` + `npm run build` green (37 modules, bundled). Live
+  round-trips of every endpoint the panel calls: add→list→remove provider,
+  set→list routing rule, and (from R4) mint/rotate/revoke + audit. Committed + pushed.
 
 Honest framing to preserve: xMustard already wins on governed memory + drift honesty
 + the 20× warm index + the deep-graph parity (S1–S6). These seven are depth/production
 polish; none blocks the agent use-case.
+
+---
+
+**Status: COMPLETE (2026-06-21).** All seven slices R1–R7 are done, verified, and
+pushed to `feat/product-v1`:
+R1 `27a96b2` · R2 `d3465c2` · R3 `43de2f7` · R4 `aed07bf` · R5 `c405bc8` ·
+R6 `de700f0` · R7 (this commit). R4 (auth) and R5 (PG write path) each passed an
+adversarial-review workflow (27 / 30 agents) with all critical/high findings fixed
+before commit.

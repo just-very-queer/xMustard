@@ -55,12 +55,13 @@ xMustard is a **tiny MCP server for governed runtime memory** — its only job i
 
 ---
 
-## 3. NOT DONE / Remaining Gaps
+## 3. Remaining-Work Loop — COMPLETE (2026-06-21)
 
-Verified against the code on 2026-06-21 (one agent per item, evidence-backed —
-see `docs/plans/2026-06-21-remaining-work-loop.md`). The items below are the
-**genuinely-open** ones; everything previously listed here that is now done has
-been removed.
+The seven items that were genuinely-open after the deep-graph loop (R1–R7, see
+`docs/plans/2026-06-21-remaining-work-loop.md`) are now **all DONE, verified, and
+pushed** to `feat/product-v1`. R4 (auth) and R5 (PG write path) each passed an
+adversarial-review workflow with all critical/high findings fixed before commit.
+The table below records each with its evidence.
 
 | Item | Verdict | Effort | Evidence |
 |------|---------|--------|----------|
@@ -70,7 +71,7 @@ been removed.
 | **Auth follow-ons** (A5) | **DONE** | large | Global capped auth-audit log (mint/revoke/rotate/denied); `ExpiresAt` + fail-closed TTL check in `ResolveToken`; `RotateToken` + rotate endpoint; `roleRank` hierarchy with an explicit `agent` gate. Adversarial review (27 agents) → fixed critical token-store race (`tokenStoreMu`), fail-open-on-corrupt (`HasAuthConfigured` fails closed), audit DoS (clip + throttle), TTL overflow. `-race` tests + live. |
 | **Postgres as the write path** (C1) | **DONE** | large | `pg_inline.go`: `saveRunRecord` + `saveVerificationProfileHistory` mirror to PG inline on mutation (xm_runs + new xm_run_plans), JSON still source-of-truth. Best-effort async (gated on `XMUSTARD_PG_DSN`). Adversarial review (30 agents) → fixed async-latency, unique-index-fragility, NULL columns. Live round-trip + `-race` tests; `/pg/run-plans` read-back. |
 | **Deeper data/control-flow edges** | **DONE** | large | A per-line flow pass classifies `returns`/`branches`/`writes` edges into a separate `SymbolGraph.flow_edges` (unperturbing authority/impact/proximity), tagged `lexical` like S2. `symbolgraph flow` CLI. Live: 399 flow edges on this repo (branches 239 / returns 107 / writes 53). |
-| **Cockpit UI for providers/routing/tokens** (A4 remainder) | not-done | large | No React components; `api.ts` has only ticket-integration CRUD. Backend endpoints (`/api/providers*`, `/api/route*`, `/api/auth/*`) exist — only the UI is missing. |
+| **Cockpit UI for providers/routing/tokens** (A4 remainder) | **DONE** | large | `AdminPanel.tsx` (providers / routing / tokens) as a new `admin` view; `api.ts` typed clients over `/api/providers*`, `/api/routes`, `/api/auth/*`. `tsc`+build green; every endpoint round-trip verified live. |
 
 ### Stale docs (being fixed in this pass)
 - `PLANNED_FEATURES.md` had ⬜ markers for enclosing-scope and LSP impl/type/rename that are now done — corrected.
@@ -79,29 +80,36 @@ been removed.
 
 ## 4. Completion Estimate Against the RETHINK Thesis
 
-**~90% complete** against the governed-memory product. Everything in the RETHINK
-plan (steps 1–5) is done; the deep-graph + IndexEngine loop (S1–S6: full LSP,
-scope-resolved CALLS, communities, incremental reindex, agent-feedback ranking,
-symbol-level impact/trace) is done. The 9 enriched MCP tools are live and tested,
-auth is hardened, grounding + drift-on-recall + conflict surfacing are real, and
-the warm index is 20× faster. The remaining 7 items (section 3) are depth/production
-polish — none blocks the primary agent use-case.
+**Effectively complete** against the governed-memory product. Everything in the
+RETHINK plan (steps 1–5) is done; the deep-graph + IndexEngine loop (S1–S6: full
+LSP, scope-resolved CALLS, communities, incremental reindex, agent-feedback ranking,
+symbol-level impact/trace) is done; and the remaining-work loop (R1–R7: proximity
+lane, contract-break detection, wiki incrementality, auth follow-ons, PG write path,
+flow edges, cockpit admin UI) is done. The 9 enriched MCP tools are live and tested,
+auth is hardened (adversarial-reviewed), grounding + drift-on-recall + conflict
+surfacing are real, and the warm index is 20× faster. What remains is open-ended
+depth (richer flow analysis, scale hardening, more provider integrations) rather
+than a closed checklist.
 
 ---
 
-## 5. Highest-Leverage Next Tasks (verified, ranked by value/effort)
+## 5. Remaining-Work Loop — all landed (R1–R7)
 
-1. ~~Graph-proximity RRF lane~~ — **DONE** (R1). 4th proximity lane via `symbol_impact`
-   BFS distances + auto-seed + `search?seed=`.
-2. ~~Contract-break detection~~ — **DONE** (R2). Baselined per-symbol signatures
-   diffed on change → `contract_break` in `impact`/`ground`.
-3. ~~Wiki incrementality~~ — **DONE** (R3). Warm cached graph + per-subsystem
-   fingerprint page cache; only changed subsystems re-render.
-4. ~~Auth A5~~ — **DONE** (R4). Audit log, token expiry/rotation, agent-role gate;
-   adversarial-reviewed (critical race + fail-open + audit DoS fixed).
-5. ~~PG write path~~ — **DONE** (R5). Inline best-effort mirror of runs/plans/
-   verifications; adversarial-reviewed (async latency + NULL columns fixed).
-6. ~~Deeper data/control-flow edges~~ — **DONE** (R6). returns/branches/writes flow
-   edges in a separate `flow_edges` field.
-7. **Cockpit UI** (providers/routing/tokens) — the last remaining item; a product
-   surface over the existing HTTP endpoints.
+1. ~~Graph-proximity RRF lane~~ — **DONE** (R1, `27a96b2`). 4th proximity lane via
+   `symbol_impact` BFS distances + auto-seed + `search?seed=`.
+2. ~~Contract-break detection~~ — **DONE** (R2, `d3465c2`). Baselined per-symbol
+   signatures diffed on change → `contract_break` in `impact`/`ground`.
+3. ~~Wiki incrementality~~ — **DONE** (R3, `43de2f7`). Warm cached graph +
+   per-subsystem fingerprint page cache; only changed subsystems re-render.
+4. ~~Auth A5~~ — **DONE** (R4, `aed07bf`). Audit log, token expiry/rotation,
+   agent-role gate; adversarial-reviewed (critical race + fail-open + audit DoS fixed).
+5. ~~PG write path~~ — **DONE** (R5, `c405bc8`). Inline best-effort mirror of
+   runs/plans/verifications; adversarial-reviewed (async latency + NULL columns fixed).
+6. ~~Deeper data/control-flow edges~~ — **DONE** (R6, `de700f0`). returns/branches/
+   writes flow edges in a separate `flow_edges` field.
+7. ~~Cockpit UI~~ — **DONE** (R7). `AdminPanel.tsx` for providers/routing/tokens
+   over the existing HTTP endpoints; tsc + build green, endpoints round-trip-verified.
+
+**Future depth (no longer a closed checklist):** richer flow analysis (LSP-resolved
+flow edges, reads vs writes precision), scale hardening (a shared PG pool replacing
+per-call connects), and more provider/routing integrations.
