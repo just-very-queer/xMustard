@@ -34,6 +34,24 @@ const maxTTLSeconds = 100 * 365 * 24 * 3600 // ~100 years
 type Principal struct {
 	ID   string `json:"id"`
 	Role string `json:"role"` // admin | agent | readonly
+	// Workspaces, when non-empty, restricts this principal to those workspace ids
+	// (per-worker token scoping). Empty/nil means unrestricted — backward-compatible
+	// with existing unscoped tokens and operator/env tokens.
+	Workspaces []string `json:"workspaces,omitempty"`
+}
+
+// AllowsWorkspace reports whether the principal may act on workspaceID. An empty
+// scope claim is unrestricted.
+func (p *Principal) AllowsWorkspace(workspaceID string) bool {
+	if p == nil || len(p.Workspaces) == 0 {
+		return true
+	}
+	for _, w := range p.Workspaces {
+		if w == workspaceID {
+			return true
+		}
+	}
+	return false
 }
 
 type tokenRecord struct {
@@ -44,6 +62,8 @@ type tokenRecord struct {
 	// ExpiresAt is an RFC3339 instant after which the token is rejected; empty
 	// means it never expires. Enforced in ResolveToken.
 	ExpiresAt string `json:"expires_at,omitempty"`
+	// Workspaces restricts the token to these workspace ids (empty = all).
+	Workspaces []string `json:"workspaces,omitempty"`
 }
 
 // tokenExpired reports whether an RFC3339 ExpiresAt is set and in the past. A
@@ -159,7 +179,7 @@ func ResolveToken(dataDir, raw string) *Principal {
 			if tokenExpired(r.ExpiresAt) {
 				return nil // a known-but-expired token resolves to no principal
 			}
-			return &Principal{ID: r.ID, Role: fallbackString(r.Role, "agent")}
+			return &Principal{ID: r.ID, Role: fallbackString(r.Role, "agent"), Workspaces: r.Workspaces}
 		}
 	}
 	return nil
@@ -173,27 +193,45 @@ func MintToken(dataDir, id, role string) (string, error) {
 // MintTokenTTL generates a token for (id, role), stores its hash, and returns the
 // raw token once. Re-minting for an existing id replaces its token. ttlSeconds > 0
 // sets an expiry (enforced in ResolveToken); 0 means the token never expires.
-func MintTokenTTL(dataDir, id, role string, ttlSeconds int) (string, error) {
-	id = strings.TrimSpace(id)
-	if err := validateSafeID("token", id); err != nil {
-		return "", fmt.Errorf("token id must be alphanumeric/._-: %w", err)
+// validateMintInputs normalizes and validates id/role/ttl in place.
+func validateMintInputs(id, role *string, ttlSeconds int) error {
+	*id = strings.TrimSpace(*id)
+	if err := validateSafeID("token", *id); err != nil {
+		return fmt.Errorf("token id must be alphanumeric/._-: %w", err)
 	}
-	role = fallbackString(strings.TrimSpace(role), "agent")
-	switch role {
+	*role = fallbackString(strings.TrimSpace(*role), "agent")
+	switch *role {
 	case "admin", "agent", "readonly":
 	default:
-		return "", fmt.Errorf("role must be admin|agent|readonly")
+		return fmt.Errorf("role must be admin|agent|readonly")
 	}
 	if ttlSeconds < 0 || ttlSeconds > maxTTLSeconds {
-		return "", fmt.Errorf("ttl_seconds must be between 0 and %d", maxTTLSeconds)
+		return fmt.Errorf("ttl_seconds must be between 0 and %d", maxTTLSeconds)
+	}
+	return nil
+}
+
+func MintTokenTTL(dataDir, id, role string, ttlSeconds int) (string, error) {
+	if err := validateMintInputs(&id, &role, ttlSeconds); err != nil {
+		return "", err
 	}
 	tokenStoreMu.Lock()
 	defer tokenStoreMu.Unlock()
-	return mintTokenLocked(dataDir, id, role, ttlSeconds)
+	return mintTokenLocked(dataDir, id, role, ttlSeconds, nil)
 }
 
 // mintTokenLocked does the load-modify-write; the caller MUST hold tokenStoreMu.
-func mintTokenLocked(dataDir, id, role string, ttlSeconds int) (string, error) {
+// MintScopedToken mints a token confined to the given workspace ids (empty = all).
+func MintScopedToken(dataDir, id, role string, ttlSeconds int, workspaces []string) (string, error) {
+	if err := validateMintInputs(&id, &role, ttlSeconds); err != nil {
+		return "", err
+	}
+	tokenStoreMu.Lock()
+	defer tokenStoreMu.Unlock()
+	return mintTokenLocked(dataDir, id, role, ttlSeconds, workspaces)
+}
+
+func mintTokenLocked(dataDir, id, role string, ttlSeconds int, workspaces []string) (string, error) {
 	buf := make([]byte, 32)
 	if _, err := rand.Read(buf); err != nil {
 		return "", err
@@ -221,6 +259,7 @@ func mintTokenLocked(dataDir, id, role string, ttlSeconds int) (string, error) {
 		TokenSHA256: hashToken(raw),
 		CreatedAt:   nowUTC(),
 		ExpiresAt:   expiresAt,
+		Workspaces:  workspaces,
 	})
 	if err := writeJSON(tokensPath(dataDir), next); err != nil {
 		return "", err
@@ -246,16 +285,20 @@ func RotateToken(dataDir, id string, ttlSeconds int) (string, error) {
 		return "", err
 	}
 	role := ""
+	var workspaces []string
+	found := false
 	for _, r := range recs {
 		if r.ID == id {
 			role = fallbackString(r.Role, "agent")
+			workspaces = r.Workspaces // preserve the workspace scope across rotation
+			found = true
 			break
 		}
 	}
-	if role == "" {
+	if !found {
 		return "", os.ErrNotExist
 	}
-	return mintTokenLocked(dataDir, id, role, ttlSeconds)
+	return mintTokenLocked(dataDir, id, role, ttlSeconds, workspaces)
 }
 
 // ListPrincipals returns the configured principals (no secrets).

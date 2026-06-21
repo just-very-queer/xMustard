@@ -119,15 +119,16 @@ func main() {
 			return
 		}
 		var req struct {
-			ID         string `json:"id"`
-			Role       string `json:"role"`
-			TTLSeconds int    `json:"ttl_seconds"`
+			ID         string   `json:"id"`
+			Role       string   `json:"role"`
+			TTLSeconds int      `json:"ttl_seconds"`
+			Workspaces []string `json:"workspaces"` // optional: confine the token to these workspaces
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON body"})
 			return
 		}
-		raw, err := workspaceops.MintTokenTTL(dataDir(), req.ID, req.Role, req.TTLSeconds)
+		raw, err := workspaceops.MintScopedToken(dataDir(), req.ID, req.Role, req.TTLSeconds, req.Workspaces)
 		if err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 			return
@@ -4040,12 +4041,38 @@ func authMiddleware(dataDir, mode string, next http.Handler) http.Handler {
 			writeJSON(w, http.StatusForbidden, map[string]any{"error": "readonly principal cannot " + r.Method})
 			return
 		}
+		// workspace scope: a scoped (per-worker) token may only touch its workspaces.
+		// Unscoped tokens (the default) are unrestricted, so this is backward-compatible.
+		if principal != nil {
+			if wsID := workspaceIDFromPath(r.URL.Path); wsID != "" && !principal.AllowsWorkspace(wsID) {
+				workspaceops.RecordAuthAudit(dataDir, workspaceops.AuthAuditEvent{
+					Action: "denied", Actor: principal.ID,
+					Detail: "workspace " + wsID + " not in token scope",
+					Method: r.Method, Path: r.URL.Path, RemoteAddr: r.RemoteAddr,
+				})
+				writeJSON(w, http.StatusForbidden, map[string]any{"error": "token not scoped to workspace " + wsID})
+				return
+			}
+		}
 		if principal == nil {
 			next.ServeHTTP(w, r)
 			return
 		}
 		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), principalCtxKey, principal)))
 	})
+}
+
+// workspaceIDFromPath extracts {id} from /api/workspaces/{id}/... ("" if not such a path).
+func workspaceIDFromPath(p string) string {
+	const prefix = "/api/workspaces/"
+	if !strings.HasPrefix(p, prefix) {
+		return ""
+	}
+	rest := p[len(prefix):]
+	if i := strings.IndexByte(rest, '/'); i >= 0 {
+		return rest[:i]
+	}
+	return rest
 }
 
 func envDefault(name string, fallback string) string {
