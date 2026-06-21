@@ -255,38 +255,64 @@ func dispatch(method string, params json.RawMessage) (any, *rpcError) {
 	}
 }
 
-func main() {
-	reader := bufio.NewReaderSize(os.Stdin, 1<<20)
-	writer := bufio.NewWriter(os.Stdout)
-	enc := json.NewEncoder(writer)
+// maxMessageBytes bounds a single newline-delimited JSON-RPC message. Without it,
+// ReadBytes('\n') accumulates a newline-less stream unboundedly and OOM-kills the
+// server (XM-NEW-020). 8 MiB comfortably fits any legitimate tool call.
+const maxMessageBytes = 8 << 20
+
+// readBoundedLine reads one '\n'-terminated message, capped at maxMessageBytes. If
+// the line exceeds the cap it is drained to the newline and reported truncated, so a
+// hostile huge frame stays bounded instead of allocating without limit.
+func readBoundedLine(r *bufio.Reader) (line []byte, truncated bool, err error) {
 	for {
-		line, err := reader.ReadBytes('\n')
-		if len(line) > 0 {
-			line = []byte(strings.TrimSpace(string(line)))
-		}
-		if len(line) > 0 {
-			var req rpcRequest
-			if jsonErr := json.Unmarshal(line, &req); jsonErr == nil {
-				// notifications have no id and expect no response
-				if len(req.ID) == 0 && strings.HasPrefix(req.Method, "notifications/") {
-					// no-op
-				} else {
-					result, rerr := dispatch(req.Method, req.Params)
-					resp := rpcResponse{JSONRPC: "2.0", ID: req.ID}
-					if rerr != nil {
-						resp.Error = rerr
-					} else {
-						resp.Result = result
-					}
-					_ = enc.Encode(resp)
-					_ = writer.Flush()
-				}
+		chunk, e := r.ReadSlice('\n')
+		if len(chunk) > 0 {
+			if len(line)+len(chunk) <= maxMessageBytes {
+				line = append(line, chunk...)
+			} else {
+				truncated = true // keep draining to the newline, discard the overflow
 			}
 		}
-		if err == io.EOF {
-			break
+		if e == bufio.ErrBufferFull {
+			continue
 		}
-		if err != nil && err != io.EOF {
+		return line, truncated, e
+	}
+}
+
+func main() {
+	reader := bufio.NewReaderSize(os.Stdin, 64<<10)
+	writer := bufio.NewWriter(os.Stdout)
+	enc := json.NewEncoder(writer)
+	send := func(resp rpcResponse) {
+		_ = enc.Encode(resp)
+		_ = writer.Flush()
+	}
+	for {
+		raw, truncated, err := readBoundedLine(reader)
+		line := []byte(strings.TrimSpace(string(raw)))
+		if truncated {
+			// can't trust the (partial) body to parse an id; reply with a null-id error.
+			send(rpcResponse{JSONRPC: "2.0", Error: &rpcError{Code: -32600, Message: "request exceeds max message size"}})
+		} else if len(line) > 0 {
+			var req rpcRequest
+			if jsonErr := json.Unmarshal(line, &req); jsonErr != nil {
+				// malformed JSON → structured parse error rather than a silent drop.
+				send(rpcResponse{JSONRPC: "2.0", Error: &rpcError{Code: -32700, Message: "parse error"}})
+			} else if len(req.ID) == 0 && strings.HasPrefix(req.Method, "notifications/") {
+				// notifications have no id and expect no response
+			} else {
+				result, rerr := dispatch(req.Method, req.Params)
+				resp := rpcResponse{JSONRPC: "2.0", ID: req.ID}
+				if rerr != nil {
+					resp.Error = rerr
+				} else {
+					resp.Result = result
+				}
+				send(resp)
+			}
+		}
+		if err != nil { // io.EOF or a read error: stop
 			break
 		}
 	}

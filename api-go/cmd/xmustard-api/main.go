@@ -9,8 +9,10 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"xmustard/api-go/internal/workspaceops"
@@ -3874,12 +3876,39 @@ func main() {
 	} else {
 		log.Printf("auth: DISABLED (XMUSTARD_AUTH=off)")
 	}
-	addr := host + ":" + envDefault("XMUSTARD_API_PORT", "8080")
+	// Default to 8042 to match the MCP bridge's API target (XM-NEW-001) and
+	// AGENTS.md ("an HTTP shell on :8042"); override with XMUSTARD_API_PORT.
+	addr := host + ":" + envDefault("XMUSTARD_API_PORT", "8042")
+	srv := &http.Server{
+		Addr:    addr,
+		Handler: handler,
+		// Bound slow/oversized clients so a few connections can't pin goroutines/FDs
+		// (XM-NEW-019). Read/Write are generous because agent runs can be long, but
+		// header + idle timeouts defeat slowloris and leaked keep-alives.
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       120 * time.Second,
+		WriteTimeout:      300 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20,
+	}
+	// Graceful shutdown on SIGINT/SIGTERM so a restart doesn't orphan in-flight work.
+	go func() {
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+		<-sigCh
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+	}()
 	log.Printf("xmustard api-go listening on %s (tls=%v)", addr, hasTLS)
+	var serveErr error
 	if hasTLS {
-		log.Fatal(http.ListenAndServeTLS(addr, tlsCert, tlsKey, handler))
+		serveErr = srv.ListenAndServeTLS(tlsCert, tlsKey)
 	} else {
-		log.Fatal(http.ListenAndServe(addr, handler))
+		serveErr = srv.ListenAndServe()
+	}
+	if serveErr != nil && serveErr != http.ErrServerClosed {
+		log.Fatal(serveErr)
 	}
 }
 
