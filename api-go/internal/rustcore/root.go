@@ -1,13 +1,80 @@
 package rustcore
 
 import (
+	"bytes"
 	"context"
+	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 )
+
+const (
+	// coreCallTimeout bounds a single Go→Rust bridge call so a hung child can't wedge
+	// the HTTP/MCP handler indefinitely.
+	coreCallTimeout = 120 * time.Second
+	// maxCoreStdout caps the result buffer so a flooding child can't OOM the API
+	// (large but finite — a graph/search result beyond this is itself a problem).
+	maxCoreStdout = 64 << 20 // 64 MiB
+	maxCoreStderr = 64 << 10 // 64 KiB
+)
+
+// capWriter buffers up to `max` bytes (dropping the overflow but never blocking the
+// child, and flagging that it happened) so bridge output is bounded.
+type capWriter struct {
+	buf  bytes.Buffer
+	max  int
+	over bool
+}
+
+func (c *capWriter) Write(p []byte) (int, error) {
+	if room := c.max - c.buf.Len(); room < len(p) {
+		c.over = true
+		if room > 0 {
+			c.buf.Write(p[:room])
+		}
+		return len(p), nil // pretend full write so the child doesn't block on a full pipe
+	}
+	return c.buf.Write(p)
+}
+
+// runCoreContext is the single hardened bridge runner: binary-first resolution,
+// context timeout, bounded stdout/stderr, full server-side logging on failure, and a
+// SANITIZED error to the caller (no raw child stderr / host paths leaked). The rust
+// bin parses args positionally (args.next()), not via a flag parser, so a
+// `-`-leading query/path/seed is read literally — no `--` delimiter is required.
+func runCoreContext(sub string, args ...string) ([]byte, error) {
+	return runCoreCtx(context.Background(), sub, args...)
+}
+
+// runCoreCtx is runCoreContext honoring a caller context (whichever deadline — the
+// caller's or coreCallTimeout — fires first), for bridges that already thread a ctx.
+func runCoreCtx(parent context.Context, sub string, args ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(parent, coreCallTimeout)
+	defer cancel()
+	cmd := coreCommandContext(ctx, sub, args...)
+	out := &capWriter{max: maxCoreStdout}
+	errb := &capWriter{max: maxCoreStderr}
+	cmd.Stdout = out
+	cmd.Stderr = errb
+	runErr := cmd.Run()
+	if out.over {
+		log.Printf("rust-core %s: stdout exceeded %d bytes (dropped)", sub, maxCoreStdout)
+		return nil, fmt.Errorf("rust-core %s: output too large", sub)
+	}
+	if runErr != nil {
+		log.Printf("rust-core %s failed: %v: %s", sub, runErr, errb.buf.String())
+		if ctx.Err() == context.DeadlineExceeded {
+			return nil, fmt.Errorf("rust-core %s timed out", sub)
+		}
+		return nil, fmt.Errorf("rust-core %s failed", sub)
+	}
+	return out.buf.Bytes(), nil
+}
 
 func rustCoreDir() string {
 	_, currentFile, _, ok := runtime.Caller(0)

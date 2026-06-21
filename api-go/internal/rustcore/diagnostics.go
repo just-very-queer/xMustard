@@ -89,34 +89,12 @@ type DiagnosticSymbolLinkResult struct {
 }
 
 func NormalizeDiagnostics(ctx context.Context, workspaceID string, repoRoot string, inputJSONPath string, sourceKind string, sourceName string) (*DiagnosticsBatch, error) {
-	cmd := exec.CommandContext(
-		ctx,
-		"cargo",
-		"run",
-		"--quiet",
-		"--bin",
-		"xmustard-core",
-		"--",
-		"normalize-diagnostics",
-		workspaceID,
-		repoRoot,
-		inputJSONPath,
-		sourceKind,
-		sourceName,
-	)
-	cmd.Dir = rustCoreDir()
-
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("rust-core normalize-diagnostics failed: %w: %s", err, stderr.String())
+	stdout, err := runCoreCtx(ctx, "normalize-diagnostics", workspaceID, repoRoot, inputJSONPath, sourceKind, sourceName)
+	if err != nil {
+		return nil, err
 	}
-
 	var result DiagnosticsBatch
-	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+	if err := json.Unmarshal(stdout, &result); err != nil {
 		return nil, fmt.Errorf("decode rust-core diagnostics: %w", err)
 	}
 	return &result, nil

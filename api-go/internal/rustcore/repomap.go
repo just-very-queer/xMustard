@@ -140,31 +140,12 @@ type CodeExplainerResult struct {
 }
 
 func BuildRepoMap(ctx context.Context, workspaceID string, repoRoot string) (*RepoMapSummary, error) {
-	cmd := exec.CommandContext(
-		ctx,
-		"cargo",
-		"run",
-		"--quiet",
-		"--bin",
-		"xmustard-core",
-		"--",
-		"build-repo-map",
-		workspaceID,
-		repoRoot,
-	)
-	cmd.Dir = rustCoreDir()
-
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("rust-core build-repo-map failed: %w: %s", err, stderr.String())
+	stdout, err := runCoreCtx(ctx, "build-repo-map", workspaceID, repoRoot)
+	if err != nil {
+		return nil, err
 	}
-
 	var summary RepoMapSummary
-	if err := json.Unmarshal(stdout.Bytes(), &summary); err != nil {
+	if err := json.Unmarshal(stdout, &summary); err != nil {
 		return nil, fmt.Errorf("decode rust-core repo-map: %w", err)
 	}
 	return &summary, nil

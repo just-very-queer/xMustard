@@ -1,19 +1,9 @@
 package rustcore
 
-import (
-	"bytes"
-	"fmt"
-)
-
+// runCore routes through the shared hardened bridge runner (timeout, bounded
+// output, sanitized errors, server-side logs — see runCoreContext).
 func runCore(sub string, args ...string) ([]byte, error) {
-	cmd := coreCommand(sub, args...)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("rust-core %s %v: %w: %s", sub, args, err, stderr.String())
-	}
-	return stdout.Bytes(), nil
+	return runCoreContext(sub, args...)
 }
 
 // RunSearch runs hybrid repo search; RunWiki generates the repo wiki.
