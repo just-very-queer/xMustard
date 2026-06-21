@@ -804,10 +804,10 @@ export function openTerminal(workspaceId: string) {
   })
 }
 
-export function writeTerminal(terminalId: string, data: string) {
+export function writeTerminal(terminalId: string, workspaceId: string, data: string) {
   return request<{ ok: boolean }>(`/api/terminal/${terminalId}/write`, {
     method: 'POST',
-    body: JSON.stringify({ data }),
+    body: JSON.stringify({ workspace_id: workspaceId, data }),
   })
 }
 
@@ -817,10 +817,13 @@ export function readTerminal(terminalId: string, workspaceId: string, offset: nu
   )
 }
 
-export function closeTerminal(terminalId: string) {
-  return request<{ ok: boolean }>(`/api/terminal/${terminalId}`, {
-    method: 'DELETE',
-  })
+export function closeTerminal(terminalId: string, workspaceId: string) {
+  return request<{ ok: boolean }>(
+    `/api/terminal/${terminalId}?workspace_id=${encodeURIComponent(workspaceId)}`,
+    {
+      method: 'DELETE',
+    },
+  )
 }
 
 export function listGoals(workspaceId: string) {

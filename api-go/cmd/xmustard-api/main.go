@@ -3766,7 +3766,7 @@ func main() {
 			})
 			return
 		}
-		if err := workspaceops.WriteTerminal(terminalID, request.Data); err != nil {
+		if err := workspaceops.WriteTerminal(request.WorkspaceID, terminalID, request.Data); err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				writeJSON(w, http.StatusNotFound, map[string]any{
 					"error": "Terminal not found",
@@ -3789,7 +3789,7 @@ func main() {
 			})
 			return
 		}
-		if err := workspaceops.ResizeTerminal(terminalID, request.Cols, request.Rows); err != nil {
+		if err := workspaceops.ResizeTerminal(request.WorkspaceID, terminalID, request.Cols, request.Rows); err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				writeJSON(w, http.StatusNotFound, map[string]any{
 					"error": "Terminal not found",
@@ -3823,7 +3823,8 @@ func main() {
 	})
 	mux.HandleFunc("DELETE /api/terminal/{terminal_id}", func(w http.ResponseWriter, r *http.Request) {
 		terminalID := r.PathValue("terminal_id")
-		if err := workspaceops.CloseTerminal(terminalID); err != nil {
+		workspaceID := strings.TrimSpace(r.URL.Query().Get("workspace_id"))
+		if err := workspaceops.CloseTerminal(workspaceID, terminalID); err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				writeJSON(w, http.StatusNotFound, map[string]any{
 					"error": "Terminal not found",

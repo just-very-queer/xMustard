@@ -18,12 +18,14 @@ type TerminalOpenRequest struct {
 }
 
 type TerminalWriteRequest struct {
-	Data string `json:"data"`
+	WorkspaceID string `json:"workspace_id"`
+	Data        string `json:"data"`
 }
 
 type TerminalResizeRequest struct {
-	Cols int `json:"cols"`
-	Rows int `json:"rows"`
+	WorkspaceID string `json:"workspace_id"`
+	Cols        int    `json:"cols"`
+	Rows        int    `json:"rows"`
 }
 
 type TerminalSessionRecord struct {
@@ -128,8 +130,8 @@ func OpenTerminal(dataDir string, request TerminalOpenRequest) (*TerminalSession
 	}, nil
 }
 
-func WriteTerminal(terminalID string, data string) error {
-	session, err := requireTerminalSession(terminalID)
+func WriteTerminal(workspaceID, terminalID string, data string) error {
+	session, err := requireTerminalSession(workspaceID, terminalID)
 	if err != nil {
 		return err
 	}
@@ -137,16 +139,16 @@ func WriteTerminal(terminalID string, data string) error {
 	return err
 }
 
-func ResizeTerminal(terminalID string, cols int, rows int) error {
-	session, err := requireTerminalSession(terminalID)
+func ResizeTerminal(workspaceID, terminalID string, cols int, rows int) error {
+	session, err := requireTerminalSession(workspaceID, terminalID)
 	if err != nil {
 		return err
 	}
 	return resizeTerminalPTY(session.pty, cols, rows)
 }
 
-func CloseTerminal(terminalID string) error {
-	session, err := requireTerminalSession(terminalID)
+func CloseTerminal(workspaceID, terminalID string) error {
+	session, err := requireTerminalSession(workspaceID, terminalID)
 	if err != nil {
 		return err
 	}
@@ -164,7 +166,10 @@ func ReadTerminal(dataDir string, workspaceID string, terminalID string, offset 
 	logPath := filepath.Join(dataDir, "workspaces", workspaceID, "terminals", terminalID+".log")
 	eof := true
 	if sessionValue, ok := terminalSessions.Load(terminalID); ok {
-		if session, ok := sessionValue.(*terminalSession); ok {
+		// only adopt the live session's log path when it belongs to the requesting
+		// workspace — otherwise a caller could read another workspace's terminal
+		// output by guessing its id (XM-NEW-013).
+		if session, ok := sessionValue.(*terminalSession); ok && session.workspaceID == workspaceID {
 			logPath = session.logPath
 			eof = session.isClosed()
 		}
@@ -203,13 +208,18 @@ func ReadTerminal(dataDir string, workspaceID string, terminalID string, offset 
 	}, nil
 }
 
-func requireTerminalSession(terminalID string) (*terminalSession, error) {
+func requireTerminalSession(workspaceID, terminalID string) (*terminalSession, error) {
 	value, ok := terminalSessions.Load(terminalID)
 	if !ok {
 		return nil, os.ErrNotExist
 	}
 	session, ok := value.(*terminalSession)
 	if !ok {
+		return nil, os.ErrNotExist
+	}
+	// Ownership: a session may only be addressed by its owning workspace, so one
+	// agent cannot read/write/resize/close another workspace's shell (XM-NEW-013).
+	if session.workspaceID != workspaceID {
 		return nil, os.ErrNotExist
 	}
 	return session, nil

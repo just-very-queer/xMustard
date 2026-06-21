@@ -2218,7 +2218,7 @@ function App() {
   async function handleSendTerminal() {
     if (!terminalId) return
     try {
-      await writeTerminal(terminalId, `${terminalInput}\n`)
+      await writeTerminal(terminalId, workspaceId ?? '', `${terminalInput}\n`)
       setTerminalInput('')
     } catch (nextError) {
       setError(nextError instanceof Error ? nextError.message : String(nextError))
@@ -2228,7 +2228,7 @@ function App() {
   async function handleCloseTerminal() {
     if (!terminalId) return
     try {
-      await closeTerminal(terminalId)
+      await closeTerminal(terminalId, workspaceId ?? '')
       setTerminalId(null)
     } catch (nextError) {
       setError(nextError instanceof Error ? nextError.message : String(nextError))
