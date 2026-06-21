@@ -1114,6 +1114,12 @@ func normalizeWorkspaceFile(rootPath string, relativePath string) (string, error
 	if err != nil || strings.HasPrefix(rel, "..") || filepath.IsAbs(rel) {
 		return "", fmt.Errorf("path escapes workspace root")
 	}
+	// The lexical check above is insufficient: a symlink *inside* the repo can point
+	// outside it, and the os.Stat below follows symlinks. Re-verify containment after
+	// symlink resolution so file explain/symbols/LSP can't read host files (XM-NEW-023).
+	if _, err := resolveWorkspacePath(rootPath, normalized); err != nil {
+		return "", fmt.Errorf("path escapes workspace root")
+	}
 	info, err := os.Stat(target)
 	if err != nil {
 		return "", err
