@@ -8,7 +8,7 @@ xMustard is a **tiny MCP server for governed runtime memory** — its only job i
 
 ## 2. DONE — Major Capabilities Built & Verified
 
-### Governed Memory (the moat — all on the 8-tool MCP surface)
+### Governed Memory (the moat — all on the 9-tool MCP surface)
 - **`remember` / `verify` / `recall`** — propose→pending→multi-agent-verified→promoted pipeline (`context_governance.go`). Verified live: 2-distinct-agent promotion, duplicate-vote rejection, readonly enforcement.
 - **Drift-on-recall** — at recall time, each memory's referenced-path hashes are re-checked against the live tree; `stale_count` / `stale_paths` / `stale_memory` flags emitted. Never serves silently-stale memory.
 - **Memory conflict surfacing** — `recall` emits `conflicts` (files ≥2 active memories claim) so agents reconcile before trusting.
@@ -34,10 +34,10 @@ xMustard is a **tiny MCP server for governed runtime memory** — its only job i
 - Stale-index + sibling-clone drift detection in `/changes/drift` and session-grounding.
 
 ### MCP Server (the delivery surface)
-- `api-go/cmd/xmustard-mcp` — stdio JSON-RPC 2.0, exactly 8 tools, tested (`main_test.go` asserts the 8-tool set and validates required-param enforcement). Bridges to the Go HTTP API.
+- `api-go/cmd/xmustard-mcp` — stdio JSON-RPC 2.0, exactly 9 tools, tested (`main_test.go` asserts the 9-tool set and validates required-param enforcement). Bridges to the Go HTTP API.
 - Verified-context injected into agent run prompts (`applyActiveContextToPrompt` on `StartIssueRun` + `StartAgentQuery`).
 
-### Providers & Routing (HTTP-only, NOT on the 8-tool MCP surface)
+### Providers & Routing (HTTP-only, NOT on the 9-tool MCP surface)
 - OpenAI-compatible provider layer (`openai_providers.go`): Ollama/vLLM/LM Studio/OpenAI + vision VLM. Secrets never stored (env-var name only). SSRF guard, redirect-follow blocked. Verified live against Ollama.
 - Task-typed model routing (`provider_router.go`): 6-type taxonomy (locate/code_edit_patch/multi_step_debug_reason/repo_qa_explain/test_gen_validate/vision_ui_diagnose) → provider+model. Verified live.
 - `/api/providers*`, `/api/route*` — HTTP-only; no MCP tool for these (correctly not on the agent surface per RETHINK).
@@ -45,7 +45,7 @@ xMustard is a **tiny MCP server for governed runtime memory** — its only job i
 ### Storage & Persistence
 - Postgres store: semantic index (`xm_files`/`xm_symbols`/`xm_edges`) + ops layer (`xm_runs`/`xm_activity`/`xm_issues`) materialized and queryable.
 - JSON remains the durable write source; PG is the queryable index.
-- Full operational memory layer (issues, runs, plans, verification profiles, eval timelines, threat models, vuln records, browser dumps) built and persisted — but these are HTTP/CLI-only, not on the 8-tool MCP surface (correctly).
+- Full operational memory layer (issues, runs, plans, verification profiles, eval timelines, threat models, vuln records, browser dumps) built and persisted — but these are HTTP/CLI-only, not on the 9-tool MCP surface (correctly).
 
 ### Auth (HTTP-only; feeds MCP gate identity)
 - Bearer-token auth with role-based access (admin/agent/readonly). Non-loopback bind requires TLS or explicit override. Auth events flow into the multi-agent verification gate.
@@ -113,3 +113,48 @@ than a closed checklist.
 **Future depth (no longer a closed checklist):** richer flow analysis (LSP-resolved
 flow edges, reads vs writes precision), scale hardening (a shared PG pool replacing
 per-call connects), and more provider/routing integrations.
+
+---
+
+## 6. Production hardening pass (2026-06-21) — concurrency, lifecycle, confinement
+
+A safety-under-sustained-concurrent-agent-load pass, driven by an external audit
+(`goal/xmustard_fix_queue.md`, `goal/xmustard_new_findings.jsonl`). Each item was
+verified against the code before patching; all are tested + committed.
+
+**Fixed (P0/P1):**
+- **State integrity:** path-keyed per-store transaction locks (`storelock.go`) around
+  the full load→mutate→save of governed memory, feedback, and audit stores —
+  concurrent votes/promotions/appends no longer lose updates (was only fixed for the
+  token store). `-race` concurrency tests.
+- **Path confinement (host-file safety):** one resolver (`safepath.go`) rejects
+  absolute/`..`/symlink escape + caps size; wired into governed-memory hashing,
+  provider `image_path` egress (confined to `<dataDir>/uploads`), terminal log ids,
+  and `normalizeWorkspaceFile` (symlink-safe).
+- **Process/FD lifecycle:** autonomous idle reaper for Go LSP sessions (was the
+  invisible RSS budget-killer — abandoned sessions leaked the child language server +
+  goroutine + FDs); run-cancel no longer signals a possibly-reused persisted PID
+  (terminal-state guard + PID-clear); retry only from terminal states.
+- **Terminal isolation:** sessions keyed/authorized by owning workspace — no
+  cross-workspace read/write/resize/close.
+- **MCP/HTTP edges:** bounded MCP stdio reader (a newline-less message no longer OOMs)
+  + structured `-32700/-32600` errors; API `http.Server` with read/write/idle
+  timeouts + graceful shutdown; unified default port to **8042** (matches the MCP
+  bridge + AGENTS.md).
+- **Bridge/deploy:** every Go→Rust call routes through the binary-first resolver
+  (no hard-coded `cargo run`) so a binary-only/no-Docker install works; goal bridge
+  gained a timeout + bounded error echo.
+- **Rust cache atomicity:** cache writes are temp-file + fsync + atomic rename, so a
+  concurrent `xmustard-core` never reads a torn cache.
+- **Bounded logs:** per-workspace audit log capped (newest 5000), like the auth-audit log.
+
+**Known still-open (P1, not yet done — honest):** a shared `pgxpool` (PG ops still
+connect-per-op); revisioned/ordered PG mirror (async mirrors can commit run states
+out of order); drift-baseline sentinels for missing/edited memory paths
+(XM-NEW-003/004); degraded-mode honesty for non-git / >800-file repos
+(XM-NEW-009/010 — search can silently return an empty/truncated graph); per-workspace
+ACLs / per-worker token scoping (XM-NEW-022); Rust verification pipe-drain
+(XM-NEW-015). The symbol graph the agent path uses is the **lexical** graph; the
+LSP-resolved upgrade exists but is not wired into `search` (a CLI-only `build-lsp`).
+The "20× warm index" figure has no committed benchmark artifact; treat it as
+indicative, not measured.

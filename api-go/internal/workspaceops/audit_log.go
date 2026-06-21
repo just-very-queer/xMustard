@@ -61,8 +61,16 @@ func recordAuditEventNoGuard(dataDir, workspaceID string, event AuditEvent) erro
 	event.CreatedAt = now
 	event.EventID = "audit_" + compactTimestamp(now) + "_" + padCount(len(events)+1)
 	events = append(events, event)
+	// Bound the log so a long-lived workspace's whole-file-rewrite append path can't
+	// grow without limit (O(n^2) I/O + unbounded disk). Keep the newest auditLogMax.
+	if len(events) > auditLogMax {
+		events = events[len(events)-auditLogMax:]
+	}
 	return writeJSON(auditLogPath(dataDir, workspaceID), events)
 }
+
+// auditLogMax bounds the per-workspace governance audit log (newest-kept).
+const auditLogMax = 5000
 
 func padCount(n int) string {
 	s := itoa(n)
