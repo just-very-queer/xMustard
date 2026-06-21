@@ -36,6 +36,25 @@ fn is_source(path: &str) -> bool {
 }
 
 fn tracked_source_files(root: &Path) -> Vec<String> {
+    tracked_source_files_with_coverage(root).0
+}
+
+/// Index coverage so consumers can tell a complete answer from a degraded one: a
+/// repo with no git / a failed git command yields zero files, and a large repo is
+/// truncated at MAX_FILES — both previously silent, so an agent treated an empty or
+/// partial graph as authoritative (XM-NEW-009/010).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct IndexCoverage {
+    pub repo_mode: String, // "git" | "git-unavailable"
+    pub eligible_files: usize,
+    pub indexed_files: usize,
+    pub truncated: bool,
+    pub max_files: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub degraded_reason: Option<String>,
+}
+
+fn tracked_source_files_with_coverage(root: &Path) -> (Vec<String>, IndexCoverage) {
     let out = Command::new("git")
         .arg("-C")
         .arg(root)
@@ -43,13 +62,43 @@ fn tracked_source_files(root: &Path) -> Vec<String> {
         .output();
     let text = match out {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
-        _ => return Vec::new(),
+        _ => {
+            return (
+                Vec::new(),
+                IndexCoverage {
+                    repo_mode: "git-unavailable".into(),
+                    max_files: MAX_FILES,
+                    degraded_reason: Some(
+                        "git ls-files failed (no .git / git missing / unsafe directory); the symbol graph is EMPTY, not authoritative".into(),
+                    ),
+                    ..Default::default()
+                },
+            );
+        }
     };
-    text.lines()
+    let all: Vec<String> = text
+        .lines()
         .filter(|l| is_source(l))
-        .take(MAX_FILES)
         .map(|l| l.to_string())
-        .collect()
+        .collect();
+    let eligible = all.len();
+    let indexed: Vec<String> = all.into_iter().take(MAX_FILES).collect();
+    let truncated = eligible > indexed.len();
+    let cov = IndexCoverage {
+        repo_mode: "git".into(),
+        eligible_files: eligible,
+        indexed_files: indexed.len(),
+        truncated,
+        max_files: MAX_FILES,
+        degraded_reason: truncated.then(|| {
+            format!(
+                "indexed first {} of {} source files; results beyond the cap are incomplete",
+                indexed.len(),
+                eligible
+            )
+        }),
+    };
+    (indexed, cov)
 }
 
 fn word_set(content: &str) -> HashSet<String> {
@@ -363,6 +412,10 @@ pub struct SymbolGraph {
     pub flow_edges: Vec<GraphEdge>,
     #[serde(default)]
     pub flow_edge_count: usize,
+    /// Index coverage (git mode, eligible vs indexed file counts, truncation) so a
+    /// consumer can distinguish complete evidence from a degraded/empty/truncated graph.
+    #[serde(default)]
+    pub coverage: IndexCoverage,
     pub generated_at: String,
 }
 
@@ -639,7 +692,7 @@ pub fn build_symbol_graph_cached(root: &Path, workspace_id: &str) -> SymbolGraph
 
 /// Build the symbol graph over tracked source files.
 pub fn build_symbol_graph(root: &Path, workspace_id: &str) -> SymbolGraph {
-    let files = tracked_source_files(root);
+    let (files, coverage) = tracked_source_files_with_coverage(root);
     let tracked: HashSet<String> = files.iter().cloned().collect();
     let mut file_nodes = Vec::new();
     let mut symbols = Vec::new();
@@ -851,6 +904,7 @@ pub fn build_symbol_graph(root: &Path, workspace_id: &str) -> SymbolGraph {
         edges,
         flow_edge_count: flow_edges.len(),
         flow_edges,
+        coverage,
         generated_at: now(),
     }
 }
@@ -1313,6 +1367,26 @@ mod tests {
             "tests edge: {:?}",
             graph.edges
         );
+    }
+
+    #[test]
+    fn index_coverage_reports_degraded_and_git_modes() {
+        // a non-git directory yields an explicit degraded/empty coverage, not a
+        // silent empty graph.
+        let plain = TempDir::new().unwrap();
+        std::fs::write(plain.path().join("a.rs"), "pub fn x() {}\n").unwrap();
+        let (files, cov) = tracked_source_files_with_coverage(plain.path());
+        assert!(files.is_empty());
+        assert_eq!(cov.repo_mode, "git-unavailable");
+        assert!(cov.degraded_reason.is_some());
+
+        // a git repo reports git mode with eligible/indexed counts and no truncation.
+        let repo = git_repo(&[("a.rs", "pub fn x() {}\n"), ("b.rs", "pub fn y() {}\n")]);
+        let graph = build_symbol_graph(repo.path(), "ws");
+        assert_eq!(graph.coverage.repo_mode, "git");
+        assert_eq!(graph.coverage.eligible_files, 2);
+        assert_eq!(graph.coverage.indexed_files, 2);
+        assert!(!graph.coverage.truncated);
     }
 
     #[test]

@@ -76,11 +76,12 @@ type searchHit struct {
 }
 
 type searchResult struct {
-	WorkspaceID string      `json:"workspace_id"`
-	Query       string      `json:"query"`
-	Total       int         `json:"total"`
-	Hits        []searchHit `json:"hits"`
-	GeneratedAt string      `json:"generated_at"`
+	WorkspaceID string          `json:"workspace_id"`
+	Query       string          `json:"query"`
+	Total       int             `json:"total"`
+	Hits        []searchHit     `json:"hits"`
+	Coverage    json.RawMessage `json:"coverage,omitempty"` // pass index coverage through to the agent
+	GeneratedAt string          `json:"generated_at"`
 }
 
 // WorkspaceSearchReranked runs the live hybrid search, then fuses a NEURAL lane:

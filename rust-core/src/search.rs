@@ -113,6 +113,10 @@ pub struct SearchResult {
     pub query: String,
     pub total: usize,
     pub hits: Vec<SearchHit>,
+    /// Index coverage: lets an agent tell complete results from a degraded/empty/
+    /// truncated graph (no-git, >MAX_FILES) instead of trusting a partial answer.
+    #[serde(default)]
+    pub coverage: symbolgraph::IndexCoverage,
     pub generated_at: String,
 }
 
@@ -149,6 +153,7 @@ pub fn hybrid_search(
             query: query.to_string(),
             total: 0,
             hits: Vec::new(),
+            coverage: graph.coverage.clone(),
             generated_at: now(),
         };
     }
@@ -364,6 +369,7 @@ pub fn hybrid_search(
         query: query.to_string(),
         total,
         hits,
+        coverage: graph.coverage.clone(),
         generated_at: now(),
     }
 }
