@@ -9,8 +9,6 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/jackc/pgx/v5"
-
 	"xmustard/api-go/internal/rustcore"
 )
 
@@ -107,11 +105,10 @@ func MaterializePostgresIndex(dataDir, workspaceID string) (map[string]any, erro
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	conn, err := pgx.Connect(ctx, pgDSN())
+	conn, err := pgPool(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("postgres connect (%s): %w", pgDSN(), err)
+		return nil, fmt.Errorf("postgres pool: %w", err)
 	}
-	defer conn.Close(ctx)
 
 	if _, err := conn.Exec(ctx, pgIndexSchema); err != nil {
 		return nil, fmt.Errorf("ensure schema: %w", err)
@@ -183,11 +180,10 @@ func SearchPostgres(dataDir, workspaceID, query string, limit int) (map[string]a
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	conn, err := pgx.Connect(ctx, pgDSN())
+	conn, err := pgPool(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("postgres connect (%s): %w", pgDSN(), err)
+		return nil, fmt.Errorf("postgres pool: %w", err)
 	}
-	defer conn.Close(ctx)
 
 	// RRF (k=60): rank the FTS matches by ts_rank (lexical lane) and by inbound
 	// edge count (structural lane), then fuse by reciprocal rank.

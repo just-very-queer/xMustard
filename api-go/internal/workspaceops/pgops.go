@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"strings"
 	"time"
-
-	"github.com/jackc/pgx/v5"
 )
 
 // Operational memory in Postgres. The semantic index (xm_files/xm_symbols/
@@ -82,11 +80,10 @@ func MaterializeOpsPostgres(dataDir, workspaceID string) (map[string]any, error)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	conn, err := pgx.Connect(ctx, pgDSN())
+	conn, err := pgPool(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("postgres connect (%s): %w", pgDSN(), err)
+		return nil, fmt.Errorf("postgres pool: %w", err)
 	}
-	defer conn.Close(ctx)
 
 	if _, err := conn.Exec(ctx, opsSchemaSQL); err != nil {
 		return nil, fmt.Errorf("ops schema: %w", err)
@@ -168,11 +165,10 @@ func ListRunsPostgres(workspaceID, status string, limit int) (map[string]any, er
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	conn, err := pgx.Connect(ctx, pgDSN())
+	conn, err := pgPool(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("postgres connect (%s): %w", pgDSN(), err)
+		return nil, fmt.Errorf("postgres pool: %w", err)
 	}
-	defer conn.Close(ctx)
 
 	query := `select run_id,issue_id,runtime,model,status,title,created_at from xm_runs where workspace_id = $1`
 	args := []any{workspaceID}
@@ -223,11 +219,10 @@ func SearchIssuesPostgres(workspaceID, query string, limit int) (map[string]any,
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	conn, err := pgx.Connect(ctx, pgDSN())
+	conn, err := pgPool(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("postgres connect (%s): %w", pgDSN(), err)
+		return nil, fmt.Errorf("postgres pool: %w", err)
 	}
-	defer conn.Close(ctx)
 
 	rows, err := conn.Query(ctx, `
 		select bug_id, title, severity, status,

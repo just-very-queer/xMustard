@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"strings"
 	"time"
-
-	"github.com/jackc/pgx/v5"
 )
 
 const opsVerifySchemaSQL = `
@@ -57,11 +55,10 @@ func MaterializeVerificationsPostgres(dataDir, workspaceID string) (map[string]a
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	conn, err := pgx.Connect(ctx, pgDSN())
+	conn, err := pgPool(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("postgres connect (%s): %w", pgDSN(), err)
+		return nil, fmt.Errorf("postgres pool: %w", err)
 	}
-	defer conn.Close(ctx)
 
 	if _, err := conn.Exec(ctx, opsVerifySchemaSQL); err != nil {
 		return nil, fmt.Errorf("verification schema: %w", err)
@@ -117,11 +114,10 @@ func ListVerificationsPostgres(workspaceID, status string, limit int) (map[strin
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	conn, err := pgx.Connect(ctx, pgDSN())
+	conn, err := pgPool(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("postgres connect (%s): %w", pgDSN(), err)
+		return nil, fmt.Errorf("postgres pool: %w", err)
 	}
-	defer conn.Close(ctx)
 
 	query := "select target_id,target_name,status,outcome,run_id,observed_at from xm_verifications where workspace_id = $1"
 	args := []any{workspaceID}

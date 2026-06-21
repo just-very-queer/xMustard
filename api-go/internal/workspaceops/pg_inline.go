@@ -10,7 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // Inline Postgres write path (C1). The ops layer's durable source of truth is JSON
@@ -99,11 +99,11 @@ create index if not exists xm_run_plans_run_idx on xm_run_plans (workspace_id, r
 // ensureInlineSchema runs the DDL once per process (idempotent CREATE … IF NOT
 // EXISTS). Skipped once it has succeeded, so it isn't paid on every mutation; a
 // failure leaves the flag unset so a later mirror retries.
-func ensureInlineSchema(ctx context.Context, conn *pgx.Conn) error {
+func ensureInlineSchema(ctx context.Context, pool *pgxpool.Pool) error {
 	if pgSchemaReady.Load() {
 		return nil
 	}
-	if _, err := conn.Exec(ctx, opsSchemaSQL+pgRunPlansSchema); err != nil {
+	if _, err := pool.Exec(ctx, opsSchemaSQL+pgRunPlansSchema); err != nil {
 		return err
 	}
 	pgSchemaReady.Store(true)
@@ -119,17 +119,16 @@ func pgInlineUpsertRun(run runRecord) {
 func pgInlineUpsertRunSync(run runRecord) {
 	ctx, cancel := context.WithTimeout(context.Background(), pgInlineMaxDur)
 	defer cancel()
-	conn, err := pgx.Connect(ctx, pgDSN())
+	pool, err := pgPool(ctx)
 	if err != nil {
-		log.Printf("pg inline: connect failed (run mirror skipped, JSON unaffected): %v", err)
+		log.Printf("pg inline: pool unavailable (run mirror skipped, JSON unaffected): %v", err)
 		return
 	}
-	defer conn.Close(ctx)
-	if err := ensureInlineSchema(ctx, conn); err != nil {
+	if err := ensureInlineSchema(ctx, pool); err != nil {
 		log.Printf("pg inline: run schema failed (mirror skipped): %v", err)
 		return
 	}
-	tx, err := conn.Begin(ctx)
+	tx, err := pool.Begin(ctx)
 	if err != nil {
 		log.Printf("pg inline: begin failed (mirror skipped): %v", err)
 		return
@@ -194,13 +193,12 @@ func ListRunPlansPostgres(workspaceID string, limit int) (map[string]any, error)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	conn, err := pgx.Connect(ctx, pgDSN())
+	pool, err := pgPool(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("postgres connect (%s): %w", pgDSN(), err)
+		return nil, fmt.Errorf("postgres pool: %w", err)
 	}
-	defer conn.Close(ctx)
 
-	rows, err := conn.Query(ctx, `
+	rows, err := pool.Query(ctx, `
 		select plan_id, run_id, coalesce(phase,''), coalesce(summary,''), coalesce(step_count,0),
 		       coalesce(created_at,''), coalesce(approved_at,'')
 		from xm_run_plans where workspace_id = $1

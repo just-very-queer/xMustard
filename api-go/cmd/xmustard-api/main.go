@@ -3900,6 +3900,7 @@ func main() {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(ctx)
+		workspaceops.ClosePgPool()
 	}()
 	log.Printf("xmustard api-go listening on %s (tls=%v)", addr, hasTLS)
 	var serveErr error
