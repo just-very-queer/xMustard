@@ -510,9 +510,11 @@ func RecallContext(dataDir, workspaceID, query string, paths []string, limit int
 		limit = 8
 	}
 	root := contextRoot(dataDir, workspaceID)
-	for i := range promoted {
-		computeStaleness(root, &promoted[i])
-	}
+	// NOTE: drift-check is deferred to a bounded candidate window AFTER ranking (see
+	// below). Re-hashing every promoted entry here was O(history) per recall — a
+	// `recall limit=1` over thousands of memories did thousands of file reads
+	// (XM-POST-011). Ranking uses only cheap metadata; only the entries that may be
+	// returned are hashed.
 
 	// path signal: explicit query paths, else the files currently being worked on.
 	focusPaths := cleanPaths(paths)
@@ -561,9 +563,8 @@ func RecallContext(dataDir, workspaceID, query string, paths []string, limit int
 		if e.UpdatedAt == newest && newest != "" {
 			boost += 0.5
 		}
-		if e.Stale {
-			boost -= 1.0
-		}
+		// NB: no stale penalty here — staleness is unknown until the bounded drift
+		// check below; the penalty is applied to the candidate window only.
 		score := boost
 		if hasSignal {
 			// gate on relevance: irrelevant memory is dropped below.
@@ -575,18 +576,41 @@ func RecallContext(dataDir, workspaceID, query string, paths []string, limit int
 		}
 		ranked = append(ranked, scored{e, score})
 	}
-	sort.SliceStable(ranked, func(a, b int) bool {
-		if ranked[a].score != ranked[b].score {
-			return ranked[a].score > ranked[b].score
-		}
-		return ranked[a].entry.UpdatedAt > ranked[b].entry.UpdatedAt
-	})
-	out := make([]ContextEntry, 0, limit)
-	staleCount := 0
+	byScore := func(s []scored) {
+		sort.SliceStable(s, func(a, b int) bool {
+			if s[a].score != s[b].score {
+				return s[a].score > s[b].score
+			}
+			return s[a].entry.UpdatedAt > s[b].entry.UpdatedAt
+		})
+	}
+	byScore(ranked)
+
+	// Drop relevance-gated entries, then take a BOUNDED candidate window — only these
+	// are drift-checked, so recall I/O is O(window), not O(history). The window is a
+	// few × limit so the stale penalty can still re-order without missing a result.
+	candidates := make([]scored, 0, len(ranked))
 	for _, s := range ranked {
 		if hasSignal && s.score < 0 {
 			continue
 		}
+		candidates = append(candidates, s)
+		if len(candidates) >= recallCandidateWindow(limit) {
+			break
+		}
+	}
+	// drift-check ONLY the candidate window; apply the stale penalty, then re-rank.
+	for i := range candidates {
+		computeStaleness(root, &candidates[i].entry)
+		if candidates[i].entry.Stale {
+			candidates[i].score -= 1.0
+		}
+	}
+	byScore(candidates)
+
+	out := make([]ContextEntry, 0, limit)
+	staleCount := 0
+	for _, s := range candidates {
 		if s.entry.Stale {
 			staleCount++
 		}
@@ -596,16 +620,30 @@ func RecallContext(dataDir, workspaceID, query string, paths []string, limit int
 		}
 	}
 	return map[string]any{
-		"workspace_id": workspaceID,
-		"query":        query,
-		"ranked":       hasSignal,
-		"total_active": len(promoted),
-		"returned":     len(out),
-		"stale_count":  staleCount,
-		"conflicts":    overlappingMemory(out),
-		"entries":      out,
-		"generated_at": nowUTC(),
+		"workspace_id":  workspaceID,
+		"query":         query,
+		"ranked":        hasSignal,
+		"total_active":  len(promoted),
+		"returned":      len(out),
+		"stale_count":   staleCount,
+		"drift_checked": len(candidates), // every returned entry is in this set (checked)
+		"conflicts":     overlappingMemory(out),
+		"entries":       out,
+		"generated_at":  nowUTC(),
 	}, nil
+}
+
+// recallCandidateWindow bounds how many top-ranked entries get drift-checked on a
+// recall, so the check is O(window) not O(history). A few × limit gives the stale
+// penalty room to re-order without dropping a result it would have returned.
+const recallCandidateFloor = 16
+
+func recallCandidateWindow(limit int) int {
+	w := limit * 4
+	if w < recallCandidateFloor {
+		w = recallCandidateFloor
+	}
+	return w
 }
 
 // memoryTokens lowercases and splits text into a set of word tokens for matching.
