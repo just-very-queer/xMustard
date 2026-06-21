@@ -6,6 +6,7 @@
 //! ignored by git), or a temp dir when there is no `.git`.
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::UNIX_EPOCH;
@@ -14,8 +15,39 @@ use sha2::{Digest, Sha256};
 
 use crate::symbolgraph::SymbolGraph;
 
+/// Atomically replace `path` with `bytes`: write to a per-process temp file in the
+/// same directory, fsync it, then rename over the target. Rename is atomic on POSIX
+/// same-filesystem, so a concurrent `xmustard-core` process reading the cache never
+/// observes a torn/partial file (it sees either the old or the new bytes). A failed
+/// or interrupted write leaves the old file intact rather than a truncated one.
+fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let base = path.file_name().and_then(|s| s.to_str()).unwrap_or("cache");
+    let tmp = dir.join(format!(".{base}.tmp.{}", std::process::id()));
+    let write_result = (|| -> std::io::Result<()> {
+        let mut f = fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        Ok(())
+    })();
+    if let Err(e) = write_result {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    if let Err(e) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
+}
+
 fn git(root: &Path, args: &[&str]) -> Option<String> {
-    let out = Command::new("git").arg("-C").arg(root).args(args).output().ok()?;
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .ok()?;
     if !out.status.success() {
         return None;
     }
@@ -65,7 +97,10 @@ fn cache_dir(root: &Path) -> PathBuf {
     if git_dir.is_dir() {
         return git_dir.join("xmustard-cache");
     }
-    std::env::temp_dir().join(format!("xmustard-index-{}", sha_hex(&root.display().to_string())))
+    std::env::temp_dir().join(format!(
+        "xmustard-index-{}",
+        sha_hex(&root.display().to_string())
+    ))
 }
 
 fn graph_cache_file(root: &Path, workspace_id: &str, key: &str) -> PathBuf {
@@ -95,7 +130,7 @@ pub fn load_symbol_cache_bytes(root: &Path, workspace_id: &str) -> Option<Vec<u8
 pub fn store_symbol_cache_bytes(root: &Path, workspace_id: &str, bytes: &[u8]) {
     let dir = cache_dir(root);
     if fs::create_dir_all(&dir).is_ok() {
-        let _ = fs::write(symbol_cache_path(root, workspace_id), bytes);
+        let _ = atomic_write(&symbol_cache_path(root, workspace_id), bytes);
     }
 }
 
@@ -113,7 +148,7 @@ pub fn load_wiki_cache_bytes(root: &Path, workspace_id: &str) -> Option<Vec<u8>>
 pub fn store_wiki_cache_bytes(root: &Path, workspace_id: &str, bytes: &[u8]) {
     let dir = cache_dir(root);
     if fs::create_dir_all(&dir).is_ok() {
-        let _ = fs::write(wiki_cache_path(root, workspace_id), bytes);
+        let _ = atomic_write(&wiki_cache_path(root, workspace_id), bytes);
     }
 }
 
@@ -134,7 +169,7 @@ pub fn store_cached_graph(root: &Path, workspace_id: &str, key: &str, graph: &Sy
     }
     prune_old(&dir, workspace_id, key);
     if let Ok(bytes) = serde_json::to_vec(graph) {
-        let _ = fs::write(graph_cache_file(root, workspace_id, key), bytes);
+        let _ = atomic_write(&graph_cache_file(root, workspace_id, key), &bytes);
     }
 }
 
@@ -156,6 +191,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn atomic_write_replaces_and_leaves_no_temp() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let target = dir.path().join("c.json");
+        atomic_write(&target, b"first").unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"first");
+        // overwrite is atomic and complete (no partial)
+        atomic_write(&target, b"second-longer").unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"second-longer");
+        // no leftover temp files in the directory
+        let leftover: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(
+            leftover.is_empty(),
+            "atomic_write left a temp file: {leftover:?}"
+        );
+    }
+
+    #[test]
     fn cheap_key_changes_when_a_file_changes() {
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path();
@@ -164,11 +220,26 @@ mod tests {
             vec!["config", "user.email", "t@t"],
             vec!["config", "user.name", "t"],
         ] {
-            Command::new("git").arg("-C").arg(root).args(&args).output().unwrap();
+            Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(&args)
+                .output()
+                .unwrap();
         }
         fs::write(root.join("a.rs"), "fn a() {}\n").unwrap();
-        Command::new("git").arg("-C").arg(root).args(["add", "-A"]).output().unwrap();
-        Command::new("git").arg("-C").arg(root).args(["commit", "-qm", "c"]).output().unwrap();
+        Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["add", "-A"])
+            .output()
+            .unwrap();
+        Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["commit", "-qm", "c"])
+            .output()
+            .unwrap();
 
         let k1 = cheap_key(root);
         // editing a tracked file changes the key.
