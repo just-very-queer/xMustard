@@ -78,8 +78,10 @@ func PgInlineFlush() { pgInlineWG.Wait() }
 // pgRunPlansSchema is the queryable run-plans table the inline upsert needs on top
 // of opsSchemaSQL (which already defines xm_runs). No unique index is required: the
 // upserts use delete-by-key + insert, so historical duplicate rows can never break
-// (or be left by) the inline path.
+// (or be left by) the inline path. xm_runs gains a mirror_seq column so an
+// out-of-order async mirror can't regress a run's state (XM-NEW-008).
 const pgRunPlansSchema = `
+alter table xm_runs add column if not exists mirror_seq bigint not null default 0;
 create table if not exists xm_run_plans (
     workspace_id text not null,
     plan_id      text not null,
@@ -95,6 +97,11 @@ create table if not exists xm_run_plans (
 );
 create index if not exists xm_run_plans_run_idx on xm_run_plans (workspace_id, run_id);
 `
+
+// pgMirrorSeq is a process-monotonic sequence captured at mutation/dispatch time
+// (in saveRunRecord order) and carried to the async mirror, so PG applies snapshots
+// in mutation order regardless of which background worker's tx commits first.
+var pgMirrorSeq atomic.Int64
 
 // ensureInlineSchema runs the DDL once per process (idempotent CREATE … IF NOT
 // EXISTS). Skipped once it has succeeded, so it isn't paid on every mutation; a
@@ -113,10 +120,12 @@ func ensureInlineSchema(ctx context.Context, pool *pgxpool.Pool) error {
 // pgInlineUpsertRun mirrors a run (and its plan) into Postgres on every
 // saveRunRecord. Best-effort; runs on a background worker.
 func pgInlineUpsertRun(run runRecord) {
-	pgInlineDispatch(func() { pgInlineUpsertRunSync(run) })
+	// capture the order seq synchronously (in saveRunRecord order) before dispatch.
+	seq := pgMirrorSeq.Add(1)
+	pgInlineDispatch(func() { pgInlineUpsertRunSync(run, seq) })
 }
 
-func pgInlineUpsertRunSync(run runRecord) {
+func pgInlineUpsertRunSync(run runRecord, seq int64) {
 	ctx, cancel := context.WithTimeout(context.Background(), pgInlineMaxDur)
 	defer cancel()
 	pool, err := pgPool(ctx)
@@ -135,6 +144,25 @@ func pgInlineUpsertRunSync(run runRecord) {
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck // best-effort rollback if commit not reached
 
+	// Serialize concurrent mirrors for this run (no unique index needed) and skip if
+	// a newer snapshot already landed, so an older async snapshot can't regress PG.
+	lockKey := run.WorkspaceID + "\x1f" + run.RunID
+	if _, err := tx.Exec(ctx, "select pg_advisory_xact_lock(hashtext($1)::bigint)", lockKey); err != nil {
+		log.Printf("pg inline: run lock %s failed: %v", run.RunID, err)
+		return
+	}
+	var storedSeq int64
+	if err := tx.QueryRow(ctx,
+		"select coalesce(max(mirror_seq), -1) from xm_runs where workspace_id=$1 and run_id=$2",
+		run.WorkspaceID, run.RunID).Scan(&storedSeq); err != nil {
+		log.Printf("pg inline: run seq read %s failed: %v", run.RunID, err)
+		return
+	}
+	if storedSeq >= seq {
+		_ = tx.Commit(ctx) // a newer snapshot already applied — skip without regressing
+		return
+	}
+
 	// delete-by-key + insert is an upsert that needs no unique constraint, so a
 	// pre-existing duplicate (workspace_id, run_id) can never disable mirroring.
 	if _, err := tx.Exec(ctx, "delete from xm_runs where workspace_id=$1 and run_id=$2", run.WorkspaceID, run.RunID); err != nil {
@@ -145,10 +173,10 @@ func pgInlineUpsertRunSync(run runRecord) {
 	// raw nullable pointers (CompletedAt/ExitCode/Error) so absent values are SQL
 	// NULL, not "", matching MaterializeOpsPostgres and keeping IS NULL queries sound.
 	if _, err := tx.Exec(ctx, `
-		insert into xm_runs(workspace_id,run_id,issue_id,runtime,model,status,title,created_at,completed_at,exit_code,error,doc)
-		values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,to_tsvector('simple',$12))`,
+		insert into xm_runs(workspace_id,run_id,issue_id,runtime,model,status,title,created_at,completed_at,exit_code,error,doc,mirror_seq)
+		values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,to_tsvector('simple',$12),$13)`,
 		run.WorkspaceID, run.RunID, run.IssueID, run.Runtime, run.Model, run.Status, run.Title,
-		run.CreatedAt, run.CompletedAt, run.ExitCode, run.Error, doc); err != nil {
+		run.CreatedAt, run.CompletedAt, run.ExitCode, run.Error, doc, seq); err != nil {
 		log.Printf("pg inline: run insert %s failed: %v", run.RunID, err)
 		return
 	}
