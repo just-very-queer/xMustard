@@ -59,37 +59,51 @@ type PlanRejectRequest struct {
 	Reason string `json:"reason"`
 }
 
+// terminalRunStatuses are end states a run cannot transition out of.
+func isTerminalRunStatus(status string) bool {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "cancelled", "completed", "failed", "error":
+		return true
+	}
+	return false
+}
+
 func CancelRun(dataDir string, workspaceID string, runID string) (*runRecord, error) {
 	run, err := ReadRun(dataDir, workspaceID, runID)
 	if err != nil {
 		return nil, err
 	}
+	// Idempotent: a run already in a terminal state cannot be cancelled, and must
+	// NEVER be signalled — its persisted PID may have been reused by an unrelated
+	// host process group since it completed (XM-NEW-006, host-safety).
+	if isTerminalRunStatus(run.Status) {
+		return run, nil
+	}
+	_, active := activeRunProcesses.Load(runID)
 	cancelledRunIDs.Store(runID, struct{}{})
 	if processValue, ok := activeRunProcesses.Load(runID); ok {
+		// signal only the LIVE supervised process handle — never a bare persisted
+		// PID (which the OS may have reused).
 		if cmd, ok := processValue.(*exec.Cmd); ok && cmd.Process != nil {
 			terminateManagedRunCommand(cmd)
-		}
-	} else if run.PID != nil && *run.PID > 0 {
-		process, findErr := os.FindProcess(*run.PID)
-		if findErr == nil && process != nil {
-			signalErr := signalManagedRunPID(*run.PID)
-			if signalErr != nil && !errors.Is(signalErr, os.ErrProcessDone) {
-				signalErr = process.Signal(syscall.SIGTERM)
-				if signalErr != nil && !errors.Is(signalErr, os.ErrProcessDone) {
-					return nil, signalErr
-				}
-			}
 		}
 	}
 	completedAt := nowUTC()
 	exitCode := -15
 	run.Status = "cancelled"
 	run.CompletedAt = &completedAt
+	run.PID = nil // clear the PID so nothing can signal it after reap
 	if run.ExitCode == nil {
 		run.ExitCode = &exitCode
 	}
 	if err := saveRunRecord(dataDir, *run); err != nil {
 		return nil, err
+	}
+	// A run that was never active is not reaped by runManagedProcess; the durable
+	// cancelled status (saved above) is the authoritative signal, so drop the
+	// in-memory marker to keep cancelledRunIDs from accumulating.
+	if !active {
+		cancelledRunIDs.Delete(runID)
 	}
 	if err := appendRunActivityWithActor(
 		dataDir,
@@ -110,6 +124,12 @@ func RetryRun(dataDir string, workspaceID string, runID string) (*runRecord, err
 	run, err := ReadRun(dataDir, workspaceID, runID)
 	if err != nil {
 		return nil, err
+	}
+	// Only retry a run that has reached a terminal state. Retrying a queued/
+	// planning/running run would start a second worker against the same worktree,
+	// spend tokens twice, and race on files/verification records (XM-NEW-007).
+	if !isTerminalRunStatus(run.Status) {
+		return nil, fmt.Errorf("cannot retry a run in status %q; cancel it first", run.Status)
 	}
 	snapshot, err := loadSnapshot(dataDir, workspaceID)
 	if err != nil {
@@ -379,6 +399,7 @@ func runManagedProcess(dataDir string, run runRecord, workspaceRoot string) {
 	final.Status = finalStatus
 	final.CompletedAt = &completedAt
 	final.ExitCode = &exitCode
+	final.PID = nil // reaped: clear the PID so a later cancel can't signal a reused PID
 	final.Summary = summary
 	if waitErr != nil && finalStatus == "failed" {
 		errText := waitErr.Error()
