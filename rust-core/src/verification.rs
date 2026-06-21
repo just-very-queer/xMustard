@@ -3,10 +3,56 @@ use roxmltree::Document;
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use std::fs;
+use std::io::Read;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
+
+/// Run a spawned child to completion (or timeout), draining stdout+stderr on
+/// dedicated threads from the start. Without concurrent draining, a child that
+/// writes past the OS pipe buffer (~64 KiB) blocks on write while the parent waits
+/// for it to exit — a deadlock that only the timeout broke, spuriously killing a
+/// verbose-but-fast command and truncating its output (XM-NEW-015). Returns
+/// (exit_code, success, timed_out, stdout, stderr).
+fn drain_child_with_timeout(
+    mut child: Child,
+    timeout: Duration,
+    started_at: Instant,
+) -> std::io::Result<(Option<i32>, bool, bool, Vec<u8>, Vec<u8>)> {
+    let mut stdout_pipe = child.stdout.take();
+    let mut stderr_pipe = child.stderr.take();
+    let out_handle = thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(p) = stdout_pipe.as_mut() {
+            let _ = p.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let err_handle = thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(p) = stderr_pipe.as_mut() {
+            let _ = p.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let mut timed_out = false;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if started_at.elapsed() >= timeout {
+            let _ = child.kill();
+            timed_out = true;
+            break child.wait()?;
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    // the reader threads finish once the pipes reach EOF (child exited / killed).
+    let stdout = out_handle.join().unwrap_or_default();
+    let stderr = err_handle.join().unwrap_or_default();
+    Ok((status.code(), status.success(), timed_out, stdout, stderr))
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VerificationMilestone {
@@ -158,46 +204,25 @@ fn run_managed_command_with_program(
     let started_at = Instant::now();
     let timeout = Duration::from_secs(timeout_seconds.max(1));
 
-    let mut child = managed_command
+    let child = managed_command
         .current_dir(&resolved_cwd)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
 
-    loop {
-        if child.try_wait()?.is_some() {
-            let output = child.wait_with_output()?;
-            return Ok(build_managed_command_result(
-                display_command,
-                &resolved_cwd,
-                output.status.code(),
-                output.status.success(),
-                false,
-                started_at.elapsed(),
-                String::from_utf8_lossy(&output.stdout).as_ref(),
-                String::from_utf8_lossy(&output.stderr).as_ref(),
-                excerpt_limit,
-            ));
-        }
-
-        if started_at.elapsed() >= timeout {
-            let _ = child.kill();
-            let output = child.wait_with_output()?;
-            return Ok(build_managed_command_result(
-                display_command,
-                &resolved_cwd,
-                output.status.code(),
-                false,
-                true,
-                started_at.elapsed(),
-                String::from_utf8_lossy(&output.stdout).as_ref(),
-                String::from_utf8_lossy(&output.stderr).as_ref(),
-                excerpt_limit,
-            ));
-        }
-
-        thread::sleep(Duration::from_millis(50));
-    }
+    let (code, success, timed_out, stdout, stderr) =
+        drain_child_with_timeout(child, timeout, started_at)?;
+    Ok(build_managed_command_result(
+        display_command,
+        &resolved_cwd,
+        code,
+        success && !timed_out,
+        timed_out,
+        started_at.elapsed(),
+        String::from_utf8_lossy(&stdout).as_ref(),
+        String::from_utf8_lossy(&stderr).as_ref(),
+        excerpt_limit,
+    ))
 }
 
 pub fn run_verification_profile(
@@ -742,48 +767,24 @@ pub fn run_migration_verification(
     let started_at = Instant::now();
     let timeout = Duration::from_secs(timeout_seconds.max(1));
 
-    let mut child = shell_cmd
+    let child = shell_cmd
         .current_dir(&resolved_cwd)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
 
-    loop {
-        if let Some(status) = child.try_wait()? {
-            let output = child.wait_with_output()?;
-            let exit_code = status.code();
-            let success = status.success();
-            let elapsed = started_at.elapsed();
-            return Ok(build_migration_result(
-                command,
-                &resolved_cwd,
-                exit_code,
-                success,
-                false,
-                elapsed,
-                String::from_utf8_lossy(&output.stdout).as_ref(),
-                String::from_utf8_lossy(&output.stderr).as_ref(),
-            ));
-        }
-
-        if started_at.elapsed() >= timeout {
-            let _ = child.kill();
-            let output = child.wait_with_output()?;
-            let elapsed = started_at.elapsed();
-            return Ok(build_migration_result(
-                command,
-                &resolved_cwd,
-                output.status.code(),
-                false,
-                true,
-                elapsed,
-                String::from_utf8_lossy(&output.stdout).as_ref(),
-                String::from_utf8_lossy(&output.stderr).as_ref(),
-            ));
-        }
-
-        thread::sleep(Duration::from_millis(50));
-    }
+    let (code, success, timed_out, stdout, stderr) =
+        drain_child_with_timeout(child, timeout, started_at)?;
+    Ok(build_migration_result(
+        command,
+        &resolved_cwd,
+        code,
+        success && !timed_out,
+        timed_out,
+        started_at.elapsed(),
+        String::from_utf8_lossy(&stdout).as_ref(),
+        String::from_utf8_lossy(&stderr).as_ref(),
+    ))
 }
 
 fn build_migration_result(
@@ -899,6 +900,32 @@ mod tests {
     };
     use chrono::Utc;
     use tempfile::TempDir;
+
+    // A command that writes far more than the OS pipe buffer (~64 KiB) before exiting
+    // must still complete (concurrently drained), not be spuriously killed at the
+    // timeout — XM-NEW-015.
+    #[cfg(unix)]
+    #[test]
+    fn verbose_command_does_not_deadlock_or_timeout() {
+        let dir = TempDir::new().unwrap();
+        let args = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            // ~50k lines (~hundreds of KiB) — well past the pipe buffer.
+            "i=0; while [ $i -lt 50000 ]; do echo \"line $i padding padding\"; i=$((i+1)); done"
+                .to_string(),
+        ];
+        let res = run_managed_command(dir.path(), &args, 20).expect("run");
+        assert!(res.success, "verbose command should succeed: {:?}", res);
+        assert!(
+            !res.timed_out,
+            "verbose command must not be killed by the timeout"
+        );
+        assert!(
+            res.stdout_excerpt.contains("line 0"),
+            "stdout should be captured"
+        );
+    }
 
     #[test]
     fn parses_lcov_content() {
