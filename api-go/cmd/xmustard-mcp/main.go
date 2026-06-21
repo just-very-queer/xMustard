@@ -8,6 +8,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -27,17 +28,41 @@ func apiBase() string {
 	return "http://127.0.0.1:8042"
 }
 
+// argSpec describes one optional tool argument (required args are always strings).
+type argSpec struct {
+	Name string
+	Type string // "string" | "boolean"
+	Enum []string
+	Desc string
+}
+
 // tool describes one MCP tool and how to turn its arguments into an API call.
 type tool struct {
 	Name        string
 	Description string
-	Required    []string
-	// build returns (method, path-with-query) for the API call.
-	Build func(args map[string]string) (string, string)
+	Required    []string  // required args (all string-typed)
+	Optional    []argSpec // optional args with types/enums for the input schema + validation
+	// Build returns (method, path-with-query, body). body is "" for no body; a
+	// non-empty body is sent as application/json (used so `remember` ships memory
+	// content in the POST body, not the URL query — XM-NEW-018).
+	Build func(args map[string]string) (string, string, string)
 }
 
 func wsPath(args map[string]string, suffix string) string {
 	return "/api/workspaces/" + url.PathEscape(args["workspace_id"]) + suffix
+}
+
+// splitCSV turns a comma-separated arg ("a.go, b.go") into a trimmed, non-empty
+// slice for JSON-body fields like `paths`.
+func splitCSV(s string) []string {
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // tools returns the agent-facing MCP tool set: a small, fixed list of governed
@@ -45,10 +70,11 @@ func wsPath(args map[string]string, suffix string) string {
 // method and path it proxies to on the xMustard API.
 func tools() []tool {
 	return []tool{
-		{"ground", "Orient before acting: what changed / what's stale / what's broken / what's blocked since the indexed baseline, with index-trust (drift) and any contract breaks (changed function signatures vs the baseline) included.", []string{"workspace_id"},
-			func(a map[string]string) (string, string) { return "GET", wsPath(a, "/session-grounding") }},
+		{"ground", "Orient before acting: what changed / what's stale / what's broken / what's blocked since the indexed baseline, with index-trust (drift) and any contract breaks (changed function signatures vs the baseline) included.", []string{"workspace_id"}, nil,
+			func(a map[string]string) (string, string, string) { return "GET", wsPath(a, "/session-grounding"), "" }},
 		{"recall", "The VERIFIED shared context to trust, RANKED to your task: pass a query and/or paths to get the few relevant facts (multi-signal: lexical + path overlap + verification strength), not a dump. No query → recency-ranked top-N.", []string{"workspace_id"},
-			func(a map[string]string) (string, string) {
+			[]argSpec{{"query", "string", nil, "task query to rank memories by"}, {"paths", "string", nil, "comma-separated repo-relative files to focus on"}},
+			func(a map[string]string) (string, string, string) {
 				p := wsPath(a, "/context/active")
 				sep := "?"
 				if a["query"] != "" {
@@ -58,29 +84,35 @@ func tools() []tool {
 				if a["paths"] != "" {
 					p += sep + "paths=" + url.QueryEscape(a["paths"])
 				}
-				return "GET", p
+				return "GET", p, ""
 			}},
 		{"remember", "Propose a durable memory (fact/decision/gotcha) for the shared context; pending until verified by enough agents. Pass content; optional title and paths (comma-separated files the memory is about, so recall can flag it stale when they change).", []string{"workspace_id", "content"},
-			func(a map[string]string) (string, string) {
-				p := wsPath(a, "/context") + "?content=" + url.QueryEscape(a["content"])
+			[]argSpec{{"title", "string", nil, "short title"}, {"paths", "string", nil, "comma-separated repo-relative files the memory is about"}},
+			func(a map[string]string) (string, string, string) {
+				// content goes in the JSON BODY, not the URL, so durable memory text is
+				// not exposed in access logs / error strings (XM-NEW-018).
+				payload := map[string]any{"content": a["content"]}
 				if a["title"] != "" {
-					p += "&title=" + url.QueryEscape(a["title"])
+					payload["title"] = a["title"]
 				}
 				if a["paths"] != "" {
-					p += "&paths=" + url.QueryEscape(a["paths"])
+					payload["paths"] = splitCSV(a["paths"])
 				}
-				return "POST", p
+				b, _ := json.Marshal(payload)
+				return "POST", wsPath(a, "/context"), string(b)
 			}},
 		{"verify", "Verify (approve/reject) a peer's proposed memory; it promotes once enough DISTINCT agents approve. Your identity is your auth token; approve defaults true.", []string{"workspace_id", "entry_id"},
-			func(a map[string]string) (string, string) {
+			[]argSpec{{"approve", "boolean", nil, "approve (default true) or reject"}},
+			func(a map[string]string) (string, string, string) {
 				approve := "true"
 				if a["approve"] == "false" {
 					approve = "false"
 				}
-				return "POST", wsPath(a, "/context/"+url.PathEscape(a["entry_id"])+"/verify") + "?approve=" + approve
+				return "POST", wsPath(a, "/context/"+url.PathEscape(a["entry_id"])+"/verify") + "?approve=" + approve, ""
 			}},
 		{"search", "Narrow code search over the repo, returning relevant slices (path:line), not a dump. Default mode is hybrid (lexical+semantic+structural+proximity). Pass seed=<symbol> to anchor a graph-PROXIMITY lane that pulls symbols structurally near that symbol up the ranking (auto-seeds from an exact query→symbol match otherwise). Pass mode=pattern to run an ast-grep STRUCTURAL query (query is the pattern, e.g. `$A && $A()`; optional lang).", []string{"workspace_id", "query"},
-			func(a map[string]string) (string, string) {
+			[]argSpec{{"mode", "string", []string{"hybrid", "pattern"}, "hybrid (default) or pattern (ast-grep)"}, {"lang", "string", nil, "language hint for pattern mode"}, {"seed", "string", nil, "symbol to anchor the graph-proximity lane"}},
+			func(a map[string]string) (string, string, string) {
 				p := wsPath(a, "/search") + "?q=" + url.QueryEscape(a["query"])
 				if a["mode"] != "" {
 					p += "&mode=" + url.QueryEscape(a["mode"])
@@ -91,14 +123,15 @@ func tools() []tool {
 				if a["seed"] != "" {
 					p += "&seed=" + url.QueryEscape(a["seed"])
 				}
-				return "GET", p
+				return "GET", p, ""
 			}},
-		{"explain", "Explain a file or directory: purpose, role, key symbols, and how to run/verify it.", []string{"workspace_id", "path"},
-			func(a map[string]string) (string, string) {
-				return "GET", wsPath(a, "/explain-path") + "?path=" + url.QueryEscape(a["path"])
+		{"explain", "Explain a file or directory: purpose, role, key symbols, and how to run/verify it.", []string{"workspace_id", "path"}, nil,
+			func(a map[string]string) (string, string, string) {
+				return "GET", wsPath(a, "/explain-path") + "?path=" + url.QueryEscape(a["path"]), ""
 			}},
 		{"impact", "Blast radius. No args → impact of the current changes (dirty symbols, with contract_break flags where a signature changed vs the baseline). symbol= → every file that transitively references that symbol (graph BFS). from= & to= → the shortest dependency path between two symbols.", []string{"workspace_id"},
-			func(a map[string]string) (string, string) {
+			[]argSpec{{"symbol", "string", nil, "symbol to compute blast radius for"}, {"from", "string", nil, "trace path from this symbol"}, {"to", "string", nil, "trace path to this symbol"}},
+			func(a map[string]string) (string, string, string) {
 				p := wsPath(a, "/changes/since-index")
 				q := ""
 				if a["from"] != "" && a["to"] != "" {
@@ -106,13 +139,13 @@ func tools() []tool {
 				} else if a["symbol"] != "" {
 					q = "?symbol=" + url.QueryEscape(a["symbol"])
 				}
-				return "GET", p + q
+				return "GET", p + q, ""
 			}},
-		{"diagnostics", "Current normalized diagnostics (errors/warnings) for the workspace.", []string{"workspace_id"},
-			func(a map[string]string) (string, string) { return "GET", wsPath(a, "/diagnostics") }},
-		{"why_failed", "Explain why a run failed: failure signals, salient error lines, and which changed files are implicated.", []string{"workspace_id", "run_id"},
-			func(a map[string]string) (string, string) {
-				return "GET", wsPath(a, "/runs/"+url.PathEscape(a["run_id"])+"/why-failed")
+		{"diagnostics", "Current normalized diagnostics (errors/warnings) for the workspace.", []string{"workspace_id"}, nil,
+			func(a map[string]string) (string, string, string) { return "GET", wsPath(a, "/diagnostics"), "" }},
+		{"why_failed", "Explain why a run failed: failure signals, salient error lines, and which changed files are implicated.", []string{"workspace_id", "run_id"}, nil,
+			func(a map[string]string) (string, string, string) {
+				return "GET", wsPath(a, "/runs/"+url.PathEscape(a["run_id"])+"/why-failed"), ""
 			}},
 	}
 }
@@ -149,10 +182,17 @@ type rpcResponse struct {
 
 func httpClient() *http.Client { return &http.Client{Timeout: 60 * time.Second} }
 
-func callAPI(method, path string) (string, error) {
-	req, err := http.NewRequest(method, apiBase()+path, nil)
+func callAPI(method, path, body string) (string, error) {
+	var bodyReader io.Reader
+	if body != "" {
+		bodyReader = bytes.NewReader([]byte(body))
+	}
+	req, err := http.NewRequest(method, apiBase()+path, bodyReader)
 	if err != nil {
 		return "", err
+	}
+	if body != "" {
+		req.Header.Set("Content-Type", "application/json")
 	}
 	// Each agent runs its own xmustard-mcp; XMUSTARD_API_TOKEN is that agent's
 	// bearer token, so the API resolves a real per-agent identity (and the
@@ -165,42 +205,74 @@ func callAPI(method, path string) (string, error) {
 		return "", fmt.Errorf("xmustard API unreachable at %s (%w)", apiBase(), err)
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	respBody, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode >= 400 {
-		return "", fmt.Errorf("API %s %s -> %d: %s", method, path, resp.StatusCode, strings.TrimSpace(string(body)))
+		return "", fmt.Errorf("API %s %s -> %d: %s", method, path, resp.StatusCode, strings.TrimSpace(string(respBody)))
 	}
-	return string(body), nil
+	return string(respBody), nil
 }
 
-// toolsListResult builds the MCP tools/list payload.
+// requiredDesc returns a human description for a required (always-string) arg.
+func requiredDesc(name string) string {
+	switch name {
+	case "issue_id":
+		return "the issue/bug id"
+	case "entry_id":
+		return "the id of the memory entry"
+	case "run_id":
+		return "the id of the run"
+	case "path":
+		return "a repo-relative file or directory path"
+	case "query":
+		return "the search query"
+	case "content":
+		return "the memory text to propose"
+	case "symbol":
+		return "a symbol name"
+	default:
+		return "the workspace id"
+	}
+}
+
+// toolsListResult builds the MCP tools/list payload. The inputSchema merges the
+// required (string) args and the typed optional args, and sets
+// additionalProperties:false so a client schema-validates the same surface the
+// server enforces in dispatch.
 func toolsListResult() map[string]any {
 	list := []map[string]any{}
 	for _, t := range tools() {
 		props := map[string]any{}
 		for _, r := range t.Required {
-			desc := "the workspace id"
-			switch r {
-			case "issue_id":
-				desc = "the issue/bug id"
-			case "path":
-				desc = "a repo-relative file or directory path"
-			case "query":
-				desc = "the search query"
-			case "symbol":
-				desc = "a symbol name"
+			props[r] = map[string]any{"type": "string", "description": requiredDesc(r)}
+		}
+		for _, o := range t.Optional {
+			typ := o.Type
+			if typ == "" {
+				typ = "string"
 			}
-			props[r] = map[string]any{"type": "string", "description": desc}
+			prop := map[string]any{"type": typ, "description": o.Desc}
+			if len(o.Enum) > 0 {
+				prop["enum"] = o.Enum
+			}
+			props[o.Name] = prop
 		}
 		list = append(list, map[string]any{
 			"name":        t.Name,
 			"description": t.Description,
-			"inputSchema": map[string]any{"type": "object", "properties": props, "required": t.Required},
+			"inputSchema": map[string]any{
+				"type":                 "object",
+				"properties":           props,
+				"required":             t.Required,
+				"additionalProperties": false,
+			},
 		})
 	}
 	return map[string]any{"tools": list}
 }
 
-// callTool runs one tool and returns the MCP tools/call result object.
+// callTool runs one tool and returns the MCP tools/call result object. Required
+// args and value types are validated up front in dispatch (buildArgs); the
+// missing-required check here is a defensive backstop for direct callers/tests.
 func callTool(name string, args map[string]string) map[string]any {
 	t, ok := toolByName(name)
 	if !ok {
@@ -211,12 +283,68 @@ func callTool(name string, args map[string]string) map[string]any {
 			return mcpText(fmt.Sprintf("missing required argument %q for %s", r, name), true)
 		}
 	}
-	method, path := t.Build(args)
-	body, err := callAPI(method, path)
+	method, path, reqBody := t.Build(args)
+	respBody, err := callAPI(method, path, reqBody)
 	if err != nil {
 		return mcpText(err.Error(), true)
 	}
-	return mcpText(body, false)
+	return mcpText(respBody, false)
+}
+
+// buildArgs strictly validates the raw tools/call arguments against a tool's
+// declared required/optional surface and coerces them into a string map. It
+// rejects (with a JSON-RPC -32602 invalid-params error) unknown arguments,
+// wrong-typed values, non-scalar values (objects/arrays), and out-of-enum
+// values — never silently string-coercing whatever was passed.
+func buildArgs(t tool, raw map[string]any) (map[string]string, *rpcError) {
+	known := map[string]argSpec{}
+	for _, r := range t.Required {
+		known[r] = argSpec{Name: r, Type: "string"}
+	}
+	for _, o := range t.Optional {
+		known[o.Name] = o
+	}
+	invalid := func(format string, a ...any) *rpcError {
+		return &rpcError{Code: -32602, Message: fmt.Sprintf(format, a...)}
+	}
+	args := map[string]string{}
+	for k, v := range raw {
+		spec, ok := known[k]
+		if !ok {
+			return nil, invalid("unknown argument %q for tool %s", k, t.Name)
+		}
+		switch spec.Type {
+		case "boolean":
+			b, ok := v.(bool)
+			if !ok {
+				return nil, invalid("argument %q for tool %s must be a boolean", k, t.Name)
+			}
+			if b {
+				args[k] = "true"
+			} else {
+				args[k] = "false"
+			}
+		default: // string-typed (required args and string optionals)
+			s, ok := v.(string)
+			if !ok {
+				return nil, invalid("argument %q for tool %s must be a string", k, t.Name)
+			}
+			if len(spec.Enum) > 0 {
+				match := false
+				for _, e := range spec.Enum {
+					if s == e {
+						match = true
+						break
+					}
+				}
+				if !match {
+					return nil, invalid("argument %q for tool %s must be one of: %s", k, t.Name, strings.Join(spec.Enum, ", "))
+				}
+			}
+			args[k] = s
+		}
+	}
+	return args, nil
 }
 
 func mcpText(text string, isError bool) map[string]any {
@@ -238,14 +366,27 @@ func dispatch(method string, params json.RawMessage) (any, *rpcError) {
 	case "tools/list":
 		return toolsListResult(), nil
 	case "tools/call":
+		dec := json.NewDecoder(bytes.NewReader(params))
+		dec.DisallowUnknownFields() // reject stray top-level fields instead of ignoring them
 		var p struct {
-			Name      string                 `json:"name"`
-			Arguments map[string]interface{} `json:"arguments"`
+			Name      string         `json:"name"`
+			Arguments map[string]any `json:"arguments"`
 		}
-		_ = json.Unmarshal(params, &p)
-		args := map[string]string{}
-		for k, v := range p.Arguments {
-			args[k] = fmt.Sprintf("%v", v)
+		if err := dec.Decode(&p); err != nil {
+			return nil, &rpcError{Code: -32602, Message: "invalid params: " + err.Error()}
+		}
+		if strings.TrimSpace(p.Name) == "" {
+			return nil, &rpcError{Code: -32602, Message: "invalid params: missing tool name"}
+		}
+		t, ok := toolByName(p.Name)
+		if !ok {
+			// Unknown tool is reported as a tool result (isError) so the agent can
+			// self-correct, matching MCP's tool-error convention.
+			return mcpText(fmt.Sprintf("unknown tool %q", p.Name), true), nil
+		}
+		args, rerr := buildArgs(t, p.Arguments)
+		if rerr != nil {
+			return nil, rerr
 		}
 		return callTool(p.Name, args), nil
 	case "ping":
