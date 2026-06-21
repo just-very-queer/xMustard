@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os/exec"
 )
 
 type ManagedCommandResult = VerificationCommandResult
@@ -18,20 +17,10 @@ func RunManagedCommand(ctx context.Context, workspaceRoot string, timeoutSeconds
 		timeoutSeconds = 1
 	}
 
-	args := []string{
-		"run",
-		"--quiet",
-		"--bin",
-		"xmustard-core",
-		"--",
-		"run-managed-command",
-		workspaceRoot,
-		fmt.Sprintf("%d", timeoutSeconds),
-	}
+	args := []string{workspaceRoot, fmt.Sprintf("%d", timeoutSeconds)}
 	args = append(args, commandArgs...)
 
-	cmd := exec.CommandContext(ctx, "cargo", args...)
-	cmd.Dir = rustCoreDir()
+	cmd := coreCommandContext(ctx, "run-managed-command", args...)
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
