@@ -1,12 +1,10 @@
 package rustcore
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 )
 
 type RepoMapDirectoryRecord struct {
@@ -166,96 +164,36 @@ func BuildSemanticImpact(ctx context.Context, workspaceID string, repoRoot strin
 		return nil, fmt.Errorf("close semantic impact changes: %w", err)
 	}
 
-	cmd := exec.CommandContext(
-		ctx,
-		"cargo",
-		"run",
-		"--quiet",
-		"--bin",
-		"xmustard-core",
-		"--",
-		"semantic-impact",
-		workspaceID,
-		repoRoot,
-		changesPath,
-	)
-	cmd.Dir = rustCoreDir()
-
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("rust-core semantic-impact failed: %w: %s", err, stderr.String())
+	stdout, err := runCoreCtx(ctx, "semantic-impact", workspaceID, repoRoot, changesPath)
+	if err != nil {
+		return nil, err
 	}
-
 	var report SemanticImpactReport
-	if err := json.Unmarshal(stdout.Bytes(), &report); err != nil {
+	if err := json.Unmarshal(stdout, &report); err != nil {
 		return nil, fmt.Errorf("decode rust-core semantic impact: %w", err)
 	}
 	return &report, nil
 }
 
 func ExtractPathSymbols(ctx context.Context, workspaceID string, repoRoot string, relativePath string) (*PathSymbolsResult, error) {
-	cmd := exec.CommandContext(
-		ctx,
-		"cargo",
-		"run",
-		"--quiet",
-		"--bin",
-		"xmustard-core",
-		"--",
-		"path-symbols",
-		workspaceID,
-		repoRoot,
-		relativePath,
-	)
-	cmd.Dir = rustCoreDir()
-
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("rust-core path-symbols failed: %w: %s", err, stderr.String())
+	stdout, err := runCoreCtx(ctx, "path-symbols", workspaceID, repoRoot, relativePath)
+	if err != nil {
+		return nil, err
 	}
-
 	var result PathSymbolsResult
-	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+	if err := json.Unmarshal(stdout, &result); err != nil {
 		return nil, fmt.Errorf("decode rust-core path symbols: %w", err)
 	}
 	return &result, nil
 }
 
 func ExplainPath(ctx context.Context, workspaceID string, repoRoot string, relativePath string) (*CodeExplainerResult, error) {
-	cmd := exec.CommandContext(
-		ctx,
-		"cargo",
-		"run",
-		"--quiet",
-		"--bin",
-		"xmustard-core",
-		"--",
-		"explain-path",
-		workspaceID,
-		repoRoot,
-		relativePath,
-	)
-	cmd.Dir = rustCoreDir()
-
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("rust-core explain-path failed: %w: %s", err, stderr.String())
+	stdout, err := runCoreCtx(ctx, "explain-path", workspaceID, repoRoot, relativePath)
+	if err != nil {
+		return nil, err
 	}
-
 	var result CodeExplainerResult
-	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+	if err := json.Unmarshal(stdout, &result); err != nil {
 		return nil, fmt.Errorf("decode rust-core path explainer: %w", err)
 	}
 	return &result, nil

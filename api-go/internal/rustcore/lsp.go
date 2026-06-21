@@ -1,12 +1,10 @@
 package rustcore
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 )
 
 type DefinitionLocation struct {
@@ -130,36 +128,13 @@ func NormalizeLSPDefinition(
 		return nil, fmt.Errorf("close LSP definition payload: %w", err)
 	}
 
-	cmd := exec.CommandContext(
-		ctx,
-		"cargo",
-		"run",
-		"--quiet",
-		"--bin",
-		"xmustard-core",
-		"--",
-		"normalize-lsp-definition",
-		workspaceID,
-		repoRoot,
-		relativePath,
-		fmt.Sprintf("%d", line),
-		fmt.Sprintf("%d", column),
-		sourceName,
-		inputPath,
-	)
-	cmd.Dir = rustCoreDir()
-
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("rust-core normalize-lsp-definition failed: %w: %s", err, stderr.String())
+	stdout, err := runCoreCtx(ctx, "normalize-lsp-definition", workspaceID, repoRoot, relativePath,
+		fmt.Sprintf("%d", line), fmt.Sprintf("%d", column), sourceName, inputPath)
+	if err != nil {
+		return nil, err
 	}
-
 	var result DefinitionResult
-	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+	if err := json.Unmarshal(stdout, &result); err != nil {
 		return nil, fmt.Errorf("decode rust-core LSP definition result: %w", err)
 	}
 	return &result, nil
@@ -189,36 +164,13 @@ func NormalizeLSPReferences(
 		return nil, fmt.Errorf("close LSP references payload: %w", err)
 	}
 
-	cmd := exec.CommandContext(
-		ctx,
-		"cargo",
-		"run",
-		"--quiet",
-		"--bin",
-		"xmustard-core",
-		"--",
-		"normalize-lsp-references",
-		workspaceID,
-		repoRoot,
-		relativePath,
-		fmt.Sprintf("%d", line),
-		fmt.Sprintf("%d", column),
-		sourceName,
-		inputPath,
-	)
-	cmd.Dir = rustCoreDir()
-
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("rust-core normalize-lsp-references failed: %w: %s", err, stderr.String())
+	stdout, err := runCoreCtx(ctx, "normalize-lsp-references", workspaceID, repoRoot, relativePath,
+		fmt.Sprintf("%d", line), fmt.Sprintf("%d", column), sourceName, inputPath)
+	if err != nil {
+		return nil, err
 	}
-
 	var result ReferencesResult
-	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+	if err := json.Unmarshal(stdout, &result); err != nil {
 		return nil, fmt.Errorf("decode rust-core LSP references result: %w", err)
 	}
 	return &result, nil
@@ -246,34 +198,12 @@ func NormalizeLSPDocumentSymbols(
 		return nil, fmt.Errorf("close LSP document-symbols payload: %w", err)
 	}
 
-	cmd := exec.CommandContext(
-		ctx,
-		"cargo",
-		"run",
-		"--quiet",
-		"--bin",
-		"xmustard-core",
-		"--",
-		"normalize-lsp-document-symbols",
-		workspaceID,
-		repoRoot,
-		relativePath,
-		sourceName,
-		inputPath,
-	)
-	cmd.Dir = rustCoreDir()
-
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("rust-core normalize-lsp-document-symbols failed: %w: %s", err, stderr.String())
+	stdout, err := runCoreCtx(ctx, "normalize-lsp-document-symbols", workspaceID, repoRoot, relativePath, sourceName, inputPath)
+	if err != nil {
+		return nil, err
 	}
-
 	var result DocumentSymbolsResult
-	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+	if err := json.Unmarshal(stdout, &result); err != nil {
 		return nil, fmt.Errorf("decode rust-core LSP document-symbols result: %w", err)
 	}
 	return &result, nil
@@ -302,35 +232,13 @@ func NormalizeLSPWorkspaceSymbols(
 		return nil, fmt.Errorf("close LSP workspace-symbols payload: %w", err)
 	}
 
-	cmd := exec.CommandContext(
-		ctx,
-		"cargo",
-		"run",
-		"--quiet",
-		"--bin",
-		"xmustard-core",
-		"--",
-		"normalize-lsp-workspace-symbols",
-		workspaceID,
-		repoRoot,
-		query,
-		fmt.Sprintf("%d", limit),
-		sourceName,
-		inputPath,
-	)
-	cmd.Dir = rustCoreDir()
-
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("rust-core normalize-lsp-workspace-symbols failed: %w: %s", err, stderr.String())
+	stdout, err := runCoreCtx(ctx, "normalize-lsp-workspace-symbols", workspaceID, repoRoot, query,
+		fmt.Sprintf("%d", limit), sourceName, inputPath)
+	if err != nil {
+		return nil, err
 	}
-
 	var result LSPWorkspaceSymbolsResult
-	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+	if err := json.Unmarshal(stdout, &result); err != nil {
 		return nil, fmt.Errorf("decode rust-core LSP workspace-symbols result: %w", err)
 	}
 	return &result, nil

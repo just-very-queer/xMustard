@@ -1,12 +1,10 @@
 package rustcore
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 )
 
 type NormalizedDiagnostic struct {
@@ -136,34 +134,12 @@ func ArchiveDiagnosticsPayload(ctx context.Context, workspaceID string, inputJSO
 		return nil, fmt.Errorf("close diagnostics server provenance: %w", err)
 	}
 
-	cmd := exec.CommandContext(
-		ctx,
-		"cargo",
-		"run",
-		"--quiet",
-		"--bin",
-		"xmustard-core",
-		"--",
-		"archive-diagnostics-payload",
-		workspaceID,
-		inputJSONPath,
-		sourceKind,
-		sourceName,
-		provenancePath,
-	)
-	cmd.Dir = rustCoreDir()
-
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("rust-core archive-diagnostics-payload failed: %w: %s", err, stderr.String())
+	stdout, err := runCoreCtx(ctx, "archive-diagnostics-payload", workspaceID, inputJSONPath, sourceKind, sourceName, provenancePath)
+	if err != nil {
+		return nil, err
 	}
-
 	var result DiagnosticsReplayArchive
-	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+	if err := json.Unmarshal(stdout, &result); err != nil {
 		return nil, fmt.Errorf("decode rust-core diagnostics replay archive: %w", err)
 	}
 	return &result, nil
@@ -196,35 +172,13 @@ func LinkDiagnosticSymbol(
 		return nil, fmt.Errorf("close diagnostic symbol candidates: %w", err)
 	}
 
-	cmd := exec.CommandContext(
-		ctx,
-		"cargo",
-		"run",
-		"--quiet",
-		"--bin",
-		"xmustard-core",
-		"--",
-		"link-diagnostic-symbol",
-		workspaceID,
-		diagnosticPath,
-		fmt.Sprintf("%d", startLine),
-		fmt.Sprintf("%d", endLine),
-		diagnosticFingerprint,
-		inputPath,
-	)
-	cmd.Dir = rustCoreDir()
-
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("rust-core link-diagnostic-symbol failed: %w: %s", err, stderr.String())
+	stdout, err := runCoreCtx(ctx, "link-diagnostic-symbol", workspaceID, diagnosticPath,
+		fmt.Sprintf("%d", startLine), fmt.Sprintf("%d", endLine), diagnosticFingerprint, inputPath)
+	if err != nil {
+		return nil, err
 	}
-
 	var result DiagnosticSymbolLinkResult
-	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+	if err := json.Unmarshal(stdout, &result); err != nil {
 		return nil, fmt.Errorf("decode rust-core diagnostic symbol link: %w", err)
 	}
 	return &result, nil
