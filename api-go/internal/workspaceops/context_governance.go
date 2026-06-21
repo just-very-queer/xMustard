@@ -85,8 +85,15 @@ func hashFileContent(root, rel string) (string, bool) {
 	return hex.EncodeToString(sum[:]), true
 }
 
+// pathMissingSentinel baselines a referenced path that was missing/unreadable/
+// escaping at verification time, so its later creation is detectable as drift
+// (rather than dropped and never tracked) — XM-NEW-003.
+const pathMissingSentinel = "\x00missing"
+
 // capturePathHashes snapshots the content hash of each referenced path — the
-// "verified-against" baseline that drift-on-recall later compares to.
+// "verified-against" baseline that drift-on-recall later compares to. EVERY
+// requested path is represented: present paths by their hash, missing/unreadable
+// ones by a sentinel, so a missing→present (or present→missing) transition is drift.
 func capturePathHashes(root string, paths []string) map[string]string {
 	if root == "" || len(paths) == 0 {
 		return nil
@@ -98,6 +105,8 @@ func capturePathHashes(root string, paths []string) map[string]string {
 		}
 		if h, ok := hashFileContent(root, p); ok {
 			out[p] = h
+		} else {
+			out[p] = pathMissingSentinel
 		}
 	}
 	if len(out) == 0 {
@@ -107,7 +116,8 @@ func capturePathHashes(root string, paths []string) map[string]string {
 }
 
 // computeStaleness flags a promoted entry whose referenced files changed since it
-// was verified — so recall never serves silently-stale memory.
+// was verified — so recall never serves silently-stale memory. A path that appears,
+// disappears, or changes content relative to its baseline is stale.
 func computeStaleness(root string, entry *ContextEntry) {
 	if root == "" || len(entry.PathHashes) == 0 {
 		return
@@ -115,8 +125,13 @@ func computeStaleness(root string, entry *ContextEntry) {
 	var stale []string
 	for p, recorded := range entry.PathHashes {
 		cur, ok := hashFileContent(root, p)
-		if !ok || cur != recorded {
-			stale = append(stale, p)
+		switch {
+		case !ok && recorded != pathMissingSentinel:
+			stale = append(stale, p) // was present at verify time, now missing/unreadable
+		case ok && recorded == pathMissingSentinel:
+			stale = append(stale, p) // was missing at verify time, now present
+		case ok && cur != recorded:
+			stale = append(stale, p) // content changed
 		}
 	}
 	if len(stale) > 0 {
@@ -401,8 +416,14 @@ func UpdateContextContent(dataDir, workspaceID, entryID, content string) (*Conte
 	}
 	entry.Content = content
 	entry.UpdatedAt = nowUTC()
-	// a content change resets verification — re-approval is required
+	// a content change resets verification — re-approval is required — AND must
+	// discard the old drift baseline, so re-promotion captures a fresh snapshot
+	// against the current files instead of reusing the previous assertion's
+	// evidence (XM-NEW-004).
 	entry.Verifications = []ContextVerification{}
+	entry.PathHashes = nil
+	entry.Stale = false
+	entry.StalePaths = nil
 	reconcileEntry(entry)
 	if err := saveContextEntries(dataDir, workspaceID, entries); err != nil {
 		return nil, err
