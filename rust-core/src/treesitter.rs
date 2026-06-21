@@ -235,7 +235,7 @@ const GO_QUERY: &str = r#"
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_symbols, TsSymbol};
+    use super::{TsSymbol, extract_symbols};
 
     fn read_lines(symbols: &[TsSymbol]) -> Vec<(&str, &str)> {
         symbols
@@ -264,7 +264,10 @@ mod tests {
         assert!(list.contains(&("Bar", "type")));
         assert!(list.contains(&("Baz", "type")));
         assert!(list.contains(&("Qux", "type")));
-        assert!(list.iter().any(|(name, kind)| *name == "build" && *kind == "method"));
+        assert!(
+            list.iter()
+                .any(|(name, kind)| *name == "build" && *kind == "method")
+        );
         // the method inside `impl Bar` carries its enclosing scope; top-level fn does not.
         let build = symbols.iter().find(|s| s.symbol == "build").unwrap();
         assert_eq!(build.enclosing_scope.as_deref(), Some("Bar"));

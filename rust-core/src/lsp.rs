@@ -796,9 +796,10 @@ fn normalize_source_name(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_definition_payload, normalize_document_symbols_payload,
-        normalize_references_payload, normalize_workspace_symbols_payload, RustDefinitionLocation,
-        RustDocumentSymbolRecord, RustReferenceLocation, RustWorkspaceSymbolRecord,
+        RustDefinitionLocation, RustDocumentSymbolRecord, RustReferenceLocation,
+        RustWorkspaceSymbolRecord, normalize_definition_payload,
+        normalize_document_symbols_payload, normalize_references_payload,
+        normalize_workspace_symbols_payload,
     };
     use serde_json::json;
     use std::path::Path;
@@ -1231,13 +1232,17 @@ mod tests {
         );
 
         assert!(result.symbols.is_empty());
-        assert!(result
-            .warnings
-            .iter()
-            .any(|item| item.contains("without a name")));
-        assert!(result
-            .warnings
-            .iter()
-            .any(|item| item.contains("No in-workspace symbols")));
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|item| item.contains("without a name"))
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|item| item.contains("No in-workspace symbols"))
+        );
     }
 }

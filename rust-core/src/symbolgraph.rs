@@ -23,8 +23,8 @@ const MAX_FILES: usize = 800;
 const MIN_NAME_LEN: usize = 4;
 // names this common produce noisy edges; skip as reference anchors.
 const STOPWORD_SYMBOLS: &[&str] = &[
-    "main", "test", "tests", "init", "new", "build", "run", "string", "error", "result",
-    "value", "data", "name", "path", "self", "this", "type", "node", "item", "list",
+    "main", "test", "tests", "init", "new", "build", "run", "string", "error", "result", "value",
+    "data", "name", "path", "self", "this", "type", "node", "item", "list",
 ];
 
 fn is_source(path: &str) -> bool {
@@ -36,7 +36,11 @@ fn is_source(path: &str) -> bool {
 }
 
 fn tracked_source_files(root: &Path) -> Vec<String> {
-    let out = Command::new("git").arg("-C").arg(root).args(["ls-files"]).output();
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["ls-files"])
+        .output();
     let text = match out {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
         _ => return Vec::new(),
@@ -140,8 +144,14 @@ fn relative_import_specs(content: &str) -> Vec<String> {
 }
 
 /// Resolve a relative import spec (from `from_path`) to a tracked file path.
-fn resolve_relative_import(from_path: &str, spec: &str, tracked: &HashSet<String>) -> Option<String> {
-    let from_dir = Path::new(from_path).parent().unwrap_or_else(|| Path::new(""));
+fn resolve_relative_import(
+    from_path: &str,
+    spec: &str,
+    tracked: &HashSet<String>,
+) -> Option<String> {
+    let from_dir = Path::new(from_path)
+        .parent()
+        .unwrap_or_else(|| Path::new(""));
     let mut joined = from_dir.to_path_buf();
     for part in spec.split('/') {
         match part {
@@ -380,8 +390,14 @@ pub fn compute_clusters(graph: &SymbolGraph) -> Vec<FileCluster> {
         if e.from_path == e.to_path {
             continue;
         }
-        *adj.entry(e.from_path.clone()).or_default().entry(e.to_path.clone()).or_insert(0) += e.weight;
-        *adj.entry(e.to_path.clone()).or_default().entry(e.from_path.clone()).or_insert(0) += e.weight;
+        *adj.entry(e.from_path.clone())
+            .or_default()
+            .entry(e.to_path.clone())
+            .or_insert(0) += e.weight;
+        *adj.entry(e.to_path.clone())
+            .or_default()
+            .entry(e.from_path.clone())
+            .or_insert(0) += e.weight;
     }
     // every file is a node; isolated files keep their own community.
     let mut nodes: Vec<String> = graph.files.iter().map(|f| f.path.clone()).collect();
@@ -392,7 +408,9 @@ pub fn compute_clusters(graph: &SymbolGraph) -> Vec<FileCluster> {
     for _ in 0..20 {
         let mut changed = false;
         for n in &nodes {
-            let Some(neighbours) = adj.get(n) else { continue };
+            let Some(neighbours) = adj.get(n) else {
+                continue;
+            };
             // tally neighbour communities by total edge weight.
             let mut weight_by_comm: BTreeMap<String, usize> = BTreeMap::new();
             for (nbr, w) in neighbours {
@@ -418,7 +436,10 @@ pub fn compute_clusters(graph: &SymbolGraph) -> Vec<FileCluster> {
     // group files by final community label, then relabel to compact ids by size.
     let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for n in &nodes {
-        groups.entry(community[n].clone()).or_default().push(n.clone());
+        groups
+            .entry(community[n].clone())
+            .or_default()
+            .push(n.clone());
     }
     let mut clusters: Vec<Vec<String>> = groups.into_values().collect();
     clusters.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a[0].cmp(&b[0])));
@@ -524,7 +545,9 @@ pub fn upgrade_graph_with_lsp(root: &Path, mut graph: SymbolGraph, budget: usize
             Ok(c) => c,
             Err(_) => continue,
         };
-        let Some(symbols) = crate::treesitter::extract_symbols(&rel, &content) else { continue };
+        let Some(symbols) = crate::treesitter::extract_symbols(&rel, &content) else {
+            continue;
+        };
         let mut session_died = false;
         for sym in symbols {
             if remaining == 0 || std::time::Instant::now() >= phase_deadline {
@@ -534,7 +557,9 @@ pub fn upgrade_graph_with_lsp(root: &Path, mut graph: SymbolGraph, budget: usize
             if sym.kind != "function" && sym.kind != "method" {
                 continue;
             }
-            let Some(session) = sessions.get_mut(lang).and_then(|s| s.as_mut()) else { break };
+            let Some(session) = sessions.get_mut(lang).and_then(|s| s.as_mut()) else {
+                break;
+            };
             let line = (sym.line_start.saturating_sub(1)) as u32;
             match session.references(&rel, line, sym.name_column as u32) {
                 Ok(refs) => {
@@ -649,8 +674,18 @@ pub fn build_symbol_graph(root: &Path, workspace_id: &str) -> SymbolGraph {
                 .map(|r| r.symbols)
                 .unwrap_or_default(),
         };
-        next_cache.insert(rel.clone(), CachedFileSymbols { hash, symbols: syms.clone() });
-        file_nodes.push(GraphFileNode { path: rel.clone(), symbol_count: syms.len(), authority: 0 });
+        next_cache.insert(
+            rel.clone(),
+            CachedFileSymbols {
+                hash,
+                symbols: syms.clone(),
+            },
+        );
+        file_nodes.push(GraphFileNode {
+            path: rel.clone(),
+            symbol_count: syms.len(),
+            authority: 0,
+        });
         for s in &syms {
             symbols.push(GraphSymbolNode {
                 name: s.symbol.clone(),
@@ -662,7 +697,10 @@ pub fn build_symbol_graph(root: &Path, workspace_id: &str) -> SymbolGraph {
             if s.symbol.len() >= MIN_NAME_LEN && !STOPWORD_SYMBOLS.contains(&lname.as_str()) {
                 let defs = name_to_defs.entry(s.symbol.clone()).or_default();
                 if !defs.iter().any(|d| d.path == *rel) {
-                    defs.push(SymbolDef { path: rel.clone(), kind: s.kind.clone() });
+                    defs.push(SymbolDef {
+                        path: rel.clone(),
+                        kind: s.kind.clone(),
+                    });
                 }
             }
         }
@@ -678,7 +716,8 @@ pub fn build_symbol_graph(root: &Path, workspace_id: &str) -> SymbolGraph {
 
     // Typed edges, aggregated by (from, to, kind): a symbol that is imported AND
     // called yields both an "imports" and a "calls" edge (distinct relationships).
-    let mut agg: HashMap<(String, String, &'static str), (usize, BTreeSet<String>)> = HashMap::new();
+    let mut agg: HashMap<(String, String, &'static str), (usize, BTreeSet<String>)> =
+        HashMap::new();
     // flow edges (returns/branches/writes) aggregate separately so they don't inflate
     // the structural authority/impact/proximity weight summed over `edges`.
     let mut flow_agg: HashMap<(String, String, &'static str), (usize, BTreeSet<String>)> =
@@ -855,7 +894,9 @@ fn reverse_adjacency(graph: &SymbolGraph) -> HashMap<String, BTreeSet<String>> {
     let mut rev: HashMap<String, BTreeSet<String>> = HashMap::new();
     for e in &graph.edges {
         if e.from_path != e.to_path {
-            rev.entry(e.to_path.clone()).or_default().insert(e.from_path.clone());
+            rev.entry(e.to_path.clone())
+                .or_default()
+                .insert(e.from_path.clone());
         }
     }
     rev
@@ -884,7 +925,10 @@ pub fn symbol_impact(graph: &SymbolGraph, symbol: &str, max_depth: usize) -> Sym
             }
         }
         for f in &next {
-            impacted.push(ImpactedFile { path: f.clone(), distance: depth });
+            impacted.push(ImpactedFile {
+                path: f.clone(),
+                distance: depth,
+            });
         }
         frontier = next.into_iter().collect();
         depth += 1;
@@ -918,8 +962,12 @@ pub fn trace_symbols(graph: &SymbolGraph, from: &str, to: &str) -> SymbolTrace {
     let mut adj: HashMap<String, BTreeSet<String>> = HashMap::new();
     for e in &graph.edges {
         if e.from_path != e.to_path {
-            adj.entry(e.from_path.clone()).or_default().insert(e.to_path.clone());
-            adj.entry(e.to_path.clone()).or_default().insert(e.from_path.clone());
+            adj.entry(e.from_path.clone())
+                .or_default()
+                .insert(e.to_path.clone());
+            adj.entry(e.to_path.clone())
+                .or_default()
+                .insert(e.from_path.clone());
         }
     }
     // multi-source BFS from all `from` files, tracking predecessors.
@@ -980,10 +1028,18 @@ pub fn compute_hotspots(graph: &SymbolGraph, limit: usize) -> Vec<Hotspot> {
         .into_iter()
         .map(|(path, w)| {
             let d = dependents.get(&path).map(BTreeSet::len).unwrap_or(0);
-            Hotspot { path, inbound_weight: w, dependent_count: d }
+            Hotspot {
+                path,
+                inbound_weight: w,
+                dependent_count: d,
+            }
         })
         .collect();
-    out.sort_by(|a, b| b.inbound_weight.cmp(&a.inbound_weight).then(a.path.cmp(&b.path)));
+    out.sort_by(|a, b| {
+        b.inbound_weight
+            .cmp(&a.inbound_weight)
+            .then(a.path.cmp(&b.path))
+    });
     out.truncate(limit);
     out
 }
@@ -1048,28 +1104,62 @@ mod tests {
             vec!["config", "user.email", "t@t"],
             vec!["config", "user.name", "t"],
         ] {
-            Command::new("git").arg("-C").arg(dir.path()).args(&args).output().unwrap();
+            Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args(&args)
+                .output()
+                .unwrap();
         }
-        Command::new("git").arg("-C").arg(dir.path()).args(["add", "-A"]).output().unwrap();
-        Command::new("git").arg("-C").arg(dir.path()).args(["commit", "-qm", "c"]).output().unwrap();
+        Command::new("git")
+            .arg("-C")
+            .arg(dir.path())
+            .args(["add", "-A"])
+            .output()
+            .unwrap();
+        Command::new("git")
+            .arg("-C")
+            .arg(dir.path())
+            .args(["commit", "-qm", "c"])
+            .output()
+            .unwrap();
         dir
     }
 
     #[test]
     fn graph_builds_edges_and_hotspots() {
         let repo = git_repo(&[
-            ("lib.rs", "pub fn compute_widget() -> i32 { 1 }\npub struct WidgetFactory {}\n"),
-            ("a.rs", "use crate::lib; fn run() { let _ = compute_widget(); let _f = WidgetFactory{}; }\n"),
+            (
+                "lib.rs",
+                "pub fn compute_widget() -> i32 { 1 }\npub struct WidgetFactory {}\n",
+            ),
+            (
+                "a.rs",
+                "use crate::lib; fn run() { let _ = compute_widget(); let _f = WidgetFactory{}; }\n",
+            ),
             ("b.rs", "fn other() { let _ = compute_widget(); }\n"),
         ]);
         let graph = build_symbol_graph(repo.path(), "ws");
         assert_eq!(graph.file_count, 3);
         assert!(graph.symbol_count >= 2);
         // a.rs and b.rs reference compute_widget defined in lib.rs -> edges to lib.rs
-        assert!(graph.edges.iter().any(|e| e.from_path == "a.rs" && e.to_path == "lib.rs"));
-        assert!(graph.edges.iter().any(|e| e.from_path == "b.rs" && e.to_path == "lib.rs"));
+        assert!(
+            graph
+                .edges
+                .iter()
+                .any(|e| e.from_path == "a.rs" && e.to_path == "lib.rs")
+        );
+        assert!(
+            graph
+                .edges
+                .iter()
+                .any(|e| e.from_path == "b.rs" && e.to_path == "lib.rs")
+        );
         let hot = compute_hotspots(&graph, 5);
-        assert_eq!(hot[0].path, "lib.rs", "lib.rs should be the top hotspot: {hot:?}");
+        assert_eq!(
+            hot[0].path, "lib.rs",
+            "lib.rs should be the top hotspot: {hot:?}"
+        );
         assert!(hot[0].dependent_count >= 2);
     }
 
@@ -1088,7 +1178,10 @@ mod tests {
         assert_eq!(g1.edge_count, g2.edge_count);
         // authority is precomputed: lib.rs is referenced by a.rs and b.rs.
         let lib = g2.files.iter().find(|f| f.path == "lib.rs").unwrap();
-        assert!(lib.authority >= 2, "lib.rs authority should reflect 2 dependents: {lib:?}");
+        assert!(
+            lib.authority >= 2,
+            "lib.rs authority should reflect 2 dependents: {lib:?}"
+        );
     }
 
     #[test]
@@ -1104,10 +1197,16 @@ mod tests {
         let impact = symbol_impact(&graph, "seed_value", 4);
         assert!(impact.defined_in.contains(&"core.rs".to_string()));
         let reached: Vec<&str> = impact.impacted.iter().map(|f| f.path.as_str()).collect();
-        assert!(reached.contains(&"mid.rs"), "impact should reach mid.rs: {impact:?}");
+        assert!(
+            reached.contains(&"mid.rs"),
+            "impact should reach mid.rs: {impact:?}"
+        );
         // trace from seed_value to mid_layer finds a path.
         let trace = trace_symbols(&graph, "seed_value", "mid_layer");
-        assert!(trace.found && trace.path.len() >= 2, "trace should find a path: {trace:?}");
+        assert!(
+            trace.found && trace.path.len() >= 2,
+            "trace should find a path: {trace:?}"
+        );
     }
 
     #[test]
@@ -1116,15 +1215,27 @@ mod tests {
         // they should land in one cluster, while an unrelated file stays separate —
         // which top-directory grouping could never produce.
         let repo = git_repo(&[
-            ("core/engine.rs", "pub fn run_engine() {}\npub fn engine_step() {}\n"),
-            ("api/handler.rs", "fn handle() { run_engine(); engine_step(); }\npub fn dispatch() {}\n"),
-            ("core/engine_caller.rs", "fn go() { run_engine(); engine_step(); dispatch(); }\n"),
+            (
+                "core/engine.rs",
+                "pub fn run_engine() {}\npub fn engine_step() {}\n",
+            ),
+            (
+                "api/handler.rs",
+                "fn handle() { run_engine(); engine_step(); }\npub fn dispatch() {}\n",
+            ),
+            (
+                "core/engine_caller.rs",
+                "fn go() { run_engine(); engine_step(); dispatch(); }\n",
+            ),
             ("misc/lonely.rs", "pub fn alone() {}\n"),
         ]);
         let graph = build_symbol_graph(repo.path(), "ws");
         let clusters = compute_clusters(&graph);
         // find the cluster containing core/engine.rs
-        let eng = clusters.iter().find(|c| c.files.iter().any(|f| f == "core/engine.rs")).unwrap();
+        let eng = clusters
+            .iter()
+            .find(|c| c.files.iter().any(|f| f == "core/engine.rs"))
+            .unwrap();
         assert!(
             eng.files.iter().any(|f| f == "api/handler.rs"),
             "cross-directory coupled files should cluster together: {clusters:?}"
@@ -1145,8 +1256,11 @@ mod tests {
             ("c.rs", "fn run() { handle_request(); }\n"),
         ]);
         let graph = build_symbol_graph(repo.path(), "ws");
-        let edges_from_c: Vec<_> =
-            graph.edges.iter().filter(|e| e.from_path == "c.rs").collect();
+        let edges_from_c: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|e| e.from_path == "c.rs")
+            .collect();
         assert!(
             edges_from_c.is_empty(),
             "ambiguous handle_request must not anchor a misrouted edge: {edges_from_c:?}"
@@ -1158,8 +1272,14 @@ mod tests {
     #[test]
     fn graph_classifies_edge_kinds() {
         let repo = git_repo(&[
-            ("core.rs", "pub fn compute_widget() -> i32 { 1 }\npub trait Renderable {}\n"),
-            ("user.rs", "use crate::core::compute_widget;\nfn run() { let _ = compute_widget(); }\n"),
+            (
+                "core.rs",
+                "pub fn compute_widget() -> i32 { 1 }\npub trait Renderable {}\n",
+            ),
+            (
+                "user.rs",
+                "use crate::core::compute_widget;\nfn run() { let _ = compute_widget(); }\n",
+            ),
             ("impl.rs", "struct Panel {}\nimpl Renderable for Panel {}\n"),
             ("core_test.rs", "fn check() { let _ = compute_widget(); }\n"),
         ]);
@@ -1171,18 +1291,37 @@ mod tests {
                 .any(|e| e.from_path == from && e.to_path == to && e.kind == kind)
         };
         // user.rs imports + calls compute_widget from core.rs
-        assert!(has("user.rs", "core.rs", "imports"), "imports edge: {:?}", graph.edges);
-        assert!(has("user.rs", "core.rs", "calls"), "calls edge: {:?}", graph.edges);
+        assert!(
+            has("user.rs", "core.rs", "imports"),
+            "imports edge: {:?}",
+            graph.edges
+        );
+        assert!(
+            has("user.rs", "core.rs", "calls"),
+            "calls edge: {:?}",
+            graph.edges
+        );
         // impl.rs implements the Renderable trait defined in core.rs
-        assert!(has("impl.rs", "core.rs", "inherits"), "inherits edge: {:?}", graph.edges);
+        assert!(
+            has("impl.rs", "core.rs", "inherits"),
+            "inherits edge: {:?}",
+            graph.edges
+        );
         // core_test.rs is a test file referencing code under test
-        assert!(has("core_test.rs", "core.rs", "tests"), "tests edge: {:?}", graph.edges);
+        assert!(
+            has("core_test.rs", "core.rs", "tests"),
+            "tests edge: {:?}",
+            graph.edges
+        );
     }
 
     #[test]
     fn graph_emits_flow_edges() {
         let repo = git_repo(&[
-            ("core.rs", "pub fn is_ready() -> bool { true }\npub fn make_widget() -> i32 { 7 }\n"),
+            (
+                "core.rs",
+                "pub fn is_ready() -> bool { true }\npub fn make_widget() -> i32 { 7 }\n",
+            ),
             (
                 "user.rs",
                 "use crate::core::{is_ready, make_widget};\n\
@@ -1216,7 +1355,12 @@ mod tests {
         // flow edges are tagged with a resolution like the structural edges (S2).
         assert!(graph.flow_edges.iter().all(|e| e.resolution == "lexical"));
         // flow edges must NOT pollute the structural edge set / authority weight.
-        assert!(graph.edges.iter().all(|e| e.kind != "returns" && e.kind != "branches"));
+        assert!(
+            graph
+                .edges
+                .iter()
+                .all(|e| e.kind != "returns" && e.kind != "branches")
+        );
         assert_eq!(graph.flow_edge_count, graph.flow_edges.len());
     }
 
@@ -1227,7 +1371,10 @@ mod tests {
             let start = line.find(sym).unwrap();
             flow_edge_kind(line, start, start + sym.len())
         };
-        assert_eq!(probe("    return make_widget();", "make_widget"), Some("returns"));
+        assert_eq!(
+            probe("    return make_widget();", "make_widget"),
+            Some("returns")
+        );
         assert_eq!(probe("    if is_ready() {", "is_ready"), Some("branches"));
         assert_eq!(probe("    while pending() {", "pending"), Some("branches"));
         assert_eq!(probe("    CONFIG = load();", "CONFIG"), Some("writes"));

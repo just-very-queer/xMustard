@@ -13,7 +13,7 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::lsp::{self, RustDocumentSymbolsResult};
 
@@ -52,8 +52,16 @@ fn server_for(rel: &str) -> Option<ServerConfig> {
         .and_then(|e| e.to_str())?
         .to_ascii_lowercase();
     let cfg = match ext.as_str() {
-        "rs" => ServerConfig { command: "rust-analyzer", args: &[], language_id: "rust" },
-        "go" => ServerConfig { command: "gopls", args: &[], language_id: "go" },
+        "rs" => ServerConfig {
+            command: "rust-analyzer",
+            args: &[],
+            language_id: "rust",
+        },
+        "go" => ServerConfig {
+            command: "gopls",
+            args: &[],
+            language_id: "go",
+        },
         "ts" => ServerConfig {
             command: "typescript-language-server",
             args: &["--stdio"],
@@ -74,10 +82,16 @@ fn server_for(rel: &str) -> Option<ServerConfig> {
             args: &["--stdio"],
             language_id: "javascriptreact",
         },
-        "c" | "h" => ServerConfig { command: "clangd", args: &[], language_id: "c" },
-        "cpp" | "cc" | "hpp" | "cxx" => {
-            ServerConfig { command: "clangd", args: &[], language_id: "cpp" }
-        }
+        "c" | "h" => ServerConfig {
+            command: "clangd",
+            args: &[],
+            language_id: "c",
+        },
+        "cpp" | "cc" | "hpp" | "cxx" => ServerConfig {
+            command: "clangd",
+            args: &[],
+            language_id: "cpp",
+        },
         _ => return None,
     };
     Some(cfg)
@@ -148,7 +162,9 @@ impl Session {
         loop {
             let now = Instant::now();
             if now >= self.deadline {
-                return Err(LspSessionError::Failed("timed out waiting for response".into()));
+                return Err(LspSessionError::Failed(
+                    "timed out waiting for response".into(),
+                ));
             }
             let budget = (self.deadline - now).min(Duration::from_millis(500));
             match self.rx.recv_timeout(budget) {
@@ -170,7 +186,9 @@ impl Session {
                 }
                 Err(RecvTimeoutError::Timeout) => continue,
                 Err(RecvTimeoutError::Disconnected) => {
-                    return Err(LspSessionError::Failed("lsp server closed the connection".into()));
+                    return Err(LspSessionError::Failed(
+                        "lsp server closed the connection".into(),
+                    ));
                 }
             }
         }
@@ -193,7 +211,9 @@ fn request_document(
     timeout: Duration,
 ) -> Result<Value, LspSessionError> {
     let Some(cfg) = server_for(rel) else {
-        return Err(LspSessionError::Unavailable(format!("no LSP server mapped for {rel}")));
+        return Err(LspSessionError::Unavailable(format!(
+            "no LSP server mapped for {rel}"
+        )));
     };
     if !binary_on_path(cfg.command) {
         return Err(LspSessionError::Unavailable(format!(
@@ -240,7 +260,11 @@ fn request_document(
         .take()
         .ok_or_else(|| LspSessionError::Failed("no stdin".into()))?;
 
-    let session = Session { child, rx, deadline: Instant::now() + timeout };
+    let session = Session {
+        child,
+        rx,
+        deadline: Instant::now() + timeout,
+    };
 
     // 1) initialize / initialized handshake
     let init = json!({
@@ -263,8 +287,11 @@ fn request_document(
     });
     frame(&mut stdin, &init).map_err(|e| LspSessionError::Failed(e.to_string()))?;
     session.wait_for(1, &mut stdin)?;
-    frame(&mut stdin, &json!({"jsonrpc":"2.0","method":"initialized","params":{}}))
-        .map_err(|e| LspSessionError::Failed(e.to_string()))?;
+    frame(
+        &mut stdin,
+        &json!({"jsonrpc":"2.0","method":"initialized","params":{}}),
+    )
+    .map_err(|e| LspSessionError::Failed(e.to_string()))?;
 
     // 2) open the document
     let did_open = json!({
@@ -287,7 +314,10 @@ fn request_document(
     let result = session.wait_for(2, &mut stdin)?;
 
     // 4) best-effort shutdown; Drop kills the child regardless
-    let _ = frame(&mut stdin, &json!({"jsonrpc":"2.0","id":3,"method":"shutdown"}));
+    let _ = frame(
+        &mut stdin,
+        &json!({"jsonrpc":"2.0","id":3,"method":"shutdown"}),
+    );
     let _ = frame(&mut stdin, &json!({"jsonrpc":"2.0","method":"exit"}));
     Ok(result)
 }
@@ -310,12 +340,21 @@ pub struct LspWorkspaceSession {
 impl LspWorkspaceSession {
     /// Start a persistent session for the server that handles `sample_rel`'s
     /// language. Unavailable if no server is mapped or installed.
-    pub fn start(root: &Path, sample_rel: &str, per_request_secs: u64) -> Result<Self, LspSessionError> {
+    pub fn start(
+        root: &Path,
+        sample_rel: &str,
+        per_request_secs: u64,
+    ) -> Result<Self, LspSessionError> {
         let Some(cfg) = server_for(sample_rel) else {
-            return Err(LspSessionError::Unavailable(format!("no LSP server mapped for {sample_rel}")));
+            return Err(LspSessionError::Unavailable(format!(
+                "no LSP server mapped for {sample_rel}"
+            )));
         };
         if !binary_on_path(cfg.command) {
-            return Err(LspSessionError::Unavailable(format!("{} is not installed", cfg.command)));
+            return Err(LspSessionError::Unavailable(format!(
+                "{} is not installed",
+                cfg.command
+            )));
         }
         let stderr = if std::env::var("XM_LSP_DEBUG").is_ok() {
             Stdio::inherit()
@@ -330,7 +369,10 @@ impl LspWorkspaceSession {
             .stderr(stderr)
             .spawn()
             .map_err(|e| LspSessionError::Failed(format!("spawn {}: {e}", cfg.command)))?;
-        let stdout = child.stdout.take().ok_or_else(|| LspSessionError::Failed("no stdout".into()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| LspSessionError::Failed("no stdout".into()))?;
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
@@ -340,10 +382,17 @@ impl LspWorkspaceSession {
                 }
             }
         });
-        let mut stdin = child.stdin.take().ok_or_else(|| LspSessionError::Failed("no stdin".into()))?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| LspSessionError::Failed("no stdin".into()))?;
         let per_request = Duration::from_secs(per_request_secs.clamp(2, 60));
         // initialize takes longer than a normal request (server indexes the repo).
-        let session = Session { child, rx, deadline: Instant::now() + Duration::from_secs(90) };
+        let session = Session {
+            child,
+            rx,
+            deadline: Instant::now() + Duration::from_secs(90),
+        };
         // canonicalize so the rootUri matches the (canonical) URIs the server returns
         // — otherwise /var vs /private/var on macOS breaks reference-path stripping.
         let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
@@ -355,8 +404,11 @@ impl LspWorkspaceSession {
         });
         frame(&mut stdin, &init).map_err(|e| LspSessionError::Failed(e.to_string()))?;
         session.wait_for(1, &mut stdin)?;
-        frame(&mut stdin, &json!({"jsonrpc":"2.0","method":"initialized","params":{}}))
-            .map_err(|e| LspSessionError::Failed(e.to_string()))?;
+        frame(
+            &mut stdin,
+            &json!({"jsonrpc":"2.0","method":"initialized","params":{}}),
+        )
+        .map_err(|e| LspSessionError::Failed(e.to_string()))?;
         Ok(Self {
             session,
             stdin,
@@ -385,7 +437,8 @@ impl LspWorkspaceSession {
                 "jsonrpc":"2.0","method":"textDocument/didOpen",
                 "params":{"textDocument":{"uri":doc_uri,"languageId":self.language_id,"version":1,"text":text}}
             });
-            frame(&mut self.stdin, &did_open).map_err(|e| LspSessionError::Failed(e.to_string()))?;
+            frame(&mut self.stdin, &did_open)
+                .map_err(|e| LspSessionError::Failed(e.to_string()))?;
             // only mark open AFTER the read + send succeed, so a failure can retry.
             self.opened.insert(rel.to_string());
         }
@@ -394,7 +447,12 @@ impl LspWorkspaceSession {
 
     /// References to the symbol at (line, character) in `rel`, as (path, line)
     /// pairs relative to the workspace root. Excludes the declaration itself.
-    pub fn references(&mut self, rel: &str, line: u32, character: u32) -> Result<Vec<(String, u32)>, LspSessionError> {
+    pub fn references(
+        &mut self,
+        rel: &str,
+        line: u32,
+        character: u32,
+    ) -> Result<Vec<(String, u32)>, LspSessionError> {
         let doc_uri = self.ensure_open(rel)?;
         self.next_id += 1;
         let id = self.next_id;
@@ -411,7 +469,11 @@ impl LspWorkspaceSession {
         if let Value::Array(items) = result {
             for it in items {
                 let uri = it.get("uri").and_then(|u| u.as_str()).unwrap_or("");
-                let l = it.get("range").and_then(|r| r.get("start")).and_then(|s| s.get("line")).and_then(|n| n.as_u64());
+                let l = it
+                    .get("range")
+                    .and_then(|r| r.get("start"))
+                    .and_then(|s| s.get("line"))
+                    .and_then(|n| n.as_u64());
                 if let (Some(rel_path), Some(l)) = (uri.strip_prefix(&root_prefix), l) {
                     out.push((rel_path.to_string(), l as u32));
                 }
@@ -423,7 +485,10 @@ impl LspWorkspaceSession {
 
 impl Drop for LspWorkspaceSession {
     fn drop(&mut self) {
-        let _ = frame(&mut self.stdin, &json!({"jsonrpc":"2.0","id":999999,"method":"shutdown"}));
+        let _ = frame(
+            &mut self.stdin,
+            &json!({"jsonrpc":"2.0","id":999999,"method":"shutdown"}),
+        );
         let _ = frame(&mut self.stdin, &json!({"jsonrpc":"2.0","method":"exit"}));
         // Session's Drop kills the child.
     }
@@ -487,7 +552,13 @@ fn position_request(
             p.insert(k.clone(), v.clone());
         }
     }
-    request_document(root, rel, method, params, Duration::from_secs(timeout_secs.clamp(2, 120)))
+    request_document(
+        root,
+        rel,
+        method,
+        params,
+        Duration::from_secs(timeout_secs.clamp(2, 120)),
+    )
 }
 
 /// `textDocument/references` — all references to the symbol at a position
@@ -520,7 +591,15 @@ pub fn live_definition(
     character: u32,
     timeout_secs: u64,
 ) -> Result<Value, LspSessionError> {
-    position_request("textDocument/definition", root, rel, line, character, json!({}), timeout_secs)
+    position_request(
+        "textDocument/definition",
+        root,
+        rel,
+        line,
+        character,
+        json!({}),
+        timeout_secs,
+    )
 }
 
 /// `textDocument/implementation` — concrete implementations of an interface/trait

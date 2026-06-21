@@ -223,7 +223,8 @@ pub fn run_verification_profile(
 
     let mut coverage_command_result = None;
     let mut coverage_result = None;
-    let resolved_report_path = resolve_report_path(workspace_root, profile.coverage_report_path.as_deref());
+    let resolved_report_path =
+        resolve_report_path(workspace_root, profile.coverage_report_path.as_deref());
 
     let test_success = attempts.last().map(|item| item.success).unwrap_or(false);
     if test_success {
@@ -455,10 +456,16 @@ pub fn parse_cobertura_content(
 
     for class_node in root.descendants().filter(|node| node.has_tag_name("class")) {
         files_total += 1;
-        let file_name = class_node.attribute("filename").unwrap_or_default().to_string();
+        let file_name = class_node
+            .attribute("filename")
+            .unwrap_or_default()
+            .to_string();
         let mut class_lines = 0usize;
         let mut class_total = 0usize;
-        for line_node in class_node.descendants().filter(|node| node.has_tag_name("line")) {
+        for line_node in class_node
+            .descendants()
+            .filter(|node| node.has_tag_name("line"))
+        {
             let hits = line_node
                 .attribute("hits")
                 .and_then(|value| value.parse::<i64>().ok())
@@ -695,7 +702,10 @@ fn truncate_excerpt(text: &str, limit: usize) -> String {
     format!("{}\n...[truncated {} chars]", &text[..limit], omitted)
 }
 
-fn resolve_report_path(workspace_root: &Path, report_path: Option<&str>) -> Option<std::path::PathBuf> {
+fn resolve_report_path(
+    workspace_root: &Path,
+    report_path: Option<&str>,
+) -> Option<std::path::PathBuf> {
     let report_path = report_path?;
     let candidate = Path::new(report_path);
     if candidate.is_absolute() {
@@ -726,7 +736,9 @@ pub fn run_migration_verification(
         cmd
     };
 
-    let resolved_cwd = workspace_root.canonicalize().unwrap_or_else(|_| workspace_root.to_path_buf());
+    let resolved_cwd = workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_root.to_path_buf());
     let started_at = Instant::now();
     let timeout = Duration::from_secs(timeout_seconds.max(1));
 
@@ -881,9 +893,9 @@ fn empty_coverage_result(
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_cobertura_content, parse_istanbul_content, parse_lcov_content, run_managed_command,
-        run_migration_verification, run_verification_command, run_verification_profile,
-        RustVerificationProfileInput,
+        RustVerificationProfileInput, parse_cobertura_content, parse_istanbul_content,
+        parse_lcov_content, run_managed_command, run_migration_verification,
+        run_verification_command, run_verification_profile,
     };
     use chrono::Utc;
     use tempfile::TempDir;
@@ -959,7 +971,8 @@ mod tests {
             "three".to_string(),
         ];
 
-        let result = run_managed_command(temp_dir.path(), &command_args, 2).expect("command should run");
+        let result =
+            run_managed_command(temp_dir.path(), &command_args, 2).expect("command should run");
 
         assert!(result.success);
         assert!(!result.timed_out);
@@ -971,7 +984,8 @@ mod tests {
     #[test]
     fn rejects_empty_managed_command_args() {
         let temp_dir = TempDir::new().expect("temp dir");
-        let err = run_managed_command(temp_dir.path(), &[], 2).expect_err("empty command args should fail");
+        let err = run_managed_command(temp_dir.path(), &[], 2)
+            .expect_err("empty command args should fail");
 
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
@@ -980,7 +994,8 @@ mod tests {
     #[test]
     fn runs_verification_command_successfully() {
         let temp_dir = TempDir::new().expect("temp dir");
-        let result = run_verification_command(temp_dir.path(), "printf 'ok\\n'", 2).expect("command should run");
+        let result = run_verification_command(temp_dir.path(), "printf 'ok\\n'", 2)
+            .expect("command should run");
 
         assert!(result.success);
         assert!(!result.timed_out);
@@ -1005,7 +1020,8 @@ mod tests {
     #[test]
     fn marks_timeout_for_long_running_verification_command() {
         let temp_dir = TempDir::new().expect("temp dir");
-        let result = run_verification_command(temp_dir.path(), "sleep 2", 1).expect("command should run");
+        let result =
+            run_verification_command(temp_dir.path(), "sleep 2", 1).expect("command should run");
 
         assert!(!result.success);
         assert!(result.timed_out);
@@ -1021,9 +1037,12 @@ mod tests {
             workspace_id: "workspace-1".to_string(),
             name: "Backend pytest".to_string(),
             description: "Verification profile".to_string(),
-            test_command: "if [ ! -f .attempt ]; then touch .attempt; exit 1; fi; printf 'tests ok\\n'".to_string(),
+            test_command:
+                "if [ ! -f .attempt ]; then touch .attempt; exit 1; fi; printf 'tests ok\\n'"
+                    .to_string(),
             coverage_command: Some(
-                "printf 'SF:src/app.py\\nDA:1,1\\nDA:2,0\\nend_of_record\\n' > coverage.info".to_string(),
+                "printf 'SF:src/app.py\\nDA:1,1\\nDA:2,0\\nend_of_record\\n' > coverage.info"
+                    .to_string(),
             ),
             coverage_report_path: Some("coverage.info".to_string()),
             coverage_format: "lcov".to_string(),
@@ -1035,39 +1054,68 @@ mod tests {
             updated_at: Utc::now().to_rfc3339(),
         };
 
-        let result = run_verification_profile(temp_dir.path(), &profile, Some("run-1"), Some("issue-1"))
-            .expect("profile should run");
+        let result =
+            run_verification_profile(temp_dir.path(), &profile, Some("run-1"), Some("issue-1"))
+                .expect("profile should run");
 
         assert!(result.success);
         assert_eq!(result.attempt_count, 2);
         assert_eq!(result.attempts.len(), 2);
         assert!(!result.attempts[0].success);
         assert!(result.attempts[1].success);
-        assert!(result.coverage_command_result.as_ref().is_some_and(|item| item.success));
-        assert_eq!(result.coverage_result.as_ref().map(|item| item.format.as_str()), Some("lcov"));
-        assert_eq!(result.coverage_result.as_ref().map(|item| item.lines_covered), Some(1));
+        assert!(
+            result
+                .coverage_command_result
+                .as_ref()
+                .is_some_and(|item| item.success)
+        );
+        assert_eq!(
+            result
+                .coverage_result
+                .as_ref()
+                .map(|item| item.format.as_str()),
+            Some("lcov")
+        );
+        assert_eq!(
+            result
+                .coverage_result
+                .as_ref()
+                .map(|item| item.lines_covered),
+            Some(1)
+        );
     }
 
     #[cfg(not(target_os = "windows"))]
     #[test]
     fn runs_migration_verification_and_returns_contract() {
         let temp_dir = TempDir::new().expect("temp dir");
-        let result = run_migration_verification(temp_dir.path(), "printf 'ok\\n'", 2).expect("should run");
+        let result =
+            run_migration_verification(temp_dir.path(), "printf 'ok\\n'", 2).expect("should run");
 
         assert!(result.risks.is_empty());
         assert!(result.recommended_contract.contains("\"success\":true"));
         assert!(result.recommended_contract.contains("exit_code\":"));
-        assert!(result.unix_constraints.contains(&"timeout_seconds_required".to_string()));
+        assert!(
+            result
+                .unix_constraints
+                .contains(&"timeout_seconds_required".to_string())
+        );
     }
 
     #[cfg(not(target_os = "windows"))]
     #[test]
     fn migration_verification_captures_failure_risks() {
         let temp_dir = TempDir::new().expect("temp dir");
-        let result = run_migration_verification(temp_dir.path(), "printf 'error\\n' 1>&2; exit 1", 2).expect("should run");
+        let result =
+            run_migration_verification(temp_dir.path(), "printf 'error\\n' 1>&2; exit 1", 2)
+                .expect("should run");
 
         assert!(result.risks.contains(&"exit_code_1".to_string()));
-        assert!(result.risks.contains(&"stderr_indicates_failure".to_string()));
+        assert!(
+            result
+                .risks
+                .contains(&"stderr_indicates_failure".to_string())
+        );
         assert!(result.recommended_contract.contains("\"success\":false"));
     }
 

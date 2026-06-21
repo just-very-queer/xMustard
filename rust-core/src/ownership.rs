@@ -45,8 +45,7 @@ fn subsystem_name(path: &str) -> String {
 pub fn build_subsystems(root: &Path, workspace_id: &str) -> Vec<Subsystem> {
     let graph = symbolgraph::build_symbol_graph(root, workspace_id);
     let mut file_to_subsystem: HashMap<String, String> = HashMap::new();
-    let mut totals: HashMap<String, (usize, usize, usize, usize)> =
-        HashMap::new(); // file_count, symbol_count, internal, external
+    let mut totals: HashMap<String, (usize, usize, usize, usize)> = HashMap::new(); // file_count, symbol_count, internal, external
 
     for file in graph.files {
         let subsystem = subsystem_name(&file.path);
@@ -80,25 +79,31 @@ pub fn build_subsystems(root: &Path, workspace_id: &str) -> Vec<Subsystem> {
 
     let mut subsystems: Vec<Subsystem> = totals
         .into_iter()
-        .map(|(name, (file_count, symbol_count, internal_edges, external_edges))| {
-            let total_edges = internal_edges + external_edges;
-            let cohesion = if total_edges == 0 {
-                0.0
-            } else {
-                internal_edges as f64 / total_edges as f64
-            };
-            Subsystem {
-                name,
-                file_count,
-                symbol_count,
-                internal_edges,
-                external_edges,
-                cohesion,
-            }
-        })
+        .map(
+            |(name, (file_count, symbol_count, internal_edges, external_edges))| {
+                let total_edges = internal_edges + external_edges;
+                let cohesion = if total_edges == 0 {
+                    0.0
+                } else {
+                    internal_edges as f64 / total_edges as f64
+                };
+                Subsystem {
+                    name,
+                    file_count,
+                    symbol_count,
+                    internal_edges,
+                    external_edges,
+                    cohesion,
+                }
+            },
+        )
         .collect();
 
-    subsystems.sort_by(|a, b| b.file_count.cmp(&a.file_count).then_with(|| a.name.cmp(&b.name)));
+    subsystems.sort_by(|a, b| {
+        b.file_count
+            .cmp(&a.file_count)
+            .then_with(|| a.name.cmp(&b.name))
+    });
     subsystems
 }
 
@@ -148,8 +153,16 @@ mod tests {
             "pub fn core_fn() -> i32 { 1 }\n",
         )
         .unwrap();
-        std::fs::write(repo.path().join("core/b.rs"), "pub fn core_extra() -> i32 { 2 }\n").unwrap();
-        std::fs::write(repo.path().join("root.rs"), "fn root() { let _ = crate::core_fn(); }\n").unwrap();
+        std::fs::write(
+            repo.path().join("core/b.rs"),
+            "pub fn core_extra() -> i32 { 2 }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.path().join("root.rs"),
+            "fn root() { let _ = crate::core_fn(); }\n",
+        )
+        .unwrap();
 
         let init = Command::new("git")
             .arg("-C")
@@ -170,7 +183,12 @@ mod tests {
             .args(["config", "user.name", "t"])
             .output()
             .unwrap();
-        Command::new("git").arg("-C").arg(repo.path()).args(["add", "-A"]).output().unwrap();
+        Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .args(["add", "-A"])
+            .output()
+            .unwrap();
         let commit = Command::new("git")
             .arg("-C")
             .arg(repo.path())
@@ -185,7 +203,10 @@ mod tests {
     fn builds_core_subsystem_from_file_paths() {
         let repo = temp_repo();
         let subsystems = build_subsystems(repo.path(), "ws");
-        let core = subsystems.iter().find(|s| s.name == "core").expect("core subsystem");
+        let core = subsystems
+            .iter()
+            .find(|s| s.name == "core")
+            .expect("core subsystem");
         assert_eq!(core.file_count, 2);
     }
 

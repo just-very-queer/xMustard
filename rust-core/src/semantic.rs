@@ -29,11 +29,7 @@ fn find_binary(name: &str) -> Option<String> {
         .ok()?;
     if output.status.success() {
         let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if path.is_empty() {
-            None
-        } else {
-            Some(path)
-        }
+        if path.is_empty() { None } else { Some(path) }
     } else {
         None
     }
@@ -87,7 +83,10 @@ pub fn parse_ast_grep_line(root: &Path, line: &str) -> Option<SemanticPatternMat
 
     let language = item.get("language").and_then(normalize_ast_grep_language);
 
-    let context_lines = item.get("lines").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let context_lines = item
+        .get("lines")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
 
     let meta_variables = item
         .get("metaVariables")

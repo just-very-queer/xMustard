@@ -1,3 +1,4 @@
+use crate::treesitter;
 use chrono::Utc;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -5,7 +6,6 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use walkdir::{DirEntry, WalkDir};
-use crate::treesitter;
 
 const SCANNER_EXCLUDED_DIR_NAMES: &[&str] = &[
     ".git",
@@ -294,12 +294,14 @@ pub fn build_repo_map(
         let is_test = role == "test";
 
         {
-            let entry = top_level.entry(top_dir).or_insert(RustRepoMapDirectoryRecord {
-                path: String::new(),
-                file_count: 0,
-                source_file_count: 0,
-                test_file_count: 0,
-            });
+            let entry = top_level
+                .entry(top_dir)
+                .or_insert(RustRepoMapDirectoryRecord {
+                    path: String::new(),
+                    file_count: 0,
+                    source_file_count: 0,
+                    test_file_count: 0,
+                });
             if entry.path.is_empty() {
                 entry.path = if relative.contains('/') {
                     relative.split('/').next().unwrap_or(".").to_string()
@@ -482,7 +484,8 @@ pub fn extract_path_symbols(
         symbol_source,
         parser_language,
         evidence_source: "rust_semantic_core".to_string(),
-        selection_reason: "Rust semantic core produced on-demand path symbols for the requested file.".to_string(),
+        selection_reason:
+            "Rust semantic core produced on-demand path symbols for the requested file.".to_string(),
         symbols,
         file_summary_row,
         symbol_rows,
@@ -519,8 +522,15 @@ pub fn explain_path(
         symbol_source: symbols.symbol_source,
         parser_language: symbols.parser_language,
         evidence_source: symbols.evidence_source,
-        selection_reason: "Rust semantic core owns code-explainer semantic substrate for this path.".to_string(),
-        summary: build_path_explainer_summary(&symbols.path, &role, line_count, import_count, &detected_symbols),
+        selection_reason:
+            "Rust semantic core owns code-explainer semantic substrate for this path.".to_string(),
+        summary: build_path_explainer_summary(
+            &symbols.path,
+            &role,
+            line_count,
+            import_count,
+            &detected_symbols,
+        ),
         hints: build_path_explainer_hints(&symbols.path, &role),
         warnings: symbols.warnings,
         generated_at: Utc::now().to_rfc3339(),
@@ -574,13 +584,19 @@ fn should_scan_file(relative_path: &str) -> bool {
     if SCANNABLE_SOURCE_FILENAMES.contains(&file_name) {
         return true;
     }
-    let ext = path.extension().and_then(|value| value.to_str()).unwrap_or_default();
+    let ext = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
     SCANNABLE_SOURCE_EXTENSIONS.contains(&format!(".{ext}").as_str())
 }
 
 fn semantic_language_for_path(relative_path: &str) -> Option<String> {
     let path = PathBuf::from(relative_path);
-    let ext = path.extension().and_then(|value| value.to_str()).unwrap_or_default();
+    let ext = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
     match ext {
         "py" => Some("python".to_string()),
         "ts" => Some("typescript".to_string()),
@@ -626,7 +642,10 @@ fn build_file_symbol_summary(
         .map(serde_json::Value::from)
         .collect::<Vec<_>>();
     let mut summary_json = BTreeMap::new();
-    summary_json.insert("top_symbols".to_string(), serde_json::Value::from(top_symbols));
+    summary_json.insert(
+        "top_symbols".to_string(),
+        serde_json::Value::from(top_symbols),
+    );
     summary_json.insert(
         "symbol_kinds".to_string(),
         serde_json::Value::Object(symbol_kinds.into_iter().collect()),
@@ -731,8 +750,7 @@ fn extract_symbols_engine(
                     evidence_source: "rust_semantic_core".to_string(),
                     semantic_status: Some("on_demand".to_string()),
                     selection_reason:
-                        "Rust semantic core extracted this symbol from a changed path."
-                            .to_string(),
+                        "Rust semantic core extracted this symbol from a changed path.".to_string(),
                     change_scopes: Vec::new(),
                     change_statuses: Vec::new(),
                 })
@@ -748,17 +766,25 @@ fn extract_symbols_engine(
     }
 }
 
-fn extract_symbols_from_file(root_path: &Path, relative_path: &str) -> Vec<RustChangedSymbolRecord> {
+fn extract_symbols_from_file(
+    root_path: &Path,
+    relative_path: &str,
+) -> Vec<RustChangedSymbolRecord> {
     extract_symbols_engine(root_path, relative_path).0
 }
 
 fn extract_symbols_with_regex(relative_path: &str, content: &str) -> Vec<RustChangedSymbolRecord> {
     let patterns = [
-        (Regex::new(r"^\s*def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(").unwrap(), "function"),
-        (Regex::new(r"^\s*class\s+([A-Za-z_][A-Za-z0-9_]*)\b").unwrap(), "class"),
         (
-            Regex::new(r"^\s*func\s+(?:\([^)]+\)\s*)?([A-Za-z_][A-Za-z0-9_]*)\s*\(")
-                .unwrap(),
+            Regex::new(r"^\s*def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(").unwrap(),
+            "function",
+        ),
+        (
+            Regex::new(r"^\s*class\s+([A-Za-z_][A-Za-z0-9_]*)\b").unwrap(),
+            "class",
+        ),
+        (
+            Regex::new(r"^\s*func\s+(?:\([^)]+\)\s*)?([A-Za-z_][A-Za-z0-9_]*)\s*\(").unwrap(),
             "function",
         ),
         (
@@ -803,8 +829,8 @@ fn extract_symbols_with_regex(relative_path: &str, content: &str) -> Vec<RustCha
                 enclosing_scope: None, // regex fallback has no AST parent chain
                 evidence_source: "rust_semantic_core".to_string(),
                 semantic_status: Some("on_demand".to_string()),
-                selection_reason:
-                    "Rust semantic core extracted this symbol from a changed path.".to_string(),
+                selection_reason: "Rust semantic core extracted this symbol from a changed path."
+                    .to_string(),
                 change_scopes: Vec::new(),
                 change_statuses: Vec::new(),
             });
@@ -939,8 +965,7 @@ fn count_import_like_lines(content: &str) -> usize {
                 || trimmed.starts_with("use ")
                 || trimmed.starts_with("mod ")
                 || trimmed.starts_with("require(")
-                || trimmed.starts_with("const ")
-                    && trimmed.contains("require(")
+                || trimmed.starts_with("const ") && trimmed.contains("require(")
         })
         .count()
 }
@@ -977,7 +1002,9 @@ fn build_path_explainer_hints(path: &str, role: &str) -> Vec<String> {
     if role == "test" || path.to_lowercase().contains("test") {
         hints.push("Treat this as verification context before modifying runtime code.".to_string());
     } else if path.ends_with(".md") || path.ends_with(".yaml") || path.ends_with(".yml") {
-        hints.push("Treat this as guidance/config context and check whether code agrees.".to_string());
+        hints.push(
+            "Treat this as guidance/config context and check whether code agrees.".to_string(),
+        );
     } else {
         hints.push("Use detected symbols as the first review anchors for this file.".to_string());
     }
@@ -1013,7 +1040,10 @@ mod tests {
 
         write(&root.join("AGENTS.md"), "# instructions\n");
         write(&root.join("src/app.py"), "print('ok')\n");
-        write(&root.join("tests/test_app.py"), "def test_ok():\n    assert True\n");
+        write(
+            &root.join("tests/test_app.py"),
+            "def test_ok():\n    assert True\n",
+        );
         write(&root.join("backend/data/generated.py"), "print('ignore')\n");
         write(&root.join("research/notes.py"), "print('ignore')\n");
 
@@ -1022,8 +1052,18 @@ mod tests {
         assert_eq!(summary.total_files, 3);
         assert_eq!(summary.source_files, 2);
         assert_eq!(summary.test_files, 1);
-        assert!(summary.key_files.iter().any(|item| item.path == "AGENTS.md"));
-        assert!(summary.top_directories.iter().any(|item| item.path == "src"));
+        assert!(
+            summary
+                .key_files
+                .iter()
+                .any(|item| item.path == "AGENTS.md")
+        );
+        assert!(
+            summary
+                .top_directories
+                .iter()
+                .any(|item| item.path == "src")
+        );
     }
 
     #[test]
@@ -1033,7 +1073,10 @@ mod tests {
 
         write(&root.join("README.md"), "# readme\n");
         write(&root.join("src/app.py"), "print('ok')\n");
-        write(&root.join("tests/test_app.py"), "def test_ok():\n    assert True\n");
+        write(
+            &root.join("tests/test_app.py"),
+            "def test_ok():\n    assert True\n",
+        );
         write(&root.join("docs/notes.txt"), "not indexed\n");
         write(&root.join("assets/logo.png"), "png");
         write(&root.join("target/debug.bin"), "bin");
@@ -1043,8 +1086,18 @@ mod tests {
         assert_eq!(summary.total_files, 3);
         assert_eq!(summary.source_files, 2);
         assert_eq!(summary.test_files, 1);
-        assert!(summary.key_files.iter().any(|item| item.path == "README.md"));
-        assert!(summary.key_files.iter().any(|item| item.path == "tests/test_app.py"));
+        assert!(
+            summary
+                .key_files
+                .iter()
+                .any(|item| item.path == "README.md")
+        );
+        assert!(
+            summary
+                .key_files
+                .iter()
+                .any(|item| item.path == "tests/test_app.py")
+        );
     }
 
     #[test]
@@ -1075,14 +1128,18 @@ mod tests {
         )
         .unwrap();
 
-        assert!(report
-            .changed_symbols
-            .iter()
-            .any(|item| item.symbol == "ExportService"));
-        assert!(report
-            .likely_affected_tests
-            .iter()
-            .any(|item| item.path == "tests/test_export.py"));
+        assert!(
+            report
+                .changed_symbols
+                .iter()
+                .any(|item| item.symbol == "ExportService")
+        );
+        assert!(
+            report
+                .likely_affected_tests
+                .iter()
+                .any(|item| item.path == "tests/test_export.py")
+        );
         assert_eq!(report.derivation_source, "rust_semantic_core");
     }
 
@@ -1102,14 +1159,18 @@ mod tests {
         assert_eq!(result.path, "src/app.rs");
         assert_eq!(result.symbol_source, "tree_sitter");
         assert_eq!(result.parser_language.as_deref(), Some("rust"));
-        assert!(result
-            .symbols
-            .iter()
-            .any(|item| item.symbol == "Runner" && item.kind == "type"));
-        assert!(result
-            .symbols
-            .iter()
-            .any(|item| item.symbol == "launch_runner" && item.kind == "function"));
+        assert!(
+            result
+                .symbols
+                .iter()
+                .any(|item| item.symbol == "Runner" && item.kind == "type")
+        );
+        assert!(
+            result
+                .symbols
+                .iter()
+                .any(|item| item.symbol == "launch_runner" && item.kind == "function")
+        );
         assert_eq!(result.evidence_source, "rust_semantic_core");
         assert_eq!(result.file_summary_row.symbol_source, "tree_sitter");
         assert_eq!(result.symbol_rows.len(), 2);
@@ -1132,10 +1193,12 @@ mod tests {
         assert_eq!(result.path, "src/app.py");
         assert_eq!(result.symbol_source, "regex");
         assert_eq!(result.parser_language.as_deref(), Some("python"));
-        assert!(result
-            .symbols
-            .iter()
-            .any(|item| item.symbol == "ExportService" && item.kind == "class"));
+        assert!(
+            result
+                .symbols
+                .iter()
+                .any(|item| item.symbol == "ExportService" && item.kind == "class")
+        );
         assert_eq!(result.file_summary_row.symbol_source, "regex");
         assert_eq!(result.file_summary_row.symbol_count, 2);
     }
@@ -1156,13 +1219,17 @@ mod tests {
         assert_eq!(result.path, "src/app.py");
         assert_eq!(result.role, "source");
         assert_eq!(result.import_count, 1);
-        assert!(result
-            .detected_symbols
-            .iter()
-            .any(|item| item == "ExportService"));
+        assert!(
+            result
+                .detected_symbols
+                .iter()
+                .any(|item| item == "ExportService")
+        );
         assert_eq!(result.evidence_source, "rust_semantic_core");
-        assert!(result
-            .selection_reason
-            .contains("code-explainer semantic substrate"));
+        assert!(
+            result
+                .selection_reason
+                .contains("code-explainer semantic substrate")
+        );
     }
 }

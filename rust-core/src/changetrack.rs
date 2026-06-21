@@ -19,7 +19,12 @@ fn now() -> String {
 }
 
 fn git(root: &Path, args: &[&str]) -> Option<String> {
-    let out = Command::new("git").arg("-C").arg(root).args(args).output().ok()?;
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .ok()?;
     if !out.status.success() {
         return None;
     }
@@ -189,7 +194,11 @@ fn classify_signature_change(old: &str, new: &str) -> String {
     };
     let return_part = |s: &str| -> String {
         match s.rfind(')') {
-            Some(rp) => s[rp + 1..].trim().trim_start_matches("->").trim().to_string(),
+            Some(rp) => s[rp + 1..]
+                .trim()
+                .trim_start_matches("->")
+                .trim()
+                .to_string(),
             None => String::new(),
         }
     };
@@ -330,7 +339,11 @@ pub fn detect_drift(data_dir: &Path, root: &Path, workspace_id: &str) -> DriftRe
     if head_changed {
         reasons.push(format!(
             "HEAD moved {} -> {}",
-            baseline.fingerprint.head_sha.clone().unwrap_or_else(|| "?".into()),
+            baseline
+                .fingerprint
+                .head_sha
+                .clone()
+                .unwrap_or_else(|| "?".into()),
             current.head_sha.clone().unwrap_or_else(|| "?".into())
         ));
     }
@@ -341,7 +354,10 @@ pub fn detect_drift(data_dir: &Path, root: &Path, workspace_id: &str) -> DriftRe
         reasons.push("index baseline came from a different clone/remote".to_string());
     }
     if current.dirty {
-        reasons.push(format!("{} uncommitted dirty path(s)", current.dirty_path_count));
+        reasons.push(format!(
+            "{} uncommitted dirty path(s)",
+            current.dirty_path_count
+        ));
     }
     DriftReport {
         workspace_id: workspace_id.to_string(),
@@ -413,16 +429,23 @@ fn diff_hash_maps(
     let mut out = Vec::new();
     for (path, hash) in current {
         match baseline.get(path) {
-            None => out.push(ChangedFile { path: path.clone(), change: "added".into() }),
-            Some(b) if b != hash => {
-                out.push(ChangedFile { path: path.clone(), change: "modified".into() })
-            }
+            None => out.push(ChangedFile {
+                path: path.clone(),
+                change: "added".into(),
+            }),
+            Some(b) if b != hash => out.push(ChangedFile {
+                path: path.clone(),
+                change: "modified".into(),
+            }),
             _ => {}
         }
     }
     for path in baseline.keys() {
         if !current.contains_key(path) {
-            out.push(ChangedFile { path: path.clone(), change: "deleted".into() });
+            out.push(ChangedFile {
+                path: path.clone(),
+                change: "deleted".into(),
+            });
         }
     }
     out.sort_by(|a, b| a.path.cmp(&b.path));
@@ -453,9 +476,10 @@ fn dirty_symbols_for(
                     && let Some(sigs) = baseline_sigs
                 {
                     let key = signature_key(&cf.path, sym.enclosing_scope.as_deref(), &sym.symbol);
-                    if let (Some(old), Some(new)) =
-                        (sigs.get(&key), symbol_signature(root, &cf.path, sym.line_start))
-                        && old != &new
+                    if let (Some(old), Some(new)) = (
+                        sigs.get(&key),
+                        symbol_signature(root, &cf.path, sym.line_start),
+                    ) && old != &new
                     {
                         contract_break = true;
                         signature_change = Some(classify_signature_change(old, &new));
@@ -487,7 +511,10 @@ pub fn changed_since_baseline(data_dir: &Path, root: &Path, workspace_id: &str) 
         Some(baseline) => diff_hash_maps(&baseline.file_hashes, &current),
         None => current
             .keys()
-            .map(|p| ChangedFile { path: p.clone(), change: "added".into() })
+            .map(|p| ChangedFile {
+                path: p.clone(),
+                change: "added".into(),
+            })
             .collect(),
     };
     let dirty_symbols = dirty_symbols_for(
@@ -519,7 +546,10 @@ pub fn working_tree_changes(data_dir: &Path, root: &Path, workspace_id: &str) ->
         } else {
             "modified"
         };
-        changed_files.push(ChangedFile { path, change: change.to_string() });
+        changed_files.push(ChangedFile {
+            path,
+            change: change.to_string(),
+        });
     }
     changed_files.sort_by(|a, b| a.path.cmp(&b.path));
     let baseline = load_index_baseline(data_dir, workspace_id);
@@ -675,12 +705,27 @@ mod tests {
             vec!["config", "user.email", "t@t"],
             vec!["config", "user.name", "t"],
         ] {
-            Command::new("git").arg("-C").arg(dir).args(&args).output().unwrap();
+            Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(&args)
+                .output()
+                .unwrap();
         }
     }
     fn git_commit(dir: &Path) {
-        Command::new("git").arg("-C").arg(dir).args(["add", "-A"]).output().unwrap();
-        Command::new("git").arg("-C").arg(dir).args(["commit", "-qm", "c"]).output().unwrap();
+        Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["add", "-A"])
+            .output()
+            .unwrap();
+        Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["commit", "-qm", "c"])
+            .output()
+            .unwrap();
     }
 
     #[test]
@@ -695,7 +740,11 @@ mod tests {
         assert!(fp1.head_sha.is_some());
         assert_eq!(fp1.tracked_file_count, 1);
 
-        fs::write(dir.path().join("a.rs"), "pub fn one() {}\npub fn two() {}\n").unwrap();
+        fs::write(
+            dir.path().join("a.rs"),
+            "pub fn one() {}\npub fn two() {}\n",
+        )
+        .unwrap();
         let fp3 = compute_fingerprint(dir.path());
         assert_ne!(fp1.content_hash, fp3.content_hash);
         assert!(fp3.dirty);
@@ -714,20 +763,36 @@ mod tests {
 
         // no drift right after indexing
         let drift0 = detect_drift(data.path(), repo.path(), "ws");
-        assert!(!drift0.stale, "fresh baseline should not be stale: {:?}", drift0.reasons);
+        assert!(
+            !drift0.stale,
+            "fresh baseline should not be stale: {:?}",
+            drift0.reasons
+        );
 
         // modify + commit -> head + content change -> stale
-        fs::write(repo.path().join("a.rs"), "pub fn one() {}\npub fn two() {}\n").unwrap();
+        fs::write(
+            repo.path().join("a.rs"),
+            "pub fn one() {}\npub fn two() {}\n",
+        )
+        .unwrap();
         git_commit(repo.path());
         let drift1 = detect_drift(data.path(), repo.path(), "ws");
         assert!(drift1.stale && drift1.head_changed && drift1.content_changed);
 
         let cs = changed_since_baseline(data.path(), repo.path(), "ws");
-        assert!(cs.changed_files.iter().any(|c| c.path == "a.rs" && c.change == "modified"));
+        assert!(
+            cs.changed_files
+                .iter()
+                .any(|c| c.path == "a.rs" && c.change == "modified")
+        );
         // dirty symbols include the new function
         assert!(cs.dirty_symbols.iter().any(|s| s.symbol == "two"));
         // adding a NEW function is not a contract break of an existing symbol.
-        assert_eq!(cs.contract_breaks, 0, "a new symbol is not a break: {:?}", cs.dirty_symbols);
+        assert_eq!(
+            cs.contract_breaks, 0,
+            "a new symbol is not a break: {:?}",
+            cs.dirty_symbols
+        );
     }
 
     #[test]
@@ -757,16 +822,30 @@ mod tests {
         git_commit(repo.path());
 
         let cs = changed_since_baseline(data.path(), repo.path(), "ws");
-        assert_eq!(cs.contract_breaks, 1, "only `add` should break: {:?}", cs.dirty_symbols);
+        assert_eq!(
+            cs.contract_breaks, 1,
+            "only `add` should break: {:?}",
+            cs.dirty_symbols
+        );
         let add = cs.dirty_symbols.iter().find(|s| s.symbol == "add").unwrap();
         assert!(add.contract_break, "add must be flagged: {add:?}");
         assert!(
-            add.signature_change.as_deref().unwrap_or("").contains("params 2→3"),
+            add.signature_change
+                .as_deref()
+                .unwrap_or("")
+                .contains("params 2→3"),
             "reason should name the arity change: {:?}",
             add.signature_change
         );
-        let keep = cs.dirty_symbols.iter().find(|s| s.symbol == "keep").unwrap();
-        assert!(!keep.contract_break, "body-only edit is not a break: {keep:?}");
+        let keep = cs
+            .dirty_symbols
+            .iter()
+            .find(|s| s.symbol == "keep")
+            .unwrap();
+        assert!(
+            !keep.contract_break,
+            "body-only edit is not a break: {keep:?}"
+        );
     }
 
     #[test]
@@ -774,19 +853,36 @@ mod tests {
         let data = TempDir::new().unwrap();
         let repo = TempDir::new().unwrap();
         git_init(repo.path());
-        fs::write(repo.path().join("api.rs"), "pub fn handler(req: u32) -> bool {\n    req > 0\n}\n")
-            .unwrap();
+        fs::write(
+            repo.path().join("api.rs"),
+            "pub fn handler(req: u32) -> bool {\n    req > 0\n}\n",
+        )
+        .unwrap();
         git_commit(repo.path());
         build_index_baseline(data.path(), repo.path(), "ws").unwrap();
 
         // change the return type WITHOUT committing → working-tree (grounding) view.
-        fs::write(repo.path().join("api.rs"), "pub fn handler(req: u32) -> String {\n    req.to_string()\n}\n")
-            .unwrap();
+        fs::write(
+            repo.path().join("api.rs"),
+            "pub fn handler(req: u32) -> String {\n    req.to_string()\n}\n",
+        )
+        .unwrap();
         let cs = working_tree_changes(data.path(), repo.path(), "ws");
-        assert_eq!(cs.contract_breaks, 1, "return-type change should break: {:?}", cs.dirty_symbols);
-        let h = cs.dirty_symbols.iter().find(|s| s.symbol == "handler").unwrap();
+        assert_eq!(
+            cs.contract_breaks, 1,
+            "return-type change should break: {:?}",
+            cs.dirty_symbols
+        );
+        let h = cs
+            .dirty_symbols
+            .iter()
+            .find(|s| s.symbol == "handler")
+            .unwrap();
         assert!(
-            h.signature_change.as_deref().unwrap_or("").contains("return"),
+            h.signature_change
+                .as_deref()
+                .unwrap_or("")
+                .contains("return"),
             "reason should name the return change: {:?}",
             h.signature_change
         );
@@ -803,7 +899,10 @@ mod tests {
         cur.insert("mod".to_string(), "h2".to_string());
         cur.insert("new".to_string(), "h".to_string());
         let diff = diff_hash_maps(&base, &cur);
-        let by: BTreeMap<_, _> = diff.iter().map(|c| (c.path.as_str(), c.change.as_str())).collect();
+        let by: BTreeMap<_, _> = diff
+            .iter()
+            .map(|c| (c.path.as_str(), c.change.as_str()))
+            .collect();
         assert_eq!(by.get("new"), Some(&"added"));
         assert_eq!(by.get("mod"), Some(&"modified"));
         assert_eq!(by.get("gone"), Some(&"deleted"));
@@ -825,7 +924,11 @@ mod tests {
         let e2 = record_incorporation(data.path(), repo.path(), "ws").unwrap();
         assert!(e2.is_empty());
         // change + record -> "changed"
-        fs::write(repo.path().join("a.rs"), "pub fn one() {}\npub fn two() {}\n").unwrap();
+        fs::write(
+            repo.path().join("a.rs"),
+            "pub fn one() {}\npub fn two() {}\n",
+        )
+        .unwrap();
         git_commit(repo.path());
         let e3 = record_incorporation(data.path(), repo.path(), "ws").unwrap();
         assert!(e3.iter().any(|e| e.path == "a.rs" && e.event == "changed"));

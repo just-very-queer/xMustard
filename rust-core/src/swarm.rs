@@ -54,7 +54,9 @@ impl SwarmRole {
             "critic" => Ok(SwarmRole::Critic),
             "verifier" => Ok(SwarmRole::Verifier),
             "controller" => Ok(SwarmRole::Controller),
-            other => Err(GoalError::Validation(format!("invalid swarm role {other:?}"))),
+            other => Err(GoalError::Validation(format!(
+                "invalid swarm role {other:?}"
+            ))),
         }
     }
 
@@ -147,10 +149,7 @@ fn lane_for(role: SwarmRole, iterations: &[GoalIterationRecord]) -> SwarmLane {
         .iter()
         .any(|it| it.evidence.iter().any(GoalEvidence::is_verification));
     let has_evidence = mine.iter().any(|it| !it.evidence.is_empty());
-    let last_outcome = mine
-        .last()
-        .map(|it| it.outcome.clone())
-        .unwrap_or_default();
+    let last_outcome = mine.last().map(|it| it.outcome.clone()).unwrap_or_default();
     SwarmLane {
         role,
         iterations: mine.len(),
@@ -208,10 +207,17 @@ pub fn gate_over(goal: &GoalRecord, iterations: &[GoalIterationRecord]) -> Swarm
 
     let mut reasons = Vec::new();
     let decision = if has_block {
-        for it in iterations.iter().filter(|it| outcome_is_failure(&it.outcome)) {
+        for it in iterations
+            .iter()
+            .filter(|it| outcome_is_failure(&it.outcome))
+        {
             reasons.push(format!(
                 "{} lane reported '{}': {}",
-                if it.role.is_empty() { "worker" } else { &it.role },
+                if it.role.is_empty() {
+                    "worker"
+                } else {
+                    &it.role
+                },
                 it.outcome,
                 it.summary
             ));
@@ -322,11 +328,35 @@ mod tests {
     fn complete_requires_verifier_evidence_and_critic() {
         let dir = TempDir::new().unwrap();
         let id = seed_goal(dir.path());
-        record_lane(dir.path(), "ws", &id, SwarmRole::Reader, iter(SwarmRole::Reader, "Mapped the candidate files")).unwrap();
-        record_lane(dir.path(), "ws", &id, SwarmRole::Builder, iter(SwarmRole::Builder, "Drafted the patch in scope")).unwrap();
+        record_lane(
+            dir.path(),
+            "ws",
+            &id,
+            SwarmRole::Reader,
+            iter(SwarmRole::Reader, "Mapped the candidate files"),
+        )
+        .unwrap();
+        record_lane(
+            dir.path(),
+            "ws",
+            &id,
+            SwarmRole::Builder,
+            iter(SwarmRole::Builder, "Drafted the patch in scope"),
+        )
+        .unwrap();
         // Only critic so far -> still Accept (no verifier evidence).
-        record_lane(dir.path(), "ws", &id, SwarmRole::Critic, iter(SwarmRole::Critic, "Reviewed the diff, low risk")).unwrap();
-        assert_eq!(gate(dir.path(), "ws", &id).unwrap().decision, SwarmDecision::Accept);
+        record_lane(
+            dir.path(),
+            "ws",
+            &id,
+            SwarmRole::Critic,
+            iter(SwarmRole::Critic, "Reviewed the diff, low risk"),
+        )
+        .unwrap();
+        assert_eq!(
+            gate(dir.path(), "ws", &id).unwrap().decision,
+            SwarmDecision::Accept
+        );
         // Verifier with real evidence -> Complete.
         let mut v = iter(SwarmRole::Verifier, "Ran the suite, all green");
         v.evidence = vec![GoalEvidence {
@@ -345,7 +375,10 @@ mod tests {
     fn failure_outcome_blocks() {
         let dir = TempDir::new().unwrap();
         let id = seed_goal(dir.path());
-        let mut b = iter(SwarmRole::Builder, "Attempted the patch but the build broke");
+        let mut b = iter(
+            SwarmRole::Builder,
+            "Attempted the patch but the build broke",
+        );
         b.outcome = "failed".to_string();
         record_lane(dir.path(), "ws", &id, SwarmRole::Builder, b).unwrap();
         let g = gate(dir.path(), "ws", &id).unwrap();
@@ -357,12 +390,21 @@ mod tests {
     fn out_of_surface_builder_narrows() {
         let dir = TempDir::new().unwrap();
         let id = seed_goal(dir.path());
-        let mut b = iter(SwarmRole::Builder, "Edited a file outside the allowed surface");
-        b.files_touched = vec!["frontend/src/App.tsx".to_string(), "rust-core/src/swarm.rs".to_string()];
+        let mut b = iter(
+            SwarmRole::Builder,
+            "Edited a file outside the allowed surface",
+        );
+        b.files_touched = vec![
+            "frontend/src/App.tsx".to_string(),
+            "rust-core/src/swarm.rs".to_string(),
+        ];
         record_lane(dir.path(), "ws", &id, SwarmRole::Builder, b).unwrap();
         let g = gate(dir.path(), "ws", &id).unwrap();
         assert_eq!(g.decision, SwarmDecision::Narrow);
-        assert_eq!(g.surface_violations, vec!["frontend/src/App.tsx".to_string()]);
+        assert_eq!(
+            g.surface_violations,
+            vec!["frontend/src/App.tsx".to_string()]
+        );
     }
 
     #[test]

@@ -389,8 +389,10 @@ pub mod slop {
     pub fn lint_evidence(field: &str, evidence: &GoalEvidence) -> Vec<SlopFinding> {
         let mut findings = Vec::new();
         let outcome = evidence.outcome.trim().to_ascii_lowercase();
-        let claims_success =
-            matches!(outcome.as_str(), "pass" | "passed" | "success" | "ok" | "green");
+        let claims_success = matches!(
+            outcome.as_str(),
+            "pass" | "passed" | "success" | "ok" | "green"
+        );
         let has_anchor = !evidence.command.trim().is_empty()
             || !evidence.path.trim().is_empty()
             || !evidence.url.trim().is_empty();
@@ -848,7 +850,10 @@ pub fn update_status(
         if !report.ok {
             return Err(GoalError::CompletionBlocked(report.blocking_summary()));
         }
-        let has_verification = goals[index].evidence.iter().any(GoalEvidence::is_verification)
+        let has_verification = goals[index]
+            .evidence
+            .iter()
+            .any(GoalEvidence::is_verification)
             || iteration_evidence.iter().any(|e| e.is_verification());
         if !has_verification {
             // Skip reason was supplied; persist it as audit evidence.
@@ -1010,7 +1015,11 @@ pub fn write_ledger(data_dir: &Path, workspace_id: &str, goal: &GoalRecord) -> R
     write_field(&mut out, "Preferred model", &goal.preferred_model);
     write_list(&mut out, "Acceptance Criteria", &goal.acceptance_criteria);
     write_list(&mut out, "Allowed Surface", &goal.allowed_surface);
-    write_list(&mut out, "Verification Commands", &goal.verification_commands);
+    write_list(
+        &mut out,
+        "Verification Commands",
+        &goal.verification_commands,
+    );
     write_list(
         &mut out,
         "Verification Profile IDs",
@@ -1099,7 +1108,11 @@ pub fn build_context_packet(data_dir: &Path, workspace_id: &str, goal_id: &str) 
     write_field(&mut out, "Preferred model", &goal.preferred_model);
     write_list(&mut out, "Acceptance Criteria", &goal.acceptance_criteria);
     write_list(&mut out, "Allowed Surface", &goal.allowed_surface);
-    write_list(&mut out, "Verification Commands", &goal.verification_commands);
+    write_list(
+        &mut out,
+        "Verification Commands",
+        &goal.verification_commands,
+    );
     write_list(
         &mut out,
         "Verification Profile IDs",
@@ -1172,14 +1185,21 @@ mod tests {
         assert_eq!(slug_id("Build Rust Goal CLI"), "build-rust-goal-cli");
         assert_eq!(slug_id("  Hello, World!! "), "hello-world");
         assert!(slug_id("日本語").starts_with("goal-"));
-        assert_eq!(compact_timestamp("2026-06-16T01:11:45.123456789Z").len(), 15);
+        assert_eq!(
+            compact_timestamp("2026-06-16T01:11:45.123456789Z").len(),
+            15
+        );
     }
 
     #[test]
     fn create_then_get_round_trips() {
         let dir = TempDir::new().unwrap();
-        let (goal, report) =
-            create_goal(dir.path(), "ws1", &create_req("Build CLI", "Ship a Rust goal CLI")).unwrap();
+        let (goal, report) = create_goal(
+            dir.path(),
+            "ws1",
+            &create_req("Build CLI", "Ship a Rust goal CLI"),
+        )
+        .unwrap();
         assert_eq!(goal.goal_id, "build-cli");
         assert_eq!(goal.status, GoalStatus::Draft);
         assert!(report.ok);
@@ -1201,8 +1221,18 @@ mod tests {
     #[test]
     fn duplicate_titles_get_unique_ids() {
         let dir = TempDir::new().unwrap();
-        let (a, _) = create_goal(dir.path(), "ws1", &create_req("Dup", "first objective here")).unwrap();
-        let (b, _) = create_goal(dir.path(), "ws1", &create_req("Dup", "second objective here")).unwrap();
+        let (a, _) = create_goal(
+            dir.path(),
+            "ws1",
+            &create_req("Dup", "first objective here"),
+        )
+        .unwrap();
+        let (b, _) = create_goal(
+            dir.path(),
+            "ws1",
+            &create_req("Dup", "second objective here"),
+        )
+        .unwrap();
         assert_eq!(a.goal_id, "dup");
         assert_ne!(a.goal_id, b.goal_id);
         assert!(b.goal_id.starts_with("dup-"));
@@ -1226,7 +1256,10 @@ mod tests {
             ..Default::default()
         };
         let (iter, report) = append_iteration(dir.path(), "ws1", "goal", &real).unwrap();
-        assert_eq!(iter.iteration_id, format!("{}-001", &iter.iteration_id[..15]));
+        assert_eq!(
+            iter.iteration_id,
+            format!("{}-001", &iter.iteration_id[..15])
+        );
         assert!(report.ok);
     }
 
@@ -1290,7 +1323,12 @@ mod tests {
     #[test]
     fn ledger_and_context_render_without_panicking() {
         let dir = TempDir::new().unwrap();
-        create_goal(dir.path(), "ws1", &create_req("Render", "render the ledger surface")).unwrap();
+        create_goal(
+            dir.path(),
+            "ws1",
+            &create_req("Render", "render the ledger surface"),
+        )
+        .unwrap();
         let ledger = read_ledger(dir.path(), "ws1", "render").unwrap();
         assert!(ledger.contains("# Goal Ledger: Render"));
         assert!(ledger.contains("Completion Gate"));
@@ -1314,9 +1352,16 @@ mod tests {
         // finding codes with their mandated severity.
 
         enum Op {
-            Create { objective: &'static str },
-            Iter { summary: &'static str, objective: &'static str },
-            Evidence { outcome: &'static str },
+            Create {
+                objective: &'static str,
+            },
+            Iter {
+                summary: &'static str,
+                objective: &'static str,
+            },
+            Evidence {
+                outcome: &'static str,
+            },
         }
 
         struct Row {
@@ -1329,28 +1374,38 @@ mod tests {
             // (1) Refusal markers -> Blocking "refusal-marker"
             Row {
                 name: "refusal-as-an-ai",
-                op: Op::Create { objective: "As an AI, I cannot do this" },
+                op: Op::Create {
+                    objective: "As an AI, I cannot do this",
+                },
                 want: vec![("refusal-marker", SlopSeverity::Blocking)],
             },
             Row {
                 name: "refusal-i-cannot",
-                op: Op::Create { objective: "I cannot help with this task" },
+                op: Op::Create {
+                    objective: "I cannot help with this task",
+                },
                 want: vec![("refusal-marker", SlopSeverity::Blocking)],
             },
             // (2) Placeholder markers -> Warning "placeholder-marker"
             Row {
                 name: "placeholder-todo",
-                op: Op::Create { objective: "TODO: implement something" },
+                op: Op::Create {
+                    objective: "TODO: implement something",
+                },
                 want: vec![("placeholder-marker", SlopSeverity::Warning)],
             },
             Row {
                 name: "placeholder-tbd",
-                op: Op::Create { objective: "tbd later discussion" },
+                op: Op::Create {
+                    objective: "tbd later discussion",
+                },
                 want: vec![("placeholder-marker", SlopSeverity::Warning)],
             },
             Row {
                 name: "placeholder-lorem-ipsum",
-                op: Op::Create { objective: "Lorem ipsum dolor sit" },
+                op: Op::Create {
+                    objective: "Lorem ipsum dolor sit",
+                },
                 want: vec![("placeholder-marker", SlopSeverity::Warning)],
             },
             // (3) Evidence pass/ok with no command/path/url -> Warning
@@ -1367,27 +1422,34 @@ mod tests {
             // (4) Summary equals objective -> Warning
             Row {
                 name: "summary-echoes-objective",
-                op: Op::Iter { summary: "build the goal cli", objective: "build the goal cli" },
+                op: Op::Iter {
+                    summary: "build the goal cli",
+                    objective: "build the goal cli",
+                },
                 want: vec![("summary-echoes-objective", SlopSeverity::Warning)],
             },
             // (5) Empty/whitespace required summary -> Blocking
             Row {
                 name: "empty-required-empty",
-                op: Op::Iter { summary: "", objective: "do the thing" },
+                op: Op::Iter {
+                    summary: "",
+                    objective: "do the thing",
+                },
                 want: vec![("empty-required", SlopSeverity::Blocking)],
             },
             Row {
                 name: "empty-required-whitespace",
-                op: Op::Iter { summary: "   ", objective: "do the thing" },
+                op: Op::Iter {
+                    summary: "   ",
+                    objective: "do the thing",
+                },
                 want: vec![("empty-required", SlopSeverity::Blocking)],
             },
         ];
 
         for row in &rows {
             let findings: Vec<slop::SlopFinding> = match &row.op {
-                Op::Create { objective } => {
-                    slop::lint_create("Test", objective, &[]).findings
-                }
+                Op::Create { objective } => slop::lint_create("Test", objective, &[]).findings,
                 Op::Iter { summary, objective } => {
                     let req = GoalIterationAppendRequest {
                         summary: summary.to_string(),
@@ -1406,7 +1468,9 @@ mod tests {
             };
             for (code, severity) in &row.want {
                 assert!(
-                    findings.iter().any(|f| f.code == *code && f.severity == *severity),
+                    findings
+                        .iter()
+                        .any(|f| f.code == *code && f.severity == *severity),
                     "[{}] expected finding ({code}, {severity:?}) not in {findings:?}",
                     row.name,
                 );

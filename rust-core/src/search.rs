@@ -271,7 +271,8 @@ pub fn hybrid_search(
             prox.insert(d.clone(), 1.0); // the seed's own file: distance 0
         }
         for f in &impact.impacted {
-            prox.entry(f.path.clone()).or_insert(1.0 / (f.distance as f64 + 1.0));
+            prox.entry(f.path.clone())
+                .or_insert(1.0 / (f.distance as f64 + 1.0));
         }
         if !prox.is_empty() {
             for c in &mut cands {
@@ -383,17 +384,35 @@ mod tests {
             vec!["config", "user.email", "t@t"],
             vec!["config", "user.name", "t"],
         ] {
-            Command::new("git").arg("-C").arg(dir.path()).args(&args).output().unwrap();
+            Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args(&args)
+                .output()
+                .unwrap();
         }
-        Command::new("git").arg("-C").arg(dir.path()).args(["add", "-A"]).output().unwrap();
-        Command::new("git").arg("-C").arg(dir.path()).args(["commit", "-qm", "c"]).output().unwrap();
+        Command::new("git")
+            .arg("-C")
+            .arg(dir.path())
+            .args(["add", "-A"])
+            .output()
+            .unwrap();
+        Command::new("git")
+            .arg("-C")
+            .arg(dir.path())
+            .args(["commit", "-qm", "c"])
+            .output()
+            .unwrap();
         dir
     }
 
     #[test]
     fn search_ranks_matching_symbol_first() {
         let repo = git_repo(&[
-            ("a.rs", "pub fn compute_widget_total() {}\npub fn unrelated_thing() {}\n"),
+            (
+                "a.rs",
+                "pub fn compute_widget_total() {}\npub fn unrelated_thing() {}\n",
+            ),
             ("b.rs", "pub fn other_helper() {}\n"),
         ]);
         let res = hybrid_search(repo.path(), "ws", "compute_widget_total", 10, None);
@@ -418,7 +437,10 @@ mod tests {
         // "dashbord" (misspelled, no exact token) should still surface
         // render_dashboard via the char-trigram embedding lane under RRF.
         let repo = git_repo(&[
-            ("ui.rs", "pub fn render_dashboard() {}\npub fn save_invoice() {}\n"),
+            (
+                "ui.rs",
+                "pub fn render_dashboard() {}\npub fn save_invoice() {}\n",
+            ),
             ("b.rs", "pub fn unrelated_widget() {}\n"),
         ]);
         let res = hybrid_search(repo.path(), "ws", "dashbord", 10, None);
@@ -433,8 +455,16 @@ mod tests {
     fn rrf_reason_notes_fused_lanes() {
         let repo = git_repo(&[("a.rs", "pub fn compute_widget() {}\n")]);
         let res = hybrid_search(repo.path(), "ws", "widget", 10, None);
-        let hit = res.hits.iter().find(|h| h.name == "compute_widget").unwrap();
-        assert!(hit.reason.contains("lexical") || hit.reason.contains("semantic"), "{}", hit.reason);
+        let hit = res
+            .hits
+            .iter()
+            .find(|h| h.name == "compute_widget")
+            .unwrap();
+        assert!(
+            hit.reason.contains("lexical") || hit.reason.contains("semantic"),
+            "{}",
+            hit.reason
+        );
     }
 
     #[test]
@@ -448,9 +478,7 @@ mod tests {
             ("near.rs", "pub fn zzz_token_near() { resolve_token(); }\n"),
             ("far.rs", "pub fn aaa_token_far() {}\n"),
         ]);
-        let pos = |res: &SearchResult, name: &str| {
-            res.hits.iter().position(|h| h.name == name)
-        };
+        let pos = |res: &SearchResult, name: &str| res.hits.iter().position(|h| h.name == name);
 
         let plain = hybrid_search(repo.path(), "ws", "token", 10, None);
         let near_plain = pos(&plain, "zzz_token_near").expect("near present");
@@ -488,7 +516,9 @@ mod tests {
         let res = hybrid_search(repo.path(), "ws", "token", 10, None);
         let handler = res.hits.iter().find(|h| h.name == "token_handler");
         assert!(
-            handler.map(|h| h.reason.contains("proximity")).unwrap_or(false),
+            handler
+                .map(|h| h.reason.contains("proximity"))
+                .unwrap_or(false),
             "exact-match auto-seed should credit the caller via proximity: {:?}",
             res.hits
         );
@@ -504,7 +534,10 @@ mod tests {
     fn embed_is_normalized_and_fuzzy() {
         let a = embed("dashboard");
         let norm: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-        assert!((norm - 1.0).abs() < 1e-4, "embedding must be L2-normalized, got {norm}");
+        assert!(
+            (norm - 1.0).abs() < 1e-4,
+            "embedding must be L2-normalized, got {norm}"
+        );
         // a near-miss spelling should be closer than an unrelated token
         let near = cosine(&embed("dashboard"), &embed("dashbord"));
         let far = cosine(&embed("dashboard"), &embed("invoice"));

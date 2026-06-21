@@ -80,7 +80,10 @@ fn main() {
                     std::process::exit(1);
                 }
             };
-            let changes = match serde_json::from_str::<Vec<xmustard_core::repomap::RustRepoChangeRecord>>(&changes_content) {
+            let changes = match serde_json::from_str::<
+                Vec<xmustard_core::repomap::RustRepoChangeRecord>,
+            >(&changes_content)
+            {
                 Ok(changes) => changes,
                 Err(err) => {
                     eprintln!("semantic-impact failed to decode changes: {err}");
@@ -88,11 +91,8 @@ fn main() {
                 }
             };
             let root_path = PathBuf::from(root);
-            match xmustard_core::repomap::build_semantic_impact(
-                &root_path,
-                &workspace_id,
-                &changes,
-            ) {
+            match xmustard_core::repomap::build_semantic_impact(&root_path, &workspace_id, &changes)
+            {
                 Ok(report) => {
                     println!(
                         "{}",
@@ -108,15 +108,21 @@ fn main() {
         }
         "path-symbols" => {
             let Some(workspace_id) = args.next() else {
-                eprintln!("usage: xmustard-core path-symbols <workspace_id> <root_path> <relative_path>");
+                eprintln!(
+                    "usage: xmustard-core path-symbols <workspace_id> <root_path> <relative_path>"
+                );
                 std::process::exit(2);
             };
             let Some(root) = args.next() else {
-                eprintln!("usage: xmustard-core path-symbols <workspace_id> <root_path> <relative_path>");
+                eprintln!(
+                    "usage: xmustard-core path-symbols <workspace_id> <root_path> <relative_path>"
+                );
                 std::process::exit(2);
             };
             let Some(relative_path) = args.next() else {
-                eprintln!("usage: xmustard-core path-symbols <workspace_id> <root_path> <relative_path>");
+                eprintln!(
+                    "usage: xmustard-core path-symbols <workspace_id> <root_path> <relative_path>"
+                );
                 std::process::exit(2);
             };
             match xmustard_core::repomap::extract_path_symbols(
@@ -139,15 +145,21 @@ fn main() {
         }
         "explain-path" => {
             let Some(workspace_id) = args.next() else {
-                eprintln!("usage: xmustard-core explain-path <workspace_id> <root_path> <relative_path>");
+                eprintln!(
+                    "usage: xmustard-core explain-path <workspace_id> <root_path> <relative_path>"
+                );
                 std::process::exit(2);
             };
             let Some(root) = args.next() else {
-                eprintln!("usage: xmustard-core explain-path <workspace_id> <root_path> <relative_path>");
+                eprintln!(
+                    "usage: xmustard-core explain-path <workspace_id> <root_path> <relative_path>"
+                );
                 std::process::exit(2);
             };
             let Some(relative_path) = args.next() else {
-                eprintln!("usage: xmustard-core explain-path <workspace_id> <root_path> <relative_path>");
+                eprintln!(
+                    "usage: xmustard-core explain-path <workspace_id> <root_path> <relative_path>"
+                );
                 std::process::exit(2);
             };
             match xmustard_core::repomap::explain_path(
@@ -170,15 +182,21 @@ fn main() {
         }
         "normalize-diagnostics" => {
             let Some(workspace_id) = args.next() else {
-                eprintln!("usage: xmustard-core normalize-diagnostics <workspace_id> <root_path> <input_json_path> <source_kind> <source_name>");
+                eprintln!(
+                    "usage: xmustard-core normalize-diagnostics <workspace_id> <root_path> <input_json_path> <source_kind> <source_name>"
+                );
                 std::process::exit(2);
             };
             let Some(root) = args.next() else {
-                eprintln!("usage: xmustard-core normalize-diagnostics <workspace_id> <root_path> <input_json_path> <source_kind> <source_name>");
+                eprintln!(
+                    "usage: xmustard-core normalize-diagnostics <workspace_id> <root_path> <input_json_path> <source_kind> <source_name>"
+                );
                 std::process::exit(2);
             };
             let Some(input_json_path) = args.next() else {
-                eprintln!("usage: xmustard-core normalize-diagnostics <workspace_id> <root_path> <input_json_path> <source_kind> <source_name>");
+                eprintln!(
+                    "usage: xmustard-core normalize-diagnostics <workspace_id> <root_path> <input_json_path> <source_kind> <source_name>"
+                );
                 std::process::exit(2);
             };
             let source_kind = args.next().unwrap_or_else(|| "lsp".to_string());
@@ -205,17 +223,23 @@ fn main() {
         }
         "archive-diagnostics-payload" => {
             let Some(workspace_id) = args.next() else {
-                eprintln!("usage: xmustard-core archive-diagnostics-payload <workspace_id> <input_json_path> <source_kind> <source_name> <server_provenance_json_path>");
+                eprintln!(
+                    "usage: xmustard-core archive-diagnostics-payload <workspace_id> <input_json_path> <source_kind> <source_name> <server_provenance_json_path>"
+                );
                 std::process::exit(2);
             };
             let Some(input_json_path) = args.next() else {
-                eprintln!("usage: xmustard-core archive-diagnostics-payload <workspace_id> <input_json_path> <source_kind> <source_name> <server_provenance_json_path>");
+                eprintln!(
+                    "usage: xmustard-core archive-diagnostics-payload <workspace_id> <input_json_path> <source_kind> <source_name> <server_provenance_json_path>"
+                );
                 std::process::exit(2);
             };
             let source_kind = args.next().unwrap_or_else(|| "lsp".to_string());
             let source_name = args.next().unwrap_or_else(|| "unknown".to_string());
             let Some(server_provenance_json_path) = args.next() else {
-                eprintln!("usage: xmustard-core archive-diagnostics-payload <workspace_id> <input_json_path> <source_kind> <source_name> <server_provenance_json_path>");
+                eprintln!(
+                    "usage: xmustard-core archive-diagnostics-payload <workspace_id> <input_json_path> <source_kind> <source_name> <server_provenance_json_path>"
+                );
                 std::process::exit(2);
             };
             match xmustard_core::diagnostics::archive_diagnostics_payload_file(
@@ -240,27 +264,39 @@ fn main() {
         }
         "link-diagnostic-symbol" => {
             let Some(workspace_id) = args.next() else {
-                eprintln!("usage: xmustard-core link-diagnostic-symbol <workspace_id> <diagnostic_path> <start_line> <end_line> <diagnostic_fingerprint> <candidates_json_path>");
+                eprintln!(
+                    "usage: xmustard-core link-diagnostic-symbol <workspace_id> <diagnostic_path> <start_line> <end_line> <diagnostic_fingerprint> <candidates_json_path>"
+                );
                 std::process::exit(2);
             };
             let Some(diagnostic_path) = args.next() else {
-                eprintln!("usage: xmustard-core link-diagnostic-symbol <workspace_id> <diagnostic_path> <start_line> <end_line> <diagnostic_fingerprint> <candidates_json_path>");
+                eprintln!(
+                    "usage: xmustard-core link-diagnostic-symbol <workspace_id> <diagnostic_path> <start_line> <end_line> <diagnostic_fingerprint> <candidates_json_path>"
+                );
                 std::process::exit(2);
             };
             let Some(start_line_raw) = args.next() else {
-                eprintln!("usage: xmustard-core link-diagnostic-symbol <workspace_id> <diagnostic_path> <start_line> <end_line> <diagnostic_fingerprint> <candidates_json_path>");
+                eprintln!(
+                    "usage: xmustard-core link-diagnostic-symbol <workspace_id> <diagnostic_path> <start_line> <end_line> <diagnostic_fingerprint> <candidates_json_path>"
+                );
                 std::process::exit(2);
             };
             let Some(end_line_raw) = args.next() else {
-                eprintln!("usage: xmustard-core link-diagnostic-symbol <workspace_id> <diagnostic_path> <start_line> <end_line> <diagnostic_fingerprint> <candidates_json_path>");
+                eprintln!(
+                    "usage: xmustard-core link-diagnostic-symbol <workspace_id> <diagnostic_path> <start_line> <end_line> <diagnostic_fingerprint> <candidates_json_path>"
+                );
                 std::process::exit(2);
             };
             let Some(diagnostic_fingerprint) = args.next() else {
-                eprintln!("usage: xmustard-core link-diagnostic-symbol <workspace_id> <diagnostic_path> <start_line> <end_line> <diagnostic_fingerprint> <candidates_json_path>");
+                eprintln!(
+                    "usage: xmustard-core link-diagnostic-symbol <workspace_id> <diagnostic_path> <start_line> <end_line> <diagnostic_fingerprint> <candidates_json_path>"
+                );
                 std::process::exit(2);
             };
             let Some(candidates_json_path) = args.next() else {
-                eprintln!("usage: xmustard-core link-diagnostic-symbol <workspace_id> <diagnostic_path> <start_line> <end_line> <diagnostic_fingerprint> <candidates_json_path>");
+                eprintln!(
+                    "usage: xmustard-core link-diagnostic-symbol <workspace_id> <diagnostic_path> <start_line> <end_line> <diagnostic_fingerprint> <candidates_json_path>"
+                );
                 std::process::exit(2);
             };
             let start_line = match start_line_raw.parse::<usize>() {
@@ -521,7 +557,10 @@ fn main() {
                 eprintln!("usage: {usage}");
                 std::process::exit(2);
             };
-            let timeout = args.next().and_then(|v| v.parse::<u64>().ok()).unwrap_or(45);
+            let timeout = args
+                .next()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(45);
             match xmustard_core::lsp_session::live_document_symbols(
                 &workspace_id,
                 &PathBuf::from(root),
@@ -561,7 +600,10 @@ fn main() {
                 eprintln!("usage: {usage}");
                 std::process::exit(2);
             };
-            let timeout = args.next().and_then(|v| v.parse::<u64>().ok()).unwrap_or(45);
+            let timeout = args
+                .next()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(45);
             match xmustard_core::lsp_session::live_hover(
                 &PathBuf::from(root),
                 &relative_path,
@@ -570,7 +612,10 @@ fn main() {
                 timeout,
             ) {
                 Ok(result) => {
-                    println!("{}", serde_json::to_string(&result).expect("lsp hover should serialize"))
+                    println!(
+                        "{}",
+                        serde_json::to_string(&result).expect("lsp hover should serialize")
+                    )
                 }
                 Err(xmustard_core::lsp_session::LspSessionError::Unavailable(msg)) => {
                     println!("{}", serde_json::json!({"available": false, "reason": msg}));
@@ -581,11 +626,14 @@ fn main() {
                 }
             }
         }
-        method @ ("lsp-references" | "lsp-definition" | "lsp-implementation"
-        | "lsp-type-definition" | "lsp-rename") => {
+        method @ ("lsp-references"
+        | "lsp-definition"
+        | "lsp-implementation"
+        | "lsp-type-definition"
+        | "lsp-rename") => {
             use xmustard_core::lsp_session::{
-                self, live_definition, live_implementation, live_references, live_rename,
-                live_type_definition, LspSessionError,
+                self, LspSessionError, live_definition, live_implementation, live_references,
+                live_rename, live_type_definition,
             };
             let needs_name = method == "lsp-rename";
             let usage = format!(
@@ -609,14 +657,23 @@ fn main() {
                 eprintln!("usage: {usage}");
                 std::process::exit(2);
             });
-            let new_name = if needs_name { need(args.next()) } else { String::new() };
-            let timeout = args.next().and_then(|v| v.parse::<u64>().ok()).unwrap_or(45);
+            let new_name = if needs_name {
+                need(args.next())
+            } else {
+                String::new()
+            };
+            let timeout = args
+                .next()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(45);
             let root = PathBuf::from(root);
             let outcome: Result<serde_json::Value, LspSessionError> = match method {
                 "lsp-references" => {
                     live_references(&root, &relative_path, line, character, true, timeout)
                 }
-                "lsp-definition" => live_definition(&root, &relative_path, line, character, timeout),
+                "lsp-definition" => {
+                    live_definition(&root, &relative_path, line, character, timeout)
+                }
                 "lsp-implementation" => {
                     live_implementation(&root, &relative_path, line, character, timeout)
                 }
@@ -644,27 +701,39 @@ fn main() {
         }
         "normalize-lsp-workspace-symbols" => {
             let Some(workspace_id) = args.next() else {
-                eprintln!("usage: xmustard-core normalize-lsp-workspace-symbols <workspace_id> <root_path> <query> <limit> <source_name> <input_json_path>");
+                eprintln!(
+                    "usage: xmustard-core normalize-lsp-workspace-symbols <workspace_id> <root_path> <query> <limit> <source_name> <input_json_path>"
+                );
                 std::process::exit(2);
             };
             let Some(root) = args.next() else {
-                eprintln!("usage: xmustard-core normalize-lsp-workspace-symbols <workspace_id> <root_path> <query> <limit> <source_name> <input_json_path>");
+                eprintln!(
+                    "usage: xmustard-core normalize-lsp-workspace-symbols <workspace_id> <root_path> <query> <limit> <source_name> <input_json_path>"
+                );
                 std::process::exit(2);
             };
             let Some(query) = args.next() else {
-                eprintln!("usage: xmustard-core normalize-lsp-workspace-symbols <workspace_id> <root_path> <query> <limit> <source_name> <input_json_path>");
+                eprintln!(
+                    "usage: xmustard-core normalize-lsp-workspace-symbols <workspace_id> <root_path> <query> <limit> <source_name> <input_json_path>"
+                );
                 std::process::exit(2);
             };
             let Some(limit_raw) = args.next() else {
-                eprintln!("usage: xmustard-core normalize-lsp-workspace-symbols <workspace_id> <root_path> <query> <limit> <source_name> <input_json_path>");
+                eprintln!(
+                    "usage: xmustard-core normalize-lsp-workspace-symbols <workspace_id> <root_path> <query> <limit> <source_name> <input_json_path>"
+                );
                 std::process::exit(2);
             };
             let Some(source_name) = args.next() else {
-                eprintln!("usage: xmustard-core normalize-lsp-workspace-symbols <workspace_id> <root_path> <query> <limit> <source_name> <input_json_path>");
+                eprintln!(
+                    "usage: xmustard-core normalize-lsp-workspace-symbols <workspace_id> <root_path> <query> <limit> <source_name> <input_json_path>"
+                );
                 std::process::exit(2);
             };
             let Some(input_json_path) = args.next() else {
-                eprintln!("usage: xmustard-core normalize-lsp-workspace-symbols <workspace_id> <root_path> <query> <limit> <source_name> <input_json_path>");
+                eprintln!(
+                    "usage: xmustard-core normalize-lsp-workspace-symbols <workspace_id> <root_path> <query> <limit> <source_name> <input_json_path>"
+                );
                 std::process::exit(2);
             };
             let limit = match limit_raw.parse::<usize>() {
@@ -685,7 +754,8 @@ fn main() {
                 Ok(result) => {
                     println!(
                         "{}",
-                        serde_json::to_string(&result).expect("LSP workspace-symbols result should serialize")
+                        serde_json::to_string(&result)
+                            .expect("LSP workspace-symbols result should serialize")
                     );
                 }
                 Err(err) => {
@@ -729,11 +799,15 @@ fn main() {
         }
         "parse-coverage" => {
             let Some(workspace_id) = args.next() else {
-                eprintln!("usage: xmustard-core parse-coverage <workspace_id> <report_path> [run_id] [issue_id]");
+                eprintln!(
+                    "usage: xmustard-core parse-coverage <workspace_id> <report_path> [run_id] [issue_id]"
+                );
                 std::process::exit(2);
             };
             let Some(report_path) = args.next() else {
-                eprintln!("usage: xmustard-core parse-coverage <workspace_id> <report_path> [run_id] [issue_id]");
+                eprintln!(
+                    "usage: xmustard-core parse-coverage <workspace_id> <report_path> [run_id] [issue_id]"
+                );
                 std::process::exit(2);
             };
             let run_id = args.next();
@@ -856,7 +930,10 @@ fn main() {
                     std::process::exit(1);
                 }
             };
-            let profile = match serde_json::from_str::<xmustard_core::verification::RustVerificationProfileInput>(&profile_content) {
+            let profile = match serde_json::from_str::<
+                xmustard_core::verification::RustVerificationProfileInput,
+            >(&profile_content)
+            {
                 Ok(profile) => profile,
                 Err(err) => {
                     eprintln!("run-verification-profile failed to decode profile: {err}");
@@ -936,11 +1013,15 @@ fn main() {
             match sub.as_str() {
                 "subsystems" => {
                     let Some(root) = args.next() else {
-                        eprintln!("usage: xmustard-core ownership subsystems <root> <workspace_id>");
+                        eprintln!(
+                            "usage: xmustard-core ownership subsystems <root> <workspace_id>"
+                        );
                         std::process::exit(2);
                     };
                     let Some(ws) = args.next() else {
-                        eprintln!("usage: xmustard-core ownership subsystems <root> <workspace_id>");
+                        eprintln!(
+                            "usage: xmustard-core ownership subsystems <root> <workspace_id>"
+                        );
                         std::process::exit(2);
                     };
                     println!(
@@ -990,7 +1071,10 @@ fn main() {
                 eprintln!("usage: {usage}");
                 std::process::exit(2);
             };
-            let limit = args.next().and_then(|v| v.parse::<usize>().ok()).unwrap_or(25);
+            let limit = args
+                .next()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(25);
             // optional 5th positional: a seed symbol for the graph-proximity lane.
             let seed = args.next().filter(|s| !s.trim().is_empty());
             let result = xmustard_core::search::hybrid_search(
@@ -1088,21 +1172,32 @@ fn run_goal_command(mut args: impl Iterator<Item = String>) {
 
     match sub.as_str() {
         "list" => {
-            let data_dir = next_or_exit(args.next(), "xmustard-core goal list <data_dir> <workspace_id>");
-            let workspace_id =
-                next_or_exit(args.next(), "xmustard-core goal list <data_dir> <workspace_id>");
+            let data_dir = next_or_exit(
+                args.next(),
+                "xmustard-core goal list <data_dir> <workspace_id>",
+            );
+            let workspace_id = next_or_exit(
+                args.next(),
+                "xmustard-core goal list <data_dir> <workspace_id>",
+            );
             match goal::list_goals(Path::new(&data_dir), &workspace_id) {
                 Ok(goals) => print_json(&goals),
                 Err(err) => fail(err),
             }
         }
         "get" => {
-            let data_dir =
-                next_or_exit(args.next(), "xmustard-core goal get <data_dir> <workspace_id> <goal_id>");
-            let workspace_id =
-                next_or_exit(args.next(), "xmustard-core goal get <data_dir> <workspace_id> <goal_id>");
-            let goal_id =
-                next_or_exit(args.next(), "xmustard-core goal get <data_dir> <workspace_id> <goal_id>");
+            let data_dir = next_or_exit(
+                args.next(),
+                "xmustard-core goal get <data_dir> <workspace_id> <goal_id>",
+            );
+            let workspace_id = next_or_exit(
+                args.next(),
+                "xmustard-core goal get <data_dir> <workspace_id> <goal_id>",
+            );
+            let goal_id = next_or_exit(
+                args.next(),
+                "xmustard-core goal get <data_dir> <workspace_id> <goal_id>",
+            );
             match goal::get_goal(Path::new(&data_dir), &workspace_id, &goal_id) {
                 Ok(record) => print_json(&record),
                 Err(err) => fail(err),
@@ -1123,8 +1218,7 @@ fn run_goal_command(mut args: impl Iterator<Item = String>) {
             }
         }
         "iterate" => {
-            let usage =
-                "xmustard-core goal iterate <data_dir> <workspace_id> <goal_id> <request_json_path>";
+            let usage = "xmustard-core goal iterate <data_dir> <workspace_id> <goal_id> <request_json_path>";
             let data_dir = next_or_exit(args.next(), usage);
             let workspace_id = next_or_exit(args.next(), usage);
             let goal_id = next_or_exit(args.next(), usage);
@@ -1139,8 +1233,7 @@ fn run_goal_command(mut args: impl Iterator<Item = String>) {
             }
         }
         "status" => {
-            let usage =
-                "xmustard-core goal status <data_dir> <workspace_id> <goal_id> <status> [skip_reason]";
+            let usage = "xmustard-core goal status <data_dir> <workspace_id> <goal_id> <status> [skip_reason]";
             let data_dir = next_or_exit(args.next(), usage);
             let workspace_id = next_or_exit(args.next(), usage);
             let goal_id = next_or_exit(args.next(), usage);
@@ -1258,8 +1351,7 @@ fn run_swarm_command(mut args: impl Iterator<Item = String>) {
             }
         }
         "record" => {
-            let usage =
-                "xmustard-core swarm record <data_dir> <workspace_id> <goal_id> <role> <request_json_path>";
+            let usage = "xmustard-core swarm record <data_dir> <workspace_id> <goal_id> <role> <request_json_path>";
             let data_dir = need(args.next(), usage);
             let workspace_id = need(args.next(), usage);
             let goal_id = need(args.next(), usage);
@@ -1309,7 +1401,10 @@ fn run_bench_command(mut args: impl Iterator<Item = String>) {
         .unwrap_or(1000);
     let scratch = env::temp_dir().join(format!("xm-bench-{}", std::process::id()));
     if let Err(err) = fs::create_dir_all(&scratch) {
-        eprintln!("bench: failed to create scratch {}: {err}", scratch.display());
+        eprintln!(
+            "bench: failed to create scratch {}: {err}",
+            scratch.display()
+        );
         std::process::exit(1);
     }
     let result = benchmark::run(iterations, &scratch);
@@ -1350,7 +1445,9 @@ fn run_changetrack_command(mut args: impl Iterator<Item = String>) {
     }
 
     let Some(sub) = args.next() else {
-        eprintln!("usage: xmustard-core changetrack <fingerprint|index|drift|changed-since|working-changes> ...");
+        eprintln!(
+            "usage: xmustard-core changetrack <fingerprint|index|drift|changed-since|working-changes> ..."
+        );
         std::process::exit(2);
     };
     match sub.as_str() {
@@ -1376,21 +1473,34 @@ fn run_changetrack_command(mut args: impl Iterator<Item = String>) {
             let data_dir = need(args.next(), usage);
             let root = need(args.next(), usage);
             let ws = need(args.next(), usage);
-            print_json(&ct::detect_drift(Path::new(&data_dir), Path::new(&root), &ws));
+            print_json(&ct::detect_drift(
+                Path::new(&data_dir),
+                Path::new(&root),
+                &ws,
+            ));
         }
         "changed-since" => {
             let usage = "xmustard-core changetrack changed-since <data_dir> <root> <workspace_id>";
             let data_dir = need(args.next(), usage);
             let root = need(args.next(), usage);
             let ws = need(args.next(), usage);
-            print_json(&ct::changed_since_baseline(Path::new(&data_dir), Path::new(&root), &ws));
+            print_json(&ct::changed_since_baseline(
+                Path::new(&data_dir),
+                Path::new(&root),
+                &ws,
+            ));
         }
         "working-changes" => {
-            let usage = "xmustard-core changetrack working-changes <data_dir> <root> <workspace_id>";
+            let usage =
+                "xmustard-core changetrack working-changes <data_dir> <root> <workspace_id>";
             let data_dir = need(args.next(), usage);
             let root = need(args.next(), usage);
             let ws = need(args.next(), usage);
-            print_json(&ct::working_tree_changes(Path::new(&data_dir), Path::new(&root), &ws));
+            print_json(&ct::working_tree_changes(
+                Path::new(&data_dir),
+                Path::new(&root),
+                &ws,
+            ));
         }
         "incorporate" => {
             let usage = "xmustard-core changetrack incorporate <data_dir> <root> <workspace_id>";
@@ -1454,7 +1564,10 @@ fn run_symbolgraph_command(mut args: impl Iterator<Item = String>) {
             let usage = "xmustard-core symbolgraph build-lsp <root> <workspace_id> [budget]";
             let root = need(args.next(), usage);
             let ws = need(args.next(), usage);
-            let budget = args.next().and_then(|v| v.parse::<usize>().ok()).unwrap_or(150);
+            let budget = args
+                .next()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(150);
             let graph = sg::build_symbol_graph(Path::new(&root), &ws);
             print_json(&sg::upgrade_graph_with_lsp(Path::new(&root), graph, budget));
         }
@@ -1466,16 +1579,21 @@ fn run_symbolgraph_command(mut args: impl Iterator<Item = String>) {
             print_json(&sg::compute_clusters(&graph));
         }
         "impact" => {
-            let usage = "xmustard-core symbolgraph impact <root> <workspace_id> <symbol> [max_depth]";
+            let usage =
+                "xmustard-core symbolgraph impact <root> <workspace_id> <symbol> [max_depth]";
             let root = need(args.next(), usage);
             let ws = need(args.next(), usage);
             let symbol = need(args.next(), usage);
-            let depth = args.next().and_then(|v| v.parse::<usize>().ok()).unwrap_or(4);
+            let depth = args
+                .next()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(4);
             let graph = sg::build_symbol_graph_cached(Path::new(&root), &ws);
             print_json(&sg::symbol_impact(&graph, &symbol, depth));
         }
         "trace" => {
-            let usage = "xmustard-core symbolgraph trace <root> <workspace_id> <from_symbol> <to_symbol>";
+            let usage =
+                "xmustard-core symbolgraph trace <root> <workspace_id> <from_symbol> <to_symbol>";
             let root = need(args.next(), usage);
             let ws = need(args.next(), usage);
             let from = need(args.next(), usage);
@@ -1509,7 +1627,10 @@ fn run_symbolgraph_command(mut args: impl Iterator<Item = String>) {
             let usage = "xmustard-core symbolgraph hotspots <root> <workspace_id> [limit]";
             let root = need(args.next(), usage);
             let ws = need(args.next(), usage);
-            let limit = args.next().and_then(|v| v.parse::<usize>().ok()).unwrap_or(20);
+            let limit = args
+                .next()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(20);
             let graph = sg::build_symbol_graph(Path::new(&root), &ws);
             print_json(&sg::compute_hotspots(&graph, limit));
         }

@@ -126,7 +126,8 @@ pub fn scan_repo_signals(root_path: &Path) -> Result<Vec<RustDiscoverySignal>, s
                         continue;
                     }
                     let trimmed = line.trim();
-                    let fingerprint = fingerprint_for_signal(rule.kind, &relative, line_number, trimmed);
+                    let fingerprint =
+                        fingerprint_for_signal(rule.kind, &relative, line_number, trimmed);
                     deduped.insert(
                         fingerprint.clone(),
                         RustDiscoverySignal {
@@ -176,7 +177,9 @@ fn signal_rules() -> Vec<SignalRule> {
             kind: "exception_swallow",
             severity: "P1",
             title: "Swallowed generic exception",
-            patterns: vec![Regex::new(r"except Exception:\s*(pass|continue|return None|return)").unwrap()],
+            patterns: vec![
+                Regex::new(r"except Exception:\s*(pass|continue|return None|return)").unwrap(),
+            ],
         },
         SignalRule {
             kind: "not_implemented",
@@ -247,7 +250,10 @@ fn should_scan_file(relative_path: &str) -> bool {
     if SCANNABLE_SOURCE_FILENAMES.contains(&file_name) {
         return true;
     }
-    let ext = path.extension().and_then(|value| value.to_str()).unwrap_or_default();
+    let ext = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
     SCANNABLE_SOURCE_EXTENSIONS.contains(&format!(".{ext}").as_str())
 }
 
@@ -298,9 +304,15 @@ mod tests {
         fs::create_dir_all(root.join("docs")).unwrap();
 
         write(&root.join("src/app.py"), "# TODO: real signal\n");
-        write(&root.join("backend/data/generated.py"), "# TODO: generated signal\n");
+        write(
+            &root.join("backend/data/generated.py"),
+            "# TODO: generated signal\n",
+        );
         write(&root.join("research/notes.py"), "# TODO: research signal\n");
-        write(&root.join("docs/ARCHITECTURE.md"), "- TODO: documentation note\n");
+        write(
+            &root.join("docs/ARCHITECTURE.md"),
+            "- TODO: documentation note\n",
+        );
 
         let signals = scan_repo_signals(root).unwrap();
         assert_eq!(signals.len(), 1);
@@ -344,8 +356,16 @@ mod tests {
             observed,
             vec![
                 ("annotation".to_string(), "src/sample.py".to_string(), 3),
-                ("not_implemented".to_string(), "src/sample.py".to_string(), 5),
-                ("test_marker".to_string(), "tests/test_sample.py".to_string(), 2),
+                (
+                    "not_implemented".to_string(),
+                    "src/sample.py".to_string(),
+                    5
+                ),
+                (
+                    "test_marker".to_string(),
+                    "tests/test_sample.py".to_string(),
+                    2
+                ),
             ]
         );
     }

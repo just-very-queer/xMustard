@@ -69,7 +69,10 @@ struct CachedWikiPage {
 /// count, and its sorted symbol names. A page is a pure function of exactly this, so
 /// an unchanged fingerprint means the rendered markdown is byte-identical — safe to
 /// reuse. Body-only edits that don't change the symbol set don't change it either.
-fn subsystem_fingerprint(files: &[String], symbols_by_file: &BTreeMap<String, Vec<String>>) -> String {
+fn subsystem_fingerprint(
+    files: &[String],
+    symbols_by_file: &BTreeMap<String, Vec<String>>,
+) -> String {
     let mut h = Sha256::new();
     for f in files {
         h.update(f.as_bytes());
@@ -100,23 +103,30 @@ pub fn generate_wiki(root: &Path, workspace_id: &str) -> RepoWiki {
     // render order so the fingerprint cache is correct (same inputs → same bytes).
     let mut symbols_by_file: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for s in &graph.symbols {
-        symbols_by_file.entry(s.path.clone()).or_default().push(s.name.clone());
+        symbols_by_file
+            .entry(s.path.clone())
+            .or_default()
+            .push(s.name.clone());
     }
     for syms in symbols_by_file.values_mut() {
         syms.sort();
     }
     let mut files_by_subsystem: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for f in &graph.files {
-        files_by_subsystem.entry(top_dir(&f.path)).or_default().push(f.path.clone());
+        files_by_subsystem
+            .entry(top_dir(&f.path))
+            .or_default()
+            .push(f.path.clone());
     }
     for files in files_by_subsystem.values_mut() {
         files.sort();
     }
 
     // load the warm page cache (subsystem slug → fingerprinted page).
-    let mut cache: BTreeMap<String, CachedWikiPage> = indexcache::load_wiki_cache_bytes(root, workspace_id)
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default();
+    let mut cache: BTreeMap<String, CachedWikiPage> =
+        indexcache::load_wiki_cache_bytes(root, workspace_id)
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default();
 
     let mut pages = Vec::new();
     let mut regenerated_slugs = Vec::new();
@@ -171,7 +181,13 @@ pub fn generate_wiki(root: &Path, workspace_id: &str) -> RepoWiki {
                 render_subsystem_page(sub, files, &symbols_by_file)
             }
         };
-        next_cache.insert(slug, CachedWikiPage { fingerprint, page: page.clone() });
+        next_cache.insert(
+            slug,
+            CachedWikiPage {
+                fingerprint,
+                page: page.clone(),
+            },
+        );
         pages.push(page);
     }
 
@@ -211,7 +227,13 @@ fn render_subsystem_page(
         if preview.is_empty() {
             let _ = writeln!(body, "- `{f}`");
         } else {
-            let _ = writeln!(body, "- `{}` — {} symbols: {}", f, syms.len(), preview.join(", "));
+            let _ = writeln!(
+                body,
+                "- `{}` — {} symbols: {}",
+                f,
+                syms.len(),
+                preview.join(", ")
+            );
         }
     }
     WikiPage {
@@ -231,17 +253,40 @@ mod tests {
     fn wiki_has_overview_and_subsystem_pages() {
         let dir = TempDir::new().unwrap();
         std::fs::create_dir_all(dir.path().join("core")).unwrap();
-        std::fs::write(dir.path().join("core/lib.rs"), "pub fn widget() {}\npub struct Gear {}\n").unwrap();
-        std::fs::write(dir.path().join("main.rs"), "fn main() { let _ = widget(); }\n").unwrap();
+        std::fs::write(
+            dir.path().join("core/lib.rs"),
+            "pub fn widget() {}\npub struct Gear {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("main.rs"),
+            "fn main() { let _ = widget(); }\n",
+        )
+        .unwrap();
         for args in [
             vec!["init", "-q"],
             vec!["config", "user.email", "t@t"],
             vec!["config", "user.name", "t"],
         ] {
-            Command::new("git").arg("-C").arg(dir.path()).args(&args).output().unwrap();
+            Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args(&args)
+                .output()
+                .unwrap();
         }
-        Command::new("git").arg("-C").arg(dir.path()).args(["add", "-A"]).output().unwrap();
-        Command::new("git").arg("-C").arg(dir.path()).args(["commit", "-qm", "c"]).output().unwrap();
+        Command::new("git")
+            .arg("-C")
+            .arg(dir.path())
+            .args(["add", "-A"])
+            .output()
+            .unwrap();
+        Command::new("git")
+            .arg("-C")
+            .arg(dir.path())
+            .args(["commit", "-qm", "c"])
+            .output()
+            .unwrap();
 
         let wiki = generate_wiki(dir.path(), "ws");
         assert!(wiki.page_count >= 2);
@@ -256,10 +301,25 @@ mod tests {
             vec!["config", "user.email", "t@t"],
             vec!["config", "user.name", "t"],
         ] {
-            Command::new("git").arg("-C").arg(dir).args(&args).output().unwrap();
+            Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(&args)
+                .output()
+                .unwrap();
         }
-        Command::new("git").arg("-C").arg(dir).args(["add", "-A"]).output().unwrap();
-        Command::new("git").arg("-C").arg(dir).args(["commit", "-qm", "c"]).output().unwrap();
+        Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["add", "-A"])
+            .output()
+            .unwrap();
+        Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["commit", "-qm", "c"])
+            .output()
+            .unwrap();
     }
 
     #[test]
@@ -268,22 +328,50 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("core")).unwrap();
         std::fs::create_dir_all(dir.path().join("util")).unwrap();
         std::fs::write(dir.path().join("core/lib.rs"), "pub fn widget() {}\n").unwrap();
-        std::fs::write(dir.path().join("util/helpers.rs"), "pub fn format_path() {}\n").unwrap();
+        std::fs::write(
+            dir.path().join("util/helpers.rs"),
+            "pub fn format_path() {}\n",
+        )
+        .unwrap();
         git_init_commit(dir.path());
 
         // first run: cold cache → both subsystems regenerate, nothing reused.
         let first = generate_wiki(dir.path(), "ws");
-        assert!(first.regenerated_slugs.contains(&"subsystem-core".to_string()));
-        assert!(first.regenerated_slugs.contains(&"subsystem-util".to_string()));
-        assert!(first.reused_slugs.is_empty(), "cold run reuses nothing: {:?}", first.reused_slugs);
-        let util_first = first.pages.iter().find(|p| p.slug == "subsystem-util").unwrap().markdown.clone();
+        assert!(
+            first
+                .regenerated_slugs
+                .contains(&"subsystem-core".to_string())
+        );
+        assert!(
+            first
+                .regenerated_slugs
+                .contains(&"subsystem-util".to_string())
+        );
+        assert!(
+            first.reused_slugs.is_empty(),
+            "cold run reuses nothing: {:?}",
+            first.reused_slugs
+        );
+        let util_first = first
+            .pages
+            .iter()
+            .find(|p| p.slug == "subsystem-util")
+            .unwrap()
+            .markdown
+            .clone();
 
         // edit only core/ (add a symbol) → util/ is untouched.
-        std::fs::write(dir.path().join("core/lib.rs"), "pub fn widget() {}\npub fn sprocket() {}\n").unwrap();
+        std::fs::write(
+            dir.path().join("core/lib.rs"),
+            "pub fn widget() {}\npub fn sprocket() {}\n",
+        )
+        .unwrap();
 
         let second = generate_wiki(dir.path(), "ws");
         assert!(
-            second.regenerated_slugs.contains(&"subsystem-core".to_string()),
+            second
+                .regenerated_slugs
+                .contains(&"subsystem-core".to_string()),
             "changed subsystem must regenerate: {:?}",
             second.regenerated_slugs
         );
@@ -294,10 +382,26 @@ mod tests {
             second.reused_slugs
         );
         // the reused page is served byte-identical from the warm cache.
-        let util_second = second.pages.iter().find(|p| p.slug == "subsystem-util").unwrap().markdown.clone();
-        assert_eq!(util_first, util_second, "reused page must be byte-identical");
+        let util_second = second
+            .pages
+            .iter()
+            .find(|p| p.slug == "subsystem-util")
+            .unwrap()
+            .markdown
+            .clone();
+        assert_eq!(
+            util_first, util_second,
+            "reused page must be byte-identical"
+        );
         // the regenerated core page reflects the new symbol.
-        let core_second = second.pages.iter().find(|p| p.slug == "subsystem-core").unwrap();
-        assert!(core_second.markdown.contains("sprocket"), "core page should show the new symbol");
+        let core_second = second
+            .pages
+            .iter()
+            .find(|p| p.slug == "subsystem-core")
+            .unwrap();
+        assert!(
+            core_second.markdown.contains("sprocket"),
+            "core page should show the new symbol"
+        );
     }
 }
