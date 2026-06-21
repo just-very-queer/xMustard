@@ -73,9 +73,12 @@ func validateSafeID(kind, id string) error {
 }
 
 // hashFileContent returns the sha256 of a repo-relative file's current content.
+// The path is confined to the workspace root (no `..`/absolute/symlink escape),
+// must be a regular file, and is size-capped — so a memory reference cannot become
+// an arbitrary host-file read/hash oracle or an I/O DoS (XM-NEW-002).
 func hashFileContent(root, rel string) (string, bool) {
-	data, err := os.ReadFile(filepath.Join(root, filepath.Clean(rel)))
-	if err != nil {
+	data, ok := readWorkspaceRegularFile(root, rel)
+	if !ok {
 		return "", false
 	}
 	sum := sha256.Sum256(data)
