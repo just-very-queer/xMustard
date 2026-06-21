@@ -2,12 +2,14 @@ package workspaceops
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 )
 
 type TerminalOpenRequest struct {
@@ -42,14 +44,65 @@ type TerminalReadResult struct {
 }
 
 type terminalSession struct {
-	terminalID  string
-	workspaceID string
-	process     *exec.Cmd
-	pty         *os.File
-	logPath     string
-	mu          sync.RWMutex
-	closed      bool
-	closeOnce   sync.Once
+	terminalID   string
+	workspaceID  string
+	process      *exec.Cmd
+	pty          *os.File
+	logPath      string
+	mu           sync.RWMutex
+	closed       bool
+	lastActivity time.Time
+	closeOnce    sync.Once
+}
+
+// terminalIdleTTL closes a terminal session abandoned (no write/resize/read) past
+// this duration, so an opened-but-forgotten session can't leak its shell child, PTY,
+// log handle, pipes, and pump goroutine forever (XM-POST-003).
+const terminalIdleTTL = 30 * time.Minute
+
+var terminalReaperOnce sync.Once
+
+func startTerminalReaper() {
+	terminalReaperOnce.Do(func() {
+		go func() {
+			t := time.NewTicker(terminalIdleTTL)
+			defer t.Stop()
+			for range t.C {
+				reapIdleTerminals()
+			}
+		}()
+	})
+}
+
+// reapIdleTerminals closes + removes sessions idle past the TTL. Collected under the
+// map iteration, fully released (shell kill + PTY close → pump goroutine ends + log
+// handle closed) afterwards.
+func reapIdleTerminals() {
+	var toClose []*terminalSession
+	terminalSessions.Range(func(k, v any) bool {
+		if s, ok := v.(*terminalSession); ok && s.idleBeyond(terminalIdleTTL) {
+			toClose = append(toClose, s)
+			terminalSessions.Delete(k)
+		}
+		return true
+	})
+	for _, s := range toClose {
+		s.markClosed()
+		terminateTerminalProcess(s.process)
+		s.closePTY()
+	}
+}
+
+func (session *terminalSession) touch() {
+	session.mu.Lock()
+	session.lastActivity = time.Now()
+	session.mu.Unlock()
+}
+
+func (session *terminalSession) idleBeyond(d time.Duration) bool {
+	session.mu.RLock()
+	defer session.mu.RUnlock()
+	return !session.lastActivity.IsZero() && time.Since(session.lastActivity) > d
 }
 
 type synchronizedLogWriter struct {
@@ -109,18 +162,34 @@ func OpenTerminal(dataDir string, request TerminalOpenRequest) (*TerminalSession
 	_ = replicaHandle.Close()
 
 	session := &terminalSession{
-		terminalID:  terminalID,
-		workspaceID: request.WorkspaceID,
-		process:     cmd,
-		pty:         ptyHandle,
-		logPath:     logPath,
+		terminalID:   terminalID,
+		workspaceID:  request.WorkspaceID,
+		process:      cmd,
+		pty:          ptyHandle,
+		logPath:      logPath,
+		lastActivity: time.Now(),
 	}
-	terminalSessions.Store(terminalID, session)
+	// reject a duplicate LIVE id rather than overwriting (and orphaning) its process
+	// handle (XM-POST-002). LoadOrStore is atomic; a stale closed entry is replaced.
+	if prev, loaded := terminalSessions.LoadOrStore(terminalID, session); loaded {
+		if existing, ok := prev.(*terminalSession); ok && !existing.isClosed() {
+			session.markClosed()
+			terminateTerminalProcess(cmd)
+			_ = ptyHandle.Close()
+			_ = logHandle.Close()
+			return nil, fmt.Errorf("terminal %s already active", terminalID)
+		}
+		terminalSessions.Store(terminalID, session) // replace the closed entry
+	}
+	startTerminalReaper()
 
 	writer := &synchronizedLogWriter{file: logHandle}
 	go pumpTerminalStream(session, writer)
 	go func() {
 		_ = cmd.Wait()
+		// On natural exit the pump goroutine's deferred closePTY + writer.Close
+		// release the PTY/log; we just mark closed. The lingering (closed) map entry
+		// is removed by the idle reaper, while CloseTerminal stays idempotent.
 		session.markClosed()
 	}()
 
@@ -135,6 +204,7 @@ func WriteTerminal(workspaceID, terminalID string, data string) error {
 	if err != nil {
 		return err
 	}
+	session.touch()
 	_, err = io.WriteString(session.pty, data)
 	return err
 }
@@ -144,6 +214,7 @@ func ResizeTerminal(workspaceID, terminalID string, cols int, rows int) error {
 	if err != nil {
 		return err
 	}
+	session.touch()
 	return resizeTerminalPTY(session.pty, cols, rows)
 }
 
@@ -170,6 +241,7 @@ func ReadTerminal(dataDir string, workspaceID string, terminalID string, offset 
 		// workspace — otherwise a caller could read another workspace's terminal
 		// output by guessing its id (XM-NEW-013).
 		if session, ok := sessionValue.(*terminalSession); ok && session.workspaceID == workspaceID {
+			session.touch()
 			logPath = session.logPath
 			eof = session.isClosed()
 		}
