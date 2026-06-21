@@ -226,6 +226,81 @@ fn reference_edge_kind(from_path: &str, def_kind: &str) -> &'static str {
     }
 }
 
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// Byte index of a whole-word occurrence of `word` in `line` (so `if` doesn't match
+/// inside `notify`), or None.
+fn find_word(line: &str, word: &str) -> Option<usize> {
+    let bytes = line.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = line[from..].find(word) {
+        let idx = from + rel;
+        let before_ok = idx == 0 || !is_ident_byte(bytes[idx - 1]);
+        let after = idx + word.len();
+        let after_ok = after >= bytes.len() || !is_ident_byte(bytes[after]);
+        if before_ok && after_ok {
+            return Some(idx);
+        }
+        from = idx + word.len();
+    }
+    None
+}
+
+const BRANCH_KEYWORDS: &[&str] = &["if", "while", "match", "switch", "elif", "when", "case"];
+
+/// Classify the control/data-flow role of a referenced symbol occurring at
+/// `[sym_start, sym_end)` on `line`. Returns a flow-edge kind when the syntactic
+/// context is a `return` value, a branch condition, or an assignment target; None for
+/// a plain expression read (already covered by the calls/references edge).
+fn flow_edge_kind(line: &str, sym_start: usize, sym_end: usize) -> Option<&'static str> {
+    // returns: a `return` keyword precedes the symbol on this line.
+    if let Some(i) = find_word(line, "return")
+        && i < sym_start
+    {
+        return Some("returns");
+    }
+    // branches: a control keyword precedes the symbol (it's inside the condition).
+    for kw in BRANCH_KEYWORDS {
+        if let Some(i) = find_word(line, kw)
+            && i < sym_start
+        {
+            return Some("branches");
+        }
+    }
+    // writes: the symbol is immediately followed by a plain/compound assignment.
+    let after = line.get(sym_end..).unwrap_or("").trim_start();
+    let is_assign = (after.starts_with('=') && !after.starts_with("=="))
+        || after.starts_with("+=")
+        || after.starts_with("-=")
+        || after.starts_with("*=")
+        || after.starts_with("/=");
+    if is_assign {
+        return Some("writes");
+    }
+    None
+}
+
+/// Identifier spans (word, start, end) on a line, for per-occurrence flow analysis.
+fn identifier_spans(line: &str) -> Vec<(&str, usize, usize)> {
+    let bytes = line.as_bytes();
+    let mut spans = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if is_ident_byte(bytes[i]) && !bytes[i].is_ascii_digit() {
+            let start = i;
+            while i < bytes.len() && is_ident_byte(bytes[i]) {
+                i += 1;
+            }
+            spans.push((&line[start..i], start, i));
+        } else {
+            i += 1;
+        }
+    }
+    spans
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GraphFileNode {
     pub path: String,
@@ -270,6 +345,14 @@ pub struct SymbolGraph {
     pub files: Vec<GraphFileNode>,
     pub symbols: Vec<GraphSymbolNode>,
     pub edges: Vec<GraphEdge>,
+    /// Control/data-flow edges (returns / branches / writes) classified from the
+    /// syntactic context of each reference. Kept SEPARATE from `edges` so the
+    /// structural authority/impact/proximity machinery (which sums edge weight) is
+    /// unperturbed; these answer "how" a dependency is used, not just "that" it is.
+    #[serde(default)]
+    pub flow_edges: Vec<GraphEdge>,
+    #[serde(default)]
+    pub flow_edge_count: usize,
     pub generated_at: String,
 }
 
@@ -596,6 +679,10 @@ pub fn build_symbol_graph(root: &Path, workspace_id: &str) -> SymbolGraph {
     // Typed edges, aggregated by (from, to, kind): a symbol that is imported AND
     // called yields both an "imports" and a "calls" edge (distinct relationships).
     let mut agg: HashMap<(String, String, &'static str), (usize, BTreeSet<String>)> = HashMap::new();
+    // flow edges (returns/branches/writes) aggregate separately so they don't inflate
+    // the structural authority/impact/proximity weight summed over `edges`.
+    let mut flow_agg: HashMap<(String, String, &'static str), (usize, BTreeSet<String>)> =
+        HashMap::new();
     let add_edge =
         |from: &str, to: &str, kind: &'static str, via: &str, agg: &mut HashMap<_, _>| {
             if from == to {
@@ -649,6 +736,21 @@ pub fn build_symbol_graph(root: &Path, workspace_id: &str) -> SymbolGraph {
                 add_edge(path, &def.path, kind, word, &mut agg);
             }
         }
+        // Flow pass: per-line, classify each referenced symbol's syntactic context
+        // into returns / branches / writes edges (additive to the call graph).
+        for line in content.lines() {
+            for (word, start, end) in identifier_spans(line) {
+                if word.len() < MIN_NAME_LEN {
+                    continue;
+                }
+                if let Some(def) = unique_definer(word)
+                    && &def.path != path
+                    && let Some(flow) = flow_edge_kind(line, start, end)
+                {
+                    add_edge(path, &def.path, flow, word, &mut flow_agg);
+                }
+            }
+        }
     }
     let mut edges: Vec<GraphEdge> = agg
         .into_iter()
@@ -662,6 +764,24 @@ pub fn build_symbol_graph(root: &Path, workspace_id: &str) -> SymbolGraph {
         })
         .collect();
     edges.sort_by(|a, b| {
+        b.weight
+            .cmp(&a.weight)
+            .then(a.from_path.cmp(&b.from_path))
+            .then(a.kind.cmp(&b.kind))
+    });
+
+    let mut flow_edges: Vec<GraphEdge> = flow_agg
+        .into_iter()
+        .map(|((from, to, kind), (weight, via))| GraphEdge {
+            from_path: from,
+            to_path: to,
+            kind: kind.to_string(),
+            weight,
+            via_symbols: via.into_iter().collect(),
+            resolution: "lexical".to_string(),
+        })
+        .collect();
+    flow_edges.sort_by(|a, b| {
         b.weight
             .cmp(&a.weight)
             .then(a.from_path.cmp(&b.from_path))
@@ -690,6 +810,8 @@ pub fn build_symbol_graph(root: &Path, workspace_id: &str) -> SymbolGraph {
         files: file_nodes,
         symbols,
         edges,
+        flow_edge_count: flow_edges.len(),
+        flow_edges,
         generated_at: now(),
     }
 }
@@ -1055,6 +1177,65 @@ mod tests {
         assert!(has("impl.rs", "core.rs", "inherits"), "inherits edge: {:?}", graph.edges);
         // core_test.rs is a test file referencing code under test
         assert!(has("core_test.rs", "core.rs", "tests"), "tests edge: {:?}", graph.edges);
+    }
+
+    #[test]
+    fn graph_emits_flow_edges() {
+        let repo = git_repo(&[
+            ("core.rs", "pub fn is_ready() -> bool { true }\npub fn make_widget() -> i32 { 7 }\n"),
+            (
+                "user.rs",
+                "use crate::core::{is_ready, make_widget};\n\
+                 fn run() -> i32 {\n\
+                 \x20   if is_ready() {\n\
+                 \x20       return make_widget();\n\
+                 \x20   }\n\
+                 \x20   0\n\
+                 }\n",
+            ),
+        ]);
+        let graph = build_symbol_graph(repo.path(), "ws");
+        let has_flow = |from: &str, to: &str, kind: &str| {
+            graph
+                .flow_edges
+                .iter()
+                .any(|e| e.from_path == from && e.to_path == to && e.kind == kind)
+        };
+        // `if is_ready()` → a control-flow BRANCH edge on is_ready (core.rs).
+        assert!(
+            has_flow("user.rs", "core.rs", "branches"),
+            "branches edge expected: {:?}",
+            graph.flow_edges
+        );
+        // `return make_widget()` → a RETURNS data-flow edge on make_widget (core.rs).
+        assert!(
+            has_flow("user.rs", "core.rs", "returns"),
+            "returns edge expected: {:?}",
+            graph.flow_edges
+        );
+        // flow edges are tagged with a resolution like the structural edges (S2).
+        assert!(graph.flow_edges.iter().all(|e| e.resolution == "lexical"));
+        // flow edges must NOT pollute the structural edge set / authority weight.
+        assert!(graph.edges.iter().all(|e| e.kind != "returns" && e.kind != "branches"));
+        assert_eq!(graph.flow_edge_count, graph.flow_edges.len());
+    }
+
+    #[test]
+    fn flow_edge_kind_classifies_contexts() {
+        // unit-level checks of the per-line classifier.
+        let probe = |line: &str, sym: &str| {
+            let start = line.find(sym).unwrap();
+            flow_edge_kind(line, start, start + sym.len())
+        };
+        assert_eq!(probe("    return make_widget();", "make_widget"), Some("returns"));
+        assert_eq!(probe("    if is_ready() {", "is_ready"), Some("branches"));
+        assert_eq!(probe("    while pending() {", "pending"), Some("branches"));
+        assert_eq!(probe("    CONFIG = load();", "CONFIG"), Some("writes"));
+        assert_eq!(probe("    total += amount;", "total"), Some("writes"));
+        // a plain call/read is NOT a flow edge (covered by calls/references).
+        assert_eq!(probe("    let x = helper();", "helper"), None);
+        // `if` must not match inside another identifier.
+        assert_eq!(probe("    let notify = thing();", "thing"), None);
     }
 
     #[test]

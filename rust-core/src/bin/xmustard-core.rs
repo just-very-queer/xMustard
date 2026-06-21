@@ -1483,6 +1483,28 @@ fn run_symbolgraph_command(mut args: impl Iterator<Item = String>) {
             let graph = sg::build_symbol_graph_cached(Path::new(&root), &ws);
             print_json(&sg::trace_symbols(&graph, &from, &to));
         }
+        "flow" => {
+            let usage = "xmustard-core symbolgraph flow <root> <workspace_id> [path_filter]";
+            let root = need(args.next(), usage);
+            let ws = need(args.next(), usage);
+            let filter = args.next();
+            let graph = sg::build_symbol_graph_cached(Path::new(&root), &ws);
+            let edges: Vec<&sg::GraphEdge> = graph
+                .flow_edges
+                .iter()
+                .filter(|e| {
+                    filter
+                        .as_deref()
+                        .is_none_or(|f| e.from_path.contains(f) || e.to_path.contains(f))
+                })
+                .collect();
+            print_json(&serde_json::json!({
+                "workspace_id": ws,
+                "flow_edge_count": graph.flow_edge_count,
+                "shown": edges.len(),
+                "flow_edges": edges,
+            }));
+        }
         "hotspots" => {
             let usage = "xmustard-core symbolgraph hotspots <root> <workspace_id> [limit]";
             let root = need(args.next(), usage);

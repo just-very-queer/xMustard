@@ -106,11 +106,19 @@ don't add tools). No Python.
   5s), `TestInlineRunPlanQueryableInPg` (live: save run+plan → queryable immediately →
   upsert-in-place on phase change). Live: NULL columns confirmed. Committed + pushed.
 
-- [ ] **R6 — Deeper data/control-flow edges** *(large)*. Add edge kinds beyond
-  imports/calls/inherits/tests/references — e.g. returns / reads / writes / branches —
-  via tree-sitter (and/or LSP) analysis per symbol, with new classification logic in
-  `reference_edge_kind`. Tag resolution like S2.
-  *DoD:* at least one new flow edge kind is emitted and verified on a synthetic case.
+- [x] **R6 — Deeper data/control-flow edges** *(large)*. **DONE.** A per-line flow
+  pass (`flow_edge_kind` + `identifier_spans` + whole-word `find_word`) classifies
+  each referenced symbol's syntactic context into **returns** (`return X`),
+  **branches** (`if/while/match/…` condition), and **writes** (`X = …`, `X += …`)
+  edges. These land in a NEW `SymbolGraph.flow_edges` field (+ `flow_edge_count`),
+  kept SEPARATE from `edges` so authority/impact/proximity (which sum edge weight) are
+  unperturbed; tagged `resolution:"lexical"` like S2. Surfaced via `symbolgraph build`
+  (full graph) and a focused `symbolgraph flow <root> <ws> [path]` CLI arm.
+  *Tests:* `graph_emits_flow_edges` (branches + returns edges on a synthetic file,
+  not polluting `edges`), `flow_edge_kind_classifies_contexts` (returns/branches/
+  writes/none + whole-word safety). Full rust suite green (98).
+  *Live (this repo):* 399 flow edges — branches 239, returns 107, writes 53; e.g.
+  `returns: project_info.go → repo_config.go via dedupeStrings`. Committed + pushed.
 
 - [ ] **R7 — Cockpit UI for providers / routing / tokens (A4 remainder)** *(large)*.
   React components + `api.ts` client for: provider management (the backend
