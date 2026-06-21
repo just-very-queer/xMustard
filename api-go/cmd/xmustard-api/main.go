@@ -4011,11 +4011,14 @@ func authMiddleware(dataDir, mode string, next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		var principal *workspaceops.Principal
+		token := ""
 		if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
-			principal = workspaceops.ResolveToken(dataDir, strings.TrimPrefix(h, "Bearer "))
+			token = strings.TrimPrefix(h, "Bearer ")
 		}
-		enforce := mode == "required" || workspaceops.HasAuthConfigured(dataDir)
+		// single read of the token store yields both the principal and whether auth
+		// is configured (was two reads per request).
+		principal, configured := workspaceops.ResolveAuth(dataDir, token)
+		enforce := mode == "required" || configured
 		if enforce && principal == nil {
 			workspaceops.RecordAuthAudit(dataDir, workspaceops.AuthAuditEvent{
 				Action:     "denied",

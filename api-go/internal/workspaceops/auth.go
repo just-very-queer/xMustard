@@ -165,24 +165,39 @@ func constantTimeEqual(a, b string) bool {
 
 // ResolveToken returns the Principal for a raw bearer token, or nil if unknown.
 func ResolveToken(dataDir, raw string) *Principal {
+	p, _ := ResolveAuth(dataDir, raw)
+	return p
+}
+
+// ResolveAuth resolves a bearer token AND reports whether auth is configured, in a
+// SINGLE read of the token store — the auth middleware needs both on every request,
+// and previously did two reads (ResolveToken + HasAuthConfigured). An unreadable
+// store fails CLOSED (configured=true), matching HasAuthConfigured.
+func ResolveAuth(dataDir, raw string) (principal *Principal, configured bool) {
+	env := envTokenHashes()
+	recs, err := loadTokenRecords(dataDir)
+	if err != nil {
+		configured = true // unreadable token store → assume configured (fail closed)
+	} else {
+		configured = len(env) > 0 || len(recs) > 0
+	}
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
-		return nil
+		return nil, configured
 	}
 	h := hashToken(raw)
-	if p, ok := envTokenHashes()[h]; ok {
-		return &p
+	if p, ok := env[h]; ok {
+		return &p, configured
 	}
-	recs, _ := loadTokenRecords(dataDir)
 	for _, r := range recs {
 		if constantTimeEqual(r.TokenSHA256, h) {
 			if tokenExpired(r.ExpiresAt) {
-				return nil // a known-but-expired token resolves to no principal
+				return nil, configured // a known-but-expired token resolves to no principal
 			}
-			return &Principal{ID: r.ID, Role: fallbackString(r.Role, "agent"), Workspaces: r.Workspaces}
+			return &Principal{ID: r.ID, Role: fallbackString(r.Role, "agent"), Workspaces: r.Workspaces}, configured
 		}
 	}
-	return nil
+	return nil, configured
 }
 
 // MintToken generates a non-expiring token for (id, role). See MintTokenTTL.
