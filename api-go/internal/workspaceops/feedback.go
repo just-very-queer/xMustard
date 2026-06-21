@@ -62,6 +62,8 @@ func RecordFeedback(dataDir, workspaceID, kind string, paths []string) error {
 	if len(clean) == 0 {
 		return nil
 	}
+	unlock := lockStore(feedbackPath(dataDir, workspaceID))
+	defer unlock()
 	m, err := loadFeedback(dataDir, workspaceID)
 	if err != nil {
 		return err

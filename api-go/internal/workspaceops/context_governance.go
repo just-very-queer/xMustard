@@ -247,6 +247,9 @@ func ProposeContext(dataDir, workspaceID string, req ProposeContextRequest) (*Co
 		required = 1
 	}
 
+	// Serialize the whole load→mutate→save so concurrent proposals don't lose updates.
+	unlock := lockStore(contextEntriesPath(dataDir, workspaceID))
+	defer unlock()
 	entries, err := loadContextEntries(dataDir, workspaceID)
 	if err != nil {
 		return nil, err
@@ -299,6 +302,10 @@ func VerifyContext(dataDir, workspaceID, entryID, agent string, approve bool, no
 	if agent == "" {
 		return nil, fmt.Errorf("agent is required")
 	}
+	// Serialize the verify/promote transaction so concurrent votes can't drop each
+	// other (the multi-agent promotion gate depends on this).
+	unlock := lockStore(contextEntriesPath(dataDir, workspaceID))
+	defer unlock()
 	entries, err := loadContextEntries(dataDir, workspaceID)
 	if err != nil {
 		return nil, err
@@ -372,6 +379,8 @@ func UpdateContextContent(dataDir, workspaceID, entryID, content string) (*Conte
 	if err := validateSafeID("entry", entryID); err != nil {
 		return nil, err
 	}
+	unlock := lockStore(contextEntriesPath(dataDir, workspaceID))
+	defer unlock()
 	entries, err := loadContextEntries(dataDir, workspaceID)
 	if err != nil {
 		return nil, err
