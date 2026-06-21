@@ -1,4 +1,4 @@
-# xMustard — Status Report (2026-06-20)
+# xMustard — Status Report (2026-06-21)
 
 ## 1. What the Product IS Now
 
@@ -148,13 +148,56 @@ verified against the code before patching; all are tested + committed.
   concurrent `xmustard-core` never reads a torn cache.
 - **Bounded logs:** per-workspace audit log capped (newest 5000), like the auth-audit log.
 
-**Known still-open (P1, not yet done — honest):** a shared `pgxpool` (PG ops still
-connect-per-op); revisioned/ordered PG mirror (async mirrors can commit run states
-out of order); drift-baseline sentinels for missing/edited memory paths
-(XM-NEW-003/004); degraded-mode honesty for non-git / >800-file repos
-(XM-NEW-009/010 — search can silently return an empty/truncated graph); per-workspace
-ACLs / per-worker token scoping (XM-NEW-022); Rust verification pipe-drain
-(XM-NEW-015). The symbol graph the agent path uses is the **lexical** graph; the
-LSP-resolved upgrade exists but is not wired into `search` (a CLI-only `build-lsp`).
-The "20× warm index" figure has no committed benchmark artifact; treat it as
-indicative, not measured.
+**Status of the P1 items this section once listed as still-open:** all closed in
+the post-hardening deepening pass — see **§7**. (Shared `pgxpool` → `3d5b1b4`;
+ordered PG mirror → `7a59f74`; drift sentinels XM-NEW-003/004 → `422bbaf`;
+index-coverage honesty XM-NEW-009/010 → `69feaac`; workspace-scoped tokens
+XM-NEW-022 → `1326b7a`; verification pipe-drain XM-NEW-015 → `100b994`.)
+
+**Genuinely still-open (honest, deferred — not blocking the governed-memory
+product):** the symbol graph the agent path uses is the **lexical** graph; the
+LSP-resolved upgrade exists but is CLI-only (`build-lsp`), not wired into
+`search`. The "20× warm index" figure still has no committed benchmark artifact;
+treat it as indicative, not measured. Two P2 index-engine items are designed but
+deliberately deferred (rationale in `docs/INDEX_ENGINE.md` §Deferred): a
+long-lived **IndexEngine daemon** (G) and a **blake3/merkle content-key**
+migration (H) — both judged premature surface/dependency expansion against the
+lean, on-demand-binary, 50–100 MB-RSS design while parsing (not hashing) is the
+reindex bottleneck and git already gives O(dirty-file) invalidation.
+
+---
+
+## 7. Post-hardening deepening pass (2026-06-21) — close the remaining P0/P1, deepen runtime memory without growing surface
+
+Driven by a second external audit (`goal/xmustard_fix_queue.md`,
+`goal/xmustard_new_findings.jsonl`) plus a reconciliation of the "deliberately
+left" list against the actual code. Rule for the pass: **trust the code over the
+docs** — every claimed gap was re-verified against the tree before patching, and
+several "open" items were already closed. Constraints held throughout: the MCP
+surface stays at **exactly 9 tools** (no new tools), no embeddings/HNSW until
+P0/P1 pass, 50–100 MB RSS, no Docker, never fake a test. Each item is tested and
+committed; the table records the evidence.
+
+| Item | Verdict | Commit | Evidence |
+|------|---------|--------|----------|
+| Shared capped Postgres pool (was connect-per-op → FD/conn DoS under load) | **DONE** | `3d5b1b4` | `pgpool.go` lazy `pgxpool` (MaxConns 10) shared by all PG ops; `pgpool_test.go`. |
+| Monotonic ordering guard for the async PG run mirror (out-of-order commits) | **DONE** | `7a59f74` | `pg_inline.go` `mirror_seq` + `pg_advisory_xact_lock`; a stale async write can't clobber a newer state. `pg_ordering_test.go`. |
+| Index-coverage honesty (non-git / >800-file repos silently returned empty/truncated graphs) | **DONE** | `69feaac` | `symbolgraph.rs` `IndexCoverage{repo_mode,eligible,indexed,truncated,degraded_reason}` on every `SymbolGraph`; search/ground surface it so a degraded graph isn't trusted as complete. |
+| Optional workspace-scoped tokens (multi-tenant isolation) | **DONE** | `1326b7a` | `auth.go` `Principal.Workspaces`/`AllowsWorkspace`/`MintScopedToken`; empty = all (back-compat). Live ACL check: scoped token → 200 own / 403 other. |
+| Drift baseline tracks missing/edited memory paths | **DONE** | `422bbaf` | `pathMissingSentinel` so a memory's path going missing↔present↔content-change all flag stale on recall (not just content edits). |
+| Concurrent drain of Rust verification child pipes (pipe-buffer deadlock) | **DONE** | `100b994` | `verification.rs` `drain_child_with_timeout` reads stdout/stderr on separate threads. |
+| Metadata-first recall — drift-check a bounded candidate window, not the whole store (was O(history) path-hash I/O per recall) | **DONE** (A) | `09495d1` | `RecallContext` ranks cheaply with no I/O, drift-checks only `max(4·limit,16)` candidates, returns `drift_checked`. |
+| Single token-store read per request (was a double read on every authed call) | **DONE** (E) | `ccc4c2f` | `ResolveAuth` does one store read; `ResolveToken` delegates. |
+| Bounded run output + activity capture (unbounded `strings.Builder` per run) | **DONE** (C) | `0e70ef7` | `boundedTail` 1 MiB ring buffer; summary exposes `output_bytes`/`output_truncated`. |
+| Terminal idle reaper + duplicate-id rejection (abandoned PTYs leaked FDs/RSS) | **DONE** (D) | `5280cae` | 30-min idle TTL reaper; `OpenTerminal` `LoadOrStore` rejects a duplicate live id. |
+| Route ALL Go→Rust bridge calls through one hardened runner | **DONE** (F) | `7170047`,`ae8ade5` | shared `runCoreCtx`/`capWriter` (120 s timeout, 64 MiB stdout / 64 KiB stderr caps, sanitized errors); every bridge file routed through it. |
+| Strict MCP arg validation + `remember` JSON body | **DONE** (B) | `1cdf390` | `tools/call` rejects malformed params / stray fields / unknown args / wrong types / non-scalar / out-of-enum with `-32602` (no silent coerce); typed `inputSchema` (enums, `additionalProperties:false`); `remember` ships content/title/paths in the JSON **body**, not the URL (XM-NEW-018). Live: special-char memory round-trips; object-valued arg & bogus enum → `-32602`. |
+
+**Deferred by design (P2, not blockers):** G (IndexEngine daemon) and H
+(blake3/merkle content key) — see `docs/INDEX_ENGINE.md` §Deferred for the
+analysis and the trigger conditions that would justify revisiting them.
+
+**Net:** every feasible P0/P1 from both audits is fixed + tested + pushed to
+`feat/product-v1`; the only remaining items are the two intentionally-deferred
+P2 index-engine designs and the long-standing LSP-graph-into-search wiring, all
+documented honestly above.

@@ -70,9 +70,58 @@ See `docs/plans/2026-06-20-deep-graph-loop.md` (S1–S6, all complete).
 ## What NOT to do
 
 Don't hash every symbol on every query (hash once at index time). Don't keep two
-divergent search paths (one engine; Postgres optional replica). Don't add 16 MCP
-tools (enrich the 8 with modes). Don't rebuild GitNexus from scratch (borrow the
-model: structure → parse → graph → query, incrementally in Rust).
+divergent search paths (one engine; Postgres optional replica). Don't add more MCP
+tools (the surface is a fixed **9**, enriched with modes/params — `search?mode=`,
+`impact symbol=/from=/to=`, `recall query=`; `tools/call` strictly validates them
+and rejects malformed/unknown/wrong-typed args with `-32602`). Don't rebuild
+GitNexus from scratch (borrow the model: structure → parse → graph → query,
+incrementally in Rust).
+
+## Deferred — designed, intentionally NOT built yet (P2)
+
+Two items from the post-hardening pass (G, H) were analysed and **deferred on
+purpose**. Recording the design + the trigger that would justify building them,
+so the decision is auditable rather than silently dropped.
+
+### G — long-lived IndexEngine daemon
+
+**What it would be:** a resident `xmustard-indexd` per workspace holding the parsed
+`SymbolGraph` + inverted index hot in RAM, fed file-change events (fs-watch or the
+existing `cheap_key` drift), serving `search`/`impact` over a local socket so warm
+queries skip even the cache-deserialize step.
+
+**Why deferred (not a skeleton):** the current model is **on-demand binary
+invocation** with a cheap-fingerprint warm cache (`indexcache.rs`) — a cold call
+rebuilds, a warm call loads a cached graph. A daemon trades that statelessness for
+a long-lived process + socket/IPC surface + crash-recovery + resident memory that
+fights the **50–100 MB RSS, no-Docker** budget (holding multiple workspace graphs
+in RAM is exactly what that budget forbids). The win (skip cache deserialize) is
+small next to the cost (tree-sitter **parsing**, not cache I/O, dominates a cold
+rebuild). For a *tiny MCP server*, statelessness is a feature.
+
+**Trigger to revisit:** a measured benchmark showing cache-deserialize (not parse)
+as the warm-query bottleneck on a real repo, **and** a workspace count low enough
+that resident graphs stay inside the RSS budget. Build the daemon as an *optional*
+accelerator behind an env flag, never the default path.
+
+### H — blake3 / merkle content-key migration
+
+**What it would be:** replace the `sha2::Sha256` file/cache hashing with `blake3`,
+and add a directory **merkle tree** so "did anything under `dir/` change" is a
+single root-hash compare.
+
+**Why deferred (not a dependency add):** hashing is **not** the reindex
+bottleneck — tree-sitter parsing is — so blake3's speed edge buys little, while it
+adds a dependency and invalidates every existing on-disk cache key (format churn).
+The merkle tree is largely **redundant with git**: `cheap_key` already gets
+O(dirty-file) invalidation from `git HEAD + dirty {path,size,mtime}`, which beats
+recomputing a merkle root. `file_hash` already content-addresses per file (sha256)
+for incremental reparse, so the correctness property H targets already holds.
+
+**Trigger to revisit:** profiling that puts the hash step on the hot path (very
+large files / non-git trees where the git fast-path is unavailable), at which
+point switch `file_hash` → blake3 **keeping the existing atomic-write path** and
+add the merkle root only for the non-git fallback.
 
 ## Related plans
 

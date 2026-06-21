@@ -30,14 +30,18 @@ gives any agent (Claude Code, codex, opencode, …) two things and nothing else:
    is re-checked against the live tree on every recall, so it never goes silently
    stale (drift detection), and overlapping memories are surfaced for reconciliation.
 
-The agent-facing surface is deliberately **eight tools**, not a platform. Current
+The agent-facing surface is deliberately **nine tools**, not a platform. Current
 coding-agent research is consistent that large tool sets bloat an agent's context
 and degrade quality; the value is disciplined, governed context, not tool count.
+The nine are enriched with modes/params (e.g. `search?mode=pattern`, `impact
+symbol=/from=/to=`, `recall query=`) rather than split into more tools, and
+`tools/call` strictly validates arguments — unknown/wrong-typed/non-scalar/
+out-of-enum args are rejected with a JSON-RPC `-32602`, never silently coerced.
 See [`docs/RETHINK.md`](docs/RETHINK.md).
 
 Under the hood it sits on a Rust semantic core (tree-sitter symbol graph, change
 tracking, hybrid search, live LSP) and a Go HTTP/persistence shell over Postgres.
-That full API stays available for a future UI; the agent only ever sees the eight
+That full API stays available for a future UI; the agent only ever sees the nine
 tools.
 
 ## Using the MCP tools
@@ -68,21 +72,24 @@ Each agent should use its **own** `XMUSTARD_API_TOKEN` (mint one with
 the multi-agent verification gate counts distinct authenticated principals, so one
 token cannot impersonate several verifiers.
 
-### The eight tools
+### The nine tools
 
-All tools take `workspace_id`. The first four are the governed-memory loop; the
-last four are narrow retrieval.
+All tools take `workspace_id` (`?` marks an optional arg). The first four are the
+governed-memory loop; the last five are narrow retrieval. `remember` sends its
+content in the JSON request body (not the URL), so durable text never leaks into
+access logs.
 
 | Tool | Args | What it does |
 |------|------|--------------|
-| `ground` | — | Orientation before acting: changed / stale / broken / blocked since baseline, with index-trust (drift) and stale-memory count. |
-| `recall` | — | The verified shared context to trust. Each entry is re-checked against the live tree; stale ones are flagged, and path-overlap conflicts are listed. |
+| `ground` | — | Orientation before acting: changed / stale / broken / blocked since baseline, with index-trust (drift), contract breaks, and stale-memory count. |
+| `recall` | `query?`, `paths?` | The verified shared context to trust, ranked to your task. Each entry is re-checked against the live tree; stale ones are flagged, and path-overlap conflicts are listed. |
 | `remember` | `content`, `title?`, `paths?` | Propose a durable memory (fact / decision / gotcha). `paths` are the files it's about, so recall can flag it stale when they change. Pending until verified. |
 | `verify` | `entry_id`, `approve?` | Approve (or reject) a peer's proposed memory; it promotes once enough distinct agents approve. Identity is your auth token. |
-| `search` | `query` | Narrow hybrid (lexical + structural) code search — relevant slices, not a dump. |
+| `search` | `query`, `mode?` (`hybrid`\|`pattern`), `lang?`, `seed?` | Narrow code search — relevant slices, not a dump. Default `hybrid` fuses lexical + semantic + structural + graph-proximity (RRF); `mode=pattern` runs an ast-grep structural query; `seed=<symbol>` anchors the proximity lane. |
 | `explain` | `path` | Explain a file or directory: purpose, key symbols, how to run/verify it. |
-| `impact` | — | Blast radius of the current changes: changed symbols and the files/tests they affect. |
+| `impact` | `symbol?`, `from?`, `to?` | Blast radius. No args → current changes (with `contract_break` flags); `symbol=` → transitive references (graph BFS); `from=`&`to=` → shortest dependency path between two symbols. |
 | `diagnostics` | — | Current normalized errors/warnings for the workspace. |
+| `why_failed` | `run_id` | Explain why a run failed: failure signals, salient error lines, and which changed files are implicated. |
 
 ### A typical session
 
@@ -195,11 +202,16 @@ The frontend (optional, for a future UI) expects the backend at
 
 ## Current Status
 
-The governed-memory product is built and verified end to end: the eight-tool MCP
+The governed-memory product is built and verified end to end: the nine-tool MCP
 surface, the propose → multi-agent-verify → promote loop, drift-on-recall, conflict
 surfacing, bearer-token auth, and the Rust semantic core (tree-sitter symbol graph,
-change tracking, hybrid search, live LSP). See [`docs/CHANGELOG.md`](docs/CHANGELOG.md)
-and [`docs/RETHINK.md`](docs/RETHINK.md) for what is done and what remains.
+change tracking, hybrid search, live LSP). Two hardening passes have since closed
+every feasible P0/P1 (concurrency/lifecycle/confinement, then a deepening pass:
+bounded recall, shared PG pool + ordered mirror, index-coverage honesty,
+workspace-scoped tokens, strict MCP arg validation). See
+[`docs/STATUS.md`](docs/STATUS.md) §6–§7 for the audited evidence, and
+[`docs/INDEX_ENGINE.md`](docs/INDEX_ENGINE.md) §Deferred for the two P2 items
+intentionally left for later.
 
 ## Architecture
 
