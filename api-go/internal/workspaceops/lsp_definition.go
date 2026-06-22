@@ -515,7 +515,21 @@ func (session *lspSession) ensureInitialized(ctx context.Context) error {
 	return nil
 }
 
+// LSP frame/document caps so an active session can't exceed the RSS budget even
+// without leaking a child process (XM-PRO-006). The language server is a spawned
+// child (semi-trusted), so these bound a buggy server and generated/huge sources.
+const (
+	maxLSPHeaderBytes   = 64 << 10 // 64 KiB of response headers
+	maxLSPPayloadBytes  = 16 << 20 // 16 MiB response payload
+	maxLSPDocumentBytes = 16 << 20 // 16 MiB source document opened/synced to the server
+)
+
 func (session *lspSession) syncDocument(absolutePath string) error {
+	// Skip pathologically large sources rather than read the whole file into memory
+	// and duplicate it into a didOpen/didChange message (XM-PRO-006).
+	if info, err := os.Stat(absolutePath); err == nil && info.Size() > maxLSPDocumentBytes {
+		return fmt.Errorf("document exceeds %d-byte LSP sync cap", maxLSPDocumentBytes)
+	}
 	content, err := os.ReadFile(absolutePath)
 	if err != nil {
 		return err
@@ -803,10 +817,16 @@ func closeAllLSPSessions() {
 
 func readLSPFrame(reader *bufio.Reader) ([]byte, error) {
 	contentLength := -1
+	headerBytes := 0
 	for {
 		line, err := reader.ReadString('\n')
 		if err != nil {
 			return nil, err
+		}
+		// Bound the header block so a buggy/hostile language server can't flood the
+		// reader with header lines before the payload (XM-PRO-006).
+		if headerBytes += len(line); headerBytes > maxLSPHeaderBytes {
+			return nil, fmt.Errorf("LSP response headers exceeded %d bytes", maxLSPHeaderBytes)
 		}
 		trimmed := strings.TrimRight(line, "\r\n")
 		if trimmed == "" {
@@ -825,6 +845,11 @@ func readLSPFrame(reader *bufio.Reader) ([]byte, error) {
 	}
 	if contentLength < 0 {
 		return nil, fmt.Errorf("missing Content-Length header in LSP response")
+	}
+	// Reject an over-large (or overflowed) Content-Length BEFORE allocating, so a
+	// single header value can't drive a multi-GB make([]byte, ...) (XM-PRO-006).
+	if contentLength > maxLSPPayloadBytes {
+		return nil, fmt.Errorf("LSP response payload %d exceeds %d-byte cap", contentLength, maxLSPPayloadBytes)
 	}
 	payload := make([]byte, contentLength)
 	if _, err := io.ReadFull(reader, payload); err != nil {
