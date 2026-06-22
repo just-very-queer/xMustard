@@ -3751,6 +3751,9 @@ func main() {
 			})
 			return
 		}
+		if !requireTerminalScope(w, r, dataDir(), request.WorkspaceID) {
+			return
+		}
 		result, err := workspaceops.OpenTerminal(
 			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
 			request,
@@ -3778,6 +3781,9 @@ func main() {
 			})
 			return
 		}
+		if !requireTerminalScope(w, r, dataDir(), request.WorkspaceID) {
+			return
+		}
 		if err := workspaceops.WriteTerminal(request.WorkspaceID, terminalID, request.Data); err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				writeJSON(w, http.StatusNotFound, map[string]any{
@@ -3801,6 +3807,9 @@ func main() {
 			})
 			return
 		}
+		if !requireTerminalScope(w, r, dataDir(), request.WorkspaceID) {
+			return
+		}
 		if err := workspaceops.ResizeTerminal(request.WorkspaceID, terminalID, request.Cols, request.Rows); err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				writeJSON(w, http.StatusNotFound, map[string]any{
@@ -3818,6 +3827,9 @@ func main() {
 	mux.HandleFunc("GET /api/terminal/{terminal_id}/read", func(w http.ResponseWriter, r *http.Request) {
 		terminalID := r.PathValue("terminal_id")
 		workspaceID := strings.TrimSpace(r.URL.Query().Get("workspace_id"))
+		if !requireTerminalScope(w, r, dataDir(), workspaceID) {
+			return
+		}
 		offset, _ := strconv.ParseInt(r.URL.Query().Get("offset"), 10, 64)
 		result, err := workspaceops.ReadTerminal(
 			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
@@ -3836,6 +3848,9 @@ func main() {
 	mux.HandleFunc("DELETE /api/terminal/{terminal_id}", func(w http.ResponseWriter, r *http.Request) {
 		terminalID := r.PathValue("terminal_id")
 		workspaceID := strings.TrimSpace(r.URL.Query().Get("workspace_id"))
+		if !requireTerminalScope(w, r, dataDir(), workspaceID) {
+			return
+		}
 		if err := workspaceops.CloseTerminal(workspaceID, terminalID); err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				writeJSON(w, http.StatusNotFound, map[string]any{
@@ -4095,6 +4110,30 @@ func authMiddleware(dataDir, mode string, next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), principalCtxKey, principal)))
 	})
+}
+
+// requireTerminalScope enforces that the authenticated principal may touch
+// workspaceID. Terminal routes live under /api/terminal (outside /api/workspaces/),
+// so the path-based middleware scope check (workspaceIDFromPath) never fires for
+// them and a workspace-scoped token could otherwise open/read/write another
+// workspace's shell by passing its workspace_id in the body/query (XM-PRO-001).
+// Writes 400 on an empty id, 403 on an out-of-scope token; returns false if handled.
+func requireTerminalScope(w http.ResponseWriter, r *http.Request, dataDir, workspaceID string) bool {
+	workspaceID = strings.TrimSpace(workspaceID)
+	if workspaceID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "workspace_id is required"})
+		return false
+	}
+	if p := principalFromContext(r.Context()); p != nil && !p.AllowsWorkspace(workspaceID) {
+		workspaceops.RecordAuthAudit(dataDir, workspaceops.AuthAuditEvent{
+			Action: "denied", Actor: p.ID,
+			Detail: "workspace " + workspaceID + " not in token scope (terminal)",
+			Method: r.Method, Path: r.URL.Path, RemoteAddr: r.RemoteAddr,
+		})
+		writeJSON(w, http.StatusForbidden, map[string]any{"error": "token not scoped to workspace " + workspaceID})
+		return false
+	}
+	return true
 }
 
 // workspaceIDFromPath extracts {id} from /api/workspaces/{id}/... ("" if not such a path).

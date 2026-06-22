@@ -230,7 +230,21 @@ func CloseTerminal(workspaceID, terminalID string) error {
 	return nil
 }
 
+// maxTerminalReadBytes bounds a single terminal log read so a long-lived shell's
+// log can't be slurped into one response (a read from an old offset would otherwise
+// allocate the whole remaining log). The caller continues from the returned Offset.
+const maxTerminalReadBytes = 256 << 10 // 256 KiB
+
 func ReadTerminal(dataDir string, workspaceID string, terminalID string, offset int64) (*TerminalReadResult, error) {
+	// Validate both caller-controlled identifiers BEFORE building a filesystem path:
+	// the historical-read path below joins them directly, so an unvalidated id could
+	// select another workspace's log or escape the terminals dir (XM-PRO-003).
+	if err := validateSafeID("workspace", workspaceID); err != nil {
+		return nil, err
+	}
+	if err := validateSafeID("terminal", terminalID); err != nil {
+		return nil, err
+	}
 	if offset < 0 {
 		offset = 0
 	}
@@ -263,18 +277,18 @@ func ReadTerminal(dataDir string, workspaceID string, terminalID string, offset 
 	if _, err := handle.Seek(offset, io.SeekStart); err != nil {
 		return nil, err
 	}
-	content, err := io.ReadAll(handle)
+	// Bounded read: at most maxTerminalReadBytes per call. A full chunk means there
+	// is more to come, so the caller polls again from the returned Offset and EOF
+	// stays false until the tail is drained (XM-PRO-003).
+	content, err := io.ReadAll(io.LimitReader(handle, maxTerminalReadBytes))
 	if err != nil {
 		return nil, err
 	}
-	nextOffset, err := handle.Seek(0, io.SeekCurrent)
-	if err != nil {
-		return nil, err
-	}
+	more := len(content) == maxTerminalReadBytes
 	return &TerminalReadResult{
-		Offset:      nextOffset,
+		Offset:      offset + int64(len(content)),
 		Content:     string(content),
-		EOF:         eof,
+		EOF:         eof && !more,
 		WorkspaceID: workspaceID,
 		TerminalID:  terminalID,
 	}, nil
