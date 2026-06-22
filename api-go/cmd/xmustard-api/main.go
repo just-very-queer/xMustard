@@ -4033,10 +4033,57 @@ func isCorePath(p string) bool {
 // clean error (the malformed-body -> 400 path) instead of the server allocating.
 const maxRequestBodyBytes = 32 << 20 // 32 MiB
 
+// maxRequestBodyBytesConfigured returns the per-request body cap, operator-tunable
+// via XMUSTARD_MAX_BODY_BYTES (so a tight-RSS deployment can lower it without a
+// rebuild). Defaults to maxRequestBodyBytes.
+func maxRequestBodyBytesConfigured() int64 {
+	if v := strings.TrimSpace(os.Getenv("XMUSTARD_MAX_BODY_BYTES")); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			return n
+		}
+	}
+	return maxRequestBodyBytes
+}
+
+// bodyInFlight bounds the number of body-bearing requests decoded concurrently, so
+// the aggregate in-flight body memory is at most cap × maxInFlight rather than
+// cap × (unbounded concurrent agents) — a single 32 MiB cap alone cannot hold the
+// 50–100 MB RSS target under fan-in (XM-PRO-008). Tunable via XMUSTARD_MAX_INFLIGHT_BODIES.
+// (Per-endpoint limits + decoded-object amplification remain follow-on work.)
+var bodyInFlight = make(chan struct{}, inFlightBodyLimit())
+
+func inFlightBodyLimit() int {
+	if v := strings.TrimSpace(os.Getenv("XMUSTARD_MAX_INFLIGHT_BODIES")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 12
+}
+
+// bodyBudgetThreshold: only requests declaring (or hiding, via chunked encoding) a
+// body larger than this acquire an in-flight slot. Normal small requests — tool
+// calls, memory proposals, run starts — are never throttled, and a long-running
+// request with a tiny body never holds a slot. This targets the actual memory risk
+// (large concurrent uploads) without affecting throughput.
+const bodyBudgetThreshold = 1 << 20 // 1 MiB
+
 func bodyLimitMiddleware(next http.Handler) http.Handler {
+	limit := maxRequestBodyBytesConfigured()
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Body != nil {
-			r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
+		if r.Body == nil {
+			next.ServeHTTP(w, r)
+			return
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, limit)
+		if r.ContentLength > bodyBudgetThreshold || r.ContentLength < 0 {
+			select {
+			case bodyInFlight <- struct{}{}:
+				defer func() { <-bodyInFlight }()
+			case <-r.Context().Done():
+				http.Error(w, "request cancelled while waiting for in-flight body budget", 499)
+				return
+			}
 		}
 		next.ServeHTTP(w, r)
 	})

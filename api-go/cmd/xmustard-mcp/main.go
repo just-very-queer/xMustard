@@ -205,12 +205,23 @@ func callAPI(method, path, body string) (string, error) {
 		return "", fmt.Errorf("xmustard API unreachable at %s (%w)", apiBase(), err)
 	}
 	defer resp.Body.Close()
-	respBody, _ := io.ReadAll(resp.Body)
+	// Bound the response read: one stdio shim runs per agent, so an unbounded
+	// io.ReadAll here lets a huge/hostile API response allocate without limit (the
+	// egress analogue of the 8 MiB request framing cap, XM-PRO-009). A legitimate
+	// tool result never approaches this; past it we fail loudly rather than return
+	// truncated JSON the agent can't parse.
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
+	if len(respBody) > maxResponseBytes {
+		return "", fmt.Errorf("API %s %s response exceeded %d bytes; narrow the query", method, path, maxResponseBytes)
+	}
 	if resp.StatusCode >= 400 {
 		return "", fmt.Errorf("API %s %s -> %d: %s", method, path, resp.StatusCode, strings.TrimSpace(string(respBody)))
 	}
 	return string(respBody), nil
 }
+
+// maxResponseBytes bounds a single API response the MCP shim will buffer.
+const maxResponseBytes = 16 << 20 // 16 MiB
 
 // requiredDesc returns a human description for a required (always-string) arg.
 func requiredDesc(name string) string {
