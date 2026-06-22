@@ -3,7 +3,6 @@ package workspaceops
 import (
 	"errors"
 	"io"
-	"os"
 	"path/filepath"
 	"strings"
 )
@@ -91,27 +90,26 @@ func resolveWorkspacePath(root, rel string) (string, error) {
 	}
 }
 
-// readWorkspaceRegularFile resolves+confines rel, requires a regular file, and reads
-// at most maxRefFileBytes. Returns (data, true) on success; (nil, false) for
-// missing/unreadable/escaping/non-regular/oversized — callers treat false as
-// "not a trustworthy in-repo file".
+// readWorkspaceRegularFile confines rel beneath root WITHOUT a check-to-open race,
+// requires a regular file, and reads at most maxRefFileBytes. Returns (data, true)
+// on success; (nil, false) for missing/unreadable/escaping/non-regular/oversized —
+// callers treat false as "not a trustworthy in-repo file". The file is opened via a
+// symlink-refusing fd-walk and then stat+read happen on THAT SAME fd, so an agent
+// swapping the path for a symlink after validation can't redirect the read
+// (XM-PRO-007).
 func readWorkspaceRegularFile(root, rel string) ([]byte, bool) {
-	abs, err := resolveWorkspacePath(root, rel)
+	f, err := openWorkspaceFileBeneath(root, rel)
 	if err != nil {
 		return nil, false
 	}
-	info, err := os.Lstat(abs)
+	defer f.Close()
+	info, err := f.Stat() // fstat on the held fd — not a re-stat by path
 	if err != nil || !info.Mode().IsRegular() {
 		return nil, false
 	}
 	if info.Size() > maxRefFileBytes {
 		return nil, false
 	}
-	f, err := os.Open(abs)
-	if err != nil {
-		return nil, false
-	}
-	defer f.Close()
 	data, err := io.ReadAll(io.LimitReader(f, maxRefFileBytes+1))
 	if err != nil || int64(len(data)) > maxRefFileBytes {
 		return nil, false
