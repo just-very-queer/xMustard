@@ -162,6 +162,22 @@ func TestDispatchToolsCallRejectsStrayField(t *testing.T) {
 	}
 }
 
+// Real MCP clients (Codex, Claude Code, opencode) include a spec-standard `_meta`
+// field in tools/call params. Strict DisallowUnknownFields must NOT reject it, or
+// every compliant client gets -32602 (regression: this shipped in item B).
+func TestDispatchToolsCallAcceptsMetaField(t *testing.T) {
+	params := json.RawMessage(`{"name":"recall","arguments":{"workspace_id":"ws"},"_meta":{"progressToken":"abc-123"}}`)
+	res, rerr := dispatch("tools/call", params)
+	if rerr != nil {
+		t.Fatalf("_meta must be accepted, got rpc error %v", rerr)
+	}
+	// It reaches the tool (which errors only because no API server is up here) — the
+	// point is it is NOT rejected as an unknown-field param error.
+	if m, _ := res.(map[string]any); m == nil {
+		t.Fatalf("expected a tool result, got %v", res)
+	}
+}
+
 func TestDispatchToolsCallMalformedParams(t *testing.T) {
 	_, rerr := dispatch("tools/call", json.RawMessage(`{"name":`))
 	if rerr == nil || rerr.Code != -32602 {

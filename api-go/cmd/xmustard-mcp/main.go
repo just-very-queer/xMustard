@@ -369,8 +369,10 @@ func dispatch(method string, params json.RawMessage) (any, *rpcError) {
 		dec := json.NewDecoder(bytes.NewReader(params))
 		dec.DisallowUnknownFields() // reject stray top-level fields instead of ignoring them
 		var p struct {
-			Name      string         `json:"name"`
-			Arguments map[string]any `json:"arguments"`
+			Name      string          `json:"name"`
+			Arguments map[string]any  `json:"arguments"`
+			Meta      json.RawMessage `json:"_meta"`         // MCP-standard request metadata (progress tokens, etc.) — accepted + ignored, NOT a stray field
+			Progress  json.RawMessage `json:"progressToken"` // some clients hoist the progress token to params level; accept + ignore
 		}
 		if err := dec.Decode(&p); err != nil {
 			return nil, &rpcError{Code: -32602, Message: "invalid params: " + err.Error()}
