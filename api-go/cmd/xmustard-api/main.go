@@ -2197,6 +2197,11 @@ func main() {
 				})
 				return
 			}
+			// A path that escapes the workspace (or other bad input) is a 400, not a 500.
+			if workspaceops.IsInvalidInput(err) {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+				return
+			}
 			writeJSON(w, http.StatusInternalServerError, map[string]any{
 				"error": err.Error(),
 			})
@@ -3190,6 +3195,12 @@ func main() {
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				writeJSON(w, http.StatusNotFound, map[string]any{"error": "Missing resource"})
+				return
+			}
+			// Bad client input (path escape, malformed id, missing/empty field) is a
+			// 400, not a 500 — a malformed request is not a server fault.
+			if workspaceops.IsInvalidInput(err) {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 				return
 			}
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})

@@ -67,7 +67,7 @@ var safeIDPattern = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
 
 func validateSafeID(kind, id string) error {
 	if id == "" || strings.Contains(id, "..") || strings.ContainsRune(id, 0) || !safeIDPattern.MatchString(id) {
-		return fmt.Errorf("invalid %s id", kind)
+		return fmt.Errorf("invalid %s id: %w", kind, ErrInvalidInput)
 	}
 	return nil
 }
@@ -242,7 +242,7 @@ func ProposeContext(dataDir, workspaceID string, req ProposeContextRequest) (*Co
 		return nil, err
 	}
 	if strings.TrimSpace(req.Content) == "" {
-		return nil, fmt.Errorf("content is required")
+		return nil, fmt.Errorf("content is required: %w", ErrInvalidInput)
 	}
 	permission := strings.ToLower(strings.TrimSpace(req.Permission))
 	if permission != "readwrite" {

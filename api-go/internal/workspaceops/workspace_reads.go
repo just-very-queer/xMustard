@@ -1107,19 +1107,19 @@ func normalizeImpactDerivationSource(source string) string {
 func normalizeWorkspaceFile(rootPath string, relativePath string) (string, error) {
 	normalized := strings.TrimPrefix(strings.TrimSpace(relativePath), "./")
 	if normalized == "" {
-		return "", fmt.Errorf("path is required")
+		return "", fmt.Errorf("path is required: %w", ErrInvalidInput)
 	}
 	root := filepath.Clean(rootPath)
 	target := filepath.Clean(filepath.Join(root, normalized))
 	rel, err := filepath.Rel(root, target)
 	if err != nil || strings.HasPrefix(rel, "..") || filepath.IsAbs(rel) {
-		return "", fmt.Errorf("path escapes workspace root")
+		return "", fmt.Errorf("path escapes workspace root: %w", ErrInvalidInput)
 	}
 	// The lexical check above is insufficient: a symlink *inside* the repo can point
 	// outside it, and the os.Stat below follows symlinks. Re-verify containment after
 	// symlink resolution so file explain/symbols/LSP can't read host files (XM-NEW-023).
 	if _, err := resolveWorkspacePath(rootPath, normalized); err != nil {
-		return "", fmt.Errorf("path escapes workspace root")
+		return "", fmt.Errorf("path escapes workspace root: %w", ErrInvalidInput)
 	}
 	info, err := os.Stat(target)
 	if err != nil {
