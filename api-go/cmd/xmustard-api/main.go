@@ -3193,17 +3193,10 @@ func main() {
 	// --- issue intelligence: quality, duplicates, triage, test suggestions ---
 	issueIntel := func(w http.ResponseWriter, err error, result any) {
 		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				writeJSON(w, http.StatusNotFound, map[string]any{"error": "Missing resource"})
-				return
-			}
-			// Bad client input (path escape, malformed id, missing/empty field) is a
-			// 400, not a 500 — a malformed request is not a server fault.
-			if workspaceops.IsInvalidInput(err) {
-				writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
-				return
-			}
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			// One typed mapper for every issueIntel handler: typed DomainError -> its
+			// class; os.ErrNotExist -> 404; IsInvalidInput -> 400; else 500. Same
+			// fallback as before, so no behavior change for un-migrated error sources.
+			respondError(w, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, result)
@@ -4203,6 +4196,51 @@ func requireTerminalScope(w http.ResponseWriter, r *http.Request, dataDir, works
 		return false
 	}
 	return true
+}
+
+// httpStatusForClass maps a typed domain-error class to an HTTP status. Status now
+// follows the error TYPE, not its English wording (XM-PRO-013).
+func httpStatusForClass(c workspaceops.ErrorClass) int {
+	switch c {
+	case workspaceops.ClassInvalidInput:
+		return http.StatusBadRequest
+	case workspaceops.ClassNotFound:
+		return http.StatusNotFound
+	case workspaceops.ClassConflict:
+		return http.StatusConflict
+	case workspaceops.ClassUnavailable:
+		return http.StatusServiceUnavailable
+	default:
+		return http.StatusInternalServerError
+	}
+}
+
+// respondError is the single error->HTTP mapper the per-handler substring classifiers
+// converge on. A typed DomainError uses its class (and for the internal class the
+// wrapped detail stays server-side); os.ErrNotExist -> 404; IsInvalidInput -> 400;
+// anything else -> 500 with the raw message (the legacy fallback still being migrated).
+func respondError(w http.ResponseWriter, err error) {
+	if err == nil {
+		return
+	}
+	if de, ok := workspaceops.AsDomainError(err); ok {
+		if de.Class == workspaceops.ClassInternal {
+			log.Printf("internal error: %v", err) // detail logged, not disclosed
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal error"})
+			return
+		}
+		writeJSON(w, httpStatusForClass(de.Class), map[string]any{"error": de.Public})
+		return
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "Missing resource"})
+		return
+	}
+	if workspaceops.IsInvalidInput(err) {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 }
 
 // workspaceIDFromPath extracts {id} from /api/workspaces/{id}/... ("" if not such a path).

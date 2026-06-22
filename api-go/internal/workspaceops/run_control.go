@@ -565,22 +565,22 @@ func validateRuntimeModel(dataDir string, runtime string, model string) error {
 	case "codex":
 		binary := resolveBinary(settings.CodexBin, "codex")
 		if binary == "" {
-			return fmt.Errorf("runtime %s is not available", runtime)
+			return Invalid(fmt.Sprintf("runtime %s is not available", runtime))
 		}
 		if !slices.Contains(defaultCodexModels, model) {
-			return fmt.Errorf("model %s is not available for runtime %s", model, runtime)
+			return Invalid(fmt.Sprintf("model %s is not available for runtime %s", model, runtime))
 		}
 	case "opencode":
 		binary := resolveBinary(settings.OpencodeBin, "opencode")
 		if binary == "" {
-			return fmt.Errorf("runtime %s is not available", runtime)
+			return Invalid(fmt.Sprintf("runtime %s is not available", runtime))
 		}
 		models := detectOpencodeModels(binary)
 		if len(models) > 0 && !slices.Contains(models, model) {
-			return fmt.Errorf("model %s is not available for runtime %s", model, runtime)
+			return Invalid(fmt.Sprintf("model %s is not available for runtime %s", model, runtime))
 		}
 	default:
-		return fmt.Errorf("runtime %s is not available", runtime)
+		return Invalid(fmt.Sprintf("runtime %s is not available", runtime))
 	}
 	return nil
 }
@@ -593,7 +593,7 @@ func buildRuntimeCommand(dataDir string, runtime string, model string, workspace
 	if runtime == "codex" {
 		codexBin := resolveBinary(settings.CodexBin, "codex")
 		if codexBin == "" {
-			return nil, fmt.Errorf("runtime %s is not available", runtime)
+			return nil, Invalid(fmt.Sprintf("runtime %s is not available", runtime))
 		}
 		args, err := sanitizeCodexArgs(firstNonEmptyPtr(settings.CodexArgs))
 		if err != nil {
@@ -614,7 +614,7 @@ func buildRuntimeCommand(dataDir string, runtime string, model string, workspace
 	}
 	opencodeBin := resolveBinary(settings.OpencodeBin, "opencode")
 	if opencodeBin == "" {
-		return nil, fmt.Errorf("runtime %s is not available", runtime)
+		return nil, Invalid(fmt.Sprintf("runtime %s is not available", runtime))
 	}
 	return []string{
 		opencodeBin,
