@@ -156,6 +156,31 @@ pub fn tracked_doc_files(root: &Path) -> Vec<String> {
         .collect()
 }
 
+// SCANNABLE_* is the SINGLE broad "source file worth scanning" set — wider than the
+// symbol-graph code set (it adds shell/markup/config) and shared by the repo map +
+// signal scanner so those lists stop diverging (XM-PRO-012).
+const SCANNABLE_SOURCE_EXTENSIONS: &[&str] = &[
+    ".bash", ".c", ".cc", ".cpp", ".cjs", ".cs", ".css", ".go", ".h", ".hpp", ".html", ".java",
+    ".js", ".jsx", ".kt", ".kts", ".mjs", ".php", ".py", ".rb", ".rs", ".scala", ".sh", ".sql",
+    ".swift", ".ts", ".tsx", ".yaml", ".yml", ".zsh",
+];
+const SCANNABLE_SOURCE_FILENAMES: &[&str] = &["Dockerfile", "Justfile", "Makefile", "Procfile"];
+
+/// is_scannable_source reports whether a path is in the broad scannable-source set
+/// (repo map / signal scanner). The single owner of that list (XM-PRO-012).
+pub fn is_scannable_source(path: &str) -> bool {
+    let p = Path::new(path);
+    if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+        if SCANNABLE_SOURCE_FILENAMES.contains(&name) {
+            return true;
+        }
+    }
+    p.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| SCANNABLE_SOURCE_EXTENSIONS.contains(&format!(".{e}").as_str()))
+        .unwrap_or(false)
+}
+
 fn word_set(content: &str) -> HashSet<String> {
     content
         .split(|c: char| !(c.is_alphanumeric() || c == '_'))

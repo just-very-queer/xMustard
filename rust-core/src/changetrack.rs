@@ -409,16 +409,11 @@ pub struct ChangeSet {
     pub generated_at: String,
 }
 
-const SOURCE_EXTS: &[&str] = &[
-    "rs", "go", "py", "ts", "tsx", "js", "jsx", "java", "rb", "c", "h", "cpp", "hpp", "cc",
-];
-
+// Change-tracking treats the same files the symbol graph does (code + tests) as
+// "source", so it delegates to the canonical repo_role classifier rather than
+// keeping its own duplicate extension list (XM-PRO-012).
 fn is_source(path: &str) -> bool {
-    Path::new(path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| SOURCE_EXTS.contains(&e))
-        .unwrap_or(false)
+    matches!(crate::symbolgraph::repo_role(path), "code" | "test")
 }
 
 /// Pure diff of two file-hash maps into added/modified/deleted.

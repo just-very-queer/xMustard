@@ -33,13 +33,6 @@ const SCANNER_EXCLUDED_DIR_NAMES: &[&str] = &[
 
 const SCANNER_EXCLUDED_RELATIVE_DIRS: &[&str] = &["backend/data", "frontend/dist"];
 
-const SCANNABLE_SOURCE_EXTENSIONS: &[&str] = &[
-    ".bash", ".c", ".cc", ".cpp", ".cjs", ".cs", ".css", ".go", ".h", ".hpp", ".html", ".java",
-    ".js", ".jsx", ".kt", ".kts", ".mjs", ".php", ".py", ".rb", ".rs", ".scala", ".sh", ".sql",
-    ".swift", ".ts", ".tsx", ".yaml", ".yml", ".zsh",
-];
-
-const SCANNABLE_SOURCE_FILENAMES: &[&str] = &["Dockerfile", "Justfile", "Makefile", "Procfile"];
 
 const REPO_MAP_KEY_FILE_PATTERNS: &[(&str, &str)] = &[
     ("AGENTS.md", "guide"),
@@ -576,19 +569,8 @@ fn should_scan_file(relative_path: &str) -> bool {
     if should_ignore_relative_path(relative_path) {
         return false;
     }
-    let path = PathBuf::from(relative_path);
-    let file_name = match path.file_name().and_then(|name| name.to_str()) {
-        Some(value) => value,
-        None => return false,
-    };
-    if SCANNABLE_SOURCE_FILENAMES.contains(&file_name) {
-        return true;
-    }
-    let ext = path
-        .extension()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default();
-    SCANNABLE_SOURCE_EXTENSIONS.contains(&format!(".{ext}").as_str())
+    // Single owner of the scannable-source set (XM-PRO-012).
+    crate::symbolgraph::is_scannable_source(relative_path)
 }
 
 fn semantic_language_for_path(relative_path: &str) -> Option<String> {
