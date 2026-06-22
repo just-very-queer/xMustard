@@ -166,6 +166,31 @@ const SCANNABLE_SOURCE_EXTENSIONS: &[&str] = &[
 ];
 const SCANNABLE_SOURCE_FILENAMES: &[&str] = &["Dockerfile", "Justfile", "Makefile", "Procfile"];
 
+/// read_repo_file_no_follow reads a repo file but REFUSES to follow a symlink at the
+/// FINAL path component (safe OpenOptions + O_NOFOLLOW). The crate forbids unsafe, so
+/// a full openat fd-walk over intermediate dirs isn't available in Rust — the Go read
+/// oracle does that walk; this closes the common target-swap vector on the rust
+/// explain/symbols read path so a swapped file→symlink can't redirect the read into a
+/// host file (XM-PRO-007 follow-on). Falls back to a plain read on non-unix.
+pub fn read_repo_file_no_follow(path: &Path) -> std::io::Result<String> {
+    #[cfg(unix)]
+    {
+        use std::io::Read;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)?;
+        let mut s = String::new();
+        f.read_to_string(&mut s)?;
+        Ok(s)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::read_to_string(path)
+    }
+}
+
 /// is_scannable_source reports whether a path is in the broad scannable-source set
 /// (repo map / signal scanner). The single owner of that list (XM-PRO-012).
 pub fn is_scannable_source(path: &str) -> bool {
@@ -674,7 +699,7 @@ pub fn upgrade_graph_with_lsp(root: &Path, mut graph: SymbolGraph, budget: usize
             continue;
         }
 
-        let content = match std::fs::read_to_string(root.join(&rel)) {
+        let content = match read_repo_file_no_follow(&root.join(&rel)) {
             Ok(c) => c,
             Err(_) => continue,
         };
@@ -799,7 +824,7 @@ pub fn build_symbol_graph(root: &Path, workspace_id: &str) -> SymbolGraph {
     let mut next_cache: HashMap<String, CachedFileSymbols> = HashMap::new();
 
     for rel in &files {
-        let content = std::fs::read_to_string(root.join(rel)).unwrap_or_default();
+        let content = read_repo_file_no_follow(&root.join(rel)).unwrap_or_default();
         let hash = crate::indexcache::file_hash(root, rel).unwrap_or_default();
         let syms = match sym_cache.remove(rel) {
             Some(c) if c.hash == hash && !hash.is_empty() => c.symbols, // reuse: clean file
@@ -1194,7 +1219,7 @@ pub fn blast_radius(root: &Path, workspace_id: &str, symbol: &str) -> BlastRadiu
     let mut defined_in = Vec::new();
     let mut referencing = BTreeSet::new();
     for rel in &files {
-        let content = std::fs::read_to_string(root.join(rel)).unwrap_or_default();
+        let content = read_repo_file_no_follow(&root.join(rel)).unwrap_or_default();
         if word_set(&content).contains(symbol) {
             referencing.insert(rel.clone());
         }
@@ -1223,6 +1248,28 @@ mod tests {
     use super::*;
     use std::process::Command;
     use tempfile::TempDir;
+
+    // O_NOFOLLOW makes the rust read path refuse a symlink final component, so a
+    // file swapped for a symlink can't redirect the explain/symbols read into a host
+    // file (XM-PRO-007 follow-on).
+    #[test]
+    #[cfg(unix)]
+    fn read_repo_file_no_follow_refuses_symlink() {
+        use std::os::unix::fs::symlink;
+        let dir = TempDir::new().unwrap();
+        let real = dir.path().join("real.txt");
+        std::fs::write(&real, "IN-REPO").unwrap();
+        assert_eq!(read_repo_file_no_follow(&real).unwrap(), "IN-REPO");
+
+        let secret = dir.path().join("secret.txt");
+        std::fs::write(&secret, "SECRET-OUTSIDE").unwrap();
+        let link = dir.path().join("link.txt");
+        symlink(&secret, &link).unwrap();
+        assert!(
+            read_repo_file_no_follow(&link).is_err(),
+            "O_NOFOLLOW must refuse a symlink final component"
+        );
+    }
 
     fn git_repo(files: &[(&str, &str)]) -> TempDir {
         let dir = TempDir::new().unwrap();

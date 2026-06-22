@@ -891,6 +891,7 @@ name = "xmustard-core"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "libc",
  "percent-encoding",
  "regex",
  "roxmltree",
