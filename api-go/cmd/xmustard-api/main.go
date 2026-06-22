@@ -3889,6 +3889,10 @@ func main() {
 	} else {
 		log.Printf("auth: DISABLED (XMUSTARD_AUTH=off)")
 	}
+	// Cap every request body so a hostile/buggy client can't drive unbounded memory
+	// by POSTing a huge payload — the HTTP analogue of the MCP stdio framing cap
+	// (readBoundedLine). Outermost wrap so it applies before any handler reads the body.
+	handler = bodyLimitMiddleware(handler)
 	// Default to 8042 to match the MCP bridge's API target (XM-NEW-001) and
 	// AGENTS.md ("an HTTP shell on :8042"); override with XMUSTARD_API_PORT.
 	addr := host + ":" + envDefault("XMUSTARD_API_PORT", "8042")
@@ -4004,6 +4008,23 @@ func isCorePath(p string) bool {
 		}
 	}
 	return false
+}
+
+// maxRequestBodyBytes bounds any single HTTP request body. ReadTimeout +
+// MaxHeaderBytes bound time and headers only; without this a single multi-GB POST
+// (e.g. to /context or /settings) is decoded into memory unbounded — the same OOM
+// class the MCP framing path explicitly caps. Generous enough for real diagnostics/
+// eval payloads; a body past the cap is cut off and the handler's decode surfaces a
+// clean error (the malformed-body -> 400 path) instead of the server allocating.
+const maxRequestBodyBytes = 32 << 20 // 32 MiB
+
+func bodyLimitMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Body != nil {
+			r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func coreOnlyMiddleware(next http.Handler) http.Handler {
