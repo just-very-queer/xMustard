@@ -288,7 +288,20 @@ func GetRunPlan(dataDir string, workspaceID string, runID string) (*RunPlan, err
 	return run.Plan, nil
 }
 
+// runLockKey is the path-keyed transaction-lock key for a single run's record, so
+// approval / launch / finalization of the same run serialize through lockStore.
+func runLockKey(dataDir, workspaceID, runID string) string {
+	return filepath.Join(dataDir, "workspaces", workspaceID, "runs", runID+".json")
+}
+
 func ApproveRunPlan(dataDir string, workspaceID string, runID string, request PlanApproveRequest) (*RunPlan, error) {
+	// Serialize the read-check-transition-launch for this run so two concurrent
+	// approvals can't both pass the awaiting_approval check and both start a worker
+	// against the same worktree (only one process handle is then cancellable).
+	// The loser, once it holds the lock, re-reads phase=approved and bails (XM-PRO-002).
+	unlock := lockStore(runLockKey(dataDir, workspaceID, runID))
+	defer unlock()
+
 	run, err := ReadRun(dataDir, workspaceID, runID)
 	if err != nil {
 		return nil, err
