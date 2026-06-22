@@ -1,7 +1,6 @@
 package rustcore
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -27,20 +26,20 @@ func RunGoalCommand(args ...string) ([]byte, error) {
 	defer cancel()
 	cmd := coreCommandContext(ctx, "goal", args...)
 
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
+	stdout, stderr, over, err := runBoundedCmd(cmd)
+	if err != nil {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) && exitErr.ExitCode() == 4 {
 			return nil, ErrGoalNotFound
 		}
 		// keep the goal runtime's own message (validation/slop/gate text is
 		// user-facing) but bound it so a huge child stderr can't be echoed wholesale.
-		return nil, fmt.Errorf("rust-core goal %v: %w: %s", args, err, truncateForError(stderr.String()))
+		return nil, fmt.Errorf("rust-core goal %v: %w: %s", args, err, truncateForError(stderr))
 	}
-	return stdout.Bytes(), nil
+	if over {
+		return nil, fmt.Errorf("rust-core goal %v: output too large", args)
+	}
+	return stdout, nil
 }
 
 // truncateForError bounds an error fragment so large child output isn't echoed.

@@ -76,6 +76,22 @@ func runCoreCtx(parent context.Context, sub string, args ...string) ([]byte, err
 	return out.buf.Bytes(), nil
 }
 
+// runBoundedCmd runs an already-built rust-core command with BOUNDED stdout/stderr
+// capture (same caps as runCoreCtx: 64 MiB / 64 KiB), for the few bridge helpers
+// that must keep their own command + timeout construction (e.g. managed/verification
+// commands whose own timeout exceeds coreCallTimeout). It returns the captured
+// stdout, the (bounded) stderr for error context, whether stdout overflowed the cap,
+// and the raw run error so callers can inspect exit codes. This replaces the
+// unbounded bytes.Buffer captures those helpers used (XM-PRO-005).
+func runBoundedCmd(cmd *exec.Cmd) (stdout []byte, stderr string, over bool, err error) {
+	out := &capWriter{max: maxCoreStdout}
+	errb := &capWriter{max: maxCoreStderr}
+	cmd.Stdout = out
+	cmd.Stderr = errb
+	err = cmd.Run()
+	return out.buf.Bytes(), errb.buf.String(), out.over, err
+}
+
 func rustCoreDir() string {
 	_, currentFile, _, ok := runtime.Caller(0)
 	if !ok {

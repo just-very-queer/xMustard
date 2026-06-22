@@ -4000,26 +4000,48 @@ func requireRole(w http.ResponseWriter, r *http.Request, role string) bool {
 	return true
 }
 
-// coreOnlyPaths are the path markers the 9 MCP tools (+ auth/health) use. In
-// CORE_ONLY mode any request whose path lacks one of these gets a 404, so a lean
-// production deployment serves only the governed-memory + grounding + search core.
-var coreOnlyPaths = []string{
-	"/session-grounding",   // ground
-	"/context",             // recall / remember / verify
-	"/search",              // search
-	"/explain-path",        // explain
-	"/changes/since-index", // impact
-	"/diagnostics",         // diagnostics
-	"/why-failed",          // why_failed
+// coreWorkspaceSubpaths are the EXACT per-workspace subpaths the 9 MCP tools hit
+// (the part after /api/workspaces/{id}/). Matching these exactly — rather than by
+// substring — is what makes CORE_ONLY a real allowlist: a substring gate over
+// "/context"/"/search"/"/diagnostics" would also admit /context-replays,
+// /goals/{id}/context, /pg/search, /diagnostics/run, etc. (XM-PRO-011).
+var coreWorkspaceSubpaths = map[string]bool{
+	"session-grounding":   true, // ground
+	"context":             true, // remember (POST)
+	"context/active":      true, // recall
+	"search":              true, // search
+	"explain-path":        true, // explain
+	"changes/since-index": true, // impact
+	"diagnostics":         true, // diagnostics
 }
 
+// isCorePath reports whether p is one of the exact routes the lean 9-tool agent
+// surface uses. CORE_ONLY 404s everything else, so the deployed attack surface
+// matches the product claim, not a substring gate over ~200 handlers.
 func isCorePath(p string) bool {
 	if p == "/api/health" || p == "/api/workspaces" || strings.HasPrefix(p, "/api/auth/") {
 		return true
 	}
-	for _, marker := range coreOnlyPaths {
-		if strings.Contains(p, marker) {
-			return true
+	const wsPrefix = "/api/workspaces/"
+	if !strings.HasPrefix(p, wsPrefix) {
+		return false
+	}
+	rest := p[len(wsPrefix):]
+	slash := strings.IndexByte(rest, '/')
+	if slash < 0 {
+		return false // /api/workspaces/{id} with no tool subpath
+	}
+	sub := rest[slash+1:] // subpath after the workspace id
+	if coreWorkspaceSubpaths[sub] {
+		return true
+	}
+	// the two parameterized core routes: context/{entry_id}/verify, runs/{run_id}/why-failed
+	if seg := strings.Split(sub, "/"); len(seg) == 3 {
+		if seg[0] == "context" && seg[2] == "verify" {
+			return true // verify
+		}
+		if seg[0] == "runs" && seg[2] == "why-failed" {
+			return true // why_failed
 		}
 	}
 	return false

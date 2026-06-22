@@ -1,7 +1,6 @@
 package rustcore
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -77,17 +76,16 @@ func RunVerificationCommand(ctx context.Context, workspaceRoot string, timeoutSe
 		command,
 	)
 
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("rust-core run-verification-command failed: %w: %s", err, stderr.String())
+	stdout, stderr, over, err := runBoundedCmd(cmd)
+	if err != nil {
+		return nil, fmt.Errorf("rust-core run-verification-command failed: %w: %s", err, stderr)
+	}
+	if over {
+		return nil, fmt.Errorf("rust-core run-verification-command: output too large")
 	}
 
 	var result VerificationCommandResult
-	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+	if err := json.Unmarshal(stdout, &result); err != nil {
 		return nil, fmt.Errorf("decode rust-core verification result: %w", err)
 	}
 	return &result, nil
@@ -129,17 +127,16 @@ func RunVerificationProfile(
 
 	cmd := coreCommandContext(ctx, "run-verification-profile", args...)
 
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("rust-core run-verification-profile failed: %w: %s", err, stderr.String())
+	stdout, stderr, over, err := runBoundedCmd(cmd)
+	if err != nil {
+		return nil, fmt.Errorf("rust-core run-verification-profile failed: %w: %s", err, stderr)
+	}
+	if over {
+		return nil, fmt.Errorf("rust-core run-verification-profile: output too large")
 	}
 
 	var result VerificationProfileResult
-	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+	if err := json.Unmarshal(stdout, &result); err != nil {
 		return nil, fmt.Errorf("decode rust-core verification profile result: %w", err)
 	}
 	return &result, nil
