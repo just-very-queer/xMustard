@@ -101,6 +101,61 @@ fn tracked_source_files_with_coverage(root: &Path) -> (Vec<String>, IndexCoverag
     (indexed, cov)
 }
 
+/// repo_role is the SINGLE canonical classification of a tracked file, so code /
+/// tests / docs / guidance / config are decided in ONE place instead of the five
+/// divergent per-subsystem extension lists the review flagged (XM-PRO-012). "code"
+/// and "test" feed the symbol graph; "doc" and "guide" feed the docs search segment;
+/// "config"/"other" are listed but not deeply indexed.
+pub fn repo_role(path: &str) -> &'static str {
+    let lower = path.to_lowercase();
+    let base = Path::new(&lower)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    if matches!(
+        base,
+        "agents.md"
+            | "claude.md"
+            | "gemini.md"
+            | "conventions.md"
+            | "readme.md"
+            | ".clinerules"
+            | ".cursorrules"
+    ) {
+        return "guide";
+    }
+    if is_test_file(&lower) {
+        return "test";
+    }
+    if is_source(&lower) {
+        return "code";
+    }
+    match Path::new(&lower).extension().and_then(|e| e.to_str()) {
+        Some("md" | "markdown" | "mdx" | "txt" | "rst" | "adoc") => "doc",
+        Some("toml" | "json" | "yaml" | "yml" | "ini" | "cfg" | "conf") => "config",
+        _ => "other",
+    }
+}
+
+/// tracked_doc_files lists the repo's git-tracked doc + guidance files — the docs
+/// search segment, so the single `search` tool can return hits from prose the symbol
+/// graph (code-only) never sees (XM-PRO-012). Empty when git is unavailable.
+pub fn tracked_doc_files(root: &Path) -> Vec<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["ls-files"])
+        .output();
+    let text = match out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+        _ => return Vec::new(),
+    };
+    text.lines()
+        .filter(|l| matches!(repo_role(l), "doc" | "guide"))
+        .map(|l| l.to_string())
+        .collect()
+}
+
 fn word_set(content: &str) -> HashSet<String> {
     content
         .split(|c: char| !(c.is_alphanumeric() || c == '_'))

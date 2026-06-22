@@ -356,6 +356,11 @@ pub fn hybrid_search(
         })
         .collect();
 
+    // Docs/guidance live OUTSIDE the code symbol graph, so fold a content search over
+    // them into the same result set: an agent can now find a concept that only appears
+    // in a README / AGENTS.md / design doc through the one search tool (XM-PRO-012).
+    hits.extend(search_docs(root, &qtokens, limit));
+
     hits.sort_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
@@ -372,6 +377,68 @@ pub fn hybrid_search(
         coverage: graph.coverage.clone(),
         generated_at: now(),
     }
+}
+
+/// search_docs makes the repo's docs/guidance content searchable (the docs segment
+/// of XM-PRO-012). The symbol graph indexes code only, so without this a query for a
+/// concept documented in prose returns nothing. It reads each tracked doc (bounded),
+/// scores line-window chunks by how many DISTINCT query tokens appear in the chunk's
+/// CONTENT (not just a name), and returns the best chunks as kind="doc" hits with the
+/// chunk's start line. Scores are calibrated to interleave with code hits.
+fn search_docs(root: &Path, qtokens: &[String], limit: usize) -> Vec<SearchHit> {
+    if qtokens.is_empty() || limit == 0 {
+        return Vec::new();
+    }
+    const MAX_DOC_BYTES: u64 = 1 << 20; // 1 MiB per doc
+    const CHUNK_LINES: usize = 30;
+    let mut hits: Vec<SearchHit> = Vec::new();
+    for rel in symbolgraph::tracked_doc_files(root) {
+        let abs = root.join(&rel);
+        match std::fs::metadata(&abs) {
+            Ok(m) if m.len() <= MAX_DOC_BYTES => {}
+            _ => continue,
+        }
+        let content = match std::fs::read_to_string(&abs) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let role = symbolgraph::repo_role(&rel);
+        let lines: Vec<&str> = content.lines().collect();
+        let mut start = 0usize;
+        while start < lines.len() {
+            let end = (start + CHUNK_LINES).min(lines.len());
+            let chunk_tokens: HashSet<String> =
+                tokens(&lines[start..end].join("\n")).into_iter().collect();
+            let matched = qtokens
+                .iter()
+                .filter(|t| chunk_tokens.contains(t.as_str()))
+                .count();
+            if matched > 0 {
+                let frac = matched as f64 / qtokens.len() as f64;
+                hits.push(SearchHit {
+                    kind: "doc".to_string(),
+                    name: rel.clone(),
+                    path: rel.clone(),
+                    line: Some(start + 1),
+                    score: 0.05 * frac,
+                    reason: format!(
+                        "matched {}/{} terms in {} content",
+                        matched,
+                        qtokens.len(),
+                        role
+                    ),
+                });
+            }
+            start = end;
+        }
+    }
+    hits.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    hits.truncate(limit);
+    hits
 }
 
 #[cfg(test)]
@@ -410,6 +477,52 @@ mod tests {
             .output()
             .unwrap();
         dir
+    }
+
+    #[test]
+    fn repo_role_classifies_canonically() {
+        use crate::symbolgraph::repo_role;
+        assert_eq!(repo_role("src/main.rs"), "code");
+        assert_eq!(repo_role("apps/api/handlers_test.go"), "test");
+        assert_eq!(repo_role("docs/DESIGN.md"), "doc");
+        assert_eq!(repo_role("notes.txt"), "doc");
+        assert_eq!(repo_role("AGENTS.md"), "guide");
+        assert_eq!(repo_role("README.md"), "guide");
+        assert_eq!(repo_role("CLAUDE.md"), "guide");
+        assert_eq!(repo_role("package.json"), "config");
+        assert_eq!(repo_role("logo.png"), "other");
+    }
+
+    #[test]
+    fn search_returns_doc_hits_for_prose_only_concepts() {
+        let repo = git_repo(&[
+            ("lib.rs", "pub fn compute_widget_total() {}\n"),
+            (
+                "README.md",
+                "# Guide\n\nThe spend guardrail enforces a daily budget ceiling.\nUnique marker zebra_protocol_v7 is documented only here.\n",
+            ),
+        ]);
+        // a concept that exists ONLY in prose, never as a code symbol
+        let res = hybrid_search(repo.path(), "ws", "zebra_protocol_v7", 10, None);
+        let doc_hit = res.hits.iter().find(|h| h.kind == "doc");
+        assert!(
+            doc_hit.is_some(),
+            "expected a doc hit for a prose-only term; got {:?}",
+            res.hits
+        );
+        let h = doc_hit.unwrap();
+        assert_eq!(h.path, "README.md");
+        assert!(h.line.is_some());
+
+        // code symbol search still works alongside docs
+        let code = hybrid_search(repo.path(), "ws", "compute widget total", 10, None);
+        assert!(
+            code.hits
+                .iter()
+                .any(|h| h.kind == "symbol" || h.kind == "file"),
+            "code search must still return code hits: {:?}",
+            code.hits
+        );
     }
 
     #[test]
