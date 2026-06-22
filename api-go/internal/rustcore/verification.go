@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 )
 
 type VerificationCommandResult struct {
@@ -70,20 +69,13 @@ func RunVerificationCommand(ctx context.Context, workspaceRoot string, timeoutSe
 		timeoutSeconds = 1
 	}
 
-	cmd := exec.CommandContext(
+	cmd := coreCommandContext(
 		ctx,
-		"cargo",
-		"run",
-		"--quiet",
-		"--bin",
-		"xmustard-core",
-		"--",
 		"run-verification-command",
 		workspaceRoot,
 		fmt.Sprintf("%d", timeoutSeconds),
 		command,
 	)
-	cmd.Dir = rustCoreDir()
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
@@ -127,16 +119,7 @@ func RunVerificationProfile(
 		return nil, fmt.Errorf("close temp verification profile: %w", err)
 	}
 
-	args := []string{
-		"run",
-		"--quiet",
-		"--bin",
-		"xmustard-core",
-		"--",
-		"run-verification-profile",
-		workspaceRoot,
-		profileFile.Name(),
-	}
+	args := []string{workspaceRoot, profileFile.Name()}
 	if runID != "" {
 		args = append(args, runID)
 	}
@@ -144,8 +127,7 @@ func RunVerificationProfile(
 		args = append(args, issueID)
 	}
 
-	cmd := exec.CommandContext(ctx, "cargo", args...)
-	cmd.Dir = rustCoreDir()
+	cmd := coreCommandContext(ctx, "run-verification-profile", args...)
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer

@@ -1,11 +1,9 @@
 package rustcore
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"os/exec"
 )
 
 type DiscoverySignal struct {
@@ -28,30 +26,12 @@ type EvidenceRef struct {
 }
 
 func ScanSignals(ctx context.Context, repoRoot string) ([]DiscoverySignal, error) {
-	cmd := exec.CommandContext(
-		ctx,
-		"cargo",
-		"run",
-		"--quiet",
-		"--bin",
-		"xmustard-core",
-		"--",
-		"scan-signals",
-		repoRoot,
-	)
-	cmd.Dir = rustCoreDir()
-
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("rust-core scan-signals failed: %w: %s", err, stderr.String())
+	stdout, err := runCoreCtx(ctx, "scan-signals", repoRoot)
+	if err != nil {
+		return nil, err
 	}
-
 	var signals []DiscoverySignal
-	if err := json.Unmarshal(stdout.Bytes(), &signals); err != nil {
+	if err := json.Unmarshal(stdout, &signals); err != nil {
 		return nil, fmt.Errorf("decode rust-core signals: %w", err)
 	}
 	return signals, nil

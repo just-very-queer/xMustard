@@ -4,238 +4,47 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
-	"xmustard/api-go/internal/migration"
-	"xmustard/api-go/internal/rustcore"
 	"xmustard/api-go/internal/workspaceops"
 )
 
-type verificationRunRequest struct {
-	WorkspaceRoot  string `json:"workspace_root"`
-	Command        string `json:"command"`
-	TimeoutSeconds int    `json:"timeout_seconds"`
-}
-
-type verificationProfileRunRequest struct {
-	WorkspaceRoot string                            `json:"workspace_root"`
-	Profile       rustcore.VerificationProfileInput `json:"profile"`
-	RunID         string                            `json:"run_id"`
-	IssueID       string                            `json:"issue_id"`
-}
-
 func main() {
+	// `xmustard-api mint-token <id> [role]` mints a bearer token (local file access,
+	// no server needed) — the bootstrap path for the first admin token.
+	if len(os.Args) > 1 && os.Args[1] == "mint-token" {
+		if len(os.Args) < 3 {
+			fmt.Fprintln(os.Stderr, "usage: xmustard-api mint-token <id> [admin|agent|readonly]")
+			os.Exit(2)
+		}
+		role := "agent"
+		if len(os.Args) > 3 {
+			role = os.Args[3]
+		}
+		raw, err := workspaceops.MintToken(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), os.Args[2], role)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		fmt.Println(raw)
+		return
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"status":  "ok",
 			"service": "api-go",
 		})
-	})
-	mux.HandleFunc("/api/migration/plan", func(w http.ResponseWriter, r *http.Request) {
-		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
-		defer cancel()
-
-		contract, err := rustcore.ReadArchitectureContract(ctx)
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{
-				"error": err.Error(),
-			})
-			return
-		}
-		writeJSON(w, http.StatusOK, contract)
-	})
-	mux.HandleFunc("/api/migration/agent-surfaces", func(w http.ResponseWriter, r *http.Request) {
-		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
-		defer cancel()
-
-		contract, err := rustcore.ReadArchitectureContract(ctx)
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{
-				"error": err.Error(),
-			})
-			return
-		}
-		writeJSON(w, http.StatusOK, buildAgentSurfacesPayload(contract))
-	})
-	mux.HandleFunc("/api/migration/routes", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(migration.APIRouteGroupsJSON)
-	})
-	mux.HandleFunc("/api/migration/scan-signals", func(w http.ResponseWriter, r *http.Request) {
-		rootPath := r.URL.Query().Get("root_path")
-		if rootPath == "" {
-			writeJSON(w, http.StatusBadRequest, map[string]any{
-				"error": "missing root_path query parameter",
-			})
-			return
-		}
-		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
-		defer cancel()
-
-		signals, err := rustcore.ScanSignals(ctx, rootPath)
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{
-				"error": err.Error(),
-			})
-			return
-		}
-		writeJSON(w, http.StatusOK, signals)
-	})
-	mux.HandleFunc("/api/migration/repo-map", func(w http.ResponseWriter, r *http.Request) {
-		rootPath := r.URL.Query().Get("root_path")
-		workspaceID := r.URL.Query().Get("workspace_id")
-		if rootPath == "" || workspaceID == "" {
-			writeJSON(w, http.StatusBadRequest, map[string]any{
-				"error": "missing workspace_id or root_path query parameter",
-			})
-			return
-		}
-		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
-		defer cancel()
-
-		summary, err := rustcore.BuildRepoMap(ctx, workspaceID, rootPath)
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{
-				"error": err.Error(),
-			})
-			return
-		}
-		writeJSON(w, http.StatusOK, summary)
-	})
-	mux.HandleFunc("/api/migration/coverage/lcov", func(w http.ResponseWriter, r *http.Request) {
-		reportPath := r.URL.Query().Get("report_path")
-		workspaceID := r.URL.Query().Get("workspace_id")
-		runID := r.URL.Query().Get("run_id")
-		issueID := r.URL.Query().Get("issue_id")
-		if reportPath == "" || workspaceID == "" {
-			writeJSON(w, http.StatusBadRequest, map[string]any{
-				"error": "missing workspace_id or report_path query parameter",
-			})
-			return
-		}
-		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
-		defer cancel()
-
-		result, err := rustcore.ParseLCOVCoverage(ctx, workspaceID, reportPath, runID, issueID)
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{
-				"error": err.Error(),
-			})
-			return
-		}
-		writeJSON(w, http.StatusOK, result)
-	})
-	mux.HandleFunc("/api/migration/coverage", func(w http.ResponseWriter, r *http.Request) {
-		reportPath := r.URL.Query().Get("report_path")
-		workspaceID := r.URL.Query().Get("workspace_id")
-		runID := r.URL.Query().Get("run_id")
-		issueID := r.URL.Query().Get("issue_id")
-		if reportPath == "" || workspaceID == "" {
-			writeJSON(w, http.StatusBadRequest, map[string]any{
-				"error": "missing workspace_id or report_path query parameter",
-			})
-			return
-		}
-		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
-		defer cancel()
-
-		result, err := rustcore.ParseCoverage(ctx, workspaceID, reportPath, runID, issueID)
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{
-				"error": err.Error(),
-			})
-			return
-		}
-		writeJSON(w, http.StatusOK, result)
-	})
-	mux.HandleFunc("/api/migration/verification/run", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{
-				"error": "method not allowed",
-			})
-			return
-		}
-
-		var request verificationRunRequest
-		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]any{
-				"error": "invalid JSON body",
-			})
-			return
-		}
-		if request.WorkspaceRoot == "" || request.Command == "" {
-			writeJSON(w, http.StatusBadRequest, map[string]any{
-				"error": "missing workspace_root or command",
-			})
-			return
-		}
-		if request.TimeoutSeconds < 1 {
-			request.TimeoutSeconds = 30
-		}
-
-		ctx, cancel := context.WithTimeout(r.Context(), time.Duration(request.TimeoutSeconds+5)*time.Second)
-		defer cancel()
-
-		result, err := rustcore.RunVerificationCommand(ctx, request.WorkspaceRoot, request.TimeoutSeconds, request.Command)
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{
-				"error": err.Error(),
-			})
-			return
-		}
-		writeJSON(w, http.StatusOK, result)
-	})
-	mux.HandleFunc("/api/migration/verification/profile-run", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{
-				"error": "method not allowed",
-			})
-			return
-		}
-
-		var request verificationProfileRunRequest
-		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]any{
-				"error": "invalid JSON body",
-			})
-			return
-		}
-		if request.WorkspaceRoot == "" || request.Profile.ProfileID == "" || request.Profile.WorkspaceID == "" || request.Profile.TestCommand == "" {
-			writeJSON(w, http.StatusBadRequest, map[string]any{
-				"error": "missing workspace_root or required profile fields",
-			})
-			return
-		}
-
-		timeoutSeconds := request.Profile.MaxRuntimeSeconds
-		if timeoutSeconds < 1 {
-			timeoutSeconds = 30
-		}
-		ctx, cancel := context.WithTimeout(r.Context(), time.Duration(timeoutSeconds+5)*time.Second)
-		defer cancel()
-
-		result, err := rustcore.RunVerificationProfile(
-			ctx,
-			request.WorkspaceRoot,
-			request.Profile,
-			request.RunID,
-			request.IssueID,
-		)
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{
-				"error": err.Error(),
-			})
-			return
-		}
-		writeJSON(w, http.StatusOK, result)
 	})
 	mux.HandleFunc("GET /api/runtimes", func(w http.ResponseWriter, r *http.Request) {
 		result, err := workspaceops.DetectRuntimes(
@@ -262,6 +71,9 @@ func main() {
 		writeJSON(w, http.StatusOK, result)
 	})
 	mux.HandleFunc("POST /api/settings", func(w http.ResponseWriter, r *http.Request) {
+		if !requireRole(w, r, "admin") {
+			return
+		}
 		var request workspaceops.AppSettings
 		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]any{
@@ -280,6 +92,223 @@ func main() {
 			return
 		}
 		writeJSON(w, http.StatusOK, result)
+	})
+	dataDir := func() string { return envDefault("XMUSTARD_DATA_DIR", "../backend/data") }
+	// --- auth: token admin (admin-gated) + whoami ---
+	mux.HandleFunc("GET /api/auth/whoami", func(w http.ResponseWriter, r *http.Request) {
+		if p := principalFromContext(r.Context()); p != nil {
+			writeJSON(w, http.StatusOK, p)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"id": "", "role": "anonymous"})
+	})
+	mux.HandleFunc("GET /api/auth/principals", func(w http.ResponseWriter, r *http.Request) {
+		if !requireRole(w, r, "admin") {
+			return
+		}
+		writeJSON(w, http.StatusOK, workspaceops.ListPrincipals(dataDir()))
+	})
+	auditActor := func(r *http.Request) string {
+		if p := principalFromContext(r.Context()); p != nil {
+			return p.ID
+		}
+		return "system"
+	}
+	mux.HandleFunc("POST /api/auth/tokens", func(w http.ResponseWriter, r *http.Request) {
+		if !requireRole(w, r, "admin") {
+			return
+		}
+		var req struct {
+			ID         string   `json:"id"`
+			Role       string   `json:"role"`
+			TTLSeconds int      `json:"ttl_seconds"`
+			Workspaces []string `json:"workspaces"` // optional: confine the token to these workspaces
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON body"})
+			return
+		}
+		raw, err := workspaceops.MintScopedToken(dataDir(), req.ID, req.Role, req.TTLSeconds, req.Workspaces)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
+		workspaceops.RecordAuthAudit(dataDir(), workspaceops.AuthAuditEvent{
+			Action: "mint", Actor: auditActor(r), TokenID: req.ID, Role: req.Role,
+			Method: r.Method, Path: r.URL.Path, RemoteAddr: r.RemoteAddr,
+		})
+		writeJSON(w, http.StatusOK, map[string]any{"id": req.ID, "token": raw, "note": "store this now; it is not recoverable"})
+	})
+	mux.HandleFunc("POST /api/auth/tokens/{id}/rotate", func(w http.ResponseWriter, r *http.Request) {
+		if !requireRole(w, r, "admin") {
+			return
+		}
+		var req struct {
+			TTLSeconds int `json:"ttl_seconds"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req) // body optional
+		id := r.PathValue("id")
+		raw, err := workspaceops.RotateToken(dataDir(), id, req.TTLSeconds)
+		if err != nil {
+			status := http.StatusBadRequest
+			if errors.Is(err, os.ErrNotExist) {
+				status = http.StatusNotFound
+			}
+			writeJSON(w, status, map[string]any{"error": err.Error()})
+			return
+		}
+		workspaceops.RecordAuthAudit(dataDir(), workspaceops.AuthAuditEvent{
+			Action: "rotate", Actor: auditActor(r), TokenID: id,
+			Method: r.Method, Path: r.URL.Path, RemoteAddr: r.RemoteAddr,
+		})
+		writeJSON(w, http.StatusOK, map[string]any{"id": id, "token": raw, "note": "old token invalidated; store this now"})
+	})
+	mux.HandleFunc("DELETE /api/auth/tokens/{id}", func(w http.ResponseWriter, r *http.Request) {
+		if !requireRole(w, r, "admin") {
+			return
+		}
+		id := r.PathValue("id")
+		if err := workspaceops.RevokeToken(dataDir(), id); err != nil {
+			status := http.StatusInternalServerError
+			if errors.Is(err, os.ErrNotExist) {
+				status = http.StatusNotFound
+			}
+			writeJSON(w, status, map[string]any{"error": err.Error()})
+			return
+		}
+		workspaceops.RecordAuthAudit(dataDir(), workspaceops.AuthAuditEvent{
+			Action: "revoke", Actor: auditActor(r), TokenID: id,
+			Method: r.Method, Path: r.URL.Path, RemoteAddr: r.RemoteAddr,
+		})
+		writeJSON(w, http.StatusOK, map[string]any{"revoked": id})
+	})
+	mux.HandleFunc("GET /api/auth/audit", func(w http.ResponseWriter, r *http.Request) {
+		if !requireRole(w, r, "admin") {
+			return
+		}
+		limit := 100
+		if v := r.URL.Query().Get("limit"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil {
+				limit = n
+			}
+		}
+		writeJSON(w, http.StatusOK, workspaceops.ListAuthAudit(dataDir(), limit))
+	})
+	// --- OpenAI-compatible providers (Ollama / vLLM / LM Studio / OpenAI / VLM) ---
+	respond := func(w http.ResponseWriter, err error, result any) {
+		if err != nil {
+			status := http.StatusInternalServerError
+			if errors.Is(err, os.ErrNotExist) {
+				status = http.StatusNotFound
+			}
+			writeJSON(w, status, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	}
+	mux.HandleFunc("GET /api/providers", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.ListOpenAIProviders(dataDir())
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	})
+	mux.HandleFunc("POST /api/providers", func(w http.ResponseWriter, r *http.Request) {
+		if !requireRole(w, r, "admin") {
+			return
+		}
+		var req workspaceops.OpenAIProvider
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON body"})
+			return
+		}
+		result, err := workspaceops.AddOpenAIProvider(dataDir(), req)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	})
+	mux.HandleFunc("DELETE /api/providers/{name}", func(w http.ResponseWriter, r *http.Request) {
+		if !requireRole(w, r, "admin") {
+			return
+		}
+		if err := workspaceops.RemoveOpenAIProvider(dataDir(), r.PathValue("name")); err != nil {
+			status := http.StatusInternalServerError
+			if errors.Is(err, os.ErrNotExist) {
+				status = http.StatusNotFound
+			}
+			writeJSON(w, status, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"removed": r.PathValue("name")})
+	})
+	mux.HandleFunc("GET /api/providers/{name}/models", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.ListProviderModels(dataDir(), r.PathValue("name"))
+		respond(w, err, result)
+	})
+	mux.HandleFunc("POST /api/providers/{name}/probe", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.ProbeOpenAIProvider(dataDir(), r.PathValue("name"))
+		respond(w, err, result)
+	})
+	mux.HandleFunc("POST /api/providers/{name}/chat", func(w http.ResponseWriter, r *http.Request) {
+		var req workspaceops.ChatRequest
+		_ = json.NewDecoder(r.Body).Decode(&req) // body optional; query params support the MCP bridge
+		q := r.URL.Query()
+		if req.Prompt == "" {
+			req.Prompt = q.Get("prompt")
+		}
+		if req.Model == "" {
+			req.Model = q.Get("model")
+		}
+		result, err := workspaceops.OpenAIChat(dataDir(), r.PathValue("name"), req)
+		respond(w, err, result)
+	})
+	// --- task-typed model routing over the providers ---
+	mux.HandleFunc("POST /api/route", func(w http.ResponseWriter, r *http.Request) {
+		var req workspaceops.RouteRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		q := r.URL.Query()
+		if req.Prompt == "" {
+			req.Prompt = q.Get("prompt")
+		}
+		if q.Has("has_image") {
+			req.HasImage = q.Get("has_image") == "true"
+		}
+		if req.TaskHint == "" {
+			req.TaskHint = q.Get("task_hint")
+		}
+		result, err := workspaceops.RouteModel(dataDir(), req)
+		respond(w, err, result)
+	})
+	mux.HandleFunc("POST /api/route/chat", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			workspaceops.RouteRequest
+			ImageURLs []string `json:"image_urls"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if body.Prompt == "" {
+			body.Prompt = r.URL.Query().Get("prompt")
+		}
+		result, err := workspaceops.RouteAndChat(dataDir(), body.RouteRequest, body.ImageURLs)
+		respond(w, err, result)
+	})
+	mux.HandleFunc("GET /api/routes", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.ListModelRoutes(dataDir())
+		respond(w, err, result)
+	})
+	mux.HandleFunc("POST /api/routes", func(w http.ResponseWriter, r *http.Request) {
+		if !requireRole(w, r, "admin") {
+			return
+		}
+		var rule workspaceops.RoutingRule
+		if err := json.NewDecoder(r.Body).Decode(&rule); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON body"})
+			return
+		}
+		result, err := workspaceops.SetModelRoute(dataDir(), rule)
+		respond(w, err, result)
 	})
 	mux.HandleFunc("GET /api/postgres/plan", func(w http.ResponseWriter, r *http.Request) {
 		result, err := workspaceops.GetPostgresSchemaPlan(
@@ -356,19 +385,6 @@ func main() {
 			return
 		}
 		writeJSON(w, http.StatusOK, result)
-	})
-	mux.HandleFunc("GET /api/agent/surfaces", func(w http.ResponseWriter, r *http.Request) {
-		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
-		defer cancel()
-
-		contract, err := rustcore.ReadArchitectureContract(ctx)
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{
-				"error": err.Error(),
-			})
-			return
-		}
-		writeJSON(w, http.StatusOK, buildAgentSurfacesPayload(contract))
 	})
 	mux.HandleFunc("POST /api/workspaces/{workspace_id}/agent/probe", func(w http.ResponseWriter, r *http.Request) {
 		workspaceID := r.PathValue("workspace_id")
@@ -495,7 +511,90 @@ func main() {
 		}
 		writeJSON(w, http.StatusOK, result)
 	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/repo-state", func(w http.ResponseWriter, r *http.Request) {
+		workspaceID := r.PathValue("workspace_id")
+		result, err := workspaceops.ReadRepoToolState(
+			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
+			workspaceID,
+		)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				writeJSON(w, http.StatusNotFound, map[string]any{
+					"error": "Workspace not found",
+				})
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"error": err.Error(),
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/ingestion-plan", func(w http.ResponseWriter, r *http.Request) {
+		workspaceID := r.PathValue("workspace_id")
+		result, err := workspaceops.ReadIngestionPlan(
+			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
+			workspaceID,
+		)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				writeJSON(w, http.StatusNotFound, map[string]any{
+					"error": "Workspace not found",
+				})
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"error": err.Error(),
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/run-targets", func(w http.ResponseWriter, r *http.Request) {
+		workspaceID := r.PathValue("workspace_id")
+		result, err := workspaceops.ReadRunTargets(
+			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
+			workspaceID,
+		)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				writeJSON(w, http.StatusNotFound, map[string]any{
+					"error": "Workspace not found",
+				})
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"error": err.Error(),
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/verify-targets", func(w http.ResponseWriter, r *http.Request) {
+		workspaceID := r.PathValue("workspace_id")
+		result, err := workspaceops.ReadVerifyTargets(
+			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
+			workspaceID,
+		)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				writeJSON(w, http.StatusNotFound, map[string]any{
+					"error": "Workspace not found",
+				})
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"error": err.Error(),
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	})
 	mux.HandleFunc("POST /api/workspaces/{workspace_id}/issues/{issue_id}/runs", func(w http.ResponseWriter, r *http.Request) {
+		if !requireRole(w, r, "agent") { // launching a run is an agent action, not readonly
+			return
+		}
 		workspaceID := r.PathValue("workspace_id")
 		issueID := r.PathValue("issue_id")
 		var request workspaceops.RunRequest
@@ -1674,6 +1773,7 @@ func main() {
 		result, err := workspaceops.ReadDiagnostics(
 			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
 			workspaceID,
+			r.URL.Query().Get("diagnostic_run_id"),
 		)
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
@@ -1683,6 +1783,33 @@ func main() {
 				return
 			}
 			if errors.Is(err, workspaceops.ErrInvalidDiagnosticsRequest) {
+				writeJSON(w, http.StatusBadRequest, map[string]any{
+					"error": err.Error(),
+				})
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"error": err.Error(),
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/diagnostics/live", func(w http.ResponseWriter, r *http.Request) {
+		workspaceID := r.PathValue("workspace_id")
+		result, err := workspaceops.ReadLiveDiagnostics(
+			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
+			workspaceID,
+			r.URL.Query().Get("path"),
+		)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				writeJSON(w, http.StatusNotFound, map[string]any{
+					"error": "Workspace or path not found",
+				})
+				return
+			}
+			if errors.Is(err, workspaceops.ErrInvalidSemanticRequest) {
 				writeJSON(w, http.StatusBadRequest, map[string]any{
 					"error": err.Error(),
 				})
@@ -1735,6 +1862,46 @@ func main() {
 			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
 			workspaceID,
 			r.URL.Query().Get("base_ref"),
+		)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				writeJSON(w, http.StatusNotFound, map[string]any{
+					"error": "Workspace not found",
+				})
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"error": err.Error(),
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/project-info", func(w http.ResponseWriter, r *http.Request) {
+		workspaceID := r.PathValue("workspace_id")
+		result, err := workspaceops.ReadProjectInfo(
+			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
+			workspaceID,
+		)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				writeJSON(w, http.StatusNotFound, map[string]any{
+					"error": "Workspace not found",
+				})
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"error": err.Error(),
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/verification-outcomes", func(w http.ResponseWriter, r *http.Request) {
+		workspaceID := r.PathValue("workspace_id")
+		result, err := workspaceops.ReadVerificationOutcomes(
+			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
+			workspaceID,
 		)
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
@@ -1815,12 +1982,116 @@ func main() {
 		}
 		writeJSON(w, http.StatusOK, result)
 	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/go-to-definition", func(w http.ResponseWriter, r *http.Request) {
+		workspaceID := r.PathValue("workspace_id")
+		line, _ := strconv.Atoi(r.URL.Query().Get("line"))
+		column, _ := strconv.Atoi(r.URL.Query().Get("column"))
+		result, err := workspaceops.GoToDefinition(
+			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
+			workspaceID,
+			r.URL.Query().Get("path"),
+			line,
+			column,
+		)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				writeJSON(w, http.StatusNotFound, map[string]any{
+					"error": "Workspace or path not found",
+				})
+				return
+			}
+			if errors.Is(err, workspaceops.ErrInvalidSemanticRequest) {
+				writeJSON(w, http.StatusBadRequest, map[string]any{
+					"error": err.Error(),
+				})
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"error": err.Error(),
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/references", func(w http.ResponseWriter, r *http.Request) {
+		workspaceID := r.PathValue("workspace_id")
+		line, _ := strconv.Atoi(r.URL.Query().Get("line"))
+		column, _ := strconv.Atoi(r.URL.Query().Get("column"))
+		includeDeclaration := true
+		if raw := strings.TrimSpace(r.URL.Query().Get("include_declaration")); raw != "" {
+			parsed, err := strconv.ParseBool(raw)
+			if err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]any{
+					"error": "include_declaration must be a boolean",
+				})
+				return
+			}
+			includeDeclaration = parsed
+		}
+		result, err := workspaceops.FindReferences(
+			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
+			workspaceID,
+			r.URL.Query().Get("path"),
+			line,
+			column,
+			includeDeclaration,
+		)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				writeJSON(w, http.StatusNotFound, map[string]any{
+					"error": "Workspace or path not found",
+				})
+				return
+			}
+			if errors.Is(err, workspaceops.ErrInvalidSemanticRequest) {
+				writeJSON(w, http.StatusBadRequest, map[string]any{
+					"error": err.Error(),
+				})
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"error": err.Error(),
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	})
 	mux.HandleFunc("GET /api/workspaces/{workspace_id}/workspace-symbols", func(w http.ResponseWriter, r *http.Request) {
 		workspaceID := r.PathValue("workspace_id")
 		limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 		result, err := workspaceops.ReadWorkspaceSymbols(
 			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
 			workspaceID,
+			r.URL.Query().Get("query"),
+			limit,
+		)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				writeJSON(w, http.StatusNotFound, map[string]any{
+					"error": "Workspace not found",
+				})
+				return
+			}
+			if errors.Is(err, workspaceops.ErrInvalidSemanticRequest) {
+				writeJSON(w, http.StatusBadRequest, map[string]any{
+					"error": err.Error(),
+				})
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"error": err.Error(),
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/lsp/workspace-symbols", func(w http.ResponseWriter, r *http.Request) {
+		workspaceID := r.PathValue("workspace_id")
+		limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+		result, err := workspaceops.LSPWorkspaceSymbols(
+			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
+			workspaceID,
+			r.URL.Query().Get("language"),
 			r.URL.Query().Get("query"),
 			limit,
 		)
@@ -1926,9 +2197,29 @@ func main() {
 				})
 				return
 			}
+			// A path that escapes the workspace (or other bad input) is a 400, not a 500.
+			if workspaceops.IsInvalidInput(err) {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+				return
+			}
 			writeJSON(w, http.StatusInternalServerError, map[string]any{
 				"error": err.Error(),
 			})
+			return
+		}
+		// enrich with the file's community cluster (its functional neighbourhood),
+		// so explain answers "where does this file sit in the repo" — best-effort.
+		path := r.URL.Query().Get("path")
+		if cluster, cerr := workspaceops.PathCluster(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), workspaceID, path); cerr == nil && cluster != nil {
+			writeJSON(w, http.StatusOK, map[string]any{"explanation": result, "cluster": cluster})
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/clusters", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.WorkspaceClusters(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 			return
 		}
 		writeJSON(w, http.StatusOK, result)
@@ -2156,6 +2447,184 @@ func main() {
 			"ok":         true,
 			"runbook_id": runbookID,
 		})
+	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/goals", func(w http.ResponseWriter, r *http.Request) {
+		workspaceID := r.PathValue("workspace_id")
+		result, err := workspaceops.ListGoals(
+			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
+			workspaceID,
+		)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				writeJSON(w, http.StatusNotFound, map[string]any{
+					"error": "Workspace not found",
+				})
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"error": err.Error(),
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	})
+	mux.HandleFunc("POST /api/workspaces/{workspace_id}/goals", func(w http.ResponseWriter, r *http.Request) {
+		workspaceID := r.PathValue("workspace_id")
+		var request workspaceops.GoalCreateRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{
+				"error": "invalid JSON body",
+			})
+			return
+		}
+		result, err := workspaceops.CreateGoal(
+			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
+			workspaceID,
+			request,
+		)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				writeJSON(w, http.StatusNotFound, map[string]any{
+					"error": "Workspace not found",
+				})
+				return
+			}
+			writeJSON(w, http.StatusBadRequest, map[string]any{
+				"error": err.Error(),
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/goals/{goal_id}", func(w http.ResponseWriter, r *http.Request) {
+		workspaceID := r.PathValue("workspace_id")
+		goalID := r.PathValue("goal_id")
+		result, err := workspaceops.GetGoal(
+			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
+			workspaceID,
+			goalID,
+		)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				writeJSON(w, http.StatusNotFound, map[string]any{
+					"error": "Missing resource",
+				})
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"error": err.Error(),
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	})
+	mux.HandleFunc("PATCH /api/workspaces/{workspace_id}/goals/{goal_id}/status", func(w http.ResponseWriter, r *http.Request) {
+		workspaceID := r.PathValue("workspace_id")
+		goalID := r.PathValue("goal_id")
+		var request workspaceops.GoalStatusUpdateRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{
+				"error": "invalid JSON body",
+			})
+			return
+		}
+		result, err := workspaceops.UpdateGoalStatus(
+			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
+			workspaceID,
+			goalID,
+			request,
+		)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				writeJSON(w, http.StatusNotFound, map[string]any{
+					"error": "Missing resource",
+				})
+				return
+			}
+			writeJSON(w, http.StatusBadRequest, map[string]any{
+				"error": err.Error(),
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	})
+	mux.HandleFunc("POST /api/workspaces/{workspace_id}/goals/{goal_id}/iterations", func(w http.ResponseWriter, r *http.Request) {
+		workspaceID := r.PathValue("workspace_id")
+		goalID := r.PathValue("goal_id")
+		var request workspaceops.GoalIterationAppendRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{
+				"error": "invalid JSON body",
+			})
+			return
+		}
+		result, err := workspaceops.AppendGoalIteration(
+			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
+			workspaceID,
+			goalID,
+			request,
+		)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				writeJSON(w, http.StatusNotFound, map[string]any{
+					"error": "Missing resource",
+				})
+				return
+			}
+			writeJSON(w, http.StatusBadRequest, map[string]any{
+				"error": err.Error(),
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/goals/{goal_id}/ledger", func(w http.ResponseWriter, r *http.Request) {
+		workspaceID := r.PathValue("workspace_id")
+		goalID := r.PathValue("goal_id")
+		result, err := workspaceops.ReadGoalLedger(
+			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
+			workspaceID,
+			goalID,
+		)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				writeJSON(w, http.StatusNotFound, map[string]any{
+					"error": "Missing resource",
+				})
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"error": err.Error(),
+			})
+			return
+		}
+		w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(result))
+	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/goals/{goal_id}/context", func(w http.ResponseWriter, r *http.Request) {
+		workspaceID := r.PathValue("workspace_id")
+		goalID := r.PathValue("goal_id")
+		result, err := workspaceops.BuildGoalContextPacket(
+			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
+			workspaceID,
+			goalID,
+		)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				writeJSON(w, http.StatusNotFound, map[string]any{
+					"error": "Missing resource",
+				})
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"error": err.Error(),
+			})
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(result))
 	})
 	mux.HandleFunc("GET /api/workspaces/{workspace_id}/verification-profiles", func(w http.ResponseWriter, r *http.Request) {
 		workspaceID := r.PathValue("workspace_id")
@@ -2721,6 +3190,559 @@ func main() {
 		}
 		writeJSON(w, http.StatusOK, result)
 	})
+	// --- issue intelligence: quality, duplicates, triage, test suggestions ---
+	issueIntel := func(w http.ResponseWriter, err error, result any) {
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				writeJSON(w, http.StatusNotFound, map[string]any{"error": "Missing resource"})
+				return
+			}
+			// Bad client input (path escape, malformed id, missing/empty field) is a
+			// 400, not a 500 — a malformed request is not a server fault.
+			if workspaceops.IsInvalidInput(err) {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	}
+	handleIssueQuality := func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.ScoreIssueQuality(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), r.PathValue("issue_id"))
+		issueIntel(w, err, result)
+	}
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/issues/{issue_id}/quality", handleIssueQuality)
+	mux.HandleFunc("POST /api/workspaces/{workspace_id}/issues/{issue_id}/quality", handleIssueQuality)
+	mux.HandleFunc("POST /api/workspaces/{workspace_id}/quality/score-all", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.ScoreAllIssueQuality(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))
+		issueIntel(w, err, result)
+	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/issues/{issue_id}/duplicates", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.FindDuplicates(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), r.PathValue("issue_id"))
+		issueIntel(w, err, result)
+	})
+	mux.HandleFunc("POST /api/workspaces/{workspace_id}/issues/{issue_id}/triage", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.TriageIssue(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), r.PathValue("issue_id"))
+		issueIntel(w, err, result)
+	})
+	mux.HandleFunc("POST /api/workspaces/{workspace_id}/triage/all", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.TriageAllIssues(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))
+		issueIntel(w, err, result)
+	})
+	mux.HandleFunc("POST /api/workspaces/{workspace_id}/issues/{issue_id}/test-suggestions", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.GenerateTestSuggestions(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), r.PathValue("issue_id"))
+		issueIntel(w, err, result)
+	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/issues/{issue_id}/test-suggestions", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.ListTestSuggestions(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), r.PathValue("issue_id"))
+		issueIntel(w, err, result)
+	})
+	// --- workspace policy / governance ---
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/policy", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.GetWorkspacePolicy(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))
+		issueIntel(w, err, result)
+	})
+	mux.HandleFunc("PUT /api/workspaces/{workspace_id}/policy", func(w http.ResponseWriter, r *http.Request) {
+		var policy workspaceops.WorkspacePolicy
+		if err := json.NewDecoder(r.Body).Decode(&policy); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON body"})
+			return
+		}
+		result, err := workspaceops.SetWorkspacePolicy(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), policy)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				writeJSON(w, http.StatusNotFound, map[string]any{"error": "Workspace not found"})
+				return
+			}
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	})
+	mux.HandleFunc("POST /api/workspaces/{workspace_id}/policy/evaluate", func(w http.ResponseWriter, r *http.Request) {
+		var input workspaceops.RunPolicyInput
+		if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON body"})
+			return
+		}
+		result, err := workspaceops.EvaluateRunAgainstPolicy(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), input)
+		issueIntel(w, err, result)
+	})
+	// --- audit log ---
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/audit-log", func(w http.ResponseWriter, r *http.Request) {
+		limit := 0
+		if v := r.URL.Query().Get("limit"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil {
+				limit = n
+			}
+		}
+		result, err := workspaceops.ListAuditEvents(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), limit)
+		issueIntel(w, err, result)
+	})
+	mux.HandleFunc("POST /api/workspaces/{workspace_id}/audit-log", func(w http.ResponseWriter, r *http.Request) {
+		var event workspaceops.AuditEvent
+		if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON body"})
+			return
+		}
+		result, err := workspaceops.RecordAuditEvent(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), event)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				writeJSON(w, http.StatusNotFound, map[string]any{"error": "Workspace not found"})
+				return
+			}
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	})
+	// --- PR-style review packet ---
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/issues/{issue_id}/review-packet", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.BuildReviewPacket(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), r.PathValue("issue_id"))
+		issueIntel(w, err, result)
+	})
+	// --- security review depth ---
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/security/dispositions", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.ListSecurityDispositions(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))
+		issueIntel(w, err, result)
+	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/security/findings/{finding_id}/disposition", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.GetSecurityDisposition(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), r.PathValue("finding_id"))
+		issueIntel(w, err, result)
+	})
+	mux.HandleFunc("PUT /api/workspaces/{workspace_id}/security/findings/{finding_id}/disposition", func(w http.ResponseWriter, r *http.Request) {
+		var in workspaceops.SecurityDisposition
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON body"})
+			return
+		}
+		result, err := workspaceops.SetSecurityDisposition(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), r.PathValue("finding_id"), in)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				writeJSON(w, http.StatusNotFound, map[string]any{"error": "Workspace not found"})
+				return
+			}
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/security/review-packet", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.BuildSecurityReviewPacket(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))
+		issueIntel(w, err, result)
+	})
+	// --- operational dashboard ---
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/dashboard", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.BuildWorkspaceDashboard(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))
+		issueIntel(w, err, result)
+	})
+	// --- change state (gitnexus-style change tracking) ---
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/fingerprint", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.WorkspaceFingerprint(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))
+		issueIntel(w, err, result)
+	})
+	mux.HandleFunc("POST /api/workspaces/{workspace_id}/index", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.IndexWorkspace(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))
+		issueIntel(w, err, result)
+	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/changes/drift", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.WorkspaceDrift(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))
+		issueIntel(w, err, result)
+	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/changes/since-index", func(w http.ResponseWriter, r *http.Request) {
+		dd := envDefault("XMUSTARD_DATA_DIR", "../backend/data")
+		ws := r.PathValue("workspace_id")
+		q := r.URL.Query()
+		// impact enriched with the precomputed symbol graph: ?symbol= → blast radius;
+		// ?from=&to= → shortest dependency path; otherwise the dirty-symbols view.
+		switch {
+		case q.Get("from") != "" && q.Get("to") != "":
+			result, err := workspaceops.TraceSymbols(dd, ws, q.Get("from"), q.Get("to"))
+			issueIntel(w, err, result)
+		case q.Get("symbol") != "":
+			depth, _ := strconv.Atoi(q.Get("depth"))
+			result, err := workspaceops.SymbolImpact(dd, ws, q.Get("symbol"), depth)
+			issueIntel(w, err, result)
+		default:
+			result, err := workspaceops.WorkspaceChangesSinceIndex(dd, ws)
+			issueIntel(w, err, result)
+		}
+	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/changes", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.WorkspaceWorkingChanges(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))
+		issueIntel(w, err, result)
+	})
+	// --- semantic symbol graph (intelligence) ---
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/symbol-graph", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.WorkspaceSymbolGraph(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))
+		issueIntel(w, err, result)
+	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/issue-symbol-edges", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.IssueSymbolEdges(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))
+		issueIntel(w, err, result)
+	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/lsp/document-symbols", func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Query().Get("path")
+		if path == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "path query param required"})
+			return
+		}
+		result, err := workspaceops.LiveDocumentSymbols(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), path)
+		issueIntel(w, err, result)
+	})
+	// --- context governance: propose / verify / active shared context ---
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/context", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.ListContextEntries(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), r.URL.Query().Get("filter"))
+		issueIntel(w, err, result)
+	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/context/active", func(w http.ResponseWriter, r *http.Request) {
+		dd := envDefault("XMUSTARD_DATA_DIR", "../backend/data")
+		q := r.URL.Query()
+		// ranked recall when a query/paths signal is present; full active set otherwise.
+		if q.Get("query") != "" || q.Get("paths") != "" {
+			var paths []string
+			if q.Get("paths") != "" {
+				paths = strings.Split(q.Get("paths"), ",")
+			}
+			limit := 8
+			if v := q.Get("limit"); v != "" {
+				if n, err := strconv.Atoi(v); err == nil {
+					limit = n
+				}
+			}
+			result, err := workspaceops.RecallContext(dd, r.PathValue("workspace_id"), q.Get("query"), paths, limit)
+			issueIntel(w, err, result)
+			return
+		}
+		result, err := workspaceops.GetActiveContext(dd, r.PathValue("workspace_id"))
+		issueIntel(w, err, result)
+	})
+	mux.HandleFunc("POST /api/workspaces/{workspace_id}/context", func(w http.ResponseWriter, r *http.Request) {
+		if !requireRole(w, r, "agent") { // proposing memory is an agent action, not readonly
+			return
+		}
+		var req workspaceops.ProposeContextRequest
+		_ = json.NewDecoder(r.Body).Decode(&req) // body optional; query params are the MCP-bridge path
+		q := r.URL.Query()
+		if req.Content == "" {
+			req.Content = q.Get("content")
+		}
+		if req.Title == "" {
+			req.Title = q.Get("title")
+		}
+		if req.Source == "" {
+			req.Source = q.Get("source")
+		}
+		if req.Permission == "" {
+			req.Permission = q.Get("permission")
+		}
+		if len(req.Paths) == 0 && q.Get("paths") != "" {
+			req.Paths = strings.Split(q.Get("paths"), ",")
+		}
+		// attribute to the authenticated principal; open-mode callers collapse to one
+		// "anonymous" identity (so the author can't also masquerade as a verifier).
+		if p := principalFromContext(r.Context()); p != nil {
+			req.Source = p.ID
+		} else {
+			req.Source = "anonymous"
+		}
+		result, err := workspaceops.ProposeContext(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), req)
+		issueIntel(w, err, result)
+	})
+	mux.HandleFunc("POST /api/workspaces/{workspace_id}/context/{entry_id}/verify", func(w http.ResponseWriter, r *http.Request) {
+		if !requireRole(w, r, "agent") { // verifying/promoting memory is an agent action
+			return
+		}
+		var req struct {
+			Agent   string `json:"agent"`
+			Approve bool   `json:"approve"`
+			Note    string `json:"note"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req) // body optional; query params are the MCP-bridge path
+		q := r.URL.Query()
+		if req.Agent == "" {
+			req.Agent = q.Get("agent")
+		}
+		if q.Has("approve") {
+			req.Approve = q.Get("approve") == "true" // only a literal "true" approves; anything else is a reject
+		}
+		if req.Note == "" {
+			req.Note = q.Get("note")
+		}
+		// The agent identity is the AUTHENTICATED principal, never a caller-asserted
+		// string. In open mode (no auth configured) all unauthenticated callers
+		// collapse to a single "anonymous" identity, so N fabricated agent names
+		// cannot satisfy the multi-agent gate.
+		if p := principalFromContext(r.Context()); p != nil {
+			req.Agent = p.ID
+		} else {
+			req.Agent = "anonymous"
+		}
+		result, err := workspaceops.VerifyContext(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), r.PathValue("entry_id"), req.Agent, req.Approve, req.Note)
+		issueIntel(w, err, result)
+	})
+	mux.HandleFunc("PUT /api/workspaces/{workspace_id}/context/{entry_id}", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Content string `json:"content"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON body"})
+			return
+		}
+		result, err := workspaceops.UpdateContextContent(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), r.PathValue("entry_id"), req.Content)
+		issueIntel(w, err, result)
+	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/hotspots", func(w http.ResponseWriter, r *http.Request) {
+		limit := 20
+		if v := r.URL.Query().Get("limit"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil {
+				limit = n
+			}
+		}
+		result, err := workspaceops.WorkspaceHotspots(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), limit)
+		issueIntel(w, err, result)
+	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/blast-radius", func(w http.ResponseWriter, r *http.Request) {
+		symbol := r.URL.Query().Get("symbol")
+		if symbol == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "symbol query param required"})
+			return
+		}
+		result, err := workspaceops.SymbolBlastRadius(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), symbol)
+		issueIntel(w, err, result)
+	})
+	// --- knowledge layer: hybrid search + wiki ---
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/search", func(w http.ResponseWriter, r *http.Request) {
+		query := r.URL.Query().Get("q")
+		if query == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "q query param required"})
+			return
+		}
+		limit := 25
+		if v := r.URL.Query().Get("limit"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil {
+				limit = n
+			}
+		}
+		dd := envDefault("XMUSTARD_DATA_DIR", "../backend/data")
+		var result json.RawMessage
+		var err error
+		switch {
+		case r.URL.Query().Get("mode") == "pattern":
+			// structural AST search: the query is an ast-grep pattern (e.g. `$A && $A()`).
+			pat, perr := workspaceops.SearchSemanticPattern(dd, r.PathValue("workspace_id"), query, r.URL.Query().Get("lang"), r.URL.Query().Get("path"), limit)
+			if perr != nil {
+				issueIntel(w, perr, nil)
+				return
+			}
+			result, err = json.Marshal(pat)
+		case r.URL.Query().Get("rerank") != "":
+			// optional neural lane: ?rerank=<provider>&embed_model=<model>
+			result, err = workspaceops.WorkspaceSearchReranked(dd, r.PathValue("workspace_id"), query, r.URL.Query().Get("rerank"), r.URL.Query().Get("embed_model"), limit)
+		default:
+			// default search fuses the agent-feedback boost and records retrieval.
+			// optional ?seed=<symbol> activates the graph-proximity lane.
+			result, err = workspaceops.WorkspaceSearchWithFeedback(dd, r.PathValue("workspace_id"), query, r.URL.Query().Get("seed"), limit)
+		}
+		issueIntel(w, err, result)
+	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/wiki", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.WorkspaceWiki(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))
+		issueIntel(w, err, result)
+	})
+	// --- Postgres primary store: materialize + FTS hybrid search ---
+	mux.HandleFunc("POST /api/workspaces/{workspace_id}/pg/materialize", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.MaterializePostgresIndex(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))
+		issueIntel(w, err, result)
+	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/pg/search", func(w http.ResponseWriter, r *http.Request) {
+		query := r.URL.Query().Get("q")
+		if query == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "q query param required"})
+			return
+		}
+		limit := 25
+		if v := r.URL.Query().Get("limit"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil {
+				limit = n
+			}
+		}
+		result, err := workspaceops.SearchPostgres(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), query, limit)
+		issueIntel(w, err, result)
+	})
+	// --- ops layer in Postgres: runs / activity / issues ---
+	mux.HandleFunc("POST /api/workspaces/{workspace_id}/pg/ops/materialize", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.MaterializeOpsPostgres(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))
+		issueIntel(w, err, result)
+	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/pg/runs", func(w http.ResponseWriter, r *http.Request) {
+		limit := 50
+		if v := r.URL.Query().Get("limit"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil {
+				limit = n
+			}
+		}
+		result, err := workspaceops.ListRunsPostgres(r.PathValue("workspace_id"), r.URL.Query().Get("status"), limit)
+		issueIntel(w, err, result)
+	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/pg/run-plans", func(w http.ResponseWriter, r *http.Request) {
+		limit := 50
+		if v := r.URL.Query().Get("limit"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil {
+				limit = n
+			}
+		}
+		result, err := workspaceops.ListRunPlansPostgres(r.PathValue("workspace_id"), limit)
+		issueIntel(w, err, result)
+	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/pg/issues/search", func(w http.ResponseWriter, r *http.Request) {
+		query := r.URL.Query().Get("q")
+		if query == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "q query param required"})
+			return
+		}
+		limit := 25
+		if v := r.URL.Query().Get("limit"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil {
+				limit = n
+			}
+		}
+		result, err := workspaceops.SearchIssuesPostgres(r.PathValue("workspace_id"), query, limit)
+		issueIntel(w, err, result)
+	})
+	// --- verification outcomes: materialize to Postgres, then query/filter ---
+	mux.HandleFunc("POST /api/workspaces/{workspace_id}/pg/verifications/materialize", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.MaterializeVerificationsPostgres(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))
+		issueIntel(w, err, result)
+	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/pg/verifications", func(w http.ResponseWriter, r *http.Request) {
+		limit := 50
+		if v := r.URL.Query().Get("limit"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil {
+				limit = n
+			}
+		}
+		result, err := workspaceops.ListVerificationsPostgres(r.PathValue("workspace_id"), r.URL.Query().Get("status"), limit)
+		issueIntel(w, err, result)
+	})
+	// --- ownership, incorporation lineage, session grounding ---
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/subsystems", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.WorkspaceSubsystems(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))
+		issueIntel(w, err, result)
+	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/owners", func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Query().Get("path")
+		if path == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "path query param required"})
+			return
+		}
+		result, err := workspaceops.FileOwners(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), path)
+		issueIntel(w, err, result)
+	})
+	mux.HandleFunc("POST /api/workspaces/{workspace_id}/incorporate", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.RecordIncorporation(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))
+		issueIntel(w, err, result)
+	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/lineage", func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Query().Get("path")
+		if path == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "path query param required"})
+			return
+		}
+		result, err := workspaceops.FileLineage(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), path)
+		issueIntel(w, err, result)
+	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/session-grounding", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.BuildSessionGrounding(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))
+		issueIntel(w, err, result)
+	})
+	// --- run confidence, owner suggestions, ownership, eval timeline, ticket ingest, guidance customization ---
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/runs/{run_id}/confidence", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.ScoreRunConfidence(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), r.PathValue("run_id"))
+		issueIntel(w, err, result)
+	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/runs/{run_id}/why-failed", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.ExplainRunFailure(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), r.PathValue("run_id"))
+		issueIntel(w, err, result)
+	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/issues/{issue_id}/owner-suggestions", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.SuggestIssueOwners(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), r.PathValue("issue_id"))
+		issueIntel(w, err, result)
+	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/issues/{issue_id}/ownership-history", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.BuildOwnershipHistory(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), r.PathValue("issue_id"))
+		issueIntel(w, err, result)
+	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/eval-timeline", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.BuildEvalTimeline(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))
+		issueIntel(w, err, result)
+	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/issues/{issue_id}/ingested-ticket", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.GetIngestedTicket(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), r.PathValue("issue_id"))
+		issueIntel(w, err, result)
+	})
+	mux.HandleFunc("POST /api/workspaces/{workspace_id}/issues/{issue_id}/ingest-ticket", func(w http.ResponseWriter, r *http.Request) {
+		var req workspaceops.IngestTicketRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON body"})
+			return
+		}
+		result, err := workspaceops.IngestTicket(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), r.PathValue("issue_id"), req)
+		issueIntel(w, err, result)
+	})
+	mux.HandleFunc("POST /api/workspaces/{workspace_id}/guidance/customize", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Kind string `json:"kind"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		result, err := workspaceops.BuildGuidanceCustomization(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), body.Kind)
+		issueIntel(w, err, result)
+	})
+	// --- per-run brief export ---
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/runs/{run_id}/brief", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.BuildRunBrief(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), r.PathValue("run_id"))
+		issueIntel(w, err, result)
+	})
+	// --- persistent agent identity registry ---
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/agents", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.ListAgentIdentities(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))
+		issueIntel(w, err, result)
+	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/agents/{agent_id}", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.GetAgentIdentity(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), r.PathValue("agent_id"))
+		issueIntel(w, err, result)
+	})
+	mux.HandleFunc("POST /api/workspaces/{workspace_id}/agents/sync", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.SyncAgentIdentitiesFromRuns(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))
+		issueIntel(w, err, result)
+	})
+	// --- explicit security acceptance criteria ---
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/security/acceptance-criteria", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.GetSecurityAcceptanceCriteria(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))
+		issueIntel(w, err, result)
+	})
+	mux.HandleFunc("PUT /api/workspaces/{workspace_id}/security/acceptance-criteria", func(w http.ResponseWriter, r *http.Request) {
+		var in workspaceops.SecurityAcceptanceCriteria
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON body"})
+			return
+		}
+		result, err := workspaceops.SetSecurityAcceptanceCriteria(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), in)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				writeJSON(w, http.StatusNotFound, map[string]any{"error": "Workspace not found"})
+				return
+			}
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	})
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/security/acceptance-evaluation", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.EvaluateSecurityAcceptance(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))
+		issueIntel(w, err, result)
+	})
 	mux.HandleFunc("POST /api/terminal/open", func(w http.ResponseWriter, r *http.Request) {
 		var request workspaceops.TerminalOpenRequest
 		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
@@ -2756,7 +3778,7 @@ func main() {
 			})
 			return
 		}
-		if err := workspaceops.WriteTerminal(terminalID, request.Data); err != nil {
+		if err := workspaceops.WriteTerminal(request.WorkspaceID, terminalID, request.Data); err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				writeJSON(w, http.StatusNotFound, map[string]any{
 					"error": "Terminal not found",
@@ -2779,7 +3801,7 @@ func main() {
 			})
 			return
 		}
-		if err := workspaceops.ResizeTerminal(terminalID, request.Cols, request.Rows); err != nil {
+		if err := workspaceops.ResizeTerminal(request.WorkspaceID, terminalID, request.Cols, request.Rows); err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				writeJSON(w, http.StatusNotFound, map[string]any{
 					"error": "Terminal not found",
@@ -2813,7 +3835,8 @@ func main() {
 	})
 	mux.HandleFunc("DELETE /api/terminal/{terminal_id}", func(w http.ResponseWriter, r *http.Request) {
 		terminalID := r.PathValue("terminal_id")
-		if err := workspaceops.CloseTerminal(terminalID); err != nil {
+		workspaceID := strings.TrimSpace(r.URL.Query().Get("workspace_id"))
+		if err := workspaceops.CloseTerminal(workspaceID, terminalID); err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				writeJSON(w, http.StatusNotFound, map[string]any{
 					"error": "Terminal not found",
@@ -2828,9 +3851,242 @@ func main() {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 	})
 
-	addr := ":" + envDefault("XMUSTARD_API_PORT", "8080")
-	log.Printf("xmustard api-go listening on %s", addr)
-	log.Fatal(http.ListenAndServe(addr, mux))
+	// Bind to loopback by default. The API makes server-side requests (providers),
+	// so it should not be exposed on all interfaces unless the operator opts in via
+	// XMUSTARD_API_HOST=0.0.0.0 — and if they do, auth tokens must be configured.
+	host := envDefault("XMUSTARD_API_HOST", "127.0.0.1")
+	authMode := strings.ToLower(envDefault("XMUSTARD_AUTH", "auto"))
+	isLoopback := host == "127.0.0.1" || host == "localhost" || host == "::1"
+	tlsCert, tlsKey := os.Getenv("XMUSTARD_API_TLS_CERT"), os.Getenv("XMUSTARD_API_TLS_KEY")
+	hasTLS := tlsCert != "" && tlsKey != ""
+	allowInsecureBind := os.Getenv("XMUSTARD_ALLOW_INSECURE_BIND") == "1"
+	// Fail-closed on a non-loopback bind: requires auth AND transport security.
+	// XMUSTARD_AUTH=off does not satisfy this interlock; disabling auth and exposing
+	// the interface are separate opt-ins.
+	if !isLoopback {
+		if authMode != "required" && !workspaceops.HasAuthConfigured(dataDir()) {
+			log.Fatal("refusing non-loopback bind without auth; run `xmustard-api mint-token <id> admin` or set XMUSTARD_AUTH=required")
+		}
+		if !hasTLS && !allowInsecureBind {
+			log.Fatal("refusing non-loopback bind without TLS; set XMUSTARD_API_TLS_CERT/KEY, or XMUSTARD_ALLOW_INSECURE_BIND=1 if TLS is terminated by a front proxy")
+		}
+	}
+	var handler http.Handler = mux
+	if os.Getenv("XMUSTARD_CORE_ONLY") == "1" {
+		// Lean production surface: expose only the governed-memory + grounding +
+		// search core (the paths the 9 MCP tools + auth use), 404 everything else.
+		// The full platform surface stays available when this is unset (for the UI).
+		handler = coreOnlyMiddleware(handler)
+		log.Printf("surface: CORE_ONLY — platform routes disabled")
+	}
+	if authMode != "off" {
+		handler = authMiddleware(dataDir(), authMode, handler)
+		if authMode == "required" || workspaceops.HasAuthConfigured(dataDir()) {
+			log.Printf("auth: ENFORCED (mode=%s, bearer token required)", authMode)
+		} else {
+			log.Printf("auth: open — no tokens configured (mode=%s); unauthenticated callers collapse to one identity. Mint a token to enforce.", authMode)
+		}
+	} else {
+		log.Printf("auth: DISABLED (XMUSTARD_AUTH=off)")
+	}
+	// Default to 8042 to match the MCP bridge's API target (XM-NEW-001) and
+	// AGENTS.md ("an HTTP shell on :8042"); override with XMUSTARD_API_PORT.
+	addr := host + ":" + envDefault("XMUSTARD_API_PORT", "8042")
+	srv := &http.Server{
+		Addr:    addr,
+		Handler: handler,
+		// Bound slow/oversized clients so a few connections can't pin goroutines/FDs
+		// (XM-NEW-019). Read/Write are generous because agent runs can be long, but
+		// header + idle timeouts defeat slowloris and leaked keep-alives.
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       120 * time.Second,
+		WriteTimeout:      300 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20,
+	}
+	// Graceful shutdown on SIGINT/SIGTERM so a restart doesn't orphan in-flight work.
+	go func() {
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+		<-sigCh
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+		workspaceops.ClosePgPool()
+	}()
+	log.Printf("xmustard api-go listening on %s (tls=%v)", addr, hasTLS)
+	var serveErr error
+	if hasTLS {
+		serveErr = srv.ListenAndServeTLS(tlsCert, tlsKey)
+	} else {
+		serveErr = srv.ListenAndServe()
+	}
+	if serveErr != nil && serveErr != http.ErrServerClosed {
+		log.Fatal(serveErr)
+	}
+}
+
+// --- auth middleware + principal helpers ---
+
+type ctxKey string
+
+const principalCtxKey ctxKey = "principal"
+
+func principalFromContext(ctx context.Context) *workspaceops.Principal {
+	p, _ := ctx.Value(principalCtxKey).(*workspaceops.Principal)
+	return p
+}
+
+// roleRank orders the role hierarchy: admin > agent > readonly. Used so a gate for
+// "agent" is satisfied by admin too, and "readonly" by everyone authenticated.
+func roleRank(role string) int {
+	switch role {
+	case "admin":
+		return 3
+	case "agent":
+		return 2
+	case "readonly":
+		return 1
+	default:
+		return 0
+	}
+}
+
+// requireRole enforces a minimum role for an endpoint (admin > agent > readonly).
+// In open mode (no auth configured) it allows the operation locally; once auth is
+// configured the middleware has already rejected unauthenticated requests. A denied
+// authenticated request is recorded in the auth-audit log.
+func requireRole(w http.ResponseWriter, r *http.Request, role string) bool {
+	dd := envDefault("XMUSTARD_DATA_DIR", "../backend/data")
+	p := principalFromContext(r.Context())
+	if p == nil {
+		if !workspaceops.HasAuthConfigured(dd) {
+			return true
+		}
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "authentication required"})
+		return false
+	}
+	if roleRank(p.Role) < roleRank(role) {
+		workspaceops.RecordAuthAudit(dd, workspaceops.AuthAuditEvent{
+			Action:     "denied",
+			Actor:      p.ID,
+			Detail:     role + " role required (have " + p.Role + ")",
+			Method:     r.Method,
+			Path:       r.URL.Path,
+			RemoteAddr: r.RemoteAddr,
+		})
+		writeJSON(w, http.StatusForbidden, map[string]any{"error": role + " role required"})
+		return false
+	}
+	return true
+}
+
+// coreOnlyPaths are the path markers the 9 MCP tools (+ auth/health) use. In
+// CORE_ONLY mode any request whose path lacks one of these gets a 404, so a lean
+// production deployment serves only the governed-memory + grounding + search core.
+var coreOnlyPaths = []string{
+	"/session-grounding",   // ground
+	"/context",             // recall / remember / verify
+	"/search",              // search
+	"/explain-path",        // explain
+	"/changes/since-index", // impact
+	"/diagnostics",         // diagnostics
+	"/why-failed",          // why_failed
+}
+
+func isCorePath(p string) bool {
+	if p == "/api/health" || p == "/api/workspaces" || strings.HasPrefix(p, "/api/auth/") {
+		return true
+	}
+	for _, marker := range coreOnlyPaths {
+		if strings.Contains(p, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func coreOnlyMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !isCorePath(r.URL.Path) {
+			writeJSON(w, http.StatusNotFound, map[string]any{"error": "endpoint disabled in CORE_ONLY mode"})
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func authMiddleware(dataDir, mode string, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/health" { // health stays public for liveness probes
+			next.ServeHTTP(w, r)
+			return
+		}
+		token := ""
+		if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
+			token = strings.TrimPrefix(h, "Bearer ")
+		}
+		// single read of the token store yields both the principal and whether auth
+		// is configured (was two reads per request).
+		principal, configured := workspaceops.ResolveAuth(dataDir, token)
+		enforce := mode == "required" || configured
+		if enforce && principal == nil {
+			workspaceops.RecordAuthAudit(dataDir, workspaceops.AuthAuditEvent{
+				Action:     "denied",
+				Actor:      "anonymous",
+				Detail:     "missing/invalid/expired bearer token",
+				Method:     r.Method,
+				Path:       r.URL.Path,
+				RemoteAddr: r.RemoteAddr,
+			})
+			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "authentication required: provide Authorization: Bearer <token>"})
+			return
+		}
+		// readonly principals may only read.
+		if principal != nil && principal.Role == "readonly" && r.Method != http.MethodGet {
+			workspaceops.RecordAuthAudit(dataDir, workspaceops.AuthAuditEvent{
+				Action:     "denied",
+				Actor:      principal.ID,
+				Detail:     "readonly principal cannot " + r.Method,
+				Method:     r.Method,
+				Path:       r.URL.Path,
+				RemoteAddr: r.RemoteAddr,
+			})
+			writeJSON(w, http.StatusForbidden, map[string]any{"error": "readonly principal cannot " + r.Method})
+			return
+		}
+		// workspace scope: a scoped (per-worker) token may only touch its workspaces.
+		// Unscoped tokens (the default) are unrestricted, so this is backward-compatible.
+		if principal != nil {
+			if wsID := workspaceIDFromPath(r.URL.Path); wsID != "" && !principal.AllowsWorkspace(wsID) {
+				workspaceops.RecordAuthAudit(dataDir, workspaceops.AuthAuditEvent{
+					Action: "denied", Actor: principal.ID,
+					Detail: "workspace " + wsID + " not in token scope",
+					Method: r.Method, Path: r.URL.Path, RemoteAddr: r.RemoteAddr,
+				})
+				writeJSON(w, http.StatusForbidden, map[string]any{"error": "token not scoped to workspace " + wsID})
+				return
+			}
+		}
+		if principal == nil {
+			next.ServeHTTP(w, r)
+			return
+		}
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), principalCtxKey, principal)))
+	})
+}
+
+// workspaceIDFromPath extracts {id} from /api/workspaces/{id}/... ("" if not such a path).
+func workspaceIDFromPath(p string) string {
+	const prefix = "/api/workspaces/"
+	if !strings.HasPrefix(p, prefix) {
+		return ""
+	}
+	rest := p[len(prefix):]
+	if i := strings.IndexByte(rest, '/'); i >= 0 {
+		return rest[:i]
+	}
+	return rest
 }
 
 func envDefault(name string, fallback string) string {

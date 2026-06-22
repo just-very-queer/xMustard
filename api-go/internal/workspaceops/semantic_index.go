@@ -111,6 +111,7 @@ type semanticRepoTarget struct {
 	Command    string
 	SourcePath string
 	Confidence int
+	EntryPath  *string
 }
 
 func PlanSemanticIndex(dataDir string, workspaceID string, request SemanticIndexRequest) (*SemanticIndexPlan, error) {
@@ -485,6 +486,10 @@ func semanticIndexTargetSeeds(repoRoot string, workspaceID string, surface strin
 		if target.SourcePath != "" {
 			seeds = append(seeds, target.SourcePath)
 		}
+		if target.EntryPath != nil && strings.TrimSpace(*target.EntryPath) != "" {
+			seeds = append(seeds, *target.EntryPath)
+			continue
+		}
 		command := strings.ToLower(target.Command)
 		if strings.Contains(command, "python") {
 			seeds = append(seeds, "main.py", "cli.py", "__main__.py")
@@ -497,11 +502,19 @@ func semanticIndexTargetSeeds(repoRoot string, workspaceID string, surface strin
 }
 
 func semanticDiscoverTargets(repoRoot string, includeVerify bool) []semanticRepoTarget {
-	targets := []semanticRepoTarget{}
-	targets = append(targets, semanticDiscoverMakeTargets(repoRoot, includeVerify)...)
-	targets = append(targets, semanticDiscoverPackageTargets(repoRoot, includeVerify)...)
-	targets = append(targets, semanticDiscoverDockerTargets(repoRoot)...)
-	return dedupeSemanticTargets(targets)
+	repoTargets := discoverManifestTargets(repoRoot, includeVerify)
+	targets := make([]semanticRepoTarget, 0, len(repoTargets))
+	for _, item := range repoTargets {
+		targets = append(targets, semanticRepoTarget{
+			Kind:       item.Kind,
+			Label:      item.Label,
+			Command:    item.Command,
+			SourcePath: item.SourcePath,
+			Confidence: item.Confidence,
+			EntryPath:  item.EntryPath,
+		})
+	}
+	return targets
 }
 
 func semanticDiscoverMakeTargets(repoRoot string, includeVerify bool) []semanticRepoTarget {
@@ -656,7 +669,8 @@ func candidatePackageJSONFiles(repoRoot string) []string {
 			queue = append(queue, filepath.Join(current, entry.Name()))
 		}
 	}
-	return candidates
+	candidates = append(candidates, discoverPackageWorkspaceManifestPaths(repoRoot)...)
+	return dedupeStrings(candidates, 48)
 }
 
 func dedupeSemanticTargets(targets []semanticRepoTarget) []semanticRepoTarget {

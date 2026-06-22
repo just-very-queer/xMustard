@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"xmustard/api-go/internal/rustcore"
 )
 
 type MaterializedSymbolRecord struct {
@@ -33,16 +35,18 @@ type WorkspaceSymbolsResult struct {
 }
 
 type DiagnosticLinkedSymbol struct {
-	SymbolID       int64   `json:"symbol_id"`
-	Path           string  `json:"path"`
-	Symbol         string  `json:"symbol"`
-	Kind           string  `json:"kind"`
-	Language       *string `json:"language,omitempty"`
-	LineStart      *int    `json:"line_start,omitempty"`
-	LineEnd        *int    `json:"line_end,omitempty"`
-	EnclosingScope *string `json:"enclosing_scope,omitempty"`
-	SignatureText  *string `json:"signature_text,omitempty"`
-	LinkStrategy   string  `json:"link_strategy"`
+	SymbolID        int64   `json:"symbol_id"`
+	Path            string  `json:"path"`
+	Symbol          string  `json:"symbol"`
+	Kind            string  `json:"kind"`
+	Language        *string `json:"language,omitempty"`
+	LineStart       *int    `json:"line_start,omitempty"`
+	LineEnd         *int    `json:"line_end,omitempty"`
+	EnclosingScope  *string `json:"enclosing_scope,omitempty"`
+	SignatureText   *string `json:"signature_text,omitempty"`
+	LinkStrategy    string  `json:"link_strategy"`
+	EvidenceSource  string  `json:"evidence_source"`
+	SelectionReason string  `json:"selection_reason"`
 }
 
 func ReadWorkspaceSymbols(dataDir string, workspaceID string, query string, limit int) (*WorkspaceSymbolsResult, error) {
@@ -80,7 +84,21 @@ func ReadWorkspaceSymbols(dataDir string, workspaceID string, query string, limi
 }
 
 func ReadDocumentSymbols(dataDir string, workspaceID string, relativePath string) (*PathSymbolsResult, error) {
-	return ReadPathSymbols(dataDir, workspaceID, relativePath)
+	result, err := LSPDocumentSymbols(dataDir, workspaceID, relativePath)
+	if err != nil {
+		return nil, err
+	}
+	return &PathSymbolsResult{
+		WorkspaceID:     result.WorkspaceID,
+		Path:            result.Path,
+		SymbolSource:    result.SymbolSource,
+		ParserLanguage:  result.ParserLanguage,
+		EvidenceSource:  result.EvidenceSource,
+		SelectionReason: result.SelectionReason,
+		Symbols:         convertRustDocumentSymbols(result.Symbols),
+		Warnings:        result.Warnings,
+		GeneratedAt:     result.GeneratedAt,
+	}, nil
 }
 
 func readWorkspaceSymbolRows(dsn string, schema string, workspaceID string, query string, limit int) ([]MaterializedSymbolRecord, error) {
@@ -155,58 +173,80 @@ func readWorkspaceSymbolRows(dsn string, schema string, workspaceID string, quer
 	return rows, nil
 }
 
-func findBestDiagnosticSymbolLink(ctx context.Context, connection semanticMaterializationConn, schema string, workspaceID string, relativePath string, startLine int, endLine int) (*DiagnosticLinkedSymbol, error) {
-	_ = endLine
+func findBestDiagnosticSymbolLink(ctx context.Context, connection semanticMaterializationConn, schema string, workspaceID string, relativePath string, startLine int, endLine int, diagnosticFingerprint string) (*DiagnosticLinkContext, *DiagnosticLinkedSymbol, error) {
 	var payload []byte
 	err := connection.QueryRow(
 		ctx,
 		fmt.Sprintf(`
-			select coalesce((
-				select case
-					when jsonb_array_length(matches) = 1
-						then jsonb_set(matches->0, '{link_strategy}', '"diagnostic_start_line_exact_symbol_anchor"'::jsonb, true)
-					else 'null'::jsonb
-				end
-				from (
-					select coalesce(jsonb_agg(jsonb_build_object(
-						'symbol_id', s.symbol_id,
-						'path', s.path,
-						'symbol', s.symbol,
-						'kind', s.kind,
-						'language', s.language,
-						'line_start', s.line_start,
-						'line_end', s.line_end,
-						'enclosing_scope', s.enclosing_scope,
-						'signature_text', s.signature_text
-					) order by s.symbol), '[]'::jsonb) as matches
-					from (
-						select s.symbol_id, s.path, s.symbol, s.kind, s.language, s.line_start, s.line_end, s.enclosing_scope, s.signature_text
-						from %s.symbols s
-						where s.workspace_id = $1
-						  and s.path = $2
-						  and s.line_start is not null
-						  and s.line_start = $3
-						order by s.symbol asc
-						limit 2
-					) s
-				) candidates
-			), 'null'::jsonb)
+			select coalesce(jsonb_agg(jsonb_build_object(
+				'symbol_id', candidate.symbol_id,
+				'path', candidate.path,
+				'symbol', candidate.symbol,
+				'kind', candidate.kind,
+				'language', candidate.language,
+				'line_start', candidate.line_start,
+				'line_end', candidate.line_end,
+				'enclosing_scope', candidate.enclosing_scope,
+				'signature_text', candidate.signature_text
+			) order by coalesce(candidate.line_start, 2147483647), coalesce(candidate.line_end, 2147483647), candidate.symbol), '[]'::jsonb)
+			from (
+				select s.symbol_id, s.path, s.symbol, s.kind, s.language, s.line_start, s.line_end, s.enclosing_scope, s.signature_text
+				from %s.symbols s
+				where s.workspace_id = $1
+				  and s.path = $2
+				  and s.line_start is not null
+				  and (
+					s.line_start = $3
+					or (s.line_end is not null and s.line_start <= $3 and s.line_end >= $4)
+				  )
+				order by coalesce(s.line_start, 2147483647), coalesce(s.line_end, 2147483647), s.symbol
+				limit 50
+			) candidate
 		`, schema),
 		workspaceID,
 		relativePath,
 		startLine,
+		endLine,
 	).Scan(&payload)
 	if err != nil {
-		return nil, fmt.Errorf("read diagnostic symbol link: %w", err)
+		return nil, nil, fmt.Errorf("read diagnostic symbol candidates: %w", err)
 	}
-	if strings.TrimSpace(string(payload)) == "null" || len(payload) == 0 {
-		return nil, nil
+	var candidates []rustcore.DiagnosticSymbolCandidate
+	if len(payload) > 0 {
+		if err := json.Unmarshal(payload, &candidates); err != nil {
+			return nil, nil, fmt.Errorf("decode diagnostic symbol candidates: %w", err)
+		}
 	}
-	var link DiagnosticLinkedSymbol
-	if err := json.Unmarshal(payload, &link); err != nil {
-		return nil, fmt.Errorf("decode diagnostic symbol link: %w", err)
+	linkResult, err := rustcore.LinkDiagnosticSymbol(ctx, workspaceID, relativePath, startLine, endLine, diagnosticFingerprint, candidates)
+	if err != nil {
+		return nil, nil, err
 	}
-	return &link, nil
+	linkContext := &DiagnosticLinkContext{
+		CandidateCount:  linkResult.CandidateCount,
+		Candidates:      convertRustDiagnosticLinkCandidates(candidates),
+		EvidenceSource:  linkResult.EvidenceSource,
+		SelectionReason: linkResult.SelectionReason,
+		Warnings:        append([]string{}, linkResult.Warnings...),
+		GeneratedAt:     linkResult.GeneratedAt,
+	}
+	if linkResult.LinkedSymbol == nil {
+		return linkContext, nil, nil
+	}
+	return linkContext, convertRustDiagnosticLinkedSymbol(linkResult.LinkedSymbol), nil
+}
+
+func hasMaterializedSymbolSummary(ctx context.Context, connection semanticMaterializationConn, schema string, workspaceID string, relativePath string) (bool, error) {
+	var ready bool
+	err := connection.QueryRow(
+		ctx,
+		fmt.Sprintf("select exists(select 1 from %s.file_symbol_summaries where workspace_id = $1 and path = $2)", schema),
+		workspaceID,
+		relativePath,
+	).Scan(&ready)
+	if err != nil {
+		return false, fmt.Errorf("read diagnostic symbol readiness: %w", err)
+	}
+	return ready, nil
 }
 
 func normalizeWorkspaceSymbolLimit(limit int) int {
@@ -217,4 +257,60 @@ func normalizeWorkspaceSymbolLimit(limit int) int {
 		return 200
 	}
 	return limit
+}
+
+func convertRustDocumentSymbols(items []rustcore.DocumentSymbolRecord) []PathSymbolRecord {
+	out := make([]PathSymbolRecord, 0, len(items))
+	for _, item := range items {
+		out = append(out, PathSymbolRecord{
+			Path:           item.Path,
+			Symbol:         item.Symbol,
+			Kind:           item.Kind,
+			LineStart:      item.LineStart,
+			LineEnd:        item.LineEnd,
+			EnclosingScope: item.EnclosingScope,
+			EvidenceSource: item.EvidenceSource,
+			Reason:         item.Reason,
+			Score:          item.Score,
+		})
+	}
+	return out
+}
+
+func convertRustDiagnosticLinkedSymbol(item *rustcore.DiagnosticLinkedSymbol) *DiagnosticLinkedSymbol {
+	if item == nil {
+		return nil
+	}
+	return &DiagnosticLinkedSymbol{
+		SymbolID:        item.SymbolID,
+		Path:            item.Path,
+		Symbol:          item.Symbol,
+		Kind:            item.Kind,
+		Language:        item.Language,
+		LineStart:       item.LineStart,
+		LineEnd:         item.LineEnd,
+		EnclosingScope:  item.EnclosingScope,
+		SignatureText:   item.SignatureText,
+		LinkStrategy:    item.LinkStrategy,
+		EvidenceSource:  item.EvidenceSource,
+		SelectionReason: item.SelectionReason,
+	}
+}
+
+func convertRustDiagnosticLinkCandidates(items []rustcore.DiagnosticSymbolCandidate) []DiagnosticLinkCandidate {
+	out := make([]DiagnosticLinkCandidate, 0, len(items))
+	for _, item := range items {
+		out = append(out, DiagnosticLinkCandidate{
+			SymbolID:       item.SymbolID,
+			Path:           item.Path,
+			Symbol:         item.Symbol,
+			Kind:           item.Kind,
+			Language:       item.Language,
+			LineStart:      item.LineStart,
+			LineEnd:        item.LineEnd,
+			EnclosingScope: item.EnclosingScope,
+			SignatureText:  item.SignatureText,
+		})
+	}
+	return out
 }

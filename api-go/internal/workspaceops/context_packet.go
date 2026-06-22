@@ -1,6 +1,8 @@
 package workspaceops
 
 import (
+	"crypto/sha1"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"os/exec"
@@ -77,6 +79,7 @@ type RepoMapSymbolRecord struct {
 	LineStart      *int    `json:"line_start,omitempty"`
 	LineEnd        *int    `json:"line_end,omitempty"`
 	EnclosingScope *string `json:"enclosing_scope,omitempty"`
+	EvidenceSource string  `json:"evidence_source,omitempty"`
 	Reason         *string `json:"reason,omitempty"`
 	Score          int     `json:"score"`
 }
@@ -91,6 +94,29 @@ type RelatedContextRecord struct {
 	Score        int      `json:"score"`
 }
 
+type VulnerabilityFindingRecord struct {
+	FindingID      string   `json:"finding_id"`
+	WorkspaceID    string   `json:"workspace_id"`
+	IssueID        string   `json:"issue_id"`
+	Scanner        string   `json:"scanner"`
+	Source         string   `json:"source"`
+	Severity       string   `json:"severity"`
+	Status         string   `json:"status"`
+	Title          string   `json:"title"`
+	Summary        string   `json:"summary"`
+	RuleID         *string  `json:"rule_id,omitempty"`
+	LocationPath   *string  `json:"location_path,omitempty"`
+	LocationLine   *int     `json:"location_line,omitempty"`
+	CWEIDs         []string `json:"cwe_ids"`
+	CVEIDs         []string `json:"cve_ids"`
+	References     []string `json:"references"`
+	Evidence       []string `json:"evidence"`
+	ThreatModelIDs []string `json:"threat_model_ids"`
+	RawPayload     *string  `json:"raw_payload,omitempty"`
+	CreatedAt      string   `json:"created_at"`
+	UpdatedAt      string   `json:"updated_at"`
+}
+
 type ContextRetrievalLedgerEntry struct {
 	EntryID      string   `json:"entry_id"`
 	SourceType   string   `json:"source_type"`
@@ -103,13 +129,17 @@ type ContextRetrievalLedgerEntry struct {
 }
 
 type DynamicContextBundle struct {
-	SymbolContext  []RepoMapSymbolRecord  `json:"symbol_context"`
-	RelatedContext []RelatedContextRecord `json:"related_context"`
+	SymbolContext     []RepoMapSymbolRecord                `json:"symbol_context"`
+	SemanticMatches   []SemanticPatternMatchRecord         `json:"semantic_matches"`
+	SemanticQueries   []SemanticQueryMaterializationRecord `json:"semantic_queries"`
+	SemanticMatchRows []SemanticMatchMaterializationRecord `json:"semantic_match_rows"`
+	RelatedContext    []RelatedContextRecord               `json:"related_context"`
 }
 
 type IssueContextPacket struct {
 	Issue                         issueRecord                         `json:"issue"`
 	Workspace                     workspaceRecord                     `json:"workspace"`
+	SemanticStatus                *SemanticIndexStatus                `json:"semantic_status,omitempty"`
 	TreeFocus                     []string                            `json:"tree_focus"`
 	RelatedPaths                  []string                            `json:"related_paths"`
 	EvidenceBundle                []evidenceRef                       `json:"evidence_bundle"`
@@ -122,6 +152,7 @@ type IssueContextPacket struct {
 	TicketContexts                []TicketContextRecord               `json:"ticket_contexts"`
 	ThreatModels                  []ThreatModelRecord                 `json:"threat_models"`
 	BrowserDumps                  []BrowserDumpRecord                 `json:"browser_dumps"`
+	VulnerabilityFindings         []VulnerabilityFindingRecord        `json:"vulnerability_findings"`
 	RepoMap                       *rustcore.RepoMapSummary            `json:"repo_map,omitempty"`
 	DynamicContext                *DynamicContextBundle               `json:"dynamic_context,omitempty"`
 	RetrievalLedger               []ContextRetrievalLedgerEntry       `json:"retrieval_ledger"`
@@ -184,6 +215,10 @@ func BuildIssueContextPacket(dataDir string, workspaceID string, issueID string)
 	if err != nil {
 		return nil, err
 	}
+	vulnerabilityFindings, err := listVulnerabilityFindings(dataDir, workspaceID, issueID)
+	if err != nil {
+		return nil, err
+	}
 	repoConfig, err := ReadWorkspaceRepoConfig(dataDir, workspaceID)
 	if err != nil {
 		return nil, err
@@ -193,7 +228,8 @@ func BuildIssueContextPacket(dataDir string, workspaceID string, issueID string)
 		return nil, err
 	}
 
-	relatedPaths := rankRelatedPathsForIssue(*issue, treeFocus, ticketContexts, repoMap)
+	relatedPaths := rankRelatedPathsForIssue(*issue, treeFocus, ticketContexts, vulnerabilityFindings, repoMap)
+	semanticStatus := bestEffortSemanticStatus(dataDir, workspaceID, relatedPaths)
 	evidencePaths := make([]string, 0, len(evidenceBundle))
 	for _, item := range evidenceBundle {
 		if item.NormalizedPath != nil && strings.TrimSpace(*item.NormalizedPath) != "" {
@@ -220,12 +256,24 @@ func BuildIssueContextPacket(dataDir string, workspaceID string, issueID string)
 		recentActivity = recentActivity[:8]
 	}
 	worktree := readWorktreeStatus(snapshot.Workspace.RootPath)
-	dynamicContext := buildDynamicContext(snapshot.Workspace, *issue, treeFocus, ticketContexts, threatModels, browserDumps, recentFixes, recentActivity, relatedPaths)
+	dynamicContext := buildDynamicContext(dataDir, snapshot.Workspace, *issue, treeFocus, ticketContexts, threatModels, browserDumps, vulnerabilityFindings, recentFixes, recentActivity, relatedPaths, repoMap)
+	if dynamicContext != nil {
+		semanticPaths := make([]string, 0, len(dynamicContext.SemanticMatches))
+		for _, item := range dynamicContext.SemanticMatches {
+			semanticPaths = append(semanticPaths, item.Path)
+		}
+		relatedPaths = dedupeText(append(relatedPaths, semanticPaths...))
+		if len(relatedPaths) > 8 {
+			relatedPaths = relatedPaths[:8]
+		}
+	}
+	matchedPathInstructions = matchRepoPathInstructions(repoConfig, append(append([]string{}, treeFocus...), append(relatedPaths, evidencePaths...)...))
 	retrievalLedger := buildContextRetrievalLedger(*issue, treeFocus, evidenceBundle, relatedPaths, guidance, dynamicContext, matchedPathInstructions)
 
 	packet := &IssueContextPacket{
 		Issue:                         *issue,
 		Workspace:                     snapshot.Workspace,
+		SemanticStatus:                semanticStatus,
 		TreeFocus:                     treeFocus[:min(len(treeFocus), 12)],
 		RelatedPaths:                  relatedPaths,
 		EvidenceBundle:                evidenceBundle[:min(len(evidenceBundle), 20)],
@@ -238,6 +286,7 @@ func BuildIssueContextPacket(dataDir string, workspaceID string, issueID string)
 		TicketContexts:                ticketContexts,
 		ThreatModels:                  threatModels,
 		BrowserDumps:                  browserDumps,
+		VulnerabilityFindings:         vulnerabilityFindings,
 		RepoMap:                       repoMap,
 		DynamicContext:                dynamicContext,
 		RetrievalLedger:               retrievalLedger,
@@ -256,9 +305,11 @@ func BuildIssueContextPacket(dataDir string, workspaceID string, issueID string)
 		packet.TicketContexts,
 		packet.ThreatModels,
 		packet.BrowserDumps,
+		packet.VulnerabilityFindings,
 		packet.RelatedPaths,
 		packet.RepoMap,
 		packet.DynamicContext,
+		packet.SemanticStatus,
 		packet.RetrievalLedger,
 		packet.RepoConfig,
 		packet.MatchedPathInstructions,
@@ -559,6 +610,7 @@ func inferVerificationProfilesFromGuidance(workspace workspaceRecord, guidance [
 				MaxRuntimeSeconds:  60,
 				RetryCount:         1,
 				SourcePaths:        []string{item.Path},
+				ChecklistItems:     []string{},
 				BuiltIn:            true,
 				CreatedAt:          nowUTC(),
 				UpdatedAt:          nowUTC(),
@@ -656,7 +708,7 @@ func verificationProfileName(command string) string {
 	}
 }
 
-func contextTokens(issue issueRecord, ticketContexts []TicketContextRecord) []string {
+func contextTokens(issue issueRecord, ticketContexts []TicketContextRecord, vulnerabilityFindings []VulnerabilityFindingRecord) []string {
 	textParts := []string{
 		issue.Title,
 		firstNonEmptyPtr(issue.Summary),
@@ -665,6 +717,9 @@ func contextTokens(issue issueRecord, ticketContexts []TicketContextRecord) []st
 	}
 	for _, item := range ticketContexts[:min(len(ticketContexts), 4)] {
 		textParts = append(textParts, item.Title, item.Summary, strings.Join(item.Labels, " "), strings.Join(item.AcceptanceCriteria, " "))
+	}
+	for _, item := range vulnerabilityFindings[:min(len(vulnerabilityFindings), 4)] {
+		textParts = append(textParts, item.Title, item.Summary, item.Scanner, firstNonEmptyPtr(item.RuleID), strings.Join(item.CWEIDs, " "), strings.Join(item.CVEIDs, " "), firstNonEmptyPtr(item.LocationPath), strings.Join(item.Evidence, " "))
 	}
 	tokens := regexp.MustCompile(`[a-z0-9_./-]{3,}`).FindAllString(strings.ToLower(strings.Join(textParts, " ")), -1)
 	stopWords := map[string]struct{}{
@@ -692,6 +747,7 @@ func rankRelatedPathsForIssue(
 	issue issueRecord,
 	treeFocus []string,
 	ticketContexts []TicketContextRecord,
+	vulnerabilityFindings []VulnerabilityFindingRecord,
 	repoMap *rustcore.RepoMapSummary,
 ) []string {
 	candidates := append([]string{}, treeFocus...)
@@ -703,7 +759,12 @@ func rankRelatedPathsForIssue(
 			candidates = append(candidates, item.Path)
 		}
 	}
-	tokens := contextTokens(issue, ticketContexts)
+	for _, item := range vulnerabilityFindings[:min(len(vulnerabilityFindings), 6)] {
+		if item.LocationPath != nil && strings.TrimSpace(*item.LocationPath) != "" {
+			candidates = append(candidates, *item.LocationPath)
+		}
+	}
+	tokens := contextTokens(issue, ticketContexts, vulnerabilityFindings)
 	scored := map[string]int{}
 	for _, path := range candidates {
 		if path == "" {
@@ -754,26 +815,380 @@ func rankRelatedPathsForIssue(
 	return ordered
 }
 
+func listVulnerabilityFindings(dataDir string, workspaceID string, issueID string) ([]VulnerabilityFindingRecord, error) {
+	path := filepath.Join(dataDir, "workspaces", workspaceID, "vulnerability_findings.json")
+	var items []VulnerabilityFindingRecord
+	if err := readJSON(path, &items); err != nil {
+		if os.IsNotExist(err) {
+			return []VulnerabilityFindingRecord{}, nil
+		}
+		return nil, err
+	}
+	filtered := make([]VulnerabilityFindingRecord, 0, len(items))
+	for _, item := range items {
+		if issueID == "" || item.IssueID == issueID {
+			filtered = append(filtered, item)
+		}
+	}
+	slices.SortFunc(filtered, func(a, b VulnerabilityFindingRecord) int {
+		if a.IssueID != b.IssueID {
+			if a.IssueID < b.IssueID {
+				return -1
+			}
+			return 1
+		}
+		if a.Severity != b.Severity {
+			if a.Severity < b.Severity {
+				return -1
+			}
+			return 1
+		}
+		left := strings.ToLower(a.Title)
+		right := strings.ToLower(b.Title)
+		if left != right {
+			if left < right {
+				return -1
+			}
+			return 1
+		}
+		if a.CreatedAt < b.CreatedAt {
+			return -1
+		}
+		if a.CreatedAt > b.CreatedAt {
+			return 1
+		}
+		return 0
+	})
+	return filtered, nil
+}
+
+func bestEffortSemanticStatus(dataDir string, workspaceID string, candidatePaths []string) *SemanticIndexStatus {
+	paths := []string{}
+	for _, path := range dedupeText(candidatePaths) {
+		switch strings.ToLower(filepath.Ext(path)) {
+		case ".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".rs", ".java":
+			paths = append(paths, path)
+		}
+		if len(paths) >= 12 {
+			break
+		}
+	}
+	status, err := ReadSemanticIndexStatus(dataDir, workspaceID, SemanticIndexRequest{
+		Surface:  "cli",
+		Strategy: "paths",
+		Paths:    paths,
+		Limit:    12,
+	})
+	if err != nil {
+		return nil
+	}
+	return status
+}
+
+func collectIssueSemanticMatches(
+	workspaceID string,
+	root string,
+	issue issueRecord,
+	tokens []string,
+	candidatePaths []string,
+	repoMap *rustcore.RepoMapSummary,
+) ([]SemanticPatternMatchRecord, []SemanticQueryMaterializationRecord, []SemanticMatchMaterializationRecord) {
+	if astGrepBinary() == "" {
+		return nil, nil, nil
+	}
+	queries := deriveIssueSemanticPatterns(tokens, candidatePaths, repoMap)
+	matches := []SemanticPatternMatchRecord{}
+	queryRows := []SemanticQueryMaterializationRecord{}
+	matchRows := []SemanticMatchMaterializationRecord{}
+	seen := map[string]struct{}{}
+	issueID := issue.BugID
+	for _, query := range queries {
+		pattern := query.pattern
+		language := optionalString(query.language)
+		pathGlob := trimOptional(optionalString(query.pathGlob))
+		found, binaryPath, queryError, truncated := runAstGrepSemanticQuery(root, pattern, language, pathGlob, 6)
+		engine := "none"
+		if binaryPath != nil {
+			engine = "ast_grep"
+		}
+		reason := query.reason
+		queryRow := buildSemanticQueryRow(workspaceID, pattern, language, pathGlob, engine, len(found), truncated, queryError, "issue_context", &reason, &issueID, nil)
+		queryRows = append(queryRows, *queryRow)
+		if queryError != nil {
+			continue
+		}
+		queryMatchBuffer := []SemanticPatternMatchRecord{}
+		for _, item := range found {
+			key := fmt.Sprintf("%s\x00%d\x00%s", item.Path, intPtrValue(item.LineStart), item.MatchedText)
+			if _, exists := seen[key]; exists {
+				continue
+			}
+			seen[key] = struct{}{}
+			lowered := strings.ToLower(item.Path + " " + item.MatchedText + " " + firstNonEmptyPtr(item.ContextLines))
+			matchedTerms := []string{}
+			for _, token := range tokens[:min(len(tokens), 12)] {
+				if strings.Contains(lowered, token) {
+					matchedTerms = append(matchedTerms, token)
+				}
+			}
+			score := max(3, len(matchedTerms)*2)
+			for _, candidate := range candidatePaths[:min(len(candidatePaths), 4)] {
+				if item.Path == candidate {
+					score += 2
+					break
+				}
+			}
+			item.Reason = &reason
+			item.Score = score
+			matches = append(matches, item)
+			queryMatchBuffer = append(queryMatchBuffer, item)
+			if len(matches) >= 8 {
+				break
+			}
+		}
+		matchRows = append(matchRows, buildSemanticMatchRows(workspaceID, queryRow.QueryRef, queryMatchBuffer)...)
+		if len(matches) >= 8 {
+			break
+		}
+	}
+	sortSemanticMatches(matches)
+	sortSemanticMatchRows(matchRows)
+	return matches[:min(len(matches), 8)], queryRows, matchRows[:min(len(matchRows), 8)]
+}
+
+type issueSemanticPattern struct {
+	pattern  string
+	language string
+	pathGlob string
+	reason   string
+}
+
+func deriveIssueSemanticPatterns(tokens []string, candidatePaths []string, repoMap *rustcore.RepoMapSummary) []issueSemanticPattern {
+	identifierTokens := []string{}
+	blocked := map[string]struct{}{"export": {}, "backend": {}, "frontend": {}, "render": {}, "error": {}, "issue": {}}
+	identifierPattern := regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{2,}$`)
+	for _, token := range tokens {
+		if !identifierPattern.MatchString(token) {
+			continue
+		}
+		if _, ok := blocked[token]; ok {
+			continue
+		}
+		identifierTokens = append(identifierTokens, token)
+	}
+	if len(identifierTokens) == 0 {
+		return nil
+	}
+
+	languagePaths := map[string]string{}
+	for _, path := range candidatePaths[:min(len(candidatePaths), 8)] {
+		if language := detectAstGrepLanguage(path); language != "" {
+			if _, exists := languagePaths[language]; !exists {
+				languagePaths[language] = path
+			}
+		}
+	}
+	if len(languagePaths) == 0 && repoMap != nil {
+		extensionLanguages := map[string]string{
+			".py":  "python",
+			".ts":  "typescript",
+			".tsx": "tsx",
+			".js":  "javascript",
+			".go":  "go",
+			".rs":  "rust",
+		}
+		for extension := range repoMap.TopExtensions {
+			if language := extensionLanguages[extension]; language != "" {
+				if _, exists := languagePaths[language]; !exists {
+					languagePaths[language] = "repo map extension " + extension
+				}
+			}
+		}
+	}
+	languages := make([]string, 0, len(languagePaths))
+	for language := range languagePaths {
+		languages = append(languages, language)
+	}
+	slices.Sort(languages)
+
+	out := []issueSemanticPattern{}
+	seen := map[string]struct{}{}
+	for _, language := range languages {
+		samplePath := languagePaths[language]
+		for _, name := range identifierTokens[:min(len(identifierTokens), 4)] {
+			for _, template := range semanticPatternsForName(language, name) {
+				key := language + "\x00" + template.pattern
+				if _, exists := seen[key]; exists {
+					continue
+				}
+				seen[key] = struct{}{}
+				out = append(out, issueSemanticPattern{
+					pattern:  template.pattern,
+					language: language,
+					pathGlob: astGrepGlobForLanguage(language),
+					reason:   template.reason + " near " + samplePath,
+				})
+				if len(out) >= 8 {
+					return out
+				}
+			}
+		}
+	}
+	return out
+}
+
+type semanticPatternTemplate struct {
+	pattern string
+	reason  string
+}
+
+func semanticPatternsForName(language string, name string) []semanticPatternTemplate {
+	if name == "" {
+		return nil
+	}
+	isExported := strings.ToUpper(name[:1]) == name[:1]
+	switch language {
+	case "python":
+		if isExported {
+			return []semanticPatternTemplate{{pattern: "class " + name + ": $$$BODY", reason: "Semantic class lookup for " + name}}
+		}
+		return []semanticPatternTemplate{{pattern: "def " + name + "($$$ARGS): $$$BODY", reason: "Semantic function lookup for " + name}}
+	case "typescript", "tsx", "javascript":
+		if isExported {
+			return []semanticPatternTemplate{{pattern: "class " + name + " { $$$BODY }", reason: "Semantic class lookup for " + name}}
+		}
+		return []semanticPatternTemplate{
+			{pattern: "function " + name + "($$$ARGS) { $$$BODY }", reason: "Semantic function lookup for " + name},
+			{pattern: "const " + name + " = ($$$ARGS) => $$$BODY", reason: "Semantic arrow-function lookup for " + name},
+		}
+	case "go":
+		if isExported {
+			return []semanticPatternTemplate{{pattern: "type " + name + " struct { $$$BODY }", reason: "Semantic type lookup for " + name}}
+		}
+		return []semanticPatternTemplate{{pattern: "func " + name + "($$$ARGS) { $$$BODY }", reason: "Semantic function lookup for " + name}}
+	case "rust":
+		if isExported {
+			return []semanticPatternTemplate{{pattern: "struct " + name + " { $$$BODY }", reason: "Semantic type lookup for " + name}}
+		}
+		return []semanticPatternTemplate{{pattern: "fn " + name + "($$$ARGS) { $$$BODY }", reason: "Semantic function lookup for " + name}}
+	default:
+		return nil
+	}
+}
+
+func detectAstGrepLanguage(path string) string {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".py":
+		return "python"
+	case ".ts":
+		return "typescript"
+	case ".tsx":
+		return "tsx"
+	case ".js":
+		return "javascript"
+	case ".go":
+		return "go"
+	case ".rs":
+		return "rust"
+	default:
+		return ""
+	}
+}
+
+func astGrepGlobForLanguage(language string) string {
+	switch language {
+	case "python":
+		return "**/*.py"
+	case "typescript":
+		return "**/*.ts"
+	case "tsx":
+		return "**/*.tsx"
+	case "javascript":
+		return "**/*.js"
+	case "go":
+		return "**/*.go"
+	case "rust":
+		return "**/*.rs"
+	default:
+		return ""
+	}
+}
+
+func sortSemanticMatches(items []SemanticPatternMatchRecord) {
+	slices.SortFunc(items, func(a, b SemanticPatternMatchRecord) int {
+		if a.Score != b.Score {
+			if a.Score > b.Score {
+				return -1
+			}
+			return 1
+		}
+		if a.Path != b.Path {
+			if a.Path < b.Path {
+				return -1
+			}
+			return 1
+		}
+		if intPtrValue(a.LineStart) < intPtrValue(b.LineStart) {
+			return -1
+		}
+		if intPtrValue(a.LineStart) > intPtrValue(b.LineStart) {
+			return 1
+		}
+		return 0
+	})
+}
+
+func sortSemanticMatchRows(items []SemanticMatchMaterializationRecord) {
+	slices.SortFunc(items, func(a, b SemanticMatchMaterializationRecord) int {
+		if a.Score != b.Score {
+			if a.Score > b.Score {
+				return -1
+			}
+			return 1
+		}
+		if a.Path != b.Path {
+			if a.Path < b.Path {
+				return -1
+			}
+			return 1
+		}
+		if intPtrValue(a.LineStart) < intPtrValue(b.LineStart) {
+			return -1
+		}
+		if intPtrValue(a.LineStart) > intPtrValue(b.LineStart) {
+			return 1
+		}
+		return 0
+	})
+}
+
 func buildDynamicContext(
+	dataDir string,
 	workspace workspaceRecord,
 	issue issueRecord,
 	treeFocus []string,
 	ticketContexts []TicketContextRecord,
 	threatModels []ThreatModelRecord,
 	browserDumps []BrowserDumpRecord,
+	vulnerabilityFindings []VulnerabilityFindingRecord,
 	recentFixes []FixRecord,
 	recentActivity []activityRecord,
 	relatedPaths []string,
+	repoMap *rustcore.RepoMapSummary,
 ) *DynamicContextBundle {
-	tokens := contextTokens(issue, ticketContexts)
-	symbols := extractSymbolContext(workspace.RootPath, append(append([]string{}, treeFocus...), relatedPaths...), tokens)
-	related := rankRelatedArtifacts(ticketContexts, threatModels, browserDumps, recentFixes, recentActivity, tokens)
-	if len(symbols) == 0 && len(related) == 0 {
+	tokens := contextTokens(issue, ticketContexts, vulnerabilityFindings)
+	symbols := extractSymbolContext(dataDir, workspace.WorkspaceID, workspace.RootPath, append(append([]string{}, treeFocus...), relatedPaths...), tokens)
+	semanticMatches, semanticQueries, semanticMatchRows := collectIssueSemanticMatches(workspace.WorkspaceID, workspace.RootPath, issue, tokens, append(append([]string{}, treeFocus...), relatedPaths...), repoMap)
+	related := rankRelatedArtifacts(ticketContexts, threatModels, browserDumps, vulnerabilityFindings, recentFixes, recentActivity, tokens)
+	if len(symbols) == 0 && len(semanticMatches) == 0 && len(semanticQueries) == 0 && len(semanticMatchRows) == 0 && len(related) == 0 {
 		return nil
 	}
 	return &DynamicContextBundle{
-		SymbolContext:  symbols,
-		RelatedContext: related,
+		SymbolContext:     symbols,
+		SemanticMatches:   semanticMatches,
+		SemanticQueries:   semanticQueries,
+		SemanticMatchRows: semanticMatchRows,
+		RelatedContext:    related,
 	}
 }
 
@@ -786,7 +1201,7 @@ func buildContextRetrievalLedger(
 	dynamicContext *DynamicContextBundle,
 	matchedPathInstructions []RepoPathInstructionMatch,
 ) []ContextRetrievalLedgerEntry {
-	tokens := contextTokens(issue, nil)
+	tokens := contextTokens(issue, nil, nil)
 	entries := []ContextRetrievalLedgerEntry{}
 	seen := map[string]struct{}{}
 	focusSet := map[string]struct{}{}
@@ -880,15 +1295,43 @@ func buildContextRetrievalLedger(
 			if symbol.EnclosingScope != nil {
 				scope = *symbol.EnclosingScope
 			}
+			sourceType := "on_demand_symbol"
+			if symbol.EvidenceSource == "stored_semantic" {
+				sourceType = "stored_symbol"
+			}
 			push(ContextRetrievalLedgerEntry{
 				EntryID:      "symbol:" + sourceID,
-				SourceType:   "symbol",
+				SourceType:   sourceType,
 				SourceID:     sourceID,
 				Title:        symbol.Kind + " " + symbol.Symbol,
 				Path:         ptr(symbol.Path),
 				Reason:       reason,
 				MatchedTerms: matchTerms(symbol.Path, symbol.Symbol, scope),
 				Score:        symbol.Score,
+			})
+		}
+		for _, match := range dynamicContext.SemanticMatches[:min(len(dynamicContext.SemanticMatches), 8)] {
+			lineStart := intPtrValue(match.LineStart)
+			columnStart := intPtrValue(match.ColumnStart)
+			sum := sha1.Sum([]byte(match.MatchedText))
+			sourceID := fmt.Sprintf("%s:%d:%d:%s", match.Path, lineStart, columnStart, hex.EncodeToString(sum[:])[:10])
+			reason := "Matched a semantic pattern derived from issue terms."
+			if match.Reason != nil && strings.TrimSpace(*match.Reason) != "" {
+				reason = *match.Reason
+			}
+			title := match.MatchedText
+			if len(title) > 72 {
+				title = title[:72] + "..."
+			}
+			push(ContextRetrievalLedgerEntry{
+				EntryID:      "semantic_match:" + sourceID,
+				SourceType:   "semantic_match",
+				SourceID:     sourceID,
+				Title:        title,
+				Path:         ptr(match.Path),
+				Reason:       reason,
+				MatchedTerms: matchTerms(match.Path, match.MatchedText, firstNonEmptyPtr(match.ContextLines)),
+				Score:        match.Score,
 			})
 		}
 		for _, artifact := range dynamicContext.RelatedContext[:min(len(dynamicContext.RelatedContext), 8)] {
@@ -964,17 +1407,10 @@ func buildContextRetrievalLedger(
 	return entries[:min(len(entries), 32)]
 }
 
-func extractSymbolContext(root string, candidatePaths []string, tokens []string) []RepoMapSymbolRecord {
+func extractSymbolContext(dataDir string, workspaceID string, root string, candidatePaths []string, tokens []string) []RepoMapSymbolRecord {
 	results := []RepoMapSymbolRecord{}
 	seen := map[string]struct{}{}
 	deduped := dedupeText(candidatePaths)
-	classRe := regexp.MustCompile(`^class\s+([A-Za-z_][A-Za-z0-9_]*)`)
-	defRe := regexp.MustCompile(`^def\s+([A-Za-z_][A-Za-z0-9_]*)`)
-	goFuncRe := regexp.MustCompile(`^func\s+(?:\([^)]+\)\s*)?([A-Za-z_][A-Za-z0-9_]*)`)
-	rustFnRe := regexp.MustCompile(`^fn\s+([A-Za-z_][A-Za-z0-9_]*)`)
-	jsFuncRe := regexp.MustCompile(`^(?:export\s+)?function\s+([A-Za-z_][A-Za-z0-9_]*)`)
-	varFuncRe := regexp.MustCompile(`^(?:const|let|var)\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:async\s*)?\(`)
-	structRe := regexp.MustCompile(`^struct\s+([A-Za-z_][A-Za-z0-9_]*)`)
 	for _, relPath := range deduped[:min(len(deduped), 10)] {
 		absPath := filepath.Join(root, relPath)
 		info, err := os.Stat(absPath)
@@ -985,52 +1421,16 @@ func extractSymbolContext(root string, candidatePaths []string, tokens []string)
 		if !slices.Contains([]string{".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".rs", ".java"}, ext) {
 			continue
 		}
-		content, err := os.ReadFile(absPath)
+		pathSymbols, err := ReadPathSymbols(dataDir, workspaceID, relPath)
 		if err != nil {
 			continue
 		}
-		lines := strings.Split(string(content), "\n")
-		var currentScope *string
-		for index, raw := range lines {
-			line := strings.TrimSpace(raw)
-			kind := ""
-			symbol := ""
-			switch {
-			case classRe.MatchString(line):
-				symbol = classRe.FindStringSubmatch(line)[1]
-				kind = "class"
-				value := symbol
-				currentScope = &value
-			case defRe.MatchString(line):
-				symbol = defRe.FindStringSubmatch(line)[1]
-				kind = "function"
-				if currentScope != nil {
-					kind = "method"
-				}
-			case goFuncRe.MatchString(line):
-				symbol = goFuncRe.FindStringSubmatch(line)[1]
-				kind = "function"
-			case rustFnRe.MatchString(line):
-				symbol = rustFnRe.FindStringSubmatch(line)[1]
-				kind = "function"
-			case jsFuncRe.MatchString(line):
-				symbol = jsFuncRe.FindStringSubmatch(line)[1]
-				kind = "function"
-			case varFuncRe.MatchString(line):
-				symbol = varFuncRe.FindStringSubmatch(line)[1]
-				kind = "function"
-			case structRe.MatchString(line):
-				symbol = structRe.FindStringSubmatch(line)[1]
-				kind = "type"
-			}
-			if symbol == "" || kind == "" {
-				continue
-			}
-			key := relPath + "::" + symbol
+		for _, record := range pathSymbols.Symbols[:min(len(pathSymbols.Symbols), 20)] {
+			key := fmt.Sprintf("%s::%s::%d::%s", record.Path, record.Symbol, intPtrValue(record.LineStart), record.Kind)
 			if _, ok := seen[key]; ok {
 				continue
 			}
-			lowered := strings.ToLower(relPath + " " + symbol)
+			lowered := strings.ToLower(record.Path + " " + record.Symbol + " " + firstNonEmptyPtr(record.EnclosingScope))
 			score := 0
 			matches := []string{}
 			for _, token := range tokens[:min(len(tokens), 12)] {
@@ -1049,22 +1449,23 @@ func extractSymbolContext(root string, candidatePaths []string, tokens []string)
 				continue
 			}
 			seen[key] = struct{}{}
-			lineNumber := index + 1
 			var reason *string
 			if len(matches) > 0 {
-				value := "Matches " + strings.Join(matches[:min(len(matches), 3)], ", ")
+				value := "Matches " + strings.Join(matches[:min(len(matches), 3)], ", ") + "; " + strings.ToLower(pathSymbols.SelectionReason)
 				reason = &value
 			} else {
-				value := "Near ranked focus files."
+				value := pathSymbols.SelectionReason
 				reason = &value
 			}
 			results = append(results, RepoMapSymbolRecord{
-				Path:           relPath,
-				Symbol:         symbol,
-				Kind:           kind,
-				LineStart:      &lineNumber,
-				EnclosingScope: currentScope,
+				Path:           record.Path,
+				Symbol:         record.Symbol,
+				Kind:           record.Kind,
+				LineStart:      record.LineStart,
+				LineEnd:        record.LineEnd,
+				EnclosingScope: record.EnclosingScope,
 				Reason:         reason,
+				EvidenceSource: pathSymbols.EvidenceSource,
 				Score:          score,
 			})
 		}
@@ -1093,10 +1494,18 @@ func extractSymbolContext(root string, candidatePaths []string, tokens []string)
 	return results[:min(len(results), 8)]
 }
 
+func intPtrValue(value *int) int {
+	if value == nil {
+		return 0
+	}
+	return *value
+}
+
 func rankRelatedArtifacts(
 	ticketContexts []TicketContextRecord,
 	threatModels []ThreatModelRecord,
 	browserDumps []BrowserDumpRecord,
+	vulnerabilityFindings []VulnerabilityFindingRecord,
 	recentFixes []FixRecord,
 	recentActivity []activityRecord,
 	tokens []string,
@@ -1152,6 +1561,15 @@ func rankRelatedArtifacts(
 		path := "browser_dumps.json"
 		records = append(records, RelatedContextRecord{ArtifactType: "browser_dump", ArtifactID: item.DumpID, Title: item.Label, Path: &path, Reason: &reason, MatchedTerms: matches, Score: len(matches)*2 + 1})
 	}
+	for _, item := range vulnerabilityFindings[:min(len(vulnerabilityFindings), 4)] {
+		matches := matchTerms(item.Title, item.Summary, item.Scanner, firstNonEmptyPtr(item.RuleID), firstNonEmptyPtr(item.LocationPath), strings.Join(item.CWEIDs, " "), strings.Join(item.CVEIDs, " "), strings.Join(item.Evidence, " "))
+		if len(matches) == 0 {
+			continue
+		}
+		reason := "Scanner evidence overlaps with the current issue language or files."
+		path := "vulnerability_findings.json"
+		records = append(records, RelatedContextRecord{ArtifactType: "vulnerability_finding", ArtifactID: item.FindingID, Title: item.Title, Path: &path, Reason: &reason, MatchedTerms: matches, Score: len(matches)*2 + 2})
+	}
 	for _, item := range recentFixes[:min(len(recentFixes), 4)] {
 		matches := matchTerms(item.Summary, strings.Join(item.ChangedFiles, " "))
 		if len(matches) == 0 {
@@ -1205,9 +1623,11 @@ func buildIssueContextPrompt(
 	ticketContexts []TicketContextRecord,
 	threatModels []ThreatModelRecord,
 	browserDumps []BrowserDumpRecord,
+	vulnerabilityFindings []VulnerabilityFindingRecord,
 	relatedPaths []string,
 	repoMap *rustcore.RepoMapSummary,
 	dynamicContext *DynamicContextBundle,
+	semanticStatus *SemanticIndexStatus,
 	retrievalLedger []ContextRetrievalLedgerEntry,
 	repoConfig *RepoConfigRecord,
 	matchedPathInstructions []RepoPathInstructionMatch,
@@ -1357,6 +1777,57 @@ func buildIssueContextPrompt(
 		threatLines = append(threatLines, "- No threat model recorded yet.")
 	}
 
+	vulnerabilityLines := []string{}
+	threatModelLookup := map[string]string{}
+	for _, item := range threatModels {
+		threatModelLookup[item.ThreatModelID] = item.Title
+	}
+	for _, item := range vulnerabilityFindings[:min(len(vulnerabilityFindings), 4)] {
+		location := "No file location recorded."
+		if item.LocationPath != nil && strings.TrimSpace(*item.LocationPath) != "" {
+			location = *item.LocationPath
+		}
+		if item.LocationLine != nil {
+			location += fmt.Sprintf(":%d", *item.LocationLine)
+		}
+		ruleBits := []string{}
+		if item.RuleID != nil && strings.TrimSpace(*item.RuleID) != "" {
+			ruleBits = append(ruleBits, *item.RuleID)
+		}
+		if len(item.CWEIDs) > 0 {
+			ruleBits = append(ruleBits, strings.Join(item.CWEIDs[:min(len(item.CWEIDs), 3)], ", "))
+		}
+		if len(item.CVEIDs) > 0 {
+			ruleBits = append(ruleBits, strings.Join(item.CVEIDs[:min(len(item.CVEIDs), 2)], ", "))
+		}
+		ruleSummary := "No rule or taxonomy ids recorded."
+		if len(ruleBits) > 0 {
+			ruleSummary = strings.Join(ruleBits, " | ")
+		}
+		evidenceSummary := "No scanner evidence recorded."
+		if len(item.Evidence) > 0 {
+			evidenceSummary = strings.Join(item.Evidence[:min(len(item.Evidence), 2)], "; ")
+		}
+		linked := []string{}
+		for _, threatModelID := range item.ThreatModelIDs {
+			if title, ok := threatModelLookup[threatModelID]; ok {
+				linked = append(linked, title)
+			}
+		}
+		linkageSummary := ""
+		if len(linked) > 0 {
+			linkageSummary = " Linked threat models: " + strings.Join(linked, ", ") + "."
+		}
+		summary := item.Summary
+		if strings.TrimSpace(summary) == "" {
+			summary = "No summary."
+		}
+		vulnerabilityLines = append(vulnerabilityLines, "- "+item.Title+" ["+item.Scanner+" / "+item.Source+" / "+item.Severity+" / "+item.Status+"]: "+summary+" Location: "+location+". IDs: "+ruleSummary+". Evidence: "+evidenceSummary+"."+linkageSummary)
+	}
+	if len(vulnerabilityLines) == 0 {
+		vulnerabilityLines = append(vulnerabilityLines, "- No vulnerability findings recorded yet.")
+	}
+
 	browserLines := []string{}
 	for _, item := range browserDumps[:min(len(browserDumps), 3)] {
 		pageBits := []string{}
@@ -1432,6 +1903,7 @@ func buildIssueContextPrompt(
 	}
 
 	symbolLines := []string{}
+	semanticMatchLines := []string{}
 	relatedArtifactLines := []string{}
 	if dynamicContext != nil {
 		for _, item := range dynamicContext.SymbolContext[:min(len(dynamicContext.SymbolContext), 6)] {
@@ -1448,6 +1920,25 @@ func buildIssueContextPrompt(
 				reason = " (" + *item.Reason + ")"
 			}
 			symbolLines = append(symbolLines, "- "+item.Kind+" "+item.Symbol+scope+" @ "+location+reason)
+		}
+		for _, item := range dynamicContext.SemanticMatches[:min(len(dynamicContext.SemanticMatches), 6)] {
+			location := item.Path
+			if item.LineStart != nil {
+				location = fmt.Sprintf("%s:%d", item.Path, *item.LineStart)
+			}
+			language := "unknown"
+			if item.Language != nil && strings.TrimSpace(*item.Language) != "" {
+				language = *item.Language
+			}
+			reason := ""
+			if item.Reason != nil && strings.TrimSpace(*item.Reason) != "" {
+				reason = " (" + *item.Reason + ")"
+			}
+			matchedText := item.MatchedText
+			if len(matchedText) > 120 {
+				matchedText = matchedText[:120]
+			}
+			semanticMatchLines = append(semanticMatchLines, "- "+location+" ["+language+"]"+reason+": "+matchedText)
 		}
 		for _, item := range dynamicContext.RelatedContext[:min(len(dynamicContext.RelatedContext), 6)] {
 			matched := ""
@@ -1468,6 +1959,9 @@ func buildIssueContextPrompt(
 	}
 	if len(symbolLines) == 0 {
 		symbolLines = append(symbolLines, "- No symbol context ranked yet.")
+	}
+	if len(semanticMatchLines) == 0 {
+		semanticMatchLines = append(semanticMatchLines, "- No semantic matches ranked yet.")
 	}
 	if len(relatedArtifactLines) == 0 {
 		relatedArtifactLines = append(relatedArtifactLines, "- No related artifacts ranked yet.")
@@ -1503,6 +1997,20 @@ func buildIssueContextPrompt(
 		pathInstructionLines = append(pathInstructionLines, "- No path-specific instructions matched the current issue paths.")
 	}
 
+	semanticStatusLines := []string{}
+	if semanticStatus != nil {
+		semanticStatusLines = append(semanticStatusLines, "- status: "+semanticStatus.Status)
+		for _, reason := range semanticStatus.StaleReasons[:min(len(semanticStatus.StaleReasons), 3)] {
+			semanticStatusLines = append(semanticStatusLines, "- reason: "+reason)
+		}
+		for _, warning := range semanticStatus.Warnings[:min(len(semanticStatus.Warnings), 3)] {
+			semanticStatusLines = append(semanticStatusLines, "- warning: "+warning)
+		}
+	}
+	if len(semanticStatusLines) == 0 {
+		semanticStatusLines = append(semanticStatusLines, "- No semantic index freshness status available.")
+	}
+
 	summary := firstNonEmptyPtr(issue.Summary)
 	if summary == "" {
 		summary = "No summary supplied."
@@ -1525,12 +2033,15 @@ func buildIssueContextPrompt(
 		"Prior fix history:\n" + strings.Join(fixLines, "\n") + "\n\n" +
 		"Ticket context:\n" + strings.Join(ticketLines, "\n") + "\n\n" +
 		"Threat model:\n" + strings.Join(threatLines, "\n") + "\n\n" +
+		"Vulnerability findings:\n" + strings.Join(vulnerabilityLines, "\n") + "\n\n" +
 		"Browser context:\n" + strings.Join(browserLines, "\n") + "\n\n" +
 		"Repo config:\n" + strings.Join(repoConfigLines, "\n") + "\n\n" +
 		"Path-specific guidance:\n" + strings.Join(pathInstructionLines, "\n") + "\n\n" +
+		"Semantic freshness:\n" + strings.Join(semanticStatusLines, "\n") + "\n\n" +
 		"Structural context:\n" + strings.Join(repoDirLines, "\n") + "\n\n" +
 		"Ranked related paths:\n" + relatedLines + "\n\n" +
 		"Symbol context:\n" + strings.Join(symbolLines, "\n") + "\n\n" +
+		"Semantic matches:\n" + strings.Join(semanticMatchLines, "\n") + "\n\n" +
 		"Related artifacts:\n" + strings.Join(relatedArtifactLines, "\n") + "\n\n" +
 		"Retrieval ledger:\n" + strings.Join(retrievalLines, "\n") + "\n\n" +
 		"Repository guidance:\n" + strings.Join(guidanceLines, "\n") + "\n\n" +

@@ -1,11 +1,9 @@
 package rustcore
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"os/exec"
 )
 
 type CoverageResult struct {
@@ -28,76 +26,29 @@ type CoverageResult struct {
 	CreatedAt        string   `json:"created_at"`
 }
 
-func ParseLCOVCoverage(ctx context.Context, workspaceID string, reportPath string, runID string, issueID string) (*CoverageResult, error) {
-	args := []string{
-		"run",
-		"--quiet",
-		"--bin",
-		"xmustard-core",
-		"--",
-		"parse-coverage-lcov",
-		workspaceID,
-		reportPath,
-	}
+func parseCoverageWith(ctx context.Context, sub, workspaceID, reportPath, runID, issueID string) (*CoverageResult, error) {
+	args := []string{workspaceID, reportPath}
 	if runID != "" {
 		args = append(args, runID)
 	}
 	if issueID != "" {
 		args = append(args, issueID)
 	}
-
-	cmd := exec.CommandContext(ctx, "cargo", args...)
-	cmd.Dir = rustCoreDir()
-
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("rust-core parse-coverage-lcov failed: %w: %s", err, stderr.String())
+	stdout, err := runCoreCtx(ctx, sub, args...)
+	if err != nil {
+		return nil, err
 	}
-
 	var result CoverageResult
-	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+	if err := json.Unmarshal(stdout, &result); err != nil {
 		return nil, fmt.Errorf("decode rust-core coverage result: %w", err)
 	}
 	return &result, nil
 }
 
+func ParseLCOVCoverage(ctx context.Context, workspaceID string, reportPath string, runID string, issueID string) (*CoverageResult, error) {
+	return parseCoverageWith(ctx, "parse-coverage-lcov", workspaceID, reportPath, runID, issueID)
+}
+
 func ParseCoverage(ctx context.Context, workspaceID string, reportPath string, runID string, issueID string) (*CoverageResult, error) {
-	args := []string{
-		"run",
-		"--quiet",
-		"--bin",
-		"xmustard-core",
-		"--",
-		"parse-coverage",
-		workspaceID,
-		reportPath,
-	}
-	if runID != "" {
-		args = append(args, runID)
-	}
-	if issueID != "" {
-		args = append(args, issueID)
-	}
-
-	cmd := exec.CommandContext(ctx, "cargo", args...)
-	cmd.Dir = rustCoreDir()
-
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("rust-core parse-coverage failed: %w: %s", err, stderr.String())
-	}
-
-	var result CoverageResult
-	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
-		return nil, fmt.Errorf("decode rust-core coverage result: %w", err)
-	}
-	return &result, nil
+	return parseCoverageWith(ctx, "parse-coverage", workspaceID, reportPath, runID, issueID)
 }

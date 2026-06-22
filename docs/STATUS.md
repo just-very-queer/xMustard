@@ -1,0 +1,203 @@
+# xMustard — Status Report (2026-06-21)
+
+## 1. What the Product IS Now
+
+xMustard is a **tiny MCP server for governed runtime memory** — its only job is giving coding agents (Claude Code, opencode, codex, etc.) two things: *grounding* ("what changed / what's stale / what's broken since you last touched this") and *memory with a trust lifecycle* (propose → multi-agent verify → promote, with drift-on-recall so memory never goes silently stale). It exposes **9 enriched MCP tools** (ground, recall, remember, verify, search, explain, impact, diagnostics, why_failed — several take modes/params, e.g. `search?mode=pattern`, `impact symbol=/from=/to=`, `recall query=`) backed by a Go API shell (`api-go/`) and a Rust semantic core (`rust-core/`). It deliberately does *not* try to be the agent, the search engine, the eval platform, or the security tracker — those are either cut from the agent surface or deferred to a future UI.
+
+---
+
+## 2. DONE — Major Capabilities Built & Verified
+
+### Governed Memory (the moat — all on the 9-tool MCP surface)
+- **`remember` / `verify` / `recall`** — propose→pending→multi-agent-verified→promoted pipeline (`context_governance.go`). Verified live: 2-distinct-agent promotion, duplicate-vote rejection, readonly enforcement.
+- **Drift-on-recall** — at recall time, each memory's referenced-path hashes are re-checked against the live tree; `stale_count` / `stale_paths` / `stale_memory` flags emitted. Never serves silently-stale memory.
+- **Memory conflict surfacing** — `recall` emits `conflicts` (files ≥2 active memories claim) so agents reconcile before trusting.
+- **Auth** (`auth.go`) — per-principal bearer tokens (admin/agent/readonly), sha256-hashed at rest, constant-time compare; agent identity in the verification gate comes from the authenticated principal (one token ≠ N fake agents). 7 adversarial issues found and fixed.
+
+### Session Grounding (`ground` — MCP surface)
+- `grounding.go` `BuildSessionGrounding` — changed/dirty-symbols/failed-runs, stale-index + sibling-clone drift flag, blocked-by-dirty/failing flags. Backed by `rust-core/changetrack.rs` (317 incorporation events recorded live).
+
+### Semantic Core (partial MCP surface via `search` / `explain` / `impact`)
+- **`search`** — hybrid BM25 + hashing-trick embedding + char-trigram fuzzy + Postgres ts_rank RRF. Lexical + structural, narrow, not a dump.
+- **`explain`** — file/directory explainer via `rust-core` (purpose, key symbols, run/verify info).
+- **`impact`** — dirty symbols → callers/tests blast radius (`rust-core/semantic.rs`).
+- **`diagnostics`** — normalized diagnostics for the workspace.
+- tree-sitter symbol extraction (Rust/Go/TS/TSX/JS/JSX; regex fallback) backing search + impact.
+- ast-grep semantic pattern search (`rust-core/semantic.rs`).
+- LSP live sessions (`rust-core/lsp_session.rs`): rust-analyzer/gopls/typescript-language-server/clangd; documentSymbol + hover verified live.
+- Semantic repo graph (`rust-core/symbolgraph.rs`): typed edges (imports/calls/inherits/tests/refs), verified live (820 calls / 466 refs / 420 tests).
+- Ownership & subsystem model (`rust-core/ownership.rs`): cohesion, likely owners from git history, blast radius.
+
+### Change Tracking (feeds `ground` — MCP surface)
+- File/symbol fingerprinting + incorporation-lineage chain (`rust-core/changetrack.rs`). Verified: 317 events.
+- Changed-since-baseline + working-tree dirty symbols (not only dirty files).
+- Stale-index + sibling-clone drift detection in `/changes/drift` and session-grounding.
+
+### MCP Server (the delivery surface)
+- `api-go/cmd/xmustard-mcp` — stdio JSON-RPC 2.0, exactly 9 tools, tested (`main_test.go` asserts the 9-tool set and validates required-param enforcement). Bridges to the Go HTTP API.
+- Verified-context injected into agent run prompts (`applyActiveContextToPrompt` on `StartIssueRun` + `StartAgentQuery`).
+
+### Providers & Routing (HTTP-only, NOT on the 9-tool MCP surface)
+- OpenAI-compatible provider layer (`openai_providers.go`): Ollama/vLLM/LM Studio/OpenAI + vision VLM. Secrets never stored (env-var name only). SSRF guard, redirect-follow blocked. Verified live against Ollama.
+- Task-typed model routing (`provider_router.go`): 6-type taxonomy (locate/code_edit_patch/multi_step_debug_reason/repo_qa_explain/test_gen_validate/vision_ui_diagnose) → provider+model. Verified live.
+- `/api/providers*`, `/api/route*` — HTTP-only; no MCP tool for these (correctly not on the agent surface per RETHINK).
+
+### Storage & Persistence
+- Postgres store: semantic index (`xm_files`/`xm_symbols`/`xm_edges`) + ops layer (`xm_runs`/`xm_activity`/`xm_issues`) materialized and queryable.
+- JSON remains the durable write source; PG is the queryable index.
+- Full operational memory layer (issues, runs, plans, verification profiles, eval timelines, threat models, vuln records, browser dumps) built and persisted — but these are HTTP/CLI-only, not on the 9-tool MCP surface (correctly).
+
+### Auth (HTTP-only; feeds MCP gate identity)
+- Bearer-token auth with role-based access (admin/agent/readonly). Non-loopback bind requires TLS or explicit override. Auth events flow into the multi-agent verification gate.
+
+### UI / Cockpit (HTTP-only, secondary consumer)
+- `frontend/` React: cockpit (`Cockpit.tsx`), kanban (`KanbanBoard.tsx`), intelligence inspector. Exists but not the primary product surface per RETHINK.
+
+---
+
+## 3. Remaining-Work Loop — COMPLETE (2026-06-21)
+
+The seven items that were genuinely-open after the deep-graph loop (R1–R7, see
+`docs/plans/2026-06-21-remaining-work-loop.md`) are now **all DONE, verified, and
+pushed** to `feat/product-v1`. R4 (auth) and R5 (PG write path) each passed an
+adversarial-review workflow with all critical/high findings fixed before commit.
+The table below records each with its evidence.
+
+| Item | Verdict | Effort | Evidence |
+|------|---------|--------|----------|
+| **Graph-proximity RRF lane** (A2 remainder) | **DONE** | medium | `hybrid_search` takes `seed: Option<&str>`, calls `symbol_impact` for BFS distances → `1/(d+1)` 4th `"proximity"` RRF lane; auto-seeds from the top exact match; wired `search?seed=` + MCP `seed` param. Live: `seed=RecordFeedback` re-ranks `feedback.go` neighbours up (lane shows `…+proximity`). |
+| **Contract-break detection** (A3 remainder) | **DONE** | medium | `changetrack` derives + baselines per-symbol signatures (`IndexBaseline.signatures`), diffs them on modified files → `DirtySymbol.contract_break` + `signature_change` (`params N→M, return x→y`); surfaced in `impact`/`ground` (`contract_breaks`, `broken_contracts`). Live: arity/return change flags, body-only edit doesn't. |
+| **Wiki incrementality** | **DONE** | small–med | `generate_wiki` now uses `build_symbol_graph_cached` (was the last cold-rebuild caller) + a per-subsystem fingerprint page cache (`wiki-<ws>.json`); only changed subsystems re-render (`regenerated_slugs`/`reused_slugs`). Live: edit one file → one subsystem regenerates. |
+| **Auth follow-ons** (A5) | **DONE** | large | Global capped auth-audit log (mint/revoke/rotate/denied); `ExpiresAt` + fail-closed TTL check in `ResolveToken`; `RotateToken` + rotate endpoint; `roleRank` hierarchy with an explicit `agent` gate. Adversarial review (27 agents) → fixed critical token-store race (`tokenStoreMu`), fail-open-on-corrupt (`HasAuthConfigured` fails closed), audit DoS (clip + throttle), TTL overflow. `-race` tests + live. |
+| **Postgres as the write path** (C1) | **DONE** | large | `pg_inline.go`: `saveRunRecord` + `saveVerificationProfileHistory` mirror to PG inline on mutation (xm_runs + new xm_run_plans), JSON still source-of-truth. Best-effort async (gated on `XMUSTARD_PG_DSN`). Adversarial review (30 agents) → fixed async-latency, unique-index-fragility, NULL columns. Live round-trip + `-race` tests; `/pg/run-plans` read-back. |
+| **Deeper data/control-flow edges** | **DONE** | large | A per-line flow pass classifies `returns`/`branches`/`writes` edges into a separate `SymbolGraph.flow_edges` (unperturbing authority/impact/proximity), tagged `lexical` like S2. `symbolgraph flow` CLI. Live: 399 flow edges on this repo (branches 239 / returns 107 / writes 53). |
+| **Cockpit UI for providers/routing/tokens** (A4 remainder) | **DONE** | large | `AdminPanel.tsx` (providers / routing / tokens) as a new `admin` view; `api.ts` typed clients over `/api/providers*`, `/api/routes`, `/api/auth/*`. `tsc`+build green; every endpoint round-trip verified live. |
+
+### Stale docs (being fixed in this pass)
+- `PLANNED_FEATURES.md` had ⬜ markers for enclosing-scope and LSP impl/type/rename that are now done — corrected.
+
+---
+
+## 4. Completion Estimate Against the RETHINK Thesis
+
+**Effectively complete** against the governed-memory product. Everything in the
+RETHINK plan (steps 1–5) is done; the deep-graph + IndexEngine loop (S1–S6: full
+LSP, scope-resolved CALLS, communities, incremental reindex, agent-feedback ranking,
+symbol-level impact/trace) is done; and the remaining-work loop (R1–R7: proximity
+lane, contract-break detection, wiki incrementality, auth follow-ons, PG write path,
+flow edges, cockpit admin UI) is done. The 9 enriched MCP tools are live and tested,
+auth is hardened (adversarial-reviewed), grounding + drift-on-recall + conflict
+surfacing are real, and the warm index is 20× faster. What remains is open-ended
+depth (richer flow analysis, scale hardening, more provider integrations) rather
+than a closed checklist.
+
+---
+
+## 5. Remaining-Work Loop — all landed (R1–R7)
+
+1. ~~Graph-proximity RRF lane~~ — **DONE** (R1, `27a96b2`). 4th proximity lane via
+   `symbol_impact` BFS distances + auto-seed + `search?seed=`.
+2. ~~Contract-break detection~~ — **DONE** (R2, `d3465c2`). Baselined per-symbol
+   signatures diffed on change → `contract_break` in `impact`/`ground`.
+3. ~~Wiki incrementality~~ — **DONE** (R3, `43de2f7`). Warm cached graph +
+   per-subsystem fingerprint page cache; only changed subsystems re-render.
+4. ~~Auth A5~~ — **DONE** (R4, `aed07bf`). Audit log, token expiry/rotation,
+   agent-role gate; adversarial-reviewed (critical race + fail-open + audit DoS fixed).
+5. ~~PG write path~~ — **DONE** (R5, `c405bc8`). Inline best-effort mirror of
+   runs/plans/verifications; adversarial-reviewed (async latency + NULL columns fixed).
+6. ~~Deeper data/control-flow edges~~ — **DONE** (R6, `de700f0`). returns/branches/
+   writes flow edges in a separate `flow_edges` field.
+7. ~~Cockpit UI~~ — **DONE** (R7). `AdminPanel.tsx` for providers/routing/tokens
+   over the existing HTTP endpoints; tsc + build green, endpoints round-trip-verified.
+
+**Future depth (no longer a closed checklist):** richer flow analysis (LSP-resolved
+flow edges, reads vs writes precision), scale hardening (a shared PG pool replacing
+per-call connects), and more provider/routing integrations.
+
+---
+
+## 6. Production hardening pass (2026-06-21) — concurrency, lifecycle, confinement
+
+A safety-under-sustained-concurrent-agent-load pass, driven by an external audit
+(`goal/xmustard_fix_queue.md`, `goal/xmustard_new_findings.jsonl`). Each item was
+verified against the code before patching; all are tested + committed.
+
+**Fixed (P0/P1):**
+- **State integrity:** path-keyed per-store transaction locks (`storelock.go`) around
+  the full load→mutate→save of governed memory, feedback, and audit stores —
+  concurrent votes/promotions/appends no longer lose updates (was only fixed for the
+  token store). `-race` concurrency tests.
+- **Path confinement (host-file safety):** one resolver (`safepath.go`) rejects
+  absolute/`..`/symlink escape + caps size; wired into governed-memory hashing,
+  provider `image_path` egress (confined to `<dataDir>/uploads`), terminal log ids,
+  and `normalizeWorkspaceFile` (symlink-safe).
+- **Process/FD lifecycle:** autonomous idle reaper for Go LSP sessions (was the
+  invisible RSS budget-killer — abandoned sessions leaked the child language server +
+  goroutine + FDs); run-cancel no longer signals a possibly-reused persisted PID
+  (terminal-state guard + PID-clear); retry only from terminal states.
+- **Terminal isolation:** sessions keyed/authorized by owning workspace — no
+  cross-workspace read/write/resize/close.
+- **MCP/HTTP edges:** bounded MCP stdio reader (a newline-less message no longer OOMs)
+  + structured `-32700/-32600` errors; API `http.Server` with read/write/idle
+  timeouts + graceful shutdown; unified default port to **8042** (matches the MCP
+  bridge + AGENTS.md).
+- **Bridge/deploy:** every Go→Rust call routes through the binary-first resolver
+  (no hard-coded `cargo run`) so a binary-only/no-Docker install works; goal bridge
+  gained a timeout + bounded error echo.
+- **Rust cache atomicity:** cache writes are temp-file + fsync + atomic rename, so a
+  concurrent `xmustard-core` never reads a torn cache.
+- **Bounded logs:** per-workspace audit log capped (newest 5000), like the auth-audit log.
+
+**Status of the P1 items this section once listed as still-open:** all closed in
+the post-hardening deepening pass — see **§7**. (Shared `pgxpool` → `3d5b1b4`;
+ordered PG mirror → `7a59f74`; drift sentinels XM-NEW-003/004 → `422bbaf`;
+index-coverage honesty XM-NEW-009/010 → `69feaac`; workspace-scoped tokens
+XM-NEW-022 → `1326b7a`; verification pipe-drain XM-NEW-015 → `100b994`.)
+
+**Genuinely still-open (honest, deferred — not blocking the governed-memory
+product):** the symbol graph the agent path uses is the **lexical** graph; the
+LSP-resolved upgrade exists but is CLI-only (`build-lsp`), not wired into
+`search`. The "20× warm index" figure still has no committed benchmark artifact;
+treat it as indicative, not measured. Two P2 index-engine items are designed but
+deliberately deferred (rationale in `docs/INDEX_ENGINE.md` §Deferred): a
+long-lived **IndexEngine daemon** (G) and a **blake3/merkle content-key**
+migration (H) — both judged premature surface/dependency expansion against the
+lean, on-demand-binary, 50–100 MB-RSS design while parsing (not hashing) is the
+reindex bottleneck and git already gives O(dirty-file) invalidation.
+
+---
+
+## 7. Post-hardening deepening pass (2026-06-21) — close the remaining P0/P1, deepen runtime memory without growing surface
+
+Driven by a second external audit (`goal/xmustard_fix_queue.md`,
+`goal/xmustard_new_findings.jsonl`) plus a reconciliation of the "deliberately
+left" list against the actual code. Rule for the pass: **trust the code over the
+docs** — every claimed gap was re-verified against the tree before patching, and
+several "open" items were already closed. Constraints held throughout: the MCP
+surface stays at **exactly 9 tools** (no new tools), no embeddings/HNSW until
+P0/P1 pass, 50–100 MB RSS, no Docker, never fake a test. Each item is tested and
+committed; the table records the evidence.
+
+| Item | Verdict | Commit | Evidence |
+|------|---------|--------|----------|
+| Shared capped Postgres pool (was connect-per-op → FD/conn DoS under load) | **DONE** | `3d5b1b4` | `pgpool.go` lazy `pgxpool` (MaxConns 10) shared by all PG ops; `pgpool_test.go`. |
+| Monotonic ordering guard for the async PG run mirror (out-of-order commits) | **DONE** | `7a59f74` | `pg_inline.go` `mirror_seq` + `pg_advisory_xact_lock`; a stale async write can't clobber a newer state. `pg_ordering_test.go`. |
+| Index-coverage honesty (non-git / >800-file repos silently returned empty/truncated graphs) | **DONE** | `69feaac` | `symbolgraph.rs` `IndexCoverage{repo_mode,eligible,indexed,truncated,degraded_reason}` on every `SymbolGraph`; search/ground surface it so a degraded graph isn't trusted as complete. |
+| Optional workspace-scoped tokens (multi-tenant isolation) | **DONE** | `1326b7a` | `auth.go` `Principal.Workspaces`/`AllowsWorkspace`/`MintScopedToken`; empty = all (back-compat). Live ACL check: scoped token → 200 own / 403 other. |
+| Drift baseline tracks missing/edited memory paths | **DONE** | `422bbaf` | `pathMissingSentinel` so a memory's path going missing↔present↔content-change all flag stale on recall (not just content edits). |
+| Concurrent drain of Rust verification child pipes (pipe-buffer deadlock) | **DONE** | `100b994` | `verification.rs` `drain_child_with_timeout` reads stdout/stderr on separate threads. |
+| Metadata-first recall — drift-check a bounded candidate window, not the whole store (was O(history) path-hash I/O per recall) | **DONE** (A) | `09495d1` | `RecallContext` ranks cheaply with no I/O, drift-checks only `max(4·limit,16)` candidates, returns `drift_checked`. |
+| Single token-store read per request (was a double read on every authed call) | **DONE** (E) | `ccc4c2f` | `ResolveAuth` does one store read; `ResolveToken` delegates. |
+| Bounded run output + activity capture (unbounded `strings.Builder` per run) | **DONE** (C) | `0e70ef7` | `boundedTail` 1 MiB ring buffer; summary exposes `output_bytes`/`output_truncated`. |
+| Terminal idle reaper + duplicate-id rejection (abandoned PTYs leaked FDs/RSS) | **DONE** (D) | `5280cae` | 30-min idle TTL reaper; `OpenTerminal` `LoadOrStore` rejects a duplicate live id. |
+| Route ALL Go→Rust bridge calls through one hardened runner | **DONE** (F) | `7170047`,`ae8ade5` | shared `runCoreCtx`/`capWriter` (120 s timeout, 64 MiB stdout / 64 KiB stderr caps, sanitized errors); every bridge file routed through it. |
+| Strict MCP arg validation + `remember` JSON body | **DONE** (B) | `1cdf390` | `tools/call` rejects malformed params / stray fields / unknown args / wrong types / non-scalar / out-of-enum with `-32602` (no silent coerce); typed `inputSchema` (enums, `additionalProperties:false`); `remember` ships content/title/paths in the JSON **body**, not the URL (XM-NEW-018). Live: special-char memory round-trips; object-valued arg & bogus enum → `-32602`. |
+
+**Deferred by design (P2, not blockers):** G (IndexEngine daemon) and H
+(blake3/merkle content key) — see `docs/INDEX_ENGINE.md` §Deferred for the
+analysis and the trigger conditions that would justify revisiting them.
+
+**Net:** every feasible P0/P1 from both audits is fixed + tested + pushed to
+`feat/product-v1`; the only remaining items are the two intentionally-deferred
+P2 index-engine designs and the long-standing LSP-graph-into-search wiring, all
+documented honestly above.

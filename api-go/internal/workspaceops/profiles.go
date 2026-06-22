@@ -379,7 +379,19 @@ func loadSavedVerificationProfiles(dataDir string, workspaceID string) ([]rustco
 		}
 		return nil, err
 	}
+	for idx := range profiles {
+		normalizeVerificationProfile(&profiles[idx])
+	}
 	return profiles, nil
+}
+
+func normalizeVerificationProfile(profile *rustcore.VerificationProfileInput) {
+	if profile.SourcePaths == nil {
+		profile.SourcePaths = []string{}
+	}
+	if profile.ChecklistItems == nil {
+		profile.ChecklistItems = []string{}
+	}
 }
 
 func saveVerificationProfiles(dataDir string, workspaceID string, profiles []rustcore.VerificationProfileInput) error {
@@ -422,6 +434,7 @@ func defaultVerificationProfile(workspaceID string) rustcore.VerificationProfile
 		MaxRuntimeSeconds: 30,
 		RetryCount:        1,
 		SourcePaths:       []string{},
+		ChecklistItems:    []string{},
 		BuiltIn:           true,
 		CreatedAt:         now,
 		UpdatedAt:         now,
@@ -441,23 +454,7 @@ func appendSettingsActivity(dataDir string, workspaceID string, entityID string,
 		Details:     details,
 		CreatedAt:   createdAt,
 	}
-	path := filepath.Join(dataDir, "workspaces", workspaceID, "activity.jsonl")
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
-	handle, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
-	if err != nil {
-		return err
-	}
-	defer handle.Close()
-	payload, err := jsonMarshal(record)
-	if err != nil {
-		return err
-	}
-	if _, err := handle.Write(append(payload, '\n')); err != nil {
-		return err
-	}
-	return nil
+	return writeActivityRecord(dataDir, workspaceID, record)
 }
 
 func slugProfileID(name string) string {

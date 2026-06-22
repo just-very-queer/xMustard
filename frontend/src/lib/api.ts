@@ -20,6 +20,11 @@ import type {
   GitHubIssueImport,
   GitHubPRCreate,
   GitHubPRResult,
+  GoalCreateRequest,
+  GoalIterationAppendRequest,
+  GoalIterationRecord,
+  GoalRecord,
+  GoalStatusUpdateRequest,
   GuidanceStarterRequest,
   GuidanceStarterResult,
   ImprovementSuggestion,
@@ -71,6 +76,11 @@ import type {
   WorktreeStatus,
   WorkspaceSnapshot,
   WorkspaceRecord,
+  OpenAIProvider,
+  RoutingRule,
+  AuthPrincipal,
+  MintTokenResult,
+  AuthAuditEvent,
 } from './types'
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -86,12 +96,74 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return response.json() as Promise<T>
 }
 
+async function requestText(path: string): Promise<string> {
+  const response = await fetch(path)
+  if (!response.ok) {
+    throw new Error(await response.text())
+  }
+  return response.text()
+}
+
 export function listWorkspaces() {
   return request<WorkspaceRecord[]>('/api/workspaces')
 }
 
 export function getHealth() {
   return request<ApiHealth>('/api/health')
+}
+
+// --- governed runtime memory (the product moat) ---
+
+export interface MemoryEntry {
+  id: string
+  title: string
+  content: string
+  source: string
+  permission: string
+  status: string
+  promoted: boolean
+  required_verifications: number
+  verifications: { agent: string; approve: boolean }[]
+  paths?: string[]
+  stale?: boolean
+  stale_paths?: string[]
+}
+
+export interface ActiveMemory {
+  active_count: number
+  stale_count: number
+  conflicts: { path: string; entry_ids: string[]; titles: string[] }[]
+  entries: MemoryEntry[]
+}
+
+export function getActiveMemory(workspaceId: string) {
+  return request<ActiveMemory>(`/api/workspaces/${workspaceId}/context/active`)
+}
+
+export function listMemory(workspaceId: string, filter = 'all') {
+  return request<MemoryEntry[]>(`/api/workspaces/${workspaceId}/context?filter=${filter}`)
+}
+
+export function proposeMemory(
+  workspaceId: string,
+  body: { content: string; title?: string; paths?: string[]; permission?: string },
+) {
+  return request<MemoryEntry>(`/api/workspaces/${workspaceId}/context`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  })
+}
+
+export function verifyMemory(
+  workspaceId: string,
+  entryId: string,
+  approve: boolean,
+  note = '',
+) {
+  return request<MemoryEntry>(`/api/workspaces/${workspaceId}/context/${entryId}/verify`, {
+    method: 'POST',
+    body: JSON.stringify({ approve, note }),
+  })
 }
 
 export function loadWorkspace(rootPath: string, name?: string) {
@@ -732,10 +804,10 @@ export function openTerminal(workspaceId: string) {
   })
 }
 
-export function writeTerminal(terminalId: string, data: string) {
+export function writeTerminal(terminalId: string, workspaceId: string, data: string) {
   return request<{ ok: boolean }>(`/api/terminal/${terminalId}/write`, {
     method: 'POST',
-    body: JSON.stringify({ data }),
+    body: JSON.stringify({ workspace_id: workspaceId, data }),
   })
 }
 
@@ -745,8 +817,204 @@ export function readTerminal(terminalId: string, workspaceId: string, offset: nu
   )
 }
 
-export function closeTerminal(terminalId: string) {
-  return request<{ ok: boolean }>(`/api/terminal/${terminalId}`, {
+export function closeTerminal(terminalId: string, workspaceId: string) {
+  return request<{ ok: boolean }>(
+    `/api/terminal/${terminalId}?workspace_id=${encodeURIComponent(workspaceId)}`,
+    {
+      method: 'DELETE',
+    },
+  )
+}
+
+export function listGoals(workspaceId: string) {
+  return request<GoalRecord[]>(`/api/workspaces/${workspaceId}/goals`)
+}
+
+export function createGoal(workspaceId: string, payload: GoalCreateRequest) {
+  return request<GoalRecord>(`/api/workspaces/${workspaceId}/goals`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+}
+
+export function getGoal(workspaceId: string, goalId: string) {
+  return request<GoalRecord>(`/api/workspaces/${workspaceId}/goals/${goalId}`)
+}
+
+export function appendGoalIteration(workspaceId: string, goalId: string, payload: GoalIterationAppendRequest) {
+  return request<GoalIterationRecord>(`/api/workspaces/${workspaceId}/goals/${goalId}/iterations`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+}
+
+export function updateGoalStatus(workspaceId: string, goalId: string, payload: GoalStatusUpdateRequest) {
+  return request<GoalRecord>(`/api/workspaces/${workspaceId}/goals/${goalId}/status`, {
+    method: 'PATCH',
+    body: JSON.stringify(payload),
+  })
+}
+
+export function readGoalLedger(workspaceId: string, goalId: string) {
+  return requestText(`/api/workspaces/${workspaceId}/goals/${goalId}/ledger`)
+}
+
+export function readGoalContext(workspaceId: string, goalId: string) {
+  return requestText(`/api/workspaces/${workspaceId}/goals/${goalId}/context`)
+}
+
+// --- Cockpit: change state + intelligence (Surface 1.C / 3) ---
+
+export type ChangedFile = { path: string; change: string }
+export type DirtySymbol = { path: string; symbol: string; kind: string; change: string }
+export type ChangeSet = {
+  workspace_id: string
+  since: string
+  changed_files: ChangedFile[]
+  dirty_symbols: DirtySymbol[]
+  generated_at: string
+}
+export type DriftReport = {
+  workspace_id: string
+  has_baseline: boolean
+  stale: boolean
+  head_changed: boolean
+  content_changed: boolean
+  sibling_clone: boolean
+  reasons: string[]
+  current_head?: string | null
+  baseline_head?: string | null
+}
+export type Hotspot = { path: string; inbound_weight: number; dependent_count: number }
+export type BlastRadius = {
+  workspace_id: string
+  symbol: string
+  defined_in: string[]
+  referencing_files: string[]
+  referencing_file_count: number
+}
+export type CockpitDashboard = {
+  workspace_id: string
+  issues_total: number
+  issues_by_severity: Record<string, number>
+  issues_by_status: Record<string, number>
+  needs_followup_count: number
+  avg_quality: number
+  low_quality_count: number
+  review_ready_count: number
+  audit_event_count: number
+}
+export type SessionGrounding = {
+  workspace_id: string
+  changed_files: number
+  dirty_symbols: number
+  recent_failed_runs: string[]
+  blocked_by_dirty_state: boolean
+  blocked_by_failing_verification: boolean
+  summary: string
+  generated_at: string
+}
+export type Subsystem = {
+  name: string
+  file_count: number
+  symbol_count: number
+  internal_edges: number
+  external_edges: number
+  cohesion: number
+}
+export type OwnerCount = { name: string; commits: number }
+export type OwnerSuggestion = {
+  path: string
+  owners: OwnerCount[]
+  generated_at: string
+}
+export type LineageEvent = { path: string; hash: string; head_sha: string; event: string; at: string }
+export type FileLineage = { events: LineageEvent[]; change_count: number }
+
+export function getWorkspaceChanges(workspaceId: string) {
+  return request<ChangeSet>(`/api/workspaces/${workspaceId}/changes`)
+}
+export function getWorkspaceDrift(workspaceId: string) {
+  return request<DriftReport>(`/api/workspaces/${workspaceId}/changes/drift`)
+}
+export function indexWorkspace(workspaceId: string) {
+  return request<unknown>(`/api/workspaces/${workspaceId}/index`, { method: 'POST' })
+}
+export function getWorkspaceHotspots(workspaceId: string, limit = 15) {
+  return request<Hotspot[]>(`/api/workspaces/${workspaceId}/hotspots?limit=${limit}`)
+}
+export function getBlastRadius(workspaceId: string, symbol: string) {
+  return request<BlastRadius>(
+    `/api/workspaces/${workspaceId}/blast-radius?symbol=${encodeURIComponent(symbol)}`,
+  )
+}
+export function getCockpitDashboard(workspaceId: string) {
+  return request<CockpitDashboard>(`/api/workspaces/${workspaceId}/dashboard`)
+}
+export function getSessionGrounding(workspaceId: string) {
+  return request<SessionGrounding>(`/api/workspaces/${workspaceId}/session-grounding`)
+}
+export function getWorkspaceSubsystems(workspaceId: string) {
+  return request<Subsystem[]>(`/api/workspaces/${workspaceId}/subsystems`)
+}
+export function getFileOwners(workspaceId: string, path: string) {
+  return request<OwnerSuggestion>(
+    `/api/workspaces/${workspaceId}/owners?path=${encodeURIComponent(path)}`,
+  )
+}
+export function getFileLineage(workspaceId: string, path: string) {
+  return request<FileLineage>(
+    `/api/workspaces/${workspaceId}/lineage?path=${encodeURIComponent(path)}`,
+  )
+}
+
+// --- operator admin: providers / routing / tokens (HTTP-only surfaces) ---
+
+export function listProviders() {
+  return request<OpenAIProvider[]>('/api/providers')
+}
+export function addProvider(provider: OpenAIProvider) {
+  return request<OpenAIProvider>('/api/providers', {
+    method: 'POST',
+    body: JSON.stringify(provider),
+  })
+}
+export function removeProvider(name: string) {
+  return request<{ removed: string }>(`/api/providers/${encodeURIComponent(name)}`, {
     method: 'DELETE',
   })
+}
+
+export function listRoutingRules() {
+  return request<RoutingRule[]>('/api/routes')
+}
+export function setRoutingRule(rule: RoutingRule) {
+  return request<RoutingRule[]>('/api/routes', {
+    method: 'POST',
+    body: JSON.stringify(rule),
+  })
+}
+
+export function listPrincipals() {
+  return request<AuthPrincipal[]>('/api/auth/principals')
+}
+export function mintToken(id: string, role: string, ttlSeconds = 0) {
+  return request<MintTokenResult>('/api/auth/tokens', {
+    method: 'POST',
+    body: JSON.stringify({ id, role, ttl_seconds: ttlSeconds }),
+  })
+}
+export function rotateToken(id: string, ttlSeconds = 0) {
+  return request<MintTokenResult>(`/api/auth/tokens/${encodeURIComponent(id)}/rotate`, {
+    method: 'POST',
+    body: JSON.stringify({ ttl_seconds: ttlSeconds }),
+  })
+}
+export function revokeToken(id: string) {
+  return request<{ revoked: string }>(`/api/auth/tokens/${encodeURIComponent(id)}`, {
+    method: 'DELETE',
+  })
+}
+export function listAuthAudit(limit = 50) {
+  return request<AuthAuditEvent[]>(`/api/auth/audit?limit=${limit}`)
 }

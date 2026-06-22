@@ -1,0 +1,278 @@
+package workspaceops
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+func writeTestSettings(t *testing.T, dir string, s appSettings) {
+	t.Helper()
+	if err := writeJSON(filepath.Join(dir, "settings.json"), s); err != nil {
+		t.Fatalf("write settings: %v", err)
+	}
+}
+
+func TestContextMultiAgentPromotion(t *testing.T) {
+	dir := t.TempDir()
+	ws := "ws1"
+	require := true
+	writeTestSettings(t, dir, appSettings{RequireMultiAgentVerification: &require, ContextVerificationThreshold: 2})
+
+	entry, err := ProposeContext(dir, ws, ProposeContextRequest{
+		Title: "API base path", Content: "the api base is /api", Source: "agent-a", Permission: "readonly",
+	})
+	if err != nil {
+		t.Fatalf("propose: %v", err)
+	}
+	if entry.Promoted || entry.Status != "pending" {
+		t.Fatalf("multi-agent entry should start pending, got status=%s promoted=%v", entry.Status, entry.Promoted)
+	}
+
+	// first approval — still below threshold of 2
+	e, _ := VerifyContext(dir, ws, entry.ID, "agent-b", true, "looks right")
+	if e.Promoted {
+		t.Fatalf("one approval should not promote (threshold 2)")
+	}
+	// same agent voting again must NOT count twice
+	e, _ = VerifyContext(dir, ws, entry.ID, "agent-b", true, "still right")
+	if e.Promoted {
+		t.Fatalf("duplicate agent vote must not satisfy multi-agent gate")
+	}
+	// a second distinct agent approves — now promoted
+	e, _ = VerifyContext(dir, ws, entry.ID, "agent-c", true, "confirmed")
+	if !e.Promoted || e.Status != "verified" {
+		t.Fatalf("two distinct approvals should promote, got status=%s promoted=%v", e.Status, e.Promoted)
+	}
+
+	active, _ := GetActiveContext(dir, ws)
+	if active["active_count"].(int) != 1 {
+		t.Fatalf("expected 1 active entry, got %v", active["active_count"])
+	}
+}
+
+func TestContextSingleAgentMode(t *testing.T) {
+	dir := t.TempDir()
+	ws := "ws2"
+	disable := false
+	writeTestSettings(t, dir, appSettings{RequireMultiAgentVerification: &disable})
+
+	entry, err := ProposeContext(dir, ws, ProposeContextRequest{
+		Content: "single agent fact", Source: "solo",
+	})
+	if err != nil {
+		t.Fatalf("propose: %v", err)
+	}
+	if !entry.Promoted {
+		t.Fatalf("single-agent mode should promote immediately, got %v", entry.Status)
+	}
+
+	// per-proposal override: force multi-agent even though global is off
+	on := true
+	entry2, _ := ProposeContext(dir, ws, ProposeContextRequest{
+		Content: "needs review", Source: "solo", RequireVerification: &on,
+	})
+	if entry2.Promoted {
+		t.Fatalf("per-proposal RequireVerification=true should keep it pending")
+	}
+}
+
+func TestReadonlyEntryRejectsEdit(t *testing.T) {
+	dir := t.TempDir()
+	ws := "ws3"
+	disable := false
+	writeTestSettings(t, dir, appSettings{RequireMultiAgentVerification: &disable})
+
+	entry, _ := ProposeContext(dir, ws, ProposeContextRequest{
+		Content: "frozen fact", Source: "solo", Permission: "readonly",
+	})
+	if !entry.Promoted {
+		t.Fatalf("expected promoted in single-agent mode")
+	}
+	if _, err := UpdateContextContent(dir, ws, entry.ID, "tampered"); err == nil {
+		t.Fatalf("readonly verified entry must reject edits")
+	}
+
+	// a readwrite entry CAN be edited (and edit resets verification)
+	rw, _ := ProposeContext(dir, ws, ProposeContextRequest{
+		Content: "mutable", Source: "solo", Permission: "readwrite",
+	})
+	updated, err := UpdateContextContent(dir, ws, rw.ID, "new content")
+	if err != nil {
+		t.Fatalf("readwrite edit should succeed: %v", err)
+	}
+	if updated.Content != "new content" {
+		t.Fatalf("content not updated")
+	}
+}
+
+func TestPerRequestOverrideCannotLoosen(t *testing.T) {
+	dir := t.TempDir()
+	ws := "wsClamp"
+	require := true
+	writeTestSettings(t, dir, appSettings{RequireMultiAgentVerification: &require, ContextVerificationThreshold: 2})
+	// an untrusted proposer tries to self-promote by forcing single-agent mode
+	off := false
+	entry, err := ProposeContext(dir, ws, ProposeContextRequest{Content: "sneaky", Source: "attacker", RequireVerification: &off})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entry.Promoted || entry.Status != "pending" {
+		t.Fatalf("require_verification:false must NOT loosen a multi-agent-required policy; got status=%s promoted=%v", entry.Status, entry.Promoted)
+	}
+	// but it CAN tighten: when global is single-agent, forcing verification keeps it pending
+	disable := false
+	writeTestSettings(t, dir, appSettings{RequireMultiAgentVerification: &disable})
+	on := true
+	e2, _ := ProposeContext(dir, "wsClamp2", ProposeContextRequest{Content: "careful", Source: "a", RequireVerification: &on})
+	if e2.Promoted {
+		t.Fatalf("require_verification:true should tighten even when global is single-agent")
+	}
+}
+
+func TestContextRejectsPathTraversalID(t *testing.T) {
+	dir := t.TempDir()
+	for _, bad := range []string{"../../etc", "..", "a/b", "x\x00y", ""} {
+		if _, err := ProposeContext(dir, bad, ProposeContextRequest{Content: "x", Source: "s"}); err == nil {
+			t.Fatalf("expected rejection for workspace id %q", bad)
+		}
+		if _, err := ListContextEntries(dir, bad, ""); err == nil {
+			t.Fatalf("expected list rejection for workspace id %q", bad)
+		}
+	}
+	// a normal id is accepted
+	if _, err := ListContextEntries(dir, "co-titan_123", ""); err != nil {
+		t.Fatalf("valid id should be accepted: %v", err)
+	}
+}
+
+func TestProposerCannotSelfApproveMultiAgent(t *testing.T) {
+	dir := t.TempDir()
+	ws := "wsSelf"
+	require := true
+	writeTestSettings(t, dir, appSettings{RequireMultiAgentVerification: &require, ContextVerificationThreshold: 2})
+	e, _ := ProposeContext(dir, ws, ProposeContextRequest{Content: "x", Source: "author"})
+	// author verifies its OWN entry + one other agent — author must not count
+	VerifyContext(dir, ws, e.ID, "author", true, "")
+	got, _ := VerifyContext(dir, ws, e.ID, "other", true, "")
+	if got.Promoted {
+		t.Fatalf("author self-approval must not count toward a 2-distinct gate; got promoted with author+1")
+	}
+	// a second NON-author approval promotes
+	got2, _ := VerifyContext(dir, ws, e.ID, "other2", true, "")
+	if !got2.Promoted {
+		t.Fatalf("two non-author approvals should promote")
+	}
+}
+
+func TestDriftOnRecallFlagsStaleMemory(t *testing.T) {
+	dir := t.TempDir()
+	repo := t.TempDir()
+	ws := "wsDrift"
+	// a workspace snapshot pointing at the repo root, single-agent mode
+	if err := writeJSON(filepath.Join(dir, "workspaces", ws, "snapshot.json"),
+		map[string]any{"workspace": map[string]any{"workspace_id": ws, "root_path": repo}}); err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	disable := false
+	writeTestSettings(t, dir, appSettings{RequireMultiAgentVerification: &disable})
+
+	if err := os.WriteFile(filepath.Join(repo, "api.go"), []byte("v1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	entry, err := ProposeContext(dir, ws, ProposeContextRequest{
+		Content: "the api base is /api", Source: "a", Paths: []string{"api.go"},
+	})
+	if err != nil || !entry.Promoted {
+		t.Fatalf("propose+promote: %v %+v", err, entry)
+	}
+	if len(entry.PathHashes) != 1 {
+		t.Fatalf("expected a path-hash baseline, got %v", entry.PathHashes)
+	}
+
+	// fresh tree → not stale
+	active, _ := GetActiveContext(dir, ws)
+	if active["stale_count"].(int) != 0 {
+		t.Fatalf("expected 0 stale before edit, got %v", active["stale_count"])
+	}
+
+	// edit the referenced file → memory is now stale
+	if err := os.WriteFile(filepath.Join(repo, "api.go"), []byte("v2-changed"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	active, _ = GetActiveContext(dir, ws)
+	if active["stale_count"].(int) != 1 {
+		t.Fatalf("expected 1 stale after edit, got %v", active["stale_count"])
+	}
+	entries := active["entries"].([]ContextEntry)
+	if !entries[0].Stale || len(entries[0].StalePaths) != 1 || entries[0].StalePaths[0] != "api.go" {
+		t.Fatalf("entry not flagged stale: %+v", entries[0])
+	}
+}
+
+func TestOverlappingMemorySurfacesConflicts(t *testing.T) {
+	entries := []ContextEntry{
+		{ID: "a", Title: "uses /api", Paths: []string{"server.go"}},
+		{ID: "b", Title: "uses /v2", Paths: []string{"server.go", "router.go"}},
+		{ID: "c", Title: "unrelated", Paths: []string{"db.go"}},
+	}
+	conflicts := overlappingMemory(entries)
+	if len(conflicts) != 1 || conflicts[0].Path != "server.go" || len(conflicts[0].EntryIDs) != 2 {
+		t.Fatalf("expected one server.go conflict between a+b, got %+v", conflicts)
+	}
+}
+
+func TestRecallRanksAndDoesNotDump(t *testing.T) {
+	dir := t.TempDir()
+	ws := "wsRecall"
+	disable := false
+	writeTestSettings(t, dir, appSettings{RequireMultiAgentVerification: &disable})
+
+	// three verified memories on different topics.
+	mk := func(title, content string, paths []string) {
+		if _, err := ProposeContext(dir, ws, ProposeContextRequest{
+			Title: title, Content: content, Source: "a", Paths: paths,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mk("auth", "the bearer token is the agent identity", []string{"auth.go"})
+	mk("search", "search builds the symbol graph live", []string{"search.rs"})
+	mk("misc", "the changelog lives in docs", nil)
+
+	// query about auth returns the auth memory first, and NOT all three.
+	res, err := RecallContext(dir, ws, "how does bearer auth identity work", nil, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res["ranked"] != true {
+		t.Fatalf("expected ranked recall for a query")
+	}
+	entries := res["entries"].([]ContextEntry)
+	if len(entries) == 0 || entries[0].Title != "auth" {
+		t.Fatalf("expected auth memory ranked first, got %+v", entries)
+	}
+	if len(entries) >= 3 {
+		t.Fatalf("recall should NOT dump all 3 memories for a focused query, got %d", len(entries))
+	}
+
+	// path-focused recall returns the search memory.
+	res2, _ := RecallContext(dir, ws, "", []string{"search.rs"}, 5)
+	e2 := res2["entries"].([]ContextEntry)
+	if len(e2) != 1 || e2[0].Title != "search" {
+		t.Fatalf("expected only the search.rs memory by path, got %+v", e2)
+	}
+}
+
+func TestRejectionBlocksPromotion(t *testing.T) {
+	dir := t.TempDir()
+	ws := "ws4"
+	require := true
+	writeTestSettings(t, dir, appSettings{RequireMultiAgentVerification: &require, ContextVerificationThreshold: 2})
+	entry, _ := ProposeContext(dir, ws, ProposeContextRequest{Content: "doubtful", Source: "a"})
+	VerifyContext(dir, ws, entry.ID, "b", false, "wrong")
+	e, _ := VerifyContext(dir, ws, entry.ID, "c", false, "also wrong")
+	if e.Promoted || e.Status != "rejected" {
+		t.Fatalf("two rejections should reject, got status=%s", e.Status)
+	}
+}

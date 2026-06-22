@@ -1036,21 +1036,7 @@ func appendEntityActivity(
 		Details:     details,
 		CreatedAt:   nowUTC(),
 	}
-	path := filepath.Join(dataDir, "workspaces", workspaceID, "activity.jsonl")
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
-	handle, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
-	if err != nil {
-		return err
-	}
-	defer handle.Close()
-	payload, err := jsonMarshal(record)
-	if err != nil {
-		return err
-	}
-	_, err = handle.Write(append(payload, '\n'))
-	return err
+	return writeActivityRecord(dataDir, workspaceID, record)
 }
 
 func testGitHubIntegration(manifest AgentPluginManifest, settings map[string]any) *IntegrationTestResult {

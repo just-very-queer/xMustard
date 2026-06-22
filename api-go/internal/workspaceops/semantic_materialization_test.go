@@ -115,10 +115,12 @@ type fakeSemanticConn struct {
 	queryRows []pgx.Row
 	querySQL  []string
 	execSQL   []string
+	execArgs  [][]any
 }
 
-func (f *fakeSemanticConn) Exec(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
+func (f *fakeSemanticConn) Exec(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
 	f.execSQL = append(f.execSQL, sql)
+	f.execArgs = append(f.execArgs, args)
 	return pgconn.CommandTag{}, nil
 }
 

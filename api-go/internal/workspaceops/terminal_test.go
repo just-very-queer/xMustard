@@ -13,13 +13,13 @@ import (
 func TestTerminalOpenWriteReadResizeAndLogReplay(t *testing.T) {
 	dataDir, workspaceID, session := newTerminalTestSession(t, 100, 28)
 	t.Cleanup(func() {
-		_ = CloseTerminal(session.TerminalID)
+		_ = CloseTerminal(workspaceID, session.TerminalID)
 	})
 
-	if err := WriteTerminal(session.TerminalID, "IFS= read -r line; printf '__RAW__:%s:__ENDRAW__\\n' \"$line\"\n"); err != nil {
+	if err := WriteTerminal(workspaceID, session.TerminalID, "IFS= read -r line; printf '__RAW__:%s:__ENDRAW__\\n' \"$line\"\n"); err != nil {
 		t.Fatalf("write read command: %v", err)
 	}
-	if err := WriteTerminal(session.TerminalID, "   \n"); err != nil {
+	if err := WriteTerminal(workspaceID, session.TerminalID, "   \n"); err != nil {
 		t.Fatalf("write raw whitespace: %v", err)
 	}
 
@@ -31,7 +31,7 @@ func TestTerminalOpenWriteReadResizeAndLogReplay(t *testing.T) {
 		t.Fatalf("expected whitespace payload to round-trip, got %q", rawOutput)
 	}
 
-	if err := WriteTerminal(session.TerminalID, "printf '__TERM_OK__\\n'\n"); err != nil {
+	if err := WriteTerminal(workspaceID, session.TerminalID, "printf '__TERM_OK__\\n'\n"); err != nil {
 		t.Fatalf("write terminal marker: %v", err)
 	}
 	output, _ := waitForTerminal(t, dataDir, workspaceID, session.TerminalID, &offset, func(read *TerminalReadResult, content string) bool {
@@ -41,7 +41,7 @@ func TestTerminalOpenWriteReadResizeAndLogReplay(t *testing.T) {
 		t.Fatalf("expected terminal marker, got %q", output)
 	}
 
-	if err := WriteTerminal(session.TerminalID, "size=$(stty size); printf '__SIZE1__:%s:__END1__\\n' \"$size\"\n"); err != nil {
+	if err := WriteTerminal(workspaceID, session.TerminalID, "size=$(stty size); printf '__SIZE1__:%s:__END1__\\n' \"$size\"\n"); err != nil {
 		t.Fatalf("write size command: %v", err)
 	}
 	initialSizeOutput, _ := waitForTerminal(t, dataDir, workspaceID, session.TerminalID, &offset, func(read *TerminalReadResult, content string) bool {
@@ -51,10 +51,10 @@ func TestTerminalOpenWriteReadResizeAndLogReplay(t *testing.T) {
 		t.Fatalf("expected initial size 28 100, got %q from %q", got, initialSizeOutput)
 	}
 
-	if err := ResizeTerminal(session.TerminalID, 120, 40); err != nil {
+	if err := ResizeTerminal(workspaceID, session.TerminalID, 120, 40); err != nil {
 		t.Fatalf("resize terminal: %v", err)
 	}
-	if err := WriteTerminal(session.TerminalID, "size=$(stty size); printf '__SIZE2__:%s:__END2__\\n' \"$size\"\n"); err != nil {
+	if err := WriteTerminal(workspaceID, session.TerminalID, "size=$(stty size); printf '__SIZE2__:%s:__END2__\\n' \"$size\"\n"); err != nil {
 		t.Fatalf("write resized size command: %v", err)
 	}
 	resizedOutput, _ := waitForTerminal(t, dataDir, workspaceID, session.TerminalID, &offset, func(read *TerminalReadResult, content string) bool {
@@ -64,7 +64,7 @@ func TestTerminalOpenWriteReadResizeAndLogReplay(t *testing.T) {
 		t.Fatalf("expected resized size 40 120, got %q from %q", got, resizedOutput)
 	}
 
-	if err := CloseTerminal(session.TerminalID); err != nil {
+	if err := CloseTerminal(workspaceID, session.TerminalID); err != nil {
 		t.Fatalf("close terminal: %v", err)
 	}
 
@@ -83,7 +83,7 @@ func TestTerminalOpenWriteReadResizeAndLogReplay(t *testing.T) {
 func TestCloseTerminalSucceedsAfterNaturalExit(t *testing.T) {
 	dataDir, workspaceID, session := newTerminalTestSession(t, 100, 28)
 
-	if err := WriteTerminal(session.TerminalID, "exit\n"); err != nil {
+	if err := WriteTerminal(workspaceID, session.TerminalID, "exit\n"); err != nil {
 		t.Fatalf("write exit: %v", err)
 	}
 
@@ -95,7 +95,7 @@ func TestCloseTerminalSucceedsAfterNaturalExit(t *testing.T) {
 		t.Fatalf("expected terminal EOF after natural exit, got %#v", read)
 	}
 
-	if err := CloseTerminal(session.TerminalID); err != nil {
+	if err := CloseTerminal(workspaceID, session.TerminalID); err != nil {
 		t.Fatalf("close terminal after exit: %v", err)
 	}
 
@@ -115,7 +115,7 @@ func TestCloseTerminalTearsDownBackgroundChild(t *testing.T) {
 		"sh -c 'sleep 2; printf bg > \"$1\"' _ %s >/dev/null 2>&1 & printf '__BG_STARTED__\\n'\n",
 		shellQuote(childOutputPath),
 	)
-	if err := WriteTerminal(session.TerminalID, command); err != nil {
+	if err := WriteTerminal(workspaceID, session.TerminalID, command); err != nil {
 		t.Fatalf("write background command: %v", err)
 	}
 
@@ -124,7 +124,7 @@ func TestCloseTerminalTearsDownBackgroundChild(t *testing.T) {
 		return strings.Count(content, "__BG_STARTED__") >= 2
 	})
 
-	if err := CloseTerminal(session.TerminalID); err != nil {
+	if err := CloseTerminal(workspaceID, session.TerminalID); err != nil {
 		t.Fatalf("close terminal with background child: %v", err)
 	}
 

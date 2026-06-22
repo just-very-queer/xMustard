@@ -351,6 +351,14 @@ func ReadRepoContext(dataDir string, workspaceID string, baseRef string) (*RepoC
 	if err != nil {
 		return nil, err
 	}
+	runTargets, err := ReadRunTargets(dataDir, workspaceID)
+	if err != nil {
+		return nil, err
+	}
+	verifyTargets, err := ReadVerifyTargets(dataDir, workspaceID)
+	if err != nil {
+		return nil, err
+	}
 	referencePaths := map[string]struct{}{}
 	for _, path := range changePaths(impact.ChangedFiles, true) {
 		referencePaths[path] = struct{}{}
@@ -369,8 +377,8 @@ func ReadRepoContext(dataDir string, workspaceID string, baseRef string) (*RepoC
 		WorkspaceID:       workspaceID,
 		BaseRef:           impact.BaseRef,
 		Impact:            impact,
-		RunTargets:        []RepoContextTargetLink{},
-		VerifyTargets:     []RepoContextTargetLink{},
+		RunTargets:        buildRepoContextTargetLinks(runTargets, "Run"),
+		VerifyTargets:     buildRepoContextTargetLinks(verifyTargets, "Verification"),
 		PlanLinks:         planLinks,
 		RecentActivity:    activityLinks,
 		LatestAcceptedFix: latestFix,
@@ -540,6 +548,7 @@ func ListWorkspaceActivity(dataDir string, workspaceID string, issueID string, r
 
 	items := []activityRecord{}
 	scanner := bufio.NewScanner(handle)
+	scanner.Buffer(make([]byte, 0, 64*1024), maxActivityLineBytes)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
@@ -1098,13 +1107,19 @@ func normalizeImpactDerivationSource(source string) string {
 func normalizeWorkspaceFile(rootPath string, relativePath string) (string, error) {
 	normalized := strings.TrimPrefix(strings.TrimSpace(relativePath), "./")
 	if normalized == "" {
-		return "", fmt.Errorf("path is required")
+		return "", fmt.Errorf("path is required: %w", ErrInvalidInput)
 	}
 	root := filepath.Clean(rootPath)
 	target := filepath.Clean(filepath.Join(root, normalized))
 	rel, err := filepath.Rel(root, target)
 	if err != nil || strings.HasPrefix(rel, "..") || filepath.IsAbs(rel) {
-		return "", fmt.Errorf("path escapes workspace root")
+		return "", fmt.Errorf("path escapes workspace root: %w", ErrInvalidInput)
+	}
+	// The lexical check above is insufficient: a symlink *inside* the repo can point
+	// outside it, and the os.Stat below follows symlinks. Re-verify containment after
+	// symlink resolution so file explain/symbols/LSP can't read host files (XM-NEW-023).
+	if _, err := resolveWorkspacePath(rootPath, normalized); err != nil {
+		return "", fmt.Errorf("path escapes workspace root: %w", ErrInvalidInput)
 	}
 	info, err := os.Stat(target)
 	if err != nil {

@@ -3,10 +3,56 @@ use roxmltree::Document;
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use std::fs;
+use std::io::Read;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
+
+/// Run a spawned child to completion (or timeout), draining stdout+stderr on
+/// dedicated threads from the start. Without concurrent draining, a child that
+/// writes past the OS pipe buffer (~64 KiB) blocks on write while the parent waits
+/// for it to exit — a deadlock that only the timeout broke, spuriously killing a
+/// verbose-but-fast command and truncating its output (XM-NEW-015). Returns
+/// (exit_code, success, timed_out, stdout, stderr).
+fn drain_child_with_timeout(
+    mut child: Child,
+    timeout: Duration,
+    started_at: Instant,
+) -> std::io::Result<(Option<i32>, bool, bool, Vec<u8>, Vec<u8>)> {
+    let mut stdout_pipe = child.stdout.take();
+    let mut stderr_pipe = child.stderr.take();
+    let out_handle = thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(p) = stdout_pipe.as_mut() {
+            let _ = p.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let err_handle = thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(p) = stderr_pipe.as_mut() {
+            let _ = p.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let mut timed_out = false;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if started_at.elapsed() >= timeout {
+            let _ = child.kill();
+            timed_out = true;
+            break child.wait()?;
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    // the reader threads finish once the pipes reach EOF (child exited / killed).
+    let stdout = out_handle.join().unwrap_or_default();
+    let stderr = err_handle.join().unwrap_or_default();
+    Ok((status.code(), status.success(), timed_out, stdout, stderr))
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VerificationMilestone {
@@ -158,46 +204,25 @@ fn run_managed_command_with_program(
     let started_at = Instant::now();
     let timeout = Duration::from_secs(timeout_seconds.max(1));
 
-    let mut child = managed_command
+    let child = managed_command
         .current_dir(&resolved_cwd)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
 
-    loop {
-        if child.try_wait()?.is_some() {
-            let output = child.wait_with_output()?;
-            return Ok(build_managed_command_result(
-                display_command,
-                &resolved_cwd,
-                output.status.code(),
-                output.status.success(),
-                false,
-                started_at.elapsed(),
-                String::from_utf8_lossy(&output.stdout).as_ref(),
-                String::from_utf8_lossy(&output.stderr).as_ref(),
-                excerpt_limit,
-            ));
-        }
-
-        if started_at.elapsed() >= timeout {
-            let _ = child.kill();
-            let output = child.wait_with_output()?;
-            return Ok(build_managed_command_result(
-                display_command,
-                &resolved_cwd,
-                output.status.code(),
-                false,
-                true,
-                started_at.elapsed(),
-                String::from_utf8_lossy(&output.stdout).as_ref(),
-                String::from_utf8_lossy(&output.stderr).as_ref(),
-                excerpt_limit,
-            ));
-        }
-
-        thread::sleep(Duration::from_millis(50));
-    }
+    let (code, success, timed_out, stdout, stderr) =
+        drain_child_with_timeout(child, timeout, started_at)?;
+    Ok(build_managed_command_result(
+        display_command,
+        &resolved_cwd,
+        code,
+        success && !timed_out,
+        timed_out,
+        started_at.elapsed(),
+        String::from_utf8_lossy(&stdout).as_ref(),
+        String::from_utf8_lossy(&stderr).as_ref(),
+        excerpt_limit,
+    ))
 }
 
 pub fn run_verification_profile(
@@ -223,7 +248,8 @@ pub fn run_verification_profile(
 
     let mut coverage_command_result = None;
     let mut coverage_result = None;
-    let resolved_report_path = resolve_report_path(workspace_root, profile.coverage_report_path.as_deref());
+    let resolved_report_path =
+        resolve_report_path(workspace_root, profile.coverage_report_path.as_deref());
 
     let test_success = attempts.last().map(|item| item.success).unwrap_or(false);
     if test_success {
@@ -455,10 +481,16 @@ pub fn parse_cobertura_content(
 
     for class_node in root.descendants().filter(|node| node.has_tag_name("class")) {
         files_total += 1;
-        let file_name = class_node.attribute("filename").unwrap_or_default().to_string();
+        let file_name = class_node
+            .attribute("filename")
+            .unwrap_or_default()
+            .to_string();
         let mut class_lines = 0usize;
         let mut class_total = 0usize;
-        for line_node in class_node.descendants().filter(|node| node.has_tag_name("line")) {
+        for line_node in class_node
+            .descendants()
+            .filter(|node| node.has_tag_name("line"))
+        {
             let hits = line_node
                 .attribute("hits")
                 .and_then(|value| value.parse::<i64>().ok())
@@ -695,7 +727,10 @@ fn truncate_excerpt(text: &str, limit: usize) -> String {
     format!("{}\n...[truncated {} chars]", &text[..limit], omitted)
 }
 
-fn resolve_report_path(workspace_root: &Path, report_path: Option<&str>) -> Option<std::path::PathBuf> {
+fn resolve_report_path(
+    workspace_root: &Path,
+    report_path: Option<&str>,
+) -> Option<std::path::PathBuf> {
     let report_path = report_path?;
     let candidate = Path::new(report_path);
     if candidate.is_absolute() {
@@ -726,52 +761,30 @@ pub fn run_migration_verification(
         cmd
     };
 
-    let resolved_cwd = workspace_root.canonicalize().unwrap_or_else(|_| workspace_root.to_path_buf());
+    let resolved_cwd = workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_root.to_path_buf());
     let started_at = Instant::now();
     let timeout = Duration::from_secs(timeout_seconds.max(1));
 
-    let mut child = shell_cmd
+    let child = shell_cmd
         .current_dir(&resolved_cwd)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
 
-    loop {
-        if let Some(status) = child.try_wait()? {
-            let output = child.wait_with_output()?;
-            let exit_code = status.code();
-            let success = status.success();
-            let elapsed = started_at.elapsed();
-            return Ok(build_migration_result(
-                command,
-                &resolved_cwd,
-                exit_code,
-                success,
-                false,
-                elapsed,
-                String::from_utf8_lossy(&output.stdout).as_ref(),
-                String::from_utf8_lossy(&output.stderr).as_ref(),
-            ));
-        }
-
-        if started_at.elapsed() >= timeout {
-            let _ = child.kill();
-            let output = child.wait_with_output()?;
-            let elapsed = started_at.elapsed();
-            return Ok(build_migration_result(
-                command,
-                &resolved_cwd,
-                output.status.code(),
-                false,
-                true,
-                elapsed,
-                String::from_utf8_lossy(&output.stdout).as_ref(),
-                String::from_utf8_lossy(&output.stderr).as_ref(),
-            ));
-        }
-
-        thread::sleep(Duration::from_millis(50));
-    }
+    let (code, success, timed_out, stdout, stderr) =
+        drain_child_with_timeout(child, timeout, started_at)?;
+    Ok(build_migration_result(
+        command,
+        &resolved_cwd,
+        code,
+        success && !timed_out,
+        timed_out,
+        started_at.elapsed(),
+        String::from_utf8_lossy(&stdout).as_ref(),
+        String::from_utf8_lossy(&stderr).as_ref(),
+    ))
 }
 
 fn build_migration_result(
@@ -881,12 +894,38 @@ fn empty_coverage_result(
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_cobertura_content, parse_istanbul_content, parse_lcov_content, run_managed_command,
-        run_migration_verification, run_verification_command, run_verification_profile,
-        RustVerificationProfileInput,
+        RustVerificationProfileInput, parse_cobertura_content, parse_istanbul_content,
+        parse_lcov_content, run_managed_command, run_migration_verification,
+        run_verification_command, run_verification_profile,
     };
     use chrono::Utc;
     use tempfile::TempDir;
+
+    // A command that writes far more than the OS pipe buffer (~64 KiB) before exiting
+    // must still complete (concurrently drained), not be spuriously killed at the
+    // timeout — XM-NEW-015.
+    #[cfg(unix)]
+    #[test]
+    fn verbose_command_does_not_deadlock_or_timeout() {
+        let dir = TempDir::new().unwrap();
+        let args = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            // ~50k lines (~hundreds of KiB) — well past the pipe buffer.
+            "i=0; while [ $i -lt 50000 ]; do echo \"line $i padding padding\"; i=$((i+1)); done"
+                .to_string(),
+        ];
+        let res = run_managed_command(dir.path(), &args, 20).expect("run");
+        assert!(res.success, "verbose command should succeed: {:?}", res);
+        assert!(
+            !res.timed_out,
+            "verbose command must not be killed by the timeout"
+        );
+        assert!(
+            res.stdout_excerpt.contains("line 0"),
+            "stdout should be captured"
+        );
+    }
 
     #[test]
     fn parses_lcov_content() {
@@ -959,7 +998,8 @@ mod tests {
             "three".to_string(),
         ];
 
-        let result = run_managed_command(temp_dir.path(), &command_args, 2).expect("command should run");
+        let result =
+            run_managed_command(temp_dir.path(), &command_args, 2).expect("command should run");
 
         assert!(result.success);
         assert!(!result.timed_out);
@@ -971,7 +1011,8 @@ mod tests {
     #[test]
     fn rejects_empty_managed_command_args() {
         let temp_dir = TempDir::new().expect("temp dir");
-        let err = run_managed_command(temp_dir.path(), &[], 2).expect_err("empty command args should fail");
+        let err = run_managed_command(temp_dir.path(), &[], 2)
+            .expect_err("empty command args should fail");
 
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
@@ -980,7 +1021,8 @@ mod tests {
     #[test]
     fn runs_verification_command_successfully() {
         let temp_dir = TempDir::new().expect("temp dir");
-        let result = run_verification_command(temp_dir.path(), "printf 'ok\\n'", 2).expect("command should run");
+        let result = run_verification_command(temp_dir.path(), "printf 'ok\\n'", 2)
+            .expect("command should run");
 
         assert!(result.success);
         assert!(!result.timed_out);
@@ -1005,7 +1047,8 @@ mod tests {
     #[test]
     fn marks_timeout_for_long_running_verification_command() {
         let temp_dir = TempDir::new().expect("temp dir");
-        let result = run_verification_command(temp_dir.path(), "sleep 2", 1).expect("command should run");
+        let result =
+            run_verification_command(temp_dir.path(), "sleep 2", 1).expect("command should run");
 
         assert!(!result.success);
         assert!(result.timed_out);
@@ -1021,9 +1064,12 @@ mod tests {
             workspace_id: "workspace-1".to_string(),
             name: "Backend pytest".to_string(),
             description: "Verification profile".to_string(),
-            test_command: "if [ ! -f .attempt ]; then touch .attempt; exit 1; fi; printf 'tests ok\\n'".to_string(),
+            test_command:
+                "if [ ! -f .attempt ]; then touch .attempt; exit 1; fi; printf 'tests ok\\n'"
+                    .to_string(),
             coverage_command: Some(
-                "printf 'SF:src/app.py\\nDA:1,1\\nDA:2,0\\nend_of_record\\n' > coverage.info".to_string(),
+                "printf 'SF:src/app.py\\nDA:1,1\\nDA:2,0\\nend_of_record\\n' > coverage.info"
+                    .to_string(),
             ),
             coverage_report_path: Some("coverage.info".to_string()),
             coverage_format: "lcov".to_string(),
@@ -1035,39 +1081,68 @@ mod tests {
             updated_at: Utc::now().to_rfc3339(),
         };
 
-        let result = run_verification_profile(temp_dir.path(), &profile, Some("run-1"), Some("issue-1"))
-            .expect("profile should run");
+        let result =
+            run_verification_profile(temp_dir.path(), &profile, Some("run-1"), Some("issue-1"))
+                .expect("profile should run");
 
         assert!(result.success);
         assert_eq!(result.attempt_count, 2);
         assert_eq!(result.attempts.len(), 2);
         assert!(!result.attempts[0].success);
         assert!(result.attempts[1].success);
-        assert!(result.coverage_command_result.as_ref().is_some_and(|item| item.success));
-        assert_eq!(result.coverage_result.as_ref().map(|item| item.format.as_str()), Some("lcov"));
-        assert_eq!(result.coverage_result.as_ref().map(|item| item.lines_covered), Some(1));
+        assert!(
+            result
+                .coverage_command_result
+                .as_ref()
+                .is_some_and(|item| item.success)
+        );
+        assert_eq!(
+            result
+                .coverage_result
+                .as_ref()
+                .map(|item| item.format.as_str()),
+            Some("lcov")
+        );
+        assert_eq!(
+            result
+                .coverage_result
+                .as_ref()
+                .map(|item| item.lines_covered),
+            Some(1)
+        );
     }
 
     #[cfg(not(target_os = "windows"))]
     #[test]
     fn runs_migration_verification_and_returns_contract() {
         let temp_dir = TempDir::new().expect("temp dir");
-        let result = run_migration_verification(temp_dir.path(), "printf 'ok\\n'", 2).expect("should run");
+        let result =
+            run_migration_verification(temp_dir.path(), "printf 'ok\\n'", 2).expect("should run");
 
         assert!(result.risks.is_empty());
         assert!(result.recommended_contract.contains("\"success\":true"));
         assert!(result.recommended_contract.contains("exit_code\":"));
-        assert!(result.unix_constraints.contains(&"timeout_seconds_required".to_string()));
+        assert!(
+            result
+                .unix_constraints
+                .contains(&"timeout_seconds_required".to_string())
+        );
     }
 
     #[cfg(not(target_os = "windows"))]
     #[test]
     fn migration_verification_captures_failure_risks() {
         let temp_dir = TempDir::new().expect("temp dir");
-        let result = run_migration_verification(temp_dir.path(), "printf 'error\\n' 1>&2; exit 1", 2).expect("should run");
+        let result =
+            run_migration_verification(temp_dir.path(), "printf 'error\\n' 1>&2; exit 1", 2)
+                .expect("should run");
 
         assert!(result.risks.contains(&"exit_code_1".to_string()));
-        assert!(result.risks.contains(&"stderr_indicates_failure".to_string()));
+        assert!(
+            result
+                .risks
+                .contains(&"stderr_indicates_failure".to_string())
+        );
         assert!(result.recommended_contract.contains("\"success\":false"));
     }
 

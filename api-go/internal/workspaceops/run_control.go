@@ -22,6 +22,39 @@ import (
 var activeRunProcesses sync.Map
 var cancelledRunIDs sync.Map
 
+// maxRunOutputBytes caps the in-RAM tail of a managed run's combined output (the
+// full stream still goes to the run's .log file on disk).
+const maxRunOutputBytes = 1 << 20 // 1 MiB
+
+// boundedTail is an io.Writer that retains only the last `max` bytes written while
+// counting the total, so capturing a run's output can't grow the heap unbounded.
+type boundedTail struct {
+	buf       []byte
+	max       int
+	total     int64
+	truncated bool
+}
+
+func (b *boundedTail) Write(p []byte) (int, error) {
+	b.total += int64(len(p))
+	if b.max <= 0 {
+		return len(p), nil
+	}
+	if len(p) >= b.max {
+		b.buf = append(b.buf[:0], p[len(p)-b.max:]...)
+		b.truncated = true
+		return len(p), nil
+	}
+	if len(b.buf)+len(p) > b.max {
+		b.buf = b.buf[len(b.buf)+len(p)-b.max:]
+		b.truncated = true
+	}
+	b.buf = append(b.buf, p...)
+	return len(p), nil
+}
+
+func (b *boundedTail) String() string { return string(b.buf) }
+
 var defaultCodexModels = []string{
 	"gpt-5.4",
 	"gpt-5.4-mini",
@@ -45,6 +78,10 @@ type appSettings struct {
 	OpencodeModel  *string `json:"opencode_model"`
 	PostgresDSN    *string `json:"postgres_dsn"`
 	PostgresSchema string  `json:"postgres_schema"`
+	// Context-governance: whether shared-context entries must be verified by
+	// multiple agents before promotion, and how many distinct approvals are needed.
+	RequireMultiAgentVerification *bool `json:"require_multi_agent_verification,omitempty"`
+	ContextVerificationThreshold  int   `json:"context_verification_threshold,omitempty"`
 }
 
 type PlanApproveRequest struct {
@@ -55,37 +92,51 @@ type PlanRejectRequest struct {
 	Reason string `json:"reason"`
 }
 
+// terminalRunStatuses are end states a run cannot transition out of.
+func isTerminalRunStatus(status string) bool {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "cancelled", "completed", "failed", "error":
+		return true
+	}
+	return false
+}
+
 func CancelRun(dataDir string, workspaceID string, runID string) (*runRecord, error) {
 	run, err := ReadRun(dataDir, workspaceID, runID)
 	if err != nil {
 		return nil, err
 	}
+	// Idempotent: a run already in a terminal state cannot be cancelled, and must
+	// NEVER be signalled — its persisted PID may have been reused by an unrelated
+	// host process group since it completed (XM-NEW-006, host-safety).
+	if isTerminalRunStatus(run.Status) {
+		return run, nil
+	}
+	_, active := activeRunProcesses.Load(runID)
 	cancelledRunIDs.Store(runID, struct{}{})
 	if processValue, ok := activeRunProcesses.Load(runID); ok {
+		// signal only the LIVE supervised process handle — never a bare persisted
+		// PID (which the OS may have reused).
 		if cmd, ok := processValue.(*exec.Cmd); ok && cmd.Process != nil {
 			terminateManagedRunCommand(cmd)
-		}
-	} else if run.PID != nil && *run.PID > 0 {
-		process, findErr := os.FindProcess(*run.PID)
-		if findErr == nil && process != nil {
-			signalErr := signalManagedRunPID(*run.PID)
-			if signalErr != nil && !errors.Is(signalErr, os.ErrProcessDone) {
-				signalErr = process.Signal(syscall.SIGTERM)
-				if signalErr != nil && !errors.Is(signalErr, os.ErrProcessDone) {
-					return nil, signalErr
-				}
-			}
 		}
 	}
 	completedAt := nowUTC()
 	exitCode := -15
 	run.Status = "cancelled"
 	run.CompletedAt = &completedAt
+	run.PID = nil // clear the PID so nothing can signal it after reap
 	if run.ExitCode == nil {
 		run.ExitCode = &exitCode
 	}
 	if err := saveRunRecord(dataDir, *run); err != nil {
 		return nil, err
+	}
+	// A run that was never active is not reaped by runManagedProcess; the durable
+	// cancelled status (saved above) is the authoritative signal, so drop the
+	// in-memory marker to keep cancelledRunIDs from accumulating.
+	if !active {
+		cancelledRunIDs.Delete(runID)
 	}
 	if err := appendRunActivityWithActor(
 		dataDir,
@@ -106,6 +157,12 @@ func RetryRun(dataDir string, workspaceID string, runID string) (*runRecord, err
 	run, err := ReadRun(dataDir, workspaceID, runID)
 	if err != nil {
 		return nil, err
+	}
+	// Only retry a run that has reached a terminal state. Retrying a queued/
+	// planning/running run would start a second worker against the same worktree,
+	// spend tokens twice, and race on files/verification records (XM-NEW-007).
+	if !isTerminalRunStatus(run.Status) {
+		return nil, fmt.Errorf("cannot retry a run in status %q; cancel it first", run.Status)
 	}
 	snapshot, err := loadSnapshot(dataDir, workspaceID)
 	if err != nil {
@@ -338,8 +395,11 @@ func runManagedProcess(dataDir string, run runRecord, workspaceRoot string) {
 	command.Dir = workspaceRoot
 	command.Stdin = nil
 	configureManagedRunCommand(command)
-	var output strings.Builder
-	multi := io.MultiWriter(logHandle, &output)
+	// The full stream is persisted to the .log file on disk (logHandle); the in-RAM
+	// capture used for the output snapshot + summary is a bounded tail, so a chatty
+	// long-running agent can't grow the API's heap without limit (XM-POST-005).
+	output := &boundedTail{max: maxRunOutputBytes}
+	multi := io.MultiWriter(logHandle, output)
 	command.Stdout = multi
 	command.Stderr = multi
 	if err := command.Start(); err != nil {
@@ -359,6 +419,10 @@ func runManagedProcess(dataDir string, run runRecord, workspaceRoot string) {
 	combinedOutput := output.String()
 	_ = os.WriteFile(run.OutputPath, []byte(combinedOutput), 0o644)
 	summary := summarizeRunOutput(run.Runtime, combinedOutput)
+	// surface the true byte count + whether the in-RAM snapshot was truncated (the
+	// full stream remains in the .log file).
+	summary["output_bytes"] = output.total
+	summary["output_truncated"] = output.truncated
 	persisted, _ = loadRun(dataDir, run.WorkspaceID, run.RunID)
 	finalStatus := "completed"
 	if _, cancelled := cancelledRunIDs.Load(run.RunID); cancelled || (persisted != nil && persisted.Status == "cancelled") {
@@ -375,6 +439,7 @@ func runManagedProcess(dataDir string, run runRecord, workspaceRoot string) {
 	final.Status = finalStatus
 	final.CompletedAt = &completedAt
 	final.ExitCode = &exitCode
+	final.PID = nil // reaped: clear the PID so a later cancel can't signal a reused PID
 	final.Summary = summary
 	if waitErr != nil && finalStatus == "failed" {
 		errText := waitErr.Error()
@@ -957,7 +1022,14 @@ Respond with a JSON object containing:
 }
 
 func saveRunRecord(dataDir string, run runRecord) error {
-	return writeJSON(filepath.Join(dataDir, "workspaces", run.WorkspaceID, "runs", run.RunID+".json"), run)
+	if err := writeJSON(filepath.Join(dataDir, "workspaces", run.WorkspaceID, "runs", run.RunID+".json"), run); err != nil {
+		return err
+	}
+	// JSON is the source of truth (written above). Mirror into the queryable PG
+	// index inline so run plans/status are queryable immediately — best-effort,
+	// never fails the mutation (no-op unless XMUSTARD_PG_DSN is set).
+	pgInlineUpsertRun(run)
+	return nil
 }
 
 func appendRunActivityWithActor(dataDir string, workspaceID string, issueID string, runID string, action string, summary string, actor activityActor, details map[string]any) error {
@@ -975,23 +1047,7 @@ func appendRunActivityWithActor(dataDir string, workspaceID string, issueID stri
 	}
 	record.IssueID = &issueID
 	record.RunID = &runID
-	path := filepath.Join(dataDir, "workspaces", workspaceID, "activity.jsonl")
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
-	handle, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
-	if err != nil {
-		return err
-	}
-	defer handle.Close()
-	payload, err := jsonMarshal(record)
-	if err != nil {
-		return err
-	}
-	if _, err := handle.Write(append(payload, '\n')); err != nil {
-		return err
-	}
-	return nil
+	return writeActivityRecord(dataDir, workspaceID, record)
 }
 
 func summarizeRunOutput(runtime string, output string) map[string]any {

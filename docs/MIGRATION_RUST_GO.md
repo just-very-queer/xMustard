@@ -222,7 +222,14 @@ That boundary work is now live for three concrete slices:
 - FastAPI no longer registers those semantic-search/materialization HTTP handlers in `backend/app/main.py`, so Python is no longer the live request-path owner for this route group.
 - The `semantic-index` operator flow now runs through the Go `xmustard-ops` binary for plan/run/status plus baseline freshness/persistence, so Python is no longer the authority path for that shipped CLI slice.
 - The Go `xmustard-ops` binary now also exposes shipped workspace and Postgres actions for:
+  - `workspace load`
   - `workspace changed-symbols`
+  - `workspace project-info`
+  - `workspace run-targets`
+  - `workspace verify-targets`
+  - `workspace verification-outcomes`
+  - `workspace verification-profile-save`
+  - `workspace verification-profile-run`
   - `postgres plan`
   - `postgres render`
   - `postgres bootstrap`
@@ -236,6 +243,7 @@ That boundary work is now live for three concrete slices:
   - `workspace postgres-materialize-workspace-symbols`
   - `workspace postgres-materialize-semantic-search`
 - The Python Typer CLI keeps the old command names for compatibility, but those commands now delegate to `go run ./cmd/xmustard-ops ...` for the migrated workspace/Postgres/semantic surfaces instead of calling `TrackerService` as the authority.
+- Python remains a compatibility reader for the migrated runtime/project-truth surfaces; `project-info`, raw run targets, raw verify targets, verification outcomes, and verification-profile operator actions are Go-owned through `xmustard-ops` and the Go API shell.
 - FastAPI no longer registers `GET /api/workspaces/{workspace_id}/path-symbols` or `GET /api/workspaces/{workspace_id}/explain-path`; those single-path semantic reads are Go HTTP delivery over Rust semantic-core output.
 - Python no longer exposes a public `TrackerService.read_changed_symbols(...)` CLI authority seam; the compatibility CLI delegates `changed-symbols` to Go, which derives it from Rust-backed impact.
 - Public `TrackerService` compatibility methods for Postgres foundation, Postgres semantic materialization, semantic-index plan/run/status, repo-intelligence reads, path symbols, explainer, semantic search, and retrieval now delegate to Go `xmustard-ops`; the old Python private helpers for those migrated slices have been removed from `TrackerService`.

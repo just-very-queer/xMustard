@@ -109,41 +109,62 @@ func ScanWorkspace(dataDir string, workspaceID string) (*workspaceSnapshot, erro
 	if err != nil {
 		return nil, err
 	}
+	savedVerificationProfiles, err := loadSavedVerificationProfiles(dataDir, workspaceID)
+	if err != nil {
+		return nil, err
+	}
+	runTargets := discoverRunTargetsForRoot(root)
+	verifyTargets := discoverVerifyTargetsForRoot(root, savedVerificationProfiles)
+	projectInfo := buildProjectInfo(workspaceID, root, runTargets, verifyTargets, savedVerificationProfiles)
+	projectInfo.SourceMode = projectInfoSourceModeSnapshot
+	runTargets = applyProjectCommandOwnership(runTargets, projectInfo.StaticTruth.RunTargets)
+	verifyTargets = applyProjectCommandOwnership(verifyTargets, projectInfo.StaticTruth.VerifyTargets)
 	treeSummary := summarizeTree(root)
 	now := nowUTC()
+	runTargets = stampRepoTargetsTruth(runTargets, repoTargetTruthSourceSnapshotScan, now, true)
+	verifyTargets = stampRepoTargetsTruth(verifyTargets, repoTargetTruthSourceSnapshotScan, now, true)
 	workspace.LatestScanAt = ptr(now)
 	workspace.UpdatedAt = ptr(now)
 	snapshot := &workspaceSnapshot{
 		ScannerVersion: scannerVersion,
 		Workspace:      workspace,
 		Summary: map[string]int{
-			"issues_total":          len(issues),
-			"issues_fixed":          countIssuesFixed(issues),
-			"issues_open":           countIssuesOpen(issues),
-			"review_ready_total":    countReviewReady(issues),
-			"review_queue_total":    countReviewQueue(issues),
-			"signals_total":         len(signals),
-			"signals_promoted":      countSignalsPromoted(signals),
-			"drift_total":           countDriftFlags(issues),
-			"sources_total":         len(sources),
-			"tracker_issues_total":  len(trackerIssues),
-			"fixes_total":           len(fixes),
-			"runbooks_total":        len(runbooks),
-			"ticket_contexts_total": len(ticketContexts),
-			"threat_models_total":   len(threatModels),
-			"repo_map_files":        repoMap.TotalFiles,
-			"tree_files":            treeSummary["files"],
-			"tree_directories":      treeSummary["directories"],
+			"issues_total":                len(issues),
+			"issues_fixed":                countIssuesFixed(issues),
+			"issues_open":                 countIssuesOpen(issues),
+			"review_ready_total":          countReviewReady(issues),
+			"review_queue_total":          countReviewQueue(issues),
+			"signals_total":               len(signals),
+			"signals_promoted":            countSignalsPromoted(signals),
+			"drift_total":                 countDriftFlags(issues),
+			"sources_total":               len(sources),
+			"tracker_issues_total":        len(trackerIssues),
+			"fixes_total":                 len(fixes),
+			"runbooks_total":              len(runbooks),
+			"verification_profiles_total": len(verificationProfiles),
+			"ticket_contexts_total":       len(ticketContexts),
+			"threat_models_total":         len(threatModels),
+			"repo_map_files":              repoMap.TotalFiles,
+			"tree_files":                  treeSummary["files"],
+			"tree_directories":            treeSummary["directories"],
+			"run_targets_total":           len(runTargets),
+			"verify_targets_total":        len(verifyTargets),
 		},
 		Issues:         issues,
 		Signals:        signals,
 		Sources:        sources,
 		DriftSummary:   driftSummary,
 		Runtimes:       toSnapshotRuntimes(runtimes),
+		RunTargets:     runTargets,
+		VerifyTargets:  verifyTargets,
+		ProjectInfo:    projectInfo,
 		LatestLedger:   optionalString(ledgerPath),
 		LatestVerdicts: optionalString(lastString(verdictPaths)),
 		GeneratedAt:    now,
 	}
+	freshnessContext := buildRepoTargetFreshnessContext(root, snapshot, savedVerificationProfiles)
+	snapshot.RunTargets = annotateRepoTargetsFreshness(snapshot.RunTargets, freshnessContext)
+	snapshot.VerifyTargets = annotateRepoTargetsFreshness(snapshot.VerifyTargets, freshnessContext)
 	if err := saveWorkspaceRecord(dataDir, workspace); err != nil {
 		return nil, err
 	}

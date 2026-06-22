@@ -91,6 +91,9 @@ import { AgentDock } from './components/AgentDock'
 import { DetailPane } from './components/DetailPane'
 import { ExecutionPane } from './components/ExecutionPane'
 import { QueuePane } from './components/QueuePane'
+import { Cockpit } from './components/Cockpit'
+import { AdminPanel } from './components/AdminPanel'
+import { KanbanBoard } from './components/KanbanBoard'
 import type { QueuePreset } from './components/QueuePresetStrip'
 import { WorkspaceSidebar } from './components/WorkspaceSidebar'
 import type {
@@ -2215,7 +2218,7 @@ function App() {
   async function handleSendTerminal() {
     if (!terminalId) return
     try {
-      await writeTerminal(terminalId, `${terminalInput}\n`)
+      await writeTerminal(terminalId, workspaceId ?? '', `${terminalInput}\n`)
       setTerminalInput('')
     } catch (nextError) {
       setError(nextError instanceof Error ? nextError.message : String(nextError))
@@ -2225,7 +2228,7 @@ function App() {
   async function handleCloseTerminal() {
     if (!terminalId) return
     try {
-      await closeTerminal(terminalId)
+      await closeTerminal(terminalId, workspaceId ?? '')
       setTerminalId(null)
     } catch (nextError) {
       setError(nextError instanceof Error ? nextError.message : String(nextError))
@@ -2390,6 +2393,13 @@ function App() {
             ) : null}
 
             <section className={`board-grid ${executionOpen ? 'board-grid-with-execution' : 'board-grid-focus'}`}>
+              {activeView === 'cockpit' ? (
+                <Cockpit workspaceId={workspaceId ?? ''} />
+              ) : activeView === 'admin' ? (
+                <AdminPanel />
+              ) : activeView === 'kanban' ? (
+                <KanbanBoard issues={issueQueue} onSelect={setSelectedIssueId} />
+              ) : (
               <QueuePane
                 activeView={activeView}
                 issueQueue={issueQueue}
@@ -2459,6 +2469,7 @@ function App() {
                 onActivityActorKindFilterChange={setActivityActorKindFilter}
                 onNavigateTree={setTreePath}
               />
+              )}
 
               <DetailPane
                 activeView={activeView}
@@ -2632,6 +2643,7 @@ function App() {
 
               {executionOpen ? (
                 <ExecutionPane
+                  workspaceId={snapshot?.workspace.workspace_id ?? null}
                   runtime={runtime}
                   model={model}
                   runtimeModels={runtimeModels}

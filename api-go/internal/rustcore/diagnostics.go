@@ -1,11 +1,10 @@
 package rustcore
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"os/exec"
+	"os"
 )
 
 type NormalizedDiagnostic struct {
@@ -35,36 +34,152 @@ type DiagnosticsBatch struct {
 	GeneratedAt     string                 `json:"generated_at"`
 }
 
+type DiagnosticsReplayArchive struct {
+	WorkspaceID      string         `json:"workspace_id"`
+	SourceKind       string         `json:"source_kind"`
+	SourceName       string         `json:"source_name"`
+	RawPayload       any            `json:"raw_payload"`
+	RawPayloadSHA256 string         `json:"raw_payload_sha256"`
+	RawPayloadBytes  int            `json:"raw_payload_bytes"`
+	ServerProvenance map[string]any `json:"server_provenance"`
+	ReplayReadiness  string         `json:"replay_readiness"`
+	Warnings         []string       `json:"warnings"`
+	GeneratedAt      string         `json:"generated_at"`
+}
+
+type DiagnosticSymbolCandidate struct {
+	SymbolID       int64   `json:"symbol_id"`
+	Path           string  `json:"path"`
+	Symbol         string  `json:"symbol"`
+	Kind           string  `json:"kind"`
+	Language       *string `json:"language,omitempty"`
+	LineStart      *int    `json:"line_start,omitempty"`
+	LineEnd        *int    `json:"line_end,omitempty"`
+	EnclosingScope *string `json:"enclosing_scope,omitempty"`
+	SignatureText  *string `json:"signature_text,omitempty"`
+}
+
+type DiagnosticLinkedSymbol struct {
+	SymbolID        int64   `json:"symbol_id"`
+	Path            string  `json:"path"`
+	Symbol          string  `json:"symbol"`
+	Kind            string  `json:"kind"`
+	Language        *string `json:"language,omitempty"`
+	LineStart       *int    `json:"line_start,omitempty"`
+	LineEnd         *int    `json:"line_end,omitempty"`
+	EnclosingScope  *string `json:"enclosing_scope,omitempty"`
+	SignatureText   *string `json:"signature_text,omitempty"`
+	LinkStrategy    string  `json:"link_strategy"`
+	EvidenceSource  string  `json:"evidence_source"`
+	SelectionReason string  `json:"selection_reason"`
+}
+
+type DiagnosticSymbolLinkResult struct {
+	WorkspaceID           string                  `json:"workspace_id"`
+	Path                  string                  `json:"path"`
+	DiagnosticFingerprint string                  `json:"diagnostic_fingerprint"`
+	LinkedSymbol          *DiagnosticLinkedSymbol `json:"linked_symbol,omitempty"`
+	CandidateCount        int                     `json:"candidate_count"`
+	EvidenceSource        string                  `json:"evidence_source"`
+	SelectionReason       string                  `json:"selection_reason"`
+	Warnings              []string                `json:"warnings"`
+	GeneratedAt           string                  `json:"generated_at"`
+}
+
 func NormalizeDiagnostics(ctx context.Context, workspaceID string, repoRoot string, inputJSONPath string, sourceKind string, sourceName string) (*DiagnosticsBatch, error) {
-	cmd := exec.CommandContext(
-		ctx,
-		"cargo",
-		"run",
-		"--quiet",
-		"--bin",
-		"xmustard-core",
-		"--",
-		"normalize-diagnostics",
-		workspaceID,
-		repoRoot,
-		inputJSONPath,
-		sourceKind,
-		sourceName,
-	)
-	cmd.Dir = rustCoreDir()
+	stdout, err := runCoreCtx(ctx, "normalize-diagnostics", workspaceID, repoRoot, inputJSONPath, sourceKind, sourceName)
+	if err != nil {
+		return nil, err
+	}
+	var result DiagnosticsBatch
+	if err := json.Unmarshal(stdout, &result); err != nil {
+		return nil, fmt.Errorf("decode rust-core diagnostics: %w", err)
+	}
+	return &result, nil
+}
 
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+func NormalizeDiagnosticsPayload(ctx context.Context, workspaceID string, repoRoot string, payload []byte, sourceKind string, sourceName string) (*DiagnosticsBatch, error) {
+	inputFile, err := os.CreateTemp("", "xmustard-live-diagnostics-*.json")
+	if err != nil {
+		return nil, fmt.Errorf("create live diagnostics temp file: %w", err)
+	}
+	inputPath := inputFile.Name()
+	defer os.Remove(inputPath)
+	if _, err := inputFile.Write(payload); err != nil {
+		inputFile.Close()
+		return nil, fmt.Errorf("write live diagnostics payload: %w", err)
+	}
+	if err := inputFile.Close(); err != nil {
+		return nil, fmt.Errorf("close live diagnostics payload: %w", err)
+	}
+	return NormalizeDiagnostics(ctx, workspaceID, repoRoot, inputPath, sourceKind, sourceName)
+}
 
-	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("rust-core normalize-diagnostics failed: %w: %s", err, stderr.String())
+func ArchiveDiagnosticsPayload(ctx context.Context, workspaceID string, inputJSONPath string, sourceKind string, sourceName string, serverProvenance map[string]any) (*DiagnosticsReplayArchive, error) {
+	provenancePayload, err := json.Marshal(serverProvenance)
+	if err != nil {
+		return nil, fmt.Errorf("encode diagnostics server provenance: %w", err)
+	}
+	provenanceFile, err := os.CreateTemp("", "xmustard-diagnostics-server-provenance-*.json")
+	if err != nil {
+		return nil, fmt.Errorf("create diagnostics server provenance temp file: %w", err)
+	}
+	provenancePath := provenanceFile.Name()
+	defer os.Remove(provenancePath)
+	if _, err := provenanceFile.Write(provenancePayload); err != nil {
+		provenanceFile.Close()
+		return nil, fmt.Errorf("write diagnostics server provenance: %w", err)
+	}
+	if err := provenanceFile.Close(); err != nil {
+		return nil, fmt.Errorf("close diagnostics server provenance: %w", err)
 	}
 
-	var result DiagnosticsBatch
-	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
-		return nil, fmt.Errorf("decode rust-core diagnostics: %w", err)
+	stdout, err := runCoreCtx(ctx, "archive-diagnostics-payload", workspaceID, inputJSONPath, sourceKind, sourceName, provenancePath)
+	if err != nil {
+		return nil, err
+	}
+	var result DiagnosticsReplayArchive
+	if err := json.Unmarshal(stdout, &result); err != nil {
+		return nil, fmt.Errorf("decode rust-core diagnostics replay archive: %w", err)
+	}
+	return &result, nil
+}
+
+func LinkDiagnosticSymbol(
+	ctx context.Context,
+	workspaceID string,
+	diagnosticPath string,
+	startLine int,
+	endLine int,
+	diagnosticFingerprint string,
+	candidates []DiagnosticSymbolCandidate,
+) (*DiagnosticSymbolLinkResult, error) {
+	payload, err := json.Marshal(candidates)
+	if err != nil {
+		return nil, fmt.Errorf("encode diagnostic symbol candidates: %w", err)
+	}
+	inputFile, err := os.CreateTemp("", "xmustard-diagnostic-symbol-candidates-*.json")
+	if err != nil {
+		return nil, fmt.Errorf("create diagnostic symbol candidates temp file: %w", err)
+	}
+	inputPath := inputFile.Name()
+	defer os.Remove(inputPath)
+	if _, err := inputFile.Write(payload); err != nil {
+		inputFile.Close()
+		return nil, fmt.Errorf("write diagnostic symbol candidates: %w", err)
+	}
+	if err := inputFile.Close(); err != nil {
+		return nil, fmt.Errorf("close diagnostic symbol candidates: %w", err)
+	}
+
+	stdout, err := runCoreCtx(ctx, "link-diagnostic-symbol", workspaceID, diagnosticPath,
+		fmt.Sprintf("%d", startLine), fmt.Sprintf("%d", endLine), diagnosticFingerprint, inputPath)
+	if err != nil {
+		return nil, err
+	}
+	var result DiagnosticSymbolLinkResult
+	if err := json.Unmarshal(stdout, &result); err != nil {
+		return nil, fmt.Errorf("decode rust-core diagnostic symbol link: %w", err)
 	}
 	return &result, nil
 }

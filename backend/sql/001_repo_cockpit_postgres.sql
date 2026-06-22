@@ -249,9 +249,19 @@ create table if not exists {{schema}}.issue_artifacts (
 create table if not exists {{schema}}.diagnostic_runs (
     diagnostic_run_id text primary key,
     workspace_id text not null references {{schema}}.workspaces(workspace_id) on delete cascade,
+    issue_id text,
+    run_id text references {{schema}}.run_records(run_id) on delete set null,
     source_kind text not null default 'lsp',
     source_name text not null,
     batch_fingerprint text not null,
+    raw_payload_json jsonb,
+    raw_payload_sha256 text,
+    raw_payload_bytes integer not null default 0,
+    server_provenance_json jsonb,
+    normalization_contract text not null default 'diagnostics.normalized.v1',
+    replay_readiness text,
+    replay_warnings_json jsonb not null default '[]'::jsonb,
+    semantic_baseline_json jsonb,
     head_sha text,
     dirty_files integer not null default 0,
     worktree_dirty boolean not null default false,
@@ -285,11 +295,24 @@ create table if not exists {{schema}}.diagnostics (
     head_sha text,
     content_hash text,
     symbol_id bigint references {{schema}}.symbols(symbol_id) on delete set null,
+    link_status text not null default 'unevaluated',
+    linked_symbol_json jsonb,
+    link_context_json jsonb,
     observed_at timestamptz not null default now(),
     generated_at timestamptz not null default now(),
     unique (workspace_id, diagnostic_run_id, fingerprint)
 );
 
+alter table {{schema}}.diagnostic_runs add column if not exists raw_payload_json jsonb;
+alter table {{schema}}.diagnostic_runs add column if not exists raw_payload_sha256 text;
+alter table {{schema}}.diagnostic_runs add column if not exists raw_payload_bytes integer not null default 0;
+alter table {{schema}}.diagnostic_runs add column if not exists server_provenance_json jsonb;
+alter table {{schema}}.diagnostic_runs add column if not exists normalization_contract text not null default 'diagnostics.normalized.v1';
+alter table {{schema}}.diagnostic_runs add column if not exists replay_readiness text;
+alter table {{schema}}.diagnostic_runs add column if not exists replay_warnings_json jsonb not null default '[]'::jsonb;
+alter table {{schema}}.diagnostic_runs add column if not exists semantic_baseline_json jsonb;
+alter table {{schema}}.diagnostic_runs add column if not exists issue_id text;
+alter table {{schema}}.diagnostic_runs add column if not exists run_id text references {{schema}}.run_records(run_id) on delete set null;
 alter table {{schema}}.diagnostics add column if not exists diagnostic_run_id text;
 alter table {{schema}}.diagnostics add column if not exists file_id bigint;
 alter table {{schema}}.diagnostics add column if not exists range_start_line integer;
@@ -302,7 +325,13 @@ alter table {{schema}}.diagnostics add column if not exists rule_code text;
 alter table {{schema}}.diagnostics add column if not exists fingerprint text;
 alter table {{schema}}.diagnostics add column if not exists head_sha text;
 alter table {{schema}}.diagnostics add column if not exists content_hash text;
+alter table {{schema}}.diagnostics add column if not exists link_status text default 'unevaluated';
+alter table {{schema}}.diagnostics add column if not exists linked_symbol_json jsonb;
+alter table {{schema}}.diagnostics add column if not exists link_context_json jsonb;
 alter table {{schema}}.diagnostics add column if not exists generated_at timestamptz;
+update {{schema}}.diagnostics set link_status = 'unevaluated' where link_status is null;
+alter table {{schema}}.diagnostics alter column link_status set default 'unevaluated';
+alter table {{schema}}.diagnostics alter column link_status set not null;
 alter table {{schema}}.diagnostics alter column source set default 'lsp';
 
 create index if not exists workspaces_root_path_idx on {{schema}}.workspaces(root_path);
@@ -317,6 +346,7 @@ create index if not exists semantic_matches_workspace_path_idx on {{schema}}.sem
 create index if not exists semantic_matches_query_idx on {{schema}}.semantic_matches(query_id);
 create index if not exists semantic_index_runs_workspace_surface_idx on {{schema}}.semantic_index_runs(workspace_id, surface, created_at desc);
 create index if not exists diagnostic_runs_workspace_idx on {{schema}}.diagnostic_runs(workspace_id, created_at desc);
+create index if not exists diagnostic_runs_workspace_run_idx on {{schema}}.diagnostic_runs(workspace_id, run_id, created_at desc);
 create index if not exists activity_events_workspace_idx on {{schema}}.activity_events(workspace_id, created_at desc);
 create index if not exists run_records_workspace_idx on {{schema}}.run_records(workspace_id, created_at desc);
 create index if not exists run_plans_workspace_idx on {{schema}}.run_plans(workspace_id, issue_id, updated_at desc);

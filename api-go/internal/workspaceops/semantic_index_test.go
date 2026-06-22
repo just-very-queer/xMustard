@@ -192,7 +192,7 @@ func writeSemanticIndexFixture(t *testing.T) (string, string, string) {
 		t.Fatalf("write workspaces: %v", err)
 	}
 	snapshot := workspaceSnapshot{
-		ScannerVersion: 2,
+		ScannerVersion: scannerVersion,
 		Workspace: workspaceRecord{
 			WorkspaceID: workspaceID,
 			Name:        "repo",

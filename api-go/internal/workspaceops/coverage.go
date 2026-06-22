@@ -198,6 +198,7 @@ func loadSnapshot(dataDir string, workspaceID string) (*workspaceSnapshot, error
 	if err := readJSON(snapshotPath, &snapshot); err != nil {
 		return nil, fmt.Errorf("load snapshot: %w", err)
 	}
+	snapshot.Issues = normalizeIssueSlices(snapshot.Issues)
 	return &snapshot, nil
 }
 

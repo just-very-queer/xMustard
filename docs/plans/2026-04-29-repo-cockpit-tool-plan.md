@@ -253,7 +253,7 @@ Phase naming correction:
 - The thing we later called "Phase 3" in the migration stream was not this original LSP phase.
 - It became a Python-exit / ownership-shift tranche for semantic, Postgres, and repo-intelligence surfaces.
 - That scoped migration target is effectively done in `docs/plans/2026-05-02-python-exit-map.md`.
-- This original Phase 3 remains the LSP and diagnostics phase and is still not done.
+- This original Phase 3 remains the LSP and diagnostics phase.
 
 Goal:
 
@@ -271,6 +271,13 @@ Done when:
 
 - agents can ask for definitions, references, and diagnostics through xMustard
 - diagnostics persist and can be linked to repo state and runs
+
+Completion-pass audit on 2026-05-06:
+
+- Go now serves direct definitions, references, document symbols, workspace symbols, live diagnostics, diagnostics status, diagnostics readback, and diagnostics materialization surfaces.
+- Rust owns diagnostics normalization plus conservative diagnostic-to-symbol link decisions behind those Go delivery surfaces.
+- Postgres persists diagnostic runs and rows with repo-state anchors, replay provenance, semantic baseline context, linked symbol snapshots, link context, and durable run linkage.
+- Blunt status: the original Phase 3 done bar is now satisfied from shipped code. Context-packet enrichment from LSP answers remains a follow-on ergonomics improvement, not the done-bar blocker.
 
 ## Phase 4: Runtime And Project Discovery
 
@@ -290,6 +297,13 @@ Build:
 Done when:
 
 - xMustard can answer how to run and verify the repo without hand-authored markdown
+
+Completion-pass audit on 2026-05-12:
+
+- `project-info` is the richer runtime/config/service graph truth surface. It reports manifests, declared and observed runtimes, entrypoints, run targets, verify targets, compose services, service identities, service groups, and service relationships from Go-owned project discovery.
+- Raw `run-targets` and `verify-targets` stay narrower by design. They carry source, scan/coherence/freshness metadata, ownership status, owner service IDs where exact, and related target IDs without pretending to be a full project graph.
+- Package workspaces, `go.work`, Go `cmd/*` entrypoints, Cargo bin entrypoints, compose `depends_on`, Vite proxy edges, and package workspace dependency edges are represented only when manifest/config/entrypoint evidence is present.
+- Blunt status: Phase 4 is done for the current roadmap target. Remaining improvements should move to Phase 5 retrieval/search/impact or later ergonomics work unless shipped code exposes a concrete runtime/project-discovery blocker.
 
 ## Phase 5: Retrieval, Search, And Impact
 

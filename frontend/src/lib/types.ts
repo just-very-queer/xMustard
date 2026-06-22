@@ -109,7 +109,60 @@ export type IssueQueueFilters = {
   review_ready_only: boolean
 }
 
-export type ViewMode = 'issues' | 'review' | 'signals' | 'runs' | 'sources' | 'drift' | 'tree' | 'activity'
+export type ViewMode =
+  | 'issues'
+  | 'review'
+  | 'signals'
+  | 'runs'
+  | 'sources'
+  | 'drift'
+  | 'tree'
+  | 'activity'
+  | 'cockpit'
+  | 'kanban'
+  | 'admin'
+
+// --- operator admin: providers / routing / tokens ---
+
+export type OpenAIProvider = {
+  name: string
+  kind: string // ollama | openai | vllm | lmstudio | custom
+  base_url: string
+  api_key_env?: string
+  default_model?: string
+  supports_vision: boolean
+  created_at?: string
+}
+
+export type RoutingRule = {
+  task_type: string
+  provider: string
+  model: string
+}
+
+export type AuthPrincipal = {
+  id: string
+  role: string // admin | agent | readonly
+}
+
+export type MintTokenResult = {
+  id: string
+  token: string
+  note?: string
+}
+
+export type AuthAuditEvent = {
+  event_id: string
+  action: string // mint | revoke | rotate | denied
+  actor: string
+  token_id?: string
+  role?: string
+  detail?: string
+  method?: string
+  path?: string
+  remote_addr?: string
+  created_at: string
+}
 
 export type SourceRecord = {
   source_id: string
@@ -1431,4 +1484,78 @@ export type IntegrationTestResult = {
   message: string
   details: Record<string, unknown>
   tested_at: string
+}
+
+export type GoalStatus = 'draft' | 'active' | 'blocked' | 'complete' | 'archived'
+
+export type GoalEvidence = {
+  kind: string
+  label?: string
+  command?: string
+  outcome?: string
+  path?: string
+  url?: string
+  notes?: string
+  created_at?: string
+}
+
+export type GoalIterationRecord = {
+  iteration_id: string
+  goal_id: string
+  role?: string
+  summary: string
+  outcome?: string
+  runtime?: string
+  model?: string
+  files_touched?: string[]
+  evidence?: GoalEvidence[]
+  created_at: string
+}
+
+export type GoalRecord = {
+  goal_id: string
+  workspace_id: string
+  title: string
+  objective: string
+  status: GoalStatus
+  acceptance_criteria?: string[]
+  current_tranche?: string
+  allowed_surface?: string[]
+  verification_commands?: string[]
+  verification_profile_ids?: string[]
+  runtime_preference?: 'manual' | 'codex' | 'opencode' | string
+  preferred_model?: string
+  resumption_notes?: string
+  evidence?: GoalEvidence[]
+  created_at: string
+  updated_at: string
+  completed_at?: string
+}
+
+export type GoalCreateRequest = {
+  title: string
+  objective: string
+  acceptance_criteria?: string[]
+  current_tranche?: string
+  allowed_surface?: string[]
+  verification_commands?: string[]
+  verification_profile_ids?: string[]
+  runtime_preference?: 'manual' | 'codex' | 'opencode' | string
+  preferred_model?: string
+  resumption_notes?: string
+}
+
+export type GoalIterationAppendRequest = {
+  role?: string
+  summary: string
+  outcome?: string
+  runtime?: string
+  model?: string
+  files_touched?: string[]
+  evidence?: GoalEvidence[]
+}
+
+export type GoalStatusUpdateRequest = {
+  status: GoalStatus
+  verification_skipped_reason?: string
 }

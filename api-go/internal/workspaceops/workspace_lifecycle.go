@@ -17,7 +17,7 @@ import (
 
 const (
 	maxCachedSnapshotBytes = 25 * 1024 * 1024
-	scannerVersion         = 2
+	scannerVersion         = 11
 )
 
 type WorkspaceLoadRequest struct {
@@ -321,6 +321,11 @@ func workspaceIDForPath(rootPath string) string {
 	return value + "-" + hex.EncodeToString(digest[:])[:10]
 }
 
+// maxActivityLineBytes lifts the bufio.Scanner token cap so a single large activity
+// record can't terminate the whole scan with bufio.ErrTooLong (XM-NEW-021), while
+// still bounding per-line memory.
+const maxActivityLineBytes = 4 << 20 // 4 MiB
+
 func loadAllWorkspaceActivity(dataDir string, workspaceID string) ([]activityRecord, error) {
 	path := filepath.Join(dataDir, "workspaces", workspaceID, "activity.jsonl")
 	handle, err := os.Open(path)
@@ -334,6 +339,7 @@ func loadAllWorkspaceActivity(dataDir string, workspaceID string) ([]activityRec
 
 	items := []activityRecord{}
 	scanner := bufio.NewScanner(handle)
+	scanner.Buffer(make([]byte, 0, 64*1024), maxActivityLineBytes)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {

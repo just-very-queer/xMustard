@@ -11,7 +11,8 @@ import (
 )
 
 func TestBuildIssueContextPacketBuildsFrontendShapeFromArtifacts(t *testing.T) {
-	dataDir, workspaceID, issueID, _ := writeIssueContextFixture(t, false)
+	dataDir, workspaceID, issueID, repoRoot := writeIssueContextFixture(t, false)
+	installFakeAstGrep(t, repoRoot)
 
 	packet, err := BuildIssueContextPacket(dataDir, workspaceID, issueID)
 	if err != nil {
@@ -54,13 +55,25 @@ func TestBuildIssueContextPacketBuildsFrontendShapeFromArtifacts(t *testing.T) {
 	if len(packet.BrowserDumps) != 1 || packet.BrowserDumps[0].DumpID != "browser-1" {
 		t.Fatalf("unexpected browser dumps: %#v", packet.BrowserDumps)
 	}
+	if len(packet.VulnerabilityFindings) != 1 || packet.VulnerabilityFindings[0].FindingID != "finding-1" {
+		t.Fatalf("unexpected vulnerability findings: %#v", packet.VulnerabilityFindings)
+	}
 	if packet.RepoMap == nil || len(packet.RelatedPaths) == 0 {
 		t.Fatalf("expected repo map and related paths, got repo_map=%#v related=%#v", packet.RepoMap, packet.RelatedPaths)
 	}
-	if packet.DynamicContext == nil || len(packet.DynamicContext.SymbolContext) == 0 || len(packet.DynamicContext.RelatedContext) == 0 {
+	if packet.DynamicContext == nil || len(packet.DynamicContext.SymbolContext) == 0 || len(packet.DynamicContext.RelatedContext) == 0 || len(packet.DynamicContext.SemanticMatches) == 0 {
 		t.Fatalf("expected dynamic context bundle, got %#v", packet.DynamicContext)
 	}
-	if len(packet.RetrievalLedger) == 0 || !hasRetrievalSource(packet.RetrievalLedger, "symbol") || !hasRetrievalSource(packet.RetrievalLedger, "artifact") {
+	if len(packet.DynamicContext.SemanticQueries) == 0 || len(packet.DynamicContext.SemanticMatchRows) == 0 {
+		t.Fatalf("expected semantic query and match rows, got %#v", packet.DynamicContext)
+	}
+	if packet.DynamicContext.SymbolContext[0].EvidenceSource != "rust_semantic_core" {
+		t.Fatalf("expected issue-context symbols from Rust path-symbols, got %#v", packet.DynamicContext.SymbolContext)
+	}
+	if packet.DynamicContext.SymbolContext[0].LineEnd == nil || packet.DynamicContext.SymbolContext[0].Reason == nil || !strings.Contains(strings.ToLower(*packet.DynamicContext.SymbolContext[0].Reason), "rust") {
+		t.Fatalf("expected ranked Rust path-symbol details in issue context, got %#v", packet.DynamicContext.SymbolContext[0])
+	}
+	if len(packet.RetrievalLedger) == 0 || !hasRetrievalSource(packet.RetrievalLedger, "on_demand_symbol") || !hasRetrievalSource(packet.RetrievalLedger, "artifact") || !hasRetrievalSource(packet.RetrievalLedger, "semantic_match") {
 		t.Fatalf("expected retrieval ledger with symbol and artifact entries, got %#v", packet.RetrievalLedger)
 	}
 	if packet.RepoConfig == nil || packet.RepoConfig.SourcePath == nil || *packet.RepoConfig.SourcePath != ".xmustard.yaml" {
@@ -81,7 +94,10 @@ func TestBuildIssueContextPacketBuildsFrontendShapeFromArtifacts(t *testing.T) {
 	if !strings.Contains(packet.Prompt, "Browser context:") || !strings.Contains(packet.Prompt, "/api/export") {
 		t.Fatalf("prompt missing browser context sections:\n%s", packet.Prompt)
 	}
-	if !strings.Contains(packet.Prompt, "Symbol context:") || !strings.Contains(packet.Prompt, "Related artifacts:") {
+	if !strings.Contains(packet.Prompt, "Vulnerability findings:") || !strings.Contains(packet.Prompt, "Semantic freshness:") {
+		t.Fatalf("prompt missing vulnerability or semantic freshness sections:\n%s", packet.Prompt)
+	}
+	if !strings.Contains(packet.Prompt, "Symbol context:") || !strings.Contains(packet.Prompt, "Semantic matches:") || !strings.Contains(packet.Prompt, "Related artifacts:") {
 		t.Fatalf("prompt missing dynamic context sections:\n%s", packet.Prompt)
 	}
 	if !strings.Contains(packet.Prompt, "Retrieval ledger:") {
@@ -89,6 +105,36 @@ func TestBuildIssueContextPacketBuildsFrontendShapeFromArtifacts(t *testing.T) {
 	}
 	if !strings.Contains(packet.Prompt, "Repo config:") || !strings.Contains(packet.Prompt, "Path-specific guidance:") || !strings.Contains(packet.Prompt, "browser-dump") {
 		t.Fatalf("prompt missing repo config sections:\n%s", packet.Prompt)
+	}
+}
+
+func TestBuildIssueContextPacketNormalizesLegacyReviewReadyRuns(t *testing.T) {
+	dataDir, workspaceID, issueID, repoRoot := writeIssueContextFixture(t, false)
+	installFakeAstGrep(t, repoRoot)
+
+	snapshotPath := filepath.Join(dataDir, "workspaces", workspaceID, "snapshot.json")
+	var snapshot workspaceSnapshot
+	if err := readJSON(snapshotPath, &snapshot); err != nil {
+		t.Fatalf("read snapshot: %v", err)
+	}
+	snapshot.Issues[0].ReviewReadyRuns = nil
+	if err := writeJSON(snapshotPath, snapshot); err != nil {
+		t.Fatalf("write legacy snapshot: %v", err)
+	}
+
+	packet, err := BuildIssueContextPacket(dataDir, workspaceID, issueID)
+	if err != nil {
+		t.Fatalf("build issue context packet: %v", err)
+	}
+	if packet.Issue.ReviewReadyRuns == nil {
+		t.Fatalf("expected legacy review_ready_runs to normalize to an empty slice")
+	}
+	encoded, err := json.Marshal(packet)
+	if err != nil {
+		t.Fatalf("marshal packet: %v", err)
+	}
+	if !strings.Contains(string(encoded), "\"review_ready_runs\":[]") {
+		t.Fatalf("expected normalized review_ready_runs JSON, got %s", encoded)
 	}
 }
 
@@ -297,6 +343,31 @@ func writeIssueContextFixture(t *testing.T, withRunbook bool) (string, string, s
 		},
 	}); err != nil {
 		t.Fatalf("write browser dumps: %v", err)
+	}
+	if err := writeJSON(filepath.Join(dataDir, "workspaces", workspaceID, "vulnerability_findings.json"), []VulnerabilityFindingRecord{
+		{
+			FindingID:      "finding-1",
+			WorkspaceID:    workspaceID,
+			IssueID:        issueID,
+			Scanner:        "sarif",
+			Source:         "manual",
+			Severity:       "high",
+			Status:         "open",
+			Title:          "Export summary injection",
+			Summary:        "Export summary field is not validated.",
+			RuleID:         stringPtr("XM-001"),
+			LocationPath:   stringPtr("src/app.py"),
+			LocationLine:   intPtr(2),
+			CWEIDs:         []string{"CWE-20"},
+			CVEIDs:         []string{},
+			References:     []string{},
+			Evidence:       []string{"summary column accepts unsafe values"},
+			ThreatModelIDs: []string{"threat-1"},
+			CreatedAt:      "2026-04-14T10:00:00Z",
+			UpdatedAt:      "2026-04-14T10:00:00Z",
+		},
+	}); err != nil {
+		t.Fatalf("write vulnerability findings: %v", err)
 	}
 
 	activityPath := filepath.Join(dataDir, "workspaces", workspaceID, "activity.jsonl")

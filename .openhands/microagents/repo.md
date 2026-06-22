@@ -25,8 +25,9 @@ xMustard is a local bug-operations product, not a general-purpose chat shell. Th
 
 ## Repo Layout
 
-- `backend/app/`: service, runtimes, scanners, models, API
-- `backend/tests/`: regression tests
+- `api-go/`: Go HTTP backend + `xmustard-ops` CLI (calls the Rust core)
+- `rust-core/`: Rust core logic (scanner, repo map, verification, goals, models, semantic)
+- `backend/`: runtime `data/` + `sql/` only — Python retired to `archive/2026-06-16-python-backend/`
 - `frontend/src/`: app state, panes, API client, styles
 - `docs/`: current product docs
 - `research/`: reference repos that inform the roadmap

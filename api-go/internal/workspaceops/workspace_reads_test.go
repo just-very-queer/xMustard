@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -83,8 +84,138 @@ func TestReadActivityOverviewMatchesTrackerRollups(t *testing.T) {
 	}
 }
 
+func TestReadRepoToolStateAggregatesWorkspaceTruth(t *testing.T) {
+	dataDir, workspaceID, _, _ := writeIssueContextFixture(t, false)
+
+	state, err := ReadRepoToolState(dataDir, workspaceID)
+	if err != nil {
+		t.Fatalf("read repo tool state: %v", err)
+	}
+	if state.Workspace.WorkspaceID != workspaceID {
+		t.Fatalf("unexpected workspace: %#v", state.Workspace)
+	}
+	if state.SnapshotSummary["issues"] != 1 || state.SnapshotSummary["signals"] != 1 {
+		t.Fatalf("unexpected snapshot summary: %#v", state.SnapshotSummary)
+	}
+	if state.ActivityOverview == nil || state.ActivityOverview.TotalEvents != 2 {
+		t.Fatalf("unexpected activity overview: %#v", state.ActivityOverview)
+	}
+	if len(state.RecentActivity) != 2 {
+		t.Fatalf("unexpected recent activity: %#v", state.RecentActivity)
+	}
+	if state.RepoConfigHealth == nil || state.RepoConfigHealth.Status != "configured" {
+		t.Fatalf("unexpected repo config health: %#v", state.RepoConfigHealth)
+	}
+	if state.GuidanceHealth == nil || state.GuidanceHealth.Status != "partial" {
+		t.Fatalf("unexpected guidance health: %#v", state.GuidanceHealth)
+	}
+	if state.RepoMap == nil || state.RepoMap.WorkspaceID != workspaceID {
+		t.Fatalf("unexpected repo map: %#v", state.RepoMap)
+	}
+}
+
+func TestReadIngestionPlanReportsConfiguredRuntimeDiscovery(t *testing.T) {
+	dataDir, workspaceID, _, repoRoot := writeIssueContextFixture(t, false)
+	if err := os.WriteFile(filepath.Join(repoRoot, "package.json"), []byte(`{"scripts":{"dev":"vite","test":"vitest run"}}`), 0o644); err != nil {
+		t.Fatalf("write package.json: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, "Makefile"), []byte("backend:\n\tpython3 -m uvicorn app.main:app\n"), 0o644); err != nil {
+		t.Fatalf("write Makefile: %v", err)
+	}
+	if err := saveVerificationProfiles(dataDir, workspaceID, []verificationProfileRecord{
+		{
+			ProfileID:         "backend-pytest",
+			WorkspaceID:       workspaceID,
+			Name:              "Backend pytest",
+			Description:       "Saved verification command",
+			TestCommand:       "pytest -q",
+			CoverageFormat:    "unknown",
+			MaxRuntimeSeconds: 60,
+			RetryCount:        1,
+			BuiltIn:           false,
+			CreatedAt:         nowUTC(),
+			UpdatedAt:         nowUTC(),
+		},
+	}); err != nil {
+		t.Fatalf("save verification profiles: %v", err)
+	}
+	if err := writeJSON(filepath.Join(dataDir, "settings.json"), appSettings{
+		LocalAgentType: "codex",
+		PostgresDSN:    stringPtr("postgresql://xmustard:secret@localhost:5432/xmustard"),
+		PostgresSchema: "agent_context",
+	}); err != nil {
+		t.Fatalf("write settings: %v", err)
+	}
+
+	plan, err := ReadIngestionPlan(dataDir, workspaceID)
+	if err != nil {
+		t.Fatalf("read ingestion plan: %v", err)
+	}
+	if !plan.PostgresConfigured || plan.PostgresSchema != "agent_context" {
+		t.Fatalf("unexpected Postgres config truth: %#v", plan)
+	}
+	repoScan := findIngestionPhase(t, plan.Phases, "repo_scan")
+	if repoScan.DeliveryState != "complete" {
+		t.Fatalf("expected repo_scan complete, got %#v", repoScan)
+	}
+	runtimeDiscovery := findIngestionPhase(t, plan.Phases, "runtime_discovery")
+	if runtimeDiscovery.DeliveryState != "complete" {
+		t.Fatalf("expected runtime_discovery complete, got %#v", runtimeDiscovery)
+	}
+	if !containsEvidence(runtimeDiscovery.Evidence, "run_targets=") || !containsEvidence(runtimeDiscovery.Evidence, "verify_targets=") {
+		t.Fatalf("missing runtime discovery evidence: %#v", runtimeDiscovery)
+	}
+}
+
 func TestGoRepoIntelligenceReadsImpactContextAndRetrieval(t *testing.T) {
 	dataDir, workspaceID, _, repoRoot := writeIssueContextFixture(t, false)
+	if err := os.WriteFile(filepath.Join(repoRoot, "package.json"), []byte(`{"scripts":{"dev":"vite","test":"vitest run"}}`), 0o644); err != nil {
+		t.Fatalf("write package.json: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(repoRoot, "backend", "app"), 0o755); err != nil {
+		t.Fatalf("mkdir backend/app: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, "backend", "pyproject.toml"), []byte("[project]\nname = \"fixture-backend\"\n[project.scripts]\nxmustard = \"app.cli:app\"\n"), 0o644); err != nil {
+		t.Fatalf("write backend pyproject.toml: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, "backend", "app", "cli.py"), []byte("def app():\n    return True\n\nif __name__ == \"__main__\":\n    app()\n"), 0o644); err != nil {
+		t.Fatalf("write backend cli.py: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(repoRoot, "rust-core", "src", "bin"), 0o755); err != nil {
+		t.Fatalf("mkdir rust-core/src/bin: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, "rust-core", "Cargo.toml"), []byte("[package]\nname = \"fixture-core\"\nversion = \"0.1.0\"\nedition = \"2024\"\n"), 0o644); err != nil {
+		t.Fatalf("write rust-core Cargo.toml: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, "rust-core", "src", "bin", "fixture-core.rs"), []byte("fn main() {}\n"), 0o644); err != nil {
+		t.Fatalf("write rust-core bin: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(repoRoot, "api-go", "cmd", "fixture-api"), 0o755); err != nil {
+		t.Fatalf("mkdir api-go/cmd/fixture-api: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, "api-go", "go.mod"), []byte("module fixture/api-go\n\ngo 1.26.0\n"), 0o644); err != nil {
+		t.Fatalf("write api-go go.mod: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, "api-go", "cmd", "fixture-api", "main.go"), []byte("package main\n\nfunc main() {}\n"), 0o644); err != nil {
+		t.Fatalf("write api-go main.go: %v", err)
+	}
+	if err := saveVerificationProfiles(dataDir, workspaceID, []verificationProfileRecord{
+		{
+			ProfileID:         "backend-pytest",
+			WorkspaceID:       workspaceID,
+			Name:              "Backend pytest",
+			Description:       "Saved verification command",
+			TestCommand:       "pytest -q",
+			CoverageFormat:    "unknown",
+			MaxRuntimeSeconds: 60,
+			RetryCount:        1,
+			BuiltIn:           false,
+			CreatedAt:         nowUTC(),
+			UpdatedAt:         nowUTC(),
+		},
+	}); err != nil {
+		t.Fatalf("save verification profiles: %v", err)
+	}
 
 	runGit(t, repoRoot, "init")
 	runGit(t, repoRoot, "add", ".")
@@ -119,6 +250,24 @@ func TestGoRepoIntelligenceReadsImpactContextAndRetrieval(t *testing.T) {
 	if context.Impact == nil || len(context.RetrievalLedger) == 0 || context.LatestAcceptedFix == nil {
 		t.Fatalf("expected impact, ledger, and fix link, got %#v", context)
 	}
+	if len(context.RunTargets) == 0 || len(context.VerifyTargets) == 0 {
+		t.Fatalf("expected repo context targets, got %#v", context)
+	}
+	if !repoContextHasCommand(context.RunTargets, "cd backend && python3 -m app.cli") {
+		t.Fatalf("expected pyproject repo-context target, got %#v", context.RunTargets)
+	}
+	if !repoContextHasCommand(context.RunTargets, "cd rust-core && cargo run --bin fixture-core") {
+		t.Fatalf("expected cargo repo-context run target, got %#v", context.RunTargets)
+	}
+	if !repoContextHasCommand(context.RunTargets, "cd api-go && go run ./cmd/fixture-api") {
+		t.Fatalf("expected go repo-context run target, got %#v", context.RunTargets)
+	}
+	if !repoContextHasCommand(context.VerifyTargets, "cd rust-core && cargo test") {
+		t.Fatalf("expected cargo repo-context verify target, got %#v", context.VerifyTargets)
+	}
+	if !repoContextHasCommand(context.VerifyTargets, "cd api-go && go test ./...") {
+		t.Fatalf("expected go repo-context verify target, got %#v", context.VerifyTargets)
+	}
 
 	retrieval, err := SearchRetrieval(dataDir, workspaceID, "export summary", 5)
 	if err != nil {
@@ -151,4 +300,40 @@ func runGit(t *testing.T, repoRoot string, args ...string) {
 	if output, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("git %v failed: %v\n%s", args, err, output)
 	}
+}
+
+func repoContextHasCommand(items []RepoContextTargetLink, command string) bool {
+	for _, item := range items {
+		switch target := item.Target.(type) {
+		case RepoTargetRecord:
+			if target.Command == command {
+				return true
+			}
+		case map[string]any:
+			if value, ok := target["command"].(string); ok && value == command {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func findIngestionPhase(t *testing.T, phases []IngestionPhaseRecord, phaseID string) IngestionPhaseRecord {
+	t.Helper()
+	for _, phase := range phases {
+		if phase.PhaseID == phaseID {
+			return phase
+		}
+	}
+	t.Fatalf("missing ingestion phase %q in %#v", phaseID, phases)
+	return IngestionPhaseRecord{}
+}
+
+func containsEvidence(items []string, prefix string) bool {
+	for _, item := range items {
+		if strings.HasPrefix(item, prefix) {
+			return true
+		}
+	}
+	return false
 }

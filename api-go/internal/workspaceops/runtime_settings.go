@@ -33,6 +33,9 @@ type AppSettings struct {
 	OpencodeModel  *string `json:"opencode_model,omitempty"`
 	PostgresDSN    *string `json:"postgres_dsn,omitempty"`
 	PostgresSchema string  `json:"postgres_schema"`
+
+	RequireMultiAgentVerification *bool `json:"require_multi_agent_verification,omitempty"`
+	ContextVerificationThreshold  int   `json:"context_verification_threshold,omitempty"`
 }
 
 type LocalAgentCapabilities struct {
@@ -93,6 +96,9 @@ func GetSettings(dataDir string) (*AppSettings, error) {
 		OpencodeModel:  settings.OpencodeModel,
 		PostgresDSN:    settings.PostgresDSN,
 		PostgresSchema: settings.PostgresSchema,
+
+		RequireMultiAgentVerification: settings.RequireMultiAgentVerification,
+		ContextVerificationThreshold:  settings.ContextVerificationThreshold,
 	}, nil
 }
 
@@ -106,6 +112,9 @@ func UpdateSettings(dataDir string, settings AppSettings) (*AppSettings, error) 
 		OpencodeModel:  trimOptional(settings.OpencodeModel),
 		PostgresDSN:    trimOptional(settings.PostgresDSN),
 		PostgresSchema: fallbackString(strings.TrimSpace(settings.PostgresSchema), "xmustard"),
+
+		RequireMultiAgentVerification: settings.RequireMultiAgentVerification,
+		ContextVerificationThreshold:  settings.ContextVerificationThreshold,
 	}
 	if err := writeJSON(filepath.Join(dataDir, "settings.json"), next); err != nil {
 		return nil, err
@@ -249,6 +258,7 @@ func StartIssueRun(dataDir string, workspaceID string, issueID string, request R
 	if request.Instruction != nil && strings.TrimSpace(*request.Instruction) != "" {
 		prompt = prompt + "\n\nAdditional operator instruction:\n" + strings.TrimSpace(*request.Instruction)
 	}
+	prompt = applyActiveContextToPrompt(dataDir, workspaceID, prompt)
 	command, err := buildRuntimeCommand(dataDir, request.Runtime, request.Model, packet.Workspace.RootPath, prompt)
 	if err != nil {
 		return nil, err
@@ -463,9 +473,11 @@ func applyEvalScenarioToPacket(packet *IssueContextPacket, scenario EvalScenario
 		ticketContexts,
 		packet.ThreatModels,
 		browserDumps,
+		packet.VulnerabilityFindings,
 		packet.RelatedPaths,
 		packet.RepoMap,
 		packet.DynamicContext,
+		packet.SemanticStatus,
 		packet.RetrievalLedger,
 		packet.RepoConfig,
 		packet.MatchedPathInstructions,
@@ -515,6 +527,11 @@ func StartAgentQuery(dataDir string, workspaceID string, request AgentQueryReque
 	if trimmedPrompt == "" {
 		return nil, fmt.Errorf("prompt is required")
 	}
+	// A "provider:<name>" or "route" runtime executes the query by calling a model
+	// directly instead of shelling out to a CLI runtime.
+	if provider, ok := isProviderRuntime(request.Runtime); ok {
+		return StartProviderRun(dataDir, workspaceID, provider, request.Model, trimmedPrompt)
+	}
 	guidance, err := ListWorkspaceGuidanceRecords(dataDir, workspaceID)
 	if err != nil {
 		return nil, err
@@ -525,7 +542,7 @@ func StartAgentQuery(dataDir string, workspaceID string, request AgentQueryReque
 	if err := validateRuntimeModel(dataDir, request.Runtime, request.Model); err != nil {
 		return nil, err
 	}
-	prompt := applyGuidanceToPrompt(trimmedPrompt, guidance)
+	prompt := applyActiveContextToPrompt(dataDir, workspaceID, applyGuidanceToPrompt(trimmedPrompt, guidance))
 	command, err := buildRuntimeCommand(dataDir, request.Runtime, request.Model, snapshot.Workspace.RootPath, prompt)
 	if err != nil {
 		return nil, err
@@ -584,6 +601,33 @@ func applyGuidanceToPrompt(prompt string, guidance []RepoGuidanceRecord) string 
 		lines = append(lines, "- "+item.Path+": "+fallbackString(item.Summary, item.Title))
 	}
 	return "Repository guidance to respect:\n" + strings.Join(lines, "\n") + "\n\n" + prompt
+}
+
+const activeContextLimit = 12
+
+// applyActiveContextToPrompt prepends the workspace's VERIFIED shared context —
+// entries promoted only after multi-agent verification (context governance) — to
+// an agent prompt, so every run grounds on the same trusted facts instead of each
+// agent re-deriving them. Best-effort and bounded: returns the prompt unchanged on
+// error or when nothing has been promoted, and caps both entry count and length.
+func applyActiveContextToPrompt(dataDir, workspaceID, prompt string) string {
+	entries, err := ListContextEntries(dataDir, workspaceID, "promoted")
+	if err != nil || len(entries) == 0 {
+		return prompt
+	}
+	if len(entries) > activeContextLimit {
+		entries = entries[:activeContextLimit]
+	}
+	lines := make([]string, 0, len(entries))
+	for _, e := range entries {
+		title := fallbackString(strings.TrimSpace(e.Title), e.ID)
+		content := strings.TrimSpace(e.Content)
+		if len(content) > 280 {
+			content = content[:280] + "…"
+		}
+		lines = append(lines, "- "+title+": "+content)
+	}
+	return "Verified shared context (governance-approved):\n" + strings.Join(lines, "\n") + "\n\n" + prompt
 }
 
 func guidancePathList(guidance []RepoGuidanceRecord) []string {
