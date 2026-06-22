@@ -296,6 +296,12 @@ type runRecord struct {
 	GuidancePaths     []string        `json:"guidance_paths"`
 	Summary           map[string]any  `json:"summary,omitempty"`
 	Plan              *RunPlan        `json:"plan,omitempty"`
+	// MirrorRevision is a durable, per-run monotonic counter bumped on every
+	// saveRunRecord and carried into the Postgres mirror's ordering guard. Persisting
+	// it (rather than a process-local sequence) keeps the mirror advancing after an
+	// API restart instead of suppressing updates until the new process counter passes
+	// the old persisted value (XM-PRO-004).
+	MirrorRevision int64 `json:"mirror_revision,omitempty"`
 }
 
 func ReadImpact(dataDir string, workspaceID string, baseRef string) (*ImpactReport, error) {

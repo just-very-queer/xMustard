@@ -1035,6 +1035,15 @@ Respond with a JSON object containing:
 }
 
 func saveRunRecord(dataDir string, run runRecord) error {
+	// Durable, restart-safe mirror revision: bump past whatever is already persisted
+	// (and past the caller's in-memory value), so the PG mirror's monotonic guard
+	// survives a process restart instead of resetting to a process-local zero and
+	// suppressing updates for existing runs (XM-PRO-004).
+	prev := run.MirrorRevision
+	if existing, err := loadRun(dataDir, run.WorkspaceID, run.RunID); err == nil && existing != nil && existing.MirrorRevision > prev {
+		prev = existing.MirrorRevision
+	}
+	run.MirrorRevision = prev + 1
 	if err := writeJSON(filepath.Join(dataDir, "workspaces", run.WorkspaceID, "runs", run.RunID+".json"), run); err != nil {
 		return err
 	}

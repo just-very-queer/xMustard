@@ -98,10 +98,10 @@ create table if not exists xm_run_plans (
 create index if not exists xm_run_plans_run_idx on xm_run_plans (workspace_id, run_id);
 `
 
-// pgMirrorSeq is a process-monotonic sequence captured at mutation/dispatch time
-// (in saveRunRecord order) and carried to the async mirror, so PG applies snapshots
-// in mutation order regardless of which background worker's tx commits first.
-var pgMirrorSeq atomic.Int64
+// The async mirror is ordered by the run's DURABLE MirrorRevision (persisted in the
+// run JSON by saveRunRecord), so PG applies snapshots in mutation order regardless
+// of which background worker's tx commits first — and the ordering survives an API
+// restart (XM-PRO-004), unlike a process-local counter.
 
 // ensureInlineSchema runs the DDL once per process (idempotent CREATE … IF NOT
 // EXISTS). Skipped once it has succeeded, so it isn't paid on every mutation; a
@@ -120,9 +120,8 @@ func ensureInlineSchema(ctx context.Context, pool *pgxpool.Pool) error {
 // pgInlineUpsertRun mirrors a run (and its plan) into Postgres on every
 // saveRunRecord. Best-effort; runs on a background worker.
 func pgInlineUpsertRun(run runRecord) {
-	// capture the order seq synchronously (in saveRunRecord order) before dispatch.
-	seq := pgMirrorSeq.Add(1)
-	pgInlineDispatch(func() { pgInlineUpsertRunSync(run, seq) })
+	// Order by the durable per-run revision saveRunRecord just persisted.
+	pgInlineDispatch(func() { pgInlineUpsertRunSync(run, run.MirrorRevision) })
 }
 
 func pgInlineUpsertRunSync(run runRecord, seq int64) {
