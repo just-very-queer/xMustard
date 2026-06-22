@@ -230,7 +230,7 @@ func GenerateRunPlan(dataDir string, workspaceID string, runID string) (*RunPlan
 		return nil, err
 	}
 	if run.Status != "queued" && run.Status != "planning" {
-		return nil, fmt.Errorf("cannot generate plan for run in status %s", run.Status)
+		return nil, Conflict(fmt.Sprintf("cannot generate plan for run in status %s", run.Status))
 	}
 	runbookID := firstNonEmptyPtr(run.RunbookID)
 	packet, err := BuildIssueWorkPacket(dataDir, workspaceID, run.IssueID, runbookID)
@@ -283,7 +283,7 @@ func GetRunPlan(dataDir string, workspaceID string, runID string) (*RunPlan, err
 		return nil, err
 	}
 	if run.Plan == nil {
-		return nil, fmt.Errorf("no plan found for run %s", runID)
+		return nil, NotFoundErr(fmt.Sprintf("no plan found for run %s", runID))
 	}
 	return run.Plan, nil
 }
@@ -310,7 +310,7 @@ func ApproveRunPlan(dataDir string, workspaceID string, runID string, request Pl
 		return nil, os.ErrNotExist
 	}
 	if run.Plan.Phase != "awaiting_approval" && run.Plan.Phase != "modified" {
-		return nil, fmt.Errorf("plan is not awaiting approval (phase: %s)", run.Plan.Phase)
+		return nil, Conflict(fmt.Sprintf("plan is not awaiting approval (phase: %s)", run.Plan.Phase))
 	}
 	snapshot, err := loadSnapshot(dataDir, workspaceID)
 	if err != nil {

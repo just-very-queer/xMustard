@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -80,7 +79,7 @@ func LoadWorkspace(dataDir string, request WorkspaceLoadRequest) (*workspaceSnap
 		return nil, err
 	}
 	if rootPath == "" {
-		return nil, fmt.Errorf("root_path is required")
+		return nil, Invalid("root_path is required")
 	}
 	now := nowUTC()
 	name := strings.TrimSpace(firstNonEmptyPtr(request.Name))

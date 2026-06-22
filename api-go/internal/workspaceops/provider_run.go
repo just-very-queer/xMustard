@@ -40,7 +40,7 @@ func StartProviderRun(dataDir, workspaceID, providerName, model, prompt string) 
 	}
 	prompt = strings.TrimSpace(prompt)
 	if prompt == "" {
-		return nil, fmt.Errorf("prompt is required")
+		return nil, Invalid("prompt is required")
 	}
 	grounded := applyActiveContextToPrompt(dataDir, workspaceID, prompt)
 

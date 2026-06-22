@@ -83,12 +83,12 @@ func CreateIssue(dataDir string, workspaceID string, request IssueCreateRequest)
 	}
 	for _, item := range tracked {
 		if item.BugID == bugID {
-			return nil, fmt.Errorf("issue already exists: %s", bugID)
+			return nil, Conflict(fmt.Sprintf("issue already exists: %s", bugID))
 		}
 	}
 	for _, item := range snapshot.Issues {
 		if item.BugID == bugID {
-			return nil, fmt.Errorf("issue already exists: %s", bugID)
+			return nil, Conflict(fmt.Sprintf("issue already exists: %s", bugID))
 		}
 	}
 

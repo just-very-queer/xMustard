@@ -525,7 +525,7 @@ func StartAgentQuery(dataDir string, workspaceID string, request AgentQueryReque
 	}
 	trimmedPrompt := strings.TrimSpace(request.Prompt)
 	if trimmedPrompt == "" {
-		return nil, fmt.Errorf("prompt is required")
+		return nil, Invalid("prompt is required")
 	}
 	// A "provider:<name>" or "route" runtime executes the query by calling a model
 	// directly instead of shelling out to a CLI runtime.
