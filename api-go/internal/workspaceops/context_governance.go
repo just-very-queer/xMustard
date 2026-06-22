@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync/atomic"
 )
 
 // Context governance: the trust layer for the MCP context engine. Agents don't
@@ -44,6 +45,11 @@ type ContextEntry struct {
 	// file changed since the memory was verified, the memory may be stale.
 	Paths      []string          `json:"paths,omitempty"`
 	PathHashes map[string]string `json:"path_hashes,omitempty"`
+	// SearchTokens is the precomputed, deduplicated relevance token set for
+	// title+content, persisted at write time so recall ranks on it WITHOUT
+	// re-tokenizing every entry's full content on every call (the O(history) CPU /
+	// allocation hot spot, XM-PRO-010). Empty on legacy entries → computed lazily.
+	SearchTokens []string `json:"search_tokens,omitempty"`
 	// Stale / StalePaths are computed at read time (drift-on-recall), never stored.
 	Stale      bool     `json:"stale,omitempty"`
 	StalePaths []string `json:"stale_paths,omitempty"`
@@ -283,6 +289,7 @@ func ProposeContext(dataDir, workspaceID string, req ProposeContextRequest) (*Co
 		UpdatedAt:             now,
 		Paths:                 cleanPaths(req.Paths),
 	}
+	entry.SearchTokens = memoryTokenList(entry.Title + " " + entry.Content)
 	if !requireMulti {
 		// single-agent mode: the proposer's own assertion promotes it.
 		entry.Verifications = append(entry.Verifications, ContextVerification{
@@ -415,6 +422,7 @@ func UpdateContextContent(dataDir, workspaceID, entryID, content string) (*Conte
 		return nil, fmt.Errorf("entry %s is readonly and verified; propose a new entry to supersede it", entryID)
 	}
 	entry.Content = content
+	entry.SearchTokens = memoryTokenList(entry.Title + " " + entry.Content)
 	entry.UpdatedAt = nowUTC()
 	// a content change resets verification — re-approval is required — AND must
 	// discard the old drift baseline, so re-promotion captures a fresh snapshot
@@ -545,7 +553,7 @@ func RecallContext(dataDir, workspaceID, query string, paths []string, limit int
 		// irrelevant memory when a query/paths signal is present.
 		relevance := 0.0
 		if len(qtokens) > 0 {
-			etoks := memoryTokens(e.Title + " " + e.Content)
+			etoks := entrySearchTokenSet(&e) // precomputed; no content scan per recall
 			for t := range qtokens {
 				if _, ok := etoks[t]; ok {
 					relevance += 1.0
@@ -647,7 +655,13 @@ func recallCandidateWindow(limit int) int {
 }
 
 // memoryTokens lowercases and splits text into a set of word tokens for matching.
+// memoryTokenizeCalls counts full-text tokenizations of memory content — a test
+// hook to assert recall is metadata-first (it should not grow with promoted-history
+// size once entries carry precomputed SearchTokens). Not used in production logic.
+var memoryTokenizeCalls atomic.Int64
+
 func memoryTokens(text string) map[string]struct{} {
+	memoryTokenizeCalls.Add(1)
 	out := map[string]struct{}{}
 	for _, tok := range strings.FieldsFunc(strings.ToLower(text), func(r rune) bool {
 		return !(r == '_' || (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9'))
@@ -657,6 +671,31 @@ func memoryTokens(text string) map[string]struct{} {
 		}
 	}
 	return out
+}
+
+// memoryTokenList is memoryTokens as a deduplicated slice, for persisting an entry's
+// precomputed SearchTokens.
+func memoryTokenList(text string) []string {
+	set := memoryTokens(text)
+	out := make([]string, 0, len(set))
+	for t := range set {
+		out = append(out, t)
+	}
+	return out
+}
+
+// entrySearchTokenSet returns the entry's relevance token set, using the persisted
+// SearchTokens when present (no content scan) and falling back to tokenizing
+// title+content only for legacy entries written before the field existed.
+func entrySearchTokenSet(e *ContextEntry) map[string]struct{} {
+	if len(e.SearchTokens) > 0 {
+		set := make(map[string]struct{}, len(e.SearchTokens))
+		for _, t := range e.SearchTokens {
+			set[t] = struct{}{}
+		}
+		return set
+	}
+	return memoryTokens(e.Title + " " + e.Content)
 }
 
 // MemoryConflict flags a file that two or more active memories reference, so the
