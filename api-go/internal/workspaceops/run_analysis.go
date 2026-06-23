@@ -22,7 +22,11 @@ type RunSessionInsight struct {
 	Recommendations  []string                 `json:"recommendations"`
 	AcceptanceReview AcceptanceCriteriaReview `json:"acceptance_review"`
 	ScopeWarnings    []ScopeWarning           `json:"scope_warnings"`
-	GeneratedAt      string                   `json:"generated_at"`
+	// Policy surfaces the workspace run-policy decision (allowed-runtime / required
+	// verification / budget warning + ceiling) evaluated against THIS run, so policy
+	// outcomes are visible in run insights — not just at the pre-run gate + dashboard.
+	Policy      *RunPolicyEvaluation `json:"policy,omitempty"`
+	GeneratedAt string               `json:"generated_at"`
 }
 
 type PlanStep struct {
@@ -221,6 +225,28 @@ func GetRunSessionInsight(dataDir string, workspaceID string, runID string) (*Ru
 		}
 	}
 
+	// Evaluate the workspace run policy against THIS run and surface the decision in the
+	// insight (and as risks/recommendations), so policy/budget outcomes are visible per
+	// run, not only at the pre-run gate and on the dashboard.
+	var policyEval *RunPolicyEvaluation
+	policyInput := RunPolicyInput{Runtime: run.Runtime, Model: run.Model, PlanApproved: run.Plan == nil || run.Plan.Phase == "approved"}
+	if metrics != nil && metrics.EstimatedCost > 0 {
+		cost := metrics.EstimatedCost
+		policyInput.EstimatedCostUSD = &cost
+	}
+	if eval, perr := EvaluateRunAgainstPolicy(dataDir, workspaceID, policyInput); perr == nil {
+		policyEval = eval
+		for _, v := range eval.Violations {
+			switch v.Severity {
+			case "block":
+				risks = append(risks, "Policy: "+v.Message)
+				recommendations = append(recommendations, "This run violates a blocking workspace policy ("+v.Code+"); reconcile before accepting it.")
+			case "warn":
+				risks = append(risks, "Policy warning: "+v.Message)
+			}
+		}
+	}
+
 	return &RunSessionInsight{
 		WorkspaceID:      workspaceID,
 		RunID:            runID,
@@ -234,6 +260,7 @@ func GetRunSessionInsight(dataDir string, workspaceID string, runID string) (*Ru
 		Recommendations:  dedupeText(recommendations),
 		AcceptanceReview: acceptanceReview,
 		ScopeWarnings:    scopeWarnings,
+		Policy:           policyEval,
 		GeneratedAt:      nowUTC(),
 	}, nil
 }
