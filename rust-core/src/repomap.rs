@@ -493,7 +493,7 @@ pub fn explain_path(
     relative_path: &str,
 ) -> Result<RustCodeExplainerResult, std::io::Error> {
     let symbols = extract_path_symbols(root_path, workspace_id, relative_path)?;
-    let content = crate::symbolgraph::read_repo_file_no_follow(&root_path.join(&symbols.path))?;
+    let content = crate::symbolgraph::read_repo_file_beneath(root_path, &symbols.path)?;
     let role = repo_map_file_role(&symbols.path)
         .unwrap_or("source")
         .to_string();
@@ -714,7 +714,7 @@ fn extract_symbols_engine(
     if !should_scan_file(relative_path) {
         return (Vec::new(), "none");
     }
-    let content = match crate::symbolgraph::read_repo_file_no_follow(&root_path.join(relative_path)) {
+    let content = match crate::symbolgraph::read_repo_file_beneath(root_path, relative_path) {
         Ok(value) => value,
         Err(_) => return (Vec::new(), "none"),
     };

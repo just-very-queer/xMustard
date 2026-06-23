@@ -166,29 +166,74 @@ const SCANNABLE_SOURCE_EXTENSIONS: &[&str] = &[
 ];
 const SCANNABLE_SOURCE_FILENAMES: &[&str] = &["Dockerfile", "Justfile", "Makefile", "Procfile"];
 
-/// read_repo_file_no_follow reads a repo file but REFUSES to follow a symlink at the
-/// FINAL path component (safe OpenOptions + O_NOFOLLOW). The crate forbids unsafe, so
-/// a full openat fd-walk over intermediate dirs isn't available in Rust — the Go read
-/// oracle does that walk; this closes the common target-swap vector on the rust
-/// explain/symbols read path so a swapped file→symlink can't redirect the read into a
-/// host file (XM-PRO-007 follow-on). Falls back to a plain read on non-unix.
-pub fn read_repo_file_no_follow(path: &Path) -> std::io::Result<String> {
-    #[cfg(unix)]
-    {
-        use std::io::Read;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut f = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(path)?;
-        let mut s = String::new();
-        f.read_to_string(&mut s)?;
-        Ok(s)
+/// read_repo_file_beneath reads `rel` relative to `root` WITHOUT following a symlink
+/// at ANY path component: it opens the root directory, then walks each component with
+/// openat()+O_NOFOLLOW (via rustix's SAFE wrappers — the crate's #![forbid(unsafe_code)]
+/// rules out a hand-rolled openat). The fd reached is exactly the in-repo file, so a
+/// concurrent agent swapping any component (the final file OR an intermediate dir) for
+/// a symlink can't redirect the read into a host file — the full check-to-open TOCTOU
+/// is closed, matching the Go read oracle (XM-PRO-007). Rejects absolute paths and "..".
+pub fn read_repo_file_beneath(root: &Path, rel: &str) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut f = open_repo_file_beneath(root, rel)?;
+    let mut s = String::new();
+    f.read_to_string(&mut s)?;
+    Ok(s)
+}
+
+#[cfg(unix)]
+fn open_repo_file_beneath(root: &Path, rel: &str) -> std::io::Result<std::fs::File> {
+    use rustix::fs::{open, openat, Mode, OFlags};
+    use std::path::Component;
+
+    let rel = rel.trim();
+    if rel.is_empty() || rel.contains('\0') {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "empty path",
+        ));
     }
-    #[cfg(not(unix))]
-    {
-        std::fs::read_to_string(path)
+    let mut comps: Vec<&std::ffi::OsStr> = Vec::new();
+    for c in Path::new(rel).components() {
+        match c {
+            Component::Normal(s) => comps.push(s),
+            Component::CurDir => {}
+            // absolute, "..", or a drive prefix would escape — refuse.
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "path escapes workspace root",
+                ))
+            }
+        }
     }
+    if comps.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "empty path",
+        ));
+    }
+
+    let mut dir = open(
+        root,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    let last = comps.len() - 1;
+    for (i, comp) in comps.iter().enumerate() {
+        let mut flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        if i < last {
+            flags |= OFlags::DIRECTORY;
+        }
+        // O_NOFOLLOW fails (ELOOP) on a symlink at this component — no traversal.
+        dir = openat(&dir, *comp, flags, Mode::empty())?;
+    }
+    Ok(std::fs::File::from(dir))
+}
+
+#[cfg(not(unix))]
+fn open_repo_file_beneath(root: &Path, rel: &str) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(root.join(rel))
 }
 
 /// is_scannable_source reports whether a path is in the broad scannable-source set
@@ -699,7 +744,7 @@ pub fn upgrade_graph_with_lsp(root: &Path, mut graph: SymbolGraph, budget: usize
             continue;
         }
 
-        let content = match read_repo_file_no_follow(&root.join(&rel)) {
+        let content = match read_repo_file_beneath(root, &rel) {
             Ok(c) => c,
             Err(_) => continue,
         };
@@ -824,7 +869,7 @@ pub fn build_symbol_graph(root: &Path, workspace_id: &str) -> SymbolGraph {
     let mut next_cache: HashMap<String, CachedFileSymbols> = HashMap::new();
 
     for rel in &files {
-        let content = read_repo_file_no_follow(&root.join(rel)).unwrap_or_default();
+        let content = read_repo_file_beneath(root, rel).unwrap_or_default();
         let hash = crate::indexcache::file_hash(root, rel).unwrap_or_default();
         let syms = match sym_cache.remove(rel) {
             Some(c) if c.hash == hash && !hash.is_empty() => c.symbols, // reuse: clean file
@@ -1219,7 +1264,7 @@ pub fn blast_radius(root: &Path, workspace_id: &str, symbol: &str) -> BlastRadiu
     let mut defined_in = Vec::new();
     let mut referencing = BTreeSet::new();
     for rel in &files {
-        let content = read_repo_file_no_follow(&root.join(rel)).unwrap_or_default();
+        let content = read_repo_file_beneath(root, rel).unwrap_or_default();
         if word_set(&content).contains(symbol) {
             referencing.insert(rel.clone());
         }
@@ -1249,26 +1294,46 @@ mod tests {
     use std::process::Command;
     use tempfile::TempDir;
 
-    // O_NOFOLLOW makes the rust read path refuse a symlink final component, so a
-    // file swapped for a symlink can't redirect the explain/symbols read into a host
-    // file (XM-PRO-007 follow-on).
+    // The openat fd-walk refuses a symlink at EVERY path component (final file AND
+    // intermediate directory), so a swap can't redirect the explain/symbols read into
+    // a host file — the full check-to-open TOCTOU is closed (XM-PRO-007).
     #[test]
     #[cfg(unix)]
-    fn read_repo_file_no_follow_refuses_symlink() {
+    fn read_repo_file_beneath_resists_symlinks_at_every_component() {
         use std::os::unix::fs::symlink;
-        let dir = TempDir::new().unwrap();
-        let real = dir.path().join("real.txt");
-        std::fs::write(&real, "IN-REPO").unwrap();
-        assert_eq!(read_repo_file_no_follow(&real).unwrap(), "IN-REPO");
-
-        let secret = dir.path().join("secret.txt");
-        std::fs::write(&secret, "SECRET-OUTSIDE").unwrap();
-        let link = dir.path().join("link.txt");
-        symlink(&secret, &link).unwrap();
-        assert!(
-            read_repo_file_no_follow(&link).is_err(),
-            "O_NOFOLLOW must refuse a symlink final component"
+        let root = TempDir::new().unwrap();
+        std::fs::create_dir_all(root.path().join("sub/dir")).unwrap();
+        std::fs::write(root.path().join("sub/dir/doc.txt"), "IN-REPO").unwrap();
+        assert_eq!(
+            read_repo_file_beneath(root.path(), "sub/dir/doc.txt").unwrap(),
+            "IN-REPO"
         );
+
+        let outside = TempDir::new().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "SECRET").unwrap();
+
+        // (1) final-component symlink to the secret -> refused
+        symlink(
+            outside.path().join("secret.txt"),
+            root.path().join("sub/dir/link.txt"),
+        )
+        .unwrap();
+        assert!(
+            read_repo_file_beneath(root.path(), "sub/dir/link.txt").is_err(),
+            "a symlink final component must be refused"
+        );
+
+        // (2) INTERMEDIATE-directory symlink: an interior component points outside.
+        // The full fd-walk refuses it; a final-component-only check would NOT.
+        symlink(outside.path(), root.path().join("evil")).unwrap();
+        assert!(
+            read_repo_file_beneath(root.path(), "evil/secret.txt").is_err(),
+            "an intermediate-directory symlink must be refused (full fd-walk)"
+        );
+
+        // (3) ".." escape and absolute paths refused
+        assert!(read_repo_file_beneath(root.path(), "../etc/hosts").is_err());
+        assert!(read_repo_file_beneath(root.path(), "/etc/hosts").is_err());
     }
 
     fn git_repo(files: &[(&str, &str)]) -> TempDir {
