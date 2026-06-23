@@ -3753,7 +3753,21 @@ func main() {
 		<-sigCh
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
+		// 1. stop admissions + drain in-flight HTTP.
 		_ = srv.Shutdown(ctx)
+		// 2. workload-aware drain: persist+reap runs, close terminals, flush the PG
+		//    mirror — bounded so a stuck flush can't wedge exit.
+		done := make(chan struct{})
+		go func() {
+			workspaceops.ShutdownInFlight(dataDir())
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			log.Printf("shutdown: in-flight drain exceeded budget; closing anyway")
+		}
+		// 3. close services.
 		workspaceops.ClosePgPool()
 	}()
 	log.Printf("xmustard api-go listening on %s (tls=%v)", addr, hasTLS)

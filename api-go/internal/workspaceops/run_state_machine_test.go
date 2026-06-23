@@ -199,6 +199,59 @@ func TestManagedRunCancelVsFinalizeConverges(t *testing.T) {
 	}
 }
 
+// P1-C: a workload-aware shutdown must durably mark every in-flight run terminal
+// (interrupted) and reap its process — no zombie "running" record survives a restart,
+// and JSON/PG converge. Uses a real long-running subprocess.
+func TestShutdownInFlightInterruptsAndReapsRuns(t *testing.T) {
+	dataDir, workspaceID, issueID, repoRoot := writeIssueContextFixture(t, false)
+	getSnaps, cleanup := captureRunMirror(t)
+	defer cleanup()
+
+	const runID = "run-shutdown"
+	run := runRecord{
+		RunID:       runID,
+		WorkspaceID: workspaceID,
+		IssueID:     issueID,
+		Runtime:     "opencode",
+		Model:       "fake/m",
+		Status:      "queued",
+		Title:       "shutdown",
+		Command:     []string{"sh", "-c", "sleep 30"},
+		LogPath:     filepath.Join(dataDir, "workspaces", workspaceID, "runs", runID+".log"),
+		OutputPath:  filepath.Join(dataDir, "workspaces", workspaceID, "runs", runID+".out.json"),
+		CreatedAt:   "2026-04-14T10:06:00Z",
+	}
+	if err := saveRunRecord(dataDir, run); err != nil {
+		t.Fatal(err)
+	}
+	startManagedRun(dataDir, run, repoRoot)
+	waitForRunStatus(t, dataDir, workspaceID, runID, "running")
+
+	// workload-aware shutdown drain (admissions already stopped in prod).
+	ShutdownInFlight(dataDir)
+
+	// the run must settle to a terminal, non-running status with no retained PID.
+	deadline := time.Now().Add(8 * time.Second)
+	var final *runRecord
+	for time.Now().Before(deadline) {
+		r, err := ReadRun(dataDir, workspaceID, runID)
+		if err == nil && isTerminalRunStatus(r.Status) && r.PID == nil {
+			final = r
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if final == nil {
+		t.Fatalf("run never reached a terminal, reaped state after shutdown")
+	}
+	if final.Status != "interrupted" {
+		t.Fatalf("an in-flight run must be persisted as interrupted on shutdown, got %q", final.Status)
+	}
+	waitForRunCleanup(t, runID)
+	time.Sleep(20 * time.Millisecond)
+	assertMirrorConverges(t, dataDir, workspaceID, runID, getSnaps())
+}
+
 func statusList(snaps []runRecord) []string {
 	out := make([]string, len(snaps))
 	for i, s := range snaps {

@@ -95,10 +95,18 @@ type PlanRejectRequest struct {
 // terminalRunStatuses are end states a run cannot transition out of.
 func isTerminalRunStatus(status string) bool {
 	switch strings.ToLower(strings.TrimSpace(status)) {
-	case "cancelled", "completed", "failed", "error":
+	case "cancelled", "completed", "failed", "error", "interrupted":
 		return true
 	}
 	return false
+}
+
+// managedRun is the in-memory handle for a live run: the supervised process plus the
+// workspace it belongs to, so a workload-aware shutdown can persist its interrupted
+// state (which needs the workspace id) before reaping it.
+type managedRun struct {
+	cmd         *exec.Cmd
+	workspaceID string
 }
 
 func CancelRun(dataDir string, workspaceID string, runID string) (*runRecord, error) {
@@ -135,8 +143,8 @@ func CancelRun(dataDir string, workspaceID string, runID string) (*runRecord, er
 	_, active := activeRunProcesses.Load(runID)
 	cancelledRunIDs.Store(runID, struct{}{})
 	if processValue, ok := activeRunProcesses.Load(runID); ok {
-		if cmd, ok := processValue.(*exec.Cmd); ok && cmd.Process != nil {
-			terminateManagedRunCommand(cmd)
+		if mp, ok := processValue.(*managedRun); ok && mp.cmd != nil && mp.cmd.Process != nil {
+			terminateManagedRunCommand(mp.cmd)
 		}
 	}
 	// A run that was never active is not reaped by runManagedProcess; the durable
@@ -471,7 +479,7 @@ func runManagedProcess(dataDir string, run runRecord, workspaceRoot string) {
 	}
 	// Publish the live handle BEFORE claiming running, so a concurrent CancelRun can
 	// signal the real process (never a reused PID) the moment it commits cancelled.
-	activeRunProcesses.Store(run.RunID, command)
+	activeRunProcesses.Store(run.RunID, &managedRun{cmd: command, workspaceID: run.WorkspaceID})
 	startedAt := nowUTC()
 	pid := command.Process.Pid
 	// Claim the running transition under the run lock. If a cancel/reject already
@@ -513,8 +521,10 @@ func runManagedProcess(dataDir string, run runRecord, workspaceRoot string) {
 	// clobbered to completed. This is the cancel-vs-finalize guarantee.
 	final, ferr := mutateRun(dataDir, run.WorkspaceID, run.RunID, func(r *runRecord) (bool, error) {
 		finalStatus := "completed"
-		if r.Status == "cancelled" {
-			finalStatus = "cancelled"
+		if isTerminalRunStatus(r.Status) {
+			// a cancel or a workload-aware shutdown already terminalized this run
+			// (cancelled/interrupted) under the lock — honor it, don't clobber it.
+			finalStatus = r.Status
 		} else if _, cancelled := cancelledRunIDs.Load(run.RunID); cancelled {
 			finalStatus = "cancelled"
 		} else if waitErr != nil {
