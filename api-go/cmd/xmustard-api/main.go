@@ -3542,6 +3542,12 @@ func main() {
 		}
 		writeJSON(w, http.StatusOK, result)
 	})
+	// One versioned issue handoff merging review (verification+risk), security, and the
+	// latest run insight (acceptance+policy) — consumable by PR/Linear/Jira sync.
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/issues/{issue_id}/handoff", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.BuildVersionedHandoff(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), r.PathValue("issue_id"))
+		issueIntel(w, err, result)
+	})
 	// Verifier reliability + pairwise-agreement telemetry (the evidence a future weighted
 	// quorum would use; the gate itself stays an unweighted distinct-agent threshold).
 	mux.HandleFunc("GET /api/workspaces/{workspace_id}/verifier-telemetry", func(w http.ResponseWriter, r *http.Request) {
