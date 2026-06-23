@@ -9,49 +9,173 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// Run a spawned child to completion (or timeout), draining stdout+stderr on
-/// dedicated threads from the start. Without concurrent draining, a child that
-/// writes past the OS pipe buffer (~64 KiB) blocks on write while the parent waits
-/// for it to exit — a deadlock that only the timeout broke, spuriously killing a
-/// verbose-but-fast command and truncating its output (XM-NEW-015). Returns
-/// (exit_code, success, timed_out, stdout, stderr).
+/// Per-stream capture bound: keep the first HEAD and last TAIL bytes of each pipe, so a
+/// command that emits gigabytes (a runaway test) uses ~constant memory instead of being
+/// buffered whole. The head keeps the failure's start, the tail keeps the summary line.
+const CAPTURE_HEAD_BYTES: usize = 48 * 1024;
+const CAPTURE_TAIL_BYTES: usize = 16 * 1024;
+/// How long a timed-out group gets to exit on SIGTERM before we escalate to SIGKILL.
+const TERM_GRACE: Duration = Duration::from_secs(3);
+
+/// boundedCapture keeps a fixed head + a rolling tail of a byte stream in O(1) memory,
+/// recording the true total and whether anything in the middle was dropped.
+struct BoundedCapture {
+    head: Vec<u8>,
+    tail: std::collections::VecDeque<u8>,
+    total: u64,
+}
+
+impl BoundedCapture {
+    fn new() -> Self {
+        BoundedCapture {
+            head: Vec::with_capacity(CAPTURE_HEAD_BYTES.min(8 * 1024)),
+            tail: std::collections::VecDeque::new(),
+            total: 0,
+        }
+    }
+
+    fn push(&mut self, chunk: &[u8]) {
+        self.total += chunk.len() as u64;
+        let mut rest = chunk;
+        if self.head.len() < CAPTURE_HEAD_BYTES {
+            let take = (CAPTURE_HEAD_BYTES - self.head.len()).min(rest.len());
+            self.head.extend_from_slice(&rest[..take]);
+            rest = &rest[take..];
+        }
+        if rest.is_empty() {
+            return;
+        }
+        // append to the rolling tail, then trim it back down to CAPTURE_TAIL_BYTES.
+        if rest.len() >= CAPTURE_TAIL_BYTES {
+            self.tail.clear();
+            self.tail.extend(&rest[rest.len() - CAPTURE_TAIL_BYTES..]);
+        } else {
+            let overflow = (self.tail.len() + rest.len()).saturating_sub(CAPTURE_TAIL_BYTES);
+            if overflow > 0 {
+                self.tail.drain(..overflow);
+            }
+            self.tail.extend(rest);
+        }
+    }
+
+    fn into_bytes(self) -> Vec<u8> {
+        let captured = self.head.len() as u64 + self.tail.len() as u64;
+        let mut out = self.head;
+        if self.total > captured {
+            out.extend_from_slice(
+                format!("\n...[dropped {} bytes of {} total]\n", self.total - captured, self.total)
+                    .as_bytes(),
+            );
+        }
+        out.extend(self.tail);
+        out
+    }
+}
+
+/// Reads a pipe to EOF into a BoundedCapture (O(1) memory regardless of volume).
+fn spawn_bounded_reader<R: Read + Send + 'static>(
+    mut pipe: Option<R>,
+) -> thread::JoinHandle<Vec<u8>> {
+    thread::spawn(move || {
+        let mut cap = BoundedCapture::new();
+        if let Some(p) = pipe.as_mut() {
+            let mut buf = [0u8; 64 * 1024];
+            loop {
+                match p.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => cap.push(&buf[..n]),
+                    Err(_) => break,
+                }
+            }
+        }
+        cap.into_bytes()
+    })
+}
+
+/// Sends `sig` to the child's whole PROCESS GROUP (the child is the group leader, so the
+/// pgid equals its pid) — so grandchildren that inherited the pipes are signalled too. On
+/// non-unix this degrades to a no-op (the caller's child.kill() handles the direct child).
+#[cfg(unix)]
+fn signal_child_group(pid: u32, sig: rustix::process::Signal) {
+    use rustix::process::{kill_process_group, Pid};
+    if let Some(p) = Pid::from_raw(pid as i32) {
+        let _ = kill_process_group(p, sig);
+    }
+}
+#[cfg(not(unix))]
+fn signal_child_group(_pid: u32, _sig: ()) {}
+
+/// Run a spawned child to completion (or timeout), draining stdout+stderr on dedicated
+/// threads into BOUNDED head+tail captures from the start. Two hazards are closed here:
+/// (1) without concurrent draining a child that writes past the ~64 KiB pipe buffer
+/// deadlocks against a parent waiting for exit (XM-NEW-015); (2) on timeout, killing only
+/// the direct child leaves a GRANDCHILD holding the pipe write-ends open, so the reader
+/// threads never see EOF and join() hangs forever — so we TERM then KILL the whole process
+/// GROUP, which reaps grandchildren and closes the pipes. Returns
+/// (exit_code, success, timed_out, stdout, stderr); the captures are bounded, not whole.
 fn drain_child_with_timeout(
     mut child: Child,
     timeout: Duration,
     started_at: Instant,
 ) -> std::io::Result<(Option<i32>, bool, bool, Vec<u8>, Vec<u8>)> {
-    let mut stdout_pipe = child.stdout.take();
-    let mut stderr_pipe = child.stderr.take();
-    let out_handle = thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(p) = stdout_pipe.as_mut() {
-            let _ = p.read_to_end(&mut buf);
-        }
-        buf
-    });
-    let err_handle = thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(p) = stderr_pipe.as_mut() {
-            let _ = p.read_to_end(&mut buf);
-        }
-        buf
-    });
+    let pid = child.id();
+    let out_handle = spawn_bounded_reader(child.stdout.take());
+    let err_handle = spawn_bounded_reader(child.stderr.take());
+
     let mut timed_out = false;
     let status = loop {
         if let Some(status) = child.try_wait()? {
             break status;
         }
         if started_at.elapsed() >= timeout {
-            let _ = child.kill();
             timed_out = true;
-            break child.wait()?;
+            break terminate_group_and_reap(&mut child, pid)?;
         }
         thread::sleep(Duration::from_millis(50));
     };
-    // the reader threads finish once the pipes reach EOF (child exited / killed).
+    // Force-close the process group even on a NORMAL child exit: if the command exited
+    // but left a GRANDCHILD holding our pipe write-ends open, the bounded readers would
+    // never see EOF and join() would hang forever. Killing the (leader-vacated) group
+    // reaps any such orphan so the pipes close. No-op when the group is already empty.
+    #[cfg(unix)]
+    signal_child_group(pid, rustix::process::Signal::KILL);
+    // every pipe write-end is now closed, so the bounded readers reach EOF and join.
     let stdout = out_handle.join().unwrap_or_default();
     let stderr = err_handle.join().unwrap_or_default();
     Ok((status.code(), status.success(), timed_out, stdout, stderr))
+}
+
+/// Escalating termination of a timed-out child's process group: SIGTERM the group, give
+/// it TERM_GRACE to exit cleanly, then SIGKILL the group and reap. Returns the reaped
+/// status. Always reaps exactly once (no double-wait).
+fn terminate_group_and_reap(
+    child: &mut Child,
+    pid: u32,
+) -> std::io::Result<std::process::ExitStatus> {
+    #[cfg(unix)]
+    {
+        signal_child_group(pid, rustix::process::Signal::TERM);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        let _ = child.kill();
+    }
+    let deadline = Instant::now() + TERM_GRACE;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if Instant::now() >= deadline {
+            #[cfg(unix)]
+            {
+                signal_child_group(pid, rustix::process::Signal::KILL);
+            }
+            let _ = child.kill(); // also signal the direct child as a backstop
+            return child.wait();
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -198,12 +322,23 @@ fn run_managed_command_with_program(
 ) -> Result<RustManagedCommandResult, std::io::Error> {
     let mut managed_command = Command::new(program);
     managed_command.args(args);
+    // Put the child in its OWN process group (pgid = child pid) so a timeout can signal
+    // the whole tree — the child AND any grandchildren that inherited the pipes — rather
+    // than orphaning a grandchild that keeps the pipes open and hangs the readers.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        managed_command.process_group(0);
+    }
     let resolved_cwd = workspace_root
         .canonicalize()
         .unwrap_or_else(|_| workspace_root.to_path_buf());
     let started_at = Instant::now();
     let timeout = Duration::from_secs(timeout_seconds.max(1));
 
+    // A spawn failure here is NOT_STARTED: the command never ran, so the `?` propagates
+    // an error the caller treats as a non-retryable, side-effect-free failure (distinct
+    // from a STARTED_UNKNOWN timeout below, which must never be re-run).
     let child = managed_command
         .current_dir(&resolved_cwd)
         .stdout(Stdio::piped())
@@ -240,8 +375,15 @@ pub fn run_verification_profile(
             profile.max_runtime_seconds.max(1),
         )?;
         let attempt_success = attempt.success;
+        let attempt_timed_out = attempt.timed_out;
         attempts.push(attempt);
         if attempt_success {
+            break;
+        }
+        // A timed-out attempt is STARTED_UNKNOWN: the command began and may have applied a
+        // partial side effect before we killed its group, so re-running it could double
+        // that effect. Never repeat a possibly-started command — stop retrying on timeout.
+        if attempt_timed_out {
             break;
         }
     }
@@ -723,8 +865,15 @@ fn truncate_excerpt(text: &str, limit: usize) -> String {
     if text.len() <= limit {
         return text.to_string();
     }
-    let omitted = text.len() - limit;
-    format!("{}\n...[truncated {} chars]", &text[..limit], omitted)
+    // Back up to a UTF-8 char boundary so we never slice through a multibyte sequence
+    // (a raw &text[..limit] panics on a non-boundary). The boundary is <= limit, so the
+    // result still respects the cap.
+    let mut end = limit;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let omitted = text.len() - end;
+    format!("{}\n...[truncated {} chars]", &text[..end], omitted)
 }
 
 fn resolve_report_path(
@@ -896,9 +1045,10 @@ mod tests {
     use super::{
         RustVerificationProfileInput, parse_cobertura_content, parse_istanbul_content,
         parse_lcov_content, run_managed_command, run_migration_verification,
-        run_verification_command, run_verification_profile,
+        run_verification_command, run_verification_profile, truncate_excerpt,
     };
     use chrono::Utc;
+    use std::time::{Duration, Instant};
     use tempfile::TempDir;
 
     // A command that writes far more than the OS pipe buffer (~64 KiB) before exiting
@@ -1110,6 +1260,133 @@ mod tests {
                 .map(|item| item.lines_covered),
             Some(1)
         );
+    }
+
+    // P1-A: a command that emits ~1 GiB must NOT be buffered whole — the bounded head+tail
+    // capture keeps memory ~constant. The run completes (no OOM) and the excerpt is small
+    // with a "dropped" marker proving the middle was discarded.
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn managed_command_bounds_gigabyte_output() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        // 1 GiB of output; if it were buffered whole this would OOM. run_managed_command's
+        // 64 KiB excerpt window includes the head and the dropped-bytes marker.
+        let result = run_managed_command(
+            temp_dir.path(),
+            &[
+                "sh".to_string(),
+                "-lc".to_string(),
+                "dd if=/dev/zero bs=1048576 count=1024 2>/dev/null".to_string(),
+            ],
+            120,
+        )
+        .expect("should run");
+        assert!(result.success, "the producer command should succeed");
+        assert!(!result.timed_out);
+        assert!(
+            result.stdout_excerpt.len() < 256 * 1024,
+            "stdout must be bounded, got {} bytes",
+            result.stdout_excerpt.len()
+        );
+        assert!(
+            result.stdout_excerpt.contains("dropped"),
+            "a >cap output must carry the dropped-bytes marker proving the middle was discarded"
+        );
+    }
+
+    // P1-A: a command that exits NORMALLY but leaves a grandchild holding the stdout pipe
+    // must not hang the reader join — the group is force-closed on exit. If this regressed
+    // the test would block until the 300s sleep (i.e. effectively hang).
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn managed_command_does_not_hang_on_grandchild_holding_pipe() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let start = Instant::now();
+        let result = run_verification_command(
+            temp_dir.path(),
+            "( sleep 300 ) & echo hi; exit 0",
+            120,
+        )
+        .expect("should run");
+        assert!(result.success);
+        assert!(result.stdout_excerpt.contains("hi"));
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "must return promptly despite a grandchild holding the pipe, took {:?}",
+            start.elapsed()
+        );
+    }
+
+    // P1-A: on timeout, the WHOLE process group (child + grandchild) is TERM->KILLed, so
+    // the readers reach EOF and the call returns quickly with timed_out=true — instead of
+    // a grandchild keeping the pipes open and hanging forever.
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn managed_command_times_out_and_kills_group() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let start = Instant::now();
+        let result = run_verification_command(
+            temp_dir.path(),
+            "( sleep 300 ) & echo started; sleep 300",
+            1,
+        )
+        .expect("should run");
+        assert!(result.timed_out, "command should be marked timed out");
+        assert!(!result.success);
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "group kill must reap the tree quickly, took {:?}",
+            start.elapsed()
+        );
+    }
+
+    // P1-A: a timed-out (STARTED_UNKNOWN) attempt must NEVER be re-run, or a partial side
+    // effect would be repeated. With retry_count=2 the side-effect file is written exactly
+    // once and only one attempt is recorded.
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn timed_out_command_is_never_repeated() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let side = temp_dir.path().join("sideeffect.log");
+        let profile = RustVerificationProfileInput {
+            profile_id: "p".to_string(),
+            workspace_id: "w".to_string(),
+            name: "n".to_string(),
+            description: "d".to_string(),
+            test_command: format!("echo ran >> {}; sleep 300", side.display()),
+            coverage_command: None,
+            coverage_report_path: None,
+            coverage_format: "lcov".to_string(),
+            max_runtime_seconds: 1,
+            retry_count: 2, // would allow 3 attempts if timeouts were retried
+            source_paths: vec![],
+            built_in: false,
+            created_at: Utc::now().to_rfc3339(),
+            updated_at: Utc::now().to_rfc3339(),
+        };
+        let result = run_verification_profile(temp_dir.path(), &profile, None, None)
+            .expect("profile should run");
+        assert!(!result.success);
+        assert_eq!(result.attempts.len(), 1, "a timed-out command must not be retried");
+        assert!(result.attempts[0].timed_out);
+        let contents = std::fs::read_to_string(&side).unwrap_or_default();
+        assert_eq!(
+            contents.lines().count(),
+            1,
+            "the possibly-side-effecting command ran exactly once, got: {contents:?}"
+        );
+    }
+
+    // P1-A: excerpt truncation must be UTF-8 safe — slicing at a non-char-boundary would
+    // panic. A multibyte char straddling the limit truncates cleanly to valid UTF-8.
+    #[test]
+    fn truncate_excerpt_is_utf8_safe() {
+        // 'é' is 2 bytes; place it so the byte limit lands in its middle.
+        let text = format!("{}{}", "a".repeat(9), "é".repeat(5));
+        let out = truncate_excerpt(&text, 10); // boundary falls mid-'é'
+        assert!(out.is_char_boundary(0));
+        assert!(out.starts_with("aaaaaaaaa"));
+        assert!(out.contains("truncated"));
     }
 
     #[cfg(not(target_os = "windows"))]

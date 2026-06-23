@@ -10,7 +10,7 @@ path = "src/lib.rs"
 
 [dependencies]
 chrono = { version = "0.4", features = ["clock", "serde"] }
-rustix = { version = "1", features = ["fs"] }
+rustix = { version = "1", features = ["fs", "process"] }
 tree-sitter = "0.25"
 tree-sitter-go = "0.25"
 tree-sitter-javascript = "0.25"
