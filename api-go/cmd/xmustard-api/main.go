@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"xmustard/api-go/internal/budget"
 	"xmustard/api-go/internal/workspaceops"
 )
 
@@ -3984,11 +3985,11 @@ func bodyLimitMiddleware(next http.Handler) http.Handler {
 			if charge < 0 {
 				charge = limit
 			}
-			if !workspaceops.TransientBytes.Acquire(charge) {
+			if !budget.TransientBytes.Acquire(charge) {
 				http.Error(w, "server transient-memory budget exhausted; retry shortly", http.StatusServiceUnavailable)
 				return
 			}
-			defer workspaceops.TransientBytes.Release(charge)
+			defer budget.TransientBytes.Release(charge)
 		}
 		next.ServeHTTP(w, r)
 	})

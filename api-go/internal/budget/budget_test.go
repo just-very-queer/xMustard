@@ -1,4 +1,4 @@
-package workspaceops
+package budget
 
 import (
 	"sync"
@@ -32,6 +32,28 @@ func TestByteBudgetBoundsAggregate(t *testing.T) {
 	}
 	if !b.Acquire(40) {
 		t.Fatalf("after release 40 should fit again")
+	}
+}
+
+// Charge (internal accounting) raises usage and applies BACKPRESSURE to Acquire (external
+// admission) — so internal subsystems holding memory cause new external load to be shed,
+// without the internal op itself being rejected.
+func TestChargeAccountsAndPressuresAcquire(t *testing.T) {
+	b := NewByteBudget(100)
+	b.Charge(80) // internal subsystem reserves 80 unconditionally
+	if b.InUse() != 80 {
+		t.Fatalf("charge should account 80, got %d", b.InUse())
+	}
+	if b.Acquire(30) {
+		t.Fatalf("external admission must be shed: 80+30 > 100")
+	}
+	if !b.Acquire(20) {
+		t.Fatalf("80+20 == 100 should still admit")
+	}
+	b.Release(80)
+	b.Release(20)
+	if b.InUse() != 0 {
+		t.Fatalf("all released, used should be 0, got %d", b.InUse())
 	}
 }
 

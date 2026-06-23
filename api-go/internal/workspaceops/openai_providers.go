@@ -16,6 +16,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"xmustard/api-go/internal/budget"
 )
 
 // SSRF guard. Provider URLs trigger server-side HTTP requests with the operator's
@@ -81,6 +83,20 @@ func rejectBlockedURLHost(baseURL string) error {
 // Security: we never store API keys. A provider records the NAME of an
 // environment variable (APIKeyEnv); the key is read from the process env at call
 // time. This keeps secrets out of providers.json (which is plain config).
+
+// maxProviderResponseBytes bounds a single provider/LLM HTTP response read — these were
+// unbounded io.ReadAll, so a hostile or runaway provider could allocate without limit.
+const maxProviderResponseBytes = 16 << 20 // 16 MiB
+
+// readProviderBody reads a provider response with a hard cap AND charges the bounded read
+// against the shared transient-byte pool, so concurrent provider reads count toward the
+// same <100 MB ceiling. Internal (a run shouldn't be rejected mid-flight), so it accounts.
+func readProviderBody(resp *http.Response) []byte {
+	budget.TransientBytes.Charge(maxProviderResponseBytes)
+	defer budget.TransientBytes.Release(maxProviderResponseBytes)
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, maxProviderResponseBytes))
+	return raw
+}
 
 type OpenAIProvider struct {
 	Name         string `json:"name"`
@@ -274,7 +290,7 @@ func OpenAIEmbeddings(dataDir, name, model string, inputs []string) ([][]float64
 		return nil, fmt.Errorf("provider %s unreachable at %s: %w", name, provider.BaseURL, err)
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
+	raw := readProviderBody(resp)
 	if resp.StatusCode >= 400 {
 		return nil, fmt.Errorf("provider %s embeddings -> %d: %s", name, resp.StatusCode, strings.TrimSpace(string(raw)))
 	}
@@ -310,7 +326,7 @@ func ListProviderModels(dataDir, name string) (map[string]any, error) {
 		return nil, fmt.Errorf("provider %s unreachable at %s: %w", name, provider.BaseURL, err)
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
+	raw := readProviderBody(resp)
 	if resp.StatusCode >= 400 {
 		return nil, fmt.Errorf("provider %s /models -> %d: %s", name, resp.StatusCode, strings.TrimSpace(string(raw)))
 	}
@@ -433,7 +449,7 @@ func OpenAIChat(dataDir, name string, req ChatRequest) (map[string]any, error) {
 		return nil, fmt.Errorf("provider %s unreachable at %s: %w", name, provider.BaseURL, err)
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
+	raw := readProviderBody(resp)
 	if resp.StatusCode >= 400 {
 		return nil, fmt.Errorf("provider %s chat -> %d: %s", name, resp.StatusCode, strings.TrimSpace(string(raw)))
 	}

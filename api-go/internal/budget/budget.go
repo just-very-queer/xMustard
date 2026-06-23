@@ -1,4 +1,8 @@
-package workspaceops
+// Package budget provides a process-wide weighted ceiling on transient in-flight bytes,
+// shared by every subsystem that does large transient reads (HTTP decode, provider
+// responses, Go↔Rust capture, ast-grep, subprocess capture). It is a leaf package (no
+// internal imports) so both workspaceops and rustcore can charge against the same pool.
+package budget
 
 import (
 	"os"
@@ -40,7 +44,24 @@ func (b *ByteBudget) Acquire(n int64) bool {
 	return true
 }
 
-// Release returns n previously-acquired bytes to the pool.
+// Charge unconditionally records n in-flight bytes — for INTERNAL subsystems that must
+// not be rejected (verification, the Go↔Rust bridge, subprocess capture). It still raises
+// the pool's used/peak, so the EXTERNAL admission path (Acquire, which can reject) sees
+// the backpressure and sheds new external load instead of stacking more memory. Always
+// paired with Release.
+func (b *ByteBudget) Charge(n int64) {
+	if n <= 0 {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.used += n
+	if b.used > b.peak {
+		b.peak = b.used
+	}
+}
+
+// Release returns n previously-acquired-or-charged bytes to the pool.
 func (b *ByteBudget) Release(n int64) {
 	if n <= 0 {
 		return

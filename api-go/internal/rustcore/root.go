@@ -11,6 +11,8 @@ import (
 	"runtime"
 	"strings"
 	"time"
+
+	"xmustard/api-go/internal/budget"
 )
 
 const (
@@ -84,6 +86,13 @@ func runCoreCtx(parent context.Context, sub string, args ...string) ([]byte, err
 // and the raw run error so callers can inspect exit codes. This replaces the
 // unbounded bytes.Buffer captures those helpers used (XM-PRO-005).
 func runBoundedCmd(cmd *exec.Cmd) (stdout []byte, stderr string, over bool, err error) {
+	// Charge the worst-case capture size against the shared transient-byte pool while this
+	// Go↔Rust / subprocess (incl. ast-grep) capture is in flight, so its peak counts
+	// toward the same <100 MB ceiling the HTTP admission path sheds against. Internal, so
+	// it accounts (Charge) rather than rejects.
+	const reserve = maxCoreStdout + maxCoreStderr
+	budget.TransientBytes.Charge(reserve)
+	defer budget.TransientBytes.Release(reserve)
 	out := &capWriter{max: maxCoreStdout}
 	errb := &capWriter{max: maxCoreStderr}
 	cmd.Stdout = out
