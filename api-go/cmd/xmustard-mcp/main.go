@@ -9,6 +9,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -16,6 +17,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -183,11 +185,20 @@ type rpcResponse struct {
 func httpClient() *http.Client { return &http.Client{Timeout: 60 * time.Second} }
 
 func callAPI(method, path, body string) (string, error) {
+	return callAPICtx(context.Background(), method, path, body)
+}
+
+// callAPICtx is callAPI bound to a context, so an MCP tools/call cancellation (or
+// deadline) propagates shim→API: cancelling ctx aborts the in-flight HTTP request, and
+// the API handler's request context (and the exec.CommandContext under it) is in turn
+// cancelled — the whole chain tears down instead of running an abandoned tool to
+// completion. The 9 tools are unchanged; only their transport became cancelable.
+func callAPICtx(ctx context.Context, method, path, body string) (string, error) {
 	var bodyReader io.Reader
 	if body != "" {
 		bodyReader = bytes.NewReader([]byte(body))
 	}
-	req, err := http.NewRequest(method, apiBase()+path, bodyReader)
+	req, err := http.NewRequestWithContext(ctx, method, apiBase()+path, bodyReader)
 	if err != nil {
 		return "", err
 	}
@@ -285,6 +296,10 @@ func toolsListResult() map[string]any {
 // args and value types are validated up front in dispatch (buildArgs); the
 // missing-required check here is a defensive backstop for direct callers/tests.
 func callTool(name string, args map[string]string) map[string]any {
+	return callToolCtx(context.Background(), name, args)
+}
+
+func callToolCtx(ctx context.Context, name string, args map[string]string) map[string]any {
 	t, ok := toolByName(name)
 	if !ok {
 		return mcpText(fmt.Sprintf("unknown tool %q", name), true)
@@ -295,7 +310,7 @@ func callTool(name string, args map[string]string) map[string]any {
 		}
 	}
 	method, path, reqBody := t.Build(args)
-	respBody, err := callAPI(method, path, reqBody)
+	respBody, err := callAPICtx(ctx, method, path, reqBody)
 	if err != nil {
 		return mcpText(err.Error(), true)
 	}
@@ -367,6 +382,10 @@ func mcpText(text string, isError bool) map[string]any {
 
 // dispatch handles one JSON-RPC method, returning a result (or nil for notifications).
 func dispatch(method string, params json.RawMessage) (any, *rpcError) {
+	return dispatchCtx(context.Background(), method, params)
+}
+
+func dispatchCtx(ctx context.Context, method string, params json.RawMessage) (any, *rpcError) {
 	switch method {
 	case "initialize":
 		return map[string]any{
@@ -401,7 +420,7 @@ func dispatch(method string, params json.RawMessage) (any, *rpcError) {
 		if rerr != nil {
 			return nil, rerr
 		}
-		return callTool(p.Name, args), nil
+		return callToolCtx(ctx, p.Name, args), nil
 	case "ping":
 		return map[string]any{}, nil
 	default:
@@ -434,14 +453,68 @@ func readBoundedLine(r *bufio.Reader) (line []byte, truncated bool, err error) {
 	}
 }
 
+// inflight tracks cancel funcs for in-progress requests by their JSON-RPC id, so an MCP
+// `notifications/cancelled` can abort the matching tool call mid-flight. Bounded by the
+// number of concurrently outstanding requests one well-behaved client has open.
+type inflightRegistry struct {
+	mu sync.Mutex
+	m  map[string]context.CancelFunc
+}
+
+func newInflight() *inflightRegistry { return &inflightRegistry{m: map[string]context.CancelFunc{}} }
+
+func (r *inflightRegistry) add(id string, cancel context.CancelFunc) {
+	r.mu.Lock()
+	r.m[id] = cancel
+	r.mu.Unlock()
+}
+func (r *inflightRegistry) done(id string) {
+	r.mu.Lock()
+	delete(r.m, id)
+	r.mu.Unlock()
+}
+
+// cancel aborts the in-flight request with this id (no-op if already finished/unknown).
+func (r *inflightRegistry) cancel(id string) {
+	r.mu.Lock()
+	cancel := r.m[id]
+	delete(r.m, id)
+	r.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+// cancelledRequestID extracts the target request id from a notifications/cancelled
+// params object: {"requestId": <id>, "reason": "..."}. The id is matched by its raw JSON
+// encoding so numeric and string ids both round-trip exactly.
+func cancelledRequestID(params json.RawMessage) (string, bool) {
+	var p struct {
+		RequestID json.RawMessage `json:"requestId"`
+	}
+	if err := json.Unmarshal(params, &p); err != nil || len(p.RequestID) == 0 {
+		return "", false
+	}
+	return string(p.RequestID), true
+}
+
 func main() {
 	reader := bufio.NewReaderSize(os.Stdin, 64<<10)
 	writer := bufio.NewWriter(os.Stdout)
 	enc := json.NewEncoder(writer)
+	// stdout is shared by the read loop and the per-request worker goroutines, so every
+	// response write is serialized.
+	var sendMu sync.Mutex
 	send := func(resp rpcResponse) {
+		sendMu.Lock()
 		_ = enc.Encode(resp)
 		_ = writer.Flush()
+		sendMu.Unlock()
 	}
+	inflight := newInflight()
+	var workers sync.WaitGroup
+	defer workers.Wait()
+
 	for {
 		raw, truncated, err := readBoundedLine(reader)
 		line := []byte(strings.TrimSpace(string(raw)))
@@ -454,16 +527,35 @@ func main() {
 				// malformed JSON → structured parse error rather than a silent drop.
 				send(rpcResponse{JSONRPC: "2.0", Error: &rpcError{Code: -32700, Message: "parse error"}})
 			} else if len(req.ID) == 0 && strings.HasPrefix(req.Method, "notifications/") {
-				// notifications have no id and expect no response
-			} else {
-				result, rerr := dispatch(req.Method, req.Params)
-				resp := rpcResponse{JSONRPC: "2.0", ID: req.ID}
-				if rerr != nil {
-					resp.Error = rerr
-				} else {
-					resp.Result = result
+				// notifications have no id and expect no response. A cancellation aborts
+				// the matching in-flight request so the loop stays responsive to it.
+				if req.Method == "notifications/cancelled" {
+					if id, ok := cancelledRequestID(req.Params); ok {
+						inflight.cancel(id)
+					}
 				}
-				send(resp)
+			} else {
+				// Run each id-bearing request on its own goroutine with a cancelable
+				// context registered by id, so the read loop keeps reading (and can
+				// service a cancellation) while the tool call is outstanding. JSON-RPC
+				// permits out-of-order responses; the client matches by id.
+				ctx, cancel := context.WithCancel(context.Background())
+				idKey := string(req.ID)
+				inflight.add(idKey, cancel)
+				workers.Add(1)
+				go func(req rpcRequest) {
+					defer workers.Done()
+					defer inflight.done(idKey)
+					defer cancel()
+					result, rerr := dispatchCtx(ctx, req.Method, req.Params)
+					resp := rpcResponse{JSONRPC: "2.0", ID: req.ID}
+					if rerr != nil {
+						resp.Error = rerr
+					} else {
+						resp.Result = result
+					}
+					send(resp)
+				}(req)
 			}
 		}
 		if err != nil { // io.EOF or a read error: stop
