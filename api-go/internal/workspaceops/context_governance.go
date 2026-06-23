@@ -51,6 +51,10 @@ type ContextEntry struct {
 	// re-tokenizing every entry's full content on every call (the O(history) CPU /
 	// allocation hot spot, XM-PRO-010). Empty on legacy entries → computed lazily.
 	SearchTokens []string `json:"search_tokens,omitempty"`
+	// ContentHash is a DERIVED transport field: it is never set on the source entry
+	// (stays empty there), only populated from the recall meta cache so recall can
+	// locate the entry's hash-named content file. See hashContent / loadWindowContent.
+	ContentHash string `json:"content_hash,omitempty"`
 	// Stale / StalePaths are computed at read time (drift-on-recall), never stored.
 	Stale      bool     `json:"stale,omitempty"`
 	StalePaths []string `json:"stale_paths,omitempty"`
@@ -77,6 +81,16 @@ func validateSafeID(kind, id string) error {
 		return fmt.Errorf("invalid %s id: %w", kind, ErrInvalidInput)
 	}
 	return nil
+}
+
+// hashContent returns a short stable digest of an entry's content, used to NAME its
+// per-id content cache file. That makes the file immutable + self-validating: changing
+// the content yields a new filename, so recall can never read content that no longer
+// matches the entry — a failed cache write simply leaves the new-hash file absent and
+// recall falls back to the source. Per-id namespacing makes 64 bits ample.
+func hashContent(s string) string {
+	sum := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(sum[:8])
 }
 
 // hashFileContent returns the sha256 of a repo-relative file's current content.
@@ -192,6 +206,10 @@ type contextEntryMeta struct {
 	Paths                 []string              `json:"paths,omitempty"`
 	PathHashes            map[string]string     `json:"path_hashes,omitempty"`
 	SearchTokens          []string              `json:"search_tokens,omitempty"`
+	// ContentHash is set ONLY in the recall meta cache (writeContextMetaCache); the
+	// source's metas decode it as empty (the source has no such field). It names the
+	// entry's content file so recall reads the file matching the current content.
+	ContentHash string `json:"content_hash,omitempty"`
 }
 
 func (m *contextEntryMeta) toEntry() ContextEntry {
@@ -200,7 +218,7 @@ func (m *contextEntryMeta) toEntry() ContextEntry {
 		Permission: m.Permission, Status: m.Status, Promoted: m.Promoted,
 		Verifications: m.Verifications, RequiredVerifications: m.RequiredVerifications,
 		CreatedAt: m.CreatedAt, UpdatedAt: m.UpdatedAt, Paths: m.Paths,
-		PathHashes: m.PathHashes, SearchTokens: m.SearchTokens,
+		PathHashes: m.PathHashes, SearchTokens: m.SearchTokens, ContentHash: m.ContentHash,
 		// Content is loaded for the returned window; Stale/StalePaths at read time.
 	}
 }
@@ -222,6 +240,128 @@ func loadPromotedMeta(dataDir, workspaceID string) ([]ContextEntry, error) {
 		}
 	}
 	return out, nil
+}
+
+// --- recall read caches (XM-PRO-010): content-free meta cache + per-id content files,
+// DERIVED from the unchanged context_entries.json source of truth. Recall parses the
+// small meta cache (not the source's content bytes) for ranking, and reads only the
+// returned window's content from per-id files — so recall's parse TIME, not just its
+// allocation, stops scaling with total content size. Both caches fall back to the
+// source when missing/stale, so they can never corrupt or hide a memory.
+
+func contextMetaCachePath(dataDir, workspaceID string) string {
+	return filepath.Join(dataDir, "workspaces", workspaceID, "context_meta.json")
+}
+
+func contextContentDir(dataDir, workspaceID string) string {
+	return filepath.Join(dataDir, "workspaces", workspaceID, "context_content")
+}
+
+// content files live in a per-id subdirectory (context_content/<id>/<hash>.txt) so a
+// single validated id segment owns its own namespace — pruning an id's stale-hash
+// files can never touch another id's, even though ids may legally contain dots.
+func contextContentEntryDir(dataDir, workspaceID, id string) string {
+	return filepath.Join(contextContentDir(dataDir, workspaceID), id)
+}
+
+func contextContentFilePath(dataDir, workspaceID, id, hash string) string {
+	return filepath.Join(contextContentEntryDir(dataDir, workspaceID, id), hash+".txt")
+}
+
+// writeContextMetaCache writes the content-free metadata projection used by recall's
+// ranking pass, stamping each entry's ContentHash so recall can find its content file.
+// Best-effort: a failure just means recall falls back to the source.
+func writeContextMetaCache(dataDir, workspaceID string, entries []ContextEntry) {
+	metas := make([]contextEntryMeta, 0, len(entries))
+	for i := range entries {
+		e := &entries[i]
+		metas = append(metas, contextEntryMeta{
+			ID: e.ID, WorkspaceID: e.WorkspaceID, Title: e.Title, Source: e.Source,
+			Permission: e.Permission, Status: e.Status, Promoted: e.Promoted,
+			Verifications: e.Verifications, RequiredVerifications: e.RequiredVerifications,
+			CreatedAt: e.CreatedAt, UpdatedAt: e.UpdatedAt, Paths: e.Paths,
+			PathHashes: e.PathHashes, SearchTokens: e.SearchTokens,
+			ContentHash: hashContent(e.Content),
+		})
+	}
+	_ = writeJSON(contextMetaCachePath(dataDir, workspaceID), metas)
+}
+
+// writeContextContentFile persists one entry's content to a hash-named file (a recall
+// read cache). Called only where content is set (propose/update), so verify/promote
+// don't rewrite content files (no write amplification). The hash name makes the file
+// immutable + self-validating; stale-hash files for this id are pruned. Best-effort.
+func writeContextContentFile(dataDir, workspaceID, id, content string) {
+	dir := contextContentEntryDir(dataDir, workspaceID, id)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return
+	}
+	hash := hashContent(content)
+	if err := writeJSON(contextContentFilePath(dataDir, workspaceID, id, hash), content); err != nil {
+		return
+	}
+	// drop any prior-content file(s) for this id (content changed → old hash obsolete).
+	if ents, err := os.ReadDir(dir); err == nil {
+		keep := hash + ".txt"
+		for _, de := range ents {
+			if name := de.Name(); name != keep {
+				_ = os.Remove(filepath.Join(dir, name))
+			}
+		}
+	}
+}
+
+// loadPromotedMetaCached reads the content-free meta cache for ranking (fast parse,
+// no content bytes). Returns ok=false when the cache is absent so the caller falls
+// back to loadPromotedMeta over the source.
+func loadPromotedMetaCached(dataDir, workspaceID string) ([]ContextEntry, bool) {
+	cachePath := contextMetaCachePath(dataDir, workspaceID)
+	// the cache write is best-effort; never trust a cache older than the source (a
+	// failed cache write would otherwise serve stale promotion state). writeJSON is
+	// atomic, so this mtime compare is exact — the cache is whole or absent, never torn.
+	cacheInfo, cerr := os.Stat(cachePath)
+	srcInfo, serr := os.Stat(contextEntriesPath(dataDir, workspaceID))
+	if cerr != nil || serr != nil || cacheInfo.ModTime().Before(srcInfo.ModTime()) {
+		return nil, false
+	}
+	var metas []contextEntryMeta
+	if err := readJSON(cachePath, &metas); err != nil {
+		return nil, false
+	}
+	out := make([]ContextEntry, 0, len(metas))
+	for i := range metas {
+		if metas[i].Promoted {
+			out = append(out, metas[i].toEntry())
+		}
+	}
+	return out, true
+}
+
+// loadWindowContent returns the content of the requested ids, reading each id's
+// hash-named content file first (O(window) reads, no full-source parse) and falling
+// back to a streaming source read for any id whose content file is missing — covering
+// legacy/unmigrated entries and the rare case of a failed content-file write (the
+// new-hash file is then absent, so we never serve stale content). idHashes maps each
+// window id to the ContentHash recorded in the (source-fresh) meta cache.
+func loadWindowContent(dataDir, workspaceID string, idHashes map[string]string) map[string]string {
+	out := make(map[string]string, len(idHashes))
+	missing := make(map[string]struct{})
+	for id, hash := range idHashes {
+		var content string
+		if err := readJSON(contextContentFilePath(dataDir, workspaceID, id, hash), &content); err == nil {
+			out[id] = content
+		} else {
+			missing[id] = struct{}{}
+		}
+	}
+	if len(missing) > 0 {
+		if fromSource, err := loadContentsForIDs(dataDir, workspaceID, missing); err == nil {
+			for id, c := range fromSource {
+				out[id] = c
+			}
+		}
+	}
+	return out
 }
 
 // loadContentsForIDs streams the entry store and returns the content of ONLY the
@@ -257,7 +397,13 @@ func loadContentsForIDs(dataDir, workspaceID string, ids map[string]struct{}) (m
 }
 
 func saveContextEntries(dataDir, workspaceID string, entries []ContextEntry) error {
-	return writeJSON(contextEntriesPath(dataDir, workspaceID), entries)
+	if err := writeJSON(contextEntriesPath(dataDir, workspaceID), entries); err != nil {
+		return err
+	}
+	// refresh the content-free meta cache (recall's fast ranking parse). Derived +
+	// best-effort: a stale/missing cache only makes recall fall back to the source.
+	writeContextMetaCache(dataDir, workspaceID, entries)
+	return nil
 }
 
 // contextDefaults returns (requireMultiAgent, threshold) from settings.
@@ -391,6 +537,10 @@ func ProposeContext(dataDir, workspaceID string, req ProposeContextRequest) (*Co
 	if err := saveContextEntries(dataDir, workspaceID, entries); err != nil {
 		return nil, err
 	}
+	// persist the per-id content file (recall's window read cache) — only here and in
+	// UpdateContextContent, the two sites that set content, so verify/promote never
+	// rewrite content files.
+	writeContextContentFile(dataDir, workspaceID, entry.ID, entry.Content)
 	return &entry, nil
 }
 
@@ -520,6 +670,8 @@ func UpdateContextContent(dataDir, workspaceID, entryID, content string) (*Conte
 	if err := saveContextEntries(dataDir, workspaceID, entries); err != nil {
 		return nil, err
 	}
+	// content changed → refresh the per-id content file (recall's window read cache).
+	writeContextContentFile(dataDir, workspaceID, entry.ID, entry.Content)
 	return entry, nil
 }
 
@@ -596,10 +748,15 @@ func GetActiveContext(dataDir, workspaceID string) (map[string]any, error) {
 func RecallContext(dataDir, workspaceID, query string, paths []string, limit int) (map[string]any, error) {
 	// metadata-first load: rank on content-less metadata (precomputed SearchTokens), so
 	// recall's decode/allocation doesn't scale with content size; content is fetched
-	// only for the returned window below (XM-PRO-010).
-	promoted, err := loadPromotedMeta(dataDir, workspaceID)
-	if err != nil {
-		return nil, err
+	// only for the returned window below (XM-PRO-010). The content-free meta CACHE bounds
+	// the ranking PARSE time too — parsing it never touches the source's content bytes —
+	// with a transparent fallback to the source when the cache is absent.
+	promoted, ok := loadPromotedMetaCached(dataDir, workspaceID)
+	if !ok {
+		var err error
+		if promoted, err = loadPromotedMeta(dataDir, workspaceID); err != nil {
+			return nil, err
+		}
 	}
 	metaFast := true
 	for i := range promoted {
@@ -732,14 +889,16 @@ func RecallContext(dataDir, workspaceID, query string, paths []string, limit int
 	// In the metadata-fast path the ranked entries carry no content — load it for ONLY
 	// the returned window (the rest of the store's content is never allocated).
 	if metaFast && len(out) > 0 {
-		ids := make(map[string]struct{}, len(out))
+		idHashes := make(map[string]string, len(out))
 		for i := range out {
-			ids[out[i].ID] = struct{}{}
+			idHashes[out[i].ID] = out[i].ContentHash
 		}
-		if contents, cerr := loadContentsForIDs(dataDir, workspaceID, ids); cerr == nil {
-			for i := range out {
-				out[i].Content = contents[out[i].ID]
-			}
+		// per-id hash-named content files first (O(window) reads, no full-source parse);
+		// any missing file falls back to a streaming source read inside loadWindowContent.
+		contents := loadWindowContent(dataDir, workspaceID, idHashes)
+		for i := range out {
+			out[i].Content = contents[out[i].ID]
+			out[i].ContentHash = "" // derived transport field — don't leak it to callers
 		}
 	}
 	return map[string]any{
