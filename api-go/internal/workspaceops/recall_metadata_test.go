@@ -2,8 +2,54 @@ package workspaceops
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 )
+
+// In the metadata-fast path recall ranks on content-less metadata, then loads full
+// content for ONLY the returned window — so a returned entry still carries its content
+// while the rest of the store's content is never allocated (XM-PRO-010 final).
+func TestRecallMetaFastLoadsContentForReturnedWindow(t *testing.T) {
+	dir := t.TempDir()
+	ws := "wsMetaContent"
+	root := t.TempDir()
+	writeSnapshotWithRoot(t, dir, ws, root)
+
+	const n = 120
+	entries := make([]ContextEntry, 0, n)
+	for i := 0; i < n; i++ {
+		title := fmt.Sprintf("entry %d", i)
+		content := fmt.Sprintf("body %d generic filler text", i)
+		if i == n-1 {
+			title = "guardrail note"
+			content = "the spend guardrail enforces a daily budget ceiling MARKER_XYZ"
+		}
+		entries = append(entries, ContextEntry{
+			ID:           fmt.Sprintf("e%04d", i),
+			Title:        title,
+			Content:      content,
+			Status:       "verified",
+			Promoted:     true,
+			CreatedAt:    fmt.Sprintf("2026-06-01T00:00:00.%09dZ", i),
+			UpdatedAt:    fmt.Sprintf("2026-06-01T00:00:00.%09dZ", i),
+			SearchTokens: memoryTokenList(title + " " + content),
+		})
+	}
+	if err := saveContextEntries(dir, ws, entries); err != nil {
+		t.Fatal(err)
+	}
+	res, err := RecallContext(dir, ws, "spend guardrail ceiling", nil, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := res["entries"].([]ContextEntry)
+	if len(got) != 1 {
+		t.Fatalf("want 1 returned entry, got %d", len(got))
+	}
+	if !strings.Contains(got[0].Content, "MARKER_XYZ") {
+		t.Fatalf("the returned entry must carry its loaded content, got %q", got[0].Content)
+	}
+}
 
 // Recall must rank on precomputed metadata (SearchTokens), NOT re-tokenize every
 // promoted entry's full content on every call — so its CPU/allocation stops scaling

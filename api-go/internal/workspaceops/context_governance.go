@@ -3,6 +3,7 @@ package workspaceops
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -170,6 +171,89 @@ func loadContextEntries(dataDir, workspaceID string) ([]ContextEntry, error) {
 		return nil, err
 	}
 	return entries, nil
+}
+
+// contextEntryMeta mirrors ContextEntry WITHOUT the Content field, so loading the
+// promoted history for ranking skips allocating every entry's content string — recall's
+// decode/allocation stops scaling with content size (XM-PRO-010). Content is loaded
+// only for the returned window. KEEP IN SYNC with ContextEntry (minus Content/Stale).
+type contextEntryMeta struct {
+	ID                    string                `json:"id"`
+	WorkspaceID           string                `json:"workspace_id"`
+	Title                 string                `json:"title"`
+	Source                string                `json:"source"`
+	Permission            string                `json:"permission"`
+	Status                string                `json:"status"`
+	Promoted              bool                  `json:"promoted"`
+	Verifications         []ContextVerification `json:"verifications"`
+	RequiredVerifications int                   `json:"required_verifications"`
+	CreatedAt             string                `json:"created_at"`
+	UpdatedAt             string                `json:"updated_at"`
+	Paths                 []string              `json:"paths,omitempty"`
+	PathHashes            map[string]string     `json:"path_hashes,omitempty"`
+	SearchTokens          []string              `json:"search_tokens,omitempty"`
+}
+
+func (m *contextEntryMeta) toEntry() ContextEntry {
+	return ContextEntry{
+		ID: m.ID, WorkspaceID: m.WorkspaceID, Title: m.Title, Source: m.Source,
+		Permission: m.Permission, Status: m.Status, Promoted: m.Promoted,
+		Verifications: m.Verifications, RequiredVerifications: m.RequiredVerifications,
+		CreatedAt: m.CreatedAt, UpdatedAt: m.UpdatedAt, Paths: m.Paths,
+		PathHashes: m.PathHashes, SearchTokens: m.SearchTokens,
+		// Content is loaded for the returned window; Stale/StalePaths at read time.
+	}
+}
+
+// loadPromotedMeta loads the promoted entries WITHOUT their content (the JSON
+// "content" value is scanned past, not allocated) for the recall ranking pass.
+func loadPromotedMeta(dataDir, workspaceID string) ([]ContextEntry, error) {
+	var metas []contextEntryMeta
+	if err := readJSON(contextEntriesPath(dataDir, workspaceID), &metas); err != nil {
+		if os.IsNotExist(err) {
+			return []ContextEntry{}, nil
+		}
+		return nil, err
+	}
+	out := make([]ContextEntry, 0, len(metas))
+	for i := range metas {
+		if metas[i].Promoted {
+			out = append(out, metas[i].toEntry())
+		}
+	}
+	return out, nil
+}
+
+// loadContentsForIDs streams the entry store and returns the content of ONLY the
+// requested ids, so recall fetches content for just the returned window — the rest of
+// the (potentially huge) content is decoded transiently and discarded, never retained.
+func loadContentsForIDs(dataDir, workspaceID string, ids map[string]struct{}) (map[string]string, error) {
+	f, err := os.Open(contextEntriesPath(dataDir, workspaceID))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return map[string]string{}, nil
+		}
+		return nil, err
+	}
+	defer f.Close()
+	dec := json.NewDecoder(f)
+	if _, err := dec.Token(); err != nil { // opening '['
+		return nil, err
+	}
+	out := make(map[string]string, len(ids))
+	for dec.More() {
+		var e struct {
+			ID      string `json:"id"`
+			Content string `json:"content"`
+		}
+		if err := dec.Decode(&e); err != nil {
+			return nil, err
+		}
+		if _, want := ids[e.ID]; want {
+			out[e.ID] = e.Content
+		}
+	}
+	return out, nil
 }
 
 func saveContextEntries(dataDir, workspaceID string, entries []ContextEntry) error {
@@ -510,9 +594,27 @@ func GetActiveContext(dataDir, workspaceID string) (map[string]any, error) {
 // top-N, so an agent grounds on the few facts that matter rather than the whole
 // store. With no query or paths it falls back to recency-ranked top-N.
 func RecallContext(dataDir, workspaceID, query string, paths []string, limit int) (map[string]any, error) {
-	promoted, err := ListContextEntries(dataDir, workspaceID, "promoted")
+	// metadata-first load: rank on content-less metadata (precomputed SearchTokens), so
+	// recall's decode/allocation doesn't scale with content size; content is fetched
+	// only for the returned window below (XM-PRO-010).
+	promoted, err := loadPromotedMeta(dataDir, workspaceID)
 	if err != nil {
 		return nil, err
+	}
+	metaFast := true
+	for i := range promoted {
+		if len(promoted[i].SearchTokens) == 0 {
+			// a legacy entry without precomputed tokens needs its content to rank
+			// correctly — fall back to the full load (transitional; entries written
+			// since SearchTokens landed always carry them).
+			full, ferr := ListContextEntries(dataDir, workspaceID, "promoted")
+			if ferr != nil {
+				return nil, ferr
+			}
+			promoted = full
+			metaFast = false
+			break
+		}
 	}
 	if limit <= 0 {
 		limit = 8
@@ -625,6 +727,19 @@ func RecallContext(dataDir, workspaceID, query string, paths []string, limit int
 		out = append(out, s.entry)
 		if len(out) >= limit {
 			break
+		}
+	}
+	// In the metadata-fast path the ranked entries carry no content — load it for ONLY
+	// the returned window (the rest of the store's content is never allocated).
+	if metaFast && len(out) > 0 {
+		ids := make(map[string]struct{}, len(out))
+		for i := range out {
+			ids[out[i].ID] = struct{}{}
+		}
+		if contents, cerr := loadContentsForIDs(dataDir, workspaceID, ids); cerr == nil {
+			for i := range out {
+				out[i].Content = contents[out[i].ID]
+			}
 		}
 	}
 	return map[string]any{
