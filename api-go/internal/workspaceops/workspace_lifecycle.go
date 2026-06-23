@@ -44,6 +44,28 @@ type ExportBundle struct {
 	ExportedAt           string                      `json:"exported_at"`
 }
 
+// ListWorkspacesScoped returns only the workspaces the principal may access. An
+// unrestricted principal (nil, or a token with no workspace scope claim) sees all; a
+// workspace-scoped token sees only its allowed roots — so GET /api/workspaces never
+// discloses other tenants' repo root paths to a scoped caller (the list was previously
+// unfiltered even though per-workspace routes were scope-checked).
+func ListWorkspacesScoped(dataDir string, principal *Principal) ([]workspaceRecord, error) {
+	items, err := ListWorkspaces(dataDir)
+	if err != nil {
+		return nil, err
+	}
+	if principal == nil || len(principal.Workspaces) == 0 {
+		return items, nil
+	}
+	filtered := make([]workspaceRecord, 0, len(items))
+	for _, it := range items {
+		if principal.AllowsWorkspace(it.WorkspaceID) {
+			filtered = append(filtered, it)
+		}
+	}
+	return filtered, nil
+}
+
 func ListWorkspaces(dataDir string) ([]workspaceRecord, error) {
 	path := filepath.Join(dataDir, "workspaces.json")
 	var items []workspaceRecord

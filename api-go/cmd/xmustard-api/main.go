@@ -392,8 +392,11 @@ func main() {
 		writeJSON(w, http.StatusOK, result)
 	})
 	mux.HandleFunc("GET /api/workspaces", func(w http.ResponseWriter, r *http.Request) {
-		result, err := workspaceops.ListWorkspaces(
+		// Filter the list by the caller's token scope so a workspace-scoped (per-worker)
+		// token can't enumerate other tenants' repo roots. Unscoped tokens see all.
+		result, err := workspaceops.ListWorkspacesScoped(
 			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
+			principalFromContext(r.Context()),
 		)
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{
