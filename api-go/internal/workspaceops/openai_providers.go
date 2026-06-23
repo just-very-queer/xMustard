@@ -83,13 +83,28 @@ func rejectBlockedURLHost(baseURL string) error {
 // time. This keeps secrets out of providers.json (which is plain config).
 
 type OpenAIProvider struct {
-	Name           string `json:"name"`
-	Kind           string `json:"kind"` // ollama | openai | vllm | lmstudio | custom
-	BaseURL        string `json:"base_url"`
-	APIKeyEnv      string `json:"api_key_env,omitempty"` // env var holding the key, NOT the key
-	DefaultModel   string `json:"default_model,omitempty"`
-	SupportsVision bool   `json:"supports_vision"`
-	CreatedAt      string `json:"created_at"`
+	Name         string `json:"name"`
+	Kind         string `json:"kind"` // ollama | openai | vllm | lmstudio | custom
+	BaseURL      string `json:"base_url"`
+	APIKeyEnv    string `json:"api_key_env,omitempty"` // env var holding the key, NOT the key
+	DefaultModel string `json:"default_model,omitempty"`
+	SupportsVision bool `json:"supports_vision"`
+	// Capabilities are the model CLASSES this provider declares it serves well
+	// (code-specialized | large-reasoning | small-fast | vision). When present, routing
+	// uses this STRUCTURED signal in preference to guessing the class from the model
+	// name — operator intent over a substring heuristic. Empty = fall back to the name.
+	Capabilities []string `json:"capabilities,omitempty"`
+	CreatedAt    string   `json:"created_at"`
+}
+
+// declaresCapability reports whether the provider explicitly declares it serves a class.
+func (p OpenAIProvider) declaresCapability(class string) bool {
+	for _, c := range p.Capabilities {
+		if strings.EqualFold(strings.TrimSpace(c), class) {
+			return true
+		}
+	}
+	return false
 }
 
 func providersPath(dataDir string) string {

@@ -171,7 +171,17 @@ func RouteModel(dataDir string, req RouteRequest) (*ModelRoute, error) {
 		route.Reason = "vision task but no supports_vision provider; "
 	}
 
-	// prefer a provider whose default_model name matches the class.
+	// 3a) STRUCTURED capability match: a provider that explicitly DECLARES it serves this
+	// model class is the strongest signal — operator intent beats name-guessing.
+	for _, p := range providers {
+		if p.declaresCapability(modelClass) {
+			route.Provider = p.Name
+			route.Model = pickModelForClass(p, modelClass)
+			route.Reason += "matched " + modelClass + " by declared capability on provider " + p.Name
+			return route, nil
+		}
+	}
+	// 3b) fall back to guessing the class from the default_model name.
 	for _, p := range providers {
 		if p.DefaultModel != "" && modelLooksLike(p.DefaultModel, modelClass) {
 			route.Provider = p.Name
