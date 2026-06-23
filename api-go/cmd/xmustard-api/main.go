@@ -3542,6 +3542,12 @@ func main() {
 		}
 		writeJSON(w, http.StatusOK, result)
 	})
+	// Verifier reliability + pairwise-agreement telemetry (the evidence a future weighted
+	// quorum would use; the gate itself stays an unweighted distinct-agent threshold).
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/verifier-telemetry", func(w http.ResponseWriter, r *http.Request) {
+		result, err := workspaceops.ComputeVerifierTelemetry(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))
+		issueIntel(w, err, result)
+	})
 	// --- per-run brief export ---
 	mux.HandleFunc("GET /api/workspaces/{workspace_id}/runs/{run_id}/brief", func(w http.ResponseWriter, r *http.Request) {
 		result, err := workspaceops.BuildRunBrief(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), r.PathValue("run_id"))
