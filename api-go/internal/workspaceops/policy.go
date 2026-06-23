@@ -85,7 +85,7 @@ func SetWorkspacePolicy(dataDir, workspaceID string, policy WorkspacePolicy) (*W
 	policy.RequiredVerificationProfileIDs = cleanStrings(policy.RequiredVerificationProfileIDs)
 	for _, rt := range policy.AllowedRuntimes {
 		if !validPolicyRuntime(rt) {
-			return nil, fmt.Errorf("invalid runtime %q in allowed_runtimes", rt)
+			return nil, Invalid(fmt.Sprintf("invalid runtime %q in allowed_runtimes", rt))
 		}
 	}
 	if policy.BudgetWarningUSD != nil && *policy.BudgetWarningUSD < 0 {

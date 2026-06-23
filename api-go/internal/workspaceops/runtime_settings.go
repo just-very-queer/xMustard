@@ -356,7 +356,7 @@ func buildIssueWorkPacketForRun(
 		return nil, nil, os.ErrNotExist
 	}
 	if scenario.IssueID != issueID {
-		return nil, nil, fmt.Errorf("eval scenario %s does not belong to issue %s", scenarioID, issueID)
+		return nil, nil, Invalid(fmt.Sprintf("eval scenario %s does not belong to issue %s", scenarioID, issueID))
 	}
 	packet, err := BuildIssueContextPacket(dataDir, workspaceID, issueID)
 	if err != nil {

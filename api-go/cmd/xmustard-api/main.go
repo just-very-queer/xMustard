@@ -315,15 +315,7 @@ func main() {
 			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
 		)
 		if err != nil {
-			if strings.Contains(strings.ToLower(err.Error()), "postgres schema") {
-				writeJSON(w, http.StatusBadRequest, map[string]any{
-					"error": err.Error(),
-				})
-				return
-			}
-			writeJSON(w, http.StatusInternalServerError, map[string]any{
-				"error": err.Error(),
-			})
+			respondError(w, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, result)
@@ -334,15 +326,7 @@ func main() {
 			r.URL.Query().Get("schema"),
 		)
 		if err != nil {
-			if strings.Contains(strings.ToLower(err.Error()), "postgres schema") {
-				writeJSON(w, http.StatusBadRequest, map[string]any{
-					"error": err.Error(),
-				})
-				return
-			}
-			writeJSON(w, http.StatusInternalServerError, map[string]any{
-				"error": err.Error(),
-			})
+			respondError(w, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"sql": sqlText})
@@ -402,21 +386,7 @@ func main() {
 			request.Model,
 		)
 		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				writeJSON(w, http.StatusNotFound, map[string]any{
-					"error": err.Error(),
-				})
-				return
-			}
-			if strings.Contains(strings.ToLower(err.Error()), "model") {
-				writeJSON(w, http.StatusBadRequest, map[string]any{
-					"error": err.Error(),
-				})
-				return
-			}
-			writeJSON(w, http.StatusInternalServerError, map[string]any{
-				"error": err.Error(),
-			})
+			respondError(w, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, result)
@@ -446,27 +416,7 @@ func main() {
 			request,
 		)
 		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				writeJSON(w, http.StatusNotFound, map[string]any{
-					"error": "Workspace snapshot not found",
-				})
-				return
-			}
-			if strings.Contains(strings.ToLower(err.Error()), "root_path") {
-				writeJSON(w, http.StatusBadRequest, map[string]any{
-					"error": err.Error(),
-				})
-				return
-			}
-			if strings.Contains(strings.ToLower(err.Error()), "not yet migrated") {
-				writeJSON(w, http.StatusServiceUnavailable, map[string]any{
-					"error": err.Error(),
-				})
-				return
-			}
-			writeJSON(w, http.StatusInternalServerError, map[string]any{
-				"error": err.Error(),
-			})
+			respondError(w, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, result)
@@ -611,23 +561,7 @@ func main() {
 			request,
 		)
 		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				writeJSON(w, http.StatusNotFound, map[string]any{
-					"error": "Missing resource",
-				})
-				return
-			}
-			if strings.Contains(strings.ToLower(err.Error()), "model") ||
-				strings.Contains(strings.ToLower(err.Error()), "runtime") ||
-				strings.Contains(strings.ToLower(err.Error()), "instruction") {
-				writeJSON(w, http.StatusBadRequest, map[string]any{
-					"error": err.Error(),
-				})
-				return
-			}
-			writeJSON(w, http.StatusInternalServerError, map[string]any{
-				"error": err.Error(),
-			})
+			respondError(w, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, result)
@@ -647,23 +581,7 @@ func main() {
 			request,
 		)
 		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				writeJSON(w, http.StatusNotFound, map[string]any{
-					"error": "Missing resource",
-				})
-				return
-			}
-			if strings.Contains(strings.ToLower(err.Error()), "prompt is required") ||
-				strings.Contains(strings.ToLower(err.Error()), "model") ||
-				strings.Contains(strings.ToLower(err.Error()), "runtime") {
-				writeJSON(w, http.StatusBadRequest, map[string]any{
-					"error": err.Error(),
-				})
-				return
-			}
-			writeJSON(w, http.StatusInternalServerError, map[string]any{
-				"error": err.Error(),
-			})
+			respondError(w, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, result)
@@ -798,21 +716,7 @@ func main() {
 			request,
 		)
 		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				writeJSON(w, http.StatusNotFound, map[string]any{
-					"error": "Workspace not found",
-				})
-				return
-			}
-			if strings.Contains(strings.ToLower(err.Error()), "already exists") {
-				writeJSON(w, http.StatusBadRequest, map[string]any{
-					"error": err.Error(),
-				})
-				return
-			}
-			writeJSON(w, http.StatusInternalServerError, map[string]any{
-				"error": err.Error(),
-			})
+			respondError(w, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, result)
@@ -1263,22 +1167,7 @@ func main() {
 			runID,
 		)
 		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				writeJSON(w, http.StatusNotFound, map[string]any{
-					"error": "Run not found",
-				})
-				return
-			}
-			if strings.Contains(strings.ToLower(err.Error()), "model") ||
-				strings.Contains(strings.ToLower(err.Error()), "runtime") {
-				writeJSON(w, http.StatusBadRequest, map[string]any{
-					"error": err.Error(),
-				})
-				return
-			}
-			writeJSON(w, http.StatusInternalServerError, map[string]any{
-				"error": err.Error(),
-			})
+			respondError(w, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, result)
@@ -1292,23 +1181,7 @@ func main() {
 			runID,
 		)
 		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				writeJSON(w, http.StatusNotFound, map[string]any{
-					"error": err.Error(),
-				})
-				return
-			}
-			if strings.Contains(strings.ToLower(err.Error()), "cannot generate plan") ||
-				strings.Contains(strings.ToLower(err.Error()), "runtime") ||
-				strings.Contains(strings.ToLower(err.Error()), "model") {
-				writeJSON(w, http.StatusBadRequest, map[string]any{
-					"error": err.Error(),
-				})
-				return
-			}
-			writeJSON(w, http.StatusInternalServerError, map[string]any{
-				"error": err.Error(),
-			})
+			respondError(w, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, result)
@@ -1322,15 +1195,7 @@ func main() {
 			runID,
 		)
 		if err != nil {
-			if errors.Is(err, os.ErrNotExist) || strings.Contains(strings.ToLower(err.Error()), "no plan found") {
-				writeJSON(w, http.StatusNotFound, map[string]any{
-					"error": "No plan found for this run",
-				})
-				return
-			}
-			writeJSON(w, http.StatusInternalServerError, map[string]any{
-				"error": err.Error(),
-			})
+			respondError(w, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, result)
@@ -1352,23 +1217,7 @@ func main() {
 			request,
 		)
 		if err != nil {
-			if errors.Is(err, os.ErrNotExist) || strings.Contains(strings.ToLower(err.Error()), "no plan found") {
-				writeJSON(w, http.StatusNotFound, map[string]any{
-					"error": err.Error(),
-				})
-				return
-			}
-			if strings.Contains(strings.ToLower(err.Error()), "awaiting approval") ||
-				strings.Contains(strings.ToLower(err.Error()), "runtime") ||
-				strings.Contains(strings.ToLower(err.Error()), "model") {
-				writeJSON(w, http.StatusBadRequest, map[string]any{
-					"error": err.Error(),
-				})
-				return
-			}
-			writeJSON(w, http.StatusInternalServerError, map[string]any{
-				"error": err.Error(),
-			})
+			respondError(w, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, result)
