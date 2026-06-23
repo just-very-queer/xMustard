@@ -113,6 +113,7 @@ pub fn repo_role(path: &str) -> &'static str {
     // same guidance the Go grounding packet does — one cross-FFI contract (XM-PRO-012).
     if lower.starts_with(".cursor/rules/")
         || lower.starts_with(".openhands/microagents/")
+        || lower.starts_with(".openhands/skills/")
         || lower.starts_with(".agents/skills/")
     {
         return "guide";
@@ -1495,6 +1496,33 @@ mod tests {
             hash_repo_file_beneath(root.path(), "a.rs").unwrap(),
             expected
         );
+    }
+
+    // The repo_role classifier must match the SHARED golden spec (one source of truth
+    // both Go and Rust pin to, so the code/test/doc/guide/config/other taxonomy and the
+    // guidance set can't drift across the FFI). The matching Go test is
+    // TestGuidanceRootsMatchGoldenSpec.
+    #[test]
+    fn repo_role_matches_golden_spec() {
+        let spec = include_str!("testdata/repo_role_golden.tsv");
+        let mut checked = 0;
+        for (i, line) in spec.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let (path, role) = line
+                .split_once('\t')
+                .unwrap_or_else(|| panic!("golden line {} not tab-separated: {line:?}", i + 1));
+            assert_eq!(
+                repo_role(path.trim()),
+                role.trim(),
+                "repo_role({:?}) disagrees with the golden spec",
+                path.trim()
+            );
+            checked += 1;
+        }
+        assert!(checked >= 20, "golden spec should pin many paths, got {checked}");
     }
 
     // A directory target is not a regular file and must be refused by the read/hash path.

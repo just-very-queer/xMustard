@@ -359,35 +359,43 @@ func listReplayActivity(dataDir string, workspaceID string, issueID string, limi
 // below must stay ALIGNED with rust-core symbolgraph.rs repo_role's "guide"
 // classification, so the Rust docs/guidance SEARCH segment and this Go grounding
 // packet recognize the same guidance (XM-PRO-012).
+// guidanceRoot is one recognized guidance file (candidate) or walk-root directory. The
+// two lists below are the cross-FFI guidance contract: they MUST stay aligned with the
+// rust-core symbolgraph.rs repo_role "guide" classification — pinned by the shared golden
+// spec (rust-core/src/testdata/repo_role_golden.tsv) and its Go/Rust golden tests.
+type guidanceRoot struct {
+	path     string
+	kind     string
+	alwaysOn bool
+	priority int
+}
+
+// guidanceCandidateFiles are the named guidance files recognized at fixed repo paths.
+var guidanceCandidateFiles = []guidanceRoot{
+	{path: "AGENTS.md", kind: "agent_instructions", alwaysOn: true, priority: 10},
+	{path: "agents.md", kind: "agent_instructions", alwaysOn: true, priority: 10},
+	{path: "CLAUDE.md", kind: "agent_instructions", alwaysOn: true, priority: 12},
+	{path: "GEMINI.md", kind: "agent_instructions", alwaysOn: true, priority: 12},
+	{path: ".openhands/microagents/repo.md", kind: "agent_instructions", alwaysOn: true, priority: 14},
+	{path: "CONVENTIONS.md", kind: "conventions", alwaysOn: true, priority: 20},
+	{path: ".clinerules", kind: "conventions", alwaysOn: true, priority: 22},
+	{path: ".cursorrules", kind: "conventions", alwaysOn: true, priority: 22},
+	{path: ".devin/wiki.json", kind: "repo_index", alwaysOn: true, priority: 25},
+	{path: "README.md", kind: "workspace_overview", alwaysOn: false, priority: 60},
+}
+
+// guidanceWalkRoots are directories whose .md/.mdc/.json files are all guidance.
+var guidanceWalkRoots = []guidanceRoot{
+	{path: ".openhands/microagents", kind: "agent_instructions", alwaysOn: true, priority: 28},
+	{path: ".openhands/skills", kind: "skill", alwaysOn: false, priority: 30},
+	{path: ".agents/skills", kind: "skill", alwaysOn: false, priority: 32},
+	{path: ".cursor/rules", kind: "conventions", alwaysOn: false, priority: 34},
+}
+
 func collectWorkspaceGuidance(root string, workspaceID string) ([]RepoGuidanceRecord, error) {
 	rootPath := filepath.Clean(root)
-	candidates := []struct {
-		path     string
-		kind     string
-		alwaysOn bool
-		priority int
-	}{
-		{path: "AGENTS.md", kind: "agent_instructions", alwaysOn: true, priority: 10},
-		{path: "agents.md", kind: "agent_instructions", alwaysOn: true, priority: 10},
-		{path: "CLAUDE.md", kind: "agent_instructions", alwaysOn: true, priority: 12},
-		{path: "GEMINI.md", kind: "agent_instructions", alwaysOn: true, priority: 12},
-		{path: ".openhands/microagents/repo.md", kind: "agent_instructions", alwaysOn: true, priority: 14},
-		{path: "CONVENTIONS.md", kind: "conventions", alwaysOn: true, priority: 20},
-		{path: ".clinerules", kind: "conventions", alwaysOn: true, priority: 22},
-		{path: ".devin/wiki.json", kind: "repo_index", alwaysOn: true, priority: 25},
-		{path: "README.md", kind: "workspace_overview", alwaysOn: false, priority: 60},
-	}
-	walkRoots := []struct {
-		path     string
-		kind     string
-		alwaysOn bool
-		priority int
-	}{
-		{path: ".openhands/microagents", kind: "agent_instructions", alwaysOn: true, priority: 28},
-		{path: ".openhands/skills", kind: "skill", alwaysOn: false, priority: 30},
-		{path: ".agents/skills", kind: "skill", alwaysOn: false, priority: 32},
-		{path: ".cursor/rules", kind: "conventions", alwaysOn: false, priority: 34},
-	}
+	candidates := guidanceCandidateFiles
+	walkRoots := guidanceWalkRoots
 
 	seen := map[string]struct{}{}
 	items := make([]RepoGuidanceRecord, 0, 12)

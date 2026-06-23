@@ -1,0 +1,39 @@
+# Shared Go/Rust repo-role golden spec (one source of truth). Format: <path>\t<role>.
+# Roles: code | test | doc | guide | config | other (see rust-core symbolgraph.rs repo_role).
+# The Rust test (repo_role_matches_golden_spec) asserts repo_role(path)==role for every
+# row; the Go test (TestGuidanceRootsMatchGoldenSpec) asserts the Go guidance discovery
+# recognizes exactly the `guide` path-roots/filenames here. Keep BOTH in sync via this file.
+#
+# --- guidance (path roots, must mirror Go collectWorkspaceGuidance walkRoots) ---
+.cursor/rules/style.md	guide
+.openhands/microagents/repo.md	guide
+.openhands/skills/refactor.md	guide
+.agents/skills/test.md	guide
+# --- guidance (named files, must mirror Go candidate filenames) ---
+AGENTS.md	guide
+CLAUDE.md	guide
+GEMINI.md	guide
+CONVENTIONS.md	guide
+README.md	guide
+.clinerules	guide
+.cursorrules	guide
+# --- code ---
+src/main.rs	code
+api-go/server.go	code
+frontend/src/app.tsx	code
+lib/util.py	code
+# --- test ---
+src/foo_test.go	test
+tests/test_thing.py	test
+# --- doc ---
+docs/architecture.md	doc
+notes.rst	doc
+guide.adoc	doc
+# --- config ---
+Cargo.toml	config
+package.json	config
+config.yaml	config
+settings.ini	config
+# --- other ---
+image.png	other
+data.bin	other
