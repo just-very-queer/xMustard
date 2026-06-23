@@ -117,9 +117,18 @@ func ensureInlineSchema(ctx context.Context, pool *pgxpool.Pool) error {
 	return nil
 }
 
+// runMirrorObserver, when non-nil (tests only), receives every immutable run snapshot
+// handed to the PG mirror, in commit order. It lets a test prove JSON and the mirror
+// converge — and that revisions are unique + monotonic so the mirror's seq guard never
+// drops a state change — without standing up a live Postgres.
+var runMirrorObserver func(runRecord)
+
 // pgInlineUpsertRun mirrors a run (and its plan) into Postgres on every
 // saveRunRecord. Best-effort; runs on a background worker.
 func pgInlineUpsertRun(run runRecord) {
+	if obs := runMirrorObserver; obs != nil {
+		obs(run)
+	}
 	// Order by the durable per-run revision saveRunRecord just persisted.
 	pgInlineDispatch(func() { pgInlineUpsertRunSync(run, run.MirrorRevision) })
 }

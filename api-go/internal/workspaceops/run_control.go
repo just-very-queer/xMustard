@@ -102,39 +102,46 @@ func isTerminalRunStatus(status string) bool {
 }
 
 func CancelRun(dataDir string, workspaceID string, runID string) (*runRecord, error) {
-	run, err := ReadRun(dataDir, workspaceID, runID)
+	// The cancel transition runs through the serialized run transaction so it can't
+	// interleave with the launch/running/finalize writes. fn loads the authoritative
+	// status under the run lock: a run already terminal is an idempotent no-op (and is
+	// NEVER signalled — its persisted PID may have been reused by an unrelated host
+	// process group since it completed, XM-NEW-006 host-safety).
+	cancelled := false
+	run, err := mutateRun(dataDir, workspaceID, runID, func(r *runRecord) (bool, error) {
+		if isTerminalRunStatus(r.Status) {
+			return false, nil
+		}
+		completedAt := nowUTC()
+		exitCode := -15
+		r.Status = "cancelled"
+		r.CompletedAt = &completedAt
+		r.PID = nil // clear the PID so nothing can signal it after reap
+		if r.ExitCode == nil {
+			r.ExitCode = &exitCode
+		}
+		cancelled = true
+		return true, nil
+	})
 	if err != nil {
 		return nil, err
 	}
-	// Idempotent: a run already in a terminal state cannot be cancelled, and must
-	// NEVER be signalled — its persisted PID may have been reused by an unrelated
-	// host process group since it completed (XM-NEW-006, host-safety).
-	if isTerminalRunStatus(run.Status) {
-		return run, nil
+	if !cancelled {
+		return run, nil // already terminal — idempotent
 	}
+	// Cancelled status is now durably persisted (the authoritative signal a concurrent
+	// finalize will read under the same lock). Mark + signal the LIVE supervised handle
+	// only — never a bare persisted PID.
 	_, active := activeRunProcesses.Load(runID)
 	cancelledRunIDs.Store(runID, struct{}{})
 	if processValue, ok := activeRunProcesses.Load(runID); ok {
-		// signal only the LIVE supervised process handle — never a bare persisted
-		// PID (which the OS may have reused).
 		if cmd, ok := processValue.(*exec.Cmd); ok && cmd.Process != nil {
 			terminateManagedRunCommand(cmd)
 		}
 	}
-	completedAt := nowUTC()
-	exitCode := -15
-	run.Status = "cancelled"
-	run.CompletedAt = &completedAt
-	run.PID = nil // clear the PID so nothing can signal it after reap
-	if run.ExitCode == nil {
-		run.ExitCode = &exitCode
-	}
-	if err := saveRunRecord(dataDir, *run); err != nil {
-		return nil, err
-	}
 	// A run that was never active is not reaped by runManagedProcess; the durable
-	// cancelled status (saved above) is the authoritative signal, so drop the
-	// in-memory marker to keep cancelledRunIDs from accumulating.
+	// cancelled status is authoritative, so drop the in-memory marker to keep
+	// cancelledRunIDs from accumulating.
 	if !active {
 		cancelledRunIDs.Delete(runID)
 	}
@@ -288,48 +295,89 @@ func GetRunPlan(dataDir string, workspaceID string, runID string) (*RunPlan, err
 	return run.Plan, nil
 }
 
-// runLockKey is the path-keyed transaction-lock key for a single run's record, so
-// approval / launch / finalization of the same run serialize through lockStore.
-func runLockKey(dataDir, workspaceID, runID string) string {
+// runRecordPath is the single on-disk location of a run's JSON record.
+func runRecordPath(dataDir, workspaceID, runID string) string {
 	return filepath.Join(dataDir, "workspaces", workspaceID, "runs", runID+".json")
 }
 
-func ApproveRunPlan(dataDir string, workspaceID string, runID string, request PlanApproveRequest) (*RunPlan, error) {
-	// Serialize the read-check-transition-launch for this run so two concurrent
-	// approvals can't both pass the awaiting_approval check and both start a worker
-	// against the same worktree (only one process handle is then cancellable).
-	// The loser, once it holds the lock, re-reads phase=approved and bails (XM-PRO-002).
+// runLockKey is the path-keyed transaction-lock key for a single run's record, so
+// every state transition of the same run serializes through lockStore.
+func runLockKey(dataDir, workspaceID, runID string) string {
+	return runRecordPath(dataDir, workspaceID, runID)
+}
+
+// mutateRun is the ONE serialized transaction for every run state change — approve,
+// launch→running, finalization, failure, cancel, reject. It holds the per-run store
+// lock, loads the authoritative record ONCE, lets fn validate the transition and mutate
+// it in place, then commits via saveRunRecord (which bumps MirrorRevision exactly once,
+// atomically writes JSON — the source of truth — and mirrors that immutable snapshot to
+// Postgres). Holding the lock across load→validate→write closes the cancel-vs-finalize
+// and start-vs-cancel races: no two actors can interleave a read-modify-write on the
+// same run, so the JSON status is single-valued and every persisted revision is unique +
+// strictly monotonic — which is exactly what the PG mirror's "skip seq <= stored" guard
+// needs to never drop a state change (JSON and the mirror converge). fn returns
+// (commit, error): commit=false is an idempotent no-op (e.g. the run is already
+// terminal); a non-nil error aborts the transaction without writing. The *runRecord is
+// a private copy loaded under the lock — fn mutates it, not shared state.
+func mutateRun(dataDir, workspaceID, runID string, fn func(*runRecord) (bool, error)) (*runRecord, error) {
 	unlock := lockStore(runLockKey(dataDir, workspaceID, runID))
 	defer unlock()
-
-	run, err := ReadRun(dataDir, workspaceID, runID)
+	run, err := loadRun(dataDir, workspaceID, runID)
 	if err != nil {
 		return nil, err
 	}
-	if run.Plan == nil {
+	if run == nil {
 		return nil, os.ErrNotExist
 	}
-	if run.Plan.Phase != "awaiting_approval" && run.Plan.Phase != "modified" {
-		return nil, Conflict(fmt.Sprintf("plan is not awaiting approval (phase: %s)", run.Plan.Phase))
+	commit, err := fn(run)
+	if err != nil {
+		return nil, err
 	}
+	if !commit {
+		return run, nil
+	}
+	if err := saveRunRecord(dataDir, *run); err != nil {
+		return nil, err
+	}
+	// return the persisted snapshot carrying the just-bumped MirrorRevision.
+	if persisted, lerr := loadRun(dataDir, workspaceID, runID); lerr == nil && persisted != nil {
+		return persisted, nil
+	}
+	return run, nil
+}
+
+func ApproveRunPlan(dataDir string, workspaceID string, runID string, request PlanApproveRequest) (*RunPlan, error) {
+	// The whole read-check-transition serializes through the run transaction so two
+	// concurrent approvals can't both pass the awaiting_approval check and both start a
+	// worker against the same worktree (only one process handle is then cancellable).
+	// The loser, once it holds the lock, re-reads phase=approved and bails (XM-PRO-002).
 	snapshot, err := loadSnapshot(dataDir, workspaceID)
 	if err != nil {
 		return nil, err
 	}
-	approvedAt := nowUTC()
-	approver := "operator"
 	feedback := trimOptional(request.Feedback)
-	modifiedSummary := (*string)(nil)
-	if feedback != nil && run.Plan.Phase == "modified" {
-		modifiedSummary = feedback
-	}
-	run.Plan.Phase = "approved"
-	run.Plan.ApprovedAt = &approvedAt
-	run.Plan.Approver = &approver
-	run.Plan.Feedback = feedback
-	run.Plan.ModifiedSummary = modifiedSummary
-	run.Status = "queued"
-	if err := saveRunRecord(dataDir, *run); err != nil {
+	run, err := mutateRun(dataDir, workspaceID, runID, func(r *runRecord) (bool, error) {
+		if r.Plan == nil {
+			return false, os.ErrNotExist
+		}
+		if r.Plan.Phase != "awaiting_approval" && r.Plan.Phase != "modified" {
+			return false, Conflict(fmt.Sprintf("plan is not awaiting approval (phase: %s)", r.Plan.Phase))
+		}
+		approvedAt := nowUTC()
+		approver := "operator"
+		modifiedSummary := (*string)(nil)
+		if feedback != nil && r.Plan.Phase == "modified" {
+			modifiedSummary = feedback
+		}
+		r.Plan.Phase = "approved"
+		r.Plan.ApprovedAt = &approvedAt
+		r.Plan.Approver = &approver
+		r.Plan.Feedback = feedback
+		r.Plan.ModifiedSummary = modifiedSummary
+		r.Status = "queued"
+		return true, nil
+	})
+	if err != nil {
 		return nil, err
 	}
 	startManagedRun(dataDir, *run, snapshot.Workspace.RootPath)
@@ -349,20 +397,22 @@ func ApproveRunPlan(dataDir string, workspaceID string, runID string, request Pl
 }
 
 func RejectRunPlan(dataDir string, workspaceID string, runID string, request PlanRejectRequest) (*RunPlan, error) {
-	run, err := ReadRun(dataDir, workspaceID, runID)
-	if err != nil {
-		return nil, err
-	}
-	if run.Plan == nil {
-		return nil, os.ErrNotExist
-	}
-	run.Plan.Phase = "rejected"
 	reason := strings.TrimSpace(request.Reason)
-	if reason != "" {
-		run.Plan.Feedback = &reason
-	}
-	run.Status = "cancelled"
-	if err := saveRunRecord(dataDir, *run); err != nil {
+	run, err := mutateRun(dataDir, workspaceID, runID, func(r *runRecord) (bool, error) {
+		if r.Plan == nil {
+			return false, os.ErrNotExist
+		}
+		if isTerminalRunStatus(r.Status) {
+			return false, nil // already cancelled/done — don't clobber a terminal run
+		}
+		r.Plan.Phase = "rejected"
+		if reason != "" {
+			r.Plan.Feedback = &reason
+		}
+		r.Status = "cancelled"
+		return true, nil
+	})
+	if err != nil {
 		return nil, err
 	}
 	if err := appendRunActivityWithActor(
@@ -419,14 +469,30 @@ func runManagedProcess(dataDir string, run runRecord, workspaceRoot string) {
 		saveRunFailure(dataDir, run, err)
 		return
 	}
+	// Publish the live handle BEFORE claiming running, so a concurrent CancelRun can
+	// signal the real process (never a reused PID) the moment it commits cancelled.
 	activeRunProcesses.Store(run.RunID, command)
 	startedAt := nowUTC()
 	pid := command.Process.Pid
-	current := run
-	current.Status = "running"
-	current.StartedAt = &startedAt
-	current.PID = &pid
-	_ = saveRunRecord(dataDir, current)
+	// Claim the running transition under the run lock. If a cancel/reject already
+	// committed a terminal status (start-vs-cancel race), DON'T overwrite it: kill the
+	// process we just started, reap it, and leave the terminal record authoritative.
+	claimed, cerr := mutateRun(dataDir, run.WorkspaceID, run.RunID, func(r *runRecord) (bool, error) {
+		if isTerminalRunStatus(r.Status) {
+			return false, nil
+		}
+		r.Status = "running"
+		r.StartedAt = &startedAt
+		r.PID = &pid
+		return true, nil
+	})
+	if cerr != nil || claimed == nil || claimed.Status != "running" {
+		terminateManagedRunCommand(command)
+		_ = command.Wait()
+		activeRunProcesses.Delete(run.RunID)
+		cancelledRunIDs.Delete(run.RunID)
+		return
+	}
 
 	waitErr := command.Wait()
 	combinedOutput := output.String()
@@ -436,34 +502,45 @@ func runManagedProcess(dataDir string, run runRecord, workspaceRoot string) {
 	// full stream remains in the .log file).
 	summary["output_bytes"] = output.total
 	summary["output_truncated"] = output.truncated
-	persisted, _ = loadRun(dataDir, run.WorkspaceID, run.RunID)
-	finalStatus := "completed"
-	if _, cancelled := cancelledRunIDs.Load(run.RunID); cancelled || (persisted != nil && persisted.Status == "cancelled") {
-		finalStatus = "cancelled"
-	} else if waitErr != nil {
-		finalStatus = "failed"
-	}
 	completedAt := nowUTC()
 	exitCode := 0
 	if command.ProcessState != nil {
 		exitCode = command.ProcessState.ExitCode()
 	}
-	final := current
-	final.Status = finalStatus
-	final.CompletedAt = &completedAt
-	final.ExitCode = &exitCode
-	final.PID = nil // reaped: clear the PID so a later cancel can't signal a reused PID
-	final.Summary = summary
-	if waitErr != nil && finalStatus == "failed" {
-		errText := waitErr.Error()
-		final.Error = &errText
+	// Finalize under the run lock so the terminal status is decided against the
+	// AUTHORITATIVE record: if a cancel committed first (in JSON or the in-memory
+	// marker), the run converges to cancelled (operator intent wins) instead of being
+	// clobbered to completed. This is the cancel-vs-finalize guarantee.
+	final, ferr := mutateRun(dataDir, run.WorkspaceID, run.RunID, func(r *runRecord) (bool, error) {
+		finalStatus := "completed"
+		if r.Status == "cancelled" {
+			finalStatus = "cancelled"
+		} else if _, cancelled := cancelledRunIDs.Load(run.RunID); cancelled {
+			finalStatus = "cancelled"
+		} else if waitErr != nil {
+			finalStatus = "failed"
+		}
+		r.Status = finalStatus
+		r.CompletedAt = &completedAt
+		r.ExitCode = &exitCode
+		r.PID = nil // reaped: clear the PID so a later cancel can't signal a reused PID
+		r.Summary = summary
+		if waitErr != nil && finalStatus == "failed" {
+			errText := waitErr.Error()
+			r.Error = &errText
+		}
+		return true, nil
+	})
+	if ferr != nil || final == nil {
+		activeRunProcesses.Delete(run.RunID)
+		cancelledRunIDs.Delete(run.RunID)
+		return
 	}
-	_ = saveRunRecord(dataDir, final)
-	metrics := calculateRunMetrics(final, len(combinedOutput))
+	metrics := calculateRunMetrics(*final, len(combinedOutput))
 	_ = saveRunMetricsRecord(dataDir, metrics)
 	action := "run.completed"
-	if finalStatus != "completed" {
-		action = "run." + finalStatus
+	if final.Status != "completed" {
+		action = "run." + final.Status
 	}
 	_ = appendRunActivityWithActor(
 		dataDir,
@@ -508,14 +585,33 @@ func signalManagedRunPID(pid int) error {
 }
 
 func saveRunFailure(dataDir string, run runRecord, err error) {
-	completedAt := nowUTC()
-	failed := run
-	failed.Status = "failed"
-	failed.CompletedAt = &completedAt
 	errText := err.Error()
-	failed.Error = &errText
-	failed.Summary = map[string]any{"event_count": 0, "tool_event_count": 0, "text_excerpt": nil, "last_event_type": nil}
-	_ = saveRunRecord(dataDir, failed)
+	// Route the failure transition through the serialized run transaction; if a cancel
+	// already committed a terminal status, honor it (don't clobber cancelled→failed).
+	updated, mErr := mutateRun(dataDir, run.WorkspaceID, run.RunID, func(r *runRecord) (bool, error) {
+		if isTerminalRunStatus(r.Status) {
+			return false, nil
+		}
+		completedAt := nowUTC()
+		r.Status = "failed"
+		r.CompletedAt = &completedAt
+		r.Error = &errText
+		r.PID = nil
+		r.Summary = map[string]any{"event_count": 0, "tool_event_count": 0, "text_excerpt": nil, "last_event_type": nil}
+		return true, nil
+	})
+	failed := run
+	if mErr == nil && updated != nil {
+		failed = *updated
+	} else {
+		// the record may not exist yet (pre-create failure); fall back to a direct write.
+		failed.Status = "failed"
+		completedAt := nowUTC()
+		failed.CompletedAt = &completedAt
+		failed.Error = &errText
+		failed.Summary = map[string]any{"event_count": 0, "tool_event_count": 0, "text_excerpt": nil, "last_event_type": nil}
+		_ = saveRunRecord(dataDir, failed)
+	}
 	metrics := calculateRunMetrics(failed, 0)
 	_ = saveRunMetricsRecord(dataDir, metrics)
 	_ = os.WriteFile(run.LogPath, []byte(errText), 0o644)
