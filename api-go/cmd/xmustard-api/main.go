@@ -3522,6 +3522,26 @@ func main() {
 		result, err := workspaceops.BuildGuidanceCustomization(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), body.Kind)
 		issueIntel(w, err, result)
 	})
+	// Generate a deterministic starter guidance file (the frontend previously POSTed here
+	// to a non-existent route — a dead path; now implemented with confined no-follow writes).
+	mux.HandleFunc("POST /api/workspaces/{workspace_id}/guidance/starters", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			TemplateID string `json:"template_id"`
+			Overwrite  bool   `json:"overwrite"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			respondError(w, workspaceops.Invalid("invalid JSON body"))
+			return
+		}
+		result, err := workspaceops.GenerateGuidanceStarter(
+			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
+			r.PathValue("workspace_id"), body.TemplateID, body.Overwrite)
+		if err != nil {
+			respondError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	})
 	// --- per-run brief export ---
 	mux.HandleFunc("GET /api/workspaces/{workspace_id}/runs/{run_id}/brief", func(w http.ResponseWriter, r *http.Request) {
 		result, err := workspaceops.BuildRunBrief(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), r.PathValue("run_id"))
