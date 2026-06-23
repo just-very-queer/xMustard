@@ -367,7 +367,7 @@ func OpenAIChat(dataDir, name string, req ChatRequest) (map[string]any, error) {
 		model = provider.DefaultModel
 	}
 	if model == "" {
-		return nil, fmt.Errorf("model is required (provider %s has no default_model)", name)
+		return nil, Invalid(fmt.Sprintf("model is required (provider %s has no default_model)", name))
 	}
 
 	// Build the user message: plain text, or multimodal parts when images present.

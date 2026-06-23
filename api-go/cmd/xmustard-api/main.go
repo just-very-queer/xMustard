@@ -1434,15 +1434,7 @@ func main() {
 			runID,
 		)
 		if err != nil {
-			if errors.Is(err, os.ErrNotExist) || strings.Contains(strings.ToLower(err.Error()), "no metrics found") {
-				writeJSON(w, http.StatusNotFound, map[string]any{
-					"error": err.Error(),
-				})
-				return
-			}
-			writeJSON(w, http.StatusInternalServerError, map[string]any{
-				"error": err.Error(),
-			})
+			respondError(w, err) // typed: no-metrics (NotFound) / os.ErrNotExist -> 404, else 500
 			return
 		}
 		writeJSON(w, http.StatusOK, result)
@@ -1496,21 +1488,7 @@ func main() {
 			runID,
 		)
 		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				writeJSON(w, http.StatusNotFound, map[string]any{
-					"error": err.Error(),
-				})
-				return
-			}
-			if strings.Contains(strings.ToLower(err.Error()), "cannot critique run in status") {
-				writeJSON(w, http.StatusBadRequest, map[string]any{
-					"error": err.Error(),
-				})
-				return
-			}
-			writeJSON(w, http.StatusInternalServerError, map[string]any{
-				"error": err.Error(),
-			})
+			respondError(w, err) // typed: not-found -> 404, cannot-critique (Invalid) -> 400, else 500
 			return
 		}
 		writeJSON(w, http.StatusOK, result)

@@ -247,7 +247,7 @@ func GetRunMetrics(dataDir string, workspaceID string, runID string) (*RunMetric
 		return nil, err
 	}
 	if metrics == nil {
-		return nil, fmt.Errorf("no metrics found for run %s", runID)
+		return nil, NotFoundErr(fmt.Sprintf("no metrics found for run %s", runID))
 	}
 	return metrics, nil
 }
@@ -348,7 +348,7 @@ func GeneratePatchCritique(dataDir string, workspaceID string, runID string) (*P
 		return nil, err
 	}
 	if run.Status != "completed" && run.Status != "failed" {
-		return nil, fmt.Errorf("cannot critique run in status %s", run.Status)
+		return nil, Invalid(fmt.Sprintf("cannot critique run in status %s", run.Status))
 	}
 	outputText := ""
 	if strings.TrimSpace(run.OutputPath) != "" {

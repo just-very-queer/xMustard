@@ -20,7 +20,13 @@ func IsInvalidInput(err error) bool {
 	if errors.Is(err, ErrInvalidInput) {
 		return true
 	}
-	for _, s := range []error{errNoRoot, errEmptyPath, errAbsPath, errEscape, errNotRegular} {
+	for _, s := range []error{
+		errNoRoot, errEmptyPath, errAbsPath, errEscape, errNotRegular,
+		// existing per-subsystem validation sentinels — all client-input errors,
+		// so the central mapper classifies them 400 without each handler's substring
+		// check (XM-PRO-013).
+		errInvalidPostgresRequest, ErrInvalidSemanticRequest, ErrInvalidDiagnosticsRequest,
+	} {
 		if errors.Is(err, s) {
 			return true
 		}
