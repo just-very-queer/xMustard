@@ -3975,6 +3975,20 @@ func bodyLimitMiddleware(next http.Handler) http.Handler {
 				http.Error(w, "request cancelled while waiting for in-flight body budget", 499)
 				return
 			}
+			// Charge the declared body size against the shared transient-byte pool so
+			// aggregate concurrent decode memory (across this and the other subsystems
+			// drawing on the same budget) stays under the RSS target. Shed with 503 when
+			// the pool is exhausted rather than allocating past it. Unknown length
+			// (chunked) is charged the per-request cap as a conservative estimate.
+			charge := r.ContentLength
+			if charge < 0 {
+				charge = limit
+			}
+			if !workspaceops.TransientBytes.Acquire(charge) {
+				http.Error(w, "server transient-memory budget exhausted; retry shortly", http.StatusServiceUnavailable)
+				return
+			}
+			defer workspaceops.TransientBytes.Release(charge)
 		}
 		next.ServeHTTP(w, r)
 	})
