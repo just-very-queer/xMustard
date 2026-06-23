@@ -176,21 +176,15 @@ const SCANNABLE_SOURCE_EXTENSIONS: &[&str] = &[
 ];
 const SCANNABLE_SOURCE_FILENAMES: &[&str] = &["Dockerfile", "Justfile", "Makefile", "Procfile"];
 
-/// read_repo_file_beneath reads `rel` relative to `root` WITHOUT following a symlink
-/// at ANY path component: it opens the root directory, then walks each component with
+/// open_repo_file_beneath opens `rel` relative to `root` WITHOUT following a symlink at
+/// ANY path component: it opens the root directory, then walks each component with
 /// openat()+O_NOFOLLOW (via rustix's SAFE wrappers — the crate's #![forbid(unsafe_code)]
 /// rules out a hand-rolled openat). The fd reached is exactly the in-repo file, so a
-/// concurrent agent swapping any component (the final file OR an intermediate dir) for
-/// a symlink can't redirect the read into a host file — the full check-to-open TOCTOU
-/// is closed, matching the Go read oracle (XM-PRO-007). Rejects absolute paths and "..".
-pub fn read_repo_file_beneath(root: &Path, rel: &str) -> std::io::Result<String> {
-    use std::io::Read;
-    let mut f = open_repo_file_beneath(root, rel)?;
-    let mut s = String::new();
-    f.read_to_string(&mut s)?;
-    Ok(s)
-}
-
+/// concurrent agent swapping any component (the final file OR an intermediate dir) for a
+/// symlink can't redirect the read into a host file — the full check-to-open TOCTOU is
+/// closed, matching the Go read oracle (XM-PRO-007). Rejects absolute paths and "..".
+/// This is the ONLY repo read/hash primitive; the public read_repo_file_beneath /
+/// read_repo_bytes_beneath_capped / hash_repo_file_beneath all hold the fd it returns.
 #[cfg(unix)]
 fn open_repo_file_beneath(root: &Path, rel: &str) -> std::io::Result<std::fs::File> {
     use rustix::fs::{open, openat, Mode, OFlags};
@@ -234,6 +228,12 @@ fn open_repo_file_beneath(root: &Path, rel: &str) -> std::io::Result<std::fs::Fi
         let mut flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
         if i < last {
             flags |= OFlags::DIRECTORY;
+        } else {
+            // O_NONBLOCK on the final component so opening a fifo/device (a
+            // non-terminating target) returns immediately instead of blocking on the
+            // open; the regular-file fstat in open_repo_regular_file_beneath then
+            // rejects it. Harmless on a regular file (reads stay fully blocking/normal).
+            flags |= OFlags::NONBLOCK;
         }
         // O_NOFOLLOW fails (ELOOP) on a symlink at this component — no traversal.
         dir = openat(&dir, *comp, flags, Mode::empty())?;
@@ -244,6 +244,88 @@ fn open_repo_file_beneath(root: &Path, rel: &str) -> std::io::Result<std::fs::Fi
 #[cfg(not(unix))]
 fn open_repo_file_beneath(root: &Path, rel: &str) -> std::io::Result<std::fs::File> {
     std::fs::File::open(root.join(rel))
+}
+
+/// MAX_REPO_FILE_BYTES bounds every single-file repo read/hash. It defends the
+/// "huge file" (unbounded allocation) and "non-terminating target" (a fifo/device that
+/// never EOFs) hazards: the read stops at the cap instead of growing without limit or
+/// blocking forever.
+pub const MAX_REPO_FILE_BYTES: u64 = 8 << 20; // 8 MiB
+
+/// open_repo_regular_file_beneath opens `rel` under `root` via the no-follow fd-walk AND
+/// fstat-verifies the held descriptor is a REGULAR file — so a fifo, character/block
+/// device, directory, or socket is refused before any byte is read (closing the
+/// non-terminating-target read). This is the single primitive every repo read/hash flows
+/// through; raw `root.join(rel)` reads are banned because they follow symlinks and re-open
+/// (TOCTOU) instead of holding the checked fd.
+fn open_repo_regular_file_beneath(root: &Path, rel: &str) -> std::io::Result<std::fs::File> {
+    let f = open_repo_file_beneath(root, rel)?;
+    let meta = f.metadata()?;
+    if !meta.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    Ok(f)
+}
+
+/// read_repo_bytes_beneath_capped reads at most `cap` bytes of `rel` from the held
+/// no-follow descriptor. If the file is larger than `cap` it returns an error rather than
+/// silently truncating, so callers consistently skip oversized files.
+pub fn read_repo_bytes_beneath_capped(
+    root: &Path,
+    rel: &str,
+    cap: u64,
+) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let f = open_repo_regular_file_beneath(root, rel)?;
+    let mut buf = Vec::new();
+    // Take(cap+1) so reading exactly cap+1 bytes proves the file exceeds the cap.
+    let n = f.take(cap + 1).read_to_end(&mut buf)?;
+    if n as u64 > cap {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "file exceeds size cap",
+        ));
+    }
+    Ok(buf)
+}
+
+/// read_repo_file_beneath reads `rel` under `root` (bounded, regular-file-checked,
+/// no-follow) as strict UTF-8. The bounded read replaces the prior unbounded
+/// read_to_string, so a huge or non-terminating in-repo target can't exhaust memory.
+pub fn read_repo_file_beneath(root: &Path, rel: &str) -> std::io::Result<String> {
+    let bytes = read_repo_bytes_beneath_capped(root, rel, MAX_REPO_FILE_BYTES)?;
+    String::from_utf8(bytes)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "not utf-8"))
+}
+
+/// hash_repo_file_beneath STREAMS the content hash of `rel` from the SAME no-follow,
+/// regular-file-checked descriptor — so the bytes hashed are exactly the bytes a parser
+/// reading through the same opener would see (no metadata-check-then-reopen swap window),
+/// in constant memory, bounded by MAX_REPO_FILE_BYTES. Returns None on any open/read
+/// error or oversize. (Hash stays sha256 for drift-baseline + index-cache continuity; the
+/// blake3 content-key migration is the separate deferred item.)
+pub fn hash_repo_file_beneath(root: &Path, rel: &str) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut f = open_repo_regular_file_beneath(root, rel).ok()?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    let mut total: u64 = 0;
+    loop {
+        let n = f.read(&mut buf).ok()?;
+        if n == 0 {
+            break;
+        }
+        total += n as u64;
+        if total > MAX_REPO_FILE_BYTES {
+            return None; // bounded: refuse to hash past the cap
+        }
+        hasher.update(&buf[..n]);
+    }
+    Some(format!("{:x}", hasher.finalize()))
 }
 
 /// is_scannable_source reports whether a path is in the broad scannable-source set
@@ -1344,6 +1426,84 @@ mod tests {
         // (3) ".." escape and absolute paths refused
         assert!(read_repo_file_beneath(root.path(), "../etc/hosts").is_err());
         assert!(read_repo_file_beneath(root.path(), "/etc/hosts").is_err());
+    }
+
+    // The single opener bounds the "huge file" hazard: a file over MAX_REPO_FILE_BYTES is
+    // refused (not partially/silently truncated), and the streaming hash refuses it too.
+    #[test]
+    fn repo_reader_refuses_oversized_file() {
+        let root = TempDir::new().unwrap();
+        let small = vec![b'a'; 1024];
+        std::fs::write(root.path().join("small.txt"), &small).unwrap();
+        assert_eq!(
+            read_repo_bytes_beneath_capped(root.path(), "small.txt", MAX_REPO_FILE_BYTES)
+                .unwrap()
+                .len(),
+            1024
+        );
+        assert!(hash_repo_file_beneath(root.path(), "small.txt").is_some());
+
+        let huge = vec![b'x'; (MAX_REPO_FILE_BYTES as usize) + 4096];
+        std::fs::write(root.path().join("huge.bin"), &huge).unwrap();
+        assert!(
+            read_repo_file_beneath(root.path(), "huge.bin").is_err(),
+            "a file over the cap must be refused, not truncated"
+        );
+        assert!(
+            read_repo_bytes_beneath_capped(root.path(), "huge.bin", MAX_REPO_FILE_BYTES).is_err()
+        );
+        assert!(
+            hash_repo_file_beneath(root.path(), "huge.bin").is_none(),
+            "the streaming hash must refuse an over-cap file rather than hash unbounded"
+        );
+    }
+
+    // A non-terminating target (a fifo with no writer) must be refused WITHOUT blocking:
+    // O_NONBLOCK makes the open return immediately and the regular-file check rejects it.
+    // If the defense regressed, this test would hang forever (the bound proves it doesn't).
+    #[cfg(unix)]
+    #[test]
+    fn repo_reader_refuses_fifo_without_blocking() {
+        let root = TempDir::new().unwrap();
+        let fifo = root.path().join("pipe");
+        let status = Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo available");
+        assert!(status.success(), "mkfifo failed");
+        // No writer is ever opened; a blocking O_RDONLY open would hang here.
+        assert!(
+            read_repo_file_beneath(root.path(), "pipe").is_err(),
+            "a fifo (non-regular, non-terminating) target must be refused"
+        );
+        assert!(hash_repo_file_beneath(root.path(), "pipe").is_none());
+    }
+
+    // hash_repo_file_beneath streams the SAME sha256 a single read-then-hash would
+    // produce (continuity with existing drift baselines + index-cache keys), from the
+    // one no-follow descriptor.
+    #[test]
+    fn repo_hash_matches_read_then_sha256_same_bytes() {
+        use sha2::{Digest, Sha256};
+        let root = TempDir::new().unwrap();
+        let content = b"fn main() { println!(\"hi\"); }\n";
+        std::fs::write(root.path().join("a.rs"), content).unwrap();
+        let mut h = Sha256::new();
+        h.update(content);
+        let expected = format!("{:x}", h.finalize());
+        assert_eq!(
+            hash_repo_file_beneath(root.path(), "a.rs").unwrap(),
+            expected
+        );
+    }
+
+    // A directory target is not a regular file and must be refused by the read/hash path.
+    #[test]
+    fn repo_reader_refuses_directory_target() {
+        let root = TempDir::new().unwrap();
+        std::fs::create_dir_all(root.path().join("adir")).unwrap();
+        assert!(read_repo_file_beneath(root.path(), "adir").is_err());
+        assert!(hash_repo_file_beneath(root.path(), "adir").is_none());
     }
 
     fn git_repo(files: &[(&str, &str)]) -> TempDir {

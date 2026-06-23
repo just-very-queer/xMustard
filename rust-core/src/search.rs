@@ -478,13 +478,10 @@ fn search_docs(root: &Path, qtokens: &[String], limit: usize) -> Vec<SearchHit> 
     const CHUNK_LINES: usize = 30;
     let mut hits: Vec<SearchHit> = Vec::new();
     for rel in symbolgraph::tracked_doc_files(root) {
-        let abs = root.join(&rel);
-        match std::fs::metadata(&abs) {
-            Ok(m) if m.len() <= MAX_DOC_BYTES => {}
-            _ => continue,
-        }
-        let content = match std::fs::read_to_string(&abs) {
-            Ok(c) => c,
+        // single held-fd, no-follow, bounded read (no metadata-check-then-reopen TOCTOU,
+        // no symlink follow). Lossy decode so a non-UTF-8 doc degrades instead of vanishing.
+        let content = match symbolgraph::read_repo_bytes_beneath_capped(root, &rel, MAX_DOC_BYTES) {
+            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
             Err(_) => continue,
         };
         let role = symbolgraph::repo_role(&rel);

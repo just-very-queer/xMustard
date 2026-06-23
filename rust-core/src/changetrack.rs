@@ -32,13 +32,6 @@ fn git(root: &Path, args: &[&str]) -> Option<String> {
     if text.is_empty() { None } else { Some(text) }
 }
 
-fn hash_file(path: &Path) -> Option<String> {
-    let bytes = fs::read(path).ok()?;
-    let mut hasher = Sha256::new();
-    hasher.update(&bytes);
-    Some(format!("{:x}", hasher.finalize()))
-}
-
 fn tracked_files(root: &Path) -> Vec<String> {
     git(root, &["ls-files"])
         .map(|s| s.lines().map(|l| l.to_string()).collect())
@@ -80,7 +73,9 @@ pub struct RepoFingerprint {
 fn file_hash_map(root: &Path) -> BTreeMap<String, String> {
     let mut map = BTreeMap::new();
     for rel in tracked_files(root) {
-        if let Some(h) = hash_file(&root.join(&rel)) {
+        // hash through the single no-follow, bounded, regular-file-checked opener — no
+        // raw root.join read (which would follow a swapped-in symlink).
+        if let Some(h) = crate::symbolgraph::hash_repo_file_beneath(root, &rel) {
             map.insert(rel, h);
         }
     }
@@ -146,7 +141,7 @@ fn symbol_signature(root: &Path, rel_path: &str, line_start: Option<usize>) -> O
     if ls == 0 {
         return None;
     }
-    let full = fs::read_to_string(root.join(rel_path)).ok()?;
+    let full = crate::symbolgraph::read_repo_file_beneath(root, rel_path).ok()?;
     let lines: Vec<&str> = full.lines().collect();
     if ls > lines.len() {
         return None;

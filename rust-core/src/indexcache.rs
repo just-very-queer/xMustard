@@ -108,12 +108,11 @@ fn graph_cache_file(root: &Path, workspace_id: &str, key: &str) -> PathBuf {
 }
 
 /// sha256 of a tracked file's current content — the per-file key for incremental
-/// reindex (only files whose hash changed need re-parsing).
+/// reindex (only files whose hash changed need re-parsing). Streams from the single
+/// no-follow, bounded, regular-file-checked opener (no raw root.join read), so the key
+/// reflects exactly the bytes a parser would read through the same opener.
 pub fn file_hash(root: &Path, rel: &str) -> Option<String> {
-    let bytes = fs::read(root.join(rel)).ok()?;
-    let mut h = Sha256::new();
-    h.update(&bytes);
-    Some(format!("{:x}", h.finalize()))
+    crate::symbolgraph::hash_repo_file_beneath(root, rel)
 }
 
 /// Path to the per-workspace symbol cache (path → (hash, symbols)).

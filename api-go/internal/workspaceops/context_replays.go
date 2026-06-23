@@ -404,16 +404,20 @@ func collectWorkspaceGuidance(root string, workspaceID string) ([]RepoGuidanceRe
 		if err != nil || info.IsDir() {
 			return nil
 		}
-		text, err := os.ReadFile(path)
-		if err != nil {
-			return err
-		}
-		summary, excerpt, triggerKeywords := summarizeGuidanceText(path, kind, string(text), info)
-		title := guidanceTitleFromText(path, string(text))
 		rel, err := filepath.Rel(rootPath, path)
 		if err != nil {
 			rel = filepath.Base(path)
 		}
+		// Read CONTENT through the no-follow, bounded, same-fd workspace opener — never a
+		// raw os.ReadFile, which would follow a symlink an agent swapped in to redirect a
+		// guidance read out of the repo. A non-regular/escaping/oversized file is skipped.
+		textBytes, ok := readWorkspaceRegularFile(rootPath, rel)
+		if !ok {
+			return nil
+		}
+		text := string(textBytes)
+		summary, excerpt, triggerKeywords := summarizeGuidanceText(path, kind, text, info)
+		title := guidanceTitleFromText(path, text)
 		seen[key] = struct{}{}
 		items = append(items, RepoGuidanceRecord{
 			GuidanceID:      hashID(workspaceID, rel, kind),

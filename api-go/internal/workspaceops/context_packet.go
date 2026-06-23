@@ -576,9 +576,10 @@ func inferVerificationProfilesFromGuidance(workspace workspaceRecord, guidance [
 	profiles := []rustcore.VerificationProfileInput{}
 	seenCommands := map[string]struct{}{}
 	for _, item := range guidance {
-		candidatePath := filepath.Join(workspace.RootPath, item.Path)
-		content, err := os.ReadFile(candidatePath)
-		if err != nil {
+		// no-follow, bounded, same-fd read (item.Path is repo-relative) — never a raw
+		// os.ReadFile join that would follow a swapped-in symlink out of the workspace.
+		content, ok := readWorkspaceRegularFile(workspace.RootPath, item.Path)
+		if !ok {
 			continue
 		}
 		text := string(content)
