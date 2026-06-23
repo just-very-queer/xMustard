@@ -36,29 +36,29 @@ type IssueContextReplayRecord struct {
 }
 
 type IssueContextReplayComparison struct {
-	Replay                         IssueContextReplayRecord `json:"replay"`
-	CurrentPrompt                  string                   `json:"current_prompt"`
-	CurrentTreeFocus               []string                 `json:"current_tree_focus"`
-	CurrentGuidancePaths           []string                 `json:"current_guidance_paths"`
-	CurrentVerificationProfileIDs  []string                 `json:"current_verification_profile_ids"`
-	CurrentTicketContextIDs        []string                 `json:"current_ticket_context_ids"`
-	CurrentBrowserDumpIDs          []string                 `json:"current_browser_dump_ids"`
-	PromptChanged                  bool                     `json:"prompt_changed"`
-	Changed                        bool                     `json:"changed"`
-	SavedPromptLength              int                      `json:"saved_prompt_length"`
-	CurrentPromptLength            int                      `json:"current_prompt_length"`
-	AddedTreeFocus                 []string                 `json:"added_tree_focus"`
-	RemovedTreeFocus               []string                 `json:"removed_tree_focus"`
-	AddedGuidancePaths             []string                 `json:"added_guidance_paths"`
-	RemovedGuidancePaths           []string                 `json:"removed_guidance_paths"`
-	AddedVerificationProfileIDs    []string                 `json:"added_verification_profile_ids"`
-	RemovedVerificationProfileIDs  []string                 `json:"removed_verification_profile_ids"`
-	AddedTicketContextIDs          []string                 `json:"added_ticket_context_ids"`
-	RemovedTicketContextIDs        []string                 `json:"removed_ticket_context_ids"`
-	AddedBrowserDumpIDs            []string                 `json:"added_browser_dump_ids"`
-	RemovedBrowserDumpIDs          []string                 `json:"removed_browser_dump_ids"`
-	Summary                        string                   `json:"summary"`
-	ComparedAt                     string                   `json:"compared_at"`
+	Replay                        IssueContextReplayRecord `json:"replay"`
+	CurrentPrompt                 string                   `json:"current_prompt"`
+	CurrentTreeFocus              []string                 `json:"current_tree_focus"`
+	CurrentGuidancePaths          []string                 `json:"current_guidance_paths"`
+	CurrentVerificationProfileIDs []string                 `json:"current_verification_profile_ids"`
+	CurrentTicketContextIDs       []string                 `json:"current_ticket_context_ids"`
+	CurrentBrowserDumpIDs         []string                 `json:"current_browser_dump_ids"`
+	PromptChanged                 bool                     `json:"prompt_changed"`
+	Changed                       bool                     `json:"changed"`
+	SavedPromptLength             int                      `json:"saved_prompt_length"`
+	CurrentPromptLength           int                      `json:"current_prompt_length"`
+	AddedTreeFocus                []string                 `json:"added_tree_focus"`
+	RemovedTreeFocus              []string                 `json:"removed_tree_focus"`
+	AddedGuidancePaths            []string                 `json:"added_guidance_paths"`
+	RemovedGuidancePaths          []string                 `json:"removed_guidance_paths"`
+	AddedVerificationProfileIDs   []string                 `json:"added_verification_profile_ids"`
+	RemovedVerificationProfileIDs []string                 `json:"removed_verification_profile_ids"`
+	AddedTicketContextIDs         []string                 `json:"added_ticket_context_ids"`
+	RemovedTicketContextIDs       []string                 `json:"removed_ticket_context_ids"`
+	AddedBrowserDumpIDs           []string                 `json:"added_browser_dump_ids"`
+	RemovedBrowserDumpIDs         []string                 `json:"removed_browser_dump_ids"`
+	Summary                       string                   `json:"summary"`
+	ComparedAt                    string                   `json:"compared_at"`
 }
 
 const replayGuidanceLimit = 6
@@ -355,6 +355,10 @@ func listReplayActivity(dataDir string, workspaceID string, issueID string, limi
 	return items, nil
 }
 
+// collectWorkspaceGuidance is the cross-FFI guidance contract: the file/dir set
+// below must stay ALIGNED with rust-core symbolgraph.rs repo_role's "guide"
+// classification, so the Rust docs/guidance SEARCH segment and this Go grounding
+// packet recognize the same guidance (XM-PRO-012).
 func collectWorkspaceGuidance(root string, workspaceID string) ([]RepoGuidanceRecord, error) {
 	rootPath := filepath.Clean(root)
 	candidates := []struct {

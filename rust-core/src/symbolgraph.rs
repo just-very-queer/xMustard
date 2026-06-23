@@ -108,10 +108,20 @@ fn tracked_source_files_with_coverage(root: &Path) -> (Vec<String>, IndexCoverag
 /// "config"/"other" are listed but not deeply indexed.
 pub fn repo_role(path: &str) -> &'static str {
     let lower = path.to_lowercase();
+    // Path-based guidance roots — MUST mirror the Go collectWorkspaceGuidance walk
+    // roots (context_replays.go) so the Rust docs/guidance SEARCH segment covers the
+    // same guidance the Go grounding packet does — one cross-FFI contract (XM-PRO-012).
+    if lower.starts_with(".cursor/rules/")
+        || lower.starts_with(".openhands/microagents/")
+        || lower.starts_with(".agents/skills/")
+    {
+        return "guide";
+    }
     let base = Path::new(&lower)
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("");
+    // Named guidance files — keep aligned with the Go candidate list.
     if matches!(
         base,
         "agents.md"

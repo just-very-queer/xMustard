@@ -66,7 +66,43 @@ fn fnv1a(s: &str) -> u64 {
 /// is not a neural embedding — it is a model-free, dependency-free vector lane that
 /// captures fuzzy sub-token overlap (so "dashbord" lands near "dashboard"), giving
 /// RRF fusion a third signal distinct from exact-token BM25 and structural weight.
+/// embed produces the semantic-lane vector for `text`. This is the pluggable seam:
+/// the DEFAULT is the model-free lexical hashing embedding (`lexical_embed` below) —
+/// zero dependency, preserving the lean 50–100 MB / no-Docker profile. A real neural
+/// lane (a local int8 ONNX sentence-embedding model, e.g. snowflake-arctic-embed) is a
+/// drop-in behind the `semantic-onnx` cargo feature: when built with it and a model is
+/// configured, `onnx_embed::try_embed` returns the neural vector; otherwise the lexical
+/// default runs. Enabling it accepts the ~120–160 MB peak the review scopes as P3, so
+/// it is OFF by default and hybrid_search stays agnostic to which embedder runs
+/// (XM-PRO-012).
 fn embed(text: &str) -> Vec<f32> {
+    #[cfg(feature = "semantic-onnx")]
+    {
+        if let Some(v) = onnx_embed::try_embed(text) {
+            return v;
+        }
+    }
+    lexical_embed(text)
+}
+
+/// onnx_embed is the neural semantic-lane drop-in, compiled ONLY with the
+/// `semantic-onnx` cargo feature. try_embed should load a local int8 ONNX
+/// sentence-embedding model (path via XMUSTARD_EMBED_MODEL), embed `text`, L2-normalize,
+/// and return the vector — or None when unconfigured so the lexical default runs. The
+/// model + the `ort`/`fastembed` backend are operator-provided: they add a native
+/// dependency and a ~120–160 MB peak, deliberately kept out of the lean default build
+/// (the review's P3). The seam keeps that decision a build-time flag, not a code change.
+#[cfg(feature = "semantic-onnx")]
+mod onnx_embed {
+    pub fn try_embed(_text: &str) -> Option<Vec<f32>> {
+        // Wire the ort/fastembed model load here, keyed off XMUSTARD_EMBED_MODEL.
+        // Until a backend + model are configured this returns None and the lexical
+        // lane runs, so enabling the feature never breaks retrieval.
+        None
+    }
+}
+
+fn lexical_embed(text: &str) -> Vec<f32> {
     let mut v = vec![0f32; EMBED_DIM];
     let mut add = |feat: &str, w: f32| {
         let h = fnv1a(feat);
@@ -489,6 +525,9 @@ mod tests {
         assert_eq!(repo_role("AGENTS.md"), "guide");
         assert_eq!(repo_role("README.md"), "guide");
         assert_eq!(repo_role("CLAUDE.md"), "guide");
+        // path-based guidance roots (mirror the Go guidance walk roots)
+        assert_eq!(repo_role(".cursor/rules/style.md"), "guide");
+        assert_eq!(repo_role(".openhands/microagents/repo.md"), "guide");
         assert_eq!(repo_role("package.json"), "config");
         assert_eq!(repo_role("logo.png"), "other");
     }
