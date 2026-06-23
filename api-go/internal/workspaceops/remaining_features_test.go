@@ -1,6 +1,9 @@
 package workspaceops
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestScoreRunConfidence(t *testing.T) {
 	zero := 0
@@ -34,7 +37,13 @@ func TestBuildEvalTimelineEntries(t *testing.T) {
 		{BatchID: "b2", CreatedAt: "2026-01-02T00:00:00Z", QueuedRunIDs: []string{"r3", "r4"}},
 	}
 	runStatus := map[string]string{"r1": "succeeded", "r2": "failed", "r3": "succeeded", "r4": "succeeded"}
-	entries := buildEvalTimelineEntries(batches, runStatus)
+	runMetrics := map[string]*RunMetrics{
+		"r1": {DurationMS: 1000, EstimatedCost: 0.10},
+		"r2": {DurationMS: 2000, EstimatedCost: 0.20},
+		"r3": {DurationMS: 500, EstimatedCost: 0.05},
+		"r4": {DurationMS: 700, EstimatedCost: 0.05},
+	}
+	entries := buildEvalTimelineEntries(batches, runStatus, runMetrics)
 	if len(entries) != 2 {
 		t.Fatalf("expected 2 entries, got %d", len(entries))
 	}
@@ -44,6 +53,17 @@ func TestBuildEvalTimelineEntries(t *testing.T) {
 	}
 	if entries[1].Movement <= 0 {
 		t.Fatalf("expected positive movement for improved batch, got %d", entries[1].Movement)
+	}
+	// enriched columns: cost + avg duration aggregated from run metrics.
+	if entries[1].TotalCostUSD != 0.10 || entries[1].AvgDurationMS != 600 {
+		t.Fatalf("b2 cost/duration aggregation wrong: %+v", entries[1])
+	}
+	// causal why-moved attributes the improvement to the metric deltas.
+	if !strings.Contains(entries[1].WhyMoved, "rank improved") || !strings.Contains(entries[1].WhyMoved, "success rate") {
+		t.Fatalf("why_moved must explain the rank change causally, got %q", entries[1].WhyMoved)
+	}
+	if entries[0].WhyMoved == "" {
+		t.Fatalf("first batch should still have a why_moved note")
 	}
 }
 
