@@ -85,20 +85,69 @@ fn embed(text: &str) -> Vec<f32> {
     lexical_embed(text)
 }
 
-/// onnx_embed is the neural semantic-lane drop-in, compiled ONLY with the
-/// `semantic-onnx` cargo feature. try_embed should load a local int8 ONNX
-/// sentence-embedding model (path via XMUSTARD_EMBED_MODEL), embed `text`, L2-normalize,
-/// and return the vector — or None when unconfigured so the lexical default runs. The
-/// model + the `ort`/`fastembed` backend are operator-provided: they add a native
-/// dependency and a ~120–160 MB peak, deliberately kept out of the lean default build
-/// (the review's P3). The seam keeps that decision a build-time flag, not a code change.
+/// onnx_embed is the neural semantic-lane backend, compiled ONLY with the `semantic-onnx`
+/// cargo feature. try_embed loads a local ONNX sentence-embedding model from the directory
+/// in XMUSTARD_EMBED_MODEL (preferring an int8/quantized graph), embeds `text` with mean
+/// pooling, L2-normalizes, and returns the vector — or None when unconfigured or on any
+/// load/inference error, so the lexical default still runs and retrieval never breaks. The
+/// `fastembed`/`ort` (onnxruntime) backend is a heavy native dependency (~120–160 MB peak),
+/// deliberately kept out of the lean default build (the review's P3); the feature flag keeps
+/// enabling it a build-time + operator-config decision, not a source change (XM-PRO-012).
 #[cfg(feature = "semantic-onnx")]
 mod onnx_embed {
-    pub fn try_embed(_text: &str) -> Option<Vec<f32>> {
-        // Wire the ort/fastembed model load here, keyed off XMUSTARD_EMBED_MODEL.
-        // Until a backend + model are configured this returns None and the lexical
-        // lane runs, so enabling the feature never breaks retrieval.
-        None
+    use fastembed::{
+        InitOptionsUserDefined, Pooling, TextEmbedding, TokenizerFiles, UserDefinedEmbeddingModel,
+    };
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, OnceLock};
+
+    // The model is loaded once (multi-MB, links an onnxruntime session) and reused under a
+    // Mutex — the inference session is not assumed Sync. None means "no model configured /
+    // load failed", cached so we don't retry a broken config on every query.
+    static MODEL: OnceLock<Option<Mutex<TextEmbedding>>> = OnceLock::new();
+
+    fn read(dir: &Path, name: &str) -> Option<Vec<u8>> {
+        std::fs::read(dir.join(name)).ok()
+    }
+
+    fn load() -> Option<Mutex<TextEmbedding>> {
+        load_user_defined(&PathBuf::from(std::env::var_os("XMUSTARD_EMBED_MODEL")?))
+    }
+
+    // Build the embedder from a model directory, or None on any missing file / init
+    // error (so the lexical lane runs — retrieval is never broken by a bad config).
+    // Separated from env-reading so it is deterministically testable.
+    pub(super) fn load_user_defined(dir: &Path) -> Option<Mutex<TextEmbedding>> {
+        // prefer a quantized/int8 graph (smaller RSS) when the operator shipped one.
+        let onnx = ["model_quantized.onnx", "model_int8.onnx", "model.onnx"]
+            .iter()
+            .map(|n| dir.join(n))
+            .find(|p| p.is_file())
+            .and_then(|p| std::fs::read(p).ok())?;
+        let tokenizer_files = TokenizerFiles {
+            tokenizer_file: read(dir, "tokenizer.json")?,
+            config_file: read(dir, "config.json")?,
+            special_tokens_map_file: read(dir, "special_tokens_map.json")?,
+            tokenizer_config_file: read(dir, "tokenizer_config.json")?,
+        };
+        let model =
+            UserDefinedEmbeddingModel::new(onnx, tokenizer_files).with_pooling(Pooling::Mean);
+        TextEmbedding::try_new_from_user_defined(model, InitOptionsUserDefined::default())
+            .ok()
+            .map(Mutex::new)
+    }
+
+    pub fn try_embed(text: &str) -> Option<Vec<f32>> {
+        let model = MODEL.get_or_init(load).as_ref()?;
+        let mut v = model.lock().ok()?.embed(vec![text], None).ok()?.pop()?;
+        // L2-normalize so cosine() (a plain dot product) is valid for this lane too.
+        let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm > 0.0 {
+            for x in &mut v {
+                *x /= norm;
+            }
+        }
+        Some(v)
     }
 }
 
@@ -700,5 +749,27 @@ mod tests {
         let near = cosine(&embed("dashboard"), &embed("dashbord"));
         let far = cosine(&embed("dashboard"), &embed("invoice"));
         assert!(near > far, "fuzzy near={near} should beat far={far}");
+    }
+
+    // With the neural lane compiled in, a missing/empty/incomplete model directory must
+    // load to None so embed() transparently falls back to the lexical lane — enabling the
+    // feature without shipping a valid model never breaks retrieval (XM-PRO-012).
+    #[cfg(feature = "semantic-onnx")]
+    #[test]
+    fn onnx_lane_falls_back_when_model_dir_invalid() {
+        use std::path::Path;
+        // a path that doesn't exist
+        assert!(onnx_embed::load_user_defined(Path::new("/nonexistent/xmustard/model")).is_none());
+        // an empty dir (no model.onnx) and a dir with only the onnx (missing tokenizer)
+        let empty = tempfile::tempdir().unwrap();
+        assert!(onnx_embed::load_user_defined(empty.path()).is_none());
+        let partial = tempfile::tempdir().unwrap();
+        std::fs::write(partial.path().join("model.onnx"), b"not a real graph").unwrap();
+        assert!(onnx_embed::load_user_defined(partial.path()).is_none());
+
+        // and embed() (which routes through try_embed first) still yields a valid vector.
+        let v = embed("dashboard ledger");
+        let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-4, "fallback embedding must be normalized");
     }
 }
