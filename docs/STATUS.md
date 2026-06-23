@@ -157,8 +157,11 @@ XM-NEW-022 → `1326b7a`; verification pipe-drain XM-NEW-015 → `100b994`.)
 **Genuinely still-open (honest, deferred — not blocking the governed-memory
 product):** the symbol graph the agent path uses is the **lexical** graph; the
 LSP-resolved upgrade exists but is CLI-only (`build-lsp`), not wired into
-`search`. The "20× warm index" figure still has no committed benchmark artifact;
-treat it as indicative, not measured. Two P2 index-engine items are designed but
+`search` (deliberate opt-in — see `docs/plans/2026-06-20-deep-graph-loop.md` S2).
+The warm-index speedup now **has a committed benchmark** (`docs/BENCHMARKS.md`
+§Warm symbol-index: measured **18.0×**, cold 676 ms → warm 37 ms on this 369-file
+repo) — the older "~20×" prose was indicative; 18× is the measured floor. Two P2
+index-engine items are designed but
 deliberately deferred (rationale in `docs/INDEX_ENGINE.md` §Deferred): a
 long-lived **IndexEngine daemon** (G) and a **blake3/merkle content-key**
 migration (H) — both judged premature surface/dependency expansion against the

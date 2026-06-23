@@ -29,6 +29,33 @@ Apple Silicon (arm64), APFS, release build, 2000 iterations per op:
 - **Peak RSS under ~10k bulk ops:** 15.3 MB — well under the 50 MB runtime
   budget, and flat across thousands of operations (bounded buffers, no leak).
 
+## Warm symbol-index (cold vs. cache reuse)
+
+The symbol graph (`build_symbol_graph_cached`) persists a per-workspace graph +
+per-file symbol cache under `.git/xmustard-cache/`. A cold build tree-sitter-parses
+every source file; a warm build reuses the cached parse when file hashes are
+unchanged. Measured on **this repo (369 tracked files)**, Apple Silicon, release
+build, median of 5 runs each (full cache cleared between cold runs):
+
+| Path | median | Notes |
+|------|-------:|-------|
+| **cold** (full rebuild) | 676 ms | tree-sitter parse + graph build of all files |
+| **warm** (cache hit)    |  37 ms | reuse cached graph/symbols; incl. process start + cluster compute |
+| **speedup**             | **18.0×** | the warm-index figure previously quoted as "~20×" |
+
+Reproduce:
+
+```bash
+cd rust-core && cargo build --release --bin xmustard-core
+BIN=target/release/xmustard-core; R=$(cd ../ && pwd)
+rm -f $R/.git/xmustard-cache/symbolgraph-bench-*.json $R/.git/xmustard-cache/symbols-bench.json
+time $BIN symbolgraph clusters "$R" bench   # cold
+time $BIN symbolgraph clusters "$R" bench   # warm (cache hit)
+```
+
+The speedup grows with repo size (parse cost is the cold-path dominant term); 18×
+on a 369-file tree is the measured floor for the "warm index" claim, not a ceiling.
+
 ## How to read these numbers
 
 The write paths (`goal_create`, `goal_iterate`) are deliberately **crash-safe

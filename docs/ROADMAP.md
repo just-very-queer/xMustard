@@ -9,16 +9,18 @@ tracks that can proceed in parallel.
 self-contained, pattern-following slices; Claude takes architectural, cross-cutting,
 security-sensitive, and integration-heavy work.
 
-> **Status (verified 2026-06-21):** C2, C3, C4, A1, A3 ✅ done; A2 ✅ neural-embedding
-> rerank done, ⬜ graph-proximity lane remains; A4 ✅ governance MemoryPanel done,
-> ⬜ provider/routing/token UI remains; C1 ⬜ and A5 ⬜ open. The genuinely-open work
-> is tracked in `docs/plans/2026-06-21-remaining-work-loop.md`.
+> **Status (all closed 2026-06-21, re-verified 2026-06-23):** every track item is now
+> done. C2/C3/C4/A1/A3 closed earlier; the items this banner once listed as open all
+> shipped in the remaining-work loop — C1 → **R5** (PG write path), A2 graph-proximity
+> → **R1**, A3 contract-break → **R2**, A4 provider/routing/token UI → **R7**, A5 auth
+> follow-ons → **R4**. See `docs/plans/2026-06-21-remaining-work-loop.md` (R1–R7, all
+> committed) and `docs/STATUS.md` §7. No track item remains open.
 
 ## Codex track (mechanical, pattern-following — Claude verifies)
 
-- **C1 — Postgres write path for ops** ⬜: make `run_plans` + `verification_*` live in
-  Postgres (currently JSON), mirroring the `pgops.go` pattern (schema + materialize + read-back +
-  FTS where useful). Endpoints under `/pg/*`. `PLANNED_FEATURES.md` line "make PG the write path".
+- **C1 — Postgres write path for ops** ✅ (**R5**): `pg_inline.go` mirrors `run_plans` +
+  `verification_*` into PG inline on mutation (JSON stays source of truth; best-effort,
+  gated on `XMUSTARD_PG_DSN`), read-back via `GET /pg/run-plans`.
 - **C2 — LSP impl/type/rename** ✅: `lsp_session.rs` has references/definition/implementation/
   typeDefinition/rename + a persistent session (S1).
 - **C3 — Enclosing-scope context** ✅: `treesitter.rs` walks the parent chain → enclosing_scope.
@@ -29,14 +31,16 @@ security-sensitive, and integration-heavy work.
 
 - **A1 — Routing as a first-class run-execution runtime** ✅: `StartProviderRun` —
   `provider:<name>`/`route` runtimes execute via the model and record a runRecord.
-- **A2 — Neural embeddings + graph-proximity RRF lane** ✅/⬜: neural-embedding rerank
-  (`OpenAIEmbeddings`, `/search?rerank=`) done; ⬜ graph-proximity lane (use `symbol_impact`
-  distances as a 4th RRF lane) remains.
+- **A2 — Neural embeddings + graph-proximity RRF lane** ✅: neural-embedding rerank
+  (`OpenAIEmbeddings`, `/search?rerank=`) done; graph-proximity lane → **R1** (`hybrid_search`
+  `seed=` folds `symbol_impact` distances into a 4th `proximity` RRF lane).
 - **A3 — Failure explainers** ✅: `why_failed` correlates run output + error lines + changed files.
-  ⬜ contract-break detection remains (foundation: `signature_text` already extracted).
-- **A4 — Cockpit integration** ✅/⬜: governance `MemoryPanel` done; ⬜ provider/routing/token UI remains.
-- **A5 — Auth follow-ons** ⬜: audit log of auth events (mint/revoke/denied), token expiry/rotation,
-  and finer per-endpoint authz beyond the admin/agent/readonly split.
+  Contract-break detection → **R2** (`changetrack::symbol_signature` + `ChangeSet.contract_breaks`).
+- **A4 — Cockpit integration** ✅: governance `MemoryPanel` done; provider/routing/token UI → **R7**
+  (`AdminPanel.tsx`, `admin` view).
+- **A5 — Auth follow-ons** ✅ (**R4**): capped auth-audit log (mint/revoke/rotate/denied,
+  `GET /api/auth/audit`), token expiry + rotation, and a real `roleRank` hierarchy with
+  explicit per-endpoint `agent` gates.
 
 ## Goal records
 The two tracks are also registered as `/goal` runtime goals in the self workspace
