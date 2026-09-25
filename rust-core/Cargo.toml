@@ -26,6 +26,11 @@ sha2 = "0.10"
 thiserror = "2.0"
 walkdir = "2.5"
 percent-encoding = "2.3"
+# Code index store (WS-07, PAR-STORE-03): one SQLite file per workspace under
+# <git-dir>/xmustard-cache/index-v3. `bundled` compiles SQLite with FTS5 (contentless
+# chunk postings) so the index never depends on the host library. D-02 measurement:
+# docs/benchmarks/2026-09-25-d02-fts5-vs-tantivy.md.
+rusqlite = { version = "0.32.1", features = ["bundled"] }
 
 # Neural semantic lane (XM-PRO-012): the ort(onnxruntime)+tokenizers backend is a heavy
 # native dependency (~120-160 MB peak), so it is OPTIONAL and pulled in ONLY by the
@@ -35,6 +40,9 @@ fastembed = { version = "5", optional = true }
 
 [dev-dependencies]
 tempfile = "3.23"
+# tests/index_build.rs reads a child's peak RSS with wait4(2) (test code only; the
+# library keeps #![forbid(unsafe_code)]).
+libc = "0.2"
 
 [features]
 # Opt-in neural semantic lane (local int8 ONNX via fastembed/ort); off by default to keep
@@ -45,4 +53,19 @@ semantic-onnx = ["dep:fastembed"]
 # that regression take ~12 s. Optimizing only this dependency keeps tests about behavior.
 # Release builds are unaffected.
 [profile.dev.package.sha2]
+opt-level = 3
+
+# The index tests build 5,000-file fixtures through bundled SQLite and the tree-sitter
+# grammars (C code); unoptimized C made those runs several times slower.
+[profile.dev.package.libsqlite3-sys]
+opt-level = 3
+[profile.dev.package.tree-sitter]
+opt-level = 3
+[profile.dev.package.tree-sitter-go]
+opt-level = 3
+[profile.dev.package.tree-sitter-rust]
+opt-level = 3
+[profile.dev.package.tree-sitter-typescript]
+opt-level = 3
+[profile.dev.package.tree-sitter-javascript]
 opt-level = 3
