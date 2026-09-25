@@ -24,6 +24,8 @@ type Record struct {
 	RawBytes       int64      `json:"raw_bytes"`
 	ProjectedBytes int        `json:"projected_bytes"`
 	Omissions      []Omission `json:"omissions,omitempty"`
+	// Family is set when a tool-family reducer (registry.go) produced the projection.
+	Family *FamilyRecord `json:"family,omitempty"`
 }
 
 // Omission names one omitted region of the original by byte range, so a client can
@@ -48,6 +50,16 @@ type Omission struct {
 // every large container ends, nesting deeper than maxNesting is refused, ctx is
 // checked throughout, and every write is checked against the hard cap max.
 func Reduce(ctx context.Context, r io.ReaderAt, n int64, contentType string, target, max int) (string, Record, error) {
+	// registry hook: a capture that selected a tool-family reducer (registry.go)
+	if h := reduceHookFrom(ctx); h != nil {
+		return h.run(ctx, r, n, contentType, target, max)
+	}
+	return reduceGeneric(ctx, r, n, contentType, target, max, false)
+}
+
+// reduceGeneric is xm-reduce/1. keepStatus (the structured family only) keeps
+// scalar status members of every reduced object verbatim.
+func reduceGeneric(ctx context.Context, r io.ReaderAt, n int64, contentType string, target, max int, keepStatus bool) (string, Record, error) {
 	rec := Record{Reducer: ReducerVersion, RawBytes: n}
 	if target > max {
 		target = max
@@ -67,7 +79,7 @@ func Reduce(ctx context.Context, r io.ReaderAt, n int64, contentType string, tar
 	mode := classify(r, n, contentType)
 	declaredJSON := strings.Contains(strings.ToLower(contentType), "json")
 	if mode == "json" {
-		jr := &jsonReducer{ctx: ctx, src: newSrc(r, n), hardMax: max, extra: max - target}
+		jr := &jsonReducer{ctx: ctx, src: newSrc(r, n), hardMax: max, extra: max - target, keepStatus: keepStatus}
 		var out bytes.Buffer
 		// one linear, cancellable structural pass validates and indexes the document
 		err := jr.src.index(ctx)
@@ -485,6 +497,8 @@ type jsonReducer struct {
 	omissions []Omission
 	hardMax   int // no projection may exceed this
 	extra     int // shared slack beyond the target for mandatory failure elements
+	// keepStatus makes scalar status members (statusKeys) mandatory in every object.
+	keepStatus bool
 }
 
 func (j *jsonReducer) omit(o Omission) {
@@ -654,8 +668,28 @@ func (j *jsonReducer) reduceObject(out *bytes.Buffer, start, end int64, budget i
 	remaining := budget - 2
 	include := make([]int, len(ms)) // 0 placeholder, 1 verbatim, 2 reduce with share
 	cost := func(m member) int { return int(m.key.end-m.key.start) + 2 + int(m.val.end-m.val.start) }
+	// phase 0 (structured family): scalar status members are never dropped
+	if j.keepStatus {
+		for k, m := range ms {
+			c := cost(m)
+			if v, _ := j.src.at(m.val.start); v == '{' || v == '[' || c > 512 || !isStatusKey(j.src.read(m.key.start+1, m.key.end-1)) {
+				continue // long status strings are mandatory in phase 2
+			}
+			if c > remaining {
+				if j.extra < c-remaining {
+					return errHardCap
+				}
+				j.extra -= c - remaining
+				remaining = c
+			}
+			include[k], remaining = 1, remaining-c
+		}
+	}
 	// phase 1: small members verbatim, in document order
 	for k, m := range ms {
+		if include[k] != 0 {
+			continue
+		}
 		if c := cost(m); c <= 512 && c <= remaining {
 			include[k], remaining = 1, remaining-c
 		}
@@ -668,7 +702,7 @@ func (j *jsonReducer) reduceObject(out *bytes.Buffer, start, end int64, budget i
 		if include[k] != 0 {
 			continue
 		}
-		if j.src.salientIn(m.val.start, m.val.end) {
+		if j.src.salientIn(m.val.start, m.val.end) || (j.keepStatus && isStatusKey(j.src.read(m.key.start+1, m.key.end-1))) {
 			mandatory = append(mandatory, k)
 		} else {
 			large = append(large, k)

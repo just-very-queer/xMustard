@@ -401,7 +401,11 @@ func inFlightBodyLimit() int {
 const bodyBudgetThreshold = 1 << 20 // 1 MiB
 
 func bodyLimitMiddleware(next http.Handler) http.Handler {
-	limit := budget.CapToPool(maxRequestBodyBytesConfigured())
+	// A body reserved in the transient pool can never exceed the pool, so its cap is
+	// the pool size (a permanent 413, not a retried 503). A body its handler streams to
+	// disk (streamsRequestBody) is never reserved, so it keeps the configured cap.
+	streamLimit := maxRequestBodyBytesConfigured()
+	reservedLimit := budget.CapToPool(streamLimit)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Every request gets a transient-byte ledger held until the handler returns
 		// (deferred, so success, error, cancellation and panic all release it). Rust
@@ -413,12 +417,21 @@ func bodyLimitMiddleware(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
+		streams := streamsRequestBody(r)
+		limit := reservedLimit
+		if streams {
+			limit = streamLimit
+		}
 		if r.ContentLength > limit {
 			// permanently too large: 413, not a retryable overload
 			writeJSON(w, http.StatusRequestEntityTooLarge, map[string]any{"error": "request body too large"})
 			return
 		}
 		r.Body = http.MaxBytesReader(w, r.Body, limit)
+		if streams { // capped, but spooled to disk in O(window) by the handler
+			next.ServeHTTP(w, r)
+			return
+		}
 		if r.ContentLength > bodyBudgetThreshold || r.ContentLength < 0 {
 			select {
 			case bodyInFlight <- struct{}{}:

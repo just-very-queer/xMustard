@@ -84,6 +84,8 @@ var routeGateTable = map[string]routeGate{
 	"GET /api/workspaces/{workspace_id}/evidence/{handle}":    coreGate(roleReader, "", "issuer-bound expansion"),
 	"DELETE /api/workspaces/{workspace_id}/evidence/{handle}": {Core: true, Role: roleProposer, ReadSafe: true, Note: "issuer revokes its own original"},
 	"DELETE /api/workspaces/{workspace_id}/evidence":          coreGate(roleAdmin, "", "workspace-wide purge of every principal's originals"),
+	"POST /api/workspaces/{workspace_id}/evidence/capture":    {Core: true, Role: roleProposer, ReadSafe: true, Note: "any tool's output (raw or a client hook body), the caller's own"},
+	"GET /api/workspaces/{workspace_id}/evidence/search":      coreGate(roleReader, "", "issuer-bound search in an original"),
 
 	// --- platform: operator configuration ---
 	"GET /api/runtimes":                platformGate(roleReader, ""),

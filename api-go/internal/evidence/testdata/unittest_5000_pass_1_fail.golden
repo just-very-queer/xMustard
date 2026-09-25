@@ -1,0 +1,404 @@
+[xmustard test] xm-test/1 exit=1 lines=5416 passed=5000 failed=1 skipped=0 counts_from=summary failing=test_parse_value failure_lines=4 collapsed=5000
+[xmustard: 2500 lines omitted, bytes 0-155000]
+test_parse_value (tests.test_mod.TestMod.test_parse_value) ... FAIL
+[xmustard: 2500 lines omitted, bytes 155068-310068]
+
+======================================================================
+FAIL: test_parse_value (tests.test_mod.TestMod.test_parse_value)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/src/tests/test_mod.py", line 42, in test_parse_value
+    self.assertEqual(parse("3"), 4)
+  File "/src/mod/layer0.py", line 10, in step0
+    return step1(value)
+  File "/src/mod/layer1.py", line 11, in step1
+    return step2(value)
+  File "/src/mod/layer2.py", line 12, in step2
+    return step3(value)
+  File "/src/mod/layer3.py", line 13, in step3
+    return step4(value)
+  File "/src/mod/layer4.py", line 14, in step4
+    return step5(value)
+  File "/src/mod/layer5.py", line 15, in step5
+    return step6(value)
+  File "/src/mod/layer6.py", line 16, in step6
+    return step7(value)
+  File "/src/mod/layer7.py", line 17, in step7
+    return step8(value)
+  File "/src/mod/layer8.py", line 18, in step8
+    return step9(value)
+  File "/src/mod/layer9.py", line 19, in step9
+    return step10(value)
+  File "/src/mod/layer10.py", line 20, in step10
+    return step11(value)
+  File "/src/mod/layer11.py", line 21, in step11
+    return step12(value)
+  File "/src/mod/layer12.py", line 22, in step12
+    return step13(value)
+  File "/src/mod/layer13.py", line 23, in step13
+    return step14(value)
+  File "/src/mod/layer14.py", line 24, in step14
+    return step15(value)
+  File "/src/mod/layer15.py", line 25, in step15
+    return step16(value)
+  File "/src/mod/layer16.py", line 26, in step16
+    return step17(value)
+  File "/src/mod/layer17.py", line 27, in step17
+    return step18(value)
+  File "/src/mod/layer18.py", line 28, in step18
+    return step19(value)
+  File "/src/mod/layer19.py", line 29, in step19
+    return step20(value)
+  File "/src/mod/layer20.py", line 30, in step20
+    return step21(value)
+  File "/src/mod/layer21.py", line 31, in step21
+    return step22(value)
+  File "/src/mod/layer22.py", line 32, in step22
+    return step23(value)
+  File "/src/mod/layer23.py", line 33, in step23
+    return step24(value)
+  File "/src/mod/layer24.py", line 34, in step24
+    return step25(value)
+  File "/src/mod/layer25.py", line 35, in step25
+    return step26(value)
+  File "/src/mod/layer26.py", line 36, in step26
+    return step27(value)
+  File "/src/mod/layer27.py", line 37, in step27
+    return step28(value)
+  File "/src/mod/layer28.py", line 38, in step28
+    return step29(value)
+  File "/src/mod/layer29.py", line 39, in step29
+    return step30(value)
+  File "/src/mod/layer30.py", line 40, in step30
+    return step31(value)
+  File "/src/mod/layer31.py", line 41, in step31
+    return step32(value)
+  File "/src/mod/layer32.py", line 42, in step32
+    return step33(value)
+  File "/src/mod/layer33.py", line 43, in step33
+    return step34(value)
+  File "/src/mod/layer34.py", line 44, in step34
+    return step35(value)
+  File "/src/mod/layer35.py", line 45, in step35
+    return step36(value)
+  File "/src/mod/layer36.py", line 46, in step36
+    return step37(value)
+  File "/src/mod/layer37.py", line 47, in step37
+    return step38(value)
+  File "/src/mod/layer38.py", line 48, in step38
+    return step39(value)
+  File "/src/mod/layer39.py", line 49, in step39
+    return step40(value)
+  File "/src/mod/layer40.py", line 50, in step40
+    return step41(value)
+  File "/src/mod/layer41.py", line 51, in step41
+    return step42(value)
+  File "/src/mod/layer42.py", line 52, in step42
+    return step43(value)
+  File "/src/mod/layer43.py", line 53, in step43
+    return step44(value)
+  File "/src/mod/layer44.py", line 54, in step44
+    return step45(value)
+  File "/src/mod/layer45.py", line 55, in step45
+    return step46(value)
+  File "/src/mod/layer46.py", line 56, in step46
+    return step47(value)
+  File "/src/mod/layer47.py", line 57, in step47
+    return step48(value)
+  File "/src/mod/layer48.py", line 58, in step48
+    return step49(value)
+  File "/src/mod/layer49.py", line 59, in step49
+    return step50(value)
+  File "/src/mod/layer50.py", line 60, in step50
+    return step51(value)
+  File "/src/mod/layer51.py", line 61, in step51
+    return step52(value)
+  File "/src/mod/layer52.py", line 62, in step52
+    return step53(value)
+  File "/src/mod/layer53.py", line 63, in step53
+    return step54(value)
+  File "/src/mod/layer54.py", line 64, in step54
+    return step55(value)
+  File "/src/mod/layer55.py", line 65, in step55
+    return step56(value)
+  File "/src/mod/layer56.py", line 66, in step56
+    return step57(value)
+  File "/src/mod/layer57.py", line 67, in step57
+    return step58(value)
+  File "/src/mod/layer58.py", line 68, in step58
+    return step59(value)
+  File "/src/mod/layer59.py", line 69, in step59
+[xmustard: 16 lines omitted, bytes 314795-315387]
+    return step68(value)
+  File "/src/mod/layer68.py", line 78, in step68
+    return step69(value)
+  File "/src/mod/layer69.py", line 79, in step69
+    return step70(value)
+  File "/src/mod/layer70.py", line 80, in step70
+    return step71(value)
+  File "/src/mod/layer71.py", line 81, in step71
+    return step72(value)
+  File "/src/mod/layer72.py", line 82, in step72
+    return step73(value)
+  File "/src/mod/layer73.py", line 83, in step73
+    return step74(value)
+  File "/src/mod/layer74.py", line 84, in step74
+    return step75(value)
+  File "/src/mod/layer75.py", line 85, in step75
+    return step76(value)
+  File "/src/mod/layer76.py", line 86, in step76
+    return step77(value)
+  File "/src/mod/layer77.py", line 87, in step77
+    return step78(value)
+  File "/src/mod/layer78.py", line 88, in step78
+    return step79(value)
+  File "/src/mod/layer79.py", line 89, in step79
+    return step80(value)
+  File "/src/mod/layer80.py", line 90, in step80
+    return step81(value)
+  File "/src/mod/layer81.py", line 91, in step81
+    return step82(value)
+  File "/src/mod/layer82.py", line 92, in step82
+    return step83(value)
+  File "/src/mod/layer83.py", line 93, in step83
+    return step84(value)
+  File "/src/mod/layer84.py", line 94, in step84
+    return step85(value)
+  File "/src/mod/layer85.py", line 95, in step85
+    return step86(value)
+  File "/src/mod/layer86.py", line 96, in step86
+    return step87(value)
+  File "/src/mod/layer87.py", line 97, in step87
+    return step88(value)
+  File "/src/mod/layer88.py", line 98, in step88
+    return step89(value)
+  File "/src/mod/layer89.py", line 99, in step89
+    return step90(value)
+  File "/src/mod/layer90.py", line 100, in step90
+    return step91(value)
+  File "/src/mod/layer91.py", line 101, in step91
+    return step92(value)
+  File "/src/mod/layer92.py", line 102, in step92
+    return step93(value)
+  File "/src/mod/layer93.py", line 103, in step93
+    return step94(value)
+  File "/src/mod/layer94.py", line 104, in step94
+    return step95(value)
+  File "/src/mod/layer95.py", line 105, in step95
+    return step96(value)
+  File "/src/mod/layer96.py", line 106, in step96
+    return step97(value)
+  File "/src/mod/layer97.py", line 107, in step97
+    return step98(value)
+  File "/src/mod/layer98.py", line 108, in step98
+    return step99(value)
+  File "/src/mod/layer99.py", line 109, in step99
+    return step100(value)
+  File "/src/mod/layer100.py", line 110, in step100
+    return step101(value)
+  File "/src/mod/layer101.py", line 111, in step101
+    return step102(value)
+  File "/src/mod/layer102.py", line 112, in step102
+    return step103(value)
+  File "/src/mod/layer103.py", line 113, in step103
+    return step104(value)
+  File "/src/mod/layer104.py", line 114, in step104
+    return step105(value)
+  File "/src/mod/layer105.py", line 115, in step105
+    return step106(value)
+  File "/src/mod/layer106.py", line 116, in step106
+    return step107(value)
+  File "/src/mod/layer107.py", line 117, in step107
+    return step108(value)
+  File "/src/mod/layer108.py", line 118, in step108
+    return step109(value)
+  File "/src/mod/layer109.py", line 119, in step109
+    return step110(value)
+  File "/src/mod/layer110.py", line 120, in step110
+    return step111(value)
+  File "/src/mod/layer111.py", line 121, in step111
+    return step112(value)
+  File "/src/mod/layer112.py", line 122, in step112
+    return step113(value)
+  File "/src/mod/layer113.py", line 123, in step113
+    return step114(value)
+  File "/src/mod/layer114.py", line 124, in step114
+    return step115(value)
+  File "/src/mod/layer115.py", line 125, in step115
+    return step116(value)
+  File "/src/mod/layer116.py", line 126, in step116
+    return step117(value)
+  File "/src/mod/layer117.py", line 127, in step117
+    return step118(value)
+  File "/src/mod/layer118.py", line 128, in step118
+    return step119(value)
+  File "/src/mod/layer119.py", line 129, in step119
+    return step120(value)
+  File "/src/mod/layer120.py", line 130, in step120
+    return step121(value)
+  File "/src/mod/layer121.py", line 131, in step121
+    return step122(value)
+  File "/src/mod/layer122.py", line 132, in step122
+    return step123(value)
+  File "/src/mod/layer123.py", line 133, in step123
+    return step124(value)
+  File "/src/mod/layer124.py", line 134, in step124
+    return step125(value)
+  File "/src/mod/layer125.py", line 135, in step125
+    return step126(value)
+  File "/src/mod/layer126.py", line 136, in step126
+    return step127(value)
+  File "/src/mod/layer127.py", line 137, in step127
+    return step128(value)
+  File "/src/mod/layer128.py", line 138, in step128
+    return step129(value)
+  File "/src/mod/layer129.py", line 139, in step129
+    return step130(value)
+  File "/src/mod/layer130.py", line 140, in step130
+    return step131(value)
+  File "/src/mod/layer131.py", line 141, in step131
+    return step132(value)
+  File "/src/mod/layer132.py", line 142, in step132
+    return step133(value)
+  File "/src/mod/layer133.py", line 143, in step133
+    return step134(value)
+  File "/src/mod/layer134.py", line 144, in step134
+    return step135(value)
+  File "/src/mod/layer135.py", line 145, in step135
+    return step136(value)
+  File "/src/mod/layer136.py", line 146, in step136
+    return step137(value)
+  File "/src/mod/layer137.py", line 147, in step137
+    return step138(value)
+  File "/src/mod/layer138.py", line 148, in step138
+    return step139(value)
+  File "/src/mod/layer139.py", line 149, in step139
+    return step140(value)
+  File "/src/mod/layer140.py", line 150, in step140
+    return step141(value)
+  File "/src/mod/layer141.py", line 151, in step141
+    return step142(value)
+  File "/src/mod/layer142.py", line 152, in step142
+    return step143(value)
+  File "/src/mod/layer143.py", line 153, in step143
+    return step144(value)
+  File "/src/mod/layer144.py", line 154, in step144
+    return step145(value)
+  File "/src/mod/layer145.py", line 155, in step145
+    return step146(value)
+  File "/src/mod/layer146.py", line 156, in step146
+    return step147(value)
+  File "/src/mod/layer147.py", line 157, in step147
+    return step148(value)
+  File "/src/mod/layer148.py", line 158, in step148
+    return step149(value)
+  File "/src/mod/layer149.py", line 159, in step149
+    return step150(value)
+  File "/src/mod/layer150.py", line 160, in step150
+    return step151(value)
+  File "/src/mod/layer151.py", line 161, in step151
+    return step152(value)
+  File "/src/mod/layer152.py", line 162, in step152
+    return step153(value)
+  File "/src/mod/layer153.py", line 163, in step153
+    return step154(value)
+  File "/src/mod/layer154.py", line 164, in step154
+    return step155(value)
+  File "/src/mod/layer155.py", line 165, in step155
+    return step156(value)
+  File "/src/mod/layer156.py", line 166, in step156
+    return step157(value)
+  File "/src/mod/layer157.py", line 167, in step157
+    return step158(value)
+  File "/src/mod/layer158.py", line 168, in step158
+    return step159(value)
+  File "/src/mod/layer159.py", line 169, in step159
+    return step160(value)
+  File "/src/mod/layer160.py", line 170, in step160
+    return step161(value)
+  File "/src/mod/layer161.py", line 171, in step161
+    return step162(value)
+  File "/src/mod/layer162.py", line 172, in step162
+    return step163(value)
+  File "/src/mod/layer163.py", line 173, in step163
+    return step164(value)
+  File "/src/mod/layer164.py", line 174, in step164
+    return step165(value)
+  File "/src/mod/layer165.py", line 175, in step165
+    return step166(value)
+  File "/src/mod/layer166.py", line 176, in step166
+    return step167(value)
+  File "/src/mod/layer167.py", line 177, in step167
+    return step168(value)
+  File "/src/mod/layer168.py", line 178, in step168
+    return step169(value)
+  File "/src/mod/layer169.py", line 179, in step169
+    return step170(value)
+  File "/src/mod/layer170.py", line 180, in step170
+    return step171(value)
+  File "/src/mod/layer171.py", line 181, in step171
+    return step172(value)
+  File "/src/mod/layer172.py", line 182, in step172
+    return step173(value)
+  File "/src/mod/layer173.py", line 183, in step173
+    return step174(value)
+  File "/src/mod/layer174.py", line 184, in step174
+    return step175(value)
+  File "/src/mod/layer175.py", line 185, in step175
+    return step176(value)
+  File "/src/mod/layer176.py", line 186, in step176
+    return step177(value)
+  File "/src/mod/layer177.py", line 187, in step177
+    return step178(value)
+  File "/src/mod/layer178.py", line 188, in step178
+    return step179(value)
+  File "/src/mod/layer179.py", line 189, in step179
+    return step180(value)
+  File "/src/mod/layer180.py", line 190, in step180
+    return step181(value)
+  File "/src/mod/layer181.py", line 191, in step181
+    return step182(value)
+  File "/src/mod/layer182.py", line 192, in step182
+    return step183(value)
+  File "/src/mod/layer183.py", line 193, in step183
+    return step184(value)
+  File "/src/mod/layer184.py", line 194, in step184
+    return step185(value)
+  File "/src/mod/layer185.py", line 195, in step185
+    return step186(value)
+  File "/src/mod/layer186.py", line 196, in step186
+    return step187(value)
+  File "/src/mod/layer187.py", line 197, in step187
+    return step188(value)
+  File "/src/mod/layer188.py", line 198, in step188
+    return step189(value)
+  File "/src/mod/layer189.py", line 199, in step189
+    return step190(value)
+  File "/src/mod/layer190.py", line 200, in step190
+    return step191(value)
+  File "/src/mod/layer191.py", line 201, in step191
+    return step192(value)
+  File "/src/mod/layer192.py", line 202, in step192
+    return step193(value)
+  File "/src/mod/layer193.py", line 203, in step193
+    return step194(value)
+  File "/src/mod/layer194.py", line 204, in step194
+    return step195(value)
+  File "/src/mod/layer195.py", line 205, in step195
+    return step196(value)
+  File "/src/mod/layer196.py", line 206, in step196
+    return step197(value)
+  File "/src/mod/layer197.py", line 207, in step197
+    return step198(value)
+  File "/src/mod/layer198.py", line 208, in step198
+    return step199(value)
+  File "/src/mod/layer199.py", line 209, in step199
+    return step200(value)
+  File "/src/mod/core.py", line 88, in convert
+    return int(s) + 1
+AssertionError: 3 != 4
+
+----------------------------------------------------------------------
+Ran 5001 tests in 12.345s
+
+FAILED (failures=1)

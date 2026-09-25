@@ -1,0 +1,57 @@
+{"reducer":"xm-reduce/1","mode":"text","reduced":true,"raw_bytes":218986,"projected_bytes":2998,"omissions":[{"kind":"lines","start":1315,"end":136335,"items":2474},{"kind":"lines","start":136596,"end":217666,"items":1474}]}
+2026-09-25T12:00:00 info worker 0 processed batch 0
+2026-09-25T12:00:01 info worker 1 processed batch 1
+2026-09-25T12:00:02 info worker 2 processed batch 2
+2026-09-25T12:00:03 info worker 3 processed batch 3
+2026-09-25T12:00:04 info worker 4 processed batch 4
+2026-09-25T12:00:05 info worker 5 processed batch 5
+2026-09-25T12:00:06 info worker 6 processed batch 6
+2026-09-25T12:00:07 info worker 7 processed batch 7
+2026-09-25T12:00:08 info worker 0 processed batch 8
+2026-09-25T12:00:09 info worker 1 processed batch 9
+2026-09-25T12:00:10 info worker 2 processed batch 10
+2026-09-25T12:00:11 info worker 3 processed batch 11
+2026-09-25T12:00:12 info worker 4 processed batch 12
+2026-09-25T12:00:13 info worker 5 processed batch 13
+2026-09-25T12:00:14 info worker 6 processed batch 14
+2026-09-25T12:00:15 info worker 7 processed batch 15
+2026-09-25T12:00:16 info worker 0 processed batch 16
+2026-09-25T12:00:17 info worker 1 processed batch 17
+2026-09-25T12:00:18 info worker 2 processed batch 18
+2026-09-25T12:00:19 info worker 3 processed batch 19
+2026-09-25T12:00:20 info worker 4 processed batch 20
+2026-09-25T12:00:21 info worker 5 processed batch 21
+2026-09-25T12:00:22 info worker 6 processed batch 22
+2026-09-25T12:00:23 info worker 7 processed batch 23
+2026-09-25T12:00:24 info worker 0 processed batch 24
+[xmustard: 2474 lines omitted, bytes 1315-136335]
+2026-09-25T12:41:39 info worker 3 processed batch 2499
+2026-09-25T12:41:40 info worker 4 processed batch 2500
+panic: runtime error: invalid memory address or nil pointer dereference
+	goroutine 7 [running]:
+2026-09-25T12:41:41 info worker 5 processed batch 2501
+[xmustard: 1474 lines omitted, bytes 136596-217666]
+2026-09-25T12:06:16 info worker 0 processed batch 3976
+2026-09-25T12:06:17 info worker 1 processed batch 3977
+2026-09-25T12:06:18 info worker 2 processed batch 3978
+2026-09-25T12:06:19 info worker 3 processed batch 3979
+2026-09-25T12:06:20 info worker 4 processed batch 3980
+2026-09-25T12:06:21 info worker 5 processed batch 3981
+2026-09-25T12:06:22 info worker 6 processed batch 3982
+2026-09-25T12:06:23 info worker 7 processed batch 3983
+2026-09-25T12:06:24 info worker 0 processed batch 3984
+2026-09-25T12:06:25 info worker 1 processed batch 3985
+2026-09-25T12:06:26 info worker 2 processed batch 3986
+2026-09-25T12:06:27 info worker 3 processed batch 3987
+2026-09-25T12:06:28 info worker 4 processed batch 3988
+2026-09-25T12:06:29 info worker 5 processed batch 3989
+2026-09-25T12:06:30 info worker 6 processed batch 3990
+2026-09-25T12:06:31 info worker 7 processed batch 3991
+2026-09-25T12:06:32 info worker 0 processed batch 3992
+2026-09-25T12:06:33 info worker 1 processed batch 3993
+2026-09-25T12:06:34 info worker 2 processed batch 3994
+2026-09-25T12:06:35 info worker 3 processed batch 3995
+2026-09-25T12:06:36 info worker 4 processed batch 3996
+2026-09-25T12:06:37 info worker 5 processed batch 3997
+2026-09-25T12:06:38 info worker 6 processed batch 3998
+2026-09-25T12:06:39 info worker 7 processed batch 3999

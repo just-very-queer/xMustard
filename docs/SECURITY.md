@@ -179,6 +179,8 @@ whether `XMUSTARD_READ_ONLY=1` still serves the route.
 | `GET /api/workspaces/{workspace_id}/diagnostics` | core | reader | served | diagnostics |  |
 | `DELETE /api/workspaces/{workspace_id}/evidence` | core | admin | refused |  | workspace-wide purge of every principal's originals |
 | `POST /api/workspaces/{workspace_id}/evidence` | core | proposer | served |  | projection of the caller's own tool result |
+| `POST /api/workspaces/{workspace_id}/evidence/capture` | core | proposer | served |  | any tool's output (raw or a client hook body), the caller's own |
+| `GET /api/workspaces/{workspace_id}/evidence/search` | core | reader | served |  | issuer-bound search in an original |
 | `DELETE /api/workspaces/{workspace_id}/evidence/{handle}` | core | proposer | served |  | issuer revokes its own original |
 | `GET /api/workspaces/{workspace_id}/evidence/{handle}` | core | reader | served |  | issuer-bound expansion |
 | `GET /api/workspaces/{workspace_id}/explain-path` | core | reader | served | explain |  |

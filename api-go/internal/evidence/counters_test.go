@@ -84,3 +84,23 @@ func TestCaptureNeverWaitsOnHeavySlot(t *testing.T) {
 		t.Fatalf("capture must never queue for the heavy slot: %+v", st)
 	}
 }
+
+// The universal capture digests the whole request body (hook or raw) before the store
+// hashes the decoded original: both count as hashed bytes, and the capture is counted.
+func TestObserveCountsBodyDigestAndCapture(t *testing.T) {
+	s, _ := testStore(t, nil)
+	body := []byte(`{"tool_name":"Bash","tool_input":{"command":"ls"},"tool_response":{"stdout":"a\nb\n","stderr":""}}`)
+	before := budget.Counters()
+	res, err := s.Observe(context.Background(), nil, ObservationInput{WorkspaceID: "ws", Format: FormatClaude,
+		Body: bytes.NewReader(body), Meta: CaptureMeta{Client: "claude"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	after := budget.Counters()
+	if got := after.Captures - before.Captures; got != 1 {
+		t.Fatalf("captures counted %d, want 1", got)
+	}
+	if got, want := after.BytesHashed-before.BytesHashed, int64(len(body))+res.RawBytes; got != want {
+		t.Fatalf("hashed bytes counted %d, want body %d + original %d", got, len(body), res.RawBytes)
+	}
+}
