@@ -29,9 +29,11 @@ type routeGate struct {
 	Core bool
 	Role string
 	Tool string
-	// ReadSafe marks a non-GET route that changes no shared state (evidence
-	// capture of the caller's own tool output, policy evaluation), so read-only mode
-	// still serves it.
+	// ReadSafe marks a non-GET route read-only mode still serves: it changes no
+	// shared state (capture or revocation of the caller's own tool output, policy
+	// evaluation), or it only withdraws access (token revoke and rotate, so a leaked
+	// token can be cut off without leaving read-only mode). A route that deletes
+	// shared data is never ReadSafe.
 	ReadSafe bool
 	Note     string
 }
@@ -57,8 +59,8 @@ var routeGateTable = map[string]routeGate{
 	"GET /api/auth/whoami":                      coreGate(roleReader, "", "caller principal, roles and usable tools"),
 	"GET /api/auth/principals":                  coreGate(roleAdmin, "", ""),
 	"POST /api/auth/tokens":                     coreGate(roleAdmin, "", "mint"),
-	"POST /api/auth/tokens/{id}/rotate":         coreGate(roleAdmin, "", ""),
-	"DELETE /api/auth/tokens/{id}":              coreGate(roleAdmin, "", "revoke"),
+	"POST /api/auth/tokens/{id}/rotate":         {Core: true, Role: roleAdmin, ReadSafe: true, Note: "replaces the secret; the old one stops working"},
+	"DELETE /api/auth/tokens/{id}":              {Core: true, Role: roleAdmin, ReadSafe: true, Note: "revoke; served in read-only mode to cut off a leaked token"},
 	"GET /api/auth/audit":                       coreGate(roleAdmin, "", ""),
 	"GET /api/workspaces":                       coreGate(roleReader, "", "filtered by token scope and workspace allowlist"),
 	"POST /api/workspaces/load":                 coreGate(roleAdmin, "", "workspace registration; root checked against the allowlist"),
@@ -81,7 +83,7 @@ var routeGateTable = map[string]routeGate{
 	"POST /api/workspaces/{workspace_id}/evidence":            {Core: true, Role: roleProposer, ReadSafe: true, Note: "projection of the caller's own tool result"},
 	"GET /api/workspaces/{workspace_id}/evidence/{handle}":    coreGate(roleReader, "", "issuer-bound expansion"),
 	"DELETE /api/workspaces/{workspace_id}/evidence/{handle}": {Core: true, Role: roleProposer, ReadSafe: true, Note: "issuer revokes its own original"},
-	"DELETE /api/workspaces/{workspace_id}/evidence":          {Core: true, Role: roleAdmin, ReadSafe: true, Note: "workspace-wide revocation"},
+	"DELETE /api/workspaces/{workspace_id}/evidence":          coreGate(roleAdmin, "", "workspace-wide purge of every principal's originals"),
 
 	// --- platform: operator configuration ---
 	"GET /api/runtimes":                platformGate(roleReader, ""),
@@ -324,17 +326,21 @@ type routeRegistrar interface {
 }
 
 // gatedMux registers routes on a ServeMux and records each route's gate. A route
-// without a row in routeGateTable is a programming error caught at startup.
+// without a row in routeGateTable is a programming error caught at startup. The
+// ServeMux is not embedded, so no promoted Handle or HandleFunc can register a
+// route around the table; routeGateMiddleware also refuses a matched pattern that
+// has no gate.
 type gatedMux struct {
-	*http.ServeMux
+	mux   *http.ServeMux
 	gates map[string]routeGate
 }
 
 func newGatedMux() *gatedMux {
-	return &gatedMux{ServeMux: http.NewServeMux(), gates: map[string]routeGate{}}
+	return &gatedMux{mux: http.NewServeMux(), gates: map[string]routeGate{}}
 }
 
-func (m *gatedMux) HandleFunc(pattern string, handler func(http.ResponseWriter, *http.Request)) {
+// gate returns the route's row, panicking when it is missing or invalid.
+func (m *gatedMux) gate(pattern string) routeGate {
 	g, ok := routeGateTable[pattern]
 	if !ok {
 		panic(fmt.Sprintf("route %q has no row in routeGateTable (route_gates.go): classify it core or platform and give it a role", pattern))
@@ -342,9 +348,23 @@ func (m *gatedMux) HandleFunc(pattern string, handler func(http.ResponseWriter, 
 	if g.Role == "" || !validGateRole(g.Role) {
 		panic(fmt.Sprintf("route %q has an invalid gate role %q", pattern, g.Role))
 	}
-	m.gates[pattern] = g
-	m.ServeMux.HandleFunc(pattern, handler)
+	return g
 }
+
+func (m *gatedMux) HandleFunc(pattern string, handler func(http.ResponseWriter, *http.Request)) {
+	m.Handle(pattern, http.HandlerFunc(handler))
+}
+
+func (m *gatedMux) Handle(pattern string, handler http.Handler) {
+	g := m.gate(pattern)
+	m.gates[pattern] = g
+	m.mux.Handle(pattern, handler)
+}
+
+// Handler reports the handler and pattern the ServeMux would use for r.
+func (m *gatedMux) Handler(r *http.Request) (http.Handler, string) { return m.mux.Handler(r) }
+
+func (m *gatedMux) ServeHTTP(w http.ResponseWriter, r *http.Request) { m.mux.ServeHTTP(w, r) }
 
 func validGateRole(role string) bool {
 	for _, r := range workspaceops.Roles() {

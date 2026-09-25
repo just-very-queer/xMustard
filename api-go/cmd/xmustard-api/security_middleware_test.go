@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -231,6 +232,25 @@ func TestReadOnlyMode(t *testing.T) {
 	if code, body := call(t, "POST", base+"/evidence?tool=search", tok, `{"hits":[]}`, nil); body["reason"] == "read_only" {
 		t.Fatalf("capturing the caller's own result is not a shared-state write: %d %v", code, body)
 	}
+	// deleting every principal's evidence is a shared-state write
+	admin := mint(t, dir, "rootRO", "admin")
+	if code, body := call(t, "DELETE", base+"/evidence", admin, "", nil); code != http.StatusForbidden || body["reason"] != "read_only" {
+		t.Fatalf("workspace-wide evidence purge in read-only mode: want 403 read_only, got %d %v", code, body)
+	}
+	if code, body := call(t, "POST", srv.URL+"/api/auth/tokens", admin, `{"id":"new","role":"agent"}`, nil); code != http.StatusForbidden || body["reason"] != "read_only" {
+		t.Fatalf("minting in read-only mode: want 403 read_only, got %d %v", code, body)
+	}
+	// a leaked token can still be rotated and revoked: both only withdraw access
+	leaked := mint(t, dir, "leaked", "agent")
+	if code, body := call(t, "POST", srv.URL+"/api/auth/tokens/leaked/rotate", admin, "", nil); code != http.StatusOK {
+		t.Fatalf("rotating in read-only mode: %d %v", code, body)
+	}
+	if workspaceops.ResolveToken(dir, leaked) != nil {
+		t.Fatal("the rotated-out secret must stop resolving")
+	}
+	if code, body := call(t, "DELETE", srv.URL+"/api/auth/tokens/leaked", admin, "", nil); code != http.StatusOK {
+		t.Fatalf("revoking in read-only mode: %d %v", code, body)
+	}
 	_, who := call(t, "GET", srv.URL+"/api/auth/whoami", tok, "", nil)
 	tools := who["tools"].([]any)
 	for _, tl := range tools {
@@ -402,5 +422,157 @@ func TestPatternValuesFailClosed(t *testing.T) {
 	}
 	if _, ok := patternValues(pattern, "/api/workspaces/ws%zz/context/ctx_1/verify"); ok {
 		t.Fatal("a malformed escape must not yield values")
+	}
+}
+
+// Every path wildcard is validated, not only the workspace id: an encoded "../" in
+// the core why_failed route's run_id must not read another workspace's run (past the
+// workspace allowlist and the token's scope) or a planted record outside runs/.
+func TestEveryPathWildcardIsValidated(t *testing.T) {
+	srv, dir := securityServer(t, exposurePosture{Workspaces: map[string]bool{"wsA": true}})
+	reg, _ := json.Marshal([]map[string]any{
+		{"workspace_id": "wsA", "name": "a", "root_path": filepath.Join(dir, "a")},
+		{"workspace_id": "wsB", "name": "b", "root_path": filepath.Join(dir, "b")},
+	})
+	write := func(rel, body string) {
+		t.Helper()
+		p := filepath.Join(dir, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("workspaces.json", string(reg))
+	for _, ws := range []string{"wsA", "wsB"} {
+		write(filepath.Join("workspaces", ws, "snapshot.json"), `{"workspace_id":"`+ws+`"}`)
+	}
+	run := func(id, out string) string {
+		raw, _ := json.Marshal(map[string]any{"run_id": id, "status": "failed", "output_path": out})
+		return string(raw)
+	}
+	write("secret-b.log", "error: SECRET_FROM_WSB\n")
+	write("mine-a.log", "error: OWN_RUN_OUTPUT\n")
+	write(filepath.Join("workspaces", "wsB", "runs", "run_b.json"), run("run_b", filepath.Join(dir, "secret-b.log")))
+	write(filepath.Join("workspaces", "wsA", "evil.json"), run("evil", filepath.Join(dir, "secret-b.log")))
+	write(filepath.Join("workspaces", "wsA", "runs", "run_a.json"), run("run_a", filepath.Join(dir, "mine-a.log")))
+	tok, err := workspaceops.MintScopedToken(dir, "scoped", "agent", 0, []string{"wsA"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := srv.URL + "/api/workspaces/wsA/runs/"
+	code, body := call(t, "GET", base+"run_a/why-failed", tok, "", nil)
+	if code != http.StatusOK || !strings.Contains(fmt.Sprint(body["error_lines"]), "OWN_RUN_OUTPUT") {
+		t.Fatalf("own run: want 200 with its output, got %d %v", code, body)
+	}
+	for _, runID := range []string{"..%2F..%2FwsB%2Fruns%2Frun_b", "..%2Fevil", "%2E%2E", "run_a%5Cx", "run_a%00"} {
+		code, body := call(t, "GET", base+runID+"/why-failed", tok, "", nil)
+		if code != http.StatusBadRequest || body["reason"] != "invalid_id" || strings.Contains(fmt.Sprint(body), "SECRET") {
+			t.Errorf("run_id %s: want 400 invalid_id, got %d %v", runID, code, body)
+		}
+	}
+	// a literal dot segment is cleaned by the mux (redirect, then no route)
+	if code, body := call(t, "GET", base+"../../wsB/runs/run_b/why-failed", tok, "", nil); code == http.StatusOK || strings.Contains(fmt.Sprint(body), "SECRET") {
+		t.Errorf("literal ../ in the path: got %d %v", code, body)
+	}
+	// defence in depth: the run store refuses the id too
+	if _, err := workspaceops.ReadRun(dir, "wsA", "../evil"); !workspaceops.IsInvalidInput(err) {
+		t.Fatalf("ReadRun with a traversing id: want invalid input, got %v", err)
+	}
+}
+
+// Platform wildcards (issue, view, provider and other ids) must be one safe path
+// segment; free-form characters that stay inside a segment are kept.
+func TestPlatformWildcardsAreOneSafeSegment(t *testing.T) {
+	t.Setenv("XMUSTARD_DATA_DIR", t.TempDir())
+	stub := newGatedMux()
+	for pattern := range routeGateTable {
+		stub.HandleFunc(pattern, func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(299) })
+	}
+	h := routeGateMiddleware(exposurePosture{Profile: profilePlatform}, stub, stub)
+	cases := []struct {
+		path string
+		code int
+	}{
+		{"/api/workspaces/ws1/issues/P1_ABC-12/quality", 299},
+		{"/api/workspaces/ws1/views/wip%2526done-1a2b3c4d", 299}, // a query-escaped view slug
+		{"/api/providers/openai-compatible%20local/models", 299},
+		{"/api/workspaces/ws1/issues/..%2F..%2Fx/quality", 400},
+		{"/api/workspaces/ws1/issues/../quality", 400}, // cleaned by the mux, then refused as misaligned
+		{"/api/workspaces/ws1/issues/%2E/quality", 400},
+		{"/api/workspaces/ws1/issues/a%5Cb/quality", 400},
+		{"/api/workspaces/ws1/issues/a%0Ab/quality", 400},
+		{"/api/providers/..%2F..%2Fsettings/models", 400},
+		{"/api/workspaces/ws1/goals/g..1", 400},
+	}
+	for _, c := range cases {
+		method := http.MethodGet
+		if strings.Contains(c.path, "/views/") {
+			method = http.MethodDelete
+		}
+		req := httptest.NewRequest(method, c.path, nil)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if c.code == 400 && (rec.Code == 299 || rec.Code == 200) {
+			t.Errorf("%s: an unsafe segment reached the handler (%d)", c.path, rec.Code)
+		}
+		if c.code == 299 && rec.Code != 299 {
+			t.Errorf("%s: want the handler, got %d %s", c.path, rec.Code, rec.Body.String())
+		}
+	}
+}
+
+// A pattern the mux matches without a gate row is refused, never served ungated.
+func TestUnclassifiedMatchFailsClosed(t *testing.T) {
+	m := newGatedMux()
+	m.mux.HandleFunc("GET /api/workspaces/{workspace_id}/unclassified", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(299) })
+	h := routeGateMiddleware(exposurePosture{Profile: profilePlatform}, m, m)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/api/workspaces/ws1/unclassified", nil))
+	if rec.Code != http.StatusInternalServerError || !strings.Contains(rec.Body.String(), "unclassified_route") {
+		t.Fatalf("an ungated match must fail closed, got %d %s", rec.Code, rec.Body.String())
+	}
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("Handle must refuse a route without a gate row")
+		}
+	}()
+	m.Handle("GET /api/workspaces/{workspace_id}/unclassified-too", http.NotFoundHandler())
+}
+
+// Reader-only tokens reach the route gate, so a write names the role it lacks.
+func TestReaderWritesNameMissingRole(t *testing.T) {
+	srv, dir := securityServer(t, exposurePosture{})
+	base := srv.URL + "/api/workspaces/wsR"
+	for _, spec := range []string{"reader", "readonly"} {
+		tok := mint(t, dir, "rita-"+spec, spec)
+		for _, c := range []struct{ path, body, role string }{
+			{"/context", `{"content":"x"}`, "proposer"},
+			{"/context/ctx_1/verify?approve=true", "", "verifier"},
+			{"/index", "", "indexer"},
+		} {
+			code, body := call(t, "POST", base+c.path, tok, c.body, nil)
+			if code != http.StatusForbidden || body["missing_role"] != c.role || body["reason"] != "missing_role" {
+				t.Errorf("%s POST %s: want 403 naming %s, got %d %v", spec, c.path, c.role, code, body)
+			}
+		}
+		if code, body := call(t, "GET", base+"/context/active", tok, "", nil); code != http.StatusOK {
+			t.Errorf("%s recall: %d %v", spec, code, body)
+		}
+	}
+}
+
+// With the auth middleware's reader short-circuit gone, the gate table alone keeps
+// reader-only tokens read-only: no non-GET route may grant reader.
+func TestNoWriteRouteGrantsReader(t *testing.T) {
+	for pattern, g := range routeGateTable {
+		switch patternMethod(pattern) {
+		case "", http.MethodGet, http.MethodHead:
+			continue
+		}
+		if g.Role == roleReader {
+			t.Errorf("%s: a non-GET route must need more than reader", pattern)
+		}
 	}
 }

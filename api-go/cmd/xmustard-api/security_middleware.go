@@ -3,10 +3,12 @@ package main
 import (
 	"context"
 	"fmt"
+	"maps"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 
@@ -317,13 +319,50 @@ func patternValues(pattern, escapedPath string) (map[string]string, bool) {
 	return out, true
 }
 
+// strictIDWildcards are path wildcards whose values the server generates or
+// validates as plain identifiers (workspaceops.IsSafeID). Every other wildcard must
+// still be one safe path segment (safeSegment).
+var strictIDWildcards = map[string]bool{
+	"workspace_id": true, "entry_id": true, "run_id": true, "terminal_id": true, "id": true,
+}
+
+// safeSegment reports whether a decoded wildcard value is one path segment that
+// cannot climb out of a directory: not empty, no "/", "\\" or control character,
+// and no "..". Free-form platform ids (issue, view and provider names) keep their
+// other characters.
+func safeSegment(v string) bool {
+	if v == "" || v == "." || strings.Contains(v, "..") || strings.ContainsAny(v, "/\\") {
+		return false
+	}
+	for _, c := range v {
+		if c < 0x20 || c == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
+// wildcardValid applies the rule for a wildcard's name to its decoded value.
+func wildcardValid(name, v string) bool {
+	if strictIDWildcards[name] {
+		return workspaceops.IsSafeID(v)
+	}
+	return safeSegment(v)
+}
+
 func routeGateMiddleware(p exposurePosture, mux *gatedMux, next http.Handler) http.Handler {
 	posture := &p
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, pattern := mux.Handler(r)
 		g, ok := mux.gates[pattern]
 		if !ok {
-			next.ServeHTTP(w, r) // unmatched: the mux answers 404, 405 or a redirect
+			if pattern != "" {
+				// a route reached the mux without a gate row: refuse rather than
+				// serve it unclassified (gatedMux registration normally prevents this)
+				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "route " + pattern + " has no gate", "reason": "unclassified_route"})
+				return
+			}
+			next.ServeHTTP(w, r) // unmatched: the mux answers 404 or 405
 			return
 		}
 		r = r.WithContext(context.WithValue(r.Context(), postureCtxKey, posture))
@@ -339,9 +378,16 @@ func routeGateMiddleware(p exposurePosture, mux *gatedMux, next http.Handler) ht
 			writeJSON(w, http.StatusForbidden, map[string]any{"error": "tool " + g.Tool + " is disabled on this deployment", "reason": "tool_disabled"})
 			return
 		}
+		// Every path wildcard is checked, not only the workspace id: a handler joins
+		// run, issue and other ids into file paths. A path that does not line up
+		// with a pattern that has wildcards fails closed.
 		values, aligned := patternValues(pattern, r.URL.EscapedPath())
-		for _, name := range []string{"workspace_id", "entry_id"} {
-			if v, ok := values[name]; (!aligned && strings.Contains(pattern, "{"+name+"}")) || (ok && !workspaceops.IsSafeID(v)) {
+		if !aligned && strings.Contains(pattern, "{") {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid path for " + pattern, "reason": "invalid_id"})
+			return
+		}
+		for _, name := range slices.Sorted(maps.Keys(values)) {
+			if !wildcardValid(name, values[name]) {
 				writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid " + name, "reason": "invalid_id"})
 				return
 			}

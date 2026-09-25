@@ -47,7 +47,9 @@ A token carries a role spec: one role, or several joined with `+`.
 The legacy names stay valid: `agent` is `proposer+verifier`, and `readonly` is
 `reader`. A blank role mints `agent`. An unknown role is refused at mint time, and a
 stored or environment role that cannot be parsed resolves to `reader`. A principal
-that holds only `reader` may use only GET routes.
+that holds only `reader` may use only GET routes: every non-GET route needs a higher
+role, and a test enforces that. A reader's write is refused by the route gate, so
+the answer names the missing role like any other refusal.
 
 The `agent` role does not include `indexer`, so an agent token cannot reset the
 index baseline. Give automation that rebaselines a dedicated `indexer` token. Keep
@@ -84,6 +86,30 @@ In open mode no credentials exist. Every caller is the single identity
 `anonymous`, passes every role gate, and memory it writes is labelled
 `self_asserted_open_mode`, never peer-verified.
 
+### Changes for existing tokens
+
+Before the role table, an `agent` token could call every route except the admin
+routes (settings, providers, `POST /api/routes`, token administration, the auth
+audit log, the full memory list and the workspace-wide evidence purge). These routes
+now need a role that `agent` (`proposer+verifier`) does not hold, so an `agent`
+token gets `403 missing_role`:
+
+| Route | Role now required |
+|---|---|
+| `POST /api/workspaces/load` (workspace registration) | `admin` |
+| `POST /api/workspaces/{id}/index` (rebaseline) | `indexer` |
+| `POST /api/postgres/bootstrap`, `POST /api/integrations/test`, `POST /api/workspaces/{id}/integrations` | `admin` |
+| `POST`/`DELETE .../verification-profiles` (definitions) | `admin` |
+| `POST /api/workspaces/{id}/audit-log` | `admin` |
+| the five `/api/terminal` routes, including `GET .../read` (a `readonly` token could read terminal output before) | `admin` |
+| `PUT /api/workspaces/{id}/policy`, `PUT .../security/acceptance-criteria`, `PUT .../security/findings/{finding_id}/disposition` | `human-approver` |
+| `POST .../runs/{run_id}/accept`, `POST .../runs/{run_id}/plan/approve`, `POST .../runs/{run_id}/plan/reject` | `human-approver` |
+
+Workspace registration is `admin` because a registered root becomes readable, through
+`search`, `explain` and `ground`, by every token that can reach the workspace.
+Automation that registers repositories needs an `admin` token. Unauthenticated open
+mode is unchanged: the single local identity passes every role gate.
+
 ## Exposure posture
 
 | Control | Setting | Behavior |
@@ -92,15 +118,23 @@ In open mode no credentials exist. Every caller is the single identity
 | Host allowlist | `XMUSTARD_ALLOWED_HOSTS=name,...` | On a loopback bind only `localhost` and loopback IPs are accepted as `Host`, plus listed names. This blocks DNS rebinding. On other binds the list applies when it is set. A refusal answers `403 host_not_allowed`. |
 | Origin check | `XMUSTARD_ALLOWED_ORIGINS=https://ui.example,...` | A request that carries `Origin` must come from a loopback origin (loopback bind), the same origin (other binds), or a listed origin. `Origin: null` is refused. A refusal answers `403 origin_not_allowed`. |
 | No keys in URLs | none | `token`, `access_token`, `api_key`, `key`, `password` and similar query parameters answer `400 query_credentials`, even when an `Authorization` header is also present. Send `Authorization: Bearer <token>`. |
-| Read-only mode | `XMUSTARD_READ_ONLY=1` | Mutating routes answer `403 read_only`, and `remember`/`verify` disappear from `tools/list`. Evidence capture and revocation of the caller's own tool output, and policy evaluation, stay available. |
+| Read-only mode | `XMUSTARD_READ_ONLY=1` | Mutating routes answer `403 read_only`, and `remember`/`verify` disappear from `tools/list`. Three kinds of non-GET route stay available: capture and revocation of the caller's own tool output, policy evaluation, and token revoke and rotate, so an admin can cut off a leaked token without leaving read-only mode. Minting and the workspace-wide evidence purge are refused. |
 | Tool disable | `XMUSTARD_DISABLED_TOOLS=impact,why_failed` | The tool's route answers `403 tool_disabled` and the tool leaves `tools/list`. Unknown names stop startup. |
 | Workspace allowlist | `XMUSTARD_WORKSPACE_ALLOWLIST=ws-a,ws-b` | Other workspace ids answer `403 workspace_not_allowed`. The same rule filters `GET /api/workspaces` and checks `POST /api/workspaces/load` (by the id the root would get) and the terminal routes. |
 | Remote execution | profile | Terminals exist only in the platform profile and need `admin`. |
 
-Workspace and memory entry ids in a route must be plain identifiers (letters, digits,
-`_`, `.`, `-`, no `..`). They are read from the escaped path, as `ServeMux` reads
-them, so an encoded `/` cannot hide a second segment. Anything else answers
-`400 invalid_id`.
+Every `{wildcard}` in a route is checked before the handler runs. Values are read
+from the escaped path and decoded per segment, as `ServeMux` reads them, so an
+encoded `/` cannot hide a second segment. Workspace, memory entry, run, terminal and
+token ids must be plain identifiers (letters, digits, `_`, `.`, `-`, no `..`). The
+other ids (issue, view, provider name and the rest) may hold other characters but
+must be one path segment: no `/`, `\`, control character or `..`, and not `.`.
+Anything else answers `400 invalid_id`. The run store also refuses a run id that is
+not a plain identifier.
+
+If the mux matches a route that has no gate row, the request answers
+`500 unclassified_route` instead of reaching the handler. `gatedMux` does not expose
+the underlying `ServeMux`, so routes can only be registered through the table.
 
 Bearer tokens are compared as SHA-256 digests with `crypto/subtle`. Each credential
 is compared in constant time, the scan does not stop at the first match, and
@@ -130,8 +164,8 @@ whether `XMUSTARD_READ_ONLY=1` still serves the route.
 | `GET /api/auth/audit` | core | admin | served |  |  |
 | `GET /api/auth/principals` | core | admin | served |  |  |
 | `POST /api/auth/tokens` | core | admin | refused |  | mint |
-| `DELETE /api/auth/tokens/{id}` | core | admin | refused |  | revoke |
-| `POST /api/auth/tokens/{id}/rotate` | core | admin | refused |  |  |
+| `DELETE /api/auth/tokens/{id}` | core | admin | served |  | revoke; served in read-only mode to cut off a leaked token |
+| `POST /api/auth/tokens/{id}/rotate` | core | admin | served |  | replaces the secret; the old one stops working |
 | `GET /api/auth/whoami` | core | reader | served |  | caller principal, roles and usable tools |
 | `ANY /api/health` | core | reader | served |  | public liveness and budget counters |
 | `GET /api/workspaces` | core | reader | served |  | filtered by token scope and workspace allowlist |
@@ -143,7 +177,7 @@ whether `XMUSTARD_READ_ONLY=1` still serves the route.
 | `PUT /api/workspaces/{workspace_id}/context/{entry_id}` | core | proposer | refused |  | memory edit; author or admin only |
 | `POST /api/workspaces/{workspace_id}/context/{entry_id}/verify` | core | verifier | refused | verify | verifier is the principal |
 | `GET /api/workspaces/{workspace_id}/diagnostics` | core | reader | served | diagnostics |  |
-| `DELETE /api/workspaces/{workspace_id}/evidence` | core | admin | served |  | workspace-wide revocation |
+| `DELETE /api/workspaces/{workspace_id}/evidence` | core | admin | refused |  | workspace-wide purge of every principal's originals |
 | `POST /api/workspaces/{workspace_id}/evidence` | core | proposer | served |  | projection of the caller's own tool result |
 | `DELETE /api/workspaces/{workspace_id}/evidence/{handle}` | core | proposer | served |  | issuer revokes its own original |
 | `GET /api/workspaces/{workspace_id}/evidence/{handle}` | core | reader | served |  | issuer-bound expansion |

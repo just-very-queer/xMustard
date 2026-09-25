@@ -485,19 +485,9 @@ func authMiddleware(dataDir, mode string, next http.Handler) http.Handler {
 			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "authentication required: provide Authorization: Bearer <token>"})
 			return
 		}
-		// principals holding nothing beyond reader may only read.
-		if principal != nil && principal.ReadOnly() && r.Method != http.MethodGet && r.Method != http.MethodHead {
-			workspaceops.RecordAuthAudit(dataDir, workspaceops.AuthAuditEvent{
-				Action:     "denied",
-				Actor:      principal.ID,
-				Detail:     "readonly principal cannot " + r.Method,
-				Method:     r.Method,
-				Path:       r.URL.Path,
-				RemoteAddr: r.RemoteAddr,
-			})
-			writeJSON(w, http.StatusForbidden, map[string]any{"error": "readonly principal cannot " + r.Method})
-			return
-		}
+		// A reader-only principal's writes are refused by the route gate, which
+		// names the missing role; every non-GET route needs more than reader
+		// (TestNoWriteRouteGrantsReader).
 		// workspace scope: a scoped (per-worker) token may only touch its workspaces.
 		// Unscoped tokens (the default) are unrestricted, so this is backward-compatible.
 		if principal != nil {
