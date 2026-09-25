@@ -1,8 +1,11 @@
 package workspaceops
 
 import (
+	"crypto/sha256"
+	"crypto/subtle"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -228,9 +231,50 @@ func TestTokenStoreCacheSeesExternalChanges(t *testing.T) {
 	}
 }
 
-// Resolution scans every credential (constant time per comparison, no early exit),
-// keeps env precedence, and rejects an expired file token.
-func TestResolveScansAllCredentials(t *testing.T) {
+// matchCredential compares every credential with crypto/subtle and does not stop at
+// the first match, so the time taken does not reveal which credential matched.
+func TestMatchCredentialComparesEveryCredential(t *testing.T) {
+	if reflect.ValueOf(digestCompare).Pointer() != reflect.ValueOf(subtle.ConstantTimeCompare).Pointer() {
+		t.Fatal("credential digests must be compared with subtle.ConstantTimeCompare")
+	}
+	creds := make([]credential, 6)
+	for i := range creds {
+		creds[i].digest = sha256.Sum256([]byte("token-" + itoa(i)))
+	}
+	creds[4].digest = creds[0].digest // a later duplicate must not win
+	var compared []int
+	orig := digestCompare
+	digestCompare = func(x, y []byte) int {
+		for i := range creds {
+			if &creds[i].digest[0] == &x[0] {
+				compared = append(compared, i)
+			}
+		}
+		return orig(x, y)
+	}
+	t.Cleanup(func() { digestCompare = orig })
+
+	for _, tc := range []struct {
+		raw  string
+		want int // index of the expected match, -1 for none
+	}{{"token-0", 0}, {"token-5", 5}, {"no-such-token", -1}} {
+		compared = nil
+		got := matchCredential(creds, sha256.Sum256([]byte(tc.raw)))
+		if !slices.Equal(compared, []int{0, 1, 2, 3, 4, 5}) {
+			t.Fatalf("%s: every credential must be compared once, in order; compared %v", tc.raw, compared)
+		}
+		switch {
+		case tc.want < 0 && got != nil:
+			t.Fatalf("%s: unexpected match", tc.raw)
+		case tc.want >= 0 && got != &creds[tc.want]:
+			t.Fatalf("%s: want credential %d", tc.raw, tc.want)
+		}
+	}
+}
+
+// Resolution keeps env precedence, rejects an expired file token, and returns a copy
+// of the cached principal.
+func TestResolvePrecedenceExpiryAndCopy(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("XMUSTARD_AUTH_TOKENS", "ops:admin:shared-secret-token-0123456789")
 	for i := 0; i < 4; i++ {

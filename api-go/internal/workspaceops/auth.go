@@ -255,12 +255,16 @@ func ResolveToken(dataDir, raw string) *Principal {
 	return p
 }
 
+// digestCompare is the comparison matchCredential applies to every credential. It
+// is a variable only so a test can count the comparisons.
+var digestCompare = subtle.ConstantTimeCompare
+
 // matchCredential compares digest against every credential in constant time per
 // comparison and without stopping at a match, and returns the first match.
 func matchCredential(creds []credential, digest [sha256.Size]byte) *credential {
 	var found *credential
 	for i := range creds {
-		if subtle.ConstantTimeCompare(creds[i].digest[:], digest[:]) == 1 && found == nil {
+		if digestCompare(creds[i].digest[:], digest[:]) == 1 && found == nil {
 			found = &creds[i]
 		}
 	}
