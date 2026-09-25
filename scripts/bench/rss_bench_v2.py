@@ -10,12 +10,13 @@ call succeeded, every registered root was present in every snapshot, and the who
 workload completed with its mandatory checks. A low number from a broken run is INVALID,
 never PASS.
 
-Alongside the gate, per process:
-  * footprint: phys_footprint on macOS (proc_pid_rusage), PSS and USS on Linux
+Alongside the gate, per process and every sample:
+  * footprint: phys_footprint on macOS (task_info TASK_VM_INFO), PSS and USS on Linux
     (/proc/<pid>/smaps_rollup);
-  * anon versus file-backed resident memory: RssAnon/RssFile/RssShmem on Linux; on macOS a
-    VM region walk (proc_pidinfo PROC_PIDREGIONPATHINFO) at each new tree peak;
-  * the unsampled per-process peak (macOS ri_lifetime_max_phys_footprint, Linux VmHWM);
+  * anonymous versus file-backed resident memory, which sum to the RSS ps reports:
+    TASK_VM_INFO internal/external on macOS, RssAnon/RssFile/RssShmem on Linux;
+  * the unsampled per-process peaks (macOS resident_size_peak and lifetime max
+    phys_footprint, Linux VmHWM);
   * storage bytes read and written (macOS ri_diskio_*, Linux /proc/<pid>/io).
 
 Attribution. Every process is assigned a component through the process-role registry in
@@ -31,7 +32,7 @@ v2 sampler running beside v1's sampler, so one run yields both numbers. Parity-s
 scenarios run over pinned Apache/MIT fixtures (parity_fixtures.json): 1, 2 and 4 agents,
 queries during a reindex, a snapshot swap under load, captures during indexing, two hot
 repos, four agents in four worktrees, and the watcher. A scenario whose product feature
-is absent at this HEAD is reported as not run, with the missing requirement named; it is
+is absent at this HEAD is reported as skipped, with the missing requirement named; it is
 never reported as passed.
 
 Tool accounting (PAR-EVAL-04, bench side). Every MCP call the harness makes is recorded:
@@ -447,7 +448,7 @@ class SamplerV2(threading.Thread):
         self.tree_all_peak_kib = 0
         self.step_peak_kib = {}
         self.comp_peak_kib, self.comp_values = {}, collections.defaultdict(list)
-        self.comp_fp_peak = {}
+        self.comp_fp_peak, self.comp_fp_values = {}, {}
         self.ext_peak_kib, self.ext_fp_peak, self.agent_peak_kib = {}, {}, {}
         self.fp = {"peak_bytes": 0, "step": None, "t_s": None, "partial_samples": 0}
         self.proc_last = {}  # (pid, exe) -> last stats + component/class
@@ -523,6 +524,8 @@ class SamplerV2(threading.Thread):
                 self.comp_values[c].append(0)
         for c, b in comp_fp.items():
             self.comp_fp_peak[c] = max(self.comp_fp_peak.get(c, 0), b)
+        for c in set(comp_fp) | set(self.comp_fp_values):  # footprint per sample, 0 when absent
+            self.comp_fp_values.setdefault(c, [0] * (self.samples - 1)).append(comp_fp.get(c, 0))
         for c, kib in tot["externals_kib"].items():
             self.ext_peak_kib[c] = max(self.ext_peak_kib.get(c, 0), kib)
         for c, b in ext_fp.items():
@@ -620,6 +623,7 @@ class SamplerV2(threading.Thread):
                 "peak_mib": mib(self.comp_peak_kib.get(c, 0) * 1024), "p50_mib": mib((_pct(vals, 0.5) or 0) * 1024),
                 "at_gate_peak_mib": mib(self.peak.get("components_kib", {}).get(c, 0) * 1024),
                 "footprint_peak_mib": mib(self.comp_fp_peak.get(c)),
+                "footprint_p50_mib": mib(_pct(self.comp_fp_values.get(c, []), 0.5)),
                 "process_rss_peak_mib": mib(max(hwm) or None) if hwm else None,
                 "process_footprint_peak_mib": mib(max(lifetime) or None) if lifetime else None,
                 "processes_seen": len(keys), "max_concurrent": self.max_concurrent.get(c, 0),
@@ -647,6 +651,8 @@ class SamplerV2(threading.Thread):
             "externals": externals,
             "agents": {k: {"peak_mib": mib(v * 1024)} for k, v in sorted(self.agent_peak_kib.items())},
             "processes_at_gate_peak": self.peak.get("processes", []),
+            "per_exe_sampled_max_mib": {exe: mib(max(k for (_, e), k in self.pid_peak_kib.items() if e == exe) * 1024)
+                                        for exe in sorted({e for _, e in self.pid_peak_kib})},
             "step_peak_mib": {k: mib(v * 1024) for k, v in self.step_peak_kib.items()},
             "samples": self.samples, "interval_ms_target": int(self.interval * 1000),
             "interval_ms_observed": {"median": round(gaps[len(gaps) // 2] * 1000, 1) if gaps else None,
@@ -758,6 +764,8 @@ def result_accounting(reply):
     # resources/read returns contents[] with text or a base64 blob; count what is delivered
     resources = [c.get("text") or c.get("blob") or "" for c in (res.get("contents") or []) if isinstance(c, dict)]
     n = sum(len(t.encode()) for t in texts + resources)
+    if isinstance(res.get("tools"), list):  # tools/list: the schemas every session carries in its prompt
+        n += len(json.dumps(res["tools"], separators=(",", ":")).encode())
     out["content_bytes"] = n
     out["est_tokens"] = math.ceil(n / 4)
     if res.get("isError"):
@@ -1227,11 +1235,19 @@ def ledger_check(ledger, workstream, head, base):
                "tree_allowed_mib": round(line + tol["tree_peak_mib"], 2)}
         row["tree_ok"] = d_tree <= line + tol["tree_peak_mib"]
         if proc:
-            hc = h.get("components_p50_mib", {}).get(proc, 0.0) or 0.0
-            bc = b.get("components_p50_mib", {}).get(proc, 0.0) or 0.0
-            row.update(process=proc, process_p50_delta_mib=round(hc - bc, 2),
+            # The process check compares private memory (footprint p50: phys_footprint on
+            # macOS, PSS on Linux) when both runs have it: RSS p50 of a Go process on macOS
+            # moves with lazily reclaimed and compressed pages. RSS p50 is the fallback.
+            hf = (h.get("components_footprint_p50_mib") or {}).get(proc)
+            bf = (b.get("components_footprint_p50_mib") or {}).get(proc)
+            hr = h.get("components_p50_mib", {}).get(proc, 0.0) or 0.0
+            br = b.get("components_p50_mib", {}).get(proc, 0.0) or 0.0
+            use_fp = hf is not None and bf is not None
+            delta = (hf - bf) if use_fp else (hr - br)
+            row.update(process=proc, process_basis="footprint p50" if use_fp else "RSS p50",
+                       process_p50_delta_mib=round(delta, 2), process_rss_p50_delta_mib=round(hr - br, 2),
                        process_allowed_mib=round(line + tol["component_p50_mib"], 2))
-            row["process_ok"] = hc - bc <= line + tol["component_p50_mib"]
+            row["process_ok"] = delta <= line + tol["component_p50_mib"]
         row["ok"] = row["tree_ok"] and row.get("process_ok", True)
         ok = ok and row["ok"]
         results.append(row)
@@ -1250,7 +1266,8 @@ def ledger_view(report):
             continue
         comps = r["sampler"]["components"]
         out[sc] = {"gate_peak_mib": r["gate"]["peak_mib"],
-                   "components_p50_mib": {c: v["p50_mib"] for c, v in comps.items()}}
+                   "components_p50_mib": {c: v["p50_mib"] for c, v in comps.items()},
+                   "components_footprint_p50_mib": {c: v.get("footprint_p50_mib") for c, v in comps.items()}}
     return out
 
 
@@ -1282,7 +1299,8 @@ def provenance_for(source_root, api_bin, mcp_bin, core, scripts):
     for p in sorted(untracked):
         uh.update(p.encode() + b"\0" + sha_file(os.path.join(source_root, p)).encode() + b"\n")
     return {
-        "source_root": source_root, "head": g("rev-parse", "HEAD"),
+        "source_root": source_root, "head": g("rev-parse", "HEAD") or None,
+        "source_is_git_checkout": run(["git", "rev-parse", "--is-inside-work-tree"], cwd=source_root, check=False).stdout.strip() == "true",
         "source_diff_sha256": hashlib.sha256(diff.encode()).hexdigest(),
         "untracked_source_files": len(untracked), "untracked_source_sha256": uh.hexdigest(),
         "binaries_sha256": {"xmustard-api": sha_file(api_bin), "xmustard-mcp": sha_file(mcp_bin), "xmustard-core": sha_file(core)},
@@ -1959,11 +1977,12 @@ def render_markdown(report):
         L.append(f"Samples {s['samples']} (median interval {s['interval_ms_observed']['median']} ms, max {s['interval_ms_observed']['max']} ms). "
                  f"Footprint basis: {s['footprint']['basis']}. Split basis: {s['split_at_gate_peak']['basis']}.")
         L.append("")
-        L.append("| Component | Peak MiB | p50 MiB | At gate peak MiB | Footprint peak MiB | Largest process RSS peak MiB (unsampled) | "
-                 "Largest process footprint peak MiB (unsampled) | Processes seen | Max concurrent |")
-        L.append("|---|---|---|---|---|---|---|---|---|")
+        L.append("| Component | Peak MiB | p50 MiB | At gate peak MiB | Footprint peak MiB | Footprint p50 MiB | "
+                 "Largest process RSS peak MiB (unsampled) | Largest process footprint peak MiB (unsampled) | Processes seen | Max concurrent |")
+        L.append("|---|---|---|---|---|---|---|---|---|---|")
         for c, v in s["components"].items():
             L.append(f"| {c} | {fmt(v['peak_mib'])} | {fmt(v['p50_mib'])} | {fmt(v['at_gate_peak_mib'])} | {fmt(v['footprint_peak_mib'])} | "
+                     f"{fmt(v.get('footprint_p50_mib'))} | "
                      f"{fmt(v.get('process_rss_peak_mib'))} | {fmt(v.get('process_footprint_peak_mib'))} | {v['processes_seen']} | {v['max_concurrent']} |")
         L.append("")
         if s["externals"]:
@@ -2031,10 +2050,12 @@ def render_markdown(report):
         L.append("")
         L.append(f"Workstream {lc['workstream']} (line {lc['line_mib']} MiB on `{lc['process']}`): **{'PASS' if lc['passed'] else 'FAIL'}**.")
         L.append("")
-        L.append("| Scenario | Tree peak delta MiB | Allowed | Process p50 delta MiB | Allowed |")
-        L.append("|---|---|---|---|---|")
+        L.append("| Scenario | Tree peak delta MiB | Allowed | Process delta MiB (basis) | Allowed | Process RSS p50 delta MiB |")
+        L.append("|---|---|---|---|---|---|")
         for row in lc["rows"]:
-            L.append(f"| {row['scenario']} | {row['tree_peak_delta_mib']} | {row['tree_allowed_mib']} | {fmt(row.get('process_p50_delta_mib'))} | {fmt(row.get('process_allowed_mib'))} |")
+            L.append(f"| {row['scenario']} | {row['tree_peak_delta_mib']} | {row['tree_allowed_mib']} | "
+                     f"{fmt(row.get('process_p50_delta_mib'))} ({row.get('process_basis', '–')}) | {fmt(row.get('process_allowed_mib'))} | "
+                     f"{fmt(row.get('process_rss_p50_delta_mib'))} |")
     rec = report.get("ledger_reconcile")
     if rec:
         L.append("")
@@ -2093,6 +2114,7 @@ def median_report(runs):
                       "detail": [{"gate_peak_mib": r["gate"]["peak_mib"], "verdict": r["gate"]["verdict"],
                                   "v1_difference_mib": (r.get("v1_crosscheck") or {}).get("difference_mib"),
                                   "components_p50_mib": {c: v["p50_mib"] for c, v in ((r.get("sampler") or {}).get("components") or {}).items()},
+                                  "components_footprint_p50_mib": {c: v.get("footprint_p50_mib") for c, v in ((r.get("sampler") or {}).get("components") or {}).items()},
                                   "components_peak_mib": {c: v["peak_mib"] for c, v in ((r.get("sampler") or {}).get("components") or {}).items()}}
                                  for r in ok]}
     if any(r["gate"]["verdict"] != "PASS" for r in ok):

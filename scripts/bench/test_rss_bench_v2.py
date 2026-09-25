@@ -219,6 +219,7 @@ class SamplerMetrics(unittest.TestCase):
         d = r["components"]["go_daemon"]
         self.assertEqual((d["peak_mib"], d["p50_mib"], d["process_rss_peak_mib"], d["process_footprint_peak_mib"], d["io_read_bytes"]),
                          (20.0, 20.0, 25.0, 30.0, 5000))
+        self.assertEqual((d["footprint_p50_mib"], r["components"]["rust_core_per_call"]["footprint_p50_mib"]), (12.0, 0.0))
         c = r["components"]["rust_core_per_call"]
         self.assertEqual((c["peak_mib"], c["p50_mib"], c["at_gate_peak_mib"], c["processes_seen"]), (12.0, 0.0, 12.0, 1))
         self.assertEqual({p["pid"] for p in r["processes_at_gate_peak"]}, {100, 101, 110})
@@ -337,6 +338,9 @@ class Accounting(unittest.TestCase):
         self.assertIsNone(r["error"])
         self.assertTrue(v2.result_accounting({"result": {"content": [{"text": "boom"}], "isError": True}})["error"].startswith("isError"))
         self.assertIn("rpc -32000", v2.result_accounting({"error": {"code": -32000, "message": "busy"}})["error"])
+        tools = [{"name": "search", "inputSchema": {"type": "object"}}]
+        listed = v2.result_accounting({"result": {"tools": tools}})
+        self.assertEqual(listed["content_bytes"], len(json.dumps(tools, separators=(",", ":"))))
         page = v2.result_accounting({"result": {"contents": [{"uri": "x", "blob": "QUJD" * 100}], "_meta": {}}})
         self.assertEqual((page["content_bytes"], page["est_tokens"]), (400, 100))
 
@@ -509,12 +513,25 @@ class Ledger(unittest.TestCase):
         # no common scenario is a failure, not a pass
         self.assertFalse(v2.ledger_check(LEDGER, "WS-01", {}, base)["passed"])
 
+    def test_process_check_prefers_footprint_when_both_runs_have_it(self):
+        tol = LEDGER["tolerance"]["component_p50_mib"]
+        base = {"s": {"gate_peak_mib": 80.0, "components_p50_mib": {"go_daemon": 18.0}, "components_footprint_p50_mib": {"go_daemon": 12.0}}}
+        noisy_rss = {"s": {"gate_peak_mib": 80.0, "components_p50_mib": {"go_daemon": 18.0 + 3 + tol + 5},
+                           "components_footprint_p50_mib": {"go_daemon": 12.0 + 3}}}
+        chk = v2.ledger_check(LEDGER, "WS-01", noisy_rss, base)
+        self.assertTrue(chk["passed"], chk)
+        self.assertEqual(chk["rows"][0]["process_basis"], "footprint p50")
+        grew = {"s": {"gate_peak_mib": 80.0, "components_p50_mib": {"go_daemon": 18.0},
+                      "components_footprint_p50_mib": {"go_daemon": 12.0 + 3 + tol + 0.5}}}
+        self.assertFalse(v2.ledger_check(LEDGER, "WS-01", grew, base)["passed"])
+
     def test_ledger_view_skips_invalid_runs(self):
         rep = {"scenarios": {
             "a": {"status": "ran", "gate": {"valid": True, "peak_mib": 50.0}, "sampler": {"components": {"go_daemon": {"p50_mib": 20.0}}}},
             "b": {"status": "ran", "gate": {"valid": False, "peak_mib": 10.0}, "sampler": {"components": {}}},
             "c": {"status": "skipped"}}}
-        self.assertEqual(v2.ledger_view(rep), {"a": {"gate_peak_mib": 50.0, "components_p50_mib": {"go_daemon": 20.0}}})
+        self.assertEqual(v2.ledger_view(rep), {"a": {"gate_peak_mib": 50.0, "components_p50_mib": {"go_daemon": 20.0},
+                                                     "components_footprint_p50_mib": {"go_daemon": None}}})
 
 
 def git(args, cwd):
