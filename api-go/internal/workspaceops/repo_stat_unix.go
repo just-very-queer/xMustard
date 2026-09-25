@@ -26,14 +26,18 @@ import (
 //   - the stat keys of the index and of every file that changes what status shows
 //     or ignores: the repository config and config.worktree, info/exclude,
 //     info/attributes, info/sparse-checkout, the global and XDG config, ignore and
-//     attributes files, the core.excludesFile / core.attributesFile they name, and
-//     the common system config paths;
+//     attributes files, the common system config paths, the config files any of
+//     these include ([include] / [includeIf], whatever the condition), and the
+//     core.excludesFile / core.attributesFile any of them names;
 //   - every directory git traverses: from the worktree top, every directory except
 //     the ones `repo-key` reported as ignored as a whole (git never descends into
-//     them). Each listing enters in full (names and types), and every file or
-//     symlink in it enters by its stat key (mode, size, mtime, ctime, inode). That
-//     covers edits to tracked and untracked files at any depth, files added to or
-//     removed from any traversed directory, and new directories;
+//     them). Each directory enters by its own stat key and its listing in full
+//     (names and types), and every file or symlink in it by its stat key (mode,
+//     size, mtime, ctime, inode). That covers edits to tracked and untracked files
+//     at any depth, files added to, removed from or renamed within any traversed
+//     directory, and new directories. A removal leaves no stat key of its own: the
+//     directory's (its mtime and ctime move) is what lets the racy rule below see
+//     one when there is no earlier listing to compare with;
 //   - nested worktrees (submodules, or repositories inside the tree): their HEAD,
 //     refs, index and config, and all of their directories (their own ignore rules
 //     are not known, so nothing inside them is skipped).
@@ -49,9 +53,10 @@ import (
 // with) began only if every stat key it holds is older than that moment by
 // fingerprintRacyWindow (repo_identity.go).
 //
-// Not covered: config pulled in through [include] / [includeIf], system config under
-// other install prefixes, and a clock on another host (network filesystems) that
-// disagrees with this one. The identity TTL bounds how long such a change can go
+// Not covered: system config under other install prefixes, config named by
+// GIT_CONFIG_COUNT / GIT_CONFIG_PARAMETERS in repo-key's environment, include paths
+// using %(prefix), and a clock on another host (network filesystems) that disagrees
+// with this one. The identity TTL bounds how long such a change can go
 // unseen while a cached identity is reused. A walk that exceeds its bounds, a
 // nested-worktree depth over fingerprintMaxNesting, or a layout it cannot read makes
 // the fingerprint unavailable, and the caller samples instead.
@@ -290,6 +295,11 @@ func (s *digestSink) metadata(top, gitDir, commonDir string) bool {
 	for i, p := range configuredFiles(filepath.Join(commonDir, "config"), top) {
 		s.fileKey("repo-configured-"+strconv.Itoa(i), p)
 	}
+	// git reads config.worktree only with extensions.worktreeConfig; following it
+	// regardless costs at most a few stat keys
+	for i, p := range configuredFiles(filepath.Join(gitDir, "config.worktree"), top) {
+		s.fileKey("worktree-configured-"+strconv.Itoa(i), p)
+	}
 	return true
 }
 
@@ -322,39 +332,80 @@ func (s *digestSink) userConfig(top string) {
 	}
 }
 
-// configuredFiles returns the core.excludesFile and core.attributesFile paths set in
-// a config file (a line scan: both keys exist only in [core]). "~/" expands to the
-// home directory; a relative path is taken from top, where repo-key runs git.
+// configuredFiles returns the files a config file adds to what status reads: the
+// config files it includes through [include] / [includeIf] (whatever the condition:
+// following one git skips only adds a stat key), scanned in turn to git's include
+// depth, and the core.excludesFile / core.attributesFile any of them sets (a key
+// scan: both keys exist only in [core]). An include path is relative to the
+// including file's directory; an excludes or attributes path is relative to top,
+// where repo-key runs git. "~/" is the home directory in both.
 func configuredFiles(configPath, top string) []string {
-	b, err := readBounded(configPath, fingerprintMaxConfig)
-	if err != nil {
-		return nil
-	}
 	var out []string
-	for _, line := range strings.Split(string(b), "\n") {
-		key, val, ok := strings.Cut(line, "=")
-		if !ok {
-			continue
+	seen := map[string]bool{}
+	var scan func(path string, depth int)
+	scan = func(path string, depth int) {
+		if seen[path] {
+			return
 		}
-		key = strings.ToLower(strings.TrimSpace(key))
-		if key != "excludesfile" && key != "attributesfile" {
-			continue
+		seen[path] = true
+		b, err := readBounded(path, fingerprintMaxConfig)
+		if err != nil {
+			return
 		}
-		val = strings.Trim(strings.TrimSpace(val), `"`)
-		if rest, ok := strings.CutPrefix(val, "~/"); ok {
-			home, herr := os.UserHomeDir()
-			if herr != nil {
+		section := ""
+		for _, line := range strings.Split(string(b), "\n") {
+			line = strings.TrimSpace(line)
+			if rest, ok := strings.CutPrefix(line, "["); ok {
+				header, after, _ := strings.Cut(rest, "]")
+				name, _, _ := strings.Cut(strings.TrimSpace(header), " ")
+				name, _, _ = strings.Cut(name, ".") // the older [section.subsection] form
+				section, line = strings.ToLower(name), after
+			}
+			key, val, ok := strings.Cut(line, "=")
+			if !ok {
 				continue
 			}
-			val = filepath.Join(home, rest)
-		} else if val != "" && !filepath.IsAbs(val) {
-			val = filepath.Join(top, val)
-		}
-		if val != "" {
-			out = append(out, val)
+			key = strings.ToLower(strings.TrimSpace(key))
+			switch {
+			case key == "excludesfile" || key == "attributesfile":
+				if p := configValuePath(val, top); p != "" {
+					out = append(out, p)
+				}
+			case key == "path" && (section == "include" || section == "includeif") && depth < configMaxIncludeDepth:
+				if p := configValuePath(val, filepath.Dir(path)); p != "" {
+					out = append(out, p)
+					scan(p, depth+1)
+				}
+			}
 		}
 	}
+	scan(configPath, 0)
 	return out
+}
+
+// configMaxIncludeDepth is git's include depth limit.
+const configMaxIncludeDepth = 10
+
+// configValuePath resolves a path-valued config value: unquoted, without a trailing
+// comment, "~/" expanded, a relative path taken from base.
+func configValuePath(val, base string) string {
+	val = strings.TrimSpace(val)
+	if quoted, ok := strings.CutPrefix(val, `"`); ok {
+		val, _, _ = strings.Cut(quoted, `"`)
+	} else if i := strings.IndexAny(val, "#;"); i >= 0 {
+		val = strings.TrimSpace(val[:i])
+	}
+	if rest, ok := strings.CutPrefix(val, "~/"); ok {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return ""
+		}
+		return filepath.Join(home, rest)
+	}
+	if val != "" && !filepath.IsAbs(val) {
+		return filepath.Join(base, val)
+	}
+	return val
 }
 
 // fingerprintWalker walks the directories of one fingerprint with a few workers
@@ -451,6 +502,10 @@ func (w *fingerprintWalker) dir(d walkDir, s *digestSink) ([]walkDir, bool) {
 	}
 	f := os.NewFile(uintptr(fd), d.abs)
 	defer f.Close()
+	// the directory's own stat key: its mtime and ctime move when an entry is added,
+	// removed or renamed, so a removal is visible to the racy rule too
+	var dst unix.Stat_t
+	s.statKey(".", &dst, unix.Fstat(fd, &dst))
 	var subdirs []walkDir
 	nested := false
 	for {

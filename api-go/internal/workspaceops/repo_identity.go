@@ -239,7 +239,8 @@ func (f repoFingerprint) settled() bool { return f.quietBefore(f.startedAt) }
 // observations use the same rule: the after-identity equals the before-identity
 // without a spawn when a walk after execution matches the settled walk that
 // validated the before-identity, or, for a freshly sampled one, is quiet since that
-// sample began. That check has no TTL: it depends on the fingerprint, not on how
+// sample began (a file removed meanwhile moves its directory's stat key, so the tree
+// is not quiet). That check has no TTL: it depends on the fingerprint, not on how
 // long the handler ran.
 //
 // The fingerprint is not used (every observation samples, as without the cache)

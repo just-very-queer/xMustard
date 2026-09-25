@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -32,6 +33,9 @@ type identityFixture struct {
 type identityFixtureOpts struct {
 	noListing   bool   // repo-key reports no ignored_dirs, as an older core does
 	searchDelay string // seconds the fake search takes (a slow handler)
+	// searchRemoves is a root-relative file the fake search deletes, moving the key
+	// to rev-2 (the repository changes while the handler runs)
+	searchRemoves string
 }
 
 func newIdentityFixture(t *testing.T, searchBytes int, opts ...identityFixtureOpts) *identityFixture {
@@ -111,6 +115,9 @@ func newIdentityFixture(t *testing.T, searchBytes int, opts ...identityFixtureOp
 	delay := ""
 	if o.searchDelay != "" {
 		delay = "sleep " + o.searchDelay + "; "
+	}
+	if o.searchRemoves != "" {
+		delay += "rm " + filepath.Join(root, o.searchRemoves) + "; printf rev-2 > " + f.keyFile + "; "
 	}
 	core := writeScript(t, `case "$1" in
 search) `+delay+`cat `+bigFile+` ;;
@@ -278,6 +285,31 @@ func TestSlowReadToolStillSamplesIdentityOnce(t *testing.T) {
 	}
 	if n := f.repoKeySpawns() - before; n != 1 {
 		t.Fatalf("a 0.6 s handler with a 300 ms TTL sampled identity %d times; want 1", n)
+	}
+}
+
+// A tracked file deleted while a read tool runs, on a cold identity cache (the
+// capture-time check has no settled walk to compare with, only the racy rule), with
+// the real clock: the deletion moves its directory's stat key, so the check samples
+// again (2 runs, as without the cache) and the result is not bound to the
+// pre-deletion identity; the next identity read does not serve it either.
+func TestDeletionDuringAReadToolIsNotBound(t *testing.T) {
+	f := newIdentityFixture(t, 200<<10, identityFixtureOpts{searchRemoves: "src/f.go"})
+	before := f.repoKeySpawns()
+	_, b, _ := f.do(t, "GET", "/api/workspaces/"+f.ws+"/search?q=x", "", nil, deliver)
+	var d evidence.Delivery
+	_ = json.Unmarshal(b, &d)
+	if !d.Reduced || d.Handle == "" || d.CapturedIdentity != "unknown" {
+		t.Fatalf("a result produced across a deletion must not bind: reduced=%v handle=%q identity=%s", d.Reduced, d.Handle, d.CapturedIdentity)
+	}
+	if n := f.repoKeySpawns() - before; n != 2 {
+		t.Fatalf("the capture-time check sampled %d times; want 2 (before and after)", n)
+	}
+	if _, last := f.expandAll(t, d.Handle, ""); last["freshness"] != "unknown" {
+		t.Fatalf("page of unbound evidence: %v", last)
+	}
+	if id, _ := workspaceops.CurrentRepoIdentity(context.Background(), f.root); id.Key != "rev-2" {
+		t.Fatalf("identity after the deletion = %+v; want rev-2", id)
 	}
 }
 

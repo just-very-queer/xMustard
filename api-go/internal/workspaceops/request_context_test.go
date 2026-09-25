@@ -237,6 +237,60 @@ func TestIdentityAfterExecutionHonorsTheRacyWindow(t *testing.T) {
 	}
 }
 
+// A file deleted during the handler leaves no stat key of its own, so on the cold
+// path (a fresh before-sample, no settled walk to compare against) only its
+// directory's stat key, which the deletion moves, shows the tree is not quiet. The
+// after-check must then sample again rather than bind across the deletion, and the
+// pre-deletion identity must not be cached. The clock is frozen: files written before
+// the request are settled, the deletion is not (an aged clock would hide it).
+func TestIdentityAfterExecutionSeesADeletionOnTheColdPath(t *testing.T) {
+	for _, rel := range []string{"c/z.go", "u/v/one.txt"} { // tracked, untracked
+		t.Run(rel, func(t *testing.T) {
+			f := installFakeSampler(t)
+			root := initGitRepo(t)
+			writeFile(t, filepath.Join(root, "u", "v", "one.txt"), "one")
+			writeFile(t, filepath.Join(root, "u", "v", "two.txt"), "two")
+			dir, ws := t.TempDir(), "wsDeleted"
+			writeSnapshotWithRoot(t, dir, ws, root)
+			frozenIdentityClock(t)
+			ctx := context.Background()
+			rc := NewRequestContext(dir, ws)
+			if _, obs := rc.Identity(ctx); obs.Cached {
+				t.Fatal("cold cache: the before-identity must be sampled")
+			}
+			if err := os.Remove(filepath.Join(root, rel)); err != nil {
+				t.Fatal(err)
+			}
+			f.set("k2")
+			if id, obs := rc.IdentityAfter(ctx); id.Key != "k2" || obs.Cached || f.runs.Load() != 2 {
+				t.Fatalf("a deletion during the handler must re-sample: %+v %+v runs=%d", id, obs, f.runs.Load())
+			}
+			if id, _ := CurrentRepoIdentity(ctx, root); id.Key != "k2" {
+				t.Fatalf("the pre-deletion identity was cached: %+v", id)
+			}
+		})
+	}
+}
+
+// A file present while repo-key runs and removed before the walk that would be paired
+// with that sample: the pairing is refused (the directory's stat key is racy), so the
+// next read samples instead of serving the pre-deletion key.
+func TestIdentityCacheRefusesAPairingAcrossADeletion(t *testing.T) {
+	f := installFakeSampler(t)
+	root := initGitRepo(t)
+	frozenIdentityClock(t)
+	gone := filepath.Join(root, "a", "b", "y.go")
+	f.during = func() { _ = os.Remove(gone) } // after repo-key read it, before the walk
+	ctx := context.Background()
+	if id, _ := CurrentRepoIdentity(ctx, root); id.Key != "k1" {
+		t.Fatalf("first read: %+v", id)
+	}
+	f.set("k2")
+	if id, obs := CurrentRepoIdentity(ctx, root); id.Key != "k2" || obs.Cached || f.runs.Load() != 2 {
+		t.Fatalf("a pairing across a deletion served %+v %+v (runs=%d); want a fresh k2", id, obs, f.runs.Load())
+	}
+}
+
 // A workspace root re-pointed (symlink) during a request has no after-identity, so
 // evidence produced across the move cannot bind; the next request follows it.
 func TestIdentityAfterExecutionRefusesAMovedRoot(t *testing.T) {
@@ -562,6 +616,46 @@ func TestFingerprintLayouts(t *testing.T) {
 	if fp := repoStatFingerprint(root, nil); fp.ok {
 		t.Fatal("a Git fingerprint without the ignored-directory listing must be unavailable")
 	}
+}
+
+// The ignore and attributes files git reads can be named in config.worktree (with
+// extensions.worktreeConfig) or in a config file pulled in by [include] /
+// [includeIf]; editing any of them, or the included file itself, changes the
+// fingerprint.
+func TestFingerprintFollowsWorktreeConfigAndIncludes(t *testing.T) {
+	ign := newIgnoreSet(nil)
+	root := initGitRepo(t)
+	edit := func(what, path, content string) {
+		t.Helper()
+		before := repoStatFingerprint(root, ign)
+		if !before.ok {
+			t.Fatalf("%s: fingerprint unavailable", what)
+		}
+		writeFile(t, path, content)
+		if after := repoStatFingerprint(root, ign); after.same(before) {
+			t.Fatalf("%s: an edit to %s must change the fingerprint", what, path)
+		}
+	}
+	tmp := t.TempDir()
+	wtExcludes := filepath.Join(tmp, "worktree-excludes")
+	writeFile(t, wtExcludes, "*.log\n")
+	runGit(t, root, "config", "extensions.worktreeConfig", "true")
+	runGit(t, root, "config", "--worktree", "core.excludesFile", wtExcludes)
+	edit("core.excludesFile set in config.worktree", wtExcludes, "*.tmp\n")
+
+	incExcludes := filepath.Join(tmp, "included-excludes")
+	writeFile(t, incExcludes, "*.log\n")
+	inc := filepath.Join(tmp, "nested", "included.gitconfig")
+	attrs := filepath.Join(tmp, "included-attributes")
+	writeFile(t, inc, "[core]\n\tattributesFile = "+attrs+"\n")
+	top := filepath.Join(tmp, "top.gitconfig")
+	writeFile(t, top, "[include]\n\tpath = nested/included.gitconfig\n")
+	runGit(t, root, "config", "include.path", top)
+	runGit(t, root, "config", "includeIf.gitdir:"+root+"/.git.path", incExcludes+".cfg")
+	writeFile(t, incExcludes+".cfg", "[core]\n\texcludesFile = "+incExcludes+"\n")
+	edit("a config file included by a relative path", inc, "[core]\n\tattributesFile = "+attrs+"\n\tquotePath = false\n")
+	edit("core.attributesFile set in an included config", attrs, "*.bin binary\n")
+	edit("core.excludesFile set in an [includeIf] config", incExcludes, "*.tmp\n")
 }
 
 // git status runs with --ignore-submodules=none, so a submodule's working state is
