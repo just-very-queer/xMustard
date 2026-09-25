@@ -1,18 +1,21 @@
 // xMustard Pi extension: the nine xMustard tools as direct HTTP-backed Pi tools, plus
-// `xmustard_expand`, inactive until a result carries a recovery handle.
+// `xmustard_expand`, inactive until a result carries a recovery handle. Pi's built-in
+// tools (bash, read, grep, find, ls, edit, write) are projected through xMustard's
+// capture route.
 //
 // Load-time work is registration only: no sidecar, socket, timer or network call.
 // Configuration (see README.md): XMUSTARD_API_BASE, optional XMUSTARD_TOKEN (sent as
 // a bearer token, never logged), optional XMUSTARD_WORKSPACE_ID (else the workspace
-// is resolved from Pi's working directory), XMUSTARD_PI_DELIVERY=source|hook, and
-// lower-only XMUSTARD_PI_TOOL_TIMEOUT_MS / XMUSTARD_PI_PROJECTION_TIMEOUT_MS.
+// is resolved from Pi's working directory), XMUSTARD_PI_DELIVERY=source|hook,
+// lower-only XMUSTARD_PI_TOOL_TIMEOUT_MS / XMUSTARD_PI_PROJECTION_TIMEOUT_MS /
+// XMUSTARD_PI_PROJECTION_TARGET_BYTES, XMUSTARD_PI_BUILTINS.
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { type TSchema, Type } from "typebox";
 import { loadConfig } from "./config.ts";
-import { EXPAND_TOOL, expand, PAGE_SIZE, PendingCalls, projectResult, runTool } from "./delivery.ts";
+import { Capturer, EXPAND_TOOL, expand, PAGE_SIZE, PendingCalls, projectBuiltin, projectResult, runTool } from "./delivery.ts";
 import { TOOL_NAMES, TOOL_SPECS, type ToolArgs, type ToolSpec } from "./tools.ts";
-import { WorkspaceResolver } from "./workspace.ts";
+import { callerTools, WorkspaceResolver } from "./workspace.ts";
 
 // toolParameters renders a spec as TypeBox, serializing to exactly toJsonSchema (the
 // MCP tools/list inputSchema).
@@ -57,6 +60,13 @@ export default function xmustard(pi: ExtensionAPI): void {
 	const cfg = loadConfig();
 	const pending = new PendingCalls();
 	const workspaces = new WorkspaceResolver(cfg);
+	const capturer = new Capturer(cfg);
+	// built-in projection resolves the session's workspace within the projection
+	// deadline (the resolver caches it per directory)
+	const resolveWorkspace = async (cwd: string | undefined, signal?: AbortSignal): Promise<string> => {
+		const deadline = AbortSignal.timeout(cfg.projectionTimeoutMs);
+		return String((await workspaces.resolve({}, cwd, signal ? AbortSignal.any([signal, deadline]) : deadline)).workspace_id);
+	};
 
 	for (const spec of TOOL_SPECS) {
 		pi.registerTool({
@@ -87,20 +97,22 @@ export default function xmustard(pi: ExtensionAPI): void {
 		if (!active.includes(EXPAND_TOOL)) pi.setActiveTools([...active, EXPAND_TOOL]);
 	};
 
-	// Registered tools start active; expansion stays hidden until a handle is issued.
-	pi.on("session_start", () => {
-		const active = pi.getActiveTools();
-		if (active.includes(EXPAND_TOOL)) pi.setActiveTools(active.filter((n) => n !== EXPAND_TOOL));
+	// Registered tools start active; expansion stays hidden until a handle is issued,
+	// and xMustard tools this caller cannot use are deactivated, so they never reach
+	// the model (registration itself stays load-time only, without network calls).
+	pi.on("session_start", async () => {
+		let active = pi.getActiveTools().filter((n) => n !== EXPAND_TOOL);
+		const allowed = await callerTools(cfg);
+		if (allowed) active = active.filter((n) => !TOOL_NAMES.has(n) || allowed.has(n));
+		pi.setActiveTools(active);
 	});
 
 	pi.on("tool_result", async (event, ctx) => {
-		if (!TOOL_NAMES.has(event.toolName)) return undefined; // other tools pass through untouched
-		return projectResult(
-			cfg,
-			event,
-			pending,
-			{ sessionId: sessionIdOf(ctx), signal: ctx.signal },
-			activateExpand,
-		);
+		const meta = { sessionId: sessionIdOf(ctx), signal: ctx.signal };
+		if (TOOL_NAMES.has(event.toolName)) return projectResult(cfg, event, pending, meta, activateExpand);
+		if (cfg.builtins.has(event.toolName)) {
+			return projectBuiltin(cfg, capturer, (signal) => resolveWorkspace(ctx.cwd, signal), event, meta, activateExpand);
+		}
+		return undefined; // other tools pass through untouched
 	});
 }

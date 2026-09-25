@@ -9,22 +9,26 @@ import type net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { after, before, describe, test } from "node:test";
-import { type AdapterConfig, loadConfig } from "../src/config.ts";
+import { type AdapterConfig, loadConfig, PI_POLICY_TARGET } from "../src/config.ts";
 import {
 	argsDigest,
+	CAPTURE_PAUSE_MS,
+	Capturer,
 	DELIVERY_HEADER,
 	expand,
 	DELIVERY_VERSION,
 	type Delivery,
 	INLINE_LIMIT,
 	PendingCalls,
+	projectBuiltin,
 	projectResult,
 	renderPage,
 	runTool,
 } from "../src/delivery.ts";
+import { callerTools, WorkspaceResolver } from "../src/workspace.ts";
 import { send, XmustardHttpError } from "../src/http.ts";
 import { checkRequired, TOOL_SPECS, toJsonSchema } from "../src/tools.ts";
-import { WorkspaceResolver } from "../src/workspace.ts";
+
 
 type Handler = (req: http.IncomingMessage, res: http.ServerResponse, body: Buffer) => void;
 let handler: Handler = (_q, s) => s.end();
@@ -48,6 +52,7 @@ after(() => {
 });
 
 const cfg = (over: Partial<AdapterConfig> = {}): AdapterConfig => ({
+	...loadConfig({}),
 	apiBase: base,
 	token: undefined,
 	delivery: "source",
@@ -471,5 +476,174 @@ describe("expansion search", () => {
 			res.end(JSON.stringify({ error: "evidence access denied", reason: "denied" }));
 		};
 		await assert.rejects(expand(cfg(), { workspace_id: "w", handle: "xm1.S", lines: "1-5" }, undefined), /evidence\/search/);
+	});
+});
+
+// ---- WS-24: built-in projection through capture, caller-scoped tools ----------------
+
+const observation = (over: Record<string, unknown> = {}) => ({
+	delivery: DELIVERY_VERSION,
+	tool: "bash",
+	status: 0,
+	is_error: false,
+	content_type: "text/plain; charset=utf-8",
+	reduced: true,
+	projection: "[xmustard test] xm-test/1 exit=1 failed=1\\n--- FAIL: TestParse",
+	handle: "xm1.CAPTURED",
+	raw_bytes: 60_000,
+	raw_sha256: "cd",
+	projected_bytes: 60,
+	reducer: "xm-test/1",
+	omissions: [{ kind: "lines" }],
+	page_size: 65536,
+	projection_mode: "text",
+	captured_identity: "unknown",
+	expires_at: "2026-09-26T00:00:00Z",
+	family: "test",
+	target_bytes: 32768,
+	shape: { client: "pi", shape: "pi.tool_result", mode: "replace" },
+	...over,
+});
+
+interface Seen {
+	method: string;
+	path: string;
+	query: URLSearchParams;
+	body: string;
+}
+
+// captureServer answers capture and whoami requests and records them; retained
+// originals are kept by handle, as Go's store would keep them.
+function captureServer(over: (seen: Seen, n: number) => { status?: number; body?: unknown } | undefined = () => undefined) {
+	const seen: Seen[] = [];
+	const retained = new Map<string, string>();
+	handler = (req, res, body) => {
+		const u = new URL(req.url ?? "", "http://x");
+		const s: Seen = { method: req.method ?? "", path: u.pathname, query: u.searchParams, body: body.toString("utf8") };
+		seen.push(s);
+		const custom = over(s, seen.length);
+		if (custom) {
+			res.writeHead(custom.status ?? 200, { "Content-Type": "application/json" }).end(JSON.stringify(custom.body ?? {}));
+			return;
+		}
+		if (u.pathname === "/api/workspaces") return res.end(JSON.stringify([{ workspace_id: "w1", root_path: "/" }]));
+		if (u.pathname.endsWith("/evidence/capture")) {
+			const handle = `xm1.H${seen.length}`;
+			retained.set(handle, s.body);
+			return res.end(JSON.stringify(observation({ handle, tool: u.searchParams.get("tool"), raw_bytes: body.length, is_error: u.searchParams.get("is_error") === "true" })));
+		}
+		res.writeHead(404).end("{}");
+	};
+	return { seen, retained, captures: () => seen.filter((x) => x.path.endsWith("/evidence/capture")) };
+}
+
+const bigText = (n: number, word = "ok") => Array.from({ length: n }, (_, i) => `${word} line ${i}`).join("\n");
+
+describe("built-in tool projection through capture", () => {
+	const resolve = async () => "w1";
+	test("config: built-ins and the lower-only target", () => {
+		const d = loadConfig({});
+		assert.deepEqual([...d.builtins].sort(), ["bash", "edit", "find", "grep", "ls", "read", "write"]);
+		assert.equal(d.projectionTarget, PI_POLICY_TARGET);
+		const c = loadConfig({ XMUSTARD_PI_BUILTINS: "bash, read,nope", XMUSTARD_PI_PROJECTION_TARGET_BYTES: "8192" });
+		assert.deepEqual([...c.builtins].sort(), ["bash", "read"]);
+		assert.equal(c.projectionTarget, 8192);
+		assert.equal(loadConfig({ XMUSTARD_PI_PROJECTION_TARGET_BYTES: "999999" }).projectionTarget, PI_POLICY_TARGET, "never raised");
+		assert.equal(loadConfig({ XMUSTARD_PI_PROJECTION_TARGET_BYTES: "100" }).projectionTarget, PI_POLICY_TARGET, "below 1 KiB refused");
+		assert.equal(loadConfig({ XMUSTARD_PI_BUILTINS: "none" }).builtins.size, 0);
+	});
+	test("a large result is replaced by its projection with a handle; isError and details are kept", async () => {
+		const srv = captureServer();
+		const text = bigText(4000, "--- PASS");
+		const details = { truncation: { truncated: true, totalLines: 9000 }, fullOutputPath: "/tmp/pi-bash-1.log" };
+		let handles = 0;
+		const out = await projectBuiltin(
+			cfg(),
+			new Capturer(cfg()),
+			resolve,
+			{ toolCallId: "b1", toolName: "bash", input: { command: "go test ./..." }, content: [{ type: "text", text }], details, isError: true },
+			{ sessionId: "s1" },
+			() => handles++,
+		);
+		const [cap] = srv.captures();
+		assert.equal(cap.path, "/api/workspaces/w1/evidence/capture");
+		assert.equal(cap.query.get("format"), "pi");
+		assert.equal(cap.query.get("client"), "pi");
+		assert.equal(cap.query.get("is_error"), "true");
+		assert.equal(cap.query.get("session_id"), "s1");
+		assert.equal(cap.query.get("target"), null, "the Pi policy target is Go's default");
+		const posted = JSON.parse(cap.body);
+		assert.deepEqual(posted, { type: "tool_result", toolName: "bash", toolCallId: "b1", sessionId: "s1", input: { command: "go test ./..." }, content: [{ type: "text", text }], isError: true });
+		assert.ok(!("details" in posted), "details are not model-visible and are not captured");
+		assert.ok(out?.content);
+		const [proj, footer] = out.content[0].text.split("\n[xmustard evidence] ");
+		assert.equal(proj, observation().projection);
+		assert.equal(JSON.parse(footer).handle, "xm1.H1");
+		assert.equal(JSON.parse(footer).workspace_id, "w1");
+		assert.equal((out as { isError?: boolean }).isError, undefined, "isError is never touched");
+		const d = out.details as Record<string, any>;
+		assert.deepEqual(d.truncation, details.truncation);
+		assert.equal(d.fullOutputPath, details.fullOutputPath);
+		assert.equal(d.xmustard.path, "capture");
+		assert.equal(d.xmustard.handle, "xm1.H1");
+		assert.equal(d.xmustard.family, "test");
+		assert.equal(handles, 1);
+		assert.ok(!("xmustard" in details), "the tool's own details object is not mutated");
+	});
+	test("small, image and non-built-in results never reach Go", async () => {
+		const srv = captureServer();
+		const c = new Capturer(cfg());
+		const small = await projectBuiltin(cfg(), c, resolve, { toolCallId: "s", toolName: "read", input: {}, content: [{ type: "text", text: "x".repeat(PI_POLICY_TARGET) }], details: undefined, isError: false }, {}, () => {});
+		const img = await projectBuiltin(
+			cfg(),
+			c,
+			resolve,
+			{ toolCallId: "i", toolName: "read", input: {}, content: [{ type: "text", text: bigText(9000) }, { type: "image", data: "AAAA", mimeType: "image/png" }], details: undefined, isError: false },
+			{},
+			() => {},
+		);
+		const other = await projectBuiltin(cfg({ builtins: new Set(["bash"]) }), c, resolve, { toolCallId: "o", toolName: "read", input: {}, content: [{ type: "text", text: bigText(9000) }], details: undefined, isError: false }, {}, () => {});
+		assert.deepEqual([small, img, other], [undefined, undefined, undefined]);
+		assert.equal(srv.seen.length, 0);
+	});
+	test("capture unavailable: Pi's result stands, the reason is recorded, and capture pauses", async () => {
+		let now = 1_000;
+		const srv = captureServer(() => ({ status: 503, body: { reason: "redaction_unavailable", error: "capture is disabled until a streaming secret redactor is configured" } }));
+		const c = new Capturer(cfg(), () => now);
+		const ev = { toolCallId: "u", toolName: "bash", input: { command: "yes" }, content: [{ type: "text", text: bigText(9000) }], details: undefined, isError: false };
+		const out = await projectBuiltin(cfg(), c, resolve, ev, {}, () => assert.fail("no handle"));
+		assert.equal(out?.content, undefined, "content untouched");
+		assert.match((out?.details as any).xmustard.reason, /503 redaction_unavailable/);
+		assert.equal(srv.captures().length, 1);
+		const again = await projectBuiltin(cfg(), c, resolve, ev, {}, () => {});
+		assert.match((again?.details as any).xmustard.reason, /capture paused/);
+		assert.equal(srv.captures().length, 1, "paused: no second request");
+		now += CAPTURE_PAUSE_MS + 1;
+		await projectBuiltin(cfg(), c, resolve, ev, {}, () => {});
+		assert.equal(srv.captures().length, 2, "retried after the pause");
+	});
+	test("an unshapable capture or an unresolved workspace keeps Pi's result", async () => {
+		captureServer((s) => (s.path.endsWith("/capture") ? { body: observation({ shape: { client: "pi", shape: "pi.tool_result", mode: "fallback_original", reason: "status members" } }) } : undefined));
+		const ev = { toolCallId: "f", toolName: "grep", input: { pattern: "x" }, content: [{ type: "text", text: bigText(9000) }], details: { matchLimitReached: 100 }, isError: false };
+		const out = await projectBuiltin(cfg(), new Capturer(cfg()), resolve, ev, {}, () => assert.fail("no handle"));
+		assert.equal(out?.content, undefined);
+		assert.equal((out?.details as any).matchLimitReached, 100);
+		assert.match((out?.details as any).xmustard.reason, /fallback_original/);
+		const noWs = await projectBuiltin(cfg(), new Capturer(cfg()), async () => Promise.reject(new Error("no workspace resolved")), ev, {}, () => {});
+		assert.equal(noWs?.content, undefined);
+		assert.match((noWs?.details as any).xmustard.reason, /no workspace resolved/);
+	});
+	test("a lowered projection target is sent to Go", async () => {
+		const srv = captureServer();
+		await projectBuiltin(cfg({ projectionTarget: 4096 }), new Capturer(cfg()), resolve, { toolCallId: "t", toolName: "ls", input: {}, content: [{ type: "text", text: bigText(600) }], details: undefined, isError: false }, {}, () => {});
+		assert.equal(srv.captures()[0].query.get("target"), "4096");
+	});
+	test("whoami scopes the nine tools; any failure keeps them all", async () => {
+		handler = (req, res) => res.end(JSON.stringify({ id: "rita", tools: ["ground", "recall", "search"] }));
+		assert.deepEqual([...((await callerTools(cfg())) ?? [])], ["ground", "recall", "search"]);
+		handler = (_q, res) => res.writeHead(401).end('{"error":"authentication required"}');
+		assert.equal(await callerTools(cfg()), undefined);
+		handler = (_q, res) => res.end('{"id":"old-api"}');
+		assert.equal(await callerTools(cfg()), undefined);
 	});
 });
