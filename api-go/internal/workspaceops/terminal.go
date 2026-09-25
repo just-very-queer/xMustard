@@ -53,7 +53,20 @@ type terminalSession struct {
 	closed       bool
 	lastActivity time.Time
 	closeOnce    sync.Once
+	teardownOnce sync.Once
+	pumpDone     chan struct{} // closed once the pump has released the PTY and log
+	tornDown     chan struct{} // closed once shutdown has finished
 }
+
+const (
+	// terminalKillGrace is how long a closing terminal's processes get to exit
+	// after SIGHUP before they are sent SIGKILL.
+	terminalKillGrace = 2 * time.Second
+	// terminalPumpDrain bounds the wait for the pump to reach the PTY's end after
+	// teardown. It only runs out if a process outside the session still holds
+	// the PTY.
+	terminalPumpDrain = time.Second
+)
 
 // terminalIdleTTL closes a terminal session abandoned (no write/resize/read) past
 // this duration, so an opened-but-forgotten session can't leak its shell child, PTY,
@@ -87,9 +100,7 @@ func reapIdleTerminals() {
 		return true
 	})
 	for _, s := range toClose {
-		s.markClosed()
-		terminateTerminalProcess(s.process)
-		s.closePTY()
+		s.shutdown()
 	}
 }
 
@@ -168,14 +179,17 @@ func OpenTerminal(dataDir string, request TerminalOpenRequest) (*TerminalSession
 		pty:          ptyHandle,
 		logPath:      logPath,
 		lastActivity: time.Now(),
+		pumpDone:     make(chan struct{}),
+		tornDown:     make(chan struct{}),
 	}
 	// reject a duplicate LIVE id rather than overwriting (and orphaning) its process
 	// handle (XM-POST-002). LoadOrStore is atomic; a stale closed entry is replaced.
 	if prev, loaded := terminalSessions.LoadOrStore(terminalID, session); loaded {
 		if existing, ok := prev.(*terminalSession); ok && !existing.isClosed() {
-			session.markClosed()
-			terminateTerminalProcess(cmd)
-			_ = ptyHandle.Close()
+			// never published and no pump started: tear down, reap, close the log
+			close(session.pumpDone)
+			session.shutdown()
+			_ = cmd.Wait()
 			_ = logHandle.Close()
 			return nil, fmt.Errorf("terminal %s already active", terminalID)
 		}
@@ -187,10 +201,11 @@ func OpenTerminal(dataDir string, request TerminalOpenRequest) (*TerminalSession
 	go pumpTerminalStream(session, writer)
 	go func() {
 		_ = cmd.Wait()
-		// On natural exit the pump goroutine's deferred closePTY + writer.Close
-		// release the PTY/log; we just mark closed. The lingering (closed) map entry
-		// is removed by the idle reaper, while CloseTerminal stays idempotent.
-		session.markClosed()
+		// The shell is gone. Whatever it left running in its session (background
+		// jobs, nohup'd work) still holds the PTY, so end it now, while the session
+		// id still names only this shell's processes. CloseTerminal stays
+		// idempotent; the idle reaper removes the closed map entry.
+		session.shutdown()
 	}()
 
 	return &TerminalSessionRecord{
@@ -223,10 +238,8 @@ func CloseTerminal(workspaceID, terminalID string) error {
 	if err != nil {
 		return err
 	}
-	session.markClosed()
 	terminalSessions.Delete(terminalID)
-	terminateTerminalProcess(session.process)
-	session.closePTY()
+	session.shutdown()
 	return nil
 }
 
@@ -257,7 +270,7 @@ func ReadTerminal(dataDir string, workspaceID string, terminalID string, offset 
 		if session, ok := sessionValue.(*terminalSession); ok && session.workspaceID == workspaceID {
 			session.touch()
 			logPath = session.logPath
-			eof = session.isClosed()
+			eof = session.isTornDown()
 		}
 	}
 	handle, err := os.Open(logPath)
@@ -312,9 +325,48 @@ func requireTerminalSession(workspaceID, terminalID string) (*terminalSession, e
 }
 
 func pumpTerminalStream(session *terminalSession, writer io.WriteCloser) {
+	defer close(session.pumpDone)
 	defer writer.Close()
 	defer session.closePTY()
 	_, _ = io.Copy(writer, session.pty)
+}
+
+// shutdown ends the session: it marks it closed, closes the PTY, ends every process
+// the shell started (killTerminalSession) and waits, bounded, for the pump to
+// release the PTY and log. It runs once; a concurrent caller blocks until that run
+// has finished, so a return means the session is down.
+func (session *terminalSession) shutdown() {
+	session.markClosed()
+	session.teardownOnce.Do(func() {
+		// Later writes fail at once. A pump blocked in read keeps the descriptor
+		// open until that read returns, on output or once no process holds the
+		// other side; the real close then hangs the PTY up.
+		session.closePTY()
+		killTerminalSession(session.process, terminalKillGrace)
+		if session.pumpDone != nil {
+			select {
+			case <-session.pumpDone:
+			case <-time.After(terminalPumpDrain):
+			}
+		}
+		if session.tornDown != nil {
+			close(session.tornDown)
+		}
+	})
+}
+
+// isTornDown reports whether shutdown has finished: the shell and its session are
+// gone and the pump has written the last output to the log.
+func (session *terminalSession) isTornDown() bool {
+	if session.tornDown == nil {
+		return session.isClosed()
+	}
+	select {
+	case <-session.tornDown:
+		return true
+	default:
+		return false
+	}
 }
 
 func (session *terminalSession) markClosed() {

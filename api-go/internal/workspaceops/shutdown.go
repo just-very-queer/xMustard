@@ -2,6 +2,7 @@ package workspaceops
 
 import (
 	"log"
+	"sync"
 )
 
 // ShutdownInFlight performs a workload-aware drain AFTER HTTP admissions have stopped
@@ -13,7 +14,7 @@ import (
 //  1. each live run: durably mark it `interrupted` (under the run transaction, so JSON +
 //     the PG mirror converge) and signal its process group, so a restart never re-attaches
 //     to or double-launches an orphaned worker.
-//  2. each terminal: mark closed, terminate the shell, close the PTY.
+//  2. each terminal: mark closed, end every process in the shell's session, close the PTY.
 //  3. merge the coalesced search-retrieval feedback into each workspace's store.
 //  4. flush the inline PG mirror workers so the interrupted run snapshots are mirrored.
 func ShutdownInFlight(dataDir string) {
@@ -78,9 +79,14 @@ func closeAllTerminals() {
 		}
 		return true
 	})
+	// in parallel: each teardown may wait out the SIGHUP grace period
+	var wg sync.WaitGroup
 	for _, s := range toClose {
-		s.markClosed()
-		terminateTerminalProcess(s.process)
-		s.closePTY()
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s.shutdown()
+		}()
 	}
+	wg.Wait()
 }
