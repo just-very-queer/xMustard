@@ -199,7 +199,7 @@ func evidenceDeliveryMiddleware(store *evidence.Store, next http.Handler) http.H
 			scope.Close()
 		}
 		w.Header().Set(deliveryHeader, evidence.DeliveryVersion)
-		writeJSON(w, http.StatusOK, d)
+		writeJSON(w, http.StatusOK, withTokenEstimate(d))
 	})
 }
 
@@ -292,7 +292,7 @@ func registerEvidenceRoutes(mux *http.ServeMux, store *evidence.Store) {
 			writeEvidenceError(w, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, d)
+		writeJSON(w, http.StatusOK, withTokenEstimate(d))
 	})
 	readReq := func(r *http.Request) evidence.ReadRequest {
 		actor, enforced := principalScope(r)

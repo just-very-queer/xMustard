@@ -163,6 +163,16 @@ func registerEvidenceCaptureRoutes(mux *http.ServeMux, store *evidence.Store) {
 	})
 }
 
+// withTokenEstimate adds delivered_tokens_est (PAR-CTX-13, xm-tokens/1) to an
+// evidence envelope: the estimated tokens of the projection a client receives.
+func withTokenEstimate(d *evidence.Delivery) any {
+	return struct {
+		*evidence.Delivery
+		DeliveredTokensEst int    `json:"delivered_tokens_est"`
+		TokenEstimator     string `json:"token_estimator"`
+	}{d, evidence.EstimateTokens(d.Projection), evidence.TokenEstimator}
+}
+
 func badCapture(w http.ResponseWriter, reason, msg string) {
 	writeJSON(w, http.StatusBadRequest, map[string]any{"error": msg, "reason": reason})
 }

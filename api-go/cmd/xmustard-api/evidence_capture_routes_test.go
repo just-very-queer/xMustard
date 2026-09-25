@@ -176,3 +176,26 @@ func TestCaptureRoutesAreCoreSurface(t *testing.T) {
 		}
 	}
 }
+
+// Existing evidence envelopes (nine-tool delivery and the Pi POST) carry
+// delivered_tokens_est; the projection itself is unchanged.
+func TestEvidenceEnvelopesCarryTokenEstimate(t *testing.T) {
+	f := newEvidenceFixture(t, true)
+	code, b, _ := f.do(t, "POST", "/api/workspaces/"+f.ws+"/evidence?tool=search", "", bytes.NewReader(f.big), nil)
+	var env struct {
+		evidence.Delivery
+		DeliveredTokensEst int    `json:"delivered_tokens_est"`
+		TokenEstimator     string `json:"token_estimator"`
+	}
+	if err := json.Unmarshal(b, &env); err != nil || code != 200 {
+		t.Fatalf("pi capture: %d %v", code, err)
+	}
+	if env.DeliveredTokensEst != evidence.EstimateTokens(env.Projection) || env.DeliveredTokensEst == 0 || env.TokenEstimator != evidence.TokenEstimator {
+		t.Fatalf("token estimate: %d (%s)", env.DeliveredTokensEst, env.TokenEstimator)
+	}
+	code, b, _ = f.do(t, "GET", "/api/workspaces/"+f.ws+"/search?q=x", "", nil, deliver)
+	_ = json.Unmarshal(b, &env)
+	if code != 200 || env.DeliveredTokensEst == 0 || env.Reducer != evidence.ReducerVersion {
+		t.Fatalf("tool delivery: %d est %d reducer %s", code, env.DeliveredTokensEst, env.Reducer)
+	}
+}

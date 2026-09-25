@@ -93,6 +93,7 @@ type envelope struct {
 	ProjectionMode   string            `json:"projection_mode"`
 	CapturedIdentity string            `json:"captured_identity"`
 	Omissions        []json.RawMessage `json:"omissions"`
+	TokensEst        int               `json:"delivered_tokens_est"`
 }
 
 // evidenceResult turns an evidence envelope into the MCP tool result: the projection
@@ -119,10 +120,11 @@ func evidenceResult(ctx context.Context, body, ws string) (map[string]any, *rpcE
 		"raw_sha256": env.RawSHA256, "projected_bytes": env.ProjectedBytes, "expires_at": env.ExpiresAt,
 		"projection_mode": env.ProjectionMode, "captured_identity": env.CapturedIdentity,
 		"omissions": len(env.Omissions), "tool": env.Tool, "call_id": env.CallID, "status": env.Status,
+		"delivered_tokens_est": env.TokensEst,
 	}
 	rememberHandle(env.Handle, ws, meta)
 	note := fmt.Sprintf("[xmustard evidence] %s result reduced from %d to %d bytes (%d omitted regions, identity %s). "+
-		"The exact original is retained until %s: read it with resources/read uri=%s (pages of at most %d bytes; add &offset=N&length=N).",
+		"The exact original is retained until %s: read it with resources/read uri=%s (pages of at most %d bytes; add &offset=N&length=N, or search it with &pattern=RE2 or &lines=A-B).",
 		env.Tool, env.RawBytes, env.ProjectedBytes, len(env.Omissions), env.CapturedIdentity, env.ExpiresAt, env.ResourceURI, pageBytes)
 	res["content"] = append(content, map[string]any{"type": "text", "text": note})
 	res["_meta"] = map[string]any{"xmustard/evidence": meta}
@@ -158,9 +160,9 @@ func resourcesListResult() map[string]any {
 
 func resourceTemplatesResult() map[string]any {
 	return map[string]any{"resourceTemplates": []map[string]any{{
-		"uriTemplate": resourceScheme + "{handle}{?offset,length,workspace_id}",
+		"uriTemplate": resourceScheme + "{handle}{?offset,length,workspace_id,pattern,query,lines,max_matches,context,start_line}",
 		"name":        "xMustard evidence original",
-		"description": "Exact bytes of a reduced xMustard tool result, in pages of at most 64 KiB (base64 blob).",
+		"description": "Exact bytes of a reduced xMustard tool result, in pages of at most 64 KiB (base64 blob); with pattern (RE2), query or lines=A-B, the matching lines as JSON.",
 		"mimeType":    "application/octet-stream",
 	}}}
 }
@@ -208,6 +210,9 @@ func readResource(ctx context.Context, params json.RawMessage) (any, *rpcError) 
 		return nil, &rpcError{Code: resourceNotFound, Message: "resource not found: handle not issued in this session; pass ?workspace_id=",
 			Data: map[string]any{"uri": p.URI, "reason": "unknown_workspace"}}
 	}
+	if isSearch(q) {
+		return searchResource(ctx, p.URI, handle, ws, q)
+	}
 	path := fmt.Sprintf("/api/workspaces/%s/evidence/%s?offset=%d&length=%d", url.PathEscape(ws), url.PathEscape(handle), offset, length)
 	resp, err := callAPIResp(ctx, "GET", path, "", nil)
 	if err != nil {
@@ -217,22 +222,7 @@ func readResource(ctx context.Context, params json.RawMessage) (any, *rpcError) 
 		return nil, &rpcError{Code: -32603, Message: err.Error()}
 	}
 	if resp.status != http.StatusOK {
-		var e struct {
-			Error  string `json:"error"`
-			Reason string `json:"reason"`
-		}
-		_ = json.Unmarshal([]byte(resp.body), &e)
-		code := -32603
-		switch resp.status {
-		case http.StatusNotFound, http.StatusGone, http.StatusForbidden, http.StatusUnauthorized:
-			code = resourceNotFound // missing, expired, revoked, denied: never substituted
-		case http.StatusRequestedRangeNotSatisfiable, http.StatusBadRequest:
-			code = -32602
-		case http.StatusServiceUnavailable:
-			code = overloadCode
-		}
-		return nil, &rpcError{Code: code, Message: fmt.Sprintf("evidence %s: %s", e.Reason, e.Error),
-			Data: map[string]any{"uri": p.URI, "status": resp.status, "reason": e.Reason}}
+		return nil, evidenceRPCError(p.URI, resp)
 	}
 	var page map[string]any
 	if err := json.Unmarshal([]byte(resp.body), &page); err != nil {
