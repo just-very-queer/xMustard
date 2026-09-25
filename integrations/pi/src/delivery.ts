@@ -349,11 +349,65 @@ export interface ExpandArgs {
 	handle: string;
 	offset?: number;
 	length?: number;
+	// search inside the original instead of paging (PAR-CTX-04)
+	pattern?: string; // RE2 regular expression
+	query?: string; // literal, case-insensitive
+	lines?: string; // "A-B" line range
+	max_matches?: number;
+	start_line?: number; // next_line of a previous search, with offset=next_offset
 }
 
 export interface ExpandResult {
 	content: { type: "text"; text: string }[];
 	details: Omit<Page, "data"> & { data_base64: string; text_encoding: "utf-8" | "base64" };
+}
+
+export interface SearchExpandResult {
+	content: { type: "text"; text: string }[];
+	details: SearchResult;
+}
+
+// ExpandToolResult is what xmustard_expand returns: a page or a search.
+export interface ExpandToolResult {
+	content: { type: "text"; text: string }[];
+	details: ExpandResult["details"] | SearchResult;
+}
+
+// SearchResult mirrors evidence.SearchResult (Go JSON).
+export interface SearchResult {
+	handle: string;
+	tool: string;
+	lines: { line: number; offset: number; text: string; truncated?: boolean; match?: boolean }[];
+	matches: number;
+	match_cap_reached: boolean;
+	byte_cap_reached?: boolean;
+	long_lines_truncated?: number;
+	next_offset: number;
+	next_line: number;
+	eof: boolean;
+	bytes_scanned: number;
+	total_bytes: number;
+	freshness: string;
+	stale: boolean;
+	expires_at: string;
+}
+
+// renderSearch shows matching lines, numbered, under a `[xmustard search]` header
+// that says where to resume and how fresh the capture is.
+export function renderSearch(res: SearchResult): SearchExpandResult {
+	const header = {
+		handle: res.handle,
+		matches: res.matches,
+		match_cap_reached: res.match_cap_reached,
+		next_offset: res.next_offset,
+		next_line: res.next_line,
+		eof: res.eof,
+		freshness: res.freshness,
+		stale: res.stale,
+		expires_at: res.expires_at,
+	};
+	const body = res.lines.map((l) => `${String(l.line).padStart(6)}${l.match ? ":" : "-"} ${l.text}${l.truncated ? " …" : ""}`).join("\n");
+	return { content: [{ type: "text", text: `[xmustard search] ${JSON.stringify(header)}\n${body}` }], details: res };
 }
 
 const strictUtf8 = new TextDecoder("utf-8", { fatal: true });
@@ -394,8 +448,9 @@ export function renderPage(page: Page): ExpandResult {
 	};
 }
 
-export async function expand(cfg: AdapterConfig, args: ExpandArgs, signal: AbortSignal | undefined): Promise<ExpandResult> {
+export async function expand(cfg: AdapterConfig, args: ExpandArgs, signal: AbortSignal | undefined): Promise<ExpandToolResult> {
 	if (!args.workspace_id?.trim() || !args.handle?.trim()) throw new Error("xmustard_expand needs workspace_id and handle");
+	if (args.pattern || args.query || args.lines) return search(cfg, args, signal);
 	const params = new URLSearchParams({ offset: String(Math.max(0, Math.trunc(args.offset ?? 0))) });
 	if (args.length !== undefined) params.set("length", String(Math.min(PAGE_SIZE, Math.max(1, Math.trunc(args.length)))));
 	const path = `/api/workspaces/${encodeURIComponent(args.workspace_id)}/evidence/${encodeURIComponent(args.handle)}?${params}`;
@@ -409,4 +464,29 @@ export async function expand(cfg: AdapterConfig, args: ExpandArgs, signal: Abort
 	}
 	if (page.encoding !== "base64" || typeof page.data !== "string") throw new Error("xMustard GET /evidence/{handle}: unexpected page encoding");
 	return renderPage(page);
+}
+
+// search asks Go to scan the original (1 MiB chunks, match cap) for a pattern,
+// literal or line range; the page path is unchanged.
+async function search(cfg: AdapterConfig, args: ExpandArgs, signal: AbortSignal | undefined): Promise<SearchExpandResult> {
+	const params = new URLSearchParams({ handle: args.handle });
+	if (args.pattern) params.set("pattern", args.pattern);
+	if (args.query) params.set("query", args.query);
+	if (args.lines) params.set("lines", args.lines);
+	if (args.max_matches !== undefined) params.set("max_matches", String(Math.trunc(args.max_matches)));
+	if (args.offset !== undefined && args.offset > 0) {
+		params.set("offset", String(Math.trunc(args.offset)));
+		params.set("start_line", String(Math.max(1, Math.trunc(args.start_line ?? 1))));
+	}
+	const path = `/api/workspaces/${encodeURIComponent(args.workspace_id)}/evidence/search?${params}`;
+	const res = await send(cfg, { method: "GET", path, timeoutMs: cfg.toolTimeoutMs, signal, maxBytes: MAX_PAGE_RESPONSE });
+	if (res.status >= 400) throw errorFromResponse("GET /evidence/search", res);
+	let parsed: SearchResult;
+	try {
+		parsed = JSON.parse(utf8.decode(res.body)) as SearchResult;
+	} catch {
+		throw new Error("xMustard GET /evidence/search: malformed result");
+	}
+	if (!Array.isArray(parsed.lines)) throw new Error("xMustard GET /evidence/search: malformed result");
+	return renderSearch(parsed);
 }

@@ -57,7 +57,12 @@ unchanged. A reduced result ends with one line
 `xmustard_expand` answers with a `[xmustard page] {…}` header (offset, next_offset,
 eof, freshness, captured/current key) followed by the bytes, as text when the page is
 valid UTF-8 on its own and standard base64 otherwise. Tool `details` always carry the
-exact base64.
+exact base64. With `pattern` (RE2), `query` (literal) or `lines` (`A-B`),
+`xmustard_expand` searches the original instead (Go scans it in 1 MiB chunks up to
+`max_matches`, default 40) and answers with a `[xmustard search] {…}` header
+(matches, next_offset, next_line, freshness) followed by numbered lines (`12:` a
+match, `11-` context); pass `offset=next_offset` with `start_line=next_line` to
+continue.
 
 Failure behavior:
 

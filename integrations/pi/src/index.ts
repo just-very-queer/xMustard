@@ -32,6 +32,11 @@ const ExpandParameters = Type.Object(
 		handle: Type.String({ description: "the xm1.… recovery handle from an [xmustard evidence] line" }),
 		offset: Type.Optional(Type.Integer({ minimum: 0, description: "byte offset into the original (next_offset of the previous page)" })),
 		length: Type.Optional(Type.Integer({ minimum: 1, maximum: PAGE_SIZE, description: `bytes to read (max ${PAGE_SIZE})` })),
+		pattern: Type.Optional(Type.String({ description: "search the original for this RE2 pattern instead of paging" })),
+		query: Type.Optional(Type.String({ description: "search for this literal text (case-insensitive)" })),
+		lines: Type.Optional(Type.String({ description: "line range A-B to return (or to search within)" })),
+		max_matches: Type.Optional(Type.Integer({ minimum: 1, maximum: 200, description: "match cap (default 40)" })),
+		start_line: Type.Optional(Type.Integer({ minimum: 1, description: "next_line of a previous search, with offset=next_offset" })),
 	},
 	{ additionalProperties: false },
 );
@@ -64,7 +69,7 @@ export default function xmustard(pi: ExtensionAPI): void {
 		name: EXPAND_TOOL,
 		label: "xMustard expand",
 		description:
-			"Read the exact original bytes behind a reduced xMustard result, one page at a time (max 64 KiB). Pass the workspace_id and handle from its [xmustard evidence] line; start at offset 0 and continue from next_offset until eof. Pages report whether the capture is current, stale or of unknown freshness; serve captured bytes only.",
+			"Read the exact original bytes behind a reduced xMustard result, one page at a time (max 64 KiB), or search it. Pass the workspace_id and handle from its [xmustard evidence] line; start at offset 0 and continue from next_offset until eof, or pass pattern (RE2), query or lines=A-B to get matching lines with numbers. Results report whether the capture is current, stale or of unknown freshness; serve captured bytes only.",
 		parameters: ExpandParameters,
 		async execute(_toolCallId, params, signal) {
 			return expand(cfg, params, signal);

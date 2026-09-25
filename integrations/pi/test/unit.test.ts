@@ -10,6 +10,7 @@ import { type AdapterConfig, loadConfig } from "../src/config.ts";
 import {
 	argsDigest,
 	DELIVERY_HEADER,
+	expand,
 	DELIVERY_VERSION,
 	type Delivery,
 	INLINE_LIMIT,
@@ -331,5 +332,57 @@ describe("expansion pages", () => {
 		assert.equal(p.size, 256);
 		assert.equal(p.take("c0"), undefined);
 		assert.ok(p.take("c999"));
+	});
+});
+
+describe("expansion search", () => {
+	test("pattern, query and lines search the original through /evidence/search", async () => {
+		let seen = "";
+		handler = (req, res) => {
+			seen = req.url ?? "";
+			res.setHeader("content-type", "application/json");
+			res.end(
+				JSON.stringify({
+					handle: "xm1.S",
+					tool: "bash",
+					lines: [
+						{ line: 11, offset: 300, text: "context before" },
+						{ line: 12, offset: 320, text: "--- FAIL: TestParse (0.00s)", match: true },
+					],
+					matches: 1,
+					match_cap_reached: false,
+					next_offset: 400,
+					next_line: 13,
+					eof: true,
+					bytes_scanned: 400,
+					total_bytes: 400,
+					freshness: "unknown",
+					stale: true,
+					expires_at: "t",
+				}),
+			);
+		};
+		const out = await expand(cfg(), { workspace_id: "w 1", handle: "xm1.S", pattern: "--- FAIL", max_matches: 5 }, undefined);
+		const u = new URL(seen, "http://x");
+		assert.equal(u.pathname, "/api/workspaces/w%201/evidence/search");
+		assert.equal(u.searchParams.get("pattern"), "--- FAIL");
+		assert.equal(u.searchParams.get("max_matches"), "5");
+		assert.equal(u.searchParams.get("handle"), "xm1.S");
+		assert.match(out.content[0].text, /^\[xmustard search\] .*"matches":1/);
+		assert.match(out.content[0].text, /\n {4}12: --- FAIL: TestParse/);
+		assert.match(out.content[0].text, /\n {4}11- context before/);
+		// resuming a search forwards offset with start_line
+		await expand(cfg(), { workspace_id: "w", handle: "xm1.S", query: "fail", offset: 400, start_line: 13 }, undefined);
+		const r = new URL(seen, "http://x");
+		assert.equal(r.searchParams.get("query"), "fail");
+		assert.equal(r.searchParams.get("offset"), "400");
+		assert.equal(r.searchParams.get("start_line"), "13");
+	});
+	test("search refusals are explicit errors", async () => {
+		handler = (_req, res) => {
+			res.statusCode = 403;
+			res.end(JSON.stringify({ error: "evidence access denied", reason: "denied" }));
+		};
+		await assert.rejects(expand(cfg(), { workspace_id: "w", handle: "xm1.S", lines: "1-5" }, undefined), /evidence\/search/);
 	});
 });
