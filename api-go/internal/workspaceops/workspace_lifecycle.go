@@ -2,6 +2,7 @@ package workspaceops
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/sha1"
 	"encoding/hex"
 	"encoding/json"
@@ -28,6 +29,19 @@ type WorkspaceLoadRequest struct {
 	Name                 *string `json:"name"`
 	AutoScan             bool    `json:"auto_scan"`
 	PreferCachedSnapshot bool    `json:"prefer_cached_snapshot"`
+	// Registration is set by the API for a non-admin caller, never from a request
+	// body: how this load registers RootPath if the registry does not hold it yet.
+	Registration *NonAdminRegistration `json:"-"`
+}
+
+// NonAdminRegistration is how a non-admin principal's load registers a new root:
+// the record keeps the registration root and the principal (so every later use
+// re-checks the root, verifyRegisteredRoot), and the principal may hold at most
+// Limit such records (0 = no limit), counted under the registry lock.
+type NonAdminRegistration struct {
+	RegisterRoot string // the registration root that admitted RootPath, resolved
+	Principal    string
+	Limit        int
 }
 
 type ExportBundle struct {
@@ -113,7 +127,7 @@ func LoadWorkspace(dataDir string, request WorkspaceLoadRequest) (*workspaceSnap
 		name = filepath.Base(rootPath)
 	}
 
-	workspace, err := upsertLoadedWorkspace(dataDir, rootPath, name, now)
+	workspace, err := upsertLoadedWorkspace(dataDir, rootPath, name, now, request.Registration)
 	if err != nil {
 		return nil, err
 	}
@@ -141,6 +155,8 @@ func LoadWorkspace(dataDir string, request WorkspaceLoadRequest) (*workspaceSnap
 		cached.Workspace.RootPath = workspace.RootPath
 		cached.Workspace.CreatedAt = workspace.CreatedAt
 		cached.Workspace.UpdatedAt = workspace.UpdatedAt
+		cached.Workspace.RegisterRoot = workspace.RegisterRoot
+		cached.Workspace.RegisteredBy = workspace.RegisteredBy
 		if cached.Workspace.LatestScanAt == nil {
 			cached.Workspace.LatestScanAt = workspace.LatestScanAt
 		}
@@ -156,6 +172,8 @@ func LoadWorkspace(dataDir string, request WorkspaceLoadRequest) (*workspaceSnap
 		cached.Workspace.RootPath = workspace.RootPath
 		cached.Workspace.CreatedAt = workspace.CreatedAt
 		cached.Workspace.UpdatedAt = workspace.UpdatedAt
+		cached.Workspace.RegisterRoot = workspace.RegisterRoot
+		cached.Workspace.RegisteredBy = workspace.RegisteredBy
 		if cached.Workspace.LatestScanAt == nil {
 			cached.Workspace.LatestScanAt = workspace.LatestScanAt
 		}
@@ -256,6 +274,9 @@ func getWorkspaceRecord(dataDir string, workspaceID string) (workspaceRecord, er
 	}
 	for _, item := range workspaces {
 		if item.WorkspaceID == workspaceID {
+			if err := verifyRegisteredRoot(item); err != nil {
+				return workspaceRecord{}, err
+			}
 			return item, nil
 		}
 	}
@@ -270,8 +291,10 @@ func getWorkspaceRecord(dataDir string, workspaceID string) (workspaceRecord, er
 }
 
 // upsertLoadedWorkspace finds or creates the record for rootPath and saves it, as one
-// registry transaction: the id lookup and the write see the same registry.
-func upsertLoadedWorkspace(dataDir, rootPath, name, now string) (workspaceRecord, error) {
+// registry transaction: the id lookup, the non-admin limit and the write see the
+// same registry. reg applies only when the record is created; an existing record
+// keeps who registered it.
+func upsertLoadedWorkspace(dataDir, rootPath, name, now string, reg *NonAdminRegistration) (workspaceRecord, error) {
 	unlock := lockStore(workspacesPath(dataDir))
 	defer unlock()
 	workspaces, err := ListWorkspaces(dataDir)
@@ -292,19 +315,58 @@ func upsertLoadedWorkspace(dataDir, rootPath, name, now string) (workspaceRecord
 		CreatedAt:   ptr(now),
 		UpdatedAt:   ptr(now),
 	}
+	created := true
 	for _, item := range workspaces {
 		if item.WorkspaceID == workspaceID {
 			workspace = item
 			workspace.Name = name
 			workspace.RootPath = rootPath
 			workspace.UpdatedAt = ptr(now)
+			created = false
 			break
 		}
+	}
+	if created && reg != nil {
+		held := 0
+		for _, item := range workspaces {
+			if item.RegisteredBy == reg.Principal {
+				held++
+			}
+		}
+		if reg.Limit > 0 && held >= reg.Limit {
+			return workspaceRecord{}, refusal(RefusalRegisterLimit, "%s already registered %d workspaces, the most XMUSTARD_REGISTER_LIMIT allows a non-admin principal; an admin must register %s or raise the limit", reg.Principal, held, rootPath)
+		}
+		workspace.RegisterRoot = reg.RegisterRoot
+		workspace.RegisteredBy = reg.Principal
 	}
 	return workspace, saveWorkspaceRecordLocked(dataDir, workspace)
 }
 
 func workspacesPath(dataDir string) string { return filepath.Join(dataDir, "workspaces.json") }
+
+// registeredByNonAdmin returns the registration root and principal the registry
+// records for workspaceID ("" when an admin or open mode registered it). A registry
+// with no non-admin registration is not decoded at all.
+func registeredByNonAdmin(dataDir, workspaceID string) (registerRoot, principal string) {
+	raw, err := os.ReadFile(workspacesPath(dataDir))
+	if err != nil || !bytes.Contains(raw, []byte(`"register_root"`)) {
+		return "", ""
+	}
+	var items []struct {
+		WorkspaceID  string `json:"workspace_id"`
+		RegisterRoot string `json:"register_root"`
+		RegisteredBy string `json:"registered_by"`
+	}
+	if json.Unmarshal(raw, &items) != nil {
+		return "", ""
+	}
+	for _, it := range items {
+		if it.WorkspaceID == workspaceID {
+			return it.RegisterRoot, it.RegisteredBy
+		}
+	}
+	return "", ""
+}
 
 // saveWorkspaceRecord upserts one record. The registry is one JSON file rewritten
 // whole, so its read-modify-write holds the store lock: without it, concurrent

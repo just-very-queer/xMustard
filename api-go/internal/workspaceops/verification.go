@@ -39,6 +39,12 @@ type workspaceRecord struct {
 	LatestScanAt *string `json:"latest_scan_at"`
 	CreatedAt    *string `json:"created_at,omitempty"`
 	UpdatedAt    *string `json:"updated_at,omitempty"`
+	// RegisterRoot and RegisteredBy are set when a non-admin principal registered
+	// the root under XMUSTARD_REGISTER_ROOTS, and never change afterwards. RootPath
+	// is then fully resolved, and every use of it re-checks the registration
+	// (verifyRegisteredRoot).
+	RegisterRoot string `json:"register_root,omitempty"`
+	RegisteredBy string `json:"registered_by,omitempty"`
 }
 
 type issueRecord struct {

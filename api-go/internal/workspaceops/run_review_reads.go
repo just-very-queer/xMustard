@@ -245,7 +245,7 @@ func RecordFix(dataDir string, workspaceID string, issueID string, request FixRe
 		run = loaded
 	}
 
-	worktree := readWorktreeStatusFromRunOrRepo(run, filepath.Join(dataDir, "workspaces", workspaceID))
+	worktree := readWorktreeStatusFromRunOrRepo(run, dataDir, workspaceID)
 	actor := operatorActor()
 	var sessionID *string
 	if run != nil {
@@ -515,13 +515,11 @@ func nextFixID(workspaceID string, issueID string, ordinal int) string {
 	return "fix_" + strings.ToLower(issueID) + "_" + hex.EncodeToString(digest[:])[:8]
 }
 
-func readWorktreeStatusFromRunOrRepo(run *runRecord, workspaceDir string) *WorktreeStatus {
+func readWorktreeStatusFromRunOrRepo(run *runRecord, dataDir, workspaceID string) *WorktreeStatus {
 	if run != nil && run.Worktree != nil && run.Worktree.Available {
 		return run.Worktree
 	}
-	snapshotPath := filepath.Join(workspaceDir, "snapshot.json")
-	var snapshot workspaceSnapshot
-	if err := readJSON(snapshotPath, &snapshot); err == nil {
+	if snapshot, err := loadSnapshot(dataDir, workspaceID); err == nil {
 		return readWorktreeStatus(snapshot.Workspace.RootPath)
 	}
 	return &WorktreeStatus{Available: false, IsGitRepo: false, DirtyPaths: []string{}}
