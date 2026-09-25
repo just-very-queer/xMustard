@@ -17,7 +17,9 @@ const (
 var validVerdicts = set(VerdictApprove, VerdictReject, VerdictDuplicateOf, VerdictRetract)
 
 // Vote is a principal's latest verdict on one revision. A verdict binds to the
-// revision and the content digest it was cast on.
+// revision and the content digest it was cast on, and to the entry's vote epoch: once
+// a restore starts a new epoch, earlier verdicts stop counting and are no longer listed
+// (the event history keeps them).
 type Vote struct {
 	EntryID        string `json:"entry_id"`
 	Revision       int64  `json:"revision"`
@@ -31,6 +33,7 @@ type Vote struct {
 	ContentDigest  string `json:"content_digest"`
 	SessionID      string `json:"session_id,omitempty"`
 	Ordinal        int64  `json:"ordinal"`
+	Epoch          int64  `json:"epoch,omitempty"`
 	At             string `json:"at"`
 }
 
@@ -45,7 +48,8 @@ type VoteInput struct {
 	EvidenceHandle string
 }
 
-// Tally counts the distinct latest verdicts on one revision.
+// Tally counts the distinct latest verdicts on one revision in the entry's current vote
+// epoch.
 type Tally struct {
 	EntryID  string `json:"entry_id"`
 	Revision int64  `json:"revision"`
@@ -86,15 +90,17 @@ func (r *reader) resolveRevision(ctx context.Context, entryID string, revision i
 	return served, nil
 }
 
-// ListVotes returns the latest verdicts on a revision (0 = served) in cast order.
+// ListVotes returns the latest verdicts on a revision (0 = served) in cast order, from
+// the entry's current vote epoch: the verdicts that count.
 func (r *reader) ListVotes(ctx context.Context, entryID string, revision int64) ([]Vote, error) {
 	rev, err := r.resolveRevision(ctx, entryID, revision)
 	if err != nil {
 		return nil, err
 	}
-	rows, err := r.query(ctx, `SELECT entry_id, revision, principal, principal_owner, principal_kind, verdict, target,
-		note, evidence_handle, content_digest, session_id, ordinal, at
-		FROM votes WHERE entry_id = ? AND revision = ? ORDER BY ordinal, pk`, entryID, rev)
+	rows, err := r.query(ctx, `SELECT v.entry_id, v.revision, v.principal, v.principal_owner, v.principal_kind, v.verdict,
+		v.target, v.note, v.evidence_handle, v.content_digest, v.session_id, v.ordinal, v.epoch, v.at
+		FROM votes v JOIN entries e ON e.id = v.entry_id AND e.vote_epoch = v.epoch
+		WHERE v.entry_id = ? AND v.revision = ? ORDER BY v.ordinal, v.pk`, entryID, rev)
 	if err != nil {
 		return nil, err
 	}
@@ -103,7 +109,7 @@ func (r *reader) ListVotes(ctx context.Context, entryID string, revision int64) 
 	for rows.Next() {
 		var v Vote
 		if err := rows.Scan(&v.EntryID, &v.Revision, &v.Principal, &v.PrincipalOwner, &v.PrincipalKind, &v.Verdict,
-			&v.Target, &v.Note, &v.EvidenceHandle, &v.ContentDigest, &v.SessionID, &v.Ordinal, &v.At); err != nil {
+			&v.Target, &v.Note, &v.EvidenceHandle, &v.ContentDigest, &v.SessionID, &v.Ordinal, &v.Epoch, &v.At); err != nil {
 			return nil, err
 		}
 		out = append(out, v)
@@ -132,7 +138,7 @@ func (r *reader) Tally(ctx context.Context, entryID string, revision int64) (Tal
 		coalesce(sum(v.verdict = 'duplicate_of'), 0)
 		FROM entries e
 		LEFT JOIN revisions rv ON rv.entry_id = e.id AND rv.revision = ?2
-		LEFT JOIN votes v ON v.entry_id = e.id AND v.revision = ?2
+		LEFT JOIN votes v ON v.entry_id = e.id AND v.revision = ?2 AND v.epoch = e.vote_epoch
 		WHERE e.id = ?3`, OpenModeIdentity, rev, entryID).Scan(
 		&tl.Approvals, &tl.Rejections, &tl.PeerApprovals, &tl.PeerRejections, &authorApproved, &openApproved,
 		&tl.Retractions, &tl.Duplicates)
@@ -204,15 +210,15 @@ func (t *txn) RecordVote(ctx context.Context, in VoteInput, actor Actor) (Vote, 
 		return Vote{}, err
 	}
 	if _, err := t.exec(ctx, `INSERT INTO votes (entry_id, revision, principal, principal_key, principal_owner,
-		principal_kind, verdict, target, note, evidence_handle, content_digest, session_id, ordinal, at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		principal_kind, verdict, target, note, evidence_handle, content_digest, session_id, ordinal, epoch, at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (entry_id, revision, principal_key) DO UPDATE SET principal = excluded.principal,
 		principal_owner = excluded.principal_owner, principal_kind = excluded.principal_kind,
 		verdict = excluded.verdict, target = excluded.target, note = excluded.note,
 		evidence_handle = excluded.evidence_handle, content_digest = excluded.content_digest,
-		session_id = excluded.session_id, at = excluded.at`,
+		session_id = excluded.session_id, epoch = excluded.epoch, at = excluded.at`,
 		in.EntryID, rev, principal, key, actor.Owner, actor.Kind, in.Verdict, in.Target, in.Note, in.EvidenceHandle,
-		rv.ContentDigest, actor.SessionID, ordinal, at); err != nil {
+		rv.ContentDigest, actor.SessionID, ordinal, cur.VoteEpoch, at); err != nil {
 		return Vote{}, err
 	}
 	evType := EventVote
@@ -229,6 +235,6 @@ func (t *txn) RecordVote(ctx context.Context, in VoteInput, actor Actor) (Vote, 
 	return Vote{
 		EntryID: in.EntryID, Revision: rev, Principal: principal, PrincipalOwner: actor.Owner, PrincipalKind: actor.Kind,
 		Verdict: in.Verdict, Target: in.Target, Note: in.Note, EvidenceHandle: in.EvidenceHandle,
-		ContentDigest: rv.ContentDigest, SessionID: actor.SessionID, Ordinal: ordinal, At: at,
+		ContentDigest: rv.ContentDigest, SessionID: actor.SessionID, Ordinal: ordinal, Epoch: cur.VoteEpoch, At: at,
 	}, nil
 }

@@ -71,35 +71,38 @@ type Entry struct {
 	Lifecycle             string            `json:"lifecycle"`
 	RequiredVerifications int               `json:"required_verifications"`
 	RequireVerification   bool              `json:"require_verification,omitempty"`
-	Source                string            `json:"source"`
-	SourceOwner           string            `json:"source_owner,omitempty"`
-	SessionID             string            `json:"session_id,omitempty"`
-	AgentID               string            `json:"agent_id,omitempty"`
-	Revision              int64             `json:"revision"`
-	HeadRevision          int64             `json:"head_revision"`
-	ContentDigest         string            `json:"content_digest"`
-	SearchTokens          []string          `json:"search_tokens,omitempty"`
-	CreatedAt             string            `json:"created_at"`
-	UpdatedAt             string            `json:"updated_at"`
-	PromotedAt            string            `json:"promoted_at,omitempty"`
-	ValidFrom             string            `json:"valid_from,omitempty"`
-	ValidFromCommit       string            `json:"valid_from_commit,omitempty"`
-	InvalidatedAt         string            `json:"invalidated_at,omitempty"`
-	InvalidatedCommit     string            `json:"invalidated_commit,omitempty"`
-	ExpiredAt             string            `json:"expired_at,omitempty"`
-	ExpiresAt             string            `json:"expires_at,omitempty"`
-	SupersededBy          string            `json:"superseded_by,omitempty"`
-	MergedInto            string            `json:"merged_into,omitempty"`
-	NeedsReverify         bool              `json:"needs_reverify,omitempty"`
-	StaleSince            string            `json:"stale_since,omitempty"`
-	ProposeHead           string            `json:"propose_head,omitempty"`
-	ProposeBranch         string            `json:"propose_branch,omitempty"`
-	ProposeDirty          *bool             `json:"propose_dirty,omitempty"`
-	PromoteHead           string            `json:"promote_head,omitempty"`
-	PromoteBranch         string            `json:"promote_branch,omitempty"`
-	PromoteDirty          *bool             `json:"promote_dirty,omitempty"`
-	Worktree              string            `json:"worktree,omitempty"`
-	RetentionClass        string            `json:"retention_class"`
+	// VoteEpoch counts restores from retracted, superseded or merged. Only verdicts cast
+	// in the current epoch count toward promotion.
+	VoteEpoch         int64    `json:"vote_epoch,omitempty"`
+	Source            string   `json:"source"`
+	SourceOwner       string   `json:"source_owner,omitempty"`
+	SessionID         string   `json:"session_id,omitempty"`
+	AgentID           string   `json:"agent_id,omitempty"`
+	Revision          int64    `json:"revision"`
+	HeadRevision      int64    `json:"head_revision"`
+	ContentDigest     string   `json:"content_digest"`
+	SearchTokens      []string `json:"search_tokens,omitempty"`
+	CreatedAt         string   `json:"created_at"`
+	UpdatedAt         string   `json:"updated_at"`
+	PromotedAt        string   `json:"promoted_at,omitempty"`
+	ValidFrom         string   `json:"valid_from,omitempty"`
+	ValidFromCommit   string   `json:"valid_from_commit,omitempty"`
+	InvalidatedAt     string   `json:"invalidated_at,omitempty"`
+	InvalidatedCommit string   `json:"invalidated_commit,omitempty"`
+	ExpiredAt         string   `json:"expired_at,omitempty"`
+	ExpiresAt         string   `json:"expires_at,omitempty"`
+	SupersededBy      string   `json:"superseded_by,omitempty"`
+	MergedInto        string   `json:"merged_into,omitempty"`
+	NeedsReverify     bool     `json:"needs_reverify,omitempty"`
+	StaleSince        string   `json:"stale_since,omitempty"`
+	ProposeHead       string   `json:"propose_head,omitempty"`
+	ProposeBranch     string   `json:"propose_branch,omitempty"`
+	ProposeDirty      *bool    `json:"propose_dirty,omitempty"`
+	PromoteHead       string   `json:"promote_head,omitempty"`
+	PromoteBranch     string   `json:"promote_branch,omitempty"`
+	PromoteDirty      *bool    `json:"promote_dirty,omitempty"`
+	Worktree          string   `json:"worktree,omitempty"`
+	RetentionClass    string   `json:"retention_class"`
 	// Cursor orders entries by insertion; pass it as EntryFilter.AfterCursor.
 	Cursor int64 `json:"cursor"`
 }
@@ -173,10 +176,12 @@ type SupersedeInput struct {
 // have their own methods.
 //
 // Restoring (To "active") from retracted, superseded or merged clears the entry's
-// promotion, verification mode and drift baselines, and appends a demote event: the
-// entry was withdrawn as wrong or replaced, so it must be verified again before it is
-// served. Restoring from archived keeps the promotion, because archiving only puts a
-// still-valid memory away.
+// promotion, verification mode and drift baselines, appends a demote event and starts
+// a new vote epoch: the entry was withdrawn as wrong or replaced, so it must be verified
+// again before it is served. Verdicts cast before the restore stay in the event history
+// but no longer count, so peer_verified needs fresh approvals. Restoring from archived
+// keeps the promotion and the votes, because archiving only puts a still-valid memory
+// away.
 type TransitionInput struct {
 	To     string // retracted | archived | merged | active (restore)
 	Target string // merge target
@@ -220,7 +225,7 @@ const entryCols = `e.id, e.workspace_id, e.scope, e.scope_key, e.kind, e.tier, e
 	coalesce(e.promoted_at, ''), coalesce(e.valid_from, ''), e.valid_from_commit, coalesce(e.invalidated_at, ''),
 	e.invalidated_commit, coalesce(e.expired_at, ''), coalesce(e.expires_at, ''), e.superseded_by, e.merged_into,
 	e.needs_reverify, coalesce(e.stale_since, ''), e.propose_head, e.propose_branch, e.propose_dirty,
-	e.promote_head, e.promote_branch, e.promote_dirty, e.worktree, e.retention_class, e.pk`
+	e.promote_head, e.promote_branch, e.promote_dirty, e.worktree, e.retention_class, e.vote_epoch, e.pk`
 
 type scanner interface{ Scan(dest ...any) error }
 
@@ -236,7 +241,7 @@ func scanEntry(s scanner) (Entry, error) {
 		&e.PromotedAt, &e.ValidFrom, &e.ValidFromCommit, &e.InvalidatedAt,
 		&e.InvalidatedCommit, &e.ExpiredAt, &e.ExpiresAt, &e.SupersededBy, &e.MergedInto,
 		&needsReverify, &e.StaleSince, &e.ProposeHead, &e.ProposeBranch, &proposeDirty,
-		&e.PromoteHead, &e.PromoteBranch, &promoteDirty, &e.Worktree, &e.RetentionClass, &e.Cursor)
+		&e.PromoteHead, &e.PromoteBranch, &promoteDirty, &e.Worktree, &e.RetentionClass, &e.VoteEpoch, &e.Cursor)
 	if err != nil {
 		return Entry{}, err
 	}
@@ -685,11 +690,12 @@ func (t *txn) Transition(ctx context.Context, id string, in TransitionInput, act
 				invalidated_commit = '', expired_at = NULL, superseded_by = '', merged_into = '' WHERE id = ?`, now, id)
 			break
 		}
-		// Back from retracted, superseded or merged: nothing verified earlier carries over.
+		// Back from retracted, superseded or merged: nothing verified earlier carries over,
+		// including the votes, which a new epoch leaves behind.
 		if _, err = t.exec(ctx, `UPDATE entries SET lifecycle = 'active', updated_at = ?, invalidated_at = NULL,
 			invalidated_commit = '', expired_at = NULL, superseded_by = '', merged_into = '',
 			status = CASE WHEN status = 'verified' THEN 'pending' ELSE status END, promoted = 0, verification_mode = '',
-			needs_reverify = 0, stale_since = NULL WHERE id = ?`, now, id); err == nil {
+			needs_reverify = 0, stale_since = NULL, vote_epoch = vote_epoch + 1 WHERE id = ?`, now, id); err == nil {
 			err = t.clearBaselines(ctx, id)
 		}
 		t.touch(id)
@@ -714,9 +720,13 @@ func (t *txn) Transition(ctx context.Context, id string, in TransitionInput, act
 	if err != nil {
 		return Entry{}, err
 	}
+	data := map[string]any{"from": cur.Lifecycle, "to": in.To, "target": in.Target}
+	if in.To == LifecycleActive && cur.Lifecycle != LifecycleArchived {
+		data["vote_epoch"] = cur.VoteEpoch + 1
+	}
 	if err := t.appendEvent(ctx, actor, eventRow{
 		WorkspaceID: cur.WorkspaceID, EntryID: id, Type: evType, Revision: cur.Revision, OldDigest: cur.ContentDigest,
-		Note: in.Reason, Data: map[string]any{"from": cur.Lifecycle, "to": in.To, "target": in.Target},
+		Note: in.Reason, Data: data,
 	}); err != nil {
 		return Entry{}, err
 	}

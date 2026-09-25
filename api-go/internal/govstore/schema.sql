@@ -42,6 +42,9 @@ CREATE TABLE entries (
   lifecycle              TEXT NOT NULL DEFAULT 'active'
                            CHECK (lifecycle IN ('active', 'superseded', 'retracted', 'merged', 'archived', 'purged')),
   required_verifications INTEGER NOT NULL DEFAULT 2 CHECK (required_verifications >= 1),
+  -- Only votes cast in the current epoch count. Restoring an entry from retracted,
+  -- superseded or merged starts a new epoch, so it must be verified again.
+  vote_epoch             INTEGER NOT NULL DEFAULT 0 CHECK (vote_epoch >= 0),
   require_verification   INTEGER NOT NULL DEFAULT 0 CHECK (require_verification IN (0, 1)),
   source                 TEXT NOT NULL,
   source_key             TEXT NOT NULL CHECK (source_key <> ''),
@@ -174,15 +177,18 @@ CREATE TABLE votes (
   content_digest  TEXT NOT NULL,
   session_id      TEXT NOT NULL DEFAULT '',
   ordinal         INTEGER NOT NULL,
+  -- The entry's vote_epoch when the verdict was cast; a verdict from an earlier epoch
+  -- no longer counts.
+  epoch           INTEGER NOT NULL DEFAULT 0,
   at              TEXT NOT NULL,
   UNIQUE (entry_id, revision, principal_key)
 ) STRICT;
 
 -- Defense in depth for the core governance invariant: an entry can only be labelled
--- peer_verified when enough distinct principals approved the revision it serves, not
--- counting the entry's author, the author of that revision (an editor cannot verify
--- their own edit) or the open-mode identity. The Go layer re-checks entries whose
--- votes changed before every commit.
+-- peer_verified when enough distinct principals approved the revision it serves in the
+-- current vote epoch, not counting the entry's author, the author of that revision (an
+-- editor cannot verify their own edit) or the open-mode identity. The Go layer
+-- re-checks entries whose votes changed before every commit.
 CREATE TRIGGER entries_peer_verified_insert BEFORE INSERT ON entries
 WHEN NEW.verification_mode = 'peer_verified'
 BEGIN
@@ -190,10 +196,11 @@ BEGIN
 END;
 
 CREATE TRIGGER entries_peer_verified_update
-BEFORE UPDATE OF verification_mode, revision, promoted, source_key, required_verifications ON entries
+BEFORE UPDATE OF verification_mode, revision, promoted, source_key, required_verifications, vote_epoch ON entries
 WHEN NEW.verification_mode = 'peer_verified'
   AND (SELECT count(*) FROM votes v
         WHERE v.entry_id = NEW.id AND v.revision = NEW.revision AND v.verdict = 'approve'
+          AND v.epoch = NEW.vote_epoch
           AND v.principal_key <> NEW.source_key AND v.principal_key <> 'anonymous'
           AND v.principal_key NOT IN (SELECT r.author_key FROM revisions r
                                        WHERE r.entry_id = NEW.id AND r.revision = NEW.revision)) < NEW.required_verifications

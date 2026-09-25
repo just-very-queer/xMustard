@@ -824,6 +824,119 @@ func TestRestoreKeepsPromotionOnlyFromArchive(t *testing.T) {
 	}
 }
 
+// Restoring a retracted, superseded or merged entry starts a new vote epoch: the
+// approvals cast before the restore stop counting, so nobody can re-promote the entry
+// as peer_verified from them, and a Tally-driven reconcile sees no peer approvals.
+func TestRestoreNeedsFreshApprovals(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t, newClock())
+	dave := Actor{Principal: "dave"}
+	peer := Promotion{Status: StatusVerified, Promoted: true, VerificationMode: ModePeerVerified}
+	setPeer := func(id string) error {
+		return s.Update(ctx, func(tx Tx) error {
+			_, err := tx.SetPromotion(ctx, id, peer, dave)
+			return err
+		})
+	}
+	for _, c := range []struct{ id, to, target string }{
+		{"retr", LifecycleRetracted, ""},
+		{"merg", LifecycleMerged, "keep"},
+		{"supd", "", "keep"}, // superseded through Supersede
+	} {
+		t.Run(c.id, func(t *testing.T) {
+			if c.target != "" {
+				if _, err := s.GetEntry(ctx, c.target); isNotFound(err) {
+					propose(t, s, c.target, "keeper", "the keeper", "docs/keep.md")
+					vote(t, s, c.target, bob, VerdictApprove)
+					vote(t, s, c.target, carol, VerdictApprove)
+					promotePeer(t, s, c.target) // a superseding entry must be served
+				}
+			}
+			propose(t, s, c.id, "t "+c.id, "fact "+c.id, "docs/"+c.id+".md")
+			vote(t, s, c.id, bob, VerdictApprove)
+			vote(t, s, c.id, carol, VerdictApprove)
+			promotePeer(t, s, c.id)
+			mustUpdate(t, s, func(tx Tx) error {
+				if c.to == "" {
+					return tx.Supersede(ctx, SupersedeInput{NewID: c.target, OldIDs: []string{c.id}}, carol)
+				}
+				_, err := tx.Transition(ctx, c.id, TransitionInput{To: c.to, Target: c.target}, carol)
+				return err
+			})
+			mustUpdate(t, s, func(tx Tx) error {
+				_, err := tx.Transition(ctx, c.id, TransitionInput{To: LifecycleActive}, alice)
+				return err
+			})
+			e, _ := s.GetEntry(ctx, c.id)
+			if e.Promoted || e.VerificationMode != "" || e.VoteEpoch != 1 {
+				t.Fatalf("restored = %+v", e)
+			}
+			if tl, err := s.Tally(ctx, c.id, 0); err != nil || tl.PeerApprovals != 0 || tl.Approvals != 0 {
+				t.Fatalf("tally after restore = %+v, %v", tl, err)
+			}
+			if votes, err := s.ListVotes(ctx, c.id, 0); err != nil || len(votes) != 0 {
+				t.Fatalf("votes after restore = %+v, %v", votes, err)
+			}
+			// The earlier approvals cannot carry a re-promotion...
+			if err := setPeer(c.id); !errors.Is(err, ErrInvariant) {
+				t.Fatalf("re-promotion from pre-restore approvals: %v", err)
+			}
+			// ...not even written straight to the table: the trigger counts the epoch too.
+			if _, err := s.writer.ExecContext(ctx, `UPDATE entries SET status = 'verified', promoted = 1,
+				verification_mode = 'peer_verified' WHERE id = ?`, c.id); err == nil || !strings.Contains(err.Error(), "peer_verified") {
+				t.Fatalf("raw peer_verified label after restore: %v", err)
+			}
+			// One fresh approval is not enough; two are.
+			vote(t, s, c.id, bob, VerdictApprove)
+			if err := setPeer(c.id); !errors.Is(err, ErrInvariant) {
+				t.Fatalf("promotion with one fresh approval: %v", err)
+			}
+			vote(t, s, c.id, carol, VerdictApprove)
+			if err := setPeer(c.id); err != nil {
+				t.Fatalf("promotion after fresh approvals: %v", err)
+			}
+			votes, _ := s.ListVotes(ctx, c.id, 0)
+			if len(votes) != 2 || votes[0].Epoch != 1 || votes[1].Epoch != 1 {
+				t.Fatalf("fresh votes = %+v", votes)
+			}
+			// The event history still holds the pre-restore verdicts and the epoch change.
+			evs, err := s.ListEvents(ctx, EventFilter{EntryID: c.id, Limit: 100})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var votesSeen, epochMarked int
+			for _, ev := range evs {
+				if ev.Type == EventVote {
+					votesSeen++
+				}
+				if strings.Contains(string(ev.Data), `"vote_epoch":1`) {
+					epochMarked++
+				}
+			}
+			if votesSeen != 4 || epochMarked != 1 {
+				t.Fatalf("history: %d vote events, %d epoch marks", votesSeen, epochMarked)
+			}
+		})
+	}
+	// Archiving keeps the epoch and the approvals.
+	propose(t, s, "arch2", "t", "fact arch2", "docs/arch2.md")
+	vote(t, s, "arch2", bob, VerdictApprove)
+	vote(t, s, "arch2", carol, VerdictApprove)
+	promotePeer(t, s, "arch2")
+	for _, to := range []string{LifecycleArchived, LifecycleActive} {
+		mustUpdate(t, s, func(tx Tx) error {
+			_, err := tx.Transition(ctx, "arch2", TransitionInput{To: to}, alice)
+			return err
+		})
+	}
+	if e, _ := s.GetEntry(ctx, "arch2"); e.VoteEpoch != 0 || e.VerificationMode != ModePeerVerified {
+		t.Fatalf("archive round trip = %+v", e)
+	}
+	if tl, _ := s.Tally(ctx, "arch2", 0); tl.PeerApprovals != 2 {
+		t.Fatalf("archive round trip tally = %+v", tl)
+	}
+}
+
 func TestLifecycleSupersedeRetractMergeExpiryPurge(t *testing.T) {
 	ctx := context.Background()
 	clk := newClock()
@@ -890,7 +1003,10 @@ func TestLifecycleSupersedeRetractMergeExpiryPurge(t *testing.T) {
 		evs[0].Type != EventRestore || evs[1].Type != EventDemote {
 		t.Fatalf("restore events = %+v", evs)
 	}
-	promotePeer(t, s, "old") // bob's and carol's approvals of revision 1 still stand
+	// The approvals from before the supersession no longer count: fresh ones are needed.
+	vote(t, s, "old", bob, VerdictApprove)
+	vote(t, s, "old", carol, VerdictApprove)
+	promotePeer(t, s, "old")
 	if err := s.Update(ctx, func(tx Tx) error {
 		_, err := tx.Transition(ctx, "old", TransitionInput{To: LifecyclePurged}, carol)
 		return err

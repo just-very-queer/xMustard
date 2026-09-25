@@ -19,7 +19,9 @@
 //   - Some invariants hold whatever policy a caller applies. Changing the served
 //     revision clears promotion. An entry is labelled peer_verified only while enough
 //     distinct principals approve the revision it serves, not counting the entry's
-//     author, that revision's author or the open-mode identity.
+//     author, that revision's author or the open-mode identity. Restoring a retracted,
+//     superseded or merged entry starts a new vote epoch, and verdicts cast before it
+//     stop counting.
 //
 // Governance policy (thresholds, open mode, roles) stays with the caller. The store
 // provides transactional primitives: a caller reads, decides and writes inside one
@@ -747,11 +749,12 @@ func (t *txn) touch(entryID string) {
 }
 
 // peerShortfall matches a peer_verified entry whose served revision lacks enough
-// approvals from principals other than the entry's author, the revision's author and
-// the open-mode identity (the same rule as the entries_peer_verified_update trigger).
+// approvals, cast in the entry's current vote epoch, from principals other than the
+// entry's author, the revision's author and the open-mode identity (the same rule as
+// the entries_peer_verified_update trigger).
 const peerShortfall = `e.verification_mode = 'peer_verified'
 	AND (SELECT count(*) FROM votes v
-	      WHERE v.entry_id = e.id AND v.revision = e.revision AND v.verdict = 'approve'
+	      WHERE v.entry_id = e.id AND v.revision = e.revision AND v.verdict = 'approve' AND v.epoch = e.vote_epoch
 	        AND v.principal_key <> e.source_key AND v.principal_key <> ?
 	        AND v.principal_key NOT IN (SELECT r.author_key FROM revisions r
 	                                     WHERE r.entry_id = e.id AND r.revision = e.revision)) < e.required_verifications`
