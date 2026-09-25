@@ -221,6 +221,96 @@ pub fn tokenize_into(text: &str, out: &mut String) {
     }
 }
 
+/// Like `tokenize_into`, but credential-shaped words (see `is_secret_like`) are left out
+/// together with their subtokens.
+pub fn tokenize_without_secrets(text: &str, out: &mut String) {
+    for word in text.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
+        if !is_secret_like(word) {
+            push_word_tokens(word, out);
+        }
+    }
+}
+
+/// A heuristic for credential-shaped words in chunk text (not a redaction guarantee;
+/// PAR-SEC-04 owns the full pattern set): AWS access key ids, common token prefixes
+/// (`ghp_`, `github_pat_`, `xoxb`, `sk_live_`...) and long random-looking runs that mix
+/// letters and digits (API keys, hex digests, base64 segments).
+pub fn is_secret_like(word: &str) -> bool {
+    let b = word.as_bytes();
+    if b.len() == 20
+        && (word.starts_with("AKIA") || word.starts_with("ASIA"))
+        && b.iter()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+    {
+        return true;
+    }
+    const PREFIXES: &[&str] = &[
+        "ghp_",
+        "gho_",
+        "ghu_",
+        "ghs_",
+        "ghr_",
+        "github_pat_",
+        "xoxb",
+        "xoxp",
+        "xoxa",
+        "xoxs",
+        "sk_live_",
+        "sk_test_",
+        "rk_live_",
+        "pk_live_",
+        "npm_",
+        "pypi_",
+        "hf_",
+    ];
+    if b.len() >= 16 && PREFIXES.iter().any(|p| word.starts_with(p)) {
+        return true;
+    }
+    if b.len() < 20 {
+        return false;
+    }
+    let digits = b.iter().filter(|c| c.is_ascii_digit()).count();
+    let letters = b.iter().filter(|c| c.is_ascii_alphabetic()).count();
+    if digits < 3 || letters < 3 {
+        return false;
+    }
+    let transitions = b
+        .windows(2)
+        .filter(|w| w[0].is_ascii_digit() != w[1].is_ascii_digit())
+        .count();
+    if transitions < 4 {
+        return false;
+    }
+    let mut freq = [0u32; 256];
+    for c in b {
+        freq[*c as usize] += 1;
+    }
+    let n = b.len() as f64;
+    let entropy: f64 = freq
+        .iter()
+        .filter(|f| **f > 0)
+        .map(|f| {
+            let p = *f as f64 / n;
+            -p * p.log2()
+        })
+        .sum();
+    entropy >= 3.0
+}
+
+/// The postings of a chunk as an unordered bag: the tokens sorted, with repeats kept so
+/// BM25 term frequencies and lengths are unchanged. FTS5 still records positions, but
+/// they no longer follow the source, so the text cannot be read back from the index.
+pub fn unordered(tokens: &str) -> String {
+    let mut v: Vec<&str> = tokens.split(' ').filter(|t| !t.is_empty()).collect();
+    v.sort_unstable();
+    let mut out = String::with_capacity(tokens.len());
+    for t in v {
+        out.push_str(t);
+        out.push(' ');
+    }
+    out
+}
+
 /// Tokens of a repository path: its segments, the stem and the extension.
 pub fn path_tokens(path: &str) -> String {
     let mut out = String::new();
@@ -261,6 +351,31 @@ mod tests {
         let mut out = String::new();
         tokenize_into("let x = parseConfig(42);", &mut out);
         assert_eq!(out, "let x parseconfig parse config ");
+    }
+
+    #[test]
+    fn secret_shaped_words_are_recognized() {
+        for w in [
+            "zq9xk2lmvbp7wr4tnd8hs3fy6gc1ej5a",
+            "AKIAIOSFODNN7EXAMPLE",
+            "ghp_16C7e42F292c6912E7710c838347Ae178B4a",
+            "ce013625030ba8dba906f756967f9e9ca394464a",
+        ] {
+            assert!(is_secret_like(w), "{w}");
+        }
+        for w in [
+            "parseConfigFileFromDisk2",
+            "renderWidget",
+            "HTTPServer2Handler",
+            "MAX_SYMBOLS_PER_FILE",
+            "sha256",
+        ] {
+            assert!(!is_secret_like(w), "{w}");
+        }
+        let mut out = String::new();
+        tokenize_without_secrets("token = zq9xk2lmvbp7wr4tnd8hs3fy6gc1ej5a; ok", &mut out);
+        assert_eq!(out, "token ok ");
+        assert_eq!(unordered("b a c a "), "a a b c ");
     }
 
     #[test]

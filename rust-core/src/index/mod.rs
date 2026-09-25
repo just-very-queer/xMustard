@@ -6,15 +6,25 @@
 //! or string literals), imports, function-aligned chunks with contentless FTS5 postings,
 //! lexical file edges, the content-addressed per-file fact cache and meta.
 //!
-//! The worker streams one file at a time on one thread: read, parse, extract, drop the
-//! tree, write the rows in batched transactions. A full build writes a fresh file and
-//! swaps it in; an incremental update rewrites only changed files in place under the
-//! `incremental_in_progress` dirty flag and re-resolves edges only for changed files
-//! and the files that name a declaration whose definer changed (PAR-FRESH-04). A leftover
-//! dirty flag, a schema, analyzer or configuration change, or a write set above 50% of
-//! the files and at least 50 files forces a full rebuild. The declared scale envelope
-//! (PAR-RT-09) bounds files, bytes and symbols; beyond it the index is partial and says
-//! so in `coverage`, never by growing the worker.
+//! The worker takes the index lock, then scans and streams one file at a time on one
+//! thread: read, parse, extract, drop the tree, write the rows in batched transactions.
+//! A full build writes a fresh file, fsyncs it and swaps it in; an incremental update
+//! rewrites only changed files in place under the `incremental_in_progress` dirty flag
+//! and re-resolves edges only for changed files and the files that name a declaration
+//! whose definer changed (PAR-FRESH-04). A leftover dirty flag, a schema, analyzer or
+//! configuration change, a corrupt store, or a write set above 50% of the files and at
+//! least 50 files forces a full rebuild.
+//!
+//! The declared scale envelope (PAR-RT-09) bounds files, bytes and symbols; beyond it
+//! the index is partial and says so in `coverage`, never by growing the worker. Which
+//! files and symbols are kept is a pure function of the tree in path order (see
+//! `scan` for files and bytes, `plan_symbol_budget` for symbols), so an index past the
+//! envelope still exits early when nothing changed and updates the rest incrementally.
+//!
+//! Readers: the full build renames a new file over `index.db` (after removing the old
+//! WAL and SHM by name). A reader that keeps a connection open across a rebuild keeps
+//! reading the old, unlinked file; long-lived readers (WS-14) must reopen when `meta`
+//! `generation` changes, and must never write. Every writer holds the index lock.
 //!
 //! No consumer reads this store yet; WS-14 switches the query side to it.
 
@@ -31,7 +41,7 @@ pub mod schema;
 pub mod uid;
 pub mod writer;
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
@@ -55,6 +65,10 @@ pub const ESCALATE_MIN_FILES: usize = 50;
 /// Unreferenced fact-cache entries kept at least (superseded versions, for reverts and
 /// branch switches).
 const FACT_CACHE_KEEP_MIN: i64 = 256;
+/// Prefix of stored stat keys taken inside the racy window (see `stat_key_for`).
+const RACY_PREFIX: &str = "racy:";
+/// Prefix of store errors that mean the file is damaged (a full rebuild replaces it).
+const CORRUPT_ERROR: &str = "index store corrupt";
 
 /// Analyzer identity: extraction rules and grammar versions. A change forces a full
 /// rebuild and invalidates the fact cache.
@@ -75,6 +89,8 @@ pub struct Counters {
     /// Files whose rows were (re)written.
     pub written: usize,
     pub deleted: usize,
+    /// Unchanged files rewritten because the symbol-budget boundary moved over them.
+    pub rebudgeted: usize,
     /// Files whose outgoing edges were recomputed.
     pub reresolved: usize,
     /// The update's write set crossed the escalation gate and ran as a full rebuild.
@@ -97,8 +113,8 @@ pub struct IndexReport {
     /// `full` | `incremental` | `noop`
     pub mode: String,
     /// Why this mode ran: `requested`, `no_index`, `schema_changed`, `analyzer_changed`,
-    /// `retention_changed`, `config_changed`, `dirty_flag`, `escalated`, `envelope`,
-    /// `unreadable_index`, `changes` or `unchanged`.
+    /// `retention_changed`, `config_changed`, `dirty_flag`, `escalated`,
+    /// `unreadable_index`, `corrupt_index`, `changes` or `unchanged`.
     pub reason: String,
     pub root: String,
     pub index_path: String,
@@ -114,7 +130,33 @@ pub struct IndexReport {
     pub timing: Timing,
 }
 
-/// The directory holding `index.db` for a scan's root.
+/// Per-user cache directory for indexes of non-Git directories: `$XDG_CACHE_HOME`,
+/// `~/Library/Caches` (macOS) or `~/.cache`; never the shared temp directory unless no
+/// home is known, and then a per-user subdirectory of it.
+fn user_cache_dir() -> PathBuf {
+    let env = |k: &str| {
+        std::env::var_os(k)
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+    };
+    if let Some(x) = env("XDG_CACHE_HOME") {
+        return x;
+    }
+    if let Some(home) = env("HOME") {
+        return if cfg!(target_os = "macos") {
+            home.join("Library").join("Caches")
+        } else {
+            home.join(".cache")
+        };
+    }
+    #[cfg(unix)]
+    let who = rustix::process::geteuid().as_raw().to_string();
+    #[cfg(not(unix))]
+    let who = "user".to_string();
+    std::env::temp_dir().join(format!("xmustard-{who}"))
+}
+
+/// The directory holding `index.db` for an index root.
 pub fn index_dir(root: &Path, git_dir: Option<&Path>, cfg: &IndexConfig) -> PathBuf {
     if let Some(d) = &cfg.index_dir {
         return d.clone();
@@ -126,10 +168,59 @@ pub fn index_dir(root: &Path, git_dir: Option<&Path>, cfg: &IndexConfig) -> Path
     let scope = format!("{:x}", h.finalize())[..32].to_string();
     match git_dir {
         Some(g) => g.join("xmustard-cache").join(INDEX_DIR_NAME).join(scope),
-        None => std::env::temp_dir()
-            .join(format!("xmustard-{INDEX_DIR_NAME}"))
+        None => user_cache_dir()
+            .join("xmustard")
+            .join(INDEX_DIR_NAME)
             .join(scope),
     }
+}
+
+/// Create `dir` (and missing parents) readable by its owner only, and refuse a
+/// directory that is a symlink or belongs to another user: the index holds identifiers
+/// and postings of the source, and with `full` retention the source itself.
+fn ensure_private_dir(dir: &Path) -> Result<(), String> {
+    let err = |e: std::io::Error| format!("{}: {e}", dir.display());
+    let mut b = fs::DirBuilder::new();
+    b.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        b.mode(0o700);
+    }
+    b.create(dir).map_err(err)?;
+    let meta = fs::symlink_metadata(dir).map_err(err)?;
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        return Err(format!(
+            "{}: index directory is not a plain directory",
+            dir.display()
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if meta.uid() != rustix::process::geteuid().as_raw() {
+            return Err(format!(
+                "{}: index directory belongs to another user",
+                dir.display()
+            ));
+        }
+        if meta.mode() & 0o077 != 0 {
+            fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).map_err(err)?;
+        }
+    }
+    Ok(())
+}
+
+/// Open (creating when missing) a file of the index directory with owner-only access.
+fn open_private_file(path: &Path, truncate: bool) -> Result<fs::File, String> {
+    let mut o = fs::OpenOptions::new();
+    o.create(true).write(true).truncate(truncate);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.mode(0o600);
+    }
+    o.open(path).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// Advisory lock serializing index writers of one directory across processes.
@@ -138,14 +229,9 @@ struct IndexLock {
 }
 
 fn lock(dir: &Path) -> Result<IndexLock, String> {
-    fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    ensure_private_dir(dir)?;
     let path = dir.join("index.lock");
-    let file = fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&path)
-        .map_err(|e| format!("{}: {e}", path.display()))?;
+    let file = open_private_file(&path, false)?;
     let start = Instant::now();
     let timeout = crate::indexcache::lock_timeout();
     loop {
@@ -166,8 +252,23 @@ fn lock(dir: &Path) -> Result<IndexLock, String> {
     }
 }
 
+fn is_corrupt(e: &rusqlite::Error) -> bool {
+    matches!(
+        e,
+        rusqlite::Error::SqliteFailure(f, _)
+            if matches!(
+                f.code,
+                rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase
+            )
+    )
+}
+
 fn sql_err(e: rusqlite::Error) -> String {
-    format!("index store: {e}")
+    if is_corrupt(&e) {
+        format!("{CORRUPT_ERROR}: {e}")
+    } else {
+        format!("index store: {e}")
+    }
 }
 
 /// Facts by content key: the new store first, then (full builds) the previous index.
@@ -223,14 +324,6 @@ impl FactCache<'_> {
     }
 }
 
-/// Running totals for the envelope.
-#[derive(Default)]
-struct Totals {
-    files_indexed: usize,
-    bytes: u64,
-    symbols: usize,
-}
-
 struct Processed {
     rec: FileRecord,
     facts: Option<FileFacts>,
@@ -239,13 +332,13 @@ struct Processed {
 
 /// The stat key stored for a file scanned at `started_ns`. A file modified within the
 /// second before the scan may be modified again without changing its timestamp on a
-/// coarse filesystem (Git's "racily clean" case), so its key is marked racy and never
-/// matches: the next update hashes it and stores a trusted key once the content is
-/// confirmed.
+/// coarse filesystem (Git's "racily clean" case), so its key is marked racy and is never
+/// trusted: the next update hashes the file, and stores a trusted key once its mtime is
+/// safely in the past.
 fn stat_key_for(stat: &scan::StatKey, started_ns: i64) -> String {
     const RACY_WINDOW_NS: i64 = 1_000_000_000;
     if stat.mtime_ns >= started_ns - RACY_WINDOW_NS {
-        format!("racy:{}", stat.encode())
+        format!("{RACY_PREFIX}{}", stat.encode())
     } else {
         stat.encode()
     }
@@ -266,6 +359,7 @@ fn record_for(cand: &Candidate, started_ns: i64) -> FileRecord {
         content_hash: String::new(),
         parse_status: String::new(),
         flags: 0,
+        fact_symbols: 0,
     }
 }
 
@@ -279,15 +373,25 @@ fn strip_symbols(f: &mut FileFacts) {
     }
 }
 
-/// Read, identify and extract one candidate, applying the envelope. The file's tree and
-/// text are dropped before this returns; only its facts and bytes go to the writer.
+/// Apply the symbol-budget decision to a processed file.
+fn apply_budget(p: &mut Processed, keep: bool) {
+    if let Some(f) = p.facts.as_mut()
+        && !keep
+    {
+        strip_symbols(f);
+        p.rec.flags |= file_flag::SYMBOL_BUDGET;
+    }
+}
+
+/// Read, identify and extract one candidate. The file's tree and text are dropped
+/// before this returns; only its facts and bytes go to the writer. `rec.fact_symbols`
+/// is the extracted symbol count (the budget is applied by the caller).
 fn process(
     root: &Path,
     started_ns: i64,
     cand: &Candidate,
     cfg: &IndexConfig,
     cache: &FactCache<'_>,
-    totals: &mut Totals,
     counters: &mut Counters,
 ) -> Result<Processed, String> {
     let mut rec = record_for(cand, started_ns);
@@ -298,19 +402,6 @@ fn process(
     };
     if let Some(loss) = cand.loss {
         rec.parse_status = loss.into();
-        return Ok(none(rec));
-    }
-    if totals.files_indexed >= cfg.max_files {
-        rec.parse_status = "envelope_files".into();
-        return Ok(none(rec));
-    }
-    // the scan's stat (taken before this read) is what `rec` records.
-    if cand.stat.size > cfg.max_file_size {
-        rec.parse_status = "oversized".into();
-        return Ok(none(rec));
-    }
-    if totals.bytes + cand.stat.size > cfg.max_total_bytes {
-        rec.parse_status = "envelope_bytes".into();
         return Ok(none(rec));
     }
     let bytes = match crate::symbolgraph::read_source_beneath(
@@ -326,16 +417,15 @@ fn process(
     };
     counters.bytes_read += bytes.len() as u64;
     rec.content_hash = scan::blob_id(&bytes);
-    let mode = extract::extraction_mode(cand.lang, bytes.len(), cfg.max_parse_bytes);
-    let key = format!("{}:{}:{mode}", rec.content_hash, cand.lang.name());
-    let len = bytes.len() as u64;
     // Facts, chunk ranges and postings all refer to the decoded text: for invalid UTF-8
     // that is the lossy decoding, so the writer slices the same bytes extraction saw.
     let (text, invalid) = match String::from_utf8(bytes) {
         Ok(t) => (t, false),
         Err(e) => (String::from_utf8_lossy(e.as_bytes()).into_owned(), true),
     };
-    let mut facts = match cache.get(&key).map_err(sql_err)? {
+    let mode = extract::extraction_mode(cand.lang, text.as_bytes(), cfg.max_parse_bytes);
+    let key = format!("{}:{}:{mode}", rec.content_hash, cand.lang.name());
+    let facts = match cache.get(&key).map_err(sql_err)? {
         Some(f) => {
             counters.reused_from_cache += 1;
             f
@@ -347,15 +437,8 @@ fn process(
             f
         }
     };
-    totals.files_indexed += 1;
-    totals.bytes += len;
-    if totals.symbols + facts.symbols.len() > cfg.max_symbols {
-        strip_symbols(&mut facts);
-        rec.flags |= file_flag::SYMBOL_BUDGET;
-    } else {
-        totals.symbols += facts.symbols.len();
-    }
     rec.parse_status = facts.engine.clone();
+    rec.fact_symbols = facts.symbols.len() as i64;
     Ok(Processed {
         rec,
         facts: Some(facts),
@@ -378,13 +461,34 @@ fn set_meta_common(
     meta::set(conn, "analyzer_version", &analyzer_version())?;
     meta::set(conn, "content_retention", cfg.content_retention.as_str())?;
     meta::set(conn, "config", &cfg.eligibility_fingerprint())?;
-    meta::set(conn, "last_commit", &scan.head)?;
     meta::set(conn, "repo_mode", scan.repo_mode)?;
     meta::set(conn, "root", &scan.root.to_string_lossy())?;
-    meta::set(conn, "ignored_files", &scan.ignored.to_string())?;
-    meta::set(conn, "invalid_paths", &scan.invalid_paths.to_string())?;
-    meta::set(conn, "worktree_deleted", &scan.worktree_deleted.to_string())?;
     meta::set(conn, "generation", &generation.to_string())?;
+    set_scan_meta(conn, scan)?;
+    Ok(())
+}
+
+/// Meta derived from the scan alone (files without rows, the ignore outcome, HEAD).
+/// Written only when it differs, so a no-change update writes nothing.
+fn set_scan_meta(conn: &Connection, scan: &Scan) -> rusqlite::Result<()> {
+    let beyond = serde_json::to_string(&scan.beyond).unwrap_or_default();
+    let sample = serde_json::to_string(&scan.beyond_sample).unwrap_or_default();
+    for (k, v) in [
+        ("last_commit", scan.head.clone()),
+        ("ignored_files", scan.ignored.to_string()),
+        (
+            "ignore_rules_dropped",
+            scan.ignore_rules_dropped.to_string(),
+        ),
+        ("invalid_paths", scan.invalid_paths.to_string()),
+        ("worktree_deleted", scan.worktree_deleted.to_string()),
+        (meta::BEYOND, beyond),
+        (meta::BEYOND_SAMPLE, sample),
+    ] {
+        if meta::get(conn, k)?.as_deref() != Some(v.as_str()) {
+            meta::set(conn, k, &v)?;
+        }
+    }
     Ok(())
 }
 
@@ -433,15 +537,23 @@ fn report(
     }
 }
 
+/// Resolve the index directory and take its lock, then scan: a writer that waited for
+/// the lock scans the tree as it is after the previous writer finished.
+fn locked_scan(root: &Path, cfg: &IndexConfig) -> Result<(Scan, PathBuf, IndexLock, u64), String> {
+    let layout = scan::layout(root, cfg)?;
+    let dir = index_dir(&layout.root, layout.git_dir.as_deref(), cfg);
+    let lock = lock(&dir)?;
+    let t = Instant::now();
+    let scan = scan::scan(&layout, cfg)?;
+    Ok((scan, dir, lock, t.elapsed().as_millis() as u64))
+}
+
 /// `index build`: a full rebuild into a fresh file, swapped in atomically.
 pub fn build(root: &Path, cfg: &IndexConfig) -> Result<IndexReport, String> {
     let t0 = Instant::now();
-    let scan = scan::scan(root, cfg)?;
-    let scan_ms = t0.elapsed().as_millis() as u64;
-    let dir = index_dir(&scan.root, scan.git_dir.as_deref(), cfg);
-    let _lock = lock(&dir)?;
+    let (scan, dir, _lock, scan_ms) = locked_scan(root, cfg)?;
     full_build(
-        &scan,
+        scan,
         cfg,
         &dir,
         "build",
@@ -474,7 +586,7 @@ fn sweep_stale_builds(dir: &Path) {
 
 #[allow(clippy::too_many_arguments)]
 fn full_build(
-    scan: &Scan,
+    mut scan: Scan,
     cfg: &IndexConfig,
     dir: &Path,
     command: &str,
@@ -487,6 +599,8 @@ fn full_build(
     let final_path = dir.join(DB_FILE);
     let tmp_path = dir.join(format!("{DB_FILE}.building-{}", std::process::id()));
     let _ = fs::remove_file(&tmp_path);
+    // owner-only from the start: SQLite gives the WAL and SHM the database file's mode.
+    drop(open_private_file(&tmp_path, true)?);
     let old = if cfg.use_fact_cache {
         open_compatible(&final_path, cfg)
     } else {
@@ -511,19 +625,27 @@ fn full_build(
             reuse: cfg.use_fact_cache,
         };
         let mut w = Writer::new(&conn, cfg.content_retention).map_err(sql_err)?;
-        let mut totals = Totals::default();
+        // the symbol budget in path order (the same rule as `plan_symbol_budget`).
+        let mut symbols = 0usize;
         conn.execute_batch("BEGIN").map_err(sql_err)?;
         for (i, cand) in scan.candidates.iter().enumerate() {
             counters.files_scanned += 1;
-            let p = process(
+            let mut p = process(
                 &scan.root,
                 scan.started_ns,
                 cand,
                 cfg,
                 &cache,
-                &mut totals,
                 &mut counters,
             )?;
+            if p.facts.is_some() {
+                let n = p.rec.fact_symbols as usize;
+                let keep = symbols + n <= cfg.max_symbols;
+                if keep {
+                    symbols += n;
+                }
+                apply_budget(&mut p, keep);
+            }
             w.write_file(None, &p.rec, p.facts.as_ref(), p.bytes.as_deref())
                 .map_err(sql_err)?;
             counters.written += 1;
@@ -533,7 +655,11 @@ fn full_build(
             }
         }
         conn.execute_batch("COMMIT").map_err(sql_err)?;
+        // the edge and FTS merge phases set the build's peak: free what the file loop
+        // no longer needs first.
         drop(old);
+        drop(w);
+        scan.candidates = Vec::new();
         schema::create_indexes(&conn).map_err(sql_err)?;
         let te = Instant::now();
         conn.execute_batch("BEGIN").map_err(sql_err)?;
@@ -550,7 +676,7 @@ fn full_build(
         counters.reresolved = files.len();
         drop(defs);
         edges_ms = te.elapsed().as_millis() as u64;
-        set_meta_common(&conn, scan, cfg, generation).map_err(sql_err)?;
+        set_meta_common(&conn, &scan, cfg, generation).map_err(sql_err)?;
         meta::set(&conn, meta::DIRTY_FLAG, "0").map_err(sql_err)?;
         coverage = meta::coverage(&conn, cfg).map_err(sql_err)?;
         meta::set(
@@ -573,6 +699,11 @@ fn full_build(
             .map_err(sql_err)?;
         conn.close().map_err(|(_, e)| sql_err(e))?;
     }
+    // The bulk load ran without journal or fsync: make the file durable before the
+    // rename can publish it (sync_all is F_FULLFSYNC on macOS).
+    fs::File::open(&tmp_path)
+        .and_then(|f| f.sync_all())
+        .map_err(|e| format!("sync {}: {e}", tmp_path.display()))?;
     swap_into_place(&tmp_path, &final_path)?;
     let timing = Timing {
         elapsed_ms: t0.elapsed().as_millis() as u64,
@@ -581,7 +712,7 @@ fn full_build(
     };
     Ok(report(
         (command, "full", reason),
-        scan,
+        &scan,
         dir,
         cfg,
         counters,
@@ -590,8 +721,9 @@ fn full_build(
     ))
 }
 
-/// Replace `final_path` with the finished build. The previous file is checkpointed and
-/// its WAL/SHM removed first, so the new file never meets a stale WAL.
+/// Replace `final_path` with the finished (fsynced) build. The previous file is
+/// checkpointed and its WAL/SHM removed first, so the new file never meets a stale WAL;
+/// the directory is fsynced after the rename.
 fn swap_into_place(tmp: &Path, final_path: &Path) -> Result<(), String> {
     let wal = PathBuf::from(format!("{}-wal", final_path.display()));
     let shm = PathBuf::from(format!("{}-shm", final_path.display()));
@@ -604,10 +736,10 @@ fn swap_into_place(tmp: &Path, final_path: &Path) -> Result<(), String> {
     let _ = fs::remove_file(&wal);
     let _ = fs::remove_file(&shm);
     fs::rename(tmp, final_path).map_err(|e| format!("swap {}: {e}", final_path.display()))?;
-    if let Some(dir) = final_path.parent()
-        && let Ok(d) = fs::File::open(dir)
-    {
-        let _ = d.sync_all();
+    if let Some(dir) = final_path.parent() {
+        fs::File::open(dir)
+            .and_then(|d| d.sync_all())
+            .map_err(|e| format!("sync {}: {e}", dir.display()))?;
     }
     Ok(())
 }
@@ -651,16 +783,6 @@ fn full_rebuild_reason(
     if get(meta::DIRTY_FLAG)?.as_deref() != Some("0") {
         return Ok(Some("dirty_flag"));
     }
-    let partial: i64 = conn.query_row(
-        "SELECT count(*) FROM files WHERE parse_status IN ('envelope_files','envelope_bytes')
-         OR (flags & ?1) != 0",
-        [file_flag::SYMBOL_BUDGET],
-        |r| r.get(0),
-    )?;
-    if partial > 0 {
-        // beyond the envelope the kept set depends on path order; rebuild to stay exact.
-        return Ok(Some("envelope"));
-    }
     Ok(None)
 }
 
@@ -670,6 +792,8 @@ struct Existing {
     content_hash: String,
     parse_status: String,
     lang: String,
+    flags: i64,
+    fact_symbols: i64,
 }
 
 /// `index update [--paths ...]`: bring the index to the working tree, incrementally
@@ -680,70 +804,36 @@ pub fn update(
     paths: Option<&[String]>,
 ) -> Result<IndexReport, String> {
     let t0 = Instant::now();
-    let scan = scan::scan(root, cfg)?;
-    let scan_ms = t0.elapsed().as_millis() as u64;
-    let dir = index_dir(&scan.root, scan.git_dir.as_deref(), cfg);
-    let _lock = lock(&dir)?;
+    let (scan, dir, _lock, scan_ms) = locked_scan(root, cfg)?;
     let final_path = dir.join(DB_FILE);
+    let full = |scan: Scan, reason: &str, counters: Counters| {
+        full_build(scan, cfg, &dir, "update", reason, counters, t0, scan_ms)
+    };
     if !final_path.exists() {
-        return full_build(
-            &scan,
-            cfg,
-            &dir,
-            "update",
-            "no_index",
-            Counters::default(),
-            t0,
-            scan_ms,
-        );
+        return full(scan, "no_index", Counters::default());
     }
     let conn = match Connection::open(&final_path) {
         Ok(c) => c,
-        Err(_) => {
-            return full_build(
-                &scan,
-                cfg,
-                &dir,
-                "update",
-                "unreadable_index",
-                Counters::default(),
-                t0,
-                scan_ms,
-            );
-        }
+        Err(_) => return full(scan, "unreadable_index", Counters::default()),
     };
     let reason =
         match schema::configure_durable(&conn).and_then(|_| full_rebuild_reason(&conn, cfg)) {
             Ok(r) => r,
+            Err(e) if is_corrupt(&e) => Some("corrupt_index"),
             Err(_) => Some("unreadable_index"),
         };
     if let Some(reason) = reason {
         drop(conn);
-        return full_build(
-            &scan,
-            cfg,
-            &dir,
-            "update",
-            reason,
-            Counters::default(),
-            t0,
-            scan_ms,
-        );
+        return full(scan, reason, Counters::default());
     }
-    if scan.candidates.len() > cfg.max_files {
-        drop(conn);
-        return full_build(
-            &scan,
-            cfg,
-            &dir,
-            "update",
-            "envelope",
-            Counters::default(),
-            t0,
-            scan_ms,
-        );
+    // a damaged page found mid-update (the dirty flag is still set) is replaced by a
+    // full rebuild rather than failing every later update.
+    match incremental(conn, &scan, cfg, &dir, paths, t0, scan_ms) {
+        Ok(Step::Done(r)) => Ok(*r),
+        Ok(Step::Rebuild(reason, counters)) => full(scan, reason, counters),
+        Err(e) if e.starts_with(CORRUPT_ERROR) => full(scan, "corrupt_index", Counters::default()),
+        Err(e) => Err(e),
     }
-    incremental(conn, &scan, cfg, &dir, paths, t0, scan_ms)
 }
 
 fn normalize_paths(root: &Path, paths: &[String]) -> HashSet<String> {
@@ -763,6 +853,80 @@ fn normalize_paths(root: &Path, paths: &[String]) -> HashSet<String> {
         .collect()
 }
 
+/// Outcome of the in-place path: finished, or a full rebuild is needed.
+enum Step {
+    Done(Box<IndexReport>),
+    Rebuild(&'static str, Counters),
+}
+
+/// One file in the symbol-budget plan.
+struct PlanEntry {
+    /// Symbols extraction found (before the budget).
+    symbols: usize,
+    /// The file's content is indexed (it can hold symbols at all).
+    indexed: bool,
+    /// Stored decision for a file not being rewritten: kept its symbols.
+    stored_keep: Option<bool>,
+}
+
+/// The symbol budget in path order: a file keeps its symbols when they fit the budget
+/// left by the files before it, otherwise its symbols are dropped (`symbol_budget`).
+/// Returns the keep decision per path. Full builds apply the same rule inline.
+fn plan_symbol_budget<'p>(
+    entries: &BTreeMap<&'p str, PlanEntry>,
+    max_symbols: usize,
+) -> HashMap<&'p str, bool> {
+    let mut total = 0usize;
+    let mut out = HashMap::with_capacity(entries.len());
+    for (path, e) in entries {
+        if !e.indexed {
+            continue;
+        }
+        let keep = total + e.symbols <= max_symbols;
+        if keep {
+            total += e.symbols;
+        }
+        out.insert(*path, keep);
+    }
+    out
+}
+
+/// Read and extract `cand` (or take its facts from the cache) for its symbol count only;
+/// None when it cannot be indexed. The facts go to the cache, so writing the file later
+/// costs a read but no second parse (unless `--no-cache` disabled reuse).
+fn symbol_count(
+    root: &Path,
+    cand: &Candidate,
+    cfg: &IndexConfig,
+    cache: &FactCache<'_>,
+    counters: &mut Counters,
+) -> Result<Option<usize>, String> {
+    if cand.loss.is_some() {
+        return Ok(None);
+    }
+    let Ok(bytes) =
+        crate::symbolgraph::read_source_beneath(root, Path::new(&cand.path), cfg.max_file_size)
+    else {
+        return Ok(None);
+    };
+    counters.bytes_read += bytes.len() as u64;
+    let blob = scan::blob_id(&bytes);
+    let (text, invalid) = match String::from_utf8(bytes) {
+        Ok(t) => (t, false),
+        Err(e) => (String::from_utf8_lossy(e.as_bytes()).into_owned(), true),
+    };
+    let mode = extract::extraction_mode(cand.lang, text.as_bytes(), cfg.max_parse_bytes);
+    let key = format!("{blob}:{}:{mode}", cand.lang.name());
+    if let Some(f) = cache.get(&key).map_err(sql_err)? {
+        counters.reused_from_cache += 1;
+        return Ok(Some(f.symbols.len()));
+    }
+    let f = extract::extract(cand.lang, &text, invalid, cfg.max_parse_bytes);
+    counters.reparsed += 1;
+    cache.put(&key, &f).map_err(sql_err)?;
+    Ok(Some(f.symbols.len()))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn incremental(
     conn: Connection,
@@ -772,15 +936,19 @@ fn incremental(
     paths: Option<&[String]>,
     t0: Instant,
     scan_ms: u64,
-) -> Result<IndexReport, String> {
+) -> Result<Step, String> {
     let mut counters = Counters::default();
     let filter = paths.map(|p| normalize_paths(&scan.root, p));
     let considered = |p: &str| filter.as_ref().is_none_or(|f| f.contains(p));
 
+    // every stored row: bounded by the scan's row bound (max_files + MAX_LOSS_ROWS).
     let mut existing: HashMap<String, Existing> = HashMap::new();
     {
         let mut st = conn
-            .prepare("SELECT id, path, content_hash, parse_status, lang, stat_key FROM files")
+            .prepare(
+                "SELECT id, path, content_hash, parse_status, lang, stat_key, flags, fact_symbols
+                 FROM files",
+            )
             .map_err(sql_err)?;
         let rows = st
             .query_map([], |r| {
@@ -792,30 +960,31 @@ fn incremental(
                         parse_status: r.get(3)?,
                         lang: r.get(4)?,
                         stat_key: r.get(5)?,
+                        flags: r.get(6)?,
+                        fact_symbols: r.get(7)?,
                     },
                 ))
             })
             .map_err(sql_err)?;
         for row in rows {
             let (p, e) = row.map_err(sql_err)?;
-            if considered(&p) {
-                existing.insert(p, e);
-            }
+            existing.insert(p, e);
         }
     }
-    let db_total: i64 = conn
-        .query_row("SELECT count(*) FROM files", [], |r| r.get(0))
-        .map_err(sql_err)?;
+    let db_total = existing.len();
 
-    // ---- classify without extracting: unchanged stat keys skip the read; other files
-    // are identified by hashing ----
+    // ---- classify without extracting: trusted unchanged stat keys skip the read; other
+    // files are identified by hashing (or by the same read failure as before) ----
     let mut changed: Vec<&Candidate> = Vec::new();
     // same bytes under a new stat key (touched, checked out again): refresh the key.
     let mut restat: Vec<(i64, String)> = Vec::new();
-    let mut seen: HashSet<&str> = HashSet::new();
-    for cand in scan.candidates.iter().filter(|c| considered(&c.path)) {
-        counters.files_scanned += 1;
+    let mut seen: HashSet<&str> = HashSet::with_capacity(scan.candidates.len());
+    for cand in &scan.candidates {
         seen.insert(cand.path.as_str());
+        if !considered(&cand.path) {
+            continue;
+        }
+        counters.files_scanned += 1;
         let Some(ex) = existing.get(&cand.path) else {
             changed.push(cand);
             continue;
@@ -832,24 +1001,24 @@ fn incremental(
             }
             continue;
         }
-        let indexed = meta::INDEXED_STATUSES.contains(&ex.parse_status.as_str());
         let key = stat_key_for(&cand.stat, scan.started_ns);
-        if indexed && key == ex.stat_key {
+        if !ex.stat_key.starts_with(RACY_PREFIX) && key == ex.stat_key {
             counters.unchanged += 1;
             continue;
         }
-        // stat changed, racy, or previously unreadable: identify by content
-        let same = crate::symbolgraph::read_source_beneath(
+        // stat changed or racy: identify by content, or by the same read failure
+        let indexed = meta::INDEXED_STATUSES.contains(&ex.parse_status.as_str());
+        let same = match crate::symbolgraph::read_source_beneath(
             &scan.root,
             Path::new(&cand.path),
             cfg.max_file_size,
-        )
-        .ok()
-        .map(|b| {
-            counters.bytes_read += b.len() as u64;
-            scan::blob_id(&b)
-        })
-        .is_some_and(|h| indexed && h == ex.content_hash);
+        ) {
+            Ok(b) => {
+                counters.bytes_read += b.len() as u64;
+                indexed && scan::blob_id(&b) == ex.content_hash
+            }
+            Err(f) => !indexed && f.reason() == ex.parse_status,
+        };
         if same {
             counters.unchanged += 1;
             if key != ex.stat_key {
@@ -867,25 +1036,22 @@ fn incremental(
             st.execute(params![id, key]).map_err(sql_err)?;
         }
     }
-    let deleted: Vec<(String, i64)> = existing
+    let mut deleted: Vec<(String, i64)> = existing
         .iter()
-        .filter(|(p, _)| !seen.contains(p.as_str()))
+        .filter(|(p, _)| considered(p) && !seen.contains(p.as_str()))
         .map(|(p, e)| (p.clone(), e.id))
         .collect();
+    deleted.sort();
 
-    let head_changed =
-        meta::get(&conn, "last_commit").map_err(sql_err)?.as_deref() != Some(scan.head.as_str());
     if changed.is_empty() && deleted.is_empty() {
-        if head_changed {
-            meta::set(&conn, "last_commit", &scan.head).map_err(sql_err)?;
-        }
+        set_scan_meta(&conn, scan).map_err(sql_err)?;
         let coverage = meta::coverage(&conn, cfg).map_err(sql_err)?;
         let timing = Timing {
             elapsed_ms: t0.elapsed().as_millis() as u64,
             scan_ms,
             edges_ms: 0,
         };
-        return Ok(report(
+        return Ok(Step::Done(Box::new(report(
             ("update", "noop", "unchanged"),
             scan,
             dir,
@@ -893,73 +1059,115 @@ fn incremental(
             counters,
             coverage,
             timing,
-        ));
+        ))));
+    }
+
+    let generation = meta::get(&conn, "generation")
+        .map_err(sql_err)?
+        .and_then(|g| g.parse::<i64>().ok())
+        .unwrap_or(0)
+        + 1;
+    let cache = FactCache {
+        conn: &conn,
+        old: None,
+        generation,
+        reuse: cfg.use_fact_cache,
+    };
+    // files the budget plan already read and extracted (counted there, not again).
+    let mut precounted: HashSet<&str> = HashSet::new();
+
+    // ---- symbol budget: which files keep their symbols after this change. Needed only
+    // when the budget can bind: some file is already over it, or the changed files could
+    // push the total past it. ----
+    let changed_paths: HashSet<&str> = changed.iter().map(|c| c.path.as_str()).collect();
+    let deleted_paths: HashSet<&str> = deleted.iter().map(|(p, _)| p.as_str()).collect();
+    let retained = existing.iter().filter(|(p, _)| {
+        !changed_paths.contains(p.as_str()) && !deleted_paths.contains(p.as_str())
+    });
+    let (mut stored_total, mut any_stripped) = (0usize, false);
+    for (_, e) in retained.clone() {
+        if meta::INDEXED_STATUSES.contains(&e.parse_status.as_str()) {
+            stored_total += e.fact_symbols.max(0) as usize;
+            any_stripped |= e.flags & file_flag::SYMBOL_BUDGET != 0;
+        }
+    }
+    let worst_case = changed
+        .len()
+        .saturating_mul(extract::MAX_SYMBOLS_PER_FILE)
+        .saturating_add(stored_total);
+    let mut keep_of: HashMap<String, bool> = HashMap::new();
+    let mut rebudget: Vec<&Candidate> = Vec::new();
+    if any_stripped || worst_case > cfg.max_symbols {
+        let mut entries: BTreeMap<&str, PlanEntry> = BTreeMap::new();
+        for (p, e) in retained {
+            entries.insert(
+                p.as_str(),
+                PlanEntry {
+                    symbols: e.fact_symbols.max(0) as usize,
+                    indexed: meta::INDEXED_STATUSES.contains(&e.parse_status.as_str()),
+                    stored_keep: Some(e.flags & file_flag::SYMBOL_BUDGET == 0),
+                },
+            );
+        }
+        for cand in &changed {
+            let n = symbol_count(&scan.root, cand, cfg, &cache, &mut counters)?;
+            precounted.insert(cand.path.as_str());
+            entries.insert(
+                cand.path.as_str(),
+                PlanEntry {
+                    symbols: n.unwrap_or(0),
+                    indexed: n.is_some(),
+                    stored_keep: None,
+                },
+            );
+        }
+        let plan = plan_symbol_budget(&entries, cfg.max_symbols);
+        let cand_of: HashMap<&str, &Candidate> = scan
+            .candidates
+            .iter()
+            .map(|c| (c.path.as_str(), c))
+            .collect();
+        for (path, e) in &entries {
+            let keep = plan.get(path).copied().unwrap_or(true);
+            match e.stored_keep {
+                None => {
+                    keep_of.insert(path.to_string(), keep);
+                }
+                Some(stored) if stored != keep && e.symbols > 0 => {
+                    // the boundary moved over an unchanged file: rewrite it too.
+                    if let Some(c) = cand_of.get(path) {
+                        keep_of.insert(path.to_string(), keep);
+                        rebudget.push(c);
+                    }
+                }
+                Some(_) => {}
+            }
+        }
     }
 
     // ---- escalation gate ----
-    let write_set = changed.len() + deleted.len();
-    let total = (db_total as usize).max(scan.candidates.len());
+    let write_set = changed.len() + rebudget.len() + deleted.len();
+    let total = db_total.max(scan.candidates.len());
     if write_set * 2 > total && write_set >= ESCALATE_MIN_FILES {
         drop(conn);
         let c = Counters {
             escalated: true,
             ..Default::default()
         };
-        return full_build(scan, cfg, dir, "update", "escalated", c, t0, scan_ms);
+        return Ok(Step::Rebuild("escalated", c));
     }
 
     // ---- apply in place under the dirty flag ----
     meta::set(&conn, meta::DIRTY_FLAG, "1").map_err(sql_err)?;
-    let generation = meta::get(&conn, "generation")
-        .map_err(sql_err)?
-        .and_then(|g| g.parse::<i64>().ok())
-        .unwrap_or(0)
-        + 1;
     let defs_before = edges::Definers::load(&conn).map_err(sql_err)?;
     let mut candidate_names: BTreeSet<i64> = BTreeSet::new();
     let mut touched_paths: Vec<String> = Vec::new();
     let mut changed_ids: Vec<i64> = Vec::new();
+    counters.rebudgeted = rebudget.len();
+    let mut writes: Vec<&Candidate> = changed.iter().chain(rebudget.iter()).copied().collect();
+    writes.sort_by(|a, b| a.path.cmp(&b.path));
     {
-        let cache = FactCache {
-            conn: &conn,
-            old: None,
-            generation,
-            reuse: cfg.use_fact_cache,
-        };
         let mut w = Writer::new(&conn, cfg.content_retention).map_err(sql_err)?;
-        // totals for the envelope: everything not being rewritten stays as stored.
-        let mut totals = Totals::default();
-        {
-            let rewritten: HashSet<&str> = changed
-                .iter()
-                .map(|c| c.path.as_str())
-                .chain(deleted.iter().map(|(p, _)| p.as_str()))
-                .collect();
-            let mut st = conn
-                .prepare("SELECT path, parse_status, size, symbol_count FROM files")
-                .map_err(sql_err)?;
-            let rows = st
-                .query_map([], |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, i64>(2)?,
-                        r.get::<_, i64>(3)?,
-                    ))
-                })
-                .map_err(sql_err)?;
-            for row in rows {
-                let (p, status, size, syms) = row.map_err(sql_err)?;
-                if rewritten.contains(p.as_str())
-                    || !meta::INDEXED_STATUSES.contains(&status.as_str())
-                {
-                    continue;
-                }
-                totals.files_indexed += 1;
-                totals.bytes += size.max(0) as u64;
-                totals.symbols += syms.max(0) as usize;
-            }
-        }
         conn.execute_batch("BEGIN").map_err(sql_err)?;
         for (path, id) in &deleted {
             candidate_names.extend(edges::defined_names(&conn, *id).map_err(sql_err)?);
@@ -967,7 +1175,7 @@ fn incremental(
             counters.deleted += 1;
             touched_paths.push(path.clone());
         }
-        for (i, cand) in changed.iter().enumerate() {
+        for (i, cand) in writes.iter().enumerate() {
             let prior = existing.get(&cand.path).map(|e| e.id);
             if let Some(id) = prior {
                 candidate_names.extend(edges::defined_names(&conn, id).map_err(sql_err)?);
@@ -975,32 +1183,15 @@ fn incremental(
             } else {
                 touched_paths.push(cand.path.clone());
             }
-            let p = process(
-                &scan.root,
-                scan.started_ns,
-                cand,
-                cfg,
-                &cache,
-                &mut totals,
-                &mut counters,
-            )?;
-            if p.rec.flags & file_flag::SYMBOL_BUDGET != 0
-                || p.rec.parse_status.starts_with("envelope")
-            {
-                // the update crosses the envelope: rebuild so the kept set is exact.
-                conn.execute_batch("COMMIT").map_err(sql_err)?;
-                drop(w);
-                drop(conn);
-                return full_build(
-                    scan,
-                    cfg,
-                    dir,
-                    "update",
-                    "envelope",
-                    Counters::default(),
-                    t0,
-                    scan_ms,
-                );
+            let mut uncounted = Counters::default();
+            let tally = if precounted.contains(cand.path.as_str()) {
+                &mut uncounted
+            } else {
+                &mut counters
+            };
+            let mut p = process(&scan.root, scan.started_ns, cand, cfg, &cache, tally)?;
+            if p.facts.is_some() {
+                apply_budget(&mut p, keep_of.get(&cand.path).copied().unwrap_or(true));
             }
             let fid = w
                 .write_file(prior, &p.rec, p.facts.as_ref(), p.bytes.as_deref())
@@ -1091,7 +1282,7 @@ fn incremental(
         scan_ms,
         edges_ms,
     };
-    Ok(report(
+    Ok(Step::Done(Box::new(report(
         ("update", "incremental", "changes"),
         scan,
         dir,
@@ -1099,7 +1290,7 @@ fn incremental(
         counters,
         coverage,
         timing,
-    ))
+    ))))
 }
 
 /// Drop fact-cache entries no file uses, keeping the most recently used superseded ones.
@@ -1119,7 +1310,8 @@ fn gc_fact_cache(conn: &Connection) -> rusqlite::Result<usize> {
 }
 
 /// `index stats`: the stored index's identity, freshness inputs and coverage; with
-/// `digest`, its content digest.
+/// `digest`, its content digest. Read-only: it never takes the writer lock and never
+/// opens the store for writing.
 pub fn stats(root: &Path, cfg: &IndexConfig, digest: bool) -> Result<serde_json::Value, String> {
     let root = fs::canonicalize(root).map_err(|e| format!("{}: {e}", root.display()))?;
     let git_dir = crate::indexcache::run_git_bounded(
@@ -1163,6 +1355,7 @@ pub fn stats(root: &Path, cfg: &IndexConfig, digest: bool) -> Result<serde_json:
         "db_bytes": db_bytes,
         "repo_mode": get("repo_mode"),
         "last_commit": get("last_commit"),
+        "generation": get("generation"),
         "schema_version": get("schema_version"),
         "schema_fingerprint": get("schema_fingerprint"),
         "analyzer_version": get("analyzer_version"),
@@ -1175,11 +1368,9 @@ pub fn stats(root: &Path, cfg: &IndexConfig, digest: bool) -> Result<serde_json:
         "coverage": coverage,
     });
     if digest {
-        // the digest uses a temporary FTS5 vocabulary table: open a writable handle
-        // (the temp schema only; the index itself is not modified).
-        let rw = Connection::open(&path).map_err(sql_err)?;
-        schema::configure(&rw).map_err(sql_err)?;
-        let d = meta::content_digest(&rw).map_err(sql_err)?;
+        // the FTS5 vocabulary table lives in the connection's temp schema, which a
+        // read-only connection may create.
+        let d = meta::content_digest(&conn).map_err(sql_err)?;
         v["content_digest"] = serde_json::Value::String(d);
     }
     Ok(v)
@@ -1189,8 +1380,8 @@ pub fn stats(root: &Path, cfg: &IndexConfig, digest: bool) -> Result<serde_json:
 pub fn run_cli(args: impl Iterator<Item = String>) -> i32 {
     let usage = "usage: xmustard-core index <build|update|stats> <root> \
         [--content-retention full|symbol|none] [--max-file-size N] [--max-files N] \
-        [--max-symbols N] [--max-total-bytes N] [--index-dir DIR] [--allow-non-git] \
-        [--include-untracked] [--no-cache] [--paths P ...] [--digest]";
+        [--max-symbols N] [--max-total-bytes N] [--max-parse-bytes N] [--index-dir DIR] \
+        [--allow-non-git] [--include-untracked] [--no-cache] [--paths P ...] [--digest]";
     let args: Vec<String> = args.collect();
     let (Some(sub), Some(root)) = (args.first(), args.get(1)) else {
         eprintln!("{usage}");

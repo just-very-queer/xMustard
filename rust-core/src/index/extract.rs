@@ -29,7 +29,17 @@ pub const MAX_SYMBOLS_PER_FILE: usize = crate::treesitter::MAX_SYMBOLS_PER_FILE;
 pub const MAX_REFS_PER_FILE: usize = 200_000;
 
 /// Bump when extraction output changes for the same bytes. Part of the analyzer version.
-pub const EXTRACTOR_REVISION: u32 = 1;
+pub const EXTRACTOR_REVISION: u32 = 2;
+
+/// Longest container prefix spelled out in a qualified name. A deeper prefix is replaced
+/// by `~<hash of the prefix>`, so qualified names, UIDs and scope frames stay bounded
+/// whatever the nesting depth (a file of 4,600 nested functions otherwise needs
+/// quadratic memory: measured 167 MiB peak for one 64 KB file).
+pub const MAX_QUALIFIED_BYTES: usize = 256;
+
+/// Syntax-tree depth past which leading doc comments are not looked up (each lookup
+/// walks the tree from the root: quadratic time on a deeply nested file).
+const MAX_DOC_DEPTH: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Lang {
@@ -120,16 +130,48 @@ pub fn grammar_versions() -> String {
 /// lexical extractor instead, reported as the `lexical_fallback` coverage loss.
 pub const DEFAULT_MAX_PARSE_BYTES: usize = 64 << 10;
 
+/// Bracket nesting past which a grammar file is extracted lexically. Tree-sitter's parse
+/// stack and tree grow with nesting depth (measured: 4,600 nested `if` blocks in 28 KB
+/// peak at 19 MiB, 4,600 nested functions in 64 KB at 24 MiB), while real code stays far
+/// below this; deeper files are reported as `lexical_fallback` and `nesting_truncated`.
+pub const MAX_PARSE_NESTING: usize = 256;
+
+/// Whether bracket nesting in `bytes` exceeds `limit` (a cheap upper bound: brackets in
+/// strings and comments count too).
+fn nests_deeper_than(bytes: &[u8], limit: usize) -> bool {
+    let mut depth = 0usize;
+    for &c in bytes {
+        match c {
+            b'{' | b'(' | b'[' => {
+                depth += 1;
+                if depth > limit {
+                    return true;
+                }
+            }
+            b'}' | b')' | b']' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    false
+}
+
 /// Extract the facts of one file. `text` is the decoded source (lossy when
-/// `invalid_utf8`). Grammar files up to `max_parse_bytes` are parsed with tree-sitter.
+/// `invalid_utf8`). Grammar files up to `max_parse_bytes` and `MAX_PARSE_NESTING` are
+/// parsed with tree-sitter; the rest use the lexical extractor.
 pub fn extract(lang: Lang, text: &str, invalid_utf8: bool, max_parse_bytes: usize) -> FileFacts {
-    let parse = lang.has_grammar() && text.len() <= max_parse_bytes;
+    let parse = extraction_mode(lang, text.as_bytes(), max_parse_bytes) == "ts";
     let mut facts = if parse {
         extract_tree_sitter(lang, text).unwrap_or_else(|| lexical::extract(lang, text))
     } else {
         lexical::extract(lang, text)
     };
     facts.lexical_fallback = lang.has_grammar() && facts.engine != "tree_sitter";
+    if lang.has_grammar()
+        && text.len() <= max_parse_bytes
+        && nests_deeper_than(text.as_bytes(), MAX_PARSE_NESTING)
+    {
+        facts.nesting_truncated = true;
+    }
     facts.invalid_utf8 = invalid_utf8;
     uid::assign_suffixes(&mut facts.symbols);
     let starts = chunks::line_starts(text.as_bytes());
@@ -138,10 +180,13 @@ pub fn extract(lang: Lang, text: &str, invalid_utf8: bool, max_parse_bytes: usiz
     facts
 }
 
-/// Which extractor `extract` uses for this file: part of the fact-cache key, so a
-/// change of `max_parse_bytes` never serves facts made the other way.
-pub fn extraction_mode(lang: Lang, len: usize, max_parse_bytes: usize) -> &'static str {
-    if lang.has_grammar() && len <= max_parse_bytes {
+/// Which extractor `extract` uses for this (decoded) text: part of the fact-cache key,
+/// so a change of `max_parse_bytes` never serves facts made the other way.
+pub fn extraction_mode(lang: Lang, text: &[u8], max_parse_bytes: usize) -> &'static str {
+    if lang.has_grammar()
+        && text.len() <= max_parse_bytes
+        && !nests_deeper_than(text, MAX_PARSE_NESTING)
+    {
         "ts"
     } else {
         "lex"
@@ -164,11 +209,11 @@ fn extract_tree_sitter(lang: Lang, text: &str) -> Option<FileFacts> {
     Some(facts)
 }
 
-/// What a scope frame contributes to the names and containers of nested nodes.
+/// What a scope frame contributes to the names and containers of nested nodes. Its
+/// qualified prefix is its symbol's qualified name (never copied into the frame, so a
+/// deep nesting costs one bounded name per symbol, not per frame).
 struct Scope {
     node_id: usize,
-    /// Qualified prefix for nested declarations.
-    qual: String,
     symbol: Option<u32>,
     callable: bool,
     /// Symbol kind that owns the scope (Impl/Trait/Class...), for method detection.
@@ -216,14 +261,17 @@ struct Walker<'a> {
     imports: Vec<ImportFact>,
     truncated: bool,
     refs_truncated: bool,
+    /// Some qualified name hit MAX_QUALIFIED_BYTES.
+    nesting_truncated: bool,
     anc: Vec<Anc>,
     scopes: Vec<Scope>,
     def_names: HashSet<usize>,
     /// value node id → name for `const f = () => ...`, class fields with function
     /// values, and Go `f := func() {}`.
     pending: HashMap<usize, PendingName>,
-    /// object-literal node id → (qualified prefix, owning symbol) from its declarator.
-    object_scopes: HashMap<usize, (String, Option<u32>)>,
+    /// object-literal node id → owning symbol (its declarator), whose qualified name is
+    /// the prefix of the object's members.
+    object_scopes: HashMap<usize, u32>,
     /// Go method symbol index → receiver type name, resolved after the walk.
     go_receivers: Vec<(u32, String)>,
     /// Names listed in local `export { ... }` clauses (JS/TS).
@@ -266,6 +314,7 @@ impl<'a> Walker<'a> {
             imports: Vec::new(),
             truncated: false,
             refs_truncated: false,
+            nesting_truncated: false,
             anc: Vec::with_capacity(64),
             scopes: Vec::with_capacity(16),
             def_names: HashSet::new(),
@@ -336,7 +385,12 @@ impl<'a> Walker<'a> {
     }
 
     fn qual_prefix(&self) -> &str {
-        self.scopes.last().map(|s| s.qual.as_str()).unwrap_or("")
+        self.scopes
+            .last()
+            .and_then(|s| s.symbol)
+            .and_then(|i| self.symbols.get(i as usize))
+            .map(|s| s.qualified_name.as_str())
+            .unwrap_or("")
     }
 
     fn enter(&mut self, node: Node<'_>, field: Option<&'static str>) {
@@ -607,6 +661,11 @@ impl<'a> Walker<'a> {
     /// contiguous run, or `outer`'s own line.
     fn doc_start_line(&self, outer: Node<'_>) -> u32 {
         let mut line = outer.start_position().row as u32 + 1;
+        // tree-sitter's sibling and parent lookups walk down from the root, so they cost
+        // O(depth) each; past MAX_DOC_DEPTH a declaration starts at its own line.
+        if self.anc.len() > MAX_DOC_DEPTH {
+            return line;
+        }
         let mut prev = outer.prev_sibling();
         while let Some(p) = prev {
             let is_doc = matches!(
@@ -707,12 +766,8 @@ impl<'a> Walker<'a> {
         let qualified = match qual_override {
             Some(q) => q,
             None => {
-                let prefix = self.qual_prefix();
-                if prefix.is_empty() {
-                    name.clone()
-                } else {
-                    format!("{prefix}.{name}")
-                }
+                let prefix = self.qual_prefix().to_string();
+                self.qualify(&prefix, &name)
             }
         };
         let at = name_node.unwrap_or(decl);
@@ -729,7 +784,7 @@ impl<'a> Walker<'a> {
         };
         self.symbols.push(SymbolFact {
             name,
-            qualified_name: qualified.clone(),
+            qualified_name: qualified,
             kind: kind.to_string(),
             container: self.container_symbol(),
             arity: if callable {
@@ -752,13 +807,26 @@ impl<'a> Walker<'a> {
         if push_scope {
             self.scopes.push(Scope {
                 node_id: decl.id(),
-                qual: qualified,
                 symbol: Some(idx),
                 callable,
                 kind,
             });
         }
         Some(idx)
+    }
+
+    /// `prefix.name`, with a prefix longer than MAX_QUALIFIED_BYTES replaced by
+    /// `~<16 hex of its hash>` (deterministic, so UIDs stay stable).
+    fn qualify(&mut self, prefix: &str, name: &str) -> String {
+        if prefix.is_empty() {
+            return name.to_string();
+        }
+        if prefix.len() + 1 + name.len() <= MAX_QUALIFIED_BYTES {
+            return format!("{prefix}.{name}");
+        }
+        self.nesting_truncated = true;
+        let h = format!("{:x}", Sha256::digest(prefix.as_bytes()));
+        format!("~{}.{name}", &h[..16])
     }
 
     fn name_of<'t>(&self, node: Node<'t>, field: &str) -> Option<(Node<'t>, String)> {
@@ -837,11 +905,10 @@ impl<'a> Walker<'a> {
             );
             return;
         }
-        if let Some((qual, sym)) = self.object_scopes.remove(&node.id()) {
+        if let Some(sym) = self.object_scopes.remove(&node.id()) {
             self.scopes.push(Scope {
                 node_id: node.id(),
-                qual,
-                symbol: sym,
+                symbol: Some(sym),
                 callable: false,
                 kind: "Const",
             });
@@ -1004,11 +1071,7 @@ impl<'a> Walker<'a> {
                 let sig = self.signature_hash(&[params, node.child_by_field_name("result")]);
                 let arity = self.arity_of(params);
                 let exported = go_exported(&name);
-                let qual = if recv.is_empty() {
-                    name.clone()
-                } else {
-                    format!("{recv}.{name}")
-                };
+                let qual = self.qualify(&recv, &name);
                 if let Some(idx) = self.add_symbol(
                     node,
                     doc,
@@ -1209,6 +1272,9 @@ impl<'a> Walker<'a> {
     }
 
     fn js_outer_doc(&self, node: Node<'_>) -> u32 {
+        if self.anc.len() > MAX_DOC_DEPTH {
+            return self.doc_start_line(node);
+        }
         // comments sit above `export ...` / `const ...`, not above the inner node.
         let mut outer = node;
         for _ in 0..2 {
@@ -1538,8 +1604,7 @@ impl<'a> Walker<'a> {
                     && v.kind() == "object"
                     && let Some(i) = idx
                 {
-                    let q = self.symbols[i as usize].qualified_name.clone();
-                    self.object_scopes.insert(v.id(), (q, Some(i)));
+                    self.object_scopes.insert(v.id(), i);
                 }
             }
             _ => {}
@@ -1878,6 +1943,7 @@ impl<'a> Walker<'a> {
             invalid_utf8: false,
             symbols_truncated: self.truncated || self.refs_truncated,
             lexical_fallback: false,
+            nesting_truncated: self.nesting_truncated,
             line_count: 0,
             names: self.names,
             symbols: self.symbols,

@@ -2,7 +2,9 @@
 //!
 //! Rows for one file are written together inside the caller's transaction. Chunk
 //! postings are derived here from the bytes (or, for `content_retention=none`, from the
-//! identifier facts alone), so the fact cache never needs source text.
+//! identifier facts alone), so the fact cache never needs source text. Unless retention
+//! is `full`, a chunk's postings are an unordered bag of words (see `chunks::unordered`),
+//! and under `symbol` credential-shaped words are left out.
 
 use std::collections::HashMap;
 
@@ -32,6 +34,8 @@ pub struct FileRecord {
     /// `tree_sitter` | `regex` | `none` for parsed files, otherwise the loss reason.
     pub parse_status: String,
     pub flags: i64,
+    /// Symbols extraction found, before the symbol budget (the budget plan's input).
+    pub fact_symbols: i64,
 }
 
 pub struct Writer<'c> {
@@ -100,7 +104,7 @@ impl<'c> Writer<'c> {
                     .prepare_cached(
                         "UPDATE files SET path=?2, lang=?3, role=?4, size=?5, mtime_ns=?6,
                          content_hash=?7, parse_status=?8, flags=?9, symbol_count=?10,
-                         line_count=?11, stat_key=?12 WHERE id=?1",
+                         line_count=?11, stat_key=?12, fact_symbols=?13 WHERE id=?1",
                     )?
                     .execute(params![
                         id,
@@ -114,7 +118,8 @@ impl<'c> Writer<'c> {
                         flags,
                         symbol_count,
                         line_count,
-                        rec.stat_key
+                        rec.stat_key,
+                        rec.fact_symbols
                     ])?;
                 id
             }
@@ -122,8 +127,8 @@ impl<'c> Writer<'c> {
                 self.conn
                     .prepare_cached(
                         "INSERT INTO files(path, lang, role, size, mtime_ns, content_hash,
-                         parse_status, flags, symbol_count, line_count, stat_key)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                         parse_status, flags, symbol_count, line_count, stat_key, fact_symbols)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                     )?
                     .execute(params![
                         rec.path,
@@ -136,7 +141,8 @@ impl<'c> Writer<'c> {
                         flags,
                         symbol_count,
                         line_count,
-                        rec.stat_key
+                        rec.stat_key,
+                        rec.fact_symbols
                     ])?;
                 self.conn.last_insert_rowid()
             }
@@ -241,6 +247,7 @@ impl<'c> Writer<'c> {
         sym_id: &dyn Fn(u32) -> i64,
     ) -> rusqlite::Result<()> {
         let path_tokens = chunks::path_tokens(path);
+        let refs_sorted = f.refs.is_sorted_by_key(|r| r.line());
         for (ord, c) in f.chunks.iter().enumerate() {
             let id = self.next_chunk;
             self.next_chunk += 1;
@@ -261,14 +268,20 @@ impl<'c> Writer<'c> {
                     c.end_byte,
                     c.content_hash
                 ])?;
-            // symbols declared in the chunk
+            // symbols declared in the chunk: each one's own name and its container's
+            // (never the whole path, whose size grows with nesting depth).
             let mut sym_tokens = String::new();
             for s in f
                 .symbols
                 .iter()
                 .filter(|s| c.start_line <= s.name_line && s.name_line <= c.end_line)
             {
-                for seg in s.qualified_name.split('.') {
+                for seg in s
+                    .qualified_name
+                    .rsplit('.')
+                    .take(2)
+                    .filter(|seg| !seg.starts_with('~'))
+                {
                     chunks::push_word_tokens(seg, &mut sym_tokens);
                 }
             }
@@ -278,16 +291,29 @@ impl<'c> Writer<'c> {
             let mut body = String::new();
             match (self.retention, &text) {
                 (ContentRetention::None, _) | (_, None) => {
-                    // identifiers only: reference names on the chunk's lines, in order.
-                    for r in f
-                        .refs
+                    // identifiers only: reference names on the chunk's lines.
+                    let from = if refs_sorted {
+                        f.refs.partition_point(|r| r.line() < c.start_line)
+                    } else {
+                        0
+                    };
+                    for r in f.refs[from..]
                         .iter()
+                        .take_while(|r| !refs_sorted || r.line() <= c.end_line)
                         .filter(|r| c.start_line <= r.line() && r.line() <= c.end_line)
                     {
                         chunks::push_word_tokens(&f.names[r.name_idx()], &mut body);
                     }
                 }
-                (_, Some(t)) => chunks::tokenize_into(t, &mut body),
+                (ContentRetention::Symbol, Some(t)) => {
+                    chunks::tokenize_without_secrets(t, &mut body)
+                }
+                (ContentRetention::Full, Some(t)) => chunks::tokenize_into(t, &mut body),
+            }
+            // Without full retention the postings are a bag of words: the source's word
+            // order is not kept anywhere in the index.
+            if self.retention != ContentRetention::Full {
+                body = chunks::unordered(&body);
             }
             self.conn
                 .prepare_cached(

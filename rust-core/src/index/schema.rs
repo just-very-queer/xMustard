@@ -3,7 +3,11 @@
 //! One SQLite file per workspace scope holds every extracted fact. Rows reference files
 //! and symbols by integer id; names are interned once in `names`. The chunk postings
 //! live in a contentless FTS5 table, so the index keeps term postings but never the
-//! chunk text unless `content_retention=full` fills `chunk_text`.
+//! chunk text unless `content_retention=full` fills `chunk_text`. With `symbol` or
+//! `none` retention each chunk's postings are an unordered bag of words (sorted before
+//! insertion), so FTS5's positions carry no source order and `fts5vocab` cannot rebuild
+//! the text; `symbol` also leaves credential-shaped words out, and `none` posts only
+//! code identifiers.
 
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
@@ -11,7 +15,7 @@ use sha2::{Digest, Sha256};
 use super::config::ContentRetention;
 
 /// Bump on any table or column change. Part of the schema fingerprint.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Table definitions. Secondary indexes are in `INDEX_DDL` so a full build can create
 /// them after the bulk insert.
@@ -33,7 +37,8 @@ CREATE TABLE files(
   parse_status TEXT NOT NULL,
   flags INTEGER NOT NULL,
   symbol_count INTEGER NOT NULL,
-  line_count INTEGER NOT NULL
+  line_count INTEGER NOT NULL,
+  fact_symbols INTEGER NOT NULL
 );
 
 CREATE TABLE names(
@@ -185,7 +190,8 @@ pub const BULK_CACHE_KIB: i64 = 512;
 pub const FTS_HASHSIZE: i64 = 256 << 10;
 
 /// Fast settings for a full build into a fresh temporary file: a crash discards the
-/// file, so no journal and no fsync until the final swap.
+/// file, so no journal and no fsync while it loads. The worker fsyncs the finished file
+/// before the swap renames it over `index.db`.
 pub fn configure_bulk(conn: &Connection) -> rusqlite::Result<()> {
     configure(conn)?;
     conn.execute_batch(&format!(

@@ -3,8 +3,10 @@
 //! Meta keys: `schema_version`, `schema_fingerprint`, `analyzer_version`,
 //! `content_retention`, `config`, `incremental_in_progress` (the crash dirty flag),
 //! `last_commit`, `repo_mode`, `root`, `ignored_files`, `invalid_paths`,
-//! `worktree_deleted`, `generation`, `coverage` (JSON, as of the last build or update)
-//! and `last_run` (that run's counters, JSON).
+//! `worktree_deleted`, `ignore_rules_dropped`, `envelope_beyond` (JSON: count per loss
+//! reason of eligible files that have no row because they are past the envelope) and
+//! `envelope_beyond_sample` (JSON: the first of them by path), `generation`, `coverage`
+//! (JSON, as of the last build or update) and `last_run` (that run's counters, JSON).
 
 use std::collections::BTreeMap;
 
@@ -21,6 +23,11 @@ pub const INDEXED_STATUSES: &[&str] = &["tree_sitter", "regex", "none"];
 
 /// Losses listed by path in the report (counts stay exact).
 pub const MAX_LOSS_ENTRIES: usize = 200;
+
+/// Meta key: count per reason of eligible files past the envelope (no `files` row).
+pub const BEYOND: &str = "envelope_beyond";
+/// Meta key: the first of those files by path, `[[path, reason], ...]`.
+pub const BEYOND_SAMPLE: &str = "envelope_beyond_sample";
 
 pub fn get(conn: &Connection, key: &str) -> rusqlite::Result<Option<String>> {
     conn.query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0))
@@ -41,7 +48,7 @@ pub struct Loss {
     pub path: String,
     /// `oversized` | `unreadable` | `symlink` | `not_regular` | `missing` |
     /// `envelope_files` | `envelope_bytes` | `symbol_budget` | `symbols_truncated` |
-    /// `parse_errors` | `invalid_utf8` | `lexical_fallback`
+    /// `nesting_truncated` | `parse_errors` | `invalid_utf8` | `lexical_fallback`
     pub reason: String,
     /// Whether the file's content still contributed rows (partial, not absent).
     pub content_indexed: bool,
@@ -59,11 +66,13 @@ pub struct Envelope {
 
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct Coverage {
-    /// Source files the ignore rules admit (each has a `files` row).
+    /// Source files the ignore rules admit (those past the envelope have no row).
     pub eligible_files: usize,
     /// Eligible files whose content was read and extracted.
     pub indexed_files: usize,
     pub ignored_files: usize,
+    /// Ignore-file lines skipped by the matcher's bounds (too long, too many rules).
+    pub ignore_rules_dropped: usize,
     pub invalid_paths: usize,
     /// Tracked files deleted from the worktree (not eligible, not a loss).
     pub worktree_deleted_files: usize,
@@ -96,7 +105,17 @@ fn count(conn: &Connection, sql: &str) -> rusqlite::Result<usize> {
 pub fn coverage(conn: &Connection, cfg: &IndexConfig) -> rusqlite::Result<Coverage> {
     use super::facts::file_flag;
     let mut c = Coverage::default();
+    // Losses are counted exactly but only the first MAX_LOSS_ENTRIES by path are kept:
+    // rows arrive in path order, and the sample of files past the envelope is sorted.
     let mut losses: Vec<Loss> = Vec::new();
+    let mut total_losses = 0usize;
+    let mut note = |c: &mut Coverage, losses: &mut Vec<Loss>, l: Loss| {
+        *c.loss_counts.entry(l.reason.clone()).or_default() += 1;
+        total_losses += 1;
+        if losses.len() < MAX_LOSS_ENTRIES {
+            losses.push(l);
+        }
+    };
     {
         let mut st =
             conn.prepare("SELECT path, lang, parse_status, flags, size FROM files ORDER BY path")?;
@@ -115,34 +134,57 @@ pub fn coverage(conn: &Connection, cfg: &IndexConfig) -> rusqlite::Result<Covera
                 *c.languages.entry(lang).or_default() += 1;
                 *c.extraction.entry(status.clone()).or_default() += 1;
             } else {
-                losses.push(Loss {
-                    path: path.clone(),
-                    reason: status.clone(),
-                    content_indexed: false,
-                });
+                note(
+                    &mut c,
+                    &mut losses,
+                    Loss {
+                        path: path.clone(),
+                        reason: status.clone(),
+                        content_indexed: false,
+                    },
+                );
             }
             for (bit, reason) in [
                 (file_flag::INVALID_UTF8, "invalid_utf8"),
                 (file_flag::SYMBOLS_TRUNCATED, "symbols_truncated"),
+                (file_flag::NESTING_TRUNCATED, "nesting_truncated"),
                 (file_flag::PARSE_ERRORS, "parse_errors"),
                 (file_flag::SYMBOL_BUDGET, "symbol_budget"),
                 (file_flag::LEXICAL_FALLBACK, "lexical_fallback"),
             ] {
                 if flags & bit != 0 {
-                    losses.push(Loss {
-                        path: path.clone(),
-                        reason: reason.into(),
-                        content_indexed: true,
-                    });
+                    note(
+                        &mut c,
+                        &mut losses,
+                        Loss {
+                            path: path.clone(),
+                            reason: reason.into(),
+                            content_indexed: true,
+                        },
+                    );
                 }
             }
         }
     }
-    for l in &losses {
-        *c.loss_counts.entry(l.reason.clone()).or_default() += 1;
+    let beyond: BTreeMap<String, usize> = get(conn, BEYOND)?
+        .and_then(|v| serde_json::from_str(&v).ok())
+        .unwrap_or_default();
+    let sample: Vec<(String, String)> = get(conn, BEYOND_SAMPLE)?
+        .and_then(|v| serde_json::from_str(&v).ok())
+        .unwrap_or_default();
+    for (reason, n) in &beyond {
+        c.eligible_files += n;
+        *c.loss_counts.entry(reason.clone()).or_default() += n;
+        total_losses += n;
     }
-    c.losses_truncated = losses.len() > MAX_LOSS_ENTRIES;
+    losses.extend(sample.into_iter().map(|(path, reason)| Loss {
+        path,
+        reason,
+        content_indexed: false,
+    }));
+    losses.sort_by(|a, b| a.path.cmp(&b.path));
     losses.truncate(MAX_LOSS_ENTRIES);
+    c.losses_truncated = total_losses > losses.len();
     c.losses = losses;
     c.complete = c.loss_counts.is_empty();
     c.symbols = count(conn, "SELECT count(*) FROM symbols")?;
@@ -155,6 +197,9 @@ pub fn coverage(conn: &Connection, cfg: &IndexConfig) -> rusqlite::Result<Covera
     c.chunks = count(conn, "SELECT count(*) FROM chunks")?;
     c.edges = count(conn, "SELECT count(*) FROM edges")?;
     c.ignored_files = get(conn, "ignored_files")?
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    c.ignore_rules_dropped = get(conn, "ignore_rules_dropped")?
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
     c.invalid_paths = get(conn, "invalid_paths")?

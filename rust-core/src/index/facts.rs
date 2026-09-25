@@ -47,6 +47,9 @@ pub mod file_flag {
     /// A grammar language extracted lexically (file above `max_parse_bytes`, or the
     /// parse failed).
     pub const LEXICAL_FALLBACK: i64 = 16;
+    /// Declarations nested deeper than the extractor's qualified-name bound: their
+    /// container path is shortened to a hash (`~<hash>.name`).
+    pub const NESTING_TRUNCATED: i64 = 32;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -150,6 +153,8 @@ pub struct FileFacts {
     pub invalid_utf8: bool,
     pub symbols_truncated: bool,
     pub lexical_fallback: bool,
+    /// Some qualified names were shortened (see `file_flag::NESTING_TRUNCATED`).
+    pub nesting_truncated: bool,
     pub line_count: u32,
     /// Distinct reference names; `RefFact.0` indexes this table.
     pub names: Vec<String>,
@@ -172,7 +177,8 @@ impl FileFacts {
             u8::from(self.parse_errors)
                 | u8::from(self.invalid_utf8) << 1
                 | u8::from(self.symbols_truncated) << 2
-                | u8::from(self.lexical_fallback) << 3,
+                | u8::from(self.lexical_fallback) << 3
+                | u8::from(self.nesting_truncated) << 4,
         );
         w.uv(self.line_count as u64);
         w.uv(self.names.len() as u64);
@@ -332,6 +338,7 @@ impl FileFacts {
             invalid_utf8: fl & 2 != 0,
             symbols_truncated: fl & 4 != 0,
             lexical_fallback: fl & 8 != 0,
+            nesting_truncated: fl & 16 != 0,
             line_count,
             names,
             symbols,
@@ -355,11 +362,14 @@ impl FileFacts {
         if self.lexical_fallback {
             f |= file_flag::LEXICAL_FALLBACK;
         }
+        if self.nesting_truncated {
+            f |= file_flag::NESTING_TRUNCATED;
+        }
         f
     }
 }
 
-const CODEC_VERSION: u8 = 1;
+const CODEC_VERSION: u8 = 2;
 
 struct Enc(Vec<u8>);
 

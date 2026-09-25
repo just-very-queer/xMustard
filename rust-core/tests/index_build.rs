@@ -1163,6 +1163,58 @@ fn ignore_files_and_non_git_mode() {
     assert_eq!(rep["coverage"]["indexed_files"], 1);
 }
 
+/// Peak RSS of the child process itself, sampled while it runs (macOS: the resident
+/// size from proc_pid_rusage; Linux: VmHWM), and the wait4(2) peak, which also covers
+/// the child's own children (the `git ls-files` it streams from).
+fn child_self_peak_rss(cmd: &mut Command) -> (u64, u64, std::process::ExitStatus) {
+    let child = cmd.spawn().unwrap();
+    let pid = child.id() as libc::pid_t;
+    let mut own = 0u64;
+    let mut status: libc::c_int = 0;
+    // SAFETY: zeroed rusage/rusage_info are valid out-parameters; `pid` is our unreaped
+    // child until wait4 returns it.
+    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+    loop {
+        #[cfg(target_os = "macos")]
+        {
+            let mut info: libc::rusage_info_v2 = unsafe { std::mem::zeroed() };
+            let rc = unsafe {
+                libc::proc_pid_rusage(
+                    pid,
+                    libc::RUSAGE_INFO_V2,
+                    &mut info as *mut _ as *mut libc::rusage_info_t,
+                )
+            };
+            if rc == 0 {
+                own = own.max(info.ri_resident_size);
+            }
+        }
+        #[cfg(target_os = "linux")]
+        if let Ok(s) = fs::read_to_string(format!("/proc/{pid}/status"))
+            && let Some(kb) = s
+                .lines()
+                .find_map(|l| l.strip_prefix("VmHWM:"))
+                .and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
+        {
+            own = own.max(kb * 1024);
+        }
+        let rc = unsafe { libc::wait4(pid, &mut status, libc::WNOHANG, &mut ru) };
+        if rc == pid {
+            break;
+        }
+        assert_eq!(rc, 0, "wait4 failed");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    std::mem::forget(child);
+    let tree = if cfg!(target_os = "macos") {
+        ru.ru_maxrss as u64
+    } else {
+        ru.ru_maxrss as u64 * 1024
+    };
+    use std::os::unix::process::ExitStatusExt;
+    (own, tree, std::process::ExitStatus::from_raw(status))
+}
+
 /// Peak RSS of one child run, from wait4(2).
 fn child_peak_rss(cmd: &mut Command) -> (u64, std::process::ExitStatus) {
     let child = cmd.spawn().unwrap();
@@ -1283,4 +1335,605 @@ fn invalid_utf8_files_are_indexed_from_their_lossy_text() {
         "{text:?}"
     );
     assert!(text.contains('\u{fffd}'));
+}
+
+// ---- review round 1 regressions ----
+
+fn run_env(args: &[&str], env: &[(&str, &str)]) -> Output {
+    let mut cmd = Command::new(BIN);
+    cmd.args(args);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    cmd.output().unwrap()
+}
+
+/// Every term of `chunk_fts`'s vocabulary (any column).
+fn vocab(conn: &Connection) -> BTreeSet<String> {
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS temp.v_row USING fts5vocab(main, chunk_fts, row);",
+    )
+    .unwrap();
+    let mut st = conn.prepare("SELECT term FROM temp.v_row").unwrap();
+    st.query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+fn names(conn: &Connection) -> BTreeSet<String> {
+    let mut st = conn.prepare("SELECT name FROM names").unwrap();
+    st.query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+/// Code padding that keeps a file above the 64 KiB parse cap.
+fn rust_padding(n: usize) -> String {
+    (0..n)
+        .map(|i| format!("pub fn pad_{i}(x: u32) -> u32 {{ x + {i} }}\n"))
+        .collect()
+}
+
+#[test]
+fn fallback_extractor_keeps_literals_out_of_references_names_and_postings() {
+    let big_rs = format!(
+        "{}pub fn uses_nothing() -> &'static str {{\n    let _raw = r#\"raw \"GhostRaw\" here\"#;\n    \"the secret passphrase is hunter2 swordfish\n GhostTarget end\"\n}}\n",
+        rust_padding(2200)
+    );
+    assert!(big_rs.len() > 64 << 10);
+    let big_tsx = format!(
+        "{}export function Panel() {{\n  return <p className=\"GhostClass\">Open renderGhostPanel now</p>;\n}}\n",
+        (0..1800)
+            .map(|i| format!("export const pad{i} = (x: number) => x + {i};\n"))
+            .collect::<String>()
+    );
+    assert!(big_tsx.len() > 64 << 10);
+    let r = repo(&[
+        ("src/big.rs", &big_rs),
+        (
+            "src/defs.rs",
+            "pub struct GhostTarget;\npub fn GhostRaw() {}\n",
+        ),
+        ("web/big.tsx", &big_tsx),
+        ("web/defs.ts", "export function renderGhostPanel() {}\n"),
+        (
+            "Legacy.java",
+            "class Legacy {\n  String s = \"\"\"\n    text block mentions GhostJava and AKIASECRETJAVA\n    \"\"\";\n  void run() { helper(s); }\n}\n",
+        ),
+        ("Ghost.java", "class GhostJava {}\n"),
+        (
+            "r.rb",
+            "def run\n  doc = <<~EOS\n    rubyheredocsecret mentions GhostRuby\n  EOS\n  q = %q{rubypercentsecret}\n  finish(doc, q)\nend\n",
+        ),
+        ("g.rb", "class GhostRuby\nend\n"),
+    ]);
+    let rep = index("build", r.path(), &["--content-retention", "none"]);
+    assert_eq!(
+        rep["coverage"]["loss_counts"]["lexical_fallback"], 2,
+        "{:#}",
+        rep["coverage"]
+    );
+    let conn = db(&rep);
+    for (path, ghosts) in [
+        (
+            "src/big.rs",
+            &[
+                "GhostTarget",
+                "GhostRaw",
+                "hunter2",
+                "swordfish",
+                "passphrase",
+            ][..],
+        ),
+        (
+            "web/big.tsx",
+            &["renderGhostPanel", "GhostClass", "Open"][..],
+        ),
+        ("Legacy.java", &["GhostJava", "AKIASECRETJAVA", "block"][..]),
+        (
+            "r.rb",
+            &["GhostRuby", "rubyheredocsecret", "rubypercentsecret", "EOS"][..],
+        ),
+    ] {
+        let refs = ref_names(&conn, path);
+        for g in ghosts {
+            assert!(
+                !refs.contains(*g),
+                "{path}: literal word {g} is a reference"
+            );
+        }
+    }
+    assert!(ref_names(&conn, "src/big.rs").contains("x"));
+    assert!(ref_names(&conn, "Legacy.java").contains("helper"));
+    assert!(ref_names(&conn, "r.rb").contains("finish"));
+    let e = edges(&conn);
+    for (from, to) in [
+        ("src/big.rs", "src/defs.rs"),
+        ("web/big.tsx", "web/defs.ts"),
+        ("Legacy.java", "Ghost.java"),
+        ("Legacy.java", "r.rb"),
+        ("r.rb", "g.rb"),
+    ] {
+        assert!(
+            !e.keys().any(|(f, t, _)| f == from && t == to),
+            "false edge {from} -> {to}: {e:#?}"
+        );
+    }
+    // content_retention=none: literal words reach neither the names nor the postings
+    let (n, v) = (names(&conn), vocab(&conn));
+    for w in [
+        "hunter2",
+        "swordfish",
+        "passphrase",
+        "rubyheredocsecret",
+        "rubypercentsecret",
+        "AKIASECRETJAVA",
+    ] {
+        assert!(!n.contains(w), "names table holds literal word {w}");
+        assert!(
+            !v.contains(&w.to_lowercase()),
+            "postings hold literal word {w}"
+        );
+    }
+    drop(conn);
+    for needle in ["hunter2", "rubyheredocsecret", "AKIASECRETJAVA"] {
+        assert!(!contains(&db_bytes(&rep), needle), "{needle} stored");
+    }
+}
+
+#[test]
+fn symbol_retention_postings_cannot_rebuild_the_source() {
+    let src = "// zebracomment explains the quokka pathway\n\
+               export function renderWidget(id: number): string {\n\
+               \x20 const secretToken = \"zq9xk2lmvbp7wr4tnd8hs3fy6gc1ej5a hunter2 open sesame\";\n\
+               \x20 return `${secretToken}-${id}`;\n\
+               }\n";
+    let r = repo(&[("w.ts", src)]);
+    let rep = index("build", r.path(), &[]);
+    assert_eq!(rep["content_retention"], "symbol");
+    let conn = db(&rep);
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE temp.v_inst USING fts5vocab(main, chunk_fts, instance);",
+    )
+    .unwrap();
+    let mut st = conn
+        .prepare("SELECT term FROM temp.v_inst WHERE col = 'body' ORDER BY doc, offset")
+        .unwrap();
+    let stream: Vec<String> = st
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    let joined = stream.join(" ");
+    assert!(!stream.is_empty());
+    for phrase in [
+        "zebracomment explains the quokka pathway",
+        "hunter2 open sesame",
+        "export function renderwidget",
+    ] {
+        assert!(
+            !joined.contains(phrase),
+            "source order recoverable ({phrase:?}): {joined}"
+        );
+    }
+    let mut sorted = stream.clone();
+    sorted.sort();
+    assert_eq!(
+        stream, sorted,
+        "positions follow the sorted bag, not the source"
+    );
+    // words stay searchable; the credential-shaped token does not
+    let v = vocab(&conn);
+    assert!(v.contains("quokka") && v.contains("renderwidget"));
+    assert!(!v.contains("zq9xk2lmvbp7wr4tnd8hs3fy6gc1ej5a"));
+    let hits: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM chunk_fts WHERE chunk_fts MATCH 'render AND widget'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(hits, 1);
+}
+
+#[test]
+fn unreadable_and_oversized_files_do_not_block_the_noop_exit() {
+    let r = repo(&[
+        ("a.rs", "pub fn a() {}\n"),
+        ("b.rs", "pub fn b() {}\n"),
+        ("sub/c.rs", "pub fn c() {}\n"),
+    ]);
+    let big: String = rust_padding(40_000);
+    assert!(big.len() > 1 << 20);
+    write(r.path(), "huge.rs", &big);
+    backdate(&r.path().join("huge.rs"));
+    commit_all(r.path());
+    // a tracked file reached through a symlinked directory cannot be read beneath the root
+    fs::rename(r.path().join("sub"), r.path().join("real")).unwrap();
+    std::os::unix::fs::symlink("real", r.path().join("sub")).unwrap();
+    let rep = index("build", r.path(), &[]);
+    let losses = &rep["coverage"]["loss_counts"];
+    assert_eq!(losses["oversized"], 1, "{losses:#}");
+    // refused by the beneath-root read (reported as symlink or not_regular by platform)
+    let read_failures =
+        losses["symlink"].as_u64().unwrap_or(0) + losses["not_regular"].as_u64().unwrap_or(0);
+    assert_eq!(read_failures, 1, "{losses:#}");
+    for _ in 0..2 {
+        let up = index("update", r.path(), &[]);
+        assert_eq!(
+            (up["mode"].as_str(), up["reason"].as_str()),
+            (Some("noop"), Some("unchanged")),
+            "{:#}",
+            up["counters"]
+        );
+        assert_eq!(up["counters"]["written"], 0);
+    }
+}
+
+#[test]
+fn a_racy_stat_key_is_never_trusted() {
+    let r = repo(&[("a.ts", "export function alphaOne() {}\n")]);
+    let rep = index("build", r.path(), &[]);
+    // same-size edit that a coarse timestamp cannot see: the stored key equals the key
+    // the next scan computes, but it is marked racy.
+    let p = r.path().join("a.ts");
+    fs::write(&p, "export function alphaTwo() {}\n").unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&p)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(120))
+        .unwrap();
+    let key = xmustard_core::index::scan::StatKey::of(&fs::symlink_metadata(&p).unwrap());
+    let c = Connection::open(rep["index_path"].as_str().unwrap()).unwrap();
+    c.execute(
+        "UPDATE files SET stat_key = ?1 WHERE path = 'a.ts'",
+        [format!("racy:{}", key.encode())],
+    )
+    .unwrap();
+    drop(c);
+    let up = index("update", r.path(), &[]);
+    assert_eq!(up["mode"], "incremental", "{up:#}");
+    assert!(up["counters"]["bytes_read"].as_u64().unwrap() > 0);
+    let syms = symbols_of(&db(&up), "a.ts");
+    assert!(has(&syms, "alphaTwo", "Function"), "{syms:#?}");
+}
+
+#[test]
+fn a_writer_that_waited_for_the_lock_scans_the_tree_after_it() {
+    let r = repo(&[("a.ts", "export function a() {}\n")]);
+    let rep = index("build", r.path(), &[]);
+    let dir = PathBuf::from(rep["index_path"].as_str().unwrap())
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let held = fs::File::options()
+        .write(true)
+        .open(dir.join("index.lock"))
+        .unwrap();
+    held.lock().unwrap();
+    let child = Command::new(BIN)
+        .args(["index", "update", r.path().to_str().unwrap()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // the update is now waiting for the lock; the tree changes meanwhile.
+    std::thread::sleep(std::time::Duration::from_millis(700));
+    write(r.path(), "z.ts", "export function zeta() {}\n");
+    commit_all(r.path());
+    let head = String::from_utf8(
+        Command::new("git")
+            .arg("-C")
+            .arg(r.path())
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    held.unlock().unwrap();
+    let out = child.wait_with_output().unwrap();
+    let up = ok_json(&out);
+    assert_eq!(up["last_commit"].as_str(), Some(head.trim()), "{up:#}");
+    assert_eq!(up["coverage"]["indexed_files"], 2, "{:#}", up["coverage"]);
+}
+
+#[test]
+fn an_index_past_the_envelope_updates_incrementally_and_exits_early() {
+    let files: Vec<(String, String)> = (0..6)
+        .map(|i| {
+            (
+                format!("m{i}.ts"),
+                format!(
+                    "export function f{i}a() {{}}\nexport function f{i}b() {{}}\nexport function f{i}c() {{}}\n"
+                ),
+            )
+        })
+        .collect();
+    let r = repo_owned(&files);
+    for flags in [&["--max-files", "3"][..], &["--max-symbols", "7"][..]] {
+        let rep = index("build", r.path(), flags);
+        assert_eq!(rep["coverage"]["complete"], false, "{flags:?}");
+        let rows: i64 = db(&rep)
+            .query_row("SELECT count(*) FROM files", [], |r| r.get(0))
+            .unwrap();
+        for _ in 0..2 {
+            let up = index("update", r.path(), flags);
+            assert_eq!(up["mode"], "noop", "{flags:?}: {up:#}");
+        }
+        // an edit inside the kept set stays incremental and equals a full build
+        write(
+            r.path(),
+            "m0.ts",
+            "export function f0a() {}\nexport function f0z() {}\n",
+        );
+        let up = index("update", r.path(), flags);
+        assert_eq!(up["mode"], "incremental", "{flags:?}: {up:#}");
+        let inc = digest(r.path(), flags);
+        index("build", r.path(), flags);
+        assert_eq!(
+            inc,
+            digest(r.path(), flags),
+            "{flags:?}: incremental != full"
+        );
+        // a new file ahead in path order moves the boundary: still incremental
+        write(r.path(), "a0.ts", "export function early() {}\n");
+        commit_all(r.path());
+        let up = index("update", r.path(), flags);
+        assert_eq!(up["mode"], "incremental", "{flags:?}: {up:#}");
+        let inc = digest(r.path(), flags);
+        let full = index("build", r.path(), flags);
+        assert_eq!(
+            inc,
+            digest(r.path(), flags),
+            "{flags:?}: incremental != full"
+        );
+        if flags[0] == "--max-files" {
+            // files past the envelope are counted, not stored
+            assert_eq!(full["coverage"]["loss_counts"]["envelope_files"], 4);
+            assert_eq!(full["coverage"]["eligible_files"], 7);
+            let now: i64 = db(&full)
+                .query_row("SELECT count(*) FROM files", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!((rows, now), (3, 3));
+        }
+        fs::remove_file(r.path().join("a0.ts")).unwrap();
+        write(r.path(), "m0.ts", &files[0].1);
+        commit_all(r.path());
+    }
+}
+
+#[test]
+fn deep_nesting_is_bounded_and_reported() {
+    // 4,600 nested functions in 64 KB: quadratic qualified names (measured 167 MiB) and a
+    // deep tree-sitter stack; now extracted lexically past MAX_PARSE_NESTING.
+    let mut deep = "function a(){".repeat(4600);
+    deep.push_str(&"}".repeat(4600));
+    deep.push('\n');
+    assert!(deep.len() < 64 << 10);
+    // 200 levels of long names: parsed, with qualified names bounded by a hashed prefix.
+    let name = "n".repeat(40);
+    let mut named = format!("function {name}(){{").repeat(200);
+    named.push_str(&"}".repeat(200));
+    named.push('\n');
+    let dir = repo(&[
+        ("deep.ts", &deep),
+        ("named.ts", &named),
+        ("ok.ts", "export function ok() {}\n"),
+    ]);
+    let out_path = dir.path().join("report.json");
+    let (peak, status) = child_peak_rss(
+        Command::new(BIN)
+            .args(["index", "build", dir.path().to_str().unwrap(), "--no-cache"])
+            .stdout(Stdio::from(fs::File::create(&out_path).unwrap()))
+            .stderr(Stdio::inherit()),
+    );
+    assert!(status.success());
+    let rep: Value = serde_json::from_slice(&fs::read(&out_path).unwrap()).unwrap();
+    let losses = &rep["coverage"]["loss_counts"];
+    assert_eq!(losses["nesting_truncated"], 2, "{losses:#}");
+    assert_eq!(losses["lexical_fallback"], 1, "{losses:#}");
+    let conn = db(&rep);
+    let (named_syms, longest): (i64, i64) = conn
+        .query_row(
+            "SELECT count(*), max(length(s.qualified_name)) FROM symbols s
+             JOIN files f ON f.id = s.file_id WHERE f.path = 'named.ts'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(named_syms, 200);
+    assert!(
+        longest <= 256 + 41,
+        "qualified names grow with depth: {longest}"
+    );
+    let engine: String = conn
+        .query_row(
+            "SELECT parse_status FROM files WHERE path = 'named.ts'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(engine, "tree_sitter");
+    let mib = peak as f64 / (1u64 << 20) as f64;
+    eprintln!("deeply nested build: peak RSS {mib:.1} MiB");
+    assert!(mib <= 25.0, "peak RSS {mib:.1} MiB for nested 64 KB files");
+}
+
+#[test]
+fn tracked_sets_far_past_the_envelope_keep_the_worker_bounded() {
+    let dir = TempDir::new().unwrap();
+    git(dir.path(), &["init", "-q"]);
+    let blob = String::from_utf8(
+        Command::new("git")
+            .arg("-C")
+            .arg(dir.path())
+            .args(["hash-object", "-w", "--stdin"])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    let blob = blob.trim();
+    // 20,000 present files and 100,000 tracked entries missing from the worktree
+    let mut info = String::new();
+    for i in 0..20_000 {
+        let rel = format!("p{:02}/f{i:05}.ts", i % 100);
+        write(dir.path(), &rel, &format!("export const v{i} = {i};\n"));
+        info.push_str(&format!("100644 {blob}\t{rel}\n"));
+    }
+    for i in 0..100_000 {
+        info.push_str(&format!("100644 {blob}\tgone/g{i:06}.ts\n"));
+    }
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(dir.path())
+        .args(["update-index", "--add", "--index-info"])
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(info.as_bytes())
+            .unwrap();
+    }
+    assert!(child.wait().unwrap().success());
+    drop(info);
+    let out_path = dir.path().join("report.json");
+    let (peak, tree_peak, status) = child_self_peak_rss(
+        Command::new(BIN)
+            .args([
+                "index",
+                "build",
+                dir.path().to_str().unwrap(),
+                "--no-cache",
+                "--max-files",
+                "2000",
+            ])
+            .stdout(Stdio::from(fs::File::create(&out_path).unwrap()))
+            .stderr(Stdio::inherit()),
+    );
+    assert!(status.success());
+    let rep: Value = serde_json::from_slice(&fs::read(&out_path).unwrap()).unwrap();
+    let cov = &rep["coverage"];
+    assert_eq!(cov["indexed_files"], 2000, "{cov:#}");
+    assert_eq!(cov["eligible_files"], 20_000);
+    assert_eq!(cov["loss_counts"]["envelope_files"], 18_000);
+    assert_eq!(cov["worktree_deleted_files"], 100_000);
+    assert_eq!(cov["losses"].as_array().unwrap().len(), 200);
+    assert_eq!(cov["losses_truncated"], true);
+    let rows: i64 = db(&rep)
+        .query_row("SELECT count(*) FROM files", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 2000, "files past the envelope have no rows");
+    let mib = peak as f64 / (1u64 << 20) as f64;
+    // `git ls-files` itself holds the whole Git index (about 28 MiB for 120k entries,
+    // measured alone); it is an external child and runs while the worker is at its
+    // scan-time low, so the worker's own peak is the bound asserted here.
+    eprintln!(
+        "120,000 tracked entries past the envelope: worker peak RSS {mib:.1} MiB (sampled), \
+         with children {:.1} MiB",
+        tree_peak as f64 / (1u64 << 20) as f64
+    );
+    assert!(mib <= 25.0, "worker peak RSS {mib:.1} MiB");
+    let up = index("update", dir.path(), &["--max-files", "2000"]);
+    assert_eq!(up["mode"], "noop", "{up:#}");
+}
+
+#[test]
+fn a_corrupt_store_is_rebuilt_instead_of_failing_every_update() {
+    let r = repo_owned(&many_files(4));
+    let rep = index("build", r.path(), &[]);
+    let path = PathBuf::from(rep["index_path"].as_str().unwrap());
+    let mut bytes = fs::read(&path).unwrap();
+    for b in bytes.iter_mut().skip(4096) {
+        *b = 0xAB;
+    }
+    fs::write(&path, &bytes).unwrap();
+    let up = index("update", r.path(), &[]);
+    assert_eq!(
+        (up["mode"].as_str(), up["reason"].as_str()),
+        (Some("full"), Some("corrupt_index")),
+        "{up:#}"
+    );
+    assert_eq!(index("update", r.path(), &[])["mode"], "noop");
+}
+
+#[test]
+fn non_git_indexes_are_private_and_repo_config_cannot_widen_access() {
+    use std::os::unix::fs::PermissionsExt;
+    let plain = TempDir::new().unwrap();
+    let cache = TempDir::new().unwrap();
+    write(plain.path(), "a.ts", "export function a() {}\n");
+    write(
+        plain.path(),
+        ".xmustard.json",
+        r#"{"index":{"allow_non_git":true,"content_retention":"full","include_untracked":true}}"#,
+    );
+    let env = [("XDG_CACHE_HOME", cache.path().to_str().unwrap())];
+    let root = plain.path().to_str().unwrap();
+    let out = run_env(&["index", "build", root], &env);
+    assert!(
+        !out.status.success(),
+        "a repository file enabled non-Git indexing"
+    );
+    let rep = ok_json(&run_env(&["index", "build", root, "--allow-non-git"], &env));
+    assert_eq!(rep["repo_mode"], "non-git");
+    assert_eq!(
+        rep["content_retention"], "symbol",
+        "repo file raised retention"
+    );
+    let db_path = PathBuf::from(rep["index_path"].as_str().unwrap());
+    let cache_root = fs::canonicalize(cache.path()).unwrap();
+    assert!(
+        fs::canonicalize(&db_path).unwrap().starts_with(&cache_root),
+        "{db_path:?} is not in the per-user cache"
+    );
+    let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(db_path.parent().unwrap()), 0o700);
+    assert_eq!(mode(&db_path), 0o600);
+    assert_eq!(mode(&db_path.parent().unwrap().join("index.lock")), 0o600);
+}
+
+#[test]
+fn nested_and_untracked_ignore_files_apply() {
+    let r = repo(&[
+        ("pkg/keep.ts", "export function keep() {}\n"),
+        ("pkg/gen.ts", "export function generated() {}\n"),
+        ("pkg/.xmustardignore", "gen.ts\n"),
+        ("backend/data/seed.ts", "export const seed = 1;\n"),
+        ("lib/a.ts", "export function a() {}\n"),
+    ]);
+    let rep = index("build", r.path(), &[]);
+    let paths = |rep: &Value| -> Vec<String> {
+        let conn = db(rep);
+        let mut st = conn
+            .prepare("SELECT path FROM files ORDER BY path")
+            .unwrap();
+        st.query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    };
+    // nested tracked ignore file, and the shared default for backend/data
+    assert_eq!(paths(&rep), vec!["lib/a.ts", "pkg/keep.ts"]);
+    // an untracked ignore file counts only when untracked files are indexed
+    write(r.path(), "lib/.xmustardignore", "a.ts\n");
+    write(r.path(), "lib/b.ts", "export function b() {}\n");
+    assert_eq!(
+        paths(&index("build", r.path(), &[])),
+        vec!["lib/a.ts", "pkg/keep.ts"]
+    );
+    assert_eq!(
+        paths(&index("build", r.path(), &["--include-untracked"])),
+        vec!["lib/b.ts", "pkg/keep.ts"]
+    );
 }

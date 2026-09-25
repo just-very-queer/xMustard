@@ -2,7 +2,9 @@
 //!
 //! Precedence, lowest first: built-in defaults, the `index` object of `<root>/.xmustard.json`,
 //! `XMUSTARD_INDEX_*` environment variables, then command-line flags. YAML repository
-//! configs are read by the Go API, which passes the same settings as flags.
+//! configs are read by the Go API, which passes the same settings as flags. The
+//! repository file may only narrow: lower the bounds and the retention, or turn
+//! `allow_non_git`/`include_untracked` off; widening is operator-only.
 
 use std::path::{Path, PathBuf};
 
@@ -10,12 +12,20 @@ use serde::{Deserialize, Serialize};
 
 /// What source-derived text the index may keep.
 ///
-/// - `full`: chunk source text is stored in `chunk_text` (snippets without disk reads).
-/// - `symbol` (default): no source text; chunk postings cover every word of the chunk
-///   (identifiers, comments and literals) as contentless FTS5 terms.
+/// - `full`: chunk source text is stored in `chunk_text` (snippets without disk reads),
+///   and chunk postings keep word positions.
+/// - `symbol` (default): no source text. A chunk's postings are the words of the chunk
+///   (identifiers, comment and literal words) as an unordered bag: sorted, so the
+///   positions FTS5 stores do not follow the source and the text cannot be rebuilt from
+///   the index. Credential-shaped words are left out (`chunks::is_secret_like`, a
+///   heuristic; PAR-SEC-04 owns redaction), but other literal and comment words remain
+///   searchable terms.
 /// - `none`: no source text, and the postings hold only code identifiers, which the
 ///   symbol and reference tables already name. Comment and literal words never reach
 ///   the index.
+///
+/// Ranking is BM25 over term frequencies, which the bag keeps; only phrase and NEAR
+/// queries need `full`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ContentRetention {
@@ -31,6 +41,15 @@ impl ContentRetention {
             ContentRetention::Full => "full",
             ContentRetention::Symbol => "symbol",
             ContentRetention::None => "none",
+        }
+    }
+
+    /// How much source-derived text a level keeps (`none` < `symbol` < `full`).
+    fn rank(self) -> u8 {
+        match self {
+            ContentRetention::None => 0,
+            ContentRetention::Symbol => 1,
+            ContentRetention::Full => 2,
         }
     }
 
@@ -118,21 +137,25 @@ impl IndexConfig {
             let file: RepoConfigFile =
                 serde_json::from_slice(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
             // The repository file is content the index reads, not operator input: it may
-            // lower resource bounds but never raise them above the defaults (raising takes
-            // a flag or XMUSTARD_INDEX_* from the operator).
+            // lower resource bounds and retention but never raise them above the defaults,
+            // and it cannot widen what is read (non-Git directories, untracked files).
+            // Raising takes a flag or XMUSTARD_INDEX_* from the operator.
             if let Some(ix) = file.index {
                 if let Some(v) = ix.content_retention {
-                    cfg.content_retention = ContentRetention::parse(&v)
+                    let want = ContentRetention::parse(&v)
                         .ok_or_else(|| format!("index.content_retention: unknown value {v:?}"))?;
+                    if want.rank() <= cfg.content_retention.rank() {
+                        cfg.content_retention = want;
+                    }
                 }
                 if let Some(v) = ix.max_file_size {
                     cfg.max_file_size = v.min(DEFAULT_MAX_FILE_SIZE);
                 }
-                if let Some(v) = ix.allow_non_git {
-                    cfg.allow_non_git = v;
+                if ix.allow_non_git == Some(false) {
+                    cfg.allow_non_git = false;
                 }
-                if let Some(v) = ix.include_untracked {
-                    cfg.include_untracked = v;
+                if ix.include_untracked == Some(false) {
+                    cfg.include_untracked = false;
                 }
                 if let Some(v) = ix.max_files {
                     cfg.max_files = v.min(DEFAULT_MAX_FILES);
@@ -162,6 +185,9 @@ impl IndexConfig {
         }
         if let Some(v) = get("XMUSTARD_INDEX_ALLOW_NON_GIT") {
             self.allow_non_git = parse_bool(&v);
+        }
+        if let Some(v) = get("XMUSTARD_INDEX_INCLUDE_UNTRACKED") {
+            self.include_untracked = parse_bool(&v);
         }
         if let Some(v) = get("XMUSTARD_INDEX_DIR").filter(|v| !v.is_empty()) {
             self.index_dir = Some(PathBuf::from(v));
@@ -256,6 +282,25 @@ mod tests {
             "a repo cannot raise bounds"
         );
         assert_eq!(raised.max_files, DEFAULT_MAX_FILES);
+        // nor widen what is read or kept
+        std::fs::write(
+            dir.path().join(".xmustard.json"),
+            r#"{"index":{"allow_non_git":true,"include_untracked":true,"content_retention":"full"}}"#,
+        )
+        .unwrap();
+        let widened = IndexConfig::load(dir.path()).unwrap();
+        if std::env::var_os("XMUSTARD_INDEX_ALLOW_NON_GIT").is_none() {
+            assert!(
+                !widened.allow_non_git,
+                "repo config enabled non-Git indexing"
+            );
+        }
+        if std::env::var_os("XMUSTARD_INDEX_INCLUDE_UNTRACKED").is_none() {
+            assert!(!widened.include_untracked);
+        }
+        if std::env::var_os("XMUSTARD_INDEX_CONTENT_RETENTION").is_none() {
+            assert_eq!(widened.content_retention, ContentRetention::Symbol);
+        }
         cfg.apply_env(|k| (k == "XMUSTARD_INDEX_CONTENT_RETENTION").then(|| "full".to_string()))
             .unwrap();
         assert_eq!(cfg.content_retention, ContentRetention::Full);
