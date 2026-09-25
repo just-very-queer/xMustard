@@ -94,12 +94,12 @@ access logs.
 | Tool | Args | What it does |
 |------|------|--------------|
 | `ground` | — | Orientation before acting: changed / stale / broken / blocked since baseline, with index-trust (drift), contract breaks, and stale-memory count. |
-| `recall` | `query?`, `paths?` | The verified shared context to trust, ranked to your task. Each entry is re-checked against the live tree; stale ones are flagged, and path-overlap conflicts are listed. |
+| `recall` | `query?`, `paths?` | The verified shared context to trust, ranked to your task (lexical + path overlap + verification strength). Each entry is re-checked against the live tree; stale ones are flagged. `conflicts` lists memories that cite the same file: path overlap, not semantic contradiction. |
 | `remember` | `content`, `title?`, `paths?` | Propose a durable memory (fact / decision / gotcha). `paths` are the files it's about, so recall can flag it stale when they change. Pending until verified. |
 | `verify` | `entry_id`, `approve?` | Approve (or reject) a peer's proposed memory; it promotes once enough distinct principals approve. |
-| `search` | `query`, `mode?` (`hybrid`\|`pattern`), `lang?`, `seed?` | Narrow code search — relevant slices, not a dump. Default `hybrid` fuses lexical + semantic + structural + graph-proximity (RRF); `mode=pattern` runs an ast-grep structural query; `seed=<symbol>` anchors the proximity lane. |
+| `search` | `query`, `mode?` (`hybrid`\|`pattern`), `lang?`, `seed?` | Code search returning `path:line` slices, not a dump. Default `hybrid` ranks symbol names, file paths and doc chunks, not function bodies: RRF over lexical IDF, char-trigram fuzzy matching (typo tolerance; conceptual matching only when built with the optional `semantic-onnx` feature), inbound-reference degree, and graph proximity to `seed=<symbol>`. `mode=pattern` runs an ast-grep structural query over code. |
 | `explain` | `path` | Explain a file or directory: purpose, key symbols, how to run/verify it. |
-| `impact` | `symbol?`, `from?`, `to?` | Blast radius. No args → current changes (with `contract_break` flags); `symbol=` → transitive references (graph BFS); `from=`&`to=` → shortest dependency path between two symbols. |
+| `impact` | `symbol?`, `from?`, `to?` | Blast radius over a lexical reference graph (symbol-name matches across files plus import-line heuristics, not resolved calls), so distance ≥ 1 edges are leads to confirm, not proof. No args → current changes (with `contract_break` flags); `symbol=` → transitive dependents; `from=`&`to=` → shortest dependency path between two symbols. |
 | `diagnostics` | — | Current normalized errors/warnings for the workspace. |
 | `why_failed` | `run_id` | Explain why a run failed: failure signals, salient error lines, and which changed files are implicated. |
 
@@ -138,7 +138,7 @@ in [architecture](docs/ARCHITECTURE.md).
 ## Repo Layout
 
 - `api-go/`: Go HTTP backend, stdio MCP server, operator CLI, persistence, and Rust bridge
-- `rust-core/`: Rust core — scanner, repo map, verification, diagnostics, lsp, goal/swarm runtime, data models, semantic search
+- `rust-core/`: Rust core — scanner, repo map, verification, diagnostics, lsp, goal/swarm runtime, semantic search
 - `backend/`: runtime data (`data/`) and SQL schema (`sql/`) only; the Python FastAPI/Typer stack was retired to `archive/2026-06-16-python-backend/`
 - `frontend/`: React and TypeScript UI surface (proxies `/api` → `:8042`)
 - `integrations/pi/`: version-pinned Pi extension (implementation candidate)
