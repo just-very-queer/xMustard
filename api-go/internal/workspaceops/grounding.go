@@ -71,10 +71,14 @@ type SessionGrounding struct {
 	WorkspaceID string `json:"workspace_id"`
 	groundingIndex
 	groundingRuns
-	BlockedByDirtyState          bool `json:"blocked_by_dirty_state"`
-	BlockedByFailingVerification bool `json:"blocked_by_failing_verification"`
+	// The blocked flags are null when the count they derive from is unknown.
+	BlockedByDirtyState          *bool `json:"blocked_by_dirty_state"`
+	BlockedByFailingVerification *bool `json:"blocked_by_failing_verification"`
 	groundingMemory
 	groundingSession
+	// Unknown lists every field that could not be determined (PAR-RT-11): a
+	// decode, read or listing failure is reported here, never as 0.
+	Unknown []GroundingUnknown `json:"unknown,omitempty"`
 }
 
 // BuildSessionGrounding answers "what changed / what's broken / what's blocked"
@@ -86,14 +90,23 @@ func BuildSessionGrounding(dataDir, workspaceID string) (*SessionGrounding, erro
 // BuildSessionGroundingCtx is the request-scoped variant: cancelling ctx kills its Rust/tool children.
 func BuildSessionGroundingCtx(ctx context.Context, dataDir, workspaceID string) (*SessionGrounding, error) {
 	g := &SessionGrounding{WorkspaceID: workspaceID}
-	if err := g.groundingIndex.build(ctx, dataDir, workspaceID); err != nil {
+	unknown, err := g.groundingIndex.build(ctx, dataDir, workspaceID)
+	if err != nil {
 		return nil, err
 	}
-	g.groundingRuns.build(dataDir, workspaceID)
-	g.BlockedByDirtyState = g.ChangedFiles > 0
-	g.BlockedByFailingVerification = len(g.RecentFailedRuns) > 0
+	g.Unknown = append(g.Unknown, unknown...)
+	if g.ChangedFiles != nil {
+		dirty := *g.ChangedFiles > 0
+		g.BlockedByDirtyState = &dirty
+	}
+	unknown, failuresKnown := g.groundingRuns.build(dataDir, workspaceID)
+	g.Unknown = append(g.Unknown, unknown...)
+	// a listed failure blocks even when other records are unreadable
+	if failing := len(g.RecentFailedRuns) > 0; failing || failuresKnown {
+		g.BlockedByFailingVerification = &failing
+	}
 	g.stampGenerated()
-	g.groundingMemory.build(dataDir, workspaceID)
+	g.Unknown = append(g.Unknown, g.groundingMemory.build(dataDir, workspaceID)...)
 	g.summarize()
 	return g, nil
 }

@@ -7,7 +7,8 @@ import (
 )
 
 // The section split of grounding.go must not change the `ground` wire shape: the
-// same keys, in the same order, with the same values.
+// same keys, in the same order, with the same values. ("unknown" is added only
+// when a field could not be determined; see grounding_unknown_test.go.)
 func TestGroundingSplitKeepsWireShape(t *testing.T) {
 	dataDir, ws := seedGroundBenchWorkspace(t)
 	g, err := BuildSessionGrounding(dataDir, ws)
@@ -41,9 +42,9 @@ func TestGroundingSplitKeepsWireShape(t *testing.T) {
 	if strings.Join(keys, ",") != strings.Join(want, ",") {
 		t.Fatalf("ground keys changed:\n got %v\nwant %v", keys, want)
 	}
-	if g.ChangedFiles != 1 || g.DirtySymbols != 1 || g.ContractBreaks != 1 || len(g.BrokenContracts) != 1 ||
-		len(g.RecentFailedRuns) != 4 || !g.BlockedByDirtyState || !g.BlockedByFailingVerification ||
-		g.StaleMemoryTotal != 50 || g.StaleMemoryChecked != 50 || !g.StaleMemoryComplete {
+	if *g.ChangedFiles != 1 || *g.DirtySymbols != 1 || *g.ContractBreaks != 1 || len(g.BrokenContracts) != 1 ||
+		len(g.RecentFailedRuns) != 4 || !*g.BlockedByDirtyState || !*g.BlockedByFailingVerification ||
+		g.StaleMemoryTotal != 50 || g.StaleMemoryChecked != 50 || !g.StaleMemoryComplete || len(g.Unknown) != 0 {
 		t.Fatalf("ground values changed: %s", raw)
 	}
 	if want := "1 changed file(s), 1 dirty symbol(s), 1 contract break(s), 4 failed run(s), 0 stale memory."; g.Summary != want {

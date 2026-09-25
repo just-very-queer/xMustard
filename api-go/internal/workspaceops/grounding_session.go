@@ -16,11 +16,46 @@ func (s *groundingSession) stampGenerated() {
 	s.GeneratedAt = time.Now().UTC().Format(time.RFC3339)
 }
 
-// summarize writes the summary from the other sections.
+// GroundingUnknown names a `ground` field that could not be determined and why.
+// Such a field is null (or, for the stale-memory counts, incomplete), never a
+// silent 0.
+type GroundingUnknown struct {
+	Field  string `json:"field"`
+	Reason string `json:"reason"`
+}
+
+// summarize writes the summary from the other sections; "?" marks an unknown count.
 func (g *SessionGrounding) summarize() {
-	g.Summary = fmt.Sprintf("%d changed file(s), %d dirty symbol(s), %d contract break(s), %d failed run(s), %d stale memory.",
-		g.ChangedFiles, g.DirtySymbols, g.ContractBreaks, len(g.RecentFailedRuns), g.StaleMemory)
+	count := func(n *int) string {
+		if n == nil {
+			return "?"
+		}
+		return fmt.Sprint(*n)
+	}
+	runs := fmt.Sprint(len(g.RecentFailedRuns))
+	if g.BlockedByFailingVerification == nil {
+		runs = "?"
+	}
+	stale := fmt.Sprint(g.StaleMemory)
+	if g.isUnknown("stale_memory") {
+		stale = "?"
+	}
+	g.Summary = fmt.Sprintf("%s changed file(s), %s dirty symbol(s), %s contract break(s), %s failed run(s), %s stale memory.",
+		count(g.ChangedFiles), count(g.DirtySymbols), count(g.ContractBreaks), runs, stale)
 	if n := g.MemoryVerificationModes[VerificationSelfAssertedOpen]; n > 0 {
 		g.Summary += fmt.Sprintf(" %d memory self-asserted in open mode (not peer-verified).", n)
 	}
+	if len(g.Unknown) > 0 {
+		g.Summary += fmt.Sprintf(" %d field(s) unknown (see unknown).", len(g.Unknown))
+	}
+}
+
+// isUnknown reports whether field is listed unknown.
+func (g *SessionGrounding) isUnknown(field string) bool {
+	for _, u := range g.Unknown {
+		if u.Field == field {
+			return true
+		}
+	}
+	return false
 }
