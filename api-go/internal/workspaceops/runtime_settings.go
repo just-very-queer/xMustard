@@ -638,9 +638,9 @@ func applyGuidanceToPrompt(prompt string, guidance []RepoGuidanceRecord) string 
 
 const activeContextLimit = 12
 
-// applyActiveContextToPrompt prepends the workspace's VERIFIED shared context —
-// entries promoted only after multi-agent verification (context governance) — to
-// an agent prompt, so every run grounds on the same trusted facts instead of each
+// applyActiveContextToPrompt prepends the workspace's promoted shared context —
+// entries promoted by context governance, with open-mode self-asserted ones tagged
+// as such — to an agent prompt, so every run grounds on the same trusted facts instead of each
 // agent re-deriving them. Best-effort and bounded: returns the prompt unchanged on
 // error or when nothing has been promoted, and caps both entry count and length.
 func applyActiveContextToPrompt(dataDir, workspaceID, prompt string) string {
@@ -657,6 +657,9 @@ func applyActiveContextToPrompt(dataDir, workspaceID, prompt string) string {
 		content := strings.TrimSpace(e.Content)
 		if len(content) > 280 {
 			content = content[:280] + "…"
+		}
+		if e.VerificationMode == VerificationSelfAssertedOpen {
+			title += " (self-asserted in open mode, not peer-verified)"
 		}
 		lines = append(lines, "- "+title+": "+content)
 	}

@@ -123,6 +123,8 @@ export interface MemoryEntry {
   status: string
   promoted: boolean
   required_verifications: number
+  require_verification?: boolean
+  verification_mode?: 'peer_verified' | 'self_asserted_open_mode' | 'single_agent' | ''
   verifications: { agent: string; approve: boolean }[]
   paths?: string[]
   stale?: boolean
@@ -131,6 +133,7 @@ export interface MemoryEntry {
 
 export interface ActiveMemory {
   active_count: number
+  verification_modes?: Record<string, number>
   stale_count: number
   conflicts: { path: string; entry_ids: string[]; titles: string[] }[]
   entries: MemoryEntry[]

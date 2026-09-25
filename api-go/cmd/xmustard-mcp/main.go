@@ -76,9 +76,9 @@ func splitCSV(s string) []string {
 // method and path it proxies to on the xMustard API.
 func tools() []tool {
 	return []tool{
-		{"ground", "Orient before acting: what changed / what's stale / what's broken / what's blocked since the indexed baseline, with index-trust (drift) and any contract breaks (changed function signatures vs the baseline) included.", []string{"workspace_id"}, nil,
+		{"ground", "Orient before acting: what changed, is stale, broken or blocked since the baseline, with index drift and contract breaks (changed signatures).", []string{"workspace_id"}, nil,
 			func(a map[string]string) (string, string, string) { return "GET", wsPath(a, "/session-grounding"), "" }},
-		{"recall", "VERIFIED shared context, RANKED by query and/or paths (lexical + path overlap + approvals); non-matches dropped. No args → top-N favoring working-tree overlap, then recency. conflicts: path overlap, not contradiction.", []string{"workspace_id"},
+		{"recall", "Shared memory RANKED by query/paths (lexical, path overlap, approvals); non-matches dropped (terms >=3 chars). No args: top-N by working-tree overlap, then recency. verification_mode: peer_verified | single_agent | self_asserted_open_mode (no auth/quorum). conflicts: path overlap, not contradiction.", []string{"workspace_id"},
 			[]argSpec{{"query", "string", nil, "task query to rank memories by"}, {"paths", "string", nil, "comma-separated repo-relative files to focus on"}},
 			func(a map[string]string) (string, string, string) {
 				p := wsPath(a, "/context/active")
@@ -92,7 +92,7 @@ func tools() []tool {
 				}
 				return "GET", p, ""
 			}},
-		{"remember", "Propose a durable memory (fact/decision/gotcha) for the shared context; pending until verified by enough agents. Pass content; optional title and paths (comma-separated files the memory is about, so recall can flag it stale when they change).", []string{"workspace_id", "content"},
+		{"remember", "Propose a durable memory (fact/decision/gotcha); pending until enough distinct agents verify it (open mode: promoted at once as self_asserted_open_mode). Pass content; optional title, paths (comma-separated files it is about, so recall flags it stale when they change).", []string{"workspace_id", "content"},
 			[]argSpec{{"title", "string", nil, "short title"}, {"paths", "string", nil, "comma-separated repo-relative files the memory is about"}},
 			func(a map[string]string) (string, string, string) {
 				// content goes in the JSON BODY, not the URL, so durable memory text is
@@ -116,7 +116,7 @@ func tools() []tool {
 				}
 				return "POST", wsPath(a, "/context/"+url.PathEscape(a["entry_id"])+"/verify") + "?approve=" + approve, ""
 			}},
-		{"search", "Code search: path:line slices. Default hybrid ranks symbol NAMES, file paths and doc chunks, not function bodies: RRF of lexical IDF, trigram fuzzy match (typo tolerance, not meaning, unless built with semantic-onnx and XMUSTARD_EMBED_MODEL set), reference degree, graph proximity to seed=<symbol> (else exact-name match). mode=pattern: ast-grep structural query (e.g. `$A && $A()`; optional lang).", []string{"workspace_id", "query"},
+		{"search", "Code search, path:line slices. Hybrid ranks symbol NAMES, paths and doc chunks, not function bodies: RRF of lexical IDF, trigram fuzzy match (typo tolerance, not meaning, unless built with semantic-onnx and XMUSTARD_EMBED_MODEL set), reference degree, proximity to seed=<symbol>. mode=pattern: ast-grep structural query (e.g. `$A && $A()`; optional lang).", []string{"workspace_id", "query"},
 			[]argSpec{{"mode", "string", []string{"hybrid", "pattern"}, "hybrid (default) or pattern (ast-grep)"}, {"lang", "string", nil, "language hint for pattern mode"}, {"seed", "string", nil, "symbol to anchor the graph-proximity lane"}},
 			func(a map[string]string) (string, string, string) {
 				p := wsPath(a, "/search") + "?q=" + url.QueryEscape(a["query"])

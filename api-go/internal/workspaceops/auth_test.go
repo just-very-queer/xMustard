@@ -64,6 +64,13 @@ func TestMintTokenValidation(t *testing.T) {
 	if _, err := MintToken(dir, "ok", "superuser"); err == nil {
 		t.Fatal("unknown role must be rejected")
 	}
+	// the open-mode identity is reserved: a principal under it would pass as the
+	// author of every open-mode memory
+	for _, id := range []string{OpenModeIdentity, "Anonymous", " ANONYMOUS "} {
+		if _, err := MintScopedToken(dir, id, "agent", 0, nil); err == nil {
+			t.Fatalf("reserved id %q must be rejected", id)
+		}
+	}
 	if _, err := MintToken(dir, "ok", "admin"); err != nil {
 		t.Fatalf("valid admin mint should succeed: %v", err)
 	}

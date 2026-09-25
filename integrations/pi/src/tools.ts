@@ -50,7 +50,7 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
 	{
 		name: "ground",
 		description:
-			"Orient before acting: what changed / what's stale / what's broken / what's blocked since the indexed baseline, with index-trust (drift) and any contract breaks (changed function signatures vs the baseline) included.",
+			"Orient before acting: what changed, is stale, broken or blocked since the baseline, with index drift and contract breaks (changed signatures).",
 		required: ["workspace_id"],
 		optional: [],
 		build: (a) => ({ method: "GET", path: ws(a, "/session-grounding") }),
@@ -58,7 +58,7 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
 	{
 		name: "recall",
 		description:
-			"VERIFIED shared context, RANKED by query and/or paths (lexical + path overlap + approvals); non-matches dropped. No args → top-N favoring working-tree overlap, then recency. conflicts: path overlap, not contradiction.",
+			"Shared memory RANKED by query/paths (lexical, path overlap, approvals); non-matches dropped (terms >=3 chars). No args: top-N by working-tree overlap, then recency. verification_mode: peer_verified | single_agent | self_asserted_open_mode (no auth/quorum). conflicts: path overlap, not contradiction.",
 		required: ["workspace_id"],
 		optional: [
 			{ name: "query", type: "string", desc: "task query to rank memories by" },
@@ -78,7 +78,7 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
 	{
 		name: "remember",
 		description:
-			"Propose a durable memory (fact/decision/gotcha) for the shared context; pending until verified by enough agents. Pass content; optional title and paths (comma-separated files the memory is about, so recall can flag it stale when they change).",
+			"Propose a durable memory (fact/decision/gotcha); pending until enough distinct agents verify it (open mode: promoted at once as self_asserted_open_mode). Pass content; optional title, paths (comma-separated files it is about, so recall flags it stale when they change).",
 		required: ["workspace_id", "content"],
 		optional: [
 			{ name: "title", type: "string", desc: "short title" },
@@ -106,7 +106,7 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
 	{
 		name: "search",
 		description:
-			"Code search: path:line slices. Default hybrid ranks symbol NAMES, file paths and doc chunks, not function bodies: RRF of lexical IDF, trigram fuzzy match (typo tolerance, not meaning, unless built with semantic-onnx and XMUSTARD_EMBED_MODEL set), reference degree, graph proximity to seed=<symbol> (else exact-name match). mode=pattern: ast-grep structural query (e.g. `$A && $A()`; optional lang).",
+			"Code search, path:line slices. Hybrid ranks symbol NAMES, paths and doc chunks, not function bodies: RRF of lexical IDF, trigram fuzzy match (typo tolerance, not meaning, unless built with semantic-onnx and XMUSTARD_EMBED_MODEL set), reference degree, proximity to seed=<symbol>. mode=pattern: ast-grep structural query (e.g. `$A && $A()`; optional lang).",
 		required: ["workspace_id", "query"],
 		optional: [
 			{ name: "mode", type: "string", enum: ["hybrid", "pattern"], desc: "hybrid (default) or pattern (ast-grep)" },
