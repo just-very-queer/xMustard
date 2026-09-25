@@ -784,6 +784,46 @@ func TestFTSRanksTitleContentAndAnchors(t *testing.T) {
 	}
 }
 
+// Archiving puts a still-valid memory away, so restoring it keeps its promotion;
+// retraction says it was wrong, so restoring it needs a new verification.
+func TestRestoreKeepsPromotionOnlyFromArchive(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t, newClock())
+	for _, id := range []string{"arch", "retr"} {
+		propose(t, s, id, "t", "fact "+id, "docs/"+id+".md")
+		vote(t, s, id, bob, VerdictApprove)
+		vote(t, s, id, carol, VerdictApprove)
+		promotePeer(t, s, id)
+		mustUpdate(t, s, func(tx Tx) error {
+			return tx.SetBaselines(ctx, id, []Baseline{{Kind: AnchorPath, Value: "docs/" + id + ".md", State: BaselineHash,
+				Hash: "h-" + id, BaselineKind: "file"}}, "c0ffee1", bob)
+		})
+	}
+	move := func(id, to string) {
+		mustUpdate(t, s, func(tx Tx) error {
+			_, err := tx.Transition(ctx, id, TransitionInput{To: to}, alice)
+			return err
+		})
+	}
+	move("arch", LifecycleArchived)
+	move("retr", LifecycleRetracted)
+	move("arch", LifecycleActive)
+	move("retr", LifecycleActive)
+	if e, _ := s.GetEntry(ctx, "arch"); !e.Served(time.Now()) || e.VerificationMode != ModePeerVerified {
+		t.Fatalf("restored from archive = %+v", e)
+	}
+	e, _ := s.GetEntry(ctx, "retr")
+	if e.Promoted || e.Status != StatusPending || e.VerificationMode != "" || e.Served(time.Now()) {
+		t.Fatalf("restored from retraction = %+v", e)
+	}
+	if anchors, _ := s.ListAnchors(ctx, "retr"); len(anchors) != 1 || anchors[0].BaselineState != BaselineNone {
+		t.Fatalf("baselines survived the demotion: %+v", anchors)
+	}
+	if anchors, _ := s.ListAnchors(ctx, "arch"); len(anchors) != 1 || anchors[0].BaselineState != BaselineHash {
+		t.Fatalf("archive restore dropped baselines: %+v", anchors)
+	}
+}
+
 func TestLifecycleSupersedeRetractMergeExpiryPurge(t *testing.T) {
 	ctx := context.Background()
 	clk := newClock()
@@ -839,10 +879,18 @@ func TestLifecycleSupersedeRetractMergeExpiryPurge(t *testing.T) {
 		_, err := tx.Transition(ctx, "old", TransitionInput{To: LifecycleActive}, carol)
 		return err
 	})
+	// Restoring a superseded entry does not bring its old verification back: it must be
+	// verified again before it is served.
 	old, _ = s.GetEntry(ctx, "old")
-	if old.Lifecycle != LifecycleActive || old.SupersededBy != "" || old.InvalidatedAt != "" || !old.Served(time.Now()) {
+	if old.Lifecycle != LifecycleActive || old.SupersededBy != "" || old.InvalidatedAt != "" ||
+		old.Promoted || old.Status != StatusPending || old.VerificationMode != "" || old.Served(time.Now()) {
 		t.Fatalf("restored = %+v", old)
 	}
+	if evs, _ := s.ListEvents(ctx, EventFilter{EntryID: "old", Types: []string{EventRestore, EventDemote}}); len(evs) != 2 ||
+		evs[0].Type != EventRestore || evs[1].Type != EventDemote {
+		t.Fatalf("restore events = %+v", evs)
+	}
+	promotePeer(t, s, "old") // bob's and carol's approvals of revision 1 still stand
 	if err := s.Update(ctx, func(tx Tx) error {
 		_, err := tx.Transition(ctx, "old", TransitionInput{To: LifecyclePurged}, carol)
 		return err

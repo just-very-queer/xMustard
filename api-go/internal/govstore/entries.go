@@ -171,6 +171,12 @@ type SupersedeInput struct {
 
 // TransitionInput moves an entry between lifecycle states. Supersession and purge
 // have their own methods.
+//
+// Restoring (To "active") from retracted, superseded or merged clears the entry's
+// promotion, verification mode and drift baselines, and appends a demote event: the
+// entry was withdrawn as wrong or replaced, so it must be verified again before it is
+// served. Restoring from archived keeps the promotion, because archiving only puts a
+// still-valid memory away.
 type TransitionInput struct {
 	To     string // retracted | archived | merged | active (restore)
 	Target string // merge target
@@ -671,10 +677,22 @@ func (t *txn) Transition(ctx context.Context, id string, in TransitionInput, act
 		return Entry{}, fmt.Errorf("%w: cannot move entry %s from %s to %s", ErrInvalid, id, cur.Lifecycle, in.To)
 	}
 	now := t.nowText()
+	demote := in.To == LifecycleActive && cur.Lifecycle != LifecycleArchived && (cur.Promoted || cur.Status == StatusVerified)
 	switch in.To {
 	case LifecycleActive:
-		_, err = t.exec(ctx, `UPDATE entries SET lifecycle = 'active', updated_at = ?, invalidated_at = NULL,
-			invalidated_commit = '', expired_at = NULL, superseded_by = '', merged_into = '' WHERE id = ?`, now, id)
+		if cur.Lifecycle == LifecycleArchived {
+			_, err = t.exec(ctx, `UPDATE entries SET lifecycle = 'active', updated_at = ?, invalidated_at = NULL,
+				invalidated_commit = '', expired_at = NULL, superseded_by = '', merged_into = '' WHERE id = ?`, now, id)
+			break
+		}
+		// Back from retracted, superseded or merged: nothing verified earlier carries over.
+		if _, err = t.exec(ctx, `UPDATE entries SET lifecycle = 'active', updated_at = ?, invalidated_at = NULL,
+			invalidated_commit = '', expired_at = NULL, superseded_by = '', merged_into = '',
+			status = CASE WHEN status = 'verified' THEN 'pending' ELSE status END, promoted = 0, verification_mode = '',
+			needs_reverify = 0, stale_since = NULL WHERE id = ?`, now, id); err == nil {
+			err = t.clearBaselines(ctx, id)
+		}
+		t.touch(id)
 	case LifecycleMerged:
 		target, terr := t.GetEntry(ctx, in.Target)
 		if terr != nil {
@@ -701,6 +719,18 @@ func (t *txn) Transition(ctx context.Context, id string, in TransitionInput, act
 		Note: in.Reason, Data: map[string]any{"from": cur.Lifecycle, "to": in.To, "target": in.Target},
 	}); err != nil {
 		return Entry{}, err
+	}
+	if demote {
+		if err := t.appendEvent(ctx, actor, eventRow{
+			WorkspaceID: cur.WorkspaceID, EntryID: id, Type: EventDemote, Revision: cur.Revision,
+			OldDigest: cur.ContentDigest, NewDigest: cur.ContentDigest,
+			Data: map[string]any{
+				"reason": "restored from " + cur.Lifecycle + "; must be verified again",
+				"from":   map[string]any{"status": cur.Status, "promoted": cur.Promoted, "verification_mode": cur.VerificationMode},
+			},
+		}); err != nil {
+			return Entry{}, err
+		}
 	}
 	return t.GetEntry(ctx, id)
 }

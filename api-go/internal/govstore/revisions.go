@@ -300,8 +300,7 @@ func (t *txn) serveRevision(ctx context.Context, cur Entry, rev int64, title, de
 		rev, rev, digest, title, description, tokenJSON, now, cur.ID); err != nil {
 		return err
 	}
-	if _, err := t.exec(ctx, `UPDATE anchors SET baseline_state = 'none', baseline_hash = '', baseline_kind = '',
-		baseline_commit = '', baseline_at = NULL, stale_since = NULL, stale_commit = '' WHERE entry_id = ?`, cur.ID); err != nil {
+	if err := t.clearBaselines(ctx, cur.ID); err != nil {
 		return err
 	}
 	res, err := t.exec(ctx, `UPDATE revisions SET state = 'withdrawn', decided_at = ?
@@ -319,6 +318,14 @@ func (t *txn) serveRevision(ctx context.Context, cur Entry, rev int64, title, de
 	}
 	t.touch(cur.ID)
 	return t.refreshFTS(ctx, cur.ID)
+}
+
+// clearBaselines drops an entry's drift baselines and stale marks. Baselines are
+// captured at promotion, so whatever clears a promotion clears them too.
+func (t *txn) clearBaselines(ctx context.Context, entryID string) error {
+	_, err := t.exec(ctx, `UPDATE anchors SET baseline_state = 'none', baseline_hash = '', baseline_kind = '',
+		baseline_commit = '', baseline_at = NULL, stale_since = NULL, stale_commit = '' WHERE entry_id = ?`, entryID)
+	return err
 }
 
 // AcceptRevision makes the pending head revision the served one. Like any change of
