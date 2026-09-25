@@ -153,6 +153,22 @@ symlink-refusing descriptor walk (`api-go/internal/workspaceops/safepath_unix.go
 so a path swapped for a symlink later is still refused. `explain` applies the same
 symlink check to its `path` before the core reads the file.
 
+## Health endpoint
+
+`/api/health` stays public so liveness probes need no token. Its full view shows
+host-wide activity: the data-movement counters (spawns, hashed bytes, captures),
+the owned process tree and the stdio shims on the host, live external processes,
+the heavy-slot owner labels and queue, the resident Rust worker's pid and memory,
+and the live pool and child counters. While authentication is enforced
+(`XMUSTARD_AUTH=required`, or `auto` with credentials minted), only an operator sees
+the full view: an `admin` token, or another token that holds more than `reader`, with
+no workspace scope. A reader-only token and a workspace-scoped token of any role
+(`admin` included) get the public view, which is the same as for a caller without a
+token: `status`, the pool size, the child cap, the budget gate and the soft ceiling,
+with a `detail` that says why. A public-view poll never samples the process tree.
+With `XMUSTARD_AUTH=off`, or `auto` with no credentials (the open loopback default),
+everyone gets the full view.
+
 ## Route gate table
 
 Every registered route appears here, core routes first. "Read-only mode" says
@@ -167,7 +183,7 @@ whether `XMUSTARD_READ_ONLY=1` still serves the route.
 | `DELETE /api/auth/tokens/{id}` | core | admin | served |  | revoke; served in read-only mode to cut off a leaked token |
 | `POST /api/auth/tokens/{id}/rotate` | core | admin | served |  | replaces the secret; the old one stops working |
 | `GET /api/auth/whoami` | core | reader | served |  | caller principal, roles and usable tools |
-| `ANY /api/health` | core | reader | served |  | public liveness and budget counters |
+| `ANY /api/health` | core | reader | served |  | public liveness and limits; the budget block needs an operator token while auth is enforced |
 | `GET /api/workspaces` | core | reader | served |  | filtered by token scope and workspace allowlist |
 | `POST /api/workspaces/load` | core | admin | refused |  | workspace registration; root checked against the allowlist |
 | `GET /api/workspaces/{workspace_id}/changes/since-index` | core | reader | served | impact |  |

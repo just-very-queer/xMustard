@@ -6,17 +6,20 @@ import (
 	"strings"
 
 	"xmustard/api-go/internal/budget"
+	"xmustard/api-go/internal/rustcore"
 	"xmustard/api-go/internal/workspaceops"
 )
 
 // healthBudget is the /api/health "budget" block (PAR-OPS-01): per-component reserved
-// and used memory, the heavy slot's owner and queue, the RSS watchdog, the byte pool and
-// child limit, Go GC and heap stats, and the data-movement counters (PAR-EVAL-04), plus
-// the API's own body admission.
+// and used memory, the heavy slot's owner and queue, the RSS watchdog and reclaim
+// requests, the byte pool and child limit, Go GC and heap stats, the data-movement
+// counters (PAR-EVAL-04), the resident Rust worker (WS-06B), plus the API's own body
+// admission.
 type healthBudget struct {
 	budget.Snapshot
-	RequestBodyCapBytes int64      `json:"request_body_cap_bytes"`
-	InFlightBodies      slotStatus `json:"in_flight_bodies"`
+	CoreWorker          rustcore.WorkerHealth `json:"core_worker"`
+	RequestBodyCapBytes int64                 `json:"request_body_cap_bytes"`
+	InFlightBodies      slotStatus            `json:"in_flight_bodies"`
 }
 
 type slotStatus struct {
@@ -24,8 +27,8 @@ type slotStatus struct {
 	InUse int `json:"in_use"`
 }
 
-// publicBudget is what an unauthenticated caller sees while authentication is enforced:
-// the static gate and soft ceiling, and nothing about activity.
+// publicBudget is what a caller without the full view sees: the static gate and soft
+// ceiling, and nothing about activity.
 type publicBudget struct {
 	Version          int    `json:"version"`
 	GateBytes        int64  `json:"gate_bytes"`
@@ -33,39 +36,61 @@ type publicBudget struct {
 	Detail           string `json:"detail"`
 }
 
-// healthBudgetFor is the budget block for one /api/health request. Health stays public
-// for liveness probes, but while authentication is enforced (XMUSTARD_AUTH=required, or
-// auto with credentials minted, as on every non-loopback bind) the block needs a valid
-// bearer token: it shows activity (captures, hashed bytes, spawns, live external
-// processes, heavy-slot owner and queue) and each uncached call samples the process
-// tree. Without a token only the gate and the soft ceiling are shown and nothing is
-// sampled.
-func healthBudgetFor(r *http.Request) any {
-	if !healthBudgetVisible(r) {
-		return publicBudget{Version: 1, GateBytes: budget.GateBytes, SoftCeilingBytes: budget.Gov.SoftCeiling(),
-			Detail: "authentication is enforced: send a bearer token for the full budget block"}
+// healthResponse is the /api/health body. Health stays public for liveness probes. The
+// full view (the budget block, and the live pool and child counters) shows host-wide
+// activity: captures, hashed bytes, spawns, the owned tree and live external processes,
+// the stdio shims on the host, the heavy-slot owner and queue, and the worker's pid and
+// memory. Each uncached call also samples the process tree. So while authentication is
+// enforced (XMUSTARD_AUTH=required, or auto with credentials minted, as on every
+// non-loopback bind) only an operator sees it: an admin or other non-reader token with
+// no workspace scope. Everyone else (no token, a reader-only token, or a
+// workspace-scoped token of any role) sees the static limits, and nothing is sampled.
+func healthResponse(r *http.Request) map[string]any {
+	full, detail := healthBudgetView(r)
+	body := map[string]any{"status": "ok", "service": "api-go"}
+	if !full {
+		body["transient_pool"] = map[string]any{"max": budget.TransientBytes.Max()}
+		body["children"] = map[string]any{"cap": budget.Children.Cap()}
+		body["budget"] = publicBudget{Version: 1, GateBytes: budget.GateBytes, SoftCeilingBytes: budget.Gov.SoftCeiling(), Detail: detail}
+		return body
 	}
-	return healthBudgetBlock()
+	// admission counters (bench/diagnostics): bytes xMustard reserved, not RSS
+	body["transient_pool"] = map[string]any{"max": budget.TransientBytes.Max(), "in_use": budget.TransientBytes.InUse(), "peak": budget.TransientBytes.Peak()}
+	body["children"] = map[string]any{"cap": budget.Children.Cap(), "in_use": budget.Children.InUse(), "peak": budget.Children.Peak()}
+	body["budget"] = healthBudgetBlock()
+	return body
 }
 
-// healthBudgetVisible applies the auth middleware's rule (enforce when mode is required
-// or credentials exist) to a route that middleware does not guard.
-func healthBudgetVisible(r *http.Request) bool {
+// healthBudgetView applies the auth middleware's rule (enforce when mode is required or
+// credentials exist) to a route that middleware does not guard, then the operator rule
+// above. detail says why a caller gets only the public view.
+func healthBudgetView(r *http.Request) (full bool, detail string) {
 	mode := strings.ToLower(strings.TrimSpace(envDefault("XMUSTARD_AUTH", "auto")))
 	if mode == "off" {
-		return true
+		return true, ""
 	}
 	token := ""
 	if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
 		token = strings.TrimPrefix(h, "Bearer ")
 	}
 	principal, configured := workspaceops.ResolveAuth(dataDir(), token)
-	return principal != nil || (mode != "required" && !configured)
+	switch {
+	case principal == nil && (mode == "required" || configured):
+		return false, "authentication is enforced: send an operator bearer token (admin, or another non-reader role with no workspace scope) for the full budget block"
+	case principal == nil:
+		return true, "" // auto mode with no credentials: the open loopback default
+	case len(principal.Workspaces) > 0:
+		return false, "the full budget block shows host-wide activity, so a workspace-scoped token sees only the limits"
+	case principal.ReadOnly():
+		return false, "the full budget block shows host-wide activity, so a reader-only token sees only the limits"
+	}
+	return true, ""
 }
 
 func healthBudgetBlock() healthBudget {
 	return healthBudget{
 		Snapshot:            budget.Status(),
+		CoreWorker:          rustcore.CoreWorkerHealth(),
 		RequestBodyCapBytes: budget.CapToPool(maxRequestBodyBytesConfigured()),
 		InFlightBodies:      slotStatus{Cap: cap(bodyInFlight), InUse: len(bodyInFlight)},
 	}
