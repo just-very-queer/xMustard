@@ -43,6 +43,9 @@ type exposurePosture struct {
 	AllowedHosts   map[string]bool // extra Host names (lowercase, no port)
 	AllowedOrigins map[string]bool // extra origins, "scheme://host[:port]"
 	Loopback       bool            // the API binds loopback only
+	// RegisterRoots are the directories under which a non-admin principal may
+	// register a git work tree (POST /api/workspaces/load); empty = admins only.
+	RegisterRoots []string
 }
 
 func (p *exposurePosture) platform() bool { return p != nil && p.Profile == profilePlatform }
@@ -62,6 +65,13 @@ func (p *exposurePosture) toolDisabled(tool string) bool {
 
 func (p *exposurePosture) allowsWorkspace(id string) bool {
 	return p == nil || len(p.Workspaces) == 0 || p.Workspaces[id]
+}
+
+func (p *exposurePosture) registerRoots() []string {
+	if p == nil {
+		return nil
+	}
+	return p.RegisterRoots
 }
 
 func (p *exposurePosture) disabledTools() []string {
@@ -84,6 +94,8 @@ func (p *exposurePosture) disabledTools() []string {
 //	XMUSTARD_WORKSPACE_ALLOWLIST=a,b workspace ids this deployment serves
 //	XMUSTARD_ALLOWED_HOSTS=a,b       extra Host names (a proxy's public name)
 //	XMUSTARD_ALLOWED_ORIGINS=a,b     extra browser origins, scheme://host[:port]
+//	XMUSTARD_REGISTER_ROOTS=/a:/b    where non-admin tokens may register git work
+//	                                 trees (OS path list; default: admins only)
 //
 // Conflicting profile settings and malformed values are startup errors.
 func loadExposurePosture() (exposurePosture, error) {
@@ -166,6 +178,11 @@ func loadExposurePosture() (exposurePosture, error) {
 		}
 		p.AllowedOrigins[norm] = true
 	}
+	roots, err := workspaceops.ParseRegisterRoots(os.Getenv("XMUSTARD_REGISTER_ROOTS"))
+	if err != nil {
+		return p, err
+	}
+	p.RegisterRoots = roots
 	return p, nil
 }
 

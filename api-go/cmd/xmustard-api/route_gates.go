@@ -63,7 +63,7 @@ var routeGateTable = map[string]routeGate{
 	"DELETE /api/auth/tokens/{id}":              {Core: true, Role: roleAdmin, ReadSafe: true, Note: "revoke; served in read-only mode to cut off a leaked token"},
 	"GET /api/auth/audit":                       coreGate(roleAdmin, "", ""),
 	"GET /api/workspaces":                       coreGate(roleReader, "", "filtered by token scope and workspace allowlist"),
-	"POST /api/workspaces/load":                 coreGate(roleAdmin, "", "workspace registration; root checked against the allowlist"),
+	"POST /api/workspaces/load":                 coreGate(roleProposer, "", "workspace registration; below admin only a git work tree top level under XMUSTARD_REGISTER_ROOTS; id checked against the allowlist"),
 	"POST /api/workspaces/{workspace_id}/index": coreGate(roleIndexer, "", "rebaseline the index; agents cannot reset it"),
 
 	// --- core: the nine MCP tools ---
