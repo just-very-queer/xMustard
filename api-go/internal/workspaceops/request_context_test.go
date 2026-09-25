@@ -327,6 +327,78 @@ func TestIdentityAfterExecutionSeesARefMoveOnTheColdPath(t *testing.T) {
 	}
 }
 
+// A removal leaves no stat key of its own. Among the git files the fingerprint reads
+// that holds for a loose ref (`update-ref -d`, the usual way to undo a root commit),
+// the index and the files in info/. On the cold path the stat key of the directory
+// that held one stands in (it moved when the file went), so the after-check samples
+// again rather than bind across the removal, and the pre-removal identity is not
+// cached. The clock is frozen, as for a deletion in the working tree.
+func TestIdentityAfterExecutionSeesAGitFileRemovalOnTheColdPath(t *testing.T) {
+	for _, c := range []struct {
+		name   string
+		setup  func(t *testing.T, root string) (tree string)
+		remove func(t *testing.T, tree string)
+	}{
+		{"the checked-out branch",
+			func(t *testing.T, root string) string { return root },
+			func(t *testing.T, tree string) { runGit(t, tree, "update-ref", "-d", "HEAD") }},
+		{"a branch in a nested ref directory",
+			func(t *testing.T, root string) string {
+				runGit(t, root, "checkout", "-q", "-b", "feature/x")
+				return root
+			},
+			func(t *testing.T, tree string) { runGit(t, tree, "update-ref", "-d", "refs/heads/feature/x") }},
+		{"a linked worktree's branch in the common dir",
+			func(t *testing.T, root string) string {
+				wt := filepath.Join(t.TempDir(), "wt")
+				runGit(t, root, "worktree", "add", "-q", "-b", "side", wt)
+				if canon, err := filepath.EvalSymlinks(wt); err == nil {
+					wt = canon
+				}
+				return wt
+			},
+			func(t *testing.T, tree string) { runGit(t, tree, "update-ref", "-d", "HEAD") }},
+		{"info/exclude",
+			func(t *testing.T, root string) string {
+				writeFile(t, filepath.Join(root, ".git", "info", "exclude"), "scratch.txt\n")
+				writeFile(t, filepath.Join(root, "scratch.txt"), "excluded until info/exclude goes\n")
+				return root
+			},
+			func(t *testing.T, tree string) { mustRemove(t, filepath.Join(tree, ".git", "info", "exclude")) }},
+		{"the index",
+			func(t *testing.T, root string) string { return root },
+			func(t *testing.T, tree string) { mustRemove(t, filepath.Join(tree, ".git", "index")) }},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f := installFakeSampler(t)
+			tree := c.setup(t, initGitRepo(t))
+			dir, ws := t.TempDir(), "wsGitFileRemoved"
+			writeSnapshotWithRoot(t, dir, ws, tree)
+			frozenIdentityClock(t)
+			ctx := context.Background()
+			rc := NewRequestContext(dir, ws)
+			if _, obs := rc.Identity(ctx); obs.Cached {
+				t.Fatal("cold cache: the before-identity must be sampled")
+			}
+			c.remove(t, tree)
+			f.set("k2")
+			if id, obs := rc.IdentityAfter(ctx); id.Key != "k2" || obs.Cached || f.runs.Load() != 2 {
+				t.Fatalf("a removal during the handler must re-sample: %+v %+v runs=%d", id, obs, f.runs.Load())
+			}
+			if id, _ := CurrentRepoIdentity(ctx, tree); id.Key != "k2" {
+				t.Fatalf("the pre-removal identity was cached: %+v", id)
+			}
+		})
+	}
+}
+
+func mustRemove(t *testing.T, path string) {
+	t.Helper()
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // A branch moved after repo-key read it and before the walk that would be paired with
 // that sample: the pairing is refused (the ref's stat key is racy), so the next read
 // samples instead of serving the pre-move key.
@@ -514,26 +586,39 @@ func TestIdentityCacheSkipsThePairingWalkForIsolatedReads(t *testing.T) {
 }
 
 // The lazy pairing of an isolated read's sample follows the same rule as any pairing
-// of a sample with a walk taken at another moment: a change after the sample (here a
-// branch moved by update-ref, which rewrites only the loose ref) makes the tree not
-// quiet, so the next read samples instead of serving the pre-change key.
+// of a sample with a walk taken at another moment: a change after the sample makes
+// the tree not quiet, so the next read samples instead of serving the pre-change key.
+// The changes here show up only in git files: a branch moved by update-ref (only the
+// loose ref is rewritten), the branch deleted (`update-ref -d HEAD`: the loose ref is
+// gone, its directory moved) and the index removed.
 func TestIdentityCacheRefusesALazyPairingAcrossAChange(t *testing.T) {
-	f := installFakeSampler(t)
-	root := initGitRepo(t)
-	moved := strings.TrimSpace(gitOutput(t, root, "commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "moved"))
-	frozenIdentityClock(t)
-	identityCache.mu.Lock()
-	identityCache.state(root).unusedPairing = true // a pairing expired unused
-	identityCache.mu.Unlock()
-	ctx := context.Background()
-	walks := fingerprintWalks.Load()
-	if id, obs := CurrentRepoIdentity(ctx, root); id.Key != "k1" || obs.Cached || fingerprintWalks.Load() != walks {
-		t.Fatalf("isolated read: %+v %+v walks=%d; want a sample and no walk", id, obs, fingerprintWalks.Load()-walks)
-	}
-	runGit(t, root, "update-ref", "HEAD", moved)
-	f.set("k2")
-	if id, obs := CurrentRepoIdentity(ctx, root); id.Key != "k2" || obs.Cached || f.runs.Load() != 2 {
-		t.Fatalf("a lazy pairing across a ref move served %+v %+v (runs=%d); want a fresh k2", id, obs, f.runs.Load())
+	for _, c := range []struct {
+		name   string
+		change func(t *testing.T, root, moved string)
+	}{
+		{"a branch moved", func(t *testing.T, root, moved string) { runGit(t, root, "update-ref", "HEAD", moved) }},
+		{"the branch deleted", func(t *testing.T, root, _ string) { runGit(t, root, "update-ref", "-d", "HEAD") }},
+		{"the index removed", func(t *testing.T, root, _ string) { mustRemove(t, filepath.Join(root, ".git", "index")) }},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f := installFakeSampler(t)
+			root := initGitRepo(t)
+			moved := strings.TrimSpace(gitOutput(t, root, "commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "moved"))
+			frozenIdentityClock(t)
+			identityCache.mu.Lock()
+			identityCache.state(root).unusedPairing = true // a pairing expired unused
+			identityCache.mu.Unlock()
+			ctx := context.Background()
+			walks := fingerprintWalks.Load()
+			if id, obs := CurrentRepoIdentity(ctx, root); id.Key != "k1" || obs.Cached || fingerprintWalks.Load() != walks {
+				t.Fatalf("isolated read: %+v %+v walks=%d; want a sample and no walk", id, obs, fingerprintWalks.Load()-walks)
+			}
+			c.change(t, root, moved)
+			f.set("k2")
+			if id, obs := CurrentRepoIdentity(ctx, root); id.Key != "k2" || obs.Cached || f.runs.Load() != 2 {
+				t.Fatalf("a lazy pairing across %s served %+v %+v (runs=%d); want a fresh k2", c.name, id, obs, f.runs.Load())
+			}
+		})
 	}
 }
 
@@ -741,6 +826,8 @@ func TestFingerprintStatKeysTheGitFilesItReads(t *testing.T) {
 	runGit(t, root, "worktree", "add", "-q", "-b", "side", wt)
 	branch := strings.TrimSpace(gitOutput(t, root, "symbolic-ref", "HEAD"))
 	wtGitDir := strings.TrimSpace(gitOutput(t, wt, "rev-parse", "--absolute-git-dir"))
+	// git reads a linked worktree's sparse-checkout file from its own git dir
+	writeFile(t, filepath.Join(wtGitDir, "info", "sparse-checkout"), "/*\n")
 	for _, c := range []struct{ what, tree, file string }{
 		{"HEAD", root, filepath.Join(root, ".git", "HEAD")},
 		{"the branch ref", root, filepath.Join(root, ".git", branch)},
@@ -748,6 +835,7 @@ func TestFingerprintStatKeysTheGitFilesItReads(t *testing.T) {
 		{"a linked worktree's branch ref (common dir)", wt, filepath.Join(root, ".git", "refs", "heads", "side")},
 		{"a linked worktree's gitfile", wt, filepath.Join(wt, ".git")},
 		{"a linked worktree's commondir", wt, filepath.Join(wtGitDir, "commondir")},
+		{"a linked worktree's sparse-checkout", wt, filepath.Join(wtGitDir, "info", "sparse-checkout")},
 	} {
 		before := repoStatFingerprint(c.tree, ign)
 		if !before.ok {
@@ -772,6 +860,55 @@ func TestFingerprintStatKeysTheGitFilesItReads(t *testing.T) {
 	runGit(t, root, "update-ref", "--no-deref", branch, moved)
 	if after := repoStatFingerprint(root, ign); !after.ok || after.same(before) {
 		t.Fatal("moving the branch at the end of a symbolic ref chain must change the fingerprint")
+	}
+}
+
+// A removal leaves no stat key of its own, and where no earlier walk exists to compare
+// with, only a newer stat key shows the racy rule a change. While the loose ref HEAD
+// resolves through, the index, a file in info/ or the XDG ignore file is missing, the
+// stat keys of the directories that held it stand in, so its removal adds a newer
+// stat key. While the ref is present its directories are not keyed: writing another
+// branch (a commit in another linked worktree, say) leaves the fingerprint alone.
+func TestFingerprintDatesTheRemovalOfAGitFile(t *testing.T) {
+	ign := newIgnoreSet(nil)
+	xdg := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", xdg)
+	root := initGitRepo(t)
+	writeFile(t, filepath.Join(root, ".git", "info", "attributes"), "*.bin binary\n")
+	writeFile(t, filepath.Join(xdg, "git", "ignore"), "*.log\n")
+	root2 := initGitRepo(t)
+	runGit(t, root2, "checkout", "-q", "-b", "feature/x")
+	wt := filepath.Join(t.TempDir(), "wt")
+	runGit(t, root2, "worktree", "add", "-q", "-b", "side", wt)
+
+	before := repoStatFingerprint(root, ign)
+	time.Sleep(20 * time.Millisecond)
+	runGit(t, root, "branch", "other")
+	if after := repoStatFingerprint(root, ign); !after.ok || !after.same(before) {
+		t.Fatal("writing another branch must leave the fingerprint alone while the checked-out one is a loose ref")
+	}
+	for _, c := range []struct {
+		what, tree string
+		remove     func()
+	}{
+		{"info/exclude", root, func() { mustRemove(t, filepath.Join(root, ".git", "info", "exclude")) }},
+		{"info/attributes", root, func() { mustRemove(t, filepath.Join(root, ".git", "info", "attributes")) }},
+		{"the XDG ignore file", root, func() { mustRemove(t, filepath.Join(xdg, "git", "ignore")) }},
+		{"the checked-out branch", root, func() { runGit(t, root, "update-ref", "-d", "HEAD") }},
+		{"the index", root, func() { mustRemove(t, filepath.Join(root, ".git", "index")) }},
+		{"a branch in a nested ref directory", root2, func() { runGit(t, root2, "update-ref", "-d", "refs/heads/feature/x") }},
+		{"a linked worktree's branch (common dir)", wt, func() { runGit(t, wt, "update-ref", "-d", "HEAD") }},
+	} {
+		before := repoStatFingerprint(c.tree, ign)
+		if !before.ok {
+			t.Fatalf("%s: fingerprint unavailable", c.what)
+		}
+		time.Sleep(20 * time.Millisecond) // a distinct mtime
+		c.remove()
+		after := repoStatFingerprint(c.tree, ign)
+		if !after.ok || after.same(before) || after.newestNs <= before.newestNs {
+			t.Fatalf("%s: its removal must add a newer stat key (newest %d -> %d, ok=%v)", c.what, before.newestNs, after.newestNs, after.ok)
+		}
 	}
 }
 

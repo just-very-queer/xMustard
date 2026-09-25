@@ -39,6 +39,10 @@ type identityFixtureOpts struct {
 	// searchMovesRef: the fake search moves the branch to a new commit with
 	// `git update-ref` (index and working tree untouched), moving the key to rev-2
 	searchMovesRef bool
+	// searchDeletesRef: the fake search deletes the checked-out branch's loose ref
+	// with `git update-ref -d HEAD` (the usual way to undo a root commit), moving the
+	// key to rev-2
+	searchDeletesRef bool
 }
 
 func newIdentityFixture(t *testing.T, searchBytes int, opts ...identityFixtureOpts) *identityFixture {
@@ -124,6 +128,9 @@ func newIdentityFixture(t *testing.T, searchBytes int, opts ...identityFixtureOp
 	}
 	if o.searchMovesRef {
 		delay += `git -C ` + root + ` update-ref HEAD "$(git -C ` + root + ` commit-tree 'HEAD^{tree}' -p HEAD -m moved)"; printf rev-2 > ` + f.keyFile + "; "
+	}
+	if o.searchDeletesRef {
+		delay += `git -C ` + root + ` update-ref -d HEAD; printf rev-2 > ` + f.keyFile + "; "
 	}
 	core := writeScript(t, `case "$1" in
 search) `+delay+`cat `+bigFile+` ;;
@@ -346,30 +353,42 @@ func TestDeletionDuringAReadToolIsNotBound(t *testing.T) {
 }
 
 // A branch moved while a read tool runs (`update-ref`: index and working tree
-// untouched, only the loose ref is rewritten), on a cold identity cache with the real
-// clock: the ref's stat key is racy, so the capture-time check samples again (2 runs)
-// and the result is not bound to the pre-move identity; neither the page nor the next
-// identity read serves it.
+// untouched, only the loose ref is rewritten) or deleted (`update-ref -d HEAD`: the
+// loose ref is gone, and only its directory's stat key moves), on a cold identity
+// cache with the real clock: the capture-time check sees a racy stat key and samples
+// again (2 runs), so the result is not bound to the pre-change identity; neither the
+// page nor the next identity read serves it.
 func TestRefMoveDuringAReadToolIsNotBound(t *testing.T) {
-	f := newIdentityFixture(t, 200<<10, identityFixtureOpts{searchMovesRef: true})
-	before := f.repoKeySpawns()
-	_, b, _ := f.do(t, "GET", "/api/workspaces/"+f.ws+"/search?q=x", "", nil, deliver)
-	var d evidence.Delivery
-	_ = json.Unmarshal(b, &d)
-	if !d.Reduced || d.Handle == "" || d.CapturedIdentity != "unknown" {
-		t.Fatalf("a result produced across a ref move must not bind: reduced=%v handle=%q identity=%s", d.Reduced, d.Handle, d.CapturedIdentity)
-	}
-	if n := f.repoKeySpawns() - before; n != 2 {
-		t.Fatalf("the capture-time check sampled %d times; want 2 (before and after)", n)
-	}
-	if _, last := f.expandAll(t, d.Handle, ""); last["freshness"] != "unknown" {
-		t.Fatalf("page of unbound evidence: %v", last)
-	}
-	if id, _ := workspaceops.CurrentRepoIdentity(context.Background(), f.root); id.Key != "rev-2" {
-		t.Fatalf("identity after the ref move = %+v; want rev-2", id)
+	for _, c := range []struct {
+		name string
+		opts identityFixtureOpts
+	}{
+		{"moved", identityFixtureOpts{searchMovesRef: true}},
+		{"deleted", identityFixtureOpts{searchDeletesRef: true}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f := newIdentityFixture(t, 200<<10, c.opts)
+			before := f.repoKeySpawns()
+			_, b, _ := f.do(t, "GET", "/api/workspaces/"+f.ws+"/search?q=x", "", nil, deliver)
+			var d evidence.Delivery
+			_ = json.Unmarshal(b, &d)
+			if !d.Reduced || d.Handle == "" || d.CapturedIdentity != "unknown" {
+				t.Fatalf("a result produced across a ref change must not bind: reduced=%v handle=%q identity=%s", d.Reduced, d.Handle, d.CapturedIdentity)
+			}
+			if n := f.repoKeySpawns() - before; n != 2 {
+				t.Fatalf("the capture-time check sampled %d times; want 2 (before and after)", n)
+			}
+			if _, last := f.expandAll(t, d.Handle, ""); last["freshness"] != "unknown" {
+				t.Fatalf("page of unbound evidence: %v", last)
+			}
+			if id, _ := workspaceops.CurrentRepoIdentity(context.Background(), f.root); id.Key != "rev-2" {
+				t.Fatalf("identity after the ref change = %+v; want rev-2", id)
+			}
+		})
 	}
 }
 
+// Without the fingerprint (here: a core that reports no ignored-directory listing;
 // likewise XMUSTARD_IDENTITY_CACHE_MS=0, an unavailable or costly walk) identity is
 // sampled as before the cache: before and after a reduced result, and on every
 // evidence page. Labels are unaffected.

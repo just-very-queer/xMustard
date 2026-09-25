@@ -25,13 +25,18 @@ import (
 //   - HEAD and the loose refs it resolves through, by content and by stat key (a
 //     branch moved by `reset --soft` or `update-ref` touches nothing else), the
 //     stat keys of packed-refs / reftable, and a gitfile or commondir file that
-//     points at the git directories;
+//     points at the git directories. A loose ref that is missing enters by the stat
+//     keys of its directories up to refs/ instead, so a ref removed (`update-ref -d
+//     HEAD`, which undoes a root commit) moves the nearest one that remains;
 //   - the stat keys of the index and of every file that changes what status shows
 //     or ignores: the repository config and config.worktree, info/exclude,
-//     info/attributes, info/sparse-checkout, the global and XDG config, ignore and
-//     attributes files, the common system config paths, the config files any of
-//     these include ([include] / [includeIf], whatever the condition), and the
-//     core.excludesFile / core.attributesFile any of them names;
+//     info/attributes, info/sparse-checkout (per worktree), the global and XDG
+//     config, ignore and attributes files, the common system config paths, the
+//     config files any of these include ([include] / [includeIf], whatever the
+//     condition), and the core.excludesFile / core.attributesFile any of them names.
+//     While missing, the index, the files in info/ and the XDG ignore and attributes
+//     files enter by the stat key of the directory that holds them (the git dir,
+//     info/, the XDG git directory), so their removal is dated too;
 //   - every directory git traverses: from the worktree top, every directory except
 //     the ones `repo-key` reported as ignored as a whole (git never descends into
 //     them). Each directory enters by its own stat key and its listing in full
@@ -59,10 +64,16 @@ import (
 // Not covered: system config under other install prefixes, config named by
 // GIT_CONFIG_COUNT / GIT_CONFIG_PARAMETERS in repo-key's environment, include paths
 // using %(prefix), and a clock on another host (network filesystems) that disagrees
-// with this one. The identity TTL bounds how long such a change can go
-// unseen while a cached identity is reused. A walk that exceeds its bounds, a
-// nested-worktree depth over fingerprintMaxNesting, or a layout it cannot read makes
-// the fingerprint unavailable, and the caller samples instead.
+// with this one. Nor, where no earlier walk exists to compare with, the removal of
+// config.worktree, of the global, system or an included config file, of a
+// core.excludesFile / core.attributesFile outside info/ and the XDG git directory,
+// or of a whole info/ or XDG git directory: the directories that would date it (the
+// git dir, the home or XDG config directory) change too often to key, so only the
+// digest shows such a removal, and only a comparison with an earlier walk sees it.
+// The identity TTL bounds how long such a change can go unseen while a cached
+// identity is reused. A walk that exceeds its bounds, a nested-worktree depth over
+// fingerprintMaxNesting, or a layout it cannot read makes the fingerprint
+// unavailable, and the caller samples instead.
 
 // fingerprintEntryBound is the directory entries one walk may read (a var for tests).
 var fingerprintEntryBound = 400_000
@@ -216,11 +227,27 @@ func (s *digestSink) statKey(label string, st *unix.Stat_t, err error) {
 }
 
 // fileKey adds the stat key of a metadata file, following symlinks as git does when
-// it reads config and ignore files.
-func (s *digestSink) fileKey(label, path string) {
+// it reads config and ignore files, and reports whether the file is there.
+func (s *digestSink) fileKey(label, path string) bool {
 	var st unix.Stat_t
 	err := unix.Stat(path, &st)
 	s.statKey(label, &st, err)
+	return err == nil
+}
+
+// fileOrDirKeys adds the stat key of the metadata file base/rel. A removed file
+// leaves no stat key of its own, so while it is missing the stat keys of its
+// directories below base stand in: the nearest one that remains moved when it went,
+// which gives the racy rule a newer timestamp. They are keyed only then, so writing a
+// sibling (another branch, say) does not change the fingerprint while the file is
+// there.
+func (s *digestSink) fileOrDirKeys(label, base, rel string) {
+	if s.fileKey(label, filepath.Join(base, rel)) {
+		return
+	}
+	for d := filepath.Dir(rel); d != "." && d != "/"; d = filepath.Dir(d) {
+		s.fileKey(label+"-dir", filepath.Join(base, d))
+	}
 }
 
 // repoStatFingerprint computes the fingerprint of the working state at root, walking
@@ -270,7 +297,9 @@ func repoStatFingerprint(root string, ignored *ignoreSet) repoFingerprint {
 // ignore, attributes and sparse-checkout files. Every file whose content it digests
 // also enters by its stat key: on a path with no earlier walk to compare with, the
 // racy rule sees a change only through a stat key (a branch moved by `reset --soft`
-// or `update-ref` rewrites the loose ref alone).
+// or `update-ref` rewrites the loose ref alone). A loose ref, the index or a file in
+// info/ that is missing enters by the stat keys of the directories that held it, so
+// its removal (`update-ref -d HEAD`, which undoes a root commit) is dated too.
 func (s *digestSink) metadata(top, gitDir, commonDir string) bool {
 	s.str("git", top, gitDir, commonDir)
 	// the layout itself: a linked worktree's or submodule's gitfile, and commondir
@@ -291,10 +320,10 @@ func (s *digestSink) metadata(top, gitDir, commonDir string) bool {
 		if depth >= symrefMaxDepth || strings.Contains(ref, "..") || filepath.IsAbs(ref) {
 			return false
 		}
-		s.fileKey("ref", filepath.Join(gitDir, ref))
+		s.fileOrDirKeys("ref", gitDir, ref)
 		loose, lerr := readSmallFile(filepath.Join(gitDir, ref))
 		if gitDir != commonDir {
-			s.fileKey("common-ref", filepath.Join(commonDir, ref))
+			s.fileOrDirKeys("common-ref", commonDir, ref)
 			if errors.Is(lerr, os.ErrNotExist) {
 				loose, lerr = readSmallFile(filepath.Join(commonDir, ref))
 			}
@@ -307,12 +336,17 @@ func (s *digestSink) metadata(top, gitDir, commonDir string) bool {
 	}
 	s.fileKey("packed-refs", filepath.Join(commonDir, "packed-refs"))
 	s.fileKey("reftable", filepath.Join(commonDir, "reftable", "tables.list"))
-	s.fileKey("index", filepath.Join(gitDir, "index"))
+	if !s.fileKey("index", filepath.Join(gitDir, "index")) {
+		// the git dir's stat key dates a removed index (it also moves with every
+		// index.lock, so it is keyed only while there is no index)
+		s.fileKey("index-dir", gitDir)
+	}
 	s.fileKey("config", filepath.Join(commonDir, "config"))
 	s.fileKey("config.worktree", filepath.Join(gitDir, "config.worktree"))
-	s.fileKey("exclude", filepath.Join(commonDir, "info", "exclude"))
-	s.fileKey("attributes", filepath.Join(commonDir, "info", "attributes"))
-	s.fileKey("sparse-checkout", filepath.Join(commonDir, "info", "sparse-checkout"))
+	s.fileOrDirKeys("exclude", commonDir, "info/exclude")
+	s.fileOrDirKeys("attributes", commonDir, "info/attributes")
+	// sparse-checkout is per worktree: a linked worktree's lives in its own git dir
+	s.fileOrDirKeys("sparse-checkout", gitDir, "info/sparse-checkout")
 	for i, p := range configuredFiles(filepath.Join(commonDir, "config"), top) {
 		s.fileKey("repo-configured-"+strconv.Itoa(i), p)
 	}
@@ -339,8 +373,8 @@ func (s *digestSink) userConfig(top string) {
 	}
 	if xdg != "" {
 		configs = append(configs, filepath.Join(xdg, "git", "config"))
-		s.fileKey("xdg-ignore", filepath.Join(xdg, "git", "ignore"))
-		s.fileKey("xdg-attributes", filepath.Join(xdg, "git", "attributes"))
+		s.fileOrDirKeys("xdg-ignore", xdg, "git/ignore")
+		s.fileOrDirKeys("xdg-attributes", xdg, "git/attributes")
 	}
 	for i, c := range configs {
 		if c == "" {
