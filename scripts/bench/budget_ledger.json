@@ -41,7 +41,7 @@
  },
  "default_line_mib": 0,
  "workstreams": {
-  "WS-00": {"line_mib": 0, "process": null, "title": "prepare parity/w0-* branches"},
+  "WS-00": {"line_mib": 0, "process": "go_daemon", "title": "prepare parity/w0-* branches (kernel, feedback, cleanup, drift)"},
   "WS-01": {"line_mib": 3, "process": "go_daemon", "title": "govstore SQLite WAL store (in-process)"},
   "WS-02": {"line_mib": 3, "process": "rust_index_service", "title": "resident xmustard-core serve worker"},
   "WS-03": {"line_mib": 0.2, "process": "go_daemon", "title": "per-request context kernel"},
@@ -108,9 +108,9 @@
  },
  "tolerance": {
    "tree_peak_mib": 10.0,
-   "component_p50_mib": 2.0,
-   "v1_crosscheck_mib": 3.0,
-   "basis": "Measured 2026-09-25 on darwin-arm64 (Apple M1, 8 GB, shared with other agents, load average 5-55) with one set of binaries. v1-workload gate peak over five valid single runs: 71.0, 78.2, 78.7, 87.4 and 87.9 MiB (a 16.9 MiB single-run spread; the frozen v1's own history is 72.3-84.9 MB), so the tree-peak check compares medians of three repeats (CI runs --repeat 3). go_daemon p50 18.1-18.8 MiB and rust_core_per_call p50 6.2 MiB across five runs, so the process-p50 check is the precise one. v2 minus v1 sampler in the same run: 0.0, -1.31, +0.09, -0.17, +0.24 and -1.62 MiB over six runs. Idle-process RSS moves with macOS memory compression (mcp_access p50 13.1-20.7 MiB). Revisit all three with CI-runner data."
+   "component_p50_mib": 3.0,
+   "v1_crosscheck_mib": 8.0,
+   "basis": "Measured 2026-09-25 on darwin-arm64 (Apple M1, 8 GB, shared with other agents, load average 4-55). Tree peak: single v1-workload runs of one set of binaries ranged 66.8-87.9 MiB over 12 runs (the frozen v1's own history is 72.3-84.9 MB); medians of three were 74.2, 78.7 and 80.8 MiB, so CI compares medians of three and allows 10 MiB. Process check: go_daemon RSS p50 moved 17.8-23.2 MiB within one set of three (lazily reclaimed and compressed pages), footprint p50 11.0-13.1 MiB, so the check uses footprint p50 when both runs report it and allows 3 MiB. v1 cross-check: v2 minus the frozen v1 sampler in the same run stayed within 2.33 MiB in 19 of 20 runs and reached -5.62 MiB once at load average 25; it is a gross-error detector (a missed shim or core is 8+ MiB), so it allows 8 MiB. Revisit all three with CI-runner data."
  },
  "reference_measurement": {
    "about": "v1-workload (the frozen 501-file workload) measured by gate v2, median of three repeats. Binaries were built at source_head, whose api-go and rust-core trees equal feat/parity-v2 b4f7b49. The per-process p50 feeds the reconciliation's projected steady state; replace it with a CI-runner measurement when one exists.",
