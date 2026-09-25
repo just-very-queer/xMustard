@@ -258,11 +258,11 @@ func fingerprintDirs(t *testing.T, root string) []string {
 	}
 	defer f.Close()
 	fi, _ := f.Stat()
-	dirs, err := parseIndexDirs(bufio.NewReader(f), fi.Size(), objectHashLen(commonDir))
+	idx, err := parseIndexDirs(bufio.NewReader(f), fi.Size(), objectHashLen(commonDir))
 	if err != nil {
 		t.Fatalf("parse index: %v", err)
 	}
-	return dirs
+	return idx.dirs
 }
 
 func TestFingerprintParsesIndexVersionsAndLayouts(t *testing.T) {
@@ -310,17 +310,40 @@ func TestFingerprintParsesIndexVersionsAndLayouts(t *testing.T) {
 	}
 }
 
-func TestFingerprintUnavailableForSplitIndexAndSubmodules(t *testing.T) {
+func TestFingerprintUnavailableForSplitIndex(t *testing.T) {
 	root := initGitRepo(t)
 	runGit(t, root, "update-index", "--split-index")
 	if fp := repoStatFingerprint(root); fp.ok {
 		t.Fatal("a split index must make the fingerprint unavailable")
 	}
-	root = initGitRepo(t)
+}
+
+// git status runs with --ignore-submodules=none, so a submodule's working state is
+// part of the identity: the fingerprint walks initialized submodules too.
+func TestFingerprintCoversSubmodules(t *testing.T) {
+	// an uninitialized gitlink (no checkout) is a state, not a failure
+	root := initGitRepo(t)
 	head := strings.TrimSpace(gitOutput(t, root, "rev-parse", "HEAD"))
-	runGit(t, root, "update-index", "--add", "--cacheinfo", "160000,"+head+",sub")
-	if fp := repoStatFingerprint(root); fp.ok {
-		t.Fatal("a gitlink (submodule) must make the fingerprint unavailable")
+	runGit(t, root, "update-index", "--add", "--cacheinfo", "160000,"+head+",vendor/sub")
+	if fp := repoStatFingerprint(root); !fp.ok || !fp.git {
+		t.Fatalf("uninitialized submodule: %+v", fp)
+	}
+
+	sub := initGitRepo(t)
+	parent := initGitRepo(t)
+	runGit(t, parent, "-c", "protocol.file.allow=always", "submodule", "add", "-q", sub, "deps/sub")
+	runGit(t, parent, "commit", "-q", "-m", "add submodule")
+	before := repoStatFingerprint(parent)
+	if !before.ok || !before.git {
+		t.Fatalf("initialized submodule: %+v", before)
+	}
+	if again := repoStatFingerprint(parent); again != before {
+		t.Fatal("fingerprint unstable over an unchanged tree with a submodule")
+	}
+	// an in-place edit inside the submodule's checkout changes the parent's identity
+	writeFile(t, filepath.Join(parent, "deps", "sub", "a", "x.go"), "package p // edited inside the submodule\n")
+	if after := repoStatFingerprint(parent); after == before {
+		t.Fatal("an edit inside a submodule must change the fingerprint")
 	}
 }
 
@@ -331,4 +354,39 @@ func gitOutput(t *testing.T, root string, args ...string) string {
 		t.Fatalf("git %v: %v", args, err)
 	}
 	return string(out)
+}
+
+// BenchmarkRepoStatFingerprint measures the spawn-free fingerprint an evidence page
+// or a cached identity read pays instead of a repo-key run, on the repository named by
+// XMUSTARD_BENCH_REPO (skipped when unset), and reports the resident bytes of its
+// cached tracked-directory list.
+func BenchmarkRepoStatFingerprint(b *testing.B) {
+	root := os.Getenv("XMUSTARD_BENCH_REPO")
+	if root == "" {
+		b.Skip("set XMUSTARD_BENCH_REPO to a Git worktree")
+	}
+	if fp := repoStatFingerprint(root); !fp.ok || !fp.git {
+		b.Fatalf("fingerprint unavailable for %s", root)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		repoStatFingerprint(root)
+	}
+	b.StopTimer()
+	resident := 0
+	indexDirsCache.Lock()
+	for _, e := range indexDirsCache.m {
+		resident += len(e.key) + 24*len(e.dirs)
+		for _, d := range e.dirs {
+			resident += len(d)
+		}
+	}
+	dirs := 0
+	for _, e := range indexDirsCache.m {
+		dirs += len(e.dirs)
+	}
+	indexDirsCache.Unlock()
+	b.ReportMetric(float64(resident), "cached-dir-bytes")
+	b.ReportMetric(float64(dirs), "tracked-dirs")
 }

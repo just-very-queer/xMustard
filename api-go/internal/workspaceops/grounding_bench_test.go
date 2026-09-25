@@ -9,10 +9,10 @@ import (
 )
 
 // seedGroundBenchWorkspace builds a workspace shaped like a real one: a multi-MB
-// snapshot.json (the measured snapshot on this machine is 3.8 MB), a run history
-// with failures, promoted memories with path baselines, and a fake Rust core that
-// answers drift and working-changes instantly, so the benchmark measures the Go
-// side of `ground`.
+// snapshot.json written as the scanner writes it (5.4 MB here; the measured one on
+// this machine is 3.8 MB), a run history with failures, promoted memories with path
+// baselines, and a fake Rust core that answers drift and working-changes instantly,
+// so the benchmark measures the Go side of `ground`.
 func seedGroundBenchWorkspace(tb testing.TB) (dataDir, ws string) {
 	tb.Helper()
 	dataDir = tb.TempDir()
@@ -80,7 +80,7 @@ esac
 }
 
 // BenchmarkBuildSessionGrounding reports the Go allocations of one `ground` over a
-// workspace with a 3.8 MB-class snapshot (run with -benchmem).
+// workspace with a multi-MB snapshot (run with -benchmem).
 func BenchmarkBuildSessionGrounding(b *testing.B) {
 	dataDir, ws := seedGroundBenchWorkspace(b)
 	b.ReportAllocs()

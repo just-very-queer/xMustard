@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -29,13 +30,16 @@ import (
 //   - every entry of every directory that holds a tracked file (from the index):
 //     name, type, size, mtime, ctime and inode. That covers edits to tracked files
 //     and to untracked files beside them, and files added to or removed from those
-//     directories (including new untracked directories).
+//     directories (including new untracked directories);
+//   - the same, recursively, for every initialized submodule (git status runs with
+//     --ignore-submodules=none, so their working state is part of the identity).
 //
 // Not covered: in-place edits of files inside directories that hold no tracked file
 // (for example an existing untracked tree). The identity TTL bounds that window, and
 // every cached observation carries its age. Anything unusual (split or sparse index,
-// submodules, an unknown index version, a malformed file, more than the entry
-// bounds) makes the fingerprint unavailable, and the caller then samples every time.
+// an unknown index version, a malformed file, submodules nested deeper than
+// fingerprintMaxDepth, more than the entry bounds) makes the fingerprint
+// unavailable, and the caller then samples every time.
 
 const (
 	fingerprintMaxIndexEntries = 200_000
@@ -44,6 +48,7 @@ const (
 	fingerprintMaxSmallFile    = 4 << 10
 	fingerprintMaxIndexBytes   = 256 << 20
 	fingerprintRacyWindow      = 2 * time.Second
+	fingerprintMaxDepth        = 3 // submodule nesting
 )
 
 // repoFingerprint is one fingerprint reading. ok is false when it could not be
@@ -67,42 +72,9 @@ func fileInodeCtime(fi os.FileInfo) (uint64, int64) {
 func gitLayoutFor(root string) (top, gitDir, commonDir string, found bool, err error) {
 	dir := filepath.Clean(root)
 	for {
-		p := filepath.Join(dir, ".git")
-		fi, lerr := os.Lstat(p)
-		switch {
-		case lerr == nil && fi.IsDir():
-			top, gitDir = dir, p
-		case lerr == nil && fi.Mode().IsRegular():
-			b, rerr := readSmallFile(p)
-			if rerr != nil {
-				return "", "", "", false, rerr
-			}
-			line := strings.TrimSpace(string(b))
-			if !strings.HasPrefix(line, "gitdir:") {
-				return "", "", "", false, errors.New("unrecognized gitfile")
-			}
-			gd := strings.TrimSpace(strings.TrimPrefix(line, "gitdir:"))
-			if !filepath.IsAbs(gd) {
-				gd = filepath.Join(dir, gd)
-			}
-			top, gitDir = dir, gd
-		case lerr == nil:
-			return "", "", "", false, errors.New(".git is neither a directory nor a gitfile")
-		case !errors.Is(lerr, os.ErrNotExist):
-			return "", "", "", false, lerr
-		}
-		if gitDir != "" {
-			commonDir = gitDir
-			if b, cerr := readSmallFile(filepath.Join(gitDir, "commondir")); cerr == nil {
-				cd := strings.TrimSpace(string(b))
-				if !filepath.IsAbs(cd) {
-					cd = filepath.Join(gitDir, cd)
-				}
-				commonDir = cd
-			} else if !errors.Is(cerr, os.ErrNotExist) {
-				return "", "", "", false, cerr
-			}
-			return top, gitDir, commonDir, true, nil
+		gitDir, commonDir, found, err = gitDirsAt(dir)
+		if err != nil || found {
+			return dir, gitDir, commonDir, found, err
 		}
 		parent := filepath.Dir(dir)
 		if parent == dir {
@@ -110,6 +82,47 @@ func gitLayoutFor(root string) (top, gitDir, commonDir string, found bool, err e
 		}
 		dir = parent
 	}
+}
+
+// gitDirsAt resolves dir/.git (a directory, or a gitfile naming one) and the common
+// dir a linked worktree shares. found is false when dir has no .git.
+func gitDirsAt(dir string) (gitDir, commonDir string, found bool, err error) {
+	p := filepath.Join(dir, ".git")
+	fi, err := os.Lstat(p)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		return "", "", false, nil
+	case err != nil:
+		return "", "", false, err
+	case fi.IsDir():
+		gitDir = p
+	case fi.Mode().IsRegular():
+		b, err := readSmallFile(p)
+		if err != nil {
+			return "", "", false, err
+		}
+		gd, ok := strings.CutPrefix(strings.TrimSpace(string(b)), "gitdir:")
+		if !ok {
+			return "", "", false, errors.New("unrecognized gitfile")
+		}
+		if gd = strings.TrimSpace(gd); !filepath.IsAbs(gd) {
+			gd = filepath.Join(dir, gd)
+		}
+		gitDir = gd
+	default:
+		return "", "", false, errors.New(".git is neither a directory nor a gitfile")
+	}
+	commonDir = gitDir
+	if b, err := readSmallFile(filepath.Join(gitDir, "commondir")); err == nil {
+		cd := strings.TrimSpace(string(b))
+		if !filepath.IsAbs(cd) {
+			cd = filepath.Join(gitDir, cd)
+		}
+		commonDir = cd
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", "", false, err
+	}
+	return gitDir, commonDir, true, nil
 }
 
 func readSmallFile(path string) ([]byte, error) {
@@ -128,14 +141,28 @@ func readSmallFile(path string) ([]byte, error) {
 	return b, nil
 }
 
-// writeStatKey adds a stat key (or the reason there is none) to the digest.
+// writeStatKey adds a stat key (or the reason there is none) to the digest. It
+// formats into a pooled buffer: the walk writes one key per directory entry.
 func writeStatKey(h hash.Hash, label string, st *unix.Stat_t, err error) {
+	bp := statKeyBuf.Get().(*[]byte)
+	b := append((*bp)[:0], label...)
 	if err != nil {
-		fmt.Fprintf(h, "%s:err:%v\x00", label, errors.Is(err, os.ErrNotExist) || errors.Is(err, unix.ENOENT))
-		return
+		b = append(b, ":err:"...)
+		b = strconv.AppendBool(b, errors.Is(err, os.ErrNotExist) || errors.Is(err, unix.ENOENT))
+	} else {
+		b = append(b, ':')
+		b = strconv.AppendUint(b, uint64(st.Mode), 8)
+		for _, v := range [...]int64{st.Size, st.Mtim.Nano(), st.Ctim.Nano(), int64(st.Ino)} {
+			b = append(b, ':')
+			b = strconv.AppendInt(b, v, 10)
+		}
 	}
-	fmt.Fprintf(h, "%s:%o:%d:%d:%d:%d\x00", label, st.Mode, st.Size, st.Mtim.Nano(), st.Ctim.Nano(), st.Ino)
+	h.Write(append(b, 0))
+	*bp = b
+	statKeyBuf.Put(bp)
 }
+
+var statKeyBuf = sync.Pool{New: func() any { b := make([]byte, 0, 256); return &b }}
 
 func lstatKey(h hash.Hash, label, path string) {
 	var st unix.Stat_t
@@ -157,23 +184,33 @@ func repoStatFingerprint(root string) repoFingerprint {
 		fmt.Fprintf(h, "nogit\x00%s\x00", root)
 		return repoFingerprint{digest: hex.EncodeToString(h.Sum(nil)), ok: true}
 	}
+	budget := fingerprintMaxDirEntries
+	if !digestWorktree(h, top, gitDir, commonDir, &budget, 0) {
+		return repoFingerprint{}
+	}
+	return repoFingerprint{digest: hex.EncodeToString(h.Sum(nil)), ok: true, git: true}
+}
+
+// digestWorktree adds one worktree (and its initialized submodules) to h. budget is
+// the directory entries still allowed across the whole walk.
+func digestWorktree(h hash.Hash, top, gitDir, commonDir string, budget *int, depth int) bool {
 	fmt.Fprintf(h, "git\x00%s\x00%s\x00%s\x00", top, gitDir, commonDir)
 	head, err := readSmallFile(filepath.Join(gitDir, "HEAD"))
 	if err != nil {
-		return repoFingerprint{}
+		return false
 	}
 	h.Write(head)
 	h.Write([]byte{0})
 	if ref, ok := strings.CutPrefix(strings.TrimSpace(string(head)), "ref: "); ok {
 		if strings.Contains(ref, "..") || filepath.IsAbs(ref) {
-			return repoFingerprint{}
+			return false
 		}
 		loose, lerr := readSmallFile(filepath.Join(gitDir, ref))
 		if errors.Is(lerr, os.ErrNotExist) && gitDir != commonDir {
 			loose, lerr = readSmallFile(filepath.Join(commonDir, ref))
 		}
 		if lerr != nil && !errors.Is(lerr, os.ErrNotExist) {
-			return repoFingerprint{}
+			return false
 		}
 		h.Write(loose)
 		h.Write([]byte{0})
@@ -181,14 +218,28 @@ func repoStatFingerprint(root string) repoFingerprint {
 	lstatKey(h, "packed-refs", filepath.Join(commonDir, "packed-refs"))
 	lstatKey(h, "reftable", filepath.Join(commonDir, "reftable", "tables.list"))
 
-	dirs, err := trackedDirs(filepath.Join(gitDir, "index"), objectHashLen(commonDir), h)
-	if err != nil {
-		return repoFingerprint{}
+	idx, err := trackedDirs(filepath.Join(gitDir, "index"), commonDir, h)
+	if err != nil || !digestDirs(h, top, idx.dirs, budget) {
+		return false
 	}
-	if !digestDirs(h, top, dirs) {
-		return repoFingerprint{}
+	for _, sub := range idx.gitlinks {
+		subTop := filepath.Join(top, filepath.FromSlash(sub))
+		fmt.Fprintf(h, "submodule\x00%s\x00", sub)
+		subGit, subCommon, found, err := gitDirsAt(subTop)
+		switch {
+		case err != nil:
+			return false
+		case !found:
+			// not initialized: git status reports nothing inside it, and the
+			// directory's own entry is already part of its parent's listing
+			fmt.Fprint(h, "uninitialized\x00")
+		case depth+1 >= fingerprintMaxDepth:
+			return false
+		case !digestWorktree(h, subTop, subGit, subCommon, budget, depth+1):
+			return false
+		}
 	}
-	return repoFingerprint{digest: hex.EncodeToString(h.Sum(nil)), ok: true, git: true}
+	return true
 }
 
 // objectHashLen is 32 for SHA-256 repositories, else 20.
@@ -206,10 +257,17 @@ func objectHashLen(commonDir string) int {
 	return 20
 }
 
-// indexDirs caches the tracked-directory list per index file stat key.
+// indexDirs is what the fingerprint needs from an index: the directories holding
+// tracked paths and the submodule (gitlink) paths.
+type indexDirs struct {
+	dirs     []string
+	gitlinks []string
+}
+
+// indexDirsEntry caches an index's directories per index file stat key.
 type indexDirsEntry struct {
-	key  string
-	dirs []string
+	key string
+	indexDirs
 }
 
 var indexDirsCache = struct {
@@ -218,36 +276,37 @@ var indexDirsCache = struct {
 }{m: map[string]indexDirsEntry{}}
 
 // trackedDirs returns every directory (relative, "" for the top) that holds a
-// tracked path, parsed from the index, and adds the index stat key to h. A missing
-// index (no commit and nothing staged) yields only the top directory.
-func trackedDirs(indexPath string, hashLen int, h hash.Hash) ([]string, error) {
+// tracked path, parsed from the index (once per index stat key), and adds the index
+// stat key to h. A missing index (no commit and nothing staged) yields only the top
+// directory.
+func trackedDirs(indexPath, commonDir string, h hash.Hash) (indexDirs, error) {
 	f, err := os.Open(indexPath)
 	if errors.Is(err, os.ErrNotExist) {
 		fmt.Fprint(h, "index:none\x00")
-		return []string{""}, nil
+		return indexDirs{dirs: []string{""}}, nil
 	}
 	if err != nil {
-		return nil, err
+		return indexDirs{}, err
 	}
 	defer f.Close()
 	var st unix.Stat_t
 	if err := unix.Fstat(int(f.Fd()), &st); err != nil {
-		return nil, err
+		return indexDirs{}, err
 	}
 	writeStatKey(h, "index", &st, nil)
 	key := fmt.Sprintf("%d:%d:%d:%d:%d", st.Size, st.Mtim.Nano(), st.Ctim.Nano(), st.Ino, st.Dev)
 	indexDirsCache.Lock()
 	if e, ok := indexDirsCache.m[indexPath]; ok && e.key == key {
 		indexDirsCache.Unlock()
-		return e.dirs, nil
+		return e.indexDirs, nil
 	}
 	indexDirsCache.Unlock()
 	if st.Size > fingerprintMaxIndexBytes {
-		return nil, errors.New("index too large")
+		return indexDirs{}, errors.New("index too large")
 	}
-	dirs, err := parseIndexDirs(bufio.NewReaderSize(f, 64<<10), st.Size, hashLen)
+	idx, err := parseIndexDirs(bufio.NewReaderSize(f, 64<<10), st.Size, objectHashLen(commonDir))
 	if err != nil {
-		return nil, err
+		return indexDirs{}, err
 	}
 	// racy: an index written within the window may be rewritten in the same tick
 	if newestNs(st.Mtim.Nano(), st.Ctim.Nano()) < time.Now().Add(-fingerprintRacyWindow).UnixNano() {
@@ -255,16 +314,16 @@ func trackedDirs(indexPath string, hashLen int, h hash.Hash) ([]string, error) {
 		if len(indexDirsCache.m) >= 16 {
 			clear(indexDirsCache.m)
 		}
-		indexDirsCache.m[indexPath] = indexDirsEntry{key: key, dirs: dirs}
+		indexDirsCache.m[indexPath] = indexDirsEntry{key: key, indexDirs: idx}
 		indexDirsCache.Unlock()
 	}
-	return dirs, nil
+	return idx, nil
 }
 
 // parseIndexDirs reads a Git index (versions 2-4) and returns the sorted set of
-// directories holding its entries. It refuses split and sparse indexes and gitlinks
-// (their working state is not visible from this directory walk).
-func parseIndexDirs(r *bufio.Reader, size int64, hashLen int) ([]string, error) {
+// directories holding its entries and the gitlink (submodule) paths. It refuses
+// split and sparse indexes, whose entries are not all in this file.
+func parseIndexDirs(r *bufio.Reader, size int64, hashLen int) (indexDirs, error) {
 	var consumed int64
 	read := func(n int) ([]byte, error) {
 		b := make([]byte, n)
@@ -276,36 +335,37 @@ func parseIndexDirs(r *bufio.Reader, size int64, hashLen int) ([]string, error) 
 	}
 	hdr, err := read(12)
 	if err != nil {
-		return nil, err
+		return indexDirs{}, err
 	}
 	if string(hdr[:4]) != "DIRC" {
-		return nil, errors.New("not a git index")
+		return indexDirs{}, errors.New("not a git index")
 	}
 	version := binary.BigEndian.Uint32(hdr[4:8])
 	count := binary.BigEndian.Uint32(hdr[8:12])
 	if version < 2 || version > 4 {
-		return nil, fmt.Errorf("unsupported index version %d", version)
+		return indexDirs{}, fmt.Errorf("unsupported index version %d", version)
 	}
 	if count > fingerprintMaxIndexEntries {
-		return nil, errors.New("index has too many entries")
+		return indexDirs{}, errors.New("index has too many entries")
 	}
 	dirSet := map[string]struct{}{"": {}}
+	var gitlinks []string
 	var prev []byte
 	fixed := 40 + hashLen + 2
 	for i := uint32(0); i < count; i++ {
 		meta, err := read(fixed)
 		if err != nil {
-			return nil, err
+			return indexDirs{}, err
 		}
 		mode := binary.BigEndian.Uint32(meta[24:28])
 		flags := binary.BigEndian.Uint16(meta[fixed-2:])
 		entryLen := fixed
 		if flags&0x4000 != 0 {
 			if version < 3 {
-				return nil, errors.New("extended flag in a version 2 index")
+				return indexDirs{}, errors.New("extended flag in a version 2 index")
 			}
 			if _, err := read(2); err != nil {
-				return nil, err
+				return indexDirs{}, err
 			}
 			entryLen += 2
 		}
@@ -313,16 +373,16 @@ func parseIndexDirs(r *bufio.Reader, size int64, hashLen int) ([]string, error) 
 		if version == 4 {
 			strip, n, err := readIndexVarint(r)
 			if err != nil {
-				return nil, err
+				return indexDirs{}, err
 			}
 			consumed += int64(n)
 			suffix, err := r.ReadBytes(0)
 			if err != nil {
-				return nil, err
+				return indexDirs{}, err
 			}
 			consumed += int64(len(suffix))
 			if strip > uint64(len(prev)) {
-				return nil, errors.New("malformed index path prefix")
+				return indexDirs{}, errors.New("malformed index path prefix")
 			}
 			name = append(append([]byte{}, prev[:len(prev)-int(strip)]...), suffix[:len(suffix)-1]...)
 		} else {
@@ -330,13 +390,13 @@ func parseIndexDirs(r *bufio.Reader, size int64, hashLen int) ([]string, error) 
 			read0 := 0 // NUL bytes already consumed after the name
 			if nameLen < 0x0fff {
 				if name, err = read(nameLen); err != nil {
-					return nil, err
+					return indexDirs{}, err
 				}
 			} else {
 				// a long name is NUL-terminated inside the padding
 				b, err := r.ReadBytes(0)
 				if err != nil {
-					return nil, err
+					return indexDirs{}, err
 				}
 				consumed += int64(len(b))
 				name, read0 = b[:len(b)-1], 1
@@ -345,19 +405,19 @@ func parseIndexDirs(r *bufio.Reader, size int64, hashLen int) ([]string, error) 
 			total := (entryLen + len(name) + 8) &^ 7
 			if pad := total - entryLen - len(name) - read0; pad > 0 {
 				if _, err := read(pad); err != nil {
-					return nil, err
+					return indexDirs{}, err
 				}
 			}
 		}
-		switch mode & 0o170000 {
-		case 0o160000:
-			return nil, errors.New("index has a submodule (gitlink)")
-		case 0o040000:
-			return nil, errors.New("sparse index directory entry")
-		}
 		p := string(name)
 		if p == "" || strings.HasPrefix(p, "/") || slices.Contains(strings.Split(p, "/"), "..") {
-			return nil, errors.New("unsafe index path")
+			return indexDirs{}, errors.New("unsafe index path")
+		}
+		switch mode & 0o170000 {
+		case 0o160000:
+			gitlinks = append(gitlinks, p)
+		case 0o040000:
+			return indexDirs{}, errors.New("sparse index directory entry")
 		}
 		for d := pathDir(p); ; d = pathDir(d) {
 			if _, seen := dirSet[d]; seen {
@@ -365,7 +425,7 @@ func parseIndexDirs(r *bufio.Reader, size int64, hashLen int) ([]string, error) 
 			}
 			dirSet[d] = struct{}{}
 			if len(dirSet) > fingerprintMaxDirs {
-				return nil, errors.New("too many tracked directories")
+				return indexDirs{}, errors.New("too many tracked directories")
 			}
 		}
 		prev = name
@@ -374,32 +434,32 @@ func parseIndexDirs(r *bufio.Reader, size int64, hashLen int) ([]string, error) 
 	for consumed+int64(hashLen) < size {
 		ext, err := read(8)
 		if err != nil {
-			return nil, err
+			return indexDirs{}, err
 		}
 		switch string(ext[:4]) {
 		case "link":
-			return nil, errors.New("split index")
+			return indexDirs{}, errors.New("split index")
 		case "sdir":
-			return nil, errors.New("sparse index")
+			return indexDirs{}, errors.New("sparse index")
 		}
 		n := int64(binary.BigEndian.Uint32(ext[4:8]))
 		if consumed+n+int64(hashLen) > size {
-			return nil, errors.New("malformed index extension")
+			return indexDirs{}, errors.New("malformed index extension")
 		}
 		if _, err := r.Discard(int(n)); err != nil {
-			return nil, err
+			return indexDirs{}, err
 		}
 		consumed += n
 	}
 	if consumed+int64(hashLen) != size {
-		return nil, errors.New("malformed index")
+		return indexDirs{}, errors.New("malformed index")
 	}
 	dirs := make([]string, 0, len(dirSet))
 	for d := range dirSet {
 		dirs = append(dirs, d)
 	}
 	slices.Sort(dirs)
-	return dirs, nil
+	return indexDirs{dirs: dirs, gitlinks: gitlinks}, nil
 }
 
 // pathDir is path.Dir for index paths, with "" for the top directory.
@@ -432,10 +492,9 @@ func readIndexVarint(r *bufio.Reader) (uint64, int, error) {
 	return val, n, nil
 }
 
-// digestDirs adds every entry of every tracked directory to h. False when a bound
-// is exceeded or a directory cannot be read for a reason other than being gone.
-func digestDirs(h hash.Hash, top string, dirs []string) bool {
-	total := 0
+// digestDirs adds every entry of every tracked directory to h. False when the entry
+// budget is spent or a directory cannot be listed for a reason other than being gone.
+func digestDirs(h hash.Hash, top string, dirs []string, budget *int) bool {
 	for _, rel := range dirs {
 		dir := top
 		if rel != "" {
@@ -454,8 +513,7 @@ func digestDirs(h hash.Hash, top string, dirs []string) bool {
 			f.Close()
 			return false
 		}
-		total += len(names)
-		if total > fingerprintMaxDirEntries {
+		if *budget -= len(names); *budget < 0 {
 			f.Close()
 			return false
 		}
