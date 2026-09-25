@@ -1,0 +1,66 @@
+{
+ "schema": 1,
+ "about": "Pinned parity-scale fixtures for scripts/bench/rss_bench_v2.py (PAR-EVAL-05). Each is fetched at an exact upstream commit into a scratch cache (never vendored into this repository), checked against its commit and tree id, then materialized from git objects into a workspace repo whose tree id, file count and on-disk content SHA-256 are pinned below. Only Apache-2.0 and MIT sources are used (PARITY_REQUIREMENTS §2.4, §12.3).",
+ "fixtures": {
+  "cline": {
+   "license": "Apache-2.0",
+   "url": "https://github.com/cline/cline.git",
+   "mirrors": ["research/cline"],
+   "commit": "ee59f81706981e0a64c8b32f8f0415c9d39561fa",
+   "tree": "961c4685b15303e9ad2869b13e402c2e725c706c",
+   "exclude": [],
+   "workspace": {"tree": "961c4685b15303e9ad2869b13e402c2e725c706c", "files": 3454, "content_sha256": "156f47cc11ce42bec632ece22826d3a09ae309f716f1a49b614fbae6bb3b947c"},
+   "probes": [
+    {"search": "Controller", "explain": "apps/vscode/src/core/controller/index.ts", "impact": "Controller"},
+    {"search": "buildApiHandler", "explain": "apps/vscode/src/core/api/index.ts", "impact": "buildApiHandler"},
+    {"search": "AnthropicHandler", "explain": "apps/vscode/src/core/api/providers/anthropic.ts", "impact": "AnthropicHandler"}
+   ]
+  },
+  "pi-mono": {
+   "license": "MIT",
+   "url": "https://github.com/badlogic/pi-mono.git",
+   "mirrors": ["research/pi-mono"],
+   "commit": "5fd446ca1843682e8da3fec4ceb71c42f56fbace",
+   "tree": "9973327c819bc6a650b4ee85674fa8a49dd59d94",
+   "exclude": [],
+   "workspace": {"tree": "9973327c819bc6a650b4ee85674fa8a49dd59d94", "files": 1929, "content_sha256": "3fc4c67d0781d20d916594aa73779615e931d60df021abf62997ec5786d635ed"},
+   "probes": [
+    {"search": "agentLoop", "explain": "packages/agent/src/agent-loop.ts", "impact": "agentLoop"},
+    {"search": "estimateContextTokens", "explain": "packages/agent/src/harness/compaction/compaction.ts", "impact": "shouldCompact"}
+   ]
+  },
+  "openhands": {
+   "license": "MIT outside enterprise/; enterprise/ is separately licensed and excluded from the workspace",
+   "url": "https://github.com/OpenHands/OpenHands.git",
+   "mirrors": ["research/OpenHands"],
+   "commit": "38f7b1baa1ab1146a950d5797bdc3f3511a13858",
+   "tree": "61be7c4e3700b623266f9d1214bc4a97d2cf6a57",
+   "exclude": ["enterprise/"],
+   "workspace": {"tree": "48d959ed4c04dfe655247cd00a4e53f4d399b13d", "files": 1905, "content_sha256": "afb3689451981d48afefe05c42f3f052e386106efc25c84a22e46c8604d5335e"},
+   "probes": [
+    {"search": "AnalyticsService", "explain": "openhands/analytics/analytics_service.py", "impact": "AnalyticsService"},
+    {"search": "AppConversationInfoService", "explain": "openhands/app_server/app_conversation/app_conversation_info_service.py", "impact": "AppConversationInfoService"}
+   ]
+  }
+ },
+ "composites": {
+  "parity-composite": {
+   "about": "The real multi-language 5-10k-file repository for PAR-EVAL-05: cline, pi-mono and openhands (minus enterprise/) as top-level directories of one repo (TypeScript, TSX, JavaScript, Python, C and more).",
+   "members": ["cline", "pi-mono", "openhands"],
+   "workspace": {"tree": "c8d4dc35172d1fe7a9de3cfb4f3feef68d65faf3", "files": 7288, "content_sha256": "af14f5727242c35d82f19cea56dd78f456f6445034ee87076439e00f14c0978f"}
+  }
+ },
+ "feature_probes": {
+  "http_mcp": {"requirement": "PAR-RT-03, agents over HTTP MCP (WS-13)", "keys": [],
+               "detect": "POST /mcp answers MCP initialize (Streamable HTTP)"},
+  "watcher": {"requirement": "PAR-FRESH-03, watcher on (WS-15)", "keys": ["watcher_state"],
+              "detect": "a watcher_state key in a tool result whose value is not off/disabled/absent"},
+  "static_embeddings": {"requirement": "PAR-RET-03, static embeddings on (WS-37)", "keys": ["semantic_lane", "embedding_lane"],
+                        "detect": "a semantic_lane or embedding_lane key in a search result whose value is on"},
+  "uncapped_index": {"requirement": "PAR-RT-09, no file cap at parity scale (WS-14)", "keys": [],
+                     "detect": "search coverage.truncated is false on the fixture"}
+ },
+ "not_used": {
+  "gitnexus": "PolyForm Noncommercial 1.0.0: design reference only (§2.4). Not a fixture or comparator without an explicit owner decision (§12.3)."
+ }
+}
