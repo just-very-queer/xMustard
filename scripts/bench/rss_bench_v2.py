@@ -22,13 +22,18 @@ Alongside the gate, per process and every sample:
 Attribution. Every process is assigned a component through the process-role registry in
 budget_ledger.json: registered roots carry their role; descendants are classified by
 executable name. Processes that match an external rule (LSP servers, compilers, tests,
-shells run for the runner) and everything below them go on separate external lines and
-are never counted in the gate. Unknown descendants of owned processes count as owned
-(`unclassified:<exe>`), so nothing is excluded silently. Agent roots (here the bench
-harness) are external; only xMustard binaries launched below them are pulled in as owned.
+shells and agent CLIs run for the runner) and everything below them go on separate
+external lines and are never counted in the gate, except xMustard binaries: a shim, hook
+client or core found below an external counts again, with its own descendants. Unknown
+descendants of owned processes count as owned (`unclassified:<exe>`), so nothing is
+excluded silently. Agent roots (here the bench harness) are external; only xMustard
+binaries launched below them are pulled in as owned.
 
 Scenarios. `v1-workload` runs the frozen v1 workload verbatim (v1's own main()) with the
-v2 sampler running beside v1's sampler, so one run yields both numbers. Parity-scale
+v2 sampler running beside v1's sampler, so one run yields both numbers. The CI suite adds
+2 agents through the native relay once one exists; `agents-2-small` (2 agents on the same
+generated fixture, over HTTP MCP when the API serves it, else stdio shims) runs in CI for
+the workstreams whose ledger line is measured on it. Parity-scale
 scenarios run over pinned Apache/MIT fixtures (parity_fixtures.json): 1, 2 and 4 agents,
 queries during a reindex, a snapshot swap under load, captures during indexing, two hot
 repos, four agents in four worktrees, and the watcher. A scenario whose product feature
@@ -1151,10 +1156,35 @@ def verify_workspace(path, expect, label):
     return got
 
 
+def fixture_spec(fixtures, name):
+    for section in ("fixtures", "composites", "generated"):
+        spec = fixtures.get(section, {}).get(name)
+        if spec is not None:
+            return spec
+    return None
+
+
+def generated_source(name, spec, cache):
+    """A scratch repo holding a generated fixture, committed with the fixed identity so
+    its tree id is a pure function of the generator's bytes. Only rss_bench.generate_repo
+    (the frozen v1 fixture) is known."""
+    if spec.get("generator") != "rss_bench.generate_repo":
+        raise FixtureError(f"{name}: unknown generator {spec.get('generator')!r}")
+    src = os.path.join(cache, "gen", name)
+    shutil.rmtree(src, ignore_errors=True)
+    os.makedirs(src)
+    v1mod().generate_repo(src)
+    git(["init", "-q"], src)
+    git(["add", "-A"], src)
+    git(["commit", "-q", "-m", f"generated fixture {name}"], src)
+    return src, git(["rev-parse", "HEAD"], src).stdout.strip()
+
+
 def ensure_workspace(name, fixtures, cache):
-    """The verified workspace repo for a fixture or composite name (cached, re-verified)."""
+    """The verified workspace repo for a fixture, composite or generated name (cached,
+    re-verified)."""
     fx, comp = fixtures["fixtures"], fixtures.get("composites", {})
-    spec = fx.get(name) or comp.get(name)
+    spec = fixture_spec(fixtures, name)
     if spec is None:
         raise FixtureError(f"unknown fixture {name!r}")
     ws = spec["workspace"]
@@ -1168,10 +1198,15 @@ def ensure_workspace(name, fixtures, cache):
             return info
         except FixtureError:
             pass
+    gen_src = None
     if name in fx:
         src, used = ensure_source(name, spec, cache)
         parts = [(src, spec["commit"], "", spec.get("exclude", []))]
         info["upstream"] = {"commit": spec["commit"], "tree": spec["tree"], "fetched_from": used}
+    elif name not in comp:
+        gen_src, commit = generated_source(name, spec, cache)
+        parts = [(gen_src, commit, "", [])]
+        info["generated_by"] = spec["generator"]
     else:
         parts = []
         for member in spec["members"]:
@@ -1180,6 +1215,8 @@ def ensure_workspace(name, fixtures, cache):
             parts.append((m["path"], head, member.rstrip("/") + "/", []))
         info["members"] = spec["members"]
     build_workspace_repo(dest, parts)
+    if gen_src:
+        shutil.rmtree(gen_src, ignore_errors=True)
     info["verified"] = verify_workspace(dest, ws, name)
     info["source"] = "built"
     missing = [p["explain"] for p in spec.get("probes", []) if not os.path.isfile(os.path.join(dest, p["explain"]))]
@@ -1324,6 +1361,21 @@ def build_binaries_from(source_root, out_dir, core_bin=None):
         run(["cargo", "build", "--release", "--quiet", "--bin", "xmustard-core"], cwd=rust)
         core = os.path.join(rust, "target", "release", "xmustard-core")
     return os.path.join(out_dir, "xmustard-api"), os.path.join(out_dir, "xmustard-mcp"), os.path.abspath(core)
+
+
+def resolve_relay(source_root, relay_bin=None):
+    """The native stdio relay (WS-13) when this revision has one: --relay-bin,
+    XMUSTARD_RELAY_BIN, or a cargo build of rust-core/src/bin/xmustard-relay.rs. None when
+    the revision has no relay or cargo is unavailable; the relay scenario is then skipped."""
+    relay = relay_bin or os.environ.get("XMUSTARD_RELAY_BIN")
+    if relay:
+        return os.path.abspath(relay) if os.path.isfile(relay) else None
+    rust = os.path.join(source_root, "rust-core")
+    if not os.path.isfile(os.path.join(rust, "src", "bin", "xmustard-relay.rs")) or not shutil.which("cargo"):
+        return None
+    p = run(["cargo", "build", "--release", "--quiet", "--bin", "xmustard-relay"], cwd=rust, check=False)
+    out = os.path.join(rust, "target", "release", "xmustard-relay")
+    return out if p.returncode == 0 and os.path.isfile(out) else None
 
 
 def provenance_for(source_root, api_bin, mcp_bin, core, scripts):
@@ -1483,6 +1535,15 @@ def run_v1_workload(ctx):
 SCENARIOS = collections.OrderedDict([
     ("v1-workload", {"kind": "v1", "suites": ["ci", "parity"],
                      "about": "frozen v1 workload: 501 generated files, 2 stdio agents, captures and expansion"}),
+    # Not in a suite: CI runs it for the workstreams that designate it (WS-13). At this HEAD
+    # its stdio shims plus concurrent per-call cores reach the gate (69.9-96.8 MiB over three
+    # runs of one build), so running it on every pull request would fail unrelated ones.
+    ("agents-2-small", {"kind": "agents", "agents": 2, "fixture": "v1-generated", "suites": [],
+                        "about": "2 agents on the generated 501-file fixture, over HTTP MCP when the API serves /mcp, "
+                                 "else one stdio shim each (the transport-sensitive scenario WS-13 is measured on)"}),
+    ("agents-2-relay", {"kind": "agents", "agents": 2, "fixture": "v1-generated", "transport": "relay",
+                        "requires": ["relay", "http_mcp"], "suites": ["ci"],
+                        "about": "2 stdio agents through the native xmustard-relay (launched like the Go shim) to /mcp"}),
     ("agents-1", {"kind": "agents", "agents": 1, "fixture": "parity-composite", "suites": ["parity"],
                   "about": "1 agent querying the composite fixture"}),
     ("agents-2", {"kind": "agents", "agents": 2, "fixture": "parity-composite", "suites": ["parity"],
@@ -1492,7 +1553,9 @@ SCENARIOS = collections.OrderedDict([
     ("reindex-during-queries", {"kind": "agents", "agents": 2, "fixture": "parity-composite", "disturb": "reindex",
                                 "suites": ["parity"], "about": "2 agents query while edited files are reindexed (overlapping peaks)"}),
     ("snapshot-swap-under-load", {"kind": "agents", "agents": 2, "fixture": "parity-composite", "disturb": "edits",
-                                  "suites": ["parity"], "about": "2 agents query while edits force index refresh and swap"}),
+                                  "requires": ["resident_index"], "suites": ["parity"],
+                                  "about": "2 agents query while edits force the resident index to swap snapshots "
+                                           "(snapshot_generation must advance under load)"}),
     ("captures-during-index", {"kind": "agents", "agents": 1, "fixture": "parity-composite", "disturb": "captures",
                                "cold": True, "suites": ["parity"], "about": "cold index build with 5 x 16 MiB captures in flight"}),
     ("two-hot-repos", {"kind": "agents", "agents": 2, "fixtures": ["cline", "pi-mono"], "suites": ["parity"],
@@ -1502,6 +1565,10 @@ SCENARIOS = collections.OrderedDict([
     ("watcher-on", {"kind": "agents", "agents": 2, "fixture": "parity-composite", "disturb": "edits",
                     "requires": ["watcher"], "suites": ["parity"], "about": "2 agents with the watcher running while files change"}),
 ])
+
+
+# Scenario requirements that are binaries of the revision, not markers in tool results.
+BINARY_FEATURES = {"relay": {"requirement": "PAR-RT-03, native stdio-to-HTTP relay xmustard-relay (WS-13)"}}
 
 
 def find_key(obj, key, depth=0):
@@ -1530,25 +1597,55 @@ def tool_body(reply):
         return None
 
 
+OFF_VALUES = frozenset({"", "off", "disabled", "absent", "none", "false", "no", "0", "stopped", "inactive",
+                        "unavailable", "error"})
+STATE_FIELDS = ("enabled", "state", "status")
+
+
+def scalar_on(v):
+    """A scalar marker is on unless it is null, false, zero or an off word (OFF_VALUES)."""
+    if v is None or isinstance(v, bool):
+        return bool(v)
+    if isinstance(v, (int, float)):
+        return v != 0
+    if isinstance(v, str):
+        return v.strip().lower() not in OFF_VALUES
+    return False
+
+
 def feature_present(feat, v):
-    """Whether an observed feature value means the feature is on."""
+    """Whether an observed feature value means the feature is on (parity_fixtures.json
+    `feature_on_rule`): a scalar by scalar_on; an object only through explicit
+    enabled/state/status fields, every one of them on; a list never."""
     if feat == "uncapped_index":
         return isinstance(v, dict) and v.get("truncated") is False
-    if isinstance(v, (dict, list)):
-        return bool(v)
-    if isinstance(v, str):
-        v = v.lower()
-    return v not in (None, False, "", "off", "disabled", "absent", "none")
+    if isinstance(v, dict):
+        fields = [k for k in STATE_FIELDS if k in v]
+        return bool(fields) and all(scalar_on(v[k]) for k in fields)
+    if isinstance(v, list):
+        return False
+    return scalar_on(v)
 
 
 class FeatureState:
     """Product features the parity claim needs, detected from live responses using the
-    detection keys declared in parity_fixtures.json `feature_probes`."""
+    detection keys declared in parity_fixtures.json `feature_probes`. An off observation
+    is kept over any later on one, so a feature counts only if it was on every time it was
+    seen. A `counter` feature (snapshot_generation) records the range of integers seen."""
 
     def __init__(self, spec):
         self.spec = spec
         self.values = {}
         self.lock = threading.Lock()
+
+    def _counter(self, feat, v):
+        prev = self.values.get(feat)
+        if not isinstance(v, int) or isinstance(v, bool):
+            self.values[feat] = {"state": "off", "value": v}
+        elif prev is None:
+            self.values[feat] = {"state": "on", "min": v, "max": v, "observations": 1}
+        elif prev.get("state") == "on":
+            prev.update(min=min(prev["min"], v), max=max(prev["max"], v), observations=prev["observations"] + 1)
 
     def observe(self, body):
         if not isinstance(body, dict):
@@ -1557,7 +1654,11 @@ class FeatureState:
             for feat, s in self.spec.items():
                 for key in s.get("keys", []):
                     v = find_key(body, key)
-                    if v is not None and feat not in self.values:
+                    if v is None:
+                        continue
+                    if s.get("kind") == "counter":
+                        self._counter(feat, v)
+                    elif feat not in self.values or (feature_present(feat, self.values[feat]) and not feature_present(feat, v)):
                         self.values[feat] = v
             cov = body.get("coverage") if isinstance(body.get("coverage"), dict) else None
             if cov and "truncated" in cov:
@@ -1603,8 +1704,8 @@ def fixture_probes(fixtures, name, agent_idx=0):
     """The probe list for a fixture or composite (composite paths get the member prefix),
     rotated per agent so agents do not all ask the same question at once."""
     fx, comp = fixtures["fixtures"], fixtures.get("composites", {})
-    if name in fx:
-        probes = list(fx[name]["probes"])
+    if name not in comp:
+        probes = list(fixture_spec(fixtures, name)["probes"])
     else:
         probes = []
         for m in comp[name]["members"]:
@@ -1687,7 +1788,7 @@ def run_agents_scenario(ctx, name, sc):
         repos, fixture_info = [], {}
         for fx_name in names:
             info = ensure_workspace(fx_name, fixtures, ctx["cache"])
-            fixture_info[fx_name] = {k: info.get(k) for k in ("verified", "source", "upstream", "members")}
+            fixture_info[fx_name] = {k: info.get(k) for k in ("verified", "source", "upstream", "members", "generated_by")}
             dest = clone_workspace(info["path"], os.path.join(work, fx_name))
             got = verify_workspace(dest, info["pinned"], f"{fx_name} (scenario copy)")
             checks.check(f"fixture {fx_name} matches its pinned tree and content hash", True,
@@ -1707,16 +1808,21 @@ def run_agents_scenario(ctx, name, sc):
         api = Api(ctx["api_bin"], data, {"XMUSTARD_CORE_BIN": ctx["core"]}).start()
         http_ok, http_detail = probe_http_mcp(api.base)
         feats.values["http_mcp"] = http_ok
-        result["transport"] = "http" if http_ok else "stdio-shim"
+        relay = sc.get("transport") == "relay"
+        if relay and not (http_ok and ctx.get("relay_bin")):
+            raise RuntimeError(f"relay scenario needs /mcp and a relay binary (http {http_ok}, relay {ctx.get('relay_bin')})")
+        result["transport"] = "stdio-relay" if relay else ("http" if http_ok else "stdio-shim")
         result["transport_detail"] = http_detail
         n_agents = sc["agents"]
+        stdio_bin = ctx.get("relay_bin") if relay else ctx["mcp_bin"]
         for i in range(n_agents):
-            if http_ok:
+            if http_ok and not relay:
                 agents.append(HttpMcp(api.base, usage=usage, agent=f"agent{i + 1}"))
-            else:
-                agents.append(accounting_mcp_class(usage, f"agent{i + 1}")(ctx["mcp_bin"], api.base).start())
+            else:  # the relay is a drop-in for the Go shim: same environment, stdio in and out
+                agents.append(accounting_mcp_class(usage, f"agent{i + 1}")(stdio_bin, api.base).start())
         roots = [Root("xmustard-api", api.proc.pid, "go_daemon", "owned")]
-        roots += [Root(f"xmustard-mcp#{i + 1}", a.proc.pid, "mcp_access", "owned") for i, a in enumerate(agents) if a.proc]
+        roots += [Root(f"{os.path.basename(stdio_bin)}#{i + 1}", a.proc.pid, "mcp_access", "owned")
+                  for i, a in enumerate(agents) if a.proc]
         roots.append(Root("bench-harness", os.getpid(), "agent:bench-harness", "agent"))
         sampler = SamplerV2(roots, ctx["registry"], ctx["probe"], step_ref=step, storage_dir=os.path.join(data, "evidence"))
         sampler.start()
@@ -1806,6 +1912,10 @@ def run_agents_scenario(ctx, name, sc):
                 checks.check("edits landed while agents were querying (overlap)", under_load > 0, f"{under_load} edits under load")
                 result["edits_under_load"] = under_load
                 [t.join() for t in threads]
+                if "resident_index" in sc.get("requires", []):
+                    ri = feats.values.get("resident_index") or {}
+                    checks.check("the resident index swapped snapshots while agents were querying (snapshot_generation advanced)",
+                                 ri.get("state") == "on" and ri.get("max", 0) > ri.get("min", 0), json.dumps(ri))
                 if last:
                     body = tool_body(agents[0].tool("search", {"workspace_id": wsids[0], "query": last[0]}, timeout=900)) or {}
                     fresh = any(h.get("path") == last[1] for h in (body.get("hits") or [])[:10])
@@ -1941,7 +2051,8 @@ def parity_claim(report, fixtures):
             missing.append(f"{name}: {r.get('status')} ({r.get('reason')})")
         elif not r["gate"]["passed"]:
             missing.append(f"{name}: gate {r['gate']['verdict']}")
-    ran = [n for n, r in scen.items() if r.get("status") == "ran" and SCENARIOS.get(n, {}).get("kind") == "agents"]
+    ran = [n for n, r in scen.items() if r.get("status") == "ran" and SCENARIOS.get(n, {}).get("kind") == "agents"
+           and "parity" in SCENARIOS[n]["suites"]]
     for f, spec in fixtures["feature_probes"].items():
         absent = [n for n in ran if not feature_present(f, scen[n].get("features", {}).get(f))]
         if absent:
@@ -2180,10 +2291,13 @@ def cmd_run(args):
                             or os.path.join(tempfile.gettempdir(), "xmustard-parity-fixtures"))
     names = select_scenarios(args)
     api_bin, mcp_bin, core = build_binaries_from(source_root, os.path.join(work, "bin"), args.core_bin)
+    relay_bin = resolve_relay(source_root, args.relay_bin) if any(SCENARIOS[n].get("transport") == "relay" for n in names) else None
     ctx = {"ledger": ledger, "fixtures": fixtures, "registry": RoleRegistry(ledger["process_roles"]),
-           "probe": default_probe(), "api_bin": api_bin, "mcp_bin": mcp_bin, "core": core, "work": work,
-           "cache": cache, "keep": args.keep, "rounds": args.rounds}
+           "probe": default_probe(), "api_bin": api_bin, "mcp_bin": mcp_bin, "core": core, "relay_bin": relay_bin,
+           "work": work, "cache": cache, "keep": args.keep, "rounds": args.rounds}
     ctx["provenance"] = provenance_for(source_root, api_bin, mcp_bin, core, SCRIPTS)
+    if relay_bin:
+        ctx["provenance"]["binaries_sha256"]["xmustard-relay"] = sha_file(relay_bin)
     report = {"schema": 2, "generated_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
               "gate_limit_bytes": GATE_BYTES, "gate_limit_mib": GATE_MIB, "provenance": ctx["provenance"],
               "probe": ctx["probe"].name, "fixture_cache": cache, "scenarios": collections.OrderedDict(),
@@ -2193,12 +2307,13 @@ def cmd_run(args):
         if any(SCENARIOS[n]["kind"] == "agents" for n in names):
             probe = probe_features(ctx)
             report["grammars"], report["features_probed"] = probe["grammars"], probe["features"]
-            present = probe["features"]
+            present = dict(probe["features"])
+        present["relay"] = bool(relay_bin)
         for n in names:
             sc = SCENARIOS[n]
             absent = [f for f in sc.get("requires", []) if not feature_present(f, present.get(f))]
             if absent:
-                reqs = ", ".join(f"{f} ({fixtures['feature_probes'][f]['requirement']})" for f in absent)
+                reqs = ", ".join(f"{f} ({(fixtures['feature_probes'].get(f) or BINARY_FEATURES[f])['requirement']})" for f in absent)
                 report["scenarios"][n] = {"status": "skipped", "reason": f"feature absent at this HEAD: {reqs}", "about": sc["about"]}
                 print(f"== scenario {n}: skipped, {report['scenarios'][n]['reason']}", flush=True)
                 continue
@@ -2246,15 +2361,17 @@ def cmd_fixtures(args):
     fixtures = load_json(FIXTURES_PATH)
     cache = os.path.abspath(args.fixture_cache or os.environ.get("XMUSTARD_FIXTURE_CACHE")
                             or os.path.join(tempfile.gettempdir(), "xmustard-parity-fixtures"))
-    names = args.names.split(",") if args.names else list(fixtures["fixtures"]) + list(fixtures.get("composites", {}))
+    sections = ("fixtures", "composites", "generated")
+    names = args.names.split(",") if args.names else [n for s in sections for n in fixtures.get(s, {})]
     if args.compute_pins:  # maintainer mode: build unpinned and print the values to pin
-        for spec in list(fixtures["fixtures"].values()) + list(fixtures.get("composites", {}).values()):
-            spec["workspace"] = {"tree": None, "files": None, "content_sha256": None}
+        for s in sections:
+            for spec in fixtures.get(s, {}).values():
+                spec["workspace"] = {"tree": None, "files": None, "content_sha256": None}
     out, code = {}, 0
     for n in names:
         try:
             info = ensure_workspace(n, fixtures, cache)
-            out[n] = {"ok": True, **{k: info.get(k) for k in ("path", "source", "verified", "upstream", "members")}}
+            out[n] = {"ok": True, **{k: info.get(k) for k in ("path", "source", "verified", "upstream", "members", "generated_by")}}
         except FixtureError as e:
             out[n] = {"ok": False, "error": str(e)}
             code = 1
@@ -2294,6 +2411,7 @@ def main(argv=None):
     r.add_argument("--rounds", type=int, default=3, help="query rounds per agent in parity scenarios")
     r.add_argument("--source-root", help="checkout to build the binaries from (default: this checkout)")
     r.add_argument("--core-bin", help="prebuilt xmustard-core (default: XMUSTARD_CORE_BIN or cargo build)")
+    r.add_argument("--relay-bin", help="prebuilt xmustard-relay (default: XMUSTARD_RELAY_BIN, or cargo build when the source has it)")
     r.add_argument("--fixture-cache", help="scratch directory for pinned fixture clones")
     r.add_argument("--ledger", default=LEDGER_PATH)
     r.add_argument("--workstream", help="check this workstream's ledger line against --baseline")
