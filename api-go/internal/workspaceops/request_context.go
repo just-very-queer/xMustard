@@ -6,9 +6,11 @@ import (
 )
 
 // RequestContext is the per-request context kernel (PAR-FRESH-02): the workspace is
-// resolved once from the registry and the repository identity is sampled at most
-// once, then both are handed to the handler through context.Context. Write tools
-// (remember, verify) never ask for the identity, so they never sample it.
+// resolved once from the registry and the repository identity is observed once
+// before the handler runs, then both are available through context.Context. Write
+// tools (remember, verify) never ask for the identity, so they never sample it.
+// Today the evidence middleware is the identity's only consumer; handlers take the
+// resolved root, and the Rust core still computes its own source identity.
 type RequestContext struct {
 	DataDir     string
 	WorkspaceID string
@@ -18,8 +20,7 @@ type RequestContext struct {
 	wsErr  error
 
 	idOnce sync.Once
-	id     RepoIdentity
-	idObs  IdentityObservation
+	basis  identityBasis
 }
 
 type requestContextKey struct{}
@@ -56,16 +57,25 @@ func (rc *RequestContext) Scope() string {
 	return ws.Scope
 }
 
-// Identity samples the repository identity once per request (through the identity
+// Identity observes the repository identity once per request (through the identity
 // cache) and returns that same observation to every later caller in the request.
 func (rc *RequestContext) Identity(ctx context.Context) (RepoIdentity, IdentityObservation) {
-	rc.idOnce.Do(func() {
-		scope := rc.Scope()
-		if scope == "" {
-			rc.id = RepoIdentity{Source: "unavailable", Limitations: []IdentityLimitation{{Reason: "workspace_root_unavailable"}}}
-			return
-		}
-		rc.id, rc.idObs = CurrentRepoIdentity(ctx, scope)
-	})
-	return rc.id, rc.idObs
+	rc.idOnce.Do(func() { rc.basis = identityCache.observe(ctx, rc.Scope(), false) })
+	return rc.basis.id, rc.basis.obs
+}
+
+// IdentityAfter observes the identity again after the handler ran, for binding
+// captured evidence: without a spawn when a fingerprint shows the tree did not move
+// since Identity, else from one repo-key run begun now. A workspace root that
+// resolves to another directory than when the request began (a re-pointed symlink)
+// has no identity, so nothing produced across that move can bind.
+func (rc *RequestContext) IdentityAfter(ctx context.Context) (RepoIdentity, IdentityObservation) {
+	rc.Identity(ctx)
+	if rc.basis.root == "" {
+		return rc.basis.id, IdentityObservation{}
+	}
+	if ws, err := rc.Workspace(); err != nil || canonicalRoot(ws.Root) != rc.basis.root {
+		return unavailableIdentity("workspace_root_moved", "the workspace root resolves to another directory than when the request began"), IdentityObservation{}
+	}
+	return identityCache.after(ctx, rc.basis)
 }

@@ -19,15 +19,22 @@ import (
 )
 
 // identityFixture serves the real handler stack over a workspace whose root is a
-// Git repository, with a fake Rust core whose `repo-key` appends a line to a log
-// (one line per spawn) and reports the content of keyFile as a complete identity.
+// Git repository (with an untracked file two directories deep), with a fake Rust
+// core whose `repo-key` appends a line to a log (one line per spawn) and reports the
+// content of keyFile as a complete identity with an empty ignored-directory listing.
 type identityFixture struct {
 	*evidenceFixture
 	root   string
 	keyLog string
 }
 
-func newIdentityFixture(t *testing.T, searchBytes int) *identityFixture {
+// identityFixtureOpts varies the fake core.
+type identityFixtureOpts struct {
+	noListing   bool   // repo-key reports no ignored_dirs, as an older core does
+	searchDelay string // seconds the fake search takes (a slow handler)
+}
+
+func newIdentityFixture(t *testing.T, searchBytes int, opts ...identityFixtureOpts) *identityFixture {
 	t.Helper()
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not installed")
@@ -53,6 +60,16 @@ func newIdentityFixture(t *testing.T, searchBytes int) *identityFixture {
 	}
 	git("add", "-A")
 	git("commit", "-q", "-m", "init")
+	if err := os.MkdirAll(filepath.Join(root, "u", "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "u", "sub", "x.txt"), []byte("untracked\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var o identityFixtureOpts
+	if len(opts) > 0 {
+		o = opts[0]
+	}
 
 	f := &identityFixture{evidenceFixture: &evidenceFixture{ws: "wsId"}, root: root}
 	f.dir = t.TempDir()
@@ -87,9 +104,17 @@ func newIdentityFixture(t *testing.T, searchBytes int) *identityFixture {
 	f.keyFile = filepath.Join(t.TempDir(), "key")
 	_ = os.WriteFile(f.keyFile, []byte("rev-1"), 0o644)
 	f.keyLog = filepath.Join(t.TempDir(), "repo-key.log")
+	listing := `,"ignored_dirs":[]`
+	if o.noListing {
+		listing = ""
+	}
+	delay := ""
+	if o.searchDelay != "" {
+		delay = "sleep " + o.searchDelay + "; "
+	}
 	core := writeScript(t, `case "$1" in
-search) cat `+bigFile+` ;;
-repo-key) echo spawn >> `+f.keyLog+`; printf '{"key":"%s","identity_complete":true}' "$(cat `+f.keyFile+`)" ;;
+search) `+delay+`cat `+bigFile+` ;;
+repo-key) echo spawn >> `+f.keyLog+`; printf '{"key":"%s","identity_complete":true`+listing+`}' "$(cat `+f.keyFile+`)" ;;
 changetrack) printf '{"head_sha":"abc","content_hash":"h","dirty":false,"changed_files":[]}' ;;
 *) echo '{}' ;;
 esac
@@ -99,6 +124,9 @@ esac
 	t.Cleanup(func() { workspaceops.InvalidateRepoIdentity("") })
 	f.srv = httptest.NewServer(bodyLimitMiddleware(authMiddleware(f.dir, "auto", newAPIHandler())))
 	t.Cleanup(f.srv.Close)
+	// the identity cache trusts a file's stat key only once it is older than the
+	// racy window (2 s): let the fixture's files age past it
+	time.Sleep(2100 * time.Millisecond)
 	return f
 }
 
@@ -109,7 +137,8 @@ func (f *identityFixture) repoKeySpawns() int {
 }
 
 // PAR-FRESH-02: each core read tool samples the repository identity exactly once
-// (cold cache), including the capture-time re-check; remember and verify never do.
+// (cold cache), including the capture-time re-check, when the fingerprint is
+// available and the tree is quiet; remember and verify never do.
 func TestIdentitySampledOncePerReadToolAndNeverForWrites(t *testing.T) {
 	f := newIdentityFixture(t, 200<<10)
 	ws := "/api/workspaces/" + f.ws
@@ -188,8 +217,9 @@ func TestEvidencePagesReuseIdentityUntilTheRepositoryChanges(t *testing.T) {
 	if last["freshness"] != "current" || last["current_key_cached"] != true {
 		t.Fatalf("cached page: %v", last)
 	}
-	// the repository changes: a tracked file is edited (and its identity moves)
-	if err := os.WriteFile(filepath.Join(f.root, "src", "f.go"), []byte("package src // edited\n"), 0o644); err != nil {
+	// the repository changes inside an untracked directory two levels down (git
+	// status --untracked-files=all hashes it, so the identity moves)
+	if err := os.WriteFile(filepath.Join(f.root, "u", "sub", "x.txt"), []byte("untracked, edited\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	_ = os.WriteFile(f.keyFile, []byte("rev-2"), 0o644)
@@ -232,4 +262,59 @@ func TestExpanding16MiBOriginalSpawnsNoProcessPerPage(t *testing.T) {
 		t.Fatalf("%d pages spawned repo-key %d times; want 0", pages, n)
 	}
 	t.Logf("expanded %d bytes in %d pages in %v with 0 repo-key spawns (fake core)", len(orig), pages, elapsed)
+}
+
+// The capture-time re-check depends on the fingerprint, not on the identity TTL: a
+// handler that outlives the TTL still binds with one repo-key run.
+func TestSlowReadToolStillSamplesIdentityOnce(t *testing.T) {
+	t.Setenv("XMUSTARD_IDENTITY_CACHE_MS", "300")
+	f := newIdentityFixture(t, 200<<10, identityFixtureOpts{searchDelay: "0.6"})
+	before := f.repoKeySpawns()
+	_, b, _ := f.do(t, "GET", "/api/workspaces/"+f.ws+"/search?q=x", "", nil, deliver)
+	var d evidence.Delivery
+	_ = json.Unmarshal(b, &d)
+	if !d.Reduced || d.CapturedIdentity != "bound" {
+		t.Fatalf("slow search: %+v", d)
+	}
+	if n := f.repoKeySpawns() - before; n != 1 {
+		t.Fatalf("a 0.6 s handler with a 300 ms TTL sampled identity %d times; want 1", n)
+	}
+}
+
+// Without the fingerprint (here: a core that reports no ignored-directory listing;
+// likewise XMUSTARD_IDENTITY_CACHE_MS=0, an unavailable or costly walk) identity is
+// sampled as before the cache: before and after a reduced result, and on every
+// evidence page. Labels are unaffected.
+func TestIdentityFallbackWithoutTheFingerprint(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		opts identityFixtureOpts
+		ttl  string
+	}{
+		{"no ignored-directory listing", identityFixtureOpts{noListing: true}, ""},
+		{"cache off", identityFixtureOpts{}, "0"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			if c.ttl != "" {
+				t.Setenv("XMUSTARD_IDENTITY_CACHE_MS", c.ttl)
+			}
+			f := newIdentityFixture(t, 400<<10, c.opts)
+			before := f.repoKeySpawns()
+			_, b, _ := f.do(t, "GET", "/api/workspaces/"+f.ws+"/search?q=x", "", nil, deliver)
+			var d evidence.Delivery
+			_ = json.Unmarshal(b, &d)
+			if d.Handle == "" || d.CapturedIdentity != "bound" {
+				t.Fatalf("capture: %+v", d)
+			}
+			if n := f.repoKeySpawns() - before; n != 2 {
+				t.Fatalf("reduced result sampled identity %d times; want 2 (before and after)", n)
+			}
+			before = f.repoKeySpawns()
+			orig, last := f.expandAll(t, d.Handle, "")
+			pages := (len(orig) + evidence.DefaultPageSize - 1) / evidence.DefaultPageSize
+			if n := f.repoKeySpawns() - before; n != pages || last["freshness"] != "current" || last["current_key_cached"] != false {
+				t.Fatalf("%d pages: %d spawns, last %v", pages, n, last)
+			}
+		})
+	}
 }

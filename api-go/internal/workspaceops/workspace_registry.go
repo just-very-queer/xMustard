@@ -20,11 +20,17 @@ import (
 // "workspace" object, a bounded streaming read) and keeps it until the snapshot or
 // workspaces.json changes.
 //
-// Invalidation is by file identity: size, mtime, ctime and inode of both files, the
-// same stat key Git trusts for its index. As in Git's racy-index rule, a file whose
-// mtime is within registryRacyWindow of the moment it was read is not trusted: it is
-// re-read on the next lookup until it ages past the window, so a same-size rewrite
-// inside one timestamp tick is never served stale.
+// Invalidation is by file identity: size, mtime, ctime, inode and device of both
+// files (on unix; size and mtime elsewhere), the stat key Git trusts for its index.
+// As in Git's racy-index rule, a file whose mtime or ctime is within
+// registryRacyWindow of the moment it was read is not trusted: it is re-read on the
+// next lookup until it ages past the window, so a same-size rewrite inside one
+// timestamp tick is never served stale. A replacement that preserves size and mtime
+// (cp -p, rsync -a, a restore) still changes the ctime and usually the inode.
+//
+// The registry keeps the recorded root, not its symlink resolution: the canonical
+// scope is resolved again on every lookup (a few lstats), so re-pointing a symlinked
+// root takes effect on the next request.
 
 const (
 	// snapshotHeaderLimit bounds the bytes read to find the snapshot's workspace
@@ -40,8 +46,8 @@ type ResolvedWorkspace struct {
 	// Root is the repository root recorded by the workspace snapshot (the same value
 	// every tool path used when it parsed the snapshot).
 	Root string
-	// Scope is Root with symlinks resolved (Root itself when that fails): the
-	// evidence trust scope and the key of the repository identity cache.
+	// Scope is Root with symlinks resolved at lookup time (Root itself when that
+	// fails): the evidence trust scope and the key of the repository identity cache.
 	Scope  string
 	Record workspaceRecord
 }
@@ -53,15 +59,7 @@ type fileMark struct {
 	mtimeNs int64
 	ctimeNs int64
 	ino     uint64
-}
-
-func statMark(path string) (fileMark, error) {
-	fi, err := os.Stat(path)
-	if err != nil {
-		return fileMark{}, err
-	}
-	ino, ctimeNs := fileInodeCtime(fi)
-	return fileMark{exists: true, size: fi.Size(), mtimeNs: fi.ModTime().UnixNano(), ctimeNs: ctimeNs, ino: ino}, nil
+	dev     uint64
 }
 
 // trusted reports whether a mark read at readAt can identify the file's content:
@@ -100,6 +98,9 @@ type workspaceRegistry struct {
 
 var registry = &workspaceRegistry{entries: map[string]*registryEntry{}, records: map[string]*recordsEntry{}}
 
+// registryNow is the registry clock (tests shift it past the racy window).
+var registryNow = time.Now
+
 // Counting hooks: full snapshot parses (loadSnapshot) and bounded header reads.
 var (
 	snapshotLoads       atomic.Int64
@@ -128,13 +129,13 @@ func resolveWorkspace(dataDir, workspaceID string) (ResolvedWorkspace, error) {
 	}
 	recMark, _ := statMark(filepath.Join(dataDir, "workspaces.json"))
 	key := dataDir + "\x00" + workspaceID
-	now := time.Now()
+	now := registryNow()
 	registry.mu.Lock()
 	if e := registry.entries[key]; e != nil && e.trusted && e.snap == snap && e.records == recMark {
 		e.lastUsed = now
 		ws := e.ws
 		registry.mu.Unlock()
-		return ws, nil
+		return withScope(ws), nil
 	}
 	registry.mu.Unlock()
 
@@ -148,12 +149,6 @@ func resolveWorkspace(dataDir, workspaceID string) (ResolvedWorkspace, error) {
 			ws.Root = rec.RootPath
 		}
 	}
-	if ws.Root != "" {
-		ws.Scope = ws.Root
-		if canon, err := filepath.EvalSymlinks(ws.Root); err == nil {
-			ws.Scope = canon
-		}
-	}
 	registry.mu.Lock()
 	if len(registry.entries) >= registryMaxEntries {
 		evictOldestRegistryEntry()
@@ -161,7 +156,16 @@ func resolveWorkspace(dataDir, workspaceID string) (ResolvedWorkspace, error) {
 	registry.entries[key] = &registryEntry{snap: snap, records: recMark,
 		trusted: snap.trusted(now) && (!recMark.exists || recMark.trusted(now)), ws: ws, lastUsed: now}
 	registry.mu.Unlock()
-	return ws, nil
+	return withScope(ws), nil
+}
+
+// withScope resolves the workspace's canonical scope now, so identity and handlers
+// follow a re-pointed symlinked root from the next request on.
+func withScope(ws ResolvedWorkspace) ResolvedWorkspace {
+	if ws.Root != "" {
+		ws.Scope = canonicalRoot(ws.Root)
+	}
+	return ws
 }
 
 // evictOldestRegistryEntry drops the least recently used entry. Caller holds mu.
@@ -217,7 +221,7 @@ func lookupWorkspaceRecord(dataDir, workspaceID string) (workspaceRecord, error)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return workspaceRecord{}, err
 	}
-	rec, ok, err := registryRecord(dataDir, workspaceID, recMark, time.Now())
+	rec, ok, err := registryRecord(dataDir, workspaceID, recMark, registryNow())
 	if err != nil {
 		return workspaceRecord{}, err
 	}

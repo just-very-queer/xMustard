@@ -121,22 +121,17 @@ func principalScope(r *http.Request) (actor string, enforced bool) {
 	return "", false
 }
 
-// scopeIdentityFunc reads the current identity of a canonical root through the
-// identity cache: no repo-key run while the root's stat fingerprint and TTL hold.
-func scopeIdentityFunc(scope string) func(ctx context.Context) evidence.Identity {
+// repoIdentityFunc reads a workspace's current identity through the identity cache
+// (an evidence page read), resolving the scope only when the identity is needed:
+// no repo-key run while a fingerprint of the tree matches the cached pairing.
+func repoIdentityFunc(ws string) func(ctx context.Context) evidence.Identity {
 	return func(ctx context.Context) evidence.Identity {
+		scope := workspaceops.WorkspaceRepoScope(dataDir(), ws)
 		if scope == "" {
 			return toEvidenceIdentity(workspaceops.RepoIdentity{Source: "unavailable",
 				Limitations: []workspaceops.IdentityLimitation{{Reason: "workspace_root_unavailable"}}}, workspaceops.IdentityObservation{})
 		}
 		return toEvidenceIdentity(workspaceops.CurrentRepoIdentity(ctx, scope))
-	}
-}
-
-// repoIdentityFunc resolves the workspace's scope only when the identity is needed.
-func repoIdentityFunc(ws string) func(ctx context.Context) evidence.Identity {
-	return func(ctx context.Context) evidence.Identity {
-		return scopeIdentityFunc(workspaceops.WorkspaceRepoScope(dataDir(), ws))(ctx)
 	}
 }
 
@@ -178,16 +173,19 @@ func evidenceDeliveryMiddleware(store *evidence.Store, next http.Handler) http.H
 		}
 		r.Body = body
 		// Identity is observed around execution and Capture binds it only when the
-		// before and after identities are complete and equal. Read tools sample it
-		// once, here; the after-identity is re-read through the identity cache, which
-		// runs repo-key again only if the spawn-free fingerprint moved (a concurrent
-		// change) or the TTL passed. Write tools sample nothing.
+		// before and after identities are complete and equal. Read tools observe it
+		// once, here. Capture asks for the after-identity only for a reduced result
+		// with a complete before-identity; it then costs one fingerprint walk and no
+		// repo-key run when the tree provably did not move during the handler, and
+		// one run otherwise (or when the fingerprint is off for this root). Write
+		// tools sample nothing.
 		scope := rc.Scope()
 		var before *evidence.Identity
 		var afterKey func(ctx context.Context) evidence.Identity
 		if !identityFreeTools[tool] {
 			b := toEvidenceIdentity(rc.Identity(r.Context()))
-			before, afterKey = &b, scopeIdentityFunc(scope)
+			before = &b
+			afterKey = func(ctx context.Context) evidence.Identity { return toEvidenceIdentity(rc.IdentityAfter(ctx)) }
 		}
 		sw := &spoolWriter{header: http.Header{}, spool: sp}
 		next.ServeHTTP(sw, r)

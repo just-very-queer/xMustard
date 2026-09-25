@@ -9,8 +9,9 @@ import (
 	"time"
 )
 
-// agedWrite writes a registry source file with a past mtime, so the registry may
-// trust its stat key (it is outside the racy window).
+// agedWrite writes a registry source file with a past mtime and runs the registry
+// clock ahead of the filesystem, so the registry may trust its stat key (the ctime,
+// which cannot be set back, is outside the racy window too).
 func agedWrite(t *testing.T, path string, v any, age time.Duration) {
 	t.Helper()
 	if err := writeJSON(path, v); err != nil {
@@ -20,6 +21,13 @@ func agedWrite(t *testing.T, path string, v any, age time.Duration) {
 	if err := os.Chtimes(path, at, at); err != nil {
 		t.Fatal(err)
 	}
+	agedRegistryClock(t)
+}
+
+func agedRegistryClock(t *testing.T) {
+	prev := registryNow
+	registryNow = func() time.Time { return time.Now().Add(3 * time.Second) }
+	t.Cleanup(func() { registryNow = prev })
 }
 
 func snapshotWithRoot(ws, root string) map[string]any {
@@ -103,6 +111,75 @@ func TestRegistryRereadsARacySnapshot(t *testing.T) {
 	write("/r/bbbb") // same size, same mtime
 	if got, _, _ := resolveChangeRoot(dir, ws); got != "/r/bbbb" {
 		t.Fatalf("racy rewrite served stale: %q", got)
+	}
+}
+
+// A snapshot replaced by one of the same size with the mtime preserved (cp -p,
+// rsync -a, a restore) still has a new ctime and inode: the registry must not keep
+// serving the old root.
+func TestRegistryInvalidatesOnSameSizeSameMtimeReplacement(t *testing.T) {
+	agedRegistryClock(t)
+	dir, ws := t.TempDir(), "wsRegSwap"
+	path := snapshotPath(dir, ws)
+	old := time.Now().Add(-time.Hour)
+	write := func(p, root string) {
+		if err := writeJSON(p, snapshotWithRoot(ws, root)); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(p, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(path, "/repo/aaaa")
+	if got, _, _ := resolveChangeRoot(dir, ws); got != "/repo/aaaa" {
+		t.Fatalf("got %q", got)
+	}
+	before, _ := statMark(path)
+	write(path+".new", "/repo/bbbb")
+	if err := os.Rename(path+".new", path); err != nil {
+		t.Fatal(err)
+	}
+	after, _ := statMark(path)
+	if after.size != before.size || after.mtimeNs != before.mtimeNs {
+		t.Fatalf("fixture must keep size and mtime: %+v %+v", before, after)
+	}
+	if got, _, _ := resolveChangeRoot(dir, ws); got != "/repo/bbbb" {
+		t.Fatalf("same-size, same-mtime replacement served stale: %q", got)
+	}
+}
+
+// The canonical scope follows a re-pointed symlinked root on the next lookup, while
+// the registry keeps its cached record (no snapshot re-read).
+func TestRegistryScopeFollowsARepointedSymlink(t *testing.T) {
+	canon := func(p string) string {
+		c, err := filepath.EvalSymlinks(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	a, b := canon(t.TempDir()), canon(t.TempDir())
+	link := filepath.Join(t.TempDir(), "current")
+	if err := os.Symlink(a, link); err != nil {
+		t.Fatal(err)
+	}
+	dir, ws := t.TempDir(), "wsRegLink"
+	agedWrite(t, snapshotPath(dir, ws), snapshotWithRoot(ws, link), time.Hour)
+	if got := WorkspaceRepoScope(dir, ws); got != a {
+		t.Fatalf("scope = %q want %q", got, a)
+	}
+	headers := snapshotHeaderReads.Load()
+	if err := os.Remove(link); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(b, link); err != nil {
+		t.Fatal(err)
+	}
+	if got := WorkspaceRepoScope(dir, ws); got != b {
+		t.Fatalf("scope stayed on the old target: %q want %q", got, b)
+	}
+	if n := snapshotHeaderReads.Load() - headers; n != 0 {
+		t.Fatalf("re-resolving the scope re-read the snapshot %d time(s)", n)
 	}
 }
 
