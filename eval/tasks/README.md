@@ -203,46 +203,69 @@ running. So:
     that repository's other worktrees;
   - the output directory (other runs' diffs and oracle logs). The API is allowed only
     its own stack directory inside it;
-  - the harness's git directories and watchdog state, and every other run's worktree,
-    repository, client config and fake-driver files, including kept worktrees.
+  - the harness's git directories, watchdog state and judge copies (see the next
+    item);
+  - the whole areas of the work root that hold per-run worktrees, repositories, client
+    configs and fake-driver files, except the run's own entry. Because the areas are
+    denied as a whole, this also covers kept worktrees and the entries of runs that
+    start after the profile was made.
 
   It denies writes to the scratch repositories and to the operator's global git
   config (`~/.gitconfig`, `~/.config/git`). The mode is recorded per run. `none` puts a
   warning in the report. PWD and OLDPWD are removed from every child's environment, and
   PWD is set to the command's own directory, so the operator's directory is not
   revealed.
-- **Hidden oracle.** Oracle files enter the worktree only after all of these steps:
+- **Hidden oracle.** Oracle files never enter the worktree. They are staged only after
+  all of these steps:
   - the agent's process group is dead;
-  - every other process of the run is dead (see the next item);
-  - the visible verify step has run;
-  - the worktree has been checked against the agent's final snapshot.
+  - every other process of the run that the sweep finds is dead (see the next item);
+  - the visible verify step has run and the sweep has run again.
 
-  Verify runs after that snapshot. If verify changed non-ignored files, the worktree is
-  restored to the snapshot, the run records `verify_changed_tree`, and the report warns.
-  The oracle therefore judges exactly the tree in `diff.patch`. Before the agent starts,
-  the worktree is scanned for any file whose bytes equal an oracle file, and for
-  existing oracle destinations. A hit fails the run as `oracle_visible`.
-- **Escaped processes.** Processes that leave the client's process group (`setsid`, as
-  Pi's bash tool does for every command) are found and killed at three points: after
-  the agent, after verify, and after the oracle. A run fails if any survive. They are
-  found three ways:
-  - as descendants the 100 ms process sampler saw while the client ran, identified by
-    pid and start time;
+  The harness then copies the worktree into a judge directory under the work root.
+  Every agent, setup and verify profile hides that directory. The copy keeps ignored
+  files such as installed dependencies. On macOS it is one `clonefile` call; elsewhere
+  it is made file by file, with links copied as links. Its other files are reset to the
+  agent's final snapshot through the harness's git directory. The copy is not a git
+  repository. The oracle files are written into it from the bytes loaded with the
+  corpus, and the oracle runs there under its own profile. That profile hides every
+  run's worktree and allows only the judge copy. So the oracle judges exactly the tree
+  in `diff.patch` (ignored files aside, see below), whatever verify, or a process the
+  run left behind, did to the worktree afterwards. If verify changed non-ignored files,
+  the run records `verify_changed_tree` and the report warns. Staging runs with the
+  operator's rights.
+  It goes through an `os.Root`, and if any directory on a destination path is a
+  symbolic link the run fails as `oracle_path_symlink`. The judge copy is deleted with
+  the run, even with `--keep-worktrees`. Before the agent starts, the worktree is
+  scanned for any file whose bytes equal an oracle file, and for existing oracle
+  destinations. A hit fails the run as `oracle_visible`. `validate --oracles` judges
+  copies in the same way.
+- **Escaped processes.** Processes that leave their command's process group (`setsid`,
+  as Pi's bash tool does for every command) are found and killed at three points:
+  after the agent, after verify, and after the oracle. A run fails if any survive.
+  They are found three ways:
+  - as descendants seen by a 100 ms process sampler while setup, the client, verify or
+    the oracle ran, identified by pid and start time;
   - by a per-run environment marker (Linux reads `/proc/<pid>/environ`; recent macOS no
     longer exposes other processes' environments);
-  - by a working directory inside the worktree.
+  - by a working directory inside the worktree or the judge copy.
 
-  On macOS, a process that detaches and leaves the worktree within 100 ms of starting,
-  with a parent that exits just as fast, can be missed. It stays inside the run's
-  containment. On Linux, bwrap's pid namespace kills everything when the sandbox exits.
+  On macOS some processes are not found. One example is a process that detaches within
+  100 ms of starting, has a parent that exits just as fast, changes to another
+  directory and clears its environment. Such a process keeps running under the profile
+  it started with. That profile hides the judge copies and every other run's entries,
+  including runs that start later. The process can still use everything the sandbox
+  allows: the rest of the machine, the home directory, the network and signals to the
+  operator's other processes. On Linux, bwrap's pid namespace kills everything when
+  the sandbox exits.
 - **Executor death.** A watchdog child process holds a pipe to the executor. If the
   executor dies without cleaning up (SIGKILL, an OOM kill, a test timeout), the
   watchdog kills the live process groups and the run's escaped processes, and removes
-  the work root.
+  the work root (with `--keep-worktrees`, only the judge copies).
 - **Kept worktrees.** `--keep-worktrees` keeps every run's worktree under the work
-  root, which is printed at the end, with the oracle files removed. Each is hidden from
-  later runs' agents. `isolation.kept_at` names the directory, and the report warns
-  that worktrees were kept. Remove the work root when done.
+  root, which is printed at the end. The oracle was never in them. A kept worktree
+  shows the tree after verify. Each is hidden from later runs' agents.
+  `isolation.kept_at` names the directory, and the report warns that worktrees were
+  kept. Remove the work root when done.
 - **Nested seatbelts.** A macOS seatbelt cannot be applied inside another one. Under
   `sandbox-exec`, codex runs with `--sandbox danger-full-access` because the sandbox is
   external. If Claude Code's own sandbox is enabled in the operator's settings, use
@@ -253,19 +276,31 @@ running. So:
 What containment does not cover:
 - The sandbox allows everything it does not deny. The agent can read the rest of the
   machine and write its home directory (caches, client settings), and those writes
-  persist into later runs.
+  persist into later runs of every arm. Clients are run without session persistence
+  (claude `--no-session-persistence`, codex `--ephemeral`, pi `--no-session`), so none
+  of them leaves a transcript for a later run. The operator's own earlier transcripts
+  in the client homes are still readable. So are shared toolchain caches, such as the
+  Go build cache, which both the agent and the oracle write. For strict isolation, run
+  the eval as a dedicated OS user whose home holds only the client credentials.
+- The oracle runs code the agent wrote while the oracle files are present in the judge
+  copy. Its profile hides every run's directories, but it does not confine writes. So
+  code that runs at oracle time can copy the oracle to a place a later run can read,
+  such as the home directory or the shared build cache. Closing that would need the
+  oracle's writes confined to the judge copy, with private toolchain caches. A cold Go
+  build cache costs about 8 s and 66 MB per oracle run on the seed fixture.
 - Copies of the corpus outside its repository's worktrees are not found. Keep oracle
   sources and reference patches out of any other place an agent could read, such as
   another clone or a synced folder.
-- Ignored files (per `.gitignore`) are outside every snapshot. Verify-time changes to
-  them are not undone.
+- Ignored files (per `.gitignore`) are outside every snapshot. The judge copy takes
+  them from the worktree as they are after verify, so verify-time changes to them are
+  not undone.
 
 ## Drivers and accounting
 
 | Driver | Invocation | Final event used for tokens and cost |
 | --- | --- | --- |
 | `claude` | `claude -p --output-format stream-json --verbose --no-session-persistence --permission-mode bypassPermissions --model M`, prompt on stdin | `{"type":"result"}`: `modelUsage` summed over models (else `usage`), `total_cost_usd` |
-| `codex` | `codex exec --json --color never -C <worktree> --sandbox workspace-write -m M -` (`danger-full-access` under `sandbox-exec`, see Isolation), prompt on stdin | every `turn.completed` `usage` (cached tokens split out of `input_tokens`); cost from `pricing` or `unpriced` |
+| `codex` | `codex exec --ephemeral --json --color never -C <worktree> --sandbox workspace-write -m M -` (`danger-full-access` under `sandbox-exec`, see Isolation), prompt on stdin | every `turn.completed` `usage` (cached tokens split out of `input_tokens`); cost from `pricing` or `unpriced` |
 | `pi` | `pi --mode rpc --no-session --model M`; the harness sends `prompt`, waits for `agent_settled`, then asks `get_session_stats` | the `get_session_stats` response (tokens, cost). Without it, per-message usage is reported with `usage_source: message_end` and `final_event: false` |
 
 A run without a final event is flagged in the report. Token numbers count only when the
