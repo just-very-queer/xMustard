@@ -19,19 +19,24 @@
 // The same engine serves strings (String, Bytes, Check, Findings) and streams
 // (NewReader, Copy, WriteFile). Input is processed in fixed 128 KiB windows,
 // about 33 KiB of which are held back as lookahead, which covers everything a
-// detector reads past where it matched. So a secret split across read or
-// window boundaries is still found, the output is what one pass over the whole
-// input produces whatever the chunking of reads or the window boundaries, and
-// the engine's memory is bounded by the window whatever the input length (the
-// 16 MiB stream test grows the live heap by under 0.5 MiB). String and Bytes
+// detector reads past where it matched. A window emits text in clear only
+// before the positions it has decided; a secret it found that starts later
+// (the password of a URL whose scheme it saw) is merged with the next
+// window's findings. So a secret split across read or window boundaries is
+// still found, the output is what one pass over the whole input produces
+// whatever the chunking of reads or the window boundaries, and the engine's
+// memory is bounded by the window whatever the input length (the 16 MiB
+// stream test grows the live heap by under 0.5 MiB). String and Bytes
 // also hold their result, one copy of the input's size, and String returns its
 // input without copying when nothing is redacted; Check holds nothing;
 // Findings holds one entry per secret.
 //
 // A private key is replaced between its BEGIN and END markers. When separators
 // interrupt it (quoted lines joined by "+" or written as adjacent literals,
-// "# " or "> " prefixes), they stay and each base64 line is replaced, so
-// source code, comments and JSON strings keep their shape.
+// "# " or "> " prefixes, a prefix such as `sb.append("` repeated on each line),
+// they stay and each base64 line is replaced, so source code, comments and
+// JSON strings keep their shape. Text between two markers that is not shaped
+// like a key (code or prose that names both) is left alone.
 //
 // Key-aware detection reads how a value was written. A quoted value or YAML
 // block scalar under a password-like key is always a secret unless it is a
@@ -45,11 +50,16 @@
 // password is one word, so a multi-word YAML value ("password: correct horse")
 // is not taken for one; validators judge the first 512 bytes of a
 // value; a YAML block scalar is read for at most 3 KiB; and a private key is
-// read for at most 32 KiB past its BEGIN marker. Without an END marker in that
-// span, a key is replaced only as far as its body runs uninterrupted, and only
-// if that holds a base64 run of 16 bytes, so a BEGIN marker named in prose or
-// a log line costs nothing, and a truncated key split into quoted or
-// commented lines keeps the lines after the first separator.
+// read for at most 32 KiB past its BEGIN marker. A key split by separators is
+// taken only when its lines (all but the last) hold 40 bytes or more and its
+// separators hold 32 bytes at most, with no words but a repeated prefix; a
+// key interleaved with other text (records between its lines) is not. Without
+// an END marker in that span, or with text between the markers that is not
+// shaped like a key, a key is replaced only as far as its body runs
+// uninterrupted, and only if that holds a mixed-case base64 run of 16 bytes,
+// so a BEGIN marker named in prose or a log line costs nothing, and a
+// truncated key split into quoted or commented lines keeps the lines after
+// the first separator.
 //
 // Intended callers:
 //
@@ -60,6 +70,8 @@
 //   - Transcript and session imports: NewReader per file, or Value per decoded
 //     JSON record.
 //   - Fixtures, overflow and handoff files: WriteFile (mode 0600, atomic).
+//   - File reads and context injection: IsSecretPath (or MatchSecretPath, which
+//     names the pattern for a structured refusal) before a path is opened.
 //   - Request metadata in logs or fixtures: Headers.
 //   - Rendering configuration: EnvRefs; redacting process output: WithEnv with
 //     SecretEnv(os.Environ()).
@@ -516,7 +528,8 @@ type candidate struct {
 	prio       int32 // lower wins the label when regions merge
 	scanner    int8  // 1 + index of the scanner that found it; 0 for a triggered detector
 	covers     bool  // its scanner looks for nothing inside it (see engine.resume)
-	part       bool  // more of the previous candidate's secret: a marker, but no new count
+	head       bool  // the first part of a secret redacted in several parts
+	part       bool  // a later part of the secret whose head shares its anchor: a marker, but no new count
 	ext        bool  // continues the region that ended where this window's output resumes
 }
 
@@ -565,13 +578,22 @@ type engine struct {
 	// again, with a full lookahead, in the next window.
 	evalFrom int
 	// lastStart and lastEnd are the input offsets of the last redacted region,
-	// including what its continuation swallowed.
-	lastStart, lastEnd int
+	// including what its continuation swallowed; lastFinding is its entry in
+	// found.
+	lastStart, lastEnd, lastFinding int
+	// keyAnchor is the input offset of the anchor of the last secret redacted
+	// in parts, and keyFinding its entry in found: its later parts extend it.
+	keyAnchor, keyFinding int
 	// resume holds, per scanner, the input offset its scan resumes from. A
 	// scanner may skip what a value it found covers (keyedRule does not look
 	// for keys inside a bare value); a later window skips it as well, so where
 	// a window ends does not change what is found.
 	resume []int
+	// pending holds candidates, in input offsets, that a window decided but
+	// could not emit: they start past what it consumed, where secrets anchored
+	// in the next window may still precede or overlap them. The next window
+	// merges them with its own.
+	pending []candidate
 }
 
 // lookahead is how many bytes at the end of a non-final window are held back.
@@ -592,6 +614,14 @@ const lookahead = pemSpan + 512
 // that reaches past what is already consumed extends the carried region when
 // it starts inside it, exactly as one window over the whole input would merge
 // the two.
+//
+// Output goes as far as the decided positions (limit) and, past them, only
+// through the one redacted region that crosses limit, so every clear byte
+// emitted precedes limit and every anchor inside an emitted byte range was
+// evaluated. A candidate decided here that starts past that point (the
+// password of a URL whose scheme precedes limit, a later line of a split key)
+// waits in pending for the next window, where it is merged with what that
+// window finds before it, as one window over the whole input would.
 func (e *engine) window(out, buf []byte, from, n int, eof bool) ([]byte, int) {
 	done := from // everything before done is emitted or swallowed
 	if len(e.open) > 0 {
@@ -639,42 +669,76 @@ func (e *engine) window(out, buf []byte, from, n int, eof bool) ([]byte, int) {
 			e.cands[k].scanner = int8(i + 1)
 		}
 	}
-	sort.SliceStable(e.cands, func(i, j int) bool { return e.cands[i].anchor < e.cands[j].anchor })
 
-	consumed := max(limit, done)
-	committed := e.cands[:0]
+	// Candidates anchored at or past limit are evaluated again, with their full
+	// lookahead, in the next window; the pending ones join the rest.
+	known := e.cands[:0]
 	for _, c := range e.cands {
 		if c.anchor >= limit {
-			break // evaluated again, with its full lookahead, in the next window
+			continue
 		}
 		if c.covers {
 			e.resume[c.scanner-1] = max(e.resume[c.scanner-1], e.base+c.end)
 		} else {
 			c.scanner = 0
 		}
+		known = append(known, c)
+	}
+	for _, c := range e.pending {
+		c.anchor, c.start, c.end = c.anchor-e.base, c.start-e.base, c.end-e.base
+		if c.cont != nil { // a value that ran to the previous window's end
+			end, open := c.cont.advance(buf, c.end, n, eof)
+			c.end = end
+			if !open {
+				c.cont = nil
+			}
+		}
+		known = push(known, c)
+	}
+	e.pending = e.pending[:0]
+	e.cands = known
+
+	kept := known[:0]
+	for _, c := range known {
 		if c.start < done {
 			if c.end <= done && c.cont == nil {
-				continue // inside what was already redacted or emitted
+				continue // inside what was already redacted
 			}
 			c.ext = e.lastEnd == e.base+done && e.base+c.start >= e.lastStart
 			c.start, c.end = done, max(c.end, done)
 		}
-		committed = append(committed, c)
-		consumed = max(consumed, c.end)
-		if c.cont != nil {
-			e.open = append(e.open, openRegion{c.cont, c.scanner})
-		}
+		kept = append(kept, c)
 	}
-	sort.SliceStable(committed, func(i, j int) bool {
-		a, b := &committed[i], &committed[j]
+	sort.SliceStable(kept, func(i, j int) bool {
+		a, b := &kept[i], &kept[j]
 		if a.start != b.start {
 			return a.start < b.start
 		}
 		if a.ext != b.ext {
 			return a.ext
 		}
-		return a.prio < b.prio
+		if a.prio != b.prio {
+			return a.prio < b.prio
+		}
+		return a.anchor < b.anchor
 	})
+
+	// Commit, in start order, what starts before limit, extends the region
+	// carried to done, or starts inside the region that crosses limit; the
+	// rest waits for the next window.
+	consumed := max(limit, done)
+	m := 0
+	for ; m < len(kept) && (kept[m].start < consumed || kept[m].ext); m++ {
+		consumed = max(consumed, kept[m].end)
+		if c := kept[m]; c.cont != nil {
+			e.open = append(e.open, openRegion{c.cont, c.scanner})
+		}
+	}
+	committed := kept[:m]
+	for _, c := range kept[m:] {
+		c.anchor, c.start, c.end = c.anchor+e.base, c.start+e.base, c.end+e.base
+		e.pending = append(e.pending, c)
+	}
 
 	pos := done
 	for i := 0; i < len(committed); {
@@ -694,16 +758,28 @@ func (e *engine) window(out, buf []byte, from, n int, eof bool) ([]byte, int) {
 			}
 			e.lastStart = e.base + c.start
 		}
-		if c.ext || c.part {
+		switch {
+		case c.ext:
 			e.extendRegion(end)
-		} else {
+		case c.part:
+			if e.keyAnchor == e.base+c.anchor {
+				e.lastFinding = e.keyFinding
+			}
+			e.extendRegion(end)
+		default:
 			if e.collect {
 				e.found = append(e.found, Finding{Rule: c.rule, Offset: e.base + c.start, Length: end - c.start})
+				e.lastFinding = len(e.found) - 1
 			}
 			if e.rep.Rules[c.rule] == 0 {
 				e.order = append(e.order, c.rule)
 			}
 			e.rep.add(c.rule, 1)
+		}
+		for _, h := range committed[i:j] {
+			if h.head {
+				e.keyAnchor, e.keyFinding = e.base+h.anchor, e.lastFinding
+			}
 		}
 		e.lastEnd = e.base + end
 		pos = end
@@ -719,8 +795,8 @@ func (e *engine) window(out, buf []byte, from, n int, eof bool) ([]byte, int) {
 // window position); its finding grows to match.
 func (e *engine) extendRegion(end int) {
 	e.lastEnd = max(e.lastEnd, e.base+end)
-	if e.collect && len(e.found) > 0 {
-		f := &e.found[len(e.found)-1]
+	if e.collect && e.lastFinding < len(e.found) {
+		f := &e.found[e.lastFinding]
 		f.Length = max(f.Length, e.lastEnd-f.Offset)
 	}
 }

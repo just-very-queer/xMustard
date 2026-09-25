@@ -475,9 +475,16 @@ const (
 	pemSpan = 2*pemMarkerMax + pemMaxBody
 	// pemMinRun is the shortest base64 run taken for key material. A body with
 	// no END marker must hold one, and between the separators of a quoted,
-	// concatenated or prefixed key each such run is replaced. Key lines are 64
-	// or 76 bytes; words in prose and log fields are shorter.
+	// concatenated or prefixed key each such run is a line of the key. Key
+	// lines are 64, 70 or 76 bytes; words in prose and log fields are shorter.
 	pemMinRun = 16
+	// pemMinLine is the shortest line, but for the last, of a key that
+	// separators interrupt: identifiers and paths between two markers named in
+	// code or prose are shorter.
+	pemMinLine = 40
+	// pemMaxGap bounds a separator between the lines of such a key (`\n" + "`,
+	// "\n# ", a repeated line prefix).
+	pemMaxGap = 32
 )
 
 type pemRule struct{}
@@ -490,14 +497,15 @@ func (pemRule) triggers() ([]string, bool) { return []string{"-----BEGIN"}, fals
 //     headers) is replaced whole;
 //   - a body interrupted by separators (a closing quote and "+" or an adjacent
 //     literal, "# " or "> " line prefixes, spaces between lines) whose END
-//     marker follows within pemMaxBody keeps the separators: each base64 run of
-//     pemMinRun or more bytes is replaced, and so is the key's short last line
-//     (see keyRuns), so JSON strings and records, source code and comments keep
-//     their shape;
-//   - a body with no END marker is replaced up to the first byte a body cannot
-//     hold, if it holds a base64 run of pemMinRun bytes, so a BEGIN marker named
-//     in prose or a log line ("found -----BEGIN PRIVATE KEY----- in upload")
-//     costs nothing.
+//     marker follows within pemMaxBody keeps the separators when the text
+//     between the markers is shaped like a key: each line is replaced, and so
+//     is the key's short last line (see keyRuns), so JSON strings and records,
+//     source code and comments keep their shape;
+//   - otherwise, a body is replaced up to the first byte a body cannot hold,
+//     if it holds a base64 run of pemMinRun bytes with upper- and lowercase
+//     letters, as key material does, so a BEGIN marker named in prose, code or
+//     a log line ("found -----BEGIN PRIVATE KEY----- in upload", "-----BEGIN
+//     PRIVATE KEY----- /home/dev/") costs nothing.
 //
 // Later BEGIN markers inside what was redacted are skipped: they add nothing.
 func (pemRule) at(buf []byte, pos, litLen, from, n int, eof bool, _ *runMemo, out []candidate) ([]candidate, int) {
@@ -517,10 +525,12 @@ func (pemRule) at(buf []byte, pos, litLen, from, n int, eof bool, _ *runMemo, ou
 	}
 	if lim := min(n, me+pemMaxBody); b.stop < lim {
 		if e := pemEndAfter(buf, b.stop, lim, n); e >= 0 {
-			return keyRuns(buf, pos, me, e, out), e
+			if more, ok := keyRuns(buf, pos, me, e, out); ok {
+				return more, e
+			}
 		}
 	}
-	if b.run < pemMinRun {
+	if !b.keyRun {
 		return out, pos + 1
 	}
 	return push(out, c), b.end
@@ -531,76 +541,59 @@ type pemBodyScan struct {
 	stop   int  // first byte past the body; the END marker when closed
 	end    int  // end of the redacted body: stop, less trailing whitespace unless closed
 	run    int  // longest run of base64
+	keyRun bool // some run of pemMinRun bytes or more holds upper- and lowercase letters, as key material does
 	closed bool // the body ends at an END marker
 }
 
 // scanPEMBody reads a key body from me: base64 lines, whitespace, JSON-escaped
-// line breaks (\n, \\n, \/) and armor header lines before the base64
-// ("Proc-Type: 4,ENCRYPTED", "DEK-Info: ...", OpenPGP "Version: ..."). A line
-// of base64 is one word, so a space followed by another word on the same line
-// ends the body, as do a byte a body cannot hold (a quote, other punctuation,
-// non-ASCII) and pemMaxBody bytes.
+// line breaks (\n, \\n), escaped base64 bytes (\/, \u002B) and armor
+// header lines before the base64 ("Proc-Type: 4,ENCRYPTED", "DEK-Info: ...",
+// OpenPGP "Version: ..."). A line of base64 is one word, so a space followed by
+// another word on the same line ends the body, as do a byte a body cannot hold
+// (a quote, other punctuation, non-ASCII) and pemMaxBody bytes.
 func scanPEMBody(buf []byte, me, n int) pemBodyScan {
 	lim := min(n, me+pemMaxBody)
 	var b pemBodyScan
 	i, ws, run := me, 0, 0
-	midLine, header, sawData := false, false, false
+	midLine, header, sawData, upper, lower := false, false, false, false, false
 body:
 	for i < lim {
-		c, w, space, data := buf[i], 1, false, false
+		c, w, ok := unit(buf, i, n)
+		if !ok {
+			break // an escape cut by the end of the window
+		}
+		space, data := false, false
 		switch {
-		case c == '-':
+		case buf[i] == '-' && (!header || pemEndAt(buf, i, n)): // "Proc-Type:" is a header's
 			b.closed = pemEndAt(buf, i, n)
 			break body
 		case c == '\n' || c == '\r':
 			midLine, header, space = false, false, true
 		case c == ' ' || c == '\t':
-			if midLine && !header && ws == 0 && wordFollows(buf, i, n) {
+			if midLine && !header && ws == 0 && wordFollows(buf, i+w, n) {
 				break body
 			}
 			space = true
-		case c == '\\':
-			k := i
-			for k < n && k-i < 8 && buf[k] == '\\' {
-				k++
-			}
-			if k == n {
-				break body
-			}
-			switch buf[k] {
-			case 'n', 'r':
-				midLine, header, space = false, false, true
-			case 't':
-				if midLine && !header && ws == 0 && wordFollows(buf, k+1, n) {
-					break body
-				}
-				space = true
-			case '/':
-				data = !header
-			default:
-				break body // \" and other escapes end the body
-			}
-			w = k + 1 - i
 		case header:
 			if c < 0x20 || c > 0x7e || c == '"' {
 				break body
 			}
+		case w == 1 && !midLine && !sawData && pemHeader(buf, i, n):
+			header, midLine = true, true
+		case !b64Std[c]:
+			break body // quotes, other escapes and punctuation end the body
 		default:
-			if !midLine && !sawData && pemHeader(buf, i, n) {
-				header, midLine = true, true
-				break
-			}
-			if !b64Std[c] {
-				break body
-			}
 			data = true
 		}
 		if data {
 			midLine, sawData = true, true
 			run++
 			b.run = max(b.run, run)
+			upper = upper || ('A' <= c && c <= 'Z')
+			lower = lower || ('a' <= c && c <= 'z')
+			b.keyRun = b.keyRun || (run >= pemMinRun && upper && lower)
 		} else {
-			run = 0
+			run, upper, lower = 0, false, false
 		}
 		if space {
 			ws += w
@@ -616,17 +609,74 @@ body:
 	return b
 }
 
-// wordFollows reports whether a word follows the spaces at i on the same line.
-func wordFollows(buf []byte, i, n int) bool {
-	for i < n {
-		switch {
-		case buf[i] == ' ' || buf[i] == '\t':
-			i++
-		case buf[i] == '\\' && i+1 < n && buf[i+1] == 't':
-			i += 2
-		default:
-			return b64Std[buf[i]]
+// unit decodes the byte at buf[i]: a raw byte, or an escape as a string
+// literal writes it, at any depth of JSON nesting ("\n", "\\n", "\"", "\/",
+// "\u002B"). It returns the byte the unit stands for (0 for an escape that
+// stands for no single ASCII byte) and the unit's width; ok is false when n
+// cuts an escape.
+func unit(buf []byte, i, n int) (c byte, w int, ok bool) {
+	if buf[i] != '\\' {
+		return buf[i], 1, true
+	}
+	k := i
+	for k < n && k-i < 8 && buf[k] == '\\' {
+		k++
+	}
+	if k == n {
+		return 0, 0, false
+	}
+	switch x := buf[k]; x {
+	case 'n':
+		return '\n', k + 1 - i, true
+	case 'r':
+		return '\r', k + 1 - i, true
+	case 't':
+		return '\t', k + 1 - i, true
+	case '"', '\'', '/':
+		return x, k + 1 - i, true
+	case 'u':
+		if k+5 > n {
+			return 0, 0, false
 		}
+		v := 0
+		for _, h := range buf[k+1 : k+5] {
+			d := hexDigit(h)
+			if d < 0 {
+				return 0, k + 1 - i, true
+			}
+			v = v<<4 | d
+		}
+		if v < 0x80 {
+			return byte(v), k + 5 - i, true
+		}
+		return 0, k + 5 - i, true
+	}
+	return 0, k + 1 - i, true
+}
+
+func hexDigit(c byte) int {
+	switch {
+	case '0' <= c && c <= '9':
+		return int(c - '0')
+	case 'a' <= c|0x20 && c|0x20 <= 'f':
+		return int(c|0x20-'a') + 10
+	}
+	return -1
+}
+
+// wordFollows reports whether a word follows the spaces at i on the same line.
+// It looks past at most 32 spaces, so the answer does not depend on where a
+// window ends.
+func wordFollows(buf []byte, i, n int) bool {
+	for k := 0; i < n && k < 32; k++ {
+		c, w, ok := unit(buf, i, n)
+		if !ok {
+			return false
+		}
+		if c != ' ' && c != '\t' {
+			return b64Std[c]
+		}
+		i += w
 	}
 	return false
 }
@@ -684,44 +734,131 @@ func pemEndAfter(buf []byte, from, lim, n int) int {
 }
 
 // keyRuns returns the key material of buf[me:e), a key between its markers
-// that is interrupted by separators: every base64 run of pemMinRun or more
-// bytes, and after the last of them the key's short last line, the last run of
-// 4 or more bytes holding a digit, an uppercase letter or '+', '/', '='. A
-// backslash escape (\n, \", \\) separates runs. Only the first run is counted;
-// the others are parts of the same secret.
-func keyRuns(buf []byte, pos, me, e int, out []candidate) []candidate {
-	first, last := len(out), me
-	tail := -1
-	var tailEnd int
+// that separators interrupt, when the text there is shaped like one; ok is
+// false, and out unchanged, otherwise. A line is a base64 run of pemMinRun or
+// more bytes, escaped base64 bytes (\/, \u002B) included. The text is a key
+// when every line but the last, and the first, holds pemMinLine bytes or more,
+// and every separator (before the first line, between lines, after the last)
+// is short, pemMaxGap bytes at most, and holds only quotes, spaces, line
+// breaks, escapes and punctuation ("\n" + ", "\n# ", "\n'\n    '"), or else
+// the words of a prefix repeated on the lines (sb.append(", a JSONL record's
+// {"role":"user","text":"): the same words in each separator that holds any,
+// and in at least two. After the last line, the key's short last line may
+// follow between two such separators.
+//
+// Each line and the short last line are replaced; the separators stay. The
+// first line counts; the others are parts of the same secret.
+func keyRuns(buf []byte, pos, me, e int, out []candidate) ([]candidate, bool) {
+	first := len(out)
+	var g gapCheck
+	lines, prev, gap := 0, 0, me // lines so far, the last one's length, where the separator after it starts
 	for i := me; i < e; {
-		switch c := buf[i]; {
-		case c == '\\':
-			i += 2
-			continue
-		case !b64Std[c]:
-			i++
+		j, l := b64Run(buf, i, e)
+		if l < pemMinRun {
+			i = max(j, i+unitWidth(buf, i, e))
 			continue
 		}
-		j := scanSet(buf, i, e, b64Std)
-		switch {
-		case j-i >= pemMinRun:
-			out = push(out, candidate{anchor: pos, start: i, end: j, label: RulePrivateKey, rule: RulePrivateKey, prio: 1, part: len(out) > first})
-			last = j
-		case j-i >= 4 && keyLike(buf[i:j]):
-			tail, tailEnd = i, j
+		if (lines == 0 && l < pemMinLine) || (lines > 0 && prev < pemMinLine) || !g.add(buf, gap, i) {
+			return out[:first], false
+		}
+		out = push(out, candidate{anchor: pos, start: i, end: j, label: RulePrivateKey, rule: RulePrivateKey, prio: 1, head: lines == 0, part: lines > 0})
+		lines, prev, gap, i = lines+1, l, j, j
+	}
+	if lines == 0 {
+		return out[:first], false
+	}
+	// What follows the last line is a separator, or two around the short last line.
+	if end := g; end.add(buf, gap, e) && end.ok() {
+		return out, true
+	}
+	for i := gap; i < e; {
+		j, l := b64Run(buf, i, e)
+		if l == 0 {
+			i += unitWidth(buf, i, e)
+			continue
+		}
+		if end := g; end.add(buf, gap, i) && end.add(buf, j, e) && end.ok() {
+			return push(out, candidate{anchor: pos, start: i, end: j, label: RulePrivateKey, rule: RulePrivateKey, prio: 1, part: true}), true
 		}
 		i = j
 	}
-	if len(out) > first && tail >= last {
-		out = push(out, candidate{anchor: pos, start: tail, end: tailEnd, label: RulePrivateKey, rule: RulePrivateKey, prio: 1, part: true})
-	}
-	return out
+	return out[:first], false
 }
 
-// keyLike reports whether a short base64 run looks like the end of a key
-// rather than a word: it holds a digit, an uppercase letter or '+', '/', '='.
-func keyLike(b []byte) bool {
-	return hasDigit(b) || hasUpper(b) || bytes.ContainsAny(b, "+/=")
+// b64Run returns the end of the run of base64 units at i (i itself when the
+// unit there is not one) and how many bytes it stands for.
+func b64Run(buf []byte, i, e int) (end, length int) {
+	for i < e {
+		c, w, ok := unit(buf, i, e)
+		if !ok || !b64Std[c] {
+			break
+		}
+		i += w
+		length++
+	}
+	return i, length
+}
+
+// unitWidth is the width of the unit at i, or 1 for an escape e cuts.
+func unitWidth(buf []byte, i, e int) int {
+	if _, w, ok := unit(buf, i, e); ok {
+		return w
+	}
+	return 1
+}
+
+// gapCheck accumulates the separators of a key that separators interrupt.
+type gapCheck struct {
+	words  [pemMaxGap]byte // the words of the first separator that holds any
+	nwords int
+	worded int // separators holding words
+}
+
+// add records the separator buf[s:t) and reports whether it may be one.
+func (g *gapCheck) add(buf []byte, s, t int) bool {
+	if t-s > pemMaxGap {
+		return false
+	}
+	var w [pemMaxGap]byte
+	k := wordsOf(&w, buf, s, t)
+	switch {
+	case k == 0:
+		return true
+	case g.worded == 0:
+		g.words, g.nwords = w, k
+	case string(w[:k]) != string(g.words[:g.nwords]):
+		return false
+	}
+	g.worded++
+	return true
+}
+
+// ok reports whether words, if any separator holds them, repeat.
+func (g *gapCheck) ok() bool { return g.worded != 1 }
+
+// wordsOf writes the alphanumeric words the units of buf[s:t) stand for,
+// separated by single spaces, to dst and returns their length (at most t-s).
+func wordsOf(dst *[pemMaxGap]byte, buf []byte, s, t int) int {
+	k, sep := 0, false
+	for i := s; i < t; {
+		c, w, ok := unit(buf, i, t)
+		if !ok {
+			c, w = 0, 1
+		}
+		i += w
+		if !alnum[c] {
+			sep = true
+			continue
+		}
+		if sep && k > 0 {
+			dst[k] = ' '
+			k++
+		}
+		dst[k] = c
+		k++
+		sep = false
+	}
+	return k
 }
 
 // literalRule redacts exact environment values.

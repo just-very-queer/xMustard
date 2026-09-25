@@ -296,6 +296,120 @@ func TestPEMWithSeparators(t *testing.T) {
 	}
 }
 
+// A prefix repeated on every line of a key (a shell echo, a builder call) is a
+// separator: each line goes, the short last line included, and the words of
+// the prefix (a file name) stay.
+func TestPEMWithRepeatedPrefix(t *testing.T) {
+	r := Default()
+	rng := rand.New(rand.NewSource(21))
+	begin, end := join("-----BEGIN ", "RSA PRIVATE", " KEY-----"), join("-----END ", "RSA PRIVATE", " KEY-----")
+	l1, l2, last := randToken(rng, alphaNum+"+/", 64), randToken(rng, alphaNum+"+/", 64), "Xk9pQ2w=="
+	echo := func(l, op string) string { return `echo "` + l + `" ` + op + " key2.pem\n" }
+	in := echo(begin, ">") + echo(l1, ">>") + echo(l2, ">>") + echo(last, ">>") + echo(end, ">>")
+	want := echo(begin, ">") + echo("[REDACTED:private_key]", ">>") + echo("[REDACTED:private_key]", ">>") +
+		echo("[REDACTED:private_key]", ">>") + echo(end, ">>")
+	if got := sameAsOneShot(t, r, "echo", in); got != want {
+		t.Errorf("echo lines:\n got %q\nwant %q", got, want)
+	}
+	app := func(l string) string { return `sb.append("` + l + `\n");` + "\n" }
+	in = app(begin) + app(l1) + app(l2) + app(last) + app(end)
+	want = app(begin) + app("[REDACTED:private_key]") + app("[REDACTED:private_key]") + app("[REDACTED:private_key]") + app(end)
+	if got := sameAsOneShot(t, r, "append", in); got != want {
+		t.Errorf("builder lines:\n got %q\nwant %q", got, want)
+	}
+
+	// A secret inside the repeated prefix is a finding of its own; the key's
+	// finding spans its lines, and neither is stretched over the other.
+	pw := "Tr0ub4!"
+	pre := "\n# password=\"" + pw + "\" "
+	in = "# " + begin + pre + l1 + pre + l2 + pre + last + pre + end + "\n"
+	out := sameAsOneShot(t, r, "prefixed password", in)
+	if strings.Contains(out, pw) || strings.Contains(out, l1) || strings.Contains(out, last) || !strings.Contains(out, "password=") {
+		t.Fatalf("prefixed key: %q", out)
+	}
+	var keys, fields int
+	for _, f := range r.Findings(in) {
+		switch f.Rule {
+		case RulePrivateKey:
+			keys++
+			if f.Offset != strings.Index(in, l1) || f.Offset+f.Length != strings.Index(in, last)+len(last) {
+				t.Errorf("key finding %+v does not span its lines", f)
+			}
+		case RuleSecretField:
+			fields++
+			if f.Length != len(pw) {
+				t.Errorf("password finding stretched: %+v", f)
+			}
+		}
+	}
+	if keys != 1 || fields != 4 {
+		t.Errorf("findings: %d keys, %d passwords", keys, fields)
+	}
+}
+
+// A key that a JSON encoder wrote with \u escapes ('+' as \u002B, '"' as
+// \u0022, as System.Text.Json does by default) is replaced along whole
+// escapes: the output stays valid JSON and no fragment of a line survives.
+func TestPEMWithUnicodeEscapes(t *testing.T) {
+	r := Default()
+	rng := rand.New(rand.NewSource(22))
+	begin, end := join("-----BEGIN ", "RSA PRIVATE", " KEY-----"), join("-----END ", "RSA PRIVATE", " KEY-----")
+	var lines []string
+	for range 3 {
+		l := []byte(randToken(rng, alphaNum+"/", 64))
+		for k := 5; k < len(l); k += 11 {
+			l[k] = '+'
+		}
+		lines = append(lines, string(l))
+	}
+	lines = append(lines, randToken(rng, alphaNum, 18)+"==")
+	encode := func(v string) string {
+		var b strings.Builder
+		b.WriteByte('"')
+		for _, c := range []byte(v) {
+			switch c {
+			case '"':
+				b.WriteString(`\u0022`)
+			case '+':
+				b.WriteString(`\u002B`)
+			case '\\':
+				b.WriteString(`\\`)
+			case '\n':
+				b.WriteString(`\n`)
+			default:
+				b.WriteByte(c)
+			}
+		}
+		b.WriteByte('"')
+		return b.String()
+	}
+	java := `String k = "` + begin + `\n"`
+	for _, l := range lines {
+		java += ` + "` + l + `\n"`
+	}
+	java += ` + "` + end + `";`
+	for name, v := range map[string]string{
+		"pem":  begin + "\n" + strings.Join(lines, "\n") + "\n" + end + "\n",
+		"java": java,
+	} {
+		in := `{"text":` + encode(v) + `,"n":1}`
+		if !json.Valid([]byte(in)) {
+			t.Fatalf("%s: fixture is not JSON", name)
+		}
+		out := sameAsOneShot(t, r, name, in)
+		if !json.Valid([]byte(out)) {
+			t.Errorf("%s: redaction broke JSON: %s", name, out)
+		}
+		for _, l := range lines {
+			for k := 0; k+5 <= len(l); k++ {
+				if frag := l[k : k+5]; !strings.ContainsAny(frag, "+") && strings.Contains(out, frag) {
+					t.Fatalf("%s: fragment %q survived: %s", name, frag, out)
+				}
+			}
+		}
+	}
+}
+
 // A BEGIN marker without an END redacts only what could be a key body: base64
 // up to the first byte a body cannot hold, never a following word, quote, line
 // or record, and nothing when there is no base64 run of pemMinRun bytes.
@@ -411,7 +525,21 @@ func falsePositiveCorpus() []string {
 	png := make([]byte, 48<<10)
 	rng.Read(png)
 	image := "data:image/png;base64," + base64.StdEncoding.EncodeToString(png)
+	begin, end := join("-----BEGIN ", "RSA PRIVATE", " KEY-----"), join("-----END ", "RSA PRIVATE", " KEY-----")
+	hash := "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
 	return []string{
+		// both key markers named in code, prose and chat, with no key between
+		"const pemBegin = \"" + begin + "\"\n\nfunc load(b []byte) (*rsa.PrivateKey, error) {\n\tblock, _ := pem.Decode(b)\n" +
+			"\treturn x509.ParsePKCS1PrivateKey(block.Bytes)\n}\n\nconst pemEnd = \"" + end + "\"\n",
+		"if bytes.HasPrefix(b, []byte(\"" + begin + "\")) {\n\treturn x509.ParsePKCS1PrivateKey(b)\n}\nconst pemEnd = \"" + end + "\"\n",
+		"Put the " + begin + " block in /etc/ssl/private/server.key and close it with " + end + ".",
+		"Write " + begin + " to /etc/ssl/private/server.key, then " + end + " last.",
+		begin + "\n- sha256: " + hash + "\n" + end + "\n",
+		begin + "\n\"sha256: " + hash + "\"\n" + end + "\n",
+		"The key " + begin + " sha256: " + hash + " " + end + " was rotated.",
+		`{"role":"user","text":"why does openssl write ` + begin + ` to /home/developer/.ssh/key.pem?"}` + "\n" +
+			`{"role":"assistant","text":"x509.ParsePKCS1PrivateKey expects the ` + end + ` footer"}` + "\n",
+		`{"role":"user","text":"` + begin + ` /home/developer/"}` + "\n" + `{"role":"assistant","text":"ParsePKCS1PrivateKey ` + end + `"}` + "\n",
 		"sha256: 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
 		"commit 3f5ba7e1c2d4e6f8a0b1c3d5e7f9a1b3c5d7e9f1",
 		`{"content_digest":"sha256:2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae"}`,
@@ -880,9 +1008,134 @@ func TestCarriedRegionExtendsIntoNextWindow(t *testing.T) {
 	}
 }
 
+// firstLimit is the input offset of the first window's limit: anchors before
+// it are decided in the first window, the rest in the second.
+const firstLimit = contextLen + windowSize - 1 - lookahead
+
+// padTo returns prose of exactly n bytes, ending in a line break.
+func padTo(n int) string {
+	pre := strings.Repeat("lorem ipsum\n", (n-1)/12)
+	return pre + strings.Repeat(" ", n-1-len(pre)) + "\n"
+}
+
+// A secret decided in one window that starts past the output it emits (a URL
+// password after a token user name, the later lines of a split key after a
+// prefix holding a password) waits for the next window: what that window
+// finds before or inside it is merged exactly as one window would. Before,
+// the bytes between were emitted in clear and a secret anchored there leaked.
+func TestSecretsPastTheDecisionLimit(t *testing.T) {
+	r := Default()
+	rng := rand.New(rand.NewSource(31))
+	begin, end := join("-----BEGIN ", "RSA PRIVATE", " KEY-----"), join("-----END ", "RSA PRIVATE", " KEY-----")
+	step := 1
+	if testing.Short() {
+		step = 7
+	}
+	check := func(name, in string, secrets ...string) {
+		t.Helper()
+		want := sameAsOneShot(t, r, name, in)
+		for _, s := range secrets {
+			if strings.Contains(want, s) {
+				t.Fatalf("%s: one window leaks %q", name, s)
+			}
+		}
+		_, wantRep, _ := oneShot(r, in)
+		if got, rep := streamAll(t, r, &chunkReader{data: []byte(in), rng: rng, max: 1 + rng.Intn(9000)}); got != want || rep.Count != wantRep.Count {
+			t.Fatalf("%s: stream differs from one window", name)
+		}
+	}
+	tail := filler(rng, 40000)
+	pw := "Tr0ub4dor&3x!"
+	for d := 1; d <= 400; d += step {
+		l1 := randToken(rng, alphaNum+"+/", 64)
+		// BEGIN just before the limit, the password and the key line after it
+		in := padTo(firstLimit-d) + `{"text":"my key: ` + begin + `"}` + "\n" + `{"cmd":"export DB_PASSWORD='` + pw + `'"}` + "\n" +
+			`{"text":"` + l1 + `"}` + "\n" + `{"text":"` + end + `"}` + "\n" + tail
+		check(fmt.Sprint("jsonl records ", d), in, pw)
+		// a key whose repeated line prefix holds a password
+		pre := "\n# password=\"" + randToken(rng, alphaNum, 6) + "!\" "
+		in = padTo(firstLimit-d) + "# " + begin + pre + l1 + pre + randToken(rng, alphaNum+"+/", 64) + pre + "Xk9pQ2w==" + pre + end + "\n" + tail
+		check(fmt.Sprint("prefixed key ", d), in, pre[len("\n# password=\""):len(pre)-2], l1, "Xk9pQ2w==")
+	}
+	gh := join("gh", "p_", randToken(rng, alphaNum, 36))
+	for d := 1; d <= 12; d++ {
+		in := padTo(firstLimit-d) + "https://" + gh + ":x-oauth-basic@github.com/org/repo.git\n" + tail
+		check(fmt.Sprint("url user ", d), in, gh)
+		in = padTo(firstLimit-d) + "Authorization: Bearer " + randToken(rng, alphaNum, 40) + "\n" + tail
+		check(fmt.Sprint("bearer header ", d), in)
+	}
+}
+
+// denseInput packs fragments whose secrets start well past their anchors
+// (URL passwords, the later lines of split keys, YAML block scalars, flag and
+// header values, webhook paths) next to secrets that may lie between, so every
+// window boundary falls inside one.
+func denseInput(rng *rand.Rand, size int) string {
+	begin, end := join("-----BEGIN ", "RSA PRIVATE", " KEY-----"), join("-----END ", "RSA PRIVATE", " KEY-----")
+	line := func() string { return randToken(rng, alphaNum+"+/", 64) }
+	var b strings.Builder
+	for b.Len() < size {
+		switch rng.Intn(10) {
+		case 0:
+			b.WriteString("git clone https://" + join("gh", "p_", randToken(rng, alphaNum, 36)) + ":x-oauth-basic@github.com/o/r.git\n")
+		case 1:
+			pre := "\n# password=\"" + randToken(rng, alphaNum, 6) + "!\" "
+			b.WriteString("# " + begin)
+			for range 1 + rng.Intn(6) {
+				b.WriteString(pre + line())
+			}
+			b.WriteString(pre + randToken(rng, alphaNum, 1+rng.Intn(12)) + "==" + pre + end + "\n")
+		case 2:
+			b.WriteString("Authorization: Bearer " + randToken(rng, alphaNum, 40) + "\n")
+		case 3:
+			b.WriteString(`{"text":"my key: ` + begin + `"}` + "\n" + `{"cmd":"export DB_PASSWORD='Tr0ub4dor&3x!'"}` + "\n" +
+				`{"text":"` + line() + `"}` + "\n" + `{"text":"` + end + `"}` + "\n")
+		case 4:
+			shapes := pemShapes(begin, end, []string{line(), line(), randToken(rng, alphaNum, 10) + "=="})
+			b.WriteString(shapes[rng.Intn(len(shapes))].text + "\n")
+		case 5:
+			b.WriteString("db:\n  password: |\n" + strings.Repeat(" ", rng.Intn(200)) + "\n    " + line() + "\n  host: x\n")
+		case 6:
+			b.WriteString("post to https://hooks.slack.com/services/T0" + randToken(rng, upperNum, 8) + "/B0" +
+				randToken(rng, upperNum, 8) + "/" + randToken(rng, alphaNum, 24) + " ok\n")
+		case 7:
+			b.WriteString("deploy --api-key        " + randToken(rng, "0123456789abcdef", 32) + " --force\n")
+		case 8:
+			b.WriteString("echo \"" + begin + "\" > k.pem\necho \"" + line() + "\" >> k.pem\necho \"" +
+				join("AK", "IA", randToken(rng, upperNum, 16)) + "\" >> k.pem\necho \"" + end + "\" >> k.pem\n")
+		default:
+			b.WriteString(filler(rng, rng.Intn(400)) + "\n")
+		}
+	}
+	return b.String()
+}
+
+// Randomized differential: on dense inputs, every windowed path produces the
+// one-window output, report and findings, whatever the chunking of reads.
+// Before pending candidates, the windowed paths differed on 115 of 200 such
+// inputs, each time redacting less.
+func TestStreamMatchesOneShotDense(t *testing.T) {
+	r := Default()
+	seeds := int64(40)
+	if testing.Short() {
+		seeds = 6
+	}
+	for seed := int64(1); seed <= seeds; seed++ {
+		rng := rand.New(rand.NewSource(seed))
+		in := denseInput(rng, 300<<10+rng.Intn(300<<10))
+		want := sameAsOneShot(t, r, fmt.Sprint("seed ", seed), in)
+		_, wantRep, _ := oneShot(r, in)
+		got, rep := streamAll(t, r, &chunkReader{data: []byte(in), rng: rng, max: 1 + rng.Intn(20000)})
+		if got != want || rep.Count != wantRep.Count {
+			t.Fatalf("seed %d: stream differs from one window (%d vs %d redactions)", seed, rep.Count, wantRep.Count)
+		}
+	}
+}
+
 // stickyInput mixes fragments that open long regions (unterminated quotes,
-// long lines and bare values, YAML blocks) with keys in every shape, tokens
-// and marker mentions, so that regions and secrets straddle window ends.
+// long lines and bare values, YAML blocks) with keys in every shape, secrets
+// between the lines of split keys, tokens and marker mentions, so that
+// regions and secrets straddle window ends.
 func stickyInput(rng *rand.Rand, size int) string {
 	begin, end := join("-----BEGIN ", "RSA PRIVATE", " KEY-----"), join("-----END ", "RSA PRIVATE", " KEY-----")
 	words := func(n int) string {
@@ -895,7 +1148,7 @@ func stickyInput(rng *rand.Rand, size int) string {
 	line := func() string { return randToken(rng, alphaNum+"+/", 64) }
 	var b strings.Builder
 	for b.Len() < size {
-		switch rng.Intn(14) {
+		switch rng.Intn(16) {
 		case 0:
 			b.WriteString("note: password: 'draft " + words(rng.Intn(60000)) + "\n")
 		case 1:
@@ -919,6 +1172,15 @@ func stickyInput(rng *rand.Rand, size int) string {
 			b.WriteString("db:\n  password: |\n    " + line() + "\n  host: x\n")
 		case 10:
 			b.WriteString("key " + begin + "\n" + line() + "\n" + words(rng.Intn(40)) + "\n")
+		case 11:
+			// secrets between the lines of a split key: in its repeated prefix,
+			// or in records between (text that is then not taken for a key)
+			pre := "\n# password=\"" + randToken(rng, alphaNum, 6) + "!\" "
+			b.WriteString("# " + begin + pre + line() + pre + line() + pre + end + "\n")
+			b.WriteString(`{"t":"` + begin + `"}` + "\n" + `{"t":"token ` + join("gh", "p_", randToken(rng, alphaNum, 36)) + `"}` + "\n" +
+				`{"t":"` + line() + `"}` + "\n" + `{"t":"` + end + `"}` + "\n")
+		case 12:
+			b.WriteString("https://" + join("gh", "p_", randToken(rng, alphaNum, 36)) + ":x-oauth-basic@github.com/o/r " + words(rng.Intn(200)) + "\n")
 		default:
 			b.WriteString(words(rng.Intn(9000)) + "\n")
 		}
@@ -1041,6 +1303,10 @@ func TestAdversarialInputsAreLinear(t *testing.T) {
 		"pem quoted mentions":    rep(join("-----BEGIN ", "PRIVATE", ` KEY-----" + x + "`)),
 		"pem lines without end":  rep(join("-----BEGIN ", "PRIVATE", " KEY-----\n# ") + strings.Repeat("Ab3/", 16) + "\n# "),
 		"pem ends without key":   rep(join("-----BEGIN ", "PRIVATE", ` KEY-----", "`, "-----END ", "PRIVATE", ` KEY-----", "`)),
+		"split keys":             rep(join("# -----BEGIN ", "PRIVATE", " KEY-----\n# ") + strings.Repeat("Ab3/", 16) + "\n# " + strings.Repeat("Qz9+", 16) + join("\n# -----END ", "PRIVATE", " KEY-----\n")),
+		"escaped key lines":      rep(join("-----BEGIN ", "PRIVATE", ` KEY-----\u0022 \u002B \u0022`) + strings.Repeat(`Ab3\u002B`, 12) + `\n\u0022 `),
+		"short runs to an end":   rep(join("-----BEGIN ", "PRIVATE", " KEY-----\n") + strings.Repeat("Ab3/", 16) + strings.Repeat(" ab", 10000) + join("-----END ", "PRIVATE", " KEY-----\n")),
+		"url token users":        rep("https://ghp_" + strings.Repeat("a1", 18) + ":x@h "),
 		"keys in a quoted value": `password: "` + rep("token:"),
 		"nested quoted values":   `password: "` + rep("a_token='Zx9 "),
 	}
