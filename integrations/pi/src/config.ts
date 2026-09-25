@@ -8,6 +8,13 @@ import { BUILTIN_TOOLS } from "./tools.ts";
 
 export type DeliveryMode = "source" | "hook";
 
+export interface MaskConfig {
+	enabled: boolean; // XMUSTARD_PI_MASK=off disables turn_end masking
+	afterTurns: number; // a result older than this many turns may be masked
+	everyTurns: number; // the mask advances only every this many turns (polling window)
+	minBytes: number; // smaller results are never masked
+}
+
 export interface AdapterConfig {
 	apiBase: string;
 	token: string | undefined;
@@ -21,6 +28,7 @@ export interface AdapterConfig {
 	// Built-in results at or below this many bytes pass through unchanged (Go would
 	// return them unchanged too); larger ones are captured and projected to about it.
 	projectionTarget: number;
+	mask: MaskConfig;
 }
 
 export const DEFAULT_API_BASE = "http://127.0.0.1:8042";
@@ -31,10 +39,18 @@ export const DEFAULT_PROJECTION_TIMEOUT_MS = 5_000;
 // (evidence.MinCaptureTarget).
 export const PI_POLICY_TARGET = 32 << 10;
 export const MIN_CAPTURE_TARGET = 1 << 10;
+export const DEFAULT_MASK: MaskConfig = { enabled: true, afterTurns: 10, everyTurns: 5, minBytes: 2 << 10 };
 
 function lowerOnly(raw: string | undefined, fallback: number, min = 1): number {
 	const v = Number.parseInt((raw ?? "").trim(), 10);
 	return Number.isFinite(v) && v >= min && v < fallback ? v : fallback;
+}
+
+function bounded(raw: string | undefined, fallback: number, min: number, max: number): number {
+	const s = (raw ?? "").trim();
+	if (!/^\d+$/.test(s)) return fallback;
+	const v = Number.parseInt(s, 10);
+	return v >= min && v <= max ? v : fallback;
 }
 
 const off = (v: string | undefined): boolean => ["off", "0", "false", "no"].includes((v ?? "").trim().toLowerCase());
@@ -64,6 +80,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AdapterConfig 
 		projectionTimeoutMs: lowerOnly(env.XMUSTARD_PI_PROJECTION_TIMEOUT_MS, DEFAULT_PROJECTION_TIMEOUT_MS),
 		builtins: builtinSet(env.XMUSTARD_PI_BUILTINS),
 		projectionTarget: lowerOnly(env.XMUSTARD_PI_PROJECTION_TARGET_BYTES, PI_POLICY_TARGET, MIN_CAPTURE_TARGET),
+		mask: {
+			enabled: !off(env.XMUSTARD_PI_MASK),
+			afterTurns: bounded(env.XMUSTARD_PI_MASK_AFTER_TURNS, DEFAULT_MASK.afterTurns, 1, 10_000),
+			everyTurns: bounded(env.XMUSTARD_PI_MASK_EVERY_TURNS, DEFAULT_MASK.everyTurns, 1, 10_000),
+			// a masked result must be retained behind a handle, which needs more than
+			// the smallest capture target
+			minBytes: bounded(env.XMUSTARD_PI_MASK_MIN_BYTES, DEFAULT_MASK.minBytes, MIN_CAPTURE_TARGET + 1, 1 << 20),
+		},
 	};
 }
 

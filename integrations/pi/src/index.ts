@@ -1,19 +1,20 @@
 // xMustard Pi extension: the nine xMustard tools as direct HTTP-backed Pi tools, plus
 // `xmustard_expand`, inactive until a result carries a recovery handle. Pi's built-in
 // tools (bash, read, grep, find, ls, edit, write) are projected through xMustard's
-// capture route.
+// capture route, and older tool results are masked at turn_end in polling windows.
 //
 // Load-time work is registration only: no sidecar, socket, timer or network call.
 // Configuration (see README.md): XMUSTARD_API_BASE, optional XMUSTARD_TOKEN (sent as
 // a bearer token, never logged), optional XMUSTARD_WORKSPACE_ID (else the workspace
 // is resolved from Pi's working directory), XMUSTARD_PI_DELIVERY=source|hook,
 // lower-only XMUSTARD_PI_TOOL_TIMEOUT_MS / XMUSTARD_PI_PROJECTION_TIMEOUT_MS /
-// XMUSTARD_PI_PROJECTION_TARGET_BYTES, XMUSTARD_PI_BUILTINS.
+// XMUSTARD_PI_PROJECTION_TARGET_BYTES, XMUSTARD_PI_BUILTINS, XMUSTARD_PI_MASK*.
 
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, SessionBoundaryDraft } from "@earendil-works/pi-coding-agent";
 import { type TSchema, Type } from "typebox";
 import { loadConfig } from "./config.ts";
 import { Capturer, EXPAND_TOOL, expand, PAGE_SIZE, PendingCalls, projectBuiltin, projectResult, runTool } from "./delivery.ts";
+import { createMasker } from "./masking.ts";
 import { TOOL_NAMES, TOOL_SPECS, type ToolArgs, type ToolSpec } from "./tools.ts";
 import { callerTools, WorkspaceResolver } from "./workspace.ts";
 
@@ -36,7 +37,7 @@ export function toolParameters(spec: ToolSpec): TSchema {
 const ExpandParameters = Type.Object(
 	{
 		workspace_id: Type.String({ description: "the workspace id the handle was issued in" }),
-		handle: Type.String({ description: "the xm1.… recovery handle from an [xmustard evidence] line" }),
+		handle: Type.String({ description: "the xm1.… recovery handle from an [xmustard evidence] line or [xmustard masked: …] stub" }),
 		offset: Type.Optional(Type.Integer({ minimum: 0, description: "byte offset into the original (next_offset of the previous page)" })),
 		length: Type.Optional(Type.Integer({ minimum: 1, maximum: PAGE_SIZE, description: `bytes to read (max ${PAGE_SIZE})` })),
 		pattern: Type.Optional(Type.String({ description: "search the original for this RE2 pattern instead of paging" })),
@@ -61,8 +62,8 @@ export default function xmustard(pi: ExtensionAPI): void {
 	const pending = new PendingCalls();
 	const workspaces = new WorkspaceResolver(cfg);
 	const capturer = new Capturer(cfg);
-	// built-in projection resolves the session's workspace within the projection
-	// deadline (the resolver caches it per directory)
+	// built-in projection and masking resolve the session's workspace
+	// within the projection deadline (the resolver caches it per directory)
 	const resolveWorkspace = async (cwd: string | undefined, signal?: AbortSignal): Promise<string> => {
 		const deadline = AbortSignal.timeout(cfg.projectionTimeoutMs);
 		return String((await workspaces.resolve({}, cwd, signal ? AbortSignal.any([signal, deadline]) : deadline)).workspace_id);
@@ -85,7 +86,7 @@ export default function xmustard(pi: ExtensionAPI): void {
 		name: EXPAND_TOOL,
 		label: "xMustard expand",
 		description:
-			"Read the exact original bytes behind a reduced xMustard result, one page at a time (max 64 KiB), or search it. Pass the workspace_id and handle from its [xmustard evidence] line; start at offset 0 and continue from next_offset until eof, or pass pattern (RE2), query or lines=A-B to get matching lines with numbers. Results report whether the capture is current, stale or of unknown freshness; serve captured bytes only.",
+			"Read the exact original bytes behind a reduced or masked xMustard result, one page at a time (max 64 KiB), or search it. Pass the workspace_id and handle from its [xmustard evidence] line or [xmustard masked: …] stub; start at offset 0 and continue from next_offset until eof, or pass pattern (RE2), query or lines=A-B to get matching lines with numbers. Results report whether the capture is current, stale or of unknown freshness; serve captured bytes only.",
 		parameters: ExpandParameters,
 		async execute(_toolCallId, params, signal) {
 			return expand(cfg, params, signal);
@@ -114,5 +115,12 @@ export default function xmustard(pi: ExtensionAPI): void {
 			return projectBuiltin(cfg, capturer, (signal) => resolveWorkspace(ctx.cwd, signal), event, meta, activateExpand);
 		}
 		return undefined; // other tools pass through untouched
+	});
+
+	// masking returns the drafts earlier handlers proposed plus its context edits
+	const mask = createMasker({ cfg: cfg.mask, capturer, resolveWorkspace, onHandle: activateExpand });
+	pi.on("turn_end", async (event, ctx) => {
+		const out = await mask(event, ctx);
+		return out ? { entries: out.entries as SessionBoundaryDraft[] } : undefined;
 	});
 }
