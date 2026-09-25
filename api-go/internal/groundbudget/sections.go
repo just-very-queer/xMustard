@@ -120,13 +120,6 @@ var sections = []Section{
 // otherCap bounds the undeclared members together.
 const otherCap = 1024
 
-// Sections returns the declared sections, most important first.
-func Sections() []Section {
-	out := make([]Section, len(sections))
-	copy(out, sections)
-	return out
-}
-
 // SectionNames lists the names sections= accepts, most important first.
 func SectionNames() []string {
 	out := make([]string, len(sections))
@@ -165,9 +158,9 @@ type ArgError struct {
 
 func (e *ArgError) Error() string { return fmt.Sprintf("argument %q %s", e.Argument, e.Reason) }
 
-// ParseSections validates a comma-separated section list. Blank selects every
+// parseSections validates a comma-separated section list. Blank selects every
 // section (nil). Names are trimmed and deduplicated; an unknown name is rejected.
-func ParseSections(list string) (map[string]bool, *ArgError) {
+func parseSections(list string) (map[string]bool, *ArgError) {
 	if strings.TrimSpace(list) == "" {
 		return nil, nil
 	}
@@ -190,9 +183,9 @@ func ParseSections(list string) (map[string]bool, *ArgError) {
 	return out, nil
 }
 
-// ParseMaxChars validates max_chars; blank is the default. Out-of-range values are
+// parseMaxChars validates max_chars; blank is the default. Out-of-range values are
 // rejected, never clamped.
-func ParseMaxChars(v string) (int, *ArgError) {
+func parseMaxChars(v string) (int, *ArgError) {
 	v = strings.TrimSpace(v)
 	if v == "" {
 		return DefaultMaxChars, nil
@@ -211,11 +204,11 @@ func ParseMaxChars(v string) (int, *ArgError) {
 
 // ParseRequest validates the sections and max_chars arguments.
 func ParseRequest(sectionList, maxChars string) (Request, *ArgError) {
-	secs, aerr := ParseSections(sectionList)
+	secs, aerr := parseSections(sectionList)
 	if aerr != nil {
 		return Request{}, aerr
 	}
-	n, aerr := ParseMaxChars(maxChars)
+	n, aerr := parseMaxChars(maxChars)
 	if aerr != nil {
 		return Request{}, aerr
 	}
