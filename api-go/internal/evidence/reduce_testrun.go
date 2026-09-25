@@ -78,9 +78,20 @@ var testRules = &lineRules{
 			s += " counts_from=" + f.CountsFrom
 		}
 		if len(f.FailingTests) > 0 {
-			s += " failing=" + strings.Join(f.FailingTests, ",")
-			if f.Failed > len(f.FailingTests) {
-				s += fmt.Sprintf(",+%d", f.Failed-len(f.FailingTests))
+			// at most ~400 bytes of names: the header must not eat a small budget
+			names, shown := "", 0
+			for _, n := range f.FailingTests {
+				if len(names)+len(n) > 400 && shown > 0 {
+					break
+				}
+				if shown > 0 {
+					names += ","
+				}
+				names, shown = names+n, shown+1
+			}
+			s += " failing=" + names
+			if rest := max(f.Failed, len(f.FailingTests)) - shown; rest > 0 {
+				s += fmt.Sprintf(",+%d", rest)
 			}
 		}
 		return s

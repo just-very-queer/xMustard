@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -238,27 +239,25 @@ func nonEmpty(secs []Section) []Section {
 	return out
 }
 
-// sectionShares splits a budget over sections: a section smaller than a quarter of
-// the budget gets exactly its size, the others share the rest by size, and none gets
-// less than a quarter, so a small stderr is kept whole and never starved.
+// sectionShares splits a budget over sections max-min fairly (water-filling): in
+// ascending size, each section gets all it needs or an equal share of what is left,
+// so a small stderr is kept whole, large sections split the rest, and the shares
+// never add up to more than the budget.
 func sectionShares(secs []Section, budget int) []int {
 	budget = max(budget, 1024)
-	shares := make([]int, len(secs))
-	floor := budget / 4
-	left := budget
-	var rest int64
-	for i, s := range secs {
-		if sz := s.End - s.Start; sz <= int64(floor) {
-			shares[i] = int(sz)
-			left -= int(sz)
-		} else {
-			rest += sz
-		}
+	order := make([]int, len(secs))
+	for i := range order {
+		order[i] = i
 	}
-	for i, s := range secs {
-		if shares[i] == 0 {
-			shares[i] = max(floor, int(int64(max(left, 0))*(s.End-s.Start)/max(rest, 1)))
-		}
+	sort.Slice(order, func(a, b int) bool {
+		return secs[order[a]].End-secs[order[a]].Start < secs[order[b]].End-secs[order[b]].Start
+	})
+	shares := make([]int, len(secs))
+	left := budget
+	for k, i := range order {
+		fair := left / (len(order) - k)
+		shares[i] = int(min(secs[i].End-secs[i].Start, int64(fair)))
+		left -= shares[i]
 	}
 	return shares
 }

@@ -208,6 +208,9 @@ func buildPayload(pol ClientPolicy, in ShapeInput) (json.RawMessage, error) {
 		if in.Body != nil && in.Body.Dropped > 0 {
 			return nil, fmt.Errorf("%w: %d image blocks cannot be carried by a text projection", errUnshapable, in.Body.Dropped)
 		}
+		if in.Body != nil && in.Body.Incomplete {
+			return nil, fmt.Errorf("%w: details exceed the skeleton bounds", errUnshapable)
+		}
 		out := map[string]any{"content": []map[string]any{{"type": "text", "text": text}}, "isError": in.Body != nil && in.Body.IsError}
 		if in.Body != nil && in.Body.Response != nil {
 			for _, k := range in.Body.Response.Kids {
@@ -222,6 +225,9 @@ func buildPayload(pol ClientPolicy, in ShapeInput) (json.RawMessage, error) {
 		}
 		return json.Marshal(out)
 	case "opencode":
+		if in.Body != nil && in.Body.Incomplete {
+			return nil, fmt.Errorf("%w: metadata exceeds the skeleton bounds", errUnshapable)
+		}
 		title := in.Tool
 		var meta json.RawMessage = []byte("{}")
 		if in.Body != nil && in.Body.Response != nil && in.Body.Response.Kind == 'o' {
@@ -256,38 +262,43 @@ func buildPayload(pol ClientPolicy, in ShapeInput) (json.RawMessage, error) {
 }
 
 // claudeFixups adjusts scalars that describe the replaced text (Read numLines, Grep
-// numLines, Glob truncated) so the payload stays self-consistent.
-func claudeFixups(in ShapeInput) map[string]func(parts map[int]string) json.RawMessage {
-	fix := map[string]func(map[int]string) json.RawMessage{}
+// numLines, Glob truncated) so the payload stays self-consistent. Each fixup reads
+// the rendered text of the section it describes, by name.
+func claudeFixups(in ShapeInput) map[string]func(parts map[string]string) json.RawMessage {
+	fix := map[string]func(map[string]string) json.RawMessage{}
 	lines := func(s string) json.RawMessage { return json.RawMessage(fmt.Sprint(countLines([]byte(s)))) }
 	switch in.Tool {
 	case "Read":
-		fix["file.numLines"] = func(p map[int]string) json.RawMessage { return lines(firstPart(p)) }
+		fix["file.numLines"] = func(p map[string]string) json.RawMessage { return lines(p["file.content"]) }
 	case "Grep":
 		if in.Body.Scalar("numLines") != "" {
-			fix["numLines"] = func(p map[int]string) json.RawMessage { return lines(firstPart(p)) }
+			fix["numLines"] = func(p map[string]string) json.RawMessage { return lines(p["content"]) }
 		}
 	case "Glob":
-		fix["truncated"] = func(map[int]string) json.RawMessage { return json.RawMessage("true") }
+		fix["truncated"] = func(map[string]string) json.RawMessage { return json.RawMessage("true") }
 	}
 	return fix
 }
 
-func firstPart(p map[int]string) string {
-	best, s := -1, ""
-	for k, v := range p {
-		if best < 0 || k < best {
-			best, s = k, v
+// primarySection is the largest output section: the recovery line goes there.
+func primarySection(b *HookBody) int {
+	best := -1
+	for i, s := range b.Sections {
+		if best < 0 || s.End-s.Start > b.Sections[best].End-b.Sections[best].Start {
+			best = i
 		}
 	}
-	return s
+	return best
 }
 
 // rebuild renders a skeleton value with each section replaced by its projection.
 // The footer is appended to the first text section (the primary output).
-func rebuild(root *Node, in ShapeInput, fix map[string]func(map[int]string) json.RawMessage) (json.RawMessage, error) {
-	parts := map[int]string{}
-	footerDone := false
+func rebuild(root *Node, in ShapeInput, fix map[string]func(map[string]string) json.RawMessage) (json.RawMessage, error) {
+	parts := map[string]string{} // rendered text per section name
+	primary := -1
+	if in.Body != nil {
+		primary = primarySection(in.Body)
+	}
 	var buf bytes.Buffer
 	var walk func(n *Node, path string) error
 	walk = func(n *Node, path string) error {
@@ -321,17 +332,20 @@ func rebuild(root *Node, in ShapeInput, fix map[string]func(map[int]string) json
 			if in.Body == nil || n.Section >= len(in.Body.Sections) {
 				return errUnshapable
 			}
-			text, ok := in.Proj.Parts[in.Body.Sections[n.Section].Name]
+			name := in.Body.Sections[n.Section].Name
+			text, ok := in.Proj.Parts[name]
 			if !ok {
-				return fmt.Errorf("%w: no projection for section %q", errUnshapable, in.Body.Sections[n.Section].Name)
+				return fmt.Errorf("%w: no projection for section %q", errUnshapable, name)
 			}
-			if !footerDone && in.Footer != "" {
+			if n.Section == primary && in.Footer != "" {
 				text = strings.TrimRight(text, "\n") + "\n" + in.Footer
-				footerDone = true
 			}
-			parts[n.Section] = text
+			parts[name] = text
 			if n.Kind == 'l' {
-				lines := strings.Split(strings.TrimRight(text, "\n"), "\n")
+				lines := []string{} // an empty list stays []
+				if t := strings.TrimRight(text, "\n"); t != "" {
+					lines = strings.Split(t, "\n")
+				}
 				raw, _ := json.Marshal(lines)
 				buf.Write(raw)
 				return nil

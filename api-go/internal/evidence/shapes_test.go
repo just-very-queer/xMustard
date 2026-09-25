@@ -335,6 +335,27 @@ func TestClaudeReadGrepGlobShapes(t *testing.T) {
 	if res.Family != FamilyGlob || res.Shape.Mode != ShapeReplace || gl.NumFiles != 700 || !gl.Truncated || len(gl.Filenames) > 62 || gl.Filenames[0] != files[0] {
 		t.Fatalf("glob: %s %+v %d names", res.Family, res.Shape.Mode, len(gl.Filenames))
 	}
+	// content mode: an empty filenames list precedes the content; the recovery line
+	// and numLines follow the content, and the empty list stays []
+	var content strings.Builder
+	for i := 0; i < 900; i++ {
+		fmt.Fprintf(&content, "src/pkg%d/f%04d.go:%d:\tneedle := %d\n", i%9, i%70, i+1, i)
+	}
+	grepContent := `{"tool_name":"Grep","tool_input":{"pattern":"needle","output_mode":"content"},"tool_response":{"mode":"content","numFiles":70,"filenames":[],"content":` +
+		jsonString(content.String()) + `,"numLines":900}}`
+	res = observe(t, s, FormatClaude, grepContent, CaptureMeta{Client: "claude"})
+	var gc struct {
+		Mode      string
+		NumFiles  int
+		Filenames []string
+		Content   string
+		NumLines  int
+	}
+	_ = json.Unmarshal(res.Shape.Payload, &gc)
+	if res.Shape.Mode != ShapeReplace || gc.Filenames == nil || len(gc.Filenames) != 0 || gc.NumFiles != 70 ||
+		!strings.Contains(gc.Content, "[xmustard evidence]") || gc.NumLines != countLines([]byte(gc.Content)) || !strings.Contains(string(res.Shape.Payload), `"filenames":[]`) {
+		t.Fatalf("grep content: %s %+v", res.Shape.Mode, gc)
+	}
 	grep := `{"tool_name":"Grep","tool_input":{"pattern":"needle","output_mode":"files_with_matches"},"tool_response":{"mode":"files_with_matches","filenames":` + string(fl) + `,"numFiles":700}}`
 	res = observe(t, s, FormatClaude, grep, CaptureMeta{Client: "claude"})
 	if res.Family != FamilyGrep || res.Shape.Mode != ShapeReplace {
@@ -452,5 +473,25 @@ func TestPolicyTableLowersTargets(t *testing.T) {
 	if PolicyFor("claude").ContextChars != 10000 || PolicyFor("codex").ContextTokens != 2500 || PolicyFor("letta").MaxChars != 30000 ||
 		PolicyFor("unknown").Client != "http" {
 		t.Fatalf("policy table drifted")
+	}
+}
+
+func TestManySectionsShareTheTarget(t *testing.T) {
+	s, _ := testStore(t, nil)
+	var blocks []string
+	for i := 0; i < 10; i++ {
+		blocks = append(blocks, `{"type":"text","text":`+jsonString(strings.Repeat(fmt.Sprintf("block %d line of output\n", i), 3000))+`}`)
+	}
+	body := `{"tool_name":"mcp__ci__logs","tool_input":{"job":"7"},"tool_response":[` + strings.Join(blocks, ",") + `]}`
+	res := observe(t, s, FormatClaude, body, CaptureMeta{Client: "claude"})
+	if len(res.Projection) > PolicyFor("claude").Target || res.Shape.Mode != ShapeReplace {
+		t.Fatalf("10 sections: projection %d bytes, shape %+v", len(res.Projection), res.Shape.Mode)
+	}
+	var out []map[string]any
+	if err := json.Unmarshal(res.Shape.Payload, &out); err != nil || len(out) != 10 {
+		t.Fatalf("MCP content array not preserved: %v %d", err, len(out))
+	}
+	if strings.Count(string(res.Shape.Payload), "[xmustard evidence]") != 1 {
+		t.Fatalf("recovery line must appear once")
 	}
 }

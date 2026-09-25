@@ -623,6 +623,14 @@ func (structuredReducer) Version() int   { return 1 }
 
 func (structuredReducer) Reduce(ctx context.Context, in *Input) (*Projection, error) {
 	secs := nonEmpty(in.Sections)
+	anyJSON := false
+	for _, sec := range secs {
+		n := sec.End - sec.Start
+		anyJSON = anyJSON || classify(io.NewSectionReader(in.R, sec.Start, n), n, "") == "json"
+	}
+	if !anyJSON {
+		return reduceLineSections(ctx, in, shellRules) // plain text blocks: one header
+	}
 	shares := sectionShares(secs, in.Target-256)
 	var out bytes.Buffer
 	parts := map[string]string{}
