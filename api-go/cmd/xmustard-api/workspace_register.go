@@ -17,19 +17,21 @@ import (
 //
 //   - admin, open mode (no credentials) and XMUSTARD_AUTH=off: any root, as before.
 //   - any other principal: only the top level of a git work tree that resolves,
-//     symlinks evaluated, at or below a directory in XMUSTARD_REGISTER_ROOTS
-//     (workspaceops.CheckRegistrationRoot). The resolved path is what gets
-//     registered. The load always prefers the cached snapshot, so a non-admin
-//     never forces a rescan, and it keeps an existing workspace's name. A
-//     workspace-scoped token registers only a workspace inside its scope.
+//     symlinks evaluated, at or below a directory in XMUSTARD_REGISTER_ROOTS, with
+//     its git directory there too (workspaceops.CheckRegistrationRoot). The
+//     resolved path is what gets registered, and the record keeps the registration
+//     root, so every later use re-checks it. A directory already registered, under
+//     any spelling or link, is reused, keeps its name and is never rescanned; a new
+//     one is registered with its first scan, up to XMUSTARD_REGISTER_LIMIT per
+//     principal. The caller never chooses whether to scan.
 //
 // For every caller the root's workspace id must pass the deployment's workspace
-// allowlist, and a load that creates a registry entry is recorded in the auth audit
-// log (GET /api/auth/audit) with the principal that made it.
+// allowlist and the token's workspace scope, and a load that creates a registry
+// entry is recorded in the auth audit log (GET /api/auth/audit) with the principal
+// that made it.
 
-// registrationNotAllowed is the reason a refused non-admin registration answers
-// with; "refusal" in the body carries a workspaceops.Refusal* code, or
-// refusalTokenScope.
+// registrationNotAllowed is the reason a refused registration answers with;
+// "refusal" in the body carries a workspaceops.Refusal* code, or refusalTokenScope.
 const (
 	registrationNotAllowed = "registration_not_allowed"
 	refusalTokenScope      = "token_scope"
@@ -46,38 +48,68 @@ type workspaceLoadAdmission struct {
 // non-admin caller, or answers the refusal and returns false.
 func admitWorkspaceLoad(w http.ResponseWriter, r *http.Request, req *workspaceops.WorkspaceLoadRequest) (workspaceLoadAdmission, bool) {
 	p := principalFromContext(r.Context())
+	posture := postureFrom(r)
 	adm := workspaceLoadAdmission{restricted: p != nil && !p.Has(workspaceops.RoleAdmin)}
+	lookup, registerRoot := workspaceops.LookupWorkspaceRoot, ""
 	if adm.restricted {
-		path, _, err := workspaceops.CheckRegistrationRoot(req.RootPath, postureFrom(r).registerRoots())
+		path, root, err := workspaceops.CheckRegistrationRoot(req.RootPath, posture.registerRoots())
 		if err != nil {
-			code := workspaceops.RefusalInvalidPath
-			var refusal *workspaceops.RegistrationRefusal
-			if errors.As(err, &refusal) {
-				code = refusal.Code
-			}
-			denyRegistration(w, r, p, code, err.Error())
+			denyRegistration(w, r, p, refusalCode(err), err.Error())
 			return adm, false
 		}
-		req.RootPath = path
-		req.PreferCachedSnapshot = true
+		req.RootPath, registerRoot = path, root
+		lookup = workspaceops.LookupWorkspaceDir
 	}
-	before, err := workspaceops.LookupWorkspaceRoot(dataDir(), req.RootPath)
-	if err != nil || !postureFrom(r).allowsWorkspace(before.ID) {
+	before, err := lookup(dataDir(), req.RootPath)
+	if err != nil || !posture.allowsWorkspace(before.ID) {
 		writeJSON(w, http.StatusForbidden, map[string]any{"error": "workspace root is not served by this deployment", "reason": "workspace_not_allowed"})
 		return adm, false
 	}
+	// /api/workspaces/load names no workspace, so the auth middleware leaves the
+	// token's scope to this check, for admins too
+	if p != nil && !p.AllowsWorkspace(before.ID) {
+		denyRegistration(w, r, p, refusalTokenScope, req.RootPath+" registers as workspace "+before.ID+", outside this token's workspace scope")
+		return adm, false
+	}
 	if adm.restricted {
-		if !p.AllowsWorkspace(before.ID) {
-			denyRegistration(w, r, p, refusalTokenScope, req.RootPath+" registers as workspace "+before.ID+", outside this token's workspace scope")
-			return adm, false
-		}
-		if before.Registered { // a non-admin load never renames a workspace
+		req.PreferCachedSnapshot = true
+		req.AutoScan = !before.Registered
+		if before.Registered {
+			req.RootPath = before.RootPath
 			name := before.Name
 			req.Name = &name
+		} else {
+			req.Registration = &workspaceops.NonAdminRegistration{RegisterRoot: registerRoot, Principal: p.ID, Limit: posture.registerLimit()}
 		}
 	}
 	adm.before = before
 	return adm, true
+}
+
+// refusalCode is a refused registration's workspaceops.Refusal* code.
+func refusalCode(err error) string {
+	var refusal *workspaceops.RegistrationRefusal
+	if errors.As(err, &refusal) {
+		return refusal.Code
+	}
+	return workspaceops.RefusalInvalidPath
+}
+
+// finish audits the load and answers its error: a registration the registry
+// refused (the principal's XMUSTARD_REGISTER_LIMIT) as a refused registration.
+// It reports whether the load succeeded.
+func (a workspaceLoadAdmission) finish(w http.ResponseWriter, r *http.Request, root string, err error) bool {
+	a.audit(r, root)
+	var refusal *workspaceops.RegistrationRefusal
+	switch {
+	case err == nil:
+		return true
+	case errors.As(err, &refusal) && a.restricted:
+		denyRegistration(w, r, principalFromContext(r.Context()), refusal.Code, refusal.Message)
+	default:
+		respondError(w, err)
+	}
+	return false
 }
 
 // denyRegistration audits a refused non-admin registration and answers 403.
@@ -115,6 +147,6 @@ func (a workspaceLoadAdmission) audit(r *http.Request, root string) {
 // logRegisterRoots reports at startup where non-admin tokens may register.
 func logRegisterRoots(p exposurePosture) {
 	if len(p.RegisterRoots) > 0 {
-		log.Printf("registration: non-admin tokens may register git work trees under %s (XMUSTARD_REGISTER_ROOTS)", strings.Join(p.RegisterRoots, string(filepath.ListSeparator)))
+		log.Printf("registration: non-admin tokens may register git work trees under %s (XMUSTARD_REGISTER_ROOTS), up to %d each (XMUSTARD_REGISTER_LIMIT)", strings.Join(p.RegisterRoots, string(filepath.ListSeparator)), p.registerLimit())
 	}
 }

@@ -46,6 +46,9 @@ type exposurePosture struct {
 	// RegisterRoots are the directories under which a non-admin principal may
 	// register a git work tree (POST /api/workspaces/load); empty = admins only.
 	RegisterRoots []string
+	// RegisterLimit is how many workspaces one non-admin principal may register;
+	// 0 = workspaceops.DefaultRegisterLimit.
+	RegisterLimit int
 }
 
 func (p *exposurePosture) platform() bool { return p != nil && p.Profile == profilePlatform }
@@ -74,6 +77,13 @@ func (p *exposurePosture) registerRoots() []string {
 	return p.RegisterRoots
 }
 
+func (p *exposurePosture) registerLimit() int {
+	if p == nil || p.RegisterLimit <= 0 {
+		return workspaceops.DefaultRegisterLimit
+	}
+	return p.RegisterLimit
+}
+
 func (p *exposurePosture) disabledTools() []string {
 	out := []string{}
 	for _, t := range mcpToolOrder {
@@ -96,6 +106,7 @@ func (p *exposurePosture) disabledTools() []string {
 //	XMUSTARD_ALLOWED_ORIGINS=a,b     extra browser origins, scheme://host[:port]
 //	XMUSTARD_REGISTER_ROOTS=/a:/b    where non-admin tokens may register git work
 //	                                 trees (OS path list; default: admins only)
+//	XMUSTARD_REGISTER_LIMIT=n        workspaces one non-admin principal may register
 //
 // Conflicting profile settings and malformed values are startup errors.
 func loadExposurePosture() (exposurePosture, error) {
@@ -183,6 +194,9 @@ func loadExposurePosture() (exposurePosture, error) {
 		return p, err
 	}
 	p.RegisterRoots = roots
+	if p.RegisterLimit, err = workspaceops.ParseRegisterLimit(os.Getenv("XMUSTARD_REGISTER_LIMIT")); err != nil {
+		return p, err
+	}
 	return p, nil
 }
 

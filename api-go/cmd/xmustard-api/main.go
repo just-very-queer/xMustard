@@ -1059,9 +1059,7 @@ func registerRoutes(mux routeRegistrar) {
 			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
 			request,
 		)
-		admitted.audit(r, request.RootPath)
-		if err != nil {
-			respondError(w, err)
+		if !admitted.finish(w, r, request.RootPath, err) {
 			return
 		}
 		writeJSON(w, http.StatusOK, result)

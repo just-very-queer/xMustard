@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -349,5 +350,237 @@ func TestRegisterRootsPosture(t *testing.T) {
 		if err := validateStartup(loadServerConfig(t.TempDir())); err == nil || !strings.Contains(err.Error(), "XMUSTARD_REGISTER_ROOTS") {
 			t.Fatalf("%q must stop the API at startup: %v", bad, err)
 		}
+	}
+
+	t.Setenv("XMUSTARD_REGISTER_ROOTS", root)
+	if p, err := loadExposurePosture(); err != nil || p.registerLimit() != workspaceops.DefaultRegisterLimit {
+		t.Fatalf("unset XMUSTARD_REGISTER_LIMIT: want %d, got %d %v", workspaceops.DefaultRegisterLimit, p.registerLimit(), err)
+	}
+	t.Setenv("XMUSTARD_REGISTER_LIMIT", "3")
+	if p, err := loadExposurePosture(); err != nil || p.registerLimit() != 3 {
+		t.Fatalf("XMUSTARD_REGISTER_LIMIT=3: got %d %v", p.registerLimit(), err)
+	}
+	for _, bad := range []string{"0", "-2", "lots"} {
+		t.Setenv("XMUSTARD_REGISTER_LIMIT", bad)
+		if err := validateStartup(loadServerConfig(t.TempDir())); err == nil || !strings.Contains(err.Error(), "XMUSTARD_REGISTER_LIMIT") {
+			t.Fatalf("XMUSTARD_REGISTER_LIMIT=%q must stop the API at startup: %v", bad, err)
+		}
+	}
+}
+
+// A workspace-scoped admin token registers only inside its scope:
+// /api/workspaces/load is not a workspace route, so the handler applies the scope to
+// every principal, admins included.
+func TestScopedAdminRegistersOnlyInsideScope(t *testing.T) {
+	f := newRegisterFixture(t)
+	srv, dir := securityServer(t, exposurePosture{RegisterRoots: []string{f.allowed}})
+	scoped, err := workspaceops.MintScopedToken(dir, "scoped-op", "admin", 0, []string{"only-this-ws"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedSnapshot(t, dir, f.secret)
+	if code, body := call(t, "POST", srv.URL+"/api/workspaces/load", scoped, loadBody(f.secret), nil); code != http.StatusForbidden || body["refusal"] != refusalTokenScope {
+		t.Fatalf("scoped admin outside its scope: want 403 token_scope, got %d %v", code, body)
+	}
+	if reg := registered(t, dir); len(reg) != 0 {
+		t.Fatalf("a refused registration must not reach the registry: %v", reg)
+	}
+	id := seedSnapshot(t, dir, f.plain)
+	inScope, err := workspaceops.MintScopedToken(dir, "scoped-in", "admin", 0, []string{id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code, body := call(t, "POST", srv.URL+"/api/workspaces/load", inScope, loadBody(f.plain), nil); code != http.StatusOK {
+		t.Fatalf("scoped admin inside its scope registers any directory: want 200, got %d %v", code, body)
+	}
+}
+
+// sameDirSpellings returns other spellings of dir's last element that name the same
+// directory (a case-insensitive filesystem), or nil.
+func sameDirSpellings(t *testing.T, dir string) []string {
+	t.Helper()
+	base := filepath.Base(dir)
+	var out []string
+	for _, v := range []string{strings.ToUpper(base), strings.ToUpper(base[:1]) + base[1:]} {
+		alt := filepath.Join(filepath.Dir(dir), v)
+		a, errA := os.Stat(dir)
+		b, errB := os.Stat(alt)
+		if v != base && errA == nil && errB == nil && os.SameFile(a, b) {
+			out = append(out, alt)
+		}
+	}
+	return out
+}
+
+func loadedID(body map[string]any) string {
+	ws, _ := body["workspace"].(map[string]any)
+	id, _ := ws["workspace_id"].(string)
+	return id
+}
+
+// A non-admin load of a directory that is already registered, through a symlink or
+// under another spelling on a case-insensitive filesystem, reuses that workspace and
+// never registers the directory a second time.
+func TestAgentLoadReusesRegisteredDirectory(t *testing.T) {
+	f := newRegisterFixture(t)
+	srv, dir := securityServer(t, exposurePosture{RegisterRoots: []string{f.allowed}})
+	admin, agent := mint(t, dir, "root-op", "admin"), mint(t, dir, "ada", "agent")
+	link := filepath.Join(filepath.Dir(f.allowed), "codelink")
+	if err := os.Symlink(f.allowed, link); err != nil {
+		t.Fatal(err)
+	}
+	viaLink := filepath.Join(link, "repo")
+	id := seedSnapshot(t, dir, viaLink)
+	if code, body := call(t, "POST", srv.URL+"/api/workspaces/load", admin, loadBody(viaLink, "name", "Pretty"), nil); code != http.StatusOK {
+		t.Fatalf("admin registration through a link: %d %v", code, body)
+	}
+	code, body := call(t, "POST", srv.URL+"/api/workspaces/load", agent, loadBody(f.repo), nil)
+	if code != http.StatusOK || loadedID(body) != id {
+		t.Fatalf("agent load of the admin's workspace by its real path: want 200 %s, got %d %v", id, code, body)
+	}
+	if reg := registered(t, dir); len(reg) != 1 || reg[viaLink]["name"] != "Pretty" {
+		t.Fatalf("the directory must stay registered once, as the admin named it: %v", reg)
+	}
+
+	other := gitLayout(t, filepath.Join(f.allowed, "other"))
+	otherID := seedSnapshot(t, dir, other)
+	if code, body := call(t, "POST", srv.URL+"/api/workspaces/load", agent, loadBody(other), nil); code != http.StatusOK || loadedID(body) != otherID {
+		t.Fatalf("agent registration: %d %v", code, body)
+	}
+	for _, alt := range sameDirSpellings(t, other) {
+		if code, body := call(t, "POST", srv.URL+"/api/workspaces/load", agent, loadBody(alt), nil); code != http.StatusOK || loadedID(body) != otherID {
+			t.Fatalf("case variant %s: want 200 %s, got %d %v", alt, otherID, code, body)
+		}
+	}
+	if reg := registered(t, dir); len(reg) != 2 {
+		t.Fatalf("every spelling of one directory is one workspace: %v", reg)
+	}
+	if ev := registerEvents(dir); len(ev) != 2 {
+		t.Fatalf("two directories, two registrations: %+v", ev)
+	}
+}
+
+// A non-admin load never decides whether to scan. Registering a new root always
+// scans it, whatever auto_scan says (the test server has no Rust core, so that scan
+// answers 500). Loading a registered root never rescans it, even when its cached
+// snapshot cannot be reused: the answer is 404, and admin, indexer or /scan rescans.
+func TestAgentLoadScanPolicy(t *testing.T) {
+	f := newRegisterFixture(t)
+	srv, dir := securityServer(t, exposurePosture{RegisterRoots: []string{f.allowed}})
+	admin, agent := mint(t, dir, "root-op", "admin"), mint(t, dir, "ada", "agent")
+	if code, body := call(t, "POST", srv.URL+"/api/workspaces/load", agent, loadBody(f.repo, "auto_scan", "false"), nil); code != http.StatusInternalServerError {
+		t.Fatalf("an agent registration comes with its first scan: want the scan's 500, got %d %v", code, body)
+	}
+
+	other := gitLayout(t, filepath.Join(f.allowed, "other"))
+	id := seedSnapshot(t, dir, other)
+	if code, body := call(t, "POST", srv.URL+"/api/workspaces/load", admin, loadBody(other), nil); code != http.StatusOK {
+		t.Fatalf("admin registration: %d %v", code, body)
+	}
+	stale, _ := json.Marshal(map[string]any{"scanner_version": workspaceops.ScannerVersion - 1,
+		"workspace": map[string]any{"workspace_id": id, "name": "other", "root_path": other}})
+	if err := os.WriteFile(filepath.Join(dir, "workspaces", id, "snapshot.json"), stale, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if code, body := call(t, "POST", srv.URL+"/api/workspaces/load", agent, loadBody(other, "prefer_cached_snapshot", "false"), nil); code != http.StatusNotFound {
+		t.Fatalf("an agent load of a registered root must not rescan it: want 404, got %d %v", code, body)
+	}
+}
+
+// XMUSTARD_REGISTER_LIMIT caps how many workspaces one non-admin principal
+// registers; reloading its own workspaces and admin registrations are not capped.
+func TestAgentRegistrationLimit(t *testing.T) {
+	f := newRegisterFixture(t)
+	srv, dir := securityServer(t, exposurePosture{RegisterRoots: []string{f.allowed}, RegisterLimit: 2})
+	admin, ada, bob := mint(t, dir, "root-op", "admin"), mint(t, dir, "ada", "agent"), mint(t, dir, "bob", "agent")
+	var repos []string
+	for _, name := range []string{"r1", "r2", "r3", "r4"} {
+		repo := gitLayout(t, filepath.Join(f.allowed, name))
+		seedSnapshot(t, dir, repo)
+		repos = append(repos, repo)
+	}
+	for _, repo := range repos[:2] {
+		if code, body := call(t, "POST", srv.URL+"/api/workspaces/load", ada, loadBody(repo), nil); code != http.StatusOK {
+			t.Fatalf("within the limit: %d %v", code, body)
+		}
+	}
+	code, body := call(t, "POST", srv.URL+"/api/workspaces/load", ada, loadBody(repos[2]), nil)
+	if code != http.StatusForbidden || body["refusal"] != workspaceops.RefusalRegisterLimit || !strings.Contains(fmt.Sprint(body["error"]), "XMUSTARD_REGISTER_LIMIT") {
+		t.Fatalf("over the limit: want 403 %s, got %d %v", workspaceops.RefusalRegisterLimit, code, body)
+	}
+	if reg := registered(t, dir); reg[repos[2]] != nil {
+		t.Fatalf("a refused registration must not reach the registry: %v", reg)
+	}
+	if code, body := call(t, "POST", srv.URL+"/api/workspaces/load", ada, loadBody(repos[0]), nil); code != http.StatusOK {
+		t.Fatalf("reloading an own workspace is not a new registration: %d %v", code, body)
+	}
+	if code, body := call(t, "POST", srv.URL+"/api/workspaces/load", bob, loadBody(repos[2]), nil); code != http.StatusOK {
+		t.Fatalf("the limit is per principal: %d %v", code, body)
+	}
+	if code, body := call(t, "POST", srv.URL+"/api/workspaces/load", admin, loadBody(repos[3]), nil); code != http.StatusOK {
+		t.Fatalf("admins are not capped: %d %v", code, body)
+	}
+}
+
+// After an agent registers a work tree, swapping the directory for a symlink, or
+// repointing its .git, makes xMustard refuse the workspace (409) instead of reading
+// wherever the link now leads. A root an admin registered is not held to this.
+func TestSwappedAgentRootIsRefused(t *testing.T) {
+	f := newRegisterFixture(t)
+	srv, dir := securityServer(t, exposurePosture{RegisterRoots: []string{f.allowed}})
+	admin, agent := mint(t, dir, "root-op", "admin"), mint(t, dir, "ada", "agent")
+	nested := gitLayout(t, filepath.Join(f.repo, "vendor", "x"))
+	if err := os.WriteFile(filepath.Join(nested, "README"), []byte("x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	id := seedSnapshot(t, dir, nested)
+	if code, body := call(t, "POST", srv.URL+"/api/workspaces/load", agent, loadBody(nested), nil); code != http.StatusOK {
+		t.Fatalf("agent registration: %d %v", code, body)
+	}
+	remember := func(token string) (int, map[string]any) {
+		return call(t, "POST", srv.URL+"/api/workspaces/"+id+"/context", token, `{"content":"a fact","paths":["README"]}`, nil)
+	}
+	if code, body := remember(agent); code >= 300 {
+		t.Fatalf("remember before the swap: %d %v", code, body)
+	}
+
+	if err := os.RemoveAll(nested); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(f.secret, nested); err != nil {
+		t.Fatal(err)
+	}
+	if code, body := remember(agent); code != http.StatusConflict {
+		t.Fatalf("remember after the root became a symlink: want 409, got %d %v", code, body)
+	}
+	if code, body := call(t, "POST", srv.URL+"/api/workspaces/load", admin, loadBody(nested), nil); code != http.StatusConflict {
+		t.Fatalf("loading a swapped root: want 409, got %d %v", code, body)
+	}
+
+	// restored, then its .git repointed outside the registration root
+	if err := os.Remove(nested); err != nil {
+		t.Fatal(err)
+	}
+	gitLayout(t, nested)
+	if code, body := remember(agent); code >= 300 {
+		t.Fatalf("remember once the directory is restored: %d %v", code, body)
+	}
+	if err := os.RemoveAll(filepath.Join(nested, ".git")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(nested, ".git"), []byte("gitdir: "+filepath.Join(f.secret, ".git")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if code, body := remember(agent); code != http.StatusConflict {
+		t.Fatalf("remember after .git was repointed outside the root: want 409, got %d %v", code, body)
+	}
+
+	// an admin-registered root is used as registered, links and all
+	adminID := seedSnapshot(t, dir, f.escape)
+	if code, body := call(t, "POST", srv.URL+"/api/workspaces/load", admin, loadBody(f.escape), nil); code != http.StatusOK {
+		t.Fatalf("admin registration of a link: %d %v", code, body)
+	}
+	if code, body := call(t, "POST", srv.URL+"/api/workspaces/"+adminID+"/context", admin, `{"content":"a fact","paths":["src"]}`, nil); code >= 300 {
+		t.Fatalf("an admin-registered root is not pinned: %d %v", code, body)
 	}
 }
