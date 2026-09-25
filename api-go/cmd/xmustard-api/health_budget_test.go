@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -284,5 +286,54 @@ func TestHealthBudgetBlockNeedsAuthWhenEnforced(t *testing.T) {
 	t.Setenv("XMUSTARD_AUTH", "off")
 	if b := health(""); !full(b) {
 		t.Fatalf("auth off shows the block: %v", b)
+	}
+}
+
+// Correction to PAR-RT-04 ("no hook or capture path waits on the heavy slot"), checked
+// with a caller that would wait: an identity sampler that takes the heavy slot. Inside
+// a delivered call's capture (before- and after-identity) it is refused at once, never
+// queued, while heavy work holds the slot, and the call still completes.
+func TestCaptureIdentitySamplingNeverWaitsOnHeavySlot(t *testing.T) {
+	f := newEvidenceFixture(t, true)
+	holdHeavy(t, "test_index_writer", 0)
+	var mu sync.Mutex
+	var errs []error
+	var longest time.Duration
+	prev := sampleCaptureIdentity
+	sampleCaptureIdentity = func(ctx context.Context, dataDir, ws string) (workspaceops.RepoIdentity, string) {
+		t0 := time.Now()
+		release, err := budget.AcquireHeavy(ctx, "identity_refresh", 0)
+		if err == nil {
+			release()
+		}
+		mu.Lock()
+		errs, longest = append(errs, err), max(longest, time.Since(t0))
+		mu.Unlock()
+		return prev(ctx, dataDir, ws)
+	}
+	t.Cleanup(func() { sampleCaptureIdentity = prev })
+	before := budget.Status().HeavySlot
+
+	start := time.Now()
+	code, body, _ := f.do(t, "GET", "/api/workspaces/"+f.ws+"/search?q=x", "", nil, deliver)
+	if code != http.StatusOK {
+		t.Fatalf("delivered call with the heavy slot held: %d %s", code, body)
+	}
+	after := budget.Status().HeavySlot
+	mu.Lock()
+	defer mu.Unlock()
+	if len(errs) < 2 {
+		t.Fatalf("both identity samples of a reduced capture must run: %d", len(errs))
+	}
+	for _, err := range errs {
+		if !errors.Is(err, budget.ErrOverloaded) {
+			t.Fatalf("heavy admission from a capture path must be refused while the slot is held: %v", err)
+		}
+	}
+	if longest > time.Second || time.Since(start) > 5*time.Second {
+		t.Fatalf("a capture path waited for the heavy slot: longest %s, call %s (wait bound %s)", longest, time.Since(start), budget.DefaultHeavyWait)
+	}
+	if got := after.RefusedHotPath - before.RefusedHotPath; got != int64(len(errs)) || after.QueueLen != 0 || after.RefusedBusy != before.RefusedBusy {
+		t.Fatalf("refusals must be hot-path refusals, never queued: %d of %d, before %+v after %+v", got, len(errs), before, after)
 	}
 }

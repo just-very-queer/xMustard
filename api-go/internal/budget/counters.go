@@ -4,10 +4,11 @@ import "sync/atomic"
 
 // Data-movement counters (PAR-EVAL-04). They are process-wide, monotonic since start,
 // and cost one atomic add per event. They count what THIS process did: the children it
-// spawned, the bytes it hashed, and the tool results it captured. Work done inside a
-// child is not visible here (a Rust core call's own git spawns and file hashing, for
-// example), and neither are agent runs, LSP servers or terminals, which are external
-// processes reported on their own lines.
+// spawned, the content it hashed (request bodies, tool results and file contents; short
+// fingerprints over ids and metadata are not counted), and the tool results it
+// captured. Work done inside a child is not visible here (a Rust core call's own git
+// spawns and file hashing, for example), and neither are agent runs, LSP servers or
+// terminals, which are external processes reported on their own lines.
 
 // SpawnKind classifies a child process this process started.
 type SpawnKind int
@@ -72,7 +73,7 @@ type CounterSnapshot struct {
 	Scope        string           `json:"scope"`
 }
 
-const counterScope = "this process since start; work inside children (Rust core git spawns and hashing) and external processes (agent runs, LSP servers, terminals) are not counted here"
+const counterScope = "this process since start; bytes_hashed covers content Go hashes (request bodies, tool results, file contents), not short fingerprints over ids or metadata; work inside children (Rust core git spawns and hashing) and external processes (agent runs, LSP servers, terminals) are not counted here"
 
 // Counters returns the current counter values.
 func Counters() CounterSnapshot {
