@@ -36,13 +36,13 @@ repositories. The default Rust build does not enable `semantic-onnx`.
 
 | Responsibility | Source owner | Important interface / constraint |
 | --- | --- | --- |
-| MCP protocol and tool schemas | `api-go/internal/mcpserver/` (tool table, one `tool_<name>.go` per tool); `api-go/cmd/xmustard-mcp/` (stdio transport, evidence resources: pages and search) | Nine tools; closed schemas with bounds; version negotiation (2025-06-18, 2024-11-05); `tools/list` limited to the caller's usable tools (`GET /api/auth/whoami`); optional `workspace_id` resolution; HTTP proxy; bounded framing |
+| MCP protocol and tool schemas | `api-go/internal/mcpserver/` (tool table, one `tool_<name>.go` per tool); `api-go/cmd/xmustard-mcp/` (stdio transport, evidence resources: pages and search) | Nine tools; closed schemas with bounds; version negotiation (2025-06-18, 2024-11-05); `tools/list` limited to the caller's usable tools (`GET /api/auth/whoami`) and held under tested byte caps per schema profile, protocol version and role (`testdata/tools_list_budget.json`); advanced arguments accepted but listed only with `XMUSTARD_MCP_SCHEMA=full`, documented at `xmustard://docs/tools`; optional `workspace_id` resolution; HTTP proxy; bounded framing |
 | HTTP, authentication, request limits | `api-go/cmd/xmustard-api/` | Go request routing and policy; route gate table (profile, role, read-only) and exposure middleware ([SECURITY](SECURITY.md)) |
 | Scoped evidence delivery | `api-go/internal/evidence/`, API/MCP evidence routes | Admission, stable opaque scoped handles, byte-safe original pages and search, projection and expiry. The nine tools use `xm-reduce/1`; any tool's output captured through `POST .../evidence/capture` (raw or a Claude, Codex, Cursor, Pi or OpenCode hook body, stream-decoded) is reduced by a versioned tool-family reducer (`registry.go`) and shaped and validated per client (`shapes.go`). Capture is refused (503 `redaction_unavailable`) until a streaming secret redactor is wired, because originals are retained and searchable; enforced byte admission is not an RSS ceiling |
 | Pi client adapter | `integrations/pi/` | Pinned extension uses the shared Go evidence path; nine existing tools plus `xmustard_expand` (pages or search) only when a handle is issued |
 | Local operator commands | `api-go/cmd/xmustard-ops/` | Calls stores directly; local filesystem authority, not HTTP-token isolation |
 | Memory proposals, votes, recall and drift | `api-go/internal/workspaceops/context_governance.go` | Content, trust state, path hashes, ranking and conflict reporting |
-| Agent grounding and outcome feedback | `grounding.go`, `feedback.go`, `verifier_telemetry.go` in `workspaceops` | Compose current evidence and persist inspectable feedback |
+| Agent grounding and outcome feedback | `grounding.go`, `feedback.go`, `verifier_telemetry.go` in `workspaceops`; `api-go/internal/groundbudget/` | Compose current evidence and persist inspectable feedback; `ground` output budget (`sections`, `max_chars`, per-section caps, degradation ladder, `output_budget` report) |
 | JSON persistence, auth, workspace scope | `workspaceops` store/auth/workspace files | Operational records under the configured data directory |
 | Postgres materialization | `workspaceops/pg*.go`, `backend/sql/` | Optional; JSON remains operational write authority |
 | Rust process invocation | `api-go/internal/rustcore/` | Binary resolution, subprocess output, deadlines and wire shaping |
@@ -61,8 +61,9 @@ above identify actual ownership, not a proposed additional abstraction layer.
 
 `ground`, `recall`, `remember`, `verify`, `search`, `explain`, `impact`,
 `diagnostics`, and `why_failed` remain the nine MCP tools. Candidate MCP also
-advertises resources/list and resources/read for authorized recovery; this is not
-a tenth tool. The Pi client separately exposes `xmustard_expand` when a recovery
+advertises resources/list and resources/read for authorized recovery and for the
+`xmustard://docs/tools` reference to arguments `tools/list` does not list; this is
+not a tenth tool. The Pi client separately exposes `xmustard_expand` when a recovery
 handle is emitted. The HTTP/CLI platform is much larger; its existence does not
 expand the supported agent interface.
 
