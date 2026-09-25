@@ -42,8 +42,16 @@ const (
 // reserved against budget.TransientBytes in chunks BEFORE it is buffered. When ctx
 // carries a request scope the reservation is held until the request finishes (through
 // decode and response construction); otherwise it is released on return. A refused
-// reservation kills the child and returns budget.ErrOverloaded.
+// reservation kills the child and returns budget.ErrOverloaded. Whole-repository
+// builds first take the governor's heavy slot (heavy.go).
 func runCoreCtx(parent context.Context, sub string, args ...string) ([]byte, error) {
+	heavyDone, err := acquireHeavyCore(parent, sub, args)
+	if err != nil {
+		return nil, err
+	}
+	if heavyDone != nil {
+		defer heavyDone()
+	}
 	if out, handled, err := runViaWorker(parent, sub, args); handled {
 		return out, err
 	}

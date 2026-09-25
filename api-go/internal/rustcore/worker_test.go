@@ -49,6 +49,9 @@ func fakeCore(mode string, args []string) int {
 			sub = args[0]
 		}
 		record("oneshot " + sub)
+		if ms, _ := strconv.Atoi(os.Getenv("XMUSTARD_FAKE_ONESHOT_SLEEP_MS")); ms > 0 {
+			time.Sleep(time.Duration(ms) * time.Millisecond)
+		}
 		fmt.Printf("{\"oneshot\":%q}\n", sub)
 		return 0
 	}
@@ -540,6 +543,7 @@ func TestWorkerThatCannotBeReachedSendsTheCallOneShot(t *testing.T) {
 }
 
 func TestWorkerIsNotStartedForOneShotOnlyCalls(t *testing.T) {
+	quietGovernor(t, budget.GovernorConfig{}) // the builds take the heavy slot
 	t.Setenv("XMUSTARD_CORE_WORKER_START_MS", "1500")
 	logPath := useFakeWorker(t, "nohandshake")
 	before := CoreWorkerStats()
