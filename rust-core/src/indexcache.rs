@@ -638,11 +638,6 @@ fn hidden_index_entries(toplevel: &Path) -> Result<Vec<StatusEntry>, GitRunError
     Ok(hidden)
 }
 
-/// sha256 of a tracked file's current content through the bounded no-follow opener.
-pub fn file_hash(root: &Path, rel: &str) -> Option<String> {
-    crate::symbolgraph::hash_repo_file_beneath(root, rel)
-}
-
 /// The trust scope a cache is shared within. Set `XMUSTARD_INDEX_TRUST_SCOPE` to the
 /// authorization scope the caller has resolved; the default is `local`.
 pub fn trust_scope() -> String {
