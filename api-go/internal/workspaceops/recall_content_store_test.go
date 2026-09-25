@@ -87,7 +87,7 @@ func TestContentStorePrunesStaleHashOnUpdate(t *testing.T) {
 		t.Fatalf("v1 content file should exist: %v", err)
 	}
 
-	updated, err := UpdateContextContent(dir, ws, entry.ID, "v2 UPDATED_TOKEN")
+	updated, err := UpdateContextContent(dir, ws, entry.ID, "v2 UPDATED_TOKEN", ContextEditor{Admin: true})
 	if err != nil {
 		t.Fatal(err)
 	}

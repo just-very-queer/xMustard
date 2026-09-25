@@ -78,7 +78,7 @@ func tools() []tool {
 	return []tool{
 		{"ground", "Orient before acting: what changed / what's stale / what's broken / what's blocked since the indexed baseline, with index-trust (drift) and any contract breaks (changed function signatures vs the baseline) included.", []string{"workspace_id"}, nil,
 			func(a map[string]string) (string, string, string) { return "GET", wsPath(a, "/session-grounding"), "" }},
-		{"recall", "The VERIFIED shared context to trust, RANKED to your task: pass a query and/or paths to get the few relevant facts (multi-signal: lexical + path overlap + verification strength), not a dump. No query → recency-ranked top-N.", []string{"workspace_id"},
+		{"recall", "The promoted shared context, RANKED to your task: pass a query and/or paths to get the few relevant facts (multi-signal: lexical + path overlap + verification strength), not a dump. No query → recency-ranked top-N. Each entry's verification_mode says how far to trust it: peer_verified (distinct agents approved), single_agent, or self_asserted_open_mode (the API runs without auth, so nobody checked it).", []string{"workspace_id"},
 			[]argSpec{{"query", "string", nil, "task query to rank memories by"}, {"paths", "string", nil, "comma-separated repo-relative files to focus on"}},
 			func(a map[string]string) (string, string, string) {
 				p := wsPath(a, "/context/active")
@@ -92,7 +92,7 @@ func tools() []tool {
 				}
 				return "GET", p, ""
 			}},
-		{"remember", "Propose a durable memory (fact/decision/gotcha) for the shared context; pending until verified by enough agents. Pass content; optional title and paths (comma-separated files the memory is about, so recall can flag it stale when they change).", []string{"workspace_id", "content"},
+		{"remember", "Propose a durable memory (fact/decision/gotcha) for the shared context; pending until enough distinct agents verify it. If the API runs without auth (open mode) it is promoted at once as self_asserted_open_mode, not peer-verified. Pass content; optional title and paths (comma-separated files the memory is about, so recall can flag it stale when they change).", []string{"workspace_id", "content"},
 			[]argSpec{{"title", "string", nil, "short title"}, {"paths", "string", nil, "comma-separated repo-relative files the memory is about"}},
 			func(a map[string]string) (string, string, string) {
 				// content goes in the JSON BODY, not the URL, so durable memory text is

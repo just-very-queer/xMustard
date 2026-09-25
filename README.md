@@ -84,6 +84,15 @@ Each agent should authenticate with an `XMUSTARD_API_TOKEN` (mint one with
 multi-agent verification gate. Rotating a token while retaining its principal ID
 does not create a new verifier. Never share one principal between verifiers.
 
+**Open vs authenticated trust.** With no tokens minted, the loopback-only API runs
+in open mode: every caller is one identity (`anonymous`), so `remember` promotes a
+memory at once as `verification_mode: self_asserted_open_mode` instead of leaving it
+pending forever. Once tokens exist, every call must authenticate, and a memory becomes
+`peer_verified` only after enough distinct principals other than its author approve it
+(or is promoted at once as `single_agent` if the operator turned multi-agent
+verification off). `recall` shows each entry's mode and counts them in
+`verification_modes`; `ground` reports `memory_verification_modes`.
+
 ### The nine tools
 
 All tools take `workspace_id` (`?` marks an optional arg). The first four are the
@@ -94,8 +103,8 @@ access logs.
 | Tool | Args | What it does |
 |------|------|--------------|
 | `ground` | — | Orientation before acting: changed / stale / broken / blocked since baseline, with index-trust (drift), contract breaks, and stale-memory count. |
-| `recall` | `query?`, `paths?` | The verified shared context to trust, ranked to your task. Each entry is re-checked against the live tree; stale ones are flagged, and path-overlap conflicts are listed. |
-| `remember` | `content`, `title?`, `paths?` | Propose a durable memory (fact / decision / gotcha). `paths` are the files it's about, so recall can flag it stale when they change. Pending until verified. |
+| `recall` | `query?`, `paths?` | The promoted shared context, ranked to your task. Each entry carries its `verification_mode` and is re-checked against the live tree; stale ones are flagged, and path-overlap conflicts are listed. |
+| `remember` | `content`, `title?`, `paths?` | Propose a durable memory (fact / decision / gotcha). `paths` are the files it's about, so recall can flag it stale when they change. Pending until verified; in open mode it is promoted at once as self-asserted. |
 | `verify` | `entry_id`, `approve?` | Approve (or reject) a peer's proposed memory; it promotes once enough distinct principals approve. |
 | `search` | `query`, `mode?` (`hybrid`\|`pattern`), `lang?`, `seed?` | Narrow code search — relevant slices, not a dump. Default `hybrid` fuses lexical + semantic + structural + graph-proximity (RRF); `mode=pattern` runs an ast-grep structural query; `seed=<symbol>` anchors the proximity lane. |
 | `explain` | `path` | Explain a file or directory: purpose, key symbols, how to run/verify it. |

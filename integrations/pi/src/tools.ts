@@ -58,7 +58,7 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
 	{
 		name: "recall",
 		description:
-			"The VERIFIED shared context to trust, RANKED to your task: pass a query and/or paths to get the few relevant facts (multi-signal: lexical + path overlap + verification strength), not a dump. No query → recency-ranked top-N.",
+			"The promoted shared context, RANKED to your task: pass a query and/or paths to get the few relevant facts (multi-signal: lexical + path overlap + verification strength), not a dump. No query → recency-ranked top-N. Each entry's verification_mode says how far to trust it: peer_verified (distinct agents approved), single_agent, or self_asserted_open_mode (the API runs without auth, so nobody checked it).",
 		required: ["workspace_id"],
 		optional: [
 			{ name: "query", type: "string", desc: "task query to rank memories by" },
@@ -78,7 +78,7 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
 	{
 		name: "remember",
 		description:
-			"Propose a durable memory (fact/decision/gotcha) for the shared context; pending until verified by enough agents. Pass content; optional title and paths (comma-separated files the memory is about, so recall can flag it stale when they change).",
+			"Propose a durable memory (fact/decision/gotcha) for the shared context; pending until enough distinct agents verify it. If the API runs without auth (open mode) it is promoted at once as self_asserted_open_mode, not peer-verified. Pass content; optional title and paths (comma-separated files the memory is about, so recall can flag it stale when they change).",
 		required: ["workspace_id", "content"],
 		optional: [
 			{ name: "title", type: "string", desc: "short title" },

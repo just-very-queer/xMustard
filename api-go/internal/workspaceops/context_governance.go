@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -21,6 +22,28 @@ import (
 // can never be mutated after promotion (only superseded by a new proposal). A
 // per-workspace/global toggle decides whether multi-agent verification is required
 // at all — "run it through multiple agents, or not".
+
+// Verification modes record HOW a promoted memory earned its place in shared
+// context, so an agent can weigh a peer-verified fact above a self-asserted one.
+const (
+	// VerificationPeer: a quorum of distinct authenticated principals other than the
+	// author approved it.
+	VerificationPeer = "peer_verified"
+	// VerificationSelfAssertedOpen: promoted on its author's own word because the API
+	// runs without credentials (open mode). Every caller is then OpenModeIdentity, so
+	// no peer quorum can form.
+	VerificationSelfAssertedOpen = "self_asserted_open_mode"
+	// VerificationSingleAgent: promoted on the author's own authenticated word because
+	// the operator opted out of multi-agent verification.
+	VerificationSingleAgent = "single_agent"
+)
+
+// OpenModeIdentity is the one identity every unauthenticated caller collapses to when
+// no credentials are configured, so fabricated names cannot pose as distinct verifiers.
+const OpenModeIdentity = "anonymous"
+
+// ErrNotEntryAuthor: only an entry's author or an admin may amend its content.
+var ErrNotEntryAuthor = errors.New("only the entry's author or an admin may edit it")
 
 type ContextVerification struct {
 	Agent   string `json:"agent"`
@@ -40,8 +63,12 @@ type ContextEntry struct {
 	Promoted              bool                  `json:"promoted"`   // visible in active shared context
 	Verifications         []ContextVerification `json:"verifications"`
 	RequiredVerifications int                   `json:"required_verifications"`
-	CreatedAt             string                `json:"created_at"`
-	UpdatedAt             string                `json:"updated_at"`
+	// VerificationMode is the trust basis of a promoted entry: peer_verified,
+	// self_asserted_open_mode or single_agent. Empty while pending or rejected. Entries
+	// written before the field existed are labelled on read (verificationMode).
+	VerificationMode string `json:"verification_mode"`
+	CreatedAt        string `json:"created_at"`
+	UpdatedAt        string `json:"updated_at"`
 	// Paths the memory is ABOUT. PathHashes captures their content hash at the
 	// moment the entry was promoted, so recall can detect drift: if a referenced
 	// file changed since the memory was verified, the memory may be stale.
@@ -72,10 +99,21 @@ type ProposeContextRequest struct {
 	Source     string   `json:"source"`
 	Permission string   `json:"permission"`
 	Paths      []string `json:"paths,omitempty"`
-	// RequireVerification overrides the workspace default: when explicitly false,
-	// the entry is promoted immediately (single-agent mode); when true, it needs
-	// the multi-agent threshold. nil → use the workspace/global setting.
+	// RequireVerification can only TIGHTEN the gate: true requires the multi-agent
+	// threshold even in single-agent or open mode; false or nil uses the setting.
 	RequireVerification *bool `json:"require_verification,omitempty"`
+	// OpenMode is set by the HTTP layer, never decoded from a client, when the caller
+	// is unauthenticated because no credentials are configured. The proposal is then
+	// promoted at once as self_asserted_open_mode instead of waiting for a quorum that
+	// a single identity can never form.
+	OpenMode bool `json:"-"`
+}
+
+// ContextEditor is who amends an entry's content. Admin may edit any entry; anyone
+// else only an entry whose Source is exactly their ID.
+type ContextEditor struct {
+	ID    string
+	Admin bool
 }
 
 // safeIDPattern rejects anything that could escape the data dir or be a path
@@ -225,6 +263,7 @@ type contextEntryMeta struct {
 	Promoted              bool                  `json:"promoted"`
 	Verifications         []ContextVerification `json:"verifications"`
 	RequiredVerifications int                   `json:"required_verifications"`
+	VerificationMode      string                `json:"verification_mode"`
 	CreatedAt             string                `json:"created_at"`
 	UpdatedAt             string                `json:"updated_at"`
 	Paths                 []string              `json:"paths,omitempty"`
@@ -244,7 +283,7 @@ func (m *contextEntryMeta) toEntry() ContextEntry {
 		ID: m.ID, WorkspaceID: m.WorkspaceID, Title: m.Title, Source: m.Source,
 		Permission: m.Permission, Status: m.Status, Promoted: m.Promoted,
 		Verifications: m.Verifications, RequiredVerifications: m.RequiredVerifications,
-		CreatedAt: m.CreatedAt, UpdatedAt: m.UpdatedAt, Paths: m.Paths,
+		VerificationMode: m.VerificationMode, CreatedAt: m.CreatedAt, UpdatedAt: m.UpdatedAt, Paths: m.Paths,
 		PathHashes: m.PathHashes, SearchTokens: m.SearchTokens, ContentHash: m.ContentHash,
 		ContentDigest: m.ContentDigest,
 		// Content is loaded for the returned window; Stale/StalePaths at read time.
@@ -323,7 +362,7 @@ func writeContextMetaCache(dataDir, workspaceID string, entries []ContextEntry) 
 			ID: e.ID, WorkspaceID: e.WorkspaceID, Title: e.Title, Source: e.Source,
 			Permission: e.Permission, Status: e.Status, Promoted: e.Promoted,
 			Verifications: e.Verifications, RequiredVerifications: e.RequiredVerifications,
-			CreatedAt: e.CreatedAt, UpdatedAt: e.UpdatedAt, Paths: e.Paths,
+			VerificationMode: e.VerificationMode, CreatedAt: e.CreatedAt, UpdatedAt: e.UpdatedAt, Paths: e.Paths,
 			PathHashes: e.PathHashes, SearchTokens: e.SearchTokens,
 			ContentHash:   hashContent(e.Content),
 			ContentDigest: contentDigest(e.Content),
@@ -537,8 +576,73 @@ func reconcileEntry(entry *ContextEntry) {
 	}
 }
 
-// ProposeContext creates a pending context entry. In single-agent mode (multi-agent
-// verification not required) it is promoted immediately.
+// latestVerdicts returns each distinct agent's latest verdict, keyed case-insensitively
+// (matching VerifyContext's replace-by-EqualFold semantics).
+func latestVerdicts(verifications []ContextVerification) map[string]bool {
+	latest := map[string]bool{}
+	for _, v := range verifications {
+		if agent := strings.ToLower(strings.TrimSpace(v.Agent)); agent != "" {
+			latest[agent] = v.Approve
+		}
+	}
+	return latest
+}
+
+// verificationMode labels how a promoted entry earned promotion, from its
+// votes ("" when not promoted). It is peer_verified once enough distinct principals
+// other than the author and OpenModeIdentity approve: the entry's own quorum, or the
+// workspace threshold for an entry that one assertion promoted. Otherwise it is
+// self_asserted_open_mode if the open-mode identity wrote or approved it, else
+// single_agent (its authenticated author's own word).
+func verificationMode(e *ContextEntry, threshold int) string {
+	if !e.Promoted {
+		return ""
+	}
+	need := e.RequiredVerifications
+	if need <= 1 {
+		need = max(threshold, 1)
+	}
+	author := strings.ToLower(strings.TrimSpace(e.Source))
+	peers, anonymous := 0, author == OpenModeIdentity
+	for agent, approve := range latestVerdicts(e.Verifications) {
+		switch {
+		case !approve || agent == author:
+			// not an independent approval
+		case agent == OpenModeIdentity:
+			anonymous = true
+		default:
+			peers++
+		}
+	}
+	switch {
+	case peers >= need:
+		return VerificationPeer
+	case anonymous:
+		return VerificationSelfAssertedOpen
+	default:
+		return VerificationSingleAgent
+	}
+}
+
+// labelVerificationModes fills VerificationMode on entries written before it existed
+// and counts the promoted entries per mode, so recall and ground can show how many
+// facts are peer-verified versus self-asserted.
+func labelVerificationModes(entries []ContextEntry, threshold int) map[string]int {
+	counts := map[string]int{VerificationPeer: 0, VerificationSelfAssertedOpen: 0, VerificationSingleAgent: 0}
+	for i := range entries {
+		if entries[i].VerificationMode == "" {
+			entries[i].VerificationMode = verificationMode(&entries[i], threshold)
+		}
+		if entries[i].Promoted && entries[i].VerificationMode != "" {
+			counts[entries[i].VerificationMode]++
+		}
+	}
+	return counts
+}
+
+// ProposeContext creates a pending context entry. It is promoted immediately, on the
+// proposer's own assertion, in single-agent mode (the operator setting) and in open
+// mode (req.OpenMode), unless the request explicitly asks for peer verification.
 func ProposeContext(dataDir, workspaceID string, req ProposeContextRequest) (*ContextEntry, error) {
 	if err := validateSafeID("workspace", workspaceID); err != nil {
 		return nil, err
@@ -556,11 +660,27 @@ func ProposeContext(dataDir, workspaceID string, req ProposeContextRequest) (*Co
 	// require_verification:false to self-promote and poison the shared context
 	// that gets injected into every agent run. Single-agent mode is an operator
 	// SETTING (require_multi_agent_verification), not a per-request choice.
-	if req.RequireVerification != nil && *req.RequireVerification {
+	tighten := req.RequireVerification != nil && *req.RequireVerification
+	if tighten {
 		requireMulti = true
 	}
+	source := fallbackString(strings.TrimSpace(req.Source), "unknown")
+	if req.OpenMode {
+		source = OpenModeIdentity
+	}
+	// selfNote, when set, promotes the entry on the proposer's own assertion.
+	selfNote := ""
+	switch {
+	case req.OpenMode && !tighten:
+		// No credentials are configured, so every caller is OpenModeIdentity and a
+		// peer quorum can never form. Promote the entry labelled as self-asserted
+		// instead of leaving it pending forever.
+		selfNote = "open mode: self-asserted (no authentication configured)"
+	case !requireMulti:
+		selfNote = "single-agent mode"
+	}
 	required := threshold
-	if !requireMulti {
+	if selfNote != "" {
 		required = 1
 	}
 
@@ -577,7 +697,7 @@ func ProposeContext(dataDir, workspaceID string, req ProposeContextRequest) (*Co
 		WorkspaceID:           workspaceID,
 		Title:                 strings.TrimSpace(req.Title),
 		Content:               req.Content,
-		Source:                fallbackString(strings.TrimSpace(req.Source), "unknown"),
+		Source:                source,
 		Permission:            permission,
 		Verifications:         []ContextVerification{},
 		RequiredVerifications: required,
@@ -586,13 +706,14 @@ func ProposeContext(dataDir, workspaceID string, req ProposeContextRequest) (*Co
 		Paths:                 cleanPaths(req.Paths),
 	}
 	entry.SearchTokens = memoryTokenList(entry.Title + " " + entry.Content)
-	if !requireMulti {
-		// single-agent mode: the proposer's own assertion promotes it.
+	if selfNote != "" {
+		// single-agent or open mode: the proposer's own assertion promotes it.
 		entry.Verifications = append(entry.Verifications, ContextVerification{
-			Agent: entry.Source, Approve: true, Note: "single-agent mode", At: now,
+			Agent: entry.Source, Approve: true, Note: selfNote, At: now,
 		})
 	}
 	reconcileEntry(&entry)
+	entry.VerificationMode = verificationMode(&entry, threshold)
 	if entry.Promoted {
 		// snapshot the referenced files so drift-on-recall has a baseline, and boost
 		// the verified paths in the agent-feedback layer (single-agent immediate promote).
@@ -658,6 +779,8 @@ func VerifyContext(dataDir, workspaceID, entryID, agent string, approve bool, no
 	}
 	entry.UpdatedAt = now
 	reconcileEntry(entry)
+	_, threshold := contextDefaults(dataDir)
+	entry.VerificationMode = verificationMode(entry, threshold)
 	if entry.Promoted && len(entry.PathHashes) == 0 {
 		// just transitioned to promoted — snapshot referenced files for drift checks,
 		// and boost the verified paths in the agent-feedback layer.
@@ -691,10 +814,11 @@ func cleanPaths(paths []string) []string {
 	return out
 }
 
-// UpdateContextContent amends an entry's content. Readonly entries that are
-// already verified/promoted reject edits — they can only be superseded by a new
-// proposal (this is the "readonly" permission guarantee).
-func UpdateContextContent(dataDir, workspaceID, entryID, content string) (*ContextEntry, error) {
+// UpdateContextContent amends an entry's content on behalf of editor, who must be its
+// author or an admin (ErrNotEntryAuthor otherwise). Readonly entries that are already
+// verified/promoted reject edits — they can only be superseded by a new proposal (this
+// is the "readonly" permission guarantee).
+func UpdateContextContent(dataDir, workspaceID, entryID, content string, editor ContextEditor) (*ContextEntry, error) {
 	if err := validateSafeID("workspace", workspaceID); err != nil {
 		return nil, err
 	}
@@ -718,6 +842,9 @@ func UpdateContextContent(dataDir, workspaceID, entryID, content string) (*Conte
 		return nil, os.ErrNotExist
 	}
 	entry := &entries[idx]
+	if !editor.Admin && (editor.ID == "" || editor.ID != entry.Source) {
+		return nil, ErrNotEntryAuthor
+	}
 	if entry.Permission == "readonly" && (entry.Promoted || entry.Status == "verified") {
 		return nil, fmt.Errorf("entry %s is readonly and verified; propose a new entry to supersede it", entryID)
 	}
@@ -733,6 +860,8 @@ func UpdateContextContent(dataDir, workspaceID, entryID, content string) (*Conte
 	entry.Stale = false
 	entry.StalePaths = nil
 	reconcileEntry(entry)
+	_, threshold := contextDefaults(dataDir)
+	entry.VerificationMode = verificationMode(entry, threshold)
 	if err := saveContextEntries(dataDir, workspaceID, entries); err != nil {
 		return nil, err
 	}
@@ -751,6 +880,8 @@ func ListContextEntries(dataDir, workspaceID, filter string) ([]ContextEntry, er
 	if err != nil {
 		return nil, err
 	}
+	_, threshold := contextDefaults(dataDir)
+	labelVerificationModes(entries, threshold) // label entries written before the field existed
 	filter = strings.ToLower(strings.TrimSpace(filter))
 	out := make([]ContextEntry, 0, len(entries))
 	for _, e := range entries {
@@ -793,11 +924,13 @@ func GetActiveContext(dataDir, workspaceID string) (map[string]any, error) {
 		}
 	}
 	requireMulti, threshold := contextDefaults(dataDir)
+	modes := labelVerificationModes(promoted, threshold)
 	return map[string]any{
 		"workspace_id":           workspaceID,
 		"require_multi_agent":    requireMulti,
 		"verification_threshold": threshold,
 		"active_count":           len(promoted),
+		"verification_modes":     modes,
 		"stale_count":            staleCount,
 		"conflicts":              overlappingMemory(promoted),
 		"entries":                promoted,
@@ -1020,6 +1153,7 @@ func recallOnce(ctx context.Context, dataDir, workspaceID, query string, paths [
 		out = kept
 	}
 	requireMulti, threshold := contextDefaults(dataDir)
+	modes := labelVerificationModes(out, threshold)
 	return map[string]any{
 		"workspace_id":           workspaceID,
 		"query":                  query,
@@ -1031,6 +1165,7 @@ func recallOnce(ctx context.Context, dataDir, workspaceID, query string, paths [
 		"total_active":           len(promoted),
 		"active_count":           len(promoted),
 		"returned":               len(out),
+		"verification_modes":     modes, // per-mode counts of the returned entries
 		"stale_count":            staleCount,
 		"drift_checked":          len(candidates), // every returned entry is in this set (checked)
 		"conflicts":              overlappingMemory(out),

@@ -57,7 +57,7 @@ func TestEditClearsDriftBaseline(t *testing.T) {
 	entries[0].StalePaths = []string{"a.go"}
 	_ = saveContextEntries(dir, ws, entries)
 
-	if _, err := UpdateContextContent(dir, ws, entry.ID, "second"); err != nil {
+	if _, err := UpdateContextContent(dir, ws, entry.ID, "second", ContextEditor{Admin: true}); err != nil {
 		t.Fatal(err)
 	}
 	after, _ := loadContextEntries(dir, ws)

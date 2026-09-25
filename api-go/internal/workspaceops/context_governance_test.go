@@ -89,7 +89,7 @@ func TestReadonlyEntryRejectsEdit(t *testing.T) {
 	if !entry.Promoted {
 		t.Fatalf("expected promoted in single-agent mode")
 	}
-	if _, err := UpdateContextContent(dir, ws, entry.ID, "tampered"); err == nil {
+	if _, err := UpdateContextContent(dir, ws, entry.ID, "tampered", ContextEditor{Admin: true}); err == nil {
 		t.Fatalf("readonly verified entry must reject edits")
 	}
 
@@ -97,7 +97,7 @@ func TestReadonlyEntryRejectsEdit(t *testing.T) {
 	rw, _ := ProposeContext(dir, ws, ProposeContextRequest{
 		Content: "mutable", Source: "solo", Permission: "readwrite",
 	})
-	updated, err := UpdateContextContent(dir, ws, rw.ID, "new content")
+	updated, err := UpdateContextContent(dir, ws, rw.ID, "new content", ContextEditor{Admin: true})
 	if err != nil {
 		t.Fatalf("readwrite edit should succeed: %v", err)
 	}
