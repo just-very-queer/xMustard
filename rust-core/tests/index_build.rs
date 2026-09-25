@@ -1256,3 +1256,31 @@ fn build_of_5000_files_has_no_file_cap_and_peaks_under_25_mib() {
         "peak RSS {mib:.1} MiB exceeds the 25 MiB heavy-slot line"
     );
 }
+
+#[test]
+fn invalid_utf8_files_are_indexed_from_their_lossy_text() {
+    let r = repo(&[("ok.ts", "export function fine() {}\n")]);
+    let mut bytes = b"export function before\xff\xfeName(): number {\n  return 1;\n}\nexport function after(): void {}\n".to_vec();
+    bytes.extend_from_slice(b"// trailing \xc3\x28 comment\n");
+    fs::write(r.path().join("bad.ts"), &bytes).unwrap();
+    backdate(&r.path().join("bad.ts"));
+    commit_all(r.path());
+    let rep = index("build", r.path(), &["--content-retention", "full"]);
+    assert_eq!(rep["coverage"]["loss_counts"]["invalid_utf8"], 1, "{rep:#}");
+    let conn = db(&rep);
+    let (after_sym, text): (i64, String) = conn
+        .query_row(
+            "SELECT (SELECT count(*) FROM symbols WHERE uid = 'Function:bad.ts:after#0'),
+                    (SELECT group_concat(t.text, '') FROM chunk_text t JOIN chunks c ON c.id = t.chunk_id
+                     JOIN files f ON f.id = c.file_id WHERE f.path = 'bad.ts')",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(after_sym, 1);
+    assert!(
+        text.contains("export function after(): void {}"),
+        "{text:?}"
+    );
+    assert!(text.contains('\u{fffd}'));
+}

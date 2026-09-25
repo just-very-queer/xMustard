@@ -328,16 +328,19 @@ fn process(
     rec.content_hash = scan::blob_id(&bytes);
     let mode = extract::extraction_mode(cand.lang, bytes.len(), cfg.max_parse_bytes);
     let key = format!("{}:{}:{mode}", rec.content_hash, cand.lang.name());
+    let len = bytes.len() as u64;
+    // Facts, chunk ranges and postings all refer to the decoded text: for invalid UTF-8
+    // that is the lossy decoding, so the writer slices the same bytes extraction saw.
+    let (text, invalid) = match String::from_utf8(bytes) {
+        Ok(t) => (t, false),
+        Err(e) => (String::from_utf8_lossy(e.as_bytes()).into_owned(), true),
+    };
     let mut facts = match cache.get(&key).map_err(sql_err)? {
         Some(f) => {
             counters.reused_from_cache += 1;
             f
         }
         None => {
-            let (text, invalid) = match std::str::from_utf8(&bytes) {
-                Ok(t) => (std::borrow::Cow::Borrowed(t), false),
-                Err(_) => (String::from_utf8_lossy(&bytes), true),
-            };
             let f = extract::extract(cand.lang, &text, invalid, cfg.max_parse_bytes);
             counters.reparsed += 1;
             cache.put(&key, &f).map_err(sql_err)?;
@@ -345,7 +348,7 @@ fn process(
         }
     };
     totals.files_indexed += 1;
-    totals.bytes += bytes.len() as u64;
+    totals.bytes += len;
     if totals.symbols + facts.symbols.len() > cfg.max_symbols {
         strip_symbols(&mut facts);
         rec.flags |= file_flag::SYMBOL_BUDGET;
@@ -356,7 +359,7 @@ fn process(
     Ok(Processed {
         rec,
         facts: Some(facts),
-        bytes: Some(bytes),
+        bytes: Some(text.into_bytes()),
     })
 }
 

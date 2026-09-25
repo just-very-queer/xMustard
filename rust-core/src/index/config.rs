@@ -117,13 +117,16 @@ impl IndexConfig {
         {
             let file: RepoConfigFile =
                 serde_json::from_slice(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+            // The repository file is content the index reads, not operator input: it may
+            // lower resource bounds but never raise them above the defaults (raising takes
+            // a flag or XMUSTARD_INDEX_* from the operator).
             if let Some(ix) = file.index {
                 if let Some(v) = ix.content_retention {
                     cfg.content_retention = ContentRetention::parse(&v)
                         .ok_or_else(|| format!("index.content_retention: unknown value {v:?}"))?;
                 }
                 if let Some(v) = ix.max_file_size {
-                    cfg.max_file_size = v;
+                    cfg.max_file_size = v.min(DEFAULT_MAX_FILE_SIZE);
                 }
                 if let Some(v) = ix.allow_non_git {
                     cfg.allow_non_git = v;
@@ -132,16 +135,16 @@ impl IndexConfig {
                     cfg.include_untracked = v;
                 }
                 if let Some(v) = ix.max_files {
-                    cfg.max_files = v;
+                    cfg.max_files = v.min(DEFAULT_MAX_FILES);
                 }
                 if let Some(v) = ix.max_symbols {
-                    cfg.max_symbols = v;
+                    cfg.max_symbols = v.min(DEFAULT_MAX_SYMBOLS);
                 }
                 if let Some(v) = ix.max_total_bytes {
-                    cfg.max_total_bytes = v;
+                    cfg.max_total_bytes = v.min(DEFAULT_MAX_TOTAL_BYTES);
                 }
                 if let Some(v) = ix.max_parse_bytes {
-                    cfg.max_parse_bytes = v;
+                    cfg.max_parse_bytes = v.min(super::extract::DEFAULT_MAX_PARSE_BYTES);
                 }
             }
         }
@@ -242,6 +245,17 @@ mod tests {
         // the process env may carry XMUSTARD_INDEX_* in CI; only assert file values
         // that the env override below does not touch.
         assert_eq!(cfg.max_files, 7);
+        std::fs::write(
+            dir.path().join(".xmustard.json"),
+            r#"{"index":{"max_file_size":1073741824,"max_files":1000000}}"#,
+        )
+        .unwrap();
+        let raised = IndexConfig::load(dir.path()).unwrap();
+        assert_eq!(
+            raised.max_file_size, DEFAULT_MAX_FILE_SIZE,
+            "a repo cannot raise bounds"
+        );
+        assert_eq!(raised.max_files, DEFAULT_MAX_FILES);
         cfg.apply_env(|k| (k == "XMUSTARD_INDEX_CONTENT_RETENTION").then(|| "full".to_string()))
             .unwrap();
         assert_eq!(cfg.content_retention, ContentRetention::Full);
