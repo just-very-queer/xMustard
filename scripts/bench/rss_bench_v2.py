@@ -158,7 +158,10 @@ def attribute(procs, children, roots, registry, argv1_of=lambda pid: None):
     Returns (missing_root_labels, rows) with rows = {pid: (component, klass, root_label)}
     and klass in owned | external | agent.
       * An owned root and its descendants are owned, except a descendant that matches an
-        external rule: it and everything below it are external.
+        external rule: it and everything below it are external, except an xMustard binary
+        (owned_binaries) found below an external. That binary and its descendants count
+        again: for example a hook client or MCP shim that an agent CLI or shell launched
+        from a run the daemon started (§12.4).
       * An agent root is reported on its own line. Below it, only xMustard binaries are
         pulled in (as owned sub-roots, for example a hook client or shim the agent
         launched); the rest of an agent's tree is the agent's own and is not attributed.
@@ -180,8 +183,11 @@ def attribute(procs, children, roots, registry, argv1_of=lambda pid: None):
                 if ch in rows or ch not in procs:
                     continue
                 cc, ck = registry.classify(procs[ch].comm, argv1(ch))
-                if k == "external":  # externals stay external; keep a more specific external name
-                    stack.append((ch, cc if ck == "external" else c, "external"))
+                if k == "external":
+                    if registry.is_owned_binary(procs[ch].comm):  # an xMustard binary below an external counts again
+                        stack.append((ch, cc, "owned"))
+                    else:  # externals stay external; keep a more specific external name
+                        stack.append((ch, cc if ck == "external" else c, "external"))
                 elif ck == "owned" and exe_name(procs[ch].comm) == exe_name(procs[pid].comm):
                     # a child still running its parent's image: forked, not yet exec'd. It stays
                     # in the gate (ps counts its copy-on-write pages again) under its own name.
@@ -373,9 +379,10 @@ class LinuxProbe:
 
     @staticmethod
     def _read(path):
+        # bytes, decoded leniently: a cmdline or comm need not be UTF-8
         try:
-            with open(path) as f:
-                return f.read()
+            with open(path, "rb") as f:
+                return f.read().decode(errors="replace")
         except OSError:
             return None
 
@@ -429,8 +436,12 @@ class SamplerV2(threading.Thread):
     """Every 100 ms: one ps snapshot -> attribution -> per-process probes -> peaks.
 
     `ingest()` holds all per-sample logic so unit tests can feed synthetic snapshots and
-    a fake probe; `run()` only adds the ps call and the pacing.
+    a fake probe; `run()` only adds the ps call and the pacing. Any exception inside a
+    sample is recorded and invalidates the run; so does a thread that ends before stop()
+    or a last sample older than STALE_S at stop().
     """
+
+    STALE_S = 5.0
 
     def __init__(self, roots, registry, probe=None, step_ref=None, interval=INTERVAL_S, storage_dir=None):
         super().__init__(daemon=True)
@@ -443,6 +454,7 @@ class SamplerV2(threading.Thread):
         self.stop_ev = threading.Event()
         self.t0 = time.time()
         self.samples, self.errors, self.lost_roots, self.gaps, self.last_t = 0, [], [], [], None
+        self.exceptions, self.exited_early, self.stopped_at = [], False, None
         self.sample_cost_ms = []
         self.peak = {"gate_kib": 0}
         self.tree_all_peak_kib = 0
@@ -463,7 +475,10 @@ class SamplerV2(threading.Thread):
     def _argv1(self, pid, comm):
         key = (pid, comm)
         if key not in self.argv_cache:
-            self.argv_cache[key] = self.probe.argv1(pid)
+            try:
+                self.argv_cache[key] = self.probe.argv1(pid)
+            except (OSError, ValueError, struct.error):  # gone or unreadable: the exe rule still applies
+                self.argv_cache[key] = None
         return self.argv_cache[key]
 
     def _stats(self, pid):
@@ -574,26 +589,40 @@ class SamplerV2(threading.Thread):
                      "footprint_bytes": fp_total, "footprint_partial": fp_partial,
                      "split": dict(split, complete=split_ok)}
 
+    def read_ps(self):
+        """(returncode, stdout text, stderr text) of one ps call. Decoded leniently: one
+        process with a non-UTF-8 name must not end the sampler."""
+        p = subprocess.run(PS_CMD, capture_output=True, timeout=5)
+        return p.returncode, p.stdout.decode(errors="replace"), p.stderr.decode(errors="replace")
+
     def sample_once(self):
         t, step = time.time(), self.step_ref[0]
         try:
-            p = subprocess.run(PS_CMD, capture_output=True, text=True, timeout=5)
+            code, out, err = self.read_ps()
         except (OSError, subprocess.TimeoutExpired) as e:
             self.errors.append({"t": round(t - self.t0, 2), "step": step, "error": repr(e)})
             return
-        if p.returncode != 0 or not p.stdout.strip():
-            self.errors.append({"t": round(t - self.t0, 2), "step": step, "error": f"ps exit {p.returncode}: {p.stderr.strip()[:200]}"})
+        if code != 0 or not out.strip():
+            self.errors.append({"t": round(t - self.t0, 2), "step": step, "error": f"ps exit {code}: {err.strip()[:200]}"})
             return
-        self.ingest(t, step, p.stdout)
+        self.ingest(t, step, out)
         self.sample_cost_ms.append((time.time() - t) * 1000)
 
     def run(self):
-        while not self.stop_ev.is_set():
-            t0 = time.time()
-            self.sample_once()
-            self.stop_ev.wait(max(0.0, self.interval - (time.time() - t0)))
+        try:
+            while not self.stop_ev.is_set():
+                t0 = time.time()
+                try:
+                    self.sample_once()
+                except Exception as e:  # noqa: BLE001 - recorded; a sampler that raised never yields a PASS
+                    self.exceptions.append({"t": round(t0 - self.t0, 2), "step": self.step_ref[0],
+                                            "error": f"{type(e).__name__}: {e}"[:300]})
+                self.stop_ev.wait(max(0.0, self.interval - (time.time() - t0)))
+        finally:
+            self.exited_early = not self.stop_ev.is_set()
 
     def stop(self):
+        self.stopped_at = time.time()
         self.stop_ev.set()
         if self.is_alive():
             self.join(10)
@@ -606,6 +635,12 @@ class SamplerV2(threading.Thread):
             problems.append(f"{len(self.errors)} ps errors")
         if self.lost_roots:
             problems.append(f"required roots missing in {len(self.lost_roots)} snapshots")
+        if self.exceptions:
+            problems.append(f"sampler raised {len(self.exceptions)} times (first: {self.exceptions[0]['error']})")
+        if self.exited_early:
+            problems.append("sampler thread ended before the workload did")
+        if self.stopped_at and self.last_t and self.stopped_at - self.last_t > self.STALE_S:
+            problems.append(f"no sample in the last {round(self.stopped_at - self.last_t, 1)} s before the workload ended")
         return problems
 
     def report(self):
@@ -661,6 +696,7 @@ class SamplerV2(threading.Thread):
             "sample_cost_ms": {"p50": round(_pct(self.sample_cost_ms, 0.5), 1) if self.sample_cost_ms else None,
                                "max": round(max(self.sample_cost_ms), 1) if self.sample_cost_ms else None},
             "ps_errors": self.errors[:20], "ps_error_count": len(self.errors),
+            "sampler_exceptions": self.exceptions[:20], "sampler_exited_early": self.exited_early,
             "lost_root_snapshots": self.lost_roots[:20], "lost_root_count": len(self.lost_roots),
             "roots": [r._asdict() for r in self.roots],
             "probe": self.probe.name,
@@ -1425,6 +1461,11 @@ def run_v1_workload(ctx):
             invalid.append(f"v2 disagrees with the frozen v1 sampler by {d} MiB (tolerance {tol})")
     else:
         invalid.append("the frozen v1 sampler reported no peak")
+    if srep["externals"]:
+        # v1 counts owned and external alike, so the cross-check above cannot see an owned
+        # process misfiled as external. The frozen workload launches no externals, so any
+        # external line here means the gate/external split is unverified.
+        invalid.append(f"externals observed in the frozen v1 workload, which launches none: {sorted(srep['externals'])}")
     gate = evaluate_gate(srep, invalid)
     return {"status": "ran", "description": "frozen v1 workload (501 generated files), v1's own code",
             "transport": "stdio-shim", "gate": gate, "sampler": srep, "v1": {"gate": v1gate, "sampled_tree_peak_mib": mib(v1_peak),

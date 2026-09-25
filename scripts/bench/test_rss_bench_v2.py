@@ -20,6 +20,7 @@ import tempfile
 import threading
 import time
 import unittest
+import unittest.mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -113,6 +114,23 @@ class ParseAndAttribution(unittest.TestCase):
         for pid in (300, 303, 500):
             self.assertNotIn(pid, rows)
         self.assertEqual(v2.snapshot_totals(procs, rows)["gate_kib"], 20000 + 2000 + 900)
+
+    def test_xmustard_binaries_below_an_external_count_again(self):
+        # daemon -> agent CLI run by the runner -> shim and hook client; daemon -> sh -> core
+        text = ps((100, 1, 20000, "xmustard-api"), (110, 100, 50000, "codex"), (111, 110, 12000, "/x/xmustard-mcp"),
+                  (112, 110, 9000, "/x/xmustard-hook"), (113, 112, 700, "git"), (120, 100, 1000, "/bin/sh"),
+                  (121, 120, 15000, "xmustard-core"), (122, 121, 4000, "node"))
+        procs, children = v2.parse_ps(text)
+        _, rows = v2.attribute(procs, children, roots(shims=(), agent=None), REGISTRY)
+        self.assertEqual(rows[110][:2], ("runner_command", "external"))
+        self.assertEqual(rows[111][:2], ("mcp_access", "owned"))
+        self.assertEqual(rows[112][:2], ("hook_client", "owned"))
+        self.assertEqual(rows[113][:2], ("git_child", "owned"))  # below the re-owned hook client
+        self.assertEqual(rows[121][:2], ("rust_core_per_call", "owned"))
+        self.assertEqual(rows[122][:2], ("runner_command", "external"))  # an external below it is external again
+        tot = v2.snapshot_totals(procs, rows)
+        self.assertEqual(tot["gate_kib"], 20000 + 12000 + 9000 + 700 + 15000)
+        self.assertEqual(tot["externals_kib"], {"runner_command": 50000 + 1000 + 4000})
 
     def test_forked_child_before_exec_is_named_and_counted(self):
         procs, children = v2.parse_ps(ps((100, 1, 30000, "xmustard-api"), (101, 100, 29000, "xmustard-api")))
@@ -240,6 +258,72 @@ class SamplerMetrics(unittest.TestCase):
         s = v2.SamplerV2(roots(), REGISTRY, FakeProbe())
         self.assertIn("zero samples", s.validity())
 
+    def scripted(self, outputs, probe, interval=0.005):
+        """A real sampler thread whose ps output comes from a script (the last repeats)."""
+        seq = list(outputs)
+
+        class Scripted(v2.SamplerV2):
+            def read_ps(self):
+                return 0, (seq.pop(0) if len(seq) > 1 else seq[0]), ""
+        return Scripted(roots(shims=(), agent=None), REGISTRY, probe, interval=interval)
+
+    def test_an_exception_mid_run_makes_the_run_invalid(self):
+        class Boom(FakeProbe):
+            def stats(self, pid):
+                if pid == 101:
+                    raise RuntimeError("probe broke")
+                return None
+        small = ps((100, 1, 20480, "xmustard-api"))
+        big = ps((100, 1, 20480, "xmustard-api"), (101, 100, 92160, "xmustard-core"))  # a 90 MiB core appears
+        s = self.scripted([small, small, big], Boom())
+        s.start()
+        time.sleep(0.2)
+        s.stop()
+        self.assertFalse(s.is_alive())
+        self.assertTrue(any(p.startswith("sampler raised") for p in s.validity()), s.validity())
+        gate = v2.evaluate_gate(s.report(), s.validity())
+        self.assertEqual(gate["verdict"], "INVALID")
+        self.assertIn("RuntimeError: probe broke", s.report()["sampler_exceptions"][0]["error"])
+
+    def test_a_thread_that_ends_early_or_goes_stale_is_invalid(self):
+        class Fatal(BaseException):
+            pass
+
+        class Dies(FakeProbe):
+            def stats(self, pid):
+                raise Fatal()
+        s = self.scripted([ps((100, 1, 20480, "xmustard-api"))], Dies())
+        old_hook = threading.excepthook
+        threading.excepthook = lambda args: None
+        try:
+            s.start()
+            s.join(2)
+        finally:
+            threading.excepthook = old_hook
+        s.stop()
+        self.assertIn("sampler thread ended before the workload did", s.validity())
+        stale = v2.SamplerV2(roots(shims=(), agent=None), REGISTRY, FakeProbe())
+        stale.ingest(time.time() - 60, "x", ps((100, 1, 20480, "xmustard-api")))
+        stale.stop()  # never started: stop() only records the time
+        self.assertTrue(any(p.startswith("no sample in the last") for p in stale.validity()), stale.validity())
+
+    def test_non_utf8_process_names_do_not_break_sampling(self):
+        s = v2.SamplerV2(roots(shims=(), agent=None), REGISTRY, FakeProbe())
+        raw = ps((100, 1, 20480, "xmustard-api")).encode() + b"   555      1     100 caf\xe9-tool\n"
+        with self.assertRaises(UnicodeDecodeError):
+            raw.decode()  # what text=True would have raised inside the sampler thread
+        with unittest.mock.patch.object(v2.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, raw, b"")):
+            code, out, _ = s.read_ps()
+        self.assertEqual(code, 0)
+        s.ingest(1.0, "x", out)
+        self.assertEqual((s.validity(), s.report()["gate"]["peak_mib"]), ([], 20.0))
+        with tempfile.NamedTemporaryFile(delete=False) as f:
+            f.write(b"xmustard-core\0serve\0\xff\xfe\0")
+        try:
+            self.assertEqual(v2.LinuxProbe._read(f.name).split("\0")[1], "serve")
+        finally:
+            os.remove(f.name)
+
 
 class GateVerdict(unittest.TestCase):
     def rep(self, peak):
@@ -320,10 +404,34 @@ class PlatformDecoders(unittest.TestCase):
     @unittest.skipUnless(sys.platform.startswith("linux"), "Linux probe")
     def test_linux_probe_reads_a_live_child(self):
         p = subprocess.Popen(["sleep", "5"])
+        time.sleep(0.5)
         try:
-            st = v2.LinuxProbe().stats(p.pid)
+            probe = v2.LinuxProbe()
+            st = probe.stats(p.pid)
             self.assertGreater(st["resident_bytes"], 0)
-            self.assertIsNotNone(st["anon_bytes"])
+            self.assertEqual(st["anon_bytes"] + st["file_bytes"] + (st["shmem_bytes"] or 0), st["resident_bytes"])
+            self.assertGreater(st["footprint_bytes"], 0)  # PSS from smaps_rollup
+            self.assertGreaterEqual(st["hwm_bytes"], st["resident_bytes"])
+            out = subprocess.run(["ps", "-o", "rss=", "-p", str(p.pid)], capture_output=True, text=True).stdout
+            self.assertEqual(int(out) * 1024, st["resident_bytes"])
+            self.assertEqual(probe.argv1(p.pid), "5")
+        finally:
+            p.kill()
+            p.wait()
+
+    def test_live_ps_parses_and_attributes_this_platform(self):
+        # the exact ps invocation v1 and v2 use, on this platform (procps on Linux runners)
+        p = subprocess.Popen(["sleep", "5"])
+        time.sleep(0.3)
+        try:
+            out = subprocess.run(v2.PS_CMD, capture_output=True, check=True).stdout.decode(errors="replace")
+            procs, children = v2.parse_ps(out)
+            self.assertEqual(procs[p.pid].comm, "sleep")
+            self.assertEqual(procs[p.pid].ppid, os.getpid())
+            self.assertGreater(procs[p.pid].rss_kib, 0)
+            self.assertIn(p.pid, children[os.getpid()])
+            _, rows = v2.attribute(procs, children, [v2.Root("self", os.getpid(), "go_daemon", "owned")], REGISTRY)
+            self.assertEqual(rows[p.pid][:2], ("unclassified:sleep", "owned"))
         finally:
             p.kill()
             p.wait()
