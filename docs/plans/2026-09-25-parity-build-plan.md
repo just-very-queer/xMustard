@@ -1323,3 +1323,26 @@ Export verified memories to .clinerules paths:, Cursor rules, .claude/rules, AGE
 
 Tasks with hidden oracles validated to fail on baseline and pass on the reference, on Apache/MIT repos; budgeted real-model run as an operator step.
 
+
+## Open Code Review adoption (added 2026-09-25)
+
+Adopted per the critic's reduced plan in requirements §13.6. No tenth MCP tool. Review evidence informs the human merge decision and never constitutes approval.
+
+| ID | Disposition | Title / change |
+|---|---|---|
+| WS-64 | **Folded into WS-35** as its first deliverable | Shared hardened diff and scope module (OCR's three diff modes plus full git isolation: GIT_CONFIG_NOSYSTEM/GLOBAL, env scrub, pinned diff.algorithm/indentHeuristic/interHunkContext/orderFile, core.fsmonitor=false, --no-ext-diff, --no-textconv, --end-of-options). One reconciled `scope` vocabulary for impact. |
+| WS-65 | **New, wave 2 (should)** | Deterministic finding anchoring (port of OCR resolver/hunk/relocation, Apache-2.0 with NOTICE and kept SPDX headers): sliding-window snippet anchoring to new/old side, re-filing, partial Ground-A check; bounded existing_code (≤40 lines / 4 KB); exposed as a library for WS-27 quoted-code anchors and WS-28 re-anchoring. Findings arrive via evidence_handle or a findings file, not nested MCP arrays. |
+| WS-66 | **New, wave 2, shrunk (should)** | Review findings store on existing govstore events/outcomes/jobs/anchors tables with a subject_kind column; OCR's exact dedupe (same path, strict IoU > 0.6, single-line never equals multi-line) plus normalized existing_code hash; positional-only overlap is `possible_duplicate`, never corroboration. Coverage denominator counts all changed files; excluded files are listed as not_reviewed(reason). |
+| WS-67 | **Split** | Structured-argument transport stays scalar (evidence_handle / findings_file); diagnostics `source=review` becomes a WS-47 sub-deliverable; verify gets a subject-conditional `approve` default and rejects approve for subject=change. |
+| WS-68 | **Kept, wave 3 (should)** | impact(op='review') LLM-free review packet; depends on WS-52 and WS-55 (or v1 limited to workspace and commit-at-HEAD); token acceptance: default packet ≤ 1.5× raw -U3 diff bytes on fixtures, expansion on demand. |
+| WS-69 | Deferred (could) | Review rules as governed path-scoped memory; checklist pack only after editing the 7 OCR docs that name OCR-only tools, with modification notices. |
+| WS-70 | Kept, wave 3 (could) | SARIF 2.1.0 export; OCR JSON import only from `--format json --output`, deferred until WS-65/66 prove out. |
+| WS-71 | **Folded into WS-57** | Human merge-approval attestation bound to the reviewed diff; labelled attestation (enforcement is branch protection); approver token unreadable by agent processes or the record is advisory. |
+| WS-72 | **Folded into WS-05** | Secret-path denylist in the redact package (Go list plus Rust golden copy) across read and injection surfaces. |
+| WS-73 | Deferred | Recurring findings to consolidation; needs a defined normalized snippet shape and distinct token principals. |
+| WS-74 | **Folded into WS-04 / WS-42** (must) | Cache-stable deterministic rendering keyed by (tool, canonical args, repo revision, memory-store revision, renderer version); live-session sections keyed separately; covers search's volatile fields. |
+| WS-75 | **Folded into WS-23 / WS-40 / WS-44** | Review workflow packaging and OCR interop recipe; fake-driver e2e; 8-concurrent-client admission and RSS test for external MCP clients such as OCR. |
+| WS-76 | **Folded into WS-63** (optional corpus) | AACR-Bench pilot (5–10 PRs), PR-cluster bootstrap, judge agreement, numeric spend cap, licence gate; not part of the WS-50 parity gate. |
+
+Budget: review features sit behind a profile/build tag that is off in the lean default until gate v2 (WS-10) shows headroom.
+
