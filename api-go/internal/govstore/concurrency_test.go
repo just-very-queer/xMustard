@@ -52,8 +52,13 @@ func TestGovstoreHelperProcess(t *testing.T) {
 	os.Exit(0)
 }
 
+// testBusyTimeout is generous: these tests check that writers wait for each other
+// instead of failing or losing updates, not how fast they are, and they must hold
+// on a loaded machine under the race detector.
+const testBusyTimeout = time.Minute
+
 func helperStore() (*SQLStore, error) {
-	return Open(context.Background(), os.Getenv("GOVSTORE_DB"), Options{})
+	return Open(context.Background(), os.Getenv("GOVSTORE_DB"), Options{BusyTimeout: testBusyTimeout})
 }
 
 // helperProposeVerify proposes its own entries and votes on the shared ones, in
@@ -269,7 +274,7 @@ func TestTwoProcessesProposeAndVerifyWithoutLostUpdates(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "gov.db")
-	s, err := Open(ctx, dbPath, Options{})
+	s, err := Open(ctx, dbPath, Options{BusyTimeout: testBusyTimeout})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -421,7 +426,7 @@ func TestConcurrentOpensAndMigrationsWaitInsteadOfFailing(t *testing.T) {
 		go func() {
 			defer func() { done <- struct{}{} }()
 			for range 4 {
-				s, err := Open(context.Background(), path, Options{})
+				s, err := Open(context.Background(), path, Options{BusyTimeout: testBusyTimeout})
 				if err != nil {
 					errs <- err
 					return
