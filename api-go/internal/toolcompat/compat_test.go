@@ -359,6 +359,9 @@ func TestDuplicateSpellings(t *testing.T) {
 	if res.Err == nil || res.Err.Code != CodeAmbiguous || res.Err.Field != "content" {
 		t.Fatalf("conflicting spellings on a mutating tool must be rejected, got %+v", res.Err)
 	}
+	if want := map[string]any{"workspace_id": "w", "content": "a", "text": "b"}; !reflect.DeepEqual(res.Args, want) || len(res.Normalizations) != 0 {
+		t.Fatalf("a rejected call must return its input untouched: %#v %+v", res.Args, res.Normalizations)
+	}
 	res = Normalize(specs[KindRemember], map[string]any{"workspace_id": "w", "content": "a", "text": "a"})
 	if res.Err != nil || res.Args["content"] != "a" || !hasNorm(res, OpDrop, "content", "text", true) {
 		t.Fatalf("equal duplicate should be dropped and recorded: %+v %+v", res.Err, res.Normalizations)

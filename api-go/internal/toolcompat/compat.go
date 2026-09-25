@@ -221,11 +221,14 @@ func (r Result) Applied() bool {
 func Normalize(spec Spec, args map[string]any) Result {
 	tool := spec.toolName()
 	mutating := spec.mutating()
-	canon, norms, amb := canonicalizeKeys(spec, deepCopyMap(args))
+	input := deepCopyMap(args)
+	canon, norms, amb := canonicalizeKeys(spec, input)
 	res := Result{Args: canon, Normalizations: norms}
 	if amb != nil {
+		// nothing is applied when the spellings conflict: Args is the input as given
+		res.Args, res.Normalizations = input, nil
 		amb.Tool = tool
-		amb.Signature = Signature(tool, canon, amb.Message)
+		amb.Signature = Signature(tool, input, amb.Message)
 		res.Err = amb
 		return res
 	}
