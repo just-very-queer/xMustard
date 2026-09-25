@@ -1,0 +1,117 @@
+# Seed corpus for xmustard-eval (schema: eval/tasks/README.md).
+#
+# Three small, self-contained Go tasks that exercise every executor path: a bug fix,
+# a feature, and a coding-memory lifecycle task whose answer exists only in shared
+# memory. They are for dry runs and harness checks, not for parity claims; the
+# evaluation corpus proper (Apache/MIT repositories, oracles validated to fail on the
+# starting state and pass on the reference) is authored in WS-63.
+schema: xmustard.eval/v1
+name: seed
+description: Harness seed tasks (bugfix, feature, memory lifecycle) on generated Go fixtures.
+defaults:
+  timeout_sec: 900
+  repeats: 1
+
+tasks:
+  - id: calc-mean-fraction
+    class: bugfix
+    repo:
+      fixture: fixtures/go-calc
+    prompt: |
+      calc.Mean truncates fractional averages (Mean of 1 and 2 returns 1) and panics
+      on an empty slice. Make Mean return the exact average, and 0 for an empty slice.
+    verify:
+      cmd: [go, test, ./...]
+    oracle:
+      files:
+        - src: oracles/calc_mean_hidden_test.go
+          dest: calc/mean_hidden_test.go
+      cmd: [go, test, -count=1, -run, Hidden, ./calc/]
+    reference:
+      patch: references/calc-mean.patch
+    gold_files: [calc/calc.go]
+
+  - id: calc-median
+    class: feature
+    repo:
+      fixture: fixtures/go-calc
+    prompt: |
+      Add func Median(xs []int) float64 to package calc. It returns the middle value
+      (the mean of the two middle values for an even count) and 0 for an empty slice,
+      and it must not reorder the caller's slice.
+    verify:
+      cmd: [go, test, ./...]
+    oracle:
+      files:
+        - src: oracles/calc_median_hidden_test.go
+          dest: calc/median_hidden_test.go
+      cmd: [go, test, -count=1, -run, Hidden, ./calc/]
+    reference:
+      patch: references/calc-median.patch
+    gold_files: [calc/calc.go]
+
+  - id: service-agreed-port
+    class: memory_lifecycle
+    repo:
+      fixture: fixtures/go-service
+    prompt: |
+      Set server.DefaultPort to the port the team agreed on for this service. The
+      decision is not written in the code; use the team's shared notes.
+    verify:
+      cmd: [go, test, ./...]
+    oracle:
+      files:
+        - src: oracles/service_port_hidden_test.go
+          dest: server/port_hidden_test.go
+      cmd: [go, test, -count=1, -run, Hidden, ./server/]
+    reference:
+      patch: references/service-port.patch
+    gold_files: [server/config.go]
+    memory:
+      seed:
+        - key: port-decision
+          label: current
+          title: Service port decision
+          content: "Team decision (2026-08): the service listens on port 8081 because the metrics sidecar owns 8080."
+          paths: [server/config.go]
+          supersedes: port-original
+        - key: port-original
+          label: superseded
+          title: Service port
+          content: "The service listens on port 8080."
+          paths: [server/config.go]
+        - key: port-reminder
+          label: duplicate
+          title: Port reminder
+          content: "Reminder: the service port is 8081; 8080 belongs to the metrics sidecar."
+          paths: [server/config.go]
+          duplicate_of: port-decision
+        - key: port-infra-ticket
+          label: contradiction
+          title: Infra ticket port
+          content: "Infra ticket (2026-03): the service should listen on port 9090."
+          paths: [server/config.go]
+          contradicts: port-decision
+        - key: read-timeout
+          label: stale
+          title: Read timeout
+          content: "server/timeouts.go sets ReadTimeout to 5 seconds."
+          paths: [server/timeouts.go]
+        - key: other-repo-port
+          label: foreign_scope
+          title: Port in another repository
+          content: "In this repository the service port is 7070."
+        - key: unreviewed-port
+          label: pending
+          title: Unreviewed port note
+          content: "Unreviewed: the service port should be 6060."
+          paths: [server/config.go]
+      drift:
+        - path: server/timeouts.go
+          replace: |
+            package server
+
+            import "time"
+
+            // ReadTimeout bounds how long the server waits for a request.
+            const ReadTimeout = 30 * time.Second

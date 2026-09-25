@@ -1,0 +1,57 @@
+# Example run config for `xmustard-eval run --config`. Flags override these values.
+# Every key is optional except what the chosen driver and stack need; unknown keys are
+# rejected. Copy, fill in absolute paths, and keep the file outside the output dir.
+
+driver: claude                  # claude | codex | pi | fake:<driver> (dry run)
+model: claude-sonnet-4-5        # one fixed model for every run (required for real drivers)
+arms: [baseline, baseline_nomcp, xmustard_mcp, xmustard_mcp_hooks, xmustard_memory]
+reference_arm: baseline_nomcp   # paired comparisons are against this arm
+repeats: 3                      # repetitions per task and arm, paired by index
+seed: 20260925                  # arm order per task and the bootstrap
+containment: auto               # auto | sandbox-exec | bwrap | none
+
+clients:
+  claude:
+    bin: claude
+    max_budget_usd: 2.0         # passed as --max-budget-usd
+  codex:
+    bin: codex
+  pi:
+    bin: /abs/path/integrations/pi/node_modules/.bin/pi
+    extension: /abs/path/integrations/pi/src/index.ts
+
+stack:
+  kind: real                    # real | stub (fake driver only) | none
+  api_bin: /abs/path/api-go/bin/xmustard-api
+  mcp_bin: /abs/path/api-go/bin/xmustard-mcp
+  core_bin: /abs/path/rust-core/target/release/xmustard-core
+  core_only: true               # the agent phase runs the nine-tool CORE_ONLY surface
+
+# Arguments that turn xmustard_mcp into xmustard_mcp_hooks for a driver. Without an
+# entry for the driver the arm is skipped and named as a placeholder (WS-23).
+hooks:
+  claude: ["--settings", "/abs/path/hooks-settings.json"]
+
+# Separately installed comparator MCP servers; each becomes arm peer:<name>. A
+# noncommercial license needs owner_decision recorded before the peer can run.
+peers:
+  - name: serena
+    license: GPL-3.0-or-later (run as an external tool, not vendored)
+    command: /abs/path/serena
+    args: [start-mcp-server, --context, ide-assistant]
+
+# Price table for clients whose final event carries no cost (codex). USD per million
+# tokens; a model missing here is reported as unpriced, never as zero.
+pricing:
+  gpt-5-codex:
+    input_per_mtok: 1.25
+    cached_input_per_mtok: 0.125
+    output_per_mtok: 10.0
+
+# Pre-registered go/no-go bar for memory_harness.go's CompareArms. The numeric parity
+# thresholds are set in WS-50; these values only make the verdict computable.
+thresholds:
+  max_p: 0.05
+  min_solved_delta: 0.0
+  bootstrap_iters: 10000
+  alpha: 0.05

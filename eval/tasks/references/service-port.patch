@@ -1,0 +1,13 @@
+diff --git a/server/config.go b/server/config.go
+index a963eae..461f496 100644
+--- a/server/config.go
++++ b/server/config.go
+@@ -2,7 +2,7 @@
+ package server
+ 
+ // DefaultPort is the TCP port the service listens on when none is configured.
+-const DefaultPort = 8080
++const DefaultPort = 8081
+ 
+ // Addr returns the listen address for port p (DefaultPort when p is 0).
+ func Addr(p int) string {

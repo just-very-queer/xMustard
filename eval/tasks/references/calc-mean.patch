@@ -1,0 +1,19 @@
+diff --git a/calc/calc.go b/calc/calc.go
+index 8da3a68..f37fd42 100644
+--- a/calc/calc.go
++++ b/calc/calc.go
+@@ -10,9 +10,12 @@ func Sum(xs []int) int {
+ 	return total
+ }
+ 
+-// Mean returns the arithmetic mean of xs.
++// Mean returns the arithmetic mean of xs, or 0 when xs is empty.
+ func Mean(xs []int) float64 {
+-	return float64(Sum(xs) / len(xs))
++	if len(xs) == 0 {
++		return 0
++	}
++	return float64(Sum(xs)) / float64(len(xs))
+ }
+ 
+ // Max returns the largest element of xs and false when xs is empty.
