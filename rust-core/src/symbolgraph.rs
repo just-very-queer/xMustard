@@ -373,6 +373,16 @@ pub const MAX_REPO_FILE_BYTES: u64 = 8 << 20; // 8 MiB
 /// through; raw `root.join(rel)` reads are banned because they follow symlinks and re-open
 /// (TOCTOU) instead of holding the checked fd.
 fn open_repo_regular_file_beneath(root: &Path, rel: &str) -> std::io::Result<std::fs::File> {
+    open_repo_regular_file_with_meta(root, rel).map(|(f, _)| f)
+}
+
+/// open_repo_regular_file_with_meta is open_repo_regular_file_beneath that also returns
+/// the fstat of the held descriptor, so a caller can key a stat cache on exactly the
+/// file it would hash (no separate path-based stat that could name a different file).
+pub(crate) fn open_repo_regular_file_with_meta(
+    root: &Path,
+    rel: &str,
+) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
     let f = open_repo_file_beneath(root, rel)?;
     let meta = f.metadata()?;
     if !meta.is_file() {
@@ -381,7 +391,7 @@ fn open_repo_regular_file_beneath(root: &Path, rel: &str) -> std::io::Result<std
             "not a regular file",
         ));
     }
-    Ok(f)
+    Ok((f, meta))
 }
 
 /// read_repo_bytes_beneath_capped reads at most `cap` bytes of `rel` from the held
@@ -511,9 +521,16 @@ pub fn read_repo_file_beneath(root: &Path, rel: &str) -> std::io::Result<String>
 /// error or oversize. (Hash stays sha256 for drift-baseline + index-cache continuity; the
 /// blake3 content-key migration is the separate deferred item.)
 pub fn hash_repo_file_beneath(root: &Path, rel: &str) -> Option<String> {
+    let f = open_repo_regular_file_beneath(root, rel).ok()?;
+    sha256_open_file(f).map(|digest| hex_lower(&digest))
+}
+
+/// sha256_open_file streams the SHA-256 of an already-opened (no-follow, regular-file
+/// checked) descriptor in constant memory. None on a read error or once the content
+/// passes MAX_REPO_FILE_BYTES, matching hash_repo_file_beneath.
+pub(crate) fn sha256_open_file(mut f: std::fs::File) -> Option<[u8; 32]> {
     use sha2::{Digest, Sha256};
     use std::io::Read;
-    let mut f = open_repo_regular_file_beneath(root, rel).ok()?;
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 64 * 1024];
     let mut total: u64 = 0;
@@ -528,7 +545,18 @@ pub fn hash_repo_file_beneath(root: &Path, rel: &str) -> Option<String> {
         }
         hasher.update(&buf[..n]);
     }
-    Some(format!("{:x}", hasher.finalize()))
+    Some(hasher.finalize().into())
+}
+
+/// Lowercase hex of a digest (the `{:x}` form every stored content hash uses).
+pub(crate) fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        out.push(HEX[usize::from(b >> 4)] as char);
+        out.push(HEX[usize::from(b & 0x0f)] as char);
+    }
+    out
 }
 
 /// is_scannable_source reports whether a path is in the broad scannable-source set

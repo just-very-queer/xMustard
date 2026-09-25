@@ -84,17 +84,20 @@ pub struct RepoFingerprint {
     pub generated_at: String,
 }
 
-/// Build the file-hash map (path -> sha256) over tracked files.
+/// Build the file-hash map (path -> sha256) over tracked files. Files are hashed through
+/// the no-follow, bounded, regular-file-checked opener; unchanged ones come from the
+/// stat cache in the Git dir, so only new, edited or racy files are read.
 fn file_hash_map(root: &Path) -> BTreeMap<String, String> {
-    let mut map = BTreeMap::new();
-    for rel in tracked_files(root) {
-        // hash through the single no-follow, bounded, regular-file-checked opener — no
-        // raw root.join read (which would follow a swapped-in symlink).
-        if let Some(h) = crate::symbolgraph::hash_repo_file_beneath(root, &rel) {
-            map.insert(rel, h);
-        }
-    }
-    map
+    file_hash_map_counted(root).0
+}
+
+fn file_hash_map_counted(root: &Path) -> (BTreeMap<String, String>, crate::hashcache::HashPass) {
+    // resolve the cache location (one `git rev-parse`) while `git ls-files` runs.
+    let (rels, cache) = std::thread::scope(|s| {
+        let cache = s.spawn(|| crate::hashcache::cache_file(root));
+        (tracked_files(root), cache.join().ok().flatten())
+    });
+    crate::hashcache::hash_files(root, rels, cache.as_deref())
 }
 
 fn content_hash_of(map: &BTreeMap<String, String>) -> String {
@@ -766,6 +769,48 @@ mod tests {
             .collect();
         assert!(paths.contains(&"renamed.rs".to_string()), "{paths:?}");
         assert!(paths.contains(&" lead.rs".to_string()), "{paths:?}");
+    }
+
+    // w0-drift: a repeat fingerprint/drift over an untouched tree reads no file bytes
+    // (hashes come from the stat cache in the Git dir), reports the same content hash
+    // as hashing every file directly, and still sees a same-size edit.
+    #[test]
+    fn repeat_fingerprint_reads_no_unchanged_files() {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        git_init(repo.path());
+        fs::write(repo.path().join("a.rs"), "pub fn one() {}\n").unwrap();
+        fs::write(repo.path().join("b.rs"), "pub fn two() {}\n").unwrap();
+        git_commit(repo.path());
+        let direct: BTreeMap<String, String> = ["a.rs", "b.rs"]
+            .iter()
+            .map(|p| {
+                let h = crate::symbolgraph::hash_repo_file_beneath(repo.path(), p).unwrap();
+                (p.to_string(), h)
+            })
+            .collect();
+        // leave the racy window so the first pass records entries a later pass trusts.
+        std::thread::sleep(crate::hashcache::RACY_WINDOW + std::time::Duration::from_millis(200));
+        let (first, p1) = file_hash_map_counted(repo.path());
+        assert_eq!((p1.hashed, p1.cache_written), (2, true), "{p1:?}");
+        build_index_baseline(data.path(), repo.path(), "ws").unwrap();
+        let (second, p2) = file_hash_map_counted(repo.path());
+        assert_eq!(
+            (p2.hashed, p2.reused),
+            (0, 2),
+            "unchanged files re-read: {p2:?}"
+        );
+        assert_eq!(first, direct);
+        assert_eq!(second, direct);
+        assert_eq!(
+            compute_fingerprint(repo.path()).content_hash,
+            content_hash_of(&direct)
+        );
+        assert!(!detect_drift(data.path(), repo.path(), "ws").stale);
+
+        fs::write(repo.path().join("a.rs"), "pub fn uno() {}\n").unwrap(); // same size
+        let drift = detect_drift(data.path(), repo.path(), "ws");
+        assert!(drift.content_changed, "same-size edit missed: {drift:?}");
     }
 
     #[test]

@@ -40,7 +40,7 @@ pub const MAX_IDENTITY_BYTES: u64 = 64 << 20;
 pub const DEFAULT_LOCK_TIMEOUT_MS: u64 = 60_000;
 
 /// Temp files older than this are crash leftovers (no write takes this long).
-const STALE_TEMP_AGE: Duration = Duration::from_secs(600);
+pub(crate) const STALE_TEMP_AGE: Duration = Duration::from_secs(600);
 
 /// Graph snapshots kept per scope (a few, so toggling between states stays warm).
 const GRAPH_SNAPSHOTS_KEPT: usize = 3;
@@ -61,7 +61,7 @@ fn sha_hex(bytes: &[u8]) -> String {
 /// Atomically replace `path` with `bytes`: write a uniquely named temp file in the
 /// same directory, fsync it, then rename over the target. Readers see the old or the
 /// new bytes, never a torn file; a failed write leaves the old file intact.
-fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     atomic_write_with(path, |w| w.write_all(bytes))
 }
 
@@ -276,7 +276,7 @@ pub struct GitLayout {
     pub prefix: String,
 }
 
-fn git_layout(root: &Path) -> Option<GitLayout> {
+pub(crate) fn git_layout(root: &Path) -> Option<GitLayout> {
     let out = git_output(
         root,
         &[
@@ -660,6 +660,11 @@ pub struct CacheScope {
     legacy_dir: PathBuf,
 }
 
+/// `<git-dir>/xmustard-cache`, the parent of every per-repository xMustard cache.
+pub(crate) fn xmustard_cache_dir(layout: &GitLayout) -> PathBuf {
+    layout.git_dir.join("xmustard-cache")
+}
+
 /// The cache scope for `id`, or None outside Git.
 pub fn cache_scope(id: &SourceIdentity) -> Option<CacheScope> {
     let layout = id.layout.as_ref()?;
@@ -668,7 +673,7 @@ pub fn cache_scope(id: &SourceIdentity) -> Option<CacheScope> {
     push_field(&mut h, trust_scope().as_bytes());
     push_field(&mut h, id.parser_version.as_bytes());
     let scope = format!("{:x}", h.finalize());
-    let base = layout.git_dir.join("xmustard-cache");
+    let base = xmustard_cache_dir(layout);
     Some(CacheScope {
         dir: base.join("index-v2").join(&scope[..32]),
         legacy_dir: base,
@@ -754,47 +759,54 @@ impl CacheScope {
     /// The lock is an OS advisory lock, released when the holder exits or drops it,
     /// so a crashed builder never leaves a stale lock.
     pub fn lock_build(&self, timeout: Duration) -> (Option<BuildLock>, LockOutcome) {
-        let start = Instant::now();
         if let Err(e) = fs::create_dir_all(&self.dir) {
             return (None, LockOutcome::Unavailable(e.to_string()));
         }
-        let file = match fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(self.dir.join("build.lock"))
-        {
-            Ok(f) => f,
-            Err(e) => return (None, LockOutcome::Unavailable(e.to_string())),
-        };
-        let mut contended = false;
-        loop {
-            match file.try_lock() {
-                Ok(()) => {
-                    let waited_ms = start.elapsed().as_millis() as u64;
+        lock_file(&self.dir.join("build.lock"), timeout)
+    }
+}
+
+/// Take an OS advisory lock on `path` (created if absent; its parent must exist),
+/// waiting at most `timeout` (`Duration::ZERO` tries once). Released when the returned
+/// guard drops or the holder exits, so a crashed holder never leaves a stale lock.
+pub(crate) fn lock_file(path: &Path, timeout: Duration) -> (Option<BuildLock>, LockOutcome) {
+    let start = Instant::now();
+    let file = match fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+    {
+        Ok(f) => f,
+        Err(e) => return (None, LockOutcome::Unavailable(e.to_string())),
+    };
+    let mut contended = false;
+    loop {
+        match file.try_lock() {
+            Ok(()) => {
+                let waited_ms = start.elapsed().as_millis() as u64;
+                return (
+                    Some(BuildLock { _file: file }),
+                    LockOutcome::Acquired {
+                        waited_ms,
+                        contended,
+                    },
+                );
+            }
+            Err(fs::TryLockError::WouldBlock) => {
+                contended = true;
+                if start.elapsed() >= timeout {
                     return (
-                        Some(BuildLock { _file: file }),
-                        LockOutcome::Acquired {
-                            waited_ms,
-                            contended,
+                        None,
+                        LockOutcome::TimedOut {
+                            waited_ms: start.elapsed().as_millis() as u64,
                         },
                     );
                 }
-                Err(fs::TryLockError::WouldBlock) => {
-                    contended = true;
-                    if start.elapsed() >= timeout {
-                        return (
-                            None,
-                            LockOutcome::TimedOut {
-                                waited_ms: start.elapsed().as_millis() as u64,
-                            },
-                        );
-                    }
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-                Err(fs::TryLockError::Error(e)) => {
-                    return (None, LockOutcome::Unavailable(e.to_string()));
-                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(fs::TryLockError::Error(e)) => {
+                return (None, LockOutcome::Unavailable(e.to_string()));
             }
         }
     }
