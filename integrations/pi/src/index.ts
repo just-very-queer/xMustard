@@ -1,17 +1,20 @@
 // xMustard Pi extension: the nine xMustard tools as direct HTTP-backed Pi tools, plus
 // `xmustard_expand`, inactive until a result carries a recovery handle. Pi's built-in
 // tools (bash, read, grep, find, ls, edit, write) are projected through xMustard's
-// capture route, and older tool results are masked at turn_end in polling windows.
+// capture route; older tool results are masked at turn_end in polling windows; and
+// session_before_compact supplies a snapshot compaction whose details carry handles.
 //
 // Load-time work is registration only: no sidecar, socket, timer or network call.
 // Configuration (see README.md): XMUSTARD_API_BASE, optional XMUSTARD_TOKEN (sent as
 // a bearer token, never logged), optional XMUSTARD_WORKSPACE_ID (else the workspace
 // is resolved from Pi's working directory), XMUSTARD_PI_DELIVERY=source|hook,
 // lower-only XMUSTARD_PI_TOOL_TIMEOUT_MS / XMUSTARD_PI_PROJECTION_TIMEOUT_MS /
-// XMUSTARD_PI_PROJECTION_TARGET_BYTES, XMUSTARD_PI_BUILTINS, XMUSTARD_PI_MASK*.
+// XMUSTARD_PI_PROJECTION_TARGET_BYTES, XMUSTARD_PI_BUILTINS, XMUSTARD_PI_MASK*,
+// XMUSTARD_PI_COMPACTION.
 
 import type { ExtensionAPI, ExtensionContext, SessionBoundaryDraft } from "@earendil-works/pi-coding-agent";
 import { type TSchema, Type } from "typebox";
+import { createCompactor } from "./compaction.ts";
 import { loadConfig } from "./config.ts";
 import { Capturer, EXPAND_TOOL, expand, PAGE_SIZE, PendingCalls, projectBuiltin, projectResult, runTool } from "./delivery.ts";
 import { createMasker } from "./masking.ts";
@@ -62,7 +65,7 @@ export default function xmustard(pi: ExtensionAPI): void {
 	const pending = new PendingCalls();
 	const workspaces = new WorkspaceResolver(cfg);
 	const capturer = new Capturer(cfg);
-	// built-in projection and masking resolve the session's workspace
+	// built-in projection, masking and compaction resolve the session's workspace
 	// within the projection deadline (the resolver caches it per directory)
 	const resolveWorkspace = async (cwd: string | undefined, signal?: AbortSignal): Promise<string> => {
 		const deadline = AbortSignal.timeout(cfg.projectionTimeoutMs);
@@ -123,4 +126,6 @@ export default function xmustard(pi: ExtensionAPI): void {
 		const out = await mask(event, ctx);
 		return out ? { entries: out.entries as SessionBoundaryDraft[] } : undefined;
 	});
+
+	pi.on("session_before_compact", createCompactor({ enabled: cfg.compaction, capturer, resolveWorkspace, onHandle: activateExpand }));
 }

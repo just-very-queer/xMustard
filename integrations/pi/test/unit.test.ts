@@ -9,6 +9,7 @@ import type net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { after, before, describe, test } from "node:test";
+import { buildCompaction, COMPACTION_VERSION, createCompactor, SNAPSHOT_HEADER, SNAPSHOT_MAX_BYTES } from "../src/compaction.ts";
 import { type AdapterConfig, loadConfig, PI_POLICY_TARGET } from "../src/config.ts";
 import {
 	argsDigest,
@@ -480,7 +481,7 @@ describe("expansion search", () => {
 	});
 });
 
-// ---- WS-24: built-in projection, masking, caller-scoped tools ----------------------
+// ---- WS-24: built-in projection, masking, compaction, caller-scoped tools ----------
 
 const observation = (over: Record<string, unknown> = {}) => ({
 	delivery: DELIVERY_VERSION,
@@ -542,21 +543,24 @@ const bigText = (n: number, word = "ok") => Array.from({ length: n }, (_, i) => 
 
 describe("built-in tool projection through capture", () => {
 	const resolve = async () => "w1";
-	test("config: built-ins, lower-only target, mask bounds", () => {
+	test("config: built-ins, lower-only target, mask bounds, compaction switch", () => {
 		const d = loadConfig({});
 		assert.deepEqual([...d.builtins].sort(), ["bash", "edit", "find", "grep", "ls", "read", "write"]);
 		assert.equal(d.projectionTarget, PI_POLICY_TARGET);
 		assert.deepEqual(d.mask, { enabled: true, afterTurns: 10, everyTurns: 5, minBytes: 2048 });
+		assert.equal(d.compaction, true);
 		const c = loadConfig({
 			XMUSTARD_PI_BUILTINS: "bash, read,nope",
 			XMUSTARD_PI_PROJECTION_TARGET_BYTES: "8192",
 			XMUSTARD_PI_MASK_AFTER_TURNS: "3",
 			XMUSTARD_PI_MASK_EVERY_TURNS: "2",
 			XMUSTARD_PI_MASK_MIN_BYTES: "512",
+			XMUSTARD_PI_COMPACTION: "off",
 		});
 		assert.deepEqual([...c.builtins].sort(), ["bash", "read"]);
 		assert.equal(c.projectionTarget, 8192);
 		assert.deepEqual(c.mask, { enabled: true, afterTurns: 3, everyTurns: 2, minBytes: 2048 }, "a min below the capture target is refused");
+		assert.equal(c.compaction, false);
 		assert.equal(loadConfig({ XMUSTARD_PI_PROJECTION_TARGET_BYTES: "999999" }).projectionTarget, PI_POLICY_TARGET, "never raised");
 		assert.equal(loadConfig({ XMUSTARD_PI_PROJECTION_TARGET_BYTES: "100" }).projectionTarget, PI_POLICY_TARGET, "below 1 KiB refused");
 		assert.equal(loadConfig({ XMUSTARD_PI_BUILTINS: "none" }).builtins.size, 0);
@@ -816,5 +820,101 @@ describe("turn_end masking", () => {
 		);
 		const stub = maskStub(plan.candidates[0], { handle: "xm1.A", workspace_id: "w", source: "retained" });
 		assert.deepEqual(parseStub(stub), { handle: "xm1.A", workspace_id: "w", source: "mask" });
+	});
+});
+
+describe("session_before_compact snapshot", () => {
+	function session() {
+		const b = new Branch();
+		b.entries.push({
+			type: "compaction",
+			id: "old-compaction",
+			summary: `${SNAPSHOT_HEADER} earlier`,
+			firstKeptEntryId: "none",
+			details: { xmustard: { version: COMPACTION_VERSION, handles: [{ handle: "xm1.OLD", workspace_id: "w1", tool: "bash", tool_call_id: "c0", turn: 0, is_error: false, bytes: 5000, lines: 400, label: "bash `old`", source: "retained" }] } },
+		});
+		b.user("fix the parser bug in a.go");
+		const fail = b.turn([{ tool: "bash", args: { command: "go test ./parser" }, text: `${bigText(200, "--- PASS")}\n--- FAIL: TestParse\nCommand exited with code 1`, isError: true }]);
+		const read = b.turn([{ tool: "read", args: { path: "a.go" }, text: bigText(200, "code") }]);
+		b.turn([{ tool: "edit", args: { path: "a.go" }, text: "Successfully replaced 1 block(s) in a.go." }]);
+		b.turn([{ tool: "remember", args: { content: "parser needs utf-8", title: "parser note" }, text: JSON.stringify({ id: "mem-1", status: "pending", title: "parser note" }) }]);
+		b.turn([{ tool: "bash", args: { command: "go vet" }, text: bigText(3000), details: { xmustard: { path: "capture", handle: "xm1.HAVE", workspace_id: "w1" } } }]);
+		const kept = b.say("next I will rerun the parser tests");
+		const prep = {
+			firstKeptEntryId: kept,
+			messagesToSummarize: b.messages(kept),
+			turnPrefixMessages: [],
+			tokensBefore: 12_345,
+			previousSummary: `${SNAPSHOT_HEADER} earlier`,
+			fileOps: { read: new Set(["a.go"]), written: new Set<string>(), edited: new Set(["a.go"]) },
+		};
+		return { b, prep, fail: fail.get("c1_0"), read: read.get("c2_0") };
+	}
+	test("the entry carries every handle in details, recovers exact originals and stays within 2 KB", async () => {
+		const srv = captureServer();
+		const { b, prep, fail, read } = session();
+		let handles = 0;
+		const out = await buildCompaction({ preparation: prep, branchEntries: b.entries, reason: "manual" }, ctxOf(b), { enabled: true, capturer: new Capturer(cfg()), resolveWorkspace: async () => "w1", onHandle: () => handles++ });
+		assert.ok("compaction" in out, JSON.stringify(out));
+		const c = out.compaction;
+		assert.equal(c.firstKeptEntryId, prep.firstKeptEntryId);
+		assert.equal(c.tokensBefore, 12_345);
+		const xm = c.details.xmustard;
+		assert.equal(xm.version, COMPACTION_VERSION);
+		assert.equal(xm.derived, true);
+		assert.equal(xm.verified_memory, false);
+		assert.equal(xm.workspace_id, "w1");
+		const byCall = new Map(xm.handles.map((h) => [h.tool_call_id, h]));
+		assert.deepEqual([...byCall.keys()].sort(), ["c0", "c1_0", "c2_0", "c5_0"], "retained, existing and carried handles; small outputs have none");
+		assert.equal(xm.carried, 1);
+		assert.equal(byCall.get("c5_0")?.handle, "xm1.HAVE", "an existing handle is reused, not recaptured");
+		// recoverable: each retained handle holds the exact model-visible text
+		assert.equal(srv.retained.get(byCall.get("c1_0")?.handle ?? ""), (fail?.message?.content as any[])[0].text);
+		assert.equal(srv.retained.get(byCall.get("c2_0")?.handle ?? ""), (read?.message?.content as any[])[0].text);
+		assert.equal(srv.captures().length, 2);
+		assert.equal(handles, 1);
+		// the snapshot
+		assert.ok(Buffer.byteLength(c.summary) <= SNAPSHOT_MAX_BYTES, `${Buffer.byteLength(c.summary)} bytes`);
+		assert.equal(xm.summary_bytes, Buffer.byteLength(c.summary));
+		assert.ok(c.summary.startsWith(SNAPSHOT_HEADER));
+		assert.match(c.summary, /not verified memory/);
+		assert.match(c.summary, /\nGoal: fix the parser bug in a\.go\n/);
+		assert.match(c.summary, /\nOpen failures:\n- bash `go test \.\/parser` \(turn 1\): Command exited with code 1 → xm1\.H\d+\n/);
+		assert.match(c.summary, /\nModified files: a\.go\n/);
+		assert.match(c.summary, /\nMemory proposals awaiting a distinct verifier:\n- mem-1 "parser note" \(pending\)\n/);
+		assert.match(c.summary, /\nLast progress: next I will rerun the parser tests/);
+		assert.match(c.summary, /\nRecoverable outputs \(newest first; all of them are in the compaction details\):\n- bash `go vet`, \d+ B → xm1\.HAVE/);
+		assert.deepEqual(c.details.modifiedFiles, ["a.go"]);
+		assert.deepEqual(c.details.readFiles, []);
+		assert.equal(xm.snapshot.failures[0].handle, byCall.get("c1_0")?.handle);
+	});
+	test("many outputs: the summary stays within budget and points at the details", async () => {
+		captureServer();
+		const b = new Branch();
+		b.user("long task");
+		for (let i = 0; i < 80; i++) b.turn([{ tool: "bash", args: { command: `step ${i}` }, text: bigText(200) }]);
+		const kept = b.say("done");
+		const out = await buildCompaction(
+			{ preparation: { firstKeptEntryId: kept, messagesToSummarize: b.messages(kept), tokensBefore: 1 }, branchEntries: b.entries },
+			ctxOf(b),
+			{ enabled: true, capturer: new Capturer(cfg()), resolveWorkspace: async () => "w1", onHandle: () => {} },
+		);
+		assert.ok("compaction" in out);
+		assert.equal(out.compaction.details.xmustard.handles.length, 80);
+		assert.ok(Buffer.byteLength(out.compaction.summary) <= SNAPSHOT_MAX_BYTES);
+		assert.match(out.compaction.summary, /\n\(\+\d+ more\)$/);
+	});
+	test("Pi compacts itself when capture is unavailable or the user asked for a focus", async () => {
+		const srv = captureServer(() => ({ status: 503, body: { reason: "redaction_unavailable", error: "no redactor" } }));
+		const { b, prep } = session();
+		const reasons: string[] = [];
+		const compactor = createCompactor({ enabled: true, capturer: new Capturer(cfg()), resolveWorkspace: async () => "w1", onHandle: () => {} }, (r) => reasons.push(r));
+		assert.equal(await compactor({ preparation: prep, branchEntries: b.entries }, ctxOf(b)), undefined);
+		assert.match(reasons[0], /redaction_unavailable/);
+		const n = srv.seen.length;
+		assert.equal(await compactor({ preparation: prep, branchEntries: b.entries, customInstructions: "focus on the parser" }, ctxOf(b)), undefined);
+		assert.match(reasons[1], /custom instructions/);
+		assert.equal(srv.seen.length, n, "no request for a focused compaction");
+		assert.equal(await createCompactor({ enabled: false, capturer: new Capturer(cfg()), resolveWorkspace: async () => "w1", onHandle: () => {} })({ preparation: prep, branchEntries: b.entries }, ctxOf(b)), undefined);
 	});
 });

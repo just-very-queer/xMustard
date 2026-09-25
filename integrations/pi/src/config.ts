@@ -29,6 +29,7 @@ export interface AdapterConfig {
 	// return them unchanged too); larger ones are captured and projected to about it.
 	projectionTarget: number;
 	mask: MaskConfig;
+	compaction: boolean; // XMUSTARD_PI_COMPACTION=off keeps Pi's own compaction
 }
 
 export const DEFAULT_API_BASE = "http://127.0.0.1:8042";
@@ -88,6 +89,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AdapterConfig 
 			// the smallest capture target
 			minBytes: bounded(env.XMUSTARD_PI_MASK_MIN_BYTES, DEFAULT_MASK.minBytes, MIN_CAPTURE_TARGET + 1, 1 << 20),
 		},
+		compaction: !off(env.XMUSTARD_PI_COMPACTION),
 	};
 }
 
