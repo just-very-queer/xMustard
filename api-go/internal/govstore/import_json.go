@@ -86,15 +86,56 @@ type ImportProblem struct {
 	Reason  string `json:"reason"`
 }
 
+// MaxReportItems caps each per-entry list in an ImportReport, so a report never grows
+// with the size of the file. The *Count fields stay exact, and every import event in
+// the history records its own entry's outcome.
+const MaxReportItems = 100
+
 // ImportReport describes one import.
 type ImportReport struct {
-	Imported     int             `json:"imported"`
-	Unchanged    int             `json:"unchanged"`
+	Imported        int `json:"imported"`
+	Unchanged       int `json:"unchanged"`
+	ConflictCount   int `json:"conflict_count"`
+	SkippedCount    int `json:"skipped_count"`
+	RelabelledCount int `json:"relabelled_count"`
+	WarningCount    int `json:"warning_count"`
+	// The first MaxReportItems of each kind, in file order.
 	Conflicts    []ImportProblem `json:"conflicts,omitempty"`
 	Skipped      []ImportProblem `json:"skipped,omitempty"`
 	Relabelled   []ImportProblem `json:"relabelled,omitempty"`
 	Warnings     []string        `json:"warnings,omitempty"`
 	SourceDigest string          `json:"source_digest"`
+}
+
+func (r *ImportReport) conflict(id, reason string) {
+	r.ConflictCount++
+	if len(r.Conflicts) < MaxReportItems {
+		r.Conflicts = append(r.Conflicts, ImportProblem{EntryID: id, Reason: reason})
+	}
+}
+
+func (r *ImportReport) skip(id, reason string) {
+	r.SkippedCount++
+	if len(r.Skipped) < MaxReportItems {
+		r.Skipped = append(r.Skipped, ImportProblem{EntryID: id, Reason: reason})
+	}
+}
+
+func (r *ImportReport) relabel(id, reason string) {
+	r.RelabelledCount++
+	if len(r.Relabelled) < MaxReportItems {
+		r.Relabelled = append(r.Relabelled, ImportProblem{EntryID: id, Reason: reason})
+	}
+}
+
+func (r *ImportReport) warn(msgs []string) {
+	r.WarningCount += len(msgs)
+	for _, m := range msgs {
+		if len(r.Warnings) >= MaxReportItems {
+			return
+		}
+		r.Warnings = append(r.Warnings, m)
+	}
 }
 
 // errInvalidEntry marks a malformed legacy entry.
@@ -141,7 +182,7 @@ func (s *SQLStore) ImportContextEntriesJSON(ctx context.Context, workspaceID str
 			}
 			if err := t.importEntry(ctx, workspaceID, le, opts, actor, &rep); err != nil {
 				if errors.Is(err, errInvalidEntry) && opts.SkipInvalid {
-					rep.Skipped = append(rep.Skipped, ImportProblem{EntryID: le.ID, Reason: err.Error()})
+					rep.skip(le.ID, err.Error())
 					continue
 				}
 				return err
@@ -157,8 +198,8 @@ func (s *SQLStore) ImportContextEntriesJSON(ctx context.Context, workspaceID str
 		return t.appendEvent(ctx, actor, eventRow{
 			WorkspaceID: workspaceID, Type: EventImport, Data: map[string]any{
 				"source": "context_entries.json", "source_digest": rep.SourceDigest, "imported": rep.Imported,
-				"unchanged": rep.Unchanged, "conflicts": len(rep.Conflicts), "skipped": len(rep.Skipped),
-				"relabelled": len(rep.Relabelled),
+				"unchanged": rep.Unchanged, "conflicts": rep.ConflictCount, "skipped": rep.SkippedCount,
+				"relabelled": rep.RelabelledCount, "warnings": rep.WarningCount,
 			},
 		})
 	})
@@ -174,6 +215,28 @@ type normalizedLegacy struct {
 	entry      LegacyEntry
 	relabelled string
 	warnings   []string
+	// withheld holds verifications cast on content other than the entry's: they are
+	// recorded in the import event and never become votes.
+	withheld []LegacyVerification
+}
+
+// Relabel reasons are fixed strings, so labelling a large file allocates none per row.
+var (
+	relabelDerived    = modeNotes("verification_mode derived as ")
+	relabelDowngraded = modeNotes("recorded peer_verified is not supported by distinct peer approvals; labelled ")
+)
+
+const (
+	bindingDigestBroken = "content_digest does not match content; votes and promotion withheld"
+	bindingHashBroken   = "content_hash does not match content; votes and promotion withheld"
+)
+
+func modeNotes(prefix string) map[string]string {
+	m := make(map[string]string, len(validModes))
+	for mode := range validModes {
+		m[mode] = prefix + mode
+	}
+	return m
 }
 
 func invalid(format string, args ...any) error {
@@ -210,6 +273,7 @@ func normalizeLegacy(workspaceID string, le LegacyEntry, threshold int) (normali
 	out := le
 	out.WorkspaceID = workspaceID
 	out.Title = strings.TrimSpace(le.Title)
+	out.Source = strings.TrimSpace(le.Source) // stored trimmed, so compare it trimmed
 	out.ContentHash, out.Stale, out.StalePaths = "", false, nil
 	for _, f := range []*string{&out.CreatedAt, &out.UpdatedAt} {
 		v, ok := normTime(*f)
@@ -223,9 +287,9 @@ func normalizeLegacy(workspaceID string, le LegacyEntry, threshold int) (normali
 	bindingBroken := ""
 	switch {
 	case le.ContentDigest != "" && le.ContentDigest != digest:
-		bindingBroken = "content_digest does not match content"
+		bindingBroken = bindingDigestBroken
 	case le.ContentHash != "" && le.ContentHash != digest[:16]:
-		bindingBroken = "content_hash does not match content"
+		bindingBroken = bindingHashBroken
 	}
 	// Verifications: blank agents never counted; a principal keeps its first position
 	// and its latest verdict, as the legacy tally does.
@@ -266,9 +330,12 @@ func normalizeLegacy(workspaceID string, le LegacyEntry, threshold int) (normali
 		out.SearchTokens = nil
 	}
 	switch {
-	case bindingBroken != "" && out.Promoted:
+	case bindingBroken != "":
+		// The verdicts were cast on other content. They must not count for this text,
+		// now or at any later reconciliation, so the entry starts unverified.
+		n.withheld, out.Verifications = out.Verifications, []LegacyVerification{}
 		out.Promoted, out.Status, out.VerificationMode = false, StatusPending, ""
-		n.relabelled = bindingBroken + "; promotion withheld"
+		n.relabelled = bindingBroken
 	case !out.Promoted:
 		out.VerificationMode = ""
 	default:
@@ -276,12 +343,12 @@ func normalizeLegacy(workspaceID string, le LegacyEntry, threshold int) (normali
 		switch {
 		case le.VerificationMode == "":
 			out.VerificationMode = derived
-			n.relabelled = "verification_mode derived as " + derived
+			n.relabelled = relabelDerived[derived]
 		case !validModes[le.VerificationMode]:
 			return n, invalid("entry %s verification_mode %q", le.ID, le.VerificationMode)
 		case le.VerificationMode == ModePeerVerified && derived != ModePeerVerified:
 			out.VerificationMode = derived
-			n.relabelled = "recorded peer_verified is not supported by distinct peer approvals; labelled " + derived
+			n.relabelled = relabelDowngraded[derived]
 		}
 	}
 	n.entry = out
@@ -330,7 +397,7 @@ func (t *txn) importEntry(ctx context.Context, workspaceID string, le LegacyEntr
 	switch {
 	case err == nil:
 		if existing.WorkspaceID != workspaceID {
-			rep.Conflicts = append(rep.Conflicts, ImportProblem{EntryID: want.ID, Reason: "id exists in workspace " + existing.WorkspaceID})
+			rep.conflict(want.ID, "id exists in workspace "+existing.WorkspaceID)
 			return nil
 		}
 		have, err := exportEntry(ctx, &t.reader, existing)
@@ -340,7 +407,7 @@ func (t *txn) importEntry(ctx context.Context, workspaceID string, le LegacyEntr
 		if legacyEqual(have, want) {
 			rep.Unchanged++
 		} else {
-			rep.Conflicts = append(rep.Conflicts, ImportProblem{EntryID: want.ID, Reason: "stored entry differs; left untouched"})
+			rep.conflict(want.ID, "stored entry differs; left untouched")
 		}
 		return nil
 	case !isNotFound(err):
@@ -392,20 +459,27 @@ func (t *txn) importEntry(ctx context.Context, workspaceID string, le LegacyEntr
 		want.Status, boolInt(want.Promoted), want.VerificationMode, updatedAt, want.ID); err != nil {
 		return fmt.Errorf("import %s: %w", want.ID, err)
 	}
+	data := map[string]any{
+		"author": want.Source, "status": want.Status, "promoted": want.Promoted,
+		"verification_mode": want.VerificationMode, "votes": len(want.Verifications),
+		"path_baselines": len(want.PathHashes),
+	}
+	if len(n.withheld) > 0 {
+		// kept as history only: who approved or rejected which (other) content, and when
+		data["withheld_verifications"] = n.withheld
+		data["legacy_content_digest"] = le.ContentDigest
+		data["legacy_content_hash"] = le.ContentHash
+	}
 	if err := t.appendEvent(ctx, actor, eventRow{
 		WorkspaceID: workspaceID, EntryID: want.ID, Type: EventImport, Revision: 1, NewDigest: digest,
-		Note: n.relabelled, Data: map[string]any{
-			"author": want.Source, "status": want.Status, "promoted": want.Promoted,
-			"verification_mode": want.VerificationMode, "votes": len(want.Verifications),
-			"path_baselines": len(want.PathHashes),
-		},
+		Note: n.relabelled, Data: data,
 	}); err != nil {
 		return err
 	}
 	rep.Imported++
-	rep.Warnings = append(rep.Warnings, n.warnings...)
+	rep.warn(n.warnings)
 	if n.relabelled != "" {
-		rep.Relabelled = append(rep.Relabelled, ImportProblem{EntryID: want.ID, Reason: n.relabelled})
+		rep.relabel(want.ID, n.relabelled)
 	}
 	return nil
 }
@@ -570,8 +644,12 @@ type legacyFeedback struct {
 	LastUsed       string `json:"last_used"`
 }
 
-// ImportFeedbackJSON imports a legacy agent_feedback.json array. Counters merge by
-// maximum, so re-importing the same file changes nothing.
+// unknownLastUsed stands in for a missing or unparsable legacy last_used. It is a
+// fixed time, never the import time, so re-importing the same file changes nothing.
+const unknownLastUsed = "1970-01-01T00:00:00.000000000Z"
+
+// ImportFeedbackJSON imports a legacy agent_feedback.json array. Counters and
+// last_used merge by maximum, so re-importing the same file changes nothing.
 func (s *SQLStore) ImportFeedbackJSON(ctx context.Context, workspaceID string, src io.Reader) (int, error) {
 	if err := validID("workspace", workspaceID); err != nil {
 		return 0, err
@@ -601,7 +679,7 @@ func (s *SQLStore) ImportFeedbackJSON(ctx context.Context, workspaceID string, s
 			}
 			lastUsed, ok := normTime(f.LastUsed)
 			if !ok || lastUsed == "" {
-				lastUsed = t.nowText()
+				lastUsed = unknownLastUsed
 			}
 			clamp := func(v int) int { return min(max(v, 0), feedbackCap) }
 			if _, err := t.exec(ctx, `INSERT INTO path_feedback (workspace_id, path, retrieval_count, verify_count,

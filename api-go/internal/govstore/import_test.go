@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -208,8 +209,91 @@ func TestImportLabelsConservatively(t *testing.T) {
 	if votes, _ := s.ListVotes(ctx, "claims_peer", 0); len(votes) != 1 {
 		t.Fatalf("case-folded duplicate verdicts not merged: %+v", votes)
 	}
-	if len(rep.Warnings) != 1 {
+	if len(rep.Warnings) != 1 || rep.WarningCount != 1 {
 		t.Fatalf("warnings = %v", rep.Warnings)
+	}
+	// Verdicts cast on other content never become votes on this content, so no later
+	// reconciliation can promote the tampered text on the strength of them.
+	if tl, _ := s.Tally(ctx, "digest_broken", 0); tl.Approvals != 0 || tl.PeerApprovals != 0 {
+		t.Fatalf("tampered entry kept its votes: %+v", tl)
+	}
+	if err := s.Update(ctx, func(tx Tx) error {
+		_, err := tx.SetPromotion(ctx, "digest_broken", Promotion{Status: StatusVerified, Promoted: true,
+			VerificationMode: ModePeerVerified}, Actor{Principal: "reconciler"})
+		return err
+	}); !errors.Is(err, ErrInvariant) {
+		t.Fatalf("tampered entry re-promoted as peer_verified: %v", err)
+	}
+	evs, _ := s.ListEvents(ctx, EventFilter{EntryID: "digest_broken", Types: []string{EventImport}})
+	if len(evs) != 1 || !strings.Contains(string(evs[0].Data), `"withheld_verifications"`) ||
+		!strings.Contains(string(evs[0].Data), "peer-2") || !strings.Contains(evs[0].Note, "withheld") {
+		t.Fatalf("withheld verdicts not kept as history: %+v", evs)
+	}
+	// Re-importing the same file is a no-op, the withheld verdicts included.
+	rep2, err := s.ImportContextEntriesJSON(ctx, "ws1", strings.NewReader(legacy), ImportOptions{Threshold: 2})
+	if err != nil || rep2.Unchanged != 5 || rep2.ConflictCount != 0 {
+		t.Fatalf("re-import = %+v %v", rep2, err)
+	}
+}
+
+// Whitespace the store normalizes away must not turn a re-import into a conflict.
+func TestImportIsIdempotentForUntrimmedSources(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t, newClock())
+	legacy := `[{"id": "ctx_y", "title": " t ", "content": "c", "source": " alice ", "permission": "readonly",
+	  "status": "pending", "promoted": false, "required_verifications": 2,
+	  "verifications": [{"agent": " bob ", "approve": true, "at": "2026-01-01T00:00:00Z"}],
+	  "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z"}]`
+	for i, want := range []ImportReport{{Imported: 1}, {Unchanged: 1}} {
+		rep, err := s.ImportContextEntriesJSON(ctx, "ws1", strings.NewReader(legacy), ImportOptions{})
+		if err != nil || rep.Imported != want.Imported || rep.Unchanged != want.Unchanged || rep.ConflictCount != 0 {
+			t.Fatalf("import %d = %+v %v", i+1, rep, err)
+		}
+	}
+	if e, _ := s.GetEntry(ctx, "ctx_y"); e.Source != "alice" {
+		t.Fatalf("source = %q", e.Source)
+	}
+}
+
+// The report of a large import stays small: per-entry lists are capped and the
+// counts stay exact.
+func TestImportReportIsBounded(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t, newClock())
+	const n = MaxReportItems + 150
+	var b strings.Builder
+	b.WriteString("[")
+	for i := range n {
+		if i > 0 {
+			b.WriteString(",")
+		}
+		// the pre-w0 shape (no verification_mode): every promoted entry is relabelled
+		fmt.Fprintf(&b, `{"id": "e%d", "title": "t", "content": "c%d", "source": "a", "permission": "readonly",
+		  "status": "verified", "promoted": true, "required_verifications": 2,
+		  "verifications": [{"agent": "b", "approve": true, "at": "2026-01-01T00:00:00Z"},
+		                    {"agent": "c", "approve": true, "at": "2026-01-01T00:00:00Z"},
+		                    {"agent": " ", "approve": true, "at": "2026-01-01T00:00:00Z"}],
+		  "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z"}`, i, i)
+		if i%2 == 1 { // and a malformed entry to skip
+			fmt.Fprintf(&b, `, {"id": "bad%d", "content": ""}`, i)
+		}
+	}
+	b.WriteString("]")
+	rep, err := s.ImportContextEntriesJSON(ctx, "ws1", strings.NewReader(b.String()), ImportOptions{SkipInvalid: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Imported != n || rep.RelabelledCount != n || rep.WarningCount != n || rep.SkippedCount != n/2 ||
+		len(rep.Relabelled) != MaxReportItems || len(rep.Warnings) != MaxReportItems || len(rep.Skipped) != MaxReportItems {
+		t.Fatalf("report counts = imported %d relabelled %d/%d warnings %d/%d skipped %d/%d", rep.Imported,
+			rep.RelabelledCount, len(rep.Relabelled), rep.WarningCount, len(rep.Warnings), rep.SkippedCount, len(rep.Skipped))
+	}
+	if rep.Relabelled[0].EntryID != "e0" || rep.Relabelled[0].Reason != "verification_mode derived as peer_verified" {
+		t.Fatalf("first relabel = %+v", rep.Relabelled[0])
+	}
+	rep2, err := s.ImportContextEntriesJSON(ctx, "ws1", strings.NewReader(b.String()), ImportOptions{SkipInvalid: true})
+	if err != nil || rep2.Unchanged != n || rep2.ConflictCount != 0 {
+		t.Fatalf("re-import = unchanged %d conflicts %d %v", rep2.Unchanged, rep2.ConflictCount, err)
 	}
 }
 
@@ -258,13 +342,23 @@ func TestImportLegacyFeedbackIsIdempotent(t *testing.T) {
 	s := openTestStore(t, newClock())
 	legacy := `[{"path": "api-go/go.mod", "retrieval_count": 4, "verify_count": 2, "run_success": 1, "run_fail": 0,
 	  "last_used": "2026-09-01T00:00:00Z"}, {"path": "./Makefile", "retrieval_count": 99999, "last_used": "bad"}]`
-	for range 2 {
+	var first map[string]PathFeedback
+	for i := range 2 {
 		n, err := s.ImportFeedbackJSON(ctx, "ws1", strings.NewReader(legacy))
 		if err != nil || n != 2 {
 			t.Fatalf("import feedback: %d %v", n, err)
 		}
+		fb, _ := s.GetFeedback(ctx, "ws1", []string{"api-go/go.mod", "Makefile"})
+		if i == 0 {
+			first = fb
+			continue
+		}
+		// a missing last_used must not become "now", or every re-import moves it
+		if mustJSON(t, fb) != mustJSON(t, first) {
+			t.Fatalf("re-import changed feedback:\n%s\n%s", mustJSON(t, first), mustJSON(t, fb))
+		}
 	}
-	fb, _ := s.GetFeedback(ctx, "ws1", []string{"api-go/go.mod", "Makefile"})
+	fb := first
 	if fb["api-go/go.mod"].RetrievalCount != 4 || fb["api-go/go.mod"].VerifyCount != 2 || fb["Makefile"].RetrievalCount != feedbackCap {
 		t.Fatalf("feedback = %+v", fb)
 	}
