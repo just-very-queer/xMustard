@@ -612,45 +612,142 @@ class Ledger(unittest.TestCase):
     def test_real_ledger_is_consistent(self):
         procs = {c["process"] for c in LEDGER["components"].values() if c["process"]}
         roles = {r["component"] for r in LEDGER["process_roles"]["rules"]}
+        items = set(LEDGER["go_daemon_suballocation"]["items"])
         self.assertEqual(LEDGER["gate"]["limit_bytes"], v2.GATE_BYTES)
         self.assertEqual(sorted(LEDGER["workstreams"]), [f"WS-{i:02d}" for i in range(64)])
         for wid, w in LEDGER["workstreams"].items():
             self.assertTrue(w["process"] is None or w["process"] in procs | roles, wid)
+            for sc in w.get("scenarios", []):
+                self.assertIn(sc, v2.SCENARIOS, wid)
+                self.assertNotIn("requires", v2.SCENARIOS[sc], f"{wid}: a designated scenario must run on the base too")
+            if "item" in w:
+                self.assertEqual(w["process"], "go_daemon", wid)
+                self.assertIn(w["item"], items, wid)
         for p in procs:
             self.assertIn(p, roles | {"go_daemon"}, p)
         for k in ("tree_peak_mib", "component_p50_mib", "v1_crosscheck_mib"):
             self.assertIsInstance(LEDGER["tolerance"][k], (int, float), k)
+        self.assertEqual(LEDGER["reconciliation"]["status"], "open")
 
-    def test_reconcile_reports_the_critic_overcommit(self):
+    def test_reconcile_reports_the_overcommit_and_exits_nonzero(self):
         rec = v2.ledger_reconcile(LEDGER)
         by = {r["process"]: r for r in rec["per_process"]}
         self.assertGreater(by["rust_index_service"]["workstream_lines_mib"], by["rust_index_service"]["design_steady_mib"])
+        self.assertEqual((by["go_daemon"]["design_steady_mib"], by["go_daemon"]["projected_steady_mib"]), (27.0, 46.5))
+        self.assertIn("go_daemon", rec["over_design"])
+        items = {i["item"]: i for i in rec["go_daemon_items"]}
+        self.assertTrue(items["governance_caches"]["over"])
+        self.assertFalse(items["runtime_base"]["over"])  # a base item is compared at the process level only
+        self.assertEqual(set(items["unallocated"]["workstreams"]), {"WS-43", "WS-45", "WS-51"})
+        self.assertAlmostEqual(sum(i["workstream_lines_mib"] for i in items.values()), by["go_daemon"]["workstream_lines_mib"])
         self.assertTrue(rec["fits_7_2_method"])
         self.assertFalse(rec["fits_with_query_overlap"])
         self.assertIn("WS-55", rec["workstreams_without_a_line"])
+        measured = v2.ledger_reconcile(LEDGER, {"source": "this run", "component_p50_mib": {"go_daemon": 10.0}})
+        self.assertEqual(({r["process"]: r for r in measured["per_process"]})["go_daemon"]["projected_steady_mib"], 37.7)
+        self.assertEqual(measured["measured_from"], "this run")
+        with unittest.mock.patch("sys.stdout"), unittest.mock.patch("sys.stderr"):
+            self.assertEqual(v2.main(["ledger"]), 1)  # open reconciliation: nonzero until the owner decides
+        fitted = copy.deepcopy(LEDGER)
+        for w in fitted["workstreams"].values():
+            w["line_mib"] = 0 if w["line_mib"] is not None else None
+        fitted["reference_measurement"]["component_p50_mib"] = {"go_daemon": 18.8}
+        self.assertEqual(v2.ledger_reconcile(fitted)["over_design"], [])
 
-    def view(self, peak, daemon):
-        return {"v1-workload": {"gate_peak_mib": peak, "components_p50_mib": {"go_daemon": daemon, "mcp_access": 20.0}}}
+    def view(self, peak, daemon, mcp=20.0, tree_all=None, ext=None, fp=None):
+        v = {"gate_peak_mib": peak, "tree_all_peak_mib": tree_all if tree_all is not None else peak,
+             "components_p50_mib": {"go_daemon": daemon, "mcp_access": mcp}, "externals_peak_mib": ext or {}}
+        if fp:
+            v["components_footprint_p50_mib"] = fp
+        return {"v1-workload": v}
 
-    def test_check_enforces_lines_and_savings(self):
+    def check(self, ws, head, base):
+        return v2.ledger_check(LEDGER, ws, head, base)
+
+    def test_lines_are_enforced_with_resolution_verdicts(self):
         tol = LEDGER["tolerance"]
         base = self.view(80.0, 20.0)
-        ok = v2.ledger_check(LEDGER, "WS-01", self.view(80.0 + 3 + tol["tree_peak_mib"], 20.0 + 3), base)
-        self.assertTrue(ok["passed"], ok)
-        over = v2.ledger_check(LEDGER, "WS-01", self.view(80.0 + 3 + tol["tree_peak_mib"] + 0.5, 23.0), base)
-        self.assertFalse(over["passed"])
-        daemon_over = v2.ledger_check(LEDGER, "WS-01", self.view(80.0, 20.0 + 3 + tol["component_p50_mib"] + 0.1), base)
-        self.assertFalse(daemon_over["passed"])
-        # WS-13 must actually save its 10 MiB
-        saved = {"v1-workload": {"gate_peak_mib": 80.0 - 10 - tol["tree_peak_mib"], "components_p50_mib": {"mcp_access": 0.0}}}
-        self.assertTrue(v2.ledger_check(LEDGER, "WS-13", saved, base)["passed"])
-        self.assertFalse(v2.ledger_check(LEDGER, "WS-13", self.view(80.0, 20.0), base)["passed"])
-        # unlisted work and a null line default to 0 MiB
-        over_default = 80.0 + LEDGER["default_line_mib"] + tol["tree_peak_mib"] + 0.5
-        self.assertFalse(v2.ledger_check(LEDGER, "not-a-workstream", self.view(over_default, 20.0), base)["passed"])
-        self.assertEqual(v2.ledger_check(LEDGER, "WS-55", base, base)["line_mib"], 0.0)
+        ok = self.check("WS-01", self.view(80.0 + 3 + tol["tree_peak_mib"], 20.0 + 3), base)
+        self.assertEqual(ok["verdict"], "PASS", ok)
+        self.assertFalse(ok["blocking"])
+        self.assertEqual(self.check("WS-01", self.view(80.0 + 3 + tol["tree_peak_mib"] + 0.5, 23.0), base)["verdict"], "FAIL")
+        self.assertEqual(self.check("WS-01", self.view(80.0, 20.0 + 3 + tol["component_p50_mib"] + 0.1), base)["verdict"], "FAIL")
+        # a 0.2 MiB line cannot be resolved with a 3 MiB tolerance: held, but not reported as passed
+        small = self.check("WS-03", self.view(80.0, 22.0), base)
+        self.assertEqual(small["verdict"], "BELOW_RESOLUTION")
+        self.assertFalse(small["blocking"])
+        self.assertEqual(self.check("WS-03", self.view(80.0, 20.0 + 0.2 + 3.1), base)["verdict"], "FAIL")
+        # WS-25's 2 MiB saving is below resolution: an unchanged process is not a delivered saving
+        ws25 = self.check("WS-25", {"v1-workload": dict(base["v1-workload"], components_p50_mib={"go_daemon": 20.0, "mcp_access": 20.0,
+                                                                                                "rust_core_per_call": 6.0})},
+                          {"v1-workload": dict(base["v1-workload"], components_p50_mib={"go_daemon": 20.0, "mcp_access": 20.0,
+                                                                                        "rust_core_per_call": 6.0})})
+        self.assertEqual(ws25["verdict"], "BELOW_RESOLUTION", ws25)
+        # WS-49's resolvable -4 saving must show at least 1 MiB (line + tolerance)
+        self.assertEqual(self.check("WS-49", self.view(80.0, 20.0), base)["verdict"], "FAIL")
+        self.assertEqual(self.check("WS-49", self.view(78.0, 18.5), base)["verdict"], "PASS")
+        # unlisted work and a null line default to 0 MiB, and are below resolution when they hold
+        self.assertEqual(self.check("not-a-workstream", self.view(80.0 + tol["tree_peak_mib"] + 0.5, 20.0), base)["verdict"], "FAIL")
+        self.assertEqual(self.check("not-a-workstream", base, base)["verdict"], "BELOW_RESOLUTION")
+        self.assertEqual(self.check("WS-55", base, base)["line_mib"], 0.0)
         # no common scenario is a failure, not a pass
-        self.assertFalse(v2.ledger_check(LEDGER, "WS-01", {}, base)["passed"])
+        self.assertEqual(self.check("WS-01", {}, base)["verdict"], "FAIL")
+
+    def test_every_owned_component_is_checked_not_only_the_workstreams(self):
+        base = self.view(78.7, 18.8, fp={"go_daemon": 12.0, "mcp_access": 15.0})
+        head = self.view(88.6, 28.3, fp={"go_daemon": 21.5, "mcp_access": 15.0})  # +9.5 MiB of daemon
+        for ws in ("unlisted", "WS-10", "WS-24", "WS-14"):
+            chk = self.check(ws, head, base)
+            self.assertEqual(chk["verdict"], "FAIL", ws)
+            self.assertIn("go_daemon", chk["note"])
+        # mcp_access has its own measured tolerance (5 MiB)
+        noisy = self.view(78.7, 18.8, fp={"go_daemon": 12.0, "mcp_access": 19.5})
+        self.assertNotEqual(self.check("WS-10", noisy, base)["verdict"], "FAIL")
+
+    def test_moving_work_into_an_external_process_is_not_a_saving(self):
+        base = self.view(30.0, 30.0, mcp=0.0, tree_all=30.0)
+        head = self.view(20.0, 20.0, mcp=0.0, tree_all=45.0, ext={"runner_command": 25.0})  # daemon -> node helper
+        for ws in ("WS-49", "unlisted", "WS-03"):
+            chk = self.check(ws, head, base)
+            self.assertEqual(chk["verdict"], "FAIL", (ws, chk["note"]))
+            self.assertEqual(chk["rows"][0]["externals_new"], ["runner_command"])
+        row = self.check("WS-49", head, base)["rows"][0]
+        self.assertEqual((row["process"]["delta_mib"], row["process"]["credited_mib"]), (-10.0, 0.0))
+        # a real saving with no external growth is credited
+        self.assertEqual(self.check("WS-49", self.view(24.0, 24.0, mcp=0.0), base)["verdict"], "PASS")
+
+    def test_design_check_catches_accumulated_small_overruns(self):
+        # each step is inside every per-PR tolerance, but the daemon walks past its design line
+        daemon, base_peak = 18.8, 78.7
+        verdicts = []
+        for step in range(6):
+            base = self.view(base_peak, daemon, fp={"go_daemon": daemon, "mcp_access": 15.0})
+            daemon += 2.5
+            base_peak += 2.5
+            head = self.view(base_peak, daemon, fp={"go_daemon": daemon, "mcp_access": 15.0})
+            verdicts.append(self.check("WS-03", head, base)["verdict"])
+        self.assertEqual(verdicts[:4], ["BELOW_RESOLUTION"] * 4)  # 21.3 .. 28.8 MiB: within 27 + 3
+        self.assertEqual(verdicts[4:], ["FAIL", "FAIL"])  # 31.3 MiB: over the design line whatever the delta
+        design = {d["process"]: d for d in self.check("WS-03", head, base)["rows"][0]["design"]}
+        self.assertTrue(design["mcp_access"]["grandfathered"])  # over its 0 MiB line at the reference: delta check only
+        self.assertFalse(design["go_daemon"]["ok"])
+
+    def test_designated_scenarios_and_ceiling_elsewhere(self):
+        tol = LEDGER["tolerance"]
+        base = {"v1-workload": self.view(80.0, 20.0)["v1-workload"], "agents-2-small": self.view(60.0, 18.0)["v1-workload"]}
+        # WS-13: the frozen v1 workload keeps its stdio shims, so the saving is demanded only on agents-2-small
+        head = {"v1-workload": base["v1-workload"], "agents-2-small": self.view(40.0, 18.5, mcp=0.0)["v1-workload"]}
+        chk = self.check("WS-13", head, base)
+        self.assertEqual(chk["verdict"], "PASS", chk)
+        self.assertEqual({r["scenario"]: r["line_mib"] for r in chk["rows"]}, {"agents-2-small": -10, "v1-workload": 0.0})
+        self.assertEqual(self.check("WS-13", base, base)["verdict"], "FAIL")  # no saving where it is designated
+        # a designated scenario that did not run on both sides: not checkable, never passed
+        only_v1 = {"v1-workload": base["v1-workload"]}
+        self.assertEqual(self.check("WS-13", only_v1, only_v1)["verdict"], "NOT_CHECKABLE")
+        # a positive line still bounds the non-designated scenarios as a ceiling
+        grow = {"v1-workload": dict(self.view(80.0, 20.0)["v1-workload"], components_p50_mib={"go_daemon": 20.0, "mcp_access": 20.0,
+                                                                                              "rust_index_service": 12 + tol["component_p50_mib"] + 1})}
+        self.assertEqual(self.check("WS-14", grow, {"v1-workload": base["v1-workload"]})["verdict"], "FAIL")
 
     def test_process_check_prefers_footprint_when_both_runs_have_it(self):
         tol = LEDGER["tolerance"]["component_p50_mib"]
@@ -658,19 +755,55 @@ class Ledger(unittest.TestCase):
         noisy_rss = {"s": {"gate_peak_mib": 80.0, "components_p50_mib": {"go_daemon": 18.0 + 3 + tol + 5},
                            "components_footprint_p50_mib": {"go_daemon": 12.0 + 3}}}
         chk = v2.ledger_check(LEDGER, "WS-01", noisy_rss, base)
-        self.assertTrue(chk["passed"], chk)
-        self.assertEqual(chk["rows"][0]["process_basis"], "footprint p50")
+        self.assertEqual(chk["verdict"], "PASS", chk)
+        self.assertEqual(chk["rows"][0]["process"]["basis"], "footprint p50")
         grew = {"s": {"gate_peak_mib": 80.0, "components_p50_mib": {"go_daemon": 18.0},
                       "components_footprint_p50_mib": {"go_daemon": 12.0 + 3 + tol + 0.5}}}
-        self.assertFalse(v2.ledger_check(LEDGER, "WS-01", grew, base)["passed"])
+        self.assertEqual(v2.ledger_check(LEDGER, "WS-01", grew, base)["verdict"], "FAIL")
 
     def test_ledger_view_skips_invalid_runs(self):
         rep = {"scenarios": {
-            "a": {"status": "ran", "gate": {"valid": True, "peak_mib": 50.0}, "sampler": {"components": {"go_daemon": {"p50_mib": 20.0}}}},
+            "a": {"status": "ran", "gate": {"valid": True, "peak_mib": 50.0}, "sampler": {"components": {"go_daemon": {"p50_mib": 20.0, "peak_mib": 30.0}},
+                                                                                     "tree_all_peak_mib": 55.0, "externals": {"lsp_server": {"peak_mib": 5.0}}}},
             "b": {"status": "ran", "gate": {"valid": False, "peak_mib": 10.0}, "sampler": {"components": {}}},
             "c": {"status": "skipped"}}}
-        self.assertEqual(v2.ledger_view(rep), {"a": {"gate_peak_mib": 50.0, "components_p50_mib": {"go_daemon": 20.0},
-                                                     "components_footprint_p50_mib": {"go_daemon": None}}})
+        self.assertEqual(v2.ledger_view(rep), {"a": {"valid_runs": 1, "gate_peak_mib": 50.0, "tree_all_peak_mib": 55.0,
+                                                     "components_p50_mib": {"go_daemon": 20.0},
+                                                     "components_footprint_p50_mib": {"go_daemon": None},
+                                                     "components_peak_mib": {"go_daemon": 30.0},
+                                                     "externals_peak_mib": {"lsp_server": 5.0}}})
+
+    def test_ledger_diff_flags_every_governance_change(self):
+        head = copy.deepcopy(LEDGER)
+        self.assertEqual(v2.ledger_diff(LEDGER, head), [])
+        head["workstreams"]["WS-13"]["title"] = "prose only"
+        head["tolerance"]["basis"] = "prose only"
+        self.assertEqual(v2.ledger_diff(LEDGER, head), [])
+        head["workstreams"]["WS-14"]["line_mib"] = 20
+        head["tolerance"]["component_p50_mib"] = 6.0
+        head["workstreams"]["WS-99"] = {"line_mib": 1, "process": None}
+        paths = [d["path"] for d in v2.ledger_diff(LEDGER, head)]
+        self.assertEqual(paths, ["tolerance.component_p50_mib", "workstreams.WS-14.line_mib", "workstreams.WS-99"])
+        with tempfile.TemporaryDirectory() as d:
+            a, b = os.path.join(d, "base.json"), os.path.join(d, "head.json")
+            for path, obj in ((a, LEDGER), (b, head)):
+                with open(path, "w") as f:
+                    json.dump(obj, f)
+            with unittest.mock.patch("sys.stdout"):
+                self.assertEqual(v2.main(["ledger", "--ledger", b, "--diff", a]), 1)
+                self.assertEqual(v2.main(["ledger", "--ledger", a, "--diff", a]), 0)
+
+    def test_workstream_from_branch_and_ci_plan(self):
+        cases = {"parity/ws-10": "WS-10", "ws13-http": "WS-13", "parity/WS-19a": "WS-19", "feature/news2024": None,
+                 "fix/draws-12": None, "ws-100": None, "main": None, "parity/w0-kernel": None}
+        for ref, want in cases.items():
+            self.assertEqual(v2.workstream_from_branch(ref), want, ref)
+        ci = [n for n, sc in v2.SCENARIOS.items() if "ci" in sc["suites"]]
+        self.assertEqual(ci, ["v1-workload", "agents-2-relay"])
+        self.assertEqual(v2.ci_plan(LEDGER, FIXTURES, "fix/draws-12"), {"workstream": "unlisted", "scenarios": ci, "fixtures": False})
+        self.assertEqual(v2.ci_plan(LEDGER, FIXTURES, "parity/ws-13"),
+                         {"workstream": "WS-13", "scenarios": ci + ["agents-2-small"], "fixtures": False})
+        self.assertEqual(v2.ci_plan(LEDGER, FIXTURES, "parity/ws-14"), {"workstream": "WS-14", "scenarios": ci + ["agents-2"], "fixtures": True})
 
 
 def git(args, cwd):
@@ -816,24 +949,52 @@ class RepoWiring(unittest.TestCase):
         else:
             self.assertIn("pull_request:", text)
             runs = text
-        for needle in ("make check-backend", "retrieval-gate.sh", "rss_v2.sh run --suite ci", "make bench-test", "--workstream"):
+        for needle in ("make check-backend", "retrieval-gate.sh", "rss_v2.sh run --suite ci", "make bench-test", "--workstream",
+                       "rss_v2.sh ci-plan --branch", '--ledger "$LEDGER"', "--diff \"$BASE_LEDGER\"", "--repeat 3"):
             self.assertIn(needle, runs)
+        self.assertIn("budget-ledger-change", text)
+        self.assertNotIn("grep -oiE 'ws-?[0-9]{2}'", text)  # the workstream comes from the anchored, tested parser
 
 
 class Repeats(unittest.TestCase):
     def run_(self, peak, verdict="PASS", daemon=20.0):
+        reasons = ["v2 disagrees with the frozen v1 sampler by 9 MiB"] if verdict == "INVALID" else []
         return {"status": "ran", "gate": {"peak_mib": peak, "peak_bytes": int(peak * 2**20), "verdict": verdict,
-                                          "passed": verdict == "PASS", "invalid_reasons": []},
-                "sampler": {"components": {"go_daemon": {"p50_mib": daemon, "peak_mib": daemon + 5}}}}
+                                          "valid": verdict != "INVALID", "passed": verdict == "PASS", "invalid_reasons": reasons},
+                "sampler": {"components": {"go_daemon": {"p50_mib": daemon, "peak_mib": daemon + 5}}, "tree_all_peak_mib": peak}}
 
     def test_median_run_is_kept_and_any_bad_repeat_fails(self):
         folded = v2.median_report([self.run_(70.0), self.run_(90.0), self.run_(80.0, daemon=21.0)])
         self.assertEqual(folded["gate"]["peak_mib"], 80.0)
         self.assertEqual(folded["repeats"]["gate_peak_mib"], [70.0, 80.0, 90.0])
         self.assertEqual([d["components_p50_mib"]["go_daemon"] for d in folded["repeats"]["detail"]], [20.0, 21.0, 20.0])
+        self.assertEqual([d["kept"] for d in folded["repeats"]["detail"]], [False, True, False])
         bad = v2.median_report([self.run_(70.0), self.run_(71.0, "INVALID"), self.run_(72.0)])
-        self.assertEqual(bad["gate"]["verdict"], "INVALID")
-        self.assertFalse(bad["gate"]["passed"])
+        self.assertEqual((bad["gate"]["verdict"], bad["gate"]["valid"], bad["gate"]["passed"]), ("INVALID", False, False))
+
+    def test_an_invalid_repeat_is_never_the_measurement(self):
+        # the invalid run sorts to the middle: the kept run is the median of the valid ones
+        base = v2.median_report([self.run_(70.0), self.run_(75.0, "INVALID"), self.run_(80.0)])
+        self.assertEqual(base["gate"]["peak_mib"], 80.0)
+        self.assertEqual((base["gate"]["verdict"], base["gate"]["valid"]), ("INVALID", False))
+        self.assertEqual(base["repeats"]["valid_runs"], 2)
+        view = v2.ledger_view({"scenarios": {"v1-workload": base}})
+        self.assertEqual(view["v1-workload"]["gate_peak_mib"], 75.0)  # median of 70 and 80: the invalid 75 dropped out
+        self.assertEqual(view["v1-workload"]["valid_runs"], 2)
+        head = v2.ledger_view({"scenarios": {"v1-workload": v2.median_report([self.run_(74.0), self.run_(75.0), self.run_(76.0)])}})
+        self.assertNotEqual(v2.ledger_check(LEDGER, "WS-01", head, view)["verdict"], "FAIL")
+        # an invalid low run does not become the kept run either
+        low = v2.median_report([self.run_(70.0, "INVALID"), self.run_(75.0), self.run_(80.0)])
+        self.assertEqual((low["gate"]["peak_mib"], low["gate"]["verdict"], low["gate"]["valid"]), (80.0, "INVALID", False))
+        # no valid run at all: kept for the record, and no ledger view
+        none = v2.median_report([self.run_(70.0, "INVALID"), self.run_(75.0, "INVALID")])
+        self.assertEqual(none["repeats"]["kept"], "median-peak run (no run was valid)")
+        self.assertEqual(v2.ledger_view({"scenarios": {"x": none}}), {})
+
+    def test_fail_outranks_invalid(self):
+        folded = v2.median_report([self.run_(70.0, "INVALID"), self.run_(90.0), self.run_(97.0, "FAIL")])
+        self.assertEqual((folded["gate"]["verdict"], folded["gate"]["valid"], folded["gate"]["passed"]), ("FAIL", True, False))
+        self.assertIn("a repeat was FAIL", folded["gate"]["repeat_note"])
 
 
 class Rendering(unittest.TestCase):
@@ -849,7 +1010,16 @@ class Rendering(unittest.TestCase):
                "ledger_reconcile": v2.ledger_reconcile(LEDGER), "unmeasured": v2.UNMEASURED}
         md = v2.render_markdown(rep)
         for needle in ("**Verdict: PASS**", "95.4 MiB", "not established", "watcher-on | skipped", "lsp_server: peak 80.0 MiB",
-                       "| go_daemon |", "Design lines"):
+                       "| go_daemon |", "Reconciliation (open)", "governance_caches (feature) | 3 | 10.5 **over**"):
+            self.assertIn(needle, md)
+        view = {"agents-1": {"gate_peak_mib": 20.0, "tree_all_peak_mib": 100.0, "components_p50_mib": {"go_daemon": 30.0},
+                             "components_footprint_p50_mib": {"go_daemon": 29.0}, "components_peak_mib": {"go_daemon": 40.0},
+                             "externals_peak_mib": {}}}
+        rep["design_comparison"] = v2.design_comparison(LEDGER, view)
+        rep["ledger_check"] = v2.ledger_check(LEDGER, "WS-03", view, view)
+        md = v2.render_markdown(rep)
+        for needle in ("| agents-1 | go_daemon | 30.0 | 29.0 | 27.0 **over** | 40.0 | 33.0 **over** |",
+                       "Workstream WS-03 (line 0.2 MiB on `go_daemon`): **BELOW_RESOLUTION**"):
             self.assertIn(needle, md)
 
 

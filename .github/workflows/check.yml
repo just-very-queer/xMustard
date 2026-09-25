@@ -5,6 +5,8 @@ name: check
 
 on:
   pull_request:
+    # labeled/unlabeled: re-run when a maintainer approves a budget ledger change
+    types: [opened, synchronize, reopened, labeled, unlabeled]
   push:
     branches: [main]
   workflow_dispatch:
@@ -93,10 +95,18 @@ jobs:
           workspaces: rust-core
           key: release
       - run: cd rust-core && cargo build --release --locked --bin xmustard-core
+      # the native stdio relay (WS-13), once this revision has one; its gate scenario skips until then
+      - run: |
+          if [ -f rust-core/src/bin/xmustard-relay.rs ]; then
+            cd rust-core && cargo build --release --locked --bin xmustard-relay
+          fi
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: xmustard-core
-          path: rust-core/target/release/xmustard-core
+          path: |
+            rust-core/target/release/xmustard-core
+            rust-core/target/release/xmustard-relay
+          if-no-files-found: error
           retention-days: 3
 
   retrieval-gate:
@@ -130,7 +140,7 @@ jobs:
     name: budget gate v2
     needs: core-release
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -143,12 +153,13 @@ jobs:
         with:
           name: xmustard-core
           path: ${{ runner.temp }}/core
-      - run: chmod +x "$RUNNER_TEMP/core/xmustard-core"
+      - run: chmod +x "$RUNNER_TEMP"/core/xmustard-*
       # Pull requests: measure the base revision on this same runner, then the head (each
-      # the median of three runs), and check the head's delta against the workstream's
-      # ledger line (budget_ledger.json).
-      # The workstream comes from the branch name (parity/ws-NN); other branches use the
-      # ledger's default line of 0 MiB plus tolerance.
+      # the median of the valid runs among three), and check the head's delta against the
+      # workstream's ledger line. The workstream comes from the branch name (a path segment
+      # starting ws-NN); other branches get the default line of 0 MiB. The check reads the
+      # BASE revision's budget_ledger.json: a pull request that changes lines, tolerances,
+      # design lines or roles fails unless a maintainer adds the budget-ledger-change label.
       - name: Prepare the base revision
         if: github.event_name == 'pull_request'
         id: base
@@ -163,6 +174,35 @@ jobs:
             echo "core=$RUNNER_TEMP/base/rust-core/target/release/xmustard-core" >> "$GITHUB_OUTPUT"
             echo "build_core=true" >> "$GITHUB_OUTPUT"
           fi
+      - name: Choose the ledger and the scenarios
+        if: github.event_name == 'pull_request'
+        id: plan
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+          LEDGER_CHANGE_APPROVED: ${{ contains(github.event.pull_request.labels.*.name, 'budget-ledger-change') }}
+        run: |
+          mkdir -p bench-out
+          LEDGER=scripts/bench/budget_ledger.json
+          BASE_LEDGER="$RUNNER_TEMP/base/scripts/bench/budget_ledger.json"
+          if [ -f "$BASE_LEDGER" ]; then
+            if scripts/bench/rss_v2.sh ledger --ledger "$LEDGER" --diff "$BASE_LEDGER" > bench-out/ledger-diff.json; then
+              LEDGER="$BASE_LEDGER"
+            elif [ "$LEDGER_CHANGE_APPROVED" = "true" ]; then
+              echo "::notice::budget_ledger.json changes approved by the budget-ledger-change label"
+            else
+              cat bench-out/ledger-diff.json
+              echo "::error::This pull request changes budget_ledger.json lines, tolerances, design lines or roles. It is measured against the base ledger and fails until a maintainer adds the budget-ledger-change label."
+              LEDGER="$BASE_LEDGER"
+              echo "ledger_unapproved=true" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+          echo "ledger=$LEDGER" >> "$GITHUB_OUTPUT"
+          scripts/bench/rss_v2.sh ci-plan --branch "$HEAD_REF" --ledger "$LEDGER" | tee -a "$GITHUB_OUTPUT"
+      - if: steps.plan.outputs.fixtures == 'true'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/fixtures
+          key: parity-fixtures-${{ hashFiles('scripts/bench/parity_fixtures.json') }}
       - if: steps.base.outputs.build_core == 'true'
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch
         with:
@@ -172,21 +212,34 @@ jobs:
         run: cd "$RUNNER_TEMP/base/rust-core" && cargo build --release --locked --bin xmustard-core
       - name: Gate v2 on the base revision
         if: github.event_name == 'pull_request'
+        env:
+          LEDGER: ${{ steps.plan.outputs.ledger }}
+          SCENARIOS: ${{ steps.plan.outputs.scenarios }}
+          XMUSTARD_FIXTURE_CACHE: ${{ runner.temp }}/fixtures
         run: |
-          scripts/bench/rss_v2.sh run --suite ci --repeat 3 --source-root "$RUNNER_TEMP/base" \
+          scripts/bench/rss_v2.sh run --scenarios "$SCENARIOS" --repeat 3 --ledger "$LEDGER" --source-root "$RUNNER_TEMP/base" \
             --core-bin "${{ steps.base.outputs.core }}" --out bench-out/base || true
           test -f bench-out/base/report.json
       - name: Gate v2 on the head (pull request, with the ledger check)
         if: github.event_name == 'pull_request'
         env:
-          HEAD_REF: ${{ github.head_ref }}
+          LEDGER: ${{ steps.plan.outputs.ledger }}
+          SCENARIOS: ${{ steps.plan.outputs.scenarios }}
+          WS: ${{ steps.plan.outputs.workstream }}
+          XMUSTARD_FIXTURE_CACHE: ${{ runner.temp }}/fixtures
         run: |
-          WS=$(printf '%s' "$HEAD_REF" | grep -oiE 'ws-?[0-9]{2}' | head -n1 | tr '[:lower:]' '[:upper:]' | sed -E 's/^WS-?/WS-/')
-          scripts/bench/rss_v2.sh run --suite ci --repeat 3 --core-bin "$RUNNER_TEMP/core/xmustard-core" --out bench-out/head \
-            --workstream "${WS:-unlisted}" --baseline bench-out/base/report.json
+          [ -x "$RUNNER_TEMP/core/xmustard-relay" ] && export XMUSTARD_RELAY_BIN="$RUNNER_TEMP/core/xmustard-relay"
+          scripts/bench/rss_v2.sh run --scenarios "$SCENARIOS" --repeat 3 --ledger "$LEDGER" \
+            --core-bin "$RUNNER_TEMP/core/xmustard-core" --out bench-out/head \
+            --workstream "$WS" --baseline bench-out/base/report.json
+      - name: Unapproved ledger change
+        if: github.event_name == 'pull_request' && steps.plan.outputs.ledger_unapproved == 'true'
+        run: exit 1
       - name: Gate v2 (push or manual run)
         if: github.event_name != 'pull_request'
-        run: scripts/bench/rss_v2.sh run --suite ci --core-bin "$RUNNER_TEMP/core/xmustard-core" --out bench-out/head
+        run: |
+          [ -x "$RUNNER_TEMP/core/xmustard-relay" ] && export XMUSTARD_RELAY_BIN="$RUNNER_TEMP/core/xmustard-relay"
+          scripts/bench/rss_v2.sh run --suite ci --core-bin "$RUNNER_TEMP/core/xmustard-core" --out bench-out/head
       - name: Report summary
         if: always()
         run: |

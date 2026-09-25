@@ -60,7 +60,9 @@ import json
 import math
 import os
 import platform
+import re
 import shutil
+import statistics
 import struct
 import subprocess
 import sys
@@ -1240,38 +1242,87 @@ def load_json(path):
 # Ledger: per-component budget lines, workstream lines, reconciliation, delta check
 # --------------------------------------------------------------------------------------
 
-def ledger_reconcile(ledger):
-    """Reconcile the §7.2 component lines with the per-workstream lines (§12.5, WS-10)."""
+def design_lines(ledger):
+    """{process: {"steady": MiB, "peak": MiB}}: the §7.2 component lines summed per process
+    (ps-RSS basis)."""
+    out = {}
+    for c in ledger["components"].values():
+        p = c.get("process")
+        if p:
+            d = out.setdefault(p, {"steady": 0.0, "peak": 0.0})
+            d["steady"] += c["steady_mib"]
+            d["peak"] += c["peak_mib"]
+    return out
+
+
+def component_tolerance(ledger, proc):
+    """The p50 noise allowance for one process: a per-process override or the default."""
+    tol = ledger["tolerance"]
+    return (tol.get("component_p50_mib_by_process") or {}).get(proc, tol["component_p50_mib"])
+
+
+def ledger_reconcile(ledger, measured=None):
+    """Reconcile the §7.2 component lines, the §7.3 Go-daemon sub-allocation and the
+    per-workstream lines (§12.4-12.5).
+
+    measured: {"source": text, "component_p50_mib": {process: MiB}} from this run's
+    reference scenario; without it the ledger's static reference measurement is used.
+    Projected steady = measured p50 + the workstream lines placed on the process.
+    `over_design` names every process projected above its design steady line; `rss_v2.sh
+    ledger` exits nonzero while it is non-empty. The decision that clears it (raise design
+    lines, or cut and re-place workstream lines) belongs to the owner and is recorded in
+    the ledger's `reconciliation` block."""
     comps = ledger["components"]
     steady = sum(c["steady_mib"] for c in comps.values())
     heavy = comps["heavy_slot"]["peak_mib"] + comps["git_child"]["peak_mib"]
     overlap = sum(max(0, c["peak_mib"] - c["steady_mib"]) for n, c in comps.items()
                   if n not in ("heavy_slot", "git_child", "margin") and not c.get("peak_in_heavy_slot"))
-    design_by_proc = collections.defaultdict(lambda: [0.0, 0.0])
-    for c in comps.values():
-        if c.get("process"):
-            design_by_proc[c["process"]][0] += c["steady_mib"]
-            design_by_proc[c["process"]][1] += c["peak_mib"]
-    ws_by_proc = collections.defaultdict(float)
-    unassigned = []
+    design = design_lines(ledger)
+    ws_by_proc, ws_names, unassigned = collections.defaultdict(float), collections.defaultdict(list), []
     for wid, w in ledger["workstreams"].items():
         if w.get("line_mib") is None:
             unassigned.append(wid)
             continue
         if w.get("process"):
             ws_by_proc[w["process"]] += w["line_mib"]
-    ref = (ledger.get("reference_measurement") or {}).get("component_p50_mib") or {}
+            if w["line_mib"]:
+                ws_names[w["process"]].append(wid)
+    ref = ledger.get("reference_measurement") or {}
+    if measured:
+        source, cur_p50 = measured["source"], measured["component_p50_mib"]
+    else:
+        source = f"reference_measurement ({ref.get('scenario')}, {ref.get('platform')}, {ref.get('date')})"
+        cur_p50 = ref.get("component_p50_mib") or {}
     rows = []
-    for proc in sorted(set(design_by_proc) | set(ws_by_proc)):
-        d_steady, d_peak = design_by_proc.get(proc, [0.0, 0.0])
-        cur = ref.get(proc)
+    for proc in sorted(set(design) | set(ws_by_proc)):
+        d = design.get(proc, {"steady": 0.0, "peak": 0.0})
+        cur = cur_p50.get(proc, 0.0 if measured else None)  # absent from a measured run: that process used nothing
         projected = None if cur is None else round(cur + ws_by_proc.get(proc, 0.0), 1)
-        rows.append({"process": proc, "design_steady_mib": round(d_steady, 1), "design_peak_mib": round(d_peak, 1),
-                     "workstream_lines_mib": round(ws_by_proc.get(proc, 0.0), 1), "reference_p50_mib": cur,
-                     "projected_steady_mib": projected,
-                     "over_design_steady": None if projected is None else projected > d_steady})
+        rows.append({"process": proc, "design_steady_mib": round(d["steady"], 1), "design_peak_mib": round(d["peak"], 1),
+                     "workstream_lines_mib": round(ws_by_proc.get(proc, 0.0), 1), "workstreams": ws_names.get(proc, []),
+                     "measured_p50_mib": cur, "projected_steady_mib": projected,
+                     "over_design_steady": projected is not None and projected > d["steady"],
+                     "overcommit_mib": None if projected is None else round(projected - d["steady"], 1)})
+    sub = ledger.get("go_daemon_suballocation") or {}
+    items_spec = sub.get("items") or {}
+    by_item = collections.defaultdict(list)
+    for wid, w in ledger["workstreams"].items():
+        if w.get("process") == "go_daemon":
+            by_item[w.get("item") or "unallocated"].append((wid, w.get("line_mib")))
+    items = []
+    for name in list(items_spec) + sorted(k for k in by_item if k not in items_spec):
+        spec = items_spec.get(name) or {}
+        lines = by_item.get(name, [])
+        total = round(sum(v for _, v in lines if v is not None), 1)
+        alloc = spec.get("mib")
+        feature = spec.get("kind", "feature") == "feature"
+        items.append({"item": name, "allocation_mib": alloc, "kind": spec.get("kind", "feature" if alloc is not None else "none"),
+                      "workstream_lines_mib": total, "workstreams": [w for w, v in lines if v],
+                      "over": feature and total > (alloc or 0.0)})
     limit = ledger["gate"]["limit_bytes"] / MIB
     return {
+        "status": (ledger.get("reconciliation") or {}).get("status", "open"),
+        "measured_from": source,
         "design_steady_mib": round(steady, 1),
         "design_peak_mib_7_2_method": round(steady + heavy, 1),
         "design_peak_mib_with_query_overlap": round(steady + heavy + overlap, 1),
@@ -1279,70 +1330,270 @@ def ledger_reconcile(ledger):
         "fits_7_2_method": steady + heavy <= limit,
         "fits_with_query_overlap": steady + heavy + overlap <= limit,
         "per_process": rows,
+        "over_design": [r["process"] for r in rows if r["over_design_steady"]],
+        "go_daemon_items": items,
+        "go_daemon_items_over": [i["item"] for i in items if i["over"]],
         "workstreams_without_a_line": unassigned,
         "note": ("7.2 method: steady subtotal + heavy slot + git child. With query overlap: resident components "
-                 "also at their peak while the heavy slot runs (critic §12.4). Projected = reference measurement "
-                 "p50 + the sum of workstream lines placed on that process."),
+                 "also at their peak while the heavy slot runs (critic §12.4). Projected = measured p50 + the sum "
+                 "of workstream lines placed on that process. go_daemon_items: §7.3 targets against the lines "
+                 "placed on them; a base item's allocation is today's daemon, so it is not compared."),
     }
 
 
-def ledger_check(ledger, workstream, head, base):
-    """Fail when a workstream's measured delta exceeds its ledger line (plus tolerance).
+def median(values):
+    vals = [v for v in values if v is not None]
+    return round(statistics.median(vals), 2) if vals else None
 
-    head/base: ledger_view() of two reports measured on the same machine. The tree-peak
-    delta and the p50 delta of the workstream's process (footprint when both reports have
-    it, else RSS) are both checked; a negative line (a saving) must actually be delivered.
-    No common valid scenario is a failure."""
-    tol = ledger["tolerance"]
-    w = ledger["workstreams"].get(workstream)
-    if w is None:
-        line, proc, why = ledger.get("default_line_mib", 0.0), None, "not in the ledger: default line"
-    else:
-        line, proc, why = w.get("line_mib"), w.get("process"), w.get("title", "")
-        if line is None:
-            line, why = 0.0, "no line declared in the ledger (treated as 0 until one is set)"
-    results, ok = [], True
-    for sc in sorted(set(head) & set(base)):
-        h, b = head[sc], base[sc]
-        d_tree = round(h["gate_peak_mib"] - b["gate_peak_mib"], 2)
-        row = {"scenario": sc, "line_mib": line, "tree_peak_delta_mib": d_tree,
-               "tree_allowed_mib": round(line + tol["tree_peak_mib"], 2)}
-        row["tree_ok"] = d_tree <= line + tol["tree_peak_mib"]
-        if proc:
-            # The process check compares private memory (footprint p50: phys_footprint on
-            # macOS, PSS on Linux) when both runs have it: RSS p50 of a Go process on macOS
-            # moves with lazily reclaimed and compressed pages. RSS p50 is the fallback.
-            hf = (h.get("components_footprint_p50_mib") or {}).get(proc)
-            bf = (b.get("components_footprint_p50_mib") or {}).get(proc)
-            hr = h.get("components_p50_mib", {}).get(proc, 0.0) or 0.0
-            br = b.get("components_p50_mib", {}).get(proc, 0.0) or 0.0
-            use_fp = hf is not None and bf is not None
-            delta = (hf - bf) if use_fp else (hr - br)
-            row.update(process=proc, process_basis="footprint p50" if use_fp else "RSS p50",
-                       process_p50_delta_mib=round(delta, 2), process_rss_p50_delta_mib=round(hr - br, 2),
-                       process_allowed_mib=round(line + tol["component_p50_mib"], 2))
-            row["process_ok"] = delta <= line + tol["component_p50_mib"]
-        row["ok"] = row["tree_ok"] and row.get("process_ok", True)
-        ok = ok and row["ok"]
-        results.append(row)
-    if not results:
-        ok = False
-    return {"workstream": workstream, "line_mib": line, "process": proc, "why": why, "tolerance": tol,
-            "rows": results, "passed": ok,
-            "note": "no common scenario between head and base" if not results else None}
+
+def run_digest(r):
+    """The numbers of one scenario run that repeats and the ledger compare."""
+    s = r.get("sampler") or {}
+    comps = s.get("components") or {}
+    g = r.get("gate") or {}
+    return {"gate_peak_mib": g.get("peak_mib"), "verdict": g.get("verdict"), "valid": bool(g.get("valid")),
+            "tree_all_peak_mib": s.get("tree_all_peak_mib"),
+            "v1_difference_mib": (r.get("v1_crosscheck") or {}).get("difference_mib"),
+            "components_p50_mib": {c: v["p50_mib"] for c, v in comps.items()},
+            "components_footprint_p50_mib": {c: v.get("footprint_p50_mib") for c, v in comps.items()},
+            "components_peak_mib": {c: v["peak_mib"] for c, v in comps.items()},
+            "externals_peak_mib": {c: v["peak_mib"] for c, v in (s.get("externals") or {}).items()}}
 
 
 def ledger_view(report):
-    """{scenario: {gate_peak_mib, components_p50_mib}} from a v2 report, for ledger_check."""
+    """{scenario: medians over the valid runs} for ledger_check: gate peak, owned+external
+    tree peak, per-component RSS p50, footprint p50 and peak, and per-external peak. With
+    repeats, every metric is the median of its own values over the valid repeats (one
+    broken repeat drops out instead of removing the scenario). A scenario with no valid
+    run is left out."""
     out = {}
     for sc, r in report.get("scenarios", {}).items():
-        if r.get("status") != "ran" or not (r.get("gate") or {}).get("valid"):
+        if r.get("status") != "ran":
             continue
-        comps = r["sampler"]["components"]
-        out[sc] = {"gate_peak_mib": r["gate"]["peak_mib"],
-                   "components_p50_mib": {c: v["p50_mib"] for c, v in comps.items()},
-                   "components_footprint_p50_mib": {c: v.get("footprint_p50_mib") for c, v in comps.items()}}
+        rep = r.get("repeats") or {}
+        if rep.get("detail"):
+            runs = [d for d in rep["detail"] if d.get("valid", d.get("verdict") != "INVALID")]
+        else:
+            runs = [run_digest(r)] if (r.get("gate") or {}).get("valid") else []
+        if not runs:
+            continue
+
+        def per(key, default=None):
+            names = sorted(set().union(*[set(d.get(key) or {}) for d in runs]))
+            return {c: median([(d.get(key) or {}).get(c, default) for d in runs]) for c in names}
+
+        out[sc] = {"valid_runs": len(runs), "gate_peak_mib": median([d.get("gate_peak_mib") for d in runs]),
+                   "tree_all_peak_mib": median([d.get("tree_all_peak_mib") for d in runs]),
+                   "components_p50_mib": per("components_p50_mib", 0.0),
+                   "components_footprint_p50_mib": per("components_footprint_p50_mib"),
+                   "components_peak_mib": per("components_peak_mib", 0.0),
+                   "externals_peak_mib": per("externals_peak_mib", 0.0)}
     return out
+
+
+def component_delta(h, b, c):
+    """(delta, basis, RSS delta) of component c between two views: footprint p50 (private
+    memory) when both have it, else RSS p50. RSS p50 of a Go process on macOS moves with
+    lazily reclaimed and compressed pages, so it is the fallback."""
+    hf = (h.get("components_footprint_p50_mib") or {}).get(c)
+    bf = (b.get("components_footprint_p50_mib") or {}).get(c)
+    hr = (h.get("components_p50_mib") or {}).get(c) or 0.0
+    br = (b.get("components_p50_mib") or {}).get(c) or 0.0
+    if hf is not None and bf is not None:
+        return round(hf - bf, 2), "footprint p50", round(hr - br, 2)
+    return round(hr - br, 2), "RSS p50", round(hr - br, 2)
+
+
+def workstream_line(ledger, workstream):
+    """(line MiB, process, designated scenarios, why) of a workstream id."""
+    w = ledger["workstreams"].get(workstream)
+    if w is None:
+        return ledger.get("default_line_mib", 0.0), None, [], "not in the ledger: default line"
+    line, why = w.get("line_mib"), w.get("title", "")
+    if line is None:
+        line, why = 0.0, "no line declared in the ledger (treated as 0 until one is set)"
+    return line, w.get("process"), list(w.get("scenarios") or []), why
+
+
+def ledger_check(ledger, workstream, head, base):
+    """Check a workstream's measured delta (head minus base: ledger_view() of two reports
+    measured on one machine) against its ledger line.
+
+    Checks per common scenario, each failing the workstream:
+      * tree: owned gate-peak delta <= line + tolerance.tree_peak_mib;
+      * tree_all: owned+external peak delta <= the same allowance (moving work into an
+        external process is never a saving, §7.6);
+      * process: the workstream's process p50 delta (footprint when both reports have it,
+        else RSS) <= line + that process's p50 tolerance;
+      * other components: every other owned component's p50 delta <= the default line (0)
+        + its tolerance, so a workstream cannot grow a process that is not its own;
+      * design (cumulative): every process that was within its §7.2 design line at the
+        ledger's reference must stay within it: head p50 (footprint when present, else
+        RSS) <= design steady + tolerance. Many small in-tolerance deltas still fail once
+        they add up past the design line.
+    A negative delta counts as a saving only net of external growth. A workstream's line
+    applies as declared on its designated scenarios (`scenarios`, all when none are
+    named); elsewhere only as a ceiling (max(line, 0)), so a saving a scenario cannot show
+    is not demanded there.
+
+    Verdicts: FAIL (blocking) when any check fails or no valid scenario is common.
+    NOT_CHECKABLE when designated scenarios exist and none was measured on both sides.
+    BELOW_RESOLUTION when every check held but |line| is below the tolerance of its check:
+    a line of 0.2 MiB, or a saving of 2 MiB, cannot be told apart from noise, so only the
+    absence of a larger overrun is established. PASS otherwise. A resolvable saving is
+    enforced to within the tolerance: it must show at least |line| - tolerance."""
+    tol = ledger["tolerance"]
+    t_tree = tol["tree_peak_mib"]
+    default = ledger.get("default_line_mib", 0.0)
+    line, proc, designated, why = workstream_line(ledger, workstream)
+    design = design_lines(ledger)
+    ref = (ledger.get("reference_measurement") or {}).get("component_p50_mib") or {}
+    rows = []
+    for sc in sorted(set(head) & set(base)):
+        h, b = head[sc], base[sc]
+        is_designated = not designated or sc in designated
+        line_here = line if is_designated else max(line, 0.0)
+        hx, bx = h.get("externals_peak_mib") or {}, b.get("externals_peak_mib") or {}
+        ext_growth = round(sum(max(0.0, v - (bx.get(c) or 0.0)) for c, v in hx.items()), 2)
+
+        def credited(d):
+            return d if d >= 0 else min(0.0, round(d + ext_growth, 2))
+
+        fails = []
+        row = {"scenario": sc, "designated": is_designated, "line_mib": line_here,
+               "externals_new": sorted(set(hx) - set(bx)), "external_growth_mib": ext_growth}
+        d_tree = round(h["gate_peak_mib"] - b["gate_peak_mib"], 2)
+        allowed = round(line_here + t_tree, 2)
+        row["tree"] = {"delta_mib": d_tree, "credited_mib": credited(d_tree), "allowed_mib": allowed}
+        if credited(d_tree) > allowed:
+            fails.append(f"tree peak delta {credited(d_tree)} MiB > {allowed}")
+        if h.get("tree_all_peak_mib") is not None and b.get("tree_all_peak_mib") is not None:
+            d_all = round(h["tree_all_peak_mib"] - b["tree_all_peak_mib"], 2)
+            row["tree_all"] = {"delta_mib": d_all, "allowed_mib": allowed}
+            if d_all > allowed:
+                fails.append(f"owned+external peak delta {d_all} MiB > {allowed}")
+        comps = set(h.get("components_p50_mib") or {}) | set(b.get("components_p50_mib") or {})
+        if proc:
+            comps.add(proc)
+        others = []
+        for c in sorted(comps):
+            d, basis, d_rss = component_delta(h, b, c)
+            if c == proc:
+                allowed_c = round(line_here + component_tolerance(ledger, c), 2)
+                row["process"] = {"component": c, "basis": basis, "delta_mib": d, "credited_mib": credited(d),
+                                  "rss_delta_mib": d_rss, "allowed_mib": allowed_c}
+                if credited(d) > allowed_c:
+                    fails.append(f"{c} {basis} delta {credited(d)} MiB > {allowed_c}")
+            else:
+                allowed_c = round(default + component_tolerance(ledger, c), 2)
+                others.append({"component": c, "basis": basis, "delta_mib": d, "allowed_mib": allowed_c, "ok": d <= allowed_c})
+                if d > allowed_c:
+                    fails.append(f"{c} (not this workstream's process) {basis} delta {d} MiB > {allowed_c}")
+        row["other_components"] = others
+        des = []
+        for p, dl in sorted(design.items()):
+            grandfathered = ref.get(p) is not None and ref[p] > dl["steady"]
+            fp = (h.get("components_footprint_p50_mib") or {}).get(p)
+            cur = fp if fp is not None else ((h.get("components_p50_mib") or {}).get(p) or 0.0)
+            allowed_d = round(dl["steady"] + component_tolerance(ledger, p), 2)
+            ok = grandfathered or cur <= allowed_d
+            des.append({"process": p, "p50_mib": cur, "basis": "footprint p50" if fp is not None else "RSS p50",
+                        "design_steady_mib": dl["steady"], "allowed_mib": allowed_d, "grandfathered": grandfathered, "ok": ok})
+            if not ok:
+                fails.append(f"{p} p50 {cur} MiB is over its design line {dl['steady']} + tolerance (accumulated lines)")
+        row["design"] = des
+        row["failures"] = fails
+        row["ok"] = not fails
+        rows.append(row)
+    proc_tol = component_tolerance(ledger, proc) if proc else t_tree
+    resolvable = line != 0 and abs(line) >= proc_tol
+    measured_designated = [r["scenario"] for r in rows if r["designated"]]
+    if not rows:
+        verdict, note = "FAIL", "no common valid scenario between head and base"
+    elif not all(r["ok"] for r in rows):
+        verdict, note = "FAIL", "; ".join(f"{r['scenario']}: {f}" for r in rows for f in r["failures"])
+    elif designated and not measured_designated:
+        verdict, note = "NOT_CHECKABLE", (f"the line is measured on {designated}, which did not run on both sides; "
+                                          "the generic checks held")
+    elif not resolvable:
+        verdict, note = "BELOW_RESOLUTION", (f"every check held, but the line ({line} MiB) is smaller than the "
+                                             f"{proc_tol} MiB tolerance, so it is not verified")
+    else:
+        verdict, note = "PASS", None
+    return {"workstream": workstream, "line_mib": line, "process": proc, "scenarios_designated": designated, "why": why,
+            "tolerance": tol, "rows": rows, "verdict": verdict, "blocking": verdict == "FAIL", "note": note}
+
+
+def design_comparison(ledger, view):
+    """This run's processes against the §7.2 design lines per scenario (medians of the
+    valid repeats). Report only; ledger_check's design check is the blocking form."""
+    design = design_lines(ledger)
+    out = {}
+    for sc, v in view.items():
+        rows = []
+        for p, dl in sorted(design.items()):
+            rss = (v.get("components_p50_mib") or {}).get(p)
+            fp = (v.get("components_footprint_p50_mib") or {}).get(p)
+            peak = (v.get("components_peak_mib") or {}).get(p)
+            basis = fp if fp is not None else rss
+            rows.append({"process": p, "design_steady_mib": round(dl["steady"], 1), "design_peak_mib": round(dl["peak"], 1),
+                         "rss_p50_mib": rss, "footprint_p50_mib": fp, "rss_peak_mib": peak,
+                         "steady_over": basis is not None and basis > dl["steady"],
+                         "peak_over": peak is not None and peak > dl["peak"]})
+        out[sc] = rows
+    return out
+
+
+LEDGER_PROSE_KEYS = frozenset({"about", "basis", "note", "title"})
+ABSENT = "<absent>"
+
+
+def ledger_diff(base, head):
+    """Every non-prose value that differs between two ledgers (lines, processes,
+    designated scenarios, tolerances, design lines, roles, the reference measurement).
+    CI judges a pull request by its base's ledger, and fails when the pull request
+    changes any of these without the maintainer's budget-ledger-change label."""
+    out = []
+
+    def strip(v):
+        if isinstance(v, dict):
+            return {k: strip(x) for k, x in v.items() if k not in LEDGER_PROSE_KEYS}
+        if isinstance(v, list):
+            return [strip(x) for x in v]
+        return v
+
+    def walk(path, a, b):
+        if isinstance(a, dict) and isinstance(b, dict):
+            for k in sorted(set(a) | set(b)):
+                walk(f"{path}.{k}" if path else k, a.get(k, ABSENT), b.get(k, ABSENT))
+        elif a != b:
+            out.append({"path": path, "base": a, "head": b})
+
+    walk("", strip(base), strip(head))
+    return out
+
+
+BRANCH_WORKSTREAM = re.compile(r"(?:^|/)ws-?(\d{2})(?!\d)", re.IGNORECASE)
+
+
+def workstream_from_branch(ref):
+    """WS-NN from a branch name whose path segment starts with ws-NN or wsNN
+    (parity/ws-13, ws13-http); None otherwise (feature/news2024, fix/draws-12, ws-100)."""
+    m = BRANCH_WORKSTREAM.search(ref or "")
+    return f"WS-{m.group(1)}" if m else None
+
+
+def ci_plan(ledger, fixtures, branch):
+    """What CI measures for a branch: its workstream, the CI suite plus the scenarios the
+    workstream's line is measured on, and whether any needs the pinned upstream fixtures."""
+    ws = workstream_from_branch(branch) or "unlisted"
+    names = [n for n, sc in SCENARIOS.items() if "ci" in sc["suites"]]
+    for n in (ledger["workstreams"].get(ws) or {}).get("scenarios") or []:
+        if n not in names:
+            names.append(n)
+    upstream = set(fixtures["fixtures"]) | set(fixtures.get("composites", {}))
+    needs = any(set(SCENARIOS[n].get("fixtures") or [SCENARIOS[n].get("fixture")]) & upstream for n in names)
+    return {"workstream": ws, "scenarios": names, "fixtures": needs}
 
 
 # --------------------------------------------------------------------------------------
@@ -2124,6 +2375,9 @@ def render_markdown(report):
         if r["gate"]["invalid_reasons"]:
             L.append("")
             L.append("Invalid because: " + "; ".join(r["gate"]["invalid_reasons"]))
+        if r["gate"].get("repeat_note"):
+            L.append("")
+            L.append(f"Repeats: {r['gate']['repeat_note']}.")
         if not s:
             continue
         L.append("")
@@ -2201,25 +2455,58 @@ def render_markdown(report):
     L.append("## Budget ledger")
     if lc:
         L.append("")
-        L.append(f"Workstream {lc['workstream']} (line {lc['line_mib']} MiB on `{lc['process']}`): **{'PASS' if lc['passed'] else 'FAIL'}**.")
+        L.append(f"Workstream {lc['workstream']} (line {lc['line_mib']} MiB on `{lc['process']}`"
+                 + (f", measured on {', '.join(lc['scenarios_designated'])}" if lc.get("scenarios_designated") else "")
+                 + f"): **{lc['verdict']}**" + (f" ({lc['note']})" if lc.get("note") else "") + ".")
         L.append("")
-        L.append("| Scenario | Tree peak delta MiB | Allowed | Process delta MiB (basis) | Allowed | Process RSS p50 delta MiB |")
-        L.append("|---|---|---|---|---|---|")
+        L.append("| Scenario | Line MiB | Tree delta (allowed) | Owned+external delta | External growth | "
+                 "Process delta, basis (allowed) | Other components over | Design lines over |")
+        L.append("|---|---|---|---|---|---|---|---|")
         for row in lc["rows"]:
-            L.append(f"| {row['scenario']} | {row['tree_peak_delta_mib']} | {row['tree_allowed_mib']} | "
-                     f"{fmt(row.get('process_p50_delta_mib'))} ({row.get('process_basis', '–')}) | {fmt(row.get('process_allowed_mib'))} | "
-                     f"{fmt(row.get('process_rss_p50_delta_mib'))} |")
+            pr = row.get("process")
+            proc_cell = f"{pr['credited_mib']}, {pr['basis']} ({pr['allowed_mib']})" if pr else "–"
+            others = [f"{o['component']} {o['delta_mib']}" for o in row.get("other_components", []) if not o["ok"]] or ["none"]
+            design = [f"{d['process']} {d['p50_mib']}/{d['design_steady_mib']}" for d in row.get("design", []) if not d["ok"]] or ["none"]
+            ta = row.get("tree_all")
+            L.append(f"| {row['scenario']}{'' if row['designated'] else ' (ceiling only)'} | {row['line_mib']} | "
+                     f"{row['tree']['credited_mib']} ({row['tree']['allowed_mib']}) | {fmt(ta and ta['delta_mib'])} | "
+                     f"{row['external_growth_mib']}{(' new: ' + ', '.join(row['externals_new'])) if row['externals_new'] else ''} | "
+                     f"{proc_cell} | {'; '.join(others)} | {'; '.join(design)} |")
+    dc = report.get("design_comparison")
+    if dc:
+        L.append("")
+        L.append("Measured against the §7.2 design lines (this run, medians of the valid repeats; the steady test uses "
+                 "footprint p50 when present, else RSS p50):")
+        L.append("")
+        L.append("| Scenario | Process | RSS p50 | Footprint p50 | Design steady | RSS peak | Design peak |")
+        L.append("|---|---|---|---|---|---|---|")
+        for sc, rows in dc.items():
+            for d in rows:
+                if d["rss_p50_mib"] is None and d["rss_peak_mib"] is None:
+                    continue
+                L.append(f"| {sc} | {d['process']} | {fmt(d['rss_p50_mib'])} | {fmt(d['footprint_p50_mib'])} | "
+                         f"{d['design_steady_mib']}{' **over**' if d['steady_over'] else ''} | {fmt(d['rss_peak_mib'])} | "
+                         f"{d['design_peak_mib']}{' **over**' if d['peak_over'] else ''} |")
     rec = report.get("ledger_reconcile")
     if rec:
         L.append("")
-        L.append(f"Design lines (§7.2): steady {rec['design_steady_mib']} MiB; peak {rec['design_peak_mib_7_2_method']} MiB by the §7.2 method, "
-                 f"{rec['design_peak_mib_with_query_overlap']} MiB with query peaks overlapping the heavy slot; gate {rec['gate_mib']} MiB.")
+        L.append(f"Reconciliation ({rec['status']}): design steady {rec['design_steady_mib']} MiB; peak {rec['design_peak_mib_7_2_method']} MiB "
+                 f"by the §7.2 method, {rec['design_peak_mib_with_query_overlap']} MiB with query peaks overlapping the heavy slot; "
+                 f"gate {rec['gate_mib']} MiB. Measured from {rec['measured_from']}."
+                 + (f" Projected over the design line: {', '.join(rec['over_design'])}." if rec["over_design"] else ""))
         L.append("")
-        L.append("| Process | Design steady | Design peak | Workstream lines | Reference p50 | Projected steady |")
-        L.append("|---|---|---|---|---|---|")
+        L.append("| Process | Design steady | Design peak | Workstream lines | Measured p50 | Projected steady | Overcommit |")
+        L.append("|---|---|---|---|---|---|---|")
         for row in rec["per_process"]:
             L.append(f"| {row['process']} | {row['design_steady_mib']} | {row['design_peak_mib']} | {row['workstream_lines_mib']} | "
-                     f"{fmt(row['reference_p50_mib'])} | {fmt(row['projected_steady_mib'])} |")
+                     f"{fmt(row['measured_p50_mib'])} | {fmt(row['projected_steady_mib'])} | {fmt(row['overcommit_mib'])} |")
+        if rec.get("go_daemon_items"):
+            L.append("")
+            L.append("| §7.3 go_daemon item | Allocation | Workstream lines | Workstreams |")
+            L.append("|---|---|---|---|")
+            for it in rec["go_daemon_items"]:
+                L.append(f"| {it['item']} ({it['kind']}) | {fmt(it['allocation_mib'])} | {it['workstream_lines_mib']}"
+                         f"{' **over**' if it['over'] else ''} | {', '.join(it['workstreams']) or '–'} |")
     L.append("")
     L.append("## Not measured")
     L.append("")
@@ -2253,28 +2540,40 @@ def select_scenarios(args):
     return [n for n, sc in SCENARIOS.items() if args.suite in sc["suites"]]
 
 
+VERDICT_SEVERITY = {"PASS": 0, "INVALID": 1, "FAIL": 2}
+
+
 def median_report(runs):
-    """Fold repeated runs of one scenario: the run with the median gate peak is kept,
-    and every run's peak is listed."""
-    ok = [r for r in runs if r.get("status") == "ran"]
-    if len(ok) <= 1:
-        return runs[0]
-    ok.sort(key=lambda r: r["gate"]["peak_bytes"])
-    mid = ok[len(ok) // 2]
-    mid = dict(mid)
-    mid["repeats"] = {"runs": len(runs), "gate_peak_mib": [r["gate"]["peak_mib"] for r in ok],
-                      "verdicts": [r["gate"]["verdict"] for r in ok],
-                      "detail": [{"gate_peak_mib": r["gate"]["peak_mib"], "verdict": r["gate"]["verdict"],
-                                  "v1_difference_mib": (r.get("v1_crosscheck") or {}).get("difference_mib"),
-                                  "components_p50_mib": {c: v["p50_mib"] for c, v in ((r.get("sampler") or {}).get("components") or {}).items()},
-                                  "components_footprint_p50_mib": {c: v.get("footprint_p50_mib") for c, v in ((r.get("sampler") or {}).get("components") or {}).items()},
-                                  "components_peak_mib": {c: v["peak_mib"] for c, v in ((r.get("sampler") or {}).get("components") or {}).items()}}
-                                 for r in ok]}
-    if any(r["gate"]["verdict"] != "PASS" for r in ok):
-        worst = next(r for r in ok if r["gate"]["verdict"] != "PASS")
-        mid["gate"] = dict(mid["gate"], verdict=worst["gate"]["verdict"], passed=False,
-                           invalid_reasons=mid["gate"]["invalid_reasons"] + [f"a repeat was {worst['gate']['verdict']}"])
-    return mid
+    """Fold repeated runs of one scenario.
+
+    The kept run is the median-peak run among the valid runs; an invalid run is kept only
+    when no run is valid, so a broken repeat neither becomes the measurement nor shifts it.
+    Any non-PASS repeat still fails the scenario: the folded verdict is the most severe
+    repeat verdict (FAIL over INVALID) and gate.valid follows it. repeats.detail lists
+    every run; the ledger compares per-metric medians over the valid runs (ledger_view)."""
+    ran = sorted((r for r in runs if r.get("status") == "ran"), key=lambda r: r["gate"]["peak_bytes"])
+    if len(ran) <= 1:
+        return ran[0] if ran else runs[0]
+    valid = [r for r in ran if r["gate"].get("valid")]
+    pool = valid or ran
+    kept = pool[len(pool) // 2]
+    folded = dict(kept)
+    verdicts = [r["gate"]["verdict"] for r in ran]
+    folded["repeats"] = {"runs": len(runs), "valid_runs": len(valid), "gate_peak_mib": [r["gate"]["peak_mib"] for r in ran],
+                         "verdicts": verdicts,
+                         "kept": "median-peak run among the valid runs" if valid else "median-peak run (no run was valid)",
+                         "detail": [dict(run_digest(r), kept=r is kept) for r in ran]}
+    bad = [v for v in verdicts if v != "PASS"]
+    if bad:
+        worst = max(bad, key=lambda v: VERDICT_SEVERITY.get(v, 1))
+        gate = dict(kept["gate"], verdict=worst, passed=False, valid=worst != "INVALID")
+        note = f"repeat verdicts {verdicts} (peaks {folded['repeats']['gate_peak_mib']} MiB): a repeat was {worst}"
+        if worst == "INVALID":
+            gate["invalid_reasons"] = list(kept["gate"]["invalid_reasons"]) + [note]
+        else:
+            gate["repeat_note"] = note
+        folded["gate"] = gate
+    return folded
 
 
 def cmd_run(args):
@@ -2334,17 +2633,24 @@ def cmd_run(args):
             shutil.rmtree(work, ignore_errors=True)
     report["verdict"] = overall_verdict(report)
     report["parity_claim"] = parity_claim(report, fixtures)
-    report["ledger_reconcile"] = ledger_reconcile(ledger)
+    view = ledger_view(report)
+    ref_sc = (ledger.get("reference_measurement") or {}).get("scenario")
+    measured = ({"source": f"this run ({ref_sc}, median of {view[ref_sc]['valid_runs']} valid run(s))",
+                 "component_p50_mib": view[ref_sc]["components_p50_mib"]} if ref_sc in view else None)
+    report["ledger_reconcile"] = ledger_reconcile(ledger, measured)
+    report["design_comparison"] = design_comparison(ledger, view)
+    report["ledger_path"] = os.path.abspath(args.ledger)
     if args.workstream:
-        report["ledger_check"] = ledger_check(ledger, args.workstream, ledger_view(report), ledger_view(base))
+        report["ledger_check"] = ledger_check(ledger, args.workstream, view, ledger_view(base))
         report["ledger_check"]["baseline_head"] = (base.get("provenance") or {}).get("head")
     write_reports(report, out_dir)
     code = 0 if report["verdict"] == "PASS" else 1
-    if report.get("ledger_check") and not report["ledger_check"]["passed"]:
+    if report.get("ledger_check") and report["ledger_check"]["blocking"]:
         code = 1
     if args.require_parity_claim and not report["parity_claim"]["established"]:
         code = 1
     print(json.dumps({"verdict": report["verdict"], "parity_claim": report["parity_claim"]["established"],
+                      "ledger_check": (report.get("ledger_check") or {}).get("verdict"),
                       "scenarios": {n: (r.get("gate") or {}).get("verdict", r.get("status")) for n, r in report["scenarios"].items()},
                       "report": os.path.join(out_dir, "report.json")}))
     return code
@@ -2380,12 +2686,34 @@ def cmd_fixtures(args):
 
 
 def cmd_ledger(args):
+    """Reconcile (exit 1 while any process is projected over its design line), check a
+    workstream between two reports (exit 1 on FAIL), or diff against a base ledger (exit 1
+    on any governance-relevant change)."""
     ledger = load_json(args.ledger)
+    if args.diff:
+        changes = ledger_diff(load_json(args.diff), ledger)
+        print(json.dumps({"base": os.path.abspath(args.diff), "head": os.path.abspath(args.ledger), "changes": changes}, indent=1))
+        return 1 if changes else 0
     if args.workstream:
+        if not (args.head and args.baseline):
+            raise SystemExit("ledger --workstream needs --head and --baseline report.json files")
         chk = ledger_check(ledger, args.workstream, ledger_view(load_json(args.head)), ledger_view(load_json(args.baseline)))
         print(json.dumps(chk, indent=1))
-        return 0 if chk["passed"] else 1
-    print(json.dumps(ledger_reconcile(ledger), indent=1))
+        return 1 if chk["blocking"] else 0
+    rec = ledger_reconcile(ledger)
+    print(json.dumps(rec, indent=1))
+    if rec["over_design"]:
+        print(f"reconciliation {rec['status']}: projected over the design line: {rec['over_design']}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def cmd_ci_plan(args):
+    """key=value lines for $GITHUB_OUTPUT: workstream, scenarios, fixtures."""
+    plan = ci_plan(load_json(args.ledger), load_json(FIXTURES_PATH), args.branch)
+    print(f"workstream={plan['workstream']}")
+    print(f"scenarios={','.join(plan['scenarios'])}")
+    print(f"fixtures={'true' if plan['fixtures'] else 'false'}")
     return 0
 
 
@@ -2422,16 +2750,21 @@ def main(argv=None):
     f.add_argument("--names")
     f.add_argument("--fixture-cache")
     f.add_argument("--compute-pins", action="store_true", help="build without workspace pins and print the values to pin")
-    lg = sub.add_parser("ledger", help="reconcile the ledger, or check a workstream delta between two reports")
+    lg = sub.add_parser("ledger", help="reconcile the ledger, check a workstream delta between two reports, or diff two ledgers")
     lg.add_argument("--ledger", default=LEDGER_PATH)
     lg.add_argument("--workstream")
     lg.add_argument("--head")
     lg.add_argument("--baseline")
+    lg.add_argument("--diff", metavar="BASE_LEDGER", help="list governance-relevant changes from BASE_LEDGER to --ledger")
+    cp = sub.add_parser("ci-plan", help="workstream, scenarios and fixture need for a branch (key=value lines)")
+    cp.add_argument("--branch", required=True)
+    cp.add_argument("--ledger", default=LEDGER_PATH)
     rd = sub.add_parser("render", help="render report.md from a report.json")
     rd.add_argument("report")
     rd.add_argument("--md")
     args = ap.parse_args(argv)
-    return {"run": cmd_run, "fixtures": cmd_fixtures, "ledger": cmd_ledger, "render": cmd_render}[args.cmd](args)
+    return {"run": cmd_run, "fixtures": cmd_fixtures, "ledger": cmd_ledger, "ci-plan": cmd_ci_plan,
+            "render": cmd_render}[args.cmd](args)
 
 
 if __name__ == "__main__":
