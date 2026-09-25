@@ -55,9 +55,17 @@ func WorkspaceSearchWithFeedbackCtx(ctx context.Context, dataDir, workspaceID, q
 	if err != nil {
 		return nil, err
 	}
+	return fuseSearchFeedback(dataDir, workspaceID, raw), nil
+}
+
+// fuseSearchFeedback re-ranks a raw search result with the feedback boost and
+// buffers a retrieval signal for the top hits. Recording only enqueues in memory
+// (feedback_recorder.go), so the search never waits on the feedback store. Returns
+// raw unchanged if it can't parse or has no hits.
+func fuseSearchFeedback(dataDir, workspaceID string, raw json.RawMessage) json.RawMessage {
 	var res searchResult
 	if err := json.Unmarshal(raw, &res); err != nil || len(res.Hits) == 0 {
-		return raw, nil //nolint:nilerr
+		return raw
 	}
 	res.Hits = applyFeedbackToHits(dataDir, workspaceID, res.Hits)
 	// record retrieval for the top results (the slice the agent actually sees).
@@ -69,12 +77,12 @@ func WorkspaceSearchWithFeedbackCtx(ctx context.Context, dataDir, workspaceID, q
 	for _, h := range top {
 		paths = append(paths, h.Path)
 	}
-	_ = RecordFeedback(dataDir, workspaceID, "retrieval", paths)
-	out, merr := json.Marshal(res)
-	if merr != nil {
-		return raw, nil
+	feedbackRec.enqueue(dataDir, workspaceID, "retrieval", paths)
+	out, err := json.Marshal(res)
+	if err != nil {
+		return raw
 	}
-	return out, nil
+	return out
 }
 
 type searchHit struct {

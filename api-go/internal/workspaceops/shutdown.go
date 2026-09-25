@@ -5,19 +5,21 @@ import (
 )
 
 // ShutdownInFlight performs a workload-aware drain AFTER HTTP admissions have stopped
-// (srv.Shutdown). Order matters: persist+reap in-flight runs, close terminals, then
-// flush the Postgres mirror so the durable interrupted states reach PG before the pool
-// closes. The caller closes the PG pool afterward. Every step is best-effort and bounded
-// so shutdown can't hang.
+// (srv.Shutdown). Order matters: persist+reap in-flight runs, close terminals, persist
+// buffered search feedback, then flush the Postgres mirror so the durable interrupted
+// states reach PG before the pool closes. The caller closes the PG pool afterward. Every
+// step is best-effort and bounded so shutdown can't hang.
 //
-//   1. each live run: durably mark it `interrupted` (under the run transaction, so JSON +
-//      the PG mirror converge) and signal its process group, so a restart never re-attaches
-//      to or double-launches an orphaned worker.
-//   2. each terminal: mark closed, terminate the shell, close the PTY.
-//   3. flush the inline PG mirror workers so the interrupted run snapshots are mirrored.
+//  1. each live run: durably mark it `interrupted` (under the run transaction, so JSON +
+//     the PG mirror converge) and signal its process group, so a restart never re-attaches
+//     to or double-launches an orphaned worker.
+//  2. each terminal: mark closed, terminate the shell, close the PTY.
+//  3. merge the coalesced search-retrieval feedback into each workspace's store.
+//  4. flush the inline PG mirror workers so the interrupted run snapshots are mirrored.
 func ShutdownInFlight(dataDir string) {
 	interruptInFlightRuns(dataDir)
 	closeAllTerminals()
+	feedbackRec.flush()
 	PgInlineFlush()
 }
 
