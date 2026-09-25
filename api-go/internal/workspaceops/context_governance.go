@@ -717,6 +717,10 @@ func ProposeContext(dataDir, workspaceID string, req ProposeContextRequest) (*Co
 	if strings.TrimSpace(req.Content) == "" {
 		return nil, fmt.Errorf("content is required: %w", ErrInvalidInput)
 	}
+	anchors, err := confineAnchorPaths(dataDir, workspaceID, cleanPaths(req.Paths))
+	if err != nil {
+		return nil, err
+	}
 	permission := strings.ToLower(strings.TrimSpace(req.Permission))
 	if permission != "readwrite" {
 		permission = "readonly" // default to the safest permission
@@ -771,7 +775,7 @@ func ProposeContext(dataDir, workspaceID string, req ProposeContextRequest) (*Co
 		RequireVerification:   tighten,
 		CreatedAt:             now,
 		UpdatedAt:             now,
-		Paths:                 cleanPaths(req.Paths),
+		Paths:                 cleanPaths(anchors),
 	}
 	entry.SearchTokens = memoryTokenList(entry.Title + " " + entry.Content)
 	if selfNote != "" {

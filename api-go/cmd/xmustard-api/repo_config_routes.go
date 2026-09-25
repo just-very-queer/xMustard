@@ -8,7 +8,7 @@ import (
 	"xmustard/api-go/internal/workspaceops"
 )
 
-func registerRepoConfigRoutes(mux *http.ServeMux, dataDir string) {
+func registerRepoConfigRoutes(mux routeRegistrar, dataDir string) {
 	mux.HandleFunc("GET /api/workspaces/{workspace_id}/repo-config", func(w http.ResponseWriter, r *http.Request) {
 		workspaceID := r.PathValue("workspace_id")
 		result, err := workspaceops.ReadWorkspaceRepoConfig(dataDir, workspaceID)

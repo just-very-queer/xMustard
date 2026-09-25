@@ -858,6 +858,10 @@ func countByActorKind(activity []activityRecord, kind string) int {
 }
 
 func loadRun(dataDir string, workspaceID string, runID string) (*runRecord, error) {
+	// the run id names a file under runs/; the route gate checks it too
+	if err := validateSafeID("run", runID); err != nil {
+		return nil, err
+	}
 	path := filepath.Join(dataDir, "workspaces", workspaceID, "runs", runID+".json")
 	var run runRecord
 	if err := readJSON(path, &run); err != nil {

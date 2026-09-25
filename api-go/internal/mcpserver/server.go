@@ -8,6 +8,7 @@ package mcpserver
 import (
 	"context"
 	"encoding/json"
+	"net/http"
 	"os"
 	"strings"
 	"sync"
@@ -193,7 +194,7 @@ func (s *Session) Handle(ctx context.Context, method string, params json.RawMess
 	case "ping":
 		return map[string]any{}, nil
 	case "tools/list":
-		return s.ToolsList(), nil
+		return s.toolsList(s.callerTools(ctx)), nil
 	case "tools/call":
 		return s.callTool(ctx, params)
 	case "resources/list", "resources/templates/list", "resources/read":
@@ -260,14 +261,48 @@ func (s *Session) initialize(params json.RawMessage) (any, *RPCError) {
 	}, nil
 }
 
-// ToolsList is the tools/list result under the negotiated version.
-func (s *Session) ToolsList() map[string]any {
+// ToolsList is the tools/list result under the negotiated version, every tool listed.
+func (s *Session) ToolsList() map[string]any { return s.toolsList(nil) }
+
+// toolsList lists the tools in allowed, or every tool when allowed is nil.
+func (s *Session) toolsList(allowed map[string]bool) map[string]any {
 	v := s.Version()
 	list := []map[string]any{}
 	for _, t := range Tools() {
-		list = append(list, t.listEntry(v))
+		if allowed == nil || allowed[t.Name] {
+			list = append(list, t.listEntry(v))
+		}
 	}
 	return map[string]any{"tools": list}
+}
+
+// callerToolsTimeout bounds the tools/list posture lookup so a slow API can't stall
+// session start; on any failure the full list is advertised (the API still enforces).
+const callerToolsTimeout = 2 * time.Second
+
+// callerTools asks the API which tools this caller can use on this deployment
+// (GET /api/auth/whoami "tools": the caller's roles, read-only mode, disabled tools
+// and profile applied), so tools/list does not offer remember/verify under a reader
+// token or in read-only mode. It returns nil when the API can't say (unreachable, an
+// older API without the field), and tools/list then advertises every tool.
+func (s *Session) callerTools(ctx context.Context) map[string]bool {
+	ctx, cancel := context.WithTimeout(ctx, callerToolsTimeout)
+	defer cancel()
+	resp, err := s.srv.opts.Backend.Do(ctx, Request{Method: http.MethodGet, Path: "/api/auth/whoami"})
+	if err != nil || resp.Status != http.StatusOK {
+		return nil
+	}
+	var who struct {
+		Tools *[]string `json:"tools"`
+	}
+	if json.Unmarshal([]byte(resp.Body), &who) != nil || who.Tools == nil {
+		return nil
+	}
+	allowed := map[string]bool{} // non-nil even when empty: the caller can use no tool
+	for _, t := range *who.Tools {
+		allowed[t] = true
+	}
+	return allowed
 }
 
 // TextResult is a tools/call result carrying one text block.

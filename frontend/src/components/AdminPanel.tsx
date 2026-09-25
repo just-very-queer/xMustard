@@ -244,7 +244,7 @@ function TokensSection() {
   return (
     <section className="sidebar-panel">
       <h2>Tokens &amp; auth</h2>
-      <p className="subtle">Bearer tokens per principal (admin · agent · readonly). The raw token shows once at mint/rotate — store it now.</p>
+      <p className="subtle">Bearer tokens per principal. Roles: reader · proposer · verifier · human-approver · indexer · admin (agent = proposer+verifier, readonly = reader). The raw token shows once at mint/rotate — store it now.</p>
       {error && <p className="error-text">{error}</p>}
       {minted && (
         <p className="callout">
@@ -271,7 +271,7 @@ function TokensSection() {
       <div className="field-row" style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem', marginTop: '0.75rem' }}>
         <input placeholder="token id" value={id} onChange={(e) => setId(e.target.value)} />
         <select value={role} onChange={(e) => setRole(e.target.value)}>
-          {['admin', 'agent', 'readonly'].map((r) => <option key={r} value={r}>{r}</option>)}
+          {['agent', 'reader', 'proposer', 'verifier', 'human-approver', 'indexer', 'admin', 'readonly'].map((r) => <option key={r} value={r}>{r}</option>)}
         </select>
         <input placeholder="ttl seconds (0 = never)" value={ttl} onChange={(e) => setTtl(e.target.value)} style={{ width: '10rem' }} />
         <button className="nav-button nav-button-active" onClick={() => void mint()}>Mint token</button>

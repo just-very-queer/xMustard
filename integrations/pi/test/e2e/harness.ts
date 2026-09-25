@@ -272,6 +272,8 @@ export class Api {
 				XMUSTARD_API_HOST: "127.0.0.1",
 				XMUSTARD_API_PORT: String(this.port),
 				XMUSTARD_CORE_BIN: env("XM_CORE_BIN"),
+				// the fixture setup uses platform routes (settings, postgres bootstrap, diagnostics/run)
+				XMUSTARD_PROFILE: "platform",
 				...this.opts.extraEnv,
 			},
 			stdio: ["ignore", "pipe", "pipe"],

@@ -9,9 +9,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -32,8 +34,13 @@ const maxTTLSeconds = 100 * 365 * 24 * 3600 // ~100 years
 // once at mint time and is not recoverable.
 
 type Principal struct {
-	ID   string `json:"id"`
-	Role string `json:"role"` // admin | agent | readonly
+	ID string `json:"id"`
+	// Role is the token's role spec as minted: one role or several joined with "+"
+	// (see auth_roles.go). Legacy specs are admin, agent and readonly.
+	Role string `json:"role"`
+	// Roles is the expanded set Role holds (every role implies reader; admin holds
+	// all). Filled when a token resolves.
+	Roles []string `json:"roles,omitempty"`
 	// Workspaces, when non-empty, restricts this principal to those workspace ids
 	// (per-worker token scoping). Empty/nil means unrestricted — backward-compatible
 	// with existing unscoped tokens and operator/env tokens.
@@ -101,14 +108,104 @@ func loadTokenRecords(dataDir string) ([]tokenRecord, error) {
 	return recs, nil
 }
 
-// envTokenHashes parses XMUSTARD_AUTH_TOKENS="id:role:rawtoken,..." into hash→Principal
-// (the raw tokens are hashed in memory and never persisted).
-func envTokenHashes() map[string]Principal {
-	out := map[string]Principal{}
-	raw := strings.TrimSpace(os.Getenv("XMUSTARD_AUTH_TOKENS"))
-	if raw == "" {
-		return out
+// credential is one resolvable bearer credential: the SHA-256 of the raw token and
+// the principal it stands for.
+type credential struct {
+	digest    [sha256.Size]byte
+	principal Principal
+	expiresAt string
+}
+
+func newPrincipal(id, roleSpec string, workspaces []string) Principal {
+	return Principal{ID: id, Role: roleSpec, Roles: ExpandRoles(roleSpec), Workspaces: workspaces}
+}
+
+// Token store cache (PAR-SEC-07). The auth middleware resolves a token on every
+// request; the store is parsed once and reused while the file keeps the same
+// identity (inode), modification time and size. A file whose mtime is within
+// tokenCacheRacyWindow of the load is re-read next time, so a same-size rewrite
+// inside one timestamp tick is still seen. Mint, rotate and revoke drop the entry
+// explicitly after their write.
+
+const tokenCacheRacyWindow = 2 * time.Second
+
+type tokenFileCache struct {
+	info     os.FileInfo // nil: the file was absent
+	loadedAt time.Time
+	recs     []tokenRecord
+	creds    []credential
+	err      error
+}
+
+var (
+	tokenCacheMu sync.Mutex
+	tokenCache   = map[string]*tokenFileCache{}
+	// tokenStoreParses counts reads of the token file from disk (tests).
+	tokenStoreParses atomic.Int64
+)
+
+// cachedTokenStore returns the parsed token file, re-reading it only when the file
+// changed. An unreadable or corrupt store returns its error (callers fail closed).
+func cachedTokenStore(dataDir string) (*tokenFileCache, error) {
+	path := tokensPath(dataDir)
+	info, statErr := os.Stat(path)
+	if statErr != nil && !os.IsNotExist(statErr) {
+		return nil, statErr
 	}
+	tokenCacheMu.Lock()
+	defer tokenCacheMu.Unlock()
+	c := tokenCache[path]
+	if statErr != nil { // absent file: no file-backed tokens
+		if c == nil || c.info != nil {
+			c = &tokenFileCache{loadedAt: time.Now()}
+			tokenCache[path] = c
+		}
+		return c, nil
+	}
+	if c != nil && c.info != nil && os.SameFile(c.info, info) && c.info.ModTime().Equal(info.ModTime()) &&
+		c.info.Size() == info.Size() && c.loadedAt.Sub(info.ModTime()) > tokenCacheRacyWindow {
+		return c, c.err
+	}
+	tokenStoreParses.Add(1)
+	recs, err := loadTokenRecords(dataDir)
+	c = &tokenFileCache{info: info, loadedAt: time.Now(), recs: recs, err: err}
+	for _, r := range recs {
+		raw, derr := hex.DecodeString(r.TokenSHA256)
+		if derr != nil || len(raw) != sha256.Size {
+			continue // a malformed digest can never match
+		}
+		cred := credential{principal: newPrincipal(r.ID, fallbackString(r.Role, roleAgent), r.Workspaces), expiresAt: r.ExpiresAt}
+		copy(cred.digest[:], raw)
+		c.creds = append(c.creds, cred)
+	}
+	tokenCache[path] = c
+	return c, err
+}
+
+// invalidateTokenCache drops the cached store after a mint, rotate or revoke.
+func invalidateTokenCache(dataDir string) {
+	tokenCacheMu.Lock()
+	delete(tokenCache, tokensPath(dataDir))
+	tokenCacheMu.Unlock()
+}
+
+// envCredentials caches the parse of XMUSTARD_AUTH_TOKENS by its raw value.
+var envCredentials struct {
+	sync.Mutex
+	raw   string
+	creds []credential
+}
+
+// envTokenCredentials parses XMUSTARD_AUTH_TOKENS="id:role:rawtoken,..." (the raw
+// tokens are hashed in memory and never persisted). role may be a "+"-joined spec.
+func envTokenCredentials() []credential {
+	raw := strings.TrimSpace(os.Getenv("XMUSTARD_AUTH_TOKENS"))
+	envCredentials.Lock()
+	defer envCredentials.Unlock()
+	if raw == envCredentials.raw {
+		return envCredentials.creds
+	}
+	var creds []credential
 	for _, item := range strings.Split(raw, ",") {
 		parts := strings.SplitN(strings.TrimSpace(item), ":", 3)
 		if len(parts) != 3 {
@@ -119,28 +216,21 @@ func envTokenHashes() map[string]Principal {
 		if id == "" || len(strings.TrimSpace(tok)) < 24 {
 			continue
 		}
-		out[hashToken(tok)] = Principal{ID: id, Role: normalizeRole(role)}
+		creds = append(creds, credential{digest: sha256.Sum256([]byte(tok)), principal: newPrincipal(id, normalizeRole(role), nil)})
 	}
-	return out
+	envCredentials.raw, envCredentials.creds = raw, creds
+	return creds
 }
 
-// normalizeRole maps a role string to a known role, defaulting unknown/blank to
-// the least-privileged "readonly" so a typo in XMUSTARD_AUTH_TOKENS can't mint an
-// unconstrained principal (an unknown role would otherwise dodge both the
-// readonly-method gate and the role-hierarchy gate).
+// normalizeRole maps an env role spec to a valid one. A blank role is the historical
+// "agent"; an unknown one becomes the least-privileged "readonly", so a typo in
+// XMUSTARD_AUTH_TOKENS can't mint an unconstrained principal.
 func normalizeRole(role string) string {
-	switch strings.TrimSpace(role) {
-	case "admin":
-		return "admin"
-	case "agent":
-		return "agent"
-	case "readonly":
-		return "readonly"
-	case "":
-		return "agent" // historical default for a blank role
-	default:
-		return "readonly"
+	spec, err := ParseRoleSpec(role)
+	if err != nil {
+		return roleReadonly
 	}
+	return spec
 }
 
 // HasAuthConfigured reports whether any tokens exist (file or env) — i.e. whether
@@ -149,18 +239,14 @@ func normalizeRole(role string) string {
 // file can't silently disable auth and open every admin gate. A genuinely-absent
 // file (os.IsNotExist) correctly reports false.
 func HasAuthConfigured(dataDir string) bool {
-	if len(envTokenHashes()) > 0 {
+	if len(envTokenCredentials()) > 0 {
 		return true
 	}
-	recs, err := loadTokenRecords(dataDir)
+	store, err := cachedTokenStore(dataDir)
 	if err != nil {
 		return true // unreadable token store → assume auth is configured (fail closed)
 	}
-	return len(recs) > 0
-}
-
-func constantTimeEqual(a, b string) bool {
-	return len(a) == len(b) && subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
+	return len(store.recs) > 0
 }
 
 // ResolveToken returns the Principal for a raw bearer token, or nil if unknown.
@@ -169,35 +255,57 @@ func ResolveToken(dataDir, raw string) *Principal {
 	return p
 }
 
-// ResolveAuth resolves a bearer token AND reports whether auth is configured, in a
-// SINGLE read of the token store — the auth middleware needs both on every request,
-// and previously did two reads (ResolveToken + HasAuthConfigured). An unreadable
-// store fails CLOSED (configured=true), matching HasAuthConfigured.
+// digestCompare is the comparison matchCredential applies to every credential. It
+// is a variable only so a test can count the comparisons.
+var digestCompare = subtle.ConstantTimeCompare
+
+// matchCredential compares digest against every credential in constant time per
+// comparison and without stopping at a match, and returns the first match.
+func matchCredential(creds []credential, digest [sha256.Size]byte) *credential {
+	var found *credential
+	for i := range creds {
+		if digestCompare(creds[i].digest[:], digest[:]) == 1 && found == nil {
+			found = &creds[i]
+		}
+	}
+	return found
+}
+
+// ResolveAuth resolves a bearer token AND reports whether auth is configured, from
+// one (cached) view of the token store — the auth middleware needs both on every
+// request. An unreadable store fails CLOSED (configured=true), matching
+// HasAuthConfigured. Env credentials take precedence over file-backed ones.
 func ResolveAuth(dataDir, raw string) (principal *Principal, configured bool) {
-	env := envTokenHashes()
-	recs, err := loadTokenRecords(dataDir)
+	env := envTokenCredentials()
+	store, err := cachedTokenStore(dataDir)
+	var file []credential
 	if err != nil {
 		configured = true // unreadable token store → assume configured (fail closed)
 	} else {
-		configured = len(env) > 0 || len(recs) > 0
+		file = store.creds
+		configured = len(env) > 0 || len(store.recs) > 0
 	}
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return nil, configured
 	}
-	h := hashToken(raw)
-	if p, ok := env[h]; ok {
-		return &p, configured
+	digest := sha256.Sum256([]byte(raw))
+	envHit := matchCredential(env, digest)
+	fileHit := matchCredential(file, digest)
+	switch {
+	case envHit != nil:
+		return clonePrincipal(envHit.principal), configured
+	case fileHit != nil && !tokenExpired(fileHit.expiresAt):
+		return clonePrincipal(fileHit.principal), configured
 	}
-	for _, r := range recs {
-		if constantTimeEqual(r.TokenSHA256, h) {
-			if tokenExpired(r.ExpiresAt) {
-				return nil, configured // a known-but-expired token resolves to no principal
-			}
-			return &Principal{ID: r.ID, Role: fallbackString(r.Role, "agent"), Workspaces: r.Workspaces}, configured
-		}
-	}
-	return nil, configured
+	return nil, configured // unknown, or known but expired
+}
+
+// clonePrincipal copies a cached principal so a caller cannot mutate the cache.
+func clonePrincipal(p Principal) *Principal {
+	p.Roles = slices.Clone(p.Roles)
+	p.Workspaces = slices.Clone(p.Workspaces)
+	return &p
 }
 
 // MintToken generates a non-expiring token for (id, role). See MintTokenTTL.
@@ -219,12 +327,11 @@ func validateMintInputs(id, role *string, ttlSeconds int) error {
 		// minted under it would pass as the author of all open-mode memory.
 		return fmt.Errorf("token id %q is reserved for open mode", *id)
 	}
-	*role = fallbackString(strings.TrimSpace(*role), "agent")
-	switch *role {
-	case "admin", "agent", "readonly":
-	default:
-		return fmt.Errorf("role must be admin|agent|readonly")
+	spec, err := ParseRoleSpec(*role)
+	if err != nil {
+		return err
 	}
+	*role = spec
 	if ttlSeconds < 0 || ttlSeconds > maxTTLSeconds {
 		return fmt.Errorf("ttl_seconds must be between 0 and %d", maxTTLSeconds)
 	}
@@ -284,6 +391,7 @@ func mintTokenLocked(dataDir, id, role string, ttlSeconds int, workspaces []stri
 	if err := writeJSON(tokensPath(dataDir), next); err != nil {
 		return "", err
 	}
+	invalidateTokenCache(dataDir)
 	return raw, nil
 }
 
@@ -309,7 +417,7 @@ func RotateToken(dataDir, id string, ttlSeconds int) (string, error) {
 	found := false
 	for _, r := range recs {
 		if r.ID == id {
-			role = fallbackString(r.Role, "agent")
+			role = fallbackString(r.Role, roleAgent)
 			workspaces = r.Workspaces // preserve the workspace scope across rotation
 			found = true
 			break
@@ -321,15 +429,16 @@ func RotateToken(dataDir, id string, ttlSeconds int) (string, error) {
 	return mintTokenLocked(dataDir, id, role, ttlSeconds, workspaces)
 }
 
-// ListPrincipals returns the configured principals (no secrets).
+// ListPrincipals returns the configured principals and their roles (no secrets).
 func ListPrincipals(dataDir string) []Principal {
 	seen := map[string]Principal{}
-	for _, p := range envTokenHashes() {
-		seen[p.ID] = p
+	for _, c := range envTokenCredentials() {
+		seen[c.principal.ID] = *clonePrincipal(c.principal)
 	}
-	recs, _ := loadTokenRecords(dataDir)
-	for _, r := range recs {
-		seen[r.ID] = Principal{ID: r.ID, Role: fallbackString(r.Role, "agent")}
+	if store, err := cachedTokenStore(dataDir); err == nil {
+		for _, r := range store.recs {
+			seen[r.ID] = newPrincipal(r.ID, fallbackString(r.Role, roleAgent), slices.Clone(r.Workspaces))
+		}
 	}
 	out := make([]Principal, 0, len(seen))
 	for _, p := range seen {
@@ -360,5 +469,9 @@ func RevokeToken(dataDir, id string) error {
 	if !found {
 		return os.ErrNotExist
 	}
-	return writeJSON(tokensPath(dataDir), next)
+	if err := writeJSON(tokensPath(dataDir), next); err != nil {
+		return err
+	}
+	invalidateTokenCache(dataDir)
+	return nil
 }

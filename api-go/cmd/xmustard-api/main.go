@@ -27,7 +27,8 @@ func main() {
 	// no server needed) — the bootstrap path for the first admin token.
 	if len(os.Args) > 1 && os.Args[1] == "mint-token" {
 		if len(os.Args) < 3 {
-			fmt.Fprintln(os.Stderr, "usage: xmustard-api mint-token <id> [admin|agent|readonly]")
+			fmt.Fprintln(os.Stderr, "usage: xmustard-api mint-token <id> [role[+role...]]")
+			fmt.Fprintln(os.Stderr, "roles: admin human-approver indexer verifier proposer reader; legacy agent (proposer+verifier) and readonly (reader)")
 			os.Exit(2)
 		}
 		role := "agent"
@@ -53,7 +54,7 @@ func main() {
 	defer cancelBase()
 	srv := &http.Server{
 		Addr:        cfg.addr(),
-		Handler:     buildHandler(cfg, newAPIHandler()),
+		Handler:     buildHandler(cfg, newAPIHandlerFor(cfg.posture)),
 		BaseContext: func(net.Listener) context.Context { return baseCtx },
 		// Bound slow/oversized clients so a few connections can't pin goroutines/FDs
 		// (XM-NEW-019). Read/Write are generous because agent runs can be long, but
@@ -135,12 +136,14 @@ type serverConfig struct {
 	authConfigured    bool   // at least one bearer credential exists
 	tlsCert, tlsKey   string
 	allowInsecureBind bool
-	coreOnly          bool
+	posture           exposurePosture // profile, read-only, tool/workspace/host/origin allowlists
+	postureErr        error
 	dataDir           string
 }
 
 func loadServerConfig(dataDir string) serverConfig {
-	return serverConfig{
+	posture, postureErr := loadExposurePosture()
+	c := serverConfig{
 		// Bind to loopback by default. The API makes server-side requests (providers),
 		// so it should not be exposed on all interfaces unless the operator opts in.
 		host: envDefault("XMUSTARD_API_HOST", "127.0.0.1"),
@@ -151,9 +154,12 @@ func loadServerConfig(dataDir string) serverConfig {
 		tlsCert:           os.Getenv("XMUSTARD_API_TLS_CERT"),
 		tlsKey:            os.Getenv("XMUSTARD_API_TLS_KEY"),
 		allowInsecureBind: os.Getenv("XMUSTARD_ALLOW_INSECURE_BIND") == "1",
-		coreOnly:          os.Getenv("XMUSTARD_CORE_ONLY") == "1",
+		posture:           posture,
+		postureErr:        postureErr,
 		dataDir:           dataDir,
 	}
+	c.posture.Loopback = c.loopback()
+	return c
 }
 
 func (c serverConfig) addr() string   { return net.JoinHostPort(c.host, c.port) }
@@ -179,6 +185,9 @@ func isLoopbackHost(host string) bool {
 //     (off is always fatal there, whatever tokens or overrides exist) AND transport
 //     security (TLS, or the explicit insecure-bind override for a TLS-terminating proxy).
 func validateStartup(c serverConfig) error {
+	if c.postureErr != nil {
+		return c.postureErr
+	}
 	switch c.authMode {
 	case "auto", "required", "off":
 	default:
@@ -199,15 +208,18 @@ func validateStartup(c serverConfig) error {
 	return nil
 }
 
-// buildHandler wraps the route table in the configured middleware stack.
+// buildHandler wraps the route table in the configured middleware stack:
+// exposure (host/origin/query credentials) → body limit → auth → route gates
+// (newAPIHandlerFor) → evidence delivery → handlers.
 func buildHandler(c serverConfig, api http.Handler) http.Handler {
 	handler := api
-	if c.coreOnly {
-		// Lean production surface: expose only the governed-memory + grounding +
-		// search core (the paths the 9 MCP tools + auth use), 404 everything else.
-		// The full platform surface stays available when this is unset (for the UI).
-		handler = coreOnlyMiddleware(handler)
-		log.Printf("surface: CORE_ONLY — platform routes disabled")
+	if c.posture.platform() {
+		log.Printf("surface: profile=platform — core and platform routes served (the UI needs this profile)")
+	} else {
+		log.Printf("surface: profile=core — nine tools, memory, evidence and auth only; platform routes 404 (XMUSTARD_PROFILE=platform serves them)")
+	}
+	if c.posture.ReadOnly {
+		log.Printf("surface: READ-ONLY — mutating routes refused, write tools hidden")
 	}
 	if c.authMode != "off" {
 		handler = authMiddleware(c.dataDir, c.authMode, handler)
@@ -225,8 +237,11 @@ func buildHandler(c serverConfig, api http.Handler) http.Handler {
 	}
 	// Cap every request body so a hostile/buggy client can't drive unbounded memory
 	// by POSTing a huge payload — the HTTP analogue of the MCP stdio framing cap
-	// (readBoundedLine). Outermost wrap so it applies before any handler reads the body.
-	return bodyLimitMiddleware(handler)
+	// (readBoundedLine). It applies before any handler reads the body.
+	handler = bodyLimitMiddleware(handler)
+	// Outermost: refuse rebinding Hosts, cross-origin browsers and query-string keys
+	// before any other work.
+	return exposureMiddleware(c.posture, c.dataDir, handler)
 }
 
 // --- auth middleware + principal helpers ---
@@ -240,45 +255,21 @@ func principalFromContext(ctx context.Context) *workspaceops.Principal {
 	return p
 }
 
-// roleRank orders the role hierarchy: admin > agent > readonly. Used so a gate for
-// "agent" is satisfied by admin too, and "readonly" by everyone authenticated.
-func roleRank(role string) int {
-	switch role {
-	case "admin":
-		return 3
-	case "agent":
-		return 2
-	case "readonly":
-		return 1
-	default:
-		return 0
-	}
-}
-
-// requireRole enforces a minimum role for an endpoint (admin > agent > readonly).
-// In open mode (no auth configured) it allows the operation locally; once auth is
-// configured the middleware has already rejected unauthenticated requests. A denied
-// authenticated request is recorded in the auth-audit log.
+// requireRole enforces a role inside a handler (admin holds every role; the legacy
+// "agent" gate means proposer). In open mode (no auth configured) it allows the
+// operation locally; once auth is configured the middleware has already rejected
+// unauthenticated requests. A denial names the missing role and is audited.
 func requireRole(w http.ResponseWriter, r *http.Request, role string) bool {
-	dd := envDefault("XMUSTARD_DATA_DIR", "../backend/data")
 	p := principalFromContext(r.Context())
 	if p == nil {
-		if !workspaceops.HasAuthConfigured(dd) {
+		if !workspaceops.HasAuthConfigured(dataDir()) {
 			return true
 		}
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "authentication required"})
 		return false
 	}
-	if roleRank(p.Role) < roleRank(role) {
-		workspaceops.RecordAuthAudit(dd, workspaceops.AuthAuditEvent{
-			Action:     "denied",
-			Actor:      p.ID,
-			Detail:     role + " role required (have " + p.Role + ")",
-			Method:     r.Method,
-			Path:       r.URL.Path,
-			RemoteAddr: r.RemoteAddr,
-		})
-		writeJSON(w, http.StatusForbidden, map[string]any{"error": role + " role required"})
+	if need := workspaceops.GateRole(role); !p.Has(need) {
+		denyMissingRole(w, r, p, need)
 		return false
 	}
 	return true
@@ -304,16 +295,17 @@ func (c memoryCaller) id() string {
 // the open-mode caller already passes every requireRole gate (it is the local
 // operator), so it edits as admin.
 func (c memoryCaller) actor() workspaceops.ContextActor {
-	return workspaceops.ContextActor{ID: c.id(), Admin: c.openMode || c.principal.Role == "admin", OpenMode: c.openMode}
+	return workspaceops.ContextActor{ID: c.id(), Admin: c.openMode || c.principal.Has(workspaceops.RoleAdmin), OpenMode: c.openMode}
 }
 
-// requireMemoryCaller gates a governed-memory write on the agent role and resolves the
-// caller. requireRole admits an unauthenticated request only when no credentials are
-// configured, so a nil principal here means open mode. A principal holding the reserved
-// open-mode identity (an env token, or a token minted before the id was reserved) is
-// refused, since it would pass as the author of every open-mode memory.
-func requireMemoryCaller(w http.ResponseWriter, r *http.Request) (memoryCaller, bool) {
-	if !requireRole(w, r, "agent") {
+// requireMemoryCaller gates a governed-memory write on role (proposer to propose or
+// edit, verifier to verify) and resolves the caller. requireRole admits an
+// unauthenticated request only when no credentials are configured, so a nil principal
+// here means open mode. A principal holding the reserved open-mode identity (an env
+// token, or a token minted before the id was reserved) is refused, since it would pass
+// as the author of every open-mode memory.
+func requireMemoryCaller(w http.ResponseWriter, r *http.Request, role string) (memoryCaller, bool) {
+	if !requireRole(w, r, role) {
 		return memoryCaller{}, false
 	}
 	p := principalFromContext(r.Context())
@@ -361,57 +353,6 @@ func writeJSONBodyError(w http.ResponseWriter, err error) bool {
 		return false
 	}
 	writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON body"})
-	return false
-}
-
-// coreWorkspaceSubpaths are the EXACT per-workspace subpaths the 9 MCP tools hit
-// (the part after /api/workspaces/{id}/). Matching these exactly — rather than by
-// substring — is what makes CORE_ONLY a real allowlist: a substring gate over
-// "/context"/"/search"/"/diagnostics" would also admit /context-replays,
-// /goals/{id}/context, /pg/search, /diagnostics/run, etc. (XM-PRO-011).
-var coreWorkspaceSubpaths = map[string]bool{
-	"session-grounding":   true, // ground
-	"context":             true, // remember (POST)
-	"context/active":      true, // recall
-	"search":              true, // search
-	"explain-path":        true, // explain
-	"changes/since-index": true, // impact
-	"diagnostics":         true, // diagnostics
-	"evidence":            true, // evidence capture (Pi) / workspace revocation
-}
-
-// isCorePath reports whether p is one of the exact routes the lean 9-tool agent
-// surface uses. CORE_ONLY 404s everything else, so the deployed attack surface
-// matches the product claim, not a substring gate over ~200 handlers.
-func isCorePath(p string) bool {
-	if p == "/api/health" || p == "/api/workspaces" || strings.HasPrefix(p, "/api/auth/") {
-		return true
-	}
-	const wsPrefix = "/api/workspaces/"
-	if !strings.HasPrefix(p, wsPrefix) {
-		return false
-	}
-	rest := p[len(wsPrefix):]
-	slash := strings.IndexByte(rest, '/')
-	if slash < 0 {
-		return false // /api/workspaces/{id} with no tool subpath
-	}
-	sub := rest[slash+1:] // subpath after the workspace id
-	if coreWorkspaceSubpaths[sub] {
-		return true
-	}
-	// the two parameterized core routes: context/{entry_id}/verify, runs/{run_id}/why-failed
-	if seg := strings.Split(sub, "/"); len(seg) == 3 {
-		if seg[0] == "context" && seg[2] == "verify" {
-			return true // verify
-		}
-		if seg[0] == "runs" && seg[2] == "why-failed" {
-			return true // why_failed
-		}
-	}
-	if seg := strings.Split(sub, "/"); len(seg) == 2 && seg[0] == "evidence" {
-		return true // evidence expansion / revocation
-	}
 	return false
 }
 
@@ -518,16 +459,6 @@ func writeOverloaded(w http.ResponseWriter) {
 	writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": budget.ErrOverloaded.Error(), "overloaded": true})
 }
 
-func coreOnlyMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !isCorePath(r.URL.Path) {
-			writeJSON(w, http.StatusNotFound, map[string]any{"error": "endpoint disabled in CORE_ONLY mode"})
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
-}
-
 func authMiddleware(dataDir, mode string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/api/health" { // health stays public for liveness probes
@@ -554,19 +485,9 @@ func authMiddleware(dataDir, mode string, next http.Handler) http.Handler {
 			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "authentication required: provide Authorization: Bearer <token>"})
 			return
 		}
-		// readonly principals may only read.
-		if principal != nil && principal.Role == "readonly" && r.Method != http.MethodGet {
-			workspaceops.RecordAuthAudit(dataDir, workspaceops.AuthAuditEvent{
-				Action:     "denied",
-				Actor:      principal.ID,
-				Detail:     "readonly principal cannot " + r.Method,
-				Method:     r.Method,
-				Path:       r.URL.Path,
-				RemoteAddr: r.RemoteAddr,
-			})
-			writeJSON(w, http.StatusForbidden, map[string]any{"error": "readonly principal cannot " + r.Method})
-			return
-		}
+		// A reader-only principal's writes are refused by the route gate, which
+		// names the missing role; every non-GET route needs more than reader
+		// (TestNoWriteRouteGrantsReader).
 		// workspace scope: a scoped (per-worker) token may only touch its workspaces.
 		// Unscoped tokens (the default) are unrestricted, so this is backward-compatible.
 		if principal != nil {
@@ -598,6 +519,10 @@ func requireTerminalScope(w http.ResponseWriter, r *http.Request, dataDir, works
 	workspaceID = strings.TrimSpace(workspaceID)
 	if workspaceID == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "workspace_id is required"})
+		return false
+	}
+	if !postureFrom(r).allowsWorkspace(workspaceID) {
+		writeJSON(w, http.StatusForbidden, map[string]any{"error": "workspace " + workspaceID + " is not served by this deployment", "reason": "workspace_not_allowed"})
 		return false
 	}
 	if p := principalFromContext(r.Context()); p != nil && !p.AllowsWorkspace(workspaceID) {
@@ -717,7 +642,7 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 
 // registerRoutes mounts every HTTP route on mux. It is separate from main so tests
 // can exercise the real route table through httptest.
-func registerRoutes(mux *http.ServeMux) {
+func registerRoutes(mux routeRegistrar) {
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"status":  "ok",
@@ -776,11 +701,7 @@ func registerRoutes(mux *http.ServeMux) {
 	})
 	// --- auth: token admin (admin-gated) + whoami ---
 	mux.HandleFunc("GET /api/auth/whoami", func(w http.ResponseWriter, r *http.Request) {
-		if p := principalFromContext(r.Context()); p != nil {
-			writeJSON(w, http.StatusOK, p)
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]any{"id": "", "role": "anonymous"})
+		writeJSON(w, http.StatusOK, whoamiResponse(r))
 	})
 	mux.HandleFunc("GET /api/auth/principals", func(w http.ResponseWriter, r *http.Request) {
 		if !requireRole(w, r, "admin") {
@@ -800,13 +721,21 @@ func registerRoutes(mux *http.ServeMux) {
 		}
 		var req struct {
 			ID         string   `json:"id"`
-			Role       string   `json:"role"`
+			Role       string   `json:"role"`  // one role, or several joined with "+"
+			Roles      []string `json:"roles"` // alternative to role: a list of roles
 			TTLSeconds int      `json:"ttl_seconds"`
 			Workspaces []string `json:"workspaces"` // optional: confine the token to these workspaces
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON body"})
 			return
+		}
+		if len(req.Roles) > 0 {
+			if req.Role != "" {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"error": "send role or roles, not both"})
+				return
+			}
+			req.Role = strings.Join(req.Roles, "+")
 		}
 		raw, err := workspaceops.MintScopedToken(dataDir(), req.ID, req.Role, req.TTLSeconds, req.Workspaces)
 		if err != nil {
@@ -1084,7 +1013,14 @@ func registerRoutes(mux *http.ServeMux) {
 			})
 			return
 		}
-		writeJSON(w, http.StatusOK, result)
+		n := 0 // and by the deployment's workspace allowlist
+		for _, it := range result {
+			if postureFrom(r).allowsWorkspace(it.WorkspaceID) {
+				result[n] = it
+				n++
+			}
+		}
+		writeJSON(w, http.StatusOK, result[:n])
 	})
 	mux.HandleFunc("POST /api/workspaces/load", func(w http.ResponseWriter, r *http.Request) {
 		var request workspaceops.WorkspaceLoadRequest
@@ -1092,6 +1028,10 @@ func registerRoutes(mux *http.ServeMux) {
 			writeJSON(w, http.StatusBadRequest, map[string]any{
 				"error": "invalid JSON body",
 			})
+			return
+		}
+		if id, err := workspaceops.WorkspaceIDForRoot(dataDir(), request.RootPath); err != nil || !postureFrom(r).allowsWorkspace(id) {
+			writeJSON(w, http.StatusForbidden, map[string]any{"error": "workspace root is not served by this deployment", "reason": "workspace_not_allowed"})
 			return
 		}
 		result, err := workspaceops.LoadWorkspace(
@@ -3930,7 +3870,7 @@ func registerRoutes(mux *http.ServeMux) {
 		issueIntel(w, err, result)
 	})
 	mux.HandleFunc("POST /api/workspaces/{workspace_id}/context", func(w http.ResponseWriter, r *http.Request) {
-		caller, ok := requireMemoryCaller(w, r) // proposing memory is an agent action, not readonly
+		caller, ok := requireMemoryCaller(w, r, workspaceops.RoleProposer)
 		if !ok {
 			return
 		}
@@ -3963,7 +3903,7 @@ func registerRoutes(mux *http.ServeMux) {
 		issueIntel(w, err, result)
 	})
 	mux.HandleFunc("POST /api/workspaces/{workspace_id}/context/{entry_id}/verify", func(w http.ResponseWriter, r *http.Request) {
-		caller, ok := requireMemoryCaller(w, r) // verifying/promoting memory is an agent action
+		caller, ok := requireMemoryCaller(w, r, workspaceops.RoleVerifier)
 		if !ok {
 			return
 		}
@@ -3997,7 +3937,7 @@ func registerRoutes(mux *http.ServeMux) {
 		// Editing memory is an agent action bound to the entry's author (or an admin):
 		// an edit resets the entry's verification, so an unbound edit would let any
 		// caller rewrite and demote any readwrite memory.
-		caller, ok := requireMemoryCaller(w, r)
+		caller, ok := requireMemoryCaller(w, r, workspaceops.RoleProposer)
 		if !ok {
 			return
 		}
@@ -4184,7 +4124,7 @@ func registerRoutes(mux *http.ServeMux) {
 	})
 	mux.HandleFunc("GET /api/workspaces/{workspace_id}/session-grounding", func(w http.ResponseWriter, r *http.Request) {
 		result, err := workspaceops.BuildSessionGroundingCtx(r.Context(), envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))
-		issueIntel(w, err, result)
+		issueIntel(w, err, groundResponse(r, result))
 	})
 	// --- run confidence, owner suggestions, ownership, eval timeline, ticket ingest, guidance customization ---
 	mux.HandleFunc("GET /api/workspaces/{workspace_id}/runs/{run_id}/confidence", func(w http.ResponseWriter, r *http.Request) {

@@ -142,7 +142,8 @@ export type RoutingRule = {
 
 export type AuthPrincipal = {
   id: string
-  role: string // admin | agent | readonly
+  role: string // role spec as minted: one role or several joined with "+" (legacy: admin | agent | readonly)
+  roles?: string[] // expanded: reader | proposer | verifier | human-approver | indexer | admin
 }
 
 export type MintTokenResult = {

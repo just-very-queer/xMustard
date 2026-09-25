@@ -9,7 +9,7 @@ import (
 	"xmustard/api-go/internal/workspaceops"
 )
 
-func registerEvalRoutes(mux *http.ServeMux, dataDir string) {
+func registerEvalRoutes(mux routeRegistrar, dataDir string) {
 	mux.HandleFunc("GET /api/workspaces/{workspace_id}/eval-scenarios", func(w http.ResponseWriter, r *http.Request) {
 		workspaceID := r.PathValue("workspace_id")
 		result, err := workspaceops.ListEvalScenarios(dataDir, workspaceID, r.URL.Query().Get("issue_id"))
