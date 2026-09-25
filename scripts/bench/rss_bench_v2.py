@@ -1356,6 +1356,28 @@ def median(values):
     return round(statistics.median(vals), 2) if vals else None
 
 
+def max_of(values):
+    vals = [v for v in values if v is not None]
+    return max(vals) if vals else None
+
+
+def peak_delta(h, b, key):
+    """(delta, median delta, max delta) of a peak between two ledger views. The delta is
+    the smaller of the median and the max deltas over the valid repeats, so growth counts
+    only when both the typical and the worst repeat show it. The gate peak of these
+    workloads is bimodal (on Linux v1-workload, the Go daemon's RSS at the peak sample was
+    21.9 MiB in a low run and 28.9 in high ones): the medians of three runs of one
+    revision ranged 69.1-81.0 MiB on v1-workload and 80.2-97.1 MiB on agents-2 while the
+    maxes stayed within 5.7 and 2.3 MiB. A view without maxes
+    (older reports, a single run) uses the median delta."""
+    if h.get(key) is None or b.get(key) is None:
+        return None, None, None
+    d_med = round(h[key] - b[key], 2)
+    hm, bm = h.get(key.replace("_mib", "_max_mib")), b.get(key.replace("_mib", "_max_mib"))
+    d_max = round(hm - bm, 2) if hm is not None and bm is not None else None
+    return (d_med if d_max is None else min(d_med, d_max)), d_med, d_max
+
+
 def run_digest(r):
     """The numbers of one scenario run that repeats and the ledger compare."""
     s = r.get("sampler") or {}
@@ -1396,7 +1418,9 @@ def ledger_view(report):
             return {c: median([(d.get(key) or {}).get(c, default) for d in runs]) for c in names}
 
         out[sc] = {"valid_runs": len(runs), "gate_peak_mib": median([d.get("gate_peak_mib") for d in runs]),
+                   "gate_peak_max_mib": max_of([d.get("gate_peak_mib") for d in runs]),
                    "tree_all_peak_mib": median([d.get("tree_all_peak_mib") for d in runs]),
+                   "tree_all_peak_max_mib": max_of([d.get("tree_all_peak_mib") for d in runs]),
                    "components_p50_mib": per("components_p50_mib", 0.0),
                    "components_footprint_p50_mib": per("components_footprint_p50_mib"),
                    "components_peak_mib": per("components_peak_mib", 0.0),
@@ -1534,7 +1558,8 @@ def ledger_check(ledger, workstream, head, base, head_status=None, base_status=N
     measured on one machine) against its ledger line.
 
     Checks per common scenario, each failing the workstream:
-      * tree: owned gate-peak delta <= line + tolerance.tree_peak_mib;
+      * tree: owned gate-peak delta (peak_delta: the smaller of the median and the max
+        deltas) <= line + tolerance.tree_peak_mib;
       * tree_all: owned+external peak delta <= the same allowance (moving work into an
         external process is never a saving, §7.6);
       * process: the workstream's process p50 delta (footprint when both reports have it,
@@ -1594,14 +1619,15 @@ def ledger_check(ledger, workstream, head, base, head_status=None, base_status=N
         fails = []
         row = {"scenario": sc, "designated": is_designated, "ci_suite": in_ci_suite(sc), "line_mib": line_here,
                "externals_new": sorted(set(hx) - set(bx)), "external_growth_mib": ext_growth}
-        d_tree = round(h["gate_peak_mib"] - b["gate_peak_mib"], 2)
+        d_tree, d_med, d_max = peak_delta(h, b, "gate_peak_mib")
         allowed = round(line_here + t_tree, 2)
-        row["tree"] = {"delta_mib": d_tree, "credited_mib": credited(d_tree), "allowed_mib": allowed}
+        row["tree"] = {"delta_mib": d_tree, "median_delta_mib": d_med, "max_delta_mib": d_max,
+                       "credited_mib": credited(d_tree), "allowed_mib": allowed}
         if credited(d_tree) > allowed:
-            fails.append(f"tree peak delta {credited(d_tree)} MiB > {allowed}")
-        if h.get("tree_all_peak_mib") is not None and b.get("tree_all_peak_mib") is not None:
-            d_all = round(h["tree_all_peak_mib"] - b["tree_all_peak_mib"], 2)
-            row["tree_all"] = {"delta_mib": d_all, "allowed_mib": allowed}
+            fails.append(f"tree peak delta {credited(d_tree)} MiB > {allowed} (median delta {d_med}, max delta {d_max})")
+        d_all, d_all_med, d_all_max = peak_delta(h, b, "tree_all_peak_mib")
+        if d_all is not None:
+            row["tree_all"] = {"delta_mib": d_all, "median_delta_mib": d_all_med, "max_delta_mib": d_all_max, "allowed_mib": allowed}
             if d_all > allowed:
                 fails.append(f"owned+external peak delta {d_all} MiB > {allowed}")
         comps = set(h.get("components_p50_mib") or {}) | set(b.get("components_p50_mib") or {})
@@ -1692,10 +1718,10 @@ def gate_blocking(ledger, workstream, report, base_report):
         introduced it, so there is no base to compare with.
       * regression: any other scenario that ran (a workstream's designated parity-scale
         scenario) blocks only on a regression beyond noise: the base median over its
-        valid repeats was within the gate, and the head median is over the gate and more
-        than tolerance.tree_peak_mib above the base median. Medians decide, so one noisy
-        repeat does not, and neither does a median that moved within the noise the
-        ledger allows every tree delta. An overrun the base already had is reported and
+        valid repeats was within the gate, the head median is over the gate, and both
+        the median and the max rose by more than tolerance.tree_peak_mib (peak_delta).
+        One noisy repeat does not decide, and neither does a median that flipped between
+        the two clusters of a bimodal peak. An overrun the base already had is reported and
         does not block; ledger_check still bounds its growth. A side without a
         measurement (most repeats invalid) blocks: re-run the check.
       * coverage: a scenario the base ran and the head skipped, because its feature went
@@ -1747,14 +1773,17 @@ def gate_blocking(ledger, workstream, report, base_report):
                 blocking, why_ = True, "the base has no measurement (most repeats invalid): re-run the check"
             elif b_med > limit:
                 blocking, why_ = False, f"the base median {b_med} MiB was already over the gate"
-            elif h_med <= limit:
-                blocking, why_ = False, f"head median {h_med} MiB is within the gate (base median {b_med} MiB)"
-            elif round(h_med - b_med, 2) <= noise:
-                blocking, why_ = False, (f"head median {h_med} MiB is over the gate but within {noise} MiB of the base "
-                                         f"median {b_med} MiB: not told apart from noise")
             else:
-                blocking, why_ = True, (f"head median {h_med} MiB is over the gate and {round(h_med - b_med, 2)} MiB "
-                                        f"above the base median {b_med} MiB (noise allowance {noise} MiB)")
+                d, d_med, d_max = peak_delta(hv[sc], bv[sc], "gate_peak_mib")
+                grew = f"{d_med} MiB above the base median {b_med} MiB, max delta {d_max} MiB"
+                if h_med <= limit:
+                    blocking, why_ = False, f"head median {h_med} MiB is within the gate (base median {b_med} MiB)"
+                elif d <= noise:
+                    blocking, why_ = False, (f"head median {h_med} MiB is over the gate, {grew}: within the {noise} MiB "
+                                             "noise allowance in the median or the max")
+                else:
+                    blocking, why_ = True, (f"head median {h_med} MiB is over the gate, {grew}: beyond the {noise} MiB "
+                                            "noise allowance in both")
         row.update(rule=rule, blocking=blocking, why=why_)
         rows.append(row)
     ran = [r for r in rows if r["rule"] != "coverage"]
@@ -2708,9 +2737,10 @@ def render_markdown(report):
         L.append(f"Workstream {gb.get('workstream')}: **{'blocking' if gb.get('blocking') else 'not blocking'}**"
                  + (f" ({gb['note']})" if gb.get("note") else "") + ". CI-suite scenarios, and those of a workstream "
                  "that opts in with `gate_blocking`, block on their own verdict, and so does a scenario the base could "
-                 "not run. Other scenarios block only on a regression: the base median was within the gate, and the head "
-                 f"median is over it and more than {gb.get('noise_allowance_mib', 'the tree tolerance')} MiB above the base "
-                 "median. A scenario the base ran and the head skipped blocks.")
+                 "not run. Other scenarios block only on a regression: the base median was within the gate, the head "
+                 f"median is over it, and both the median and the max rose by more than "
+                 f"{gb.get('noise_allowance_mib', 'the tree tolerance')} MiB. A scenario the base ran and the head skipped "
+                 "blocks.")
         L.append("")
         L.append("| Scenario | Head verdict | Base verdict | Rule | Head median MiB | Base median MiB | Blocks | Why |")
         L.append("|---|---|---|---|---|---|---|---|")

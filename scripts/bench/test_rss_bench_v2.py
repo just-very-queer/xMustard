@@ -808,7 +808,8 @@ class Ledger(unittest.TestCase):
                                                                                      "tree_all_peak_mib": 55.0, "externals": {"lsp_server": {"peak_mib": 5.0}}}},
             "b": {"status": "ran", "gate": {"valid": False, "peak_mib": 10.0}, "sampler": {"components": {}}},
             "c": {"status": "skipped"}}}
-        self.assertEqual(v2.ledger_view(rep), {"a": {"valid_runs": 1, "gate_peak_mib": 50.0, "tree_all_peak_mib": 55.0,
+        self.assertEqual(v2.ledger_view(rep), {"a": {"valid_runs": 1, "gate_peak_mib": 50.0, "gate_peak_max_mib": 50.0,
+                                                     "tree_all_peak_mib": 55.0, "tree_all_peak_max_mib": 55.0,
                                                      "components_p50_mib": {"go_daemon": 20.0},
                                                      "components_footprint_p50_mib": {"go_daemon": None},
                                                      "components_peak_mib": {"go_daemon": 30.0},
@@ -932,18 +933,36 @@ class PullRequestBlocking(unittest.TestCase):
         gb = v2.gate_blocking(LEDGER, "WS-14", head, base)
         row = {r["scenario"]: r for r in gb["rows"]}["agents-2"]
         self.assertEqual((gb["blocking"], row["rule"], row["head_median_mib"], row["base_median_mib"]), (False, "regression", 96.0, 88.0))
-        self.assertIn("within 10.0 MiB of the base median", row["why"])
-        # beyond the tree tolerance and over the gate: the pull request did it
-        self.assertEqual(self.blocks("WS-14", gate_report(v1_workload=v1_ok, agents_2=[99.0, 100.0, 90.0]), base)[0], True)
-        # every combination of three repeats drawn from the recorded peaks: 140 of 729 blocked under the
-        # medians-only rule; now only a base median at the low peak against a head median at the high one
+        self.assertIn("within the 10.0 MiB noise allowance", row["why"])
+        # Linux, one revision measured as base and head by the CI commands: the medians of three flipped between
+        # the two clusters of the bimodal peak (80.2 against 97.1) while the maxes moved 2.2 MiB
+        linux = v2.gate_blocking(LEDGER, "WS-14", gate_report(v1_workload=v1_ok, agents_2=[96.4, 97.1, 97.1]),
+                                 gate_report(v1_workload=v1_ok, agents_2=[79.6, 94.9, 80.2]))
+        self.assertEqual(linux["blocking"], False, linux["rows"])
+        # both the median and the max rose beyond the allowance and the head is over the gate: the pull request did it
+        self.assertEqual(self.blocks("WS-14", gate_report(v1_workload=v1_ok, agents_2=[101.0, 102.0, 90.0]), base)[0], True)
+        self.assertEqual(self.blocks("WS-14", gate_report(v1_workload=v1_ok, agents_2=[99.0, 100.0, 90.0]), base)[0], False)
+        # every combination of three repeats drawn from the recorded darwin peaks: 140 of 729 blocked under the
+        # medians-only rule, 49 with a median margin, 7 now (a base of three low runs against a high head)
         import itertools
         peaks = (79.4, 87.2, 97.0)
         blocked = 0
         for h in itertools.product(peaks, repeat=3):
             for b in itertools.product(peaks, repeat=3):
                 blocked += v2.gate_blocking(LEDGER, "WS-14", gate_report(agents_2=list(h)), gate_report(agents_2=list(b)))["blocking"]
-        self.assertEqual(blocked, 49)
+        self.assertEqual(blocked, 7)
+
+    def test_tree_delta_needs_the_median_and_the_max(self):
+        # Linux v1-workload, one revision: medians 69.1 and 81.0 MiB (clusters flipped), maxes 75.9 and 81.6
+        base = v2.ledger_view(gate_report(v1_workload=[68.7, 69.1, 75.9]))
+        head = v2.ledger_view(gate_report(v1_workload=[81.6, 76.0, 81.0]))
+        chk = v2.ledger_check(LEDGER, "WS-10", head, base)
+        tree = chk["rows"][0]["tree"]
+        self.assertEqual((tree["median_delta_mib"], tree["max_delta_mib"], tree["delta_mib"]), (11.9, 5.7, 5.7))
+        self.assertNotEqual(chk["verdict"], "FAIL", chk["note"])
+        # a shift of the whole distribution fails
+        grown = v2.ledger_view(gate_report(v1_workload=[80.0, 80.5, 87.0]))
+        self.assertEqual(v2.ledger_check(LEDGER, "WS-10", grown, base)["verdict"], "FAIL")
 
     def test_a_scenario_the_base_could_not_run_is_judged_by_the_head(self):
         # WS-15 designating watcher-on, which its base cannot run (feature absent): the head's own verdict decides

@@ -103,12 +103,17 @@ deliberate commit bump.
 `rss_v2.sh ledger` reconciles the design lines, the §7.3 items and the workstream lines
 against the measured p50 and exits nonzero while any process is projected over its design
 line. The lines of workstreams already merged into the measured revision
-(`reference_measurement.included`) are inside the measurement and are not projected again. With `--workstream WS-NN` (on `run` with `--baseline`, or on `ledger` with `--head`
-and `--baseline`), each common scenario is checked:
+(`reference_measurement.included`) are inside the measurement and are not projected
+again. With `--workstream WS-NN` (on `run` with `--baseline`, or on `ledger` with
+`--head` and `--baseline`), each common scenario is checked:
 
 - tree: owned gate-peak delta ≤ line + 10 MiB; the owned+external peak delta must meet the
   same allowance, and a negative delta counts only net of external growth (moving work
-  into an external process is never a saving);
+  into an external process is never a saving). A peak delta is the smaller of the median
+  delta and the max delta over the valid repeats: these peaks are bimodal (on Linux the
+  Go daemon's RSS at the peak sample was 21.9 MiB in a low `v1-workload` run and 28.9 in
+  high ones), and the medians of three runs of one revision ranged 69.1-81.0 MiB while
+  the maxes stayed within 5.7 MiB;
 - process: the workstream's process p50 delta ≤ line + its tolerance (footprint p50 when
   both runs have it, because RSS p50 of a Go process on macOS moves with lazily reclaimed
   and compressed pages; the RSS delta is reported beside it);
@@ -117,15 +122,16 @@ and `--baseline`), each common scenario is checked:
   CI-suite scenario, a process within its §7.2 design line at the ledger's reference must
   stay within design steady + tolerance whatever the base shows, so small in-tolerance
   deltas still fail once they add up. A process already over its line at the reference
-  (today's stdio shims and per-call cores) is bounded on the reference scenario by
-  reference p50 (on the head's basis: footprint p50 when the reference has it, else RSS)
-  + the lines of the workstreams merged since + its own positive line + tolerance. The merged workstreams come from the first-parent merge commits in
+  (today's stdio shims and per-call cores) is bounded on the reference scenario by the
+  sum of its reference p50 (on the head's basis: footprint p50 when the reference has
+  it, else RSS), the lines of the workstreams merged since, its own positive line and
+  the tolerance. The merged workstreams come from the first-parent merge commits in
   `reference_measurement.base_commit..<base revision>` (`merge: parity/ws-NN into ...` or
   GitHub's `Merge pull request #N from .../ws-NN`); `merged_since` lists only those merged
-  without a merge commit (squash or rebase). On other
-  scenarios, and for that cumulative bound, the check is base-aware: it fails the pull
-  request that crosses the bound, and reports an overrun the base already had without
-  blocking (the delta checks still bound its growth).
+  without a merge commit (squash or rebase). On other scenarios, and for that cumulative
+  bound, the check is base-aware: it fails the pull request that crosses the bound, and
+  reports an overrun the base already had without blocking (the delta checks still bound
+  its growth).
 
 A line applies as declared on its designated scenarios and only as a ceiling
 (max(line, 0)) elsewhere. Verdicts: **FAIL** (blocks CI; also when a designated scenario
@@ -144,17 +150,19 @@ starting `ws-NN`). What blocks the pull request (`gate_blocking` in the report):
 
 - a CI-suite scenario's own gate verdict: any repeat over 95.4 MiB, or an invalid run;
 - a designated scenario outside the CI suite only on a regression beyond noise: the base's
-  median gate peak was within the gate, and the head's is over it and more than
-  `tolerance.tree_peak_mib` (10 MiB) above the base's. Without the margin, identical code
-  blocked 140 of the 729 combinations of three repeats drawn from agents-2's recorded
-  single-run peaks (79.4, 87.2, 97.0 MiB on a loaded M1); with it, 49 (a base drawing two
-  low runs against a head drawing two high ones). On Linux agents-2 sits at the gate: two
-  sets of three runs of `c3603a2` had medians 94.2 and 96.1 MiB, so the rule without the
-  margin would block a pull request measured as the second against the first. An overrun
-  the base already had is reported, not blocking. A side without a measurement (most repeats invalid) blocks: re-run.
-  A workstream whose acceptance is the absolute gate on its scenario opts in with
-  `gate_blocking: true` (WS-13, WS-30, WS-55), and its designated scenarios then block like
-  CI-suite ones;
+  median gate peak was within the gate, the head's is over it, and the peak delta (the
+  smaller of the median and max deltas) is over `tolerance.tree_peak_mib` (10 MiB).
+  Identical code blocked 140 of the 729 combinations of three repeats drawn from agents-2's
+  recorded darwin peaks (79.4, 87.2, 97.0 MiB) under the medians-only rule, 49 with a 10
+  MiB margin on the medians, and 7 now. On Linux agents-2 sits at the gate and its peak
+  is bimodal (twelve runs of `c3603a2`: three at 80-81 MiB, nine at 94-97): one revision
+  measured as base and head through the CI commands gave medians 80.2 and 97.1 MiB, which
+  the median margin would have blocked; drawing base and head triples from those twelve
+  runs, the median margin blocks 4.6% of the draws and the current rule 0.17%. An overrun
+  the base already had is reported, not blocking. A side without a measurement (most
+  repeats invalid) blocks: re-run. A workstream whose acceptance is the absolute gate on
+  its scenario opts in with `gate_blocking: true` (WS-13, WS-30, WS-55), and its
+  designated scenarios then block like CI-suite ones;
 - a scenario the base could not run (skipped for an absent feature): the head's own
   verdict, since the pull request introduced it;
 - a scenario the base ran and the head skipped, CI suite or not: the pull request removed
@@ -186,8 +194,10 @@ pull request from `parity/ws-10` into `feat/parity-v2` (both pushed first):
 
 1. Record the verdict and duration of `backend`, `bench-unit`, `integrations-pi`,
    `core-release`, `retrieval-gate` and `budget-gate` (each has a timeout; a cold Rust
-   cache is the slow case). `parity-scale` runs only on the schedule or a manual dispatch
-   with `parity: true`.
+   cache is the slow case). On the 6-core Linux box, running each job's commands took
+   0.6 min (`core-release`, cold), 1.4 min (`backend`, warm Go cache), 2.5 min
+   (`budget-gate`) and under 0.3 min for the others. `parity-scale` runs only on the
+   schedule or a manual dispatch with `parity: true`.
 2. `bench-unit` must report `test_linux_probe_reads_a_live_child` and
    `test_live_ps_parses_and_attributes_this_platform` as run, not skipped: they are the
    procps `ps` parse and the `/proc` smaps_rollup, status and io probes.

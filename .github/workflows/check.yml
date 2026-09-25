@@ -167,8 +167,8 @@ jobs:
       # design lines or roles fails unless a maintainer adds the budget-ledger-change label.
       # CI-suite scenarios block on their own gate verdict. A workstream's designated
       # parity-scale scenario blocks only on a regression beyond noise (base median within
-      # 95.4 MiB, head median over it and more than tolerance.tree_peak_mib above the base)
-      # unless its ledger entry sets gate_blocking (WS-13, WS-30, WS-55). A scenario the base
+      # 95.4 MiB, head median over it, median and max both more than tolerance.tree_peak_mib
+      # above the base's) unless its ledger entry sets gate_blocking (WS-13, WS-30, WS-55). A scenario the base
       # cannot run is judged by the head's verdict; one the head stops running blocks.
       # The base uses the head's binaries when rust-core is identical, else its own build.
       - name: Prepare the base revision
