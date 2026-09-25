@@ -329,6 +329,52 @@ func toolsListResult() map[string]any {
 	return map[string]any{"tools": list}
 }
 
+// callerToolsTimeout bounds the tools/list posture lookup so a slow API can't stall
+// session start; on any failure the full list is advertised (the API still enforces).
+const callerToolsTimeout = 2 * time.Second
+
+// callerTools asks the API which tools this caller can use on this deployment
+// (GET /api/auth/whoami "tools": the caller's roles, read-only mode, disabled tools
+// and profile applied). ok is false when the API can't say (unreachable, an older
+// API without the field), and tools/list then advertises every tool.
+func callerTools(ctx context.Context) (map[string]bool, bool) {
+	ctx, cancel := context.WithTimeout(ctx, callerToolsTimeout)
+	defer cancel()
+	resp, err := callAPIResp(ctx, http.MethodGet, "/api/auth/whoami", "", nil)
+	if err != nil || resp.status != http.StatusOK {
+		return nil, false
+	}
+	var who struct {
+		Tools *[]string `json:"tools"`
+	}
+	if json.Unmarshal([]byte(resp.body), &who) != nil || who.Tools == nil {
+		return nil, false
+	}
+	allowed := map[string]bool{}
+	for _, t := range *who.Tools {
+		allowed[t] = true
+	}
+	return allowed, true
+}
+
+// toolsListFor is tools/list limited to the tools the caller can use, so an agent
+// is not offered remember/verify under a reader token or in read-only mode.
+func toolsListFor(ctx context.Context) map[string]any {
+	res := toolsListResult()
+	allowed, ok := callerTools(ctx)
+	if !ok {
+		return res
+	}
+	all := res["tools"].([]map[string]any)
+	kept := make([]map[string]any, 0, len(all))
+	for _, t := range all {
+		if allowed[t["name"].(string)] {
+			kept = append(kept, t)
+		}
+	}
+	return map[string]any{"tools": kept}
+}
+
 // callTool runs one tool and returns the MCP tools/call result object. Required
 // args and value types are validated up front in dispatch (buildArgs); the
 // missing-required check here is a defensive backstop for direct callers/tests.
@@ -468,7 +514,7 @@ func dispatchCtx(ctx context.Context, method string, params json.RawMessage) (an
 			"serverInfo":      map[string]any{"name": "xmustard", "version": "0.1.0"},
 		}, nil
 	case "tools/list":
-		return toolsListResult(), nil
+		return toolsListFor(ctx), nil
 	case "tools/call":
 		// decoding arguments copies their text once more: reserve before decoding
 		if scope, owned := budget.ScopeFor(ctx); !owned {
