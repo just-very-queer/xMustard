@@ -147,7 +147,9 @@ Source: `docs/research/PARITY_REQUIREMENTS_2026-09-25.md` (requirements, process
 
 **Acceptance.** With the flag on, the nine tools run with zero per-call xmustard-core execs; only git children remain until WS-15. Warm-call latency and process counts are reported against the one-shot path. A subcommand dispatch table is introduced so later workstreams add one entry each.
 
-**Collision risk.** rust-core/src/bin/xmustard-core.rs and lib.rs are also touched by WS-00 (cleanup, drift) and WS-07, so land the dispatch-table refactor first and keep it small. root.go was touched at an older base by the diagnostics session's tree; that change is likely already at HEAD, so risk is low. No diagnostics_*.go files.
+**Collision risk.** rust-core/src/bin/xmustard-core.rs and lib.rs are also touched by WS-00 (cleanup, drift) and WS-07, so land the dispatch-table refactor first and keep it small. WS-03 changed the `repo-key` arm of xmustard-core.rs (it calls `repo_key_identity`, which adds `ignored_dirs`). root.go was touched at an older base by the diagnostics session's tree; that change is likely already at HEAD, so risk is low. No diagnostics_*.go files.
+
+**Follow-up from WS-03.** Carry the request's repository identity (observed once per request by the Go RequestContext) on the worker request, so symbol-graph paths reuse it instead of recomputing `source_identity` (PAR-FRESH-02's remaining part; WS-14 keys the graph cache by it).
 
 ### WS-03 — Per-request context kernel: workspace registry, identity sampled once, evidence page identity cache, grounding split
 
@@ -170,6 +172,11 @@ Source: `docs/research/PARITY_REQUIREMENTS_2026-09-25.md` (requirements, process
 **Acceptance.** ground does ≤1 identity sample and 0 snapshot.json parses. Expanding a 16 MiB original no longer spawns a process per page, and its measured expansion time is recorded. grounding.go is split into section files with no behavior change.
 
 **Collision risk.** grounding.go (w0-kernel via WS-00; later WS-20/21/22/28/31/33 own the section files this creates). evidence/store.go is shared with WS-08, which only adds files plus a reduce.go hook; WS-03 owns the store.go change. evidence_routes.go is also touched by WS-41 later. workspace_reads.go is not touched by the diagnostics session at HEAD.
+
+**Closeout notes (parity/ws-03).**
+- Files touched beyond the list above: `grounding_session.go` (created here; WS-33 and WS-34 modify it), `repo_stat_unix.go` / `repo_stat_other.go` (new: the spawn-free working-tree fingerprint), `symbolgraph.go` and `workspace_lifecycle.go` (registry lookups in place of snapshot parses; WS-22 owns both), `knowledge.go` and `semantic_materialization.go` (registry lookups; WS-14 and WS-18 touch knowledge.go), `frontend/src/lib/api.ts` (SessionGrounding nullable counts), `rust-core/src/indexcache.rs` and `rust-core/src/bin/xmustard-core.rs` (`repo-key` also reports `ignored_dirs`, the directories git ignores as a whole, from the same `git status` run with `--ignored=matching`; the key is unchanged), and `scripts/e2e/mcp_evidence.py`.
+- PAR-FRESH-02 is partial. The per-request identity is observed once and consumed by the evidence middleware (before and after execution). Handlers take the request's resolved root but not its identity, and the Rust graph paths (`build_symbol_graph_cached`, `build_symbol_graph`, `build_graph` in symbolgraph.rs) still compute their own `source_identity` per call. Passing the request identity to the core is a follow-up for WS-02 (a request field on the worker protocol) and WS-14 (graph cache keyed by it).
+- Freshness semantics: a page labelled `current` is current as of an identity observation at most `current_key_age_ms` old. The identity cache reuses an identity only while a fingerprint of everything `git status --untracked-files=all` reads (every non-ignored directory, the index, refs, config and ignore files) is identical and settled under Git's racy rule; the remaining blind spots (config pulled in through `[include]`, system config under other prefixes, clocks of network filesystems) are listed in `repo_stat_unix.go` and bounded by the 5 s TTL.
 
 ### WS-04 — MCP server package and protocol modernization
 
@@ -414,7 +421,7 @@ Source: `docs/research/PARITY_REQUIREMENTS_2026-09-25.md` (requirements, process
 
 **Acceptance.** No JSON graph deserialization on tool paths when an index exists. The 800-file cap is gone behind the envelope config. The gate v2 run is attached.
 
-**Collision risk.** search.rs is shared with WS-18 (swap the graph source only; leave lanes to WS-18). symbolgraph.rs was changed by w0-drift (WS-00). serve.rs is from WS-02.
+**Collision risk.** search.rs is shared with WS-18 (swap the graph source only; leave lanes to WS-18). symbolgraph.rs was changed by w0-drift (WS-00). serve.rs is from WS-02. WS-03 changed indexcache.rs (`repo_key_identity`, `ignored_dirs`) and knowledge.go (registry lookups), so rebase on it.
 
 **Correction.** Critic: RSS acceptance uses a real resolved graph (>=5 edges/symbol) and includes swap double-buffering; decide file-backed CSR segments vs in-memory from measurement.
 
@@ -498,7 +505,7 @@ Source: `docs/research/PARITY_REQUIREMENTS_2026-09-25.md` (requirements, process
 
 **Acceptance.** search returns {path, lines, snippet, lanes_matched, scores, reasons, uid}. The retrieval gate passes at the improved threshold. The BM25 cache stays within 5-8 MiB (gate v2).
 
-**Collision risk.** search.rs is shared with WS-14 (graph source) and WS-37 (embedding lane), so sequence the edits. knowledge.go was changed by w0-feedback (WS-00).
+**Collision risk.** search.rs is shared with WS-14 (graph source) and WS-37 (embedding lane), so sequence the edits. knowledge.go was changed by w0-feedback (WS-00) and by WS-03 (registry lookups).
 
 ### WS-19 — Memory lifecycle writes: history API, supersede/retire/retract/purge, CAS edits, expiry, provenance, verify outcomes
 
@@ -586,7 +593,7 @@ Source: `docs/research/PARITY_REQUIREMENTS_2026-09-25.md` (requirements, process
 
 **Acceptance.** ground and impact work on a fresh install in core-only mode, and the cliffs are bounded with tests.
 
-**Collision risk.** changetrack.rs was changed by w0-drift (WS-00) and is also touched by WS-15, so land WS-22 first. main.go gets a single line to thread the clustering context. grounding_index.go was created by WS-03.
+**Collision risk.** changetrack.rs was changed by w0-drift (WS-00) and is also touched by WS-15, so land WS-22 first. main.go gets a single line to thread the clustering context. grounding_index.go was created by WS-03, which also changed workspace_lifecycle.go and symbolgraph.go (registry lookups in place of snapshot parses), so rebase on it.
 
 ### WS-23 — Hook service, static hook client and Claude Code adapter plugin
 
@@ -825,7 +832,7 @@ No Rust or git spawn happens per hook.
 **Requirements.** PAR-PROV-06, PAR-HAR-04, PAR-HAR-05, PAR-PROV-08, PAR-PROV-07, PAR-GOV-14
 
 **Files.** `api-go/internal/workspaceops/session_ledger.go`, `api-go/internal/workspaceops/session_snapshot.go`, `api-go/internal/workspaceops/handoff_capsule.go`, `api-go/internal/workspaceops/grounding_session.go`, `api-go/internal/govstore/sessions.go`, `api-go/internal/hooks/claude.go`, `api-go/internal/mcpserver/tool_remember.go`, `api-go/internal/workspaceops/session_ledger_test.go`  
-**New modules.** `api-go/internal/workspaceops/session_ledger.go`, `api-go/internal/workspaceops/session_snapshot.go`, `api-go/internal/workspaceops/handoff_capsule.go`, `api-go/internal/workspaceops/grounding_session.go`
+**New modules.** `api-go/internal/workspaceops/session_ledger.go`, `api-go/internal/workspaceops/session_snapshot.go`, `api-go/internal/workspaceops/handoff_capsule.go` (`grounding_session.go` already exists: WS-03 created it with GroundingUnknown and the summary; modify it)
 
 **Tests required.**
 - The snapshot is ≤2 KB and prioritized; handles in it are expandable
@@ -837,7 +844,7 @@ No Rust or git spawn happens per hook.
 
 **Acceptance.** Continuity survives client compaction and client switches, backed by evidence.
 
-**Collision risk.** hooks/claude.go (WS-23, WS-31) and tool_remember.go.
+**Collision risk.** hooks/claude.go (WS-23, WS-31) and tool_remember.go. grounding_session.go was created by WS-03 (GroundingUnknown, summarize).
 
 **Correction.** Critic: SessionEnd/Stop work is async (Claude Code gives SessionEnd hooks a shared 1.5 s budget).
 
@@ -863,7 +870,7 @@ No Rust or git spawn happens per hook.
 
 **Acceptance.** Past sessions from existing agents are searchable and cited by consolidation jobs. Transient import RSS is recorded.
 
-**Collision risk.** grounding_session.go (WS-33) and tool_recall.go (WS-20, WS-28, WS-29).
+**Collision risk.** grounding_session.go (created by WS-03, extended by WS-33) and tool_recall.go (WS-20, WS-28, WS-29).
 
 ### WS-35 — Impact v2: tiers, risk, epistemic envelope, typed filters, trace caps, diff-to-symbol and import cycles
 
