@@ -1125,3 +1125,38 @@ func TestWithinAndMatch(t *testing.T) {
 		t.Error("a parent of every root matched")
 	}
 }
+
+// structured() shapes: objects keep their members, anything else is wrapped, and the
+// result is always one valid JSON object carrying _xmustard.
+func TestStructuredShapes(t *testing.T) {
+	cases := []struct {
+		text string
+		want map[string]any
+	}{
+		{`{}`, map[string]any{}},
+		{"  {\"a\":1}\n", map[string]any{"a": float64(1)}},
+		{`[1,2]`, map[string]any{"result": []any{float64(1), float64(2)}}},
+		{`"s"`, map[string]any{"result": "s"}},
+		{`{"a":1},{"b":2}`, map[string]any{"text": `{"a":1},{"b":2}`}},
+		{`not json`, map[string]any{"text": "not json"}},
+		{``, map[string]any{"text": ""}},
+		{`{"_xmustard":1}`, map[string]any{"result": map[string]any{"_xmustard": float64(1)}}},
+	}
+	for _, c := range cases {
+		raw, err := structured(context.Background(), c.text, map[string]any{"k": "v"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got map[string]any
+		if err := json.Unmarshal(raw, &got); err != nil {
+			t.Fatalf("%q: invalid structuredContent %s: %v", c.text, raw, err)
+		}
+		if !reflect.DeepEqual(got[resultMetaMember], map[string]any{"k": "v"}) {
+			t.Fatalf("%q: %s member: %v", c.text, resultMetaMember, got)
+		}
+		delete(got, resultMetaMember)
+		if !reflect.DeepEqual(got, c.want) {
+			t.Fatalf("%q: got %v, want %v", c.text, got, c.want)
+		}
+	}
+}

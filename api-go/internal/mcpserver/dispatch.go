@@ -198,7 +198,8 @@ func (s *Session) firstEcho(ws Workspace) bool {
 // structured builds structuredContent from a result's text without decoding it into
 // Go values (a projection can be up to 1 MiB, a raw body 16 MiB): a JSON object is
 // reused as is with the reserved _xmustard member spliced in; any other JSON value or
-// text is wrapped as {"result": value} or {"text": text}.
+// text is wrapped as {"result": value} or {"text": text}. The spliced bytes are
+// validated once, in place, so the text is copied exactly once.
 func structured(ctx context.Context, text string, extra map[string]any) (json.RawMessage, error) {
 	meta, err := json.Marshal(extra)
 	if err != nil {
@@ -208,30 +209,35 @@ func structured(ctx context.Context, text string, extra map[string]any) (json.Ra
 	if err := ReserveReply(ctx, 2*(len(text)+len(meta))+64); err != nil {
 		return nil, err
 	}
-	trimmed := bytes.TrimSpace([]byte(text))
-	var out bytes.Buffer
-	switch {
-	case len(trimmed) > 0 && trimmed[0] == '{' && json.Valid(trimmed) && !bytes.Contains(trimmed, []byte(`"`+resultMetaMember+`"`)):
-		body := bytes.TrimSpace(trimmed[1 : len(trimmed)-1])
-		out.WriteByte('{')
-		if len(body) > 0 {
-			out.Write(body)
-			out.WriteByte(',')
-		}
-	case len(trimmed) > 0 && json.Valid(trimmed):
-		out.WriteString(`{"result":`)
-		out.Write(trimmed)
-		out.WriteByte(',')
-	default:
-		quoted, _ := json.Marshal(text)
-		out.WriteString(`{"text":`)
-		out.Write(quoted)
-		out.WriteByte(',')
+	t := strings.TrimSpace(text)
+	tail := `"` + resultMetaMember + `":`
+	buf := make([]byte, 0, len(t)+len(meta)+len(tail)+16)
+	finish := func(buf []byte) []byte {
+		buf = append(buf, tail...)
+		buf = append(buf, meta...)
+		return append(buf, '}')
 	}
-	out.WriteString(`"` + resultMetaMember + `":`)
-	out.Write(meta)
-	out.WriteByte('}')
-	return json.RawMessage(out.Bytes()), nil
+	if len(t) >= 2 && t[0] == '{' && t[len(t)-1] == '}' && !strings.Contains(t, `"`+resultMetaMember+`"`) {
+		body := strings.TrimSpace(t[1 : len(t)-1])
+		buf = append(buf, '{')
+		if body != "" {
+			buf = append(append(buf, body...), ',')
+		}
+		if buf = finish(buf); json.Valid(buf) {
+			return buf, nil
+		}
+		buf = buf[:0]
+	}
+	if t != "" {
+		buf = append(append(append(buf, `{"result":`...), t...), ',')
+		if buf = finish(buf); json.Valid(buf) {
+			return buf, nil
+		}
+		buf = buf[:0]
+	}
+	quoted, _ := json.Marshal(text)
+	buf = append(append(append(buf, `{"text":`...), quoted...), ',')
+	return finish(buf), nil
 }
 
 // statusText names an HTTP status for error messages.
