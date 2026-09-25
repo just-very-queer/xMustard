@@ -49,7 +49,7 @@ for Git repositories. The default Rust build does not enable `semantic-onnx`.
 | Search, impact and change tracking | `search.rs`, `semantic.rs`, `changetrack.rs` | Retrieval lanes, graph traversal, baseline and signature differences |
 | Diagnostics and live language servers | `diagnostics.rs`, `lsp.rs`, `lsp_session.rs`; Go LSP adapters | LSP is optional; transient results do not require Postgres |
 | Verification and retained goal runtime | `verification.rs`, `goalruntime.rs`; Go run control | Process execution, evidence and persisted operational state |
-| Resource accounting | `api-go/internal/budget/` | Shared transient-byte accounting; currently not a complete RSS bound |
+| Resource accounting | `api-go/internal/budget/` | 24 MiB transient-byte pool and helper-child limit; one heavy slot (bounded wait, owner label) behind an RSS watchdog on the xMustard-owned process tree that refuses heavy work near a soft ceiling; static component reservations; Go memory limit; data-movement counters; all reported in the `/api/health` budget block. Byte admission is still not a complete RSS bound |
 | Shared wire models | Go request/record structs, Rust `models.rs`, `frontend/src/lib/types.ts` | Contract changes need matching consumers |
 | Optional operator UI | `frontend/src/` | Full API consumer; outside the current development focus |
 
