@@ -9,6 +9,7 @@ BINDIR := $(PREFIX)/bin
 
 .PHONY: build install backend go-api frontend go-api-build rust-core-check \
 	rust-core-scan migration-check dev build-ui scan check check-backend check-frontend
+.PHONY: bench-test bench-gate bench-parity bench-retrieval
 
 build:
 	cd rust-core && cargo build --release --bin xmustard-core
@@ -68,3 +69,22 @@ check-backend:
 check-frontend:
 	cd frontend && npm run lint
 	cd frontend && npm run build
+
+# Budget gate v2 and the retrieval gate (scripts/bench). BENCH_OUT holds report.json and
+# report.md per gate. WORKSTREAM + BASELINE add the ledger delta check (see budget_ledger.json).
+BENCH_OUT ?= bench-out
+BENCH_ARGS ?=
+
+bench-test:
+	python3 -m unittest discover -s scripts/bench -p 'test_*.py'
+
+bench-gate:
+	scripts/bench/rss_v2.sh run --suite ci --out $(BENCH_OUT)/gate $(BENCH_ARGS) \
+		$(if $(WORKSTREAM),--workstream $(WORKSTREAM) --baseline $(BASELINE))
+
+bench-parity:
+	scripts/bench/rss_v2.sh run --suite parity --out $(BENCH_OUT)/parity $(BENCH_ARGS)
+
+bench-retrieval:
+	mkdir -p $(BENCH_OUT)
+	scripts/bench/retrieval-gate.sh --report $(BENCH_OUT)/retrieval-gate.json

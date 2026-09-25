@@ -583,6 +583,15 @@ class FixturePins(unittest.TestCase):
             self.assertEqual(info["verified"], spec["workspace"])
 
 
+class RepoWiring(unittest.TestCase):
+    def test_makefile_targets(self):
+        with open(os.path.join(REPO, "Makefile")) as f:
+            text = f.read()
+        for target in ("bench-parity:", "bench-gate:", "bench-retrieval:", "bench-test:"):
+            self.assertIn(target, text)
+        self.assertIn("rss_v2.sh run --suite parity", text)
+
+
 class Rendering(unittest.TestCase):
     def test_markdown_carries_the_verdict_and_external_lines(self):
         s = v2.SamplerV2(roots(shims=(), agent=None), REGISTRY, FakeProbe(stats={100: {"footprint_bytes": 2**20}}))
