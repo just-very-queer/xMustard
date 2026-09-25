@@ -20,5 +20,8 @@ func noteGitIfStarted(cmd *exec.Cmd) {
 	}
 }
 
+// noteHelperSpawn records one started short-lived helper (ast-grep, an agent CLI probe).
+func noteHelperSpawn() { budget.NoteSpawn(budget.SpawnHelper) }
+
 // noteHashed records n bytes fed through a content hash.
 func noteHashed(n int) { budget.NoteHashed(int64(n)) }

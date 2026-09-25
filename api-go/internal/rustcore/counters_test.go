@@ -10,9 +10,11 @@ import (
 	"xmustard/api-go/internal/budget"
 )
 
-// PAR-EVAL-04: every started rust-core child is counted as a core spawn, a tracked
-// helper as a helper spawn, and a command that never started is not counted.
-func TestCoreAndHelperSpawnsAreCounted(t *testing.T) {
+// PAR-EVAL-04: every started rust-core child is counted as a core spawn where it is
+// started, and a command that never started is not counted. TrackChild itself counts
+// nothing: its callers know the kind (the resident worker, ast-grep, agent CLI probes)
+// and count it there, so a generic tracking path can never mislabel a spawn.
+func TestCoreSpawnsAreCountedAtTheirCallSites(t *testing.T) {
 	withPool(t, 64<<20)
 	core := filepath.Join(t.TempDir(), "xmustard-core")
 	if err := os.WriteFile(core, []byte("#!/bin/sh\necho '{}'\n"), 0o755); err != nil {
@@ -41,7 +43,7 @@ func TestCoreAndHelperSpawnsAreCounted(t *testing.T) {
 	if got := after.Spawns["core"] - before.Spawns["core"]; got != 2 {
 		t.Fatalf("core spawns counted %d, want 2 (a failed start is not a spawn)", got)
 	}
-	if got := after.Spawns["helper"] - before.Spawns["helper"]; got != 1 {
-		t.Fatalf("helper spawns counted %d, want 1", got)
+	if after.SpawnsTotal-before.SpawnsTotal != 2 {
+		t.Fatalf("TrackChild must not count a spawn of its own: %v -> %v", before.Spawns, after.Spawns)
 	}
 }

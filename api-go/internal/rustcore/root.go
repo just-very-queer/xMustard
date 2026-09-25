@@ -61,6 +61,7 @@ func runCoreCtx(parent context.Context, sub string, args ...string) ([]byte, err
 	cmd.Stdout = out
 	cmd.Stderr = errb
 	runErr := runTracked(cmd)
+	noteCoreSpawn(cmd)
 	// Reap any descendant the child left in its group (normal exit included): the
 	// owned tree ends with the call.
 	KillProcessTree(cmd)
@@ -127,6 +128,7 @@ func runBoundedCmd(cmd *exec.Cmd) (stdout []byte, stderr string, over bool, err 
 		isolateProcessGroup(cmd)
 	}
 	err = runTracked(cmd)
+	noteCoreSpawn(cmd)
 	KillProcessTree(cmd)
 	if out.Refused() || errb.Refused() {
 		return nil, errb.String(), false, budget.ErrOverloaded
@@ -181,7 +183,7 @@ func coreCommandContext(ctx context.Context, sub string, args ...string) *exec.C
 	name, full, dir := coreInvocation(sub, args...)
 	cmd := exec.CommandContext(ctx, name, full...)
 	cmd.Dir = dir
-	cmd.Env = budget.ChildEnv() // nil (inherit) except for the Linux glibc arena cap
+	cmd.Env = coreChildEnv(sub) // nil (inherit) except for the Linux glibc arena cap
 	IsolateProcessTree(cmd)
 	return cmd
 }

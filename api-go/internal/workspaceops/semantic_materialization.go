@@ -688,6 +688,7 @@ func semanticFileMetadata(workspaceRoot string, relativePath string) (*int64, *s
 		return nil, nil, fmt.Errorf("read semantic file content: %w", err)
 	}
 	size := int64(len(content))
+	noteHashed(len(content))
 	sum := sha1.Sum(content)
 	hash := hex.EncodeToString(sum[:])
 	return &size, &hash, nil
@@ -931,6 +932,7 @@ func astGrepQuery(ctx context.Context, repoRoot string, pattern string, language
 		return []SemanticPatternMatchRecord{}, optionalString(binary), &message, false, nil
 	}
 	defer rustcore.TrackChild(cmd)()
+	noteHelperSpawn()
 	matches := []SemanticPatternMatchRecord{}
 	truncated := false
 	scanner := bufio.NewScanner(stdout)
