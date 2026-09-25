@@ -9,11 +9,11 @@
   "caps": {
     "lean": {
       "2024-11-05": {"reader": 3999, "proposer": 4715, "verifier": 4630, "agent": 5346},
-      "2025-06-18": {"reader": 6884, "proposer": 8006, "verifier": 7918, "agent": 9040}
+      "2025-06-18": {"reader": 6646, "proposer": 7768, "verifier": 7680, "agent": 8802}
     },
     "full": {
       "2024-11-05": {"reader": 4230, "proposer": 4946, "verifier": 4861, "agent": 5577},
-      "2025-06-18": {"reader": 7115, "proposer": 8237, "verifier": 8149, "agent": 9271}
+      "2025-06-18": {"reader": 6877, "proposer": 7999, "verifier": 7911, "agent": 9033}
     }
   }
 }
