@@ -46,6 +46,7 @@ for Git repositories. The default Rust build does not enable `semantic-onnx`.
 | Postgres materialization | `workspaceops/pg*.go`, `backend/sql/` | Optional; JSON remains operational write authority |
 | Rust process invocation | `api-go/internal/rustcore/` | Binary resolution, subprocess output, deadlines and wire shaping |
 | Repository files, roles, graph and coverage | `rust-core/src/symbolgraph.rs`, `indexcache.rs`, `treesitter.rs`, `repomap.rs` | Bounded file access, graph/cache generation, extracted symbols |
+| Code index store (not yet read by any tool) | `index/` (`xmustard-core index build\|update\|stats`) | Per-workspace SQLite `index.db` under `<git-dir>/xmustard-cache/index-v3/`; streaming one-file-at-a-time extraction; incremental updates under a dirty flag; lexical edges ported from `symbolgraph.rs` |
 | Search, impact and change tracking | `search.rs`, `semantic.rs`, `changetrack.rs` | Retrieval lanes, graph traversal, baseline and signature differences |
 | Diagnostics and live language servers | `diagnostics.rs`, `lsp.rs`, `lsp_session.rs`; Go LSP adapters | LSP is optional; transient results do not require Postgres |
 | Verification and retained goal runtime | `verification.rs`, `goalruntime.rs`; Go run control | Process execution, evidence and persisted operational state |

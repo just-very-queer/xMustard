@@ -1002,6 +1002,7 @@ fn main() {
         "changetrack" => {
             run_changetrack_command(args);
         }
+        "index" => std::process::exit(xmustard_core::index::run_cli(args)),
         "symbolgraph" => {
             run_symbolgraph_command(args);
         }
