@@ -35,6 +35,7 @@ docs/reviews/*
 !docs/reviews/2026-09-24-go-audit.md
 !docs/reviews/2026-09-24-rust-audit.md
 !docs/reviews/2026-09-24-runtime-smoke.md
+!docs/reviews/2026-09-25-full-project-assessment.md
 !docs/reviews/2026-09-24-fable-plan-review.md
 !docs/reviews/2026-09-24-fable-plan-recheck.md
 !docs/reviews/2026-09-24-fable-recall-review.md
