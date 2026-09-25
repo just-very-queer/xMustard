@@ -299,21 +299,33 @@ func (c memoryCaller) id() string {
 	return workspaceops.OpenModeIdentity
 }
 
-// editor binds a content edit to the caller: an admin edits any entry, anyone else only
-// entries they authored. The open-mode caller already passes every requireRole gate
-// (it is the local operator), so it edits as admin.
-func (c memoryCaller) editor() workspaceops.ContextEditor {
-	return workspaceops.ContextEditor{ID: c.id(), Admin: c.openMode || c.principal.Role == "admin"}
+// actor binds a memory write to the caller and marks whether it happened in open mode.
+// For content edits an admin edits any entry, anyone else only entries they authored;
+// the open-mode caller already passes every requireRole gate (it is the local
+// operator), so it edits as admin.
+func (c memoryCaller) actor() workspaceops.ContextActor {
+	return workspaceops.ContextActor{ID: c.id(), Admin: c.openMode || c.principal.Role == "admin", OpenMode: c.openMode}
 }
 
 // requireMemoryCaller gates a governed-memory write on the agent role and resolves the
 // caller. requireRole admits an unauthenticated request only when no credentials are
-// configured, so a nil principal here means open mode.
+// configured, so a nil principal here means open mode. A principal holding the reserved
+// open-mode identity (an env token, or a token minted before the id was reserved) is
+// refused, since it would pass as the author of every open-mode memory.
 func requireMemoryCaller(w http.ResponseWriter, r *http.Request) (memoryCaller, bool) {
 	if !requireRole(w, r, "agent") {
 		return memoryCaller{}, false
 	}
 	p := principalFromContext(r.Context())
+	if p != nil && workspaceops.IsOpenModeIdentity(p.ID) {
+		dd := envDefault("XMUSTARD_DATA_DIR", "../backend/data")
+		workspaceops.RecordAuthAudit(dd, workspaceops.AuthAuditEvent{
+			Action: "denied", Actor: p.ID, Detail: "principal id is reserved for open mode",
+			Method: r.Method, Path: r.URL.Path, RemoteAddr: r.RemoteAddr,
+		})
+		writeJSON(w, http.StatusForbidden, map[string]any{"error": fmt.Sprintf("principal id %q is reserved for open mode; mint a token under another id", p.ID)})
+		return memoryCaller{}, false
+	}
 	return memoryCaller{principal: p, openMode: p == nil}, true
 }
 
@@ -321,7 +333,26 @@ func requireMemoryCaller(w http.ResponseWriter, r *http.Request) (memoryCaller, 
 // falls back to query params). A malformed body is a 400, never silently empty, and a
 // body cut off at the size cap is a 413. Returns false once it has written the error.
 func requireWellFormedJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
-	err := decodeOptionalJSONBody(r, dst)
+	return writeJSONBodyError(w, decodeOptionalJSONBody(r, dst))
+}
+
+// requireJSONBody is requireWellFormedJSON for a handler with no query fallback: an
+// absent or blank body is a 400 too.
+func requireJSONBody(w http.ResponseWriter, r *http.Request, dst any) bool {
+	var raw json.RawMessage // left empty only by an absent or blank body
+	err := decodeOptionalJSONBody(r, &raw)
+	if err == nil && len(raw) == 0 {
+		err = errors.New("request body is required")
+	}
+	if err == nil {
+		err = json.Unmarshal(raw, dst)
+	}
+	return writeJSONBodyError(w, err)
+}
+
+// writeJSONBodyError maps a body read/decode error to 413 (cut off at the size cap) or
+// 400, and reports whether the body was fine.
+func writeJSONBodyError(w http.ResponseWriter, err error) bool {
 	if err == nil {
 		return true
 	}
@@ -3956,11 +3987,10 @@ func registerRoutes(mux *http.ServeMux) {
 			req.Note = q.Get("note")
 		}
 		// The agent identity is the AUTHENTICATED principal, never a caller-asserted
-		// string. In open mode (no auth configured) all unauthenticated callers
-		// collapse to a single identity, so N fabricated agent names cannot satisfy
-		// the multi-agent gate.
-		req.Agent = caller.id()
-		result, err := workspaceops.VerifyContext(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), r.PathValue("entry_id"), req.Agent, req.Approve, req.Note)
+		// string (req.Agent is ignored). In open mode (no auth configured) all
+		// unauthenticated callers collapse to a single identity, so N fabricated agent
+		// names cannot satisfy the multi-agent gate.
+		result, err := workspaceops.VerifyContextAs(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), r.PathValue("entry_id"), caller.actor(), req.Approve, req.Note)
 		issueIntel(w, err, result)
 	})
 	mux.HandleFunc("PUT /api/workspaces/{workspace_id}/context/{entry_id}", func(w http.ResponseWriter, r *http.Request) {
@@ -3974,12 +4004,14 @@ func registerRoutes(mux *http.ServeMux) {
 		var req struct {
 			Content string `json:"content"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON body"})
+		// Same strict body handling as propose/verify, but required: 400 on an absent,
+		// malformed or trailing-junk body, 413 past the cap. Empty content is a 400
+		// from UpdateContextContent, so a misspelled field cannot blank a memory.
+		if !requireJSONBody(w, r, &req) {
 			return
 		}
 		dd := envDefault("XMUSTARD_DATA_DIR", "../backend/data")
-		result, err := workspaceops.UpdateContextContent(dd, r.PathValue("workspace_id"), r.PathValue("entry_id"), req.Content, caller.editor())
+		result, err := workspaceops.UpdateContextContent(dd, r.PathValue("workspace_id"), r.PathValue("entry_id"), req.Content, caller.actor())
 		if errors.Is(err, workspaceops.ErrNotEntryAuthor) {
 			workspaceops.RecordAuthAudit(dd, workspaceops.AuthAuditEvent{
 				Action: "denied", Actor: caller.id(), Detail: "not the author of context entry " + r.PathValue("entry_id"),

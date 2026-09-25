@@ -45,6 +45,17 @@ const OpenModeIdentity = "anonymous"
 // ErrNotEntryAuthor: only an entry's author or an admin may amend its content.
 var ErrNotEntryAuthor = errors.New("only the entry's author or an admin may edit it")
 
+// ErrReadonlyVerified: a readonly entry that is already verified can only be superseded
+// by a new proposal. UpdateContextContent wraps it in a Conflict, so HTTP returns 409.
+var ErrReadonlyVerified = errors.New("readonly entry is verified")
+
+// IsOpenModeIdentity reports whether id is the open-mode identity, compared the way
+// verification tallies compare agents (trimmed, case-insensitive). The identity is
+// reserved: no token may be minted for it.
+func IsOpenModeIdentity(id string) bool {
+	return strings.EqualFold(strings.TrimSpace(id), OpenModeIdentity)
+}
+
 type ContextVerification struct {
 	Agent   string `json:"agent"`
 	Approve bool   `json:"approve"`
@@ -63,6 +74,9 @@ type ContextEntry struct {
 	Promoted              bool                  `json:"promoted"`   // visible in active shared context
 	Verifications         []ContextVerification `json:"verifications"`
 	RequiredVerifications int                   `json:"required_verifications"`
+	// RequireVerification records that the proposal asked for peer verification
+	// (require_verification:true), so an open-mode assertion never promotes it.
+	RequireVerification bool `json:"require_verification,omitempty"`
 	// VerificationMode is the trust basis of a promoted entry: peer_verified,
 	// self_asserted_open_mode or single_agent. Empty while pending or rejected. Entries
 	// written before the field existed are labelled on read (verificationMode).
@@ -109,11 +123,14 @@ type ProposeContextRequest struct {
 	OpenMode bool `json:"-"`
 }
 
-// ContextEditor is who amends an entry's content. Admin may edit any entry; anyone
-// else only an entry whose Source is exactly their ID.
-type ContextEditor struct {
-	ID    string
-	Admin bool
+// ContextActor is who writes to an entry. ID is recorded as its author or verifier.
+// Admin may edit any entry's content; anyone else only an entry whose Source is exactly
+// their ID. OpenMode marks a write made with no credentials configured (ID is then
+// OpenModeIdentity): open mode is a property of each write, not of the entry.
+type ContextActor struct {
+	ID       string
+	Admin    bool
+	OpenMode bool
 }
 
 // safeIDPattern rejects anything that could escape the data dir or be a path
@@ -263,6 +280,7 @@ type contextEntryMeta struct {
 	Promoted              bool                  `json:"promoted"`
 	Verifications         []ContextVerification `json:"verifications"`
 	RequiredVerifications int                   `json:"required_verifications"`
+	RequireVerification   bool                  `json:"require_verification,omitempty"`
 	VerificationMode      string                `json:"verification_mode"`
 	CreatedAt             string                `json:"created_at"`
 	UpdatedAt             string                `json:"updated_at"`
@@ -283,7 +301,8 @@ func (m *contextEntryMeta) toEntry() ContextEntry {
 		ID: m.ID, WorkspaceID: m.WorkspaceID, Title: m.Title, Source: m.Source,
 		Permission: m.Permission, Status: m.Status, Promoted: m.Promoted,
 		Verifications: m.Verifications, RequiredVerifications: m.RequiredVerifications,
-		VerificationMode: m.VerificationMode, CreatedAt: m.CreatedAt, UpdatedAt: m.UpdatedAt, Paths: m.Paths,
+		RequireVerification: m.RequireVerification, VerificationMode: m.VerificationMode,
+		CreatedAt: m.CreatedAt, UpdatedAt: m.UpdatedAt, Paths: m.Paths,
 		PathHashes: m.PathHashes, SearchTokens: m.SearchTokens, ContentHash: m.ContentHash,
 		ContentDigest: m.ContentDigest,
 		// Content is loaded for the returned window; Stale/StalePaths at read time.
@@ -362,7 +381,8 @@ func writeContextMetaCache(dataDir, workspaceID string, entries []ContextEntry) 
 			ID: e.ID, WorkspaceID: e.WorkspaceID, Title: e.Title, Source: e.Source,
 			Permission: e.Permission, Status: e.Status, Promoted: e.Promoted,
 			Verifications: e.Verifications, RequiredVerifications: e.RequiredVerifications,
-			VerificationMode: e.VerificationMode, CreatedAt: e.CreatedAt, UpdatedAt: e.UpdatedAt, Paths: e.Paths,
+			RequireVerification: e.RequireVerification, VerificationMode: e.VerificationMode,
+			CreatedAt: e.CreatedAt, UpdatedAt: e.UpdatedAt, Paths: e.Paths,
 			PathHashes: e.PathHashes, SearchTokens: e.SearchTokens,
 			ContentHash:   hashContent(e.Content),
 			ContentDigest: contentDigest(e.Content),
@@ -567,12 +587,55 @@ func reconcileEntry(entry *ContextEntry) {
 	case rejections >= entry.RequiredVerifications && rejections > 0:
 		entry.Status = "rejected"
 		entry.Promoted = false
-	case approvals >= entry.RequiredVerifications:
+	case approvals >= entry.RequiredVerifications || openModeAssertionStands(entry):
+		// A self-asserted open-mode entry stays promoted while authenticated peers
+		// build a quorum, so approving it never hides it; any dissent removes that basis.
 		entry.Status = "verified"
 		entry.Promoted = true
 	default:
 		entry.Status = "pending"
 		entry.Promoted = false
+	}
+}
+
+// openModeAssertionStands reports whether an entry the open-mode identity wrote still
+// rests on that identity's own word: it approved the current content (an edit clears
+// every vote), nobody has dissented since, and the proposal did not ask for peer
+// verification. Such an entry is promoted as self_asserted_open_mode until a full peer
+// quorum upgrades it.
+func openModeAssertionStands(e *ContextEntry) bool {
+	if e.RequireVerification || !IsOpenModeIdentity(e.Source) {
+		return false
+	}
+	asserted := false
+	for agent, approve := range latestVerdicts(e.Verifications) {
+		if !approve {
+			return false
+		}
+		asserted = asserted || agent == OpenModeIdentity
+	}
+	return asserted
+}
+
+// regateOpenModeEntry sets the quorum of an entry the open-mode identity wrote for the
+// write happening now, because open mode is a property of each write. An open-mode
+// write gets the single-assertion gate ProposeContext gives an open-mode proposal
+// (unless it asked for peer verification), so entries that older builds left pending
+// can still be asserted. An authenticated write raises a single-assertion gate to the
+// workspace quorum, so once tokens exist no single principal can reject, rewrite and
+// re-promote open-mode memory alone. Entries proposed under authentication keep the
+// gate they were proposed with.
+func regateOpenModeEntry(e *ContextEntry, openModeWrite, requireMulti bool, threshold int) {
+	if !IsOpenModeIdentity(e.Source) {
+		return
+	}
+	switch {
+	case openModeWrite:
+		if !e.RequireVerification {
+			e.RequiredVerifications = 1
+		}
+	case e.RequiredVerifications <= 1 && (requireMulti || e.RequireVerification):
+		e.RequiredVerifications = max(threshold, 1)
 	}
 }
 
@@ -588,12 +651,14 @@ func latestVerdicts(verifications []ContextVerification) map[string]bool {
 	return latest
 }
 
-// verificationMode labels how a promoted entry earned promotion, from its
-// votes ("" when not promoted). It is peer_verified once enough distinct principals
-// other than the author and OpenModeIdentity approve: the entry's own quorum, or the
-// workspace threshold for an entry that one assertion promoted. Otherwise it is
-// self_asserted_open_mode if the open-mode identity wrote or approved it, else
-// single_agent (its authenticated author's own word).
+// verificationMode labels how a promoted entry's CURRENT content earned promotion, from
+// the votes on it ("" when not promoted). It is peer_verified once enough distinct
+// principals other than the author and OpenModeIdentity approve: the entry's own
+// quorum, or the workspace threshold for an entry that one assertion promoted.
+// Otherwise it is self_asserted_open_mode if the open-mode identity approved the
+// current content, else single_agent (one authenticated principal's word). Authorship
+// alone never makes it self-asserted: an edit clears every vote, so content an
+// authenticated editor rewrote carries no open-mode vote.
 func verificationMode(e *ContextEntry, threshold int) string {
 	if !e.Promoted {
 		return ""
@@ -603,13 +668,14 @@ func verificationMode(e *ContextEntry, threshold int) string {
 		need = max(threshold, 1)
 	}
 	author := strings.ToLower(strings.TrimSpace(e.Source))
-	peers, anonymous := 0, author == OpenModeIdentity
+	peers, openAsserted := 0, false
 	for agent, approve := range latestVerdicts(e.Verifications) {
 		switch {
-		case !approve || agent == author:
-			// not an independent approval
+		case !approve:
 		case agent == OpenModeIdentity:
-			anonymous = true
+			openAsserted = true // the open-mode identity's word, never a peer's
+		case agent == author:
+			// the author's own word is not an independent approval
 		default:
 			peers++
 		}
@@ -617,7 +683,7 @@ func verificationMode(e *ContextEntry, threshold int) string {
 	switch {
 	case peers >= need:
 		return VerificationPeer
-	case anonymous:
+	case openAsserted:
 		return VerificationSelfAssertedOpen
 	default:
 		return VerificationSingleAgent
@@ -701,6 +767,7 @@ func ProposeContext(dataDir, workspaceID string, req ProposeContextRequest) (*Co
 		Permission:            permission,
 		Verifications:         []ContextVerification{},
 		RequiredVerifications: required,
+		RequireVerification:   tighten,
 		CreatedAt:             now,
 		UpdatedAt:             now,
 		Paths:                 cleanPaths(req.Paths),
@@ -731,17 +798,23 @@ func ProposeContext(dataDir, workspaceID string, req ProposeContextRequest) (*Co
 	return &entry, nil
 }
 
-// VerifyContext records an agent's verdict on an entry and re-promotes if the
-// approval threshold is now met. Distinct agents only — a single agent cannot
-// satisfy a multi-agent gate by voting twice.
+// VerifyContext records an authenticated agent's verdict. See VerifyContextAs.
 func VerifyContext(dataDir, workspaceID, entryID, agent string, approve bool, note string) (*ContextEntry, error) {
+	return VerifyContextAs(dataDir, workspaceID, entryID, ContextActor{ID: agent}, approve, note)
+}
+
+// VerifyContextAs records voter's verdict on an entry and re-promotes if the approval
+// threshold is now met. Distinct agents only — a single agent cannot satisfy a
+// multi-agent gate by voting twice. The vote re-gates an entry the open-mode identity
+// wrote for the kind of write it is (regateOpenModeEntry).
+func VerifyContextAs(dataDir, workspaceID, entryID string, voter ContextActor, approve bool, note string) (*ContextEntry, error) {
 	if err := validateSafeID("workspace", workspaceID); err != nil {
 		return nil, err
 	}
 	if err := validateSafeID("entry", entryID); err != nil {
 		return nil, err
 	}
-	agent = strings.TrimSpace(agent)
+	agent := strings.TrimSpace(voter.ID)
 	if agent == "" {
 		return nil, fmt.Errorf("agent is required")
 	}
@@ -778,8 +851,9 @@ func VerifyContext(dataDir, workspaceID, entryID, agent string, approve bool, no
 		entry.Verifications = append(entry.Verifications, ContextVerification{Agent: agent, Approve: approve, Note: note, At: now})
 	}
 	entry.UpdatedAt = now
+	requireMulti, threshold := contextDefaults(dataDir)
+	regateOpenModeEntry(entry, voter.OpenMode, requireMulti, threshold)
 	reconcileEntry(entry)
-	_, threshold := contextDefaults(dataDir)
 	entry.VerificationMode = verificationMode(entry, threshold)
 	if entry.Promoted && len(entry.PathHashes) == 0 {
 		// just transitioned to promoted — snapshot referenced files for drift checks,
@@ -816,14 +890,19 @@ func cleanPaths(paths []string) []string {
 
 // UpdateContextContent amends an entry's content on behalf of editor, who must be its
 // author or an admin (ErrNotEntryAuthor otherwise). Readonly entries that are already
-// verified/promoted reject edits — they can only be superseded by a new proposal (this
-// is the "readonly" permission guarantee).
-func UpdateContextContent(dataDir, workspaceID, entryID, content string, editor ContextEditor) (*ContextEntry, error) {
+// verified/promoted reject edits with a Conflict wrapping ErrReadonlyVerified — they can
+// only be superseded by a new proposal (this is the "readonly" permission guarantee).
+// The edit resets verification and re-gates an entry the open-mode identity wrote for
+// the kind of write it is (regateOpenModeEntry).
+func UpdateContextContent(dataDir, workspaceID, entryID, content string, editor ContextActor) (*ContextEntry, error) {
 	if err := validateSafeID("workspace", workspaceID); err != nil {
 		return nil, err
 	}
 	if err := validateSafeID("entry", entryID); err != nil {
 		return nil, err
+	}
+	if strings.TrimSpace(content) == "" {
+		return nil, fmt.Errorf("content is required: %w", ErrInvalidInput)
 	}
 	unlock := lockStore(contextEntriesPath(dataDir, workspaceID))
 	defer unlock()
@@ -846,7 +925,7 @@ func UpdateContextContent(dataDir, workspaceID, entryID, content string, editor 
 		return nil, ErrNotEntryAuthor
 	}
 	if entry.Permission == "readonly" && (entry.Promoted || entry.Status == "verified") {
-		return nil, fmt.Errorf("entry %s is readonly and verified; propose a new entry to supersede it", entryID)
+		return nil, Conflict(fmt.Sprintf("entry %s is readonly and verified; propose a new entry to supersede it", entryID)).WithCause(ErrReadonlyVerified)
 	}
 	entry.Content = content
 	entry.SearchTokens = memoryTokenList(entry.Title + " " + entry.Content)
@@ -859,8 +938,9 @@ func UpdateContextContent(dataDir, workspaceID, entryID, content string, editor 
 	entry.PathHashes = nil
 	entry.Stale = false
 	entry.StalePaths = nil
+	requireMulti, threshold := contextDefaults(dataDir)
+	regateOpenModeEntry(entry, editor.OpenMode, requireMulti, threshold)
 	reconcileEntry(entry)
-	_, threshold := contextDefaults(dataDir)
 	entry.VerificationMode = verificationMode(entry, threshold)
 	if err := saveContextEntries(dataDir, workspaceID, entries); err != nil {
 		return nil, err

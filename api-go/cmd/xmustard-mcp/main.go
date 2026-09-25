@@ -78,7 +78,7 @@ func tools() []tool {
 	return []tool{
 		{"ground", "Orient before acting: what changed / what's stale / what's broken / what's blocked since the indexed baseline, with index-trust (drift) and any contract breaks (changed function signatures vs the baseline) included.", []string{"workspace_id"}, nil,
 			func(a map[string]string) (string, string, string) { return "GET", wsPath(a, "/session-grounding"), "" }},
-		{"recall", "The promoted shared context, RANKED to your task: pass a query and/or paths to get the few relevant facts (multi-signal: lexical + path overlap + verification strength), not a dump. No query → recency-ranked top-N. Each entry's verification_mode says how far to trust it: peer_verified (distinct agents approved), single_agent, or self_asserted_open_mode (the API runs without auth, so nobody checked it).", []string{"workspace_id"},
+		{"recall", "The promoted shared context, RANKED to your task: pass a query and/or paths to get the few relevant facts (multi-signal: lexical + path overlap + verification strength), not a dump. No query → recency-ranked top-N. Each entry's verification_mode says how far to trust it: peer_verified (distinct agents approved), single_agent, or self_asserted_open_mode (asserted while the API ran without auth; no peer quorum has checked it).", []string{"workspace_id"},
 			[]argSpec{{"query", "string", nil, "task query to rank memories by"}, {"paths", "string", nil, "comma-separated repo-relative files to focus on"}},
 			func(a map[string]string) (string, string, string) {
 				p := wsPath(a, "/context/active")

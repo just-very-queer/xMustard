@@ -146,6 +146,106 @@ func TestSelfAssertedEntryUpgradesOnPeerQuorum(t *testing.T) {
 	if !got.Promoted || got.VerificationMode != VerificationPeer {
 		t.Fatalf("a full peer quorum must upgrade to peer_verified, got promoted=%v mode=%q", got.Promoted, got.VerificationMode)
 	}
+	// the upgrade runs on the workspace quorum, so one dissent is outvoted exactly as
+	// on a natively peer-verified entry
+	if got.RequiredVerifications != 2 {
+		t.Fatalf("authenticated votes must raise the quorum to the threshold, got %d", got.RequiredVerifications)
+	}
+	got, _ = VerifyContext(dir, ws, e.ID, "dave", false, "")
+	if !got.Promoted || got.Status != "verified" || got.VerificationMode != VerificationPeer {
+		t.Fatalf("one dissent after the upgrade must not reject, got status=%s promoted=%v mode=%q", got.Status, got.Promoted, got.VerificationMode)
+	}
+}
+
+// Open mode is a property of each write. Once an authenticated principal writes to an
+// open-mode entry it needs the workspace quorum, so one principal cannot reject,
+// rewrite and re-promote it alone, and content rewritten under authentication is
+// never labelled self-asserted.
+func TestAuthenticatedWritesRegateOpenModeEntry(t *testing.T) {
+	dir := t.TempDir()
+	ws := "wsRegate"
+	quorumSettings(t, dir)
+	e, _ := ProposeContext(dir, ws, ProposeContextRequest{Content: "v1", OpenMode: true})
+	root := ContextActor{ID: "root", Admin: true}
+
+	got, err := VerifyContextAs(dir, ws, e.ID, root, false, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != "pending" || got.Promoted || got.RequiredVerifications != 2 {
+		t.Fatalf("an authenticated dissent must demote to pending under the quorum, got status=%s promoted=%v required=%d", got.Status, got.Promoted, got.RequiredVerifications)
+	}
+	if got, err = UpdateContextContent(dir, ws, e.ID, "REWRITTEN", root); err != nil {
+		t.Fatalf("admin edit of the now-pending entry: %v", err)
+	}
+	if got.Promoted || got.RequiredVerifications != 2 {
+		t.Fatalf("authenticated edit must stay pending under the quorum, got promoted=%v required=%d", got.Promoted, got.RequiredVerifications)
+	}
+	if got, _ = VerifyContextAs(dir, ws, e.ID, root, true, ""); got.Promoted {
+		t.Fatalf("one principal must not re-promote rewritten open-mode memory alone")
+	}
+	got, _ = VerifyContext(dir, ws, e.ID, "bob", true, "")
+	if !got.Promoted || got.VerificationMode != VerificationPeer {
+		t.Fatalf("two distinct peers must promote as peer_verified, got promoted=%v mode=%q", got.Promoted, got.VerificationMode)
+	}
+	// an authenticated edit of a still self-asserted entry re-gates it on its own
+	rw, _ := ProposeContext(dir, ws, ProposeContextRequest{Content: "rw1", Permission: "readwrite", OpenMode: true})
+	if got, _ = UpdateContextContent(dir, ws, rw.ID, "rw2", root); got.Promoted || got.RequiredVerifications != 2 {
+		t.Fatalf("authenticated edit must re-gate to the quorum, got promoted=%v required=%d", got.Promoted, got.RequiredVerifications)
+	}
+
+	// single-agent setting: content rewritten under authentication is that principal's
+	// word, not an open-mode self-assertion
+	off := false
+	writeTestSettings(t, dir, appSettings{RequireMultiAgentVerification: &off})
+	solo, _ := ProposeContext(dir, ws, ProposeContextRequest{Content: "s1", Permission: "readwrite", OpenMode: true})
+	if _, err := UpdateContextContent(dir, ws, solo.ID, "s2", root); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = VerifyContextAs(dir, ws, solo.ID, root, true, "")
+	if !got.Promoted || got.VerificationMode != VerificationSingleAgent {
+		t.Fatalf("authenticated rewrite must be labelled single_agent, got promoted=%v mode=%q", got.Promoted, got.VerificationMode)
+	}
+}
+
+// Entries an older build proposed in open mode were stored pending with the full
+// quorum and could never promote. An open-mode verify now asserts them like a fresh
+// open-mode proposal; an explicit require_verification:true proposal still waits.
+func TestOpenModeVerifyAssertsLegacyPendingEntry(t *testing.T) {
+	dir := t.TempDir()
+	ws := "wsLegacyOpen"
+	quorumSettings(t, dir)
+	pending := func(id, source string) map[string]any {
+		return map[string]any{
+			"id": id, "workspace_id": ws, "title": "", "content": id + " body", "source": source,
+			"permission": "readonly", "status": "pending", "promoted": false, "required_verifications": 2,
+			"verifications": []map[string]any{{"agent": source, "approve": true, "at": "2026-01-01T00:00:00Z"}},
+			"created_at":    "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z",
+		}
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "workspaces", ws), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSON(contextEntriesPath(dir, ws), []map[string]any{pending("legacy", OpenModeIdentity), pending("authed", "alice")}); err != nil {
+		t.Fatal(err)
+	}
+	on := true
+	tight, _ := ProposeContext(dir, ws, ProposeContextRequest{Content: "careful", OpenMode: true, RequireVerification: &on})
+	open := ContextActor{ID: OpenModeIdentity, Admin: true, OpenMode: true}
+
+	got, err := VerifyContextAs(dir, ws, "legacy", open, true, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Promoted || got.RequiredVerifications != 1 || got.VerificationMode != VerificationSelfAssertedOpen {
+		t.Fatalf("legacy open-mode entry must be asserted, got promoted=%v required=%d mode=%q", got.Promoted, got.RequiredVerifications, got.VerificationMode)
+	}
+	if got, _ = VerifyContextAs(dir, ws, tight.ID, open, true, ""); got.Promoted || got.RequiredVerifications != 2 {
+		t.Fatalf("require_verification:true must keep waiting for peers, got promoted=%v required=%d", got.Promoted, got.RequiredVerifications)
+	}
+	if got, _ = VerifyContextAs(dir, ws, "authed", open, true, ""); got.Promoted {
+		t.Fatalf("an entry proposed under authentication keeps its quorum")
+	}
 }
 
 // Entries persisted before verification_mode existed are labelled on read.
@@ -241,20 +341,25 @@ func TestUpdateContextContentAuthorBinding(t *testing.T) {
 	writeTestSettings(t, dir, appSettings{RequireMultiAgentVerification: &off})
 	e, _ := ProposeContext(dir, ws, ProposeContextRequest{Content: "v1", Source: "alice", Permission: "readwrite"})
 
-	for _, ed := range []ContextEditor{{ID: "mallory"}, {ID: ""}, {ID: "ALICE"}} {
+	for _, ed := range []ContextActor{{ID: "mallory"}, {ID: ""}, {ID: "ALICE"}} {
 		if _, err := UpdateContextContent(dir, ws, e.ID, "hijacked", ed); !errors.Is(err, ErrNotEntryAuthor) {
 			t.Fatalf("editor %+v: want ErrNotEntryAuthor, got %v", ed, err)
 		}
 	}
-	got, err := UpdateContextContent(dir, ws, e.ID, "v2", ContextEditor{ID: "alice"})
+	got, err := UpdateContextContent(dir, ws, e.ID, "v2", ContextActor{ID: "alice"})
 	if err != nil {
 		t.Fatalf("author edit: %v", err)
 	}
 	if got.Content != "v2" || got.Promoted || len(got.Verifications) != 0 || got.VerificationMode != "" {
 		t.Fatalf("author edit must reset verification, got promoted=%v verifications=%d mode=%q", got.Promoted, len(got.Verifications), got.VerificationMode)
 	}
-	if _, err := UpdateContextContent(dir, ws, e.ID, "v3", ContextEditor{ID: "root", Admin: true}); err != nil {
+	if _, err := UpdateContextContent(dir, ws, e.ID, "v3", ContextActor{ID: "root", Admin: true}); err != nil {
 		t.Fatalf("admin edit: %v", err)
+	}
+	// empty content is a client error, as in ProposeContext, so a misspelled field
+	// cannot blank a memory
+	if _, err := UpdateContextContent(dir, ws, e.ID, "  ", ContextActor{ID: "alice"}); !IsInvalidInput(err) {
+		t.Fatalf("empty content: want invalid input, got %v", err)
 	}
 }
 

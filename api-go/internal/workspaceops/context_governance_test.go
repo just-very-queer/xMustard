@@ -1,6 +1,7 @@
 package workspaceops
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -89,15 +90,16 @@ func TestReadonlyEntryRejectsEdit(t *testing.T) {
 	if !entry.Promoted {
 		t.Fatalf("expected promoted in single-agent mode")
 	}
-	if _, err := UpdateContextContent(dir, ws, entry.ID, "tampered", ContextEditor{Admin: true}); err == nil {
-		t.Fatalf("readonly verified entry must reject edits")
+	_, err := UpdateContextContent(dir, ws, entry.ID, "tampered", ContextActor{Admin: true})
+	if de, ok := AsDomainError(err); !errors.Is(err, ErrReadonlyVerified) || !ok || de.Class != ClassConflict {
+		t.Fatalf("readonly verified entry must reject edits as a conflict, got %v", err)
 	}
 
 	// a readwrite entry CAN be edited (and edit resets verification)
 	rw, _ := ProposeContext(dir, ws, ProposeContextRequest{
 		Content: "mutable", Source: "solo", Permission: "readwrite",
 	})
-	updated, err := UpdateContextContent(dir, ws, rw.ID, "new content", ContextEditor{Admin: true})
+	updated, err := UpdateContextContent(dir, ws, rw.ID, "new content", ContextActor{Admin: true})
 	if err != nil {
 		t.Fatalf("readwrite edit should succeed: %v", err)
 	}

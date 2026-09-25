@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -160,6 +163,100 @@ func TestOpenModeEditResetsVerification(t *testing.T) {
 	}
 }
 
+// remember defaults to readonly, so an open-mode memory is promoted readonly at once.
+// Editing it is a state conflict (409, supersede it instead), not a server fault.
+func TestEditingPromotedReadonlyMemoryIsConflict(t *testing.T) {
+	srv, _ := newRouteServer(t)
+	base := srv.URL + "/api/workspaces/wsReadonlyEdit"
+	_, e := sendJSON(t, "POST", base+"/context", "", `{"content":"v1"}`)
+	if e["permission"] != "readonly" || e["promoted"] != true {
+		t.Fatalf("default open-mode remember: %v", e)
+	}
+	if code, body := sendJSON(t, "PUT", base+"/context/"+e["id"].(string), "", `{"content":"v2"}`); code != http.StatusConflict {
+		t.Fatalf("edit of a promoted readonly memory: want 409, got %d %v", code, body)
+	}
+}
+
+// Open mode is a property of each write. Once tokens exist an open-mode memory needs
+// the workspace quorum: one principal can reject, rewrite and approve it without
+// promoting it, and the open-mode identity cannot be minted to pose as its author.
+func TestOpenModeMemoryNeedsQuorumOnceTokensExist(t *testing.T) {
+	srv, dir := newRouteServer(t)
+	base := srv.URL + "/api/workspaces/wsOpenThenAuth"
+	code, e := sendJSON(t, "POST", base+"/context", "", `{"content":"v1 fact"}`)
+	if code != http.StatusOK || e["verification_mode"] != workspaceops.VerificationSelfAssertedOpen {
+		t.Fatalf("open-mode remember: %d %v", code, e)
+	}
+	entryURL := base + "/context/" + e["id"].(string)
+
+	tok := map[string]string{}
+	for id, role := range map[string]string{"root": "admin", "bob": "agent"} {
+		raw, err := workspaceops.MintToken(dir, id, role)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tok[id] = raw
+	}
+	if code, body := sendJSON(t, "POST", srv.URL+"/api/auth/tokens", tok["root"], `{"id":"Anonymous","role":"agent"}`); code != http.StatusBadRequest {
+		t.Fatalf("minting the open-mode identity: want 400, got %d %v", code, body)
+	}
+
+	expect := func(what string, code int, got map[string]any) {
+		t.Helper()
+		if code != http.StatusOK || got["promoted"] != false || got["status"] != "pending" || got["required_verifications"] != float64(2) {
+			t.Fatalf("%s must leave it pending under quorum 2: %d %v", what, code, got)
+		}
+	}
+	code, got := sendJSON(t, "POST", entryURL+"/verify?approve=false", tok["root"], "")
+	expect("reject", code, got)
+	code, got = sendJSON(t, "PUT", entryURL, tok["root"], `{"content":"REWRITTEN BY ONE PRINCIPAL"}`)
+	expect("rewrite", code, got)
+	code, got = sendJSON(t, "POST", entryURL+"/verify?approve=true", tok["root"], "")
+	expect("the rewriter's own approval", code, got)
+	if _, rec := getJSON(t, base+"/context/active?query=rewritten", tok["bob"]); entryCount(rec) != 0 {
+		t.Fatalf("a one-principal rewrite must not be recalled: %v", rec)
+	}
+
+	code, got = sendJSON(t, "POST", entryURL+"/verify?approve=true", tok["bob"], "")
+	if code != http.StatusOK || got["promoted"] != true || got["verification_mode"] != workspaceops.VerificationPeer {
+		t.Fatalf("a second distinct peer must promote it as peer_verified: %d %v", code, got)
+	}
+}
+
+// A principal holding the reserved open-mode identity (an env token here, or one minted
+// before the id was reserved) cannot write memory.
+func TestReservedOpenModePrincipalCannotWriteMemory(t *testing.T) {
+	t.Setenv("XMUSTARD_AUTH_TOKENS", "anonymous:agent:reserved-identity-token-0123456789")
+	srv, _ := newRouteServer(t)
+	code, body := sendJSON(t, "POST", srv.URL+"/api/workspaces/wsReserved/context", "reserved-identity-token-0123456789", `{"content":"x"}`)
+	if code != http.StatusForbidden {
+		t.Fatalf("reserved principal remember: want 403, got %d %v", code, body)
+	}
+}
+
+// Entries an older build proposed in open mode were stored pending under the full
+// quorum and could never promote; an open-mode verify now asserts them.
+func TestOpenModeVerifyAssertsLegacyPendingMemory(t *testing.T) {
+	srv, dir := newRouteServer(t)
+	ws := "wsLegacyRoute"
+	legacy := []map[string]any{{
+		"id": "ctx_legacy", "workspace_id": ws, "content": "legacy fact", "source": workspaceops.OpenModeIdentity,
+		"permission": "readonly", "status": "pending", "promoted": false, "required_verifications": 2,
+		"verifications": []any{}, "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z",
+	}}
+	b, _ := json.Marshal(legacy)
+	if err := os.MkdirAll(filepath.Join(dir, "workspaces", ws), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "workspaces", ws, "context_entries.json"), b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	code, got := sendJSON(t, "POST", srv.URL+"/api/workspaces/"+ws+"/context/ctx_legacy/verify?approve=true", "", "")
+	if code != http.StatusOK || got["promoted"] != true || got["verification_mode"] != workspaceops.VerificationSelfAssertedOpen {
+		t.Fatalf("open-mode verify of a legacy pending memory: %d %v", code, got)
+	}
+}
+
 // A malformed JSON body is a 400 rather than a silent fall back to query params; an
 // empty body still falls back.
 func TestContextHandlersRejectMalformedJSON(t *testing.T) {
@@ -183,8 +280,30 @@ func TestContextHandlersRejectMalformedJSON(t *testing.T) {
 	if code, body := sendJSON(t, "POST", entryURL+"/verify?approve=true", "", ""); code != http.StatusOK {
 		t.Fatalf("verify with empty body must use the query fallback: %d %v", code, body)
 	}
-	if code, body := sendJSON(t, "PUT", entryURL, "", `{"content":`); code != http.StatusBadRequest {
-		t.Fatalf("edit with malformed body: want 400, got %d %v", code, body)
+	for name, body := range map[string]string{
+		"malformed":       `{"content":`,
+		"trailing junk":   `{"content":"v2"} trailing-junk`,
+		"misspelled key":  `{"contnet":"typo"}`,
+		"blank content":   `{"content":"  "}`,
+		"absent body":     "",
+		"whitespace body": "  \n",
+	} {
+		if code, got := sendJSON(t, "PUT", entryURL, "", body); code != http.StatusBadRequest {
+			t.Fatalf("edit with %s body: want 400, got %d %v", name, code, got)
+		}
+	}
+	if _, rec := getJSON(t, base+"/context/active?query=from-query", ""); entryCount(rec) != 1 || rec["entries"].([]any)[0].(map[string]any)["content"] != "from-query" {
+		t.Fatalf("rejected edits must leave the memory unchanged: %v", rec)
+	}
+
+	// A body cut off at the size cap is a 413 from the handler too. (The middleware
+	// refuses a declared or chunked oversize body first, so drive the handler directly.)
+	req := httptest.NewRequest("PUT", "/api/workspaces/wsBadJSON/context/"+e["id"].(string), strings.NewReader(`{"content":"`+strings.Repeat("a", 64)+`"}`))
+	rec := httptest.NewRecorder()
+	req.Body = http.MaxBytesReader(rec, req.Body, 16)
+	newAPIHandler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("edit past the body cap: want 413, got %d %s", rec.Code, rec.Body.String())
 	}
 }
 

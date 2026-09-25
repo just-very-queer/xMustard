@@ -123,6 +123,7 @@ export interface MemoryEntry {
   status: string
   promoted: boolean
   required_verifications: number
+  require_verification?: boolean
   verification_mode?: 'peer_verified' | 'self_asserted_open_mode' | 'single_agent' | ''
   verifications: { agent: string; approve: boolean }[]
   paths?: string[]

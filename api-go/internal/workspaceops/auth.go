@@ -214,6 +214,11 @@ func validateMintInputs(id, role *string, ttlSeconds int) error {
 	if err := validateSafeID("token", *id); err != nil {
 		return fmt.Errorf("token id must be alphanumeric/._-: %w", err)
 	}
+	if IsOpenModeIdentity(*id) {
+		// Every unauthenticated open-mode caller is this identity, so a principal
+		// minted under it would pass as the author of all open-mode memory.
+		return fmt.Errorf("token id %q is reserved for open mode", *id)
+	}
 	*role = fallbackString(strings.TrimSpace(*role), "agent")
 	switch *role {
 	case "admin", "agent", "readonly":

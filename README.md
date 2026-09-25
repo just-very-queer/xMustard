@@ -90,7 +90,11 @@ memory at once as `verification_mode: self_asserted_open_mode` instead of leavin
 pending forever. Once tokens exist, every call must authenticate, and a memory becomes
 `peer_verified` only after enough distinct principals other than its author approve it
 (or is promoted at once as `single_agent` if the operator turned multi-agent
-verification off). `recall` shows each entry's mode and counts them in
+verification off). Open mode is a property of each write: once tokens exist, an
+open-mode memory stays self-asserted until a full quorum of distinct principals
+approves it, and any authenticated dissent or edit puts it back under that quorum, so
+one principal cannot rewrite and re-promote it alone. The id `anonymous` is reserved
+and cannot be minted. `recall` shows each entry's mode and counts them in
 `verification_modes`; `ground` reports `memory_verification_modes`.
 
 ### The nine tools

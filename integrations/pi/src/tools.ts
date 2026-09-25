@@ -58,7 +58,7 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
 	{
 		name: "recall",
 		description:
-			"The promoted shared context, RANKED to your task: pass a query and/or paths to get the few relevant facts (multi-signal: lexical + path overlap + verification strength), not a dump. No query → recency-ranked top-N. Each entry's verification_mode says how far to trust it: peer_verified (distinct agents approved), single_agent, or self_asserted_open_mode (the API runs without auth, so nobody checked it).",
+			"The promoted shared context, RANKED to your task: pass a query and/or paths to get the few relevant facts (multi-signal: lexical + path overlap + verification strength), not a dump. No query → recency-ranked top-N. Each entry's verification_mode says how far to trust it: peer_verified (distinct agents approved), single_agent, or self_asserted_open_mode (asserted while the API ran without auth; no peer quorum has checked it).",
 		required: ["workspace_id"],
 		optional: [
 			{ name: "query", type: "string", desc: "task query to rank memories by" },
