@@ -53,6 +53,9 @@ const (
 const (
 	ComponentResident  = "resident"
 	ComponentTransient = "transient"
+	// ComponentClientLaunched is memory the gate counts that clients start (the
+	// per-agent stdio shims): measured and admitted against, never reserved.
+	ComponentClientLaunched = "client_launched"
 )
 
 // Component is one static reservation. Used, when set, reports live usage on the basis
@@ -178,6 +181,13 @@ func (g *Governor) registerDefaultComponents() {
 		UsedBasis: "ps_rss", Used: func() (int64, bool) {
 			s, err := g.cachedSample(healthSampleMaxAge)
 			return s.ChildrenRSSBytes(), err == nil && s.Supported
+		}})
+	// Per-agent stdio shims until an HTTP MCP transport replaces them (WS-13): measured
+	// on the host and added to the tree for heavy admission.
+	g.Reserve(Component{Name: "stdio_shims", Kind: ComponentClientLaunched,
+		UsedBasis: "ps_rss", Used: func() (int64, bool) {
+			s, err := g.cachedSample(healthSampleMaxAge)
+			return s.ShimRSSBytes, err == nil && s.Supported
 		}})
 }
 
@@ -332,7 +342,7 @@ func (g *Governor) holderLabelLocked() string {
 // ceiling. Without a sampler it projects from the steady reservations instead.
 func (g *Governor) admitMemory(declared int64) error {
 	s, err := g.Sample()
-	base, basis := s.admissionBytes(), "measured tree"
+	base, basis := s.admissionBytes(), "measured tree and stdio shims"
 	if err != nil || !s.Supported {
 		base, basis = g.steadyReserved(), "reserved steady"
 	}
@@ -434,14 +444,14 @@ func (g *Governor) Sample() (TreeSample, error) {
 	g.samples++
 	g.last, g.hasLast = s, true
 	if err == nil && s.Supported {
-		g.peakRSS = max(g.peakRSS, s.RSSBytes)
-		g.peakFP = max(g.peakFP, s.FootprintBytes)
+		g.peakRSS = max(g.peakRSS, s.RSSBytes+s.ShimRSSBytes)
+		g.peakFP = max(g.peakFP, s.FootprintBytes+s.ShimFootprintBytes)
 		if s.admissionBytes() > g.cfg.SoftCeilingBytes {
 			g.overSoft++
 			if g.watching && time.Since(g.warnedFor) > time.Minute {
 				g.warnedFor = time.Now()
-				log.Printf("budget: process tree at %d bytes (rss %d, footprint %d) is over the %d-byte soft ceiling during heavy work",
-					s.admissionBytes(), s.RSSBytes, s.FootprintBytes, g.cfg.SoftCeilingBytes)
+				log.Printf("budget: process tree and shims at %d bytes (rss %d + shims %d, footprint %d + shims %d) are over the %d-byte soft ceiling during heavy work",
+					s.admissionBytes(), s.RSSBytes, s.ShimRSSBytes, s.FootprintBytes, s.ShimFootprintBytes, g.cfg.SoftCeilingBytes)
 			}
 		}
 	}
@@ -603,7 +613,7 @@ func (g *Governor) Snapshot() Snapshot {
 	}
 
 	g.wmu.Lock()
-	s.Watchdog = WatchdogStatus{Scope: "this process and its xMustard-owned descendants (Rust core, git, ast-grep); other descendants are external and reported separately; per-agent stdio shims are launched by clients and are outside it",
+	s.Watchdog = WatchdogStatus{Scope: "this process and its xMustard-owned descendants (Rust core, git, ast-grep), plus this user's xmustard-mcp stdio shims on the host (launched by clients, counted by the gate; another instance's shims are over-counted); admission and peaks use tree plus shims; other descendants are external and reported separately",
 		IntervalMS: g.cfg.WatchInterval.Milliseconds(), SamplingActive: g.watching, Samples: g.samples,
 		OverSoftCeilingSamples: g.overSoft, PeakRSSBytes: g.peakRSS, PeakFootprintBytes: g.peakFP, Last: g.last}
 	g.wmu.Unlock()

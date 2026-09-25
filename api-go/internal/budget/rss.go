@@ -6,6 +6,7 @@ import (
 	"errors"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -17,6 +18,12 @@ import (
 // below it, is external (agent runs, LSP servers, terminals, test commands a
 // verification run starts) and is reported on its own line, never in the owned sums
 // (PARITY_REQUIREMENTS §7.6).
+//
+// The per-agent stdio shims (xmustard-mcp) are launched by the clients, so they are not
+// descendants, but the gate counts them. They are found by name among this user's
+// processes on the host and reported on the Shim line, which admission adds to the tree
+// (admissionBytes). A second xMustard instance's shims on the same host are counted
+// too: an over-count, so admission errs toward refusing.
 type TreeSample struct {
 	At                 time.Time `json:"at"`
 	Supported          bool      `json:"supported"`
@@ -29,6 +36,9 @@ type TreeSample struct {
 	SelfFootprintBytes int64     `json:"self_footprint_bytes"`
 	ExternalProcesses  int       `json:"external_processes"`
 	ExternalRSSBytes   int64     `json:"external_rss_bytes"`
+	ShimProcesses      int       `json:"shim_processes"`
+	ShimRSSBytes       int64     `json:"shim_rss_bytes"`
+	ShimFootprintBytes int64     `json:"shim_footprint_bytes"`
 	Error              string    `json:"error,omitempty"`
 }
 
@@ -56,10 +66,54 @@ func ownedProcessName(name string) bool {
 	return false
 }
 
-// admissionBytes is the conservative size used for admission: the larger of the two
-// metrics, so neither file-backed pages (ps-RSS) nor compressed or swapped memory
-// (footprint) can hide growth.
-func (s TreeSample) admissionBytes() int64 { return max(s.RSSBytes, s.FootprintBytes) }
+// admissionBytes is the conservative size used for admission: the owned tree plus the
+// stdio shims, on the larger of the two metrics, so neither file-backed pages (ps-RSS)
+// nor compressed or swapped memory (footprint) can hide growth.
+func (s TreeSample) admissionBytes() int64 {
+	return max(s.RSSBytes+s.ShimRSSBytes, s.FootprintBytes+s.ShimFootprintBytes)
+}
+
+// shimProcessName is the stdio MCP shim's command name (it fits both the 16-byte macOS
+// and the 15-byte Linux short name).
+const shimProcessName = "xmustard-mcp"
+
+// shimListMaxAge bounds how often the host's process list is read for shims. Shims live
+// as long as their agent session, so a list up to this old is current enough; their
+// memory is measured afresh on every sample.
+const shimListMaxAge = 2 * time.Second
+
+var shimList = struct {
+	sync.Mutex
+	at   time.Time
+	pids []int
+}{}
+
+// cachedShimPIDs returns list's answer, reusing one younger than shimListMaxAge.
+func cachedShimPIDs(list func() []int) []int {
+	shimList.Lock()
+	defer shimList.Unlock()
+	if shimList.at.IsZero() || time.Since(shimList.at) >= shimListMaxAge {
+		shimList.pids, shimList.at = list(), time.Now()
+	}
+	return shimList.pids
+}
+
+// addShims measures the shim pids that are not already in the tree (a shim started by
+// an agent run the API spawned is a descendant and counted there) onto s's Shim line.
+func addShims(s *TreeSample, inTree map[int]bool, pids []int, measure func(int) (procMem, bool)) {
+	for _, pid := range pids {
+		if inTree[pid] {
+			continue
+		}
+		m, ok := measure(pid)
+		if !ok || m.name != shimProcessName { // gone, or the pid was reused
+			continue
+		}
+		s.ShimProcesses++
+		s.ShimRSSBytes += m.rss
+		s.ShimFootprintBytes += m.footprint
+	}
+}
 
 // maxTreeProcesses bounds one tree walk; a larger tree is reported as truncated.
 const maxTreeProcesses = 256
@@ -71,6 +125,12 @@ var errNoRSSSampler = errors.New("process-tree memory sampling is not supported 
 // them. children lists a pid's direct children; measure returns ok=false for a process
 // that is gone or unreadable, which is skipped with its subtree.
 func walkTree(root int, children func(int) []int, measure func(int) (procMem, bool)) TreeSample {
+	s, _ := walkTreeSeen(root, children, measure)
+	return s
+}
+
+// walkTreeSeen is walkTree that also returns every pid it reached.
+func walkTreeSeen(root int, children func(int) []int, measure func(int) (procMem, bool)) (TreeSample, map[int]bool) {
 	type item struct {
 		pid      int
 		external bool
@@ -108,7 +168,7 @@ func walkTree(root int, children func(int) []int, measure func(int) (procMem, bo
 			}
 		}
 	}
-	return s
+	return s, seen
 }
 
 // parseSmapsRollup reads Rss and Pss (kB lines) from /proc/<pid>/smaps_rollup text and

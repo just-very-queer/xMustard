@@ -40,12 +40,28 @@ const treeBasis = "ps_rss+phys_footprint"
 
 func sampleOwnTree() (TreeSample, error) {
 	buf := make([]int32, 128)
-	s := walkTree(os.Getpid(), func(pid int) []int { return darwinChildPIDs(pid, buf) }, darwinProcMem)
+	s, seen := walkTreeSeen(os.Getpid(), func(pid int) []int { return darwinChildPIDs(pid, buf) }, darwinProcMem)
 	s.Basis = treeBasis
 	if s.Processes == 0 {
 		return TreeSample{At: s.At, Basis: treeBasis}, errNoRSSSampler
 	}
+	addShims(&s, seen, cachedShimPIDs(darwinShimPIDs), darwinProcMem)
 	return s, nil
+}
+
+// darwinShimPIDs lists this user's processes named like the stdio shim (one sysctl).
+func darwinShimPIDs() []int {
+	procs, err := unix.SysctlKinfoProcSlice("kern.proc.uid", os.Getuid())
+	if err != nil {
+		return nil
+	}
+	var out []int
+	for i := range procs {
+		if unix.ByteSliceToString(procs[i].Proc.P_comm[:]) == shimProcessName {
+			out = append(out, int(procs[i].Proc.P_pid))
+		}
+	}
+	return out
 }
 
 func darwinProcMem(pid int) (procMem, bool) {

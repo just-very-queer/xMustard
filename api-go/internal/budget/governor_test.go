@@ -7,9 +7,12 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -368,10 +371,13 @@ func TestDefaultGovernorDeclaresBaseComponents(t *testing.T) {
 	for _, c := range s.Reservations.Components {
 		byName[c.Name] = c
 	}
-	for _, name := range []string{"go_daemon", "transient_pool", "heavy_slot", "helper_children"} {
+	for _, name := range []string{"go_daemon", "transient_pool", "heavy_slot", "helper_children", "stdio_shims"} {
 		if _, ok := byName[name]; !ok {
 			t.Fatalf("missing default component %q in %+v", name, s.Reservations.Components)
 		}
+	}
+	if c := byName["stdio_shims"]; c.Kind != ComponentClientLaunched || c.ReservedSteadyBytes != 0 || c.ReservedPeakBytes != 0 {
+		t.Fatalf("stdio shims are measured, never reserved: %+v", c)
 	}
 	if c := byName["go_daemon"]; c.Kind != ComponentResident || c.ReservedSteadyBytes != daemonSteadyBytes || c.ReservedPeakBytes != daemonPeakBytes {
 		t.Fatalf("go_daemon line: %+v", c)
@@ -508,4 +514,101 @@ func TestConcurrentSnapshotsShareOneSample(t *testing.T) {
 	if n := calls.Load(); n != 1 {
 		t.Fatalf("16 concurrent snapshots took %d samples, want 1", n)
 	}
+}
+
+// The per-agent stdio shims are not descendants of the API, but the gate counts them:
+// heavy admission adds their measured memory to the tree, so work that fits the API
+// tree alone but not the gate-counted total is refused.
+func TestWatchdogCountsStdioShims(t *testing.T) {
+	var shimRSS atomic.Int64
+	g := NewGovernor(GovernorConfig{SoftCeilingBytes: 90 << 20, FreeOSMemory: func() {}, Sampler: func() (TreeSample, error) {
+		return TreeSample{At: time.Now(), Supported: true, Processes: 1, RSSBytes: 60 << 20, SelfRSSBytes: 60 << 20,
+			ShimProcesses: 2, ShimRSSBytes: shimRSS.Load()}, nil
+	}})
+	r, err := g.AcquireHeavy(context.Background(), "index_build", DefaultHeavyLineBytes)
+	if err != nil {
+		t.Fatalf("60 + 25 MiB with no shim memory fits 90 MiB: %v", err)
+	}
+	r()
+	shimRSS.Store(21 << 20) // two shims at about 10.5 MiB each, as measured at the bench peak
+	_, err = g.AcquireHeavy(context.Background(), "index_build", DefaultHeavyLineBytes)
+	if !errors.Is(err, ErrOverloaded) || !strings.Contains(err.Error(), "stdio shims") {
+		t.Fatalf("60 + 21 MiB of shims + 25 MiB is over 90 MiB: want a retryable refusal naming the shims, got %v", err)
+	}
+	if w := g.Snapshot().Watchdog; w.PeakRSSBytes != 81<<20 || w.Last.ShimProcesses != 2 {
+		t.Fatalf("peaks are on the gate basis (tree plus shims): %+v", w)
+	}
+}
+
+// Shim pids already in the tree are not counted twice, and a pid that no longer names
+// a shim (exited and reused) is skipped.
+func TestAddShimsSkipsTreeAndReusedPIDs(t *testing.T) {
+	names := map[int]string{10: shimProcessName, 11: shimProcessName, 12: "zsh"}
+	s := TreeSample{}
+	addShims(&s, map[int]bool{11: true}, []int{10, 11, 12, 13}, func(pid int) (procMem, bool) {
+		n, ok := names[pid]
+		return procMem{rss: int64(pid) << 20, footprint: int64(pid) << 10, name: n}, ok
+	})
+	if s.ShimProcesses != 1 || s.ShimRSSBytes != 10<<20 || s.ShimFootprintBytes != 10<<10 {
+		t.Fatalf("shim line: %+v", s)
+	}
+	if s.admissionBytes() != 10<<20 {
+		t.Fatalf("admission adds shims to the tree: %d", s.admissionBytes())
+	}
+}
+
+// The platform sampler finds a shim that is not a descendant (clients launch shims) by
+// its name among this user's processes.
+func TestOwnTreeSamplerCountsDetachedShims(t *testing.T) {
+	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
+		t.Skip("no tree sampler on " + runtime.GOOS)
+	}
+	// a copy of this test binary named like the shim (a copied system binary is killed
+	// by code signing on macOS), sleeping in TestShimStandInProcess
+	self, err := os.Executable()
+	if err != nil {
+		t.Skip(err)
+	}
+	raw, err := os.ReadFile(self)
+	if err != nil {
+		t.Skipf("cannot copy the test binary: %v", err)
+	}
+	shim := filepath.Join(t.TempDir(), shimProcessName)
+	if err := os.WriteFile(shim, raw, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// started by a shell that exits at once, so the shim is reparented away from us
+	cmd := exec.Command("sh", "-c", `"$0" -test.run='^TestShimStandInProcess$' >/dev/null 2>&1 & echo $!`, shim)
+	cmd.Env = append(os.Environ(), "XMUSTARD_BUDGET_SHIM_STAND_IN=1")
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(out)))
+	if err != nil {
+		t.Fatalf("pid %q: %v", out, err)
+	}
+	t.Cleanup(func() { _ = syscall.Kill(pid, syscall.SIGKILL) })
+	var s TreeSample
+	var pids []int
+	waitFor(t, "the detached shim on the shim line", func() bool {
+		shimList.Lock()
+		shimList.at = time.Time{}
+		shimList.Unlock()
+		s, err = sampleOwnTree()
+		pids = cachedShimPIDs(func() []int { return nil })
+		return err == nil && slices.Contains(pids, pid) && s.ShimProcesses >= 1 && s.ShimRSSBytes > 0
+	})
+	if s.Processes != 1 || s.RSSBytes != s.SelfRSSBytes {
+		t.Fatalf("a detached shim is not a descendant and must stay off the owned tree: %+v", s)
+	}
+}
+
+// TestShimStandInProcess is the body of the stand-in shim above; it does nothing in a
+// normal run.
+func TestShimStandInProcess(t *testing.T) {
+	if os.Getenv("XMUSTARD_BUDGET_SHIM_STAND_IN") != "1" {
+		t.Skip("stand-in process for TestOwnTreeSamplerCountsDetachedShims")
+	}
+	time.Sleep(20 * time.Second)
 }

@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 )
 
 // Linux sampling reads procfs: Rss (the ps-RSS basis) and Pss from smaps_rollup, with
@@ -25,12 +26,42 @@ func sampleOwnTree() (TreeSample, error) {
 		byParent := linuxScanParents()
 		children = func(pid int) []int { return byParent[pid] }
 	}
-	s := walkTree(os.Getpid(), children, linuxProcMem)
+	s, seen := walkTreeSeen(os.Getpid(), children, linuxProcMem)
 	s.Basis = treeBasis
 	if s.Processes == 0 {
 		return TreeSample{At: s.At, Basis: treeBasis}, errNoRSSSampler
 	}
+	addShims(&s, seen, cachedShimPIDs(linuxShimPIDs), linuxProcMem)
 	return s, nil
+}
+
+// linuxShimPIDs lists this user's processes named like the stdio shim from
+// /proc/<pid>/comm (another user's shim is skipped: its memory is unreadable anyway).
+func linuxShimPIDs() []int {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return nil
+	}
+	uid := os.Getuid()
+	var out []int
+	for _, e := range entries {
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil || pid <= 0 {
+			continue
+		}
+		if info, err := e.Info(); err != nil || !ownedByUID(info, uid) {
+			continue
+		}
+		if comm, err := os.ReadFile("/proc/" + e.Name() + "/comm"); err == nil && strings.TrimSpace(string(comm)) == shimProcessName {
+			out = append(out, pid)
+		}
+	}
+	return out
+}
+
+func ownedByUID(info os.FileInfo, uid int) bool {
+	st, ok := info.Sys().(*syscall.Stat_t)
+	return ok && int(st.Uid) == uid
 }
 
 func linuxProcMem(pid int) (procMem, bool) {
