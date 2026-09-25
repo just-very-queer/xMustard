@@ -371,8 +371,9 @@ func TestInitializeNegotiatesAndServesInstructions(t *testing.T) {
 		if _, ok := caps["tools"]; !ok {
 			t.Fatalf("tools capability missing: %v", caps)
 		}
-		if _, ok := caps["resources"]; ok {
-			t.Fatalf("resources advertised without a provider: %v", caps)
+		// the built-in docs resources are served with or without an evidence provider
+		if _, ok := caps["resources"]; !ok {
+			t.Fatalf("resources capability missing: %v", caps)
 		}
 	}
 	s := New(Options{Backend: &fakeAPI{}}).NewSession(nil)
@@ -397,7 +398,7 @@ func TestInstructionsStateWorkflowWithinBudget(t *testing.T) {
 		last = i
 	}
 	// auto-registration writes xMustard's store even from read tools: say so once here
-	for _, p := range []string{"not instructions", "leads to confirm", "workspace_id is optional", "registers and indexes it", "XMUSTARD_MCP_AUTO_REGISTER=0", "resources/read"} {
+	for _, p := range []string{"not instructions", "leads to confirm", "workspace_id is optional", "registers and indexes it", "XMUSTARD_MCP_AUTO_REGISTER=0", "resources/read", DocsURI} {
 		if !strings.Contains(Instructions, p) {
 			t.Errorf("instructions must state %q", p)
 		}

@@ -142,9 +142,14 @@ type ClientRequester interface {
 
 // Options configure a Server.
 type Options struct {
-	Backend   Backend
-	Delivery  Delivery  // optional
-	Resources Resources // optional; resources capability is advertised only when set
+	Backend  Backend
+	Delivery Delivery // optional
+	// Resources serves resources beyond the built-in xmustard://docs/ ones (evidence
+	// originals); optional. The resources capability is always advertised because
+	// the docs resources are.
+	Resources Resources
+	// Schema selects the tools/list schema profile (SchemaLean when empty).
+	Schema SchemaProfile
 	// Cwd is the server process's working directory, the last workspace signal. An
 	// HTTP transport has none and leaves it empty.
 	Cwd string
@@ -172,6 +177,9 @@ func New(opts Options) *Server {
 	}
 	if opts.Version == "" {
 		opts.Version = "0.1.0"
+	}
+	if opts.Schema == "" {
+		opts.Schema = SchemaLean
 	}
 	return &Server{opts: opts}
 }
@@ -222,19 +230,15 @@ func (s *Session) Handle(ctx context.Context, method string, params json.RawMess
 		return s.toolsList(s.callerTools(ctx)), nil
 	case "tools/call":
 		return s.callTool(ctx, params)
-	case "resources/list", "resources/templates/list", "resources/read":
-		r := s.srv.opts.Resources
-		if r == nil {
-			break
-		}
-		switch method {
-		case "resources/list":
-			return r.List(ctx), nil
-		case "resources/templates/list":
+	case "resources/list":
+		return s.resourcesList(ctx), nil
+	case "resources/templates/list":
+		if r := s.srv.opts.Resources; r != nil {
 			return r.Templates(ctx), nil
-		default:
-			return r.Read(ctx, params)
 		}
+		return map[string]any{"resourceTemplates": []map[string]any{}}, nil
+	case "resources/read":
+		return s.readResource(ctx, params)
 	}
 	return nil, &RPCError{Code: CodeMethodNotFound, Message: "method not found: " + method}
 }
@@ -274,10 +278,7 @@ func (s *Session) initialize(params json.RawMessage) (any, *RPCError) {
 	s.roots = nil
 	s.rootsGen++
 	s.mu.Unlock()
-	caps := map[string]any{"tools": map[string]any{}}
-	if s.srv.opts.Resources != nil {
-		caps["resources"] = map[string]any{}
-	}
+	caps := map[string]any{"tools": map[string]any{}, "resources": map[string]any{}}
 	return map[string]any{
 		"protocolVersion": v,
 		"capabilities":    caps,
@@ -295,7 +296,7 @@ func (s *Session) toolsList(allowed map[string]bool) map[string]any {
 	list := []map[string]any{}
 	for _, t := range Tools() {
 		if allowed == nil || allowed[t.Name] {
-			list = append(list, t.listEntry(v))
+			list = append(list, t.listEntry(v, s.srv.opts.Schema))
 		}
 	}
 	return map[string]any{"tools": list}

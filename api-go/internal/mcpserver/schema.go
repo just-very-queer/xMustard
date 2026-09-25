@@ -28,7 +28,10 @@ type Arg struct {
 	Enum     []string
 	Min, Max int // inclusive bounds of an integer argument
 	MaxLen   int // maximum length of a string argument in characters (0: unbounded)
-	Desc     string
+	// List marks a comma-separated list (a JSON array of strings is also accepted);
+	// with Enum, every element must be one of it. It travels as one canonical string.
+	List bool
+	Desc string
 }
 
 // Annotations are the MCP ToolAnnotations hints (2025-03-26 and later).
@@ -44,6 +47,10 @@ type Tool struct {
 	Name        string
 	Description string
 	Args        []Arg
+	// Advanced arguments are accepted and validated on tools/call exactly like Args
+	// but are not advertised in the lean tools/list (SchemaLean), which every session
+	// pays for in its prompt prefix; they are documented at DocsURI instead.
+	Advanced []Arg
 	// Aliases maps a hidden argument name to its canonical one. Aliases are accepted
 	// on tools/call and never advertised in tools/list.
 	Aliases     map[string]string
@@ -63,21 +70,54 @@ type Tool struct {
 }
 
 func (t *Tool) arg(name string) (Arg, bool) {
-	for _, a := range t.Args {
-		if a.Name == name {
-			return a, true
+	for _, list := range [][]Arg{t.Args, t.Advanced} {
+		for _, a := range list {
+			if a.Name == name {
+				return a, true
+			}
 		}
 	}
 	return Arg{}, false
 }
 
-// InputSchema is the closed JSON Schema a client validates tools/call arguments with.
-func (t *Tool) InputSchema() map[string]any {
+// SchemaProfile selects how much of each tool's argument surface tools/list
+// advertises. Every profile accepts the same arguments on tools/call.
+type SchemaProfile string
+
+const (
+	// SchemaLean (the default) advertises only Args; Advanced arguments are
+	// documented at DocsURI. tools/list stays under a tested byte cap.
+	SchemaLean SchemaProfile = "lean"
+	// SchemaFull also advertises Advanced arguments, for clients that validate calls
+	// against the closed inputSchema before sending them.
+	SchemaFull SchemaProfile = "full"
+)
+
+// ParseSchemaProfile reads the XMUSTARD_MCP_SCHEMA setting: blank is lean.
+func ParseSchemaProfile(v string) (SchemaProfile, error) {
+	switch p := SchemaProfile(strings.ToLower(strings.TrimSpace(v))); p {
+	case "":
+		return SchemaLean, nil
+	case SchemaLean, SchemaFull:
+		return p, nil
+	}
+	return "", fmt.Errorf("invalid XMUSTARD_MCP_SCHEMA=%q; use lean or full", v)
+}
+
+// InputSchema is the closed JSON Schema a client validates tools/call arguments
+// with, as the lean profile advertises it.
+func (t *Tool) InputSchema() map[string]any { return t.inputSchema(SchemaLean) }
+
+func (t *Tool) inputSchema(profile SchemaProfile) map[string]any {
 	props := map[string]any{}
 	var required []string
-	for _, a := range t.Args {
+	args := t.Args
+	if profile == SchemaFull {
+		args = append(append([]Arg{}, t.Args...), t.Advanced...)
+	}
+	for _, a := range args {
 		p := map[string]any{"type": a.Type, "description": a.Desc}
-		if len(a.Enum) > 0 {
+		if len(a.Enum) > 0 && !a.List { // a list's elements are checked on tools/call
 			p["enum"] = a.Enum
 		}
 		if a.Type == typeInteger {
@@ -115,9 +155,10 @@ func (t *Tool) OutputSchema() map[string]any {
 	return map[string]any{"type": "object", "properties": props}
 }
 
-// listEntry renders the tool for tools/list under the negotiated protocol version.
-func (t *Tool) listEntry(version string) map[string]any {
-	e := map[string]any{"name": t.Name, "description": t.Description, "inputSchema": t.InputSchema()}
+// listEntry renders the tool for tools/list under the negotiated protocol version
+// and schema profile.
+func (t *Tool) listEntry(version string, profile SchemaProfile) map[string]any {
+	e := map[string]any{"name": t.Name, "description": t.Description, "inputSchema": t.inputSchema(profile)}
 	if !atLeast(version, version20250618) {
 		return e // annotations, outputSchema and _meta postdate 2024-11-05
 	}
@@ -216,6 +257,9 @@ func coerce(tool, key string, spec Arg, v any) (string, *RPCError) {
 		}
 		return strconv.FormatInt(int64(f), 10), nil
 	default: // string
+		if spec.List {
+			return coerceList(tool, key, spec, v)
+		}
 		s, ok := v.(string)
 		if !ok {
 			return "", invalidParams(tool, key, "must be a string", nil)
@@ -228,6 +272,45 @@ func coerce(tool, key string, spec Arg, v any) (string, *RPCError) {
 		}
 		return s, nil
 	}
+}
+
+// coerceList validates a comma-separated list, or a JSON array of strings, and
+// returns its elements trimmed and comma-joined.
+func coerceList(tool, key string, spec Arg, v any) (string, *RPCError) {
+	var elems []string
+	switch x := v.(type) {
+	case string:
+		if spec.MaxLen > 0 && utf8.RuneCountInString(x) > spec.MaxLen {
+			return "", invalidParams(tool, key, fmt.Sprintf("must be at most %d characters", spec.MaxLen), map[string]any{"maxLength": spec.MaxLen})
+		}
+		elems = strings.Split(x, ",")
+	case []any:
+		for _, e := range x {
+			s, ok := e.(string)
+			if !ok {
+				return "", invalidParams(tool, key, "must be a comma-separated string or an array of strings", nil)
+			}
+			elems = append(elems, s)
+		}
+	default:
+		return "", invalidParams(tool, key, "must be a comma-separated string or an array of strings", nil)
+	}
+	out := make([]string, 0, len(elems))
+	for _, e := range elems {
+		if e = strings.TrimSpace(e); e == "" {
+			continue
+		}
+		if len(spec.Enum) > 0 && !contains(spec.Enum, e) {
+			return "", invalidParams(tool, key, fmt.Sprintf("names %q; each element must be one of: %s", e, strings.Join(spec.Enum, ", ")),
+				map[string]any{"enum": spec.Enum})
+		}
+		out = append(out, e)
+	}
+	joined := strings.Join(out, ",")
+	if spec.MaxLen > 0 && utf8.RuneCountInString(joined) > spec.MaxLen {
+		return "", invalidParams(tool, key, fmt.Sprintf("must be at most %d characters", spec.MaxLen), map[string]any{"maxLength": spec.MaxLen})
+	}
+	return joined, nil
 }
 
 func contains(list []string, s string) bool {

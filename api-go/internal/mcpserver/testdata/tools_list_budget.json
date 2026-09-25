@@ -1,0 +1,19 @@
+{
+  "about": "Byte caps on the tools/list result (compact JSON, as the stdio shim writes it) per schema profile, protocol version and role profile. Measured 2026-09-25 (WS-54). Lower a cap when the list shrinks; never raise one to fit an addition: advertise less (declare the argument Advanced, documented at xmustard://docs/tools) or trim a description. cmd/xmustard-api checks role_profiles against the route gates.",
+  "role_profiles": {
+    "reader": ["ground", "recall", "search", "explain", "impact", "diagnostics", "why_failed"],
+    "proposer": ["ground", "recall", "remember", "search", "explain", "impact", "diagnostics", "why_failed"],
+    "verifier": ["ground", "recall", "verify", "search", "explain", "impact", "diagnostics", "why_failed"],
+    "agent": ["ground", "recall", "remember", "verify", "search", "explain", "impact", "diagnostics", "why_failed"]
+  },
+  "caps": {
+    "lean": {
+      "2024-11-05": {"reader": 3999, "proposer": 4715, "verifier": 4630, "agent": 5346},
+      "2025-06-18": {"reader": 6884, "proposer": 8006, "verifier": 7918, "agent": 9040}
+    },
+    "full": {
+      "2024-11-05": {"reader": 4230, "proposer": 4946, "verifier": 4861, "agent": 5577},
+      "2025-06-18": {"reader": 7115, "proposer": 8237, "verifier": 8149, "agent": 9271}
+    }
+  }
+}
