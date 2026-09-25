@@ -245,11 +245,12 @@ func (f repoFingerprint) settled() bool { return f.quietBefore(f.startedAt) }
 //
 // Costs against base (one repo-key run per observation): a hit is one walk; a read
 // with no live pairing is one run, plus one walk to pair it unless the read is
-// isolated after a pairing expired unused (see observe); a read that finds the tree
-// changed is one walk and one run (plus a second walk when the change is inside the
-// racy window). The cost judge below turns the walk off for a while once one costs
-// more than half a run, which keeps a read under about twice base and a read with no
-// live pairing under about 1.5 times.
+// isolated after a pairing expired unused (see observe), whose sample the next read
+// within the TTL pairs with its own walk instead; a read that finds the tree changed
+// is one walk and one run (plus a second walk when the change is inside the racy
+// window). The cost judge below turns the walk off for a while once one costs more
+// than half a run, which keeps a read under about twice base and a read with no live
+// pairing under about 1.5 times.
 //
 // The fingerprint is not used (every observation samples, as without the cache)
 // when: the TTL is 0; the platform cannot fingerprint; the root's repo-key reports
@@ -288,10 +289,13 @@ type IdentityObservation struct {
 }
 
 type identityEntry struct {
-	id        RepoIdentity
-	fp        repoFingerprint // settled
-	ign       *ignoreSet      // the listing fp was walked with
+	id RepoIdentity
+	// fp is the settled walk the sample is paired with; zero for an isolated read's
+	// sample kept unpaired (the next read pairs it with its own walk, see observe)
+	fp        repoFingerprint
+	ign       *ignoreSet // the listing fp was (or will be) walked with
 	sampledAt time.Time
+	epoch     uint64 // the root's epoch when the sample began
 	lastUsed  time.Time
 	hits      int // reads it served without a sample
 }
@@ -436,12 +440,19 @@ func (b identityBasis) sample() sampleResult {
 	return sampleResult{identitySample: identitySample{id: b.id, ign: b.ign}, at: b.sampledAt, epoch: b.epoch}
 }
 
+func (e *identityEntry) sample() sampleResult {
+	return sampleResult{identitySample: identitySample{id: e.id, ign: e.ign}, at: e.sampledAt, epoch: e.epoch}
+}
+
 // observe returns root's identity. populate pairs a fresh sample with a walk right
 // away (for callers that read again soon); a request's before-identity defers that
 // walk to its after-check, which only reduced results need. The pairing walk pays
 // off only if another read follows within the TTL, so it is skipped for an isolated
 // read (none within the TTL before it) once a pairing has expired unused: such a
-// read then costs one repo-key run, as without the cache.
+// read then costs one repo-key run, as without the cache. Its sample is kept
+// unpaired, and a read within the TTL after it pairs it with that read's own walk
+// when store's rule allows (the tree quiet since before the sample), so a burst of
+// reads after an idle spell costs one run and then one walk per read.
 func (c *identityCacheT) observe(ctx context.Context, root string, populate bool) identityBasis {
 	if root == "" {
 		return identityBasis{id: unavailableIdentity("workspace_root_unavailable", "")}
@@ -460,18 +471,38 @@ func (c *identityCacheT) observe(ctx context.Context, root string, populate bool
 		}
 		e = nil
 	}
-	if st.unusedPairing && (st.lastRead.IsZero() || start.Sub(st.lastRead) >= ttl) {
+	isolated := st.unusedPairing && (st.lastRead.IsZero() || start.Sub(st.lastRead) >= ttl)
+	if isolated {
 		populate = false
 	}
 	st.lastRead = start
 	c.mu.Unlock()
+	unpaired := func(s sampleResult) identityBasis {
+		if populate {
+			return c.populate(root, s)
+		}
+		if isolated {
+			c.keepUnpaired(root, s)
+		}
+		return s.basis(root)
+	}
 	if e != nil {
 		fp := c.walkCoalesced(root, e.ign, start)
-		if fp.same(e.fp) && fp.settled() && c.epochIs(root, fp.epoch) {
+		var reused bool
+		if e.fp.ok {
+			reused = fp.same(e.fp) && fp.settled() && c.epochIs(root, fp.epoch)
+		} else {
+			// an isolated read's sample: pair it with this walk when store's rule allows
+			reused = c.store(root, e.sample(), fp, e.ign)
+		}
+		if reused {
 			c.mu.Lock()
-			e.lastUsed = identityNow()
-			e.hits++
-			c.state(root).unusedPairing = false
+			st := c.state(root)
+			if cur := st.entry; cur != nil && cur.sampledAt.Equal(e.sampledAt) {
+				cur.lastUsed = identityNow()
+				cur.hits++
+			}
+			st.unusedPairing = false
 			c.mu.Unlock()
 			return identityBasis{root: root, id: e.id, obs: IdentityObservation{Cached: true, Age: identityNow().Sub(e.sampledAt)},
 				ign: e.ign, fp: fp, sampledAt: e.sampledAt, epoch: fp.epoch}
@@ -483,16 +514,25 @@ func (c *identityCacheT) observe(ctx context.Context, root string, populate bool
 			return b
 		}
 		c.dropEntry(root, e)
-		if populate {
-			return c.populate(root, s)
-		}
-		return s.basis(root)
+		return unpaired(s)
 	}
-	s := c.sampleCoalesced(ctx, root, time.Time{})
-	if populate {
-		return c.populate(root, s)
+	return unpaired(c.sampleCoalesced(ctx, root, time.Time{}))
+}
+
+// keepUnpaired caches an isolated read's sample without a walk, for the next read
+// within the TTL to pair (it replaces no newer entry).
+func (c *identityCacheT) keepUnpaired(root string, s sampleResult) {
+	if s.id.Source != "repo-key" || s.ign == nil {
+		return
 	}
-	return s.basis(root)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	st := c.state(root)
+	if st.epoch != s.epoch || (st.entry != nil && !st.entry.sampledAt.Before(s.at)) {
+		return
+	}
+	st.entry = &identityEntry{id: s.id, ign: s.ign, sampledAt: s.at, epoch: s.epoch, lastUsed: identityNow()}
+	c.boundRetained(root)
 }
 
 // populate pairs a fresh sample with a walk begun after it.
@@ -570,9 +610,9 @@ func (c *identityCacheT) store(root string, s sampleResult, fp repoFingerprint, 
 		return false
 	}
 	if st.entry != nil && st.entry.sampledAt.After(s.at) {
-		return true // a newer pairing is already cached
+		return true // a newer pairing (or unpaired sample) is already cached
 	}
-	st.entry = &identityEntry{id: s.id, fp: fp, ign: walkIgn, sampledAt: s.at, lastUsed: identityNow()}
+	st.entry = &identityEntry{id: s.id, fp: fp, ign: walkIgn, sampledAt: s.at, epoch: s.epoch, lastUsed: identityNow()}
 	c.boundRetained(root)
 	return true
 }

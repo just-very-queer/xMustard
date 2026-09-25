@@ -36,6 +36,9 @@ type identityFixtureOpts struct {
 	// searchRemoves is a root-relative file the fake search deletes, moving the key
 	// to rev-2 (the repository changes while the handler runs)
 	searchRemoves string
+	// searchMovesRef: the fake search moves the branch to a new commit with
+	// `git update-ref` (index and working tree untouched), moving the key to rev-2
+	searchMovesRef bool
 }
 
 func newIdentityFixture(t *testing.T, searchBytes int, opts ...identityFixtureOpts) *identityFixture {
@@ -118,6 +121,9 @@ func newIdentityFixture(t *testing.T, searchBytes int, opts ...identityFixtureOp
 	}
 	if o.searchRemoves != "" {
 		delay += "rm " + filepath.Join(root, o.searchRemoves) + "; printf rev-2 > " + f.keyFile + "; "
+	}
+	if o.searchMovesRef {
+		delay += `git -C ` + root + ` update-ref HEAD "$(git -C ` + root + ` commit-tree 'HEAD^{tree}' -p HEAD -m moved)"; printf rev-2 > ` + f.keyFile + "; "
 	}
 	core := writeScript(t, `case "$1" in
 search) `+delay+`cat `+bigFile+` ;;
@@ -271,6 +277,32 @@ func TestExpanding16MiBOriginalSpawnsNoProcessPerPage(t *testing.T) {
 	t.Logf("expanded %d bytes in %d pages in %v with 0 repo-key spawns (fake core)", len(orig), pages, elapsed)
 }
 
+// The common agent pattern: a read tool, then an LLM turn longer than the identity
+// TTL (the capture's pairing expires unused), then a burst of evidence pages. The
+// first page is isolated and samples once, without a walk; the second, within the
+// TTL of it, pairs that sample with its own walk; the rest reuse the pairing. The
+// burst costs one repo-key run, and every page reads current.
+func TestPageBurstAfterAnIdleTurnSamplesOnce(t *testing.T) {
+	t.Setenv("XMUSTARD_IDENTITY_CACHE_MS", "1500")
+	f := newIdentityFixture(t, 400<<10)
+	_, b, _ := f.do(t, "GET", "/api/workspaces/"+f.ws+"/search?q=x", "", nil, deliver)
+	var d evidence.Delivery
+	_ = json.Unmarshal(b, &d)
+	if d.Handle == "" || d.CapturedIdentity != "bound" {
+		t.Fatalf("capture: %+v", d)
+	}
+	time.Sleep(1600 * time.Millisecond) // the LLM turn: the capture's pairing expires unused
+	before := f.repoKeySpawns()
+	orig, last := f.expandAll(t, d.Handle, "")
+	pages := (len(orig) + evidence.DefaultPageSize - 1) / evidence.DefaultPageSize
+	if n := f.repoKeySpawns() - before; pages < 3 || n != 1 {
+		t.Fatalf("a burst of %d pages after an idle turn spawned repo-key %d times; want 1", pages, n)
+	}
+	if last["freshness"] != "current" || last["current_key_cached"] != true {
+		t.Fatalf("last page of the burst: %v", last)
+	}
+}
+
 // The capture-time re-check depends on the fingerprint, not on the identity TTL: a
 // handler that outlives the TTL still binds with one repo-key run.
 func TestSlowReadToolStillSamplesIdentityOnce(t *testing.T) {
@@ -313,7 +345,31 @@ func TestDeletionDuringAReadToolIsNotBound(t *testing.T) {
 	}
 }
 
-// Without the fingerprint (here: a core that reports no ignored-directory listing;
+// A branch moved while a read tool runs (`update-ref`: index and working tree
+// untouched, only the loose ref is rewritten), on a cold identity cache with the real
+// clock: the ref's stat key is racy, so the capture-time check samples again (2 runs)
+// and the result is not bound to the pre-move identity; neither the page nor the next
+// identity read serves it.
+func TestRefMoveDuringAReadToolIsNotBound(t *testing.T) {
+	f := newIdentityFixture(t, 200<<10, identityFixtureOpts{searchMovesRef: true})
+	before := f.repoKeySpawns()
+	_, b, _ := f.do(t, "GET", "/api/workspaces/"+f.ws+"/search?q=x", "", nil, deliver)
+	var d evidence.Delivery
+	_ = json.Unmarshal(b, &d)
+	if !d.Reduced || d.Handle == "" || d.CapturedIdentity != "unknown" {
+		t.Fatalf("a result produced across a ref move must not bind: reduced=%v handle=%q identity=%s", d.Reduced, d.Handle, d.CapturedIdentity)
+	}
+	if n := f.repoKeySpawns() - before; n != 2 {
+		t.Fatalf("the capture-time check sampled %d times; want 2 (before and after)", n)
+	}
+	if _, last := f.expandAll(t, d.Handle, ""); last["freshness"] != "unknown" {
+		t.Fatalf("page of unbound evidence: %v", last)
+	}
+	if id, _ := workspaceops.CurrentRepoIdentity(context.Background(), f.root); id.Key != "rev-2" {
+		t.Fatalf("identity after the ref move = %+v; want rev-2", id)
+	}
+}
+
 // likewise XMUSTARD_IDENTITY_CACHE_MS=0, an unavailable or costly walk) identity is
 // sampled as before the cache: before and after a reduced result, and on every
 // evidence page. Labels are unaffected.

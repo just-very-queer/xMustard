@@ -22,7 +22,10 @@ import (
 // Spawn-free working-tree fingerprint (PAR-FRESH-02, PAR-RT-12). The identity cache
 // reuses a sampled `repo-key` identity only while this fingerprint is unchanged. It
 // walks what `git status --untracked-files=all` walks, without running git:
-//   - HEAD, the ref it names (loose), and the stat keys of packed-refs / reftable;
+//   - HEAD and the loose refs it resolves through, by content and by stat key (a
+//     branch moved by `reset --soft` or `update-ref` touches nothing else), the
+//     stat keys of packed-refs / reftable, and a gitfile or commondir file that
+//     points at the git directories;
 //   - the stat keys of the index and of every file that changes what status shows
 //     or ignores: the repository config and config.worktree, info/exclude,
 //     info/attributes, info/sparse-checkout, the global and XDG config, ignore and
@@ -70,6 +73,7 @@ const (
 	fingerprintMaxSmallFile = 4 << 10
 	fingerprintMaxConfig    = 1 << 20
 	fingerprintMaxNesting   = 3 // nested worktrees inside nested worktrees
+	symrefMaxDepth          = 5 // git's SYMREF_MAXDEPTH
 )
 
 // fingerprintSupported: this platform can fingerprint without spawning.
@@ -263,26 +267,43 @@ func repoStatFingerprint(root string, ignored *ignoreSet) repoFingerprint {
 }
 
 // metadata adds one worktree's HEAD, refs, index and repository-level config,
-// ignore, attributes and sparse-checkout files.
+// ignore, attributes and sparse-checkout files. Every file whose content it digests
+// also enters by its stat key: on a path with no earlier walk to compare with, the
+// racy rule sees a change only through a stat key (a branch moved by `reset --soft`
+// or `update-ref` rewrites the loose ref alone).
 func (s *digestSink) metadata(top, gitDir, commonDir string) bool {
 	s.str("git", top, gitDir, commonDir)
+	// the layout itself: a linked worktree's or submodule's gitfile, and commondir
+	if gitDir != filepath.Join(top, ".git") {
+		s.fileKey("gitfile", filepath.Join(top, ".git"))
+	}
+	s.fileKey("commondir", filepath.Join(gitDir, "commondir"))
 	head, err := readSmallFile(filepath.Join(gitDir, "HEAD"))
 	if err != nil {
 		return false
 	}
+	s.fileKey("HEAD", filepath.Join(gitDir, "HEAD"))
 	s.str(string(head))
-	if ref, ok := strings.CutPrefix(strings.TrimSpace(string(head)), "ref: "); ok {
-		if strings.Contains(ref, "..") || filepath.IsAbs(ref) {
+	// follow the symbolic ref chain as git resolves HEAD (a loose ref can itself be
+	// symbolic), keying each loose ref where it may live
+	ref, symbolic := strings.CutPrefix(strings.TrimSpace(string(head)), "ref: ")
+	for depth := 0; symbolic; depth++ {
+		if depth >= symrefMaxDepth || strings.Contains(ref, "..") || filepath.IsAbs(ref) {
 			return false
 		}
+		s.fileKey("ref", filepath.Join(gitDir, ref))
 		loose, lerr := readSmallFile(filepath.Join(gitDir, ref))
-		if errors.Is(lerr, os.ErrNotExist) && gitDir != commonDir {
-			loose, lerr = readSmallFile(filepath.Join(commonDir, ref))
+		if gitDir != commonDir {
+			s.fileKey("common-ref", filepath.Join(commonDir, ref))
+			if errors.Is(lerr, os.ErrNotExist) {
+				loose, lerr = readSmallFile(filepath.Join(commonDir, ref))
+			}
 		}
 		if lerr != nil && !errors.Is(lerr, os.ErrNotExist) {
 			return false
 		}
 		s.str(string(loose))
+		ref, symbolic = strings.CutPrefix(strings.TrimSpace(string(loose)), "ref: ")
 	}
 	s.fileKey("packed-refs", filepath.Join(commonDir, "packed-refs"))
 	s.fileKey("reftable", filepath.Join(commonDir, "reftable", "tables.list"))

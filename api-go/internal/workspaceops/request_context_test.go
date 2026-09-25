@@ -291,6 +291,62 @@ func TestIdentityCacheRefusesAPairingAcrossADeletion(t *testing.T) {
 	}
 }
 
+// A branch moved without touching the index or the working tree (`reset --soft`,
+// `update-ref`) rewrites only the loose ref. On the cold path (a fresh before-sample,
+// no settled walk to compare with) only the ref's own stat key shows the tree is not
+// quiet: the after-check must sample again rather than bind across the move, and the
+// pre-move identity must not be cached. The clock is frozen, as for a deletion.
+func TestIdentityAfterExecutionSeesARefMoveOnTheColdPath(t *testing.T) {
+	for _, move := range [][]string{
+		{"reset", "-q", "--soft", "HEAD~1"},
+		{"update-ref", "HEAD", "HEAD~1"},
+	} {
+		t.Run(move[0], func(t *testing.T) {
+			f := installFakeSampler(t)
+			root := initGitRepo(t)
+			writeFile(t, filepath.Join(root, "second.go"), "package p\n")
+			runGit(t, root, "add", "second.go")
+			runGit(t, root, "commit", "-q", "-m", "second")
+			dir, ws := t.TempDir(), "wsRefMoved"
+			writeSnapshotWithRoot(t, dir, ws, root)
+			frozenIdentityClock(t)
+			ctx := context.Background()
+			rc := NewRequestContext(dir, ws)
+			if _, obs := rc.Identity(ctx); obs.Cached {
+				t.Fatal("cold cache: the before-identity must be sampled")
+			}
+			runGit(t, root, move...)
+			f.set("k2")
+			if id, obs := rc.IdentityAfter(ctx); id.Key != "k2" || obs.Cached || f.runs.Load() != 2 {
+				t.Fatalf("a ref move during the handler must re-sample: %+v %+v runs=%d", id, obs, f.runs.Load())
+			}
+			if id, _ := CurrentRepoIdentity(ctx, root); id.Key != "k2" {
+				t.Fatalf("the pre-move identity was cached: %+v", id)
+			}
+		})
+	}
+}
+
+// A branch moved after repo-key read it and before the walk that would be paired with
+// that sample: the pairing is refused (the ref's stat key is racy), so the next read
+// samples instead of serving the pre-move key.
+func TestIdentityCacheRefusesAPairingAcrossARefMove(t *testing.T) {
+	f := installFakeSampler(t)
+	root := initGitRepo(t)
+	moved := strings.TrimSpace(gitOutput(t, root, "commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "moved"))
+	frozenIdentityClock(t)
+	var once sync.Once
+	f.during = func() { once.Do(func() { runGit(t, root, "update-ref", "HEAD", moved) }) }
+	ctx := context.Background()
+	if id, _ := CurrentRepoIdentity(ctx, root); id.Key != "k1" {
+		t.Fatalf("first read: %+v", id)
+	}
+	f.set("k2")
+	if id, obs := CurrentRepoIdentity(ctx, root); id.Key != "k2" || obs.Cached || f.runs.Load() != 2 {
+		t.Fatalf("a pairing across a ref move served %+v %+v (runs=%d); want a fresh k2", id, obs, f.runs.Load())
+	}
+}
+
 // A workspace root re-pointed (symlink) during a request has no after-identity, so
 // evidence produced across the move cannot bind; the next request follows it.
 func TestIdentityAfterExecutionRefusesAMovedRoot(t *testing.T) {
@@ -428,8 +484,10 @@ func TestIdentityCacheTTLAndInvalidation(t *testing.T) {
 // A read that finds no live pairing samples, then walks to pair the sample for the
 // next read. That walk pays off only if another read follows within the TTL: after
 // a pairing expired unused, an isolated read (none within the TTL before it) samples
-// without walking, exactly as without the cache; a read within the TTL of the last
-// one walks again, and a pairing that was used keeps the walk on.
+// without walking, exactly as without the cache, and keeps its sample unpaired. A
+// read within the TTL of it pairs that sample with its own walk (one walk, no run:
+// the common burst of pages after an LLM turn longer than the TTL costs one run in
+// all), and a pairing that was used keeps the walk on.
 func TestIdentityCacheSkipsThePairingWalkForIsolatedReads(t *testing.T) {
 	f := installFakeSampler(t)
 	root := initGitRepo(t)
@@ -450,9 +508,33 @@ func TestIdentityCacheSkipsThePairingWalkForIsolatedReads(t *testing.T) {
 	read("first read: sample, then a walk to pair it", 0, 1, 1, false)
 	read("isolated read after the pairing expired unused: no walk", idle, 2, 0, false)
 	read("another isolated read: no walk", idle, 3, 0, false)
-	read("a read within the TTL of the last one: walks to pair", time.Second, 4, 1, false)
-	read("the next read uses the pairing", 100*time.Millisecond, 4, 1, true)
-	read("the used pairing expired: the walk stays on", idle, 5, 1, false)
+	read("a read within the TTL of it: pairs its sample with this walk", time.Second, 3, 1, true)
+	read("the next read uses the pairing", 100*time.Millisecond, 3, 1, true)
+	read("the used pairing expired: the walk stays on", idle, 4, 1, false)
+}
+
+// The lazy pairing of an isolated read's sample follows the same rule as any pairing
+// of a sample with a walk taken at another moment: a change after the sample (here a
+// branch moved by update-ref, which rewrites only the loose ref) makes the tree not
+// quiet, so the next read samples instead of serving the pre-change key.
+func TestIdentityCacheRefusesALazyPairingAcrossAChange(t *testing.T) {
+	f := installFakeSampler(t)
+	root := initGitRepo(t)
+	moved := strings.TrimSpace(gitOutput(t, root, "commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "moved"))
+	frozenIdentityClock(t)
+	identityCache.mu.Lock()
+	identityCache.state(root).unusedPairing = true // a pairing expired unused
+	identityCache.mu.Unlock()
+	ctx := context.Background()
+	walks := fingerprintWalks.Load()
+	if id, obs := CurrentRepoIdentity(ctx, root); id.Key != "k1" || obs.Cached || fingerprintWalks.Load() != walks {
+		t.Fatalf("isolated read: %+v %+v walks=%d; want a sample and no walk", id, obs, fingerprintWalks.Load()-walks)
+	}
+	runGit(t, root, "update-ref", "HEAD", moved)
+	f.set("k2")
+	if id, obs := CurrentRepoIdentity(ctx, root); id.Key != "k2" || obs.Cached || f.runs.Load() != 2 {
+		t.Fatalf("a lazy pairing across a ref move served %+v %+v (runs=%d); want a fresh k2", id, obs, f.runs.Load())
+	}
 }
 
 func TestIdentityCacheOutsideGitReusesOnlyIncompleteIdentities(t *testing.T) {
@@ -645,6 +727,51 @@ func TestFingerprintLayouts(t *testing.T) {
 	// inside a Git worktree the walk needs repo-key's listing
 	if fp := repoStatFingerprint(root, nil); fp.ok {
 		t.Fatal("a Git fingerprint without the ignored-directory listing must be unavailable")
+	}
+}
+
+// Every git metadata file the fingerprint reads enters by its stat key as well as its
+// content: rewriting one in place with the same content changes the fingerprint, so a
+// change to it is visible to the racy rule where no earlier walk exists to compare
+// with. A symbolic ref chain (HEAD -> alias -> branch) is followed to the branch.
+func TestFingerprintStatKeysTheGitFilesItReads(t *testing.T) {
+	ign := newIgnoreSet(nil)
+	root := initGitRepo(t)
+	wt := filepath.Join(t.TempDir(), "wt")
+	runGit(t, root, "worktree", "add", "-q", "-b", "side", wt)
+	branch := strings.TrimSpace(gitOutput(t, root, "symbolic-ref", "HEAD"))
+	wtGitDir := strings.TrimSpace(gitOutput(t, wt, "rev-parse", "--absolute-git-dir"))
+	for _, c := range []struct{ what, tree, file string }{
+		{"HEAD", root, filepath.Join(root, ".git", "HEAD")},
+		{"the branch ref", root, filepath.Join(root, ".git", branch)},
+		{"a linked worktree's HEAD", wt, filepath.Join(wtGitDir, "HEAD")},
+		{"a linked worktree's branch ref (common dir)", wt, filepath.Join(root, ".git", "refs", "heads", "side")},
+		{"a linked worktree's gitfile", wt, filepath.Join(wt, ".git")},
+		{"a linked worktree's commondir", wt, filepath.Join(wtGitDir, "commondir")},
+	} {
+		before := repoStatFingerprint(c.tree, ign)
+		if !before.ok {
+			t.Fatalf("%s: fingerprint unavailable", c.what)
+		}
+		b, err := os.ReadFile(c.file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(20 * time.Millisecond) // a distinct mtime
+		if err := os.WriteFile(c.file, b, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if after := repoStatFingerprint(c.tree, ign); !after.ok || after.same(before) {
+			t.Fatalf("%s: rewriting %s must change the fingerprint", c.what, c.file)
+		}
+	}
+	runGit(t, root, "symbolic-ref", "refs/heads/alias", branch)
+	runGit(t, root, "symbolic-ref", "HEAD", "refs/heads/alias")
+	before := repoStatFingerprint(root, ign)
+	moved := strings.TrimSpace(gitOutput(t, root, "commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "moved"))
+	runGit(t, root, "update-ref", "--no-deref", branch, moved)
+	if after := repoStatFingerprint(root, ign); !after.ok || after.same(before) {
+		t.Fatal("moving the branch at the end of a symbolic ref chain must change the fingerprint")
 	}
 }
 
