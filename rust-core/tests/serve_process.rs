@@ -204,7 +204,7 @@ fn worker_output_matches_one_shot_cli() {
             "helperValue",
         ],
         vec!["symbolgraph", "clusters", root, "ws"],
-        vec!["symbolgraph", "blast-radius", root, "ws", "ComputeTotal"],
+        vec!["symbolgraph", "hotspots", root, "ws", "5"],
         vec!["symbolgraph", "flow", root, "ws"],
         vec!["explain-path", "ws", root, "src/engine.go"],
         vec!["path-symbols", "ws", root, "web/view.ts"],
@@ -292,7 +292,7 @@ const GO_BRIDGE_CALLS: &[&[&str]] = &[
     &["normalize-lsp-workspace-symbols"],
     &["parse-coverage-lcov"],
     &["parse-coverage"],
-    &["symbolgraph", "blast-radius"],
+    &["symbolgraph", "hotspots"],
     &["symbolgraph", "impact"],
     &["symbolgraph", "trace"],
     &["symbolgraph", "clusters"],
@@ -348,8 +348,8 @@ fn whole_repository_builds_are_left_to_one_shot_processes() {
     for case in [
         vec!["changetrack", "index", data_dir, root, "ws"],
         vec!["symbolgraph", "build", root, "ws"],
-        vec!["symbolgraph", "hotspots", root, "ws", "5"],
         vec!["symbolgraph", "build-lsp", root, "ws"],
+        vec!["symbolgraph", "blast-radius", root, "ws", "ComputeTotal"],
         vec!["goal", "list", data_dir, "ws"],
         vec!["lsp-hover", root, "a.go", "1", "1"],
     ] {
@@ -374,7 +374,7 @@ fn whole_repository_builds_are_left_to_one_shot_processes() {
     }
     assert_eq!(
         init["one_shot_subcommands"],
-        json!({"changetrack": ["index"], "symbolgraph": ["build", "hotspots", "build-lsp"]})
+        json!({"changetrack": ["index"], "symbolgraph": ["build", "build-lsp", "blast-radius"]})
     );
 }
 

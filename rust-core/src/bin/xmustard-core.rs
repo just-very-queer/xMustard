@@ -92,11 +92,14 @@ const COMMANDS: &[Command] = &[
     cmd("swarm", Residency::OneShot, run_swarm_command),
     cmd("semantic-search", Residency::OneShot, semantic_search),
     cmd("bench", Residency::OneShot, run_bench_command),
-    // Whole-repository builds run one-shot so their transient heap leaves with the
-    // process (PAR-RT-02): measured on pi-mono, one `changetrack index` left a serve
-    // worker at 36.8 MiB instead of the 24.4 MiB query-only plateau. `symbolgraph
-    // build` and `hotspots` rebuild the full graph on every call; build-lsp also starts
-    // language servers. None of them is on a nine-tool query path.
+    // Whole-repository work runs one-shot so its transient heap leaves with the process
+    // (PAR-RT-02): measured on pi-mono, one `changetrack index` left a serve worker at
+    // 36.8 MiB instead of the 24.4 MiB query-only plateau. `symbolgraph build`
+    // rebuilds and prints the full graph; build-lsp also starts language servers;
+    // blast-radius reads every tracked source file on each call and uses no cached
+    // graph, so residency saves it nothing. None of them is on a nine-tool query path.
+    // Queries over the graph (impact, trace, clusters, flow, hotspots, ownership
+    // subsystems) read the shared snapshot and stay resident.
     cmd(
         "changetrack",
         Residency::ResidentExcept(&["index"]),
@@ -104,7 +107,7 @@ const COMMANDS: &[Command] = &[
     ),
     cmd(
         "symbolgraph",
-        Residency::ResidentExcept(&["build", "hotspots", "build-lsp"]),
+        Residency::ResidentExcept(&["build", "build-lsp", "blast-radius"]),
         run_symbolgraph_command,
     ),
     cmd("ownership", Residency::Resident, ownership),
@@ -1119,7 +1122,7 @@ fn run_symbolgraph_command(mut args: Args) -> CmdResult {
                 .next()
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(20);
-            let graph = sg::build_symbol_graph(Path::new(&root), &ws);
+            let graph = sg::symbol_graph_for_query(Path::new(&root), &ws);
             json(&sg::compute_hotspots(&graph, limit))
         }
         "blast-radius" => {
@@ -1161,7 +1164,7 @@ mod tests {
         ("normalize-lsp-workspace-symbols", &[]),
         ("parse-coverage-lcov", &[]),
         ("parse-coverage", &[]),
-        ("symbolgraph", &["blast-radius"]),
+        ("symbolgraph", &["hotspots"]),
         ("symbolgraph", &["impact"]),
         ("symbolgraph", &["trace"]),
         ("symbolgraph", &["clusters"]),
@@ -1212,7 +1215,7 @@ mod tests {
             assert!(!entry.is_resident(), "{name} must stay one-shot");
         }
         let sg = dispatch::find(COMMANDS, "symbolgraph").unwrap();
-        for sub in ["build-lsp", "build", "hotspots"] {
+        for sub in ["build-lsp", "build", "blast-radius"] {
             assert!(!sg.resident_for(&strings(&[sub, "/r", "ws"])), "{sub}");
         }
         let ct = dispatch::find(COMMANDS, "changetrack").unwrap();
