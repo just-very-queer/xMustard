@@ -44,6 +44,10 @@ var coreTools = map[string]bool{
 	"explain": true, "impact": true, "diagnostics": true, "why_failed": true,
 }
 
+// identityFreeTools are the write tools: their results are memory records, not
+// observations of the repository, so no repository identity is sampled for them.
+var identityFreeTools = map[string]bool{"remember": true, "verify": true}
+
 // coreToolFor returns the tool served by (method, path), or "".
 func coreToolFor(method, path string) string {
 	ws := workspaceIDFromPath(path)
@@ -117,29 +121,50 @@ func principalScope(r *http.Request) (actor string, enforced bool) {
 	return "", false
 }
 
-func repoIdentityFunc(ws string) func(ctx context.Context) evidence.Identity {
+// scopeIdentityFunc reads the current identity of a canonical root through the
+// identity cache: no repo-key run while the root's stat fingerprint and TTL hold.
+func scopeIdentityFunc(scope string) func(ctx context.Context) evidence.Identity {
 	return func(ctx context.Context) evidence.Identity {
-		id, _ := workspaceops.WorkspaceRepoIdentity(ctx, dataDir(), ws)
-		return toEvidenceIdentity(id)
+		if scope == "" {
+			return toEvidenceIdentity(workspaceops.RepoIdentity{Source: "unavailable",
+				Limitations: []workspaceops.IdentityLimitation{{Reason: "workspace_root_unavailable"}}}, workspaceops.IdentityObservation{})
+		}
+		return toEvidenceIdentity(workspaceops.CurrentRepoIdentity(ctx, scope))
 	}
 }
 
-func toEvidenceIdentity(id workspaceops.RepoIdentity) evidence.Identity {
+// repoIdentityFunc resolves the workspace's scope only when the identity is needed.
+func repoIdentityFunc(ws string) func(ctx context.Context) evidence.Identity {
+	return func(ctx context.Context) evidence.Identity {
+		return scopeIdentityFunc(workspaceops.WorkspaceRepoScope(dataDir(), ws))(ctx)
+	}
+}
+
+func toEvidenceIdentity(id workspaceops.RepoIdentity, obs workspaceops.IdentityObservation) evidence.Identity {
 	lims := make([]string, 0, len(id.Limitations))
 	for _, l := range id.Limitations {
 		lims = append(lims, l.String())
 	}
-	return evidence.Identity{Key: id.Key, Complete: id.Complete, Limitations: lims}
+	return evidence.Identity{Key: id.Key, Complete: id.Complete, Limitations: lims,
+		Cached: obs.Cached, AgeMs: obs.Age.Milliseconds()}
 }
 
 func evidenceDeliveryMiddleware(store *evidence.Store, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		tool := coreToolFor(r.Method, r.URL.Path)
-		if r.Header.Get(deliveryHeader) != evidence.DeliveryVersion || tool == "" {
+		if tool == "" {
 			next.ServeHTTP(w, r)
 			return
 		}
+		// the request context kernel: the workspace is resolved once (registry) and
+		// the identity sampled at most once, for the handler and for capture alike
 		ws := workspaceIDFromPath(r.URL.Path)
+		rc := workspaceops.NewRequestContext(dataDir(), ws)
+		r = r.WithContext(workspaceops.WithRequestContext(r.Context(), rc))
+		if r.Header.Get(deliveryHeader) != evidence.DeliveryVersion {
+			next.ServeHTTP(w, r)
+			return
+		}
 		sp, err := store.NewSpool(ws)
 		if err != nil {
 			respondError(w, workspaceops.Invalid("invalid workspace id"))
@@ -152,11 +177,18 @@ func evidenceDeliveryMiddleware(store *evidence.Store, next http.Handler) http.H
 			body.ReadCloser = r.Body
 		}
 		r.Body = body
-		// identity is sampled around execution: Capture binds it only when the
-		// before and after samples are complete and equal.
-		// one sample yields both the before-identity and the canonical trust scope
-		beforeID, scope := workspaceops.WorkspaceRepoIdentity(r.Context(), dataDir(), ws)
-		before := toEvidenceIdentity(beforeID)
+		// Identity is observed around execution and Capture binds it only when the
+		// before and after identities are complete and equal. Read tools sample it
+		// once, here; the after-identity is re-read through the identity cache, which
+		// runs repo-key again only if the spawn-free fingerprint moved (a concurrent
+		// change) or the TTL passed. Write tools sample nothing.
+		scope := rc.Scope()
+		var before *evidence.Identity
+		var afterKey func(ctx context.Context) evidence.Identity
+		if !identityFreeTools[tool] {
+			b := toEvidenceIdentity(rc.Identity(r.Context()))
+			before, afterKey = &b, scopeIdentityFunc(scope)
+		}
 		sw := &spoolWriter{header: http.Header{}, spool: sp}
 		next.ServeHTTP(sw, r)
 		if sw.status == 0 {
@@ -182,7 +214,7 @@ func evidenceDeliveryMiddleware(store *evidence.Store, next http.Handler) http.H
 			SessionID: r.Header.Get("X-Xmustard-Session-Id"), CallID: r.Header.Get("X-Xmustard-Call-Id"),
 			Tool: tool, ToolVersion: toolVersion, ArgsDigest: hex.EncodeToString(argsHash.Sum(nil)),
 			Status: sw.status, IsError: sw.status >= 400, ContentType: sw.header.Get("Content-Type"),
-			BeforeKey: &before, RepoKey: repoIdentityFunc(ws),
+			BeforeKey: before, RepoKey: afterKey,
 		})
 		if err != nil {
 			writeEvidenceError(w, err)

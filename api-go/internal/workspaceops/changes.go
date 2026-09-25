@@ -13,8 +13,10 @@ import (
 // delegates gitnexus-style change tracking to the Rust core. Feeds the cockpit
 // UI's "change state" pane and the MCP `changed_since` tool.
 
+// resolveChangeRoot returns the workspace's repository root and the absolute data
+// dir from the workspace registry (no snapshot parse).
 func resolveChangeRoot(dataDir, workspaceID string) (root string, absData string, err error) {
-	snapshot, err := loadSnapshot(dataDir, workspaceID)
+	ws, err := resolveWorkspace(dataDir, workspaceID)
 	if err != nil {
 		return "", "", err
 	}
@@ -22,7 +24,24 @@ func resolveChangeRoot(dataDir, workspaceID string) (root string, absData string
 	if err != nil {
 		return "", "", fmt.Errorf("resolve data dir: %w", err)
 	}
-	return snapshot.Workspace.RootPath, abs, nil
+	return ws.Root, abs, nil
+}
+
+// resolveChangeRootCtx is resolveChangeRoot that reuses the workspace already
+// resolved for this request (request_context.go) when ctx carries one.
+func resolveChangeRootCtx(ctx context.Context, dataDir, workspaceID string) (root string, absData string, err error) {
+	if rc := RequestContextFrom(ctx); rc != nil && rc.DataDir == dataDir && rc.WorkspaceID == workspaceID {
+		ws, err := rc.Workspace()
+		if err != nil {
+			return "", "", err
+		}
+		abs, err := filepath.Abs(dataDir)
+		if err != nil {
+			return "", "", fmt.Errorf("resolve data dir: %w", err)
+		}
+		return ws.Root, abs, nil
+	}
+	return resolveChangeRoot(dataDir, workspaceID)
 }
 
 // WorkspaceFingerprint returns the current repo fingerprint (head/remote/content hash).
@@ -58,7 +77,7 @@ func WorkspaceDrift(dataDir, workspaceID string) (json.RawMessage, error) {
 
 // WorkspaceDriftCtx is the request-scoped variant: cancelling ctx kills its Rust/tool children.
 func WorkspaceDriftCtx(ctx context.Context, dataDir, workspaceID string) (json.RawMessage, error) {
-	root, absData, err := resolveChangeRoot(dataDir, workspaceID)
+	root, absData, err := resolveChangeRootCtx(ctx, dataDir, workspaceID)
 	if err != nil {
 		return nil, err
 	}
@@ -76,7 +95,7 @@ func WorkspaceChangesSinceIndex(dataDir, workspaceID string) (json.RawMessage, e
 
 // WorkspaceChangesSinceIndexCtx is the request-scoped variant: cancelling ctx kills its Rust/tool children.
 func WorkspaceChangesSinceIndexCtx(ctx context.Context, dataDir, workspaceID string) (json.RawMessage, error) {
-	root, absData, err := resolveChangeRoot(dataDir, workspaceID)
+	root, absData, err := resolveChangeRootCtx(ctx, dataDir, workspaceID)
 	if err != nil {
 		return nil, err
 	}
@@ -95,7 +114,7 @@ func WorkspaceWorkingChanges(dataDir, workspaceID string) (json.RawMessage, erro
 
 // WorkspaceWorkingChangesCtx is the request-scoped variant: cancelling ctx kills its Rust/tool children.
 func WorkspaceWorkingChangesCtx(ctx context.Context, dataDir, workspaceID string) (json.RawMessage, error) {
-	root, absData, err := resolveChangeRoot(dataDir, workspaceID)
+	root, absData, err := resolveChangeRootCtx(ctx, dataDir, workspaceID)
 	if err != nil {
 		return nil, err
 	}

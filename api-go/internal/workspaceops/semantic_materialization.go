@@ -163,7 +163,7 @@ func SearchSemanticPatternCtx(ctx context.Context, dataDir string, workspaceID s
 	if strings.TrimSpace(pattern) == "" {
 		return nil, fmt.Errorf("%w: pattern is required", ErrInvalidSemanticRequest)
 	}
-	snapshot, err := loadSnapshot(dataDir, workspaceID)
+	root, _, err := resolveChangeRootCtx(ctx, dataDir, workspaceID)
 	if err != nil {
 		return nil, err
 	}
@@ -171,7 +171,7 @@ func SearchSemanticPatternCtx(ctx context.Context, dataDir string, workspaceID s
 	normalizedPathGlob := trimOptional(optionalString(pathGlob))
 	matches, binaryPath, queryError, truncated, admitErr := runAstGrepSemanticQueryCtx(
 		ctx,
-		snapshot.Workspace.RootPath,
+		root,
 		pattern,
 		normalizedLanguage,
 		normalizedPathGlob,

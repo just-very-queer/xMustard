@@ -271,24 +271,10 @@ func ExportWorkspace(dataDir string, workspaceID string) (*ExportBundle, error) 
 	}, nil
 }
 
+// getWorkspaceRecord returns the workspaces.json record, else the snapshot's own
+// workspace record, through the workspace registry (no snapshot parse).
 func getWorkspaceRecord(dataDir string, workspaceID string) (workspaceRecord, error) {
-	workspaces, err := ListWorkspaces(dataDir)
-	if err != nil {
-		return workspaceRecord{}, err
-	}
-	for _, item := range workspaces {
-		if item.WorkspaceID == workspaceID {
-			return item, nil
-		}
-	}
-	snapshot, err := loadSnapshot(dataDir, workspaceID)
-	if err == nil && snapshot != nil {
-		return snapshot.Workspace, nil
-	}
-	if errors.Is(err, os.ErrNotExist) {
-		return workspaceRecord{}, os.ErrNotExist
-	}
-	return workspaceRecord{}, err
+	return lookupWorkspaceRecord(dataDir, workspaceID)
 }
 
 func saveWorkspaceRecord(dataDir string, workspace workspaceRecord) error {

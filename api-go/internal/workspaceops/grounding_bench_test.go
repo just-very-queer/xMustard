@@ -22,19 +22,21 @@ func seedGroundBenchWorkspace(tb testing.TB) (dataDir, ws string) {
 		tb.Fatal(err)
 	}
 	summary := strings.Repeat("summary text for a synthetic issue ", 16)
-	issues := make([]map[string]any, 0, 4000)
+	issues := make([]issueRecord, 0, 4000)
 	for i := 0; i < 4000; i++ {
-		issues = append(issues, map[string]any{
-			"bug_id": fmt.Sprintf("BUG-%05d", i), "title": fmt.Sprintf("issue %d", i), "severity": "P2",
-			"issue_status": "open", "source": "scanner", "doc_status": "ok", "code_status": "ok",
-			"summary": summary, "evidence": []map[string]any{{"path": fmt.Sprintf("src/f%04d.go", i), "line": i}},
-			"labels": []string{"a", "b"}, "updated_at": "2026-09-25T00:00:00Z",
+		line := i
+		issues = append(issues, issueRecord{
+			BugID: fmt.Sprintf("BUG-%05d", i), Title: fmt.Sprintf("issue %d", i), Severity: "P2",
+			IssueStatus: "open", Source: "scanner", DocStatus: "ok", CodeStatus: "ok", Summary: &summary,
+			Evidence: []evidenceRef{{Path: fmt.Sprintf("src/f%04d.go", i), Line: &line}},
+			Labels:   []string{"a", "b"}, UpdatedAt: "2026-09-25T00:00:00Z",
 		})
 	}
-	if err := writeJSON(filepath.Join(dataDir, "workspaces", ws, "snapshot.json"), map[string]any{
-		"scanner_version": scannerVersion,
-		"workspace":       map[string]any{"workspace_id": ws, "name": "bench", "root_path": root},
-		"issues":          issues,
+	// written the way the scanner writes it: the workspaceSnapshot struct
+	if err := writeJSON(filepath.Join(dataDir, "workspaces", ws, "snapshot.json"), workspaceSnapshot{
+		ScannerVersion: scannerVersion,
+		Workspace:      workspaceRecord{WorkspaceID: ws, Name: "bench", RootPath: root},
+		Issues:         issues,
 	}); err != nil {
 		tb.Fatal(err)
 	}
