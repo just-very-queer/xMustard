@@ -489,6 +489,28 @@ func TestPeerVerifiedNeedsDistinctPeers(t *testing.T) {
 	if err := rawExec(t, s.Path(), "UPDATE entries SET status = 'verified', promoted = 1, verification_mode = 'peer_verified' WHERE id = 'ctx_pv'"); err == nil {
 		t.Fatal("raw write labelled an entry peer_verified")
 	}
+	for _, bad := range []VoteInput{
+		{EntryID: "ctx_pv", Verdict: "maybe"},
+		{EntryID: "ctx_pv", Verdict: VerdictDuplicateOf},
+		{EntryID: "ctx_pv", Verdict: VerdictDuplicateOf, Target: "ctx_pv"},
+		{EntryID: "ctx_pv", Verdict: VerdictApprove, Target: "ctx_other"},
+		{EntryID: "ctx_pv", Verdict: VerdictApprove, Revision: 9},
+	} {
+		err := s.Update(ctx, func(tx Tx) error { _, err := tx.RecordVote(ctx, bad, carol); return err })
+		if !errors.Is(err, ErrInvalid) && !errors.Is(err, ErrNotFound) {
+			t.Fatalf("RecordVote(%+v) = %v", bad, err)
+		}
+	}
+	mustUpdate(t, s, func(tx Tx) error {
+		_, err := tx.InsertEntry(ctx, NewEntry{ID: "ctx_elsewhere", WorkspaceID: "ws2", Content: "x"}, alice)
+		return err
+	})
+	if err := s.Update(ctx, func(tx Tx) error {
+		_, err := tx.RecordVote(ctx, VoteInput{EntryID: "ctx_pv", Verdict: VerdictDuplicateOf, Target: "ctx_elsewhere"}, carol)
+		return err
+	}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("cross-workspace duplicate_of: %v", err)
+	}
 	vote(t, s, "ctx_pv", carol, VerdictApprove)
 	e := promotePeer(t, s, "ctx_pv")
 	if !e.Promoted || e.VerificationMode != ModePeerVerified || e.PromotedAt == "" || e.ValidFrom == "" || !e.Served(time.Now()) {

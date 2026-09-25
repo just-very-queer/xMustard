@@ -139,11 +139,6 @@ func (r *reader) Tally(ctx context.Context, entryID string, revision int64) (Tal
 
 // RecordVote stores actor's verdict on a live revision and appends a vote event.
 func (t *txn) RecordVote(ctx context.Context, in VoteInput, actor Actor) (Vote, error) {
-	return t.recordVote(ctx, in, actor, "")
-}
-
-// recordVote lets the importer keep a legacy verdict's original time.
-func (t *txn) recordVote(ctx context.Context, in VoteInput, actor Actor, at string) (Vote, error) {
 	if err := actor.validate(); err != nil {
 		return Vote{}, err
 	}
@@ -175,15 +170,17 @@ func (t *txn) recordVote(ctx context.Context, in VoteInput, actor Actor, at stri
 		if in.Target == "" || in.Target == in.EntryID {
 			return Vote{}, fmt.Errorf("%w: duplicate_of needs another entry as target", ErrInvalid)
 		}
-		if _, err := t.GetEntry(ctx, in.Target); err != nil {
+		target, err := t.GetEntry(ctx, in.Target)
+		if err != nil {
 			return Vote{}, err
+		}
+		if target.WorkspaceID != cur.WorkspaceID {
+			return Vote{}, fmt.Errorf("%w: duplicate_of target %s is in another workspace", ErrInvalid, in.Target)
 		}
 	} else if in.Target != "" {
 		return Vote{}, fmt.Errorf("%w: only duplicate_of takes a target", ErrInvalid)
 	}
-	if at == "" {
-		at = t.nowText()
-	}
+	at := t.nowText()
 	principal := strings.TrimSpace(actor.Principal)
 	key := principalKey(principal)
 	var ordinal int64
