@@ -1,0 +1,7 @@
+ok  	xmustard/api-go/cmd/xmustard-api	15.259s
+ok  	xmustard/api-go/cmd/xmustard-mcp	2.651s
+ok  	xmustard/api-go/cmd/xmustard-ops	3.211s
+ok  	xmustard/api-go/internal/budget	0.385s
+ok  	xmustard/api-go/internal/evidence	1.959s
+ok  	xmustard/api-go/internal/rustcore	4.378s
+ok  	xmustard/api-go/internal/workspaceops	32.654s

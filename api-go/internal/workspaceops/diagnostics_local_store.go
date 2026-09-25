@@ -71,8 +71,8 @@ type localDiagnosticsEnvelope struct {
 	Schema           string                   `json:"schema"`
 	EnvelopeSHA256   string                   `json:"envelope_sha256"`
 	Run              DiagnosticRun            `json:"run"`
-	Rows             []DiagnosticRecord       `json:"rows"`
 	RawPayloadBase64 string                   `json:"raw_payload_base64"`
+	Rows             []DiagnosticRecord       `json:"rows"`
 	PathIdentities   []diagnosticPathIdentity `json:"path_identities"`
 }
 
@@ -220,6 +220,12 @@ func buildLocalDiagnosticsEnvelope(pub *diagnosticsPublication, identities []dia
 		}
 		rows = append(rows, record)
 	}
+	sort.SliceStable(rows, func(i, j int) bool {
+		if rows[i].Severity != rows[j].Severity {
+			return rows[i].Severity < rows[j].Severity
+		}
+		return rows[i].Path < rows[j].Path
+	})
 	archive := *plan.ReplayArchive
 	archive.RawPayload = nil // the exact bytes live in raw_payload_base64
 	expiresAt := createdAt.Add(diagnosticsRetention)

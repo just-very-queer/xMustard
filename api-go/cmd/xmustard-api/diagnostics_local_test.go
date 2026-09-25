@@ -15,7 +15,7 @@ import (
 	"xmustard/api-go/internal/workspaceops"
 )
 
-func localDiagnosticsServer(t *testing.T, coreOnly bool) (http.Handler, string, string) {
+func localDiagnosticsServer(t testing.TB, coreOnly bool) (http.Handler, string, string) {
 	t.Helper()
 	dataDir := t.TempDir()
 	repo := t.TempDir()
@@ -42,7 +42,7 @@ func localDiagnosticsServer(t *testing.T, coreOnly bool) (http.Handler, string, 
 	return buildHandler(serverConfig{authMode: "off", coreOnly: coreOnly, dataDir: dataDir}, mux), ws.Workspace.WorkspaceID, repo
 }
 
-func do(t *testing.T, h http.Handler, method, path, body string) *httptest.ResponseRecorder {
+func do(t testing.TB, h http.Handler, method, path, body string) *httptest.ResponseRecorder {
 	t.Helper()
 	req := httptest.NewRequest(method, path, strings.NewReader(body))
 	rec := httptest.NewRecorder()

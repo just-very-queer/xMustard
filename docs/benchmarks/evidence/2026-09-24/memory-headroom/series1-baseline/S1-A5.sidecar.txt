@@ -1,0 +1,23 @@
+label: S1-A5
+tree: /private/tmp/xmustard-opus-l9b1F4
+start_utc: 2026-09-24T15:38:54Z
+host: 192 Apple M1 memsize=8589934592 27.0 27.0.0
+uptime: 21:08  up 3 days, 51 mins, 10 users, load averages: 2.42 2.27 2.32
+launch_command: env -u GOGC -u GOMEMLIMIT -u GODEBUG -u GOFLAGS -u GOMAXPROCS -u XMUSTARD_CORE_BIN bash /private/tmp/xmustard-opus-l9b1F4/scripts/bench/rss.sh --report /private/tmp/xmustard-opus-l9b1F4/docs/benchmarks/evidence/2026-09-24/memory-headroom/series1-baseline/S1-A5.json
+--- ambient env names matching ^(GOGC|GOMEMLIMIT|GODEBUG|GOFLAGS|GOMAXPROCS|XMUSTARD_) (must be empty):
+--- sanitized-launch env names, same pattern (must be empty):
+--- env names ^(RUSTFLAGS|CARGO_) (must be empty):
+--- .cargo/config* in tree: (must be empty)
+--- go env GOFLAGS GODEBUG (must be two empty lines):
+
+
+--- rg -n 'SetGCPercent|SetMemoryLimit|//go:debug' api-go (no matches expected):
+rg_exit=1
+--- pinned script sha256:
+7c7254e0282379e60aa19eb20a9ba040344533c6097758eb91a91089edf5faa9  scripts/bench/rss_bench.py
+973147225ffce59f2d5af01fd71ba06cc0d0d74964f140e00365bb4ae129d5bc  scripts/e2e/harness.py
+7d8d9e545e507e980faf8fa67658d346122bebdc5c4b0d88af62fa11277ceb51  scripts/bench/rss.sh
+--- tree head: cd13e2b78a9fadcbcd760b19442d5992136b1db0
+--- exit_code: 1  wall_s: 93  end_utc: 2026-09-24T15:40:27Z
+report_sha256: 0430fe09559d7dd64fae31632f58b813f63d7186831ef4ff310722c004b26313
+log_sha256: 13fe7d859a8630c5d6c22cb731b38a697173dc7608d80b5ac90a13d8a6736211

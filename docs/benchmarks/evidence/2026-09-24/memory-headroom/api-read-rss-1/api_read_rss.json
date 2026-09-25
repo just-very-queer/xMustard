@@ -1,0 +1,267 @@
+{
+ "instrumented": false,
+ "gate_attempt": false,
+ "bins": {
+  "A": {
+   "path": "/Users/for_work/.claude/jobs/b06aa386/tmp/bin-Arev/xmustard-api",
+   "sha256": "fd19aa900d5b387e63de67552843dd8e4d61c5c011fbe69b038cbbc0b5ec90be"
+  },
+  "B": {
+   "path": "/Users/for_work/.claude/jobs/b06aa386/tmp/bin-B/xmustard-api",
+   "sha256": "a1a588ef208a67e9e3d69d364a57e2a363ebf72cb04ad3e6173f9020ecc2a9ff"
+  }
+ },
+ "seconds": 4.0,
+ "trials": [
+  {
+   "trial": 1,
+   "bin": "A",
+   "idle_rss_kib": 14320,
+   "max_rss_kib": 50272,
+   "median_rss_kib": 50192,
+   "samples": 65,
+   "reads": 144,
+   "codes": [
+    200
+   ],
+   "lat_ms_p50": 53.7,
+   "lat_ms_p95": 69.2,
+   "api_cpu_s": 4.17,
+   "cpu_ms_per_read": 28.96
+  },
+  {
+   "trial": 1,
+   "bin": "B",
+   "idle_rss_kib": 14416,
+   "max_rss_kib": 54464,
+   "median_rss_kib": 53472,
+   "samples": 66,
+   "reads": 150,
+   "codes": [
+    200
+   ],
+   "lat_ms_p50": 51.0,
+   "lat_ms_p95": 68.3,
+   "api_cpu_s": 3.89,
+   "cpu_ms_per_read": 25.93
+  },
+  {
+   "trial": 2,
+   "bin": "A",
+   "idle_rss_kib": 14576,
+   "max_rss_kib": 48240,
+   "median_rss_kib": 48128,
+   "samples": 67,
+   "reads": 140,
+   "codes": [
+    200
+   ],
+   "lat_ms_p50": 58.1,
+   "lat_ms_p95": 70.3,
+   "api_cpu_s": 4.09,
+   "cpu_ms_per_read": 29.21
+  },
+  {
+   "trial": 2,
+   "bin": "B",
+   "idle_rss_kib": 14512,
+   "max_rss_kib": 55328,
+   "median_rss_kib": 55264,
+   "samples": 67,
+   "reads": 142,
+   "codes": [
+    200
+   ],
+   "lat_ms_p50": 57.6,
+   "lat_ms_p95": 68.3,
+   "api_cpu_s": 3.68,
+   "cpu_ms_per_read": 25.92
+  },
+  {
+   "trial": 3,
+   "bin": "A",
+   "idle_rss_kib": 14400,
+   "max_rss_kib": 48528,
+   "median_rss_kib": 47584,
+   "samples": 65,
+   "reads": 150,
+   "codes": [
+    200
+   ],
+   "lat_ms_p50": 52.0,
+   "lat_ms_p95": 70.0,
+   "api_cpu_s": 4.38,
+   "cpu_ms_per_read": 29.2
+  },
+  {
+   "trial": 3,
+   "bin": "B",
+   "idle_rss_kib": 14592,
+   "max_rss_kib": 54016,
+   "median_rss_kib": 53968,
+   "samples": 68,
+   "reads": 140,
+   "codes": [
+    200
+   ],
+   "lat_ms_p50": 57.4,
+   "lat_ms_p95": 69.1,
+   "api_cpu_s": 3.62,
+   "cpu_ms_per_read": 25.86
+  },
+  {
+   "trial": 4,
+   "bin": "A",
+   "idle_rss_kib": 14480,
+   "max_rss_kib": 47760,
+   "median_rss_kib": 47632,
+   "samples": 65,
+   "reads": 149,
+   "codes": [
+    200
+   ],
+   "lat_ms_p50": 51.1,
+   "lat_ms_p95": 71.0,
+   "api_cpu_s": 4.31,
+   "cpu_ms_per_read": 28.93
+  },
+  {
+   "trial": 4,
+   "bin": "B",
+   "idle_rss_kib": 14432,
+   "max_rss_kib": 56368,
+   "median_rss_kib": 47744,
+   "samples": 66,
+   "reads": 142,
+   "codes": [
+    200
+   ],
+   "lat_ms_p50": 57.5,
+   "lat_ms_p95": 68.8,
+   "api_cpu_s": 3.66,
+   "cpu_ms_per_read": 25.77
+  },
+  {
+   "trial": 5,
+   "bin": "A",
+   "idle_rss_kib": 14544,
+   "max_rss_kib": 49600,
+   "median_rss_kib": 49536,
+   "samples": 66,
+   "reads": 140,
+   "codes": [
+    200
+   ],
+   "lat_ms_p50": 58.6,
+   "lat_ms_p95": 73.0,
+   "api_cpu_s": 4.07,
+   "cpu_ms_per_read": 29.07
+  },
+  {
+   "trial": 5,
+   "bin": "B",
+   "idle_rss_kib": 14208,
+   "max_rss_kib": 54784,
+   "median_rss_kib": 54640,
+   "samples": 66,
+   "reads": 142,
+   "codes": [
+    200
+   ],
+   "lat_ms_p50": 57.5,
+   "lat_ms_p95": 69.2,
+   "api_cpu_s": 3.67,
+   "cpu_ms_per_read": 25.85
+  }
+ ],
+ "summary": {
+  "A": {
+   "max_rss_kib": [
+    50272,
+    48240,
+    48528,
+    47760,
+    49600
+   ],
+   "median_rss_kib": [
+    50192,
+    48128,
+    47584,
+    47632,
+    49536
+   ],
+   "reads": [
+    144,
+    140,
+    150,
+    149,
+    140
+   ],
+   "lat_ms_p50": [
+    53.7,
+    58.1,
+    52.0,
+    51.1,
+    58.6
+   ],
+   "lat_ms_p95": [
+    69.2,
+    70.3,
+    70.0,
+    71.0,
+    73.0
+   ],
+   "cpu_ms_per_read": [
+    28.96,
+    29.21,
+    29.2,
+    28.93,
+    29.07
+   ]
+  },
+  "B": {
+   "max_rss_kib": [
+    54464,
+    55328,
+    54016,
+    56368,
+    54784
+   ],
+   "median_rss_kib": [
+    53472,
+    55264,
+    53968,
+    47744,
+    54640
+   ],
+   "reads": [
+    150,
+    142,
+    140,
+    142,
+    142
+   ],
+   "lat_ms_p50": [
+    51.0,
+    57.6,
+    57.4,
+    57.5,
+    57.5
+   ],
+   "lat_ms_p95": [
+    68.3,
+    68.3,
+    69.1,
+    68.8,
+    69.2
+   ],
+   "cpu_ms_per_read": [
+    25.93,
+    25.92,
+    25.86,
+    25.77,
+    25.85
+   ]
+  }
+ }
+}

@@ -1,0 +1,61 @@
+3a1c6d67044693164573ecec3bff700dd1bb25500dae7c8c2b9f30f463479f77  /Users/for_work/.claude/jobs/b06aa386/tmp/bin-A/xmustard-api
+7045b1daf7e234fc19b23ca909e86693a155c23108174e423a3cd721079e86b9  /Users/for_work/.claude/jobs/b06aa386/tmp/bin-A/xmustard-mcp
+d9fbfd4b9710e664666b4ab3d642a1cc9d67f7dc4274483767aba02ed16d1b43  /Users/for_work/.claude/jobs/b06aa386/tmp/bin-A/xmustard-ops
+d644743ba005318ebbce451d7924ce4bcbefb26be057a48ff64f24ff430c3576  rust-core/target/release/xmustard-core
+/Users/for_work/.claude/jobs/b06aa386/tmp/bin-A/xmustard-api: go1.26.1
+	path	xmustard/api-go/cmd/xmustard-api
+	mod	xmustard/api-go	(devel)	
+	dep	github.com/bmatcuk/doublestar/v4	v4.9.1	h1:X8jg9rRZmJd4yRy7ZeNDRnM+T3ZfHv15JiBJ/avrEXE=
+	dep	github.com/jackc/pgpassfile	v1.0.0	h1:/6Hmqy13Ss2zCq62VdNG8tM1wchn8zjSGOBJ6icpsIM=
+	dep	github.com/jackc/pgservicefile	v0.0.0-20240606120523-5a60cdf6a761	h1:iCEnooe7UlwOQYpKFhBabPMi4aNAfoODPEFNiAnClxo=
+	dep	github.com/jackc/pgx/v5	v5.9.2	h1:3ZhOzMWnR4yJ+RW1XImIPsD1aNSz4T4fyP7zlQb56hw=
+	dep	github.com/jackc/puddle/v2	v2.2.2	h1:PR8nw+E/1w0GLuRFSmiioY6UooMp6KJv0/61nB7icHo=
+	dep	golang.org/x/sync	v0.17.0	h1:l60nONMj9l5drqw6jlhIELNv9I0A4OFgRsG9k2oT9Ug=
+	dep	golang.org/x/sys	v0.38.0	h1:3yZWxaJjBmCWXqhN1qh02AkOnCQ1poK6oF+a7xWL6Gc=
+	dep	golang.org/x/text	v0.29.0	h1:1neNs90w9YzJ9BocxfsQNHKuAT4pkghyXc4nhZ6sJvk=
+	dep	gopkg.in/yaml.v3	v3.0.1	h1:fxVm/GzAzEWqLHuvctI91KS9hhNmmWOoWu0XTYJS7CA=
+	build	-buildmode=exe
+	build	-compiler=gc
+	build	CGO_ENABLED=1
+	build	CGO_CFLAGS=
+	build	CGO_CPPFLAGS=
+	build	CGO_CXXFLAGS=
+	build	CGO_LDFLAGS=
+	build	GOARCH=arm64
+	build	GOOS=darwin
+	build	GOARM64=v8.0
+/Users/for_work/.claude/jobs/b06aa386/tmp/bin-A/xmustard-mcp: go1.26.1
+	path	xmustard/api-go/cmd/xmustard-mcp
+	mod	xmustard/api-go	(devel)	
+	build	-buildmode=exe
+	build	-compiler=gc
+	build	CGO_ENABLED=1
+	build	CGO_CFLAGS=
+	build	CGO_CPPFLAGS=
+	build	CGO_CXXFLAGS=
+	build	CGO_LDFLAGS=
+	build	GOARCH=arm64
+	build	GOOS=darwin
+	build	GOARM64=v8.0
+/Users/for_work/.claude/jobs/b06aa386/tmp/bin-A/xmustard-ops: go1.26.1
+	path	xmustard/api-go/cmd/xmustard-ops
+	mod	xmustard/api-go	(devel)	
+	dep	github.com/bmatcuk/doublestar/v4	v4.9.1	h1:X8jg9rRZmJd4yRy7ZeNDRnM+T3ZfHv15JiBJ/avrEXE=
+	dep	github.com/jackc/pgpassfile	v1.0.0	h1:/6Hmqy13Ss2zCq62VdNG8tM1wchn8zjSGOBJ6icpsIM=
+	dep	github.com/jackc/pgservicefile	v0.0.0-20240606120523-5a60cdf6a761	h1:iCEnooe7UlwOQYpKFhBabPMi4aNAfoODPEFNiAnClxo=
+	dep	github.com/jackc/pgx/v5	v5.9.2	h1:3ZhOzMWnR4yJ+RW1XImIPsD1aNSz4T4fyP7zlQb56hw=
+	dep	github.com/jackc/puddle/v2	v2.2.2	h1:PR8nw+E/1w0GLuRFSmiioY6UooMp6KJv0/61nB7icHo=
+	dep	golang.org/x/sync	v0.17.0	h1:l60nONMj9l5drqw6jlhIELNv9I0A4OFgRsG9k2oT9Ug=
+	dep	golang.org/x/sys	v0.38.0	h1:3yZWxaJjBmCWXqhN1qh02AkOnCQ1poK6oF+a7xWL6Gc=
+	dep	golang.org/x/text	v0.29.0	h1:1neNs90w9YzJ9BocxfsQNHKuAT4pkghyXc4nhZ6sJvk=
+	dep	gopkg.in/yaml.v3	v3.0.1	h1:fxVm/GzAzEWqLHuvctI91KS9hhNmmWOoWu0XTYJS7CA=
+	build	-buildmode=exe
+	build	-compiler=gc
+	build	CGO_ENABLED=1
+	build	CGO_CFLAGS=
+	build	CGO_CPPFLAGS=
+	build	CGO_CXXFLAGS=
+	build	CGO_LDFLAGS=
+	build	GOARCH=arm64
+	build	GOOS=darwin
+	build	GOARM64=v8.0

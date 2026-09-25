@@ -1,0 +1,12 @@
+revision A: /private/tmp/xmustard-revA-l9b1F4 (detached at cd13e2b, git worktree)
+full tracked diff sha256 (git diff HEAD --binary): e0ecc99551fb39ee0893099c4767e5152ffff42ea202bf9ef61c31af19033623 (equal to isolated tree before B edits)
+source_diff_sha256: a5aaf5d72914e738f7d8bb5569680bb9f081a4773034b922141a767a6ffec0a6
+untracked manifest: 134 files (all untracked non-ignored, excluding this evidence dir), per-file sha list sha256 d73cd8a22f811565ba9001394ee0c87e00b643a0f3ffdbaf0f5078172c1d6c43, identical in both trees
+untracked_source_sha256: 39 files 8562a222dbdbe62fffc545087173cb3932c12824909a05fbd8ea19c2bfd37719
+pinned scripts in A: rss_bench.py 7c7254e0…faa9, harness.py 97314722…d5bc, rss.sh 7d8d9e54…eb51 (verified)
+A source made read-only (chmod a-w api-go rust-core/src Cargo.* scripts)
+A sanitized prebuild:
+fd19aa900d5b387e63de67552843dd8e4d61c5c011fbe69b038cbbc0b5ec90be  /Users/for_work/.claude/jobs/b06aa386/tmp/bin-Arev/xmustard-api
+771af90425407fe9b604e54ad84436ed8e19d7e8c10f30f393df7e13e346d854  /Users/for_work/.claude/jobs/b06aa386/tmp/bin-Arev/xmustard-mcp
+e2d6a2ebf951cb078019f62fdd2812ac40ebdc6e0c2527484dbfcbbce01d956b  /Users/for_work/.claude/jobs/b06aa386/tmp/bin-Arev/xmustard-ops
+d644743ba005318ebbce451d7924ce4bcbefb26be057a48ff64f24ff430c3576  /private/tmp/xmustard-revA-l9b1F4/rust-core/target/release/xmustard-core

@@ -1,0 +1,112 @@
+{
+ "label": "PA1-profile",
+ "instrumented": true,
+ "gate_attempt": false,
+ "profile_captured": true,
+ "pprof_addr": "127.0.0.1:59967",
+ "tree": "/private/tmp/xmustard-opus-l9b1F4",
+ "diagnostics_get_latency_ms": {
+  "CLI diagnostics imports with concurrent reads": {
+   "n": 1741,
+   "p50": 0.42,
+   "p95": 0.62,
+   "max": 69.93
+  }
+ },
+ "step_events": [
+  {
+   "t": 1790264552.205952,
+   "enter": "two concurrent index clients",
+   "stats": {
+    "gc_cpu_fraction": 4.078028764104707e-05,
+    "heap_alloc": 8357904,
+    "heap_idle": 10018816,
+    "heap_inuse": 10199040,
+    "heap_released": 5799936,
+    "heap_sys": 20217856,
+    "mallocs": 35366,
+    "next_gc": 12442426,
+    "num_gc": 5,
+    "pause_total_ns": 150128,
+    "rusage": "rusage self_maxrss=32620544 children_maxrss=33849344 unit=bytes self_cpu_s=0.093 children_cpu_s=17.273 go_total_alloc_bytes=20201600 go_mallocs=35372 go_heap_sys_bytes=20217856",
+    "sys": 27216136,
+    "total_alloc": 20200568
+   },
+   "allocs": {
+    "saved": "PA1-profile.0.allocs.enter.pb.gz",
+    "bytes": 5057
+   }
+  },
+  {
+   "t": 1790264552.57164,
+   "exit": "two concurrent index clients",
+   "stats": {
+    "gc_cpu_fraction": 3.1718969696690285e-05,
+    "heap_alloc": 2915656,
+    "heap_idle": 15687680,
+    "heap_inuse": 4464640,
+    "heap_released": 10518528,
+    "heap_sys": 20152320,
+    "mallocs": 37937,
+    "next_gc": 4480442,
+    "num_gc": 6,
+    "pause_total_ns": 265753,
+    "rusage": "rusage self_maxrss=33406976 children_maxrss=33849344 unit=bytes self_cpu_s=0.120 children_cpu_s=17.759 go_total_alloc_bytes=23796328 go_mallocs=37943 go_heap_sys_bytes=20152320",
+    "sys": 27216136,
+    "total_alloc": 23795296
+   },
+   "allocs": {
+    "saved": "PA1-profile.0.allocs.exit.pb.gz",
+    "bytes": 6370
+   }
+  },
+  {
+   "cpu_step": "two concurrent index clients",
+   "seconds": 1,
+   "cpu": {
+    "saved": "PA1-profile.0.cpu.pb.gz",
+    "bytes": 6719
+   }
+  },
+  {
+   "t": 1790264618.764498,
+   "enter": "CLI diagnostics imports with concurrent reads",
+   "stats": {
+    "gc_cpu_fraction": 0.0011438021889998316,
+    "heap_alloc": 2105472,
+    "heap_idle": 16506880,
+    "heap_inuse": 3448832,
+    "heap_released": 14499840,
+    "heap_sys": 19955712,
+    "mallocs": 12954407,
+    "next_gc": 4194304,
+    "num_gc": 512,
+    "pause_total_ns": 86038830,
+    "rusage": "rusage self_maxrss=34193408 children_maxrss=33849344 unit=bytes self_cpu_s=4.498 children_cpu_s=69.866 go_total_alloc_bytes=1101143480 go_mallocs=12954413 go_heap_sys_bytes=19955712",
+    "sys": 27543816,
+    "total_alloc": 1101142448
+   },
+   "allocs": {
+    "saved": "PA1-profile.1.allocs.enter.pb.gz",
+    "bytes": 12339
+   }
+  },
+  {
+   "cpu_step": "CLI diagnostics imports with concurrent reads",
+   "seconds": 2,
+   "cpu": {
+    "error": "RemoteDisconnected('Remote end closed connection without response')"
+   }
+  },
+  {
+   "t": 1790264622.571712,
+   "exit": "CLI diagnostics imports with concurrent reads",
+   "stats": {
+    "error": "URLError(ConnectionRefusedError(61, 'Connection refused'))"
+   },
+   "allocs": {
+    "error": "URLError(ConnectionRefusedError(61, 'Connection refused'))"
+   }
+  }
+ ]
+}

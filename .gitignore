@@ -113,3 +113,28 @@ docs/research/papers/*.pdf
 
 # make build output
 api-go/bin/
+
+# 2026-09-24/25 isolated-worktree workstreams (wip/diagnostics-live-set)
+!docs/benchmarks/evidence/2026-09-24/memory-headroom/
+!docs/benchmarks/evidence/2026-09-24/memory-headroom/**
+!docs/benchmarks/evidence/2026-09-25/
+!docs/benchmarks/evidence/2026-09-25/**
+!docs/plans/2026-09-24-diagnostics-live-set-redesign.md
+!docs/plans/2026-09-24-memory-headroom.md
+!docs/plans/2026-09-25-diagnostics-throughput-replan.md
+!docs/reviews/2026-09-24-diagnostics-redesign-auth-checkpoint.md
+!docs/reviews/2026-09-24-fable-diagnostics-live-set-plan-fifth-review.md
+!docs/reviews/2026-09-24-fable-diagnostics-live-set-plan-final.md
+!docs/reviews/2026-09-24-fable-diagnostics-live-set-plan-fourth-review.md
+!docs/reviews/2026-09-24-fable-diagnostics-live-set-plan-recheck.md
+!docs/reviews/2026-09-24-fable-diagnostics-live-set-plan.md
+!docs/reviews/2026-09-24-fable-local-diagnostics-code-review.md
+!docs/reviews/2026-09-24-fable-local-diagnostics-plan-final.md
+!docs/reviews/2026-09-24-fable-local-diagnostics-plan-recheck.md
+!docs/reviews/2026-09-24-fable-local-diagnostics-recheck.md
+!docs/reviews/2026-09-24-fable-memory-headroom-implementation-review.md
+!docs/reviews/2026-09-24-fable-memory-headroom-plan-final.md
+!docs/reviews/2026-09-24-fable-memory-headroom-plan-recheck.md
+!docs/reviews/2026-09-24-fable-memory-headroom-plan.md
+!docs/reviews/2026-09-24-local-diagnostics-implementation.md
+!docs/reviews/2026-09-24-memory-headroom-implementation.md

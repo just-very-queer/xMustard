@@ -1,0 +1,118 @@
+[PASS] fixture: 501 tracked files, ~20 MiB, 70-symbol file — 501 files, 21179988 bytes
+[PASS] cold query finds symbol_070 (beyond the old 32/64 caps)
+[PASS] cold query is a cache miss that parses every tracked file — {"graph_cache": "miss", "files_read": 501, "files_parsed": 501, "files_reused": 0, "bytes_parsed": 21179988, "symbols_indexed": 29737}
+[PASS] warm query is a cache hit with 0 files parsed — {"graph_cache": "hit", "files_read": 0, "files_parsed": 0, "files_reused": 0, "bytes_parsed": 0, "symbols_indexed": 29737}
+[PASS] same-size dirty edit reparses exactly one file — {"graph_cache": "miss", "files_read": 1, "files_parsed": 1, "files_reused": 500, "bytes_parsed": 42168, "symbols_indexed": 29737}
+[PASS] rename/delete reparses at most the renamed file and drops the deleted file's symbols — {"graph_cache": "miss", "files_read": 0, "files_parsed": 0, "files_reused": 499, "bytes_parsed": 0, "symbols_indexed": 29625}
+[PASS] two concurrent index clients both answer
+[PASS] capture payloads are exactly 16 MiB — 16777216 bytes x5, sha256 86612914aa3da896
+[PASS] every capture attempt was decided on its headers — ['captured', 'captured', 'captured', 'wire_503_overloaded', 'captured']
+[PASS] no capture attempt ended in a transport error — []
+[PASS] at least one capture refused on the wire: 503 + Retry-After + overloaded:true — ['captured', 'captured', 'captured', 'wire_503_overloaded', 'captured']
+[PASS] admitted captures succeed — ['captured', 'captured', 'captured', 'wire_503_overloaded', 'captured']
+[PASS] pool held while admitted captures overlapped never exceeded its max — {"in_use": 67108864, "max": 67108864, "peak": 67108864}
+[PASS] every captured original reports exact size and SHA-256 and retains a handle — [[true, 16777216, "86612914aa3d"], [true, 16777216, "86612914aa3d"], [true, 16777216, "86612914aa3d"], [true, 16777216, "86612914aa3d"]]
+[PASS] 5 database-free CLI imports of 2500 rows succeed with concurrent API reads — exits [0, 0, 0, 0, 0], 1740 reads [200]
+[PASS] every captured original fully expanded in <=64 KiB pages with exact size and SHA-256 — [["mcp#1", 256, true, null], ["http", 256, true, null], ["mcp#2", 256, true, null], ["http", 256, true, null], ["http", 256, true, null]]
+[PASS] transient pool in-use never exceeded its max and is released — {"in_use": 0, "max": 67108864, "peak": 67108864}
+[PASS] helper-child limit held — admission peak 2/4, sampled concurrent xmustard-core 2
+[PASS] sampler valid: samples taken, no ps errors, no lost required roots, workload complete
+[PASS] sampled xMustard-owned tree peak <= 100 MB (100,000,000 bytes) — 95.5 MB (91.1 MiB) over 832 samples at 'CLI diagnostics imports with concurrent reads'
+{
+ "gate": {
+  "limit_bytes": 100000000,
+  "valid": true,
+  "invalid_reasons": [],
+  "passed": true
+ },
+ "admission": {
+  "capture_attempts": [
+   {
+    "idx": 0,
+    "outcome": "captured",
+    "body_bytes_sent": 16777216,
+    "decision_ms": 0.9,
+    "admitted_on_headers": true,
+    "status": 200,
+    "retry_after": null,
+    "response_bytes": 2313,
+    "elapsed_ms": 383.2
+   },
+   {
+    "idx": 1,
+    "outcome": "captured",
+    "body_bytes_sent": 16777216,
+    "decision_ms": 0.8,
+    "admitted_on_headers": true,
+    "status": 200,
+    "retry_after": null,
+    "response_bytes": 2313,
+    "elapsed_ms": 434.8
+   },
+   {
+    "idx": 2,
+    "outcome": "captured",
+    "body_bytes_sent": 16777216,
+    "decision_ms": 0.7,
+    "admitted_on_headers": true,
+    "status": 200,
+    "retry_after": null,
+    "response_bytes": 2313,
+    "elapsed_ms": 434.8
+   },
+   {
+    "idx": 3,
+    "outcome": "wire_503_overloaded",
+    "body_bytes_sent": 0,
+    "decision_ms": 0.7,
+    "admitted_on_headers": false,
+    "status": 503,
+    "retry_after": "1",
+    "response_bytes": 93,
+    "elapsed_ms": 0.9
+   },
+   {
+    "idx": 4,
+    "outcome": "captured",
+    "body_bytes_sent": 16777216,
+    "decision_ms": 0.6,
+    "admitted_on_headers": true,
+    "status": 200,
+    "retry_after": null,
+    "response_bytes": 2313,
+    "elapsed_ms": 410.7
+   }
+  ],
+  "outcomes": [
+   "captured",
+   "captured",
+   "captured",
+   "wire_503_overloaded",
+   "captured"
+  ],
+  "pool_while_held": {
+   "in_use": 67108864,
+   "max": 67108864,
+   "peak": 67108864
+  },
+  "transient_pool_final": {
+   "in_use": 0,
+   "max": 67108864,
+   "peak": 67108864
+  },
+  "children": {
+   "cap": 4,
+   "in_use": 0,
+   "peak": 2
+  },
+  "client": "Expect: 100-continue; refusal decided on headers before any body byte"
+ },
+ "fixture": {
+  "tracked_files": 501,
+  "bytes": 21179988,
+  "tree_sha256": "c16734b0a9e17964720c6b4c226b93d6f61951eb50a3ed1e68ecee5a18957ef8",
+  "many_rs_symbols": 70,
+  "syntax_limitation": "generated Rust statements lack ';' (tree-sitter-rust GLR error recovery); baseline kept unchanged for comparability"
+ }
+}
+{"suite": "rss-bench", "passed": 20, "failed": 0}

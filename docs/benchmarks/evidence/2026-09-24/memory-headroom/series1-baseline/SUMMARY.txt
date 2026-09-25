@@ -1,0 +1,20 @@
+S1-A1.json: peak 88.1 MB (84.0 MiB) step='CLI diagnostics imports with concurrent reads' samples=863 gate valid=True passed=True invalid=[] prov_mismatch=none
+   at peak: [('xmustard-api', 40.6, 48885, 48814), ('(xmustard-ops)', 28.0, 67655, 48814), ('xmustard-mcp', 7.6, 48913, 48814), ('xmustard-mcp', 7.6, 48914, 48814), ('(git)', 0.2, 67667, 48885)]
+   step peaks MB: {'cold query symbol_070': 80.6, 'warm query symbol_070': 61.0, 'same-size dirty edit': 74.1, 'rename/delete cycle': 69.2, 'two concurrent index cli': 86.8, 'expand every retained or': 66.0, 'CLI diagnostics imports ': 88.1}
+   idx step 0.367 s; cli step 3.969 s; api_reads 3082 statuses [200] cli [0, 0, 0, 0, 0]
+S1-A2.json: peak 91.9 MB (87.7 MiB) step='CLI diagnostics imports with concurrent reads' samples=857 gate valid=True passed=True invalid=[] prov_mismatch=none
+   at peak: [('xmustard-api', 44.2, 67792, 67717), ('(xmustard-ops)', 28.0, 86710, 67717), ('xmustard-mcp', 7.7, 67804, 67717), ('xmustard-mcp', 7.7, 67803, 67717)]
+   step peaks MB: {'cold query symbol_070': 74.4, 'same-size dirty edit': 66.6, 'two concurrent index cli': 77.2, 'expand every retained or': 66.8, 'CLI diagnostics imports ': 91.9}
+   idx step 0.373 s; cli step 3.809 s; api_reads 1753 statuses [200] cli [0, 0, 0, 0, 0]
+S1-A3.json: peak 105.8 MB (100.9 MiB) step='CLI diagnostics imports with concurrent reads' samples=850 gate valid=True passed=False invalid=[] prov_mismatch=none
+   at peak: [('xmustard-api', 52.6, 86883, 86793), ('xmustard-ops', 19.1, 6008, 86793), ('(xmustard-core)', 13.9, 6013, 6008), ('xmustard-mcp', 7.7, 86890, 86793), ('xmustard-mcp', 7.6, 86891, 86793)]
+   step peaks MB: {'cold query symbol_070': 83.1, 'warm query symbol_070': 64.2, 'same-size dirty edit': 69.7, 'rename/delete cycle': 70.2, 'two concurrent index cli': 86.7, 'expand every retained or': 68.5, 'CLI diagnostics imports ': 105.8}
+   idx step 0.368 s; cli step 3.458 s; api_reads 1559 statuses [200] cli [0, 0, 0, 0, 0]
+S1-A4.json: peak 95.3 MB (90.8 MiB) step='CLI diagnostics imports with concurrent reads' samples=851 gate valid=True passed=True invalid=[] prov_mismatch=none
+   at peak: [('xmustard-api', 42.4, 6165, 6081), ('xmustard-ops', 19.6, 24929, 6081), ('(xmustard-core)', 13.5, 24934, 24929), ('xmustard-mcp', 7.7, 6166, 6081), ('xmustard-mcp', 7.7, 6167, 6081)]
+   step peaks MB: {'cold query symbol_070': 80.1, 'warm query symbol_070': 60.3, 'same-size dirty edit': 70.6, 'rename/delete cycle': 72.5, 'two concurrent index cli': 87.4, 'expand every retained or': 69.5, 're-expand one original': 69.4, 'CLI diagnostics imports ': 95.3}
+   idx step 0.382 s; cli step 3.683 s; api_reads 1617 statuses [200] cli [0, 0, 0, 0, 0]
+S1-A5.json: peak 104.1 MB (99.3 MiB) step='CLI diagnostics imports with concurrent reads' samples=841 gate valid=True passed=False invalid=[] prov_mismatch=none
+   at peak: [('xmustard-api', 51.2, 25055, 24987), ('xmustard-ops', 19.4, 43806, 24987), ('(xmustard-core)', 13.4, 43811, 43806), ('xmustard-mcp', 7.7, 25066, 24987), ('xmustard-mcp', 7.6, 25067, 24987)]
+   step peaks MB: {'cold query symbol_070': 73.6, 'same-size dirty edit': 61.0, 'rename/delete cycle': 61.0, 'two concurrent index cli': 78.3, 'expand every retained or': 66.6, 're-expand one original': 66.5, 'CLI diagnostics imports ': 104.1}
+   idx step 0.37 s; cli step 3.867 s; api_reads 3152 statuses [200] cli [0, 0, 0, 0, 0]

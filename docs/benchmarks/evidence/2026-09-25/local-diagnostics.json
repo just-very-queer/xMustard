@@ -1,0 +1,99 @@
+{
+ "suite": "local-diagnostics",
+ "passed": 15,
+ "failed": 1,
+ "checks": [
+  {
+   "check": "fresh workspace: no-DSN GET is 200 no_baseline",
+   "ok": true,
+   "detail": "200 {'workspace_id': 'repo-0da8fb1c73', 'diagnostics': [], 'warnings': ['No diagnostics baseline has been materialized.'], 'storage': {'backend': 'local', 'status': 'no_baseline', 'freshness_basis': 'ingestion_identity'}, 'generated_at': '2026-09-25T00:25:35.557327Z'}"
+  },
+  {
+   "check": "CORE_ONLY hides GET diagnostics/status",
+   "ok": true,
+   "detail": "status 404"
+  },
+  {
+   "check": "CORE_ONLY hides POST diagnostics/run",
+   "ok": true,
+   "detail": "status 404"
+  },
+  {
+   "check": "CORE_ONLY hides GET diagnostics/live",
+   "ok": true,
+   "detail": "status 404"
+  },
+  {
+   "check": "10 max-row (2,500) CLI imports succeed under concurrent reads",
+   "ok": true,
+   "detail": "[0, 0, 0, 0, 0, 0, 0, 0, 0, 0]"
+  },
+  {
+   "check": "CLI import succeeds with local storage",
+   "ok": true,
+   "detail": "ention\":{\"expires_at\":\"2026-09-26T00:25:36Z\",\"promise\":\"full envelope and exact original bytes kept for at least 24h\"}},\"diagnostic_rows\":1,\"storage_backend\":\"local\",\"message\":\"Materialized 1 normalized diagnostic row(s) into local diagnostics storage.\",\"generated_at\":\"2026-09-25T00:25:37.005751Z\"}\n"
+  },
+  {
+   "check": "concurrent API reads all succeeded",
+   "ok": false,
+   "detail": "2390 reads, codes [200, 503]"
+  },
+  {
+   "check": "next GET sees the CLI row without restart",
+   "ok": true,
+   "detail": "200"
+  },
+  {
+   "check": "local row: symbols unavailable, no invented links",
+   "ok": true,
+   "detail": ""
+  },
+  {
+   "check": "raw provenance is the exact CLI input",
+   "ok": true,
+   "detail": ""
+  },
+  {
+   "check": "status labels: available with matched identity, source_revision unknown",
+   "ok": true,
+   "detail": "{\"backend\": \"local\", \"status\": \"available\", \"freshness_basis\": \"ingestion_identity\"}"
+  },
+  {
+   "check": "after restart: same run, severity, path/range/message, fingerprint, raw sha",
+   "ok": true,
+   "detail": "{\"diagnostic_run_id\": \"diag_974cc9e6f19b\", \"severity\": \"error\", \"path\": \"pkg/handler.go\", \"range_start_line\": 4, \"range_start_column\": 2, \"range_end_line\": 4, \"range_end_column\": 10, \"message\": \"xm_local_diagnostic: seeded by the CLI\", \"fingerprint\": \"b6167f574ed480f2c7fab4f7938acaf06638dc22\", \"raw_sha\": \"855323dca3275a820562dc619809df1f8eab97d93f0903ff8b79b934c6b0bdce\"}"
+  },
+  {
+   "check": "zero-error baseline is present and distinct from no_baseline",
+   "ok": true,
+   "detail": "200 rc=0 ention\":{\"expires_at\":\"2026-09-26T00:25:37Z\",\"promise\":\"full envelope and exact original bytes kept for at least 24h\"}},\"diagnostic_rows\":0,\"storage_backend\":\"local\",\"message\":\"Materialized 0 normalized diagnostic row(s) into local diagnostics storage.\",\"generated_at\":\"2026-09-25T00:25:37.191555Z\"}\n  {\"workspace_id\": \"repo-empty-718a7b9b49\", \"baseline\": {\"diagnostic_run_id\": \"diag_064f54ae844d\", \"workspace_id\": \"repo-empty-718a7b9b49\", \"source_kind\": \"compiler\", \"source_name\": \"e2e\", \"batch_fingerprint\": \"a3ad09fd4755651b4fdcd147eda4b28864f8fba54fec2a04ac72b8d354b2d7b5\", \"replay_archive\": {\"raw_"
+  },
+  {
+   "check": "two concurrent CLI imports: each publishes or reports busy; latest is a complete published run",
+   "ok": true,
+   "detail": "published 2, busy 0"
+  },
+  {
+   "check": "MCP exposes exactly the nine tools",
+   "ok": true,
+   "detail": "['diagnostics', 'explain', 'ground', 'impact', 'recall', 'remember', 'search', 'verify', 'why_failed']"
+  },
+  {
+   "check": "MCP diagnostics tool returns the local row",
+   "ok": true,
+   "detail": "{\"workspace_id\":\"repo-0da8fb1c73\",\"baseline\":{\"diagnostic_run_id\":\"diag_ae5a7ad73435\",\"workspace_id\":\"repo-0da8fb1c73\",\"source_kind\":\"lsp\",\"source_name\":\"race-1\",\"batch_fingerprint\":\"75a836fb4f347d808"
+  }
+ ],
+ "resources": {
+  "method": "ps -A -o pid=,ppid=,rss= every ~20 ms, summed per process tree (KiB -> MiB)",
+  "samples": 31,
+  "failures": 0,
+  "peak_mib": {
+   "api_tree": 34.9,
+   "xmustard_owned_total": 64.4,
+   "cli_tree": 32.0
+  },
+  "workload": "10 sequential max-row (2,500-row) CLI imports plus one seeded 1-row import (real Rust normalize+archive), concurrent with 4 threads looping GET /diagnostics against the CORE_ONLY API",
+  "api_reads": 2390
+ }
+}

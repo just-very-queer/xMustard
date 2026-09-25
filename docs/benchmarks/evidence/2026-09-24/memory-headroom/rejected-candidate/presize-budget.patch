@@ -1,0 +1,140 @@
+--- api-go/internal/budget/budget.go	2026-09-24 21:32:16
++++ /Users/for_work/.claude/jobs/b06aa386/tmp/rejected-candidate-budget.go	2026-09-24 21:32:16
+@@ -238,6 +238,32 @@
+ 	}
+ 	c.buf = append(c.buf, p...)
+ 	return len(p), nil
++}
++
++// presize reserves and allocates n bytes of capacity up front. It is only a hint: a
++// size past max, or one the pool cannot admit now, leaves Write's chunked admission
++// to decide exactly as it would without it.
++func (c *CaptureWriter) presize(n int64) {
++	if n <= 0 || n > int64(c.max) || c.buf != nil {
++		return
++	}
++	if c.scope.Acquire(n) != nil {
++		return
++	}
++	c.reserved += n
++	c.buf = make([]byte, 0, n)
++}
++
++func regularFileSize(r io.Reader) int64 {
++	f, ok := r.(interface{ Stat() (os.FileInfo, error) })
++	if !ok {
++		return 0
++	}
++	info, err := f.Stat()
++	if err != nil || !info.Mode().IsRegular() {
++		return 0
++	}
++	return info.Size()
+ }
+ 
+ func (c *CaptureWriter) Bytes() []byte  { return c.buf }
+@@ -251,9 +277,11 @@
+ 
+ // ReadAllAdmitted reads r up to max bytes, reserving pool bytes before buffering. It
+ // returns the admission error when refused (ErrOverloaded, or ErrAdmissionLimit from a
+-// Limited scope) and ErrTooLarge past max.
++// Limited scope) and ErrTooLarge past max. A regular file's buffer is sized once from
++// its stat size (reserved first), instead of regrowing on every 32 KiB write.
+ func ReadAllAdmitted(scope *Scope, r io.Reader, max int) ([]byte, error) {
+ 	w := NewCaptureWriter(scope, max)
++	w.presize(regularFileSize(r))
+ 	_, err := io.Copy(w, r)
+ 	switch {
+ 	case w.Refused():
+--- api-go/internal/budget/budget_test.go	2026-09-24 21:32:16
++++ /Users/for_work/.claude/jobs/b06aa386/tmp/rejected-candidate-budget_test.go	2026-09-24 21:32:16
+@@ -5,6 +5,8 @@
+ 	"context"
+ 	"errors"
+ 	"math"
++	"os"
++	"path/filepath"
+ 	"sync"
+ 	"testing"
+ 	"time"
+@@ -201,3 +203,80 @@
+ 		t.Fatalf("capture refusal must carry the cause, got %v", w.RefusalErr())
+ 	}
+ }
++
++// statReader reports a fixed stat size that need not match its content, as a file
++// that grows or shrinks between stat and read would.
++type statReader struct {
++	*bytes.Reader
++	size int64
++}
++
++func (s statReader) Stat() (os.FileInfo, error) { return fakeInfo{size: s.size}, nil }
++
++type fakeInfo struct {
++	os.FileInfo
++	size int64
++}
++
++func (f fakeInfo) Size() int64       { return f.size }
++func (f fakeInfo) Mode() os.FileMode { return 0o644 }
++
++func TestReadAllAdmittedPresizesRegularFiles(t *testing.T) {
++	data := bytes.Repeat([]byte("0123456789abcdef"), 40_000) // 640,000 bytes: many 32 KiB writes
++	path := filepath.Join(t.TempDir(), "f")
++	if err := os.WriteFile(path, data, 0o644); err != nil {
++		t.Fatal(err)
++	}
++	f, err := os.Open(path)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer f.Close()
++	pool := NewByteBudget(1 << 20)
++	scope := NewScope(pool)
++	got, err := ReadAllAdmitted(scope, f, 1<<20)
++	if err != nil || !bytes.Equal(got, data) {
++		t.Fatalf("read: err=%v len=%d", err, len(got))
++	}
++	if cap(got) != len(data) || scope.Held() != int64(len(data)) {
++		t.Fatalf("want one exact allocation and reservation: cap=%d held=%d size=%d", cap(got), scope.Held(), len(data))
++	}
++	scope.Close()
++	if pool.InUse() != 0 {
++		t.Fatalf("pool not released: %d", pool.InUse())
++	}
++}
++
++func TestReadAllAdmittedStatSizeIsOnlyAHint(t *testing.T) {
++	data := bytes.Repeat([]byte("x"), 100_000)
++	for _, size := range []int64{10, 50_000, 200_000} { // grew, grew, shrank since stat
++		got, err := ReadAllAdmitted(NewScope(NewByteBudget(1<<20)), statReader{bytes.NewReader(data), size}, 1<<20)
++		if err != nil || !bytes.Equal(got, data) {
++			t.Fatalf("stat %d: err=%v len=%d", size, err, len(got))
++		}
++	}
++	// a hint past max is ignored; the read still fails as too large
++	if _, err := ReadAllAdmitted(NewScope(NewByteBudget(1<<20)), statReader{bytes.NewReader(data), 100_000}, 1000); !errors.Is(err, ErrTooLarge) {
++		t.Fatalf("over max: %v", err)
++	}
++}
++
++func TestReadAllAdmittedPresizeKeepsAdmission(t *testing.T) {
++	data := bytes.Repeat([]byte("y"), 100_000)
++	// the pool cannot admit the file: refused as before, nothing left reserved
++	pool := NewByteBudget(1000)
++	scope := NewScope(pool)
++	if _, err := ReadAllAdmitted(scope, statReader{bytes.NewReader(data), int64(len(data))}, 1<<20); !errors.Is(err, ErrOverloaded) {
++		t.Fatalf("small pool: %v", err)
++	}
++	scope.Close()
++	if pool.InUse() != 0 {
++		t.Fatalf("pool leaked %d", pool.InUse())
++	}
++	// a Limited scope's cap still applies to the up-front reservation
++	parent := NewScope(NewByteBudget(1 << 20))
++	defer parent.Close()
++	if _, err := ReadAllAdmitted(parent.Limited(50_000), statReader{bytes.NewReader(data), int64(len(data))}, 1<<20); !errors.Is(err, ErrAdmissionLimit) {
++		t.Fatalf("limited scope: %v", err)
++	}
++}

@@ -1,0 +1,12 @@
+A      200	  38795893 ns/op	23688863 B/op	   37832 allocs/op
+A      200	  38493689 ns/op	23689007 B/op	   37832 allocs/op
+A      200	  39029171 ns/op	23688909 B/op	   37832 allocs/op
+B      200	  37202123 ns/op	13803221 B/op	   37817 allocs/op
+B      200	  37350538 ns/op	13803016 B/op	   37816 allocs/op
+B      200	  37391930 ns/op	13886115 B/op	   37816 allocs/op
+A      200	  38509092 ns/op	23688927 B/op	   37832 allocs/op
+A      200	  37702336 ns/op	23688946 B/op	   37832 allocs/op
+A      200	  37432621 ns/op	23688830 B/op	   37832 allocs/op
+B      200	  37115036 ns/op	14107602 B/op	   37818 allocs/op
+B      200	  36920935 ns/op	13885966 B/op	   37816 allocs/op
+B      200	  36597991 ns/op	13830741 B/op	   37816 allocs/op

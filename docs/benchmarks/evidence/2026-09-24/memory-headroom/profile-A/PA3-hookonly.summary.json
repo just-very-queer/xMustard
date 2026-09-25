@@ -1,0 +1,82 @@
+{
+ "label": "PA3-hookonly",
+ "instrumented": true,
+ "gate_attempt": false,
+ "profile_captured": false,
+ "pprof_addr": "127.0.0.1:65212",
+ "tree": "/private/tmp/xmustard-opus-l9b1F4",
+ "diagnostics_get_latency_ms": {
+  "CLI diagnostics imports with concurrent reads": {
+   "n": 3190,
+   "p50": 0.41,
+   "p95": 0.6,
+   "max": 76.21
+  }
+ },
+ "step_events": [
+  {
+   "t": 1790264741.551702,
+   "enter": "two concurrent index clients",
+   "stats": {
+    "gc_cpu_fraction": 4.0990653874199664e-05,
+    "heap_alloc": 8356984,
+    "heap_idle": 10223616,
+    "heap_inuse": 10027008,
+    "heap_released": 5824512,
+    "heap_sys": 20250624,
+    "mallocs": 35399,
+    "next_gc": 12445786,
+    "num_gc": 5,
+    "pause_total_ns": 147958,
+    "rusage": "rusage self_maxrss=29622272 children_maxrss=33177600 unit=bytes self_cpu_s=0.099 children_cpu_s=17.359 go_total_alloc_bytes=20218544 go_mallocs=35405 go_heap_sys_bytes=20250624",
+    "sys": 27216136,
+    "total_alloc": 20217512
+   }
+  },
+  {
+   "t": 1790264741.9319801,
+   "exit": "two concurrent index clients",
+   "stats": {
+    "gc_cpu_fraction": 4.0990653874199664e-05,
+    "heap_alloc": 9678520,
+    "heap_idle": 8806400,
+    "heap_inuse": 11313152,
+    "heap_released": 5709824,
+    "heap_sys": 20119552,
+    "mallocs": 37245,
+    "next_gc": 12445786,
+    "num_gc": 5,
+    "pause_total_ns": 147958,
+    "rusage": "rusage self_maxrss=29622272 children_maxrss=33177600 unit=bytes self_cpu_s=0.122 children_cpu_s=17.846 go_total_alloc_bytes=21540080 go_mallocs=37251 go_heap_sys_bytes=20119552",
+    "sys": 27478280,
+    "total_alloc": 21539048
+   }
+  },
+  {
+   "t": 1790264809.0599291,
+   "enter": "CLI diagnostics imports with concurrent reads",
+   "stats": {
+    "gc_cpu_fraction": 0.0011610598529051919,
+    "heap_alloc": 2009800,
+    "heap_idle": 16588800,
+    "heap_inuse": 3399680,
+    "heap_released": 14860288,
+    "heap_sys": 19988480,
+    "mallocs": 12952293,
+    "next_gc": 4194304,
+    "num_gc": 583,
+    "pause_total_ns": 88593537,
+    "rusage": "rusage self_maxrss=29622272 children_maxrss=33177600 unit=bytes self_cpu_s=4.624 children_cpu_s=70.781 go_total_alloc_bytes=1099415240 go_mallocs=12952299 go_heap_sys_bytes=19988480",
+    "sys": 27543816,
+    "total_alloc": 1099414208
+   }
+  },
+  {
+   "t": 1790264813.050312,
+   "exit": "CLI diagnostics imports with concurrent reads",
+   "stats": {
+    "error": "URLError(ConnectionRefusedError(61, 'Connection refused'))"
+   }
+  }
+ ]
+}

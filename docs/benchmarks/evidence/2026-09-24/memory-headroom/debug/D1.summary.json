@@ -1,0 +1,125 @@
+{
+ "label": "D1",
+ "instrumented": true,
+ "gate_attempt": false,
+ "profile_captured": true,
+ "pprof_addr": "127.0.0.1:52972",
+ "tree": "/private/tmp/xmustard-opus-l9b1F4",
+ "diagnostics_get_latency_ms": {
+  "CLI diagnostics imports with concurrent reads": {
+   "n": 1531,
+   "p50": 0.43,
+   "p95": 0.65,
+   "max": 76.02
+  }
+ },
+ "step_events": [
+  {
+   "t": 1790264897.893334,
+   "enter": "two concurrent index clients",
+   "stats": {
+    "gc_cpu_fraction": 4.2800472546436155e-05,
+    "heap_alloc": 8358336,
+    "heap_idle": 9928704,
+    "heap_inuse": 10289152,
+    "heap_released": 6545408,
+    "heap_sys": 20217856,
+    "mallocs": 35347,
+    "next_gc": 12440906,
+    "num_gc": 5,
+    "pause_total_ns": 216460,
+    "rusage": "rusage self_maxrss=31555584 children_maxrss=33718272 unit=bytes self_cpu_s=0.117 children_cpu_s=17.171 go_total_alloc_bytes=20202192 go_mallocs=35353 go_heap_sys_bytes=20217856",
+    "sys": 26708232,
+    "total_alloc": 20201160
+   },
+   "allocs": {
+    "saved": "D1.0.allocs.enter.pb.gz",
+    "bytes": 3739
+   }
+  },
+  {
+   "t": 1790264898.2398322,
+   "exit": "two concurrent index clients",
+   "stats": {
+    "gc_cpu_fraction": 3.235950021647209e-05,
+    "heap_alloc": 2925680,
+    "heap_idle": 15736832,
+    "heap_inuse": 4448256,
+    "heap_released": 7094272,
+    "heap_sys": 20185088,
+    "mallocs": 37630,
+    "next_gc": 4512762,
+    "num_gc": 6,
+    "pause_total_ns": 312211,
+    "rusage": "rusage self_maxrss=32358400 children_maxrss=33718272 unit=bytes self_cpu_s=0.127 children_cpu_s=17.661 go_total_alloc_bytes=23776112 go_mallocs=37636 go_heap_sys_bytes=20185088",
+    "sys": 26986760,
+    "total_alloc": 23775080
+   },
+   "allocs": {
+    "saved": "D1.0.allocs.exit.pb.gz",
+    "bytes": 4707
+   }
+  },
+  {
+   "cpu_step": "two concurrent index clients",
+   "seconds": 1,
+   "cpu": {
+    "saved": "D1.0.cpu.pb.gz",
+    "bytes": 5759
+   }
+  },
+  {
+   "t": 1790264965.414037,
+   "enter": "CLI diagnostics imports with concurrent reads",
+   "stats": {
+    "gc_cpu_fraction": 0.0010488348947963742,
+    "heap_alloc": 2181920,
+    "heap_idle": 16293888,
+    "heap_inuse": 3661824,
+    "heap_released": 12681216,
+    "heap_sys": 19955712,
+    "mallocs": 12954035,
+    "next_gc": 4194304,
+    "num_gc": 513,
+    "pause_total_ns": 77019214,
+    "rusage": "rusage self_maxrss=33423360 children_maxrss=33718272 unit=bytes self_cpu_s=4.528 children_cpu_s=70.526 go_total_alloc_bytes=1098954328 go_mallocs=12954041 go_heap_sys_bytes=19955712",
+    "sys": 27543816,
+    "total_alloc": 1098953296
+   },
+   "allocs": {
+    "saved": "D1.1.allocs.enter.pb.gz",
+    "bytes": 11719
+   }
+  },
+  {
+   "t": 1790264968.788057,
+   "exit": "CLI diagnostics imports with concurrent reads",
+   "stats": {
+    "gc_cpu_fraction": 0.0011338490902585493,
+    "heap_alloc": 10121880,
+    "heap_idle": 29614080,
+    "heap_inuse": 11280384,
+    "heap_released": 25673728,
+    "heap_sys": 40894464,
+    "mallocs": 13900136,
+    "next_gc": 13677338,
+    "num_gc": 577,
+    "pause_total_ns": 83234759,
+    "rusage": "rusage self_maxrss=56557568 children_maxrss=33718272 unit=bytes self_cpu_s=5.547 children_cpu_s=70.806 go_total_alloc_bytes=1574579128 go_mallocs=13900142 go_heap_sys_bytes=40894464",
+    "sys": 48515336,
+    "total_alloc": 1574578096
+   },
+   "allocs": {
+    "saved": "D1.1.allocs.exit.pb.gz",
+    "bytes": 13953
+   }
+  },
+  {
+   "cpu_step": "CLI diagnostics imports with concurrent reads",
+   "seconds": 2,
+   "cpu": {
+    "error": "RemoteDisconnected('Remote end closed connection without response')"
+   }
+  }
+ ]
+}

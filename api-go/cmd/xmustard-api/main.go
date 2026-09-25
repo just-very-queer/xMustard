@@ -590,6 +590,8 @@ func respondDiagnosticsError(w http.ResponseWriter, err error) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 	case errors.Is(err, workspaceops.ErrDiagnosticsStoreUnsupported):
 		writeJSON(w, http.StatusNotImplemented, map[string]any{"error": err.Error()})
+	case errors.Is(err, workspaceops.ErrDiagnosticsReadBudgetConfig):
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 	case errors.Is(err, budget.ErrOverloaded):
 		writeOverloaded(w)
 	case errors.Is(err, os.ErrNotExist):
@@ -2209,7 +2211,7 @@ func registerRoutes(mux *http.ServeMux) {
 		writeJSON(w, http.StatusOK, result)
 	})
 	mux.HandleFunc("GET /api/workspaces/{workspace_id}/diagnostics", func(w http.ResponseWriter, r *http.Request) {
-		result, err := workspaceops.ReadDiagnosticsCtx(
+		prepared, err := workspaceops.PrepareDiagnosticsReadCtx(
 			r.Context(),
 			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
 			r.PathValue("workspace_id"),
@@ -2219,7 +2221,16 @@ func registerRoutes(mux *http.ServeMux) {
 			respondDiagnosticsError(w, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, result)
+		defer prepared.Close()
+		if err := r.Context().Err(); err != nil {
+			respondDiagnosticsError(w, err)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		if _, err := prepared.WriteJSON(w); err != nil {
+			panic(http.ErrAbortHandler)
+		}
 	})
 	mux.HandleFunc("GET /api/workspaces/{workspace_id}/diagnostics/live", func(w http.ResponseWriter, r *http.Request) {
 		workspaceID := r.PathValue("workspace_id")

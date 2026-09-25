@@ -1,0 +1,384 @@
+cd api-go && go test ./...
+ok  	xmustard/api-go/cmd/xmustard-api	16.437s
+ok  	xmustard/api-go/cmd/xmustard-mcp	(cached)
+ok  	xmustard/api-go/cmd/xmustard-ops	(cached)
+ok  	xmustard/api-go/internal/budget	(cached)
+ok  	xmustard/api-go/internal/evidence	(cached)
+ok  	xmustard/api-go/internal/rustcore	(cached)
+ok  	xmustard/api-go/internal/workspaceops	(cached)
+cd api-go && go build ./...
+cd rust-core && cargo test
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.22s
+     Running unittests src/lib.rs (target/debug/deps/xmustard_core-ae5051f7dbc4159b)
+
+running 131 tests
+test benchmark::tests::summarize_computes_percentiles ... ok
+test changetrack::tests::diff_hash_maps_classifies ... ok
+test diagnostics::tests::archives_raw_diagnostics_payload_with_server_provenance ... ok
+test diagnostics::tests::links_diagnostic_to_unique_exact_symbol_anchor ... ok
+test diagnostics::tests::links_diagnostic_to_unique_narrowest_enclosing_symbol ... ok
+test diagnostics::tests::normalizes_lsp_publish_diagnostics_payload ... ok
+test diagnostics::tests::refuses_ambiguous_symbol_links ... ok
+test diagnostics::tests::warns_when_lsp_server_command_is_missing ... ok
+test goalruntime::tests::completion_gate_blocks_without_evidence ... ok
+test goalruntime::tests::completion_gate_passes_with_real_evidence ... ok
+test goalruntime::tests::create_rejects_refusal_objective ... ok
+test goalruntime::tests::create_then_get_round_trips ... ok
+test goalruntime::tests::duplicate_titles_get_unique_ids ... ok
+test goalruntime::tests::get_missing_goal_is_not_found ... ok
+test goalruntime::tests::iteration_rejects_empty_summary_but_keeps_real_one ... ok
+test goalruntime::tests::ledger_and_context_render_without_panicking ... ok
+test goalruntime::tests::slop_linter_table ... ok
+test goalruntime::tests::slug_and_compact_match_go_rules ... ok
+test goalruntime::tests::status_round_trips_through_json ... ok
+test goalruntime::tests::unverifiable_success_evidence_warns ... ok
+test indexcache::tests::atomic_write_replaces_and_leaves_no_temp ... ok
+test benchmark::tests::bench_runs_all_ops ... ok
+test changetrack::tests::contract_break_surfaces_in_working_tree_changes ... ok
+test indexcache::tests::non_git_root_is_incomplete ... ok
+test changetrack::tests::incorporation_lineage_chains_changes ... ok
+test indexcache::tests::porcelain_z_parses_untrimmed_renames_and_odd_names ... ok
+test changetrack::tests::contract_break_on_signature_change_not_on_body ... ok
+test indexcache::tests::sweep_removes_only_old_temps ... ok
+test lsp::tests::definition_contract_rejects_symbol_materialization_payloads ... ok
+test lsp::tests::document_symbols_reject_non_lsp_materialized_rows ... ok
+test lsp::tests::normalizes_definition_locations_from_lsp_response ... ok
+test lsp::tests::normalizes_document_symbols_from_live_lsp_response ... ok
+test lsp::tests::normalizes_references_from_lsp_response ... ok
+test lsp::tests::normalizes_workspace_symbols_from_live_lsp_response ... ok
+test lsp::tests::references_contract_rejects_symbol_materialization_payloads ... ok
+test lsp::tests::workspace_symbols_reject_non_lsp_materialized_rows ... ok
+test lsp_session::tests::document_text_uses_bounded_no_follow_reader ... ok
+test changetrack::tests::fingerprint_preserves_exact_paths ... ok
+test lsp_session::tests::position_requests_degrade_on_unmapped_extension ... ok
+test lsp_session::tests::read_message_rejects_oversized_header ... ok
+test lsp_session::tests::server_mapping_covers_core_languages ... ok
+test lsp_session::tests::unmapped_extension_is_unavailable ... ok
+test models::tests::activity_record_round_trip ... ok
+test models::tests::app_settings_round_trip ... ok
+test models::tests::browser_dump_record_round_trip ... ok
+test models::tests::issue_record_minimal_deserialization ... ok
+test models::tests::issue_record_round_trip ... ok
+test models::tests::runbook_record_round_trip ... ok
+test models::tests::workspace_record_round_trip ... ok
+test changetrack::tests::fingerprint_is_stable_and_changes_with_content ... ok
+test changetrack::tests::baseline_drift_and_changed_since ... ok
+test repomap::tests::explain_path_returns_rust_owned_code_explainer_contract ... ok
+test repomap::tests::path_symbols_extracts_requested_file_symbols_with_treesitter ... ok
+test repomap::tests::path_symbols_falls_back_to_regex_for_non_treesitter_language ... ok
+test repomap::tests::repomap_counts_only_repo_understanding_relevant_files ... ok
+test repomap::tests::repomap_ignores_excluded_dirs_and_collects_summary ... ok
+test ownership::tests::likely_owners_reports_t ... ok
+test repomap::tests::semantic_impact_extracts_symbols_and_ranks_related_paths ... ok
+test scanner::tests::scanner_finds_actionable_matches_not_pattern_literals ... ok
+test scanner::tests::scanner_ignores_excluded_dirs_and_docs ... ok
+test scanner::tests::scanner_reads_whitespace_named_files_exactly ... ok
+test indexcache::tests::oversized_dirty_file_is_an_explicit_limitation_not_a_prefix_hash ... ok
+test search::tests::embed_is_normalized_and_fuzzy ... ok
+test scanner::tests::scanner_skips_files_over_the_shared_read_cap ... ok
+test search::tests::repo_role_classifies_canonically ... ok
+test ownership::tests::builds_core_subsystem_from_file_paths ... ok
+test indexcache::tests::identity_changes_on_dirty_to_dirty_and_untracked_edits ... ok
+test lsp_session::tests::inbound_queue_drops_notifications_and_bounds_responses ... ok
+test indexcache::tests::scope_separates_roots_and_lock_is_exclusive ... ok
+test indexcache::tests::ignored_dirty_submodule_is_not_complete ... ok
+test search::tests::auto_seed_from_exact_match_activates_proximity ... ok
+test search::tests::rrf_reason_notes_fused_lanes ... ok
+test semantic::tests::parse_ast_grep_line_missing_file_returns_none ... ok
+test semantic::tests::parse_ast_grep_line_parses_valid_json ... ok
+test search::tests::search_ranks_matching_symbol_first ... ok
+test search::tests::proximity_lane_reranks_graph_neighbour_up ... ok
+test swarm::tests::complete_requires_verifier_evidence_and_critic ... ok
+test swarm::tests::fresh_goal_gate_accepts_and_waits ... ok
+test swarm::tests::failure_outcome_blocks ... ok
+test swarm::tests::out_of_surface_builder_narrows ... ok
+test swarm::tests::role_round_trips ... ok
+test swarm::tests::swarm_gate_edge_cases ... ok
+test swarm::tests::plan_reports_all_four_lanes ... ok
+test swarm::tests::record_lane_forces_role_and_keeps_antislop ... ok
+test search::tests::semantic_lane_recovers_fuzzy_token ... ok
+test search::tests::search_returns_doc_hits_for_prose_only_concepts ... ok
+test symbolgraph::tests::flow_edge_kind_classifies_contexts ... ok
+test search::tests::search_token_match_and_empty_query ... ok
+test semantic::tests::ast_grep_output_is_bounded_while_streaming ... ok
+test symbolgraph::tests::blast_radius_finds_referencers ... ok
+test symbolgraph::tests::ambiguous_name_does_not_misroute_edges ... ok
+test symbolgraph::tests::graph_builds_edges_and_hotspots ... ok
+test symbolgraph::tests::graph_classifies_edge_kinds ... ok
+test symbolgraph::tests::line_flows_matches_reference_classifier ... ok
+test symbolgraph::tests::clusters_span_directories ... ok
+test symbolgraph::tests::repo_reader_refuses_directory_target ... ok
+test symbolgraph::tests::repo_hash_matches_read_then_sha256_same_bytes ... ok
+test symbolgraph::tests::read_repo_file_beneath_resists_symlinks_at_every_component ... ok
+test symbolgraph::tests::repo_role_matches_golden_spec ... ok
+test symbolgraph::tests::repo_reader_refuses_fifo_without_blocking ... ok
+test treesitter::tests::extraction_is_complete_past_old_cap_and_reports_truncation ... ok
+test treesitter::tests::extracts_go_symbols_with_treesitter ... ok
+test symbolgraph::tests::repo_reader_refuses_oversized_file ... ok
+test treesitter::tests::extracts_rust_symbols_with_treesitter ... ok
+test treesitter::tests::extracts_typescript_symbols_with_treesitter ... ok
+test verification::tests::captures_verification_command_failure ... ok
+test symbolgraph::tests::graph_emits_flow_edges ... ok
+test symbolgraph::tests::edit_during_build_is_unstable_and_not_cached ... ok
+test verification::tests::managed_command_does_not_hang_on_grandchild_holding_pipe ... ok
+test verification::tests::migration_verification_captures_failure_risks ... ok
+test symbolgraph::tests::incremental_symbol_cache_is_correct_and_sets_authority ... ok
+test verification::tests::parses_cobertura_content ... ok
+test verification::tests::parses_istanbul_content ... ok
+test verification::tests::parses_lcov_content ... ok
+test verification::tests::rejects_empty_managed_command_args ... ok
+test symbolgraph::tests::symbol_impact_and_trace_traverse_the_graph ... ok
+test symbolgraph::tests::index_coverage_reports_degraded_and_git_modes ... ok
+test verification::tests::runs_managed_command_with_direct_argv ... ok
+test verification::tests::runs_verification_command_successfully ... ok
+test verification::tests::runs_migration_verification_and_returns_contract ... ok
+test verification::tests::truncate_excerpt_is_utf8_safe ... ok
+test verification::tests::managed_command_bounds_gigabyte_output ... ok
+test verification::tests::runs_verification_profile_with_retry_and_coverage ... ok
+test wiki::tests::wiki_has_overview_and_subsystem_pages ... ok
+test verification::tests::verbose_command_does_not_deadlock_or_timeout ... ok
+test wiki::tests::wiki_regenerates_only_changed_subsystem ... ok
+test verification::tests::managed_command_times_out_and_kills_group ... ok
+test verification::tests::marks_timeout_for_long_running_verification_command ... ok
+test verification::tests::timed_out_command_is_never_repeated ... ok
+kill: 89212: No such process
+test semantic::tests::ast_grep_child_is_killed_at_timeout ... ok
+test verification::tests::migration_verification_marks_timeout_risk ... ok
+
+test result: ok. 131 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.05s
+
+     Running unittests src/bin/xmustard-core.rs (target/debug/deps/xmustard_core-a40aed33798f57f3)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/index_process.rs (target/debug/deps/index_process-0f6bbf4d4233b4c4)
+
+running 5 tests
+test competing_builders_are_serialized_across_processes ... ok
+test snapshot_is_shared_across_workspaces_but_not_trust_scopes ... ok
+test lock_wait_is_bounded_and_reported ... ok
+test repo_key_contract_matches_cache_identity ... ok
+test git_status_failure_is_incomplete_and_never_serves_stale ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.38s
+
+     Running tests/index_regressions.rs (target/debug/deps/index_regressions-966ea7d2679e32f5)
+
+running 12 tests
+test stale_cache_temp_files_are_swept ... ok
+test symbols_beyond_prior_caps_are_indexed ... ok
+test per_file_symbol_bound_is_reported ... ok
+test dirty_to_dirty_edit_invalidates_warm_graph ... ok
+test same_size_same_mtime_dirty_edit_invalidates_warm_graph ... ok
+test one_file_edit_does_not_reread_unchanged_files ... ok
+test unchanged_dirty_files_are_not_reparsed ... ok
+test unreadable_oversized_invalid_utf8_are_reported ... ok
+test assume_unchanged_and_skip_worktree_edits_are_identified ... ok
+test rename_delete_branch_and_untracked_are_current ... ok
+test unusual_filenames_invalidate_warm_graph ... ok
+test untracked_bytes_over_budget_do_not_block_graph_cache ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.35s
+
+   Doc-tests xmustard_core
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+cd rust-core && cargo clippy
+warning: this function has too many arguments (11/7)
+   --> src/diagnostics.rs:568:1
+    |
+568 | / fn diagnostic_fingerprint(
+569 | |     workspace_id: &str,
+570 | |     path: &str,
+571 | |     start_line: usize,
+...   |
+579 | |     rule_code: Option<&str>,
+580 | | ) -> String {
+    | |___________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.93.0/index.html#too_many_arguments
+    = note: `#[warn(clippy::too_many_arguments)]` on by default
+
+warning: this `if` statement can be collapsed
+  --> src/semantic.rs:43:9
+   |
+43 | /         if let (Ok(root_r), Ok(cand_r)) = (root_resolved, candidate_resolved) {
+44 | |             if let Ok(rel) = cand_r.strip_prefix(&root_r) {
+45 | |                 return rel.to_string_lossy().replace('\\', "/");
+46 | |             }
+47 | |         }
+   | |_________^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.93.0/index.html#collapsible_if
+   = note: `#[warn(clippy::collapsible_if)]` on by default
+help: collapse nested if block
+   |
+43 ~         if let (Ok(root_r), Ok(cand_r)) = (root_resolved, candidate_resolved)
+44 ~             && let Ok(rel) = cand_r.strip_prefix(&root_r) {
+45 |                 return rel.to_string_lossy().replace('\\', "/");
+46 ~             }
+   |
+
+warning: this `if` statement can be collapsed
+   --> src/symbolgraph.rs:538:5
+    |
+538 | /     if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+539 | |         if SCANNABLE_SOURCE_FILENAMES.contains(&name) {
+540 | |             return true;
+541 | |         }
+542 | |     }
+    | |_____^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.93.0/index.html#collapsible_if
+help: collapse nested if block
+    |
+538 ~     if let Some(name) = p.file_name().and_then(|n| n.to_str())
+539 ~         && SCANNABLE_SOURCE_FILENAMES.contains(&name) {
+540 |             return true;
+541 ~         }
+    |
+
+warning: this `if` statement can be collapsed
+  --> src/treesitter.rs:43:17
+   |
+43 | /                 if let Some(named) = n.child_by_field_name(field) {
+44 | |                     if let Ok(text) = named.utf8_text(source) {
+45 | |                         let text = text.trim();
+46 | |                         if !text.is_empty() {
+...  |
+50 | |                 }
+   | |_________________^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.93.0/index.html#collapsible_if
+help: collapse nested if block
+   |
+43 ~                 if let Some(named) = n.child_by_field_name(field)
+44 ~                     && let Ok(text) = named.utf8_text(source) {
+45 |                         let text = text.trim();
+...
+48 |                         }
+49 ~                     }
+   |
+
+warning: very complex type used. Consider factoring parts into `type` definitions
+   --> src/verification.rs:120:6
+    |
+120 | ) -> std::io::Result<(Option<i32>, bool, bool, Vec<u8>, Vec<u8>)> {
+    |      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.93.0/index.html#type_complexity
+    = note: `#[warn(clippy::type_complexity)]` on by default
+
+warning: this `if` statement can be collapsed
+   --> src/verification.rs:410:9
+    |
+410 | /         if coverage_ok {
+411 | |             if let Some(report_path) = resolved_report_path.as_ref() {
+412 | |                 if report_path.exists() {
+413 | |                     coverage_result = Some(parse_coverage_file(
+...   |
+421 | |         }
+    | |_________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.93.0/index.html#collapsible_if
+help: collapse nested if block
+    |
+410 ~         if coverage_ok
+411 ~             && let Some(report_path) = resolved_report_path.as_ref() {
+412 |                 if report_path.exists() {
+...
+419 |                 }
+420 ~             }
+    |
+
+warning: this `if` statement can be collapsed
+   --> src/verification.rs:411:13
+    |
+411 | /             if let Some(report_path) = resolved_report_path.as_ref() {
+412 | |                 if report_path.exists() {
+413 | |                     coverage_result = Some(parse_coverage_file(
+414 | |                         report_path,
+...   |
+420 | |             }
+    | |_____________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.93.0/index.html#collapsible_if
+help: collapse nested if block
+    |
+411 ~             if let Some(report_path) = resolved_report_path.as_ref()
+412 ~                 && report_path.exists() {
+413 |                     coverage_result = Some(parse_coverage_file(
+...
+418 |                     )?);
+419 ~                 }
+    |
+
+warning: this function has too many arguments (8/7)
+   --> src/verification.rs:783:1
+    |
+783 | / fn finalize_lcov_file(
+784 | |     current_file: &mut String,
+785 | |     file_hit: &mut usize,
+786 | |     file_total: &mut usize,
+...   |
+791 | |     uncovered: &mut Vec<String>,
+792 | | ) {
+    | |_^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.93.0/index.html#too_many_arguments
+
+warning: this function has too many arguments (9/7)
+   --> src/verification.rs:828:1
+    |
+828 | / fn build_managed_command_result(
+829 | |     command: &str,
+830 | |     cwd: &Path,
+831 | |     exit_code: Option<i32>,
+...   |
+837 | |     excerpt_limit: usize,
+838 | | ) -> RustManagedCommandResult {
+    | |_____________________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.93.0/index.html#too_many_arguments
+
+warning: this function has too many arguments (8/7)
+   --> src/verification.rs:939:1
+    |
+939 | / fn build_migration_result(
+940 | |     command: &str,
+941 | |     cwd: &Path,
+942 | |     exit_code: Option<i32>,
+...   |
+947 | |     stderr: &str,
+948 | | ) -> MigrationVerificationResult {
+    | |________________________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.93.0/index.html#too_many_arguments
+
+warning: this `if` statement can be collapsed
+   --> src/verification.rs:955:5
+    |
+955 | /     if !success && !timed_out {
+956 | |         if let Some(code) = exit_code {
+957 | |             risks.push(format!("exit_code_{}", code));
+958 | |         }
+959 | |     }
+    | |_____^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.93.0/index.html#collapsible_if
+help: collapse nested if block
+    |
+955 ~     if !success && !timed_out
+956 ~         && let Some(code) = exit_code {
+957 |             risks.push(format!("exit_code_{}", code));
+958 ~         }
+    |
+
+warning: `xmustard-core` (lib) generated 11 warnings (run `cargo clippy --fix --lib -p xmustard-core` to apply 6 suggestions)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.15s
+make check-backend  22.89s user 13.98s system 119% cpu 30.777 total
