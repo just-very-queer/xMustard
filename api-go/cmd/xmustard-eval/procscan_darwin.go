@@ -48,9 +48,9 @@ func pidsWithEnv(kv string) ([]int, error) {
 	return pids, sc.Err()
 }
 
-// pidsWithCwdIn lists this user's processes whose working directory is dir or below
-// it, from lsof.
-func pidsWithCwdIn(dir string) ([]int, error) {
+// pidsWithCwdIn lists this user's processes whose working directory is one of dirs
+// or below one, from one lsof call.
+func pidsWithCwdIn(dirs []string) ([]int, error) {
 	cmd := exec.Command("lsof", "-w", "-n", "-P", "-a", "-d", "cwd", "-u", strconv.Itoa(os.Getuid()), "-F", "pn")
 	out, err := cmd.Output()
 	if err != nil && len(out) == 0 {
@@ -66,7 +66,7 @@ func pidsWithCwdIn(dir string) ([]int, error) {
 		case 'p':
 			pid, _ = strconv.Atoi(line[1:])
 		case 'n':
-			if p := line[1:]; pid > 0 && (p == dir || isWithin(p, dir)) {
+			if pid > 0 && cwdWithin(line[1:], dirs) {
 				pids = append(pids, pid)
 			}
 		}

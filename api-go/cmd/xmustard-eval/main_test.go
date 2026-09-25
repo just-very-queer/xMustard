@@ -19,6 +19,9 @@ import (
 // The test binary doubles as the fake agent and the stub MCP server: the harness
 // launches os.Executable() with XMUSTARD_EVAL_AS_MAIN=1.
 func TestMain(m *testing.M) {
+	if len(os.Args) > 1 && os.Args[1] == survivorArg {
+		os.Exit(runSurvivor(os.Args[2:]))
+	}
 	if os.Getenv(envAsMain) == "1" {
 		os.Exit(realMain(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
 	}

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"crypto/rand"
 	"errors"
 	"flag"
@@ -11,6 +12,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -62,16 +64,18 @@ func killGroup(pid int, grace time.Duration) {
 const runMarkerVar = "XMEVAL_RUN"
 
 // sweepRunProcesses kills every process of the run that is still alive: one seen in
-// the client's process tree while it ran (tracked: pid -> start time, so a reused pid
-// is left alone), one that carries marker in its environment (Linux; macOS no longer
-// exposes environments), and one whose working directory is inside dir. It repeats
-// until none is found and returns how many it killed and any still alive after the
-// last attempt. A process that detached and left the worktree before the sampler saw
-// it, with no readable environment, is not found; it stays inside the run's
-// containment (and on Linux dies with bwrap's pid namespace).
-func sweepRunProcesses(marker, dir string, tracked map[int]int64) (killed int, alive []int, err error) {
+// the tree of a command the run started while it ran (tracked: pid -> start time, so
+// a reused pid is left alone), one that carries marker in its environment (Linux;
+// macOS no longer exposes environments), and one whose working directory is inside
+// one of dirs. It repeats until none is found and returns how many it killed and any
+// still alive after the last attempt. A process that detached and left dirs before a
+// sampler saw it, with no readable environment, is not found: on macOS it keeps
+// running under the profile of the command that started it, which hides every other
+// run's directories and the oracle's judge copy; on Linux it dies with bwrap's pid
+// namespace.
+func sweepRunProcesses(marker string, dirs []string, tracked map[int]int64) (killed int, alive []int, err error) {
 	for attempt := 0; attempt < 10; attempt++ {
-		pids, err := findRunProcesses(marker, dir, tracked)
+		pids, err := findRunProcesses(marker, dirs, tracked)
 		if err != nil {
 			return killed, nil, err
 		}
@@ -85,21 +89,23 @@ func sweepRunProcesses(marker, dir string, tracked map[int]int64) (killed int, a
 		}
 		time.Sleep(time.Duration(50*(attempt+1)) * time.Millisecond)
 	}
-	alive, err = findRunProcesses(marker, dir, tracked)
+	alive, err = findRunProcesses(marker, dirs, tracked)
 	return killed, alive, err
 }
 
 // findRunProcesses lists this user's processes (other than the executor) that are
 // tracked and still the same process, carry marker in their environment, or have a
-// working directory at or below dir.
-func findRunProcesses(marker, dir string, tracked map[int]int64) ([]int, error) {
-	realDir := ""
-	if dir != "" {
-		if r, err := filepath.EvalSymlinks(dir); err == nil {
-			realDir = r
-		} else {
-			realDir = dir
+// working directory at or below one of dirs.
+func findRunProcesses(marker string, dirs []string, tracked map[int]int64) ([]int, error) {
+	var realDirs []string
+	for _, d := range dirs {
+		if d == "" {
+			continue
 		}
+		if r, err := filepath.EvalSymlinks(d); err == nil {
+			d = r
+		}
+		realDirs = append(realDirs, d)
 	}
 	var (
 		mu    sync.Mutex
@@ -123,9 +129,9 @@ func findRunProcesses(marker, dir string, tracked map[int]int64) ([]int, error) 
 		wg.Add(1)
 		go func() { defer wg.Done(); add(pidsWithEnv(marker)) }()
 	}
-	if realDir != "" {
+	if len(realDirs) > 0 {
 		wg.Add(1)
-		go func() { defer wg.Done(); add(pidsWithCwdIn(realDir)) }()
+		go func() { defer wg.Done(); add(pidsWithCwdIn(realDirs)) }()
 	}
 	var same []int
 	for pid, start := range tracked {
@@ -140,6 +146,82 @@ func findRunProcesses(marker, dir string, tracked map[int]int64) ([]int, error) 
 		out = append(out, p)
 	}
 	return out, errors.Join(errs...)
+}
+
+// cwdWithin reports whether a working directory is one of dirs or below one.
+func cwdWithin(cwd string, dirs []string) bool {
+	for _, d := range dirs {
+		if cwd == d || isWithin(cwd, d) {
+			return true
+		}
+	}
+	return false
+}
+
+// procSet is every process seen in the trees of the commands a run started (setup,
+// the client, verify, the oracle): pid -> start time. A process that left its
+// command's session is reparented away from the tree, so the sweep uses this record
+// to find it again.
+type procSet struct {
+	mu sync.Mutex
+	m  map[int]int64
+}
+
+func newProcSet() *procSet { return &procSet{m: map[int]int64{}} }
+
+func (s *procSet) merge(m map[int]int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for pid, start := range m {
+		s.m[pid] = start
+	}
+}
+
+func (s *procSet) snapshot() map[int]int64 {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[int]int64, len(s.m))
+	for k, v := range s.m {
+		out[k] = v
+	}
+	return out
+}
+
+// watchTree records every process under root into set, sampling every interval
+// until the returned stop function is called.
+func watchTree(root int, set *procSet, interval time.Duration) (stop func()) {
+	quit, done := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(done)
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		seen := map[int]int64{}
+		for {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			procs, err := psSnapshot(ctx)
+			cancel()
+			if err == nil {
+				_, _, tree := splitTrees(procs, nil, root, nil)
+				for _, pid := range tree {
+					if _, ok := seen[pid]; !ok {
+						if start, ok := procStartTime(pid); ok {
+							seen[pid] = start
+						}
+					}
+				}
+			}
+			select {
+			case <-quit:
+				set.merge(seen)
+				return
+			case <-t.C:
+			}
+		}
+	}()
+	return func() { close(quit); <-done }
 }
 
 // newRunMarker returns a fresh "XMEVAL_RUN=<random>" environment entry.
@@ -165,7 +247,7 @@ type groupTracker struct {
 	path   string
 	groups map[int]bool
 	marker string
-	dir    string
+	dirs   []string
 }
 
 var (
@@ -190,7 +272,8 @@ func trackGroup(pid int, live bool) {
 	t.writeLocked()
 }
 
-func trackRun(marker, dir string) {
+// trackRun records the current run's marker and directories for the watchdog.
+func trackRun(marker string, dirs ...string) {
 	trackerMu.Lock()
 	t := tracker
 	trackerMu.Unlock()
@@ -199,7 +282,7 @@ func trackRun(marker, dir string) {
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.marker, t.dir = marker, dir
+	t.marker, t.dirs = marker, slices.Clone(dirs)
 	t.writeLocked()
 }
 
@@ -208,8 +291,8 @@ func (t *groupTracker) writeLocked() {
 	if t.marker != "" {
 		fmt.Fprintf(&b, "marker %s\n", t.marker)
 	}
-	if t.dir != "" {
-		fmt.Fprintf(&b, "dir %s\n", t.dir)
+	for _, d := range t.dirs {
+		fmt.Fprintf(&b, "dir %s\n", d)
 	}
 	for _, g := range sortedKeys(intKeys(t.groups)) {
 		fmt.Fprintf(&b, "group %s\n", g)
@@ -298,7 +381,7 @@ func runWatchdog(args []string, stdin io.Reader) int {
 // cleanupAfterExecutor is what the watchdog does when the executor died.
 func cleanupAfterExecutor(statePath, removeDir string) {
 	b, _ := os.ReadFile(statePath)
-	marker, dir := "", ""
+	marker, dirs := "", []string(nil)
 	for _, line := range strings.Split(string(b), "\n") {
 		key, val, _ := strings.Cut(line, " ")
 		switch key {
@@ -309,11 +392,11 @@ func cleanupAfterExecutor(statePath, removeDir string) {
 		case "marker":
 			marker = val
 		case "dir":
-			dir = val
+			dirs = append(dirs, val)
 		}
 	}
-	if marker != "" || dir != "" {
-		_, _, _ = sweepRunProcesses(marker, dir, nil)
+	if marker != "" || len(dirs) > 0 {
+		_, _, _ = sweepRunProcesses(marker, dirs, nil)
 	}
 	if removeDir != "" {
 		_ = os.RemoveAll(removeDir)

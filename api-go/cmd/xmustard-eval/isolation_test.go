@@ -438,3 +438,341 @@ func TestManifestRecordsCorpusDigests(t *testing.T) {
 		t.Fatalf("corpus digests %v", m.CorpusFiles)
 	}
 }
+
+// survivorCorpus: the agent's only change rewrites the visible verify script so that
+// it leaves a survivor behind (runSurvivor). value.txt stays wrong, so the oracle can
+// pass only if the survivor reaches it.
+func survivorCorpus(t *testing.T, lingerMS int, logDir string, runIDs []string) string {
+	t.Helper()
+	dir := t.TempDir()
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, filepath.Join(dir, "fixtures/app/value.txt"), "old\n")
+	mustWrite(t, filepath.Join(dir, "fixtures/app/verify.sh"), "true\n")
+	mustWrite(t, filepath.Join(dir, "oracles/check.sh"), "grep -qx new value.txt # SECRET-ORACLE\n")
+	mustWrite(t, filepath.Join(dir, "references/fix.patch"), `diff --git a/verify.sh b/verify.sh
+--- a/verify.sh
++++ b/verify.sh
+@@ -1 +1 @@
+-true
++'`+self+`' `+survivorArg+` spawn `+strconv.Itoa(lingerMS)+` '`+logDir+`' SECRET-ORACLE `+strings.Join(runIDs, " ")+`
+`)
+	path := filepath.Join(dir, "corpus.yaml")
+	mustWrite(t, path, `schema: xmustard.eval/v1
+name: survivor
+tasks:
+  - id: survive
+    class: bugfix
+    repo: {fixture: fixtures/app}
+    prompt: Change value.txt.
+    verify: {cmd: [sh, verify.sh]}
+    oracle:
+      files: [{src: oracles/check.sh, dest: oracle/check.sh}]
+      cmd: [sh, oracle/check.sh]
+    reference: {patch: references/fix.patch}
+`)
+	return path
+}
+
+// stopSurvivors ends every survivor that logged its pid in logDir and returns their
+// logs and pids.
+func stopSurvivors(t *testing.T, logDir string) (logs string, pids []int) {
+	t.Helper()
+	_ = os.WriteFile(filepath.Join(logDir, "stop"), nil, 0o644)
+	names, _ := filepath.Glob(filepath.Join(logDir, "pid-*"))
+	for _, n := range names {
+		if pid, err := strconv.Atoi(strings.TrimPrefix(filepath.Base(n), "pid-")); err == nil {
+			pids = append(pids, pid)
+		}
+	}
+	files, _ := filepath.Glob(filepath.Join(logDir, "log-*"))
+	for _, f := range files {
+		b, _ := os.ReadFile(f)
+		logs += string(b)
+	}
+	return logs, pids
+}
+
+func killSurvivors(pids []int) {
+	for _, pid := range pids {
+		_ = syscall.Kill(pid, syscall.SIGKILL)
+	}
+}
+
+// TestVerifyTimeSurvivorCannotReachTheOracle is the round-2 reproduction: code the
+// visible verify step runs starts a process in a new session with working directory
+// "/" and an empty environment, so no sweep can attribute it to the run, and it waits
+// for the oracle. It must neither read nor rewrite its own run's oracle nor reach any
+// later run's worktree or oracle: the oracle judges a copy of the final tree that no
+// run's agent, setup or verify profile can reach, and every profile hides the whole
+// area of per-run directories except the run's own.
+func TestVerifyTimeSurvivorCannotReachTheOracle(t *testing.T) {
+	mode := availableContainment(t)
+	logDir := t.TempDir()
+	arms := []string{ArmBaseline, ArmBaselineNoMCP}
+	var ids []string
+	for _, a := range arms {
+		ids = append(ids, opaqueRunID("survive", a, 0))
+	}
+	c := loadTestCorpus(t, survivorCorpus(t, 0, logDir, ids))
+	var pids []int
+	defer func() { killSurvivors(pids) }()
+	out := filepath.Join(t.TempDir(), "out")
+	cfg := prepared(t, &RunConfig{Driver: "fake:claude", Arms: arms, Containment: mode}, c, out)
+	_, runErr := Execute(context.Background(), cfg, c)
+	// give a survivor of the last run time to try the paths it knows
+	time.Sleep(300 * time.Millisecond)
+	logs, pids := stopSurvivors(t, logDir)
+	if runErr != nil {
+		t.Fatal(runErr)
+	}
+	killed := 0
+	for _, r := range readRecords(t, out) {
+		if r.Status != StatusCompleted || r.Resolved {
+			t.Fatalf("%s: status %s (%s) resolved %v: the oracle judged a tree the survivor changed", r.Arm, r.Status, r.Reason, r.Resolved)
+		}
+		killed += r.Isolation.EscapedKilled
+	}
+	for _, bad := range []string{"LEAK", "TAMPERED", "READ"} {
+		if strings.Contains(logs, bad) {
+			t.Fatalf("a verify-time survivor reached another run's files or an oracle under %s:\n%s", mode, logs)
+		}
+	}
+	// the attack must have run: a survivor started (bwrap's pid namespace may kill it
+	// first on Linux), or the sweep found and killed it
+	if mode == ContainSandbox && !strings.Contains(logs, "started") && killed == 0 {
+		t.Fatal("no survivor started; the reproduction did not run")
+	}
+}
+
+// TestVerifyTimeSurvivorIsFoundAndKilled: a process the verify step detaches while its
+// parent is still alive is seen in the verify step's tree and killed before the
+// oracle, although it left the session, the worktree and its environment.
+func TestVerifyTimeSurvivorIsFoundAndKilled(t *testing.T) {
+	logDir := t.TempDir()
+	id := opaqueRunID("survive", ArmBaselineNoMCP, 0)
+	c := loadTestCorpus(t, survivorCorpus(t, 600, logDir, []string{id}))
+	var pids []int
+	defer func() { killSurvivors(pids) }()
+	out := filepath.Join(t.TempDir(), "out")
+	cfg := prepared(t, &RunConfig{Driver: "fake:claude", Arms: []string{ArmBaselineNoMCP}}, c, out)
+	_, runErr := Execute(context.Background(), cfg, c)
+	_, pids = stopSurvivors(t, logDir)
+	if runErr != nil {
+		t.Fatal(runErr)
+	}
+	r := readRecords(t, out)[0]
+	if len(pids) == 0 {
+		t.Fatal("the verify step left no survivor; the reproduction did not run")
+	}
+	if r.Status != StatusCompleted || r.Isolation.EscapedKilled < 1 {
+		t.Fatalf("status %s (%s) isolation %+v: the verify-time survivor was not found", r.Status, r.Reason, r.Isolation)
+	}
+	for _, pid := range pids {
+		if syscall.Kill(pid, 0) == nil {
+			t.Fatalf("verify-time survivor %d outlived the run", pid)
+		}
+	}
+	if !hasWarning(buildReportFromDir(t, out), "outlived the run") {
+		t.Fatal("report does not flag the killed survivor")
+	}
+}
+
+// symlinkPatch replaces the oracle's destination directory with a link to target.
+func symlinkPatch(target string) string {
+	return `diff --git a/oracle b/oracle
+new file mode 120000
+--- /dev/null
++++ b/oracle
+@@ -0,0 +1 @@
++` + target + `
+\ No newline at end of file
+`
+}
+
+// TestSymlinkedOracleDestinationFailsTheRun: an agent that turns a directory on the
+// oracle's destination path into a link must not make the harness write the hidden
+// oracle through it (outside the worktree, where later runs could read it).
+func TestSymlinkedOracleDestinationFailsTheRun(t *testing.T) {
+	target := t.TempDir()
+	corpusPath := writeFixtureCorpus(t, nil)
+	mustWrite(t, filepath.Join(filepath.Dir(corpusPath), "references/fix.patch"), symlinkPatch(target))
+	c := loadTestCorpus(t, corpusPath)
+	out := filepath.Join(t.TempDir(), "out")
+	cfg := prepared(t, &RunConfig{Driver: "fake:claude", Arms: []string{ArmBaseline, ArmBaselineNoMCP}, Tasks: []string{"flip"}}, c, out)
+	if _, err := Execute(context.Background(), cfg, c); err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range readRecords(t, out) {
+		if r.Status != StatusError || !strings.Contains(r.Reason, "oracle_path_symlink") || r.Resolved {
+			t.Fatalf("%s: status %s reason %q", r.Arm, r.Status, r.Reason)
+		}
+	}
+	if left, _ := os.ReadDir(target); len(left) != 0 {
+		t.Fatalf("the harness wrote the oracle through the agent's link: %v", left)
+	}
+}
+
+func TestStageOracleRefusesSymlinks(t *testing.T) {
+	c := loadTestCorpus(t, writeFixtureCorpus(t, nil))
+	task := &c.Tasks[0]
+	t.Run("directory link out of the tree", func(t *testing.T) {
+		root, outside := t.TempDir(), t.TempDir()
+		if err := os.Symlink(outside, filepath.Join(root, "oracle")); err != nil {
+			t.Fatal(err)
+		}
+		if err := stageOracle(c, task, root); err == nil || !strings.Contains(err.Error(), "oracle_path_symlink") {
+			t.Fatalf("stage through a link: %v", err)
+		}
+		if left, _ := os.ReadDir(outside); len(left) != 0 {
+			t.Fatalf("wrote through the link: %v", left)
+		}
+	})
+	t.Run("directory link inside the tree", func(t *testing.T) {
+		root := t.TempDir()
+		mustWrite(t, filepath.Join(root, "sub/keep"), "")
+		if err := os.Symlink("sub", filepath.Join(root, "oracle")); err != nil {
+			t.Fatal(err)
+		}
+		if err := stageOracle(c, task, root); err == nil || !strings.Contains(err.Error(), "oracle_path_symlink") {
+			t.Fatalf("stage through a relative link: %v", err)
+		}
+		if _, err := os.Stat(filepath.Join(root, "sub/check.sh")); !os.IsNotExist(err) {
+			t.Fatal("wrote through the relative link")
+		}
+	})
+	t.Run("destination file is a link", func(t *testing.T) {
+		root, outside := t.TempDir(), t.TempDir()
+		victim := filepath.Join(outside, "victim")
+		mustWrite(t, victim, "keep\n")
+		mustWrite(t, filepath.Join(root, "oracle/.keep"), "")
+		if err := os.Symlink(victim, filepath.Join(root, "oracle/check.sh")); err != nil {
+			t.Fatal(err)
+		}
+		if err := stageOracle(c, task, root); err != nil {
+			t.Fatal(err)
+		}
+		if b, _ := os.ReadFile(victim); string(b) != "keep\n" {
+			t.Fatalf("wrote through the destination link: %q", b)
+		}
+		fi, err := os.Lstat(filepath.Join(root, "oracle/check.sh"))
+		if err != nil || !fi.Mode().IsRegular() {
+			t.Fatalf("destination is not the oracle file: %v %v", fi, err)
+		}
+	})
+}
+
+// TestSandboxHidesRunDirectoriesCreatedLater: a profile made when a run starts must
+// hide the worktrees and judge copies of runs that start after it, and the oracle's
+// profile allows only its own judge copy.
+func TestSandboxHidesRunDirectoriesCreatedLater(t *testing.T) {
+	mode := availableContainment(t)
+	root := t.TempDir()
+	ex := &executor{cfg: &RunConfig{contain: mode, workRoot: root}}
+	if err := makeRunAreas(root); err != nil {
+		t.Fatal(err)
+	}
+	own := filepath.Join(root, "wt", "aaaa", "app")
+	mustWrite(t, filepath.Join(own, "value.txt"), "own\n")
+	sb := ex.sandboxFor("aaaa")
+	judge := filepath.Join(root, "judge", "aaaa", "app")
+	later := filepath.Join(root, "wt", "bbbb", "app", "value.txt")
+	laterJudge := filepath.Join(root, "judge", "bbbb", "app", "oracle", "check.sh")
+	mustWrite(t, later, "later\n")
+	mustWrite(t, laterJudge, "secret\n")
+	mustWrite(t, filepath.Join(judge, "oracle", "check.sh"), "own secret\n")
+	readable := func(sb *sandbox, p string) bool {
+		bin, args, err := sb.wrap("cat", []string{p})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return exec.Command(bin, args...).Run() == nil
+	}
+	if !readable(sb, filepath.Join(own, "value.txt")) {
+		t.Fatal("the run cannot read its own worktree")
+	}
+	for _, p := range []string{later, laterJudge, filepath.Join(judge, "oracle", "check.sh")} {
+		if readable(sb, p) {
+			t.Fatalf("the run's profile can read %s", p)
+		}
+	}
+	jb := ex.judgeSandbox(judge)
+	if !readable(jb, filepath.Join(judge, "oracle", "check.sh")) {
+		t.Fatal("the oracle cannot read its judge copy")
+	}
+	for _, p := range []string{later, laterJudge, filepath.Join(own, "value.txt")} {
+		if readable(jb, p) {
+			t.Fatalf("the oracle's profile can read %s", p)
+		}
+	}
+}
+
+// TestJudgeCopyKeepsTheSnapshot: the judge copy holds exactly the snapshotted tree
+// (a gitlink of a submodule that is not checked out included), keeps ignored files,
+// drops what changed after the snapshot, keeps links as links, and is not a git
+// repository.
+func TestJudgeCopyKeepsTheSnapshot(t *testing.T) {
+	src := t.TempDir()
+	mustWrite(t, filepath.Join(src, "value.txt"), "old\n")
+	mustWrite(t, filepath.Join(src, ".gitignore"), "deps/\n")
+	for _, a := range [][]string{{"init", "-q", "-b", "main"}, {"add", "-A"},
+		{"update-index", "--add", "--cacheinfo", "160000,1111111111111111111111111111111111111111,sub"},
+		{"-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "base"}} {
+		if _, err := git(src, a...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sha, err := git(src, "rev-parse", "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	w, err := newRunWorktree(src, sha, filepath.Join(root, "r"), filepath.Join(root, "w", "app"), filepath.Join(root, "h"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Remove()
+	mustWrite(t, filepath.Join(w.Dir, "value.txt"), "new\n")
+	mustWrite(t, filepath.Join(w.Dir, "deps/lib.txt"), "installed\n")
+	if err := os.Symlink("value.txt", filepath.Join(w.Dir, "link")); err != nil {
+		t.Fatal(err)
+	}
+	final, err := w.SnapshotTree()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// changed after the snapshot (by verify, or by a process the run left behind)
+	mustWrite(t, filepath.Join(w.Dir, "value.txt"), "changed later\n")
+	mustWrite(t, filepath.Join(w.Dir, "extra.txt"), "later\n")
+	judge := filepath.Join(root, "judge", "app")
+	if err := w.JudgeCopy(final, judge); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(judge, "value.txt")); string(b) != "new\n" {
+		t.Fatalf("judge value.txt %q", b)
+	}
+	if b, _ := os.ReadFile(filepath.Join(judge, "deps/lib.txt")); string(b) != "installed\n" {
+		t.Fatalf("ignored file not carried over: %q", b)
+	}
+	if fi, err := os.Lstat(filepath.Join(judge, "link")); err != nil || fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("link not kept as a link: %v %v", fi, err)
+	}
+	for _, gone := range []string{"extra.txt", ".git"} {
+		if _, err := os.Lstat(filepath.Join(judge, gone)); !os.IsNotExist(err) {
+			t.Fatalf("%s in the judge copy: %v", gone, err)
+		}
+	}
+	// a worktree replaced by a link is not copied through
+	moved := filepath.Join(root, "moved")
+	if err := os.Rename(w.Dir, moved); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(moved, w.Dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.JudgeCopy(final, filepath.Join(root, "judge2", "app")); err == nil {
+		t.Fatal("copied a worktree that had been replaced by a link")
+	}
+}

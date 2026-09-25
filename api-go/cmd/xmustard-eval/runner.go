@@ -269,14 +269,18 @@ type Isolation struct {
 	WorktreeDetached bool   `json:"worktree_detached"`
 	OracleLeakScan   string `json:"oracle_leak_scan"` // clean | leaked | skipped
 	OracleStagedPost bool   `json:"oracle_staged_after_agent"`
+	// OracleJudgedCopy: the oracle ran in a copy of the agent's final snapshot outside
+	// the worktree, in a directory every run's agent, setup and verify profile hides.
+	OracleJudgedCopy bool   `json:"oracle_judged_copy,omitempty"`
 	Containment      string `json:"containment"`
 	WorktreeRemoved  bool   `json:"worktree_removed"`
 	// EscapedKilled counts processes of the run that outlived their process group
-	// (found in the sampled client tree, by the run marker, or by a working directory
-	// in the worktree) and were killed before the tree was judged or after the oracle.
+	// (found in the sampled tree of a command the run started, by the run marker, or
+	// by a working directory in the worktree or judge copy) and were killed before the
+	// tree was judged or after the oracle.
 	EscapedKilled int `json:"escaped_processes_killed,omitempty"`
-	// VerifyChangedTree is set when the visible verify step changed non-ignored files;
-	// the worktree was restored to the agent's final tree before the oracle.
+	// VerifyChangedTree is set when the visible verify step changed non-ignored files.
+	// The oracle still judges the agent's final snapshot: the judge copy is reset to it.
 	VerifyChangedTree bool   `json:"verify_changed_tree,omitempty"`
 	KeptAt            string `json:"kept_at,omitempty"` // --keep-worktrees
 }
@@ -371,13 +375,13 @@ func Execute(ctx context.Context, cfg *RunConfig, corpus *Corpus) (*Report, erro
 	}
 	cfg.workRoot = workRoot
 	ex := &executor{cfg: cfg, corpus: corpus, driver: d, registry: newWorktreeRegistry()}
-	if err := os.MkdirAll(filepath.Join(workRoot, "harness"), 0o700); err != nil {
+	if err := makeRunAreas(workRoot); err != nil {
 		_ = os.RemoveAll(workRoot)
 		return nil, err
 	}
 	removeOnCrash := workRoot
 	if cfg.KeepWorktrees {
-		removeOnCrash = ""
+		removeOnCrash = filepath.Join(workRoot, "judge") // the staged oracles go regardless
 	}
 	wd, err := startWatchdog(cfg.self, filepath.Join(workRoot, "harness", "watchdog.state"), removeOnCrash)
 	if err != nil {
@@ -545,30 +549,65 @@ func repoDirName(c *Corpus, t *Task) string {
 	return "repo"
 }
 
-// sandboxFor is the containment for one run: the configured hidden paths, the
-// harness's own git directories and watchdog state, and every other run's worktree,
-// repository, client config and fake-driver files (kept worktrees included), so no
-// run can read another's solved tree or staged oracle. The scratch repositories and
-// the operator's global git config are read-only.
-func (ex *executor) sandboxFor(runID string) *sandbox {
-	cfg := ex.cfg
-	hidden := append(slices.Clone(cfg.hidden), filepath.Join(cfg.workRoot, "harness"))
-	for _, area := range []string{"wt", "runrepos", "fake", "clientcfg"} {
-		entries, _ := os.ReadDir(filepath.Join(cfg.workRoot, area))
-		for _, e := range entries {
-			if e.Name() != runID {
-				hidden = append(hidden, filepath.Join(cfg.workRoot, area, e.Name()))
-			}
+// Areas of the work root. harness and judge hold the harness's git directories,
+// watchdog state and the oracle's judge copies; the others hold one entry per run,
+// named by its run id.
+var (
+	harnessAreas = []string{"harness", "judge"}
+	runAreas     = []string{"wt", "runrepos", "fake", "clientcfg"}
+)
+
+// makeRunAreas creates every area up front, so each profile hides an area as a whole,
+// including entries of runs that start after the profile was made.
+func makeRunAreas(workRoot string) error {
+	for _, a := range harnessAreas {
+		if err := os.MkdirAll(filepath.Join(workRoot, a), 0o700); err != nil {
+			return err
 		}
 	}
+	for _, a := range runAreas {
+		if err := os.MkdirAll(filepath.Join(workRoot, a), 0o755); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// areaSandbox hides the configured hidden paths and every work-root area, and allows
+// back only the given directories. The scratch repositories and the operator's global
+// git config are read-only.
+func (ex *executor) areaSandbox(allow ...string) *sandbox {
+	cfg := ex.cfg
+	hidden := slices.Clone(cfg.hidden)
+	for _, a := range append(slices.Clone(harnessAreas), runAreas...) {
+		hidden = append(hidden, filepath.Join(cfg.workRoot, a))
+	}
 	readOnly := append([]string{filepath.Join(cfg.workRoot, "repos")}, gitConfigPaths()...)
-	return &sandbox{mode: cfg.contain, hidden: hidden, readOnly: readOnly}
+	return &sandbox{mode: cfg.contain, hidden: hidden, readOnly: readOnly, allow: allow}
+}
+
+// sandboxFor is the containment for one run's agent, setup, verify and xMustard API:
+// the run's own worktree, repository, client config and fake-driver files, and
+// nothing of any other run (earlier, kept or later) or of the harness. A process the
+// run leaves behind keeps this profile, so it cannot reach a later run or the oracle.
+func (ex *executor) sandboxFor(runID string) *sandbox {
+	var own []string
+	for _, a := range runAreas {
+		own = append(own, filepath.Join(ex.cfg.workRoot, a, runID))
+	}
+	return ex.areaSandbox(own...)
+}
+
+// judgeSandbox is the oracle's containment: its judge copy and nothing of any run's
+// worktree or of the harness.
+func (ex *executor) judgeSandbox(judgeDir string) *sandbox {
+	return ex.areaSandbox(judgeDir)
 }
 
 // sweep kills the run's processes that outlived their process group and fails when
 // any survive.
-func sweep(marker, dir string, tracked map[int]int64, iso *Isolation) error {
-	killed, alive, err := sweepRunProcesses(marker, dir, tracked)
+func sweep(marker string, dirs []string, tracked *procSet, iso *Isolation) error {
+	killed, alive, err := sweepRunProcesses(marker, dirs, tracked.snapshot())
 	iso.EscapedKilled += killed
 	if err != nil {
 		return fmt.Errorf("find the run's processes: %w", err)
@@ -637,21 +676,23 @@ func (ex *executor) runOne(ctx context.Context, t *Task, arm Arm, rep int, repo,
 	}
 	ex.registry.add(wt)
 	iso.WorktreeDetached = true
-	trackRun(marker, wt.Dir)
+	judgeRun := filepath.Join(cfg.workRoot, "judge", runID)
+	judgeDir := filepath.Join(judgeRun, repoDirName(corpus, t))
+	runDirs := []string{wt.Dir, judgeDir}
+	trackRun(marker, runDirs...)
 	fakeDir := filepath.Join(cfg.workRoot, "fake", runID)
-	oracleStaged := false
-	var tracked map[int]int64 // processes seen in the client's tree
+	tracked := newProcSet() // processes seen in the trees of the run's commands
 	defer func() {
-		// Nothing the run started may outlive it: a survivor could read a later run's
-		// staged oracle or write into its worktree.
-		if err := sweep(marker, wt.Dir, tracked, iso); err != nil && (rec.Status == StatusCompleted || rec.Status == StatusClientError) {
+		// Nothing the run started may outlive it that the sweep can find.
+		if err := sweep(marker, runDirs, tracked, iso); err != nil && (rec.Status == StatusCompleted || rec.Status == StatusClientError) {
 			rec.Status, rec.Reason = StatusError, "after the oracle: "+err.Error()
 		}
-		trackRun("", "")
+		trackRun("")
+		// the judge copy holds the staged oracle: it never outlives the run
+		if err := os.RemoveAll(judgeRun); err != nil && rec.Reason == "" {
+			rec.Reason = "judge cleanup: " + err.Error()
+		}
 		if cfg.KeepWorktrees {
-			if oracleStaged {
-				unstageOracle(t, wt.Dir)
-			}
 			ex.registry.forget(wt)
 			iso.KeptAt = wt.Dir
 			return
@@ -660,10 +701,12 @@ func (ex *executor) runOne(ctx context.Context, t *Task, arm Arm, rep int, repo,
 		if err := ex.registry.remove(wt); err != nil && rec.Reason == "" {
 			rec.Reason = "worktree cleanup: " + err.Error()
 		}
+		// the agent may have left files next to its worktree
+		_ = os.RemoveAll(filepath.Dir(wt.Dir))
 		iso.WorktreeRemoved = wt.gone()
 	}()
 	runStep := func(spec CommandSpec, logName string, def int) CheckResult {
-		return check{argv: spec.Cmd, dir: wt.Dir, env: spec.Env, extraEnv: []string{marker}, sb: sb,
+		return check{argv: spec.Cmd, dir: wt.Dir, env: spec.Env, extraEnv: []string{marker}, sb: sb, track: tracked,
 			timeout: secondsOr(spec.TimeoutSec, def), logPath: filepath.Join(art, logName), logRel: logName}.run(ctx)
 	}
 
@@ -778,7 +821,7 @@ func (ex *executor) runOne(ctx context.Context, t *Task, arm Arm, rep int, repo,
 		time.Duration(corpus.timeoutSec(t))*time.Second, sampler.setAgentRoot)
 	sampler.setPhase("post")
 	finishSampler()
-	tracked = sampler.agentProcesses()
+	tracked.merge(sampler.agentProcesses())
 	rec.Client = &exit
 	if err != nil {
 		return fail(StatusError, "client: "+err.Error())
@@ -803,7 +846,7 @@ func (ex *executor) runOne(ctx context.Context, t *Task, arm Arm, rep int, repo,
 	}
 	// The client's group is dead; so must be everything else the run started (a
 	// command the agent detached with setsid) before the tree is judged.
-	if err := sweep(marker, wt.Dir, tracked, iso); err != nil {
+	if err := sweep(marker, runDirs, tracked, iso); err != nil {
 		return fail(StatusError, err.Error())
 	}
 
@@ -819,7 +862,7 @@ func (ex *executor) runOne(ctx context.Context, t *Task, arm Arm, rep int, repo,
 	rec.Localization = editLocalization(t.GoldFiles, churn.Files)
 
 	// Verify runs code the agent wrote, so it is contained like the agent, and it runs
-	// after the final snapshot, so whatever it changes is undone before the oracle.
+	// after the final snapshot: the oracle judges that snapshot, not what verify left.
 	if t.Verify != nil {
 		v := runStep(*t.Verify, "verify.log", 600)
 		rec.Verify = &v
@@ -827,32 +870,34 @@ func (ex *executor) runOne(ctx context.Context, t *Task, arm Arm, rep int, repo,
 	if ctx.Err() != nil {
 		return fail(StatusInterrupted, "interrupted before the oracle")
 	}
-	if err := sweep(marker, wt.Dir, tracked, iso); err != nil {
+	if err := sweep(marker, runDirs, tracked, iso); err != nil {
 		return fail(StatusError, "after verify: "+err.Error())
 	}
+	// Harness git only reads the worktree here (the agent may have replaced it with a
+	// link), so the change is recorded, not undone; the judge copy is reset instead.
 	afterVerify, err := wt.SnapshotTree()
 	if err != nil {
 		return fail(StatusError, "snapshot: "+err.Error())
 	}
-	if afterVerify != finalTree {
-		iso.VerifyChangedTree = true
-		if err := wt.RestoreTree(finalTree); err != nil {
-			return fail(StatusError, "restore the agent's final tree after verify: "+err.Error())
-		}
-	}
-	// Only now, with no process of the run alive and the tree as the agent left it,
-	// may the hidden oracle enter the worktree. A corpus file that changed on disk
-	// means something escaped containment: the run fails and no further run starts.
+	iso.VerifyChangedTree = afterVerify != finalTree
+	// A corpus file that changed on disk means something escaped containment: the run
+	// fails and no further run starts.
 	if err := corpus.checkIntegrity(); err != nil {
 		ex.aborted = "corpus_changed: " + err.Error()
 		return fail(StatusError, ex.aborted)
 	}
-	oracleStaged = true
-	if err := stageOracle(corpus, t, wt.Dir); err != nil {
+	// The oracle judges a copy of the final snapshot in a directory that every run's
+	// agent, setup and verify profile hides, so a process of this run that the sweeps
+	// did not find can neither change the judged tree nor read the staged oracle.
+	if err := wt.JudgeCopy(finalTree, judgeDir); err != nil {
+		return fail(StatusError, "judge copy: "+err.Error())
+	}
+	iso.OracleJudgedCopy = true
+	if err := stageOracle(corpus, t, judgeDir); err != nil {
 		return fail(StatusError, "stage oracle: "+err.Error())
 	}
 	iso.OracleStagedPost = true
-	o := check{argv: t.Oracle.Cmd, dir: wt.Dir, env: t.Oracle.Env, extraEnv: []string{marker}, sb: sb,
+	o := check{argv: t.Oracle.Cmd, dir: judgeDir, env: t.Oracle.Env, extraEnv: []string{marker}, sb: ex.judgeSandbox(judgeDir), track: tracked,
 		timeout: secondsOr(t.Oracle.TimeoutSec, 600), logPath: filepath.Join(art, "oracle.log"), logRel: "oracle.log"}.run(ctx)
 	rec.Oracle = &o
 	if ctx.Err() != nil {

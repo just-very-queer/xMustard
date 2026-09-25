@@ -20,26 +20,30 @@ import (
 // Hidden-oracle isolation. The model-visible verify step and the harness-owned
 // oracle are separated in these ways:
 //
-//  1. Oracle files never exist in the worktree while the agent runs. They are copied
-//     in only after the agent's process group is dead, every process that carries the
-//     run's marker or works inside the worktree has been killed, and the visible
-//     verify step has been recorded. They are written from the bytes read when the
-//     corpus was loaded, never re-read from disk, and the on-disk files are checked
-//     against their load-time digests before staging.
-//  2. Before the agent starts, the worktree is scanned for any file whose bytes equal
+//  1. Oracle files never enter the worktree. After the agent's process group is dead,
+//     every process of the run the sweep can find has been killed, and the visible
+//     verify step has run, the harness copies the worktree into a judge directory
+//     that every run's agent, setup and verify profile hides, resets the copy's
+//     non-ignored files to the agent's final snapshot, and stages the oracle there.
+//     The oracle runs in that copy under its own profile, which hides every run's
+//     worktree and allows only the copy. A process the run left behind that no sweep
+//     found keeps the profile it started under, so it can reach neither the copy nor
+//     any later run's directories.
+//  2. Oracle files are written from the bytes read when the corpus was loaded, never
+//     re-read from disk, and the on-disk files are checked against their load-time
+//     digests before staging. Staging runs with the operator's rights, so it goes
+//     through an os.Root and refuses a destination whose directories include a link.
+//  3. Before the agent starts, the worktree is scanned for any file whose bytes equal
 //     an oracle file and for any oracle destination that already exists; either fails
 //     the run as a leaked oracle instead of producing a contaminated result.
-//  3. Everything that executes code the agent could have written runs under the same
-//     containment: the client, the setup, verify and oracle commands, and the xMustard
-//     API (which runs git in the worktree). It denies reads and writes of the corpus
-//     file, oracle sources, reference patches, the git directory (and every other
-//     worktree copy) of any repository holding them, the eval output directory, the
-//     harness's own git directories and other runs' worktrees: sandbox-exec on macOS,
-//     bwrap on Linux when installed. The mode in effect is recorded per run; "none" is
-//     reported as a warning.
-//  4. Verify runs after the final snapshot, so the harness snapshots again afterwards;
-//     when verify changed the tree, the worktree is restored to the agent's final tree
-//     before the oracle is staged, and the run records it.
+//  4. Everything that executes code the agent could have written runs contained: the
+//     client, the setup, verify and oracle commands, and the xMustard API (which runs
+//     git in the worktree). The profiles deny reads and writes of the corpus file,
+//     oracle sources, reference patches, the git directory (and every other worktree
+//     copy) of any repository holding them, the eval output directory, the harness's
+//     own git directories and judge copies, and every run's per-run directories except
+//     the run's own: sandbox-exec on macOS, bwrap on Linux when installed. The mode in
+//     effect is recorded per run; "none" is reported as a warning.
 //  5. Oracle output is written to the run's artifact directory, never the worktree.
 
 // CheckResult is one harness-run command (setup, verify or oracle).
@@ -60,6 +64,7 @@ type check struct {
 	env      map[string]string
 	extraEnv []string // after env: the run marker
 	sb       *sandbox // nil runs uncontained (validate, where no agent code exists)
+	track    *procSet // when set, receives every process seen in the command's tree
 	timeout  time.Duration
 	logPath  string
 	logRel   string
@@ -92,6 +97,12 @@ func (c check) run(ctx context.Context) CheckResult {
 	if err := startGroup(cmd); err != nil {
 		res.Error = err.Error()
 		return res
+	}
+	if c.track != nil {
+		// a process the command detaches is reparented away from its tree; recording
+		// the tree while it runs lets the sweep find such a process again
+		stopWatch := watchTree(cmd.Process.Pid, c.track, 100*time.Millisecond)
+		defer stopWatch()
 	}
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
@@ -184,34 +195,69 @@ func scanForOracleLeaks(c *Corpus, t *Task, worktree string) error {
 	})
 }
 
-// stageOracle writes the oracle files into the worktree from the bytes read when the
-// corpus was loaded. Call only after every agent process is dead and the visible
-// verify step has run.
-func stageOracle(c *Corpus, t *Task, worktree string) error {
+// stageOracle writes the oracle files into root (the judge copy, or validate's
+// worktree) from the bytes read when the corpus was loaded. It runs with the
+// operator's rights, outside any containment, and root holds a tree the agent wrote,
+// so it never follows a link: a link among a destination's directories fails with
+// oracle_path_symlink, an existing destination (whatever its type) is replaced, and
+// every write goes through an os.Root, which cannot leave root.
+func stageOracle(c *Corpus, t *Task, root string) error {
+	r, err := os.OpenRoot(root)
+	if err != nil {
+		return err
+	}
+	defer r.Close()
 	for _, f := range t.Oracle.Files {
 		b, err := c.fileBytes(f.Src)
 		if err != nil {
 			return err
 		}
-		dst := filepath.Join(worktree, filepath.FromSlash(f.Dest))
-		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		dest := filepath.FromSlash(f.Dest)
+		if err := noLinkedDirs(r, filepath.Dir(dest)); err != nil {
 			return err
 		}
-		// An agent may have created the destination; the oracle's copy wins.
-		_ = os.RemoveAll(dst)
-		if err := os.WriteFile(dst, b, 0o644); err != nil {
+		if err := r.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+			return err
+		}
+		if err := r.RemoveAll(dest); err != nil {
+			return err
+		}
+		w, err := r.OpenFile(dest, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+		if err != nil {
+			return err
+		}
+		_, err = w.Write(b)
+		if cerr := w.Close(); err == nil {
+			err = cerr
+		}
+		if err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// unstageOracle removes the oracle files again (validate reuses the worktree, and a
-// kept worktree is left as the agent finished it).
-func unstageOracle(t *Task, worktree string) {
-	for _, f := range t.Oracle.Files {
-		_ = os.Remove(filepath.Join(worktree, filepath.FromSlash(f.Dest)))
+// noLinkedDirs fails with oracle_path_symlink when dir (relative to r) or one of its
+// ancestors inside r is a symbolic link.
+func noLinkedDirs(r *os.Root, dir string) error {
+	if dir == "." {
+		return nil
 	}
+	p := ""
+	for _, part := range strings.Split(dir, string(filepath.Separator)) {
+		p = filepath.Join(p, part)
+		fi, err := r.Lstat(p)
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if fi.Mode()&fs.ModeSymlink != 0 {
+			return fmt.Errorf("oracle_path_symlink: %s on the oracle's destination path is a symbolic link", filepath.ToSlash(p))
+		}
+	}
+	return nil
 }
 
 // ---- containment ----

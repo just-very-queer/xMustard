@@ -3,12 +3,15 @@ package main
 import (
 	"errors"
 	"fmt"
+	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 )
 
 // Worktree is one fresh, detached checkout of a task's starting commit. Every run gets
@@ -300,6 +303,144 @@ func (w *Worktree) RestoreTree(tree string) error {
 		return fmt.Errorf("worktree is %s after restoring %s", got, tree)
 	}
 	return nil
+}
+
+// JudgeCopy makes dst, the tree the oracle judges. It copies the worktree, so ignored
+// files such as installed dependencies come along, then resets every non-ignored file
+// to tree through the harness's git directory, so dst holds exactly the agent's final
+// snapshot whatever happened to the worktree since. dst must lie where no process of
+// the run can reach it (the run profiles hide it), so nothing the run left behind can
+// change the judged tree or read the oracle staged into it. dst is not a git
+// repository: the copied .git file, which names the agent-writable run repository,
+// is dropped.
+func (w *Worktree) JudgeCopy(tree, dst string) error {
+	if w.hdir == "" {
+		return errors.New("worktree has no harness git directory")
+	}
+	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
+		return err
+	}
+	if err := copyWorktree(w.Dir, dst); err != nil {
+		return fmt.Errorf("copy the worktree: %w", err)
+	}
+	if err := os.RemoveAll(filepath.Join(dst, ".git")); err != nil {
+		return err
+	}
+	j := &Worktree{Dir: dst, hdir: w.hdir, hindex: filepath.Join(w.hdir, "judge-index")}
+	defer os.Remove(j.hindex)
+	// start the copy's index from tree, so entries a fresh `add -A` would not see
+	// (gitlinks of submodules that are not checked out) stay as snapshotted
+	if _, err := j.hgit(nil, "read-tree", tree); err != nil {
+		return err
+	}
+	return j.RestoreTree(tree)
+}
+
+// copyWorktree copies src to dst (which must not exist) without following symbolic
+// links: links are copied as links, and sockets, pipes and devices are left out. On
+// macOS the directory is cloned in one clonefile call (copy-on-write on APFS);
+// elsewhere, or when cloning fails, files are copied one by one (on Linux io.Copy
+// between files uses copy_file_range, which shares extents where the filesystem can).
+// Directories in the copy are owner-writable, so the reset to the snapshot can
+// rewrite them.
+func copyWorktree(src, dst string) error {
+	// the agent can replace its worktree with a link; the harness must not copy (and
+	// then write) through one
+	if fi, err := os.Lstat(src); err != nil || !fi.IsDir() {
+		return fmt.Errorf("%s is no longer a directory: %v", src, err)
+	}
+	err := cloneDir(src, dst)
+	if err == nil {
+		err = tidyCopy(dst)
+	} else {
+		_ = os.RemoveAll(dst)
+		err = walkCopy(src, dst)
+	}
+	if err != nil {
+		return err
+	}
+	if fi, err := os.Lstat(dst); err != nil || !fi.IsDir() {
+		return fmt.Errorf("the copy of %s is not a directory: %v", src, err)
+	}
+	return nil
+}
+
+func walkCopy(src, dst string) error {
+	return filepath.WalkDir(src, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(src, p)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(dst, rel)
+		switch typ := d.Type(); {
+		case typ.IsDir():
+			info, err := d.Info()
+			if err != nil {
+				return err
+			}
+			return os.Mkdir(target, info.Mode().Perm()|0o700)
+		case typ&fs.ModeSymlink != 0:
+			link, err := os.Readlink(p)
+			if err != nil {
+				return err
+			}
+			return os.Symlink(link, target)
+		case typ.IsRegular():
+			return copyRegular(p, target)
+		}
+		return nil
+	})
+}
+
+// copyRegular copies one regular file with its permission bits. The source is opened
+// without following a link and without blocking, and anything that turns out not to
+// be a regular file is skipped.
+func copyRegular(src, dst string) error {
+	in, err := os.OpenFile(src, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	info, err := in.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		return err
+	}
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, info.Mode().Perm())
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		return err
+	}
+	return out.Close()
+}
+
+// tidyCopy removes sockets, pipes and devices from a cloned tree and makes its
+// directories owner-writable.
+func tidyCopy(root string) error {
+	return filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		switch typ := d.Type(); {
+		case typ.IsDir():
+			info, err := d.Info()
+			if err != nil {
+				return err
+			}
+			if info.Mode().Perm()&0o700 != 0o700 {
+				return os.Chmod(p, info.Mode().Perm()|0o700)
+			}
+		case typ.IsRegular(), typ&fs.ModeSymlink != 0:
+		default:
+			return os.Remove(p)
+		}
+		return nil
+	})
 }
 
 // DiffChurn is the size of an agent's change between two snapshots.

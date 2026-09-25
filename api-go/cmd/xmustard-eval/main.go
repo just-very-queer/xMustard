@@ -355,12 +355,23 @@ func validateOneOracle(ctx context.Context, corpus *Corpus, t *Task, work, logRo
 	if err := scanForOracleLeaks(corpus, t, wt.Dir); err != nil {
 		return fail(err)
 	}
+	// the oracle judges a copy of the tree, as in a run
 	runOracle := func(name string) (CheckResult, error) {
-		if err := stageOracle(corpus, t, wt.Dir); err != nil {
+		tree, err := wt.SnapshotTree()
+		if err != nil {
 			return CheckResult{}, err
 		}
-		defer unstageOracle(t, wt.Dir)
-		r := step(CommandSpec{Cmd: t.Oracle.Cmd, Env: t.Oracle.Env, TimeoutSec: t.Oracle.TimeoutSec}, filepath.Join(logs, name))
+		judgeRun := filepath.Join(work, "judge", t.ID, strings.TrimSuffix(name, ".log"))
+		defer os.RemoveAll(judgeRun)
+		judge := filepath.Join(judgeRun, repoDirName(corpus, t))
+		if err := wt.JudgeCopy(tree, judge); err != nil {
+			return CheckResult{}, err
+		}
+		if err := stageOracle(corpus, t, judge); err != nil {
+			return CheckResult{}, err
+		}
+		r := check{argv: t.Oracle.Cmd, dir: judge, env: t.Oracle.Env, timeout: secondsOr(t.Oracle.TimeoutSec, 600),
+			logPath: filepath.Join(logs, name), logRel: filepath.Join(logs, name)}.run(ctx)
 		if r.Error != "" {
 			return r, errors.New("oracle did not run: " + r.Error)
 		}

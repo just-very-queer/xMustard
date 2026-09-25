@@ -45,11 +45,11 @@ func pidsWithEnv(kv string) ([]int, error) {
 	})
 }
 
-// pidsWithCwdIn lists processes whose working directory is dir or below it.
-func pidsWithCwdIn(dir string) ([]int, error) {
+// pidsWithCwdIn lists processes whose working directory is one of dirs or below one.
+func pidsWithCwdIn(dirs []string) ([]int, error) {
 	return scanProc(func(pid string) bool {
 		cwd, err := os.Readlink(filepath.Join("/proc", pid, "cwd"))
-		return err == nil && (cwd == dir || isWithin(cwd, dir))
+		return err == nil && cwdWithin(cwd, dirs)
 	})
 }
 

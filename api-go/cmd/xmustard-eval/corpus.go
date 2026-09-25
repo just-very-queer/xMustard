@@ -94,7 +94,8 @@ type CommandSpec struct {
 }
 
 // OracleSpec is the hidden, harness-owned check that decides whether a run resolved
-// the task. Its files enter the worktree only after the agent has exited.
+// the task. Its files never enter the worktree: they are staged into a copy of the
+// agent's final tree after the agent has exited (see oracle.go).
 type OracleSpec struct {
 	Files      []OracleFile      `yaml:"files"`
 	Cmd        []string          `yaml:"cmd"`
