@@ -85,6 +85,9 @@ type rpcMessage struct {
 	Params  json.RawMessage `json:"params,omitempty"`
 	Result  json.RawMessage `json:"result,omitempty"`
 	Error   *rpcError       `json:"error,omitempty"`
+	// dropped, set by the transport (never decoded), fails a server request whose
+	// answer arrived but could not be read (over the size cap or refused admission).
+	dropped error
 }
 
 // isResponse reports whether the frame answers a request this server sent.
@@ -130,8 +133,12 @@ func (c *stdioClient) Request(ctx context.Context, method string, params any) (j
 	send(map[string]any{"jsonrpc": "2.0", "id": id, "method": method, "params": params})
 	select {
 	case m := <-ch:
+		if m.dropped != nil {
+			return nil, m.dropped
+		}
 		if m.Error != nil {
-			return nil, fmt.Errorf("client error %d: %s", m.Error.Code, m.Error.Message)
+			// wrapped, so the session can tell method-not-found from a failure
+			return nil, fmt.Errorf("client error %d: %w", m.Error.Code, m.Error)
 		}
 		return m.Result, nil
 	case <-ctx.Done():
@@ -155,6 +162,36 @@ func (c *stdioClient) deliver(m rpcMessage) {
 		default:
 		}
 	}
+}
+
+func (c *stdioClient) isPending(id json.RawMessage) bool {
+	var key string
+	if json.Unmarshal(id, &key) != nil {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.pending[key] != nil
+}
+
+// answerUndecoded returns the reply owed to a frame that was not decoded (over the
+// size cap, or refused admission), or nil when none is owed. A client's response to a
+// server request (roots/list) is never answered: it is dropped, and the request
+// waiting for it fails now instead of timing out. withID answers a request with its
+// probed id; without it (a truncated frame) the error carries a null id.
+func (c *stdioClient) answerUndecoded(probe []byte, rerr *rpcError, withID bool) *rpcResponse {
+	p := probeFrame(probe)
+	if !p.method && (p.answer || (p.id != nil && c.isPending(p.id))) {
+		if p.id != nil {
+			c.deliver(rpcMessage{ID: p.id, dropped: fmt.Errorf("the client's answer was dropped unread: %s", rerr.Message)})
+		}
+		return nil
+	}
+	id := p.id
+	if !withID {
+		id = nil
+	}
+	return &rpcResponse{JSONRPC: "2.0", ID: id, Error: rerr}
 }
 
 // maxInflight bounds concurrently outstanding id-bearing requests; beyond it the shim
@@ -238,30 +275,49 @@ func readAdmittedLine(r *bufio.Reader, scope *budget.Scope) frame {
 // was not decoded, by parsing the prefix's top-level members in order. If the id is
 // not reached and fully parsed inside the prefix, it returns nil (a null-id error):
 // guessing could correlate the error with a different live call.
-func probeID(probe []byte) json.RawMessage {
+func probeID(probe []byte) json.RawMessage { return probeFrame(probe).id }
+
+// probed is what the bounded prefix of an undecoded frame shows.
+type probed struct {
+	id     json.RawMessage // the top-level id, when fully inside the prefix and scalar
+	method bool            // a top-level method member was seen: a request or notification
+	answer bool            // a top-level result or error member was seen: a response
+}
+
+// probeFrame reads the prefix's top-level members in order. A member's key counts even
+// when its value runs past the prefix (a large roots/list result).
+func probeFrame(probe []byte) probed {
+	var p probed
 	dec := json.NewDecoder(bytes.NewReader(probe))
 	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
-		return nil
+		return p
 	}
+	seenID := false
 	for dec.More() {
 		key, err := dec.Token()
 		if err != nil {
-			return nil
+			break
+		}
+		switch key {
+		case "method":
+			p.method = true
+		case "result", "error":
+			p.answer = true
 		}
 		var val json.RawMessage
 		if err := dec.Decode(&val); err != nil {
-			return nil // value runs past the prefix (or is malformed)
+			break // value runs past the prefix (or is malformed)
 		}
-		if key == "id" {
+		if key == "id" && !seenID {
+			seenID = true
 			var s string
 			var n json.Number
 			if json.Unmarshal(val, &s) == nil || json.Unmarshal(val, &n) == nil {
-				return val
+				p.id = val
 			}
-			return nil
 		}
 	}
-	return nil
+	return p
 }
 
 // inflight tracks cancel funcs for in-progress requests by their JSON-RPC id, so an MCP
@@ -353,8 +409,11 @@ func main() {
 		line := bytes.TrimSpace(f.line)
 		if f.truncated {
 			scope.Close()
-			// can't trust the (partial) body to parse an id; reply with a null-id error.
-			send(rpcResponse{JSONRPC: "2.0", Error: &rpcError{Code: mcpserver.CodeInvalidRequest, Message: "request exceeds max message size"}})
+			// can't trust the (partial) body to parse an id; reply with a null-id error
+			// (a response to a server request is dropped, never answered).
+			if resp := client.answerUndecoded(f.probe, &rpcError{Code: mcpserver.CodeInvalidRequest, Message: "request exceeds max message size"}, false); resp != nil {
+				send(*resp)
+			}
 		} else if f.headroom {
 			// served from the fixed control headroom: only control frames proceed
 			scope.Close()
@@ -372,7 +431,9 @@ func main() {
 			}
 		} else if f.refused || (len(line) > 0 && scope.Acquire(int64(len(line))) != nil) {
 			scope.Close()
-			send(rpcResponse{JSONRPC: "2.0", ID: probeID(f.probe), Error: overloadError(budget.ErrOverloaded)})
+			if resp := client.answerUndecoded(f.probe, overloadError(budget.ErrOverloaded), true); resp != nil {
+				send(*resp)
+			}
 		} else if len(line) == 0 {
 			scope.Close()
 		} else {

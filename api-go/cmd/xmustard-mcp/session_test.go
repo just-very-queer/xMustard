@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,6 +15,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"xmustard/api-go/internal/budget"
 )
 
 // shimProc runs the built shim with a line reader over its stdout.
@@ -143,6 +146,98 @@ func TestShimNegotiatesBeforePipelinedRequests(t *testing.T) {
 	}
 	if _, ok := got["3"]; !ok || strings.Contains(fmt.Sprint(got), "xmustard-999") {
 		t.Fatalf("the stray response was answered: %v", got)
+	}
+	select {
+	case m := <-p.lines:
+		t.Fatalf("unexpected extra message (a response must never be answered): %v", m)
+	case <-time.After(300 * time.Millisecond):
+	}
+}
+
+// A client's answer to a server request that is not decoded (over the size cap, or
+// refused admission) is still a response: it is never answered back, and the request
+// waiting for it fails at once instead of timing out. Requests keep their error reply.
+func TestUndecodedClientResponseIsNeverAnswered(t *testing.T) {
+	c := newStdioClient()
+	sent := make(chan map[string]any, 1)
+	c.send = func(v any) { sent <- v.(map[string]any) }
+	errc := make(chan error, 1)
+	go func() {
+		_, err := c.Request(context.Background(), "roots/list", map[string]any{})
+		errc <- err
+	}()
+	req := <-sent
+	id, _ := json.Marshal(req["id"])
+	refused := overloadError(budget.ErrOverloaded)
+	big := fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"result":{"roots":[{"uri":"file:///%s"}]}}`, id, strings.Repeat("a", 8<<10))
+	if resp := c.answerUndecoded([]byte(big[:idProbeBytes]), refused, true); resp != nil {
+		t.Fatalf("a client response was answered: %+v", resp)
+	}
+	select {
+	case err := <-errc:
+		if err == nil || !strings.Contains(err.Error(), "dropped unread") {
+			t.Fatalf("waiting request: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the waiting request was not failed")
+	}
+	cases := []struct {
+		probe  string
+		withID bool
+		want   string // "" means no reply
+	}{
+		// a stray answer (nothing pending), and one whose result lies past the prefix
+		{`{"jsonrpc":"2.0","id":"xmustard-99","result":{"roots":[`, true, ""},
+		{`{"jsonrpc":"2.0","id":"xmustard-98","error":{"code":-1`, true, ""},
+		// requests keep their id; a truncated request gets a null id
+		{`{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"x":"`, true, "7"},
+		{`{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"x":"`, false, "null"},
+		// a request that also carries a result member is still a request
+		{`{"jsonrpc":"2.0","id":8,"method":"ping","result":{`, true, "8"},
+	}
+	for _, tc := range cases {
+		resp := c.answerUndecoded([]byte(tc.probe), refused, tc.withID)
+		switch {
+		case tc.want == "" && resp != nil:
+			t.Errorf("%s: answered %+v", tc.probe, resp)
+		case tc.want != "" && resp == nil:
+			t.Errorf("%s: no reply", tc.probe)
+		case tc.want != "":
+			if got, _ := json.Marshal(resp.ID); string(got) != tc.want && !(tc.want == "null" && resp.ID == nil) {
+				t.Errorf("%s: reply id %s, want %s", tc.probe, got, tc.want)
+			}
+		}
+	}
+}
+
+// End to end: a roots/list answer over the 8 MiB frame cap produces no reply of any
+// kind, and the tool call that asked finishes at once, naming the dropped answer.
+func TestShimDropsAnOversizedRootsAnswer(t *testing.T) {
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`[]`))
+	}))
+	defer api.Close()
+	p := startShim(t, "/", "XMUSTARD_API_BASE="+api.URL, "XMUSTARD_WORKSPACE_ID=")
+	p.send(t, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{"roots":{}},"clientInfo":{"name":"t","version":"1"}}}`)
+	p.next(t)
+	p.send(t, `{"jsonrpc":"2.0","method":"notifications/initialized"}`)
+	p.send(t, `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"ground","arguments":{}}}`)
+	req := p.next(t)
+	if req["method"] != "roots/list" {
+		t.Fatalf("expected roots/list, got %v", req)
+	}
+	id, _ := json.Marshal(req["id"])
+	start := time.Now()
+	p.send(t, `{"jsonrpc":"2.0","id":%s,"result":{"roots":[{"uri":"file:///%s"}]}}`, id, strings.Repeat("a", maxMessageBytes))
+	res := p.next(t)
+	if res["id"] != float64(2) {
+		t.Fatalf("the oversized answer was answered (or the call lost): %v", res)
+	}
+	if took := time.Since(start); took > 4*time.Second {
+		t.Fatalf("the call waited %s for an answer that was already dropped", took)
+	}
+	if msg := fmt.Sprint(res["result"]); !strings.Contains(msg, "dropped unread") {
+		t.Fatalf("the call does not name the dropped answer: %s", msg)
 	}
 	select {
 	case m := <-p.lines:
