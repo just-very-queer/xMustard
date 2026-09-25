@@ -17,14 +17,21 @@
 // *RejectError.
 //
 // The same engine serves strings (String, Bytes, Check, Findings) and streams
-// (NewReader, Copy, WriteFile). Input is processed in fixed 64 KiB windows with
-// a held-back lookahead, so a secret split across read or window boundaries is
-// still found, the output does not depend on how the source chunks its reads,
-// and the engine's memory is bounded by the window whatever the input length
-// (the 16 MiB stream test grows the live heap by about 0.2 MiB). String and
-// Bytes also hold their result, one copy of the input's size, and String
-// returns its input without copying when nothing is redacted; Check holds
-// nothing; Findings holds one entry per secret.
+// (NewReader, Copy, WriteFile). Input is processed in fixed 128 KiB windows,
+// about 33 KiB of which are held back as lookahead, which covers everything a
+// detector reads past where it matched. So a secret split across read or
+// window boundaries is still found, the output is what one pass over the whole
+// input produces whatever the chunking of reads or the window boundaries, and
+// the engine's memory is bounded by the window whatever the input length (the
+// 16 MiB stream test grows the live heap by under 0.5 MiB). String and Bytes
+// also hold their result, one copy of the input's size, and String returns its
+// input without copying when nothing is redacted; Check holds nothing;
+// Findings holds one entry per secret.
+//
+// A private key is replaced between its BEGIN and END markers. When separators
+// interrupt it (quoted lines joined by "+" or written as adjacent literals,
+// "# " or "> " prefixes), they stay and each base64 line is replaced, so
+// source code, comments and JSON strings keep their shape.
 //
 // Key-aware detection reads how a value was written. A quoted value or YAML
 // block scalar under a password-like key is always a secret unless it is a
@@ -37,9 +44,12 @@
 // token-like value needs a digit ("API_TOKEN=abcdefgh" is kept); an unquoted
 // password is one word, so a multi-word YAML value ("password: correct horse")
 // is not taken for one; validators judge the first 512 bytes of a
-// value; a YAML block scalar is read for at most 3 KiB; and a private key body
-// is at most 32 KiB, ending without an END marker at the first byte a key body
-// cannot hold (so a BEGIN marker in prose costs the rest of its phrase).
+// value; a YAML block scalar is read for at most 3 KiB; and a private key is
+// read for at most 32 KiB past its BEGIN marker. Without an END marker in that
+// span, a key is replaced only as far as its body runs uninterrupted, and only
+// if that holds a base64 run of 16 bytes, so a BEGIN marker named in prose or
+// a log line costs nothing, and a truncated key split into quoted or
+// commented lines keeps the lines after the first separator.
 //
 // Intended callers:
 //
@@ -170,6 +180,10 @@ type literalEntry struct {
 	detector int
 }
 
+// anchorReach bounds how far before its literal a triggered detector's anchor
+// can lie (an e-mail's local part before "@", a URL scheme before "://").
+const anchorReach = 64
+
 // triggered detectors can only match where one of their literals occurs.
 type triggered interface {
 	triggers() (literals []string, fold bool)
@@ -182,9 +196,10 @@ type triggered interface {
 
 // scanners look at the whole window.
 type scanner interface {
-	// find appends candidates whose anchor lies in [from, n). buf[:from] is
-	// already-emitted context (at least one byte), available for lookbehind.
-	find(buf []byte, from, n int, eof bool, out []candidate) []candidate
+	// find appends candidates whose anchor lies in [from, to); it may read up
+	// to n. buf[:from] is already-emitted context (at least one byte),
+	// available for lookbehind.
+	find(buf []byte, from, to, n int, eof bool, out []candidate) []candidate
 }
 
 func (r *Redactor) add(d triggered) {
@@ -213,12 +228,13 @@ func cases(c byte, fold bool) []byte {
 	return []byte{c}
 }
 
-// trigger evaluates, in one pass over buf[from:n], every trigger literal
-// occurrence that its detector has not ruled out, in position order. Hits are
-// evaluated as they are found, so nothing grows with their number.
-func (e *engine) trigger(buf []byte, from, n int, eof bool) {
+// trigger evaluates, in one pass over buf[from:to], every trigger literal
+// occurrence that its detector has not ruled out, in position order; the
+// detectors may read up to n. Hits are evaluated as they are found, so nothing
+// grows with their number.
+func (e *engine) trigger(buf []byte, from, to, n int, eof bool) {
 	r := e.r
-	for i := from; i < n; i++ {
+	for i := from; i < to; i++ {
 		var c1 byte
 		if i+1 < n {
 			c1 = buf[i+1]
@@ -496,22 +512,44 @@ type candidate struct {
 	start, end int    // bytes replaced by the marker
 	label      string // marker label
 	rule       string // report rule
-	prio       int    // lower wins the label when regions merge
 	cont       continuation
+	prio       int32 // lower wins the label when regions merge
+	scanner    int8  // 1 + index of the scanner that found it; 0 for a triggered detector
+	covers     bool  // its scanner looks for nothing inside it (see engine.resume)
+	part       bool  // more of the previous candidate's secret: a marker, but no new count
+	ext        bool  // continues the region that ended where this window's output resumes
 }
 
 // continuation extends a region that reached the end of a window before it
-// could end (a long token, an unterminated quoted value, a PEM body).
+// could end (a long token, an unterminated quoted value).
 type continuation interface {
 	// advance consumes buf[from:n]. It returns where the region ends and whether
 	// it is still open; an open region may stop short of n to keep a carry.
 	advance(buf []byte, from, n int, eof bool) (end int, open bool)
 }
 
+// push appends c to out, doubling the capacity when it runs out: a window can
+// hold thousands of candidates, and append's gentler growth for large slices
+// would allocate several times the final size on the way there.
+func push(out []candidate, c candidate) []candidate {
+	if len(out) == cap(out) {
+		grown := make([]candidate, len(out), 2*cap(out)+16)
+		copy(grown, out)
+		out = grown
+	}
+	return append(out, c)
+}
+
+// openRegion is a region carried into the next window.
+type openRegion struct {
+	cont    continuation
+	scanner int8 // 1 + index of the scanner whose covering value this is, or 0
+}
+
 // engine runs the detectors over successive windows of one input.
 type engine struct {
 	r       *Redactor
-	open    []continuation
+	open    []openRegion
 	cands   []candidate
 	skip    []int
 	memo    []runMemo
@@ -521,38 +559,61 @@ type engine struct {
 	collect bool     // record Findings
 	found   []Finding
 	base    int // input offset of buf[0]; -1 while buf[0] is the synthetic newline
+
+	// evalFrom is the input offset from which detector positions still need
+	// their final evaluation: positions in a window's lookahead are evaluated
+	// again, with a full lookahead, in the next window.
+	evalFrom int
+	// lastStart and lastEnd are the input offsets of the last redacted region,
+	// including what its continuation swallowed.
+	lastStart, lastEnd int
+	// resume holds, per scanner, the input offset its scan resumes from. A
+	// scanner may skip what a value it found covers (keyedRule does not look
+	// for keys inside a bare value); a later window skips it as well, so where
+	// a window ends does not change what is found.
+	resume []int
 }
 
-// lookahead is how many bytes at the end of a non-final window are held back:
-// a detector's decision about a secret starting before n-lookahead is final.
-const lookahead = 4 << 10
+// lookahead is how many bytes at the end of a non-final window are held back.
+// Only positions before n-lookahead are decided in a window, so every decision
+// sees at least lookahead bytes, which covers the longest any detector reads
+// past its anchor (a private key body and its END marker), and does not depend
+// on where the window ends.
+const lookahead = pemSpan + 512
 
 // window redacts buf[from:n], appending output to out, and returns how far the
 // input was consumed. Unconsumed bytes must be presented again, after the
 // consumed prefix (kept as context), in the next call.
+//
+// A region carried from the previous window (an open continuation) is swallowed
+// first. Detectors then run from the first position that has not had its final
+// evaluation, which may lie inside that region or in the previous window's
+// lookahead (the Reader keeps enough context for it). A secret found there
+// that reaches past what is already consumed extends the carried region when
+// it starts inside it, exactly as one window over the whole input would merge
+// the two.
 func (e *engine) window(out, buf []byte, from, n int, eof bool) ([]byte, int) {
+	done := from // everything before done is emitted or swallowed
 	if len(e.open) > 0 {
-		frontier, still := from, e.open[:0]
-		for _, c := range e.open {
-			end, open := c.advance(buf, from, n, eof)
-			if end > frontier {
-				frontier = end
+		still := e.open[:0]
+		for _, o := range e.open {
+			end, open := o.cont.advance(buf, from, n, eof)
+			done = max(done, end)
+			if o.scanner > 0 {
+				e.resume[o.scanner-1] = max(e.resume[o.scanner-1], e.base+end)
 			}
 			if open {
-				still = append(still, c)
+				still = append(still, o)
 			}
 		}
 		e.open = still
-		if e.collect && len(e.found) > 0 { // the open region is the last finding
-			f := &e.found[len(e.found)-1]
-			f.Length = max(f.Length, e.base+frontier-f.Offset)
-		}
-		if len(e.open) > 0 {
-			return out, frontier
-		}
-		from = frontier
+		e.extendRegion(done)
 	}
 
+	start := from
+	if s := e.evalFrom - e.base; s < start {
+		start = max(1, s)
+	}
 	e.cands = e.cands[:0]
 	if len(e.skip) < len(e.r.triggered) {
 		e.skip = make([]int, len(e.r.triggered))
@@ -560,38 +621,62 @@ func (e *engine) window(out, buf []byte, from, n int, eof bool) ([]byte, int) {
 	}
 	clear(e.skip)
 	clear(e.memo)
-	e.trigger(buf, from, n, eof)
-	for _, d := range e.r.scanners {
-		e.cands = d.find(buf, from, n, eof, e.cands)
-	}
 	limit := n
 	if !eof {
 		limit = max(from, n-lookahead)
+		e.evalFrom = e.base + limit
+	}
+	// Only anchors before limit are decided here, so nothing past it (or, for
+	// a literal, past limit+anchorReach) is looked at.
+	e.trigger(buf, start, min(n, limit+anchorReach), n, eof)
+	if len(e.resume) < len(e.r.scanners) {
+		e.resume = make([]int, len(e.r.scanners))
+	}
+	for i, d := range e.r.scanners {
+		k := len(e.cands)
+		e.cands = d.find(buf, min(limit, max(start, e.resume[i]-e.base)), limit, n, eof, e.cands)
+		for ; k < len(e.cands); k++ {
+			e.cands[k].scanner = int8(i + 1)
+		}
 	}
 	sort.SliceStable(e.cands, func(i, j int) bool { return e.cands[i].anchor < e.cands[j].anchor })
 
-	frontier := limit
+	consumed := max(limit, done)
 	committed := e.cands[:0]
 	for _, c := range e.cands {
-		if c.anchor >= frontier {
-			break
+		if c.anchor >= limit {
+			break // evaluated again, with its full lookahead, in the next window
+		}
+		if c.covers {
+			e.resume[c.scanner-1] = max(e.resume[c.scanner-1], e.base+c.end)
+		} else {
+			c.scanner = 0
+		}
+		if c.start < done {
+			if c.end <= done && c.cont == nil {
+				continue // inside what was already redacted or emitted
+			}
+			c.ext = e.lastEnd == e.base+done && e.base+c.start >= e.lastStart
+			c.start, c.end = done, max(c.end, done)
 		}
 		committed = append(committed, c)
-		if c.end > frontier {
-			frontier = c.end
-		}
+		consumed = max(consumed, c.end)
 		if c.cont != nil {
-			e.open = append(e.open, c.cont)
+			e.open = append(e.open, openRegion{c.cont, c.scanner})
 		}
 	}
 	sort.SliceStable(committed, func(i, j int) bool {
-		if committed[i].start != committed[j].start {
-			return committed[i].start < committed[j].start
+		a, b := &committed[i], &committed[j]
+		if a.start != b.start {
+			return a.start < b.start
 		}
-		return committed[i].prio < committed[j].prio
+		if a.ext != b.ext {
+			return a.ext
+		}
+		return a.prio < b.prio
 	})
 
-	pos := from
+	pos := done
 	for i := 0; i < len(committed); {
 		c := committed[i]
 		end := c.end
@@ -600,26 +685,44 @@ func (e *engine) window(out, buf []byte, from, n int, eof bool) ([]byte, int) {
 			end = max(end, committed[j].end)
 			j++
 		}
-		if !e.discard {
-			out = append(out, buf[pos:c.start]...)
-			out = append(out, "[REDACTED:"...)
-			out = append(out, c.label...)
-			out = append(out, ']')
+		if !c.ext {
+			if !e.discard {
+				out = append(out, buf[pos:c.start]...)
+				out = append(out, "[REDACTED:"...)
+				out = append(out, c.label...)
+				out = append(out, ']')
+			}
+			e.lastStart = e.base + c.start
 		}
-		if e.collect {
-			e.found = append(e.found, Finding{Rule: c.rule, Offset: e.base + c.start, Length: end - c.start})
+		if c.ext || c.part {
+			e.extendRegion(end)
+		} else {
+			if e.collect {
+				e.found = append(e.found, Finding{Rule: c.rule, Offset: e.base + c.start, Length: end - c.start})
+			}
+			if e.rep.Rules[c.rule] == 0 {
+				e.order = append(e.order, c.rule)
+			}
+			e.rep.add(c.rule, 1)
 		}
-		if e.rep.Rules[c.rule] == 0 {
-			e.order = append(e.order, c.rule)
-		}
-		e.rep.add(c.rule, 1)
+		e.lastEnd = e.base + end
 		pos = end
 		i = j
 	}
-	if !e.discard && frontier > pos {
-		out = append(out, buf[pos:frontier]...)
+	if !e.discard && consumed > pos {
+		out = append(out, buf[pos:consumed]...)
 	}
-	return out, frontier
+	return out, consumed
+}
+
+// extendRegion records that the last redacted region now reaches end (a
+// window position); its finding grows to match.
+func (e *engine) extendRegion(end int) {
+	e.lastEnd = max(e.lastEnd, e.base+end)
+	if e.collect && len(e.found) > 0 {
+		f := &e.found[len(e.found)-1]
+		f.Length = max(f.Length, e.lastEnd-f.Offset)
+	}
 }
 
 // EnvSecret is one environment variable whose value must never appear in

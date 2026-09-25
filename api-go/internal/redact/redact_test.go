@@ -68,7 +68,7 @@ func secretCorpus() []sample {
 	pw := "hunter2-" + randToken(rng, alphaNum, 6)
 	apiHex := randToken(rng, "0123456789abcdef", 32)
 
-	return []sample{
+	out := []sample{
 		{"bearer header", "Authorization: Bearer " + bearer + "\n", bearer, RuleBearer},
 		{"bearer in curl", `curl -H "authorization: bearer ` + bearer + `" https://api`, bearer, RuleBearer},
 		{"basic auth", "Authorization: Basic " + basic, basic, RuleBasicAuth},
@@ -127,6 +127,42 @@ func secretCorpus() []sample {
 		{"single-line pem", `KEY="` + begin + " " + strings.ReplaceAll(pemBody, "\n", " ") + " " + end + `"`,
 			strings.ReplaceAll(pemBody, "\n", " "), RulePrivateKey},
 	}
+	for _, sh := range pemShapes(begin, end, strings.Split(pemBody, "\n")) {
+		out = append(out, sample{"pem " + sh.name, sh.text, strings.Split(pemBody, "\n")[0], RulePrivateKey})
+	}
+	return out
+}
+
+type pemShape struct{ name, text, want string }
+
+// pemShapes writes a key the ways source code, comments and transcripts
+// carry it, each with the output a redaction must produce: separators kept,
+// every line replaced.
+func pemShapes(begin, end string, lines []string) []pemShape {
+	each := func(pre, post string) (text, want string) {
+		for _, l := range lines {
+			text += pre + l + post
+			want += pre + "[REDACTED:private_key]" + post
+		}
+		return
+	}
+	var shapes []pemShape
+	add := func(name, open, pre, post, close string) {
+		text, want := each(pre, post)
+		shapes = append(shapes, pemShape{name, open + text + close, open + want + close})
+	}
+	add("java concatenation", `String k = "`+begin+`\n"`, ` + "`, `\n"`, ` + "`+end+`";`)
+	add("go concatenation", `k := "`+begin+`\n" +`, "\n\t\"", `\n" +`, "\n\t\""+end+`\n"`)
+	add("python adjacent literals", "k = (\n    '"+begin+`\n'`, "\n    '", `\n'`, "\n    '"+end+`\n'`+"\n)\n")
+	add("c adjacent literals", `const char *k = "`+begin+`\n"`, "\n\"", `\n"`, "\n\""+end+`\n";`)
+	add("hash comment", "# "+begin, "\n# ", "", "\n# "+end+"\n")
+	add("slash comment", "// "+begin, "\n// ", "", "\n// "+end+"\n")
+	add("markdown quote", "> "+begin, "\n> ", "", "\n> "+end+"\n")
+	goSrc := shapes[1]
+	text, _ := json.Marshal(map[string]string{"text": goSrc.text})
+	want, _ := json.Marshal(map[string]string{"text": goSrc.want})
+	shapes = append(shapes, pemShape{"go concatenation in json", string(text), string(want)})
+	return shapes
 }
 
 func TestSecretCorpus(t *testing.T) {
@@ -204,51 +240,113 @@ func TestRedactedJSONLStaysValid(t *testing.T) {
 	}
 }
 
-// A BEGIN marker without an END redacts only what could be a key body: never
-// past punctuation, a quote or pemMaxBody bytes.
+// A key interrupted by separators (string concatenation, adjacent literals,
+// comment and quote prefixes) is redacted line by line when its END marker
+// follows: the separators stay, so source and JSON keep their shape, and the
+// key counts once.
+func TestPEMWithSeparators(t *testing.T) {
+	r := Default()
+	rng := rand.New(rand.NewSource(11))
+	begin, end := join("-----BEGIN ", "RSA PRIVATE", " KEY-----"), join("-----END ", "RSA PRIVATE", " KEY-----")
+	lines := []string{randToken(rng, alphaNum+"+/", 64), randToken(rng, alphaNum+"+/", 64), randToken(rng, alphaNum, 6) + "=="}
+	for _, sh := range pemShapes(begin, end, lines) {
+		got := sameAsOneShot(t, r, sh.name, sh.text)
+		if got != sh.want {
+			t.Errorf("%s:\n got %q\nwant %q", sh.name, got, sh.want)
+		}
+		if _, rep := r.String(sh.text); rep.Count != 1 || rep.Rules[RulePrivateKey] != 1 {
+			t.Errorf("%s: one key must count once: %+v", sh.name, rep)
+		}
+		if f := r.Findings(sh.text); len(f) != 1 || f[0].Offset > strings.Index(sh.text, lines[0]) ||
+			f[0].Offset+f[0].Length < strings.Index(sh.text, lines[2])+len(lines[2]) {
+			t.Errorf("%s: one finding must cover the key: %+v", sh.name, f)
+		}
+	}
+
+	// BEGIN and END in different JSONL records: the key lines between them go,
+	// every record stays valid JSON and later records are untouched.
+	records := []string{
+		`{"role":"user","text":"my key: ` + begin + `"}`,
+		`{"role":"user","text":"` + lines[0] + `"}`,
+		`{"role":"user","text":"` + lines[1] + `\n` + lines[2] + `"}`,
+		`{"role":"user","text":"` + end + `"}`,
+		`{"role":"assistant","text":"noted, thanks"}`,
+	}
+	in := strings.Join(records, "\n") + "\n"
+	out := sameAsOneShot(t, r, "jsonl key", in)
+	got := strings.Split(strings.TrimSuffix(out, "\n"), "\n")
+	if len(got) != len(records) || got[0] != records[0] || got[3] != records[3] || got[4] != records[4] {
+		t.Fatalf("records merged or changed:\n%s", out)
+	}
+	for i, rec := range got {
+		if !json.Valid([]byte(rec)) {
+			t.Errorf("record %d is not JSON: %s", i, rec)
+		}
+	}
+	for _, l := range lines {
+		if strings.Contains(out, l) {
+			t.Errorf("key line survived: %s", out)
+		}
+	}
+
+	// Constants naming the markers, with code between them, are not a key.
+	code := "const (\n\tpemBegin = \"" + begin + "\"\n\tpemEnd   = \"" + end + "\"\n)\n"
+	if got, rep := r.String(code); got != code || rep.Redacted {
+		t.Errorf("marker constants were redacted: %q", got)
+	}
+}
+
+// A BEGIN marker without an END redacts only what could be a key body: base64
+// up to the first byte a body cannot hold, never a following word, quote, line
+// or record, and nothing when there is no base64 run of pemMinRun bytes.
 func TestPEMWithoutEndIsBounded(t *testing.T) {
 	r := Default()
 	begin := join("-----BEGIN ", "PRIVATE", " KEY-----")
-	prose := "Keys look like " + begin + " followed by base64. The rest of this paragraph stays."
-	if got, _ := r.String(prose); got != "Keys look like "+begin+"[REDACTED:private_key]. The rest of this paragraph stays." {
-		t.Errorf("prose mention: %q", got)
+	kept := []string{
+		"Keys look like " + begin + " followed by base64. The rest of this paragraph stays.",
+		`if strings.HasPrefix(s, "` + begin + `") { return true }`,
+		"warn: found " + begin + " in upload\n\n{\"n\":1}\n{\"n\":2}\n",
+		"WARN found " + begin + " in upload\nINFO server started on port 8080\nINFO ready\nERROR disk full: /var\n",
+		begin + "\n2026-01-01 INFO " + strings.Repeat("QUJD", 10) + "\n",
+		`{"text":"the header is ` + begin + `\n","n":1}`,
 	}
-	code := `if strings.HasPrefix(s, "` + begin + `") { return true }`
-	if got, _ := r.String(code); got != code {
-		t.Errorf("a marker in code has no body to redact: %q", got)
+	for _, in := range kept {
+		if got, rep := r.String(in); got != in || rep.Redacted {
+			t.Errorf("a marker mention lost text:\n in %q\nout %q", in, got)
+		}
 	}
-	// Raw text keeps its line structure: the next line is not pulled in.
-	log := "warn: found " + begin + " in upload\n\n{\"n\":1}\n{\"n\":2}\n"
-	if got := sameAsOneShot(t, r, "raw log", log); got != "warn: found "+begin+"[REDACTED:private_key]\n\n{\"n\":1}\n{\"n\":2}\n" {
-		t.Errorf("raw log: %q", got)
+
+	// A truncated key is redacted up to where it stops; what follows the stop,
+	// including trailing whitespace and later records, stays.
+	rng := rand.New(rand.NewSource(9))
+	l1, l2 := randToken(rng, alphaNum+"+/", 64), randToken(rng, alphaNum+"+/", 40)
+	cases := map[string]string{
+		`{"text":"` + begin + `\n` + l1 + `\n` + l2 + `"}` + "\n{\"n\":1}\n": `{"text":"` + begin + `[REDACTED:private_key]"}` + "\n{\"n\":1}\n",
+		begin + "\n" + l1 + "\n" + l2 + "   \n\n# next line\n":               begin + "[REDACTED:private_key]   \n\n# next line\n",
+		begin + "\n" + l1 + " (truncated)\n":                                 begin + "[REDACTED:private_key] (truncated)\n",
 	}
-	// ... also when a body reaches the window end and its trailing whitespace
-	// straddles the boundary. A run longer than pemMaxSpace stays redacted.
-	rng0 := rand.New(rand.NewSource(8))
+	for in, want := range cases {
+		if got := sameAsOneShot(t, r, "truncated key", in); got != want {
+			t.Errorf("truncated key:\n got %q\nwant %q", got, want)
+		}
+	}
+
+	// The same around the first window boundary, from either side of the
+	// lookahead, whatever the chunking of reads.
 	first := contextLen + windowSize - 1 // input bytes in the first window
-	for _, space := range []int{200, pemMaxSpace + 50} {
-		for shift := -3; shift <= 3; shift++ {
-			pre := filler(rng0, first-6000) + "\n" + begin + "\n"
-			body := randToken(rng0, alphaNum, first-space/2+shift-len(pre))
-			tail := strings.Repeat(" ", space) + "\n" + `{"n":1}` + "\n"
-			in := pre + body + tail
-			want := sameAsOneShot(t, r, "whitespace at boundary", in)
-			kept := tail
-			if space+1 > pemMaxSpace {
-				kept = `{"n":1}` + "\n"
-			}
-			if !strings.HasSuffix(want, "[REDACTED:private_key]"+kept) {
-				t.Fatalf("space %d shift %d: got suffix %q", space, shift, want[max(0, len(want)-60):])
-			}
-			for _, src := range []io.Reader{strings.NewReader(in), iotest.HalfReader(strings.NewReader(in))} {
-				if got, _ := streamAll(t, r, src); got != want {
-					t.Fatalf("space %d shift %d: stream differs", space, shift)
-				}
+	for _, at := range []int{first - lookahead - 3000, first - lookahead - 40, first - lookahead + 40, first - 2000} {
+		in := filler(rng, at) + "\n" + begin + "\n" + l1 + "\n" + l2 + strings.Repeat(" ", 300) + "\n" + `{"n":1}` + "\n" + filler(rng, 3000)
+		want := sameAsOneShot(t, r, "truncated key at boundary", in)
+		if !strings.Contains(want, begin+"[REDACTED:private_key]"+strings.Repeat(" ", 300)+"\n"+`{"n":1}`+"\n") {
+			t.Fatalf("at %d: trailing whitespace or next record lost", at)
+		}
+		for _, src := range []io.Reader{strings.NewReader(in), iotest.HalfReader(strings.NewReader(in))} {
+			if got, _ := streamAll(t, r, src); got != want {
+				t.Fatalf("at %d: stream differs", at)
 			}
 		}
 	}
 
-	rng := rand.New(rand.NewSource(9))
 	var body strings.Builder
 	for body.Len() < pemMaxBody+8<<10 {
 		body.WriteString(randToken(rng, alphaNum+"+/", 64) + "\n")
@@ -745,14 +843,123 @@ func TestStreamLongSecretsSpanWindows(t *testing.T) {
 	}
 }
 
-// A PEM END marker split across a window boundary still closes the block.
+// A secret that starts inside a region carried over from the previous window
+// and reaches past its end extends that region, as one window over the whole
+// input would merge the two: here a key, and a quoted value that closes after
+// the region does, inside a long unterminated single-quoted value that crosses
+// the first window boundary.
+func TestCarriedRegionExtendsIntoNextWindow(t *testing.T) {
+	r := Default()
+	rng := rand.New(rand.NewSource(12))
+	first := contextLen + windowSize - 1 // input bytes in the first window
+	begin, end := join("-----BEGIN ", "PRIVATE", " KEY-----"), join("-----END ", "PRIVATE", " KEY-----")
+	l1, l2 := randToken(rng, alphaNum+"+/", 64), randToken(rng, alphaNum+"+/", 64)
+	tok := "Zq8" + randToken(rng, alphaNum, 20) + "'" + randToken(rng, alphaNum, 20) + "7x"
+	tails := map[string]string{
+		"key": begin + "\n" + l1 + "\n" + l2 + "\n" + end + "\nafter\n",
+		// the single-quoted region closes at the quote inside the token value
+		"quoted value": `api_key: "` + tok + `"` + "\nafter\n",
+	}
+	for name, tail := range tails {
+		for _, lead := range []int{lookahead + 500, lookahead + 3000} {
+			pre := strings.Repeat("lorem ipsum\n", (first-lead)/12)
+			words := strings.Repeat("lorem ipsum ", (lead+2000)/12) // crosses the window end
+			in := pre + "note: password: 'draft " + words + tail
+			want := sameAsOneShot(t, r, name, in)
+			for _, leak := range []string{l1, l2, tok[len(tok)-22:]} {
+				if strings.Contains(tail, leak) && strings.Contains(want, leak) {
+					t.Fatalf("%s: one-shot reference leaks", name)
+				}
+			}
+			for _, src := range []io.Reader{strings.NewReader(in), &chunkReader{data: []byte(in), rng: rng, max: 4000}, iotest.OneByteReader(strings.NewReader(in))} {
+				if got, rep := streamAll(t, r, src); got != want || rep.Count != strings.Count(want, "[REDACTED:") {
+					t.Fatalf("%s lead %d: stream differs from one window", name, lead)
+				}
+			}
+		}
+	}
+}
+
+// stickyInput mixes fragments that open long regions (unterminated quotes,
+// long lines and bare values, YAML blocks) with keys in every shape, tokens
+// and marker mentions, so that regions and secrets straddle window ends.
+func stickyInput(rng *rand.Rand, size int) string {
+	begin, end := join("-----BEGIN ", "RSA PRIVATE", " KEY-----"), join("-----END ", "RSA PRIVATE", " KEY-----")
+	words := func(n int) string {
+		var b strings.Builder
+		for b.Len() < n {
+			b.WriteString([]string{"lorem ", "ipsum ", "dolor ", "sit ", "amet "}[rng.Intn(5)])
+		}
+		return b.String()
+	}
+	line := func() string { return randToken(rng, alphaNum+"+/", 64) }
+	var b strings.Builder
+	for b.Len() < size {
+		switch rng.Intn(14) {
+		case 0:
+			b.WriteString("note: password: 'draft " + words(rng.Intn(60000)) + "\n")
+		case 1:
+			b.WriteString("note: password: 'draft " + words(rng.Intn(60000)) + begin + "\n" + line() + "\n" + line() + "\n" + end + "\n")
+		case 2:
+			b.WriteString(`{"password":"` + randToken(rng, alphaNum, 1+rng.Intn(3000)) + `"}` + "\n")
+		case 3:
+			shapes := pemShapes(begin, end, []string{line(), line(), randToken(rng, alphaNum, 10) + "=="})
+			b.WriteString(shapes[rng.Intn(len(shapes))].text + "\n")
+		case 4:
+			b.WriteString("token " + join("gh", "p_", randToken(rng, alphaNum, 36+rng.Intn(3))) + " x\n")
+		case 5:
+			b.WriteString("API_TOKEN=" + randToken(rng, alphaNum, 1+rng.Intn(50000)) + "1\n")
+		case 6:
+			b.WriteString("warn " + begin + " in upload " + words(rng.Intn(200)) + "\n")
+		case 7:
+			b.WriteString(begin + "\n" + line() + "\n" + line() + "\n" + end + "\n")
+		case 8:
+			b.WriteString(`{"text":"say password: '` + words(rng.Intn(20000)) + `","n":1}` + "\n")
+		case 9:
+			b.WriteString("db:\n  password: |\n    " + line() + "\n  host: x\n")
+		case 10:
+			b.WriteString("key " + begin + "\n" + line() + "\n" + words(rng.Intn(40)) + "\n")
+		default:
+			b.WriteString(words(rng.Intn(9000)) + "\n")
+		}
+	}
+	return b.String()
+}
+
+// Randomized: long regions and secrets at random positions, random read
+// sizes. Every windowed path produces exactly the one-window output, report
+// and findings.
+func TestStreamMatchesOneShotSticky(t *testing.T) {
+	r := Default()
+	seeds := int64(60)
+	if testing.Short() {
+		seeds = 10
+	}
+	for seed := int64(1); seed <= seeds; seed++ {
+		rng := rand.New(rand.NewSource(seed))
+		in := stickyInput(rng, windowSize/2+rng.Intn(3*windowSize))
+		want := sameAsOneShot(t, r, fmt.Sprint("seed ", seed), in)
+		_, wantRep, _ := oneShot(r, in)
+		got, rep := streamAll(t, r, &chunkReader{data: []byte(in), rng: rng, max: 1 + rng.Intn(20000)})
+		if got != want || rep.Count != wantRep.Count {
+			t.Fatalf("seed %d: stream differs from one window (%d vs %d redactions)", seed, rep.Count, wantRep.Count)
+		}
+	}
+}
+
+// A PEM END marker split across a window boundary still closes the block, for
+// a BEGIN marker on either side of the lookahead.
 func TestStreamPEMEndMarkerAcrossBoundary(t *testing.T) {
 	r := Default()
 	begin, end := join("-----BEGIN ", "EC PRIVATE", " KEY-----"), join("-----END ", "EC PRIVATE", " KEY-----")
 	first := contextLen + windowSize - 1
 	for split := 1; split < len(end); split += 3 {
-		head := strings.Repeat("a", first-lookahead-200)
-		body := strings.Repeat("Q", lookahead+200-len(begin)-split)
+		bodyLen := pemMaxBody - 100
+		if split%2 == 0 {
+			bodyLen = 3000
+		}
+		head := strings.Repeat("a", first-split-len(begin)-bodyLen) // END starts split bytes before the window end
+		body := strings.Repeat("Q", bodyLen)
 		in := head + begin + body + end + "\nvisible"
 		want := sameAsOneShot(t, r, "pem end split", in)
 		got, _ := streamAll(t, r, iotest.HalfReader(strings.NewReader(in)))
@@ -813,24 +1020,29 @@ func TestAdversarialInputsAreLinear(t *testing.T) {
 	const size = 2 << 20
 	rep := func(unit string) string { return strings.Repeat(unit, size/len(unit)+1)[:size] }
 	inputs := map[string]string{
-		"openai literal run":    rep("sk-"),
-		"anthropic literal run": rep("sk-ant-"),
-		"jwt literal run":       rep("eyJ"),
-		"github pat run":        rep("github_pat_"),
-		"xmustard token run":    rep("xmt_"),
-		"slack run":             rep("xoxb-"),
-		"keyed separators":      rep("token:"),
-		"keyed equals":          rep("api_key=api_key="),
-		"flags":                 rep("--token --token "),
-		"pem begin markers":     rep(join("-----BEGIN ", "RSA PRIVATE", " KEY-----")),
-		"bearer words":          rep("bearer bearer "),
-		"url separators":        rep("a://b:c"),
-		"quotes":                rep(`"password":"`),
-		"glued failing runs":    rep("sk-" + strings.Repeat("a", 510) + "1"),
-		"glued slack runs":      rep("xoxb-" + strings.Repeat("a", 520) + "1"),
-		"pem prose mentions":    rep(join("-----BEGIN ", "PRIVATE", " KEY----- and then ")),
-		"yaml blocks":           rep("api_key: |\n  api_key: |\n    aaaa\n"),
-		"single quotes in json": rep(`{"t":"password: 'a","u":"`),
+		"openai literal run":     rep("sk-"),
+		"anthropic literal run":  rep("sk-ant-"),
+		"jwt literal run":        rep("eyJ"),
+		"github pat run":         rep("github_pat_"),
+		"xmustard token run":     rep("xmt_"),
+		"slack run":              rep("xoxb-"),
+		"keyed separators":       rep("token:"),
+		"keyed equals":           rep("api_key=api_key="),
+		"flags":                  rep("--token --token "),
+		"pem begin markers":      rep(join("-----BEGIN ", "RSA PRIVATE", " KEY-----")),
+		"bearer words":           rep("bearer bearer "),
+		"url separators":         rep("a://b:c"),
+		"quotes":                 rep(`"password":"`),
+		"glued failing runs":     rep("sk-" + strings.Repeat("a", 510) + "1"),
+		"glued slack runs":       rep("xoxb-" + strings.Repeat("a", 520) + "1"),
+		"pem prose mentions":     rep(join("-----BEGIN ", "PRIVATE", " KEY----- and then ")),
+		"yaml blocks":            rep("api_key: |\n  api_key: |\n    aaaa\n"),
+		"single quotes in json":  rep(`{"t":"password: 'a","u":"`),
+		"pem quoted mentions":    rep(join("-----BEGIN ", "PRIVATE", ` KEY-----" + x + "`)),
+		"pem lines without end":  rep(join("-----BEGIN ", "PRIVATE", " KEY-----\n# ") + strings.Repeat("Ab3/", 16) + "\n# "),
+		"pem ends without key":   rep(join("-----BEGIN ", "PRIVATE", ` KEY-----", "`, "-----END ", "PRIVATE", ` KEY-----", "`)),
+		"keys in a quoted value": `password: "` + rep("token:"),
+		"nested quoted values":   `password: "` + rep("a_token='Zx9 "),
 	}
 	start := time.Now()
 	for name, in := range inputs {

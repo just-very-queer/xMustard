@@ -11,15 +11,18 @@ import (
 // output buffer and per-window scratch sized by one window, so a stream of any
 // length is redacted in memory bounded by the window.
 const (
-	windowSize = 64 << 10 // input bytes buffered per step
-	contextLen = 256      // emitted bytes kept for boundary checks and key lookbehind
+	windowSize = 128 << 10 // input bytes buffered per step
+	// contextLen is how many consumed bytes the next window keeps: the part of
+	// the lookahead that a region carried past it consumed, which is evaluated
+	// again, plus room for the detectors' lookbehind (at most 256 bytes).
+	contextLen = lookahead + 256
 )
 
 // Reader redacts another reader as it is read. Output is identical to
 // Bytes over the whole input, whatever the chunking of the source's reads:
-// the input is processed in fixed windows, and the last few KiB of each window
-// are held back until the next one arrives, so a secret that straddles a read
-// or window boundary is seen whole before any of it is emitted.
+// the input is processed in fixed windows, and the last 33 KiB or so of each
+// window are held back until the next one arrives, so a secret that straddles
+// a read or window boundary is seen whole before any of it is emitted.
 //
 // If the source fails with an error other than io.EOF, the Reader emits what
 // it had already decided, withholds the undecided tail (it may hold part of a

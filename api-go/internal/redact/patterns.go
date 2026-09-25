@@ -95,7 +95,7 @@ type regexRule struct {
 	need     *need    // class check on the secret, if any
 	tail     *byteSet // greedy final alphabet: extends a secret reaching the window end
 	run      *byteSet // set when the literal is followed directly by a greedy run of this alphabet
-	prio     int
+	prio     int32
 
 	re *regexp.Regexp
 }
@@ -147,9 +147,9 @@ func (r *regexRule) at(buf []byte, pos, litLen, from, n int, eof bool, memo *run
 		c.cont = &tailCont{set: r.tail}
 	}
 	if r.tail == nil {
-		return append(out, c), pos + 1 // fixed length: a later match may extend past this one
+		return push(out, c), pos + 1 // fixed length: a later match may extend past this one
 	}
-	return append(out, c), max(fail, ge)
+	return push(out, c), max(fail, ge)
 }
 
 // retry returns the first later hit worth evaluating after the value [gs, ge)
@@ -248,7 +248,7 @@ var tokenRules = sync.OnceValue(func() []*regexRule {
 			literals: []string{"eyJ"}, tail: jwtBody, run: b64url},
 	}
 	for i, r := range rules {
-		r.prio = 10 + i
+		r.prio = int32(10 + i)
 		r.re = regexp.MustCompile(`^(?:` + r.pattern + `)`)
 	}
 	return rules
@@ -294,7 +294,7 @@ type schemeRule struct {
 	set   *byteSet
 	min   int
 	valid func([]byte) bool
-	prio  int
+	prio  int32
 }
 
 func (r *schemeRule) triggers() ([]string, bool) { return []string{r.word}, true }
@@ -321,7 +321,7 @@ func (r *schemeRule) at(buf []byte, pos, litLen, from, n int, eof bool, _ *runMe
 	if touches {
 		c.cont = &tailCont{set: r.set}
 	}
-	return append(out, c), end
+	return push(out, c), end
 }
 
 // urlCredRule finds the password in URL userinfo: scheme://user:password@host.
@@ -358,7 +358,7 @@ func urlCredAt(buf []byte, sep, from, n int, out []candidate) []candidate {
 	if p == u+1 || p >= n || buf[p] != '@' || !notPlaceholder(buf[u+1:p]) {
 		return out
 	}
-	return append(out, candidate{anchor: q, start: u + 1, end: p, label: RuleURLCredentials, rule: RuleURLCredentials, prio: 42})
+	return push(out, candidate{anchor: q, start: u + 1, end: p, label: RuleURLCredentials, rule: RuleURLCredentials, prio: 42})
 }
 
 // emailRule (PII) triggers on "@" and reads the local part backwards.
@@ -386,16 +386,16 @@ func emailAt(buf []byte, pos, from, n int, eof bool, out []candidate) []candidat
 	if loc == nil || (pos+loc[1] == n && !eof) {
 		return out
 	}
-	return append(out, candidate{anchor: s, start: s, end: pos + loc[1], label: RuleEmail, rule: RuleEmail, prio: 90})
+	return push(out, candidate{anchor: s, start: s, end: pos + loc[1], label: RuleEmail, rule: RuleEmail, prio: 90})
 }
 
 // cardRule (PII) finds 13-19 digit runs, optionally grouped by single spaces
 // or dashes, that pass the Luhn check.
 type cardRule struct{}
 
-func (cardRule) find(buf []byte, from, n int, eof bool, out []candidate) []candidate {
+func (cardRule) find(buf []byte, from, to, n int, eof bool, out []candidate) []candidate {
 	isDigit := func(c byte) bool { return '0' <= c && c <= '9' }
-	for i := from; i < n; i++ {
+	for i := from; i < to; i++ {
 		if !isDigit(buf[i]) || isWordByte(buf[i-1]) {
 			continue
 		}
@@ -415,7 +415,7 @@ func (cardRule) find(buf []byte, from, n int, eof bool, out []candidate) []candi
 			return out // undecided; deferred to the next window
 		}
 		if digits >= 13 && (last == n || !alnum[buf[last]]) && luhn(buf[i:last]) {
-			out = append(out, candidate{anchor: i, start: i, end: last, label: RulePaymentCard, rule: RulePaymentCard, prio: 91})
+			out = push(out, candidate{anchor: i, start: i, end: last, label: RulePaymentCard, rule: RulePaymentCard, prio: 91})
 		}
 		i = last
 	}
@@ -453,7 +453,8 @@ func (t *tailCont) advance(buf []byte, from, n int, eof bool) (int, bool) {
 	return i, false
 }
 
-// PEM private-key blocks. The markers stay; the body is replaced.
+// PEM private-key blocks. The markers stay; the key material between them is
+// replaced.
 var (
 	pemBegin = sync.OnceValue(func() *regexp.Regexp {
 		return regexp.MustCompile(`^-----BEGIN[ A-Z0-9]{0,40}PRIVATE KEY(?: BLOCK)?-----`)
@@ -464,20 +465,41 @@ var (
 )
 
 const (
-	// pemMarkerMax bounds a BEGIN or END marker, so a marker cut by a window is
-	// seen whole in the next one.
+	// pemMarkerMax bounds a BEGIN or END marker.
 	pemMarkerMax = 72
 	// pemMaxBody bounds a body: an RSA-16384 key is about 13 KiB of PEM, so
-	// this leaves room for escaping and armor headers.
+	// this leaves room for escaping, string concatenation and armor headers.
 	pemMaxBody = 32 << 10
+	// pemSpan is the most a PEM decision reads past its trigger: a BEGIN
+	// marker, a body and an END marker. The lookahead covers it.
+	pemSpan = 2*pemMarkerMax + pemMaxBody
+	// pemMinRun is the shortest base64 run taken for key material. A body with
+	// no END marker must hold one, and between the separators of a quoted,
+	// concatenated or prefixed key each such run is replaced. Key lines are 64
+	// or 76 bytes; words in prose and log fields are shorter.
+	pemMinRun = 16
 )
 
 type pemRule struct{}
 
 func (pemRule) triggers() ([]string, bool) { return []string{"-----BEGIN"}, false }
 
-// at replaces the body after a BEGIN marker. Later BEGIN markers inside the
-// body are skipped: they add nothing.
+// at redacts the key after a BEGIN marker:
+//
+//   - a body that runs to its END marker (raw, JSON-escaped, with armor
+//     headers) is replaced whole;
+//   - a body interrupted by separators (a closing quote and "+" or an adjacent
+//     literal, "# " or "> " line prefixes, spaces between lines) whose END
+//     marker follows within pemMaxBody keeps the separators: each base64 run of
+//     pemMinRun or more bytes is replaced, and so is the key's short last line
+//     (see keyRuns), so JSON strings and records, source code and comments keep
+//     their shape;
+//   - a body with no END marker is replaced up to the first byte a body cannot
+//     hold, if it holds a base64 run of pemMinRun bytes, so a BEGIN marker named
+//     in prose or a log line ("found -----BEGIN PRIVATE KEY----- in upload")
+//     costs nothing.
+//
+// Later BEGIN markers inside what was redacted are skipped: they add nothing.
 func (pemRule) at(buf []byte, pos, litLen, from, n int, eof bool, _ *runMemo, out []candidate) ([]candidate, int) {
 	marker := buf[pos:min(n, pos+pemMarkerMax)]
 	if !pemBegin().Match(marker) { // Match, unlike FindIndex, does not allocate
@@ -485,62 +507,57 @@ func (pemRule) at(buf []byte, pos, litLen, from, n int, eof bool, _ *runMemo, ou
 	}
 	// '-' is outside the marker's name class: the first dashes after BEGIN close it.
 	me := pos + litLen + bytes.IndexByte(marker[litLen:], '-') + len("-----")
-	var body pemBody
-	end, open := body.advance(buf, me, n, eof)
-	if end == me && !open {
-		return out, pos + 1 // nothing that could be a key follows the marker
-	}
-	c := candidate{anchor: pos, start: me, end: end, label: RulePrivateKey, rule: RulePrivateKey, prio: 1}
-	if open {
-		b := body // only an open body is kept, and allocated
-		c.cont = &b
-	}
-	return append(out, c), max(pos+1, end)
-}
-
-// pemBody scans a private key body: base64 and whitespace, JSON-escaped line
-// breaks (\n, \\n), and header lines before the base64 ("Proc-Type:
-// 4,ENCRYPTED", "DEK-Info: ...", OpenPGP "Version: ..."). It stops before the
-// END marker, at the first byte a body cannot hold (a quote, other
-// punctuation, non-ASCII), or after pemMaxBody bytes. A BEGIN marker mentioned
-// in prose, code or a JSON string therefore costs at most the rest of its
-// phrase, never the rest of the input, a closing quote or a line break: a
-// body that stops without an END marker ends before its trailing whitespace.
-type pemBody struct {
-	pemState
-	ws     int      // length of the whitespace run just scanned
-	before pemState // state where that run began
-}
-
-type pemState struct {
-	size    int  // bytes consumed so far
-	midLine bool // past the start of the current line
-	header  bool // inside a header line
-	sawData bool // base64 seen: header lines are over
-}
-
-// pemMaxSpace bounds the trailing whitespace a stopped body gives back. A
-// window never ends inside a shorter run (hold), so the run is judged whole.
-const pemMaxSpace = 256
-
-func (p *pemBody) advance(buf []byte, from, n int, eof bool) (int, bool) {
-	i := from
-	for i < n {
-		if p.size >= pemMaxBody {
-			return p.end(i), false
+	b := scanPEMBody(buf, me, n)
+	c := candidate{anchor: pos, start: me, end: b.end, label: RulePrivateKey, rule: RulePrivateKey, prio: 1}
+	if b.closed {
+		if b.run == 0 {
+			return out, pos + 1 // no key between the markers
 		}
-		if p.ws == 0 {
-			p.before = p.pemState
+		return push(out, c), b.end
+	}
+	if lim := min(n, me+pemMaxBody); b.stop < lim {
+		if e := pemEndAfter(buf, b.stop, lim, n); e >= 0 {
+			return keyRuns(buf, pos, me, e, out), e
 		}
-		c, w, space := buf[i], 1, false
+	}
+	if b.run < pemMinRun {
+		return out, pos + 1
+	}
+	return push(out, c), b.end
+}
+
+// pemBodyScan describes the contiguous body after a BEGIN marker.
+type pemBodyScan struct {
+	stop   int  // first byte past the body; the END marker when closed
+	end    int  // end of the redacted body: stop, less trailing whitespace unless closed
+	run    int  // longest run of base64
+	closed bool // the body ends at an END marker
+}
+
+// scanPEMBody reads a key body from me: base64 lines, whitespace, JSON-escaped
+// line breaks (\n, \\n, \/) and armor header lines before the base64
+// ("Proc-Type: 4,ENCRYPTED", "DEK-Info: ...", OpenPGP "Version: ..."). A line
+// of base64 is one word, so a space followed by another word on the same line
+// ends the body, as do a byte a body cannot hold (a quote, other punctuation,
+// non-ASCII) and pemMaxBody bytes.
+func scanPEMBody(buf []byte, me, n int) pemBodyScan {
+	lim := min(n, me+pemMaxBody)
+	var b pemBodyScan
+	i, ws, run := me, 0, 0
+	midLine, header, sawData := false, false, false
+body:
+	for i < lim {
+		c, w, space, data := buf[i], 1, false, false
 		switch {
-		case c == '-' && !eof && n-i < pemMarkerMax:
-			return p.hold(i), true // may be an END marker cut by the window
-		case c == '-' && bytes.HasPrefix(buf[i:n], []byte("-----END")) && pemEnd().Match(buf[i:min(n, i+pemMarkerMax)]):
-			return i, false
+		case c == '-':
+			b.closed = pemEndAt(buf, i, n)
+			break body
 		case c == '\n' || c == '\r':
-			p.midLine, p.header, space = false, false, true
+			midLine, header, space = false, false, true
 		case c == ' ' || c == '\t':
+			if midLine && !header && ws == 0 && wordFollows(buf, i, n) {
+				break body
+			}
 			space = true
 		case c == '\\':
 			k := i
@@ -548,94 +565,163 @@ func (p *pemBody) advance(buf []byte, from, n int, eof bool) (int, bool) {
 				k++
 			}
 			if k == n {
-				if !eof {
-					return p.hold(i), true // the escape is cut by the window
-				}
-				return p.end(i), false
+				break body
 			}
 			switch buf[k] {
 			case 'n', 'r':
-				p.midLine, p.header, space = false, false, true
+				midLine, header, space = false, false, true
 			case 't':
+				if midLine && !header && ws == 0 && wordFollows(buf, k+1, n) {
+					break body
+				}
 				space = true
 			case '/':
+				data = !header
 			default:
-				return p.end(i), false // \" and other escapes end the body
+				break body // \" and other escapes end the body
 			}
 			w = k + 1 - i
-		case p.header:
+		case header:
 			if c < 0x20 || c > 0x7e || c == '"' {
-				return p.end(i), false
+				break body
 			}
 		default:
-			if !p.midLine && !p.sawData {
-				header, more := pemHeader(buf, i, n)
-				if more && !eof {
-					return p.hold(i), true
-				}
-				if header {
-					p.header, p.midLine = true, true
-					break
-				}
+			if !midLine && !sawData && pemHeader(buf, i, n) {
+				header, midLine = true, true
+				break
 			}
 			if !b64Std[c] {
-				return p.end(i), false
+				break body
 			}
-			p.midLine, p.sawData = true, true
+			data = true
+		}
+		if data {
+			midLine, sawData = true, true
+			run++
+			b.run = max(b.run, run)
+		} else {
+			run = 0
 		}
 		if space {
-			p.ws += w
+			ws += w
 		} else {
-			p.ws = 0
+			ws = 0
 		}
-		p.size += w
 		i += w
 	}
-	if eof {
-		return p.end(n), false
+	b.stop, b.end = i, i
+	if !b.closed {
+		b.end = i - ws // a stopped body gives back its trailing whitespace
 	}
-	return p.hold(n), true
+	return b
 }
 
-// end is where a body that stops at i ends: before its trailing whitespace,
-// unless that run is longer than pemMaxSpace.
-func (p *pemBody) end(i int) int {
-	if p.ws > 0 && p.ws <= pemMaxSpace {
-		return i - p.ws
-	}
-	return i
-}
-
-// hold is where to resume when the window ends at i: before a pending
-// whitespace run of at most pemMaxSpace bytes, with the state it began in, so
-// the next window sees the run whole.
-func (p *pemBody) hold(i int) int {
-	if p.ws > 0 && p.ws <= pemMaxSpace {
-		i -= p.ws
-		p.pemState, p.ws = p.before, 0
-	}
-	return i
-}
-
-// pemHeader reports whether a header line ("Name: value") starts at i; more
-// is set when the window ends before that is decided.
-func pemHeader(buf []byte, i, n int) (header, more bool) {
-	if !isLetter(buf[i]) {
-		return false, false
-	}
-	for k := i + 1; k < i+42; k++ {
-		if k+1 >= n {
-			return false, true
+// wordFollows reports whether a word follows the spaces at i on the same line.
+func wordFollows(buf []byte, i, n int) bool {
+	for i < n {
+		switch {
+		case buf[i] == ' ' || buf[i] == '\t':
+			i++
+		case buf[i] == '\\' && i+1 < n && buf[i+1] == 't':
+			i += 2
+		default:
+			return b64Std[buf[i]]
 		}
+	}
+	return false
+}
+
+// pemHeader reports whether an armor header line ("Name: value") starts at i.
+func pemHeader(buf []byte, i, n int) bool {
+	if !isLetter(buf[i]) {
+		return false
+	}
+	for k := i + 1; k < i+42 && k+1 < n; k++ {
 		switch c := buf[k]; {
 		case alnum[c] || c == '-':
 		case c == ':':
-			return buf[k+1] == ' ' || buf[k+1] == '\t', false
+			return buf[k+1] == ' ' || buf[k+1] == '\t'
 		default:
-			return false, false
+			return false
 		}
 	}
-	return false, false
+	return false
+}
+
+var (
+	pemDashes    = []byte("-----")
+	pemEndPrefix = []byte("-----END")
+	pemBeginWord = []byte("-----BEGIN")
+)
+
+// pemEndAt reports whether a private key END marker starts at i.
+func pemEndAt(buf []byte, i, n int) bool {
+	return bytes.HasPrefix(buf[i:n], pemEndPrefix) && pemEnd().Match(buf[i:min(n, i+pemMarkerMax)])
+}
+
+// pemEndAfter returns where a private key END marker starts in buf[from:lim),
+// or -1 when there is none or another block's marker ("-----BEGIN", another
+// kind of END) comes first. Stopping at the next BEGIN keeps the search for all
+// the markers in an input linear.
+func pemEndAfter(buf []byte, from, lim, n int) int {
+	for i := from; i < lim; i++ {
+		k := bytes.Index(buf[i:lim], pemDashes)
+		if k < 0 {
+			return -1
+		}
+		i += k
+		switch {
+		case bytes.HasPrefix(buf[i:n], pemEndPrefix):
+			if pemEndAt(buf, i, n) {
+				return i
+			}
+			return -1
+		case bytes.HasPrefix(buf[i:n], pemBeginWord):
+			return -1
+		}
+	}
+	return -1
+}
+
+// keyRuns returns the key material of buf[me:e), a key between its markers
+// that is interrupted by separators: every base64 run of pemMinRun or more
+// bytes, and after the last of them the key's short last line, the last run of
+// 4 or more bytes holding a digit, an uppercase letter or '+', '/', '='. A
+// backslash escape (\n, \", \\) separates runs. Only the first run is counted;
+// the others are parts of the same secret.
+func keyRuns(buf []byte, pos, me, e int, out []candidate) []candidate {
+	first, last := len(out), me
+	tail := -1
+	var tailEnd int
+	for i := me; i < e; {
+		switch c := buf[i]; {
+		case c == '\\':
+			i += 2
+			continue
+		case !b64Std[c]:
+			i++
+			continue
+		}
+		j := scanSet(buf, i, e, b64Std)
+		switch {
+		case j-i >= pemMinRun:
+			out = push(out, candidate{anchor: pos, start: i, end: j, label: RulePrivateKey, rule: RulePrivateKey, prio: 1, part: len(out) > first})
+			last = j
+		case j-i >= 4 && keyLike(buf[i:j]):
+			tail, tailEnd = i, j
+		}
+		i = j
+	}
+	if len(out) > first && tail >= last {
+		out = push(out, candidate{anchor: pos, start: tail, end: tailEnd, label: RulePrivateKey, rule: RulePrivateKey, prio: 1, part: true})
+	}
+	return out
+}
+
+// keyLike reports whether a short base64 run looks like the end of a key
+// rather than a word: it holds a digit, an uppercase letter or '+', '/', '='.
+func keyLike(b []byte) bool {
+	return hasDigit(b) || hasUpper(b) || bytes.ContainsAny(b, "+/=")
 }
 
 // literalRule redacts exact environment values.
@@ -670,15 +756,15 @@ func newLiteralRule(env []EnvSecret) *literalRule {
 	return &lr
 }
 
-func (l *literalRule) find(buf []byte, from, n int, eof bool, out []candidate) []candidate {
+func (l *literalRule) find(buf []byte, from, to, n int, eof bool, out []candidate) []candidate {
 	for i, v := range l.values {
-		for pos := from; pos < n; {
-			j := bytes.Index(buf[pos:n], v)
+		for pos := from; pos < to; {
+			j := bytes.Index(buf[pos:min(n, to+len(v)-1)], v)
 			if j < 0 {
 				break
 			}
 			s := pos + j
-			out = append(out, candidate{anchor: s, start: s, end: s + len(v), label: l.labels[i], rule: RuleEnv})
+			out = push(out, candidate{anchor: s, start: s, end: s + len(v), label: l.labels[i], rule: RuleEnv})
 			pos = s + len(v)
 		}
 	}
@@ -881,10 +967,10 @@ func (m *runMemo) scan(buf []byte, v, n int, set *byteSet) int {
 	return m.end
 }
 
-func (keyedRule) find(buf []byte, from, n int, eof bool, out []candidate) []candidate {
+func (keyedRule) find(buf []byte, from, to, n int, eof bool, out []candidate) []candidate {
 	memo := &runMemo{}
-	for i := from; i < n; {
-		j := bytes.IndexAny(buf[i:n], ":=-")
+	for i := from; i < to; {
+		j := bytes.IndexAny(buf[i:to], ":=-")
 		if j < 0 {
 			break
 		}
@@ -898,8 +984,10 @@ func (keyedRule) find(buf []byte, from, n int, eof bool, out []candidate) []cand
 			c, ok = assignedValue(buf, at, n, eof, memo)
 		}
 		if ok {
-			out = append(out, c)
-			i = max(i, c.end)
+			out = push(out, c)
+			if c.covers {
+				i = max(i, c.end)
+			}
 		}
 	}
 	return out
@@ -1140,6 +1228,12 @@ func valueAt(buf []byte, anchor, v, n int, eof bool, a assign, memo *runMemo) (c
 		if a.level == 2 && buf[v] == '\\' {
 			return candidate{}, false
 		}
+		// A bare value is one run: a key inside it could only name a value
+		// ending where it does, so find skips it, which keeps runs such as
+		// "token:token:..." linear. A quoted value or block scalar ends at its
+		// own delimiter, and a key inside it is still looked at: its value may
+		// close later.
+		c.covers = true
 		c.start = v
 		c.end = memo.scan(buf, v, n, valueByte)
 		if w := buf[c.start:c.end]; c.end < n && (buf[c.end] == ' ' || buf[c.end] == '\t') && isScheme(w) {
