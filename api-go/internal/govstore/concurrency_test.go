@@ -124,8 +124,10 @@ func helperProposeVerify() error {
 	return nil
 }
 
-// helperKillMidTx commits some entries, then opens a large transaction and blocks
-// inside it until the parent SIGKILLs the process.
+// helperKillMidTx commits some entries, checkpoints so the WAL is empty, then opens a
+// large transaction and blocks inside it until the parent SIGKILLs the process. It
+// reports the WAL size at both points: frames in the WAL at the second point can only
+// be the open transaction's, spilled from the capped page cache.
 func helperKillMidTx() error {
 	ctx := context.Background()
 	s, err := helperStore()
@@ -141,7 +143,10 @@ func helperKillMidTx() error {
 			return err
 		}
 	}
-	fmt.Println("committed 50")
+	if err := s.Checkpoint(ctx); err != nil { // TRUNCATE: every committed frame is in the main file
+		return err
+	}
+	fmt.Printf("committed 50 wal=%d\n", walSize(os.Getenv("GOVSTORE_DB")))
 	big := strings.Repeat("uncommitted payload ", 250) // ~5 KiB per row: spills into the WAL
 	return s.Update(ctx, func(tx Tx) error {
 		for i := range 600 {
@@ -153,7 +158,7 @@ func helperKillMidTx() error {
 				return err
 			}
 		}
-		fmt.Println("in-tx")
+		fmt.Printf("in-tx wal=%d\n", walSize(os.Getenv("GOVSTORE_DB")))
 		time.Sleep(time.Hour) // the parent kills us here
 		return nil
 	})
@@ -187,6 +192,31 @@ func helperCommitStorm() error {
 			fmt.Println("started")
 		}
 	}
+}
+
+// walSize is the size of the database's -wal file, 0 when it does not exist.
+func walSize(dbPath string) int64 {
+	fi, err := os.Stat(dbPath + "-wal")
+	if err != nil {
+		return 0
+	}
+	return fi.Size()
+}
+
+// walField parses the wal=N field of a helper line.
+func walField(t *testing.T, line string) int64 {
+	t.Helper()
+	for _, f := range strings.Fields(line) {
+		if v, ok := strings.CutPrefix(f, "wal="); ok {
+			n, err := strconv.ParseInt(v, 10, 64)
+			if err != nil {
+				t.Fatalf("bad wal field in %q", line)
+			}
+			return n
+		}
+	}
+	t.Fatalf("no wal field in %q", line)
+	return 0
 }
 
 type helper struct {
@@ -355,11 +385,17 @@ func TestKillNineMidTransactionLeavesConsistentDatabase(t *testing.T) {
 	}
 	dbPath := filepath.Join(t.TempDir(), "gov.db")
 	h := startHelper(t, "kill_mid_tx", "GOVSTORE_DB="+dbPath)
-	h.waitFor(t, "committed 50", time.Minute)
-	h.waitFor(t, "in-tx", time.Minute)
-	if fi, err := os.Stat(dbPath + "-wal"); err != nil || fi.Size() == 0 {
-		t.Fatalf("expected uncommitted frames in the WAL before the kill: %v", err)
+	// After the checkpoint the WAL is empty, and nothing commits until the kill, so
+	// every byte in it at "in-tx" is an uncommitted frame spilled from the page cache:
+	// the crash really interrupts a transaction that has already written to the WAL.
+	if before := walField(t, h.waitFor(t, "committed 50", time.Minute)); before != 0 {
+		t.Fatalf("WAL after the checkpoint = %d bytes, want 0", before)
 	}
+	inTx := walField(t, h.waitFor(t, "in-tx", time.Minute))
+	if onDisk := walSize(dbPath); inTx < 1<<20 || onDisk < inTx {
+		t.Fatalf("uncommitted frames in the WAL before the kill: %d bytes reported, %d on disk; want at least 1 MiB", inTx, onDisk)
+	}
+	t.Logf("uncommitted WAL frames at the kill: %d bytes", inTx)
 	h.kill9(t)
 
 	s := assertConsistent(t, dbPath)
