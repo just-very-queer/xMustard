@@ -1,4 +1,4 @@
-package main
+package mcpserver
 
 import (
 	"errors"
@@ -29,7 +29,7 @@ func TestToolDescriptionsStateImplementationLimits(t *testing.T) {
 		"recall": {"conflicts", "path overlap, not contradiction", "non-matches dropped", "working-tree overlap"},
 	}
 	for name, phrases := range want {
-		tl, ok := toolByName(name)
+		tl, ok := ToolByName(name)
 		if !ok {
 			t.Fatalf("tool %q missing", name)
 		}
@@ -46,7 +46,7 @@ func TestToolDescriptionsStateImplementationLimits(t *testing.T) {
 		"recall": {"recency top-n"},
 	}
 	for name, phrases := range stale {
-		tl, _ := toolByName(name)
+		tl, _ := ToolByName(name)
 		for _, p := range phrases {
 			if strings.Contains(strings.ToLower(tl.Description), p) {
 				t.Errorf("%s description still claims %q: %q", name, p, tl.Description)
@@ -57,7 +57,7 @@ func TestToolDescriptionsStateImplementationLimits(t *testing.T) {
 
 func TestToolDescriptionsStayWithinBudget(t *testing.T) {
 	total := 0
-	for _, tl := range tools() {
+	for _, tl := range Tools() {
 		total += len(tl.Description)
 	}
 	if total > toolDescriptionBudget {
@@ -65,7 +65,7 @@ func TestToolDescriptionsStayWithinBudget(t *testing.T) {
 	}
 }
 
-// The Pi extension mirrors tools() verbatim; its live e2e diff only runs in the
+// The Pi extension mirrors Tools() verbatim; its live e2e diff only runs in the
 // harness, so catch a description edited on one side here.
 func TestPiMirrorCarriesGoDescriptions(t *testing.T) {
 	src, err := os.ReadFile(filepath.Join("..", "..", "..", "integrations", "pi", "src", "tools.ts"))
@@ -75,7 +75,7 @@ func TestPiMirrorCarriesGoDescriptions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, tl := range tools() {
+	for _, tl := range Tools() {
 		if !strings.Contains(string(src), `"`+tl.Description+`"`) {
 			t.Errorf("integrations/pi/src/tools.ts does not carry the %s description verbatim", tl.Name)
 		}

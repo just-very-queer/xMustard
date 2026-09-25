@@ -1,0 +1,47 @@
+{
+  "arguments": {},
+  "result": {
+    "changed_files": [
+      {
+        "change": "added",
+        "path": "go.mod"
+      },
+      {
+        "change": "added",
+        "path": "main.go"
+      },
+      {
+        "change": "added",
+        "path": "pkg/calc/calc.go"
+      }
+    ],
+    "contract_breaks": 0,
+    "dirty_symbols": [
+      {
+        "change": "added",
+        "contract_break": false,
+        "kind": "function",
+        "path": "main.go",
+        "symbol": "main"
+      },
+      {
+        "change": "added",
+        "contract_break": false,
+        "kind": "function",
+        "path": "pkg/calc/calc.go",
+        "symbol": "Add"
+      },
+      {
+        "change": "added",
+        "contract_break": false,
+        "kind": "function",
+        "path": "pkg/calc/calc.go",
+        "symbol": "Double"
+      }
+    ],
+    "generated_at": "2026-09-25T08:23:38Z",
+    "since": "baseline",
+    "workspace_id": "fixture-4aa33b094a"
+  },
+  "tool": "impact"
+}

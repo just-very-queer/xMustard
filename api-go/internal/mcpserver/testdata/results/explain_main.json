@@ -1,0 +1,38 @@
+{
+  "arguments": {
+    "path": "main.go"
+  },
+  "result": {
+    "cluster": {
+      "cluster_id": 0,
+      "files": [
+        "main.go",
+        "pkg/calc/calc.go"
+      ],
+      "label": "main.go",
+      "size": 2
+    },
+    "explanation": {
+      "detected_symbols": [
+        "main"
+      ],
+      "evidence_source": "rust_semantic_core",
+      "generated_at": "2026-09-25T08:23:35.106420+00:00",
+      "hints": [
+        "Rust semantic core owns this path explanation contract; Go delivery only forwards it.",
+        "Use detected symbols as the first review anchors for this file."
+      ],
+      "import_count": 1,
+      "line_count": 9,
+      "parser_language": "go",
+      "path": "main.go",
+      "role": "source",
+      "selection_reason": "Rust semantic core owns code-explainer semantic substrate for this path.",
+      "summary": "main.go is a source file with 9 line(s) and 1 import/reference line(s). Rust semantic core detected symbols: main.",
+      "symbol_source": "tree_sitter",
+      "warnings": [],
+      "workspace_id": "fixture-4aa33b094a"
+    }
+  },
+  "tool": "explain"
+}

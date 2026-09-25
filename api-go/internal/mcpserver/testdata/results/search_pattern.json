@@ -1,0 +1,31 @@
+{
+  "arguments": {
+    "lang": "go",
+    "mode": "pattern",
+    "q": "Add($A, $B)"
+  },
+  "result": {
+    "engine": "none",
+    "error": "ast-grep binary is not installed on this machine.",
+    "generated_at": "2026-09-25T08:23:33.071117Z",
+    "language": "go",
+    "match_count": 0,
+    "match_rows": [],
+    "matches": [],
+    "pattern": "Add($A, $B)",
+    "query_row": {
+      "engine": "none",
+      "error": "ast-grep binary is not installed on this machine.",
+      "language": "go",
+      "match_count": 0,
+      "pattern": "Add($A, $B)",
+      "query_ref": "semanticq_a9d0e059e9c33ce6",
+      "source": "adhoc_tool",
+      "truncated": false,
+      "workspace_id": "fixture-4aa33b094a"
+    },
+    "truncated": false,
+    "workspace_id": "fixture-4aa33b094a"
+  },
+  "tool": "search"
+}

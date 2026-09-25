@@ -1,0 +1,17 @@
+{
+  "arguments": {
+    "from": "Double",
+    "to": "Add"
+  },
+  "result": {
+    "found": true,
+    "from": "Double",
+    "generated_at": "2026-09-25T08:23:37Z",
+    "length": 0,
+    "path": [
+      "pkg/calc/calc.go"
+    ],
+    "to": "Add"
+  },
+  "tool": "impact"
+}

@@ -1,0 +1,22 @@
+{
+  "arguments": {
+    "max_depth": 3,
+    "symbol": "Add"
+  },
+  "result": {
+    "defined_in": [
+      "pkg/calc/calc.go"
+    ],
+    "generated_at": "2026-09-25T08:23:36Z",
+    "impacted": [
+      {
+        "distance": 1,
+        "path": "main.go"
+      }
+    ],
+    "impacted_count": 1,
+    "max_depth": 3,
+    "symbol": "Add"
+  },
+  "tool": "impact"
+}

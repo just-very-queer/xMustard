@@ -1,0 +1,67 @@
+{
+  "arguments": {
+    "limit": 10,
+    "q": "Double"
+  },
+  "result": {
+    "coverage": {
+      "complete": true,
+      "eligible_files": 2,
+      "extraction": {
+        "tree_sitter": 2
+      },
+      "indexed_files": 2,
+      "loss_counts": {},
+      "losses": [],
+      "losses_truncated": false,
+      "max_files": 800,
+      "repo_mode": "git",
+      "selected_files": 2,
+      "source_identity": {
+        "head": "452da1e09e2c230b829c1d824bd82f83fa187dec",
+        "identity_complete": true,
+        "key": "a156582ef7dd69692cf8bae19d43cd2ba01007676dce6106b1c1f3a1db27afe4",
+        "limitations": 0,
+        "parser_version": "xm-index-2;ts-abi-15;rust-0.24;go-0.25;typescript-0.23;javascript-0.25;regex-2",
+        "stable": true
+      },
+      "symbols_truncated_files": 0,
+      "truncated": false,
+      "work": {
+        "bytes_parsed": 0,
+        "bytes_read": 0,
+        "coverage_losses": 0,
+        "elapsed_ms": 435,
+        "files_parsed": 0,
+        "files_read": 0,
+        "files_reused": 0,
+        "graph_cache": "hit",
+        "identity_bytes_hashed": 184,
+        "identity_files_hashed": 1,
+        "identity_passes": 1,
+        "lock": "not_used",
+        "lock_contended": false,
+        "lock_wait_ms": 0,
+        "stale_temps_removed": 0,
+        "symbols_extracted": 0,
+        "symbols_indexed": 3
+      },
+      "worktree_deleted_files": 0
+    },
+    "generated_at": "2026-09-25T08:23:32Z",
+    "hits": [
+      {
+        "kind": "symbol",
+        "line": 7,
+        "name": "Double",
+        "path": "pkg/calc/calc.go",
+        "reason": "exact symbol match \u00b7 feedback",
+        "score": 1.1417331496161323
+      }
+    ],
+    "query": "Double",
+    "total": 1,
+    "workspace_id": "fixture-4aa33b094a"
+  },
+  "tool": "search"
+}
