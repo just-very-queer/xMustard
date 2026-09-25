@@ -21,7 +21,10 @@ import (
 //     the tree is over the soft ceiling (budget.PressureOverSoftCeiling). An idle
 //     worker is retired at once and the governor waits for its exit; a busy one is
 //     marked and retired when its last call finishes, so no second worker starts
-//     beside it while memory is short;
+//     beside it while memory is short. Going idle is itself a sampling point
+//     (checkPressureAtIdle), so query traffic cannot keep the tree over the soft
+//     ceiling between heavy work and health polls; the governor asks at most once per
+//     pressure interval;
 //   - it goes idle above the runaway line (reasonRunaway);
 //   - it has been idle for its trim period while the governor's level is tight or over
 //     (reasonIdleTight), or while it is still above its reserved peak
@@ -163,16 +166,30 @@ func (s *workerSupervisor) checkRunaway(p *workerProc) {
 	}
 }
 
+// checkPressureAtIdle has the governor sample the tree, off the caller's path, when the
+// worker goes idle: over the soft ceiling it asks for the worker's memory (reclaim-
+// CoreWorker). One check runs at a time, and the governor reuses a sample younger
+// than its health cache, so a burst of calls costs at most a few tree walks a second.
+func (s *workerSupervisor) checkPressureAtIdle(g *budget.Governor) {
+	if !s.pressureCheck.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer s.pressureCheck.Store(false)
+		g.CheckPressure()
+	}()
+}
+
 // armIdlePressureCheck schedules the idle check at p's trim period (while its idle exit
-// is later). The caller holds s.mu.
-func (s *workerSupervisor) armIdlePressureCheck(p *workerProc) {
+// is later), against governor g. The caller holds s.mu.
+func (s *workerSupervisor) armIdlePressureCheck(p *workerProc, g *budget.Governor) {
 	if p.trimAfter <= 0 || (p.idleAfter > 0 && p.trimAfter >= p.idleAfter) {
 		return
 	}
 	if p.pressureTimer != nil {
 		p.pressureTimer.Stop()
 	}
-	p.pressureTimer = time.AfterFunc(p.trimAfter, func() { s.idlePressureCheck(p) })
+	p.pressureTimer = time.AfterFunc(p.trimAfter, func() { s.idlePressureCheck(p, g) })
 }
 
 // idlePressureCheck recycles p when it has been idle for its trim period and the
@@ -180,14 +197,14 @@ func (s *workerSupervisor) armIdlePressureCheck(p *workerProc) {
 // has dropped its snapshots by then, but the allocator kept most of the memory; only
 // an exit returns it. Otherwise the check repeats every trim period until the idle
 // exit.
-func (s *workerSupervisor) idlePressureCheck(p *workerProc) {
+func (s *workerSupervisor) idlePressureCheck(p *workerProc, g *budget.Governor) {
 	s.mu.Lock()
 	idle := s.proc == p && p.active == 0 && time.Since(p.lastUsed) >= p.trimAfter
 	s.mu.Unlock()
 	if !idle {
 		return
 	}
-	switch budget.Gov.Level() {
+	switch g.Level() {
 	case budget.LevelTight, budget.LevelOver:
 		s.recycleIdle(p, reasonIdleTight)
 		return
@@ -198,7 +215,7 @@ func (s *workerSupervisor) idlePressureCheck(p *workerProc) {
 	}
 	s.mu.Lock()
 	if s.proc == p && p.active == 0 {
-		s.armIdlePressureCheck(p)
+		s.armIdlePressureCheck(p, g)
 	}
 	s.mu.Unlock()
 }

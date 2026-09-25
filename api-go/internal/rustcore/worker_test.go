@@ -217,6 +217,9 @@ func useFakeWorker(t *testing.T, mode string) string {
 	prevPeak, prevRunaway := workerPeakLine, workerRunawayLine
 	workerPeakLine, workerRunawayLine = 1<<40, 1<<40
 	t.Cleanup(func() { workerPeakLine, workerRunawayLine = prevPeak, prevRunaway })
+	// Nor does the tree's: the worker samples it when it goes idle, and this test
+	// binary's memory must not recycle the fake. Tests of the policy swap in their own.
+	quietGovernor(t, budget.GovernorConfig{})
 	resetWorker()
 	t.Cleanup(resetWorker)
 	return logPath
@@ -876,6 +879,9 @@ func realCore(t *testing.T) string {
 		// answers "unknown command: serve".
 		out, _ := exec.Command(bin, "serve", "--bogus=1").CombinedOutput()
 		if strings.HasPrefix(string(out), "usage: xmustard-core serve") {
+			// The worker samples the tree when it goes idle, and this test binary's
+			// memory (with other tests' fixtures) must not recycle it.
+			quietGovernor(t, budget.GovernorConfig{})
 			return bin
 		}
 	}

@@ -274,6 +274,46 @@ func TestSampleOverTheSoftCeilingRecyclesTheWorker(t *testing.T) {
 	}
 }
 
+// Going idle is a sampling point: with the tree over the soft ceiling, the worker is
+// recycled after its call without any health poll or heavy work, and only once per
+// pressure interval however many calls go idle.
+func TestWorkerGoingIdleOverTheSoftCeilingIsRecycled(t *testing.T) {
+	logPath := useFakeWorker(t, "ok")
+	tree := newWorkerTree(20<<20, 90<<20)
+	g := quietGovernor(t, budget.GovernorConfig{SoftCeilingBytes: 100 << 20, Sampler: tree.sample, PressureInterval: time.Hour})
+	// the worker's pid is known once it has started; track it from the fake's log
+	go func() {
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			if starts := fakeLog(t, logPath, "serve "); len(starts) > 0 {
+				pid, _ := strconv.Atoi(strings.TrimPrefix(starts[0], "serve "))
+				tree.track(pid)
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}()
+	out, err := runCoreCtx(context.Background(), "sleep", "300") // long enough to be tracked
+	if err != nil || string(out) != `"slept"` {
+		t.Fatalf("call: %s %v", out, err)
+	}
+	first, _ := strconv.Atoi(strings.TrimPrefix(fakeLog(t, logPath, "serve ")[0], "serve "))
+	waitFor(t, "the idle worker over the soft ceiling to be recycled", 3*time.Second, func() bool { return processGone(first) })
+	if n := CoreWorkerStats().Recycles[budget.PressureOverSoftCeiling]; n != 1 {
+		t.Fatalf("recycles: %v", CoreWorkerStats().Recycles)
+	}
+	for i := 0; i < 3; i++ {
+		mustEcho(t, "again")
+	}
+	time.Sleep(300 * time.Millisecond)
+	if rc := g.Snapshot().Reclaim; rc.Requests[budget.PressureOverSoftCeiling] != 1 {
+		t.Fatalf("the governor must ask at most once per interval: %+v", rc)
+	}
+	if n := len(fakeLog(t, logPath, "serve ")); n != 2 {
+		t.Fatalf("starts: %d", n)
+	}
+}
+
 // A worker above the runaway line is recycled as soon as it goes idle; one within it
 // stays.
 func TestRunawayWorkerIsRecycledWhenIdle(t *testing.T) {

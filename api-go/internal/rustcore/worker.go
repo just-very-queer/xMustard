@@ -238,6 +238,8 @@ type workerSupervisor struct {
 	// a reclaim request can wait for its exit (worker_governor.go).
 	recycles     map[string]int64
 	lastRecycled *workerProc
+	// pressureCheck is set while an idle-time pressure check runs.
+	pressureCheck atomic.Bool
 }
 
 // coreWorker is the process-wide resident worker supervisor.
@@ -433,8 +435,10 @@ func (s *workerSupervisor) acquire(ctx context.Context, key workerKey, set worke
 // release ends a caller's use of p. ok reports a completed call, which clears the
 // crash backoff. When p goes idle it is retired if the governor asked for its memory
 // while it was busy, or if it is above the runaway line; otherwise its idle exit and
-// idle pressure check are armed (worker_governor.go).
+// idle pressure check are armed, and the governor samples the tree
+// (worker_governor.go).
 func (s *workerSupervisor) release(p *workerProc, ok bool) {
+	gov := budget.Gov // read on the caller's goroutine; the timers and checks keep it
 	s.mu.Lock()
 	p.active--
 	p.lastUsed = time.Now()
@@ -455,7 +459,7 @@ func (s *workerSupervisor) release(p *workerProc, ok bool) {
 		p.idleTimer = time.AfterFunc(p.idleAfter, func() { s.idleCheck(p) })
 	}
 	if idle {
-		s.armIdlePressureCheck(p)
+		s.armIdlePressureCheck(p, gov)
 	}
 	s.mu.Unlock()
 	if reason != "" {
@@ -467,6 +471,7 @@ func (s *workerSupervisor) release(p *workerProc, ok bool) {
 	}
 	if idle {
 		s.checkRunaway(p)
+		s.checkPressureAtIdle(gov)
 	}
 }
 

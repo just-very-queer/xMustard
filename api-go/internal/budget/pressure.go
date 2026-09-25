@@ -17,7 +17,8 @@ import (
 //     tree once more before refusing. A hook or capture path (WithoutHeavyWait) never
 //     waits for this: the components are asked, and the path is refused at once.
 //   - Over the soft ceiling. A sample over the soft ceiling asks every reclaimable
-//     component, at most once per PressureInterval.
+//     component, at most once per PressureInterval. Samples come from heavy work (every
+//     WatchInterval), health polls and CheckPressure.
 //
 // Components apply their own idle policy through Level. The worker gives its memory back
 // when it goes idle above its runaway line, or when it has been idle for its trim
@@ -101,6 +102,13 @@ func (g *Governor) levelOf(treeBytes int64) string {
 	}
 	return LevelNormal
 }
+
+// CheckPressure samples the tree unless a sample younger than the health cache exists.
+// A sample over the soft ceiling asks the reclaimable components for memory, at most
+// once per PressureInterval. Components call it at their own quiet moments (the Rust
+// worker when it goes idle), so the soft ceiling is enforced between heavy work and
+// health polls too.
+func (g *Governor) CheckPressure() { _, _ = g.cachedSample(healthSampleMaxAge) }
 
 // Level measures the tree (reusing a sample younger than the health cache) and
 // classifies it.

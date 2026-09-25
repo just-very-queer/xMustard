@@ -283,3 +283,27 @@ func TestRegisterProcessComponent(t *testing.T) {
 		}
 	}
 }
+
+// CheckPressure samples unless a recent sample exists, and a sample over the soft
+// ceiling asks for memory.
+func TestCheckPressureSamplesOnDemand(t *testing.T) {
+	f := newGov(t, GovernorConfig{SoftCeilingBytes: 100 << 20})
+	r := &reclaimable{reasons: make(chan string, 4)}
+	f.g.Reserve(r.component("svc", 0))
+	f.tree.rss.Store(110 << 20)
+	before := f.tree.calls.Load()
+	for i := 0; i < 5; i++ {
+		f.g.CheckPressure()
+	}
+	if n := f.tree.calls.Load() - before; n != 1 {
+		t.Fatalf("five checks inside the health cache took %d samples, want 1", n)
+	}
+	select {
+	case reason := <-r.reasons:
+		if reason != PressureOverSoftCeiling {
+			t.Fatalf("reason %q", reason)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("a check over the soft ceiling must ask for memory")
+	}
+}
