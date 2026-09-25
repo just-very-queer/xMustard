@@ -6,7 +6,8 @@ driver: claude                  # claude | codex | pi | fake:<driver> (dry run)
 model: claude-sonnet-4-5        # one fixed model for every run (required for real drivers)
 arms: [baseline, baseline_nomcp, xmustard_mcp, xmustard_mcp_hooks, xmustard_memory]
 reference_arm: baseline_nomcp   # paired comparisons are against this arm
-repeats: 3                      # repetitions per task and arm, paired by index
+repeats: 3                      # repetitions per task and arm; odd, since a task counts as solved by strict majority
+exclude_client_errors: false    # true pre-registers leaving client failures (not timeouts) out of the pairs
 seed: 20260925                  # arm order per task and the bootstrap
 containment: auto               # auto | sandbox-exec | bwrap | none
 
