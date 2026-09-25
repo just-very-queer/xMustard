@@ -5,7 +5,9 @@
 #   scripts/bench/rss_v2.sh run --suite ci|parity [--out DIR] [--repeat N]
 #   scripts/bench/rss_v2.sh run --scenarios v1-workload --workstream WS-NN --baseline base/report.json
 #   scripts/bench/rss_v2.sh fixtures            # clone + verify the pinned parity fixtures
-#   scripts/bench/rss_v2.sh ledger              # reconcile the budget ledger
+#   scripts/bench/rss_v2.sh ledger              # reconcile the budget ledger (exit 1 while overcommitted)
+#   scripts/bench/rss_v2.sh ledger --diff BASE_LEDGER   # governance-relevant ledger changes (exit 1 if any)
+#   scripts/bench/rss_v2.sh ci-plan --branch REF        # workstream, scenarios and fixture need for CI
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 exec python3 scripts/bench/rss_bench_v2.py "$@"
