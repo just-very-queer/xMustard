@@ -15,6 +15,7 @@ import (
 	"testing"
 
 	"xmustard/api-go/internal/budget"
+	"xmustard/api-go/internal/workspaceops"
 )
 
 // fakeAPI is an in-memory Backend: it records every request, serves the workspace
@@ -827,6 +828,37 @@ func TestOutputSchemasMatchRecordedResults(t *testing.T) {
 	for _, name := range []string{"ground", "recall", "remember", "verify", "search", "explain", "impact"} {
 		if !covered[name] {
 			t.Errorf("no recorded result for %s", name)
+		}
+	}
+}
+
+// ground reports a count or flag it cannot determine as null (listed under
+// "unknown"), and the portable schema subset has no null type, so outputSchema
+// declares only ground members that can never be null: a client that validates
+// structuredContent must never see a null where a type was promised.
+func TestGroundOutputSchemaDeclaresNoNullableMember(t *testing.T) {
+	tl, _ := ToolByName("ground")
+	fields := map[string]reflect.Kind{}
+	var collect func(rt reflect.Type)
+	collect = func(rt reflect.Type) {
+		for i := 0; i < rt.NumField(); i++ {
+			f := rt.Field(i)
+			if f.Anonymous && f.Type.Kind() == reflect.Struct {
+				collect(f.Type)
+				continue
+			}
+			if name, _, _ := strings.Cut(f.Tag.Get("json"), ","); name != "" && name != "-" {
+				fields[name] = f.Type.Kind()
+			}
+		}
+	}
+	collect(reflect.TypeOf(workspaceops.SessionGrounding{}))
+	for name := range tl.Output {
+		switch kind, ok := fields[name]; {
+		case !ok:
+			t.Errorf("ground outputSchema declares %s, which SessionGrounding does not have", name)
+		case kind == reflect.Pointer || kind == reflect.Slice || kind == reflect.Map || kind == reflect.Interface:
+			t.Errorf("ground.%s can be null but outputSchema declares it %s", name, tl.Output[name])
 		}
 	}
 }

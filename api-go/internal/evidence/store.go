@@ -142,17 +142,21 @@ type CaptureRequest struct {
 	ContentType  string
 	// BeforeKey is the identity sampled before the tool executed (nil when unknown).
 	BeforeKey *Identity
-	// RepoKey returns the repository identity at capture time.
+	// RepoKey returns the repository identity at capture time. It is asked only when
+	// BeforeKey is complete, because only then can the two bind.
 	RepoKey func(ctx context.Context) Identity
 }
 
 // Identity is a repository identity observation (Rust `repo-key` contract: key plus
 // whether it covers the complete working state). An incomplete or failed identity can
-// never make evidence look current.
+// never make evidence look current. Cached and AgeMs say whether it was served from
+// the identity cache and how long ago it was sampled.
 type Identity struct {
 	Key         string   `json:"key"`
 	Complete    bool     `json:"identity_complete"`
 	Limitations []string `json:"limitations,omitempty"`
+	Cached      bool     `json:"cached,omitempty"`
+	AgeMs       int64    `json:"age_ms,omitempty"`
 }
 
 // Delivery is what travels in the tool result: the projection and how to recover the rest.
@@ -204,6 +208,11 @@ type Page struct {
 	Freshness string `json:"freshness"`
 	Stale     bool   `json:"stale"`
 	ExpiresAt string `json:"expires_at"`
+	// CurrentKeyCached / CurrentKeyAgeMs: the current identity came from the identity
+	// cache (no repo-key run for this page) and was sampled that long ago. A capture
+	// whose identity is not bound never needs the current identity, so none is read.
+	CurrentKeyCached bool  `json:"current_key_cached"`
+	CurrentKeyAgeMs  int64 `json:"current_key_age_ms"`
 }
 
 // ReadRequest asks for one page.
@@ -459,12 +468,15 @@ func (s *Store) Capture(ctx context.Context, sp *Spool, req CaptureRequest) (*De
 		Projection: rec,
 	}
 	// identity is bound only when complete identities sampled before and after
-	// execution agree; otherwise freshness of this evidence is unknown forever.
-	if req.RepoKey != nil {
+	// execution agree; otherwise freshness of this evidence is unknown forever. An
+	// incomplete or missing before-identity can never bind, so the after-identity is
+	// not sampled for it.
+	if b := req.BeforeKey; b != nil && b.Complete && b.Key != "" && req.RepoKey != nil {
 		after := req.RepoKey(ctx)
 		obs.CapturedKey = after.Key
-		b := req.BeforeKey
-		obs.CapturedKeyOK = b != nil && b.Complete && after.Complete && after.Key != "" && b.Key == after.Key
+		obs.CapturedKeyOK = after.Complete && after.Key != "" && b.Key == after.Key
+	} else if b != nil {
+		obs.CapturedKey = b.Key
 	}
 	d.CapturedIdentity = "unknown"
 	if obs.CapturedKeyOK {
@@ -550,10 +562,10 @@ func (s *Store) Read(ctx context.Context, req ReadRequest) (*Page, error) {
 		CapturedKey: obs.CapturedKey, ExpiresAt: obs.ExpiresAt}
 	p.EOF = p.NextOffset >= obs.RawBytes
 	var cur Identity
-	if req.RepoKey != nil {
+	if obs.CapturedKeyOK && req.RepoKey != nil {
 		cur = req.RepoKey(ctx)
 	}
-	p.CurrentKey = cur.Key
+	p.CurrentKey, p.CurrentKeyCached, p.CurrentKeyAgeMs = cur.Key, cur.Cached, cur.AgeMs
 	switch {
 	case !obs.CapturedKeyOK || !cur.Complete || cur.Key == "":
 		p.Freshness = "unknown"
