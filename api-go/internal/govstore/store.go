@@ -130,6 +130,9 @@ type Options struct {
 	// QuickCheckOnOpen runs PRAGMA quick_check before Open returns. It reads the whole
 	// file, so it is off by default; the daemon lifecycle decides when to call
 	// QuickCheck instead (for example in the background after start, or in doctor).
+	// The check runs on a short-lived connection with its own small page cache
+	// (quickCheckCacheKiB), closed before Open returns, so what it adds to the
+	// resident set is bounded by that cache and the code it touches, not by the file.
 	QuickCheckOnOpen bool
 	// Now overrides the clock, for tests.
 	Now func() time.Time
@@ -310,7 +313,7 @@ func Open(ctx context.Context, path string, opts Options) (*SQLStore, error) {
 		return nil, fmt.Errorf("govstore: migrate %s: %w", path, err)
 	}
 	if opts.QuickCheckOnOpen {
-		if err := retryBusy(ctx, opts.BusyTimeout, func() error { return quickCheck(ctx, writer) }); err != nil {
+		if err := retryBusy(ctx, opts.BusyTimeout, func() error { return quickCheckFile(ctx, path, opts) }); err != nil {
 			_ = writer.Close()
 			return nil, fmt.Errorf("govstore: check %s: %w", path, err)
 		}
@@ -388,6 +391,23 @@ func retryBusy(ctx context.Context, timeout time.Duration, fn func() error) erro
 		}
 		wait = min(wait*2, 100*time.Millisecond)
 	}
+}
+
+// quickCheckCacheKiB caps the page cache of the open-time quick_check connection.
+const quickCheckCacheKiB = 256
+
+// quickCheckFile runs quick_check on a dedicated read-only connection that is closed
+// afterwards, so the check's page cache is small and released.
+func quickCheckFile(ctx context.Context, path string, o Options) error {
+	db, err := sql.Open("sqlite", path+"?_busy_timeout="+strconv.FormatInt(o.BusyTimeout.Milliseconds(), 10)+
+		"&_pragma=query_only(1)&_pragma=mmap_size(0)&_pragma=temp_store(FILE)&_pragma=cache_size(-"+
+		strconv.Itoa(quickCheckCacheKiB)+")")
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	return quickCheck(ctx, db)
 }
 
 func quickCheck(ctx context.Context, db *sql.DB) error {
@@ -491,14 +511,28 @@ func (s *SQLStore) View(ctx context.Context, fn func(Reader) error) error {
 }
 
 // Backup writes a consistent, compacted copy of the database to dest. dest must not
-// exist. It runs on a dedicated connection so writers are never blocked.
-func (s *SQLStore) Backup(ctx context.Context, dest string) error {
+// exist. It runs on a dedicated connection so writers are never blocked. The copy holds
+// all governance text, so it is created 0600 like the store; a backup taken before a
+// purge still holds the purged text.
+func (s *SQLStore) Backup(ctx context.Context, dest string) (err error) {
 	if s.closed.Load() {
 		return ErrClosed
 	}
-	if _, err := os.Stat(dest); err == nil {
-		return fmt.Errorf("%w: backup destination %s exists", ErrInvalid, dest)
+	// Create dest first, exclusively and private: this refuses an existing file without
+	// a stat-then-create race, and VACUUM INTO accepts an empty existing file.
+	f, err := os.OpenFile(dest, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return fmt.Errorf("%w: backup destination %s exists", ErrInvalid, dest)
+		}
+		return err
 	}
+	_ = f.Close()
+	defer func() {
+		if err != nil {
+			_ = os.Remove(dest)
+		}
+	}()
 	db, err := sql.Open("sqlite", s.path+"?_pragma=busy_timeout("+
 		strconv.FormatInt(s.opts.BusyTimeout.Milliseconds(), 10)+")&_pragma=mmap_size(0)&_pragma=cache_size(-"+
 		strconv.Itoa(s.opts.ReaderCacheKiB)+")")
@@ -510,6 +544,29 @@ func (s *SQLStore) Backup(ctx context.Context, dest string) error {
 	if _, err := db.ExecContext(ctx, "VACUUM INTO ?", dest); err != nil {
 		return mapErr(err)
 	}
+	return syncFileAndDir(dest)
+}
+
+// syncFileAndDir makes a finished file and its directory entry durable.
+func syncFileAndDir(path string) error {
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	d, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	// Some file systems cannot sync a directory; the file itself is already durable.
+	_ = d.Sync()
 	return nil
 }
 

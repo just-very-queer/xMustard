@@ -1567,8 +1567,18 @@ func TestBackupQuickCheckAndClose(t *testing.T) {
 	if err := s.Backup(ctx, dest); err != nil {
 		t.Fatal(err)
 	}
+	// The copy holds all governance text: it is as private as the store.
+	if fi, err := os.Stat(dest); err != nil || fi.Mode().Perm() != 0o600 {
+		t.Fatalf("backup mode = %v (%v), want 0600", fi.Mode().Perm(), err)
+	}
 	if err := s.Backup(ctx, dest); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("backup over an existing file: %v", err)
+	}
+	if fi, err := os.Stat(dest); err != nil || fi.Size() == 0 {
+		t.Fatalf("a refused backup removed the existing file: %v", err)
+	}
+	if err := s.Backup(ctx, filepath.Join(t.TempDir(), "missing-dir", "b.db")); err == nil {
+		t.Fatal("backup into a missing directory succeeded")
 	}
 	b, err := Open(ctx, dest, Options{})
 	if err != nil {
