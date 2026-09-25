@@ -794,10 +794,20 @@ func familyHeader(rules *lineRules, f *Facts) string {
 
 var progressLine = regexp.MustCompile(`(?i)^\s*(\[?\s*\d{1,3}(\.\d+)?%\]?|[#=>\-.\s]{0,4}\[[#=>\-\s.]+\]|downloading|downloaded|fetching|fetched|resolving|resolved|compiling|compiled|checking|building|installing|installed|unpacking|extracting|collecting|uploading|progress|receiving objects|resolving deltas|counting objects|compressing objects|writing objects|remote: (counting|compressing|enumerating|total))\b`)
 
+// progress reports a progress/noise line that carries no failure evidence: only
+// those collapse (a "Checking ... error" line is never hidden as progress).
+func (st *lineState) progress(line []byte) bool {
+	if !progressLine.Match(line) {
+		return false
+	}
+	ok, err := st.salient(line)
+	return err == nil && !ok
+}
+
 var shellRules = &lineRules{
 	family: FamilyShell, id: "xm-shell", version: 1,
 	classify: func(st *lineState, line []byte) lineClass {
-		if progressLine.Match(line) {
+		if st.progress(line) {
 			return lcCollapse
 		}
 		return lcPlain
@@ -822,7 +832,7 @@ var buildRules = &lineRules{
 			return lcPlain
 		case buildSummary.Match(line):
 			return lcSummary
-		case progressLine.Match(line):
+		case st.progress(line):
 			return lcCollapse
 		}
 		return lcPlain
@@ -865,7 +875,7 @@ var gitRules = &lineRules{
 		case bytes.HasPrefix(line, []byte("On branch ")) || bytes.HasPrefix(line, []byte("Your branch ")) ||
 			bytes.HasPrefix(line, []byte("HEAD detached")) || bytes.HasPrefix(line, []byte("nothing to commit")):
 			return lcSummary
-		case progressLine.Match(line):
+		case st.progress(line):
 			return lcCollapse
 		}
 		return lcPlain

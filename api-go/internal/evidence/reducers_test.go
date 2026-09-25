@@ -168,6 +168,20 @@ func TestShellCollapsesProgressAndRepeats(t *testing.T) {
 	}
 }
 
+// A progress-looking line that carries failure evidence is never collapsed.
+func TestProgressLinesWithFailuresAreKept(t *testing.T) {
+	var b bytes.Buffer
+	for i := 0; i < 3000; i++ {
+		fmt.Fprintf(&b, "Downloading dependency %d\n", i)
+	}
+	b.WriteString("Checking signatures: error: signature mismatch for dep 1234\n")
+	for i := 0; i < 3000; i++ {
+		fmt.Fprintf(&b, "Compiling unit %d\n", i)
+	}
+	p, _ := reduceWith(t, b.Bytes(), Selector{Tool: "Bash", Command: "./build.sh"}, 4<<10)
+	mustContain(t, p.Text, "Checking signatures: error: signature mismatch for dep 1234", "failure_lines=1")
+}
+
 func TestGrepProjectionCapsPerFileAndReportsTotals(t *testing.T) {
 	raw := grepOutput(30, 4) // file 3 has 80 matches, the others 4
 	p, rec := reduceWith(t, raw, Selector{Client: "claude", Tool: "Bash", Command: "rg -n needle src"}, 8<<10)

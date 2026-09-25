@@ -37,8 +37,8 @@ for Git repositories. The default Rust build does not enable `semantic-onnx`.
 | --- | --- | --- |
 | MCP protocol and tool schemas | `api-go/cmd/xmustard-mcp/` | Nine tools; strict arguments; HTTP proxy; bounded framing |
 | HTTP, authentication, request limits | `api-go/cmd/xmustard-api/` | Go request routing and policy; core-only route allowlist |
-| Scoped evidence delivery | `api-go/internal/evidence/`, API/MCP evidence routes | Admission, stable opaque scoped handles, byte-safe original pages, projection and expiry; enforced byte admission is not an RSS ceiling |
-| Pi client adapter | `integrations/pi/` | Pinned extension uses the shared Go evidence path; nine existing tools plus `xmustard_expand` only when a handle is issued |
+| Scoped evidence delivery | `api-go/internal/evidence/`, API/MCP evidence routes | Admission, stable opaque scoped handles, byte-safe original pages and search, projection and expiry. The nine tools use `xm-reduce/1`; any tool's output captured through `POST .../evidence/capture` (raw or a Claude, Codex, Cursor, Pi or OpenCode hook body, stream-decoded) is reduced by a versioned tool-family reducer (`registry.go`) and shaped and validated per client (`shapes.go`); enforced byte admission is not an RSS ceiling |
+| Pi client adapter | `integrations/pi/` | Pinned extension uses the shared Go evidence path; nine existing tools plus `xmustard_expand` (pages or search) only when a handle is issued |
 | Local operator commands | `api-go/cmd/xmustard-ops/` | Calls stores directly; local filesystem authority, not HTTP-token isolation |
 | Memory proposals, votes, recall and drift | `api-go/internal/workspaceops/context_governance.go` | Content, trust state, path hashes, ranking and conflict reporting |
 | Agent grounding and outcome feedback | `grounding.go`, `feedback.go`, `verifier_telemetry.go` in `workspaceops` | Compose current evidence and persist inspectable feedback |
