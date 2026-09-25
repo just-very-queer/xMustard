@@ -1098,7 +1098,7 @@ fn main() {
                 eprintln!("usage: {usage}");
                 std::process::exit(2);
             };
-            let id = xmustard_core::indexcache::source_identity(&PathBuf::from(root));
+            let id = xmustard_core::indexcache::repo_key_identity(&PathBuf::from(root));
             println!(
                 "{}",
                 serde_json::to_string(&id).expect("repo-key result should serialize")
