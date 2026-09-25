@@ -36,12 +36,8 @@ func (g *SessionGrounding) summarize() {
 	if g.BlockedByFailingVerification == nil {
 		runs = "?"
 	}
-	stale := fmt.Sprint(g.StaleMemory)
-	if g.isUnknown("stale_memory") {
-		stale = "?"
-	}
 	g.Summary = fmt.Sprintf("%s changed file(s), %s dirty symbol(s), %s contract break(s), %s failed run(s), %s stale memory.",
-		count(g.ChangedFiles), count(g.DirtySymbols), count(g.ContractBreaks), runs, stale)
+		count(g.ChangedFiles), count(g.DirtySymbols), count(g.ContractBreaks), runs, count(g.StaleMemory))
 	if n := g.MemoryVerificationModes[VerificationSelfAssertedOpen]; n > 0 {
 		g.Summary += fmt.Sprintf(" %d memory self-asserted in open mode (not peer-verified).", n)
 	}

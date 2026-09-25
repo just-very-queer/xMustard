@@ -137,8 +137,15 @@ func TestGroundReportsUnreadableMemoryAsUnknown(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if g.StaleMemoryComplete || g.MemoryVerificationModes != nil || !slices.Contains(unknownFields(g), "stale_memory") {
+	if g.StaleMemory != nil || g.StaleMemoryTotal != nil || g.StaleMemoryComplete || g.MemoryVerificationModes != nil ||
+		!slices.Contains(unknownFields(g), "stale_memory") || !slices.Contains(unknownFields(g), "stale_memory_total") {
 		t.Fatalf("unreadable memory must be unknown: %+v unknown=%+v", g.groundingMemory, g.Unknown)
+	}
+	raw, _ := json.Marshal(g)
+	var wire map[string]any
+	_ = json.Unmarshal(raw, &wire)
+	if v, ok := wire["stale_memory"]; !ok || v != nil || wire["stale_memory_total"] != nil || wire["stale_memory_checked"] != float64(0) {
+		t.Fatalf("an unreadable store must put null stale_memory on the wire, not 0: %s", raw)
 	}
 	if !strings.Contains(g.Summary, "? stale memory") {
 		t.Fatalf("summary = %q", g.Summary)

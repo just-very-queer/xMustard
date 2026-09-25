@@ -916,6 +916,10 @@ export type SessionGrounding = {
   recent_failed_runs: string[] | null
   blocked_by_dirty_state: boolean | null
   blocked_by_failing_verification: boolean | null
+  stale_memory: number | null
+  stale_memory_checked: number
+  stale_memory_total: number | null
+  stale_memory_complete: boolean
   unknown?: { field: string; reason: string }[]
   summary: string
   generated_at: string

@@ -47,8 +47,8 @@ func TestGroundingStaleMemoryWorkIsBounded(t *testing.T) {
 	if checks := stalenessChecks.Load() - before; checks > groundStaleWindow {
 		t.Fatalf("grounding drift-checked %d memories; want at most %d", checks, groundStaleWindow)
 	}
-	if g.StaleMemory == 0 || g.StaleMemoryComplete || g.StaleMemoryTotal != n {
-		t.Fatalf("expected partial stale report over %d memories, got stale=%d complete=%v total=%d",
+	if g.StaleMemory == nil || *g.StaleMemory == 0 || g.StaleMemoryComplete || g.StaleMemoryTotal == nil || *g.StaleMemoryTotal != n {
+		t.Fatalf("expected partial stale report over %d memories, got stale=%v complete=%v total=%v",
 			n, g.StaleMemory, g.StaleMemoryComplete, g.StaleMemoryTotal)
 	}
 }

@@ -5,11 +5,13 @@ import "sort"
 // groundingMemory is the memory section of `ground`: promoted memory whose
 // referenced files drifted, and how promoted memory is trusted.
 type groundingMemory struct {
-	StaleMemory int `json:"stale_memory"`
+	// StaleMemory is null when the memory store could not be read (see unknown).
+	StaleMemory *int `json:"stale_memory"`
 	// StaleMemoryChecked / Total / Complete make the bounded drift check explicit:
 	// only the most recent groundStaleWindow memories with path baselines are hashed.
+	// Total is null with StaleMemory; Checked is then 0 (nothing was checked).
 	StaleMemoryChecked  int  `json:"stale_memory_checked"`
-	StaleMemoryTotal    int  `json:"stale_memory_total"`
+	StaleMemoryTotal    *int `json:"stale_memory_total"`
 	StaleMemoryComplete bool `json:"stale_memory_complete"`
 	// MemoryVerificationModes counts promoted memories by trust basis (peer_verified,
 	// self_asserted_open_mode, single_agent), so an agent can tell peer-verified
@@ -20,15 +22,18 @@ type groundingMemory struct {
 // build runs the stale verified-memory check (drift-on-recall): memory whose
 // referenced files changed. Bounded: only the most recent groundStaleWindow
 // baselined memories are hashed, and the result says whether that covered every one.
-// When the memory store cannot be read, nothing was checked: stale_memory_complete
-// is false, memory_verification_modes is null, and the fields are listed unknown.
+// When the memory store cannot be read, nothing was checked: stale_memory and
+// stale_memory_total are null, stale_memory_complete is false,
+// memory_verification_modes is null, and the fields are listed unknown.
 func (s *groundingMemory) build(dataDir, workspaceID string) []GroundingUnknown {
-	var err error
-	s.StaleMemory, s.StaleMemoryChecked, s.StaleMemoryTotal, s.StaleMemoryComplete, s.MemoryVerificationModes, err = boundedStaleMemory(dataDir, workspaceID, groundStaleWindow)
+	stale, checked, total, complete, modes, err := boundedStaleMemory(dataDir, workspaceID, groundStaleWindow)
+	s.StaleMemoryChecked, s.StaleMemoryComplete, s.MemoryVerificationModes = checked, complete, modes
 	if err != nil {
 		reason := "memory store unreadable: " + err.Error()
-		return []GroundingUnknown{{Field: "stale_memory", Reason: reason}, {Field: "memory_verification_modes", Reason: reason}}
+		return []GroundingUnknown{{Field: "stale_memory", Reason: reason}, {Field: "stale_memory_total", Reason: reason},
+			{Field: "memory_verification_modes", Reason: reason}}
 	}
+	s.StaleMemory, s.StaleMemoryTotal = &stale, &total
 	return nil
 }
 

@@ -44,7 +44,7 @@ func TestGroundingSplitKeepsWireShape(t *testing.T) {
 	}
 	if *g.ChangedFiles != 1 || *g.DirtySymbols != 1 || *g.ContractBreaks != 1 || len(g.BrokenContracts) != 1 ||
 		len(g.RecentFailedRuns) != 4 || !*g.BlockedByDirtyState || !*g.BlockedByFailingVerification ||
-		g.StaleMemoryTotal != 50 || g.StaleMemoryChecked != 50 || !g.StaleMemoryComplete || len(g.Unknown) != 0 {
+		*g.StaleMemory != 0 || *g.StaleMemoryTotal != 50 || g.StaleMemoryChecked != 50 || !g.StaleMemoryComplete || len(g.Unknown) != 0 {
 		t.Fatalf("ground values changed: %s", raw)
 	}
 	if want := "1 changed file(s), 1 dirty symbol(s), 1 contract break(s), 4 failed run(s), 0 stale memory."; g.Summary != want {
