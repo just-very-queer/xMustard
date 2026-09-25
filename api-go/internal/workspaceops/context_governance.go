@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -597,7 +598,7 @@ func ProposeContext(dataDir, workspaceID string, req ProposeContextRequest) (*Co
 		// snapshot the referenced files so drift-on-recall has a baseline, and boost
 		// the verified paths in the agent-feedback layer (single-agent immediate promote).
 		entry.PathHashes = capturePathHashes(contextRoot(dataDir, workspaceID), entry.Paths)
-		_ = RecordFeedback(dataDir, workspaceID, "verify", entry.Paths)
+		recordVerifyFeedback(dataDir, workspaceID, entry.ID, entry.Paths)
 	}
 	entries = append(entries, entry)
 	if err := saveContextEntries(dataDir, workspaceID, entries); err != nil {
@@ -662,12 +663,21 @@ func VerifyContext(dataDir, workspaceID, entryID, agent string, approve bool, no
 		// just transitioned to promoted — snapshot referenced files for drift checks,
 		// and boost the verified paths in the agent-feedback layer.
 		entry.PathHashes = capturePathHashes(contextRoot(dataDir, workspaceID), entry.Paths)
-		_ = RecordFeedback(dataDir, workspaceID, "verify", entry.Paths)
+		recordVerifyFeedback(dataDir, workspaceID, entry.ID, entry.Paths)
 	}
 	if err := saveContextEntries(dataDir, workspaceID, entries); err != nil {
 		return nil, err
 	}
 	return entry, nil
+}
+
+// recordVerifyFeedback boosts a newly promoted entry's paths in the agent-feedback
+// layer. The boost is a best-effort ranking signal, so a failure is logged rather
+// than failing the memory write that promoted the entry.
+func recordVerifyFeedback(dataDir, workspaceID, entryID string, paths []string) {
+	if err := RecordFeedback(dataDir, workspaceID, "verify", paths); err != nil {
+		log.Printf("feedback: verify boost for workspace %s entry %s failed: %v", workspaceID, entryID, err)
+	}
 }
 
 // cleanPaths trims, drops empties, and de-duplicates referenced paths.

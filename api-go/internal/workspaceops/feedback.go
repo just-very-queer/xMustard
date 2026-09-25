@@ -52,8 +52,87 @@ func saveFeedback(dataDir, workspaceID string, m map[string]*FeedbackEntry) erro
 	return writeJSON(feedbackPath(dataDir, workspaceID), list)
 }
 
-// RecordFeedback bumps a signal for the given paths. kind is one of "retrieval",
-// "verify", "run_success", "run_fail". Best-effort and bounded (caps per path).
+// feedbackCountCap bounds every per-path counter.
+const feedbackCountCap = 10_000
+
+// feedbackDelta is a not-yet-persisted increment to one path's entry. The search hot
+// path coalesces these in memory (feedback_recorder.go); RecordFeedback folds a
+// batch straight into the store.
+type feedbackDelta struct {
+	Retrieval, Verify, RunSuccess, RunFail int
+	LastUsed                               string
+}
+
+// add bumps the counter for kind ("retrieval", "verify", "run_success", "run_fail";
+// an unknown kind only refreshes LastUsed) as of timestamp at.
+func (d *feedbackDelta) add(kind, at string) {
+	switch kind {
+	case "retrieval":
+		d.Retrieval = minInt(d.Retrieval+1, feedbackCountCap)
+	case "verify":
+		d.Verify = minInt(d.Verify+1, feedbackCountCap)
+	case "run_success":
+		d.RunSuccess = minInt(d.RunSuccess+1, feedbackCountCap)
+	case "run_fail":
+		d.RunFail = minInt(d.RunFail+1, feedbackCountCap)
+	}
+	d.LastUsed = laterTimestamp(d.LastUsed, at)
+}
+
+// merge adds o into d (counts capped, latest LastUsed wins).
+func (d *feedbackDelta) merge(o feedbackDelta) {
+	d.Retrieval = minInt(d.Retrieval+o.Retrieval, feedbackCountCap)
+	d.Verify = minInt(d.Verify+o.Verify, feedbackCountCap)
+	d.RunSuccess = minInt(d.RunSuccess+o.RunSuccess, feedbackCountCap)
+	d.RunFail = minInt(d.RunFail+o.RunFail, feedbackCountCap)
+	d.LastUsed = laterTimestamp(d.LastUsed, o.LastUsed)
+}
+
+// applyFeedbackDeltas folds deltas into m, creating entries as needed.
+func applyFeedbackDeltas(m map[string]*FeedbackEntry, deltas map[string]feedbackDelta) {
+	for p, d := range deltas {
+		e := m[p]
+		if e == nil {
+			e = &FeedbackEntry{Path: p}
+			m[p] = e
+		}
+		e.RetrievalCount = minInt(e.RetrievalCount+d.Retrieval, feedbackCountCap)
+		e.VerifyCount = minInt(e.VerifyCount+d.Verify, feedbackCountCap)
+		e.RunSuccess = minInt(e.RunSuccess+d.RunSuccess, feedbackCountCap)
+		e.RunFail = minInt(e.RunFail+d.RunFail, feedbackCountCap)
+		e.LastUsed = laterTimestamp(e.LastUsed, d.LastUsed)
+	}
+}
+
+// laterTimestamp returns whichever RFC3339 timestamp is later, preferring a
+// parseable one over an unparseable one.
+func laterTimestamp(a, b string) string {
+	tb, errB := time.Parse(time.RFC3339, b)
+	if errB != nil {
+		return a
+	}
+	if ta, errA := time.Parse(time.RFC3339, a); errA == nil && ta.After(tb) {
+		return a
+	}
+	return b
+}
+
+// mergeFeedback folds deltas into the on-disk store in one locked read-modify-write.
+func mergeFeedback(dataDir, workspaceID string, deltas map[string]feedbackDelta) error {
+	unlock := lockStore(feedbackPath(dataDir, workspaceID))
+	defer unlock()
+	m, err := loadFeedback(dataDir, workspaceID)
+	if err != nil {
+		return err
+	}
+	applyFeedbackDeltas(m, deltas)
+	return saveFeedback(dataDir, workspaceID, m)
+}
+
+// RecordFeedback synchronously bumps a signal for the given paths. kind is one of
+// "retrieval", "verify", "run_success", "run_fail". Bounded (caps per path). Used by
+// the low-rate verify/run outcome paths; search retrievals go through the coalescing
+// recorder instead so they never write the store on the request path.
 func RecordFeedback(dataDir, workspaceID, kind string, paths []string) error {
 	if err := validateSafeID("workspace", workspaceID); err != nil {
 		return err
@@ -62,32 +141,14 @@ func RecordFeedback(dataDir, workspaceID, kind string, paths []string) error {
 	if len(clean) == 0 {
 		return nil
 	}
-	unlock := lockStore(feedbackPath(dataDir, workspaceID))
-	defer unlock()
-	m, err := loadFeedback(dataDir, workspaceID)
-	if err != nil {
-		return err
-	}
 	now := nowUTC()
+	deltas := make(map[string]feedbackDelta, len(clean))
 	for _, p := range clean {
-		e := m[p]
-		if e == nil {
-			e = &FeedbackEntry{Path: p}
-			m[p] = e
-		}
-		switch kind {
-		case "retrieval":
-			e.RetrievalCount = minInt(e.RetrievalCount+1, 10_000)
-		case "verify":
-			e.VerifyCount = minInt(e.VerifyCount+1, 10_000)
-		case "run_success":
-			e.RunSuccess = minInt(e.RunSuccess+1, 10_000)
-		case "run_fail":
-			e.RunFail = minInt(e.RunFail+1, 10_000)
-		}
-		e.LastUsed = now
+		var d feedbackDelta
+		d.add(kind, now)
+		deltas[p] = d
 	}
-	return saveFeedback(dataDir, workspaceID, m)
+	return mergeFeedback(dataDir, workspaceID, deltas)
 }
 
 func minInt(a, b int) int {
@@ -99,10 +160,18 @@ func minInt(a, b int) int {
 
 // feedbackBoosts returns a per-path boost in roughly [0, 1], combining the signals
 // with a recency decay (a path unused for ~30 days contributes ~1/e of its raw
-// score). A failing run suppresses a path.
+// score). A failing run suppresses a path. Feedback the recorder has not flushed yet
+// is merged over the on-disk state, so a search sees retrievals recorded moments ago.
 func feedbackBoosts(dataDir, workspaceID string) map[string]float64 {
+	// Snapshot the buffer before reading the store: a flush racing this read can then
+	// only count its batch twice for this one ranking, never drop it.
+	pending := feedbackRec.pending(dataDir, workspaceID)
 	m, err := loadFeedback(dataDir, workspaceID)
-	if err != nil || len(m) == 0 {
+	if err != nil {
+		return nil
+	}
+	applyFeedbackDeltas(m, pending)
+	if len(m) == 0 {
 		return nil
 	}
 	out := make(map[string]float64, len(m))
