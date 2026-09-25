@@ -64,6 +64,7 @@ func secretCorpus() []sample {
 	basic := base64.StdEncoding.EncodeToString([]byte("deploy:" + randToken(rng, alphaNum, 16)))
 	pemBody := randToken(rng, alphaNum+"+/", 64) + "\n" + randToken(rng, alphaNum+"+/", 64) + "\n" + randToken(rng, alphaNum+"+/", 20) + "=="
 	begin, end := join("-----BEGIN ", "RSA PRIVATE", " KEY-----"), join("-----END ", "RSA PRIVATE", " KEY-----")
+	pgpBegin, pgpEnd := join("-----BEGIN ", "PGP PRIVATE", " KEY BLOCK-----"), join("-----END ", "PGP PRIVATE", " KEY BLOCK-----")
 	pw := "hunter2-" + randToken(rng, alphaNum, 6)
 	apiHex := randToken(rng, "0123456789abcdef", 32)
 
@@ -101,6 +102,30 @@ func secretCorpus() []sample {
 		{"flag with space", "deploy --api-key " + apiHex + " --force", apiHex, RuleSecretField},
 		{"url userinfo", "DATABASE_URL=postgres://admin:" + pw + "@db:5432/app", pw, RuleURLCredentials},
 		{"header line", "X-Api-Key: " + apiHex, apiHex, RuleSecretField},
+		// letter-only passwords on data lines (env, dotenv, YAML, flags)
+		{"env letters-only password", "DB_PASSWORD=letmeinplease\n", "letmeinplease", RuleSecretField},
+		{"export letters-only password", "export PGPASSWORD=correcthorsebatterystaple\n", "correcthorsebatterystaple", RuleSecretField},
+		{"env root password at end", "MYSQL_ROOT_PASSWORD=changeme", "changeme", RuleSecretField},
+		{"dotenv lowercase key", "\ndb_password=swordfish\nport=5432", "swordfish", RuleSecretField},
+		{"yaml letters-only password", "db:\n  password: letmein\n", "letmein", RuleSecretField},
+		{"yaml list item password", "users:\n  - password: opensesame # rotate\n", "opensesame", RuleSecretField},
+		{"flag letters-only password", "mysql --password hunter -h db", "hunter", RuleSecretField},
+		// YAML block scalars
+		{"yaml block scalar password", "db:\n  password: |\n    Sup3rS3cret!Value\n  host: x\n", "Sup3rS3cret!Value", RuleSecretField},
+		{"yaml folded block in json", `{"content":"db:\n  password: >-\n    first line\n    second line\n  host: x\n"}`, "second line", RuleSecretField},
+		// values that start like a placeholder but are not one
+		{"password starting with your", `{"password":"yourDog2024!"}`, "yourDog2024!", RuleSecretField},
+		{"password starting with insert", `{"password":"Insert-Coin-99"}`, "Insert-Coin-99", RuleSecretField},
+		{"password starting with replace", `{"password": "Replace-Me-Not-9x!"}`, "Replace-Me-Not-9x!", RuleSecretField},
+		{"env-name-shaped password with digits", "DB_PASSWORD=HUNTER_2024\n", "HUNTER_2024", RuleSecretField},
+		{"api key starting with your", `{"api_key": "your8f14e45fceea167a5a36dedd4bea2543"}`, "your8f14e45fceea167a5a36dedd4bea2543", RuleSecretField},
+		// key bodies with armor headers
+		{"encrypted pem with headers", begin + "\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,3F17F5316E2BAC89\n\n" + pemBody + "\n" + end,
+			pemBody, RulePrivateKey},
+		{"pgp private key block", pgpBegin + "\nVersion: GnuPG v2.2.41 (GNU/Linux)\nComment: https://gnupg.org\n\n" + pemBody + "\n=Ab12\n" + pgpEnd,
+			pemBody, RulePrivateKey},
+		{"single-line pem", `KEY="` + begin + " " + strings.ReplaceAll(pemBody, "\n", " ") + " " + end + `"`,
+			strings.ReplaceAll(pemBody, "\n", " "), RulePrivateKey},
 	}
 }
 
@@ -134,6 +159,131 @@ func TestRedactedJSONStaysValid(t *testing.T) {
 		out, _ := r.String(s.text)
 		if !json.Valid([]byte(out)) {
 			t.Errorf("%s: redaction broke JSON: %s", s.name, out)
+		}
+	}
+}
+
+// JSONL transcripts stay one valid record per line, and later records
+// survive, whatever a record's text contains.
+func TestRedactedJSONLStaysValid(t *testing.T) {
+	r := Default()
+	begin := join("-----BEGIN ", "PRIVATE", " KEY-----")
+	token := join("a8f5f167f44f", "4964e6c998dee827110c")
+	lines := []string{
+		`{"role":"user","text":"my key file starts with ` + begin + ` and then base64"}`,
+		`{"text":"set password: 'hunter2 for now","n":1}`,
+		`{"cmd":"export API_TOKEN='` + token + `","ok":true}`,
+		`{"role":"assistant","text":"noted"}`,
+		`["password: 'x9-long-pass", "next"]`,
+		`{"n":2}`,
+	}
+	in := strings.Join(lines, "\n") + "\n"
+	out := sameAsOneShot(t, r, "jsonl", in)
+	got := strings.Split(strings.TrimSuffix(out, "\n"), "\n")
+	if len(got) != len(lines) {
+		t.Fatalf("records lost: %d of %d\n%s", len(got), len(lines), out)
+	}
+	for i, line := range got {
+		if !json.Valid([]byte(line)) {
+			t.Errorf("record %d is not JSON after redaction: %s", i, line)
+		}
+	}
+	for _, i := range []int{3, 5} {
+		if got[i] != lines[i] {
+			t.Errorf("record %d changed: %s", i, got[i])
+		}
+	}
+	for _, leak := range []string{"hunter2", token, "x9-long-pass"} {
+		if strings.Contains(out, leak) {
+			t.Errorf("secret %q survived: %s", leak, out)
+		}
+	}
+	// A single-quoted shell value may still hold a double quote.
+	if got, _ := r.String(`password='ab"cd' next`); got != `password='[REDACTED:secret_field]' next` {
+		t.Errorf("single-quoted value: %q", got)
+	}
+}
+
+// A BEGIN marker without an END redacts only what could be a key body: never
+// past punctuation, a quote or pemMaxBody bytes.
+func TestPEMWithoutEndIsBounded(t *testing.T) {
+	r := Default()
+	begin := join("-----BEGIN ", "PRIVATE", " KEY-----")
+	prose := "Keys look like " + begin + " followed by base64. The rest of this paragraph stays."
+	if got, _ := r.String(prose); got != "Keys look like "+begin+"[REDACTED:private_key]. The rest of this paragraph stays." {
+		t.Errorf("prose mention: %q", got)
+	}
+	code := `if strings.HasPrefix(s, "` + begin + `") { return true }`
+	if got, _ := r.String(code); got != code {
+		t.Errorf("a marker in code has no body to redact: %q", got)
+	}
+	// Raw text keeps its line structure: the next line is not pulled in.
+	log := "warn: found " + begin + " in upload\n\n{\"n\":1}\n{\"n\":2}\n"
+	if got := sameAsOneShot(t, r, "raw log", log); got != "warn: found "+begin+"[REDACTED:private_key]\n\n{\"n\":1}\n{\"n\":2}\n" {
+		t.Errorf("raw log: %q", got)
+	}
+	// ... also when a body reaches the window end and its trailing whitespace
+	// straddles the boundary. A run longer than pemMaxSpace stays redacted.
+	rng0 := rand.New(rand.NewSource(8))
+	first := contextLen + windowSize - 1 // input bytes in the first window
+	for _, space := range []int{200, pemMaxSpace + 50} {
+		for shift := -3; shift <= 3; shift++ {
+			pre := filler(rng0, first-6000) + "\n" + begin + "\n"
+			body := randToken(rng0, alphaNum, first-space/2+shift-len(pre))
+			tail := strings.Repeat(" ", space) + "\n" + `{"n":1}` + "\n"
+			in := pre + body + tail
+			want := sameAsOneShot(t, r, "whitespace at boundary", in)
+			kept := tail
+			if space+1 > pemMaxSpace {
+				kept = `{"n":1}` + "\n"
+			}
+			if !strings.HasSuffix(want, "[REDACTED:private_key]"+kept) {
+				t.Fatalf("space %d shift %d: got suffix %q", space, shift, want[max(0, len(want)-60):])
+			}
+			for _, src := range []io.Reader{strings.NewReader(in), iotest.HalfReader(strings.NewReader(in))} {
+				if got, _ := streamAll(t, r, src); got != want {
+					t.Fatalf("space %d shift %d: stream differs", space, shift)
+				}
+			}
+		}
+	}
+
+	rng := rand.New(rand.NewSource(9))
+	var body strings.Builder
+	for body.Len() < pemMaxBody+8<<10 {
+		body.WriteString(randToken(rng, alphaNum+"+/", 64) + "\n")
+	}
+	in := begin + "\n" + body.String() + "tail"
+	want := begin + "[REDACTED:private_key]" + in[len(begin)+pemMaxBody:]
+	if got := sameAsOneShot(t, r, "capped body", in); got != want {
+		t.Fatalf("body not capped at pemMaxBody: kept %d bytes", len(got))
+	}
+	if got, _ := streamAll(t, r, &chunkReader{data: []byte(in), rng: rng, max: 3000}); got != want {
+		t.Fatal("capped body: stream differs")
+	}
+}
+
+// A long run that fails its class check must not hide a real key glued after
+// it: each hit is judged on its own first judgedLen bytes.
+func TestLongRunDoesNotHideGluedKey(t *testing.T) {
+	r := Default()
+	key := join("sk-", "proj-", "Ab3dEf5gHi7jKl9mNo1pQr3sTu5vWx7yZa9Bc")
+	slack := join("xox", "b-", "123456789012-", "Ab3dEf5gHi7jKl9mNo1pQr3s")
+	cases := map[string]struct{ in, secret string }{
+		"openai after 600":   {"x sk-" + strings.Repeat("a", 600) + "-" + key + " y", key[8:]},
+		"openai at the edge": {"x sk-" + strings.Repeat("a", judgedLen-4) + "-" + key + " y", key[8:]},
+		"slack after 600":    {"x xoxb-" + strings.Repeat("a", 600) + "-" + slack + " y", slack[5:]},
+	}
+	rng := rand.New(rand.NewSource(4))
+	for name, tc := range cases {
+		out := sameAsOneShot(t, r, name, tc.in)
+		if strings.Contains(out, tc.secret) {
+			t.Errorf("%s: key survived: %q", name, out)
+		}
+		padded := filler(rng, windowSize-300) + " " + tc.in
+		want, _, _ := oneShot(r, padded)
+		if got, _ := streamAll(t, r, &chunkReader{data: []byte(padded), rng: rng, max: 999}); got != want || strings.Contains(got, tc.secret) {
+			t.Errorf("%s: stream differs or leaks", name)
 		}
 	}
 }
@@ -197,6 +347,19 @@ func falsePositiveCorpus() []string {
 		"db:\n  password: |\n",
 		`Password: os.Getenv("DB_PASSWORD"),`,
 		"level=info msg=ok token_count=5 auth_mode=oidc",
+		// code, prose and references that data-line detection must leave alone
+		"    password: SecretStr = Field(default=None)",
+		"    conn = connect(\n        password=db_password,\n    )",
+		"connect(host, password=secretvalue)",
+		"PASSWORD=getpass()",
+		"Password: must be at least 8 characters.",
+		`{"msg":"password: invalid"}`,
+		"DB_PASSWORD=${DB_PASSWORD}",
+		"password: ${DB_PASSWORD}",
+		"export PGPASSWORD=$(pass show db)",
+		`{"password":"your-password-here","token":"YOUR_TOKEN_HERE"}`,
+		`{"password":"yourApiKey"}`,
+		"db:\n  password: |\n  host: x\n",
 	}
 }
 
@@ -439,6 +602,33 @@ func streamAll(t *testing.T, r *Redactor, src io.Reader) (string, Report) {
 	return out.String(), rep
 }
 
+// oneShot redacts in as one window: the reference that every windowed path
+// (String, Bytes, Check and Findings above 64 KiB, Reader, Copy) must match.
+func oneShot(r *Redactor, in string) (string, Report, []Finding) {
+	e := &engine{r: r, collect: true, base: -1}
+	buf := make([]byte, 1+len(in))
+	buf[0] = '\n'
+	copy(buf[1:], in)
+	out, _ := e.window(nil, buf, 1, len(buf), true)
+	return string(out), e.rep, e.found
+}
+
+// sameAsOneShot checks the windowed one-shot calls against oneShot.
+func sameAsOneShot(t *testing.T, r *Redactor, name, in string) string {
+	t.Helper()
+	want, wantRep, wantFound := oneShot(r, in)
+	if got, rep := r.String(in); got != want || rep.Count != wantRep.Count {
+		t.Fatalf("%s: String differs from one window (%d vs %d redactions)", name, rep.Count, wantRep.Count)
+	}
+	if got, _ := r.Bytes([]byte(in)); string(got) != want {
+		t.Fatalf("%s: Bytes differs from one window", name)
+	}
+	if found := r.Findings(in); fmt.Sprint(found) != fmt.Sprint(wantFound) {
+		t.Fatalf("%s: Findings differ from one window:\n got %v\nwant %v", name, found, wantFound)
+	}
+	return want
+}
+
 // filler is prose-like text with no secrets.
 func filler(rng *rand.Rand, n int) string {
 	words := []string{"the", "index", "memory", "verify", "path", "func", "return", "err", "nil", "{", "}", "\n", "x := 1", "// note", "a-b", "key", "value", "::", "==", "https://example.com/a"}
@@ -468,7 +658,7 @@ func TestStreamSecretsAcrossWindowBoundaries(t *testing.T) {
 	for i, off := range offsets {
 		s := corpus[i%len(corpus)]
 		in := filler(rng, off) + " " + s.text + " " + filler(rng, 2000)
-		want, _ := r.String(in)
+		want := sameAsOneShot(t, r, s.name, in)
 		if strings.Contains(want, s.secret) {
 			t.Fatalf("one-shot leaked %s at %d", s.name, off)
 		}
@@ -499,7 +689,8 @@ func TestStreamMatchesOneShotRandomized(t *testing.T) {
 			secrets = append(secrets, s.secret)
 		}
 		in := b.String()
-		want, wantRep := r.String(in)
+		want := sameAsOneShot(t, r, fmt.Sprint("seed ", seed), in)
+		_, wantRep, _ := oneShot(r, in)
 		got, gotRep := streamAll(t, r, &chunkReader{data: []byte(in), rng: rng, max: 1 + rng.Intn(20000)})
 		if got != want {
 			i := 0
@@ -528,7 +719,7 @@ func TestStreamLongSecretsSpanWindows(t *testing.T) {
 	longValue := randToken(rng, alphaNum+"+/", 200<<10)
 	longJSON := randToken(rng, alphaNum, 90<<10) + `\"` + randToken(rng, alphaNum, 90<<10)
 	begin, end := join("-----BEGIN ", "PRIVATE", " KEY-----"), join("-----END ", "PRIVATE", " KEY-----")
-	pemBody := randToken(rng, alphaNum+"+/\n", 180<<10)
+	pemBody := randToken(rng, alphaNum+"+/\n", 30<<10) // a large key, under pemMaxBody
 	cases := []struct {
 		name, in, secret, tail string
 	}{
@@ -538,7 +729,7 @@ func TestStreamLongSecretsSpanWindows(t *testing.T) {
 		{"long pem", filler(rng, 63<<10) + "\n" + begin + "\n" + pemBody + "\n" + end + "\nafter", pemBody, end + "\nafter"},
 	}
 	for _, tc := range cases {
-		want, _ := r.String(tc.in)
+		want := sameAsOneShot(t, r, tc.name, tc.in)
 		for _, src := range []io.Reader{strings.NewReader(tc.in), &chunkReader{data: []byte(tc.in), rng: rng, max: 777}} {
 			got, rep := streamAll(t, r, src)
 			if got != want {
@@ -563,7 +754,7 @@ func TestStreamPEMEndMarkerAcrossBoundary(t *testing.T) {
 		head := strings.Repeat("a", first-lookahead-200)
 		body := strings.Repeat("Q", lookahead+200-len(begin)-split)
 		in := head + begin + body + end + "\nvisible"
-		want, _ := r.String(in)
+		want := sameAsOneShot(t, r, "pem end split", in)
 		got, _ := streamAll(t, r, iotest.HalfReader(strings.NewReader(in)))
 		if got != want || !strings.HasSuffix(got, begin+"[REDACTED:private_key]"+end+"\nvisible") {
 			t.Fatalf("split %d: got suffix %q", split, got[max(0, len(got)-80):])
@@ -584,7 +775,7 @@ func TestStreamEscapedQuoteAcrossBoundary(t *testing.T) {
 		if !json.Valid([]byte(in)) {
 			t.Fatal("fixture is not JSON")
 		}
-		want, _ := r.String(in)
+		want := sameAsOneShot(t, r, "escaped quote split", in)
 		got, _ := streamAll(t, r, strings.NewReader(in))
 		if got != want || !json.Valid([]byte(got)) || strings.Contains(got, "s3cR") {
 			t.Fatalf("shift %d: got suffix %q, want %q", shift, got[max(0, len(got)-40):], want[max(0, len(want)-40):])
@@ -635,6 +826,11 @@ func TestAdversarialInputsAreLinear(t *testing.T) {
 		"bearer words":          rep("bearer bearer "),
 		"url separators":        rep("a://b:c"),
 		"quotes":                rep(`"password":"`),
+		"glued failing runs":    rep("sk-" + strings.Repeat("a", 510) + "1"),
+		"glued slack runs":      rep("xoxb-" + strings.Repeat("a", 520) + "1"),
+		"pem prose mentions":    rep(join("-----BEGIN ", "PRIVATE", " KEY----- and then ")),
+		"yaml blocks":           rep("api_key: |\n  api_key: |\n    aaaa\n"),
+		"single quotes in json": rep(`{"t":"password: 'a","u":"`),
 	}
 	start := time.Now()
 	for name, in := range inputs {
@@ -647,6 +843,56 @@ func TestAdversarialInputsAreLinear(t *testing.T) {
 		}
 	}
 	t.Logf("all adversarial inputs in %v", time.Since(start))
+}
+
+// The one-shot calls run through the same fixed windows as a Reader, so their
+// working memory does not grow with the input or its density of trigger
+// literals. Before, String on 16 MiB of "hf_" allocated about 836 MiB.
+func TestOneShotMemoryIsBounded(t *testing.T) {
+	if testing.Short() {
+		t.Skip("allocates 16 MiB inputs")
+	}
+	const size = 16 << 20
+	allocated := func(f func()) uint64 {
+		var a, b runtime.MemStats
+		runtime.GC()
+		runtime.ReadMemStats(&a)
+		f()
+		runtime.ReadMemStats(&b)
+		return b.TotalAlloc - a.TotalAlloc
+	}
+	fill := func(unit string) string { return strings.Repeat(unit, size/len(unit)+1)[:size] }
+	const bound = 4 << 20
+	pii := New(WithPII())
+	cases := []struct {
+		name string
+		red  *Redactor
+		unit string
+	}{
+		{"hugging face literal", Default(), "hf_"},
+		{"openai literal", Default(), "sk-"},
+		{"url separators", Default(), "://"},
+		{"keyed separators", Default(), "token:"},
+		{"quoted keys", Default(), `"password":"`},
+		{"pem markers", Default(), join("-----BEGIN ", "PRIVATE", " KEY-----")},
+		{"email at signs", pii, "@"},
+	}
+	for _, tc := range cases {
+		in := fill(tc.unit)
+		if n := allocated(func() { tc.red.String(in) }); n > bound {
+			t.Errorf("String(%s): allocated %d MiB", tc.name, n>>20)
+		}
+	}
+	// Check shares the window loop; it also keeps counts rather than findings,
+	// so a secret on every line costs nothing either.
+	in := fill("hf_")
+	if n := allocated(func() { _ = Default().Check(in) }); n > bound {
+		t.Errorf("Check(hugging face literal): allocated %d MiB", n>>20)
+	}
+	in = fill("password=Zx9!Zx9!\n")
+	if n := allocated(func() { _ = Default().Check(in) }); n > bound {
+		t.Errorf("Check on dense secrets: allocated %d MiB", n>>20)
+	}
 }
 
 // errAfterReader yields its data and then fails.

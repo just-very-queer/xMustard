@@ -16,12 +16,30 @@
 // Report (redacted:true with a count per rule) or, from Check, a structured
 // *RejectError.
 //
-// The same engine serves strings (String, Bytes) and streams (NewReader, Copy,
-// WriteFile). A stream is processed in fixed windows with a held-back
-// lookahead, so a secret split across read or window boundaries is still
-// found, the output does not depend on how the source chunks its reads, and
-// memory is bounded by the 64 KiB window whatever the stream length (the
-// 16 MiB stream test grows the live heap by about 0.2 MiB).
+// The same engine serves strings (String, Bytes, Check, Findings) and streams
+// (NewReader, Copy, WriteFile). Input is processed in fixed 64 KiB windows with
+// a held-back lookahead, so a secret split across read or window boundaries is
+// still found, the output does not depend on how the source chunks its reads,
+// and the engine's memory is bounded by the window whatever the input length
+// (the 16 MiB stream test grows the live heap by about 0.2 MiB). String and
+// Bytes also hold their result, one copy of the input's size, and String
+// returns its input without copying when nothing is redacted; Check holds
+// nothing; Findings holds one entry per secret.
+//
+// Key-aware detection reads how a value was written. A quoted value or YAML
+// block scalar under a password-like key is always a secret unless it is a
+// placeholder. So is a bare word on a data line: an env or dotenv assignment
+// (DB_PASSWORD=..., export pw=...), a flag (--password ...), or a YAML
+// "key: value" line. On a line that may be code (spaces around '=', a key in
+// mid-line) a bare identifier is a reference (password = request_password).
+//
+// Known limits, which leave text in place rather than lose it: an unquoted
+// token-like value needs a digit ("API_TOKEN=abcdefgh" is kept); an unquoted
+// password is one word, so a multi-word YAML value ("password: correct horse")
+// is not taken for one; validators judge the first 512 bytes of a
+// value; a YAML block scalar is read for at most 3 KiB; and a private key body
+// is at most 32 KiB, ending without an END marker at the first byte a key body
+// cannot hold (so a BEGIN marker in prose costs the rest of its phrase).
 //
 // Intended callers:
 //
@@ -38,8 +56,10 @@
 package redact
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"sort"
 	"strings"
 	"sync"
@@ -155,8 +175,9 @@ type triggered interface {
 	triggers() (literals []string, fold bool)
 	// at appends the candidate for the literal occurrence (of length litLen)
 	// at pos, if any. It returns skip: later occurrences of this detector's
-	// literals before skip are redundant and are not evaluated.
-	at(buf []byte, pos, litLen, from, n int, eof bool, out []candidate) ([]candidate, int)
+	// literals before skip are redundant and are not evaluated. memo is the
+	// detector's scratch for this window.
+	at(buf []byte, pos, litLen, from, n int, eof bool, memo *runMemo, out []candidate) ([]candidate, int)
 }
 
 // scanners look at the whole window.
@@ -192,10 +213,11 @@ func cases(c byte, fold bool) []byte {
 	return []byte{c}
 }
 
-type hit struct{ pos, detector, litLen int }
-
-// hits lists, in one pass over buf[from:n], every trigger literal occurrence.
-func (r *Redactor) hits(buf []byte, from, n int, out []hit) []hit {
+// trigger evaluates, in one pass over buf[from:n], every trigger literal
+// occurrence that its detector has not ruled out, in position order. Hits are
+// evaluated as they are found, so nothing grows with their number.
+func (e *engine) trigger(buf []byte, from, n int, eof bool) {
+	r := e.r
 	for i := from; i < n; i++ {
 		var c1 byte
 		if i+1 < n {
@@ -204,22 +226,21 @@ func (r *Redactor) hits(buf []byte, from, n int, out []hit) []hit {
 		if r.pairs[buf[i]][c1>>6]&(1<<(c1&63)) == 0 {
 			continue
 		}
-		for _, e := range r.lits[buf[i]] {
-			if n-i < len(e.lit) {
+		for _, le := range r.lits[buf[i]] {
+			if n-i < len(le.lit) || i < e.skip[le.detector] {
 				continue
 			}
 			var ok bool
-			if e.fold {
-				ok = equalFoldASCII(buf[i:i+len(e.lit)], e.lit)
+			if le.fold {
+				ok = equalFoldASCII(buf[i:i+len(le.lit)], le.lit)
 			} else {
-				ok = string(buf[i:i+len(e.lit)]) == e.lit
+				ok = string(buf[i:i+len(le.lit)]) == le.lit
 			}
 			if ok {
-				out = append(out, hit{pos: i, detector: e.detector, litLen: len(e.lit)})
+				e.cands, e.skip[le.detector] = r.triggered[le.detector].at(buf, i, len(le.lit), from, n, eof, &e.memo[le.detector], e.cands)
 			}
 		}
 	}
-	return out
 }
 
 // Option configures New.
@@ -279,51 +300,89 @@ func Default() *Redactor {
 	return defaultRed
 }
 
-// String redacts s.
+// String redacts s. When nothing is redacted it returns s itself.
 func (r *Redactor) String(s string) (string, Report) {
-	out, rep := r.Bytes([]byte(s))
-	return string(out), rep
+	e := &engine{r: r}
+	var sb strings.Builder
+	same := 0 // until the first redaction, the output is s[:same]
+	runAll(e, s, func(out []byte) {
+		if !e.rep.Redacted {
+			same += len(out)
+			return
+		}
+		if sb.Cap() == 0 {
+			sb.Grow(len(s) + 64)
+			sb.WriteString(s[:same])
+		}
+		sb.Write(out)
+	})
+	if !e.rep.Redacted {
+		return s, e.rep
+	}
+	return sb.String(), e.rep
 }
 
 // Bytes redacts b and returns a new slice; b is not modified.
 func (r *Redactor) Bytes(b []byte) ([]byte, Report) {
-	e := engine{r: r}
-	buf := make([]byte, 1+len(b))
-	buf[0] = '\n' // synthetic left context: the start of input is a boundary
-	copy(buf[1:], b)
-	out, _ := e.window(make([]byte, 0, len(b)+64), buf, 1, len(buf), true)
+	e := &engine{r: r}
+	out := make([]byte, 0, len(b)+64)
+	runAll(e, b, func(chunk []byte) { out = append(out, chunk...) })
 	return out, e.rep
+}
+
+// runAll runs e over all of in. An input that fits one window is processed in
+// place of a Reader, exactly as a Reader's first and final window would be;
+// a longer one goes through a Reader's fixed windows, so the engine's memory
+// does not grow with the input. sink, if set, receives each output chunk and
+// must copy what it keeps.
+func runAll[T string | []byte](e *engine, in T, sink func([]byte)) {
+	if len(in) <= windowSize {
+		buf := make([]byte, 1+len(in))
+		buf[0] = '\n' // synthetic left context: the start of input is a boundary
+		copy(buf[1:], in)
+		var out []byte
+		if !e.discard {
+			out = make([]byte, 0, len(in)+64)
+		}
+		e.base = -1
+		out, _ = e.window(out, buf, 1, len(buf), true)
+		if sink != nil {
+			sink(out)
+		}
+		return
+	}
+	var src io.Reader
+	switch v := any(in).(type) {
+	case string:
+		src = strings.NewReader(v)
+	case []byte:
+		src = bytes.NewReader(v)
+	}
+	rd := newReader(src, e)
+	for !rd.done {
+		rd.step()
+		if sink != nil && len(rd.out) > 0 {
+			sink(rd.out)
+		}
+	}
 }
 
 // Findings reports where secrets occur in s, without changing it.
 func (r *Redactor) Findings(s string) []Finding {
-	e := engine{r: r, collect: true}
-	buf := make([]byte, 1+len(s))
-	buf[0] = '\n'
-	copy(buf[1:], s)
-	e.window(nil, buf, 1, len(buf), true)
-	for i := range e.found {
-		e.found[i].Offset--
-	}
+	e := &engine{r: r, discard: true, collect: true}
+	runAll(e, s, nil)
 	return e.found
 }
 
 // Check returns a *RejectError when s contains a secret, and nil otherwise.
 // Use it where a secret must be refused rather than rewritten.
 func (r *Redactor) Check(s string) error {
-	found := r.Findings(s)
-	if len(found) == 0 {
+	e := &engine{r: r, discard: true}
+	runAll(e, s, nil)
+	if !e.rep.Redacted {
 		return nil
 	}
-	rej := &RejectError{Code: "secret_detected", Count: len(found)}
-	seen := map[string]bool{}
-	for _, f := range found {
-		if !seen[f.Rule] {
-			seen[f.Rule] = true
-			rej.Rules = append(rej.Rules, f.Rule)
-		}
-	}
-	return rej
+	return &RejectError{Code: "secret_detected", Rules: e.order, Count: e.rep.Count}
 }
 
 // Value redacts a decoded JSON value (maps, slices, strings) and returns a deep
@@ -342,7 +401,7 @@ func (r *Redactor) value(v any, rep *Report) any {
 		out := make(map[string]any, len(x))
 		for k, val := range x {
 			if s, ok := val.(string); ok {
-				if class := classifyKey([]byte(k)); class != keyNone && secretValue(class, []byte(s), true) {
+				if class := classifyKey([]byte(k)); class != keyNone && secretValue(class, []byte(s), ctxQuoted) {
 					out[k] = Marker(RuleSecretField)
 					rep.add(RuleSecretField, 1)
 					continue
@@ -454,11 +513,14 @@ type engine struct {
 	r       *Redactor
 	open    []continuation
 	cands   []candidate
-	hits    []hit
 	skip    []int
+	memo    []runMemo
 	rep     Report
-	collect bool
+	order   []string // rules in order of first redaction
+	discard bool     // produce no output (Check, Findings)
+	collect bool     // record Findings
 	found   []Finding
+	base    int // input offset of buf[0]; -1 while buf[0] is the synthetic newline
 }
 
 // lookahead is how many bytes at the end of a non-final window are held back:
@@ -481,6 +543,10 @@ func (e *engine) window(out, buf []byte, from, n int, eof bool) ([]byte, int) {
 			}
 		}
 		e.open = still
+		if e.collect && len(e.found) > 0 { // the open region is the last finding
+			f := &e.found[len(e.found)-1]
+			f.Length = max(f.Length, e.base+frontier-f.Offset)
+		}
 		if len(e.open) > 0 {
 			return out, frontier
 		}
@@ -488,17 +554,13 @@ func (e *engine) window(out, buf []byte, from, n int, eof bool) ([]byte, int) {
 	}
 
 	e.cands = e.cands[:0]
-	e.hits = e.r.hits(buf, from, n, e.hits[:0])
 	if len(e.skip) < len(e.r.triggered) {
 		e.skip = make([]int, len(e.r.triggered))
+		e.memo = make([]runMemo, len(e.r.triggered))
 	}
 	clear(e.skip)
-	for _, h := range e.hits {
-		if h.pos < e.skip[h.detector] {
-			continue
-		}
-		e.cands, e.skip[h.detector] = e.r.triggered[h.detector].at(buf, h.pos, h.litLen, from, n, eof, e.cands)
-	}
+	clear(e.memo)
+	e.trigger(buf, from, n, eof)
 	for _, d := range e.r.scanners {
 		e.cands = d.find(buf, from, n, eof, e.cands)
 	}
@@ -538,19 +600,23 @@ func (e *engine) window(out, buf []byte, from, n int, eof bool) ([]byte, int) {
 			end = max(end, committed[j].end)
 			j++
 		}
-		if !e.collect {
+		if !e.discard {
 			out = append(out, buf[pos:c.start]...)
 			out = append(out, "[REDACTED:"...)
 			out = append(out, c.label...)
 			out = append(out, ']')
-		} else {
-			e.found = append(e.found, Finding{Rule: c.rule, Offset: c.start, Length: end - c.start})
+		}
+		if e.collect {
+			e.found = append(e.found, Finding{Rule: c.rule, Offset: e.base + c.start, Length: end - c.start})
+		}
+		if e.rep.Rules[c.rule] == 0 {
+			e.order = append(e.order, c.rule)
 		}
 		e.rep.add(c.rule, 1)
 		pos = end
 		i = j
 	}
-	if !e.collect && frontier > pos {
+	if !e.discard && frontier > pos {
 		out = append(out, buf[pos:frontier]...)
 	}
 	return out, frontier

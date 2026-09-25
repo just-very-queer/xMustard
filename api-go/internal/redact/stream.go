@@ -26,7 +26,7 @@ const (
 // secret), and returns the error.
 type Reader struct {
 	src    io.Reader
-	eng    engine
+	eng    *engine
 	buf    []byte
 	n      int // valid bytes in buf
 	from   int // first unprocessed byte; buf[:from] is context
@@ -39,9 +39,14 @@ type Reader struct {
 
 // NewReader returns a Reader that redacts src.
 func (r *Redactor) NewReader(src io.Reader) *Reader {
-	rd := &Reader{src: src, eng: engine{r: r}, buf: make([]byte, contextLen+windowSize)}
+	return newReader(src, &engine{r: r})
+}
+
+func newReader(src io.Reader, e *engine) *Reader {
+	rd := &Reader{src: src, eng: e, buf: make([]byte, contextLen+windowSize)}
 	rd.buf[0] = '\n' // synthetic left context: the start of input is a boundary
 	rd.n, rd.from = 1, 1
+	e.base = -1
 	return rd
 }
 
@@ -89,6 +94,7 @@ func (rd *Reader) step() {
 	}
 	keep := min(contextLen, consumed)
 	copy(rd.buf, rd.buf[consumed-keep:rd.n])
+	rd.eng.base += consumed - keep
 	rd.n = keep + rd.n - consumed
 	rd.from = keep
 }

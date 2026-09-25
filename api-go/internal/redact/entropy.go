@@ -96,13 +96,19 @@ var placeholderWords = []string{
 	"null", "none", "nil", "undefined", "true", "false", "redacted", "placeholder", "example",
 	"dummy", "test", "todo", "tbd", "string", "str", "optional", "required", "secret", "password",
 	"token",
+	// status words, as in "password: invalid"
+	"invalid", "incorrect", "expired", "missing", "wrong", "unset", "hidden", "masked", "empty",
+	"unknown",
 }
 
 // isPlaceholder reports a value that stands for a secret without being one:
-// empty, a variable reference (${TOKEN}, $TOKEN, %TOKEN%, {{ token }}), an
-// angle-bracketed hint, an already-redacted marker, a run of one character
-// (****, xxxx), an env-var-style name (YOUR_API_KEY), a YAML block indicator,
-// or a stock word.
+// empty; a whole variable reference (${TOKEN}, $TOKEN, $(cmd), %TOKEN%,
+// {{ token }}) or a bare "$" (a reference cut short at '{' or '('); an
+// angle-bracketed hint; a whole redaction marker; a run of one character
+// (****, xxxx); an env-var-style name without digits (YOUR_API_KEY); a
+// fill-in hint (see hintLike); a YAML block indicator; or a stock word. Each
+// rule needs the whole value to have that shape, so a real secret that merely
+// starts like one ("yourDog2024!", "${abc}Xy9") is not a placeholder.
 func isPlaceholder(v []byte) bool {
 	s := bytes.TrimSpace(v)
 	if len(s) == 0 {
@@ -114,18 +120,18 @@ func isPlaceholder(v []byte) bool {
 		}
 	}
 	switch string(s) {
-	case "|", "|-", "|+", ">-", ">+": // YAML block scalar: the value is on the next lines
+	case "$": // a reference cut short at '{' or '('
+		return true
+	case "|", "|-", "|+", ">", ">-", ">+": // YAML block scalar: the value is on the next lines
 		return true
 	}
-	for _, p := range []string{"${", "$(", "{{", "[REDACTED"} {
-		if bytes.HasPrefix(s, []byte(p)) {
+	for _, p := range [...]struct{ open, close string }{{"${", "}"}, {"$(", ")"}, {"{{", "}}"}, {"[REDACTED", "]"}} {
+		if len(s) >= len(p.open)+len(p.close) && bytes.HasPrefix(s, []byte(p.open)) && bytes.HasSuffix(s, []byte(p.close)) {
 			return true
 		}
 	}
-	for _, p := range []string{"<your", "your", "insert", "replace"} {
-		if len(s) >= len(p) && equalFoldASCII(s[:len(p)], p) {
-			return true
-		}
+	if hintLike(s) {
+		return true
 	}
 	switch last := s[len(s)-1]; {
 	case len(s) > 1 && s[0] == '<' && last == '>':
@@ -138,7 +144,30 @@ func isPlaceholder(v []byte) bool {
 	if len(s) >= 3 && bytes.Count(s, s[:1]) == len(s) {
 		return true
 	}
-	return bytes.IndexByte(s, '_') >= 0 && envNameLike(s)
+	return bytes.IndexByte(s, '_') >= 0 && !hasDigit(s) && envNameLike(s)
+}
+
+// hintLike reports a fill-in hint: "your", "insert" or "replace", then a
+// separator or a capital, then only letters and separators ("your-api-key",
+// "YOUR_TOKEN_HERE", "insert key here", "yourApiKey"). A digit or a symbol
+// makes the value a candidate secret ("yourDog2024!", "Insert-Coin-99").
+func hintLike(s []byte) bool {
+	for _, p := range []string{"your", "insert", "replace"} {
+		if len(s) <= len(p) || !equalFoldASCII(s[:len(p)], p) {
+			continue
+		}
+		rest := s[len(p):]
+		if c := rest[0]; c != '-' && c != '_' && c != ' ' && !('A' <= c && c <= 'Z') {
+			return false
+		}
+		for _, c := range rest {
+			if !isLetter(c) && c != '-' && c != '_' && c != ' ' && c != '.' {
+				return false
+			}
+		}
+		return true
+	}
+	return false
 }
 
 func envNameLike(s []byte) bool {
