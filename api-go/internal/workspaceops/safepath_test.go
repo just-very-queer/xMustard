@@ -72,3 +72,27 @@ func TestReadWorkspaceRegularFileSizeCap(t *testing.T) {
 		t.Fatal("directory must be rejected")
 	}
 }
+
+// Regression: after the root fd is closed, a later openat may reuse its number; a
+// nested path must still open rather than read as "the root itself".
+func TestOpenWorkspaceFileBeneathNestedPathAfterFdReuse(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "a", "b"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, rel := range []string{"a/f.txt", "a/b/f.txt"} {
+		if err := os.WriteFile(filepath.Join(root, rel), []byte(rel), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		for i := 0; i < 8; i++ {
+			f, err := openWorkspaceFileBeneath(root, rel)
+			if err != nil {
+				t.Fatalf("open %s: %v", rel, err)
+			}
+			f.Close()
+		}
+	}
+	if _, err := openWorkspaceFileBeneath(root, "."); err == nil {
+		t.Fatal("the root itself is not a file")
+	}
+}

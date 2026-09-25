@@ -2,6 +2,7 @@ package rustcore
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -63,7 +64,14 @@ func runCoreCtx(parent context.Context, sub string, args ...string) ([]byte, err
 	KillProcessTree(cmd)
 	if out.Refused() || errb.Refused() {
 		log.Printf("rust-core %s: output refused by transient budget after %d bytes", sub, out.Len())
-		return nil, fmt.Errorf("rust-core %s: %w", sub, budget.ErrOverloaded)
+		cause := out.RefusalErr()
+		if cause == nil {
+			cause = errb.RefusalErr()
+		}
+		if !errors.Is(cause, budget.ErrAdmissionLimit) {
+			cause = budget.ErrOverloaded
+		}
+		return nil, fmt.Errorf("rust-core %s: %w", sub, cause)
 	}
 	if out.Over() {
 		log.Printf("rust-core %s: stdout exceeded %d bytes (dropped)", sub, maxCoreStdout)
@@ -85,7 +93,10 @@ func runCoreCtx(parent context.Context, sub string, args ...string) ([]byte, err
 	// are admitted now, before they are allocated.
 	if !owned {
 		if err := scope.Acquire(2 * int64(out.Len())); err != nil {
-			return nil, fmt.Errorf("rust-core %s: %w", sub, budget.ErrOverloaded)
+			if !errors.Is(err, budget.ErrAdmissionLimit) {
+				err = budget.ErrOverloaded
+			}
+			return nil, fmt.Errorf("rust-core %s: %w", sub, err)
 		}
 	}
 	return out.Bytes(), nil

@@ -6,7 +6,11 @@ process in ONE ps snapshot: the API, both stdio MCP shims and all their descenda
 (~20 MiB) plus one 70-symbol file; cold query, warm query, same-size dirty edit,
 rename/delete cycle, two concurrent index clients, five concurrent exactly-16 MiB
 capture attempts against the 64 MiB transient pool, then a full 64 KiB-paged expansion
-of every retained original (plus one re-expansion) while the sampler is still running.
+of every retained original (plus one re-expansion), then five database-free
+`xmustard-ops diagnostics run` imports of a 2,500-row report (the per-import row cap),
+each concurrent with two threads reading GET /diagnostics, while the sampler is still
+running. The CLI processes (and their Rust children) are transient xMustard-owned roots:
+counted in the tree while alive, not required in every snapshot.
 
 Gate: sampled tree peak <= 100 MB (100,000,000 bytes), valid only when the sampler took
 samples, every ps call succeeded, every required root (API + both shims) was present in
@@ -45,7 +49,9 @@ REQUIRED_STEPS = [
     "load workspace (initial scan)", "index baseline", "cold query symbol_070", "warm query symbol_070",
     "same-size dirty edit", "rename/delete cycle", "two concurrent index clients",
     "five concurrent 16 MiB captures", "expand every retained original", "re-expand one original",
+    "CLI diagnostics imports with concurrent reads",
 ]
+DIAG_IMPORTS, DIAG_ROWS = 5, 2500
 
 
 def generate_repo(root, files=500, target_bytes=20 * 1024 * 1024):
@@ -114,6 +120,7 @@ class Sampler(threading.Thread):
     def __init__(self, roots, storage_dir=None):
         super().__init__(daemon=True)
         self.roots = dict(roots)
+        self.transient_roots = {}  # label -> pid; counted when alive, never required
         self.storage_dir = storage_dir
         self.stop_ev = threading.Event()
         self.peak_kib, self.samples, self.max_core = 0, 0, 0
@@ -152,7 +159,7 @@ class Sampler(threading.Thread):
         if missing:
             self.lost_roots.append({"t": round(t - self.t0, 2), "step": step, "missing": missing})
             return
-        owned, stack = set(), list(self.roots.values())
+        owned, stack = set(), list(self.roots.values()) + [q for q in list(self.transient_roots.values()) if q in procs]
         while stack:
             q = stack.pop()
             if q in owned:
@@ -577,6 +584,46 @@ def main():
             e["via"], e["re_expansion"] = "http", True
             expansions.append(e)
         steps.append({"step": "re-expand one original", "seconds": round(time.time() - t0, 3)})
+        CURRENT_STEP[0] = "CLI diagnostics imports with concurrent reads"
+        t0 = time.time()
+        ops_bin = os.path.join(tmp, "bin", "xmustard-ops")
+        run(["go", "build", "-o", ops_bin, "./cmd/xmustard-ops"], cwd=os.path.join(REPO_ROOT, "api-go"))
+        report = os.path.join(tmp, "diagnostics-2500.json")
+        with open(report, "w") as f:
+            json.dump([{"path": "core/src/many.rs", "message": f"rss_diag_{i}: synthetic", "severity": 2,
+                        "range": {"start": {"line": i % 60, "character": 0}, "end": {"line": i % 60, "character": 8}}}
+                       for i in range(DIAG_ROWS)], f)
+        stop_reads, read_codes = threading.Event(), []
+
+        def diag_reader():
+            while not stop_reads.is_set():
+                read_codes.append(api.get(f"/api/workspaces/{ws}/diagnostics")[0])
+
+        readers = [threading.Thread(target=diag_reader, daemon=True) for _ in range(2)]
+        for th in readers:
+            th.start()
+        ops_env = {k: v for k, v in os.environ.items() if not k.startswith("XMUSTARD_")}
+        ops_env.update({"XMUSTARD_CORE_BIN": core})
+        import_codes = []
+        for i in range(DIAG_IMPORTS):
+            proc = subprocess.Popen([ops_bin, "diagnostics", "run", ws, "--data-dir", data, "--input-path", report,
+                                     "--source-kind", "compiler", "--source-name", "rss"], env=ops_env,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+            sampler.transient_roots[f"xmustard-ops#{i + 1}"] = proc.pid
+            proc.wait(180)
+            import_codes.append(proc.returncode)
+        stop_reads.set()
+        for th in readers:
+            th.join(30)
+        _, diag, _ = api.get(f"/api/workspaces/{ws}/diagnostics")
+        steps.append({"step": "CLI diagnostics imports with concurrent reads", "seconds": round(time.time() - t0, 3)})
+        result["diagnostics_imports"] = {"imports": DIAG_IMPORTS, "rows_each": DIAG_ROWS, "cli_exit_codes": import_codes,
+                                         "api_reads": len(read_codes), "read_statuses": sorted(set(read_codes)),
+                                         "storage": (diag or {}).get("storage")}
+        checks.check(f"{DIAG_IMPORTS} database-free CLI imports of {DIAG_ROWS} rows succeed with concurrent API reads",
+                     all(c == 0 for c in import_codes) and read_codes and all(c == 200 for c in read_codes)
+                     and len((diag or {}).get("diagnostics") or []) == DIAG_ROWS,
+                     f"exits {import_codes}, {len(read_codes)} reads {sorted(set(read_codes))}")
         CURRENT_STEP[0] = "between steps"
         first = [e for e in expansions if not e.get("re_expansion")]
         checks.check("every captured original fully expanded in <=64 KiB pages with exact size and SHA-256",

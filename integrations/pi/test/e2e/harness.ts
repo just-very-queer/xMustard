@@ -36,8 +36,8 @@ export const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 // largest value seen across samples, not an OS high-water mark: short spikes between
 // samples are missed, so these are sampled lower bounds, not ceilings.
 
-export type Owner = "xmustard-api" | "xmustard-mcp" | "pi" | "postgres-fixture";
-const XMUSTARD_OWNED: readonly Owner[] = ["xmustard-api", "xmustard-mcp"];
+export type Owner = "xmustard-api" | "xmustard-mcp" | "xmustard-ops" | "pi" | "postgres-fixture";
+const XMUSTARD_OWNED: readonly Owner[] = ["xmustard-api", "xmustard-mcp", "xmustard-ops"];
 
 interface Proc {
 	pid: number;
@@ -354,6 +354,21 @@ export function makeRepo(dir: string, files = 400): void {
 	git(dir, "init", "-q");
 	git(dir, "-c", "user.email=e2e@example.invalid", "-c", "user.name=e2e", "add", "-A");
 	git(dir, "-c", "user.email=e2e@example.invalid", "-c", "user.name=e2e", "commit", "-qm", "fixture");
+}
+
+// runOps runs the real xmustard-ops CLI (XM_OPS_BIN) against a data dir, sampled as
+// xMustard-owned, and resolves with its exit code and output.
+export function runOps(dataDir: string, args: string[]): Promise<{ code: number | null; stdout: string; stderr: string }> {
+	const child = spawn(env("XM_OPS_BIN"), [...args, "--data-dir", dataDir], {
+		env: { PATH: process.env.PATH ?? "", HOME: dataDir, XMUSTARD_CORE_BIN: env("XM_CORE_BIN") },
+		stdio: ["ignore", "pipe", "pipe"],
+	});
+	sampler.register(child.pid, "xmustard-ops");
+	let stdout = "";
+	let stderr = "";
+	child.stdout?.on("data", (b: Buffer) => (stdout += b.toString()));
+	child.stderr?.on("data", (b: Buffer) => (stderr += b.toString()));
+	return new Promise((resolve) => child.once("close", (code) => resolve({ code, stdout, stderr })));
 }
 
 // seedFailedRun writes a run record: the API has no route that creates a run

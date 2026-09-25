@@ -27,6 +27,11 @@ import (
 // HTTP maps it to 503 + Retry-After; MCP maps it to JSON-RPC -32000.
 var ErrOverloaded = errors.New("xmustard overloaded: transient budget exhausted; retry shortly")
 
+// ErrAdmissionLimit is returned when one operation's own ledger cap (Scope.Limited) is
+// exceeded. Unlike ErrOverloaded it is deterministic for the input: retrying the same
+// operation cannot succeed, so HTTP maps it to a 4xx, never 503 + Retry-After.
+var ErrAdmissionLimit = errors.New("operation exceeds its transient admission limit")
+
 // ByteBudget is a shared, weighted ceiling on TRANSIENT in-flight bytes across the whole
 // process. Acquire reserves n bytes if they fit; Release returns them.
 type ByteBudget struct {
@@ -83,6 +88,10 @@ type Scope struct {
 	mu     sync.Mutex
 	held   int64
 	closed bool
+	// parent and limit are set on a Limited child: its bytes reserve in parent (and are
+	// released when parent closes), and more than limit bytes fail with ErrAdmissionLimit.
+	parent *Scope
+	limit  int64
 }
 
 // NewScope opens a ledger against pool (TransientBytes when nil).
@@ -93,7 +102,16 @@ func NewScope(pool *ByteBudget) *Scope {
 	return &Scope{pool: pool}
 }
 
-// Acquire reserves n more bytes in this scope or returns ErrOverloaded.
+// Limited opens a child ledger for one operation inside s. The child admits at most
+// limit bytes in total (beyond that, ErrAdmissionLimit); what it admits is reserved in
+// s, so it stays held until s closes — for HTTP, until the response has been written.
+// Closing the child releases nothing.
+func (s *Scope) Limited(limit int64) *Scope {
+	return &Scope{pool: s.pool, parent: s, limit: limit}
+}
+
+// Acquire reserves n more bytes in this scope. It returns ErrAdmissionLimit when a
+// Limited scope's cap would be exceeded, else ErrOverloaded when the pool refuses.
 func (s *Scope) Acquire(n int64) error {
 	if n <= 0 {
 		return nil
@@ -102,6 +120,16 @@ func (s *Scope) Acquire(n int64) error {
 	defer s.mu.Unlock()
 	if s.closed {
 		return fmt.Errorf("%w (scope closed)", ErrOverloaded)
+	}
+	if s.parent != nil {
+		if n > s.limit || s.held > s.limit-n {
+			return fmt.Errorf("%w (%d-byte cap)", ErrAdmissionLimit, s.limit)
+		}
+		if err := s.parent.Acquire(n); err != nil {
+			return err
+		}
+		s.held += n
+		return nil
 	}
 	if !s.pool.Acquire(n) {
 		return ErrOverloaded
@@ -121,7 +149,9 @@ func (s *Scope) Close() {
 		return
 	}
 	s.closed = true
-	s.pool.Release(s.held)
+	if s.parent == nil {
+		s.pool.Release(s.held)
+	}
 	s.held = 0
 }
 
@@ -155,6 +185,7 @@ type CaptureWriter struct {
 	buf      []byte
 	over     bool
 	refused  bool
+	err      error // the refusal cause (ErrOverloaded or ErrAdmissionLimit)
 	// OnStop, when set, runs once at the first overflow or refusal so the owner can
 	// kill the producer. Returning an error only stops pipe copying; a child that
 	// stops writing (e.g. floods, then sleeps) would otherwise keep running.
@@ -198,6 +229,7 @@ func (c *CaptureWriter) Write(p []byte) (int, error) {
 		}
 		if err := c.scope.Acquire(chunk); err != nil {
 			c.refused = true
+			c.err = err
 			c.stop()
 			return 0, errCaptureStopped
 		}
@@ -214,14 +246,18 @@ func (c *CaptureWriter) String() string { return string(c.buf) }
 func (c *CaptureWriter) Over() bool     { return c.over }
 func (c *CaptureWriter) Refused() bool  { return c.refused }
 
+// RefusalErr is the admission error that stopped capture (nil unless Refused).
+func (c *CaptureWriter) RefusalErr() error { return c.err }
+
 // ReadAllAdmitted reads r up to max bytes, reserving pool bytes before buffering. It
-// returns ErrOverloaded when the pool refuses and ErrTooLarge past max.
+// returns the admission error when refused (ErrOverloaded, or ErrAdmissionLimit from a
+// Limited scope) and ErrTooLarge past max.
 func ReadAllAdmitted(scope *Scope, r io.Reader, max int) ([]byte, error) {
 	w := NewCaptureWriter(scope, max)
 	_, err := io.Copy(w, r)
 	switch {
 	case w.Refused():
-		return nil, ErrOverloaded
+		return nil, w.RefusalErr()
 	case w.Over():
 		return nil, ErrTooLarge
 	case err != nil:

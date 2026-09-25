@@ -45,6 +45,9 @@ func openWorkspaceFileBeneath(root, rel string) (*os.File, error) {
 	}
 
 	parts := strings.Split(filepath.Clean(rel), string(filepath.Separator))
+	// opened tracks whether any component was opened. Comparing cur with rootFd is not
+	// enough: once rootFd is closed, a later openat may reuse its number.
+	opened := false
 	for i, part := range parts {
 		if part == "" || part == "." {
 			continue
@@ -55,6 +58,7 @@ func openWorkspaceFileBeneath(root, rel string) (*os.File, error) {
 			closeCur()
 			return nil, errEscape
 		}
+		opened = true
 		flags := unix.O_RDONLY | unix.O_NOFOLLOW | unix.O_CLOEXEC
 		if i < len(parts)-1 {
 			flags |= unix.O_DIRECTORY
@@ -70,7 +74,7 @@ func openWorkspaceFileBeneath(root, rel string) (*os.File, error) {
 		cur = next
 	}
 
-	if cur == rootFd {
+	if !opened {
 		// rel cleaned to "." — that's the root directory, not a file.
 		closeCur()
 		return nil, errEmptyPath

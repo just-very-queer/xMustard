@@ -14,6 +14,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"xmustard/api-go/internal/budget"
 	"xmustard/api-go/internal/rustcore"
 )
 
@@ -38,28 +39,30 @@ type DiagnosticsRequest struct {
 }
 
 type DiagnosticsPlan struct {
-	WorkspaceID        string                   `json:"workspace_id"`
-	RootPath           string                   `json:"root_path"`
-	InputPath          string                   `json:"input_path"`
-	SourceKind         string                   `json:"source_kind"`
-	SourceName         string                   `json:"source_name"`
-	IssueID            *string                  `json:"issue_id,omitempty"`
-	RunID              *string                  `json:"run_id,omitempty"`
-	DiagnosticCount    int                      `json:"diagnostic_count"`
-	SeverityCounts     map[string]int           `json:"severity_counts"`
-	HeadSHA            *string                  `json:"head_sha,omitempty"`
-	DirtyFiles         int                      `json:"dirty_files"`
-	WorktreeDirty      bool                     `json:"worktree_dirty"`
-	BatchFingerprint   *string                  `json:"batch_fingerprint,omitempty"`
-	ReplayArchive      *DiagnosticReplayArchive `json:"replay_archive,omitempty"`
-	PostgresConfigured bool                     `json:"postgres_configured"`
-	PostgresSchema     string                   `json:"postgres_schema"`
-	Blockers           []string                 `json:"blockers"`
-	Warnings           []string                 `json:"warnings"`
-	NextActions        []string                 `json:"next_actions"`
-	CanRun             bool                     `json:"can_run"`
-	GeneratedAt        string                   `json:"generated_at"`
-	NormalizedBatch    *DiagnosticsBatch        `json:"normalized_batch,omitempty"`
+	WorkspaceID        string                    `json:"workspace_id"`
+	RootPath           string                    `json:"root_path"`
+	InputPath          string                    `json:"input_path"`
+	SourceKind         string                    `json:"source_kind"`
+	SourceName         string                    `json:"source_name"`
+	IssueID            *string                   `json:"issue_id,omitempty"`
+	RunID              *string                   `json:"run_id,omitempty"`
+	DiagnosticCount    int                       `json:"diagnostic_count"`
+	SeverityCounts     map[string]int            `json:"severity_counts"`
+	HeadSHA            *string                   `json:"head_sha,omitempty"`
+	DirtyFiles         int                       `json:"dirty_files"`
+	WorktreeDirty      bool                      `json:"worktree_dirty"`
+	BatchFingerprint   *string                   `json:"batch_fingerprint,omitempty"`
+	ReplayArchive      *DiagnosticReplayArchive  `json:"replay_archive,omitempty"`
+	PostgresConfigured bool                      `json:"postgres_configured"`
+	PostgresSchema     string                    `json:"postgres_schema"`
+	StorageBackend     string                    `json:"storage_backend"`
+	Normalization      *DiagnosticsNormalization `json:"normalization,omitempty"`
+	Blockers           []string                  `json:"blockers"`
+	Warnings           []string                  `json:"warnings"`
+	NextActions        []string                  `json:"next_actions"`
+	CanRun             bool                      `json:"can_run"`
+	GeneratedAt        string                    `json:"generated_at"`
+	NormalizedBatch    *DiagnosticsBatch         `json:"normalized_batch,omitempty"`
 }
 
 type DiagnosticsRunResult struct {
@@ -68,8 +71,12 @@ type DiagnosticsRunResult struct {
 	Plan           *DiagnosticsPlan `json:"plan"`
 	Baseline       *DiagnosticRun   `json:"baseline,omitempty"`
 	DiagnosticRows int              `json:"diagnostic_rows"`
+	StorageBackend string           `json:"storage_backend"`
 	Message        string           `json:"message"`
-	GeneratedAt    string           `json:"generated_at"`
+	// Warnings are problems after the baseline was committed; they never mean the
+	// import failed (Baseline is set and readable).
+	Warnings    []string `json:"warnings,omitempty"`
+	GeneratedAt string   `json:"generated_at"`
 }
 
 type DiagnosticsStatus struct {
@@ -80,9 +87,13 @@ type DiagnosticsStatus struct {
 	CurrentHeadSHA     *string        `json:"current_head_sha,omitempty"`
 	CurrentDirtyFiles  int            `json:"current_dirty_files"`
 	Baseline           *DiagnosticRun `json:"baseline,omitempty"`
-	StaleReasons       []string       `json:"stale_reasons"`
-	Warnings           []string       `json:"warnings"`
-	GeneratedAt        string         `json:"generated_at"`
+	// StaleReasons carries prose sentences for PostgreSQL (unchanged) and coded tokens
+	// for local storage (head_moved, dirty_worktree, ingestion_identity_*, ...).
+	StaleReasons   []string `json:"stale_reasons"`
+	Warnings       []string `json:"warnings"`
+	StorageBackend string   `json:"storage_backend"`
+	FreshnessBasis string   `json:"freshness_basis"`
+	GeneratedAt    string   `json:"generated_at"`
 }
 
 type DiagnosticRun struct {
@@ -103,6 +114,30 @@ type DiagnosticRun struct {
 	InputPath        string                      `json:"input_path"`
 	PostgresSchema   string                      `json:"postgres_schema"`
 	CreatedAt        string                      `json:"created_at"`
+	// Additive storage fields. Local records set all of them; PostgreSQL reads set
+	// storage_backend and freshness_basis only.
+	StorageBackend    string                        `json:"storage_backend,omitempty"`
+	SourceRevision    string                        `json:"source_revision,omitempty"`
+	FreshnessBasis    string                        `json:"freshness_basis,omitempty"`
+	Normalization     *DiagnosticsNormalization     `json:"normalization,omitempty"`
+	Coverage          *DiagnosticsCoverage          `json:"coverage,omitempty"`
+	IngestionIdentity *DiagnosticsIngestionIdentity `json:"ingestion_identity,omitempty"`
+	Retention         *DiagnosticsRetention         `json:"retention,omitempty"`
+}
+
+// DiagnosticsRetention is the local store's retention promise for one baseline.
+type DiagnosticsRetention struct {
+	ExpiresAt string `json:"expires_at"`
+	Promise   string `json:"promise"`
+}
+
+// DiagnosticsStorage describes where a GET's baseline came from and how current it is.
+// Status is set for local storage only (no_baseline | available | stale).
+type DiagnosticsStorage struct {
+	Backend        string   `json:"backend"`
+	Status         string   `json:"status,omitempty"`
+	StaleReasons   []string `json:"stale_reasons,omitempty"`
+	FreshnessBasis string   `json:"freshness_basis"`
 }
 
 type DiagnosticReplayArchive struct {
@@ -164,15 +199,17 @@ type DiagnosticRecord struct {
 	LinkStatus       string                  `json:"link_status"`
 	LinkedSymbol     *DiagnosticLinkedSymbol `json:"linked_symbol,omitempty"`
 	LinkContext      *DiagnosticLinkContext  `json:"link_context,omitempty"`
+	IdentityStatus   string                  `json:"identity_status,omitempty"`
 	GeneratedAt      string                  `json:"generated_at"`
 }
 
 type DiagnosticsReadResult struct {
-	WorkspaceID string             `json:"workspace_id"`
-	Baseline    *DiagnosticRun     `json:"baseline,omitempty"`
-	Diagnostics []DiagnosticRecord `json:"diagnostics"`
-	Warnings    []string           `json:"warnings"`
-	GeneratedAt string             `json:"generated_at"`
+	WorkspaceID string              `json:"workspace_id"`
+	Baseline    *DiagnosticRun      `json:"baseline,omitempty"`
+	Diagnostics []DiagnosticRecord  `json:"diagnostics"`
+	Warnings    []string            `json:"warnings"`
+	Storage     *DiagnosticsStorage `json:"storage,omitempty"`
+	GeneratedAt string              `json:"generated_at"`
 }
 
 type DiagnosticsBatch = rustcore.DiagnosticsBatch
@@ -206,20 +243,141 @@ func ReadLiveDiagnostics(dataDir string, workspaceID string, relativePath string
 	return rustcore.NormalizeDiagnosticsPayload(ctx, workspaceID, workspace.RootPath, payload, "lsp", config.ServerID)
 }
 
+const (
+	diagnosticsBackendLocal               = "local"
+	diagnosticsBackendPostgres            = "postgres"
+	diagnosticsFreshnessIngestionIdentity = "ingestion_identity"
+	diagnosticsFreshnessHeadMatch         = "head_match"
+	diagnosticsLocalSymbolWarning         = "Symbol linking requires PostgreSQL; local diagnostics rows are not linked to symbols."
+)
+
+// DiagnosticBaselineStore is the one seam between diagnostics import/read and where
+// baselines live. selectDiagnosticsStore picks the adapter; a PostgreSQL failure is
+// returned as-is, never retried against local storage.
+type DiagnosticBaselineStore interface {
+	Backend() string
+	Publish(ctx context.Context, pub *diagnosticsPublication) (*DiagnosticRun, int, error)
+	Latest(ctx context.Context, workspaceID string) (*DiagnosticRun, error)
+	ByID(ctx context.Context, workspaceID string, diagnosticRunID string) (*DiagnosticRun, error)
+	Rows(ctx context.Context, workspaceID string, diagnosticRunID string) ([]DiagnosticRecord, error)
+}
+
+// diagnosticsPublication is what an import hands a store: the plan, the Go-owned
+// original bytes, and the import's admission ledger.
+type diagnosticsPublication struct {
+	Plan  *DiagnosticsPlan
+	Input *capturedDiagnosticsInput
+	Scope *budget.Scope
+}
+
+// postgresDiagnosticsStore wraps the existing PostgreSQL persistence and reads unchanged.
+type postgresDiagnosticsStore struct {
+	dataDir string
+	dsn     string
+	schema  string
+}
+
+func (s *postgresDiagnosticsStore) Backend() string { return diagnosticsBackendPostgres }
+
+func (s *postgresDiagnosticsStore) Publish(ctx context.Context, pub *diagnosticsPublication) (*DiagnosticRun, int, error) {
+	run, rows, err := persistDiagnosticsBaseline(ctx, s.dataDir, s.dsn, s.schema, pub.Plan)
+	return withPostgresStorage(run), rows, err
+}
+
+func (s *postgresDiagnosticsStore) Latest(ctx context.Context, workspaceID string) (*DiagnosticRun, error) {
+	run, err := readLatestDiagnosticRun(ctx, s.dsn, s.schema, workspaceID)
+	return withPostgresStorage(run), err
+}
+
+func (s *postgresDiagnosticsStore) ByID(ctx context.Context, workspaceID string, diagnosticRunID string) (*DiagnosticRun, error) {
+	run, err := readDiagnosticRunByID(ctx, s.dsn, s.schema, workspaceID, diagnosticRunID)
+	return withPostgresStorage(run), err
+}
+
+func (s *postgresDiagnosticsStore) Rows(ctx context.Context, workspaceID string, diagnosticRunID string) ([]DiagnosticRecord, error) {
+	return readDiagnosticRows(ctx, s.dsn, s.schema, workspaceID, diagnosticRunID)
+}
+
+func withPostgresStorage(run *DiagnosticRun) *DiagnosticRun {
+	if run != nil {
+		run.StorageBackend = diagnosticsBackendPostgres
+		run.FreshnessBasis = diagnosticsFreshnessHeadMatch
+	}
+	return run
+}
+
+// selectDiagnosticsStore is the only DSN-selection seam: an explicit (request) or
+// configured DSN selects PostgreSQL; with neither, local storage, and nothing dials
+// PostgreSQL. It returns the resolved schema for plan/status reporting.
+func selectDiagnosticsStore(dataDir string, settings *appSettings, requestDSN *string, requestSchema *string) (DiagnosticBaselineStore, string) {
+	schema := strings.TrimSpace(firstConfiguredString(requestSchema, &settings.PostgresSchema))
+	if schema == "" {
+		schema = "xmustard"
+	}
+	dsn := strings.TrimSpace(firstConfiguredString(requestDSN, settings.PostgresDSN))
+	if dsn == "" {
+		return newLocalDiagnosticsStore(dataDir), schema
+	}
+	return &postgresDiagnosticsStore{dataDir: dataDir, dsn: dsn, schema: schema}, schema
+}
+
+// diagnosticsImportSlots bounds concurrent imports in this process.
+var diagnosticsImportSlots = make(chan struct{}, 2)
+
+func acquireDiagnosticsImportSlot(ctx context.Context) (func(), error) {
+	timer := time.NewTimer(diagnosticsLockWait)
+	defer timer.Stop()
+	select {
+	case diagnosticsImportSlots <- struct{}{}:
+		return func() { <-diagnosticsImportSlots }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-timer.C:
+		return nil, fmt.Errorf("%w (diagnostics import limit %d reached)", budget.ErrOverloaded, cap(diagnosticsImportSlots))
+	}
+}
+
+// importScope opens the one per-import admission ledger inside ctx's scope (the HTTP
+// request's, or one the CLI opened), so both entry points account identically.
+func importScope(ctx context.Context) (context.Context, *budget.Scope, func()) {
+	parent, owned := budget.ScopeFor(ctx)
+	scope := parent.Limited(diagnosticsImportAdmissionBytes)
+	return budget.WithScope(ctx, scope), scope, func() {
+		scope.Close()
+		if owned {
+			parent.Close()
+		}
+	}
+}
+
 func PlanDiagnostics(dataDir string, workspaceID string, request DiagnosticsRequest) (*DiagnosticsPlan, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), diagnosticsImportTimeout)
+	defer cancel()
+	return PlanDiagnosticsCtx(ctx, dataDir, workspaceID, request, DiagnosticsRunOptions{})
+}
+
+// PlanDiagnosticsCtx captures, validates and normalizes the input without publishing.
+func PlanDiagnosticsCtx(ctx context.Context, dataDir string, workspaceID string, request DiagnosticsRequest, opts DiagnosticsRunOptions) (*DiagnosticsPlan, error) {
+	ctx, cancel := context.WithTimeout(ctx, diagnosticsImportTimeout)
+	defer cancel()
+	ctx, scope, closeScope := importScope(ctx)
+	defer closeScope()
+	plan, captured, err := planDiagnostics(ctx, scope, dataDir, workspaceID, request, opts)
+	captured.Close()
+	return plan, err
+}
+
+func planDiagnostics(ctx context.Context, scope *budget.Scope, dataDir string, workspaceID string, request DiagnosticsRequest, opts DiagnosticsRunOptions) (*DiagnosticsPlan, *capturedDiagnosticsInput, error) {
 	workspace, err := getWorkspaceRecord(dataDir, workspaceID)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	settings, err := loadSettings(dataDir)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	targetDSN := strings.TrimSpace(firstConfiguredString(request.DSN, settings.PostgresDSN))
-	targetSchema := strings.TrimSpace(firstConfiguredString(request.SchemaName, &settings.PostgresSchema))
-	if targetSchema == "" {
-		targetSchema = "xmustard"
-	}
+	store, targetSchema := selectDiagnosticsStore(dataDir, settings, request.DSN, request.SchemaName)
+	backend := store.Backend()
 	blockers := []string{}
 	warnings := []string{}
 	sourceKind := normalizeDiagnosticSourceKind(request.SourceKind)
@@ -227,39 +385,67 @@ func PlanDiagnostics(dataDir string, workspaceID string, request DiagnosticsRequ
 	if sourceName == "" {
 		sourceName = "unknown"
 	}
-	if targetDSN == "" {
-		blockers = append(blockers, "Postgres DSN is not configured; diagnostics need durable baseline storage.")
-	}
 	issueID, runID, runLinkErr := resolveDiagnosticsRunLink(dataDir, workspaceID, request.IssueID, request.RunID)
 	if runLinkErr != nil {
 		blockers = append(blockers, runLinkErr.Error())
 	}
-	inputPath, inputErr := resolveDiagnosticsInputPath(workspace.RootPath, request.InputPath)
-	if inputErr != nil {
+	captured, inputErr := captureDiagnosticsInput(scope, workspace.RootPath, request.InputPath, opts.InputAuthority)
+	inputPath := strings.TrimSpace(request.InputPath)
+	switch {
+	case inputErr == nil:
+		inputPath = captured.Path
+	case errors.Is(inputErr, errDiagnosticsInputMissing):
 		blockers = append(blockers, inputErr.Error())
+	default:
+		return nil, nil, inputErr
 	}
-	worktree := readWorktreeStatus(workspace.RootPath)
+	probeCtx, cancelProbe := context.WithTimeout(ctx, diagnosticsGitProbeTimeout)
+	worktree := readWorktreeStatusCtx(probeCtx, workspace.RootPath)
+	cancelProbe()
 	var batch *DiagnosticsBatch
 	var fingerprint *string
 	var replayArchive *DiagnosticReplayArchive
-	if inputErr == nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		batch, err = rustcore.NormalizeDiagnostics(ctx, workspaceID, workspace.RootPath, inputPath, sourceKind, sourceName)
+	var normalization *DiagnosticsNormalization
+	if captured != nil {
+		fail := func(err error) (*DiagnosticsPlan, *capturedDiagnosticsInput, error) {
+			captured.Close()
+			return nil, nil, err
+		}
+		normalizeCtx, cancelNormalize := context.WithTimeout(ctx, diagnosticsNormalizeTimeout)
+		batch, err = rustcore.NormalizeDiagnostics(normalizeCtx, workspaceID, workspace.RootPath, captured.TempPath, sourceKind, sourceName)
+		cancelNormalize()
 		if err != nil {
+			if hardErr := diagnosticsHardError(ctx, err); hardErr != nil {
+				return fail(hardErr)
+			}
 			blockers = append(blockers, err.Error())
 		} else {
+			if normalization, err = diagnosticsNormalizationFor(captured.Items, batch.DiagnosticCount); err != nil {
+				return fail(err)
+			}
 			warnings = append(warnings, batch.Warnings...)
 			value := diagnosticsBatchFingerprint(workspaceID, sourceKind, sourceName, batch.Diagnostics, worktree.HeadSHA)
 			fingerprint = &value
-			archive, err := rustcore.ArchiveDiagnosticsPayload(ctx, workspaceID, inputPath, sourceKind, sourceName, diagnosticServerProvenance(workspace.RootPath, sourceKind, sourceName, inputPath, batch))
+			archiveCtx, cancelArchive := context.WithTimeout(ctx, diagnosticsArchiveTimeout)
+			archive, err := rustcore.ArchiveDiagnosticsPayload(archiveCtx, workspaceID, captured.TempPath, sourceKind, sourceName, diagnosticServerProvenance(workspace.RootPath, sourceKind, sourceName, inputPath, batch))
+			cancelArchive()
 			if err != nil {
+				if hardErr := diagnosticsHardError(ctx, err); hardErr != nil {
+					return fail(hardErr)
+				}
 				blockers = append(blockers, err.Error())
 			} else {
+				// Rust re-emits parsed JSON; the Go-captured bytes are the source of truth.
+				if archive.RawPayloadSHA256 != captured.SHA256 || archive.RawPayloadBytes != len(captured.Raw) {
+					return fail(errors.New("diagnostics import failed: Rust archived bytes do not match the captured input checksum"))
+				}
 				replayArchive = diagnosticsReplayArchiveFromRust(archive)
 				warnings = append(warnings, archive.Warnings...)
 			}
 		}
+	}
+	if normalization != nil && normalization.Status == "partial" {
+		warnings = append(warnings, fmt.Sprintf("Normalization is partial: %d of %d input diagnostics were skipped; this baseline cannot read as clean.", normalization.Skipped, normalization.Items))
 	}
 	if worktree.DirtyFiles > 0 {
 		warnings = append(warnings, "Worktree has dirty files; this diagnostics baseline should be treated as provisional.")
@@ -267,18 +453,22 @@ func PlanDiagnostics(dataDir string, workspaceID string, request DiagnosticsRequ
 	if runID == nil {
 		warnings = append(warnings, "No run_id was provided; this diagnostics baseline will be linked to repo state but not a durable run record.")
 	}
+	if backend == diagnosticsBackendLocal {
+		warnings = append(warnings, diagnosticsLocalSymbolWarning)
+	}
 	nextActions := []string{
 		"Run diagnostics run after reviewing the normalized diagnostics count and source provenance.",
 		"Feed LSP publishDiagnostics JSON into --input-path for the first bounded Phase 3 ingestion path.",
-	}
-	if targetDSN == "" {
-		nextActions = append([]string{"Configure Postgres or pass --dsn for this diagnostics run."}, nextActions...)
 	}
 	counts := map[string]int{}
 	if batch != nil {
 		counts = batch.SeverityCounts
 	}
-	return &DiagnosticsPlan{
+	schema := targetSchema
+	if backend == diagnosticsBackendLocal {
+		schema = ""
+	}
+	plan := &DiagnosticsPlan{
 		WorkspaceID:        workspaceID,
 		RootPath:           workspace.RootPath,
 		InputPath:          inputPath,
@@ -293,55 +483,106 @@ func PlanDiagnostics(dataDir string, workspaceID string, request DiagnosticsRequ
 		WorktreeDirty:      worktree.DirtyFiles > 0,
 		BatchFingerprint:   fingerprint,
 		ReplayArchive:      replayArchive,
-		PostgresConfigured: targetDSN != "",
-		PostgresSchema:     targetSchema,
+		PostgresConfigured: backend == diagnosticsBackendPostgres,
+		PostgresSchema:     schema,
+		StorageBackend:     backend,
+		Normalization:      normalization,
 		Blockers:           dedupeSemanticStrings(blockers),
 		Warnings:           dedupeSemanticStrings(warnings),
 		NextActions:        nextActions,
 		CanRun:             len(blockers) == 0,
 		GeneratedAt:        nowUTC(),
 		NormalizedBatch:    batch,
-	}, nil
+	}
+	return plan, captured, nil
+}
+
+// diagnosticsHardError picks out child failures that must fail the import with their
+// own status instead of becoming a plan blocker: cancellation/deadline, busy (503),
+// and a deterministic admission-cap breach (413).
+func diagnosticsHardError(ctx context.Context, err error) error {
+	switch {
+	case ctx.Err() != nil:
+		return fmt.Errorf("diagnostics import cancelled: %w", ctx.Err())
+	case errors.Is(err, budget.ErrAdmissionLimit):
+		return diagnosticsAdmissionError(err)
+	case errors.Is(err, budget.ErrOverloaded):
+		return err
+	}
+	return nil
 }
 
 func RunDiagnostics(dataDir string, workspaceID string, request DiagnosticsRequest) (*DiagnosticsRunResult, error) {
-	plan, err := PlanDiagnostics(dataDir, workspaceID, request)
-	if err != nil {
+	return RunDiagnosticsCtx(context.Background(), dataDir, workspaceID, request, DiagnosticsRunOptions{})
+}
+
+// RunDiagnosticsCtx imports one diagnostics report under a single 120 s deadline
+// (child-slot waits, both Rust children, the git probe, lock and I/O) and one
+// admission ledger. Cancellation kills the children and publishes nothing.
+func RunDiagnosticsCtx(ctx context.Context, dataDir string, workspaceID string, request DiagnosticsRequest, opts DiagnosticsRunOptions) (*DiagnosticsRunResult, error) {
+	ctx, cancel := context.WithTimeout(ctx, diagnosticsImportTimeout)
+	defer cancel()
+	if _, err := getWorkspaceRecord(dataDir, workspaceID); err != nil {
 		return nil, err
-	}
-	if request.DryRun {
-		return &DiagnosticsRunResult{
-			WorkspaceID: workspaceID,
-			DryRun:      true,
-			Plan:        plan,
-			Message:     "Diagnostics dry run completed; no rows were written.",
-			GeneratedAt: nowUTC(),
-		}, nil
-	}
-	if !plan.CanRun {
-		return &DiagnosticsRunResult{
-			WorkspaceID: workspaceID,
-			DryRun:      false,
-			Plan:        plan,
-			Message:     "Diagnostics run is blocked; inspect plan.blockers.",
-			GeneratedAt: nowUTC(),
-		}, nil
 	}
 	settings, err := loadSettings(dataDir)
 	if err != nil {
 		return nil, err
 	}
-	targetDSN := strings.TrimSpace(firstConfiguredString(request.DSN, settings.PostgresDSN))
-	baseline, rows, err := persistDiagnosticsBaseline(dataDir, targetDSN, plan.PostgresSchema, plan)
+	store, _ := selectDiagnosticsStore(dataDir, settings, request.DSN, request.SchemaName)
+	if !request.DryRun {
+		release, err := acquireDiagnosticsImportSlot(ctx)
+		if err != nil {
+			return nil, err
+		}
+		defer release()
+		if local, ok := store.(*localDiagnosticsStore); ok {
+			unlock, err := local.lockImport(ctx, workspaceID)
+			if err != nil {
+				return nil, err
+			}
+			defer unlock()
+		}
+	}
+	ctx, scope, closeScope := importScope(ctx)
+	defer closeScope()
+	plan, captured, err := planDiagnostics(ctx, scope, dataDir, workspaceID, request, opts)
 	if err != nil {
 		return nil, err
 	}
+	defer captured.Close()
+	if request.DryRun {
+		return &DiagnosticsRunResult{
+			WorkspaceID:    workspaceID,
+			DryRun:         true,
+			Plan:           plan,
+			StorageBackend: plan.StorageBackend,
+			Message:        "Diagnostics dry run completed; no rows were written.",
+			GeneratedAt:    nowUTC(),
+		}, nil
+	}
+	if !plan.CanRun {
+		return &DiagnosticsRunResult{
+			WorkspaceID:    workspaceID,
+			DryRun:         false,
+			Plan:           plan,
+			StorageBackend: plan.StorageBackend,
+			Message:        "Diagnostics run is blocked; inspect plan.blockers.",
+			GeneratedAt:    nowUTC(),
+		}, nil
+	}
+	baseline, rows, err := store.Publish(ctx, &diagnosticsPublication{Plan: plan, Input: captured, Scope: scope})
+	if err != nil {
+		return nil, err
+	}
+	var warnings []string
 	if err := appendWorkspaceSemanticActivity(
 		dataDir,
 		workspaceID,
-		"postgres.materialize.diagnostics",
+		"diagnostics.materialize",
 		fmt.Sprintf("Materialized %d normalized diagnostic row(s)", rows),
 		map[string]any{
+			"storage_backend":   plan.StorageBackend,
 			"source_kind":       plan.SourceKind,
 			"source_name":       plan.SourceName,
 			"schema_name":       plan.PostgresSchema,
@@ -351,7 +592,13 @@ func RunDiagnostics(dataDir string, workspaceID string, request DiagnosticsReque
 			"run_id":            trimOptional(plan.RunID),
 		},
 	); err != nil {
-		return nil, err
+		// The baseline is already committed and readable; failing here would hide its
+		// run ID and invite a retry that publishes a duplicate.
+		warnings = append(warnings, fmt.Sprintf("Baseline %s was committed, but recording its activity failed: %v", baseline.DiagnosticRunID, err))
+	}
+	message := fmt.Sprintf("Materialized %d normalized diagnostic row(s) into Postgres schema '%s'.", rows, plan.PostgresSchema)
+	if plan.StorageBackend == diagnosticsBackendLocal {
+		message = fmt.Sprintf("Materialized %d normalized diagnostic row(s) into local diagnostics storage.", rows)
 	}
 	return &DiagnosticsRunResult{
 		WorkspaceID:    workspaceID,
@@ -359,12 +606,18 @@ func RunDiagnostics(dataDir string, workspaceID string, request DiagnosticsReque
 		Plan:           plan,
 		Baseline:       baseline,
 		DiagnosticRows: rows,
-		Message:        fmt.Sprintf("Materialized %d normalized diagnostic row(s) into Postgres schema '%s'.", rows, plan.PostgresSchema),
+		StorageBackend: plan.StorageBackend,
+		Message:        message,
+		Warnings:       warnings,
 		GeneratedAt:    nowUTC(),
 	}, nil
 }
 
 func ReadDiagnosticsStatus(dataDir string, workspaceID string) (*DiagnosticsStatus, error) {
+	return ReadDiagnosticsStatusCtx(context.Background(), dataDir, workspaceID)
+}
+
+func ReadDiagnosticsStatusCtx(ctx context.Context, dataDir string, workspaceID string) (*DiagnosticsStatus, error) {
 	workspace, err := getWorkspaceRecord(dataDir, workspaceID)
 	if err != nil {
 		return nil, err
@@ -373,28 +626,30 @@ func ReadDiagnosticsStatus(dataDir string, workspaceID string) (*DiagnosticsStat
 	if err != nil {
 		return nil, err
 	}
-	targetDSN := strings.TrimSpace(firstConfiguredString(nil, settings.PostgresDSN))
-	schema := settings.PostgresSchema
-	if schema == "" {
-		schema = "xmustard"
-	}
-	worktree := readWorktreeStatus(workspace.RootPath)
-	warnings := []string{}
-	if targetDSN == "" {
-		return &DiagnosticsStatus{
-			WorkspaceID:        workspaceID,
-			Status:             "blocked",
-			PostgresConfigured: false,
-			PostgresSchema:     schema,
-			CurrentHeadSHA:     worktree.HeadSHA,
-			CurrentDirtyFiles:  worktree.DirtyFiles,
-			StaleReasons:       []string{"Postgres DSN is not configured, so no diagnostics baseline can be read."},
-			GeneratedAt:        nowUTC(),
-		}, nil
-	}
-	baseline, err := readLatestDiagnosticRun(context.Background(), targetDSN, schema, workspaceID)
+	store, schema := selectDiagnosticsStore(dataDir, settings, nil, nil)
+	probeCtx, cancelProbe := context.WithTimeout(ctx, diagnosticsGitProbeTimeout)
+	worktree := readWorktreeStatusCtx(probeCtx, workspace.RootPath)
+	cancelProbe()
+	baseline, err := store.Latest(ctx, workspaceID)
 	if err != nil {
 		return nil, err
+	}
+	if store.Backend() == diagnosticsBackendLocal {
+		status, reasons := localDiagnosticsStatus(baseline, worktree)
+		return &DiagnosticsStatus{
+			WorkspaceID:        workspaceID,
+			Status:             status,
+			PostgresConfigured: false,
+			PostgresSchema:     "",
+			CurrentHeadSHA:     worktree.HeadSHA,
+			CurrentDirtyFiles:  worktree.DirtyFiles,
+			Baseline:           baseline,
+			StaleReasons:       reasons,
+			Warnings:           []string{},
+			StorageBackend:     diagnosticsBackendLocal,
+			FreshnessBasis:     diagnosticsFreshnessIngestionIdentity,
+			GeneratedAt:        nowUTC(),
+		}, nil
 	}
 	status := "fresh"
 	staleReasons := []string{}
@@ -420,7 +675,9 @@ func ReadDiagnosticsStatus(dataDir string, workspaceID string) (*DiagnosticsStat
 		CurrentDirtyFiles:  worktree.DirtyFiles,
 		Baseline:           baseline,
 		StaleReasons:       dedupeSemanticStrings(staleReasons),
-		Warnings:           warnings,
+		Warnings:           []string{},
+		StorageBackend:     diagnosticsBackendPostgres,
+		FreshnessBasis:     diagnosticsFreshnessHeadMatch,
 		GeneratedAt:        nowUTC(),
 	}, nil
 }
@@ -429,26 +686,22 @@ func ReadDiagnostics(dataDir string, workspaceID string, diagnosticRunID string)
 	return ReadDiagnosticsCtx(context.Background(), dataDir, workspaceID, diagnosticRunID)
 }
 
-// ReadDiagnosticsCtx is the request-scoped variant: cancelling ctx aborts its Postgres reads.
+// ReadDiagnosticsCtx is the request-scoped variant: cancelling ctx aborts its reads.
+// Without a DSN it reads local storage and never dials PostgreSQL.
 func ReadDiagnosticsCtx(ctx context.Context, dataDir string, workspaceID string, diagnosticRunID string) (*DiagnosticsReadResult, error) {
-	if _, err := getWorkspaceRecord(dataDir, workspaceID); err != nil {
+	workspace, err := getWorkspaceRecord(dataDir, workspaceID)
+	if err != nil {
 		return nil, err
 	}
 	settings, err := loadSettings(dataDir)
 	if err != nil {
 		return nil, err
 	}
-	targetDSN := strings.TrimSpace(firstConfiguredString(nil, settings.PostgresDSN))
-	schema := settings.PostgresSchema
-	if schema == "" {
-		schema = "xmustard"
-	}
-	if targetDSN == "" {
-		return nil, fmt.Errorf("%w: Postgres DSN is required to read diagnostics", ErrInvalidDiagnosticsRequest)
-	}
+	store, _ := selectDiagnosticsStore(dataDir, settings, nil, nil)
+	local := store.Backend() == diagnosticsBackendLocal
 	var baseline *DiagnosticRun
 	if strings.TrimSpace(diagnosticRunID) != "" {
-		baseline, err = readDiagnosticRunByID(ctx, targetDSN, schema, workspaceID, diagnosticRunID)
+		baseline, err = store.ByID(ctx, workspaceID, diagnosticRunID)
 		if err != nil {
 			return nil, err
 		}
@@ -456,29 +709,62 @@ func ReadDiagnosticsCtx(ctx context.Context, dataDir string, workspaceID string,
 			return nil, fmt.Errorf("%w: diagnostics run not found: %s", ErrInvalidDiagnosticsRequest, strings.TrimSpace(diagnosticRunID))
 		}
 	} else {
-		baseline, err = readLatestDiagnosticRun(ctx, targetDSN, schema, workspaceID)
+		baseline, err = store.Latest(ctx, workspaceID)
 		if err != nil {
 			return nil, err
 		}
 	}
-	if baseline == nil {
-		return &DiagnosticsReadResult{WorkspaceID: workspaceID, Diagnostics: []DiagnosticRecord{}, Warnings: []string{"No diagnostics baseline has been materialized."}, GeneratedAt: nowUTC()}, nil
+	var storage *DiagnosticsStorage
+	if local {
+		var worktree *WorktreeStatus
+		if baseline != nil {
+			probeCtx, cancelProbe := context.WithTimeout(ctx, diagnosticsGitProbeTimeout)
+			worktree = readWorktreeStatusCtx(probeCtx, workspace.RootPath)
+			cancelProbe()
+		}
+		status, reasons := localDiagnosticsStatus(baseline, worktree)
+		storage = &DiagnosticsStorage{Backend: diagnosticsBackendLocal, Status: status, StaleReasons: reasons, FreshnessBasis: diagnosticsFreshnessIngestionIdentity}
+	} else {
+		storage = &DiagnosticsStorage{Backend: diagnosticsBackendPostgres, FreshnessBasis: diagnosticsFreshnessHeadMatch}
 	}
-	diagnostics, err := readDiagnosticRows(ctx, targetDSN, schema, workspaceID, baseline.DiagnosticRunID)
+	if baseline == nil {
+		return &DiagnosticsReadResult{WorkspaceID: workspaceID, Diagnostics: []DiagnosticRecord{}, Warnings: []string{"No diagnostics baseline has been materialized."}, Storage: storage, GeneratedAt: nowUTC()}, nil
+	}
+	diagnostics, err := store.Rows(ctx, workspaceID, baseline.DiagnosticRunID)
 	if err != nil {
 		return nil, err
+	}
+	warnings := []string{}
+	if local {
+		warnings = localDiagnosticsWarnings(baseline)
+	} else {
+		warnings = diagnosticReplayWarnings(baseline, diagnostics)
 	}
 	return &DiagnosticsReadResult{
 		WorkspaceID: workspaceID,
 		Baseline:    baseline,
 		Diagnostics: diagnostics,
-		Warnings:    diagnosticReplayWarnings(baseline, diagnostics),
+		Warnings:    warnings,
+		Storage:     storage,
 		GeneratedAt: nowUTC(),
 	}, nil
 }
 
-func persistDiagnosticsBaseline(dataDir string, dsn string, schema string, plan *DiagnosticsPlan) (*DiagnosticRun, int, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+func localDiagnosticsWarnings(baseline *DiagnosticRun) []string {
+	warnings := []string{diagnosticsLocalSymbolWarning}
+	if baseline.ReplayArchive != nil {
+		warnings = append(warnings, baseline.ReplayArchive.Warnings...)
+	}
+	if n := baseline.Normalization; n != nil && n.Status == "partial" {
+		warnings = append(warnings, fmt.Sprintf("Normalization is partial: %d of %d input diagnostics were skipped; this baseline cannot read as clean.", n.Skipped, n.Items))
+	}
+	return dedupeSemanticStrings(warnings)
+}
+
+// persistDiagnosticsBaseline writes under the caller's context (the request or CLI
+// import deadline), capped at 60 s, so a cancelled import stops its PostgreSQL work.
+func persistDiagnosticsBaseline(ctx context.Context, dataDir string, dsn string, schema string, plan *DiagnosticsPlan) (*DiagnosticRun, int, error) {
+	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
 	connection, err := connectSemanticPostgres(ctx, dsn)
 	if err != nil {
@@ -817,25 +1103,6 @@ func readDiagnosticRows(ctx context.Context, dsn string, schema string, workspac
 		}
 	}
 	return rows, nil
-}
-
-func resolveDiagnosticsInputPath(rootPath string, inputPath string) (string, error) {
-	trimmed := strings.TrimSpace(inputPath)
-	if trimmed == "" {
-		return "", fmt.Errorf("%w: input_path is required", ErrInvalidDiagnosticsRequest)
-	}
-	path := trimmed
-	if !filepath.IsAbs(path) {
-		path = filepath.Join(rootPath, filepath.FromSlash(path))
-	}
-	info, err := os.Stat(path)
-	if err != nil {
-		return path, fmt.Errorf("%w: diagnostics input not found: %s", ErrInvalidDiagnosticsRequest, trimmed)
-	}
-	if info.IsDir() {
-		return path, fmt.Errorf("%w: diagnostics input must be a JSON file: %s", ErrInvalidDiagnosticsRequest, trimmed)
-	}
-	return path, nil
 }
 
 func normalizeDiagnosticSourceKind(value string) string {

@@ -21,6 +21,7 @@ import {
 	pageHeaderOf,
 	PgFixture,
 	REPO_ROOT,
+	runOps,
 	runPi,
 	sampler,
 	StallProxy,
@@ -39,8 +40,9 @@ const summary: Record<string, unknown> = { dir: T };
 let api: Api;
 let ws = "";
 let runSeq = 0;
-// Native Postgres is required for the diagnostics tool to succeed; the script sets
-// XM_PG_BIN_DIR, or XM_E2E_ALLOW_NO_POSTGRES=1 to accept diagnostics as error-only.
+// With XM_PG_BIN_DIR the diagnostics baseline is the native-Postgres control; without
+// it (XM_E2E_ALLOW_NO_POSTGRES=1) the same tool reads database-free local storage,
+// seeded by the real xmustard-ops CLI.
 const pgBin = process.env.XM_PG_BIN_DIR;
 let pg: PgFixture | undefined;
 
@@ -65,9 +67,20 @@ function seedDataDir(dir: string): void {
 	cpSync(join(T, "data", "workspaces.json"), join(dir, "workspaces.json"));
 }
 
+const seededReport = (root: string) =>
+	JSON.stringify({
+		uri: `file://${join(root, "pkg", "handler_0007.go")}`,
+		diagnostics: [
+			{ range: { start: { line: 5, character: 8 }, end: { line: 5, character: 13 } }, severity: 1, code: "XME2E", source: "gopls", message: "xm_e2e_diagnostic: negative input panics" },
+		],
+	});
+
 // setUpDiagnostics points the API at the fixture database through the existing
 // settings and bootstrap routes, then materializes one LSP diagnostic through the
-// existing diagnostics/run route (Rust normalizes, Go persists).
+// existing diagnostics/run route (Rust normalizes, Go persists). HTTP input is
+// workspace-confined, so the fixture lives under repo/.xmustard-e2e/ and is posted
+// as a relative path; it is written after the auto_scan load, so the seeded scan
+// never sees it.
 async function setUpDiagnostics(fixture: PgFixture): Promise<void> {
 	mkdirSync(join(T, "sql"), { recursive: true }); // the API reads <data>/../sql
 	cpSync(join(REPO_ROOT, "backend", "sql", "001_repo_cockpit_postgres.sql"), join(T, "sql", "001_repo_cockpit_postgres.sql"));
@@ -76,19 +89,28 @@ async function setUpDiagnostics(fixture: PgFixture): Promise<void> {
 	assert.equal(set.status, 200, set.text);
 	const boot = await api.json("POST", "/api/postgres/bootstrap", { dsn: fixture.dsn, schema_name: "xmustard" });
 	assert.equal(boot.status, 200, boot.text);
-	const input = join(T, "diagnostics-lsp.json");
-	writeFileSync(
-		input,
-		JSON.stringify({
-			uri: `file://${join(repo, "pkg", "handler_0007.go")}`,
-			diagnostics: [
-				{ range: { start: { line: 5, character: 8 }, end: { line: 5, character: 13 } }, severity: 1, code: "XME2E", source: "gopls", message: "xm_e2e_diagnostic: negative input panics" },
-			],
-		}),
-	);
-	const run = await api.json("POST", `/api/workspaces/${ws}/diagnostics/run`, { input_path: input, source_kind: "lsp", source_name: "gopls-e2e-fixture" });
+	mkdirSync(join(repo, ".xmustard-e2e"), { recursive: true });
+	writeFileSync(join(repo, ".xmustard-e2e", "diagnostics-lsp.json"), seededReport(repo));
+	const run = await api.json("POST", `/api/workspaces/${ws}/diagnostics/run`, { input_path: ".xmustard-e2e/diagnostics-lsp.json", source_kind: "lsp", source_name: "gopls-e2e-fixture" });
 	assert.equal(run.status, 200, run.text.slice(0, 500));
+	assert.equal(run.body.storage_backend, "postgres", "configured DSN keeps the PostgreSQL control");
 	record("postgres_fixture", { status: "native", port: fixture.port, bootstrap: boot.status, diagnostics_run: run.status });
+}
+
+// setUpLocalDiagnostics proves the fresh workspace reads no_baseline with no database,
+// then imports the same report through the real CLI (explicit external file) while
+// the API is running.
+async function setUpLocalDiagnostics(): Promise<void> {
+	const fresh = await api.json("GET", `/api/workspaces/${ws}/diagnostics`);
+	assert.equal(fresh.status, 200, fresh.text.slice(0, 300));
+	assert.equal(fresh.body.storage?.status, "no_baseline");
+	assert.deepEqual(fresh.body.diagnostics, []);
+	const input = join(T, "diagnostics-lsp.json");
+	writeFileSync(input, seededReport(repo));
+	const cli = await runOps(join(T, "data"), ["diagnostics", "run", ws, "--input-path", input, "--source-kind", "lsp", "--source-name", "gopls-e2e-cli"]);
+	assert.equal(cli.code, 0, cli.stderr.slice(-500));
+	assert.equal(JSON.parse(cli.stdout).storage_backend, "local");
+	record("local_diagnostics_fixture", { fresh_status: fresh.body.storage.status, cli_exit: cli.code });
 }
 
 function pi(name: string, steps: Step[], o: { env?: Record<string, string>; apiBase?: string; ws?: string; rpc?: Parameters<typeof runPi>[0]["rpc"]; timeoutMs?: number } = {}): Promise<PiRun> {
@@ -153,7 +175,8 @@ before(async () => {
 		await pg.start(T);
 		await setUpDiagnostics(pg);
 	} else {
-		record("postgres_fixture", { status: "missing", consequence: "diagnostics success NOT covered; only its explicit error is" });
+		record("postgres_fixture", { status: "missing", consequence: "PostgreSQL control NOT covered; diagnostics use local storage" });
+		await setUpLocalDiagnostics();
 	}
 });
 after(async () => {
@@ -235,17 +258,13 @@ describe("Pi adapter against the real xMustard API", () => {
 		assert.equal(verify.isError, false, textOf(verify).slice(0, 300));
 		assert.equal(JSON.parse(textOf(verify)).id, rem.id, "verify answered for the remembered entry");
 		const diag = one(run, "diagnostics");
-		if (pgBin) {
-			assert.equal(diag.isError, false, textOf(diag).slice(0, 300));
-			const d = JSON.parse(textOf(diag));
-			const hit = d.diagnostics.find((x: any) => /xm_e2e_diagnostic/.test(x.message));
-			assert.ok(hit, `seeded diagnostic delivered: ${textOf(diag).slice(0, 400)}`);
-			assert.match(JSON.stringify(hit), /pkg\/handler_0007\.go/);
-			record("diagnostics_success", { path: hit.path ?? hit.file_path, line: hit.range_start_line, message: hit.message });
-		} else {
-			assert.equal(diag.isError, true);
-			assert.match(textOf(diag), /Postgres DSN is required/, "diagnostics error is explicit");
-		}
+		assert.equal(diag.isError, false, textOf(diag).slice(0, 300));
+		const d = JSON.parse(textOf(diag));
+		const hit = d.diagnostics.find((x: any) => /xm_e2e_diagnostic/.test(x.message));
+		assert.ok(hit, `seeded diagnostic delivered: ${textOf(diag).slice(0, 400)}`);
+		assert.match(JSON.stringify(hit), /pkg\/handler_0007\.go/);
+		assert.equal(d.storage?.backend, pgBin ? "postgres" : "local");
+		record("diagnostics_success", { backend: d.storage?.backend, path: hit.path ?? hit.file_path, line: hit.range_start_line, message: hit.message });
 		assert.ok(!run.trace.at(-1)?.active_tools.includes("xmustard_expand"), "no handle issued, so expand stays inactive");
 	});
 
@@ -367,6 +386,50 @@ describe("Pi adapter against the real xMustard API", () => {
 		const all = await readAll(api, ws, original.handle);
 		assert.equal(sha(all.bytes), original.footer.raw_sha256);
 		record("restart", { page_offset: page.offset, sha_ok: true });
+	});
+
+	test("database-free diagnostics: fresh, zero-error and CLI baselines survive an API restart", async () => {
+		const dir = join(T, "local-diag");
+		const repo2 = join(dir, "repo");
+		makeRepo(repo2, 12);
+		const api2 = new Api({ dataDir: join(dir, "data"), logFile: join(T, "api-local-diag.log") });
+		mkdirSync(join(dir, "data"), { recursive: true });
+		await api2.start();
+		try {
+			const load = await api2.json("POST", "/api/workspaces/load", { root_path: repo2, auto_scan: true });
+			assert.equal(load.status, 200, load.text.slice(0, 300));
+			const ws2 = load.body.workspace.workspace_id as string;
+			const get = () => api2.json("GET", `/api/workspaces/${ws2}/diagnostics`);
+			const fresh = await get();
+			assert.equal(fresh.status, 200);
+			assert.equal(fresh.body.storage.status, "no_baseline");
+			assert.equal(fresh.body.baseline, undefined);
+			writeFileSync(join(dir, "empty.json"), "[]");
+			const zero = await runOps(join(dir, "data"), ["diagnostics", "run", ws2, "--input-path", join(dir, "empty.json"), "--source-kind", "compiler", "--source-name", "e2e"]);
+			assert.equal(zero.code, 0, zero.stderr);
+			const zeroRead = await get();
+			assert.ok(zeroRead.body.baseline, "an imported zero-error baseline is not 'no baseline'");
+			assert.deepEqual(zeroRead.body.diagnostics, []);
+			assert.equal(zeroRead.body.storage.status, "available");
+			writeFileSync(join(dir, "seeded.json"), seededReport(repo2));
+			const seeded = await runOps(join(dir, "data"), ["diagnostics", "run", ws2, "--input-path", join(dir, "seeded.json"), "--source-kind", "lsp", "--source-name", "gopls-e2e-cli"]);
+			assert.equal(seeded.code, 0, seeded.stderr);
+			const before = (await get()).body;
+			assert.match(before.diagnostics[0].message, /xm_e2e_diagnostic/);
+			await api2.restart();
+			const after = (await get()).body;
+			assert.equal(after.baseline.diagnostic_run_id, before.baseline.diagnostic_run_id);
+			assert.deepEqual(after.diagnostics, before.diagnostics);
+			assert.equal(after.baseline.replay_archive.raw_payload_sha256, before.baseline.replay_archive.raw_payload_sha256);
+			const run = await pi("local-diagnostics", [{ calls: [call("diagnostics")] }, { text: "done" }], { apiBase: api2.base, ws: ws2 });
+			assert.equal(run.code, 0, run.stderr);
+			const diag = one(run, "diagnostics");
+			assert.equal(diag.isError, false, textOf(diag).slice(0, 300));
+			assert.match(textOf(diag), /xm_e2e_diagnostic/);
+			record("local_diagnostics", { run_id: after.baseline.diagnostic_run_id, status: after.storage.status, restart_same: true });
+		} finally {
+			await api2.stop();
+		}
 	});
 
 	test("expiry: an expired handle is refused explicitly and never re-served", async () => {

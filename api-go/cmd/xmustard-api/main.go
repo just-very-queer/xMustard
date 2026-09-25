@@ -577,6 +577,28 @@ func respondError(w http.ResponseWriter, err error) {
 	writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 }
 
+// respondDiagnosticsError maps diagnostics import/read failures. A fixed-cap breach is
+// a deterministic 413 and a full store a 409 — neither is retryable — while lock or
+// admission contention stays 503 + Retry-After (via respondError).
+func respondDiagnosticsError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, workspaceops.ErrDiagnosticsLimit), errors.Is(err, budget.ErrAdmissionLimit):
+		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]any{"error": err.Error()})
+	case errors.Is(err, workspaceops.ErrDiagnosticsQuota):
+		writeJSON(w, http.StatusConflict, map[string]any{"error": err.Error()})
+	case errors.Is(err, workspaceops.ErrInvalidDiagnosticsRequest):
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+	case errors.Is(err, workspaceops.ErrDiagnosticsStoreUnsupported):
+		writeJSON(w, http.StatusNotImplemented, map[string]any{"error": err.Error()})
+	case errors.Is(err, budget.ErrOverloaded):
+		writeOverloaded(w)
+	case errors.Is(err, os.ErrNotExist):
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "Workspace not found"})
+	default:
+		respondError(w, err)
+	}
+}
+
 // workspaceIDFromPath extracts {id} from /api/workspaces/{id}/... ("" if not such a path).
 func workspaceIDFromPath(p string) string {
 	const prefix = "/api/workspaces/"
@@ -2175,47 +2197,26 @@ func registerRoutes(mux *http.ServeMux) {
 		writeJSON(w, http.StatusOK, result)
 	})
 	mux.HandleFunc("GET /api/workspaces/{workspace_id}/diagnostics/status", func(w http.ResponseWriter, r *http.Request) {
-		workspaceID := r.PathValue("workspace_id")
-		result, err := workspaceops.ReadDiagnosticsStatus(
+		result, err := workspaceops.ReadDiagnosticsStatusCtx(
+			r.Context(),
 			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
-			workspaceID,
+			r.PathValue("workspace_id"),
 		)
 		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				writeJSON(w, http.StatusNotFound, map[string]any{
-					"error": "Workspace not found",
-				})
-				return
-			}
-			writeJSON(w, http.StatusInternalServerError, map[string]any{
-				"error": err.Error(),
-			})
+			respondDiagnosticsError(w, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, result)
 	})
 	mux.HandleFunc("GET /api/workspaces/{workspace_id}/diagnostics", func(w http.ResponseWriter, r *http.Request) {
-		workspaceID := r.PathValue("workspace_id")
 		result, err := workspaceops.ReadDiagnosticsCtx(
 			r.Context(),
 			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
-			workspaceID,
+			r.PathValue("workspace_id"),
 			r.URL.Query().Get("diagnostic_run_id"),
 		)
 		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				writeJSON(w, http.StatusNotFound, map[string]any{
-					"error": "Workspace not found",
-				})
-				return
-			}
-			if errors.Is(err, workspaceops.ErrInvalidDiagnosticsRequest) {
-				writeJSON(w, http.StatusBadRequest, map[string]any{
-					"error": err.Error(),
-				})
-				return
-			}
-			respondError(w, err)
+			respondDiagnosticsError(w, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, result)
@@ -2248,7 +2249,6 @@ func registerRoutes(mux *http.ServeMux) {
 		writeJSON(w, http.StatusOK, result)
 	})
 	mux.HandleFunc("POST /api/workspaces/{workspace_id}/diagnostics/run", func(w http.ResponseWriter, r *http.Request) {
-		workspaceID := r.PathValue("workspace_id")
 		var request workspaceops.DiagnosticsRequest
 		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]any{
@@ -2256,27 +2256,16 @@ func registerRoutes(mux *http.ServeMux) {
 			})
 			return
 		}
-		result, err := workspaceops.RunDiagnostics(
+		// HTTP input is workspace-confined; only the CLI may name an external file.
+		result, err := workspaceops.RunDiagnosticsCtx(
+			r.Context(),
 			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
-			workspaceID,
+			r.PathValue("workspace_id"),
 			request,
+			workspaceops.DiagnosticsRunOptions{InputAuthority: workspaceops.DiagnosticsInputWorkspace},
 		)
 		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				writeJSON(w, http.StatusNotFound, map[string]any{
-					"error": "Workspace not found",
-				})
-				return
-			}
-			if errors.Is(err, workspaceops.ErrInvalidDiagnosticsRequest) {
-				writeJSON(w, http.StatusBadRequest, map[string]any{
-					"error": err.Error(),
-				})
-				return
-			}
-			writeJSON(w, http.StatusInternalServerError, map[string]any{
-				"error": err.Error(),
-			})
+			respondDiagnosticsError(w, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, result)

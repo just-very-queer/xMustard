@@ -82,19 +82,21 @@ npm run check                   # typecheck + unit tests (in-process HTTP server
 ../../scripts/e2e/pi-adapter.sh # real Pi CLI + real Go API + Rust core
 ```
 
-The e2e needs native PostgreSQL server binaries (`initdb`, `postgres`, `psql`) on PATH.
-`diagnostics` reads its baseline from Postgres (optional and off in xMustard's default),
-so the script starts a disposable cluster: temp dir, loopback on a random port, private
-socket, deleted afterwards. It configures the cluster through the existing settings and
-bootstrap routes and seeds one diagnostic through `diagnostics/run`. Without the binaries
-the script stops, unless `XM_E2E_ALLOW_NO_POSTGRES=1`, which accepts diagnostics as
-error-only.
+The e2e needs native PostgreSQL server binaries (`initdb`, `postgres`, `psql`) on PATH
+for its PostgreSQL control. With them, the script starts a disposable cluster (temp dir,
+loopback on a random port, private socket, deleted afterwards), configures it through the
+existing settings and bootstrap routes, and seeds one diagnostic through `diagnostics/run`
+from `repo/.xmustard-e2e/` (HTTP input is workspace-confined). Without the binaries the
+script stops, unless `XM_E2E_ALLOW_NO_POSTGRES=1`: then `diagnostics` reads database-free
+local storage, seeded by the real `xmustard-ops diagnostics run` CLI. Both modes also run
+a database-free check on a second workspace: fresh `no_baseline`, a zero-error baseline,
+and a CLI baseline read back after an API restart.
 
 The e2e drives the pinned `pi` CLI (JSON and RPC modes). The model is pi-ai's faux
 transport scripted by `test/fixtures/scripted-provider.ts`, which records every model
 request. No provider is contacted, and each Pi run gets an empty HOME, an empty agent
 dir and a scrubbed environment. Coverage: schema conformance with MCP `tools/list`;
-all nine tools succeeding (diagnostics through the Postgres fixture); results reaching
+all nine tools succeeding (diagnostics through the Postgres fixture or local storage); results reaching
 the next model request; errors staying errors;
 `xmustard_expand` activation and exact 64 KiB paging; bound, stale and unknown labels;
 API restart; expiry; two concurrent Pi processes; RPC abort; tool and projection

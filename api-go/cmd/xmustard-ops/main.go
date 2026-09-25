@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"xmustard/api-go/internal/budget"
 	"xmustard/api-go/internal/workspaceops"
 )
 
@@ -95,15 +96,24 @@ func runDiagnostics(args []string) {
 		payload any
 		err     error
 	)
+	// One deadline and one admission ledger for the whole command, held until the
+	// output is written, so the CLI accounts exactly like an HTTP request.
+	ctx, cancel := context.WithTimeout(context.Background(), diagnosticsCLITimeout)
+	defer cancel()
+	scope := budget.NewScope(nil)
+	defer scope.Close()
+	ctx = budget.WithScope(ctx, scope)
+	// The operator named this file explicitly, so it may live outside the workspace.
+	opts := workspaceops.DiagnosticsRunOptions{InputAuthority: workspaceops.DiagnosticsInputLocalOperator}
 	switch action {
 	case "plan":
-		payload, err = workspaceops.PlanDiagnostics(*dataDir, workspaceID, request)
+		payload, err = workspaceops.PlanDiagnosticsCtx(ctx, *dataDir, workspaceID, request, opts)
 	case "run":
-		payload, err = workspaceops.RunDiagnostics(*dataDir, workspaceID, request)
+		payload, err = workspaceops.RunDiagnosticsCtx(ctx, *dataDir, workspaceID, request, opts)
 	case "status":
-		payload, err = workspaceops.ReadDiagnosticsStatus(*dataDir, workspaceID)
+		payload, err = workspaceops.ReadDiagnosticsStatusCtx(ctx, *dataDir, workspaceID)
 	case "read":
-		payload, err = workspaceops.ReadDiagnostics(*dataDir, workspaceID, *diagnosticRunID)
+		payload, err = workspaceops.ReadDiagnosticsCtx(ctx, *dataDir, workspaceID, *diagnosticRunID)
 	case "live":
 		payload, err = workspaceops.ReadLiveDiagnostics(*dataDir, workspaceID, *path)
 	default:
@@ -111,6 +121,9 @@ func runDiagnostics(args []string) {
 	}
 	writeJSON(payload, err)
 }
+
+// diagnosticsCLITimeout bounds a diagnostics CLI command end to end.
+const diagnosticsCLITimeout = 120 * time.Second
 
 func runSemanticIndex(args []string) {
 	if len(args) < 2 {

@@ -1,6 +1,7 @@
 package workspaceops
 
 import (
+	"context"
 	"crypto/sha1"
 	"encoding/hex"
 	"fmt"
@@ -2057,12 +2058,17 @@ func buildIssueContextPrompt(
 }
 
 func readWorktreeStatus(root string) *WorktreeStatus {
+	return readWorktreeStatusCtx(context.Background(), root)
+}
+
+// readWorktreeStatusCtx is readWorktreeStatus with a cancellable git probe.
+func readWorktreeStatusCtx(ctx context.Context, root string) *WorktreeStatus {
 	result := &WorktreeStatus{
 		Available:  false,
 		IsGitRepo:  false,
 		DirtyPaths: []string{},
 	}
-	output, err := exec.Command("git", "-C", root, "status", "--branch", "--porcelain=v2").CombinedOutput()
+	output, err := exec.CommandContext(ctx, "git", "-C", root, "status", "--branch", "--porcelain=v2").CombinedOutput()
 	if err != nil {
 		if _, lookErr := exec.LookPath("git"); lookErr != nil {
 			return result

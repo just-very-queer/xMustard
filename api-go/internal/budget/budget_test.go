@@ -168,3 +168,36 @@ func TestAcquireRejectsOverflowingReservation(t *testing.T) {
 		t.Fatalf("scope must refuse MaxInt64: %v", err)
 	}
 }
+
+func TestLimitedScopeIsDeterministicAndHeldByParent(t *testing.T) {
+	pool := NewByteBudget(100)
+	parent := NewScope(pool)
+	child := parent.Limited(40)
+	if err := child.Acquire(30); err != nil {
+		t.Fatal(err)
+	}
+	if err := child.Acquire(20); !errors.Is(err, ErrAdmissionLimit) || errors.Is(err, ErrOverloaded) {
+		t.Fatalf("over the child cap: want ErrAdmissionLimit only, got %v", err)
+	}
+	child.Close()
+	if pool.InUse() != 30 {
+		t.Fatalf("closing the child must leave its bytes held by the parent, in use %d", pool.InUse())
+	}
+	other := NewScope(pool)
+	if err := other.Acquire(60); err != nil {
+		t.Fatal(err)
+	}
+	busy := parent.Limited(40)
+	if err := busy.Acquire(20); !errors.Is(err, ErrOverloaded) {
+		t.Fatalf("pool exhaustion within the child cap: want ErrOverloaded, got %v", err)
+	}
+	parent.Close()
+	other.Close()
+	if pool.InUse() != 0 {
+		t.Fatalf("parent close must release everything, in use %d", pool.InUse())
+	}
+	w := NewCaptureWriter(NewScope(pool).Limited(10), 1<<20)
+	if _, err := w.Write(make([]byte, 11)); err == nil || !errors.Is(w.RefusalErr(), ErrAdmissionLimit) {
+		t.Fatalf("capture refusal must carry the cause, got %v", w.RefusalErr())
+	}
+}

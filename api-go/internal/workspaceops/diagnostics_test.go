@@ -101,7 +101,7 @@ func TestRunDiagnosticsNormalizesWithRustAndPersistsRows(t *testing.T) {
 	if err != nil {
 		t.Fatalf("run diagnostics: %v", err)
 	}
-	if result.Baseline == nil || result.DiagnosticRows != 1 || result.Plan.DiagnosticCount != 1 {
+	if result.Baseline == nil || result.DiagnosticRows != 1 || result.Plan.DiagnosticCount != 1 || result.StorageBackend != "postgres" || result.Baseline.StorageBackend != "postgres" || result.Baseline.FreshnessBasis != "head_match" {
 		t.Fatalf("unexpected diagnostics run result: %#v", result)
 	}
 	if result.Plan.NormalizedBatch.Diagnostics[0].SourceKind != "lsp" {
@@ -161,7 +161,7 @@ func TestRunDiagnosticsNormalizesWithRustAndPersistsRows(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read activity log: %v", err)
 	}
-	if !strings.Contains(string(activityContent), "postgres.materialize.diagnostics") {
+	if !strings.Contains(string(activityContent), "diagnostics.materialize") || !strings.Contains(string(activityContent), `"storage_backend":"postgres"`) {
 		t.Fatalf("expected diagnostics activity, got %s", activityContent)
 	}
 }
@@ -212,18 +212,6 @@ func diagnosticRunInsertArgs(t *testing.T, fakeConn *fakeSemanticConn) []any {
 	}
 	t.Fatalf("missing diagnostic run insert: %#v", fakeConn.execSQL)
 	return nil
-}
-
-func TestDiagnosticsStatusBlocksWithoutPostgres(t *testing.T) {
-	dataDir, workspaceID, _, _ := writeIssueContextFixture(t, false)
-
-	status, err := ReadDiagnosticsStatus(dataDir, workspaceID)
-	if err != nil {
-		t.Fatalf("read diagnostics status: %v", err)
-	}
-	if status.Status != "blocked" || status.PostgresConfigured {
-		t.Fatalf("expected blocked status without Postgres, got %#v", status)
-	}
 }
 
 func TestReadDiagnosticsWarnsWhenLegacyReplayArchiveLacksResolvedServerProvenance(t *testing.T) {
