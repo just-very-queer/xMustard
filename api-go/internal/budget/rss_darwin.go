@@ -3,6 +3,7 @@
 package budget
 
 import (
+	"bytes"
 	"os"
 	"syscall"
 	"unsafe"
@@ -11,15 +12,46 @@ import (
 )
 
 // macOS sampling uses the proc_info system call behind libproc, without cgo:
-// proc_listchildpids for the tree and proc_pid_rusage (RUSAGE_INFO_V0) for
-// ri_resident_size (what ps reports as RSS) and ri_phys_footprint. The command name
-// comes from sysctl kern.proc.pid (p_comm).
+// proc_listchildpids for the tree, proc_listpids(PROC_UID_ONLY) for the shims,
+// proc_pid_rusage (RUSAGE_INFO_V0) for ri_resident_size (what ps reports as RSS) and
+// ri_phys_footprint, and proc_pidinfo(PROC_PIDT_SHORTBSDINFO) for the command name
+// (p_comm). Names are read into fixed buffers, so a sample allocates almost nothing.
 const (
-	procInfoCallListPIDs  = 1 // PROC_INFO_CALL_LISTPIDS
-	procInfoCallPIDRusage = 9 // PROC_INFO_CALL_PIDRUSAGE
-	procPPIDOnly          = 6 // PROC_PPID_ONLY
-	rusageInfoV0          = 0 // RUSAGE_INFO_V0
+	procInfoCallListPIDs  = 1  // PROC_INFO_CALL_LISTPIDS
+	procInfoCallPIDInfo   = 2  // PROC_INFO_CALL_PIDINFO
+	procInfoCallPIDRusage = 9  // PROC_INFO_CALL_PIDRUSAGE
+	procUIDOnly           = 4  // PROC_UID_ONLY
+	procPPIDOnly          = 6  // PROC_PPID_ONLY
+	procPIDTShortBSDInfo  = 13 // PROC_PIDT_SHORTBSDINFO
+	rusageInfoV0          = 0  // RUSAGE_INFO_V0
 )
+
+// procBSDShortInfo mirrors struct proc_bsdshortinfo from <sys/proc_info.h>.
+type procBSDShortInfo struct {
+	PID, PPID, PGID, Status uint32
+	Comm                    [16]byte // MAXCOMLEN
+	Flags                   uint32
+	UID, GID, RUID, RGID    uint32
+	SVUID, SVGID, RFU       uint32
+}
+
+// darwinComm reads pid's short command name into c without allocating.
+func darwinComm(pid int, c *procBSDShortInfo) bool {
+	n, _, errno := syscall.Syscall6(unix.SYS_PROC_INFO, procInfoCallPIDInfo, uintptr(pid), procPIDTShortBSDInfo, 0,
+		uintptr(unsafe.Pointer(c)), unsafe.Sizeof(*c))
+	return errno == 0 && n == unsafe.Sizeof(*c)
+}
+
+func commString(c *procBSDShortInfo) string { return unix.ByteSliceToString(c.Comm[:]) }
+
+// commIs compares a short name without converting it to a string.
+func commIs(c *procBSDShortInfo, name string) bool {
+	n := bytes.IndexByte(c.Comm[:], 0)
+	if n < 0 {
+		n = len(c.Comm)
+	}
+	return string(c.Comm[:n]) == name // no allocation: the conversion is only compared
+}
 
 // rusageInfoV0Struct mirrors struct rusage_info_v0 from <sys/resource.h>.
 type rusageInfoV0Struct struct {
@@ -49,16 +81,30 @@ func sampleOwnTree() (TreeSample, error) {
 	return s, nil
 }
 
-// darwinShimPIDs lists this user's processes named like the stdio shim (one sysctl).
+// uidPIDs is the reusable buffer for this user's pid list (guarded by shimList).
+var uidPIDs = make([]int32, 2048)
+
+// darwinShimPIDs lists this user's processes named like the stdio shim: one
+// proc_listpids for the user's pids, then one short-name read per pid.
 func darwinShimPIDs() []int {
-	procs, err := unix.SysctlKinfoProcSlice("kern.proc.uid", os.Getuid())
-	if err != nil {
-		return nil
+	var n int
+	for {
+		r, _, errno := syscall.Syscall6(unix.SYS_PROC_INFO, procInfoCallListPIDs, procUIDOnly, uintptr(os.Getuid()), 0,
+			uintptr(unsafe.Pointer(&uidPIDs[0])), uintptr(len(uidPIDs)*4))
+		if errno != 0 {
+			return nil
+		}
+		n = min(int(r)/4, len(uidPIDs))
+		if n < len(uidPIDs) || len(uidPIDs) >= 1<<16 {
+			break
+		}
+		uidPIDs = make([]int32, 2*len(uidPIDs)) // the list filled the buffer: it may be cut short
 	}
 	var out []int
-	for i := range procs {
-		if unix.ByteSliceToString(procs[i].Proc.P_comm[:]) == shimProcessName {
-			out = append(out, int(procs[i].Proc.P_pid))
+	var c procBSDShortInfo
+	for _, pid := range uidPIDs[:n] {
+		if pid > 0 && darwinComm(int(pid), &c) && commIs(&c, shimProcessName) {
+			out = append(out, int(pid))
 		}
 	}
 	return out
@@ -71,8 +117,9 @@ func darwinProcMem(pid int) (procMem, bool) {
 		return procMem{}, false
 	}
 	m := procMem{rss: int64(ri.ResidentSize), footprint: int64(ri.PhysFootprint)}
-	if kp, err := unix.SysctlKinfoProc("kern.proc.pid", pid); err == nil {
-		m.name = unix.ByteSliceToString(kp.Proc.P_comm[:])
+	var c procBSDShortInfo
+	if darwinComm(pid, &c) {
+		m.name = commString(&c)
 	}
 	return m, true
 }

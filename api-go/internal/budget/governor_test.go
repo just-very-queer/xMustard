@@ -471,24 +471,17 @@ func TestOwnTreeSamplerSeesChildren(t *testing.T) {
 	if err != nil {
 		t.Skip("no sleep binary")
 	}
-	raw, err := os.ReadFile(sleep)
-	if err != nil {
-		t.Skipf("cannot copy sleep: %v", err)
-	}
-	owned := filepath.Join(t.TempDir(), "xmustard-core")
-	if err := os.WriteFile(owned, raw, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	start := func(bin string) *exec.Cmd {
-		cmd := exec.Command(bin, "5")
+	// the owned child is a copy of this test binary named like the Rust core (a copied
+	// system binary is killed by code signing on macOS, leaving only a zombie)
+	owned := standInBinary(t, "xmustard-core")
+	start := func(cmd *exec.Cmd) {
 		if err := cmd.Start(); err != nil {
-			t.Skipf("cannot start %s: %v", bin, err)
+			t.Skipf("cannot start %s: %v", cmd.Path, err)
 		}
 		t.Cleanup(func() { _ = cmd.Process.Kill(); _ = cmd.Wait() })
-		return cmd
 	}
-	start(owned)
-	start(sleep)
+	start(standInCommand(owned))
+	start(exec.Command(sleep, "5"))
 	var s TreeSample
 	waitFor(t, "owned and external children in the sample", func() bool {
 		s, err = sampleOwnTree()
@@ -563,23 +556,11 @@ func TestOwnTreeSamplerCountsDetachedShims(t *testing.T) {
 	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
 		t.Skip("no tree sampler on " + runtime.GOOS)
 	}
-	// a copy of this test binary named like the shim (a copied system binary is killed
-	// by code signing on macOS), sleeping in TestShimStandInProcess
-	self, err := os.Executable()
-	if err != nil {
-		t.Skip(err)
-	}
-	raw, err := os.ReadFile(self)
-	if err != nil {
-		t.Skipf("cannot copy the test binary: %v", err)
-	}
-	shim := filepath.Join(t.TempDir(), shimProcessName)
-	if err := os.WriteFile(shim, raw, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	// started by a shell that exits at once, so the shim is reparented away from us
-	cmd := exec.Command("sh", "-c", `"$0" -test.run='^TestShimStandInProcess$' >/dev/null 2>&1 & echo $!`, shim)
-	cmd.Env = append(os.Environ(), "XMUSTARD_BUDGET_SHIM_STAND_IN=1")
+	// a stand-in named like the shim, started by a shell that exits at once, so it is
+	// reparented away from us
+	shim := standInBinary(t, shimProcessName)
+	cmd := exec.Command("sh", "-c", `"$0" -test.run='^TestSleepingStandInProcess$' >/dev/null 2>&1 & echo $!`, shim)
+	cmd.Env = append(os.Environ(), standInEnv+"=1")
 	out, err := cmd.Output()
 	if err != nil {
 		t.Fatal(err)
@@ -604,11 +585,39 @@ func TestOwnTreeSamplerCountsDetachedShims(t *testing.T) {
 	}
 }
 
-// TestShimStandInProcess is the body of the stand-in shim above; it does nothing in a
-// normal run.
-func TestShimStandInProcess(t *testing.T) {
-	if os.Getenv("XMUSTARD_BUDGET_SHIM_STAND_IN") != "1" {
-		t.Skip("stand-in process for TestOwnTreeSamplerCountsDetachedShims")
+const standInEnv = "XMUSTARD_BUDGET_STAND_IN"
+
+// standInBinary copies this test binary under name, so a sampler sees a live process
+// with that short name (a copied system binary is killed by code signing on macOS).
+func standInBinary(t *testing.T, name string) string {
+	t.Helper()
+	self, err := os.Executable()
+	if err != nil {
+		t.Skip(err)
+	}
+	raw, err := os.ReadFile(self)
+	if err != nil {
+		t.Skipf("cannot copy the test binary: %v", err)
+	}
+	bin := filepath.Join(t.TempDir(), name)
+	if err := os.WriteFile(bin, raw, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return bin
+}
+
+// standInCommand runs a stand-in binary as a sleeping process.
+func standInCommand(bin string) *exec.Cmd {
+	cmd := exec.Command(bin, "-test.run=^TestSleepingStandInProcess$")
+	cmd.Env = append(os.Environ(), standInEnv+"=1")
+	return cmd
+}
+
+// TestSleepingStandInProcess is the body of the stand-in processes above; it does
+// nothing in a normal run.
+func TestSleepingStandInProcess(t *testing.T) {
+	if os.Getenv(standInEnv) != "1" {
+		t.Skip("stand-in process body for the sampler tests")
 	}
 	time.Sleep(20 * time.Second)
 }
