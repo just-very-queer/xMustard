@@ -270,7 +270,8 @@ func (codexDriver) Build(req DriverRequest, prompt string) (Invocation, error) {
 	if req.ExternalSandbox {
 		sandbox = "danger-full-access"
 	}
-	args := []string{"exec", "--json", "--color", "never", "-C", req.WorkDir, "--sandbox", sandbox}
+	// --ephemeral: no session files, which later runs of any arm could read
+	args := []string{"exec", "--ephemeral", "--json", "--color", "never", "-C", req.WorkDir, "--sandbox", sandbox}
 	if req.Model != "" {
 		args = append(args, "-m", req.Model)
 	}

@@ -232,6 +232,14 @@ func TestDriverInvocationsPerArm(t *testing.T) {
 	if _, err := (piDriver{}).Build(DriverRequest{Arm: arm(ArmXmustardMCP)}, "p"); err == nil {
 		t.Fatal("pi xMustard arm without the adapter must fail")
 	}
+
+	// no client keeps a session on disk that a later run (of any arm) could read
+	for name, want := range map[Driver]string{claudeDriver{}: "--no-session-persistence", codexDriver{}: "--ephemeral", piDriver{}: "--no-session"} {
+		inv, err := name.Build(DriverRequest{Arm: arm(ArmBaseline), Model: "m", WorkDir: "/wt", ConfigDir: cfgDir}, "p")
+		if err != nil || !slices.Contains(inv.Args, want) {
+			t.Fatalf("%T must pass %s: %v %v", name, want, inv.Args, err)
+		}
+	}
 }
 
 func TestTOMLStringRoundTrip(t *testing.T) {
