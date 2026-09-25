@@ -1,0 +1,5 @@
+# A pull request is measured and judged by its own copies of the budget gate
+# (scripts/bench/) and the CI workflow (.github/). Branch protection with "Require
+# review from Code Owners" on the target branches makes this review binding.
+/scripts/bench/ @just-very-queer
+/.github/ @just-very-queer

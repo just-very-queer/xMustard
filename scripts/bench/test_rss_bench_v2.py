@@ -1157,6 +1157,10 @@ class RepoWiring(unittest.TestCase):
                        "rss_v2.sh ci-plan --branch", '--ledger "$LEDGER"', "--diff \"$BASE_LEDGER\"", "--repeat 3"):
             self.assertIn(needle, runs)
         self.assertIn("budget-ledger-change", text)
+        with open(os.path.join(REPO, ".github", "CODEOWNERS")) as f:
+            owned = [line.split()[0] for line in f if line.strip() and not line.startswith("#")]
+        self.assertIn("/scripts/bench/", owned)  # the pull request runs its own copies of these
+        self.assertIn("/.github/", owned)
         self.assertNotIn("grep -oiE 'ws-?[0-9]{2}'", text)  # the workstream comes from the anchored, tested parser
 
 
