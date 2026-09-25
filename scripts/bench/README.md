@@ -51,6 +51,9 @@ agents over HTTP MCP, the watcher, static embeddings, no file cap, and all 17 gr
 The report lists exactly what is missing. `--require-parity-claim` makes that fatal.
 
 Outputs: `<out>/report.json` and `<out>/report.md` (`--out`, default `bench-out/gate-v2`).
+A single run of a borderline scenario can land on either side of the gate (agents-2 measured
+79.4-97.0 MiB across three runs of one build), so decisions use `--repeat 3`: the median run
+is reported and any failed repeat fails the scenario.
 
 ### Fixtures (`parity_fixtures.json`)
 

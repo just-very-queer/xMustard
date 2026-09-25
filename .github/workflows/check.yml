@@ -201,9 +201,10 @@ jobs:
           path: bench-out/
           if-no-files-found: ignore
 
-  # Reports the parity-scale status. It fails at this HEAD (per-agent shims and per-call
-  # cores exceed 95.4 MiB at 2+ agents), so it does not fail the workflow until the
-  # final parity-scale gate (WS-50) makes it blocking.
+  # Reports the parity-scale status, three runs per scenario (a borderline single run
+  # flips between PASS and FAIL). It fails at this HEAD (per-agent shims and per-call
+  # cores exceed 95.4 MiB at 4 agents, two hot repos and four worktrees), so it does not
+  # fail the workflow until the final parity-scale gate (WS-50) makes it blocking.
   parity-scale:
     name: parity-scale budget gate
     if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.parity)
@@ -230,7 +231,7 @@ jobs:
           XMUSTARD_FIXTURE_CACHE: ${{ runner.temp }}/fixtures
         run: |
           chmod +x "$RUNNER_TEMP/core/xmustard-core"
-          make bench-parity BENCH_OUT=bench-out BENCH_ARGS="--core-bin $RUNNER_TEMP/core/xmustard-core"
+          make bench-parity BENCH_OUT=bench-out BENCH_ARGS="--repeat 3 --core-bin $RUNNER_TEMP/core/xmustard-core"
       - name: Report summary
         if: always()
         run: |
