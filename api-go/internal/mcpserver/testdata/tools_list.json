@@ -27,26 +27,8 @@
           "_xmustard": {
             "type": "object"
           },
-          "blocked_by_dirty_state": {
-            "type": "boolean"
-          },
-          "blocked_by_failing_verification": {
-            "type": "boolean"
-          },
-          "changed_files": {
-            "type": "integer"
-          },
-          "contract_breaks": {
-            "type": "integer"
-          },
-          "dirty_symbols": {
-            "type": "integer"
-          },
           "generated_at": {
             "type": "string"
-          },
-          "stale_memory": {
-            "type": "integer"
           },
           "summary": {
             "type": "string"
