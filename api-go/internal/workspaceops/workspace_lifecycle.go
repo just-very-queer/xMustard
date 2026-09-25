@@ -19,6 +19,10 @@ const (
 	scannerVersion         = 11
 )
 
+// ScannerVersion is the snapshot format LoadWorkspace reuses from its cache. A test
+// that seeds a cached snapshot stamps it, so a load answers without a scan.
+const ScannerVersion = scannerVersion
+
 type WorkspaceLoadRequest struct {
 	RootPath             string  `json:"root_path"`
 	Name                 *string `json:"name"`

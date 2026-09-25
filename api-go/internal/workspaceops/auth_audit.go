@@ -10,9 +10,10 @@ import (
 )
 
 // Global (not workspace-scoped) audit trail of authentication/authorization events:
-// token mint/revoke/rotate and denied requests. Distinct from the per-workspace
-// governance audit log (audit_log.go). Append-only with a bounded tail so a flood
-// of denied requests can't fill the disk — the oldest events roll off.
+// token mint/revoke/rotate, workspace registrations and denied requests. Distinct
+// from the per-workspace governance audit log (audit_log.go). Append-only with a
+// bounded tail so a flood of denied requests can't fill the disk — the oldest events
+// roll off.
 
 const authAuditMax = 5000
 
@@ -51,7 +52,7 @@ func clipField(s string) string {
 
 type AuthAuditEvent struct {
 	EventID    string `json:"event_id"`
-	Action     string `json:"action"` // mint | revoke | rotate | denied
+	Action     string `json:"action"` // mint | revoke | rotate | denied | register
 	Actor      string `json:"actor"`  // principal id performing the action (or "anonymous")
 	TokenID    string `json:"token_id,omitempty"`
 	Role       string `json:"role,omitempty"`
