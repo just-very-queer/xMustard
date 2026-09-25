@@ -757,7 +757,35 @@ func (d *hookDecoder) decodeInput(c byte) error {
 				d.body.Input[key] = string(dst.small)
 			}
 			return nil
-		case '{', '[':
+		case '[':
+			// an argv array (Codex shell: ["bash","-lc","go test ./..."]) is kept joined
+			// by spaces; other element kinds are skipped
+			var parts []string
+			used := 0
+			err := d.eachElement(func(int) error {
+				c, err := d.peek()
+				if err != nil {
+					return err
+				}
+				if c != '"' {
+					return d.skip(2)
+				}
+				dst := &strDest{d: d, limit: min(maxHookInputValue-used, max(0, maxHookMetaBytes-d.metaUsed))}
+				if err := d.readString(dst); err != nil {
+					return err
+				}
+				if !dst.overflow {
+					parts = append(parts, string(dst.small))
+					used += len(dst.small) + 1
+				}
+				return nil
+			})
+			if err == nil && len(parts) > 0 {
+				d.body.Input[key] = strings.Join(parts, " ")
+				d.metaUsed += used
+			}
+			return err
+		case '{':
 			return d.skip(1)
 		}
 		raw, err := d.readScalar()

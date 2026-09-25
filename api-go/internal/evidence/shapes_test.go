@@ -423,12 +423,13 @@ func TestOtherClientShapes(t *testing.T) {
 		t.Fatalf("opencode: %+v %+v", res.Shape.Mode, op)
 	}
 	// Codex: decision block with the projection as the reason
-	cx := `{"session_id":"s","turn_id":"t","hook_event_name":"PostToolUse","tool_name":"shell","tool_input":{"command":"go test ./..."},"tool_response":{"output":` +
+	cx := `{"session_id":"s","turn_id":"t","hook_event_name":"PostToolUse","tool_name":"shell","tool_input":{"command":["bash","-lc","go test ./..."],"workdir":"/repo"},"tool_response":{"output":` +
 		jsonString(log) + `,"exit_code":1}}`
 	res = observe(t, s, FormatCodex, cx, CaptureMeta{Client: "codex"})
 	var cd struct{ Decision, Reason string }
 	_ = json.Unmarshal(res.Shape.Payload, &cd)
-	if res.Shape.Mode != ShapeReplace || cd.Decision != "block" || !strings.Contains(cd.Reason, "exit=1") || res.Capture.ExitCode == nil || *res.Capture.ExitCode != 1 {
+	if res.Shape.Mode != ShapeReplace || cd.Decision != "block" || !strings.Contains(cd.Reason, "exit=1") || res.Capture.ExitCode == nil || *res.Capture.ExitCode != 1 ||
+		res.Family != FamilyTest {
 		t.Fatalf("codex: %+v %+v", res.Shape.Mode, cd)
 	}
 	// Cursor: built-in shell output is observe-only; MCP results are replaced

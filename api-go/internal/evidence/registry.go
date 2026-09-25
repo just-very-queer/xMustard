@@ -277,11 +277,50 @@ func commandFamily(cmdline string) (Family, string) {
 			continue
 		}
 		f := argvFamily(argv)
+		if inner, ok := shellWrapped(argv); ok {
+			// bash -lc "go test ./..." classifies the wrapped command line
+			f, argv = commandFamilyWords(inner)
+		}
 		if r := familyRank[f]; r > bestRank {
 			best, bestArgv0, bestRank = f, path.Base(argv[0]), r
 		}
 	}
 	return best, bestArgv0
+}
+
+// shellWrapped returns the command string of `bash -c CMD` / `sh -lc CMD` style argv.
+func shellWrapped(argv []string) (string, bool) {
+	switch path.Base(argv[0]) {
+	case "bash", "sh", "zsh", "dash", "ksh":
+	default:
+		return "", false
+	}
+	for i := 1; i < len(argv); i++ {
+		a := argv[i]
+		if !strings.HasPrefix(a, "-") {
+			return "", false
+		}
+		if !strings.HasPrefix(a, "--") && strings.ContainsRune(a[1:], 'c') && i+1 < len(argv) {
+			return strings.Join(argv[i+1:], " "), true // -c, -lc, -ic
+		}
+	}
+	return "", false
+}
+
+// commandFamilyWords classifies a wrapped command line and returns the argv of its
+// most specific part.
+func commandFamilyWords(cmdline string) (Family, []string) {
+	best, bestArgv, bestRank := FamilyShell, []string{"sh"}, -1
+	for _, simple := range splitCommand(cmdline) {
+		argv := commandWords(simple)
+		if len(argv) == 0 {
+			continue
+		}
+		if f := argvFamily(argv); familyRank[f] > bestRank {
+			best, bestArgv, bestRank = f, argv, familyRank[f]
+		}
+	}
+	return best, bestArgv
 }
 
 // familyRank orders families by specificity when a command line has several parts.

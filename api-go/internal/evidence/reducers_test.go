@@ -397,6 +397,9 @@ func TestRegistrySelectsByToolAndArgv0(t *testing.T) {
 		{"exec_command", "pytest", FamilyTest},
 		{"mcp__github__get_pull_request", "", FamilyStructured},
 		{"mcp__repo__exec", "go test ./...", FamilyTest},
+		{"shell", "bash -lc cd api-go && go test ./...", FamilyTest},
+		{"shell", "sh -c 'rg -n needle src'", FamilyGrep},
+		{"shell", "bash script.sh", FamilyShell},
 	}
 	reg := DefaultRegistry()
 	for _, c := range cases {
