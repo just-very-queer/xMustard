@@ -1415,7 +1415,63 @@ def workstream_line(ledger, workstream):
     return line, w.get("process"), list(w.get("scenarios") or []), why
 
 
-def ledger_check(ledger, workstream, head, base):
+def in_ci_suite(sc):
+    """Whether every pull request runs scenario sc. An unknown name counts as one (the
+    strict side)."""
+    return "ci" in SCENARIOS.get(sc, {"suites": ["ci"]})["suites"]
+
+
+def process_p50(view, p):
+    """(p50 MiB, basis) of process p in a view: footprint p50 when present, else RSS p50
+    (0 when the process did not run)."""
+    fp = (view.get("components_footprint_p50_mib") or {}).get(p)
+    if fp is not None:
+        return fp, "footprint p50"
+    return (view.get("components_p50_mib") or {}).get(p) or 0.0, "RSS p50"
+
+
+def merged_lines(ledger, process, exclude=None):
+    """(sum, names) of the lines on `process` of the workstreams merged since the reference
+    was measured (reference_measurement.merged_since), leaving out `exclude`."""
+    total, names = 0.0, []
+    for wid in (ledger.get("reference_measurement") or {}).get("merged_since") or []:
+        w = ledger["workstreams"].get(wid) or {}
+        if wid != exclude and w.get("process") == process and w.get("line_mib"):
+            total += w["line_mib"]
+            names.append(wid)
+    return round(total, 2), names
+
+
+def scenario_status(report):
+    """{scenario: "valid" | "invalid" | "skipped"} of one report: valid when at least one
+    repeat is valid (ledger_view keeps it), invalid when it ran without a valid repeat."""
+    view = ledger_view(report)
+    out = {}
+    for sc, r in (report.get("scenarios") or {}).items():
+        if r.get("status") != "ran":
+            out[sc] = r.get("status") or "skipped"
+        else:
+            out[sc] = "valid" if sc in view else "invalid"
+    return out
+
+
+DESIGNATED_GAPS = {  # (head, base) scenario states that leave a line unchecked and must block
+    ("valid", "invalid"): "the base produced no valid run, so the line is unchecked; re-run the check",
+    ("invalid", "valid"): "the head produced no valid run of a scenario the base measured",
+    ("invalid", "invalid"): "neither side produced a valid run, so the line is unchecked; re-run the check",
+    ("skipped", "valid"): "skipped at the head (feature absent) but measured at the base",
+}
+
+
+def designated_gap(sc, head_state, base_state):
+    """Why a designated scenario leaves the line unchecked in a way that must block, or
+    None. A scenario the base cannot run (skipped, or not in the base report) or that was
+    not run at all is not a gap: there is nothing to re-run."""
+    why = DESIGNATED_GAPS.get((head_state, base_state))
+    return f"{sc}: {why}" if why else None
+
+
+def ledger_check(ledger, workstream, head, base, head_status=None, base_status=None):
     """Check a workstream's measured delta (head minus base: ledger_view() of two reports
     measured on one machine) against its ledger line.
 
@@ -1427,27 +1483,42 @@ def ledger_check(ledger, workstream, head, base):
         else RSS) <= line + that process's p50 tolerance;
       * other components: every other owned component's p50 delta <= the default line (0)
         + its tolerance, so a workstream cannot grow a process that is not its own;
-      * design (cumulative): every process that was within its §7.2 design line at the
-        ledger's reference must stay within it: head p50 (footprint when present, else
-        RSS) <= design steady + tolerance. Many small in-tolerance deltas still fail once
-        they add up past the design line.
+      * design: head p50 (footprint when present, else RSS) against a bound per process.
+        On a CI-suite scenario a process within its §7.2 design line at the reference
+        must stay within design steady + tolerance whatever the base shows, so many small
+        in-tolerance deltas still fail once they add up ("absolute"). A process already
+        over its design line at the reference ("grandfathered": the stdio shims,
+        per-call cores and git children) is bounded on the reference scenario by reference p50 + the lines
+        of the workstreams merged since (reference_measurement.merged_since) + this
+        workstream's positive line + tolerance ("cumulative"). Everywhere else, and for
+        the cumulative bound, the check is base-aware: it fails the pull request that
+        crosses the bound, and an overrun the base already had is reported, not blocking
+        (the delta checks still bound its growth).
     A negative delta counts as a saving only net of external growth. A workstream's line
     applies as declared on its designated scenarios (`scenarios`, all when none are
     named); elsewhere only as a ceiling (max(line, 0)), so a saving a scenario cannot show
     is not demanded there.
 
-    Verdicts: FAIL (blocking) when any check fails or no valid scenario is common.
-    NOT_CHECKABLE when designated scenarios exist and none was measured on both sides.
-    BELOW_RESOLUTION when every check held but |line| is below the tolerance of its check:
-    a line of 0.2 MiB, or a saving of 2 MiB, cannot be told apart from noise, so only the
-    absence of a larger overrun is established. PASS otherwise. A resolvable saving is
-    enforced to within the tolerance: it must show at least |line| - tolerance."""
+    head_status/base_status ({scenario: "valid" | "invalid" | "skipped"}, scenario_status
+    of each report) let the check tell a designated scenario that ran without a valid
+    repeat from one that was not run; without them a scenario absent from a view counts
+    as not run.
+
+    Verdicts: FAIL (blocking) when any check fails, no valid scenario is common, or a
+    designated scenario ran on both sides without a valid run on one (designated_gap).
+    NOT_CHECKABLE when designated scenarios exist and none could be measured on both
+    sides (not run, or not runnable at the base). BELOW_RESOLUTION when every check held
+    but |line| is below the tolerance of its check: a line of 0.2 MiB, or a saving of
+    2 MiB, cannot be told apart from noise, so only the absence of a larger overrun is
+    established. PASS otherwise. A resolvable saving is enforced to within the tolerance:
+    it must show at least |line| - tolerance."""
     tol = ledger["tolerance"]
     t_tree = tol["tree_peak_mib"]
     default = ledger.get("default_line_mib", 0.0)
     line, proc, designated, why = workstream_line(ledger, workstream)
     design = design_lines(ledger)
-    ref = (ledger.get("reference_measurement") or {}).get("component_p50_mib") or {}
+    ref_meas = ledger.get("reference_measurement") or {}
+    ref, ref_sc = ref_meas.get("component_p50_mib") or {}, ref_meas.get("scenario")
     rows = []
     for sc in sorted(set(head) & set(base)):
         h, b = head[sc], base[sc]
@@ -1460,7 +1531,7 @@ def ledger_check(ledger, workstream, head, base):
             return d if d >= 0 else min(0.0, round(d + ext_growth, 2))
 
         fails = []
-        row = {"scenario": sc, "designated": is_designated, "line_mib": line_here,
+        row = {"scenario": sc, "designated": is_designated, "ci_suite": in_ci_suite(sc), "line_mib": line_here,
                "externals_new": sorted(set(hx) - set(bx)), "external_growth_mib": ext_growth}
         d_tree = round(h["gate_peak_mib"] - b["gate_peak_mib"], 2)
         allowed = round(line_here + t_tree, 2)
@@ -1492,36 +1563,117 @@ def ledger_check(ledger, workstream, head, base):
         row["other_components"] = others
         des = []
         for p, dl in sorted(design.items()):
+            tol_p = component_tolerance(ledger, p)
+            cur, basis = process_p50(h, p)
+            base_cur, _ = process_p50(b, p)
             grandfathered = ref.get(p) is not None and ref[p] > dl["steady"]
-            fp = (h.get("components_footprint_p50_mib") or {}).get(p)
-            cur = fp if fp is not None else ((h.get("components_p50_mib") or {}).get(p) or 0.0)
-            allowed_d = round(dl["steady"] + component_tolerance(ledger, p), 2)
-            ok = grandfathered or cur <= allowed_d
-            des.append({"process": p, "p50_mib": cur, "basis": "footprint p50" if fp is not None else "RSS p50",
-                        "design_steady_mib": dl["steady"], "allowed_mib": allowed_d, "grandfathered": grandfathered, "ok": ok})
-            if not ok:
-                fails.append(f"{p} p50 {cur} MiB is over its design line {dl['steady']} + tolerance (accumulated lines)")
+            merged = []
+            if grandfathered and sc == ref_sc:
+                m, merged = merged_lines(ledger, p, exclude=workstream)
+                own = max(line_here, 0.0) if p == proc else 0.0
+                allowed_d, rule = round(ref[p] + m + own + tol_p, 2), "cumulative"
+            else:
+                allowed_d = round(dl["steady"] + tol_p, 2)
+                rule = "absolute" if in_ci_suite(sc) and not grandfathered else "base-aware"
+            over, base_over = cur > allowed_d, base_cur > allowed_d
+            ok = not over or (rule != "absolute" and base_over)
+            des.append({"process": p, "p50_mib": cur, "basis": basis, "base_p50_mib": base_cur,
+                        "design_steady_mib": dl["steady"], "allowed_mib": allowed_d, "rule": rule,
+                        "grandfathered": grandfathered, "merged_since": merged, "over": over, "base_over": base_over, "ok": ok})
+            if ok:
+                continue
+            if rule == "cumulative":
+                fails.append(f"{p} {basis} {cur} MiB is over its reference {ref[p]} + merged lines + tolerance "
+                             f"({allowed_d}; base {base_cur}): accumulated growth on a process already over its design line")
+            elif rule == "base-aware":
+                fails.append(f"{p} {basis} {cur} MiB crossed its design line {dl['steady']} + tolerance ({allowed_d}); "
+                             f"the base was within it ({base_cur})")
+            else:
+                fails.append(f"{p} {basis} {cur} MiB is over its design line {dl['steady']} + tolerance (accumulated lines)")
         row["design"] = des
         row["failures"] = fails
         row["ok"] = not fails
         rows.append(row)
+    hs = head_status if head_status is not None else {sc: "valid" for sc in head}
+    bs = base_status if base_status is not None else {sc: "valid" for sc in base}
+    gaps = [g for g in (designated_gap(sc, hs.get(sc, "not run"), bs.get(sc, "not run")) for sc in designated) if g]
     proc_tol = component_tolerance(ledger, proc) if proc else t_tree
     resolvable = line != 0 and abs(line) >= proc_tol
     measured_designated = [r["scenario"] for r in rows if r["designated"]]
     if not rows:
-        verdict, note = "FAIL", "no common valid scenario between head and base"
-    elif not all(r["ok"] for r in rows):
-        verdict, note = "FAIL", "; ".join(f"{r['scenario']}: {f}" for r in rows for f in r["failures"])
+        verdict, note = "FAIL", "; ".join(["no common valid scenario between head and base"] + gaps)
+    elif gaps or not all(r["ok"] for r in rows):
+        verdict, note = "FAIL", "; ".join([f"{r['scenario']}: {f}" for r in rows for f in r["failures"]] + gaps)
     elif designated and not measured_designated:
-        verdict, note = "NOT_CHECKABLE", (f"the line is measured on {designated}, which did not run on both sides; "
-                                          "the generic checks held")
+        verdict, note = "NOT_CHECKABLE", (f"the line is measured on {designated}, which could not be measured on both "
+                                          "sides (not run, or not runnable at the base); the generic checks held")
     elif not resolvable:
         verdict, note = "BELOW_RESOLUTION", (f"every check held, but the line ({line} MiB) is smaller than the "
                                              f"{proc_tol} MiB tolerance, so it is not verified")
     else:
         verdict, note = "PASS", None
     return {"workstream": workstream, "line_mib": line, "process": proc, "scenarios_designated": designated, "why": why,
-            "tolerance": tol, "rows": rows, "verdict": verdict, "blocking": verdict == "FAIL", "note": note}
+            "tolerance": tol, "rows": rows, "designated_gaps": gaps, "verdict": verdict, "blocking": verdict == "FAIL",
+            "note": note}
+
+
+def gate_blocking(ledger, workstream, report, base_report):
+    """Which gate verdicts block a pull request (run --workstream with --baseline).
+
+    A CI-suite scenario blocks on its own verdict, as on a push: any repeat over the gate,
+    or an invalid run, fails the pull request. Any other scenario that ran (a workstream's
+    designated parity-scale scenario) blocks only on a regression the pull request
+    introduced: the base's median gate peak over its valid repeats was within the gate and
+    the head's is over it, or the base had a valid run and the head has none. Medians of
+    both sides decide, so one noisy repeat does not. An overrun the base already had is
+    reported and does not block; ledger_check still bounds its growth. A workstream whose
+    acceptance names the absolute gate on its designated scenarios opts in with
+    `gate_blocking: true`, and those scenarios then block like CI-suite ones. Nothing
+    having run blocks."""
+    w = ledger["workstreams"].get(workstream) or {}
+    opt_in = set(w.get("scenarios") or []) if w.get("gate_blocking") else set()
+    limit = ledger["gate"]["limit_bytes"] / MIB
+    base_report = base_report or {}
+    hv, bv = ledger_view(report), ledger_view(base_report)
+    rows = []
+    for sc, r in (report.get("scenarios") or {}).items():
+        if r.get("status") != "ran":
+            continue
+        verdict = (r.get("gate") or {}).get("verdict")
+        br = (base_report.get("scenarios") or {}).get(sc) or {}
+        b_verdict = (br.get("gate") or {}).get("verdict", br.get("status", "not run"))
+        h_med, b_med = (hv.get(sc) or {}).get("gate_peak_mib"), (bv.get(sc) or {}).get("gate_peak_mib")
+        if in_ci_suite(sc) or sc in opt_in:
+            rule = "absolute" if in_ci_suite(sc) else "absolute (gate_blocking)"
+            blocking = verdict != "PASS"
+            why_ = ("a CI-suite scenario" if in_ci_suite(sc) else "the workstream opted in") + ": its own verdict decides"
+        else:
+            rule = "regression"
+            if b_med is None:
+                blocking, why_ = False, "the base has no valid run to compare with"
+            elif b_med > limit:
+                blocking, why_ = False, f"the base median {b_med} MiB was already over the gate"
+            elif h_med is None:
+                blocking, why_ = True, f"the head has no valid run; the base median {b_med} MiB was within the gate"
+            else:
+                blocking = h_med > limit
+                why_ = f"head median {h_med} MiB, base median {b_med} MiB"
+        rows.append({"scenario": sc, "verdict": verdict, "base_verdict": b_verdict, "rule": rule, "head_median_mib": h_med,
+                     "base_median_mib": b_med, "blocking": blocking, "why": why_})
+    return {"workstream": workstream, "limit_mib": round(limit, 1), "rows": rows,
+            "blocking": not rows or any(r["blocking"] for r in rows), "note": None if rows else "no scenario ran"}
+
+
+def exit_code(report, require_parity_claim=False):
+    """0 when nothing blocks. Without a workstream every scenario that ran must PASS; with
+    one, gate_blocking decides which verdicts block, and a blocking ledger check fails."""
+    gb = report.get("gate_blocking")
+    code = (1 if gb["blocking"] else 0) if gb else (0 if report["verdict"] == "PASS" else 1)
+    if (report.get("ledger_check") or {}).get("blocking"):
+        code = 1
+    if require_parity_claim and not report["parity_claim"]["established"]:
+        code = 1
+    return code
 
 
 def design_comparison(ledger, view):
@@ -2450,28 +2602,56 @@ def render_markdown(report):
     if g:
         L.append("")
         L.append(f"## Grammars\n\n{g['count']} of {g['required']} parity languages parse with a grammar: {', '.join(g['with_grammar']) or 'none'}.")
+    gb = report.get("gate_blocking")
+    if gb:
+        L.append("")
+        L.append("## Blocking for this pull request")
+        L.append("")
+        L.append(f"Workstream {gb.get('workstream')}: **{'blocking' if gb.get('blocking') else 'not blocking'}**"
+                 + (f" ({gb['note']})" if gb.get("note") else "") + ". CI-suite scenarios block on their own verdict; "
+                 "other scenarios block only when the base median was within the gate and the head median is over it, "
+                 "unless the workstream opts in with `gate_blocking`.")
+        L.append("")
+        L.append("| Scenario | Head verdict | Base verdict | Rule | Head median MiB | Base median MiB | Blocks | Why |")
+        L.append("|---|---|---|---|---|---|---|---|")
+        for row in gb.get("rows", []):
+            L.append(f"| {row.get('scenario')} | {row.get('verdict')} | {row.get('base_verdict')} | {row.get('rule')} | "
+                     f"{fmt(row.get('head_median_mib'))} | {fmt(row.get('base_median_mib'))} | "
+                     f"{'**yes**' if row.get('blocking') else 'no'} | {row.get('why', '')} |")
     lc = report.get("ledger_check")
     L.append("")
     L.append("## Budget ledger")
     if lc:
         L.append("")
-        L.append(f"Workstream {lc['workstream']} (line {lc['line_mib']} MiB on `{lc['process']}`"
+        L.append(f"Workstream {lc.get('workstream')} (line {lc.get('line_mib')} MiB on `{lc.get('process')}`"
                  + (f", measured on {', '.join(lc['scenarios_designated'])}" if lc.get("scenarios_designated") else "")
-                 + f"): **{lc['verdict']}**" + (f" ({lc['note']})" if lc.get("note") else "") + ".")
+                 + f"): **{lc.get('verdict') or ('PASS' if lc.get('passed') else 'FAIL')}**"
+                 + (f" ({lc['note']})" if lc.get("note") else "") + ".")
         L.append("")
         L.append("| Scenario | Line MiB | Tree delta (allowed) | Owned+external delta | External growth | "
-                 "Process delta, basis (allowed) | Other components over | Design lines over |")
+                 "Process delta, basis (allowed) | Other components over | Design bounds over |")
         L.append("|---|---|---|---|---|---|---|---|")
-        for row in lc["rows"]:
+        for row in lc.get("rows", []):
             pr = row.get("process")
-            proc_cell = f"{pr['credited_mib']}, {pr['basis']} ({pr['allowed_mib']})" if pr else "–"
-            others = [f"{o['component']} {o['delta_mib']}" for o in row.get("other_components", []) if not o["ok"]] or ["none"]
-            design = [f"{d['process']} {d['p50_mib']}/{d['design_steady_mib']}" for d in row.get("design", []) if not d["ok"]] or ["none"]
+            if isinstance(pr, dict):
+                proc_cell = f"{pr.get('credited_mib', pr.get('delta_mib'))}, {pr.get('basis')} ({pr.get('allowed_mib')})"
+            else:  # reports written before the per-process record
+                proc_cell = f"{fmt(row.get('process_p50_delta_mib'))} ({fmt(row.get('process_allowed_mib'))})" if pr else "–"
+            tree = row.get("tree") or {"credited_mib": row.get("tree_peak_delta_mib"), "allowed_mib": row.get("tree_allowed_mib")}
+            others = [f"{o['component']} {o['delta_mib']}" for o in row.get("other_components", []) if not o.get("ok")] or ["none"]
+            design = []
+            for d in row.get("design", []):
+                if not d.get("ok"):
+                    design.append(f"{d['process']} {d.get('p50_mib')}/{d.get('allowed_mib', d.get('design_steady_mib'))}"
+                                  f" ({d.get('rule', 'absolute')})")
+                elif d.get("over"):
+                    design.append(f"{d['process']} {d.get('p50_mib')}/{d.get('allowed_mib')} (base already over: reported)")
             ta = row.get("tree_all")
-            L.append(f"| {row['scenario']}{'' if row['designated'] else ' (ceiling only)'} | {row['line_mib']} | "
-                     f"{row['tree']['credited_mib']} ({row['tree']['allowed_mib']}) | {fmt(ta and ta['delta_mib'])} | "
-                     f"{row['external_growth_mib']}{(' new: ' + ', '.join(row['externals_new'])) if row['externals_new'] else ''} | "
-                     f"{proc_cell} | {'; '.join(others)} | {'; '.join(design)} |")
+            L.append(f"| {row.get('scenario')}{'' if row.get('designated', True) else ' (ceiling only)'} | {row.get('line_mib')} | "
+                     f"{fmt(tree.get('credited_mib'))} ({fmt(tree.get('allowed_mib'))}) | {fmt(ta and ta.get('delta_mib'))} | "
+                     f"{fmt(row.get('external_growth_mib'))}"
+                     f"{(' new: ' + ', '.join(row['externals_new'])) if row.get('externals_new') else ''} | "
+                     f"{proc_cell} | {'; '.join(others)} | {'; '.join(design) or 'none'} |")
     dc = report.get("design_comparison")
     if dc:
         L.append("")
@@ -2482,31 +2662,35 @@ def render_markdown(report):
         L.append("|---|---|---|---|---|---|---|")
         for sc, rows in dc.items():
             for d in rows:
-                if d["rss_p50_mib"] is None and d["rss_peak_mib"] is None:
+                if d.get("rss_p50_mib") is None and d.get("rss_peak_mib") is None:
                     continue
-                L.append(f"| {sc} | {d['process']} | {fmt(d['rss_p50_mib'])} | {fmt(d['footprint_p50_mib'])} | "
-                         f"{d['design_steady_mib']}{' **over**' if d['steady_over'] else ''} | {fmt(d['rss_peak_mib'])} | "
-                         f"{d['design_peak_mib']}{' **over**' if d['peak_over'] else ''} |")
+                L.append(f"| {sc} | {d['process']} | {fmt(d.get('rss_p50_mib'))} | {fmt(d.get('footprint_p50_mib'))} | "
+                         f"{d.get('design_steady_mib')}{' **over**' if d.get('steady_over') else ''} | {fmt(d.get('rss_peak_mib'))} | "
+                         f"{d.get('design_peak_mib')}{' **over**' if d.get('peak_over') else ''} |")
     rec = report.get("ledger_reconcile")
     if rec:
+        over = rec.get("over_design") or []
         L.append("")
-        L.append(f"Reconciliation ({rec['status']}): design steady {rec['design_steady_mib']} MiB; peak {rec['design_peak_mib_7_2_method']} MiB "
-                 f"by the §7.2 method, {rec['design_peak_mib_with_query_overlap']} MiB with query peaks overlapping the heavy slot; "
-                 f"gate {rec['gate_mib']} MiB. Measured from {rec['measured_from']}."
-                 + (f" Projected over the design line: {', '.join(rec['over_design'])}." if rec["over_design"] else ""))
+        L.append(f"Reconciliation ({rec.get('status', 'open')}): design steady {fmt(rec.get('design_steady_mib'))} MiB; peak "
+                 f"{fmt(rec.get('design_peak_mib_7_2_method'))} MiB by the §7.2 method, "
+                 f"{fmt(rec.get('design_peak_mib_with_query_overlap'))} MiB with query peaks overlapping the heavy slot; "
+                 f"gate {fmt(rec.get('gate_mib'))} MiB. Measured from {rec.get('measured_from', 'the ledger reference')}."
+                 + (f" Projected over the design line: {', '.join(over)}." if over else ""))
         L.append("")
         L.append("| Process | Design steady | Design peak | Workstream lines | Measured p50 | Projected steady | Overcommit |")
         L.append("|---|---|---|---|---|---|---|")
-        for row in rec["per_process"]:
-            L.append(f"| {row['process']} | {row['design_steady_mib']} | {row['design_peak_mib']} | {row['workstream_lines_mib']} | "
-                     f"{fmt(row['measured_p50_mib'])} | {fmt(row['projected_steady_mib'])} | {fmt(row['overcommit_mib'])} |")
+        for row in rec.get("per_process", []):
+            measured = row.get("measured_p50_mib", row.get("reference_p50_mib"))
+            L.append(f"| {row.get('process')} | {row.get('design_steady_mib')} | {row.get('design_peak_mib')} | "
+                     f"{row.get('workstream_lines_mib')} | {fmt(measured)} | {fmt(row.get('projected_steady_mib'))} | "
+                     f"{fmt(row.get('overcommit_mib'))} |")
         if rec.get("go_daemon_items"):
             L.append("")
             L.append("| §7.3 go_daemon item | Allocation | Workstream lines | Workstreams |")
             L.append("|---|---|---|---|")
             for it in rec["go_daemon_items"]:
-                L.append(f"| {it['item']} ({it['kind']}) | {fmt(it['allocation_mib'])} | {it['workstream_lines_mib']}"
-                         f"{' **over**' if it['over'] else ''} | {', '.join(it['workstreams']) or '–'} |")
+                L.append(f"| {it['item']} ({it.get('kind')}) | {fmt(it.get('allocation_mib'))} | {it.get('workstream_lines_mib')}"
+                         f"{' **over**' if it.get('over') else ''} | {', '.join(it.get('workstreams') or []) or '–'} |")
     L.append("")
     L.append("## Not measured")
     L.append("")
@@ -2641,16 +2825,16 @@ def cmd_run(args):
     report["design_comparison"] = design_comparison(ledger, view)
     report["ledger_path"] = os.path.abspath(args.ledger)
     if args.workstream:
-        report["ledger_check"] = ledger_check(ledger, args.workstream, view, ledger_view(base))
+        report["ledger_check"] = ledger_check(ledger, args.workstream, view, ledger_view(base),
+                                              scenario_status(report), scenario_status(base))
         report["ledger_check"]["baseline_head"] = (base.get("provenance") or {}).get("head")
+        report["gate_blocking"] = gate_blocking(ledger, args.workstream, report, base)
     write_reports(report, out_dir)
-    code = 0 if report["verdict"] == "PASS" else 1
-    if report.get("ledger_check") and report["ledger_check"]["blocking"]:
-        code = 1
-    if args.require_parity_claim and not report["parity_claim"]["established"]:
-        code = 1
-    print(json.dumps({"verdict": report["verdict"], "parity_claim": report["parity_claim"]["established"],
+    code = exit_code(report, args.require_parity_claim)
+    gb = report.get("gate_blocking")
+    print(json.dumps({"verdict": report["verdict"], "exit": code, "parity_claim": report["parity_claim"]["established"],
                       "ledger_check": (report.get("ledger_check") or {}).get("verdict"),
+                      "blocking_scenarios": [r["scenario"] for r in gb["rows"] if r["blocking"]] if gb else None,
                       "scenarios": {n: (r.get("gate") or {}).get("verdict", r.get("status")) for n, r in report["scenarios"].items()},
                       "report": os.path.join(out_dir, "report.json")}))
     return code
@@ -2697,7 +2881,8 @@ def cmd_ledger(args):
     if args.workstream:
         if not (args.head and args.baseline):
             raise SystemExit("ledger --workstream needs --head and --baseline report.json files")
-        chk = ledger_check(ledger, args.workstream, ledger_view(load_json(args.head)), ledger_view(load_json(args.baseline)))
+        head, base = load_json(args.head), load_json(args.baseline)
+        chk = ledger_check(ledger, args.workstream, ledger_view(head), ledger_view(base), scenario_status(head), scenario_status(base))
         print(json.dumps(chk, indent=1))
         return 1 if chk["blocking"] else 0
     rec = ledger_reconcile(ledger)

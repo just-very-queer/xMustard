@@ -628,6 +628,13 @@ class Ledger(unittest.TestCase):
         for k in ("tree_peak_mib", "component_p50_mib", "v1_crosscheck_mib"):
             self.assertIsInstance(LEDGER["tolerance"][k], (int, float), k)
         self.assertEqual(LEDGER["reconciliation"]["status"], "open")
+        # the absolute gate on a designated scenario blocks only where the workstream's acceptance is that gate
+        opted = {wid for wid, w in LEDGER["workstreams"].items() if w.get("gate_blocking")}
+        self.assertEqual(opted, {"WS-13", "WS-30", "WS-55"})
+        for wid in opted:
+            self.assertTrue(LEDGER["workstreams"][wid].get("scenarios"), wid)
+        for wid in LEDGER["reference_measurement"]["merged_since"]:
+            self.assertIn(wid, LEDGER["workstreams"])
 
     def test_reconcile_reports_the_overcommit_and_exits_nonzero(self):
         rec = v2.ledger_reconcile(LEDGER)
@@ -804,6 +811,203 @@ class Ledger(unittest.TestCase):
         self.assertEqual(v2.ci_plan(LEDGER, FIXTURES, "parity/ws-13"),
                          {"workstream": "WS-13", "scenarios": ci + ["agents-2-small"], "fixtures": False})
         self.assertEqual(v2.ci_plan(LEDGER, FIXTURES, "parity/ws-14"), {"workstream": "WS-14", "scenarios": ci + ["agents-2"], "fixtures": True})
+
+
+def gate_run(peak, verdict=None, daemon=20.0, fp=None):
+    """One scenario run: the verdict follows the peak unless given (INVALID)."""
+    verdict = verdict or ("PASS" if peak * 2**20 <= v2.GATE_BYTES else "FAIL")
+    reasons = ["a mandatory workload check failed"] if verdict == "INVALID" else []
+    comps = {"go_daemon": {"p50_mib": daemon, "peak_mib": daemon + 5, "footprint_p50_mib": fp}}
+    return {"status": "ran", "gate": {"peak_mib": peak, "peak_bytes": int(peak * 2**20), "verdict": verdict,
+                                      "valid": verdict != "INVALID", "passed": verdict == "PASS", "invalid_reasons": reasons},
+            "sampler": {"components": comps, "tree_all_peak_mib": peak}}
+
+
+def gate_report(**scenarios):
+    """A report whose scenarios are folded from repeat peaks (a number) or given runs;
+    None marks a scenario skipped for an absent feature."""
+    out = {}
+    for name, runs in scenarios.items():
+        name = name.replace("_", "-")
+        if runs is None:
+            out[name] = {"status": "skipped", "reason": "feature absent at this HEAD"}
+        else:
+            out[name] = v2.median_report([r if isinstance(r, dict) else gate_run(r) for r in runs])
+    rep = {"scenarios": out, "parity_claim": {"established": False, "missing": []}}
+    rep["verdict"] = v2.overall_verdict(rep)
+    return rep
+
+
+class PullRequestBlocking(unittest.TestCase):
+    """Which verdicts block a pull request (review round 2: a designated parity-scale
+    scenario must not block on an overrun its base already had)."""
+
+    def blocks(self, ws, head, base):
+        gb = v2.gate_blocking(LEDGER, ws, head, base)
+        return gb["blocking"], {r["scenario"]: r["blocking"] for r in gb["rows"]}
+
+    def test_designated_parity_scenario_blocks_only_on_a_regression(self):
+        v1_ok = [74.0, 75.0, 76.0]
+        # WS-14's agents-2 is over the gate at the base already: reported, not blocking
+        head = gate_report(v1_workload=v1_ok, agents_2=[97.0, 80.0, 88.0])
+        base = gate_report(v1_workload=v1_ok, agents_2=[96.0, 97.0, 90.0])
+        self.assertEqual(head["verdict"], "FAIL")
+        self.assertEqual(self.blocks("WS-14", head, base), (False, {"v1-workload": False, "agents-2": False}))
+        head["gate_blocking"] = v2.gate_blocking(LEDGER, "WS-14", head, base)
+        self.assertEqual(v2.exit_code(head), 0)
+        # the base was within the gate (median) and the head's median is over it: the pull request did it
+        base_ok = gate_report(v1_workload=v1_ok, agents_2=[80.0, 82.0, 85.0])
+        self.assertEqual(self.blocks("WS-14", gate_report(v1_workload=v1_ok, agents_2=[97.0, 98.0, 80.0]), base_ok),
+                         (True, {"v1-workload": False, "agents-2": True}))
+        # one noisy head repeat over the gate: the scenario's verdict is FAIL, the median is not over
+        noisy = gate_report(v1_workload=v1_ok, agents_2=[80.0, 82.0, 97.0])
+        self.assertEqual(noisy["scenarios"]["agents-2"]["gate"]["verdict"], "FAIL")
+        self.assertEqual(self.blocks("WS-14", noisy, base_ok)[0], False)
+        # the base measured it and the head has no valid run: blocks
+        broken = gate_report(v1_workload=v1_ok, agents_2=[gate_run(80.0, "INVALID")] * 3)
+        self.assertEqual(self.blocks("WS-14", broken, base_ok), (True, {"v1-workload": False, "agents-2": True}))
+        # the same rule for any workstream that designates a parity-scale scenario
+        for ws in ("WS-15", "WS-17", "WS-18", "WS-35", "WS-36", "WS-37", "WS-38", "WS-52", "WS-59", "WS-61"):
+            self.assertFalse(self.blocks(ws, head, base)[0], ws)
+
+    def test_ci_suite_scenarios_and_opted_in_workstreams_block_on_the_verdict(self):
+        base = gate_report(v1_workload=[96.0, 97.0, 98.0], agents_2_small=[96.0, 97.0, 98.0])
+        head = gate_report(v1_workload=[70.0, 71.0, 97.0], agents_2_small=[96.0, 97.0, 98.0])
+        # a CI-suite scenario blocks on any bad repeat, whatever the base showed
+        self.assertEqual(self.blocks("unlisted", head, base), (True, {"v1-workload": True, "agents-2-small": False}))
+        # WS-13's acceptance is the gate on agents-2-small (gate_blocking): an old overrun blocks it
+        ok_v1 = gate_report(v1_workload=[70.0, 71.0, 72.0], agents_2_small=[96.0, 97.0, 98.0])
+        self.assertEqual(self.blocks("WS-13", ok_v1, base), (True, {"v1-workload": False, "agents-2-small": True}))
+        self.assertEqual(self.blocks("unlisted", ok_v1, base)[0], False)
+        for ws in ("WS-30", "WS-55"):
+            self.assertTrue(LEDGER["workstreams"][ws]["gate_blocking"], ws)
+        self.assertEqual(self.blocks("WS-13", gate_report(v1_workload=[70.0], agents_2_small=[60.0, 61.0, 62.0]), base)[0], False)
+        # an invalid CI-suite run blocks; a CI-suite scenario skipped for an absent feature does not
+        inv = gate_report(v1_workload=[gate_run(70.0, "INVALID"), 71.0, 72.0], agents_2_relay=None)
+        self.assertEqual(self.blocks("unlisted", inv, base), (True, {"v1-workload": True}))
+        # nothing ran: blocking
+        self.assertEqual(v2.gate_blocking(LEDGER, "unlisted", gate_report(agents_2_relay=None), base)["blocking"], True)
+
+    def test_exit_code(self):
+        rep = gate_report(v1_workload=[70.0, 71.0, 72.0], agents_2=[97.0, 98.0, 99.0])
+        self.assertEqual(v2.exit_code(rep), 1)  # no workstream: every scenario that ran must pass (push, weekly suite)
+        rep["gate_blocking"] = {"blocking": False, "rows": []}
+        self.assertEqual(v2.exit_code(rep), 0)
+        rep["ledger_check"] = {"blocking": True}
+        self.assertEqual(v2.exit_code(rep), 1)
+        rep["ledger_check"] = {"blocking": False}
+        self.assertEqual(v2.exit_code(rep, require_parity_claim=True), 1)
+
+    def view(self, sc, peak, fp):
+        return {sc: {"gate_peak_mib": peak, "tree_all_peak_mib": peak, "components_p50_mib": {c: v + 5 for c, v in fp.items()},
+                     "components_footprint_p50_mib": fp, "externals_peak_mib": {}}}
+
+    def design(self, chk, proc):
+        return {d["process"]: d for d in chk["rows"][0]["design"]}[proc]
+
+    def test_design_check_is_base_aware_outside_the_ci_suite(self):
+        # agents-2 (WS-14's scenario): the daemon is over its line at the base already
+        base = self.view("agents-2", 90.0, {"go_daemon": 33.0, "mcp_access": 20.0})
+        head = self.view("agents-2", 90.5, {"go_daemon": 33.5, "mcp_access": 20.0})
+        chk = v2.ledger_check(LEDGER, "WS-14", head, base)
+        self.assertNotEqual(chk["verdict"], "FAIL", chk["note"])
+        d = self.design(chk, "go_daemon")
+        self.assertEqual((d["rule"], d["over"], d["base_over"], d["ok"]), ("base-aware", True, True, True))
+        # the pull request that takes it across the line fails, even inside the delta tolerance
+        crossed = v2.ledger_check(LEDGER, "WS-14", self.view("agents-2", 90.0, {"go_daemon": 31.0, "mcp_access": 20.0}),
+                                  self.view("agents-2", 90.0, {"go_daemon": 28.5, "mcp_access": 20.0}))
+        self.assertEqual(crossed["verdict"], "FAIL")
+        self.assertIn("crossed its design line", crossed["note"])
+        # on a CI-suite scenario the design line is absolute
+        v1 = v2.ledger_check(LEDGER, "WS-03", self.view("v1-workload", 80.0, {"go_daemon": 31.0, "mcp_access": 20.0}),
+                             self.view("v1-workload", 80.0, {"go_daemon": 31.0, "mcp_access": 20.0}))
+        self.assertEqual((v1["verdict"], self.design(v1, "go_daemon")["rule"]), ("FAIL", "absolute"))
+
+    def test_grandfathered_processes_are_bounded_cumulatively(self):
+        # WS-16 (line 0 on rust_core_per_call) adds 2.9 MiB per pull request: each is below resolution,
+        # and the cumulative bound (reference 6.2 + merged lines + tolerance 3) stops the second one
+        cur, verdicts = 6.2, []
+        for _ in range(3):
+            base = self.view("v1-workload", 80.0, {"go_daemon": 12.0, "mcp_access": 20.0, "rust_core_per_call": cur})
+            cur = round(cur + 2.9, 1)
+            head = self.view("v1-workload", 80.0, {"go_daemon": 12.0, "mcp_access": 20.0, "rust_core_per_call": cur})
+            verdicts.append(v2.ledger_check(LEDGER, "WS-16", head, base)["verdict"])
+        self.assertEqual(verdicts[:2], ["BELOW_RESOLUTION", "FAIL"])
+        chk = v2.ledger_check(LEDGER, "WS-16", self.view("v1-workload", 80.0, {"rust_core_per_call": 12.0}),
+                              self.view("v1-workload", 80.0, {"rust_core_per_call": 9.1}))
+        d = self.design(chk, "rust_core_per_call")
+        self.assertEqual((d["rule"], d["allowed_mib"], d["ok"]), ("cumulative", 9.2, False))
+        # a merged workstream's line on that process moves the bound; the checked workstream's own line counts once
+        led = copy.deepcopy(LEDGER)
+        led["workstreams"]["WS-60"]["line_mib"] = 4
+        led["workstreams"]["WS-16"]["line_mib"] = 1
+        led["reference_measurement"]["merged_since"] = ["WS-60", "WS-16"]
+        d = self.design(v2.ledger_check(led, "WS-16", self.view("v1-workload", 80.0, {"rust_core_per_call": 12.0}),
+                                        self.view("v1-workload", 80.0, {"rust_core_per_call": 9.1})), "rust_core_per_call")
+        self.assertEqual((d["allowed_mib"], d["merged_since"], d["ok"]), (14.2, ["WS-60"], True))
+        # a base already past the bound (a reference from another runner): reported, not blocking
+        far = v2.ledger_check(LEDGER, "WS-16", self.view("v1-workload", 80.0, {"rust_core_per_call": 15.5}),
+                              self.view("v1-workload", 80.0, {"rust_core_per_call": 15.0}))
+        d = self.design(far, "rust_core_per_call")
+        self.assertEqual((d["over"], d["base_over"], d["ok"]), (True, True, True))
+        # off the reference scenario a grandfathered process is held to its design line, base-aware
+        relay = v2.ledger_check(LEDGER, "WS-13", self.view("agents-2-relay", 60.0, {"mcp_access": 5.5}),
+                                self.view("agents-2-relay", 60.0, {"mcp_access": 2.0}))
+        self.assertEqual((self.design(relay, "mcp_access")["rule"], self.design(relay, "mcp_access")["ok"]), ("base-aware", False))
+
+    def test_an_unmeasured_designated_scenario_fails_closed(self):
+        v1v = self.view("v1-workload", 80.0, {"go_daemon": 12.0})
+        a2 = dict(v1v, **self.view("agents-2", 85.0, {"go_daemon": 20.0}))
+        valid, base_bad = {"v1-workload": "valid", "agents-2": "valid"}, {"v1-workload": "valid", "agents-2": "invalid"}
+        chk = v2.ledger_check(LEDGER, "WS-14", a2, v1v, valid, base_bad)
+        self.assertEqual(chk["verdict"], "FAIL")
+        self.assertIn("the base produced no valid run", chk["note"])
+        self.assertEqual(v2.ledger_check(LEDGER, "WS-14", v1v, a2, base_bad, valid)["verdict"], "FAIL")
+        both_bad = v2.ledger_check(LEDGER, "WS-14", v1v, v1v, base_bad, base_bad)
+        self.assertEqual(both_bad["verdict"], "FAIL")
+        self.assertIn("neither side", both_bad["note"])
+        skipped_head = {"v1-workload": "valid", "agents-2": "skipped"}
+        self.assertEqual(v2.ledger_check(LEDGER, "WS-14", v1v, a2, skipped_head, valid)["verdict"], "FAIL")
+        # not run at all, or not runnable at the base: nothing to compare, not blocking
+        only_v1 = {"v1-workload": "valid"}
+        self.assertEqual(v2.ledger_check(LEDGER, "WS-14", v1v, v1v, only_v1, only_v1)["verdict"], "NOT_CHECKABLE")
+        self.assertEqual(v2.ledger_check(LEDGER, "WS-14", a2, v1v, valid, skipped_head)["verdict"], "NOT_CHECKABLE")
+        # the statuses come from the reports: `rss_v2.sh ledger` fails on a base whose agents-2 had no valid repeat
+        head = gate_report(v1_workload=[74.0, 75.0, 76.0], agents_2=[80.0, 81.0, 82.0])
+        base = gate_report(v1_workload=[74.0, 75.0, 76.0], agents_2=[gate_run(80.0, "INVALID")] * 3)
+        self.assertEqual(v2.scenario_status(base), {"v1-workload": "valid", "agents-2": "invalid"})
+        with tempfile.TemporaryDirectory() as d:
+            h, b = os.path.join(d, "head.json"), os.path.join(d, "base.json")
+            for path, obj in ((h, head), (b, base)):
+                with open(path, "w") as f:
+                    json.dump(obj, f)
+            with unittest.mock.patch("sys.stdout"):
+                self.assertEqual(v2.main(["ledger", "--workstream", "WS-14", "--head", h, "--baseline", b]), 1)
+                self.assertEqual(v2.main(["ledger", "--workstream", "WS-14", "--head", h, "--baseline", h]), 0)
+
+    def test_render_shows_what_blocks_and_reads_older_reports(self):
+        head = gate_report(v1_workload=[74.0, 75.0, 76.0], agents_2=[97.0, 98.0, 99.0])
+        base = gate_report(v1_workload=[74.0, 75.0, 76.0], agents_2=[96.0, 97.0, 98.0])
+        head.update(generated_at="t", provenance={}, unmeasured=[], gate_blocking=v2.gate_blocking(LEDGER, "WS-14", head, base))
+        for r in head["scenarios"].values():
+            r.pop("sampler")  # synthetic runs carry no sample series to render
+        md = v2.render_markdown(head)
+        self.assertIn("Workstream WS-14: **not blocking**", md)
+        self.assertIn("| agents-2 | FAIL | FAIL | regression | 98.0 | 97.0 | no | the base median 97.0 MiB was already over the gate |", md)
+        # a report written before reconciliation status, the per-process record and the design rules
+        old = {"generated_at": "t", "verdict": "PASS", "provenance": {}, "unmeasured": [], "scenarios": {},
+               "parity_claim": {"established": False, "missing": []},
+               "ledger_reconcile": {"design_steady_mib": 64, "design_peak_mib_7_2_method": 94, "design_peak_mib_with_query_overlap": 112,
+                                    "gate_mib": 95.4, "per_process": [{"process": "go_daemon", "design_steady_mib": 27, "design_peak_mib": 33,
+                                                                       "workstream_lines_mib": 27.7, "reference_p50_mib": 18.8,
+                                                                       "projected_steady_mib": 46.5, "over_design_steady": True}]},
+               "ledger_check": {"workstream": "WS-00", "line_mib": 0, "process": "go_daemon", "passed": False, "note": None,
+                                "rows": [{"scenario": "v1-workload", "line_mib": 0, "tree_peak_delta_mib": 6.1, "tree_allowed_mib": 10.0,
+                                          "process": "go_daemon", "process_p50_delta_mib": 7.9, "process_allowed_mib": 2.0, "ok": False}]}}
+        md = v2.render_markdown(old)
+        for needle in ("Reconciliation (open)", "| go_daemon | 27 | 33 | 27.7 | 18.8 | 46.5 | – |", "**FAIL**",
+                       "| v1-workload | 0 | 6.1 (10.0) | – | – | 7.9 (2.0) | none | none |"):
+            self.assertIn(needle, md)
 
 
 def git(args, cwd):

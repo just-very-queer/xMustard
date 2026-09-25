@@ -1,6 +1,6 @@
 {
  "schema": 1,
- "about": "One ledger for the xMustard-owned process tree (PARITY_REQUIREMENTS §7, §12.4-12.5). Gate v2 (rss_bench_v2.py) attributes every sampled process to a component through process_roles; ledger_check fails a pull request whose measured delta against its base exceeds its workstream's line plus tolerance, grows any other owned component or the owned+external tree, or pushes a process past its §7.2 design line (the cumulative check); `rss_v2.sh ledger` reconciles the design lines, the §7.3 go_daemon items and the workstream lines and exits nonzero while a process is projected over its design line. CI judges a pull request by its base's ledger unless the budget-ledger-change label approves a change. MiB = 2^20 bytes.",
+ "about": "One ledger for the xMustard-owned process tree (PARITY_REQUIREMENTS §7, §12.4-12.5). Gate v2 (rss_bench_v2.py) attributes every sampled process to a component through process_roles; ledger_check fails a pull request whose measured delta against its base exceeds its workstream's line plus tolerance, grows any other owned component or the owned+external tree, or pushes a process past its §7.2 design line (the cumulative check); `rss_v2.sh ledger` reconciles the design lines, the §7.3 go_daemon items and the workstream lines and exits nonzero while a process is projected over its design line. CI judges a pull request by its base's ledger unless the budget-ledger-change label approves a change. A workstream's designated scenarios outside the CI suite block its pull request on the absolute 95.4 MiB gate only with gate_blocking: true: WS-30 and WS-55, whose acceptance names that gate there, and WS-13, since the overrun on agents-2-small is the per-agent stdio shims WS-13 removes; otherwise only on a regression (base median within the gate, head median over it). MiB = 2^20 bytes.",
  "gate": {
   "limit_bytes": 100000000,
   "metric": "ps-RSS summed over the xMustard-owned tree in one snapshot every 100 ms; externals excluded and reported on their own lines",
@@ -61,7 +61,7 @@
    "cut or re-place workstream lines so every process's lines fit its design line (for example SQLite-resident LSH bands and anchor postings per §12.4, WS-43 opt-in only)",
    "declare offsetting savings as negative lines (§7.2 counts on -3 to -8 MiB from unlinking the platform half; only WS-49's -4 is declared)"
   ],
-  "enforced_meanwhile": "ledger_check's design check fails any pull request whose measured process p50 crosses its design line plus tolerance, so the overcommit fails CI when it materializes, whatever the lines say"
+  "enforced_meanwhile": "ledger_check's design check fails any pull request whose measured process p50 on a CI-suite scenario is over its design line plus tolerance, and one that takes a process across that line on a designated scenario, so the overcommit fails CI when it materializes, whatever the lines say"
  },
  "default_line_mib": 0,
  "workstreams": {
@@ -78,7 +78,7 @@
   "WS-10": {"line_mib": 0, "process": null, "title": "gate v2 and CI (bench only)"},
   "WS-11": {"line_mib": 0, "process": null, "title": "outcome evaluation executor (outside the tree)"},
   "WS-12": {"line_mib": 0, "process": "go_daemon", "item": "sqlite_governance", "title": "governance cutover to govstore"},
-  "WS-13": {"line_mib": -10, "process": "mcp_access", "scenarios": ["agents-2-small"], "title": "MCP over HTTP; removes per-agent Go shims"},
+  "WS-13": {"line_mib": -10, "process": "mcp_access", "scenarios": ["agents-2-small"], "gate_blocking": true, "title": "MCP over HTTP; removes per-agent Go shims"},
   "WS-14": {"line_mib": 12, "process": "rust_index_service", "scenarios": ["agents-2"], "title": "resident index query side (CSR, names)"},
   "WS-15": {"line_mib": 2, "process": "rust_index_service", "scenarios": ["agents-2"], "title": "watcher and incremental refresh"},
   "WS-16": {"line_mib": 0, "process": "rust_core_per_call", "title": "language packs (worker only)"},
@@ -95,7 +95,7 @@
   "WS-27": {"line_mib": 3, "process": "go_daemon", "item": "governance_caches", "title": "dedupe, anchors, claims"},
   "WS-28": {"line_mib": 1, "process": "go_daemon", "item": "governance_caches", "title": "change-driven invalidation"},
   "WS-29": {"line_mib": 0.5, "process": "go_daemon", "item": "governance_caches", "title": "memory scopes and grants"},
-  "WS-30": {"line_mib": 0.5, "process": "rust_index_service", "scenarios": ["two-hot-repos"], "title": "cross-workspace query and residency LRU"},
+  "WS-30": {"line_mib": 0.5, "process": "rust_index_service", "scenarios": ["two-hot-repos"], "gate_blocking": true, "title": "cross-workspace query and residency LRU"},
   "WS-31": {"line_mib": 1, "process": "go_daemon", "item": "governance_caches", "title": "tiered memory and injection"},
   "WS-32": {"line_mib": 1, "process": "go_daemon", "item": "governance_caches", "title": "consolidation queue"},
   "WS-33": {"line_mib": 1.5, "process": "go_daemon", "item": "governance_caches", "title": "session ledger and handoff"},
@@ -120,7 +120,7 @@
   "WS-52": {"line_mib": 1, "process": "rust_index_service", "scenarios": ["agents-2"], "title": "revision-aware reads"},
   "WS-53": {"line_mib": 2, "process": "go_daemon", "item": "run_lineage_runner", "title": "verification and run-lineage runner"},
   "WS-54": {"line_mib": null, "process": "go_daemon", "item": "mcp_http_sessions", "title": "output-budget contract (critic addition)"},
-  "WS-55": {"line_mib": null, "process": "rust_index_service", "scenarios": ["four-agents-four-worktrees"], "title": "worktree overlay index (critic addition)"},
+  "WS-55": {"line_mib": null, "process": "rust_index_service", "scenarios": ["four-agents-four-worktrees"], "gate_blocking": true, "title": "worktree overlay index (critic addition)"},
   "WS-56": {"line_mib": null, "process": "go_daemon", "item": "governance_caches", "title": "injection-safety policy (critic addition)"},
   "WS-57": {"line_mib": null, "process": "go_daemon", "item": "governance_caches", "title": "human-approval surface (critic addition)"},
   "WS-58": {"line_mib": null, "process": "go_daemon", "item": "runtime_base", "title": "daemon lifecycle (critic addition)"},
@@ -138,7 +138,7 @@
    "basis": "Measured 2026-09-25 on darwin-arm64 (Apple M1, 8 GB, shared with other agents, load average 4-55). Tree peak: single v1-workload runs of one set of binaries ranged 66.8-87.9 MiB over 12 runs (the frozen v1's own history is 72.3-84.9 MB); medians of three were 74.2, 78.7 and 80.8 MiB, so CI compares medians of three and allows 10 MiB. Process check: go_daemon RSS p50 moved 17.8-23.2 MiB within one set of three (lazily reclaimed and compressed pages), footprint p50 11.0-13.1 MiB, so the check uses footprint p50 when both runs report it and allows 3 MiB. Between the medians of two sets of three runs of identical code, footprint p50 moved 2.0 MiB for go_daemon, 1.9 for rust_core_per_call and 4.0 for mcp_access (two stdio Go shims), hence 5 MiB for mcp_access. v1 cross-check: v2 minus the frozen v1 sampler in the same run stayed within 2.33 MiB in 19 of 20 runs and reached -5.62 MiB once at load average 25; it is a gross-error detector (a missed shim or core is 8+ MiB), so it allows 8 MiB. A line smaller than its check's tolerance is below measurement resolution (ledger_check reports BELOW_RESOLUTION, never PASS). Revisit all of these with CI-runner data."
  },
  "reference_measurement": {
-   "about": "v1-workload (the frozen 501-file workload) measured by gate v2, median of three repeats. Binaries were built at source_head, whose api-go and rust-core trees equal feat/parity-v2 b4f7b49. The per-process p50 feeds the reconciliation's projected steady state; replace it with a CI-runner measurement when one exists.",
+   "about": "v1-workload (the frozen 501-file workload) measured by gate v2, median of three repeats. Binaries were built at source_head, whose api-go and rust-core trees equal feat/parity-v2 b4f7b49. The per-process p50 feeds the reconciliation's projected steady state and, for a process already over its design line here (mcp_access, rust_core_per_call, git_child), the cumulative bound ledger_check applies on this scenario: this p50 + the lines of the workstreams in merged_since (merged into the base after this measurement; none of the four listed is on such a process) + tolerance. Replace it with a CI-runner measurement when one exists, and clear merged_since then.",
    "scenario": "v1-workload",
    "platform": "darwin-arm64 (Apple M1, 8 GB, shared with other agents; load average 15-55 during the runs)",
    "date": "2026-09-25",
@@ -164,6 +164,7 @@
      "mcp_access": 24.3,
      "rust_core_per_call": 36.6
    },
-   "note": "rust_index_service is absent at this HEAD (0.0); mcp_access is two stdio Go shims"
+   "note": "rust_index_service is absent at this HEAD (0.0); mcp_access is two stdio Go shims",
+   "merged_since": ["WS-02", "WS-04", "WS-06", "WS-09"]
  }
 }

@@ -160,6 +160,9 @@ jobs:
       # starting ws-NN); other branches get the default line of 0 MiB. The check reads the
       # BASE revision's budget_ledger.json: a pull request that changes lines, tolerances,
       # design lines or roles fails unless a maintainer adds the budget-ledger-change label.
+      # CI-suite scenarios block on their own gate verdict. A workstream's designated
+      # parity-scale scenario blocks only on a regression (base median within 95.4 MiB, head
+      # median over it) unless its ledger entry sets gate_blocking (WS-13, WS-30, WS-55).
       - name: Prepare the base revision
         if: github.event_name == 'pull_request'
         id: base
@@ -257,7 +260,8 @@ jobs:
   # Reports the parity-scale status, three runs per scenario (a borderline single run
   # flips between PASS and FAIL). It fails at this HEAD (per-agent shims and per-call
   # cores exceed 95.4 MiB at 4 agents, two hot repos and four worktrees), so it does not
-  # fail the workflow until the final parity-scale gate (WS-50) makes it blocking.
+  # fail the workflow until the final parity-scale gate (WS-50) makes it blocking. On a
+  # pull request only the designated scenarios of its workstream run (see budget-gate).
   parity-scale:
     name: parity-scale budget gate
     if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.parity)

@@ -110,15 +110,22 @@ and `--baseline`), each common scenario is checked:
   both runs have it, because RSS p50 of a Go process on macOS moves with lazily reclaimed
   and compressed pages; the RSS delta is reported beside it);
 - every other owned component: p50 delta ≤ 0 + its tolerance;
-- design (cumulative): every process that was within its §7.2 design line at the ledger's
-  reference must stay within design steady + tolerance (footprint p50 when present, else
-  RSS p50), so small in-tolerance deltas still fail once they add up. Processes already
-  over their line at the reference
-  (today's stdio shims and per-call cores) are checked by delta only.
+- design: head p50 (footprint when present, else RSS) against a bound per process. On a
+  CI-suite scenario, a process within its §7.2 design line at the ledger's reference must
+  stay within design steady + tolerance whatever the base shows, so small in-tolerance
+  deltas still fail once they add up. A process already over its line at the reference
+  (today's stdio shims, per-call cores and git children) is bounded on the reference
+  scenario by reference p50 + the lines of the workstreams merged since
+  (`reference_measurement.merged_since`) + its own positive line + tolerance. On other
+  scenarios, and for that cumulative bound, the check is base-aware: it fails the pull
+  request that crosses the bound, and reports an overrun the base already had without
+  blocking (the delta checks still bound its growth).
 
 A line applies as declared on its designated scenarios and only as a ceiling
-(max(line, 0)) elsewhere. Verdicts: **FAIL** (blocks CI), **NOT_CHECKABLE** (the
-designated scenarios did not run on both sides), **BELOW_RESOLUTION** (every check held,
+(max(line, 0)) elsewhere. Verdicts: **FAIL** (blocks CI; also when a designated scenario
+ran on both sides without a valid run on one, or was measured at the base and skipped at
+the head, so an unmeasured line never merges silently), **NOT_CHECKABLE** (the designated
+scenarios were not run, or cannot run at the base), **BELOW_RESOLUTION** (every check held,
 but |line| is smaller than its check's tolerance, so the line itself, or a saving such as
 WS-25's 2 MiB, is not verified; only a larger overrun would have been seen), **PASS**. A
 resolvable saving is enforced to within the tolerance: WS-49's -4 MiB must show at least
@@ -127,8 +134,23 @@ resolvable saving is enforced to within the tolerance: WS-49's -4 MiB must show 
 CI measures the pull request's base revision and the head on the same runner (three
 repeats each) over the CI suite plus the workstream's designated scenarios
 (`rss_v2.sh ci-plan --branch REF`, which takes the workstream from a branch path segment
-starting `ws-NN`). The check uses the base revision's ledger; a pull request that changes
-any non-prose ledger value (`rss_v2.sh ledger --diff BASE_LEDGER`) fails unless a
-maintainer adds the `budget-ledger-change` label. The measuring code and the workflow still
-come from the pull request, so a change to `scripts/bench/` or `.github/workflows/` needs
-review; branch protection with code owners for those paths is the owner's setting.
+starting `ws-NN`). What blocks the pull request (`gate_blocking` in the report):
+
+- a CI-suite scenario's own gate verdict: any repeat over 95.4 MiB, or an invalid run;
+- a designated scenario outside the CI suite only on a regression: the base's median gate
+  peak was within the gate and the head's is over it, or the base had a valid run and the
+  head has none. An overrun the base already had (agents-2 measured 79.4-97.0 MiB before
+  WS-13 removes the stdio shims) is reported, not blocking. A workstream whose acceptance
+  is the absolute gate on its scenario opts in with `gate_blocking: true` (WS-13, WS-30,
+  WS-55), and its designated scenarios then block like CI-suite ones;
+- a FAIL from the ledger check.
+
+The check uses the base revision's ledger; a pull request that changes any non-prose
+ledger value (`rss_v2.sh ledger --diff BASE_LEDGER`) fails unless a maintainer adds the
+`budget-ledger-change` label. The measuring code and the workflow still come from the pull
+request, so `.github/CODEOWNERS` names the owner for `scripts/bench/` and `.github/`;
+branch protection with "Require review from Code Owners" is the owner's setting.
+
+The tolerances and `reference_measurement` were measured on a loaded M1 (darwin, where
+footprint is `phys_footprint`); on the Linux runner footprint is PSS. Replace both with
+data from the first CI runs before relying on the design and cumulative bounds there.
