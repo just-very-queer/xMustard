@@ -54,10 +54,13 @@ const OpenModeIdentity = "anonymous"
 // Default resource limits. cache_size counts page bytes, but modernc's allocator puts
 // each 4 KiB page and its header into an 8 KiB slot, so a cache really costs about
 // twice its nominal size (measured by the RSS probe). The defaults below therefore
-// cap the resident page caches at about 3 MiB in total: 2 MiB for the writer and
-// 512 KiB for each of the two readers, inside the 2-4 MiB line of PAR-STORE-01.
+// cap the resident page caches at about 2 MiB in total: 1 MiB for the writer and
+// 512 KiB for each of the two readers, inside the 2-4 MiB line of PAR-STORE-01. The
+// writer's cache fills during a bulk write, so it sets most of the bulk peak: the
+// probe measured 1 MiB less SQLite heap at 512 KiB than at 1 MiB nominal, with no
+// measurable slowdown of a 100k-row insert (single runs on a loaded host).
 const (
-	DefaultCacheKiB       = 1024
+	DefaultCacheKiB       = 512
 	DefaultReaderCacheKiB = 256
 	// cacheSlotFactor is the resident cost of a page-cache byte under modernc's
 	// power-of-two slot allocator.
@@ -133,6 +136,10 @@ type Options struct {
 	// The check runs on a short-lived connection with its own small page cache
 	// (quickCheckCacheKiB), closed before Open returns, so what it adds to the
 	// resident set is bounded by that cache and the code it touches, not by the file.
+	// Measured on the RSS probe's 153 MiB store (macOS arm64, one run): Open() with
+	// the check added 4.67 MiB ps-RSS (5.09 MiB by footprint plus machine code)
+	// against about 2.4 MiB without it; on the writer connection it had cost
+	// 5.7-6.3 MiB.
 	QuickCheckOnOpen bool
 	// Now overrides the clock, for tests.
 	Now func() time.Time

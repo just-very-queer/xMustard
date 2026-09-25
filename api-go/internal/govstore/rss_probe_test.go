@@ -15,14 +15,17 @@ package govstore
 // open deltas, max(getrusage peak, sampled RSS) for bulk peaks. On macOS an open
 // delta is taken as the larger of the ps-RSS delta and vmmap's footprint plus
 // __TEXT delta, because ps-RSS deltas read low when other pages are reclaimed under
-// memory pressure between samples. Budgets asserted:
+// memory pressure between samples. Budgets asserted, as the WS-01 test line states
+// them ("open adds ≤3 MiB; a 100k-row bulk insert inside a single scope stays
+// ≤14 MiB above baseline"), with one baseline for both: the process before Open.
 //   - Open() on an existing store, and Open() plus the first read (which opens a
 //     reader connection), each add at most 3 MiB; creating a new file also runs the
 //     migration and is reported only;
 //   - a 100k-row bulk write inside one Update (InsertEntry, and the legacy importer)
-//     peaks at most 14 MiB above the process with the store open, which is how §7.2
-//     adds the heavy slot to steady state. The peak above the pre-open process is
-//     reported too.
+//     peaks at most 14 MiB above the pre-open process. The peak above the open store
+//     (§7.2's heavy-slot view) is reported too.
+// The legacy import fixture has the pre-w0 shape (no verification_mode), the worst
+// case for the importer: every promoted entry is relabelled.
 //
 // Runs under /usr/bin/time -l should set GOVSTORE_NO_VMMAP=1: time reports the peak
 // over waited-for children as well, and vmmap is larger than the probe.
@@ -51,6 +54,7 @@ const (
 	probeRows    = 100_000
 	mib          = 1024 * 1024
 	maxOpenDelta = 3 * mib
+	// maxBulkDelta is measured from the process before Open (OverBase).
 	maxBulkDelta = 14 * mib
 )
 
@@ -302,13 +306,15 @@ func probeImport(ctx context.Context, s *SQLStore, sample func()) error {
 	if err != nil {
 		return err
 	}
-	if rep.Imported != probeRows {
-		return fmt.Errorf("imported %d", rep.Imported)
+	if rep.Imported != probeRows || rep.RelabelledCount != probeRows {
+		return fmt.Errorf("imported %d, relabelled %d", rep.Imported, rep.RelabelledCount)
 	}
 	return nil
 }
 
-// writeLegacyFixture streams a large legacy file without holding it in memory.
+// writeLegacyFixture streams a large legacy file without holding it in memory. The
+// entries have the pre-w0 shape: promoted, with no verification_mode, as every entry
+// written before w0-kernel is stored on disk.
 func writeLegacyFixture(t *testing.T, path string) {
 	t.Helper()
 	f, err := os.Create(path)
@@ -327,8 +333,7 @@ func writeLegacyFixture(t *testing.T, path string) {
 				{Agent: "agent-b", Approve: true, At: "2026-09-20T08:16:00Z"},
 				{Agent: "agent-c", Approve: true, At: "2026-09-20T08:17:00Z"},
 			},
-			RequiredVerifications: 2, VerificationMode: ModePeerVerified,
-			CreatedAt: "2026-09-20T08:15:00Z", UpdatedAt: "2026-09-20T08:17:00Z",
+			RequiredVerifications: 2, CreatedAt: "2026-09-20T08:15:00Z", UpdatedAt: "2026-09-20T08:17:00Z",
 			Paths: []string{path}, PathHashes: map[string]string{path: Digest(content)},
 		})
 		if i > 0 {
@@ -377,13 +382,15 @@ func TestRSSProbe(t *testing.T) {
 	dir := t.TempDir()
 	insert := runProbe(t, "rss_insert", dir) // creates and migrates probe.db, then writes 100k rows
 	t.Logf("create: opening a new file (with migration) added %.2f MiB", float64(insert.OpenDelta)/mib)
-	if insert.OverOpen > maxBulkDelta {
-		t.Errorf("100k-row InsertEntry transaction peaked %.2f MiB above the open store, budget %d MiB",
-			float64(insert.OverOpen)/mib, maxBulkDelta/mib)
+	if insert.OverBase > maxBulkDelta {
+		t.Errorf("100k-row InsertEntry transaction peaked %.2f MiB above the pre-open process, budget %d MiB",
+			float64(insert.OverBase)/mib, maxBulkDelta/mib)
 	}
 	// Reported, not asserted: the same restart with the opt-in open-time quick_check.
 	qc := runProbe(t, "rss_reopen", dir, "GOVSTORE_QC=1")
-	t.Logf("reopen with QuickCheckOnOpen: open added %.2f MiB", float64(qc.OpenDelta)/mib)
+	t.Logf("reopen with QuickCheckOnOpen: Open() added %.2f MiB (conservative %.2f), with the first read %.2f MiB (conservative %.2f)",
+		float64(qc.OpenOnlyDelta)/mib, float64(openCost(qc.OpenOnlyDelta, qc.FootprintBase, qc.FootprintOpenOnly, qc.TextBase, qc.TextOpenOnly))/mib,
+		float64(qc.OpenDelta)/mib, float64(openCost(qc.OpenDelta, qc.FootprintBase, qc.FootprintOpen, qc.TextBase, qc.TextOpen))/mib)
 	// The same 100k-row file as a restarted daemon sees it. Single ps-RSS samples vary
 	// by about 1 MiB between runs, so the budget applies to the median of five.
 	var openOnly, withRead []int64
@@ -406,8 +413,8 @@ func TestRSSProbe(t *testing.T) {
 	src := filepath.Join(t.TempDir(), "context_entries.json")
 	writeLegacyFixture(t, src)
 	imp := runProbe(t, "rss_import", t.TempDir(), "GOVSTORE_IMPORT="+src)
-	if imp.OverOpen > maxBulkDelta {
-		t.Errorf("100k-entry legacy import peaked %.2f MiB above the open store, budget %d MiB",
-			float64(imp.OverOpen)/mib, maxBulkDelta/mib)
+	if imp.OverBase > maxBulkDelta {
+		t.Errorf("100k-entry legacy import peaked %.2f MiB above the pre-open process, budget %d MiB",
+			float64(imp.OverBase)/mib, maxBulkDelta/mib)
 	}
 }
