@@ -3,8 +3,9 @@
 `xmustard-eval` (`api-go/cmd/xmustard-eval`) runs coding tasks with a real headless
 client under paired arms and reports whether xMustard changes the outcome
 (PAR-EVAL-01), how shared memory behaves over its lifecycle (PAR-EVAL-02), and edit
-localization against gold files (a PAR-EVAL-09 component). It is an operator tool. It
-runs outside the measured xMustard process tree and never ships with the product.
+localization against gold files (a PAR-EVAL-09 component). It is an operator tool for
+macOS and Linux. It runs outside the measured xMustard process tree and never ships
+with the product.
 
 This directory holds the corpus schema (this file), a seed corpus (`seed.yaml`) and an
 example run config (`run-config.example.yaml`). The seed tasks exercise the harness. They
@@ -137,7 +138,7 @@ labelled as estimates.
 | --- | --- |
 | `baseline` | the client exactly as the operator configured it |
 | `baseline_nomcp` | every MCP server disabled: claude `--strict-mcp-config` with an empty config; codex `-c mcp_servers.<name>.enabled=false` for each server that `codex mcp list --json` reports (`-c mcp_servers={}` merges rather than replaces); pi `--no-extensions` |
-| `xmustard_mcp` | `baseline_nomcp` plus the xMustard stack: MCP server `xmustard` for claude and codex, the Pi adapter (`-e`) for pi; empty memory |
+| `xmustard_mcp` | `baseline_nomcp` plus the xMustard stack: MCP server `xmustard` for claude and codex, the Pi adapter (`-e`) for pi; empty memory. Server credentials never reach a command line: claude reads its MCP config from a 0600 file, and codex forwards server env by name (`env_vars`) from its own environment |
 | `xmustard_mcp_hooks` | `xmustard_mcp` plus `hooks.<driver>` arguments from the run config. Without them it is skipped and named as a placeholder until WS-23 builds the adapters |
 | `xmustard_memory` | `xmustard_mcp` plus the task's seeded memory. Tasks without `memory.seed` are skipped and named |
 | `peer:<name>` | `baseline_nomcp` plus one peer MCP server from `peers`. Peers are installed separately and never vendored. A noncommercial license (for example GitNexus, PolyForm Noncommercial) needs `owner_decision` |
@@ -178,7 +179,7 @@ a fresh data directory and its own principals. The agent phase restarts the API 
 | Driver | Invocation | Final event used for tokens and cost |
 | --- | --- | --- |
 | `claude` | `claude -p --output-format stream-json --verbose --no-session-persistence --permission-mode bypassPermissions --model M`, prompt on stdin | `{"type":"result"}`: `modelUsage` summed over models (else `usage`), `total_cost_usd` |
-| `codex` | `codex exec --json --color never -C <worktree> --sandbox workspace-write -m M -`, prompt on stdin | every `turn.completed` `usage` (cached tokens split out of `input_tokens`); cost from `pricing` or `unpriced` |
+| `codex` | `codex exec --json --color never -C <worktree> --sandbox workspace-write -m M -` (`danger-full-access` under `sandbox-exec`, see Isolation), prompt on stdin | every `turn.completed` `usage` (cached tokens split out of `input_tokens`); cost from `pricing` or `unpriced` |
 | `pi` | `pi --mode rpc --no-session --model M`; the harness sends `prompt`, waits for `agent_settled`, then asks `get_session_stats` | the `get_session_stats` response (tokens, cost). Without it, per-message usage is reported with `usage_source: message_end` and `final_event: false` |
 
 A run without a final event is flagged in the report. Nothing is estimated from text
