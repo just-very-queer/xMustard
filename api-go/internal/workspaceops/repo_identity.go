@@ -7,7 +7,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"xmustard/api-go/internal/rustcore"
@@ -80,7 +79,6 @@ func WorkspaceRepoScope(dataDir, workspaceID string) string {
 // if `repo-key` fails or answers something undecodable, the identity is unavailable
 // and incomplete, so evidence freshness is "unknown" — never inferred from a weaker key.
 func repoIdentity(ctx context.Context, root string) RepoIdentity {
-	repoKeySamples.Add(1)
 	out, err := rustcore.RunRepoKey(ctx, root)
 	if err != nil {
 		return RepoIdentity{Source: "unavailable", Limitations: []IdentityLimitation{{Reason: "repo_key_unavailable", Detail: err.Error()}}}
@@ -151,8 +149,6 @@ var (
 	identityCache = &identityCacheT{entries: map[string]*identityEntry{}, flights: map[string]*identityFlight{}}
 	// identityNow is the cache clock (tests).
 	identityNow = time.Now
-	// repoKeySamples counts repo-key runs (tests and diagnostics).
-	repoKeySamples atomic.Int64
 	// sampleRepoIdentity is the sampler (tests replace it).
 	sampleRepoIdentity = repoIdentity
 	// identityWaitHook runs when a caller starts waiting on another's sample (tests).
@@ -174,9 +170,6 @@ func identityTTL() time.Duration {
 	}
 	return maxIdentityTTL
 }
-
-// RepoKeySamples reports how many repo-key runs this process made.
-func RepoKeySamples() int64 { return repoKeySamples.Load() }
 
 // InvalidateRepoIdentity drops the cached identity of root ("" drops every root), so
 // the next read samples. For watcher and edit events.
@@ -241,25 +234,31 @@ func CurrentRepoIdentity(ctx context.Context, root string) (RepoIdentity, Identi
 }
 
 // sample runs repo-key once for the flight f and caches the result when the
-// fingerprint held still across it.
-func (c *identityCacheT) sample(ctx context.Context, root string, before repoFingerprint, f *identityFlight, epoch uint64, ttl time.Duration) (RepoIdentity, IdentityObservation) {
+// fingerprint held still across it and nothing invalidated the root meanwhile.
+// Waiters share the result only under the same conditions.
+func (c *identityCacheT) sample(ctx context.Context, root string, before repoFingerprint, f *identityFlight, epoch uint64, ttl time.Duration) (id RepoIdentity, obs IdentityObservation) {
 	at := identityNow()
-	id := sampleRepoIdentity(ctx, root)
-	after := repoStatFingerprint(root)
-	stable := before.ok && after == before && id.Source == "repo-key" && (after.git || !id.Complete)
-	c.mu.Lock()
-	f.id, f.fp, f.at, f.stable = id, after, at, stable
-	delete(c.flights, root)
-	if stable && ttl > 0 && c.epoch == epoch {
-		if len(c.entries) >= identityCacheMaxLen {
-			c.evictOldest()
+	id = RepoIdentity{Source: "unavailable", Limitations: []IdentityLimitation{{Reason: "repo_key_unavailable"}}}
+	after := repoFingerprint{}
+	defer func() { // settle the flight even if the sampler panics
+		stable := before.ok && after == before && id.Source == "repo-key" && (after.git || !id.Complete)
+		c.mu.Lock()
+		stable = stable && c.epoch == epoch
+		f.id, f.fp, f.at, f.stable = id, after, at, stable
+		delete(c.flights, root)
+		if stable && ttl > 0 {
+			if len(c.entries) >= identityCacheMaxLen {
+				c.evictOldest()
+			}
+			c.entries[root] = &identityEntry{id: id, fp: after, sampledAt: at, lastUsed: at}
+		} else if !stable {
+			delete(c.entries, root)
 		}
-		c.entries[root] = &identityEntry{id: id, fp: after, sampledAt: at, lastUsed: at}
-	} else if !stable {
-		delete(c.entries, root)
-	}
-	c.mu.Unlock()
-	close(f.done)
+		c.mu.Unlock()
+		close(f.done)
+	}()
+	id = sampleRepoIdentity(ctx, root)
+	after = repoStatFingerprint(root)
 	return id, IdentityObservation{}
 }
 
