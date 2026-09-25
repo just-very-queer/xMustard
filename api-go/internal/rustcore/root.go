@@ -30,7 +30,8 @@ const (
 // bin parses args positionally (args.next()), not via a flag parser, so a
 // `-`-leading query/path/seed is read literally — no `--` delimiter is required.
 // The child is killed when the caller's ctx is cancelled or coreCallTimeout elapses,
-// whichever comes first.
+// whichever comes first. With XMUSTARD_CORE_WORKER on, resident subcommands run on
+// the resident worker instead (worker.go) under the same admission and deadlines.
 //
 // Admission: the child takes a slot from budget.Children, and its captured output is
 // reserved against budget.TransientBytes in chunks BEFORE it is buffered. When ctx
@@ -38,6 +39,9 @@ const (
 // decode and response construction); otherwise it is released on return. A refused
 // reservation kills the child and returns budget.ErrOverloaded.
 func runCoreCtx(parent context.Context, sub string, args ...string) ([]byte, error) {
+	if out, handled, err := runViaWorker(parent, sub, args); handled {
+		return out, err
+	}
 	release, err := budget.Children.Acquire(parent)
 	if err != nil {
 		return nil, fmt.Errorf("rust-core %s: %w", sub, err)

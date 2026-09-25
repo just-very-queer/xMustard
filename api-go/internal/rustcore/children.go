@@ -40,12 +40,22 @@ func KillActiveChildren() int {
 	return len(cmds)
 }
 
+// startTracked starts cmd and tracks it for shutdown until the returned untrack is
+// called (after Wait). The resident worker uses it directly; one-shot children use
+// runTracked.
+func startTracked(cmd *exec.Cmd) (untrack func(), err error) {
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	return TrackChild(cmd), nil
+}
+
 // runTracked starts cmd, tracks it until it exits, and waits for it.
 func runTracked(cmd *exec.Cmd) error {
-	if err := cmd.Start(); err != nil {
+	untrack, err := startTracked(cmd)
+	if err != nil {
 		return err
 	}
-	untrack := TrackChild(cmd)
 	defer untrack()
 	return cmd.Wait()
 }
