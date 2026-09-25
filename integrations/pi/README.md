@@ -31,6 +31,7 @@ Or list this directory as a Pi package (`package.json` declares `pi.extensions`)
 | --- | --- | --- |
 | `XMUSTARD_API_BASE` | `http://127.0.0.1:8042` | Go API base URL |
 | `XMUSTARD_TOKEN` | unset | Bearer token (needs `agent` role for capture). Sent as a header, never logged or echoed. Required when the API enforces auth. |
+| `XMUSTARD_WORKSPACE_ID` | unset | Workspace for calls that omit `workspace_id`. Unset: the registered workspace whose root contains Pi's working directory (longest root wins). The adapter never registers a repository; an unregistered directory is an explicit error. |
 | `XMUSTARD_PI_DELIVERY` | `source` | `source` or `hook`; see below |
 | `XMUSTARD_PI_TOOL_TIMEOUT_MS` | `60000` | Per-call deadline for tools and `xmustard_expand`; may only be lowered |
 | `XMUSTARD_PI_PROJECTION_TIMEOUT_MS` | `5000` | Deadline for the `tool_result` projection POST; may only be lowered |
@@ -81,6 +82,12 @@ by unit tests only: there, the deadline alone bounds the request.
 npm run check                   # typecheck + unit tests (in-process HTTP server)
 ../../scripts/e2e/pi-adapter.sh # real Pi CLI + real Go API + Rust core
 ```
+
+`src/tools.ts` mirrors `api-go/internal/mcpserver/tool_<name>.go`. The unit tests
+compare it with the tools/list snapshot that the Go tests generate
+(`api-go/internal/mcpserver/testdata/tools_list.json`; regenerate with
+`XMUSTARD_UPDATE_GOLDEN=1 go test ./internal/mcpserver`), so a description or schema
+changed on one side fails without the live e2e.
 
 The e2e needs native PostgreSQL server binaries (`initdb`, `postgres`, `psql`) on PATH.
 `diagnostics` reads its baseline from Postgres (optional and off in xMustard's default),
