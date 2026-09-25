@@ -332,8 +332,9 @@ func TestMutatingArgumentsAreNeverAlteredSilently(t *testing.T) {
 	if res.Err == nil || res.Err.Code != CodeNeedsRepair || res.Err.Field != "paths" || res.Err.Expected != "local_path" {
 		t.Fatalf("unrepaired paths must fail validation, got %+v", res.Err)
 	}
-	if !strings.Contains(res.Err.Message, "mutating") || strings.Contains(res.Err.Message, "file:///repo") {
-		t.Fatalf("error should explain the refusal without echoing values: %q", res.Err.Message)
+	if !strings.Contains(res.Err.Message, "mutating") || strings.Contains(res.Err.Message, "file:///repo") ||
+		!strings.Contains(res.Err.Message, `send "/repo/a.go,c.go"`) {
+		t.Fatalf("error should explain the refusal and name the canonical paths, not echo the input: %q", res.Err.Message)
 	}
 	noneApplied(t, res)
 
@@ -466,6 +467,56 @@ func TestNormalizeJSON(t *testing.T) {
 	}
 	if _, _, err := NormalizeJSON(Spec{Kind: KindShell}, json.RawMessage(`{"cmd":"ls"} {"cmd":"rm"}`)); err == nil {
 		t.Fatal("trailing data must be an error")
+	}
+}
+
+// A value repair on a mutating tool names the canonical value when the field
+// is structural (paths, ids), so the agent can send it; a field that may hold
+// user content is never quoted back.
+func TestNeedsRepairNamesCanonicalValue(t *testing.T) {
+	specs := xmSpecs()
+	res := Normalize(specs[KindRemember], map[string]any{"workspace_id": "w", "content": "c", "paths": "a.go, ./b.go"})
+	if res.Err == nil || res.Err.Code != CodeNeedsRepair || !strings.Contains(res.Err.Message, `send "a.go,b.go"`) {
+		t.Fatalf("paths repair should name the canonical value: %+v", res.Err)
+	}
+	res = Normalize(specs[KindVerify], map[string]any{"workspace_id": "w", "entry_id": " e1 ", "approve": true})
+	if res.Err == nil || !strings.Contains(res.Err.Message, `send "e1"`) {
+		t.Fatalf("id trim should name the canonical value: %+v", res.Err)
+	}
+	fetch := Spec{Kind: KindWebFetch, Mutating: true, Fields: []Field{{Name: "url", Type: TypeString, Required: true}}}
+	res = Normalize(fetch, map[string]any{"url": " https://deploy:hunter2@example.com/x "})
+	if res.Err == nil || res.Err.Code != CodeNeedsRepair || strings.Contains(res.Err.Message, "hunter2") ||
+		!strings.Contains(res.Err.Message, `"url"`) || !strings.Contains(res.Err.Message, "send the canonical value") {
+		t.Fatalf("a field that may hold user content must be named, not quoted: %+v", res.Err)
+	}
+}
+
+// JSON Schema counts an integral number written with a fraction or exponent
+// ("5.0", "1e2") as an integer: NormalizeJSON accepts it and sends it as an
+// integer, as Normalize does for a float64; a mutating tool names the value.
+func TestNormalizeJSONIntegralNumbers(t *testing.T) {
+	spec := xmSpecs()[KindExplain]
+	spec.Fields = append(spec.Fields, Field{Name: "limit", Type: TypeInteger})
+	for raw, want := range map[string]string{
+		`{"workspace_id":"w","path":"a.go","limit":5.0}`: `{"limit":5,"path":"a.go","workspace_id":"w"}`,
+		`{"workspace_id":"w","path":"a.go","limit":1e2}`: `{"limit":100,"path":"a.go","workspace_id":"w"}`,
+		`{"workspace_id":"w","path":"a.go","limit":7}`:   `{"limit":7,"path":"a.go","workspace_id":"w"}`,
+	} {
+		out, res, err := NormalizeJSON(spec, json.RawMessage(raw))
+		if err != nil || res.Err != nil || string(out) != want {
+			t.Errorf("%s: got %s %v %+v", raw, out, err, res.Err)
+		}
+	}
+	for _, raw := range []string{`{"workspace_id":"w","path":"a.go","limit":5.5}`, `{"workspace_id":"w","path":"a.go","limit":1e300}`} {
+		if _, res, _ := NormalizeJSON(spec, json.RawMessage(raw)); res.Err == nil || res.Err.Code != CodeType {
+			t.Errorf("%s: a non-integral or out-of-range number must fail: %+v", raw, res.Err)
+		}
+	}
+	spec.Mutating = true
+	out, res, err := NormalizeJSON(spec, json.RawMessage(`{"workspace_id":"w","path":"a.go","limit":5.0}`))
+	if err != nil || string(out) != `{"limit":5.0,"path":"a.go","workspace_id":"w"}` || res.Err == nil ||
+		res.Err.Code != CodeNeedsRepair || !strings.Contains(res.Err.Message, "send 5 ") {
+		t.Fatalf("mutating: %s %v %+v", out, err, res.Err)
 	}
 }
 

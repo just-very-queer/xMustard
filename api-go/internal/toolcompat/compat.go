@@ -274,7 +274,7 @@ func Normalize(spec Spec, args map[string]any) Result {
 			}
 		}
 	case verr == nil && mutating && len(norms) > 0:
-		verr = needsRepair(tool, norms[0])
+		verr = needsRepair(tool, norms, work)
 	}
 	if verr != nil {
 		verr.Tool = tool
@@ -285,19 +285,65 @@ func Normalize(spec Spec, args map[string]any) Result {
 }
 
 // needsRepair is the error for a mutating call whose arguments are valid in
-// canonical form but were not sent that way.
-func needsRepair(tool string, n Normalization) *ValidationError {
+// canonical form but were not sent that way. norms are the normalizations the
+// call would have needed, and repaired the arguments with them applied.
+func needsRepair(tool string, norms []Normalization, repaired map[string]any) *ValidationError {
+	n := norms[0]
 	var msg string
 	switch n.Op {
 	case OpAlias:
 		msg = fmt.Sprintf("argument %q for %s must be sent as %q", n.From, tool, n.Field)
 	case OpDrop:
 		msg = fmt.Sprintf("argument %q for %s repeats %q; send it once, as %q", n.From, tool, n.Field, n.Field)
+	case OpRemove:
+		msg = fmt.Sprintf("argument %q for %s is a placeholder (%s); leave it out", n.Field, tool, n.Rule)
 	default:
-		msg = fmt.Sprintf("argument %q for %s is not in canonical form (%s); send the canonical value", n.Field, tool, n.Rule)
+		if n.From != "" {
+			msg = fmt.Sprintf("argument %q for %s must be sent as %q (%s)", n.From, tool, n.Field, n.Rule)
+		} else {
+			msg = fmt.Sprintf("argument %q for %s is not in canonical form (%s)", n.Field, tool, n.Rule)
+		}
+		if v, ok := canonicalValue(n.Field, norms, repaired); ok {
+			msg += "; send " + v
+		} else {
+			msg += "; send the canonical value"
+		}
 	}
 	msg += fmt.Sprintf(" (%s is a mutating tool: its arguments are never rewritten)", tool)
 	return &ValidationError{Field: n.Field, Code: CodeNeedsRepair, Expected: n.Rule, Message: msg}
+}
+
+// structuralRules rewrite a path, glob, identifier, enum value or scalar type,
+// never free text, so their result may be quoted back in an error: it tells
+// the agent exactly what to send instead of inviting another guess.
+var structuralRules = map[string]bool{
+	"local_path": true, "glob": true, "trim": true, "list_to_csv": true,
+	"enum_case": true, "integer": true, "number": true, "boolean": true,
+}
+
+// maxEchoedValue bounds a canonical value quoted in an error.
+const maxEchoedValue = 512
+
+// canonicalValue returns field's repaired value as JSON when every repair of
+// the field is structural; a field that may hold user content (memory text, a
+// command, a URL) is never quoted back.
+func canonicalValue(field string, norms []Normalization, repaired map[string]any) (string, bool) {
+	for _, n := range norms {
+		if n.Field == field && !structuralRules[n.Rule] {
+			return "", false
+		}
+	}
+	v, ok := repaired[field]
+	if !ok {
+		return "", false
+	}
+	var b bytes.Buffer
+	enc := json.NewEncoder(&b)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil || b.Len() > maxEchoedValue {
+		return "", false
+	}
+	return strings.TrimSuffix(b.String(), "\n"), true
 }
 
 // NormalizeJSON is Normalize over a JSON object. It returns the normalized
@@ -782,13 +828,24 @@ func coerceIntArg(s *state, key string) {
 			s.coerce(key, n, "integer")
 		}
 	case json.Number:
-		if _, err := v.Int64(); err == nil {
-			return // already an integer
-		}
-		if f, err := v.Float64(); err == nil && f == math.Trunc(f) && math.Abs(f) <= 1<<53 {
-			s.coerce(key, int(f), "integer")
+		if n, ok := integralNumber(v); ok {
+			s.coerce(key, n, "integer")
 		}
 	}
+}
+
+// integralNumber reports whether a JSON number that is not written as an
+// integer ("5.0", "1e2") has an integral value that a float64 holds exactly,
+// and returns it. JSON Schema counts such a number as an integer.
+func integralNumber(v json.Number) (int, bool) {
+	if _, err := v.Int64(); err == nil {
+		return 0, false // already written as an integer
+	}
+	f, err := v.Float64()
+	if err != nil || f != math.Trunc(f) || math.Abs(f) > 1<<53 {
+		return 0, false
+	}
+	return int(f), true
 }
 
 // Field classes for the generic repairs of closed specs.
@@ -883,8 +940,13 @@ func coerceField(f Field, s *state) {
 			}
 		}
 	case TypeInteger:
-		if str, ok := v.(string); ok {
-			if n, err := strconv.Atoi(strings.TrimSpace(str)); err == nil {
+		switch x := v.(type) {
+		case string:
+			if n, err := strconv.Atoi(strings.TrimSpace(x)); err == nil {
+				s.coerce(f.Name, n, "integer")
+			}
+		case json.Number:
+			if n, ok := integralNumber(x); ok {
 				s.coerce(f.Name, n, "integer")
 			}
 		}
@@ -1120,8 +1182,11 @@ func hasType(v any, t Type) bool {
 		case float64:
 			return n == float64(int64(n))
 		case json.Number:
-			_, err := n.Int64()
-			return err == nil
+			if _, err := n.Int64(); err == nil {
+				return true
+			}
+			_, ok := integralNumber(n)
+			return ok
 		}
 		return false
 	case TypeNumber:
