@@ -223,7 +223,7 @@ pub fn hybrid_search(
     limit: usize,
     seed: Option<&str>,
 ) -> SearchResult {
-    let graph = symbolgraph::build_symbol_graph_cached(root, workspace_id);
+    let (graph, coverage) = symbolgraph::symbol_graph_with_coverage(root, workspace_id);
     let hotspots: HashSet<String> = symbolgraph::compute_hotspots(&graph, 30)
         .into_iter()
         .map(|h| h.path)
@@ -238,7 +238,7 @@ pub fn hybrid_search(
             query: query.to_string(),
             total: 0,
             hits: Vec::new(),
-            coverage: graph.coverage.clone(),
+            coverage,
             generated_at: now(),
         };
     }
@@ -457,7 +457,7 @@ pub fn hybrid_search(
         query: query.to_string(),
         total,
         hits,
-        coverage: graph.coverage.clone(),
+        coverage,
         generated_at: now(),
     }
 }

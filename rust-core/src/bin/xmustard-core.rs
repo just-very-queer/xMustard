@@ -119,6 +119,9 @@ fn main() {
         eprintln!("usage: xmustard-core <command> [args]");
         std::process::exit(2);
     };
+    if command == "serve" {
+        std::process::exit(xmustard_core::serve::run_stdio(COMMANDS, args.collect()));
+    }
     let Some(entry) = dispatch::find(COMMANDS, &command) else {
         eprintln!("unknown command: {command}");
         std::process::exit(2);
@@ -1021,6 +1024,8 @@ fn run_changetrack_command(mut args: Args) -> CmdResult {
 }
 
 /// `symbolgraph <build|hotspots|blast-radius|...> ...` — the semantic symbol graph.
+/// The read-only queries share the resident snapshot when serving (see
+/// `symbolgraph::symbol_graph_for_query`).
 fn run_symbolgraph_command(mut args: Args) -> CmdResult {
     use xmustard_core::symbolgraph as sg;
 
@@ -1050,7 +1055,7 @@ fn run_symbolgraph_command(mut args: Args) -> CmdResult {
             let usage = "xmustard-core symbolgraph clusters <root> <workspace_id>";
             let root = need(&mut args, usage)?;
             let ws = need(&mut args, usage)?;
-            let graph = sg::build_symbol_graph_cached(Path::new(&root), &ws);
+            let graph = sg::symbol_graph_for_query(Path::new(&root), &ws);
             json(&sg::compute_clusters(&graph))
         }
         "impact" => {
@@ -1063,7 +1068,7 @@ fn run_symbolgraph_command(mut args: Args) -> CmdResult {
                 .next()
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(4);
-            let graph = sg::build_symbol_graph_cached(Path::new(&root), &ws);
+            let graph = sg::symbol_graph_for_query(Path::new(&root), &ws);
             json(&sg::symbol_impact(&graph, &symbol, depth))
         }
         "trace" => {
@@ -1073,7 +1078,7 @@ fn run_symbolgraph_command(mut args: Args) -> CmdResult {
             let ws = need(&mut args, usage)?;
             let from = need(&mut args, usage)?;
             let to = need(&mut args, usage)?;
-            let graph = sg::build_symbol_graph_cached(Path::new(&root), &ws);
+            let graph = sg::symbol_graph_for_query(Path::new(&root), &ws);
             json(&sg::trace_symbols(&graph, &from, &to))
         }
         "flow" => {
@@ -1081,7 +1086,7 @@ fn run_symbolgraph_command(mut args: Args) -> CmdResult {
             let root = need(&mut args, usage)?;
             let ws = need(&mut args, usage)?;
             let filter = args.next();
-            let graph = sg::build_symbol_graph_cached(Path::new(&root), &ws);
+            let graph = sg::symbol_graph_for_query(Path::new(&root), &ws);
             let edges: Vec<&sg::GraphEdge> = graph
                 .flow_edges
                 .iter()
@@ -1131,6 +1136,80 @@ mod tests {
         v.iter().map(|s| s.to_string()).collect()
     }
 
+    /// Every subcommand the Go bridge sends through `runCoreCtx` (the worker path),
+    /// with the first argument for the command families.
+    const GO_WORKER_CALLS: &[(&str, &[&str])] = &[
+        ("scan-signals", &[]),
+        ("build-repo-map", &[]),
+        ("semantic-impact", &[]),
+        ("path-symbols", &[]),
+        ("explain-path", &[]),
+        ("normalize-diagnostics", &[]),
+        ("archive-diagnostics-payload", &[]),
+        ("link-diagnostic-symbol", &[]),
+        ("normalize-lsp-definition", &[]),
+        ("normalize-lsp-references", &[]),
+        ("normalize-lsp-document-symbols", &[]),
+        ("normalize-lsp-workspace-symbols", &[]),
+        ("parse-coverage-lcov", &[]),
+        ("parse-coverage", &[]),
+        ("symbolgraph", &["build"]),
+        ("symbolgraph", &["hotspots"]),
+        ("symbolgraph", &["blast-radius"]),
+        ("symbolgraph", &["impact"]),
+        ("symbolgraph", &["trace"]),
+        ("symbolgraph", &["clusters"]),
+        ("changetrack", &["fingerprint"]),
+        ("changetrack", &["index"]),
+        ("changetrack", &["drift"]),
+        ("changetrack", &["changed-since"]),
+        ("changetrack", &["working-changes"]),
+        ("changetrack", &["incorporate"]),
+        ("changetrack", &["lineage"]),
+        ("ownership", &["subsystems"]),
+        ("ownership", &["owners"]),
+        ("search", &[]),
+        ("repo-key", &[]),
+        ("wiki", &[]),
+    ];
+
+    #[test]
+    fn every_go_worker_call_is_resident() {
+        for (name, args) in GO_WORKER_CALLS {
+            let entry = dispatch::find(COMMANDS, name)
+                .unwrap_or_else(|| panic!("{name} missing from COMMANDS"));
+            assert!(
+                entry.resident_for(&strings(args)),
+                "{name} {args:?} must be resident: the Go worker path sends it"
+            );
+        }
+    }
+
+    #[test]
+    fn process_spawning_commands_stay_one_shot() {
+        for name in [
+            "lsp-document-symbols",
+            "lsp-hover",
+            "lsp-references",
+            "lsp-definition",
+            "lsp-implementation",
+            "lsp-type-definition",
+            "lsp-rename",
+            "run-verification-command",
+            "run-managed-command",
+            "run-verification-profile",
+            "goal",
+            "swarm",
+            "semantic-search",
+            "bench",
+        ] {
+            let entry = dispatch::find(COMMANDS, name).unwrap();
+            assert!(!entry.is_resident(), "{name} must stay one-shot");
+        }
+        let sg = dispatch::find(COMMANDS, "symbolgraph").unwrap();
+        assert!(!sg.resident_for(&strings(&["build-lsp", "/r", "ws"])));
+    }
+
     #[test]
     fn table_names_are_unique() {
         let mut names: Vec<&str> = COMMANDS.iter().map(|c| c.name).collect();
@@ -1138,6 +1217,10 @@ mod tests {
         let before = names.len();
         names.dedup();
         assert_eq!(before, names.len(), "duplicate subcommand in COMMANDS");
+        assert!(
+            dispatch::find(COMMANDS, "serve").is_none(),
+            "serve is the worker entry point, not a table command"
+        );
     }
 
     #[test]

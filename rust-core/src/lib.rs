@@ -18,6 +18,7 @@ pub mod repomap;
 pub mod scanner;
 pub mod search;
 pub mod semantic;
+pub mod serve;
 pub mod swarm;
 pub mod symbolgraph;
 pub mod treesitter;
