@@ -1,29 +1,12 @@
 package rustcore
 
 import (
-	"bytes"
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
-
-func TestCapWriterBoundsAndFlags(t *testing.T) {
-	c := &capWriter{max: 1024}
-	chunk := bytes.Repeat([]byte("y"), 1024)
-	for i := 0; i < 50; i++ {
-		n, _ := c.Write(chunk)
-		if n != len(chunk) {
-			t.Fatalf("Write must report full length (no child block), got %d", n)
-		}
-	}
-	if c.buf.Len() > c.max {
-		t.Fatalf("buffered %d bytes, must be <= max %d", c.buf.Len(), c.max)
-	}
-	if !c.over {
-		t.Fatal("over flag must be set after exceeding max")
-	}
-}
 
 // A flooding core child is bounded (output too large), not OOM, and the error is
 // sanitized (no raw stderr / paths). Uses a fake core binary via XMUSTARD_CORE_BIN.
@@ -38,7 +21,7 @@ func TestRunCoreContextBoundsFloodingChild(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("XMUSTARD_CORE_BIN", fake)
-	_, err := runCoreContext("search", "root", "ws", "query")
+	_, err := runCoreCtx(context.Background(), "search", "root", "ws", "query")
 	if err == nil {
 		t.Fatal("a failing core child must error")
 	}

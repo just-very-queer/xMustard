@@ -33,27 +33,42 @@ fn git(root: &Path, args: &[&str]) -> Option<String> {
 }
 
 fn tracked_files(root: &Path) -> Vec<String> {
-    git(root, &["ls-files"])
-        .map(|s| s.lines().map(|l| l.to_string()).collect())
-        .unwrap_or_default()
+    // NUL-delimited and untrimmed, so whitespace/newline names stay exact.
+    crate::indexcache::run_git_bounded(
+        root,
+        &["ls-files", "-z"],
+        crate::indexcache::MAX_GIT_OUTPUT_BYTES,
+        crate::indexcache::git_timeout(),
+    )
+    .map(|out| {
+        out.split(|b| *b == 0)
+            .filter(|p| !p.is_empty())
+            .filter_map(|p| String::from_utf8(p.to_vec()).ok())
+            .collect()
+    })
+    .unwrap_or_default()
 }
 
-/// `git status --porcelain` parsed into (status_code, path).
+/// `git status --porcelain=v1 -z` parsed into (status_code, path), untrimmed; a rename
+/// reports its new path.
 fn dirty_paths(root: &Path) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    if let Some(text) = git(root, &["status", "--porcelain"]) {
-        for line in text.lines() {
-            if line.len() < 4 {
-                continue;
-            }
-            let code = line[..2].trim().to_string();
-            // porcelain is `XY<space>path`; trim from the status field so 1- or
-            // 2-char codes and extra padding never shift the path.
-            let path = line[2..].trim_start().to_string();
-            out.push((code, path));
-        }
-    }
-    out
+    let Ok(out) = crate::indexcache::run_git_bounded(
+        root,
+        &["status", "--porcelain=v1", "-z"],
+        crate::indexcache::MAX_GIT_OUTPUT_BYTES,
+        crate::indexcache::git_timeout(),
+    ) else {
+        return Vec::new();
+    };
+    crate::indexcache::parse_porcelain_v1_z(&out)
+        .into_iter()
+        .map(|e| {
+            (
+                String::from_utf8_lossy(&e.xy).trim().to_string(),
+                String::from_utf8_lossy(&e.path).into_owned(),
+            )
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -221,7 +236,9 @@ fn collect_signatures(root: &Path, workspace_id: &str) -> BTreeMap<String, Strin
         if !is_source(path) {
             continue;
         }
-        if let Ok(result) = repomap::extract_path_symbols(root, workspace_id, path) {
+        if let Ok(result) =
+            repomap::extract_path_symbols_limited(root, workspace_id, path, usize::MAX)
+        {
             for sym in &result.symbols {
                 if !is_contract_kind(&sym.kind) {
                     continue;
@@ -457,7 +474,9 @@ fn dirty_symbols_for(
         if cf.change == "deleted" || !is_source(&cf.path) {
             continue;
         }
-        if let Ok(result) = repomap::extract_path_symbols(root, workspace_id, &cf.path) {
+        if let Ok(result) =
+            repomap::extract_path_symbols_limited(root, workspace_id, &cf.path, usize::MAX)
+        {
             for sym in result.symbols {
                 let mut contract_break = false;
                 let mut signature_change = None;
@@ -716,6 +735,37 @@ mod tests {
             .args(["commit", "-qm", "c"])
             .output()
             .unwrap();
+    }
+
+    // Fable F4: whitespace/newline names must hash the exact file Git lists (not a
+    // trimmed decoy), and a rename is one dirty path, not "old -> new".
+    #[test]
+    fn fingerprint_preserves_exact_paths() {
+        let dir = TempDir::new().unwrap();
+        git_init(dir.path());
+        fs::write(dir.path().join(" lead.rs"), "REAL\n").unwrap();
+        fs::write(dir.path().join("lead.rs"), "DECOY\n").unwrap();
+        fs::write(dir.path().join("new\nline.rs"), "NL\n").unwrap();
+        fs::write(dir.path().join("old.rs"), "OLD\n").unwrap();
+        git_commit(dir.path());
+        let fp = compute_fingerprint(dir.path());
+        assert_eq!(fp.tracked_file_count, 4, "odd names dropped: {fp:?}");
+        let before = fp.content_hash;
+        fs::write(dir.path().join(" lead.rs"), "REAL2\n").unwrap();
+        let after = compute_fingerprint(dir.path());
+        assert_ne!(before, after.content_hash, "edit to ' lead.rs' not seen");
+        Command::new("git")
+            .arg("-C")
+            .arg(dir.path())
+            .args(["mv", "old.rs", "renamed.rs"])
+            .output()
+            .unwrap();
+        let paths: Vec<String> = dirty_paths(dir.path())
+            .into_iter()
+            .map(|(_, p)| p)
+            .collect();
+        assert!(paths.contains(&"renamed.rs".to_string()), "{paths:?}");
+        assert!(paths.contains(&" lead.rs".to_string()), "{paths:?}");
     }
 
     #[test]

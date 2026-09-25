@@ -33,7 +33,6 @@ const SCANNER_EXCLUDED_DIR_NAMES: &[&str] = &[
 
 const SCANNER_EXCLUDED_RELATIVE_DIRS: &[&str] = &["backend/data", "frontend/dist"];
 
-
 const REPO_MAP_KEY_FILE_PATTERNS: &[(&str, &str)] = &[
     ("AGENTS.md", "guide"),
     ("CONVENTIONS.md", "guide"),
@@ -183,6 +182,13 @@ pub struct RustPathSymbolsResult {
     pub symbol_rows: Vec<RustSymbolMaterializationRecord>,
     pub warnings: Vec<String>,
     pub generated_at: String,
+    /// Symbols the extractor found before the display limit was applied.
+    #[serde(default)]
+    pub total_symbols: usize,
+    /// True when `symbols` omits some: the display limit or the per-file extraction
+    /// bound cut the list.
+    #[serde(default)]
+    pub symbols_truncated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -410,10 +416,29 @@ pub fn build_semantic_impact(
     })
 }
 
+/// Display limit for the `path-symbols` contract.
+pub const PATH_SYMBOLS_DISPLAY_LIMIT: usize = 32;
+
 pub fn extract_path_symbols(
     root_path: &Path,
     workspace_id: &str,
     relative_path: &str,
+) -> Result<RustPathSymbolsResult, std::io::Error> {
+    extract_path_symbols_limited(
+        root_path,
+        workspace_id,
+        relative_path,
+        PATH_SYMBOLS_DISPLAY_LIMIT,
+    )
+}
+
+/// Path symbols with an explicit display limit (`usize::MAX` for every extracted symbol,
+/// as signature baselines need).
+pub fn extract_path_symbols_limited(
+    root_path: &Path,
+    workspace_id: &str,
+    relative_path: &str,
+    display_limit: usize,
 ) -> Result<RustPathSymbolsResult, std::io::Error> {
     let normalized = relative_path.trim_start_matches("./").replace('\\', "/");
     let path = root_path.join(&normalized);
@@ -431,15 +456,25 @@ pub fn extract_path_symbols(
             "Rust semantic core does not treat this path as an indexable source file.".to_string(),
         );
     }
-    let (symbols_raw, engine) = extract_symbols_engine(root_path, &normalized);
+    let (symbols_raw, engine, extraction_truncated) =
+        extract_symbols_engine(root_path, &normalized);
     let symbol_source = if symbols_raw.is_empty() {
         "none".to_string()
     } else {
         engine.to_string()
     };
+    let total_symbols = symbols_raw.len();
+    let symbols_truncated = extraction_truncated || total_symbols > display_limit;
+    if symbols_truncated {
+        warnings.push(format!(
+            "Showing {} of {total_symbols}{} extracted symbols.",
+            total_symbols.min(display_limit),
+            if extraction_truncated { "+" } else { "" }
+        ));
+    }
     let symbols = symbols_raw
         .into_iter()
-        .take(32)
+        .take(display_limit)
         .map(|item| RustPathSymbolRecord {
             path: item.path,
             symbol: item.symbol,
@@ -484,6 +519,8 @@ pub fn extract_path_symbols(
         symbol_rows,
         warnings,
         generated_at: Utc::now().to_rfc3339(),
+        total_symbols,
+        symbols_truncated,
     })
 }
 
@@ -710,41 +747,93 @@ fn derive_changed_symbols(
 fn extract_symbols_engine(
     root_path: &Path,
     relative_path: &str,
-) -> (Vec<RustChangedSymbolRecord>, &'static str) {
+) -> (Vec<RustChangedSymbolRecord>, &'static str, bool) {
     if !should_scan_file(relative_path) {
-        return (Vec::new(), "none");
+        return (Vec::new(), "none", false);
     }
     let content = match crate::symbolgraph::read_repo_file_beneath(root_path, relative_path) {
         Ok(value) => value,
-        Err(_) => return (Vec::new(), "none"),
+        Err(_) => return (Vec::new(), "none", false),
     };
-    if let Some(symbols) = treesitter::extract_symbols(relative_path, &content) {
-        if !symbols.is_empty() {
-            let mapped = symbols
-                .into_iter()
-                .map(|item| RustChangedSymbolRecord {
-                    path: relative_path.replace('\\', "/"),
-                    symbol: item.symbol,
-                    kind: item.kind,
-                    line_start: Some(item.line_start),
-                    line_end: Some(item.line_end),
-                    enclosing_scope: item.enclosing_scope,
-                    evidence_source: "rust_semantic_core".to_string(),
-                    semantic_status: Some("on_demand".to_string()),
-                    selection_reason:
-                        "Rust semantic core extracted this symbol from a changed path.".to_string(),
-                    change_scopes: Vec::new(),
-                    change_statuses: Vec::new(),
-                })
-                .collect();
-            return (mapped, "tree_sitter");
-        }
+    let out = extract_source_symbols(relative_path, &content, treesitter::MAX_SYMBOLS_PER_FILE);
+    let engine = match out.engine {
+        "tree_sitter" | "regex" => out.engine,
+        _ => "none",
+    };
+    (out.symbols, engine, out.truncated)
+}
+
+/// Symbols extracted from one file's text, with how they were extracted.
+pub struct SourceSymbols {
+    pub symbols: Vec<RustChangedSymbolRecord>,
+    /// `tree_sitter` | `regex` | `none` (supported, no symbols) | `excluded_path`
+    /// (vendored/generated directory, never extracted) | `unsupported_language`
+    pub engine: &'static str,
+    /// More than `max` symbols existed; the rest were not extracted.
+    pub truncated: bool,
+}
+
+/// Extensions indexed for references but with no symbol extractor at all.
+const UNSUPPORTED_SYMBOL_EXTS: &[&str] = &["c", "h", "cc", "cpp", "hpp", "cxx", "java", "rb"];
+
+/// Extract up to `max` symbols from already-read text, reporting truncation and the
+/// extraction engine. The single extraction entry point for indexing.
+pub fn extract_source_symbols(relative_path: &str, content: &str, max: usize) -> SourceSymbols {
+    if !should_scan_file(relative_path) {
+        return SourceSymbols {
+            symbols: Vec::new(),
+            engine: "excluded_path",
+            truncated: false,
+        };
     }
-    let fallback = extract_symbols_with_regex(relative_path, &content);
-    if fallback.is_empty() {
-        (fallback, "none")
+    if let Some((symbols, truncated)) =
+        treesitter::extract_symbols_limited(relative_path, content, max)
+        && !symbols.is_empty()
+    {
+        let mapped = symbols
+            .into_iter()
+            .map(|item| RustChangedSymbolRecord {
+                path: relative_path.replace('\\', "/"),
+                symbol: item.symbol,
+                kind: item.kind,
+                line_start: Some(item.line_start),
+                line_end: Some(item.line_end),
+                enclosing_scope: item.enclosing_scope,
+                evidence_source: "rust_semantic_core".to_string(),
+                semantic_status: Some("on_demand".to_string()),
+                selection_reason: "Rust semantic core extracted this symbol from a changed path."
+                    .to_string(),
+                change_scopes: Vec::new(),
+                change_statuses: Vec::new(),
+            })
+            .collect();
+        return SourceSymbols {
+            symbols: mapped,
+            engine: "tree_sitter",
+            truncated,
+        };
+    }
+    let (fallback, truncated) = extract_symbols_with_regex(relative_path, content, max);
+    let engine = if !fallback.is_empty() {
+        "regex"
+    } else if treesitter::supports(relative_path) {
+        "none"
     } else {
-        (fallback, "regex")
+        let ext = Path::new(relative_path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if UNSUPPORTED_SYMBOL_EXTS.contains(&ext.as_str()) {
+            "unsupported_language"
+        } else {
+            "none"
+        }
+    };
+    SourceSymbols {
+        symbols: fallback,
+        engine,
+        truncated,
     }
 }
 
@@ -755,7 +844,11 @@ fn extract_symbols_from_file(
     extract_symbols_engine(root_path, relative_path).0
 }
 
-fn extract_symbols_with_regex(relative_path: &str, content: &str) -> Vec<RustChangedSymbolRecord> {
+fn extract_symbols_with_regex(
+    relative_path: &str,
+    content: &str,
+    max: usize,
+) -> (Vec<RustChangedSymbolRecord>, bool) {
     let patterns = [
         (
             Regex::new(r"^\s*def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(").unwrap(),
@@ -794,6 +887,13 @@ fn extract_symbols_with_regex(relative_path: &str, content: &str) -> Vec<RustCha
     ];
     let mut out = Vec::new();
     for (index, line) in content.lines().enumerate() {
+        if out.len() >= max {
+            // another definition line exists past the bound?
+            if patterns.iter().any(|(p, _)| p.is_match(line)) {
+                return (out, true);
+            }
+            continue;
+        }
         for (pattern, kind) in &patterns {
             let Some(captures) = pattern.captures(line) else {
                 continue;
@@ -818,11 +918,8 @@ fn extract_symbols_with_regex(relative_path: &str, content: &str) -> Vec<RustCha
             });
             break;
         }
-        if out.len() >= 48 {
-            break;
-        }
     }
-    out
+    (out, false)
 }
 
 fn rank_affected_paths(

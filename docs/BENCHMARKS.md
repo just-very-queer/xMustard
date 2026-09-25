@@ -1,5 +1,9 @@
 # Benchmarks
 
+> Historical working document, retained as evidence of earlier design and work.
+> Use [VISION.md](VISION.md), [STATUS.md](STATUS.md), and [ROADMAP.md](ROADMAP.md)
+> for current direction, verified behavior, and remaining work.
+
 Reproducible micro-benchmarks for the Rust goal/swarm runtime (`rust-core`).
 
 Run them yourself:

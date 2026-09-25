@@ -1,0 +1,369 @@
+{
+ "suite": "retrieval-gate",
+ "passed": 12,
+ "failed": 0,
+ "checks": [
+  {
+   "check": "fixture workspace loads",
+   "ok": true,
+   "detail": "200"
+  },
+  {
+   "check": "cold: >= 11/12 gold in top 5",
+   "ok": true,
+   "detail": "12/12, spans 10/10; misses []"
+  },
+  {
+   "check": "cold pass built the graph (first query is a cache miss)",
+   "ok": true,
+   "detail": "graph_cache=miss files_parsed=15"
+  },
+  {
+   "check": "explicit coverage loss: gen/huge.go (oversized)",
+   "ok": true,
+   "detail": "reported oversized"
+  },
+  {
+   "check": "explicit coverage loss: web/src/broken.ts (invalid_utf8)",
+   "ok": true,
+   "detail": "reported invalid_utf8"
+  },
+  {
+   "check": "coverage not claimed complete with losses present",
+   "ok": true,
+   "detail": ""
+  },
+  {
+   "check": "warm: >= 11/12 gold in top 5",
+   "ok": true,
+   "detail": "12/12, spans 10/10; misses []"
+  },
+  {
+   "check": "warm pass served from the cache without parsing",
+   "ok": true,
+   "detail": "graph_cache=hit files_parsed=0"
+  },
+  {
+   "check": "after-one-file-edit: >= 11/12 gold in top 5",
+   "ok": true,
+   "detail": "12/12, spans 10/10; misses []"
+  },
+  {
+   "check": "recall unchanged or improved after one-file edit",
+   "ok": true,
+   "detail": "12 vs warm 12"
+  },
+  {
+   "check": "one-file edit reparses only that file",
+   "ok": true,
+   "detail": "files_parsed=1 files_reused=14 bytes_parsed=217"
+  },
+  {
+   "check": "no stale hit presented as current",
+   "ok": true,
+   "detail": "found_before=True stale_after=False served_key==current=True"
+  }
+ ],
+ "results": {
+  "passes": {
+   "cold": {
+    "score": 12,
+    "span_hits": 10,
+    "rows": [
+     {
+      "id": "go-session",
+      "ok": true,
+      "detail": "top5=[('auth/session.go', 15), ('auth/session.go', 9), ('ratelimit/bucket.go', 6), ('auth/session.go', None)]"
+     },
+     {
+      "id": "go-bucket",
+      "ok": true,
+      "detail": "top5=[('ratelimit/bucket.go', 6), ('ratelimit/bucket.go', 13), ('ratelimit/bucket.go', None)]"
+     },
+     {
+      "id": "go-retry",
+      "ok": true,
+      "detail": "top5=[('store/retry.go', 6), ('store/retry.go', None), ('httpapi/middleware.go', 6)]"
+     },
+     {
+      "id": "go-health",
+      "ok": true,
+      "detail": "top5=[('httpapi/handlers.go', 6), ('httpapi/handlers.go', 12)]"
+     },
+     {
+      "id": "rs-config",
+      "ok": true,
+      "detail": "top5=[('src/config.rs', 9), ('src/config.rs', 4), ('src/config.rs', None)]"
+     },
+     {
+      "id": "rs-lru",
+      "ok": true,
+      "detail": "top5=[('src/cache.rs', 4), ('src/cache.rs', 11), ('src/cache.rs', 9), ('src/cache.rs', None)]"
+     },
+     {
+      "id": "rs-query",
+      "ok": true,
+      "detail": "top5=[('src/parser.rs', 4)]"
+     },
+     {
+      "id": "ts-route",
+      "ok": true,
+      "detail": "top5=[('web/src/router.ts', 7), ('web/src/router.ts', 1)]"
+     },
+     {
+      "id": "ts-currency",
+      "ok": true,
+      "detail": "top5=[('web/src/format.ts', 2), ('web/src/format.ts', 7), ('web/src/format.ts', None)]"
+     },
+     {
+      "id": "ts-debounce",
+      "ok": true,
+      "detail": "top5=[('web/src/debounce.ts', 2), ('web/src/debounce.ts', None)]"
+     },
+     {
+      "id": "failure-only",
+      "ok": true,
+      "detail": "projected=4076 raw=140008 exact=True"
+     },
+     {
+      "id": "contradiction",
+      "ok": true,
+      "detail": "returned=2 conflicts=1"
+     }
+    ],
+    "search_latency_s": {
+     "mean": 0.07831282615661621,
+     "max": 0.1711738109588623
+    }
+   },
+   "warm": {
+    "score": 12,
+    "span_hits": 10,
+    "rows": [
+     {
+      "id": "go-session",
+      "ok": true,
+      "detail": "top5=[('ratelimit/bucket.go', 6), ('auth/session.go', 15), ('auth/session.go', 9), ('auth/session.go', None)]"
+     },
+     {
+      "id": "go-bucket",
+      "ok": true,
+      "detail": "top5=[('ratelimit/bucket.go', 6), ('ratelimit/bucket.go', 13), ('ratelimit/bucket.go', None)]"
+     },
+     {
+      "id": "go-retry",
+      "ok": true,
+      "detail": "top5=[('store/retry.go', 6), ('store/retry.go', None), ('httpapi/middleware.go', 6)]"
+     },
+     {
+      "id": "go-health",
+      "ok": true,
+      "detail": "top5=[('httpapi/handlers.go', 6), ('httpapi/handlers.go', 12)]"
+     },
+     {
+      "id": "rs-config",
+      "ok": true,
+      "detail": "top5=[('src/config.rs', 9), ('src/config.rs', 4), ('src/config.rs', None)]"
+     },
+     {
+      "id": "rs-lru",
+      "ok": true,
+      "detail": "top5=[('src/cache.rs', 4), ('src/cache.rs', 11), ('src/cache.rs', 9), ('src/cache.rs', None)]"
+     },
+     {
+      "id": "rs-query",
+      "ok": true,
+      "detail": "top5=[('src/parser.rs', 4)]"
+     },
+     {
+      "id": "ts-route",
+      "ok": true,
+      "detail": "top5=[('web/src/router.ts', 7), ('web/src/router.ts', 1)]"
+     },
+     {
+      "id": "ts-currency",
+      "ok": true,
+      "detail": "top5=[('web/src/format.ts', 2), ('web/src/format.ts', 7), ('web/src/format.ts', None)]"
+     },
+     {
+      "id": "ts-debounce",
+      "ok": true,
+      "detail": "top5=[('web/src/debounce.ts', 2), ('web/src/debounce.ts', None)]"
+     },
+     {
+      "id": "failure-only",
+      "ok": true,
+      "detail": "projected=4076 raw=140008 exact=True"
+     },
+     {
+      "id": "contradiction",
+      "ok": true,
+      "detail": "returned=2 conflicts=1"
+     }
+    ],
+    "search_latency_s": {
+     "mean": 0.07072689533233642,
+     "max": 0.08517193794250488
+    }
+   },
+   "after-one-file-edit": {
+    "score": 12,
+    "span_hits": 10,
+    "rows": [
+     {
+      "id": "go-session",
+      "ok": true,
+      "detail": "top5=[('ratelimit/bucket.go', 6), ('auth/session.go', 15), ('auth/session.go', 9), ('auth/session.go', None)]"
+     },
+     {
+      "id": "go-bucket",
+      "ok": true,
+      "detail": "top5=[('ratelimit/bucket.go', 6), ('ratelimit/bucket.go', 13), ('ratelimit/bucket.go', None)]"
+     },
+     {
+      "id": "go-retry",
+      "ok": true,
+      "detail": "top5=[('store/retry.go', 6), ('store/retry.go', None), ('httpapi/middleware.go', 6)]"
+     },
+     {
+      "id": "go-health",
+      "ok": true,
+      "detail": "top5=[('httpapi/handlers.go', 6), ('httpapi/handlers.go', 12)]"
+     },
+     {
+      "id": "rs-config",
+      "ok": true,
+      "detail": "top5=[('src/config.rs', 9), ('src/config.rs', 4), ('src/config.rs', None)]"
+     },
+     {
+      "id": "rs-lru",
+      "ok": true,
+      "detail": "top5=[('src/cache.rs', 4), ('src/cache.rs', 11), ('src/cache.rs', 9), ('src/cache.rs', None)]"
+     },
+     {
+      "id": "rs-query",
+      "ok": true,
+      "detail": "top5=[('src/parser.rs', 4)]"
+     },
+     {
+      "id": "ts-route",
+      "ok": true,
+      "detail": "top5=[('web/src/router.ts', 7), ('web/src/router.ts', 1)]"
+     },
+     {
+      "id": "ts-currency",
+      "ok": true,
+      "detail": "top5=[('web/src/format.ts', 2), ('web/src/format.ts', 7), ('web/src/format.ts', None)]"
+     },
+     {
+      "id": "ts-debounce",
+      "ok": true,
+      "detail": "top5=[('web/src/debounce.ts', 2), ('web/src/debounce.ts', None)]"
+     },
+     {
+      "id": "failure-only",
+      "ok": true,
+      "detail": "projected=4076 raw=140008 exact=True"
+     },
+     {
+      "id": "contradiction",
+      "ok": true,
+      "detail": "returned=2 conflicts=1"
+     }
+    ],
+    "search_latency_s": {
+     "mean": 0.0770747184753418,
+     "max": 0.13849425315856934
+    }
+   }
+  },
+  "work": {
+   "cold_first_query": {
+    "graph_cache": "miss",
+    "lock": "acquired",
+    "lock_wait_ms": 0,
+    "lock_contended": false,
+    "identity_passes": 2,
+    "identity_files_hashed": 0,
+    "identity_bytes_hashed": 0,
+    "files_read": 15,
+    "bytes_read": 4478,
+    "files_parsed": 15,
+    "bytes_parsed": 4478,
+    "files_reused": 0,
+    "symbols_extracted": 24,
+    "symbols_indexed": 24,
+    "coverage_losses": 2,
+    "stale_temps_removed": 0,
+    "elapsed_ms": 148
+   },
+   "warm_first_query": {
+    "graph_cache": "hit",
+    "lock": "not_used",
+    "lock_wait_ms": 0,
+    "lock_contended": false,
+    "identity_passes": 1,
+    "identity_files_hashed": 0,
+    "identity_bytes_hashed": 0,
+    "files_read": 0,
+    "bytes_read": 0,
+    "files_parsed": 0,
+    "bytes_parsed": 0,
+    "files_reused": 0,
+    "symbols_extracted": 0,
+    "symbols_indexed": 24,
+    "coverage_losses": 2,
+    "stale_temps_removed": 0,
+    "elapsed_ms": 45
+   },
+   "after_edit_first_query": {
+    "graph_cache": "miss",
+    "lock": "acquired",
+    "lock_wait_ms": 0,
+    "lock_contended": false,
+    "identity_passes": 2,
+    "identity_files_hashed": 2,
+    "identity_bytes_hashed": 434,
+    "files_read": 1,
+    "bytes_read": 217,
+    "files_parsed": 1,
+    "bytes_parsed": 217,
+    "files_reused": 14,
+    "symbols_extracted": 1,
+    "symbols_indexed": 24,
+    "coverage_losses": 2,
+    "stale_temps_removed": 0,
+    "elapsed_ms": 117
+   }
+  },
+  "provenance": {
+   "head": "cd13e2b78a9fadcbcd760b19442d5992136b1db0",
+   "source_diff_sha256": "e0e282e6403c5d4fd688cd307a8e690967674fd50731d3af79f3abafc6adcd19",
+   "untracked_source_files": 33,
+   "untracked_source_sha256": "61245cae425f045f9e2da6af1b5220b35cdbb453650067425105e13988bd5037",
+   "binaries_sha256": {
+    "xmustard-api": "88e88bacc3f02a8aaf46253ca0ec5787c70da6e901640a1410781a59ba17f39b",
+    "xmustard-mcp": "3d06d73f776146e0b9e98972c1a059e14b9a048fb71026ef86272b16aafd3a37",
+    "xmustard-core": "d644743ba005318ebbce451d7924ce4bcbefb26be057a48ff64f24ff430c3576"
+   },
+   "core_bin": "/private/tmp/xmustard-opus-l9b1F4/rust-core/target/release/xmustard-core",
+   "core_bin_prebuilt": false,
+   "script_sha256": {
+    "scripts/bench/retrieval_gate.py": "3c183600f32b56f6f0c0ffadac6b1d29b2e96152e03d21754785a0e54ce3ece2",
+    "scripts/bench/gold/queries.json": "134cf7e713b0a0a389cd90e919881e029da3eab81c8dae3d8283614d7fbc08cb",
+    "scripts/e2e/harness.py": "973147225ffce59f2d5af01fd71ba06cc0d0d74964f140e00365bb4ae129d5bc"
+   },
+   "env": {
+    "os": "macOS-27.0-arm64-arm-64bit",
+    "machine": "arm64",
+    "python": "3.9.6",
+    "go": "go version go1.26.1 darwin/arm64",
+    "cpus": 8
+   }
+  },
+  "fixture": {
+   "git_tree": "44a2548578e27b0b5441406471bb8d9170adef73",
+   "tracked_files": 16
+  }
+ }
+}

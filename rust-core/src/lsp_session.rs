@@ -6,9 +6,12 @@
 //! same contract ast-grep uses — so this never hard-fails a workspace.
 
 use std::collections::HashSet;
+use std::io::Read;
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -117,15 +120,46 @@ fn frame(stdin: &mut impl Write, value: &Value) -> std::io::Result<()> {
     stdin.flush()
 }
 
-fn read_message<R: BufRead>(reader: &mut R) -> std::io::Result<Option<Value>> {
+/// Bounds on one inbound LSP message: header line length, header line count, payload.
+const MAX_HEADER_LINE_BYTES: usize = 8 << 10;
+const MAX_HEADER_LINES: usize = 32;
+const MAX_PAYLOAD_BYTES: usize = 16 << 20;
+/// Bounds on messages queued between the reader thread and the requester. Server
+/// notifications are dropped before queueing (nothing consumes them).
+const MAX_QUEUED_MESSAGES: usize = 16;
+const MAX_QUEUED_BYTES: usize = 32 << 20;
+
+fn invalid(msg: String) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, msg)
+}
+
+/// Read one Content-Length-framed message, returning it with its payload size.
+fn read_framed<R: BufRead>(reader: &mut R) -> std::io::Result<Option<(Value, usize)>> {
     let mut content_length: Option<usize> = None;
+    let mut line = Vec::new();
+    let mut lines = 0;
     loop {
-        let mut line = String::new();
-        let n = reader.read_line(&mut line)?;
+        line.clear();
+        let n = reader
+            .by_ref()
+            .take(MAX_HEADER_LINE_BYTES as u64 + 1)
+            .read_until(b'\n', &mut line)?;
         if n == 0 {
             return Ok(None); // EOF
         }
-        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if n > MAX_HEADER_LINE_BYTES {
+            return Err(invalid(format!(
+                "LSP header line exceeds {MAX_HEADER_LINE_BYTES} bytes"
+            )));
+        }
+        lines += 1;
+        if lines > MAX_HEADER_LINES {
+            return Err(invalid(format!(
+                "LSP header exceeds {MAX_HEADER_LINES} lines"
+            )));
+        }
+        let text = String::from_utf8_lossy(&line);
+        let trimmed = text.trim_end_matches(['\r', '\n']);
         if trimmed.is_empty() {
             break; // end of header block
         }
@@ -137,21 +171,79 @@ fn read_message<R: BufRead>(reader: &mut R) -> std::io::Result<Option<Value>> {
         return Ok(None);
     };
     // cap the payload so a malformed/hostile Content-Length cannot OOM the process.
-    if len > 64 * 1024 * 1024 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("LSP Content-Length {len} exceeds 64 MiB limit"),
-        ));
+    if len > MAX_PAYLOAD_BYTES {
+        return Err(invalid(format!(
+            "LSP Content-Length {len} exceeds the {MAX_PAYLOAD_BYTES}-byte limit"
+        )));
     }
     let mut buf = vec![0u8; len];
     reader.read_exact(&mut buf)?;
-    Ok(serde_json::from_slice::<Value>(&buf).ok())
+    Ok(serde_json::from_slice::<Value>(&buf).ok().map(|v| (v, len)))
+}
+
+/// Inbound message queue shared by the reader thread and the session.
+struct Inbox {
+    rx: mpsc::Receiver<(Value, usize)>,
+    queued_bytes: Arc<AtomicUsize>,
+    overflow: Arc<AtomicBool>,
+}
+
+/// Spawn the stdout reader: frames are bounded by read_framed; notifications are
+/// dropped; responses and server requests are queued up to MAX_QUEUED_MESSAGES and
+/// MAX_QUEUED_BYTES. Past either bound the message is dropped and `overflow` is set,
+/// which fails the waiting request instead of growing memory or blocking the server.
+fn spawn_reader(stdout: std::process::ChildStdout) -> Inbox {
+    let (tx, rx) = mpsc::sync_channel::<(Value, usize)>(MAX_QUEUED_MESSAGES);
+    let queued_bytes = Arc::new(AtomicUsize::new(0));
+    let overflow = Arc::new(AtomicBool::new(false));
+    let (q, o) = (queued_bytes.clone(), overflow.clone());
+    thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        loop {
+            let (msg, len) = match read_framed(&mut reader) {
+                Ok(Some(m)) => m,
+                Ok(None) => break,
+                Err(_) => {
+                    o.store(true, Ordering::SeqCst);
+                    break;
+                }
+            };
+            if msg.get("method").is_some() && msg.get("id").is_none() {
+                continue; // notification: never consumed, never queued
+            }
+            if q.load(Ordering::SeqCst) + len > MAX_QUEUED_BYTES {
+                o.store(true, Ordering::SeqCst);
+                continue;
+            }
+            q.fetch_add(len, Ordering::SeqCst);
+            match tx.try_send((msg, len)) {
+                Ok(()) => {}
+                Err(mpsc::TrySendError::Full(_)) => {
+                    q.fetch_sub(len, Ordering::SeqCst);
+                    o.store(true, Ordering::SeqCst);
+                }
+                Err(mpsc::TrySendError::Disconnected(_)) => break,
+            }
+        }
+    });
+    Inbox {
+        rx,
+        queued_bytes,
+        overflow,
+    }
+}
+
+/// Source text for a didOpen notification, through the shared bounded, no-follow,
+/// regular-file-checked repo reader. The text is sent and then dropped, not retained.
+fn read_document_text(root: &Path, rel: &str) -> Result<String, LspSessionError> {
+    crate::symbolgraph::read_repo_file_beneath(root, rel)
+        .map_err(|e| LspSessionError::Failed(format!("read {rel}: {e}")))
 }
 
 /// A live LSP session bound to one server process. Drop kills the child.
 struct Session {
     child: Child,
-    rx: mpsc::Receiver<Value>,
+    inbox: Inbox,
     deadline: Instant,
 }
 
@@ -166,9 +258,15 @@ impl Session {
                     "timed out waiting for response".into(),
                 ));
             }
+            if self.inbox.overflow.load(Ordering::SeqCst) {
+                return Err(LspSessionError::Failed(
+                    "lsp inbound message bound exceeded (oversized frame or queue overflow)".into(),
+                ));
+            }
             let budget = (self.deadline - now).min(Duration::from_millis(500));
-            match self.rx.recv_timeout(budget) {
-                Ok(msg) => {
+            match self.inbox.rx.recv_timeout(budget) {
+                Ok((msg, len)) => {
+                    self.inbox.queued_bytes.fetch_sub(len, Ordering::SeqCst);
                     let has_method = msg.get("method").is_some();
                     if let Some(mid) = msg.get("id") {
                         if has_method {
@@ -222,8 +320,7 @@ fn request_document(
         )));
     }
     let abs = root.join(rel);
-    let text = std::fs::read_to_string(&abs)
-        .map_err(|e| LspSessionError::Failed(format!("read {rel}: {e}")))?;
+    let text = read_document_text(root, rel)?;
     let root_uri = format!("file://{}", root.display());
     let doc_uri = format!("file://{}", abs.display());
 
@@ -246,15 +343,7 @@ fn request_document(
         .stdout
         .take()
         .ok_or_else(|| LspSessionError::Failed("no stdout".into()))?;
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let mut reader = BufReader::new(stdout);
-        while let Ok(Some(v)) = read_message(&mut reader) {
-            if tx.send(v).is_err() {
-                break;
-            }
-        }
-    });
+    let inbox = spawn_reader(stdout);
     let mut stdin = child
         .stdin
         .take()
@@ -262,7 +351,7 @@ fn request_document(
 
     let session = Session {
         child,
-        rx,
+        inbox,
         deadline: Instant::now() + timeout,
     };
 
@@ -373,15 +462,7 @@ impl LspWorkspaceSession {
             .stdout
             .take()
             .ok_or_else(|| LspSessionError::Failed("no stdout".into()))?;
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            let mut reader = BufReader::new(stdout);
-            while let Ok(Some(v)) = read_message(&mut reader) {
-                if tx.send(v).is_err() {
-                    break;
-                }
-            }
-        });
+        let inbox = spawn_reader(stdout);
         let mut stdin = child
             .stdin
             .take()
@@ -390,7 +471,7 @@ impl LspWorkspaceSession {
         // initialize takes longer than a normal request (server indexes the repo).
         let session = Session {
             child,
-            rx,
+            inbox,
             deadline: Instant::now() + Duration::from_secs(90),
         };
         // canonicalize so the rootUri matches the (canonical) URIs the server returns
@@ -431,8 +512,7 @@ impl LspWorkspaceSession {
         let abs = self.root.join(rel);
         let doc_uri = format!("file://{}", abs.display());
         if !self.opened.contains(rel) {
-            let text = std::fs::read_to_string(&abs)
-                .map_err(|e| LspSessionError::Failed(format!("read {rel}: {e}")))?;
+            let text = read_document_text(&self.root, rel)?;
             let did_open = json!({
                 "jsonrpc":"2.0","method":"textDocument/didOpen",
                 "params":{"textDocument":{"uri":doc_uri,"languageId":self.language_id,"version":1,"text":text}}
@@ -669,7 +749,122 @@ mod tests {
     #[test]
     fn unmapped_extension_is_unavailable() {
         let err = live_document_symbols("ws", Path::new("/tmp"), "notes.txt", 5).unwrap_err();
-        matches!(err, LspSessionError::Unavailable(_));
+        assert!(matches!(err, LspSessionError::Unavailable(_)));
+    }
+
+    // Audit finding 5: header lines were read with an unbounded read_line.
+    #[test]
+    fn read_message_rejects_oversized_header() {
+        let mut input = vec![b'X'; 1 << 20];
+        input.extend_from_slice(b"\r\n\r\n");
+        let mut reader = std::io::Cursor::new(input);
+        assert!(
+            read_framed(&mut reader).is_err(),
+            "a 1 MiB header line must be refused, not buffered"
+        );
+        let many: String = (0..10_000).map(|i| format!("X-Junk-{i}: 1\r\n")).collect();
+        let mut reader = std::io::Cursor::new(format!("{many}\r\n").into_bytes());
+        assert!(
+            read_framed(&mut reader).is_err(),
+            "unbounded header count accepted"
+        );
+        let huge = format!("Content-Length: {}\r\n\r\n", MAX_PAYLOAD_BYTES + 1);
+        let mut reader = std::io::Cursor::new(huge.into_bytes());
+        assert!(
+            read_framed(&mut reader).is_err(),
+            "payload over the cap accepted"
+        );
+        let ok = "Content-Length: 2\r\n\r\n{}";
+        let mut reader = std::io::Cursor::new(ok.as_bytes().to_vec());
+        assert_eq!(read_framed(&mut reader).unwrap().unwrap().1, 2);
+    }
+
+    fn frames(messages: &[Value]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for m in messages {
+            frame(&mut out, m).unwrap();
+        }
+        out
+    }
+
+    fn inbox_over(bytes: Vec<u8>) -> (Inbox, std::process::Child) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("frames");
+        std::fs::write(&path, bytes).unwrap();
+        let mut child = Command::new("cat")
+            .arg(&path)
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let inbox = spawn_reader(child.stdout.take().unwrap());
+        let _ = child.wait();
+        std::thread::sleep(Duration::from_millis(200));
+        (inbox, child)
+    }
+
+    // Audit finding 5: the reader queued every message on an unbounded channel.
+    #[cfg(unix)]
+    #[test]
+    fn inbound_queue_drops_notifications_and_bounds_responses() {
+        // a notification flood is never queued: only the one response arrives.
+        let mut msgs: Vec<Value> = (0..2_000)
+            .map(|i| json!({"jsonrpc":"2.0","method":"$/progress","params":{"i":i}}))
+            .collect();
+        msgs.push(json!({"jsonrpc":"2.0","id":7,"result":"ok"}));
+        let (inbox, _c) = inbox_over(frames(&msgs));
+        let (first, _) = inbox.rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(first["id"], 7);
+        assert!(inbox.rx.try_recv().is_err());
+        assert!(!inbox.overflow.load(Ordering::SeqCst));
+
+        // more unconsumed responses than the queue holds: bounded and flagged.
+        let msgs: Vec<Value> = (0..(MAX_QUEUED_MESSAGES as i64 + 10))
+            .map(|i| json!({"jsonrpc":"2.0","id":i,"result":null}))
+            .collect();
+        let (inbox, _c) = inbox_over(frames(&msgs));
+        assert!(
+            inbox.overflow.load(Ordering::SeqCst),
+            "queue overflow not flagged"
+        );
+        let queued = std::iter::from_fn(|| inbox.rx.try_recv().ok()).count();
+        assert!(queued <= MAX_QUEUED_MESSAGES, "queued {queued} messages");
+    }
+
+    // Audit finding 5: didOpen text used a raw, symlink-following, unbounded read.
+    #[cfg(unix)]
+    #[test]
+    fn document_text_uses_bounded_no_follow_reader() {
+        let root = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        std::fs::write(outside.path().join("secret.rs"), "SECRET").unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("secret.rs"),
+            root.path().join("link.rs"),
+        )
+        .unwrap();
+        assert!(
+            read_document_text(root.path(), "link.rs").is_err(),
+            "symlink followed"
+        );
+        let big = vec![b'a'; (crate::symbolgraph::MAX_REPO_FILE_BYTES as usize) + 1];
+        std::fs::write(root.path().join("big.rs"), big).unwrap();
+        assert!(
+            read_document_text(root.path(), "big.rs").is_err(),
+            "oversized read"
+        );
+        std::fs::write(root.path().join("ok.rs"), "fn ok() {}").unwrap();
+        assert_eq!(
+            read_document_text(root.path(), "ok.rs").unwrap(),
+            "fn ok() {}"
+        );
+        // Fable F4: exact path, no trimming onto a decoy; a whitespace-named symlink is
+        // still refused.
+        std::fs::write(root.path().join(" lead.rs"), "REAL").unwrap();
+        std::fs::write(root.path().join("lead.rs"), "DECOY").unwrap();
+        assert_eq!(read_document_text(root.path(), " lead.rs").unwrap(), "REAL");
+        std::os::unix::fs::symlink(outside.path().join("secret.rs"), root.path().join(" s.rs"))
+            .unwrap();
+        assert!(read_document_text(root.path(), " s.rs").is_err());
     }
 
     #[test]

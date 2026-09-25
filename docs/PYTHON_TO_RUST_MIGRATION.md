@@ -1,5 +1,9 @@
 # Python → Rust Migration Plan
 
+> Historical working document, retained as evidence of earlier design and work.
+> Use [VISION.md](VISION.md), [STATUS.md](STATUS.md), and [ROADMAP.md](ROADMAP.md)
+> for current direction, verified behavior, and remaining work.
+
 Goal: retire the Python backend (`backend/app/`, ~16.2k LOC) by moving logic into
 the Rust core (`rust-core`) and the thin Go shell (`api-go`). Per
 `docs/MIGRATION_RUST_GO.md`: **no flag-day rewrite — move ownership by subsystem,

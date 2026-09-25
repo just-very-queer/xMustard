@@ -1,6 +1,7 @@
 package workspaceops
 
 import (
+	"context"
 	"encoding/json"
 	"strconv"
 
@@ -14,7 +15,7 @@ func WorkspaceSymbolGraph(dataDir, workspaceID string) (json.RawMessage, error) 
 	if err != nil {
 		return nil, err
 	}
-	out, err := rustcore.RunSymbolgraph("build", root, workspaceID)
+	out, err := rustcore.RunSymbolgraph(context.Background(), "build", root, workspaceID)
 	if err != nil {
 		return nil, err
 	}
@@ -29,7 +30,7 @@ func WorkspaceHotspots(dataDir, workspaceID string, limit int) (json.RawMessage,
 	if limit <= 0 {
 		limit = 20
 	}
-	out, err := rustcore.RunSymbolgraph("hotspots", root, workspaceID, strconv.Itoa(limit))
+	out, err := rustcore.RunSymbolgraph(context.Background(), "hotspots", root, workspaceID, strconv.Itoa(limit))
 	if err != nil {
 		return nil, err
 	}
@@ -41,7 +42,7 @@ func SymbolBlastRadius(dataDir, workspaceID, symbol string) (json.RawMessage, er
 	if err != nil {
 		return nil, err
 	}
-	out, err := rustcore.RunSymbolgraph("blast-radius", root, workspaceID, symbol)
+	out, err := rustcore.RunSymbolgraph(context.Background(), "blast-radius", root, workspaceID, symbol)
 	if err != nil {
 		return nil, err
 	}
@@ -51,6 +52,11 @@ func SymbolBlastRadius(dataDir, workspaceID, symbol string) (json.RawMessage, er
 // SymbolImpact returns the true blast radius of a symbol — every file that
 // transitively references it (bounded BFS over the precomputed reference graph).
 func SymbolImpact(dataDir, workspaceID, symbol string, maxDepth int) (json.RawMessage, error) {
+	return SymbolImpactCtx(context.Background(), dataDir, workspaceID, symbol, maxDepth)
+}
+
+// SymbolImpactCtx is the request-scoped variant: cancelling ctx kills its Rust/tool children.
+func SymbolImpactCtx(ctx context.Context, dataDir, workspaceID, symbol string, maxDepth int) (json.RawMessage, error) {
 	root, _, err := resolveChangeRoot(dataDir, workspaceID)
 	if err != nil {
 		return nil, err
@@ -58,7 +64,7 @@ func SymbolImpact(dataDir, workspaceID, symbol string, maxDepth int) (json.RawMe
 	if maxDepth <= 0 {
 		maxDepth = 4
 	}
-	out, err := rustcore.RunSymbolgraph("impact", root, workspaceID, symbol, strconv.Itoa(maxDepth))
+	out, err := rustcore.RunSymbolgraph(ctx, "impact", root, workspaceID, symbol, strconv.Itoa(maxDepth))
 	if err != nil {
 		return nil, err
 	}
@@ -67,11 +73,16 @@ func SymbolImpact(dataDir, workspaceID, symbol string, maxDepth int) (json.RawMe
 
 // TraceSymbols returns the shortest dependency path between two symbols.
 func TraceSymbols(dataDir, workspaceID, from, to string) (json.RawMessage, error) {
+	return TraceSymbolsCtx(context.Background(), dataDir, workspaceID, from, to)
+}
+
+// TraceSymbolsCtx is the request-scoped variant: cancelling ctx kills its Rust/tool children.
+func TraceSymbolsCtx(ctx context.Context, dataDir, workspaceID, from, to string) (json.RawMessage, error) {
 	root, _, err := resolveChangeRoot(dataDir, workspaceID)
 	if err != nil {
 		return nil, err
 	}
-	out, err := rustcore.RunSymbolgraph("trace", root, workspaceID, from, to)
+	out, err := rustcore.RunSymbolgraph(ctx, "trace", root, workspaceID, from, to)
 	if err != nil {
 		return nil, err
 	}
@@ -93,7 +104,7 @@ func WorkspaceClusters(dataDir, workspaceID string) ([]FileCluster, error) {
 	if err != nil {
 		return nil, err
 	}
-	out, err := rustcore.RunSymbolgraph("clusters", root, workspaceID)
+	out, err := rustcore.RunSymbolgraph(context.Background(), "clusters", root, workspaceID)
 	if err != nil {
 		return nil, err
 	}

@@ -392,7 +392,7 @@ func ReadDiagnosticsStatus(dataDir string, workspaceID string) (*DiagnosticsStat
 			GeneratedAt:        nowUTC(),
 		}, nil
 	}
-	baseline, err := readLatestDiagnosticRun(targetDSN, schema, workspaceID)
+	baseline, err := readLatestDiagnosticRun(context.Background(), targetDSN, schema, workspaceID)
 	if err != nil {
 		return nil, err
 	}
@@ -426,6 +426,11 @@ func ReadDiagnosticsStatus(dataDir string, workspaceID string) (*DiagnosticsStat
 }
 
 func ReadDiagnostics(dataDir string, workspaceID string, diagnosticRunID string) (*DiagnosticsReadResult, error) {
+	return ReadDiagnosticsCtx(context.Background(), dataDir, workspaceID, diagnosticRunID)
+}
+
+// ReadDiagnosticsCtx is the request-scoped variant: cancelling ctx aborts its Postgres reads.
+func ReadDiagnosticsCtx(ctx context.Context, dataDir string, workspaceID string, diagnosticRunID string) (*DiagnosticsReadResult, error) {
 	if _, err := getWorkspaceRecord(dataDir, workspaceID); err != nil {
 		return nil, err
 	}
@@ -443,7 +448,7 @@ func ReadDiagnostics(dataDir string, workspaceID string, diagnosticRunID string)
 	}
 	var baseline *DiagnosticRun
 	if strings.TrimSpace(diagnosticRunID) != "" {
-		baseline, err = readDiagnosticRunByID(targetDSN, schema, workspaceID, diagnosticRunID)
+		baseline, err = readDiagnosticRunByID(ctx, targetDSN, schema, workspaceID, diagnosticRunID)
 		if err != nil {
 			return nil, err
 		}
@@ -451,7 +456,7 @@ func ReadDiagnostics(dataDir string, workspaceID string, diagnosticRunID string)
 			return nil, fmt.Errorf("%w: diagnostics run not found: %s", ErrInvalidDiagnosticsRequest, strings.TrimSpace(diagnosticRunID))
 		}
 	} else {
-		baseline, err = readLatestDiagnosticRun(targetDSN, schema, workspaceID)
+		baseline, err = readLatestDiagnosticRun(ctx, targetDSN, schema, workspaceID)
 		if err != nil {
 			return nil, err
 		}
@@ -459,7 +464,7 @@ func ReadDiagnostics(dataDir string, workspaceID string, diagnosticRunID string)
 	if baseline == nil {
 		return &DiagnosticsReadResult{WorkspaceID: workspaceID, Diagnostics: []DiagnosticRecord{}, Warnings: []string{"No diagnostics baseline has been materialized."}, GeneratedAt: nowUTC()}, nil
 	}
-	diagnostics, err := readDiagnosticRows(targetDSN, schema, workspaceID, baseline.DiagnosticRunID)
+	diagnostics, err := readDiagnosticRows(ctx, targetDSN, schema, workspaceID, baseline.DiagnosticRunID)
 	if err != nil {
 		return nil, err
 	}
@@ -697,16 +702,16 @@ func upsertDiagnosticLinkedRun(ctx context.Context, connection semanticMateriali
 	return nil
 }
 
-func readLatestDiagnosticRun(dsn string, schema string, workspaceID string) (*DiagnosticRun, error) {
-	return readDiagnosticRun(dsn, schema, workspaceID, "")
+func readLatestDiagnosticRun(ctx context.Context, dsn string, schema string, workspaceID string) (*DiagnosticRun, error) {
+	return readDiagnosticRun(ctx, dsn, schema, workspaceID, "")
 }
 
-func readDiagnosticRunByID(dsn string, schema string, workspaceID string, runID string) (*DiagnosticRun, error) {
-	return readDiagnosticRun(dsn, schema, workspaceID, strings.TrimSpace(runID))
+func readDiagnosticRunByID(ctx context.Context, dsn string, schema string, workspaceID string, runID string) (*DiagnosticRun, error) {
+	return readDiagnosticRun(ctx, dsn, schema, workspaceID, strings.TrimSpace(runID))
 }
 
-func readDiagnosticRun(dsn string, schema string, workspaceID string, targetRunID string) (*DiagnosticRun, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+func readDiagnosticRun(ctx context.Context, dsn string, schema string, workspaceID string, targetRunID string) (*DiagnosticRun, error) {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	connection, err := connectSemanticPostgres(ctx, dsn)
 	if err != nil {
@@ -782,8 +787,8 @@ func readDiagnosticRun(dsn string, schema string, workspaceID string, targetRunI
 	}, nil
 }
 
-func readDiagnosticRows(dsn string, schema string, workspaceID string, runID string) ([]DiagnosticRecord, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+func readDiagnosticRows(ctx context.Context, dsn string, schema string, workspaceID string, runID string) ([]DiagnosticRecord, error) {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	connection, err := connectSemanticPostgres(ctx, dsn)
 	if err != nil {

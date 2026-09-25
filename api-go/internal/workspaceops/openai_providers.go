@@ -88,23 +88,27 @@ func rejectBlockedURLHost(baseURL string) error {
 // unbounded io.ReadAll, so a hostile or runaway provider could allocate without limit.
 const maxProviderResponseBytes = 16 << 20 // 16 MiB
 
-// readProviderBody reads a provider response with a hard cap AND charges the bounded read
-// against the shared transient-byte pool, so concurrent provider reads count toward the
-// same <100 MB ceiling. Internal (a run shouldn't be rejected mid-flight), so it accounts.
-func readProviderBody(resp *http.Response) []byte {
-	budget.TransientBytes.Charge(maxProviderResponseBytes)
-	defer budget.TransientBytes.Release(maxProviderResponseBytes)
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, maxProviderResponseBytes))
-	return raw
+// readProviderBody reads a provider response with a hard cap, reserving each chunk
+// against the shared transient-byte pool before buffering it. The reservation is held
+// until the caller invokes release (after decoding). A pool refusal is an explicit
+// overload error; a body past the cap is an error, never silently truncated.
+func readProviderBody(resp *http.Response) ([]byte, func(), error) {
+	scope := budget.NewScope(nil)
+	raw, err := budget.ReadAllAdmitted(scope, resp.Body, maxProviderResponseBytes)
+	if err != nil {
+		scope.Close()
+		return nil, func() {}, fmt.Errorf("read provider response: %w", err)
+	}
+	return raw, scope.Close, nil
 }
 
 type OpenAIProvider struct {
-	Name         string `json:"name"`
-	Kind         string `json:"kind"` // ollama | openai | vllm | lmstudio | custom
-	BaseURL      string `json:"base_url"`
-	APIKeyEnv    string `json:"api_key_env,omitempty"` // env var holding the key, NOT the key
-	DefaultModel string `json:"default_model,omitempty"`
-	SupportsVision bool `json:"supports_vision"`
+	Name           string `json:"name"`
+	Kind           string `json:"kind"` // ollama | openai | vllm | lmstudio | custom
+	BaseURL        string `json:"base_url"`
+	APIKeyEnv      string `json:"api_key_env,omitempty"` // env var holding the key, NOT the key
+	DefaultModel   string `json:"default_model,omitempty"`
+	SupportsVision bool   `json:"supports_vision"`
 	// Capabilities are the model CLASSES this provider declares it serves well
 	// (code-specialized | large-reasoning | small-fast | vision). When present, routing
 	// uses this STRUCTURED signal in preference to guessing the class from the model
@@ -290,7 +294,11 @@ func OpenAIEmbeddings(dataDir, name, model string, inputs []string) ([][]float64
 		return nil, fmt.Errorf("provider %s unreachable at %s: %w", name, provider.BaseURL, err)
 	}
 	defer resp.Body.Close()
-	raw := readProviderBody(resp)
+	raw, release, err := readProviderBody(resp)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	if resp.StatusCode >= 400 {
 		return nil, fmt.Errorf("provider %s embeddings -> %d: %s", name, resp.StatusCode, strings.TrimSpace(string(raw)))
 	}
@@ -326,7 +334,11 @@ func ListProviderModels(dataDir, name string) (map[string]any, error) {
 		return nil, fmt.Errorf("provider %s unreachable at %s: %w", name, provider.BaseURL, err)
 	}
 	defer resp.Body.Close()
-	raw := readProviderBody(resp)
+	raw, release, err := readProviderBody(resp)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	if resp.StatusCode >= 400 {
 		return nil, fmt.Errorf("provider %s /models -> %d: %s", name, resp.StatusCode, strings.TrimSpace(string(raw)))
 	}
@@ -449,7 +461,11 @@ func OpenAIChat(dataDir, name string, req ChatRequest) (map[string]any, error) {
 		return nil, fmt.Errorf("provider %s unreachable at %s: %w", name, provider.BaseURL, err)
 	}
 	defer resp.Body.Close()
-	raw := readProviderBody(resp)
+	raw, release, err := readProviderBody(resp)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	if resp.StatusCode >= 400 {
 		return nil, fmt.Errorf("provider %s chat -> %d: %s", name, resp.StatusCode, strings.TrimSpace(string(raw)))
 	}

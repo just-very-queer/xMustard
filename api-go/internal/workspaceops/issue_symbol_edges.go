@@ -1,6 +1,7 @@
 package workspaceops
 
 import (
+	"context"
 	"encoding/json"
 	"sort"
 	"strings"
@@ -51,7 +52,7 @@ func IssueSymbolEdges(dataDir, workspaceID string) ([]IssueSymbolEdge, error) {
 	if err != nil {
 		return nil, err
 	}
-	raw, err := rustcore.RunSymbolgraph("build", root, workspaceID)
+	raw, err := rustcore.RunSymbolgraph(context.Background(), "build", root, workspaceID)
 	if err != nil {
 		return nil, err
 	}

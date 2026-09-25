@@ -1,0 +1,122 @@
+{
+ "suite": "mcp-evidence",
+ "passed": 23,
+ "failed": 0,
+ "checks": [
+  {
+   "check": "workspace loads over authenticated HTTP",
+   "ok": true,
+   "detail": "status 200"
+  },
+  {
+   "check": "index baseline",
+   "ok": true,
+   "detail": "status 200"
+  },
+  {
+   "check": "unauthenticated tool route is refused",
+   "ok": true,
+   "detail": "status 401"
+  },
+  {
+   "check": "initialize advertises tools and resources",
+   "ok": true,
+   "detail": ""
+  },
+  {
+   "check": "exactly the nine tools",
+   "ok": true,
+   "detail": "['diagnostics', 'explain', 'ground', 'impact', 'recall', 'remember', 'search', 'verify', 'why_failed']"
+  },
+  {
+   "check": "remember x10 over MCP",
+   "ok": true,
+   "detail": ""
+  },
+  {
+   "check": "plain recall is bounded",
+   "ok": true,
+   "detail": "returned=8 total=10"
+  },
+  {
+   "check": "recall delivered as reduced projection with a handle",
+   "ok": true,
+   "detail": "projected=52137 raw=138508"
+  },
+  {
+   "check": "issued URI is self-sufficient (names its workspace)",
+   "ok": true,
+   "detail": "xmustard://evidence/xm1.vg0jSLkNEfEDJ7-0PhvaaoR1FFSgEOeBsdZpSiV3asg?workspace_id=repo-c90bbc5ce1"
+  },
+  {
+   "check": "resources/read pages the exact original",
+   "ok": true,
+   "detail": "3 pages, client ms per page [49.8, 54.1, 50.9] (each page samples repo identity)"
+  },
+  {
+   "check": "original is the complete bounded recall",
+   "ok": true,
+   "detail": ""
+  },
+  {
+   "check": "fresh capture labeled current",
+   "ok": true,
+   "detail": "current"
+  },
+  {
+   "check": "issuer reads over HTTP; other principal, anonymous and cross-workspace are denied",
+   "ok": true,
+   "detail": "200,403,401,404"
+  },
+  {
+   "check": "six concurrent calls answered and correlated",
+   "ok": true,
+   "detail": ""
+  },
+  {
+   "check": "search finds the exact symbol with coverage",
+   "ok": true,
+   "detail": ""
+  },
+  {
+   "check": "cancellation answers the call and kills its child",
+   "ok": true,
+   "detail": "child=98067 alive=False reply_error=True"
+  },
+  {
+   "check": "repository mutation labels the original stale",
+   "ok": true,
+   "detail": "stale"
+  },
+  {
+   "check": "API shut down cleanly",
+   "ok": true,
+   "detail": ""
+  },
+  {
+   "check": "after API + shim restart the exact URI pages the same original",
+   "ok": true,
+   "detail": ""
+  },
+  {
+   "check": "original reads until expiry and is denied afterward",
+   "ok": true,
+   "detail": "{\"code\": -32002, \"message\": \"evidence expired: evidence expired\", \"data\": {\"reason\": \"expired\", \"status\": 410, \"uri\": \"xmustard://evidence/xm1.Qli58MNS5GKtJSFLds2kffq_-mkxOJk4wy0fq5kSqGI?workspace_id="
+  },
+  {
+   "check": "longer-retention original unaffected by another's expiry",
+   "ok": true,
+   "detail": ""
+  },
+  {
+   "check": "tool errors stay errors",
+   "ok": true,
+   "detail": ""
+  },
+  {
+   "check": "unknown resource is a protocol resource-not-found error",
+   "ok": true,
+   "detail": ""
+  }
+ ]
+}

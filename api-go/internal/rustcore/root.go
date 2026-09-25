@@ -1,7 +1,6 @@
 package rustcore
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"log"
@@ -25,80 +24,108 @@ const (
 	maxCoreStderr = 64 << 10 // 64 KiB
 )
 
-// capWriter buffers up to `max` bytes (dropping the overflow but never blocking the
-// child, and flagging that it happened) so bridge output is bounded.
-type capWriter struct {
-	buf  bytes.Buffer
-	max  int
-	over bool
-}
-
-func (c *capWriter) Write(p []byte) (int, error) {
-	if room := c.max - c.buf.Len(); room < len(p) {
-		c.over = true
-		if room > 0 {
-			c.buf.Write(p[:room])
-		}
-		return len(p), nil // pretend full write so the child doesn't block on a full pipe
-	}
-	return c.buf.Write(p)
-}
-
-// runCoreContext is the single hardened bridge runner: binary-first resolution,
+// runCoreCtx is the single hardened bridge runner: binary-first resolution,
 // context timeout, bounded stdout/stderr, full server-side logging on failure, and a
 // SANITIZED error to the caller (no raw child stderr / host paths leaked). The rust
 // bin parses args positionally (args.next()), not via a flag parser, so a
 // `-`-leading query/path/seed is read literally — no `--` delimiter is required.
-func runCoreContext(sub string, args ...string) ([]byte, error) {
-	return runCoreCtx(context.Background(), sub, args...)
-}
-
-// runCoreCtx is runCoreContext honoring a caller context (whichever deadline — the
-// caller's or coreCallTimeout — fires first), for bridges that already thread a ctx.
+// The child is killed when the caller's ctx is cancelled or coreCallTimeout elapses,
+// whichever comes first.
+//
+// Admission: the child takes a slot from budget.Children, and its captured output is
+// reserved against budget.TransientBytes in chunks BEFORE it is buffered. When ctx
+// carries a request scope the reservation is held until the request finishes (through
+// decode and response construction); otherwise it is released on return. A refused
+// reservation kills the child and returns budget.ErrOverloaded.
 func runCoreCtx(parent context.Context, sub string, args ...string) ([]byte, error) {
+	release, err := budget.Children.Acquire(parent)
+	if err != nil {
+		return nil, fmt.Errorf("rust-core %s: %w", sub, err)
+	}
+	defer release()
+	scope, owned := budget.ScopeFor(parent)
+	if owned {
+		defer scope.Close()
+	}
 	ctx, cancel := context.WithTimeout(parent, coreCallTimeout)
 	defer cancel()
 	cmd := coreCommandContext(ctx, sub, args...)
-	out := &capWriter{max: maxCoreStdout}
-	errb := &capWriter{max: maxCoreStderr}
+	cmd.WaitDelay = 2 * time.Second
+	out := budget.NewCaptureWriter(scope, maxCoreStdout)
+	errb := budget.NewCaptureWriter(scope, maxCoreStderr)
+	// first overflow/refusal cancels ctx, which kills the child (CommandContext)
+	out.OnStop, errb.OnStop = cancel, cancel
 	cmd.Stdout = out
 	cmd.Stderr = errb
-	runErr := cmd.Run()
-	if out.over {
+	runErr := runTracked(cmd)
+	// Reap any descendant the child left in its group (normal exit included): the
+	// owned tree ends with the call.
+	KillProcessTree(cmd)
+	if out.Refused() || errb.Refused() {
+		log.Printf("rust-core %s: output refused by transient budget after %d bytes", sub, out.Len())
+		return nil, fmt.Errorf("rust-core %s: %w", sub, budget.ErrOverloaded)
+	}
+	if out.Over() {
 		log.Printf("rust-core %s: stdout exceeded %d bytes (dropped)", sub, maxCoreStdout)
 		return nil, fmt.Errorf("rust-core %s: output too large", sub)
 	}
 	if runErr != nil {
-		log.Printf("rust-core %s failed: %v: %s", sub, runErr, errb.buf.String())
+		log.Printf("rust-core %s failed: %v: %s", sub, runErr, errb.String())
+		if parent.Err() != nil {
+			return nil, fmt.Errorf("rust-core %s: %w", sub, parent.Err())
+		}
 		if ctx.Err() == context.DeadlineExceeded {
 			return nil, fmt.Errorf("rust-core %s timed out", sub)
 		}
 		return nil, fmt.Errorf("rust-core %s failed", sub)
 	}
-	return out.buf.Bytes(), nil
+	// Without a request scope (owned), the reservation ends when this call returns;
+	// with one, it is held until the request's response has been written, and the
+	// caller's decode and response construction (about two more copies of the output)
+	// are admitted now, before they are allocated.
+	if !owned {
+		if err := scope.Acquire(2 * int64(out.Len())); err != nil {
+			return nil, fmt.Errorf("rust-core %s: %w", sub, budget.ErrOverloaded)
+		}
+	}
+	return out.Bytes(), nil
 }
 
 // runBoundedCmd runs an already-built rust-core command with BOUNDED stdout/stderr
 // capture (same caps as runCoreCtx: 64 MiB / 64 KiB), for the few bridge helpers
 // that must keep their own command + timeout construction (e.g. managed/verification
-// commands whose own timeout exceeds coreCallTimeout). It returns the captured
+// commands whose own timeout exceeds coreCallTimeout). It takes a helper-child slot and
+// reserves captured bytes against the shared pool as they arrive; a refused
+// reservation returns budget.ErrOverloaded (over=false). It returns the captured
 // stdout, the (bounded) stderr for error context, whether stdout overflowed the cap,
-// and the raw run error so callers can inspect exit codes. This replaces the
-// unbounded bytes.Buffer captures those helpers used (XM-PRO-005).
+// and the raw run error so callers can inspect exit codes.
 func runBoundedCmd(cmd *exec.Cmd) (stdout []byte, stderr string, over bool, err error) {
-	// Charge the worst-case capture size against the shared transient-byte pool while this
-	// Go↔Rust / subprocess (incl. ast-grep) capture is in flight, so its peak counts
-	// toward the same <100 MB ceiling the HTTP admission path sheds against. Internal, so
-	// it accounts (Charge) rather than rejects.
-	const reserve = maxCoreStdout + maxCoreStderr
-	budget.TransientBytes.Charge(reserve)
-	defer budget.TransientBytes.Release(reserve)
-	out := &capWriter{max: maxCoreStdout}
-	errb := &capWriter{max: maxCoreStderr}
+	release, aerr := budget.Children.Acquire(context.Background())
+	if aerr != nil {
+		return nil, "", false, aerr
+	}
+	defer release()
+	scope := budget.NewScope(nil)
+	defer scope.Close()
+	out := budget.NewCaptureWriter(scope, maxCoreStdout)
+	errb := budget.NewCaptureWriter(scope, maxCoreStderr)
+	// first overflow/refusal kills the child (and its process group when it has one)
+	out.OnStop = func() { KillProcessTree(cmd) }
+	errb.OnStop = out.OnStop
 	cmd.Stdout = out
 	cmd.Stderr = errb
-	err = cmd.Run()
-	return out.buf.Bytes(), errb.buf.String(), out.over, err
+	if cmd.WaitDelay == 0 {
+		cmd.WaitDelay = 2 * time.Second
+	}
+	if cmd.SysProcAttr == nil {
+		isolateProcessGroup(cmd)
+	}
+	err = runTracked(cmd)
+	KillProcessTree(cmd)
+	if out.Refused() || errb.Refused() {
+		return nil, errb.String(), false, budget.ErrOverloaded
+	}
+	return out.Bytes(), errb.String(), out.Over(), err
 }
 
 func rustCoreDir() string {
@@ -148,5 +175,6 @@ func coreCommandContext(ctx context.Context, sub string, args ...string) *exec.C
 	name, full, dir := coreInvocation(sub, args...)
 	cmd := exec.CommandContext(ctx, name, full...)
 	cmd.Dir = dir
+	IsolateProcessTree(cmd)
 	return cmd
 }

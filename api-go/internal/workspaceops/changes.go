@@ -1,6 +1,7 @@
 package workspaceops
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"path/filepath"
@@ -30,7 +31,7 @@ func WorkspaceFingerprint(dataDir, workspaceID string) (json.RawMessage, error) 
 	if err != nil {
 		return nil, err
 	}
-	out, err := rustcore.RunChangetrack("fingerprint", root)
+	out, err := rustcore.RunChangetrack(context.Background(), "fingerprint", root)
 	if err != nil {
 		return nil, err
 	}
@@ -43,7 +44,7 @@ func IndexWorkspace(dataDir, workspaceID string) (json.RawMessage, error) {
 	if err != nil {
 		return nil, err
 	}
-	out, err := rustcore.RunChangetrack("index", absData, root, workspaceID)
+	out, err := rustcore.RunChangetrack(context.Background(), "index", absData, root, workspaceID)
 	if err != nil {
 		return nil, err
 	}
@@ -52,11 +53,16 @@ func IndexWorkspace(dataDir, workspaceID string) (json.RawMessage, error) {
 
 // WorkspaceDrift reports stale-index / sibling-clone drift vs the baseline.
 func WorkspaceDrift(dataDir, workspaceID string) (json.RawMessage, error) {
+	return WorkspaceDriftCtx(context.Background(), dataDir, workspaceID)
+}
+
+// WorkspaceDriftCtx is the request-scoped variant: cancelling ctx kills its Rust/tool children.
+func WorkspaceDriftCtx(ctx context.Context, dataDir, workspaceID string) (json.RawMessage, error) {
 	root, absData, err := resolveChangeRoot(dataDir, workspaceID)
 	if err != nil {
 		return nil, err
 	}
-	out, err := rustcore.RunChangetrack("drift", absData, root, workspaceID)
+	out, err := rustcore.RunChangetrack(ctx, "drift", absData, root, workspaceID)
 	if err != nil {
 		return nil, err
 	}
@@ -65,11 +71,16 @@ func WorkspaceDrift(dataDir, workspaceID string) (json.RawMessage, error) {
 
 // WorkspaceChangesSinceIndex returns files + dirty symbols changed since the baseline.
 func WorkspaceChangesSinceIndex(dataDir, workspaceID string) (json.RawMessage, error) {
+	return WorkspaceChangesSinceIndexCtx(context.Background(), dataDir, workspaceID)
+}
+
+// WorkspaceChangesSinceIndexCtx is the request-scoped variant: cancelling ctx kills its Rust/tool children.
+func WorkspaceChangesSinceIndexCtx(ctx context.Context, dataDir, workspaceID string) (json.RawMessage, error) {
 	root, absData, err := resolveChangeRoot(dataDir, workspaceID)
 	if err != nil {
 		return nil, err
 	}
-	out, err := rustcore.RunChangetrack("changed-since", absData, root, workspaceID)
+	out, err := rustcore.RunChangetrack(ctx, "changed-since", absData, root, workspaceID)
 	if err != nil {
 		return nil, err
 	}
@@ -79,11 +90,16 @@ func WorkspaceChangesSinceIndex(dataDir, workspaceID string) (json.RawMessage, e
 // WorkspaceWorkingChanges returns uncommitted working-tree changes + dirty symbols,
 // including contract-break flags (vs the index baseline) on modified symbols.
 func WorkspaceWorkingChanges(dataDir, workspaceID string) (json.RawMessage, error) {
+	return WorkspaceWorkingChangesCtx(context.Background(), dataDir, workspaceID)
+}
+
+// WorkspaceWorkingChangesCtx is the request-scoped variant: cancelling ctx kills its Rust/tool children.
+func WorkspaceWorkingChangesCtx(ctx context.Context, dataDir, workspaceID string) (json.RawMessage, error) {
 	root, absData, err := resolveChangeRoot(dataDir, workspaceID)
 	if err != nil {
 		return nil, err
 	}
-	out, err := rustcore.RunChangetrack("working-changes", absData, root, workspaceID)
+	out, err := rustcore.RunChangetrack(ctx, "working-changes", absData, root, workspaceID)
 	if err != nil {
 		return nil, err
 	}

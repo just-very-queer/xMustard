@@ -1,206 +1,196 @@
-# xMustard — Status Report (2026-06-21)
+# Current status — 2026-09-24
 
-## 1. What the Product IS Now
+**Baseline assessment:** substantial working foundation; not yet a demonstrated
+reliable, resource-bounded competitor-parity product. The core memory loop works
+in a live small fixture. The September audit findings below describe that
+baseline; see candidate disposition before treating them as current source truth.
 
-xMustard is a **tiny MCP server for governed runtime memory** — its only job is giving coding agents (Claude Code, opencode, codex, etc.) two things: *grounding* ("what changed / what's stale / what's broken since you last touched this") and *memory with a trust lifecycle* (propose → multi-agent verify → promote, with drift-on-recall so memory never goes silently stale). It exposes **9 enriched MCP tools** (ground, recall, remember, verify, search, explain, impact, diagnostics, why_failed — several take modes/params, e.g. `search?mode=pattern`, `impact symbol=/from=/to=`, `recall query=`) backed by a Go API shell (`api-go/`) and a Rust semantic core (`rust-core/`). It deliberately does *not* try to be the agent, the search engine, the eval platform, or the security tracker — those are either cut from the agent surface or deferred to a future UI.
+## Implementation candidate — imported, uncommitted, verification complete
 
----
+The reviewed candidate is now imported into the main working tree, remains
+uncommitted, and is not shipped. It repairs selected audited Go/Rust contracts,
+adds bounded recoverable delivery for xMustard's own MCP surface, and adds one
+pinned Pi adapter. Fable's final source review is approved. All current backend,
+MCP, retrieval, Pi, and fixed-workload RSS gates pass on the imported candidate.
+The remaining decision is human review of the exact diff and merge; no automatic
+merge or repository-enforced human gate is claimed.
 
-## 2. DONE — Major Capabilities Built & Verified
+| Candidate evidence | Result | What it does not establish |
+| --- | --- | --- |
+| Backend tests/build and Rust checks | Main-worktree `make check-backend` passes: all 7 Go packages, 148 Rust tests, Clippy exits 0 with 11 existing warnings; uncached Go suite also passes all 7 packages | No warning-clean claim; does not establish broad language/repository coverage or task-quality parity |
+| MCP evidence E2E | Main-worktree provenance-bound run: 23/23 checks pass, including bounded recall, exact recovery, authorization, expiry, cancellation and unchanged URI after restart; focused evidence and shim race checks also pass separately | Scoped to these MCP contracts; no other client/gateway parity implied |
+| Retrieval fixture | Main-worktree provenance-bound gold gate: 12/12 across cold/warm/edit; spans 10/10 | Lexical-leaning regression only—not held-out localization quality, task success, or competitor parity |
+| Rust index review | Fable Recheck 2 approved Rust source hash `d039d76d…7a358`; imported current core is `d644743b…` | Review/tests do not establish broader retrieval quality or task-quality parity |
+| Pi adapter | Main-worktree run on current Rust core `d644743b…`: 17 unit + 15 actual pinned-runtime checks; all nine tools pass using disposable native Postgres fixture for diagnostics | Root run record binds main binaries; the Pi summary itself has no binary hashes. One adapter only; fixture is not a default DB dependency or SQL-correctness proof; no native host-tool or universal client claim |
+| Sampled process-tree RSS | Main run passes 19/19 at 80,592,896 B (80.6 MB), 853 valid samples. Two same-source/script/fixture candidate runs pass 19/19 at 72.3 and 84.9 MB. Each fully recovered four 16 MiB originals plus a repeat (1,280 pages) and exercised a real 503 refusal | Fixed workload on one machine; sampled peaks are not a universal RSS ceiling or hardware-bandwidth/task-quality proof |
 
-### Governed Memory (the moat — all on the 9-tool MCP surface)
-- **`remember` / `verify` / `recall`** — propose→pending→multi-agent-verified→promoted pipeline (`context_governance.go`). Verified live: 2-distinct-agent promotion, duplicate-vote rejection, readonly enforcement.
-- **Drift-on-recall** — at recall time, each memory's referenced-path hashes are re-checked against the live tree; `stale_count` / `stale_paths` / `stale_memory` flags emitted. Never serves silently-stale memory.
-- **Memory conflict surfacing** — `recall` emits `conflicts` (files ≥2 active memories claim) so agents reconcile before trusting.
-- **Auth** (`auth.go`) — per-principal bearer tokens (admin/agent/readonly), sha256-hashed at rest, constant-time compare; agent identity in the verification gate comes from the authenticated principal (one token ≠ N fake agents). 7 adversarial issues found and fixed.
+The main RSS/MCP/gold JSONs carry the matching Go/Rust source and untracked-source
+digests (`e0e282e6…`, `61245cae…`). Their script and fixture provenance also
+matches the two isolated runs. The main Go binaries have different hashes because
+the build path is embedded. The Pi summary does not carry executable hashes; the
+root invocation record binds its run to the main API/MCP binaries and current core
+(see the final [Fable source review](reviews/2026-09-24-fable-code-review.md)).
 
-### Session Grounding (`ground` — MCP surface)
-- `grounding.go` `BuildSessionGrounding` — changed/dirty-symbols/failed-runs, stale-index + sibling-clone drift flag, blocked-by-dirty/failing flags. Backed by `rust-core/changetrack.rs` (317 incorporation events recorded live).
+Detailed scope: [Go report](reviews/2026-09-24-implementation-results.md),
+[Rust report](reviews/2026-09-24-rust-implementation-results.md),
+[Pi report](reviews/2026-09-24-pi-implementation-results.md), and
+[resource benchmark](benchmarks/2026-09-24-lean-context.md). Current main-worktree
+[RSS](benchmarks/evidence/2026-09-24/main-rss.json),
+[MCP](benchmarks/evidence/2026-09-24/main-mcp.json),
+[retrieval](benchmarks/evidence/2026-09-24/main-gold.json), and
+[Pi E2E](benchmarks/evidence/2026-09-24/pi-e2e-summary-main.json) records are
+linked here; only the first three JSONs carry source/build provenance. Their
+Go/Rust source-diff and untracked-source digests match the reviewed candidate
+(`e0e282e6…`, `61245cae…`). The Pi binary binding is documented in the root run
+record cited above.
 
-### Semantic Core (partial MCP surface via `search` / `explain` / `impact`)
-- **`search`** — hybrid BM25 + hashing-trick embedding + char-trigram fuzzy + Postgres ts_rank RRF. Lexical + structural, narrow, not a dump.
-- **`explain`** — file/directory explainer via `rust-core` (purpose, key symbols, run/verify info).
-- **`impact`** — dirty symbols → callers/tests blast radius (`rust-core/semantic.rs`).
-- **`diagnostics`** — normalized diagnostics for the workspace.
-- tree-sitter symbol extraction (Rust/Go/TS/TSX/JS/JSX; regex fallback) backing search + impact.
-- ast-grep semantic pattern search (`rust-core/semantic.rs`).
-- LSP live sessions (`rust-core/lsp_session.rs`): rust-analyzer/gopls/typescript-language-server/clangd; documentSymbol + hover verified live.
-- Semantic repo graph (`rust-core/symbolgraph.rs`): typed edges (imports/calls/inherits/tests/refs), verified live (820 calls / 466 refs / 420 tests).
-- Ownership & subsystem model (`rust-core/ownership.rs`): cohesion, likely owners from git history, blast radius.
+All required checks for this imported candidate tranche are green. A separate
+database-free diagnostics plan is an unimplemented next-stage proposal; Fable
+review returned `CHANGES_REQUIRED`. It is not an acceptance gate for this tranche.
+Held-out task quality, broad
+competitor parity, hardware memory bandwidth, and universal RSS claims remain
+unproven.
 
-### Change Tracking (feeds `ground` — MCP surface)
-- File/symbol fingerprinting + incorporation-lineage chain (`rust-core/changetrack.rs`). Verified: 317 events.
-- Changed-since-baseline + working-tree dirty symbols (not only dirty files).
-- Stale-index + sibling-clone drift detection in `/changes/drift` and session-grounding.
+Reviewed implementation: `cd13e2b78a9fadcbcd760b19442d5992136b1db0`, local branch
+`feat/product-v1`. The worktree was clean at review start. At that baseline review,
+the source defects listed below remained open; candidate disposition follows.
 
-### MCP Server (the delivery surface)
-- `api-go/cmd/xmustard-mcp` — stdio JSON-RPC 2.0, exactly 9 tools, tested (`main_test.go` asserts the 9-tool set and validates required-param enforcement). Bridges to the Go HTTP API.
-- Verified-context injected into agent run prompts (`applyActiveContextToPrompt` on `StartIssueRun` + `StartAgentQuery`).
+## Product direction
 
-### Providers & Routing (HTTP-only, NOT on the 9-tool MCP surface)
-- OpenAI-compatible provider layer (`openai_providers.go`): Ollama/vLLM/LM Studio/OpenAI + vision VLM. Secrets never stored (env-var name only). SSRF guard, redirect-follow blocked. Verified live against Ollama.
-- Task-typed model routing (`provider_router.go`): 6-type taxonomy (locate/code_edit_patch/multi_step_debug_reason/repo_qa_explain/test_gen_validate/vision_ui_diagnose) → provider+model. Verified live.
-- `/api/providers*`, `/api/route*` — HTTP-only; no MCP tool for these (correctly not on the agent surface per RETHINK).
+The owner confirmed shared, verified memory and repository intelligence for
+existing coding agents, current competitor comparisons across both categories,
+and a local/no-Docker default targeting roughly 50–100 MB. UI is out of scope.
+The subsequent clarification includes concurrent/cross-session/cross-repo work,
+tool-context compression, investigation of a Needle-like local helper, and human
+final code-merge authority. See [vision](VISION.md), the proposed
+[context layer](CONTEXT_LAYER.md), and the
+[current parity review](research/COMPETITOR_PARITY_2026-09-24.md).
 
-### Storage & Persistence
-- Postgres store: semantic index (`xm_files`/`xm_symbols`/`xm_edges`) + ops layer (`xm_runs`/`xm_activity`/`xm_issues`) materialized and queryable.
-- JSON remains the durable write source; PG is the queryable index.
-- Full operational memory layer (issues, runs, plans, verification profiles, eval timelines, threat models, vuln records, browser dumps) built and persisted — but these are HTTP/CLI-only, not on the 9-tool MCP surface (correctly).
+The candidate implements only recoverable projection on xMustard's own MCP path
+and one Pi extension. An upstream gateway, other native-client result hooks,
+helper-model integration, and human-specific merge enforcement are **not
+implemented**. Existing memory promotion counts peer votes; run-plan approval
+starts work and does not establish human approval of a Git merge. The owner
+clarified that "cheaper than OpenHands" refers to a lighter harness, context
+shedding and better indexing, not API-price reductions. Comparative harness RSS,
+allocation/copy overhead and hardware memory bandwidth remain unmeasured.
 
-### Auth (HTTP-only; feeds MCP gate identity)
-- Bearer-token auth with role-based access (admin/agent/readonly). Non-loopback bind requires TLS or explicit override. Auth events flow into the multi-agent verification gate.
+## Live GitHub state
 
-### UI / Cockpit (HTTP-only, secondary consumer)
-- `frontend/` React: cockpit (`Cockpit.tsx`), kanban (`KanbanBoard.tsx`), intelligence inspector. Exists but not the primary product surface per RETHINK.
+Checked through GitHub and remote refs on 2026-09-24; local tracking refs were not
+treated as current remote truth.
 
----
+| Item | Observed state |
+| --- | --- |
+| Public repository | [just-very-queer/xMustard](https://github.com/just-very-queer/xMustard), MIT, default branch `main` |
+| Public main | [`2c312338`](https://github.com/just-very-queer/xMustard/commit/2c312338aeddf829c811c606481b6edff652dd10), PR #7 merged June 22 |
+| Remote feature | [`3f28eef7`](https://github.com/just-very-queer/xMustard/commit/3f28eef72f373d62e69001fd0170c571ae1fc577) |
+| Local development | `cd13e2b`, **21 commits ahead of remote feature, zero behind** |
+| Feature vs main | Remote feature 18 ahead / 3 behind; the three main-only commits are merges #4, #5, #7. Local has 39 feature-line commits after their common ancestor. [Comparison](https://github.com/just-very-queer/xMustard/compare/main...feat/product-v1) |
+| CI / releases | No Actions workflows or runs; no tags or releases |
+| Work tracking | No issues; [PR #3](https://github.com/just-very-queer/xMustard/pull/3) is open, conflicting, with no checks |
 
-## 3. Remaining-Work Loop — COMPLETE (2026-06-21)
+At review start the local and published README were byte-identical, despite
+the local code being ahead. The published overview therefore still contains
+unqualified completion claims and contradictory migration language. This review
+did not push, merge, change repository settings, or modify that PR.
 
-The seven items that were genuinely-open after the deep-graph loop (R1–R7, see
-`docs/plans/2026-06-21-remaining-work-loop.md`) are now **all DONE, verified, and
-pushed** to `feat/product-v1`. R4 (auth) and R5 (PG write path) each passed an
-adversarial-review workflow with all critical/high findings fixed before commit.
-The table below records each with its evidence.
+## Fresh verification (baseline review)
 
-| Item | Verdict | Effort | Evidence |
-|------|---------|--------|----------|
-| **Graph-proximity RRF lane** (A2 remainder) | **DONE** | medium | `hybrid_search` takes `seed: Option<&str>`, calls `symbol_impact` for BFS distances → `1/(d+1)` 4th `"proximity"` RRF lane; auto-seeds from the top exact match; wired `search?seed=` + MCP `seed` param. Live: `seed=RecordFeedback` re-ranks `feedback.go` neighbours up (lane shows `…+proximity`). |
-| **Contract-break detection** (A3 remainder) | **DONE** | medium | `changetrack` derives + baselines per-symbol signatures (`IndexBaseline.signatures`), diffs them on modified files → `DirtySymbol.contract_break` + `signature_change` (`params N→M, return x→y`); surfaced in `impact`/`ground` (`contract_breaks`, `broken_contracts`). Live: arity/return change flags, body-only edit doesn't. |
-| **Wiki incrementality** | **DONE** | small–med | `generate_wiki` now uses `build_symbol_graph_cached` (was the last cold-rebuild caller) + a per-subsystem fingerprint page cache (`wiki-<ws>.json`); only changed subsystems re-render (`regenerated_slugs`/`reused_slugs`). Live: edit one file → one subsystem regenerates. |
-| **Auth follow-ons** (A5) | **DONE** | large | Global capped auth-audit log (mint/revoke/rotate/denied); `ExpiresAt` + fail-closed TTL check in `ResolveToken`; `RotateToken` + rotate endpoint; `roleRank` hierarchy with an explicit `agent` gate. Adversarial review (27 agents) → fixed critical token-store race (`tokenStoreMu`), fail-open-on-corrupt (`HasAuthConfigured` fails closed), audit DoS (clip + throttle), TTL overflow. `-race` tests + live. |
-| **Postgres as the write path** (C1) | **DONE** | large | `pg_inline.go`: `saveRunRecord` + `saveVerificationProfileHistory` mirror to PG inline on mutation (xm_runs + new xm_run_plans), JSON still source-of-truth. Best-effort async (gated on `XMUSTARD_PG_DSN`). Adversarial review (30 agents) → fixed async-latency, unique-index-fragility, NULL columns. Live round-trip + `-race` tests; `/pg/run-plans` read-back. |
-| **Deeper data/control-flow edges** | **DONE** | large | A per-line flow pass classifies `returns`/`branches`/`writes` edges into a separate `SymbolGraph.flow_edges` (unperturbing authority/impact/proximity), tagged `lexical` like S2. `symbolgraph flow` CLI. Live: 399 flow edges on this repo (branches 239 / returns 107 / writes 53). |
-| **Cockpit UI for providers/routing/tokens** (A4 remainder) | **DONE** | large | `AdminPanel.tsx` (providers / routing / tokens) as a new `admin` view; `api.ts` typed clients over `/api/providers*`, `/api/routes`, `/api/auth/*`. `tsc`+build green; every endpoint round-trip verified live. |
+| Check | Result and limit |
+| --- | --- |
+| Go build | All six packages pass |
+| Go tests | All six packages pass: 277 top-level tests passed, 3 initially skipped. Fresh Rust parity rerun passed; **278/280 exercised**, two live Postgres tests remain skipped |
+| Rust tests | **114 passed**, no failures or ignored tests, default features |
+| Rust binary build | Passed; fresh debug core used for integration checks |
+| Clippy | Exit 0, **12 warnings**; not warning-clean |
+| Isolated HTTP + stdio MCP | **18 checks passed**, including authenticated propose/verify/recall and drift after edit |
+| Optional frontend | Build passes; lint fails with four hook errors. Recorded baseline only; UI changes excluded |
+| Reorganization checks | Curated Markdown links resolve; historical document bodies preserved; diff whitespace check and formula Ruby syntax pass; Make recipe dry runs and missing-root rejection verified |
 
-### Stale docs (being fixed in this pass)
-- `PLANNED_FEATURES.md` had ⬜ markers for enclosing-scope and LSP impl/type/rename that are now done — corrected.
+Details: [Go audit](reviews/2026-09-24-go-audit.md),
+[Rust audit](reviews/2026-09-24-rust-audit.md), and
+[live smoke](reviews/2026-09-24-runtime-smoke.md).
 
----
+The frontend lint errors are in `AdminPanel.tsx:65,147,209` and
+`MemoryPanel.tsx:38`. No browser workflow was tested. The UI also lacks bearer
+token plumbing and assumes the full API rather than core-only mode; it is not a
+release-ready authenticated frontend.
 
-## 4. Completion Estimate Against the RETHINK Thesis
+## Highest-priority baseline findings
 
-**Effectively complete** against the governed-memory product. Everything in the
-RETHINK plan (steps 1–5) is done; the deep-graph + IndexEngine loop (S1–S6: full
-LSP, scope-resolved CALLS, communities, incremental reindex, agent-feedback ranking,
-symbol-level impact/trace) is done; and the remaining-work loop (R1–R7: proximity
-lane, contract-break detection, wiki incrementality, auth follow-ons, PG write path,
-flow edges, cockpit admin UI) is done. The 9 enriched MCP tools are live and tested,
-auth is hardened (adversarial-reviewed), grounding + drift-on-recall + conflict
-surfacing are real, and the warm index is 20× faster. What remains is open-ended
-depth (richer flow analysis, scale hardening, more provider integrations) rather
-than a closed checklist.
+| Finding | Evidence level | Effect |
+| --- | --- | --- |
+| Repeated unstaged edits reuse a stale symbol graph | Reproduced in an isolated repository | Search can return a removed symbol as current; Git porcelain whitespace is trimmed before fixed-column parsing |
+| Graph indexes only 32 symbols per file without reporting truncation | Reproduced with a 70-function file | Search/impact omit real code while file coverage says complete |
+| Plain `recall` bypasses the bounded ranking path | Source-confirmed route/control flow | Reads and drift-checks all promoted entries instead of top-N |
+| Main returns before the shutdown goroutine completes | Source-confirmed lifecycle | Run interruption, child cleanup, and Postgres flush can be cut short |
+| Non-loopback auth interlock admits `AUTH=off` when tokens exist | Source-confirmed condition mismatch | Supported remote-bind configurations can disable authentication |
+| MCP cancellation stops the HTTP client but is not threaded through core handlers | Source-confirmed call chain | Rust work can continue after a tool is cancelled |
+| Shared transient-byte accounting is not enforced on all work | Source-confirmed paths | At the audit revision the 50–100 MB target was unproven; unconditional charges and uncharged calls allowed excess work |
 
----
+These rows are findings against the reviewed baseline commit, not a fresh list of
+known defects in the candidate. The candidate addresses several of them; exact
+scope and regression evidence are in the implementation reports. The candidate
+does not establish that every route is covered or that enforced byte admission
+forms a hard RSS ceiling. The three passing sampled runs include original recovery
+expansions and the measured xMustard-owned process tree, but establish only that
+fixed workload on that machine. They do not establish other workload performance
+or hardware bandwidth.
 
-## 5. Remaining-Work Loop — all landed (R1–R7)
+The baseline metadata/content race in ranked recall under concurrent edits was
+reproduced; the candidate fixes it with a regression test. The retained goal
+runtime still loses acknowledged creates under concurrency and accepts
+failed-test evidence for completion; both are reproduced, deferred
+secondary-platform defects.
 
-1. ~~Graph-proximity RRF lane~~ — **DONE** (R1, `27a96b2`). 4th proximity lane via
-   `symbol_impact` BFS distances + auto-seed + `search?seed=`.
-2. ~~Contract-break detection~~ — **DONE** (R2, `d3465c2`). Baselined per-symbol
-   signatures diffed on change → `contract_break` in `impact`/`ground`.
-3. ~~Wiki incrementality~~ — **DONE** (R3, `43de2f7`). Warm cached graph +
-   per-subsystem fingerprint page cache; only changed subsystems re-render.
-4. ~~Auth A5~~ — **DONE** (R4, `aed07bf`). Audit log, token expiry/rotation,
-   agent-role gate; adversarial-reviewed (critical race + fail-open + audit DoS fixed).
-5. ~~PG write path~~ — **DONE** (R5, `c405bc8`). Inline best-effort mirror of
-   runs/plans/verifications; adversarial-reviewed (async latency + NULL columns fixed).
-6. ~~Deeper data/control-flow edges~~ — **DONE** (R6, `de700f0`). returns/branches/
-   writes flow edges in a separate `flow_edges` field.
-7. ~~Cockpit UI~~ — **DONE** (R7). `AdminPanel.tsx` for providers/routing/tokens
-   over the existing HTTP endpoints; tsc + build green, endpoints round-trip-verified.
+## Strategic and delivery gaps
 
-**Future depth (no longer a closed checklist):** richer flow analysis (LSP-resolved
-flow edges, reads vs writes precision), scale hardening (a shared PG pool replacing
-per-call connects), and more provider/routing integrations.
+- The memory harness implements paired statistical analysis, **not** a task
+  executor, held-out corpus, or measured solve-rate benefit.
+- Default retrieval uses lexical/hash-based signals and a mostly lexical graph.
+  Optional ONNX inference does not establish a persisted neural vector index;
+  its heavy feature was not built or benchmarked in this review.
+- Language coverage, cross-repo behavior, real client compatibility, and
+  comparable retrieval quality need explicit parity tests.
+- The baseline audit did not complete a sustained process-tree RSS test or live
+  Postgres verification. The imported candidate's fixed-workload RSS gate now
+  passes; the Pi diagnostics E2E uses a disposable native Postgres fixture.
+  Optional Postgres mirror correctness remains a separate deferred gate; this
+  does not establish general SQL correctness.
+- Homebrew instructions did not constitute a working release path: the formula
+  is HEAD-only and the named public tap was not found. Installed binaries do not
+  include the SQL asset required by the optional Postgres bootstrap path.
+- Existing tracked runtime data needs a separate hygiene review. This pass
+  preserved the records and did not remove data or rewrite Git history.
 
----
+## Reorganization completed in this review
 
-## 6. Production hardening pass (2026-06-21) — concurrency, lifecycle, confinement
+- Established [one documentation entrypoint](README.md), current vision,
+  implementation map, status, and [ordered backlog](ROADMAP.md).
+- Preserved previous architecture/status/roadmap under `docs/history/` and
+  indexed available conversations, decisions, and unavailable transcript gaps.
+- Aligned README, AGENTS, and OpenHands guidance with Go/Rust and the confirmed
+  agent-facing focus; removed obsolete Python checks and global completion claims.
+- Allowlisted the curated documentation set while leaving raw sessions and
+  private working material ignored.
+- Added phony Make targets so backend/frontend startup recipes execute; repaired
+  the `scan` CLI invocation and added backend/frontend check entrypoints.
+- Corrected the packaging caveat from eight to nine tools; packaging remains
+  a development starting point, not a verified release.
 
-A safety-under-sustained-concurrent-agent-load pass, driven by an external audit
-(`goal/xmustard_fix_queue.md`, `goal/xmustard_new_findings.jsonl`). Each item was
-verified against the code before patching; all are tested + committed.
+Code-module directories and persisted data paths remain stable. Their real
+coupling needs behavior-level repairs and deliberate extraction, not a bulk move.
 
-**Fixed (P0/P1):**
-- **State integrity:** path-keyed per-store transaction locks (`storelock.go`) around
-  the full load→mutate→save of governed memory, feedback, and audit stores —
-  concurrent votes/promotions/appends no longer lose updates (was only fixed for the
-  token store). `-race` concurrency tests.
-- **Path confinement (host-file safety):** one resolver (`safepath.go`) rejects
-  absolute/`..`/symlink escape + caps size; wired into governed-memory hashing,
-  provider `image_path` egress (confined to `<dataDir>/uploads`), terminal log ids,
-  and `normalizeWorkspaceFile` (symlink-safe).
-- **Process/FD lifecycle:** autonomous idle reaper for Go LSP sessions (was the
-  invisible RSS budget-killer — abandoned sessions leaked the child language server +
-  goroutine + FDs); run-cancel no longer signals a possibly-reused persisted PID
-  (terminal-state guard + PID-clear); retry only from terminal states.
-- **Terminal isolation:** sessions keyed/authorized by owning workspace — no
-  cross-workspace read/write/resize/close.
-- **MCP/HTTP edges:** bounded MCP stdio reader (a newline-less message no longer OOMs)
-  + structured `-32700/-32600` errors; API `http.Server` with read/write/idle
-  timeouts + graceful shutdown; unified default port to **8042** (matches the MCP
-  bridge + AGENTS.md).
-- **Bridge/deploy:** every Go→Rust call routes through the binary-first resolver
-  (no hard-coded `cargo run`) so a binary-only/no-Docker install works; goal bridge
-  gained a timeout + bounded error echo.
-- **Rust cache atomicity:** cache writes are temp-file + fsync + atomic rename, so a
-  concurrent `xmustard-core` never reads a torn cache.
-- **Bounded logs:** per-workspace audit log capped (newest 5000), like the auth-audit log.
+## Review coverage
 
-**Status of the P1 items this section once listed as still-open:** all closed in
-the post-hardening deepening pass — see **§7**. (Shared `pgxpool` → `3d5b1b4`;
-ordered PG mirror → `7a59f74`; drift sentinels XM-NEW-003/004 → `422bbaf`;
-index-coverage honesty XM-NEW-009/010 → `69feaac`; workspace-scoped tokens
-XM-NEW-022 → `1326b7a`; verification pipe-drain XM-NEW-015 → `100b994`.)
+The review inventoried the active Go, Rust, frontend, build and SQL surfaces and
+inspected their principal contracts and implementations. Detailed correctness
+review concentrated on the agent-facing paths and shared runtime/storage seams;
+this is not a claim of formal line-by-line verification of all source and tests.
 
-**Genuinely still-open (honest, deferred — not blocking the governed-memory
-product):** the symbol graph the agent path uses is the **lexical** graph; the
-LSP-resolved upgrade exists but is CLI-only (`build-lsp`), not wired into
-`search` (deliberate opt-in — see `docs/plans/2026-06-20-deep-graph-loop.md` S2).
-The warm-index speedup now **has a committed benchmark** (`docs/BENCHMARKS.md`
-§Warm symbol-index: measured **18.0×**, cold 676 ms → warm 37 ms on this 369-file
-repo) — the older "~20×" prose was indicative; 18× is the measured floor. Two P2
-index-engine items are designed but
-deliberately deferred (rationale in `docs/INDEX_ENGINE.md` §Deferred): a
-long-lived **IndexEngine daemon** (G) and a **blake3/merkle content-key**
-migration (H) — both judged premature surface/dependency expansion against the
-lean, on-demand-binary, 50–100 MB-RSS design while parsing (not hashing) is the
-reindex bottleneck and git already gives O(dirty-file) invalidation.
-
----
-
-## 7. Post-hardening deepening pass (2026-06-21) — close the remaining P0/P1, deepen runtime memory without growing surface
-
-Driven by a second external audit (`goal/xmustard_fix_queue.md`,
-`goal/xmustard_new_findings.jsonl`) plus a reconciliation of the "deliberately
-left" list against the actual code. Rule for the pass: **trust the code over the
-docs** — every claimed gap was re-verified against the tree before patching, and
-several "open" items were already closed. Constraints held throughout: the MCP
-surface stays at **exactly 9 tools** (no new tools), no embeddings/HNSW until
-P0/P1 pass, 50–100 MB RSS, no Docker, never fake a test. Each item is tested and
-committed; the table records the evidence.
-
-| Item | Verdict | Commit | Evidence |
-|------|---------|--------|----------|
-| Shared capped Postgres pool (was connect-per-op → FD/conn DoS under load) | **DONE** | `3d5b1b4` | `pgpool.go` lazy `pgxpool` (MaxConns 10) shared by all PG ops; `pgpool_test.go`. |
-| Monotonic ordering guard for the async PG run mirror (out-of-order commits) | **DONE** | `7a59f74` | `pg_inline.go` `mirror_seq` + `pg_advisory_xact_lock`; a stale async write can't clobber a newer state. `pg_ordering_test.go`. |
-| Index-coverage honesty (non-git / >800-file repos silently returned empty/truncated graphs) | **DONE** | `69feaac` | `symbolgraph.rs` `IndexCoverage{repo_mode,eligible,indexed,truncated,degraded_reason}` on every `SymbolGraph`; search/ground surface it so a degraded graph isn't trusted as complete. |
-| Optional workspace-scoped tokens (multi-tenant isolation) | **DONE** | `1326b7a` | `auth.go` `Principal.Workspaces`/`AllowsWorkspace`/`MintScopedToken`; empty = all (back-compat). Live ACL check: scoped token → 200 own / 403 other. |
-| Drift baseline tracks missing/edited memory paths | **DONE** | `422bbaf` | `pathMissingSentinel` so a memory's path going missing↔present↔content-change all flag stale on recall (not just content edits). |
-| Concurrent drain of Rust verification child pipes (pipe-buffer deadlock) | **DONE** | `100b994` | `verification.rs` `drain_child_with_timeout` reads stdout/stderr on separate threads. |
-| Metadata-first recall — drift-check a bounded candidate window, not the whole store (was O(history) path-hash I/O per recall) | **DONE** (A) | `09495d1` | `RecallContext` ranks cheaply with no I/O, drift-checks only `max(4·limit,16)` candidates, returns `drift_checked`. |
-| Single token-store read per request (was a double read on every authed call) | **DONE** (E) | `ccc4c2f` | `ResolveAuth` does one store read; `ResolveToken` delegates. |
-| Bounded run output + activity capture (unbounded `strings.Builder` per run) | **DONE** (C) | `0e70ef7` | `boundedTail` 1 MiB ring buffer; summary exposes `output_bytes`/`output_truncated`. |
-| Terminal idle reaper + duplicate-id rejection (abandoned PTYs leaked FDs/RSS) | **DONE** (D) | `5280cae` | 30-min idle TTL reaper; `OpenTerminal` `LoadOrStore` rejects a duplicate live id. |
-| Route ALL Go→Rust bridge calls through one hardened runner | **DONE** (F) | `7170047`,`ae8ade5` | shared `runCoreCtx`/`capWriter` (120 s timeout, 64 MiB stdout / 64 KiB stderr caps, sanitized errors); every bridge file routed through it. |
-| Strict MCP arg validation + `remember` JSON body | **DONE** (B) | `1cdf390` | `tools/call` rejects malformed params / stray fields / unknown args / wrong types / non-scalar / out-of-enum with `-32602` (no silent coerce); typed `inputSchema` (enums, `additionalProperties:false`); `remember` ships content/title/paths in the JSON **body**, not the URL (XM-NEW-018). Live: special-char memory round-trips; object-valued arg & bogus enum → `-32602`. |
-
-**Deferred by design (P2, not blockers):** G (IndexEngine daemon) and H
-(blake3/merkle content key) — see `docs/INDEX_ENGINE.md` §Deferred for the
-analysis and the trigger conditions that would justify revisiting them.
-
-**Net:** every feasible P0/P1 from both audits is fixed + tested + pushed to
-`feat/product-v1`; the only remaining items are the two intentionally-deferred
-P2 index-engine designs and the long-standing LSP-graph-into-search wiring, all
-documented honestly above.
+All **62 available archived project conversations** were read at the conversational
+message level (995 substantive messages). Two indexed older Codex transcripts
+and the June Claude conversation are unavailable locally. All tool payloads were
+parsed where present, but not exhaustively re-audited. See the
+[history index](history/README.md) for exact scope and provenance.

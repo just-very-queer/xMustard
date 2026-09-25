@@ -105,7 +105,8 @@ func ScanWorkspace(dataDir string, workspaceID string) (*workspaceSnapshot, erro
 	}
 	sources = append(sources, buildTrackerSources(dataDir, workspaceID, trackerIssues, fixes, runbooks, runReviews, verificationProfiles, ticketContexts, threatModels)...)
 	driftSummary := buildDriftSummary(issues)
-	runtimes, err := DetectRuntimes(dataDir)
+	// never launch agent CLIs during a scan (cached model lists only)
+	runtimes, err := DetectRuntimesCached(dataDir)
 	if err != nil {
 		return nil, err
 	}

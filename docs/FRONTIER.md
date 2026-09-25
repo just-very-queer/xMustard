@@ -1,5 +1,9 @@
 # Research Frontier Map
 
+> Historical working document, retained as evidence of earlier design and work.
+> Use [VISION.md](VISION.md), [STATUS.md](STATUS.md), and [ROADMAP.md](ROADMAP.md)
+> for current direction, verified behavior, and remaining work.
+
 This document turns the local research synthesis into the next product frontier for xMustard.
 It is intentionally shorter and more operational than the broader planning docs: each lane
 should point to a buildable artifact, not only a theme.

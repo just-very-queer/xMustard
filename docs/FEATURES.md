@@ -1,5 +1,9 @@
 # Feature Specifications
 
+> Historical working document, retained as evidence of earlier design and work.
+> Use [VISION.md](VISION.md), [STATUS.md](STATUS.md), and [ROADMAP.md](ROADMAP.md)
+> for current direction, verified behavior, and remaining work.
+
 This file describes xMustard as it exists now and the next research-backed extensions we want to add.
 
 ## F1: Issue Context Packets

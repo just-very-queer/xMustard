@@ -736,12 +736,26 @@ func buildRuntimeCommand(dataDir string, runtime string, model string, workspace
 }
 
 func detectOpencodeModels(binary string) []string {
-	command := exec.Command(binary, "models")
-	output, err := command.Output()
+	// bounded: 15 s, 1 MiB of output, own process group killed with it, tracked for
+	// shutdown. The CLI is an external agent runtime, so it runs only when asked for.
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	command := exec.CommandContext(ctx, binary, "models")
+	command.WaitDelay = 2 * time.Second
+	rustcore.IsolateProcessTree(command)
+	out := &cappedBuffer{max: 1 << 20}
+	command.Stdout = out
+	if err := command.Start(); err != nil {
+		return nil
+	}
+	untrack := rustcore.TrackChild(command)
+	err := command.Wait()
+	untrack()
+	rustcore.KillProcessTree(command)
 	if err != nil {
 		return nil
 	}
-	return parseOpencodeModelsOutput(string(output))
+	return parseOpencodeModelsOutput(out.String())
 }
 
 func resolveBinary(configuredValue *string, defaultName string) string {

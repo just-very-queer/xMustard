@@ -1,6 +1,7 @@
 package workspaceops
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -55,6 +56,11 @@ type ContextEntry struct {
 	// (stays empty there), only populated from the recall meta cache so recall can
 	// locate the entry's hash-named content file. See hashContent / loadWindowContent.
 	ContentHash string `json:"content_hash,omitempty"`
+	// ContentDigest is the full SHA-256 of the content version the metadata describes.
+	// Like ContentHash it is DERIVED (meta cache / source scan only) and cleared before
+	// entries are returned; recall's trust binding compares against it, never against
+	// the 64-bit filename hash.
+	ContentDigest string `json:"content_digest,omitempty"`
 	// Stale / StalePaths are computed at read time (drift-on-recall), never stored.
 	Stale      bool     `json:"stale,omitempty"`
 	StalePaths []string `json:"stale_paths,omitempty"`
@@ -91,6 +97,23 @@ func validateSafeID(kind, id string) error {
 func hashContent(s string) string {
 	sum := sha256.Sum256([]byte(s))
 	return hex.EncodeToString(sum[:8])
+}
+
+// contentDigest is the full SHA-256 (hex) of an entry's content: the collision-resistant
+// identity recall uses to bind returned text to the promoted metadata version.
+// hashContent's 64-bit prefix only names cache files and is never a trust comparison.
+func contentDigest(s string) string {
+	sum := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(sum[:])
+}
+
+// isContentDigest reports whether d is a full SHA-256 hex digest.
+func isContentDigest(d string) bool {
+	if len(d) != 2*sha256.Size {
+		return false
+	}
+	_, err := hex.DecodeString(d)
+	return err == nil
 }
 
 // hashFileContent returns the sha256 of a repo-relative file's current content.
@@ -143,6 +166,7 @@ func computeStaleness(root string, entry *ContextEntry) {
 	if root == "" || len(entry.PathHashes) == 0 {
 		return
 	}
+	stalenessChecks.Add(1)
 	var stale []string
 	for p, recorded := range entry.PathHashes {
 		cur, ok := hashFileContent(root, p)
@@ -210,6 +234,9 @@ type contextEntryMeta struct {
 	// source's metas decode it as empty (the source has no such field). It names the
 	// entry's content file so recall reads the file matching the current content.
 	ContentHash string `json:"content_hash,omitempty"`
+	// ContentDigest is the full SHA-256 content identity (see ContextEntry). A cache
+	// written before it existed lacks it and is treated as unusable (fail closed).
+	ContentDigest string `json:"content_digest,omitempty"`
 }
 
 func (m *contextEntryMeta) toEntry() ContextEntry {
@@ -219,24 +246,41 @@ func (m *contextEntryMeta) toEntry() ContextEntry {
 		Verifications: m.Verifications, RequiredVerifications: m.RequiredVerifications,
 		CreatedAt: m.CreatedAt, UpdatedAt: m.UpdatedAt, Paths: m.Paths,
 		PathHashes: m.PathHashes, SearchTokens: m.SearchTokens, ContentHash: m.ContentHash,
+		ContentDigest: m.ContentDigest,
 		// Content is loaded for the returned window; Stale/StalePaths at read time.
 	}
 }
 
-// loadPromotedMeta loads the promoted entries WITHOUT their content (the JSON
-// "content" value is scanned past, not allocated) for the recall ranking pass.
+// loadPromotedMeta loads the promoted entries for the recall ranking pass when the
+// meta cache is unusable. Entries are streamed one at a time; each content body is
+// hashed into ContentHash (binding the ranked metadata to that exact revision) and
+// then dropped, so only the returned window's content is ever retained.
 func loadPromotedMeta(dataDir, workspaceID string) ([]ContextEntry, error) {
-	var metas []contextEntryMeta
-	if err := readJSON(contextEntriesPath(dataDir, workspaceID), &metas); err != nil {
+	f, err := os.Open(contextEntriesPath(dataDir, workspaceID))
+	if err != nil {
 		if os.IsNotExist(err) {
 			return []ContextEntry{}, nil
 		}
 		return nil, err
 	}
-	out := make([]ContextEntry, 0, len(metas))
-	for i := range metas {
-		if metas[i].Promoted {
-			out = append(out, metas[i].toEntry())
+	defer f.Close()
+	dec := json.NewDecoder(f)
+	if _, err := dec.Token(); err != nil { // opening '['
+		return nil, err
+	}
+	out := []ContextEntry{}
+	for dec.More() {
+		var m struct {
+			contextEntryMeta
+			Content string `json:"content"`
+		}
+		if err := dec.Decode(&m); err != nil {
+			return nil, err
+		}
+		if m.Promoted {
+			m.ContentHash = hashContent(m.Content)
+			m.ContentDigest = contentDigest(m.Content)
+			out = append(out, m.toEntry())
 		}
 	}
 	return out, nil
@@ -281,7 +325,8 @@ func writeContextMetaCache(dataDir, workspaceID string, entries []ContextEntry) 
 			Verifications: e.Verifications, RequiredVerifications: e.RequiredVerifications,
 			CreatedAt: e.CreatedAt, UpdatedAt: e.UpdatedAt, Paths: e.Paths,
 			PathHashes: e.PathHashes, SearchTokens: e.SearchTokens,
-			ContentHash: hashContent(e.Content),
+			ContentHash:   hashContent(e.Content),
+			ContentDigest: contentDigest(e.Content),
 		})
 	}
 	_ = writeJSON(contextMetaCachePath(dataDir, workspaceID), metas)
@@ -330,19 +375,40 @@ func loadPromotedMetaCached(dataDir, workspaceID string) ([]ContextEntry, bool) 
 	}
 	out := make([]ContextEntry, 0, len(metas))
 	for i := range metas {
-		if metas[i].Promoted {
-			out = append(out, metas[i].toEntry())
+		if !metas[i].Promoted {
+			continue
 		}
+		if !isContentDigest(metas[i].ContentDigest) {
+			// Legacy cache (64-bit filename hash only): it cannot bind content to the
+			// approved version, so fall back to the source and rebuild the cache.
+			migrateContextMetaCache(dataDir, workspaceID)
+			return nil, false
+		}
+		out = append(out, metas[i].toEntry())
 	}
 	return out, true
+}
+
+// migrateContextMetaCache rewrites a legacy meta cache with full content digests. It
+// runs under the store lock so it cannot overwrite a cache written by a newer save.
+// Best-effort: on failure recall keeps using the source fallback.
+func migrateContextMetaCache(dataDir, workspaceID string) {
+	unlock := lockStore(contextEntriesPath(dataDir, workspaceID))
+	defer unlock()
+	entries, err := loadContextEntries(dataDir, workspaceID)
+	if err != nil {
+		return
+	}
+	writeContextMetaCache(dataDir, workspaceID, entries)
 }
 
 // loadWindowContent returns the content of the requested ids, reading each id's
 // hash-named content file first (O(window) reads, no full-source parse) and falling
 // back to a streaming source read for any id whose content file is missing — covering
-// legacy/unmigrated entries and the rare case of a failed content-file write (the
-// new-hash file is then absent, so we never serve stale content). idHashes maps each
-// window id to the ContentHash recorded in the (source-fresh) meta cache.
+// legacy/unmigrated entries and the rare case of a failed content-file write. The
+// source may hold a newer revision than the ranked metadata, so callers must compare
+// each returned body against its expected hash. idHashes maps each window id to the
+// ContentHash recorded in the (source-fresh) meta cache.
 func loadWindowContent(dataDir, workspaceID string, idHashes map[string]string) map[string]string {
 	out := make(map[string]string, len(idHashes))
 	missing := make(map[string]struct{})
@@ -746,6 +812,41 @@ func GetActiveContext(dataDir, workspaceID string) (map[string]any, error) {
 // top-N, so an agent grounds on the few facts that matter rather than the whole
 // store. With no query or paths it falls back to recency-ranked top-N.
 func RecallContext(dataDir, workspaceID, query string, paths []string, limit int) (map[string]any, error) {
+	return RecallContextCtx(context.Background(), dataDir, workspaceID, query, paths, limit)
+}
+
+// RecallContextCtx is RecallContext bound to the request context, so the working-change
+// lookup's Rust child is killed when the caller cancels.
+func RecallContextCtx(ctx context.Context, dataDir, workspaceID, query string, paths []string, limit int) (map[string]any, error) {
+	// Content is bound to the exact promoted version whose metadata was ranked: a
+	// concurrent update between the metadata pass and the content load yields a hash
+	// mismatch, and the whole recall is retried against the new state. If the store
+	// keeps moving, mismatched entries are withheld (fail closed) and counted.
+	var res map[string]any
+	for attempt := 1; attempt <= recallConsistencyAttempts; attempt++ {
+		var mismatched int
+		var err error
+		res, mismatched, err = recallOnce(ctx, dataDir, workspaceID, query, paths, limit, attempt == recallConsistencyAttempts)
+		if err != nil {
+			return nil, err
+		}
+		res["consistency_attempts"] = attempt
+		if mismatched == 0 {
+			return res, nil
+		}
+		res["consistency_withheld"] = mismatched
+	}
+	return res, nil
+}
+
+// recallConsistencyAttempts bounds how often recall re-reads when content changed
+// under it before withholding the mismatched entries.
+const recallConsistencyAttempts = 3
+
+// recallOnce is one ranked-recall pass. It reports how many returned entries had
+// content that no longer matched their ranked metadata; when withhold is set those
+// entries are removed from the result instead of being returned.
+func recallOnce(ctx context.Context, dataDir, workspaceID, query string, paths []string, limit int, withhold bool) (map[string]any, int, error) {
 	// metadata-first load: rank on content-less metadata (precomputed SearchTokens), so
 	// recall's decode/allocation doesn't scale with content size; content is fetched
 	// only for the returned window below (XM-PRO-010). The content-free meta CACHE bounds
@@ -755,7 +856,7 @@ func RecallContext(dataDir, workspaceID, query string, paths []string, limit int
 	if !ok {
 		var err error
 		if promoted, err = loadPromotedMeta(dataDir, workspaceID); err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 	}
 	metaFast := true
@@ -766,7 +867,7 @@ func RecallContext(dataDir, workspaceID, query string, paths []string, limit int
 			// since SearchTokens landed always carry them).
 			full, ferr := ListContextEntries(dataDir, workspaceID, "promoted")
 			if ferr != nil {
-				return nil, ferr
+				return nil, 0, ferr
 			}
 			promoted = full
 			metaFast = false
@@ -774,7 +875,7 @@ func RecallContext(dataDir, workspaceID, query string, paths []string, limit int
 		}
 	}
 	if limit <= 0 {
-		limit = 8
+		limit = defaultRecallLimit
 	}
 	root := contextRoot(dataDir, workspaceID)
 	// NOTE: drift-check is deferred to a bounded candidate window AFTER ranking (see
@@ -784,9 +885,12 @@ func RecallContext(dataDir, workspaceID, query string, paths []string, limit int
 	// returned are hashed.
 
 	// path signal: explicit query paths, else the files currently being worked on.
+	// Explicit query/paths gate relevance; with neither, the current working changes
+	// only boost matching memories so a dirty tree still yields recency top-N.
 	focusPaths := cleanPaths(paths)
-	if len(focusPaths) == 0 && query == "" {
-		focusPaths = currentChangedFiles(dataDir, workspaceID)
+	explicitSignal := query != "" || len(focusPaths) > 0
+	if !explicitSignal {
+		focusPaths = recallChangedFiles(ctx, dataDir, workspaceID)
 	}
 	focusSet := map[string]struct{}{}
 	for _, p := range focusPaths {
@@ -805,7 +909,7 @@ func RecallContext(dataDir, workspaceID, query string, paths []string, limit int
 			newest = e.UpdatedAt
 		}
 	}
-	hasSignal := len(qtokens) > 0 || len(focusSet) > 0
+	hasSignal := explicitSignal && (len(qtokens) > 0 || len(focusSet) > 0)
 	for _, e := range promoted {
 		// relevance = the task-match signal (lexical + path overlap). boost = trust
 		// + recency, applied on top but never enough on its own to surface an
@@ -832,14 +936,11 @@ func RecallContext(dataDir, workspaceID, query string, paths []string, limit int
 		}
 		// NB: no stale penalty here — staleness is unknown until the bounded drift
 		// check below; the penalty is applied to the candidate window only.
-		score := boost
-		if hasSignal {
-			// gate on relevance: irrelevant memory is dropped below.
-			if relevance <= 0 {
-				score = -1 // sentinel: filtered out
-			} else {
-				score = relevance + boost
-			}
+		score := relevance + boost
+		if hasSignal && relevance <= 0 {
+			// explicit query/paths gate relevance: irrelevant memory is dropped below.
+			// Implicit working-change focus only adds to the score.
+			score = -1 // sentinel: filtered out
 		}
 		ranked = append(ranked, scored{e, score})
 	}
@@ -876,6 +977,7 @@ func RecallContext(dataDir, workspaceID, query string, paths []string, limit int
 	byScore(candidates)
 
 	out := make([]ContextEntry, 0, limit)
+	mismatched := 0
 	staleCount := 0
 	for _, s := range candidates {
 		if s.entry.Stale {
@@ -889,31 +991,68 @@ func RecallContext(dataDir, workspaceID, query string, paths []string, limit int
 	// In the metadata-fast path the ranked entries carry no content — load it for ONLY
 	// the returned window (the rest of the store's content is never allocated).
 	if metaFast && len(out) > 0 {
+		// The filename hash only locates a candidate body; acceptance below requires
+		// the full digest recorded with the ranked metadata.
 		idHashes := make(map[string]string, len(out))
 		for i := range out {
 			idHashes[out[i].ID] = out[i].ContentHash
 		}
+		if recallBeforeContentLoad != nil {
+			recallBeforeContentLoad()
+		}
 		// per-id hash-named content files first (O(window) reads, no full-source parse);
 		// any missing file falls back to a streaming source read inside loadWindowContent.
 		contents := loadWindowContent(dataDir, workspaceID, idHashes)
+		kept := out[:0]
 		for i := range out {
-			out[i].Content = contents[out[i].ID]
-			out[i].ContentHash = "" // derived transport field — don't leak it to callers
+			content, ok := contents[out[i].ID]
+			if !ok || contentDigest(content) != out[i].ContentDigest {
+				mismatched++
+				if withhold {
+					continue
+				}
+			}
+			out[i].Content = content
+			out[i].ContentHash = "" // derived transport fields — don't leak them to callers
+			out[i].ContentDigest = ""
+			kept = append(kept, out[i])
 		}
+		out = kept
 	}
+	requireMulti, threshold := contextDefaults(dataDir)
 	return map[string]any{
-		"workspace_id":  workspaceID,
-		"query":         query,
-		"ranked":        hasSignal,
-		"total_active":  len(promoted),
-		"returned":      len(out),
-		"stale_count":   staleCount,
-		"drift_checked": len(candidates), // every returned entry is in this set (checked)
-		"conflicts":     overlappingMemory(out),
-		"entries":       out,
-		"generated_at":  nowUTC(),
-	}, nil
+		"workspace_id":           workspaceID,
+		"query":                  query,
+		"ranked":                 hasSignal,
+		"bounded":                true,
+		"limit":                  limit,
+		"require_multi_agent":    requireMulti,
+		"verification_threshold": threshold,
+		"total_active":           len(promoted),
+		"active_count":           len(promoted),
+		"returned":               len(out),
+		"stale_count":            staleCount,
+		"drift_checked":          len(candidates), // every returned entry is in this set (checked)
+		"conflicts":              overlappingMemory(out),
+		"entries":                out,
+		"generated_at":           nowUTC(),
+	}, mismatched, nil
 }
+
+// stalenessChecks counts drift checks that hash referenced files — a test hook for
+// asserting that grounding/recall drift work is bounded, not O(promoted history).
+var stalenessChecks atomic.Int64
+
+// defaultRecallLimit is the top-N returned when the caller passes no limit.
+const defaultRecallLimit = 8
+
+// recallChangedFiles supplies the implicit focus paths (current working changes) for
+// a recall without query/paths; a variable so tests can fix the working-tree state.
+var recallChangedFiles = currentChangedFiles
+
+// recallBeforeContentLoad is a test seam that runs between recall's metadata ranking
+// and its content load, so a concurrent update can be interleaved deterministically.
+var recallBeforeContentLoad func()
 
 // recallCandidateWindow bounds how many top-ranked entries get drift-checked on a
 // recall, so the check is O(window) not O(history). A few × limit gives the stale

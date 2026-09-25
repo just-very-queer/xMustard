@@ -1,5 +1,7 @@
-use std::collections::HashSet;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::rc::Rc;
 
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{Language, Parser, Query, QueryCursor};
@@ -54,24 +56,62 @@ fn enclosing_scope_of(node: tree_sitter::Node, source: &[u8]) -> Option<String> 
 }
 
 struct LanguageConfig {
+    /// Grammar identity for the compiled-query cache.
+    name: &'static str,
     language: Language,
     query: &'static str,
 }
 
-/// Extract semantic symbol candidates from a file using tree-sitter.
+thread_local! {
+    /// Compiled queries per grammar. Compiling a query costs far more than parsing a
+    /// typical file, so it is done once per grammar per thread, not once per file.
+    static QUERY_CACHE: RefCell<HashMap<&'static str, Rc<Query>>> = RefCell::new(HashMap::new());
+}
+
+fn compiled_query(config: &LanguageConfig) -> Option<Rc<Query>> {
+    QUERY_CACHE.with(|cache| {
+        if let Some(q) = cache.borrow().get(config.name) {
+            return Some(q.clone());
+        }
+        let q = Rc::new(Query::new(&config.language, config.query).ok()?);
+        cache.borrow_mut().insert(config.name, q.clone());
+        Some(q)
+    })
+}
+
+/// Index-completeness bound on symbols extracted from one file. Display limits are
+/// applied by callers; reaching this bound is reported as `symbols_truncated`.
+pub const MAX_SYMBOLS_PER_FILE: usize = 4096;
+
+/// Whether `relative_path` has a tree-sitter grammar.
+pub fn supports(relative_path: &str) -> bool {
+    language_config(relative_path).is_some()
+}
+
+/// Extract semantic symbol candidates from a file using tree-sitter, up to
+/// MAX_SYMBOLS_PER_FILE.
 pub fn extract_symbols(relative_path: &str, source: &str) -> Option<Vec<TsSymbol>> {
+    extract_symbols_limited(relative_path, source, MAX_SYMBOLS_PER_FILE).map(|(s, _)| s)
+}
+
+/// Extract at most `max` symbols; the flag is true when more symbols existed.
+pub fn extract_symbols_limited(
+    relative_path: &str,
+    source: &str,
+    max: usize,
+) -> Option<(Vec<TsSymbol>, bool)> {
     let config = language_config(relative_path)?;
     let mut parser = Parser::new();
     if parser.set_language(&config.language).is_err() {
-        return Some(Vec::new());
+        return Some((Vec::new(), false));
     }
     let tree = match parser.parse(source, None) {
         Some(tree) => tree,
-        None => return Some(Vec::new()),
+        None => return Some((Vec::new(), false)),
     };
-    let query = match Query::new(&config.language, config.query) {
-        Ok(query) => query,
-        Err(_) => return Some(Vec::new()),
+    let query = match compiled_query(&config) {
+        Some(query) => query,
+        None => return Some((Vec::new(), false)),
     };
     let mut cursor = QueryCursor::new();
     let mut symbols = Vec::new();
@@ -104,6 +144,9 @@ pub fn extract_symbols(relative_path: &str, source: &str) -> Option<Vec<TsSymbol
             if !seen.insert((symbol.to_string(), line_start)) {
                 continue;
             }
+            if symbols.len() >= max {
+                return Some((symbols, true));
+            }
             // a symbol is never its own scope (e.g. the `impl Foo` type capture).
             let enclosing_scope =
                 enclosing_scope_of(capture.node, source.as_bytes()).filter(|s| s != symbol);
@@ -115,12 +158,9 @@ pub fn extract_symbols(relative_path: &str, source: &str) -> Option<Vec<TsSymbol
                 name_column,
                 enclosing_scope,
             });
-            if symbols.len() >= 64 {
-                return Some(symbols);
-            }
         }
     }
-    Some(symbols)
+    Some((symbols, false))
 }
 
 fn map_capture_kind(kind: &str) -> Option<&'static str> {
@@ -144,26 +184,32 @@ fn language_config(relative_path: &str) -> Option<LanguageConfig> {
         .to_ascii_lowercase();
     match extension.as_str() {
         "rs" => Some(LanguageConfig {
+            name: "rust",
             language: tree_sitter_rust::LANGUAGE.into(),
             query: RUST_QUERY,
         }),
         "go" => Some(LanguageConfig {
+            name: "go",
             language: tree_sitter_go::LANGUAGE.into(),
             query: GO_QUERY,
         }),
         "ts" => Some(LanguageConfig {
+            name: "typescript",
             language: tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
             query: TYPESCRIPT_QUERY,
         }),
         "tsx" => Some(LanguageConfig {
+            name: "tsx",
             language: tree_sitter_typescript::LANGUAGE_TSX.into(),
             query: TYPESCRIPT_QUERY,
         }),
         "js" | "mjs" | "cjs" => Some(LanguageConfig {
+            name: "javascript",
             language: tree_sitter_javascript::LANGUAGE.into(),
             query: JAVASCRIPT_QUERY,
         }),
         "jsx" => Some(LanguageConfig {
+            name: "javascript",
             language: tree_sitter_javascript::LANGUAGE.into(),
             query: JAVASCRIPT_QUERY,
         }),
@@ -235,7 +281,23 @@ const GO_QUERY: &str = r#"
 
 #[cfg(test)]
 mod tests {
-    use super::{TsSymbol, extract_symbols};
+    use super::{TsSymbol, extract_symbols, extract_symbols_limited};
+
+    #[test]
+    fn extraction_is_complete_past_old_cap_and_reports_truncation() {
+        let source: String = (1..=70)
+            .map(|i| format!("fn symbol_{i:03}() {{}}\n"))
+            .collect();
+        let all = extract_symbols("many.rs", &source).unwrap();
+        assert_eq!(all.len(), 70);
+        assert_eq!(all[69].symbol, "symbol_070");
+        let (some, truncated) = extract_symbols_limited("many.rs", &source, 10).unwrap();
+        assert_eq!(some.len(), 10);
+        assert!(truncated);
+        let (exact, t2) = extract_symbols_limited("many.rs", &source, 70).unwrap();
+        assert_eq!(exact.len(), 70);
+        assert!(!t2);
+    }
 
     fn read_lines(symbols: &[TsSymbol]) -> Vec<(&str, &str)> {
         symbols

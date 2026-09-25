@@ -1,6 +1,7 @@
 package workspaceops
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha1"
 	"encoding/hex"
@@ -14,6 +15,9 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"xmustard/api-go/internal/budget"
+	"xmustard/api-go/internal/rustcore"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -150,6 +154,12 @@ var connectSemanticPostgres = func(ctx context.Context, dsn string) (semanticMat
 }
 
 func SearchSemanticPattern(dataDir string, workspaceID string, pattern string, language string, pathGlob string, limit int) (*SemanticPatternQueryResult, error) {
+	return SearchSemanticPatternCtx(context.Background(), dataDir, workspaceID, pattern, language, pathGlob, limit)
+}
+
+// SearchSemanticPatternCtx is SearchSemanticPattern bound to the caller's context:
+// cancelling ctx kills the ast-grep child.
+func SearchSemanticPatternCtx(ctx context.Context, dataDir string, workspaceID string, pattern string, language string, pathGlob string, limit int) (*SemanticPatternQueryResult, error) {
 	if strings.TrimSpace(pattern) == "" {
 		return nil, fmt.Errorf("%w: pattern is required", ErrInvalidSemanticRequest)
 	}
@@ -159,13 +169,17 @@ func SearchSemanticPattern(dataDir string, workspaceID string, pattern string, l
 	}
 	normalizedLanguage := trimOptional(optionalString(language))
 	normalizedPathGlob := trimOptional(optionalString(pathGlob))
-	matches, binaryPath, queryError, truncated := runAstGrepSemanticQuery(
+	matches, binaryPath, queryError, truncated, admitErr := runAstGrepSemanticQueryCtx(
+		ctx,
 		snapshot.Workspace.RootPath,
 		pattern,
 		normalizedLanguage,
 		normalizedPathGlob,
 		max(1, min(limit, 200)),
 	)
+	if admitErr != nil {
+		return nil, admitErr
+	}
 	engine := "none"
 	if binaryPath != nil {
 		engine = "ast_grep"
@@ -849,9 +863,47 @@ func semanticMaterializationPathScore(relativePath string) int {
 }
 
 func runAstGrepSemanticQuery(repoRoot string, pattern string, language *string, pathGlob *string, limit int) ([]SemanticPatternMatchRecord, *string, *string, bool) {
+	matches, binary, queryError, truncated, err := runAstGrepSemanticQueryCtx(context.Background(), repoRoot, pattern, language, pathGlob, limit)
+	if err != nil {
+		message := err.Error()
+		return []SemanticPatternMatchRecord{}, binary, &message, false
+	}
+	return matches, binary, queryError, truncated
+}
+
+// astGrep bounds: the child is killed at the deadline, each streamed JSON line is
+// capped, and reading stops (killing the child) once the result limit is reached, so
+// neither the child's output volume nor its runtime is unbounded in the API process.
+const (
+	astGrepTimeout      = 60 * time.Second
+	astGrepMaxLineBytes = 1 << 20
+	astGrepMaxStderr    = 64 << 10
+)
+
+// runAstGrepSemanticQueryCtx returns an error only for admission refusal (helper-child
+// slot or line-buffer reservation); query failures are reported in the message result.
+func runAstGrepSemanticQueryCtx(ctx context.Context, repoRoot string, pattern string, language *string, pathGlob *string, limit int) ([]SemanticPatternMatchRecord, *string, *string, bool, error) {
+	matches, binary, queryError, truncated, err := astGrepQuery(ctx, repoRoot, pattern, language, pathGlob, limit)
+	return matches, binary, queryError, truncated, err
+}
+
+func astGrepQuery(ctx context.Context, repoRoot string, pattern string, language *string, pathGlob *string, limit int) ([]SemanticPatternMatchRecord, *string, *string, bool, error) {
 	binary := astGrepBinary()
 	if binary == "" {
-		return []SemanticPatternMatchRecord{}, nil, optionalString("ast-grep binary is not installed on this machine."), false
+		return []SemanticPatternMatchRecord{}, nil, optionalString("ast-grep binary is not installed on this machine."), false, nil
+	}
+	release, err := budget.Children.Acquire(ctx)
+	if err != nil {
+		return nil, optionalString(binary), nil, false, err
+	}
+	defer release()
+	scope, owned := budget.ScopeFor(ctx)
+	if owned {
+		defer scope.Close()
+	}
+	// the scanner may grow its line buffer to astGrepMaxLineBytes: reserve it first.
+	if err := scope.Acquire(astGrepMaxLineBytes + astGrepMaxStderr); err != nil {
+		return nil, optionalString(binary), nil, false, err
 	}
 	args := []string{"run", "--pattern", pattern, "--json=stream"}
 	if language != nil {
@@ -861,83 +913,143 @@ func runAstGrepSemanticQuery(repoRoot string, pattern string, language *string, 
 		args = append(args, "--globs", *pathGlob)
 	}
 	args = append(args, repoRoot)
-	cmd := exec.Command(binary, args...)
-	var stdout strings.Builder
-	var stderr strings.Builder
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
-			matches, truncated := parseAstGrepMatches(repoRoot, stdout.String(), limit)
-			return matches, optionalString(binary), nil, truncated
+	ctx, cancel := context.WithTimeout(ctx, astGrepTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, binary, args...)
+	cmd.WaitDelay = 2 * time.Second
+	rustcore.IsolateProcessTree(cmd)
+	defer rustcore.KillProcessTree(cmd)
+	stderr := &cappedBuffer{max: astGrepMaxStderr}
+	cmd.Stderr = stderr
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		message := err.Error()
+		return []SemanticPatternMatchRecord{}, optionalString(binary), &message, false, nil
+	}
+	if err := cmd.Start(); err != nil {
+		message := err.Error()
+		return []SemanticPatternMatchRecord{}, optionalString(binary), &message, false, nil
+	}
+	defer rustcore.TrackChild(cmd)()
+	matches := []SemanticPatternMatchRecord{}
+	truncated := false
+	scanner := bufio.NewScanner(stdout)
+	scanner.Buffer(make([]byte, 0, 64<<10), astGrepMaxLineBytes)
+	for scanner.Scan() {
+		if m, ok := parseAstGrepLine(repoRoot, scanner.Text()); ok {
+			matches = append(matches, m)
+			if len(matches) >= limit {
+				truncated = true
+				cancel() // enough results: stop the child instead of draining it
+				break
+			}
+		}
+	}
+	scanErr := scanner.Err()
+	waitErr := cmd.Wait()
+	if truncated {
+		return matches, optionalString(binary), nil, true, nil
+	}
+	if ctx.Err() != nil {
+		message := "ast-grep query cancelled or timed out"
+		return []SemanticPatternMatchRecord{}, optionalString(binary), &message, false, nil
+	}
+	if scanErr != nil {
+		message := "ast-grep output line exceeded limit: " + scanErr.Error()
+		return matches, optionalString(binary), &message, true, nil
+	}
+	if waitErr != nil {
+		if exitErr, ok := waitErr.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
+			return matches, optionalString(binary), nil, false, nil
 		}
 		message := strings.TrimSpace(stderr.String())
 		if message == "" {
-			message = strings.TrimSpace(stdout.String())
+			message = waitErr.Error()
 		}
-		if message == "" {
-			message = err.Error()
-		}
-		return []SemanticPatternMatchRecord{}, optionalString(binary), &message, false
+		return []SemanticPatternMatchRecord{}, optionalString(binary), &message, false, nil
 	}
-	matches, truncated := parseAstGrepMatches(repoRoot, stdout.String(), limit)
-	return matches, optionalString(binary), nil, truncated
+	return matches, optionalString(binary), nil, false, nil
 }
+
+// cappedBuffer keeps the first max bytes written and discards the rest without
+// blocking the writer.
+type cappedBuffer struct {
+	buf strings.Builder
+	max int
+}
+
+func (c *cappedBuffer) Write(p []byte) (int, error) {
+	if room := c.max - c.buf.Len(); room > 0 {
+		if len(p) > room {
+			c.buf.Write(p[:room])
+		} else {
+			c.buf.Write(p)
+		}
+	}
+	return len(p), nil
+}
+
+func (c *cappedBuffer) String() string { return c.buf.String() }
 
 func parseAstGrepMatches(repoRoot string, output string, limit int) ([]SemanticPatternMatchRecord, bool) {
 	matches := []SemanticPatternMatchRecord{}
-	truncated := false
 	for _, rawLine := range strings.Split(output, "\n") {
-		line := strings.TrimSpace(rawLine)
-		if line == "" {
-			continue
-		}
-		var payload map[string]any
-		if err := json.Unmarshal([]byte(line), &payload); err != nil {
-			continue
-		}
-		filePath, ok := payload["file"].(string)
-		if !ok || strings.TrimSpace(filePath) == "" {
-			continue
-		}
-		matchedText, ok := payload["text"].(string)
-		if !ok {
-			continue
-		}
-		rangePayload, _ := payload["range"].(map[string]any)
-		startPayload, _ := rangePayload["start"].(map[string]any)
-		endPayload, _ := rangePayload["end"].(map[string]any)
-		var contextLines *string
-		if value, ok := payload["lines"].(string); ok && strings.TrimSpace(value) != "" {
-			contextLines = &value
-		}
-		metaVariables := []string{}
-		if metaPayload, ok := payload["metaVariables"].(map[string]any); ok {
-			if singlePayload, ok := metaPayload["single"].(map[string]any); ok {
-				for key := range singlePayload {
-					metaVariables = append(metaVariables, key)
-				}
-				sort.Strings(metaVariables)
+		if m, ok := parseAstGrepLine(repoRoot, rawLine); ok {
+			matches = append(matches, m)
+			if len(matches) >= limit {
+				return matches, true
 			}
 		}
-		matches = append(matches, SemanticPatternMatchRecord{
-			Path:          relativeSemanticMatchPath(repoRoot, filePath),
-			Language:      normalizeAstGrepLanguage(payload["language"]),
-			LineStart:     oneBasedSemanticIndex(startPayload, "line"),
-			LineEnd:       oneBasedSemanticIndex(endPayload, "line"),
-			ColumnStart:   oneBasedSemanticIndex(startPayload, "column"),
-			ColumnEnd:     oneBasedSemanticIndex(endPayload, "column"),
-			MatchedText:   matchedText,
-			ContextLines:  contextLines,
-			MetaVariables: metaVariables,
-			Score:         0,
-		})
-		if len(matches) >= limit {
-			truncated = true
-			break
+	}
+	return matches, false
+}
+
+// parseAstGrepLine decodes one `--json=stream` match line.
+func parseAstGrepLine(repoRoot string, rawLine string) (SemanticPatternMatchRecord, bool) {
+	line := strings.TrimSpace(rawLine)
+	if line == "" {
+		return SemanticPatternMatchRecord{}, false
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(line), &payload); err != nil {
+		return SemanticPatternMatchRecord{}, false
+	}
+	filePath, ok := payload["file"].(string)
+	if !ok || strings.TrimSpace(filePath) == "" {
+		return SemanticPatternMatchRecord{}, false
+	}
+	matchedText, ok := payload["text"].(string)
+	if !ok {
+		return SemanticPatternMatchRecord{}, false
+	}
+	rangePayload, _ := payload["range"].(map[string]any)
+	startPayload, _ := rangePayload["start"].(map[string]any)
+	endPayload, _ := rangePayload["end"].(map[string]any)
+	var contextLines *string
+	if value, ok := payload["lines"].(string); ok && strings.TrimSpace(value) != "" {
+		contextLines = &value
+	}
+	metaVariables := []string{}
+	if metaPayload, ok := payload["metaVariables"].(map[string]any); ok {
+		if singlePayload, ok := metaPayload["single"].(map[string]any); ok {
+			for key := range singlePayload {
+				metaVariables = append(metaVariables, key)
+			}
+			sort.Strings(metaVariables)
 		}
 	}
-	return matches, truncated
+	return SemanticPatternMatchRecord{
+		Path:          relativeSemanticMatchPath(repoRoot, filePath),
+		Language:      normalizeAstGrepLanguage(payload["language"]),
+		LineStart:     oneBasedSemanticIndex(startPayload, "line"),
+		LineEnd:       oneBasedSemanticIndex(endPayload, "line"),
+		ColumnStart:   oneBasedSemanticIndex(startPayload, "column"),
+		ColumnEnd:     oneBasedSemanticIndex(endPayload, "column"),
+		MatchedText:   matchedText,
+		ContextLines:  contextLines,
+		MetaVariables: metaVariables,
+		Score:         0,
+	}, true
 }
 
 func relativeSemanticMatchPath(repoRoot string, filePath string) string {

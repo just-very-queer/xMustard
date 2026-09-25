@@ -1,5 +1,9 @@
 # Planning
 
+> Historical working document, retained as evidence of earlier design and work.
+> Use [VISION.md](VISION.md), [STATUS.md](STATUS.md), and [ROADMAP.md](ROADMAP.md)
+> for current direction, verified behavior, and remaining work.
+
 This roadmap reflects the current state of xMustard, not the original alpha sketch.
 
 ## Current Status

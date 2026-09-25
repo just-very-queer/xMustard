@@ -1,6 +1,7 @@
 package workspaceops
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -35,6 +36,11 @@ var pathLikePattern = regexp.MustCompile(`[\w./-]+\.[A-Za-z]{1,5}`)
 var errorLinePattern = regexp.MustCompile(`(?i)\b(error|fail(ed|ure)?|panic|exception|undefined|cannot|expected|traceback|fatal)\b`)
 
 func ExplainRunFailure(dataDir, workspaceID, runID string) (*FailureExplanation, error) {
+	return ExplainRunFailureCtx(context.Background(), dataDir, workspaceID, runID)
+}
+
+// ExplainRunFailureCtx is the request-scoped variant: cancelling ctx kills its Rust/tool children.
+func ExplainRunFailureCtx(ctx context.Context, dataDir, workspaceID, runID string) (*FailureExplanation, error) {
 	run, err := ReadRun(dataDir, workspaceID, runID)
 	if err != nil {
 		return nil, err
@@ -56,7 +62,7 @@ func ExplainRunFailure(dataDir, workspaceID, runID string) (*FailureExplanation,
 	exp.Failed = runLooksFailed(run, exp.Signals)
 
 	exp.ErrorLines = salientErrorLines(output, 8)
-	exp.ChangedFiles = currentChangedFiles(dataDir, workspaceID)
+	exp.ChangedFiles = currentChangedFiles(ctx, dataDir, workspaceID)
 	exp.ImplicatedPaths = intersectMentionedPaths(output, exp.ChangedFiles)
 	exp.Summary = summarizeFailure(exp)
 	// feed the outcome back into ranking: suppress the implicated paths of a failure.
@@ -128,8 +134,8 @@ func intersectMentionedPaths(output string, changed []string) []string {
 }
 
 // currentChangedFiles lists the working-tree changed paths (best-effort).
-func currentChangedFiles(dataDir, workspaceID string) []string {
-	raw, err := WorkspaceWorkingChanges(dataDir, workspaceID)
+func currentChangedFiles(ctx context.Context, dataDir, workspaceID string) []string {
+	raw, err := WorkspaceWorkingChangesCtx(ctx, dataDir, workspaceID)
 	if err != nil {
 		return nil
 	}

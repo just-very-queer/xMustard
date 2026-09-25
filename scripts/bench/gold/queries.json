@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "description": "Internal 12-query retrieval regression gate for xMustard (Go, Rust, TypeScript). Spans are 1-based inclusive definition lines in scripts/bench/gold/repo. Not a competitor-parity or task-success benchmark.",
+  "top_k": 5,
+  "pass_min": 11,
+  "queries": [
+    {"id": "go-session", "lang": "go", "kind": "search", "query": "ValidateSession session token", "gold": {"path": "auth/session.go", "span": [14, 20]}},
+    {"id": "go-bucket", "lang": "go", "kind": "search", "query": "TokenBucket rate limiter Allow", "gold": {"path": "ratelimit/bucket.go", "span": [5, 19]}},
+    {"id": "go-retry", "lang": "go", "kind": "search", "query": "RetryWithBackoff exponential backoff", "gold": {"path": "store/retry.go", "span": [5, 17]}},
+    {"id": "go-health", "lang": "go", "kind": "search", "query": "HandleHealthCheck liveness", "gold": {"path": "httpapi/handlers.go", "span": [5, 9]}},
+    {"id": "rs-config", "lang": "rust", "kind": "search", "query": "load_config configuration file", "gold": {"path": "src/config.rs", "span": [8, 12]}},
+    {"id": "rs-lru", "lang": "rust", "kind": "search", "query": "LruCache evict_oldest least recently used", "gold": {"path": "src/cache.rs", "span": [3, 17]}},
+    {"id": "rs-query", "lang": "rust", "kind": "search", "query": "parse_query_string", "gold": {"path": "src/parser.rs", "span": [3, 10]}},
+    {"id": "ts-route", "lang": "typescript", "kind": "search", "query": "matchRoute route path", "gold": {"path": "web/src/router.ts", "span": [6, 9]}},
+    {"id": "ts-currency", "lang": "typescript", "kind": "search", "query": "formatCurrency cents", "gold": {"path": "web/src/format.ts", "span": [1, 4]}},
+    {"id": "ts-debounce", "lang": "typescript", "kind": "search", "query": "debounce wait timer", "gold": {"path": "web/src/debounce.ts", "span": [1, 8]}},
+    {"id": "failure-only", "lang": "typescript", "kind": "failure_evidence",
+     "note": "The only evidence naming the defect is one FAIL line inside a long passing test log; the delivered projection must keep it and the original must page back exactly.",
+     "log": {"passing_lines": 3000, "fail_line": "FAIL web/src/checkout.test.ts > applyDiscount rounds half cents: expected 1001 received 1000 at web/src/checkout.ts:9"},
+     "gold": {"path": "web/src/checkout.ts", "span": [6, 10]}},
+    {"id": "contradiction", "lang": "go", "kind": "contradiction",
+     "note": "Two verified memories about store/retry.go disagree; path-focused recall must return both and report the conflict.",
+     "memories": ["RetryWithBackoff is called with 3 attempts by the sync job.", "RetryWithBackoff is called with 5 attempts by the sync job."],
+     "gold": {"path": "store/retry.go", "span": [5, 17]}}
+  ],
+  "coverage_fixtures": [
+    {"path": "gen/huge.go", "reason": "oversized", "note": "generated at run time, 9 MiB (over the 8 MiB read cap)"},
+    {"path": "web/src/broken.ts", "reason": "invalid_utf8", "note": "generated at run time with invalid UTF-8 bytes"}
+  ],
+  "one_file_edit": {"path": "web/src/api.ts", "append": "\n// fetchJson is used by the dashboard widgets.\n"},
+  "stale_probe": {"path": "store/legacy.go", "symbol": "LegacyFlushQueue"}
+}

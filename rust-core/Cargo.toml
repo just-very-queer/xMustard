@@ -40,3 +40,9 @@ tempfile = "3.23"
 # Opt-in neural semantic lane (local int8 ONNX via fastembed/ort); off by default to keep
 # the lean no-Docker / 50-100 MB profile. See search.rs onnx_embed (XM-PRO-012).
 semantic-onnx = ["dep:fastembed"]
+
+# Debug/test builds hash up to the 64 MiB identity budget; an unoptimized SHA-256 made
+# that regression take ~12 s. Optimizing only this dependency keeps tests about behavior.
+# Release builds are unaffected.
+[profile.dev.package.sha2]
+opt-level = 3

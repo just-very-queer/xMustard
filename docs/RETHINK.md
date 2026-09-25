@@ -1,5 +1,9 @@
 # xMustard Rethink — governed memory, not a platform (June 2026)
 
+> Historical working document, retained as evidence of earlier design and work.
+> Use [VISION.md](VISION.md), [STATUS.md](STATUS.md), and [ROADMAP.md](ROADMAP.md)
+> for current direction, verified behavior, and remaining work.
+
 The honest critique is correct: xMustard is **over-engineered and under-delivering**.
 It has breadth (39 MCP tools, ~196 REST routes, a symbol graph, a Postgres static
 index, RRF + a hashing embedding, a goal/swarm runtime, eval timelines, security

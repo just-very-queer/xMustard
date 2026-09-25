@@ -11,14 +11,18 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"xmustard/api-go/internal/budget"
 )
 
 const protocolVersion = "2024-11-05"
@@ -173,6 +177,7 @@ type rpcRequest struct {
 type rpcError struct {
 	Code    int    `json:"code"`
 	Message string `json:"message"`
+	Data    any    `json:"data,omitempty"`
 }
 
 type rpcResponse struct {
@@ -194,16 +199,42 @@ func callAPI(method, path, body string) (string, error) {
 // cancelled — the whole chain tears down instead of running an abandoned tool to
 // completion. The 9 tools are unchanged; only their transport became cancelable.
 func callAPICtx(ctx context.Context, method, path, body string) (string, error) {
-	var bodyReader io.Reader
-	if body != "" {
-		bodyReader = bytes.NewReader([]byte(body))
-	}
-	req, err := http.NewRequestWithContext(ctx, method, apiBase()+path, bodyReader)
+	resp, err := callAPIResp(ctx, method, path, body, nil)
 	if err != nil {
 		return "", err
 	}
+	if resp.status == http.StatusServiceUnavailable && strings.Contains(resp.body, `"overloaded":true`) {
+		return "", fmt.Errorf("API %s %s: %w", method, path, budget.ErrOverloaded)
+	}
+	if resp.status >= 400 {
+		return "", fmt.Errorf("API %s %s -> %d: %s", method, path, resp.status, strings.TrimSpace(resp.body))
+	}
+	return resp.body, nil
+}
+
+// apiResponse is one admitted API response.
+type apiResponse struct {
+	status int
+	header http.Header
+	body   string
+}
+
+// callAPIResp performs one API request with extra headers and returns the admitted
+// response whatever its status; transport, admission and size failures are errors.
+func callAPIResp(ctx context.Context, method, path, body string, headers map[string]string) (*apiResponse, error) {
+	var bodyReader io.Reader
+	if body != "" {
+		bodyReader = strings.NewReader(body) // no second copy of the argument payload
+	}
+	req, err := http.NewRequestWithContext(ctx, method, apiBase()+path, bodyReader)
+	if err != nil {
+		return nil, err
+	}
 	if body != "" {
 		req.Header.Set("Content-Type", "application/json")
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
 	}
 	// Each agent runs its own xmustard-mcp; XMUSTARD_API_TOKEN is that agent's
 	// bearer token, so the API resolves a real per-agent identity (and the
@@ -213,22 +244,28 @@ func callAPICtx(ctx context.Context, method, path, body string) (string, error) 
 	}
 	resp, err := httpClient().Do(req)
 	if err != nil {
-		return "", fmt.Errorf("xmustard API unreachable at %s (%w)", apiBase(), err)
+		return nil, fmt.Errorf("xmustard API unreachable at %s (%w)", apiBase(), err)
 	}
 	defer resp.Body.Close()
-	// Bound the response read: one stdio shim runs per agent, so an unbounded
-	// io.ReadAll here lets a huge/hostile API response allocate without limit (the
-	// egress analogue of the 8 MiB request framing cap, XM-PRO-009). A legitimate
-	// tool result never approaches this; past it we fail loudly rather than return
-	// truncated JSON the agent can't parse.
-	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
-	if len(respBody) > maxResponseBytes {
-		return "", fmt.Errorf("API %s %s response exceeded %d bytes; narrow the query", method, path, maxResponseBytes)
+	// Bound the response read: one stdio shim runs per agent, so an unbounded read lets
+	// a huge/hostile API response allocate without limit (the egress analogue of the
+	// 8 MiB request framing cap, XM-PRO-009). Bytes are reserved against the shim's
+	// transient pool before they are buffered and held until the reply is written;
+	// past the cap we fail loudly rather than return truncated JSON.
+	scope, owned := budget.ScopeFor(ctx)
+	if owned {
+		defer scope.Close()
 	}
-	if resp.StatusCode >= 400 {
-		return "", fmt.Errorf("API %s %s -> %d: %s", method, path, resp.StatusCode, strings.TrimSpace(string(respBody)))
+	raw, rerr := budget.ReadAllAdmitted(scope, resp.Body, maxResponseBytes)
+	switch {
+	case errors.Is(rerr, budget.ErrOverloaded):
+		return nil, fmt.Errorf("API %s %s: %w", method, path, budget.ErrOverloaded)
+	case errors.Is(rerr, budget.ErrTooLarge):
+		return nil, fmt.Errorf("API %s %s response exceeded %d bytes; narrow the query", method, path, maxResponseBytes)
+	case rerr != nil:
+		return nil, fmt.Errorf("API %s %s: read response: %w", method, path, rerr)
 	}
-	return string(respBody), nil
+	return &apiResponse{status: resp.StatusCode, header: resp.Header, body: string(raw)}, nil
 }
 
 // maxResponseBytes bounds a single API response the MCP shim will buffer.
@@ -300,21 +337,58 @@ func callTool(name string, args map[string]string) map[string]any {
 }
 
 func callToolCtx(ctx context.Context, name string, args map[string]string) map[string]any {
+	res, _ := callToolChecked(ctx, name, args)
+	return res
+}
+
+// callToolChecked is callToolCtx that also reports admission refusal (from this shim
+// or the API) so dispatch can answer with a JSON-RPC overload error instead of a
+// tool result.
+func callToolChecked(ctx context.Context, name string, args map[string]string) (map[string]any, *rpcError) {
 	t, ok := toolByName(name)
 	if !ok {
-		return mcpText(fmt.Sprintf("unknown tool %q", name), true)
+		return mcpText(fmt.Sprintf("unknown tool %q", name), true), nil
 	}
 	for _, r := range t.Required {
 		if strings.TrimSpace(args[r]) == "" {
-			return mcpText(fmt.Sprintf("missing required argument %q for %s", r, name), true)
+			return mcpText(fmt.Sprintf("missing required argument %q for %s", r, name), true), nil
 		}
 	}
-	method, path, reqBody := t.Build(args)
-	respBody, err := callAPICtx(ctx, method, path, reqBody)
-	if err != nil {
-		return mcpText(err.Error(), true)
+	// Building the request copies argument text (JSON body marshal + string): reserve
+	// it before it is allocated.
+	var argBytes int64
+	for _, v := range args {
+		argBytes += int64(len(v))
 	}
-	return mcpText(respBody, false)
+	if scope, owned := budget.ScopeFor(ctx); !owned {
+		if err := scope.Acquire(2 * argBytes); err != nil {
+			return nil, overloadError(err)
+		}
+	} else {
+		scope.Close() // no request ledger (direct callers/tests): nothing to hold
+	}
+	method, path, reqBody := t.Build(args)
+	resp, err := callAPIResp(ctx, method, path, reqBody, deliveryHeaders(ctx))
+	if errors.Is(err, budget.ErrOverloaded) {
+		return nil, overloadError(err)
+	}
+	if err != nil {
+		return mcpText(err.Error(), true), nil
+	}
+	if resp.status == http.StatusServiceUnavailable && strings.Contains(resp.body, `"overloaded":true`) {
+		return nil, overloadError(budget.ErrOverloaded)
+	}
+	if resp.status == http.StatusOK && resp.header.Get(deliveryHeader) == deliveryVersion {
+		return evidenceResult(ctx, resp.body, args["workspace_id"])
+	}
+	if resp.status >= 400 {
+		return mcpText(fmt.Sprintf("API %s %s -> %d: %s", method, path, resp.status, strings.TrimSpace(resp.body)), true), nil
+	}
+	// the reply text and its encoding copy the body again: reserve before building it
+	if err := reserveReply(ctx, len(resp.body)); err != nil {
+		return nil, overloadError(err)
+	}
+	return mcpText(resp.body, false), nil
 }
 
 // buildArgs strictly validates the raw tools/call arguments against a tool's
@@ -390,12 +464,20 @@ func dispatchCtx(ctx context.Context, method string, params json.RawMessage) (an
 	case "initialize":
 		return map[string]any{
 			"protocolVersion": protocolVersion,
-			"capabilities":    map[string]any{"tools": map[string]any{}},
+			"capabilities":    map[string]any{"tools": map[string]any{}, "resources": map[string]any{}},
 			"serverInfo":      map[string]any{"name": "xmustard", "version": "0.1.0"},
 		}, nil
 	case "tools/list":
 		return toolsListResult(), nil
 	case "tools/call":
+		// decoding arguments copies their text once more: reserve before decoding
+		if scope, owned := budget.ScopeFor(ctx); !owned {
+			if err := scope.Acquire(int64(len(params))); err != nil {
+				return nil, overloadError(err)
+			}
+		} else {
+			scope.Close()
+		}
 		dec := json.NewDecoder(bytes.NewReader(params))
 		dec.DisallowUnknownFields() // reject stray top-level fields instead of ignoring them
 		var p struct {
@@ -420,12 +502,40 @@ func dispatchCtx(ctx context.Context, method string, params json.RawMessage) (an
 		if rerr != nil {
 			return nil, rerr
 		}
-		return callToolCtx(ctx, p.Name, args), nil
+		res, oerr := callToolChecked(ctx, p.Name, args)
+		if oerr != nil {
+			return nil, oerr
+		}
+		return res, nil
 	case "ping":
 		return map[string]any{}, nil
+	case "resources/list":
+		return resourcesListResult(), nil
+	case "resources/templates/list":
+		return resourceTemplatesResult(), nil
+	case "resources/read":
+		return readResource(ctx, params)
 	default:
 		return nil, &rpcError{Code: -32601, Message: "method not found: " + method}
 	}
+}
+
+// overloadCode is the JSON-RPC server-error code used for admission refusal.
+const overloadCode = -32000
+
+func overloadError(err error) *rpcError {
+	return &rpcError{Code: overloadCode, Message: err.Error()}
+}
+
+// maxInflight bounds concurrently outstanding id-bearing requests; beyond it the shim
+// answers immediately with an overload error instead of starting another worker.
+func maxInflight() int {
+	if v := strings.TrimSpace(os.Getenv("XMUSTARD_MCP_MAX_INFLIGHT")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 8
 }
 
 // maxMessageBytes bounds a single newline-delimited JSON-RPC message. Without it,
@@ -437,20 +547,90 @@ const maxMessageBytes = 8 << 20
 // the line exceeds the cap it is drained to the newline and reported truncated, so a
 // hostile huge frame stays bounded instead of allocating without limit.
 func readBoundedLine(r *bufio.Reader) (line []byte, truncated bool, err error) {
+	f := readAdmittedLine(r, nil)
+	return f.line, f.truncated, f.err
+}
+
+// frame is one newline-delimited request as read under admission.
+type frame struct {
+	line      []byte
+	probe     []byte // first idProbeBytes of the frame (fixed, for recovering the id)
+	truncated bool   // exceeded maxMessageBytes; drained, not buffered
+	refused   bool   // the transient pool refused it; drained, not buffered
+	headroom  bool   // pool refused, but it fit the fixed control headroom (see below)
+	err       error
+}
+
+const idProbeBytes = 1024
+
+// controlHeadroom lets a small frame through when the pool is saturated, so a client
+// can still cancel (notifications/cancelled) or ping while calls hold the pool. Frames
+// are read one at a time, so this is a fixed 4 KiB, not a second pool; only
+// notifications and ping are serviced from it — anything else is refused with its id.
+const controlHeadroom = 4 << 10
+
+// readAdmittedLine reads one frame, reserving each chunk in scope BEFORE appending it.
+// A frame over maxMessageBytes, or one the pool refuses, is drained to its newline
+// without being buffered. scope nil means unadmitted (tests of the framing alone).
+func readAdmittedLine(r *bufio.Reader, scope *budget.Scope) frame {
+	var f frame
 	for {
 		chunk, e := r.ReadSlice('\n')
 		if len(chunk) > 0 {
-			if len(line)+len(chunk) <= maxMessageBytes {
-				line = append(line, chunk...)
-			} else {
-				truncated = true // keep draining to the newline, discard the overflow
+			if room := idProbeBytes - len(f.probe); room > 0 {
+				f.probe = append(f.probe, chunk[:min(room, len(chunk))]...)
+			}
+			switch {
+			case f.truncated || f.refused:
+			case len(f.line)+len(chunk) > maxMessageBytes:
+				f.truncated, f.line = true, nil
+			case f.headroom || (scope != nil && scope.Acquire(int64(len(chunk))) != nil):
+				if len(f.line)+len(chunk) <= controlHeadroom {
+					f.headroom = true
+					f.line = append(f.line, chunk...)
+				} else {
+					f.refused, f.headroom, f.line = true, false, nil
+				}
+			default:
+				f.line = append(f.line, chunk...)
 			}
 		}
 		if e == bufio.ErrBufferFull {
 			continue
 		}
-		return line, truncated, e
+		f.err = e
+		return f
 	}
+}
+
+// probeID recovers the TOP-LEVEL JSON-RPC id from the bounded prefix of a frame that
+// was not decoded, by parsing the prefix's top-level members in order. If the id is
+// not reached and fully parsed inside the prefix, it returns nil (a null-id error):
+// guessing could correlate the error with a different live call.
+func probeID(probe []byte) json.RawMessage {
+	dec := json.NewDecoder(bytes.NewReader(probe))
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
+		return nil
+	}
+	for dec.More() {
+		key, err := dec.Token()
+		if err != nil {
+			return nil
+		}
+		var val json.RawMessage
+		if err := dec.Decode(&val); err != nil {
+			return nil // value runs past the prefix (or is malformed)
+		}
+		if key == "id" {
+			var s string
+			var n json.Number
+			if json.Unmarshal(val, &s) == nil || json.Unmarshal(val, &n) == nil {
+				return val
+			}
+			return nil
+		}
+	}
+	return nil
 }
 
 // inflight tracks cancel funcs for in-progress requests by their JSON-RPC id, so an MCP
@@ -512,21 +692,54 @@ func main() {
 		sendMu.Unlock()
 	}
 	inflight := newInflight()
+	slots := make(chan struct{}, maxInflight())
 	var workers sync.WaitGroup
 	defer workers.Wait()
 
 	for {
-		raw, truncated, err := readBoundedLine(reader)
-		line := []byte(strings.TrimSpace(string(raw)))
-		if truncated {
+		// Every frame is admitted against the shim's transient pool before it is
+		// buffered, again before it is decoded (the decoded params are a second copy),
+		// and the reservation is held by the worker until its reply is written.
+		scope := budget.NewScope(nil)
+		f := readAdmittedLine(reader, scope)
+		err := f.err
+		line := bytes.TrimSpace(f.line)
+		if f.truncated {
+			scope.Close()
 			// can't trust the (partial) body to parse an id; reply with a null-id error.
 			send(rpcResponse{JSONRPC: "2.0", Error: &rpcError{Code: -32600, Message: "request exceeds max message size"}})
-		} else if len(line) > 0 {
+		} else if f.headroom {
+			// served from the fixed control headroom: only control frames proceed
+			scope.Close()
 			var req rpcRequest
-			if jsonErr := json.Unmarshal(line, &req); jsonErr != nil {
+			if json.Unmarshal(line, &req) != nil {
+				send(rpcResponse{JSONRPC: "2.0", Error: &rpcError{Code: -32700, Message: "parse error"}})
+			} else if len(req.ID) == 0 && strings.HasPrefix(req.Method, "notifications/") {
+				if req.Method == "notifications/cancelled" {
+					if id, ok := cancelledRequestID(req.Params); ok {
+						inflight.cancel(id)
+					}
+				}
+			} else if req.Method == "ping" {
+				send(rpcResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{}})
+			} else {
+				send(rpcResponse{JSONRPC: "2.0", ID: req.ID, Error: overloadError(budget.ErrOverloaded)})
+			}
+		} else if f.refused || (len(line) > 0 && scope.Acquire(int64(len(line))) != nil) {
+			scope.Close()
+			send(rpcResponse{JSONRPC: "2.0", ID: probeID(f.probe), Error: overloadError(budget.ErrOverloaded)})
+		} else if len(line) == 0 {
+			scope.Close()
+		} else {
+			var req rpcRequest
+			jsonErr := json.Unmarshal(line, &req)
+			f.line, line = nil, nil // the raw frame is no longer referenced
+			if jsonErr != nil {
+				scope.Close()
 				// malformed JSON → structured parse error rather than a silent drop.
 				send(rpcResponse{JSONRPC: "2.0", Error: &rpcError{Code: -32700, Message: "parse error"}})
 			} else if len(req.ID) == 0 && strings.HasPrefix(req.Method, "notifications/") {
+				scope.Close()
 				// notifications have no id and expect no response. A cancellation aborts
 				// the matching in-flight request so the loop stays responsive to it.
 				if req.Method == "notifications/cancelled" {
@@ -539,12 +752,24 @@ func main() {
 				// context registered by id, so the read loop keeps reading (and can
 				// service a cancellation) while the tool call is outstanding. JSON-RPC
 				// permits out-of-order responses; the client matches by id.
-				ctx, cancel := context.WithCancel(context.Background())
+				select {
+				case slots <- struct{}{}:
+				default:
+					scope.Close()
+					send(rpcResponse{JSONRPC: "2.0", ID: req.ID, Error: &rpcError{Code: overloadCode,
+						Message: fmt.Sprintf("xmustard overloaded: %d requests already in flight; retry shortly", cap(slots))}})
+					continue // a final frame at EOF is followed by an empty EOF read
+				}
+				// The worker owns the frame's ledger (ingress, decode, argument and
+				// response bytes) until its reply is sent.
+				ctx, cancel := context.WithCancel(withCallID(budget.WithScope(context.Background(), scope), req.ID))
 				idKey := string(req.ID)
 				inflight.add(idKey, cancel)
 				workers.Add(1)
 				go func(req rpcRequest) {
 					defer workers.Done()
+					defer func() { <-slots }()
+					defer scope.Close()
 					defer inflight.done(idKey)
 					defer cancel()
 					result, rerr := dispatchCtx(ctx, req.Method, req.Params)

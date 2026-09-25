@@ -136,6 +136,10 @@ type PathSymbolsResult struct {
 	SymbolRows      []SymbolMaterializationRecord           `json:"symbol_rows,omitempty"`
 	Warnings        []string                                `json:"warnings"`
 	GeneratedAt     string                                  `json:"generated_at"`
+	// TotalSymbols / SymbolsTruncated pass through the Rust extractor's completeness;
+	// nil (omitted) on paths that do not use that extractor, e.g. live LSP symbols.
+	TotalSymbols     *int  `json:"total_symbols,omitempty"`
+	SymbolsTruncated *bool `json:"symbols_truncated,omitempty"`
 }
 
 type FileSymbolSummaryMaterializationRecord struct {
@@ -485,21 +489,28 @@ func ReadPathSymbols(dataDir string, workspaceID string, relativePath string) (*
 		return nil, err
 	}
 	return &PathSymbolsResult{
-		WorkspaceID:     workspaceID,
-		Path:            rustResult.Path,
-		SymbolSource:    rustResult.SymbolSource,
-		ParserLanguage:  rustResult.ParserLanguage,
-		EvidenceSource:  rustResult.EvidenceSource,
-		SelectionReason: rustResult.SelectionReason,
-		Symbols:         convertRustPathSymbols(rustResult.Symbols),
-		FileSummaryRow:  convertRustFileSummaryRow(rustResult.FileSummaryRow),
-		SymbolRows:      convertRustSymbolRows(rustResult.SymbolRows),
-		Warnings:        rustResult.Warnings,
-		GeneratedAt:     rustResult.GeneratedAt,
+		WorkspaceID:      workspaceID,
+		Path:             rustResult.Path,
+		SymbolSource:     rustResult.SymbolSource,
+		ParserLanguage:   rustResult.ParserLanguage,
+		EvidenceSource:   rustResult.EvidenceSource,
+		SelectionReason:  rustResult.SelectionReason,
+		Symbols:          convertRustPathSymbols(rustResult.Symbols),
+		FileSummaryRow:   convertRustFileSummaryRow(rustResult.FileSummaryRow),
+		SymbolRows:       convertRustSymbolRows(rustResult.SymbolRows),
+		Warnings:         rustResult.Warnings,
+		GeneratedAt:      rustResult.GeneratedAt,
+		TotalSymbols:     &rustResult.TotalSymbols,
+		SymbolsTruncated: &rustResult.SymbolsTruncated,
 	}, nil
 }
 
 func ExplainPath(dataDir string, workspaceID string, relativePath string) (*CodeExplainerResult, error) {
+	return ExplainPathCtx(context.Background(), dataDir, workspaceID, relativePath)
+}
+
+// ExplainPathCtx is the request-scoped variant: cancelling ctx kills its Rust/tool children.
+func ExplainPathCtx(ctx context.Context, dataDir string, workspaceID string, relativePath string) (*CodeExplainerResult, error) {
 	snapshot, err := loadSnapshot(dataDir, workspaceID)
 	if err != nil {
 		return nil, err
@@ -508,7 +519,7 @@ func ExplainPath(dataDir string, workspaceID string, relativePath string) (*Code
 	if err != nil {
 		return nil, err
 	}
-	rustResult, err := readRustPathExplanation(workspaceID, snapshot.Workspace.RootPath, normalized)
+	rustResult, err := readRustPathExplanation(ctx, workspaceID, snapshot.Workspace.RootPath, normalized)
 	if err != nil {
 		return nil, err
 	}
@@ -997,8 +1008,8 @@ func readRustPathSymbols(workspaceID string, rootPath string, relativePath strin
 	return rustcore.ExtractPathSymbols(ctx, workspaceID, rootPath, relativePath)
 }
 
-func readRustPathExplanation(workspaceID string, rootPath string, relativePath string) (*rustcore.CodeExplainerResult, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+func readRustPathExplanation(ctx context.Context, workspaceID string, rootPath string, relativePath string) (*rustcore.CodeExplainerResult, error) {
+	ctx, cancel := context.WithTimeout(ctx, 90*time.Second)
 	defer cancel()
 	return rustcore.ExplainPath(ctx, workspaceID, rootPath, relativePath)
 }

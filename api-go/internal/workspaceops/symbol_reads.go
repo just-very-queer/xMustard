@@ -88,6 +88,13 @@ func ReadDocumentSymbols(dataDir string, workspaceID string, relativePath string
 	if err != nil {
 		return nil, err
 	}
+	return documentSymbolsResult(result), nil
+}
+
+// documentSymbolsResult maps a live LSP documentSymbol answer. The path-symbols
+// extraction-completeness fields (total_symbols / symbols_truncated) describe the
+// Rust extractor, not a language server, so they are omitted here rather than zeroed.
+func documentSymbolsResult(result *rustcore.DocumentSymbolsResult) *PathSymbolsResult {
 	return &PathSymbolsResult{
 		WorkspaceID:     result.WorkspaceID,
 		Path:            result.Path,
@@ -98,7 +105,7 @@ func ReadDocumentSymbols(dataDir string, workspaceID string, relativePath string
 		Symbols:         convertRustDocumentSymbols(result.Symbols),
 		Warnings:        result.Warnings,
 		GeneratedAt:     result.GeneratedAt,
-	}, nil
+	}
 }
 
 func readWorkspaceSymbolRows(dsn string, schema string, workspaceID string, query string, limit int) ([]MaterializedSymbolRecord, error) {

@@ -1,0 +1,259 @@
+{
+ "suite": "rss-bench",
+ "passed": 6,
+ "failed": 2,
+ "checks": [
+  {
+   "check": "cold query finds symbol_070 (beyond the old 32/64 caps)",
+   "ok": true,
+   "detail": ""
+  },
+  {
+   "check": "two concurrent index clients both answer",
+   "ok": true,
+   "detail": ""
+  },
+  {
+   "check": "capture payloads are exactly 16 MiB",
+   "ok": true,
+   "detail": "16777216 bytes x5"
+  },
+  {
+   "check": "at least one 16 MiB capture refused by admission (503)",
+   "ok": false,
+   "detail": "[200, 200, -1, 200, 200]"
+  },
+  {
+   "check": "admitted captures succeed",
+   "ok": true,
+   "detail": "[200, 200, -1, 200, 200]"
+  },
+  {
+   "check": "transient pool in-use never exceeded its max",
+   "ok": true,
+   "detail": "{\"in_use\": 0, \"max\": 67108864, \"peak\": 67108864}"
+  },
+  {
+   "check": "helper-child limit held",
+   "ok": true,
+   "detail": "admission peak 2/4, sampled concurrent xmustard-core 2"
+  },
+  {
+   "check": "sampled xMustard-owned tree peak <= 100 MB",
+   "ok": false,
+   "detail": "134.1 MB (127.8 MiB) over 347 samples"
+  }
+ ],
+ "results": {
+  "fixture": {
+   "tracked_files": 501,
+   "bytes": 21179988
+  },
+  "admission": {
+   "capture_codes": [
+    200,
+    200,
+    -1,
+    200,
+    200
+   ],
+   "transient_pool": {
+    "in_use": 0,
+    "max": 67108864,
+    "peak": 67108864
+   },
+   "children": {
+    "cap": 4,
+    "in_use": 0,
+    "peak": 2
+   }
+  },
+  "rusage": "self_maxrss=39157760 children_maxrss=60080128 unit=bytes self_cpu_s=21.821 children_cpu_s=27.300 go_total_alloc_bytes=429446120 go_mallocs=8955265 go_heap_sys_bytes=36962304",
+  "sampled_tree": {
+   "peak_bytes": 134053888,
+   "peak_mb": 134.1,
+   "peak_mib": 127.8,
+   "samples": 347,
+   "interval_ms": 100,
+   "breakdown_at_peak_kib": {
+    "xmustard-core": 74928,
+    "xmustard-api": 36208,
+    "xmustard-mcp": 19776
+   },
+   "max_single_process_sampled_peak_kib_by_command": {
+    "(git)": 4416,
+    "xmustard-mcp": 10336,
+    "xmustard-api": 38240,
+    "xmustard-core": 58528,
+    "(xmustard-core)": 23136
+   },
+   "max_concurrent_xmustard_core": 2,
+   "peak_step": "two concurrent index clients",
+   "step_sampled_peak_mb": {
+    "load workspace (initial scan)": 45.8,
+    "index baseline": 54.5,
+    "cold query symbol_070": 111.1,
+    "warm query symbol_070": 76.7,
+    "same-size dirty edit": 107.3,
+    "rename/delete cycle": 107.4,
+    "two concurrent index clients": 134.1,
+    "five concurrent 16 MiB captures": 57.9
+   }
+  },
+  "steps": [
+   {
+    "step": "load workspace (initial scan)",
+    "seconds": 0.379
+   },
+   {
+    "step": "index baseline",
+    "seconds": 16.849
+   },
+   {
+    "step": "cold query symbol_070",
+    "seconds": 10.943
+   },
+   {
+    "step": "warm query symbol_070",
+    "seconds": 0.391
+   },
+   {
+    "step": "same-size dirty edit",
+    "seconds": 0.453
+   },
+   {
+    "step": "rename/delete cycle",
+    "seconds": 0.398
+   },
+   {
+    "step": "index client 2 (concurrent)",
+    "seconds": 0.453
+   },
+   {
+    "step": "index client 1 (concurrent)",
+    "seconds": 0.46
+   },
+   {
+    "step": "five concurrent 16 MiB captures",
+    "seconds": 7.107
+   }
+  ],
+  "work": {
+   "cold query symbol_070": {
+    "graph_cache": "miss",
+    "lock": "acquired",
+    "lock_wait_ms": 0,
+    "lock_contended": false,
+    "identity_passes": 2,
+    "identity_files_hashed": 0,
+    "identity_bytes_hashed": 0,
+    "files_read": 501,
+    "bytes_read": 21179988,
+    "files_parsed": 501,
+    "bytes_parsed": 21179988,
+    "files_reused": 0,
+    "symbols_extracted": 29737,
+    "symbols_indexed": 29737,
+    "coverage_losses": 0,
+    "stale_temps_removed": 0,
+    "elapsed_ms": 10677
+   },
+   "warm query symbol_070": {
+    "graph_cache": "hit",
+    "lock": "not_used",
+    "lock_wait_ms": 0,
+    "lock_contended": false,
+    "identity_passes": 1,
+    "identity_files_hashed": 0,
+    "identity_bytes_hashed": 0,
+    "files_read": 0,
+    "bytes_read": 0,
+    "files_parsed": 0,
+    "bytes_parsed": 0,
+    "files_reused": 0,
+    "symbols_extracted": 0,
+    "symbols_indexed": 29737,
+    "coverage_losses": 0,
+    "stale_temps_removed": 0,
+    "elapsed_ms": 98
+   },
+   "same-size dirty edit": {
+    "graph_cache": "miss",
+    "lock": "acquired",
+    "lock_wait_ms": 0,
+    "lock_contended": false,
+    "identity_passes": 2,
+    "identity_files_hashed": 2,
+    "identity_bytes_hashed": 84336,
+    "files_read": 1,
+    "bytes_read": 42168,
+    "files_parsed": 1,
+    "bytes_parsed": 42168,
+    "files_reused": 500,
+    "symbols_extracted": 56,
+    "symbols_indexed": 29737,
+    "coverage_losses": 0,
+    "stale_temps_removed": 0,
+    "elapsed_ms": 206
+   },
+   "rename/delete cycle": {
+    "graph_cache": "miss",
+    "lock": "acquired",
+    "lock_wait_ms": 0,
+    "lock_contended": false,
+    "identity_passes": 2,
+    "identity_files_hashed": 4,
+    "identity_bytes_hashed": 168672,
+    "files_read": 1,
+    "bytes_read": 42168,
+    "files_parsed": 1,
+    "bytes_parsed": 42168,
+    "files_reused": 498,
+    "symbols_extracted": 56,
+    "symbols_indexed": 29625,
+    "coverage_losses": 0,
+    "stale_temps_removed": 0,
+    "elapsed_ms": 197
+   },
+   "index client 2 (concurrent)": {
+    "graph_cache": "miss",
+    "lock": "acquired",
+    "lock_wait_ms": 0,
+    "lock_contended": false,
+    "identity_passes": 2,
+    "identity_files_hashed": 6,
+    "identity_bytes_hashed": 253010,
+    "files_read": 2,
+    "bytes_read": 84337,
+    "files_parsed": 2,
+    "bytes_parsed": 84337,
+    "files_reused": 497,
+    "symbols_extracted": 112,
+    "symbols_indexed": 29625,
+    "coverage_losses": 0,
+    "stale_temps_removed": 0,
+    "elapsed_ms": 248
+   },
+   "index client 1 (concurrent)": {
+    "graph_cache": "hit",
+    "lock": "acquired",
+    "lock_wait_ms": 203,
+    "lock_contended": true,
+    "identity_passes": 1,
+    "identity_files_hashed": 3,
+    "identity_bytes_hashed": 126505,
+    "files_read": 0,
+    "bytes_read": 0,
+    "files_parsed": 0,
+    "bytes_parsed": 0,
+    "files_reused": 0,
+    "symbols_extracted": 0,
+    "symbols_indexed": 29625,
+    "coverage_losses": 0,
+    "stale_temps_removed": 0,
+    "elapsed_ms": 265
+   }
+  },
+  "hardware_memory_bandwidth": "unmeasured"
+ }
+}

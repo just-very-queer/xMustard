@@ -122,7 +122,30 @@ func UpdateSettings(dataDir string, settings AppSettings) (*AppSettings, error) 
 	return GetSettings(dataDir)
 }
 
+// DetectRuntimes lists agent runtimes with LIVE model detection (bounded child
+// processes) and refreshes the cached model list that scans report.
 func DetectRuntimes(dataDir string) ([]RuntimeCapabilities, error) {
+	return detectRuntimes(dataDir, true)
+}
+
+// DetectRuntimesCached lists agent runtimes without launching any agent CLI: binary
+// availability comes from settings/PATH and model lists from the last live detection.
+// Workspace scans use it so loading a repository never starts an external agent.
+func DetectRuntimesCached(dataDir string) ([]RuntimeCapabilities, error) {
+	return detectRuntimes(dataDir, false)
+}
+
+type runtimeModelsCache struct {
+	OpencodeBinary string   `json:"opencode_binary"`
+	OpencodeModels []string `json:"opencode_models"`
+	DetectedAt     string   `json:"detected_at"`
+}
+
+func runtimeModelsCachePath(dataDir string) string {
+	return filepath.Join(dataDir, "runtime_models_cache.json")
+}
+
+func detectRuntimes(dataDir string, live bool) ([]RuntimeCapabilities, error) {
 	settings, err := loadSettings(dataDir)
 	if err != nil {
 		return nil, err
@@ -135,7 +158,17 @@ func DetectRuntimes(dataDir string) ([]RuntimeCapabilities, error) {
 	}
 	opencodeModels := []RuntimeModel{}
 	if opencodeBin != "" {
-		for _, model := range detectOpencodeModels(opencodeBin) {
+		var ids []string
+		if live {
+			ids = detectOpencodeModels(opencodeBin)
+			_ = writeJSON(runtimeModelsCachePath(dataDir), runtimeModelsCache{OpencodeBinary: opencodeBin, OpencodeModels: ids, DetectedAt: nowUTC()})
+		} else {
+			var cache runtimeModelsCache
+			if readJSON(runtimeModelsCachePath(dataDir), &cache) == nil && cache.OpencodeBinary == opencodeBin {
+				ids = cache.OpencodeModels
+			}
+		}
+		for _, model := range ids {
 			opencodeModels = append(opencodeModels, RuntimeModel{Runtime: "opencode", ID: model})
 		}
 	}

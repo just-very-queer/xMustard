@@ -1,5 +1,9 @@
 # Rust Core And Go API Migration
 
+> Historical working document, retained as evidence of earlier design and work.
+> Use [VISION.md](VISION.md), [STATUS.md](STATUS.md), and [ROADMAP.md](ROADMAP.md)
+> for current direction, verified behavior, and remaining work.
+
 This document turns the existing "move backend-heavy subsystems toward Rust" roadmap into a concrete implementation lane for this repo.
 
 ## Current State

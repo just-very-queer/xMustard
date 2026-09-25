@@ -1,8 +1,13 @@
 package budget
 
 import (
+	"bytes"
+	"context"
+	"errors"
+	"math"
 	"sync"
 	"testing"
+	"time"
 )
 
 // The shared byte budget bounds AGGREGATE in-flight bytes: concurrent acquirers can't
@@ -35,26 +40,85 @@ func TestByteBudgetBoundsAggregate(t *testing.T) {
 	}
 }
 
-// Charge (internal accounting) raises usage and applies BACKPRESSURE to Acquire (external
-// admission) — so internal subsystems holding memory cause new external load to be shed,
-// without the internal op itself being rejected.
-func TestChargeAccountsAndPressuresAcquire(t *testing.T) {
+// A Scope holds reservations until Close (idempotent) and refuses, reserving nothing,
+// once the pool is full — there is no unconditional charge path any more.
+func TestScopeEnforcesAndReleasesOnClose(t *testing.T) {
 	b := NewByteBudget(100)
-	b.Charge(80) // internal subsystem reserves 80 unconditionally
-	if b.InUse() != 80 {
-		t.Fatalf("charge should account 80, got %d", b.InUse())
+	s := NewScope(b)
+	if err := s.Acquire(80); err != nil {
+		t.Fatalf("80 should fit: %v", err)
 	}
-	if b.Acquire(30) {
-		t.Fatalf("external admission must be shed: 80+30 > 100")
+	if err := s.Acquire(30); !errors.Is(err, ErrOverloaded) {
+		t.Fatalf("80+30 > 100 must be refused with ErrOverloaded, got %v", err)
 	}
-	if !b.Acquire(20) {
-		t.Fatalf("80+20 == 100 should still admit")
+	if b.InUse() != 80 || s.Held() != 80 {
+		t.Fatalf("refusal must reserve nothing: pool=%d scope=%d", b.InUse(), s.Held())
 	}
-	b.Release(80)
-	b.Release(20)
+	s.Close()
+	s.Close()
 	if b.InUse() != 0 {
-		t.Fatalf("all released, used should be 0, got %d", b.InUse())
+		t.Fatalf("close must release everything once, in use=%d", b.InUse())
 	}
+	if err := s.Acquire(1); err == nil {
+		t.Fatalf("a closed scope must not reserve")
+	}
+}
+
+// Scope release runs on panic when deferred, as the HTTP middleware relies on.
+func TestScopeReleasedOnPanic(t *testing.T) {
+	b := NewByteBudget(100)
+	func() {
+		defer func() { _ = recover() }()
+		s := NewScope(b)
+		defer s.Close()
+		_ = s.Acquire(50)
+		panic("handler panic")
+	}()
+	if b.InUse() != 0 {
+		t.Fatalf("panic leaked %d bytes", b.InUse())
+	}
+}
+
+// CaptureWriter never buffers past max, never reserves past max, reserves before it
+// buffers, and stops (rather than pretending to accept) once over the cap or refused.
+func TestCaptureWriterBoundsReservesAndStops(t *testing.T) {
+	b := NewByteBudget(1 << 30)
+	s := NewScope(b)
+	c := NewCaptureWriter(s, 1024)
+	chunk := bytes.Repeat([]byte("y"), 300)
+	var err error
+	for i := 0; i < 10 && err == nil; i++ {
+		_, err = c.Write(chunk)
+	}
+	if err == nil || !c.Over() || c.Len() > 1024 || s.Held() > 1024 {
+		t.Fatalf("over=%v len=%d held=%d err=%v", c.Over(), c.Len(), s.Held(), err)
+	}
+	small := NewByteBudget(500)
+	c2 := NewCaptureWriter(NewScope(small), 1<<20)
+	_, err = c2.Write(bytes.Repeat([]byte("z"), 600))
+	if err == nil || !c2.Refused() || c2.Len() != 0 || small.InUse() != 0 {
+		t.Fatalf("600 bytes under a 500-byte pool: refused=%v len=%d inuse=%d", c2.Refused(), c2.Len(), small.InUse())
+	}
+}
+
+// ChildLimit admits at most n concurrent holders and refuses after the bounded wait.
+func TestChildLimitBoundsConcurrency(t *testing.T) {
+	l := NewChildLimit(2, 20*time.Millisecond)
+	r1, err1 := l.Acquire(context.Background())
+	r2, err2 := l.Acquire(context.Background())
+	if err1 != nil || err2 != nil {
+		t.Fatalf("two slots should be free: %v %v", err1, err2)
+	}
+	if _, err := l.Acquire(context.Background()); !errors.Is(err, ErrOverloaded) {
+		t.Fatalf("third holder must be refused with ErrOverloaded, got %v", err)
+	}
+	r1()
+	r3, err := l.Acquire(context.Background())
+	if err != nil {
+		t.Fatalf("released slot must be reusable: %v", err)
+	}
+	r2()
+	r3()
 }
 
 // Under heavy concurrency the invariant holds: InUse never exceeds Max, and the number of
@@ -83,5 +147,24 @@ func TestByteBudgetConcurrentNeverExceedsMax(t *testing.T) {
 	}
 	if b.Peak() > max {
 		t.Fatalf("peak exceeded max: %d > %d", b.Peak(), max)
+	}
+}
+
+// Root review: used+n can overflow int64, admitting a MaxInt64 reservation once any
+// byte is in use (HTTP ContentLength is int64). Capacity must be compared safely.
+func TestAcquireRejectsOverflowingReservation(t *testing.T) {
+	b := NewByteBudget(100)
+	if !b.Acquire(1) {
+		t.Fatal("1 byte should fit")
+	}
+	if b.Acquire(math.MaxInt64) {
+		t.Fatalf("MaxInt64 admitted after 1 byte: used=%d", b.InUse())
+	}
+	if b.InUse() != 1 {
+		t.Fatalf("refusal must reserve nothing, used=%d", b.InUse())
+	}
+	s := NewScope(b)
+	if err := s.Acquire(math.MaxInt64); !errors.Is(err, ErrOverloaded) {
+		t.Fatalf("scope must refuse MaxInt64: %v", err)
 	}
 }

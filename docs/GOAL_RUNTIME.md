@@ -1,5 +1,9 @@
 # Goal Runtime
 
+> Historical working document, retained as evidence of earlier design and work.
+> Use [VISION.md](VISION.md), [STATUS.md](STATUS.md), and [ROADMAP.md](ROADMAP.md)
+> for current direction, verified behavior, and remaining work.
+
 `/goal` adds a durable objective layer above individual issue runs and ad hoc agent prompts.
 
 The feature is intentionally small. It does not try to become a second chat thread manager, a full autonomous runtime, or a swarm scheduler. It records what the operator is trying to achieve, what proof is expected, what file surface is allowed, which runtime/model is preferred, and which evidence has been collected.

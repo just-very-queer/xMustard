@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -16,6 +18,7 @@ import (
 	"time"
 
 	"xmustard/api-go/internal/budget"
+	"xmustard/api-go/internal/rustcore"
 	"xmustard/api-go/internal/workspaceops"
 )
 
@@ -40,11 +43,604 @@ func main() {
 		return
 	}
 
-	mux := http.NewServeMux()
+	cfg := loadServerConfig(dataDir())
+	if err := validateStartup(cfg); err != nil {
+		log.Fatal(err)
+	}
+	// Every request context derives from baseCtx, which shutdown cancels after the
+	// bounded drain so in-flight helper children end with the API.
+	baseCtx, cancelBase := context.WithCancel(context.Background())
+	defer cancelBase()
+	srv := &http.Server{
+		Addr:        cfg.addr(),
+		Handler:     buildHandler(cfg, newAPIHandler()),
+		BaseContext: func(net.Listener) context.Context { return baseCtx },
+		// Bound slow/oversized clients so a few connections can't pin goroutines/FDs
+		// (XM-NEW-019). Read/Write are generous because agent runs can be long, but
+		// header + idle timeouts defeat slowloris and leaked keep-alives.
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       120 * time.Second,
+		WriteTimeout:      300 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20,
+	}
+	// Graceful shutdown on SIGINT/SIGTERM. main owns the join: ListenAndServe returns
+	// as soon as Shutdown closes the listener, so main must wait for the drain below
+	// (interrupted-run persistence, worker/terminal teardown, service close) to finish
+	// before the process exits.
+	shutdownDone := make(chan struct{})
+	go func() {
+		defer close(shutdownDone)
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+		<-sigCh
+		log.Printf("shutdown: signal received; draining")
+		ctx, cancel := context.WithTimeout(context.Background(), shutdownDrain())
+		defer cancel()
+		// 1. stop admissions + drain in-flight HTTP (bounded), then cancel every
+		//    request context and kill owned helper children still running: they are
+		//    in their own process groups and would otherwise outlive the API.
+		_ = srv.Shutdown(ctx)
+		cancelBase()
+		if n := rustcore.KillActiveChildren(); n > 0 {
+			log.Printf("shutdown: killed %d in-flight helper children", n)
+		}
+		// 2. workload-aware drain: persist+reap runs, close terminals, flush the PG
+		//    mirror — bounded so a stuck flush can't wedge exit.
+		done := make(chan struct{})
+		go func() {
+			workspaceops.ShutdownInFlight(dataDir())
+			close(done)
+		}()
+		select {
+		case <-done:
+			log.Printf("shutdown: in-flight work drained")
+		case <-time.After(10 * time.Second):
+			log.Printf("shutdown: in-flight drain exceeded budget; closing anyway")
+		}
+		// 3. close services.
+		workspaceops.ClosePgPool()
+		log.Printf("shutdown: services closed")
+	}()
+	log.Printf("xmustard api-go listening on %s (tls=%v)", cfg.addr(), cfg.hasTLS())
+	var serveErr error
+	if cfg.hasTLS() {
+		serveErr = srv.ListenAndServeTLS(cfg.tlsCert, cfg.tlsKey)
+	} else {
+		serveErr = srv.ListenAndServe()
+	}
+	if serveErr != nil && serveErr != http.ErrServerClosed {
+		log.Fatal(serveErr)
+	}
+	<-shutdownDone
+	// per-process high-water of waited-for children (diagnostic, not a tree peak)
+	log.Printf("shutdown: %s", childHighWater())
+	log.Printf("shutdown: complete")
+}
+
+// shutdownDrain bounds how long shutdown waits for in-flight requests before
+// cancelling them (XMUSTARD_SHUTDOWN_DRAIN_SECONDS, default 15).
+func shutdownDrain() time.Duration {
+	if v, err := strconv.Atoi(strings.TrimSpace(os.Getenv("XMUSTARD_SHUTDOWN_DRAIN_SECONDS"))); err == nil && v > 0 {
+		return time.Duration(v) * time.Second
+	}
+	return 15 * time.Second
+}
+
+// serverConfig is the startup configuration read from the environment.
+type serverConfig struct {
+	host              string
+	port              string
+	authMode          string // auto | required | off
+	authConfigured    bool   // at least one bearer credential exists
+	tlsCert, tlsKey   string
+	allowInsecureBind bool
+	coreOnly          bool
+	dataDir           string
+}
+
+func loadServerConfig(dataDir string) serverConfig {
+	return serverConfig{
+		// Bind to loopback by default. The API makes server-side requests (providers),
+		// so it should not be exposed on all interfaces unless the operator opts in.
+		host: envDefault("XMUSTARD_API_HOST", "127.0.0.1"),
+		// Default to 8042 to match the MCP bridge's API target (XM-NEW-001).
+		port:              envDefault("XMUSTARD_API_PORT", "8042"),
+		authMode:          strings.ToLower(strings.TrimSpace(envDefault("XMUSTARD_AUTH", "auto"))),
+		authConfigured:    workspaceops.HasAuthConfigured(dataDir),
+		tlsCert:           os.Getenv("XMUSTARD_API_TLS_CERT"),
+		tlsKey:            os.Getenv("XMUSTARD_API_TLS_KEY"),
+		allowInsecureBind: os.Getenv("XMUSTARD_ALLOW_INSECURE_BIND") == "1",
+		coreOnly:          os.Getenv("XMUSTARD_CORE_ONLY") == "1",
+		dataDir:           dataDir,
+	}
+}
+
+func (c serverConfig) addr() string   { return net.JoinHostPort(c.host, c.port) }
+func (c serverConfig) hasTLS() bool   { return c.tlsCert != "" && c.tlsKey != "" }
+func (c serverConfig) loopback() bool { return isLoopbackHost(c.host) }
+
+// isLoopbackHost reports whether host names only the loopback interface. Anything
+// else — including the unspecified 0.0.0.0/:: and unresolvable names — is treated as
+// an exposed bind.
+func isLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(strings.Trim(host, "[]"))
+	return ip != nil && ip.IsLoopback()
+}
+
+// validateStartup is the fail-closed startup interlock:
+//   - XMUSTARD_AUTH must be auto, required or off;
+//   - required without configured credentials is refused on every bind (it would
+//     reject every caller, or tempt an operator to weaken it);
+//   - a non-loopback bind requires XMUSTARD_AUTH=required AND configured credentials
+//     (off is always fatal there, whatever tokens or overrides exist) AND transport
+//     security (TLS, or the explicit insecure-bind override for a TLS-terminating proxy).
+func validateStartup(c serverConfig) error {
+	switch c.authMode {
+	case "auto", "required", "off":
+	default:
+		return fmt.Errorf("invalid XMUSTARD_AUTH=%q; use auto, required or off", c.authMode)
+	}
+	if c.authMode == "required" && !c.authConfigured {
+		return fmt.Errorf("XMUSTARD_AUTH=required but no credentials are configured; run `xmustard-api mint-token <id> admin` first")
+	}
+	if c.loopback() {
+		return nil
+	}
+	if c.authMode != "required" {
+		return fmt.Errorf("refusing non-loopback bind %s with XMUSTARD_AUTH=%s; set XMUSTARD_AUTH=required and mint credentials", c.host, c.authMode)
+	}
+	if !c.hasTLS() && !c.allowInsecureBind {
+		return fmt.Errorf("refusing non-loopback bind without TLS; set XMUSTARD_API_TLS_CERT/KEY, or XMUSTARD_ALLOW_INSECURE_BIND=1 if TLS is terminated by a front proxy")
+	}
+	return nil
+}
+
+// buildHandler wraps the route table in the configured middleware stack.
+func buildHandler(c serverConfig, api http.Handler) http.Handler {
+	handler := api
+	if c.coreOnly {
+		// Lean production surface: expose only the governed-memory + grounding +
+		// search core (the paths the 9 MCP tools + auth use), 404 everything else.
+		// The full platform surface stays available when this is unset (for the UI).
+		handler = coreOnlyMiddleware(handler)
+		log.Printf("surface: CORE_ONLY — platform routes disabled")
+	}
+	if c.authMode != "off" {
+		handler = authMiddleware(c.dataDir, c.authMode, handler)
+		if c.authMode == "required" || c.authConfigured {
+			log.Printf("auth: ENFORCED (mode=%s, bearer token required)", c.authMode)
+		} else {
+			log.Printf("auth: open — no tokens configured (mode=%s); unauthenticated callers collapse to one identity. Mint a token to enforce.", c.authMode)
+		}
+	} else {
+		log.Printf("auth: DISABLED (XMUSTARD_AUTH=off; loopback only)")
+	}
+	// Cap every request body so a hostile/buggy client can't drive unbounded memory
+	// by POSTing a huge payload — the HTTP analogue of the MCP stdio framing cap
+	// (readBoundedLine). Outermost wrap so it applies before any handler reads the body.
+	return bodyLimitMiddleware(handler)
+}
+
+// --- auth middleware + principal helpers ---
+
+type ctxKey string
+
+const principalCtxKey ctxKey = "principal"
+
+func principalFromContext(ctx context.Context) *workspaceops.Principal {
+	p, _ := ctx.Value(principalCtxKey).(*workspaceops.Principal)
+	return p
+}
+
+// roleRank orders the role hierarchy: admin > agent > readonly. Used so a gate for
+// "agent" is satisfied by admin too, and "readonly" by everyone authenticated.
+func roleRank(role string) int {
+	switch role {
+	case "admin":
+		return 3
+	case "agent":
+		return 2
+	case "readonly":
+		return 1
+	default:
+		return 0
+	}
+}
+
+// requireRole enforces a minimum role for an endpoint (admin > agent > readonly).
+// In open mode (no auth configured) it allows the operation locally; once auth is
+// configured the middleware has already rejected unauthenticated requests. A denied
+// authenticated request is recorded in the auth-audit log.
+func requireRole(w http.ResponseWriter, r *http.Request, role string) bool {
+	dd := envDefault("XMUSTARD_DATA_DIR", "../backend/data")
+	p := principalFromContext(r.Context())
+	if p == nil {
+		if !workspaceops.HasAuthConfigured(dd) {
+			return true
+		}
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "authentication required"})
+		return false
+	}
+	if roleRank(p.Role) < roleRank(role) {
+		workspaceops.RecordAuthAudit(dd, workspaceops.AuthAuditEvent{
+			Action:     "denied",
+			Actor:      p.ID,
+			Detail:     role + " role required (have " + p.Role + ")",
+			Method:     r.Method,
+			Path:       r.URL.Path,
+			RemoteAddr: r.RemoteAddr,
+		})
+		writeJSON(w, http.StatusForbidden, map[string]any{"error": role + " role required"})
+		return false
+	}
+	return true
+}
+
+// coreWorkspaceSubpaths are the EXACT per-workspace subpaths the 9 MCP tools hit
+// (the part after /api/workspaces/{id}/). Matching these exactly — rather than by
+// substring — is what makes CORE_ONLY a real allowlist: a substring gate over
+// "/context"/"/search"/"/diagnostics" would also admit /context-replays,
+// /goals/{id}/context, /pg/search, /diagnostics/run, etc. (XM-PRO-011).
+var coreWorkspaceSubpaths = map[string]bool{
+	"session-grounding":   true, // ground
+	"context":             true, // remember (POST)
+	"context/active":      true, // recall
+	"search":              true, // search
+	"explain-path":        true, // explain
+	"changes/since-index": true, // impact
+	"diagnostics":         true, // diagnostics
+	"evidence":            true, // evidence capture (Pi) / workspace revocation
+}
+
+// isCorePath reports whether p is one of the exact routes the lean 9-tool agent
+// surface uses. CORE_ONLY 404s everything else, so the deployed attack surface
+// matches the product claim, not a substring gate over ~200 handlers.
+func isCorePath(p string) bool {
+	if p == "/api/health" || p == "/api/workspaces" || strings.HasPrefix(p, "/api/auth/") {
+		return true
+	}
+	const wsPrefix = "/api/workspaces/"
+	if !strings.HasPrefix(p, wsPrefix) {
+		return false
+	}
+	rest := p[len(wsPrefix):]
+	slash := strings.IndexByte(rest, '/')
+	if slash < 0 {
+		return false // /api/workspaces/{id} with no tool subpath
+	}
+	sub := rest[slash+1:] // subpath after the workspace id
+	if coreWorkspaceSubpaths[sub] {
+		return true
+	}
+	// the two parameterized core routes: context/{entry_id}/verify, runs/{run_id}/why-failed
+	if seg := strings.Split(sub, "/"); len(seg) == 3 {
+		if seg[0] == "context" && seg[2] == "verify" {
+			return true // verify
+		}
+		if seg[0] == "runs" && seg[2] == "why-failed" {
+			return true // why_failed
+		}
+	}
+	if seg := strings.Split(sub, "/"); len(seg) == 2 && seg[0] == "evidence" {
+		return true // evidence expansion / revocation
+	}
+	return false
+}
+
+// maxRequestBodyBytes bounds any single HTTP request body. ReadTimeout +
+// MaxHeaderBytes bound time and headers only; without this a single multi-GB POST
+// (e.g. to /context or /settings) is decoded into memory unbounded — the same OOM
+// class the MCP framing path explicitly caps. Generous enough for real diagnostics/
+// eval payloads; a body past the cap is cut off and the handler's decode surfaces a
+// clean error (the malformed-body -> 400 path) instead of the server allocating.
+const maxRequestBodyBytes = 32 << 20 // 32 MiB
+
+// maxRequestBodyBytesConfigured returns the per-request body cap, operator-tunable
+// via XMUSTARD_MAX_BODY_BYTES (so a tight-RSS deployment can lower it without a
+// rebuild). Defaults to maxRequestBodyBytes.
+func maxRequestBodyBytesConfigured() int64 {
+	if v := strings.TrimSpace(os.Getenv("XMUSTARD_MAX_BODY_BYTES")); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			return n
+		}
+	}
+	return maxRequestBodyBytes
+}
+
+// bodyInFlight bounds the number of body-bearing requests decoded concurrently, so
+// the aggregate in-flight body memory is at most cap × maxInFlight rather than
+// cap × (unbounded concurrent agents) — a single 32 MiB cap alone cannot hold the
+// 50–100 MB RSS target under fan-in (XM-PRO-008). Tunable via XMUSTARD_MAX_INFLIGHT_BODIES.
+// (Per-endpoint limits + decoded-object amplification remain follow-on work.)
+var bodyInFlight = make(chan struct{}, inFlightBodyLimit())
+
+func inFlightBodyLimit() int {
+	if v := strings.TrimSpace(os.Getenv("XMUSTARD_MAX_INFLIGHT_BODIES")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 12
+}
+
+// bodyBudgetThreshold: only requests declaring (or hiding, via chunked encoding) a
+// body larger than this acquire an in-flight slot. Normal small requests — tool
+// calls, memory proposals, run starts — are never throttled, and a long-running
+// request with a tiny body never holds a slot. This targets the actual memory risk
+// (large concurrent uploads) without affecting throughput.
+const bodyBudgetThreshold = 1 << 20 // 1 MiB
+
+func bodyLimitMiddleware(next http.Handler) http.Handler {
+	limit := maxRequestBodyBytesConfigured()
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Every request gets a transient-byte ledger held until the handler returns
+		// (deferred, so success, error, cancellation and panic all release it). Rust
+		// captures and other streamed reads made under r.Context() reserve into it.
+		scope := budget.NewScope(nil)
+		defer scope.Close()
+		r = r.WithContext(budget.WithScope(r.Context(), scope))
+		if r.Body == nil || r.Body == http.NoBody {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if r.ContentLength > limit {
+			// permanently too large: 413, not a retryable overload
+			writeJSON(w, http.StatusRequestEntityTooLarge, map[string]any{"error": "request body too large"})
+			return
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, limit)
+		if r.ContentLength > bodyBudgetThreshold || r.ContentLength < 0 {
+			select {
+			case bodyInFlight <- struct{}{}:
+				defer func() { <-bodyInFlight }()
+			case <-r.Context().Done():
+				http.Error(w, "request cancelled while waiting for in-flight body budget", 499)
+				return
+			}
+		}
+		// Reserve the body before any handler reads it. A declared length is reserved
+		// up front; an unknown (chunked) length is read here chunk by chunk under
+		// admission, so a refusal is still a protocol-correct 503 (or 413 past the cap)
+		// rather than a handler decode error.
+		if r.ContentLength > 0 {
+			if err := scope.Acquire(r.ContentLength); err != nil {
+				writeOverloaded(w)
+				return
+			}
+		} else if r.ContentLength < 0 {
+			raw, err := budget.ReadAllAdmitted(scope, r.Body, int(limit))
+			switch {
+			case errors.Is(err, budget.ErrOverloaded):
+				writeOverloaded(w)
+				return
+			case err != nil:
+				writeJSON(w, http.StatusRequestEntityTooLarge, map[string]any{"error": "request body too large"})
+				return
+			}
+			r.Body = io.NopCloser(bytes.NewReader(raw))
+			r.ContentLength = int64(len(raw))
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// writeOverloaded is the protocol-correct admission refusal: 503 + Retry-After.
+func writeOverloaded(w http.ResponseWriter) {
+	w.Header().Set("Retry-After", "1")
+	writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": budget.ErrOverloaded.Error(), "overloaded": true})
+}
+
+func coreOnlyMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !isCorePath(r.URL.Path) {
+			writeJSON(w, http.StatusNotFound, map[string]any{"error": "endpoint disabled in CORE_ONLY mode"})
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func authMiddleware(dataDir, mode string, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/health" { // health stays public for liveness probes
+			next.ServeHTTP(w, r)
+			return
+		}
+		token := ""
+		if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
+			token = strings.TrimPrefix(h, "Bearer ")
+		}
+		// single read of the token store yields both the principal and whether auth
+		// is configured (was two reads per request).
+		principal, configured := workspaceops.ResolveAuth(dataDir, token)
+		enforce := mode == "required" || configured
+		if enforce && principal == nil {
+			workspaceops.RecordAuthAudit(dataDir, workspaceops.AuthAuditEvent{
+				Action:     "denied",
+				Actor:      "anonymous",
+				Detail:     "missing/invalid/expired bearer token",
+				Method:     r.Method,
+				Path:       r.URL.Path,
+				RemoteAddr: r.RemoteAddr,
+			})
+			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "authentication required: provide Authorization: Bearer <token>"})
+			return
+		}
+		// readonly principals may only read.
+		if principal != nil && principal.Role == "readonly" && r.Method != http.MethodGet {
+			workspaceops.RecordAuthAudit(dataDir, workspaceops.AuthAuditEvent{
+				Action:     "denied",
+				Actor:      principal.ID,
+				Detail:     "readonly principal cannot " + r.Method,
+				Method:     r.Method,
+				Path:       r.URL.Path,
+				RemoteAddr: r.RemoteAddr,
+			})
+			writeJSON(w, http.StatusForbidden, map[string]any{"error": "readonly principal cannot " + r.Method})
+			return
+		}
+		// workspace scope: a scoped (per-worker) token may only touch its workspaces.
+		// Unscoped tokens (the default) are unrestricted, so this is backward-compatible.
+		if principal != nil {
+			if wsID := workspaceIDFromPath(r.URL.Path); wsID != "" && !principal.AllowsWorkspace(wsID) {
+				workspaceops.RecordAuthAudit(dataDir, workspaceops.AuthAuditEvent{
+					Action: "denied", Actor: principal.ID,
+					Detail: "workspace " + wsID + " not in token scope",
+					Method: r.Method, Path: r.URL.Path, RemoteAddr: r.RemoteAddr,
+				})
+				writeJSON(w, http.StatusForbidden, map[string]any{"error": "token not scoped to workspace " + wsID})
+				return
+			}
+		}
+		if principal == nil {
+			next.ServeHTTP(w, r)
+			return
+		}
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), principalCtxKey, principal)))
+	})
+}
+
+// requireTerminalScope enforces that the authenticated principal may touch
+// workspaceID. Terminal routes live under /api/terminal (outside /api/workspaces/),
+// so the path-based middleware scope check (workspaceIDFromPath) never fires for
+// them and a workspace-scoped token could otherwise open/read/write another
+// workspace's shell by passing its workspace_id in the body/query (XM-PRO-001).
+// Writes 400 on an empty id, 403 on an out-of-scope token; returns false if handled.
+func requireTerminalScope(w http.ResponseWriter, r *http.Request, dataDir, workspaceID string) bool {
+	workspaceID = strings.TrimSpace(workspaceID)
+	if workspaceID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "workspace_id is required"})
+		return false
+	}
+	if p := principalFromContext(r.Context()); p != nil && !p.AllowsWorkspace(workspaceID) {
+		workspaceops.RecordAuthAudit(dataDir, workspaceops.AuthAuditEvent{
+			Action: "denied", Actor: p.ID,
+			Detail: "workspace " + workspaceID + " not in token scope (terminal)",
+			Method: r.Method, Path: r.URL.Path, RemoteAddr: r.RemoteAddr,
+		})
+		writeJSON(w, http.StatusForbidden, map[string]any{"error": "token not scoped to workspace " + workspaceID})
+		return false
+	}
+	return true
+}
+
+// httpStatusForClass maps a typed domain-error class to an HTTP status. Status now
+// follows the error TYPE, not its English wording (XM-PRO-013).
+func httpStatusForClass(c workspaceops.ErrorClass) int {
+	switch c {
+	case workspaceops.ClassInvalidInput:
+		return http.StatusBadRequest
+	case workspaceops.ClassNotFound:
+		return http.StatusNotFound
+	case workspaceops.ClassConflict:
+		return http.StatusConflict
+	case workspaceops.ClassUnavailable:
+		return http.StatusServiceUnavailable
+	default:
+		return http.StatusInternalServerError
+	}
+}
+
+// respondError is the single error->HTTP mapper the per-handler substring classifiers
+// converge on. A typed DomainError uses its class (and for the internal class the
+// wrapped detail stays server-side); os.ErrNotExist -> 404; IsInvalidInput -> 400;
+// anything else -> 500 with the raw message (the legacy fallback still being migrated).
+func respondError(w http.ResponseWriter, err error) {
+	if err == nil {
+		return
+	}
+	if errors.Is(err, budget.ErrOverloaded) {
+		writeOverloaded(w)
+		return
+	}
+	if de, ok := workspaceops.AsDomainError(err); ok {
+		if de.Class == workspaceops.ClassInternal {
+			log.Printf("internal error: %v", err) // detail logged, not disclosed
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal error"})
+			return
+		}
+		writeJSON(w, httpStatusForClass(de.Class), map[string]any{"error": de.Public})
+		return
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "Missing resource"})
+		return
+	}
+	if workspaceops.IsInvalidInput(err) {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+}
+
+// workspaceIDFromPath extracts {id} from /api/workspaces/{id}/... ("" if not such a path).
+func workspaceIDFromPath(p string) string {
+	const prefix = "/api/workspaces/"
+	if !strings.HasPrefix(p, prefix) {
+		return ""
+	}
+	rest := p[len(prefix):]
+	if i := strings.IndexByte(rest, '/'); i >= 0 {
+		return rest[:i]
+	}
+	return rest
+}
+
+func envDefault(name string, fallback string) string {
+	value := os.Getenv(name)
+	if value == "" {
+		return fallback
+	}
+	return value
+}
+
+func splitCSV(value string) []string {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+	parts := strings.Split(value, ",")
+	items := make([]string, 0, len(parts))
+	for _, part := range parts {
+		trimmed := strings.TrimSpace(part)
+		if trimmed != "" {
+			items = append(items, trimmed)
+		}
+	}
+	if len(items) == 0 {
+		return nil
+	}
+	return items
+}
+
+func writeJSON(w http.ResponseWriter, status int, payload any) {
+	w.Header().Set("Content-Type", "application/json")
+	// Rust results arrive already encoded: write them as-is instead of re-encoding
+	// (the encoder compacts into a second growing buffer — a full extra copy of
+	// multi-MB results, measured as the API's retained-heap peak on the index step).
+	if raw, ok := payload.(json.RawMessage); ok && json.Valid(raw) {
+		w.WriteHeader(status)
+		_, _ = w.Write(raw)
+		_, _ = w.Write([]byte("\n"))
+		return
+	}
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(payload)
+}
+
+// registerRoutes mounts every HTTP route on mux. It is separate from main so tests
+// can exercise the real route table through httptest.
+func registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"status":  "ok",
 			"service": "api-go",
+			// admission counters (bench/diagnostics): bytes xMustard reserved, not RSS
+			"transient_pool": map[string]any{"max": budget.TransientBytes.Max(), "in_use": budget.TransientBytes.InUse(), "peak": budget.TransientBytes.Peak()},
+			"children":       map[string]any{"cap": budget.Children.Cap(), "in_use": budget.Children.InUse(), "peak": budget.Children.Peak()},
 		})
 	})
 	mux.HandleFunc("GET /api/runtimes", func(w http.ResponseWriter, r *http.Request) {
@@ -94,7 +690,6 @@ func main() {
 		}
 		writeJSON(w, http.StatusOK, result)
 	})
-	dataDir := func() string { return envDefault("XMUSTARD_DATA_DIR", "../backend/data") }
 	// --- auth: token admin (admin-gated) + whoami ---
 	mux.HandleFunc("GET /api/auth/whoami", func(w http.ResponseWriter, r *http.Request) {
 		if p := principalFromContext(r.Context()); p != nil {
@@ -1601,7 +2196,8 @@ func main() {
 	})
 	mux.HandleFunc("GET /api/workspaces/{workspace_id}/diagnostics", func(w http.ResponseWriter, r *http.Request) {
 		workspaceID := r.PathValue("workspace_id")
-		result, err := workspaceops.ReadDiagnostics(
+		result, err := workspaceops.ReadDiagnosticsCtx(
+			r.Context(),
 			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
 			workspaceID,
 			r.URL.Query().Get("diagnostic_run_id"),
@@ -1619,9 +2215,7 @@ func main() {
 				})
 				return
 			}
-			writeJSON(w, http.StatusInternalServerError, map[string]any{
-				"error": err.Error(),
-			})
+			respondError(w, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, result)
@@ -2016,7 +2610,8 @@ func main() {
 	})
 	mux.HandleFunc("GET /api/workspaces/{workspace_id}/explain-path", func(w http.ResponseWriter, r *http.Request) {
 		workspaceID := r.PathValue("workspace_id")
-		result, err := workspaceops.ExplainPath(
+		result, err := workspaceops.ExplainPathCtx(
+			r.Context(),
 			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
 			workspaceID,
 			r.URL.Query().Get("path"),
@@ -2033,9 +2628,7 @@ func main() {
 				writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 				return
 			}
-			writeJSON(w, http.StatusInternalServerError, map[string]any{
-				"error": err.Error(),
-			})
+			respondError(w, err)
 			return
 		}
 		// enrich with the file's community cluster (its functional neighbourhood),
@@ -3182,14 +3775,14 @@ func main() {
 		// ?from=&to= → shortest dependency path; otherwise the dirty-symbols view.
 		switch {
 		case q.Get("from") != "" && q.Get("to") != "":
-			result, err := workspaceops.TraceSymbols(dd, ws, q.Get("from"), q.Get("to"))
+			result, err := workspaceops.TraceSymbolsCtx(r.Context(), dd, ws, q.Get("from"), q.Get("to"))
 			issueIntel(w, err, result)
 		case q.Get("symbol") != "":
 			depth, _ := strconv.Atoi(q.Get("depth"))
-			result, err := workspaceops.SymbolImpact(dd, ws, q.Get("symbol"), depth)
+			result, err := workspaceops.SymbolImpactCtx(r.Context(), dd, ws, q.Get("symbol"), depth)
 			issueIntel(w, err, result)
 		default:
-			result, err := workspaceops.WorkspaceChangesSinceIndex(dd, ws)
+			result, err := workspaceops.WorkspaceChangesSinceIndexCtx(r.Context(), dd, ws)
 			issueIntel(w, err, result)
 		}
 	})
@@ -3217,29 +3810,39 @@ func main() {
 	})
 	// --- context governance: propose / verify / active shared context ---
 	mux.HandleFunc("GET /api/workspaces/{workspace_id}/context", func(w http.ResponseWriter, r *http.Request) {
+		// Every filter of this list (including the default "all") returns complete
+		// memory history with content, so it is administrative; agents use the
+		// bounded recall (GET context/active).
+		if !requireRole(w, r, "admin") {
+			return
+		}
 		result, err := workspaceops.ListContextEntries(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), r.URL.Query().Get("filter"))
 		issueIntel(w, err, result)
 	})
 	mux.HandleFunc("GET /api/workspaces/{workspace_id}/context/active", func(w http.ResponseWriter, r *http.Request) {
 		dd := envDefault("XMUSTARD_DATA_DIR", "../backend/data")
 		q := r.URL.Query()
-		// ranked recall when a query/paths signal is present; full active set otherwise.
-		if q.Get("query") != "" || q.Get("paths") != "" {
-			var paths []string
-			if q.Get("paths") != "" {
-				paths = strings.Split(q.Get("paths"), ",")
+		// The complete promoted history (every entry, every drift hash) is an explicit
+		// administrative read; the agent-facing recall is always bounded and ranked.
+		if q.Get("scope") == "all" {
+			if !requireRole(w, r, "admin") {
+				return
 			}
-			limit := 8
-			if v := q.Get("limit"); v != "" {
-				if n, err := strconv.Atoi(v); err == nil {
-					limit = n
-				}
-			}
-			result, err := workspaceops.RecallContext(dd, r.PathValue("workspace_id"), q.Get("query"), paths, limit)
+			result, err := workspaceops.GetActiveContext(dd, r.PathValue("workspace_id"))
 			issueIntel(w, err, result)
 			return
 		}
-		result, err := workspaceops.GetActiveContext(dd, r.PathValue("workspace_id"))
+		var paths []string
+		if q.Get("paths") != "" {
+			paths = strings.Split(q.Get("paths"), ",")
+		}
+		limit := 0
+		if v := q.Get("limit"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n > 0 {
+				limit = min(n, maxRecallLimit) // clamp: recall stays bounded
+			}
+		}
+		result, err := workspaceops.RecallContextCtx(r.Context(), dd, r.PathValue("workspace_id"), q.Get("query"), paths, limit)
 		issueIntel(w, err, result)
 	})
 	mux.HandleFunc("POST /api/workspaces/{workspace_id}/context", func(w http.ResponseWriter, r *http.Request) {
@@ -3355,7 +3958,7 @@ func main() {
 		switch {
 		case r.URL.Query().Get("mode") == "pattern":
 			// structural AST search: the query is an ast-grep pattern (e.g. `$A && $A()`).
-			pat, perr := workspaceops.SearchSemanticPattern(dd, r.PathValue("workspace_id"), query, r.URL.Query().Get("lang"), r.URL.Query().Get("path"), limit)
+			pat, perr := workspaceops.SearchSemanticPatternCtx(r.Context(), dd, r.PathValue("workspace_id"), query, r.URL.Query().Get("lang"), r.URL.Query().Get("path"), limit)
 			if perr != nil {
 				issueIntel(w, perr, nil)
 				return
@@ -3367,7 +3970,7 @@ func main() {
 		default:
 			// default search fuses the agent-feedback boost and records retrieval.
 			// optional ?seed=<symbol> activates the graph-proximity lane.
-			result, err = workspaceops.WorkspaceSearchWithFeedback(dd, r.PathValue("workspace_id"), query, r.URL.Query().Get("seed"), limit)
+			result, err = workspaceops.WorkspaceSearchWithFeedbackCtx(r.Context(), dd, r.PathValue("workspace_id"), query, r.URL.Query().Get("seed"), limit)
 		}
 		issueIntel(w, err, result)
 	})
@@ -3478,7 +4081,7 @@ func main() {
 		issueIntel(w, err, result)
 	})
 	mux.HandleFunc("GET /api/workspaces/{workspace_id}/session-grounding", func(w http.ResponseWriter, r *http.Request) {
-		result, err := workspaceops.BuildSessionGrounding(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))
+		result, err := workspaceops.BuildSessionGroundingCtx(r.Context(), envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))
 		issueIntel(w, err, result)
 	})
 	// --- run confidence, owner suggestions, ownership, eval timeline, ticket ingest, guidance customization ---
@@ -3487,7 +4090,7 @@ func main() {
 		issueIntel(w, err, result)
 	})
 	mux.HandleFunc("GET /api/workspaces/{workspace_id}/runs/{run_id}/why-failed", func(w http.ResponseWriter, r *http.Request) {
-		result, err := workspaceops.ExplainRunFailure(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), r.PathValue("run_id"))
+		result, err := workspaceops.ExplainRunFailureCtx(r.Context(), envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), r.PathValue("run_id"))
 		issueIntel(w, err, result)
 	})
 	mux.HandleFunc("GET /api/workspaces/{workspace_id}/issues/{issue_id}/owner-suggestions", func(w http.ResponseWriter, r *http.Request) {
@@ -3721,460 +4324,10 @@ func main() {
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 	})
-
-	// Bind to loopback by default. The API makes server-side requests (providers),
-	// so it should not be exposed on all interfaces unless the operator opts in via
-	// XMUSTARD_API_HOST=0.0.0.0 — and if they do, auth tokens must be configured.
-	host := envDefault("XMUSTARD_API_HOST", "127.0.0.1")
-	authMode := strings.ToLower(envDefault("XMUSTARD_AUTH", "auto"))
-	isLoopback := host == "127.0.0.1" || host == "localhost" || host == "::1"
-	tlsCert, tlsKey := os.Getenv("XMUSTARD_API_TLS_CERT"), os.Getenv("XMUSTARD_API_TLS_KEY")
-	hasTLS := tlsCert != "" && tlsKey != ""
-	allowInsecureBind := os.Getenv("XMUSTARD_ALLOW_INSECURE_BIND") == "1"
-	// Fail-closed on a non-loopback bind: requires auth AND transport security.
-	// XMUSTARD_AUTH=off does not satisfy this interlock; disabling auth and exposing
-	// the interface are separate opt-ins.
-	if !isLoopback {
-		if authMode != "required" && !workspaceops.HasAuthConfigured(dataDir()) {
-			log.Fatal("refusing non-loopback bind without auth; run `xmustard-api mint-token <id> admin` or set XMUSTARD_AUTH=required")
-		}
-		if !hasTLS && !allowInsecureBind {
-			log.Fatal("refusing non-loopback bind without TLS; set XMUSTARD_API_TLS_CERT/KEY, or XMUSTARD_ALLOW_INSECURE_BIND=1 if TLS is terminated by a front proxy")
-		}
-	}
-	var handler http.Handler = mux
-	if os.Getenv("XMUSTARD_CORE_ONLY") == "1" {
-		// Lean production surface: expose only the governed-memory + grounding +
-		// search core (the paths the 9 MCP tools + auth use), 404 everything else.
-		// The full platform surface stays available when this is unset (for the UI).
-		handler = coreOnlyMiddleware(handler)
-		log.Printf("surface: CORE_ONLY — platform routes disabled")
-	}
-	if authMode != "off" {
-		handler = authMiddleware(dataDir(), authMode, handler)
-		if authMode == "required" || workspaceops.HasAuthConfigured(dataDir()) {
-			log.Printf("auth: ENFORCED (mode=%s, bearer token required)", authMode)
-		} else {
-			log.Printf("auth: open — no tokens configured (mode=%s); unauthenticated callers collapse to one identity. Mint a token to enforce.", authMode)
-		}
-	} else {
-		log.Printf("auth: DISABLED (XMUSTARD_AUTH=off)")
-	}
-	// Cap every request body so a hostile/buggy client can't drive unbounded memory
-	// by POSTing a huge payload — the HTTP analogue of the MCP stdio framing cap
-	// (readBoundedLine). Outermost wrap so it applies before any handler reads the body.
-	handler = bodyLimitMiddleware(handler)
-	// Default to 8042 to match the MCP bridge's API target (XM-NEW-001) and
-	// AGENTS.md ("an HTTP shell on :8042"); override with XMUSTARD_API_PORT.
-	addr := host + ":" + envDefault("XMUSTARD_API_PORT", "8042")
-	srv := &http.Server{
-		Addr:    addr,
-		Handler: handler,
-		// Bound slow/oversized clients so a few connections can't pin goroutines/FDs
-		// (XM-NEW-019). Read/Write are generous because agent runs can be long, but
-		// header + idle timeouts defeat slowloris and leaked keep-alives.
-		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       120 * time.Second,
-		WriteTimeout:      300 * time.Second,
-		IdleTimeout:       120 * time.Second,
-		MaxHeaderBytes:    1 << 20,
-	}
-	// Graceful shutdown on SIGINT/SIGTERM so a restart doesn't orphan in-flight work.
-	go func() {
-		sigCh := make(chan os.Signal, 1)
-		signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
-		<-sigCh
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		defer cancel()
-		// 1. stop admissions + drain in-flight HTTP.
-		_ = srv.Shutdown(ctx)
-		// 2. workload-aware drain: persist+reap runs, close terminals, flush the PG
-		//    mirror — bounded so a stuck flush can't wedge exit.
-		done := make(chan struct{})
-		go func() {
-			workspaceops.ShutdownInFlight(dataDir())
-			close(done)
-		}()
-		select {
-		case <-done:
-		case <-time.After(10 * time.Second):
-			log.Printf("shutdown: in-flight drain exceeded budget; closing anyway")
-		}
-		// 3. close services.
-		workspaceops.ClosePgPool()
-	}()
-	log.Printf("xmustard api-go listening on %s (tls=%v)", addr, hasTLS)
-	var serveErr error
-	if hasTLS {
-		serveErr = srv.ListenAndServeTLS(tlsCert, tlsKey)
-	} else {
-		serveErr = srv.ListenAndServe()
-	}
-	if serveErr != nil && serveErr != http.ErrServerClosed {
-		log.Fatal(serveErr)
-	}
 }
 
-// --- auth middleware + principal helpers ---
+// maxRecallLimit caps a caller-supplied recall limit so the bounded path stays bounded.
+const maxRecallLimit = 50
 
-type ctxKey string
-
-const principalCtxKey ctxKey = "principal"
-
-func principalFromContext(ctx context.Context) *workspaceops.Principal {
-	p, _ := ctx.Value(principalCtxKey).(*workspaceops.Principal)
-	return p
-}
-
-// roleRank orders the role hierarchy: admin > agent > readonly. Used so a gate for
-// "agent" is satisfied by admin too, and "readonly" by everyone authenticated.
-func roleRank(role string) int {
-	switch role {
-	case "admin":
-		return 3
-	case "agent":
-		return 2
-	case "readonly":
-		return 1
-	default:
-		return 0
-	}
-}
-
-// requireRole enforces a minimum role for an endpoint (admin > agent > readonly).
-// In open mode (no auth configured) it allows the operation locally; once auth is
-// configured the middleware has already rejected unauthenticated requests. A denied
-// authenticated request is recorded in the auth-audit log.
-func requireRole(w http.ResponseWriter, r *http.Request, role string) bool {
-	dd := envDefault("XMUSTARD_DATA_DIR", "../backend/data")
-	p := principalFromContext(r.Context())
-	if p == nil {
-		if !workspaceops.HasAuthConfigured(dd) {
-			return true
-		}
-		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "authentication required"})
-		return false
-	}
-	if roleRank(p.Role) < roleRank(role) {
-		workspaceops.RecordAuthAudit(dd, workspaceops.AuthAuditEvent{
-			Action:     "denied",
-			Actor:      p.ID,
-			Detail:     role + " role required (have " + p.Role + ")",
-			Method:     r.Method,
-			Path:       r.URL.Path,
-			RemoteAddr: r.RemoteAddr,
-		})
-		writeJSON(w, http.StatusForbidden, map[string]any{"error": role + " role required"})
-		return false
-	}
-	return true
-}
-
-// coreWorkspaceSubpaths are the EXACT per-workspace subpaths the 9 MCP tools hit
-// (the part after /api/workspaces/{id}/). Matching these exactly — rather than by
-// substring — is what makes CORE_ONLY a real allowlist: a substring gate over
-// "/context"/"/search"/"/diagnostics" would also admit /context-replays,
-// /goals/{id}/context, /pg/search, /diagnostics/run, etc. (XM-PRO-011).
-var coreWorkspaceSubpaths = map[string]bool{
-	"session-grounding":   true, // ground
-	"context":             true, // remember (POST)
-	"context/active":      true, // recall
-	"search":              true, // search
-	"explain-path":        true, // explain
-	"changes/since-index": true, // impact
-	"diagnostics":         true, // diagnostics
-}
-
-// isCorePath reports whether p is one of the exact routes the lean 9-tool agent
-// surface uses. CORE_ONLY 404s everything else, so the deployed attack surface
-// matches the product claim, not a substring gate over ~200 handlers.
-func isCorePath(p string) bool {
-	if p == "/api/health" || p == "/api/workspaces" || strings.HasPrefix(p, "/api/auth/") {
-		return true
-	}
-	const wsPrefix = "/api/workspaces/"
-	if !strings.HasPrefix(p, wsPrefix) {
-		return false
-	}
-	rest := p[len(wsPrefix):]
-	slash := strings.IndexByte(rest, '/')
-	if slash < 0 {
-		return false // /api/workspaces/{id} with no tool subpath
-	}
-	sub := rest[slash+1:] // subpath after the workspace id
-	if coreWorkspaceSubpaths[sub] {
-		return true
-	}
-	// the two parameterized core routes: context/{entry_id}/verify, runs/{run_id}/why-failed
-	if seg := strings.Split(sub, "/"); len(seg) == 3 {
-		if seg[0] == "context" && seg[2] == "verify" {
-			return true // verify
-		}
-		if seg[0] == "runs" && seg[2] == "why-failed" {
-			return true // why_failed
-		}
-	}
-	return false
-}
-
-// maxRequestBodyBytes bounds any single HTTP request body. ReadTimeout +
-// MaxHeaderBytes bound time and headers only; without this a single multi-GB POST
-// (e.g. to /context or /settings) is decoded into memory unbounded — the same OOM
-// class the MCP framing path explicitly caps. Generous enough for real diagnostics/
-// eval payloads; a body past the cap is cut off and the handler's decode surfaces a
-// clean error (the malformed-body -> 400 path) instead of the server allocating.
-const maxRequestBodyBytes = 32 << 20 // 32 MiB
-
-// maxRequestBodyBytesConfigured returns the per-request body cap, operator-tunable
-// via XMUSTARD_MAX_BODY_BYTES (so a tight-RSS deployment can lower it without a
-// rebuild). Defaults to maxRequestBodyBytes.
-func maxRequestBodyBytesConfigured() int64 {
-	if v := strings.TrimSpace(os.Getenv("XMUSTARD_MAX_BODY_BYTES")); v != "" {
-		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
-			return n
-		}
-	}
-	return maxRequestBodyBytes
-}
-
-// bodyInFlight bounds the number of body-bearing requests decoded concurrently, so
-// the aggregate in-flight body memory is at most cap × maxInFlight rather than
-// cap × (unbounded concurrent agents) — a single 32 MiB cap alone cannot hold the
-// 50–100 MB RSS target under fan-in (XM-PRO-008). Tunable via XMUSTARD_MAX_INFLIGHT_BODIES.
-// (Per-endpoint limits + decoded-object amplification remain follow-on work.)
-var bodyInFlight = make(chan struct{}, inFlightBodyLimit())
-
-func inFlightBodyLimit() int {
-	if v := strings.TrimSpace(os.Getenv("XMUSTARD_MAX_INFLIGHT_BODIES")); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			return n
-		}
-	}
-	return 12
-}
-
-// bodyBudgetThreshold: only requests declaring (or hiding, via chunked encoding) a
-// body larger than this acquire an in-flight slot. Normal small requests — tool
-// calls, memory proposals, run starts — are never throttled, and a long-running
-// request with a tiny body never holds a slot. This targets the actual memory risk
-// (large concurrent uploads) without affecting throughput.
-const bodyBudgetThreshold = 1 << 20 // 1 MiB
-
-func bodyLimitMiddleware(next http.Handler) http.Handler {
-	limit := maxRequestBodyBytesConfigured()
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Body == nil {
-			next.ServeHTTP(w, r)
-			return
-		}
-		r.Body = http.MaxBytesReader(w, r.Body, limit)
-		if r.ContentLength > bodyBudgetThreshold || r.ContentLength < 0 {
-			select {
-			case bodyInFlight <- struct{}{}:
-				defer func() { <-bodyInFlight }()
-			case <-r.Context().Done():
-				http.Error(w, "request cancelled while waiting for in-flight body budget", 499)
-				return
-			}
-			// Charge the declared body size against the shared transient-byte pool so
-			// aggregate concurrent decode memory (across this and the other subsystems
-			// drawing on the same budget) stays under the RSS target. Shed with 503 when
-			// the pool is exhausted rather than allocating past it. Unknown length
-			// (chunked) is charged the per-request cap as a conservative estimate.
-			charge := r.ContentLength
-			if charge < 0 {
-				charge = limit
-			}
-			if !budget.TransientBytes.Acquire(charge) {
-				http.Error(w, "server transient-memory budget exhausted; retry shortly", http.StatusServiceUnavailable)
-				return
-			}
-			defer budget.TransientBytes.Release(charge)
-		}
-		next.ServeHTTP(w, r)
-	})
-}
-
-func coreOnlyMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !isCorePath(r.URL.Path) {
-			writeJSON(w, http.StatusNotFound, map[string]any{"error": "endpoint disabled in CORE_ONLY mode"})
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
-}
-
-func authMiddleware(dataDir, mode string, next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/api/health" { // health stays public for liveness probes
-			next.ServeHTTP(w, r)
-			return
-		}
-		token := ""
-		if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
-			token = strings.TrimPrefix(h, "Bearer ")
-		}
-		// single read of the token store yields both the principal and whether auth
-		// is configured (was two reads per request).
-		principal, configured := workspaceops.ResolveAuth(dataDir, token)
-		enforce := mode == "required" || configured
-		if enforce && principal == nil {
-			workspaceops.RecordAuthAudit(dataDir, workspaceops.AuthAuditEvent{
-				Action:     "denied",
-				Actor:      "anonymous",
-				Detail:     "missing/invalid/expired bearer token",
-				Method:     r.Method,
-				Path:       r.URL.Path,
-				RemoteAddr: r.RemoteAddr,
-			})
-			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "authentication required: provide Authorization: Bearer <token>"})
-			return
-		}
-		// readonly principals may only read.
-		if principal != nil && principal.Role == "readonly" && r.Method != http.MethodGet {
-			workspaceops.RecordAuthAudit(dataDir, workspaceops.AuthAuditEvent{
-				Action:     "denied",
-				Actor:      principal.ID,
-				Detail:     "readonly principal cannot " + r.Method,
-				Method:     r.Method,
-				Path:       r.URL.Path,
-				RemoteAddr: r.RemoteAddr,
-			})
-			writeJSON(w, http.StatusForbidden, map[string]any{"error": "readonly principal cannot " + r.Method})
-			return
-		}
-		// workspace scope: a scoped (per-worker) token may only touch its workspaces.
-		// Unscoped tokens (the default) are unrestricted, so this is backward-compatible.
-		if principal != nil {
-			if wsID := workspaceIDFromPath(r.URL.Path); wsID != "" && !principal.AllowsWorkspace(wsID) {
-				workspaceops.RecordAuthAudit(dataDir, workspaceops.AuthAuditEvent{
-					Action: "denied", Actor: principal.ID,
-					Detail: "workspace " + wsID + " not in token scope",
-					Method: r.Method, Path: r.URL.Path, RemoteAddr: r.RemoteAddr,
-				})
-				writeJSON(w, http.StatusForbidden, map[string]any{"error": "token not scoped to workspace " + wsID})
-				return
-			}
-		}
-		if principal == nil {
-			next.ServeHTTP(w, r)
-			return
-		}
-		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), principalCtxKey, principal)))
-	})
-}
-
-// requireTerminalScope enforces that the authenticated principal may touch
-// workspaceID. Terminal routes live under /api/terminal (outside /api/workspaces/),
-// so the path-based middleware scope check (workspaceIDFromPath) never fires for
-// them and a workspace-scoped token could otherwise open/read/write another
-// workspace's shell by passing its workspace_id in the body/query (XM-PRO-001).
-// Writes 400 on an empty id, 403 on an out-of-scope token; returns false if handled.
-func requireTerminalScope(w http.ResponseWriter, r *http.Request, dataDir, workspaceID string) bool {
-	workspaceID = strings.TrimSpace(workspaceID)
-	if workspaceID == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "workspace_id is required"})
-		return false
-	}
-	if p := principalFromContext(r.Context()); p != nil && !p.AllowsWorkspace(workspaceID) {
-		workspaceops.RecordAuthAudit(dataDir, workspaceops.AuthAuditEvent{
-			Action: "denied", Actor: p.ID,
-			Detail: "workspace " + workspaceID + " not in token scope (terminal)",
-			Method: r.Method, Path: r.URL.Path, RemoteAddr: r.RemoteAddr,
-		})
-		writeJSON(w, http.StatusForbidden, map[string]any{"error": "token not scoped to workspace " + workspaceID})
-		return false
-	}
-	return true
-}
-
-// httpStatusForClass maps a typed domain-error class to an HTTP status. Status now
-// follows the error TYPE, not its English wording (XM-PRO-013).
-func httpStatusForClass(c workspaceops.ErrorClass) int {
-	switch c {
-	case workspaceops.ClassInvalidInput:
-		return http.StatusBadRequest
-	case workspaceops.ClassNotFound:
-		return http.StatusNotFound
-	case workspaceops.ClassConflict:
-		return http.StatusConflict
-	case workspaceops.ClassUnavailable:
-		return http.StatusServiceUnavailable
-	default:
-		return http.StatusInternalServerError
-	}
-}
-
-// respondError is the single error->HTTP mapper the per-handler substring classifiers
-// converge on. A typed DomainError uses its class (and for the internal class the
-// wrapped detail stays server-side); os.ErrNotExist -> 404; IsInvalidInput -> 400;
-// anything else -> 500 with the raw message (the legacy fallback still being migrated).
-func respondError(w http.ResponseWriter, err error) {
-	if err == nil {
-		return
-	}
-	if de, ok := workspaceops.AsDomainError(err); ok {
-		if de.Class == workspaceops.ClassInternal {
-			log.Printf("internal error: %v", err) // detail logged, not disclosed
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "internal error"})
-			return
-		}
-		writeJSON(w, httpStatusForClass(de.Class), map[string]any{"error": de.Public})
-		return
-	}
-	if errors.Is(err, os.ErrNotExist) {
-		writeJSON(w, http.StatusNotFound, map[string]any{"error": "Missing resource"})
-		return
-	}
-	if workspaceops.IsInvalidInput(err) {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
-		return
-	}
-	writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
-}
-
-// workspaceIDFromPath extracts {id} from /api/workspaces/{id}/... ("" if not such a path).
-func workspaceIDFromPath(p string) string {
-	const prefix = "/api/workspaces/"
-	if !strings.HasPrefix(p, prefix) {
-		return ""
-	}
-	rest := p[len(prefix):]
-	if i := strings.IndexByte(rest, '/'); i >= 0 {
-		return rest[:i]
-	}
-	return rest
-}
-
-func envDefault(name string, fallback string) string {
-	value := os.Getenv(name)
-	if value == "" {
-		return fallback
-	}
-	return value
-}
-
-func splitCSV(value string) []string {
-	if strings.TrimSpace(value) == "" {
-		return nil
-	}
-	parts := strings.Split(value, ",")
-	items := make([]string, 0, len(parts))
-	for _, part := range parts {
-		trimmed := strings.TrimSpace(part)
-		if trimmed != "" {
-			items = append(items, trimmed)
-		}
-	}
-	if len(items) == 0 {
-		return nil
-	}
-	return items
-}
-
-func writeJSON(w http.ResponseWriter, status int, payload any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(payload)
-}
+// dataDir resolves the runtime data root (XMUSTARD_DATA_DIR, default ../backend/data).
+func dataDir() string { return envDefault("XMUSTARD_DATA_DIR", "../backend/data") }

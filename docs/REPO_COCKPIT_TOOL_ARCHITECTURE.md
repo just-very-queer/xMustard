@@ -1,5 +1,9 @@
 # Repo Cockpit Tool Architecture
 
+> Historical working document, retained as evidence of earlier design and work.
+> Use [VISION.md](VISION.md), [STATUS.md](STATUS.md), and [ROADMAP.md](ROADMAP.md)
+> for current direction, verified behavior, and remaining work.
+
 This document reframes xMustard from a tracker-first local bug operations app into a
 standalone repo intelligence and agent grounding tool.
 

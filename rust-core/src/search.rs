@@ -245,14 +245,12 @@ pub fn hybrid_search(
     let query_lc = query.trim().to_lowercase();
 
     // document frequency of each query token across symbol-name tokens (idf).
+    // Token sets are computed per symbol and dropped (not materialized for every
+    // symbol at once); the candidate pass below recomputes them the same way.
     let n = graph.symbols.len().max(1) as f64;
     let mut df: HashMap<String, usize> = HashMap::new();
-    let symbol_token_sets: Vec<HashSet<String>> = graph
-        .symbols
-        .iter()
-        .map(|s| tokens(&s.name).into_iter().collect::<HashSet<String>>())
-        .collect();
-    for set in &symbol_token_sets {
+    for s in &graph.symbols {
+        let set: HashSet<String> = tokens(&s.name).into_iter().collect();
         for t in &qtokens {
             if set.contains(t) {
                 *df.entry(t.clone()).or_insert(0) += 1;
@@ -288,8 +286,8 @@ pub fn hybrid_search(
     const EMB_GATE: f32 = 0.30; // a pure-semantic hit must clear this to enter the pool
 
     let mut cands: Vec<Cand> = Vec::new();
-    for (i, sym) in graph.symbols.iter().enumerate() {
-        let name_tokens = &symbol_token_sets[i];
+    for sym in &graph.symbols {
+        let name_tokens: HashSet<String> = tokens(&sym.name).into_iter().collect();
         let path_tokens: HashSet<String> = tokens(&sym.path).into_iter().collect();
         let mut lexical = 0.0;
         let mut matched = Vec::new();
@@ -767,6 +765,9 @@ mod tests {
         // and embed() (which routes through try_embed first) still yields a valid vector.
         let v = embed("dashboard ledger");
         let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-        assert!((norm - 1.0).abs() < 1e-4, "fallback embedding must be normalized");
+        assert!(
+            (norm - 1.0).abs() < 1e-4,
+            "fallback embedding must be normalized"
+        );
     }
 }

@@ -1089,6 +1089,21 @@ fn main() {
                 serde_json::to_string(&result).expect("search result should serialize")
             );
         }
+        "repo-key" => {
+            // The repaired source identity (same key as graph-cache invalidation).
+            // Always exits 0 with JSON; failures are `identity_complete=false` plus
+            // `limitations`, never a partial key presented as complete.
+            let usage = "xmustard-core repo-key <root>";
+            let Some(root) = args.next() else {
+                eprintln!("usage: {usage}");
+                std::process::exit(2);
+            };
+            let id = xmustard_core::indexcache::source_identity(&PathBuf::from(root));
+            println!(
+                "{}",
+                serde_json::to_string(&id).expect("repo-key result should serialize")
+            );
+        }
         "wiki" => {
             let usage = "xmustard-core wiki <root> <workspace_id>";
             let Some(root) = args.next() else {

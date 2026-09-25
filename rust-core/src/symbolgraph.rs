@@ -8,7 +8,6 @@ use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
-use std::process::Command;
 
 use crate::repomap;
 
@@ -35,70 +34,170 @@ fn is_source(path: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn tracked_source_files(root: &Path) -> Vec<String> {
-    tracked_source_files_with_coverage(root).0
+/// Bound on symbols held by one graph (memory); files past it report `symbol_budget`.
+pub const MAX_GRAPH_SYMBOLS: usize = 100_000;
+/// Bound on per-file loss entries listed in coverage (`loss_counts` stays exact).
+pub const MAX_LOSS_ENTRIES: usize = 200;
+
+/// One file whose content or symbols are not fully represented in the graph.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct CoverageLoss {
+    pub path: String,
+    /// `file_cap` | `oversized` | `unreadable` | `symlink` | `not_regular` |
+    /// `invalid_path_encoding` | `invalid_utf8` | `excluded_path` |
+    /// `unsupported_language` | `symbols_truncated` | `symbol_budget`
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub detail: String,
+    /// Whether the file's text still contributed references/edges to the graph.
+    #[serde(default)]
+    pub content_indexed: bool,
 }
 
-/// Index coverage so consumers can tell a complete answer from a degraded one: a
-/// repo with no git / a failed git command yields zero files, and a large repo is
-/// truncated at MAX_FILES — both previously silent, so an agent treated an empty or
-/// partial graph as authoritative (XM-NEW-009/010).
+/// Work done by THIS invocation (a cache hit reports the hit, not the original build).
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct IndexWork {
+    /// `hit` | `miss` (built and stored) | `bypass` (built, not cacheable) |
+    /// `uncached` (a build command that does not consult the graph cache)
+    pub graph_cache: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub graph_cache_detail: String,
+    /// `not_used` | `acquired` | `timeout` | `unavailable`
+    pub lock: String,
+    pub lock_wait_ms: u64,
+    /// The lock was held by another builder when first tried (this call waited).
+    #[serde(default)]
+    pub lock_contended: bool,
+    /// Source-identity computations (1 on a hit; 2 when a build re-checks stability).
+    pub identity_passes: usize,
+    pub identity_files_hashed: usize,
+    pub identity_bytes_hashed: u64,
+    /// Source files opened and read for indexing (excludes identity hashing).
+    pub files_read: usize,
+    pub bytes_read: u64,
+    /// Files whose text was parsed/analyzed this invocation.
+    pub files_parsed: usize,
+    pub bytes_parsed: u64,
+    /// Files served from the per-file feature cache without reading them.
+    pub files_reused: usize,
+    /// Symbols extracted by parsing this invocation.
+    pub symbols_extracted: usize,
+    /// Symbols in the returned graph.
+    pub symbols_indexed: usize,
+    pub coverage_losses: usize,
+    pub stale_temps_removed: usize,
+    pub elapsed_ms: u64,
+}
+
+/// The source identity the graph was built from (see `indexcache::source_identity`).
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct SourceIdentitySummary {
+    /// Same value `xmustard-core repo-key <root>` reports for an unchanged tree.
+    pub key: String,
+    pub head: String,
+    pub parser_version: String,
+    pub identity_complete: bool,
+    /// The identity recomputed after the build matched, and every dirty file parsed
+    /// had exactly the hashed bytes: the graph reflects `key`. False results are
+    /// never cached.
+    pub stable: bool,
+    /// Number of identity limitations (oversized/unreadable/... dirty files).
+    pub limitations: usize,
+}
+
+/// Index coverage so consumers can tell a complete answer from a degraded one. File
+/// counts never imply symbol completeness: every file that was not fully read and
+/// extracted appears in `loss_counts`/`losses`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct IndexCoverage {
     pub repo_mode: String, // "git" | "git-unavailable"
+    /// Tracked source files present in the worktree.
     pub eligible_files: usize,
+    /// Files whose text was read (now or from the per-file cache) and analyzed.
     pub indexed_files: usize,
+    /// True when the file cap, a per-file symbol bound or the graph symbol budget cut
+    /// the result.
     pub truncated: bool,
     pub max_files: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub degraded_reason: Option<String>,
+    /// Files selected under `max_files`.
+    #[serde(default)]
+    pub selected_files: usize,
+    /// No losses, Git mode, and a stable source identity.
+    #[serde(default)]
+    pub complete: bool,
+    /// Tracked files deleted in the worktree (not indexed, not a loss).
+    #[serde(default)]
+    pub worktree_deleted_files: usize,
+    #[serde(default)]
+    pub symbols_truncated_files: usize,
+    /// Exact count per loss reason.
+    #[serde(default)]
+    pub loss_counts: BTreeMap<String, usize>,
+    /// The first MAX_LOSS_ENTRIES losses, sorted by path.
+    #[serde(default)]
+    pub losses: Vec<CoverageLoss>,
+    #[serde(default)]
+    pub losses_truncated: bool,
+    /// Indexed files per extraction engine (`tree_sitter`, `regex`, `none`,
+    /// `excluded_path`, `unsupported_language`).
+    #[serde(default)]
+    pub extraction: BTreeMap<String, usize>,
+    #[serde(default)]
+    pub source_identity: SourceIdentitySummary,
+    #[serde(default)]
+    pub work: IndexWork,
 }
 
-fn tracked_source_files_with_coverage(root: &Path) -> (Vec<String>, IndexCoverage) {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["ls-files"])
-        .output();
-    let text = match out {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
-        _ => {
-            return (
-                Vec::new(),
-                IndexCoverage {
-                    repo_mode: "git-unavailable".into(),
-                    max_files: MAX_FILES,
-                    degraded_reason: Some(
-                        "git ls-files failed (no .git / git missing / unsafe directory); the symbol graph is EMPTY, not authoritative".into(),
-                    ),
-                    ..Default::default()
-                },
-            );
+/// One `git ls-files -s -z` index entry.
+struct IndexEntry {
+    mode: String,
+    blob: String,
+    path: Vec<u8>,
+}
+
+fn ls_files_stage(root: &Path) -> Result<Vec<IndexEntry>, crate::indexcache::GitRunError> {
+    let out = crate::indexcache::run_git_bounded(
+        root,
+        &["ls-files", "-s", "-z"],
+        crate::indexcache::MAX_GIT_OUTPUT_BYTES,
+        crate::indexcache::git_timeout(),
+    )?;
+    let mut entries: Vec<IndexEntry> = Vec::new();
+    for rec in out.split(|b| *b == 0) {
+        // "<mode> <blob> <stage>\t<path>"
+        let Some(tab) = rec.iter().position(|b| *b == b'\t') else {
+            continue;
+        };
+        let meta = String::from_utf8_lossy(&rec[..tab]);
+        let mut parts = meta.split(' ');
+        let (Some(mode), Some(blob)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        let path = rec[tab + 1..].to_vec();
+        // unmerged paths appear once per stage; keep the first.
+        if entries.last().is_some_and(|e| e.path == path) {
+            continue;
         }
-    };
-    let all: Vec<String> = text
-        .lines()
-        .filter(|l| is_source(l))
-        .map(|l| l.to_string())
-        .collect();
-    let eligible = all.len();
-    let indexed: Vec<String> = all.into_iter().take(MAX_FILES).collect();
-    let truncated = eligible > indexed.len();
-    let cov = IndexCoverage {
-        repo_mode: "git".into(),
-        eligible_files: eligible,
-        indexed_files: indexed.len(),
-        truncated,
+        entries.push(IndexEntry {
+            mode: mode.to_string(),
+            blob: blob.to_string(),
+            path,
+        });
+    }
+    Ok(entries)
+}
+
+fn git_unavailable_coverage(why: &str) -> IndexCoverage {
+    IndexCoverage {
+        repo_mode: "git-unavailable".into(),
         max_files: MAX_FILES,
-        degraded_reason: truncated.then(|| {
-            format!(
-                "indexed first {} of {} source files; results beyond the cap are incomplete",
-                indexed.len(),
-                eligible
-            )
-        }),
-    };
-    (indexed, cov)
+        degraded_reason: Some(format!(
+            "git ls-files failed ({why}); the symbol graph is EMPTY, not authoritative"
+        )),
+        ..Default::default()
+    }
 }
 
 /// repo_role is the SINGLE canonical classification of a tracked file, so code /
@@ -151,19 +250,19 @@ pub fn repo_role(path: &str) -> &'static str {
 /// tracked_doc_files lists the repo's git-tracked doc + guidance files — the docs
 /// search segment, so the single `search` tool can return hits from prose the symbol
 /// graph (code-only) never sees (XM-PRO-012). Empty when git is unavailable.
+/// Uses the bounded `ls-files -z` runner, so unusual names are not split or quoted.
 pub fn tracked_doc_files(root: &Path) -> Vec<String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["ls-files"])
-        .output();
-    let text = match out {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
-        _ => return Vec::new(),
+    let Ok(out) = crate::indexcache::run_git_bounded(
+        root,
+        &["ls-files", "-z"],
+        crate::indexcache::MAX_GIT_OUTPUT_BYTES,
+        crate::indexcache::git_timeout(),
+    ) else {
+        return Vec::new();
     };
-    text.lines()
-        .filter(|l| matches!(repo_role(l), "doc" | "guide"))
-        .map(|l| l.to_string())
+    out.split(|b| *b == 0)
+        .filter_map(|p| String::from_utf8(p.to_vec()).ok())
+        .filter(|l| !l.is_empty() && matches!(repo_role(l), "doc" | "guide"))
         .collect()
 }
 
@@ -188,18 +287,27 @@ const SCANNABLE_SOURCE_FILENAMES: &[&str] = &["Dockerfile", "Justfile", "Makefil
 /// read_repo_bytes_beneath_capped / hash_repo_file_beneath all hold the fd it returns.
 #[cfg(unix)]
 fn open_repo_file_beneath(root: &Path, rel: &str) -> std::io::Result<std::fs::File> {
-    use rustix::fs::{open, openat, Mode, OFlags};
-    use std::path::Component;
-
-    let rel = rel.trim();
-    if rel.is_empty() || rel.contains('\0') {
+    // byte-exact: a Git path may begin or end with whitespace, and trimming would open
+    // a different (decoy) file.
+    if rel.contains('\0') {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "empty path",
         ));
     }
+    open_repo_path_beneath(root, Path::new(rel))
+}
+
+/// open_repo_path_beneath is the untrimmed core of open_repo_file_beneath: `rel` is used
+/// byte-for-byte, so Git paths with leading/trailing whitespace or newlines open the
+/// file Git names rather than a trimmed neighbour.
+#[cfg(unix)]
+fn open_repo_path_beneath(root: &Path, rel: &Path) -> std::io::Result<std::fs::File> {
+    use rustix::fs::{Mode, OFlags, open, openat};
+    use std::path::Component;
+
     let mut comps: Vec<&std::ffi::OsStr> = Vec::new();
-    for c in Path::new(rel).components() {
+    for c in rel.components() {
         match c {
             Component::Normal(s) => comps.push(s),
             Component::CurDir => {}
@@ -208,7 +316,7 @@ fn open_repo_file_beneath(root: &Path, rel: &str) -> std::io::Result<std::fs::Fi
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     "path escapes workspace root",
-                ))
+                ));
             }
         }
     }
@@ -244,6 +352,11 @@ fn open_repo_file_beneath(root: &Path, rel: &str) -> std::io::Result<std::fs::Fi
 
 #[cfg(not(unix))]
 fn open_repo_file_beneath(root: &Path, rel: &str) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(root.join(rel))
+}
+
+#[cfg(not(unix))]
+fn open_repo_path_beneath(root: &Path, rel: &Path) -> std::io::Result<std::fs::File> {
     std::fs::File::open(root.join(rel))
 }
 
@@ -289,6 +402,95 @@ pub fn read_repo_bytes_beneath_capped(
             std::io::ErrorKind::InvalidInput,
             "file exceeds size cap",
         ));
+    }
+    Ok(buf)
+}
+
+/// Why a source file's bytes were not read. Each variant is reported as a coverage
+/// loss or identity limitation; none is silently treated as empty content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SourceReadFailure {
+    /// Larger than the cap; nothing past the fstat size check was read.
+    Oversized(u64),
+    /// A symlink at some path component (O_NOFOLLOW refused it).
+    Symlink,
+    /// A directory, fifo, device or socket.
+    NotRegular,
+    /// The path does not exist in the worktree.
+    Missing,
+    /// Permission or I/O error, with its message.
+    Unreadable(String),
+}
+
+impl SourceReadFailure {
+    /// The stable coverage/identity reason code for this failure.
+    pub fn reason(&self) -> &'static str {
+        match self {
+            SourceReadFailure::Oversized(_) => "oversized",
+            SourceReadFailure::Symlink => "symlink",
+            SourceReadFailure::NotRegular => "not_regular",
+            SourceReadFailure::Missing => "missing",
+            SourceReadFailure::Unreadable(_) => "unreadable",
+        }
+    }
+
+    pub fn detail(&self) -> String {
+        match self {
+            SourceReadFailure::Oversized(n) => {
+                format!("{n} bytes exceeds the {MAX_REPO_FILE_BYTES}-byte read cap; not read")
+            }
+            SourceReadFailure::Unreadable(e) => e.clone(),
+            _ => String::new(),
+        }
+    }
+}
+
+fn classify_open_error(e: &std::io::Error) -> SourceReadFailure {
+    #[cfg(unix)]
+    {
+        use rustix::io::Errno;
+        match Errno::from_io_error(e) {
+            Some(Errno::LOOP) => return SourceReadFailure::Symlink,
+            // an intermediate component that is not a directory (e.g. replaced by a
+            // file) or a symlinked directory opened with O_DIRECTORY|O_NOFOLLOW.
+            Some(Errno::NOTDIR) => return SourceReadFailure::NotRegular,
+            _ => {}
+        }
+    }
+    if e.kind() == std::io::ErrorKind::NotFound {
+        SourceReadFailure::Missing
+    } else {
+        SourceReadFailure::Unreadable(e.to_string())
+    }
+}
+
+/// read_source_beneath reads all bytes of `rel` (untrimmed, byte-exact) under `root`
+/// through the no-follow, regular-file-checked descriptor, refusing files larger than
+/// `cap` before reading them. The single classified reader for indexing and identity.
+pub fn read_source_beneath(
+    root: &Path,
+    rel: &Path,
+    cap: u64,
+) -> Result<Vec<u8>, SourceReadFailure> {
+    use std::io::Read;
+    let f = open_repo_path_beneath(root, rel).map_err(|e| classify_open_error(&e))?;
+    let meta = f
+        .metadata()
+        .map_err(|e| SourceReadFailure::Unreadable(e.to_string()))?;
+    if !meta.is_file() {
+        return Err(SourceReadFailure::NotRegular);
+    }
+    if meta.len() > cap {
+        return Err(SourceReadFailure::Oversized(meta.len()));
+    }
+    let mut buf = Vec::with_capacity(meta.len() as usize);
+    let n = f
+        .take(cap + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| SourceReadFailure::Unreadable(e.to_string()))?;
+    if n as u64 > cap {
+        // grew after the size check: still refuse instead of truncating.
+        return Err(SourceReadFailure::Oversized(n as u64));
     }
     Ok(buf)
 }
@@ -353,11 +555,24 @@ fn word_set(content: &str) -> HashSet<String> {
 }
 
 /// A symbol definition: where it lives and what kind it is.
-#[derive(Debug, Clone)]
-struct SymbolDef {
-    path: String,
-    kind: String,
+#[derive(Debug, Clone, Copy)]
+struct SymbolDef<'a> {
+    path: &'a str,
+    kind: &'a str,
 }
+
+/// Definitions of one symbol name, borrowed from the feature store. A name defined
+/// in more than one file is ambiguous: lexical matching cannot tell which definition
+/// a reference means, so it anchors no edge.
+#[derive(Debug, Clone, Copy)]
+enum Definer<'a> {
+    One { path: &'a str, kind: &'a str },
+    Ambiguous,
+}
+
+/// Edges aggregated by (from, to, kind) → (weight, up to 8 `via` symbols), borrowing
+/// every string from the feature store until the edges are materialized.
+type EdgeAgg<'a> = HashMap<(&'a str, &'a str, &'static str), (usize, BTreeSet<&'a str>)>;
 
 /// Test files reference code under test; they get "tests" edges, not "calls".
 fn is_test_file(path: &str) -> bool {
@@ -533,7 +748,8 @@ fn is_ident_byte(b: u8) -> bool {
 }
 
 /// Byte index of a whole-word occurrence of `word` in `line` (so `if` doesn't match
-/// inside `notify`), or None.
+/// inside `notify`), or None. Reference implementation for `line_flows`.
+#[cfg(test)]
 fn find_word(line: &str, word: &str) -> Option<usize> {
     let bytes = line.as_bytes();
     let mut from = 0;
@@ -552,10 +768,48 @@ fn find_word(line: &str, word: &str) -> Option<usize> {
 
 const BRANCH_KEYWORDS: &[&str] = &["if", "while", "match", "switch", "elif", "when", "case"];
 
+/// Flow classifications (`returns` / `branches` / `writes`) for every identifier of at
+/// least MIN_NAME_LEN bytes on `line`: the same result as `flow_edge_kind` per
+/// identifier, but keyword positions are read from the line's identifier spans once
+/// instead of running a substring search per keyword per identifier.
+fn line_flows(line: &str) -> Vec<(&str, &'static str)> {
+    let bytes = line.as_bytes();
+    let spans = identifier_spans(line);
+    // a span is a whole word unless glued to a preceding digit (e.g. `9return`).
+    let whole = |s: &(&str, usize, usize)| s.1 == 0 || !is_ident_byte(bytes[s.1 - 1]);
+    let ret = spans
+        .iter()
+        .find(|s| s.0 == "return" && whole(s))
+        .map(|s| s.1);
+    let branch = spans
+        .iter()
+        .find(|s| BRANCH_KEYWORDS.contains(&s.0) && whole(s))
+        .map(|s| s.1);
+    let mut out = Vec::new();
+    for (word, start, end) in spans {
+        if word.len() < MIN_NAME_LEN {
+            continue;
+        }
+        let kind = if ret.is_some_and(|i| i < start) {
+            "returns"
+        } else if branch.is_some_and(|i| i < start) {
+            "branches"
+        } else if is_assignment_target(line, end) {
+            "writes"
+        } else {
+            continue;
+        };
+        out.push((word, kind));
+    }
+    out
+}
+
 /// Classify the control/data-flow role of a referenced symbol occurring at
 /// `[sym_start, sym_end)` on `line`. Returns a flow-edge kind when the syntactic
 /// context is a `return` value, a branch condition, or an assignment target; None for
-/// a plain expression read (already covered by the calls/references edge).
+/// a plain expression read (already covered by the calls/references edge). Reference
+/// implementation that `line_flows` must match.
+#[cfg(test)]
 fn flow_edge_kind(line: &str, sym_start: usize, sym_end: usize) -> Option<&'static str> {
     // returns: a `return` keyword precedes the symbol on this line.
     if let Some(i) = find_word(line, "return")
@@ -571,17 +825,20 @@ fn flow_edge_kind(line: &str, sym_start: usize, sym_end: usize) -> Option<&'stat
             return Some("branches");
         }
     }
-    // writes: the symbol is immediately followed by a plain/compound assignment.
-    let after = line.get(sym_end..).unwrap_or("").trim_start();
-    let is_assign = (after.starts_with('=') && !after.starts_with("=="))
-        || after.starts_with("+=")
-        || after.starts_with("-=")
-        || after.starts_with("*=")
-        || after.starts_with("/=");
-    if is_assign {
+    if is_assignment_target(line, sym_end) {
         return Some("writes");
     }
     None
+}
+
+/// writes: the symbol is immediately followed by a plain/compound assignment.
+fn is_assignment_target(line: &str, sym_end: usize) -> bool {
+    let after = line.get(sym_end..).unwrap_or("").trim_start();
+    (after.starts_with('=') && !after.starts_with("=="))
+        || after.starts_with("+=")
+        || after.starts_with("-=")
+        || after.starts_with("*=")
+        || after.starts_with("/=")
 }
 
 /// Identifier spans (word, start, end) on a line, for per-occurrence flow analysis.
@@ -919,211 +1176,576 @@ pub fn upgrade_graph_with_lsp(root: &Path, mut graph: SymbolGraph, budget: usize
     graph
 }
 
-/// Build the symbol graph, using the warm cache when the repo is unchanged. The
-/// cache key is cheap (git HEAD + dirty-file mtimes), so a warm search loads the
-/// cached graph instead of re-crawling the whole repo. Falls back to a fresh build
-/// (and refreshes the cache) on a miss.
-pub fn build_symbol_graph_cached(root: &Path, workspace_id: &str) -> SymbolGraph {
-    let key = crate::indexcache::cheap_key(root);
-    if let Some(graph) = crate::indexcache::load_cached_graph(root, workspace_id, &key) {
-        return graph;
+/// A symbol as the graph stores it per file.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct IndexedSymbol {
+    name: String,
+    kind: String,
+    line_start: Option<usize>,
+}
+
+/// Everything graph assembly needs from one file, so an unchanged file is neither
+/// read nor parsed again and no file body is retained after analysis.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct FileFeatures {
+    /// `git:<index blob>` for files clean against the index, else `sha256:<bytes>`.
+    identity: String,
+    engine: String,
+    symbols: Vec<IndexedSymbol>,
+    symbols_truncated: bool,
+    invalid_utf8: bool,
+    words: Vec<String>,
+    imports: Vec<String>,
+    inherits: Vec<String>,
+    rel_specs: Vec<String>,
+    /// (identifier, flow kind, occurrences)
+    flows: Vec<(String, String, usize)>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Default)]
+struct FeatureCache {
+    parser_version: String,
+    files: BTreeMap<String, FileFeatures>,
+}
+
+fn sorted<I: IntoIterator<Item = String>>(items: I) -> Vec<String> {
+    let mut v: Vec<String> = items.into_iter().collect();
+    v.sort();
+    v
+}
+
+/// Analyze one file's bytes into graph features, then drop the bytes.
+fn analyze_source(rel: &str, bytes: Vec<u8>, identity: String) -> FileFeatures {
+    let (text, invalid_utf8) = match String::from_utf8(bytes) {
+        Ok(t) => (t, false),
+        Err(e) => (String::from_utf8_lossy(e.as_bytes()).into_owned(), true),
+    };
+    let ex = repomap::extract_source_symbols(rel, &text, crate::treesitter::MAX_SYMBOLS_PER_FILE);
+    let mut flows: BTreeMap<(String, &'static str), usize> = BTreeMap::new();
+    for line in text.lines() {
+        for (word, kind) in line_flows(line) {
+            *flows.entry((word.to_string(), kind)).or_insert(0) += 1;
+        }
     }
-    let graph = build_symbol_graph(root, workspace_id);
-    crate::indexcache::store_cached_graph(root, workspace_id, &key, &graph);
+    FileFeatures {
+        identity,
+        engine: ex.engine.to_string(),
+        symbols: ex
+            .symbols
+            .into_iter()
+            .map(|s| IndexedSymbol {
+                name: s.symbol,
+                kind: s.kind,
+                line_start: s.line_start,
+            })
+            .collect(),
+        symbols_truncated: ex.truncated,
+        invalid_utf8,
+        words: sorted(word_set(&text)),
+        imports: sorted(import_candidates(&text)),
+        inherits: sorted(inheritance_candidates(&text)),
+        rel_specs: relative_import_specs(&text),
+        flows: flows
+            .into_iter()
+            .map(|((w, k), n)| (w, k.to_string(), n))
+            .collect(),
+    }
+}
+
+/// Build the symbol graph through the shared, repo/trust/parser-scoped cache. The
+/// cache key is the full source identity (HEAD + NUL-parsed status + dirty and
+/// untracked content hashes), so any content change misses; builders for one scope
+/// are serialized across processes, and a waiter re-checks the cache after the lock.
+pub fn build_symbol_graph_cached(root: &Path, workspace_id: &str) -> SymbolGraph {
+    use crate::indexcache::{LockOutcome, cache_scope, lock_timeout, source_identity};
+    let started = std::time::Instant::now();
+    let id = source_identity(root);
+    let mut work = IndexWork {
+        lock: "not_used".into(),
+        identity_passes: 1,
+        identity_files_hashed: id.files_hashed,
+        identity_bytes_hashed: id.bytes_hashed,
+        ..Default::default()
+    };
+    let scope = cache_scope(&id);
+    let Some(scope) = scope.filter(|_| id.graph_cacheable()) else {
+        work.graph_cache = "bypass".into();
+        work.graph_cache_detail = format!(
+            "source identity does not determine the graph: {}",
+            id.graph_bypass_reason().unwrap_or_default()
+        );
+        return build_graph(
+            root,
+            workspace_id,
+            &id,
+            cache_scope(&id).as_ref(),
+            false,
+            work,
+            started,
+        );
+    };
+    if let Some(graph) = scope.load_graph(&id.key) {
+        return serve_cached(graph, workspace_id, work, started);
+    }
+    let (lock, outcome) = scope.lock_build(lock_timeout());
+    match outcome {
+        LockOutcome::Acquired {
+            waited_ms,
+            contended,
+        } => {
+            work.lock = "acquired".into();
+            work.lock_wait_ms = waited_ms;
+            work.lock_contended = contended;
+        }
+        LockOutcome::TimedOut { waited_ms } => {
+            work.lock = "timeout".into();
+            work.lock_wait_ms = waited_ms;
+            work.lock_contended = true;
+        }
+        LockOutcome::Unavailable(e) => {
+            work.lock = "unavailable".into();
+            work.graph_cache_detail = format!("build lock unavailable: {e}");
+        }
+    }
+    if lock.is_some()
+        && let Some(graph) = scope.load_graph(&id.key)
+    {
+        // another process built this snapshot while we waited.
+        return serve_cached(graph, workspace_id, work, started);
+    }
+    let store = lock.is_some();
+    if !store {
+        work.graph_cache_detail = format!(
+            "built without the build lock ({}); result not stored",
+            work.lock
+        );
+    }
+    let graph = build_graph(root, workspace_id, &id, Some(&scope), store, work, started);
+    drop(lock);
     graph
 }
 
-/// Build the symbol graph over tracked source files.
+fn serve_cached(
+    mut graph: SymbolGraph,
+    workspace_id: &str,
+    mut work: IndexWork,
+    started: std::time::Instant,
+) -> SymbolGraph {
+    work.graph_cache = "hit".into();
+    work.symbols_indexed = graph.symbols.len();
+    work.coverage_losses = graph.coverage.loss_counts.values().sum();
+    work.elapsed_ms = started.elapsed().as_millis() as u64;
+    graph.workspace_id = workspace_id.to_string();
+    graph.coverage.work = work;
+    graph
+}
+
+/// Build the symbol graph over tracked source files without consulting the graph
+/// cache. The per-file feature cache still applies: only files whose identity changed
+/// are read and parsed.
 pub fn build_symbol_graph(root: &Path, workspace_id: &str) -> SymbolGraph {
-    let (files, coverage) = tracked_source_files_with_coverage(root);
-    let tracked: HashSet<String> = files.iter().cloned().collect();
-    let mut file_nodes = Vec::new();
-    let mut symbols = Vec::new();
-    // name -> ALL definitions. A name defined in multiple files is AMBIGUOUS:
-    // lexical matching can't tell which one a reference means, so previously the
-    // first-definer won and every reference was silently misrouted to it. We now
-    // record all definers and skip ambiguous names for edge-anchoring (see
-    // unique_definer) rather than route them wrong.
-    let mut name_to_defs: HashMap<String, Vec<SymbolDef>> = HashMap::new();
-    let mut content_cache: BTreeMap<String, String> = BTreeMap::new();
+    use crate::indexcache::{cache_scope, source_identity};
+    let started = std::time::Instant::now();
+    let id = source_identity(root);
+    let work = IndexWork {
+        graph_cache: "uncached".into(),
+        lock: "not_used".into(),
+        identity_passes: 1,
+        identity_files_hashed: id.files_hashed,
+        identity_bytes_hashed: id.bytes_hashed,
+        ..Default::default()
+    };
+    build_graph(
+        root,
+        workspace_id,
+        &id,
+        cache_scope(&id).as_ref(),
+        false,
+        work,
+        started,
+    )
+}
 
-    // incremental reindex: per-file symbol cache keyed by content hash, so only
-    // files whose content changed are re-parsed (tree-sitter parse is the dominant
-    // cost). Clean files reuse their cached symbols.
-    #[derive(serde::Serialize, serde::Deserialize, Clone)]
-    struct CachedFileSymbols {
-        hash: String,
-        symbols: Vec<repomap::RustPathSymbolRecord>,
+fn empty_graph(workspace_id: &str, coverage: IndexCoverage) -> SymbolGraph {
+    SymbolGraph {
+        workspace_id: workspace_id.to_string(),
+        file_count: 0,
+        symbol_count: 0,
+        edge_count: 0,
+        files: Vec::new(),
+        symbols: Vec::new(),
+        edges: Vec::new(),
+        flow_edges: Vec::new(),
+        flow_edge_count: 0,
+        coverage,
+        generated_at: now(),
     }
-    let mut sym_cache: HashMap<String, CachedFileSymbols> =
-        crate::indexcache::load_symbol_cache_bytes(root, workspace_id)
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default();
-    let mut next_cache: HashMap<String, CachedFileSymbols> = HashMap::new();
+}
 
-    for rel in &files {
-        let content = read_repo_file_beneath(root, rel).unwrap_or_default();
-        let hash = crate::indexcache::file_hash(root, rel).unwrap_or_default();
-        let syms = match sym_cache.remove(rel) {
-            Some(c) if c.hash == hash && !hash.is_empty() => c.symbols, // reuse: clean file
-            _ => repomap::extract_path_symbols(root, workspace_id, rel)
-                .map(|r| r.symbols)
-                .unwrap_or_default(),
-        };
-        next_cache.insert(
-            rel.clone(),
-            CachedFileSymbols {
-                hash,
-                symbols: syms.clone(),
-            },
-        );
-        file_nodes.push(GraphFileNode {
-            path: rel.clone(),
-            symbol_count: syms.len(),
-            authority: 0,
+fn identity_summary(id: &crate::indexcache::SourceIdentity, stable: bool) -> SourceIdentitySummary {
+    SourceIdentitySummary {
+        key: id.key.clone(),
+        head: id.head.clone(),
+        parser_version: id.parser_version.clone(),
+        identity_complete: id.identity_complete,
+        stable,
+        limitations: id.limitations.len(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_graph(
+    root: &Path,
+    workspace_id: &str,
+    id: &crate::indexcache::SourceIdentity,
+    scope: Option<&crate::indexcache::CacheScope>,
+    store_graph: bool,
+    mut work: IndexWork,
+    started: std::time::Instant,
+) -> SymbolGraph {
+    use crate::indexcache::{DirtyContent, source_identity};
+
+    let listing = match id.layout {
+        Some(_) => ls_files_stage(root).map_err(|e| e.to_string()),
+        None => Err("no .git / git missing / unsafe directory".to_string()),
+    };
+    let (layout, listing) = match (id.layout.as_ref(), listing) {
+        (Some(layout), Ok(listing)) => (layout, listing),
+        (_, res) => {
+            let mut cov = git_unavailable_coverage(&res.err().unwrap_or_default());
+            cov.source_identity = identity_summary(id, false);
+            work.elapsed_ms = started.elapsed().as_millis() as u64;
+            cov.work = work;
+            return empty_graph(workspace_id, cov);
+        }
+    };
+    let status_known = !id.limitations.iter().any(|l| {
+        matches!(
+            l.reason.as_str(),
+            "git_status_failed" | "git_index_flags_failed"
+        )
+    });
+    let parser = crate::indexcache::parser_version();
+    let mut cache: FeatureCache = scope
+        .and_then(|s| s.load_features::<FeatureCache>())
+        .filter(|c| c.parser_version == parser)
+        .unwrap_or_default();
+    let mut next = FeatureCache {
+        parser_version: parser,
+        files: BTreeMap::new(),
+    };
+
+    let mut losses: Vec<CoverageLoss> = Vec::new();
+    let mut loss = |path: &str, reason: &str, detail: String, content_indexed: bool| {
+        losses.push(CoverageLoss {
+            path: path.to_string(),
+            reason: reason.to_string(),
+            detail,
+            content_indexed,
         });
-        for s in &syms {
-            symbols.push(GraphSymbolNode {
-                name: s.symbol.clone(),
-                kind: s.kind.clone(),
-                path: rel.clone(),
-                line_start: s.line_start,
-            });
-            let lname = s.symbol.to_lowercase();
-            if s.symbol.len() >= MIN_NAME_LEN && !STOPWORD_SYMBOLS.contains(&lname.as_str()) {
-                let defs = name_to_defs.entry(s.symbol.clone()).or_default();
-                if !defs.iter().any(|d| d.path == *rel) {
-                    defs.push(SymbolDef {
-                        path: rel.clone(),
-                        kind: s.kind.clone(),
-                    });
+    };
+    let mut eligible = 0usize;
+    let mut selected = 0usize;
+    let mut deleted = 0usize;
+    let mut identity_mismatch = false;
+    let mut clean_read_failed = false;
+    // `next.files` is the single store of this build's features (path order equals
+    // Git's index order); it is written to the feature cache and dropped before the
+    // graph snapshot is stored, so features are never held twice.
+
+    for entry in listing {
+        let Ok(rel) = String::from_utf8(entry.path.clone()) else {
+            if is_source(&String::from_utf8_lossy(&entry.path)) {
+                eligible += 1;
+                loss(
+                    &String::from_utf8_lossy(&entry.path),
+                    "invalid_path_encoding",
+                    "path is not UTF-8".into(),
+                    false,
+                );
+            }
+            continue;
+        };
+        if !is_source(&rel) {
+            continue;
+        }
+        let mut top_rel = layout.prefix.as_bytes().to_vec();
+        top_rel.extend_from_slice(&entry.path);
+        let dirty = if status_known {
+            id.dirty.get(&top_rel)
+        } else {
+            Some(&DirtyContent::Unhashed)
+        };
+        if matches!(dirty, Some(DirtyContent::Deleted)) {
+            deleted += 1;
+            continue;
+        }
+        eligible += 1;
+        if selected >= MAX_FILES {
+            loss(
+                &rel,
+                "file_cap",
+                format!("beyond the {MAX_FILES}-file cap"),
+                false,
+            );
+            continue;
+        }
+        selected += 1;
+        match (entry.mode.as_str(), dirty) {
+            ("120000", _) | (_, Some(DirtyContent::Symlink(_))) => {
+                loss(&rel, "symlink", "symlinks are not followed".into(), false);
+                continue;
+            }
+            ("160000", _) => {
+                loss(&rel, "not_regular", "submodule".into(), false);
+                continue;
+            }
+            (_, Some(DirtyContent::Incomplete(f))) => {
+                loss(&rel, f.reason(), f.detail(), false);
+                continue;
+            }
+            _ => {}
+        }
+        let expected = match dirty {
+            Some(DirtyContent::Sha256(h)) => Some(h.clone()),
+            _ => None,
+        };
+        let clean_identity = dirty.is_none().then(|| format!("git:{}", entry.blob));
+        // reuse key: the index blob for clean files, the identity pass's full SHA-256
+        // for dirty ones. Dirty reuse stays source-consistent because the post-build
+        // identity pass must re-hash the same bytes for the result to be stable.
+        let reuse_identity = clean_identity
+            .clone()
+            .or_else(|| expected.as_ref().map(|h| format!("sha256:{h}")));
+        if let Some(ident) = &reuse_identity
+            && let Some(f) = cache.files.remove(&rel)
+            && &f.identity == ident
+        {
+            work.files_reused += 1;
+            next.files.insert(rel, f);
+            continue;
+        }
+        match read_source_beneath(root, Path::new(&rel), MAX_REPO_FILE_BYTES) {
+            Ok(bytes) => {
+                work.files_read += 1;
+                work.bytes_read += bytes.len() as u64;
+                work.files_parsed += 1;
+                work.bytes_parsed += bytes.len() as u64;
+                let identity = match clean_identity {
+                    Some(i) => i,
+                    None => {
+                        let actual =
+                            format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(&bytes));
+                        if expected.as_ref().is_some_and(|e| *e != actual) {
+                            identity_mismatch = true;
+                        }
+                        format!("sha256:{actual}")
+                    }
+                };
+                let f = analyze_source(&rel, bytes, identity);
+                work.symbols_extracted += f.symbols.len();
+                next.files.insert(rel, f);
+            }
+            Err(f) => {
+                if dirty.is_none() && matches!(f, SourceReadFailure::Unreadable(_)) {
+                    clean_read_failed = true;
                 }
+                if matches!(f, SourceReadFailure::Missing) {
+                    // deleted after status ran: the identity no longer holds.
+                    identity_mismatch = true;
+                }
+                loss(&rel, f.reason(), f.detail(), false);
             }
         }
-        content_cache.insert(rel.clone(), content);
     }
-    // resolve a name to its single defining file, or None when ambiguous.
-    let unique_definer = |name: &str| -> Option<&SymbolDef> {
+
+    // ---- assemble symbols and definitions ----
+    // Everything below borrows from the feature store until the features are written
+    // to the cache; only then are symbol names/kinds *moved* into graph nodes, so no
+    // symbol string is held twice at the peak.
+    let tracked: HashSet<String> = next.files.keys().cloned().collect();
+    let mut file_nodes = Vec::with_capacity(next.files.len());
+    let mut kept_total = 0usize;
+    let mut name_to_defs: HashMap<&str, Definer<'_>> = HashMap::new();
+    let mut extraction: BTreeMap<String, usize> = BTreeMap::new();
+    let mut symbols_truncated_files = 0usize;
+    let mut budget_hit = false;
+    for (rel, f) in &next.files {
+        *extraction.entry(f.engine.clone()).or_insert(0) += 1;
+        match f.engine.as_str() {
+            "excluded_path" => loss(
+                rel,
+                "excluded_path",
+                "vendored/generated directory: symbols not extracted".into(),
+                true,
+            ),
+            "unsupported_language" => loss(
+                rel,
+                "unsupported_language",
+                "no symbol extractor for this language; references only".into(),
+                true,
+            ),
+            _ => {}
+        }
+        if f.invalid_utf8 {
+            loss(
+                rel,
+                "invalid_utf8",
+                "decoded with U+FFFD replacement".into(),
+                true,
+            );
+        }
+        if f.symbols_truncated {
+            symbols_truncated_files += 1;
+            loss(
+                rel,
+                "symbols_truncated",
+                format!(
+                    "more than {} symbols; the rest are not indexed",
+                    crate::treesitter::MAX_SYMBOLS_PER_FILE
+                ),
+                true,
+            );
+        }
+        let room = MAX_GRAPH_SYMBOLS.saturating_sub(kept_total);
+        if f.symbols.len() > room {
+            budget_hit = true;
+            loss(
+                rel,
+                "symbol_budget",
+                format!(
+                    "graph symbol budget {MAX_GRAPH_SYMBOLS} reached; {} of {} symbols indexed",
+                    room,
+                    f.symbols.len()
+                ),
+                true,
+            );
+        }
+        let kept = &f.symbols[..f.symbols.len().min(room)];
+        kept_total += kept.len();
+        file_nodes.push(GraphFileNode {
+            path: rel.clone(),
+            symbol_count: kept.len(),
+            authority: 0,
+        });
+        for s in kept {
+            let lname = s.name.to_lowercase();
+            if s.name.len() >= MIN_NAME_LEN && !STOPWORD_SYMBOLS.contains(&lname.as_str()) {
+                name_to_defs
+                    .entry(s.name.as_str())
+                    .and_modify(|d| {
+                        // a second defining FILE makes the name ambiguous; a repeat in
+                        // the same file keeps the first definition.
+                        if let Definer::One { path, .. } = d
+                            && *path != rel.as_str()
+                        {
+                            *d = Definer::Ambiguous;
+                        }
+                    })
+                    .or_insert(Definer::One {
+                        path: rel.as_str(),
+                        kind: s.kind.as_str(),
+                    });
+            }
+        }
+    }
+    let unique_definer = |name: &str| -> Option<SymbolDef<'_>> {
         match name_to_defs.get(name) {
-            Some(defs) if defs.len() == 1 => Some(&defs[0]),
+            Some(Definer::One { path, kind }) => Some(SymbolDef { path, kind }),
             _ => None,
         }
     };
 
-    // Typed edges, aggregated by (from, to, kind): a symbol that is imported AND
-    // called yields both an "imports" and a "calls" edge (distinct relationships).
-    let mut agg: HashMap<(String, String, &'static str), (usize, BTreeSet<String>)> =
-        HashMap::new();
-    // flow edges (returns/branches/writes) aggregate separately so they don't inflate
-    // the structural authority/impact/proximity weight summed over `edges`.
-    let mut flow_agg: HashMap<(String, String, &'static str), (usize, BTreeSet<String>)> =
-        HashMap::new();
-    let add_edge =
-        |from: &str, to: &str, kind: &'static str, via: &str, agg: &mut HashMap<_, _>| {
-            if from == to {
-                return;
-            }
-            let entry: &mut (usize, BTreeSet<String>) = agg
-                .entry((from.to_string(), to.to_string(), kind))
-                .or_insert((0, BTreeSet::new()));
-            entry.0 += 1;
-            if entry.1.len() < 8 {
-                entry.1.insert(via.to_string());
-            }
-        };
-
-    for (path, content) in &content_cache {
-        let imports = import_candidates(content);
-        let inherits = inheritance_candidates(content);
-        // Resolved relative-path imports (TS/JS) — file-level "imports" edges.
-        for spec in relative_import_specs(content) {
-            if let Some(target) = resolve_relative_import(path, &spec, &tracked) {
-                add_edge(path, &target, "imports", &spec, &mut agg);
-            }
+    // ---- edges from features (all dependents re-resolved every build) ----
+    let mut agg: EdgeAgg<'_> = HashMap::new();
+    let mut flow_agg: EdgeAgg<'_> = HashMap::new();
+    fn add_edge<'a>(
+        from: &'a str,
+        to: &'a str,
+        kind: &'static str,
+        via: &'a str,
+        n: usize,
+        agg: &mut EdgeAgg<'a>,
+    ) {
+        if from == to {
+            return;
         }
-        // Inheritance: extends/implements/impl-for/class(Base) → "inherits".
-        for name in &inherits {
-            if let Some(def) = unique_definer(name)
-                && &def.path != path
+        let entry = agg.entry((from, to, kind)).or_insert((0, BTreeSet::new()));
+        entry.0 += n;
+        if entry.1.len() < 8 {
+            entry.1.insert(via);
+        }
+    }
+    for (path, f) in &next.files {
+        for spec in &f.rel_specs {
+            if let Some(target) = resolve_relative_import(path, spec, &tracked)
+                && let Some(target) = tracked.get(&target)
             {
-                add_edge(path, &def.path, "inherits", name, &mut agg);
+                add_edge(path, target, "imports", spec, 1, &mut agg);
             }
         }
-        // Symbol-level imports: an import/use line naming a symbol defined elsewhere.
-        for name in &imports {
+        for name in &f.inherits {
             if let Some(def) = unique_definer(name)
-                && &def.path != path
+                && def.path != path
             {
-                add_edge(path, &def.path, "imports", name, &mut agg);
+                add_edge(path, def.path, "inherits", name, 1, &mut agg);
             }
         }
-        // References across the file body → calls / tests / references (by def kind).
-        let words = word_set(content);
-        for word in &words {
-            if inherits.contains(word) {
+        for name in &f.imports {
+            if let Some(def) = unique_definer(name)
+                && def.path != path
+            {
+                add_edge(path, def.path, "imports", name, 1, &mut agg);
+            }
+        }
+        for word in &f.words {
+            if f.inherits.binary_search(word).is_ok() {
                 continue; // already captured as a typed inheritance edge
             }
-            if let Some(def) = unique_definer(word) {
-                if &def.path == path {
-                    continue;
-                }
-                let kind = reference_edge_kind(path, &def.kind);
-                add_edge(path, &def.path, kind, word, &mut agg);
+            if let Some(def) = unique_definer(word)
+                && def.path != path
+            {
+                let kind = reference_edge_kind(path, def.kind);
+                add_edge(path, def.path, kind, word, 1, &mut agg);
             }
         }
-        // Flow pass: per-line, classify each referenced symbol's syntactic context
-        // into returns / branches / writes edges (additive to the call graph).
-        for line in content.lines() {
-            for (word, start, end) in identifier_spans(line) {
-                if word.len() < MIN_NAME_LEN {
-                    continue;
-                }
-                if let Some(def) = unique_definer(word)
-                    && &def.path != path
-                    && let Some(flow) = flow_edge_kind(line, start, end)
-                {
-                    add_edge(path, &def.path, flow, word, &mut flow_agg);
-                }
+        for (word, kind, n) in &f.flows {
+            if let Some(def) = unique_definer(word)
+                && def.path != path
+            {
+                let kind: &'static str = match kind.as_str() {
+                    "returns" => "returns",
+                    "branches" => "branches",
+                    _ => "writes",
+                };
+                add_edge(path, def.path, kind, word, *n, &mut flow_agg);
             }
         }
     }
-    let mut edges: Vec<GraphEdge> = agg
-        .into_iter()
-        .map(|((from, to, kind), (weight, via))| GraphEdge {
-            from_path: from,
-            to_path: to,
-            kind: kind.to_string(),
-            weight,
-            via_symbols: via.into_iter().collect(),
-            resolution: "lexical".to_string(),
-        })
-        .collect();
-    edges.sort_by(|a, b| {
-        b.weight
-            .cmp(&a.weight)
-            .then(a.from_path.cmp(&b.from_path))
-            .then(a.kind.cmp(&b.kind))
-    });
-
-    let mut flow_edges: Vec<GraphEdge> = flow_agg
-        .into_iter()
-        .map(|((from, to, kind), (weight, via))| GraphEdge {
-            from_path: from,
-            to_path: to,
-            kind: kind.to_string(),
-            weight,
-            via_symbols: via.into_iter().collect(),
-            resolution: "lexical".to_string(),
-        })
-        .collect();
-    flow_edges.sort_by(|a, b| {
-        b.weight
-            .cmp(&a.weight)
-            .then(a.from_path.cmp(&b.from_path))
-            .then(a.kind.cmp(&b.kind))
-    });
-
-    // precompute authority (total inbound reference weight) per file at index time.
+    let to_edges = |agg: EdgeAgg<'_>| {
+        let mut edges: Vec<GraphEdge> = agg
+            .into_iter()
+            .map(|((from, to, kind), (weight, via))| GraphEdge {
+                from_path: from.to_string(),
+                to_path: to.to_string(),
+                kind: kind.to_string(),
+                weight,
+                via_symbols: via.into_iter().map(str::to_string).collect(),
+                resolution: "lexical".to_string(),
+            })
+            .collect();
+        edges.sort_by(|a, b| {
+            b.weight
+                .cmp(&a.weight)
+                .then(a.from_path.cmp(&b.from_path))
+                .then(a.to_path.cmp(&b.to_path))
+                .then(a.kind.cmp(&b.kind))
+        });
+        edges
+    };
+    let edges = to_edges(agg);
+    let flow_edges = to_edges(flow_agg);
+    drop(name_to_defs);
     let mut inbound: HashMap<&str, usize> = HashMap::new();
     for e in &edges {
         *inbound.entry(e.to_path.as_str()).or_insert(0) += e.weight;
@@ -1132,12 +1754,95 @@ pub fn build_symbol_graph(root: &Path, workspace_id: &str) -> SymbolGraph {
         node.authority = inbound.get(node.path.as_str()).copied().unwrap_or(0);
     }
 
-    // persist the per-file symbol cache for the next (incremental) build.
-    if let Ok(bytes) = serde_json::to_vec(&next_cache) {
-        crate::indexcache::store_symbol_cache_bytes(root, workspace_id, &bytes);
+    // ---- stability: the graph reflects exactly the identity it reports ----
+    let after = source_identity(root);
+    work.identity_passes += 1;
+    work.identity_files_hashed += after.files_hashed;
+    work.identity_bytes_hashed += after.bytes_hashed;
+    let stable = !identity_mismatch && after.key == id.key;
+
+    let mut stored_temps = 0;
+    let indexed_files = next.files.len();
+    if let Some(scope) = scope
+        && stable
+    {
+        stored_temps += scope.store_features(&next);
+    }
+    // move (not clone) symbol names/kinds into graph nodes, releasing each file's
+    // remaining features as it goes; the node vector is allocated once at full size.
+    let mut symbols = Vec::with_capacity(kept_total);
+    for ((rel, f), node) in next.files.into_iter().zip(&file_nodes) {
+        for s in f.symbols.into_iter().take(node.symbol_count) {
+            symbols.push(GraphSymbolNode {
+                name: s.name,
+                kind: s.kind,
+                path: rel.clone(),
+                line_start: s.line_start,
+            });
+        }
     }
 
-    SymbolGraph {
+    // ---- coverage ----
+    losses.sort_by(|a, b| a.path.cmp(&b.path).then(a.reason.cmp(&b.reason)));
+    let mut loss_counts: BTreeMap<String, usize> = BTreeMap::new();
+    for l in &losses {
+        *loss_counts.entry(l.reason.clone()).or_insert(0) += 1;
+    }
+    let total_losses = losses.len();
+    let losses_truncated = total_losses > MAX_LOSS_ENTRIES;
+    losses.truncate(MAX_LOSS_ENTRIES);
+    let file_capped = loss_counts.contains_key("file_cap");
+    let truncated = file_capped || symbols_truncated_files > 0 || budget_hit;
+    let mut reasons: Vec<String> = Vec::new();
+    if file_capped {
+        reasons.push(format!(
+            "indexed first {selected} of {eligible} source files; results beyond the cap are incomplete"
+        ));
+    }
+    let other: Vec<String> = loss_counts
+        .iter()
+        .filter(|(r, _)| r.as_str() != "file_cap")
+        .map(|(r, n)| format!("{r}={n}"))
+        .collect();
+    if !other.is_empty() {
+        reasons.push(format!("coverage losses: {}", other.join(", ")));
+    }
+    if !stable {
+        reasons.push("source changed during indexing; this result is not cached".into());
+    }
+    // `complete` covers the graph's input: no coverage loss, a stable build, and an
+    // identity that determines every tracked file the graph reads. Limitations on
+    // untracked files (never indexed) are reported in `source_identity` only.
+    let identity_determines_graph = id.graph_bypass_reason().is_none();
+    let complete = loss_counts.is_empty() && stable && identity_determines_graph;
+    if !identity_determines_graph {
+        reasons.push(format!(
+            "source identity is incomplete for indexed files ({})",
+            id.graph_bypass_reason().unwrap_or_default()
+        ));
+    }
+    let cacheable = store_graph && stable && !clean_read_failed;
+    work.graph_cache = match (work.graph_cache.as_str(), cacheable) {
+        ("uncached", _) => "uncached".into(),
+        ("bypass", _) => "bypass".into(),
+        (_, true) => "miss".into(),
+        (_, false) => {
+            if work.graph_cache_detail.is_empty() {
+                work.graph_cache_detail = if !stable {
+                    "source changed during the build".into()
+                } else if clean_read_failed {
+                    "an unchanged file could not be read; retried on the next call".into()
+                } else {
+                    "not stored".into()
+                };
+            }
+            "bypass".into()
+        }
+    };
+    work.symbols_indexed = symbols.len();
+    work.coverage_losses = total_losses;
+
+    let mut graph = SymbolGraph {
         workspace_id: workspace_id.to_string(),
         file_count: file_nodes.len(),
         symbol_count: symbols.len(),
@@ -1147,9 +1852,36 @@ pub fn build_symbol_graph(root: &Path, workspace_id: &str) -> SymbolGraph {
         edges,
         flow_edge_count: flow_edges.len(),
         flow_edges,
-        coverage,
+        coverage: IndexCoverage {
+            repo_mode: "git".into(),
+            eligible_files: eligible,
+            indexed_files,
+            truncated,
+            max_files: MAX_FILES,
+            degraded_reason: (!reasons.is_empty()).then(|| reasons.join("; ")),
+            selected_files: selected,
+            complete,
+            worktree_deleted_files: deleted,
+            symbols_truncated_files,
+            loss_counts,
+            losses,
+            losses_truncated,
+            extraction,
+            source_identity: identity_summary(id, stable),
+            work: IndexWork::default(),
+        },
         generated_at: now(),
+    };
+    if cacheable && let Some(scope) = scope {
+        // the stored snapshot carries this build's counters; hits replace them.
+        work.elapsed_ms = started.elapsed().as_millis() as u64;
+        graph.coverage.work = work.clone();
+        stored_temps += scope.store_graph(&id.key, &graph);
     }
+    work.stale_temps_removed = stored_temps;
+    work.elapsed_ms = started.elapsed().as_millis() as u64;
+    graph.coverage.work = work;
+    graph
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1349,21 +2081,54 @@ pub struct BlastRadius {
     pub referencing_files: Vec<String>,
     pub referencing_file_count: usize,
     pub generated_at: String,
+    /// Files that could not be read or fully extracted, so the answer may miss them.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub coverage_losses: Vec<CoverageLoss>,
 }
 
 /// What files reference a given symbol — the blast radius of changing it.
 pub fn blast_radius(root: &Path, workspace_id: &str, symbol: &str) -> BlastRadius {
-    let files = tracked_source_files(root);
     let mut defined_in = Vec::new();
     let mut referencing = BTreeSet::new();
+    let mut coverage_losses = Vec::new();
+    let mut lose = |path: &str, reason: &str, detail: String| {
+        coverage_losses.push(CoverageLoss {
+            path: path.to_string(),
+            reason: reason.to_string(),
+            detail,
+            content_indexed: false,
+        })
+    };
+    let files: Vec<String> = match ls_files_stage(root) {
+        Ok(entries) => entries
+            .into_iter()
+            .filter_map(|e| String::from_utf8(e.path).ok())
+            .filter(|p| is_source(p))
+            .collect(),
+        Err(e) => {
+            lose("", "git_unavailable", e.to_string());
+            Vec::new()
+        }
+    };
     for rel in &files {
-        let content = read_repo_file_beneath(root, rel).unwrap_or_default();
+        let bytes = match read_source_beneath(root, Path::new(rel), MAX_REPO_FILE_BYTES) {
+            Ok(b) => b,
+            Err(SourceReadFailure::Missing) => continue,
+            Err(f) => {
+                lose(rel, f.reason(), f.detail());
+                continue;
+            }
+        };
+        let content = String::from_utf8_lossy(&bytes);
         if word_set(&content).contains(symbol) {
             referencing.insert(rel.clone());
         }
-        if let Ok(result) = repomap::extract_path_symbols(root, workspace_id, rel)
-            && result.symbols.iter().any(|s| s.symbol == symbol)
-        {
+        let ex =
+            repomap::extract_source_symbols(rel, &content, crate::treesitter::MAX_SYMBOLS_PER_FILE);
+        if ex.truncated {
+            lose(rel, "symbols_truncated", String::new());
+        }
+        if ex.symbols.iter().any(|s| s.symbol == symbol) {
             defined_in.push(rel.clone());
         }
     }
@@ -1378,6 +2143,7 @@ pub fn blast_radius(root: &Path, workspace_id: &str, symbol: &str) -> BlastRadiu
         referencing_file_count: referencing_files.len(),
         referencing_files,
         generated_at: now(),
+        coverage_losses,
     }
 }
 
@@ -1522,7 +2288,10 @@ mod tests {
             );
             checked += 1;
         }
-        assert!(checked >= 20, "golden spec should pin many paths, got {checked}");
+        assert!(
+            checked >= 20,
+            "golden spec should pin many paths, got {checked}"
+        );
     }
 
     // A directory target is not a regular file and must be refused by the read/hash path.
@@ -1765,10 +2534,12 @@ mod tests {
         // silent empty graph.
         let plain = TempDir::new().unwrap();
         std::fs::write(plain.path().join("a.rs"), "pub fn x() {}\n").unwrap();
-        let (files, cov) = tracked_source_files_with_coverage(plain.path());
-        assert!(files.is_empty());
+        let empty = build_symbol_graph(plain.path(), "ws");
+        let cov = &empty.coverage;
+        assert!(empty.files.is_empty());
         assert_eq!(cov.repo_mode, "git-unavailable");
         assert!(cov.degraded_reason.is_some());
+        assert!(!cov.complete);
 
         // a git repo reports git mode with eligible/indexed counts and no truncation.
         let repo = git_repo(&[("a.rs", "pub fn x() {}\n"), ("b.rs", "pub fn y() {}\n")]);
@@ -1847,6 +2618,79 @@ mod tests {
         assert_eq!(probe("    let x = helper();", "helper"), None);
         // `if` must not match inside another identifier.
         assert_eq!(probe("    let notify = thing();", "thing"), None);
+    }
+
+    // Source output must reflect the identity it reports: an edit between computing the
+    // identity and reading the file makes the build unstable, uncached and labeled.
+    #[test]
+    fn edit_during_build_is_unstable_and_not_cached() {
+        use crate::indexcache::{cache_scope, source_identity};
+        let repo = git_repo(&[("a.rs", "pub fn before_edit() {}\n")]);
+        std::fs::write(repo.path().join("a.rs"), "pub fn dirty_one() {}\n").unwrap();
+        let id = source_identity(repo.path());
+        let scope = cache_scope(&id).unwrap();
+        // the file changes after the identity was taken, before the build reads it.
+        std::fs::write(repo.path().join("a.rs"), "pub fn dirty_two() {}\n").unwrap();
+        let work = IndexWork {
+            graph_cache: "miss".into(),
+            ..Default::default()
+        };
+        let g = build_graph(
+            repo.path(),
+            "ws",
+            &id,
+            Some(&scope),
+            true,
+            work,
+            std::time::Instant::now(),
+        );
+        let c = &g.coverage;
+        assert!(!c.source_identity.stable && !c.complete);
+        assert_eq!(c.work.graph_cache, "bypass");
+        assert!(
+            c.degraded_reason
+                .as_deref()
+                .unwrap()
+                .contains("source changed")
+        );
+        assert!(
+            scope.load_graph(&id.key).is_none(),
+            "unstable graph was cached"
+        );
+        // the next call sees a consistent tree and caches it.
+        let g2 = build_symbol_graph_cached(repo.path(), "ws");
+        assert!(g2.coverage.source_identity.stable);
+        assert!(g2.symbols.iter().any(|s| s.name == "dirty_two"));
+    }
+
+    // line_flows (production) must classify exactly like flow_edge_kind (reference)
+    // for every identifier it reports and every one it skips.
+    #[test]
+    fn line_flows_matches_reference_classifier() {
+        let lines = [
+            "    return make_widget(total_count);",
+            "    if is_ready() && other_flag { run_task(); }",
+            "    while pending_work() { value_sum += step_size; }",
+            "    CONFIG_VALUE = load_config();",
+            "    let notify_user = thing_maker();",
+            "    x9return some_value; 9return other_value; match_arm = case_value;",
+            "    // step 3: accumulate value for f000_001 when ready",
+            "    elif branch_cond == target_value: switch_mode = 1",
+            "    café_name = résumé_value; return naïve_value",
+        ];
+        for line in lines {
+            let got: Vec<(&str, &str)> = line_flows(line);
+            let mut want = Vec::new();
+            for (word, start, end) in identifier_spans(line) {
+                if word.len() < MIN_NAME_LEN {
+                    continue;
+                }
+                if let Some(k) = flow_edge_kind(line, start, end) {
+                    want.push((word, k));
+                }
+            }
+            assert_eq!(got, want, "line: {line:?}");
+        }
     }
 
     #[test]

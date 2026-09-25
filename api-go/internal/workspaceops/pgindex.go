@@ -94,7 +94,7 @@ func MaterializePostgresIndex(dataDir, workspaceID string) (map[string]any, erro
 	if err != nil {
 		return nil, err
 	}
-	raw, err := rustcore.RunSymbolgraph("build", root, workspaceID)
+	raw, err := rustcore.RunSymbolgraph(context.Background(), "build", root, workspaceID)
 	if err != nil {
 		return nil, err
 	}

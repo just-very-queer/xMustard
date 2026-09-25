@@ -2,7 +2,6 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use std::collections::BTreeMap;
-use std::fs;
 use std::path::Path;
 use walkdir::{DirEntry, WalkDir};
 
@@ -106,7 +105,9 @@ pub fn scan_repo_signals(root_path: &Path) -> Result<Vec<RustDiscoverySignal>, s
         if !should_scan_file(&relative) {
             continue;
         }
-        let content = match fs::read_to_string(entry.path()) {
+        // shared bounded, no-follow, regular-file-checked reader: over-cap, symlinked,
+        // non-UTF-8 or vanished files are skipped rather than read raw.
+        let content = match crate::symbolgraph::read_repo_file_beneath(root_path, &relative) {
             Ok(content) => content,
             Err(_) => continue,
         };
@@ -273,6 +274,38 @@ mod tests {
             fs::create_dir_all(parent).unwrap();
         }
         fs::write(path, content).unwrap();
+    }
+
+    // Audit finding 5: the scanner used a raw, unbounded read_to_string.
+    // Fable F4: a leading-space name is read exactly, never as its trimmed decoy.
+    #[test]
+    fn scanner_reads_whitespace_named_files_exactly() {
+        let dir = tempfile::TempDir::new().unwrap();
+        fs::write(dir.path().join(" lead.py"), "# TODO real marker\n").unwrap();
+        fs::write(dir.path().join("lead.py"), "x = 1\n").unwrap();
+        let signals = scan_repo_signals(dir.path()).unwrap();
+        assert!(
+            signals.iter().any(|s| s.file_path == " lead.py"),
+            "whitespace-named file skipped or read as its trimmed decoy: {signals:?}"
+        );
+    }
+
+    #[test]
+    fn scanner_skips_files_over_the_shared_read_cap() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut body = b"# TODO oversized marker\n".to_vec();
+        body.resize(
+            (crate::symbolgraph::MAX_REPO_FILE_BYTES as usize) + 16,
+            b' ',
+        );
+        fs::write(dir.path().join("big.py"), body).unwrap();
+        fs::write(dir.path().join("small.py"), "# TODO small marker\n").unwrap();
+        let signals = scan_repo_signals(dir.path()).unwrap();
+        assert!(signals.iter().any(|s| s.file_path == "small.py"));
+        assert!(
+            !signals.iter().any(|s| s.file_path == "big.py"),
+            "an over-cap file was read without the shared bound"
+        );
     }
 
     #[test]

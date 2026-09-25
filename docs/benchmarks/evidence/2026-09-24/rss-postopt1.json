@@ -1,0 +1,4848 @@
+{
+ "suite": "rss-bench",
+ "passed": 19,
+ "failed": 0,
+ "checks": [
+  {
+   "check": "fixture: 501 tracked files, ~20 MiB, 70-symbol file",
+   "ok": true,
+   "detail": "501 files, 21179988 bytes"
+  },
+  {
+   "check": "cold query finds symbol_070 (beyond the old 32/64 caps)",
+   "ok": true,
+   "detail": ""
+  },
+  {
+   "check": "cold query is a cache miss that parses every tracked file",
+   "ok": true,
+   "detail": "{\"graph_cache\": \"miss\", \"files_read\": 501, \"files_parsed\": 501, \"files_reused\": 0, \"bytes_parsed\": 21179988, \"symbols_indexed\": 29737}"
+  },
+  {
+   "check": "warm query is a cache hit with 0 files parsed",
+   "ok": true,
+   "detail": "{\"graph_cache\": \"hit\", \"files_read\": 0, \"files_parsed\": 0, \"files_reused\": 0, \"bytes_parsed\": 0, \"symbols_indexed\": 29737}"
+  },
+  {
+   "check": "same-size dirty edit reparses exactly one file",
+   "ok": true,
+   "detail": "{\"graph_cache\": \"miss\", \"files_read\": 1, \"files_parsed\": 1, \"files_reused\": 500, \"bytes_parsed\": 42168, \"symbols_indexed\": 29737}"
+  },
+  {
+   "check": "rename/delete reparses at most the renamed file and drops the deleted file's symbols",
+   "ok": true,
+   "detail": "{\"graph_cache\": \"miss\", \"files_read\": 0, \"files_parsed\": 0, \"files_reused\": 499, \"bytes_parsed\": 0, \"symbols_indexed\": 29625}"
+  },
+  {
+   "check": "two concurrent index clients both answer",
+   "ok": true,
+   "detail": ""
+  },
+  {
+   "check": "capture payloads are exactly 16 MiB",
+   "ok": true,
+   "detail": "16777216 bytes x5, sha256 86612914aa3da896"
+  },
+  {
+   "check": "every capture attempt was decided on its headers",
+   "ok": true,
+   "detail": "['captured', 'captured', 'captured', 'captured', 'wire_503_overloaded']"
+  },
+  {
+   "check": "no capture attempt ended in a transport error",
+   "ok": true,
+   "detail": "[]"
+  },
+  {
+   "check": "at least one capture refused on the wire: 503 + Retry-After + overloaded:true",
+   "ok": true,
+   "detail": "['captured', 'captured', 'captured', 'captured', 'wire_503_overloaded']"
+  },
+  {
+   "check": "admitted captures succeed",
+   "ok": true,
+   "detail": "['captured', 'captured', 'captured', 'captured', 'wire_503_overloaded']"
+  },
+  {
+   "check": "pool held while admitted captures overlapped never exceeded its max",
+   "ok": true,
+   "detail": "{\"in_use\": 67108864, \"max\": 67108864, \"peak\": 67108864}"
+  },
+  {
+   "check": "every captured original reports exact size and SHA-256 and retains a handle",
+   "ok": true,
+   "detail": "[[true, 16777216, \"86612914aa3d\"], [true, 16777216, \"86612914aa3d\"], [true, 16777216, \"86612914aa3d\"], [true, 16777216, \"86612914aa3d\"]]"
+  },
+  {
+   "check": "every captured original fully expanded in <=64 KiB pages with exact size and SHA-256",
+   "ok": true,
+   "detail": "[[\"mcp#1\", 256, true, null], [\"http\", 256, true, null], [\"mcp#2\", 256, true, null], [\"http\", 256, true, null], [\"http\", 256, true, null]]"
+  },
+  {
+   "check": "transient pool in-use never exceeded its max and is released",
+   "ok": true,
+   "detail": "{\"in_use\": 0, \"max\": 67108864, \"peak\": 67108864}"
+  },
+  {
+   "check": "helper-child limit held",
+   "ok": true,
+   "detail": "admission peak 2/4, sampled concurrent xmustard-core 2"
+  },
+  {
+   "check": "sampler valid: samples taken, no ps errors, no lost required roots, workload complete",
+   "ok": true,
+   "detail": ""
+  },
+  {
+   "check": "sampled xMustard-owned tree peak <= 100 MB (100,000,000 bytes)",
+   "ok": true,
+   "detail": "72.3 MB (69.0 MiB) over 838 samples at 'two concurrent index clients'"
+  }
+ ],
+ "results": {
+  "tmp": null,
+  "provenance": {
+   "head": "cd13e2b78a9fadcbcd760b19442d5992136b1db0",
+   "source_diff_sha256": "e0e282e6403c5d4fd688cd307a8e690967674fd50731d3af79f3abafc6adcd19",
+   "untracked_source_files": 33,
+   "untracked_source_sha256": "61245cae425f045f9e2da6af1b5220b35cdbb453650067425105e13988bd5037",
+   "binaries_sha256": {
+    "xmustard-api": "88e88bacc3f02a8aaf46253ca0ec5787c70da6e901640a1410781a59ba17f39b",
+    "xmustard-mcp": "3d06d73f776146e0b9e98972c1a059e14b9a048fb71026ef86272b16aafd3a37",
+    "xmustard-core": "d644743ba005318ebbce451d7924ce4bcbefb26be057a48ff64f24ff430c3576"
+   },
+   "core_bin": "/private/tmp/xmustard-opus-l9b1F4/rust-core/target/release/xmustard-core",
+   "core_bin_prebuilt": false,
+   "script_sha256": {
+    "scripts/bench/rss_bench.py": "6411f391878bd4ddd452c6128141dfc2c54739c8c1f9885c8ed537c2d54facef",
+    "scripts/e2e/harness.py": "973147225ffce59f2d5af01fd71ba06cc0d0d74964f140e00365bb4ae129d5bc"
+   },
+   "env": {
+    "os": "macOS-27.0-arm64-arm-64bit",
+    "machine": "arm64",
+    "python": "3.9.6",
+    "go": "go version go1.26.1 darwin/arm64",
+    "cpus": 8
+   }
+  },
+  "fixture": {
+   "tracked_files": 501,
+   "bytes": 21179988,
+   "tree_sha256": "c16734b0a9e17964720c6b4c226b93d6f61951eb50a3ed1e68ecee5a18957ef8",
+   "many_rs_symbols": 70,
+   "syntax_limitation": "generated Rust statements lack ';' (tree-sitter-rust GLR error recovery); baseline kept unchanged for comparability"
+  },
+  "admission": {
+   "capture_attempts": [
+    {
+     "idx": 0,
+     "outcome": "captured",
+     "body_bytes_sent": 16777216,
+     "decision_ms": 1.0,
+     "admitted_on_headers": true,
+     "status": 200,
+     "retry_after": null,
+     "response_bytes": 2313,
+     "elapsed_ms": 432.7
+    },
+    {
+     "idx": 1,
+     "outcome": "captured",
+     "body_bytes_sent": 16777216,
+     "decision_ms": 1.0,
+     "admitted_on_headers": true,
+     "status": 200,
+     "retry_after": null,
+     "response_bytes": 2313,
+     "elapsed_ms": 450.5
+    },
+    {
+     "idx": 2,
+     "outcome": "captured",
+     "body_bytes_sent": 16777216,
+     "decision_ms": 1.0,
+     "admitted_on_headers": true,
+     "status": 200,
+     "retry_after": null,
+     "response_bytes": 2313,
+     "elapsed_ms": 474.6
+    },
+    {
+     "idx": 3,
+     "outcome": "captured",
+     "body_bytes_sent": 16777216,
+     "decision_ms": 0.9,
+     "admitted_on_headers": true,
+     "status": 200,
+     "retry_after": null,
+     "response_bytes": 2313,
+     "elapsed_ms": 474.3
+    },
+    {
+     "idx": 4,
+     "outcome": "wire_503_overloaded",
+     "body_bytes_sent": 0,
+     "decision_ms": 0.4,
+     "admitted_on_headers": false,
+     "status": 503,
+     "retry_after": "1",
+     "response_bytes": 93,
+     "elapsed_ms": 0.8
+    }
+   ],
+   "outcomes": [
+    "captured",
+    "captured",
+    "captured",
+    "captured",
+    "wire_503_overloaded"
+   ],
+   "pool_while_held": {
+    "in_use": 67108864,
+    "max": 67108864,
+    "peak": 67108864
+   },
+   "transient_pool_final": {
+    "in_use": 0,
+    "max": 67108864,
+    "peak": 67108864
+   },
+   "children": {
+    "cap": 4,
+    "in_use": 0,
+    "peak": 2
+   },
+   "client": "Expect: 100-continue; refusal decided on headers before any body byte"
+  },
+  "bytes": {
+   "raw_per_capture": 16777216,
+   "captured_originals": 4,
+   "deliveries": [
+    {
+     "idx": 0,
+     "handle": "xm1.mCeris_5p4V0FBzUpJ520lm-azQotCPEqt7mfAMQ3Qk",
+     "resource_uri": "xmustard://evidence/xm1.mCeris_5p4V0FBzUpJ520lm-azQotCPEqt7mfAMQ3Qk?workspace_id=repo-3b176dac3f",
+     "raw_bytes": 16777216,
+     "raw_sha256": "86612914aa3da896f8a2f8f4db94cb4f9f07ed1a9822a491388498dec69ca361",
+     "projected_bytes": 1561,
+     "projection_len": 1561,
+     "response_bytes": 2313,
+     "reduced": true,
+     "reducer": "xm-reduce/1",
+     "omissions": 1
+    },
+    {
+     "idx": 1,
+     "handle": "xm1._MnCxLrS0rNS7jtiGFeA7SAcpRuFxpeIE2ra4tTGZZI",
+     "resource_uri": "xmustard://evidence/xm1._MnCxLrS0rNS7jtiGFeA7SAcpRuFxpeIE2ra4tTGZZI?workspace_id=repo-3b176dac3f",
+     "raw_bytes": 16777216,
+     "raw_sha256": "86612914aa3da896f8a2f8f4db94cb4f9f07ed1a9822a491388498dec69ca361",
+     "projected_bytes": 1561,
+     "projection_len": 1561,
+     "response_bytes": 2313,
+     "reduced": true,
+     "reducer": "xm-reduce/1",
+     "omissions": 1
+    },
+    {
+     "idx": 2,
+     "handle": "xm1.xmPBNd_TnMST5cUj0zoxc6yGwchjxv5iZlxpM-TpgV4",
+     "resource_uri": "xmustard://evidence/xm1.xmPBNd_TnMST5cUj0zoxc6yGwchjxv5iZlxpM-TpgV4?workspace_id=repo-3b176dac3f",
+     "raw_bytes": 16777216,
+     "raw_sha256": "86612914aa3da896f8a2f8f4db94cb4f9f07ed1a9822a491388498dec69ca361",
+     "projected_bytes": 1561,
+     "projection_len": 1561,
+     "response_bytes": 2313,
+     "reduced": true,
+     "reducer": "xm-reduce/1",
+     "omissions": 1
+    },
+    {
+     "idx": 3,
+     "handle": "xm1._u-eLenDJMRGHScha2LEAl6CvWtvzJXEN0gUlfprXbc",
+     "resource_uri": "xmustard://evidence/xm1._u-eLenDJMRGHScha2LEAl6CvWtvzJXEN0gUlfprXbc?workspace_id=repo-3b176dac3f",
+     "raw_bytes": 16777216,
+     "raw_sha256": "86612914aa3da896f8a2f8f4db94cb4f9f07ed1a9822a491388498dec69ca361",
+     "projected_bytes": 1561,
+     "projection_len": 1561,
+     "response_bytes": 2313,
+     "reduced": true,
+     "reducer": "xm-reduce/1",
+     "omissions": 1
+    }
+   ],
+   "retained_storage_after_capture": {
+    "apparent": 67111920,
+    "allocated": 67125248,
+    "files": 8
+   },
+   "retained_storage_after_expansion": {
+    "apparent": 67111920,
+    "allocated": 67125248,
+    "files": 8
+   },
+   "expansions": [
+    {
+     "handle": "xm1.mCeris_5",
+     "ok": true,
+     "bytes": 16777216,
+     "sha256": "86612914aa3da896f8a2f8f4db94cb4f9f07ed1a9822a491388498dec69ca361",
+     "exact_size_and_sha256": true,
+     "pages": 256,
+     "overload_retries": 0,
+     "delivered_bytes": 22570649,
+     "delivered_measure": "mcp_reply_reserialized_bytes (estimate, not wire bytes)",
+     "page_ms": {
+      "p50": 52.8,
+      "p95": 57.4,
+      "max": 116.4,
+      "total_s": 13.69
+     },
+     "via": "mcp#1"
+    },
+    {
+     "handle": "xm1._MnCxLrS",
+     "ok": true,
+     "bytes": 16777216,
+     "sha256": "86612914aa3da896f8a2f8f4db94cb4f9f07ed1a9822a491388498dec69ca361",
+     "exact_size_and_sha256": true,
+     "pages": 256,
+     "overload_retries": 0,
+     "delivered_bytes": 22498984,
+     "delivered_measure": "http_response_body_bytes (exact)",
+     "page_ms": {
+      "p50": 52.0,
+      "p95": 57.2,
+      "max": 68.4,
+      "total_s": 13.44
+     },
+     "via": "http"
+    },
+    {
+     "handle": "xm1.xmPBNd_T",
+     "ok": true,
+     "bytes": 16777216,
+     "sha256": "86612914aa3da896f8a2f8f4db94cb4f9f07ed1a9822a491388498dec69ca361",
+     "exact_size_and_sha256": true,
+     "pages": 256,
+     "overload_retries": 0,
+     "delivered_bytes": 22570641,
+     "delivered_measure": "mcp_reply_reserialized_bytes (estimate, not wire bytes)",
+     "page_ms": {
+      "p50": 52.6,
+      "p95": 59.9,
+      "max": 102.3,
+      "total_s": 13.7
+     },
+     "via": "mcp#2"
+    },
+    {
+     "handle": "xm1._u-eLenD",
+     "ok": true,
+     "bytes": 16777216,
+     "sha256": "86612914aa3da896f8a2f8f4db94cb4f9f07ed1a9822a491388498dec69ca361",
+     "exact_size_and_sha256": true,
+     "pages": 256,
+     "overload_retries": 0,
+     "delivered_bytes": 22498984,
+     "delivered_measure": "http_response_body_bytes (exact)",
+     "page_ms": {
+      "p50": 51.9,
+      "p95": 58.8,
+      "max": 88.6,
+      "total_s": 13.55
+     },
+     "via": "http"
+    },
+    {
+     "handle": "xm1.mCeris_5",
+     "ok": true,
+     "bytes": 16777216,
+     "sha256": "86612914aa3da896f8a2f8f4db94cb4f9f07ed1a9822a491388498dec69ca361",
+     "exact_size_and_sha256": true,
+     "pages": 256,
+     "overload_retries": 0,
+     "delivered_bytes": 22498984,
+     "delivered_measure": "http_response_body_bytes (exact)",
+     "page_ms": {
+      "p50": 51.8,
+      "p95": 56.7,
+      "max": 63.9,
+      "total_s": 13.35
+     },
+     "via": "http",
+     "re_expansion": true
+    }
+   ],
+   "expansion_count": 5,
+   "pages_total": 1280,
+   "overload_retries_total": 0,
+   "expansion_delivered_bytes_by_measure": {
+    "mcp_reply_reserialized_bytes (estimate, not wire bytes)": 45141290,
+    "http_response_body_bytes (exact)": 67496952
+   },
+   "raw_bytes_recovered_total": 83886080
+  },
+  "api_rusage": "self_maxrss=29229056 children_maxrss=32899072 unit=bytes self_cpu_s=4.579 children_cpu_s=72.191 go_total_alloc_bytes=1082725152 go_mallocs=12949350 go_heap_sys_bytes=19955712",
+  "os_child_high_water": {
+   "api_self_and_children": "self_maxrss=29229056 children_maxrss=32899072 unit=bytes self_cpu_s=4.579 children_cpu_s=72.191 go_total_alloc_bytes=1082725152 go_mallocs=12949350 go_heap_sys_bytes=19955712",
+   "unit": "bytes",
+   "note": "API getrusage: self high-water and the largest single waited-for child (Rust core/git); not a concurrent tree peak. MCP shim high-water is unmeasured (the harness's own RUSAGE_CHILDREN also counts `go build`, so it is not attributable and not reported)."
+  },
+  "sampled_tree": {
+   "peak_bytes": 72302592,
+   "peak_mb": 72.3,
+   "peak_mib": 69.0,
+   "samples": 838,
+   "interval_ms_target": 100,
+   "interval_ms_observed": {
+    "median": 103.8,
+    "max": 105.4,
+    "over_150ms": 0
+   },
+   "ps_errors": [],
+   "ps_error_count": 0,
+   "lost_root_snapshots": [],
+   "lost_root_count": 0,
+   "required_roots": {
+    "xmustard-api": 10191,
+    "xmustard-mcp#1": 10192,
+    "xmustard-mcp#2": 10193
+   },
+   "peak_step": "two concurrent index clients",
+   "peak_t_s": 18.21,
+   "processes_at_peak": [
+    {
+     "pid": 10630,
+     "ppid": 10191,
+     "comm": "xmustard-core",
+     "rss_kib": 22336
+    },
+    {
+     "pid": 10191,
+     "ppid": 10137,
+     "comm": "xmustard-api",
+     "rss_kib": 21632
+    },
+    {
+     "pid": 10192,
+     "ppid": 10137,
+     "comm": "xmustard-mcp",
+     "rss_kib": 10432
+    },
+    {
+     "pid": 10193,
+     "ppid": 10137,
+     "comm": "xmustard-mcp",
+     "rss_kib": 9600
+    },
+    {
+     "pid": 10631,
+     "ppid": 10191,
+     "comm": "xmustard-core",
+     "rss_kib": 6608
+    }
+   ],
+   "step_sampled_peak_mb": {
+    "setup": 36.2,
+    "load workspace (initial scan)": 46.6,
+    "index baseline": 54.1,
+    "cold query symbol_070": 67.0,
+    "warm query symbol_070": 51.2,
+    "same-size dirty edit": 61.6,
+    "rename/delete cycle": 61.3,
+    "two concurrent index clients": 72.3,
+    "five concurrent 16 MiB captures": 49.9,
+    "expand every retained original": 66.3,
+    "re-expand one original": 50.0
+   },
+   "per_process_sampled_max_kib_by_command": {
+    "(xmustard-core)": 31952,
+    "xmustard-core": 22448,
+    "(git)": 5088,
+    "xmustard-api": 28544,
+    "xmustard-mcp": 16144
+   },
+   "note": "per-process maxima are unsynchronized diagnostics; they are never summed",
+   "max_concurrent_xmustard_core": 2,
+   "units": "ps rss KiB (1024 bytes) on darwin/linux; *_mb = 10^6 bytes, *_mib = 2^20 bytes",
+   "series_t_step_kib": [
+    [
+     0.0,
+     "setup",
+     35392
+    ],
+    [
+     0.1,
+     "load workspace (initial scan)",
+     37136
+    ],
+    [
+     0.2,
+     "load workspace (initial scan)",
+     45472
+    ],
+    [
+     0.3,
+     "load workspace (initial scan)",
+     45472
+    ],
+    [
+     0.4,
+     "index baseline",
+     46880
+    ],
+    [
+     0.51,
+     "index baseline",
+     47248
+    ],
+    [
+     0.61,
+     "index baseline",
+     47216
+    ],
+    [
+     0.71,
+     "index baseline",
+     52000
+    ],
+    [
+     0.82,
+     "index baseline",
+     52112
+    ],
+    [
+     0.92,
+     "index baseline",
+     52240
+    ],
+    [
+     1.02,
+     "index baseline",
+     52368
+    ],
+    [
+     1.13,
+     "index baseline",
+     52448
+    ],
+    [
+     1.23,
+     "index baseline",
+     52480
+    ],
+    [
+     1.33,
+     "index baseline",
+     52512
+    ],
+    [
+     1.44,
+     "index baseline",
+     52560
+    ],
+    [
+     1.54,
+     "index baseline",
+     52576
+    ],
+    [
+     1.65,
+     "index baseline",
+     52624
+    ],
+    [
+     1.75,
+     "index baseline",
+     52640
+    ],
+    [
+     1.85,
+     "index baseline",
+     52688
+    ],
+    [
+     1.95,
+     "index baseline",
+     52720
+    ],
+    [
+     2.05,
+     "index baseline",
+     52736
+    ],
+    [
+     2.16,
+     "index baseline",
+     52800
+    ],
+    [
+     2.26,
+     "index baseline",
+     52864
+    ],
+    [
+     2.36,
+     "index baseline",
+     52320
+    ],
+    [
+     2.47,
+     "index baseline",
+     50992
+    ],
+    [
+     2.57,
+     "index baseline",
+     49264
+    ],
+    [
+     2.67,
+     "index baseline",
+     49264
+    ],
+    [
+     2.78,
+     "index baseline",
+     48512
+    ],
+    [
+     2.88,
+     "index baseline",
+     48560
+    ],
+    [
+     2.99,
+     "index baseline",
+     46496
+    ],
+    [
+     3.09,
+     "index baseline",
+     46544
+    ],
+    [
+     3.19,
+     "index baseline",
+     46560
+    ],
+    [
+     3.3,
+     "index baseline",
+     46608
+    ],
+    [
+     3.4,
+     "index baseline",
+     41920
+    ],
+    [
+     3.51,
+     "index baseline",
+     41984
+    ],
+    [
+     3.61,
+     "index baseline",
+     42000
+    ],
+    [
+     3.71,
+     "index baseline",
+     42016
+    ],
+    [
+     3.81,
+     "index baseline",
+     42064
+    ],
+    [
+     3.92,
+     "index baseline",
+     42080
+    ],
+    [
+     4.02,
+     "index baseline",
+     42128
+    ],
+    [
+     4.12,
+     "index baseline",
+     38992
+    ],
+    [
+     4.22,
+     "index baseline",
+     39056
+    ],
+    [
+     4.33,
+     "index baseline",
+     39072
+    ],
+    [
+     4.43,
+     "index baseline",
+     39104
+    ],
+    [
+     4.54,
+     "index baseline",
+     39136
+    ],
+    [
+     4.64,
+     "index baseline",
+     39152
+    ],
+    [
+     4.74,
+     "index baseline",
+     39104
+    ],
+    [
+     4.85,
+     "index baseline",
+     39120
+    ],
+    [
+     4.95,
+     "index baseline",
+     39232
+    ],
+    [
+     5.05,
+     "index baseline",
+     39248
+    ],
+    [
+     5.16,
+     "index baseline",
+     39056
+    ],
+    [
+     5.26,
+     "index baseline",
+     39120
+    ],
+    [
+     5.37,
+     "index baseline",
+     39136
+    ],
+    [
+     5.47,
+     "index baseline",
+     39184
+    ],
+    [
+     5.58,
+     "index baseline",
+     39184
+    ],
+    [
+     5.68,
+     "index baseline",
+     39248
+    ],
+    [
+     5.79,
+     "index baseline",
+     39264
+    ],
+    [
+     5.89,
+     "index baseline",
+     39312
+    ],
+    [
+     5.99,
+     "index baseline",
+     39312
+    ],
+    [
+     6.09,
+     "index baseline",
+     39360
+    ],
+    [
+     6.19,
+     "index baseline",
+     39376
+    ],
+    [
+     6.29,
+     "index baseline",
+     39376
+    ],
+    [
+     6.4,
+     "index baseline",
+     39440
+    ],
+    [
+     6.51,
+     "index baseline",
+     39456
+    ],
+    [
+     6.61,
+     "index baseline",
+     39504
+    ],
+    [
+     6.71,
+     "index baseline",
+     39520
+    ],
+    [
+     6.81,
+     "index baseline",
+     39568
+    ],
+    [
+     6.91,
+     "index baseline",
+     39584
+    ],
+    [
+     7.02,
+     "index baseline",
+     39584
+    ],
+    [
+     7.12,
+     "index baseline",
+     41072
+    ],
+    [
+     7.22,
+     "index baseline",
+     41216
+    ],
+    [
+     7.33,
+     "index baseline",
+     41344
+    ],
+    [
+     7.43,
+     "index baseline",
+     41440
+    ],
+    [
+     7.53,
+     "index baseline",
+     41600
+    ],
+    [
+     7.64,
+     "index baseline",
+     41744
+    ],
+    [
+     7.74,
+     "index baseline",
+     41872
+    ],
+    [
+     7.85,
+     "index baseline",
+     42048
+    ],
+    [
+     7.95,
+     "index baseline",
+     42192
+    ],
+    [
+     8.06,
+     "index baseline",
+     42336
+    ],
+    [
+     8.16,
+     "index baseline",
+     42480
+    ],
+    [
+     8.26,
+     "index baseline",
+     42656
+    ],
+    [
+     8.37,
+     "index baseline",
+     42784
+    ],
+    [
+     8.47,
+     "index baseline",
+     42928
+    ],
+    [
+     8.58,
+     "index baseline",
+     47616
+    ],
+    [
+     8.68,
+     "index baseline",
+     47760
+    ],
+    [
+     8.78,
+     "index baseline",
+     47888
+    ],
+    [
+     8.89,
+     "index baseline",
+     48032
+    ],
+    [
+     8.99,
+     "index baseline",
+     48176
+    ],
+    [
+     9.1,
+     "index baseline",
+     48304
+    ],
+    [
+     9.2,
+     "index baseline",
+     48432
+    ],
+    [
+     9.3,
+     "index baseline",
+     48512
+    ],
+    [
+     9.41,
+     "index baseline",
+     48672
+    ],
+    [
+     9.51,
+     "index baseline",
+     48816
+    ],
+    [
+     9.61,
+     "index baseline",
+     48944
+    ],
+    [
+     9.72,
+     "index baseline",
+     49088
+    ],
+    [
+     9.82,
+     "index baseline",
+     49232
+    ],
+    [
+     9.93,
+     "index baseline",
+     49360
+    ],
+    [
+     10.03,
+     "index baseline",
+     49440
+    ],
+    [
+     10.13,
+     "cold query symbol_070",
+     46112
+    ],
+    [
+     10.24,
+     "cold query symbol_070",
+     56880
+    ],
+    [
+     10.34,
+     "cold query symbol_070",
+     57104
+    ],
+    [
+     10.45,
+     "cold query symbol_070",
+     57232
+    ],
+    [
+     10.55,
+     "cold query symbol_070",
+     57344
+    ],
+    [
+     10.65,
+     "cold query symbol_070",
+     57456
+    ],
+    [
+     10.75,
+     "cold query symbol_070",
+     57520
+    ],
+    [
+     10.85,
+     "cold query symbol_070",
+     57584
+    ],
+    [
+     10.96,
+     "cold query symbol_070",
+     57696
+    ],
+    [
+     11.06,
+     "cold query symbol_070",
+     57728
+    ],
+    [
+     11.17,
+     "cold query symbol_070",
+     57808
+    ],
+    [
+     11.27,
+     "cold query symbol_070",
+     57872
+    ],
+    [
+     11.38,
+     "cold query symbol_070",
+     57920
+    ],
+    [
+     11.48,
+     "cold query symbol_070",
+     57968
+    ],
+    [
+     11.58,
+     "cold query symbol_070",
+     58080
+    ],
+    [
+     11.69,
+     "cold query symbol_070",
+     58128
+    ],
+    [
+     11.79,
+     "cold query symbol_070",
+     58176
+    ],
+    [
+     11.89,
+     "cold query symbol_070",
+     58240
+    ],
+    [
+     11.99,
+     "cold query symbol_070",
+     58304
+    ],
+    [
+     12.1,
+     "cold query symbol_070",
+     58368
+    ],
+    [
+     12.2,
+     "cold query symbol_070",
+     58416
+    ],
+    [
+     12.3,
+     "cold query symbol_070",
+     58480
+    ],
+    [
+     12.4,
+     "cold query symbol_070",
+     58528
+    ],
+    [
+     12.5,
+     "cold query symbol_070",
+     58592
+    ],
+    [
+     12.61,
+     "cold query symbol_070",
+     58512
+    ],
+    [
+     12.71,
+     "cold query symbol_070",
+     58576
+    ],
+    [
+     12.82,
+     "cold query symbol_070",
+     58640
+    ],
+    [
+     12.92,
+     "cold query symbol_070",
+     46784
+    ],
+    [
+     13.02,
+     "cold query symbol_070",
+     46832
+    ],
+    [
+     13.13,
+     "cold query symbol_070",
+     44736
+    ],
+    [
+     13.23,
+     "cold query symbol_070",
+     44768
+    ],
+    [
+     13.34,
+     "cold query symbol_070",
+     43280
+    ],
+    [
+     13.44,
+     "cold query symbol_070",
+     43344
+    ],
+    [
+     13.54,
+     "cold query symbol_070",
+     43408
+    ],
+    [
+     13.65,
+     "cold query symbol_070",
+     43472
+    ],
+    [
+     13.75,
+     "cold query symbol_070",
+     43520
+    ],
+    [
+     13.86,
+     "cold query symbol_070",
+     43392
+    ],
+    [
+     13.96,
+     "cold query symbol_070",
+     43472
+    ],
+    [
+     14.06,
+     "cold query symbol_070",
+     43504
+    ],
+    [
+     14.17,
+     "cold query symbol_070",
+     43584
+    ],
+    [
+     14.27,
+     "cold query symbol_070",
+     43680
+    ],
+    [
+     14.38,
+     "cold query symbol_070",
+     43488
+    ],
+    [
+     14.48,
+     "cold query symbol_070",
+     43552
+    ],
+    [
+     14.59,
+     "cold query symbol_070",
+     43616
+    ],
+    [
+     14.69,
+     "cold query symbol_070",
+     43664
+    ],
+    [
+     14.79,
+     "cold query symbol_070",
+     43728
+    ],
+    [
+     14.89,
+     "cold query symbol_070",
+     43744
+    ],
+    [
+     14.99,
+     "cold query symbol_070",
+     43728
+    ],
+    [
+     15.1,
+     "cold query symbol_070",
+     43744
+    ],
+    [
+     15.2,
+     "cold query symbol_070",
+     43616
+    ],
+    [
+     15.31,
+     "cold query symbol_070",
+     43440
+    ],
+    [
+     15.41,
+     "cold query symbol_070",
+     43456
+    ],
+    [
+     15.52,
+     "cold query symbol_070",
+     43520
+    ],
+    [
+     15.62,
+     "cold query symbol_070",
+     43440
+    ],
+    [
+     15.72,
+     "cold query symbol_070",
+     43328
+    ],
+    [
+     15.83,
+     "cold query symbol_070",
+     45120
+    ],
+    [
+     15.93,
+     "cold query symbol_070",
+     45792
+    ],
+    [
+     16.03,
+     "cold query symbol_070",
+     46464
+    ],
+    [
+     16.14,
+     "cold query symbol_070",
+     47168
+    ],
+    [
+     16.24,
+     "cold query symbol_070",
+     47648
+    ],
+    [
+     16.34,
+     "cold query symbol_070",
+     52768
+    ],
+    [
+     16.45,
+     "cold query symbol_070",
+     53424
+    ],
+    [
+     16.55,
+     "cold query symbol_070",
+     54080
+    ],
+    [
+     16.66,
+     "cold query symbol_070",
+     54640
+    ],
+    [
+     16.76,
+     "cold query symbol_070",
+     55248
+    ],
+    [
+     16.86,
+     "cold query symbol_070",
+     55856
+    ],
+    [
+     16.97,
+     "cold query symbol_070",
+     64976
+    ],
+    [
+     17.07,
+     "cold query symbol_070",
+     65472
+    ],
+    [
+     17.17,
+     "warm query symbol_070",
+     46416
+    ],
+    [
+     17.28,
+     "warm query symbol_070",
+     49984
+    ],
+    [
+     17.38,
+     "same-size dirty edit",
+     49136
+    ],
+    [
+     17.48,
+     "same-size dirty edit",
+     60144
+    ],
+    [
+     17.59,
+     "same-size dirty edit",
+     60176
+    ],
+    [
+     17.69,
+     "rename/delete cycle",
+     46320
+    ],
+    [
+     17.8,
+     "rename/delete cycle",
+     59856
+    ],
+    [
+     17.9,
+     "rename/delete cycle",
+     58560
+    ],
+    [
+     18.0,
+     "two concurrent index clients",
+     55936
+    ],
+    [
+     18.11,
+     "two concurrent index clients",
+     61712
+    ],
+    [
+     18.21,
+     "two concurrent index clients",
+     70608
+    ],
+    [
+     18.31,
+     "two concurrent index clients",
+     55520
+    ],
+    [
+     18.42,
+     "five concurrent 16 MiB captures",
+     47424
+    ],
+    [
+     18.52,
+     "five concurrent 16 MiB captures",
+     48384
+    ],
+    [
+     18.62,
+     "five concurrent 16 MiB captures",
+     48720
+    ],
+    [
+     18.72,
+     "five concurrent 16 MiB captures",
+     48736
+    ],
+    [
+     18.82,
+     "five concurrent 16 MiB captures",
+     48768
+    ],
+    [
+     18.93,
+     "expand every retained original",
+     60032
+    ],
+    [
+     19.03,
+     "expand every retained original",
+     57120
+    ],
+    [
+     19.13,
+     "expand every retained original",
+     63168
+    ],
+    [
+     19.24,
+     "expand every retained original",
+     63200
+    ],
+    [
+     19.34,
+     "expand every retained original",
+     60480
+    ],
+    [
+     19.44,
+     "expand every retained original",
+     59520
+    ],
+    [
+     19.54,
+     "expand every retained original",
+     53872
+    ],
+    [
+     19.64,
+     "expand every retained original",
+     54400
+    ],
+    [
+     19.75,
+     "expand every retained original",
+     63744
+    ],
+    [
+     19.85,
+     "expand every retained original",
+     59728
+    ],
+    [
+     19.95,
+     "expand every retained original",
+     60816
+    ],
+    [
+     20.05,
+     "expand every retained original",
+     64784
+    ],
+    [
+     20.16,
+     "expand every retained original",
+     61696
+    ],
+    [
+     20.26,
+     "expand every retained original",
+     60064
+    ],
+    [
+     20.36,
+     "expand every retained original",
+     60960
+    ],
+    [
+     20.46,
+     "expand every retained original",
+     59952
+    ],
+    [
+     20.57,
+     "expand every retained original",
+     62800
+    ],
+    [
+     20.67,
+     "expand every retained original",
+     63168
+    ],
+    [
+     20.78,
+     "expand every retained original",
+     60064
+    ],
+    [
+     20.88,
+     "expand every retained original",
+     60208
+    ],
+    [
+     20.98,
+     "expand every retained original",
+     60032
+    ],
+    [
+     21.09,
+     "expand every retained original",
+     60288
+    ],
+    [
+     21.19,
+     "expand every retained original",
+     59216
+    ],
+    [
+     21.29,
+     "expand every retained original",
+     55952
+    ],
+    [
+     21.4,
+     "expand every retained original",
+     56096
+    ],
+    [
+     21.5,
+     "expand every retained original",
+     57456
+    ],
+    [
+     21.6,
+     "expand every retained original",
+     59792
+    ],
+    [
+     21.7,
+     "expand every retained original",
+     56720
+    ],
+    [
+     21.81,
+     "expand every retained original",
+     55680
+    ],
+    [
+     21.91,
+     "expand every retained original",
+     59808
+    ],
+    [
+     22.01,
+     "expand every retained original",
+     49408
+    ],
+    [
+     22.11,
+     "expand every retained original",
+     48688
+    ],
+    [
+     22.22,
+     "expand every retained original",
+     48688
+    ],
+    [
+     22.32,
+     "expand every retained original",
+     48704
+    ],
+    [
+     22.43,
+     "expand every retained original",
+     48720
+    ],
+    [
+     22.53,
+     "expand every retained original",
+     48720
+    ],
+    [
+     22.64,
+     "expand every retained original",
+     48800
+    ],
+    [
+     22.74,
+     "expand every retained original",
+     49088
+    ],
+    [
+     22.85,
+     "expand every retained original",
+     49088
+    ],
+    [
+     22.95,
+     "expand every retained original",
+     55632
+    ],
+    [
+     23.06,
+     "expand every retained original",
+     57584
+    ],
+    [
+     23.16,
+     "expand every retained original",
+     58832
+    ],
+    [
+     23.26,
+     "expand every retained original",
+     55408
+    ],
+    [
+     23.37,
+     "expand every retained original",
+     59312
+    ],
+    [
+     23.47,
+     "expand every retained original",
+     58848
+    ],
+    [
+     23.57,
+     "expand every retained original",
+     55120
+    ],
+    [
+     23.67,
+     "expand every retained original",
+     59648
+    ],
+    [
+     23.78,
+     "expand every retained original",
+     55408
+    ],
+    [
+     23.88,
+     "expand every retained original",
+     59408
+    ],
+    [
+     23.99,
+     "expand every retained original",
+     56384
+    ],
+    [
+     24.09,
+     "expand every retained original",
+     56384
+    ],
+    [
+     24.19,
+     "expand every retained original",
+     55408
+    ],
+    [
+     24.3,
+     "expand every retained original",
+     59392
+    ],
+    [
+     24.4,
+     "expand every retained original",
+     57568
+    ],
+    [
+     24.5,
+     "expand every retained original",
+     56352
+    ],
+    [
+     24.61,
+     "expand every retained original",
+     55360
+    ],
+    [
+     24.71,
+     "expand every retained original",
+     56336
+    ],
+    [
+     24.82,
+     "expand every retained original",
+     56400
+    ],
+    [
+     24.92,
+     "expand every retained original",
+     56544
+    ],
+    [
+     25.02,
+     "expand every retained original",
+     59360
+    ],
+    [
+     25.13,
+     "expand every retained original",
+     56288
+    ],
+    [
+     25.23,
+     "expand every retained original",
+     54736
+    ],
+    [
+     25.33,
+     "expand every retained original",
+     50368
+    ],
+    [
+     25.43,
+     "expand every retained original",
+     58496
+    ],
+    [
+     25.53,
+     "expand every retained original",
+     55472
+    ],
+    [
+     25.64,
+     "expand every retained original",
+     56400
+    ],
+    [
+     25.74,
+     "expand every retained original",
+     56368
+    ],
+    [
+     25.85,
+     "expand every retained original",
+     56272
+    ],
+    [
+     25.95,
+     "expand every retained original",
+     55616
+    ],
+    [
+     26.05,
+     "expand every retained original",
+     55680
+    ],
+    [
+     26.15,
+     "expand every retained original",
+     56864
+    ],
+    [
+     26.26,
+     "expand every retained original",
+     55472
+    ],
+    [
+     26.36,
+     "expand every retained original",
+     55536
+    ],
+    [
+     26.47,
+     "expand every retained original",
+     56432
+    ],
+    [
+     26.57,
+     "expand every retained original",
+     57216
+    ],
+    [
+     26.68,
+     "expand every retained original",
+     56208
+    ],
+    [
+     26.78,
+     "expand every retained original",
+     55200
+    ],
+    [
+     26.88,
+     "expand every retained original",
+     55440
+    ],
+    [
+     26.98,
+     "expand every retained original",
+     56416
+    ],
+    [
+     27.09,
+     "expand every retained original",
+     56336
+    ],
+    [
+     27.19,
+     "expand every retained original",
+     56416
+    ],
+    [
+     27.3,
+     "expand every retained original",
+     56368
+    ],
+    [
+     27.4,
+     "expand every retained original",
+     55888
+    ],
+    [
+     27.51,
+     "expand every retained original",
+     56896
+    ],
+    [
+     27.61,
+     "expand every retained original",
+     58640
+    ],
+    [
+     27.71,
+     "expand every retained original",
+     50560
+    ],
+    [
+     27.81,
+     "expand every retained original",
+     50304
+    ],
+    [
+     27.92,
+     "expand every retained original",
+     48992
+    ],
+    [
+     28.02,
+     "expand every retained original",
+     55552
+    ],
+    [
+     28.12,
+     "expand every retained original",
+     59104
+    ],
+    [
+     28.23,
+     "expand every retained original",
+     57872
+    ],
+    [
+     28.33,
+     "expand every retained original",
+     59488
+    ],
+    [
+     28.43,
+     "expand every retained original",
+     56176
+    ],
+    [
+     28.54,
+     "expand every retained original",
+     56432
+    ],
+    [
+     28.64,
+     "expand every retained original",
+     59024
+    ],
+    [
+     28.74,
+     "expand every retained original",
+     59744
+    ],
+    [
+     28.85,
+     "expand every retained original",
+     59024
+    ],
+    [
+     28.95,
+     "expand every retained original",
+     55488
+    ],
+    [
+     29.06,
+     "expand every retained original",
+     59472
+    ],
+    [
+     29.16,
+     "expand every retained original",
+     55584
+    ],
+    [
+     29.27,
+     "expand every retained original",
+     59584
+    ],
+    [
+     29.37,
+     "expand every retained original",
+     56176
+    ],
+    [
+     29.47,
+     "expand every retained original",
+     57072
+    ],
+    [
+     29.58,
+     "expand every retained original",
+     48976
+    ],
+    [
+     29.68,
+     "expand every retained original",
+     48976
+    ],
+    [
+     29.79,
+     "expand every retained original",
+     55520
+    ],
+    [
+     29.89,
+     "expand every retained original",
+     55584
+    ],
+    [
+     29.99,
+     "expand every retained original",
+     58112
+    ],
+    [
+     30.1,
+     "expand every retained original",
+     57856
+    ],
+    [
+     30.2,
+     "expand every retained original",
+     57856
+    ],
+    [
+     30.31,
+     "expand every retained original",
+     55920
+    ],
+    [
+     30.41,
+     "expand every retained original",
+     55856
+    ],
+    [
+     30.51,
+     "expand every retained original",
+     55488
+    ],
+    [
+     30.62,
+     "expand every retained original",
+     55456
+    ],
+    [
+     30.72,
+     "expand every retained original",
+     55472
+    ],
+    [
+     30.83,
+     "expand every retained original",
+     56384
+    ],
+    [
+     30.93,
+     "expand every retained original",
+     55216
+    ],
+    [
+     31.03,
+     "expand every retained original",
+     55440
+    ],
+    [
+     31.14,
+     "expand every retained original",
+     59392
+    ],
+    [
+     31.24,
+     "expand every retained original",
+     54976
+    ],
+    [
+     31.34,
+     "expand every retained original",
+     49488
+    ],
+    [
+     31.44,
+     "expand every retained original",
+     50256
+    ],
+    [
+     31.54,
+     "expand every retained original",
+     49008
+    ],
+    [
+     31.65,
+     "expand every retained original",
+     49024
+    ],
+    [
+     31.75,
+     "expand every retained original",
+     59168
+    ],
+    [
+     31.85,
+     "expand every retained original",
+     56912
+    ],
+    [
+     31.95,
+     "expand every retained original",
+     56592
+    ],
+    [
+     32.06,
+     "expand every retained original",
+     58624
+    ],
+    [
+     32.16,
+     "expand every retained original",
+     56368
+    ],
+    [
+     32.26,
+     "expand every retained original",
+     56832
+    ],
+    [
+     32.36,
+     "expand every retained original",
+     56320
+    ],
+    [
+     32.47,
+     "expand every retained original",
+     46848
+    ],
+    [
+     32.57,
+     "expand every retained original",
+     54336
+    ],
+    [
+     32.68,
+     "expand every retained original",
+     53376
+    ],
+    [
+     32.78,
+     "expand every retained original",
+     58240
+    ],
+    [
+     32.88,
+     "expand every retained original",
+     55472
+    ],
+    [
+     32.98,
+     "expand every retained original",
+     56704
+    ],
+    [
+     33.09,
+     "expand every retained original",
+     54208
+    ],
+    [
+     33.19,
+     "expand every retained original",
+     53552
+    ],
+    [
+     33.3,
+     "expand every retained original",
+     53520
+    ],
+    [
+     33.4,
+     "expand every retained original",
+     55888
+    ],
+    [
+     33.5,
+     "expand every retained original",
+     53552
+    ],
+    [
+     33.61,
+     "expand every retained original",
+     56976
+    ],
+    [
+     33.71,
+     "expand every retained original",
+     55024
+    ],
+    [
+     33.81,
+     "expand every retained original",
+     53632
+    ],
+    [
+     33.91,
+     "expand every retained original",
+     52160
+    ],
+    [
+     34.01,
+     "expand every retained original",
+     53664
+    ],
+    [
+     34.12,
+     "expand every retained original",
+     53648
+    ],
+    [
+     34.22,
+     "expand every retained original",
+     53632
+    ],
+    [
+     34.33,
+     "expand every retained original",
+     57200
+    ],
+    [
+     34.43,
+     "expand every retained original",
+     53616
+    ],
+    [
+     34.53,
+     "expand every retained original",
+     55584
+    ],
+    [
+     34.64,
+     "expand every retained original",
+     53600
+    ],
+    [
+     34.74,
+     "expand every retained original",
+     57536
+    ],
+    [
+     34.84,
+     "expand every retained original",
+     54032
+    ],
+    [
+     34.95,
+     "expand every retained original",
+     53936
+    ],
+    [
+     35.05,
+     "expand every retained original",
+     53936
+    ],
+    [
+     35.16,
+     "expand every retained original",
+     57120
+    ],
+    [
+     35.26,
+     "expand every retained original",
+     54352
+    ],
+    [
+     35.36,
+     "expand every retained original",
+     57344
+    ],
+    [
+     35.47,
+     "expand every retained original",
+     54384
+    ],
+    [
+     35.57,
+     "expand every retained original",
+     54432
+    ],
+    [
+     35.68,
+     "expand every retained original",
+     57440
+    ],
+    [
+     35.78,
+     "expand every retained original",
+     53472
+    ],
+    [
+     35.88,
+     "expand every retained original",
+     56992
+    ],
+    [
+     35.99,
+     "expand every retained original",
+     53568
+    ],
+    [
+     36.09,
+     "expand every retained original",
+     57360
+    ],
+    [
+     36.19,
+     "expand every retained original",
+     57472
+    ],
+    [
+     36.3,
+     "expand every retained original",
+     54080
+    ],
+    [
+     36.4,
+     "expand every retained original",
+     54240
+    ],
+    [
+     36.5,
+     "expand every retained original",
+     53488
+    ],
+    [
+     36.61,
+     "expand every retained original",
+     53520
+    ],
+    [
+     36.71,
+     "expand every retained original",
+     55456
+    ],
+    [
+     36.82,
+     "expand every retained original",
+     53568
+    ],
+    [
+     36.92,
+     "expand every retained original",
+     53584
+    ],
+    [
+     37.02,
+     "expand every retained original",
+     53536
+    ],
+    [
+     37.13,
+     "expand every retained original",
+     55216
+    ],
+    [
+     37.23,
+     "expand every retained original",
+     53264
+    ],
+    [
+     37.33,
+     "expand every retained original",
+     53936
+    ],
+    [
+     37.44,
+     "expand every retained original",
+     56640
+    ],
+    [
+     37.54,
+     "expand every retained original",
+     54560
+    ],
+    [
+     37.65,
+     "expand every retained original",
+     55568
+    ],
+    [
+     37.75,
+     "expand every retained original",
+     57328
+    ],
+    [
+     37.86,
+     "expand every retained original",
+     54064
+    ],
+    [
+     37.96,
+     "expand every retained original",
+     53648
+    ],
+    [
+     38.06,
+     "expand every retained original",
+     47696
+    ],
+    [
+     38.16,
+     "expand every retained original",
+     47104
+    ],
+    [
+     38.27,
+     "expand every retained original",
+     47104
+    ],
+    [
+     38.37,
+     "expand every retained original",
+     48400
+    ],
+    [
+     38.48,
+     "expand every retained original",
+     47104
+    ],
+    [
+     38.58,
+     "expand every retained original",
+     57216
+    ],
+    [
+     38.69,
+     "expand every retained original",
+     47104
+    ],
+    [
+     38.79,
+     "expand every retained original",
+     47104
+    ],
+    [
+     38.9,
+     "expand every retained original",
+     47088
+    ],
+    [
+     39.0,
+     "expand every retained original",
+     47088
+    ],
+    [
+     39.1,
+     "expand every retained original",
+     47088
+    ],
+    [
+     39.21,
+     "expand every retained original",
+     47088
+    ],
+    [
+     39.31,
+     "expand every retained original",
+     54512
+    ],
+    [
+     39.41,
+     "expand every retained original",
+     57088
+    ],
+    [
+     39.51,
+     "expand every retained original",
+     53600
+    ],
+    [
+     39.62,
+     "expand every retained original",
+     57488
+    ],
+    [
+     39.72,
+     "expand every retained original",
+     57664
+    ],
+    [
+     39.83,
+     "expand every retained original",
+     53728
+    ],
+    [
+     39.93,
+     "expand every retained original",
+     57152
+    ],
+    [
+     40.04,
+     "expand every retained original",
+     53616
+    ],
+    [
+     40.14,
+     "expand every retained original",
+     47376
+    ],
+    [
+     40.25,
+     "expand every retained original",
+     53664
+    ],
+    [
+     40.35,
+     "expand every retained original",
+     47376
+    ],
+    [
+     40.45,
+     "expand every retained original",
+     47376
+    ],
+    [
+     40.55,
+     "expand every retained original",
+     57856
+    ],
+    [
+     40.66,
+     "expand every retained original",
+     47376
+    ],
+    [
+     40.76,
+     "expand every retained original",
+     57424
+    ],
+    [
+     40.86,
+     "expand every retained original",
+     55840
+    ],
+    [
+     40.97,
+     "expand every retained original",
+     58128
+    ],
+    [
+     41.07,
+     "expand every retained original",
+     47696
+    ],
+    [
+     41.18,
+     "expand every retained original",
+     54160
+    ],
+    [
+     41.28,
+     "expand every retained original",
+     55760
+    ],
+    [
+     41.38,
+     "expand every retained original",
+     54192
+    ],
+    [
+     41.48,
+     "expand every retained original",
+     57968
+    ],
+    [
+     41.59,
+     "expand every retained original",
+     58112
+    ],
+    [
+     41.69,
+     "expand every retained original",
+     54240
+    ],
+    [
+     41.79,
+     "expand every retained original",
+     54208
+    ],
+    [
+     41.89,
+     "expand every retained original",
+     55152
+    ],
+    [
+     42.0,
+     "expand every retained original",
+     58208
+    ],
+    [
+     42.1,
+     "expand every retained original",
+     54256
+    ],
+    [
+     42.21,
+     "expand every retained original",
+     57904
+    ],
+    [
+     42.31,
+     "expand every retained original",
+     58112
+    ],
+    [
+     42.41,
+     "expand every retained original",
+     55184
+    ],
+    [
+     42.52,
+     "expand every retained original",
+     55120
+    ],
+    [
+     42.62,
+     "expand every retained original",
+     58704
+    ],
+    [
+     42.72,
+     "expand every retained original",
+     58544
+    ],
+    [
+     42.83,
+     "expand every retained original",
+     54048
+    ],
+    [
+     42.93,
+     "expand every retained original",
+     57872
+    ],
+    [
+     43.04,
+     "expand every retained original",
+     54384
+    ],
+    [
+     43.14,
+     "expand every retained original",
+     53920
+    ],
+    [
+     43.25,
+     "expand every retained original",
+     56880
+    ],
+    [
+     43.35,
+     "expand every retained original",
+     54016
+    ],
+    [
+     43.45,
+     "expand every retained original",
+     56816
+    ],
+    [
+     43.56,
+     "expand every retained original",
+     53840
+    ],
+    [
+     43.66,
+     "expand every retained original",
+     53840
+    ],
+    [
+     43.76,
+     "expand every retained original",
+     53728
+    ],
+    [
+     43.87,
+     "expand every retained original",
+     54272
+    ],
+    [
+     43.97,
+     "expand every retained original",
+     57184
+    ],
+    [
+     44.07,
+     "expand every retained original",
+     52576
+    ],
+    [
+     44.17,
+     "expand every retained original",
+     47792
+    ],
+    [
+     44.28,
+     "expand every retained original",
+     48432
+    ],
+    [
+     44.38,
+     "expand every retained original",
+     47296
+    ],
+    [
+     44.48,
+     "expand every retained original",
+     55360
+    ],
+    [
+     44.58,
+     "expand every retained original",
+     57680
+    ],
+    [
+     44.69,
+     "expand every retained original",
+     53808
+    ],
+    [
+     44.79,
+     "expand every retained original",
+     53840
+    ],
+    [
+     44.89,
+     "expand every retained original",
+     57248
+    ],
+    [
+     45.0,
+     "expand every retained original",
+     57504
+    ],
+    [
+     45.1,
+     "expand every retained original",
+     52048
+    ],
+    [
+     45.2,
+     "expand every retained original",
+     55072
+    ],
+    [
+     45.31,
+     "expand every retained original",
+     52064
+    ],
+    [
+     45.41,
+     "expand every retained original",
+     55056
+    ],
+    [
+     45.51,
+     "expand every retained original",
+     51344
+    ],
+    [
+     45.61,
+     "expand every retained original",
+     53536
+    ],
+    [
+     45.72,
+     "expand every retained original",
+     42512
+    ],
+    [
+     45.82,
+     "expand every retained original",
+     49696
+    ],
+    [
+     45.92,
+     "expand every retained original",
+     48768
+    ],
+    [
+     46.03,
+     "expand every retained original",
+     50832
+    ],
+    [
+     46.13,
+     "expand every retained original",
+     52512
+    ],
+    [
+     46.24,
+     "expand every retained original",
+     58272
+    ],
+    [
+     46.34,
+     "expand every retained original",
+     59008
+    ],
+    [
+     46.45,
+     "expand every retained original",
+     57040
+    ],
+    [
+     46.55,
+     "expand every retained original",
+     57024
+    ],
+    [
+     46.65,
+     "expand every retained original",
+     56208
+    ],
+    [
+     46.76,
+     "expand every retained original",
+     55840
+    ],
+    [
+     46.86,
+     "expand every retained original",
+     55776
+    ],
+    [
+     46.96,
+     "expand every retained original",
+     56368
+    ],
+    [
+     47.07,
+     "expand every retained original",
+     56880
+    ],
+    [
+     47.17,
+     "expand every retained original",
+     50112
+    ],
+    [
+     47.27,
+     "expand every retained original",
+     50128
+    ],
+    [
+     47.37,
+     "expand every retained original",
+     49840
+    ],
+    [
+     47.48,
+     "expand every retained original",
+     49856
+    ],
+    [
+     47.58,
+     "expand every retained original",
+     49856
+    ],
+    [
+     47.69,
+     "expand every retained original",
+     55760
+    ],
+    [
+     47.79,
+     "expand every retained original",
+     53152
+    ],
+    [
+     47.9,
+     "expand every retained original",
+     51920
+    ],
+    [
+     48.0,
+     "expand every retained original",
+     54016
+    ],
+    [
+     48.1,
+     "expand every retained original",
+     52368
+    ],
+    [
+     48.21,
+     "expand every retained original",
+     55808
+    ],
+    [
+     48.31,
+     "expand every retained original",
+     52656
+    ],
+    [
+     48.42,
+     "expand every retained original",
+     51120
+    ],
+    [
+     48.52,
+     "expand every retained original",
+     53632
+    ],
+    [
+     48.63,
+     "expand every retained original",
+     44816
+    ],
+    [
+     48.73,
+     "expand every retained original",
+     55136
+    ],
+    [
+     48.84,
+     "expand every retained original",
+     52144
+    ],
+    [
+     48.94,
+     "expand every retained original",
+     44784
+    ],
+    [
+     49.04,
+     "expand every retained original",
+     44944
+    ],
+    [
+     49.15,
+     "expand every retained original",
+     46272
+    ],
+    [
+     49.25,
+     "expand every retained original",
+     44864
+    ],
+    [
+     49.36,
+     "expand every retained original",
+     46288
+    ],
+    [
+     49.46,
+     "expand every retained original",
+     45648
+    ],
+    [
+     49.56,
+     "expand every retained original",
+     44944
+    ],
+    [
+     49.66,
+     "expand every retained original",
+     44944
+    ],
+    [
+     49.76,
+     "expand every retained original",
+     45280
+    ],
+    [
+     49.87,
+     "expand every retained original",
+     45440
+    ],
+    [
+     49.97,
+     "expand every retained original",
+     52176
+    ],
+    [
+     50.08,
+     "expand every retained original",
+     45296
+    ],
+    [
+     50.18,
+     "expand every retained original",
+     45344
+    ],
+    [
+     50.28,
+     "expand every retained original",
+     45344
+    ],
+    [
+     50.39,
+     "expand every retained original",
+     52768
+    ],
+    [
+     50.49,
+     "expand every retained original",
+     52864
+    ],
+    [
+     50.59,
+     "expand every retained original",
+     51568
+    ],
+    [
+     50.7,
+     "expand every retained original",
+     53168
+    ],
+    [
+     50.8,
+     "expand every retained original",
+     44992
+    ],
+    [
+     50.9,
+     "expand every retained original",
+     51136
+    ],
+    [
+     51.0,
+     "expand every retained original",
+     53328
+    ],
+    [
+     51.1,
+     "expand every retained original",
+     50960
+    ],
+    [
+     51.21,
+     "expand every retained original",
+     51152
+    ],
+    [
+     51.31,
+     "expand every retained original",
+     52128
+    ],
+    [
+     51.41,
+     "expand every retained original",
+     51632
+    ],
+    [
+     51.52,
+     "expand every retained original",
+     51712
+    ],
+    [
+     51.62,
+     "expand every retained original",
+     55136
+    ],
+    [
+     51.73,
+     "expand every retained original",
+     54656
+    ],
+    [
+     51.83,
+     "expand every retained original",
+     51488
+    ],
+    [
+     51.93,
+     "expand every retained original",
+     55552
+    ],
+    [
+     52.04,
+     "expand every retained original",
+     51632
+    ],
+    [
+     52.14,
+     "expand every retained original",
+     51680
+    ],
+    [
+     52.24,
+     "expand every retained original",
+     46992
+    ],
+    [
+     52.34,
+     "expand every retained original",
+     46032
+    ],
+    [
+     52.44,
+     "expand every retained original",
+     53824
+    ],
+    [
+     52.55,
+     "expand every retained original",
+     54704
+    ],
+    [
+     52.65,
+     "expand every retained original",
+     55120
+    ],
+    [
+     52.76,
+     "expand every retained original",
+     53408
+    ],
+    [
+     52.86,
+     "expand every retained original",
+     54544
+    ],
+    [
+     52.97,
+     "expand every retained original",
+     55024
+    ],
+    [
+     53.07,
+     "expand every retained original",
+     51840
+    ],
+    [
+     53.17,
+     "expand every retained original",
+     55200
+    ],
+    [
+     53.28,
+     "expand every retained original",
+     56096
+    ],
+    [
+     53.38,
+     "expand every retained original",
+     51856
+    ],
+    [
+     53.48,
+     "expand every retained original",
+     55792
+    ],
+    [
+     53.58,
+     "expand every retained original",
+     52800
+    ],
+    [
+     53.69,
+     "expand every retained original",
+     52800
+    ],
+    [
+     53.79,
+     "expand every retained original",
+     54816
+    ],
+    [
+     53.89,
+     "expand every retained original",
+     56160
+    ],
+    [
+     54.0,
+     "expand every retained original",
+     52768
+    ],
+    [
+     54.1,
+     "expand every retained original",
+     51872
+    ],
+    [
+     54.2,
+     "expand every retained original",
+     51888
+    ],
+    [
+     54.31,
+     "expand every retained original",
+     55712
+    ],
+    [
+     54.41,
+     "expand every retained original",
+     50864
+    ],
+    [
+     54.51,
+     "expand every retained original",
+     45968
+    ],
+    [
+     54.61,
+     "expand every retained original",
+     45424
+    ],
+    [
+     54.72,
+     "expand every retained original",
+     45424
+    ],
+    [
+     54.82,
+     "expand every retained original",
+     45424
+    ],
+    [
+     54.93,
+     "expand every retained original",
+     55600
+    ],
+    [
+     55.03,
+     "expand every retained original",
+     55616
+    ],
+    [
+     55.13,
+     "expand every retained original",
+     55872
+    ],
+    [
+     55.23,
+     "expand every retained original",
+     52448
+    ],
+    [
+     55.34,
+     "expand every retained original",
+     51808
+    ],
+    [
+     55.44,
+     "expand every retained original",
+     52480
+    ],
+    [
+     55.55,
+     "expand every retained original",
+     52784
+    ],
+    [
+     55.65,
+     "expand every retained original",
+     56544
+    ],
+    [
+     55.75,
+     "expand every retained original",
+     53408
+    ],
+    [
+     55.86,
+     "expand every retained original",
+     52016
+    ],
+    [
+     55.96,
+     "expand every retained original",
+     55520
+    ],
+    [
+     56.07,
+     "expand every retained original",
+     56016
+    ],
+    [
+     56.17,
+     "expand every retained original",
+     52064
+    ],
+    [
+     56.28,
+     "expand every retained original",
+     54176
+    ],
+    [
+     56.38,
+     "expand every retained original",
+     52064
+    ],
+    [
+     56.48,
+     "expand every retained original",
+     52144
+    ],
+    [
+     56.58,
+     "expand every retained original",
+     55824
+    ],
+    [
+     56.69,
+     "expand every retained original",
+     55744
+    ],
+    [
+     56.79,
+     "expand every retained original",
+     52048
+    ],
+    [
+     56.9,
+     "expand every retained original",
+     54448
+    ],
+    [
+     57.0,
+     "expand every retained original",
+     55936
+    ],
+    [
+     57.11,
+     "expand every retained original",
+     52032
+    ],
+    [
+     57.21,
+     "expand every retained original",
+     52080
+    ],
+    [
+     57.31,
+     "expand every retained original",
+     52160
+    ],
+    [
+     57.41,
+     "expand every retained original",
+     53392
+    ],
+    [
+     57.51,
+     "expand every retained original",
+     55568
+    ],
+    [
+     57.62,
+     "expand every retained original",
+     54160
+    ],
+    [
+     57.72,
+     "expand every retained original",
+     55824
+    ],
+    [
+     57.83,
+     "expand every retained original",
+     52064
+    ],
+    [
+     57.93,
+     "expand every retained original",
+     52736
+    ],
+    [
+     58.03,
+     "expand every retained original",
+     52720
+    ],
+    [
+     58.14,
+     "expand every retained original",
+     51776
+    ],
+    [
+     58.24,
+     "expand every retained original",
+     54224
+    ],
+    [
+     58.35,
+     "expand every retained original",
+     51760
+    ],
+    [
+     58.45,
+     "expand every retained original",
+     52784
+    ],
+    [
+     58.56,
+     "expand every retained original",
+     52560
+    ],
+    [
+     58.66,
+     "expand every retained original",
+     45808
+    ],
+    [
+     58.76,
+     "expand every retained original",
+     45216
+    ],
+    [
+     58.86,
+     "expand every retained original",
+     45216
+    ],
+    [
+     58.96,
+     "expand every retained original",
+     52048
+    ],
+    [
+     59.06,
+     "expand every retained original",
+     55616
+    ],
+    [
+     59.16,
+     "expand every retained original",
+     51680
+    ],
+    [
+     59.27,
+     "expand every retained original",
+     52640
+    ],
+    [
+     59.37,
+     "expand every retained original",
+     52704
+    ],
+    [
+     59.48,
+     "expand every retained original",
+     52800
+    ],
+    [
+     59.58,
+     "expand every retained original",
+     52608
+    ],
+    [
+     59.69,
+     "expand every retained original",
+     53872
+    ],
+    [
+     59.79,
+     "expand every retained original",
+     56016
+    ],
+    [
+     59.89,
+     "expand every retained original",
+     51760
+    ],
+    [
+     59.99,
+     "expand every retained original",
+     51728
+    ],
+    [
+     60.09,
+     "expand every retained original",
+     52208
+    ],
+    [
+     60.2,
+     "expand every retained original",
+     51760
+    ],
+    [
+     60.3,
+     "expand every retained original",
+     55680
+    ],
+    [
+     60.4,
+     "expand every retained original",
+     54160
+    ],
+    [
+     60.51,
+     "expand every retained original",
+     54224
+    ],
+    [
+     60.61,
+     "expand every retained original",
+     51728
+    ],
+    [
+     60.71,
+     "expand every retained original",
+     52800
+    ],
+    [
+     60.82,
+     "expand every retained original",
+     51616
+    ],
+    [
+     60.92,
+     "expand every retained original",
+     54752
+    ],
+    [
+     61.02,
+     "expand every retained original",
+     51584
+    ],
+    [
+     61.12,
+     "expand every retained original",
+     45344
+    ],
+    [
+     61.22,
+     "expand every retained original",
+     53360
+    ],
+    [
+     61.33,
+     "expand every retained original",
+     54112
+    ],
+    [
+     61.43,
+     "expand every retained original",
+     56128
+    ],
+    [
+     61.54,
+     "expand every retained original",
+     44944
+    ],
+    [
+     61.64,
+     "expand every retained original",
+     44944
+    ],
+    [
+     61.74,
+     "expand every retained original",
+     51456
+    ],
+    [
+     61.85,
+     "expand every retained original",
+     52816
+    ],
+    [
+     61.95,
+     "expand every retained original",
+     52384
+    ],
+    [
+     62.05,
+     "expand every retained original",
+     56304
+    ],
+    [
+     62.15,
+     "expand every retained original",
+     51952
+    ],
+    [
+     62.26,
+     "expand every retained original",
+     45376
+    ],
+    [
+     62.36,
+     "expand every retained original",
+     50912
+    ],
+    [
+     62.46,
+     "expand every retained original",
+     46976
+    ],
+    [
+     62.57,
+     "expand every retained original",
+     44944
+    ],
+    [
+     62.67,
+     "expand every retained original",
+     45056
+    ],
+    [
+     62.77,
+     "expand every retained original",
+     37856
+    ],
+    [
+     62.87,
+     "expand every retained original",
+     44416
+    ],
+    [
+     62.97,
+     "expand every retained original",
+     48352
+    ],
+    [
+     63.08,
+     "expand every retained original",
+     44368
+    ],
+    [
+     63.18,
+     "expand every retained original",
+     45792
+    ],
+    [
+     63.28,
+     "expand every retained original",
+     44320
+    ],
+    [
+     63.39,
+     "expand every retained original",
+     45328
+    ],
+    [
+     63.49,
+     "expand every retained original",
+     44480
+    ],
+    [
+     63.6,
+     "expand every retained original",
+     48016
+    ],
+    [
+     63.7,
+     "expand every retained original",
+     37936
+    ],
+    [
+     63.81,
+     "expand every retained original",
+     37936
+    ],
+    [
+     63.91,
+     "expand every retained original",
+     37936
+    ],
+    [
+     64.01,
+     "expand every retained original",
+     48384
+    ],
+    [
+     64.12,
+     "expand every retained original",
+     44688
+    ],
+    [
+     64.22,
+     "expand every retained original",
+     47760
+    ],
+    [
+     64.32,
+     "expand every retained original",
+     47904
+    ],
+    [
+     64.43,
+     "expand every retained original",
+     47280
+    ],
+    [
+     64.53,
+     "expand every retained original",
+     49200
+    ],
+    [
+     64.64,
+     "expand every retained original",
+     49344
+    ],
+    [
+     64.74,
+     "expand every retained original",
+     44592
+    ],
+    [
+     64.85,
+     "expand every retained original",
+     45408
+    ],
+    [
+     64.95,
+     "expand every retained original",
+     45472
+    ],
+    [
+     65.05,
+     "expand every retained original",
+     45456
+    ],
+    [
+     65.16,
+     "expand every retained original",
+     47040
+    ],
+    [
+     65.26,
+     "expand every retained original",
+     47760
+    ],
+    [
+     65.37,
+     "expand every retained original",
+     47600
+    ],
+    [
+     65.47,
+     "expand every retained original",
+     47952
+    ],
+    [
+     65.58,
+     "expand every retained original",
+     47952
+    ],
+    [
+     65.68,
+     "expand every retained original",
+     48480
+    ],
+    [
+     65.79,
+     "expand every retained original",
+     48368
+    ],
+    [
+     65.89,
+     "expand every retained original",
+     48368
+    ],
+    [
+     66.0,
+     "expand every retained original",
+     48448
+    ],
+    [
+     66.1,
+     "expand every retained original",
+     45568
+    ],
+    [
+     66.2,
+     "expand every retained original",
+     46592
+    ],
+    [
+     66.31,
+     "expand every retained original",
+     47952
+    ],
+    [
+     66.41,
+     "expand every retained original",
+     48384
+    ],
+    [
+     66.52,
+     "expand every retained original",
+     48288
+    ],
+    [
+     66.62,
+     "expand every retained original",
+     44480
+    ],
+    [
+     66.73,
+     "expand every retained original",
+     45392
+    ],
+    [
+     66.83,
+     "expand every retained original",
+     44544
+    ],
+    [
+     66.93,
+     "expand every retained original",
+     47680
+    ],
+    [
+     67.03,
+     "expand every retained original",
+     48384
+    ],
+    [
+     67.14,
+     "expand every retained original",
+     45280
+    ],
+    [
+     67.24,
+     "expand every retained original",
+     44464
+    ],
+    [
+     67.35,
+     "expand every retained original",
+     48208
+    ],
+    [
+     67.45,
+     "expand every retained original",
+     44240
+    ],
+    [
+     67.56,
+     "expand every retained original",
+     45232
+    ],
+    [
+     67.66,
+     "expand every retained original",
+     48416
+    ],
+    [
+     67.77,
+     "expand every retained original",
+     47984
+    ],
+    [
+     67.87,
+     "expand every retained original",
+     48304
+    ],
+    [
+     67.97,
+     "expand every retained original",
+     48720
+    ],
+    [
+     68.08,
+     "expand every retained original",
+     49104
+    ],
+    [
+     68.18,
+     "expand every retained original",
+     44352
+    ],
+    [
+     68.29,
+     "expand every retained original",
+     48592
+    ],
+    [
+     68.39,
+     "expand every retained original",
+     44224
+    ],
+    [
+     68.49,
+     "expand every retained original",
+     47824
+    ],
+    [
+     68.59,
+     "expand every retained original",
+     47696
+    ],
+    [
+     68.7,
+     "expand every retained original",
+     45136
+    ],
+    [
+     68.8,
+     "expand every retained original",
+     46672
+    ],
+    [
+     68.91,
+     "expand every retained original",
+     44992
+    ],
+    [
+     69.01,
+     "expand every retained original",
+     47648
+    ],
+    [
+     69.11,
+     "expand every retained original",
+     44272
+    ],
+    [
+     69.22,
+     "expand every retained original",
+     47952
+    ],
+    [
+     69.32,
+     "expand every retained original",
+     46384
+    ],
+    [
+     69.42,
+     "expand every retained original",
+     43936
+    ],
+    [
+     69.53,
+     "expand every retained original",
+     44272
+    ],
+    [
+     69.63,
+     "expand every retained original",
+     44096
+    ],
+    [
+     69.73,
+     "expand every retained original",
+     44256
+    ],
+    [
+     69.83,
+     "expand every retained original",
+     48048
+    ],
+    [
+     69.94,
+     "expand every retained original",
+     48176
+    ],
+    [
+     70.04,
+     "expand every retained original",
+     43824
+    ],
+    [
+     70.14,
+     "expand every retained original",
+     37856
+    ],
+    [
+     70.25,
+     "expand every retained original",
+     44128
+    ],
+    [
+     70.35,
+     "expand every retained original",
+     48528
+    ],
+    [
+     70.45,
+     "expand every retained original",
+     48080
+    ],
+    [
+     70.55,
+     "expand every retained original",
+     46032
+    ],
+    [
+     70.66,
+     "expand every retained original",
+     44720
+    ],
+    [
+     70.76,
+     "expand every retained original",
+     48192
+    ],
+    [
+     70.87,
+     "expand every retained original",
+     44336
+    ],
+    [
+     70.97,
+     "expand every retained original",
+     48256
+    ],
+    [
+     71.07,
+     "expand every retained original",
+     48128
+    ],
+    [
+     71.17,
+     "expand every retained original",
+     45280
+    ],
+    [
+     71.27,
+     "expand every retained original",
+     44624
+    ],
+    [
+     71.38,
+     "expand every retained original",
+     45216
+    ],
+    [
+     71.48,
+     "expand every retained original",
+     45232
+    ],
+    [
+     71.59,
+     "expand every retained original",
+     44640
+    ],
+    [
+     71.69,
+     "expand every retained original",
+     45232
+    ],
+    [
+     71.79,
+     "expand every retained original",
+     47968
+    ],
+    [
+     71.9,
+     "expand every retained original",
+     48256
+    ],
+    [
+     72.0,
+     "expand every retained original",
+     48000
+    ],
+    [
+     72.1,
+     "expand every retained original",
+     48288
+    ],
+    [
+     72.21,
+     "expand every retained original",
+     45840
+    ],
+    [
+     72.31,
+     "expand every retained original",
+     48192
+    ],
+    [
+     72.41,
+     "expand every retained original",
+     47136
+    ],
+    [
+     72.52,
+     "expand every retained original",
+     40848
+    ],
+    [
+     72.62,
+     "expand every retained original",
+     44656
+    ],
+    [
+     72.72,
+     "expand every retained original",
+     44464
+    ],
+    [
+     72.82,
+     "expand every retained original",
+     48192
+    ],
+    [
+     72.92,
+     "expand every retained original",
+     44864
+    ],
+    [
+     73.03,
+     "expand every retained original",
+     45296
+    ],
+    [
+     73.13,
+     "expand every retained original",
+     48848
+    ],
+    [
+     73.23,
+     "expand every retained original",
+     48160
+    ],
+    [
+     73.34,
+     "re-expand one original",
+     47984
+    ],
+    [
+     73.44,
+     "re-expand one original",
+     44144
+    ],
+    [
+     73.55,
+     "re-expand one original",
+     47920
+    ],
+    [
+     73.65,
+     "re-expand one original",
+     44960
+    ],
+    [
+     73.75,
+     "re-expand one original",
+     47088
+    ],
+    [
+     73.85,
+     "re-expand one original",
+     44992
+    ],
+    [
+     73.96,
+     "re-expand one original",
+     45072
+    ],
+    [
+     74.06,
+     "re-expand one original",
+     44976
+    ],
+    [
+     74.16,
+     "re-expand one original",
+     44976
+    ],
+    [
+     74.26,
+     "re-expand one original",
+     44928
+    ],
+    [
+     74.36,
+     "re-expand one original",
+     45056
+    ],
+    [
+     74.47,
+     "re-expand one original",
+     48096
+    ],
+    [
+     74.57,
+     "re-expand one original",
+     45056
+    ],
+    [
+     74.67,
+     "re-expand one original",
+     47888
+    ],
+    [
+     74.78,
+     "re-expand one original",
+     44016
+    ],
+    [
+     74.88,
+     "re-expand one original",
+     47872
+    ],
+    [
+     74.98,
+     "re-expand one original",
+     38304
+    ],
+    [
+     75.09,
+     "re-expand one original",
+     37520
+    ],
+    [
+     75.19,
+     "re-expand one original",
+     37536
+    ],
+    [
+     75.29,
+     "re-expand one original",
+     37536
+    ],
+    [
+     75.4,
+     "re-expand one original",
+     46352
+    ],
+    [
+     75.5,
+     "re-expand one original",
+     47760
+    ],
+    [
+     75.6,
+     "re-expand one original",
+     46752
+    ],
+    [
+     75.71,
+     "re-expand one original",
+     47920
+    ],
+    [
+     75.81,
+     "re-expand one original",
+     48400
+    ],
+    [
+     75.92,
+     "re-expand one original",
+     44016
+    ],
+    [
+     76.02,
+     "re-expand one original",
+     48112
+    ],
+    [
+     76.12,
+     "re-expand one original",
+     46304
+    ],
+    [
+     76.22,
+     "re-expand one original",
+     48080
+    ],
+    [
+     76.33,
+     "re-expand one original",
+     47648
+    ],
+    [
+     76.43,
+     "re-expand one original",
+     44160
+    ],
+    [
+     76.54,
+     "re-expand one original",
+     46288
+    ],
+    [
+     76.64,
+     "re-expand one original",
+     45248
+    ],
+    [
+     76.74,
+     "re-expand one original",
+     46256
+    ],
+    [
+     76.84,
+     "re-expand one original",
+     48016
+    ],
+    [
+     76.95,
+     "re-expand one original",
+     39296
+    ],
+    [
+     77.05,
+     "re-expand one original",
+     37712
+    ],
+    [
+     77.15,
+     "re-expand one original",
+     44224
+    ],
+    [
+     77.26,
+     "re-expand one original",
+     37680
+    ],
+    [
+     77.36,
+     "re-expand one original",
+     37680
+    ],
+    [
+     77.46,
+     "re-expand one original",
+     38128
+    ],
+    [
+     77.57,
+     "re-expand one original",
+     41152
+    ],
+    [
+     77.67,
+     "re-expand one original",
+     43632
+    ],
+    [
+     77.78,
+     "re-expand one original",
+     38272
+    ],
+    [
+     77.88,
+     "re-expand one original",
+     37664
+    ],
+    [
+     77.98,
+     "re-expand one original",
+     45184
+    ],
+    [
+     78.09,
+     "re-expand one original",
+     48128
+    ],
+    [
+     78.19,
+     "re-expand one original",
+     44000
+    ],
+    [
+     78.3,
+     "re-expand one original",
+     45072
+    ],
+    [
+     78.4,
+     "re-expand one original",
+     45120
+    ],
+    [
+     78.51,
+     "re-expand one original",
+     44288
+    ],
+    [
+     78.61,
+     "re-expand one original",
+     46112
+    ],
+    [
+     78.71,
+     "re-expand one original",
+     48416
+    ],
+    [
+     78.82,
+     "re-expand one original",
+     48800
+    ],
+    [
+     78.92,
+     "re-expand one original",
+     44816
+    ],
+    [
+     79.03,
+     "re-expand one original",
+     43744
+    ],
+    [
+     79.13,
+     "re-expand one original",
+     47584
+    ],
+    [
+     79.23,
+     "re-expand one original",
+     43520
+    ],
+    [
+     79.34,
+     "re-expand one original",
+     43712
+    ],
+    [
+     79.44,
+     "re-expand one original",
+     44688
+    ],
+    [
+     79.54,
+     "re-expand one original",
+     44688
+    ],
+    [
+     79.65,
+     "re-expand one original",
+     43728
+    ],
+    [
+     79.75,
+     "re-expand one original",
+     43728
+    ],
+    [
+     79.85,
+     "re-expand one original",
+     47424
+    ],
+    [
+     79.96,
+     "re-expand one original",
+     43616
+    ],
+    [
+     80.06,
+     "re-expand one original",
+     47120
+    ],
+    [
+     80.16,
+     "re-expand one original",
+     43856
+    ],
+    [
+     80.27,
+     "re-expand one original",
+     45280
+    ],
+    [
+     80.37,
+     "re-expand one original",
+     43584
+    ],
+    [
+     80.47,
+     "re-expand one original",
+     44048
+    ],
+    [
+     80.58,
+     "re-expand one original",
+     47248
+    ],
+    [
+     80.68,
+     "re-expand one original",
+     47760
+    ],
+    [
+     80.78,
+     "re-expand one original",
+     44592
+    ],
+    [
+     80.88,
+     "re-expand one original",
+     38448
+    ],
+    [
+     80.98,
+     "re-expand one original",
+     37952
+    ],
+    [
+     81.08,
+     "re-expand one original",
+     37328
+    ],
+    [
+     81.18,
+     "re-expand one original",
+     37328
+    ],
+    [
+     81.29,
+     "re-expand one original",
+     37712
+    ],
+    [
+     81.39,
+     "re-expand one original",
+     37328
+    ],
+    [
+     81.49,
+     "re-expand one original",
+     47792
+    ],
+    [
+     81.59,
+     "re-expand one original",
+     37328
+    ],
+    [
+     81.7,
+     "re-expand one original",
+     41344
+    ],
+    [
+     81.8,
+     "re-expand one original",
+     37792
+    ],
+    [
+     81.9,
+     "re-expand one original",
+     37328
+    ],
+    [
+     82.01,
+     "re-expand one original",
+     38576
+    ],
+    [
+     82.11,
+     "re-expand one original",
+     38896
+    ],
+    [
+     82.21,
+     "re-expand one original",
+     37840
+    ],
+    [
+     82.32,
+     "re-expand one original",
+     37328
+    ],
+    [
+     82.42,
+     "re-expand one original",
+     37328
+    ],
+    [
+     82.52,
+     "re-expand one original",
+     37360
+    ],
+    [
+     82.63,
+     "re-expand one original",
+     37312
+    ],
+    [
+     82.73,
+     "re-expand one original",
+     37312
+    ],
+    [
+     82.83,
+     "re-expand one original",
+     37312
+    ],
+    [
+     82.93,
+     "re-expand one original",
+     43840
+    ],
+    [
+     83.04,
+     "re-expand one original",
+     43920
+    ],
+    [
+     83.14,
+     "re-expand one original",
+     47792
+    ],
+    [
+     83.24,
+     "re-expand one original",
+     43968
+    ],
+    [
+     83.35,
+     "re-expand one original",
+     43904
+    ],
+    [
+     83.45,
+     "re-expand one original",
+     47248
+    ],
+    [
+     83.56,
+     "re-expand one original",
+     46304
+    ],
+    [
+     83.66,
+     "re-expand one original",
+     43888
+    ],
+    [
+     83.76,
+     "re-expand one original",
+     43888
+    ],
+    [
+     83.86,
+     "re-expand one original",
+     43872
+    ],
+    [
+     83.96,
+     "re-expand one original",
+     44624
+    ],
+    [
+     84.07,
+     "re-expand one original",
+     43664
+    ],
+    [
+     84.17,
+     "re-expand one original",
+     43936
+    ],
+    [
+     84.28,
+     "re-expand one original",
+     47840
+    ],
+    [
+     84.38,
+     "re-expand one original",
+     47584
+    ],
+    [
+     84.48,
+     "re-expand one original",
+     44000
+    ],
+    [
+     84.59,
+     "re-expand one original",
+     43936
+    ],
+    [
+     84.69,
+     "re-expand one original",
+     44224
+    ],
+    [
+     84.79,
+     "re-expand one original",
+     48192
+    ],
+    [
+     84.9,
+     "re-expand one original",
+     48160
+    ],
+    [
+     85.0,
+     "re-expand one original",
+     48384
+    ],
+    [
+     85.1,
+     "re-expand one original",
+     48464
+    ],
+    [
+     85.2,
+     "re-expand one original",
+     47392
+    ],
+    [
+     85.3,
+     "re-expand one original",
+     43952
+    ],
+    [
+     85.41,
+     "re-expand one original",
+     48368
+    ],
+    [
+     85.51,
+     "re-expand one original",
+     48192
+    ],
+    [
+     85.62,
+     "re-expand one original",
+     48864
+    ],
+    [
+     85.72,
+     "re-expand one original",
+     44928
+    ],
+    [
+     85.83,
+     "re-expand one original",
+     43936
+    ],
+    [
+     85.93,
+     "re-expand one original",
+     43984
+    ],
+    [
+     86.04,
+     "re-expand one original",
+     43968
+    ],
+    [
+     86.14,
+     "re-expand one original",
+     43808
+    ],
+    [
+     86.25,
+     "re-expand one original",
+     37440
+    ],
+    [
+     86.35,
+     "re-expand one original",
+     47904
+    ],
+    [
+     86.45,
+     "re-expand one original",
+     47888
+    ],
+    [
+     86.56,
+     "re-expand one original",
+     47856
+    ]
+   ],
+   "storage_sampled_peak": {
+    "apparent": 67111920,
+    "allocated": 67125248,
+    "files": 8,
+    "step": "expand every retained original"
+   }
+  },
+  "gate": {
+   "limit_bytes": 100000000,
+   "valid": true,
+   "invalid_reasons": [],
+   "passed": true
+  },
+  "steps": [
+   {
+    "step": "load workspace (initial scan)",
+    "seconds": 0.37
+   },
+   {
+    "step": "index baseline",
+    "seconds": 9.707
+   },
+   {
+    "step": "cold query symbol_070",
+    "seconds": 7.006
+   },
+   {
+    "step": "warm query symbol_070",
+    "seconds": 0.209
+   },
+   {
+    "step": "same-size dirty edit",
+    "seconds": 0.344
+   },
+   {
+    "step": "rename/delete cycle",
+    "seconds": 0.318
+   },
+   {
+    "step": "index client 1 (concurrent)",
+    "seconds": 0.343
+   },
+   {
+    "step": "index client 2 (concurrent)",
+    "seconds": 0.373
+   },
+   {
+    "step": "two concurrent index clients",
+    "seconds": 0.373
+   },
+   {
+    "step": "five concurrent 16 MiB captures",
+    "seconds": 0.475
+   },
+   {
+    "step": "expand every retained original",
+    "seconds": 54.43
+   },
+   {
+    "step": "re-expand one original",
+    "seconds": 13.359
+   }
+  ],
+  "work": {
+   "cold query symbol_070": {
+    "graph_cache": "miss",
+    "lock": "acquired",
+    "lock_wait_ms": 0,
+    "lock_contended": false,
+    "identity_passes": 2,
+    "identity_files_hashed": 0,
+    "identity_bytes_hashed": 0,
+    "files_read": 501,
+    "bytes_read": 21179988,
+    "files_parsed": 501,
+    "bytes_parsed": 21179988,
+    "files_reused": 0,
+    "symbols_extracted": 29737,
+    "symbols_indexed": 29737,
+    "coverage_losses": 0,
+    "stale_temps_removed": 0,
+    "elapsed_ms": 6843
+   },
+   "warm query symbol_070": {
+    "graph_cache": "hit",
+    "lock": "not_used",
+    "lock_wait_ms": 0,
+    "lock_contended": false,
+    "identity_passes": 1,
+    "identity_files_hashed": 0,
+    "identity_bytes_hashed": 0,
+    "files_read": 0,
+    "bytes_read": 0,
+    "files_parsed": 0,
+    "bytes_parsed": 0,
+    "files_reused": 0,
+    "symbols_extracted": 0,
+    "symbols_indexed": 29737,
+    "coverage_losses": 0,
+    "stale_temps_removed": 0,
+    "elapsed_ms": 51
+   },
+   "same-size dirty edit": {
+    "graph_cache": "miss",
+    "lock": "acquired",
+    "lock_wait_ms": 0,
+    "lock_contended": false,
+    "identity_passes": 2,
+    "identity_files_hashed": 2,
+    "identity_bytes_hashed": 84336,
+    "files_read": 1,
+    "bytes_read": 42168,
+    "files_parsed": 1,
+    "bytes_parsed": 42168,
+    "files_reused": 500,
+    "symbols_extracted": 56,
+    "symbols_indexed": 29737,
+    "coverage_losses": 0,
+    "stale_temps_removed": 0,
+    "elapsed_ms": 171
+   },
+   "rename/delete cycle": {
+    "graph_cache": "miss",
+    "lock": "acquired",
+    "lock_wait_ms": 0,
+    "lock_contended": false,
+    "identity_passes": 2,
+    "identity_files_hashed": 4,
+    "identity_bytes_hashed": 168672,
+    "files_read": 0,
+    "bytes_read": 0,
+    "files_parsed": 0,
+    "bytes_parsed": 0,
+    "files_reused": 499,
+    "symbols_extracted": 0,
+    "symbols_indexed": 29625,
+    "coverage_losses": 0,
+    "stale_temps_removed": 0,
+    "elapsed_ms": 148
+   },
+   "index client 1 (concurrent)": {
+    "graph_cache": "miss",
+    "lock": "acquired",
+    "lock_wait_ms": 0,
+    "lock_contended": false,
+    "identity_passes": 2,
+    "identity_files_hashed": 6,
+    "identity_bytes_hashed": 253010,
+    "files_read": 1,
+    "bytes_read": 42169,
+    "files_parsed": 1,
+    "bytes_parsed": 42169,
+    "files_reused": 498,
+    "symbols_extracted": 56,
+    "symbols_indexed": 29625,
+    "coverage_losses": 0,
+    "stale_temps_removed": 0,
+    "elapsed_ms": 177
+   },
+   "index client 2 (concurrent)": {
+    "graph_cache": "hit",
+    "lock": "acquired",
+    "lock_wait_ms": 149,
+    "lock_contended": true,
+    "identity_passes": 1,
+    "identity_files_hashed": 3,
+    "identity_bytes_hashed": 126505,
+    "files_read": 0,
+    "bytes_read": 0,
+    "files_parsed": 0,
+    "bytes_parsed": 0,
+    "files_reused": 0,
+    "symbols_extracted": 0,
+    "symbols_indexed": 29625,
+    "coverage_losses": 0,
+    "stale_temps_removed": 0,
+    "elapsed_ms": 207
+   }
+  },
+  "unmeasured": [
+   "hardware memory bandwidth",
+   "Rust core allocations",
+   "MCP shim allocations",
+   "byte copies per stage",
+   "per-step CPU (only whole-run CPU totals are measured)"
+  ]
+ }
+}

@@ -1,6 +1,7 @@
 package workspaceops
 
 import (
+	"context"
 	"encoding/json"
 	"math"
 	"sort"
@@ -17,6 +18,11 @@ import (
 // structural fusion (with auto-seeding from an exact query→symbol match inside the
 // core).
 func WorkspaceSearch(dataDir, workspaceID, query string, limit int, seed string) (json.RawMessage, error) {
+	return WorkspaceSearchCtx(context.Background(), dataDir, workspaceID, query, limit, seed)
+}
+
+// WorkspaceSearchCtx is the request-scoped variant: cancelling ctx kills its Rust/tool children.
+func WorkspaceSearchCtx(ctx context.Context, dataDir, workspaceID, query string, limit int, seed string) (json.RawMessage, error) {
 	root, _, err := resolveChangeRoot(dataDir, workspaceID)
 	if err != nil {
 		return nil, err
@@ -29,7 +35,7 @@ func WorkspaceSearch(dataDir, workspaceID, query string, limit int, seed string)
 		// the seed is the CLI's optional 5th positional arg, after limit.
 		coreArgs = append(coreArgs, seed)
 	}
-	out, err := rustcore.RunSearch(coreArgs...)
+	out, err := rustcore.RunSearch(ctx, coreArgs...)
 	if err != nil {
 		return nil, err
 	}
@@ -40,7 +46,12 @@ func WorkspaceSearch(dataDir, workspaceID, query string, limit int, seed string)
 // into the ranking, and records that the returned paths were retrieved (closing the
 // bidirectional loop). Falls back to the raw result if it can't parse.
 func WorkspaceSearchWithFeedback(dataDir, workspaceID, query, seed string, limit int) (json.RawMessage, error) {
-	raw, err := WorkspaceSearch(dataDir, workspaceID, query, limit, seed)
+	return WorkspaceSearchWithFeedbackCtx(context.Background(), dataDir, workspaceID, query, seed, limit)
+}
+
+// WorkspaceSearchWithFeedbackCtx is the request-scoped variant: cancelling ctx kills its Rust/tool children.
+func WorkspaceSearchWithFeedbackCtx(ctx context.Context, dataDir, workspaceID, query, seed string, limit int) (json.RawMessage, error) {
+	raw, err := WorkspaceSearchCtx(ctx, dataDir, workspaceID, query, limit, seed)
 	if err != nil {
 		return nil, err
 	}
@@ -178,7 +189,7 @@ func WorkspaceWiki(dataDir, workspaceID string) (json.RawMessage, error) {
 	if err != nil {
 		return nil, err
 	}
-	out, err := rustcore.RunWiki(root, workspaceID)
+	out, err := rustcore.RunWiki(context.Background(), root, workspaceID)
 	if err != nil {
 		return nil, err
 	}

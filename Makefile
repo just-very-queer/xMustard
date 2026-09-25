@@ -1,11 +1,14 @@
 # xMustard is Go (api-go) + a Rust core (rust-core).
 #
 # PREFIX controls the install location (default /usr/local). `make install`
-# installs the rust core and the three Go binaries, plus a wrapper that points
-# the API/MCP at the installed core via XMUSTARD_CORE_BIN.
+# installs the Rust core and the three Go binaries. The Go API resolves the core
+# through XMUSTARD_CORE_BIN or PATH (no wrapper is installed).
 
 PREFIX ?= /usr/local
 BINDIR := $(PREFIX)/bin
+
+.PHONY: build install backend go-api frontend go-api-build rust-core-check \
+	rust-core-scan migration-check dev build-ui scan check check-backend check-frontend
 
 build:
 	cd rust-core && cargo build --release --bin xmustard-core
@@ -50,4 +53,18 @@ build-ui:
 	cd frontend && npm run build
 
 scan:
-	cd api-go && go run ./cmd/xmustard-ops load-workspace $(ROOT)
+	@test -n "$(ROOT)" || (echo "usage: make scan ROOT=/absolute/path/to/repo" >&2; exit 2)
+	@scan_root=$$(cd "$(ROOT)" && pwd) && \
+		cd api-go && go run ./cmd/xmustard-ops workspace load --root-path "$$scan_root"
+
+check: check-backend check-frontend
+
+check-backend:
+	cd api-go && go test ./...
+	cd api-go && go build ./...
+	cd rust-core && cargo test
+	cd rust-core && cargo clippy
+
+check-frontend:
+	cd frontend && npm run lint
+	cd frontend && npm run build

@@ -1,5 +1,9 @@
 # xMustard as a bidirectional search engine for repos
 
+> Historical working document, retained as evidence of earlier design and work.
+> Use [VISION.md](VISION.md), [STATUS.md](STATUS.md), and [ROADMAP.md](ROADMAP.md)
+> for current direction, verified behavior, and remaining work.
+
 **Thesis:** agents query a precomputed inverted index + authority graph; agent
 actions (tool calls, verified memories, run outcomes) write back into a feedback
 layer and incrementally update the crawl — Google's loop, for code intelligence.

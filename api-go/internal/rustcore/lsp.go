@@ -250,10 +250,10 @@ func NormalizeLSPWorkspaceSymbols(
 // binary prints {"available": false, ...} and exits 0). Uses the fast release
 // binary path (runCore), not `cargo run`.
 func RunLspDocumentSymbols(args ...string) ([]byte, error) {
-	return runCore("lsp-document-symbols", args...)
+	return runCore(context.Background(), "lsp-document-symbols", args...)
 }
 
 // RunLspHover runs a LIVE textDocument/hover session.
 func RunLspHover(args ...string) ([]byte, error) {
-	return runCore("lsp-hover", args...)
+	return runCore(context.Background(), "lsp-hover", args...)
 }

@@ -34,7 +34,7 @@ class Xmustard < Formula
       Run the API:    xmustard-api               # listens on 127.0.0.1:8042
       MCP for agents: xmustard-mcp               # stdio; set XMUSTARD_API_BASE
 
-      See the README for MCP client registration and the eight tools.
+      See the README for MCP client registration and the nine tools.
     EOS
   end
 

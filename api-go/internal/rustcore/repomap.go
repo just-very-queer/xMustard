@@ -118,6 +118,10 @@ type PathSymbolsResult struct {
 	SymbolRows      []SymbolMaterializationRecord           `json:"symbol_rows,omitempty"`
 	Warnings        []string                                `json:"warnings"`
 	GeneratedAt     string                                  `json:"generated_at"`
+	// TotalSymbols counts every extracted symbol; SymbolsTruncated reports that the
+	// display limit (or the extraction bound) hid some of them.
+	TotalSymbols     int  `json:"total_symbols"`
+	SymbolsTruncated bool `json:"symbols_truncated"`
 }
 
 type CodeExplainerResult struct {

@@ -1,0 +1,541 @@
+{
+  "dir": "/var/folders/rv/59993tb901gcfy8q0qdmynvm0000gn/T//xm-pi-e2e.WI7Omh/e2e",
+  "workspace_load_scan_ms": 165,
+  "workspace": "repo-f3d524d7cd",
+  "postgres_fixture": {
+    "status": "native",
+    "port": 54655,
+    "bootstrap": 200,
+    "diagnostics_run": 200
+  },
+  "conformance": {
+    "mcp_tools": 9,
+    "pi_active": [
+      "read",
+      "bash",
+      "edit",
+      "write",
+      "ground",
+      "recall",
+      "remember",
+      "verify",
+      "search",
+      "explain",
+      "impact",
+      "diagnostics",
+      "why_failed"
+    ]
+  },
+  "nine_tools": {
+    "ground": {
+      "isError": false,
+      "head": "{\"workspace_id\":\"repo-f3d524d7cd\",\"drift\":{\"workspace_id\":\"repo-f3d524d7cd\",\"has_baseline\":false,\"stale\":true,\"head_changed\":false,\"content_changed\":false,\"sibl"
+    },
+    "recall": {
+      "isError": false,
+      "head": "{\"active_count\":0,\"bounded\":true,\"conflicts\":[],\"consistency_attempts\":1,\"drift_checked\":0,\"entries\":[],\"generated_at\":\"2026-09-24T11:21:35.20438Z\",\"limit\":8,\"q"
+    },
+    "remember": {
+      "isError": false,
+      "head": "{\"id\":\"ctx_e5ab2f305a51\",\"workspace_id\":\"repo-f3d524d7cd\",\"title\":\"pi-e2e\",\"content\":\"Pi e2e: app doubles its input\",\"source\":\"anonymous\",\"permission\":\"readonly"
+    },
+    "search": {
+      "isError": false,
+      "head": "{\"workspace_id\":\"repo-f3d524d7cd\",\"query\":\"xm_marker_app\",\"total\":7,\"hits\":[{\"kind\":\"symbol\",\"name\":\"Handler27\",\"path\":\"pkg/handler_0027.go\",\"line\":4,\"score\":0."
+    },
+    "explain": {
+      "isError": false,
+      "head": "{\"workspace_id\":\"repo-f3d524d7cd\",\"path\":\"web/app.ts\",\"role\":\"source\",\"line_count\":3,\"import_count\":0,\"detected_symbols\":[\"xm_marker_app\"],\"symbol_source\":\"tree"
+    },
+    "impact": {
+      "isError": false,
+      "head": "{\"symbol\":\"Handler7\",\"defined_in\":[\"pkg/handler_0007.go\"],\"impacted\":[],\"impacted_count\":0,\"max_depth\":4,\"generated_at\":\"2026-09-24T11:21:35Z\"}\n\n"
+    },
+    "diagnostics": {
+      "isError": false,
+      "head": "{\"workspace_id\":\"repo-f3d524d7cd\",\"baseline\":{\"diagnostic_run_id\":\"diag_db02290cbf62\",\"workspace_id\":\"repo-f3d524d7cd\",\"source_kind\":\"lsp\",\"source_name\":\"gopls-"
+    },
+    "why_failed": {
+      "isError": false,
+      "head": "{\"run_id\":\"r-fail\",\"failed\":true,\"status\":\"failed\",\"exit_code\":1,\"signals\":[\"Run exited with non-zero code: 1\",\"Panic detected in output\"],\"error_lines\":[\"--- F"
+    },
+    "verify": {
+      "isError": false,
+      "head": "{\"id\":\"ctx_e5ab2f305a51\",\"workspace_id\":\"repo-f3d524d7cd\",\"title\":\"pi-e2e\",\"content\":\"Pi e2e: app doubles its input\",\"source\":\"anonymous\",\"permission\":\"readonly"
+    },
+    "why_failed!": {
+      "isError": true,
+      "head": "{\"error\":\"Missing resource\"}\n"
+    }
+  },
+  "diagnostics_success": {
+    "path": "pkg/handler_0007.go",
+    "line": 6,
+    "message": "xm_e2e_diagnostic: negative input panics"
+  },
+  "expand_source": {
+    "raw_bytes": 239221,
+    "projected_text_bytes": 65941,
+    "pages": 4,
+    "captured_identity": "bound",
+    "encodings": [
+      "utf-8",
+      "utf-8",
+      "utf-8",
+      "utf-8"
+    ]
+  },
+  "stale": {
+    "captured_key": "0f2b91b77fbad311416298ca66e6588fb4d326965362f6a8d8b8111b18c037d0",
+    "current_key": "13603753ff63704a0e68855119563e85af33be90bc6293e4890c42b264a43283"
+  },
+  "hook": {
+    "captured_identity": "unknown",
+    "freshness": "unknown",
+    "pages": 4
+  },
+  "concurrency": {
+    "calls": 8,
+    "distinct_handles": 8
+  },
+  "restart": {
+    "page_offset": 65536,
+    "sha_ok": true
+  },
+  "expiry": {
+    "first": "xMustard GET /evidence/{handle} -> 410 expired: evidence expired",
+    "again": 404
+  },
+  "abort": {
+    "acknowledged_ms": 571,
+    "result": "xMustard GET /api/workspaces/repo-f3d524d7cd/session-grounding: aborted by caller",
+    "exit": 0
+  },
+  "tool_timeout": "xMustard GET /api/workspaces/repo-f3d524d7cd/session-grounding: timed out after 1500 ms",
+  "projection_timeout": {
+    "big": "[xmustard] impact result is 239221 bytes, above the 65536-byte inline limit, and projection failed (xMustard POST /api/workspaces/repo-f3d524d7cd/evidence: timed out after 1000 ms). The original was n",
+    "small_preserved": true
+  },
+  "unreachable": {
+    "ground": "xMustard API unreachable at http://127.0.0.1:54729 (GET /api/workspaces/repo-f3d524d7cd/session-grounding)",
+    "expand": "Tool xmustard_expand not found"
+  },
+  "expand_endpoint_failure": {
+    "reset": "xMustard API unreachable at http://127.0.0.1:54732 (GET /api/workspaces/repo-f3d524d7cd/evidence/xm1.0XbIi5qjPkoJBRCgFVeDh4pvLP-mr23IzFGYytJ0KWI)",
+    "hung": "xMustard GET /api/workspaces/repo-f3d524d7cd/evidence/xm1.0XbIi5qjPkoJBRCgFVeDh4pvLP-mr23IzFGYytJ0KWI: timed out after 1500 ms"
+  },
+  "passthrough": {
+    "read_error": "ENOENT: no such file or directory, access '/private/var/folders/rv/59993tb901gcfy8q0qdmynvm0000gn/T/xm-pi-e2e.WI7Omh/e2e"
+  },
+  "auth": {
+    "anonymous": "xMustard GET /api/workspaces/repo-f3d524d7cd/session-grounding -> 401: authentication required: provide Authorization: B",
+    "rotated_old": "xMustard GET /api/workspaces/repo-f3d524d7cd/session-grounding -> 401: authentication required: provide Authorization: B",
+    "other_principal": "xMustard GET /evidence/{handle} -> 403 denied: evidence access denied"
+  },
+  "resources": {
+    "method": "ps -axo pid,ppid,rss,comm every 100 ms; RSS KiB→MiB; trees attributed to registered roots",
+    "scope": "e2e conformance workload, not the fixed scripts/bench/rss.sh workload; xmustard_owned = every registered API instance alive at the sample (the main API, plus the expiry/auth instance during those tests) with Rust/git children, and the MCP shim while it runs for the schema check; pi_external = all Pi CLI process trees alive (two during the concurrent-process test); postgres_fixture = the disposable native Postgres used only so the diagnostics tool can succeed (not part of the default no-DB deployment); workflow = all three. Test driver, proxies, builds and compilers excluded.",
+    "caveat": "every value is the maximum over 100 ms samples, not an OS high-water mark; short spikes are missed; not a ceiling and not the 100 MB gate",
+    "samples": 222,
+    "skipped_ticks": 0,
+    "sampling_failures": [],
+    "xmustard_owned": {
+      "sampled_peak_mib": 66.6,
+      "at_ms": 8014,
+      "phase": "concurrency: two concurrent Pi processes, four calls per turn, get distinct, exact originals",
+      "composition": [
+        {
+          "pid": 52834,
+          "owner": "xmustard-api",
+          "comm": "xmustard-api",
+          "rss_kib": 34176,
+          "rss_mib": 33.4
+        },
+        {
+          "pid": 53703,
+          "owner": "xmustard-api",
+          "comm": "(xmustard-core)",
+          "rss_kib": 6432,
+          "rss_mib": 6.3
+        },
+        {
+          "pid": 53704,
+          "owner": "xmustard-api",
+          "comm": "(xmustard-core)",
+          "rss_kib": 6400,
+          "rss_mib": 6.3
+        },
+        {
+          "pid": 53705,
+          "owner": "xmustard-api",
+          "comm": "xmustard-core",
+          "rss_kib": 6416,
+          "rss_mib": 6.3
+        },
+        {
+          "pid": 53712,
+          "owner": "xmustard-api",
+          "comm": "xmustard-core",
+          "rss_kib": 6416,
+          "rss_mib": 6.3
+        },
+        {
+          "pid": 53733,
+          "owner": "xmustard-api",
+          "comm": "(git)",
+          "rss_kib": 0,
+          "rss_mib": 0
+        },
+        {
+          "pid": 53739,
+          "owner": "xmustard-api",
+          "comm": "(git)",
+          "rss_kib": 3264,
+          "rss_mib": 3.2
+        },
+        {
+          "pid": 53738,
+          "owner": "xmustard-api",
+          "comm": "(git)",
+          "rss_kib": 1072,
+          "rss_mib": 1
+        },
+        {
+          "pid": 53742,
+          "owner": "xmustard-api",
+          "comm": "(git)",
+          "rss_kib": 4064,
+          "rss_mib": 4
+        }
+      ]
+    },
+    "pi_external": {
+      "sampled_peak_mib": 210.3,
+      "at_ms": 7021,
+      "phase": "concurrency: two concurrent Pi processes, four calls per turn, get distinct, exact originals",
+      "composition": [
+        {
+          "pid": 53469,
+          "owner": "pi",
+          "comm": "pi",
+          "rss_kib": 107424,
+          "rss_mib": 104.9
+        },
+        {
+          "pid": 53470,
+          "owner": "pi",
+          "comm": "pi",
+          "rss_kib": 107904,
+          "rss_mib": 105.4
+        }
+      ]
+    },
+    "postgres_fixture": {
+      "sampled_peak_mib": 45.5,
+      "at_ms": 3236,
+      "phase": "conformance: Pi sends the model exactly the MCP tool schemas; expand starts inactive",
+      "composition": [
+        {
+          "pid": 52886,
+          "owner": "postgres-fixture",
+          "comm": "postgres",
+          "rss_kib": 23280,
+          "rss_mib": 22.7
+        },
+        {
+          "pid": 52888,
+          "owner": "postgres-fixture",
+          "comm": "postgres: checkpointer",
+          "rss_kib": 3152,
+          "rss_mib": 3.1
+        },
+        {
+          "pid": 52889,
+          "owner": "postgres-fixture",
+          "comm": "postgres: background writer",
+          "rss_kib": 3600,
+          "rss_mib": 3.5
+        },
+        {
+          "pid": 52892,
+          "owner": "postgres-fixture",
+          "comm": "postgres: walwriter",
+          "rss_kib": 7280,
+          "rss_mib": 7.1
+        },
+        {
+          "pid": 52893,
+          "owner": "postgres-fixture",
+          "comm": "postgres: autovacuum launcher",
+          "rss_kib": 4832,
+          "rss_mib": 4.7
+        },
+        {
+          "pid": 52894,
+          "owner": "postgres-fixture",
+          "comm": "postgres: logical replication launcher",
+          "rss_kib": 4496,
+          "rss_mib": 4.4
+        }
+      ]
+    },
+    "workflow": {
+      "sampled_peak_mib": 310.4,
+      "at_ms": 7095,
+      "phase": "concurrency: two concurrent Pi processes, four calls per turn, get distinct, exact originals",
+      "composition": [
+        {
+          "pid": 52834,
+          "owner": "xmustard-api",
+          "comm": "xmustard-api",
+          "rss_kib": 24112,
+          "rss_mib": 23.5
+        },
+        {
+          "pid": 53479,
+          "owner": "xmustard-api",
+          "comm": "xmustard-core",
+          "rss_kib": 6320,
+          "rss_mib": 6.2
+        },
+        {
+          "pid": 53480,
+          "owner": "xmustard-api",
+          "comm": "xmustard-core",
+          "rss_kib": 6304,
+          "rss_mib": 6.2
+        },
+        {
+          "pid": 53481,
+          "owner": "xmustard-api",
+          "comm": "xmustard-core",
+          "rss_kib": 6304,
+          "rss_mib": 6.2
+        },
+        {
+          "pid": 53482,
+          "owner": "xmustard-api",
+          "comm": "xmustard-core",
+          "rss_kib": 6320,
+          "rss_mib": 6.2
+        },
+        {
+          "pid": 53487,
+          "owner": "xmustard-api",
+          "comm": "(git)",
+          "rss_kib": 4432,
+          "rss_mib": 4.3
+        },
+        {
+          "pid": 53488,
+          "owner": "xmustard-api",
+          "comm": "(git)",
+          "rss_kib": 4384,
+          "rss_mib": 4.3
+        },
+        {
+          "pid": 53491,
+          "owner": "xmustard-api",
+          "comm": "(git)",
+          "rss_kib": 4416,
+          "rss_mib": 4.3
+        },
+        {
+          "pid": 53494,
+          "owner": "xmustard-api",
+          "comm": "(git)",
+          "rss_kib": 4112,
+          "rss_mib": 4
+        },
+        {
+          "pid": 52886,
+          "owner": "postgres-fixture",
+          "comm": "postgres",
+          "rss_kib": 18272,
+          "rss_mib": 17.8
+        },
+        {
+          "pid": 52888,
+          "owner": "postgres-fixture",
+          "comm": "postgres: checkpointer",
+          "rss_kib": 2032,
+          "rss_mib": 2
+        },
+        {
+          "pid": 52889,
+          "owner": "postgres-fixture",
+          "comm": "postgres: background writer",
+          "rss_kib": 2672,
+          "rss_mib": 2.6
+        },
+        {
+          "pid": 52892,
+          "owner": "postgres-fixture",
+          "comm": "postgres: walwriter",
+          "rss_kib": 6272,
+          "rss_mib": 6.1
+        },
+        {
+          "pid": 52893,
+          "owner": "postgres-fixture",
+          "comm": "postgres: autovacuum launcher",
+          "rss_kib": 3616,
+          "rss_mib": 3.5
+        },
+        {
+          "pid": 52894,
+          "owner": "postgres-fixture",
+          "comm": "postgres: logical replication launcher",
+          "rss_kib": 3424,
+          "rss_mib": 3.3
+        },
+        {
+          "pid": 53469,
+          "owner": "pi",
+          "comm": "pi",
+          "rss_kib": 107392,
+          "rss_mib": 104.9
+        },
+        {
+          "pid": 53470,
+          "owner": "pi",
+          "comm": "pi",
+          "rss_kib": 107440,
+          "rss_mib": 104.9
+        }
+      ]
+    },
+    "per_process_sampled_max_mib": {
+      "xmustard-api:xmustard-api": 33.4,
+      "xmustard-api:(xmustard-core)": 9.1,
+      "postgres-fixture:postgres": 22.8,
+      "postgres-fixture:postgres: checkpointer": 3.1,
+      "postgres-fixture:postgres: background writer": 3.5,
+      "postgres-fixture:postgres: walwriter": 7.1,
+      "postgres-fixture:postgres: autovacuum launcher": 4.7,
+      "postgres-fixture:postgres: logical replication launcher": 4.4,
+      "xmustard-mcp:xmustard-mcp": 0,
+      "pi:node": 92.3,
+      "pi:pi": 143.5,
+      "xmustard-api:xmustard-core": 10.5,
+      "xmustard-api:(git)": 5.2,
+      "pi:(node)": 126.5,
+      "xmustard-api:<defunct>": 0,
+      "postgres-fixture:postgres: checkpointer performing shutdown checkpoint": 6
+    },
+    "per_phase_peak_mib": {
+      "setup": {
+        "samples": 11,
+        "xmustard_owned": 26.3,
+        "pi_external": 0,
+        "postgres_fixture": 44.2,
+        "workflow": 65.2
+      },
+      "conformance: Pi sends the model exactly the MCP tool schemas; expand starts inactive": {
+        "samples": 5,
+        "xmustard_owned": 22.4,
+        "pi_external": 113.3,
+        "postgres_fixture": 45.5,
+        "workflow": 169.3
+      },
+      "all nine tools run through Pi; results reach the next model request; errors stay errors": {
+        "samples": 7,
+        "xmustard_owned": 62.1,
+        "pi_external": 137.5,
+        "postgres_fixture": 36,
+        "workflow": 235.6
+      },
+      "a large result is projected at the source (bound identity); xmustard_expand activates and pages 64 KiB exactly": {
+        "samples": 9,
+        "xmustard_owned": 31.8,
+        "pi_external": 143.5,
+        "postgres_fixture": 35.9,
+        "workflow": 208.7
+      },
+      "repository mutation: the old capture is served unchanged and labelled stale": {
+        "samples": 8,
+        "xmustard_owned": 33.8,
+        "pi_external": 125.6,
+        "postgres_fixture": 35.5,
+        "workflow": 192.3
+      },
+      "hook delivery: POSTed results are projected by Go with unknown provenance, never fresh": {
+        "samples": 8,
+        "xmustard_owned": 34.1,
+        "pi_external": 143.2,
+        "postgres_fixture": 35.4,
+        "workflow": 212.4
+      },
+      "concurrency: two concurrent Pi processes, four calls per turn, get distinct, exact originals": {
+        "samples": 32,
+        "xmustard_owned": 66.6,
+        "pi_external": 210.3,
+        "postgres_fixture": 35.5,
+        "workflow": 310.4
+      },
+      "API restart: a handle issued before restart still expands to the same bytes": {
+        "samples": 11,
+        "xmustard_owned": 30.9,
+        "pi_external": 124.7,
+        "postgres_fixture": 35.2,
+        "workflow": 184.3
+      },
+      "expiry: an expired handle is refused explicitly and never re-served": {
+        "samples": 37,
+        "xmustard_owned": 43.7,
+        "pi_external": 124.6,
+        "postgres_fixture": 35.2,
+        "workflow": 201.6
+      },
+      "cancellation: an RPC abort during a tool call closes the request to Go": {
+        "samples": 5,
+        "xmustard_owned": 17.5,
+        "pi_external": 125.6,
+        "postgres_fixture": 35.2,
+        "workflow": 160.2
+      },
+      "tool deadline with a Pi signal present: a hung route fails at the configured timeout": {
+        "samples": 19,
+        "xmustard_owned": 16,
+        "pi_external": 125.6,
+        "postgres_fixture": 19,
+        "workflow": 160.2
+      },
+      "projection deadline: small originals pass through exactly, large ones become an explicit size error": {
+        "samples": 14,
+        "xmustard_owned": 35,
+        "pi_external": 126.5,
+        "postgres_fixture": 19.4,
+        "workflow": 180.1
+      },
+      "unreachable Go: xMustard tools fail explicitly, expand is not callable while inactive, other tools pass through": {
+        "samples": 3,
+        "xmustard_owned": 16.9,
+        "pi_external": 114.8,
+        "postgres_fixture": 19,
+        "workflow": 150.7
+      },
+      "activated xmustard_expand whose Go endpoint fails: explicit errors, never substituted content": {
+        "samples": 22,
+        "xmustard_owned": 30.1,
+        "pi_external": 124.5,
+        "postgres_fixture": 19,
+        "workflow": 168.3
+      },
+      "non-xMustard tools pass through untouched and never reach Go": {
+        "samples": 3,
+        "xmustard_owned": 17.8,
+        "pi_external": 111.4,
+        "postgres_fixture": 19,
+        "workflow": 148.1
+      },
+      "auth: bearer token required, handles bound to the principal, rotation keeps access, other principals denied": {
+        "samples": 28,
+        "xmustard_owned": 48.4,
+        "pi_external": 126.5,
+        "postgres_fixture": 19,
+        "workflow": 193.8
+      }
+    }
+  }
+}

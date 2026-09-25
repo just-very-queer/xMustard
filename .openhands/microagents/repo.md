@@ -5,23 +5,21 @@ type: repo
 
 # xMustard Repo Instructions
 
-xMustard is a local bug-operations product, not a general-purpose chat shell. The backend lives in `backend/` and the React frontend lives in `frontend/`.
+xMustard provides shared, verified memory and repository intelligence for existing coding agents. Read `AGENTS.md` for working rules and `docs/README.md` for the current documentation map.
 
 ## Product Intent
 
-- keep bugs, runs, fixes, and verification evidence as durable records
-- use repository guidance to shape runs
-- prefer review and verification artifacts over opaque agent behavior
+- ground agents in current code and supported shared memory
+- preserve source, freshness, verification, and run/fix lineage
+- keep the default local, no-Docker, and within the measured resource target
 
 ## Working Defaults
 
 - keep backend and frontend APIs aligned
-- prefer issue-first workflows over adding new generic chat surfaces
+- focus on MCP, CLI, and backend behavior; UI is outside the current focus
 - run targeted checks after edits:
-  - backend: `pytest -q`
-  - backend: `PYTHONPYCACHEPREFIX=/tmp/pycache python3 -m compileall app`
-  - frontend: `npm run lint`
-  - frontend: `npm run build`
+  - backend: `make check-backend`
+  - frontend, when explicitly in scope: `make check-frontend`
 
 ## Repo Layout
 
