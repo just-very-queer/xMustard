@@ -34,6 +34,7 @@ type diffFile struct {
 	order      int
 	adds, dels int
 	hunks      int
+	listed     bool // shown with hunks or as a header line
 }
 
 // DiffProjection is the structured per-kind projection of a diff.
@@ -303,6 +304,9 @@ func (diffReducer) Reduce(ctx context.Context, in *Input) (*Projection, error) {
 				}
 				headerOnly := !fileShown && cur != nil && fileIdx < maxDiffFiles && headerOnlyBudget > 0 && fits(len(path)+48)
 				fileIdx++
+				if headerOnly || fileShown {
+					cur.listed = true
+				}
 				if headerOnly {
 					headerOnlyBudget -= len(cur.path) + 40
 					fmt.Fprintf(&part, "=== %s (+%d -%d, %d hunks; not shown)\n", cur.path, cur.adds, cur.dels, cur.hunks)
@@ -382,7 +386,12 @@ func (diffReducer) Reduce(ctx context.Context, in *Input) (*Projection, error) {
 		fmt.Fprintf(&out, "[xmustard: %d of %d commit headers not shown]\n", commitsOmitted, commits)
 	}
 	if nFiles > listed {
-		rest := append([]*diffFile(nil), order[min(listed, len(order)):]...)
+		var rest []*diffFile
+		for _, f := range order {
+			if !f.listed {
+				rest = append(rest, f)
+			}
+		}
 		sort.Slice(rest, func(i, j int) bool {
 			ci, cj := rest[i].adds+rest[i].dels, rest[j].adds+rest[j].dels
 			if ci != cj {
@@ -390,11 +399,11 @@ func (diffReducer) Reduce(ctx context.Context, in *Input) (*Projection, error) {
 			}
 			return rest[i].order < rest[j].order
 		})
-		fmt.Fprintf(&out, "[xmustard: %d more files not listed; largest:", nFiles-listed)
+		var items []string
 		for _, f := range rest[:min(len(rest), maxTopFiles)] {
-			fmt.Fprintf(&out, " %s (+%d -%d)", f.path, f.adds, f.dels)
+			items = append(items, fmt.Sprintf(" %s (+%d -%d)", f.path, f.adds, f.dels))
 		}
-		out.WriteString("]\n")
+		writeWithin(&out, in.Target, fmt.Sprintf("[xmustard: %d more files not listed; largest:", nFiles-listed), items, "]\n")
 	}
 	dp := &DiffProjection{Kind: "diff", Files: nFiles, Additions: totalAdds, Deletions: totalDels, Hunks: totalHunks, Commits: commits}
 	for _, f := range order[:min(len(order), maxDiffFiles)] {

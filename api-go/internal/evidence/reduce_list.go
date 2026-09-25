@@ -198,24 +198,24 @@ func (r listReducer) Reduce(ctx context.Context, in *Input) (*Projection, error)
 	out.Write(body.Bytes())
 	note := ""
 	if shown < lp.Total {
-		var b strings.Builder
-		fmt.Fprintf(&b, "[xmustard: %d more entries not shown", lp.Total-shown)
+		prefix := fmt.Sprintf("[xmustard: %d more entries not shown", lp.Total-shown)
+		var items []string
 		if len(lp.Omitted) > 0 {
 			by := "extension"
 			if r.glob {
 				by = "directory"
 			}
-			fmt.Fprintf(&b, "; by %s:", by)
+			prefix += "; by " + by + ":"
 			for _, g := range lp.Omitted {
-				fmt.Fprintf(&b, " %s %d", g.Path, g.Matches)
+				items = append(items, fmt.Sprintf(" %s %d", g.Path, g.Matches))
 			}
 			if otherGroups > 0 {
-				fmt.Fprintf(&b, " other %d", otherGroups)
+				items = append(items, fmt.Sprintf(" other %d", otherGroups))
 			}
 		}
-		b.WriteString("]\n")
-		note = b.String()
-		out.WriteString(note)
+		start := out.Len()
+		writeWithin(&out, in.Target, prefix, items, "]\n")
+		note = out.String()[start:]
 	}
 	header := out.String()[:strings.IndexByte(out.String(), '\n')+1]
 	for i, sec := range secs {

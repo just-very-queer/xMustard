@@ -137,50 +137,89 @@ var (
 
 var lintRules = &groupedRules{family: FamilyLint, id: "xm-lint", parse: parseLintLine, sevName: true}
 
+// containsFold reports whether b contains the lowercase ASCII word w, ignoring case,
+// without allocating.
+func containsFold(b []byte, w string) bool {
+	for i := 0; i+len(w) <= len(b); i++ {
+		j := 0
+		for j < len(w) {
+			c := b[i+j]
+			if c >= 'A' && c <= 'Z' {
+				c += 'a' - 'A'
+			}
+			if c != w[j] {
+				break
+			}
+			j++
+		}
+		if j == len(w) {
+			return true
+		}
+	}
+	return false
+}
+
+// maySummarize is a cheap guard for lintSummary.
+func maySummarize(t []byte) bool {
+	for _, w := range []string{"problem", "found", "error", "issue", "passed", "checked"} {
+		if containsFold(t, w) {
+			return true
+		}
+	}
+	return false
+}
+
+// severity classifies a diagnostic's message.
+func severity(rest []byte) int {
+	switch {
+	case (containsFold(rest, "error") || containsFold(rest, "fatal") || containsFold(rest, "critical") ||
+		len(rest) > 1 && (rest[0] == 'E' || rest[0] == 'F')) && sevErrorRe.Match(rest):
+		return 2
+	case (containsFold(rest, "warn") || len(rest) > 1 && (rest[0] == 'W' || rest[0] == 'C')) && sevWarnRe.Match(rest):
+		return 1
+	}
+	return 0
+}
+
 func parseLintLine(st *groupState, line []byte) groupedItem {
 	t := bytes.TrimRight(line, "\r")
-	switch {
-	case len(bytes.TrimSpace(t)) == 0:
+	trimmed := bytes.TrimSpace(t)
+	if len(trimmed) == 0 {
 		return groupedItem{kind: ikOther}
-	case lintSummary.Match(t):
-		return groupedItem{kind: ikSummary}
-	case len(st.heading) > 0 && stylishRe.Match(t):
+	}
+	if len(st.heading) > 0 && stylishRe.Match(t) {
 		m := stylishRe.FindSubmatchIndex(t)
 		sev := 1
 		if string(t[m[6]:m[7]]) == "error" {
 			sev = 2
 		}
-		return groupedItem{kind: ikMatch, path: st.heading, line: t[m[2]:m[5]], text: bytes.TrimSpace(t), sev: sev}
-	case lintGoHeader.Match(t):
+		return groupedItem{kind: ikMatch, path: st.heading, line: t[m[2]:m[5]], text: trimmed, sev: sev}
+	}
+	// diagnostics first: they are most lines, and cheaper to recognize
+	if bytes.ContainsAny(t, ":(") && !bytes.HasPrefix(trimmed, []byte("at ")) {
+		if m := diagRe.FindSubmatchIndex(t); m != nil {
+			path := t[m[2]:m[3]]
+			var ln []byte
+			switch {
+			case m[4] >= 0 && m[6] >= 0:
+				ln = t[m[4]:m[7]] // line:col
+			case m[4] >= 0:
+				ln = t[m[4]:m[5]]
+			case m[8] >= 0:
+				ln = t[m[8]:m[11]] // (line,col)
+			}
+			if len(ln) > 0 && !bytes.ContainsAny(path, " \t") {
+				rest := t[m[12]:m[13]]
+				st.heading = st.heading[:0]
+				return groupedItem{kind: ikMatch, path: path, line: ln, text: bytes.TrimSpace(rest), sev: severity(rest)}
+			}
+		}
+	}
+	switch {
+	case maySummarize(t) && lintSummary.Match(t):
+		return groupedItem{kind: ikSummary}
+	case t[0] == '#' && lintGoHeader.Match(t):
 		return groupedItem{kind: ikOther}
-	case !bytes.HasPrefix(bytes.TrimSpace(t), []byte("at ")):
-		m := diagRe.FindSubmatchIndex(t)
-		if m == nil {
-			break
-		}
-		path := t[m[2]:m[3]]
-		var ln []byte
-		switch {
-		case m[4] >= 0 && m[6] >= 0:
-			ln = t[m[4]:m[7]] // line:col
-		case m[4] >= 0:
-			ln = t[m[4]:m[5]]
-		case m[8] >= 0:
-			ln = t[m[8]:m[11]] // (line,col)
-		}
-		if len(ln) == 0 || bytes.ContainsAny(path, " \t") {
-			break
-		}
-		rest := t[m[12]:m[13]]
-		sev := 0
-		switch {
-		case sevErrorRe.Match(rest):
-			sev = 2
-		case sevWarnRe.Match(rest):
-			sev = 1
-		}
-		st.heading = st.heading[:0]
-		return groupedItem{kind: ikMatch, path: path, line: ln, text: bytes.TrimSpace(rest), sev: sev}
 	}
 	if !bytes.HasPrefix(t, []byte(" ")) && !bytes.HasPrefix(t, []byte("\t")) && !bytes.ContainsAny(t, " \t") {
 		st.heading = append(st.heading[:0], t...) // eslint stylish file header
@@ -475,14 +514,15 @@ func reduceGrouped(ctx context.Context, in *Input, rules *groupedRules) (*Projec
 	out.WriteString(headerLine)
 	out.Write(body.Bytes())
 	if kept < total {
-		fmt.Fprintf(&out, "[xmustard: %d more of %d not shown", total-kept, total)
+		prefix := fmt.Sprintf("[xmustard: %d more of %d not shown", total-kept, total)
+		var items []string
 		if len(omitted) > 0 {
-			fmt.Fprintf(&out, "; %d files with none shown, largest:", len(omitted)+untracked)
+			prefix += fmt.Sprintf("; %d files with none shown, largest:", len(omitted)+untracked)
 			for _, fc := range gp.TopOmitted {
-				fmt.Fprintf(&out, " %s (%d)", fc.Path, fc.Matches)
+				items = append(items, fmt.Sprintf(" %s (%d)", fc.Path, fc.Matches))
 			}
 		}
-		out.WriteString("; search the original with pattern=…]\n")
+		writeWithin(&out, in.Target, prefix, items, "; search the original with pattern=…]\n")
 		for _, sec := range secs {
 			if sec.Array {
 				parts[sec.Name] += fmt.Sprintf("[xmustard: %d more of %d not shown]\n", total-kept, total)
@@ -503,6 +543,23 @@ func reduceGrouped(ctx context.Context, in *Input, rules *groupedRules) (*Projec
 	}
 	return &Projection{Text: out.String(), Parts: parts, Structured: gp, Facts: facts,
 		Record: Record{Mode: "text", Reduced: true, Omissions: capOmissions(oms)}}, nil
+}
+
+// writeWithin writes prefix, then as many items as keep out within limit bytes
+// (leaving room for suffix), then suffix: closing summaries never push a projection
+// past its target.
+func writeWithin(out *bytes.Buffer, limit int, prefix string, items []string, suffix string) {
+	out.WriteString(prefix)
+	for i, it := range items {
+		if out.Len()+len(it)+len(suffix)+4 > limit {
+			if i < len(items) {
+				out.WriteString(" …")
+			}
+			break
+		}
+		out.WriteString(it)
+	}
+	out.WriteString(suffix)
 }
 
 func registerFile(files map[string]*fileStat, path []byte, n, errs int, untracked *int) {

@@ -310,7 +310,9 @@ func TestFamilyProjectionsStayWithinTarget(t *testing.T) {
 		{lsOutput(5000), Selector{Tool: "Bash", Command: "ls -la"}},
 		{globOutput(20000), Selector{Tool: "Glob"}},
 		{diffOutput(400, 9), Selector{Tool: "Bash", Command: "git diff"}},
-		{gitLogP(2000), Selector{Tool: "Bash", Command: "git log -p"}},
+		{gitLogP(600), Selector{Tool: "Bash", Command: "git log -p"}},
+		{longPathDiff(), Selector{Tool: "Bash", Command: "git diff"}},
+		{longPathGrep(), Selector{Tool: "Bash", Command: "rg x"}},
 	}
 	for _, target := range []int{4 << 10, 16 << 10, 32 << 10} {
 		for _, in := range inputs {
@@ -572,4 +574,27 @@ func TestTokenEstimateHeuristic(t *testing.T) {
 	if a := testing.AllocsPerRun(10, func() { EstimateTokens(big) }); a != 0 {
 		t.Fatalf("EstimateTokens allocates %v times", a)
 	}
+}
+
+// long paths make closing summaries large: they must still fit the target
+func longPathDiff() []byte {
+	var b bytes.Buffer
+	for f := 0; f < 300; f++ {
+		p := fmt.Sprintf("%s/file_%03d.go", strings.Repeat("deeply/nested/directory", 8), f)
+		fmt.Fprintf(&b, "diff --git a/%s b/%s\n--- a/%s\n+++ b/%s\n@@ -1,2 +1,%d @@\n ctx\n", p, p, p, p, 2+f)
+		for i := 0; i < f; i++ {
+			fmt.Fprintf(&b, "+added line %d\n", i)
+		}
+	}
+	return b.Bytes()
+}
+
+func longPathGrep() []byte {
+	var b bytes.Buffer
+	for f := 0; f < 400; f++ {
+		for i := 0; i < 1+f%7; i++ {
+			fmt.Fprintf(&b, "%s/f%03d.go:%d:match here\n", strings.Repeat("very/long/path/segment", 10), f, i+1)
+		}
+	}
+	return b.Bytes()
 }
