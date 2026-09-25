@@ -58,7 +58,7 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
 	{
 		name: "recall",
 		description:
-			"VERIFIED shared context to trust, RANKED to your task: pass a query and/or paths for the few relevant facts (lexical + path overlap + verification strength), not a dump. No query → recency top-N. conflicts: path overlap, not contradiction.",
+			"VERIFIED shared context, RANKED by query and/or paths (lexical + path overlap + approvals); non-matches dropped. No args → top-N favoring working-tree overlap, then recency. conflicts: path overlap, not contradiction.",
 		required: ["workspace_id"],
 		optional: [
 			{ name: "query", type: "string", desc: "task query to rank memories by" },
@@ -106,7 +106,7 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
 	{
 		name: "search",
 		description:
-			"Code search: path:line slices, not a dump. Default hybrid ranks symbol NAMES, file paths and doc chunks, not function bodies: RRF of lexical IDF, trigram fuzzy match (typo tolerance, not meaning, unless built with semantic-onnx), reference degree, graph proximity to seed=<symbol> (else an exact-name match). mode=pattern: ast-grep structural query over code (e.g. `$A && $A()`; optional lang).",
+			"Code search: path:line slices. Default hybrid ranks symbol NAMES, file paths and doc chunks, not function bodies: RRF of lexical IDF, trigram fuzzy match (typo tolerance, not meaning, unless built with semantic-onnx and XMUSTARD_EMBED_MODEL set), reference degree, graph proximity to seed=<symbol> (else exact-name match). mode=pattern: ast-grep structural query (e.g. `$A && $A()`; optional lang).",
 		required: ["workspace_id", "query"],
 		optional: [
 			{ name: "mode", type: "string", enum: ["hybrid", "pattern"], desc: "hybrid (default) or pattern (ast-grep)" },
@@ -129,7 +129,7 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
 	{
 		name: "impact",
 		description:
-			"Blast radius over a LEXICAL reference graph (name matches + import lines, not resolved calls): distance≥1 edges are leads to confirm, not proof. No args → current changes (dirty symbols, contract_break if a signature changed). symbol= → transitive dependents. from=&to= → shortest dependency path.",
+			"Blast radius over a LEXICAL reference graph (name matches + import lines, not resolved calls): distance≥1 edges are leads to confirm, not proof. No args → current changes (dirty symbols, contract_break). symbol= → files referencing its defining files, ≤4 hops. from=&to= → shortest undirected file path.",
 		required: ["workspace_id"],
 		optional: [
 			{ name: "symbol", type: "string", desc: "symbol to compute blast radius for" },

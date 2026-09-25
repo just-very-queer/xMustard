@@ -78,7 +78,7 @@ func tools() []tool {
 	return []tool{
 		{"ground", "Orient before acting: what changed / what's stale / what's broken / what's blocked since the indexed baseline, with index-trust (drift) and any contract breaks (changed function signatures vs the baseline) included.", []string{"workspace_id"}, nil,
 			func(a map[string]string) (string, string, string) { return "GET", wsPath(a, "/session-grounding"), "" }},
-		{"recall", "VERIFIED shared context to trust, RANKED to your task: pass a query and/or paths for the few relevant facts (lexical + path overlap + verification strength), not a dump. No query → recency top-N. conflicts: path overlap, not contradiction.", []string{"workspace_id"},
+		{"recall", "VERIFIED shared context, RANKED by query and/or paths (lexical + path overlap + approvals); non-matches dropped. No args → top-N favoring working-tree overlap, then recency. conflicts: path overlap, not contradiction.", []string{"workspace_id"},
 			[]argSpec{{"query", "string", nil, "task query to rank memories by"}, {"paths", "string", nil, "comma-separated repo-relative files to focus on"}},
 			func(a map[string]string) (string, string, string) {
 				p := wsPath(a, "/context/active")
@@ -116,7 +116,7 @@ func tools() []tool {
 				}
 				return "POST", wsPath(a, "/context/"+url.PathEscape(a["entry_id"])+"/verify") + "?approve=" + approve, ""
 			}},
-		{"search", "Code search: path:line slices, not a dump. Default hybrid ranks symbol NAMES, file paths and doc chunks, not function bodies: RRF of lexical IDF, trigram fuzzy match (typo tolerance, not meaning, unless built with semantic-onnx), reference degree, graph proximity to seed=<symbol> (else an exact-name match). mode=pattern: ast-grep structural query over code (e.g. `$A && $A()`; optional lang).", []string{"workspace_id", "query"},
+		{"search", "Code search: path:line slices. Default hybrid ranks symbol NAMES, file paths and doc chunks, not function bodies: RRF of lexical IDF, trigram fuzzy match (typo tolerance, not meaning, unless built with semantic-onnx and XMUSTARD_EMBED_MODEL set), reference degree, graph proximity to seed=<symbol> (else exact-name match). mode=pattern: ast-grep structural query (e.g. `$A && $A()`; optional lang).", []string{"workspace_id", "query"},
 			[]argSpec{{"mode", "string", []string{"hybrid", "pattern"}, "hybrid (default) or pattern (ast-grep)"}, {"lang", "string", nil, "language hint for pattern mode"}, {"seed", "string", nil, "symbol to anchor the graph-proximity lane"}},
 			func(a map[string]string) (string, string, string) {
 				p := wsPath(a, "/search") + "?q=" + url.QueryEscape(a["query"])
@@ -135,7 +135,7 @@ func tools() []tool {
 			func(a map[string]string) (string, string, string) {
 				return "GET", wsPath(a, "/explain-path") + "?path=" + url.QueryEscape(a["path"]), ""
 			}},
-		{"impact", "Blast radius over a LEXICAL reference graph (name matches + import lines, not resolved calls): distance≥1 edges are leads to confirm, not proof. No args → current changes (dirty symbols, contract_break if a signature changed). symbol= → transitive dependents. from=&to= → shortest dependency path.", []string{"workspace_id"},
+		{"impact", "Blast radius over a LEXICAL reference graph (name matches + import lines, not resolved calls): distance≥1 edges are leads to confirm, not proof. No args → current changes (dirty symbols, contract_break). symbol= → files referencing its defining files, ≤4 hops. from=&to= → shortest undirected file path.", []string{"workspace_id"},
 			[]argSpec{{"symbol", "string", nil, "symbol to compute blast radius for"}, {"from", "string", nil, "trace path from this symbol"}, {"to", "string", nil, "trace path to this symbol"}},
 			func(a map[string]string) (string, string, string) {
 				p := wsPath(a, "/changes/since-index")
