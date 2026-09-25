@@ -102,7 +102,8 @@ deliberate commit bump.
 
 `rss_v2.sh ledger` reconciles the design lines, the §7.3 items and the workstream lines
 against the measured p50 and exits nonzero while any process is projected over its design
-line. With `--workstream WS-NN` (on `run` with `--baseline`, or on `ledger` with `--head`
+line. The lines of workstreams already merged into the measured revision
+(`reference_measurement.included`) are inside the measurement and are not projected again. With `--workstream WS-NN` (on `run` with `--baseline`, or on `ledger` with `--head`
 and `--baseline`), each common scenario is checked:
 
 - tree: owned gate-peak delta ≤ line + 10 MiB; the owned+external peak delta must meet the
@@ -116,9 +117,9 @@ and `--baseline`), each common scenario is checked:
   CI-suite scenario, a process within its §7.2 design line at the ledger's reference must
   stay within design steady + tolerance whatever the base shows, so small in-tolerance
   deltas still fail once they add up. A process already over its line at the reference
-  (today's stdio shims, per-call cores and git children) is bounded on the reference
-  scenario by reference p50 + the lines of the workstreams merged since + its own positive
-  line + tolerance. The merged workstreams come from the first-parent merge commits in
+  (today's stdio shims and per-call cores) is bounded on the reference scenario by
+  reference p50 (on the head's basis: footprint p50 when the reference has it, else RSS)
+  + the lines of the workstreams merged since + its own positive line + tolerance. The merged workstreams come from the first-parent merge commits in
   `reference_measurement.base_commit..<base revision>` (`merge: parity/ws-NN into ...` or
   GitHub's `Merge pull request #N from .../ws-NN`); `merged_since` lists only those merged
   without a merge commit (squash or rebase). On other
@@ -147,8 +148,10 @@ starting `ws-NN`). What blocks the pull request (`gate_blocking` in the report):
   `tolerance.tree_peak_mib` (10 MiB) above the base's. Without the margin, identical code
   blocked 140 of the 729 combinations of three repeats drawn from agents-2's recorded
   single-run peaks (79.4, 87.2, 97.0 MiB on a loaded M1); with it, 49 (a base drawing two
-  low runs against a head drawing two high ones). An overrun the base already had is
-  reported, not blocking. A side without a measurement (most repeats invalid) blocks: re-run.
+  low runs against a head drawing two high ones). On Linux agents-2 sits at the gate: two
+  sets of three runs of `c3603a2` had medians 94.2 and 96.1 MiB, so the rule without the
+  margin would block a pull request measured as the second against the first. An overrun
+  the base already had is reported, not blocking. A side without a measurement (most repeats invalid) blocks: re-run.
   A workstream whose acceptance is the absolute gate on its scenario opts in with
   `gate_blocking: true` (WS-13, WS-30, WS-55), and its designated scenarios then block like
   CI-suite ones;
@@ -168,9 +171,12 @@ author's own approval: until a second code owner exists, changes to the gate and
 workflow are self-reviewed, and "Require review from Code Owners" (not enabled on `main`
 or `feat/parity-v2` as of 2026-09-25) could only be met by an admin bypass.
 
-The tolerances and `reference_measurement` were measured on a loaded M1 (darwin, where
-footprint is `phys_footprint`); on the Linux runner footprint is PSS. Replace both with
-data from the first CI runs before relying on the design and cumulative bounds there.
+`reference_measurement` was measured on Linux (a shared 6-core Ubuntu box, not a GitHub
+runner) by the budget-gate job's own commands: the base run of a pull request from
+`parity/ws-10` into `feat/parity-v2` at `c3603a2`, with RSS and PSS p50 per process. The
+tolerances were measured on a loaded M1 (darwin, where footprint is `phys_footprint`);
+the Linux observations are in `tolerance.basis`. Replace both with data from the first CI
+runs before relying on the design and cumulative bounds there.
 
 ### First CI run (owner or orchestrator)
 
@@ -192,9 +198,10 @@ pull request from `parity/ws-10` into `feat/parity-v2` (both pushed first):
    WS-10, and the ledger check verdict is BELOW_RESOLUTION (WS-10's line is 0).
 4. Compare the runner's per-process p50, repeat spread and v1 cross-check difference with
    `tolerance` and `reference_measurement`. Replace `reference_measurement` with the
-   runner's base measurement (set `base_commit` to the base revision measured, clear
-   `merged_since`) and recalibrate the tolerances, including the 10 MiB regression margin,
-   from the repeat spread. That pull request needs the `budget-ledger-change` label.
+   runner's base measurement (both p50 maps; `base_commit` the base revision measured,
+   `included` the workstreams merged there, `merged_since` empty) and recalibrate the
+   tolerances, including the 10 MiB regression margin, from the repeat spread. That pull
+   request needs the `budget-ledger-change` label.
 5. Enable branch protection on `main` and `feat/parity-v2` with this workflow's jobs as
    required checks, and add a second code owner or keep the self-review note above.
 6. `rss_v2.sh ledger` exits 1 until the owner records the reconciliation decision in

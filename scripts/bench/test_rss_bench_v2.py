@@ -28,7 +28,14 @@ import rss_bench as v1  # noqa: E402
 import rss_bench_v2 as v2  # noqa: E402
 
 REPO = os.path.abspath(os.path.join(HERE, "..", ".."))
-LEDGER = v2.load_json(v2.LEDGER_PATH)
+REAL_LEDGER = v2.load_json(v2.LEDGER_PATH)
+# The checks are tested against a pinned reference measurement (the darwin one they were
+# designed with: RSS p50 only, nothing merged), so replacing the real reference with a
+# CI-runner measurement changes no expectation here. test_real_reference checks the real one.
+TEST_REFERENCE = {"scenario": "v1-workload", "base_commit": "0" * 40, "included": [], "merged_since": [],
+                  "component_p50_mib": {"git_child": 0.2, "go_daemon": 18.8, "mcp_access": 20.7, "rust_core_per_call": 6.2,
+                                        "rust_index_service": 0.0}}
+LEDGER = dict(REAL_LEDGER, reference_measurement=TEST_REFERENCE)
 FIXTURES = v2.load_json(v2.FIXTURES_PATH)
 REGISTRY = v2.RoleRegistry(LEDGER["process_roles"])
 HARNESS_PID = 900
@@ -609,6 +616,35 @@ class Features(unittest.TestCase):
 
 
 class Ledger(unittest.TestCase):
+    def test_real_reference(self):
+        ref = REAL_LEDGER["reference_measurement"]
+        self.assertIn(ref["scenario"], v2.SCENARIOS)
+        self.assertRegex(ref["base_commit"], r"^[0-9a-f]{40}$")
+        for key in ("component_p50_mib", "component_footprint_p50_mib"):
+            self.assertTrue(set(ref.get(key) or {}) <= {c["process"] for c in REAL_LEDGER["components"].values()} | {"git_child"}, key)
+        for wid in ref.get("included", []) + ref.get("merged_since", []):
+            self.assertIn(wid, REAL_LEDGER["workstreams"])
+        self.assertFalse(set(ref.get("included", [])) & set(ref.get("merged_since", [])))
+        self.assertEqual(ref["gate_peak_mib"], v2.median(ref["gate_peak_mib_repeats"]))
+
+    def test_reference_on_the_heads_basis_and_lines_already_measured(self):
+        led = copy.deepcopy(LEDGER)
+        led["reference_measurement"]["component_footprint_p50_mib"] = {"rust_core_per_call": 4.0, "mcp_access": 8.0}
+        view = {"v1-workload": {"gate_peak_mib": 80.0, "tree_all_peak_mib": 80.0,
+                                "components_p50_mib": {"rust_core_per_call": 9.0, "mcp_access": 16.0},
+                                "components_footprint_p50_mib": {"rust_core_per_call": 7.5, "mcp_access": 8.0}}}
+        design = {d["process"]: d for d in v2.ledger_check(led, "WS-16", view, view)["rows"][0]["design"]}
+        # footprint against the footprint reference (4 + 3), not the RSS one (6.2 + 3)
+        self.assertEqual((design["rust_core_per_call"]["allowed_mib"], design["rust_core_per_call"]["over"]), (7.0, True))
+        rss_only = {"v1-workload": dict(view["v1-workload"], components_footprint_p50_mib={})}
+        design = {d["process"]: d for d in v2.ledger_check(led, "WS-16", rss_only, rss_only)["rows"][0]["design"]}
+        self.assertEqual((design["rust_core_per_call"]["allowed_mib"], design["rust_core_per_call"]["basis"]), (9.2, "RSS p50"))
+        # a reference measured after WS-01 and WS-08 merged holds their lines: they are not projected again
+        rec = {r["process"]: r for r in v2.ledger_reconcile(LEDGER, included=["WS-01", "WS-08"])["per_process"]}
+        self.assertEqual((rec["go_daemon"]["lines_in_measurement_mib"], rec["go_daemon"]["projected_steady_mib"]), (4.5, 42.0))
+        led["reference_measurement"]["included"] = ["WS-01", "WS-08"]
+        self.assertEqual({r["process"]: r for r in v2.ledger_reconcile(led)["per_process"]}["go_daemon"]["projected_steady_mib"], 42.0)
+
     def test_real_ledger_is_consistent(self):
         procs = {c["process"] for c in LEDGER["components"].values() if c["process"]}
         roles = {r["component"] for r in LEDGER["process_roles"]["rules"]}
@@ -633,9 +669,6 @@ class Ledger(unittest.TestCase):
         self.assertEqual(opted, {"WS-13", "WS-30", "WS-55"})
         for wid in opted:
             self.assertTrue(LEDGER["workstreams"][wid].get("scenarios"), wid)
-        for wid in LEDGER["reference_measurement"]["merged_since"]:
-            self.assertIn(wid, LEDGER["workstreams"])
-        self.assertRegex(LEDGER["reference_measurement"]["base_commit"], r"^[0-9a-f]{40}$")
 
     def test_reconcile_reports_the_overcommit_and_exits_nonzero(self):
         rec = v2.ledger_reconcile(LEDGER)

@@ -55,9 +55,9 @@
  },
  "reconciliation": {
   "status": "open",
-  "about": "The critic's §12.4 finding stands and is not decided here: the workstream lines overcommit the §7.2/§7.3 design lines. `rss_v2.sh ledger` prints the current numbers (at the 2026-09-25 reference: go_daemon 18.8 measured + 27.7 of lines = 46.5 projected against a 27 MiB design line; rust_index_service 37 of lines against 32; §7.3 governance caches 10.5 of lines against 3, evidence caches 6.5 against 2.5, hooks 1.5 against 1, runner 2 against 1, and 7 MiB of daemon lines with no §7.3 item; mcp_access 20.7 measured with the frozen workload's two stdio shims, and WS-13's -10 leaves 10.7 against a 0 line; rust_core_per_call 6.2 measured with only WS-25's -2 declared against a 0 steady line, although WS-02/WS-14 move per-call work into the resident service) and exits nonzero until the owner decides.",
+  "about": "The critic's §12.4 finding stands and is not decided here: the workstream lines overcommit the §7.2/§7.3 design lines. `rss_v2.sh ledger` prints the current numbers (at the Linux reference, base c3603a2 with WS-00 to WS-09 merged except WS-05 and WS-07: go_daemon 21.4 measured, which holds the 5.2 MiB of merged lines, + 22.5 of lines still to merge = 43.9 projected against a 27 MiB design line; rust_index_service 34 of lines still to merge against 32; §7.3 governance caches 10.5 of lines against 3, evidence caches 6.5 against 2.5, hooks 1.5 against 1, runner 2 against 1, and 7 MiB of daemon lines with no §7.3 item; mcp_access 16.6 measured (RSS) with the frozen workload's two stdio shims, and WS-13's -10 leaves 6.6 against a 0 line; rust_core_per_call 9.7 measured with only WS-25's -2 declared against a 0 steady line, although WS-02/WS-14 move per-call work into the resident service) and exits nonzero until the owner decides.",
   "options": [
-   "raise design lines: the gate cannot absorb the full 19.5 MiB go_daemon overcommit on top of the 87-93 MiB §7.2 peak",
+   "raise design lines: the gate cannot absorb the full 16.9 MiB go_daemon overcommit on top of the 87-93 MiB §7.2 peak",
    "cut or re-place workstream lines so every process's lines fit its design line (for example SQLite-resident LSH bands and anchor postings per §12.4, WS-43 opt-in only)",
    "declare offsetting savings as negative lines (§7.2 counts on -3 to -8 MiB from unlinking the platform half; only WS-49's -4 is declared)"
   ],
@@ -135,37 +135,40 @@
    "component_p50_mib": 3.0,
    "component_p50_mib_by_process": {"mcp_access": 5.0},
    "v1_crosscheck_mib": 8.0,
-   "basis": "Measured 2026-09-25 on darwin-arm64 (Apple M1, 8 GB, shared with other agents, load average 4-55). Tree peak: single v1-workload runs of one set of binaries ranged 66.8-87.9 MiB over 12 runs (the frozen v1's own history is 72.3-84.9 MB); medians of three were 74.2, 78.7 and 80.8 MiB, so CI compares medians of three and allows 10 MiB. Process check: go_daemon RSS p50 moved 17.8-23.2 MiB within one set of three (lazily reclaimed and compressed pages), footprint p50 11.0-13.1 MiB, so the check uses footprint p50 when both runs report it and allows 3 MiB. Between the medians of two sets of three runs of identical code, footprint p50 moved 2.0 MiB for go_daemon, 1.9 for rust_core_per_call and 4.0 for mcp_access (two stdio Go shims), hence 5 MiB for mcp_access. v1 cross-check: v2 minus the frozen v1 sampler in the same run stayed within 2.33 MiB in 19 of 20 runs and reached -5.62 MiB once at load average 25; it is a gross-error detector (a missed shim or core is 8+ MiB), so it allows 8 MiB. A line smaller than its check's tolerance is below measurement resolution (ledger_check reports BELOW_RESOLUTION, never PASS). Revisit all of these with CI-runner data."
+   "basis": "Measured 2026-09-25 on darwin-arm64 (Apple M1, 8 GB, shared with other agents, load average 4-55). Tree peak: single v1-workload runs of one set of binaries ranged 66.8-87.9 MiB over 12 runs (the frozen v1's own history is 72.3-84.9 MB); medians of three were 74.2, 78.7 and 80.8 MiB, so CI compares medians of three and allows 10 MiB. Process check: go_daemon RSS p50 moved 17.8-23.2 MiB within one set of three (lazily reclaimed and compressed pages), footprint p50 11.0-13.1 MiB, so the check uses footprint p50 when both runs report it and allows 3 MiB. Between the medians of two sets of three runs of identical code, footprint p50 moved 2.0 MiB for go_daemon, 1.9 for rust_core_per_call and 4.0 for mcp_access (two stdio Go shims), hence 5 MiB for mcp_access. v1 cross-check: v2 minus the frozen v1 sampler in the same run stayed within 2.33 MiB in 19 of 20 runs and reached -5.62 MiB once at load average 25; it is a gross-error detector (a missed shim or core is 8+ MiB), so it allows 8 MiB. A line smaller than its check's tolerance is below measurement resolution (ledger_check reports BELOW_RESOLUTION, never PASS). Linux check (the reference box, four sets of three v1-workload runs of the api-go and rust-core code of feat/parity-v2 c3603a2, load average 5-11): single tree peaks 68.3-78.3 MiB in two clusters (about 69 and 77, by whether the two index clients' cores overlap at a sample), so medians of three ranged 69.1-77.1 MiB, within the 10 MiB tree allowance with little room; footprint (PSS) p50 medians moved 1.1 MiB for go_daemon, 0.2 for mcp_access and 0.4 for rust_core_per_call; the v1 cross-check stayed within 1.1 MiB in 11 of 12 runs and reached -5.8 MiB once. Revisit all of these with CI-runner data."
  },
  "reference_measurement": {
-   "about": "v1-workload (the frozen 501-file workload) measured by gate v2, median of three repeats. Binaries were built at source_head, whose api-go and rust-core trees equal base_commit (feat/parity-v2 b4f7b49). The per-process p50 feeds the reconciliation's projected steady state and, for a process already over its design line here (mcp_access, rust_core_per_call, git_child), the cumulative bound ledger_check applies on this scenario: this p50 + the lines of the workstreams merged into the base after this measurement + tolerance. Those workstreams are derived from the first-parent merge commits in base_commit..<base revision> (merge: parity/ws-NN into ..., or GitHub's Merge pull request #N from .../ws-NN); merged_since lists only those merged without a merge commit (squash or rebase). Replace this block with a CI-runner measurement when one exists, and set base_commit to the commit measured then.",
+   "about": "v1-workload (the frozen 501-file workload) measured by gate v2 on Linux, median of three repeats, through the budget-gate job's own commands (the base run of a pull request from parity/ws-10 into feat/parity-v2): binaries built from base_commit, the Rust core from the same tree. component_p50_mib is ps-RSS p50 (the reconciliation projects from it against the RSS-basis design lines); component_footprint_p50_mib is PSS p50, which ledger_check compares a head's footprint p50 with. A process already over its design line here (mcp_access, rust_core_per_call) is bounded on this scenario cumulatively: this p50 + the lines of the workstreams merged into the base after base_commit + tolerance. Those are derived from the first-parent merge commits in base_commit..<base revision> (merge: parity/ws-NN into ..., or GitHub's Merge pull request #N from .../ws-NN); merged_since lists only those merged without a merge commit (squash or rebase). included lists the workstreams already merged at base_commit, whose lines this measurement contains, so the reconciliation does not project them again. Not a GitHub runner: replace this block with the first CI run's base measurement (set base_commit, included and platform; clear merged_since). The previous reference (darwin-arm64 M1, 2026-09-25, base b4f7b49 before any workstream merged) had RSS p50 go_daemon 18.8, mcp_access 20.7, rust_core_per_call 6.2, git_child 0.2 and gate peak 78.7 MiB.",
    "scenario": "v1-workload",
-   "platform": "darwin-arm64 (Apple M1, 8 GB, shared with other agents; load average 15-55 during the runs)",
+   "platform": "linux-x86_64 (Ubuntu 26.04, kernel 7.0, procps-ng 4.0.4, 6 cores, 22 GB; shared with a Windows VM and other builds, load average 8-11 during the runs)",
    "date": "2026-09-25",
-   "source_head": "ea96e421841c",
-   "xmustard_core_sha256": "d644743ba005318e",
-   "gate_peak_mib": 78.7,
-   "gate_peak_mib_repeats": [
-     78.2,
-     78.7,
-     87.9
-   ],
-   "footprint_peak_mib": 53.6,
+   "base_commit": "c3603a239e22abb070b18f4419cd64fe5c828b42",
+   "xmustard_core_sha256": "fd3a63ca701fcac9",
+   "gate_peak_mib": 69.1,
+   "gate_peak_mib_repeats": [68.7, 69.1, 75.9],
+   "footprint_peak_mib": 54.9,
    "component_p50_mib": {
-     "git_child": 0.2,
-     "go_daemon": 18.8,
-     "mcp_access": 20.7,
-     "rust_core_per_call": 6.2,
+     "git_child": 0.0,
+     "go_daemon": 21.4,
+     "mcp_access": 16.6,
+     "rust_core_per_call": 9.7,
+     "rust_index_service": 0.0
+   },
+   "component_footprint_p50_mib": {
+     "git_child": 0.0,
+     "go_daemon": 19.6,
+     "mcp_access": 8.2,
+     "rust_core_per_call": 7.2,
      "rust_index_service": 0.0
    },
    "component_peak_mib": {
-     "git_child": 6.2,
-     "go_daemon": 43.7,
-     "mcp_access": 24.3,
-     "rust_core_per_call": 36.6
+     "git_child": 0.0,
+     "go_daemon": 27.2,
+     "mcp_access": 23.1,
+     "rust_core_per_call": 28.7
    },
-   "note": "rust_index_service is absent at this HEAD (0.0); mcp_access is two stdio Go shims",
-   "base_commit": "b4f7b49fb76cf373438f645770cf564743a2ede5",
+   "note": "rust_index_service (WS-02's resident worker) was not started during this workload at base_commit; mcp_access is two stdio Go shims, whose PSS halves the pages they share",
+   "included": ["WS-00", "WS-01", "WS-02", "WS-03", "WS-04", "WS-06", "WS-08", "WS-09"],
    "merged_since": []
  }
 }

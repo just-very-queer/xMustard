@@ -1261,13 +1261,16 @@ def component_tolerance(ledger, proc):
     return (tol.get("component_p50_mib_by_process") or {}).get(proc, tol["component_p50_mib"])
 
 
-def ledger_reconcile(ledger, measured=None):
+def ledger_reconcile(ledger, measured=None, included=None):
     """Reconcile the §7.2 component lines, the §7.3 Go-daemon sub-allocation and the
     per-workstream lines (§12.4-12.5).
 
     measured: {"source": text, "component_p50_mib": {process: MiB}} from this run's
     reference scenario; without it the ledger's static reference measurement is used.
-    Projected steady = measured p50 + the workstream lines placed on the process.
+    included: the workstreams already merged into the measured revision (default: the
+    reference's `included`), whose lines the measurement contains.
+    Projected steady = measured p50 + the lines of the other workstreams placed on the
+    process.
     `over_design` names every process projected above its design steady line; `rss_v2.sh
     ledger` exits nonzero while it is non-empty. The decision that clears it (raise design
     lines, or cut and re-place workstream lines) belongs to the owner and is recorded in
@@ -1278,16 +1281,20 @@ def ledger_reconcile(ledger, measured=None):
     overlap = sum(max(0, c["peak_mib"] - c["steady_mib"]) for n, c in comps.items()
                   if n not in ("heavy_slot", "git_child", "margin") and not c.get("peak_in_heavy_slot"))
     design = design_lines(ledger)
+    ref = ledger.get("reference_measurement") or {}
+    included = set(ref.get("included") or []) if included is None else set(included)
     ws_by_proc, ws_names, unassigned = collections.defaultdict(float), collections.defaultdict(list), []
+    pending_by_proc = collections.defaultdict(float)
     for wid, w in ledger["workstreams"].items():
         if w.get("line_mib") is None:
             unassigned.append(wid)
             continue
         if w.get("process"):
             ws_by_proc[w["process"]] += w["line_mib"]
+            if wid not in included:
+                pending_by_proc[w["process"]] += w["line_mib"]
             if w["line_mib"]:
                 ws_names[w["process"]].append(wid)
-    ref = ledger.get("reference_measurement") or {}
     if measured:
         source, cur_p50 = measured["source"], measured["component_p50_mib"]
     else:
@@ -1297,9 +1304,10 @@ def ledger_reconcile(ledger, measured=None):
     for proc in sorted(set(design) | set(ws_by_proc)):
         d = design.get(proc, {"steady": 0.0, "peak": 0.0})
         cur = cur_p50.get(proc, 0.0 if measured else None)  # absent from a measured run: that process used nothing
-        projected = None if cur is None else round(cur + ws_by_proc.get(proc, 0.0), 1)
+        projected = None if cur is None else round(cur + pending_by_proc.get(proc, 0.0), 1)
         rows.append({"process": proc, "design_steady_mib": round(d["steady"], 1), "design_peak_mib": round(d["peak"], 1),
                      "workstream_lines_mib": round(ws_by_proc.get(proc, 0.0), 1), "workstreams": ws_names.get(proc, []),
+                     "lines_in_measurement_mib": round(ws_by_proc.get(proc, 0.0) - pending_by_proc.get(proc, 0.0), 1),
                      "measured_p50_mib": cur, "projected_steady_mib": projected,
                      "over_design_steady": projected is not None and projected > d["steady"],
                      "overcommit_mib": None if projected is None else round(projected - d["steady"], 1)})
@@ -1334,10 +1342,12 @@ def ledger_reconcile(ledger, measured=None):
         "go_daemon_items": items,
         "go_daemon_items_over": [i["item"] for i in items if i["over"]],
         "workstreams_without_a_line": unassigned,
+        "workstreams_in_measurement": sorted(included),
         "note": ("7.2 method: steady subtotal + heavy slot + git child. With query overlap: resident components "
                  "also at their peak while the heavy slot runs (critic §12.4). Projected = measured p50 + the sum "
-                 "of workstream lines placed on that process. go_daemon_items: §7.3 targets against the lines "
-                 "placed on them; a base item's allocation is today's daemon, so it is not compared."),
+                 "of the lines placed on that process by workstreams not yet merged into the measured revision. "
+                 "go_daemon_items: §7.3 targets against the lines placed on them; a base item's allocation is "
+                 "today's daemon, so it is not compared."),
     }
 
 
@@ -1438,15 +1448,16 @@ MERGE_SUBJECT = re.compile(r"^(?:merge pull request #\d+ from\s+|merge (?:remote
 
 
 def merged_workstreams(repo, since, until):
-    """Workstreams merged into `until` after `since`, oldest first: those a first-parent
-    merge commit in since..until names as its merged branch ("merge: parity/ws-08 into
+    """Workstreams merged into `until` after `since` (from the start without one), oldest
+    first: those a first-parent merge commit in since..until names as its merged branch ("merge: parity/ws-08 into
     feat/parity-v2", GitHub's "Merge pull request #12 from owner/parity/ws-14", or git's
     "Merge branch 'parity/ws-14'"). None when either commit is missing or git cannot
     resolve the range (a shallow clone). A squash or rebase merge leaves no merge commit;
     list such workstreams in reference_measurement.merged_since."""
-    if not (since and until):
+    if not until:
         return None
-    p = run(["git", "log", "--first-parent", "--merges", "--format=%s", f"{since}..{until}"], cwd=repo, check=False)
+    p = run(["git", "log", "--first-parent", "--merges", "--format=%s", f"{since}..{until}" if since else until],
+            cwd=repo, check=False)
     if p.returncode != 0:
         return None
     out = []
@@ -1467,7 +1478,7 @@ def merged_since(ledger, base_head, repo=REPO_ROOT):
     ref = ledger.get("reference_measurement") or {}
     declared = list(ref.get("merged_since") or [])
     since = ref.get("base_commit")
-    derived = merged_workstreams(repo, since, base_head)
+    derived = merged_workstreams(repo, since, base_head) if since else None
     return {"workstreams": declared + [w for w in derived or [] if w not in declared], "declared": declared,
             "derived": derived, "range": f"{since}..{base_head}" if since and base_head else None,
             "note": None if derived is not None else "only the declared list: git could not resolve the range"}
@@ -1534,8 +1545,9 @@ def ledger_check(ledger, workstream, head, base, head_status=None, base_status=N
         On a CI-suite scenario a process within its §7.2 design line at the reference
         must stay within design steady + tolerance whatever the base shows, so many small
         in-tolerance deltas still fail once they add up ("absolute"). A process already
-        over its design line at the reference ("grandfathered": the stdio shims,
-        per-call cores and git children) is bounded on the reference scenario by reference p50 + the lines
+        over its design line at the reference ("grandfathered": the stdio shims and
+        per-call cores) is bounded on the reference scenario by reference p50 (on the
+        head's basis: footprint when the reference has it, else RSS) + the lines
         of the workstreams merged since (`merged`: merged_since() of the base revision;
         default reference_measurement.merged_since) + this workstream's positive line +
         tolerance ("cumulative"). Everywhere else, and for
@@ -1566,7 +1578,8 @@ def ledger_check(ledger, workstream, head, base, head_status=None, base_status=N
     line, proc, designated, why = workstream_line(ledger, workstream)
     design = design_lines(ledger)
     ref_meas = ledger.get("reference_measurement") or {}
-    ref, ref_sc = ref_meas.get("component_p50_mib") or {}, ref_meas.get("scenario")
+    ref_rss, ref_sc = ref_meas.get("component_p50_mib") or {}, ref_meas.get("scenario")
+    ref_fp = ref_meas.get("component_footprint_p50_mib") or {}
     rows = []
     for sc in sorted(set(head) & set(base)):
         h, b = head[sc], base[sc]
@@ -1614,6 +1627,8 @@ def ledger_check(ledger, workstream, head, base, head_status=None, base_status=N
             tol_p = component_tolerance(ledger, p)
             cur, basis = process_p50(h, p)
             base_cur, _ = process_p50(b, p)
+            # the reference on the head's basis: its footprint p50 when it has one, else RSS p50
+            ref = ref_fp if basis == "footprint p50" and ref_fp.get(p) is not None else ref_rss
             grandfathered = ref.get(p) is not None and ref[p] > dl["steady"]
             merged_names = []
             if grandfathered and sc == ref_sc:
@@ -1693,7 +1708,7 @@ def gate_blocking(ledger, workstream, report, base_report):
     noise = ledger["tolerance"]["tree_peak_mib"]
     base_report = base_report or {}
     hv, bv = ledger_view(report), ledger_view(base_report)
-    hs, bs = scenario_status(report), scenario_status(base_report)
+    bs = scenario_status(base_report)
     rows = []
     for sc, r in (report.get("scenarios") or {}).items():
         br = (base_report.get("scenarios") or {}).get(sc) or {}
@@ -2766,6 +2781,8 @@ def render_markdown(report):
                  f"{fmt(rec.get('design_peak_mib_7_2_method'))} MiB by the §7.2 method, "
                  f"{fmt(rec.get('design_peak_mib_with_query_overlap'))} MiB with query peaks overlapping the heavy slot; "
                  f"gate {fmt(rec.get('gate_mib'))} MiB. Measured from {rec.get('measured_from', 'the ledger reference')}."
+                 + (f" Already in the measurement (their lines are not projected again): "
+                    f"{', '.join(rec['workstreams_in_measurement'])}." if rec.get("workstreams_in_measurement") else "")
                  + (f" Projected over the design line: {', '.join(over)}." if over else ""))
         L.append("")
         L.append("| Process | Design steady | Design peak | Workstream lines | Measured p50 | Projected steady | Overcommit |")
@@ -2912,7 +2929,12 @@ def cmd_run(args):
     ref_sc = (ledger.get("reference_measurement") or {}).get("scenario")
     measured = ({"source": f"this run ({ref_sc}, median of {view[ref_sc]['valid_runs']} valid run(s))",
                  "component_p50_mib": view[ref_sc]["components_p50_mib"]} if ref_sc in view else None)
-    report["ledger_reconcile"] = ledger_reconcile(ledger, measured)
+    included = None
+    if measured:  # the reference's workstreams, those merged since, and the workstream under check
+        included = list((ledger.get("reference_measurement") or {}).get("included") or [])
+        included += merged_since(ledger, ctx["provenance"]["head"], source_root)["workstreams"]
+        included += [args.workstream] if args.workstream else []
+    report["ledger_reconcile"] = ledger_reconcile(ledger, measured, included)
     report["design_comparison"] = design_comparison(ledger, view)
     report["ledger_path"] = os.path.abspath(args.ledger)
     if args.workstream:
