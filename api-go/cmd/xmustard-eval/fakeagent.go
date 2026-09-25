@@ -70,8 +70,11 @@ func runFakeAgent(argv []string, stdin io.Reader, stdout io.Writer) int {
 	var err error
 	switch st.kind {
 	case "claude":
-		if cfg := flagValue(st.args, "--mcp-config"); cfg != "" {
-			st.servers, err = parseClaudeMCP(cfg)
+		if path := flagValue(st.args, "--mcp-config"); path != "" {
+			var raw []byte
+			if raw, err = os.ReadFile(path); err == nil {
+				st.servers, err = parseClaudeMCP(string(raw))
+			}
 		}
 		if err == nil {
 			st.prompt, err = readAll(stdin)
@@ -180,6 +183,18 @@ func (st *fakeState) summary() string {
 	return s
 }
 
+// flags lists the option names the client received (values are left out: they can
+// hold paths and settings the transcript need not repeat).
+func (st *fakeState) flags() []string {
+	var out []string
+	for _, a := range st.args {
+		if strings.HasPrefix(a, "-") && a != "-" {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
 func (st *fakeState) serverNames() []string {
 	var out []string
 	for _, s := range st.servers {
@@ -194,7 +209,7 @@ func (st *fakeState) emitClaude(emit func(any)) {
 		servers = append(servers, map[string]any{"name": s.Name, "status": "connected"})
 	}
 	emit(map[string]any{"type": "system", "subtype": "init", "session_id": "fake", "model": st.model, "mcp_servers": servers})
-	emit(map[string]any{"type": "xm.fake.config", "args": st.args, "mcp_servers": st.serverNames()})
+	emit(map[string]any{"type": "xm.fake.config", "flags": st.flags(), "mcp_servers": st.serverNames()})
 	for i, c := range st.calls {
 		id := "toolu_fake_" + strconv.Itoa(i)
 		name := "mcp__" + c.server + "__" + c.tool
@@ -220,7 +235,7 @@ func (st *fakeState) emitClaude(emit func(any)) {
 
 func (st *fakeState) emitCodex(emit func(any)) {
 	emit(map[string]any{"type": "thread.started", "thread_id": "fake"})
-	emit(map[string]any{"type": "xm.fake.config", "args": st.args, "mcp_servers": st.serverNames()})
+	emit(map[string]any{"type": "xm.fake.config", "flags": st.flags(), "mcp_servers": st.serverNames()})
 	emit(map[string]any{"type": "turn.started"})
 	for i, c := range st.calls {
 		item := map[string]any{"id": "item_" + strconv.Itoa(i), "type": "mcp_tool_call", "server": c.server, "tool": c.tool, "arguments": c.args,
@@ -241,7 +256,7 @@ func (st *fakeState) emitCodex(emit func(any)) {
 
 // piRPC answers Pi's RPC protocol: one prompt, then get_session_stats, until EOF.
 func (st *fakeState) piRPC(stdin io.Reader, emit func(any)) error {
-	emit(map[string]any{"type": "xm.fake.config", "args": st.args, "xmustard_tools": st.piTools})
+	emit(map[string]any{"type": "xm.fake.config", "flags": st.flags(), "xmustard_tools": st.piTools})
 	br := bufio.NewReader(stdin)
 	for {
 		line, err := br.ReadBytes('\n')
@@ -439,7 +454,7 @@ func parseClaudeMCP(raw string) ([]MCPServer, error) {
 }
 
 // parseCodexMCP reads the `-c mcp_servers.<name>.<field>=<toml>` overrides the codex
-// driver emits.
+// driver emits; env_vars values come from this process's environment, as in codex.
 func parseCodexMCP(args []string) ([]MCPServer, error) {
 	byName := map[string]*MCPServer{}
 	disabled := map[string]bool{}
@@ -471,8 +486,13 @@ func parseCodexMCP(args []string) ([]MCPServer, error) {
 			s.Command, err = parseTOMLString(val)
 		case len(parts) == 2 && parts[1] == "args":
 			s.Args, err = parseTOMLStringArray(val)
-		case len(parts) == 3 && parts[1] == "env":
-			s.Env[parts[2]], err = parseTOMLString(val)
+		case len(parts) == 2 && parts[1] == "env_vars":
+			var names []string
+			if names, err = parseTOMLStringArray(val); err == nil {
+				for _, n := range names {
+					s.Env[n] = os.Getenv(n)
+				}
+			}
 		case len(parts) == 2 && parts[1] == "enabled":
 			disabled[name] = val == "false"
 		default:

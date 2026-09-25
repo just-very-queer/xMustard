@@ -571,7 +571,12 @@ func (ex *executor) runOne(ctx context.Context, t *Task, arm Arm, rep int, repo,
 		return fail(StatusError, "snapshot: "+err.Error())
 	}
 
-	req := DriverRequest{Arm: arm, Model: cfg.Model, WorkDir: wt.Dir, Client: cfg.client(),
+	configDir := filepath.Join(cfg.workRoot, "clientcfg", runID)
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		return fail(StatusError, err.Error())
+	}
+	defer os.RemoveAll(configDir)
+	req := DriverRequest{Arm: arm, Model: cfg.Model, WorkDir: wt.Dir, Client: cfg.client(), ConfigDir: configDir,
 		UserServers: ex.userServers, XmServerName: "xmustard", ExternalSandbox: cfg.contain == ContainSandbox}
 	if arm.NeedsHooks {
 		req.HookArgs = cfg.Hooks[cfg.Driver]

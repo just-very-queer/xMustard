@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -154,17 +155,28 @@ func TestDriverInvocationsPerArm(t *testing.T) {
 	xm := MCPServer{Name: "xmustard", Command: "/bin/xmustard-mcp", Env: map[string]string{"XMUSTARD_API_BASE": "http://127.0.0.1:1", "XMUSTARD_API_TOKEN": `t"k`}}
 
 	// claude: baseline keeps the operator's MCP config; isolated arms are strict
-	inv, _ := claudeDriver{}.Build(DriverRequest{Arm: arm(ArmBaseline), Model: "m"}, "p")
+	cfgDir := t.TempDir()
+	readCfg := func(inv Invocation) string {
+		b, _ := os.ReadFile(flagValue(inv.Args, "--mcp-config"))
+		return string(b)
+	}
+	inv, _ := claudeDriver{}.Build(DriverRequest{Arm: arm(ArmBaseline), Model: "m", ConfigDir: cfgDir}, "p")
 	if slices.Contains(inv.Args, "--strict-mcp-config") || inv.Stdin != "p" || !slices.Contains(inv.Args, "stream-json") {
 		t.Fatalf("claude baseline %v", inv.Args)
 	}
-	inv, _ = claudeDriver{}.Build(DriverRequest{Arm: arm(ArmBaselineNoMCP), Model: "m"}, "p")
-	cfg := flagValue(inv.Args, "--mcp-config")
+	inv, _ = claudeDriver{}.Build(DriverRequest{Arm: arm(ArmBaselineNoMCP), Model: "m", ConfigDir: cfgDir}, "p")
+	cfg := readCfg(inv)
 	if !slices.Contains(inv.Args, "--strict-mcp-config") || cfg != `{"mcpServers":{}}` {
 		t.Fatalf("claude nomcp %v", inv.Args)
 	}
-	inv, _ = claudeDriver{}.Build(DriverRequest{Arm: arm(ArmXmustardMCPHooks), Model: "m", Servers: []MCPServer{xm}, HookArgs: []string{"--settings", "/h.json"}}, "p")
-	servers, err := parseClaudeMCP(flagValue(inv.Args, "--mcp-config"))
+	inv, _ = claudeDriver{}.Build(DriverRequest{Arm: arm(ArmXmustardMCPHooks), Model: "m", ConfigDir: cfgDir, Servers: []MCPServer{xm}, HookArgs: []string{"--settings", "/h.json"}}, "p")
+	if strings.Contains(strings.Join(inv.Args, " "), `t"k`) {
+		t.Fatal("a server credential reached the command line")
+	}
+	if fi, err := os.Stat(flagValue(inv.Args, "--mcp-config")); err != nil || fi.Mode().Perm() != 0o600 {
+		t.Fatalf("mcp config file must be private: %v %v", fi, err)
+	}
+	servers, err := parseClaudeMCP(readCfg(inv))
 	if err != nil || len(servers) != 1 || servers[0].Env["XMUSTARD_API_TOKEN"] != `t"k` || flagValue(inv.Args, "--settings") != "/h.json" {
 		t.Fatalf("claude xmustard %v %v", servers, err)
 	}
@@ -180,14 +192,19 @@ func TestDriverInvocationsPerArm(t *testing.T) {
 		t.Fatal(err)
 	}
 	joined := strings.Join(inv.Args, " ")
-	for _, want := range []string{"mcp_servers.chrome-devtools.enabled=false", "mcp_servers.node_repl.enabled=false", `mcp_servers.xmustard.command="/bin/xmustard-mcp"`, `mcp_servers.xmustard.env.XMUSTARD_API_TOKEN="t\"k"`, "-C /wt", "--sandbox workspace-write"} {
+	for _, want := range []string{"mcp_servers.chrome-devtools.enabled=false", "mcp_servers.node_repl.enabled=false", `mcp_servers.xmustard.command="/bin/xmustard-mcp"`,
+		`mcp_servers.xmustard.env_vars=["XMUSTARD_API_BASE","XMUSTARD_API_TOKEN"]`, "-C /wt", "--sandbox workspace-write"} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("codex args missing %q: %s", want, joined)
 		}
 	}
+	if strings.Contains(joined, `t"k`) || !slices.Contains(inv.Env, `XMUSTARD_API_TOKEN=t"k`) {
+		t.Fatalf("codex credentials must travel in the environment: %v %v", inv.Args, inv.Env)
+	}
 	if inv.Args[len(inv.Args)-1] != "-" {
 		t.Fatal("codex prompt must come from stdin")
 	}
+	t.Setenv("XMUSTARD_API_TOKEN", `t"k`)
 	parsed, err := parseCodexMCP(inv.Args)
 	if err != nil || len(parsed) != 1 || parsed[0].Env["XMUSTARD_API_TOKEN"] != `t"k` {
 		t.Fatalf("codex overrides round trip: %+v %v", parsed, err)
@@ -255,10 +272,11 @@ func TestContainmentWrappers(t *testing.T) {
 }
 
 func TestClaudeMCPConfigIsValidJSON(t *testing.T) {
-	inv, _ := claudeDriver{}.Build(DriverRequest{Arm: Arm{Name: ArmXmustardMCP, IsolateMCP: true, UsesStack: true},
+	inv, _ := claudeDriver{}.Build(DriverRequest{Arm: Arm{Name: ArmXmustardMCP, IsolateMCP: true, UsesStack: true}, ConfigDir: t.TempDir(),
 		Servers: []MCPServer{{Name: "xmustard", Command: "/x"}}}, "p")
 	var v map[string]map[string]map[string]any
-	if err := json.Unmarshal([]byte(flagValue(inv.Args, "--mcp-config")), &v); err != nil || v["mcpServers"]["xmustard"]["type"] != "stdio" {
+	raw, _ := os.ReadFile(flagValue(inv.Args, "--mcp-config"))
+	if err := json.Unmarshal(raw, &v); err != nil || v["mcpServers"]["xmustard"]["type"] != "stdio" {
 		t.Fatalf("mcp config %v %v", v, err)
 	}
 }

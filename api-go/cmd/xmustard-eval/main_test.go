@@ -673,3 +673,23 @@ func TestExampleRunConfigParses(t *testing.T) {
 		}
 	}
 }
+
+// TestHooksArmRunsWhenConfigured: with hook arguments for the driver the hooks arm is
+// xmustard_mcp plus those arguments.
+func TestHooksArmRunsWhenConfigured(t *testing.T) {
+	c := loadTestCorpus(t, writeFixtureCorpus(t, nil))
+	out := filepath.Join(t.TempDir(), "out")
+	cfg := prepared(t, &RunConfig{Driver: "fake:claude", Arms: []string{ArmXmustardMCPHooks}, Tasks: []string{"flip"},
+		Hooks: map[string][]string{"claude": {"--settings", "/nonexistent/hooks.json"}}}, c, out)
+	if _, err := Execute(context.Background(), cfg, c); err != nil {
+		t.Fatal(err)
+	}
+	r := readRecords(t, out)[0]
+	if r.Status != StatusCompleted || len(r.Transcript.XmResults) != 2 {
+		t.Fatalf("hooks arm: %s %q %+v", r.Status, r.Reason, r.Transcript)
+	}
+	b, _ := os.ReadFile(filepath.Join(out, r.Artifacts, "transcript.jsonl"))
+	if !strings.Contains(string(b), `"--settings"`) || !strings.Contains(string(b), `"--strict-mcp-config"`) {
+		t.Fatalf("hook arguments not passed:\n%s", b)
+	}
+}

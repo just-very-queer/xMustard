@@ -151,6 +151,11 @@ func (s *rssSampler) loop() {
 }
 
 func (s *rssSampler) sampleOnce() {
+	// The phase (and roots) in effect when ps starts own the snapshot, not the ones
+	// in effect when it returns ~100 ms later.
+	s.mu.Lock()
+	phase, xmRoots, agentRoot := s.phase, s.xmRoots, s.agentRoot
+	s.mu.Unlock()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	procs, err := psSnapshot(ctx)
 	cancel()
@@ -160,7 +165,7 @@ func (s *rssSampler) sampleOnce() {
 		s.sum.PSFailures++
 		return
 	}
-	xm, agent := splitTrees(procs, s.xmRoots, s.agentRoot)
+	xm, agent := splitTrees(procs, xmRoots, agentRoot)
 	s.sum.Samples++
 	var xmTotal, agentTotal int64
 	roles := map[string]*RSSPart{}
@@ -184,7 +189,7 @@ func (s *rssSampler) sampleOnce() {
 	}
 	if xmTotal > s.sum.XmPeakKiB {
 		s.sum.XmPeakKiB = xmTotal
-		s.sum.XmPeakPhase = s.phase
+		s.sum.XmPeakPhase = phase
 		s.sum.XmPeakRoles = s.sum.XmPeakRoles[:0]
 		for _, k := range sortedKeys(roles) {
 			s.sum.XmPeakRoles = append(s.sum.XmPeakRoles, *roles[k])
@@ -192,7 +197,7 @@ func (s *rssSampler) sampleOnce() {
 	}
 	found := false
 	for i := range s.sum.XmPeakByPhase {
-		if s.sum.XmPeakByPhase[i].Name == s.phase {
+		if s.sum.XmPeakByPhase[i].Name == phase {
 			found = true
 			if xmTotal > s.sum.XmPeakByPhase[i].RSSKiB {
 				s.sum.XmPeakByPhase[i].RSSKiB = xmTotal
@@ -201,11 +206,11 @@ func (s *rssSampler) sampleOnce() {
 		}
 	}
 	if !found {
-		s.sum.XmPeakByPhase = append(s.sum.XmPeakByPhase, RSSPart{Name: s.phase, RSSKiB: xmTotal, Procs: len(xm)})
+		s.sum.XmPeakByPhase = append(s.sum.XmPeakByPhase, RSSPart{Name: phase, RSSKiB: xmTotal, Procs: len(xm)})
 	}
 	s.sum.AgentPeakKiB = max(s.sum.AgentPeakKiB, agentTotal)
 	if s.out != nil {
-		line, _ := json.Marshal(map[string]any{"phase": s.phase, "xmustard_kib": xmTotal, "agent_kib": agentTotal, "xmustard_procs": len(xm), "agent_procs": len(agent)})
+		line, _ := json.Marshal(map[string]any{"phase": phase, "xmustard_kib": xmTotal, "agent_kib": agentTotal, "xmustard_procs": len(xm), "agent_procs": len(agent)})
 		_, _ = s.out.Write(append(line, '\n'))
 	}
 }

@@ -11,6 +11,7 @@ import (
 	"math"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"slices"
 	"sort"
 	"strconv"
@@ -90,6 +91,9 @@ type DriverRequest struct {
 	Client       ClientConfig
 	UserServers  []string // codex: operator-configured MCP servers to disable
 	XmServerName string   // MCP server name the xMustard tools are registered under
+	// ConfigDir is a private per-run directory for client config files, so server
+	// credentials never appear in a command line (other local users can read argv).
+	ConfigDir string
 	// ExternalSandbox is set when the harness runs the client under sandbox-exec. A
 	// macOS seatbelt cannot be applied inside another one (`codex sandbox macos` fails
 	// with "sandbox_apply: Operation not permitted" under sandbox-exec), so codex is
@@ -156,8 +160,12 @@ func (claudeDriver) Build(req DriverRequest, prompt string) (Invocation, error) 
 		if err != nil {
 			return Invocation{}, err
 		}
+		path := filepath.Join(req.ConfigDir, "mcp.json")
+		if err := os.WriteFile(path, cfg, 0o600); err != nil {
+			return Invocation{}, err
+		}
 		// --mcp-config is variadic; --strict-mcp-config after it ends the list.
-		args = append(args, "--mcp-config", string(cfg), "--strict-mcp-config")
+		args = append(args, "--mcp-config", path, "--strict-mcp-config")
 	}
 	args = append(args, req.HookArgs...)
 	args = append(args, req.Client.Args...)
@@ -269,23 +277,27 @@ func (codexDriver) Build(req DriverRequest, prompt string) (Invocation, error) {
 			args = append(args, "-c", "mcp_servers."+n+".enabled=false")
 		}
 	}
+	var env []string
 	for _, s := range req.Servers {
 		if !tomlBareKey(s.Name) {
 			return Invocation{}, fmt.Errorf("MCP server name %q is not a bare TOML key", s.Name)
 		}
 		p := "mcp_servers." + s.Name + "."
 		args = append(args, "-c", p+"command="+tomlString(s.Command), "-c", p+"args="+tomlStringArray(s.Args))
-		for _, k := range sortedKeys(s.Env) {
-			if !tomlBareKey(k) {
-				return Invocation{}, fmt.Errorf("env key %q is not a bare TOML key", k)
-			}
-			args = append(args, "-c", p+"env."+k+"="+tomlString(s.Env[k]))
+		// Values travel in codex's environment and are forwarded by name (env_vars),
+		// so credentials stay out of the command line.
+		keys := sortedKeys(s.Env)
+		if len(keys) > 0 {
+			args = append(args, "-c", p+"env_vars="+tomlStringArray(keys))
+		}
+		for _, k := range keys {
+			env = append(env, k+"="+s.Env[k])
 		}
 	}
 	args = append(args, req.HookArgs...)
 	args = append(args, req.Client.Args...)
 	args = append(args, "-") // prompt from stdin
-	return Invocation{Bin: binOr(req.Client, "codex"), Args: args, Stdin: prompt}, nil
+	return Invocation{Bin: binOr(req.Client, "codex"), Args: args, Env: env, Stdin: prompt}, nil
 }
 
 func (codexDriver) Parse(r io.Reader, xmServer string) Transcript {
