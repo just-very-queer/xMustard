@@ -3,25 +3,29 @@
 //
 // Load-time work is registration only: no sidecar, socket, timer or network call.
 // Configuration (see README.md): XMUSTARD_API_BASE, optional XMUSTARD_TOKEN (sent as
-// a bearer token, never logged), XMUSTARD_PI_DELIVERY=source|hook, and lower-only
-// XMUSTARD_PI_TOOL_TIMEOUT_MS / XMUSTARD_PI_PROJECTION_TIMEOUT_MS.
+// a bearer token, never logged), optional XMUSTARD_WORKSPACE_ID (else the workspace
+// is resolved from Pi's working directory), XMUSTARD_PI_DELIVERY=source|hook, and
+// lower-only XMUSTARD_PI_TOOL_TIMEOUT_MS / XMUSTARD_PI_PROJECTION_TIMEOUT_MS.
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { type TSchema, Type } from "typebox";
 import { loadConfig } from "./config.ts";
 import { EXPAND_TOOL, expand, PAGE_SIZE, PendingCalls, projectResult, runTool } from "./delivery.ts";
-import { requiredDesc, TOOL_NAMES, TOOL_SPECS, type ToolSpec } from "./tools.ts";
+import { TOOL_NAMES, TOOL_SPECS, type ToolArgs, type ToolSpec } from "./tools.ts";
+import { WorkspaceResolver } from "./workspace.ts";
 
+// toolParameters renders a spec as TypeBox, serializing to exactly toJsonSchema (the
+// MCP tools/list inputSchema).
 export function toolParameters(spec: ToolSpec): TSchema {
 	const props: Record<string, TSchema> = {};
-	for (const r of spec.required) props[r] = Type.String({ description: requiredDesc(r) });
-	for (const o of spec.optional) {
+	for (const a of spec.args) {
 		let schema: TSchema;
-		if (o.type === "boolean") schema = Type.Boolean({ description: o.desc });
+		if (a.type === "boolean") schema = Type.Boolean({ description: a.desc });
+		else if (a.type === "integer") schema = Type.Integer({ description: a.desc, minimum: a.minimum, maximum: a.maximum });
 		// {type:"string", enum} exactly as MCP tools/list (same shape as pi-ai's StringEnum)
-		else if (o.enum) schema = Type.Unsafe<string>({ type: "string", description: o.desc, enum: o.enum });
-		else schema = Type.String({ description: o.desc });
-		props[o.name] = Type.Optional(schema);
+		else if (a.enum) schema = Type.Unsafe<string>({ type: "string", description: a.desc, enum: a.enum });
+		else schema = Type.String(a.maxLength ? { description: a.desc, maxLength: a.maxLength } : { description: a.desc });
+		props[a.name] = a.required ? schema : Type.Optional(schema);
 	}
 	return Type.Object(props, { additionalProperties: false });
 }
@@ -47,6 +51,7 @@ function sessionIdOf(ctx: ExtensionContext | undefined): string | undefined {
 export default function xmustard(pi: ExtensionAPI): void {
 	const cfg = loadConfig();
 	const pending = new PendingCalls();
+	const workspaces = new WorkspaceResolver(cfg);
 
 	for (const spec of TOOL_SPECS) {
 		pi.registerTool({
@@ -55,7 +60,8 @@ export default function xmustard(pi: ExtensionAPI): void {
 			description: spec.description,
 			parameters: toolParameters(spec),
 			async execute(toolCallId, params, signal, _onUpdate, ctx) {
-				return runTool(cfg, spec, params as Record<string, string | boolean>, { toolCallId, sessionId: sessionIdOf(ctx) }, signal, pending);
+				const args = await workspaces.resolve(params as ToolArgs, ctx?.cwd, signal);
+				return runTool(cfg, spec, args, { toolCallId, sessionId: sessionIdOf(ctx) }, signal, pending);
 			},
 		});
 	}

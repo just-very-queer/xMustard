@@ -202,7 +202,7 @@ describe("Pi adapter against the real xMustard API", () => {
 					call("ground"),
 					call("recall"),
 					call("remember", { content: "Pi e2e: app doubles its input", title: "pi-e2e", paths: "web/app.ts" }),
-					call("search", { query: "xm_marker_app" }),
+					call("search", { q: "xm_marker_app" }),
 					call("explain", { path: "web/app.ts" }),
 					call("impact", { symbol: "Handler7" }),
 					call("diagnostics"),
@@ -222,7 +222,10 @@ describe("Pi adapter against the real xMustard API", () => {
 		assert.ok(JSON.parse(textOf(one(run, "ground"))).workspace_id === ws);
 		assert.equal(one(run, "recall").isError, false);
 		const rem = JSON.parse(textOf(one(run, "remember")));
-		assert.equal(rem.status, "pending");
+		// this API runs without auth (open mode): a proposal is promoted at once but
+		// labelled self-asserted, never peer-verified
+		assert.equal(rem.status, "verified");
+		assert.equal(rem.verification_mode, "self_asserted_open_mode");
 		assert.match(textOf(one(run, "search")), /xm_marker_app/);
 		assert.equal(one(run, "explain").isError, false);
 		assert.equal(one(run, "impact").isError, false);
@@ -463,7 +466,7 @@ describe("Pi adapter against the real xMustard API", () => {
 
 	test("unreachable Go: xMustard tools fail explicitly, expand is not callable while inactive, other tools pass through", async () => {
 		const dead = `http://127.0.0.1:${await freePort()}`;
-		const run = await pi("unreachable", [{ calls: [call("ground"), call("search", { query: "x" }), call("xmustard_expand", { handle: "xm1.x" }), { name: "read", args: { path: "README.md" } }] }, { text: "done" }], {
+		const run = await pi("unreachable", [{ calls: [call("ground"), call("search", { q: "x" }), call("xmustard_expand", { handle: "xm1.x" }), { name: "read", args: { path: "README.md" } }] }, { text: "done" }], {
 			apiBase: dead,
 		});
 		assert.equal(run.code, 0, run.stderr);

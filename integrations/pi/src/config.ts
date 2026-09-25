@@ -8,6 +8,7 @@ export type DeliveryMode = "source" | "hook";
 export interface AdapterConfig {
 	apiBase: string;
 	token: string | undefined;
+	workspaceId?: string; // XMUSTARD_WORKSPACE_ID: the workspace for calls that omit one
 	delivery: DeliveryMode;
 	toolTimeoutMs: number;
 	projectionTimeoutMs: number;
@@ -24,9 +25,11 @@ function lowerOnly(raw: string | undefined, fallback: number): number {
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AdapterConfig {
 	const token = env.XMUSTARD_TOKEN?.trim();
+	const workspaceId = env.XMUSTARD_WORKSPACE_ID?.trim();
 	return {
 		apiBase: (env.XMUSTARD_API_BASE?.trim() || DEFAULT_API_BASE).replace(/\/+$/, ""),
 		token: token ? token : undefined,
+		workspaceId: workspaceId ? workspaceId : undefined,
 		delivery: env.XMUSTARD_PI_DELIVERY?.trim() === "hook" ? "hook" : "source",
 		toolTimeoutMs: lowerOnly(env.XMUSTARD_PI_TOOL_TIMEOUT_MS, DEFAULT_TOOL_TIMEOUT_MS),
 		projectionTimeoutMs: lowerOnly(env.XMUSTARD_PI_PROJECTION_TIMEOUT_MS, DEFAULT_PROJECTION_TIMEOUT_MS),

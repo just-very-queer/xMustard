@@ -4,6 +4,11 @@
 // stdin/stdout to the running xMustard HTTP API (XMUSTARD_API_BASE, default
 // http://127.0.0.1:8042), so agents share durable state across agents/modules
 // instead of markdown, and a reconnecting agent re-checks current state.
+//
+// This file is the stdio transport only: framing, admission, in-flight
+// cancellation and server-to-client requests. The tool table, validation,
+// protocol negotiation and result shaping live in internal/mcpserver; evidence
+// delivery and resources in evidence.go.
 package main
 
 import (
@@ -13,171 +18,81 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"net/http"
-	"net/url"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
-	"time"
+	"sync/atomic"
 
 	"xmustard/api-go/internal/budget"
+	"xmustard/api-go/internal/mcpserver"
 )
 
-const protocolVersion = "2024-11-05"
+type rpcError = mcpserver.RPCError
 
-func apiBase() string {
-	if v := os.Getenv("XMUSTARD_API_BASE"); v != "" {
-		return strings.TrimRight(v, "/")
+// overloadCode is the JSON-RPC server-error code used for admission refusal.
+const overloadCode = mcpserver.CodeOverloaded
+
+func overloadError(err error) *rpcError { return mcpserver.OverloadError(err) }
+
+func mcpText(text string, isError bool) map[string]any { return mcpserver.TextResult(text, isError) }
+
+// One stdio process is one MCP session.
+var (
+	backend = &mcpserver.HTTPBackend{}
+	client  = newStdioClient()
+	session = mcpserver.New(mcpserver.Options{
+		Backend:      backend,
+		Delivery:     evidenceDelivery{},
+		Resources:    evidenceResources{},
+		Cwd:          workingDir(),
+		AutoRegister: strings.TrimSpace(os.Getenv("XMUSTARD_MCP_AUTO_REGISTER")) != "0",
+		HomeDir:      homeDir(),
+	}).NewSession(client)
+)
+
+func workingDir() string {
+	if d, err := os.Getwd(); err == nil {
+		return d
 	}
-	return "http://127.0.0.1:8042"
+	return ""
 }
 
-// argSpec describes one optional tool argument (required args are always strings).
-type argSpec struct {
-	Name string
-	Type string // "string" | "boolean"
-	Enum []string
-	Desc string
-}
-
-// tool describes one MCP tool and how to turn its arguments into an API call.
-type tool struct {
-	Name        string
-	Description string
-	Required    []string  // required args (all string-typed)
-	Optional    []argSpec // optional args with types/enums for the input schema + validation
-	// Build returns (method, path-with-query, body). body is "" for no body; a
-	// non-empty body is sent as application/json (used so `remember` ships memory
-	// content in the POST body, not the URL query — XM-NEW-018).
-	Build func(args map[string]string) (string, string, string)
-}
-
-func wsPath(args map[string]string, suffix string) string {
-	return "/api/workspaces/" + url.PathEscape(args["workspace_id"]) + suffix
-}
-
-// splitCSV turns a comma-separated arg ("a.go, b.go") into a trimmed, non-empty
-// slice for JSON-body fields like `paths`.
-func splitCSV(s string) []string {
-	parts := strings.Split(s, ",")
-	out := make([]string, 0, len(parts))
-	for _, p := range parts {
-		if p = strings.TrimSpace(p); p != "" {
-			out = append(out, p)
-		}
+func homeDir() string {
+	if d, err := os.UserHomeDir(); err == nil {
+		return d
 	}
-	return out
+	return ""
 }
 
-// tools returns the agent-facing MCP tool set: a small, fixed list of governed
-// runtime-memory and grounding tools. Each entry maps a tool name to the HTTP
-// method and path it proxies to on the xMustard API.
-func tools() []tool {
-	return []tool{
-		{"ground", "Orient before acting: what changed, is stale, broken or blocked since the baseline, with index drift and contract breaks (changed signatures).", []string{"workspace_id"}, nil,
-			func(a map[string]string) (string, string, string) { return "GET", wsPath(a, "/session-grounding"), "" }},
-		{"recall", "Shared memory RANKED by query/paths (lexical, path overlap, approvals); non-matches dropped (terms >=3 chars). No args: top-N by working-tree overlap, then recency. verification_mode: peer_verified | single_agent | self_asserted_open_mode (no auth/quorum). conflicts: path overlap, not contradiction.", []string{"workspace_id"},
-			[]argSpec{{"query", "string", nil, "task query to rank memories by"}, {"paths", "string", nil, "comma-separated repo-relative files to focus on"}},
-			func(a map[string]string) (string, string, string) {
-				p := wsPath(a, "/context/active")
-				sep := "?"
-				if a["query"] != "" {
-					p += sep + "query=" + url.QueryEscape(a["query"])
-					sep = "&"
-				}
-				if a["paths"] != "" {
-					p += sep + "paths=" + url.QueryEscape(a["paths"])
-				}
-				return "GET", p, ""
-			}},
-		{"remember", "Propose a durable memory (fact/decision/gotcha); pending until enough distinct agents verify it (open mode: promoted at once as self_asserted_open_mode). Pass content; optional title, paths (comma-separated files it is about, so recall flags it stale when they change).", []string{"workspace_id", "content"},
-			[]argSpec{{"title", "string", nil, "short title"}, {"paths", "string", nil, "comma-separated repo-relative files the memory is about"}},
-			func(a map[string]string) (string, string, string) {
-				// content goes in the JSON BODY, not the URL, so durable memory text is
-				// not exposed in access logs / error strings (XM-NEW-018).
-				payload := map[string]any{"content": a["content"]}
-				if a["title"] != "" {
-					payload["title"] = a["title"]
-				}
-				if a["paths"] != "" {
-					payload["paths"] = splitCSV(a["paths"])
-				}
-				b, _ := json.Marshal(payload)
-				return "POST", wsPath(a, "/context"), string(b)
-			}},
-		{"verify", "Verify (approve/reject) a peer's proposed memory; it promotes once enough DISTINCT agents approve. Your identity is your auth token; approve defaults true.", []string{"workspace_id", "entry_id"},
-			[]argSpec{{"approve", "boolean", nil, "approve (default true) or reject"}},
-			func(a map[string]string) (string, string, string) {
-				approve := "true"
-				if a["approve"] == "false" {
-					approve = "false"
-				}
-				return "POST", wsPath(a, "/context/"+url.PathEscape(a["entry_id"])+"/verify") + "?approve=" + approve, ""
-			}},
-		{"search", "Code search, path:line slices. Hybrid ranks symbol NAMES, paths and doc chunks, not function bodies: RRF of lexical IDF, trigram fuzzy match (typo tolerance, not meaning, unless built with semantic-onnx and XMUSTARD_EMBED_MODEL set), reference degree, proximity to seed=<symbol>. mode=pattern: ast-grep structural query (e.g. `$A && $A()`; optional lang).", []string{"workspace_id", "query"},
-			[]argSpec{{"mode", "string", []string{"hybrid", "pattern"}, "hybrid (default) or pattern (ast-grep)"}, {"lang", "string", nil, "language hint for pattern mode"}, {"seed", "string", nil, "symbol to anchor the graph-proximity lane"}},
-			func(a map[string]string) (string, string, string) {
-				p := wsPath(a, "/search") + "?q=" + url.QueryEscape(a["query"])
-				if a["mode"] != "" {
-					p += "&mode=" + url.QueryEscape(a["mode"])
-				}
-				if a["lang"] != "" {
-					p += "&lang=" + url.QueryEscape(a["lang"])
-				}
-				if a["seed"] != "" {
-					p += "&seed=" + url.QueryEscape(a["seed"])
-				}
-				return "GET", p, ""
-			}},
-		{"explain", "Explain a file or directory: purpose, role, key symbols, and how to run/verify it.", []string{"workspace_id", "path"}, nil,
-			func(a map[string]string) (string, string, string) {
-				return "GET", wsPath(a, "/explain-path") + "?path=" + url.QueryEscape(a["path"]), ""
-			}},
-		{"impact", "Blast radius over a LEXICAL reference graph (name matches + import lines, not resolved calls): distance≥1 edges are leads to confirm, not proof. No args → current changes (dirty symbols, contract_break). symbol= → files referencing its defining files, ≤4 hops. from=&to= → shortest undirected file path.", []string{"workspace_id"},
-			[]argSpec{{"symbol", "string", nil, "symbol to compute blast radius for"}, {"from", "string", nil, "trace path from this symbol"}, {"to", "string", nil, "trace path to this symbol"}},
-			func(a map[string]string) (string, string, string) {
-				p := wsPath(a, "/changes/since-index")
-				q := ""
-				if a["from"] != "" && a["to"] != "" {
-					q = "?from=" + url.QueryEscape(a["from"]) + "&to=" + url.QueryEscape(a["to"])
-				} else if a["symbol"] != "" {
-					q = "?symbol=" + url.QueryEscape(a["symbol"])
-				}
-				return "GET", p + q, ""
-			}},
-		{"diagnostics", "Current normalized diagnostics (errors/warnings) for the workspace.", []string{"workspace_id"}, nil,
-			func(a map[string]string) (string, string, string) { return "GET", wsPath(a, "/diagnostics"), "" }},
-		{"why_failed", "Explain why a run failed: failure signals, salient error lines, and which changed files are implicated.", []string{"workspace_id", "run_id"}, nil,
-			func(a map[string]string) (string, string, string) {
-				return "GET", wsPath(a, "/runs/"+url.PathEscape(a["run_id"])+"/why-failed"), ""
-			}},
-	}
+// dispatch handles one JSON-RPC method, returning a result.
+func dispatch(method string, params json.RawMessage) (any, *rpcError) {
+	return dispatchCtx(context.Background(), method, params)
 }
 
-func toolByName(name string) (tool, bool) {
-	for _, t := range tools() {
-		if t.Name == name {
-			return t, true
-		}
-	}
-	return tool{}, false
+func dispatchCtx(ctx context.Context, method string, params json.RawMessage) (any, *rpcError) {
+	return session.Handle(ctx, method, params)
 }
 
 // --- JSON-RPC ---
 
-type rpcRequest struct {
+// rpcMessage is any incoming frame: a request, a notification, or the client's
+// response to a server-to-client request (roots/list).
+type rpcMessage struct {
 	JSONRPC string          `json:"jsonrpc"`
 	ID      json.RawMessage `json:"id,omitempty"`
 	Method  string          `json:"method"`
 	Params  json.RawMessage `json:"params,omitempty"`
+	Result  json.RawMessage `json:"result,omitempty"`
+	Error   *rpcError       `json:"error,omitempty"`
+	// dropped, set by the transport (never decoded), fails a server request whose
+	// answer arrived but could not be read (over the size cap or refused admission).
+	dropped error
 }
 
-type rpcError struct {
-	Code    int    `json:"code"`
-	Message string `json:"message"`
-	Data    any    `json:"data,omitempty"`
+// isResponse reports whether the frame answers a request this server sent.
+func (m *rpcMessage) isResponse() bool {
+	return m.Method == "" && len(m.ID) > 0 && (m.Result != nil || m.Error != nil)
 }
 
 type rpcResponse struct {
@@ -187,344 +102,96 @@ type rpcResponse struct {
 	Error   *rpcError       `json:"error,omitempty"`
 }
 
-func httpClient() *http.Client { return &http.Client{Timeout: 60 * time.Second} }
-
-func callAPI(method, path, body string) (string, error) {
-	return callAPICtx(context.Background(), method, path, body)
+// stdioClient sends server-to-client requests over stdout and matches the client's
+// responses, read by the main loop, back to the waiting caller.
+type stdioClient struct {
+	mu      sync.Mutex
+	send    func(any) // set once the transport runs; nil means no client to ask
+	next    atomic.Int64
+	pending map[string]chan rpcMessage
 }
 
-// callAPICtx is callAPI bound to a context, so an MCP tools/call cancellation (or
-// deadline) propagates shim→API: cancelling ctx aborts the in-flight HTTP request, and
-// the API handler's request context (and the exec.CommandContext under it) is in turn
-// cancelled — the whole chain tears down instead of running an abandoned tool to
-// completion. The 9 tools are unchanged; only their transport became cancelable.
-func callAPICtx(ctx context.Context, method, path, body string) (string, error) {
-	resp, err := callAPIResp(ctx, method, path, body, nil)
-	if err != nil {
-		return "", err
-	}
-	if resp.status == http.StatusServiceUnavailable && strings.Contains(resp.body, `"overloaded":true`) {
-		return "", fmt.Errorf("API %s %s: %w", method, path, budget.ErrOverloaded)
-	}
-	if resp.status >= 400 {
-		return "", fmt.Errorf("API %s %s -> %d: %s", method, path, resp.status, strings.TrimSpace(resp.body))
-	}
-	return resp.body, nil
-}
+func newStdioClient() *stdioClient { return &stdioClient{pending: map[string]chan rpcMessage{}} }
 
-// apiResponse is one admitted API response.
-type apiResponse struct {
-	status int
-	header http.Header
-	body   string
-}
-
-// callAPIResp performs one API request with extra headers and returns the admitted
-// response whatever its status; transport, admission and size failures are errors.
-func callAPIResp(ctx context.Context, method, path, body string, headers map[string]string) (*apiResponse, error) {
-	var bodyReader io.Reader
-	if body != "" {
-		bodyReader = strings.NewReader(body) // no second copy of the argument payload
+func (c *stdioClient) Request(ctx context.Context, method string, params any) (json.RawMessage, error) {
+	c.mu.Lock()
+	send := c.send
+	c.mu.Unlock()
+	if send == nil {
+		return nil, errors.New("no client connection")
 	}
-	req, err := http.NewRequestWithContext(ctx, method, apiBase()+path, bodyReader)
-	if err != nil {
-		return nil, err
-	}
-	if body != "" {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	for k, v := range headers {
-		req.Header.Set(k, v)
-	}
-	// Each agent runs its own xmustard-mcp; XMUSTARD_API_TOKEN is that agent's
-	// bearer token, so the API resolves a real per-agent identity (and the
-	// multi-agent verification gate counts distinct authenticated principals).
-	if tok := strings.TrimSpace(os.Getenv("XMUSTARD_API_TOKEN")); tok != "" {
-		req.Header.Set("Authorization", "Bearer "+tok)
-	}
-	resp, err := httpClient().Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("xmustard API unreachable at %s (%w)", apiBase(), err)
-	}
-	defer resp.Body.Close()
-	// Bound the response read: one stdio shim runs per agent, so an unbounded read lets
-	// a huge/hostile API response allocate without limit (the egress analogue of the
-	// 8 MiB request framing cap, XM-PRO-009). Bytes are reserved against the shim's
-	// transient pool before they are buffered and held until the reply is written;
-	// past the cap we fail loudly rather than return truncated JSON.
-	scope, owned := budget.ScopeFor(ctx)
-	if owned {
-		defer scope.Close()
-	}
-	raw, rerr := budget.ReadAllAdmitted(scope, resp.Body, maxResponseBytes)
-	switch {
-	case errors.Is(rerr, budget.ErrOverloaded):
-		return nil, fmt.Errorf("API %s %s: %w", method, path, budget.ErrOverloaded)
-	case errors.Is(rerr, budget.ErrTooLarge):
-		return nil, fmt.Errorf("API %s %s response exceeded %d bytes; narrow the query", method, path, maxResponseBytes)
-	case rerr != nil:
-		return nil, fmt.Errorf("API %s %s: read response: %w", method, path, rerr)
-	}
-	return &apiResponse{status: resp.StatusCode, header: resp.Header, body: string(raw)}, nil
-}
-
-// maxResponseBytes bounds a single API response the MCP shim will buffer.
-const maxResponseBytes = 16 << 20 // 16 MiB
-
-// requiredDesc returns a human description for a required (always-string) arg.
-func requiredDesc(name string) string {
-	switch name {
-	case "issue_id":
-		return "the issue/bug id"
-	case "entry_id":
-		return "the id of the memory entry"
-	case "run_id":
-		return "the id of the run"
-	case "path":
-		return "a repo-relative file or directory path"
-	case "query":
-		return "the search query"
-	case "content":
-		return "the memory text to propose"
-	case "symbol":
-		return "a symbol name"
-	default:
-		return "the workspace id"
+	id := "xmustard-" + strconv.FormatInt(c.next.Add(1), 10)
+	ch := make(chan rpcMessage, 1)
+	c.mu.Lock()
+	c.pending[id] = ch
+	c.mu.Unlock()
+	defer func() {
+		c.mu.Lock()
+		delete(c.pending, id)
+		c.mu.Unlock()
+	}()
+	send(map[string]any{"jsonrpc": "2.0", "id": id, "method": method, "params": params})
+	select {
+	case m := <-ch:
+		if m.dropped != nil {
+			return nil, m.dropped
+		}
+		if m.Error != nil {
+			// wrapped, so the session can tell method-not-found from a failure
+			return nil, fmt.Errorf("client error %d: %w", m.Error.Code, m.Error)
+		}
+		return m.Result, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
 }
 
-// toolsListResult builds the MCP tools/list payload. The inputSchema merges the
-// required (string) args and the typed optional args, and sets
-// additionalProperties:false so a client schema-validates the same surface the
-// server enforces in dispatch.
-func toolsListResult() map[string]any {
-	list := []map[string]any{}
-	for _, t := range tools() {
-		props := map[string]any{}
-		for _, r := range t.Required {
-			props[r] = map[string]any{"type": "string", "description": requiredDesc(r)}
+// deliver routes a client response to the request waiting for it; unknown ids
+// (answers after a timeout) are dropped, never answered.
+func (c *stdioClient) deliver(m rpcMessage) {
+	var id string
+	if json.Unmarshal(m.ID, &id) != nil {
+		return
+	}
+	c.mu.Lock()
+	ch := c.pending[id]
+	c.mu.Unlock()
+	if ch != nil {
+		select {
+		case ch <- m:
+		default:
 		}
-		for _, o := range t.Optional {
-			typ := o.Type
-			if typ == "" {
-				typ = "string"
-			}
-			prop := map[string]any{"type": typ, "description": o.Desc}
-			if len(o.Enum) > 0 {
-				prop["enum"] = o.Enum
-			}
-			props[o.Name] = prop
-		}
-		list = append(list, map[string]any{
-			"name":        t.Name,
-			"description": t.Description,
-			"inputSchema": map[string]any{
-				"type":                 "object",
-				"properties":           props,
-				"required":             t.Required,
-				"additionalProperties": false,
-			},
-		})
-	}
-	return map[string]any{"tools": list}
-}
-
-// callTool runs one tool and returns the MCP tools/call result object. Required
-// args and value types are validated up front in dispatch (buildArgs); the
-// missing-required check here is a defensive backstop for direct callers/tests.
-func callTool(name string, args map[string]string) map[string]any {
-	return callToolCtx(context.Background(), name, args)
-}
-
-func callToolCtx(ctx context.Context, name string, args map[string]string) map[string]any {
-	res, _ := callToolChecked(ctx, name, args)
-	return res
-}
-
-// callToolChecked is callToolCtx that also reports admission refusal (from this shim
-// or the API) so dispatch can answer with a JSON-RPC overload error instead of a
-// tool result.
-func callToolChecked(ctx context.Context, name string, args map[string]string) (map[string]any, *rpcError) {
-	t, ok := toolByName(name)
-	if !ok {
-		return mcpText(fmt.Sprintf("unknown tool %q", name), true), nil
-	}
-	for _, r := range t.Required {
-		if strings.TrimSpace(args[r]) == "" {
-			return mcpText(fmt.Sprintf("missing required argument %q for %s", r, name), true), nil
-		}
-	}
-	// Building the request copies argument text (JSON body marshal + string): reserve
-	// it before it is allocated.
-	var argBytes int64
-	for _, v := range args {
-		argBytes += int64(len(v))
-	}
-	if scope, owned := budget.ScopeFor(ctx); !owned {
-		if err := scope.Acquire(2 * argBytes); err != nil {
-			return nil, overloadError(err)
-		}
-	} else {
-		scope.Close() // no request ledger (direct callers/tests): nothing to hold
-	}
-	method, path, reqBody := t.Build(args)
-	resp, err := callAPIResp(ctx, method, path, reqBody, deliveryHeaders(ctx))
-	if errors.Is(err, budget.ErrOverloaded) {
-		return nil, overloadError(err)
-	}
-	if err != nil {
-		return mcpText(err.Error(), true), nil
-	}
-	if resp.status == http.StatusServiceUnavailable && strings.Contains(resp.body, `"overloaded":true`) {
-		return nil, overloadError(budget.ErrOverloaded)
-	}
-	if resp.status == http.StatusOK && resp.header.Get(deliveryHeader) == deliveryVersion {
-		return evidenceResult(ctx, resp.body, args["workspace_id"])
-	}
-	if resp.status >= 400 {
-		return mcpText(fmt.Sprintf("API %s %s -> %d: %s", method, path, resp.status, strings.TrimSpace(resp.body)), true), nil
-	}
-	// the reply text and its encoding copy the body again: reserve before building it
-	if err := reserveReply(ctx, len(resp.body)); err != nil {
-		return nil, overloadError(err)
-	}
-	return mcpText(resp.body, false), nil
-}
-
-// buildArgs strictly validates the raw tools/call arguments against a tool's
-// declared required/optional surface and coerces them into a string map. It
-// rejects (with a JSON-RPC -32602 invalid-params error) unknown arguments,
-// wrong-typed values, non-scalar values (objects/arrays), and out-of-enum
-// values — never silently string-coercing whatever was passed.
-func buildArgs(t tool, raw map[string]any) (map[string]string, *rpcError) {
-	known := map[string]argSpec{}
-	for _, r := range t.Required {
-		known[r] = argSpec{Name: r, Type: "string"}
-	}
-	for _, o := range t.Optional {
-		known[o.Name] = o
-	}
-	invalid := func(format string, a ...any) *rpcError {
-		return &rpcError{Code: -32602, Message: fmt.Sprintf(format, a...)}
-	}
-	args := map[string]string{}
-	for k, v := range raw {
-		spec, ok := known[k]
-		if !ok {
-			return nil, invalid("unknown argument %q for tool %s", k, t.Name)
-		}
-		switch spec.Type {
-		case "boolean":
-			b, ok := v.(bool)
-			if !ok {
-				return nil, invalid("argument %q for tool %s must be a boolean", k, t.Name)
-			}
-			if b {
-				args[k] = "true"
-			} else {
-				args[k] = "false"
-			}
-		default: // string-typed (required args and string optionals)
-			s, ok := v.(string)
-			if !ok {
-				return nil, invalid("argument %q for tool %s must be a string", k, t.Name)
-			}
-			if len(spec.Enum) > 0 {
-				match := false
-				for _, e := range spec.Enum {
-					if s == e {
-						match = true
-						break
-					}
-				}
-				if !match {
-					return nil, invalid("argument %q for tool %s must be one of: %s", k, t.Name, strings.Join(spec.Enum, ", "))
-				}
-			}
-			args[k] = s
-		}
-	}
-	return args, nil
-}
-
-func mcpText(text string, isError bool) map[string]any {
-	return map[string]any{
-		"content": []map[string]any{{"type": "text", "text": text}},
-		"isError": isError,
 	}
 }
 
-// dispatch handles one JSON-RPC method, returning a result (or nil for notifications).
-func dispatch(method string, params json.RawMessage) (any, *rpcError) {
-	return dispatchCtx(context.Background(), method, params)
-}
-
-func dispatchCtx(ctx context.Context, method string, params json.RawMessage) (any, *rpcError) {
-	switch method {
-	case "initialize":
-		return map[string]any{
-			"protocolVersion": protocolVersion,
-			"capabilities":    map[string]any{"tools": map[string]any{}, "resources": map[string]any{}},
-			"serverInfo":      map[string]any{"name": "xmustard", "version": "0.1.0"},
-		}, nil
-	case "tools/list":
-		return toolsListResult(), nil
-	case "tools/call":
-		// decoding arguments copies their text once more: reserve before decoding
-		if scope, owned := budget.ScopeFor(ctx); !owned {
-			if err := scope.Acquire(int64(len(params))); err != nil {
-				return nil, overloadError(err)
-			}
-		} else {
-			scope.Close()
-		}
-		dec := json.NewDecoder(bytes.NewReader(params))
-		dec.DisallowUnknownFields() // reject stray top-level fields instead of ignoring them
-		var p struct {
-			Name      string          `json:"name"`
-			Arguments map[string]any  `json:"arguments"`
-			Meta      json.RawMessage `json:"_meta"`         // MCP-standard request metadata (progress tokens, etc.) — accepted + ignored, NOT a stray field
-			Progress  json.RawMessage `json:"progressToken"` // some clients hoist the progress token to params level; accept + ignore
-		}
-		if err := dec.Decode(&p); err != nil {
-			return nil, &rpcError{Code: -32602, Message: "invalid params: " + err.Error()}
-		}
-		if strings.TrimSpace(p.Name) == "" {
-			return nil, &rpcError{Code: -32602, Message: "invalid params: missing tool name"}
-		}
-		t, ok := toolByName(p.Name)
-		if !ok {
-			// Unknown tool is reported as a tool result (isError) so the agent can
-			// self-correct, matching MCP's tool-error convention.
-			return mcpText(fmt.Sprintf("unknown tool %q", p.Name), true), nil
-		}
-		args, rerr := buildArgs(t, p.Arguments)
-		if rerr != nil {
-			return nil, rerr
-		}
-		res, oerr := callToolChecked(ctx, p.Name, args)
-		if oerr != nil {
-			return nil, oerr
-		}
-		return res, nil
-	case "ping":
-		return map[string]any{}, nil
-	case "resources/list":
-		return resourcesListResult(), nil
-	case "resources/templates/list":
-		return resourceTemplatesResult(), nil
-	case "resources/read":
-		return readResource(ctx, params)
-	default:
-		return nil, &rpcError{Code: -32601, Message: "method not found: " + method}
+func (c *stdioClient) isPending(id json.RawMessage) bool {
+	var key string
+	if json.Unmarshal(id, &key) != nil {
+		return false
 	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.pending[key] != nil
 }
 
-// overloadCode is the JSON-RPC server-error code used for admission refusal.
-const overloadCode = -32000
-
-func overloadError(err error) *rpcError {
-	return &rpcError{Code: overloadCode, Message: err.Error()}
+// answerUndecoded returns the reply owed to a frame that was not decoded (over the
+// size cap, or refused admission), or nil when none is owed. A client's response to a
+// server request (roots/list) is never answered: it is dropped, and the request
+// waiting for it fails now instead of timing out. withID answers a request with its
+// probed id; without it (a truncated frame) the error carries a null id.
+func (c *stdioClient) answerUndecoded(probe []byte, rerr *rpcError, withID bool) *rpcResponse {
+	p := probeFrame(probe)
+	if !p.method && (p.answer || (p.id != nil && c.isPending(p.id))) {
+		if p.id != nil {
+			c.deliver(rpcMessage{ID: p.id, dropped: fmt.Errorf("the client's answer was dropped unread: %s", rerr.Message)})
+		}
+		return nil
+	}
+	id := p.id
+	if !withID {
+		id = nil
+	}
+	return &rpcResponse{JSONRPC: "2.0", ID: id, Error: rerr}
 }
 
 // maxInflight bounds concurrently outstanding id-bearing requests; beyond it the shim
@@ -564,9 +231,10 @@ type frame struct {
 const idProbeBytes = 1024
 
 // controlHeadroom lets a small frame through when the pool is saturated, so a client
-// can still cancel (notifications/cancelled) or ping while calls hold the pool. Frames
-// are read one at a time, so this is a fixed 4 KiB, not a second pool; only
-// notifications and ping are serviced from it — anything else is refused with its id.
+// can still cancel (notifications/cancelled), ping, or answer a server request while
+// calls hold the pool. Frames are read one at a time, so this is a fixed 4 KiB, not a
+// second pool; only notifications, ping and responses are serviced from it — anything
+// else is refused with its id.
 const controlHeadroom = 4 << 10
 
 // readAdmittedLine reads one frame, reserving each chunk in scope BEFORE appending it.
@@ -607,30 +275,49 @@ func readAdmittedLine(r *bufio.Reader, scope *budget.Scope) frame {
 // was not decoded, by parsing the prefix's top-level members in order. If the id is
 // not reached and fully parsed inside the prefix, it returns nil (a null-id error):
 // guessing could correlate the error with a different live call.
-func probeID(probe []byte) json.RawMessage {
+func probeID(probe []byte) json.RawMessage { return probeFrame(probe).id }
+
+// probed is what the bounded prefix of an undecoded frame shows.
+type probed struct {
+	id     json.RawMessage // the top-level id, when fully inside the prefix and scalar
+	method bool            // a top-level method member was seen: a request or notification
+	answer bool            // a top-level result or error member was seen: a response
+}
+
+// probeFrame reads the prefix's top-level members in order. A member's key counts even
+// when its value runs past the prefix (a large roots/list result).
+func probeFrame(probe []byte) probed {
+	var p probed
 	dec := json.NewDecoder(bytes.NewReader(probe))
 	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
-		return nil
+		return p
 	}
+	seenID := false
 	for dec.More() {
 		key, err := dec.Token()
 		if err != nil {
-			return nil
+			break
+		}
+		switch key {
+		case "method":
+			p.method = true
+		case "result", "error":
+			p.answer = true
 		}
 		var val json.RawMessage
 		if err := dec.Decode(&val); err != nil {
-			return nil // value runs past the prefix (or is malformed)
+			break // value runs past the prefix (or is malformed)
 		}
-		if key == "id" {
+		if key == "id" && !seenID {
+			seenID = true
 			var s string
 			var n json.Number
 			if json.Unmarshal(val, &s) == nil || json.Unmarshal(val, &n) == nil {
-				return val
+				p.id = val
 			}
-			return nil
 		}
 	}
-	return nil
+	return p
 }
 
 // inflight tracks cancel funcs for in-progress requests by their JSON-RPC id, so an MCP
@@ -678,19 +365,35 @@ func cancelledRequestID(params json.RawMessage) (string, bool) {
 	return string(p.RequestID), true
 }
 
+// notify handles a notification: cancellation here (this loop owns the in-flight
+// registry), everything else in the session.
+func notify(inflight *inflightRegistry, m rpcMessage) {
+	if m.Method == "notifications/cancelled" {
+		if id, ok := cancelledRequestID(m.Params); ok {
+			inflight.cancel(id)
+		}
+		return
+	}
+	session.Notify(m.Method, m.Params)
+}
+
 func main() {
 	reader := bufio.NewReaderSize(os.Stdin, 64<<10)
 	writer := bufio.NewWriter(os.Stdout)
 	enc := json.NewEncoder(writer)
-	// stdout is shared by the read loop and the per-request worker goroutines, so every
-	// response write is serialized.
+	// stdout is shared by the read loop, the per-request worker goroutines and
+	// server-to-client requests, so every write is serialized.
 	var sendMu sync.Mutex
-	send := func(resp rpcResponse) {
+	write := func(v any) {
 		sendMu.Lock()
-		_ = enc.Encode(resp)
+		_ = enc.Encode(v)
 		_ = writer.Flush()
 		sendMu.Unlock()
 	}
+	send := func(resp rpcResponse) { write(resp) }
+	client.mu.Lock()
+	client.send = write
+	client.mu.Unlock()
 	inflight := newInflight()
 	slots := make(chan struct{}, maxInflight())
 	var workers sync.WaitGroup
@@ -706,81 +409,95 @@ func main() {
 		line := bytes.TrimSpace(f.line)
 		if f.truncated {
 			scope.Close()
-			// can't trust the (partial) body to parse an id; reply with a null-id error.
-			send(rpcResponse{JSONRPC: "2.0", Error: &rpcError{Code: -32600, Message: "request exceeds max message size"}})
+			// can't trust the (partial) body to parse an id; reply with a null-id error
+			// (a response to a server request is dropped, never answered).
+			if resp := client.answerUndecoded(f.probe, &rpcError{Code: mcpserver.CodeInvalidRequest, Message: "request exceeds max message size"}, false); resp != nil {
+				send(*resp)
+			}
 		} else if f.headroom {
 			// served from the fixed control headroom: only control frames proceed
 			scope.Close()
-			var req rpcRequest
-			if json.Unmarshal(line, &req) != nil {
-				send(rpcResponse{JSONRPC: "2.0", Error: &rpcError{Code: -32700, Message: "parse error"}})
-			} else if len(req.ID) == 0 && strings.HasPrefix(req.Method, "notifications/") {
-				if req.Method == "notifications/cancelled" {
-					if id, ok := cancelledRequestID(req.Params); ok {
-						inflight.cancel(id)
-					}
-				}
-			} else if req.Method == "ping" {
-				send(rpcResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{}})
+			var m rpcMessage
+			if json.Unmarshal(line, &m) != nil {
+				send(rpcResponse{JSONRPC: "2.0", Error: &rpcError{Code: mcpserver.CodeParseError, Message: "parse error"}})
+			} else if m.isResponse() {
+				client.deliver(m)
+			} else if len(m.ID) == 0 && strings.HasPrefix(m.Method, "notifications/") {
+				notify(inflight, m)
+			} else if m.Method == "ping" {
+				send(rpcResponse{JSONRPC: "2.0", ID: m.ID, Result: map[string]any{}})
 			} else {
-				send(rpcResponse{JSONRPC: "2.0", ID: req.ID, Error: overloadError(budget.ErrOverloaded)})
+				send(rpcResponse{JSONRPC: "2.0", ID: m.ID, Error: overloadError(budget.ErrOverloaded)})
 			}
 		} else if f.refused || (len(line) > 0 && scope.Acquire(int64(len(line))) != nil) {
 			scope.Close()
-			send(rpcResponse{JSONRPC: "2.0", ID: probeID(f.probe), Error: overloadError(budget.ErrOverloaded)})
+			if resp := client.answerUndecoded(f.probe, overloadError(budget.ErrOverloaded), true); resp != nil {
+				send(*resp)
+			}
 		} else if len(line) == 0 {
 			scope.Close()
 		} else {
-			var req rpcRequest
-			jsonErr := json.Unmarshal(line, &req)
+			var m rpcMessage
+			jsonErr := json.Unmarshal(line, &m)
 			f.line, line = nil, nil // the raw frame is no longer referenced
 			if jsonErr != nil {
 				scope.Close()
 				// malformed JSON → structured parse error rather than a silent drop.
-				send(rpcResponse{JSONRPC: "2.0", Error: &rpcError{Code: -32700, Message: "parse error"}})
-			} else if len(req.ID) == 0 && strings.HasPrefix(req.Method, "notifications/") {
+				send(rpcResponse{JSONRPC: "2.0", Error: &rpcError{Code: mcpserver.CodeParseError, Message: "parse error"}})
+			} else if m.isResponse() {
+				scope.Close()
+				// the client answering a server request (roots/list): never answered back
+				client.deliver(m)
+			} else if len(m.ID) == 0 && strings.HasPrefix(m.Method, "notifications/") {
 				scope.Close()
 				// notifications have no id and expect no response. A cancellation aborts
 				// the matching in-flight request so the loop stays responsive to it.
-				if req.Method == "notifications/cancelled" {
-					if id, ok := cancelledRequestID(req.Params); ok {
-						inflight.cancel(id)
-					}
+				notify(inflight, m)
+			} else if m.Method == "initialize" {
+				// Negotiation is answered before the next frame is read, so requests the
+				// client pipelines behind it see the negotiated version. It does no I/O.
+				result, rerr := dispatchCtx(budget.WithScope(context.Background(), scope), m.Method, m.Params)
+				scope.Close()
+				resp := rpcResponse{JSONRPC: "2.0", ID: m.ID, Result: result}
+				if rerr != nil {
+					resp.Result, resp.Error = nil, rerr
 				}
+				send(resp)
 			} else {
 				// Run each id-bearing request on its own goroutine with a cancelable
 				// context registered by id, so the read loop keeps reading (and can
-				// service a cancellation) while the tool call is outstanding. JSON-RPC
-				// permits out-of-order responses; the client matches by id.
+				// service a cancellation or a roots/list answer) while the tool call is
+				// outstanding. JSON-RPC permits out-of-order responses; the client
+				// matches by id.
 				select {
 				case slots <- struct{}{}:
 				default:
 					scope.Close()
-					send(rpcResponse{JSONRPC: "2.0", ID: req.ID, Error: &rpcError{Code: overloadCode,
+					send(rpcResponse{JSONRPC: "2.0", ID: m.ID, Error: &rpcError{Code: overloadCode,
 						Message: fmt.Sprintf("xmustard overloaded: %d requests already in flight; retry shortly", cap(slots))}})
 					continue // a final frame at EOF is followed by an empty EOF read
 				}
 				// The worker owns the frame's ledger (ingress, decode, argument and
 				// response bytes) until its reply is sent.
-				ctx, cancel := context.WithCancel(withCallID(budget.WithScope(context.Background(), scope), req.ID))
-				idKey := string(req.ID)
+				ctx, cancel := context.WithCancel(withCallID(budget.WithScope(context.Background(), scope), m.ID))
+				idKey := string(m.ID)
 				inflight.add(idKey, cancel)
 				workers.Add(1)
-				go func(req rpcRequest) {
+				go func(m rpcMessage) {
 					defer workers.Done()
 					defer func() { <-slots }()
 					defer scope.Close()
 					defer inflight.done(idKey)
 					defer cancel()
-					result, rerr := dispatchCtx(ctx, req.Method, req.Params)
-					resp := rpcResponse{JSONRPC: "2.0", ID: req.ID}
+					result, rerr := dispatchCtx(ctx, m.Method, m.Params)
+					resp := rpcResponse{JSONRPC: "2.0", ID: m.ID}
 					if rerr != nil {
 						resp.Error = rerr
 					} else {
 						resp.Result = result
 					}
 					send(resp)
-				}(req)
+				}(m)
 			}
 		}
 		if err != nil { // io.EOF or a read error: stop

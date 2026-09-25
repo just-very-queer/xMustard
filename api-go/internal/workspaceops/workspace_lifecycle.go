@@ -109,37 +109,11 @@ func LoadWorkspace(dataDir string, request WorkspaceLoadRequest) (*workspaceSnap
 		name = filepath.Base(rootPath)
 	}
 
-	workspaces, err := ListWorkspaces(dataDir)
+	workspace, err := upsertLoadedWorkspace(dataDir, rootPath, name, now)
 	if err != nil {
 		return nil, err
 	}
-	workspaceID := workspaceIDForPath(rootPath)
-	for _, item := range workspaces {
-		if filepath.Clean(item.RootPath) == rootPath {
-			workspaceID = item.WorkspaceID
-			break
-		}
-	}
-
-	workspace := workspaceRecord{
-		WorkspaceID: workspaceID,
-		Name:        name,
-		RootPath:    rootPath,
-		CreatedAt:   ptr(now),
-		UpdatedAt:   ptr(now),
-	}
-	for _, item := range workspaces {
-		if item.WorkspaceID == workspaceID {
-			workspace = item
-			workspace.Name = name
-			workspace.RootPath = rootPath
-			workspace.UpdatedAt = ptr(now)
-			break
-		}
-	}
-	if err := saveWorkspaceRecord(dataDir, workspace); err != nil {
-		return nil, err
-	}
+	workspaceID := workspace.WorkspaceID
 
 	snapshotPath := filepath.Join(dataDir, "workspaces", workspaceID, "snapshot.json")
 	snapshotIsOversized := false
@@ -291,7 +265,54 @@ func getWorkspaceRecord(dataDir string, workspaceID string) (workspaceRecord, er
 	return workspaceRecord{}, err
 }
 
+// upsertLoadedWorkspace finds or creates the record for rootPath and saves it, as one
+// registry transaction: the id lookup and the write see the same registry.
+func upsertLoadedWorkspace(dataDir, rootPath, name, now string) (workspaceRecord, error) {
+	unlock := lockStore(workspacesPath(dataDir))
+	defer unlock()
+	workspaces, err := ListWorkspaces(dataDir)
+	if err != nil {
+		return workspaceRecord{}, err
+	}
+	workspaceID := workspaceIDForPath(rootPath)
+	for _, item := range workspaces {
+		if filepath.Clean(item.RootPath) == rootPath {
+			workspaceID = item.WorkspaceID
+			break
+		}
+	}
+	workspace := workspaceRecord{
+		WorkspaceID: workspaceID,
+		Name:        name,
+		RootPath:    rootPath,
+		CreatedAt:   ptr(now),
+		UpdatedAt:   ptr(now),
+	}
+	for _, item := range workspaces {
+		if item.WorkspaceID == workspaceID {
+			workspace = item
+			workspace.Name = name
+			workspace.RootPath = rootPath
+			workspace.UpdatedAt = ptr(now)
+			break
+		}
+	}
+	return workspace, saveWorkspaceRecordLocked(dataDir, workspace)
+}
+
+func workspacesPath(dataDir string) string { return filepath.Join(dataDir, "workspaces.json") }
+
+// saveWorkspaceRecord upserts one record. The registry is one JSON file rewritten
+// whole, so its read-modify-write holds the store lock: without it, concurrent
+// registrations (several agents' first MCP calls, each registering its repository)
+// overwrite each other and drop records.
 func saveWorkspaceRecord(dataDir string, workspace workspaceRecord) error {
+	unlock := lockStore(workspacesPath(dataDir))
+	defer unlock()
+	return saveWorkspaceRecordLocked(dataDir, workspace)
+}
+
+func saveWorkspaceRecordLocked(dataDir string, workspace workspaceRecord) error {
 	workspaces, err := ListWorkspaces(dataDir)
 	if err != nil {
 		return err
@@ -320,7 +341,7 @@ func saveWorkspaceRecord(dataDir string, workspace workspaceRecord) error {
 		}
 		return 1
 	})
-	return writeJSON(filepath.Join(dataDir, "workspaces.json"), workspaces)
+	return writeJSON(workspacesPath(dataDir), workspaces)
 }
 
 func workspaceIDForPath(rootPath string) string {

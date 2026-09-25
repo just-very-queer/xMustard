@@ -1,0 +1,41 @@
+{
+  "arguments": {
+    "entry_id": "ctx_1122b36dfdd8",
+    "note": "checked calc.go"
+  },
+  "result": {
+    "content": "calc.Double delegates to calc.Add",
+    "created_at": "2026-09-25T08:23:30.147916Z",
+    "id": "ctx_1122b36dfdd8",
+    "path_hashes": {
+      "pkg/calc/calc.go": "414e2825a6c73cf8325c2b4c78d5f2b4c37d992b88da6ab8712259e2a1ec67da"
+    },
+    "paths": [
+      "pkg/calc/calc.go"
+    ],
+    "permission": "readonly",
+    "promoted": true,
+    "required_verifications": 1,
+    "search_tokens": [
+      "delegates",
+      "add",
+      "double",
+      "calc"
+    ],
+    "source": "anonymous",
+    "status": "verified",
+    "title": "double",
+    "updated_at": "2026-09-25T08:23:31.267548Z",
+    "verification_mode": "self_asserted_open_mode",
+    "verifications": [
+      {
+        "agent": "anonymous",
+        "approve": true,
+        "at": "2026-09-25T08:23:31.267548Z",
+        "note": "checked calc.go"
+      }
+    ],
+    "workspace_id": "fixture-4aa33b094a"
+  },
+  "tool": "verify"
+}

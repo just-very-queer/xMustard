@@ -1,0 +1,111 @@
+{
+  "arguments": {
+    "limit": 5,
+    "q": "Double"
+  },
+  "result": {
+    "active_count": 3,
+    "bounded": true,
+    "conflicts": [
+      {
+        "entry_ids": [
+          "ctx_1122b36dfdd8",
+          "ctx_b1e3995e496e"
+        ],
+        "path": "pkg/calc/calc.go",
+        "titles": [
+          "double",
+          "ctx_b1e3995e496e"
+        ]
+      }
+    ],
+    "consistency_attempts": 1,
+    "drift_checked": 2,
+    "entries": [
+      {
+        "content": "calc.Double delegates to calc.Add",
+        "created_at": "2026-09-25T08:23:30.147916Z",
+        "id": "ctx_1122b36dfdd8",
+        "path_hashes": {
+          "pkg/calc/calc.go": "414e2825a6c73cf8325c2b4c78d5f2b4c37d992b88da6ab8712259e2a1ec67da"
+        },
+        "paths": [
+          "pkg/calc/calc.go"
+        ],
+        "permission": "readonly",
+        "promoted": true,
+        "required_verifications": 1,
+        "search_tokens": [
+          "delegates",
+          "add",
+          "double",
+          "calc"
+        ],
+        "source": "anonymous",
+        "status": "verified",
+        "title": "double",
+        "updated_at": "2026-09-25T08:23:30.147916Z",
+        "verification_mode": "self_asserted_open_mode",
+        "verifications": [
+          {
+            "agent": "anonymous",
+            "approve": true,
+            "at": "2026-09-25T08:23:30.147916Z",
+            "note": "open mode: self-asserted (no authentication configured)"
+          }
+        ],
+        "workspace_id": "fixture-4aa33b094a"
+      },
+      {
+        "content": "calc.Double delegates to Add",
+        "created_at": "2026-09-25T08:20:00.905991Z",
+        "id": "ctx_b1e3995e496e",
+        "path_hashes": {
+          "pkg/calc/calc.go": "414e2825a6c73cf8325c2b4c78d5f2b4c37d992b88da6ab8712259e2a1ec67da"
+        },
+        "paths": [
+          "pkg/calc/calc.go"
+        ],
+        "permission": "readonly",
+        "promoted": true,
+        "required_verifications": 1,
+        "search_tokens": [
+          "calc",
+          "double",
+          "delegates",
+          "add"
+        ],
+        "source": "anonymous",
+        "status": "verified",
+        "title": "",
+        "updated_at": "2026-09-25T08:20:00.905991Z",
+        "verification_mode": "self_asserted_open_mode",
+        "verifications": [
+          {
+            "agent": "anonymous",
+            "approve": true,
+            "at": "2026-09-25T08:20:00.905991Z",
+            "note": "open mode: self-asserted (no authentication configured)"
+          }
+        ],
+        "workspace_id": "fixture-4aa33b094a"
+      }
+    ],
+    "generated_at": "2026-09-25T08:23:30.76026Z",
+    "limit": 5,
+    "query": "Double",
+    "ranked": true,
+    "require_multi_agent": true,
+    "returned": 2,
+    "stale_count": 0,
+    "total_active": 3,
+    "verification_modes": {
+      "peer_verified": 0,
+      "self_asserted_open_mode": 2,
+      "single_agent": 0
+    },
+    "verification_threshold": 2,
+    "workspace_id": "fixture-4aa33b094a"
+  },
+  "tool": "recall"
+}

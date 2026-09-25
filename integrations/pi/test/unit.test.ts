@@ -3,8 +3,11 @@
 // delivery state machine; the real Pi + Go behavior is covered by test/e2e.
 
 import assert from "node:assert/strict";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync } from "node:fs";
 import http from "node:http";
 import type net from "node:net";
+import os from "node:os";
+import path from "node:path";
 import { after, before, describe, test } from "node:test";
 import { type AdapterConfig, loadConfig } from "../src/config.ts";
 import {
@@ -19,7 +22,8 @@ import {
 	runTool,
 } from "../src/delivery.ts";
 import { send, XmustardHttpError } from "../src/http.ts";
-import { TOOL_SPECS, toJsonSchema } from "../src/tools.ts";
+import { checkRequired, TOOL_SPECS, toJsonSchema } from "../src/tools.ts";
+import { WorkspaceResolver } from "../src/workspace.ts";
 
 type Handler = (req: http.IncomingMessage, res: http.ServerResponse, body: Buffer) => void;
 let handler: Handler = (_q, s) => s.end();
@@ -81,7 +85,7 @@ describe("tool specs mirror the MCP server", () => {
 		);
 		// url.QueryEscape: space→"+", !'()* escaped; url.PathEscape keeps $&+:=@
 		assert.equal(
-			spec("search").build({ workspace_id: "w s/1", query: "a b&c!*'()", mode: "pattern" }).path,
+			spec("search").build({ workspace_id: "w s/1", q: "a b&c!*'()", mode: "pattern" }).path,
 			"/api/workspaces/w%20s%2F1/search?q=a+b%26c%21%2A%27%28%29&mode=pattern",
 		);
 		assert.equal(
@@ -98,15 +102,46 @@ describe("tool specs mirror the MCP server", () => {
 		assert.deepEqual(toJsonSchema(spec("search")), {
 			type: "object",
 			properties: {
-				workspace_id: { type: "string", description: "the workspace id" },
-				query: { type: "string", description: "the search query" },
+				workspace_id: { type: "string", description: "workspace id; auto-resolved if omitted" },
+				q: { type: "string", description: "the search query" },
 				mode: { type: "string", description: "hybrid (default) or pattern (ast-grep)", enum: ["hybrid", "pattern"] },
 				lang: { type: "string", description: "language hint for pattern mode" },
 				seed: { type: "string", description: "symbol to anchor the graph-proximity lane" },
+				limit: { type: "integer", description: "max hits (default 25)", minimum: 1, maximum: 50 },
 			},
-			required: ["workspace_id", "query"],
+			required: ["q"],
 			additionalProperties: false,
 		});
+		// no required arguments at all: the key is omitted, as Go omits it
+		assert.deepEqual(Object.keys(toJsonSchema(spec("ground"))).sort(), ["additionalProperties", "properties", "type"]);
+	});
+	// The Go tool table generates api-go/internal/mcpserver/testdata/tools_list.json
+	// (its snapshot test fails until it is regenerated); this mirror must match it, so a
+	// description or schema edited on one side fails here, not only in the live e2e.
+	test("mirror matches the generated Go tools/list", (t) => {
+		const golden = new URL("../../../api-go/internal/mcpserver/testdata/tools_list.json", import.meta.url);
+		if (!existsSync(golden)) return t.skip("api-go not present in this checkout");
+		const list = JSON.parse(readFileSync(golden, "utf8")) as { tools: { name: string; description: string; inputSchema: unknown }[] };
+		assert.deepEqual(
+			TOOL_SPECS.map((s) => s.name),
+			list.tools.map((g) => g.name),
+		);
+		for (const g of list.tools) {
+			assert.equal(spec(g.name).description, g.description, `${g.name} description`);
+			assert.deepEqual(toJsonSchema(spec(g.name)), g.inputSchema, `${g.name} inputSchema`);
+		}
+	});
+	test("new bounds and the verify note build like Go", () => {
+		assert.equal(spec("recall").build({ workspace_id: "w", q: "auth flow", limit: 5 }).path, "/api/workspaces/w/context/active?query=auth+flow&limit=5");
+		assert.equal(spec("search").build({ workspace_id: "w", q: "x", limit: 50 }).path, "/api/workspaces/w/search?q=x&limit=50");
+		assert.equal(spec("impact").build({ workspace_id: "w", symbol: "S", max_depth: 2 }).path, "/api/workspaces/w/changes/since-index?symbol=S&depth=2");
+		const v = spec("verify").build({ workspace_id: "w", entry_id: "e", approve: false, note: "stale: a.go" });
+		assert.equal(v.path, "/api/workspaces/w/context/e/verify?approve=false");
+		assert.equal(v.body, '{"note":"stale: a.go"}');
+		assert.equal(spec("verify").build({ workspace_id: "w", entry_id: "e" }).body, undefined);
+		assert.equal(checkRequired(spec("search"), { workspace_id: "w" }), 'missing required argument "q" for search');
+		assert.equal(checkRequired(spec("ground"), {}), "no workspace_id for ground");
+		assert.equal(checkRequired(spec("ground"), { workspace_id: "w" }), undefined);
 	});
 	test("hook-path args_digest equals the Go middleware's digest", () => {
 		// expected values computed with Go's net/http + the middleware's formula
@@ -130,6 +165,44 @@ describe("config", () => {
 		assert.equal(c.token, undefined);
 		assert.equal(c.delivery, "source");
 		assert.equal(c.apiBase, "http://127.0.0.1:8042");
+		assert.equal(c.workspaceId, undefined);
+		assert.equal(loadConfig({ XMUSTARD_WORKSPACE_ID: " ws-1 " }).workspaceId, "ws-1");
+	});
+});
+
+describe("workspace resolution", () => {
+	const repo = realpathSync(mkdtempSync(path.join(os.tmpdir(), "xm-pi-ws-")));
+	const sub = path.join(repo, "src", "pkg");
+	mkdirSync(sub, { recursive: true });
+	test("argument, then XMUSTARD_WORKSPACE_ID, then the working directory", async () => {
+		let lists = 0;
+		handler = (req, res) => {
+			if (req.url === "/api/workspaces") {
+				lists++;
+				return res.end(JSON.stringify([{ workspace_id: "outer", root_path: path.dirname(repo) }, { workspace_id: "inner", root_path: repo }]));
+			}
+			res.writeHead(404).end();
+		};
+		const r = new WorkspaceResolver(cfg());
+		assert.equal((await r.resolve({ workspace_id: "given" }, sub)).workspace_id, "given");
+		assert.equal((await new WorkspaceResolver(cfg({ workspaceId: "env" })).resolve({}, sub)).workspace_id, "env");
+		assert.equal(lists, 0, "no listing when the workspace is known");
+		assert.equal((await r.resolve({ q: "x" }, sub)).workspace_id, "inner", "longest containing root wins");
+		assert.equal((await r.resolve({}, sub)).workspace_id, "inner");
+		assert.equal(lists, 1, "the directory's workspace is cached");
+	});
+	test("an unregistered directory fails clearly and never registers", async () => {
+		const posts: string[] = [];
+		handler = (req, res) => {
+			if (req.method === "POST") posts.push(req.url ?? "");
+			res.end(JSON.stringify([{ workspace_id: "alpha", root_path: "/nonexistent/alpha" }]));
+		};
+		await assert.rejects(new WorkspaceResolver(cfg()).resolve({}, sub), (e: Error) => {
+			assert.match(e.message, /no workspace resolved .*XMUSTARD_WORKSPACE_ID is unset.*not inside a registered workspace\). Pass workspace_id; registered: alpha \(\/nonexistent\/alpha\)/);
+			return true;
+		});
+		await assert.rejects(new WorkspaceResolver(cfg()).resolve({}, undefined), /Pi reported no working directory/);
+		assert.deepEqual(posts, []);
 	});
 });
 
@@ -193,7 +266,7 @@ describe("source delivery", () => {
 			res.writeHead(200, { [DELIVERY_HEADER]: DELIVERY_VERSION, "Content-Type": "application/json" }).end(JSON.stringify(envelope()));
 		};
 		const pending = new PendingCalls();
-		const r = await runTool(cfg(), spec("search"), { workspace_id: "w", query: "q" }, { toolCallId: "c2", sessionId: "s" }, undefined, pending);
+		const r = await runTool(cfg(), spec("search"), { workspace_id: "w", q: "q" }, { toolCallId: "c2", sessionId: "s" }, undefined, pending);
 		assert.equal(hdr, DELIVERY_VERSION);
 		const [proj, footer] = r.content[0].text.split("\n[xmustard evidence] ");
 		assert.equal(proj, envelope().projection);

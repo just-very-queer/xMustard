@@ -1,0 +1,40 @@
+{
+  "arguments": {},
+  "result": {
+    "blocked_by_dirty_state": true,
+    "blocked_by_failing_verification": false,
+    "changed_files": 1,
+    "contract_breaks": 0,
+    "dirty_symbols": 2,
+    "drift": {
+      "baseline_head": null,
+      "baseline_remote": null,
+      "content_changed": false,
+      "current_head": "452da1e09e2c230b829c1d824bd82f83fa187dec",
+      "current_remote": null,
+      "generated_at": "2026-09-25T08:23:29Z",
+      "has_baseline": false,
+      "head_changed": false,
+      "reasons": [
+        "no index baseline exists; results would be unindexed"
+      ],
+      "sibling_clone": false,
+      "stale": true,
+      "workspace_id": "fixture-4aa33b094a"
+    },
+    "generated_at": "2026-09-25T08:23:29Z",
+    "memory_verification_modes": {
+      "peer_verified": 0,
+      "self_asserted_open_mode": 2,
+      "single_agent": 0
+    },
+    "recent_failed_runs": [],
+    "stale_memory": 0,
+    "stale_memory_checked": 1,
+    "stale_memory_complete": true,
+    "stale_memory_total": 2,
+    "summary": "1 changed file(s), 2 dirty symbol(s), 0 contract break(s), 0 failed run(s), 0 stale memory. 2 memory self-asserted in open mode (not peer-verified).",
+    "workspace_id": "fixture-4aa33b094a"
+  },
+  "tool": "ground"
+}
