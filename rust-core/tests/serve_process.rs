@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use tempfile::TempDir;
-use xmustard_core::serve::{COMMAND_FAILED, read_header, write_frame};
+use xmustard_core::serve::{COMMAND_FAILED, METHOD_NOT_FOUND, read_header, write_frame};
 
 const BIN: &str = env!("CARGO_BIN_EXE_xmustard-core");
 
@@ -194,7 +194,6 @@ fn worker_output_matches_one_shot_cli() {
         vec!["repo-key", root],
         vec!["search", root, "ws", "ComputeTotal", "10"],
         vec!["search", root, "ws", "widget render", "5", "ComputeTotal"],
-        vec!["symbolgraph", "build", root, "ws"],
         vec!["symbolgraph", "impact", root, "ws", "ComputeTotal", "3"],
         vec![
             "symbolgraph",
@@ -205,7 +204,6 @@ fn worker_output_matches_one_shot_cli() {
             "helperValue",
         ],
         vec!["symbolgraph", "clusters", root, "ws"],
-        vec!["symbolgraph", "hotspots", root, "ws", "5"],
         vec!["symbolgraph", "blast-radius", root, "ws", "ComputeTotal"],
         vec!["symbolgraph", "flow", root, "ws"],
         vec!["explain-path", "ws", root, "src/engine.go"],
@@ -275,6 +273,46 @@ fn failures_carry_the_cli_message_and_exit_code() {
             "{case:?}"
         );
     }
+}
+
+#[test]
+fn whole_repository_builds_are_left_to_one_shot_processes() {
+    let r = fixture();
+    let root = r.path().to_str().unwrap();
+    let data = TempDir::new().unwrap();
+    let data_dir = data.path().to_str().unwrap();
+    let mut worker = Worker::start(&[]);
+    for case in [
+        vec!["changetrack", "index", data_dir, root, "ws"],
+        vec!["symbolgraph", "build", root, "ws"],
+        vec!["symbolgraph", "hotspots", root, "ws", "5"],
+        vec!["symbolgraph", "build-lsp", root, "ws"],
+        vec!["goal", "list", data_dir, "ws"],
+        vec!["lsp-hover", root, "a.go", "1", "1"],
+    ] {
+        let err = worker.call(case[0], &case[1..]).unwrap_err();
+        assert_eq!(err["code"], METHOD_NOT_FOUND, "{case:?}");
+        assert_eq!(err["data"]["reason"], "not_resident", "{case:?}");
+    }
+    assert_eq!(worker.stats()["requests"], 0, "nothing ran in-process");
+    let init = worker.call("initialize", &[]).unwrap();
+    let methods = init["methods"].as_array().unwrap();
+    for name in [
+        "search",
+        "symbolgraph",
+        "changetrack",
+        "explain-path",
+        "repo-key",
+    ] {
+        assert!(methods.contains(&json!(name)), "{name} must be resident");
+    }
+    for name in ["goal", "swarm", "lsp-hover", "run-managed-command"] {
+        assert!(!methods.contains(&json!(name)), "{name} must be one-shot");
+    }
+    assert_eq!(
+        init["one_shot_subcommands"],
+        json!({"changetrack": ["index"], "symbolgraph": ["build", "hotspots", "build-lsp"]})
+    );
 }
 
 #[test]

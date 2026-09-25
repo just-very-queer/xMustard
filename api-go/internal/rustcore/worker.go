@@ -64,8 +64,12 @@ const (
 	// the worker is killed. It matches the one-shot WaitDelay.
 	workerKillGrace = 2 * time.Second
 
-	defaultWorkerIdle  = 5 * time.Minute
-	defaultWorkerTrim  = time.Minute
+	// An idle worker keeps its heap (the allocator does not return it), so it exits
+	// after two minutes without calls: long enough to stay warm across an agent's
+	// turns, short enough that an idle API does not hold it. It drops its resident
+	// graph snapshots after 30 s.
+	defaultWorkerIdle  = 2 * time.Minute
+	defaultWorkerTrim  = 30 * time.Second
 	defaultWorkerStart = 10 * time.Second
 
 	startBackoffMin = time.Second
@@ -364,12 +368,14 @@ func (s *workerSupervisor) onExit(p *workerProc, err error) {
 
 // workerProc is one running `xmustard-core serve` process.
 type workerProc struct {
-	key       string
-	pid       int
-	cmd       *exec.Cmd
-	stdin     io.WriteCloser
-	untrack   func()
-	methods   map[string]bool
+	key     string
+	pid     int
+	cmd     *exec.Cmd
+	stdin   io.WriteCloser
+	untrack func()
+	methods map[string]bool
+	// oneShot lists, per resident family, the first arguments it runs one-shot.
+	oneShot   map[string]map[string]bool
 	counters  *workerCounters
 	idleAfter time.Duration
 	onExit    func(*workerProc, error)
@@ -418,6 +424,14 @@ type workerResult struct {
 	err    error
 }
 
+// residentFor reports whether the worker runs sub with args in-process.
+func (p *workerProc) residentFor(sub string, args []string) bool {
+	if !p.methods[sub] {
+		return false
+	}
+	return len(args) == 0 || !p.oneShot[sub][args[0]]
+}
+
 func (p *workerProc) isDead() bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -464,8 +478,9 @@ func (s *workerSupervisor) startWorker(ctx context.Context, key workerKey, set w
 	defer scope.Close()
 	r := p.call(hctx, scope, "initialize", nil)
 	var init struct {
-		Protocol int      `json:"protocol"`
-		Methods  []string `json:"methods"`
+		Protocol int                 `json:"protocol"`
+		Methods  []string            `json:"methods"`
+		OneShot  map[string][]string `json:"one_shot_subcommands"`
 	}
 	switch {
 	case r.err != nil:
@@ -488,6 +503,13 @@ func (s *workerSupervisor) startWorker(ctx context.Context, key workerKey, set w
 	p.methods = make(map[string]bool, len(init.Methods))
 	for _, m := range init.Methods {
 		p.methods[m] = true
+	}
+	p.oneShot = make(map[string]map[string]bool, len(init.OneShot))
+	for family, subs := range init.OneShot {
+		p.oneShot[family] = make(map[string]bool, len(subs))
+		for _, sub := range subs {
+			p.oneShot[family][sub] = true
+		}
 	}
 	p.started.Store(true)
 	return p, nil
@@ -883,7 +905,7 @@ func runViaWorker(parent context.Context, sub string, args []string) (out []byte
 	}
 	completed := false
 	defer func() { s.release(p, completed) }()
-	if !p.methods[sub] {
+	if !p.residentFor(sub, args) {
 		return nil, false, nil
 	}
 	release, err := budget.Children.Acquire(parent)

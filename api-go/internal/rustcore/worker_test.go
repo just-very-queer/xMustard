@@ -121,8 +121,8 @@ func fakeCore(mode string, args []string) int {
 				if mode == "badproto" {
 					proto = 99
 				}
-				result(fmt.Sprintf(`{"protocol":%d,"pid":%d,"methods":["echo","sleep","hang","crash","big","fail","conc","notresident"]}`, proto, os.Getpid()))
-			case "echo":
+				result(fmt.Sprintf(`{"protocol":%d,"pid":%d,"methods":["echo","sleep","hang","crash","big","fail","conc","notresident","family"],"one_shot_subcommands":{"family":["heavy"]}}`, proto, os.Getpid()))
+			case "echo", "family":
 				b, _ := json.Marshal(req.Params.Args)
 				result(string(b))
 			case "sleep":
@@ -536,14 +536,23 @@ func TestWorkerFallsBackToOneShotWhenItCannotStart(t *testing.T) {
 
 func TestWorkerLeavesOneShotOnlyCommandsToTheOneShotPath(t *testing.T) {
 	logPath := useFakeWorker(t, "ok")
-	for _, sub := range []string{"notresident", "lsp-hover"} {
-		out, err := runCoreCtx(context.Background(), sub)
-		if err != nil || strings.TrimSpace(string(out)) != fmt.Sprintf(`{"oneshot":%q}`, sub) {
-			t.Fatalf("%s: want the one-shot result, got %s %v", sub, out, err)
+	// not advertised, refused as not_resident, and a family's one-shot subcommand.
+	for _, call := range [][]string{{"lsp-hover"}, {"notresident"}, {"family", "heavy"}} {
+		out, err := runCoreCtx(context.Background(), call[0], call[1:]...)
+		if err != nil || strings.TrimSpace(string(out)) != fmt.Sprintf(`{"oneshot":%q}`, call[0]) {
+			t.Fatalf("%v: want the one-shot result, got %s %v", call, out, err)
 		}
 	}
-	if n := len(fakeLog(t, logPath, "oneshot ")); n != 2 {
-		t.Fatalf("want 2 one-shot execs, got %d", n)
+	if n := len(fakeLog(t, logPath, "oneshot ")); n != 3 {
+		t.Fatalf("want 3 one-shot execs, got %d", n)
+	}
+	// the family's other subcommands stay resident.
+	out, err := runCoreCtx(context.Background(), "family", "light")
+	if err != nil || string(out) != `["light"]` {
+		t.Fatalf("resident family call: %s %v", out, err)
+	}
+	if n := len(fakeLog(t, logPath, "oneshot ")); n != 3 {
+		t.Fatalf("a resident family call must not exec: %d one-shot execs", n)
 	}
 }
 

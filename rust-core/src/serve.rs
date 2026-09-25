@@ -616,6 +616,17 @@ fn handle_message(table: &'static [Command], shared: &Shared, header_id: Option<
                 .filter(|c| c.is_resident())
                 .map(|c| c.name)
                 .collect();
+            // first arguments that keep a resident family one-shot, so the client
+            // routes them without a round trip.
+            let one_shot: serde_json::Map<String, Value> = table
+                .iter()
+                .filter_map(|c| match c.residency {
+                    dispatch::Residency::ResidentExcept(subs) => {
+                        Some((c.name.to_string(), json!(subs)))
+                    }
+                    _ => None,
+                })
+                .collect();
             let result = json!({
                 "protocol": PROTOCOL_VERSION,
                 "server": "xmustard-core",
@@ -624,6 +635,7 @@ fn handle_message(table: &'static [Command], shared: &Shared, header_id: Option<
                 "max_inflight": shared.cfg.max_inflight,
                 "max_frame_bytes": MAX_FRAME_BYTES,
                 "methods": methods,
+                "one_shot_subcommands": one_shot,
             });
             reply(shared, id, &result);
         }
@@ -1034,6 +1046,10 @@ mod tests {
         assert!(methods.contains(&json!("echo")));
         assert!(methods.contains(&json!("family")));
         assert!(!methods.contains(&json!("oneshot")));
+        assert_eq!(
+            v["result"]["one_shot_subcommands"],
+            json!({"family": ["spawn"]})
+        );
         assert_eq!(h.close(), 0);
     }
 

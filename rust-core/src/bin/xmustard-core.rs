@@ -92,11 +92,19 @@ const COMMANDS: &[Command] = &[
     cmd("swarm", Residency::OneShot, run_swarm_command),
     cmd("semantic-search", Residency::OneShot, semantic_search),
     cmd("bench", Residency::OneShot, run_bench_command),
-    cmd("changetrack", Residency::Resident, run_changetrack_command),
-    // build-lsp starts language servers, which keep their per-call kill boundary.
+    // Whole-repository builds run one-shot so their transient heap leaves with the
+    // process (PAR-RT-02): measured on pi-mono, one `changetrack index` left a serve
+    // worker at 36.8 MiB instead of the 24.4 MiB query-only plateau. `symbolgraph
+    // build` and `hotspots` rebuild the full graph on every call; build-lsp also starts
+    // language servers. None of them is on a nine-tool query path.
+    cmd(
+        "changetrack",
+        Residency::ResidentExcept(&["index"]),
+        run_changetrack_command,
+    ),
     cmd(
         "symbolgraph",
-        Residency::ResidentExcept(&["build-lsp"]),
+        Residency::ResidentExcept(&["build", "hotspots", "build-lsp"]),
         run_symbolgraph_command,
     ),
     cmd("ownership", Residency::Resident, ownership),
@@ -1136,8 +1144,8 @@ mod tests {
         v.iter().map(|s| s.to_string()).collect()
     }
 
-    /// Every subcommand the Go bridge sends through `runCoreCtx` (the worker path),
-    /// with the first argument for the command families.
+    /// Every resident invocation the Go bridge sends through `runCoreCtx`, including
+    /// all nine-tool query paths, with the first argument for command families.
     const GO_WORKER_CALLS: &[(&str, &[&str])] = &[
         ("scan-signals", &[]),
         ("build-repo-map", &[]),
@@ -1153,14 +1161,11 @@ mod tests {
         ("normalize-lsp-workspace-symbols", &[]),
         ("parse-coverage-lcov", &[]),
         ("parse-coverage", &[]),
-        ("symbolgraph", &["build"]),
-        ("symbolgraph", &["hotspots"]),
         ("symbolgraph", &["blast-radius"]),
         ("symbolgraph", &["impact"]),
         ("symbolgraph", &["trace"]),
         ("symbolgraph", &["clusters"]),
         ("changetrack", &["fingerprint"]),
-        ("changetrack", &["index"]),
         ("changetrack", &["drift"]),
         ("changetrack", &["changed-since"]),
         ("changetrack", &["working-changes"]),
@@ -1207,7 +1212,11 @@ mod tests {
             assert!(!entry.is_resident(), "{name} must stay one-shot");
         }
         let sg = dispatch::find(COMMANDS, "symbolgraph").unwrap();
-        assert!(!sg.resident_for(&strings(&["build-lsp", "/r", "ws"])));
+        for sub in ["build-lsp", "build", "hotspots"] {
+            assert!(!sg.resident_for(&strings(&[sub, "/r", "ws"])), "{sub}");
+        }
+        let ct = dispatch::find(COMMANDS, "changetrack").unwrap();
+        assert!(!ct.resident_for(&strings(&["index", "/d", "/r", "ws"])));
     }
 
     #[test]
