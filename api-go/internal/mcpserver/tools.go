@@ -26,10 +26,16 @@ func ToolByName(name string) (*Tool, bool) {
 // environment, the client's roots or the working directory (resolve_workspace.go).
 var workspaceArg = Arg{Name: "workspace_id", Type: typeString, Desc: "workspace id; auto-resolved if omitted"}
 
-// boundedResultChars is the largest result a read tool is meant to deliver inline:
-// the evidence projection target (64 KiB; characters never exceed bytes) plus the
-// recovery note. Larger originals are reduced to it and paged through resources/read.
-const boundedResultChars = 64<<10 + 1<<10
+// boundedResultChars is the largest result a read tool delivers inline: the evidence
+// projection's hard cap (1 MiB; characters never exceed bytes) plus the recovery
+// note. Projections aim at 64 KiB but may grow toward the cap to keep failure evidence
+// (measured: impact with no arguments on a 1,929-file repository projected a 2 MiB
+// original to 100,671 bytes). Originals are paged through resources/read.
+const (
+	projectionHardCap  = 1 << 20 // evidence.DefaultMaxProjection
+	recoveryNoteBytes  = 1 << 10
+	boundedResultChars = projectionHardCap + recoveryNoteBytes
+)
 
 func wsPath(args map[string]string, suffix string) string {
 	return "/api/workspaces/" + url.PathEscape(args["workspace_id"]) + suffix

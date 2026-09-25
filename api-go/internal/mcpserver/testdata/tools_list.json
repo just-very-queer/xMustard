@@ -3,7 +3,7 @@
   "tools": [
     {
       "_meta": {
-        "anthropic/maxResultSizeChars": 66560
+        "anthropic/maxResultSizeChars": 1049600
       },
       "annotations": {
         "openWorldHint": false,
@@ -60,7 +60,7 @@
     },
     {
       "_meta": {
-        "anthropic/maxResultSizeChars": 66560
+        "anthropic/maxResultSizeChars": 1049600
       },
       "annotations": {
         "openWorldHint": false,
@@ -253,7 +253,7 @@
     },
     {
       "_meta": {
-        "anthropic/maxResultSizeChars": 66560
+        "anthropic/maxResultSizeChars": 1049600
       },
       "annotations": {
         "openWorldHint": false,
@@ -333,7 +333,7 @@
     },
     {
       "_meta": {
-        "anthropic/maxResultSizeChars": 66560
+        "anthropic/maxResultSizeChars": 1049600
       },
       "annotations": {
         "openWorldHint": false,
@@ -388,7 +388,7 @@
     },
     {
       "_meta": {
-        "anthropic/maxResultSizeChars": 66560
+        "anthropic/maxResultSizeChars": 1049600
       },
       "annotations": {
         "openWorldHint": false,
@@ -460,7 +460,7 @@
     },
     {
       "_meta": {
-        "anthropic/maxResultSizeChars": 66560
+        "anthropic/maxResultSizeChars": 1049600
       },
       "annotations": {
         "openWorldHint": false,
@@ -496,7 +496,7 @@
     },
     {
       "_meta": {
-        "anthropic/maxResultSizeChars": 66560
+        "anthropic/maxResultSizeChars": 1049600
       },
       "annotations": {
         "openWorldHint": false,
