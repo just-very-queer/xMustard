@@ -112,6 +112,13 @@ class ParseAndAttribution(unittest.TestCase):
             self.assertNotIn(pid, rows)
         self.assertEqual(v2.snapshot_totals(procs, rows)["gate_kib"], 20000 + 2000 + 900)
 
+    def test_forked_child_before_exec_is_named_and_counted(self):
+        procs, children = v2.parse_ps(ps((100, 1, 30000, "xmustard-api"), (101, 100, 29000, "xmustard-api")))
+        _, rows = v2.attribute(procs, children, roots(shims=(), agent=None), REGISTRY)
+        self.assertEqual(rows[101][:2], ("fork_pre_exec", "owned"))
+        tot = v2.snapshot_totals(procs, rows)
+        self.assertEqual((tot["gate_kib"], tot["components_kib"]["go_daemon"]), (59000, 30000))
+
     def test_missing_root_is_reported(self):
         procs, children = v2.parse_ps(ps((100, 1, 20000, "xmustard-api")))
         missing, _ = v2.attribute(procs, children, roots(shims=(200,), agent=None), REGISTRY)
@@ -155,6 +162,35 @@ class V1Equivalence(unittest.TestCase):
         self.assertEqual(o["lost_root_count"], n["lost_root_count"])
         self.assertEqual(o["ps_error_count"], n["ps_error_count"])
         self.assertEqual(len(old.validity()), len(new.validity()))
+
+
+class V1WorkloadValidity(unittest.TestCase):
+    CHECKS = [{"check": "fixture ok", "ok": True}, {"check": "helper-child limit held", "ok": False},
+              {"check": "sampler valid: samples taken", "ok": False},
+              {"check": "sampled xMustard-owned tree peak <= 100 MB (100,000,000 bytes)", "ok": False}]
+    V1GATE = {"invalid_reasons": ["mandatory workload checks failed: ['helper-child limit held']"]}
+
+    def srep(self, cores, forks):
+        return {"components": {"rust_core_per_call": {"max_concurrent": cores}, "fork_pre_exec": {"max_concurrent": forks}}}
+
+    def test_fork_children_do_not_break_the_admission_check(self):
+        invalid, helper = v2.v1_workload_validity(self.V1GATE, self.CHECKS, {"cap": 4, "peak": 2}, self.srep(2, 3))
+        self.assertEqual(invalid, [])
+        self.assertTrue(helper["held"])
+
+    def test_real_overrun_stays_invalid(self):
+        invalid, helper = v2.v1_workload_validity(self.V1GATE, self.CHECKS, {"cap": 4, "peak": 2}, self.srep(5, 0))
+        self.assertEqual(invalid, ["mandatory workload checks failed: ['helper-child limit held']"])
+        self.assertFalse(helper["held"])
+        invalid, _ = v2.v1_workload_validity(self.V1GATE, self.CHECKS, {"cap": 4, "peak": 5}, self.srep(1, 0))
+        self.assertTrue(invalid)
+
+    def test_other_failures_and_v1_validity_are_kept(self):
+        checks = self.CHECKS + [{"check": "cold query finds symbol_070", "ok": False}]
+        gate = {"invalid_reasons": ["3 ps errors", "workload incomplete (missing steps ['x'])", "mandatory workload checks failed: [...]"]}
+        invalid, _ = v2.v1_workload_validity(gate, checks, {"cap": 4, "peak": 1}, self.srep(1, 1))
+        self.assertEqual(invalid, ["3 ps errors", "workload incomplete (missing steps ['x'])",
+                                   "mandatory workload checks failed: ['cold query finds symbol_070']"])
 
 
 class SamplerMetrics(unittest.TestCase):
@@ -301,6 +337,8 @@ class Accounting(unittest.TestCase):
         self.assertIsNone(r["error"])
         self.assertTrue(v2.result_accounting({"result": {"content": [{"text": "boom"}], "isError": True}})["error"].startswith("isError"))
         self.assertIn("rpc -32000", v2.result_accounting({"error": {"code": -32000, "message": "busy"}})["error"])
+        page = v2.result_accounting({"result": {"contents": [{"uri": "x", "blob": "QUJD" * 100}], "_meta": {}}})
+        self.assertEqual((page["content_bytes"], page["est_tokens"]), (400, 100))
 
     def test_usage_summary(self):
         u = v2.UsageLog()
@@ -461,11 +499,12 @@ class Ledger(unittest.TestCase):
         daemon_over = v2.ledger_check(LEDGER, "WS-01", self.view(80.0, 20.0 + 3 + tol["component_p50_mib"] + 0.1), base)
         self.assertFalse(daemon_over["passed"])
         # WS-13 must actually save its 10 MiB
-        saved = {"v1-workload": {"gate_peak_mib": 60.0, "components_p50_mib": {"mcp_access": 0.0}}}
+        saved = {"v1-workload": {"gate_peak_mib": 80.0 - 10 - tol["tree_peak_mib"], "components_p50_mib": {"mcp_access": 0.0}}}
         self.assertTrue(v2.ledger_check(LEDGER, "WS-13", saved, base)["passed"])
         self.assertFalse(v2.ledger_check(LEDGER, "WS-13", self.view(80.0, 20.0), base)["passed"])
         # unlisted work and a null line default to 0 MiB
-        self.assertFalse(v2.ledger_check(LEDGER, "not-a-workstream", self.view(90.0, 20.0), base)["passed"])
+        over_default = 80.0 + LEDGER["default_line_mib"] + tol["tree_peak_mib"] + 0.5
+        self.assertFalse(v2.ledger_check(LEDGER, "not-a-workstream", self.view(over_default, 20.0), base)["passed"])
         self.assertEqual(v2.ledger_check(LEDGER, "WS-55", base, base)["line_mib"], 0.0)
         # no common scenario is a failure, not a pass
         self.assertFalse(v2.ledger_check(LEDGER, "WS-01", {}, base)["passed"])
@@ -609,6 +648,22 @@ class RepoWiring(unittest.TestCase):
             runs = text
         for needle in ("make check-backend", "retrieval-gate.sh", "rss_v2.sh run --suite ci", "make bench-test", "--workstream"):
             self.assertIn(needle, runs)
+
+
+class Repeats(unittest.TestCase):
+    def run_(self, peak, verdict="PASS", daemon=20.0):
+        return {"status": "ran", "gate": {"peak_mib": peak, "peak_bytes": int(peak * 2**20), "verdict": verdict,
+                                          "passed": verdict == "PASS", "invalid_reasons": []},
+                "sampler": {"components": {"go_daemon": {"p50_mib": daemon, "peak_mib": daemon + 5}}}}
+
+    def test_median_run_is_kept_and_any_bad_repeat_fails(self):
+        folded = v2.median_report([self.run_(70.0), self.run_(90.0), self.run_(80.0, daemon=21.0)])
+        self.assertEqual(folded["gate"]["peak_mib"], 80.0)
+        self.assertEqual(folded["repeats"]["gate_peak_mib"], [70.0, 80.0, 90.0])
+        self.assertEqual([d["components_p50_mib"]["go_daemon"] for d in folded["repeats"]["detail"]], [20.0, 21.0, 20.0])
+        bad = v2.median_report([self.run_(70.0), self.run_(71.0, "INVALID"), self.run_(72.0)])
+        self.assertEqual(bad["gate"]["verdict"], "INVALID")
+        self.assertFalse(bad["gate"]["passed"])
 
 
 class Rendering(unittest.TestCase):

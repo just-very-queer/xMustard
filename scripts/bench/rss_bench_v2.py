@@ -181,6 +181,10 @@ def attribute(procs, children, roots, registry, argv1_of=lambda pid: None):
                 cc, ck = registry.classify(procs[ch].comm, argv1(ch))
                 if k == "external":  # externals stay external; keep a more specific external name
                     stack.append((ch, cc if ck == "external" else c, "external"))
+                elif ck == "owned" and exe_name(procs[ch].comm) == exe_name(procs[pid].comm):
+                    # a child still running its parent's image: forked, not yet exec'd. It stays
+                    # in the gate (ps counts its copy-on-write pages again) under its own name.
+                    stack.append((ch, "fork_pre_exec", "owned"))
                 else:
                     stack.append((ch, cc, ck))
 
@@ -556,6 +560,7 @@ class SamplerV2(threading.Thread):
             if k == "owned":
                 if st.get("anon_bytes") is None or st.get("file_bytes") is None:
                     split_ok = False
+                    split["unsplit_bytes"] += procs[pid].rss_kib * 1024  # exited or exiting: ps still shows RSS
                 else:
                     for key in ("anon_bytes", "file_bytes", "shmem_bytes", "compressed_bytes"):
                         split[key] += st.get(key) or 0
@@ -634,7 +639,9 @@ class SamplerV2(threading.Thread):
                           "at_gate_peak_partial": self.peak.get("footprint_partial"), "partial_samples": self.fp["partial_samples"]},
             "split_at_gate_peak": {"basis": self.probe.basis["split"], "anon_mib": mib(split.get("anon_bytes")),
                                    "file_mib": mib(split.get("file_bytes")), "shmem_mib": mib(split.get("shmem_bytes")),
-                                   "compressed_mib": mib(split.get("compressed_bytes")), "complete": split.get("complete")},
+                                   "compressed_mib": mib(split.get("compressed_bytes")),
+                                   "unsplit_mib": mib(split.get("unsplit_bytes", 0)), "complete": split.get("complete"),
+                                   "note": "unsplit = RSS of owned processes that exited between ps and the probe"},
             "process_peak_basis": self.probe.basis["process_peak"], "io_basis": self.probe.basis["io"],
             "components": comps,
             "externals": externals,
@@ -748,7 +755,9 @@ def result_accounting(reply):
         return out
     res = reply.get("result") or {}
     texts = [c.get("text") or "" for c in (res.get("content") or []) if isinstance(c, dict)]
-    n = sum(len(t.encode()) for t in texts)
+    # resources/read returns contents[] with text or a base64 blob; count what is delivered
+    resources = [c.get("text") or c.get("blob") or "" for c in (res.get("contents") or []) if isinstance(c, dict)]
+    n = sum(len(t.encode()) for t in texts + resources)
     out["content_bytes"] = n
     out["est_tokens"] = math.ceil(n / 4)
     if res.get("isError"):
@@ -1293,6 +1302,32 @@ SCRIPTS = ["scripts/bench/rss_bench_v2.py", "scripts/bench/rss_bench.py", "scrip
 # Scenario: the frozen v1 workload, measured by v1's and v2's samplers in the same run
 # --------------------------------------------------------------------------------------
 
+V1_GATE_CHECKS = ("sampler valid", "sampled xMustard-owned tree peak")  # v1's own verdict lines, not workload checks
+V1_HELPER_CHECK = "helper-child limit held"
+
+
+def v1_workload_validity(v1gate, checks, kids, srep):
+    """Invalid reasons for the v1 workload as judged by v2: v1's own validity (its
+    sampler, completeness) and its mandatory workload checks, with one known v1
+    miscount re-judged. v1 counts every process whose name contains "xmustard-core",
+    including a core's forked-not-yet-exec'd children (RSS 0); v2 attributes those to
+    fork_pre_exec, so the admission cap is judged on actual cores only."""
+    invalid = [r for r in v1gate.get("invalid_reasons", []) if not r.startswith("mandatory workload checks failed")]
+    failed = [c["check"] for c in checks if not c["ok"] and not c["check"].startswith(V1_GATE_CHECKS)]
+    helper = None
+    if V1_HELPER_CHECK in failed:
+        comps = srep["components"]
+        cores = sum(comps.get(c, {}).get("max_concurrent", 0) for c in ("rust_core_per_call", "rust_index_service"))
+        ok = kids.get("peak", 1 << 30) <= kids.get("cap", -1) and cores <= kids.get("cap", -1)
+        helper = {"v1_check_failed": True, "admission": kids, "v2_max_concurrent_cores": cores,
+                  "v2_fork_pre_exec_max_concurrent": comps.get("fork_pre_exec", {}).get("max_concurrent", 0), "held": ok}
+        if ok:
+            failed.remove(V1_HELPER_CHECK)
+    if failed:
+        invalid.append(f"mandatory workload checks failed: {failed}")
+    return invalid, helper
+
+
 def run_v1_workload(ctx):
     """Run rss_bench.py's own main() with four substitutions, restored afterwards:
       * Sampler: v1's sampler class extended to run the v2 sampler beside it;
@@ -1352,7 +1387,8 @@ def run_v1_workload(ctx):
     sampler = holder["v2"]
     srep = sampler.report()
     v1gate = res.get("gate", {})
-    invalid = [r for r in v1gate.get("invalid_reasons", [])]  # v1: sampler, completeness, mandatory checks
+    checks = list(v1rep.get("checks", []))
+    invalid, helper = v1_workload_validity(v1gate, checks, (res.get("admission") or {}).get("children") or {}, srep)
     invalid += [f"v2 sampler: {p}" for p in sampler.validity()]
     v1_peak = (res.get("sampled_tree") or {}).get("peak_bytes")
     tol = ctx["ledger"]["tolerance"]["v1_crosscheck_mib"]
@@ -1371,12 +1407,12 @@ def run_v1_workload(ctx):
     else:
         invalid.append("the frozen v1 sampler reported no peak")
     gate = evaluate_gate(srep, invalid)
-    checks = [c for c in v1rep.get("checks", [])]
     return {"status": "ran", "description": "frozen v1 workload (501 generated files), v1's own code",
             "transport": "stdio-shim", "gate": gate, "sampler": srep, "v1": {"gate": v1gate, "sampled_tree_peak_mib": mib(v1_peak),
             "steps": res.get("steps"), "fixture": res.get("fixture"),
             "admission": {k: v for k, v in (res.get("admission") or {}).items() if k != "capture_attempts"}},
-            "v1_crosscheck": cross, "checks": checks, "checks_failed": [c["check"] for c in checks if not c["ok"]],
+            "v1_crosscheck": cross, "helper_child_recheck": helper, "checks": checks,
+            "checks_failed": [c["check"] for c in checks if not c["ok"]],
             "usage": usage.summary(), "exit_code": exit_code}
 
 
@@ -1523,25 +1559,29 @@ def edit_file(path, token):
         f.write(f"\nexport function {token}(): number {{ return 1; }}\n")
 
 
-def pick_edit_targets(repo, n, exclude=()):
-    """Deterministic TypeScript files to edit: sorted tracked *.ts (no .d.ts), minus the
-    files the index reported as not covered, spaced across the tree."""
-    skip = set(exclude)
-    files = sorted(f for f in git(["ls-files", "--", "*.ts"], repo).stdout.split()
-                   if not f.endswith(".d.ts") and f not in skip)
+def pick_edit_targets(candidates, n):
+    """n deterministic edit targets spread across the sorted candidates (repeating when
+    there are fewer candidates than edits)."""
+    files = sorted(set(candidates))
     if not files:
         return []
     step = max(1, len(files) // n)
-    return files[::step][:n]
+    picked = files[::step][:n]
+    return (picked * (n // len(picked) + 1))[:n]
 
 
-def uncovered_paths(api, ws):
-    """Paths the index reports as not content-indexed (coverage.losses), so edits land on
-    files a query can see."""
-    st, body, _ = api.get(f"/api/workspaces/{ws}/search?q=function")
-    if st != 200 or not isinstance(body, dict):
-        return set()
-    return {l.get("path") for l in ((body.get("coverage") or {}).get("losses") or []) if isinstance(l, dict)}
+def indexed_ts_files(api, ws, queries=("function", "export", "return", "const", "class")):
+    """TypeScript files the index content-indexes, taken from search hits. At this HEAD
+    the index covers only the first files up to its cap, and coverage.losses lists at
+    most 200 of the rest, so hits are the reliable way to find files a query can see."""
+    found = set()
+    for q in queries:
+        st, body, _ = api.get(f"/api/workspaces/{ws}/search?q={q}&limit=100")
+        for h in ((body or {}).get("hits") or []) if st == 200 and isinstance(body, dict) else []:
+            path = h.get("path") or ""
+            if path.endswith(".ts") and not path.endswith(".d.ts"):
+                found.add(path)
+    return sorted(found)
 
 
 def counter_delta(h0, h1):
@@ -1645,6 +1685,7 @@ def run_agents_scenario(ctx, name, sc):
         threads = [threading.Thread(target=agent_loop, args=(a, f"agent{i + 1}", targets_per_agent[i], rounds, feats, errors, calls))
                    for i, a in enumerate(agents)]
         disturb = sc.get("disturb")
+        edit_candidates = indexed_ts_files(api, wsids[0]) if disturb in ("reindex", "edits") else []
         label = f"{n_agents} agent(s) querying" + (f" + {disturb}" if disturb else "")
         step[0] = label
         t0 = time.time()
@@ -1653,7 +1694,7 @@ def run_agents_scenario(ctx, name, sc):
             idx_status = []
             idx = threading.Thread(target=lambda: idx_status.append(api.request("POST", f"/api/workspaces/{wsids[0]}/index", timeout=1800)[0]))
             idx.start()
-            time.sleep(0.5)
+            time.sleep(0.1)
             payload = (b"PASS suite case ok\n" * (v1mod().CAPTURE_BYTES // 19 + 1))[:v1mod().CAPTURE_BYTES]
             release, caps = threading.Event(), [None] * 5
             decided = [threading.Event() for _ in range(5)]
@@ -1674,28 +1715,35 @@ def run_agents_scenario(ctx, name, sc):
             checks.check("admitted captures succeed with exact size and SHA-256",
                          bool(ok_caps) and all((c["json"] or {}).get("raw_sha256") == sha for c in ok_caps), str(outcomes))
             checks.check("cold index build answered 200", idx_status == [200], str(idx_status))
+            checks.check("capture admission was decided while the index build was in flight", index_running,
+                         "the index finished before every capture was decided: no overlap was measured")
             result["captures"] = {"outcomes": outcomes, "index_still_running_when_decided": index_running}
         else:
             [t.start() for t in threads]
             if disturb == "reindex":
                 # edits, then a full reindex while the agents keep querying (overlapping peaks)
                 time.sleep(1.0)
-                edits = pick_edit_targets(repos[0][2], 40, uncovered_paths(api, wsids[0]))
+                edits = pick_edit_targets(edit_candidates, 40)
                 for j, rel in enumerate(edits):
                     edit_file(os.path.join(repos[0][2], rel), f"xmBenchReindex{j}")
+                alive = sum(t.is_alive() for t in threads)
                 st, _, _ = api.request("POST", f"/api/workspaces/{wsids[0]}/index", timeout=1800)
                 checks.check(f"reindex after {len(edits)} edits answered 200 during queries", st == 200 and bool(edits), str(st))
-                result["edits"] = len(edits)
+                checks.check("agents were querying when the reindex started (overlap)", alive > 0, f"{alive} agents alive")
+                result["edits"], result["agents_alive_at_reindex"] = len(edits), alive
             elif disturb == "edits":
                 # one edit every 1.5 s while the agents query: each forces a refresh and swap
-                edits = pick_edit_targets(repos[0][2], 12, uncovered_paths(api, wsids[0]))
-                last = None
+                edits = pick_edit_targets(edit_candidates, 12)
+                last, under_load = None, 0
                 for j, rel in enumerate(edits):
                     if not any(t.is_alive() for t in threads):
                         break
                     last = (f"xmBenchSwap{j}", rel)
                     edit_file(os.path.join(repos[0][2], rel), last[0])
+                    under_load += 1
                     time.sleep(1.5)
+                checks.check("edits landed while agents were querying (overlap)", under_load > 0, f"{under_load} edits under load")
+                result["edits_under_load"] = under_load
                 [t.join() for t in threads]
                 if last:
                     body = tool_body(agents[0].tool("search", {"workspace_id": wsids[0], "query": last[0]}, timeout=900)) or {}
@@ -1888,9 +1936,10 @@ def render_markdown(report):
             continue
         g, s = r["gate"], r.get("sampler") or {}
         sp = s.get("split_at_gate_peak") or {}
+        unsplit = f" (+{sp['unsplit_mib']} exited)" if sp.get("unsplit_mib") else ""
         ext = sum((v.get("peak_mib") or 0) for v in (s.get("externals") or {}).values())
         L.append(f"| {name} | {g['verdict']} | {fmt(g.get('peak_mib'))} ({fmt(round(g['peak_bytes'] / 1e6, 1) if g.get('peak_bytes') else None)}) | "
-                 f"{fmt((s.get('footprint') or {}).get('tree_peak_mib'))} | {fmt(sp.get('anon_mib'))} / {fmt(sp.get('file_mib'))} | "
+                 f"{fmt((s.get('footprint') or {}).get('tree_peak_mib'))} | {fmt(sp.get('anon_mib'))} / {fmt(sp.get('file_mib'))}{unsplit} | "
                  f"{fmt(round(ext, 1) if s.get('externals') else 0)} | {fmt((s.get('gate') or {}).get('peak_step'))} | {r.get('transport', '–')} |")
     for name, r in report["scenarios"].items():
         if r.get("status") != "ran":
@@ -1940,6 +1989,13 @@ def render_markdown(report):
                      f"v2 owned+external {cross['v2_tree_all_peak_mib']} MiB, difference {cross['difference_mib']} MiB "
                      f"(tolerance {cross['tolerance_mib']}): {'within noise' if cross['within_noise'] else 'OUTSIDE noise'}. "
                      f"Median sample interval v1 {cross.get('v1_interval_ms_median')} ms, v2 {cross.get('v2_interval_ms_median')} ms.")
+        hr = r.get("helper_child_recheck")
+        if hr:
+            L.append("")
+            L.append(f"v1's helper-child check failed on its name count; v2 re-judged it on actual cores: "
+                     f"{hr['v2_max_concurrent_cores']} concurrent cores against cap {hr['admission'].get('cap')} "
+                     f"(forked-before-exec children seen at once: {hr['v2_fork_pre_exec_max_concurrent']}): "
+                     f"{'held' if hr['held'] else 'NOT held'}.")
         u = r.get("usage")
         if u and u.get("per_tool"):
             L.append("")
@@ -2032,7 +2088,12 @@ def median_report(runs):
     mid = ok[len(ok) // 2]
     mid = dict(mid)
     mid["repeats"] = {"runs": len(runs), "gate_peak_mib": [r["gate"]["peak_mib"] for r in ok],
-                      "verdicts": [r["gate"]["verdict"] for r in ok]}
+                      "verdicts": [r["gate"]["verdict"] for r in ok],
+                      "detail": [{"gate_peak_mib": r["gate"]["peak_mib"], "verdict": r["gate"]["verdict"],
+                                  "v1_difference_mib": (r.get("v1_crosscheck") or {}).get("difference_mib"),
+                                  "components_p50_mib": {c: v["p50_mib"] for c, v in ((r.get("sampler") or {}).get("components") or {}).items()},
+                                  "components_peak_mib": {c: v["peak_mib"] for c, v in ((r.get("sampler") or {}).get("components") or {}).items()}}
+                                 for r in ok]}
     if any(r["gate"]["verdict"] != "PASS" for r in ok):
         worst = next(r for r in ok if r["gate"]["verdict"] != "PASS")
         mid["gate"] = dict(mid["gate"], verdict=worst["gate"]["verdict"], passed=False,
@@ -2041,6 +2102,9 @@ def median_report(runs):
 
 
 def cmd_run(args):
+    if args.workstream and not args.baseline:
+        raise SystemExit("--workstream needs --baseline <report.json> measured on the same machine")
+    base = load_json(args.baseline) if args.baseline else None
     ledger = load_json(args.ledger)
     fixtures = load_json(FIXTURES_PATH)
     source_root = os.path.abspath(args.source_root or REPO_ROOT)
@@ -2079,7 +2143,9 @@ def cmd_run(args):
                 r = run_v1_workload(ctx) if sc["kind"] == "v1" else run_agents_scenario(ctx, n, sc)
                 runs.append(r)
                 g = r.get("gate") or {}
-                print(f"   run {i + 1}: {r.get('status')} {g.get('verdict', '')} peak {g.get('peak_mib')} MiB", flush=True)
+                cross = (r.get("v1_crosscheck") or {}).get("difference_mib")
+                print(f"   run {i + 1}: {r.get('status')} {g.get('verdict', '')} peak {g.get('peak_mib')} MiB"
+                      + (f" (v2 - v1 sampler: {cross} MiB)" if cross is not None else ""), flush=True)
                 if r.get("status") != "ran":
                     break
             report["scenarios"][n] = median_report(runs)
@@ -2090,9 +2156,6 @@ def cmd_run(args):
     report["parity_claim"] = parity_claim(report, fixtures)
     report["ledger_reconcile"] = ledger_reconcile(ledger)
     if args.workstream:
-        if not args.baseline:
-            raise SystemExit("--workstream needs --baseline <report.json> measured on the same machine")
-        base = load_json(args.baseline)
         report["ledger_check"] = ledger_check(ledger, args.workstream, ledger_view(report), ledger_view(base))
         report["ledger_check"]["baseline_head"] = (base.get("provenance") or {}).get("head")
     write_reports(report, out_dir)

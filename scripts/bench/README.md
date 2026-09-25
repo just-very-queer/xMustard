@@ -31,7 +31,9 @@ Attribution comes from `budget_ledger.json` `process_roles`. Registered roots ca
 role; descendants are classified by executable. External processes (LSP servers,
 compilers, tests, shells, agent CLIs) are reported on their own lines and never counted.
 Unknown children of owned processes count as owned. xMustard binaries an agent launches
-(hook clients, shims, relays) count toward the gate.
+(hook clients, shims, relays) count toward the gate. A child still running its parent's
+image (forked, not yet exec'd) counts as `fork_pre_exec`: ps-RSS counts its copy-on-write
+pages a second time, which footprint does not.
 
 Scenarios (`--scenarios a,b` or `--suite ci|parity`):
 
