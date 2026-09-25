@@ -144,8 +144,9 @@ jobs:
           name: xmustard-core
           path: ${{ runner.temp }}/core
       - run: chmod +x "$RUNNER_TEMP/core/xmustard-core"
-      # Pull requests: measure the base revision on this same runner, then the head, and
-      # check the head's delta against the workstream's ledger line (budget_ledger.json).
+      # Pull requests: measure the base revision on this same runner, then the head (each
+      # the median of three runs), and check the head's delta against the workstream's
+      # ledger line (budget_ledger.json).
       # The workstream comes from the branch name (parity/ws-NN); other branches use the
       # ledger's default line of 0 MiB plus tolerance.
       - name: Prepare the base revision
@@ -172,7 +173,7 @@ jobs:
       - name: Gate v2 on the base revision
         if: github.event_name == 'pull_request'
         run: |
-          scripts/bench/rss_v2.sh run --suite ci --source-root "$RUNNER_TEMP/base" \
+          scripts/bench/rss_v2.sh run --suite ci --repeat 3 --source-root "$RUNNER_TEMP/base" \
             --core-bin "${{ steps.base.outputs.core }}" --out bench-out/base || true
           test -f bench-out/base/report.json
       - name: Gate v2 on the head (pull request, with the ledger check)
@@ -181,7 +182,7 @@ jobs:
           HEAD_REF: ${{ github.head_ref }}
         run: |
           WS=$(printf '%s' "$HEAD_REF" | grep -oiE 'ws-?[0-9]{2}' | head -n1 | tr '[:lower:]' '[:upper:]' | sed -E 's/^WS-?/WS-/')
-          scripts/bench/rss_v2.sh run --suite ci --core-bin "$RUNNER_TEMP/core/xmustard-core" --out bench-out/head \
+          scripts/bench/rss_v2.sh run --suite ci --repeat 3 --core-bin "$RUNNER_TEMP/core/xmustard-core" --out bench-out/head \
             --workstream "${WS:-unlisted}" --baseline bench-out/base/report.json
       - name: Gate v2 (push or manual run)
         if: github.event_name != 'pull_request'

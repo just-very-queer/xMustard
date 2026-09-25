@@ -73,5 +73,6 @@ deliberate commit bump.
 `rss_v2.sh ledger` reconciles the design lines with the workstream lines. With
 `--workstream WS-NN --baseline base/report.json`, a run fails when the tree-peak delta
 or the delta of the workstream's process p50 exceeds the line plus tolerance; a negative
-line is a saving that must be delivered. CI measures the pull request's base revision on
-the same runner and takes the workstream from the branch name (`parity/ws-NN`).
+line is a saving that must be delivered. CI measures the pull request's base revision and
+the head on the same runner, each as the median of three runs (`--repeat 3`; any failed
+repeat fails the scenario), and takes the workstream from the branch name (`parity/ws-NN`).
