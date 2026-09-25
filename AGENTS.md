@@ -30,7 +30,7 @@ This repository contains xMustard: shared, verified memory and repository intell
 ## Repository Structure
 
 - `api-go/`: Go HTTP backend (routes, request shaping, persistence) + `xmustard-ops` CLI
-- `rust-core/`: Rust core — scanner, repo map, verification, diagnostics, lsp, goal/swarm runtime, data models, semantic search
+- `rust-core/`: Rust core — scanner, repo map, verification, diagnostics, lsp, goal/swarm runtime, semantic search
 - `backend/`: runtime `data/` + `sql/` only (Python retired to `archive/`)
 - `frontend/src/`: React app, queue views, detail panes, and shared client types
 - `docs/`: current vision, architecture, status, roadmap, audits, and indexed history

@@ -50,7 +50,7 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
 	{
 		name: "ground",
 		description:
-			"Orient before acting: what changed / what's stale / what's broken / what's blocked since the indexed baseline, with index-trust (drift) and any contract breaks (changed function signatures vs the baseline) included.",
+			"Orient before acting: what changed, is stale, broken or blocked since the baseline, with index drift and contract breaks (changed signatures).",
 		required: ["workspace_id"],
 		optional: [],
 		build: (a) => ({ method: "GET", path: ws(a, "/session-grounding") }),
@@ -58,7 +58,7 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
 	{
 		name: "recall",
 		description:
-			"The VERIFIED shared context to trust, RANKED to your task: pass a query and/or paths to get the few relevant facts (multi-signal: lexical + path overlap + verification strength), not a dump. No query → recency-ranked top-N.",
+			"Shared memory RANKED by query/paths (lexical, path overlap, approvals); non-matches dropped (terms >=3 chars). No args: top-N by working-tree overlap, then recency. verification_mode: peer_verified | single_agent | self_asserted_open_mode (no auth/quorum). conflicts: path overlap, not contradiction.",
 		required: ["workspace_id"],
 		optional: [
 			{ name: "query", type: "string", desc: "task query to rank memories by" },
@@ -78,7 +78,7 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
 	{
 		name: "remember",
 		description:
-			"Propose a durable memory (fact/decision/gotcha) for the shared context; pending until verified by enough agents. Pass content; optional title and paths (comma-separated files the memory is about, so recall can flag it stale when they change).",
+			"Propose a durable memory (fact/decision/gotcha); pending until enough distinct agents verify it (open mode: promoted at once as self_asserted_open_mode). Pass content; optional title, paths (comma-separated files it is about, so recall flags it stale when they change).",
 		required: ["workspace_id", "content"],
 		optional: [
 			{ name: "title", type: "string", desc: "short title" },
@@ -106,7 +106,7 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
 	{
 		name: "search",
 		description:
-			"Narrow code search over the repo, returning relevant slices (path:line), not a dump. Default mode is hybrid (lexical+semantic+structural+proximity). Pass seed=<symbol> to anchor a graph-PROXIMITY lane that pulls symbols structurally near that symbol up the ranking (auto-seeds from an exact query→symbol match otherwise). Pass mode=pattern to run an ast-grep STRUCTURAL query (query is the pattern, e.g. `$A && $A()`; optional lang).",
+			"Code search, path:line slices. Hybrid ranks symbol NAMES, paths and doc chunks, not function bodies: RRF of lexical IDF, trigram fuzzy match (typo tolerance, not meaning, unless built with semantic-onnx and XMUSTARD_EMBED_MODEL set), reference degree, proximity to seed=<symbol>. mode=pattern: ast-grep structural query (e.g. `$A && $A()`; optional lang).",
 		required: ["workspace_id", "query"],
 		optional: [
 			{ name: "mode", type: "string", enum: ["hybrid", "pattern"], desc: "hybrid (default) or pattern (ast-grep)" },
@@ -129,7 +129,7 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
 	{
 		name: "impact",
 		description:
-			"Blast radius. No args → impact of the current changes (dirty symbols, with contract_break flags where a signature changed vs the baseline). symbol= → every file that transitively references that symbol (graph BFS). from= & to= → the shortest dependency path between two symbols.",
+			"Blast radius over a LEXICAL reference graph (name matches + import lines, not resolved calls): distance≥1 edges are leads to confirm, not proof. No args → current changes (dirty symbols, contract_break). symbol= → files referencing its defining files, ≤4 hops. from=&to= → shortest undirected file path.",
 		required: ["workspace_id"],
 		optional: [
 			{ name: "symbol", type: "string", desc: "symbol to compute blast radius for" },

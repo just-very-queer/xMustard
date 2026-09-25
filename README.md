@@ -84,6 +84,19 @@ Each agent should authenticate with an `XMUSTARD_API_TOKEN` (mint one with
 multi-agent verification gate. Rotating a token while retaining its principal ID
 does not create a new verifier. Never share one principal between verifiers.
 
+**Open vs authenticated trust.** With no tokens minted, the loopback-only API runs
+in open mode: every caller is one identity (`anonymous`), so `remember` promotes a
+memory at once as `verification_mode: self_asserted_open_mode` instead of leaving it
+pending forever. Once tokens exist, every call must authenticate, and a memory becomes
+`peer_verified` only after enough distinct principals other than its author approve it
+(or is promoted at once as `single_agent` if the operator turned multi-agent
+verification off). Open mode is a property of each write: once tokens exist, an
+open-mode memory stays self-asserted until a full quorum of distinct principals
+approves it, and any authenticated dissent or edit puts it back under that quorum, so
+one principal cannot rewrite and re-promote it alone. The id `anonymous` is reserved
+and cannot be minted. `recall` shows each entry's mode and counts them in
+`verification_modes`; `ground` reports `memory_verification_modes`.
+
 ### The nine tools
 
 All tools take `workspace_id` (`?` marks an optional arg). The first four are the
@@ -94,12 +107,12 @@ access logs.
 | Tool | Args | What it does |
 |------|------|--------------|
 | `ground` | — | Orientation before acting: changed / stale / broken / blocked since baseline, with index-trust (drift), contract breaks, and stale-memory count. |
-| `recall` | `query?`, `paths?` | The verified shared context to trust, ranked to your task. Each entry is re-checked against the live tree; stale ones are flagged, and path-overlap conflicts are listed. |
-| `remember` | `content`, `title?`, `paths?` | Propose a durable memory (fact / decision / gotcha). `paths` are the files it's about, so recall can flag it stale when they change. Pending until verified. |
+| `recall` | `query?`, `paths?` | The promoted shared context, ranked to your task (lexical + path overlap + approval count). With `query` and/or `paths`, entries matching neither are dropped (query terms need 3+ characters); with no args, nothing is dropped, entries touching working-tree changes are boosted, and recency breaks ties. Each entry carries its `verification_mode` (`peer_verified`, `single_agent`, or `self_asserted_open_mode`) and is re-checked against the live tree; stale ones are flagged. `conflicts` lists memories that cite the same file: path overlap, not semantic contradiction. |
+| `remember` | `content`, `title?`, `paths?` | Propose a durable memory (fact / decision / gotcha). `paths` are the files it's about, so recall can flag it stale when they change. Pending until verified; in open mode it is promoted at once as self-asserted. |
 | `verify` | `entry_id`, `approve?` | Approve (or reject) a peer's proposed memory; it promotes once enough distinct principals approve. |
-| `search` | `query`, `mode?` (`hybrid`\|`pattern`), `lang?`, `seed?` | Narrow code search — relevant slices, not a dump. Default `hybrid` fuses lexical + semantic + structural + graph-proximity (RRF); `mode=pattern` runs an ast-grep structural query; `seed=<symbol>` anchors the proximity lane. |
+| `search` | `query`, `mode?` (`hybrid`\|`pattern`), `lang?`, `seed?` | Code search returning `path:line` slices, not a dump. Default `hybrid` ranks symbol names, file paths and doc chunks, not function bodies: RRF over lexical IDF, char-trigram fuzzy matching (typo tolerance; conceptual matching only when built with the optional `semantic-onnx` feature and `XMUSTARD_EMBED_MODEL` names a local ONNX model directory), inbound-reference degree, and graph proximity to `seed=<symbol>`. `mode=pattern` runs an ast-grep structural query over code. |
 | `explain` | `path` | Explain a file or directory: purpose, key symbols, how to run/verify it. |
-| `impact` | `symbol?`, `from?`, `to?` | Blast radius. No args → current changes (with `contract_break` flags); `symbol=` → transitive references (graph BFS); `from=`&`to=` → shortest dependency path between two symbols. |
+| `impact` | `symbol?`, `from?`, `to?` | Blast radius over a lexical reference graph (symbol-name matches across files plus import-line heuristics, not resolved calls), so distance ≥ 1 edges are leads to confirm, not proof. No args → current changes (with `contract_break` flags); `symbol=` → files that reference the file(s) defining that name, up to 4 hops (file-level, so a hit may use a different symbol from the same file); `from=`&`to=` → shortest undirected path between the files defining the two names. |
 | `diagnostics` | — | Current normalized errors/warnings for the workspace. |
 | `why_failed` | `run_id` | Explain why a run failed: failure signals, salient error lines, and which changed files are implicated. |
 
@@ -138,7 +151,7 @@ in [architecture](docs/ARCHITECTURE.md).
 ## Repo Layout
 
 - `api-go/`: Go HTTP backend, stdio MCP server, operator CLI, persistence, and Rust bridge
-- `rust-core/`: Rust core — scanner, repo map, verification, diagnostics, lsp, goal/swarm runtime, data models, semantic search
+- `rust-core/`: Rust core — scanner, repo map, verification, diagnostics, lsp, goal/swarm runtime, semantic search
 - `backend/`: runtime data (`data/`) and SQL schema (`sql/`) only; the Python FastAPI/Typer stack was retired to `archive/2026-06-16-python-backend/`
 - `frontend/`: React and TypeScript UI surface (proxies `/api` → `:8042`)
 - `integrations/pi/`: version-pinned Pi extension (implementation candidate)

@@ -63,7 +63,7 @@ func TestRecallNeverAttachesRevisedContentToOldApproval(t *testing.T) {
 		// Multi-agent threshold so the revision is NOT re-promoted by the update.
 		enable := true
 		writeTestSettings(t, dir, appSettings{RequireMultiAgentVerification: &enable, ContextVerificationThreshold: 2})
-		if _, err := UpdateContextContent(dir, ws, target.ID, "REVISED_UNVERIFIED_TEXT"); err != nil {
+		if _, err := UpdateContextContent(dir, ws, target.ID, "REVISED_UNVERIFIED_TEXT", ContextActor{Admin: true}); err != nil {
 			t.Errorf("update: %v", err)
 		}
 	}

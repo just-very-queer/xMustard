@@ -76,11 +76,15 @@ type SessionGrounding struct {
 	StaleMemory                  int             `json:"stale_memory"`
 	// StaleMemoryChecked / Total / Complete make the bounded drift check explicit:
 	// only the most recent groundStaleWindow memories with path baselines are hashed.
-	StaleMemoryChecked  int    `json:"stale_memory_checked"`
-	StaleMemoryTotal    int    `json:"stale_memory_total"`
-	StaleMemoryComplete bool   `json:"stale_memory_complete"`
-	Summary             string `json:"summary"`
-	GeneratedAt         string `json:"generated_at"`
+	StaleMemoryChecked  int  `json:"stale_memory_checked"`
+	StaleMemoryTotal    int  `json:"stale_memory_total"`
+	StaleMemoryComplete bool `json:"stale_memory_complete"`
+	// MemoryVerificationModes counts promoted memories by trust basis (peer_verified,
+	// self_asserted_open_mode, single_agent), so an agent can tell peer-verified
+	// shared memory from self-asserted memory before it relies on recall.
+	MemoryVerificationModes map[string]int `json:"memory_verification_modes"`
+	Summary                 string         `json:"summary"`
+	GeneratedAt             string         `json:"generated_at"`
 }
 
 // BuildSessionGrounding answers "what changed / what's broken / what's blocked"
@@ -146,9 +150,12 @@ func BuildSessionGroundingCtx(ctx context.Context, dataDir, workspaceID string) 
 	// stale verified-memory (drift-on-recall) — memory whose referenced files changed.
 	// Bounded: only the most recent groundStaleWindow baselined memories are hashed,
 	// and the result says whether that covered every one.
-	g.StaleMemory, g.StaleMemoryChecked, g.StaleMemoryTotal, g.StaleMemoryComplete = boundedStaleMemory(dataDir, workspaceID, groundStaleWindow)
+	g.StaleMemory, g.StaleMemoryChecked, g.StaleMemoryTotal, g.StaleMemoryComplete, g.MemoryVerificationModes = boundedStaleMemory(dataDir, workspaceID, groundStaleWindow)
 	g.Summary = fmt.Sprintf("%d changed file(s), %d dirty symbol(s), %d contract break(s), %d failed run(s), %d stale memory.",
 		g.ChangedFiles, g.DirtySymbols, g.ContractBreaks, len(failed), g.StaleMemory)
+	if n := g.MemoryVerificationModes[VerificationSelfAssertedOpen]; n > 0 {
+		g.Summary += fmt.Sprintf(" %d memory self-asserted in open mode (not peer-verified).", n)
+	}
 	return g, nil
 }
 
@@ -157,16 +164,18 @@ const groundStaleWindow = 64
 
 // boundedStaleMemory drift-checks at most window promoted memories that carry path
 // baselines, most recently updated first, from content-free metadata. It returns the
-// stale count, how many were checked, the promoted total and whether every baselined
-// memory was checked.
-func boundedStaleMemory(dataDir, workspaceID string, window int) (stale, checked, total int, complete bool) {
+// stale count, how many were checked, the promoted total, whether every baselined
+// memory was checked, and the promoted count per verification mode.
+func boundedStaleMemory(dataDir, workspaceID string, window int) (stale, checked, total int, complete bool, modes map[string]int) {
 	promoted, ok := loadPromotedMetaCached(dataDir, workspaceID)
 	if !ok {
 		var err error
 		if promoted, err = loadPromotedMeta(dataDir, workspaceID); err != nil {
-			return 0, 0, 0, false
+			return 0, 0, 0, false, nil
 		}
 	}
+	_, threshold := contextDefaults(dataDir)
+	modes = labelVerificationModes(promoted, threshold)
 	sort.SliceStable(promoted, func(a, b int) bool { return promoted[a].UpdatedAt > promoted[b].UpdatedAt })
 	root := contextRoot(dataDir, workspaceID)
 	baselined := 0
@@ -184,5 +193,5 @@ func boundedStaleMemory(dataDir, workspaceID string, window int) (stale, checked
 			stale++
 		}
 	}
-	return stale, checked, len(promoted), checked == baselined
+	return stale, checked, len(promoted), checked == baselined, modes
 }
