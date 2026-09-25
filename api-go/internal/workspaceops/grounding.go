@@ -3,10 +3,6 @@ package workspaceops
 import (
 	"context"
 	"encoding/json"
-	"fmt"
-	"sort"
-	"strings"
-	"time"
 
 	"xmustard/api-go/internal/rustcore"
 )
@@ -14,6 +10,12 @@ import (
 // Ownership + incorporation lineage delegators, and the session-grounding
 // aggregator that answers "what changed / what's broken / what's blocked since
 // the baseline" by combining change tracking with run history.
+//
+// `ground` is assembled from section files so later work owns disjoint files:
+// grounding_index.go (index drift and working changes), grounding_runs.go (run
+// history), grounding_memory.go (stale and trust-labelled memory) and
+// grounding_session.go (session summary). Each section declares its own fields in
+// an embedded struct; this file only orders the sections and derives the blocked flags.
 
 func WorkspaceSubsystems(dataDir, workspaceID string) (json.RawMessage, error) {
 	root, _, err := resolveChangeRoot(dataDir, workspaceID)
@@ -63,28 +65,16 @@ func FileLineage(dataDir, workspaceID, path string) (json.RawMessage, error) {
 	return json.RawMessage(out), nil
 }
 
+// SessionGrounding is the `ground` result. The embedded sections are flattened into
+// one JSON object in this field order.
 type SessionGrounding struct {
-	WorkspaceID                  string          `json:"workspace_id"`
-	Drift                        json.RawMessage `json:"drift"`
-	ChangedFiles                 int             `json:"changed_files"`
-	DirtySymbols                 int             `json:"dirty_symbols"`
-	ContractBreaks               int             `json:"contract_breaks"`
-	BrokenContracts              []string        `json:"broken_contracts,omitempty"`
-	RecentFailedRuns             []string        `json:"recent_failed_runs"`
-	BlockedByDirtyState          bool            `json:"blocked_by_dirty_state"`
-	BlockedByFailingVerification bool            `json:"blocked_by_failing_verification"`
-	StaleMemory                  int             `json:"stale_memory"`
-	// StaleMemoryChecked / Total / Complete make the bounded drift check explicit:
-	// only the most recent groundStaleWindow memories with path baselines are hashed.
-	StaleMemoryChecked  int  `json:"stale_memory_checked"`
-	StaleMemoryTotal    int  `json:"stale_memory_total"`
-	StaleMemoryComplete bool `json:"stale_memory_complete"`
-	// MemoryVerificationModes counts promoted memories by trust basis (peer_verified,
-	// self_asserted_open_mode, single_agent), so an agent can tell peer-verified
-	// shared memory from self-asserted memory before it relies on recall.
-	MemoryVerificationModes map[string]int `json:"memory_verification_modes"`
-	Summary                 string         `json:"summary"`
-	GeneratedAt             string         `json:"generated_at"`
+	WorkspaceID string `json:"workspace_id"`
+	groundingIndex
+	groundingRuns
+	BlockedByDirtyState          bool `json:"blocked_by_dirty_state"`
+	BlockedByFailingVerification bool `json:"blocked_by_failing_verification"`
+	groundingMemory
+	groundingSession
 }
 
 // BuildSessionGrounding answers "what changed / what's broken / what's blocked"
@@ -95,103 +85,15 @@ func BuildSessionGrounding(dataDir, workspaceID string) (*SessionGrounding, erro
 
 // BuildSessionGroundingCtx is the request-scoped variant: cancelling ctx kills its Rust/tool children.
 func BuildSessionGroundingCtx(ctx context.Context, dataDir, workspaceID string) (*SessionGrounding, error) {
-	drift, err := WorkspaceDriftCtx(ctx, dataDir, workspaceID)
-	if err != nil {
+	g := &SessionGrounding{WorkspaceID: workspaceID}
+	if err := g.groundingIndex.build(ctx, dataDir, workspaceID); err != nil {
 		return nil, err
 	}
-	changesRaw, err := WorkspaceWorkingChangesCtx(ctx, dataDir, workspaceID)
-	if err != nil {
-		return nil, err
-	}
-	var changes struct {
-		ChangedFiles   []json.RawMessage `json:"changed_files"`
-		ContractBreaks int               `json:"contract_breaks"`
-		DirtySymbols   []struct {
-			Path            string `json:"path"`
-			Symbol          string `json:"symbol"`
-			ContractBreak   bool   `json:"contract_break"`
-			SignatureChange string `json:"signature_change"`
-		} `json:"dirty_symbols"`
-	}
-	_ = json.Unmarshal(changesRaw, &changes)
-	broken := []string{}
-	for _, s := range changes.DirtySymbols {
-		if s.ContractBreak {
-			broken = append(broken, fmt.Sprintf("%s in %s (%s)", s.Symbol, s.Path, s.SignatureChange))
-		}
-	}
-
-	failed := []string{}
-	if runs, err := ListRuns(dataDir, workspaceID); err == nil {
-		for _, run := range runs {
-			status := strings.ToLower(strings.TrimSpace(run.Status))
-			bad := status == "failed" || status == "error" || status == "cancelled"
-			if run.ExitCode != nil && *run.ExitCode != 0 {
-				bad = true
-			}
-			if bad {
-				failed = append(failed, run.RunID)
-			}
-		}
-	}
-
-	g := &SessionGrounding{
-		WorkspaceID:                  workspaceID,
-		Drift:                        drift,
-		ChangedFiles:                 len(changes.ChangedFiles),
-		DirtySymbols:                 len(changes.DirtySymbols),
-		ContractBreaks:               changes.ContractBreaks,
-		BrokenContracts:              broken,
-		RecentFailedRuns:             failed,
-		BlockedByDirtyState:          len(changes.ChangedFiles) > 0,
-		BlockedByFailingVerification: len(failed) > 0,
-		GeneratedAt:                  time.Now().UTC().Format(time.RFC3339),
-	}
-	// stale verified-memory (drift-on-recall) — memory whose referenced files changed.
-	// Bounded: only the most recent groundStaleWindow baselined memories are hashed,
-	// and the result says whether that covered every one.
-	g.StaleMemory, g.StaleMemoryChecked, g.StaleMemoryTotal, g.StaleMemoryComplete, g.MemoryVerificationModes = boundedStaleMemory(dataDir, workspaceID, groundStaleWindow)
-	g.Summary = fmt.Sprintf("%d changed file(s), %d dirty symbol(s), %d contract break(s), %d failed run(s), %d stale memory.",
-		g.ChangedFiles, g.DirtySymbols, g.ContractBreaks, len(failed), g.StaleMemory)
-	if n := g.MemoryVerificationModes[VerificationSelfAssertedOpen]; n > 0 {
-		g.Summary += fmt.Sprintf(" %d memory self-asserted in open mode (not peer-verified).", n)
-	}
+	g.groundingRuns.build(dataDir, workspaceID)
+	g.BlockedByDirtyState = g.ChangedFiles > 0
+	g.BlockedByFailingVerification = len(g.RecentFailedRuns) > 0
+	g.stampGenerated()
+	g.groundingMemory.build(dataDir, workspaceID)
+	g.summarize()
 	return g, nil
-}
-
-// groundStaleWindow bounds how many promoted memories `ground` drift-checks.
-const groundStaleWindow = 64
-
-// boundedStaleMemory drift-checks at most window promoted memories that carry path
-// baselines, most recently updated first, from content-free metadata. It returns the
-// stale count, how many were checked, the promoted total, whether every baselined
-// memory was checked, and the promoted count per verification mode.
-func boundedStaleMemory(dataDir, workspaceID string, window int) (stale, checked, total int, complete bool, modes map[string]int) {
-	promoted, ok := loadPromotedMetaCached(dataDir, workspaceID)
-	if !ok {
-		var err error
-		if promoted, err = loadPromotedMeta(dataDir, workspaceID); err != nil {
-			return 0, 0, 0, false, nil
-		}
-	}
-	_, threshold := contextDefaults(dataDir)
-	modes = labelVerificationModes(promoted, threshold)
-	sort.SliceStable(promoted, func(a, b int) bool { return promoted[a].UpdatedAt > promoted[b].UpdatedAt })
-	root := contextRoot(dataDir, workspaceID)
-	baselined := 0
-	for i := range promoted {
-		if len(promoted[i].PathHashes) == 0 {
-			continue
-		}
-		baselined++
-		if checked >= window {
-			continue
-		}
-		computeStaleness(root, &promoted[i])
-		checked++
-		if promoted[i].Stale {
-			stale++
-		}
-	}
-	return stale, checked, len(promoted), checked == baselined, modes
 }
