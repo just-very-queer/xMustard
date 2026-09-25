@@ -728,6 +728,7 @@ func semanticMaterializationPathScoreForSurface(relativePath string, surface str
 func semanticIndexPathSelection(repoRoot string, relativePath string, surface string) SemanticIndexPathSelection {
 	var shaValue *string
 	if content, err := os.ReadFile(filepath.Join(repoRoot, filepath.FromSlash(relativePath))); err == nil {
+		noteHashed(len(content))
 		sum := sha256.Sum256(content)
 		value := hex.EncodeToString(sum[:])
 		shaValue = &value

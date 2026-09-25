@@ -3,6 +3,8 @@ package rustcore
 import (
 	"os/exec"
 	"sync"
+
+	"xmustard/api-go/internal/budget"
 )
 
 // activeChildren tracks every started helper child (Rust core, bounded captures,
@@ -13,8 +15,14 @@ var activeChildren = struct {
 	m map[*exec.Cmd]struct{}
 }{m: map[*exec.Cmd]struct{}{}}
 
-// TrackChild registers a started command; call the returned func after Wait.
+// TrackChild registers a started helper command (counted as a helper spawn); call the
+// returned func after Wait.
 func TrackChild(cmd *exec.Cmd) (untrack func()) {
+	budget.NoteSpawn(budget.SpawnHelper)
+	return trackChild(cmd)
+}
+
+func trackChild(cmd *exec.Cmd) (untrack func()) {
 	activeChildren.Lock()
 	activeChildren.m[cmd] = struct{}{}
 	activeChildren.Unlock()
@@ -40,12 +48,14 @@ func KillActiveChildren() int {
 	return len(cmds)
 }
 
-// runTracked starts cmd, tracks it until it exits, and waits for it.
+// runTracked starts a rust-core cmd (counted as a core spawn), tracks it until it
+// exits, and waits for it.
 func runTracked(cmd *exec.Cmd) error {
 	if err := cmd.Start(); err != nil {
 		return err
 	}
-	untrack := TrackChild(cmd)
+	budget.NoteSpawn(budget.SpawnCore)
+	untrack := trackChild(cmd)
 	defer untrack()
 	return cmd.Wait()
 }

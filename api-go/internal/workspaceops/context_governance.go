@@ -125,6 +125,7 @@ func hashFileContent(root, rel string) (string, bool) {
 	if !ok {
 		return "", false
 	}
+	noteHashed(len(data))
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:]), true
 }
