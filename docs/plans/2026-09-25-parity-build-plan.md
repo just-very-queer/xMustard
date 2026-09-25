@@ -664,6 +664,12 @@ No Rust or git spawn happens per hook.
 
 **Collision risk.** lib.rs and bin/xmustard-core.rs are shared with WS-02, WS-07 and WS-41. Use the dispatch table.
 
+**Implementation record (branch parity/ws-25, 2026-09-25).**
+- *Reachability evidence.* `TestEveryCoreSubcommandGoCallsExists` (api-go/internal/rustcore/bridge_test.go) parses api-go's non-test sources from `coreInvocation` outward and finds 34 subcommands and family members. The Makefile calls only `scan-signals` and scripts/ call only `repo-key`, both also Go calls. A dead_code pass with the library compiled into the binary crate found the unreachable items.
+- *Removed.* The `swarm` and `bench` subcommands with swarm.rs and benchmark.rs, and `goalruntime::list_iterations` (only swarm called it). The five `lsp-*` position subcommands with `lsp_session::live_{references,definition,implementation,type_definition,rename}`. `symbolgraph build-lsp` and `flow`. Port-era scaffolding with no caller: `initial_{scanner,repomap,verification}_plan`, `run_migration_verification` and `indexcache::file_hash`. The one-shot hints in worker.go were trimmed to match. Release binary (macOS arm64): 9,420,112 to 9,305,808 bytes; `__text` 2,733,972 to 2,651,752 bytes.
+- *Kept, with no caller.* `semantic-search` / semantic.rs: Go runs ast-grep itself, but WS-37 lists semantic.rs in its files, so the decision is left to WS-37 or the owner. `every_command_has_a_caller` names it as the only exception. `upgrade_graph_with_lsp` and `LspWorkspaceSession` are kept per the goal above. Two Go-side leftovers were not touched: `rustcore.RunLspHover` has no caller of its own, and `goal lint` is never sent by Go (goal becomes platform-only in WS-49).
+- *Tests.* `every_command_has_a_caller` and `subcommands_without_a_caller_stay_removed` (rust-core/src/bin/xmustard-core.rs) fail on the base table and pass after the removal. The Go bridge test fails on the base core (the stale `bench` hint ran the benchmark into its timeout), fails on a wrapper core that refuses `wiki` and `goal status`, and passes on this branch's core.
+
 ### WS-26 — Release hygiene and packaging
 
 **Goal.** Untrack the 80 backend/data runtime files (git rm --cached, human confirms), reconcile .gitignore, add a tagged-release target that builds a prebuilt xmustard-core and the relay, and fix the HEAD-only Homebrew formula.

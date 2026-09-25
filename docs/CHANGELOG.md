@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Removed
+- Unreachable Rust code (WS-25, PAR-RT-08): the `swarm` and `bench` subcommands with `rust-core/src/swarm.rs` and `rust-core/src/benchmark.rs`; the `lsp-references`, `lsp-definition`, `lsp-implementation`, `lsp-type-definition` and `lsp-rename` subcommands with their `lsp_session` functions; the `symbolgraph build-lsp` and `symbolgraph flow` subcommands; and port-era scaffolding with no caller (`initial_*_plan`, `run_migration_verification`, `indexcache::file_hash`). Nothing in api-go, the Makefile or scripts/ called them. `upgrade_graph_with_lsp`, `LspWorkspaceSession`, `wiki.rs` and `goalruntime.rs` stay. `TestEveryCoreSubcommandGoCallsExists` (api-go) checks every subcommand the Go side calls against the built core.
+
 ### Changed
 - Goal logic is now owned solely by the Rust core: `api-go/internal/workspaceops/goals.go` deletes its duplicated implementation (~326 lines) and becomes a thin delivery shim that validates the workspace and delegates create/list/get/iterate/status/ledger/context to `xmustard-core goal` via `rustcore.RunGoalCommand`. One source of truth instead of two parallel implementations; lifecycle + parity tests run the real Rust binary.
 - `docs/RESEARCH_FINDINGS.md` and `docs/RESEARCH_MATRIX.md` now reflect shipped guidance, eval, verification, vulnerability, and Go/Rust migration work instead of treating those lanes as still missing.

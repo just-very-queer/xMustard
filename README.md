@@ -151,7 +151,7 @@ in [architecture](docs/ARCHITECTURE.md).
 ## Repo Layout
 
 - `api-go/`: Go HTTP backend, stdio MCP server, operator CLI, persistence, and Rust bridge
-- `rust-core/`: Rust core — scanner, repo map, verification, diagnostics, lsp, goal/swarm runtime, semantic search
+- `rust-core/`: Rust core — scanner, repo map, verification, diagnostics, lsp, goal runtime, semantic search
 - `backend/`: runtime data (`data/`) and SQL schema (`sql/`) only; the Python FastAPI/Typer stack was retired to `archive/2026-06-16-python-backend/`
 - `frontend/`: React and TypeScript UI surface (proxies `/api` → `:8042`)
 - `integrations/pi/`: version-pinned Pi extension (implementation candidate)
@@ -206,7 +206,7 @@ and the [evidence-gated backlog](docs/ROADMAP.md).
 ## Architecture
 
 - **Rust core** (`rust-core`) — semantic meaning: tree-sitter symbol graph, change
-  tracking/drift, hybrid search, diagnostics, live LSP, the goal/swarm runtime.
+  tracking/drift, hybrid search, diagnostics, live LSP, the goal runtime.
 - **Go shell** (`api-go`) — HTTP API, persistence, auth, and the `xmustard-mcp`
   stdio server; calls the Rust core for the heavy work.
 - **Postgres** — durable semantic and operational index (JSON files remain the
