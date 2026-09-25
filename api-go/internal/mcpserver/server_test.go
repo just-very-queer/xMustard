@@ -13,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"xmustard/api-go/internal/budget"
 )
 
 // fakeAPI is an in-memory Backend: it records every request, serves the workspace
@@ -1158,5 +1160,25 @@ func TestStructuredShapes(t *testing.T) {
 		if !reflect.DeepEqual(got, c.want) {
 			t.Fatalf("%q: got %v, want %v", c.text, got, c.want)
 		}
+	}
+}
+
+// errBackend fails every request with err.
+type errBackend struct{ err error }
+
+func (b errBackend) Do(context.Context, Request) (*APIResponse, error) { return nil, b.err }
+
+// Admission refusal while resolving is a retryable protocol overload, not a tool
+// error; an unreachable API during resolution is a tool error that says so.
+func TestResolutionFailuresKeepTheirKind(t *testing.T) {
+	repo := tempRepo(t)
+	s := newSession(t, errBackend{fmt.Errorf("API GET /api/workspaces: %w", budget.ErrOverloaded)}, Options{Cwd: repo}, nil, "2025-06-18")
+	if _, rerr := call(t, s, "ground", map[string]any{}); rerr == nil || rerr.Code != CodeOverloaded {
+		t.Fatalf("overload during resolution: want -32000, got %v", rerr)
+	}
+	s = newSession(t, errBackend{fmt.Errorf("xmustard API unreachable at http://127.0.0.1:9 (refused)")}, Options{Cwd: repo}, nil, "2025-06-18")
+	res, rerr := call(t, s, "ground", map[string]any{})
+	if rerr != nil || res["isError"] != true || !strings.Contains(text(res), "listing workspaces: xmustard API unreachable") {
+		t.Fatalf("unreachable API during resolution: %v %v", rerr, res)
 	}
 }

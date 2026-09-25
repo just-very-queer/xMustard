@@ -219,7 +219,7 @@ func (s *Session) register(ctx context.Context, repo string) error {
 	body, _ := json.Marshal(map[string]any{"root_path": repo, "auto_scan": true, "prefer_cached_snapshot": true})
 	resp, err := s.srv.opts.Backend.Do(ctx, Request{Method: "POST", Path: "/api/workspaces/load", Body: string(body), Discard: true})
 	if err != nil {
-		return fatalOn(err)
+		return fatalOn(fmt.Errorf("registering git repository %s: %w", repo, err))
 	}
 	if resp.Status >= 400 {
 		return fmt.Errorf("git repository %s is not registered and the API refused to register it (%s: %s)", repo, statusText(resp.Status), clip(resp.Body, 200))
@@ -238,7 +238,7 @@ func (s *Session) listWorkspaces(ctx context.Context, refresh bool) (list []regi
 	}
 	resp, err := s.srv.opts.Backend.Do(ctx, Request{Method: "GET", Path: "/api/workspaces"})
 	if err != nil {
-		return nil, false, fatalOn(err)
+		return nil, false, fatalOn(fmt.Errorf("listing workspaces: %w", err))
 	}
 	if resp.Status != http.StatusOK {
 		return nil, false, fmt.Errorf("listing workspaces failed (%s: %s)", statusText(resp.Status), clip(resp.Body, 200))
