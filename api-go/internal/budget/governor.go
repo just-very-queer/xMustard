@@ -104,6 +104,7 @@ type Governor struct {
 	onRelease  []func()
 	slot       chan struct{}
 
+	smu       sync.Mutex // serializes on-demand sampling (cachedSample)
 	wmu       sync.Mutex
 	last      TreeSample
 	hasLast   bool
@@ -447,18 +448,30 @@ func (g *Governor) Sample() (TreeSample, error) {
 	return s, err
 }
 
+// cachedSample reuses a sample younger than maxAge. Concurrent callers that find none
+// share one new sample instead of each walking the process tree.
 func (g *Governor) cachedSample(maxAge time.Duration) (TreeSample, error) {
-	g.wmu.Lock()
-	if g.hasLast && time.Since(g.last.At) < maxAge {
-		s := g.last
-		g.wmu.Unlock()
-		if !s.Supported {
-			return s, errNoRSSSampler
-		}
-		return s, nil
+	if s, ok, err := g.recentSample(maxAge); ok {
+		return s, err
 	}
-	g.wmu.Unlock()
+	g.smu.Lock()
+	defer g.smu.Unlock()
+	if s, ok, err := g.recentSample(maxAge); ok {
+		return s, err // taken by the caller this one waited for
+	}
 	return g.Sample()
+}
+
+func (g *Governor) recentSample(maxAge time.Duration) (TreeSample, bool, error) {
+	g.wmu.Lock()
+	defer g.wmu.Unlock()
+	if !g.hasLast || time.Since(g.last.At) >= maxAge {
+		return TreeSample{}, false, nil
+	}
+	if !g.last.Supported {
+		return g.last, true, errNoRSSSampler
+	}
+	return g.last, true, nil
 }
 
 // ComponentStatus is one reservation in the health view. UsedBytes is null when unknown.
@@ -543,6 +556,9 @@ type Snapshot struct {
 	Runtime          RuntimeStats      `json:"runtime"`
 	Counters         CounterSnapshot   `json:"counters"`
 }
+
+// SoftCeiling is the soft ceiling heavy admission refuses near.
+func (g *Governor) SoftCeiling() int64 { return g.cfg.SoftCeilingBytes }
 
 // Status is the process-wide governor's snapshot.
 func Status() Snapshot { return Gov.Snapshot() }

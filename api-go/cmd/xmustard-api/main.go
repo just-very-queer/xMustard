@@ -726,7 +726,7 @@ func registerRoutes(mux *http.ServeMux) {
 			// admission counters (bench/diagnostics): bytes xMustard reserved, not RSS
 			"transient_pool": map[string]any{"max": budget.TransientBytes.Max(), "in_use": budget.TransientBytes.InUse(), "peak": budget.TransientBytes.Peak()},
 			"children":       map[string]any{"cap": budget.Children.Cap(), "in_use": budget.Children.InUse(), "peak": budget.Children.Peak()},
-			"budget":         healthBudgetBlock(),
+			"budget":         healthBudgetFor(r),
 		})
 	})
 	mux.HandleFunc("GET /api/runtimes", func(w http.ResponseWriter, r *http.Request) {

@@ -2,8 +2,11 @@ package main
 
 import (
 	"log"
+	"net/http"
+	"strings"
 
 	"xmustard/api-go/internal/budget"
+	"xmustard/api-go/internal/workspaceops"
 )
 
 // healthBudget is the /api/health "budget" block (PAR-OPS-01): per-component reserved
@@ -19,6 +22,45 @@ type healthBudget struct {
 type slotStatus struct {
 	Cap   int `json:"cap"`
 	InUse int `json:"in_use"`
+}
+
+// publicBudget is what an unauthenticated caller sees while authentication is enforced:
+// the static gate and soft ceiling, and nothing about activity.
+type publicBudget struct {
+	Version          int    `json:"version"`
+	GateBytes        int64  `json:"gate_bytes"`
+	SoftCeilingBytes int64  `json:"soft_ceiling_bytes"`
+	Detail           string `json:"detail"`
+}
+
+// healthBudgetFor is the budget block for one /api/health request. Health stays public
+// for liveness probes, but while authentication is enforced (XMUSTARD_AUTH=required, or
+// auto with credentials minted, as on every non-loopback bind) the block needs a valid
+// bearer token: it shows activity (captures, hashed bytes, spawns, live external
+// processes, heavy-slot owner and queue) and each uncached call samples the process
+// tree. Without a token only the gate and the soft ceiling are shown and nothing is
+// sampled.
+func healthBudgetFor(r *http.Request) any {
+	if !healthBudgetVisible(r) {
+		return publicBudget{Version: 1, GateBytes: budget.GateBytes, SoftCeilingBytes: budget.Gov.SoftCeiling(),
+			Detail: "authentication is enforced: send a bearer token for the full budget block"}
+	}
+	return healthBudgetBlock()
+}
+
+// healthBudgetVisible applies the auth middleware's rule (enforce when mode is required
+// or credentials exist) to a route that middleware does not guard.
+func healthBudgetVisible(r *http.Request) bool {
+	mode := strings.ToLower(strings.TrimSpace(envDefault("XMUSTARD_AUTH", "auto")))
+	if mode == "off" {
+		return true
+	}
+	token := ""
+	if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
+		token = strings.TrimPrefix(h, "Bearer ")
+	}
+	principal, configured := workspaceops.ResolveAuth(dataDir(), token)
+	return principal != nil || (mode != "required" && !configured)
 }
 
 func healthBudgetBlock() healthBudget {

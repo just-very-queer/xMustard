@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -487,4 +488,24 @@ func TestOwnTreeSamplerSeesChildren(t *testing.T) {
 		s, err = sampleOwnTree()
 		return err == nil && s.Processes >= self.Processes+1 && s.ChildrenRSSBytes() > 0 && s.ExternalProcesses >= 1 && s.ExternalRSSBytes > 0
 	})
+}
+
+// Concurrent health polls share one process-tree sample instead of each walking the
+// tree (on Linux kernels without CONFIG_PROC_CHILDREN a walk scans all of /proc).
+func TestConcurrentSnapshotsShareOneSample(t *testing.T) {
+	var calls atomic.Int64
+	g := NewGovernor(GovernorConfig{FreeOSMemory: func() {}, Sampler: func() (TreeSample, error) {
+		calls.Add(1)
+		time.Sleep(50 * time.Millisecond)
+		return TreeSample{At: time.Now(), Supported: true, Processes: 1, RSSBytes: 1 << 20}, nil
+	}})
+	var wg sync.WaitGroup
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func() { defer wg.Done(); _ = g.Snapshot() }()
+	}
+	wg.Wait()
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("16 concurrent snapshots took %d samples, want 1", n)
+	}
 }

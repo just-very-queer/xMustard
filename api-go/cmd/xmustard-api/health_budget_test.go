@@ -5,10 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"xmustard/api-go/internal/budget"
+	"xmustard/api-go/internal/workspaceops"
 )
 
 func getHealth(t *testing.T, base string) map[string]any {
@@ -213,5 +216,73 @@ func TestAPIProcessMemoryLimitOnlyWhenGOMEMLIMITUnset(t *testing.T) {
 		}
 		_ = p.cmd.Process.Kill()
 		p.waitExit(t, 10*time.Second)
+	}
+}
+
+// /api/health stays public for liveness probes, but while authentication is enforced
+// its budget block (captures, hashed bytes, spawns, live external processes, heavy-slot
+// owner and queue) is shown only with a valid bearer token. Without one the block has
+// just the gate and the soft ceiling, and polling it never samples the process tree.
+// With no credentials in auto mode (the loopback default) the block stays public.
+func TestHealthBudgetBlockNeedsAuthWhenEnforced(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XMUSTARD_DATA_DIR", dir)
+	var samples atomic.Int64
+	prev := budget.Gov
+	budget.Gov = budget.NewProcessGovernor(budget.GovernorConfig{SoftCeilingBytes: 90 << 20, Sampler: func() (budget.TreeSample, error) {
+		samples.Add(1)
+		return budget.TreeSample{At: time.Now(), Supported: true, Processes: 1, RSSBytes: 1 << 20, SelfRSSBytes: 1 << 20}, nil
+	}})
+	t.Cleanup(func() { budget.Gov = prev })
+	srv := httptest.NewServer(bodyLimitMiddleware(authMiddleware(dir, "auto", newAPIHandler())))
+	defer srv.Close()
+	health := func(token string) map[string]any {
+		t.Helper()
+		req, _ := http.NewRequest("GET", srv.URL+"/api/health", nil)
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		resp, err := testClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var h map[string]any
+		if err := json.NewDecoder(resp.Body).Decode(&h); err != nil || resp.StatusCode != http.StatusOK || h["status"] != "ok" {
+			t.Fatalf("health must stay public: %d %v %v", resp.StatusCode, h, err)
+		}
+		num(t, h, "transient_pool", "max") // the pre-existing public fields stay
+		return dig(t, h, "budget").(map[string]any)
+	}
+	full := func(b map[string]any) bool { _, ok := b["counters"]; return ok }
+
+	t.Setenv("XMUSTARD_AUTH", "auto")
+	if b := health(""); !full(b) {
+		t.Fatalf("auto mode without credentials (open loopback default) shows the block: %v", b)
+	}
+	token, err := workspaceops.MintToken(dir, "agent-a", "agent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, mode := range []string{"auto", "required"} {
+		t.Setenv("XMUSTARD_AUTH", mode)
+		time.Sleep(300 * time.Millisecond) // past the health sample cache
+		before := samples.Load()
+		for _, tok := range []string{"", "not-a-token"} {
+			b := health(tok)
+			if full(b) || len(b) != 4 || num(t, b, "gate_bytes") != float64(budget.GateBytes) || num(t, b, "soft_ceiling_bytes") != 90<<20 || b["detail"] == "" {
+				t.Fatalf("%s mode, token %q: only the gate and soft ceiling may be public: %v", mode, tok, b)
+			}
+		}
+		if samples.Load() != before {
+			t.Fatalf("%s mode: unauthenticated health polls sampled the process tree", mode)
+		}
+		if b := health(token); !full(b) || dig(t, b, "heavy_slot", "capacity") != float64(1) {
+			t.Fatalf("%s mode with a valid token: want the full block, got %v", mode, b)
+		}
+	}
+	t.Setenv("XMUSTARD_AUTH", "off")
+	if b := health(""); !full(b) {
+		t.Fatalf("auth off shows the block: %v", b)
 	}
 }
