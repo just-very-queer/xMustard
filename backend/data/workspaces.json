@@ -8,12 +8,12 @@
     "updated_at": "2026-03-31T11:27:17.852660+00:00"
   },
   {
-    "workspace_id": "co-titan-bug-tracker-a598fad1ac",
-    "name": "xMustard",
-    "root_path": "/Users/for_home/Developer/xMustard",
-    "latest_scan_at": "2026-04-14T04:04:52.989011+00:00",
-    "created_at": "2026-04-14T03:46:23.158088+00:00",
-    "updated_at": "2026-04-14T04:04:52.989019+00:00"
+    "workspace_id": "mustardcopilot-71f90466e7",
+    "name": "MustardCoPilot",
+    "root_path": "/Users/for_home/Developer/mustard_CoPilot/MustardCoPilot/MustardCoPilot",
+    "latest_scan_at": "2026-04-20T18:40:05.079931+00:00",
+    "created_at": "2026-04-20T18:38:56.664338+00:00",
+    "updated_at": "2026-04-20T18:40:05.079949+00:00"
   },
   {
     "workspace_id": "repo-cb6493e598",
@@ -54,5 +54,13 @@
     "latest_scan_at": "2026-03-30T19:20:40.765650+00:00",
     "created_at": "2026-03-30T19:20:37.537367+00:00",
     "updated_at": "2026-03-30T19:20:40.765669+00:00"
+  },
+  {
+    "workspace_id": "co-titan-bug-tracker-a598fad1ac",
+    "name": "xMustard",
+    "root_path": "/Users/for_home/Developer/xMustard",
+    "latest_scan_at": "2026-04-14T04:04:52.989011+00:00",
+    "created_at": "2026-04-14T03:46:23.158088+00:00",
+    "updated_at": "2026-04-14T04:04:52.989019+00:00"
   }
 ]
