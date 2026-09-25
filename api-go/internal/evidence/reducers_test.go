@@ -401,6 +401,9 @@ func TestNineToolProjectionsUnchangedWithoutHook(t *testing.T) {
 // Family reduction is O(window): reducing a 64 MiB original allocates about what a
 // 16 MiB one does (no allocation proportional to the input).
 func TestFamilyReducersUseBoundedMemory(t *testing.T) {
+	if raceEnabled && testing.Short() {
+		t.Skip("allocation bound is not meaningful under -race")
+	}
 	pattern := []byte("=== RUN   TestCase\n--- PASS: TestCase (0.00s)\nsome log line from the test\n")
 	fail := goTestRun(10)
 	for _, fam := range []struct {
@@ -431,7 +434,7 @@ func TestFamilyReducersUseBoundedMemory(t *testing.T) {
 			allocs[i] = after.TotalAlloc - before.TotalAlloc
 		}
 		t.Logf("%s: 8 MiB → %d KiB allocated, 32 MiB → %d KiB", fam.name, allocs[0]>>10, allocs[1]>>10)
-		if allocs[1] > 12<<20 || allocs[1] > allocs[0]*2+(4<<20) {
+		if !raceEnabled && allocs[1] > 12<<20 || allocs[1] > allocs[0]*2+(4<<20) {
 			t.Fatalf("%s: allocation grows with the input: %d → %d bytes", fam.name, allocs[0], allocs[1])
 		}
 	}
@@ -484,11 +487,11 @@ func TestTokenEstimateHeuristic(t *testing.T) {
 		min, max int
 	}{
 		{"", 0, 0},
-		{"Hello, world!", 3, 5},                                               // o200k: 4
+		{"Hello, world!", 3, 5}, // o200k: 4
 		{"The quick brown fox jumps over the lazy dog.", 8, 12},               // o200k: 10
 		{"func main() {\n\tfmt.Println(\"hi\")\n}\n", 10, 18},                 // o200k: 12
 		{"2026-09-25T12:00:00Z ERROR connection refused (retry 3/5)", 14, 30}, // o200k: ~22
-		{"日本語のテキストです", 6, 12},                                              // o200k: ~7
+		{"日本語のテキストです", 6, 12},                                                 // o200k: ~7
 		{strings.Repeat("a", 4000), 900, 1100},                                // runs of letters
 	}
 	for _, c := range cases {
