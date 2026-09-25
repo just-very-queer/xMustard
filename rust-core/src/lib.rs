@@ -8,6 +8,7 @@ pub mod benchmark;
 pub mod changetrack;
 pub mod diagnostics;
 pub mod goalruntime;
+pub mod hashcache;
 pub mod indexcache;
 pub mod lsp;
 pub mod lsp_session;
