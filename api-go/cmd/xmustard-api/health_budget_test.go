@@ -189,20 +189,23 @@ func TestCapturePathsNeverWaitOnHeavySlot(t *testing.T) {
 	}
 }
 
-// PAR-RT-05: the API process sets the Go soft memory limit to the daemon's line only
-// when GOMEMLIMIT is unset, and health reports which applied.
+// PAR-RT-05: the API process sets the Go soft memory limit to the daemon's line, with
+// the GOGC floor, only when GOMEMLIMIT is unset, and health reports which applied.
 func TestAPIProcessMemoryLimitOnlyWhenGOMEMLIMITUnset(t *testing.T) {
 	for _, tc := range []struct {
 		env    string
 		source string
 		limit  float64
+		floor  float64
 	}{
-		{"", "xmustard_default", float64(budget.DefaultMemoryLimitBytes)},
-		{"64MiB", "env", 64 << 20},
+		{"", "xmustard_default", float64(budget.DefaultMemoryLimitBytes), float64(budget.DefaultGOGCFloorPercent)},
+		{"64MiB", "env", 64 << 20, 0},
 	} {
 		p := startAPIProc(t, map[string]string{"XMUSTARD_DATA_DIR": t.TempDir(), "GOMEMLIMIT": tc.env})
 		b := dig(t, getHealth(t, p.base), "budget")
-		if dig(t, b, "runtime", "gomemlimit_source") != tc.source || num(t, b, "runtime", "gomemlimit_bytes") != tc.limit {
+		// an idle API's live heap is far below the line, so the floor has not lifted it
+		if dig(t, b, "runtime", "gomemlimit_source") != tc.source || num(t, b, "runtime", "gomemlimit_bytes") != tc.limit ||
+			num(t, b, "runtime", "gogc_floor_percent") != tc.floor {
 			t.Fatalf("GOMEMLIMIT=%q: runtime %v", tc.env, dig(t, b, "runtime"))
 		}
 		if pool := num(t, b, "transient_pool", "max"); pool != float64(budget.DefaultTransientBudgetBytes) {

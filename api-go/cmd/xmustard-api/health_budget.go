@@ -29,11 +29,11 @@ func healthBudgetBlock() healthBudget {
 	}
 }
 
-// applyRuntimeHygiene sets the Go soft memory limit to the daemon's line unless
-// GOMEMLIMIT was given (PAR-RT-05).
+// applyRuntimeHygiene sets the Go soft memory limit to the daemon's line, with the GOGC
+// floor, unless GOMEMLIMIT was given (PAR-RT-05).
 func applyRuntimeHygiene() {
 	source, limit := budget.ApplyMemoryLimit()
 	s := budget.Status()
-	log.Printf("memory: Go soft limit %d bytes (%s); transient pool %d bytes; heavy slot wait %d ms; tree soft ceiling %d bytes (%s)",
-		limit, source, s.TransientPool.Max, s.HeavySlot.WaitBoundMS, s.SoftCeilingBytes, s.Watchdog.Last.Basis)
+	log.Printf("memory: Go soft limit %d bytes (%s, GOGC floor %d%%); transient pool %d bytes; heavy slot wait %d ms; tree soft ceiling %d bytes (%s)",
+		limit, source, s.Runtime.GOGCFloorPercent, s.TransientPool.Max, s.HeavySlot.WaitBoundMS, s.SoftCeilingBytes, s.Watchdog.Last.Basis)
 }
