@@ -233,10 +233,11 @@ func ReadAllAdmitted(scope *Scope, r io.Reader, max int) ([]byte, error) {
 // ErrTooLarge reports a read that exceeded its per-item cap.
 var ErrTooLarge = errors.New("payload exceeds size limit")
 
-// defaultTransientBudgetBytes keeps the AGGREGATE transient pool well under the 50–100 MB
-// RSS target (the rest of the budget is the base process + caches). Operators may lower
-// it; raising it needs a new resource measurement.
-const defaultTransientBudgetBytes = 64 << 20 // 64 MiB
+// DefaultTransientBudgetBytes is the AGGREGATE transient pool (PAR-RT-04: 16–24 MiB,
+// lowered from 64 MiB, where four 16 MiB captures held the whole pool). It sits inside
+// the Go daemon's share of the 95.4 MiB process-tree gate; heavy work has its own slot
+// (governor.go). Operators may lower it; raising it needs a new resource measurement.
+const DefaultTransientBudgetBytes = 24 << 20 // 24 MiB
 
 // TransientBytes is the process-wide transient-byte pool every large transient allocation
 // reserves against.
@@ -248,7 +249,17 @@ func transientBudgetFromEnv() int64 {
 			return n
 		}
 	}
-	return defaultTransientBudgetBytes
+	return DefaultTransientBudgetBytes
+}
+
+// CapToPool lowers a per-request byte cap to the transient pool's size. A request larger
+// than the whole pool can never be admitted, so it must be refused as too large (413),
+// not as a retryable overload.
+func CapToPool(n int64) int64 {
+	if m := TransientBytes.Max(); m > 0 && n > m {
+		return m
+	}
+	return n
 }
 
 // ChildLimit bounds how many helper children (Rust core, ast-grep, verification

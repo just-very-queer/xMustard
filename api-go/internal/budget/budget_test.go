@@ -40,6 +40,45 @@ func TestByteBudgetBoundsAggregate(t *testing.T) {
 	}
 }
 
+// PAR-RT-04: the default transient pool is 24 MiB (was 64 MiB), deliberately inside
+// the 16–24 MiB range, and it is what an unconfigured process gets.
+func TestDefaultTransientPoolIs24MiB(t *testing.T) {
+	if DefaultTransientBudgetBytes != 24<<20 {
+		t.Fatalf("default transient pool = %d, want 24 MiB", DefaultTransientBudgetBytes)
+	}
+	t.Setenv("XMUSTARD_TRANSIENT_BYTE_BUDGET", "")
+	if got := transientBudgetFromEnv(); got != 24<<20 {
+		t.Fatalf("unconfigured pool = %d, want 24 MiB", got)
+	}
+	t.Setenv("XMUSTARD_TRANSIENT_BYTE_BUDGET", "1048576")
+	if got := transientBudgetFromEnv(); got != 1<<20 {
+		t.Fatalf("operator override ignored: %d", got)
+	}
+	// Four 16 MiB reservations filled the old pool; the new one admits one at a time.
+	b := NewByteBudget(DefaultTransientBudgetBytes)
+	if !b.Acquire(16<<20) || b.Acquire(16<<20) {
+		t.Fatalf("a 24 MiB pool must admit one 16 MiB reservation and refuse a second (in use %d)", b.InUse())
+	}
+}
+
+// A request cap above the pool is lowered to the pool, so a body that can never be
+// admitted is refused as too large instead of as a retryable overload.
+func TestCapToPool(t *testing.T) {
+	prev := TransientBytes
+	defer func() { TransientBytes = prev }()
+	TransientBytes = NewByteBudget(24 << 20)
+	if got := CapToPool(32 << 20); got != 24<<20 {
+		t.Fatalf("32 MiB cap under a 24 MiB pool = %d", got)
+	}
+	if got := CapToPool(1 << 20); got != 1<<20 {
+		t.Fatalf("a cap below the pool must be kept: %d", got)
+	}
+	TransientBytes = NewByteBudget(0)
+	if got := CapToPool(32 << 20); got != 32<<20 {
+		t.Fatalf("an unlimited pool must not lower the cap: %d", got)
+	}
+}
+
 // A Scope holds reservations until Close (idempotent) and refuses, reserving nothing,
 // once the pool is full — there is no unconditional charge path any more.
 func TestScopeEnforcesAndReleasesOnClose(t *testing.T) {

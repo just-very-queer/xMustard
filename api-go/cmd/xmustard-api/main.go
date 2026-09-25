@@ -375,7 +375,7 @@ func inFlightBodyLimit() int {
 const bodyBudgetThreshold = 1 << 20 // 1 MiB
 
 func bodyLimitMiddleware(next http.Handler) http.Handler {
-	limit := maxRequestBodyBytesConfigured()
+	limit := budget.CapToPool(maxRequestBodyBytesConfigured())
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Every request gets a transient-byte ledger held until the handler returns
 		// (deferred, so success, error, cancellation and panic all release it). Rust

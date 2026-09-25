@@ -108,6 +108,8 @@ printf '"}'
 
 // Audit Go #5 (request decode): small bodies were never charged against the pool, so
 // many concurrent sub-threshold requests bypassed admission. Every body is admitted.
+// PAR-RT-04: a body larger than the whole pool can never be admitted, so it is now a
+// permanent 413 rather than a retryable 503 (the body cap is lowered to the pool).
 func TestSmallRequestBodiesAreAdmitted(t *testing.T) {
 	dir := t.TempDir()
 	seedCoreWorkspace(t, dir, "ws")
@@ -118,8 +120,8 @@ func TestSmallRequestBodiesAreAdmitted(t *testing.T) {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusServiceUnavailable {
-		t.Fatalf("300 KiB body under a 256 KiB pool: status %d, want 503", resp.StatusCode)
+	if resp.StatusCode != http.StatusRequestEntityTooLarge || resp.Header.Get("Retry-After") != "" {
+		t.Fatalf("300 KiB body under a 256 KiB pool: status %d Retry-After=%q, want 413 without Retry-After", resp.StatusCode, resp.Header.Get("Retry-After"))
 	}
 	small := `{"content":"fits"}`
 	resp, err = testClient.Post(p.base+"/api/workspaces/ws/context", "application/json", strings.NewReader(small))
