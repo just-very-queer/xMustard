@@ -47,6 +47,7 @@ func main() {
 	if err := validateStartup(cfg); err != nil {
 		log.Fatal(err)
 	}
+	applyRuntimeHygiene()
 	// Every request context derives from baseCtx, which shutdown cancels after the
 	// bounded drain so in-flight helper children end with the API.
 	baseCtx, cancelBase := context.WithCancel(context.Background())
@@ -641,6 +642,7 @@ func registerRoutes(mux *http.ServeMux) {
 			// admission counters (bench/diagnostics): bytes xMustard reserved, not RSS
 			"transient_pool": map[string]any{"max": budget.TransientBytes.Max(), "in_use": budget.TransientBytes.InUse(), "peak": budget.TransientBytes.Peak()},
 			"children":       map[string]any{"cap": budget.Children.Cap(), "in_use": budget.Children.InUse(), "peak": budget.Children.Peak()},
+			"budget":         healthBudgetBlock(),
 		})
 	})
 	mux.HandleFunc("GET /api/runtimes", func(w http.ResponseWriter, r *http.Request) {
