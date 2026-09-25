@@ -2,8 +2,10 @@
 
     python3 -m unittest discover -s scripts/bench -p 'test_*.py'
 
-The live check that v2 reproduces v1 on the 501-file workload runs the real API and core
-for about three minutes; it is skipped unless XMUSTARD_BENCH_LIVE=1.
+Two tests use real inputs and are skipped by default: XMUSTARD_BENCH_LIVE=1 runs the
+frozen 501-file workload against the real API and core (two to three minutes) and checks
+that v2 reproduces v1; XMUSTARD_FIXTURE_TEST=1 fetches the pinned parity fixtures into
+XMUSTARD_FIXTURE_CACHE (or a temporary directory) and verifies them by hash.
 """
 
 import copy
@@ -28,7 +30,7 @@ REPO = os.path.abspath(os.path.join(HERE, "..", ".."))
 LEDGER = v2.load_json(v2.LEDGER_PATH)
 FIXTURES = v2.load_json(v2.FIXTURES_PATH)
 REGISTRY = v2.RoleRegistry(LEDGER["process_roles"])
-HARNESS = 900
+HARNESS_PID = 900
 
 
 def ps(*rows):
@@ -50,7 +52,7 @@ class FakeProbe:
         return self._argv.get(pid)
 
 
-def roots(api=100, shims=(200,), agent=HARNESS):
+def roots(api=100, shims=(200,), agent=HARNESS_PID):
     r = [v2.Root("xmustard-api", api, "go_daemon", "owned")]
     r += [v2.Root(f"xmustard-mcp#{i + 1}", p, "mcp_access", "owned") for i, p in enumerate(shims)]
     if agent:
@@ -67,7 +69,7 @@ class ParseAndAttribution(unittest.TestCase):
             v2.parse_ps("garbage line\n")
 
     def test_owned_children_are_classified_by_role(self):
-        text = ps((HARNESS, 1, 30000, "python3"), (100, HARNESS, 20000, "/b/xmustard-api"), (200, HARNESS, 9000, "/b/xmustard-mcp"),
+        text = ps((HARNESS_PID, 1, 30000, "python3"), (100, HARNESS_PID, 20000, "/b/xmustard-api"), (200, HARNESS_PID, 9000, "/b/xmustard-mcp"),
                   (101, 100, 15000, "/b/xmustard-core"), (102, 100, 4000, "/b/xmustard-core"), (103, 100, 3000, "/usr/bin/git"),
                   (104, 100, 1000, "/opt/x/strange-helper"), (105, 100, 22000, "(xmustard-core)"))
         procs, children = v2.parse_ps(text)
@@ -80,7 +82,7 @@ class ParseAndAttribution(unittest.TestCase):
         self.assertEqual(rows[103][:2], ("git_child", "owned"))
         self.assertEqual(rows[104][:2], ("unclassified:strange-helper", "owned"))  # unknown counts, never silently dropped
         self.assertEqual(rows[105][:2], ("rust_core_per_call", "owned"))  # exited-but-unreaped macOS process
-        self.assertEqual(rows[HARNESS][1], "agent")
+        self.assertEqual(rows[HARNESS_PID][1], "agent")
         tot = v2.snapshot_totals(procs, rows)
         self.assertEqual(tot["gate_kib"], 20000 + 9000 + 15000 + 4000 + 3000 + 1000 + 22000)
         self.assertEqual(tot["agents_kib"], {"bench-harness": 30000})
@@ -101,8 +103,8 @@ class ParseAndAttribution(unittest.TestCase):
         self.assertEqual(tot["externals_kib"], {"runner_command": 54000, "lsp_server": 150000})
 
     def test_agent_launched_xmustard_binaries_count_but_the_agent_does_not(self):
-        text = ps((HARNESS, 1, 30000, "python3"), (100, HARNESS, 20000, "xmustard-api"), (300, HARNESS, 800, "/bin/ps"),
-                  (301, HARNESS, 2000, "/x/xmustard-hook"), (302, 301, 900, "git"), (303, HARNESS, 90000, "go"),
+        text = ps((HARNESS_PID, 1, 30000, "python3"), (100, HARNESS_PID, 20000, "xmustard-api"), (300, HARNESS_PID, 800, "/bin/ps"),
+                  (301, HARNESS_PID, 2000, "/x/xmustard-hook"), (302, 301, 900, "git"), (303, HARNESS_PID, 90000, "go"),
                   (500, 1, 99999, "xmustard-api"))  # another session's API: not ours
         procs, children = v2.parse_ps(text)
         _, rows = v2.attribute(procs, children, roots(shims=()), REGISTRY)

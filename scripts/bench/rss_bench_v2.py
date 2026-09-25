@@ -1216,9 +1216,10 @@ def ledger_reconcile(ledger):
 def ledger_check(ledger, workstream, head, base):
     """Fail when a workstream's measured delta exceeds its ledger line (plus tolerance).
 
-    head/base: {scenario: {"gate_peak_mib": x, "components_p50_mib": {...}}} measured on
-    the same machine. The tree peak delta and the p50 delta of the workstream's process
-    are both checked; a negative line (a saving) must actually be delivered."""
+    head/base: ledger_view() of two reports measured on the same machine. The tree-peak
+    delta and the p50 delta of the workstream's process (footprint when both reports have
+    it, else RSS) are both checked; a negative line (a saving) must actually be delivered.
+    No common valid scenario is a failure."""
     tol = ledger["tolerance"]
     w = ledger["workstreams"].get(workstream)
     if w is None:
