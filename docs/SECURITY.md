@@ -129,6 +129,7 @@ gate and registers any directory.
 | Workspace allowlist | `XMUSTARD_WORKSPACE_ALLOWLIST=ws-a,ws-b` | Other workspace ids answer `403 workspace_not_allowed`. The same rule filters `GET /api/workspaces` and checks `POST /api/workspaces/load` (by the id the root would get) and the terminal routes. |
 | Remote execution | profile | Terminals exist only in the platform profile and need `admin`. |
 | Registration roots | `XMUSTARD_REGISTER_ROOTS=/srv/checkouts:/home/ci/src` (OS path list: `:` on Unix, `;` on Windows) | Where a non-admin token may register a git work tree. Empty (the default) means only `admin` registers. Each entry must be an absolute path and not a filesystem root, or the API stops at startup. See [Workspace registration](#workspace-registration). |
+| Registration limit | `XMUSTARD_REGISTER_LIMIT=50` (the default) | How many workspaces one non-admin principal may register. A load over the limit answers `403 registration_not_allowed`, refusal `register_limit`. Anything but a positive integer stops startup. |
 
 Every `{wildcard}` in a route is checked before the handler runs. Values are read
 from the escaped path and decoded per segment, as `ServeMux` reads them, so an
@@ -161,54 +162,118 @@ turns it off), with the agent's own token. The code is
 
 | Caller | May register |
 |---|---|
-| `admin` token | any directory, as before |
+| `admin` token | any directory, as before (inside its scope when the token is workspace-scoped) |
 | open mode (no credentials), `XMUSTARD_AUTH=off` | any directory, as before |
 | `proposer` token (`agent` included) | the top level of a git work tree that resolves under a directory in `XMUSTARD_REGISTER_ROOTS` |
 | `reader`, `verifier`, `indexer` or `human-approver` token without `proposer` | nothing: `403 missing_role` naming `proposer` |
+
+A workspace-scoped token, `admin` included, registers only a workspace inside its
+scope: a load whose root would get another workspace id answers `403
+registration_not_allowed` with refusal `token_scope`.
 
 For a non-admin token the API checks that:
 
 1. At least one registration root is configured.
 2. `root_path` is absolute.
-3. The path, with symlinks resolved (`EvalSymlinks`), is at or below a registration
-   root, also resolved. A symlink or `..` that leads outside every root is refused.
-   A path that is not lexically inside a root gets the same answer whether or not it
-   exists, so the check does not reveal what lies outside the roots.
+3. The path, with symlinks resolved (`EvalSymlinks`), exists and is at or below a
+   registration root, also resolved. A symlink or `..` that leads outside every
+   root is refused. Every path that fails this check gets one answer,
+   `outside_register_roots`, whether it is missing, lies outside, or leads outside
+   through a symlink planted inside a root, and the answer never names where the
+   path leads. So the check cannot be used to learn whether a path outside the
+   roots exists or where a link points.
 4. No path element is `.git`, before or after symlinks are resolved. This refuses
    `.git` and anything inside it.
-5. The directory holds `.git`: either a directory with `HEAD` and `objects`, or a
-   file that starts with `gitdir: ` (a linked worktree or a submodule). A bare
+5. The directory is the top level of a git work tree whose git directory is inside
+   the same registration root. `.git` is a directory, a symlink, or a file that
+   starts with `gitdir: ` (a linked worktree or a submodule; a relative path is
+   taken from the work tree). It must resolve, inside the root, to a directory with
+   `HEAD`, and `objects` either there or in the directory its `commondir` file names
+   (a linked worktree), which must be inside the root as well. A `.git` leading to a
+   repository elsewhere is refused with one answer, whether that repository exists
+   or not: git follows the pointer, so `ground` and `impact` would otherwise report
+   the other repository's tracked files, `HEAD`, branch and authors. A bare
    repository, a subdirectory of a work tree (the answer names the top level to
    register), a plain directory and a regular file are refused.
-6. The workspace id the path gets passes `XMUSTARD_WORKSPACE_ALLOWLIST`, and a
-   workspace-scoped token registers only a workspace inside its scope.
+6. The workspace id the path gets passes `XMUSTARD_WORKSPACE_ALLOWLIST`. A miss
+   answers `403 workspace_not_allowed`, as it does on every route and for every
+   caller, and is not written to the auth audit log.
+7. The principal has registered fewer than `XMUSTARD_REGISTER_LIMIT` workspaces
+   (default 50). The count is taken under the registry lock, so concurrent loads
+   cannot exceed it. Reloading a workspace that is already registered does not
+   count.
 
-A refusal answers `403` with `reason: "registration_not_allowed"`, a `refusal` code
-(`no_register_roots`, `invalid_path`, `outside_register_roots`, `unresolvable`,
-`git_internals`, `bare_repository`, `not_work_tree_top`, `not_git_work_tree` or
-`token_scope`) and a message that names what to do. The refusal is written to the
-auth audit log as a `denied` event (denied events are throttled to one a second,
-with a count of those suppressed). The MCP shim puts the message in its resolution
-error, so the agent can tell the user that an admin has to register the repository
-or add its parent directory to `XMUSTARD_REGISTER_ROOTS`.
+A refusal of checks 1 to 5 and 7, or of the token scope, answers `403` with
+`reason: "registration_not_allowed"`, a `refusal` code (`no_register_roots`,
+`invalid_path`, `outside_register_roots`, `git_internals`, `bare_repository`,
+`not_work_tree_top`, `not_git_work_tree`, `register_limit` or `token_scope`) and a
+message that names what to do. It is written to the auth audit log as a `denied`
+event (denied events are throttled to one a second, with a count of those
+suppressed). The MCP shim puts the message in its resolution error, so the agent
+can tell the user that an admin has to register the repository or add its parent
+directory to `XMUSTARD_REGISTER_ROOTS`.
 
 When the path is admitted, the API registers the resolved path, not the path as
-sent, so a symlink in the request is never stored and repointed later. A
-non-admin load always prefers the cached snapshot, so it cannot force a rescan of a
-workspace that already has a current snapshot, and it keeps an existing workspace's
-name. `admin` and open-mode loads behave as before.
+sent, so a symlink in the request is never stored and repointed later. A directory
+that is already registered is reused, whatever spelling or link reached it: the
+lookup matches the registered roots by `os.SameFile`, so a case variant on a
+case-insensitive filesystem (macOS, Windows) or a path an admin registered
+through a symlink is the same workspace, not a second one. A non-admin caller
+never decides whether to scan. A new root is registered with its first scan,
+whatever `auto_scan` says. A registered root is served from its cached snapshot,
+or answers `404` when that snapshot is missing, stale or over 25 MiB; only an
+admin load, `POST /api/workspaces/{id}/index` (indexer) or `POST .../scan`
+(platform profile) rescans it. If the first scan fails, the entry stays and one of
+those rescans it. A non-admin load keeps an existing workspace's name. `admin` and
+open-mode loads behave as before.
 
 Every load that creates a registry entry, whoever made it, is recorded in the auth
 audit log (`GET /api/auth/audit`, admin) as a `register` event. The event's `actor`
 is the principal, or `anonymous` in open mode, and its detail names the workspace
 id and root. The detail also says when a non-admin registered it under
-`XMUSTARD_REGISTER_ROOTS`.
+`XMUSTARD_REGISTER_ROOTS`. The log keeps the newest 5000 events, and token
+administration (`mint`, `revoke`, `rotate`) rolls off last: registrations and
+denials are dropped before it, so neither can push an admin's token history out of
+the log.
 
-Choose registration roots that hold only checkouts agents are meant to index, and
-that untrusted users cannot write to. The checks run when the directory is
-registered. A user who can write inside a root could later replace a registered
-directory, or one of its parents, with a symlink to somewhere else, and a later
-rescan would then follow it.
+### A registered root stays checked
+
+The checks above hold when the directory is registered, but an agent can write its
+own checkout, and every work tree nested in it, afterwards. It could register a
+nested directory, then swap that directory (or one of its parents) for a symlink
+to anywhere the API can read, or rewrite its `.git` to point at another
+repository. Reads follow such a swap at once: no rescan is needed.
+
+So the registry entry of a non-admin registration records the registration root
+(`register_root`) and the principal (`registered_by`). Neither changes afterwards,
+whoever reloads the workspace. Every use of that workspace's root, from the
+registry or from its snapshot, re-runs the checks the filesystem can invalidate:
+the root must still resolve to itself, with no element a symlink, and its `.git`
+must still lead to a git repository inside the registration root. When either
+fails, the workspace answers `409` naming the problem, and xMustard reads nothing
+through it (no scan, search, explain, ground, memory anchor or worktree read) until
+the directory is restored. A root an admin or open mode registered is used as
+registered, symlinks included.
+
+Two gaps remain, and both need an agent that can write inside a registered work
+tree or its parent directory:
+
+- The check runs before each use, not inside it. A swap made in the instant
+  between the check and the file read or `git`/`xmustard-core` call that follows
+  can still redirect that one operation. Closing it would need every read to walk
+  from a directory handle opened without following links, which the Rust core and
+  `git` do not do.
+- xMustard runs `git` in registered work trees, and git honours the repository's
+  own configuration and layout: `core.worktree`, `core.fsmonitor`, alternates, and
+  symlinks inside `.git`. An agent that can write a work tree's `.git` can use them
+  whoever registered it; this predates non-admin registration.
+
+Choose registration roots that hold only checkouts agents are meant to index, with
+no directory above a checkout that agents can write. The first gap then needs a
+work tree nested inside an agent's own checkout, which the agent can create and
+register itself. Where an agent must not reach files outside its checkouts through
+xMustard even by that race, leave `XMUSTARD_REGISTER_ROOTS` empty and register
+repositories as admin.
 
 ## Path confinement
 
@@ -236,7 +301,7 @@ whether `XMUSTARD_READ_ONLY=1` still serves the route.
 | `GET /api/auth/whoami` | core | reader | served |  | caller principal, roles and usable tools |
 | `ANY /api/health` | core | reader | served |  | public liveness and budget counters |
 | `GET /api/workspaces` | core | reader | served |  | filtered by token scope and workspace allowlist |
-| `POST /api/workspaces/load` | core | proposer | refused |  | workspace registration; below admin only a git work tree top level under XMUSTARD_REGISTER_ROOTS; id checked against the allowlist |
+| `POST /api/workspaces/load` | core | proposer | refused |  | workspace registration; below admin only a git work tree top level under XMUSTARD_REGISTER_ROOTS; id checked against the allowlist and token scope |
 | `GET /api/workspaces/{workspace_id}/changes/since-index` | core | reader | served | impact |  |
 | `GET /api/workspaces/{workspace_id}/context` | core | admin | served |  | full memory history |
 | `POST /api/workspaces/{workspace_id}/context` | core | proposer | refused | remember | author is the principal |
