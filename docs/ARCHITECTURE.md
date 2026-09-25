@@ -50,6 +50,8 @@ for Git repositories. The default Rust build does not enable `semantic-onnx`.
 | Diagnostics and live language servers | `diagnostics.rs`, `lsp.rs`, `lsp_session.rs`; Go LSP adapters | LSP is optional; transient results do not require Postgres |
 | Verification and retained goal runtime | `verification.rs`, `goalruntime.rs`; Go run control | Process execution, evidence and persisted operational state |
 | Resource accounting | `api-go/internal/budget/` | Shared transient-byte accounting; currently not a complete RSS bound |
+| Tool-argument normalization | `api-go/internal/toolcompat/` | Alias table, per-tool repair, required-field validation, SHA-256 failure signatures, recorded normalizations; remember/verify values are never rewritten. Library only: not yet called by MCP or hooks |
+| Secret redaction | `api-go/internal/redact/` | RE2 token set, key-aware secret fields with entropy and placeholder checks, env values by name, header allow-list, constant-memory streaming, 0600 atomic writes. Library only: no call sites yet |
 | Shared wire models | Go request/record structs, Rust `models.rs`, `frontend/src/lib/types.ts` | Contract changes need matching consumers |
 | Optional operator UI | `frontend/src/` | Full API consumer; outside the current development focus |
 
