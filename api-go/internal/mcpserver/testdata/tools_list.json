@@ -346,6 +346,7 @@
         "properties": {
           "path": {
             "description": "a repo-relative file or directory path",
+            "maxLength": 4096,
             "type": "string"
           },
           "workspace_id": {

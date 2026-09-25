@@ -49,12 +49,28 @@ func (w Workspace) echo() string {
 	return s
 }
 
-// rootsTimeout bounds how long a tool call waits for the client's roots/list answer.
-const rootsTimeout = 5 * time.Second
+const (
+	// rootsTimeout bounds how long a tool call waits for the client's roots/list answer.
+	rootsTimeout = 5 * time.Second
+	// rootsRetryAfter is how long calls skip roots/list after a timed-out one, so a
+	// client that never answers does not cost every call rootsTimeout.
+	rootsRetryAfter = 15 * time.Second
+	// listingMissRefresh is how old the cached listing must be before a workspace id
+	// missing from it triggers a re-read (to learn the root of a new workspace).
+	listingMissRefresh = 10 * time.Second
+	// maxPathCache bounds the per-session cache of resolved roots and working
+	// directories; it is cleared when full.
+	maxPathCache = 32
+)
 
+// rootsState is the session's view of the client's roots. A definitive answer (the
+// roots, an answer with no file roots, or method-not-found) is kept until
+// roots/list_changed; a failed or timed-out request is transient and asked again.
 type rootsState struct {
-	paths []string
-	err   string // why the client's roots are unusable, for the resolution error
+	paths     []string
+	err       string    // why the client's roots are unusable, for the resolution error
+	transient bool      // the request failed; the client's roots are unknown, not absent
+	retryAt   time.Time // transient: roots/list is not asked again before this
 }
 
 type registeredWorkspace struct {
@@ -70,15 +86,7 @@ func (s *Session) resolveWorkspace(ctx context.Context, t *Tool, args map[string
 		pathArg = args[t.PathArg]
 	}
 	bound := func(id, source string) (Workspace, error) {
-		ws := Workspace{ID: id, Source: source}
-		// learn the root only when a path argument needs it (or it is already cached)
-		ws.Root = s.cachedRoot(id)
-		if ws.Root == "" && pathArg != "" {
-			if list, _, err := s.listWorkspaces(ctx, true); err == nil {
-				ws.Root = rootOf(list, id)
-			}
-		}
-		return ws, nil
+		return Workspace{ID: id, Root: s.rootFor(ctx, id), Source: source}, nil
 	}
 	if id := strings.TrimSpace(args["workspace_id"]); id != "" {
 		return bound(id, SourceArgument)
@@ -98,7 +106,7 @@ func (s *Session) resolveWorkspace(ctx context.Context, t *Tool, args map[string
 	if pathArg != "" {
 		// a model-supplied path only selects among registered workspaces; it never
 		// registers (and scans) a repository on its own
-		ws, err := s.byPathSignal(ctx, pathArg, SourcePath, false)
+		ws, err := s.byPathSignal(ctx, pathArg, SourcePath, "a path argument never registers a repository")
 		if err == nil {
 			return ws, nil
 		}
@@ -107,17 +115,17 @@ func (s *Session) resolveWorkspace(ctx context.Context, t *Tool, args map[string
 		}
 		tried = append(tried, fmt.Sprintf("%s %s: %v", t.PathArg, pathArg, err))
 	}
-	roots, rootsWhy := s.clientRoots(ctx)
+	roots, rootsWhy, rootsUnknown := s.clientRoots(ctx)
 	switch {
 	case len(roots) == 1:
-		ws, err := s.byPathSignal(ctx, roots[0], SourceRoots, true)
+		ws, err := s.byPathSignal(ctx, roots[0], SourceRoots, "")
 		if err == nil || isFatal(err) {
 			return ws, err
 		}
 		tried = append(tried, fmt.Sprintf("client root %s: %v", roots[0], err))
 	case len(roots) > 1:
 		if pick := containing(roots, s.srv.opts.Cwd); pick != "" {
-			ws, err := s.byPathSignal(ctx, pick, SourceRoots, true)
+			ws, err := s.byPathSignal(ctx, pick, SourceRoots, "")
 			if err == nil || isFatal(err) {
 				return ws, err
 			}
@@ -128,8 +136,15 @@ func (s *Session) resolveWorkspace(ctx context.Context, t *Tool, args map[string
 	default:
 		tried = append(tried, rootsWhy)
 	}
+	// While the client's roots are unknown (its roots/list failed), the working
+	// directory may still select a registered workspace, but it never registers one:
+	// the roots the client declared may name a different repository.
+	cwdRegister := ""
+	if rootsUnknown {
+		cwdRegister = "not auto-registered while the client's roots are unavailable"
+	}
 	if cwd := s.srv.opts.Cwd; cwd != "" {
-		ws, err := s.byPathSignal(ctx, cwd, SourceCWD, true)
+		ws, err := s.byPathSignal(ctx, cwd, SourceCWD, cwdRegister)
 		if err == nil || isFatal(err) {
 			return ws, err
 		}
@@ -157,9 +172,14 @@ func isFatal(err error) bool {
 
 // byPathSignal maps a filesystem path (a root, the cwd, or an absolute path argument)
 // to the registered workspace that contains it. When none does, the enclosing git
-// repository is registered if mayRegister (roots and cwd are the client's and the
-// operator's statements) and auto-registration is on.
-func (s *Session) byPathSignal(ctx context.Context, p, source string, mayRegister bool) (Workspace, error) {
+// repository is registered if auto-registration is on and noRegister is empty (roots
+// and cwd are the client's and the operator's statements; noRegister says why a
+// signal may not register).
+//
+// Roots and working directories are cached per session. A path argument is not: it
+// is model-supplied, so each one is matched against the cached listing instead of
+// growing resident state.
+func (s *Session) byPathSignal(ctx context.Context, p, source, noRegister string) (Workspace, error) {
 	p = canonicalPath(p)
 	s.mu.Lock()
 	if ws, ok := s.byPath[p]; ok {
@@ -169,7 +189,13 @@ func (s *Session) byPathSignal(ctx context.Context, p, source string, mayRegiste
 	}
 	s.mu.Unlock()
 	remember := func(ws Workspace) Workspace {
+		if source == SourcePath {
+			return ws
+		}
 		s.mu.Lock()
+		if len(s.byPath) >= maxPathCache {
+			clear(s.byPath)
+		}
 		s.byPath[p] = ws
 		s.mu.Unlock()
 		return ws
@@ -192,8 +218,8 @@ func (s *Session) byPathSignal(ctx context.Context, p, source string, mayRegiste
 		return Workspace{}, errors.New("not inside a registered workspace or a git repository")
 	case repo == "/" || (s.srv.opts.HomeDir != "" && repo == canonicalPath(s.srv.opts.HomeDir)):
 		return Workspace{}, fmt.Errorf("git repository %s is not registered, and a home or root directory is never auto-registered", repo)
-	case !mayRegister:
-		return Workspace{}, fmt.Errorf("git repository %s is not registered", repo)
+	case noRegister != "":
+		return Workspace{}, fmt.Errorf("git repository %s is not registered (%s)", repo, noRegister)
 	case !s.srv.opts.AutoRegister:
 		return Workspace{}, fmt.Errorf("git repository %s is not registered (auto-registration is off: XMUSTARD_MCP_AUTO_REGISTER=0)", repo)
 	}
@@ -221,6 +247,9 @@ func (s *Session) register(ctx context.Context, repo string) error {
 	if err != nil {
 		return fatalOn(fmt.Errorf("registering git repository %s: %w", repo, err))
 	}
+	if isOverloadBody(resp.Status, resp.Body) { // admission refusal: retryable, not a verdict
+		return fatalOn(fmt.Errorf("registering git repository %s: %w", repo, budget.ErrOverloaded))
+	}
 	if resp.Status >= 400 {
 		return fmt.Errorf("git repository %s is not registered and the API refused to register it (%s: %s)", repo, statusText(resp.Status), clip(resp.Body, 200))
 	}
@@ -240,6 +269,9 @@ func (s *Session) listWorkspaces(ctx context.Context, refresh bool) (list []regi
 	if err != nil {
 		return nil, false, fatalOn(fmt.Errorf("listing workspaces: %w", err))
 	}
+	if isOverloadBody(resp.Status, resp.Body) {
+		return nil, false, fatalOn(fmt.Errorf("listing workspaces: %w", budget.ErrOverloaded))
+	}
 	if resp.Status != http.StatusOK {
 		return nil, false, fmt.Errorf("listing workspaces failed (%s: %s)", statusText(resp.Status), clip(resp.Body, 200))
 	}
@@ -250,7 +282,7 @@ func (s *Session) listWorkspaces(ctx context.Context, refresh bool) (list []regi
 		list = []registeredWorkspace{}
 	}
 	s.mu.Lock()
-	s.listing = list
+	s.listing, s.listedAt = list, time.Now()
 	s.mu.Unlock()
 	return list, true, nil
 }
@@ -264,10 +296,25 @@ func fatalOn(err error) error {
 	return err
 }
 
-func (s *Session) cachedRoot(id string) string {
+// rootFor returns the registered root of workspace id, so a workspace named by
+// argument or XMUSTARD_WORKSPACE_ID is echoed with its root like any other. It reads
+// the listing when the session has none, or when id is missing from one older than
+// listingMissRefresh. Best effort: a failed read leaves the root unknown, and the
+// call itself reports whether the workspace exists.
+func (s *Session) rootFor(ctx context.Context, id string) string {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	return rootOf(s.listing, id)
+	list, at := s.listing, s.listedAt
+	s.mu.Unlock()
+	if root := rootOf(list, id); root != "" {
+		return root
+	}
+	if list != nil && time.Since(at) < listingMissRefresh {
+		return ""
+	}
+	if list, _, err := s.listWorkspaces(ctx, true); err == nil {
+		return rootOf(list, id)
+	}
+	return ""
 }
 
 func rootOf(list []registeredWorkspace, id string) string {
@@ -279,30 +326,39 @@ func rootOf(list []registeredWorkspace, id string) string {
 	return ""
 }
 
-// clientRoots returns the client's filesystem roots (roots/list), cached until the
-// client reports roots/list_changed, or why there are none.
-func (s *Session) clientRoots(ctx context.Context) ([]string, string) {
+// clientRoots returns the client's filesystem roots (roots/list), or why there are
+// none. unknown reports that the request failed, so the client's roots are unknown
+// rather than absent. Definitive answers are cached until roots/list_changed; a
+// failure is asked again on a later call (after rootsRetryAfter when it timed out).
+func (s *Session) clientRoots(ctx context.Context) (paths []string, why string, unknown bool) {
 	s.mu.Lock()
-	supported, ready, cached := s.rootsCap, s.initialized, s.roots
+	supported, ready, cached, gen := s.rootsCap, s.initialized, s.roots, s.rootsGen
 	s.mu.Unlock()
 	switch {
 	case s.client == nil || !supported:
-		return nil, "the client offers no roots"
+		return nil, "the client offers no roots", false
 	case !ready:
-		return nil, "the client has not finished initialization, so its roots were not requested"
-	case cached != nil:
-		return cached.paths, cached.err
+		return nil, "the client has not finished initialization, so its roots were not requested", false
+	case cached != nil && (!cached.transient || time.Now().Before(cached.retryAt)):
+		return cached.paths, cached.err, cached.transient
 	}
 	rctx, cancel := context.WithTimeout(ctx, rootsTimeout)
 	defer cancel()
 	st := &rootsState{}
 	raw, err := s.client.Request(rctx, "roots/list", map[string]any{})
-	if err != nil {
-		if ctx.Err() != nil {
-			return nil, ctx.Err().Error()
+	var rpcErr *RPCError
+	switch {
+	case err != nil && ctx.Err() != nil:
+		return nil, ctx.Err().Error(), true
+	case err != nil && errors.As(err, &rpcErr) && rpcErr.Code == CodeMethodNotFound:
+		st.err = "the client does not implement roots/list"
+	case err != nil:
+		st.err, st.transient = "roots/list failed: "+err.Error(), true
+		if errors.Is(err, context.DeadlineExceeded) {
+			st.retryAt = time.Now().Add(rootsRetryAfter)
+			st.err += fmt.Sprintf(" (asked again after %s)", rootsRetryAfter)
 		}
-		st.err = "roots/list failed: " + err.Error()
-	} else {
+	default:
 		var r struct {
 			Roots []struct {
 				URI string `json:"uri"`
@@ -321,9 +377,13 @@ func (s *Session) clientRoots(ctx context.Context) ([]string, string) {
 		}
 	}
 	s.mu.Lock()
-	s.roots = st
+	// An answer overtaken by roots/list_changed (or a new initialize) describes roots
+	// the client has since replaced: use it for this call, but do not keep it.
+	if s.rootsGen == gen && (!st.transient || !st.retryAt.IsZero()) {
+		s.roots = st
+	}
 	s.mu.Unlock()
-	return st.paths, st.err
+	return st.paths, st.err, st.transient
 }
 
 // relativizePath rewrites an absolute path argument inside the workspace root to the

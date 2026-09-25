@@ -145,7 +145,7 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
 	{
 		name: "explain",
 		description: "Explain a file or directory: purpose, role, key symbols, and how to run/verify it.",
-		args: [workspaceArg, { name: "path", type: "string", required: true, desc: "a repo-relative file or directory path" }],
+		args: [workspaceArg, { name: "path", type: "string", required: true, maxLength: 4096, desc: "a repo-relative file or directory path" }],
 		build: (a) => ({ method: "GET", path: query(ws(a, "/explain-path"), "path", str(a, "path")) }),
 	},
 	{

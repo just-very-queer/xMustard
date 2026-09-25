@@ -1,11 +1,15 @@
 package mcpserver
 
+// maxPathArg bounds the path argument (PATH_MAX on Linux): it is model-supplied and
+// matched against the registered roots on every call.
+const maxPathArg = 4096
+
 var explainTool = &Tool{
 	Name:        "explain",
 	Description: "Explain a file or directory: purpose, role, key symbols, and how to run/verify it.",
 	Args: []Arg{
 		workspaceArg,
-		{Name: "path", Type: typeString, Required: true, Desc: "a repo-relative file or directory path"},
+		{Name: "path", Type: typeString, Required: true, MaxLen: maxPathArg, Desc: "a repo-relative file or directory path"},
 	},
 	PathArg:     "path",
 	Annotations: Annotations{Title: "Explain a path", ReadOnly: true},

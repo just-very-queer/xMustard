@@ -87,6 +87,10 @@ func TestShimIngressFramesAreAdmitted(t *testing.T) {
 	var mu sync.Mutex
 	forwarded := 0
 	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/workspaces" { // the session's listing (the workspace root echo)
+			_, _ = w.Write([]byte(`[]`))
+			return
+		}
 		mu.Lock()
 		forwarded++
 		mu.Unlock()

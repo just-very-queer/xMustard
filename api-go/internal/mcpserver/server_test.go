@@ -862,9 +862,10 @@ func requiredArgs(tl *Tool) map[string]any {
 	return args
 }
 
-// Every tool resolves an omitted workspace_id from XMUSTARD_WORKSPACE_ID and says so.
+// Every tool resolves an omitted workspace_id from XMUSTARD_WORKSPACE_ID and says so,
+// echoing the workspace's root like any other source.
 func TestEveryToolResolvesWorkspaceFromEnv(t *testing.T) {
-	api := &fakeAPI{}
+	api := &fakeAPI{workspaces: []registeredWorkspace{{ID: "bound-ws", Root: "/r/bound"}, {ID: "explicit", Root: "/r/explicit"}}}
 	env := func(k string) string {
 		if k == "XMUSTARD_WORKSPACE_ID" {
 			return "bound-ws"
@@ -881,18 +882,29 @@ func TestEveryToolResolvesWorkspaceFromEnv(t *testing.T) {
 			t.Fatalf("%s did not use the env workspace: %s", tl.Name, p)
 		}
 		ws := res["_meta"].(map[string]any)["xmustard/workspace"].(Workspace)
-		if ws.ID != "bound-ws" || ws.Source != SourceEnv {
-			t.Fatalf("%s: env resolution not echoed: %+v", tl.Name, ws)
+		if ws.ID != "bound-ws" || ws.Source != SourceEnv || ws.Root != "/r/bound" {
+			t.Fatalf("%s: env resolution not echoed with its root: %+v", tl.Name, ws)
+		}
+		if sc := string(res["structuredContent"].(json.RawMessage)); !strings.Contains(sc, `"workspace":{"workspace_id":"bound-ws","root":"/r/bound","source":"env"}`) {
+			t.Fatalf("%s: structuredContent lacks the workspace root: %s", tl.Name, sc)
 		}
 		// the text echo is paid once per session, not on every call
-		if echoed := strings.Contains(allText(res), "[xmustard workspace] bound-ws, resolved from env"); echoed != (tl.Name == "ground") {
+		if echoed := strings.Contains(allText(res), "[xmustard workspace] bound-ws (/r/bound), resolved from env"); echoed != (tl.Name == "ground") {
 			t.Fatalf("%s: text echo = %v (want it on the first call only)", tl.Name, echoed)
 		}
 	}
-	// an explicit argument wins over the binding and adds no echo line
+	// an explicit argument wins over the binding, adds no echo line, and still reports
+	// its root
 	res, _ := call(t, s, "ground", map[string]any{"workspace_id": "explicit"})
 	if p := api.lastTool(t).Path; p != "/api/workspaces/explicit/session-grounding" || strings.Contains(allText(res), "[xmustard workspace]") {
 		t.Fatalf("explicit workspace_id: %s / %s", p, allText(res))
+	}
+	if ws := res["_meta"].(map[string]any)["xmustard/workspace"].(Workspace); ws.Root != "/r/explicit" || ws.Source != SourceArgument {
+		t.Fatalf("explicit workspace_id: root not reported: %+v", ws)
+	}
+	// the listing that supplies roots is read once per session
+	if n := api.count("GET", "/api/workspaces"); n != 1 {
+		t.Fatalf("listing read %d times", n)
 	}
 }
 
@@ -1169,12 +1181,27 @@ type errBackend struct{ err error }
 func (b errBackend) Do(context.Context, Request) (*APIResponse, error) { return nil, b.err }
 
 // Admission refusal while resolving is a retryable protocol overload, not a tool
-// error; an unreachable API during resolution is a tool error that says so.
+// error, whether the shim's pool or the API refused; an unreachable API during
+// resolution is a tool error that says so.
 func TestResolutionFailuresKeepTheirKind(t *testing.T) {
 	repo := tempRepo(t)
 	s := newSession(t, errBackend{fmt.Errorf("API GET /api/workspaces: %w", budget.ErrOverloaded)}, Options{Cwd: repo}, nil, "2025-06-18")
 	if _, rerr := call(t, s, "ground", map[string]any{}); rerr == nil || rerr.Code != CodeOverloaded {
 		t.Fatalf("overload during resolution: want -32000, got %v", rerr)
+	}
+	// the API's ingress admission answers 503 {"overloaded":true}
+	overloaded := &APIResponse{Status: http.StatusServiceUnavailable, Body: `{"error":"xmustard overloaded: retry shortly","overloaded":true}`}
+	for _, route := range []string{"GET /api/workspaces", "POST /api/workspaces/load"} {
+		api := &fakeAPI{handle: func(r Request) *APIResponse {
+			if r.Method+" "+r.Path == route {
+				return overloaded
+			}
+			return nil
+		}}
+		s = newSession(t, api, Options{Cwd: repo, AutoRegister: true}, nil, "2025-06-18")
+		if res, rerr := call(t, s, "ground", map[string]any{}); rerr == nil || rerr.Code != CodeOverloaded {
+			t.Fatalf("API refused %s: want -32000, got %v %v", route, rerr, res)
+		}
 	}
 	s = newSession(t, errBackend{fmt.Errorf("xmustard API unreachable at http://127.0.0.1:9 (refused)")}, Options{Cwd: repo}, nil, "2025-06-18")
 	res, rerr := call(t, s, "ground", map[string]any{})

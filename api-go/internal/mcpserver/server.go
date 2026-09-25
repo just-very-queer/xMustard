@@ -11,6 +11,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"xmustard/api-go/internal/budget"
 )
@@ -160,9 +161,11 @@ type Session struct {
 	rootsCap    bool   // the client declared the roots capability
 	initialized bool   // notifications/initialized received: server requests allowed
 	roots       *rootsState
+	rootsGen    uint64 // bumped by roots/list_changed and initialize; guards s.roots
 	listing     []registeredWorkspace
-	byPath      map[string]Workspace
-	echoed      map[string]bool // workspace+source pairs already echoed in text
+	listedAt    time.Time
+	byPath      map[string]Workspace // resolved roots and working directories (bounded)
+	echoed      map[string]bool      // workspace+source pairs already echoed in text
 
 	resolving chan struct{} // serializes path-based resolution (it may register)
 }
@@ -219,7 +222,10 @@ func (s *Session) Notify(method string, _ json.RawMessage) {
 	case "notifications/initialized":
 		s.initialized = true
 	case "notifications/roots/list_changed":
+		// a roots/list answer still in flight describes the old roots: the generation
+		// bump keeps it from being cached
 		s.roots = nil
+		s.rootsGen++
 	}
 }
 
@@ -240,6 +246,7 @@ func (s *Session) initialize(params json.RawMessage) (any, *RPCError) {
 	s.version = v
 	s.rootsCap = p.Capabilities.Roots != nil
 	s.roots = nil
+	s.rootsGen++
 	s.mu.Unlock()
 	caps := map[string]any{"tools": map[string]any{}}
 	if s.srv.opts.Resources != nil {
