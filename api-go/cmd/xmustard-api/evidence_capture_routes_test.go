@@ -7,6 +7,9 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -14,6 +17,23 @@ import (
 	"xmustard/api-go/internal/evidence"
 	"xmustard/api-go/internal/workspaceops"
 )
+
+// identityRedactor enables the capture route in tests that are not about redaction;
+// it redacts nothing.
+type identityRedactor struct{ io.Writer }
+
+func (identityRedactor) Flush() error { return nil }
+
+// withCaptureRedactor installs a capture redactor for one test.
+func withCaptureRedactor(t *testing.T, f func(io.Writer) evidence.StreamRedactor) {
+	t.Helper()
+	prev := captureRedactor
+	if f == nil {
+		f = func(w io.Writer) evidence.StreamRedactor { return identityRedactor{w} }
+	}
+	captureRedactor = f
+	t.Cleanup(func() { captureRedactor = prev })
+}
 
 func claudeBashBody(stdout string) string {
 	raw, _ := json.Marshal(stdout)
@@ -37,6 +57,7 @@ func goTestLog(pass int) string {
 // the test family and returned as a schema-matched updatedToolOutput value; the
 // handle then serves pages and search, bound to the capturing principal.
 func TestCaptureRouteClaudeBashAndSearch(t *testing.T) {
+	withCaptureRedactor(t, nil)
 	f := newEvidenceFixture(t, true)
 	alice, _ := workspaceops.MintToken(f.dir, "alice", "agent")
 	bob, _ := workspaceops.MintToken(f.dir, "bob", "agent")
@@ -120,6 +141,7 @@ func TestCaptureRouteStreamsLargeChunkedBody(t *testing.T) {
 	pool := budget.NewByteBudget(8 << 20)
 	budget.TransientBytes = pool
 	defer func() { budget.TransientBytes = prev }()
+	withCaptureRedactor(t, nil)
 	f := newEvidenceFixture(t, true)
 	var stdout strings.Builder
 	for stdout.Len() < 15<<20 {
@@ -157,6 +179,152 @@ func TestCaptureRouteStreamsLargeChunkedBody(t *testing.T) {
 		t.Fatalf("transient pool peak %d (in use after %d): the body was reserved or buffered", pool.Peak(), pool.InUse())
 	}
 	t.Logf("16 MiB chunked capture: pool peak %d KiB", pool.Peak()>>10)
+}
+
+// Capture fails closed without a streaming redactor: originals are retained for the
+// retention window and searchable, so nothing is captured unredacted.
+func TestCaptureRouteRefusesWithoutRedactor(t *testing.T) {
+	prev := captureRedactor
+	captureRedactor = nil
+	t.Cleanup(func() { captureRedactor = prev })
+	f := newEvidenceFixture(t, true)
+	alice, _ := workspaceops.MintToken(f.dir, "alice", "agent")
+	code, b, _ := f.do(t, "POST", "/api/workspaces/"+f.ws+"/evidence/capture?format=claude&client=claude", alice,
+		strings.NewReader(claudeBashBody(goTestLog(4000))), nil)
+	if code != http.StatusServiceUnavailable || !strings.Contains(string(b), "redaction_unavailable") {
+		t.Fatalf("capture without a redactor: %d %s", code, b)
+	}
+	entries, _ := filepath.Glob(filepath.Join(f.dir, "evidence", f.ws, "*"))
+	for _, e := range entries {
+		if fi, err := os.Stat(filepath.Join(e, "raw.bin")); err == nil && fi.Size() > 0 {
+			t.Fatalf("an original was retained: %s", e)
+		}
+	}
+}
+
+// With a redactor wired, a secret in any tool output is neither retained nor
+// searchable through the route.
+func TestCaptureRouteRedactsSecrets(t *testing.T) {
+	const secret = "ghp_0123456789abcdefghijklmnopqrstuvwxyzAB"
+	withCaptureRedactor(t, func(w io.Writer) evidence.StreamRedactor { return &secretRedactor{dst: w, secret: []byte(secret)} })
+	f := newEvidenceFixture(t, true)
+	alice, _ := workspaceops.MintToken(f.dir, "alice", "agent")
+	log := strings.Replace(goTestLog(4000), "got 3, want 4", "got 3, want 4 (token "+secret+")", 1)
+	code, b, _ := f.do(t, "POST", "/api/workspaces/"+f.ws+"/evidence/capture?format=claude&client=claude", alice, strings.NewReader(claudeBashBody(log)), nil)
+	if code != 200 || strings.Contains(string(b), secret) {
+		t.Fatalf("capture: %d (secret in reply: %v)", code, strings.Contains(string(b), secret))
+	}
+	var res evidence.Delivery
+	_ = json.Unmarshal(b, &res)
+	code, b, _ = f.do(t, "GET", "/api/workspaces/"+f.ws+"/evidence/search?handle="+res.Handle+"&query=ghp_", alice, nil, nil)
+	var sr evidence.SearchResult
+	_ = json.Unmarshal(b, &sr)
+	if code != 200 || sr.Matches != 0 {
+		t.Fatalf("the secret is searchable: %d %s", code, b)
+	}
+	code, b, _ = f.do(t, "GET", "/api/workspaces/"+f.ws+"/evidence/search?handle="+res.Handle+"&query=REDACTED", alice, nil, nil)
+	_ = json.Unmarshal(b, &sr)
+	if code != 200 || sr.Matches != 1 {
+		t.Fatalf("the redacted line: %d %s", code, b)
+	}
+}
+
+// secretRedactor replaces one secret. It holds a section's bytes until Flush (the
+// decoder flushes at every section boundary), so a secret split across writes is
+// still seen whole; a test-only simplification of a streaming redactor.
+type secretRedactor struct {
+	dst     io.Writer
+	secret  []byte
+	pending []byte
+}
+
+func (r *secretRedactor) Write(p []byte) (int, error) {
+	r.pending = append(r.pending, p...)
+	return len(p), nil
+}
+
+func (r *secretRedactor) Flush() error {
+	_, err := r.dst.Write(bytes.ReplaceAll(r.pending, r.secret, []byte("[REDACTED]")))
+	r.pending = r.pending[:0]
+	return err
+}
+
+// 100,000 content blocks through the real route: a 200 with a projection within the
+// client target, transient memory admitted by the fixed window, and a small reply.
+func TestCaptureRouteManyContentBlocks(t *testing.T) {
+	withCaptureRedactor(t, nil)
+	prev := budget.TransientBytes
+	pool := budget.NewByteBudget(16 << 20)
+	budget.TransientBytes = pool
+	defer func() { budget.TransientBytes = prev }()
+	f := newEvidenceFixture(t, true)
+	alice, _ := workspaceops.MintToken(f.dir, "alice", "agent")
+	var body strings.Builder
+	body.WriteString(`{"tool_name":"mcp__gh__list_issues","tool_input":{"repo":"x"},"tool_response":[`)
+	for i := 0; i < 100000; i++ {
+		if i > 0 {
+			body.WriteByte(',')
+		}
+		fmt.Fprintf(&body, `{"type":"text","text":"issue #%d: something broke in module %d"}`, i, i%50)
+	}
+	body.WriteString(`]}`)
+	for _, client := range []string{"claude", "codex"} {
+		runtime.GC()
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		code, b, _ := f.do(t, "POST", "/api/workspaces/"+f.ws+"/evidence/capture?format=claude&client="+client, alice, strings.NewReader(body.String()), nil)
+		runtime.ReadMemStats(&after)
+		if code != 200 {
+			t.Fatalf("%s: %d %s", client, code, b[:min(len(b), 300)])
+		}
+		var res struct {
+			evidence.Delivery
+			Shape *evidence.ShapeResult `json:"shape"`
+		}
+		_ = json.Unmarshal(b, &res)
+		t.Logf("%s: %d-byte body, reply %d bytes, projection %d, shape %s, %d KiB allocated (test and server), pool peak %d KiB",
+			client, body.Len(), len(b), len(res.Projection), res.Shape.Mode, (after.TotalAlloc-before.TotalAlloc)>>10, pool.Peak()>>10)
+		if len(res.Projection) > evidence.PolicyFor(client).Target || res.Handle == "" || len(b) > 256<<10 {
+			t.Fatalf("%s: projection %d bytes, reply %d bytes", client, len(res.Projection), len(b))
+		}
+		if alloc := after.TotalAlloc - before.TotalAlloc; alloc > 128<<20 {
+			t.Fatalf("%s: one capture allocated %d bytes", client, alloc)
+		}
+	}
+}
+
+// A hook body past the request cap is a 413, never a malformed body.
+func TestCaptureRouteOversizeHookBodyIs413(t *testing.T) {
+	withCaptureRedactor(t, nil)
+	f := newEvidenceFixture(t, true)
+	alice, _ := workspaceops.MintToken(f.dir, "alice", "agent")
+	head := `{"tool_name":"Bash","tool_input":{"command":"yes"},"tool_response":{"stdout":"`
+	line := strings.Repeat("y\\n", 1<<14)
+	n := (maxRequestBodyBytes+(8<<20))/len(line) + 1
+	pr, pw := io.Pipe()
+	go func() {
+		_, _ = pw.Write([]byte(head))
+		for i := 0; i < n; i++ {
+			if _, err := pw.Write([]byte(line)); err != nil {
+				return
+			}
+		}
+		_, _ = pw.Write([]byte(`"}}`))
+		pw.Close()
+	}()
+	req, _ := http.NewRequest("POST", f.srv.URL+"/api/workspaces/"+f.ws+"/evidence/capture?format=claude&client=claude", pr)
+	req.Header.Set("Authorization", "Bearer "+alice)
+	req.ContentLength = -1
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	pr.Close()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge || strings.Contains(string(b), "bad_body") {
+		t.Fatalf("oversize hook body: %d %s", resp.StatusCode, b)
+	}
 }
 
 func TestCaptureRoutesAreCoreSurface(t *testing.T) {

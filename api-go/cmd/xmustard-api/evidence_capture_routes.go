@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -27,7 +28,23 @@ import (
 // The capture body is streamed to the spool in O(window) memory, so the body-limit
 // middleware caps it without reserving its declared length or buffering a chunked
 // body (streamsRequestBody); the handler reserves a fixed window instead. Capture
-// never takes the heavy slot.
+// never takes the heavy slot. (Security review: this exempts the capture route from
+// the in-flight large-body semaphore; its memory is admitted by the budget instead.)
+//
+// Redaction (PAR-CTX-01 "Redaction applies") is fail-closed: an original is retained
+// for the whole retention window and is searchable, so capture refuses with 503
+// redaction_unavailable until a streaming redactor is wired (captureRedactor; the
+// WS-05 redact.Stream plugs in there). Search stays available for originals that
+// were captured redacted.
+//
+// Route gates (WS-09): these routes take any HandleFunc registrar, so they register
+// on the gated mux unchanged. Their routeGateTable rows are
+//   "POST /api/workspaces/{workspace_id}/evidence/capture": {Core: true, Role: roleProposer, ReadSafe: true, Note: "the caller's own tool output"}
+//   "GET /api/workspaces/{workspace_id}/evidence/search":   coreGate(roleReader, "", "issuer-bound search in an original")
+
+// captureRedactor wraps the capture spool writer with the streaming secret redactor.
+// While it is nil, POST .../evidence/capture refuses (503 redaction_unavailable).
+var captureRedactor func(io.Writer) evidence.StreamRedactor
 
 // captureWindowBytes is the transient memory one capture holds while it decodes and
 // reduces (read/write buffers, reducer windows, one long line).
@@ -45,7 +62,9 @@ func streamsRequestBody(r *http.Request) bool {
 	return ws != "" && r.URL.Path == "/api/workspaces/"+ws+"/evidence/capture"
 }
 
-func registerEvidenceCaptureRoutes(mux *http.ServeMux, store *evidence.Store) {
+func registerEvidenceCaptureRoutes(mux interface {
+	HandleFunc(pattern string, handler func(http.ResponseWriter, *http.Request))
+}, store *evidence.Store) {
 	reg := evidence.DefaultRegistry()
 	formats := map[evidence.HookFormat]bool{evidence.FormatRaw: true}
 	for _, f := range evidence.HookFormats() {
@@ -57,6 +76,12 @@ func registerEvidenceCaptureRoutes(mux *http.ServeMux, store *evidence.Store) {
 	}
 	mux.HandleFunc("POST /api/workspaces/{workspace_id}/evidence/capture", func(w http.ResponseWriter, r *http.Request) {
 		if !requireRole(w, r, "agent") {
+			return
+		}
+		redact := captureRedactor
+		if redact == nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"reason": "redaction_unavailable",
+				"error": "capture is disabled until a streaming secret redactor is configured: captured originals are retained and searchable"})
 			return
 		}
 		q := r.URL.Query()
@@ -107,15 +132,16 @@ func registerEvidenceCaptureRoutes(mux *http.ServeMux, store *evidence.Store) {
 		actor, enforced := principalScope(r)
 		res, err := store.Observe(r.Context(), reg, evidence.ObservationInput{
 			WorkspaceID: ws, RepoScope: workspaceops.WorkspaceRepoScope(dataDir(), ws), Actor: actor, AuthEnforced: enforced,
-			Format: format, Body: r.Body, Meta: meta, Sel: sel,
+			Format: format, Body: r.Body, Meta: meta, Sel: sel, Redact: redact,
 		})
 		if err != nil {
 			writeCaptureError(w, err)
 			return
 		}
-		// the reply encodes the projection and the shaped payload again: admit it
+		// the reply encodes the projection, the shaped payload and the (bounded)
+		// structured projection, facts and omissions again: admit it
 		if scope, owned := budget.ScopeFor(r.Context()); !owned {
-			if err := scope.Acquire(int64(2*len(res.Projection)+2*len(res.Shape.Payload)) + 8192); err != nil {
+			if err := scope.Acquire(int64(2*len(res.Projection)+2*len(res.Shape.Payload)+len(res.Omissions)*96) + 64<<10); err != nil {
 				writeOverloaded(w)
 				return
 			}
@@ -195,6 +221,8 @@ func writeCaptureError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.As(err, &tooBig):
 		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]any{"error": "request body too large", "reason": "too_large"})
+	case errors.Is(err, io.ErrUnexpectedEOF):
+		badCapture(w, "incomplete_body", "the request body ended early")
 	case errors.Is(err, evidence.ErrBadBody):
 		badCapture(w, "bad_body", err.Error())
 	case errors.Is(err, evidence.ErrInvalidSearch):
