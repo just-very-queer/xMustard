@@ -309,8 +309,7 @@ var (
 		"lsp-document-symbols": true, "lsp-hover": true, "lsp-references": true,
 		"lsp-definition": true, "lsp-implementation": true, "lsp-type-definition": true,
 		"lsp-rename": true, "run-verification-command": true, "run-managed-command": true,
-		"run-verification-profile": true, "goal": true, "swarm": true,
-		"semantic-search": true, "bench": true,
+		"run-verification-profile": true, "goal": true, "semantic-search": true,
 	}
 	oneShotFamilies = map[string]map[string]bool{
 		"changetrack": {"index": true},

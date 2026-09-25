@@ -369,7 +369,7 @@ fn whole_repository_builds_are_left_to_one_shot_processes() {
     ] {
         assert!(methods.contains(&json!(name)), "{name} must be resident");
     }
-    for name in ["goal", "swarm", "lsp-hover", "run-managed-command"] {
+    for name in ["goal", "lsp-hover", "run-managed-command"] {
         assert!(!methods.contains(&json!(name)), "{name} must be one-shot");
     }
     assert_eq!(

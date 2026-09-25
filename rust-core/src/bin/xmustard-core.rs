@@ -89,9 +89,7 @@ const COMMANDS: &[Command] = &[
         run_verification_profile,
     ),
     cmd("goal", Residency::OneShot, run_goal_command),
-    cmd("swarm", Residency::OneShot, run_swarm_command),
     cmd("semantic-search", Residency::OneShot, semantic_search),
-    cmd("bench", Residency::OneShot, run_bench_command),
     // Whole-repository work runs one-shot so its transient heap leaves with the process
     // (PAR-RT-02): measured on pi-mono, one `changetrack index` left a serve worker at
     // 36.8 MiB instead of the 24.4 MiB query-only plateau. `symbolgraph build`
@@ -859,97 +857,6 @@ fn goal_fail(err: xmustard_core::goalruntime::GoalError) -> CmdError {
     CmdError::new(goal_exit_code(&err), format!("goal: {err}"))
 }
 
-fn swarm_fail(err: xmustard_core::goalruntime::GoalError) -> CmdError {
-    CmdError::new(goal_exit_code(&err), format!("swarm: {err}"))
-}
-
-/// Dispatch the `swarm` subcommand family: multi-lane orchestration + the
-/// controller gate over a goal.
-fn run_swarm_command(mut args: Args) -> CmdResult {
-    use xmustard_core::swarm;
-
-    let sub = need(
-        &mut args,
-        "xmustard-core swarm <plan|status|gate|record> ...",
-    )?;
-    match sub.as_str() {
-        "plan" | "status" => {
-            let usage = "xmustard-core swarm plan <data_dir> <workspace_id> <goal_id>";
-            let data_dir = need(&mut args, usage)?;
-            let workspace_id = need(&mut args, usage)?;
-            let goal_id = need(&mut args, usage)?;
-            let plan =
-                swarm::plan(Path::new(&data_dir), &workspace_id, &goal_id).map_err(swarm_fail)?;
-            json(&plan)
-        }
-        "gate" => {
-            let usage = "xmustard-core swarm gate <data_dir> <workspace_id> <goal_id>";
-            let data_dir = need(&mut args, usage)?;
-            let workspace_id = need(&mut args, usage)?;
-            let goal_id = need(&mut args, usage)?;
-            let gate =
-                swarm::gate(Path::new(&data_dir), &workspace_id, &goal_id).map_err(swarm_fail)?;
-            json(&gate)
-        }
-        "record" => {
-            let usage = "xmustard-core swarm record <data_dir> <workspace_id> <goal_id> <role> <request_json_path>";
-            let data_dir = need(&mut args, usage)?;
-            let workspace_id = need(&mut args, usage)?;
-            let goal_id = need(&mut args, usage)?;
-            let role_raw = need(&mut args, usage)?;
-            let request_path = need(&mut args, usage)?;
-            let role = swarm::SwarmRole::parse(&role_raw).map_err(swarm_fail)?;
-            let content = fs::read_to_string(&request_path).map_err(|err| {
-                CmdError::failed(format!(
-                    "swarm: failed to read request {request_path}: {err}"
-                ))
-            })?;
-            let request = serde_json::from_str(&content).map_err(|err| {
-                CmdError::failed(format!(
-                    "swarm: failed to decode request {request_path}: {err}"
-                ))
-            })?;
-            let (record, report) =
-                swarm::record_lane(Path::new(&data_dir), &workspace_id, &goal_id, role, request)
-                    .map_err(swarm_fail)?;
-            json(&serde_json::json!({
-                "iteration": record,
-                "slop": report,
-            }))
-        }
-        other => Err(CmdError::new(
-            2,
-            format!("unknown swarm subcommand: {other}"),
-        )),
-    }
-}
-
-/// `bench [iterations]` — run the goal/swarm micro-benchmarks against a scratch
-/// dir (default 1000 iterations) and return a JSON timing report.
-fn run_bench_command(mut args: Args) -> CmdResult {
-    use xmustard_core::benchmark;
-
-    let iterations = args
-        .next()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(1000);
-    let scratch = env::temp_dir().join(format!("xm-bench-{}", std::process::id()));
-    fs::create_dir_all(&scratch).map_err(|err| {
-        CmdError::failed(format!(
-            "bench: failed to create scratch {}: {err}",
-            scratch.display()
-        ))
-    })?;
-    let result = benchmark::run(iterations, &scratch);
-    let _ = fs::remove_dir_all(&scratch);
-    match result {
-        Ok(report) => Ok(Output::Json(
-            serde_json::to_string_pretty(&report).expect("bench report should serialize"),
-        )),
-        Err(err) => Err(CmdError::failed(format!("bench: {err}"))),
-    }
-}
-
 /// `changetrack <fingerprint|index|drift|changed-since|working-changes> ...` —
 /// gitnexus-style repo change tracking.
 fn run_changetrack_command(mut args: Args) -> CmdResult {
@@ -1207,9 +1114,7 @@ mod tests {
             "run-managed-command",
             "run-verification-profile",
             "goal",
-            "swarm",
             "semantic-search",
-            "bench",
         ] {
             let entry = dispatch::find(COMMANDS, name).unwrap();
             assert!(!entry.is_resident(), "{name} must stay one-shot");
@@ -1238,8 +1143,8 @@ mod tests {
     #[test]
     fn handlers_report_usage_instead_of_exiting() {
         // Every handler returns a usage error (never exits the process) when its
-        // required arguments are missing; `bench` takes none and is not called.
-        for entry in COMMANDS.iter().filter(|c| c.name != "bench") {
+        // required arguments are missing.
+        for entry in COMMANDS {
             let err = (entry.run)(Vec::new().into_iter())
                 .expect_err("a handler with no arguments must fail");
             assert_eq!(err.code, 2, "{}: {}", entry.name, err.message);
@@ -1254,7 +1159,7 @@ mod tests {
 
     #[test]
     fn unknown_family_subcommands_fail_with_code_two() {
-        for name in ["symbolgraph", "changetrack", "ownership", "goal", "swarm"] {
+        for name in ["symbolgraph", "changetrack", "ownership", "goal"] {
             let entry = dispatch::find(COMMANDS, name).unwrap();
             let err = (entry.run)(strings(&["nope"]).into_iter()).unwrap_err();
             assert_eq!(err.code, 2);
