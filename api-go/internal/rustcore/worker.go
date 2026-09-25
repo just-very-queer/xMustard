@@ -306,14 +306,13 @@ func (s *workerSupervisor) mayRunResident(key workerKey, sub string, args []stri
 // sending a resident call to the one-shot path.
 var (
 	oneShotOnly = map[string]bool{
-		"lsp-document-symbols": true, "lsp-hover": true, "lsp-references": true,
-		"lsp-definition": true, "lsp-implementation": true, "lsp-type-definition": true,
-		"lsp-rename": true, "run-verification-command": true, "run-managed-command": true,
-		"run-verification-profile": true, "goal": true, "semantic-search": true,
+		"lsp-document-symbols": true, "lsp-hover": true, "run-verification-command": true,
+		"run-managed-command": true, "run-verification-profile": true, "goal": true,
+		"semantic-search": true,
 	}
 	oneShotFamilies = map[string]map[string]bool{
 		"changetrack": {"index": true},
-		"symbolgraph": {"build": true, "build-lsp": true, "blast-radius": true},
+		"symbolgraph": {"build": true, "blast-radius": true},
 	}
 )
 

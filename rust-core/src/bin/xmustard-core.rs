@@ -53,15 +53,6 @@ const COMMANDS: &[Command] = &[
         lsp_document_symbols,
     ),
     cmd("lsp-hover", Residency::OneShot, lsp_hover),
-    cmd("lsp-references", Residency::OneShot, lsp_references),
-    cmd("lsp-definition", Residency::OneShot, lsp_definition),
-    cmd("lsp-implementation", Residency::OneShot, lsp_implementation),
-    cmd(
-        "lsp-type-definition",
-        Residency::OneShot,
-        lsp_type_definition,
-    ),
-    cmd("lsp-rename", Residency::OneShot, lsp_rename),
     cmd(
         "normalize-lsp-workspace-symbols",
         Residency::Resident,
@@ -93,11 +84,10 @@ const COMMANDS: &[Command] = &[
     // Whole-repository work runs one-shot so its transient heap leaves with the process
     // (PAR-RT-02): measured on pi-mono, one `changetrack index` left a serve worker at
     // 36.8 MiB instead of the 24.4 MiB query-only plateau. `symbolgraph build`
-    // rebuilds and prints the full graph; build-lsp also starts language servers;
-    // blast-radius reads every tracked source file on each call and uses no cached
-    // graph, so residency saves it nothing. None of them is on a nine-tool query path.
-    // Queries over the graph (impact, trace, clusters, flow, hotspots, ownership
-    // subsystems) read the shared snapshot and stay resident.
+    // rebuilds and prints the full graph; blast-radius reads every tracked source file
+    // on each call and uses no cached graph, so residency saves it nothing. Neither is
+    // on a nine-tool query path. Queries over the graph (impact, trace, clusters,
+    // hotspots, ownership subsystems) read the shared snapshot and stay resident.
     cmd(
         "changetrack",
         Residency::ResidentExcept(&["index"]),
@@ -105,7 +95,7 @@ const COMMANDS: &[Command] = &[
     ),
     cmd(
         "symbolgraph",
-        Residency::ResidentExcept(&["build", "build-lsp", "blast-radius"]),
+        Residency::ResidentExcept(&["build", "blast-radius"]),
         run_symbolgraph_command,
     ),
     cmd("ownership", Residency::Resident, ownership),
@@ -432,77 +422,6 @@ fn lsp_hover(mut args: Args) -> CmdResult {
             json(&serde_json::json!({"available": false, "reason": msg}))
         }
         Err(err) => Err(CmdError::failed(format!("lsp-hover failed: {err}"))),
-    }
-}
-
-fn lsp_references(args: Args) -> CmdResult {
-    lsp_live("lsp-references", args)
-}
-
-fn lsp_definition(args: Args) -> CmdResult {
-    lsp_live("lsp-definition", args)
-}
-
-fn lsp_implementation(args: Args) -> CmdResult {
-    lsp_live("lsp-implementation", args)
-}
-
-fn lsp_type_definition(args: Args) -> CmdResult {
-    lsp_live("lsp-type-definition", args)
-}
-
-fn lsp_rename(args: Args) -> CmdResult {
-    lsp_live("lsp-rename", args)
-}
-
-/// The live-LSP position queries: `<method> <root> <path> <line> <character>
-/// [<new_name>] [timeout_secs]`.
-fn lsp_live(method: &str, mut args: Args) -> CmdResult {
-    use xmustard_core::lsp_session::{
-        LspSessionError, live_definition, live_implementation, live_references, live_rename,
-        live_type_definition,
-    };
-    let needs_name = method == "lsp-rename";
-    let usage = format!(
-        "xmustard-core {method} <root_path> <relative_path> <line> <character>{} [timeout_secs]",
-        if needs_name { " <new_name>" } else { "" }
-    );
-    let root = need(&mut args, &usage)?;
-    let relative_path = need(&mut args, &usage)?;
-    let line = need(&mut args, &usage)?
-        .parse::<u32>()
-        .map_err(|_| CmdError::usage(&usage))?;
-    let character = need(&mut args, &usage)?
-        .parse::<u32>()
-        .map_err(|_| CmdError::usage(&usage))?;
-    let new_name = if needs_name {
-        need(&mut args, &usage)?
-    } else {
-        String::new()
-    };
-    let timeout = args
-        .next()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(45);
-    let root = PathBuf::from(root);
-    let outcome: Result<serde_json::Value, LspSessionError> = match method {
-        "lsp-references" => live_references(&root, &relative_path, line, character, true, timeout),
-        "lsp-definition" => live_definition(&root, &relative_path, line, character, timeout),
-        "lsp-implementation" => {
-            live_implementation(&root, &relative_path, line, character, timeout)
-        }
-        "lsp-type-definition" => {
-            live_type_definition(&root, &relative_path, line, character, timeout)
-        }
-        "lsp-rename" => live_rename(&root, &relative_path, line, character, &new_name, timeout),
-        other => return Err(CmdError::new(2, format!("unknown command: {other}"))),
-    };
-    match outcome {
-        Ok(result) => json(&result),
-        Err(LspSessionError::Unavailable(msg)) => {
-            json(&serde_json::json!({"available": false, "reason": msg}))
-        }
-        Err(err) => Err(CmdError::failed(format!("{method} failed: {err}"))),
     }
 }
 
@@ -958,17 +877,6 @@ fn run_symbolgraph_command(mut args: Args) -> CmdResult {
             let ws = need(&mut args, usage)?;
             json(&sg::build_symbol_graph(Path::new(&root), &ws))
         }
-        "build-lsp" => {
-            let usage = "xmustard-core symbolgraph build-lsp <root> <workspace_id> [budget]";
-            let root = need(&mut args, usage)?;
-            let ws = need(&mut args, usage)?;
-            let budget = args
-                .next()
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(150);
-            let graph = sg::build_symbol_graph(Path::new(&root), &ws);
-            json(&sg::upgrade_graph_with_lsp(Path::new(&root), graph, budget))
-        }
         "clusters" => {
             let usage = "xmustard-core symbolgraph clusters <root> <workspace_id>";
             let root = need(&mut args, usage)?;
@@ -998,28 +906,6 @@ fn run_symbolgraph_command(mut args: Args) -> CmdResult {
             let to = need(&mut args, usage)?;
             let graph = sg::symbol_graph_for_query(Path::new(&root), &ws);
             json(&sg::trace_symbols(&graph, &from, &to))
-        }
-        "flow" => {
-            let usage = "xmustard-core symbolgraph flow <root> <workspace_id> [path_filter]";
-            let root = need(&mut args, usage)?;
-            let ws = need(&mut args, usage)?;
-            let filter = args.next();
-            let graph = sg::symbol_graph_for_query(Path::new(&root), &ws);
-            let edges: Vec<&sg::GraphEdge> = graph
-                .flow_edges
-                .iter()
-                .filter(|e| {
-                    filter
-                        .as_deref()
-                        .is_none_or(|f| e.from_path.contains(f) || e.to_path.contains(f))
-                })
-                .collect();
-            json(&serde_json::json!({
-                "workspace_id": ws,
-                "flow_edge_count": graph.flow_edge_count,
-                "shown": edges.len(),
-                "flow_edges": edges,
-            }))
         }
         "hotspots" => {
             let usage = "xmustard-core symbolgraph hotspots <root> <workspace_id> [limit]";
@@ -1088,6 +974,85 @@ mod tests {
         ("wiki", &[]),
     ];
 
+    /// Every table command the Go bridge (api-go/internal/rustcore) calls, resident or
+    /// one-shot. The Makefile's `scan-signals` and scripts/e2e's `repo-key` are among
+    /// them. TestEveryCoreSubcommandGoCallsExists finds the Go calls by parsing the Go
+    /// sources and checks each one against the built core.
+    const GO_CALLS: &[&str] = &[
+        "scan-signals",
+        "build-repo-map",
+        "semantic-impact",
+        "path-symbols",
+        "explain-path",
+        "normalize-diagnostics",
+        "archive-diagnostics-payload",
+        "link-diagnostic-symbol",
+        "normalize-lsp-definition",
+        "normalize-lsp-references",
+        "normalize-lsp-document-symbols",
+        "lsp-document-symbols",
+        "lsp-hover",
+        "normalize-lsp-workspace-symbols",
+        "parse-coverage-lcov",
+        "parse-coverage",
+        "run-verification-command",
+        "run-managed-command",
+        "run-verification-profile",
+        "goal",
+        "changetrack",
+        "symbolgraph",
+        "ownership",
+        "search",
+        "repo-key",
+        "wiki",
+    ];
+
+    /// Table commands kept without a caller, with the reason.
+    const KEPT_WITHOUT_CALLER: &[(&str, &str)] = &[(
+        "semantic-search",
+        "WS-37 owns semantic.rs; the Go ast-grep path runs sg itself",
+    )];
+
+    #[test]
+    fn every_command_has_a_caller() {
+        let mut table: Vec<&str> = COMMANDS.iter().map(|c| c.name).collect();
+        let mut expected: Vec<&str> = GO_CALLS
+            .iter()
+            .copied()
+            .chain(KEPT_WITHOUT_CALLER.iter().map(|(name, _)| *name))
+            .collect();
+        table.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(
+            table, expected,
+            "a subcommand nothing calls is unreachable code: remove it, or name its caller"
+        );
+    }
+
+    #[test]
+    fn subcommands_without_a_caller_stay_removed() {
+        // WS-25 removed these: no Go caller, no script caller.
+        for name in [
+            "swarm",
+            "bench",
+            "lsp-references",
+            "lsp-definition",
+            "lsp-implementation",
+            "lsp-type-definition",
+            "lsp-rename",
+        ] {
+            assert!(dispatch::find(COMMANDS, name).is_none(), "{name}");
+        }
+        let sg = dispatch::find(COMMANDS, "symbolgraph").unwrap();
+        for sub in ["build-lsp", "flow"] {
+            let err = (sg.run)(strings(&[sub, "/r", "ws"]).into_iter()).unwrap_err();
+            assert_eq!(
+                err.message,
+                format!("unknown symbolgraph subcommand: {sub}")
+            );
+        }
+    }
+
     #[test]
     fn every_go_worker_call_is_resident() {
         for (name, args) in GO_WORKER_CALLS {
@@ -1105,11 +1070,6 @@ mod tests {
         for name in [
             "lsp-document-symbols",
             "lsp-hover",
-            "lsp-references",
-            "lsp-definition",
-            "lsp-implementation",
-            "lsp-type-definition",
-            "lsp-rename",
             "run-verification-command",
             "run-managed-command",
             "run-verification-profile",
@@ -1120,7 +1080,7 @@ mod tests {
             assert!(!entry.is_resident(), "{name} must stay one-shot");
         }
         let sg = dispatch::find(COMMANDS, "symbolgraph").unwrap();
-        for sub in ["build-lsp", "build", "blast-radius"] {
+        for sub in ["build", "blast-radius"] {
             assert!(!sg.resident_for(&strings(&[sub, "/r", "ws"])), "{sub}");
         }
         let ct = dispatch::find(COMMANDS, "changetrack").unwrap();
