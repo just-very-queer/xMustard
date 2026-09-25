@@ -7,6 +7,7 @@
 pub mod benchmark;
 pub mod changetrack;
 pub mod diagnostics;
+pub mod dispatch;
 pub mod goalruntime;
 pub mod hashcache;
 pub mod indexcache;
