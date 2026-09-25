@@ -474,10 +474,11 @@ async function search(cfg: AdapterConfig, args: ExpandArgs, signal: AbortSignal 
 	if (args.query) params.set("query", args.query);
 	if (args.lines) params.set("lines", args.lines);
 	if (args.max_matches !== undefined) params.set("max_matches", String(Math.trunc(args.max_matches)));
-	if (args.offset !== undefined && args.offset > 0) {
-		params.set("offset", String(Math.trunc(args.offset)));
-		params.set("start_line", String(Math.max(1, Math.trunc(args.start_line ?? 1))));
-	}
+	// a resumed search needs the caller's start_line (the previous result's
+	// next_line): line numbers and lines=A-B are absolute, so no default is guessed
+	// here and the server's 400 surfaces when it is missing
+	if (args.offset !== undefined && args.offset > 0) params.set("offset", String(Math.trunc(args.offset)));
+	if (args.start_line !== undefined) params.set("start_line", String(Math.trunc(args.start_line)));
 	const path = `/api/workspaces/${encodeURIComponent(args.workspace_id)}/evidence/search?${params}`;
 	const res = await send(cfg, { method: "GET", path, timeoutMs: cfg.toolTimeoutMs, signal, maxBytes: MAX_PAGE_RESPONSE });
 	if (res.status >= 400) throw errorFromResponse("GET /evidence/search", res);

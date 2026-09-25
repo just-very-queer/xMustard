@@ -377,6 +377,20 @@ describe("expansion search", () => {
 		assert.equal(r.searchParams.get("query"), "fail");
 		assert.equal(r.searchParams.get("offset"), "400");
 		assert.equal(r.searchParams.get("start_line"), "13");
+		// an offset without start_line is forwarded as is: the server refuses it
+		// rather than the adapter renumbering lines from 1
+		await expand(cfg(), { workspace_id: "w", handle: "xm1.S", pattern: "x", offset: 400 }, undefined);
+		const o = new URL(seen, "http://x");
+		assert.equal(o.searchParams.get("offset"), "400");
+		assert.equal(o.searchParams.get("start_line"), null);
+	});
+	test("a resumed search without start_line surfaces the server's refusal", async () => {
+		handler = (req, res) => {
+			const u = new URL(req.url ?? "", "http://x");
+			res.statusCode = u.searchParams.get("offset") && !u.searchParams.get("start_line") ? 400 : 200;
+			res.end(JSON.stringify({ error: "invalid evidence search: resuming at an offset needs start_line", reason: "invalid_search" }));
+		};
+		await assert.rejects(expand(cfg(), { workspace_id: "w", handle: "xm1.S", query: "x", offset: 10 }, undefined), /evidence\/search/);
 	});
 	test("search refusals are explicit errors", async () => {
 		handler = (_req, res) => {

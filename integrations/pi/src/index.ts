@@ -36,7 +36,7 @@ const ExpandParameters = Type.Object(
 		query: Type.Optional(Type.String({ description: "search for this literal text (case-insensitive)" })),
 		lines: Type.Optional(Type.String({ description: "line range A-B to return (or to search within)" })),
 		max_matches: Type.Optional(Type.Integer({ minimum: 1, maximum: 200, description: "match cap (default 40)" })),
-		start_line: Type.Optional(Type.Integer({ minimum: 1, description: "next_line of a previous search, with offset=next_offset" })),
+		start_line: Type.Optional(Type.Integer({ minimum: 1, description: "next_line of the previous search; required with offset=next_offset to resume it" })),
 	},
 	{ additionalProperties: false },
 );
