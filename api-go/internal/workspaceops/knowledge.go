@@ -21,7 +21,7 @@ func WorkspaceSearch(dataDir, workspaceID, query string, limit int, seed string)
 	return WorkspaceSearchCtx(context.Background(), dataDir, workspaceID, query, limit, seed)
 }
 
-// WorkspaceSearchCtx is the request-scoped variant: cancelling ctx kills its Rust/tool children.
+// WorkspaceSearchCtx is the request-scoped variant: cancelling ctx cancels its Rust/tool work (see rustcore.runCoreCtx).
 func WorkspaceSearchCtx(ctx context.Context, dataDir, workspaceID, query string, limit int, seed string) (json.RawMessage, error) {
 	root, _, err := resolveChangeRoot(dataDir, workspaceID)
 	if err != nil {
@@ -49,7 +49,7 @@ func WorkspaceSearchWithFeedback(dataDir, workspaceID, query, seed string, limit
 	return WorkspaceSearchWithFeedbackCtx(context.Background(), dataDir, workspaceID, query, seed, limit)
 }
 
-// WorkspaceSearchWithFeedbackCtx is the request-scoped variant: cancelling ctx kills its Rust/tool children.
+// WorkspaceSearchWithFeedbackCtx is the request-scoped variant: cancelling ctx cancels its Rust/tool work (see rustcore.runCoreCtx).
 func WorkspaceSearchWithFeedbackCtx(ctx context.Context, dataDir, workspaceID, query, seed string, limit int) (json.RawMessage, error) {
 	raw, err := WorkspaceSearchCtx(ctx, dataDir, workspaceID, query, limit, seed)
 	if err != nil {

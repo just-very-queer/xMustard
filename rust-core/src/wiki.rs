@@ -96,7 +96,7 @@ fn subsystem_fingerprint(
 /// served byte-identical from the page cache. The overview always re-renders (it
 /// reflects global counts/hotspots and is a single small page).
 pub fn generate_wiki(root: &Path, workspace_id: &str) -> RepoWiki {
-    let graph = symbolgraph::build_symbol_graph_cached(root, workspace_id);
+    let graph = symbolgraph::symbol_graph_for_query(root, workspace_id);
     let hotspots = symbolgraph::compute_hotspots(&graph, 15);
 
     // group symbols by file, and files by subsystem (top dir). Sort for a stable

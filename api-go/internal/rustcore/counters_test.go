@@ -16,6 +16,9 @@ import (
 // and count it there, so a generic tracking path can never mislabel a spawn.
 func TestCoreSpawnsAreCountedAtTheirCallSites(t *testing.T) {
 	withPool(t, 64<<20)
+	// the one-shot call sites; with the resident worker on, its start is one more core
+	// spawn (TestWorkerGetsTheCoreEnvironmentAndCountsOneSpawn)
+	t.Setenv("XMUSTARD_CORE_WORKER", "")
 	core := filepath.Join(t.TempDir(), "xmustard-core")
 	if err := os.WriteFile(core, []byte("#!/bin/sh\necho '{}'\n"), 0o755); err != nil {
 		t.Fatal(err)

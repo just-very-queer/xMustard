@@ -509,7 +509,7 @@ func ExplainPath(dataDir string, workspaceID string, relativePath string) (*Code
 	return ExplainPathCtx(context.Background(), dataDir, workspaceID, relativePath)
 }
 
-// ExplainPathCtx is the request-scoped variant: cancelling ctx kills its Rust/tool children.
+// ExplainPathCtx is the request-scoped variant: cancelling ctx cancels its Rust/tool work (see rustcore.runCoreCtx).
 func ExplainPathCtx(ctx context.Context, dataDir string, workspaceID string, relativePath string) (*CodeExplainerResult, error) {
 	snapshot, err := loadSnapshot(dataDir, workspaceID)
 	if err != nil {

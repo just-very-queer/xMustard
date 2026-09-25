@@ -42,12 +42,15 @@ fn subsystem_name(path: &str) -> String {
     )
 }
 
+/// Subsystems (top-level directories) with their size and cohesion. The graph comes
+/// through the shared cache (inside `serve`, the resident snapshot), so this reads an
+/// existing graph instead of rebuilding the whole repository on every call.
 pub fn build_subsystems(root: &Path, workspace_id: &str) -> Vec<Subsystem> {
-    let graph = symbolgraph::build_symbol_graph(root, workspace_id);
+    let graph = symbolgraph::symbol_graph_for_query(root, workspace_id);
     let mut file_to_subsystem: HashMap<String, String> = HashMap::new();
     let mut totals: HashMap<String, (usize, usize, usize, usize)> = HashMap::new(); // file_count, symbol_count, internal, external
 
-    for file in graph.files {
+    for file in &graph.files {
         let subsystem = subsystem_name(&file.path);
         file_to_subsystem.insert(file.path.clone(), subsystem.clone());
         let entry = totals.entry(subsystem).or_insert((0, 0, 0, 0));
@@ -55,7 +58,7 @@ pub fn build_subsystems(root: &Path, workspace_id: &str) -> Vec<Subsystem> {
         entry.1 += file.symbol_count;
     }
 
-    for edge in graph.edges {
+    for edge in &graph.edges {
         let from = file_to_subsystem.get(&edge.from_path);
         let to = file_to_subsystem.get(&edge.to_path);
         match (from, to) {

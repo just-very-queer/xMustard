@@ -8,6 +8,7 @@ use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::repomap;
 
@@ -1284,7 +1285,61 @@ fn analyze_source(rel: &str, bytes: Vec<u8>, identity: String) -> FileFeatures {
 /// cache key is the full source identity (HEAD + NUL-parsed status + dirty and
 /// untracked content hashes), so any content change misses; builders for one scope
 /// are serialized across processes, and a waiter re-checks the cache after the lock.
+/// Inside `xmustard-core serve` the graph for the current identity is also kept in
+/// memory (`serve::GraphSnapshots`), so a warm call skips the disk read and parse.
 pub fn build_symbol_graph_cached(root: &Path, workspace_id: &str) -> SymbolGraph {
+    let cached = cached_graph(root, workspace_id);
+    match cached.resident_work {
+        Some((work, started)) => serve_cached((*cached.graph).clone(), workspace_id, work, started),
+        // unique outside `serve`: unwrapped without a copy.
+        None => Arc::try_unwrap(cached.graph).unwrap_or_else(|g| (*g).clone()),
+    }
+}
+
+/// The symbol graph for read-only queries whose output reports neither per-call index
+/// work nor the graph's workspace id (impact, trace, clusters, flow, wiki). Inside
+/// `serve` a resident snapshot is shared without a copy; otherwise this is
+/// `build_symbol_graph_cached`.
+pub fn symbol_graph_for_query(root: &Path, workspace_id: &str) -> Arc<SymbolGraph> {
+    cached_graph(root, workspace_id).graph
+}
+
+/// `symbol_graph_for_query` plus this call's coverage: the graph's coverage with the
+/// index work this call did. A query that reports coverage (search) uses it instead of
+/// copying a resident snapshot.
+pub fn symbol_graph_with_coverage(
+    root: &Path,
+    workspace_id: &str,
+) -> (Arc<SymbolGraph>, IndexCoverage) {
+    let cached = cached_graph(root, workspace_id);
+    let mut coverage = cached.graph.coverage.clone();
+    if let Some((work, started)) = cached.resident_work {
+        coverage.work = hit_work(&cached.graph, work, started);
+    }
+    (cached.graph, coverage)
+}
+
+struct CachedGraph {
+    graph: Arc<SymbolGraph>,
+    /// Set when `graph` is a resident snapshot served unchanged: this call's work and
+    /// start time. A graph built or loaded by this call already reports its own work.
+    resident_work: Option<(IndexWork, std::time::Instant)>,
+}
+
+impl CachedGraph {
+    fn fresh(graph: SymbolGraph) -> Self {
+        Self::shared(Arc::new(graph))
+    }
+
+    fn shared(graph: Arc<SymbolGraph>) -> Self {
+        Self {
+            graph,
+            resident_work: None,
+        }
+    }
+}
+
+fn cached_graph(root: &Path, workspace_id: &str) -> CachedGraph {
     use crate::indexcache::{LockOutcome, cache_scope, lock_timeout, source_identity};
     let started = std::time::Instant::now();
     let id = source_identity(root);
@@ -1302,7 +1357,7 @@ pub fn build_symbol_graph_cached(root: &Path, workspace_id: &str) -> SymbolGraph
             "source identity does not determine the graph: {}",
             id.graph_bypass_reason().unwrap_or_default()
         );
-        return build_graph(
+        return CachedGraph::fresh(build_graph(
             root,
             workspace_id,
             &id,
@@ -1310,10 +1365,18 @@ pub fn build_symbol_graph_cached(root: &Path, workspace_id: &str) -> SymbolGraph
             false,
             work,
             started,
-        );
+        ));
     };
+    let resident = crate::serve::resident_graphs();
+    if let Some(graph) = resident.and_then(|r| r.get(&id)) {
+        work.graph_cache_detail = "resident snapshot".into();
+        return CachedGraph {
+            graph,
+            resident_work: Some((work, started)),
+        };
+    }
     if let Some(graph) = scope.load_graph(&id.key) {
-        return serve_cached(graph, workspace_id, work, started);
+        return keep_resident(&id, serve_cached(graph, workspace_id, work, started));
     }
     let (lock, outcome) = scope.lock_build(lock_timeout());
     match outcome {
@@ -1339,7 +1402,7 @@ pub fn build_symbol_graph_cached(root: &Path, workspace_id: &str) -> SymbolGraph
         && let Some(graph) = scope.load_graph(&id.key)
     {
         // another process built this snapshot while we waited.
-        return serve_cached(graph, workspace_id, work, started);
+        return keep_resident(&id, serve_cached(graph, workspace_id, work, started));
     }
     let store = lock.is_some();
     if !store {
@@ -1350,22 +1413,41 @@ pub fn build_symbol_graph_cached(root: &Path, workspace_id: &str) -> SymbolGraph
     }
     let graph = build_graph(root, workspace_id, &id, Some(&scope), store, work, started);
     drop(lock);
-    graph
+    if graph.coverage.work.graph_cache == "miss" {
+        // stored for this identity: the same graph a later disk hit would load.
+        keep_resident(&id, graph)
+    } else {
+        CachedGraph::fresh(graph)
+    }
+}
+
+/// Keep `graph` (the disk cache's graph for `id`) resident when serving.
+fn keep_resident(id: &crate::indexcache::SourceIdentity, graph: SymbolGraph) -> CachedGraph {
+    let graph = Arc::new(graph);
+    if let Some(resident) = crate::serve::resident_graphs() {
+        resident.put(id, graph.clone());
+    }
+    CachedGraph::shared(graph)
 }
 
 fn serve_cached(
     mut graph: SymbolGraph,
     workspace_id: &str,
-    mut work: IndexWork,
+    work: IndexWork,
     started: std::time::Instant,
 ) -> SymbolGraph {
+    graph.coverage.work = hit_work(&graph, work, started);
+    graph.workspace_id = workspace_id.to_string();
+    graph
+}
+
+/// This call's work when it served `graph` from a cache.
+fn hit_work(graph: &SymbolGraph, mut work: IndexWork, started: std::time::Instant) -> IndexWork {
     work.graph_cache = "hit".into();
     work.symbols_indexed = graph.symbols.len();
     work.coverage_losses = graph.coverage.loss_counts.values().sum();
     work.elapsed_ms = started.elapsed().as_millis() as u64;
-    graph.workspace_id = workspace_id.to_string();
-    graph.coverage.work = work;
-    graph
+    work
 }
 
 /// Build the symbol graph over tracked source files without consulting the graph
