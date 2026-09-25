@@ -146,14 +146,14 @@ func (t *txn) insertEvent(ctx context.Context, actor Actor, ev eventRow) (int64,
 }
 
 // AppendEvent appends a caller-authored event. An entry event must name an existing
-// entry, and its workspace comes from that entry.
+// entry that is not purged, and its workspace comes from that entry.
 func (t *txn) AppendEvent(ctx context.Context, in EventInput, actor Actor) (Event, error) {
 	if err := actor.validate(); err != nil {
 		return Event{}, err
 	}
 	ws := in.WorkspaceID
 	if in.EntryID != "" {
-		e, err := t.GetEntry(ctx, in.EntryID)
+		e, err := t.liveEntry(ctx, in.EntryID)
 		if err != nil {
 			return Event{}, err
 		}

@@ -245,7 +245,7 @@ func TestPragmas(t *testing.T) {
 	check(s.writer, "busy_timeout", int64(DefaultBusyTimeout.Milliseconds()))
 	check(s.writer, "foreign_keys", int64(1))
 	check(s.writer, "temp_store", int64(1))
-	check(s.writer, "secure_delete", int64(2))
+	check(s.writer, "secure_delete", int64(1)) // ON: freed pages are zeroed
 	check(s.writer, "auto_vacuum", int64(2))
 	// readers
 	check(s.readers, "journal_mode", "wal")
@@ -911,6 +911,117 @@ func TestLifecycleSupersedeRetractMergeExpiryPurge(t *testing.T) {
 	}
 }
 
+// Purge removes the text from the database file itself, not just from query results:
+// small text in b-tree cells, large text in overflow pages, the search index segments
+// and a backup taken afterwards.
+func TestPurgeLeavesNoTextOnDisk(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t, newClock())
+	// FTS5 stores each index term prefix-compressed against its neighbour, so the file
+	// is searched for the tail of each secret token, which no other term shares.
+	const small, big = "qqzsmallsecretzz", "wwxbigsecretzz"
+	tails := []string{small[3:], big[3:], "filler text filler"}
+	filler := strings.Repeat("filler text ", 2000) // ~24 KiB: overflow pages
+	propose(t, s, "p_small", "creds", "the token is "+small, "ops/"+small+".env")
+	propose(t, s, "p_big", "dump "+big, big+" "+filler)
+	for i := range 40 { // other rows share the index segments
+		propose(t, s, fmt.Sprintf("keep_%d", i), "kept", fmt.Sprintf("unrelated memory %d about deploys", i))
+	}
+	mustUpdate(t, s, func(tx Tx) error {
+		if _, err := tx.RecordVote(ctx, VoteInput{EntryID: "p_small", Verdict: VerdictApprove, Note: "confirmed " + small}, bob); err != nil {
+			return err
+		}
+		_, err := tx.AppendRevision(ctx, RevisionInput{EntryID: "p_big", BaseRevision: 1, Op: "edit",
+			Content: big + " v2 " + filler, Reason: "reworded " + big}, carol)
+		return err
+	})
+	if err := s.Checkpoint(ctx); err != nil { // the secrets are in the main file now
+		t.Fatal(err)
+	}
+	mustUpdate(t, s, func(tx Tx) error {
+		if err := tx.Purge(ctx, "p_small", "credential", Actor{Principal: "admin"}); err != nil {
+			return err
+		}
+		return tx.Purge(ctx, "p_big", "pasted a dump", Actor{Principal: "admin"})
+	})
+	if hits, _ := s.SearchMemories(ctx, MemoryQuery{WorkspaceID: "ws1", Text: "deploys"}); len(hits) != 40 {
+		t.Fatalf("purge's index rewrite lost other entries: %d hits", len(hits))
+	}
+	if err := s.Checkpoint(ctx); err != nil {
+		t.Fatal(err)
+	}
+	backup := filepath.Join(t.TempDir(), "after-purge.db")
+	if err := s.Backup(ctx, backup); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range []string{s.Path(), s.Path() + "-wal", backup} {
+		raw, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, marker := range tails {
+			if n := strings.Count(string(raw), marker); n > 0 {
+				t.Errorf("%s still holds %q %d times after purge and checkpoint", filepath.Base(f), marker, n)
+			}
+		}
+	}
+}
+
+// After a purge nothing can attach free text to the entry again, and nothing is left
+// pending on it.
+func TestPurgedEntryTakesNoNewText(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t, newClock())
+	propose(t, s, "p", "t", "the secret is hunter2")
+	propose(t, s, "other", "t", "unrelated")
+	mustUpdate(t, s, func(tx Tx) error {
+		_, err := tx.AppendRevision(ctx, RevisionInput{EntryID: "p", BaseRevision: 1, Op: "edit", Content: "still hunter2"}, bob)
+		return err
+	})
+	mustUpdate(t, s, func(tx Tx) error { return tx.Purge(ctx, "p", "credential", Actor{Principal: "admin"}) })
+	if rv, _ := s.GetRevision(ctx, "p", 2); rv.State != RevisionWithdrawn || !rv.ContentDropped {
+		t.Fatalf("pending revision after purge = %+v", rv)
+	}
+	if e, _ := s.GetEntry(ctx, "p"); e.HeadRevision != e.Revision {
+		t.Fatalf("purged entry still has a live head: %+v", e)
+	}
+	for name, write := range map[string]func(Tx) error{
+		"reject revision": func(tx Tx) error {
+			_, err := tx.RejectRevision(ctx, "p", 2, "leaking the secret again: hunter2", carol)
+			return err
+		},
+		"append event": func(tx Tx) error {
+			_, err := tx.AppendEvent(ctx, EventInput{EntryID: "p", Type: EventNote, Note: "hunter2"}, carol)
+			return err
+		},
+		"set promotion": func(tx Tx) error {
+			_, err := tx.SetPromotion(ctx, "p", Promotion{Status: StatusRejected}, Actor{Principal: "carol", Note: "hunter2"})
+			return err
+		},
+		"relation": func(tx Tx) error {
+			return tx.AddRelation(ctx, "p", "other", RelationRefines, Actor{Principal: "carol", Note: "hunter2"})
+		},
+	} {
+		if err := s.Update(ctx, write); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("%s on a purged entry: %v", name, err)
+		}
+	}
+	// The schema refuses it for raw writers too; the purge event itself was allowed.
+	if err := rawExec(t, s.Path(), "INSERT INTO events (workspace_id, entry_id, type, note, at) "+
+		"VALUES ('ws1', 'p', 'note', 'hunter2', '2026-01-01T00:00:00.000000000Z')"); err == nil {
+		t.Fatal("raw writer attached a note to a purged entry")
+	}
+	evs, _ := s.ListEvents(ctx, EventFilter{EntryID: "p"})
+	for _, ev := range evs {
+		if strings.Contains(ev.Note, "hunter2") || strings.Contains(string(ev.Data), "hunter2") {
+			t.Fatalf("free text on a purged entry: %+v", ev)
+		}
+	}
+	if last := evs[len(evs)-1]; last.Type != EventPurge || last.Note != "credential" {
+		t.Fatalf("last event = %+v", last)
+	}
+}
+
 func TestAnchorsBaselinesAndDrift(t *testing.T) {
 	ctx := context.Background()
 	s := openTestStore(t, newClock())
@@ -1333,14 +1444,14 @@ func TestRetentionIsBoundedAndKeepsTombstones(t *testing.T) {
 	clk := newClock()
 	s := openTestStore(t, clk)
 	agent := Actor{Principal: "agent-1", SessionID: "old-sess"}
-	propose(t, s, "r1", "t", "version one")
+	propose(t, s, "r1", "t", "version one jjqoldrevisionzz")
 	mustUpdate(t, s, func(tx Tx) error {
 		if _, err := tx.UpsertSession(ctx, SessionInput{ID: "old-sess", WorkspaceID: "ws1"}, agent); err != nil {
 			return err
 		}
 		for i := range 7 {
 			if _, err := tx.AppendSessionEvent(ctx, SessionEventInput{SessionID: "old-sess", Kind: "prompt",
-				Body: "old prompt about retention " + string(rune('a'+i))}, agent); err != nil {
+				Body: "old prompt about retention jjqtranscriptsecretzz " + string(rune('a'+i))}, agent); err != nil {
 				return err
 			}
 		}
@@ -1376,9 +1487,20 @@ func TestRetentionIsBoundedAndKeepsTombstones(t *testing.T) {
 	if hits, _ := s.SearchTranscripts(ctx, TranscriptQuery{WorkspaceID: "ws1", Text: "keep"}); len(hits) != 1 {
 		t.Fatalf("keep-class row lost: %+v", hits)
 	}
+	// With Vacuum the removed text also leaves the file: the search indexes are rewritten
+	// (a contentless FTS5 delete only tombstones) and freed pages are zeroed.
+	raw, err := os.ReadFile(s.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tail := range []string{"transcriptsecretzz", "oldrevisionzz"} {
+		if strings.Contains(string(raw), tail) {
+			t.Errorf("retention with Vacuum left %q in the database file", tail)
+		}
+	}
 	rv1, _ := s.GetRevision(ctx, "r1", 1)
 	rv2, _ := s.GetRevision(ctx, "r1", 2)
-	if !rv1.ContentDropped || rv1.ContentDigest != Digest("version one") || rv1.ContentDroppedReason != "retention" || rv2.Content != "version two" {
+	if !rv1.ContentDropped || rv1.ContentDigest != Digest("version one jjqoldrevisionzz") || rv1.ContentDroppedReason != "retention" || rv2.Content != "version two" {
 		t.Fatalf("revision retention: %+v / %+v", rv1, rv2)
 	}
 	if n := countRows(t, s, "SELECT count(*) FROM events"); n != eventsBefore {

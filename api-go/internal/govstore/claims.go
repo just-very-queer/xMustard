@@ -263,6 +263,9 @@ func (t *txn) addRelation(ctx context.Context, fromID, toID, kind string, actor 
 	if from.WorkspaceID != to.WorkspaceID {
 		return fmt.Errorf("%w: %s and %s are in different workspaces", ErrInvalid, fromID, toID)
 	}
+	if from.Lifecycle == LifecyclePurged || to.Lifecycle == LifecyclePurged {
+		return fmt.Errorf("%w: a purged entry takes no new relations", ErrInvalid)
+	}
 	res, err := t.exec(ctx, `INSERT INTO relations (from_id, to_id, kind, principal, created_at) VALUES (?, ?, ?, ?, ?)
 		ON CONFLICT (from_id, to_id, kind) DO NOTHING`, fromID, toID, kind, strings.TrimSpace(actor.Principal), t.nowText())
 	if err != nil {

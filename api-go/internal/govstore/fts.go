@@ -110,6 +110,16 @@ func (t *txn) ftsDelete(ctx context.Context, pk int64) error {
 	return nil
 }
 
+// ftsOptimize merges every memory_fts segment into one. A contentless_delete table
+// deletes by tombstone, so a deleted row's terms stay in the segment blobs until a
+// merge rewrites them; purge needs them gone from the file, not just unmatched.
+func (t *txn) ftsOptimize(ctx context.Context) error {
+	if _, err := t.exec(ctx, "INSERT INTO memory_fts (memory_fts) VALUES ('optimize')"); err != nil {
+		return fmt.Errorf("optimize memory index: %w", err)
+	}
+	return nil
+}
+
 // refreshFTS re-indexes an entry from its served revision and anchors. Purged entries
 // stay out of the index.
 func (t *txn) refreshFTS(ctx context.Context, entryID string) error {

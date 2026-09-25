@@ -550,7 +550,7 @@ func (t *txn) SetPromotion(ctx context.Context, id string, p Promotion, actor Ac
 	case !p.Promoted && (p.VerificationMode != "" || p.Status == StatusVerified):
 		return Entry{}, fmt.Errorf("%w: an unpromoted entry has no verification mode and is not verified", ErrInvalid)
 	}
-	cur, err := t.GetEntry(ctx, id)
+	cur, err := t.liveEntry(ctx, id)
 	if err != nil {
 		return Entry{}, err
 	}
@@ -800,10 +800,19 @@ func (t *txn) SetClassification(ctx context.Context, id string, c Classification
 
 // Purge hard-deletes an entry's text: every revision's content, title, description
 // and edit reason, vote and outcome notes, anchors, claims, the search row, and the
-// free text of its events. What remains is a tombstone: the entry id, its lifecycle,
-// the digests of every revision, and the event skeleton ending in a purge event.
-// Purge is idempotent. The writer runs with secure_delete=FAST; call Checkpoint
-// afterwards to also flush the old pages out of the WAL.
+// free text of its events. Pending revisions are withdrawn. What remains is a
+// tombstone: the entry id, its lifecycle, the digests of every revision, and the event
+// skeleton ending in a purge event, whose note is the purge reason. Nothing can attach
+// free text to the entry afterwards.
+//
+// The text also leaves the database file. The writer runs with secure_delete=ON, so
+// the pages the purge frees (large content lives in overflow pages) are zeroed, and
+// the search index is rewritten with 'optimize': a contentless FTS5 delete only
+// tombstones the row, leaving its terms in the index segments. The optimize costs a
+// rewrite of the memory index, which is acceptable for a rare administrative purge.
+// Until a Checkpoint the old page images stay in the database file and the WAL still
+// holds the new ones, so call Checkpoint after the Update commits. Backups taken
+// before the purge still hold the text. Purge is idempotent.
 func (t *txn) Purge(ctx context.Context, id, reason string, actor Actor) error {
 	if err := actor.validate(); err != nil {
 		return err
@@ -823,12 +832,14 @@ func (t *txn) Purge(ctx context.Context, id, reason string, actor Actor) error {
 		{`UPDATE entries SET lifecycle = 'purged', promoted = 0, verification_mode = '',
 			status = CASE WHEN status = 'verified' THEN 'pending' ELSE status END,
 			title = '', description = '', topic = '', tags = '[]', metadata = '{}', search_tokens = '[]',
-			needs_reverify = 0, stale_since = NULL, updated_at = ?,
+			needs_reverify = 0, stale_since = NULL, head_revision = revision, updated_at = ?,
 			invalidated_at = coalesce(invalidated_at, ?), expired_at = coalesce(expired_at, ?) WHERE id = ?`,
 			[]any{now, now, now, id}},
 		{`UPDATE revisions SET content = NULL, title = '', description = '', reason = '',
+			state = CASE WHEN state = 'pending' THEN 'withdrawn' ELSE state END,
+			decided_at = CASE WHEN state = 'pending' THEN ? ELSE decided_at END,
 			content_dropped_at = coalesce(content_dropped_at, ?), content_dropped_reason = 'purge' WHERE entry_id = ?`,
-			[]any{now, id}},
+			[]any{now, now, id}},
 		{`UPDATE votes SET note = '' WHERE entry_id = ?`, []any{id}},
 		{`UPDATE outcomes SET note = '' WHERE entry_id = ?`, []any{id}},
 		{`DELETE FROM anchors WHERE entry_id = ?`, []any{id}},
@@ -841,6 +852,9 @@ func (t *txn) Purge(ctx context.Context, id, reason string, actor Actor) error {
 		}
 	}
 	if err := t.ftsDelete(ctx, cur.Cursor); err != nil {
+		return err
+	}
+	if err := t.ftsOptimize(ctx); err != nil {
 		return err
 	}
 	t.touch(id)

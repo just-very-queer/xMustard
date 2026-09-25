@@ -371,12 +371,13 @@ func (t *txn) AcceptRevision(ctx context.Context, in AcceptInput, actor Actor) (
 	return t.GetEntry(ctx, in.EntryID)
 }
 
-// RejectRevision closes a pending revision without serving it.
+// RejectRevision closes a pending revision without serving it. A purged entry has no
+// pending revisions (purge withdraws them) and takes no new free text.
 func (t *txn) RejectRevision(ctx context.Context, entryID string, revision int64, reason string, actor Actor) (Revision, error) {
 	if err := actor.validate(); err != nil {
 		return Revision{}, err
 	}
-	cur, err := t.GetEntry(ctx, entryID)
+	cur, err := t.liveEntry(ctx, entryID)
 	if err != nil {
 		return Revision{}, err
 	}

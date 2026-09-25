@@ -34,6 +34,9 @@ type RetentionPolicy struct {
 	// BatchSize is the number of rows per transaction (default 500).
 	BatchSize int
 	// Vacuum returns freed pages to the file system and truncates the WAL afterwards.
+	// When the pass removed transcript rows or revision content, it first rewrites the
+	// matching search index ('optimize'): a contentless FTS5 delete only tombstones a
+	// row, and its terms would otherwise stay in the file.
 	Vacuum bool
 }
 
@@ -137,6 +140,20 @@ func (s *SQLStore) ApplyRetention(ctx context.Context, p RetentionPolicy) (Reten
 		}
 	}
 	if p.Vacuum {
+		for _, ix := range []struct {
+			table   string
+			removed int64
+		}{{"transcript_fts", rep.SessionEvents}, {"memory_fts", rep.RevisionContent}} {
+			if ix.removed == 0 {
+				continue
+			}
+			if err := s.Update(ctx, func(tx Tx) error {
+				_, err := tx.(*txn).exec(ctx, "INSERT INTO "+ix.table+" ("+ix.table+") VALUES ('optimize')")
+				return err
+			}); err != nil {
+				return rep, fmt.Errorf("retention: optimize %s: %w", ix.table, err)
+			}
+		}
 		if _, err := s.writer.ExecContext(ctx, "PRAGMA incremental_vacuum"); err != nil {
 			return rep, mapErr(err)
 		}

@@ -252,6 +252,15 @@ BEGIN
   SELECT RAISE(ABORT, 'govstore: events are append-only');
 END;
 
+-- A purged entry's history keeps no free text: purge redacts the events that exist,
+-- and nothing may append a note or data to it afterwards, except the purge event.
+CREATE TRIGGER events_purged_no_text BEFORE INSERT ON events
+WHEN NEW.entry_id IS NOT NULL AND NEW.type <> 'purge' AND (NEW.note IS NOT NULL OR NEW.data IS NOT NULL)
+  AND EXISTS (SELECT 1 FROM entries e WHERE e.id = NEW.entry_id AND e.lifecycle = 'purged')
+BEGIN
+  SELECT RAISE(ABORT, 'govstore: a purged entry takes no free text');
+END;
+
 -- Code anchors: paths, symbols, identifiers, commands, config keys. They form the
 -- inverted index anchor -> memories and carry the drift baseline captured at promotion.
 CREATE TABLE anchors (
@@ -527,6 +536,10 @@ CREATE INDEX evidence_meta_expiry ON evidence_meta (expires_at);
 
 -- Full-text search. Contentless: the text lives in entries, revisions, anchors and
 -- session_events, so nothing is stored twice. rowid = entries.pk / session_events.seq.
+-- A delete only tombstones the rowid; the terms stay in the index segments until a
+-- merge rewrites them. Purge therefore runs 'optimize' on memory_fts, and a retention
+-- pass with Vacuum does the same for transcript_fts. (FTS5's secure-delete option
+-- does not apply to contentless_delete tables: they delete by tombstone.)
 CREATE VIRTUAL TABLE memory_fts USING fts5 (
   title, body, anchors,
   content = '', contentless_delete = 1,
