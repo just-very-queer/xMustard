@@ -3,7 +3,7 @@
   "tools": [
     {
       "_meta": {
-        "anthropic/maxResultSizeChars": 1049600
+        "anthropic/maxResultSizeChars": 132096
       },
       "annotations": {
         "openWorldHint": false,
@@ -60,7 +60,7 @@
     },
     {
       "_meta": {
-        "anthropic/maxResultSizeChars": 1049600
+        "anthropic/maxResultSizeChars": 132096
       },
       "annotations": {
         "openWorldHint": false,
@@ -253,7 +253,7 @@
     },
     {
       "_meta": {
-        "anthropic/maxResultSizeChars": 1049600
+        "anthropic/maxResultSizeChars": 132096
       },
       "annotations": {
         "openWorldHint": false,
@@ -333,7 +333,7 @@
     },
     {
       "_meta": {
-        "anthropic/maxResultSizeChars": 1049600
+        "anthropic/maxResultSizeChars": 132096
       },
       "annotations": {
         "openWorldHint": false,
@@ -389,7 +389,7 @@
     },
     {
       "_meta": {
-        "anthropic/maxResultSizeChars": 1049600
+        "anthropic/maxResultSizeChars": 132096
       },
       "annotations": {
         "openWorldHint": false,
@@ -461,7 +461,7 @@
     },
     {
       "_meta": {
-        "anthropic/maxResultSizeChars": 1049600
+        "anthropic/maxResultSizeChars": 132096
       },
       "annotations": {
         "openWorldHint": false,
@@ -497,7 +497,7 @@
     },
     {
       "_meta": {
-        "anthropic/maxResultSizeChars": 1049600
+        "anthropic/maxResultSizeChars": 132096
       },
       "annotations": {
         "openWorldHint": false,

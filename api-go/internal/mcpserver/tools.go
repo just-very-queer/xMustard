@@ -26,15 +26,24 @@ func ToolByName(name string) (*Tool, bool) {
 // environment, the client's roots or the working directory (resolve_workspace.go).
 var workspaceArg = Arg{Name: "workspace_id", Type: typeString, Desc: "workspace id; auto-resolved if omitted"}
 
-// boundedResultChars is the largest result a read tool delivers inline: the evidence
-// projection's hard cap (1 MiB; characters never exceed bytes) plus the recovery
-// note. Projections aim at 64 KiB but may grow toward the cap to keep failure evidence
-// (measured: impact with no arguments on a 1,929-file repository projected a 2 MiB
-// original to 100,671 bytes). Originals are paged through resources/read.
+// boundedResultChars is the result size up to which a read tool asks to be delivered
+// inline (_meta["anthropic/maxResultSizeChars"]); a larger result is written to a
+// file the agent can read, and the original is always paged through resources/read.
+// Projections aim at the 64 KiB evidence target and grow past it only to keep failure
+// evidence: the largest measured is impact with no arguments on a 1,929-file
+// repository, a 2 MiB original projected to 100,671 bytes. Twice the target plus the
+// recovery note covers that (characters never exceed bytes) and stays well inside
+// Claude Code's 500,000-character ceiling for this annotation; declaring the 1 MiB
+// projection hard cap would claim more than the client honors and let ~125k-token
+// results into context.
 const (
-	projectionHardCap  = 1 << 20 // evidence.DefaultMaxProjection
+	projectionTarget   = 64 << 10 // evidence.DefaultProjectionTarget
 	recoveryNoteBytes  = 1 << 10
-	boundedResultChars = projectionHardCap + recoveryNoteBytes
+	boundedResultChars = 2*projectionTarget + recoveryNoteBytes
+	// claudeCodeResultCeiling is the largest maxResultSizeChars Claude Code honors.
+	claudeCodeResultCeiling = 500_000
+	// measuredLargestProjection is the largest projection measured so far (impact).
+	measuredLargestProjection = 100_671
 )
 
 func wsPath(args map[string]string, suffix string) string {

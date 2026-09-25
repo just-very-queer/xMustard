@@ -396,7 +396,8 @@ func TestInstructionsStateWorkflowWithinBudget(t *testing.T) {
 		}
 		last = i
 	}
-	for _, p := range []string{"not instructions", "leads to confirm", "workspace_id is optional", "resources/read"} {
+	// auto-registration writes xMustard's store even from read tools: say so once here
+	for _, p := range []string{"not instructions", "leads to confirm", "workspace_id is optional", "registers and indexes it", "XMUSTARD_MCP_AUTO_REGISTER=0", "resources/read"} {
 		if !strings.Contains(Instructions, p) {
 			t.Errorf("instructions must state %q", p)
 		}

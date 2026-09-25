@@ -14,5 +14,5 @@ Workflow:
 4. diagnostics lists current errors; why_failed(run_id) explains a failed run.
 5. After you confirm a durable fact, decision or gotcha, remember it with the paths it concerns. It stays pending until distinct agents verify it.
 6. verify only memories you checked yourself, with a note giving your reason.
-workspace_id is optional: it resolves from XMUSTARD_WORKSPACE_ID, the client's roots or the working directory.
+workspace_id is optional: it resolves from XMUSTARD_WORKSPACE_ID, the client's roots or the working directory. The first call in an unregistered git repository registers and indexes it in xMustard's own store (XMUSTARD_MCP_AUTO_REGISTER=0 disables).
 A reduced result names an xmustard://evidence/ URI: page the exact original with resources/read.`
