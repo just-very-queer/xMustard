@@ -591,6 +591,25 @@ class RepoWiring(unittest.TestCase):
             self.assertIn(target, text)
         self.assertIn("rss_v2.sh run --suite parity", text)
 
+    def test_ci_workflow_runs_backend_checks_and_gates_on_prs(self):
+        path = os.path.join(REPO, ".github", "workflows", "check.yml")
+        with open(path) as f:
+            text = f.read()
+        try:
+            import yaml
+        except ImportError:
+            yaml = None
+        if yaml is not None:
+            wf = yaml.safe_load(text)
+            on = wf.get("on", wf.get(True))
+            self.assertIn("pull_request", on)
+            runs = "\n".join(s.get("run", "") for j in wf["jobs"].values() for s in j["steps"])
+        else:
+            self.assertIn("pull_request:", text)
+            runs = text
+        for needle in ("make check-backend", "retrieval-gate.sh", "rss_v2.sh run --suite ci", "make bench-test", "--workstream"):
+            self.assertIn(needle, runs)
+
 
 class Rendering(unittest.TestCase):
     def test_markdown_carries_the_verdict_and_external_lines(self):
