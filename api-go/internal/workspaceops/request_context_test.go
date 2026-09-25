@@ -425,6 +425,36 @@ func TestIdentityCacheTTLAndInvalidation(t *testing.T) {
 	}
 }
 
+// A read that finds no live pairing samples, then walks to pair the sample for the
+// next read. That walk pays off only if another read follows within the TTL: after
+// a pairing expired unused, an isolated read (none within the TTL before it) samples
+// without walking, exactly as without the cache; a read within the TTL of the last
+// one walks again, and a pairing that was used keeps the walk on.
+func TestIdentityCacheSkipsThePairingWalkForIsolatedReads(t *testing.T) {
+	f := installFakeSampler(t)
+	root := initGitRepo(t)
+	ctx := context.Background()
+	now := time.Now().Add(3 * time.Second)
+	identityNow = func() time.Time { return now }
+	read := func(step string, after time.Duration, wantRuns, wantWalks int64, wantCached bool) {
+		t.Helper()
+		now = now.Add(after)
+		walks := fingerprintWalks.Load()
+		_, obs := CurrentRepoIdentity(ctx, root)
+		if obs.Cached != wantCached || f.runs.Load() != wantRuns || fingerprintWalks.Load()-walks != wantWalks {
+			t.Fatalf("%s: cached=%v runs=%d walks=%d; want cached=%v runs=%d walks=%d", step, obs.Cached,
+				f.runs.Load(), fingerprintWalks.Load()-walks, wantCached, wantRuns, wantWalks)
+		}
+	}
+	idle := defaultIdentityTTL + time.Second
+	read("first read: sample, then a walk to pair it", 0, 1, 1, false)
+	read("isolated read after the pairing expired unused: no walk", idle, 2, 0, false)
+	read("another isolated read: no walk", idle, 3, 0, false)
+	read("a read within the TTL of the last one: walks to pair", time.Second, 4, 1, false)
+	read("the next read uses the pairing", 100*time.Millisecond, 4, 1, true)
+	read("the used pairing expired: the walk stays on", idle, 5, 1, false)
+}
+
 func TestIdentityCacheOutsideGitReusesOnlyIncompleteIdentities(t *testing.T) {
 	f := installFakeSampler(t)
 	root := t.TempDir()

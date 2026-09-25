@@ -243,6 +243,14 @@ func (f repoFingerprint) settled() bool { return f.quietBefore(f.startedAt) }
 // is not quiet). That check has no TTL: it depends on the fingerprint, not on how
 // long the handler ran.
 //
+// Costs against base (one repo-key run per observation): a hit is one walk; a read
+// with no live pairing is one run, plus one walk to pair it unless the read is
+// isolated after a pairing expired unused (see observe); a read that finds the tree
+// changed is one walk and one run (plus a second walk when the change is inside the
+// racy window). The cost judge below turns the walk off for a while once one costs
+// more than half a run, which keeps a read under about twice base and a read with no
+// live pairing under about 1.5 times.
+//
 // The fingerprint is not used (every observation samples, as without the cache)
 // when: the TTL is 0; the platform cannot fingerprint; the root's repo-key reports
 // no ignored-directory listing; a walk failed or exceeded its bounds (retried after
@@ -285,6 +293,7 @@ type identityEntry struct {
 	ign       *ignoreSet      // the listing fp was walked with
 	sampledAt time.Time
 	lastUsed  time.Time
+	hits      int // reads it served without a sample
 }
 
 type sampleFlight struct {
@@ -311,6 +320,10 @@ type rootState struct {
 	keyNs      int64 // repo-key duration, smoothed
 	fpOffUntil time.Time
 	lastUsed   time.Time
+	// lastRead is when the root's identity was last observed; unusedPairing is set
+	// when a pairing expired without serving a read (cleared by the next hit).
+	lastRead      time.Time
+	unusedPairing bool
 }
 
 type identityCacheT struct {
@@ -425,7 +438,10 @@ func (b identityBasis) sample() sampleResult {
 
 // observe returns root's identity. populate pairs a fresh sample with a walk right
 // away (for callers that read again soon); a request's before-identity defers that
-// walk to its after-check, which only reduced results need.
+// walk to its after-check, which only reduced results need. The pairing walk pays
+// off only if another read follows within the TTL, so it is skipped for an isolated
+// read (none within the TTL before it) once a pairing has expired unused: such a
+// read then costs one repo-key run, as without the cache.
 func (c *identityCacheT) observe(ctx context.Context, root string, populate bool) identityBasis {
 	if root == "" {
 		return identityBasis{id: unavailableIdentity("workspace_root_unavailable", "")}
@@ -434,17 +450,28 @@ func (c *identityCacheT) observe(ctx context.Context, root string, populate bool
 	if !c.fingerprintOn(root, start) {
 		return c.sampleCoalesced(ctx, root, time.Time{}).basis(root)
 	}
+	ttl := identityTTL()
 	c.mu.Lock()
-	e := c.state(root).entry
-	if e != nil && start.Sub(e.sampledAt) >= identityTTL() {
+	st := c.state(root)
+	e := st.entry
+	if e != nil && start.Sub(e.sampledAt) >= ttl {
+		if e.hits == 0 {
+			st.unusedPairing = true
+		}
 		e = nil
 	}
+	if st.unusedPairing && (st.lastRead.IsZero() || start.Sub(st.lastRead) >= ttl) {
+		populate = false
+	}
+	st.lastRead = start
 	c.mu.Unlock()
 	if e != nil {
 		fp := c.walkCoalesced(root, e.ign, start)
 		if fp.same(e.fp) && fp.settled() && c.epochIs(root, fp.epoch) {
 			c.mu.Lock()
 			e.lastUsed = identityNow()
+			e.hits++
+			c.state(root).unusedPairing = false
 			c.mu.Unlock()
 			return identityBasis{root: root, id: e.id, obs: IdentityObservation{Cached: true, Age: identityNow().Sub(e.sampledAt)},
 				ign: e.ign, fp: fp, sampledAt: e.sampledAt, epoch: fp.epoch}
