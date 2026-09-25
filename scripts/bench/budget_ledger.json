@@ -107,10 +107,38 @@
   "WS-63": {"line_mib": null, "process": null, "title": "evaluation corpus authoring (critic addition)"}
  },
  "tolerance": {
-  "tree_peak_mib": 6.0,
-  "component_p50_mib": 1.5,
-  "v1_crosscheck_mib": 3.0,
-  "basis": "provisional"
+   "tree_peak_mib": 10.0,
+   "component_p50_mib": 2.0,
+   "v1_crosscheck_mib": 3.0,
+   "basis": "Measured 2026-09-25 on darwin-arm64 (Apple M1, 8 GB, shared with other agents, load average 5-55) with one set of binaries. v1-workload gate peak over five valid single runs: 71.0, 78.2, 78.7, 87.4 and 87.9 MiB (a 16.9 MiB single-run spread; the frozen v1's own history is 72.3-84.9 MB), so the tree-peak check compares medians of three repeats (CI runs --repeat 3). go_daemon p50 18.1-18.8 MiB and rust_core_per_call p50 6.2 MiB across five runs, so the process-p50 check is the precise one. v2 minus v1 sampler in the same run: 0.0, -1.31, +0.09, -0.17, +0.24 and -1.62 MiB over six runs. Idle-process RSS moves with macOS memory compression (mcp_access p50 13.1-20.7 MiB). Revisit all three with CI-runner data."
  },
- "reference_measurement": null
+ "reference_measurement": {
+   "about": "v1-workload (the frozen 501-file workload) measured by gate v2, median of three repeats. Binaries were built at source_head, whose api-go and rust-core trees equal feat/parity-v2 b4f7b49. The per-process p50 feeds the reconciliation's projected steady state; replace it with a CI-runner measurement when one exists.",
+   "scenario": "v1-workload",
+   "platform": "darwin-arm64 (Apple M1, 8 GB, shared with other agents; load average 15-55 during the runs)",
+   "date": "2026-09-25",
+   "source_head": "ea96e421841c",
+   "xmustard_core_sha256": "d644743ba005318e",
+   "gate_peak_mib": 78.7,
+   "gate_peak_mib_repeats": [
+     78.2,
+     78.7,
+     87.9
+   ],
+   "footprint_peak_mib": 53.6,
+   "component_p50_mib": {
+     "git_child": 0.2,
+     "go_daemon": 18.8,
+     "mcp_access": 20.7,
+     "rust_core_per_call": 6.2,
+     "rust_index_service": 0.0
+   },
+   "component_peak_mib": {
+     "git_child": 6.2,
+     "go_daemon": 43.7,
+     "mcp_access": 24.3,
+     "rust_core_per_call": 36.6
+   },
+   "note": "rust_index_service is absent at this HEAD (0.0); mcp_access is two stdio Go shims"
+ }
 }
