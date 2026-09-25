@@ -710,13 +710,14 @@ fn search(mut args: Args) -> CmdResult {
 }
 
 fn repo_key(mut args: Args) -> CmdResult {
-    // The repaired source identity (same key as graph-cache invalidation). Always
-    // succeeds with JSON; failures are `identity_complete=false` plus `limitations`,
-    // never a partial key presented as complete.
+    // The repaired source identity (same key as graph-cache invalidation), plus the
+    // directories git ignores as a whole (`ignored_dirs`) for the Go identity cache's
+    // fingerprint. Always succeeds with JSON; failures are `identity_complete=false`
+    // plus `limitations`, never a partial key presented as complete.
     let root = need(&mut args, "xmustard-core repo-key <root>")?;
-    json(&xmustard_core::indexcache::source_identity(&PathBuf::from(
-        root,
-    )))
+    json(&xmustard_core::indexcache::repo_key_identity(
+        &PathBuf::from(root),
+    ))
 }
 
 fn wiki(mut args: Args) -> CmdResult {

@@ -91,14 +91,14 @@ type RunLogChunk struct {
 }
 
 func ListRuns(dataDir string, workspaceID string) ([]runRecord, error) {
-	if _, err := loadSnapshot(dataDir, workspaceID); err != nil {
+	if err := requireWorkspaceSnapshot(dataDir, workspaceID); err != nil {
 		return nil, err
 	}
 	return listRuns(dataDir, workspaceID)
 }
 
 func ReadRun(dataDir string, workspaceID string, runID string) (*runRecord, error) {
-	if _, err := loadSnapshot(dataDir, workspaceID); err != nil {
+	if err := requireWorkspaceSnapshot(dataDir, workspaceID); err != nil {
 		return nil, err
 	}
 	return loadRun(dataDir, workspaceID, runID)

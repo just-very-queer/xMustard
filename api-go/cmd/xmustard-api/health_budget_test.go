@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"xmustard/api-go/internal/budget"
+	"xmustard/api-go/internal/evidence"
 	"xmustard/api-go/internal/workspaceops"
 )
 
@@ -290,7 +291,7 @@ func TestHealthBudgetBlockNeedsAuthWhenEnforced(t *testing.T) {
 }
 
 // Correction to PAR-RT-04 ("no hook or capture path waits on the heavy slot"), checked
-// with a caller that would wait: an identity sampler that takes the heavy slot. Inside
+// with a caller that would wait: an identity observer that takes the heavy slot. Inside
 // a delivered call's capture (before- and after-identity) it is refused at once, never
 // queued, while heavy work holds the slot, and the call still completes.
 func TestCaptureIdentitySamplingNeverWaitsOnHeavySlot(t *testing.T) {
@@ -299,8 +300,8 @@ func TestCaptureIdentitySamplingNeverWaitsOnHeavySlot(t *testing.T) {
 	var mu sync.Mutex
 	var errs []error
 	var longest time.Duration
-	prev := sampleCaptureIdentity
-	sampleCaptureIdentity = func(ctx context.Context, dataDir, ws string) (workspaceops.RepoIdentity, string) {
+	prev := captureIdentity
+	captureIdentity = func(ctx context.Context, rc *workspaceops.RequestContext, after bool) evidence.Identity {
 		t0 := time.Now()
 		release, err := budget.AcquireHeavy(ctx, "identity_refresh", 0)
 		if err == nil {
@@ -309,9 +310,9 @@ func TestCaptureIdentitySamplingNeverWaitsOnHeavySlot(t *testing.T) {
 		mu.Lock()
 		errs, longest = append(errs, err), max(longest, time.Since(t0))
 		mu.Unlock()
-		return prev(ctx, dataDir, ws)
+		return prev(ctx, rc, after)
 	}
-	t.Cleanup(func() { sampleCaptureIdentity = prev })
+	t.Cleanup(func() { captureIdentity = prev })
 	before := budget.Status().HeavySlot
 
 	start := time.Now()

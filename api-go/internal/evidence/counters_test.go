@@ -63,7 +63,9 @@ func TestCaptureNeverWaitsOnHeavySlot(t *testing.T) {
 	var heavyErr error
 	var waited time.Duration
 	start := time.Now()
+	// a complete before-identity: only then does Capture sample the after-identity
 	_, err = s.Capture(context.Background(), sp, CaptureRequest{WorkspaceID: "ws", Tool: "search", Status: 200, ContentType: "application/json",
+		BeforeKey: &Identity{Key: "k", Complete: true},
 		RepoKey: func(ctx context.Context) Identity {
 			t0 := time.Now()
 			if r, e := budget.AcquireHeavy(ctx, "capture_side_work", 0); e == nil {

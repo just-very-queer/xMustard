@@ -242,3 +242,48 @@ func TestSearchResumeCountsAdjacentMatches(t *testing.T) {
 		t.Fatalf("paged %d matches %v in %d pages, want 4 [10 11 12 15]", total, flagged, pages)
 	}
 }
+
+// Search reads the current identity only for a bound capture, as Read does: an
+// unbound capture (a hook observation, a posted result) never costs a repo-key run,
+// and a bound one reports whether its current identity came from the cache.
+func TestSearchReadsIdentityOnlyForABoundCapture(t *testing.T) {
+	s, _ := testStore(t, nil)
+	raw := numberedLines(20000, func(i int) bool { return i == 777 })
+	calls := 0
+	key := func(context.Context) Identity {
+		calls++
+		return Identity{Key: "k1", Complete: true, Cached: true, AgeMs: 40}
+	}
+	search := func(handle string) *SearchResult {
+		t.Helper()
+		res, err := s.Search(context.Background(), SearchRequest{ReadRequest: ReadRequest{WorkspaceID: "ws", Handle: handle, RepoKey: key}, Pattern: "ERROR"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return res
+	}
+	obs, err := s.Observe(context.Background(), nil, ObservationInput{WorkspaceID: "ws", Format: FormatRaw,
+		Body: bytes.NewReader(raw), Meta: CaptureMeta{Client: "http", Tool: "Bash"}})
+	if err != nil || obs.Handle == "" {
+		t.Fatalf("observe: %v", err)
+	}
+	if res := search(obs.Handle); res.Freshness != "unknown" || calls != 0 {
+		t.Fatalf("unbound capture: freshness %s, current identity read %d times; want unknown, 0", res.Freshness, calls)
+	}
+	sp, err := s.NewSpool("ws")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sp.Write(raw); err != nil {
+		t.Fatal(err)
+	}
+	d, err := s.Capture(context.Background(), sp, CaptureRequest{WorkspaceID: "ws", Tool: "search", Status: 200, ContentType: "text/plain",
+		BeforeKey: &Identity{Key: "k1", Complete: true}, RepoKey: key})
+	if err != nil || d.Handle == "" || d.CapturedIdentity != "bound" {
+		t.Fatalf("bound capture: %+v %v", d, err)
+	}
+	calls = 0
+	if res := search(d.Handle); res.Freshness != "current" || calls != 1 || !res.CurrentKeyCached || res.CurrentKeyAgeMs != 40 {
+		t.Fatalf("bound capture: %+v after %d identity reads; want current from one cached read", res, calls)
+	}
+}

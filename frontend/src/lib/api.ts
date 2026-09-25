@@ -907,13 +907,20 @@ export type CockpitDashboard = {
   review_ready_count: number
   audit_event_count: number
 }
+// Counts and flags are null when ground could not determine them; `unknown` says
+// which and why (never reported as 0).
 export type SessionGrounding = {
   workspace_id: string
-  changed_files: number
-  dirty_symbols: number
-  recent_failed_runs: string[]
-  blocked_by_dirty_state: boolean
-  blocked_by_failing_verification: boolean
+  changed_files: number | null
+  dirty_symbols: number | null
+  recent_failed_runs: string[] | null
+  blocked_by_dirty_state: boolean | null
+  blocked_by_failing_verification: boolean | null
+  stale_memory: number | null
+  stale_memory_checked: number
+  stale_memory_total: number | null
+  stale_memory_complete: boolean
+  unknown?: { field: string; reason: string }[]
   summary: string
   generated_at: string
 }

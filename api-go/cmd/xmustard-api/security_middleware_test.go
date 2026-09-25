@@ -379,7 +379,9 @@ func TestCallerPrincipalReported(t *testing.T) {
 
 	req := httptest.NewRequest("GET", "/x", nil)
 	req = req.WithContext(context.WithValue(req.Context(), principalCtxKey, &workspaceops.Principal{ID: "vera", Role: "verifier"}))
-	raw, err := json.Marshal(groundResponse(req, &workspaceops.SessionGrounding{WorkspaceID: "ws1", Summary: "ok"}))
+	ground := &workspaceops.SessionGrounding{WorkspaceID: "ws1"}
+	ground.Summary = "ok" // promoted from the session section (grounding_session.go)
+	raw, err := json.Marshal(groundResponse(req, ground))
 	if err != nil {
 		t.Fatal(err)
 	}

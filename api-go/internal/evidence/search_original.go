@@ -85,9 +85,13 @@ type SearchResult struct {
 	RawSHA256       string       `json:"raw_sha256"`
 	CapturedKey     string       `json:"captured_key"`
 	CurrentKey      string       `json:"current_key"`
-	Freshness       string       `json:"freshness"`
-	Stale           bool         `json:"stale"`
-	ExpiresAt       string       `json:"expires_at"`
+	// CurrentKeyCached / CurrentKeyAgeMs: as on Page, the current identity came from
+	// the identity cache and was sampled that long ago.
+	CurrentKeyCached bool   `json:"current_key_cached"`
+	CurrentKeyAgeMs  int64  `json:"current_key_age_ms"`
+	Freshness        string `json:"freshness"`
+	Stale            bool   `json:"stale"`
+	ExpiresAt        string `json:"expires_at"`
 }
 
 var chunkPool = sync.Pool{New: func() any { b := make([]byte, SearchChunk); return &b }}
@@ -132,11 +136,13 @@ func (s *Store) Search(ctx context.Context, req SearchRequest) (*SearchResult, e
 	res.Handle, res.Tool, res.CallID, res.ContentType = req.Handle, obs.Tool, obs.CallID, obs.ContentType
 	res.Pattern, res.Query, res.FromLine, res.ToLine = req.Pattern, req.Query, req.FromLine, req.ToLine
 	res.RawSHA256, res.CapturedKey, res.ExpiresAt = obs.RawSHA256, obs.CapturedKey, obs.ExpiresAt
+	// as in Read: a capture whose identity is not bound never needs the current
+	// identity, so none is read (no repo-key run for an unbound capture)
 	var cur Identity
-	if req.RepoKey != nil {
+	if obs.CapturedKeyOK && req.RepoKey != nil {
 		cur = req.RepoKey(ctx)
 	}
-	res.CurrentKey = cur.Key
+	res.CurrentKey, res.CurrentKeyCached, res.CurrentKeyAgeMs = cur.Key, cur.Cached, cur.AgeMs
 	switch {
 	case !obs.CapturedKeyOK || !cur.Complete || cur.Key == "":
 		res.Freshness = "unknown"
