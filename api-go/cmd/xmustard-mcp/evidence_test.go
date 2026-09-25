@@ -179,3 +179,43 @@ func TestShimMapsEnvelopeOverloadToProtocolError(t *testing.T) {
 		t.Fatalf("envelope overload: want -32000, got %+v", rerr)
 	}
 }
+
+// On the default 24 MiB pool a reply is held as the API response plus the reply built
+// from it. A 10 MiB response is relayed; a 13 MiB one (under the 16 MiB response cap)
+// could never be held twice, so it is a permanent tool error, not a -32000 overload an
+// idle shim would repeat forever.
+func TestShimResponseSizesOnTheDefaultPool(t *testing.T) {
+	size := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"pad":"` + strings.Repeat("r", size) + `"}`))
+	}))
+	defer srv.Close()
+	t.Setenv("XMUSTARD_API_BASE", srv.URL)
+	prev := budget.TransientBytes
+	budget.TransientBytes = budget.NewByteBudget(budget.DefaultTransientBudgetBytes)
+	defer func() { budget.TransientBytes = prev }()
+	for _, tc := range []struct {
+		size int
+		ok   bool
+	}{{10 << 20, true}, {13 << 20, false}} {
+		size = tc.size
+		scope := budget.NewScope(nil)
+		res, rerr := dispatchCtx(budget.WithScope(context.Background(), scope), "tools/call",
+			json.RawMessage(`{"name":"search","arguments":{"workspace_id":"ws","query":"q"}}`))
+		scope.Close()
+		m, _ := res.(map[string]any)
+		text, _ := json.Marshal(m)
+		if rerr != nil {
+			t.Fatalf("%d-byte response: want a tool result, got JSON-RPC error %+v", tc.size, rerr)
+		}
+		if tc.ok && (m["isError"] == true || len(text) < tc.size) {
+			t.Fatalf("%d-byte response fits the default pool: %.200s", tc.size, text)
+		}
+		if !tc.ok && (m["isError"] != true || !strings.Contains(string(text), "transient budget")) {
+			t.Fatalf("%d-byte response can never be held twice in 24 MiB: want a permanent tool error, got %.200s", tc.size, text)
+		}
+		if budget.TransientBytes.InUse() != 0 {
+			t.Fatalf("reservation leaked: %d", budget.TransientBytes.InUse())
+		}
+	}
+}
