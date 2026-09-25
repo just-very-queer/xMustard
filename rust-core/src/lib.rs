@@ -16,6 +16,7 @@ pub mod ownership;
 pub mod repomap;
 pub mod scanner;
 pub mod search;
+pub mod secretpath;
 pub mod semantic;
 pub mod swarm;
 pub mod symbolgraph;
