@@ -91,7 +91,8 @@ async function setUpDiagnostics(fixture: PgFixture): Promise<void> {
 	record("postgres_fixture", { status: "native", port: fixture.port, bootstrap: boot.status, diagnostics_run: run.status });
 }
 
-function pi(name: string, steps: Step[], o: { env?: Record<string, string>; apiBase?: string; ws?: string; rpc?: Parameters<typeof runPi>[0]["rpc"]; timeoutMs?: number } = {}): Promise<PiRun> {
+type PiOpts = Pick<Parameters<typeof runPi>[0], "env" | "rpc" | "rpcManual" | "settings" | "timeoutMs"> & { apiBase?: string; ws?: string };
+function pi(name: string, steps: Step[], o: PiOpts = {}): Promise<PiRun> {
 	runSeq++;
 	return runPi({ dir: join(T, "pi", `${String(runSeq).padStart(2, "0")}-${name}`), cwd: repo, apiBase: o.apiBase ?? api.base, ws: o.ws ?? ws, steps, ...o });
 }
@@ -526,7 +527,7 @@ describe("Pi adapter against the real xMustard API", () => {
 		}
 	});
 
-	test("non-xMustard tools pass through untouched and never reach Go", async () => {
+	test("small built-in results pass through untouched and never reach Go", async () => {
 		const proxy = new StallProxy(api.base, () => false);
 		await proxy.start();
 		try {
@@ -547,8 +548,10 @@ describe("Pi adapter against the real xMustard API", () => {
 			const bash = one(run, "bash");
 			assert.equal(bash.isError, false);
 			assert.equal(textOf(bash).trim(), "pass-through");
-			for (const m of toolResultMessages(run)) assert.ok(!m.details?.path, `${m.toolName} carries no xMustard details`);
-			assert.deepEqual(proxy.seen, [], "no xMustard request for non-xMustard tools");
+			for (const m of toolResultMessages(run)) assert.ok(!m.details?.path && !m.details?.xmustard, `${m.toolName} carries no xMustard details`);
+			// the only request is the session-start tool scoping (whoami); small results
+			// are not posted for capture (Go would return them unchanged)
+			assert.deepEqual(proxy.seen, ["GET /api/auth/whoami"], "no xMustard request for small built-in results");
 			record("passthrough", { read_error: textOf(badRead).slice(0, 120) });
 		} finally {
 			await proxy.stop();
@@ -596,10 +599,223 @@ describe("Pi adapter against the real xMustard API", () => {
 			assert.equal(denied.isError, true);
 			assert.match(textOf(denied), /403|denied/);
 
+			// caller-scoped tools: a reader token is not offered remember/verify (whoami tools)
+			const reader = mintToken(dir, "reader-r", "readonly");
+			secrets.push(reader);
+			const scoped = await go("auth-reader", [{ text: "ok" }], reader);
+			const active = scoped.trace[0]?.active_tools ?? [];
+			for (const n of ["ground", "recall", "search", "explain", "impact", "diagnostics", "why_failed"]) assert.ok(active.includes(n), `${n} active for a reader`);
+			for (const n of ["remember", "verify"]) assert.ok(!active.includes(n), `${n} must not be offered to a reader`);
+			record("caller_scoped_tools", { reader_active: active.filter((n) => NINE.includes(n)) });
+
 			for (const r of runs) for (const s of secrets) assert.ok(!r.stdout.includes(s) && !r.stderr.includes(s) && !JSON.stringify(r.trace).includes(s), "token leaked into Pi output");
 			record("auth", { anonymous: textOf(one(anon, "ground")).slice(0, 120), rotated_old: textOf(one(stale, "ground")).slice(0, 120), other_principal: textOf(denied).slice(0, 160) });
 		} finally {
 			await api3.stop();
 		}
+	});
+});
+
+// ---- WS-24: Pi built-ins through capture, turn_end masking, snapshot compaction ------
+
+const MASKED = "[xmustard masked: ";
+const stubHandle = (text: string) => /; handle (xm1\.[A-Za-z0-9_-]+)(?:; offset \d+)?; workspace_id ([^\]\s;]+)\]/.exec(text);
+
+describe("Pi built-ins, masking and compaction through xMustard (WS-24)", () => {
+	test("built-in results above the target are projected through capture: handle, isError and details kept, redacted, recoverable", async () => {
+		const big = `${Array.from({ length: 1500 }, (_, i) => `big line ${String(i).padStart(5, "0")} ${"x".repeat(30)}`).join("\n")}\n`;
+		writeFileSync(join(repo, "big.txt"), big);
+		const cmd = "for i in $(seq 1 3000); do printf 'ok line %05d padding-padding-padding-padding\\n' $i; done; echo '--- FAIL: TestBuiltin (0.00s)'; echo 'token XM_E2E_SECRET_abc123'; exit 3";
+		const run = await pi("builtins", [
+			{ calls: [{ name: "read", args: { path: "big.txt" } }, { name: "ls", args: { path: "web" } }] },
+			{ calls: [{ name: "bash", args: { command: cmd } }] },
+			{ expand_all: { workspace_id: "$WS" } },
+			{ text: "done" },
+		]);
+		assert.equal(run.code, 0, run.stderr);
+		assertModelSawResults(run);
+		// read: projected with a handle; Pi's own truncation details are kept
+		const read = one(run, "read");
+		assert.equal(read.isError, false);
+		const rf = footerOf(textOf(read)) ?? assert.fail(`read not projected: ${textOf(read).slice(-300)}`);
+		assert.ok(rf.handle?.startsWith("xm1."));
+		assert.equal(read.details?.xmustard?.path, "capture");
+		assert.equal(read.details?.xmustard?.handle, rf.handle);
+		assert.ok(read.details?.truncation?.truncated, "Pi's truncation details survive");
+		const readOrig = await readAll(api, ws, rf.handle);
+		assert.equal(sha(readOrig.bytes), rf.raw_sha256);
+		const readText = readOrig.bytes.toString("utf8");
+		assert.ok(big.startsWith(readText.split("\n\n[Showing lines")[0]), "the retained original is Pi's read output");
+		// ls is small: untouched
+		assert.ok(!one(run, "ls").details?.xmustard, "small ls untouched");
+		// bash: an error stays an error; the projection keeps the failure, not the secret
+		const bash = one(run, "bash");
+		assert.equal(bash.isError, true);
+		const bt = textOf(bash);
+		const bf = footerOf(bt) ?? assert.fail(`bash not projected: ${bt.slice(-300)}`);
+		assert.match(bt, /--- FAIL: TestBuiltin/);
+		assert.match(bt, /Command exited with code 3/);
+		assert.ok(!bt.includes("XM_E2E_SECRET_abc123"), "the secret never reaches the model");
+		assert.ok(Buffer.byteLength(bt) < 34 << 10, `projection is bounded (${Buffer.byteLength(bt)} bytes)`);
+		assert.equal(bash.details?.xmustard?.path, "capture");
+		assert.equal(bf.captured_identity, "unknown");
+		// xmustard_expand pages the (redacted) original back exactly
+		const pages = pagesOf(run, bf.handle);
+		assert.ok(pages.length >= 1, "expand paged the bash original");
+		const orig = Buffer.concat(pages.map((p) => Buffer.from(p.data_base64, "base64")));
+		assert.equal(orig.length, bf.raw_bytes);
+		assert.equal(sha(orig), bf.raw_sha256);
+		const ot = orig.toString("utf8");
+		assert.match(ot, /--- FAIL: TestBuiltin \(0\.00s\)/);
+		assert.match(ot, /token \[REDACTED:e2e\]/, "redacted before retention");
+		assert.ok(!ot.includes("XM_E2E_SECRET_abc123"));
+		assert.match(ot, /Command exited with code 3$/);
+		// expansion activates between the read result and the next model request
+		const idx = run.trace.findIndex((l) => l.tool_results.some((r) => r.toolName === "read"));
+		assert.ok(!run.trace[idx - 1]?.active_tools.includes("xmustard_expand"));
+		assert.ok(run.trace[idx].active_tools.includes("xmustard_expand"));
+		record("builtins", {
+			read: { raw_bytes: rf.raw_bytes, projected_text_bytes: Buffer.byteLength(textOf(read)), reducer: read.details?.xmustard?.reducer },
+			bash: { raw_bytes: bf.raw_bytes, projected_text_bytes: Buffer.byteLength(bt), reducer: bash.details?.xmustard?.reducer, pages: pages.length },
+		});
+	});
+
+	test("masking: older results become stubs only at window turns; the latest failure and edited files stay; stubs recover originals; raw entries are kept", async () => {
+		writeFileSync(join(repo, "mid.txt"), `${Array.from({ length: 120 }, (_, i) => `mid line ${i} ${"y".repeat(30)}`).join("\n")}\n`);
+		let entries: any[] = [];
+		const run = await pi(
+			"masking",
+			[
+				{ calls: [{ name: "bash", args: { command: "seq 1 800" } }] }, // turn 1
+				{ calls: [{ name: "read", args: { path: "mid.txt" } }] }, // turn 2
+				{ calls: [{ name: "bash", args: { command: "seq 1 700; exit 2" } }] }, // turn 3: the latest failure
+				{ calls: [{ name: "edit", args: { path: "mid.txt", edits: [{ oldText: "mid line 0 ", newText: "mid line zero " }] } }] }, // turn 4
+				{ calls: [{ name: "bash", args: { command: "seq 1 600" } }] }, // turn 5
+				{ calls: [{ name: "bash", args: { command: "true" } }] }, // turn 6
+				{ text: "done" }, // turn 7
+			],
+			{
+				env: { XMUSTARD_PI_MASK_AFTER_TURNS: "2", XMUSTARD_PI_MASK_EVERY_TURNS: "2" },
+				rpcManual: true,
+				rpc: (ev, write, end) => {
+					if (ev.type === "agent_settled") write({ id: "g1", type: "get_entries" });
+					if (ev.type === "response" && ev.command === "get_entries") {
+						entries = ev.data?.entries ?? ev.data ?? [];
+						end();
+					}
+				},
+			},
+		);
+		assert.equal(run.code, 0, run.stderr);
+		const results = toolResultMessages(run);
+		const idOf = (name: string, n = 0) => results.filter((m) => m.toolName === name)[n]?.toolCallId as string;
+		const [b1, rd, b3] = [idOf("bash", 0), idOf("read"), idOf("bash", 1)];
+		// which results each model request saw masked
+		const maskedPerRequest = run.trace.map((l) =>
+			l.context_results
+				.filter((r) => r.head.startsWith(MASKED))
+				.map((r) => r.toolCallId)
+				.sort(),
+		);
+		assert.deepEqual(
+			maskedPerRequest,
+			[[], [], [], [], [b1], [b1], [b1, rd].sort()],
+			`masks advance only after turns 4 and 6: ${JSON.stringify(maskedPerRequest)}`,
+		);
+		// the failure is never masked; the read of mid.txt survives the first window (edited at turn 4)
+		for (const l of run.trace) {
+			const f = l.context_results.find((r) => r.toolCallId === b3);
+			if (f) {
+				assert.ok(!f.head.startsWith(MASKED), "the latest failure stays visible");
+				assert.equal(f.isError, true);
+			}
+		}
+		// the stub reached the model with the original's error flag, and recovers the original exactly
+		const stub = run.trace[4].context_results.find((r) => r.toolCallId === b1) ?? assert.fail("no stub");
+		const m = stubHandle(stub.head) ?? assert.fail(`stub names no handle: ${stub.head}`);
+		assert.equal(m[2], ws);
+		const orig = await readAll(api, ws, m[1]);
+		const original = textOf(results.find((r) => r.toolCallId === b1));
+		assert.equal(orig.bytes.toString("utf8"), original, "the masked original is recoverable byte for byte");
+		assert.equal(sha(orig.bytes), sha(Buffer.from(original)));
+		// raw entries are kept: the session still holds the original result, plus context edits
+		const rawResult = entries.find((e) => e.type === "message" && e.message?.toolCallId === b1);
+		assert.ok(rawResult, `get_entries returned ${entries.length} entries`);
+		assert.equal(textOf(rawResult.message), original);
+		const edits = entries.filter((e) => e.type === "context_edit");
+		assert.equal(edits.length, 2);
+		assert.ok(edits.some((e) => e.targetId === rawResult.id));
+		assert.ok(run.trace.at(-1)?.active_tools.includes("xmustard_expand"), "stubs activate xmustard_expand");
+		record("masking", { masked_per_request: maskedPerRequest.map((x) => x.length), stub: stub.head.slice(0, 240), context_edits: edits.length });
+	});
+
+	test("compaction: a snapshot entry whose details carry handles reaches the next model request; every handle recovers its original", async () => {
+		let phase = "p1";
+		let compacted: any;
+		let entries: any[] = [];
+		const run = await pi(
+			"compaction",
+			[
+				{ calls: [{ name: "bash", args: { command: "seq 1 800" } }] },
+				{ calls: [{ name: "read", args: { path: "mid.txt" } }] },
+				{ calls: [{ name: "bash", args: { command: "seq 1 700; echo 'boom: compaction fixture'; exit 4" } }] },
+				{ calls: [call("remember", { content: "compaction e2e memory", title: "compaction-e2e" })] },
+				{ text: "phase one done" },
+				{ text: "after compaction" },
+			],
+			{
+				env: { XMUSTARD_PI_MASK: "off" },
+				settings: { compaction: { keepRecentTokens: 1 } },
+				rpcManual: true,
+				rpc: (ev, write, end) => {
+					if (ev.type === "agent_settled" && phase === "p1") {
+						phase = "compacting";
+						write({ id: "c1", type: "compact" });
+					} else if (ev.type === "response" && ev.command === "compact") {
+						compacted = ev;
+						phase = "p2";
+						write({ id: "p2", type: "prompt", message: "continue after compaction" });
+					} else if (ev.type === "agent_settled" && phase === "p2") {
+						phase = "entries";
+						write({ id: "g1", type: "get_entries" });
+					} else if (ev.type === "response" && ev.command === "get_entries") {
+						entries = ev.data?.entries ?? ev.data ?? [];
+						end();
+					}
+				},
+				timeoutMs: 60_000,
+			},
+		);
+		assert.equal(run.code, 0, run.stderr);
+		assert.equal(compacted?.success, true, JSON.stringify(compacted).slice(0, 500));
+		const { summary, details } = compacted.data;
+		assert.ok(summary.startsWith("[xmustard compaction snapshot]"), summary.slice(0, 200));
+		assert.match(summary, /not verified memory/);
+		assert.ok(Buffer.byteLength(summary) <= 2048, `${Buffer.byteLength(summary)} bytes`);
+		assert.match(summary, /Open failures:\n- bash `seq 1 700; echo 'boom: compaction fixture'; exit 4` \(turn 3\): Command exited with code 4 → xm1\./);
+		assert.equal(details?.xmustard?.version, "xmustard.pi-compaction/v1");
+		assert.equal(details.xmustard.verified_memory, false);
+		// every summarized output above 1 KiB has a handle that recovers it exactly
+		const results = toolResultMessages(run);
+		const big = results.filter((m) => Buffer.byteLength(textOf(m)) > 1024);
+		assert.equal(big.length, 3);
+		const byCall = new Map<string, any>(details.xmustard.handles.map((h: any) => [h.tool_call_id, h]));
+		for (const m of big) {
+			const h = byCall.get(m.toolCallId) ?? assert.fail(`no handle for ${m.toolName} ${m.toolCallId}`);
+			const got = await readAll(api, h.workspace_id, h.handle);
+			assert.equal(got.status, 200);
+			assert.equal(got.bytes.toString("utf8"), textOf(m), `${m.toolName} original recovered`);
+		}
+		// the entry Pi appended is ours, with the handles in details
+		const entry = entries.find((e) => e.type === "compaction");
+		assert.ok(entry, "compaction entry appended");
+		assert.equal(entry.fromHook, true);
+		assert.equal(entry.summary, summary);
+		assert.deepEqual(entry.details.xmustard.handles, details.xmustard.handles);
+		// the next model request carries the snapshot, not the compacted tool outputs
+		const after = run.trace.find((l) => l.user_texts.some((t) => t.includes(summary))) ?? assert.fail("snapshot never reached the model");
+		for (const m of big) assert.ok(!after.context_results.some((r) => r.toolCallId === m.toolCallId), "compacted results are out of context");
+		assert.ok(after.active_tools.includes("xmustard_expand"));
+		record("compaction", { summary_bytes: Buffer.byteLength(summary), handles: details.xmustard.handles.length, tokens_before: compacted.data.tokensBefore });
 	});
 });

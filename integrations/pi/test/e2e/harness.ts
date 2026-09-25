@@ -396,6 +396,8 @@ export interface TraceLine {
 	active_tools: string[];
 	tools?: { name: string; description: string; parameters: unknown }[];
 	tool_results: { toolCallId: string; toolName: string; isError: boolean; text: string }[];
+	context_results: { toolCallId: string; toolName: string; isError: boolean; bytes: number; head: string }[];
+	user_texts: string[];
 }
 
 export interface PiRun {
@@ -414,15 +416,21 @@ export interface PiOptions {
 	steps: Step[];
 	env?: Record<string, string>;
 	timeoutMs?: number;
-	// rpc: drive `pi --mode rpc`; onEvent may write further commands to stdin.
-	rpc?: (ev: any, write: (cmd: unknown) => void) => void;
+	// rpc: drive `pi --mode rpc`; onEvent may write further commands to stdin. Unless
+	// rpcManual is set, stdin closes at the first agent_settled; with it, the callback
+	// calls end() itself.
+	rpc?: (ev: any, write: (cmd: unknown) => void, end: () => void) => void;
+	rpcManual?: boolean;
+	// Pi settings written to the empty agent dir's settings.json
+	settings?: Record<string, unknown>;
 }
 
 // runPi runs the real `pi` CLI once with the adapter and the scripted provider.
 export async function runPi(o: PiOptions): Promise<PiRun> {
 	mkdirSync(o.dir, { recursive: true });
 	const home = join(o.dir, "home");
-	mkdirSync(home, { recursive: true });
+	mkdirSync(join(home, "agent"), { recursive: true });
+	if (o.settings) writeFileSync(join(home, "agent", "settings.json"), JSON.stringify(o.settings));
 	const scenario = join(o.dir, "scenario.json");
 	const trace = join(o.dir, "trace.jsonl");
 	writeFileSync(scenario, JSON.stringify({ steps: o.steps }));
@@ -468,6 +476,7 @@ export async function runPi(o: PiOptions): Promise<PiRun> {
 	let pending = "";
 	const events: any[] = [];
 	const write = (cmd: unknown) => child.stdin.write(`${JSON.stringify(cmd)}\n`);
+	const end = () => child.stdin.end();
 	child.stdout.on("data", (b: Buffer) => {
 		const s = b.toString("utf8");
 		stdout += s;
@@ -486,8 +495,8 @@ export async function runPi(o: PiOptions): Promise<PiRun> {
 			}
 			events.push(ev);
 			if (o.rpc) {
-				o.rpc(ev, write);
-				if (ev.type === "agent_settled") child.stdin.end();
+				o.rpc(ev, write, end);
+				if (ev.type === "agent_settled" && !o.rpcManual) end();
 			}
 		}
 	});
