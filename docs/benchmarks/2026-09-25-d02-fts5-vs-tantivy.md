@@ -1,6 +1,8 @@
 # D-02: code-chunk BM25 storage, FTS5 versus tantivy — 2026-09-25
 
-Status: **measured; D-02 closes as option (a), rusqlite FTS5 in `index.db`.** This is the
+Status: **measured; the chunk BM25 part of D-02 closes as option (a), rusqlite FTS5 in
+`index.db`.** The graph placement in D-02 (file-backed CSR segments versus an in-memory CSR
+built on load) is not measured here and stays open for WS-14 (§12). This is the
 first deliverable of WS-07 (critic correction, PARITY_REQUIREMENTS §12.5), taken before
 the index schema was fixed.
 
@@ -52,7 +54,8 @@ is macOS peak physical footprint.
 
 ## Decision
 
-D-02 closes as **(a): rusqlite FTS5 inside the per-workspace `index.db`.**
+For code-chunk BM25 and the fact store, D-02 closes as **(a): rusqlite FTS5 inside the
+per-workspace `index.db`.** This decides nothing about the CSR graph.
 
 - **Writer RSS decides it.** The index writer runs in the single heavy slot with a
   ≤25 MiB transient line (§7.2). FTS5 peaks at 11–13 MiB for the whole build; tantivy's
