@@ -87,6 +87,7 @@ func TestGroundRejectsBadBudgetBeforeWork(t *testing.T) {
 		{"max_chars=65537", "max_chars"},
 		{"max_chars=lots", "max_chars"},
 		{"sections=runs,secrets", "sections"},
+		{"max_chars=3000&max_chars=9000", "max_chars"},
 	} {
 		code, _, m := getGround(t, base+"?"+tc.query)
 		if code != http.StatusBadRequest || m["argument"] != tc.arg {
@@ -151,6 +152,12 @@ func TestGroundFitsDefaultBudgetAndPagesSections(t *testing.T) {
 	}
 	if !slices.Equal(anyStrings(rep["not_requested"]), []string{"index", "memory", "drift", "principal"}) {
 		t.Fatalf("not_requested: %v", rep["not_requested"])
+	}
+	// a repeated parameter selects each value
+	_, _, m = getGround(t, base+"?sections=runs&sections=memory")
+	rep = m[groundbudget.ReportMember].(map[string]any)
+	if !slices.Equal(anyStrings(rep["not_requested"]), []string{"index", "drift", "principal"}) || m["stale_memory"] == nil {
+		t.Fatalf("repeated sections: not_requested %v", rep["not_requested"])
 	}
 }
 

@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 
 	"xmustard/api-go/internal/groundbudget"
 	"xmustard/api-go/internal/workspaceops"
@@ -15,8 +16,12 @@ import (
 func registerGroundRoutes(mux routeRegistrar) {
 	mux.HandleFunc("GET /api/workspaces/{workspace_id}/session-grounding", func(w http.ResponseWriter, r *http.Request) {
 		// validate before any work: out-of-range values are rejected, never clamped
+		// sections may repeat (?sections=runs&sections=index) or be comma-separated
 		q := r.URL.Query()
-		req, aerr := groundbudget.ParseRequest(q.Get("sections"), q.Get("max_chars"))
+		req, aerr := groundbudget.ParseRequest(strings.Join(q["sections"], ","), q.Get("max_chars"))
+		if aerr == nil && len(q["max_chars"]) > 1 {
+			aerr = &groundbudget.ArgError{Argument: "max_chars", Reason: "must be given once"}
+		}
 		if aerr != nil {
 			body := map[string]any{"error": aerr.Error(), "argument": aerr.Argument, "reason": aerr.Reason}
 			for k, v := range aerr.Extra {
