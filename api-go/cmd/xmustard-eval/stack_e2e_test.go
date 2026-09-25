@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -91,6 +92,48 @@ func TestRealStackDryRun(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestRealStackAPIContained: the agent can configure its run repository (here
+// core.fsmonitor) and xmustard-api then runs git in the worktree. The API runs under
+// the run's containment, so the planted command cannot read the hidden oracle. Opt-in
+// like TestRealStackDryRun.
+func TestRealStackAPIContained(t *testing.T) {
+	core := os.Getenv("XMUSTARD_CORE_BIN")
+	if os.Getenv("XMUSTARD_EVAL_REAL_STACK") != "1" || core == "" {
+		t.Skip("set XMUSTARD_EVAL_REAL_STACK=1 and XMUSTARD_CORE_BIN to run against the real stack")
+	}
+	mode := availableContainment(t)
+	bin := t.TempDir()
+	for _, name := range []string{"xmustard-api", "xmustard-mcp"} {
+		cmd := exec.Command("go", "build", "-o", filepath.Join(bin, name), "./cmd/"+name)
+		cmd.Dir = "../.."
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("build %s: %v\n%s", name, err, out)
+		}
+	}
+	c := loadTestCorpus(t, "../../../eval/tasks/seed.yaml")
+	oracle := c.resolve("oracles/service_port_hidden_test.go")
+	marker := filepath.Join(t.TempDir(), "fsmonitor.out")
+	out := filepath.Join(t.TempDir(), "out")
+	cfg := prepared(t, &RunConfig{Driver: "fake:claude", Arms: []string{ArmXmustardMCP}, Tasks: []string{"service-agreed-port"}, Containment: mode,
+		Stack: StackConfig{Kind: StackReal, APIBin: filepath.Join(bin, "xmustard-api"), MCPBin: filepath.Join(bin, "xmustard-mcp"), CoreBin: core}}, c, out)
+	cfg.fakeGitConfig = "core.fsmonitor=cat " + oracle + " >> " + marker + " 2>&1; true #"
+	if _, err := Execute(context.Background(), cfg, c); err != nil {
+		t.Fatal(err)
+	}
+	r := readRecords(t, out)[0]
+	if r.Status != StatusCompleted || !r.Resolved {
+		t.Fatalf("contained API run: %s %q", r.Status, r.Reason)
+	}
+	b, err := os.ReadFile(marker)
+	if err != nil {
+		t.Skipf("the API did not run the planted fsmonitor (nothing to check): %v", err)
+	}
+	if strings.Contains(string(b), "TestHidden") {
+		t.Fatalf("a command the agent planted read the hidden oracle through xmustard-api:\n%s", b)
+	}
+	t.Logf("planted fsmonitor ran under %s: %q", mode, strings.TrimSpace(string(b)))
 }
 
 func deref(p *float64) any {

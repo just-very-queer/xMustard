@@ -27,8 +27,8 @@ func TestParseClaudeFinalEvent(t *testing.T) {
 		t.Fatalf("final event: %+v", tr)
 	}
 	want := Usage{Input: 101, Output: 202, CacheRead: 303, CacheWrite: 404, Total: 1010}
-	if tr.Usage != want || tr.UsageSource != "result.modelUsage" {
-		t.Fatalf("usage %+v (%s), want %+v", tr.Usage, tr.UsageSource, want)
+	if tr.Usage != want || tr.UsageSource != "result.modelUsage" || !tr.UsageReported {
+		t.Fatalf("usage %+v (%s, reported %v), want %+v", tr.Usage, tr.UsageSource, tr.UsageReported, want)
 	}
 	if tr.CostUSD == nil || *tr.CostUSD != 0.1234 || tr.CostSource != CostClientFinal {
 		t.Fatalf("cost %v %s", tr.CostUSD, tr.CostSource)
@@ -58,12 +58,12 @@ func TestParseClaudeFinalEvent(t *testing.T) {
 	// an error result is final but flagged
 	errRes := `{"type":"result","subtype":"error_max_budget_usd","is_error":true,"num_turns":9,"total_cost_usd":5}`
 	tr = claudeDriver{}.Parse(strings.NewReader(errRes), "xmustard")
-	if !tr.FinalEvent || !tr.IsError || tr.ErrorText != "error_max_budget_usd" {
-		t.Fatalf("error result %+v", tr)
+	if !tr.FinalEvent || !tr.IsError || tr.ErrorText != "error_max_budget_usd" || tr.UsageReported {
+		t.Fatalf("error result without usage %+v", tr)
 	}
-	// no result event: not final, no cost
+	// no result event (killed at the timeout): not final, no cost, usage not reported
 	tr = claudeDriver{}.Parse(strings.NewReader(`{"type":"system","subtype":"init"}`), "xmustard")
-	if tr.FinalEvent || tr.CostUSD != nil || tr.CostSource != CostUnpriced {
+	if tr.FinalEvent || tr.CostUSD != nil || tr.CostSource != CostUnpriced || tr.UsageReported {
 		t.Fatalf("missing final %+v", tr)
 	}
 }
@@ -82,8 +82,8 @@ const codexStream = `{"type":"thread.started","thread_id":"abc"}
 func TestParseCodexFinalEvent(t *testing.T) {
 	tr := codexDriver{}.Parse(strings.NewReader(codexStream), "xmustard")
 	want := Usage{Input: 800, CacheRead: 700, Output: 350, Reasoning: 120, Total: 1850}
-	if !tr.FinalEvent || tr.FinalKind != "turn.completed" || tr.Usage != want || tr.NumTurns != 2 {
-		t.Fatalf("usage %+v final %v turns %d, want %+v", tr.Usage, tr.FinalEvent, tr.NumTurns, want)
+	if !tr.FinalEvent || tr.FinalKind != "turn.completed" || tr.Usage != want || tr.NumTurns != 2 || !tr.UsageReported {
+		t.Fatalf("usage %+v final %v turns %d reported %v, want %+v", tr.Usage, tr.FinalEvent, tr.NumTurns, tr.UsageReported, want)
 	}
 	if tr.CostUSD != nil || tr.CostSource != CostUnpriced {
 		t.Fatal("codex reports no cost; it must stay unpriced until a price table is applied")
@@ -106,8 +106,15 @@ func TestParseCodexFinalEvent(t *testing.T) {
 	}
 	failed := `{"type":"turn.failed","error":{"message":"rate limited"}}`
 	tr = codexDriver{}.Parse(strings.NewReader(failed), "xmustard")
-	if !tr.FinalEvent || !tr.IsError || tr.ErrorText != "rate limited" {
+	if !tr.FinalEvent || !tr.IsError || tr.ErrorText != "rate limited" || tr.UsageReported {
 		t.Fatalf("turn.failed %+v", tr)
+	}
+	// a failed turn carries no usage: the session total is unknown, and it is not
+	// priced from the partial sum of the earlier turns
+	tr = codexDriver{}.Parse(strings.NewReader(codexStream+failed+"\n"), "xmustard")
+	priceUsage(&tr, "gpt-x", map[string]Price{"gpt-x": {InputPerMTok: 1}})
+	if tr.UsageReported || tr.CostUSD != nil || tr.CostSource != CostUnpriced {
+		t.Fatalf("completed then failed: reported %v cost %v %s", tr.UsageReported, tr.CostUSD, tr.CostSource)
 	}
 }
 
@@ -126,8 +133,8 @@ func TestParsePiFinalEvent(t *testing.T) {
 	stats := `{"id":"xm-eval-stats","type":"response","command":"get_session_stats","success":true,"data":{"tokens":{"input":11,"output":22,"cacheRead":33,"cacheWrite":44,"total":110},"cost":0.3}}` + "\n"
 	tr := piDriver{}.Parse(strings.NewReader(piStream+stats), "")
 	want := Usage{Input: 11, Output: 22, CacheRead: 33, CacheWrite: 44, Reasoning: 6, Total: 110}
-	if !tr.FinalEvent || tr.FinalKind != "get_session_stats" || tr.Usage != want {
-		t.Fatalf("usage %+v, want %+v", tr.Usage, want)
+	if !tr.FinalEvent || tr.FinalKind != "get_session_stats" || tr.Usage != want || !tr.UsageReported {
+		t.Fatalf("usage %+v (reported %v), want %+v", tr.Usage, tr.UsageReported, want)
 	}
 	if tr.CostUSD == nil || *tr.CostUSD != 0.3 || tr.CostSource != CostClientFinal || tr.NumTurns != 2 || tr.Model != "gpt-5" {
 		t.Fatalf("cost %v %s turns %d", tr.CostUSD, tr.CostSource, tr.NumTurns)
@@ -137,7 +144,7 @@ func TestParsePiFinalEvent(t *testing.T) {
 	}
 	// no stats response: per-message sums, labelled as such, and not final
 	tr = piDriver{}.Parse(strings.NewReader(piStream), "")
-	if tr.FinalEvent || tr.Usage != (Usage{Input: 11, Output: 22, CacheRead: 33, CacheWrite: 44, Reasoning: 6, Total: 110}) || tr.UsageSource != "message_end" {
+	if tr.FinalEvent || tr.Usage != (Usage{Input: 11, Output: 22, CacheRead: 33, CacheWrite: 44, Reasoning: 6, Total: 110}) || tr.UsageSource != "message_end" || tr.UsageReported {
 		t.Fatalf("fallback %+v", tr)
 	}
 	if tr.CostUSD == nil || *tr.CostUSD != 0.3 || tr.CostSource != CostClientMessage {
@@ -244,9 +251,14 @@ func TestContainmentWrappers(t *testing.T) {
 	dir := t.TempDir()
 	file := dir + "/secret.txt"
 	mustWrite(t, file, "x")
+	own := dir + "/runs/r0/stack"
+	if err := os.MkdirAll(own, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	inv := Invocation{Bin: "claude", Args: []string{"-p"}}
 	ro := t.TempDir()
-	sb, err := contain(ContainSandbox, []string{dir, file, dir + "/missing"}, []string{ro}, inv)
+	missing := ro + "/not-yet/.gitconfig"
+	sb, err := contain(&sandbox{mode: ContainSandbox, hidden: []string{dir, file, dir + "/missing"}, readOnly: []string{ro, missing}}, inv)
 	if err != nil || sb.Bin != "sandbox-exec" || sb.Args[0] != "-p" || sb.Args[2] != "claude" || sb.Args[3] != "-p" {
 		t.Fatalf("sandbox wrapper %v %v", sb, err)
 	}
@@ -254,17 +266,30 @@ func TestContainmentWrappers(t *testing.T) {
 		!strings.Contains(sb.Args[1], "(deny file-write* (subpath ") {
 		t.Fatalf("sandbox profile %s", sb.Args[1])
 	}
-	bw, _ := contain(ContainBwrap, []string{dir, file}, []string{ro}, inv)
+	// the process's own directory inside a hidden path is re-allowed, after the denies
+	_, withOwn, _ := (&sandbox{mode: ContainSandbox, hidden: []string{dir}}).with(own).wrap("xmustard-api", nil)
+	realOwn, _ := filepathEval(own)
+	realDir, _ := filepathEval(dir)
+	prof := withOwn[1]
+	if i, j := strings.Index(prof, "(deny file-read* file-write* (subpath "+sbplString(realDir)), strings.Index(prof, "(allow file-read* file-write* (subpath "+sbplString(realOwn)); i < 0 || j < i ||
+		!strings.Contains(prof, "(allow file-read-metadata (literal "+sbplString(realDir)+"))") {
+		t.Fatalf("allow rule missing or before the deny: %s", prof)
+	}
+	bw, _ := contain(&sandbox{mode: ContainBwrap, hidden: []string{dir, file}, readOnly: []string{ro}, allow: []string{own}}, inv)
 	j := strings.Join(bw.Args, " ")
-	if bw.Bin != "bwrap" || !strings.Contains(j, "--tmpfs ") || !strings.Contains(j, "--ro-bind /dev/null ") || !strings.HasSuffix(j, "-- claude -p") {
+	if bw.Bin != "bwrap" || !strings.Contains(j, "--tmpfs ") || !strings.Contains(j, "--ro-bind /dev/null ") || !strings.HasSuffix(j, "-- claude -p") ||
+		!strings.Contains(j, "--unshare-pid") || !strings.Contains(j, "--bind "+realOwn+" "+realOwn) {
 		t.Fatalf("bwrap wrapper %s", j)
 	}
 	if realRO, _ := filepathEval(ro); !strings.Contains(j, "--ro-bind "+realRO+" "+realRO) {
 		t.Fatalf("bwrap read-only bind missing: %s", j)
 	}
-	none, _ := contain(ContainNone, []string{dir}, nil, inv)
+	none, _ := contain(&sandbox{mode: ContainNone, hidden: []string{dir}}, inv)
 	if none.Bin != "claude" {
 		t.Fatal("none must not wrap")
+	}
+	if nilSB, _ := contain(nil, inv); nilSB.Bin != "claude" {
+		t.Fatal("a nil sandbox must not wrap")
 	}
 	if _, err := resolveContainment("jail"); err == nil {
 		t.Fatal("unknown containment accepted")

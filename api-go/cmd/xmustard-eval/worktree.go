@@ -3,7 +3,6 @@ package main
 import (
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"slices"
@@ -17,16 +16,25 @@ import (
 // repository's objects through git alternates, so refs, config, hooks and objects an
 // agent creates (a commit, a branch, a hook) die with the run and never reach a later
 // run of the same task.
+//
+// The agent can write the per-run repository (its config, hooks, alternates) and the
+// worktree's .git file, and git runs configured commands (core.fsmonitor, clean
+// filters, diff.external) as whoever invokes it. So once the agent has started, the
+// harness never runs git through them: snapshots and diffs go through a harness-owned
+// git directory and index (hdir, hindex) that borrow only the scratch objects, and
+// removal deletes the directories without running git.
 type Worktree struct {
 	Repo    string // repository the worktree belongs to
 	Dir     string
 	SHA     string
-	ownRepo bool // Repo is a per-run repository, removed with the worktree
+	ownRepo bool   // Repo is a per-run repository, removed with the worktree
+	hdir    string // harness-owned git directory (hidden from the agent)
+	hindex  string // harness-owned index inside hdir
 }
 
-// newRunWorktree creates runRepo borrowing scratch's objects and a detached worktree
-// of it at sha in dir.
-func newRunWorktree(scratch, sha, runRepo, dir string) (*Worktree, error) {
+// newRunWorktree creates runRepo borrowing scratch's objects, a detached worktree of
+// it at sha in dir, and the harness's own git directory for it in harnessDir.
+func newRunWorktree(scratch, sha, runRepo, dir, harnessDir string) (*Worktree, error) {
 	if err := os.MkdirAll(filepath.Dir(runRepo), 0o755); err != nil {
 		return nil, err
 	}
@@ -35,6 +43,7 @@ func newRunWorktree(scratch, sha, runRepo, dir string) (*Worktree, error) {
 	}
 	fail := func(err error) (*Worktree, error) {
 		_ = os.RemoveAll(runRepo)
+		_ = os.RemoveAll(harnessDir)
 		return nil, err
 	}
 	objects, err := filepath.Abs(filepath.Join(scratch, ".git", "objects"))
@@ -56,7 +65,47 @@ func newRunWorktree(scratch, sha, runRepo, dir string) (*Worktree, error) {
 		return fail(err)
 	}
 	w.ownRepo = true
+	if err := w.initHarnessGit(objects, harnessDir); err != nil {
+		_ = w.Remove()
+		return fail(err)
+	}
 	return w, nil
+}
+
+// initHarnessGit creates the harness's git directory for w: a bare repository that
+// borrows only the given (read-only) objects, and an index seeded from the fresh
+// checkout's own index, which git wrote before any agent or task command ran.
+func (w *Worktree) initHarnessGit(objects, harnessDir string) error {
+	if err := os.MkdirAll(filepath.Dir(harnessDir), 0o700); err != nil {
+		return err
+	}
+	if _, err := git(filepath.Dir(harnessDir), "init", "-q", "--bare", harnessDir); err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(harnessDir, "objects", "info", "alternates"), []byte(objects+"\n"), 0o644); err != nil {
+		return err
+	}
+	realIndex, err := git(w.Dir, "rev-parse", "--path-format=absolute", "--git-path", "index")
+	if err != nil {
+		return err
+	}
+	b, err := os.ReadFile(realIndex)
+	if err != nil {
+		return err
+	}
+	w.hdir, w.hindex = harnessDir, filepath.Join(harnessDir, "index")
+	return os.WriteFile(w.hindex, b, 0o600)
+}
+
+// hgit runs git on the worktree through the harness-owned git directory and index.
+// Only the harness's own repository config applies; attributes in the worktree can
+// name a filter or diff driver, but no configuration defines one.
+func (w *Worktree) hgit(env []string, args ...string) (string, error) {
+	if w.hdir == "" {
+		return "", errors.New("worktree has no harness git directory")
+	}
+	env = append([]string{"GIT_DIR=" + w.hdir, "GIT_WORK_TREE=" + w.Dir, "GIT_INDEX_FILE=" + w.hindex}, env...)
+	return gitEnv(w.Dir, env, append([]string{"-c", "core.bare=false"}, args...)...)
 }
 
 // worktreeRegistry tracks every live worktree so an interrupt can remove the ones a
@@ -81,6 +130,13 @@ func (r *worktreeRegistry) remove(w *Worktree) error {
 	delete(r.live, w.Dir)
 	r.mu.Unlock()
 	return w.Remove()
+}
+
+// forget stops tracking w without removing it (a kept worktree).
+func (r *worktreeRegistry) forget(w *Worktree) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.live, w.Dir)
 }
 
 // removeAll removes every worktree still registered.
@@ -148,16 +204,23 @@ func (w *Worktree) Detached() (bool, error) {
 }
 
 // Remove deletes the worktree directory and its administrative entry. It is safe to
-// call more than once and after a partial creation.
+// call more than once and after a partial creation. A per-run repository is deleted
+// outright: the agent could have configured it, so git is not run through it.
 func (w *Worktree) Remove() error {
+	if w.ownRepo {
+		var errs []error
+		for _, p := range []string{w.Dir, w.Repo, w.hdir} {
+			if p != "" {
+				errs = append(errs, os.RemoveAll(p))
+			}
+		}
+		return errors.Join(errs...)
+	}
 	_, rmErr := git(w.Repo, "worktree", "remove", "--force", "--force", w.Dir)
 	if _, err := os.Stat(w.Dir); err == nil {
 		if err := os.RemoveAll(w.Dir); err != nil {
 			return fmt.Errorf("remove worktree %s: %w (git: %v)", w.Dir, err, rmErr)
 		}
-	}
-	if w.ownRepo {
-		return os.RemoveAll(w.Repo)
 	}
 	if _, err := git(w.Repo, "worktree", "prune"); err != nil {
 		return err
@@ -172,8 +235,12 @@ func (w *Worktree) gone() bool {
 		return false
 	}
 	if w.ownRepo {
-		_, err := os.Stat(w.Repo)
-		return os.IsNotExist(err)
+		for _, p := range []string{w.Repo, w.hdir} {
+			if _, err := os.Stat(p); p != "" && !os.IsNotExist(err) {
+				return false
+			}
+		}
+		return true
 	}
 	registered, err := registeredWorktree(w.Repo, w.Dir)
 	return err == nil && !registered
@@ -202,36 +269,37 @@ func registeredWorktree(repo, dir string) (bool, error) {
 }
 
 // SnapshotTree records the complete working-tree state (tracked, modified and new
-// untracked files, honouring .gitignore) as a git tree object without touching the
-// worktree's own index or creating a commit. It seeds a private index from the real
-// one so unchanged files are not rehashed.
-func (w *Worktree) SnapshotTree(scratch string) (string, error) {
-	realIndex, err := git(w.Dir, "rev-parse", "--path-format=absolute", "--git-path", "index")
-	if err != nil {
+// untracked files, honouring .gitignore) as a git tree object in the harness's git
+// directory, without touching the worktree's own index or creating a commit. The
+// harness index keeps stat data from the previous snapshot, so unchanged files are
+// not rehashed.
+func (w *Worktree) SnapshotTree() (string, error) {
+	if _, err := w.hgit(nil, "add", "-A"); err != nil {
 		return "", err
 	}
-	tmp, err := os.CreateTemp(scratch, "index-*")
-	if err != nil {
-		return "", err
-	}
-	tmpPath := tmp.Name()
-	defer os.Remove(tmpPath)
-	if src, err := os.Open(realIndex); err == nil {
-		_, cerr := io.Copy(tmp, src)
-		src.Close()
-		if cerr != nil {
-			tmp.Close()
-			return "", cerr
+	return w.hgit(nil, "write-tree")
+}
+
+// RestoreTree resets the worktree's non-ignored files to tree: files changed or
+// deleted since are written back, and new untracked files and directories are
+// removed. Ignored files are left alone (they are outside every snapshot).
+func (w *Worktree) RestoreTree(tree string) error {
+	idx := filepath.Join(w.hdir, "restore-index")
+	defer os.Remove(idx)
+	env := []string{"GIT_INDEX_FILE=" + idx}
+	for _, args := range [][]string{{"read-tree", tree}, {"checkout-index", "-a", "-f"}, {"clean", "-ffdq"}} {
+		if _, err := w.hgit(env, args...); err != nil {
+			return err
 		}
 	}
-	if err := tmp.Close(); err != nil {
-		return "", err
+	got, err := w.SnapshotTree()
+	if err != nil {
+		return err
 	}
-	env := []string{"GIT_INDEX_FILE=" + tmpPath}
-	if _, err := gitEnv(w.Dir, env, "add", "-A"); err != nil {
-		return "", err
+	if got != tree {
+		return fmt.Errorf("worktree is %s after restoring %s", got, tree)
 	}
-	return gitEnv(w.Dir, env, "write-tree")
+	return nil
 }
 
 // DiffChurn is the size of an agent's change between two snapshots.
@@ -243,11 +311,12 @@ type DiffChurn struct {
 	Files        []string `json:"files"`
 }
 
-// diffChurn computes numstat churn from tree a to tree b and writes the full patch to
-// patchPath (when non-empty).
-func diffChurn(repoDir, a, b, patchPath string) (DiffChurn, error) {
+// diffChurn computes numstat churn from tree a to tree b in the harness's git
+// directory and writes the full patch to patchPath (when non-empty). External diff
+// drivers and textconv are off.
+func diffChurn(w *Worktree, a, b, patchPath string) (DiffChurn, error) {
 	var ch DiffChurn
-	out, err := git(repoDir, "diff", "--no-renames", "--numstat", "-z", a, b)
+	out, err := w.hgit(nil, "diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--numstat", "-z", a, b)
 	if err != nil {
 		return ch, err
 	}
@@ -272,7 +341,7 @@ func diffChurn(repoDir, a, b, patchPath string) (DiffChurn, error) {
 	}
 	slices.Sort(ch.Files)
 	if patchPath != "" {
-		patch, err := git(repoDir, "diff", "--no-renames", "--binary", a, b)
+		patch, err := w.hgit(nil, "diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--binary", a, b)
 		if err != nil {
 			return ch, err
 		}

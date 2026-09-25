@@ -81,7 +81,9 @@ type MemoryMetrics struct {
 	Seeded                 map[string]int `json:"seeded"`
 	Served                 map[string]int `json:"served"` // distinct seeded keys delivered at least once, by label
 	CurrentFactRecall      *float64       `json:"current_fact_recall,omitempty"`
-	StaleServedRate        *float64       `json:"stale_served_rate,omitempty"` // stale memories delivered WITHOUT a stale flag
+	RecallK                int            `json:"recall_k"`
+	CurrentFactRecallAtK   *float64       `json:"current_fact_recall_at_k,omitempty"` // among a ranked recall's first RecallK entries; nil when no recall was ranked
+	StaleServedRate        *float64       `json:"stale_served_rate,omitempty"`        // stale memories delivered WITHOUT a stale flag
 	StaleServedFlagged     int            `json:"stale_served_flagged"`
 	SupersededServedRate   *float64       `json:"superseded_served_rate,omitempty"`
 	DuplicatePairs         int            `json:"duplicate_pairs"`
@@ -121,8 +123,8 @@ type servedEntry struct {
 // scanDeliveries finds seeded markers in each xMustard tool result. Structured recall
 // results are parsed to read each entry's stale flag, verification mode and the
 // server's conflict groups; text that is not JSON still counts by marker alone.
-func scanDeliveries(taskID string, seeds []SeedMemory, results []ToolResult, entryKeys map[string]string) (perResult [][]servedEntry, flaggedPairs map[[2]string]bool) {
-	flaggedPairs = map[[2]string]bool{}
+func scanDeliveries(taskID string, seeds []SeedMemory, results []ToolResult, entryKeys map[string]string) (perResult [][]servedEntry, flaggedPairs map[[2]string]bool, bestRank map[string]int, ranked int) {
+	flaggedPairs, bestRank = map[[2]string]bool{}, map[string]int{}
 	markers := map[string]string{}
 	for _, s := range seeds {
 		markers[memoryMarker(taskID, s.Key)] = s.Key
@@ -137,6 +139,9 @@ func scanDeliveries(taskID string, seeds []SeedMemory, results []ToolResult, ent
 			}
 		}
 		if doc, ok := firstJSONValue(r.Text); ok {
+			if r.Tool == "recall" && rankEntries(doc, markers, bestRank) {
+				ranked++
+			}
 			walkJSON(doc, func(o map[string]any) {
 				content := str(o["content"])
 				for m, key := range markers {
@@ -167,7 +172,41 @@ func scanDeliveries(taskID string, seeds []SeedMemory, results []ToolResult, ent
 		slices.SortFunc(served, func(a, b servedEntry) int { return strings.Compare(a.key, b.key) })
 		perResult = append(perResult, served)
 	}
-	return perResult, flaggedPairs
+	return perResult, flaggedPairs, bestRank, ranked
+}
+
+// rankEntries records, for each seeded key, its best (0-based) position in any ranked
+// "entries" list inside doc, and reports whether doc had such a list.
+func rankEntries(doc any, markers map[string]string, best map[string]int) bool {
+	found := false
+	var walk func(v any)
+	walk = func(v any) {
+		switch t := v.(type) {
+		case map[string]any:
+			if list, ok := t["entries"].([]any); ok {
+				found = true
+				for i, e := range list {
+					content := str(obj(e)["content"])
+					for m, key := range markers {
+						if strings.Contains(content, m) {
+							if r, seen := best[key]; !seen || i < r {
+								best[key] = i
+							}
+						}
+					}
+				}
+			}
+			for _, k := range sortedKeys(t) {
+				walk(t[k])
+			}
+		case []any:
+			for _, e := range t {
+				walk(e)
+			}
+		}
+	}
+	walk(doc)
+	return found
 }
 
 func pairKey(a, b string) [2]string {
@@ -188,9 +227,9 @@ func memoryMetrics(taskID string, m *MemorySpec, xm []ToolResult, seeds []SeedRe
 			entryKeys[s.EntryID] = s.Key
 		}
 	}
-	perResult, flagged := scanDeliveries(taskID, m.Seed, xm, entryKeys)
+	perResult, flagged, bestRank, ranked := scanDeliveries(taskID, m.Seed, xm, entryKeys)
 	label := map[string]string{}
-	mm := &MemoryMetrics{Seeded: map[string]int{}, Served: map[string]int{}, PromotionErrors: promotionErrors}
+	mm := &MemoryMetrics{Seeded: map[string]int{}, Served: map[string]int{}, PromotionErrors: promotionErrors, RecallK: m.recallK()}
 	for _, s := range m.Seed {
 		label[s.Key] = s.Label
 		mm.Seeded[s.Label]++
@@ -220,6 +259,15 @@ func memoryMetrics(taskID string, m *MemorySpec, xm []ToolResult, seeds []SeedRe
 		}
 	}
 	mm.CurrentFactRecall = ratio(mm.Served[LabelCurrent], mm.Seeded[LabelCurrent])
+	if ranked > 0 {
+		atK := 0
+		for _, s := range m.Seed {
+			if r, ok := bestRank[s.Key]; ok && s.Label == LabelCurrent && r < mm.RecallK {
+				atK++
+			}
+		}
+		mm.CurrentFactRecallAtK = ratio(atK, mm.Seeded[LabelCurrent])
+	}
 	mm.StaleServedRate = ratio(staleUnflagged, mm.Seeded[LabelStale])
 	mm.SupersededServedRate = ratio(mm.Served[LabelSuperseded], mm.Seeded[LabelSuperseded])
 	mm.ScopeLeakage = mm.Served[LabelForeignScope]

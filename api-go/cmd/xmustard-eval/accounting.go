@@ -22,13 +22,31 @@ const GateBytes = 100_000_000
 // RSS sampling follows the frozen v1 bench (scripts/bench/rss_bench.py): one `ps`
 // snapshot every 100 ms, RSS summed over every xMustard-owned process in that single
 // snapshot. The xMustard tree is the registered API process(es) with all their
-// descendants, plus any xmustard-api/-mcp/-core process under the agent (the stdio
-// shim the client launches) with its descendants. The agent's other processes are an
-// external line and never count toward the gate. The eval executor itself is outside
-// both trees. Sampling can miss short peaks, so these are SAMPLED peaks; footprint and
-// PSS (WS-10's gate v2) are not measured here.
+// descendants, plus any xMustard process under the agent (the stdio shim the client
+// launches) with its descendants. xMustard processes are recognised by name: the
+// fixed names below plus the basenames of the configured stack binaries, so a renamed
+// shim or relay still counts toward the gate; each run records the names it matched.
+// The agent's other processes are an external line and never count toward the gate.
+// The eval executor, its watchdog and the containment wrapper (bwrap) are outside the
+// tree. Sampling can miss short peaks, so these are SAMPLED peaks; footprint and PSS
+// (WS-10's gate v2) are not measured here.
 
 var xmustardProcNames = []string{"xmustard-api", "xmustard-mcp", "xmustard-core"}
+
+// containmentWrappers are harness processes that may sit between a registered root
+// and the xMustard process; they are walked through but not counted.
+var containmentWrappers = []string{"bwrap", "sandbox-exec"}
+
+// procNameMatches reports whether a ps comm is one of names. Linux truncates comm to
+// 15 bytes, so a 15-byte comm also matches a longer name it prefixes.
+func procNameMatches(comm string, names []string) bool {
+	for _, n := range names {
+		if comm == n || (len(comm) == 15 && strings.HasPrefix(n, comm)) {
+			return true
+		}
+	}
+	return false
+}
 
 type psProc struct {
 	pid, ppid int
@@ -87,6 +105,7 @@ type RSSSummary struct {
 	XmWithinGate    *bool     `json:"xmustard_within_gate,omitempty"`
 	GateBytes       int64     `json:"gate_bytes"`
 	XmRolesObserved []string  `json:"xmustard_roles_observed,omitempty"`
+	XmNames         []string  `json:"xmustard_names,omitempty"` // names attributed to the xMustard tree
 	Note            string    `json:"note,omitempty"`
 }
 
@@ -94,6 +113,7 @@ type RSSSummary struct {
 type rssSampler struct {
 	interval time.Duration
 	out      *os.File
+	names    []string
 
 	mu        sync.Mutex
 	phase     string
@@ -101,14 +121,22 @@ type rssSampler struct {
 	agentRoot int
 	sum       RSSSummary
 	seenRoles map[string]bool
-	stop      chan struct{}
-	done      chan struct{}
+	// agentProcs is every process seen in the client's tree: pid -> start time. A
+	// process the client detached (setsid) is reparented away from the tree, so the
+	// sweep uses this record to find it again.
+	agentProcs map[int]int64
+	stop       chan struct{}
+	done       chan struct{}
 }
 
-func startRSSSampler(interval time.Duration, samplesPath string) *rssSampler {
-	s := &rssSampler{interval: interval, phase: "setup", seenRoles: map[string]bool{},
+func startRSSSampler(interval time.Duration, samplesPath string, names []string) *rssSampler {
+	if len(names) == 0 {
+		names = xmustardProcNames
+	}
+	s := &rssSampler{interval: interval, phase: "setup", seenRoles: map[string]bool{}, names: names, agentProcs: map[int]int64{},
 		stop: make(chan struct{}), done: make(chan struct{})}
-	s.sum = RSSSummary{Method: "ps -A -o pid,ppid,rss,comm (sampled ps-RSS, v1 method)", IntervalMS: int(interval / time.Millisecond), GateBytes: GateBytes}
+	s.sum = RSSSummary{Method: "ps -A -o pid,ppid,rss,comm (sampled ps-RSS, v1 method)", IntervalMS: int(interval / time.Millisecond), GateBytes: GateBytes,
+		XmNames: slices.Clone(names)}
 	if samplesPath != "" {
 		s.out, _ = os.Create(samplesPath)
 	}
@@ -165,14 +193,21 @@ func (s *rssSampler) sampleOnce() {
 		s.sum.PSFailures++
 		return
 	}
-	xm, agent := splitTrees(procs, xmRoots, agentRoot)
+	xm, agent, agentAll := splitTrees(procs, xmRoots, agentRoot, s.names)
+	for _, pid := range agentAll {
+		if _, seen := s.agentProcs[pid]; !seen {
+			if start, ok := procStartTime(pid); ok {
+				s.agentProcs[pid] = start
+			}
+		}
+	}
 	s.sum.Samples++
 	var xmTotal, agentTotal int64
 	roles := map[string]*RSSPart{}
 	for _, p := range xm {
 		xmTotal += p.rssKiB
 		role := p.comm
-		if !slices.Contains(xmustardProcNames, role) {
+		if !procNameMatches(role, s.names) {
 			role = "child:" + role
 		}
 		s.seenRoles[role] = true
@@ -216,8 +251,9 @@ func (s *rssSampler) sampleOnce() {
 }
 
 // splitTrees splits a snapshot into the xMustard-owned tree and the agent's external
-// tree.
-func splitTrees(procs []psProc, xmRoots []int, agentRoot int) (xm, agent []psProc) {
+// tree. Containment wrappers are in neither. agentAll is every pid under the agent
+// root, whichever tree it counts toward.
+func splitTrees(procs []psProc, xmRoots []int, agentRoot int, names []string) (xm, agent []psProc, agentAll []int) {
 	byPID := make(map[int]psProc, len(procs))
 	children := map[int][]int{}
 	for _, p := range procs {
@@ -259,20 +295,33 @@ func splitTrees(procs []psProc, xmRoots []int, agentRoot int) (xm, agent []psPro
 			stack = append(stack, children[pid]...)
 		}
 		for _, pid := range agentTree {
-			if slices.Contains(xmustardProcNames, byPID[pid].comm) {
+			if procNameMatches(byPID[pid].comm, names) {
 				mark(pid)
 			}
 		}
 	}
 	for pid := range inXm {
-		xm = append(xm, byPID[pid])
+		if !slices.Contains(containmentWrappers, byPID[pid].comm) {
+			xm = append(xm, byPID[pid])
+		}
 	}
 	for _, pid := range agentTree {
-		if !inXm[pid] {
+		if !inXm[pid] && !slices.Contains(containmentWrappers, byPID[pid].comm) {
 			agent = append(agent, byPID[pid])
 		}
 	}
-	return xm, agent
+	return xm, agent, agentTree
+}
+
+// agentProcesses returns the processes seen in the client's tree (pid -> start time).
+func (s *rssSampler) agentProcesses() map[int]int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[int]int64, len(s.agentProcs))
+	for k, v := range s.agentProcs {
+		out[k] = v
+	}
+	return out
 }
 
 // finish stops sampling and returns the summary.
@@ -332,9 +381,15 @@ type Price struct {
 	OutputPerMTok      float64 `yaml:"output_per_mtok" json:"output_per_mtok"`
 }
 
-// priceUsage fills in cost from the price table when the client reported none.
+// priceUsage fills in cost from the price table when the client reported none. It
+// prices only usage the client reported for the whole session: pricing partial or
+// missing usage would record a truncated run as cheap.
 func priceUsage(t *Transcript, model string, pricing map[string]Price) {
 	if t.CostUSD != nil {
+		return
+	}
+	if !t.UsageReported {
+		t.CostSource = CostUnpriced
 		return
 	}
 	p, ok := pricing[model]

@@ -19,7 +19,17 @@ import (
 // The report is a pure function of eval.json and runs.jsonl: records are sorted, the
 // bootstrap is seeded from the run config, and nothing reads the clock, so the same
 // inputs always produce byte-identical report.json and report.md. The statistics are
-// memory_harness.go's (CompareArms: exact McNemar + paired bootstrap), reused as is.
+// memory_harness.go's (CompareArms: exact McNemar + paired bootstrap), reused as is,
+// on task-level pairs: repetitions of one task are not independent, so they are
+// aggregated per (task, arm) before pairing (see taskAggregation).
+//
+// A number that was not measured is never reported as 0: token medians and deltas
+// use only runs whose client reported session usage in its final event, costs only
+// session costs, and stale-memory harm is n/a when no failing memory run has a
+// completed no-memory partner.
+
+// taskAggregation is the pre-registered pairing rule, stated in every comparison.
+const taskAggregation = "task-level pairs: a task counts as solved for an arm when a strict majority of its completed repetitions resolved (use an odd repeat count); continuous deltas pair per-task medians; bootstrap resamples tasks"
 
 const reportSchema = "xmustard.eval.report/v1"
 
@@ -58,7 +68,8 @@ type ArmSummary struct {
 	Resolved          int      `json:"resolved"`
 	ResolveRate       float64  `json:"resolve_rate"`
 	VisibleVerifyPass int      `json:"visible_verify_pass"`
-	MedianTokens      float64  `json:"median_total_tokens"`
+	MedianTokens      *float64 `json:"median_total_tokens,omitempty"`
+	UsageUnknown      int      `json:"runs_without_reported_usage"` // left out of token (and partial-cost) numbers
 	MedianCostUSD     *float64 `json:"median_cost_usd,omitempty"`
 	CostCoverage      int      `json:"runs_with_cost"`
 	MedianWallMS      float64  `json:"median_wall_ms"`
@@ -69,6 +80,7 @@ type ArmSummary struct {
 	MaxAgentRSSKiB    int64    `json:"max_agent_rss_kib"`
 	NoFinalEvent      int      `json:"runs_without_final_event"`
 	TimedOut          int      `json:"timed_out"`
+	ClientErrors      int      `json:"client_errors"` // non-zero exit or error event, scored as outcomes
 }
 
 // TaskArmMedian is the per-task, per-arm median over repetitions (§6.12).
@@ -77,20 +89,25 @@ type TaskArmMedian struct {
 	Arm          string   `json:"arm"`
 	Runs         int      `json:"runs"`
 	Resolved     int      `json:"resolved"`
-	MedianTokens float64  `json:"median_total_tokens"`
+	MedianTokens *float64 `json:"median_total_tokens,omitempty"`
 	MedianCost   *float64 `json:"median_cost_usd,omitempty"`
 	MedianWallMS float64  `json:"median_wall_ms"`
 	MedianChurn  float64  `json:"median_churn_lines"`
 }
 
-// Comparison is one arm against the reference arm on the same (task, rep) pairs.
+// Comparison is one arm against the reference arm on the same tasks.
 type Comparison struct {
 	workspaceops.ArmComparison
+	Aggregation string `json:"aggregation"`
+	// SolveRateDelta is the task-clustered CI of the per-task solve-rate delta (the
+	// mean over repetitions), which keeps what majority voting discards.
+	SolveRateDelta    *workspaceops.BootstrapCI `json:"solve_rate_delta_ci,omitempty"`
 	TokensDelta       *workspaceops.BootstrapCI `json:"tokens_delta_ci,omitempty"`
+	TokensPairs       int                       `json:"tokens_delta_tasks"`
 	CostDelta         *workspaceops.BootstrapCI `json:"cost_delta_ci,omitempty"`
 	WallMSDelta       *workspaceops.BootstrapCI `json:"wall_ms_delta_ci,omitempty"`
 	LocalizationDelta *workspaceops.BootstrapCI `json:"edit_localization_recall_delta_ci,omitempty"`
-	StaleMemoryHarm   int                       `json:"stale_memory_harm,omitempty"`
+	StaleMemoryHarm   *int                      `json:"stale_memory_harm,omitempty"`
 }
 
 // ClassSummary is resolve rate per task class and arm.
@@ -107,6 +124,8 @@ type MemorySummary struct {
 	Arm                    string   `json:"arm"`
 	Runs                   int      `json:"runs"`
 	CurrentFactRecall      *float64 `json:"current_fact_recall,omitempty"`
+	CurrentFactRecallAtK   *float64 `json:"current_fact_recall_at_k,omitempty"`
+	RecallK                int      `json:"recall_k,omitempty"`
 	StaleServedRate        *float64 `json:"stale_served_rate,omitempty"`
 	SupersededServedRate   *float64 `json:"superseded_served_rate,omitempty"`
 	DuplicateRate          *float64 `json:"duplicate_rate,omitempty"`
@@ -118,8 +137,10 @@ type MemorySummary struct {
 	PromotionErrors        int      `json:"promotion_errors"`
 	PromotionUnmeasured    int      `json:"promotion_unmeasured_runs,omitempty"`
 	EstTokensPerRecall     *float64 `json:"est_tokens_per_recall,omitempty"`
-	StaleMemoryHarm        int      `json:"stale_memory_harm"`
-	HarmUnpaired           int      `json:"harm_unpaired_runs,omitempty"`
+	// StaleMemoryHarm is nil (n/a) when every failing run that received a harmful
+	// memory lacks a completed xmustard_mcp partner; HarmUnpaired counts those runs.
+	StaleMemoryHarm *int `json:"stale_memory_harm,omitempty"`
+	HarmUnpaired    int  `json:"harm_unpaired_runs,omitempty"`
 }
 
 // NotCompletedRun names every skipped, failed or interrupted run.
@@ -225,6 +246,16 @@ func buildReport(m *Manifest, recs []RunRecord) *Report {
 	if m.Interrupted {
 		r.Warnings = append(r.Warnings, "run interrupted: the result set is incomplete")
 	}
+	if m.Aborted != "" {
+		r.Warnings = append(r.Warnings, "ABORTED: "+m.Aborted+"; no run started after it, and results before it may be contaminated")
+	}
+	if cfg.KeepWorktrees {
+		w := "keep_worktrees: every run's worktree was kept for debugging (isolation.kept_at); containment hid them from later runs' agents"
+		if m.Containment == ContainNone {
+			w = "keep_worktrees with containment none: earlier runs' worktrees (solved trees) were readable by later runs' agents"
+		}
+		r.Warnings = append(r.Warnings, w)
+	}
 
 	byArm := map[string][]*RunRecord{}
 	for i := range recs {
@@ -244,6 +275,15 @@ func buildReport(m *Manifest, recs []RunRecord) *Report {
 		}
 		if rec.Transcript != nil && !rec.Transcript.FinalEvent {
 			r.Warnings = append(r.Warnings, fmt.Sprintf("%s/%s: no final client event; tokens and cost are incomplete", pairID(rec), rec.Arm))
+		}
+		if rec.ClientError != "" {
+			r.Warnings = append(r.Warnings, fmt.Sprintf("%s/%s: client error (%s), scored as the agent's outcome; exclude_client_errors pre-registers leaving such runs out", pairID(rec), rec.Arm, rec.ClientError))
+		}
+		if iso := rec.Isolation; iso != nil && iso.VerifyChangedTree {
+			r.Warnings = append(r.Warnings, fmt.Sprintf("%s/%s: the visible verify step changed the tree; the oracle judged the agent's final tree after a restore", pairID(rec), rec.Arm))
+		}
+		if iso := rec.Isolation; iso != nil && iso.EscapedKilled > 0 {
+			r.Warnings = append(r.Warnings, fmt.Sprintf("%s/%s: %d process(es) outlived the run's process groups and were killed before judging", pairID(rec), rec.Arm, iso.EscapedKilled))
 		}
 		if rec.RSS != nil {
 			if rec.RSS.AgentPeakKiB > r.RSSGate.MaxAgentKiB {
@@ -288,10 +328,16 @@ func buildReport(m *Manifest, recs []RunRecord) *Report {
 		if arm == cfg.ReferenceArm {
 			continue
 		}
-		r.Comparisons = append(r.Comparisons, compareArm(cfg.ReferenceArm, arm, ref, byArm[arm], th, harm[arm]))
+		r.Comparisons = append(r.Comparisons, compareArm(cfg.ReferenceArm, arm, ref, byArm[arm], th, harm[arm].value()))
 	}
 	for _, arm := range armNames {
-		if ms := summarizeMemory(arm, byArm[arm], harm); ms != nil {
+		if s := r.ArmSummaries[slices.Index(armNames, arm)]; s.UsageUnknown > 0 {
+			r.Warnings = append(r.Warnings, fmt.Sprintf("%s: %d completed run(s) without session usage from the client's final event; they are left out of token medians and deltas", arm, s.UsageUnknown))
+		}
+		if h := harm[arm]; h.unpaired > 0 {
+			r.Warnings = append(r.Warnings, fmt.Sprintf("%s: %d failing run(s) received a harmful memory but have no completed %s run of the same task and repetition; stale-memory harm cannot attribute them", arm, h.unpaired, ArmXmustardMCP))
+		}
+		if ms := summarizeMemory(arm, byArm[arm], harm[arm]); ms != nil {
 			r.Memory = append(r.Memory, *ms)
 			if ms.ScopeLeakage > 0 {
 				r.Warnings = append(r.Warnings, fmt.Sprintf("GOVERNANCE: %s delivered %d foreign-scope memories (scope leakage must be 0)", arm, ms.ScopeLeakage))
@@ -317,11 +363,18 @@ func summarizeArm(arm string, runs []*RunRecord) ArmSummary {
 		if rec.Verify != nil && rec.Verify.Passed {
 			s.VisibleVerifyPass++
 		}
+		if v, ok := knownTokens(rec); ok {
+			tokens = append(tokens, v)
+		} else {
+			s.UsageUnknown++
+		}
+		if v, ok := knownCost(rec); ok {
+			costs = append(costs, v)
+		}
+		if rec.ClientError != "" {
+			s.ClientErrors++
+		}
 		if rec.Transcript != nil {
-			tokens = append(tokens, float64(rec.Transcript.Usage.Total))
-			if rec.Transcript.CostUSD != nil {
-				costs = append(costs, *rec.Transcript.CostUSD)
-			}
 			if !rec.Transcript.FinalEvent {
 				s.NoFinalEvent++
 			}
@@ -347,7 +400,7 @@ func summarizeArm(arm string, runs []*RunRecord) ArmSummary {
 	if s.Completed > 0 {
 		s.ResolveRate = round6(float64(s.Resolved) / float64(s.Completed))
 	}
-	s.MedianTokens = median(tokens)
+	s.MedianTokens = medianPtr(tokens)
 	s.CostCoverage = len(costs)
 	if len(costs) > 0 {
 		c := round6(median(costs))
@@ -386,11 +439,11 @@ func taskMedians(recs []RunRecord) []TaskArmMedian {
 			if rec.Resolved {
 				t.Resolved++
 			}
-			if rec.Transcript != nil {
-				tokens = append(tokens, float64(rec.Transcript.Usage.Total))
-				if rec.Transcript.CostUSD != nil {
-					costs = append(costs, *rec.Transcript.CostUSD)
-				}
+			if v, ok := knownTokens(rec); ok {
+				tokens = append(tokens, v)
+			}
+			if v, ok := knownCost(rec); ok {
+				costs = append(costs, v)
 			}
 			if rec.Client != nil {
 				walls = append(walls, float64(rec.Client.WallMS))
@@ -399,7 +452,7 @@ func taskMedians(recs []RunRecord) []TaskArmMedian {
 				churn = append(churn, float64(rec.Churn.Insertions+rec.Churn.Deletions))
 			}
 		}
-		t.MedianTokens, t.MedianWallMS, t.MedianChurn = median(tokens), median(walls), median(churn)
+		t.MedianTokens, t.MedianWallMS, t.MedianChurn = medianPtr(tokens), median(walls), median(churn)
 		if len(costs) > 0 {
 			c := round6(median(costs))
 			t.MedianCost = &c
@@ -439,57 +492,110 @@ func classSummaries(arms []string, byArm map[string][]*RunRecord) []ClassSummary
 	return out
 }
 
-// compareArm pairs runs on (task, rep) and hands the solved outcomes to CompareArms.
-func compareArm(refName, armName string, ref, exp []*RunRecord, th workspaceops.GoNoGoThreshold, harm int) Comparison {
-	toOutcomes := func(runs []*RunRecord) []workspaceops.TaskOutcome {
-		out := make([]workspaceops.TaskOutcome, 0, len(runs))
-		for _, rec := range runs {
-			o := workspaceops.TaskOutcome{TaskID: pairID(rec), Solved: rec.Resolved}
-			if rec.Transcript != nil {
-				o.Tokens = int(rec.Transcript.Usage.Total)
-				if rec.Transcript.CostUSD != nil {
-					o.CostUSD = *rec.Transcript.CostUSD
-				}
+// knownTokens is a run's session token total, when its client reported one.
+func knownTokens(rec *RunRecord) (float64, bool) {
+	if rec.Transcript == nil || !rec.Transcript.UsageReported {
+		return 0, false
+	}
+	return float64(rec.Transcript.Usage.Total), true
+}
+
+// knownCost is a run's session cost, when known: from the client's final event or
+// priced from reported session usage (never a sum over the messages of a cut-off run).
+func knownCost(rec *RunRecord) (float64, bool) {
+	if rec.Transcript == nil || rec.Transcript.CostUSD == nil || rec.Transcript.CostSource == CostClientMessage {
+		return 0, false
+	}
+	return *rec.Transcript.CostUSD, true
+}
+
+// taskAgg is one arm's completed repetitions of one task.
+type taskAgg struct {
+	runs, solved              int
+	tokens, costs, walls, loc []float64
+	promotionError            bool
+}
+
+func aggregateByTask(runs []*RunRecord) map[string]*taskAgg {
+	out := map[string]*taskAgg{}
+	for _, rec := range runs {
+		a := out[rec.TaskID]
+		if a == nil {
+			a = &taskAgg{}
+			out[rec.TaskID] = a
+		}
+		a.runs++
+		if rec.Resolved {
+			a.solved++
+		}
+		if v, ok := knownTokens(rec); ok {
+			a.tokens = append(a.tokens, v)
+		}
+		if v, ok := knownCost(rec); ok {
+			a.costs = append(a.costs, v)
+		}
+		if rec.Client != nil {
+			a.walls = append(a.walls, float64(rec.Client.WallMS))
+		}
+		if rec.Localization != nil {
+			a.loc = append(a.loc, rec.Localization.Recall)
+		}
+		if rec.Memory != nil && rec.Memory.PromotionErrors != nil && *rec.Memory.PromotionErrors > 0 {
+			a.promotionError = true
+		}
+	}
+	return out
+}
+
+// compareArm pairs the arms per task (taskAggregation) and hands the solved outcomes
+// to CompareArms.
+func compareArm(refName, armName string, ref, exp []*RunRecord, th workspaceops.GoNoGoThreshold, harm *int) Comparison {
+	refT, expT := aggregateByTask(ref), aggregateByTask(exp)
+	toOutcomes := func(m map[string]*taskAgg) []workspaceops.TaskOutcome {
+		out := make([]workspaceops.TaskOutcome, 0, len(m))
+		for _, id := range sortedKeys(m) {
+			a := m[id]
+			o := workspaceops.TaskOutcome{TaskID: id, Solved: 2*a.solved > a.runs, PromotionError: a.promotionError}
+			if len(a.tokens) > 0 {
+				o.Tokens = int(median(a.tokens))
 			}
-			if rec.Client != nil {
-				o.DurationMS = int(rec.Client.WallMS)
+			if len(a.costs) > 0 {
+				o.CostUSD = median(a.costs)
 			}
-			if rec.Localization != nil {
-				o.LocalizationRecallAtK = rec.Localization.Recall
+			if len(a.walls) > 0 {
+				o.DurationMS = int(median(a.walls))
 			}
-			if rec.Memory != nil && rec.Memory.PromotionErrors != nil {
-				o.PromotionError = *rec.Memory.PromotionErrors > 0
+			if len(a.loc) > 0 {
+				o.LocalizationRecallAtK = median(a.loc)
 			}
 			out = append(out, o)
 		}
 		return out
 	}
-	c := Comparison{ArmComparison: workspaceops.CompareArms(toOutcomes(ref), toOutcomes(exp), refName, armName, th), StaleMemoryHarm: harm}
+	c := Comparison{ArmComparison: workspaceops.CompareArms(toOutcomes(refT), toOutcomes(expT), refName, armName, th),
+		Aggregation: taskAggregation, StaleMemoryHarm: harm}
 	if c.PairedTasks == 0 {
 		// CompareArms says NO-GO for an empty pairing; the report says why instead.
-		c.Decision, c.Rationale = "NO-DATA", "no completed run pairs with the reference arm"
+		c.Decision, c.Rationale = "NO-DATA", "no task has completed runs in both this arm and the reference arm"
 	}
-	refBy := map[string]*RunRecord{}
-	for _, rec := range ref {
-		refBy[pairID(rec)] = rec
-	}
-	var dTok, dCost, dWall, dLoc []float64
-	for _, e := range exp {
-		b, ok := refBy[pairID(e)]
-		if !ok {
+	var dRate, dTok, dCost, dWall, dLoc []float64
+	for _, id := range sortedKeys(expT) {
+		e, b := expT[id], refT[id]
+		if b == nil {
 			continue
 		}
-		if e.Transcript != nil && b.Transcript != nil {
-			dTok = append(dTok, float64(e.Transcript.Usage.Total-b.Transcript.Usage.Total))
-			if e.Transcript.CostUSD != nil && b.Transcript.CostUSD != nil {
-				dCost = append(dCost, *e.Transcript.CostUSD-*b.Transcript.CostUSD)
-			}
+		dRate = append(dRate, float64(e.solved)/float64(e.runs)-float64(b.solved)/float64(b.runs))
+		if len(e.tokens) > 0 && len(b.tokens) > 0 {
+			dTok = append(dTok, median(e.tokens)-median(b.tokens))
 		}
-		if e.Client != nil && b.Client != nil {
-			dWall = append(dWall, float64(e.Client.WallMS-b.Client.WallMS))
+		if len(e.costs) > 0 && len(b.costs) > 0 {
+			dCost = append(dCost, median(e.costs)-median(b.costs))
 		}
-		if e.Localization != nil && b.Localization != nil {
-			dLoc = append(dLoc, e.Localization.Recall-b.Localization.Recall)
+		if len(e.walls) > 0 && len(b.walls) > 0 {
+			dWall = append(dWall, median(e.walls)-median(b.walls))
+		}
+		if len(e.loc) > 0 && len(b.loc) > 0 {
+			dLoc = append(dLoc, median(e.loc)-median(b.loc))
 		}
 	}
 	ci := func(d []float64) *workspaceops.BootstrapCI {
@@ -503,15 +609,32 @@ func compareArm(refName, armName string, ref, exp []*RunRecord, th workspaceops.
 	c.SolveDeltaCI.Mean, c.SolveDeltaCI.Lo, c.SolveDeltaCI.Hi = round6(c.SolveDeltaCI.Mean), round6(c.SolveDeltaCI.Lo), round6(c.SolveDeltaCI.Hi)
 	c.McNemar.PValue = round6(c.McNemar.PValue)
 	c.BaselineSolveRate, c.ExperimentSolveRate = round6(c.BaselineSolveRate), round6(c.ExperimentSolveRate)
-	c.TokensDelta, c.CostDelta, c.WallMSDelta, c.LocalizationDelta = ci(dTok), ci(dCost), ci(dWall), ci(dLoc)
+	c.SolveRateDelta, c.TokensDelta, c.CostDelta, c.WallMSDelta, c.LocalizationDelta = ci(dRate), ci(dTok), ci(dCost), ci(dWall), ci(dLoc)
+	c.TokensPairs = len(dTok)
 	return c
+}
+
+// harmCount is stale-memory harm for one arm.
+type harmCount struct {
+	harm, eligible, unpaired int
+}
+
+// value is the harm count, or nil when every eligible run was unpaired (not measured).
+func (h harmCount) value() *int {
+	if h.eligible > 0 && h.unpaired == h.eligible {
+		return nil
+	}
+	v := h.harm
+	return &v
 }
 
 // staleMemoryHarm counts memory-arm runs that failed the oracle after a stale,
 // superseded or contradicted memory reached the model unflagged, while the paired
-// xmustard_mcp run (same task, same rep, no memory) resolved.
-func staleMemoryHarm(byArm map[string][]*RunRecord) map[string]int {
-	out := map[string]int{}
+// xmustard_mcp run (same task, same rep, no memory) resolved. A failing run with a
+// harmful delivery but no completed xmustard_mcp partner is unpaired: it can be
+// neither blamed on memory nor cleared.
+func staleMemoryHarm(byArm map[string][]*RunRecord) map[string]harmCount {
+	out := map[string]harmCount{}
 	noMem := map[string]bool{}
 	for _, rec := range byArm[ArmXmustardMCP] {
 		noMem[pairID(rec)] = rec.Resolved
@@ -521,15 +644,21 @@ func staleMemoryHarm(byArm map[string][]*RunRecord) map[string]int {
 			if rec.Memory == nil || !rec.Memory.HarmfulServed || rec.Resolved {
 				continue
 			}
-			if resolved, ok := noMem[pairID(rec)]; ok && resolved {
-				out[arm]++
+			h := out[arm]
+			h.eligible++
+			switch resolved, ok := noMem[pairID(rec)]; {
+			case !ok:
+				h.unpaired++
+			case resolved:
+				h.harm++
 			}
+			out[arm] = h
 		}
 	}
 	return out
 }
 
-func summarizeMemory(arm string, runs []*RunRecord, harm map[string]int) *MemorySummary {
+func summarizeMemory(arm string, runs []*RunRecord, harm harmCount) *MemorySummary {
 	var withMem []*MemoryMetrics
 	for _, rec := range runs {
 		if rec.Memory != nil {
@@ -539,8 +668,8 @@ func summarizeMemory(arm string, runs []*RunRecord, harm map[string]int) *Memory
 	if len(withMem) == 0 {
 		return nil
 	}
-	s := &MemorySummary{Arm: arm, Runs: len(withMem), StaleMemoryHarm: harm[arm]}
-	var cur, stale, sup, dup, cprec, crec, tpr []float64
+	s := &MemorySummary{Arm: arm, Runs: len(withMem), StaleMemoryHarm: harm.value(), HarmUnpaired: harm.unpaired}
+	var cur, curK, stale, sup, dup, cprec, crec, tpr []float64
 	add := func(dst *[]float64, v *float64) {
 		if v != nil {
 			*dst = append(*dst, *v)
@@ -548,6 +677,10 @@ func summarizeMemory(arm string, runs []*RunRecord, harm map[string]int) *Memory
 	}
 	for _, mm := range withMem {
 		add(&cur, mm.CurrentFactRecall)
+		add(&curK, mm.CurrentFactRecallAtK)
+		if mm.RecallK > 0 {
+			s.RecallK = mm.RecallK // one corpus-wide k is expected; the last run's is shown
+		}
 		add(&stale, mm.StaleServedRate)
 		add(&sup, mm.SupersededServedRate)
 		add(&dup, mm.DuplicateRate)
@@ -564,6 +697,7 @@ func summarizeMemory(arm string, runs []*RunRecord, harm map[string]int) *Memory
 		}
 	}
 	s.CurrentFactRecall, s.StaleServedRate, s.SupersededServedRate = meanPtr(cur), meanPtr(stale), meanPtr(sup)
+	s.CurrentFactRecallAtK = meanPtr(curK)
 	s.DuplicateRate, s.ContradictionPrecision, s.ContradictionRecall = meanPtr(dup), meanPtr(cprec), meanPtr(crec)
 	s.EstTokensPerRecall = meanPtr(tpr)
 	return s
@@ -580,6 +714,14 @@ func median(v []float64) float64 {
 		return round6(s[n/2])
 	}
 	return round6((s[n/2-1] + s[n/2]) / 2)
+}
+
+func medianPtr(v []float64) *float64 {
+	if len(v) == 0 {
+		return nil
+	}
+	m := median(v)
+	return &m
 }
 
 func meanPtr(v []float64) *float64 {
@@ -618,31 +760,33 @@ func renderMarkdown(r *Report) string {
 		}
 		w("\n")
 	}
-	w("## Arms\n\n| Arm | Completed | Resolved (hidden oracle) | Visible verify pass | Median tokens | Median cost USD | Median wall ms | Median churn lines | Median edit-loc recall | xMustard calls | Max xMustard RSS KiB | Max agent RSS KiB |\n")
-	w("|---|---|---|---|---|---|---|---|---|---|---|---|\n")
+	w("## Arms\n\n| Arm | Completed | Resolved (hidden oracle) | Visible verify pass | Median tokens | Runs without usage | Median cost USD | Median wall ms | Median churn lines | Median edit-loc recall | xMustard calls | Client errors | Max xMustard RSS KiB | Max agent RSS KiB |\n")
+	w("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n")
 	for _, a := range r.ArmSummaries {
-		w("| %s | %d | %d (%.3f) | %d | %.0f | %s | %.0f | %.0f | %s | %d | %d | %d |\n", a.Arm, a.Completed, a.Resolved, a.ResolveRate, a.VisibleVerifyPass,
-			a.MedianTokens, fmtPtr(a.MedianCostUSD, "%.6f"), a.MedianWallMS, a.MedianChurn, fmtPtr(a.MedianLocRecall, "%.3f"), a.XmustardToolCalls, a.MaxXmRSSKiB, a.MaxAgentRSSKiB)
+		w("| %s | %d | %d (%.3f) | %d | %s | %d | %s | %.0f | %.0f | %s | %d | %d | %d | %d |\n", a.Arm, a.Completed, a.Resolved, a.ResolveRate, a.VisibleVerifyPass,
+			fmtPtr(a.MedianTokens, "%.0f"), a.UsageUnknown, fmtPtr(a.MedianCostUSD, "%.6f"), a.MedianWallMS, a.MedianChurn, fmtPtr(a.MedianLocRecall, "%.3f"), a.XmustardToolCalls,
+			a.ClientErrors, a.MaxXmRSSKiB, a.MaxAgentRSSKiB)
 	}
-	w("\n## Paired comparisons against %s\n\nMcNemar (exact) and paired bootstrap from `memory_harness.go`; pre-registered threshold max_p=%g, min_solved_delta=%g, alpha=%g, %d bootstrap iterations.\n\n",
-		r.ReferenceArm, r.Threshold.MaxP, r.Threshold.MinSolvedDelta, r.Threshold.Alpha, r.Threshold.BootstrapIters)
-	w("| Arm | Pairs | Solve rate ref / arm | Discordant (arm+ / ref+) | p | Solve delta CI | Tokens delta CI | Wall ms delta CI | Edit-loc delta CI | Decision |\n|---|---|---|---|---|---|---|---|---|---|\n")
+	w("\n## Paired comparisons against %s\n\nMcNemar (exact) and paired bootstrap from `memory_harness.go`; pre-registered threshold max_p=%g, min_solved_delta=%g, alpha=%g, %d bootstrap iterations. Pairing: %s.\n\n",
+		r.ReferenceArm, r.Threshold.MaxP, r.Threshold.MinSolvedDelta, r.Threshold.Alpha, r.Threshold.BootstrapIters, taskAggregation)
+	w("| Arm | Tasks paired | Solve rate ref / arm | Discordant (arm+ / ref+) | p | Solve delta CI | Solve-rate delta CI (reps) | Tokens delta CI (tasks) | Wall ms delta CI | Edit-loc delta CI | Decision |\n|---|---|---|---|---|---|---|---|---|---|---|\n")
 	for _, c := range r.Comparisons {
-		w("| %s | %d | %.3f / %.3f | %d (%d / %d) | %.4f | %s | %s | %s | %s | %s |\n", c.ExperimentArm, c.PairedTasks, c.BaselineSolveRate, c.ExperimentSolveRate,
+		w("| %s | %d | %.3f / %.3f | %d (%d / %d) | %.4f | %s | %s | %s (%d) | %s | %s | %s |\n", c.ExperimentArm, c.PairedTasks, c.BaselineSolveRate, c.ExperimentSolveRate,
 			c.McNemar.Discordant, c.McNemar.BImprovedOverA, c.McNemar.AImprovedOverB, c.McNemar.PValue, fmtCI(&c.SolveDeltaCI, c.PairedTasks > 0),
-			fmtCI(c.TokensDelta, true), fmtCI(c.WallMSDelta, true), fmtCI(c.LocalizationDelta, true), c.Decision)
+			fmtCI(c.SolveRateDelta, true), fmtCI(c.TokensDelta, true), c.TokensPairs, fmtCI(c.WallMSDelta, true), fmtCI(c.LocalizationDelta, true), c.Decision)
 	}
 	if len(r.Memory) > 0 {
-		w("\n## Coding-memory lifecycle (PAR-EVAL-02)\n\n| Arm | Runs | Current-fact recall | Stale served (unflagged) | Superseded served | Duplicate rate | Contradiction P / R | Scope leakage | Pending served | Promotion errors | Est. tokens/recall | Stale-memory harm |\n|---|---|---|---|---|---|---|---|---|---|---|---|\n")
+		w("\n## Coding-memory lifecycle (PAR-EVAL-02)\n\n| Arm | Runs | Current-fact recall | Recall@k | Stale served (unflagged) | Superseded served | Duplicate rate | Contradiction P / R | Scope leakage | Pending served | Promotion errors | Est. tokens/recall | Stale-memory harm (unpaired) |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|\n")
 		for _, m := range r.Memory {
-			w("| %s | %d | %s | %s | %s | %s | %s / %s | %d | %d | %d | %s | %d |\n", m.Arm, m.Runs, fmtPtr(m.CurrentFactRecall, "%.3f"), fmtPtr(m.StaleServedRate, "%.3f"),
+			w("| %s | %d | %s | %s (k=%d) | %s | %s | %s | %s / %s | %d | %d | %d | %s | %s (%d) |\n", m.Arm, m.Runs, fmtPtr(m.CurrentFactRecall, "%.3f"),
+				fmtPtr(m.CurrentFactRecallAtK, "%.3f"), m.RecallK, fmtPtr(m.StaleServedRate, "%.3f"),
 				fmtPtr(m.SupersededServedRate, "%.3f"), fmtPtr(m.DuplicateRate, "%.3f"), fmtPtr(m.ContradictionPrecision, "%.3f"), fmtPtr(m.ContradictionRecall, "%.3f"),
-				m.ScopeLeakage, m.PendingServed, m.PromotionErrors, fmtPtr(m.EstTokensPerRecall, "%.0f"), m.StaleMemoryHarm)
+				m.ScopeLeakage, m.PendingServed, m.PromotionErrors, fmtPtr(m.EstTokensPerRecall, "%.0f"), fmtIntPtr(m.StaleMemoryHarm), m.HarmUnpaired)
 		}
 	}
 	w("\n## Per task and arm (medians over repetitions)\n\n| Task | Arm | Runs | Resolved | Median tokens | Median cost USD | Median wall ms | Median churn |\n|---|---|---|---|---|---|---|---|\n")
 	for _, t := range r.TaskMedians {
-		w("| %s | %s | %d | %d | %.0f | %s | %.0f | %.0f |\n", t.TaskID, t.Arm, t.Runs, t.Resolved, t.MedianTokens, fmtPtr(t.MedianCost, "%.6f"), t.MedianWallMS, t.MedianChurn)
+		w("| %s | %s | %d | %d | %s | %s | %.0f | %.0f |\n", t.TaskID, t.Arm, t.Runs, t.Resolved, fmtPtr(t.MedianTokens, "%.0f"), fmtPtr(t.MedianCost, "%.6f"), t.MedianWallMS, t.MedianChurn)
 	}
 	if len(r.ByClass) > 0 {
 		w("\n## By task class\n\n| Class | Arm | Completed | Resolved | Rate |\n|---|---|---|---|---|\n")
@@ -680,6 +824,13 @@ func fmtPtr(v *float64, format string) string {
 		return "n/a"
 	}
 	return fmt.Sprintf(format, *v)
+}
+
+func fmtIntPtr(v *int) string {
+	if v == nil {
+		return "n/a"
+	}
+	return strconv.Itoa(*v)
 }
 
 func fmtCI(ci *workspaceops.BootstrapCI, ok bool) string {

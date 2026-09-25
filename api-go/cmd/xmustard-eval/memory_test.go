@@ -170,3 +170,28 @@ func taskItem(fields ...string) string {
 	}
 	return s
 }
+
+// TestCurrentFactRecallAtK: a current fact counts toward recall@k only when a ranked
+// recall result lists it among its first k entries; without any ranked result the
+// metric is n/a, not 0.
+func TestCurrentFactRecallAtK(t *testing.T) {
+	spec := seedSpec()
+	spec.RecallK = 2
+	// "cur" is third in the ranked list
+	text := recallJSON("task", spec, []string{"old", "dup", "cur"}, nil, nil, nil)
+	mm := memoryMetrics("task", spec, []ToolResult{{Tool: "recall", Text: text, Bytes: len(text)}}, seedResults(spec), nil)
+	if mm.RecallK != 2 || mm.CurrentFactRecall == nil || *mm.CurrentFactRecall != 1 || mm.CurrentFactRecallAtK == nil || *mm.CurrentFactRecallAtK != 0 {
+		t.Fatalf("k=2: recall %v at-k %v", mm.CurrentFactRecall, mm.CurrentFactRecallAtK)
+	}
+	spec.RecallK = 0 // default k
+	mm = memoryMetrics("task", spec, []ToolResult{{Tool: "recall", Text: text, Bytes: len(text)}}, seedResults(spec), nil)
+	if mm.RecallK != defaultRecallK || *mm.CurrentFactRecallAtK != 1 {
+		t.Fatalf("default k: %d %v", mm.RecallK, *mm.CurrentFactRecallAtK)
+	}
+	// the marker in unstructured text: served, but its rank is unknown
+	plain := "memory: " + seededContent("task", spec.Seed[0])
+	mm = memoryMetrics("task", spec, []ToolResult{{Tool: "recall", Text: plain, Bytes: len(plain)}}, seedResults(spec), nil)
+	if *mm.CurrentFactRecall != 1 || mm.CurrentFactRecallAtK != nil {
+		t.Fatalf("unranked: recall %v at-k %v", *mm.CurrentFactRecall, mm.CurrentFactRecallAtK)
+	}
+}

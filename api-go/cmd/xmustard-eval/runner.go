@@ -26,6 +26,9 @@ const (
 	StatusSkipped     = "skipped"
 	StatusError       = "error" // harness failure; not the agent's outcome
 	StatusInterrupted = "interrupted"
+	// StatusClientError marks a run whose client failed (non-zero exit or an error
+	// event, not a timeout) when the run config pre-registers exclude_client_errors.
+	StatusClientError = "client_error"
 )
 
 // RunSchema versions each runs.jsonl record.
@@ -67,6 +70,10 @@ type RunConfig struct {
 	Tasks         []string                `yaml:"tasks" json:"tasks,omitempty"`
 	FakeFailArms  []string                `yaml:"fake_fail_arms" json:"fake_fail_arms,omitempty"`
 	KeepWorktrees bool                    `yaml:"keep_worktrees" json:"keep_worktrees,omitempty"`
+	// ExcludeClientErrors pre-registers that runs whose client failed (non-zero exit
+	// or an error final event; timeouts are outcomes) leave the paired statistics as
+	// client_error instead of counting as unsolved.
+	ExcludeClientErrors bool `yaml:"exclude_client_errors" json:"exclude_client_errors,omitempty"`
 
 	Fake bool `yaml:"-" json:"fake"`
 
@@ -77,10 +84,16 @@ type RunConfig struct {
 	workRoot string
 	contain  string
 	hidden   []string // paths the agent may neither read nor write
+	// hiddenRepos are the git directories and other-worktree copies through which the
+	// hidden files would still be readable (see repoPaths)
+	hiddenRepos []string
+	xmNames     []string // process names attributed to the xMustard tree
 	// dry-run knobs (never read from YAML)
-	fakeProbe   []string
-	fakeSleepMS int
-	fakeExit    int
+	fakeProbe     []string
+	fakeSleepMS   int
+	fakeExit      int
+	fakeDetach    bool
+	fakeGitConfig string
 }
 
 func (c *RunConfig) peer(name string) (PeerConfig, bool) {
@@ -142,10 +155,12 @@ func (c *RunConfig) prepare(corpus *Corpus, outDir string) error {
 	if c.Thresholds.Alpha == 0 {
 		c.Thresholds.Alpha = 0.05
 	}
-	for _, p := range c.Peers {
-		if err := p.validate(); err != nil {
+	for i := range c.Peers {
+		rule, err := c.Peers[i].check()
+		if err != nil {
 			errs = append(errs, err)
 		}
+		c.Peers[i].OwnerDecisionRule = rule
 	}
 	for _, id := range c.Tasks {
 		if !slices.ContainsFunc(corpus.Tasks, func(t Task) bool { return t.ID == id }) {
@@ -211,9 +226,27 @@ func (c *RunConfig) prepare(corpus *Corpus, outDir string) error {
 		errs = append(errs, err)
 	}
 	c.outDir = abs
-	// Anything the sandboxed agent must execute or load cannot live in a hidden path.
-	c.hidden = append(corpus.hiddenPaths(), c.outDir)
-	for _, p := range []string{c.Stack.MCPBin, c.client().Extension, c.client().Bin} {
+	// Anything the sandboxed agent or the contained API must execute or load cannot
+	// live in a hidden path.
+	corpusHidden := corpus.hiddenPaths()
+	c.hiddenRepos = repoPaths(corpusHidden)
+	c.hidden = append(append(corpusHidden, c.hiddenRepos...), c.outDir)
+	mustRead := []string{c.Stack.MCPBin, c.client().Extension, c.client().Bin}
+	if c.Stack.Kind == StackReal {
+		mustRead = append(mustRead, c.Stack.APIBin, c.Stack.CoreBin)
+	}
+	if c.Fake || c.Stack.Kind == StackStub {
+		mustRead = append(mustRead, c.self) // the fake agent and the stub MCP bridge
+	}
+	c.xmNames = slices.Clone(xmustardProcNames)
+	if c.Stack.Kind == StackReal {
+		for _, p := range []string{c.Stack.APIBin, c.Stack.MCPBin, c.Stack.CoreBin} {
+			c.xmNames = append(c.xmNames, filepath.Base(p))
+		}
+	}
+	slices.Sort(c.xmNames)
+	c.xmNames = slices.Compact(c.xmNames)
+	for _, p := range mustRead {
 		if p == "" || !filepath.IsAbs(p) {
 			continue
 		}
@@ -238,6 +271,14 @@ type Isolation struct {
 	OracleStagedPost bool   `json:"oracle_staged_after_agent"`
 	Containment      string `json:"containment"`
 	WorktreeRemoved  bool   `json:"worktree_removed"`
+	// EscapedKilled counts processes of the run that outlived their process group
+	// (found in the sampled client tree, by the run marker, or by a working directory
+	// in the worktree) and were killed before the tree was judged or after the oracle.
+	EscapedKilled int `json:"escaped_processes_killed,omitempty"`
+	// VerifyChangedTree is set when the visible verify step changed non-ignored files;
+	// the worktree was restored to the agent's final tree before the oracle.
+	VerifyChangedTree bool   `json:"verify_changed_tree,omitempty"`
+	KeptAt            string `json:"kept_at,omitempty"` // --keep-worktrees
 }
 
 // RunRecord is one line of runs.jsonl.
@@ -257,6 +298,7 @@ type RunRecord struct {
 	PromptSHA256 string         `json:"prompt_sha256,omitempty"`
 	Client       *ClientExit    `json:"client,omitempty"`
 	Transcript   *Transcript    `json:"transcript,omitempty"`
+	ClientError  string         `json:"client_error,omitempty"` // non-zero exit or error event (not a timeout)
 	Setup        []CheckResult  `json:"setup,omitempty"`
 	Verify       *CheckResult   `json:"verify,omitempty"`
 	Oracle       *CheckResult   `json:"oracle,omitempty"`
@@ -277,9 +319,12 @@ type Manifest struct {
 	StartedAt      string            `json:"started_at"`
 	FinishedAt     string            `json:"finished_at,omitempty"`
 	Interrupted    bool              `json:"interrupted,omitempty"`
+	Aborted        string            `json:"aborted,omitempty"` // why the executor stopped scheduling runs
 	Corpus         string            `json:"corpus"`
 	CorpusName     string            `json:"corpus_name"`
 	CorpusSHA256   string            `json:"corpus_sha256"`
+	CorpusFiles    map[string]string `json:"corpus_files_sha256"` // oracle sources and reference patches as loaded
+	HiddenRepos    []string          `json:"hidden_repository_paths,omitempty"`
 	Config         RunConfig         `json:"config"`
 	Containment    string            `json:"containment"`
 	ClientVersion  string            `json:"client_version"`
@@ -303,6 +348,7 @@ type executor struct {
 	registry    *worktreeRegistry
 	userServers []string
 	runsFile    *os.File
+	aborted     string // set when the corpus changed on disk: no further runs start
 }
 
 // Execute runs every selected task under every arm, writes runs.jsonl, eval.json and
@@ -315,25 +361,42 @@ func Execute(ctx context.Context, cfg *RunConfig, corpus *Corpus) (*Report, erro
 	if _, err := os.Stat(runsPath); err == nil {
 		return nil, fmt.Errorf("%s already exists; use a fresh --out directory", runsPath)
 	}
+	d, err := driverByName(cfg.Driver)
+	if err != nil {
+		return nil, err
+	}
 	workRoot, err := os.MkdirTemp("", "xmustard-eval-")
 	if err != nil {
 		return nil, err
 	}
 	cfg.workRoot = workRoot
+	ex := &executor{cfg: cfg, corpus: corpus, driver: d, registry: newWorktreeRegistry()}
+	if err := os.MkdirAll(filepath.Join(workRoot, "harness"), 0o700); err != nil {
+		_ = os.RemoveAll(workRoot)
+		return nil, err
+	}
+	removeOnCrash := workRoot
+	if cfg.KeepWorktrees {
+		removeOnCrash = ""
+	}
+	wd, err := startWatchdog(cfg.self, filepath.Join(workRoot, "harness", "watchdog.state"), removeOnCrash)
+	if err != nil {
+		_ = os.RemoveAll(workRoot)
+		return nil, fmt.Errorf("start watchdog: %w", err)
+	}
 	defer func() {
+		// kept worktrees were forgotten by the registry; this removes only worktrees
+		// a run did not reach its own cleanup for
+		_ = ex.registry.removeAll()
 		if !cfg.KeepWorktrees {
 			_ = os.RemoveAll(workRoot)
 		}
+		wd.stop()
 	}()
-	d, err := driverByName(cfg.Driver)
-	if err != nil {
-		return nil, err
-	}
-	ex := &executor{cfg: cfg, corpus: corpus, driver: d, registry: newWorktreeRegistry()}
-	defer func() { _ = ex.registry.removeAll() }()
 
 	m := &Manifest{Schema: manifestSchema, StartedAt: nowUTC(), Corpus: corpus.Path, CorpusName: corpus.Name,
-		CorpusSHA256: corpus.SHA256, Config: *cfg, Containment: cfg.contain, DryRun: cfg.Fake || cfg.Stack.Kind == StackStub,
+		CorpusSHA256: corpus.SHA256, CorpusFiles: corpus.FileSHA256, HiddenRepos: cfg.hiddenRepos,
+		Config: *cfg, Containment: cfg.contain, DryRun: cfg.Fake || cfg.Stack.Kind == StackStub,
 		Host: map[string]any{"os": runtime.GOOS, "arch": runtime.GOARCH, "cpus": runtime.NumCPU(), "go": runtime.Version()}}
 	m.Config.Peers = nil
 	for _, p := range cfg.Peers {
@@ -387,13 +450,14 @@ func Execute(ctx context.Context, cfg *RunConfig, corpus *Corpus) (*Report, erro
 		repos[t.ID] = p
 	}
 
-	for rep := 0; rep < cfg.Repeats && ctx.Err() == nil; rep++ {
+	stopping := func() bool { return ctx.Err() != nil || ex.aborted != "" }
+	for rep := 0; rep < cfg.Repeats && !stopping(); rep++ {
 		for _, t := range tasks {
-			if ctx.Err() != nil {
+			if stopping() {
 				break
 			}
 			for _, arm := range armOrder(cfg.arms, cfg.Seed, t.ID, rep) {
-				if ctx.Err() != nil {
+				if stopping() {
 					break
 				}
 				p := repos[t.ID]
@@ -410,8 +474,14 @@ func Execute(ctx context.Context, cfg *RunConfig, corpus *Corpus) (*Report, erro
 			}
 		}
 	}
+	if ex.aborted == "" {
+		if err := corpus.checkIntegrity(); err != nil {
+			ex.aborted = "corpus_changed: " + err.Error()
+		}
+	}
 	m.FinishedAt = nowUTC()
 	m.Interrupted = ctx.Err() != nil
+	m.Aborted = ex.aborted
 	m.ExecutorMaxRSS = selfMaxRSSBytes()
 	if err := writeJSONFile(filepath.Join(cfg.outDir, "eval.json"), m); err != nil {
 		return nil, err
@@ -422,6 +492,9 @@ func Execute(ctx context.Context, cfg *RunConfig, corpus *Corpus) (*Report, erro
 	}
 	if m.Interrupted {
 		return rep, ctx.Err()
+	}
+	if m.Aborted != "" {
+		return rep, errors.New("aborted: " + m.Aborted)
 	}
 	return rep, nil
 }
@@ -472,6 +545,56 @@ func repoDirName(c *Corpus, t *Task) string {
 	return "repo"
 }
 
+// sandboxFor is the containment for one run: the configured hidden paths, the
+// harness's own git directories and watchdog state, and every other run's worktree,
+// repository, client config and fake-driver files (kept worktrees included), so no
+// run can read another's solved tree or staged oracle. The scratch repositories and
+// the operator's global git config are read-only.
+func (ex *executor) sandboxFor(runID string) *sandbox {
+	cfg := ex.cfg
+	hidden := append(slices.Clone(cfg.hidden), filepath.Join(cfg.workRoot, "harness"))
+	for _, area := range []string{"wt", "runrepos", "fake", "clientcfg"} {
+		entries, _ := os.ReadDir(filepath.Join(cfg.workRoot, area))
+		for _, e := range entries {
+			if e.Name() != runID {
+				hidden = append(hidden, filepath.Join(cfg.workRoot, area, e.Name()))
+			}
+		}
+	}
+	readOnly := append([]string{filepath.Join(cfg.workRoot, "repos")}, gitConfigPaths()...)
+	return &sandbox{mode: cfg.contain, hidden: hidden, readOnly: readOnly}
+}
+
+// sweep kills the run's processes that outlived their process group and fails when
+// any survive.
+func sweep(marker, dir string, tracked map[int]int64, iso *Isolation) error {
+	killed, alive, err := sweepRunProcesses(marker, dir, tracked)
+	iso.EscapedKilled += killed
+	if err != nil {
+		return fmt.Errorf("find the run's processes: %w", err)
+	}
+	if len(alive) > 0 {
+		return fmt.Errorf("agent processes survived SIGKILL: %v", alive)
+	}
+	return nil
+}
+
+// clientError describes a client failure that is not a timeout or an interrupt: a
+// non-zero exit or an error final event. "" means none.
+func clientError(exit ClientExit, tr *Transcript) string {
+	if exit.TimedOut || exit.Canceled {
+		return ""
+	}
+	var parts []string
+	if exit.ExitCode != 0 {
+		parts = append(parts, fmt.Sprintf("exit %d", exit.ExitCode))
+	}
+	if tr != nil && tr.IsError {
+		parts = append(parts, "error event: "+firstNonEmpty(truncate([]byte(tr.ErrorText), 200), "(no text)"))
+	}
+	return strings.Join(parts, "; ")
+}
+
 // runOne executes one (task, arm, repetition) in a fresh detached worktree.
 func (ex *executor) runOne(ctx context.Context, t *Task, arm Arm, rep int, repo, sha string) (rec RunRecord) {
 	cfg, corpus := ex.cfg, ex.corpus
@@ -502,24 +625,50 @@ func (ex *executor) runOne(ctx context.Context, t *Task, arm Arm, rep int, repo,
 	// it, `git worktree list`) must not reveal the arm: an opaque run id plus the
 	// repository's own name, identical across arms.
 	runID := opaqueRunID(t.ID, arm.Name, rep)
-	wt, err := newRunWorktree(repo, sha, filepath.Join(cfg.workRoot, "runrepos", runID), filepath.Join(cfg.workRoot, "wt", runID, repoDirName(corpus, t)))
+	marker, err := newRunMarker()
+	if err != nil {
+		return fail(StatusError, err.Error())
+	}
+	sb := ex.sandboxFor(runID)
+	wt, err := newRunWorktree(repo, sha, filepath.Join(cfg.workRoot, "runrepos", runID),
+		filepath.Join(cfg.workRoot, "wt", runID, repoDirName(corpus, t)), filepath.Join(cfg.workRoot, "harness", runID))
 	if err != nil {
 		return fail(StatusError, "create worktree: "+err.Error())
 	}
 	ex.registry.add(wt)
 	iso.WorktreeDetached = true
+	trackRun(marker, wt.Dir)
+	fakeDir := filepath.Join(cfg.workRoot, "fake", runID)
+	oracleStaged := false
+	var tracked map[int]int64 // processes seen in the client's tree
 	defer func() {
+		// Nothing the run started may outlive it: a survivor could read a later run's
+		// staged oracle or write into its worktree.
+		if err := sweep(marker, wt.Dir, tracked, iso); err != nil && (rec.Status == StatusCompleted || rec.Status == StatusClientError) {
+			rec.Status, rec.Reason = StatusError, "after the oracle: "+err.Error()
+		}
+		trackRun("", "")
 		if cfg.KeepWorktrees {
+			if oracleStaged {
+				unstageOracle(t, wt.Dir)
+			}
+			ex.registry.forget(wt)
+			iso.KeptAt = wt.Dir
 			return
 		}
+		_ = os.RemoveAll(fakeDir)
 		if err := ex.registry.remove(wt); err != nil && rec.Reason == "" {
 			rec.Reason = "worktree cleanup: " + err.Error()
 		}
 		iso.WorktreeRemoved = wt.gone()
 	}()
+	runStep := func(spec CommandSpec, logName string, def int) CheckResult {
+		return check{argv: spec.Cmd, dir: wt.Dir, env: spec.Env, extraEnv: []string{marker}, sb: sb,
+			timeout: secondsOr(spec.TimeoutSec, def), logPath: filepath.Join(art, logName), logRel: logName}.run(ctx)
+	}
 
 	for i, s := range t.Setup {
-		res := runCheck(ctx, s.Cmd, wt.Dir, s.Env, secondsOr(s.TimeoutSec, 600), filepath.Join(art, fmt.Sprintf("setup-%d.log", i)), fmt.Sprintf("setup-%d.log", i))
+		res := runStep(s, fmt.Sprintf("setup-%d.log", i), 600)
 		rec.Setup = append(rec.Setup, res)
 		if !res.Passed {
 			return fail(StatusError, fmt.Sprintf("setup step %d failed (exit %d)", i, res.ExitCode))
@@ -531,7 +680,7 @@ func (ex *executor) runOne(ctx context.Context, t *Task, arm Arm, rep int, repo,
 	}
 	iso.OracleLeakScan = "clean"
 
-	sampler := startRSSSampler(100*time.Millisecond, filepath.Join(art, "rss.jsonl"))
+	sampler := startRSSSampler(100*time.Millisecond, filepath.Join(art, "rss.jsonl"), cfg.xmNames)
 	samplerDone := false
 	finishSampler := func() {
 		if !samplerDone {
@@ -549,8 +698,10 @@ func (ex *executor) runOne(ctx context.Context, t *Task, arm Arm, rep int, repo,
 		if arm.SeedsMemory {
 			mem = t.Memory
 		}
+		stackDir := filepath.Join(art, "stack")
 		rec.Stack = &StackInfo{Kind: cfg.Stack.Kind, CoreOnly: cfg.Stack.Kind == StackReal && cfg.Stack.coreOnly()}
-		stk, err = startStack(ctx, cfg.Stack, stackStart{runDir: filepath.Join(art, "stack"), worktree: wt.Dir, taskID: t.ID, memory: mem, sampler: sampler, self: cfg.self})
+		stk, err = startStack(ctx, cfg.Stack, stackStart{runDir: stackDir, worktree: wt.Dir, taskID: t.ID, memory: mem, sampler: sampler, self: cfg.self,
+			sb: sb.with(stackDir), marker: marker})
 		if err != nil {
 			rec.Stack.Error = err.Error()
 			return fail(StatusError, "start xMustard stack: "+err.Error())
@@ -566,7 +717,7 @@ func (ex *executor) runOne(ctx context.Context, t *Task, arm Arm, rep int, repo,
 	if err := applyDrift(t.Memory, wt.Dir); err != nil {
 		return fail(StatusError, err.Error())
 	}
-	baseTree, err := wt.SnapshotTree(cfg.workRoot)
+	baseTree, err := wt.SnapshotTree()
 	if err != nil {
 		return fail(StatusError, "snapshot: "+err.Error())
 	}
@@ -613,12 +764,13 @@ func (ex *executor) runOne(ctx context.Context, t *Task, arm Arm, rep int, repo,
 		return fail(StatusError, "build client invocation: "+err.Error())
 	}
 	if cfg.Fake {
-		inv, err = ex.fakeInvocation(inv, t, arm, rep)
+		inv, err = ex.fakeInvocation(inv, t, arm, runID)
 		if err != nil {
 			return fail(StatusError, err.Error())
 		}
 	}
-	if inv, err = contain(cfg.contain, cfg.hidden, []string{filepath.Join(cfg.workRoot, "repos")}, inv); err != nil {
+	inv.Env = append(inv.Env, marker)
+	if inv, err = contain(sb, inv); err != nil {
 		return fail(StatusError, err.Error())
 	}
 	sampler.setPhase("agent")
@@ -626,6 +778,7 @@ func (ex *executor) runOne(ctx context.Context, t *Task, arm Arm, rep int, repo,
 		time.Duration(corpus.timeoutSec(t))*time.Second, sampler.setAgentRoot)
 	sampler.setPhase("post")
 	finishSampler()
+	tracked = sampler.agentProcesses()
 	rec.Client = &exit
 	if err != nil {
 		return fail(StatusError, "client: "+err.Error())
@@ -636,21 +789,10 @@ func (ex *executor) runOne(ctx context.Context, t *Task, arm Arm, rep int, repo,
 		priceUsage(&tr, cfg.Model, cfg.Pricing)
 		rec.Transcript = &tr
 	}
+	rec.ClientError = clientError(exit, rec.Transcript)
 	if exit.Canceled {
 		return fail(StatusInterrupted, "interrupted during the agent run")
 	}
-
-	finalTree, err := wt.SnapshotTree(cfg.workRoot)
-	if err != nil {
-		return fail(StatusError, "snapshot: "+err.Error())
-	}
-	churn, err := diffChurn(wt.Dir, baseTree, finalTree, filepath.Join(art, "diff.patch"))
-	if err != nil {
-		return fail(StatusError, "diff: "+err.Error())
-	}
-	rec.Churn = &churn
-	rec.Localization = editLocalization(t.GoldFiles, churn.Files)
-
 	if stk != nil {
 		health, promo := stk.finish(ctx)
 		rec.Stack.Health = health
@@ -659,20 +801,59 @@ func (ex *executor) runOne(ctx context.Context, t *Task, arm Arm, rep int, repo,
 			rec.Memory = memoryMetrics(t.ID, t.Memory, rec.Transcript.XmResults, stk.seeds(), promo)
 		}
 	}
+	// The client's group is dead; so must be everything else the run started (a
+	// command the agent detached with setsid) before the tree is judged.
+	if err := sweep(marker, wt.Dir, tracked, iso); err != nil {
+		return fail(StatusError, err.Error())
+	}
+
+	finalTree, err := wt.SnapshotTree()
+	if err != nil {
+		return fail(StatusError, "snapshot: "+err.Error())
+	}
+	churn, err := diffChurn(wt, baseTree, finalTree, filepath.Join(art, "diff.patch"))
+	if err != nil {
+		return fail(StatusError, "diff: "+err.Error())
+	}
+	rec.Churn = &churn
+	rec.Localization = editLocalization(t.GoldFiles, churn.Files)
+
+	// Verify runs code the agent wrote, so it is contained like the agent, and it runs
+	// after the final snapshot, so whatever it changes is undone before the oracle.
 	if t.Verify != nil {
-		v := runCheck(ctx, t.Verify.Cmd, wt.Dir, t.Verify.Env, secondsOr(t.Verify.TimeoutSec, 600), filepath.Join(art, "verify.log"), "verify.log")
+		v := runStep(*t.Verify, "verify.log", 600)
 		rec.Verify = &v
 	}
 	if ctx.Err() != nil {
 		return fail(StatusInterrupted, "interrupted before the oracle")
 	}
-	// The agent's group is dead (runClient killed it) and the visible verify step is
-	// recorded; only now may the hidden oracle enter the worktree.
+	if err := sweep(marker, wt.Dir, tracked, iso); err != nil {
+		return fail(StatusError, "after verify: "+err.Error())
+	}
+	afterVerify, err := wt.SnapshotTree()
+	if err != nil {
+		return fail(StatusError, "snapshot: "+err.Error())
+	}
+	if afterVerify != finalTree {
+		iso.VerifyChangedTree = true
+		if err := wt.RestoreTree(finalTree); err != nil {
+			return fail(StatusError, "restore the agent's final tree after verify: "+err.Error())
+		}
+	}
+	// Only now, with no process of the run alive and the tree as the agent left it,
+	// may the hidden oracle enter the worktree. A corpus file that changed on disk
+	// means something escaped containment: the run fails and no further run starts.
+	if err := corpus.checkIntegrity(); err != nil {
+		ex.aborted = "corpus_changed: " + err.Error()
+		return fail(StatusError, ex.aborted)
+	}
+	oracleStaged = true
 	if err := stageOracle(corpus, t, wt.Dir); err != nil {
 		return fail(StatusError, "stage oracle: "+err.Error())
 	}
 	iso.OracleStagedPost = true
-	o := runCheck(ctx, t.Oracle.Cmd, wt.Dir, t.Oracle.Env, secondsOr(t.Oracle.TimeoutSec, 600), filepath.Join(art, "oracle.log"), "oracle.log")
+	o := check{argv: t.Oracle.Cmd, dir: wt.Dir, env: t.Oracle.Env, extraEnv: []string{marker}, sb: sb,
+		timeout: secondsOr(t.Oracle.TimeoutSec, 600), logPath: filepath.Join(art, "oracle.log"), logRel: "oracle.log"}.run(ctx)
 	rec.Oracle = &o
 	if ctx.Err() != nil {
 		return fail(StatusInterrupted, "interrupted during the oracle")
@@ -682,20 +863,23 @@ func (ex *executor) runOne(ctx context.Context, t *Task, arm Arm, rep int, repo,
 	}
 	rec.Resolved = o.Passed
 	rec.Status = StatusCompleted
+	if cfg.ExcludeClientErrors && rec.ClientError != "" {
+		rec.Status, rec.Reason = StatusClientError, "client error (exclude_client_errors): "+rec.ClientError
+	}
 	return rec
 }
 
 // fakeInvocation swaps the client binary for this executable's fake agent and gives
 // it the canned solution (a copy outside every hidden path).
-func (ex *executor) fakeInvocation(inv Invocation, t *Task, arm Arm, rep int) (Invocation, error) {
+func (ex *executor) fakeInvocation(inv Invocation, t *Task, arm Arm, runID string) (Invocation, error) {
 	cfg := ex.cfg
 	env := append(inv.Env, envAsMain+"=1")
 	if t.Reference != nil {
-		dir := filepath.Join(cfg.workRoot, "fake", t.ID+"-"+armDir(arm.Name)+"-r"+strconv.Itoa(rep))
+		dir := filepath.Join(cfg.workRoot, "fake", runID)
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return inv, err
 		}
-		b, err := os.ReadFile(ex.corpus.resolve(t.Reference.Patch))
+		b, err := ex.corpus.fileBytes(t.Reference.Patch)
 		if err != nil {
 			return inv, err
 		}
@@ -716,6 +900,12 @@ func (ex *executor) fakeInvocation(inv Invocation, t *Task, arm Arm, rep int) (I
 	}
 	if cfg.fakeExit != 0 {
 		env = append(env, envFakeExit+"="+strconv.Itoa(cfg.fakeExit))
+	}
+	if cfg.fakeDetach {
+		env = append(env, envFakeDetach+"=1")
+	}
+	if cfg.fakeGitConfig != "" {
+		env = append(env, envFakeGitConfig+"="+cfg.fakeGitConfig)
 	}
 	args := append([]string{"fake-agent", "--emulate", cfg.Driver, "--"}, inv.Args...)
 	return Invocation{Bin: cfg.self, Args: args, Env: env, Stdin: inv.Stdin}, nil

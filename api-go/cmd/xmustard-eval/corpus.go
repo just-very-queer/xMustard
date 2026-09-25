@@ -50,6 +50,10 @@ type Corpus struct {
 	Path   string `yaml:"-"` // absolute path of the corpus file
 	Dir    string `yaml:"-"` // directory relative paths resolve against
 	SHA256 string `yaml:"-"` // digest of the corpus file bytes
+	// FileSHA256 maps every oracle source and reference patch (as the corpus names
+	// it) to the digest of the bytes read at load time.
+	FileSHA256 map[string]string `yaml:"-"`
+	files      map[string][]byte // the same files' bytes; staging never re-reads disk
 }
 
 // Defaults apply to every task that does not set its own value.
@@ -117,6 +121,18 @@ type Reference struct {
 type MemorySpec struct {
 	Seed  []SeedMemory `yaml:"seed"`
 	Drift []DriftEdit  `yaml:"drift"`
+	// RecallK is the k of current-fact recall@k: a current fact counts when it is
+	// among the first k entries of a ranked recall result (default 5).
+	RecallK int `yaml:"recall_k"`
+}
+
+const defaultRecallK = 5
+
+func (m *MemorySpec) recallK() int {
+	if m.RecallK > 0 {
+		return m.RecallK
+	}
+	return defaultRecallK
 }
 
 // SeedMemory is one memory with its ground-truth label.
@@ -162,7 +178,65 @@ func LoadCorpus(path string) (*Corpus, error) {
 	if err := c.Validate(); err != nil {
 		return nil, err
 	}
+	if err := c.readFiles(); err != nil {
+		return nil, err
+	}
 	return &c, nil
+}
+
+// readFiles reads every oracle source and reference patch once. The harness stages
+// and applies these bytes, so a file changed on disk later (by code the agent wrote,
+// if containment failed) cannot change what an oracle checks.
+func (c *Corpus) readFiles() error {
+	c.files, c.FileSHA256 = map[string][]byte{}, map[string]string{}
+	for _, src := range c.namedFiles() {
+		b, err := os.ReadFile(c.resolve(src))
+		if err != nil {
+			return err
+		}
+		sum := sha256.Sum256(b)
+		c.files[src], c.FileSHA256[src] = b, hex.EncodeToString(sum[:])
+	}
+	return nil
+}
+
+// namedFiles lists the oracle sources and reference patches as the corpus names them.
+func (c *Corpus) namedFiles() []string {
+	var out []string
+	for i := range c.Tasks {
+		t := &c.Tasks[i]
+		for _, f := range t.Oracle.Files {
+			out = append(out, f.Src)
+		}
+		if t.Reference != nil {
+			out = append(out, t.Reference.Patch)
+		}
+	}
+	slices.Sort(out)
+	return slices.Compact(out)
+}
+
+// fileBytes returns the load-time bytes of an oracle source or reference patch.
+func (c *Corpus) fileBytes(src string) ([]byte, error) {
+	b, ok := c.files[src]
+	if !ok {
+		return nil, fmt.Errorf("%s was not read when the corpus was loaded", src)
+	}
+	return b, nil
+}
+
+// checkIntegrity re-hashes the corpus file, oracle sources and reference patches
+// and fails when any changed since load: something wrote to a hidden path.
+func (c *Corpus) checkIntegrity() error {
+	if got, err := fileSHA256(c.Path); err != nil || got != c.SHA256 {
+		return fmt.Errorf("corpus file %s changed during the run (%v)", c.Path, err)
+	}
+	for _, src := range sortedKeys(c.FileSHA256) {
+		if got, err := fileSHA256(c.resolve(src)); err != nil || got != c.FileSHA256[src] {
+			return fmt.Errorf("%s changed during the run (%v)", src, err)
+		}
+	}
+	return nil
 }
 
 // Validate reports every schema problem at once.
@@ -282,6 +356,9 @@ func (c *Corpus) validateTask(t *Task) []error {
 func validateMemory(m *MemorySpec) []error {
 	var errs []error
 	add := func(format string, a ...any) { errs = append(errs, fmt.Errorf(format, a...)) }
+	if m.RecallK < 0 {
+		add("memory.recall_k must not be negative")
+	}
 	keys := map[string]SeedMemory{}
 	for i, s := range m.Seed {
 		if !taskIDPattern.MatchString(s.Key) {
@@ -412,6 +489,50 @@ func (c *Corpus) hiddenPaths() []string {
 	return slices.Compact(out)
 }
 
+// repoPaths returns what the literal hidden paths leave reachable through git: for
+// every hidden path inside a git repository, that repository's common git directory
+// (its object store holds the committed bytes, so `git show HEAD:<oracle>` would read
+// them) and the same path in each of the repository's worktrees (another checkout's
+// copy). Copies elsewhere on the machine are not found; the README says to keep a
+// corpus out of places the agent can reach.
+func repoPaths(hidden []string) []string {
+	var out []string
+	for _, p := range hidden {
+		real, err := filepath.EvalSymlinks(p)
+		if err != nil {
+			continue
+		}
+		dir := real
+		if fi, err := os.Stat(real); err == nil && !fi.IsDir() {
+			dir = filepath.Dir(real)
+		}
+		common, err := git(dir, "rev-parse", "--path-format=absolute", "--git-common-dir")
+		if err != nil {
+			continue // not inside a repository
+		}
+		out = append(out, common)
+		top, err := git(dir, "rev-parse", "--show-toplevel")
+		if err != nil {
+			continue // inside a git directory or a bare repository
+		}
+		rel, err := filepath.Rel(top, real)
+		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			continue
+		}
+		list, err := git(dir, "worktree", "list", "--porcelain")
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(list, "\n") {
+			if w, ok := strings.CutPrefix(line, "worktree "); ok {
+				out = append(out, filepath.Join(w, rel))
+			}
+		}
+	}
+	slices.Sort(out)
+	return slices.Compact(out)
+}
+
 func isCleanRelPath(p string) bool {
 	if p == "" || filepath.IsAbs(p) || strings.Contains(p, `\`) {
 		return false
@@ -512,18 +633,21 @@ func copyTree(src, dst string) error {
 	})
 }
 
-// git runs a git command in dir and returns its trimmed stdout. Hooks, CRLF
-// conversion and the global excludes file are off, so results do not depend on the
-// operator's git setup.
+// git runs a git command in dir and returns its trimmed stdout. System and global
+// config are ignored and hooks, the fsmonitor, CRLF conversion and the global excludes
+// file are off, so results do not depend on the operator's git setup and no
+// configured command runs. Repository config still applies: after an agent has
+// started, the harness runs git only through its own git directory (Worktree.hgit).
 func git(dir string, args ...string) (string, error) {
 	return gitEnv(dir, nil, args...)
 }
 
 func gitEnv(dir string, env []string, args ...string) (string, error) {
-	full := append([]string{"-c", "core.hooksPath=/dev/null", "-c", "core.autocrlf=false", "-c", "core.excludesFile=/dev/null"}, args...)
+	full := append([]string{"-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "core.autocrlf=false",
+		"-c", "core.excludesFile=/dev/null", "-c", "core.pager=cat"}, args...)
 	cmd := exec.Command("git", full...)
 	cmd.Dir = dir
-	cmd.Env = append(scrubbedEnv(), env...)
+	cmd.Env = append(append(scrubbedEnv(), "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_TERMINAL_PROMPT=0"), env...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	if err := cmd.Run(); err != nil {
@@ -533,11 +657,14 @@ func gitEnv(dir string, env []string, args ...string) (string, error) {
 }
 
 // scrubbedEnv is the harness environment without any XMUSTARD_* variable, so neither
-// the agent nor the task commands inherit the harness's own configuration.
+// the agent nor the task commands inherit the harness's own configuration. PWD and
+// OLDPWD are dropped too: os/exec does not rewrite them when Env is set, so they would
+// name the operator's directory (often the checkout holding the corpus); commands get
+// PWD set to their own directory instead.
 func scrubbedEnv() []string {
 	out := make([]string, 0, len(os.Environ()))
 	for _, kv := range os.Environ() {
-		if !strings.HasPrefix(kv, "XMUSTARD_") {
+		if !strings.HasPrefix(kv, "XMUSTARD_") && !strings.HasPrefix(kv, "PWD=") && !strings.HasPrefix(kv, "OLDPWD=") {
 			out = append(out, kv)
 		}
 	}

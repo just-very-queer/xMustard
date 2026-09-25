@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -28,10 +29,20 @@ import (
 const (
 	envFakePatch = "XMUSTARD_EVAL_FAKE_PATCH" // reference patch to apply
 	envFakeSolve = "XMUSTARD_EVAL_FAKE_SOLVE" // "0" leaves the task unsolved
-	envFakeProbe = "XMUSTARD_EVAL_FAKE_PROBE" // test only: paths to try reading, "|"-separated
 	envFakeSleep = "XMUSTARD_EVAL_FAKE_SLEEP_MS"
 	envFakeExit  = "XMUSTARD_EVAL_FAKE_EXIT" // exit status after a complete transcript
 	envAsMain    = "XMUSTARD_EVAL_AS_MAIN"   // lets a test binary act as this command
+
+	// Test-only knobs.
+	//
+	// envFakeProbe lists paths to try reading, "|"-separated; an entry
+	// "git-show:<repo>:<rev:path>" runs `git -C <repo> show <rev:path>` instead.
+	envFakeProbe = "XMUSTARD_EVAL_FAKE_PROBE"
+	// envFakeDetach "1" leaves two setsid children behind.
+	envFakeDetach = "XMUSTARD_EVAL_FAKE_DETACH"
+	// envFakeGitConfig "<key>=<value>" is set with `git config` in the worktree
+	// before any tool call (an agent planting core.fsmonitor for xMustard's git).
+	envFakeGitConfig = "XMUSTARD_EVAL_FAKE_GIT_CONFIG"
 )
 
 var workspaceLine = regexp.MustCompile(`workspace_id "([^"]+)"`)
@@ -110,6 +121,12 @@ func runFakeAgent(argv []string, stdin io.Reader, stdout io.Writer) int {
 
 // work performs the canned session: orient with xMustard, probe, then patch.
 func (st *fakeState) work() {
+	if kv := os.Getenv(envFakeGitConfig); kv != "" {
+		k, v, _ := strings.Cut(kv, "=")
+		if out, err := exec.Command("git", "config", k, v).CombinedOutput(); err != nil {
+			st.notes = append(st.notes, "git config failed: "+err.Error()+" "+string(out))
+		}
+	}
 	ws := ""
 	if m := workspaceLine.FindStringSubmatch(st.prompt); m != nil {
 		ws = m[1]
@@ -144,17 +161,31 @@ func (st *fakeState) work() {
 		if p == "" {
 			continue
 		}
-		if _, err := os.ReadFile(p); err == nil {
+		var err error
+		if spec, ok := strings.CutPrefix(p, "git-show:"); ok {
+			repo, obj, _ := strings.Cut(spec, ":")
+			err = exec.Command("git", "-C", repo, "show", obj).Run()
+		} else {
+			_, err = os.ReadFile(p)
+		}
+		if err == nil {
 			st.notes = append(st.notes, "probe "+p+": readable")
 		} else {
 			st.notes = append(st.notes, "probe "+p+": denied")
 		}
 	}
+	if os.Getenv(envFakeDetach) == "1" {
+		st.detach()
+	}
 	if ms, _ := strconv.Atoi(os.Getenv(envFakeSleep)); ms > 0 {
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 	if patch := os.Getenv(envFakePatch); patch != "" && os.Getenv(envFakeSolve) != "0" {
-		if err := applyPatch(".", patch); err != nil {
+		b, err := os.ReadFile(patch)
+		if err == nil {
+			err = applyPatch(".", b)
+		}
+		if err != nil {
 			st.notes = append(st.notes, "patch failed: "+err.Error())
 		} else {
 			st.solved = true
@@ -173,6 +204,29 @@ func (st *fakeState) work() {
 	}
 	st.usage.Total = st.usage.Input + st.usage.CacheRead + st.usage.CacheWrite + st.usage.Output
 	st.cost = (float64(st.usage.Input)*3 + float64(st.usage.CacheRead)*0.3 + float64(st.usage.CacheWrite)*3.75 + float64(st.usage.Output)*15) / 1e6
+}
+
+// detach leaves two processes behind in new sessions, as Pi's bash tool does for
+// every command: one keeps the environment (and so the run marker) but works outside
+// the worktree; the other clears its environment but works inside the worktree.
+func (st *fakeState) detach() {
+	for _, c := range []struct {
+		dir string
+		env []string
+	}{{"/", nil}, {".", []string{}}} {
+		cmd := exec.Command("sleep", "120")
+		cmd.Dir, cmd.Env = c.dir, c.env
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+		if err := cmd.Start(); err != nil {
+			st.notes = append(st.notes, "detach failed: "+err.Error())
+			continue
+		}
+		st.notes = append(st.notes, "detached "+strconv.Itoa(cmd.Process.Pid))
+		_ = cmd.Process.Release()
+	}
+	// stay alive a little so the harness's 100 ms process sampler sees the children
+	// in the client's tree before they are reparented
+	time.Sleep(400 * time.Millisecond)
 }
 
 func (st *fakeState) summary() string {

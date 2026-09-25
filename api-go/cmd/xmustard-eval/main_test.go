@@ -202,7 +202,9 @@ func TestFakeDriverEndToEnd(t *testing.T) {
 }
 
 // TestSeedCorpusDryRunAllArms is the acceptance dry run: every arm over the seed
-// corpus with the fake driver and the stub stack.
+// corpus with the fake driver and the stub stack. The hooks arm gets stand-in hook
+// arguments (the fake client ignores them), so every arm completes on the seed tasks;
+// only the memory arm skips the one task without a memory fixture.
 func TestSeedCorpusDryRunAllArms(t *testing.T) {
 	if testing.Short() {
 		t.Skip("runs go test inside the seed fixtures")
@@ -212,7 +214,7 @@ func TestSeedCorpusDryRunAllArms(t *testing.T) {
 	}
 	c := loadTestCorpus(t, "../../../eval/tasks/seed.yaml")
 	out := filepath.Join(t.TempDir(), "out")
-	cfg := prepared(t, &RunConfig{Driver: "fake:claude"}, c, out)
+	cfg := prepared(t, &RunConfig{Driver: "fake:claude", Hooks: map[string][]string{"claude": {"--settings", "/nonexistent/hooks.json"}}}, c, out)
 	rep, err := Execute(context.Background(), cfg, c)
 	if err != nil {
 		t.Fatal(err)
@@ -223,8 +225,8 @@ func TestSeedCorpusDryRunAllArms(t *testing.T) {
 	}
 	for _, r := range recs {
 		if r.Status == StatusSkipped {
-			if r.Reason == "" {
-				t.Fatalf("unnamed skip %s/%s", r.TaskID, r.Arm)
+			if r.Arm != ArmXmustardMemory || r.TaskID != "calc-mean-fraction" || r.Reason == "" {
+				t.Fatalf("unexpected skip %s/%s: %q", r.TaskID, r.Arm, r.Reason)
 			}
 			continue
 		}
@@ -232,10 +234,20 @@ func TestSeedCorpusDryRunAllArms(t *testing.T) {
 			t.Fatalf("%s/%s: %s resolved=%v (%s)", r.TaskID, r.Arm, r.Status, r.Resolved, r.Reason)
 		}
 	}
-	if rep.Counts[StatusCompleted] != 10 || rep.Counts[StatusSkipped] != 5 || len(rep.NotCompleted) != 5 {
+	if rep.Counts[StatusCompleted] != 14 || rep.Counts[StatusSkipped] != 1 || len(rep.NotCompleted) != 1 {
 		t.Fatalf("counts %v", rep.Counts)
 	}
-	if len(rep.Memory) != 1 || rep.Memory[0].ScopeLeakage != 0 || rep.Memory[0].PendingServed != 0 {
+	for _, a := range rep.ArmSummaries {
+		if a.Completed == 0 {
+			t.Fatalf("arm %s completed no task", a.Arm)
+		}
+	}
+	for _, cmp := range rep.Comparisons {
+		if cmp.PairedTasks < 2 || cmp.Decision == "NO-DATA" {
+			t.Fatalf("comparison %s rests on %d task(s): %s", cmp.ExperimentArm, cmp.PairedTasks, cmp.Decision)
+		}
+	}
+	if len(rep.Memory) != 1 || rep.Memory[0].Runs != 2 || rep.Memory[0].ScopeLeakage != 0 || rep.Memory[0].PendingServed != 0 {
 		t.Fatalf("memory summary %+v", rep.Memory)
 	}
 }
@@ -412,7 +424,7 @@ func TestRunsDoNotShareRepositoryState(t *testing.T) {
 		t.Fatal(err)
 	}
 	root := t.TempDir()
-	w1, err := newRunWorktree(scratch, sha, filepath.Join(root, "r1"), filepath.Join(root, "w1"))
+	w1, err := newRunWorktree(scratch, sha, filepath.Join(root, "r1"), filepath.Join(root, "w1"), filepath.Join(root, "h1"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -426,7 +438,7 @@ func TestRunsDoNotShareRepositoryState(t *testing.T) {
 	if err := w1.Remove(); err != nil || !w1.gone() {
 		t.Fatalf("remove: %v", err)
 	}
-	w2, err := newRunWorktree(scratch, sha, filepath.Join(root, "r2"), filepath.Join(root, "w2"))
+	w2, err := newRunWorktree(scratch, sha, filepath.Join(root, "r2"), filepath.Join(root, "w2"), filepath.Join(root, "h2"))
 	if err != nil {
 		t.Fatal(err)
 	}

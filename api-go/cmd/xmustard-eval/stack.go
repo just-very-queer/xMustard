@@ -86,6 +86,11 @@ type stackStart struct {
 	memory   *MemorySpec // nil unless the arm seeds memory
 	sampler  *rssSampler
 	self     string // this executable (stub MCP bridge)
+	// sb contains the API like the agent (it runs git in the worktree the agent
+	// controls, so a hook or config the agent planted would otherwise run outside the
+	// sandbox); it must allow runDir. marker is the run's environment marker.
+	sb     *sandbox
+	marker string
 }
 
 func startStack(ctx context.Context, cfg StackConfig, st stackStart) (stackRun, error) {
@@ -166,7 +171,12 @@ func (s *realStack) startAPI(ctx context.Context, coreOnly bool) error {
 	if err != nil {
 		return err
 	}
-	cmd := exec.Command(s.cfg.APIBin)
+	bin, args, err := s.st.sb.wrap(s.cfg.APIBin, nil)
+	if err != nil {
+		logf.Close()
+		return err
+	}
+	cmd := exec.Command(bin, args...)
 	cmd.Env = append(scrubbedEnv(),
 		"XMUSTARD_DATA_DIR="+s.dataDir,
 		"XMUSTARD_API_HOST=127.0.0.1",
@@ -174,6 +184,9 @@ func (s *realStack) startAPI(ctx context.Context, coreOnly bool) error {
 		"XMUSTARD_AUTH=required",
 		"XMUSTARD_CORE_BIN="+s.cfg.CoreBin,
 	)
+	if s.st.marker != "" {
+		cmd.Env = append(cmd.Env, s.st.marker)
+	}
 	if coreOnly {
 		cmd.Env = append(cmd.Env, "XMUSTARD_CORE_ONLY=1")
 	}

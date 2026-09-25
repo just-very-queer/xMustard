@@ -54,9 +54,14 @@ type ToolResult struct {
 
 // Transcript is what the harness extracts from one client event stream.
 type Transcript struct {
-	FinalEvent    bool           `json:"final_event"`
-	FinalKind     string         `json:"final_kind,omitempty"`
-	Usage         Usage          `json:"usage"`
+	FinalEvent bool   `json:"final_event"`
+	FinalKind  string `json:"final_kind,omitempty"`
+	Usage      Usage  `json:"usage"`
+	// UsageReported is set only when the client reported usage for the whole session
+	// in its final event. Without it Usage is partial or empty (a run killed before
+	// its final event, a codex turn.failed) and the report leaves the run out of
+	// every token number instead of counting it as 0.
+	UsageReported bool           `json:"usage_reported"`
 	UsageSource   string         `json:"usage_source,omitempty"`
 	CostUSD       *float64       `json:"cost_usd,omitempty"`
 	CostSource    string         `json:"cost_source"`
@@ -224,6 +229,8 @@ func (claudeDriver) Parse(r io.Reader, xmServer string) Transcript {
 				t.CostUSD, t.CostSource = &c, CostClientFinal
 			}
 			u := obj(ev["usage"])
+			_, hasModelUsage := ev["modelUsage"].(map[string]any)
+			t.UsageReported = u != nil || hasModelUsage
 			fallback = Usage{
 				Input:      int64(num(u["input_tokens"])),
 				CacheWrite: int64(num(u["cache_creation_input_tokens"])),
@@ -303,6 +310,7 @@ func (codexDriver) Build(req DriverRequest, prompt string) (Invocation, error) {
 func (codexDriver) Parse(r io.Reader, xmServer string) Transcript {
 	t := Transcript{ToolCalls: map[string]int{}, CostSource: CostUnpriced, UsageSource: "turn.completed"}
 	var input, cached, output, reasoning int64
+	turnsWithUsage, failed := 0, false
 	eachJSONLine(r, &t, func(ev map[string]any) {
 		switch str(ev["type"]) {
 		case "item.completed":
@@ -339,6 +347,9 @@ func (codexDriver) Parse(r io.Reader, xmServer string) Transcript {
 			t.FinalEvent, t.FinalKind = true, "turn.completed"
 			t.NumTurns++
 			u := obj(ev["usage"])
+			if u != nil {
+				turnsWithUsage++
+			}
 			input += int64(num(u["input_tokens"]))
 			cached += int64(num(u["cached_input_tokens"]))
 			output += int64(num(u["output_tokens"]))
@@ -347,6 +358,7 @@ func (codexDriver) Parse(r io.Reader, xmServer string) Transcript {
 			t.FinalEvent, t.FinalKind = true, "turn.failed"
 			t.NumTurns++
 			t.IsError = true
+			failed = true // a failed turn carries no usage, so the session total is unknown
 			t.ErrorText = str(obj(ev["error"])["message"])
 		case "error":
 			t.IsError = true
@@ -356,6 +368,7 @@ func (codexDriver) Parse(r io.Reader, xmServer string) Transcript {
 	// OpenAI usage counts cached tokens inside input_tokens and reasoning inside
 	// output_tokens; split the cache out so Input is the uncached share.
 	t.Usage = Usage{Input: max(input-cached, 0), CacheRead: cached, Output: output, Reasoning: reasoning, Total: input + output}
+	t.UsageReported = turnsWithUsage > 0 && !failed
 	return t
 }
 
@@ -412,6 +425,7 @@ func (piDriver) Parse(r io.Reader, _ string) Transcript {
 					d := obj(ev["data"])
 					tok := obj(d["tokens"])
 					t.FinalEvent, t.FinalKind = true, "get_session_stats"
+					t.UsageReported = tok != nil
 					t.Usage = Usage{
 						Input:      int64(num(tok["input"])),
 						Output:     int64(num(tok["output"])),
@@ -502,7 +516,7 @@ func runClient(ctx context.Context, d Driver, inv Invocation, dir, prompt, trans
 
 	cmd := exec.Command(inv.Bin, inv.Args...)
 	cmd.Dir = dir
-	cmd.Env = append(scrubbedEnv(), inv.Env...)
+	cmd.Env = append(append(scrubbedEnv(), "PWD="+dir), inv.Env...)
 	cmd.Stderr = ef
 	// stdout goes through a pipe the harness reads line by line (Pi answers events);
 	// WaitDelay force-closes it if a straggler still holds it after the client exits.

@@ -1,8 +1,9 @@
 # Seed corpus for xmustard-eval (schema: eval/tasks/README.md).
 #
 # Three small, self-contained Go tasks that exercise every executor path: a bug fix,
-# a feature, and a coding-memory lifecycle task whose answer exists only in shared
-# memory. They are for dry runs and harness checks, not for parity claims; the
+# a feature with a small memory fixture (a current contract, the rule it superseded,
+# and an unreviewed note), and a coding-memory lifecycle task whose answer exists only
+# in shared memory. They are for dry runs and harness checks, not for parity claims; the
 # evaluation corpus proper (Apache/MIT repositories, oracles validated to fail on the
 # starting state and pass on the reference) is authored in WS-63.
 schema: xmustard.eval/v1
@@ -49,6 +50,25 @@ tasks:
     reference:
       patch: references/calc-median.patch
     gold_files: [calc/calc.go]
+    memory:
+      recall_k: 3
+      seed:
+        - key: calc-input-contract
+          label: current
+          title: calc input contract
+          content: "calc helpers never reorder or modify the caller's slice; copy it before sorting."
+          paths: [calc/calc.go]
+          supersedes: calc-sort-in-place
+        - key: calc-sort-in-place
+          label: superseded
+          title: calc sorting
+          content: "calc helpers may sort the caller's slice in place."
+          paths: [calc/calc.go]
+        - key: median-int-draft
+          label: pending
+          title: Unreviewed Median signature
+          content: "Unreviewed: Median should return an int."
+          paths: [calc/calc.go]
 
   - id: service-agreed-port
     class: memory_lifecycle

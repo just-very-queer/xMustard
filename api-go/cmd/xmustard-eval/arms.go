@@ -72,26 +72,62 @@ type PeerConfig struct {
 	Command string            `yaml:"command" json:"command"`
 	Args    []string          `yaml:"args" json:"args"`
 	Env     map[string]string `yaml:"env" json:"-"`
-	// OwnerDecision must be set for a noncommercial-licensed peer (for example
-	// GitNexus, PolyForm Noncommercial): running it needs an explicit owner decision.
+	// OwnerDecision must be set for a noncommercial or source-available peer (for
+	// example GitNexus, PolyForm Noncommercial): running it needs an explicit owner
+	// decision (§2.4).
 	OwnerDecision string `yaml:"owner_decision" json:"owner_decision,omitempty"`
+	// OwnerDecisionRule records which rule required the decision (set by prepare).
+	OwnerDecisionRule string `yaml:"-" json:"owner_decision_rule,omitempty"`
+}
+
+// knownNoncommercialPeers are peers whose license needs an owner decision whatever
+// the config's free-text license field says.
+var knownNoncommercialPeers = []string{"gitnexus"}
+
+var ncLicenseToken = regexp.MustCompile(`(^|[^a-z0-9])nc([^a-z0-9]|$)`)
+
+// ownerDecisionRule returns why this peer needs an owner decision, or "".
+func (p PeerConfig) ownerDecisionRule() string {
+	lic := strings.ToLower(p.License)
+	switch {
+	case strings.Contains(lic, "noncommercial") || strings.Contains(lic, "non-commercial"):
+		return "license names noncommercial terms"
+	case strings.Contains(lic, "polyform"):
+		return "PolyForm (source-available) license"
+	case ncLicenseToken.MatchString(lic):
+		return "license carries an NC (noncommercial) term"
+	}
+	for _, s := range append([]string{p.Name, p.Command}, p.Args...) {
+		for _, n := range knownNoncommercialPeers {
+			if strings.Contains(strings.ToLower(s), n) {
+				return "known noncommercial peer " + n
+			}
+		}
+	}
+	return ""
+}
+
+// check validates the peer and returns the rule that requires an owner decision.
+func (p PeerConfig) check() (string, error) {
+	if !peerNamePattern.MatchString(p.Name) {
+		return "", fmt.Errorf("peer %q: name must match %s", p.Name, peerNamePattern)
+	}
+	if p.Command == "" {
+		return "", fmt.Errorf("peer %q: command is required", p.Name)
+	}
+	if strings.TrimSpace(p.License) == "" {
+		return "", fmt.Errorf("peer %q: license is required (record the peer's license before running it)", p.Name)
+	}
+	rule := p.ownerDecisionRule()
+	if rule != "" && strings.TrimSpace(p.OwnerDecision) == "" {
+		return rule, fmt.Errorf("peer %q: %s (license %q); set owner_decision to record the owner's explicit approval", p.Name, rule, p.License)
+	}
+	return rule, nil
 }
 
 func (p PeerConfig) validate() error {
-	if !peerNamePattern.MatchString(p.Name) {
-		return fmt.Errorf("peer %q: name must match %s", p.Name, peerNamePattern)
-	}
-	if p.Command == "" {
-		return fmt.Errorf("peer %q: command is required", p.Name)
-	}
-	if strings.TrimSpace(p.License) == "" {
-		return fmt.Errorf("peer %q: license is required (record the peer's license before running it)", p.Name)
-	}
-	lic := strings.ToLower(p.License)
-	if (strings.Contains(lic, "noncommercial") || strings.Contains(lic, "non-commercial")) && strings.TrimSpace(p.OwnerDecision) == "" {
-		return fmt.Errorf("peer %q: license %q is noncommercial; set owner_decision to record the owner's explicit approval", p.Name, p.License)
-	}
-	return nil
+	_, err := p.check()
+	return err
 }
 
 // MCPServer is one stdio MCP server handed to a client.

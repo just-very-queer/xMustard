@@ -52,6 +52,8 @@ func realMain(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return cmdReport(args[1:], stdout, stderr)
 	case "fake-agent":
 		return runFakeAgent(args[1:], stdin, stdout)
+	case "watchdog":
+		return runWatchdog(args[1:], stdin)
 	case "stub-mcp":
 		if err := runStubMCP(stdin, stdout); err != nil {
 			fmt.Fprintln(stderr, "stub-mcp:", err)
@@ -180,9 +182,16 @@ func cmdRun(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "report: %s\n", filepath.Join(cfg.outDir, "report.md"))
 		fmt.Fprintf(stdout, "runs: %s\n", countsLine(rep.Counts))
 	}
+	if cfg.KeepWorktrees && cfg.workRoot != "" {
+		fmt.Fprintf(stdout, "worktrees kept in: %s (remove it when done)\n", cfg.workRoot)
+	}
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
-			fmt.Fprintln(stderr, "interrupted; worktrees removed, partial results written")
+			if cfg.KeepWorktrees {
+				fmt.Fprintf(stderr, "interrupted; worktrees kept in %s, partial results written\n", cfg.workRoot)
+			} else {
+				fmt.Fprintln(stderr, "interrupted; worktrees removed, partial results written")
+			}
 			return 130
 		}
 		fmt.Fprintln(stderr, err)
@@ -320,7 +329,7 @@ func validateOneOracle(ctx context.Context, corpus *Corpus, t *Task, work, logRo
 	if err != nil {
 		return fail(err)
 	}
-	wt, err := newRunWorktree(repo, sha, filepath.Join(work, "runrepos", t.ID), filepath.Join(work, "wt", t.ID))
+	wt, err := newRunWorktree(repo, sha, filepath.Join(work, "runrepos", t.ID), filepath.Join(work, "wt", t.ID), filepath.Join(work, "harness", t.ID))
 	if err != nil {
 		return fail(err)
 	}
@@ -330,8 +339,13 @@ func validateOneOracle(ctx context.Context, corpus *Corpus, t *Task, work, logRo
 	if err := os.MkdirAll(logs, 0o755); err != nil {
 		return fail(err)
 	}
+	// validate runs only the corpus's own commands and the reference patch (no agent
+	// code), so nothing here is contained
+	step := func(spec CommandSpec, logPath string) CheckResult {
+		return check{argv: spec.Cmd, dir: wt.Dir, env: spec.Env, timeout: secondsOr(spec.TimeoutSec, 600), logPath: logPath, logRel: logPath}.run(ctx)
+	}
 	for i, s := range t.Setup {
-		if r := runCheck(ctx, s.Cmd, wt.Dir, s.Env, secondsOr(s.TimeoutSec, 600), filepath.Join(logs, fmt.Sprintf("setup-%d.log", i)), ""); !r.Passed {
+		if r := step(s, filepath.Join(logs, fmt.Sprintf("setup-%d.log", i))); !r.Passed {
 			return fail(fmt.Errorf("setup step %d failed (exit %d)", i, r.ExitCode))
 		}
 	}
@@ -346,8 +360,7 @@ func validateOneOracle(ctx context.Context, corpus *Corpus, t *Task, work, logRo
 			return CheckResult{}, err
 		}
 		defer unstageOracle(t, wt.Dir)
-		logPath := filepath.Join(logs, name)
-		r := runCheck(ctx, t.Oracle.Cmd, wt.Dir, t.Oracle.Env, secondsOr(t.Oracle.TimeoutSec, 600), logPath, logPath)
+		r := step(CommandSpec{Cmd: t.Oracle.Cmd, Env: t.Oracle.Env, TimeoutSec: t.Oracle.TimeoutSec}, filepath.Join(logs, name))
 		if r.Error != "" {
 			return r, errors.New("oracle did not run: " + r.Error)
 		}
@@ -358,11 +371,15 @@ func validateOneOracle(ctx context.Context, corpus *Corpus, t *Task, work, logRo
 		return fail(err)
 	}
 	v.OracleFailsBase, v.BaselineOracleLog = !base.Passed, base.Log
-	if err := applyPatch(wt.Dir, corpus.resolve(t.Reference.Patch)); err != nil {
+	patch, err := corpus.fileBytes(t.Reference.Patch)
+	if err == nil {
+		err = applyPatch(wt.Dir, patch)
+	}
+	if err != nil {
 		return fail(err)
 	}
 	if t.Verify != nil {
-		r := runCheck(ctx, t.Verify.Cmd, wt.Dir, t.Verify.Env, secondsOr(t.Verify.TimeoutSec, 600), filepath.Join(logs, "verify-reference.log"), "")
+		r := step(*t.Verify, filepath.Join(logs, "verify-reference.log"))
 		v.VerifyPassesRef = &r.Passed
 	}
 	ref, err := runOracle("oracle-reference.log")
