@@ -35,6 +35,15 @@ const overloadCode = mcpserver.CodeOverloaded
 
 func overloadError(err error) *rpcError { return mcpserver.OverloadError(err) }
 
+// tooLargeCode answers a request this shim can never admit: past maxMessageBytes, or
+// holding more than its whole transient pool. Unlike overloadCode it is permanent, so a
+// client does not retry it.
+const tooLargeCode = mcpserver.CodeTooLarge
+
+func admissionError(err error) *rpcError { return mcpserver.AdmissionError(err) }
+
+func replyRefused(err error) (map[string]any, *rpcError) { return mcpserver.ReplyRefused(err) }
+
 func mcpText(text string, isError bool) map[string]any { return mcpserver.TextResult(text, isError) }
 
 // One stdio process is one MCP session.
@@ -175,11 +184,11 @@ func (c *stdioClient) isPending(id json.RawMessage) bool {
 }
 
 // answerUndecoded returns the reply owed to a frame that was not decoded (over the
-// size cap, or refused admission), or nil when none is owed. A client's response to a
-// server request (roots/list) is never answered: it is dropped, and the request
-// waiting for it fails now instead of timing out. withID answers a request with its
-// probed id; without it (a truncated frame) the error carries a null id.
-func (c *stdioClient) answerUndecoded(probe []byte, rerr *rpcError, withID bool) *rpcResponse {
+// size cap or the whole pool, or refused admission), or nil when none is owed. A
+// client's response to a server request (roots/list) is never answered: it is dropped,
+// and the request waiting for it fails now instead of timing out. A request is answered
+// with the id a top-level parse of the bounded prefix recovers, else a null id.
+func (c *stdioClient) answerUndecoded(probe []byte, rerr *rpcError) *rpcResponse {
 	p := probeFrame(probe)
 	if !p.method && (p.answer || (p.id != nil && c.isPending(p.id))) {
 		if p.id != nil {
@@ -187,11 +196,7 @@ func (c *stdioClient) answerUndecoded(probe []byte, rerr *rpcError, withID bool)
 		}
 		return nil
 	}
-	id := p.id
-	if !withID {
-		id = nil
-	}
-	return &rpcResponse{JSONRPC: "2.0", ID: id, Error: rerr}
+	return &rpcResponse{JSONRPC: "2.0", ID: p.id, Error: rerr}
 }
 
 // maxInflight bounds concurrently outstanding id-bearing requests; beyond it the shim
@@ -225,6 +230,7 @@ type frame struct {
 	truncated bool   // exceeded maxMessageBytes; drained, not buffered
 	refused   bool   // the transient pool refused it; drained, not buffered
 	headroom  bool   // pool refused, but it fit the fixed control headroom (see below)
+	neverFits bool   // larger than the whole pool: its refusal is permanent
 	err       error
 }
 
@@ -238,8 +244,10 @@ const idProbeBytes = 1024
 const controlHeadroom = 4 << 10
 
 // readAdmittedLine reads one frame, reserving each chunk in scope BEFORE appending it.
-// A frame over maxMessageBytes, or one the pool refuses, is drained to its newline
-// without being buffered. scope nil means unadmitted (tests of the framing alone).
+// A frame over maxMessageBytes or larger than the whole pool (it can never be admitted:
+// truncated, answered permanently), or one the pool refuses for now (refused, answered
+// with the retryable overload), is drained to its newline without being buffered.
+// scope nil means unadmitted (tests of the framing alone).
 func readAdmittedLine(r *bufio.Reader, scope *budget.Scope) frame {
 	var f frame
 	for {
@@ -248,15 +256,23 @@ func readAdmittedLine(r *bufio.Reader, scope *budget.Scope) frame {
 			if room := idProbeBytes - len(f.probe); room > 0 {
 				f.probe = append(f.probe, chunk[:min(room, len(chunk))]...)
 			}
+			var aerr error
+			if !f.truncated && !f.refused && !f.headroom && scope != nil && len(f.line)+len(chunk) <= maxMessageBytes {
+				aerr = scope.Acquire(int64(len(chunk)))
+				f.neverFits = errors.Is(aerr, budget.ErrNeverFits)
+			}
 			switch {
 			case f.truncated || f.refused:
 			case len(f.line)+len(chunk) > maxMessageBytes:
-				f.truncated, f.line = true, nil
-			case f.headroom || (scope != nil && scope.Acquire(int64(len(chunk))) != nil):
-				if len(f.line)+len(chunk) <= controlHeadroom {
+				f.truncated, f.headroom, f.line = true, false, nil
+			case f.headroom || aerr != nil:
+				switch {
+				case len(f.line)+len(chunk) <= controlHeadroom:
 					f.headroom = true
 					f.line = append(f.line, chunk...)
-				} else {
+				case f.neverFits:
+					f.truncated, f.headroom, f.line = true, false, nil
+				default:
 					f.refused, f.headroom, f.line = true, false, nil
 				}
 			default:
@@ -269,6 +285,20 @@ func readAdmittedLine(r *bufio.Reader, scope *budget.Scope) frame {
 		f.err = e
 		return f
 	}
+}
+
+// admitDecode reserves the decoded copy of an admitted frame before it is unmarshalled.
+// A frame the pool refused while it was read gets the retryable overload.
+func admitDecode(scope *budget.Scope, refused bool, line []byte) *rpcError {
+	if refused {
+		return overloadError(budget.ErrOverloaded)
+	}
+	if len(line) > 0 {
+		if err := scope.Acquire(int64(len(line))); err != nil {
+			return admissionError(err)
+		}
+	}
+	return nil
 }
 
 // probeID recovers the TOP-LEVEL JSON-RPC id from the bounded prefix of a frame that
@@ -406,12 +436,14 @@ func main() {
 		scope := budget.NewScope(nil)
 		f := readAdmittedLine(reader, scope)
 		err := f.err
+		rawBytes := int64(len(f.line)) // reserved while reading
 		line := bytes.TrimSpace(f.line)
 		if f.truncated {
 			scope.Close()
-			// can't trust the (partial) body to parse an id; reply with a null-id error
-			// (a response to a server request is dropped, never answered).
-			if resp := client.answerUndecoded(f.probe, &rpcError{Code: mcpserver.CodeInvalidRequest, Message: "request exceeds max message size"}, false); resp != nil {
+			// permanent (past the size cap or the whole pool): a request is answered with
+			// the id from a top-level parse of the bounded prefix, else null; a response to
+			// a server request is dropped, never answered.
+			if resp := client.answerUndecoded(f.probe, &rpcError{Code: tooLargeCode, Message: "request exceeds max message size"}); resp != nil {
 				send(*resp)
 			}
 		} else if f.headroom {
@@ -426,12 +458,14 @@ func main() {
 				notify(inflight, m)
 			} else if m.Method == "ping" {
 				send(rpcResponse{JSONRPC: "2.0", ID: m.ID, Result: map[string]any{}})
+			} else if f.neverFits {
+				send(rpcResponse{JSONRPC: "2.0", ID: m.ID, Error: admissionError(budget.ErrNeverFits)})
 			} else {
 				send(rpcResponse{JSONRPC: "2.0", ID: m.ID, Error: overloadError(budget.ErrOverloaded)})
 			}
-		} else if f.refused || (len(line) > 0 && scope.Acquire(int64(len(line))) != nil) {
+		} else if aerr := admitDecode(scope, f.refused, line); aerr != nil {
 			scope.Close()
-			if resp := client.answerUndecoded(f.probe, overloadError(budget.ErrOverloaded), true); resp != nil {
+			if resp := client.answerUndecoded(f.probe, aerr); resp != nil {
 				send(*resp)
 			}
 		} else if len(line) == 0 {
@@ -440,6 +474,7 @@ func main() {
 			var m rpcMessage
 			jsonErr := json.Unmarshal(line, &m)
 			f.line, line = nil, nil // the raw frame is no longer referenced
+			scope.Release(rawBytes) // ...so its reservation ends; the decoded copy stays held
 			if jsonErr != nil {
 				scope.Close()
 				// malformed JSON → structured parse error rather than a silent drop.

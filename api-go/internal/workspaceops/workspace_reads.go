@@ -930,6 +930,7 @@ func readGoChangeRecords(rootPath string, baseRef string) ([]RepoChangeRecord, [
 	} else {
 		warnings = append(warnings, "Git base-ref comparison failed for "+baseRef+"; working-tree changes are still reported.")
 	}
+	noteGitIfStarted(diffCmd)
 	statusCmd := exec.Command("git", "-C", rootPath, "status", "--porcelain=v1")
 	if output, err := statusCmd.Output(); err == nil {
 		for _, raw := range strings.Split(strings.TrimRight(string(output), "\n"), "\n") {
@@ -956,6 +957,7 @@ func readGoChangeRecords(rootPath string, baseRef string) ([]RepoChangeRecord, [
 	} else {
 		warnings = append(warnings, "Git working-tree status failed; Go impact reads may be incomplete.")
 	}
+	noteGitIfStarted(statusCmd)
 	items := make([]RepoChangeRecord, 0, len(records))
 	for _, item := range records {
 		items = append(items, item)

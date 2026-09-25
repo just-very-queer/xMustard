@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -45,6 +46,14 @@ func TestProbeIDUsesOnlyTopLevelID(t *testing.T) {
 // saturation test below for the proof).
 func TestCancellationServiceableUnderPoolSaturation(t *testing.T) {
 	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/api/workspaces" {
+			// the listing read for the result's workspace root answers at once, so the
+			// tool call itself is what holds the pool
+			_, _ = w.Write([]byte(`[]`))
+			return
+		}
+		// read the body so the server notices the shim cancelling (closing) the request
+		_, _ = io.Copy(io.Discard, r.Body)
 		<-r.Context().Done()
 	}))
 	defer api.Close()
@@ -93,24 +102,32 @@ func TestCancellationServiceableUnderPoolSaturation(t *testing.T) {
 }
 
 // With the pool provably exhausted, a cancellation frame is still read (fixed control
-// headroom) while a large frame is refused without being buffered.
+// headroom) while a large frame is refused without being buffered: retryably when it
+// would fit the idle pool, permanently (truncated) when it is larger than the whole pool.
 func TestControlFramesReadUnderExhaustedPool(t *testing.T) {
-	pool := budget.NewByteBudget(64)
-	if !pool.Acquire(64) {
+	const poolBytes = 128 << 10
+	pool := budget.NewByteBudget(poolBytes)
+	if !pool.Acquire(poolBytes) {
 		t.Fatal("fill pool")
 	}
 	cancelFrame := `{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1}}` + "\n"
 	big := `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"remember","arguments":{"content":"` + strings.Repeat("x", 64<<10) + `"}}}` + "\n"
-	r := bufio.NewReaderSize(bytes.NewReader([]byte(cancelFrame+big)), 64<<10)
+	huge := `{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"remember","arguments":{"content":"` + strings.Repeat("x", 200<<10) + `"}}}` + "\n"
+	r := bufio.NewReaderSize(bytes.NewReader([]byte(cancelFrame+big+huge)), 64<<10)
 	f := readAdmittedLine(r, budget.NewScope(pool))
 	if !f.headroom || f.refused || !strings.Contains(string(f.line), "notifications/cancelled") {
 		t.Fatalf("cancellation frame must be read from headroom: %+v", f.headroom)
 	}
 	f = readAdmittedLine(r, budget.NewScope(pool))
-	if !f.refused || f.line != nil || string(probeID(f.probe)) != "2" {
+	if !f.refused || f.truncated || f.line != nil || string(probeID(f.probe)) != "2" {
 		t.Fatalf("large frame under an exhausted pool must be refused unbuffered with its id: refused=%v", f.refused)
 	}
-	if pool.InUse() != 64 {
-		t.Fatalf("headroom must not draw on the pool: %d", pool.InUse())
+	pool.Release(poolBytes)
+	f = readAdmittedLine(r, budget.NewScope(pool))
+	if !f.truncated || f.refused || f.line != nil || string(probeID(f.probe)) != "3" {
+		t.Fatalf("a frame larger than the whole pool must be truncated (permanent) unbuffered: truncated=%v refused=%v", f.truncated, f.refused)
+	}
+	if pool.InUse() != 128<<10 {
+		t.Fatalf("the truncated frame's reservation stays with its scope until closed, headroom draws nothing: %d", pool.InUse())
 	}
 }

@@ -19,7 +19,7 @@ func (s *Session) callTool(ctx context.Context, params json.RawMessage) (any, *R
 	// decoding arguments copies their text once more: reserve before decoding
 	if scope, owned := budget.ScopeFor(ctx); !owned {
 		if err := scope.Acquire(int64(len(params))); err != nil {
-			return nil, OverloadError(err)
+			return nil, AdmissionError(err)
 		}
 	} else {
 		scope.Close()
@@ -98,7 +98,7 @@ func (s *Session) RunTool(ctx context.Context, t *Tool, args map[string]string, 
 	}
 	if scope, owned := budget.ScopeFor(ctx); !owned {
 		if err := scope.Acquire(2 * argBytes); err != nil {
-			return nil, OverloadError(err)
+			return nil, AdmissionError(err)
 		}
 	} else {
 		scope.Close() // no request ledger (direct callers/tests): nothing to hold
@@ -135,12 +135,12 @@ func (s *Session) RunTool(ctx context.Context, t *Tool, args map[string]string, 
 		}
 		// the reply text and its encoding copy the body again: reserve before building it
 		if err := ReserveReply(ctx, len(resp.Body)); err != nil {
-			return nil, OverloadError(err)
+			return ReplyRefused(err)
 		}
 		res = TextResult(resp.Body, false)
 	}
 	if err := s.finish(ctx, res, ws, norms); err != nil {
-		return nil, OverloadError(err)
+		return ReplyRefused(err)
 	}
 	return res, nil
 }

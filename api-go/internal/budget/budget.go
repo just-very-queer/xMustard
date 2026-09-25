@@ -93,7 +93,9 @@ func NewScope(pool *ByteBudget) *Scope {
 	return &Scope{pool: pool}
 }
 
-// Acquire reserves n more bytes in this scope or returns ErrOverloaded.
+// Acquire reserves n more bytes in this scope. It returns ErrNeverFits when this scope's
+// bytes plus n exceed the whole pool (the request can never be admitted, so retrying is
+// pointless) and ErrOverloaded when they do not fit now because of other requests.
 func (s *Scope) Acquire(n int64) error {
 	if n <= 0 {
 		return nil
@@ -103,6 +105,9 @@ func (s *Scope) Acquire(n int64) error {
 	if s.closed {
 		return fmt.Errorf("%w (scope closed)", ErrOverloaded)
 	}
+	if max := s.pool.Max(); max > 0 && (n > max || s.held > max-n) {
+		return fmt.Errorf("%w (%d bytes held by this request + %d more > %d-byte pool)", ErrNeverFits, s.held, n, max)
+	}
 	if !s.pool.Acquire(n) {
 		return ErrOverloaded
 	}
@@ -110,8 +115,28 @@ func (s *Scope) Acquire(n int64) error {
 	return nil
 }
 
+// Release returns up to n of this scope's bytes before Close, for a copy the request no
+// longer references (a raw frame once it has been decoded, for example).
+func (s *Scope) Release(n int64) {
+	if n <= 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return
+	}
+	n = min(n, s.held)
+	s.held -= n
+	s.pool.Release(n)
+}
+
 // Held reports the bytes currently reserved by this scope.
 func (s *Scope) Held() int64 { s.mu.Lock(); defer s.mu.Unlock(); return s.held }
+
+// PoolMax is the size of the pool this scope reserves from (0 means unlimited). Per-item
+// caps derived from it keep work that can never be admitted on the permanent path.
+func (s *Scope) PoolMax() int64 { return s.pool.Max() }
 
 // Close releases every byte the scope holds.
 func (s *Scope) Close() {
@@ -155,6 +180,7 @@ type CaptureWriter struct {
 	buf      []byte
 	over     bool
 	refused  bool
+	limitErr error // set when the pool could never admit the output (Over is true)
 	// OnStop, when set, runs once at the first overflow or refusal so the owner can
 	// kill the producer. Returning an error only stops pipe copying; a child that
 	// stops writing (e.g. floods, then sleeps) would otherwise keep running.
@@ -196,8 +222,17 @@ func (c *CaptureWriter) Write(p []byte) (int, error) {
 		if chunk < need {
 			chunk = need
 		}
-		if err := c.scope.Acquire(chunk); err != nil {
-			c.refused = true
+		err := c.scope.Acquire(chunk)
+		if err != nil && chunk > need && errors.Is(err, ErrNeverFits) {
+			chunk = need // a whole chunk would never fit, but the bytes needed might
+			err = c.scope.Acquire(chunk)
+		}
+		if err != nil {
+			if errors.Is(err, ErrNeverFits) {
+				c.over, c.limitErr = true, err // permanent: as if past the cap
+			} else {
+				c.refused = true
+			}
 			c.stop()
 			return 0, errCaptureStopped
 		}
@@ -211,17 +246,23 @@ func (c *CaptureWriter) Write(p []byte) (int, error) {
 func (c *CaptureWriter) Bytes() []byte  { return c.buf }
 func (c *CaptureWriter) Len() int       { return len(c.buf) }
 func (c *CaptureWriter) String() string { return string(c.buf) }
-func (c *CaptureWriter) Over() bool     { return c.over }
-func (c *CaptureWriter) Refused() bool  { return c.refused }
+
+// Over reports output past max, or past what the pool could ever admit for this
+// request: a permanent failure. Refused reports a transient pool refusal.
+func (c *CaptureWriter) Over() bool    { return c.over }
+func (c *CaptureWriter) Refused() bool { return c.refused }
 
 // ReadAllAdmitted reads r up to max bytes, reserving pool bytes before buffering. It
-// returns ErrOverloaded when the pool refuses and ErrTooLarge past max.
+// returns ErrOverloaded when the pool refuses for now, and an ErrTooLarge error past max
+// or past what the pool could ever admit (ErrNeverFits).
 func ReadAllAdmitted(scope *Scope, r io.Reader, max int) ([]byte, error) {
 	w := NewCaptureWriter(scope, max)
 	_, err := io.Copy(w, r)
 	switch {
 	case w.Refused():
 		return nil, ErrOverloaded
+	case w.Over() && w.limitErr != nil:
+		return nil, w.limitErr
 	case w.Over():
 		return nil, ErrTooLarge
 	case err != nil:
@@ -233,10 +274,17 @@ func ReadAllAdmitted(scope *Scope, r io.Reader, max int) ([]byte, error) {
 // ErrTooLarge reports a read that exceeded its per-item cap.
 var ErrTooLarge = errors.New("payload exceeds size limit")
 
-// defaultTransientBudgetBytes keeps the AGGREGATE transient pool well under the 50–100 MB
-// RSS target (the rest of the budget is the base process + caches). Operators may lower
-// it; raising it needs a new resource measurement.
-const defaultTransientBudgetBytes = 64 << 20 // 64 MiB
+// ErrNeverFits reports a reservation that an empty pool could not admit: the request
+// alone would hold more than the whole transient budget, so a retry cannot succeed. It
+// wraps ErrTooLarge, so callers answer it permanently (HTTP 413, a JSON-RPC
+// invalid-request or tool error), never with 503 + Retry-After or -32000.
+var ErrNeverFits = fmt.Errorf("%w: more than the whole transient budget, so a retry cannot succeed", ErrTooLarge)
+
+// DefaultTransientBudgetBytes is the AGGREGATE transient pool (PAR-RT-04: 16–24 MiB,
+// lowered from 64 MiB, where four 16 MiB captures held the whole pool). It sits inside
+// the Go daemon's share of the 95.4 MiB process-tree gate; heavy work has its own slot
+// (governor.go). Operators may lower it; raising it needs a new resource measurement.
+const DefaultTransientBudgetBytes = 24 << 20 // 24 MiB
 
 // TransientBytes is the process-wide transient-byte pool every large transient allocation
 // reserves against.
@@ -248,7 +296,17 @@ func transientBudgetFromEnv() int64 {
 			return n
 		}
 	}
-	return defaultTransientBudgetBytes
+	return DefaultTransientBudgetBytes
+}
+
+// CapToPool lowers a per-request byte cap to the transient pool's size. A request larger
+// than the whole pool can never be admitted, so it must be refused as too large (413),
+// not as a retryable overload.
+func CapToPool(n int64) int64 {
+	if m := TransientBytes.Max(); m > 0 && n > m {
+		return m
+	}
+	return n
 }
 
 // ChildLimit bounds how many helper children (Rust core, ast-grep, verification

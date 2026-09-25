@@ -6,9 +6,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
-
 	"testing"
+
 	"xmustard/api-go/internal/budget"
+	"xmustard/api-go/internal/mcpserver"
 )
 
 // fakeEvidenceAPI mimics the API's evidence contract (evidence_routes.go).
@@ -121,8 +122,10 @@ func TestResourceReadErrorsAreProtocolErrors(t *testing.T) {
 }
 
 // Fable evidence F7 (shim): decoding the envelope and encoding the reply copy the
-// projection again; with the pool unable to hold those copies the call must be refused
-// with -32000, not answered from unreserved memory.
+// projection again, so those copies are admitted before they are built. When other calls
+// hold the pool the call is refused with the retryable -32000; when the copies could
+// never fit the whole pool it gets a permanent tool error instead of an overload that an
+// idle shim would repeat forever. Neither answer is built from unreserved memory.
 func TestShimResponseConstructionIsAdmitted(t *testing.T) {
 	big := strings.Repeat("p", 200<<10)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -132,14 +135,34 @@ func TestShimResponseConstructionIsAdmitted(t *testing.T) {
 	defer srv.Close()
 	t.Setenv("XMUSTARD_API_BASE", srv.URL)
 	prev := budget.TransientBytes
-	budget.TransientBytes = budget.NewByteBudget(300 << 10)
 	defer func() { budget.TransientBytes = prev }()
-	scope := budget.NewScope(nil)
-	defer scope.Close()
-	ctx := budget.WithScope(context.Background(), scope)
-	_, rerr := dispatchCtx(ctx, "tools/call", json.RawMessage(`{"name":"search","arguments":{"workspace_id":"ws","query":"q"}}`))
-	if rerr == nil || rerr.Code != overloadCode {
-		t.Fatalf("response construction beyond the pool: want -32000, got %+v", rerr)
+	call := func() (map[string]any, *rpcError) {
+		scope := budget.NewScope(nil)
+		defer scope.Close()
+		ctx := budget.WithScope(context.Background(), scope)
+		res, rerr := dispatchCtx(ctx, "tools/call", json.RawMessage(`{"name":"search","arguments":{"workspace_id":"ws","query":"q"}}`))
+		m, _ := res.(map[string]any)
+		return m, rerr
+	}
+
+	budget.TransientBytes = budget.NewByteBudget(2 << 20)
+	other := budget.NewScope(nil)
+	if err := other.Acquire(1600 << 10); err != nil {
+		t.Fatal(err)
+	}
+	if _, rerr := call(); rerr == nil || rerr.Code != overloadCode {
+		t.Fatalf("reply copies while another call holds the pool: want -32000, got %+v", rerr)
+	}
+	other.Close()
+	if res, rerr := call(); rerr != nil || res["isError"] == true {
+		t.Fatalf("the same call on an idle 2 MiB pool must succeed: %v %+v", res, rerr)
+	}
+
+	budget.TransientBytes = budget.NewByteBudget(300 << 10)
+	res, rerr := call()
+	text, _ := json.Marshal(res)
+	if rerr != nil || res["isError"] != true || !strings.Contains(string(text), "transient budget") || strings.Contains(string(text), big[:1024]) {
+		t.Fatalf("reply copies larger than the whole pool: want a permanent tool error, got %.300s %+v", text, rerr)
 	}
 }
 
@@ -156,4 +179,67 @@ func TestShimMapsEnvelopeOverloadToProtocolError(t *testing.T) {
 	if rerr == nil || rerr.Code != overloadCode {
 		t.Fatalf("envelope overload: want -32000, got %+v", rerr)
 	}
+}
+
+// On the default 24 MiB pool a reply is held as the API response plus the text block
+// built from it and, in a 2025-06-18 session, the structuredContent that mirrors that
+// text (a spliced copy and its encoding). A 2024-11-05 session relays a 10 MiB response;
+// a 13 MiB one (under the 16 MiB response cap) could never be held twice. A 2025-06-18
+// session relays 5 MiB; 7 MiB could never be held four times. Either refusal is a
+// permanent tool error, not a -32000 overload an idle shim would repeat forever.
+func TestShimResponseSizesOnTheDefaultPool(t *testing.T) {
+	size := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/api/workspaces" {
+			_, _ = w.Write([]byte(`[]`)) // the listing read for the result's workspace root
+			return
+		}
+		_, _ = w.Write([]byte(`{"pad":"` + strings.Repeat("r", size) + `"}`))
+	}))
+	defer srv.Close()
+	t.Setenv("XMUSTARD_API_BASE", srv.URL)
+	prev := budget.TransientBytes
+	budget.TransientBytes = budget.NewByteBudget(budget.DefaultTransientBudgetBytes)
+	defer func() { budget.TransientBytes = prev }()
+	for _, tc := range []struct {
+		version string
+		size    int
+		ok      bool
+	}{
+		{"2024-11-05", 10 << 20, true}, {"2024-11-05", 13 << 20, false},
+		{"2025-06-18", 5 << 20, true}, {"2025-06-18", 7 << 20, false},
+	} {
+		s := newTestSession(t, tc.version)
+		size = tc.size
+		scope := budget.NewScope(nil)
+		res, rerr := s.Handle(budget.WithScope(context.Background(), scope), "tools/call",
+			json.RawMessage(`{"name":"search","arguments":{"workspace_id":"ws","query":"q"}}`))
+		scope.Close()
+		m, _ := res.(map[string]any)
+		text, _ := json.Marshal(m)
+		if rerr != nil {
+			t.Fatalf("%s, %d-byte response: want a tool result, got JSON-RPC error %+v", tc.version, tc.size, rerr)
+		}
+		if tc.ok && (m["isError"] == true || len(text) < tc.size) {
+			t.Fatalf("%s, %d-byte response fits the default pool: %.200s", tc.version, tc.size, text)
+		}
+		if !tc.ok && (m["isError"] != true || !strings.Contains(string(text), "transient budget")) {
+			t.Fatalf("%s, %d-byte response can never be held in 24 MiB: want a permanent tool error, got %.200s", tc.version, tc.size, text)
+		}
+		if budget.TransientBytes.InUse() != 0 {
+			t.Fatalf("reservation leaked: %d", budget.TransientBytes.InUse())
+		}
+	}
+}
+
+// newTestSession is a fresh session over the shim's backend and evidence delivery,
+// negotiated to version, so a test does not depend on what earlier tests negotiated on
+// the shared session or on its cached workspace listing.
+func newTestSession(t *testing.T, version string) *mcpserver.Session {
+	t.Helper()
+	s := mcpserver.New(mcpserver.Options{Backend: backend, Delivery: evidenceDelivery{}, Resources: evidenceResources{}}).NewSession(nil)
+	if _, rerr := s.Handle(context.Background(), "initialize", json.RawMessage(`{"protocolVersion":"`+version+`","capabilities":{},"clientInfo":{"name":"t","version":"1"}}`)); rerr != nil {
+		t.Fatalf("initialize %s: %+v", version, rerr)
+	}
+	return s
 }

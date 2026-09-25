@@ -8,6 +8,7 @@ package mcpserver
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"os"
 	"strings"
@@ -39,6 +40,30 @@ func (e *RPCError) Error() string { return e.Message }
 
 // OverloadError is the JSON-RPC answer to an admission refusal.
 func OverloadError(err error) *RPCError { return &RPCError{Code: CodeOverloaded, Message: err.Error()} }
+
+// CodeTooLarge answers a request that can never be admitted: past the framing cap, or
+// holding more than the whole transient pool. Unlike CodeOverloaded it is permanent, so
+// a client does not retry it.
+const CodeTooLarge = CodeInvalidRequest
+
+// AdmissionError answers a refused reservation: permanently when the request could
+// never fit the pool (budget.ErrNeverFits wraps budget.ErrTooLarge), with the retryable
+// overload when it does not fit for now.
+func AdmissionError(err error) *RPCError {
+	if errors.Is(err, budget.ErrTooLarge) {
+		return &RPCError{Code: CodeTooLarge, Message: "request exceeds max message size: " + err.Error()}
+	}
+	return OverloadError(err)
+}
+
+// ReplyRefused answers a refused reply reservation: an API result the server could never
+// relay is a tool error (narrow the query); a pool busy for now is the retryable overload.
+func ReplyRefused(err error) (map[string]any, *RPCError) {
+	if errors.Is(err, budget.ErrTooLarge) {
+		return TextResult("xmustard: the result is larger than this shim's transient budget; narrow the query ("+err.Error()+")", true), nil
+	}
+	return nil, OverloadError(err)
+}
 
 // Protocol versions this server implements, newest first. 2025-03-26 is not listed:
 // it requires accepting JSON-RPC batches, which this server does not.

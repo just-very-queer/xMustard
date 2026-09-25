@@ -749,6 +749,7 @@ func detectOpencodeModels(binary string) []string {
 		return nil
 	}
 	untrack := rustcore.TrackChild(command)
+	noteHelperSpawn()
 	err := command.Wait()
 	untrack()
 	rustcore.KillProcessTree(command)

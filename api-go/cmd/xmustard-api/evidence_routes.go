@@ -111,6 +111,7 @@ type hashingBody struct {
 func (b *hashingBody) Read(p []byte) (int, error) {
 	n, err := b.ReadCloser.Read(p)
 	b.h.Write(p[:n])
+	budget.NoteHashed(int64(n))
 	return n, err
 }
 
@@ -121,9 +122,13 @@ func principalScope(r *http.Request) (actor string, enforced bool) {
 	return "", false
 }
 
+// sampleCaptureIdentity samples a workspace's repository identity for a capture; a
+// variable so tests can stand in a sampler that attempts heavy work.
+var sampleCaptureIdentity = workspaceops.WorkspaceRepoIdentity
+
 func repoIdentityFunc(ws string) func(ctx context.Context) evidence.Identity {
 	return func(ctx context.Context) evidence.Identity {
-		id, _ := workspaceops.WorkspaceRepoIdentity(ctx, dataDir(), ws)
+		id, _ := sampleCaptureIdentity(ctx, dataDir(), ws)
 		return toEvidenceIdentity(id)
 	}
 }
@@ -151,6 +156,9 @@ func evidenceDeliveryMiddleware(store *evidence.Store, next http.Handler) http.H
 		}
 		// released even if the handler panics or Capture is never reached (idempotent)
 		defer sp.Discard()
+		// Capture work (identity sampling, spooling, reduction) never waits for the heavy
+		// slot; the tool itself runs on r's context as it would without delivery.
+		captureCtx := budget.WithoutHeavyWait(r.Context())
 		body := &hashingBody{ReadCloser: http.NoBody, h: sha256.New()}
 		if r.Body != nil {
 			body.ReadCloser = r.Body
@@ -159,7 +167,7 @@ func evidenceDeliveryMiddleware(store *evidence.Store, next http.Handler) http.H
 		// identity is sampled around execution: Capture binds it only when the
 		// before and after samples are complete and equal.
 		// one sample yields both the before-identity and the canonical trust scope
-		beforeID, scope := workspaceops.WorkspaceRepoIdentity(r.Context(), dataDir(), ws)
+		beforeID, scope := sampleCaptureIdentity(captureCtx, dataDir(), ws)
 		before := toEvidenceIdentity(beforeID)
 		sw := &spoolWriter{header: http.Header{}, spool: sp}
 		next.ServeHTTP(sw, r)
@@ -181,7 +189,7 @@ func evidenceDeliveryMiddleware(store *evidence.Store, next http.Handler) http.H
 		if issuer == "" {
 			issuer = "http"
 		}
-		d, err := store.Capture(r.Context(), sp, evidence.CaptureRequest{
+		d, err := store.Capture(captureCtx, sp, evidence.CaptureRequest{
 			WorkspaceID: ws, RepoScope: scope, Actor: actor, AuthEnforced: enforced, Issuer: issuer,
 			SessionID: r.Header.Get("X-Xmustard-Session-Id"), CallID: r.Header.Get("X-Xmustard-Call-Id"),
 			Tool: tool, ToolVersion: toolVersion, ArgsDigest: hex.EncodeToString(argsHash.Sum(nil)),
@@ -249,6 +257,7 @@ func registerEvidenceRoutes(mux routeRegistrar, store *evidence.Store) {
 		if !requireRole(w, r, "agent") {
 			return
 		}
+		r = r.WithContext(budget.WithoutHeavyWait(r.Context())) // a capture path: never waits for the heavy slot
 		q := r.URL.Query()
 		tool := q.Get("tool")
 		if !coreTools[tool] {
@@ -263,7 +272,9 @@ func registerEvidenceRoutes(mux routeRegistrar, store *evidence.Store) {
 		}
 		defer sp.Discard() // idempotent; covers panics before Capture
 		h := sha256.New()
-		if _, err := io.Copy(io.MultiWriter(sp, h), r.Body); err != nil {
+		n, err := io.Copy(io.MultiWriter(sp, h), r.Body)
+		budget.NoteHashed(n)
+		if err != nil {
 			sp.Discard()
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "read body: " + err.Error()})
 			return

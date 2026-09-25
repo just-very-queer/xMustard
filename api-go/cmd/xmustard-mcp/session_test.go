@@ -170,7 +170,7 @@ func TestUndecodedClientResponseIsNeverAnswered(t *testing.T) {
 	id, _ := json.Marshal(req["id"])
 	refused := overloadError(budget.ErrOverloaded)
 	big := fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"result":{"roots":[{"uri":"file:///%s"}]}}`, id, strings.Repeat("a", 8<<10))
-	if resp := c.answerUndecoded([]byte(big[:idProbeBytes]), refused, true); resp != nil {
+	if resp := c.answerUndecoded([]byte(big[:idProbeBytes]), refused); resp != nil {
 		t.Fatalf("a client response was answered: %+v", resp)
 	}
 	select {
@@ -182,21 +182,20 @@ func TestUndecodedClientResponseIsNeverAnswered(t *testing.T) {
 		t.Fatal("the waiting request was not failed")
 	}
 	cases := []struct {
-		probe  string
-		withID bool
-		want   string // "" means no reply
+		probe string
+		want  string // "" means no reply
 	}{
 		// a stray answer (nothing pending), and one whose result lies past the prefix
-		{`{"jsonrpc":"2.0","id":"xmustard-99","result":{"roots":[`, true, ""},
-		{`{"jsonrpc":"2.0","id":"xmustard-98","error":{"code":-1`, true, ""},
-		// requests keep their id; a truncated request gets a null id
-		{`{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"x":"`, true, "7"},
-		{`{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"x":"`, false, "null"},
+		{`{"jsonrpc":"2.0","id":"xmustard-99","result":{"roots":[`, ""},
+		{`{"jsonrpc":"2.0","id":"xmustard-98","error":{"code":-1`, ""},
+		// requests keep their probed id; one whose id lies past the prefix gets a null id
+		{`{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"x":"`, "7"},
+		{`{"jsonrpc":"2.0","method":"tools/call","params":{"x":"`, "null"},
 		// a request that also carries a result member is still a request
-		{`{"jsonrpc":"2.0","id":8,"method":"ping","result":{`, true, "8"},
+		{`{"jsonrpc":"2.0","id":8,"method":"ping","result":{`, "8"},
 	}
 	for _, tc := range cases {
-		resp := c.answerUndecoded([]byte(tc.probe), refused, tc.withID)
+		resp := c.answerUndecoded([]byte(tc.probe), refused)
 		switch {
 		case tc.want == "" && resp != nil:
 			t.Errorf("%s: answered %+v", tc.probe, resp)

@@ -2067,10 +2067,12 @@ func readWorktreeStatus(root string) *WorktreeStatus {
 		if _, lookErr := exec.LookPath("git"); lookErr != nil {
 			return result
 		}
+		noteGitSpawn()
 		result.Available = true
 		return result
 	}
 
+	noteGitSpawn()
 	result.Available = true
 	result.IsGitRepo = true
 	for _, line := range strings.Split(string(output), "\n") {

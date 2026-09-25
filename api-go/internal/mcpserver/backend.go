@@ -127,6 +127,8 @@ func (b *HTTPBackend) Do(ctx context.Context, r Request) (*APIResponse, error) {
 	switch {
 	case errors.Is(rerr, budget.ErrOverloaded):
 		return nil, fmt.Errorf("API %s %s: %w", r.Method, r.Path, budget.ErrOverloaded)
+	case errors.Is(rerr, budget.ErrNeverFits):
+		return nil, fmt.Errorf("API %s %s response is larger than this shim's transient budget; narrow the query", r.Method, r.Path)
 	case errors.Is(rerr, budget.ErrTooLarge):
 		return nil, fmt.Errorf("API %s %s response exceeded %d bytes; narrow the query", r.Method, r.Path, MaxResponseBytes)
 	case rerr != nil:

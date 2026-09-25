@@ -30,6 +30,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"xmustard/api-go/internal/budget"
 )
 
 // Default limits. Configuration may LOWER them (XMUSTARD_EVIDENCE_*); an increase needs
@@ -425,6 +427,10 @@ func (s *Store) Capture(ctx context.Context, sp *Spool, req CaptureRequest) (*De
 	if err != nil {
 		return nil, err
 	}
+	budget.NoteCapture(sp.n)
+	// Captures stream in O(window) memory and never use the heavy slot; anything this
+	// capture calls (reduction, identity sampling) must not wait for it either.
+	ctx = budget.WithoutHeavyWait(ctx)
 	d := &Delivery{Delivery: DeliveryVersion, Tool: req.Tool, CallID: req.CallID, Status: req.Status,
 		IsError: req.IsError, ContentType: req.ContentType, RawBytes: sp.n, RawSHA256: sum, Reducer: ReducerVersion}
 	proj, rec, err := Reduce(ctx, sp.f, sp.n, req.ContentType, s.limits.ProjectionTarget, s.limits.MaxProjection)
@@ -723,6 +729,7 @@ func hashFile(ctx context.Context, f *os.File, n int64) (string, error) {
 		}
 		m, err := f.ReadAt(buf[:min(int64(len(buf)), n-off)], off)
 		h.Write(buf[:m])
+		budget.NoteHashed(int64(m))
 		off += int64(m)
 		if err != nil && !errors.Is(err, io.EOF) {
 			return "", err

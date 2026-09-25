@@ -48,6 +48,7 @@ func main() {
 	if err := validateStartup(cfg); err != nil {
 		log.Fatal(err)
 	}
+	applyRuntimeHygiene()
 	// Every request context derives from baseCtx, which shutdown cancels after the
 	// bounded drain so in-flight helper children end with the API.
 	baseCtx, cancelBase := context.WithCancel(context.Background())
@@ -400,7 +401,7 @@ func inFlightBodyLimit() int {
 const bodyBudgetThreshold = 1 << 20 // 1 MiB
 
 func bodyLimitMiddleware(next http.Handler) http.Handler {
-	limit := maxRequestBodyBytesConfigured()
+	limit := budget.CapToPool(maxRequestBodyBytesConfigured())
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Every request gets a transient-byte ledger held until the handler returns
 		// (deferred, so success, error, cancellation and panic all release it). Rust
@@ -650,6 +651,7 @@ func registerRoutes(mux routeRegistrar) {
 			// admission counters (bench/diagnostics): bytes xMustard reserved, not RSS
 			"transient_pool": map[string]any{"max": budget.TransientBytes.Max(), "in_use": budget.TransientBytes.InUse(), "peak": budget.TransientBytes.Peak()},
 			"children":       map[string]any{"cap": budget.Children.Cap(), "in_use": budget.Children.InUse(), "peak": budget.Children.Peak()},
+			"budget":         healthBudgetFor(r),
 		})
 	})
 	mux.HandleFunc("GET /api/runtimes", func(w http.ResponseWriter, r *http.Request) {

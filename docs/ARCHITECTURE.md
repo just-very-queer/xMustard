@@ -50,7 +50,7 @@ repositories. The default Rust build does not enable `semantic-onnx`.
 | Search, impact and change tracking | `search.rs`, `semantic.rs`, `changetrack.rs`, `hashcache.rs` | Retrieval lanes, graph traversal, baseline and signature differences; stat-keyed file-hash cache with a racy-timestamp guard |
 | Diagnostics and live language servers | `diagnostics.rs`, `lsp.rs`, `lsp_session.rs`; Go LSP adapters | LSP is optional; transient results do not require Postgres |
 | Verification and retained goal runtime | `verification.rs`, `goalruntime.rs`; Go run control | Process execution, evidence and persisted operational state |
-| Resource accounting | `api-go/internal/budget/` | Shared transient-byte accounting; currently not a complete RSS bound |
+| Resource accounting | `api-go/internal/budget/` | 24 MiB transient-byte pool and helper-child limit: work that does not fit now gets 503/-32000, work that could never fit the pool gets a permanent answer (413, -32600 or a tool error); static component reservations; one heavy slot (bounded wait, owner label) behind an RSS watchdog over the owned tree plus the stdio shims, with no production callers yet, so it governs nothing today; Go memory limit at the daemon's 28 MiB line with a GOGC floor; data-movement counters; the `/api/health` budget block, which needs a bearer token while auth is enforced. Byte admission is still not a complete RSS bound |
 | Shared wire models | Go request/record structs, each Rust module's own `Serialize` output types, `frontend/src/lib/types.ts` | Contract changes need matching consumers |
 | Optional operator UI | `frontend/src/` | Full API consumer; outside the current development focus |
 
