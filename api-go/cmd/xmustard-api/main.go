@@ -393,6 +393,10 @@ func bodyLimitMiddleware(next http.Handler) http.Handler {
 			return
 		}
 		r.Body = http.MaxBytesReader(w, r.Body, limit)
+		if streamsRequestBody(r) { // capped, but spooled to disk in O(window) by the handler
+			next.ServeHTTP(w, r)
+			return
+		}
 		if r.ContentLength > bodyBudgetThreshold || r.ContentLength < 0 {
 			select {
 			case bodyInFlight <- struct{}{}:

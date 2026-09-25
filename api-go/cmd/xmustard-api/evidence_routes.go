@@ -35,6 +35,7 @@ func newAPIHandler() http.Handler {
 	registerRoutes(mux)
 	store := evidence.NewStore(dataDir(), evidence.LimitsFromEnv())
 	registerEvidenceRoutes(mux, store)
+	registerEvidenceCaptureRoutes(mux, store)
 	return evidenceDeliveryMiddleware(store, mux)
 }
 
