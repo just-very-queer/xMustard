@@ -10,7 +10,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -92,7 +98,9 @@ func TestHookBodyStreamDecode(t *testing.T) {
 	if hb.BodySHA256 != hex.EncodeToString(whole[:]) || hb.BodyBytes != int64(len(body)) {
 		t.Fatalf("body digest/size: %s %d", hb.BodySHA256, hb.BodyBytes)
 	}
-	if len(hb.Sections) != 2 || hb.Sections[0].Name != "stdout" || hb.Sections[1].Name != "stderr" {
+	// stdout, stderr, then the status line the decoder adds for "interrupted"
+	if len(hb.Sections) != 3 || hb.Sections[0].Name != "stdout" || hb.Sections[1].Name != "stderr" ||
+		hb.Sections[2].Name != StatusSection || !hb.Sections[2].Status {
 		t.Fatalf("sections: %+v", hb.Sections)
 	}
 	stdout := spool.String()[hb.Sections[0].Start:hb.Sections[0].End]
@@ -103,8 +111,94 @@ func TestHookBodyStreamDecode(t *testing.T) {
 	if spool.String()[hb.Sections[1].Start:hb.Sections[1].End] != "warn\n" {
 		t.Fatalf("stderr section wrong")
 	}
+	if got := spool.String()[hb.Sections[2].Start:hb.Sections[2].End]; got != "[xmustard status] interrupted=false\n" || hb.IsError {
+		t.Fatalf("status section %q (is_error %v)", got, hb.IsError)
+	}
 	if hb.Response == nil || hb.Response.Kind != 'o' || len(hb.Response.Kids) != 4 || hb.Scalar("interrupted") != "false" {
 		t.Fatalf("skeleton: %+v", hb.Response)
+	}
+	// surrogate escapes decode exactly as encoding/json does: a lone surrogate
+	// becomes U+FFFD and never swallows the escape or character after it
+	for _, esc := range []string{`\ud800A`, `\udc00A`, `\ud800😀`, `\ud800\u000atail`, `😀`, `\ud800𐀀`,
+		`\udfff\ud800`, `\ud800`, `x\ud800é`} {
+		var want string
+		if err := json.Unmarshal([]byte(`"`+esc+`"`), &want); err != nil {
+			t.Fatal(err)
+		}
+		var sp bytes.Buffer
+		hb, err := DecodeHookBody(FormatClaude, strings.NewReader(`{"tool_name":"Bash","tool_response":{"stdout":"`+esc+`"}}`), &sp, nil)
+		if err != nil {
+			t.Fatalf("%s: %v", esc, err)
+		}
+		if got := sp.String()[hb.Sections[0].Start:hb.Sections[0].End]; got != want {
+			t.Errorf("%s: decoded %q, encoding/json %q", esc, got, want)
+		}
+	}
+}
+
+// Output strings open at most maxHookSections sections: the rest are appended to one
+// overflow section, empty strings open none, the whole body is still captured, and
+// decoding memory stays bounded whatever the element count.
+func TestHookBodySectionCountIsBounded(t *testing.T) {
+	if raceEnabled && testing.Short() {
+		t.Skip("allocation bound is not meaningful under -race")
+	}
+	const n = 200000
+	var b strings.Builder
+	b.WriteString(`{"tool_name":"mcp__gh__list_issues","tool_response":[`)
+	nonEmpty := 0
+	for i := 0; i < n; i++ {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		switch i % 3 {
+		case 0:
+			b.WriteString(`{"type":"text","text":"x"}`)
+			nonEmpty++
+		case 1:
+			b.WriteString(`""`)
+		default:
+			b.WriteString(`"y"`)
+			nonEmpty++
+		}
+	}
+	b.WriteString(`],"hook_event_name":"PostToolUse"}`)
+	body := b.String()
+	var spool bytes.Buffer
+	spool.Grow(n)
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	hb, err := DecodeHookBody(FormatClaude, strings.NewReader(body), &spool, nil)
+	runtime.ReadMemStats(&after)
+	if err != nil {
+		t.Fatal(err)
+	}
+	alloc := after.TotalAlloc - before.TotalAlloc
+	t.Logf("%d elements: %d sections, %d KiB allocated, spool %d bytes", n, len(hb.Sections), alloc>>10, spool.Len())
+	last := hb.Sections[len(hb.Sections)-1]
+	if len(hb.Sections) != maxHookSections+1 || last.Name != OverflowSection || !hb.Incomplete || last.End != int64(spool.Len()) {
+		t.Fatalf("sections not bounded: %d, last %+v", len(hb.Sections), last)
+	}
+	// every non-empty string was captured, one per line in the overflow section
+	if got := strings.Count(spool.String(), "x") + strings.Count(spool.String(), "y"); got != nonEmpty || last.Merged != nonEmpty-maxHookSections {
+		t.Fatalf("captured %d strings (%d merged), want %d", got, last.Merged, nonEmpty)
+	}
+	// allocation is per element (a JSON path each), never per section: a small
+	// constant per element, and nothing retained
+	if !raceEnabled && alloc > uint64(n)*256 {
+		t.Fatalf("decoding %d tiny elements allocated %d bytes", n, alloc)
+	}
+	// a pathologically deep path is capped, so its frames hold bounded names
+	deep := `{"tool_name":"x","tool_response":` + strings.Repeat(`{"`+strings.Repeat("k", 1000)+`":`, 300) + `"v"` + strings.Repeat("}", 300) + `}`
+	hb, err = DecodeHookBody(FormatClaude, strings.NewReader(deep), io.Discard, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range hb.Sections {
+		if len(s.Name) > maxSectionName {
+			t.Fatalf("section name of %d bytes", len(s.Name))
+		}
 	}
 }
 
@@ -203,7 +297,8 @@ func TestSixteenMiBHookBodyStreamsIntoSpool(t *testing.T) {
 	if !raceEnabled && alloc > 1<<20 {
 		t.Fatalf("decoding allocated %d bytes; the bound is 1 MiB", alloc)
 	}
-	if sp.Over() || len(hb.Sections) != 2 || hb.Sections[0].Name != "stdout" || hb.Sections[1].End != sp.n {
+	// the empty stderr opens no section; the status line ends the spool
+	if sp.Over() || len(hb.Sections) != 2 || hb.Sections[0].Name != "stdout" || hb.Sections[1].Name != StatusSection || hb.Sections[1].End != sp.n {
 		t.Fatalf("spool/sections: over=%v %+v n=%d", sp.Over(), hb.Sections, sp.n)
 	}
 	// the decoded bytes are what the tool printed: escapes resolved
@@ -270,9 +365,10 @@ func TestClaudeBashCaptureIsShapeMatchedAndRecoverable(t *testing.T) {
 	if res.Shape.Chars > PolicyFor("claude").MaxChars || res.DeliveredTokensEst == 0 || res.TokenEstimator != TokenEstimator {
 		t.Fatalf("budget: chars %d tokens %d", res.Shape.Chars, res.DeliveredTokensEst)
 	}
-	// the exact decoded original is recoverable through the handle
+	// the exact decoded original (output strings, then the status line) is
+	// recoverable through the handle
 	got, _ := readAll(t, s, "ws", "", res.Handle, nil)
-	if string(got) != stdout+"DeprecationWarning: x\n" {
+	if string(got) != stdout+"DeprecationWarning: x\n[xmustard status] interrupted=false\n" {
 		t.Fatalf("recovered original differs (%d bytes vs %d)", len(got), len(stdout)+22)
 	}
 	// and the persisted record names the family reducer, client and shape
@@ -460,6 +556,27 @@ func TestRawCaptureForAnyTool(t *testing.T) {
 	if res.Shape.Mode != ShapeReplace || ValidateShape("pi", "bash", res.Shape.Payload) != nil {
 		t.Fatalf("raw pi shape: %+v", res.Shape)
 	}
+	// the replacement never turns a failed call into a success: a raw capture has no
+	// body, and its error status comes from the capture metadata
+	var pp struct{ IsError bool }
+	if err := json.Unmarshal(res.Shape.Payload, &pp); err != nil || !pp.IsError {
+		t.Fatalf("raw pi payload must say isError (exit 2): %s", res.Shape.Payload)
+	}
+	for _, meta := range []CaptureMeta{
+		{Client: "mcp", Tool: "mcp__srv__deploy", IsError: true},
+		{Client: "cursor", Tool: "MCP:deploy", IsError: true},
+		{Client: "letta", Tool: "mcp__srv__deploy", ExitCode: &two},
+		{Client: "http", Tool: "deploy", IsError: true},
+	} {
+		res, err := s.Observe(context.Background(), nil, ObservationInput{WorkspaceID: "ws", Format: FormatRaw, Body: strings.NewReader(raw), Meta: meta})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var mp struct{ IsError bool }
+		if res.Shape.Mode != ShapeReplace || json.Unmarshal(res.Shape.Payload, &mp) != nil || !mp.IsError || !res.Capture.IsError {
+			t.Fatalf("%s %s: shape %s payload isError=%v", meta.Client, meta.Tool, res.Shape.Mode, mp.IsError)
+		}
+	}
 	if _, err := s.Observe(context.Background(), nil, ObservationInput{WorkspaceID: "ws", Format: FormatRaw, Body: strings.NewReader("x")}); !errors.Is(err, ErrBadBody) {
 		t.Fatalf("a capture without a tool name must be refused: %v", err)
 	}
@@ -494,5 +611,268 @@ func TestManySectionsShareTheTarget(t *testing.T) {
 	}
 	if strings.Count(string(res.Shape.Payload), "[xmustard evidence]") != 1 {
 		t.Fatalf("recovery line must appear once")
+	}
+}
+
+// A status member of the tool response (outside the output strings) is never lost:
+// it is spooled as the status line, so every text payload carries it and search
+// finds it in the retained original, and a failing status marks the call an error.
+func TestStatusMembersSurviveInPayloadAndOriginal(t *testing.T) {
+	s, _ := testStore(t, func(l *Limits) { *l = DefaultLimits() })
+	out := jsonString(strings.Repeat("ci log line with nothing wrong in it\n", 9000))
+	for _, c := range []struct {
+		format HookFormat
+		client string
+		body   string
+	}{
+		{FormatCursor, "cursor", `{"hook_event_name":"postToolUse","tool_name":"MCP:ci_status","tool_output":{"status":"failed","conclusion":"failure","output":` + out + `}}`},
+		{FormatCodex, "codex", `{"hook_event_name":"PostToolUse","tool_name":"mcp__ci__status","tool_input":{},"tool_response":{"status":"failed","conclusion":"failure","content":` + out + `}}`},
+		{FormatClaude, "claude", `{"hook_event_name":"PostToolUse","tool_name":"mcp__ci__status","tool_input":{},"tool_response":{"status":"failed","conclusion":"failure","content":` + out + `}}`},
+		{FormatClaude, "mcp", `{"hook_event_name":"PostToolUse","tool_name":"mcp__ci__status","tool_input":{},"tool_response":{"status":"failed","conclusion":"failure","content":` + out + `}}`},
+	} {
+		res := observe(t, s, c.format, c.body, CaptureMeta{Client: c.client})
+		if res.Shape.Mode != ShapeReplace || !res.Capture.IsError {
+			t.Fatalf("%s: shape %s (%s), is_error %v", c.client, res.Shape.Mode, res.Shape.Reason, res.Capture.IsError)
+		}
+		payload := string(res.Shape.Payload)
+		if !strings.Contains(payload, "failed") || !strings.Contains(payload, "failure") {
+			t.Fatalf("%s: payload lost the status:\n%.600s", c.client, payload)
+		}
+		var pe struct{ IsError *bool }
+		if json.Unmarshal(res.Shape.Payload, &pe) == nil && pe.IsError != nil && !*pe.IsError {
+			t.Fatalf("%s: payload says isError=false for a failed call", c.client)
+		}
+		sr, err := s.Search(context.Background(), SearchRequest{ReadRequest: ReadRequest{WorkspaceID: "ws", Handle: res.Handle}, Query: "failed"})
+		if err != nil || sr.Matches != 1 || !strings.Contains(sr.Lines[0].Text, `status="failed"`) {
+			t.Fatalf("%s: search for the status in the original: %v %+v", c.client, err, sr)
+		}
+	}
+	// a status member inside an array cannot be carried by a text payload: the client
+	// keeps its original output instead of a replacement that drops it
+	body := `{"tool_name":"mcp__ci__jobs","tool_response":{"jobs":[{"status":"failed"},{"status":"ok"}],"content":` + out + `}}`
+	res := observe(t, s, FormatCodex, body, CaptureMeta{Client: "codex"})
+	if res.Shape.Mode == ShapeReplace || !strings.Contains(res.Shape.Reason, "status") {
+		t.Fatalf("array status: %s %s", res.Shape.Mode, res.Shape.Reason)
+	}
+}
+
+// A result of 100,000 content blocks is captured in bounded memory: at most
+// maxHookSections sections plus one overflow section, a projection within the
+// client target, a small persisted record, and page reads that stay cheap.
+func TestManyContentBlocksCaptureIsBounded(t *testing.T) {
+	if raceEnabled && testing.Short() {
+		t.Skip("allocation bound is not meaningful under -race")
+	}
+	s, _ := testStore(t, func(l *Limits) { *l = DefaultLimits() })
+	const n = 100000
+	var b strings.Builder
+	b.WriteString(`{"tool_name":"mcp__gh__list_issues","tool_input":{"repo":"x"},"tool_response":[`)
+	for i := 0; i < n; i++ {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		fmt.Fprintf(&b, `{"type":"text","text":"issue #%d: something broke in module %d"}`, i, i%50)
+	}
+	b.WriteString(`]}`)
+	body := b.String()
+	for _, client := range []string{"claude", "codex"} {
+		runtime.GC()
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		res := observe(t, s, FormatClaude, body, CaptureMeta{Client: client})
+		runtime.ReadMemStats(&after)
+		alloc := after.TotalAlloc - before.TotalAlloc
+		obs := readObservation(t, s, "ws", res.Handle)
+		key, _ := handleKey(res.Handle)
+		info, err := os.Stat(filepath.Join(s.root, "ws", key, "meta.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Logf("%s: %d-byte body, %d KiB allocated, projection %d bytes, meta.json %d bytes, shape %s", client, len(body), alloc>>10,
+			len(res.Projection), info.Size(), res.Shape.Mode)
+		if len(res.Projection) > PolicyFor(client).Target || !res.Reduced || res.Handle == "" {
+			t.Fatalf("%s: projection %d bytes for a %d target", client, len(res.Projection), PolicyFor(client).Target)
+		}
+		if secs := obs.Projection.Family.Sections; len(secs) != maxHookSections+1 || secs[maxHookSections].Merged != n-maxHookSections {
+			t.Fatalf("%s: %d sections persisted", client, len(secs))
+		}
+		if info.Size() > 32<<10 {
+			t.Fatalf("%s: meta.json %d bytes", client, info.Size())
+		}
+		// decoding allocates a small constant per element; reduction allocates the
+		// same whatever the section count (pooled line readers)
+		if !raceEnabled && alloc > uint64(n)*512 {
+			t.Fatalf("%s: capturing %d blocks allocated %d bytes", client, n, alloc)
+		}
+		switch client {
+		case "claude":
+			// merged blocks cannot be put back into 100,000 content blocks: the client
+			// keeps its original output (it persists large MCP results itself)
+			if res.Shape.Mode != ShapeSizeError || res.Shape.Notice == "" {
+				t.Fatalf("claude shape: %+v", res.Shape)
+			}
+		case "codex":
+			if res.Shape.Mode != ShapeReplace || res.Shape.Chars > PolicyFor("codex").MaxChars {
+				t.Fatalf("codex shape: %s %d chars", res.Shape.Mode, res.Shape.Chars)
+			}
+		}
+		runtime.GC()
+		runtime.ReadMemStats(&before)
+		if _, err := s.Read(context.Background(), ReadRequest{WorkspaceID: "ws", Handle: res.Handle, Length: 100}); err != nil {
+			t.Fatal(err)
+		}
+		runtime.ReadMemStats(&after)
+		if read := after.TotalAlloc - before.TotalAlloc; !raceEnabled && read > 1<<20 {
+			t.Fatalf("a 100-byte page read allocated %d bytes", read)
+		}
+	}
+}
+
+// A read with long lines is budgeted by what it delivers: the unnumbered excerpt a
+// Claude Read payload carries is cut like the numbered projection, so the payload
+// stays within the client's target and character cap.
+func TestReadLongLinesPayloadWithinTarget(t *testing.T) {
+	s, _ := testStore(t, func(l *Limits) { *l = DefaultLimits() })
+	for _, width := range []int{2000, 4000, 50000} {
+		var src strings.Builder
+		for i := 1; i <= 100; i++ {
+			fmt.Fprintf(&src, "%05d %s\n", i, strings.Repeat("x", width))
+		}
+		body := `{"tool_name":"Read","tool_input":{"file_path":"/repo/min.js"},"tool_response":{"type":"text","file":{"filePath":"/repo/min.js","content":` +
+			jsonString(src.String()) + `,"numLines":100,"startLine":1,"totalLines":100}}}`
+		res := observe(t, s, FormatClaude, body, CaptureMeta{Client: "claude"})
+		var rd struct{ File struct{ Content string } }
+		_ = json.Unmarshal(res.Shape.Payload, &rd)
+		if res.Shape.Mode != ShapeReplace || res.Shape.Chars > PolicyFor("claude").MaxChars || len(rd.File.Content) > PolicyFor("claude").Target {
+			t.Fatalf("%d-byte lines: shape %s (%s), %d chars, content %d bytes", width, res.Shape.Mode, res.Shape.Reason, res.Shape.Chars, len(rd.File.Content))
+		}
+		mustContain(t, rd.File.Content, "00001 xxx", "bytes omitted]")
+	}
+}
+
+// A read of a range numbers its lines from the range's first line, and search in
+// the original applies the same numbering: an omitted range is recovered exactly.
+func TestReadRangeRecoveredBySearch(t *testing.T) {
+	s, _ := testStore(t, func(l *Limits) { *l = DefaultLimits() })
+	var src strings.Builder
+	for i := 500; i < 3500; i++ {
+		fmt.Fprintf(&src, "file line %d content here\n", i)
+	}
+	body := `{"tool_name":"Read","tool_input":{"file_path":"/repo/big.txt","offset":500},"tool_response":{"type":"text","file":{"filePath":"/repo/big.txt","content":` +
+		jsonString(src.String()) + `,"numLines":3000,"startLine":500,"totalLines":9000}}}`
+	res := observe(t, s, FormatClaude, body, CaptureMeta{Client: "claude"})
+	m := regexp.MustCompile(`\[xmustard: lines (\d+)-(\d+) omitted\]`).FindStringSubmatch(res.Projection)
+	if m == nil {
+		t.Fatalf("no omitted range in:\n%.400s", res.Projection)
+	}
+	from, _ := strconv.Atoi(m[1])
+	sr, err := s.Search(context.Background(), SearchRequest{ReadRequest: ReadRequest{WorkspaceID: "ws", Handle: res.Handle}, FromLine: from, ToLine: from + 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sr.FirstLine != 500 || len(sr.Lines) != 2 || sr.Lines[0].Line != from || sr.Lines[0].Text != fmt.Sprintf("file line %d content here", from) {
+		t.Fatalf("lines %d-%d recovered as %+v (first line %d)", from, from+1, sr.Lines, sr.FirstLine)
+	}
+	// a pattern search reports the file's line numbers too
+	sr, err = s.Search(context.Background(), SearchRequest{ReadRequest: ReadRequest{WorkspaceID: "ws", Handle: res.Handle}, Query: "file line 3000 "})
+	if err != nil || sr.Matches != 1 || sr.Lines[0].Line != 3000 {
+		t.Fatalf("pattern search numbering: %v %+v", err, sr.Lines)
+	}
+}
+
+// A read error of the request body (the request cap, a disconnect) is returned as
+// itself, never as a malformed body.
+func TestHookBodyReadErrorsAreNotMalformed(t *testing.T) {
+	body := `{"tool_name":"Bash","tool_response":{"stdout":"` + strings.Repeat("output line\\n", 5000) + `"}}`
+	for _, capAt := range []int64{3, 30, 2000, int64(len(body) - 3)} {
+		r := http.MaxBytesReader(httptest.NewRecorder(), io.NopCloser(strings.NewReader(body)), capAt)
+		_, err := DecodeHookBody(FormatClaude, r, io.Discard, nil)
+		var mbe *http.MaxBytesError
+		if !errors.As(err, &mbe) || errors.Is(err, ErrBadBody) {
+			t.Fatalf("cap at %d: %v (want the MaxBytesError itself)", capAt, err)
+		}
+	}
+	boom := errors.New("connection reset")
+	_, err := DecodeHookBody(FormatClaude, io.MultiReader(strings.NewReader(body[:100]), errReader{boom}), io.Discard, nil)
+	if !errors.Is(err, boom) || errors.Is(err, ErrBadBody) {
+		t.Fatalf("transport error: %v", err)
+	}
+}
+
+type errReader struct{ err error }
+
+func (e errReader) Read([]byte) (int, error) { return 0, e.err }
+
+// replacingRedactor is a test StreamRedactor: it replaces a secret, holding back a
+// partial match across writes until Flush.
+type replacingRedactor struct {
+	dst     io.Writer
+	secret  string
+	pending []byte
+	flushes int
+}
+
+func (r *replacingRedactor) Write(p []byte) (int, error) {
+	r.pending = append(r.pending, p...)
+	keep := len(r.secret) - 1
+	if len(r.pending) <= keep {
+		return len(p), nil
+	}
+	out := bytes.ReplaceAll(r.pending[:len(r.pending)-keep], []byte(r.secret), []byte("[REDACTED]"))
+	// a secret straddling the cut is completed by the held-back tail
+	cut := len(r.pending) - keep
+	if i := bytes.LastIndex(r.pending[:len(r.pending)], []byte(r.secret)); i >= 0 && i < cut && i+len(r.secret) > cut {
+		cut = i
+		out = bytes.ReplaceAll(r.pending[:cut], []byte(r.secret), []byte("[REDACTED]"))
+	}
+	if _, err := r.dst.Write(out); err != nil {
+		return 0, err
+	}
+	r.pending = append(r.pending[:0], r.pending[cut:]...)
+	return len(p), nil
+}
+
+func (r *replacingRedactor) Flush() error {
+	r.flushes++
+	out := bytes.ReplaceAll(r.pending, []byte(r.secret), []byte("[REDACTED]"))
+	r.pending = r.pending[:0]
+	_, err := r.dst.Write(out)
+	return err
+}
+
+// Every captured byte passes through the capture's redactor before it reaches the
+// spool — stdout, stderr, the status line and raw bodies alike — so a secret is
+// neither retained nor searchable.
+func TestCaptureRedactorSeesEverySection(t *testing.T) {
+	s, _ := testStore(t, nil)
+	const secret = "sk-live-0123456789abcdef"
+	var reds []*replacingRedactor
+	redact := func(w io.Writer) StreamRedactor {
+		r := &replacingRedactor{dst: w, secret: secret}
+		reds = append(reds, r)
+		return r
+	}
+	stdout := strings.Repeat("deploying with key "+secret+" now\n", 400)
+	body := `{"tool_name":"Bash","tool_input":{"command":"./deploy.sh"},"tool_response":{"stdout":` + jsonString(stdout) +
+		`,"stderr":` + jsonString("warning: "+secret+"\n") + `,"interrupted":false,"isImage":false}}`
+	for _, in := range []ObservationInput{
+		{WorkspaceID: "ws", Format: FormatClaude, Body: strings.NewReader(body), Meta: CaptureMeta{Client: "claude"}, Redact: redact},
+		{WorkspaceID: "ws", Format: FormatRaw, Body: strings.NewReader(stdout), Meta: CaptureMeta{Client: "pi", Tool: "bash"}, Redact: redact},
+	} {
+		res, err := s.Observe(context.Background(), nil, in)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, _ := readAll(t, s, "ws", "", res.Handle, nil)
+		if strings.Contains(string(got), secret) || strings.Contains(res.Projection, secret) || !strings.Contains(string(got), "[REDACTED]") {
+			t.Fatalf("%s: the secret reached the spool or the projection", in.Format)
+		}
+		sr, err := s.Search(context.Background(), SearchRequest{ReadRequest: ReadRequest{WorkspaceID: "ws", Handle: res.Handle}, Query: "sk-live"})
+		if err != nil || sr.Matches != 0 {
+			t.Fatalf("%s: the secret is searchable: %v %+v", in.Format, err, sr)
+		}
+	}
+	if len(reds) != 2 || reds[0].flushes < 3 {
+		t.Fatalf("redactor not flushed at section boundaries: %d redactors, %d flushes", len(reds), reds[0].flushes)
 	}
 }

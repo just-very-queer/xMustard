@@ -16,9 +16,10 @@ import (
 // line so the shape adapter can rebuild the array.
 
 const (
-	maxListEntries = 40
-	maxGlobEntries = 60
-	maxGroupKeys   = 512
+	maxListEntries   = 40
+	maxGlobEntries   = 60
+	maxGroupKeys     = 512
+	maxListSummaries = 8 // tree summaries and tool notices kept
 )
 
 var treeSumRe = regexp.MustCompile(`^\d+ director(y|ies)(, \d+ files?)?$`)
@@ -59,8 +60,8 @@ func listEntry(line []byte) (name []byte, dir, summary bool) {
 	switch {
 	case len(t) == 0 || (bytes.HasPrefix(t, []byte("total ")) && numberAt(t, 6) == len(t)):
 		return nil, false, false
-	case treeSumRe.Match(t) || t[0] == '[':
-		return nil, false, true // tree summary, tool notices
+	case treeSumRe.Match(t) || isNotice(t):
+		return nil, false, true // tree summary, tool notices ("[500 entries limit reached]")
 	}
 	if n, ok := lsLongName(t); ok {
 		return n, t[0] == 'd', false
@@ -118,21 +119,27 @@ func (r listReducer) Reduce(ctx context.Context, in *Input) (*Projection, error)
 	var oms []Omission
 	parts := map[string]string{}
 	var body bytes.Buffer
+	summaries := 0
 	for _, sec := range secs {
 		var part bytes.Buffer
 		gapStart, gapLines := int64(-1), 0
 		err := scanLines(ctx, in.R, sec, func(idx int, line []byte, start, end int64) error {
 			name, dir, summary := listEntry(line)
 			keep := false
+			// a kept line is shown whole up to plainDisplay: charge that, not the name
+			cost := min(len(displayLine(line)), plainDisplay) + 1
 			switch {
 			case summary:
-				keep = true
+				if summaries < maxListSummaries && body.Len()+part.Len()+cost < in.Target-512 {
+					keep = true
+					summaries++
+				}
 			case len(name) > 0:
 				lp.Total++
 				if dir {
 					lp.Dirs++
 				}
-				if shown < limit && body.Len()+part.Len()+len(name) < in.Target-512 {
+				if shown < limit && body.Len()+part.Len()+cost < in.Target-512 {
 					keep = true
 					shown++
 					lp.Entries = append(lp.Entries, string(validUTF8(name)))
@@ -217,12 +224,14 @@ func (r listReducer) Reduce(ctx context.Context, in *Input) (*Projection, error)
 		writeWithin(&out, in.Target, prefix, items, "]\n")
 		note = out.String()[start:]
 	}
+	// the totals line leads the first (text) section and the closing note follows
+	// it, once: a client payload rebuilt from many sections carries each only once
 	header := out.String()[:strings.IndexByte(out.String(), '\n')+1]
-	for i, sec := range secs {
-		if !sec.Array && i == 0 {
-			parts[sec.Name] = header + parts[sec.Name]
+	if len(secs) > 0 {
+		if !secs[0].Array {
+			parts[secs[0].Name] = header + parts[secs[0].Name]
 		}
-		parts[sec.Name] += note
+		parts[secs[0].Name] += note
 	}
 	for _, s := range in.Sections {
 		if _, ok := parts[s.Name]; !ok {
@@ -234,7 +243,7 @@ func (r listReducer) Reduce(ctx context.Context, in *Input) (*Projection, error)
 		facts.ExitFrom = "tool"
 	}
 	return &Projection{Text: out.String(), Parts: parts, Structured: lp, Facts: facts,
-		Record: Record{Mode: "text", Reduced: true, Omissions: capOmissions(oms)}}, nil
+		Record: Record{Reducer: r.ID() + "/1", Mode: "text", Reduced: true, Omissions: capOmissions(oms)}}, nil
 }
 
 var (

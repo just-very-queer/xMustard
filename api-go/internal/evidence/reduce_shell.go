@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"unicode/utf8"
 )
 
@@ -129,14 +130,36 @@ func (st *lineState) salient(line []byte) (bool, error) {
 }
 
 // lineReader reads lines through one reusable buffer: the returned slice is valid
-// until the next call, so reading allocates nothing per line.
+// until the next call, so reading allocates nothing per line. Readers are pooled:
+// every pass over every section reuses one 64 KiB read buffer instead of allocating
+// its own, so a many-section original costs no more than a one-section one.
 type lineReader struct {
+	sr  io.SectionReader
 	br  *bufio.Reader
 	buf []byte
 }
 
+var lineReaders = sync.Pool{New: func() any {
+	lr := &lineReader{}
+	lr.br = bufio.NewReaderSize(&lr.sr, 64<<10)
+	return lr
+}}
+
+// newLineReader returns a pooled reader over one section; release returns it.
 func newLineReader(r io.ReaderAt, sec Section) *lineReader {
-	return &lineReader{br: bufio.NewReaderSize(io.NewSectionReader(r, sec.Start, sec.End-sec.Start), 64<<10)}
+	lr := lineReaders.Get().(*lineReader)
+	lr.sr = *io.NewSectionReader(r, sec.Start, sec.End-sec.Start)
+	lr.br.Reset(&lr.sr)
+	return lr
+}
+
+func (lr *lineReader) release() {
+	lr.sr = io.SectionReader{}
+	if cap(lr.buf) > 64<<10 {
+		lr.buf = nil // a long line's buffer is not kept past this pass
+	}
+	lr.buf = lr.buf[:0]
+	lineReaders.Put(lr)
 }
 
 // next returns the next line including its newline (at most keep bytes of it), the
@@ -175,58 +198,72 @@ type sectionPlan struct {
 
 // reduceLineSections reduces every section with its share of the budget and joins
 // them: the family header first, then each non-empty section (labeled when there are
-// several), each with explicit omission markers carrying absolute byte ranges.
+// several), each with explicit omission markers carrying absolute byte ranges. Each
+// section is planned and emitted before the next is read, so one plan is alive at a
+// time; the labels are charged against the budget before it is shared.
 func reduceLineSections(ctx context.Context, in *Input, rules *lineRules) (*Projection, error) {
 	facts := Facts{ExitCode: in.Sel.ExitCode}
 	if facts.ExitCode != nil {
 		facts.ExitFrom = "tool"
 	}
 	secs := nonEmpty(in.Sections)
-	shares := sectionShares(secs, in.Target-512)
-	plans := make([]*sectionPlan, len(secs))
+	shares := sectionShares(secs, in.Target-512-labelCost(secs))
+	var body bytes.Buffer
+	parts := map[string]string{}
+	var oms []Omission
+	firstLen := 0
 	for i, s := range secs {
 		p, err := planLines(ctx, in.R, s, shares[i], rules, &facts)
 		if err != nil {
 			return nil, err
 		}
-		plans[i] = p
-	}
-	finishFacts(&facts)
-	header := familyHeader(rules, &facts)
-	var out bytes.Buffer
-	out.WriteString(header)
-	parts := map[string]string{}
-	var oms []Omission
-	for i, s := range secs {
-		var sb bytes.Buffer
-		if i == 0 {
-			sb.WriteString(header)
+		if len(secs) > 1 {
+			fmt.Fprintf(&body, "[%s]\n", s.Name)
 		}
-		o, err := emitLines(ctx, in.R, s, plans[i], rules, &sb, in.Max)
+		start := body.Len()
+		o, err := emitLines(ctx, in.R, s, p, rules, &body, in.Max)
 		if err != nil {
 			return nil, err
 		}
 		oms = append(oms, o...)
-		body := sb.Bytes()
 		if i == 0 {
-			body = body[len(header):]
+			firstLen = body.Len() - start
+		} else {
+			parts[s.Name] = body.String()[start:]
 		}
-		if len(secs) > 1 {
-			fmt.Fprintf(&out, "[%s]\n", s.Name)
-		}
-		out.Write(body)
-		parts[s.Name] = sb.String()
-		if out.Len() > in.Max {
+		if body.Len() > in.Max {
 			return nil, fmt.Errorf("%w: %s projection exceeds %d bytes", ErrUnsupported, rules.id, in.Max)
 		}
+	}
+	finishFacts(&facts)
+	header := familyHeader(rules, &facts)
+	if len(secs) > 0 {
+		// the first section's part carries the header (the totals)
+		first := body.Bytes()
+		if len(secs) > 1 {
+			first = first[len(secs[0].Name)+3:]
+		}
+		parts[secs[0].Name] = header + string(first[:firstLen])
 	}
 	for _, s := range in.Sections {
 		if _, ok := parts[s.Name]; !ok {
 			parts[s.Name] = ""
 		}
 	}
-	return &Projection{Text: out.String(), Parts: parts, Facts: facts,
-		Record: Record{Mode: "text", Reduced: true, Omissions: capOmissions(oms)}}, nil
+	return &Projection{Text: header + body.String(), Parts: parts, Facts: facts,
+		Record: Record{Reducer: rules.id + "/" + strconv.Itoa(rules.version), Mode: "text", Reduced: true, Omissions: capOmissions(oms)}}, nil
+}
+
+// labelCost is what the "[name]" section labels of a multi-section projection cost.
+func labelCost(secs []Section) int {
+	if len(secs) < 2 {
+		return 0
+	}
+	n := 0
+	for _, s := range secs {
+		n += len(s.Name) + 3
+	}
+	return n
 }
 
 func nonEmpty(secs []Section) []Section {
@@ -331,6 +368,7 @@ func planLines(ctx context.Context, r io.ReaderAt, sec Section, budget int, rule
 	var prevKey uint64
 	havePrev := false
 	lr := newLineReader(r, sec)
+	defer lr.release()
 	for idx := 0; ; idx++ {
 		if idx&4095 == 0 {
 			if err := ctx.Err(); err != nil {
@@ -597,6 +635,7 @@ func exitFrom(m [][]byte) *int {
 func emitLines(ctx context.Context, r io.ReaderAt, sec Section, p *sectionPlan, rules *lineRules, out *bytes.Buffer, hardMax int) ([]Omission, error) {
 	var oms []Omission
 	lr := newLineReader(r, sec)
+	defer lr.release()
 	off := sec.Start
 	gapStart, gapLines, gapRepeats := int64(-1), 0, 0
 	var lastKey uint64

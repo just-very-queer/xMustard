@@ -120,10 +120,8 @@ func (s *Store) Observe(ctx context.Context, reg *Registry, in ObservationInput)
 	}
 	meta.Principal = in.Actor
 	meta.CapturedIdentity = "unknown"
-	meta.Sections = body.Sections
 	if in.Format == FormatRaw || in.Format == "" {
 		meta.BodySHA256, meta.BodyBytes = body.BodySHA256, body.BodyBytes
-		meta.Sections = nil
 	}
 	sel := selectorFor(meta, body, in.Sel)
 	red, argv0 := reg.Select(sel)
@@ -134,6 +132,10 @@ func (s *Store) Observe(ctx context.Context, reg *Registry, in ObservationInput)
 	}
 	hook := &reduceHook{reducer: red, argv0: argv0, shape: meta.OutputShape, meta: &meta,
 		in: Input{Sel: sel, Sections: body.Sections, Target: pol.Target}}
+	if sel.Family == "" && NamespacedTool(meta.Tool) {
+		// another server's tool: its name selects a family only for non-JSON output
+		hook.structured, _ = reg.Lookup(FamilyStructured)
+	}
 	d, err := s.Capture(withReduceHook(ctx, hook), sp, CaptureRequest{
 		WorkspaceID: in.WorkspaceID, RepoScope: in.RepoScope, Actor: in.Actor, AuthEnforced: in.AuthEnforced,
 		Issuer: "capture:" + meta.Client, SessionID: meta.SessionID, CallID: meta.CallID, Tool: meta.Tool,
@@ -143,21 +145,21 @@ func (s *Store) Observe(ctx context.Context, reg *Registry, in ObservationInput)
 	if err != nil {
 		return nil, err
 	}
-	res := &ObservationResult{Delivery: d, Capture: meta, Family: red.Family(), Policy: pol, TokenEstimator: TokenEstimator}
+	res := &ObservationResult{Delivery: d, Capture: meta, Family: hook.reducer.Family(), Policy: pol, TokenEstimator: TokenEstimator}
 	proj := hook.out
 	if proj == nil {
 		proj = &Projection{Text: d.Projection, Parts: map[string]string{}}
 	}
 	d.Reducer = proj.Record.Reducer
 	if d.Reducer == "" {
-		d.Reducer = reducerName(red)
+		d.Reducer = reducerName(hook.reducer)
 	}
 	res.Facts, res.Structured = proj.Facts, proj.Structured
 	if d.Handle != "" {
 		res.Footer = evidenceFooter(d, in.WorkspaceID)
 	}
 	res.Shape = ShapeOutput(ShapeInput{Client: meta.Client, Tool: meta.Tool, Body: bodyForShape(in.Format, body),
-		Proj: proj, Reduced: d.Reduced, Footer: res.Footer, RawBytes: d.RawBytes})
+		Proj: proj, Reduced: d.Reduced, Footer: res.Footer, RawBytes: d.RawBytes, IsError: meta.IsError})
 	// the model reads the projection text and the recovery line (a shaped payload
 	// carries the same text in its fields; its JSON escaping is not model-visible)
 	res.DeliveredTokensEst = EstimateTokens(d.Projection)
@@ -185,7 +187,10 @@ func spoolRaw(r io.Reader, dst io.Writer, redact func(io.Writer) StreamRedactor)
 	if err != nil {
 		return nil, err
 	}
-	if err := sink.end(); err != nil {
+	if err := sink.finish(); err != nil {
+		return nil, err
+	}
+	if err := sink.end(0); err != nil {
 		return nil, err
 	}
 	return &HookBody{Format: FormatRaw, Sections: sink.secs, Input: map[string]string{},

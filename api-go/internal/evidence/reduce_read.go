@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"regexp"
 )
 
@@ -12,8 +13,10 @@ import (
 // range (70% of the budget), then the declarations after it — an outline of what was
 // omitted (20%) — and the last lines of the range (10%), with explicit "lines A-B
 // omitted" markers. Line numbers are absolute: the capture's first line is
-// Selector.StartLine. Shape adapters that number lines themselves (Claude Read) get
-// the contiguous excerpt alone, unnumbered, in Parts.
+// Selector.StartLine (recorded as FamilyRecord.FirstLine, which search-in-original
+// applies), and a later section continues the original's line count. Shape adapters
+// that number lines themselves (Claude Read) get the contiguous excerpt alone,
+// unnumbered, in Parts, with long lines cut exactly as in the numbered projection.
 
 const (
 	readExcerptShare = 70
@@ -61,11 +64,19 @@ func (readReducer) Reduce(ctx context.Context, in *Input) (*Projection, error) {
 	var rp *ReadProjection
 	facts := Facts{ExitCode: in.Sel.ExitCode}
 	var body bytes.Buffer
+	// newlines before the current section: its first line's number in the original
+	newlines, at := 0, int64(0)
 	for i, sec := range secs {
-		p, raw, o, err := readSection(ctx, in, sec, shares[i], origin, &body)
+		gap, err := countNewlines(ctx, in.R, at, sec.Start)
 		if err != nil {
 			return nil, err
 		}
+		newlines += gap
+		p, raw, o, nl, err := readSection(ctx, in, sec, shares[i], origin+newlines, &body)
+		if err != nil {
+			return nil, err
+		}
+		newlines, at = newlines+nl, sec.End
 		oms = append(oms, o...)
 		parts[sec.Name] = raw
 		facts.Lines += p.LineCount
@@ -93,7 +104,7 @@ func (readReducer) Reduce(ctx context.Context, in *Input) (*Projection, error) {
 		}
 	}
 	return &Projection{Text: out.String(), Parts: parts, Structured: rp, Facts: facts,
-		Record: Record{Mode: "text", Reduced: true, Omissions: capOmissions(oms)}}, nil
+		Record: Record{Reducer: "xm-read/1", Mode: "text", Reduced: true, Omissions: capOmissions(oms)}}, nil
 }
 
 func pathOr(p string) string {
@@ -103,9 +114,32 @@ func pathOr(p string) string {
 	return p
 }
 
+// countNewlines counts the line feeds in r[from:to) (bytes between sections, or a
+// section's last byte).
+func countNewlines(ctx context.Context, r io.ReaderAt, from, to int64) (int, error) {
+	n := 0
+	var buf [4096]byte
+	for off := from; off < to; {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+		m, err := r.ReadAt(buf[:min(int64(len(buf)), to-off)], off)
+		if m == 0 {
+			if err != nil && err != io.EOF {
+				return 0, err
+			}
+			return 0, ErrCorrupt
+		}
+		n += bytes.Count(buf[:m], []byte{'\n'})
+		off += int64(m)
+	}
+	return n, nil
+}
+
 // readSection plans and emits one section; it returns the structured projection,
-// the unnumbered contiguous excerpt (with a trailing marker) and the omissions.
-func readSection(ctx context.Context, in *Input, sec Section, budget, origin int, out *bytes.Buffer) (*ReadProjection, string, []Omission, error) {
+// the unnumbered contiguous excerpt (with a trailing marker), the omissions and the
+// section's line feed count.
+func readSection(ctx context.Context, in *Input, sec Section, budget, origin int, out *bytes.Buffer) (*ReadProjection, string, []Omission, int, error) {
 	from, to := in.Sel.FromLine, in.Sel.ToLine
 	inRange := func(ln int) bool { return (from <= 0 || ln >= from) && (to <= 0 || ln <= to) }
 	cost := func(n int) int { return min(n, plainDisplay) + readNumberWidth + 1 }
@@ -150,7 +184,7 @@ func readSection(ctx context.Context, in *Input, sec Section, budget, origin int
 		return nil
 	})
 	if err != nil {
-		return nil, "", nil, err
+		return nil, "", nil, 0, err
 	}
 	// the outline samples declarations evenly over the omitted middle: top-level ones
 	// when there are any, else all; each costs about one line plus a gap marker
@@ -227,18 +261,33 @@ func readSection(ctx context.Context, in *Input, sec Section, budget, origin int
 		}
 		out.WriteByte('\n')
 		if ln >= excerptFrom && ln <= excerptTo {
-			raw.Write(validUTF8(line))
+			// the unnumbered excerpt is budgeted like the numbered one: a long line is
+			// cut at plainDisplay with an explicit marker (numLines is unchanged)
+			exact := validUTF8(trimRune(line[:min(len(line), plainDisplay)]))
+			raw.Write(exact)
+			if len(line) > plainDisplay {
+				fmt.Fprintf(&raw, "…[xmustard: %d bytes omitted]", len(line)-len(exact))
+			}
 			raw.WriteByte('\n')
 		}
 		return nil
 	})
 	if err != nil {
-		return nil, "", nil, err
+		return nil, "", nil, 0, err
 	}
 	flush(sec.End, origin+lines)
 	if excerptTo < last {
 		fmt.Fprintf(&raw, "[xmustard: this read continues to line %d; lines %d-%d are not in this result; read on from line %d]\n",
 			last, excerptTo+1, last, excerptTo+1)
 	}
-	return rp, raw.String(), oms, nil
+	// the section's line feeds: every line but an unterminated last one
+	newlines := lines
+	if lines > 0 {
+		if lf, err := countNewlines(ctx, in.R, sec.End-1, sec.End); err != nil {
+			return nil, "", nil, 0, err
+		} else if lf == 0 {
+			newlines--
+		}
+	}
+	return rp, raw.String(), oms, newlines, nil
 }

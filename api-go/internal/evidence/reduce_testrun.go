@@ -179,17 +179,19 @@ func classifyTestLine(st *lineState, line []byte) lineClass {
 		return lcSummary
 	// pytest
 	case has("::") && pyItem.Match(line):
-		m := pyItem.FindSubmatch(line)
-		switch string(m[2]) {
-		case "PASSED", "XPASS":
+		// the outcome word follows the first token (no per-line submatch allocation:
+		// passing lines are most of a large run)
+		i := bytes.IndexAny(line, " \t")
+		switch r := bytes.TrimLeft(line[i:], " \t\n\f\r"); {
+		case bytes.HasPrefix(r, []byte("PASSED")) || bytes.HasPrefix(r, []byte("XPASS")):
 			f.Passed++
 			return lcCollapse
-		case "SKIPPED", "XFAIL":
+		case bytes.HasPrefix(r, []byte("SKIPPED")) || bytes.HasPrefix(r, []byte("XFAIL")):
 			f.Skipped++
 			return lcCollapse
 		}
 		f.Failed++
-		f.failing(string(m[1]))
+		f.failing(string(line[:i]))
 		return lcSalient
 	case has(".py ") && pyProgress.Match(line):
 		return lcCollapse
@@ -218,18 +220,19 @@ func classifyTestLine(st *lineState, line []byte) lineClass {
 		return lcSalient
 	// unittest
 	case has(" ... ") && utItem.Match(line):
-		m := utItem.FindSubmatch(line)
-		switch r := string(m[3]); {
-		case r == "ok" || r == "unexpected success":
+		// the pattern prefers the last " ... " whose outcome is valid: the fixed
+		// outcomes are suffixes, anything else is "skipped ..."
+		switch {
+		case bytes.HasSuffix(line, []byte(" ... ok")) || bytes.HasSuffix(line, []byte(" ... unexpected success")):
 			f.Passed++
 			return lcCollapse
-		case strings.HasPrefix(r, "skipped") || r == "expected failure":
-			f.Skipped++
-			return lcCollapse
+		case bytes.HasSuffix(line, []byte(" ... FAIL")) || bytes.HasSuffix(line, []byte(" ... ERROR")):
+			f.Failed++
+			f.failing(string(line[:bytes.IndexByte(line, ' ')]))
+			return lcSalient
 		}
-		f.Failed++
-		f.failing(string(m[1]))
-		return lcSalient
+		f.Skipped++ // skipped ..., expected failure
+		return lcCollapse
 	case (c0 == 'F' || c0 == 'E') && utBlock.Match(line):
 		st.block = maxBlockLines
 		f.failing(string(utBlock.FindSubmatch(line)[2]))
@@ -278,17 +281,18 @@ func classifyTestLine(st *lineState, line []byte) lineClass {
 		return lcCollapse
 	// cargo test
 	case c0 == 't' && cargoItem.Match(line):
-		m := cargoItem.FindSubmatch(line)
-		switch string(m[2]) {
-		case "ok":
+		// "test NAME ... RESULT": NAME has no spaces
+		sp := 5 + bytes.IndexByte(line[5:], ' ')
+		switch r := line[sp+5:]; {
+		case bytes.HasPrefix(r, []byte("ok")):
 			f.Passed++
 			return lcCollapse
-		case "ignored":
+		case bytes.HasPrefix(r, []byte("ignored")):
 			f.Skipped++
 			return lcCollapse
 		}
 		f.Failed++
-		f.failing(string(m[1]))
+		f.failing(string(line[5:sp]))
 		return lcSalient
 	case c0 == '-' && cargoBlock.Match(line):
 		st.block = maxBlockLines

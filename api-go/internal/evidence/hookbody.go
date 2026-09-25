@@ -23,7 +23,11 @@ import (
 // memory whole; the tool input is hashed byte-exactly for the args digest; a few
 // bounded metadata fields are kept; and a bounded skeleton of the response records
 // where each section sat, so a shape adapter can rebuild the client's payload with
-// projected text. Memory is O(buffer + skeleton bounds) whatever the body size.
+// projected text. Memory is O(buffer + skeleton bounds) whatever the body size: at
+// most maxHookSections sections are opened (further output strings are appended to
+// one overflow section), empty strings open none, section names are capped, and the
+// response's status members are kept in one bounded status section at the end of the
+// spool, so the retained original and every text projection carry them.
 
 // HookFormat names a body layout.
 type HookFormat string
@@ -48,6 +52,19 @@ const (
 	maxHookMetaBytes  = 64 << 10 // all kept metadata and skeleton values together
 	maxSkeletonNodes  = 4096
 	maxSkeletonDepth  = 16
+	// maxHookSections bounds the sections of one body. Every section costs the line
+	// reducers a "[name]" label and at least one omission marker (about 100 bytes), so
+	// 64 sections fit the smallest client target (16 KiB) with room for their text.
+	maxHookSections = 64
+	maxSectionName  = 256 // bytes of a section name (a JSON path)
+	maxStatusFields = 32
+	maxStatusBytes  = 4 << 10
+)
+
+// Names of the sections the decoder adds itself. A JSON path never starts with "(".
+const (
+	OverflowSection = "(overflow)" // output strings past maxHookSections, one per line
+	StatusSection   = "(status)"   // the response's status members, one line
 )
 
 // Node is one value of the bounded response skeleton.
@@ -78,6 +95,13 @@ type HookBody struct {
 	Response   *Node             // skeleton of the tool response (nil when absent)
 	Dropped    int               // binary values not captured (base64 image data)
 	Incomplete bool              // the skeleton hit its bounds: the payload cannot be rebuilt
+	// Status holds the response's status members outside arrays ("path=json"), in
+	// body order; they are also spooled as the StatusSection.
+	Status []string
+	// StatusDropped reports a status member the status section could not carry (one
+	// inside an array, or past its bounds): a payload built from the projection text
+	// alone would lose it.
+	StatusDropped bool
 }
 
 // Scalar returns the raw JSON text of a scalar in the response skeleton by dotted
@@ -176,27 +200,41 @@ var exitKeys = map[string]bool{"exit_code": true, "exitCode": true, "returnCode"
 // sectionSink writes decoded output into the spool (through an optional redactor)
 // and records section boundaries at the spool offset.
 type sectionSink struct {
-	bw   *bufio.Writer
-	red  StreamRedactor
-	cw   *countingWriter
-	secs []Section
-	open bool
+	bw    *bufio.Writer
+	red   StreamRedactor
+	cw    *countingWriter
+	secs  []Section
+	names map[string]bool
+	// overflow is the index of the overflow section once maxHookSections is reached
+	// (-1 before): every later section is appended to it. Strings merged into it are
+	// not flushed one by one (a write per tiny string would cost a syscall each); its
+	// end is set when the sink finishes.
+	overflow int
+	dup      bool // two sections share a name: the payload cannot be rebuilt by name
+	// written and lastIn describe the bytes given to the sink (before redaction):
+	// a merged string is separated from the previous one by a newline.
+	written, overflowMark int64
+	lastIn                byte
 }
 
 type countingWriter struct {
-	w io.Writer
-	n int64
+	w    io.Writer
+	n    int64
+	last byte // the last byte written
 }
 
 func (c *countingWriter) Write(p []byte) (int, error) {
 	n, err := c.w.Write(p)
 	c.n += int64(n)
+	if n > 0 {
+		c.last = p[n-1]
+	}
 	return n, err
 }
 
 func newSectionSink(dst io.Writer, redact func(io.Writer) StreamRedactor) *sectionSink {
 	cw := &countingWriter{w: dst}
-	s := &sectionSink{cw: cw}
+	s := &sectionSink{cw: cw, names: map[string]bool{}, overflow: -1}
 	var w io.Writer = cw
 	if redact != nil {
 		s.red = redact(cw)
@@ -216,36 +254,92 @@ func (s *sectionSink) flush() error {
 	return nil
 }
 
+// begin opens the next section. Past maxHookSections it reopens the one overflow
+// section instead: sections are contiguous in the spool and the overflow section is
+// always the last one opened, so appending to it (after a newline separator) keeps it
+// one byte range.
 func (s *sectionSink) begin(name string) (int, error) {
+	if s.overflow >= 0 {
+		if s.written > s.overflowMark && s.lastIn != '\n' {
+			if _, err := s.Write(newline); err != nil {
+				return 0, err
+			}
+		}
+		s.secs[s.overflow].Merged++
+		return s.overflow, nil
+	}
 	if err := s.flush(); err != nil {
 		return 0, err
 	}
-	s.secs = append(s.secs, Section{Name: name, Start: s.cw.n})
-	s.open = true
-	return len(s.secs) - 1, nil
+	if len(s.secs) < maxHookSections {
+		if s.names[name] {
+			s.dup = true
+		}
+		s.names[name] = true
+		s.secs = append(s.secs, Section{Name: name, Start: s.cw.n})
+		return len(s.secs) - 1, nil
+	}
+	s.secs = append(s.secs, Section{Name: OverflowSection, Start: s.cw.n, Merged: 1})
+	s.overflow, s.overflowMark = len(s.secs)-1, s.written
+	return s.overflow, nil
 }
 
-func (s *sectionSink) end() error {
+func (s *sectionSink) end(idx int) error {
+	if idx == s.overflow {
+		return nil // finish sets its end
+	}
 	if err := s.flush(); err != nil {
 		return err
 	}
-	s.secs[len(s.secs)-1].End = s.cw.n
-	s.open = false
+	s.secs[idx].End = s.cw.n
 	return nil
 }
 
-func (s *sectionSink) Write(p []byte) (int, error) { return s.bw.Write(p) }
+// finish flushes everything written and closes the overflow section.
+func (s *sectionSink) finish() error {
+	if err := s.flush(); err != nil {
+		return err
+	}
+	if s.overflow >= 0 {
+		s.secs[s.overflow].End = s.cw.n
+	}
+	return nil
+}
+
+// writeStatus spools the status members as the last section, one line.
+func (s *sectionSink) writeStatus(status []string) error {
+	if err := s.finish(); err != nil || len(status) == 0 {
+		return err
+	}
+	s.secs = append(s.secs, Section{Name: StatusSection, Start: s.cw.n, Status: true})
+	if s.cw.n > 0 && s.cw.last != '\n' {
+		_ = s.bw.WriteByte('\n') // the status line never joins the output's last line
+	}
+	_, _ = s.bw.WriteString("[xmustard status] " + strings.Join(status, " ") + "\n")
+	return s.end(len(s.secs) - 1)
+}
+
+var newline = []byte{'\n'}
+
+func (s *sectionSink) Write(p []byte) (int, error) {
+	if len(p) > 0 {
+		s.written += int64(len(p))
+		s.lastIn = p[len(p)-1]
+	}
+	return s.bw.Write(p)
+}
 
 // hookDecoder is a streaming JSON reader over the body.
 type hookDecoder struct {
-	br       *bufio.Reader
-	n        int64
-	tee      hash.Hash // tool-input digest while active
-	one      [1]byte
-	sink     *sectionSink
-	body     *HookBody
-	nodes    int
-	metaUsed int
+	br          *bufio.Reader
+	n           int64
+	tee         hash.Hash // tool-input digest while active
+	one         [1]byte
+	sink        *sectionSink
+	body        *HookBody
+	nodes       int
+	metaUsed    int
+	statusBytes int
 }
 
 // DecodeHookBody reads one body in the given format, writing its output strings to
@@ -260,6 +354,9 @@ func DecodeHookBody(format HookFormat, r io.Reader, dst io.Writer, redact func(i
 		body: &HookBody{Format: format, Input: map[string]string{}}}
 	err := d.decodeRoot(roles)
 	if err == nil {
+		err = d.sink.writeStatus(d.body.Status)
+	}
+	if err == nil {
 		err = d.sink.flush()
 	}
 	if err != nil {
@@ -272,7 +369,21 @@ func DecodeHookBody(format HookFormat, r io.Reader, dst io.Writer, redact func(i
 	}
 	d.body.BodySHA256, d.body.BodyBytes = hex.EncodeToString(bodyHash.Sum(nil)), d.n
 	d.body.Sections = d.sink.secs
+	if d.sink.overflow >= 0 || d.sink.dup {
+		// merged or same-named sections cannot be put back field by field
+		d.body.Incomplete = true
+	}
 	return d.body, nil
+}
+
+// readErr maps a read error: the end of the body is a syntax error, anything else
+// (the request cap, a disconnect, a timeout) is returned as is, so the caller can
+// tell a malformed body from a transport failure.
+func (d *hookDecoder) readErr(err error, what string) error {
+	if err == io.EOF {
+		return d.syntax(what)
+	}
+	return err
 }
 
 func (d *hookDecoder) syntax(what string) error {
@@ -282,10 +393,7 @@ func (d *hookDecoder) syntax(what string) error {
 func (d *hookDecoder) readByte() (byte, error) {
 	b, err := d.br.ReadByte()
 	if err != nil {
-		if err == io.EOF {
-			return 0, d.syntax("unexpected end")
-		}
-		return 0, err
+		return 0, d.readErr(err, "unexpected end")
 	}
 	d.n++
 	if d.tee != nil {
@@ -309,10 +417,7 @@ func (d *hookDecoder) peek() (byte, error) {
 	for {
 		p, err := d.br.Peek(1)
 		if err != nil {
-			if err == io.EOF {
-				return 0, d.syntax("unexpected end")
-			}
-			return 0, err
+			return 0, d.readErr(err, "unexpected end")
 		}
 		switch p[0] {
 		case ' ', '\t', '\n', '\r':
@@ -364,6 +469,8 @@ func (s *strDest) write(p []byte) error {
 		s.overflow = true
 		return nil
 	}
+	// promoted on the first byte past the limit (limit 0: on the first byte, so an
+	// empty string never opens a section)
 	idx, err := s.d.sink.begin(s.name)
 	if err != nil {
 		return err
@@ -387,7 +494,7 @@ func (d *hookDecoder) readString(dst *strDest) error {
 	var enc [utf8.UTFMax]byte
 	for {
 		if _, err := d.br.Peek(1); err != nil {
-			return d.syntax("unterminated string")
+			return d.readErr(err, "unterminated string")
 		}
 		buf, _ := d.br.Peek(d.br.Buffered())
 		k := 0
@@ -434,8 +541,11 @@ func (d *hookDecoder) readString(dst *strDest) error {
 				if err != nil {
 					return err
 				}
-				if utf16.IsSurrogate(r) {
+				switch {
+				case r >= 0xD800 && r < 0xDC00:
 					r = d.lowSurrogate(r)
+				case utf16.IsSurrogate(r):
+					r = utf8.RuneError // a lone low surrogate
 				}
 				out = enc[:utf8.EncodeRune(enc[:], r)]
 			default:
@@ -486,19 +596,32 @@ func (d *hookDecoder) readHex4() (rune, error) {
 	return v, nil
 }
 
-// lowSurrogate completes a surrogate pair, or yields U+FFFD for a lone surrogate.
+// lowSurrogate completes a surrogate pair when the next escape is a low surrogate;
+// otherwise the high surrogate alone becomes U+FFFD and the next escape (or
+// character) is left to be decoded normally, as encoding/json does.
 func (d *hookDecoder) lowSurrogate(hi rune) rune {
 	p, _ := d.br.Peek(6)
-	if len(p) == 6 && p[0] == '\\' && p[1] == 'u' {
-		d.consume(2)
-		lo, err := d.readHex4()
-		if err == nil {
-			if r := utf16.DecodeRune(hi, lo); r != utf8.RuneError {
-				return r
-			}
+	if len(p) < 6 || p[0] != '\\' || p[1] != 'u' {
+		return utf8.RuneError
+	}
+	var lo rune
+	for _, b := range p[2:6] {
+		switch {
+		case b >= '0' && b <= '9':
+			lo = lo<<4 | rune(b-'0')
+		case b >= 'a' && b <= 'f':
+			lo = lo<<4 | rune(b-'a'+10)
+		case b >= 'A' && b <= 'F':
+			lo = lo<<4 | rune(b-'A'+10)
+		default:
+			return utf8.RuneError
 		}
 	}
-	return utf8.RuneError
+	if lo < 0xDC00 || lo >= 0xE000 {
+		return utf8.RuneError
+	}
+	d.consume(6)
+	return utf16.DecodeRune(hi, lo)
 }
 
 // readKey reads an object key (bounded).
@@ -518,6 +641,9 @@ func (d *hookDecoder) readScalar() ([]byte, error) {
 	var out []byte
 	for {
 		p, err := d.br.Peek(1)
+		if err != nil && err != io.EOF {
+			return nil, err
+		}
 		if err != nil || !(p[0] >= '0' && p[0] <= '9' || p[0] >= 'a' && p[0] <= 'z' || p[0] == '-' || p[0] == '+' || p[0] == '.' || p[0] == 'E') {
 			break
 		}
@@ -716,6 +842,8 @@ func (d *hookDecoder) decodeRoot(roles map[string]hookRole) error {
 		if c, _ := d.peek(); c != 0 {
 			return d.syntax("trailing content after the body")
 		}
+	} else if err != io.EOF {
+		return err
 	}
 	return nil
 }
@@ -796,13 +924,71 @@ func (d *hookDecoder) decodeInput(c byte) error {
 	})
 }
 
+// node admits one skeleton node; its key counts against the metadata bound.
 func (d *hookDecoder) node(n *Node) *Node {
-	if d.nodes >= maxSkeletonNodes {
+	if d.nodes >= maxSkeletonNodes || d.metaUsed+len(n.Key) > maxHookMetaBytes {
 		d.body.Incomplete = true
 		return nil
 	}
 	d.nodes++
+	d.metaUsed += len(n.Key)
 	return n
+}
+
+// child is the JSON path of a member (sep ".") or element (sep "["), capped at
+// maxSectionName bytes: a capped path may name two sections alike, so the payload
+// is marked unrebuildable.
+func (d *hookDecoder) child(parent, sep, key string) string {
+	if parent == "" && sep == "." {
+		sep = ""
+	}
+	if len(parent)+len(sep)+len(key) <= maxSectionName {
+		return parent + sep + key
+	}
+	d.body.Incomplete = true
+	room := max(0, maxSectionName-len(parent)-len(sep))
+	if room == 0 {
+		return parent
+	}
+	return parent + sep + string(trimRune([]byte(key[:min(len(key), room)])))
+}
+
+// status records a status member of the response (statusKeys, at any depth outside
+// arrays) for the status section; a failing status among the response's own
+// members marks the call as an error.
+func (d *hookDecoder) status(key, path string, raw []byte, depth int) {
+	if len(key) > 24 || !isStatusKey([]byte(key)) {
+		return
+	}
+	if strings.Contains(path, "[") || len(d.body.Status) >= maxStatusFields || d.statusBytes+len(path)+len(raw)+2 > maxStatusBytes {
+		d.body.StatusDropped = true
+		return
+	}
+	if depth == 1 && failingStatus(key, raw) {
+		d.body.IsError = true
+	}
+	d.body.Status = append(d.body.Status, path+"="+string(raw))
+	d.statusBytes += len(path) + len(raw) + 2
+}
+
+// failingStatus reports a status member that says the call failed.
+func failingStatus(key string, raw []byte) bool {
+	switch strings.ToLower(key) {
+	case "ok", "success", "succeeded", "passed":
+		return string(raw) == "false"
+	case "is_error", "iserror", "failed", "timed_out", "timedout":
+		return string(raw) == "true"
+	case "status", "state", "conclusion", "outcome", "result":
+		var s string
+		if json.Unmarshal(raw, &s) != nil {
+			return false
+		}
+		switch strings.ToLower(s) {
+		case "failed", "failure", "fail", "failing", "error", "errored", "timed_out", "timedout", "timeout", "crashed":
+			return true
+		}
+	}
+	return false
 }
 
 // walk reads one response value at path (key is its member key), streaming output
@@ -827,13 +1013,9 @@ func (d *hookDecoder) walk(key, path string, depth int) (*Node, error) {
 			dst.discard = true
 		case outputKeys[key] || key == "" || depth == 0:
 			if path == "" {
-				path = "output" // the whole response is one string
+				dst.name = "output" // the whole response is one string
 			}
-			idx, err := d.sink.begin(path)
-			if err != nil {
-				return nil, err
-			}
-			dst.promoted, dst.section = true, idx
+			dst.limit = 0 // a section from the first byte; an empty string opens none
 		}
 		if err := d.readString(dst); err != nil {
 			return nil, err
@@ -843,12 +1025,13 @@ func (d *hookDecoder) walk(key, path string, depth int) (*Node, error) {
 			d.body.Dropped++
 			return d.node(&Node{Kind: 'x', Key: key}), nil
 		case dst.promoted:
-			if err := d.sink.end(); err != nil {
+			if err := d.sink.end(dst.section); err != nil {
 				return nil, err
 			}
 			return d.node(&Node{Kind: 's', Key: key, Section: dst.section}), nil
 		}
 		raw, _ := json.Marshal(string(dst.small))
+		d.status(key, path, raw, depth)
 		if d.metaUsed+len(raw) > maxHookMetaBytes {
 			d.body.Incomplete = true
 			return nil, nil
@@ -858,7 +1041,7 @@ func (d *hookDecoder) walk(key, path string, depth int) (*Node, error) {
 	case '{':
 		n := d.node(&Node{Kind: 'o', Key: key})
 		err := d.eachMember(func(k string) error {
-			kid, err := d.walk(k, joinPath(path, k), depth+1)
+			kid, err := d.walk(k, d.child(path, ".", k), depth+1)
 			if n != nil && kid != nil && skeleton {
 				n.Kids = append(n.Kids, kid)
 			} else if kid == nil {
@@ -873,7 +1056,7 @@ func (d *hookDecoder) walk(key, path string, depth int) (*Node, error) {
 		}
 		n := d.node(&Node{Kind: 'a', Key: key})
 		err := d.eachElement(func(i int) error {
-			kid, err := d.walk("", path+"["+strconv.Itoa(i)+"]", depth+1)
+			kid, err := d.walk("", d.child(path, "[", strconv.Itoa(i)+"]"), depth+1)
 			if n != nil && kid != nil && skeleton {
 				n.Kids = append(n.Kids, kid)
 			} else if kid == nil {
@@ -895,19 +1078,17 @@ func (d *hookDecoder) walk(key, path string, depth int) (*Node, error) {
 	if (key == "is_error" || key == "isError") && string(raw) == "true" {
 		d.body.IsError = true
 	}
+	d.status(key, path, raw, depth)
 	d.metaUsed += len(raw)
 	return d.node(&Node{Kind: 'v', Key: key, Raw: raw}), nil
 }
 
-// walkList stores a string array one element per line in one section.
+// walkList stores a string array one element per line in one section, opened at the
+// first element (an empty list opens none).
 func (d *hookDecoder) walkList(key, path string) (*Node, error) {
-	idx, err := d.sink.begin(path)
-	if err != nil {
-		return nil, err
-	}
-	d.sink.secs[idx].Array = true
-	dst := &strDest{d: d, promoted: true, section: idx}
-	err = d.eachElement(func(int) error {
+	idx := -1
+	var dst *strDest
+	err := d.eachElement(func(int) error {
 		c, err := d.peek()
 		if err != nil {
 			return err
@@ -917,16 +1098,29 @@ func (d *hookDecoder) walkList(key, path string) (*Node, error) {
 			d.body.Incomplete = true
 			return d.skip(1)
 		}
+		if idx < 0 {
+			if idx, err = d.sink.begin(path); err != nil {
+				return err
+			}
+			if idx != d.sink.overflow {
+				d.sink.secs[idx].Array = true
+			}
+			dst = &strDest{d: d, promoted: true, section: idx}
+		}
 		if err := d.readString(dst); err != nil {
 			return err
 		}
-		_, err = d.sink.Write([]byte{'\n'})
+		_, err = d.sink.Write(newline)
 		return err
 	})
 	if err != nil {
 		return nil, err
 	}
-	if err := d.sink.end(); err != nil {
+	if idx < 0 {
+		d.metaUsed += 2
+		return d.node(&Node{Kind: 'v', Key: key, Raw: json.RawMessage("[]")}), nil
+	}
+	if err := d.sink.end(idx); err != nil {
 		return nil, err
 	}
 	return d.node(&Node{Kind: 'l', Key: key, Section: idx}), nil

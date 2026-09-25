@@ -54,8 +54,9 @@ type groupedRules struct {
 	sevName bool // render severity counts (lint)
 }
 
-// groupState is the parser state (the current heading, kept in a reused buffer).
-type groupState struct{ heading []byte }
+// groupState is the parser state: the current heading and the path of the last
+// unnumbered match, kept in reused buffers.
+type groupState struct{ heading, lastPath []byte }
 
 var grepRules = &groupedRules{family: FamilyGrep, id: "xm-grep", parse: parseGrepLine}
 
@@ -118,17 +119,46 @@ func parseGrepLine(st *groupState, line []byte) groupedItem {
 	if p, _, _, ok := splitNumbered(t, '-'); ok && (len(st.heading) == 0 || bytes.Equal(p, st.heading)) {
 		return groupedItem{kind: ikContext, path: p}
 	}
-	if bytes.HasPrefix(t, []byte("[")) || bytes.HasPrefix(t, []byte("Found ")) || bytes.HasPrefix(t, []byte("No files found")) {
+	if isNotice(t) || bytes.HasPrefix(t, []byte("Found ")) || bytes.HasPrefix(t, []byte("No files found")) {
 		return groupedItem{kind: ikSummary} // notices (Pi "[100 matches limit reached]")
+	}
+	// "path:text" without a line number (rg writing to a pipe, grep -r)
+	if p, rest, ok := splitUnnumbered(t); ok {
+		st.heading = st.heading[:0]
+		st.lastPath = append(st.lastPath[:0], p...)
+		return groupedItem{kind: ikMatch, path: p, text: rest}
+	}
+	// "path-text": unnumbered context of the file just matched
+	if n := len(st.lastPath); n > 0 && len(t) > n && t[n] == '-' && bytes.HasPrefix(t, st.lastPath) {
+		return groupedItem{kind: ikContext, path: t[:n]}
 	}
 	// a bare path: a heading when matches follow, else a files-with-matches entry
 	st.heading = append(st.heading[:0], t...)
 	return groupedItem{kind: ikFile, path: st.heading}
 }
 
+// noticeRe recognizes a tool's bracketed notice ("[100 matches limit reached. Use
+// limit=200 for more]", "[50KB limit reached]"); other lines starting with '[' are
+// output like any other.
+var noticeRe = regexp.MustCompile(`(?i)^\[[^\[\]]*\b(limit reached|more (lines|entries|results|matches|files)|truncated|omitted|not shown|no (matches|results|files))\b[^\[\]]*\]$`)
+
+func isNotice(t []byte) bool { return len(t) > 2 && len(t) <= 512 && t[0] == '[' && noticeRe.Match(t) }
+
+// splitUnnumbered splits "path:text" when the part before the first ':' looks like
+// a file path: no whitespace, a '/' or a '.', and not a URL scheme or a drive letter.
+func splitUnnumbered(t []byte) (path, rest []byte, ok bool) {
+	i := bytes.IndexByte(t, ':')
+	if i < 2 || i > 4096 {
+		return nil, nil, false
+	}
+	p := t[:i]
+	if bytes.ContainsAny(p, " \t\"'<>|") || !bytes.ContainsAny(p, "/.") || bytes.HasPrefix(t[i+1:], []byte("//")) {
+		return nil, nil, false
+	}
+	return p, t[i+1:], true
+}
+
 var (
-	diagRe       = regexp.MustCompile(`^\s*(\S[^:()]*?)(?::(\d+)(?::(\d+))?|\((\d+),(\d+)\)):?\s*(?:-\s*)?(.*)$`)
-	stylishRe    = regexp.MustCompile(`^\s+(\d+):(\d+)\s+(error|warning|warn|info)\s+(.*)$`)
 	sevErrorRe   = regexp.MustCompile(`(?i)(^|[\s\[(:])(error|fatal|critical)\b|^\s*[EF]\d{2,4}\b|^\s*error\[`)
 	sevWarnRe    = regexp.MustCompile(`(?i)(^|[\s\[(:])(warning|warn)\b|^\s*[WC]\d{2,4}\b`)
 	lintSummary  = regexp.MustCompile(`(?i)(\d+ problems?|found \d+ (errors?|issues?)|\d+ errors?(,| and) \d+ warnings?|all checks passed|no issues found|success: no issues|\d+ issues?\.?$|\d+ files? checked)`)
@@ -187,32 +217,20 @@ func parseLintLine(st *groupState, line []byte) groupedItem {
 	if len(trimmed) == 0 {
 		return groupedItem{kind: ikOther}
 	}
-	if len(st.heading) > 0 && stylishRe.Match(t) {
-		m := stylishRe.FindSubmatchIndex(t)
-		sev := 1
-		if string(t[m[6]:m[7]]) == "error" {
-			sev = 2
+	if len(st.heading) > 0 {
+		if ln, word, ok := parseStylish(t); ok {
+			sev := 1
+			if string(word) == "error" {
+				sev = 2
+			}
+			return groupedItem{kind: ikMatch, path: st.heading, line: ln, text: trimmed, sev: sev}
 		}
-		return groupedItem{kind: ikMatch, path: st.heading, line: t[m[2]:m[5]], text: trimmed, sev: sev}
 	}
 	// diagnostics first: they are most lines, and cheaper to recognize
 	if bytes.ContainsAny(t, ":(") && !bytes.HasPrefix(trimmed, []byte("at ")) {
-		if m := diagRe.FindSubmatchIndex(t); m != nil {
-			path := t[m[2]:m[3]]
-			var ln []byte
-			switch {
-			case m[4] >= 0 && m[6] >= 0:
-				ln = t[m[4]:m[7]] // line:col
-			case m[4] >= 0:
-				ln = t[m[4]:m[5]]
-			case m[8] >= 0:
-				ln = t[m[8]:m[11]] // (line,col)
-			}
-			if len(ln) > 0 && !bytes.ContainsAny(path, " \t") {
-				rest := t[m[12]:m[13]]
-				st.heading = st.heading[:0]
-				return groupedItem{kind: ikMatch, path: path, line: ln, text: bytes.TrimSpace(rest), sev: severity(rest)}
-			}
+		if path, ln, rest, ok := parseDiag(t); ok && !bytes.ContainsAny(path, " \t") {
+			st.heading = st.heading[:0]
+			return groupedItem{kind: ikMatch, path: path, line: ln, text: bytes.TrimSpace(rest), sev: severity(rest)}
 		}
 	}
 	switch {
@@ -226,6 +244,108 @@ func parseLintLine(st *groupState, line []byte) groupedItem {
 		return groupedItem{kind: ikHeading, path: st.heading}
 	}
 	return groupedItem{kind: ikOther}
+}
+
+// isRESpace is the \s class of Go's regexp syntax.
+func isRESpace(c byte) bool { return c == ' ' || c == '\t' || c == '\n' || c == '\f' || c == '\r' }
+
+// parseDiag matches `^\s*(\S[^:()]*?)(?::(\d+)(?::(\d+))?|\((\d+),(\d+)\)):?\s*(?:-\s*)?(.*)$`
+// without allocating (regexp submatch indexes allocate per line, which made lint
+// reduction allocate in proportion to its input): "path:line[:col][:] [- ]rest" or
+// "path(line,col)[:] [- ]rest". ln is "line", "line:col" or "line,col".
+// TestLintParsersMatchTheirPatterns checks the equivalence.
+func parseDiag(t []byte) (path, ln, rest []byte, ok bool) {
+	i := 0
+	for i < len(t) && isRESpace(t[i]) {
+		i++
+	}
+	if i >= len(t) {
+		return nil, nil, nil, false
+	}
+	j := i + 1
+	for j < len(t) && t[j] != ':' && t[j] != '(' && t[j] != ')' {
+		j++
+	}
+	if j >= len(t) {
+		return nil, nil, nil, false
+	}
+	path = t[i:j]
+	pos := 0
+	switch t[j] {
+	case ':':
+		k := numberAt(t, j+1)
+		if k == j+1 {
+			return nil, nil, nil, false
+		}
+		pos = k
+		if k < len(t) && t[k] == ':' {
+			if c := numberAt(t, k+1); c > k+1 {
+				pos = c // line:col
+			}
+		}
+		ln = t[j+1 : pos]
+	case '(':
+		a := numberAt(t, j+1)
+		if a == j+1 || a >= len(t) || t[a] != ',' {
+			return nil, nil, nil, false
+		}
+		b := numberAt(t, a+1)
+		if b == a+1 || b >= len(t) || t[b] != ')' {
+			return nil, nil, nil, false
+		}
+		ln, pos = t[j+1:b], b+1
+	default:
+		return nil, nil, nil, false
+	}
+	if pos < len(t) && t[pos] == ':' {
+		pos++
+	}
+	for pos < len(t) && isRESpace(t[pos]) {
+		pos++
+	}
+	if pos < len(t) && t[pos] == '-' {
+		pos++
+		for pos < len(t) && isRESpace(t[pos]) {
+			pos++
+		}
+	}
+	return path, ln, t[pos:], true
+}
+
+// parseStylish matches `^\s+(\d+):(\d+)\s+(error|warning|warn|info)\s+(.*)$`
+// ("  12:5  error  message") without allocating; ln is "line:col" and word the
+// severity word.
+func parseStylish(t []byte) (ln, word []byte, ok bool) {
+	i := 0
+	for i < len(t) && isRESpace(t[i]) {
+		i++
+	}
+	if i == 0 {
+		return nil, nil, false
+	}
+	a := numberAt(t, i)
+	if a == i || a >= len(t) || t[a] != ':' {
+		return nil, nil, false
+	}
+	b := numberAt(t, a+1)
+	if b == a+1 {
+		return nil, nil, false
+	}
+	ln = t[i:b]
+	s := b
+	for s < len(t) && isRESpace(t[s]) {
+		s++
+	}
+	if s == b {
+		return nil, nil, false
+	}
+	for _, w := range []string{"error", "warning", "warn", "info"} {
+		e := s + len(w)
+		if e < len(t) && string(t[s:e]) == w && isRESpace(t[e]) {
+			return ln, t[s:e], true
+		}
+	}
+	return nil, nil, false
 }
 
 type grepReducer struct{}
@@ -246,10 +366,16 @@ func (lintReducer) Reduce(ctx context.Context, in *Input) (*Projection, error) {
 	p, err := reduceGrouped(ctx, in, lintRules)
 	if err == errNoItems {
 		// not a diagnostics list (compiler-style or tool-specific format): the build
-		// rules keep error lines failure-first instead
+		// rules keep error lines failure-first instead, and the header and record
+		// name them (xm-build/1)
 		p, err = reduceLineSections(ctx, in, buildRules)
 		if p != nil {
-			p.Text = strings.Replace(p.Text, "[xmustard build] xm-build/1", "[xmustard lint] xm-lint/1 (build rules)", 1)
+			p.Text = strings.Replace(p.Text, "[xmustard build] ", "[xmustard lint] ", 1)
+			for k, v := range p.Parts {
+				if strings.HasPrefix(v, "[xmustard build] ") {
+					p.Parts[k] = strings.Replace(v, "[xmustard build] ", "[xmustard lint] ", 1)
+				}
+			}
 		}
 	}
 	return p, err
@@ -288,6 +414,9 @@ type FileCount struct {
 	Path    string `json:"path"`
 	Matches int    `json:"matches"`
 }
+
+// maxGroupedSummaries bounds the summary and notice lines a grouped projection keeps.
+const maxGroupedSummaries = 8
 
 func reduceGrouped(ctx context.Context, in *Input, rules *groupedRules) (*Projection, error) {
 	secs := nonEmpty(in.Sections)
@@ -375,7 +504,7 @@ func reduceGrouped(ctx context.Context, in *Input, rules *groupedRules) (*Projec
 	}
 	parts := map[string]string{}
 	var oms []Omission
-	kept, keptWarn := 0, 0
+	kept, keptWarn, keptSummaries := 0, 0, 0
 	var body bytes.Buffer
 	for _, sec := range secs {
 		var part bytes.Buffer
@@ -387,10 +516,13 @@ func reduceGrouped(ctx context.Context, in *Input, rules *groupedRules) (*Projec
 				return
 			}
 			if fs := files[curPath]; fs != nil && fs.matches > fs.shown && !fs.lastSeen {
-				fmt.Fprintf(&part, "  … %d more in %s\n", fs.matches-fs.shown, curPath)
+				fmt.Fprintf(&part, "  … %d more in %s\n", fs.matches-fs.shown, shortPath([]byte(curPath)))
 				fs.lastSeen = true
 			}
 		}
+		// used is what the projection holds so far; every kept item is checked with
+		// its own rendered size (and a file heading when it starts a new group)
+		used := func() int { return out.Len() + body.Len() + part.Len() }
 		var lastEnd int64
 		err := scanLines(ctx, in.R, sec, func(idx int, line []byte, start, end int64) error {
 			it := rules.parse(st, line)
@@ -404,7 +536,11 @@ func reduceGrouped(ctx context.Context, in *Input, rules *groupedRules) (*Projec
 				fallthrough
 			case ikMatch, ikCount:
 				fs := files[string(it.path)]
-				room := kept < maxGroupedItems && out.Len()+body.Len()+part.Len() < in.Target-512
+				need := itemCost(it, line, sec.Array)
+				if string(it.path) != curPath {
+					need += min(len(it.path), groupedTextBytes) + 48 // heading and the previous group's "more" line
+				}
+				room := kept < maxGroupedItems && used()+need < in.Target-512
 				if it.kind == ikMatch && it.sev < 2 && rules.family == FamilyLint {
 					room = room && keptWarn < warnBudget
 				}
@@ -417,7 +553,10 @@ func reduceGrouped(ctx context.Context, in *Input, rules *groupedRules) (*Projec
 					}
 				}
 			case ikSummary:
-				keep = true
+				if keptSummaries < maxGroupedSummaries && used()+min(len(line), plainDisplay)+1 < in.Target-512 {
+					keep = true
+					keptSummaries++
+				}
 			}
 			if !keep {
 				// headings are re-rendered above their first kept match
@@ -444,27 +583,31 @@ func reduceGrouped(ctx context.Context, in *Input, rules *groupedRules) (*Projec
 				curPath = string(it.path)
 				// array sections (Claude Grep filenames) render one entry per line
 				if !sec.Array && it.kind == ikMatch {
-					fmt.Fprintf(&part, "%s (%d)\n", validUTF8(it.path), files[curPath].matches)
+					fmt.Fprintf(&part, "%s (%d)\n", shortPath(it.path), files[curPath].matches)
 				}
 			}
-			gm := GroupedMatch{Path: curPath, Line: string(it.line)}
+			gm := GroupedMatch{Path: string(shortPath([]byte(curPath))), Line: string(it.line)}
 			switch {
 			case sec.Array:
-				part.Write(validUTF8(line[:min(len(line), groupedTextBytes*2)]))
+				part.Write(validUTF8(trimRune(line[:min(len(line), groupedTextBytes*2)])))
 				part.WriteByte('\n')
 			case it.kind == ikMatch:
 				text := bytes.TrimSpace(it.text)
 				short := trimRune(text[:min(len(text), groupedTextBytes)])
 				gm.Text = string(validUTF8(short))
-				fmt.Fprintf(&part, "  %s: %s", it.line, gm.Text)
+				if len(it.line) > 0 {
+					fmt.Fprintf(&part, "  %s: %s", it.line, gm.Text)
+				} else {
+					fmt.Fprintf(&part, "  %s", gm.Text)
+				}
 				if len(short) < len(text) {
 					fmt.Fprintf(&part, "…[+%d bytes]", len(text)-len(short))
 				}
 				part.WriteByte('\n')
 			case it.kind == ikCount:
-				fmt.Fprintf(&part, "%s: %d matches\n", it.path, it.count)
+				fmt.Fprintf(&part, "%s: %d matches\n", shortPath(it.path), it.count)
 			default:
-				part.Write(validUTF8(it.path))
+				part.Write(shortPath(it.path))
 				part.WriteByte('\n')
 			}
 			gp.Results = append(gp.Results, gm)
@@ -542,7 +685,30 @@ func reduceGrouped(ctx context.Context, in *Input, rules *groupedRules) (*Projec
 		facts.ExitFrom = "tool"
 	}
 	return &Projection{Text: out.String(), Parts: parts, Structured: gp, Facts: facts,
-		Record: Record{Mode: "text", Reduced: true, Omissions: capOmissions(oms)}}, nil
+		Record: Record{Reducer: rules.id + "/1", Mode: "text", Reduced: true, Omissions: capOmissions(oms)}}, nil
+}
+
+// shortPath renders a path (or a bare output line taken for one) within
+// groupedTextBytes, as valid UTF-8, with an explicit marker when cut.
+func shortPath(p []byte) []byte {
+	if len(p) <= groupedTextBytes {
+		return validUTF8(p)
+	}
+	head := trimRune(p[:groupedTextBytes])
+	out := make([]byte, 0, len(head)+24) // p is a view into the line buffer: never append to it
+	out = append(out, validUTF8(head)...)
+	return fmt.Appendf(out, "…[+%d bytes]", len(p)-len(head))
+}
+
+// itemCost bounds the rendered size of one kept item.
+func itemCost(it groupedItem, line []byte, array bool) int {
+	switch {
+	case array:
+		return min(len(line), groupedTextBytes*2) + 1
+	case it.kind == ikMatch:
+		return len(it.line) + min(len(bytes.TrimSpace(it.text)), groupedTextBytes) + 24
+	}
+	return min(len(it.path), groupedTextBytes) + 32
 }
 
 // writeWithin writes prefix, then as many items as keep out within limit bytes
@@ -580,6 +746,7 @@ func registerFile(files map[string]*fileStat, path []byte, n, errs int, untracke
 // maxSalienceLine bytes are passed) with the line's absolute start offset.
 func scanLines(ctx context.Context, r io.ReaderAt, sec Section, fn func(idx int, line []byte, start, end int64) error) error {
 	lr := newLineReader(r, sec)
+	defer lr.release()
 	off := sec.Start
 	for idx := 0; ; idx++ {
 		if idx&4095 == 0 {

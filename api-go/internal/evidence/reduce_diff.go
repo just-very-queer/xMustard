@@ -63,14 +63,19 @@ func (diffReducer) Version() int   { return 1 }
 
 // diffScanner tracks where a line sits in a (possibly multi-commit) diff.
 type diffScanner struct {
-	commit     int // commits seen: file stats are per (commit, path) occurrence
-	keyBuf     []byte
-	inHunk     bool
-	gitFile    bool   // the current file began with "diff --git" (its ---/+++ lines are meta)
-	pendingOld []byte // "--- a/x" seen, waiting for "+++ b/x" (reused buffer)
-	havePend   bool
-	commitMsg  int // message lines seen of the current commit
-	inCommit   bool
+	commit int // commits seen: file stats are per (commit, path) occurrence
+	keyBuf []byte
+	inHunk bool
+	// counted: the hunk header gave line counts, and oldLeft/newLeft are the lines
+	// still owed. While any remain, a '-' or '+' line is a deletion or addition even
+	// when it reads "--- x" or "+++ x" (a deleted SQL comment), as git reads it.
+	counted          bool
+	oldLeft, newLeft int
+	gitFile          bool   // the current file began with "diff --git" (its ---/+++ lines are meta)
+	pendingOld       []byte // "--- a/x" seen, waiting for "+++ b/x" (reused buffer)
+	havePend         bool
+	commitMsg        int // message lines seen of the current commit
+	inCommit         bool
 }
 
 type diffKind uint8
@@ -103,8 +108,66 @@ func headerPath(line []byte, strip string) []byte {
 	return bytes.TrimPrefix(bytes.TrimSpace(p), []byte(strip))
 }
 
+// hunkCounts parses the old and new line counts of a two-way "@@ -a,b +c,d @@"
+// header (a missing count is 1). Combined diffs (@@@) are not counted.
+func hunkCounts(line []byte) (old, new int, ok bool) {
+	if !bytes.HasPrefix(line, []byte("@@ -")) {
+		return 0, 0, false
+	}
+	count := func(b []byte) (int, []byte, bool) {
+		i := numberAt(b, 0)
+		if i == 0 {
+			return 0, nil, false
+		}
+		if i < len(b) && b[i] == ',' {
+			j := numberAt(b, i+1)
+			if j == i+1 {
+				return 0, nil, false
+			}
+			n, err := strconv.Atoi(string(b[i+1 : j]))
+			return n, b[j:], err == nil
+		}
+		return 1, b[i:], true
+	}
+	old, rest, ok := count(line[4:])
+	if !ok || !bytes.HasPrefix(rest, []byte(" +")) {
+		return 0, 0, false
+	}
+	new, rest, ok = count(rest[2:])
+	if !ok || !bytes.HasPrefix(rest, []byte(" @@")) || bytes.HasPrefix(rest, []byte(" @@@")) {
+		return 0, 0, false
+	}
+	return old, new, true
+}
+
 // kind classifies one line; the returned path is a view valid until the next call.
 func (d *diffScanner) kind(line []byte) (diffKind, []byte) {
+	if d.inHunk && d.counted {
+		c := byte(0)
+		if len(line) > 0 {
+			c = line[0]
+		}
+		switch {
+		case c == '-' && d.oldLeft > 0:
+			d.oldLeft--
+			return dkDel, nil
+		case c == '+' && d.newLeft > 0:
+			d.newLeft--
+			return dkAdd, nil
+		case (c == ' ' || c == 0) && d.oldLeft > 0 && d.newLeft > 0:
+			d.oldLeft--
+			d.newLeft--
+			return dkCtx, nil
+		case c == '\\':
+			return dkCtx, nil // "\ No newline at end of file"
+		case d.oldLeft > 0 || d.newLeft > 0:
+			// counts not yet met: a line the header did not announce (a mangled or
+			// hand-edited diff); read it by its prefix like an uncounted hunk
+			d.counted = false
+		default:
+			d.inHunk, d.counted = false, false // the hunk is complete
+		}
+	}
 	switch {
 	case bytes.HasPrefix(line, []byte("commit ")) && commitRe.Match(line):
 		d.inHunk, d.inCommit, d.commitMsg, d.gitFile = false, true, 0, false
@@ -121,6 +184,7 @@ func (d *diffScanner) kind(line []byte) (diffKind, []byte) {
 		return dkCtx, nil
 	case bytes.HasPrefix(line, []byte("@@")) && hunkRe.Match(line):
 		d.inHunk = true
+		d.oldLeft, d.newLeft, d.counted = hunkCounts(line)
 		return dkHunk, nil
 	case bytes.HasPrefix(line, []byte("--- ")) && len(bytes.TrimSpace(line)) > 4:
 		d.inHunk = false
@@ -147,7 +211,7 @@ func (d *diffScanner) kind(line []byte) (diffKind, []byte) {
 		d.commitMsg++
 		return dkCommitMsg, nil
 	}
-	d.inHunk = false
+	d.inHunk, d.counted = false, false
 	return dkOther, nil
 }
 
@@ -422,5 +486,5 @@ func (diffReducer) Reduce(ctx context.Context, in *Input) (*Projection, error) {
 		parts[secs[0].Name] = out.String() // includes the "more files" summary
 	}
 	return &Projection{Text: out.String(), Parts: parts, Structured: dp, Facts: facts,
-		Record: Record{Mode: "text", Reduced: true, Omissions: capOmissions(oms)}}, nil
+		Record: Record{Reducer: "xm-diff/1", Mode: "text", Reduced: true, Omissions: capOmissions(oms)}}, nil
 }

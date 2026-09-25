@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"testing"
@@ -597,4 +598,421 @@ func longPathGrep() []byte {
 		}
 	}
 	return b.Bytes()
+}
+
+// --- review fixes (round 1) ---
+
+// observeRaw captures a raw body with the production projection limits.
+func observeRaw(t *testing.T, s *Store, raw []byte, meta CaptureMeta, sel Selector) *ObservationResult {
+	t.Helper()
+	res, err := s.Observe(context.Background(), nil, ObservationInput{WorkspaceID: "ws", Format: FormatRaw,
+		Body: bytes.NewReader(raw), Meta: meta, Sel: sel})
+	if err != nil {
+		t.Fatalf("observe %s: %v", meta.Tool, err)
+	}
+	return res
+}
+
+func productionStore(t *testing.T) *Store {
+	t.Helper()
+	s, _ := testStore(t, func(l *Limits) { *l = DefaultLimits() })
+	return s
+}
+
+// Another server's tool is never reduced as native grep/read/list output just
+// because its name ends in search, read or list: JSON output goes to the structured
+// family (valid JSON, status kept, bounded); text output keeps the name's family.
+func TestNamespacedToolJSONUsesStructuredFamily(t *testing.T) {
+	s := productionStore(t)
+	var jobs []map[string]any
+	for i := 0; i < 3000; i++ {
+		jobs = append(jobs, map[string]any{"id": i, "name": fmt.Sprintf("job-%04d", i), "log": "src/app.go:12: something"})
+	}
+	pretty, _ := json.MarshalIndent(map[string]any{"jobs": jobs, "status": "failed", "ok": false}, "", "  ")
+	var results []map[string]any
+	for i := 0; i < 500; i++ {
+		results = append(results, map[string]any{"path": fmt.Sprintf("src/f%03d.go", i), "line": i, "text": "needle := 1"})
+	}
+	single, _ := json.Marshal(map[string]any{"status": "partial", "results": results, "total": 500})
+	target := PolicyFor("claude").Target
+	for _, c := range []struct {
+		tool string
+		raw  []byte
+		keep []string
+	}{
+		{"mcp__ci__list", pretty, []string{`"failed"`, `"ok"`}},
+		{"mcp__github__search", single, []string{`"partial"`}},
+		{"mcp__brave__search", single, []string{`"partial"`}},
+		{"mcp__xmustard__search", single, []string{`"partial"`}},
+		{"mcp__fs__read_file", pretty, []string{`"failed"`}},
+		{"github.search", single, []string{`"partial"`}},
+		{"MCP:search", single, []string{`"partial"`}},
+	} {
+		res := observeRaw(t, s, c.raw, CaptureMeta{Client: "claude", Tool: c.tool, ContentType: "application/json"}, Selector{})
+		if res.Family != FamilyStructured || !strings.HasPrefix(res.Reducer, "xm-structured/1") || !json.Valid([]byte(res.Projection)) {
+			t.Errorf("%s: family %s reducer %s valid=%v", c.tool, res.Family, res.Reducer, json.Valid([]byte(res.Projection)))
+			continue
+		}
+		mustContain(t, res.Projection, c.keep...)
+		if len(res.Projection) > target+1024 {
+			t.Errorf("%s: projection %d bytes for a %d target", c.tool, len(res.Projection), target)
+		}
+	}
+	// no declared content type: the output itself decides
+	if res := observeRaw(t, s, pretty, CaptureMeta{Client: "claude", Tool: "mcp__ci__list"}, Selector{}); res.Family != FamilyStructured ||
+		!strings.Contains(res.Projection, `"failed"`) {
+		t.Fatalf("undeclared JSON: %s", res.Family)
+	}
+	// text output of a namespaced tool keeps the family its name suggests
+	res := observeRaw(t, s, globOutput(900), CaptureMeta{Client: "claude", Tool: "mcp__fs__find"}, Selector{})
+	if res.Family != FamilyGlob || res.Reducer != "xm-glob/1" {
+		t.Fatalf("text output of mcp__fs__find: %s %s", res.Family, res.Reducer)
+	}
+	// native tools keep their family whatever the output looks like
+	for _, tool := range []string{"Read", "read", "list", "search"} {
+		if NamespacedTool(tool) {
+			t.Fatalf("%s is a native tool name", tool)
+		}
+	}
+	for _, tool := range []string{"mcp__a__b", "srv.search", "srv/read", "MCP:x", "mcp_x"} {
+		if !NamespacedTool(tool) {
+			t.Fatalf("%s is namespaced", tool)
+		}
+	}
+	res = observeRaw(t, s, pretty, CaptureMeta{Client: "claude", Tool: "Read"}, Selector{Path: "jobs.json"})
+	if res.Family != FamilyRead {
+		t.Fatalf("a native Read of a JSON file is a read: %s", res.Family)
+	}
+}
+
+// Every projection records the rule set that produced its text: when a family
+// reducer delegates, the record and the header name the delegate, and the family
+// record keeps the selected reducer.
+func TestRecordedReducerMatchesProjectionHeader(t *testing.T) {
+	var stat bytes.Buffer
+	for i := 0; i < 3000; i++ {
+		fmt.Fprintf(&stat, " src/file_%04d.go | %d ++--\n", i, i%9+1)
+	}
+	var plain, none bytes.Buffer
+	for i := 0; i < 5000; i++ {
+		fmt.Fprintf(&plain, "plain text result line %d\n", i)
+		none.WriteString("--\n")
+	}
+	none.WriteString("Found 0 matches\n")
+	var cc bytes.Buffer
+	for i := 0; i < 2000; i++ {
+		fmt.Fprintf(&cc, "In file included from x.h; note: step %d\n", i)
+	}
+	cc.WriteString("fatal error: missing.h not found\n")
+	for _, c := range []struct {
+		raw      []byte
+		sel      Selector
+		used     string
+		selected string
+		header   string
+	}{
+		{stat.Bytes(), Selector{Tool: "Bash", Command: "git diff --stat HEAD~50"}, "xm-git/1", "xm-diff/1", "[xmustard git] xm-git/1 "},
+		{none.Bytes(), Selector{Tool: "Bash", Command: "rg needle"}, "xm-shell/1", "xm-grep/1", "[xmustard shell] xm-shell/1 "},
+		{plain.Bytes(), Selector{Tool: "mcp__srv__tool"}, "xm-shell/1", "xm-structured/1", "[xmustard shell] xm-shell/1 "},
+		{cc.Bytes(), Selector{Tool: "Bash", Command: "npm run lint"}, "xm-build/1", "xm-lint/1", "[xmustard lint] xm-build/1 "},
+		{diffOutput(40, 4), Selector{Tool: "Bash", Command: "git diff"}, "xm-diff/1", "", "[xmustard diff] xm-diff/1 "},
+	} {
+		p, rec := reduceWith(t, c.raw, c.sel, 8<<10)
+		if rec.Reducer != c.used || rec.Family == nil || rec.Family.Reducer != c.used || rec.Family.Selected != c.selected {
+			t.Errorf("%s: record %s, family record %+v", c.sel.Command+c.sel.Tool, rec.Reducer, rec.Family)
+		}
+		if !strings.HasPrefix(p.Text, c.header) {
+			t.Errorf("%s: header %.80q, want prefix %q", c.sel.Command+c.sel.Tool, p.Text, c.header)
+		}
+	}
+}
+
+// rg and grep -r write "path:text" (no line number) when not on a tty: those lines
+// are matches grouped by file, and one enormous matched line stays within the target.
+func TestGrepUnnumberedOutputStaysWithinTarget(t *testing.T) {
+	var b bytes.Buffer
+	b.WriteString("src/app.go:\tfoo := needle()\n")
+	b.WriteString("dist/app.min.js:" + strings.Repeat("var a=needle;", 8000) + "\n")
+	b.WriteString("src/app.go:\treturn needle\n")
+	for i := 0; i < 400; i++ {
+		fmt.Fprintf(&b, "./pkg/mod%02d/file_%03d.go:  x := needle(%d)\n", i%7, i%40, i)
+	}
+	raw := b.Bytes()
+	target := 16 << 10
+	p, rec := reduceWith(t, raw, Selector{Client: "claude", Tool: "Bash", Command: "rg needle"}, target)
+	gp := p.Structured.(*GroupedProjection)
+	// 280 distinct (module, file) pairs, src/app.go and dist/app.min.js
+	if rec.Reducer != "xm-grep/1" || gp.Matches != 403 || gp.Files != 282 {
+		t.Fatalf("unnumbered grep: %s matches %d files %d", rec.Reducer, gp.Matches, gp.Files)
+	}
+	if len(p.Text) > target {
+		t.Fatalf("projection %d bytes for a %d target", len(p.Text), target)
+	}
+	mustContain(t, p.Text, "src/app.go (2)\n  foo := needle()\n", "dist/app.min.js (1)", "…[+")
+	// the same through a Claude Bash capture: a reduced replacement, not a size error
+	s := productionStore(t)
+	body := `{"tool_name":"Bash","tool_input":{"command":"rg foo"},"tool_response":{"stdout":` + jsonString(string(raw)) +
+		`,"stderr":"","interrupted":false,"isImage":false}}`
+	res := observe(t, s, FormatClaude, body, CaptureMeta{Client: "claude"})
+	if res.Family != FamilyGrep || res.Shape.Mode != ShapeReplace || len(res.Projection) > PolicyFor("claude").Target {
+		t.Fatalf("claude rg: %s %s %d bytes (%s)", res.Family, res.Shape.Mode, len(res.Projection), res.Shape.Reason)
+	}
+	// grep -h style lines starting with '[' are output, not notices, and are capped
+	var ini bytes.Buffer
+	for i := 0; i < 5000; i++ {
+		fmt.Fprintf(&ini, "[section_%05d]\n", i)
+	}
+	p, _ = reduceWith(t, ini.Bytes(), Selector{Tool: "Bash", Command: "grep -rh '^\\[' ."}, 4<<10)
+	if len(p.Text) > 4<<10 {
+		t.Fatalf("bracketed grep lines: projection %d bytes", len(p.Text))
+	}
+}
+
+// Directory names in brackets (Next.js [slug] routes) are entries: capped like any
+// other, within the target, with memory independent of the listing's size. Only a
+// tool's notice ("[500 entries limit reached...]") is kept as a summary.
+func TestListBracketedNamesAreEntries(t *testing.T) {
+	gen := func(n int) []byte {
+		var b bytes.Buffer
+		for i := 0; i < n; i++ {
+			fmt.Fprintf(&b, "[slug%06d]\n", i)
+		}
+		b.WriteString("\n[500 entries limit reached. Use limit=1000 for more]\n")
+		return b.Bytes()
+	}
+	target := 16 << 10
+	var allocs []uint64
+	for _, n := range []int{3000, 150000} {
+		raw := gen(n)
+		runtime.GC()
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		p, rec := reduceWith(t, raw, Selector{Tool: "Bash", Command: "ls app"}, target)
+		runtime.ReadMemStats(&after)
+		allocs = append(allocs, after.TotalAlloc-before.TotalAlloc)
+		lp := p.Structured.(*ListProjection)
+		if rec.Reducer != "xm-list/1" || lp.Total != n || lp.Shown != maxListEntries || len(p.Text) > target {
+			t.Fatalf("%d bracketed entries: %s total %d shown %d, %d bytes", n, rec.Reducer, lp.Total, lp.Shown, len(p.Text))
+		}
+		mustContain(t, p.Text, "[slug000000]", "[500 entries limit reached. Use limit=1000 for more]")
+	}
+	t.Logf("allocated %d KiB for 3,000 entries, %d KiB for 150,000", allocs[0]>>10, allocs[1]>>10)
+	if !raceEnabled && allocs[1] > allocs[0]+(2<<20) {
+		t.Fatalf("list allocation grows with the input: %d → %d bytes", allocs[0], allocs[1])
+	}
+}
+
+// The closing note of a list/glob projection is carried once, however many
+// sections the original has, so a rebuilt payload is no larger than the projection.
+func TestListNoteIsCarriedOnce(t *testing.T) {
+	s := productionStore(t)
+	var blocks []string
+	for i := 0; i < 50; i++ {
+		blocks = append(blocks, `{"type":"text","text":`+jsonString(string(globOutput(120)))+`}`)
+	}
+	body := `{"tool_name":"mcp__fs__find","tool_input":{"pattern":"**/*.ts"},"tool_response":[` + strings.Join(blocks, ",") + `]}`
+	res := observe(t, s, FormatClaude, body, CaptureMeta{Client: "claude"})
+	if res.Family != FamilyGlob || res.Shape.Mode != ShapeReplace {
+		t.Fatalf("50 glob blocks: %s %s (%s)", res.Family, res.Shape.Mode, res.Shape.Reason)
+	}
+	if n := strings.Count(string(res.Shape.Payload), "more entries not shown"); n != 1 {
+		t.Fatalf("closing note carried %d times", n)
+	}
+	if res.Shape.Chars > PolicyFor("claude").MaxChars || len(res.Shape.Payload) > len(res.Projection)+len(res.Footer)+8<<10 {
+		t.Fatalf("payload %d bytes (%d chars) for a %d-byte projection", len(res.Shape.Payload), res.Shape.Chars, len(res.Projection))
+	}
+}
+
+// A deleted line that reads "--- ..." (an SQL, Lua or Haskell comment) is a
+// deletion inside a counted hunk, not a file header.
+func TestDiffCountsHunkLinesThatLookLikeHeaders(t *testing.T) {
+	var b bytes.Buffer
+	for f := 0; f < 30; f++ {
+		fmt.Fprintf(&b, "diff --git a/db/m%02d.sql b/db/m%02d.sql\nindex 1111111..2222222 100644\n--- a/db/m%02d.sql\n+++ b/db/m%02d.sql\n", f, f, f, f)
+		b.WriteString("@@ -1,21 +1,20 @@\n--- old header comment\n")
+		for i := 0; i < 20; i++ {
+			fmt.Fprintf(&b, "-SELECT %d;\n+SELECT %d + 1;\n", i, i)
+		}
+	}
+	b.WriteString("diff --git a/x.lua b/x.lua\n--- a/x.lua\n+++ b/x.lua\n@@ -1 +1,2 @@\n-x = 1\n+++ counter\n+x = 2\n\\ No newline at end of file\n")
+	p, rec := reduceWith(t, b.Bytes(), Selector{Tool: "Bash", Command: "git diff"}, 16<<10)
+	dp := p.Structured.(*DiffProjection)
+	if rec.Reducer != "xm-diff/1" || dp.Files != 31 || dp.Additions != 602 || dp.Deletions != 631 || dp.Hunks != 31 {
+		t.Fatalf("diff counts: %s %+v", rec.Reducer, dp)
+	}
+	mustContain(t, p.Text, "files=31 +602 -631 hunks=31", "=== db/m00.sql (+20 -21, 1 hunks)", "--- old header comment")
+}
+
+// The lint parsers match the patterns they replace, on every line shape.
+func TestLintParsersMatchTheirPatterns(tt *testing.T) {
+	diagRe := regexp.MustCompile(`^\s*(\S[^:()]*?)(?::(\d+)(?::(\d+))?|\((\d+),(\d+)\)):?\s*(?:-\s*)?(.*)$`)
+	stylishRe := regexp.MustCompile(`^\s+(\d+):(\d+)\s+(error|warning|warn|info)\s+(.*)$`)
+	lines := []string{
+		"src/a.py:12:5: error: bad", "src/a.py:12: warning - x", "a.ts(3,4): error TS2322: y", "  lib/x.go:7:  - msg",
+		"C:\\x\\y.cs(1,2): warning CS1: z", "::12: x", ":12: x", "x:", "x:12", "x:12:", "x:12:3", "x(1,2)", "x(1,)", "x(1,2", "x)1",
+		"path with space.go:3: m", "\tsrc/b.rs:9:1:msg", "at foo (a.js:1:2)", "", "   ", "noColon", "a:b:c", "a:1:b:2: c", "a(1,2):x",
+		"x:1:2:3", "x:-1", "x:1 -", "x:1\t-\tmsg", "\f\rp:1: q", "é/ü.go:4:2: ü", "x:12:5:", "x (1,2): y",
+		"  12:5  error  Unexpected any", "  3:1  warning  foo  rule", "  3:1  warn  x", "  3:1  warnings  x", "  3:1  info\tx",
+		"3:1  error  x", "  3:1 error", "  3:1  error ", "  a:1  error  x", "  3:  error  x", "  3:1error  x",
+	}
+	for _, l := range lines {
+		t := []byte(l)
+		m := diagRe.FindSubmatchIndex(t)
+		path, ln, rest, ok := parseDiag(t)
+		if (m != nil) != ok {
+			tt.Errorf("%q: regexp match %v, parser %v", l, m != nil, ok)
+			continue
+		}
+		if ok {
+			var want []byte
+			switch {
+			case m[4] >= 0 && m[6] >= 0:
+				want = t[m[4]:m[7]]
+			case m[4] >= 0:
+				want = t[m[4]:m[5]]
+			default:
+				want = t[m[8]:m[11]]
+			}
+			if string(path) != string(t[m[2]:m[3]]) || string(ln) != string(want) || string(rest) != string(t[m[12]:m[13]]) {
+				tt.Errorf("%q: parser (%q %q %q), regexp (%q %q %q)", l, path, ln, rest, t[m[2]:m[3]], want, t[m[12]:m[13]])
+			}
+		}
+		sm := stylishRe.FindSubmatchIndex(t)
+		sln, word, sok := parseStylish(t)
+		if (sm != nil) != sok || (sok && (string(sln) != string(t[sm[2]:sm[5]]) || string(word) != string(t[sm[6]:sm[7]]))) {
+			tt.Errorf("%q: stylish regexp %v, parser %v %q %q", l, sm != nil, sok, sln, word)
+		}
+	}
+}
+
+// scaled grows a fixture to about size bytes.
+func scaled(gen func(int) []byte, size int) []byte {
+	k := 64
+	base := len(gen(k))
+	return gen(max(k, k*size/max(base, 1)))
+}
+
+// Every family reducer is O(window) on its own output shape, not only on generic
+// lines: reducing a ~4x larger original allocates about the same (tracked-file
+// tables, rings and line buffers are bounded; lint parses without per-line
+// allocation).
+func TestFamilyReducersUseBoundedMemoryOnRealShapes(t *testing.T) {
+	if raceEnabled && testing.Short() {
+		t.Skip("allocation bound is not meaningful under -race")
+	}
+	jsonDoc := func(n int) []byte {
+		var b bytes.Buffer
+		b.WriteString(`{"status":"failed","items":[`)
+		for i := 0; i < n; i++ {
+			if i > 0 {
+				b.WriteByte(',')
+			}
+			fmt.Fprintf(&b, `{"id":%d,"name":"item-%06d","state":"ok","detail":"nothing to see in item %d"}`, i, i, i)
+		}
+		b.WriteString(`],"total":1}`)
+		return b.Bytes()
+	}
+	for _, fam := range []struct {
+		name   string
+		gen    func(int) []byte
+		sel    Selector
+		prefix string
+	}{
+		{"diff", func(n int) []byte { return diffOutput(n, 6) }, Selector{Tool: "Bash", Command: "git diff"}, "[xmustard diff] xm-diff/1"},
+		{"git log -p", gitLogP, Selector{Tool: "Bash", Command: "git log -p"}, "[xmustard diff] xm-diff/1"},
+		{"grep", func(n int) []byte { return grepOutput(n, 4) }, Selector{Tool: "Bash", Command: "rg -n needle"}, "[xmustard grep] xm-grep/1"},
+		{"lint", func(n int) []byte { return lintOutput(n, 30) }, Selector{Tool: "Bash", Command: "ruff check ."}, "[xmustard lint] xm-lint/1"},
+		{"read", sourceFile, Selector{Tool: "Read", Path: "big.go"}, "[xmustard read] xm-read/1"},
+		{"list", lsOutput, Selector{Tool: "Bash", Command: "ls -la"}, "[xmustard list] xm-list/1"},
+		{"glob", globOutput, Selector{Tool: "Glob"}, "[xmustard glob] xm-glob/1"},
+		{"test (unittest)", func(n int) []byte { return unittestRun(n, 40) }, Selector{Tool: "Bash", Command: "pytest"}, "[xmustard test] xm-test/1"},
+		{"test (cargo)", cargoRun, Selector{Tool: "Bash", Command: "cargo test"}, "[xmustard test] xm-test/1"},
+		{"test (pytest -v)", func(n int) []byte {
+			var b bytes.Buffer
+			for i := 0; i < n; i++ {
+				fmt.Fprintf(&b, "tests/test_mod.py::test_case_%06d PASSED                  [ 50%%]\n", i)
+			}
+			b.WriteString("tests/test_mod.py::test_parse FAILED                  [100%]\n")
+			fmt.Fprintf(&b, "==== 1 failed, %d passed in 9.87s ====\n", n)
+			return b.Bytes()
+		}, Selector{Tool: "Bash", Command: "pytest -v"}, "[xmustard test] xm-test/1"},
+		{"structured", jsonDoc, Selector{Tool: "mcp__ci__items"}, `{"status":"failed"`},
+	} {
+		var allocs [2]uint64
+		for i, size := range []int{4 << 20, 16 << 20} {
+			raw := scaled(fam.gen, size)
+			red, argv0 := DefaultRegistry().Select(fam.sel)
+			h := &reduceHook{reducer: red, argv0: argv0, in: Input{Sel: fam.sel, Target: 16 << 10}}
+			runtime.GC()
+			var before, after runtime.MemStats
+			runtime.ReadMemStats(&before)
+			if _, _, err := Reduce(withReduceHook(context.Background(), h), bytes.NewReader(raw), int64(len(raw)), "text/plain", 64<<10, 1<<20); err != nil {
+				t.Fatalf("%s: %v", fam.name, err)
+			}
+			runtime.ReadMemStats(&after)
+			allocs[i] = after.TotalAlloc - before.TotalAlloc
+			if !strings.HasPrefix(h.out.Text, fam.prefix) {
+				t.Fatalf("%s: the fixture no longer exercises the family engine: %.80q", fam.name, h.out.Text)
+			}
+		}
+		t.Logf("%s: ~4 MiB → %d KiB allocated, ~16 MiB → %d KiB", fam.name, allocs[0]>>10, allocs[1]>>10)
+		if allocs[1] > allocs[0]*2+(4<<20) {
+			t.Errorf("%s: allocation grows with the input: %d → %d bytes", fam.name, allocs[0], allocs[1])
+		}
+	}
+}
+
+// xmReduceFixtures are the originals the xm-reduce/1 goldens pin (generated on the
+// baseline b4f7b49, before tool-family reducers existed).
+func xmReduceFixtures() map[string][]byte {
+	out := map[string][]byte{}
+	out["json_results"] = manyResults(300, 137)
+	nested := map[string]any{"status": "degraded", "exit_code": 3}
+	var items []map[string]any
+	for i := 0; i < 400; i++ {
+		items = append(items, map[string]any{"id": i, "name": fmt.Sprintf("n-%04d", i), "ok": i != 211,
+			"log": strings.Repeat(fmt.Sprintf("entry %d fine; ", i), 6)})
+	}
+	nested["items"] = items
+	nested["summary"] = map[string]any{"passed": 399, "failed": 1, "note": strings.Repeat("summary text ", 200)}
+	out["json_nested"], _ = json.Marshal(nested)
+	var log bytes.Buffer
+	for i := 0; i < 4000; i++ {
+		fmt.Fprintf(&log, "2026-09-25T12:%02d:%02d info worker %d processed batch %d\n", i/60%60, i%60, i%8, i)
+		if i == 2500 {
+			log.WriteString("panic: runtime error: invalid memory address or nil pointer dereference\n\tgoroutine 7 [running]:\n")
+		}
+	}
+	out["text_log"] = log.Bytes()
+	out["small"] = []byte(`{"ok":true,"n":1}`)
+	return out
+}
+
+// xmReduceGolden renders one fixture through Reduce without a registry hook.
+func xmReduceGolden(raw []byte, contentType string) string {
+	proj, rec, err := Reduce(context.Background(), bytes.NewReader(raw), int64(len(raw)), contentType, 8<<10, 1<<20)
+	if err != nil {
+		return "error: " + err.Error()
+	}
+	meta, _ := json.Marshal(rec)
+	return string(meta) + "\n" + proj
+}
+
+// xm-reduce/1 is pinned byte for byte to projections generated on the baseline
+// (b4f7b49, before the registry existed): the nine tools' projections, and every
+// capture that selects no family reducer, are unchanged by this workstream.
+func TestXmReduceProjectionsMatchBaseline(t *testing.T) {
+	for name, raw := range xmReduceFixtures() {
+		ct := "text/plain"
+		if !strings.HasPrefix(name, "text") {
+			ct = "application/json"
+		}
+		want, err := os.ReadFile(filepath.Join("testdata", "xm_reduce_1_"+name+".golden"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := xmReduceGolden(raw, ct); got != string(want) {
+			t.Errorf("%s: xm-reduce/1 output differs from the baseline golden:\n--- got ---\n%.2000s", name, got)
+		}
+	}
 }

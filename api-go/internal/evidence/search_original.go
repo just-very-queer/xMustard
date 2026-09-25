@@ -37,14 +37,16 @@ var ErrInvalidSearch = errors.New("invalid evidence search")
 
 // SearchRequest asks for matches (or a line range) inside one original.
 type SearchRequest struct {
-	ReadRequest        // workspace, handle, principal, identity; Offset resumes a scan
-	StartLine   int    // line number at Offset (1 when Offset is 0)
-	Pattern     string // RE2 regular expression
-	Query       string // literal, case-insensitive (alternative to Pattern)
-	FromLine    int    // inclusive line range; 0 = open
-	ToLine      int
-	MaxMatches  int // default 40, at most 200
-	Context     int // lines of context around a match, at most 5
+	ReadRequest // workspace, handle, principal, identity; Offset resumes a scan
+	// StartLine is the line number at Offset. At offset 0 it defaults to the
+	// original's first line number (1, or the first line of a read range).
+	StartLine  int
+	Pattern    string // RE2 regular expression
+	Query      string // literal, case-insensitive (alternative to Pattern)
+	FromLine   int    // inclusive line range; 0 = open
+	ToLine     int
+	MaxMatches int // default 40, at most 200
+	Context    int // lines of context around a match, at most 5
 }
 
 // SearchLine is one returned line.
@@ -66,6 +68,7 @@ type SearchResult struct {
 	Query           string       `json:"query,omitempty"`
 	FromLine        int          `json:"from_line,omitempty"`
 	ToLine          int          `json:"to_line,omitempty"`
+	FirstLine       int          `json:"first_line"` // line number of the original's first line
 	Lines           []SearchLine `json:"lines"`
 	Matches         int          `json:"matches"`
 	MatchCapReached bool         `json:"match_cap_reached"`
@@ -111,10 +114,21 @@ func (s *Store) Search(ctx context.Context, req SearchRequest) (*SearchResult, e
 		return nil, err
 	}
 	defer f.Close()
-	res, err := searchStream(ctx, f, obs.RawBytes, req.Offset, max(req.StartLine, 1), q)
+	// a read of a range is numbered from its first line, like its projection's
+	// "lines A-B omitted" markers
+	first := 1
+	if fam := obs.Projection.Family; fam != nil && fam.FirstLine > 1 {
+		first = fam.FirstLine
+	}
+	start := req.StartLine
+	if start < 1 {
+		start = first
+	}
+	res, err := searchStream(ctx, f, obs.RawBytes, req.Offset, start, q)
 	if err != nil {
 		return nil, err
 	}
+	res.FirstLine = first
 	res.Handle, res.Tool, res.CallID, res.ContentType = req.Handle, obs.Tool, obs.CallID, obs.ContentType
 	res.Pattern, res.Query, res.FromLine, res.ToLine = req.Pattern, req.Query, req.FromLine, req.ToLine
 	res.RawSHA256, res.CapturedKey, res.ExpiresAt = obs.RawSHA256, obs.CapturedKey, obs.ExpiresAt
@@ -225,8 +239,13 @@ func searchStream(ctx context.Context, r io.ReaderAt, n, offset int64, startLine
 		capped := res.MatchCapReached || res.ByteCapReached
 		switch {
 		case !inRange:
+		case capped && after > 0 && q.re != nil && q.re.Match(bytes.TrimSuffix(b, []byte("\n"))):
+			// a further match inside the owed context: stop before it, so resuming at
+			// next_offset counts and flags it
+			stopped = true
+			return
 		case capped && after > 0:
-			// owed context after the last match: never a further match
+			// owed context after the last match (itself not a match)
 			text, cut := shown(b)
 			emit(SearchLine{Line: line, Offset: start, Text: text, Truncated: cut})
 			after--

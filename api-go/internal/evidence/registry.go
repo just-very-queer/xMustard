@@ -3,6 +3,7 @@ package evidence
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"path"
@@ -62,6 +63,11 @@ type Section struct {
 	// Array marks a JSON array of strings stored one element per line (Claude
 	// Glob/Grep filenames); its projection keeps that form.
 	Array bool `json:"array,omitempty"`
+	// Merged counts the output strings appended to the overflow section.
+	Merged int `json:"merged,omitempty"`
+	// Status marks the decoder's status line (hookbody.go StatusSection). Family
+	// reducers never see it: every projection ends with it verbatim.
+	Status bool `json:"status,omitempty"`
 }
 
 // Input is one original as a family reducer sees it.
@@ -105,14 +111,23 @@ type Facts struct {
 // FamilyRecord is persisted with the projection record (Record.Family): which family
 // reducer produced it, for which client and output shape, and what it extracted.
 type FamilyRecord struct {
-	Family   Family    `json:"family"`
-	Reducer  string    `json:"reducer"` // id/version, e.g. xm-test/1
+	Family Family `json:"family"`
+	// Reducer is the id/version of the rule set that produced the projection text
+	// (e.g. xm-test/1). When the selected family reducer delegated to other rules
+	// (a diff without file headers uses xm-git rules), Selected names the family
+	// reducer and Reducer the rules actually applied.
+	Reducer  string    `json:"reducer"`
+	Selected string    `json:"selected_reducer,omitempty"`
 	Client   string    `json:"client,omitempty"`
 	Tool     string    `json:"tool,omitempty"`
 	Argv0    string    `json:"argv0,omitempty"`
 	Shape    string    `json:"output_shape,omitempty"`
 	Sections []Section `json:"sections,omitempty"`
 	Facts    Facts     `json:"facts"`
+	// FirstLine is the line number of the original's first line when it is not 1 (a
+	// read of a range): the projection numbers lines from it, and search-in-original
+	// applies it, so a "lines A-B omitted" marker is recovered with lines=A-B.
+	FirstLine int `json:"first_line,omitempty"`
 	// Capture is the capture metadata of a universal capture (capture_meta.go).
 	Capture *CaptureMeta `json:"capture,omitempty"`
 }
@@ -120,24 +135,23 @@ type FamilyRecord struct {
 // CaptureMeta is the metadata of a universal capture (PAR-CTX-01, capture_meta.go),
 // persisted with the projection record.
 type CaptureMeta struct {
-	Client           string    `json:"client"`
-	Format           string    `json:"format"`
-	Tool             string    `json:"tool"`
-	ToolVersion      string    `json:"tool_version,omitempty"`
-	CallID           string    `json:"call_id,omitempty"`
-	SessionID        string    `json:"session_id,omitempty"`
-	AgentID          string    `json:"agent_id,omitempty"`
-	Principal        string    `json:"principal,omitempty"`
-	ArgsDigest       string    `json:"args_digest,omitempty"`
-	IsError          bool      `json:"is_error"`
-	ExitCode         *int      `json:"exit_code,omitempty"`
-	ContentType      string    `json:"content_type"`
-	OutputShape      string    `json:"output_shape"`
-	HookEvent        string    `json:"hook_event,omitempty"`
-	BodySHA256       string    `json:"body_sha256,omitempty"`
-	BodyBytes        int64     `json:"body_bytes,omitempty"`
-	CapturedIdentity string    `json:"captured_identity"`
-	Sections         []Section `json:"sections,omitempty"`
+	Client           string `json:"client"`
+	Format           string `json:"format"`
+	Tool             string `json:"tool"`
+	ToolVersion      string `json:"tool_version,omitempty"`
+	CallID           string `json:"call_id,omitempty"`
+	SessionID        string `json:"session_id,omitempty"`
+	AgentID          string `json:"agent_id,omitempty"`
+	Principal        string `json:"principal,omitempty"`
+	ArgsDigest       string `json:"args_digest,omitempty"`
+	IsError          bool   `json:"is_error"`
+	ExitCode         *int   `json:"exit_code,omitempty"`
+	ContentType      string `json:"content_type"`
+	OutputShape      string `json:"output_shape"`
+	HookEvent        string `json:"hook_event,omitempty"`
+	BodySHA256       string `json:"body_sha256,omitempty"`
+	BodyBytes        int64  `json:"body_bytes,omitempty"`
+	CapturedIdentity string `json:"captured_identity"`
 }
 
 // Projection is a family reducer's result.
@@ -247,11 +261,13 @@ func SelectFamily(sel Selector) (Family, string) {
 		return sel.Family, ""
 	}
 	tool := strings.ToLower(strings.TrimSpace(sel.Tool))
-	// namespaced MCP tools: mcp__server__tool, server.tool, server/tool
+	// namespaced MCP tools (mcp__server__tool, server.tool, server/tool, MCP:tool)
+	// are selected by their last segment as a hint only: the capture pipeline sends
+	// their JSON output to the structured family (reduceHook.structured)
 	if i := strings.LastIndex(tool, "__"); i >= 0 {
 		tool = tool[i+2:]
 	}
-	if i := strings.LastIndexAny(tool, "./"); i >= 0 {
+	if i := strings.LastIndexAny(tool, ".:/"); i >= 0 {
 		tool = tool[i+1:]
 	}
 	if f, ok := toolFamilies[tool]; ok && (sel.Command == "" || !shellTools[tool]) {
@@ -264,6 +280,14 @@ func SelectFamily(sel Selector) (Family, string) {
 		return FamilyShell, ""
 	}
 	return FamilyStructured, ""
+}
+
+// NamespacedTool reports a tool name that carries a server namespace (another MCP
+// server's tool): mcp__server__tool, server.tool, server/tool or MCP:tool. Native
+// client tools (Bash, Read, grep, exec_command) never do.
+func NamespacedTool(tool string) bool {
+	t := strings.ToLower(strings.TrimSpace(tool))
+	return strings.Contains(t, "__") || strings.ContainsAny(t, "./") || strings.HasPrefix(t, "mcp:") || strings.HasPrefix(t, "mcp_")
 }
 
 // commandFamily classifies a shell command line. Every simple command of the line
@@ -539,7 +563,12 @@ type reduceHook struct {
 	in      Input // Sel, Sections and the client Target; R, N, ContentType, Max come from Reduce
 	shape   string
 	meta    *CaptureMeta // persisted with the projection record
-	out     *Projection
+	// structured, when set, replaces a name-selected reducer for JSON output: the tool
+	// is another server's (NamespacedTool), whose name ("search", "list", "read")
+	// says nothing reliable about its output format. run records the switch in
+	// reducer.
+	structured Reducer
+	out        *Projection
 }
 
 func withReduceHook(ctx context.Context, h *reduceHook) context.Context {
@@ -566,11 +595,22 @@ func (h *reduceHook) run(ctx context.Context, r io.ReaderAt, n int64, contentTyp
 	if len(in.Sections) == 0 {
 		in.Sections = []Section{{Name: "output", Start: 0, End: n}}
 	}
+	allSections := in.Sections
+	if h.structured != nil && h.reducer.Family() != FamilyStructured && n > int64(in.Target) && anyJSONSection(r, in.Sections) {
+		h.reducer = h.structured
+	}
 	name := reducerName(h.reducer)
 	rec := Record{Reducer: name, RawBytes: n}
-	famRec := func(f Facts) *FamilyRecord {
-		return &FamilyRecord{Family: h.reducer.Family(), Reducer: name, Client: in.Sel.Client, Tool: in.Sel.Tool,
-			Argv0: h.argv0, Shape: h.shape, Sections: in.Sections, Facts: f, Capture: h.meta}
+	famRec := func(f Facts, used string) *FamilyRecord {
+		fr := &FamilyRecord{Family: h.reducer.Family(), Reducer: name, Client: in.Sel.Client, Tool: in.Sel.Tool,
+			Argv0: h.argv0, Shape: h.shape, Sections: allSections, Facts: f, Capture: h.meta}
+		if used != "" && used != name {
+			fr.Reducer, fr.Selected = used, name
+		}
+		if h.reducer.Family() == FamilyRead && in.Sel.StartLine > 1 {
+			fr.FirstLine = in.Sel.StartLine
+		}
+		return fr
 	}
 	if n <= int64(in.Target) {
 		buf := make([]byte, n)
@@ -587,7 +627,7 @@ func (h *reduceHook) run(ctx context.Context, r io.ReaderAt, n int64, contentTyp
 		p.Facts.ExitCode = in.Sel.ExitCode
 		p.Facts.Lines = countLines(buf)
 		rec.Mode, rec.ProjectedBytes = "passthrough", len(buf)
-		rec.Family = famRec(p.Facts)
+		rec.Family = famRec(p.Facts, "")
 		p.Record = rec
 		h.out = p
 		return p.Text, rec, nil
@@ -599,13 +639,30 @@ func (h *reduceHook) run(ctx context.Context, r io.ReaderAt, n int64, contentTyp
 		if err != nil {
 			return "", grec, err
 		}
-		grec.Family = famRec(Facts{ExitCode: in.Sel.ExitCode})
+		grec.Family = famRec(Facts{ExitCode: in.Sel.ExitCode}, grec.Reducer)
 		h.out = &Projection{Text: text, Parts: map[string]string{}, Record: grec}
 		return text, grec, nil
+	}
+	// the decoder's status line is not the tool's output text: the family reducer
+	// never sees it, and every projection ends with it verbatim
+	status, secs, err := splitStatus(r, in.Sections)
+	if err != nil {
+		return "", rec, err
+	}
+	in.Sections = secs
+	if in.Target -= len(status); in.Target < 1<<10 {
+		in.Target = 1 << 10
 	}
 	p, err := h.reducer.Reduce(ctx, &in)
 	if err != nil {
 		return "", rec, err
+	}
+	if status != "" {
+		if p.Text != "" && !strings.HasSuffix(p.Text, "\n") {
+			p.Text += "\n"
+		}
+		p.Text += status
+		p.Parts[StatusSection] = status
 	}
 	if len(p.Text) > max {
 		return "", rec, fmt.Errorf("%w: %s projection %d bytes exceeds %d", ErrUnsupported, name, len(p.Text), max)
@@ -613,13 +670,52 @@ func (h *reduceHook) run(ctx context.Context, r io.ReaderAt, n int64, contentTyp
 	if !utf8.ValidString(p.Text) {
 		return "", rec, fmt.Errorf("%w: %s produced invalid UTF-8", ErrCorrupt, name)
 	}
-	p.Record.Reducer, p.Record.RawBytes, p.Record.ProjectedBytes = name, n, len(p.Text)
+	// the record names the rules that produced the text (a family reducer that
+	// delegated reports the delegate's id/version)
+	used := p.Record.Reducer
+	if used == "" {
+		used = name
+	}
+	p.Record.Reducer, p.Record.RawBytes, p.Record.ProjectedBytes = used, n, len(p.Text)
 	if p.Record.Mode == "" {
 		p.Record.Mode = "text"
 	}
-	p.Record.Family = famRec(p.Facts)
+	p.Record.Family = famRec(p.Facts, used)
 	h.out = p
 	return p.Text, p.Record, nil
+}
+
+// splitStatus separates the decoder's status section from the output sections and
+// returns its line (at most maxStatusBytes plus its label).
+func splitStatus(r io.ReaderAt, secs []Section) (string, []Section, error) {
+	var status string
+	out := secs[:0:0]
+	for _, s := range secs {
+		if !s.Status {
+			out = append(out, s)
+			continue
+		}
+		size := s.End - s.Start
+		if size < 0 || size > maxStatusBytes+64 {
+			return "", nil, ErrCorrupt
+		}
+		buf := make([]byte, size)
+		if m, _ := r.ReadAt(buf, s.Start); int64(m) != size {
+			return "", nil, ErrCorrupt
+		}
+		status = strings.TrimLeft(string(validUTF8(buf)), "\n")
+	}
+	return status, out, nil
+}
+
+// anyJSONSection reports an output section that sniffs as a JSON document.
+func anyJSONSection(r io.ReaderAt, secs []Section) bool {
+	for _, s := range secs {
+		if n := s.End - s.Start; n > 0 && !s.Status && classify(io.NewSectionReader(r, s.Start, n), n, "") == "json" {
+			return true
+		}
+	}
+	return false
 }
 
 func countLines(b []byte) int {
@@ -638,7 +734,7 @@ func countLines(b []byte) int {
 var statusKeys = map[string]bool{
 	"status": true, "state": true, "ok": true, "success": true, "succeeded": true, "error": true,
 	"is_error": true, "iserror": true, "exit_code": true, "exitcode": true, "exit_status": true,
-	"returncode": true, "return_code": true, "code": true, "conclusion": true, "outcome": true,
+	"returncode": true, "return_code": true, "exitstatus": true, "code": true, "conclusion": true, "outcome": true,
 	"passed": true, "failed": true, "interrupted": true, "timed_out": true, "timedout": true,
 	"cancelled": true, "canceled": true, "truncated": true, "result": true, "status_code": true,
 	"statuscode": true, "severity": true, "level": true,
@@ -648,7 +744,14 @@ func isStatusKey(raw []byte) bool {
 	if len(raw) > 24 {
 		return false
 	}
-	return statusKeys[strings.ToLower(string(raw))]
+	var lower [24]byte // ASCII-lowered on the stack: the lookup allocates nothing
+	for i, c := range raw {
+		if c >= 'A' && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		lower[i] = c
+	}
+	return statusKeys[string(lower[:len(raw)])]
 }
 
 // structuredReducer bounds JSON payloads (MCP results of other servers, JSON tool
@@ -662,38 +765,37 @@ func (structuredReducer) Version() int   { return 1 }
 
 func (structuredReducer) Reduce(ctx context.Context, in *Input) (*Projection, error) {
 	secs := nonEmpty(in.Sections)
-	anyJSON := false
-	for _, sec := range secs {
-		n := sec.End - sec.Start
-		anyJSON = anyJSON || classify(io.NewSectionReader(in.R, sec.Start, n), n, "") == "json"
-	}
-	if !anyJSON {
+	if !anyJSONSection(in.R, secs) {
 		return reduceLineSections(ctx, in, shellRules) // plain text blocks: one header
 	}
-	shares := sectionShares(secs, in.Target-256)
+	shares := sectionShares(secs, in.Target-256-labelCost(secs))
 	var out bytes.Buffer
 	parts := map[string]string{}
 	var oms []Omission
 	mode := "json"
+	anyText := false
 	for i, sec := range secs {
 		n := sec.End - sec.Start
 		sr := io.NewSectionReader(in.R, sec.Start, n)
-		var text string
-		switch {
-		case classify(sr, n, "") == "json":
-			t, rec, err := reduceGeneric(ctx, sr, n, "application/json", shares[i], in.Max-out.Len(), true)
-			if err != nil {
+		text, isJSON := "", false
+		if classify(sr, n, "") == "json" {
+			// a section that only looks like JSON ("[INFO] ...") is reduced as text
+			t, rec, err := reduceGeneric(ctx, sr, n, "", shares[i], in.Max-out.Len(), true)
+			switch {
+			case err != nil && !errors.Is(err, ErrUnsupported):
 				return nil, err
-			}
-			for _, o := range rec.Omissions {
-				if o.Start >= 0 {
-					o.Start += sec.Start
+			case err == nil && (rec.Mode == "json" || rec.Mode == "passthrough"):
+				isJSON, text = true, t
+				for _, o := range rec.Omissions {
+					if o.Start >= 0 {
+						o.Start += sec.Start
+					}
+					o.End += sec.Start
+					oms = append(oms, o)
 				}
-				o.End += sec.Start
-				oms = append(oms, o)
 			}
-			text = t
-		default:
+		}
+		if !isJSON {
 			sub := *in
 			sub.Sections, sub.Target = []Section{sec}, shares[i]
 			p, err := reduceLineSections(ctx, &sub, shellRules)
@@ -701,7 +803,7 @@ func (structuredReducer) Reduce(ctx context.Context, in *Input) (*Projection, er
 				return nil, err
 			}
 			oms = append(oms, p.Record.Omissions...)
-			text, mode = p.Parts[sec.Name], "text"
+			text, mode, anyText = p.Parts[sec.Name], "text", true
 		}
 		parts[sec.Name] = text
 		if len(secs) > 1 {
@@ -718,6 +820,10 @@ func (structuredReducer) Reduce(ctx context.Context, in *Input) (*Projection, er
 		}
 	}
 	facts := Facts{ExitCode: in.Sel.ExitCode}
+	used := "xm-structured/1"
+	if anyText {
+		used += "+" + shellRules.id + "/" + strconv.Itoa(shellRules.version) // text blocks use the shell rules
+	}
 	return &Projection{Text: out.String(), Parts: parts, Facts: facts,
-		Record: Record{Mode: mode, Reduced: true, Omissions: capOmissions(oms)}}, nil
+		Record: Record{Reducer: used, Mode: mode, Reduced: true, Omissions: capOmissions(oms)}}, nil
 }

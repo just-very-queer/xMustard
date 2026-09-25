@@ -144,6 +144,9 @@ type ShapeInput struct {
 	Reduced  bool        // something was omitted
 	Footer   string      // "[xmustard evidence] {...}" recovery line
 	RawBytes int64       // size of the captured original
+	// IsError is the capture's error status (a failing hook body, is_error, a non-zero
+	// exit code, a failing status member): every isError field of a payload says it.
+	IsError bool
 }
 
 // ShapeOutput builds and validates the client payload for one reduced capture.
@@ -199,11 +202,16 @@ func capChars(s string, n int) string {
 // buildPayload renders the client payload.
 func buildPayload(pol ClientPolicy, in ShapeInput) (json.RawMessage, error) {
 	text := in.Proj.Text + "\n" + in.Footer
+	isError := in.IsError || (in.Body != nil && in.Body.IsError)
+	if pol.Client != "claude" && in.Body != nil && in.Body.StatusDropped {
+		// the text carries the status line; a status member it could not hold would be lost
+		return nil, fmt.Errorf("%w: the tool response has status members the projection cannot carry", errUnshapable)
+	}
 	switch pol.Client {
 	case "codex":
 		return json.Marshal(map[string]any{"decision": "block", "reason": text})
 	case "cursor", "mcp", "letta", "http":
-		return json.Marshal(map[string]any{"content": []map[string]any{{"type": "text", "text": text}}, "isError": in.Body != nil && in.Body.IsError})
+		return json.Marshal(map[string]any{"content": []map[string]any{{"type": "text", "text": text}}, "isError": isError})
 	case "pi":
 		if in.Body != nil && in.Body.Dropped > 0 {
 			return nil, fmt.Errorf("%w: %d image blocks cannot be carried by a text projection", errUnshapable, in.Body.Dropped)
@@ -211,7 +219,7 @@ func buildPayload(pol ClientPolicy, in ShapeInput) (json.RawMessage, error) {
 		if in.Body != nil && in.Body.Incomplete {
 			return nil, fmt.Errorf("%w: details exceed the skeleton bounds", errUnshapable)
 		}
-		out := map[string]any{"content": []map[string]any{{"type": "text", "text": text}}, "isError": in.Body != nil && in.Body.IsError}
+		out := map[string]any{"content": []map[string]any{{"type": "text", "text": text}}, "isError": isError}
 		if in.Body != nil && in.Body.Response != nil {
 			for _, k := range in.Body.Response.Kids {
 				if k.Key == "details" {
@@ -284,6 +292,9 @@ func claudeFixups(in ShapeInput) map[string]func(parts map[string]string) json.R
 func primarySection(b *HookBody) int {
 	best := -1
 	for i, s := range b.Sections {
+		if s.Status {
+			continue
+		}
 		if best < 0 || s.End-s.Start > b.Sections[best].End-b.Sections[best].Start {
 			best = i
 		}

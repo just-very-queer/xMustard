@@ -207,3 +207,38 @@ func TestSearchFailsClosed(t *testing.T) {
 		t.Fatalf("revoked: %v", err)
 	}
 }
+
+// A match inside the context still owed after the match cap is not swallowed as
+// context: the page stops before it, so paging through counts every match.
+func TestSearchResumeCountsAdjacentMatches(t *testing.T) {
+	raw := numberedLines(20, func(i int) bool { return i == 10 || i == 11 || i == 12 || i == 15 })
+	q, err := compileSearch(SearchRequest{Pattern: `ERROR`, MaxMatches: 1, Context: 2}, 64<<10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	total, pages := 0, 0
+	var flagged []int
+	offset, line := int64(0), 1
+	for {
+		res, err := searchStream(context.Background(), bytes.NewReader(raw), int64(len(raw)), offset, line, q)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pages++
+		total += res.Matches
+		for _, l := range res.Lines {
+			if l.Match {
+				flagged = append(flagged, l.Line)
+			} else if strings.Contains(l.Text, "ERROR") {
+				t.Fatalf("page %d shows matching line %d as context", pages, l.Line)
+			}
+		}
+		if res.EOF || pages > 10 {
+			break
+		}
+		offset, line = res.NextOffset, res.NextLine
+	}
+	if total != 4 || fmt.Sprint(flagged) != "[10 11 12 15]" {
+		t.Fatalf("paged %d matches %v in %d pages, want 4 [10 11 12 15]", total, flagged, pages)
+	}
+}
