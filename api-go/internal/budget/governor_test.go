@@ -195,8 +195,8 @@ func TestWatchdogRefusesHeavyWorkNearSoftCeiling(t *testing.T) {
 		t.Fatalf("tree already over the ceiling must refuse even zero declared bytes: %v", err)
 	}
 	f.tree.rss.Store(10 << 20)
-	if _, err := f.g.AcquireHeavy(context.Background(), "huge", 1<<62); !errors.Is(err, ErrOverloaded) {
-		t.Fatalf("an overflowing declaration must be refused: %v", err)
+	if _, err := f.g.AcquireHeavy(context.Background(), "huge", 1<<62); !errors.Is(err, ErrTooLarge) || errors.Is(err, ErrOverloaded) {
+		t.Fatalf("an overflowing declaration can never be admitted: want ErrTooLarge, got %v", err)
 	}
 	r, err = f.g.AcquireHeavy(context.Background(), "index_build", 1<<20)
 	if err != nil {
@@ -204,7 +204,7 @@ func TestWatchdogRefusesHeavyWorkNearSoftCeiling(t *testing.T) {
 	}
 	r()
 	s := f.g.Snapshot()
-	if s.HeavySlot.RefusedRSS != 4 || s.HeavySlot.Acquired != 2 {
+	if s.HeavySlot.RefusedRSS != 3 || s.HeavySlot.RefusedTooLarge != 1 || s.HeavySlot.Acquired != 2 {
 		t.Fatalf("stats: %+v", s.HeavySlot)
 	}
 	if s.Watchdog.PeakRSSBytes != 101<<20 || s.Watchdog.PeakFootprintBytes != 80<<20 || s.Watchdog.OverSoftCeilingSamples != 1 {
@@ -212,7 +212,44 @@ func TestWatchdogRefusesHeavyWorkNearSoftCeiling(t *testing.T) {
 	}
 }
 
-// Without a tree sampler the admission projects from the steady reservations.
+// A declaration larger than the soft ceiling less the steady reservations can never be
+// admitted: it is refused at once as ErrTooLarge (a permanent answer), without waiting
+// for a busy slot and without taking it. A declaration that fits only once memory falls
+// stays a retryable ErrOverloaded.
+func TestHeavyDeclarationThatCanNeverFitIsPermanent(t *testing.T) {
+	f := newGov(t, GovernorConfig{SoftCeilingBytes: 100 << 20, HeavyWait: 10 * time.Second})
+	f.g.Reserve(Component{Name: "daemon", SteadyBytes: 30 << 20, PeakBytes: 40 << 20})
+	release, err := f.g.AcquireHeavy(context.Background(), "index_build", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	_, err = f.g.AcquireHeavy(context.Background(), "full_rebuild", 71<<20)
+	if !errors.Is(err, ErrTooLarge) || errors.Is(err, ErrOverloaded) || !strings.Contains(err.Error(), "full_rebuild") {
+		t.Fatalf("71 MiB over 100 - 30 MiB steady: want ErrTooLarge, got %v", err)
+	}
+	if d := time.Since(start); d > time.Second {
+		t.Fatalf("a permanent refusal must not wait for the busy slot (%s)", d)
+	}
+	release()
+	f.tree.rss.Store(60 << 20)
+	if _, err := f.g.AcquireHeavy(context.Background(), "rebuild", 70<<20); !errors.Is(err, ErrOverloaded) || errors.Is(err, ErrTooLarge) {
+		t.Fatalf("70 MiB fits once the tree falls to its steady line: want ErrOverloaded now, got %v", err)
+	}
+	f.tree.rss.Store(30 << 20)
+	r, err := f.g.AcquireHeavy(context.Background(), "rebuild", 70<<20)
+	if err != nil {
+		t.Fatalf("30 + 70 MiB at the 100 MiB ceiling: %v", err)
+	}
+	r()
+	st := f.g.Snapshot().HeavySlot
+	if st.RefusedTooLarge != 1 || st.RefusedBusy != 0 || st.MaxAdmissible != 70<<20 {
+		t.Fatalf("stats: %+v", st)
+	}
+}
+
+// Without a tree sampler the admission projects from the steady reservations, so a
+// declaration past them can never be admitted and is refused permanently.
 func TestWatchdogWithoutSamplerProjectsFromReservations(t *testing.T) {
 	f := newGov(t, GovernorConfig{SoftCeilingBytes: 100 << 20})
 	f.tree.fail.Store(true)
@@ -223,8 +260,8 @@ func TestWatchdogWithoutSamplerProjectsFromReservations(t *testing.T) {
 		t.Fatalf("60 reserved + 30 declared under 100: %v", err)
 	}
 	r()
-	if _, err := f.g.AcquireHeavy(context.Background(), "a", 50<<20); !errors.Is(err, ErrOverloaded) || !strings.Contains(err.Error(), "reserved steady") {
-		t.Fatalf("60 reserved + 50 declared over 100: want refusal from reservations, got %v", err)
+	if _, err := f.g.AcquireHeavy(context.Background(), "a", 50<<20); !errors.Is(err, ErrTooLarge) || !strings.Contains(err.Error(), "steady reservations") {
+		t.Fatalf("60 reserved + 50 declared over 100: want a permanent refusal from reservations, got %v", err)
 	}
 	if last := f.g.Snapshot().Watchdog.Last; last.Supported || last.Error == "" {
 		t.Fatalf("an unsupported sampler must show in the snapshot: %+v", last)

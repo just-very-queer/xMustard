@@ -100,7 +100,7 @@ type envelope struct {
 func evidenceResult(ctx context.Context, body, ws string) (map[string]any, *rpcError) {
 	// decoding copies the projection once and encoding the reply copies it again
 	if err := reserveReply(ctx, 2*len(body)); err != nil {
-		return nil, overloadError(err)
+		return replyRefused(err)
 	}
 	var env envelope
 	if err := json.Unmarshal([]byte(body), &env); err != nil {

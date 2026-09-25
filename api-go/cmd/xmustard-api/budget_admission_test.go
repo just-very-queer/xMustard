@@ -120,3 +120,78 @@ func (r *recorder) WriteHeader(code int) {
 		r.code = code
 	}
 }
+
+// Audit Go #5 (request decode): every body, including one under the 1 MiB in-flight
+// threshold, is charged against the pool before a handler reads it. A 300 KiB body
+// fits a 512 KiB pool on its own, so with 300 KiB of it held by another request it is
+// refused with the retryable 503 + Retry-After (not the permanent 413), and admitted
+// once that request ends.
+func TestSubThresholdBodyIsChargedAgainstThePool(t *testing.T) {
+	prev := budget.TransientBytes
+	pool := budget.NewByteBudget(512 << 10)
+	budget.TransientBytes = pool
+	defer func() { budget.TransientBytes = prev }()
+	ran := false
+	h := bodyLimitMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ran = true
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.WriteHeader(http.StatusOK)
+	}))
+	other := budget.NewScope(pool)
+	if err := other.Acquire(300 << 10); err != nil {
+		t.Fatal(err)
+	}
+	body := strings.Repeat("a", 300<<10)
+	for _, declared := range []bool{true, false} {
+		ran = false
+		req, _ := http.NewRequest("POST", "/api/workspaces/ws/context", strings.NewReader(body))
+		if !declared {
+			req.ContentLength = -1
+		}
+		rec := newRecorder()
+		h.ServeHTTP(rec, req)
+		if ran || rec.code != http.StatusServiceUnavailable || rec.header.Get("Retry-After") == "" {
+			t.Fatalf("300 KiB body with 212 KiB of the pool free (declared=%v): want 503 + Retry-After, got %d ran=%v", declared, rec.code, ran)
+		}
+	}
+	if pool.InUse() != 300<<10 {
+		t.Fatalf("a refused body must reserve nothing: %d in use", pool.InUse())
+	}
+	other.Close()
+	req, _ := http.NewRequest("POST", "/api/workspaces/ws/context", strings.NewReader(body))
+	rec := newRecorder()
+	h.ServeHTTP(rec, req)
+	if !ran || rec.code != http.StatusOK || pool.InUse() != 0 {
+		t.Fatalf("the same body on an idle pool: %d ran=%v in use %d", rec.code, ran, pool.InUse())
+	}
+}
+
+// Audit Go #5 (Go→Rust capture), retryable path: core output that fits an idle pool is
+// refused with 503 + Retry-After while other requests hold the pool, and served once
+// they finish; no reservation outlives its request.
+func TestRustCaptureRefusedWhileThePoolIsBusy(t *testing.T) {
+	url, pool := inProcessAPI(t, `printf '{"hits":[],"pad":"'; head -c 4194304 /dev/zero | tr '\0' 'a'; printf '"}'`)
+	get := func() (int, string, []byte) {
+		resp, err := testClient.Get(url + "/api/workspaces/ws/search?q=x")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, resp.Header.Get("Retry-After"), b
+	}
+	other := budget.NewScope(pool)
+	if err := other.Acquire(21 << 20); err != nil {
+		t.Fatal(err)
+	}
+	if code, retry, b := get(); code != http.StatusServiceUnavailable || retry == "" || !strings.Contains(string(b), "overload") {
+		t.Fatalf("4 MiB of output with 3 MiB of the pool free: want 503 + Retry-After, got %d %q %.200s", code, retry, b)
+	}
+	other.Close()
+	if code, _, b := get(); code != http.StatusOK || len(b) < 4<<20 {
+		t.Fatalf("the same call on an idle pool: %d, %d bytes", code, len(b))
+	}
+	if pool.InUse() != 0 || pool.Peak() > pool.Max() {
+		t.Fatalf("in use %d, peak %d of %d", pool.InUse(), pool.Peak(), pool.Max())
+	}
+}

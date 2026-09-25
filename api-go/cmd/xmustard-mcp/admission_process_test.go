@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -81,8 +82,11 @@ func TestShimRefusesCallsBeyondInflightLimit(t *testing.T) {
 
 // Fable runtime review #1: the shim read, copied and decoded request frames before any
 // admission, so a 1 MiB pool still forwarded 6×7 MiB frames (shim RSS 183 MB). A frame
-// that cannot be reserved must be refused with -32000 before it is buffered/decoded or
-// forwarded, and a small frame must still work.
+// that cannot be reserved must be refused before it is buffered/decoded or forwarded,
+// and a small frame must still work. A 7 MiB frame can never fit a 1 MiB pool, so the
+// refusal is the permanent -32600, not a retryable -32000 (the retryable path, with the
+// pool held by another call, is covered by TestCancellationServiceableUnderPoolSaturation
+// and TestControlFramesReadUnderExhaustedPool).
 func TestShimIngressFramesAreAdmitted(t *testing.T) {
 	var mu sync.Mutex
 	forwarded := 0
@@ -132,7 +136,7 @@ func TestShimIngressFramesAreAdmitted(t *testing.T) {
 			switch {
 			case string(resp.ID) == "7" && resp.Error == nil:
 				smallOK = true
-			case resp.Error != nil && resp.Error.Code == -32000:
+			case resp.Error != nil && resp.Error.Code == -32600 && string(resp.ID) != "null" && len(resp.ID) > 0:
 				refused++
 			default:
 				t.Fatalf("unexpected reply %.200s", line)
@@ -165,4 +169,101 @@ func processRSSKiB(pid int) int {
 	}
 	n, _ := strconv.Atoi(strings.TrimSpace(string(out)))
 	return n
+}
+
+// shimSession runs a freshly built shim against api with the default transient pool (no
+// budget override) and returns a function that sends one frame and reads its reply.
+func shimSession(t *testing.T, apiURL string) func(frame string) string {
+	t.Helper()
+	cmd := exec.Command(buildShim(t))
+	env := []string{}
+	for _, kv := range os.Environ() {
+		if !strings.HasPrefix(kv, "XMUSTARD_TRANSIENT_BYTE_BUDGET=") {
+			env = append(env, kv)
+		}
+	}
+	cmd.Env = append(env, "XMUSTARD_API_BASE="+apiURL)
+	stdin, _ := cmd.StdinPipe()
+	stdout, _ := cmd.StdoutPipe()
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cmd.Process.Kill(); _ = cmd.Wait() })
+	lines := make(chan string, 4)
+	go func() {
+		sc := bufio.NewScanner(stdout)
+		sc.Buffer(make([]byte, 0, 1<<20), 16<<20)
+		for sc.Scan() {
+			lines <- sc.Text()
+		}
+	}()
+	return func(frame string) string {
+		if _, err := io.WriteString(stdin, frame+"\n"); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case line := <-lines:
+			return line
+		case <-time.After(20 * time.Second):
+			t.Fatal("no reply within 20s")
+			return ""
+		}
+	}
+}
+
+// On the default 24 MiB pool, a tools/call frame is held as its decoded params, its
+// decoded arguments and the request body built from them (the raw frame is released
+// once decoded). A 5 MiB memory proposal fits and is forwarded. A frame just under the
+// 8 MiB framing cap cannot fit the pool at all, so an idle shim answers it with the
+// permanent -32600 and never with the retryable -32000 a client would retry forever.
+func TestShimFrameSizesOnTheDefaultPool(t *testing.T) {
+	var mu sync.Mutex
+	forwarded := 0
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		mu.Lock()
+		forwarded++
+		mu.Unlock()
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer api.Close()
+	send := shimSession(t, api.URL)
+	frame := func(id, n int) string {
+		return fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"method":"tools/call","params":{"name":"remember","arguments":{"workspace_id":"ws","content":"%s"}}}`, id, strings.Repeat("m", n))
+	}
+	type reply struct {
+		ID     json.RawMessage `json:"id"`
+		Result *struct {
+			IsError bool `json:"isError"`
+		} `json:"result"`
+		Error *struct {
+			Code int `json:"code"`
+		} `json:"error"`
+	}
+	for _, tc := range []struct {
+		id, size int
+		ok       bool
+	}{
+		{1, 5 << 20, true},
+		{2, 8<<20 - 4096, false},
+		{3, 7 << 20, false},
+		{4, 5 << 20, true},
+	} {
+		var r reply
+		line := send(frame(tc.id, tc.size))
+		if err := json.Unmarshal([]byte(line), &r); err != nil || string(r.ID) != strconv.Itoa(tc.id) {
+			t.Fatalf("frame %d: bad reply %.200s (%v)", tc.id, line, err)
+		}
+		if tc.ok && (r.Error != nil || r.Result == nil || r.Result.IsError) {
+			t.Fatalf("a %d-byte frame fits the default pool: %.300s", tc.size, line)
+		}
+		if !tc.ok && (r.Error == nil || r.Error.Code != -32600) {
+			t.Fatalf("a %d-byte frame can never fit the default pool: want -32600, got %.300s", tc.size, line)
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if forwarded != 2 {
+		t.Fatalf("only the frames that fit may be forwarded: api saw %d", forwarded)
+	}
 }

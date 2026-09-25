@@ -24,6 +24,22 @@ func withPool(t *testing.T, max int64) *budget.ByteBudget {
 	return b
 }
 
+// busyPool installs a pool of max bytes with held of them reserved by another request,
+// so a capture that would fit the pool on its own is refused for now: the retryable
+// overload path, which the audit tests below guard.
+func busyPool(t *testing.T, max, held int64) *budget.ByteBudget {
+	t.Helper()
+	pool := withPool(t, max)
+	other := budget.NewScope(pool)
+	if err := other.Acquire(held); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(other.Close)
+	return pool
+}
+
+const busyMax, busyHeld = 5 << 20, 4 << 20
+
 func floodingCore(t *testing.T) string {
 	t.Helper()
 	p := filepath.Join(t.TempDir(), "xmustard-core")
@@ -34,35 +50,94 @@ func floodingCore(t *testing.T) string {
 	return p
 }
 
-// Audit Go #5: runCoreCtx captured up to 64 MiB without charging the shared pool.
+// Audit Go #5: runCoreCtx captured up to 64 MiB without charging the shared pool. With
+// 1 MiB of a 5 MiB pool free, a 4 MiB capture (which would fit an idle pool) is refused
+// as a retryable overload and never drives the pool past its ceiling.
 func TestRunCoreCaptureNeverExceedsPool(t *testing.T) {
-	pool := withPool(t, 1<<20)
+	pool := busyPool(t, busyMax, busyHeld)
 	t.Setenv("XMUSTARD_CORE_BIN", floodingCore(t))
 	out, err := runCoreCtx(context.Background(), "search", "x")
 	if !errors.Is(err, budget.ErrOverloaded) {
-		t.Fatalf("4 MiB capture under a 1 MiB pool succeeded with %d bytes", len(out))
+		t.Fatalf("4 MiB capture with 1 MiB of the pool free: want ErrOverloaded, got %d bytes, %v", len(out), err)
 	}
 	if pool.Peak() > pool.Max() {
 		t.Fatalf("pool peak %d exceeded max %d", pool.Peak(), pool.Max())
 	}
-	if pool.InUse() != 0 {
-		t.Fatalf("reservation leaked: %d in use after return", pool.InUse())
+	if pool.InUse() != busyHeld {
+		t.Fatalf("reservation leaked: %d in use after return", pool.InUse()-busyHeld)
 	}
 }
 
 // Audit Go #5: runBoundedCmd charged a 64 MiB reservation unconditionally, driving the
 // pool past its ceiling instead of refusing.
 func TestRunBoundedCmdNeverExceedsPool(t *testing.T) {
-	pool := withPool(t, 1<<20)
+	pool := busyPool(t, busyMax, busyHeld)
 	_, _, _, err := runBoundedCmd(exec.Command(floodingCore(t)))
 	if !errors.Is(err, budget.ErrOverloaded) {
-		t.Fatalf("4 MiB bounded capture under a 1 MiB pool: want ErrOverloaded, got %v", err)
+		t.Fatalf("4 MiB bounded capture with 1 MiB of the pool free: want ErrOverloaded, got %v", err)
 	}
 	if pool.Peak() > pool.Max() {
 		t.Fatalf("pool peak %d exceeded max %d", pool.Peak(), pool.Max())
 	}
-	if pool.InUse() != 0 {
-		t.Fatalf("reservation leaked: %d", pool.InUse())
+	if pool.InUse() != busyHeld {
+		t.Fatalf("reservation leaked: %d", pool.InUse()-busyHeld)
+	}
+}
+
+// sizedCore prints n bytes of output.
+func sizedCore(t *testing.T, n int) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "xmustard-core")
+	script := "#!/bin/sh\nhead -c " + strconv.Itoa(n) + " /dev/zero | tr '\\0' 'a'\n"
+	if err := os.WriteFile(p, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// Output the pool could never hold is the permanent "output too large" error, never a
+// retryable overload that an idle server answers the same way forever. Under the default
+// 24 MiB pool a request-scoped call (output plus two decode copies held to the end)
+// takes about a third of the pool and an owned call about all of it.
+func TestCoreOutputThePoolCanNeverHoldIsPermanent(t *testing.T) {
+	pool := withPool(t, budget.DefaultTransientBudgetBytes)
+	request := func() (context.Context, func()) {
+		s := budget.NewScope(nil)
+		return budget.WithScope(context.Background(), s), s.Close
+	}
+	for _, tc := range []struct {
+		name   string
+		bytes  int
+		scoped bool
+		ok     bool
+	}{
+		{"5 MiB in a request", 5 << 20, true, true},
+		{"10 MiB in a request", 10 << 20, true, false},
+		{"10 MiB owned", 10 << 20, false, true},
+		{"30 MiB owned", 30 << 20, false, false},
+	} {
+		t.Setenv("XMUSTARD_CORE_BIN", sizedCore(t, tc.bytes))
+		ctx, done := context.Background(), func() {}
+		if tc.scoped {
+			ctx, done = request()
+		}
+		out, err := runCoreCtx(ctx, "search", "x")
+		done()
+		if tc.ok && (err != nil || len(out) != tc.bytes) {
+			t.Fatalf("%s: %d bytes, %v", tc.name, len(out), err)
+		}
+		if !tc.ok && (err == nil || errors.Is(err, budget.ErrOverloaded) || !strings.Contains(err.Error(), "output too large")) {
+			t.Fatalf("%s: want the permanent output-too-large error, got %v", tc.name, err)
+		}
+		if pool.InUse() != 0 {
+			t.Fatalf("%s: %d bytes leaked", tc.name, pool.InUse())
+		}
+	}
+	// the bounded runner reports it as over the cap, not as a refusal
+	withPool(t, 1<<20)
+	_, _, over, err := runBoundedCmd(exec.Command(floodingCore(t)))
+	if !over || errors.Is(err, budget.ErrOverloaded) {
+		t.Fatalf("4 MiB under an idle 1 MiB pool: want over=true, got over=%v err=%v", over, err)
 	}
 }
 
@@ -109,17 +184,40 @@ func assertKilledPromptly(t *testing.T, run func() error, pidFile string) {
 // Root review: returning an error from the capture writer only stops pipe copying; a
 // child that floods then sleeps keeps running. Refusal must kill the child.
 func TestRunCoreRefusalKillsFloodThenSleepChild(t *testing.T) {
+	pool := busyPool(t, busyMax, busyHeld)
+	core, pidFile := floodThenSleep(t)
+	t.Setenv("XMUSTARD_CORE_BIN", core)
+	assertKilledPromptly(t, func() error {
+		_, err := runCoreCtx(context.Background(), "search", "x")
+		if !errors.Is(err, budget.ErrOverloaded) {
+			t.Errorf("want ErrOverloaded from a started, refused child; got %v", err)
+		}
+		return err
+	}, pidFile)
+	if pool.InUse() != busyHeld {
+		t.Fatalf("reservation leaked: %d", pool.InUse()-busyHeld)
+	}
+}
+
+// Output past the pool-derived cap kills the child just as a refusal does.
+func TestRunCoreOverCapKillsFloodThenSleepChild(t *testing.T) {
 	pool := withPool(t, 1<<20)
 	core, pidFile := floodThenSleep(t)
 	t.Setenv("XMUSTARD_CORE_BIN", core)
-	assertKilledPromptly(t, func() error { _, err := runCoreCtx(context.Background(), "search", "x"); return err }, pidFile)
+	assertKilledPromptly(t, func() error {
+		_, err := runCoreCtx(context.Background(), "search", "x")
+		if err == nil || errors.Is(err, budget.ErrOverloaded) {
+			t.Errorf("want the permanent output-too-large error; got %v", err)
+		}
+		return err
+	}, pidFile)
 	if pool.InUse() != 0 {
 		t.Fatalf("reservation leaked: %d", pool.InUse())
 	}
 }
 
 func TestRunBoundedCmdRefusalKillsFloodThenSleepChild(t *testing.T) {
-	pool := withPool(t, 1<<20)
+	pool := busyPool(t, busyMax, busyHeld)
 	core, pidFile := floodThenSleep(t)
 	assertKilledPromptly(t, func() error {
 		_, _, _, err := runBoundedCmd(exec.Command(core))
@@ -131,8 +229,8 @@ func TestRunBoundedCmdRefusalKillsFloodThenSleepChild(t *testing.T) {
 	if _, err := os.Stat(pidFile); err != nil {
 		t.Fatalf("child never started: %v", err)
 	}
-	if pool.InUse() != 0 {
-		t.Fatalf("reservation leaked: %d", pool.InUse())
+	if pool.InUse() != busyHeld {
+		t.Fatalf("reservation leaked: %d", pool.InUse()-busyHeld)
 	}
 }
 
@@ -208,7 +306,7 @@ func TestRunCoreCancelKillsChildAndGrandchild(t *testing.T) {
 
 // Root follow-up: a capture refusal must also end the whole owned tree.
 func TestRunCoreRefusalKillsChildAndGrandchild(t *testing.T) {
-	withPool(t, 1<<20)
+	busyPool(t, busyMax, busyHeld)
 	core, cp, gp := treeCore(t, true)
 	t.Setenv("XMUSTARD_CORE_BIN", core)
 	done := make(chan error, 1)

@@ -2,6 +2,7 @@ package rustcore
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -19,7 +20,8 @@ const (
 	// the HTTP/MCP handler indefinitely.
 	coreCallTimeout = 120 * time.Second
 	// maxCoreStdout caps the result buffer so a flooding child can't OOM the API
-	// (large but finite — a graph/search result beyond this is itself a problem).
+	// (large but finite — a graph/search result beyond this is itself a problem). Each
+	// call lowers it to what the transient pool can admit (coreStdoutCap).
 	maxCoreStdout = 64 << 20 // 64 MiB
 	maxCoreStderr = 64 << 10 // 64 KiB
 )
@@ -51,7 +53,8 @@ func runCoreCtx(parent context.Context, sub string, args ...string) ([]byte, err
 	defer cancel()
 	cmd := coreCommandContext(ctx, sub, args...)
 	cmd.WaitDelay = 2 * time.Second
-	out := budget.NewCaptureWriter(scope, maxCoreStdout)
+	stdoutCap := coreStdoutCap(scope, !owned)
+	out := budget.NewCaptureWriter(scope, stdoutCap)
 	errb := budget.NewCaptureWriter(scope, maxCoreStderr)
 	// first overflow/refusal cancels ctx, which kills the child (CommandContext)
 	out.OnStop, errb.OnStop = cancel, cancel
@@ -66,7 +69,7 @@ func runCoreCtx(parent context.Context, sub string, args ...string) ([]byte, err
 		return nil, fmt.Errorf("rust-core %s: %w", sub, budget.ErrOverloaded)
 	}
 	if out.Over() {
-		log.Printf("rust-core %s: stdout exceeded %d bytes (dropped)", sub, maxCoreStdout)
+		log.Printf("rust-core %s: stdout exceeded %d bytes (dropped)", sub, stdoutCap)
 		return nil, fmt.Errorf("rust-core %s: output too large", sub)
 	}
 	if runErr != nil {
@@ -85,6 +88,9 @@ func runCoreCtx(parent context.Context, sub string, args ...string) ([]byte, err
 	// are admitted now, before they are allocated.
 	if !owned {
 		if err := scope.Acquire(2 * int64(out.Len())); err != nil {
+			if errors.Is(err, budget.ErrTooLarge) { // this request can never hold it
+				return nil, fmt.Errorf("rust-core %s: output too large", sub)
+			}
 			return nil, fmt.Errorf("rust-core %s: %w", sub, budget.ErrOverloaded)
 		}
 	}
@@ -92,7 +98,7 @@ func runCoreCtx(parent context.Context, sub string, args ...string) ([]byte, err
 }
 
 // runBoundedCmd runs an already-built rust-core command with BOUNDED stdout/stderr
-// capture (same caps as runCoreCtx: 64 MiB / 64 KiB), for the few bridge helpers
+// capture (maxCoreStdout lowered to the pool less stderr / 64 KiB), for the few bridge helpers
 // that must keep their own command + timeout construction (e.g. managed/verification
 // commands whose own timeout exceeds coreCallTimeout). It takes a helper-child slot and
 // reserves captured bytes against the shared pool as they arrive; a refused
@@ -107,7 +113,7 @@ func runBoundedCmd(cmd *exec.Cmd) (stdout []byte, stderr string, over bool, err 
 	defer release()
 	scope := budget.NewScope(nil)
 	defer scope.Close()
-	out := budget.NewCaptureWriter(scope, maxCoreStdout)
+	out := budget.NewCaptureWriter(scope, coreStdoutCap(scope, false))
 	errb := budget.NewCaptureWriter(scope, maxCoreStderr)
 	// first overflow/refusal kills the child (and its process group when it has one)
 	out.OnStop = func() { KillProcessTree(cmd) }

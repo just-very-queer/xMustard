@@ -121,8 +121,10 @@ func TestResourceReadErrorsAreProtocolErrors(t *testing.T) {
 }
 
 // Fable evidence F7 (shim): decoding the envelope and encoding the reply copy the
-// projection again; with the pool unable to hold those copies the call must be refused
-// with -32000, not answered from unreserved memory.
+// projection again, so those copies are admitted before they are built. When other calls
+// hold the pool the call is refused with the retryable -32000; when the copies could
+// never fit the whole pool it gets a permanent tool error instead of an overload that an
+// idle shim would repeat forever. Neither answer is built from unreserved memory.
 func TestShimResponseConstructionIsAdmitted(t *testing.T) {
 	big := strings.Repeat("p", 200<<10)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -132,14 +134,34 @@ func TestShimResponseConstructionIsAdmitted(t *testing.T) {
 	defer srv.Close()
 	t.Setenv("XMUSTARD_API_BASE", srv.URL)
 	prev := budget.TransientBytes
-	budget.TransientBytes = budget.NewByteBudget(300 << 10)
 	defer func() { budget.TransientBytes = prev }()
-	scope := budget.NewScope(nil)
-	defer scope.Close()
-	ctx := budget.WithScope(context.Background(), scope)
-	_, rerr := dispatchCtx(ctx, "tools/call", json.RawMessage(`{"name":"search","arguments":{"workspace_id":"ws","query":"q"}}`))
-	if rerr == nil || rerr.Code != overloadCode {
-		t.Fatalf("response construction beyond the pool: want -32000, got %+v", rerr)
+	call := func() (map[string]any, *rpcError) {
+		scope := budget.NewScope(nil)
+		defer scope.Close()
+		ctx := budget.WithScope(context.Background(), scope)
+		res, rerr := dispatchCtx(ctx, "tools/call", json.RawMessage(`{"name":"search","arguments":{"workspace_id":"ws","query":"q"}}`))
+		m, _ := res.(map[string]any)
+		return m, rerr
+	}
+
+	budget.TransientBytes = budget.NewByteBudget(2 << 20)
+	other := budget.NewScope(nil)
+	if err := other.Acquire(1600 << 10); err != nil {
+		t.Fatal(err)
+	}
+	if _, rerr := call(); rerr == nil || rerr.Code != overloadCode {
+		t.Fatalf("reply copies while another call holds the pool: want -32000, got %+v", rerr)
+	}
+	other.Close()
+	if res, rerr := call(); rerr != nil || res["isError"] == true {
+		t.Fatalf("the same call on an idle 2 MiB pool must succeed: %v %+v", res, rerr)
+	}
+
+	budget.TransientBytes = budget.NewByteBudget(300 << 10)
+	res, rerr := call()
+	text, _ := json.Marshal(res)
+	if rerr != nil || res["isError"] != true || !strings.Contains(string(text), "transient budget") || strings.Contains(string(text), big[:1024]) {
+		t.Fatalf("reply copies larger than the whole pool: want a permanent tool error, got %.300s %+v", text, rerr)
 	}
 }
 

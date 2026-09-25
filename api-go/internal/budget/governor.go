@@ -89,7 +89,7 @@ type heavyWaiter struct {
 }
 
 type heavyStats struct {
-	acquired, released, refusedBusy, refusedRSS, refusedHotPath, cancelled, freeOSMemory int64
+	acquired, released, refusedBusy, refusedRSS, refusedHotPath, refusedTooLarge, cancelled, freeOSMemory int64
 }
 
 // Governor owns the reservations, the heavy slot and the watchdog.
@@ -232,15 +232,25 @@ func AcquireHeavy(ctx context.Context, owner string, declaredBytes int64) (func(
 }
 
 // AcquireHeavy takes the single heavy slot for owner, a short code-chosen label such as
-// "index_build" (shown on the public health endpoint, so never user data). It waits at
-// most the configured bound for a busy slot, then admits the work only if measured tree
-// memory plus declaredBytes stays within the soft ceiling. The returned release is
-// idempotent and must be called when the work ends.
+// "index_build" (shown on the health endpoint, so never user data). It waits at most
+// the configured bound for a busy slot, then admits the work only if measured memory
+// plus declaredBytes stays within the soft ceiling. Refusals for now (busy slot, memory
+// pressure) wrap ErrOverloaded. A declaration that could never be admitted, because it
+// is larger than the soft ceiling less the steady reservations, wraps ErrTooLarge at
+// once, without waiting: callers answer it permanently (413 or a tool error), not with
+// Retry-After. The returned release is idempotent and must be called when the work ends.
 func (g *Governor) AcquireHeavy(ctx context.Context, owner string, declaredBytes int64) (func(), error) {
 	owner = heavyLabel(owner)
 	declaredBytes = max(0, declaredBytes)
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if limit := g.maxAdmissibleHeavy(); declaredBytes > limit {
+		g.mu.Lock()
+		g.stats.refusedTooLarge++
+		g.mu.Unlock()
+		return nil, fmt.Errorf("%w (heavy work %s declares %d bytes; at most %d can ever be admitted under the %d-byte soft ceiling less the steady reservations)",
+			ErrTooLarge, owner, declaredBytes, limit, g.cfg.SoftCeilingBytes)
 	}
 	select {
 	case g.slot <- struct{}{}:
@@ -330,6 +340,13 @@ func (g *Governor) admitMemory(declared int64) error {
 		return fmt.Errorf("%w (memory near the soft ceiling: %s %d + declared %d > %d bytes)", ErrOverloaded, basis, base, declared, soft)
 	}
 	return nil
+}
+
+// maxAdmissibleHeavy is the largest declaration admitMemory could ever accept: the soft
+// ceiling less the steady reservations, which no measurement of a running daemon falls
+// below.
+func (g *Governor) maxAdmissibleHeavy() int64 {
+	return max(0, g.cfg.SoftCeilingBytes-g.steadyReserved())
 }
 
 func (g *Governor) steadyReserved() int64 {
@@ -482,6 +499,8 @@ type HeavySlotStatus struct {
 	RefusedBusy       int64               `json:"refused_busy"`
 	RefusedRSS        int64               `json:"refused_rss"`
 	RefusedHotPath    int64               `json:"refused_hot_path"`
+	RefusedTooLarge   int64               `json:"refused_too_large"`
+	MaxAdmissible     int64               `json:"max_admissible_bytes"`
 	Cancelled         int64               `json:"cancelled"`
 	FreeOSMemoryCalls int64               `json:"free_os_memory_calls"`
 }
@@ -538,8 +557,8 @@ func (g *Governor) Snapshot() Snapshot {
 	comps := append([]Component{}, g.components...)
 	h := HeavySlotStatus{Capacity: cap(g.slot), WaitBoundMS: g.cfg.HeavyWait.Milliseconds(), QueueLen: len(g.queue),
 		Queue: []HeavyWaiterStatus{}, Acquired: g.stats.acquired, Released: g.stats.released, RefusedBusy: g.stats.refusedBusy,
-		RefusedRSS: g.stats.refusedRSS, RefusedHotPath: g.stats.refusedHotPath, Cancelled: g.stats.cancelled,
-		FreeOSMemoryCalls: g.stats.freeOSMemory}
+		RefusedRSS: g.stats.refusedRSS, RefusedHotPath: g.stats.refusedHotPath, RefusedTooLarge: g.stats.refusedTooLarge,
+		Cancelled: g.stats.cancelled, FreeOSMemoryCalls: g.stats.freeOSMemory}
 	if g.holder != nil {
 		h.Busy, h.Owner, h.DeclaredBytes = true, g.holder.owner, g.holder.declared
 		h.HeldMS = time.Since(g.holder.since).Milliseconds()
@@ -551,6 +570,7 @@ func (g *Governor) Snapshot() Snapshot {
 		h.Queue = append(h.Queue, HeavyWaiterStatus{Owner: w.owner, WaitedMS: time.Since(w.since).Milliseconds()})
 	}
 	g.mu.Unlock()
+	h.MaxAdmissible = g.maxAdmissibleHeavy()
 	s.HeavySlot = h
 
 	s.Reservations.Components = make([]ComponentStatus, 0, len(comps))
