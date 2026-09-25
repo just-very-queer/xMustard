@@ -1685,7 +1685,8 @@ def run_agents_scenario(ctx, name, sc):
         threads = [threading.Thread(target=agent_loop, args=(a, f"agent{i + 1}", targets_per_agent[i], rounds, feats, errors, calls))
                    for i, a in enumerate(agents)]
         disturb = sc.get("disturb")
-        edit_candidates = indexed_ts_files(api, wsids[0]) if disturb in ("reindex", "edits") else []
+        edit_candidates = (timed("find indexed files to edit (first query builds the graph)", lambda: indexed_ts_files(api, wsids[0]))
+                           if disturb in ("reindex", "edits") else [])
         label = f"{n_agents} agent(s) querying" + (f" + {disturb}" if disturb else "")
         step[0] = label
         t0 = time.time()
