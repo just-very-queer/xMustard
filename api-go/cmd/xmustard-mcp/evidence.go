@@ -14,12 +14,54 @@ import (
 	"sync"
 
 	"xmustard/api-go/internal/budget"
+	"xmustard/api-go/internal/mcpserver"
 )
 
 // Evidence delivery over MCP. Tool calls ask the API for the evidence envelope: the
 // agent receives a bounded projection plus, when anything was omitted, an
 // xmustard://evidence/{handle} resource it pages through with resources/read. The nine
 // tool names and schemas are unchanged; expansion is a resource, not a tenth tool.
+// evidenceDelivery and evidenceResources plug this into the mcpserver session.
+
+// evidenceDelivery asks every tool call for the evidence envelope and turns it into
+// the tool result.
+type evidenceDelivery struct{}
+
+func (evidenceDelivery) Headers(ctx context.Context) map[string]string { return deliveryHeaders(ctx) }
+
+func (evidenceDelivery) Result(ctx context.Context, resp *mcpserver.APIResponse, ws string) (map[string]any, *rpcError, bool) {
+	if resp.Status != http.StatusOK || resp.Header.Get(deliveryHeader) != deliveryVersion {
+		return nil, nil, false
+	}
+	res, rerr := evidenceResult(ctx, resp.Body, ws)
+	return res, rerr, true
+}
+
+// evidenceResources serves the retained originals as xmustard://evidence resources.
+type evidenceResources struct{}
+
+func (evidenceResources) List(context.Context) any      { return resourcesListResult() }
+func (evidenceResources) Templates(context.Context) any { return resourceTemplatesResult() }
+func (evidenceResources) Read(ctx context.Context, params json.RawMessage) (any, *rpcError) {
+	return readResource(ctx, params)
+}
+
+// apiResponse is one admitted API response.
+type apiResponse struct {
+	status int
+	header http.Header
+	body   string
+}
+
+// callAPIResp performs one API request with extra headers and returns the admitted
+// response whatever its status; transport, admission and size failures are errors.
+func callAPIResp(ctx context.Context, method, path, body string, headers map[string]string) (*apiResponse, error) {
+	resp, err := backend.Do(ctx, mcpserver.Request{Method: method, Path: path, Body: body, Headers: headers})
+	if err != nil {
+		return nil, err
+	}
+	return &apiResponse{status: resp.Status, header: resp.Header, body: resp.Body}, nil
+}
 
 const (
 	deliveryHeader  = "X-Xmustard-Delivery"
@@ -131,14 +173,7 @@ func evidenceResult(ctx context.Context, body, ws string) (map[string]any, *rpcE
 
 // reserveReply reserves n bytes of reply construction in the request's ledger (held
 // until the reply is written). Direct callers without a ledger reserve nothing.
-func reserveReply(ctx context.Context, n int) error {
-	scope, owned := budget.ScopeFor(ctx)
-	if owned {
-		scope.Close()
-		return nil
-	}
-	return scope.Acquire(int64(n))
-}
+func reserveReply(ctx context.Context, n int) error { return mcpserver.ReserveReply(ctx, n) }
 
 func resourcesListResult() map[string]any {
 	issued.Lock()

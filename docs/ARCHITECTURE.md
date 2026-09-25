@@ -36,7 +36,7 @@ repositories. The default Rust build does not enable `semantic-onnx`.
 
 | Responsibility | Source owner | Important interface / constraint |
 | --- | --- | --- |
-| MCP protocol and tool schemas | `api-go/cmd/xmustard-mcp/` | Nine tools; strict arguments; HTTP proxy; bounded framing |
+| MCP protocol and tool schemas | `api-go/internal/mcpserver/` (tool table, one `tool_<name>.go` per tool); `api-go/cmd/xmustard-mcp/` (stdio transport, evidence resources) | Nine tools; closed schemas with bounds; version negotiation (2025-06-18, 2024-11-05); optional `workspace_id` resolution; HTTP proxy; bounded framing |
 | HTTP, authentication, request limits | `api-go/cmd/xmustard-api/` | Go request routing and policy; core-only route allowlist |
 | Scoped evidence delivery | `api-go/internal/evidence/`, API/MCP evidence routes | Admission, stable opaque scoped handles, byte-safe original pages, projection and expiry; enforced byte admission is not an RSS ceiling |
 | Pi client adapter | `integrations/pi/` | Pinned extension uses the shared Go evidence path; nine existing tools plus `xmustard_expand` only when a handle is issued |
