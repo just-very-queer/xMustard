@@ -12,3 +12,5 @@ const treeBasis = "unsupported"
 func sampleOwnTree() (TreeSample, error) {
 	return TreeSample{At: time.Now(), Basis: treeBasis}, errNoRSSSampler
 }
+
+func measureProcess(int) (procMem, bool) { return procMem{}, false }

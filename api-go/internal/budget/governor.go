@@ -24,6 +24,8 @@ import (
 //   - an RSS watchdog over this process and its descendants that refuses new heavy work
 //     when measured memory plus the work's declared bytes would pass a soft ceiling. It
 //     samples every WatchInterval while heavy work runs, and on demand otherwise.
+//     Before refusing, and whenever a sample is over the soft ceiling, it asks the
+//     reclaimable resident components (the Rust worker) for memory (pressure.go).
 //
 // Releasing the heavy slot runs the registered cache-trim hooks and debug.FreeOSMemory
 // before the next holder is admitted, so its admission sees the returned memory.
@@ -67,7 +69,22 @@ type Component struct {
 	PeakBytes   int64
 	Used        func() (int64, bool)
 	UsedBasis   string
+	// Enabled, when set, reports whether the component runs in this process (an opt-in
+	// service, for example). A disabled component is listed but reserves nothing, and
+	// is never asked to reclaim.
+	Enabled func() bool
+	// Descendant marks memory that lives in an owned child process. helper_children
+	// leaves it out, so it is not counted twice.
+	Descendant bool
+	// Reclaim, when set, asks the component to give memory back (see pressure.go). It
+	// must not block. It returns a channel closed once the released memory is back with
+	// the OS, or nil when nothing is released now. A reclaimable component can fall to
+	// zero, so its steady line does not lower the largest heavy declaration that can
+	// ever be admitted.
+	Reclaim func(Pressure) <-chan struct{}
 }
+
+func (c Component) enabled() bool { return c.Enabled == nil || c.Enabled() }
 
 // GovernorConfig configures a Governor. Zero fields take the defaults.
 type GovernorConfig struct {
@@ -75,6 +92,10 @@ type GovernorConfig struct {
 	HeavyLineBytes   int64
 	HeavyWait        time.Duration
 	WatchInterval    time.Duration
+	// ReclaimWait bounds how long refused heavy work waits for reclaimed memory;
+	// PressureInterval spaces the requests a tree over the soft ceiling sends.
+	ReclaimWait      time.Duration
+	PressureInterval time.Duration
 	// Sampler measures this process tree; FreeOSMemory returns freed memory to the OS.
 	Sampler      func() (TreeSample, error)
 	FreeOSMemory func()
@@ -106,6 +127,7 @@ type Governor struct {
 	stats      heavyStats
 	onRelease  []func()
 	slot       chan struct{}
+	reclaim    reclaimStats
 
 	smu       sync.Mutex // serializes on-demand sampling (cachedSample)
 	wmu       sync.Mutex
@@ -133,13 +155,19 @@ func NewGovernor(cfg GovernorConfig) *Governor {
 	if cfg.WatchInterval <= 0 {
 		cfg.WatchInterval = DefaultWatchInterval
 	}
+	if cfg.ReclaimWait <= 0 {
+		cfg.ReclaimWait = DefaultReclaimWait
+	}
+	if cfg.PressureInterval <= 0 {
+		cfg.PressureInterval = DefaultPressureInterval
+	}
 	if cfg.Sampler == nil {
 		cfg.Sampler = sampleOwnTree
 	}
 	if cfg.FreeOSMemory == nil {
 		cfg.FreeOSMemory = debug.FreeOSMemory
 	}
-	return &Governor{cfg: cfg, slot: make(chan struct{}, 1)}
+	return &Governor{cfg: cfg, slot: make(chan struct{}, 1), reclaim: reclaimStats{requests: map[string]int64{}}}
 }
 
 // Gov is the process-wide governor. XMUSTARD_RSS_SOFT_CEILING_BYTES and
@@ -153,11 +181,13 @@ var Gov = NewProcessGovernor(GovernorConfig{
 func NewProcessGovernor(cfg GovernorConfig) *Governor {
 	g := NewGovernor(cfg)
 	g.registerDefaultComponents()
+	g.registerProcessComponents()
 	return g
 }
 
-// registerDefaultComponents declares what exists in every API process today. Later
-// resident components (the Rust index service, the governance store) call Reserve.
+// registerDefaultComponents declares what exists in every API process today. Resident
+// components owned above this package (the Rust worker, later the governance store)
+// call RegisterProcessComponent.
 func (g *Governor) registerDefaultComponents() {
 	g.Reserve(Component{Name: "go_daemon", Kind: ComponentResident, SteadyBytes: daemonSteadyBytes, PeakBytes: daemonPeakBytes,
 		UsedBasis: "ps_rss", Used: func() (int64, bool) {
@@ -176,11 +206,15 @@ func (g *Governor) registerDefaultComponents() {
 			return g.holder.declared, true
 		}})
 	// Per-call Rust cores and git children are unreserved until the resident service
-	// replaces them; their measured memory is still shown.
+	// replaces them; their measured memory is still shown. Owned children that are
+	// components of their own (Descendant) are left out.
 	g.Reserve(Component{Name: "helper_children", Kind: ComponentTransient,
 		UsedBasis: "ps_rss", Used: func() (int64, bool) {
 			s, err := g.cachedSample(healthSampleMaxAge)
-			return s.ChildrenRSSBytes(), err == nil && s.Supported
+			if err != nil || !s.Supported {
+				return 0, false
+			}
+			return max(0, s.ChildrenRSSBytes()-g.descendantUsed()), true
 		}})
 	// Per-agent stdio shims until an HTTP MCP transport replaces them (WS-13): measured
 	// on the host and added to the tree for heavy admission.
@@ -245,11 +279,14 @@ func AcquireHeavy(ctx context.Context, owner string, declaredBytes int64) (func(
 // AcquireHeavy takes the single heavy slot for owner, a short code-chosen label such as
 // "index_build" (shown on the health endpoint, so never user data). It waits at most
 // the configured bound for a busy slot, then admits the work only if measured memory
-// plus declaredBytes stays within the soft ceiling. Refusals for now (busy slot, memory
+// plus declaredBytes stays within the soft ceiling. When it does not, the reclaimable
+// components are asked for memory first, and the work is admitted if the tree falls far
+// enough within ReclaimWait (pressure.go). Refusals for now (busy slot, memory
 // pressure) wrap ErrOverloaded. A declaration that could never be admitted, because it
-// is larger than the soft ceiling less the steady reservations, wraps ErrTooLarge at
-// once, without waiting: callers answer it permanently (413 or a tool error), not with
-// Retry-After. The returned release is idempotent and must be called when the work ends.
+// is larger than the soft ceiling less the steady reservations of the components that
+// cannot give memory back, wraps ErrTooLarge at once, without waiting: callers answer
+// it permanently (413 or a tool error), not with Retry-After. The returned release is
+// idempotent and must be called when the work ends.
 func (g *Governor) AcquireHeavy(ctx context.Context, owner string, declaredBytes int64) (func(), error) {
 	owner = heavyLabel(owner)
 	declaredBytes = max(0, declaredBytes)
@@ -278,13 +315,14 @@ func (g *Governor) AcquireHeavy(ctx context.Context, owner string, declaredBytes
 		}
 	}
 	// With the slot held nothing else heavy is running, so the sample shows the memory
-	// this work would add to.
-	if err := g.admitMemory(declaredBytes); err != nil {
-		<-g.slot
-		g.mu.Lock()
-		g.stats.refusedRSS++
-		g.mu.Unlock()
-		return nil, err
+	// this work would add to. Refused for memory, it first asks the reclaimable
+	// components for memory and measures once more; a hook or capture path asks without
+	// waiting.
+	if tree, err := g.admitMemory(declaredBytes); err != nil {
+		if err = g.admitAfterReclaim(ctx, tree, declaredBytes, err); err != nil {
+			<-g.slot
+			return nil, err
+		}
 	}
 	g.mu.Lock()
 	g.holder = &heavyHolder{owner: owner, since: time.Now(), declared: declaredBytes}
@@ -293,6 +331,40 @@ func (g *Governor) AcquireHeavy(ctx context.Context, owner string, declaredBytes
 	stopWatch := g.watchWhileHeld()
 	var once sync.Once
 	return func() { once.Do(func() { g.releaseHeavy(stopWatch) }) }, nil
+}
+
+// admitAfterReclaim handles heavy work refused for memory (refusal): it asks the
+// reclaimable components for memory, waits for what they release, and measures once
+// more. It returns nil when the work is admitted after all. A hook or capture path asks
+// without waiting and is refused.
+func (g *Governor) admitAfterReclaim(ctx context.Context, tree, declared int64, refusal error) error {
+	p := Pressure{Reason: PressureHeavyAdmission, TreeBytes: tree, SoftCeilingBytes: g.cfg.SoftCeilingBytes, DeclaredBytes: declared}
+	count := func(n *int64) {
+		g.mu.Lock()
+		*n++
+		g.mu.Unlock()
+	}
+	if heavyWaitForbidden(ctx) {
+		go g.askReclaim(p)
+		count(&g.stats.refusedRSS)
+		return refusal
+	}
+	if !g.reclaimForHeavy(ctx, p) {
+		count(&g.stats.refusedRSS)
+		return refusal
+	}
+	if err := ctx.Err(); err != nil {
+		count(&g.stats.cancelled)
+		return err
+	}
+	if _, err := g.admitMemory(declared); err != nil {
+		count(&g.stats.refusedRSS)
+		return err
+	}
+	g.reclaim.mu.Lock()
+	g.reclaim.admittedAfterReclaim++
+	g.reclaim.mu.Unlock()
+	return nil
 }
 
 func (g *Governor) waitForSlot(ctx context.Context, owner string) error {
@@ -339,33 +411,61 @@ func (g *Governor) holderLabelLocked() string {
 }
 
 // admitMemory refuses when measured tree memory plus declared would pass the soft
-// ceiling. Without a sampler it projects from the steady reservations instead.
-func (g *Governor) admitMemory(declared int64) error {
-	s, err := g.Sample()
+// ceiling. Without a sampler it projects from the steady reservations instead. It
+// returns the base it measured.
+func (g *Governor) admitMemory(declared int64) (int64, error) {
+	s, err := g.sample(false) // admission asks for memory itself (admitAfterReclaim)
 	base, basis := s.admissionBytes(), "measured tree and stdio shims"
 	if err != nil || !s.Supported {
-		base, basis = g.steadyReserved(), "reserved steady"
+		base, basis = g.steadyReserved(false), "reserved steady"
 	}
 	soft := g.cfg.SoftCeilingBytes
 	if base > soft || declared > soft-base {
-		return fmt.Errorf("%w (memory near the soft ceiling: %s %d + declared %d > %d bytes)", ErrOverloaded, basis, base, declared, soft)
+		return base, fmt.Errorf("%w (memory near the soft ceiling: %s %d + declared %d > %d bytes)", ErrOverloaded, basis, base, declared, soft)
 	}
-	return nil
+	return base, nil
 }
 
 // maxAdmissibleHeavy is the largest declaration admitMemory could ever accept: the soft
-// ceiling less the steady reservations, which no measurement of a running daemon falls
-// below.
+// ceiling less the steady reservations of the components that cannot give memory back,
+// which no measurement of a running daemon falls below.
 func (g *Governor) maxAdmissibleHeavy() int64 {
-	return max(0, g.cfg.SoftCeilingBytes-g.steadyReserved())
+	return max(0, g.cfg.SoftCeilingBytes-g.steadyReserved(true))
 }
 
-func (g *Governor) steadyReserved() int64 {
+// steadyReserved totals the enabled components' steady lines, leaving out the
+// reclaimable ones when floorOnly is set.
+func (g *Governor) steadyReserved(floorOnly bool) int64 {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	var n int64
 	for _, c := range g.components {
+		if !c.enabled() || (floorOnly && c.Reclaim != nil) {
+			continue
+		}
 		n += c.SteadyBytes
+	}
+	return n
+}
+
+// descendantUsed totals the measured use of the enabled components that live in owned
+// child processes.
+func (g *Governor) descendantUsed() int64 {
+	g.mu.Lock()
+	var ds []Component
+	for _, c := range g.components {
+		if c.Descendant && c.Used != nil {
+			ds = append(ds, c)
+		}
+	}
+	g.mu.Unlock()
+	var n int64
+	for _, c := range ds {
+		if c.enabled() {
+			if v, ok := c.Used(); ok {
+				n += v
+			}
+		}
 	}
 	return n
 }
@@ -429,8 +529,11 @@ func (g *Governor) watchWhileHeld() (stop func()) {
 	}
 }
 
-// Sample measures the process tree now and records it.
-func (g *Governor) Sample() (TreeSample, error) {
+// Sample measures the process tree now and records it. A tree over the soft ceiling
+// asks the reclaimable components for memory (notePressure).
+func (g *Governor) Sample() (TreeSample, error) { return g.sample(true) }
+
+func (g *Governor) sample(dispatch bool) (TreeSample, error) {
 	s, err := g.cfg.Sampler()
 	if err != nil {
 		s.Supported = false
@@ -438,6 +541,9 @@ func (g *Governor) Sample() (TreeSample, error) {
 	}
 	if s.At.IsZero() {
 		s.At = time.Now()
+	}
+	if dispatch && err == nil && s.Supported {
+		defer g.notePressure(s.admissionBytes())
 	}
 	g.wmu.Lock()
 	defer g.wmu.Unlock()
@@ -485,9 +591,12 @@ func (g *Governor) recentSample(maxAge time.Duration) (TreeSample, bool, error) 
 }
 
 // ComponentStatus is one reservation in the health view. UsedBytes is null when unknown.
+// A disabled component reserves nothing and is left out of the totals.
 type ComponentStatus struct {
 	Name                string `json:"name"`
 	Kind                string `json:"kind"`
+	Enabled             bool   `json:"enabled"`
+	Reclaimable         bool   `json:"reclaimable,omitempty"`
 	ReservedSteadyBytes int64  `json:"reserved_steady_bytes"`
 	ReservedPeakBytes   int64  `json:"reserved_peak_bytes"`
 	UsedBytes           *int64 `json:"used_bytes"`
@@ -565,6 +674,7 @@ type Snapshot struct {
 	Children         ChildStatus       `json:"children"`
 	Runtime          RuntimeStats      `json:"runtime"`
 	Counters         CounterSnapshot   `json:"counters"`
+	Reclaim          ReclaimStatus     `json:"reclaim"`
 }
 
 // SoftCeiling is the soft ceiling heavy admission refuses near.
@@ -601,18 +711,25 @@ func (g *Governor) Snapshot() Snapshot {
 
 	s.Reservations.Components = make([]ComponentStatus, 0, len(comps))
 	for _, c := range comps {
-		cs := ComponentStatus{Name: c.Name, Kind: c.Kind, ReservedSteadyBytes: c.SteadyBytes, ReservedPeakBytes: c.PeakBytes, UsedBasis: c.UsedBasis}
+		cs := ComponentStatus{Name: c.Name, Kind: c.Kind, Enabled: c.enabled(), Reclaimable: c.Reclaim != nil,
+			ReservedSteadyBytes: c.SteadyBytes, ReservedPeakBytes: c.PeakBytes, UsedBasis: c.UsedBasis}
 		if c.Used != nil {
 			if v, ok := c.Used(); ok {
 				cs.UsedBytes = &v
 			}
 		}
-		s.Reservations.SteadyTotalBytes += c.SteadyBytes
-		s.Reservations.PeakTotalBytes += c.PeakBytes
+		if cs.Enabled {
+			s.Reservations.SteadyTotalBytes += c.SteadyBytes
+			s.Reservations.PeakTotalBytes += c.PeakBytes
+		}
 		s.Reservations.Components = append(s.Reservations.Components, cs)
 	}
 
 	g.wmu.Lock()
+	level := LevelUnknown
+	if g.hasLast && g.last.Supported {
+		level = g.levelOf(g.last.admissionBytes())
+	}
 	s.Watchdog = WatchdogStatus{Scope: "this process and its xMustard-owned descendants (Rust core, git, ast-grep), plus this user's xmustard-mcp stdio shims on the host (launched by clients, counted by the gate; another instance's shims are over-counted); admission and peaks use tree plus shims; other descendants are external and reported separately",
 		IntervalMS: g.cfg.WatchInterval.Milliseconds(), SamplingActive: g.watching, Samples: g.samples,
 		OverSoftCeilingSamples: g.overSoft, PeakRSSBytes: g.peakRSS, PeakFootprintBytes: g.peakFP, Last: g.last}
@@ -622,6 +739,7 @@ func (g *Governor) Snapshot() Snapshot {
 	s.Children = ChildStatus{Cap: Children.Cap(), InUse: Children.InUse(), Peak: Children.Peak()}
 	s.Runtime = ReadRuntimeStats()
 	s.Counters = Counters()
+	s.Reclaim = g.reclaimStatus(level)
 	return s
 }
 

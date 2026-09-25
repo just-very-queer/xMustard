@@ -134,3 +134,5 @@ func linuxScanParents() map[int][]int {
 	}
 	return byParent
 }
+
+func measureProcess(pid int) (procMem, bool) { return linuxProcMem(pid) }
