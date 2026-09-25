@@ -179,9 +179,10 @@ CREATE TABLE votes (
 ) STRICT;
 
 -- Defense in depth for the core governance invariant: an entry can only be labelled
--- peer_verified when enough distinct principals other than its author and the open-mode
--- identity approved the revision it serves. The Go layer re-checks entries whose votes
--- changed before every commit.
+-- peer_verified when enough distinct principals approved the revision it serves, not
+-- counting the entry's author, the author of that revision (an editor cannot verify
+-- their own edit) or the open-mode identity. The Go layer re-checks entries whose
+-- votes changed before every commit.
 CREATE TRIGGER entries_peer_verified_insert BEFORE INSERT ON entries
 WHEN NEW.verification_mode = 'peer_verified'
 BEGIN
@@ -193,7 +194,9 @@ BEFORE UPDATE OF verification_mode, revision, promoted, source_key, required_ver
 WHEN NEW.verification_mode = 'peer_verified'
   AND (SELECT count(*) FROM votes v
         WHERE v.entry_id = NEW.id AND v.revision = NEW.revision AND v.verdict = 'approve'
-          AND v.principal_key <> NEW.source_key AND v.principal_key <> 'anonymous') < NEW.required_verifications
+          AND v.principal_key <> NEW.source_key AND v.principal_key <> 'anonymous'
+          AND v.principal_key NOT IN (SELECT r.author_key FROM revisions r
+                                       WHERE r.entry_id = NEW.id AND r.revision = NEW.revision)) < NEW.required_verifications
 BEGIN
   SELECT RAISE(ABORT, 'govstore: peer_verified requires distinct peer approvals');
 END;

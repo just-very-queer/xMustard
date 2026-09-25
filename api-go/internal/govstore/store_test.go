@@ -611,6 +611,66 @@ func TestPeerVerifiedNeedsDistinctPeers(t *testing.T) {
 	}
 }
 
+// An editor cannot verify their own edit: the author of the served revision counts
+// no more than the entry's author, in the pre-commit check, the schema trigger and
+// Tally alike.
+func TestEditorCannotPeerVerifyOwnRevision(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t, newClock())
+	dave := Actor{Principal: "dave"}
+	propose(t, s, "ctx_ed", "Rule", "deploys need a changelog")
+	mustUpdate(t, s, func(tx Tx) error {
+		_, err := tx.AppendRevision(ctx, RevisionInput{EntryID: "ctx_ed", BaseRevision: 1, Op: "edit",
+			Content: "deploys need a changelog and a rollback plan"}, Actor{Principal: " Bob "})
+		return err
+	})
+	vote(t, s, "ctx_ed", Actor{Principal: "bob"}, VerdictApprove) // served revision 1: bob is a peer here
+	for _, who := range []Actor{bob, carol} {
+		mustUpdate(t, s, func(tx Tx) error {
+			_, err := tx.RecordVote(ctx, VoteInput{EntryID: "ctx_ed", Revision: 2, Verdict: VerdictApprove}, who)
+			return err
+		})
+	}
+	tl, _ := s.Tally(ctx, "ctx_ed", 2)
+	if tl.Approvals != 2 || tl.PeerApprovals != 1 || !tl.AuthorApproved {
+		t.Fatalf("tally of bob's own revision = %+v", tl)
+	}
+	if tl1, _ := s.Tally(ctx, "ctx_ed", 1); tl1.PeerApprovals != 1 || tl1.AuthorApproved {
+		t.Fatalf("tally of alice's revision = %+v", tl1)
+	}
+	peer := Promotion{Status: StatusVerified, Promoted: true, VerificationMode: ModePeerVerified}
+	err := s.Update(ctx, func(tx Tx) error {
+		if _, err := tx.AcceptRevision(ctx, AcceptInput{EntryID: "ctx_ed", Revision: 2}, alice); err != nil {
+			return err
+		}
+		_, err := tx.SetPromotion(ctx, "ctx_ed", peer, carol)
+		return err
+	})
+	if !errors.Is(err, ErrInvariant) {
+		t.Fatalf("editor plus one peer reached peer_verified: %v", err)
+	}
+	mustUpdate(t, s, func(tx Tx) error {
+		_, err := tx.AcceptRevision(ctx, AcceptInput{EntryID: "ctx_ed", Revision: 2}, alice)
+		return err
+	})
+	// The schema refuses it too, for writers that bypass the Go layer.
+	if err := rawExec(t, s.Path(), "UPDATE entries SET status = 'verified', promoted = 1, verification_mode = 'peer_verified' WHERE id = 'ctx_ed'"); err == nil {
+		t.Fatal("raw write labelled an editor-approved revision peer_verified")
+	}
+	// A vote flip is caught before commit even though no entry column changes.
+	vote(t, s, "ctx_ed", dave, VerdictApprove)
+	e := promotePeer(t, s, "ctx_ed")
+	if !e.Promoted || e.VerificationMode != ModePeerVerified || e.Revision != 2 {
+		t.Fatalf("promoted = %+v", e)
+	}
+	if err := s.Update(ctx, func(tx Tx) error {
+		_, err := tx.RecordVote(ctx, VoteInput{EntryID: "ctx_ed", Verdict: VerdictReject}, dave)
+		return err
+	}); !errors.Is(err, ErrInvariant) {
+		t.Fatalf("losing the second peer kept peer_verified: %v", err)
+	}
+}
+
 func TestUpdateRollsBackOnErrorAndPanic(t *testing.T) {
 	ctx := context.Background()
 	s := openTestStore(t, nil)

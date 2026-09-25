@@ -52,10 +52,12 @@ type Tally struct {
 	// Approvals and Rejections count every distinct principal.
 	Approvals  int `json:"approvals"`
 	Rejections int `json:"rejections"`
-	// PeerApprovals and PeerRejections leave out the author and the open-mode
-	// identity: only these can make an entry peer_verified.
-	PeerApprovals    int  `json:"peer_approvals"`
-	PeerRejections   int  `json:"peer_rejections"`
+	// PeerApprovals and PeerRejections leave out the authors (the entry's author and
+	// the author of this revision) and the open-mode identity: only these can make an
+	// entry peer_verified.
+	PeerApprovals  int `json:"peer_approvals"`
+	PeerRejections int `json:"peer_rejections"`
+	// AuthorApproved: the entry's author or this revision's author approved it.
 	AuthorApproved   bool `json:"author_approved"`
 	OpenModeApproved bool `json:"open_mode_approved"`
 	Retractions      int  `json:"retractions"`
@@ -117,17 +119,21 @@ func (r *reader) Tally(ctx context.Context, entryID string, revision int64) (Tal
 	}
 	tl := Tally{EntryID: entryID, Revision: rev}
 	var authorApproved, openApproved int
+	// A vote is an author's when it comes from the entry's author or from the author of
+	// the revision it was cast on: an editor's approval of their own edit is not a peer's.
 	err = r.queryRow(ctx, `SELECT
 		coalesce(sum(v.verdict = 'approve'), 0),
 		coalesce(sum(v.verdict = 'reject'), 0),
-		coalesce(sum(v.verdict = 'approve' AND v.principal_key <> e.source_key AND v.principal_key <> ?), 0),
-		coalesce(sum(v.verdict = 'reject' AND v.principal_key <> e.source_key AND v.principal_key <> ?), 0),
-		coalesce(max(v.verdict = 'approve' AND v.principal_key = e.source_key), 0),
-		coalesce(max(v.verdict = 'approve' AND v.principal_key = ?), 0),
+		coalesce(sum(v.verdict = 'approve' AND v.principal_key NOT IN (e.source_key, coalesce(rv.author_key, e.source_key), ?1)), 0),
+		coalesce(sum(v.verdict = 'reject' AND v.principal_key NOT IN (e.source_key, coalesce(rv.author_key, e.source_key), ?1)), 0),
+		coalesce(max(v.verdict = 'approve' AND v.principal_key IN (e.source_key, coalesce(rv.author_key, e.source_key))), 0),
+		coalesce(max(v.verdict = 'approve' AND v.principal_key = ?1), 0),
 		coalesce(sum(v.verdict = 'retract'), 0),
 		coalesce(sum(v.verdict = 'duplicate_of'), 0)
-		FROM entries e LEFT JOIN votes v ON v.entry_id = e.id AND v.revision = ?
-		WHERE e.id = ?`, OpenModeIdentity, OpenModeIdentity, OpenModeIdentity, rev, entryID).Scan(
+		FROM entries e
+		LEFT JOIN revisions rv ON rv.entry_id = e.id AND rv.revision = ?2
+		LEFT JOIN votes v ON v.entry_id = e.id AND v.revision = ?2
+		WHERE e.id = ?3`, OpenModeIdentity, rev, entryID).Scan(
 		&tl.Approvals, &tl.Rejections, &tl.PeerApprovals, &tl.PeerRejections, &authorApproved, &openApproved,
 		&tl.Retractions, &tl.Duplicates)
 	if err != nil {

@@ -16,8 +16,8 @@
 //     DELETE, except purge redaction of free text.
 //   - Some invariants hold whatever policy a caller applies. Changing the served
 //     revision clears promotion. An entry is labelled peer_verified only while enough
-//     distinct principals other than its author and the open-mode identity approve the
-//     revision it serves.
+//     distinct principals approve the revision it serves, not counting the entry's
+//     author, that revision's author or the open-mode identity.
 //
 // Governance policy (thresholds, open mode, roles) stays with the caller. The store
 // provides transactional primitives: a caller reads, decides and writes inside one
@@ -678,10 +678,15 @@ func (t *txn) touch(entryID string) {
 	t.touched[entryID] = struct{}{}
 }
 
+// peerShortfall matches a peer_verified entry whose served revision lacks enough
+// approvals from principals other than the entry's author, the revision's author and
+// the open-mode identity (the same rule as the entries_peer_verified_update trigger).
 const peerShortfall = `e.verification_mode = 'peer_verified'
 	AND (SELECT count(*) FROM votes v
 	      WHERE v.entry_id = e.id AND v.revision = e.revision AND v.verdict = 'approve'
-	        AND v.principal_key <> e.source_key AND v.principal_key <> ?) < e.required_verifications`
+	        AND v.principal_key <> e.source_key AND v.principal_key <> ?
+	        AND v.principal_key NOT IN (SELECT r.author_key FROM revisions r
+	                                     WHERE r.entry_id = e.id AND r.revision = e.revision)) < e.required_verifications`
 
 // checkInvariants rejects the commit if any touched entry is labelled peer_verified
 // without enough distinct peer approvals on the revision it serves. The schema
