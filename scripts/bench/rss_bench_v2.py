@@ -1363,9 +1363,10 @@ def run_digest(r):
 def ledger_view(report):
     """{scenario: medians over the valid runs} for ledger_check: gate peak, owned+external
     tree peak, per-component RSS p50, footprint p50 and peak, and per-external peak. With
-    repeats, every metric is the median of its own values over the valid repeats (one
-    broken repeat drops out instead of removing the scenario). A scenario with no valid
-    run is left out."""
+    repeats, every metric is the median of its own values over the valid repeats. A
+    scenario counts as measured only when most of its repeats are valid: one broken
+    repeat of three drops out, two leave the scenario unmeasured, so a single surviving
+    run never stands in for three. A scenario that is not measured is left out."""
     out = {}
     for sc, r in report.get("scenarios", {}).items():
         if r.get("status") != "ran":
@@ -1373,6 +1374,8 @@ def ledger_view(report):
         rep = r.get("repeats") or {}
         if rep.get("detail"):
             runs = [d for d in rep["detail"] if d.get("valid", d.get("verdict") != "INVALID")]
+            if 2 * len(runs) <= len(rep["detail"]):
+                continue
         else:
             runs = [run_digest(r)] if (r.get("gate") or {}).get("valid") else []
         if not runs:
@@ -1430,11 +1433,54 @@ def process_p50(view, p):
     return (view.get("components_p50_mib") or {}).get(p) or 0.0, "RSS p50"
 
 
-def merged_lines(ledger, process, exclude=None):
+MERGE_SUBJECT = re.compile(r"^(?:merge pull request #\d+ from\s+|merge (?:remote-tracking )?branch\s+'|merge:?\s+)"
+                           r"([^\s']+)", re.IGNORECASE)
+
+
+def merged_workstreams(repo, since, until):
+    """Workstreams merged into `until` after `since`, oldest first: those a first-parent
+    merge commit in since..until names as its merged branch ("merge: parity/ws-08 into
+    feat/parity-v2", GitHub's "Merge pull request #12 from owner/parity/ws-14", or git's
+    "Merge branch 'parity/ws-14'"). None when either commit is missing or git cannot
+    resolve the range (a shallow clone). A squash or rebase merge leaves no merge commit;
+    list such workstreams in reference_measurement.merged_since."""
+    if not (since and until):
+        return None
+    p = run(["git", "log", "--first-parent", "--merges", "--format=%s", f"{since}..{until}"], cwd=repo, check=False)
+    if p.returncode != 0:
+        return None
+    out = []
+    for subject in reversed(p.stdout.splitlines()):
+        m = MERGE_SUBJECT.match(subject.strip())
+        ws = workstream_from_branch(m.group(1)) if m else None
+        if ws and ws not in out:
+            out.append(ws)
+    return out
+
+
+def merged_since(ledger, base_head, repo=REPO_ROOT):
+    """The workstreams merged into the base after the reference was measured: the declared
+    reference_measurement.merged_since plus those merged_workstreams finds between
+    reference_measurement.base_commit (the target-branch commit the reference binaries
+    were built from) and the base revision, so the list keeps up with merges without a
+    ledger edit."""
+    ref = ledger.get("reference_measurement") or {}
+    declared = list(ref.get("merged_since") or [])
+    since = ref.get("base_commit")
+    derived = merged_workstreams(repo, since, base_head)
+    return {"workstreams": declared + [w for w in derived or [] if w not in declared], "declared": declared,
+            "derived": derived, "range": f"{since}..{base_head}" if since and base_head else None,
+            "note": None if derived is not None else "only the declared list: git could not resolve the range"}
+
+
+def merged_lines(ledger, process, exclude=None, merged=None):
     """(sum, names) of the lines on `process` of the workstreams merged since the reference
-    was measured (reference_measurement.merged_since), leaving out `exclude`."""
+    was measured (`merged`, default reference_measurement.merged_since), leaving out
+    `exclude`."""
     total, names = 0.0, []
-    for wid in (ledger.get("reference_measurement") or {}).get("merged_since") or []:
+    if merged is None:
+        merged = (ledger.get("reference_measurement") or {}).get("merged_since") or []
+    for wid in merged:
         w = ledger["workstreams"].get(wid) or {}
         if wid != exclude and w.get("process") == process and w.get("line_mib"):
             total += w["line_mib"]
@@ -1443,8 +1489,8 @@ def merged_lines(ledger, process, exclude=None):
 
 
 def scenario_status(report):
-    """{scenario: "valid" | "invalid" | "skipped"} of one report: valid when at least one
-    repeat is valid (ledger_view keeps it), invalid when it ran without a valid repeat."""
+    """{scenario: "valid" | "invalid" | "skipped"} of one report: valid when most of its
+    repeats are valid (ledger_view keeps it), invalid when it ran without that."""
     view = ledger_view(report)
     out = {}
     for sc, r in (report.get("scenarios") or {}).items():
@@ -1456,10 +1502,11 @@ def scenario_status(report):
 
 
 DESIGNATED_GAPS = {  # (head, base) scenario states that leave a line unchecked and must block
-    ("valid", "invalid"): "the base produced no valid run, so the line is unchecked; re-run the check",
-    ("invalid", "valid"): "the head produced no valid run of a scenario the base measured",
-    ("invalid", "invalid"): "neither side produced a valid run, so the line is unchecked; re-run the check",
+    ("valid", "invalid"): "the base has no measurement (most repeats invalid), so the line is unchecked; re-run the check",
+    ("invalid", "valid"): "the head has no measurement (most repeats invalid) of a scenario the base measured",
+    ("invalid", "invalid"): "neither side has a measurement (most repeats invalid), so the line is unchecked; re-run the check",
     ("skipped", "valid"): "skipped at the head (feature absent) but measured at the base",
+    ("skipped", "invalid"): "skipped at the head (feature absent) but run at the base",
 }
 
 
@@ -1471,7 +1518,7 @@ def designated_gap(sc, head_state, base_state):
     return f"{sc}: {why}" if why else None
 
 
-def ledger_check(ledger, workstream, head, base, head_status=None, base_status=None):
+def ledger_check(ledger, workstream, head, base, head_status=None, base_status=None, merged=None):
     """Check a workstream's measured delta (head minus base: ledger_view() of two reports
     measured on one machine) against its ledger line.
 
@@ -1489,8 +1536,9 @@ def ledger_check(ledger, workstream, head, base, head_status=None, base_status=N
         in-tolerance deltas still fail once they add up ("absolute"). A process already
         over its design line at the reference ("grandfathered": the stdio shims,
         per-call cores and git children) is bounded on the reference scenario by reference p50 + the lines
-        of the workstreams merged since (reference_measurement.merged_since) + this
-        workstream's positive line + tolerance ("cumulative"). Everywhere else, and for
+        of the workstreams merged since (`merged`: merged_since() of the base revision;
+        default reference_measurement.merged_since) + this workstream's positive line +
+        tolerance ("cumulative"). Everywhere else, and for
         the cumulative bound, the check is base-aware: it fails the pull request that
         crosses the bound, and an overrun the base already had is reported, not blocking
         (the delta checks still bound its growth).
@@ -1567,9 +1615,9 @@ def ledger_check(ledger, workstream, head, base, head_status=None, base_status=N
             cur, basis = process_p50(h, p)
             base_cur, _ = process_p50(b, p)
             grandfathered = ref.get(p) is not None and ref[p] > dl["steady"]
-            merged = []
+            merged_names = []
             if grandfathered and sc == ref_sc:
-                m, merged = merged_lines(ledger, p, exclude=workstream)
+                m, merged_names = merged_lines(ledger, p, exclude=workstream, merged=merged)
                 own = max(line_here, 0.0) if p == proc else 0.0
                 allowed_d, rule = round(ref[p] + m + own + tol_p, 2), "cumulative"
             else:
@@ -1579,7 +1627,7 @@ def ledger_check(ledger, workstream, head, base, head_status=None, base_status=N
             ok = not over or (rule != "absolute" and base_over)
             des.append({"process": p, "p50_mib": cur, "basis": basis, "base_p50_mib": base_cur,
                         "design_steady_mib": dl["steady"], "allowed_mib": allowed_d, "rule": rule,
-                        "grandfathered": grandfathered, "merged_since": merged, "over": over, "base_over": base_over, "ok": ok})
+                        "grandfathered": grandfathered, "merged_since": merged_names, "over": over, "base_over": base_over, "ok": ok})
             if ok:
                 continue
             if rule == "cumulative":
@@ -1618,50 +1666,85 @@ def ledger_check(ledger, workstream, head, base, head_status=None, base_status=N
 
 
 def gate_blocking(ledger, workstream, report, base_report):
-    """Which gate verdicts block a pull request (run --workstream with --baseline).
+    """Which gate verdicts block a pull request (run --workstream with --baseline). One
+    row per scenario of the head report, by rule:
 
-    A CI-suite scenario blocks on its own verdict, as on a push: any repeat over the gate,
-    or an invalid run, fails the pull request. Any other scenario that ran (a workstream's
-    designated parity-scale scenario) blocks only on a regression the pull request
-    introduced: the base's median gate peak over its valid repeats was within the gate and
-    the head's is over it, or the base had a valid run and the head has none. Medians of
-    both sides decide, so one noisy repeat does not. An overrun the base already had is
-    reported and does not block; ledger_check still bounds its growth. A workstream whose
-    acceptance names the absolute gate on its designated scenarios opts in with
-    `gate_blocking: true`, and those scenarios then block like CI-suite ones. Nothing
-    having run blocks."""
+      * absolute: a CI-suite scenario blocks on its own verdict, as on a push: any repeat
+        over the gate, or an invalid run. So does a designated scenario of a workstream
+        whose acceptance names the absolute gate there (`gate_blocking: true`).
+      * new: a scenario the base could not run (skipped for an absent feature, or not in
+        the base report) also blocks on the head's own verdict. The pull request
+        introduced it, so there is no base to compare with.
+      * regression: any other scenario that ran (a workstream's designated parity-scale
+        scenario) blocks only on a regression beyond noise: the base median over its
+        valid repeats was within the gate, and the head median is over the gate and more
+        than tolerance.tree_peak_mib above the base median. Medians decide, so one noisy
+        repeat does not, and neither does a median that moved within the noise the
+        ledger allows every tree delta. An overrun the base already had is reported and
+        does not block; ledger_check still bounds its growth. A side without a
+        measurement (most repeats invalid) blocks: re-run the check.
+      * coverage: a scenario the base ran and the head skipped, because its feature went
+        away, blocks whether it is in the CI suite or not: the pull request removed a
+        measurement. Skipped on both sides is reported.
+    Nothing having run blocks."""
     w = ledger["workstreams"].get(workstream) or {}
     opt_in = set(w.get("scenarios") or []) if w.get("gate_blocking") else set()
     limit = ledger["gate"]["limit_bytes"] / MIB
+    noise = ledger["tolerance"]["tree_peak_mib"]
     base_report = base_report or {}
     hv, bv = ledger_view(report), ledger_view(base_report)
+    hs, bs = scenario_status(report), scenario_status(base_report)
     rows = []
     for sc, r in (report.get("scenarios") or {}).items():
-        if r.get("status") != "ran":
-            continue
-        verdict = (r.get("gate") or {}).get("verdict")
         br = (base_report.get("scenarios") or {}).get(sc) or {}
+        b_state = bs.get(sc, "not run")
         b_verdict = (br.get("gate") or {}).get("verdict", br.get("status", "not run"))
         h_med, b_med = (hv.get(sc) or {}).get("gate_peak_mib"), (bv.get(sc) or {}).get("gate_peak_mib")
+        row = {"scenario": sc, "base_verdict": b_verdict, "head_median_mib": h_med, "base_median_mib": b_med}
+        if r.get("status") != "ran":
+            row["verdict"] = r.get("status") or "skipped"
+            row["rule"] = "coverage"
+            if b_state in ("valid", "invalid"):
+                row["blocking"], row["why"] = True, (f"skipped at the head ({r.get('reason', 'not run')}) but the base "
+                                                     "ran it: the pull request removed this measurement")
+            else:
+                row["blocking"], row["why"] = False, "not run at the head or the base"
+            rows.append(row)
+            continue
+        verdict = (r.get("gate") or {}).get("verdict")
+        row["verdict"] = verdict
         if in_ci_suite(sc) or sc in opt_in:
             rule = "absolute" if in_ci_suite(sc) else "absolute (gate_blocking)"
             blocking = verdict != "PASS"
             why_ = ("a CI-suite scenario" if in_ci_suite(sc) else "the workstream opted in") + ": its own verdict decides"
+        elif b_state in ("skipped", "not run"):
+            rule, blocking = "new", verdict != "PASS"
+            why_ = (f"the base could not run it ({br.get('reason') or 'not in the base report'}): the pull request "
+                    "introduced it, so its own verdict decides")
         else:
             rule = "regression"
-            if b_med is None:
-                blocking, why_ = False, "the base has no valid run to compare with"
+            rep = r.get("repeats") or {}
+            valid_h = rep.get("valid_runs", int(bool((r.get("gate") or {}).get("valid"))))
+            runs_h = rep.get("runs", 1)
+            if h_med is None:
+                blocking, why_ = True, f"the head has no measurement ({valid_h} of {runs_h} repeats valid)"
+            elif b_med is None:
+                blocking, why_ = True, "the base has no measurement (most repeats invalid): re-run the check"
             elif b_med > limit:
                 blocking, why_ = False, f"the base median {b_med} MiB was already over the gate"
-            elif h_med is None:
-                blocking, why_ = True, f"the head has no valid run; the base median {b_med} MiB was within the gate"
+            elif h_med <= limit:
+                blocking, why_ = False, f"head median {h_med} MiB is within the gate (base median {b_med} MiB)"
+            elif round(h_med - b_med, 2) <= noise:
+                blocking, why_ = False, (f"head median {h_med} MiB is over the gate but within {noise} MiB of the base "
+                                         f"median {b_med} MiB: not told apart from noise")
             else:
-                blocking = h_med > limit
-                why_ = f"head median {h_med} MiB, base median {b_med} MiB"
-        rows.append({"scenario": sc, "verdict": verdict, "base_verdict": b_verdict, "rule": rule, "head_median_mib": h_med,
-                     "base_median_mib": b_med, "blocking": blocking, "why": why_})
-    return {"workstream": workstream, "limit_mib": round(limit, 1), "rows": rows,
-            "blocking": not rows or any(r["blocking"] for r in rows), "note": None if rows else "no scenario ran"}
+                blocking, why_ = True, (f"head median {h_med} MiB is over the gate and {round(h_med - b_med, 2)} MiB "
+                                        f"above the base median {b_med} MiB (noise allowance {noise} MiB)")
+        row.update(rule=rule, blocking=blocking, why=why_)
+        rows.append(row)
+    ran = [r for r in rows if r["rule"] != "coverage"]
+    return {"workstream": workstream, "limit_mib": round(limit, 1), "noise_allowance_mib": noise, "rows": rows,
+            "blocking": not ran or any(r["blocking"] for r in rows), "note": None if ran else "no scenario ran"}
 
 
 def exit_code(report, require_parity_claim=False):
@@ -2608,9 +2691,11 @@ def render_markdown(report):
         L.append("## Blocking for this pull request")
         L.append("")
         L.append(f"Workstream {gb.get('workstream')}: **{'blocking' if gb.get('blocking') else 'not blocking'}**"
-                 + (f" ({gb['note']})" if gb.get("note") else "") + ". CI-suite scenarios block on their own verdict; "
-                 "other scenarios block only when the base median was within the gate and the head median is over it, "
-                 "unless the workstream opts in with `gate_blocking`.")
+                 + (f" ({gb['note']})" if gb.get("note") else "") + ". CI-suite scenarios, and those of a workstream "
+                 "that opts in with `gate_blocking`, block on their own verdict, and so does a scenario the base could "
+                 "not run. Other scenarios block only on a regression: the base median was within the gate, and the head "
+                 f"median is over it and more than {gb.get('noise_allowance_mib', 'the tree tolerance')} MiB above the base "
+                 "median. A scenario the base ran and the head skipped blocks.")
         L.append("")
         L.append("| Scenario | Head verdict | Base verdict | Rule | Head median MiB | Base median MiB | Blocks | Why |")
         L.append("|---|---|---|---|---|---|---|---|")
@@ -2627,6 +2712,12 @@ def render_markdown(report):
                  + (f", measured on {', '.join(lc['scenarios_designated'])}" if lc.get("scenarios_designated") else "")
                  + f"): **{lc.get('verdict') or ('PASS' if lc.get('passed') else 'FAIL')}**"
                  + (f" ({lc['note']})" if lc.get("note") else "") + ".")
+        ms = lc.get("merged_since")
+        if ms:
+            L.append("")
+            L.append(f"Workstreams merged into the base since the reference measurement: {', '.join(ms['workstreams']) or 'none'}"
+                     + (f" (merge commits in {ms['range']}" + (f", plus declared {', '.join(ms['declared'])}" if ms.get("declared") else "")
+                        + ")" if ms.get("derived") is not None else f" ({ms.get('note')})") + ".")
         L.append("")
         L.append("| Scenario | Line MiB | Tree delta (allowed) | Owned+external delta | External growth | "
                  "Process delta, basis (allowed) | Other components over | Design bounds over |")
@@ -2825,9 +2916,11 @@ def cmd_run(args):
     report["design_comparison"] = design_comparison(ledger, view)
     report["ledger_path"] = os.path.abspath(args.ledger)
     if args.workstream:
+        base_head = (base.get("provenance") or {}).get("head")
+        merged = merged_since(ledger, base_head)
         report["ledger_check"] = ledger_check(ledger, args.workstream, view, ledger_view(base),
-                                              scenario_status(report), scenario_status(base))
-        report["ledger_check"]["baseline_head"] = (base.get("provenance") or {}).get("head")
+                                              scenario_status(report), scenario_status(base), merged["workstreams"])
+        report["ledger_check"].update(baseline_head=base_head, merged_since=merged)
         report["gate_blocking"] = gate_blocking(ledger, args.workstream, report, base)
     write_reports(report, out_dir)
     code = exit_code(report, args.require_parity_claim)
@@ -2882,7 +2975,10 @@ def cmd_ledger(args):
         if not (args.head and args.baseline):
             raise SystemExit("ledger --workstream needs --head and --baseline report.json files")
         head, base = load_json(args.head), load_json(args.baseline)
-        chk = ledger_check(ledger, args.workstream, ledger_view(head), ledger_view(base), scenario_status(head), scenario_status(base))
+        merged = merged_since(ledger, (base.get("provenance") or {}).get("head"))
+        chk = ledger_check(ledger, args.workstream, ledger_view(head), ledger_view(base), scenario_status(head),
+                           scenario_status(base), merged["workstreams"])
+        chk["merged_since"] = merged
         print(json.dumps(chk, indent=1))
         return 1 if chk["blocking"] else 0
     rec = ledger_reconcile(ledger)

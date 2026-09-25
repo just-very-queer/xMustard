@@ -73,7 +73,9 @@ A single run of a borderline scenario can land on either side of the gate (agent
 79.4-97.0 MiB across three runs of one build), so decisions use `--repeat 3`. The reported
 run is the median-peak run among the valid repeats (an invalid repeat is never the
 measurement), and any non-PASS repeat fails the scenario with the most severe verdict
-(FAIL over INVALID). The ledger compares per-metric medians over the valid repeats.
+(FAIL over INVALID). The ledger compares per-metric medians over the valid repeats, and
+only when most repeats are valid: one invalid repeat of three drops out, two leave the
+scenario unmeasured.
 
 ### Fixtures (`parity_fixtures.json`)
 
@@ -115,8 +117,11 @@ and `--baseline`), each common scenario is checked:
   stay within design steady + tolerance whatever the base shows, so small in-tolerance
   deltas still fail once they add up. A process already over its line at the reference
   (today's stdio shims, per-call cores and git children) is bounded on the reference
-  scenario by reference p50 + the lines of the workstreams merged since
-  (`reference_measurement.merged_since`) + its own positive line + tolerance. On other
+  scenario by reference p50 + the lines of the workstreams merged since + its own positive
+  line + tolerance. The merged workstreams come from the first-parent merge commits in
+  `reference_measurement.base_commit..<base revision>` (`merge: parity/ws-NN into ...` or
+  GitHub's `Merge pull request #N from .../ws-NN`); `merged_since` lists only those merged
+  without a merge commit (squash or rebase). On other
   scenarios, and for that cumulative bound, the check is base-aware: it fails the pull
   request that crosses the bound, and reports an overrun the base already had without
   blocking (the delta checks still bound its growth).
@@ -137,20 +142,60 @@ repeats each) over the CI suite plus the workstream's designated scenarios
 starting `ws-NN`). What blocks the pull request (`gate_blocking` in the report):
 
 - a CI-suite scenario's own gate verdict: any repeat over 95.4 MiB, or an invalid run;
-- a designated scenario outside the CI suite only on a regression: the base's median gate
-  peak was within the gate and the head's is over it, or the base had a valid run and the
-  head has none. An overrun the base already had (agents-2 measured 79.4-97.0 MiB before
-  WS-13 removes the stdio shims) is reported, not blocking. A workstream whose acceptance
-  is the absolute gate on its scenario opts in with `gate_blocking: true` (WS-13, WS-30,
-  WS-55), and its designated scenarios then block like CI-suite ones;
+- a designated scenario outside the CI suite only on a regression beyond noise: the base's
+  median gate peak was within the gate, and the head's is over it and more than
+  `tolerance.tree_peak_mib` (10 MiB) above the base's. Without the margin, identical code
+  blocked 140 of the 729 combinations of three repeats drawn from agents-2's recorded
+  single-run peaks (79.4, 87.2, 97.0 MiB on a loaded M1); with it, 49 (a base drawing two
+  low runs against a head drawing two high ones). An overrun the base already had is
+  reported, not blocking. A side without a measurement (most repeats invalid) blocks: re-run.
+  A workstream whose acceptance is the absolute gate on its scenario opts in with
+  `gate_blocking: true` (WS-13, WS-30, WS-55), and its designated scenarios then block like
+  CI-suite ones;
+- a scenario the base could not run (skipped for an absent feature): the head's own
+  verdict, since the pull request introduced it;
+- a scenario the base ran and the head skipped, CI suite or not: the pull request removed
+  a measurement (after WS-13, a broken `/mcp` probe would otherwise skip `agents-2-relay`,
+  the only CI measurement of the HTTP transport, silently);
 - a FAIL from the ledger check.
 
 The check uses the base revision's ledger; a pull request that changes any non-prose
 ledger value (`rss_v2.sh ledger --diff BASE_LEDGER`) fails unless a maintainer adds the
 `budget-ledger-change` label. The measuring code and the workflow still come from the pull
-request, so `.github/CODEOWNERS` names the owner for `scripts/bench/` and `.github/`;
-branch protection with "Require review from Code Owners" is the owner's setting.
+request, so `.github/CODEOWNERS` names the owner for `scripts/bench/` and `.github/`.
+There is one owner, who also authors these pull requests, and GitHub does not count an
+author's own approval: until a second code owner exists, changes to the gate and the
+workflow are self-reviewed, and "Require review from Code Owners" (not enabled on `main`
+or `feat/parity-v2` as of 2026-09-25) could only be met by an admin bypass.
 
 The tolerances and `reference_measurement` were measured on a loaded M1 (darwin, where
 footprint is `phys_footprint`); on the Linux runner footprint is PSS. Replace both with
 data from the first CI runs before relying on the design and cumulative bounds there.
+
+### First CI run (owner or orchestrator)
+
+Agents do not push, so the workflow has been checked statically (`actionlint` with
+shellcheck) and its commands run on a Linux box, not on GitHub. On the first run, a test
+pull request from `parity/ws-10` into `feat/parity-v2` (both pushed first):
+
+1. Record the verdict and duration of `backend`, `bench-unit`, `integrations-pi`,
+   `core-release`, `retrieval-gate` and `budget-gate` (each has a timeout; a cold Rust
+   cache is the slow case). `parity-scale` runs only on the schedule or a manual dispatch
+   with `parity: true`.
+2. `bench-unit` must report `test_linux_probe_reads_a_live_child` and
+   `test_live_ps_parses_and_attributes_this_platform` as run, not skipped: they are the
+   procps `ps` parse and the `/proc` smaps_rollup, status and io probes.
+3. `budget-gate`: the step summary and the `budget-gate-v2-report` artifact hold
+   `bench-out/base` and `bench-out/head`. Check that the base worktree step ran, both sides
+   measured `v1-workload` three times with `probe: linux`, the footprint column is PSS,
+   `agents-2-relay` is skipped on both sides until WS-13, `gate_blocking` names workstream
+   WS-10, and the ledger check verdict is BELOW_RESOLUTION (WS-10's line is 0).
+4. Compare the runner's per-process p50, repeat spread and v1 cross-check difference with
+   `tolerance` and `reference_measurement`. Replace `reference_measurement` with the
+   runner's base measurement (set `base_commit` to the base revision measured, clear
+   `merged_since`) and recalibrate the tolerances, including the 10 MiB regression margin,
+   from the repeat spread. That pull request needs the `budget-ledger-change` label.
+5. Enable branch protection on `main` and `feat/parity-v2` with this workflow's jobs as
+   required checks, and add a second code owner or keep the self-review note above.
+6. `rss_v2.sh ledger` exits 1 until the owner records the reconciliation decision in
+   `budget_ledger.json` (`reconciliation`); CI does not run it, so it blocks nothing.

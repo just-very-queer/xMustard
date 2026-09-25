@@ -27,7 +27,6 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: never
-  CARGO_BUILD_JOBS: "2"
   PYTHONUNBUFFERED: "1"
 
 jobs:
@@ -161,8 +160,11 @@ jobs:
       # BASE revision's budget_ledger.json: a pull request that changes lines, tolerances,
       # design lines or roles fails unless a maintainer adds the budget-ledger-change label.
       # CI-suite scenarios block on their own gate verdict. A workstream's designated
-      # parity-scale scenario blocks only on a regression (base median within 95.4 MiB, head
-      # median over it) unless its ledger entry sets gate_blocking (WS-13, WS-30, WS-55).
+      # parity-scale scenario blocks only on a regression beyond noise (base median within
+      # 95.4 MiB, head median over it and more than tolerance.tree_peak_mib above the base)
+      # unless its ledger entry sets gate_blocking (WS-13, WS-30, WS-55). A scenario the base
+      # cannot run is judged by the head's verdict; one the head stops running blocks.
+      # The base uses the head's binaries when rust-core is identical, else its own build.
       - name: Prepare the base revision
         if: github.event_name == 'pull_request'
         id: base
@@ -171,10 +173,10 @@ jobs:
         run: |
           git worktree add --detach "$RUNNER_TEMP/base" "$BASE_SHA"
           if git diff --quiet "$BASE_SHA" HEAD -- rust-core; then
-            echo "core=$RUNNER_TEMP/core/xmustard-core" >> "$GITHUB_OUTPUT"
+            echo "bin=$RUNNER_TEMP/core" >> "$GITHUB_OUTPUT"
             echo "build_core=false" >> "$GITHUB_OUTPUT"
           else
-            echo "core=$RUNNER_TEMP/base/rust-core/target/release/xmustard-core" >> "$GITHUB_OUTPUT"
+            echo "bin=$RUNNER_TEMP/base/rust-core/target/release" >> "$GITHUB_OUTPUT"
             echo "build_core=true" >> "$GITHUB_OUTPUT"
           fi
       - name: Choose the ledger and the scenarios
@@ -212,16 +214,24 @@ jobs:
           toolchain: stable
       - name: Build the base core (rust-core differs)
         if: steps.base.outputs.build_core == 'true'
-        run: cd "$RUNNER_TEMP/base/rust-core" && cargo build --release --locked --bin xmustard-core
+        run: |
+          cd "$RUNNER_TEMP/base/rust-core"
+          cargo build --release --locked --bin xmustard-core
+          if [ -f src/bin/xmustard-relay.rs ]; then
+            cargo build --release --locked --bin xmustard-relay
+          fi
       - name: Gate v2 on the base revision
         if: github.event_name == 'pull_request'
         env:
+          BASE_BIN: ${{ steps.base.outputs.bin }}
           LEDGER: ${{ steps.plan.outputs.ledger }}
           SCENARIOS: ${{ steps.plan.outputs.scenarios }}
           XMUSTARD_FIXTURE_CACHE: ${{ runner.temp }}/fixtures
         run: |
+          relay=()
+          if [ -x "$BASE_BIN/xmustard-relay" ]; then relay=(--relay-bin "$BASE_BIN/xmustard-relay"); fi
           scripts/bench/rss_v2.sh run --scenarios "$SCENARIOS" --repeat 3 --ledger "$LEDGER" --source-root "$RUNNER_TEMP/base" \
-            --core-bin "${{ steps.base.outputs.core }}" --out bench-out/base || true
+            --core-bin "$BASE_BIN/xmustard-core" "${relay[@]}" --out bench-out/base || true
           test -f bench-out/base/report.json
       - name: Gate v2 on the head (pull request, with the ledger check)
         if: github.event_name == 'pull_request'
@@ -231,7 +241,7 @@ jobs:
           WS: ${{ steps.plan.outputs.workstream }}
           XMUSTARD_FIXTURE_CACHE: ${{ runner.temp }}/fixtures
         run: |
-          [ -x "$RUNNER_TEMP/core/xmustard-relay" ] && export XMUSTARD_RELAY_BIN="$RUNNER_TEMP/core/xmustard-relay"
+          if [ -x "$RUNNER_TEMP/core/xmustard-relay" ]; then export XMUSTARD_RELAY_BIN="$RUNNER_TEMP/core/xmustard-relay"; fi
           scripts/bench/rss_v2.sh run --scenarios "$SCENARIOS" --repeat 3 --ledger "$LEDGER" \
             --core-bin "$RUNNER_TEMP/core/xmustard-core" --out bench-out/head \
             --workstream "$WS" --baseline bench-out/base/report.json
@@ -241,7 +251,7 @@ jobs:
       - name: Gate v2 (push or manual run)
         if: github.event_name != 'pull_request'
         run: |
-          [ -x "$RUNNER_TEMP/core/xmustard-relay" ] && export XMUSTARD_RELAY_BIN="$RUNNER_TEMP/core/xmustard-relay"
+          if [ -x "$RUNNER_TEMP/core/xmustard-relay" ]; then export XMUSTARD_RELAY_BIN="$RUNNER_TEMP/core/xmustard-relay"; fi
           scripts/bench/rss_v2.sh run --suite ci --core-bin "$RUNNER_TEMP/core/xmustard-core" --out bench-out/head
       - name: Report summary
         if: always()

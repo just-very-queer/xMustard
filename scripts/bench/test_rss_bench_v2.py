@@ -635,6 +635,7 @@ class Ledger(unittest.TestCase):
             self.assertTrue(LEDGER["workstreams"][wid].get("scenarios"), wid)
         for wid in LEDGER["reference_measurement"]["merged_since"]:
             self.assertIn(wid, LEDGER["workstreams"])
+        self.assertRegex(LEDGER["reference_measurement"]["base_commit"], r"^[0-9a-f]{40}$")
 
     def test_reconcile_reports_the_overcommit_and_exits_nonzero(self):
         rec = v2.ledger_reconcile(LEDGER)
@@ -882,11 +883,85 @@ class PullRequestBlocking(unittest.TestCase):
         for ws in ("WS-30", "WS-55"):
             self.assertTrue(LEDGER["workstreams"][ws]["gate_blocking"], ws)
         self.assertEqual(self.blocks("WS-13", gate_report(v1_workload=[70.0], agents_2_small=[60.0, 61.0, 62.0]), base)[0], False)
-        # an invalid CI-suite run blocks; a CI-suite scenario skipped for an absent feature does not
+        # an invalid CI-suite run blocks; a CI-suite scenario skipped for an absent feature on both sides does not
         inv = gate_report(v1_workload=[gate_run(70.0, "INVALID"), 71.0, 72.0], agents_2_relay=None)
-        self.assertEqual(self.blocks("unlisted", inv, base), (True, {"v1-workload": True}))
+        base_skip = gate_report(v1_workload=[70.0, 71.0, 72.0], agents_2_relay=None)
+        self.assertEqual(self.blocks("unlisted", inv, base_skip), (True, {"v1-workload": True, "agents-2-relay": False}))
         # nothing ran: blocking
         self.assertEqual(v2.gate_blocking(LEDGER, "unlisted", gate_report(agents_2_relay=None), base)["blocking"], True)
+
+    def test_a_regression_must_be_beyond_noise(self):
+        # review round 3: identical code (single-run agents-2 peaks 79.4-97.0 MiB on a loaded M1) must not block
+        # WS-14's pull request because the head's median of three drew high and the base's drew low
+        v1_ok = [74.0, 75.0, 76.0]
+        base = gate_report(v1_workload=v1_ok, agents_2=[80.0, 88.0, 90.0])
+        head = gate_report(v1_workload=v1_ok, agents_2=[79.0, 96.0, 97.0])
+        gb = v2.gate_blocking(LEDGER, "WS-14", head, base)
+        row = {r["scenario"]: r for r in gb["rows"]}["agents-2"]
+        self.assertEqual((gb["blocking"], row["rule"], row["head_median_mib"], row["base_median_mib"]), (False, "regression", 96.0, 88.0))
+        self.assertIn("within 10.0 MiB of the base median", row["why"])
+        # beyond the tree tolerance and over the gate: the pull request did it
+        self.assertEqual(self.blocks("WS-14", gate_report(v1_workload=v1_ok, agents_2=[99.0, 100.0, 90.0]), base)[0], True)
+        # every combination of three repeats drawn from the recorded peaks: 140 of 729 blocked under the
+        # medians-only rule; now only a base median at the low peak against a head median at the high one
+        import itertools
+        peaks = (79.4, 87.2, 97.0)
+        blocked = 0
+        for h in itertools.product(peaks, repeat=3):
+            for b in itertools.product(peaks, repeat=3):
+                blocked += v2.gate_blocking(LEDGER, "WS-14", gate_report(agents_2=list(h)), gate_report(agents_2=list(b)))["blocking"]
+        self.assertEqual(blocked, 49)
+
+    def test_a_scenario_the_base_could_not_run_is_judged_by_the_head(self):
+        # WS-15 designating watcher-on, which its base cannot run (feature absent): the head's own verdict decides
+        led = copy.deepcopy(LEDGER)
+        led["workstreams"]["WS-15"]["scenarios"] = ["watcher-on"]
+        base = gate_report(v1_workload=[74.0, 75.0, 76.0], watcher_on=None)
+        gb = v2.gate_blocking(led, "WS-15", gate_report(v1_workload=[74.0, 75.0, 76.0], watcher_on=[120.0, 121.0, 122.0]), base)
+        row = {r["scenario"]: r for r in gb["rows"]}["watcher-on"]
+        self.assertEqual((gb["blocking"], row["rule"], row["blocking"]), (True, "new", True))
+        self.assertEqual(v2.gate_blocking(led, "WS-15", gate_report(v1_workload=[74.0], watcher_on=[80.0, 81.0, 82.0]), base)["blocking"], False)
+        self.assertEqual(v2.gate_blocking(led, "WS-15", gate_report(v1_workload=[74.0], watcher_on=[80.0, 81.0, 97.0]), base)["blocking"], True)
+        # a scenario missing from the base report is judged the same way
+        self.assertEqual(v2.gate_blocking(led, "WS-15", gate_report(v1_workload=[74.0], watcher_on=[120.0, 121.0, 122.0]),
+                                          gate_report(v1_workload=[74.0]))["blocking"], True)
+        # the ledger check cannot measure the line there (NOT_CHECKABLE): the gate verdict is what blocks
+        chk = v2.ledger_check(led, "WS-15", v2.ledger_view(gate_report(v1_workload=[74.0], watcher_on=[120.0, 121.0, 122.0])),
+                              v2.ledger_view(base), {"v1-workload": "valid", "watcher-on": "valid"},
+                              {"v1-workload": "valid", "watcher-on": "skipped"})
+        self.assertEqual(chk["verdict"], "NOT_CHECKABLE")
+
+    def test_a_minority_of_valid_repeats_is_no_measurement(self):
+        inv = gate_run(80.0, "INVALID")
+        base = gate_report(v1_workload=[74.0, 75.0, 76.0], agents_2=[80.0, 81.0, 82.0])
+        head = gate_report(v1_workload=[74.0, 75.0, 76.0], agents_2=[inv, inv, 80.0])
+        self.assertEqual(v2.scenario_status(head)["agents-2"], "invalid")
+        self.assertNotIn("agents-2", v2.ledger_view(head))
+        gb = v2.gate_blocking(LEDGER, "WS-14", head, base)
+        self.assertEqual((gb["blocking"], {r["scenario"]: r["why"] for r in gb["rows"]}["agents-2"]),
+                         (True, "the head has no measurement (1 of 3 repeats valid)"))
+        chk = v2.ledger_check(LEDGER, "WS-14", v2.ledger_view(head), v2.ledger_view(base), v2.scenario_status(head), v2.scenario_status(base))
+        self.assertEqual(chk["verdict"], "FAIL")
+        # two valid repeats of three are a measurement: the median of those two
+        two = gate_report(v1_workload=[74.0, 75.0, 76.0], agents_2=[inv, 80.0, 84.0])
+        self.assertEqual((v2.scenario_status(two)["agents-2"], v2.ledger_view(two)["agents-2"]["gate_peak_mib"]), ("valid", 82.0))
+        # a base without a measurement blocks the regression rule too: re-run
+        gb = v2.gate_blocking(LEDGER, "WS-14", base, head)
+        self.assertIn("re-run", {r["scenario"]: r["why"] for r in gb["rows"]}["agents-2"])
+        self.assertTrue(gb["blocking"])
+
+    def test_a_measurement_the_head_dropped_blocks(self):
+        # after WS-13, a pull request that breaks the http_mcp probe skips agents-2-relay, the only CI measurement
+        # of the HTTP transport: blocking, although agents-2-relay has no ledger line of its own
+        base = gate_report(v1_workload=[74.0, 75.0, 76.0], agents_2_relay=[60.0, 61.0, 62.0])
+        head = gate_report(v1_workload=[74.0, 75.0, 76.0], agents_2_relay=None)
+        gb = v2.gate_blocking(LEDGER, "unlisted", head, base)
+        row = {r["scenario"]: r for r in gb["rows"]}["agents-2-relay"]
+        self.assertEqual((gb["blocking"], row["rule"], row["blocking"]), (True, "coverage", True))
+        self.assertIn("removed this measurement", row["why"])
+        # the same for a designated scenario, where the ledger check also fails it
+        led_base = gate_report(v1_workload=[74.0, 75.0, 76.0], agents_2=[80.0, 81.0, 82.0])
+        self.assertTrue(v2.gate_blocking(LEDGER, "WS-14", gate_report(v1_workload=[74.0, 75.0, 76.0], agents_2=None), led_base)["blocking"])
 
     def test_exit_code(self):
         rep = gate_report(v1_workload=[70.0, 71.0, 72.0], agents_2=[97.0, 98.0, 99.0])
@@ -955,13 +1030,46 @@ class PullRequestBlocking(unittest.TestCase):
                                 self.view("agents-2-relay", 60.0, {"mcp_access": 2.0}))
         self.assertEqual((self.design(relay, "mcp_access")["rule"], self.design(relay, "mcp_access")["ok"]), ("base-aware", False))
 
+    def test_merged_workstreams_are_derived_from_merge_commits(self):
+        with tempfile.TemporaryDirectory() as repo:
+            def commit(msg, *extra):
+                git(["commit", "-q", "--allow-empty", "-m", msg, *extra], repo)
+                return git(["rev-parse", "HEAD"], repo)
+
+            git(["init", "-q"], repo)
+            since = commit("reference measured here")
+            for subject in ("merge: parity/ws-08 into feat/parity-v2", "Merge pull request #12 from owner/parity/ws-60",
+                            "merge: parity/w0-drift into feat/parity-v2", "Merge branch 'parity/ws-08'"):
+                side = git(["commit-tree", "-p", "HEAD", "-m", "side", git(["rev-parse", "HEAD^{tree}"], repo)], repo)
+                git(["merge", "-q", "--no-ff", "-m", subject, side], repo)
+            commit("feat: squash-merged WS-16 work (#13)")
+            head = git(["rev-parse", "HEAD"], repo)
+            self.assertEqual(v2.merged_workstreams(repo, since, head), ["WS-08", "WS-60"])
+            self.assertIsNone(v2.merged_workstreams(repo, "0" * 40, head))
+            led = copy.deepcopy(LEDGER)
+            led["workstreams"]["WS-60"]["line_mib"] = 4
+            led["reference_measurement"].update(base_commit=since, merged_since=["WS-16"])
+            m = v2.merged_since(led, head, repo)
+            self.assertEqual((m["workstreams"], m["derived"], m["note"]), (["WS-16", "WS-08", "WS-60"], ["WS-08", "WS-60"], None))
+            self.assertEqual(v2.merged_since(led, None, repo)["workstreams"], ["WS-16"])
+            md = v2.render_markdown({"generated_at": "t", "verdict": "PASS", "provenance": {}, "unmeasured": [], "scenarios": {},
+                                     "parity_claim": {"established": False, "missing": []},
+                                     "ledger_check": {"workstream": "WS-16", "rows": [], "merged_since": m}})
+            self.assertIn(f"since the reference measurement: WS-16, WS-08, WS-60 (merge commits in {since}..{head}, "
+                          "plus declared WS-16).", md)
+        # the derived WS-60 line on rust_core_per_call moves the cumulative bound: 6.2 + 4 + 3
+        chk = v2.ledger_check(led, "WS-16", self.view("v1-workload", 80.0, {"rust_core_per_call": 12.0}),
+                              self.view("v1-workload", 80.0, {"rust_core_per_call": 9.1}), merged=m["workstreams"])
+        d = self.design(chk, "rust_core_per_call")
+        self.assertEqual((d["allowed_mib"], d["merged_since"], d["ok"]), (13.2, ["WS-60"], True))
+
     def test_an_unmeasured_designated_scenario_fails_closed(self):
         v1v = self.view("v1-workload", 80.0, {"go_daemon": 12.0})
         a2 = dict(v1v, **self.view("agents-2", 85.0, {"go_daemon": 20.0}))
         valid, base_bad = {"v1-workload": "valid", "agents-2": "valid"}, {"v1-workload": "valid", "agents-2": "invalid"}
         chk = v2.ledger_check(LEDGER, "WS-14", a2, v1v, valid, base_bad)
         self.assertEqual(chk["verdict"], "FAIL")
-        self.assertIn("the base produced no valid run", chk["note"])
+        self.assertIn("the base has no measurement", chk["note"])
         self.assertEqual(v2.ledger_check(LEDGER, "WS-14", v1v, a2, base_bad, valid)["verdict"], "FAIL")
         both_bad = v2.ledger_check(LEDGER, "WS-14", v1v, v1v, base_bad, base_bad)
         self.assertEqual(both_bad["verdict"], "FAIL")
