@@ -3,6 +3,7 @@ package workspaceops
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sync"
@@ -128,36 +129,55 @@ func TestConcurrentSearchesCoalesceIntoOneWrite(t *testing.T) {
 }
 
 // Ranking sees buffered feedback before any flush, merged with the on-disk state.
+// hot.go starts below cold.go and carries only a small on-disk boost, so it can
+// overtake cold.go only if its unflushed retrievals are counted.
 func TestFeedbackBoostSeesPendingBeforeFlush(t *testing.T) {
 	ws := "wsPending"
 	dir := seedFeedbackWorkspace(t, ws)
 	useFeedbackRecorder(t, feedbackMaxPendingPaths)
-	if err := RecordFeedback(dir, ws, "run_fail", []string{"cold.go"}); err != nil {
+	if err := RecordFeedback(dir, ws, "retrieval", []string{"hot.go"}); err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < 5; i++ {
+	if err := RecordFeedback(dir, ws, "run_fail", []string{"failed.go"}); err != nil {
+		t.Fatal(err)
+	}
+	const buffered = 4
+	for i := 0; i < buffered; i++ {
 		fuseSearchFeedback(dir, ws, searchResultJSON(t, ws, "hot.go"))
 	}
+
+	// 1 on-disk + 4 buffered retrievals: raw 0.5*5, squashed by tanh(raw/5).
 	boosts := feedbackBoosts(dir, ws)
-	if boosts["hot.go"] <= 0 {
-		t.Fatalf("buffered retrievals should boost hot.go before a flush, got %v", boosts["hot.go"])
+	if want := math.Tanh(0.5 * (1 + buffered) / 5); math.Abs(boosts["hot.go"]-want) > 1e-6 {
+		t.Errorf("hot.go boost should merge on-disk and buffered retrievals: got %v, want %v", boosts["hot.go"], want)
 	}
-	if boosts["cold.go"] >= 0 {
-		t.Fatalf("on-disk failure should still suppress cold.go, got %v", boosts["cold.go"])
+	if boosts["failed.go"] >= 0 {
+		t.Errorf("on-disk failure should still suppress failed.go, got %v", boosts["failed.go"])
+	}
+
+	// On-disk state alone leaves hot.go at 0.99+0.1*tanh(0.1) ≈ 0.99997, below cold.go;
+	// with the buffer it reaches 0.99+0.1*tanh(0.5) ≈ 1.036.
+	raw, err := json.Marshal(searchResult{WorkspaceID: ws, Query: "q", Total: 2, Hits: []searchHit{
+		{Kind: "file", Name: "cold.go", Path: "cold.go", Score: 1.0, Reason: "match"},
+		{Kind: "file", Name: "hot.go", Path: "hot.go", Score: 0.99, Reason: "match"},
+	}})
+	if err != nil {
+		t.Fatal(err)
 	}
 	var res searchResult
-	if err := json.Unmarshal(fuseSearchFeedback(dir, ws, searchResultJSON(t, ws, "cold.go", "hot.go")), &res); err != nil {
+	if err := json.Unmarshal(fuseSearchFeedback(dir, ws, raw), &res); err != nil {
 		t.Fatal(err)
 	}
 	if res.Hits[0].Path != "hot.go" {
-		t.Fatalf("buffered feedback should rank hot.go first, got %s", res.Hits[0].Path)
+		t.Fatalf("buffered retrievals should lift hot.go above cold.go, got order %s, %s", res.Hits[0].Path, res.Hits[1].Path)
 	}
+
 	m, err := loadFeedback(dir, ws)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if m["hot.go"] != nil {
-		t.Fatal("buffered retrievals reached the store without a flush")
+	if m["hot.go"] == nil || m["hot.go"].RetrievalCount != 1 || m["cold.go"] != nil {
+		t.Fatalf("buffered retrievals reached the store without a flush: hot=%+v cold=%+v", m["hot.go"], m["cold.go"])
 	}
 }
 

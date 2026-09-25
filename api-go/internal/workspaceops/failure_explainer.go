@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"regexp"
 	"sort"
@@ -66,8 +67,11 @@ func ExplainRunFailureCtx(ctx context.Context, dataDir, workspaceID, runID strin
 	exp.ImplicatedPaths = intersectMentionedPaths(output, exp.ChangedFiles)
 	exp.Summary = summarizeFailure(exp)
 	// feed the outcome back into ranking: suppress the implicated paths of a failure.
+	// The signal is best-effort, so a failed write is logged, not returned.
 	if exp.Failed && len(exp.ImplicatedPaths) > 0 {
-		_ = RecordFeedback(dataDir, workspaceID, "run_fail", exp.ImplicatedPaths)
+		if err := RecordFeedback(dataDir, workspaceID, "run_fail", exp.ImplicatedPaths); err != nil {
+			log.Printf("feedback: run_fail signal for workspace %s run %s failed: %v", workspaceID, runID, err)
+		}
 	}
 	return exp, nil
 }
