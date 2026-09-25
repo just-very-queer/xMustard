@@ -1,0 +1,1325 @@
+# Parity build plan — 2026-09-25
+
+Source: `docs/research/PARITY_REQUIREMENTS_2026-09-25.md` (requirements, processes, budget) with the critic's corrections from its §12 applied here. Integration branch: `feat/parity-v2`. Each workstream is built on its own `parity/<id>` branch in an isolated worktree, reviewed adversarially through at least two lenses, fixed, rechecked, and stacked onto `feat/parity-v2`. **The human performs the merge to `main`.** Agent reviews and green tests do not authorize it.
+
+## Execution decisions taken for this build
+
+- **Benchmark fixtures** are Apache/MIT repositories (cline, pi-mono). GitNexus (PolyForm Noncommercial) is a design reference only and is not run as a comparator arm without an explicit owner decision.
+- **D-02 storage** is closed by measurement in WS-07's first deliverable (FTS5 in rusqlite vs tantivy).
+- **D-08 hook client** for Cursor is Rust from the start; Claude Code uses http hooks.
+- **Parity thresholds** are numeric and set in WS-50 before any parity claim.
+- **Diagnostics work** in `wip/diagnostics-live-set` belongs to a parallel session; it is not in HEAD and touches `budget.go`, `rustcore/root.go`, `main.go`, and `xmustard-ops/main.go`. Workstreams touching those files keep diffs small and additive so that session can rebase.
+
+## Workstreams
+
+| ID | Wave | Size | Lang | MiB | Depends on | Title |
+|---|---|---|---|---|---|---|
+| WS-00 | 1 | M | go+rust | 0 | — | Review, rebase and prepare the in-flight parity/w0-* branches for human merge |
+| WS-01 | 1 | L | go | 3 | — | govstore: SQLite WAL governance store package |
+| WS-02 | 1 | L | go+rust | 3 | — | Resident Rust worker (xmustard-core serve) plus Go supervisor client |
+| WS-03 | 1 | L | go | 0.2 | WS-00 | Per-request context kernel: workspace registry, identity sampled once, evidence page identity cache, grounding split |
+| WS-04 | 1 | L | go | 0 | WS-00 | MCP server package and protocol modernization |
+| WS-05 | 1 | M | go | 0.5 | — | toolcompat and redact libraries |
+| WS-06 | 1 | M | go | 0.5 | — | Budget governor, runtime hygiene and health budget/counters |
+| WS-07 | 1 | L | rust | 0 | — | Code index DB and streaming per-file fact extraction (existing languages) |
+| WS-08 | 1 | L | go | 1.5 | — | Evidence tool-family reducers, client shape adapters, capture metadata and search-in-original |
+| WS-09 | 1 | M | go | 0 | WS-00 | Security kernel: roles, gates, exposure posture and core-only default |
+| WS-10 | 1 | M | mixed | 0 | — | Parity-scale budget gate v2 and CI |
+| WS-11 | 1 | L | go | 0 | — | Outcome evaluation executor (xmustard-eval) |
+| WS-12 | 2 | L | go | 0 | WS-00, WS-01 | Governance cutover to govstore and split of context_governance.go |
+| WS-13 | 2 | L | go+rust | -10 | WS-04, WS-05, WS-09 | MCP Streamable HTTP endpoint on the API and native stdio relay |
+| WS-14 | 2 | L | go+rust | 12 | WS-02, WS-07, WS-06 | Resident index service, query side: CSR graph, name index, freshness envelope, cap removal |
+| WS-15 | 2 | L | go+rust | 2 | WS-14, WS-06, WS-22, WS-17 | Watcher, incremental refresh loop and identity unification |
+| WS-16 | 2 | L | rust | 0 | WS-07 | Language packs via the provider contract |
+| WS-17 | 2 | L | rust | 2 | WS-07 | Scope/import resolver for Go and TS/JS with typed edges, confidence tiers and epistemic counters |
+| WS-18 | 2 | L | go+rust | 5 | WS-07, WS-14 | Code BM25 lane, hybrid fusion, snippets and explainable reasons |
+| WS-19 | 2 | L | go | 1 | WS-12, WS-04, WS-05 | Memory lifecycle writes: history API, supersede/retire/retract/purge, CAS edits, expiry, provenance, verify outcomes |
+| WS-20 | 2 | L | go | 1.5 | WS-12, WS-04 | Recall v2: ranking, filters, disclosure, budgets and verification-queue visibility |
+| WS-21 | 2 | M | go | 0.5 | WS-01, WS-03, WS-04 | why_failed and ground failure signals without platform runs |
+| WS-22 | 2 | M | go+rust | 0 | WS-03, WS-09 | Governed automatic index baseline and bounding of residual unbounded work |
+| WS-23 | 2 | L | go | 1.5 | WS-03, WS-08, WS-05, WS-04, WS-14, WS-20 | Hook service, static hook client and Claude Code adapter plugin |
+| WS-24 | 2 | M | ts | 0 | WS-08, WS-04 | Pi adapter extended to built-in tools, masking and custom compaction |
+| WS-25 | 2 | S | rust | -2 | WS-00, WS-02 | Remove remaining unreachable Rust code |
+| WS-26 | 2 | S | mixed | 0 | WS-10 | Release hygiene and packaging |
+| WS-27 | 3 | L | go | 3 | WS-19, WS-14 | Dedupe, code anchors, tiered conflicts and structured claims |
+| WS-28 | 3 | L | go | 1 | WS-27, WS-15 | Change-driven invalidation, as_of, graph-proximity recall and memories on explain/impact |
+| WS-29 | 3 | L | go | 0.5 | WS-19, WS-20, WS-09 | Memory scopes and shared collections with grants |
+| WS-30 | 3 | M | go+rust | 0.5 | WS-14, WS-04 | Cross-workspace code query, residency LRU, worktree identity and path rewriting |
+| WS-31 | 3 | L | go | 1 | WS-19, WS-13, WS-23 | Tiered memory, write policy, revision-pinned injection, guidance artifacts and onboarding |
+| WS-32 | 3 | L | go | 1 | WS-27, WS-19 | Consolidation work queue, memory health, skills export and Markdown/git export-import |
+| WS-33 | 3 | L | go | 1.5 | WS-23, WS-12 | Session ledger, compaction snapshot and restore, handoff capsule and cross-client handoff |
+| WS-34 | 3 | L | go | 1.5 | WS-33, WS-05 | Session transcript store, session search, new-session bootstrap and cross-harness import |
+| WS-35 | 3 | L | go+rust | 0.5 | WS-17, WS-14 | Impact v2: tiers, risk, epistemic envelope, typed filters, trace caps, diff-to-symbol and import cycles |
+| WS-36 | 3 | L | go+rust | 1 | WS-14, WS-17, WS-18 | Symbol navigation surfaces and staged degradation contract |
+| WS-37 | 3 | L | rust | 9 | WS-18 | Static-embedding semantic lane with binary/int8 vector index |
+| WS-38 | 3 | M | go+rust | 1 | WS-17 | Functional areas, execution flows, orientation packet and flow-grouped search |
+| WS-39 | 3 | L | rust | 0 | WS-17, WS-16 | Resolvers for Rust, Python and Java |
+| WS-40 | 3 | L | mixed | 0 | WS-23, WS-08 | Codex, OpenCode and Cursor adapters, Letta recipe and adapter capability registry |
+| WS-41 | 3 | M | go+rust | 0.5 | WS-08, WS-03 | Command-wrapper reducer, retention classes and upstream references |
+| WS-42 | 3 | M | go | 1.5 | WS-08, WS-03 | Repeat guard, revision-keyed result cache and recoverable history compaction library |
+| WS-43 | 3 | L | go | 5 | WS-13, WS-08, WS-19 | Opt-in upstream MCP gateway, progress event bus and memory notifications |
+| WS-44 | 3 | L | go | 0 | WS-40, WS-23 | Install/doctor/uninstall per client, conformance suite, ops CLI, ignore/retention config and fixture capture |
+| WS-45 | 3 | M | go | 1.5 | WS-36, WS-10 | Opt-in LSP pool wiring into explain, impact and diagnostics |
+| WS-46 | 3 | M | rust | 0 | WS-17 | SCIP precise-lane ingestion |
+| WS-47 | 3 | M | go | 1 | WS-35 | Diagnostics tool deepening after the diagnostics session hands off |
+| WS-48 | 3 | M | go | 0 | WS-13, WS-23 | Single config struct replacing repeated env lookups |
+| WS-49 | 3 | L | go | -4 | WS-48, WS-12 | Kernel package extraction and platform behind a build tag |
+| WS-50 | 3 | L | mixed | 0 | WS-11, WS-10, WS-31, WS-33, WS-35, WS-37, WS-40 | Parity evaluation suite and final parity-scale gate |
+| WS-51 | 3 | M | go+rust | 0.5 | WS-06, WS-37 | Helper-model adapter contract, optional ONNX sidecar and Needle3 measurement |
+| WS-52 | 3 | M | go+rust | 1 | WS-18, WS-27, WS-35 | Revision-aware reads, commit/diff history search and task-shaped retrieval |
+| WS-53 | 3 | M | go | 2 | WS-21, WS-19 | Bounded verification and run-lineage runner |
+| WS-54 | 2 | — | go | — | WS-04 | Output-budget contract for ground and tools/list (critic addition) |
+| WS-55 | 3 | — | go+rust | — | WS-14, WS-15 | Worktree overlay index (critic addition) |
+| WS-56 | 2 | — | go | — | WS-12, WS-09 | Injection-safety policy (critic addition) |
+| WS-57 | 2 | — | go | — | WS-09, WS-12 | Human-approval surface (critic addition) |
+| WS-58 | 2 | — | go | — | WS-01, WS-13 | Daemon lifecycle (critic addition) |
+| WS-59 | 3 | — | go+rust | — | WS-17, WS-18 | impact op=rename|delete plans and search mode=exact|regex (critic addition) |
+| WS-60 | 3 | — | rust | — | WS-16, WS-38 | Framework entry-point extractors and extra language packs (critic addition) |
+| WS-61 | 3 | — | rust | — | WS-14, WS-17 | Personalized PageRank repo map fitted to a token budget (critic addition) |
+| WS-62 | 3 | — | go | — | WS-19, WS-31 | Path-scoped client rule-file export (critic addition) |
+| WS-63 | 2 | — | mixed | — | WS-11 | Evaluation corpus authoring (critic addition) |
+
+## Workstream detail
+
+### WS-00 — Review, rebase and prepare the in-flight parity/w0-* branches for human merge
+
+**Goal.** Get the already-written wave-0 fixes into a merge-ready stack on top of HEAD 7ab61a0 so later workstreams build on them instead of colliding with them. The fixes are: models.rs removal and honest tool descriptions (w0-cleanup), honest open mode plus author-bound edits plus strict JSON (w0-kernel), feedback taken off the request path (w0-feedback), and stat-cached drift hashing (w0-drift). A human performs every merge; the agent only prepares the stack.
+
+**Requirements.** PAR-RT-08, PAR-ADP-01, PAR-GOV-01, PAR-SEC-01, PAR-RET-11, PAR-FRESH-01
+
+**Files.** `rust-core/src/lib.rs`, `rust-core/src/models.rs`, `rust-core/src/changetrack.rs`, `rust-core/src/indexcache.rs`, `rust-core/src/symbolgraph.rs`, `rust-core/src/hashcache.rs`, `api-go/cmd/xmustard-mcp/main.go`, `api-go/cmd/xmustard-mcp/descriptions_test.go`, `integrations/pi/src/tools.ts`, `api-go/cmd/xmustard-api/main.go`, `api-go/cmd/xmustard-api/feedback_shutdown_test.go`, `api-go/internal/workspaceops/context_governance.go`, `api-go/internal/workspaceops/grounding.go`, `api-go/internal/workspaceops/feedback.go`, `api-go/internal/workspaceops/feedback_recorder.go`, `api-go/internal/workspaceops/knowledge.go`, `api-go/internal/workspaceops/shutdown.go`  
+**New modules.** `rust-core/src/hashcache.rs`, `api-go/internal/workspaceops/feedback_recorder.go`
+
+**Tests required.**
+- make check-backend on each branch rebased individually onto 7ab61a0
+- make check-backend on the combined stack in order cleanup -> kernel -> feedback -> drift
+- Conflict-resolution tests for context_governance.go and knowledge.go, which both w0-kernel and w0-feedback touch
+- Existing descriptions_test.go and Pi tools.ts parity test pass
+- Drift tests with same-size edits and preserved mtimes still detect changes, because a full-verify path exists
+
+**Acceptance.** Four rebased branches plus a combined integration branch, all passing cargo test/clippy and go test/build, with review notes that list each behavioral change and its risk. No merge is done by the agent. The human merges in the documented order.
+
+**Collision risk.** The hot files for everything else: main.go, context_governance.go, grounding.go, knowledge.go, xmustard-mcp/main.go, lib.rs, symbolgraph.rs, changetrack.rs, indexcache.rs. Must land before WS-03, WS-04, WS-09 and WS-12. It does not touch the diagnostics session files. That session's branch at /private/tmp/xmustard-opus-l9b1F4 sits at the older cd13e2b and also modified main.go and context_governance.go, so coordinate before its eventual landing.
+
+**Correction.** DONE by the orchestrating session: the four w0 branches were implemented, reviewed twice, and re-fixed; they sit on 7ab61a0 and are stacked onto feat/parity-v2 (integration branch). Human merges feat/parity-v2 to main.
+
+### WS-01 — govstore: SQLite WAL governance store package
+
+**Goal.** Add a new package with a transactional, cross-process-safe governance store. It uses modernc.org/sqlite (cached locally as v1.59.0). Its schema is designed up front for history, supersession, temporal validity, anchors, claims, sessions, outcomes, grants, jobs and FTS5, so later memory features only add queries. Nothing consumes it yet; WS-12 cuts over to it.
+
+**Requirements.** PAR-STORE-01, PAR-PROV-01, PAR-STORE-04
+
+**Files.** `api-go/go.mod`, `api-go/go.sum`, `api-go/internal/govstore/store.go`, `api-go/internal/govstore/schema.sql`, `api-go/internal/govstore/migrate.go`, `api-go/internal/govstore/entries.go`, `api-go/internal/govstore/revisions.go`, `api-go/internal/govstore/events.go`, `api-go/internal/govstore/votes.go`, `api-go/internal/govstore/anchors.go`, `api-go/internal/govstore/sessions.go`, `api-go/internal/govstore/outcomes.go`, `api-go/internal/govstore/grants.go`, `api-go/internal/govstore/jobs.go`, `api-go/internal/govstore/fts.go`, `api-go/internal/govstore/retention.go`, `api-go/internal/govstore/import_json.go`, `api-go/internal/govstore/store_test.go`, `api-go/internal/govstore/concurrency_test.go`, `api-go/internal/govstore/import_test.go`  
+**New modules.** `api-go/internal/govstore`
+
+**Tests required.**
+- Migrations are idempotent and a schema fingerprint is recorded
+- Compare-and-set on base_revision returns a conflict carrying the current revision and digest
+- The events table is append-only: update and delete are rejected by triggers
+- Two OS processes (helper-process test) propose and verify concurrently with no lost updates
+- A kill -9 helper mid-transaction leaves a consistent database after reopen
+- The JSON importer round-trips a context_entries.json fixture including verifications, path hashes and content digests, and is idempotent
+- Pragmas asserted: journal_mode=wal, cache_size cap, mmap_size=0, busy_timeout, synchronous level for governance commits
+- FTS5 query over title, content and anchors returns ranked results
+- Build-tagged RSS probe: open adds ≤3 MiB; a 100k-row bulk insert inside a single scope stays ≤14 MiB above baseline
+
+**Acceptance.** The govstore package exposes a Store interface (entries, revisions, votes, events, anchors, claims, relations, sessions, outcomes, grants, jobs, feedback, evidence_meta) with passing tests and measured RSS within the numbers above. There are no consumers yet. go test ./... is green.
+
+**Collision risk.** go.mod/go.sum only. No other wave-1 workstream adds Go dependencies. No diagnostics-session files.
+
+### WS-02 — Resident Rust worker (xmustard-core serve) plus Go supervisor client
+
+**Goal.** Stop exec'ing xmustard-core on every call. Add a long-lived JSON-RPC serve mode that dispatches the existing commands in-process and keeps the graph snapshot cached per source identity. Add a Go worker client that follows the cursor-bridge CodexClient/MCPClient pattern: pending map, read loop, failAllPending, lazy restart with backoff, cancel messages. It keeps the TrackChild/KillProcessTree kill boundary and ChildLimit admission. It is off by default behind XMUSTARD_CORE_WORKER until the gate passes.
+
+**Requirements.** PAR-RT-01, PAR-RT-12
+
+**Files.** `rust-core/src/serve.rs`, `rust-core/src/lib.rs`, `rust-core/src/bin/xmustard-core.rs`, `api-go/internal/rustcore/worker.go`, `api-go/internal/rustcore/worker_test.go`, `api-go/internal/rustcore/root.go`, `api-go/internal/rustcore/children.go`  
+**New modules.** `rust-core/src/serve.rs`, `api-go/internal/rustcore/worker.go`
+
+**Tests required.**
+- Rust unit tests for framing (length/line caps, 64 MiB frame limit) and dispatch of each method the Go side calls
+- Parity test: worker output equals one-shot CLI output for search, symbolgraph build/impact/trace/clusters/hotspots/blast-radius, explain-path, changetrack, repo-key, path-symbols and build-repo-map on a fixture repo
+- Crash mid-request returns an error to the caller; the next call restarts the worker
+- Context cancellation sends a cancel message and releases the child slot
+- Idle exit after the configured timeout, and lazy restart afterwards
+- Concurrent requests bounded by ChildLimit
+- Every existing api-go test passes with XMUSTARD_CORE_WORKER=1
+
+**Acceptance.** With the flag on, the nine tools run with zero per-call xmustard-core execs; only git children remain until WS-15. Warm-call latency and process counts are reported against the one-shot path. A subcommand dispatch table is introduced so later workstreams add one entry each.
+
+**Collision risk.** rust-core/src/bin/xmustard-core.rs and lib.rs are also touched by WS-00 (cleanup, drift) and WS-07, so land the dispatch-table refactor first and keep it small. root.go was touched at an older base by the diagnostics session's tree; that change is likely already at HEAD, so risk is low. No diagnostics_*.go files.
+
+### WS-03 — Per-request context kernel: workspace registry, identity sampled once, evidence page identity cache, grounding split
+
+**Goal.** Stop tool paths from parsing snapshot.json (5-6 times per ground) and from sampling repository identity repeatedly. Add a resident workspace registry and a per-request context that carries the root and identity to handlers and Rust. Write tools skip identity entirely. Cache identity per evidence page window, keyed by HEAD plus porcelain/stat digest. Split grounding.go into section files to reduce later collisions.
+
+**Requirements.** PAR-RT-06, PAR-FRESH-02, PAR-RT-12, PAR-RT-11
+
+**Files.** `api-go/internal/workspaceops/workspace_registry.go`, `api-go/internal/workspaceops/request_context.go`, `api-go/internal/workspaceops/changes.go`, `api-go/internal/workspaceops/coverage.go`, `api-go/internal/workspaceops/grounding.go`, `api-go/internal/workspaceops/grounding_index.go`, `api-go/internal/workspaceops/grounding_memory.go`, `api-go/internal/workspaceops/grounding_runs.go`, `api-go/internal/workspaceops/run_review_reads.go`, `api-go/internal/workspaceops/workspace_reads.go`, `api-go/internal/workspaceops/repo_identity.go`, `api-go/cmd/xmustard-api/evidence_routes.go`, `api-go/internal/evidence/store.go`, `api-go/internal/workspaceops/workspace_registry_test.go`, `api-go/internal/workspaceops/request_context_test.go`  
+**New modules.** `api-go/internal/workspaceops/workspace_registry.go`, `api-go/internal/workspaceops/request_context.go`
+
+**Tests required.**
+- A counting hook shows zero loadSnapshot calls on the nine tool paths
+- Identity is sampled exactly once per core read tool and zero times for remember/verify
+- Evidence pages inside the TTL reuse identity with no repo-key spawn while HEAD and digest are unchanged; they re-sample and label stale when changed
+- The registry invalidates on snapshot or workspace-record mtime change
+- ground surfaces decode and ListRuns errors as unknown rather than 0
+- Allocation benchmark for ground shows reduced allocs versus baseline
+- Existing grounding_bounded_test.go and recall_contract_test.go pass
+
+**Acceptance.** ground does ≤1 identity sample and 0 snapshot.json parses. Expanding a 16 MiB original no longer spawns a process per page, and its measured expansion time is recorded. grounding.go is split into section files with no behavior change.
+
+**Collision risk.** grounding.go (w0-kernel via WS-00; later WS-20/21/22/28/31/33 own the section files this creates). evidence/store.go is shared with WS-08, which only adds files plus a reduce.go hook; WS-03 owns the store.go change. evidence_routes.go is also touched by WS-41 later. workspace_reads.go is not touched by the diagnostics session at HEAD.
+
+### WS-04 — MCP server package and protocol modernization
+
+**Goal.** Move the tool table and dispatch out of cmd/xmustard-mcp/main.go into api-go/internal/mcpserver, one file per tool, so the stdio shim, the HTTP endpoint (WS-13) and hooks share them. Add: protocol version negotiation, initialize.instructions (static workflow text for now), tool annotations, outputSchema plus structuredContent, rejection of out-of-range values, hidden compatibility aliases, optional workspace_id resolved from env/roots/cwd/path, and the API bounds that are already supported but hidden (recall limit, search limit, impact depth, verify note).
+
+**Requirements.** PAR-ADP-01, PAR-ADP-02, PAR-ADP-04, PAR-CTX-05, PAR-HAR-03
+
+**Files.** `api-go/internal/mcpserver/server.go`, `api-go/internal/mcpserver/dispatch.go`, `api-go/internal/mcpserver/schema.go`, `api-go/internal/mcpserver/instructions.go`, `api-go/internal/mcpserver/resolve_workspace.go`, `api-go/internal/mcpserver/tool_ground.go`, `api-go/internal/mcpserver/tool_recall.go`, `api-go/internal/mcpserver/tool_remember.go`, `api-go/internal/mcpserver/tool_verify.go`, `api-go/internal/mcpserver/tool_search.go`, `api-go/internal/mcpserver/tool_explain.go`, `api-go/internal/mcpserver/tool_impact.go`, `api-go/internal/mcpserver/tool_diagnostics.go`, `api-go/internal/mcpserver/tool_why_failed.go`, `api-go/internal/mcpserver/server_test.go`, `api-go/cmd/xmustard-mcp/main.go`, `api-go/cmd/xmustard-mcp/evidence.go`, `integrations/pi/src/tools.ts`, `integrations/pi/test/unit.test.ts`  
+**New modules.** `api-go/internal/mcpserver`
+
+**Tests required.**
+- tools/list snapshot test covering annotations, outputSchema and closed schemas
+- Protocol negotiation works for 2024-11-05 clients and for the current version
+- Each tool resolves workspace_id from XMUSTARD_WORKSPACE_ID, roots/list or cwd, and fails with a clear error otherwise
+- Out-of-range numeric arguments are rejected, not clamped
+- A hidden alias is accepted but not advertised; the Claude Code 'query' drop case is covered
+- structuredContent and text content are both present and consistent
+- A generated tool-table JSON is consumed by a Pi unit test to prevent description drift
+- Existing xmustard-mcp tests (framing, cancellation, ingress, admission, evidence) pass
+
+**Acceptance.** The shim becomes a thin wrapper around mcpserver. All nine tools advertise annotations and honest descriptions, and accept optional workspace_id. Bounds are exposed. The static instructions are served. No behavior regressions.
+
+**Collision risk.** api-go/cmd/xmustard-mcp/main.go and integrations/pi/src/tools.ts are also changed by w0-cleanup (WS-00). Later tool-surface workstreams edit the per-tool files this creates. No diagnostics-session files.
+
+### WS-05 — toolcompat and redact libraries
+
+**Goal.** Add two pure libraries. toolcompat ports the owner's cursor-bridge argument alias table and canonical keys, per-tool repair, required-field validation, validation signatures (sha256) and recorded normalizations. redact provides an RE2 secret pattern set with an entropy check, env-value-to-name helper, header allow-list and a streaming redactor over io.Reader. Both are consumed later by MCP, hooks, capture, remember and imports.
+
+**Requirements.** PAR-ADP-03, PAR-SEC-04
+
+**Files.** `api-go/internal/toolcompat/compat.go`, `api-go/internal/toolcompat/aliases.go`, `api-go/internal/toolcompat/compat_test.go`, `api-go/internal/redact/redact.go`, `api-go/internal/redact/patterns.go`, `api-go/internal/redact/entropy.go`, `api-go/internal/redact/stream.go`, `api-go/internal/redact/redact_test.go`  
+**New modules.** `api-go/internal/toolcompat`, `api-go/internal/redact`
+
+**Tests required.**
+- Table tests ported from cursor-bridge bridge_orchestrator_test.go:152-399, with provenance recorded in the commit message
+- Mutating arguments of remember/verify are never altered silently; normalization is only reported
+- Secret corpus: bearer tokens, AWS/GitHub/Slack/OpenAI/Anthropic keys, PEM blocks, JSON secret fields
+- False-positive corpus: sha256 hashes, UUIDs, base64 images
+- The streaming redactor handles secrets split across chunk boundaries
+- Benchmark: redacting a 16 MiB stream uses O(1) memory
+
+**Acceptance.** Both packages are fully tested, with no dependents yet. Documented APIs are ready for WS-13, WS-19, WS-23 and WS-34.
+
+**Collision risk.** None; new packages only.
+
+### WS-06 — Budget governor, runtime hygiene and health budget/counters
+
+**Goal.** Extend the budget package with: static component reservations, a single heavy slot with a wait bound and owner label, and an RSS watchdog over the own process tree (phys_footprint on darwin, smaps_rollup on linux) that refuses new heavy work near a soft ceiling. Lower the default transient pool to 24 MiB. Set debug.SetMemoryLimit when GOMEMLIMIT is unset. Call FreeOSMemory after heavy release. Add data-movement counters: child and git spawns, bytes hashed, captures. Expose it all as a /api/health budget block.
+
+**Requirements.** PAR-RT-04, PAR-RT-05, PAR-OPS-01, PAR-EVAL-04
+
+**Files.** `api-go/internal/budget/governor.go`, `api-go/internal/budget/rss_darwin.go`, `api-go/internal/budget/rss_linux.go`, `api-go/internal/budget/rss_other.go`, `api-go/internal/budget/counters.go`, `api-go/internal/budget/governor_test.go`, `api-go/internal/budget/budget.go`, `api-go/internal/budget/budget_test.go`, `api-go/cmd/xmustard-api/health_budget.go`, `api-go/cmd/xmustard-api/main.go`  
+**New modules.** `api-go/internal/budget/governor.go`, `api-go/cmd/xmustard-api/health_budget.go`
+
+**Tests required.**
+- Heavy slot exclusivity: a second holder waits, then gets ErrOverloaded after the bound
+- Watchdog refuses heavy work when the simulated tree RSS exceeds the soft ceiling
+- The default pool change keeps existing admission tests correct (expectations updated deliberately)
+- Health JSON shape includes reservations, the heavy-slot owner and queue, and counters
+- Counters increment on rustcore spawns and captures
+- The memory limit is applied only when GOMEMLIMIT is unset
+
+**Acceptance.** /api/health reports the budget block. The heavy slot is available for WS-07/15/37/51 callers. Existing budget, admission and body-limit tests are green. The main.go diff is 1-3 lines.
+
+**Collision risk.** Small main.go registration (also touched by WS-09 and WS-00). budget.go was modified in the diagnostics session's older tree; confirm it is already at HEAD before editing.
+
+**Correction.** Critic: captures never use the heavy slot (WS-08 streams O(window)); acceptance adds "no hook or capture path waits on the heavy slot"; GOMEMLIMIT = daemon line (~26-28 MiB), not 40.
+
+### WS-07 — Code index DB and streaming per-file fact extraction (existing languages)
+
+**Goal.** Create the Rust-owned per-workspace index store (rusqlite bundled, cached locally as 0.32.1) under .git/xmustard-cache/index-v3. Schema: files, symbols (nested qualified path, byte and line ranges, UID with collision suffixes), references (strings and comments excluded), imports, chunks (contentless FTS5 postings), and meta (analyzer version, schema fingerprint, incremental_in_progress flag, last_commit, coverage). Add `xmustard-core index build|update|stats`. It streams one file at a time with one thread, drops each tree after extraction, uses a content-addressed per-file fact cache, and never stores source text when content_retention=none.
+
+**Requirements.** PAR-STORE-03, PAR-SYM-01, PAR-RT-02, PAR-FRESH-04, PAR-FRESH-08, PAR-RT-09
+
+**Files.** `rust-core/Cargo.toml`, `rust-core/src/lib.rs`, `rust-core/src/bin/xmustard-core.rs`, `rust-core/src/treesitter.rs`, `rust-core/src/index/mod.rs`, `rust-core/src/index/schema.rs`, `rust-core/src/index/facts.rs`, `rust-core/src/index/extract.rs`, `rust-core/src/index/uid.rs`, `rust-core/src/index/chunks.rs`, `rust-core/src/index/writer.rs`, `rust-core/src/index/meta.rs`, `rust-core/tests/index_build.rs`  
+**New modules.** `rust-core/src/index`
+
+**Tests required.**
+- Extraction fixtures for Go, Rust, TS/TSX and JS/JSX: nested classes, impl blocks, methods, closures, re-exports
+- UID stability across unrelated edits, and collision suffixes on overloads
+- Strings and comments produce no references (regression for the known lexical false edges)
+- Incremental update touches only changed files, with reparsed counters
+- Delete, rename and create sequences leave a correct index
+- A leftover dirty flag or a schema fingerprint change forces a full rebuild; the escalation gate triggers above 50% and 50 files
+- content_retention=none stores no source text
+- RSS: build on a 5k-file fixture peaks ≤25 MiB with no 800-file cap
+
+**Acceptance.** `xmustard-core index build` indexes every eligible file of the gitnexus clone at ≤25 MiB peak and reports coverage. Output is deterministic. No consumer is switched yet (WS-14 does that).
+
+**Collision risk.** Cargo.toml, lib.rs and bin/xmustard-core.rs (WS-00 cleanup/drift, WS-02); rebase onto WS-02's dispatch table. treesitter.rs was modified in the diagnostics session's older tree (likely at HEAD).
+
+**Correction.** Critic: first deliverable is an FTS5-vs-tantivy RSS and ranking measurement that closes D-02; schema includes an edges table populated by a port of the legacy lexical edge builder (provenance=lexical) so WS-14 can reach legacy parity before WS-17.
+
+### WS-08 — Evidence tool-family reducers, client shape adapters, capture metadata and search-in-original
+
+**Goal.** Generalize the evidence reducer beyond the nine tools. Add a versioned reducer registry keyed by (client tool name, argv0) for shell, test runners, build, git, grep, read, ls/glob, logs and lints, with failure-first head+tail excerpts and per-kind projections. Add per-client output-shape validators (Claude Bash/Read/Grep/Glob, Pi, OpenCode, Codex). Add capture metadata and stream-decode of hook JSON bodies into the spool, streaming pattern/line search inside originals, and a heuristic token estimate.
+
+**Requirements.** PAR-CTX-01, PAR-CTX-02, PAR-CTX-03, PAR-CTX-04, PAR-CTX-13
+
+**Files.** `api-go/internal/evidence/registry.go`, `api-go/internal/evidence/reduce_shell.go`, `api-go/internal/evidence/reduce_testrun.go`, `api-go/internal/evidence/reduce_grep.go`, `api-go/internal/evidence/reduce_read.go`, `api-go/internal/evidence/reduce_list.go`, `api-go/internal/evidence/reduce_diff.go`, `api-go/internal/evidence/shapes.go`, `api-go/internal/evidence/capture_meta.go`, `api-go/internal/evidence/hookbody.go`, `api-go/internal/evidence/search_original.go`, `api-go/internal/evidence/tokens.go`, `api-go/internal/evidence/reduce.go`, `api-go/internal/evidence/reducers_test.go`, `api-go/internal/evidence/shapes_test.go`, `api-go/internal/evidence/search_original_test.go`  
+**New modules.** `api-go/internal/evidence/registry.go`, `api-go/internal/evidence/shapes.go`
+
+**Tests required.**
+- Golden fixture: one failing assertion among 5,000 passing lines is kept with its first and last stack frames and the exit code
+- Grep projection caps per file and reports totals; read projection returns a line-numbered range
+- Structured payloads are byte-bounded and status fields are never dropped (cursor-bridge gap)
+- A 16 MiB Claude Code hook JSON body is stream-decoded into the spool, with an allocation test below a fixed bound
+- Shape validators accept valid per-client payloads and reject mismatches, which triggers fallback
+- Search-in-original streams 1 MiB chunks with a match cap
+- Existing invariants_test.go and store_test.go pass; the nine-tool projections are unchanged unless a tool reducer is selected
+
+**Acceptance.** The registry is selectable per tool family. Every projection records its reducer id and version, and bounded memory (O(window)) is shown by test. Ready for hooks (WS-23), Pi (WS-24) and the wrapper (WS-41).
+
+**Collision risk.** reduce.go gets a registry hook only. evidence/store.go is owned by WS-03 in this wave, so do not edit it here. No diagnostics files.
+
+### WS-09 — Security kernel: roles, gates, exposure posture and core-only default
+
+**Goal.** Add principal roles (reader, proposer, verifier, human-approver, admin) bound to tokens. verify requires verifier. POST /index gets a role gate and joins the core allowlist. Add a security middleware: Host/Origin allowlist on loopback, read-only mode, workspace allowlist, rejection of query-string tokens, constant-time compare everywhere. Cache the token store. Enforce path confinement through safepath.go. Flip core-only to the default and make the platform half opt-in with XMUSTARD_PLATFORM=1.
+
+**Requirements.** PAR-SEC-02, PAR-SEC-03, PAR-SEC-05, PAR-SEC-07, PAR-FRESH-06, PAR-RT-07
+
+**Files.** `api-go/internal/workspaceops/auth.go`, `api-go/internal/workspaceops/auth_roles_test.go`, `api-go/internal/workspaceops/safepath.go`, `api-go/cmd/xmustard-api/security_middleware.go`, `api-go/cmd/xmustard-api/security_middleware_test.go`, `api-go/cmd/xmustard-api/main.go`, `api-go/cmd/xmustard-api/core_only_test.go`  
+**New modules.** `api-go/cmd/xmustard-api/security_middleware.go`
+
+**Tests required.**
+- Role matrix: each route and tool is allowed or denied per role
+- verify with a proposer-only token is denied, with an error that names the missing role
+- POST /index is denied to the agent role and allowed to admin/indexer; it is present in core-only mode
+- Read-only mode filters writes from tools/list and returns 403 on write routes
+- A spoofed Host header on loopback is rejected; ?api_key= is rejected
+- The token file cache is invalidated on mint, rotate and revoke
+- Path escapes via absolute paths and symlinks are rejected
+- Core-only default serves the nine tools, health and evidence; platform routes 404 unless XMUSTARD_PLATFORM=1
+
+**Acceptance.** All existing auth, core-only and scope tests pass with the updated defaults. The route gate table is documented. The frontend or platform needs the opt-in flag, noted in the PR.
+
+**Collision risk.** main.go (w0-kernel via WS-00, and a small WS-06 registration). auth.go. The core-only default flip may affect the diagnostics route wiring in the diagnostics session, so coordinate the allowlist entry for GET /diagnostics.
+
+### WS-10 — Parity-scale budget gate v2 and CI
+
+**Goal.** Add a new gate (rss_bench.py is frozen at 6411f391). It records dual metrics per process (ps-RSS as the gate, plus phys_footprint or PSS/USS), splits anon from file-backed memory, attributes components by registered role, and lists externals separately. Add pinned parity fixtures (gitnexus and cline clones at fixed shas, cloned to scratch and never vendored) and scenarios: 1/2/4 agents, watcher on, reindex during queries, captures during index. Add a GitHub Actions workflow running make check-backend plus the retrieval gate.
+
+**Requirements.** PAR-EVAL-05, PAR-EVAL-08, PAR-EVAL-04
+
+**Files.** `scripts/bench/rss_bench_v2.py`, `scripts/bench/rss_v2.sh`, `scripts/bench/parity_fixtures.json`, `scripts/bench/test_rss_bench_v2.py`, `.github/workflows/check.yml`, `Makefile`  
+**New modules.** `scripts/bench/rss_bench_v2.py`, `.github/workflows/check.yml`
+
+**Tests required.**
+- Unit tests of the sampler and attribution on synthetic ps/footprint samples
+- v2 reproduces the v1 numbers within noise on the existing 501-file workload
+- Parity fixtures clone to scratch at pinned shas and are verified by hash
+- CI workflow runs make check-backend and the retrieval gate on PRs
+
+**Acceptance.** `make bench-parity` produces JSON and markdown reports with the gate verdict (≤95.4 MiB ps-RSS), footprint, anon/file split and external lines. CI is green on a test PR.
+
+**Collision risk.** Makefile was modified by the diagnostics session's older tree (low risk; add targets only). Do not edit README.md or docs/STATUS.md, which the diagnostics session edits.
+
+**Correction.** Critic: per-component budget ledger file, CI fails on overrun; scenarios for queries-during-reindex, snapshot swap under load, 4 agents in 4 worktrees; fixtures are Apache/MIT repos (cline, pi-mono) not GitNexus (PolyForm NC).
+
+### WS-11 — Outcome evaluation executor (xmustard-eval)
+
+**Goal.** Build the paired-arm outcome harness that the parity claims require. It reads a task corpus schema and runs arms (baseline, baseline_nomcp, xmustard_mcp, xmustard_mcp_hooks placeholder, xmustard_memory) in a fresh detached worktree per run. Hidden oracles are run by the harness only. Drivers are claude -p stream-json, codex exec --json and pi --mode rpc. Tokens and cost come from each client's final events. It records diff churn and RSS samples via WS-10, and reuses the memory_harness.go statistics (McNemar, bootstrap).
+
+**Requirements.** PAR-EVAL-01, PAR-EVAL-09, PAR-EVAL-02
+
+**Files.** `api-go/cmd/xmustard-eval/main.go`, `api-go/cmd/xmustard-eval/corpus.go`, `api-go/cmd/xmustard-eval/arms.go`, `api-go/cmd/xmustard-eval/drivers.go`, `api-go/cmd/xmustard-eval/oracle.go`, `api-go/cmd/xmustard-eval/worktree.go`, `api-go/cmd/xmustard-eval/accounting.go`, `api-go/cmd/xmustard-eval/report.go`, `api-go/cmd/xmustard-eval/main_test.go`, `eval/tasks/README.md`, `eval/tasks/seed.yaml`  
+**New modules.** `api-go/cmd/xmustard-eval`, `eval/tasks`
+
+**Tests required.**
+- A fake driver emitting canned stream-json runs end to end
+- The hidden oracle is isolated from the model-visible verify step
+- Worktrees are created detached and cleaned up on success, failure and interrupt
+- Token and cost accounting parsed correctly from each driver's final event shape
+- Report is deterministic given the same inputs; statistics call into memory_harness.go
+
+**Acceptance.** A dry run with the fake driver completes all arms on seed tasks. The corpus schema is documented. A real-model run is an operator step, since it needs credentials, and is documented. The executor runs outside the measured tree.
+
+**Collision risk.** None. It is a new command, and memory_harness.go is reused read-only.
+
+**Correction.** Critic: pair with WS-63 corpus authoring; numeric parity thresholds are defined in WS-50.
+
+### WS-12 — Governance cutover to govstore and split of context_governance.go
+
+**Goal.** Move propose/verify/recall/edit/feedback from JSON arrays to govstore. Split context_governance.go into memory_propose.go, memory_verify.go, memory_edit.go, memory_recall.go and memory_store.go. Emit append-only events for every transition. Import existing JSON on first open, with a backup. Route xmustard-ops writes through the store. Apply flock+fsync hardening to the JSON stores that remain (runs, tokens).
+
+**Requirements.** PAR-STORE-01, PAR-STORE-02, PAR-PROV-01, PAR-GOV-05
+
+**Files.** `api-go/internal/workspaceops/context_governance.go`, `api-go/internal/workspaceops/memory_propose.go`, `api-go/internal/workspaceops/memory_verify.go`, `api-go/internal/workspaceops/memory_edit.go`, `api-go/internal/workspaceops/memory_recall.go`, `api-go/internal/workspaceops/memory_store.go`, `api-go/internal/workspaceops/feedback.go`, `api-go/internal/workspaceops/feedback_recorder.go`, `api-go/internal/workspaceops/storelock.go`, `api-go/internal/workspaceops/verification.go`, `api-go/internal/workspaceops/context_governance_test.go`, `api-go/cmd/xmustard-api/main.go`, `api-go/cmd/xmustard-ops/main.go`  
+**New modules.** `api-go/internal/workspaceops/memory_store.go`
+
+**Tests required.**
+- All existing governance, recall-contract and feedback tests pass against SQLite
+- First open imports JSON idempotently and keeps a backup; rollback is documented
+- Two API processes plus the ops CLI running concurrently show no lost updates
+- Every transition writes an event with principal, time, HEAD and digests
+- Recall p50 is not worse than the JSON baseline on a 1k-entry fixture
+- Remaining JSON writers fsync and take a cross-process lock
+
+**Acceptance.** context_entries.json is no longer written. Governance is multi-process safe. The file split lets WS-19, WS-20 and WS-27 own disjoint files. make check-backend is green.
+
+**Collision risk.** context_governance.go, feedback.go and main.go are hot. Must follow WS-00 (w0-kernel, w0-feedback). The diagnostics session's older tree also modified context_governance.go, so coordinate before its landing.
+
+### WS-13 — MCP Streamable HTTP endpoint on the API and native stdio relay
+
+**Goal.** Serve the nine tools, resources/read and cancellation over Streamable HTTP at :8042/mcp from the API process, using the mcpserver package. The bearer principal is taken per connection, and client profiles and read-only mode come from query params. Wire toolcompat normalization. Ship a tiny native Rust stdio-to-HTTP relay (target ≤3 MiB) for stdio-only clients. Record per-tool usage counters.
+
+**Requirements.** PAR-RT-03, PAR-ADP-03, PAR-ADP-05, PAR-SEC-03, PAR-EVAL-04
+
+**Files.** `api-go/cmd/xmustard-api/mcp_http.go`, `api-go/cmd/xmustard-api/mcp_http_test.go`, `api-go/cmd/xmustard-api/main.go`, `api-go/internal/mcpserver/dispatch.go`, `api-go/internal/mcpserver/usage.go`, `rust-core/src/bin/xmustard-relay.rs`, `Makefile`  
+**New modules.** `api-go/cmd/xmustard-api/mcp_http.go`, `rust-core/src/bin/xmustard-relay.rs`
+
+**Tests required.**
+- MCP over HTTP: initialize, tools/list, tools/call, resources/read paging, cancellation and progress passthrough
+- Principal attribution per connection; 4 concurrent clients
+- Read-only profile filters tools/list and rejects writes
+- Toolcompat aliases are normalized and recorded
+- The relay forwards stdio to HTTP with cancellation and passes the existing shim test suite
+- RSS: relay ≤3 MiB; measured savings against the Go shim recorded with gate v2
+
+**Acceptance.** Agents configured with the URL work with the same nine tools. Stdio-only clients use the relay. The Go shim is kept but deprecated in docs. The gate shows per-agent savings.
+
+**Collision risk.** main.go registration (1 line). Makefile shared with WS-10 and WS-26. bin/ directory in rust-core is shared by convention only.
+
+**Correction.** Critic: relay is std-only Rust (no tokio/reqwest), parses Streamable-HTTP SSE; per-project workspace binding (/mcp?workspace= or X-Xmustard-Workspace header) and roots/list conformance test per client.
+
+### WS-14 — Resident index service, query side: CSR graph, name index, freshness envelope, cap removal
+
+**Goal.** Have the WS-02 worker load index.db (WS-07) and build a compact CSR (forward and reverse, u32 ids, interned strings, bounded block cache, ≤150 B/symbol target) and a name/UID index. Serve search, explain and impact from it instead of deserializing the JSON graph. Attach the freshness envelope and coverage. Replace the 800-file cap with the declared scale envelope.
+
+**Requirements.** PAR-RT-01, PAR-IMP-02, PAR-FRESH-05, PAR-RT-09
+
+**Files.** `rust-core/src/index/reader.rs`, `rust-core/src/index/csr.rs`, `rust-core/src/index/names.rs`, `rust-core/src/index/envelope.rs`, `rust-core/src/serve.rs`, `rust-core/src/search.rs`, `rust-core/src/symbolgraph.rs`, `api-go/internal/rustcore/worker.go`, `api-go/internal/rustcore/symbolgraph.go`, `api-go/internal/rustcore/knowledge.go`, `rust-core/tests/index_query.rs`  
+**New modules.** `rust-core/src/index/csr.rs`, `rust-core/src/index/reader.rs`
+
+**Tests required.**
+- CSR built from index.db equals the edges in the DB; reverse edges are consistent
+- BFS, trace and blast-radius give identical results to the legacy graph on fixtures (while edges are still lexical)
+- Snapshot swap under concurrent readers never produces torn reads
+- Synthetic 100k-symbol index: service steady RSS ≤15 MiB above base
+- Freshness envelope present on search, explain and impact with correct status values
+- Coverage reports losses instead of silent capping
+
+**Acceptance.** No JSON graph deserialization on tool paths when an index exists. The 800-file cap is gone behind the envelope config. The gate v2 run is attached.
+
+**Collision risk.** search.rs is shared with WS-18 (swap the graph source only; leave lanes to WS-18). symbolgraph.rs was changed by w0-drift (WS-00). serve.rs is from WS-02.
+
+**Correction.** Critic: RSS acceptance uses a real resolved graph (>=5 edges/symbol) and includes swap double-buffering; decide file-backed CSR segments vs in-memory from measurement.
+
+### WS-15 — Watcher, incremental refresh loop and identity unification
+
+**Goal.** Add a watcher (notify crate: FSEvents, kqueue, inotify) with a serialized debounced refresh queue: 300 ms debounce, max wait, overflow triggers a full refresh, ignore-file change triggers a full refresh, retry with backoff. The Go governor schedules `index update --paths` in the heavy slot, and the service swaps snapshots. Unify changetrack identity onto indexcache::source_identity and the stat cache. ground stops hashing the tree.
+
+**Requirements.** PAR-FRESH-03, PAR-FRESH-04, PAR-FRESH-01, PAR-RT-02, PAR-RT-12
+
+**Files.** `rust-core/Cargo.toml`, `rust-core/src/index/watch.rs`, `rust-core/src/index/refresh_queue.rs`, `rust-core/src/serve.rs`, `rust-core/src/changetrack.rs`, `rust-core/src/indexcache.rs`, `rust-core/src/hashcache.rs`, `api-go/internal/rustcore/worker.go`, `api-go/internal/rustcore/refresh.go`, `rust-core/tests/refresh.rs`  
+**New modules.** `rust-core/src/index/watch.rs`, `rust-core/src/index/refresh_queue.rs`, `api-go/internal/rustcore/refresh.go`
+
+**Tests required.**
+- Edit, rename, delete and create sequences produce a correct index after refresh
+- Debounce coalesces bursts; overflow triggers a full refresh; a .gitignore change triggers a full refresh
+- A crash mid-update (dirty flag) forces a full rebuild; escalation gate thresholds work
+- Counters for reparsed, reresolved and escalated are exposed
+- No git spawn per query; git runs only on overflow or HEAD change (counter assertion)
+- ground on an unchanged tree hashes 0 files
+
+**Acceptance.** Results are fresh within ≤1 s after an edit on a 5k-file fixture. ground cost no longer grows with tracked bytes (compared against the 14.8 s gitnexus clone measurement). The watcher_state appears in the envelope.
+
+**Collision risk.** changetrack.rs and indexcache.rs were changed by w0-drift (WS-00), and WS-22 also edits changetrack.rs; sequence WS-22 first. Cargo.toml is shared with WS-16 and WS-37.
+
+### WS-16 — Language packs via the provider contract
+
+**Goal.** Add feature-gated language packs for Python, Java, C, C++, C#, Ruby, PHP, Kotlin, Swift and Bash (Scala and Lua optional). Grammar crates are cached locally. Queries are written originally or taken from upstream MIT tags.scm, never from GitNexus. Precompile the regex fallbacks once. Report coverage honestly per language.
+
+**Requirements.** PAR-SYM-05, PAR-RT-11
+
+**Files.** `rust-core/Cargo.toml`, `rust-core/src/treesitter.rs`, `rust-core/src/repomap.rs`, `rust-core/src/index/lang/mod.rs`, `rust-core/src/index/lang/python.rs`, `rust-core/src/index/lang/java.rs`, `rust-core/src/index/lang/c.rs`, `rust-core/src/index/lang/cpp.rs`, `rust-core/src/index/lang/csharp.rs`, `rust-core/src/index/lang/ruby.rs`, `rust-core/src/index/lang/php.rs`, `rust-core/src/index/lang/kotlin.rs`, `rust-core/src/index/lang/swift.rs`, `rust-core/src/index/lang/bash.rs`, `rust-core/src/index/lang/queries`, `rust-core/tests/lang_fixtures.rs`  
+**New modules.** `rust-core/src/index/lang`
+
+**Tests required.**
+- Per-language fixtures: definitions, nested scopes, imports, references, doc comments
+- Coverage report lists supported, unsupported and failed files per language
+- Regex fallback compiles once (benchmark)
+- Binary size delta recorded; the worker with all packs peaks ≤25 MiB on the 5k-file fixture
+
+**Acceptance.** 14 languages are indexed through the provider contract with honest coverage in search, explain, impact and ground. License provenance is noted for each query file.
+
+**Collision risk.** Cargo.toml is shared with WS-15 and WS-37 (dependency commits first). treesitter.rs was touched by WS-07. repomap.rs has no other in-flight edits.
+
+### WS-17 — Scope/import resolver for Go and TS/JS with typed edges, confidence tiers and epistemic counters
+
+**Goal.** Replace lexical file-to-file edges with resolved symbol edges for Go and TS/JS. Edge kinds: CALLS, IMPORTS, EXTENDS, IMPLEMENTS, HAS_METHOD, HAS_PROPERTY, ACCESSES, USES. Confidence is 0.95 same-file, 0.9 import-scoped and 0.5 global. Provenance is lexical, scope, scip or lsp. Import semantics: named and namespace for TS, wildcard-leaf for Go. Receiver typing covers simple cases. Record drop counters for the epistemic envelope. Re-resolve only the dependents of changed exports.
+
+**Requirements.** PAR-IMP-01, PAR-IMP-05
+
+**Files.** `rust-core/src/index/resolve/mod.rs`, `rust-core/src/index/resolve/scope.rs`, `rust-core/src/index/resolve/imports_go.rs`, `rust-core/src/index/resolve/imports_ts.rs`, `rust-core/src/index/resolve/emit.rs`, `rust-core/src/index/resolve/counters.rs`, `rust-core/src/index/schema.rs`, `rust-core/tests/resolve_fixtures.rs`  
+**New modules.** `rust-core/src/index/resolve`
+
+**Tests required.**
+- Resolution fixtures: same-file, import-scoped, global fallback, re-exports, namespace imports, Go package-qualified calls, method receivers
+- Names inside strings and docstrings never create edges (regression for the memory note)
+- Confidence values and provenance are set per tier
+- Only dependents of changed exports are re-resolved (counter assertion)
+- Drop counters are populated for unresolved receivers and external calls
+- Precision against gopls/tsserver ground truth on a small fixture is measured and reported
+
+**Acceptance.** impact on Go and TS/JS returns resolved symbol edges with confidence and provenance. Lexical edges remain only as provenance=lexical fallback. The precision number is recorded for EVAL-09.
+
+**Collision risk.** schema.rs (from WS-07) gets an edges table addition. No in-flight collisions.
+
+### WS-18 — Code BM25 lane, hybrid fusion, snippets and explainable reasons
+
+**Goal.** Add BM25 over names, subtokens, paths, doc comments and function-aligned chunks (FTS5 in index.db, incremental per file). Rewrite fusion: RRF K=60 as a deliberate choice, lanes_matched, per-lane scores and reasons. The explainable rerank uses declaration identifier match, window coverage, identifier normalization and camel/snake split, over the top K. Return bounded line-numbered snippets. Serve the docs lane from the index instead of per-query rereads. Remove or honestly rename the FNV hashing lane.
+
+**Requirements.** PAR-RET-01, PAR-RET-02, PAR-ADP-01, PAR-RT-11
+
+**Files.** `rust-core/src/index/fts.rs`, `rust-core/src/index/chunks.rs`, `rust-core/src/search.rs`, `rust-core/src/index/rerank.rs`, `api-go/internal/workspaceops/knowledge.go`, `api-go/internal/mcpserver/tool_search.go`, `scripts/bench/gold`, `rust-core/tests/search_hybrid.rs`  
+**New modules.** `rust-core/src/index/fts.rs`, `rust-core/src/index/rerank.rs`
+
+**Tests required.**
+- Body-term queries find functions whose names do not contain the term
+- Snippets are bounded, line-numbered and at most 3 per hit
+- reasons[] present and deterministic
+- No per-query file enumeration or doc rereads (syscall/read counter)
+- The retrieval gate (scripts/bench/retrieval_gate.py) improves by the agreed delta without regressions on existing gold queries
+- The 'semantic' naming is removed from the hashing lane
+
+**Acceptance.** search returns {path, lines, snippet, lanes_matched, scores, reasons, uid}. The retrieval gate passes at the improved threshold. The BM25 cache stays within 5-8 MiB (gate v2).
+
+**Collision risk.** search.rs is shared with WS-14 (graph source) and WS-37 (embedding lane), so sequence the edits. knowledge.go was changed by w0-feedback (WS-00).
+
+### WS-19 — Memory lifecycle writes: history API, supersede/retire/retract/purge, CAS edits, expiry, provenance, verify outcomes
+
+**Goal.** Implement the governed write side on govstore. Add remember supersedes and op=retire|edit with a required reason and base_revision CAS. Verify outcomes become approve|reject|duplicate_of|retract|helpful|misleading|stale_harm, with a note and an evidence handle checked at vote time. Purge is admin-only and leaves a digest tombstone. Add expiry, kinds and tags on write, provenance binding (HEAD, branch, dirty, evidence, run and session), redaction on ingest, and an optional owner-distinct principal policy.
+
+**Requirements.** PAR-PROV-01, PAR-GOV-04, PAR-GOV-05, PAR-GOV-06, PAR-GOV-12, PAR-GOV-09, PAR-GOV-16, PAR-PROV-04, PAR-PROV-05, PAR-SEC-04, PAR-SEC-05, PAR-ADP-04
+
+**Files.** `api-go/internal/workspaceops/memory_propose.go`, `api-go/internal/workspaceops/memory_verify.go`, `api-go/internal/workspaceops/memory_edit.go`, `api-go/internal/workspaceops/memory_history.go`, `api-go/internal/govstore/entries.go`, `api-go/internal/govstore/revisions.go`, `api-go/cmd/xmustard-api/memory_routes.go`, `api-go/cmd/xmustard-api/main.go`, `api-go/internal/mcpserver/tool_remember.go`, `api-go/internal/mcpserver/tool_verify.go`, `api-go/internal/workspaceops/memory_lifecycle_test.go`  
+**New modules.** `api-go/internal/workspaceops/memory_history.go`, `api-go/cmd/xmustard-api/memory_routes.go`
+
+**Tests required.**
+- Supersede: promoting the new entry atomically marks the old entries superseded with invalidated_at, and history is kept
+- Retire and retract are governed; purge is admin-only and leaves a tombstone with the digest
+- CAS conflict returns the current revision and digest; a no-op edit is rejected; a reason is required
+- Verify binds to a specific revision; the edit-revision diff is returned
+- Expired entries are hidden from lists, still fetchable by id, and restorable
+- Provenance fields are captured at propose and promote
+- Secrets in content are rejected or redacted with the pattern named
+- The owner-distinct policy blocks self-verification across two tokens of one owner
+
+**Acceptance.** The MCP remember/verify schemas carry the new arguments with terse descriptions. The HTTP PUT/DELETE context routes move to memory_routes.go. All lifecycle tests are green.
+
+**Collision risk.** Owns memory_propose/verify/edit.go. WS-20 owns memory_recall.go, so disjoint. mcpserver tool_remember.go and tool_verify.go are per-tool files. main.go gets one registration line.
+
+**Correction.** Critic: split into WS-19a (lifecycle states, CAS edit, expiry) and WS-19b (provenance binding, evidence-bound votes, owner-distinct policy, ingest redaction).
+
+### WS-20 — Recall v2: ranking, filters, disclosure, budgets and verification-queue visibility
+
+**Goal.** Rebuild recall on govstore. FTS5 BM25 is fused with path overlap, trust, recency and a stale penalty, and explain=true returns score_details. Filters: kind, tags, topic, path_prefix, since/until, by, status (promoted, pending, awaiting_me), include_pending, include_superseded, show_expired. Add cursor pagination, names_only, a compact render with max_chars, session-seen suppression with TTL, and history=true. Add pending_for_you and memory_pressure to ground.
+
+**Requirements.** PAR-RCL-01, PAR-RCL-04, PAR-RCL-05, PAR-RCL-06, PAR-GOV-02, PAR-GOV-09, PAR-ADP-04
+
+**Files.** `api-go/internal/workspaceops/memory_recall.go`, `api-go/internal/workspaceops/memory_render.go`, `api-go/internal/workspaceops/grounding_memory.go`, `api-go/internal/govstore/fts.go`, `api-go/internal/mcpserver/tool_recall.go`, `api-go/internal/mcpserver/tool_ground.go`, `api-go/internal/workspaceops/memory_recall_test.go`, `api-go/internal/workspaceops/recall_contract_test.go`  
+**New modules.** `api-go/internal/workspaceops/memory_render.go`
+
+**Tests required.**
+- Ranking fixtures: stemming and IDF beat bag-of-words, and score_details sum consistently
+- Superseded entries are hidden by default and shown with include_superseded
+- A pending entry appears only with include_pending or status=pending, labeled unverified with votes_needed
+- awaiting_me excludes the caller's own entries and entries they already voted on
+- Session-seen suppression and re-show when content or stale state changes
+- max_chars is honored with truncation reported; the cursor is stable across pages
+- ground.pending_for_you counts are correct
+- The existing recall contract (digest binding, 3 retries, withholding) is preserved
+
+**Acceptance.** recall exposes the documented arguments and fields. The verification queue is discoverable over MCP alone. Recall latency and RSS are recorded.
+
+**Collision risk.** grounding_memory.go (created by WS-03) is also touched later by WS-28, WS-31 and WS-33. govstore/fts.go was created by WS-01. The mcpserver tool_recall.go and tool_ground.go files are per-tool.
+
+### WS-21 — why_failed and ground failure signals without platform runs
+
+**Goal.** Make why_failed work in the core product. It accepts a command (run through the bounded run-managed-command), an evidence handle or a pasted log. It writes an outcome record to govstore, reads a bounded tail (last 1 MiB) instead of an unbounded ReadFile, stays idempotent on GET (no feedback writes), and links implicated memories. Feed ground.recent_failed_runs from core outcomes.
+
+**Requirements.** PAR-HAR-06, PAR-RET-11, PAR-RT-11
+
+**Files.** `api-go/internal/workspaceops/failure_explainer.go`, `api-go/internal/workspaceops/outcomes.go`, `api-go/internal/workspaceops/grounding_runs.go`, `api-go/internal/govstore/outcomes.go`, `api-go/cmd/xmustard-api/outcome_routes.go`, `api-go/cmd/xmustard-api/main.go`, `api-go/internal/mcpserver/tool_why_failed.go`, `api-go/internal/workspaceops/failure_explainer_test.go`  
+**New modules.** `api-go/internal/workspaceops/outcomes.go`, `api-go/cmd/xmustard-api/outcome_routes.go`
+
+**Tests required.**
+- why_failed(command) runs with a timeout and a process-group kill, then records the outcome
+- why_failed(evidence_handle) reads a bounded tail from evidence
+- Repeated GETs do not change feedback counters
+- ground.recent_failed_runs is populated in core-only mode
+- A large run output is never fully loaded (allocation test)
+
+**Acceptance.** why_failed is functional without any platform route, and ground shows core failures. Existing failure-explainer tests are adapted and green.
+
+**Collision risk.** grounding_runs.go was created by WS-03. main.go gets one registration line. failure_explainer.go was modified by the diagnostics session's older tree (likely at HEAD).
+
+### WS-22 — Governed automatic index baseline and bounding of residual unbounded work
+
+**Goal.** Create the drift/contract baseline automatically at workspace registration or first ground, rebaseline it on HEAD change or admin action, keep its history, and never let an agent reset it silently. Also bound the known cliffs: the changed-since no-baseline branch, the per-symbol file re-read in symbol_signature, and explain clustering on a context.Background spawn. Report 'unknown' instead of 0 on errors.
+
+**Requirements.** PAR-FRESH-06, PAR-RT-11
+
+**Files.** `api-go/internal/workspaceops/workspace_lifecycle.go`, `api-go/internal/workspaceops/changes.go`, `api-go/internal/workspaceops/grounding_index.go`, `api-go/internal/workspaceops/symbolgraph.go`, `api-go/cmd/xmustard-api/main.go`, `rust-core/src/changetrack.rs`, `api-go/internal/workspaceops/baseline_test.go`, `rust-core/tests/changetrack_bounds.rs`  
+**New modules.** `api-go/internal/workspaceops/baseline_test.go`
+
+**Tests required.**
+- Registering a workspace creates the baseline; ground reports baseline {head, indexed_at, auto}
+- An agent-role reset is denied; an admin rebaseline is recorded in history
+- The no-baseline impact is capped and reports truncation
+- symbol_signature reads each file once per call (read counter)
+- explain clustering is cancellable through the request context
+
+**Acceptance.** ground and impact work on a fresh install in core-only mode, and the cliffs are bounded with tests.
+
+**Collision risk.** changetrack.rs was changed by w0-drift (WS-00) and is also touched by WS-15, so land WS-22 first. main.go gets a single line to thread the clustering context. grounding_index.go was created by WS-03.
+
+### WS-23 — Hook service, static hook client and Claude Code adapter plugin
+
+**Goal.** Add /api/hooks/claude/<event> routes in the daemon, with a thin Go fallback client (xmustard-hook, Unix socket, fail-open at ~200 ms). The Claude Code plugin uses http and mcp_tool hooks. Behaviors:
+- PostToolUse: capture, reduce and return shape-matched updatedToolOutput.
+- PreToolUse Grep/Glob/Bash rg|grep: inject BM25/graph hits plus verified memories for the pattern.
+- Read/Edit: inject path-bound memories.
+- Grep-burst nudge with a cooldown, and a post-git freshness notice.
+- SessionStart: ground summary plus core memories.
+- FileChanged: feeds the dirty set.
+No Rust or git spawn happens per hook.
+
+**Requirements.** PAR-HAR-01, PAR-HAR-02, PAR-ADP-06, PAR-CTX-01, PAR-FRESH-07, PAR-PROV-07, PAR-RT-12
+
+**Files.** `api-go/cmd/xmustard-api/hooks_routes.go`, `api-go/cmd/xmustard-api/hooks_routes_test.go`, `api-go/cmd/xmustard-api/main.go`, `api-go/internal/hooks/claude.go`, `api-go/internal/hooks/pattern.go`, `api-go/internal/hooks/steering.go`, `api-go/internal/hooks/hooks_test.go`, `api-go/cmd/xmustard-hook/main.go`, `api-go/cmd/xmustard-hook/main_test.go`, `integrations/claude-code/hooks.json`, `integrations/claude-code/mcp.json`, `integrations/claude-code/README.md`, `integrations/claude-code/testdata`  
+**New modules.** `api-go/internal/hooks`, `api-go/cmd/xmustard-hook`, `integrations/claude-code`
+
+**Tests required.**
+- Golden hook JSON in and out for each event, using recorded Claude Code payload fixtures
+- A shape mismatch falls back to the original within budget
+- Timeout fails open with empty output
+- Parallel PostToolUse calls are handled concurrently
+- Counter assertion: zero Rust/git spawns per hook
+- Captures are redacted; the session and agent ids are recorded as attribution
+- Pattern extraction skips value-taking flags; steering cooldown works
+
+**Acceptance.** The plugin installs manually and reduces native Bash/Read/Grep outputs with recoverable handles, and SessionStart context works. Conformance fixtures pass. The main.go diff is one registration line.
+
+**Collision risk.** main.go gets one line. Otherwise new packages only.
+
+**Correction.** Critic: add SubagentStart/Stop, CwdChanged, WorktreeCreate/Remove, UserPromptSubmit keyword-trigger recall, PostToolUse(Edit|Write) new-diagnostics delta (tree-sitter syntax errors first), explicit http-hook timeouts.
+
+### WS-24 — Pi adapter extended to built-in tools, masking and custom compaction
+
+**Goal.** Project Pi's bash/read/grep/find/ls/edit/write results through the capture API, preserving isError and details. Add turn_end context_edit masking of older results in polling windows, exempting the latest failure and edited files. Add a session_before_compact custom summary whose details carry handles. Keep xmustard_expand activation.
+
+**Requirements.** PAR-ADP-09, PAR-CTX-07, PAR-HAR-04, PAR-CTX-01
+
+**Files.** `integrations/pi/src/index.ts`, `integrations/pi/src/delivery.ts`, `integrations/pi/src/masking.ts`, `integrations/pi/src/compaction.ts`, `integrations/pi/src/tools.ts`, `integrations/pi/test/unit.test.ts`, `integrations/pi/test/e2e/pi-adapter.e2e.ts`  
+**New modules.** `integrations/pi/src/masking.ts`, `integrations/pi/src/compaction.ts`
+
+**Tests required.**
+- Built-in tool results are projected with handles, and isError/details are preserved
+- Masking advances only every N turns and exempts the latest failure and actively edited files
+- The custom compaction entry carries handles in details and is recoverable
+- e2e with pinned Pi 0.87.1 and the scripted faux provider: the replacement reaches the next model request
+
+**Acceptance.** Pi agents get reduced built-in outputs with recovery. The xMustard-owned tree RSS is recorded in the Pi e2e summary.
+
+**Collision risk.** integrations/pi/src/tools.ts, which WS-00 and WS-04 changed or generated. No Go collisions.
+
+### WS-25 — Remove remaining unreachable Rust code
+
+**Goal.** Remove the swarm and bench subcommands and modules, the symbolgraph build-lsp and flow subcommands, and the lsp-references/definition/implementation/type-definition/rename subcommands, all of which have no Go caller. Keep upgrade_graph_with_lsp and LspWorkspaceSession (future LSP lane), wiki.rs (called by rustcore/knowledge.go) and goalruntime.rs (called by rustcore/goals.go).
+
+**Requirements.** PAR-RT-08
+
+**Files.** `rust-core/src/swarm.rs`, `rust-core/src/benchmark.rs`, `rust-core/src/lib.rs`, `rust-core/src/bin/xmustard-core.rs`, `api-go/internal/rustcore/bridge_test.go`
+
+**Tests required.**
+- cargo test and cargo clippy clean
+- A Go bridge test asserts that every subcommand Go calls still exists (wiki, goal, lsp-hover, lsp-document-symbols and the others)
+
+**Acceptance.** Smaller binary; all checks green; nothing Go calls is removed.
+
+**Collision risk.** lib.rs and bin/xmustard-core.rs are shared with WS-02, WS-07 and WS-41. Use the dispatch table.
+
+### WS-26 — Release hygiene and packaging
+
+**Goal.** Untrack the 80 backend/data runtime files (git rm --cached, human confirms), reconcile .gitignore, add a tagged-release target that builds a prebuilt xmustard-core and the relay, and fix the HEAD-only Homebrew formula.
+
+**Requirements.** PAR-OPS-03
+
+**Files.** `.gitignore`, `packaging/homebrew/xmustard.rb`, `Makefile`, `.github/workflows/release.yml`  
+**New modules.** `.github/workflows/release.yml`
+
+**Tests required.**
+- A clean clone builds and passes make check-backend with no backend/data tracked files
+- The release workflow dry-run produces artifacts
+
+**Acceptance.** No machine-specific data is tracked, and a release can be cut reproducibly. Untracking is presented to the human for approval.
+
+**Collision risk.** .gitignore and the Makefile were modified in the diagnostics session's older tree. Coordinate. Do not edit README.md or docs/STATUS.md.
+
+### WS-27 — Dedupe, code anchors, tiered conflicts and structured claims
+
+**Goal.** At propose time:
+- Normalize, then exact hash, then an entropy gate, then MinHash/LSH (a Graphiti dedup_helpers port with the Apache NOTICE). Duplicates become corroboration or possible_duplicates.
+- Extract anchors: paths, identifiers resolved through the index, commands, config keys, error codes. Maintain an anchor inverted index with a damped boost.
+- Tiered conflict candidates: claim, suspected contradiction, path overlap.
+- Optional structured claims with a fixed predicate vocabulary and typed memory relations.
+- Return suggested_supersedes so the agent can act.
+
+**Requirements.** PAR-GOV-03, PAR-RCL-02, PAR-GOV-10, PAR-GOV-11, PAR-GOV-21
+
+**Files.** `api-go/internal/workspaceops/memory_dedupe.go`, `api-go/internal/workspaceops/memory_anchors.go`, `api-go/internal/workspaceops/memory_conflicts.go`, `api-go/internal/workspaceops/memory_claims.go`, `api-go/internal/workspaceops/memory_propose.go`, `api-go/internal/govstore/anchors.go`, `api-go/internal/mcpserver/tool_remember.go`, `api-go/internal/workspaceops/memory_dedupe_test.go`, `api-go/internal/workspaceops/memory_anchors_test.go`  
+**New modules.** `api-go/internal/workspaceops/memory_dedupe.go`, `api-go/internal/workspaceops/memory_anchors.go`, `api-go/internal/workspaceops/memory_conflicts.go`, `api-go/internal/workspaceops/memory_claims.go`
+
+**Tests required.**
+- An exact duplicate of a promoted memory becomes corroborated; near duplicates are returned with similarity
+- The entropy gate prevents false merges of short generic text
+- Anchors resolve symbols through the worker; a high-fan-out anchor is damped
+- Claim conflict: same subject and predicate with a different object is flagged
+- T2 contradiction on numbers, versions and commands; T3 path overlap retained and labeled
+- Dedupe signatures stay under 1 KB per memory
+
+**Acceptance.** remember returns created or corroborated, possible_duplicates, possible_conflicts, anchors and suggested_supersedes. The lifecycle suite fixtures for duplicates and contradictions pass.
+
+**Collision risk.** memory_propose.go is owned by WS-19, so this is a sequential follow-up. The per-tool mcpserver file tool_remember.go is shared with WS-19.
+
+**Correction.** Critic: MinHash/LSH bands and anchor postings stay in SQLite; per-principal pending quotas; RSS test at 50k memories.
+
+### WS-28 — Change-driven invalidation, as_of, graph-proximity recall and memories on explain/impact
+
+**Goal.** Watcher and HEAD changes intersect the anchor index. The system re-hashes only affected anchors, at symbol-body granularity, and persists stale_observed events and needs_reverify. ground shows at_risk_memories. Add bi-temporal valid_from/invalidated_at and recall as_of. Add recall seed=<symbol> ranking by graph distance, with bounded MMR diversity. Attach anchored memories to explain and impact results. Add refs_stale.
+
+**Requirements.** PAR-PROV-03, PAR-PROV-02, PAR-RCL-03, PAR-SYM-04, PAR-RCL-09
+
+**Files.** `api-go/internal/workspaceops/memory_invalidation.go`, `api-go/internal/workspaceops/memory_temporal.go`, `api-go/internal/workspaceops/memory_recall.go`, `api-go/internal/workspaceops/grounding_memory.go`, `api-go/internal/workspaceops/workspace_reads.go`, `api-go/internal/rustcore/worker.go`, `api-go/internal/mcpserver/tool_recall.go`, `api-go/internal/workspaceops/memory_invalidation_test.go`  
+**New modules.** `api-go/internal/workspaceops/memory_invalidation.go`, `api-go/internal/workspaceops/memory_temporal.go`
+
+**Tests required.**
+- An edit to an anchored symbol body marks the memory at risk; an unrelated edit in the same file does not
+- stale_observed events are persisted with commit and anchors
+- as_of at an older commit returns the facts valid then (ancestry check cached)
+- seed ranking follows graph distance; MMR runs over ≤100 candidates
+- explain and impact include memories with trust and stale labels
+
+**Acceptance.** ground lists memories affected by the caller's changes before they act, and recall supports as_of and seed. Tests are green.
+
+**Collision risk.** memory_recall.go (WS-20) and grounding_memory.go (WS-20, WS-31, WS-33); sequence after WS-20. workspace_reads.go holds the explain wiring.
+
+### WS-29 — Memory scopes and shared collections with grants
+
+**Goal.** Add private, dir, run and global scopes derived from the principal, and shared collections with grants: source, target, permission (rw or ro), granted_by, and a per-collection policy. Recall gives per-target applicability (verified_here, foreign_unchecked, stale) and merges scopes with labels. Add xmustard-ops shared list/create/grant/revoke/history.
+
+**Requirements.** PAR-SHARE-01, PAR-SHARE-02
+
+**Files.** `api-go/internal/workspaceops/memory_scopes.go`, `api-go/internal/workspaceops/memory_grants.go`, `api-go/internal/govstore/grants.go`, `api-go/cmd/xmustard-api/grant_routes.go`, `api-go/cmd/xmustard-api/main.go`, `api-go/cmd/xmustard-ops/main.go`, `api-go/internal/mcpserver/tool_recall.go`, `api-go/internal/mcpserver/tool_remember.go`, `api-go/internal/workspaceops/memory_scopes_test.go`  
+**New modules.** `api-go/internal/workspaceops/memory_scopes.go`, `api-go/internal/workspaceops/memory_grants.go`, `api-go/cmd/xmustard-api/grant_routes.go`
+
+**Tests required.**
+- A private memory is visible to others only as unverified and self-promotes for its owner
+- Scope can never be set from metadata (identity smuggling test)
+- A granted collection appears in the target with applicability foreign_unchecked until rechecked there
+- A read-only grant rejects writes; revoking a grant hides the collection
+- Scope leakage is 0 across the fixture suite
+
+**Acceptance.** Cross-repository authorized memory sharing (vision workflow 3) works end to end with labels, and the lifecycle suite scope-leak metric is 0.
+
+**Collision risk.** main.go gets one line. xmustard-ops main.go is shared with WS-32, WS-34 and WS-44 (add subcommand files, not inline code). The per-tool mcpserver files are shared.
+
+### WS-30 — Cross-workspace code query, residency LRU, worktree identity and path rewriting
+
+**Goal.** search, explain and impact accept workspaces or a group. The resident service holds at most K hot indexes (default 1) with LRU and idle eviction; cold repos are served by pread or loaded on demand in the heavy slot. Detect linked worktrees and record branch/worktree identity. Store anchors repo-relative, with a longest-prefix path rewrite map for foreign absolute paths.
+
+**Requirements.** PAR-SHARE-03, PAR-RT-10, PAR-SHARE-04, PAR-SHARE-05
+
+**Files.** `rust-core/src/serve.rs`, `rust-core/src/index/residency.rs`, `api-go/internal/workspaceops/workspace_registry.go`, `api-go/internal/workspaceops/path_rewrite.go`, `api-go/internal/mcpserver/tool_search.go`, `api-go/internal/mcpserver/tool_explain.go`, `api-go/internal/mcpserver/tool_impact.go`, `rust-core/tests/residency.rs`, `api-go/internal/workspaceops/path_rewrite_test.go`  
+**New modules.** `rust-core/src/index/residency.rs`, `api-go/internal/workspaceops/path_rewrite.go`
+
+**Tests required.**
+- A second hot repo evicts the least recent one under K=1; the RSS bound holds (gate v2)
+- Cross-workspace search applies per-repo candidate caps and reports per-repo freshness
+- Worktree detection gives distinct identity per worktree
+- Foreign absolute paths rewrite correctly; unmatched paths error clearly
+
+**Acceptance.** Multi-repo queries work within budget under the default residency, and gate v2 with 2 repos is attached.
+
+**Collision risk.** serve.rs (WS-02, WS-14, WS-15). workspace_registry.go (WS-03).
+
+### WS-31 — Tiered memory, write policy, revision-pinned injection, guidance artifacts and onboarding
+
+**Goal.** Deliver the following:
+- Core and deferred tiers, with a core character budget and governed tier changes.
+- Write-policy validation: schema, size caps, protected fields and patterns that need human-approver, and an admin-only policy config.
+- initialize.instructions with a budgeted core projection plus a deferred index, compiled from promoted state and cached by revision.
+- ground(since_revision) deltas and the SessionStart renderer.
+- Marker-bounded AGENTS.md/CLAUDE.md block writer with original prose.
+- MCP prompts (pre_commit_check, orient).
+- Onboarding checklist for empty workspaces.
+- Memory token report.
+
+**Requirements.** PAR-GOV-08, PAR-GOV-07, PAR-HAR-03, PAR-HAR-11, PAR-GOV-15, PAR-CTX-13, PAR-SEC-02, PAR-SEC-06
+
+**Files.** `api-go/internal/workspaceops/memory_tiers.go`, `api-go/internal/workspaceops/memory_policy.go`, `api-go/internal/workspaceops/grounding_memory.go`, `api-go/internal/mcpserver/instructions.go`, `api-go/internal/mcpserver/prompts.go`, `api-go/internal/hooks/claude.go`, `api-go/cmd/xmustard-ops/guidance.go`, `api-go/cmd/xmustard-ops/policy.go`, `api-go/internal/workspaceops/memory_tiers_test.go`  
+**New modules.** `api-go/internal/workspaceops/memory_tiers.go`, `api-go/internal/workspaceops/memory_policy.go`, `api-go/internal/mcpserver/prompts.go`, `api-go/cmd/xmustard-ops/guidance.go`
+
+**Tests required.**
+- The core projection respects the character budget and uses only promoted entries
+- since_revision returns only added, changed, superseded and stale entries
+- A policy violation returns structured errors; a protected memory requires human-approver
+- Policy config changes require admin plus human approval
+- The AGENTS.md block writer is idempotent with line-anchored markers and never matches inline mentions
+- Onboarding appears only when there are no promoted memories
+
+**Acceptance.** Agents receive standing conventions without calling recall. Injection is revision-pinned and budgeted. Policy is enforced server-side.
+
+**Collision risk.** grounding_memory.go (WS-20, WS-28, WS-33). hooks/claude.go (WS-23). mcpserver/instructions.go (WS-04).
+
+**Correction.** Critic: SEC-02 stays in WS-09 and SEC-06 in WS-44; add path-scoped client rule-file export (WS-62).
+
+### WS-32 — Consolidation work queue, memory health, skills export and Markdown/git export-import
+
+**Goal.** Deliver the following:
+- Deterministic consolidation jobs: dedupe clusters, stale and orphan anchors, supersession chains, ageing proposals, session digests, init seeds from AGENTS.md. Each has a per-source watermark (advanced on success) and CAS leases with a conflict signature.
+- ground consolidation_jobs and a memory_health block with an advisory next_action.
+- Procedures exported as skills with a provenance header.
+- Markdown/JSONL export and import, plus an optional git mirror. Imports land pending/foreign.
+
+**Requirements.** PAR-GOV-13, PAR-SHARE-08, PAR-GOV-17, PAR-GOV-18, PAR-GOV-14
+
+**Files.** `api-go/internal/workspaceops/memory_jobs.go`, `api-go/internal/workspaceops/memory_health.go`, `api-go/internal/govstore/jobs.go`, `api-go/internal/workspaceops/grounding_memory.go`, `api-go/cmd/xmustard-ops/memories.go`, `api-go/cmd/xmustard-ops/skills.go`, `api-go/internal/mcpserver/tool_remember.go`, `api-go/internal/workspaceops/memory_jobs_test.go`  
+**New modules.** `api-go/internal/workspaceops/memory_jobs.go`, `api-go/internal/workspaceops/memory_health.go`, `api-go/cmd/xmustard-ops/memories.go`, `api-go/cmd/xmustard-ops/skills.go`
+
+**Tests required.**
+- Jobs are idempotent; the watermark advances only on success; a crashed lease is retried and a finished-failed lease is reported
+- remember(job_id) attributes proposals; promotion still requires distinct-principal verify
+- Export/import round-trips with provenance; imports land pending
+- The git mirror refuses reset when dirty and keeps a backup ref
+- Skills export includes path hashes and flags stale procedures
+
+**Acceptance.** The consolidation loop runs end to end with an external agent doing the reasoning, and no memory is auto-promoted.
+
+**Collision risk.** grounding_memory.go, the xmustard-ops subcommand files, and tool_remember.go (WS-19, WS-27).
+
+### WS-33 — Session ledger, compaction snapshot and restore, handoff capsule and cross-client handoff
+
+**Goal.** Deliver the following:
+- A durable session ledger per workspace, client, session and principal: tool calls with digest, handle and status; files read and modified; decisions; errors; compactions.
+- A PreCompact ≤2 KB priority-tiered snapshot, re-injected via SessionStart source=compact.
+- remember(kind=handoff) with a schema-checked capsule and path hashes.
+- ground session_handoff, continuity and handoffs.
+- Deterministic candidate-memory mining at Stop/SessionEnd.
+
+**Requirements.** PAR-PROV-06, PAR-HAR-04, PAR-HAR-05, PAR-PROV-08, PAR-PROV-07, PAR-GOV-14
+
+**Files.** `api-go/internal/workspaceops/session_ledger.go`, `api-go/internal/workspaceops/session_snapshot.go`, `api-go/internal/workspaceops/handoff_capsule.go`, `api-go/internal/workspaceops/grounding_session.go`, `api-go/internal/govstore/sessions.go`, `api-go/internal/hooks/claude.go`, `api-go/internal/mcpserver/tool_remember.go`, `api-go/internal/workspaceops/session_ledger_test.go`  
+**New modules.** `api-go/internal/workspaceops/session_ledger.go`, `api-go/internal/workspaceops/session_snapshot.go`, `api-go/internal/workspaceops/handoff_capsule.go`, `api-go/internal/workspaceops/grounding_session.go`
+
+**Tests required.**
+- The snapshot is ≤2 KB and prioritized; handles in it are expandable
+- SessionStart source=compact re-injects the snapshot
+- The handoff capsule schema is validated; stale paths are flagged on read
+- A new session in a different client receives the prior snapshot and pending proposals
+- Candidate mining produces pending candidates only
+- Ledger retention and compaction bounds hold
+
+**Acceptance.** Continuity survives client compaction and client switches, backed by evidence.
+
+**Collision risk.** hooks/claude.go (WS-23, WS-31) and tool_remember.go.
+
+**Correction.** Critic: SessionEnd/Stop work is async (Claude Code gives SessionEnd hooks a shared 1.5 s budget).
+
+### WS-34 — Session transcript store, session search, new-session bootstrap and cross-harness import
+
+**Goal.** Deliver the following:
+- An immutable transcript/session event store with FTS5, labeled as raw observations.
+- recall(source=sessions) with date, agent and conversation filters and cursor expansion.
+- ground recent and relevant sessions, filtered by RRF ≥0.012 and ≥0.93 of the top score, labeled not confirmed.
+- Streaming importers for Claude Code, Codex, OpenCode and Pi session stores, via xmustard-ops import sessions.
+
+**Requirements.** PAR-RCL-07, PAR-RCL-08, PAR-ADP-12, PAR-SEC-04
+
+**Files.** `api-go/internal/sessionimport/claude.go`, `api-go/internal/sessionimport/codex.go`, `api-go/internal/sessionimport/opencode.go`, `api-go/internal/sessionimport/pi.go`, `api-go/internal/sessionimport/import_test.go`, `api-go/internal/workspaceops/transcripts.go`, `api-go/internal/workspaceops/grounding_session.go`, `api-go/internal/mcpserver/tool_recall.go`, `api-go/cmd/xmustard-ops/import_sessions.go`  
+**New modules.** `api-go/internal/sessionimport`, `api-go/internal/workspaceops/transcripts.go`, `api-go/cmd/xmustard-ops/import_sessions.go`
+
+**Tests required.**
+- Importers stream line by line with bounded memory (a 100 MB fixture stays under a fixed allocation)
+- Redaction is applied to imported content
+- Search returns excerpts with handles; cursor expansion works
+- The bootstrap thresholds and label are applied
+- Imported content never appears as verified memory
+
+**Acceptance.** Past sessions from existing agents are searchable and cited by consolidation jobs. Transient import RSS is recorded.
+
+**Collision risk.** grounding_session.go (WS-33) and tool_recall.go (WS-20, WS-28, WS-29).
+
+### WS-35 — Impact v2: tiers, risk, epistemic envelope, typed filters, trace caps, diff-to-symbol and import cycles
+
+**Goal.** Over the resolved graph, add:
+- direction, max_depth, relation_types, min_confidence and include_tests; class seeding.
+- by_depth tiers, risk scoring (CRITICAL/HIGH/MEDIUM/LOW/UNKNOWN with risk_note) and per-depth pagination.
+- The epistemic envelope, trace with per-hop metadata and caps, and the furthest-node diagnosis.
+- detect_changes scopes (unstaged/staged/all/compare, base/head, worktree) with pinned git flags and re-parsed current spans including untracked files.
+- Bounded Tarjan+Johnson import-cycle checks surfaced in impact/ground until diagnostics is handed off.
+
+**Requirements.** PAR-IMP-04, PAR-IMP-05, PAR-IMP-06, PAR-IMP-07, PAR-IMP-08, PAR-FRESH-10
+
+**Files.** `rust-core/src/index/impact.rs`, `rust-core/src/index/trace.rs`, `rust-core/src/index/detect_changes.rs`, `rust-core/src/index/cycles.rs`, `rust-core/src/serve.rs`, `api-go/internal/mcpserver/tool_impact.go`, `api-go/internal/rustcore/worker.go`, `rust-core/tests/impact_v2.rs`  
+**New modules.** `rust-core/src/index/impact.rs`, `rust-core/src/index/trace.rs`, `rust-core/src/index/detect_changes.rs`, `rust-core/src/index/cycles.rs`
+
+**Tests required.**
+- Risk thresholds are covered by table tests; UNKNOWN is returned on zero upstream callers
+- Pagination per depth is stable; summary_only counts match
+- Pinned git flags produce parsed files under a hostile user git config (quotePath, external diff, color)
+- Untracked files are included; spans are current after edits
+- Trace caps and the furthest node are reported; cycle enumeration truncates to one representative per SCC with componentCount stable
+- contract_break is preserved
+
+**Acceptance.** impact reaches parity with GitNexus impact, detect_changes and trace on fixtures, with honest completeness labels.
+
+**Collision risk.** serve.rs (shared) and tool_impact.go (WS-36 adds refs ops; coordinate). Does not touch diagnostics*.go.
+
+### WS-36 — Symbol navigation surfaces and staged degradation contract
+
+**Goal.** Deliver the following:
+- search mode=symbol with the name-path grammar (absolute, relative, overload index), include_body sliced from disk, include_info, depth children, max_matches with a refine map, and the ambiguity envelope with uids.
+- explain file/dir overview with depth and staged fallback, plus symbol 360 context with chain_depth.
+- impact op=refs|definition|implementations with the containing symbol and snippet.
+- The max_chars/limit/cursor degradation ladders on search, explain and impact.
+
+**Requirements.** PAR-SYM-02, PAR-SYM-03, PAR-SYM-04, PAR-IMP-03, PAR-CTX-05
+
+**Files.** `rust-core/src/index/namepath.rs`, `rust-core/src/index/overview.rs`, `rust-core/src/index/context.rs`, `rust-core/src/index/refs.rs`, `rust-core/src/serve.rs`, `api-go/internal/mcpserver/tool_search.go`, `api-go/internal/mcpserver/tool_explain.go`, `api-go/internal/mcpserver/tool_impact.go`, `api-go/internal/mcpserver/degrade.go`, `rust-core/tests/navigation.rs`  
+**New modules.** `rust-core/src/index/namepath.rs`, `rust-core/src/index/overview.rs`, `rust-core/src/index/context.rs`, `rust-core/src/index/refs.rs`, `api-go/internal/mcpserver/degrade.go`
+
+**Tests required.**
+- Name-path grammar fixtures including overloads and substring matching
+- Bodies are sliced from the working tree, not stored
+- Ambiguous names return ranked candidates with totalCandidates
+- Each degradation stage is reached and named at shrinking max_chars
+- refs include the containing symbol and a ±1 snippet with provenance
+
+**Acceptance.** Serena-style symbolic reads are available through the existing tools with bounded outputs.
+
+**Collision risk.** The per-tool mcpserver files search, explain and impact are shared with WS-18, WS-35 and WS-30. serve.rs.
+
+### WS-37 — Static-embedding semantic lane with binary/int8 vector index
+
+**Goal.** Deliver the following:
+- A lean static-embedding loader: mmap safetensors, int8, compact WordPiece in a sorted array or FST.
+- Vectors precomputed at index time for changed chunks.
+- A 1-bit prefilter plus int8 rerank via pread, with HNSW only below a threshold.
+- Fusion as a semantic lane with a semantic_model label.
+- An optional dense lane for memory recall.
+- Default-on only if the retrieval gate improves concept queries without regressions.
+
+**Requirements.** PAR-RET-03, PAR-RET-04, PAR-RCL-01
+
+**Files.** `rust-core/Cargo.toml`, `rust-core/src/index/embed_static.rs`, `rust-core/src/index/tokenizer_wordpiece.rs`, `rust-core/src/index/vectors.rs`, `rust-core/src/search.rs`, `rust-core/src/semantic.rs`, `rust-core/tests/embed_static.rs`, `scripts/bench/gold`  
+**New modules.** `rust-core/src/index/embed_static.rs`, `rust-core/src/index/tokenizer_wordpiece.rs`, `rust-core/src/index/vectors.rs`
+
+**Tests required.**
+- Tokenizer parity with the reference tokenizer on a fixture vocabulary
+- Embeddings match the model2vec reference within tolerance
+- Binary prefilter recall@200 then int8 rerank quality on a fixture
+- RSS: loaded lane ≤10 MiB peak (gate v2); no whole-file read into f32
+- Retrieval gate on concept queries (authenticate vs login)
+
+**Acceptance.** An honest semantic lane is available within budget, and the default-on decision is recorded with gate evidence.
+
+**Collision risk.** search.rs (WS-14, WS-18) and Cargo.toml (WS-15, WS-16).
+
+### WS-38 — Functional areas, execution flows, orientation packet and flow-grouped search
+
+**Goal.** Deliver the following:
+- Seeded deterministic communities over resolved edges, with large-graph mode, folder labels and sampled cohesion.
+- Entry-point scoring and bounded DFS flows with truncation stats.
+- ground orientation from the scanner.
+- search group_by=flow.
+- MCP resources for areas and flows.
+- explain area and flow membership.
+
+**Requirements.** PAR-SYM-08, PAR-SYM-09, PAR-SYM-10, PAR-RET-06, PAR-HAR-11, PAR-GOV-20
+
+**Files.** `rust-core/src/index/areas.rs`, `rust-core/src/index/flows.rs`, `rust-core/src/index/orientation.rs`, `rust-core/src/serve.rs`, `api-go/internal/mcpserver/resources.go`, `api-go/internal/mcpserver/tool_explain.go`, `api-go/internal/mcpserver/tool_search.go`, `api-go/internal/workspaceops/grounding_index.go`, `rust-core/tests/areas_flows.rs`  
+**New modules.** `rust-core/src/index/areas.rs`, `rust-core/src/index/flows.rs`, `rust-core/src/index/orientation.rs`, `api-go/internal/mcpserver/resources.go`
+
+**Tests required.**
+- Deterministic output across runs (seeded RNG); incremental results equal a full rebuild
+- Large-graph mode triggers above 10k symbols
+- Flow caps and truncation stats
+- Orientation lists are bounded
+- Resources list and read correctly
+
+**Acceptance.** Orientation and flow context are available through explain, ground and resources, with worker transients inside the heavy slot.
+
+**Collision risk.** The per-tool mcpserver files explain and search, and grounding_index.go (WS-03, WS-22).
+
+### WS-39 — Resolvers for Rust, Python and Java
+
+**Goal.** Extend scope/import resolution to Rust (use paths, impl blocks, traits), Python (namespace imports, MRO c3) and Java (packages, inheritance, interfaces), with the same confidence tiers, provenance and drop counters.
+
+**Requirements.** PAR-IMP-01, PAR-IMP-05
+
+**Files.** `rust-core/src/index/resolve/imports_rust.rs`, `rust-core/src/index/resolve/imports_python.rs`, `rust-core/src/index/resolve/imports_java.rs`, `rust-core/src/index/resolve/mro.rs`, `rust-core/src/index/resolve/mod.rs`, `rust-core/tests/resolve_more_langs.rs`  
+**New modules.** `rust-core/src/index/resolve/imports_rust.rs`, `rust-core/src/index/resolve/imports_python.rs`, `rust-core/src/index/resolve/imports_java.rs`, `rust-core/src/index/resolve/mro.rs`
+
+**Tests required.**
+- Per-language resolution fixtures including trait impls, relative imports and overloads
+- MRO c3 fixtures
+- Precision against rust-analyzer, pyright or jdtls ground truth on small fixtures, recorded
+
+**Acceptance.** Resolved edges are available for 5 languages, with precision numbers recorded for EVAL-09.
+
+**Collision risk.** resolve/mod.rs is from WS-17. Otherwise none.
+
+### WS-40 — Codex, OpenCode and Cursor adapters, Letta recipe and adapter capability registry
+
+**Goal.** Deliver the following:
+- Codex hooks: PostToolUse decision:block projection feedback; version-gated PreToolUse updatedInput; mcp_tool handlers; SessionStart and UserPromptSubmit; PreCompact and PostCompact.
+- An OpenCode TS plugin: tool.execute.after output mutation, messages.transform masking, session.compacting, system.transform, tool.definition.
+- Cursor hooks: updated_mcp_tool_output; preToolUse updated_input command wrapping; sessionStart; preCompact.
+- A Letta Code recipe with a letta profile.
+- A capability registry surfaced in ground delivery_capabilities.
+
+**Requirements.** PAR-ADP-07, PAR-ADP-08, PAR-ADP-10, PAR-ADP-11, PAR-ADP-14, PAR-CTX-03, PAR-CTX-07
+
+**Files.** `api-go/internal/hooks/codex.go`, `api-go/internal/hooks/cursor.go`, `api-go/internal/hooks/opencode.go`, `api-go/cmd/xmustard-api/hooks_routes.go`, `api-go/internal/adapters/capabilities.go`, `integrations/codex/hooks.json`, `integrations/codex/README.md`, `integrations/opencode/package.json`, `integrations/opencode/src/index.ts`, `integrations/opencode/test/plugin.test.ts`, `integrations/cursor/hooks.json`, `integrations/cursor/README.md`, `integrations/letta/README.md`, `api-go/internal/hooks/adapters_test.go`  
+**New modules.** `integrations/codex`, `integrations/opencode`, `integrations/cursor`, `integrations/letta`, `api-go/internal/adapters`
+
+**Tests required.**
+- Recorded payload fixtures per client and version; golden outputs
+- Codex block-feedback carries the projection plus handle; the updatedInput version gate is honored
+- OpenCode mutated output is returned; masking stubs carry handles
+- Cursor MCP output replacement; shell wrapping via updated_input
+- The capability registry returns explicit unsupported errors
+
+**Acceptance.** The four clients are supported with documented seams and pinned versions. Capability truth is exposed in ground.
+
+**Collision risk.** hooks_routes.go (WS-23) and the hooks package files (WS-31, WS-33 edit claude.go only).
+
+**Correction.** Critic: split into WS-40a Codex, WS-40b OpenCode (TS), WS-40c Cursor (Rust command hook client <=2 MiB), WS-40d Letta recipe + capability registry (records Codex additionalContextLimit 2,500 tokens, Cursor failClosed).
+
+### WS-41 — Command-wrapper reducer, retention classes and upstream references
+
+**Goal.** Add `xmustard-core run -- <argv>` (RTK pattern): it streams child output to the spool with a bounded tail, preserves exit code and signals, and prints the projection plus a handle. Add retention classes (hook-captured, own outputs, snapshots) with separate TTLs and quotas, and hashed upstream references when the client already persisted the original. A full quota means bounded passthrough, never eviction of a promised original.
+
+**Requirements.** PAR-CTX-10, PAR-CTX-09, PAR-STORE-04
+
+**Files.** `rust-core/src/run_wrapper.rs`, `rust-core/src/bin/xmustard-core.rs`, `api-go/internal/evidence/retention.go`, `api-go/internal/evidence/upstream_ref.go`, `api-go/internal/evidence/store.go`, `api-go/cmd/xmustard-api/evidence_routes.go`, `rust-core/tests/run_wrapper.rs`, `api-go/internal/evidence/retention_test.go`  
+**New modules.** `rust-core/src/run_wrapper.rs`, `api-go/internal/evidence/retention.go`, `api-go/internal/evidence/upstream_ref.go`
+
+**Tests required.**
+- The wrapper preserves the exit code, signals and stdout/stderr ordering with bounded memory on 100 MB output
+- The wrapper fails open if the API is unreachable (passthrough with a notice)
+- Retention classes expire independently; upstream-reference hash verification streams
+- Quota-full behavior never evicts unexpired originals
+
+**Acceptance.** Shell reduction works in clients without result replacement, and evidence disk use stays bounded under universal capture.
+
+**Collision risk.** evidence/store.go and evidence_routes.go (WS-03). bin/xmustard-core.rs (dispatch table).
+
+### WS-42 — Repeat guard, revision-keyed result cache and recoverable history compaction library
+
+**Goal.** Deliver the following:
+- An identity-bound per-session repeat guard keyed by (tool, canonical args, raw sha, repo revision), returning 'unchanged since call X; handle H', with error-class-aware repeat annotations and exemptions for side-effecting calls.
+- A byte-capped revision-keyed read-only result cache for search, explain, impact and diagnostics.
+- A deterministic history compaction library over structured message arrays: keep-recent-N, per-kind summaries, todo deltas, guidance dedupe; each replaced tool_result keeps tool_use_id/is_error plus a handle.
+
+**Requirements.** PAR-CTX-06, PAR-CTX-14, PAR-CTX-08
+
+**Files.** `api-go/internal/evidence/ledger.go`, `api-go/internal/evidence/result_cache.go`, `api-go/internal/compaction/compact.go`, `api-go/internal/compaction/summarize.go`, `api-go/internal/compaction/compact_test.go`, `api-go/internal/evidence/ledger_test.go`, `api-go/internal/evidence/result_cache_test.go`  
+**New modules.** `api-go/internal/evidence/ledger.go`, `api-go/internal/evidence/result_cache.go`, `api-go/internal/compaction`
+
+**Tests required.**
+- Repeat detection is invalidated by content or revision change; side-effecting tools are never deduped
+- Error classes classify validation/not_found/permission/timeout/tool_error
+- The cache is capped by bytes and scoped per principal; a revision change misses
+- Compaction keeps tool exchange pairs atomic and never byte-slices; handles recover the originals
+- Ports of cursor-bridge compaction tests (bridge_orchestrator_test.go:809-891) adapted to structured input, with provenance
+
+**Acceptance.** The libraries are ready for the gateway and context hooks, with measured context savings on fixtures.
+
+**Collision risk.** New files only in the evidence package (store.go is not edited).
+
+### WS-43 — Opt-in upstream MCP gateway, progress event bus and memory notifications
+
+**Goal.** Deliver the following:
+- A gateway mode with a namespaced catalog, BM25 tool_search, schema fetch and call. It preserves ids, cancellation, progress, pagination, list_changed and structured results; enforces per-principal allowlists and explicit profiles; projects downstream results; and has idle eviction and a max-live limit (HTTP downstreams preferred).
+- A typed event hub (128-event ring, non-blocking fan-out) feeding MCP notifications/progress, a workspace events SSE route and MCP resource subscriptions on memory revision.
+- A cursor-paginated memory event feed.
+
+**Requirements.** PAR-HAR-08, PAR-SHARE-07, PAR-SHARE-06
+
+**Files.** `api-go/internal/gateway/catalog.go`, `api-go/internal/gateway/client.go`, `api-go/internal/gateway/search.go`, `api-go/internal/gateway/gateway_test.go`, `api-go/internal/events/hub.go`, `api-go/internal/events/hub_test.go`, `api-go/cmd/xmustard-api/events_routes.go`, `api-go/cmd/xmustard-api/mcp_http.go`, `api-go/cmd/xmustard-api/main.go`, `api-go/internal/mcpserver/tool_recall.go`  
+**New modules.** `api-go/internal/gateway`, `api-go/internal/events`, `api-go/cmd/xmustard-api/events_routes.go`
+
+**Tests required.**
+- Gateway conformance: id preservation, cancel, progress and pagination passthrough
+- Allowlist enforcement; discovery is never treated as authorization
+- Idle eviction and max-live limits; spawned stdio servers are reported as external in gate v2
+- The hub drops on full without blocking publishers
+- Resource subscription notifies on memory revision change
+- recall events_since pagination
+
+**Acceptance.** Third-party MCP output is reducible through xMustard when opted in. Progress and notifications work for long calls.
+
+**Collision risk.** mcp_http.go (WS-13), main.go (1 line) and tool_recall.go (shared memory tool file).
+
+### WS-44 — Install/doctor/uninstall per client, conformance suite, ops CLI, ignore/retention config and fixture capture
+
+**Goal.** Deliver the following:
+- xmustard-ops setup/uninstall/doctor --client with version detection, preflight (health plus evidence round-trip), backup, atomic swap, automatic rollback and a savings report.
+- A pinned client conformance suite.
+- status/clean/index --prewarm/is-ignored/lsp status.
+- .xmustardignore single-sourced with .gitignore, content_retention config, and a repository-trust gate for repo-supplied config.
+- Opt-in sanitized fixture capture (0600, quotas).
+
+**Requirements.** PAR-ADP-13, PAR-EVAL-07, PAR-OPS-02, PAR-FRESH-08, PAR-HAR-12, PAR-SEC-06
+
+**Files.** `api-go/cmd/xmustard-ops/setup.go`, `api-go/cmd/xmustard-ops/doctor.go`, `api-go/cmd/xmustard-ops/status.go`, `api-go/cmd/xmustard-ops/capture_fixture.go`, `api-go/cmd/xmustard-ops/main.go`, `api-go/internal/workspaceops/repo_config.go`, `api-go/internal/conformance/suite.go`, `api-go/internal/conformance/suite_test.go`  
+**New modules.** `api-go/cmd/xmustard-ops/setup.go`, `api-go/cmd/xmustard-ops/doctor.go`, `api-go/internal/conformance`
+
+**Tests required.**
+- Setup is idempotent; uninstall fully reverses it; rollback on a failed preflight
+- Keys are never read from plists or exported into environments
+- Conformance: the replacement reaches the next model request, shape match, error preservation, abort, and denial of expired/foreign handles, on recorded fixtures
+- is-ignored agrees with the indexer on a fixture tree
+- Untrusted repo config that could run commands is ignored
+
+**Acceptance.** One-command install for Claude Code, Codex, OpenCode, Pi and Cursor, with pinned conformance results.
+
+**Collision risk.** xmustard-ops main.go (add subcommand files only). repo_config_routes.go exists in cmd/xmustard-api and must be reconciled.
+
+### WS-45 — Opt-in LSP pool wiring into explain, impact and diagnostics
+
+**Goal.** Route explain(symbol), impact(op=refs|definition) and diagnostics(path) through the existing Go LSP session pool (lsp_definition.go) when a server is installed and precise=true or config enables it. Limit to at most one live server, idle eviction, crash restart with a single retry, restart on RSS runaway and memory caps (maxTsServerMemory). Upgrade edges to provenance=lsp. LSP RSS is reported on an external line.
+
+**Requirements.** PAR-SYM-06
+
+**Files.** `api-go/internal/workspaceops/lsp_definition.go`, `api-go/internal/workspaceops/lsp_precise.go`, `api-go/internal/mcpserver/tool_explain.go`, `api-go/internal/mcpserver/tool_impact.go`, `api-go/internal/workspaceops/lsp_precise_test.go`, `scripts/bench/rss_bench_v2.py`  
+**New modules.** `api-go/internal/workspaceops/lsp_precise.go`
+
+**Tests required.**
+- Falls back to tree-sitter when no server is installed
+- Only one live server; idle eviction; a crash triggers restart and a single retry
+- Provenance=lsp set on upgraded edges
+- Gate v2 reports LSP RSS on a separate external line
+
+**Acceptance.** Serena-grade precision is available opt-in, with honest external accounting.
+
+**Collision risk.** lsp_definition.go (platform routes use it; keep behavior). Per-tool files explain and impact. Does not touch diagnostics*.go; the diagnostics wiring waits for WS-47.
+
+### WS-46 — SCIP precise-lane ingestion
+
+**Goal.** Ingest scip-go, scip-typescript and rust-analyzer scip output, produced by scheduled external jobs, into the occurrence/edge tables stamped with commit and provenance=scip. Report precision_by_lang coverage. Check indexer licenses.
+
+**Requirements.** PAR-SYM-07
+
+**Files.** `rust-core/Cargo.toml`, `rust-core/src/index/scip_ingest.rs`, `rust-core/src/bin/xmustard-core.rs`, `rust-core/tests/scip_ingest.rs`  
+**New modules.** `rust-core/src/index/scip_ingest.rs`
+
+**Tests required.**
+- Ingest a small SCIP fixture; occurrences map to symbols
+- The commit stamp mismatch with HEAD is labeled stale
+- Steady RSS unaffected (disk-backed)
+
+**Acceptance.** A precise lane exists without a resident language server. Indexer runs are external and measured.
+
+**Collision risk.** Cargo.toml and bin/xmustard-core.rs (dispatch table).
+
+### WS-47 — Diagnostics tool deepening after the diagnostics session hands off
+
+**Goal.** Once the in-flight local diagnostics store lands, which is owned by another session, add: path, symbol, min_severity, range, with_references and since=checkpoint|baseline (new and resolved sets), grouping by path, severity and owner name path, structural import-cycle findings from WS-35, and precision provenance.
+
+**Requirements.** PAR-HAR-07, PAR-IMP-08
+
+**Files.** `api-go/internal/workspaceops/diagnostics.go`, `api-go/internal/workspaceops/diagnostics_query.go`, `api-go/internal/mcpserver/tool_diagnostics.go`, `api-go/internal/workspaceops/diagnostics_query_test.go`  
+**New modules.** `api-go/internal/workspaceops/diagnostics_query.go`
+
+**Tests required.**
+- Filters and grouping on local-store fixtures
+- since=checkpoint returns new and resolved sets correctly
+- Structural findings merged with provenance
+
+**Acceptance.** diagnostics works without Postgres and offers scoped and delta queries.
+
+**Collision risk.** HIGH. It touches diagnostics*.go, which the diagnostics session owns (diagnostics_input/local_store/prepared/read_stream, diagnostics.go and tests, profile_hook*, zz_profile_gate_test.go). Start only after that session hands off and its branch (wip/diagnostics-live-set or the opus worktree) has landed.
+
+### WS-48 — Single config struct replacing repeated env lookups
+
+**Goal.** Replace the 186 envDefault("XMUSTARD_DATA_DIR"...) calls and other scattered env reads in main.go with one config struct passed to handlers. This is a mechanical change.
+
+**Requirements.** PAR-RT-07
+
+**Files.** `api-go/cmd/xmustard-api/config.go`, `api-go/cmd/xmustard-api/main.go`, `api-go/cmd/xmustard-api/config_test.go`  
+**New modules.** `api-go/cmd/xmustard-api/config.go`
+
+**Tests required.**
+- Config is loaded once; env precedence documented and tested
+- All cmd/xmustard-api tests are green
+
+**Acceptance.** main.go has no repeated envDefault data-dir lookups, and behavior is unchanged.
+
+**Collision risk.** Very high on main.go. Schedule in a quiet window after wave-2 route work lands. Coordinate with the diagnostics session's main.go wiring.
+
+### WS-49 — Kernel package extraction and platform behind a build tag
+
+**Goal.** Extract governance, grounding, evidence, budget, the nine handlers and the MCP server into a kernel package with an explicit Store interface. Move issues, runs, terminals, providers and Postgres behind a build tag so the default binary does not link pgx or provider code.
+
+**Requirements.** PAR-RT-07
+
+**Files.** `api-go/internal/kernel`, `api-go/internal/workspaceops`, `api-go/cmd/xmustard-api/main.go`, `api-go/cmd/xmustard-api/platform_routes.go`, `Makefile`  
+**New modules.** `api-go/internal/kernel`, `api-go/cmd/xmustard-api/platform_routes.go`
+
+**Tests required.**
+- The default build excludes pgx (go list -deps check)
+- The platform build tag restores all routes; both builds pass tests
+- The binary size and RSS delta are recorded with gate v2
+
+**Acceptance.** A smaller default binary with measured savings, and the platform available only with the tag.
+
+**Collision risk.** Very high: broad file moves in workspaceops. Run it last in wave 3 with no concurrent workstreams on workspaceops, and coordinate with the diagnostics session.
+
+**Correction.** Critic: gate Rust wiki and goal subcommands behind the same platform feature.
+
+### WS-50 — Parity evaluation suite and final parity-scale gate
+
+**Goal.** Deliver the following:
+- The coding-memory lifecycle suite: duplicate, supersession, contradiction, stale, expiry and scope-leak fixtures, plus a consolidation arm.
+- The context-reduction quality evaluation: raw, projection, masking and compaction, with rare-failure fixtures.
+- Component benches: retrieval against peers, impact precision against LSP/SCIP truth, and freshness latency after edit, rename and delete.
+- A footprint comparison against OpenHands, Pi and a bare agent.
+- The final EVAL-05 gate at parity scale on macOS and Linux.
+Update the docs with measured results only.
+
+**Requirements.** PAR-EVAL-02, PAR-EVAL-03, PAR-EVAL-06, PAR-EVAL-09, PAR-EVAL-05
+
+**Files.** `eval/tasks/memory_lifecycle.yaml`, `eval/tasks/reduction_quality.yaml`, `api-go/cmd/xmustard-eval/arms.go`, `scripts/bench/component_benches.py`, `scripts/bench/footprint_compare.py`, `docs/benchmarks`  
+**New modules.** `eval/tasks/memory_lifecycle.yaml`, `eval/tasks/reduction_quality.yaml`, `scripts/bench/component_benches.py`, `scripts/bench/footprint_compare.py`
+
+**Tests required.**
+- Fixture validity checks: oracles fail on the untouched baseline and pass on the reference solutions
+- Scope leakage metric is 0
+- Gate v2 run at parity scale with all default lanes on; externals on separate lines
+- Linux run alongside macOS
+
+**Acceptance.** A published, reproducible parity report. Budget and parity claims in docs are updated only from these measurements, and a failed gate is reported honestly with the offending components.
+
+**Collision risk.** docs/benchmarks only. Do not edit README.md or docs/STATUS.md until the diagnostics session has landed, then do a coordinated docs pass.
+
+### WS-51 — Helper-model adapter contract, optional ONNX sidecar and Needle3 measurement
+
+**Goal.** Deliver the following:
+- The off-by-default helper contract: an isolated serialized worker with bounded input, time and output and telemetry disabled. It returns IDs or an abstention, validated against the deterministic shortlist and snapshot. Parsing fails closed (cursor-bridge extractJSONObjectCandidates pattern).
+- An optional ONNX embedding sidecar for index time only, in the heavy slot.
+- Needle3 measured RSS and a tool-selection A/B against BM25 before any enablement.
+
+**Requirements.** PAR-CTX-11, PAR-CTX-12, PAR-RET-05, PAR-GOV-19
+
+**Files.** `rust-core/src/helper/mod.rs`, `rust-core/src/helper/contract.rs`, `rust-core/src/helper/onnx_sidecar.rs`, `api-go/internal/helper/client.go`, `api-go/internal/helper/parse.go`, `api-go/internal/helper/parse_test.go`, `rust-core/Cargo.toml`, `scripts/bench/helper_rss.py`  
+**New modules.** `rust-core/src/helper`, `api-go/internal/helper`
+
+**Tests required.**
+- Parser handles fenced output, concatenated objects and junk, and fails closed
+- Validation rejects IDs outside the shortlist; falls back on abstention
+- The sidecar is admitted only through the heavy slot and is reaped when idle
+- Needle3 RSS measured and recorded; FunctionGemma/LFM excluded by policy
+
+**Acceptance.** The contract is shipped disabled. Measurements are recorded, and there is no default-profile RSS change.
+
+**Collision risk.** Cargo.toml (feature-gated dependency).
+
+### WS-52 — Revision-aware reads, commit/diff history search and task-shaped retrieval
+
+**Goal.** Deliver the following:
+- rev= on search and explain via the git object database without checkout; impact base/head compare (building on WS-35).
+- search mode=commits|diff, bounded by git log --grep/-S/-G with caps; stale memories get the commits that invalidated them attached.
+- search mode=task, with deterministic decomposition into identifiers, paths, concepts and memories naming paths, returning a few ranges with a why.
+
+**Requirements.** PAR-FRESH-10, PAR-RET-08, PAR-RET-07
+
+**Files.** `rust-core/src/index/revision.rs`, `api-go/internal/workspaceops/history_search.go`, `api-go/internal/workspaceops/task_search.go`, `api-go/internal/mcpserver/tool_search.go`, `api-go/internal/workspaceops/history_search_test.go`, `api-go/internal/workspaceops/task_search_test.go`  
+**New modules.** `rust-core/src/index/revision.rs`, `api-go/internal/workspaceops/history_search.go`, `api-go/internal/workspaceops/task_search.go`
+
+**Tests required.**
+- A rev= read returns historical content without touching the working tree
+- Commit and diff search are capped by lines and bytes
+- Stale memory links to its invalidating commit
+- Task decomposition fixtures return ≤limit ranges with reasons
+
+**Acceptance.** Sourcegraph and Augment-style revision, history and task retrieval are available through search, with at most one extra revision graph resident.
+
+**Collision risk.** The per-tool mcpserver file tool_search.go is shared with WS-18, WS-36 and WS-38.
+
+### WS-53 — Bounded verification and run-lineage runner
+
+**Goal.** Add a small state machine in the daemon for verification runs (tests and checks) with lineage, outcome records in govstore, and restart honesty (running becomes interrupted and failed). verify reuses an in-flight run for the same claim and revision. Child tools are external, bounded by CaptureWriter and ChildLimit, and reported separately. There is no agent loop.
+
+**Requirements.** PAR-HAR-10, PAR-SHARE-09
+
+**Files.** `api-go/internal/workspaceops/run_lineage.go`, `api-go/internal/workspaceops/run_lineage_test.go`, `api-go/internal/govstore/outcomes.go`, `api-go/internal/workspaceops/memory_verify.go`, `api-go/internal/workspaceops/grounding_runs.go`  
+**New modules.** `api-go/internal/workspaceops/run_lineage.go`
+
+**Tests required.**
+- Restart marks in-flight runs interrupted and failed
+- A duplicate verification request reuses the in-flight run
+- Child output is capped; RSS of child processes appears on external lines in gate v2
+- Lineage links run, outcome, memory and evidence
+
+**Acceptance.** The verification lineage is honest and deduplicated, with no agent-runtime scope creep.
+
+**Collision risk.** memory_verify.go (WS-19) and grounding_runs.go (WS-03, WS-21).
+
+### WS-54 — Output-budget contract for ground and tools/list (critic addition)
+
+ground(sections, max_chars) with per-section caps and a degradation ladder; snapshot test that tools/list stays <= N bytes per profile (baseline 5,177 B); advanced args accepted but not advertised, documented via an MCP resource.
+
+### WS-55 — Worktree overlay index (critic addition)
+
+One base index per repo plus per-worktree delta segments for dirty and branch-diff files; acceptance: gate v2 with 4 agents in 4 worktrees of one repo stays under 95.4 MiB.
+
+### WS-56 — Injection-safety policy (critic addition)
+
+Instruction-pattern scan and data framing on everything injected; core tier and hook-injected memories need human-approver or stronger policy; untrusted-capture-derived content stays quarantined; adversarial fixtures in EVAL-02.
+
+### WS-57 — Human-approval surface (critic addition)
+
+xmustard-ops approve|reject|queue bound to a human-approver token, optional MCP elicitation; precondition for protected paths in WS-19 and WS-31.
+
+### WS-58 — Daemon lifecycle (critic addition)
+
+launchd/systemd unit or socket activation via xmustard-ops setup, health-checked auto-start, crash restart, log rotation, schema migration with connected clients; govstore backup (VACUUM INTO), quick_check on open, restore.
+
+### WS-59 — impact op=rename|delete plans and search mode=exact|regex (critic addition)
+
+Read-only rename/delete impact plans (IMP-09) and exact/regex search (RET-09) matching GitNexus rename and grep-class surfaces.
+
+### WS-60 — Framework entry-point extractors and extra language packs (critic addition)
+
+Route/DI extractors (Django, FastAPI, Next.js, Nest, Spring, Laravel, tRPC, Expo) seeding flow entry points; Vue, Dart, Objective-C packs; reimplemented from design (GitNexus is PolyForm NC).
+
+### WS-61 — Personalized PageRank repo map fitted to a token budget (critic addition)
+
+aider-style ranked map over the resident CSR, personalized by files in play and mentioned identifiers, binary-searched to max_map_tokens; surfaced via ground orientation or explain(path=".").
+
+### WS-62 — Path-scoped client rule-file export (critic addition)
+
+Export verified memories to .clinerules paths:, Cursor rules, .claude/rules, AGENTS.md sections; marker-bounded, revision-stamped; zero RSS delivery path.
+
+### WS-63 — Evaluation corpus authoring (critic addition)
+
+Tasks with hidden oracles validated to fail on baseline and pass on the reference, on Apache/MIT repos; budgeted real-model run as an operator step.
+
