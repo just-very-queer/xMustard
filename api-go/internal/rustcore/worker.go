@@ -124,11 +124,15 @@ type workerSettings struct {
 }
 
 func readWorkerSettings() workerSettings {
-	return workerSettings{
+	s := workerSettings{
 		idle:  envDuration("XMUSTARD_CORE_WORKER_IDLE_MS", defaultWorkerIdle),
 		trim:  envDuration("XMUSTARD_CORE_WORKER_TRIM_MS", defaultWorkerTrim),
 		start: envDuration("XMUSTARD_CORE_WORKER_START_MS", defaultWorkerStart),
 	}
+	if s.start <= 0 {
+		s.start = defaultWorkerStart
+	}
+	return s
 }
 
 // workerKey identifies what a worker was started as: its command line, working
