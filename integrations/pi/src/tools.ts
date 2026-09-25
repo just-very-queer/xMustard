@@ -58,7 +58,7 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
 	{
 		name: "recall",
 		description:
-			"The VERIFIED shared context to trust, RANKED to your task: pass a query and/or paths to get the few relevant facts (multi-signal: lexical + path overlap + verification strength), not a dump. No query → recency-ranked top-N.",
+			"VERIFIED shared context, RANKED by query and/or paths (lexical + path overlap + approvals); non-matches dropped. No args → top-N favoring working-tree overlap, then recency. conflicts: path overlap, not contradiction.",
 		required: ["workspace_id"],
 		optional: [
 			{ name: "query", type: "string", desc: "task query to rank memories by" },
@@ -106,7 +106,7 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
 	{
 		name: "search",
 		description:
-			"Narrow code search over the repo, returning relevant slices (path:line), not a dump. Default mode is hybrid (lexical+semantic+structural+proximity). Pass seed=<symbol> to anchor a graph-PROXIMITY lane that pulls symbols structurally near that symbol up the ranking (auto-seeds from an exact query→symbol match otherwise). Pass mode=pattern to run an ast-grep STRUCTURAL query (query is the pattern, e.g. `$A && $A()`; optional lang).",
+			"Code search: path:line slices. Default hybrid ranks symbol NAMES, file paths and doc chunks, not function bodies: RRF of lexical IDF, trigram fuzzy match (typo tolerance, not meaning, unless built with semantic-onnx and XMUSTARD_EMBED_MODEL set), reference degree, graph proximity to seed=<symbol> (else exact-name match). mode=pattern: ast-grep structural query (e.g. `$A && $A()`; optional lang).",
 		required: ["workspace_id", "query"],
 		optional: [
 			{ name: "mode", type: "string", enum: ["hybrid", "pattern"], desc: "hybrid (default) or pattern (ast-grep)" },
@@ -129,7 +129,7 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
 	{
 		name: "impact",
 		description:
-			"Blast radius. No args → impact of the current changes (dirty symbols, with contract_break flags where a signature changed vs the baseline). symbol= → every file that transitively references that symbol (graph BFS). from= & to= → the shortest dependency path between two symbols.",
+			"Blast radius over a LEXICAL reference graph (name matches + import lines, not resolved calls): distance≥1 edges are leads to confirm, not proof. No args → current changes (dirty symbols, contract_break). symbol= → files referencing its defining files, ≤4 hops. from=&to= → shortest undirected file path.",
 		required: ["workspace_id"],
 		optional: [
 			{ name: "symbol", type: "string", desc: "symbol to compute blast radius for" },

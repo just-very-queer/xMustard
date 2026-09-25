@@ -11,7 +11,6 @@ pub mod goalruntime;
 pub mod indexcache;
 pub mod lsp;
 pub mod lsp_session;
-pub mod models;
 pub mod ownership;
 pub mod repomap;
 pub mod scanner;
