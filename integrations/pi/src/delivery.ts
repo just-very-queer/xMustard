@@ -585,12 +585,18 @@ export class Capturer {
 		}
 	}
 
-	// noteFailure pauses capture after an outage: Go unreachable or hung, or capture
-	// refused because no redactor is wired. A caller's own abort is not an outage.
+	// noteFailure pauses capture after an outage or a standing refusal: Go unreachable
+	// or hung, capture refused because no redactor is wired, or this principal may not
+	// capture (401/403). A caller's own abort is not an outage.
 	noteFailure(err: unknown, callerSignal?: AbortSignal): void {
 		if (!(err instanceof XmustardHttpError) || callerSignal?.aborted) return;
 		const outage =
-			err.failure === "unreachable" || err.failure === "timeout" || err.failure === "aborted" || (err.status === 503 && err.reason === "redaction_unavailable");
+			err.failure === "unreachable" ||
+			err.failure === "timeout" ||
+			err.failure === "aborted" ||
+			err.status === 401 ||
+			err.status === 403 ||
+			(err.status === 503 && err.reason === "redaction_unavailable");
 		if (outage) {
 			this.pausedUntil = this.now() + CAPTURE_PAUSE_MS;
 			this.pauseReason = err.message;

@@ -635,6 +635,20 @@ describe("built-in tool projection through capture", () => {
 		now += CAPTURE_PAUSE_MS + 1;
 		await projectBuiltin(cfg(), c, resolve, ev, {}, () => {});
 		assert.equal(srv.captures().length, 2, "retried after the pause");
+		// a principal that may not capture (reader token) is not asked again either
+		const denied = captureServer(() => ({ status: 403, body: { reason: "forbidden", error: "role proposer required" } }));
+		const d = new Capturer(cfg(), () => now);
+		await projectBuiltin(cfg(), d, resolve, ev, {}, () => {});
+		await projectBuiltin(cfg(), d, resolve, ev, {}, () => {});
+		assert.equal(denied.captures().length, 1);
+		assert.match(d.paused ?? "", /403/);
+		// other refusals (quota, size) are per output: no pause
+		const quota = captureServer(() => ({ status: 507, body: { reason: "quota_full", error: "quota" } }));
+		const q = new Capturer(cfg(), () => now);
+		await projectBuiltin(cfg(), q, resolve, ev, {}, () => {});
+		await projectBuiltin(cfg(), q, resolve, ev, {}, () => {});
+		assert.equal(quota.captures().length, 2);
+		assert.equal(q.paused, undefined);
 	});
 	test("an unshapable capture or an unresolved workspace keeps Pi's result", async () => {
 		captureServer((s) => (s.path.endsWith("/capture") ? { body: observation({ shape: { client: "pi", shape: "pi.tool_result", mode: "fallback_original", reason: "status members" } }) } : undefined));
