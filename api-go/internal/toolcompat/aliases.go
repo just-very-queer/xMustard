@@ -30,8 +30,10 @@ func CanonicalKey(key string) string {
 
 // argAliases is the harness argument alias table, keyed by Token. It is ported
 // from the owner's cursor-bridge (bridge_tool_compat.go, bridgeToolArgAliases)
-// and extended with the argument spellings of Claude Code, Codex, OpenCode and Pi
-// tools. Values are canonical argument names.
+// and extended with the argument spellings of Claude Code, Codex, OpenCode, Pi
+// and Cline tools. Values are canonical argument names. cursor-bridge's
+// "message" → "question" is not ported: it served an ask_question repair that
+// toolcompat does not have, and it hid Task's "message" description.
 var argAliases = map[string]string{
 	// ported from cursor-bridge
 	"cmd":                "command",
@@ -60,7 +62,6 @@ var argAliases = map[string]string{
 	"resourcename":       "uri",
 	"resourceuri":        "uri",
 	"promptname":         "prompt",
-	"message":            "question",
 	"text":               "content",
 	"diagram":            "content",
 	"modelname":          "model",
@@ -102,9 +103,12 @@ var argAliases = map[string]string{
 	"workspaceid":  "workspace_id",
 	"entryid":      "entry_id",
 	"runid":        "run_id",
-	"shellid":      "session_id", // Claude Code KillShell
+	"shellid":      "session_id", // Claude Code KillShell (kind kill_shell)
 	"bashid":       "session_id", // Claude Code BashOutput
 	"blockuntilms": "block_until_ms",
+	"absolutepath": "path",    // Cline
+	"regex":        "pattern", // Cline search_files
+	"filepattern":  "glob",    // Cline search_files, like Claude Code Grep's glob
 }
 
 // kindAliases holds per-tool vocabulary for xMustard's nine MCP tools, keyed by
@@ -163,13 +167,15 @@ var commonAliases = map[string]string{
 
 // kindNames maps harness tool names (by Token) to kinds. It ports cursor-bridge's
 // bridgeToolKindFromName (bridge_orchestrator.go) for the kinds toolcompat
-// repairs, and adds the built-in tool names of Claude Code, Codex, Cursor,
-// OpenCode, Pi and Cline.
+// repairs, and adds the built-in file, search, shell, web, delegation and MCP
+// tool names of Claude Code, Codex, Cursor, OpenCode, Pi and Cline. Tools
+// outside those families (todo lists, plan mode, questions to the user) have no
+// kind.
 var kindNames = map[string]Kind{
 	// read / write / edit
 	"readfile": KindReadFile, "read": KindReadFile,
 	"writefile": KindWriteFile, "write": KindWriteFile, "createfile": KindWriteFile,
-	"deletefile": KindDeleteFile, "delete": KindDeleteFile,
+	"writetofile": KindWriteFile, "deletefile": KindDeleteFile, "delete": KindDeleteFile,
 	"applypatch": KindApplyPatch, "edit": KindApplyPatch, "editfile": KindApplyPatch,
 	"multiedit": KindApplyPatch, "editnotebook": KindApplyPatch, "notebookedit": KindApplyPatch,
 	"searchreplace": KindApplyPatch, "strreplace": KindApplyPatch, "patch": KindApplyPatch,
@@ -187,6 +193,7 @@ var kindNames = map[string]Kind{
 	"runcommand": KindShell, "executecommand": KindShell, "terminal": KindShell,
 	"writeshellstdin": KindShellStdin, "await": KindShellStdin, "awaitshell": KindShellStdin,
 	"writestdin": KindShellStdin, "bashoutput": KindShellStdin,
+	"killshell": KindKillShell, "killbash": KindKillShell,
 	"awaittask": KindAwaitTask,
 	// web
 	"webfetch": KindWebFetch, "fetch": KindWebFetch,

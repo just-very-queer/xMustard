@@ -18,10 +18,13 @@
 //     checks apply.
 //
 // Mutating tools (remember and verify always, or any spec with Mutating set)
-// never have argument values rewritten. Their keys may be renamed from an alias
-// to the canonical field (the value is untouched and the rename is recorded),
-// but value repairs and type coercions are only reported, with Applied=false,
-// and a value that would need one fails validation instead.
+// never have their arguments changed, keys included: Result.Args is the input
+// as given. Every normalization another tool would get (key rename, duplicate
+// drop, value repair, type coercion) is only reported, with Applied=false, and
+// the call fails validation: with the ordinary type, enum, required or unknown
+// error when the canonical spelling is itself invalid, and otherwise with
+// CodeNeedsRepair naming the canonical field. A mutating call therefore either
+// validates with no normalizations and its arguments exactly as sent, or fails.
 //
 // The alias table, per-kind repairs and required-field rules are ported from the
 // owner's cursor-bridge (bridge_tool_compat.go); validation signatures use
@@ -41,10 +44,14 @@
 package toolcompat
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"math"
 	"net/url"
 	"path/filepath"
 	"reflect"
@@ -73,6 +80,7 @@ const (
 const (
 	KindShell            Kind = "shell"
 	KindShellStdin       Kind = "write_shell_stdin"
+	KindKillShell        Kind = "kill_shell"
 	KindAwaitTask        Kind = "await_task"
 	KindReadFile         Kind = "read_file"
 	KindWriteFile        Kind = "write_file"
@@ -180,6 +188,10 @@ const (
 	CodeEnum      = "enum"
 	CodeUnknown   = "unknown"
 	CodeAmbiguous = "ambiguous"
+	// CodeNeedsRepair: a mutating tool's argument is not in canonical form
+	// (an alias key, a duplicate, or a value another tool would have repaired).
+	// Field names the canonical field; Expected names the repair rule, if any.
+	CodeNeedsRepair = "needs_repair"
 )
 
 // ValidationError is a structured argument error. Field is always the
@@ -199,7 +211,7 @@ func (e *ValidationError) Error() string { return e.Message }
 // Result is the outcome of Normalize.
 type Result struct {
 	// Args are the normalized arguments: a fresh deep copy; the input map is
-	// never modified. For a mutating tool only key renames are applied.
+	// never modified. For a mutating tool they are the arguments as given.
 	Args map[string]any `json:"-"`
 	// Normalizations lists every change, in the order it was made.
 	Normalizations []Normalization `json:"normalizations,omitempty"`
@@ -223,57 +235,85 @@ func Normalize(spec Spec, args map[string]any) Result {
 	mutating := spec.mutating()
 	input := deepCopyMap(args)
 	canon, norms, amb := canonicalizeKeys(spec, input)
-	res := Result{Args: canon, Normalizations: norms}
 	if amb != nil {
 		// nothing is applied when the spellings conflict: Args is the input as given
-		res.Args, res.Normalizations = input, nil
 		amb.Tool = tool
 		amb.Signature = Signature(tool, input, amb.Message)
-		res.Err = amb
-		return res
+		return Result{Args: input, Err: amb}
 	}
 
+	// Repairs run on the canonical spelling; for a mutating tool, on a scratch
+	// copy, so they are reported without touching the arguments.
 	work := canon
 	if mutating {
-		work = deepCopyMap(canon) // repairs run on a scratch copy and are only reported
+		work = deepCopyMap(canon)
 	}
 	st := &state{args: work}
 	repairKind(spec.Kind, st)
 	if spec.closed() {
 		repairFields(spec, st)
 	}
-	for i := range st.norms {
-		st.norms[i].Applied = !mutating
+	norms = append(norms, st.norms...)
+	for i := range norms {
+		norms[i].Applied = !mutating
 	}
-	if !mutating {
-		res.Args = work
+	res := Result{Args: work, Normalizations: norms}
+	check := work
+	if mutating {
+		// Validate the canonical spelling so errors name canonical fields.
+		res.Args, check = input, canon
 	}
-	res.Normalizations = append(res.Normalizations, st.norms...)
 
-	if verr := validate(spec, res.Args); verr != nil {
-		verr.Tool = tool
-		if mutating && verr.Field != "" {
-			for _, n := range st.norms {
-				if n.Field == verr.Field {
-					verr.Message += fmt.Sprintf(" (not repaired: %s is a mutating tool)", tool)
-					break
-				}
+	verr := validate(spec, check)
+	switch {
+	case verr != nil && mutating:
+		for _, n := range norms {
+			if n.Field == verr.Field {
+				verr.Message += fmt.Sprintf(" (not repaired: %s is a mutating tool)", tool)
+				break
 			}
 		}
+	case verr == nil && mutating && len(norms) > 0:
+		verr = needsRepair(tool, norms[0])
+	}
+	if verr != nil {
+		verr.Tool = tool
 		verr.Signature = Signature(tool, res.Args, verr.Message)
 		res.Err = verr
 	}
 	return res
 }
 
+// needsRepair is the error for a mutating call whose arguments are valid in
+// canonical form but were not sent that way.
+func needsRepair(tool string, n Normalization) *ValidationError {
+	var msg string
+	switch n.Op {
+	case OpAlias:
+		msg = fmt.Sprintf("argument %q for %s must be sent as %q", n.From, tool, n.Field)
+	case OpDrop:
+		msg = fmt.Sprintf("argument %q for %s repeats %q; send it once, as %q", n.From, tool, n.Field, n.Field)
+	default:
+		msg = fmt.Sprintf("argument %q for %s is not in canonical form (%s); send the canonical value", n.Field, tool, n.Rule)
+	}
+	msg += fmt.Sprintf(" (%s is a mutating tool: its arguments are never rewritten)", tool)
+	return &ValidationError{Field: n.Field, Code: CodeNeedsRepair, Expected: n.Rule, Message: msg}
+}
+
 // NormalizeJSON is Normalize over a JSON object. It returns the normalized
 // arguments re-encoded as JSON. An empty or null input is an empty object; any
-// other non-object input is an error.
+// other non-object input, or trailing data after the object, is an error.
+// Numbers decode as json.Number, so integers of any size round-trip unchanged.
 func NormalizeJSON(spec Spec, raw json.RawMessage) (json.RawMessage, Result, error) {
 	args := map[string]any{}
-	if trimmed := strings.TrimSpace(string(raw)); trimmed != "" && trimmed != "null" {
-		if err := json.Unmarshal(raw, &args); err != nil {
+	if trimmed := bytes.TrimSpace(raw); len(trimmed) > 0 && string(trimmed) != "null" {
+		dec := json.NewDecoder(bytes.NewReader(trimmed))
+		dec.UseNumber()
+		if err := dec.Decode(&args); err != nil {
 			return nil, Result{}, fmt.Errorf("tool arguments must be a JSON object: %w", err)
+		}
+		if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+			return nil, Result{}, errors.New("tool arguments must be a single JSON object")
 		}
 	}
 	res := Normalize(spec, args)
@@ -335,12 +375,12 @@ func canonicalizeKeys(spec Spec, args map[string]any) (map[string]any, []Normali
 					Message: fmt.Sprintf("arguments %q and %q both set %q for %s with different values", source[c], k, c, spec.toolName()),
 				}
 			}
-			norms = append(norms, Normalization{Op: OpDrop, Field: c, From: k, Rule: "duplicate", Applied: true})
+			norms = append(norms, Normalization{Op: OpDrop, Field: c, From: k, Rule: "duplicate"})
 			continue
 		}
 		out[c] = args[k]
 		source[c] = k
-		norms = append(norms, Normalization{Op: OpAlias, Field: c, From: k, Applied: true})
+		norms = append(norms, Normalization{Op: OpAlias, Field: c, From: k})
 	}
 	return out, norms, nil
 }
@@ -733,13 +773,21 @@ func modelSelection(s *state) (string, string) {
 	return key, provider + "/" + model
 }
 
+// coerceIntArg converts a numeric string, or a JSON number written with a
+// fraction or exponent but an integral value ("1.5e3"), to an int.
 func coerceIntArg(s *state, key string) {
-	v, ok := s.args[key].(string)
-	if !ok {
-		return
-	}
-	if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
-		s.coerce(key, n, "integer")
+	switch v := s.args[key].(type) {
+	case string:
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
+			s.coerce(key, n, "integer")
+		}
+	case json.Number:
+		if _, err := v.Int64(); err == nil {
+			return // already an integer
+		}
+		if f, err := v.Float64(); err == nil && f == math.Trunc(f) && math.Abs(f) <= 1<<53 {
+			s.coerce(key, int(f), "integer")
+		}
 	}
 }
 
@@ -942,7 +990,7 @@ func validateKind(k Kind, args map[string]any) *ValidationError {
 		if !has("command") && !nonEmptyList(args["command"]) {
 			return required("command", "command is required")
 		}
-	case KindShellStdin:
+	case KindShellStdin, KindKillShell:
 		if !has("session_id", "task_id", "id") {
 			return required("session_id", "session_id or task_id is required")
 		}
@@ -974,19 +1022,24 @@ func validateKind(k Kind, args map[string]any) *ValidationError {
 	return nil
 }
 
-// CleanLocalPath turns a path argument into a clean local path: it strips a
-// file:// scheme (decoding percent escapes), rejects other URIs by returning
-// "", and applies filepath.Clean.
+// CleanLocalPath turns a path argument into a clean local path. A file:// URI
+// loses its scheme and an optional "localhost" authority, and its percent
+// escapes are decoded when they are well formed ("file:///a%20b" → "/a b"). The
+// rest is taken as a path, as cursor-bridge does: "file://src/main.go" stays
+// relative, and '#' and '?' stay part of the name. Other URIs return "". The
+// result goes through filepath.Clean.
 func CleanLocalPath(raw string) string {
 	p := strings.TrimSpace(raw)
 	if p == "" {
 		return ""
 	}
-	if strings.HasPrefix(strings.ToLower(p), "file://") {
-		if u, err := url.Parse(p); err == nil && u.Path != "" {
-			p = u.Path
-		} else {
-			p = p[len("file://"):]
+	if hasPrefixFold(p, "file://") {
+		p = p[len("file://"):]
+		if hasPrefixFold(p, "localhost/") {
+			p = p[len("localhost"):]
+		}
+		if dec, err := url.PathUnescape(p); err == nil {
+			p = dec
 		}
 	}
 	p = strings.TrimSpace(p)
@@ -997,6 +1050,10 @@ func CleanLocalPath(raw string) string {
 		return ""
 	}
 	return filepath.Clean(p)
+}
+
+func hasPrefixFold(s, prefix string) bool {
+	return len(s) >= len(prefix) && strings.EqualFold(s[:len(prefix)], prefix)
 }
 
 // RepairGlob fixes common glob mistakes: a bare extension segment becomes a

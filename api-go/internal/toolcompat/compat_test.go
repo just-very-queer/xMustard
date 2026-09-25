@@ -153,6 +153,12 @@ func TestHarnessRepairs(t *testing.T) {
 		{"resource object uri", KindReadMCPResource, `{"server":"docs","resource":{"uri":"docs://a"}}`, "uri", "docs://a"},
 		{"model provider join", KindTask, `{"description":"d","model":"m1","provider":"acme"}`, "model", "acme/m1"},
 		{"codex workdir", KindShell, `{"command":["bash","-lc","ls"],"workdir":"/r"}`, "cwd", "/r"},
+		{"relative file uri", KindWriteFile, `{"file_path":"file://src/main.go","content":"x"}`, "path", "src/main.go"},
+		{"task message", KindTask, `{"message":"do X"}`, "description", "do X"},
+		{"cline search_files regex", KindGrep, `{"path":"src","regex":"TODO","file_pattern":".ts"}`, "pattern", "TODO"},
+		{"cline search_files file_pattern", KindGrep, `{"path":"src","regex":"TODO","file_pattern":".ts"}`, "glob", "*.ts"},
+		{"cline absolutePath", KindReadFile, `{"absolutePath":"/r/a.go"}`, "path", "/r/a.go"},
+		{"kill shell id", KindKillShell, `{"shell_id":"bash_3"}`, "session_id", "bash_3"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -180,6 +186,7 @@ func TestHarnessRequiredFields(t *testing.T) {
 		{KindShell, `{"command":""}`, "command"},
 		{KindShell, `{"command":[]}`, "command"},
 		{KindShellStdin, `{"text":"\n"}`, "session_id"},
+		{KindKillShell, `{}`, "session_id"},
 		{KindWebFetch, `{"prompt":"x"}`, "url"},
 		{KindReadMCPResource, `{"server":"docs"}`, "uri"},
 		{KindGetMCPPrompt, `{"server":"docs"}`, "prompt"},
@@ -244,6 +251,8 @@ func TestNineToolAliasesAndRepairs(t *testing.T) {
 			map[string]any{"workspace_id": "w", "path": "/repo/main.go"}},
 		{KindExplain, `{"workspace_id":"w","filePath":"./docs/"}`,
 			map[string]any{"workspace_id": "w", "path": "docs"}},
+		{KindExplain, `{"workspace_id":"w","file":"file://src/main.go"}`,
+			map[string]any{"workspace_id": "w", "path": "src/main.go"}},
 		{KindImpact, `{"workspace_id":"w","symbolName":" Foo ","source":"A","dest":"B"}`,
 			map[string]any{"workspace_id": "w", "symbol": "Foo", "from": "A", "to": "B"}},
 		{KindWhyFailed, `{"workspace_id":"w","runId":"r-1"}`, map[string]any{"workspace_id": "w", "run_id": "r-1"}},
@@ -290,40 +299,60 @@ func TestNineToolValidationNamesCanonicalField(t *testing.T) {
 	}
 }
 
-// Mutating arguments of remember and verify are never rewritten: every repair
-// the non-mutating path would apply is only reported (Applied=false).
+// Mutating arguments of remember and verify are never altered: every
+// normalization the other tools would get is only reported (Applied=false), and
+// the call fails validation naming the canonical field instead of running with
+// arguments that differ from what the agent sent.
 func TestMutatingArgumentsAreNeverAlteredSilently(t *testing.T) {
 	specs := xmSpecs()
+	noneApplied := func(t *testing.T, res Result) {
+		t.Helper()
+		if res.Applied() {
+			t.Fatalf("normalization applied to a mutating tool: %+v", res.Normalizations)
+		}
+	}
 
+	// Canonical arguments pass untouched, with nothing to report.
 	content := "  keep\tthis exact text  \n"
-	res := Normalize(specs[KindRemember], map[string]any{
-		"workspace_id": "ws",
-		"text":         content,
-		"paths":        "file:///repo/a.go, ./b/../c.go",
-		"title":        " t ",
-	})
-	if res.Err != nil {
-		t.Fatalf("remember should validate: %+v", res.Err)
+	canonical := map[string]any{"workspace_id": "ws", "content": content, "paths": "a.go,c.go", "title": " t "}
+	res := Normalize(specs[KindRemember], canonical)
+	if res.Err != nil || len(res.Normalizations) != 0 || !reflect.DeepEqual(res.Args, canonical) {
+		t.Fatalf("canonical remember must pass as sent: %+v %+v %#v", res.Err, res.Normalizations, res.Args)
 	}
-	want := map[string]any{"workspace_id": "ws", "content": content, "paths": "file:///repo/a.go, ./b/../c.go", "title": " t "}
-	if !reflect.DeepEqual(res.Args, want) {
-		t.Fatalf("remember values changed:\n got %#v\nwant %#v", res.Args, want)
-	}
-	if !hasNorm(res, OpAlias, "content", "text", true) {
-		t.Fatalf("key rename must be recorded: %+v", res.Normalizations)
+
+	// A value another tool would repair is reported and refused.
+	in := map[string]any{"workspace_id": "ws", "content": content, "paths": "file:///repo/a.go, ./b/../c.go"}
+	res = Normalize(specs[KindRemember], in)
+	if !reflect.DeepEqual(res.Args, in) {
+		t.Fatalf("remember values changed:\n got %#v\nwant %#v", res.Args, in)
 	}
 	if !hasNorm(res, OpRepair, "paths", "", false) {
 		t.Fatalf("path repair must be reported, not applied: %+v", res.Normalizations)
 	}
-	for _, n := range res.Normalizations {
-		if n.Applied && n.Op != OpAlias && n.Op != OpDrop {
-			t.Fatalf("value normalization applied to a mutating tool: %+v", n)
-		}
+	if res.Err == nil || res.Err.Code != CodeNeedsRepair || res.Err.Field != "paths" || res.Err.Expected != "local_path" {
+		t.Fatalf("unrepaired paths must fail validation, got %+v", res.Err)
 	}
+	if !strings.Contains(res.Err.Message, "mutating") || strings.Contains(res.Err.Message, "file:///repo") {
+		t.Fatalf("error should explain the refusal without echoing values: %q", res.Err.Message)
+	}
+	noneApplied(t, res)
 
+	// An alias key is reported, not renamed, and the error names the canonical field.
+	in = map[string]any{"workspace_id": "ws", "text": content}
+	res = Normalize(specs[KindRemember], in)
+	if !reflect.DeepEqual(res.Args, in) || !hasNorm(res, OpAlias, "content", "text", false) {
+		t.Fatalf("alias must be reported, not applied: %#v %+v", res.Args, res.Normalizations)
+	}
+	if res.Err == nil || res.Err.Code != CodeNeedsRepair || res.Err.Field != "content" ||
+		!strings.Contains(res.Err.Message, `"text"`) || !strings.Contains(res.Err.Message, `"content"`) {
+		t.Fatalf("alias on a mutating tool must fail naming the canonical field, got %+v", res.Err)
+	}
+	noneApplied(t, res)
+
+	// A type error on the canonical spelling is reported as such.
 	res = Normalize(specs[KindVerify], map[string]any{"workspace_id": "ws", "id": " e1 ", "approve": "false"})
-	if got := res.Args["entry_id"]; got != " e1 " {
-		t.Fatalf("entry_id rewritten: %#v", got)
+	if got := res.Args["id"]; got != " e1 " {
+		t.Fatalf("id rewritten: %#v", got)
 	}
 	if got := res.Args["approve"]; got != "false" {
 		t.Fatalf("approve coerced on a mutating tool: %#v", got)
@@ -334,8 +363,16 @@ func TestMutatingArgumentsAreNeverAlteredSilently(t *testing.T) {
 	if !strings.Contains(res.Err.Message, "mutating") {
 		t.Fatalf("error should explain why it was not coerced: %q", res.Err.Message)
 	}
-	if !hasNorm(res, OpCoerce, "approve", "", false) || !hasNorm(res, OpRepair, "entry_id", "", false) {
-		t.Fatalf("coercion and trim must be reported unapplied: %+v", res.Normalizations)
+	if !hasNorm(res, OpCoerce, "approve", "", false) || !hasNorm(res, OpRepair, "entry_id", "", false) ||
+		!hasNorm(res, OpAlias, "entry_id", "id", false) {
+		t.Fatalf("rename, coercion and trim must be reported unapplied: %+v", res.Normalizations)
+	}
+	noneApplied(t, res)
+
+	// A value that only needs trimming is refused too.
+	res = Normalize(specs[KindVerify], map[string]any{"workspace_id": "ws", "entry_id": " e1 ", "approve": true})
+	if res.Err == nil || res.Err.Code != CodeNeedsRepair || res.Err.Field != "entry_id" || res.Args["entry_id"] != " e1 " {
+		t.Fatalf("untrimmed entry_id must fail, not be trimmed: %+v %#v", res.Err, res.Args)
 	}
 
 	// The same arguments on a non-mutating spec are repaired.
@@ -348,8 +385,9 @@ func TestMutatingArgumentsAreNeverAlteredSilently(t *testing.T) {
 
 	// A caller-declared mutating spec gets the same protection.
 	custom := Spec{Kind: KindExplain, Mutating: true, Fields: []Field{{Name: "path", Type: TypeString, Required: true}}}
-	if res := Normalize(custom, map[string]any{"path": "./a/../b"}); res.Args["path"] != "./a/../b" {
-		t.Fatalf("declared mutating spec was rewritten: %#v", res.Args)
+	res = Normalize(custom, map[string]any{"path": "./a/../b"})
+	if res.Args["path"] != "./a/../b" || res.Err == nil || res.Err.Code != CodeNeedsRepair {
+		t.Fatalf("declared mutating spec was rewritten or accepted: %#v %+v", res.Args, res.Err)
 	}
 }
 
@@ -363,8 +401,9 @@ func TestDuplicateSpellings(t *testing.T) {
 		t.Fatalf("a rejected call must return its input untouched: %#v %+v", res.Args, res.Normalizations)
 	}
 	res = Normalize(specs[KindRemember], map[string]any{"workspace_id": "w", "content": "a", "text": "a"})
-	if res.Err != nil || res.Args["content"] != "a" || !hasNorm(res, OpDrop, "content", "text", true) {
-		t.Fatalf("equal duplicate should be dropped and recorded: %+v %+v", res.Err, res.Normalizations)
+	if res.Err == nil || res.Err.Code != CodeNeedsRepair || res.Err.Field != "content" || res.Args["text"] != "a" ||
+		!hasNorm(res, OpDrop, "content", "text", false) {
+		t.Fatalf("equal duplicate on a mutating tool should be reported and refused: %+v %+v", res.Err, res.Normalizations)
 	}
 	res = Normalize(specs[KindRecall], map[string]any{"workspace_id": "w", "query": "a", "q": "b"})
 	if res.Err != nil || res.Args["query"] != "a" || !hasNorm(res, OpDrop, "query", "q", true) {
@@ -425,6 +464,28 @@ func TestNormalizeJSON(t *testing.T) {
 	if _, _, err := NormalizeJSON(Spec{Kind: KindShell}, json.RawMessage(`["ls"]`)); err == nil {
 		t.Fatal("non-object arguments must be an error")
 	}
+	if _, _, err := NormalizeJSON(Spec{Kind: KindShell}, json.RawMessage(`{"cmd":"ls"} {"cmd":"rm"}`)); err == nil {
+		t.Fatal("trailing data must be an error")
+	}
+}
+
+// Integers beyond 2^53 survive NormalizeJSON unchanged: decoding through
+// float64 would round 9007199254740993 to ...992 without recording anything.
+func TestNormalizeJSONKeepsLargeIntegers(t *testing.T) {
+	spec := xmSpecs()[KindRemember]
+	spec.Fields = append(spec.Fields, Field{Name: "n", Type: TypeInteger})
+	raw := `{"content":"a","n":9007199254740993,"workspace_id":"w"}`
+	out, res, err := NormalizeJSON(spec, json.RawMessage(raw))
+	if err != nil || res.Err != nil || len(res.Normalizations) != 0 {
+		t.Fatalf("got %v %+v %+v", err, res.Err, res.Normalizations)
+	}
+	if string(out) != raw {
+		t.Fatalf("mutating arguments changed:\n got %s\nwant %s", out, raw)
+	}
+	out, _, err = NormalizeJSON(Spec{Kind: KindAwaitTask}, json.RawMessage(`{"task_id":"t","timeout_ms":1.5e3,"timeout_seconds":18446744073709551615}`))
+	if err != nil || string(out) != `{"task_id":"t","timeout_ms":1500,"timeout_seconds":18446744073709551615}` {
+		t.Fatalf("await_task numbers: %s %v", out, err)
+	}
 }
 
 func TestKindForName(t *testing.T) {
@@ -455,6 +516,9 @@ func TestKindForName(t *testing.T) {
 		"xmustard_search":           KindSearch,
 		"verify@xmustard":           KindVerify,
 		"xmustard/ground":           KindGround,
+		"write_to_file":             KindWriteFile, // Cline
+		"KillShell":                 KindKillShell,
+		"KillBash":                  KindKillShell,
 	}
 	for name, want := range cases {
 		if got, ok := KindForName(name); !ok || got != want {
@@ -515,6 +579,13 @@ func TestRepairGlobAndCleanLocalPath(t *testing.T) {
 		"./x/./y/":            "x/y",
 		"s3://bucket/key":     "",
 		"   ":                 "",
+		// the rest of a file URI is a path: no host segment, no query or fragment
+		"file://src/main.go":         "src/main.go",
+		"file://./src/main.go":       "src/main.go",
+		"file:///repo/C#/x.cs":       "/repo/C#/x.cs",
+		"file:///repo/a?.go":         "/repo/a?.go",
+		"file://localhost/etc/hosts": "/etc/hosts",
+		"file:///repo/100%.txt":      "/repo/100%.txt",
 	}
 	for in, want := range paths {
 		if got := CleanLocalPath(in); got != want {
