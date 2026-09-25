@@ -55,9 +55,12 @@ import (
 	"net/url"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+
+	"xmustard/api-go/internal/redact"
 )
 
 // Kind names a tool family whose arguments toolcompat can repair and validate.
@@ -326,7 +329,8 @@ const maxEchoedValue = 512
 
 // canonicalValue returns field's repaired value as JSON when every repair of
 // the field is structural; a field that may hold user content (memory text, a
-// command, a URL) is never quoted back.
+// command, a URL) is never quoted back, and neither is a value that holds a
+// credential (see echoable).
 func canonicalValue(field string, norms []Normalization, repaired map[string]any) (string, bool) {
 	for _, n := range norms {
 		if n.Field == field && !structuralRules[n.Rule] {
@@ -343,7 +347,21 @@ func canonicalValue(field string, norms []Normalization, repaired map[string]any
 	if err := enc.Encode(v); err != nil || b.Len() > maxEchoedValue {
 		return "", false
 	}
-	return strings.TrimSuffix(b.String(), "\n"), true
+	if out := strings.TrimSuffix(b.String(), "\n"); echoable(out) {
+		return out, true
+	}
+	return "", false
+}
+
+// userinfo is the "user:password@" of a URL or scp-style remote, with or
+// without a scheme.
+var userinfo = regexp.MustCompile(`[^\s/:@"]+:[^\s/@"]*@`)
+
+// echoable reports whether a value may be quoted back in an error message,
+// which callers may log: it holds nothing the redact package takes for a
+// secret, and no userinfo.
+func echoable(s string) bool {
+	return !userinfo.MatchString(s) && redact.Default().Check(s) == nil
 }
 
 // NormalizeJSON is Normalize over a JSON object. It returns the normalized
@@ -1088,8 +1106,10 @@ func validateKind(k Kind, args map[string]any) *ValidationError {
 // loses its scheme and an optional "localhost" authority, and its percent
 // escapes are decoded when they are well formed ("file:///a%20b" → "/a b"). The
 // rest is taken as a path, as cursor-bridge does: "file://src/main.go" stays
-// relative, and '#' and '?' stay part of the name. Other URIs return "". The
-// result goes through filepath.Clean.
+// relative, and '#' and '?' stay part of the name. A file URI whose authority
+// holds userinfo ("file://user:pass@host/a.go") names no local path, and other
+// URIs are not local either: both return "". The result goes through
+// filepath.Clean.
 func CleanLocalPath(raw string) string {
 	p := strings.TrimSpace(raw)
 	if p == "" {
@@ -1102,6 +1122,10 @@ func CleanLocalPath(raw string) string {
 		}
 		if dec, err := url.PathUnescape(p); err == nil {
 			p = dec
+		}
+		authority, _, _ := strings.Cut(p, "/")
+		if strings.IndexByte(authority, '@') > 0 {
+			return "" // user@host, not a path ("@types/node" is one)
 		}
 	}
 	p = strings.TrimSpace(p)

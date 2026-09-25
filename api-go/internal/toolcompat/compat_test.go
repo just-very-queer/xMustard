@@ -489,6 +489,20 @@ func TestNeedsRepairNamesCanonicalValue(t *testing.T) {
 		!strings.Contains(res.Err.Message, `"url"`) || !strings.Contains(res.Err.Message, "send the canonical value") {
 		t.Fatalf("a field that may hold user content must be named, not quoted: %+v", res.Err)
 	}
+	// A structural value that holds a credential is not quoted back either:
+	// the error may be logged.
+	for _, paths := range []string{
+		"file://deploy:hunter2@host/a.go, b.go",
+		"deploy:hunter2@host/a.go, ./b.go",
+		"https://deploy:hunter2@example.com/a.go, b.go",
+		"a.go, " + "ghp_" + strings.Repeat("Ab3", 12) + ".go",
+	} {
+		res = Normalize(specs[KindRemember], map[string]any{"workspace_id": "w", "content": "c", "paths": paths})
+		if res.Err == nil || res.Err.Code != CodeNeedsRepair || strings.Contains(res.Err.Message, "hunter2") ||
+			strings.Contains(res.Err.Message, "Ab3Ab3") || !strings.Contains(res.Err.Message, "send the canonical value") {
+			t.Errorf("paths %q: a credential was echoed or the refusal lost: %+v", paths, res.Err)
+		}
+	}
 }
 
 // JSON Schema counts an integral number written with a fraction or exponent
@@ -637,6 +651,12 @@ func TestRepairGlobAndCleanLocalPath(t *testing.T) {
 		"file:///repo/a?.go":         "/repo/a?.go",
 		"file://localhost/etc/hosts": "/etc/hosts",
 		"file:///repo/100%.txt":      "/repo/100%.txt",
+		// userinfo names a remote, not a path; a scoped package name is a path
+		"file://deploy:hunter2@host/a.go":     "",
+		"file://deploy%3Ahunter2%40host/a.go": "",
+		"file://git@host/a.go":                "",
+		"file://@types/node/index.d.ts":       "@types/node/index.d.ts",
+		"file:///srv/a@2x.png":                "/srv/a@2x.png",
 	}
 	for in, want := range paths {
 		if got := CleanLocalPath(in); got != want {
