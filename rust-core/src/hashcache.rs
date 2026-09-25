@@ -8,10 +8,15 @@
 //! Racy entries (Git's racy-index problem): a file rewritten within the timestamp
 //! granularity of its recorded stat can keep an identical key. An entry is trusted only
 //! when the file's newest timestamp (mtime or ctime) is older than the recording pass's
-//! start minus `RACY_WINDOW`. The pass start precedes every stat and the write, so this
-//! distrusts at least everything Git's "mtime >= index write time" rule would. A racy
-//! entry is re-hashed on the next pass and becomes trusted once a later pass records it
-//! outside the window.
+//! start minus `RACY_WINDOW`. File timestamps come from the filesystem's clock, which can
+//! differ from the host's (a network share whose server clock lags), so the pass start is
+//! the earlier of two readings: the host clock when the pass began, and the filesystem's
+//! clock at that moment, which is the cache file's own mtime minus the pass's duration.
+//! Git compares against its index file's mtime; the cache file stands in for the index
+//! here, and the cutoff is never later than its mtime, so this distrusts at least
+//! everything Git's rule would, whichever clock is off. Like Git, it assumes the cache
+//! (in the Git dir) and the worktree share a clock. A racy entry is re-hashed on the next
+//! pass and becomes trusted once a later pass records it outside the window.
 //!
 //! The cache is `<git-dir>/xmustard-cache/filehash-v1/<scope>.bin`, where the scope hashes
 //! the canonical root. It is written atomically under an advisory lock, bounded to
@@ -22,9 +27,9 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
-use std::io::Read;
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
@@ -46,10 +51,14 @@ pub(crate) const RACY_WINDOW: Duration = Duration::from_secs(2);
 /// child that a sibling thread is spawning.
 const STORE_LOCK_WAIT: Duration = Duration::from_millis(250);
 
-/// Magic + recorded-at + entry count.
+/// Magic + pass start (host clock) + entry count.
 const HEADER_BYTES: usize = 8 + 8 + 8;
-/// Path length + size, mtime, ctime, inode, device + mode + SHA-256.
-const ENTRY_FIXED_BYTES: usize = 4 + 5 * 8 + 4 + 32;
+/// Size, mtime, ctime, inode, device + mode + SHA-256; each entry adds its path length
+/// (4 bytes) and path.
+const ENTRY_KEY_BYTES: usize = 5 * 8 + 4 + 32;
+const ENTRY_FIXED_BYTES: usize = 4 + ENTRY_KEY_BYTES;
+/// Pass duration, written after the entries.
+const DURATION_BYTES: usize = 8;
 const CHECKSUM_BYTES: usize = 32;
 
 /// Counters for one hashing pass.
@@ -96,13 +105,7 @@ impl StatKey {
     /// trusted.
     #[cfg(not(unix))]
     fn of(meta: &fs::Metadata) -> Self {
-        let mtime_ns = meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .map_or(i64::MAX, |d| {
-                i64::try_from(d.as_nanos()).unwrap_or(i64::MAX)
-            });
+        let mtime_ns = meta.modified().ok().and_then(unix_ns).unwrap_or(i64::MAX);
         StatKey {
             size: meta.len(),
             mtime_ns,
@@ -126,7 +129,8 @@ struct Entry {
 
 #[derive(Debug, Default)]
 struct StatCache {
-    /// Start of the pass that recorded these entries, in Unix nanoseconds.
+    /// Start of the pass that recorded these entries, in Unix nanoseconds: the earlier of
+    /// the host and filesystem readings (see the module doc).
     recorded_at_ns: i64,
     entries: HashMap<String, Entry>,
 }
@@ -135,6 +139,29 @@ enum Loaded {
     Absent,
     Invalid,
     Valid(StatCache),
+}
+
+/// The start of a hashing pass: the host clock, and a monotonic mark for its duration.
+struct PassStart {
+    unix_ns: i64,
+    mono: Instant,
+}
+
+impl PassStart {
+    fn now() -> Self {
+        PassStart {
+            unix_ns: now_ns(),
+            mono: Instant::now(),
+        }
+    }
+
+    /// Time since the pass started. The longer of the monotonic and wall-clock readings,
+    /// so neither a suspended machine nor a clock step shortens it (a shorter duration
+    /// would move the filesystem reading of the start later).
+    fn elapsed_ns(&self) -> i64 {
+        let mono = i64::try_from(self.mono.elapsed().as_nanos()).unwrap_or(i64::MAX);
+        mono.max(now_ns().saturating_sub(self.unix_ns))
+    }
 }
 
 /// SHA-256 (lowercase hex) of every path in `rels` that hashes through the no-follow
@@ -165,14 +192,20 @@ pub fn cache_file(root: &Path) -> Option<PathBuf> {
 
 fn hash_files_with(
     root: &Path,
-    rels: Vec<String>,
+    mut rels: Vec<String>,
     cache: Option<&Path>,
     racy_window: Duration,
 ) -> (BTreeMap<String, String>, HashPass) {
-    // Taken before any stat: the racy cutoff never depends on how long hashing took.
-    let pass_started_ns = now_ns();
+    // Taken before any stat. The filesystem reading subtracts the pass's duration, so
+    // neither reading of the start depends on how long hashing took.
+    let start = PassStart::now();
+    // `git ls-files` lists an unmerged path once per conflict stage. Sorted and unique,
+    // every path is hashed once and `map` keys come out in push order, so `entries`
+    // lines up with them.
+    rels.sort_unstable();
+    rels.dedup();
     let mut pass = HashPass::default();
-    let (old, replace_invalid) = match cache.map(load) {
+    let (mut old, replace_invalid) = match cache.map(load) {
         Some(Loaded::Valid(c)) => {
             pass.cache_loaded = true;
             (c, false)
@@ -184,9 +217,10 @@ fn hash_files_with(
     let trusted_before = old.recorded_at_ns.saturating_sub(window_ns);
 
     let mut map = BTreeMap::new();
-    let mut fresh: Vec<(String, Entry)> = Vec::with_capacity(rels.len());
+    let mut entries: Vec<Entry> = Vec::with_capacity(rels.len());
     let mut entries_changed = false;
     for rel in rels {
+        // a path skipped here keeps its old entry in `old`, which marks the cache stale.
         let Ok((file, meta)) = symbolgraph::open_repo_regular_file_with_meta(root, &rel) else {
             continue;
         };
@@ -194,7 +228,7 @@ fn hash_files_with(
             continue; // the streaming hash would refuse it too; skip the read
         }
         let key = StatKey::of(&meta);
-        let prev = old.entries.get(&rel);
+        let prev = old.entries.remove(rel.as_str());
         let cached = prev.filter(|e| e.key == key);
         let digest = match cached {
             Some(e) if key.newest_ns() < trusted_before => {
@@ -207,157 +241,208 @@ fn hash_files_with(
                 }
                 pass.hashed += 1;
                 let Some(digest) = symbolgraph::sha256_open_file(file) else {
+                    entries_changed |= prev.is_some();
                     continue;
                 };
                 digest
             }
         };
         let entry = Entry { key, digest };
-        entries_changed |= prev != Some(&entry);
-        map.insert(rel.clone(), symbolgraph::hex_lower(&digest));
-        fresh.push((rel, entry));
+        entries_changed |= prev != Some(entry);
+        map.insert(rel, symbolgraph::hex_lower(&digest));
+        entries.push(entry);
     }
-    // Without `entries_changed`, `fresh` is a subset of the old entries, so a shorter
-    // list means files left. A racy re-hash is rewritten even when identical: the newer
-    // pass start is what lets the entry become trusted.
-    let removed = fresh.len() != old.entries.len();
+    // Entries still in `old` belong to paths that left the tracked set or can no longer
+    // be hashed. A racy re-hash is rewritten even when identical: the newer pass start is
+    // what lets the entry become trusted.
+    let removed = !old.entries.is_empty();
+    drop(old);
     if let Some(path) = cache
         && (replace_invalid || entries_changed || removed || pass.racy > 0)
     {
-        pass.cache_written = store(path, pass_started_ns, &fresh);
+        let rows = map.keys().map(String::as_str).zip(entries.iter());
+        pass.cache_written = store(path, &start, rows);
     }
     (map, pass)
 }
 
+fn unix_ns(t: SystemTime) -> Option<i64> {
+    let d = t.duration_since(UNIX_EPOCH).ok()?;
+    i64::try_from(d.as_nanos()).ok()
+}
+
 fn now_ns() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))
+    unix_ns(SystemTime::now()).unwrap_or(0)
 }
 
 fn load(path: &Path) -> Loaded {
     let Ok(f) = fs::File::open(path) else {
         return Loaded::Absent;
     };
-    match f.metadata() {
-        Ok(meta) if meta.is_file() && meta.len() <= MAX_CACHE_BYTES => {}
+    let meta = match f.metadata() {
+        Ok(meta) if meta.is_file() && meta.len() <= MAX_CACHE_BYTES => meta,
         _ => return Loaded::Invalid,
-    }
-    let mut buf = Vec::new();
-    if f.take(MAX_CACHE_BYTES + 1).read_to_end(&mut buf).is_err()
-        || buf.len() as u64 > MAX_CACHE_BYTES
-    {
-        return Loaded::Invalid;
-    }
-    decode(&buf).map_or(Loaded::Invalid, Loaded::Valid)
+    };
+    // the filesystem's clock when the file was written; unknown means trust nothing.
+    let written_ns = meta.modified().ok().and_then(unix_ns).unwrap_or(i64::MIN);
+    decode(io::BufReader::new(f), meta.len(), written_ns).map_or(Loaded::Invalid, Loaded::Valid)
 }
 
-/// Write the cache (best effort). Every entry is re-validated by stat on read, so a
-/// concurrent pass's last write is equally correct; the lock only serializes writers.
-fn store(path: &Path, recorded_at_ns: i64, entries: &[(String, Entry)]) -> bool {
+/// Write `rows` (path, entry) as the cache (best effort). Every entry is re-validated by
+/// stat on read, so a concurrent pass's last write is equally correct; the lock only
+/// serializes writers.
+fn store<'a, I>(path: &Path, start: &PassStart, rows: I) -> bool
+where
+    I: ExactSizeIterator<Item = (&'a str, &'a Entry)> + Clone,
+{
     let Some(dir) = path.parent() else {
         return false;
     };
-    if fs::create_dir_all(dir).is_err() {
-        return false;
-    }
-    let bytes = encode(recorded_at_ns, entries);
-    if bytes.len() as u64 > MAX_CACHE_BYTES {
+    let size = rows.clone().fold(
+        (HEADER_BYTES + DURATION_BYTES + CHECKSUM_BYTES) as u64,
+        |n, (p, _)| n.saturating_add((ENTRY_FIXED_BYTES + p.len()) as u64),
+    );
+    if size > MAX_CACHE_BYTES {
         // too many tracked files to cache: drop an older file instead of rereading it.
         let _ = fs::remove_file(path);
+        return false;
+    }
+    if fs::create_dir_all(dir).is_err() {
         return false;
     }
     let (Some(_lock), _) = indexcache::lock_file(&path.with_extension("lock"), STORE_LOCK_WAIT)
     else {
         return false;
     };
-    let written = indexcache::atomic_write(path, &bytes).is_ok();
+    let written = indexcache::atomic_write_with(path, |w| encode_into(w, start, rows)).is_ok();
     indexcache::sweep_stale_temps(dir, indexcache::STALE_TEMP_AGE);
     written
 }
 
-fn encode(recorded_at_ns: i64, entries: &[(String, Entry)]) -> Vec<u8> {
-    let paths: usize = entries.iter().map(|(p, _)| p.len()).sum();
-    let mut out = Vec::with_capacity(
-        HEADER_BYTES + entries.len() * ENTRY_FIXED_BYTES + paths + CHECKSUM_BYTES,
-    );
-    out.extend_from_slice(MAGIC);
-    out.extend_from_slice(&recorded_at_ns.to_le_bytes());
-    out.extend_from_slice(&(entries.len() as u64).to_le_bytes());
-    for (path, e) in entries {
-        out.extend_from_slice(&(path.len() as u32).to_le_bytes());
-        out.extend_from_slice(path.as_bytes());
-        out.extend_from_slice(&e.key.size.to_le_bytes());
-        out.extend_from_slice(&e.key.mtime_ns.to_le_bytes());
-        out.extend_from_slice(&e.key.ctime_ns.to_le_bytes());
-        out.extend_from_slice(&e.key.ino.to_le_bytes());
-        out.extend_from_slice(&e.key.dev.to_le_bytes());
-        out.extend_from_slice(&e.key.mode.to_le_bytes());
-        out.extend_from_slice(&e.digest);
+/// Stream the cache file into `out`: header, entries, the pass duration measured once
+/// the entries are written (so the file's mtime minus it reads the pass start on the
+/// filesystem's clock), then the SHA-256 of all of it.
+fn encode_into<'a>(
+    out: &mut dyn Write,
+    start: &PassStart,
+    rows: impl ExactSizeIterator<Item = (&'a str, &'a Entry)>,
+) -> io::Result<()> {
+    let mut w = HashingWriter {
+        inner: out,
+        hasher: Sha256::new(),
+    };
+    w.write_all(MAGIC)?;
+    w.write_all(&start.unix_ns.to_le_bytes())?;
+    w.write_all(&(rows.len() as u64).to_le_bytes())?;
+    for (path, e) in rows {
+        let len = u32::try_from(path.len()).map_err(|_| io::ErrorKind::InvalidInput)?;
+        w.write_all(&len.to_le_bytes())?;
+        w.write_all(path.as_bytes())?;
+        let k = &e.key;
+        let mut fixed = [0u8; ENTRY_KEY_BYTES];
+        let words = [k.size, k.mtime_ns as u64, k.ctime_ns as u64, k.ino, k.dev];
+        for (slot, v) in fixed.chunks_exact_mut(8).zip(words) {
+            slot.copy_from_slice(&v.to_le_bytes());
+        }
+        fixed[40..44].copy_from_slice(&k.mode.to_le_bytes());
+        fixed[44..].copy_from_slice(&e.digest);
+        w.write_all(&fixed)?;
     }
-    let checksum = Sha256::digest(&out);
-    out.extend_from_slice(&checksum);
-    out
+    w.write_all(&start.elapsed_ns().to_le_bytes())?;
+    let checksum = w.hasher.finalize();
+    w.inner.write_all(&checksum)
 }
 
-/// Parse a cache file; None when the checksum, magic, counts or lengths disagree.
-fn decode(bytes: &[u8]) -> Option<StatCache> {
-    if bytes.len() < HEADER_BYTES + CHECKSUM_BYTES {
-        return None;
+/// Passes writes through while hashing exactly the bytes the inner writer accepted.
+struct HashingWriter<'a> {
+    inner: &'a mut dyn Write,
+    hasher: Sha256,
+}
+
+impl Write for HashingWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.hasher.update(&buf[..n]);
+        Ok(n)
     }
-    let (body, checksum) = bytes.split_at(bytes.len() - CHECKSUM_BYTES);
-    if Sha256::digest(body).as_slice() != checksum || &body[..MAGIC.len()] != MAGIC {
-        return None;
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
     }
-    let mut r = Reader {
-        buf: body,
-        pos: MAGIC.len(),
+}
+
+/// Parse the first `len` bytes of a cache file whose mtime (Unix ns) is `written_ns`,
+/// streaming them rather than holding the whole file; None when the checksum, magic,
+/// counts or lengths disagree. Nothing is returned before the checksum matches, and
+/// every allocation is bounded by `len`.
+fn decode(mut input: impl Read, len: u64, written_ns: i64) -> Option<StatCache> {
+    let fixed = (HEADER_BYTES + DURATION_BYTES + CHECKSUM_BYTES) as u64;
+    let room = len.checked_sub(fixed)?;
+    let mut r = HashingReader {
+        inner: (&mut input).take(len - CHECKSUM_BYTES as u64),
+        hasher: Sha256::new(),
     };
-    let recorded_at_ns = i64::from_le_bytes(r.array()?);
-    let count = u64::from_le_bytes(r.array()?);
+    if &read_array::<8>(&mut r)? != MAGIC {
+        return None;
+    }
+    let started_ns = i64::from_le_bytes(read_array(&mut r)?);
+    let count = u64::from_le_bytes(read_array(&mut r)?);
     // every entry takes at least ENTRY_FIXED_BYTES, so a bad count cannot over-allocate.
-    if count > ((body.len() - HEADER_BYTES) / ENTRY_FIXED_BYTES) as u64 {
+    if count > room / ENTRY_FIXED_BYTES as u64 {
         return None;
     }
     let mut entries = HashMap::with_capacity(count as usize);
     for _ in 0..count {
-        let len = u32::from_le_bytes(r.array()?) as usize;
-        let path = std::str::from_utf8(r.take(len)?).ok()?.to_owned();
+        let path_len = u32::from_le_bytes(read_array(&mut r)?);
+        if u64::from(path_len) > r.inner.limit() {
+            return None;
+        }
+        let mut path = vec![0; path_len as usize];
+        r.read_exact(&mut path).ok()?;
+        let path = String::from_utf8(path).ok()?;
         let key = StatKey {
-            size: u64::from_le_bytes(r.array()?),
-            mtime_ns: i64::from_le_bytes(r.array()?),
-            ctime_ns: i64::from_le_bytes(r.array()?),
-            ino: u64::from_le_bytes(r.array()?),
-            dev: u64::from_le_bytes(r.array()?),
-            mode: u32::from_le_bytes(r.array()?),
+            size: u64::from_le_bytes(read_array(&mut r)?),
+            mtime_ns: i64::from_le_bytes(read_array(&mut r)?),
+            ctime_ns: i64::from_le_bytes(read_array(&mut r)?),
+            ino: u64::from_le_bytes(read_array(&mut r)?),
+            dev: u64::from_le_bytes(read_array(&mut r)?),
+            mode: u32::from_le_bytes(read_array(&mut r)?),
         };
-        let digest = r.array()?;
+        let digest = read_array(&mut r)?;
         entries.insert(path, Entry { key, digest });
     }
-    if r.pos != body.len() {
+    let elapsed_ns = i64::from_le_bytes(read_array(&mut r)?).max(0);
+    if r.inner.limit() != 0 {
+        return None;
+    }
+    let body_sum = r.hasher.finalize();
+    let checksum: [u8; CHECKSUM_BYTES] = read_array(&mut input)?;
+    if checksum[..] != body_sum[..] {
         return None;
     }
     Some(StatCache {
-        recorded_at_ns,
+        recorded_at_ns: started_ns.min(written_ns.saturating_sub(elapsed_ns)),
         entries,
     })
 }
 
-struct Reader<'a> {
-    buf: &'a [u8],
-    pos: usize,
+fn read_array<const N: usize>(r: &mut impl Read) -> Option<[u8; N]> {
+    let mut out = [0u8; N];
+    r.read_exact(&mut out).ok()?;
+    Some(out)
 }
 
-impl Reader<'_> {
-    fn take(&mut self, n: usize) -> Option<&[u8]> {
-        let end = self.pos.checked_add(n)?;
-        let out = self.buf.get(self.pos..end)?;
-        self.pos = end;
-        Some(out)
-    }
+/// Passes reads through while hashing exactly the bytes returned.
+struct HashingReader<R> {
+    inner: R,
+    hasher: Sha256,
+}
 
-    fn array<const N: usize>(&mut self) -> Option<[u8; N]> {
-        self.take(N)?.try_into().ok()
+impl<R: Read> Read for HashingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.hasher.update(&buf[..n]);
+        Ok(n)
     }
 }
 
@@ -398,6 +483,53 @@ mod tests {
         paths
     }
 
+    /// Outlast a coarse filesystem timestamp tick, so a pass recorded after this starts
+    /// strictly after the files' timestamps on the filesystem's clock too.
+    fn settle() {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    /// Record `rows` as a pass that started at `started_ns`. The cache file's mtime is
+    /// then moved an hour ahead so the filesystem reading (mtime minus the recorded
+    /// duration) is later, which leaves the host start as the cutoff.
+    fn store_at(cache: &Path, started_ns: i64, rows: &[(&str, &Entry)]) {
+        let start = PassStart {
+            unix_ns: started_ns,
+            mono: Instant::now(),
+        };
+        assert!(store(cache, &start, rows.iter().copied()));
+        fs::File::options()
+            .write(true)
+            .open(cache)
+            .unwrap()
+            .set_modified(SystemTime::now() + Duration::from_secs(3600))
+            .unwrap();
+    }
+
+    fn decode_bytes(bytes: &[u8], written_ns: i64) -> Option<StatCache> {
+        decode(bytes, bytes.len() as u64, written_ns)
+    }
+
+    fn encode(start: &PassStart, rows: &[(&str, &Entry)]) -> Vec<u8> {
+        let mut out = Vec::new();
+        encode_into(&mut out, start, rows.iter().copied()).unwrap();
+        out
+    }
+
+    fn sample_entry() -> Entry {
+        Entry {
+            key: StatKey {
+                size: 1,
+                mtime_ns: 2,
+                ctime_ns: 3,
+                ino: 4,
+                dev: 5,
+                mode: 6,
+            },
+            digest: [7; 32],
+        }
+    }
+
     fn setup(names: &[&str]) -> (TempDir, TempDir, PathBuf) {
         let repo = TempDir::new().unwrap();
         for n in names {
@@ -414,6 +546,7 @@ mod tests {
     fn unchanged_tree_rehashes_zero_files() {
         let names = ["a.rs", "b.rs", " lead space.rs"];
         let (repo, _s, cache) = setup(&names);
+        settle();
         let (m1, p1) = hash_files_with(repo.path(), rels(&names), Some(&cache), Duration::ZERO);
         assert_eq!((p1.hashed, p1.reused, p1.cache_loaded), (3, 0, false));
         assert!(p1.cache_written && cache.exists());
@@ -455,16 +588,12 @@ mod tests {
         let real = sha_hex(b"content of m.rs\n");
         let second = 1_000_000_000;
         for recorded_at in [key.newest_ns(), key.newest_ns() + 900_000_000] {
-            assert!(store(&cache, recorded_at, &[("m.rs".into(), stale)]));
+            store_at(&cache, recorded_at, &[("m.rs", &stale)]);
             let (m, p) = hash_files(repo.path(), rels(&["m.rs"]), Some(&cache));
             assert_eq!(m["m.rs"], real, "racy entry served a stale hash");
             assert_eq!((p.racy, p.hashed, p.reused), (1, 1, 0), "{p:?}");
         }
-        assert!(store(
-            &cache,
-            key.newest_ns() + 3 * second,
-            &[("m.rs".into(), stale)]
-        ));
+        store_at(&cache, key.newest_ns() + 3 * second, &[("m.rs", &stale)]);
         let (m, p) = hash_files(repo.path(), rels(&["m.rs"]), Some(&cache));
         assert_eq!(
             m["m.rs"],
@@ -475,30 +604,104 @@ mod tests {
     }
 
     // A same-size rewrite that restores the old mtime (what `touch -r`, rsync -t or a
-    // formatter can do) must still be seen.
+    // formatter can do) keeps size, mtime and inode, so only ctime can reject the entry.
+    // The racy guard is out of play: zero window, and the entry is recorded after the
+    // file's timestamps, so a key without ctime would serve the stale hash.
     #[test]
-    fn same_size_edit_with_restored_mtime_is_detected() {
+    fn restored_mtime_edit_is_caught_by_ctime_alone() {
         let (repo, _s, cache) = setup(&[]);
         let path = repo.path().join("m.rs");
         write(repo.path(), "m.rs", b"aaaa\n");
-        let (m1, _) = hash_files(repo.path(), rels(&["m.rs"]), Some(&cache));
-        let mtime = fs::metadata(&path).unwrap().modified().unwrap();
+        let before = StatKey::of(&fs::metadata(&path).unwrap());
+        settle();
+        let (m1, _) = hash_files_with(repo.path(), rels(&["m.rs"]), Some(&cache), Duration::ZERO);
+        let Loaded::Valid(recorded) = load(&cache) else {
+            panic!("cache not written")
+        };
+        assert!(
+            before.mtime_ns < recorded.recorded_at_ns,
+            "the racy guard alone would re-hash this entry"
+        );
+        settle();
         write(repo.path(), "m.rs", b"bbbb\n");
+        let mtime = SystemTime::UNIX_EPOCH + Duration::from_nanos(before.mtime_ns as u64);
         fs::File::options()
             .write(true)
             .open(&path)
             .unwrap()
             .set_modified(mtime)
             .unwrap();
-        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), mtime);
-        let (m2, _) = hash_files(repo.path(), rels(&["m.rs"]), Some(&cache));
+        let after = StatKey::of(&fs::metadata(&path).unwrap());
+        assert_eq!(
+            (after.size, after.mtime_ns, after.ino),
+            (before.size, before.mtime_ns, before.ino)
+        );
+        assert!(after.ctime_ns > before.ctime_ns, "ctime did not move");
+        let (m2, p2) = hash_files_with(repo.path(), rels(&["m.rs"]), Some(&cache), Duration::ZERO);
         assert_eq!(m1["m.rs"], sha_hex(b"aaaa\n"));
         assert_eq!(m2["m.rs"], sha_hex(b"bbbb\n"), "same-size edit missed");
+        assert_eq!((p2.hashed, p2.reused, p2.racy), (1, 0, 0), "{p2:?}");
+    }
+
+    // The cutoff also reads the filesystem's clock. A pass start from a host clock an
+    // hour ahead of the filesystem (a share whose server lags) must not make a file
+    // written just now look old; the cache file's own mtime bounds the start.
+    #[test]
+    fn host_clock_ahead_of_the_filesystem_does_not_trust_fresh_files() {
+        let (repo, _s, cache) = setup(&["m.rs"]);
+        let key = StatKey::of(&fs::metadata(repo.path().join("m.rs")).unwrap());
+        let stale = Entry {
+            key,
+            digest: [0xAA; 32],
+        };
+        let ahead = || PassStart {
+            unix_ns: now_ns() + 3_600_000_000_000,
+            mono: Instant::now(),
+        };
+        assert!(store(&cache, &ahead(), [("m.rs", &stale)].into_iter()));
+        let (m, p) = hash_files(repo.path(), rels(&["m.rs"]), Some(&cache));
+        assert_eq!(
+            m["m.rs"],
+            sha_hex(b"content of m.rs\n"),
+            "stale hash served"
+        );
+        assert_eq!((p.racy, p.hashed, p.reused), (1, 1, 0), "{p:?}");
+        // control: once the filesystem reading is an hour on as well, the entry is old
+        // on both clocks and is served.
+        store_at(&cache, ahead().unix_ns, &[("m.rs", &stale)]);
+        let (m, p) = hash_files(repo.path(), rels(&["m.rs"]), Some(&cache));
+        assert_eq!(m["m.rs"], "aa".repeat(32));
+        assert_eq!((p.racy, p.hashed, p.reused), (0, 0, 1), "{p:?}");
+    }
+
+    // `git ls-files` lists an unmerged path once per conflict stage. Each path is hashed
+    // and stored once, so the cache settles instead of being rewritten on every call.
+    #[test]
+    fn duplicate_paths_are_hashed_once_and_the_cache_settles() {
+        let (repo, _s, cache) = setup(&["a.rs", "b.rs"]);
+        settle();
+        let listed = rels(&["a.rs", "a.rs", "b.rs", "a.rs"]);
+        let (m1, p1) = hash_files_with(repo.path(), listed.clone(), Some(&cache), Duration::ZERO);
+        assert_eq!((p1.hashed, p1.cache_written), (2, true), "{p1:?}");
+        let two_entries = HEADER_BYTES + 2 * (ENTRY_FIXED_BYTES + 4) + DURATION_BYTES;
+        assert_eq!(
+            fs::metadata(&cache).unwrap().len(),
+            (two_entries + CHECKSUM_BYTES) as u64
+        );
+        let (m2, p2) = hash_files_with(repo.path(), listed, Some(&cache), Duration::ZERO);
+        assert_eq!(
+            (p2.hashed, p2.reused, p2.cache_written),
+            (0, 2, false),
+            "{p2:?}"
+        );
+        assert_eq!(m1, direct(repo.path(), &["a.rs", "b.rs"]));
+        assert_eq!(m2, m1);
     }
 
     #[test]
     fn added_and_deleted_files_update_the_cache() {
         let (repo, _s, cache) = setup(&["a.rs", "b.rs"]);
+        settle();
         hash_files_with(
             repo.path(),
             rels(&["a.rs", "b.rs"]),
@@ -508,6 +711,7 @@ mod tests {
         assert_eq!(cached_paths(&cache), ["a.rs", "b.rs"]);
         fs::remove_file(repo.path().join("b.rs")).unwrap();
         write(repo.path(), "c.rs", b"new\n");
+        settle();
         let (m, p) = hash_files_with(
             repo.path(),
             rels(&["a.rs", "c.rs"]),
@@ -546,6 +750,7 @@ mod tests {
         let names = ["a.rs", "b.rs"];
         let (repo, _s, cache) = setup(&names);
         let want = direct(repo.path(), &names);
+        settle();
         hash_files_with(repo.path(), rels(&names), Some(&cache), Duration::ZERO);
         let valid = fs::read(&cache).unwrap();
         let mut flipped = valid.clone();
@@ -584,6 +789,25 @@ mod tests {
         assert!(fs::metadata(&cache).unwrap().len() < 1024);
     }
 
+    // Rows past the bound are refused from their lengths alone, before anything is
+    // encoded, and an older file is removed rather than reread on every pass.
+    #[test]
+    fn store_refuses_rows_past_the_bound_and_drops_the_old_file() {
+        let (_repo, _s, cache) = setup(&[]);
+        let entry = sample_entry();
+        store_at(&cache, 1, &[("a.rs", &entry)]);
+        let long = "p".repeat(1 << 20);
+        let rows = std::iter::repeat_n((long.as_str(), &entry), 64);
+        assert!(!store(&cache, &PassStart::now(), rows));
+        assert!(!cache.exists(), "oversized store kept the old file");
+        let dir = fs::read_dir(cache.parent().unwrap()).unwrap();
+        let names: Vec<_> = dir.map(|e| e.unwrap().file_name()).collect();
+        assert!(
+            names.iter().all(|n| !n.to_string_lossy().contains(".tmp.")),
+            "{names:?}"
+        );
+    }
+
     // Stored baselines hold `format!("{:x}", digest)`; cached hashes must match it.
     #[test]
     fn hex_matches_the_stored_digest_form() {
@@ -595,19 +819,13 @@ mod tests {
 
     #[test]
     fn decode_rejects_inflated_counts_and_trailing_bytes() {
-        let entry = Entry {
-            key: StatKey {
-                size: 1,
-                mtime_ns: 2,
-                ctime_ns: 3,
-                ino: 4,
-                dev: 5,
-                mode: 6,
-            },
-            digest: [7; 32],
+        let entry = sample_entry();
+        let start = PassStart {
+            unix_ns: 9,
+            mono: Instant::now(),
         };
-        let good = encode(9, &[("p.rs".into(), entry)]);
-        let back = decode(&good).expect("round trip");
+        let good = encode(&start, &[("p.rs", &entry)]);
+        let back = decode_bytes(&good, i64::MAX).expect("round trip");
         assert_eq!((back.recorded_at_ns, back.entries["p.rs"]), (9, entry));
         let reseal = |mut body: Vec<u8>| {
             let sum = Sha256::digest(&body);
@@ -615,19 +833,40 @@ mod tests {
             body
         };
         let body = &good[..good.len() - CHECKSUM_BYTES];
+        // the pass start is the earlier of the host start and the file mtime minus the
+        // recorded duration.
+        let mut timed = body.to_vec();
+        let at = timed.len() - DURATION_BYTES;
+        timed[at..].copy_from_slice(&100i64.to_le_bytes());
+        let timed = reseal(timed);
+        assert_eq!(decode_bytes(&timed, 1_000).unwrap().recorded_at_ns, 9);
+        assert_eq!(decode_bytes(&timed, 50).unwrap().recorded_at_ns, -50);
         let mut inflated = body.to_vec();
         inflated[16..24].copy_from_slice(&u64::MAX.to_le_bytes());
-        assert!(decode(&reseal(inflated)).is_none(), "huge count accepted");
+        assert!(
+            decode_bytes(&reseal(inflated), i64::MAX).is_none(),
+            "huge count accepted"
+        );
         let mut trailing = body.to_vec();
         trailing.push(0);
         assert!(
-            decode(&reseal(trailing)).is_none(),
+            decode_bytes(&reseal(trailing), i64::MAX).is_none(),
             "trailing bytes accepted"
+        );
+        let mut long_path = body.to_vec();
+        long_path[HEADER_BYTES..HEADER_BYTES + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(
+            decode_bytes(&reseal(long_path), i64::MAX).is_none(),
+            "path length past the file accepted"
+        );
+        assert!(
+            decode(&good[..], good.len() as u64 + 1, i64::MAX).is_none(),
+            "a file shorter than its stat accepted"
         );
         let mut magic = body.to_vec();
         magic[7] = b'9';
         assert!(
-            decode(&reseal(magic)).is_none(),
+            decode_bytes(&reseal(magic), i64::MAX).is_none(),
             "other format version accepted"
         );
     }

@@ -813,6 +813,53 @@ mod tests {
         assert!(drift.content_changed, "same-size edit missed: {drift:?}");
     }
 
+    // During a merge conflict `git ls-files` lists the unmerged path once per stage. The
+    // stat cache must still settle: a repeat pass reads nothing and rewrites nothing.
+    #[test]
+    fn merge_conflict_duplicates_do_not_rewrite_the_hash_cache() {
+        let repo = TempDir::new().unwrap();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .arg("-C")
+                .arg(repo.path())
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        git_init(repo.path());
+        fs::write(repo.path().join("a.txt"), "base\n").unwrap();
+        fs::write(repo.path().join("b.txt"), "b\n").unwrap();
+        git_commit(repo.path());
+        git(&["checkout", "-qb", "side"]);
+        fs::write(repo.path().join("a.txt"), "side\n").unwrap();
+        git_commit(repo.path());
+        git(&["checkout", "-q", "-"]);
+        fs::write(repo.path().join("a.txt"), "main\n").unwrap();
+        git_commit(repo.path());
+        git(&["merge", "side"]);
+        let listed = tracked_files(repo.path());
+        assert_eq!(
+            listed.iter().filter(|p| *p == "a.txt").count(),
+            3,
+            "{listed:?}"
+        );
+
+        std::thread::sleep(crate::hashcache::RACY_WINDOW + std::time::Duration::from_millis(200));
+        let (first, p1) = file_hash_map_counted(repo.path());
+        assert_eq!(
+            (first.len(), p1.hashed, p1.cache_written),
+            (2, 2, true),
+            "{p1:?}"
+        );
+        let (second, p2) = file_hash_map_counted(repo.path());
+        assert_eq!(
+            (p2.hashed, p2.reused, p2.cache_written),
+            (0, 2, false),
+            "{p2:?}"
+        );
+        assert_eq!(second, first);
+    }
+
     #[test]
     fn fingerprint_is_stable_and_changes_with_content() {
         let dir = TempDir::new().unwrap();

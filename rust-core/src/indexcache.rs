@@ -61,13 +61,13 @@ fn sha_hex(bytes: &[u8]) -> String {
 /// Atomically replace `path` with `bytes`: write a uniquely named temp file in the
 /// same directory, fsync it, then rename over the target. Readers see the old or the
 /// new bytes, never a torn file; a failed write leaves the old file intact.
-pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     atomic_write_with(path, |w| w.write_all(bytes))
 }
 
 /// `atomic_write` with the content produced by `fill` straight into a buffered temp
 /// file, so large snapshots are streamed instead of first built as one byte vector.
-fn atomic_write_with(
+pub(crate) fn atomic_write_with(
     path: &Path,
     fill: impl FnOnce(&mut dyn Write) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
