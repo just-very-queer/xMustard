@@ -1,0 +1,353 @@
+# Security kernel
+
+This page describes who may call the xMustard HTTP API, which routes a deployment
+serves, and how the API limits its exposure. The code is authoritative:
+`api-go/cmd/xmustard-api/route_gates.go` (route table),
+`api-go/cmd/xmustard-api/security_middleware.go` (posture and middlewares) and
+`api-go/internal/workspaceops/auth.go`, `auth_roles.go` (tokens and roles). The
+route table at the end of this page is generated from the code by a test.
+
+## Profiles
+
+The API serves one of two route sets.
+
+| Profile | Selected by | Serves |
+|---|---|---|
+| `core` (default) | nothing, `XMUSTARD_PROFILE=core`, or the legacy `XMUSTARD_CORE_ONLY=1` | the nine MCP tools, governed memory (propose, verify, edit, full list), evidence capture and recovery, token administration, workspace list and registration, index rebaseline, health |
+| `platform` | `XMUSTARD_PROFILE=platform`, `XMUSTARD_PLATFORM=1`, or the legacy `XMUSTARD_CORE_ONLY=0` | core plus the platform routes: issues, runs, terminals, providers, Postgres, integrations and the other routes the React UI calls |
+
+In the core profile a platform route answers
+`404 {"reason":"platform_route"}`. Conflicting settings (for example
+`XMUSTARD_PROFILE=core` with `XMUSTARD_PLATFORM=1`) stop the API at startup.
+
+**The React UI needs the platform profile.** `make dev` starts the API with
+`XMUSTARD_PROFILE=platform` and the UI dev server together. `make backend-platform`
+starts only the API in that profile. `make backend` starts the API in the default
+core profile. The Pi end-to-end harness sets the platform profile because its
+fixture setup uses platform routes.
+
+Each route is classified when it is registered. `gatedMux` panics if a route has no
+row in `routeGateTable`, and a test fails if a row names a route that no longer
+exists. A new core route therefore cannot be dropped from the core profile by
+accident, and a new platform route cannot be served without a role.
+
+## Roles
+
+A token carries a role spec: one role, or several joined with `+`.
+
+| Role | Grants |
+|---|---|
+| `reader` | read routes and the read tools (`ground`, `recall`, `search`, `explain`, `impact`, `diagnostics`, `why_failed`) |
+| `proposer` | reader, plus `remember`, editing memory it authored, and platform writes |
+| `verifier` | reader, plus `verify` |
+| `human-approver` | reader, plus policy changes and approvals (workspace policy, security acceptance criteria and dispositions, run-plan approve/reject, run accept) |
+| `indexer` | reader, plus `POST /api/workspaces/{id}/index` (rebaseline) |
+| `admin` | every role, plus token administration, settings, providers, Postgres bootstrap, integration credentials, verification-profile definitions, terminals and workspace registration |
+
+The legacy names stay valid: `agent` is `proposer+verifier`, and `readonly` is
+`reader`. A blank role mints `agent`. An unknown role is refused at mint time, and a
+stored or environment role that cannot be parsed resolves to `reader`. A principal
+that holds only `reader` may use only GET routes.
+
+The `agent` role does not include `indexer`, so an agent token cannot reset the
+index baseline. Give automation that rebaselines a dedicated `indexer` token. Keep
+`admin` and `human-approver` tokens with people. An approval route never authorizes
+a Git merge; merges stay a human action.
+
+Mint with the CLI or the admin API:
+
+```bash
+xmustard-api mint-token alice agent              # proposer+verifier
+xmustard-api mint-token ci-indexer indexer
+xmustard-api mint-token reviewer verifier+human-approver
+curl -H "Authorization: Bearer $ADMIN" -d '{"id":"bob","roles":["proposer"]}' \
+  http://127.0.0.1:8042/api/auth/tokens
+```
+
+`XMUSTARD_AUTH_TOKENS="id:role:token,..."` accepts the same role specs.
+
+A refused call answers `403` with the missing role named:
+
+```json
+{"error":"verifier role required; principal \"pat\" holds: proposer, reader",
+ "reason":"missing_role","missing_role":"verifier"}
+```
+
+`GET /api/auth/whoami` returns the caller's id, role spec, expanded `roles`,
+`open_mode`, the deployment `profile`, `read_only`, `disabled_tools`, and `tools`:
+the MCP tools this caller can use here. `xmustard-mcp` filters `tools/list` by that
+list. If the API cannot answer within 2 seconds, it advertises all nine tools, and
+the API still enforces every gate. `ground` adds a `principal` block with the
+caller's id and roles.
+
+In open mode no credentials exist. Every caller is the single identity
+`anonymous`, passes every role gate, and memory it writes is labelled
+`self_asserted_open_mode`, never peer-verified.
+
+## Exposure posture
+
+| Control | Setting | Behavior |
+|---|---|---|
+| Loopback bind | `XMUSTARD_API_HOST` (default `127.0.0.1`) | A non-loopback bind needs `XMUSTARD_AUTH=required`, minted credentials, and TLS (or `XMUSTARD_ALLOW_INSECURE_BIND=1` behind a TLS proxy). |
+| Host allowlist | `XMUSTARD_ALLOWED_HOSTS=name,...` | On a loopback bind only `localhost` and loopback IPs are accepted as `Host`, plus listed names. This blocks DNS rebinding. On other binds the list applies when it is set. A refusal answers `403 host_not_allowed`. |
+| Origin check | `XMUSTARD_ALLOWED_ORIGINS=https://ui.example,...` | A request that carries `Origin` must come from a loopback origin (loopback bind), the same origin (other binds), or a listed origin. `Origin: null` is refused. A refusal answers `403 origin_not_allowed`. |
+| No keys in URLs | none | `token`, `access_token`, `api_key`, `key`, `password` and similar query parameters answer `400 query_credentials`, even when an `Authorization` header is also present. Send `Authorization: Bearer <token>`. |
+| Read-only mode | `XMUSTARD_READ_ONLY=1` | Mutating routes answer `403 read_only`, and `remember`/`verify` disappear from `tools/list`. Evidence capture and revocation of the caller's own tool output, and policy evaluation, stay available. |
+| Tool disable | `XMUSTARD_DISABLED_TOOLS=impact,why_failed` | The tool's route answers `403 tool_disabled` and the tool leaves `tools/list`. Unknown names stop startup. |
+| Workspace allowlist | `XMUSTARD_WORKSPACE_ALLOWLIST=ws-a,ws-b` | Other workspace ids answer `403 workspace_not_allowed`. The same rule filters `GET /api/workspaces` and checks `POST /api/workspaces/load` (by the id the root would get) and the terminal routes. |
+| Remote execution | profile | Terminals exist only in the platform profile and need `admin`. |
+
+Workspace and memory entry ids in a route must be plain identifiers (letters, digits,
+`_`, `.`, `-`, no `..`). They are read from the escaped path, as `ServeMux` reads
+them, so an encoded `/` cannot hide a second segment. Anything else answers
+`400 invalid_id`.
+
+Bearer tokens are compared as SHA-256 digests with `crypto/subtle`. Each credential
+is compared in constant time, the scan does not stop at the first match, and
+environment credentials take precedence over file credentials. The token file is
+parsed once and reused while its inode, modification time and size are unchanged.
+A file written within the last two seconds is re-read on the next request. Mint,
+rotate and revoke drop the cached copy explicitly.
+
+## Path confinement
+
+Memory anchor paths (`remember` `paths`) must stay inside the workspace root.
+Absolute paths, `..` escapes, and paths that leave the root through a symlink
+(`EvalSymlinks` on the target or its nearest existing ancestor) are refused with
+`path escapes workspace` (HTTP 400). Anchor hashing then reads the file through a
+symlink-refusing descriptor walk (`api-go/internal/workspaceops/safepath_unix.go`),
+so a path swapped for a symlink later is still refused. `explain` applies the same
+symlink check to its `path` before the core reads the file.
+
+## Route gate table
+
+Every registered route appears here, core routes first. "Read-only mode" says
+whether `XMUSTARD_READ_ONLY=1` still serves the route.
+
+<!-- route-gates:begin (generated by TestSecurityDocRouteGateTable; XMUSTARD_UPDATE_DOCS=1 rewrites it) -->
+| Route | Profile | Role | Read-only mode | Tool | Note |
+|---|---|---|---|---|---|
+| `GET /api/auth/audit` | core | admin | served |  |  |
+| `GET /api/auth/principals` | core | admin | served |  |  |
+| `POST /api/auth/tokens` | core | admin | refused |  | mint |
+| `DELETE /api/auth/tokens/{id}` | core | admin | refused |  | revoke |
+| `POST /api/auth/tokens/{id}/rotate` | core | admin | refused |  |  |
+| `GET /api/auth/whoami` | core | reader | served |  | caller principal, roles and usable tools |
+| `ANY /api/health` | core | reader | served |  | public liveness and budget counters |
+| `GET /api/workspaces` | core | reader | served |  | filtered by token scope and workspace allowlist |
+| `POST /api/workspaces/load` | core | admin | refused |  | workspace registration; root checked against the allowlist |
+| `GET /api/workspaces/{workspace_id}/changes/since-index` | core | reader | served | impact |  |
+| `GET /api/workspaces/{workspace_id}/context` | core | admin | served |  | full memory history |
+| `POST /api/workspaces/{workspace_id}/context` | core | proposer | refused | remember | author is the principal |
+| `GET /api/workspaces/{workspace_id}/context/active` | core | reader | served | recall | scope=all needs admin |
+| `PUT /api/workspaces/{workspace_id}/context/{entry_id}` | core | proposer | refused |  | memory edit; author or admin only |
+| `POST /api/workspaces/{workspace_id}/context/{entry_id}/verify` | core | verifier | refused | verify | verifier is the principal |
+| `GET /api/workspaces/{workspace_id}/diagnostics` | core | reader | served | diagnostics |  |
+| `DELETE /api/workspaces/{workspace_id}/evidence` | core | admin | served |  | workspace-wide revocation |
+| `POST /api/workspaces/{workspace_id}/evidence` | core | proposer | served |  | projection of the caller's own tool result |
+| `DELETE /api/workspaces/{workspace_id}/evidence/{handle}` | core | proposer | served |  | issuer revokes its own original |
+| `GET /api/workspaces/{workspace_id}/evidence/{handle}` | core | reader | served |  | issuer-bound expansion |
+| `GET /api/workspaces/{workspace_id}/explain-path` | core | reader | served | explain |  |
+| `POST /api/workspaces/{workspace_id}/index` | core | indexer | refused |  | rebaseline the index; agents cannot reset it |
+| `GET /api/workspaces/{workspace_id}/runs/{run_id}/why-failed` | core | reader | served | why_failed |  |
+| `GET /api/workspaces/{workspace_id}/search` | core | reader | served | search |  |
+| `GET /api/workspaces/{workspace_id}/session-grounding` | core | reader | served | ground |  |
+| `GET /api/agent/capabilities` | platform | reader | served |  |  |
+| `POST /api/integrations/test` | platform | admin | refused |  | uses supplied credentials |
+| `POST /api/postgres/bootstrap` | platform | admin | refused |  | schema DDL |
+| `GET /api/postgres/plan` | platform | reader | served |  |  |
+| `GET /api/postgres/render` | platform | reader | served |  |  |
+| `GET /api/providers` | platform | reader | served |  |  |
+| `POST /api/providers` | platform | admin | refused |  |  |
+| `DELETE /api/providers/{name}` | platform | admin | refused |  |  |
+| `POST /api/providers/{name}/chat` | platform | proposer | refused |  |  |
+| `GET /api/providers/{name}/models` | platform | reader | served |  |  |
+| `POST /api/providers/{name}/probe` | platform | proposer | refused |  |  |
+| `POST /api/route` | platform | proposer | refused |  |  |
+| `POST /api/route/chat` | platform | proposer | refused |  |  |
+| `GET /api/routes` | platform | reader | served |  |  |
+| `POST /api/routes` | platform | admin | refused |  |  |
+| `GET /api/runtimes` | platform | reader | served |  |  |
+| `GET /api/settings` | platform | reader | served |  |  |
+| `POST /api/settings` | platform | admin | refused |  | includes memory verification policy |
+| `POST /api/terminal/open` | platform | admin | refused |  | remote shell |
+| `DELETE /api/terminal/{terminal_id}` | platform | admin | refused |  | remote shell |
+| `GET /api/terminal/{terminal_id}/read` | platform | admin | served |  | remote shell output |
+| `POST /api/terminal/{terminal_id}/resize` | platform | admin | refused |  | remote shell |
+| `POST /api/terminal/{terminal_id}/write` | platform | admin | refused |  | remote shell |
+| `GET /api/workspaces/{workspace_id}/activity` | platform | reader | served |  |  |
+| `GET /api/workspaces/{workspace_id}/activity/overview` | platform | reader | served |  |  |
+| `POST /api/workspaces/{workspace_id}/agent/probe` | platform | proposer | refused |  | executes the configured runtime |
+| `POST /api/workspaces/{workspace_id}/agent/query` | platform | proposer | refused |  |  |
+| `GET /api/workspaces/{workspace_id}/agents` | platform | reader | served |  |  |
+| `POST /api/workspaces/{workspace_id}/agents/sync` | platform | proposer | refused |  |  |
+| `GET /api/workspaces/{workspace_id}/agents/{agent_id}` | platform | reader | served |  |  |
+| `GET /api/workspaces/{workspace_id}/audit-log` | platform | reader | served |  |  |
+| `POST /api/workspaces/{workspace_id}/audit-log` | platform | admin | refused |  | audit integrity |
+| `GET /api/workspaces/{workspace_id}/blast-radius` | platform | reader | served |  |  |
+| `GET /api/workspaces/{workspace_id}/changes` | platform | reader | served |  |  |
+| `GET /api/workspaces/{workspace_id}/changes/drift` | platform | reader | served |  |  |
+| `GET /api/workspaces/{workspace_id}/clusters` | platform | reader | served |  |  |
+| `GET /api/workspaces/{workspace_id}/costs` | platform | reader | served |  |  |
+| `GET /api/workspaces/{workspace_id}/coverage` | platform | reader | served |  |  |
+| `POST /api/workspaces/{workspace_id}/coverage/parse` | platform | proposer | refused |  |  |
+| `GET /api/workspaces/{workspace_id}/dashboard` | platform | reader | served |  |  |
+| `GET /api/workspaces/{workspace_id}/diagnostics/live` | platform | reader | served |  |  |
+| `POST /api/workspaces/{workspace_id}/diagnostics/run` | platform | proposer | refused |  |  |
+| `GET /api/workspaces/{workspace_id}/diagnostics/status` | platform | reader | served |  |  |
+| `GET /api/workspaces/{workspace_id}/document-symbols` | platform | reader | served |  |  |
+| `GET /api/workspaces/{workspace_id}/drift` | platform | reader | served |  |  |
+| `GET /api/workspaces/{workspace_id}/eval-report` | platform | reader | served |  |  |
+| `GET /api/workspaces/{workspace_id}/eval-scenarios` | platform | reader | served |  |  |
+| `POST /api/workspaces/{workspace_id}/eval-scenarios` | platform | proposer | refused |  |  |
+| `DELETE /api/workspaces/{workspace_id}/eval-scenarios/{scenario_id}` | platform | proposer | refused |  |  |
+| `GET /api/workspaces/{workspace_id}/eval-timeline` | platform | reader | served |  |  |
+| `GET /api/workspaces/{workspace_id}/export` | platform | reader | served |  |  |
+| `GET /api/workspaces/{workspace_id}/fingerprint` | platform | reader | served |  |  |
+| `GET /api/workspaces/{workspace_id}/fixes` | platform | reader | served |  |  |
+| `GET /api/workspaces/{workspace_id}/go-to-definition` | platform | reader | served |  |  |
+| `GET /api/workspaces/{workspace_id}/goals` | platform | reader | served |  |  |
+| `POST /api/workspaces/{workspace_id}/goals` | platform | proposer | refused |  |  |
+| `GET /api/workspaces/{workspace_id}/goals/{goal_id}` | platform | reader | served |  |  |
+| `GET /api/workspaces/{workspace_id}/goals/{goal_id}/context` | platform | reader | served |  |  |
+| `POST /api/workspaces/{workspace_id}/goals/{goal_id}/iterations` | platform | proposer | refused |  |  |
+| `GET /api/workspaces/{workspace_id}/goals/{goal_id}/ledger` | platform | reader | served |  |  |
+| `PATCH /api/workspaces/{workspace_id}/goals/{goal_id}/status` | platform | proposer | refused |  |  |
+| `GET /api/workspaces/{workspace_id}/guidance` | platform | reader | served |  |  |
+| `POST /api/workspaces/{workspace_id}/guidance/customize` | platform | proposer | refused |  |  |
+| `POST /api/workspaces/{workspace_id}/guidance/starters` | platform | proposer | refused |  | writes files into the repository |
+| `GET /api/workspaces/{workspace_id}/hotspots` | platform | reader | served |  |  |
+| `GET /api/workspaces/{workspace_id}/impact` | platform | reader | served |  |  |
+| `POST /api/workspaces/{workspace_id}/incorporate` | platform | proposer | refused |  |  |
+| `GET /api/workspaces/{workspace_id}/ingestion-plan` | platform | reader | served |  |  |
+| `GET /api/workspaces/{workspace_id}/integrations` | platform | reader | served |  |  |
+| `POST /api/workspaces/{workspace_id}/integrations` | platform | admin | refused |  | stores integration credentials |
+| `POST /api/workspaces/{workspace_id}/integrations/github/import` | platform | proposer | refused |  |  |
+| `POST /api/workspaces/{workspace_id}/integrations/github/pr` | platform | proposer | refused |  |  |
+| `POST /api/workspaces/{workspace_id}/integrations/jira/sync/{issue_id}` | platform | proposer | refused |  |  |
+| `POST /api/workspaces/{workspace_id}/integrations/linear/sync/{issue_id}` | platform | proposer | refused |  |  |
+| `POST /api/workspaces/{workspace_id}/integrations/slack/notify` | platform | proposer | refused |  |  |
+| `GET /api/workspaces/{workspace_id}/issue-symbol-edges` | platform | reader | served |  |  |
+| `GET /api/workspaces/{workspace_id}/issues` | platform | reader | served |  |  |
+| `POST /api/workspaces/{workspace_id}/issues` | platform | proposer | refused |  |  |
+| `GET /api/workspaces/{workspace_id}/issues/{issue_id}` | platform | reader | served |  |  |
+| `PATCH /api/workspaces/{workspace_id}/issues/{issue_id}` | platform | proposer | refused |  |  |
+| `GET /api/workspaces/{workspace_id}/issues/{issue_id}/browser-dumps` | platform | reader | served |  |  |
+| `POST /api/workspaces/{workspace_id}/issues/{issue_id}/browser-dumps` | platform | proposer | refused |  |  |
+| `DELETE /api/workspaces/{workspace_id}/issues/{issue_id}/browser-dumps/{dump_id}` | platform | proposer | refused |  |  |
+| `GET /api/workspaces/{workspace_id}/issues/{issue_id}/context` | platform | reader | served |  |  |
+| `GET /api/workspaces/{workspace_id}/issues/{issue_id}/context-replays` | platform | reader | served |  |  |
+| `POST /api/workspaces/{workspace_id}/issues/{issue_id}/context-replays` | platform | proposer | refused |  |  |
+| `GET /api/workspaces/{workspace_id}/issues/{issue_id}/context-replays/{replay_id}/compare` | platform | reader | served |  |  |
+| `GET /api/workspaces/{workspace_id}/issues/{issue_id}/coverage-delta` | platform | reader | served |  |  |
+| `GET /api/workspaces/{workspace_id}/issues/{issue_id}/drift` | platform | reader | served |  |  |
+| `GET /api/workspaces/{workspace_id}/issues/{issue_id}/duplicates` | platform | reader | served |  |  |
+| `POST /api/workspaces/{workspace_id}/issues/{issue_id}/eval-scenarios/replay` | platform | proposer | refused |  |  |
+| `GET /api/workspaces/{workspace_id}/issues/{issue_id}/fix-draft` | platform | reader | served |  |  |
+| `POST /api/workspaces/{workspace_id}/issues/{issue_id}/fixes` | platform | proposer | refused |  |  |
+| `GET /api/workspaces/{workspace_id}/issues/{issue_id}/handoff` | platform | reader | served |  |  |
+| `POST /api/workspaces/{workspace_id}/issues/{issue_id}/ingest-ticket` | platform | proposer | refused |  |  |
+| `GET /api/workspaces/{workspace_id}/issues/{issue_id}/ingested-ticket` | platform | reader | served |  |  |
+| `GET /api/workspaces/{workspace_id}/issues/{issue_id}/owner-suggestions` | platform | reader | served |  |  |
+| `GET /api/workspaces/{workspace_id}/issues/{issue_id}/ownership-history` | platform | reader | served |  |  |
+| `GET /api/workspaces/{workspace_id}/issues/{issue_id}/quality` | platform | reader | served |  |  |
+| `POST /api/workspaces/{workspace_id}/issues/{issue_id}/quality` | platform | proposer | refused |  |  |
+| `GET /api/workspaces/{workspace_id}/issues/{issue_id}/review-packet` | platform | reader | served |  |  |
+| `POST /api/workspaces/{workspace_id}/issues/{issue_id}/runs` | platform | proposer | refused |  | launches an agent run |
+| `GET /api/workspaces/{workspace_id}/issues/{issue_id}/test-suggestions` | platform | reader | served |  |  |
+| `POST /api/workspaces/{workspace_id}/issues/{issue_id}/test-suggestions` | platform | proposer | refused |  |  |
+| `GET /api/workspaces/{workspace_id}/issues/{issue_id}/threat-models` | platform | reader | served |  |  |
+| `POST /api/workspaces/{workspace_id}/issues/{issue_id}/threat-models` | platform | proposer | refused |  |  |
+| `DELETE /api/workspaces/{workspace_id}/issues/{issue_id}/threat-models/{threat_model_id}` | platform | proposer | refused |  |  |
+| `GET /api/workspaces/{workspace_id}/issues/{issue_id}/ticket-context` | platform | reader | served |  |  |
+| `POST /api/workspaces/{workspace_id}/issues/{issue_id}/ticket-context` | platform | proposer | refused |  |  |
+| `DELETE /api/workspaces/{workspace_id}/issues/{issue_id}/ticket-context/{context_id}` | platform | proposer | refused |  |  |
+| `POST /api/workspaces/{workspace_id}/issues/{issue_id}/triage` | platform | proposer | refused |  |  |
+| `POST /api/workspaces/{workspace_id}/issues/{issue_id}/verification-profiles/{profile_id}/run` | platform | proposer | refused |  | runs a saved profile |
+| `GET /api/workspaces/{workspace_id}/issues/{issue_id}/work` | platform | reader | served |  |  |
+| `GET /api/workspaces/{workspace_id}/lineage` | platform | reader | served |  |  |
+| `GET /api/workspaces/{workspace_id}/lsp/document-symbols` | platform | reader | served |  |  |
+| `GET /api/workspaces/{workspace_id}/lsp/workspace-symbols` | platform | reader | served |  |  |
+| `GET /api/workspaces/{workspace_id}/metrics` | platform | reader | served |  |  |
+| `GET /api/workspaces/{workspace_id}/owners` | platform | reader | served |  |  |
+| `GET /api/workspaces/{workspace_id}/path-symbols` | platform | reader | served |  |  |
+| `POST /api/workspaces/{workspace_id}/path-symbols/materialize` | platform | proposer | refused |  |  |
+| `GET /api/workspaces/{workspace_id}/pg/issues/search` | platform | reader | served |  |  |
+| `POST /api/workspaces/{workspace_id}/pg/materialize` | platform | proposer | refused |  |  |
+| `POST /api/workspaces/{workspace_id}/pg/ops/materialize` | platform | proposer | refused |  |  |
+| `GET /api/workspaces/{workspace_id}/pg/run-plans` | platform | reader | served |  |  |
+| `GET /api/workspaces/{workspace_id}/pg/runs` | platform | reader | served |  |  |
+| `GET /api/workspaces/{workspace_id}/pg/search` | platform | reader | served |  |  |
+| `GET /api/workspaces/{workspace_id}/pg/verifications` | platform | reader | served |  |  |
+| `POST /api/workspaces/{workspace_id}/pg/verifications/materialize` | platform | proposer | refused |  |  |
+| `GET /api/workspaces/{workspace_id}/policy` | platform | reader | served |  |  |
+| `PUT /api/workspaces/{workspace_id}/policy` | platform | human-approver | refused |  | policy change |
+| `POST /api/workspaces/{workspace_id}/policy/evaluate` | platform | proposer | served |  | evaluation only |
+| `GET /api/workspaces/{workspace_id}/project-info` | platform | reader | served |  |  |
+| `POST /api/workspaces/{workspace_id}/quality/score-all` | platform | proposer | refused |  |  |
+| `GET /api/workspaces/{workspace_id}/references` | platform | reader | served |  |  |
+| `GET /api/workspaces/{workspace_id}/repo-config` | platform | reader | served |  |  |
+| `GET /api/workspaces/{workspace_id}/repo-config/health` | platform | reader | served |  |  |
+| `GET /api/workspaces/{workspace_id}/repo-context` | platform | reader | served |  |  |
+| `GET /api/workspaces/{workspace_id}/repo-map` | platform | reader | served |  |  |
+| `GET /api/workspaces/{workspace_id}/repo-state` | platform | reader | served |  |  |
+| `GET /api/workspaces/{workspace_id}/retrieval-search` | platform | reader | served |  |  |
+| `GET /api/workspaces/{workspace_id}/review-queue` | platform | reader | served |  |  |
+| `GET /api/workspaces/{workspace_id}/run-targets` | platform | reader | served |  |  |
+| `GET /api/workspaces/{workspace_id}/runbooks` | platform | reader | served |  |  |
+| `POST /api/workspaces/{workspace_id}/runbooks` | platform | proposer | refused |  |  |
+| `DELETE /api/workspaces/{workspace_id}/runbooks/{runbook_id}` | platform | proposer | refused |  |  |
+| `GET /api/workspaces/{workspace_id}/runs` | platform | reader | served |  |  |
+| `GET /api/workspaces/{workspace_id}/runs/{run_id}` | platform | reader | served |  |  |
+| `POST /api/workspaces/{workspace_id}/runs/{run_id}/accept` | platform | human-approver | refused |  | approval |
+| `GET /api/workspaces/{workspace_id}/runs/{run_id}/brief` | platform | reader | served |  |  |
+| `POST /api/workspaces/{workspace_id}/runs/{run_id}/cancel` | platform | proposer | refused |  |  |
+| `GET /api/workspaces/{workspace_id}/runs/{run_id}/confidence` | platform | reader | served |  |  |
+| `GET /api/workspaces/{workspace_id}/runs/{run_id}/critique` | platform | reader | served |  |  |
+| `POST /api/workspaces/{workspace_id}/runs/{run_id}/critique` | platform | proposer | refused |  |  |
+| `GET /api/workspaces/{workspace_id}/runs/{run_id}/improvements` | platform | reader | served |  |  |
+| `POST /api/workspaces/{workspace_id}/runs/{run_id}/improvements/{suggestion_id}/dismiss` | platform | proposer | refused |  |  |
+| `GET /api/workspaces/{workspace_id}/runs/{run_id}/insights` | platform | reader | served |  |  |
+| `GET /api/workspaces/{workspace_id}/runs/{run_id}/log` | platform | reader | served |  |  |
+| `GET /api/workspaces/{workspace_id}/runs/{run_id}/metrics` | platform | reader | served |  |  |
+| `GET /api/workspaces/{workspace_id}/runs/{run_id}/plan` | platform | reader | served |  |  |
+| `POST /api/workspaces/{workspace_id}/runs/{run_id}/plan` | platform | proposer | refused |  |  |
+| `POST /api/workspaces/{workspace_id}/runs/{run_id}/plan/approve` | platform | human-approver | refused |  | approval; never a merge authorization |
+| `POST /api/workspaces/{workspace_id}/runs/{run_id}/plan/reject` | platform | human-approver | refused |  | approval |
+| `POST /api/workspaces/{workspace_id}/runs/{run_id}/retry` | platform | proposer | refused |  |  |
+| `POST /api/workspaces/{workspace_id}/runs/{run_id}/review` | platform | proposer | refused |  |  |
+| `POST /api/workspaces/{workspace_id}/scan` | platform | proposer | refused |  |  |
+| `GET /api/workspaces/{workspace_id}/security/acceptance-criteria` | platform | reader | served |  |  |
+| `PUT /api/workspaces/{workspace_id}/security/acceptance-criteria` | platform | human-approver | refused |  | policy change |
+| `GET /api/workspaces/{workspace_id}/security/acceptance-evaluation` | platform | reader | served |  |  |
+| `GET /api/workspaces/{workspace_id}/security/dispositions` | platform | reader | served |  |  |
+| `GET /api/workspaces/{workspace_id}/security/findings/{finding_id}/disposition` | platform | reader | served |  |  |
+| `PUT /api/workspaces/{workspace_id}/security/findings/{finding_id}/disposition` | platform | human-approver | refused |  | risk acceptance |
+| `GET /api/workspaces/{workspace_id}/security/review-packet` | platform | reader | served |  |  |
+| `POST /api/workspaces/{workspace_id}/semantic-index/materialize` | platform | proposer | refused |  |  |
+| `GET /api/workspaces/{workspace_id}/semantic-search` | platform | reader | served |  |  |
+| `POST /api/workspaces/{workspace_id}/semantic-search/materialize` | platform | proposer | refused |  |  |
+| `GET /api/workspaces/{workspace_id}/signals` | platform | reader | served |  |  |
+| `GET /api/workspaces/{workspace_id}/snapshot` | platform | reader | served |  |  |
+| `GET /api/workspaces/{workspace_id}/sources` | platform | reader | served |  |  |
+| `GET /api/workspaces/{workspace_id}/subsystems` | platform | reader | served |  |  |
+| `GET /api/workspaces/{workspace_id}/symbol-graph` | platform | reader | served |  |  |
+| `GET /api/workspaces/{workspace_id}/tree` | platform | reader | served |  |  |
+| `POST /api/workspaces/{workspace_id}/triage/all` | platform | proposer | refused |  |  |
+| `GET /api/workspaces/{workspace_id}/verification-outcomes` | platform | reader | served |  |  |
+| `GET /api/workspaces/{workspace_id}/verification-profile-history` | platform | reader | served |  |  |
+| `GET /api/workspaces/{workspace_id}/verification-profile-reports` | platform | reader | served |  |  |
+| `GET /api/workspaces/{workspace_id}/verification-profiles` | platform | reader | served |  |  |
+| `POST /api/workspaces/{workspace_id}/verification-profiles` | platform | admin | refused |  | defines commands a run executes |
+| `DELETE /api/workspaces/{workspace_id}/verification-profiles/{profile_id}` | platform | admin | refused |  |  |
+| `GET /api/workspaces/{workspace_id}/verifications` | platform | reader | served |  |  |
+| `GET /api/workspaces/{workspace_id}/verifier-telemetry` | platform | reader | served |  |  |
+| `GET /api/workspaces/{workspace_id}/verify-targets` | platform | reader | served |  |  |
+| `GET /api/workspaces/{workspace_id}/views` | platform | reader | served |  |  |
+| `POST /api/workspaces/{workspace_id}/views` | platform | proposer | refused |  |  |
+| `DELETE /api/workspaces/{workspace_id}/views/{view_id}` | platform | proposer | refused |  |  |
+| `PUT /api/workspaces/{workspace_id}/views/{view_id}` | platform | proposer | refused |  |  |
+| `GET /api/workspaces/{workspace_id}/wiki` | platform | reader | served |  |  |
+| `GET /api/workspaces/{workspace_id}/workspace-symbols` | platform | reader | served |  |  |
+| `GET /api/workspaces/{workspace_id}/worktree` | platform | reader | served |  |  |
+<!-- route-gates:end -->

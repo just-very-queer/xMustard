@@ -72,8 +72,8 @@ def main():
         admin = mint_token(api_bin, data, "operator", "admin")
         alice = mint_token(api_bin, data, "alice", "agent")
         bob = mint_token(api_bin, data, "bob", "agent")
-        # setup (workspace load + index baseline) uses the full surface; the checks run
-        # against the lean CORE_ONLY surface the nine tools and evidence routes use
+        # setup (workspace load + index baseline) needs the admin token; both routes are
+        # core. The checks pin the core profile explicitly with the legacy CORE_ONLY=1.
         setup_env = {"XMUSTARD_AUTH": "required", "XMUSTARD_CORE_BIN": wrapper}
         api_env = {**setup_env, "XMUSTARD_CORE_ONLY": "1"}
         api = Api(api_bin, data, setup_env).start()

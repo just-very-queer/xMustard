@@ -24,6 +24,7 @@ docs/*
 !docs/ARCHITECTURE.md
 !docs/STATUS.md
 !docs/ROADMAP.md
+!docs/SECURITY.md
 !docs/history/
 docs/history/*
 !docs/history/README.md

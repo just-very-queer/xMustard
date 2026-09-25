@@ -37,7 +37,7 @@ repositories. The default Rust build does not enable `semantic-onnx`.
 | Responsibility | Source owner | Important interface / constraint |
 | --- | --- | --- |
 | MCP protocol and tool schemas | `api-go/cmd/xmustard-mcp/` | Nine tools; strict arguments; HTTP proxy; bounded framing |
-| HTTP, authentication, request limits | `api-go/cmd/xmustard-api/` | Go request routing and policy; core-only route allowlist |
+| HTTP, authentication, request limits | `api-go/cmd/xmustard-api/` | Go request routing and policy; route gate table (profile, role, read-only) and exposure middleware ([SECURITY](SECURITY.md)) |
 | Scoped evidence delivery | `api-go/internal/evidence/`, API/MCP evidence routes | Admission, stable opaque scoped handles, byte-safe original pages, projection and expiry; enforced byte admission is not an RSS ceiling |
 | Pi client adapter | `integrations/pi/` | Pinned extension uses the shared Go evidence path; nine existing tools plus `xmustard_expand` only when a handle is issued |
 | Local operator commands | `api-go/cmd/xmustard-ops/` | Calls stores directly; local filesystem authority, not HTTP-token isolation |
@@ -66,9 +66,11 @@ a tenth tool. The Pi client separately exposes `xmustard_expand` when a recovery
 handle is emitted. The HTTP/CLI platform is much larger; its existence does not
 expand the supported agent interface.
 
-Use the root [README](../README.md) for arguments and setup. `XMUSTARD_CORE_ONLY=1`
-restricts HTTP routing; it does not itself establish a 100 MB resource ceiling.
-Authenticated agents need distinct principals for independent verification.
+Use the root [README](../README.md) for arguments and setup. The API serves the
+core profile by default; `XMUSTARD_PROFILE=platform` adds the platform routes the UI
+uses ([SECURITY](SECURITY.md)). The profile restricts HTTP routing; it does not itself
+establish a 100 MB resource ceiling. Authenticated agents need distinct principals
+for independent verification, and `verify` needs the `verifier` role.
 
 ## Current seams that need work
 

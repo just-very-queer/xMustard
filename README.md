@@ -79,7 +79,9 @@ proxies to the xMustard HTTP API (`XMUSTARD_API_BASE`, default
 ```
 
 Each agent should authenticate with an `XMUSTARD_API_TOKEN` (mint one with
-`xmustard-api mint-token <principal-id> agent`). The authenticated stable
+`xmustard-api mint-token <principal-id> agent`; `agent` is `proposer+verifier`, and
+[docs/SECURITY.md](docs/SECURITY.md) lists the reader, proposer, verifier,
+human-approver, indexer and admin roles). The authenticated stable
 `Principal.ID`, not the bearer secret, is the identity counted by the
 multi-agent verification gate. Rotating a token while retaining its principal ID
 does not create a new verifier. Never share one principal between verifiers.
@@ -181,6 +183,12 @@ Use the returned `workspace_id` in MCP calls. Point your MCP client at the absol
 path to `api-go/bin/xmustard-mcp`, or put the binaries on `PATH`. Use an explicit
 absolute `XMUSTARD_DATA_DIR` when running outside the source checkout; the current
 fallback is relative to the process working directory.
+
+The API serves the core profile by default: the nine tools, governed memory,
+evidence and token administration. The React UI uses platform routes, so run it
+with `make dev` (API with `XMUSTARD_PROFILE=platform` plus the UI dev server) or
+`make backend-platform`; see [docs/SECURITY.md](docs/SECURITY.md) for profiles,
+roles, read-only mode and the Host/Origin and workspace allowlists.
 
 `make backend` starts the development API. `make check-backend` runs the Go tests
 and build plus Rust tests and Clippy. `make check-frontend` runs the separate
