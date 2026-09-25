@@ -473,3 +473,88 @@ fn serve_rejects_unknown_flags() {
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).starts_with("usage: xmustard-core serve"));
 }
+
+/// A child the worker starts must not inherit the protocol stream. The supervisor
+/// learns that the worker ended from end of output on its stdout, so a descendant
+/// that outlives the worker (a git fsmonitor daemon, a detached helper) must not
+/// keep that pipe open.
+#[test]
+#[cfg(unix)]
+fn a_descendant_that_outlives_the_worker_does_not_hold_its_output_open() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::mpsc;
+
+    let r = fixture();
+    let root = r.path().to_str().unwrap();
+    let real_git = Command::new("sh")
+        .args(["-c", "command -v git"])
+        .output()
+        .unwrap();
+    let real_git = String::from_utf8(real_git.stdout).unwrap();
+    let real_git = real_git.trim();
+    assert!(!real_git.is_empty(), "git must be on PATH");
+    // a `git` that leaves a long-lived process behind, with its stdio detached, as a
+    // daemon would, then runs the real git.
+    let bin = TempDir::new().unwrap();
+    let pids = bin.path().join("pids");
+    let fake = bin.path().join("git");
+    fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\nsleep 30 </dev/null >/dev/null 2>&1 &\necho $! >> '{}'\nexec '{}' \"$@\"\n",
+            pids.display(),
+            real_git
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}",
+        bin.path().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let mut child = Command::new(BIN)
+        .arg("serve")
+        .env("PATH", path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let body = json!({"jsonrpc": "2.0", "id": 1, "method": "repo-key", "params": {"args": [root]}});
+    write_frame(&mut stdin, Some(1), &[body.to_string().as_bytes()]).unwrap();
+    let header = read_header(&mut stdout).unwrap();
+    let mut buf = vec![0; header.len];
+    stdout.read_exact(&mut buf).unwrap();
+    let reply: Value = serde_json::from_slice(&buf).unwrap();
+    assert!(reply.get("result").is_some(), "{reply}");
+    let left_behind: Vec<String> = fs::read_to_string(&pids)
+        .unwrap_or_default()
+        .split_whitespace()
+        .map(str::to_string)
+        .collect();
+    assert!(
+        !left_behind.is_empty(),
+        "repo-key ran no git child, so this test proves nothing"
+    );
+
+    drop(stdin);
+    let status = child.wait().unwrap();
+    assert!(status.success(), "{status}");
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut rest = Vec::new();
+        let _ = stdout.read_to_end(&mut rest);
+        let _ = tx.send(rest.len());
+    });
+    let eof = rx.recv_timeout(Duration::from_secs(5));
+    for pid in &left_behind {
+        let _ = Command::new("kill").arg(pid).status();
+    }
+    assert!(
+        eof.is_ok(),
+        "the worker exited but its output never ended: a descendant holds the protocol stream"
+    );
+}

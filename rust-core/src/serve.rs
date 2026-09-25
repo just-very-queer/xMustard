@@ -29,9 +29,10 @@
 //!
 //! - `initialize` returns the protocol version, the pid, `max_inflight` and the
 //!   resident subcommand names.
-//! - `$/cancelRequest` (a notification, params `{"id": N}`): a queued request never
-//!   runs; a running one finishes, but its output is dropped. Either way the request
-//!   is answered with [`REQUEST_CANCELLED`], so the client knows when it has ended.
+//! - `$/cancelRequest` (a notification, params `{"id": N}`): a queued request is
+//!   removed and answered at once; a running one finishes, but its output is dropped,
+//!   and it is answered when its handler returns. Either way the answer is
+//!   [`REQUEST_CANCELLED`], so the client knows when the request's work has ended.
 //! - `$/stats` returns counters.
 //! - Any resident subcommand, with params `{"args": [...]}`. The subcommand's JSON
 //!   output becomes `result` byte for byte: every result frame is written as
@@ -43,7 +44,9 @@
 //! Requests run on a fixed pool of `max_inflight` threads (the Go side passes its
 //! child limit). End of input on stdin ends the process at once, so a worker never
 //! outlives its supervisor's pipe. After `trim_idle` without requests, the resident
-//! graph snapshots are dropped. The supervisor owns idle exit: it closes stdin.
+//! graph snapshots are dropped; the allocator returns only part of that memory to the
+//! OS, so the process keeps most of its peak RSS until it exits. The supervisor owns
+//! idle exit: it closes stdin. Children (git) never inherit the protocol stream.
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -484,7 +487,11 @@ pub fn run_stdio(table: &'static [Command], args: Vec<String>) -> i32 {
 #[cfg(unix)]
 fn protocol_stdout() -> io::Result<Box<dyn Write + Send>> {
     use std::os::fd::AsFd;
-    let proto = rustix::io::dup(io::stdout().as_fd())?;
+    // Close-on-exec (F_DUPFD_CLOEXEC): the git children the handlers start, and
+    // anything they leave running (an fsmonitor daemon), must not inherit the
+    // protocol stream. The supervisor learns that the worker ended from end of
+    // output on this pipe, which a descendant holding it would delay indefinitely.
+    let proto = io::stdout().as_fd().try_clone_to_owned()?;
     rustix::stdio::dup2_stdout(io::stderr().as_fd())?;
     Ok(Box::new(std::fs::File::from(proto)))
 }
@@ -604,10 +611,8 @@ fn handle_message(table: &'static [Command], shared: &Shared, header_id: Option<
     shared.touch();
     match method {
         "$/cancelRequest" => {
-            if let Some(target) = msg.pointer("/params/id").and_then(Value::as_i64)
-                && let Some(flag) = lock(&shared.inflight).get(&target)
-            {
-                flag.store(true, Ordering::SeqCst);
+            if let Some(target) = msg.pointer("/params/id").and_then(Value::as_i64) {
+                cancel_request(shared, target);
             }
         }
         "initialize" => {
@@ -687,6 +692,28 @@ fn handle_message(table: &'static [Command], shared: &Shared, header_id: Option<
             });
             shared.ready.notify_one();
         }
+    }
+}
+
+/// Cancel request `id`. A queued request is removed and answered now, so the client
+/// learns at once that it will never run. A running one is flagged: its output is
+/// dropped and it is answered when its handler returns.
+fn cancel_request(shared: &Shared, id: i64) {
+    let queued = {
+        let mut queue = lock(&shared.queue);
+        queue
+            .iter()
+            .position(|job| job.id == id)
+            .and_then(|at| queue.remove(at))
+    };
+    if queued.is_some() {
+        lock(&shared.inflight).remove(&id);
+        shared.counters.cancelled.fetch_add(1, Ordering::Relaxed);
+        shared.send_error(Some(id), REQUEST_CANCELLED, "request cancelled", None);
+        return;
+    }
+    if let Some(flag) = lock(&shared.inflight).get(&id) {
+        flag.store(true, Ordering::SeqCst);
     }
 }
 
@@ -1217,6 +1244,32 @@ mod tests {
         }
         assert_eq!(seen[&1]["result"], "released");
         assert_eq!(seen[&2]["error"]["code"], REQUEST_CANCELLED);
+        h.close();
+    }
+
+    #[test]
+    fn a_cancelled_queued_request_is_answered_before_the_pool_frees() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = dir.path().join("gate");
+        let mut h = Harness::start(ServeConfig {
+            max_inflight: 1,
+            ..ServeConfig::default()
+        });
+        h.request(1, "wait", &[gate.to_str().unwrap()]);
+        h.request(2, "echo", &["queued"]);
+        h.send(
+            None,
+            &json!({"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": 2}}),
+        );
+        // the only pool thread is still blocked on request 1.
+        let (hid, _, v) = h.recv();
+        assert_eq!(hid, Some(2));
+        assert_eq!(v["error"]["code"], REQUEST_CANCELLED);
+        h.request(3, "$/stats", &[]);
+        // only request 1 is left, whether or not the pool has picked it up yet.
+        assert_eq!(h.recv().2["result"]["inflight"], 1);
+        std::fs::write(&gate, b"").unwrap();
+        assert_eq!(h.recv().2["result"], "released");
         h.close();
     }
 
