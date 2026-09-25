@@ -68,7 +68,7 @@ func listIntegrationRouteSpecs() []integrationRouteSpec {
 	}
 }
 
-func registerIntegrationRoutes(mux *http.ServeMux, dataDir string) {
+func registerIntegrationRoutes(mux routeRegistrar, dataDir string) {
 	mux.HandleFunc(configureIntegrationRoute.Pattern(), func(w http.ResponseWriter, r *http.Request) {
 		workspaceID := r.PathValue("workspace_id")
 		provider := strings.TrimSpace(r.URL.Query().Get("provider"))

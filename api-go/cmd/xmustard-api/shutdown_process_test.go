@@ -43,7 +43,8 @@ func TestSIGTERMPersistsInterruptedRunBeforeExit(t *testing.T) {
 		"created_at": "2026-09-24T00:00:00Z",
 	})
 
-	p := startAPIProc(t, map[string]string{"XMUSTARD_DATA_DIR": dir})
+	// runs are platform routes
+	p := startAPIProc(t, map[string]string{"XMUSTARD_DATA_DIR": dir, "XMUSTARD_PROFILE": "platform"})
 	resp, err := http.Post(p.base+"/api/workspaces/"+ws+"/runs/run-origin/retry", "application/json", nil)
 	if err != nil {
 		t.Fatal(err)

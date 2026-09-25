@@ -29,13 +29,17 @@ const (
 	toolVersion    = "api-go/xmustard-tools-1"
 )
 
-// newAPIHandler builds the route table with evidence delivery wired in.
-func newAPIHandler() http.Handler {
-	mux := http.NewServeMux()
+// newAPIHandler builds the route table for the posture in the environment.
+func newAPIHandler() http.Handler { return newAPIHandlerFor(postureFromEnv()) }
+
+// newAPIHandlerFor builds the gated route table with evidence delivery wired in. The
+// route gates run before delivery, so a refused call is never captured.
+func newAPIHandlerFor(p exposurePosture) http.Handler {
+	mux := newGatedMux()
 	registerRoutes(mux)
 	store := evidence.NewStore(dataDir(), evidence.LimitsFromEnv())
 	registerEvidenceRoutes(mux, store)
-	return evidenceDeliveryMiddleware(store, mux)
+	return routeGateMiddleware(p, mux, evidenceDeliveryMiddleware(store, mux))
 }
 
 // coreTools maps the nine MCP tool names to the route that serves them.
@@ -238,7 +242,7 @@ func writeEvidenceError(w http.ResponseWriter, err error) {
 	writeJSON(w, status, map[string]any{"error": err.Error(), "reason": reason})
 }
 
-func registerEvidenceRoutes(mux *http.ServeMux, store *evidence.Store) {
+func registerEvidenceRoutes(mux routeRegistrar, store *evidence.Store) {
 	// Pi (and any direct client) posts one xMustard tool result for projection. The
 	// raw result is the request body; tool identity/call metadata are query params.
 	mux.HandleFunc("POST /api/workspaces/{workspace_id}/evidence", func(w http.ResponseWriter, r *http.Request) {
