@@ -18,12 +18,19 @@ package govstore
 // memory pressure between samples. Budgets asserted, as the WS-01 test line states
 // them ("open adds ≤3 MiB; a 100k-row bulk insert inside a single scope stays
 // ≤14 MiB above baseline"), with one baseline for both: the process before Open.
-//   - Open() on an existing store, and Open() plus the first read (which opens a
-//     reader connection), each add at most 3 MiB; creating a new file also runs the
-//     migration and is reported only;
+//   - Open() on an existing store, and Open() plus the first read, each add at most
+//     3 MiB. Reads served one at a time borrow the idle writer connection, so the first
+//     read opens no second connection. Creating a new file also runs the migration and
+//     is reported only;
 //   - a 100k-row bulk write inside one Update (InsertEntry, and the legacy importer)
 //     peaks at most 14 MiB above the pre-open process. The peak above the open store
 //     (§7.2's heavy-slot view) is reported too.
+// Also measured on the restarted store, and reported rather than asserted because the
+// WS-01 line does not set it: the serving state after three FTS searches that match
+// most of the 100k rows, a list and a content fetch, with one reader connection opened
+// by a read that overlapped a write. That is what a daemon under concurrent requests
+// holds: both page caches at their caps, FTS5 working memory the allocator keeps, and
+// the code of those queries. Compare it with §7.2's steady 3-5 MiB for the store.
 // The legacy import fixture has the pre-w0 shape (no verification_mode), the worst
 // case for the importer: every promoted entry is relabelled.
 //
@@ -92,6 +99,11 @@ type rssReport struct {
 	TextOpen          int64 `json:"text_open"`
 	FootprintOpenOnly int64 `json:"footprint_open_only"`
 	TextOpenOnly      int64 `json:"text_open_only"`
+	// Serving state (reopen mode): after the reads, plus one reader connection.
+	ServingDelta     int64 `json:"serving_delta"`
+	FootprintServing int64 `json:"footprint_serving"`
+	TextServing      int64 `json:"text_serving"`
+	ReaderConns      int   `json:"reader_conns"`
 }
 
 // openCost is the conservative open delta: on macOS, ps-RSS deltas drop below what
@@ -201,7 +213,7 @@ func rssProbe(run probeFn) error {
 	}
 	rep.OpenOnlyDelta = settle() - rep.BaseRSS
 	rep.FootprintOpenOnly, rep.TextOpenOnly = vmmapFootprint()
-	// a first read on the reader pool, as the daemon's first request would do
+	// a first read, as the daemon's first request would do; it borrows the idle writer
 	if _, err := s.ListEntries(ctx, EntryFilter{WorkspaceID: "ws1", ServedOnly: true, Limit: 8}); err != nil {
 		return err
 	}
@@ -225,6 +237,14 @@ func rssProbe(run probeFn) error {
 	rep.PeakRSS = max(rep.MaxRSS, rep.SampledPeak)
 	rep.OverOpen = rep.PeakRSS - rep.OpenRSS
 	rep.OverBase = rep.PeakRSS - rep.BaseRSS
+	if rep.Mode == "rss_reopen" {
+		if err := readDuringWrite(ctx, s); err != nil {
+			return err
+		}
+		rep.ReaderConns = s.readers.Stats().OpenConnections
+		rep.ServingDelta = settle() - rep.BaseRSS
+		rep.FootprintServing, rep.TextServing = vmmapFootprint()
+	}
 	if info, err := s.SchemaInfo(ctx); err == nil {
 		rep.DBBytes = info.PageCount * info.PageSize
 	}
@@ -255,6 +275,27 @@ func probeInsert(ctx context.Context, s *SQLStore, sample func()) error {
 		sample()
 		return nil
 	})
+}
+
+// readDuringWrite runs a read while a write holds the writer connection, so the read
+// opens a reader connection, as overlapping requests do in a daemon.
+func readDuringWrite(ctx context.Context, s *SQLStore) error {
+	holding, release := make(chan struct{}), make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- s.Update(ctx, func(Tx) error {
+			close(holding)
+			<-release
+			return nil
+		})
+	}()
+	<-holding
+	_, err := s.SearchMemories(ctx, MemoryQuery{WorkspaceID: "ws1", Text: "retry backoff", Limit: 8})
+	close(release)
+	if werr := <-done; err == nil {
+		err = werr
+	}
+	return err
 }
 
 // probeReopen serves reads from an existing 100k-entry store: the daemon's restart.
@@ -372,6 +413,10 @@ func runProbe(t *testing.T, mode, dir string, env ...string) rssReport {
 		t.Logf("%s: vmmap split, Open(): private footprint +%.2f MiB, machine code (__TEXT, clean file-backed) +%.2f MiB; with first read: +%.2f and +%.2f MiB",
 			mode, m(rep.FootprintOpenOnly-rep.FootprintBase), m(rep.TextOpenOnly-rep.TextBase),
 			m(rep.FootprintOpen-rep.FootprintBase), m(rep.TextOpen-rep.TextBase))
+		if rep.FootprintServing > 0 {
+			t.Logf("%s: vmmap split, serving with %d reader connection(s): +%.2f and +%.2f MiB",
+				mode, rep.ReaderConns, m(rep.FootprintServing-rep.FootprintBase), m(rep.TextServing-rep.TextBase))
+		}
 	}
 	t.Logf("%s: SQLite C heap (libc) %.2f -> %.2f at open -> %.2f peak MiB | Go heap resident %.2f -> %.2f peak MiB | maxrss %.2f, sampled %.2f MiB",
 		mode, m(rep.LibcBase), m(rep.LibcOpen), m(rep.LibcPeak), m(int64(rep.GoHeapBase)), m(int64(rep.GoHeapPeak)), m(rep.MaxRSS), m(rep.SampledPeak))
@@ -393,15 +438,19 @@ func TestRSSProbe(t *testing.T) {
 		float64(qc.OpenDelta)/mib, float64(openCost(qc.OpenDelta, qc.FootprintBase, qc.FootprintOpen, qc.TextBase, qc.TextOpen))/mib)
 	// The same 100k-row file as a restarted daemon sees it. Single ps-RSS samples vary
 	// by about 1 MiB between runs, so the budget applies to the median of five.
-	var openOnly, withRead []int64
+	var openOnly, withRead, serving []int64
 	for range 5 {
 		rep := runProbe(t, "rss_reopen", dir)
+		if rep.ReaderConns != 1 {
+			t.Errorf("the overlapping read left %d reader connections open, want 1", rep.ReaderConns)
+		}
 		openOnly = append(openOnly, openCost(rep.OpenOnlyDelta, rep.FootprintBase, rep.FootprintOpenOnly, rep.TextBase, rep.TextOpenOnly))
 		withRead = append(withRead, openCost(rep.OpenDelta, rep.FootprintBase, rep.FootprintOpen, rep.TextBase, rep.TextOpen))
+		serving = append(serving, openCost(rep.ServingDelta, rep.FootprintBase, rep.FootprintServing, rep.TextBase, rep.TextServing))
 	}
 	medianOf := func(v []int64) int64 { slices.Sort(v); return v[len(v)/2] }
-	t.Logf("reopen, conservative cost (max of ps-RSS delta and vmmap footprint+__TEXT delta), Open() (MiB): %v; Open()+first read (MiB): %v",
-		mibs(openOnly), mibs(withRead))
+	t.Logf("reopen, conservative cost (max of ps-RSS delta and vmmap footprint+__TEXT delta), Open() (MiB): %v; Open()+first read (MiB): %v; serving with a reader connection (MiB): %v",
+		mibs(openOnly), mibs(withRead), mibs(serving))
 	if m := medianOf(openOnly); m > maxOpenDelta {
 		t.Errorf("Open() on the existing store added %.2f MiB (median), budget %d MiB", float64(m)/mib, maxOpenDelta/mib)
 	}
@@ -410,6 +459,8 @@ func TestRSSProbe(t *testing.T) {
 	if m := medianOf(withRead); m > maxOpenDelta {
 		t.Errorf("Open() plus the first read added %.2f MiB (median), budget %d MiB", float64(m)/mib, maxOpenDelta/mib)
 	}
+	t.Logf("serving with a reader connection: %.2f MiB (median) over the pre-open process; reported, §7.2 puts the store at 3-5 MiB steady",
+		float64(medianOf(serving))/mib)
 	src := filepath.Join(t.TempDir(), "context_entries.json")
 	writeLegacyFixture(t, src)
 	imp := runProbe(t, "rss_import", t.TempDir(), "GOVSTORE_IMPORT="+src)

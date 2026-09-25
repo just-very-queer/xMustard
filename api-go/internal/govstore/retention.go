@@ -154,7 +154,12 @@ func (s *SQLStore) ApplyRetention(ctx context.Context, p RetentionPolicy) (Reten
 				return rep, fmt.Errorf("retention: optimize %s: %w", ix.table, err)
 			}
 		}
-		if _, err := s.writer.ExecContext(ctx, "PRAGMA incremental_vacuum"); err != nil {
+		if err := s.lockWriter(ctx); err != nil {
+			return rep, err
+		}
+		_, err := s.writer.ExecContext(ctx, "PRAGMA incremental_vacuum")
+		s.unlockWriter()
+		if err != nil {
 			return rep, mapErr(err)
 		}
 		if err := s.Checkpoint(ctx); err != nil {

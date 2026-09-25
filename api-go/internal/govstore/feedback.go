@@ -66,7 +66,12 @@ func (r *reader) GetFeedback(ctx context.Context, workspaceID string, paths []st
 			}
 			out[f.Path] = f
 		}
-		if err := rows.Close(); err != nil {
+		// A failed step ends the loop early; report it instead of a partial result.
+		err = rows.Err()
+		if cerr := rows.Close(); err == nil {
+			err = cerr
+		}
+		if err != nil {
 			return nil, err
 		}
 	}

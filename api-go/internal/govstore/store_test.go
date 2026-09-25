@@ -1675,6 +1675,79 @@ func TestRetentionIsBoundedAndKeepsTombstones(t *testing.T) {
 	}
 }
 
+// Reads served one at a time borrow the idle writer connection, so no reader
+// connection (with its own parsed schema and page cache) opens. A read that arrives
+// while a write holds the writer goes to the reader pool instead of waiting, and every
+// read, including the ones that fail, hands the writer back.
+func TestReadsBorrowTheIdleWriter(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t, newClock())
+	propose(t, s, "m1", "retry policy", "use capped backoff", "docs/retry.md")
+	vote(t, s, "m1", bob, VerdictApprove)
+	reads := func() {
+		t.Helper()
+		if _, err := s.GetEntry(ctx, "m1"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.GetEntry(ctx, "missing"); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("missing entry: %v", err)
+		}
+		if _, err := s.Tally(ctx, "missing", 0); err == nil {
+			t.Fatal("tally of a missing entry succeeded")
+		}
+		if es, err := s.ListEntries(ctx, EntryFilter{WorkspaceID: "ws1"}); err != nil || len(es) != 1 {
+			t.Fatalf("list = %d, %v", len(es), err)
+		}
+		if vs, err := s.ListVotes(ctx, "m1", 0); err != nil || len(vs) != 1 {
+			t.Fatalf("votes = %d, %v", len(vs), err)
+		}
+		if hits, err := s.SearchMemories(ctx, MemoryQuery{WorkspaceID: "ws1", Text: "backoff"}); err != nil || len(hits) != 1 {
+			t.Fatalf("search = %d, %v", len(hits), err)
+		}
+		if _, err := s.SearchMemories(ctx, MemoryQuery{WorkspaceID: "ws1", Text: `"unterminated`}); err != nil && !errors.Is(err, ErrInvalid) {
+			t.Fatalf("malformed search: %v", err)
+		}
+		if cs, err := s.EntryContents(ctx, []string{"m1", "missing"}); err != nil || len(cs) != 1 {
+			t.Fatalf("contents = %d, %v", len(cs), err)
+		}
+		if _, err := s.SchemaInfo(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	reads()
+	if n := s.readers.Stats().OpenConnections; n != 0 {
+		t.Fatalf("sequential reads opened %d reader connections", n)
+	}
+	// No read kept the writer: a write gets it at once.
+	short, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	if err := s.Update(short, func(tx Tx) error {
+		_, err := tx.SetTier(short, "m1", "core", alice)
+		return err
+	}); err != nil {
+		t.Fatalf("write after reads: %v", err)
+	}
+	// While a write holds the writer, reads go to the reader pool and do not wait.
+	holding, release := make(chan struct{}), make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- s.Update(ctx, func(tx Tx) error {
+			close(holding)
+			<-release
+			return nil
+		})
+	}()
+	<-holding
+	reads()
+	if n := s.readers.Stats().OpenConnections; n != 1 {
+		t.Fatalf("reads during a write used %d reader connections, want 1", n)
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestBackupQuickCheckAndClose(t *testing.T) {
 	ctx := context.Background()
 	s := openTestStore(t, newClock())

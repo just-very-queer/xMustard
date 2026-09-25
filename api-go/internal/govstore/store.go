@@ -8,6 +8,11 @@
 //   - Each process has one writer connection. Every write transaction starts with
 //     BEGIN IMMEDIATE and waits up to busy_timeout for another process's lock, so the
 //     API daemon and the ops CLI can write the same file without lost updates.
+//   - A single read borrows the writer connection while nothing else holds it, so a
+//     store that serves one request at a time keeps one connection, with one parsed
+//     schema and one page cache, resident. A read that arrives while the writer is
+//     busy goes to a small reader pool instead of waiting; reader connections open on
+//     demand and close after ReaderIdleTimeout. View always uses the reader pool.
 //   - Governance commits run with synchronous=FULL.
 //   - Pages are never memory-mapped (mmap_size=0) and each connection's page cache is
 //     capped, so resident memory stays small and bounded.
@@ -126,7 +131,8 @@ type Options struct {
 	CacheKiB int
 	// ReaderCacheKiB caps each reader connection's page cache.
 	ReaderCacheKiB int
-	// MaxReaders bounds the read connection pool.
+	// MaxReaders bounds the read connection pool, which serves View and the reads that
+	// arrive while the writer connection is busy.
 	MaxReaders int
 	// BusyTimeout is how long a writer waits for another process's write lock.
 	BusyTimeout time.Duration
@@ -267,8 +273,11 @@ type SQLStore struct {
 	opts    Options
 	writer  *sql.DB // exactly one connection: the process's single writer
 	readers *sql.DB
-	closed  atomic.Bool
-	closeMu sync.Mutex
+	// writerSem is held by whoever uses the writer connection: a write transaction, a
+	// check or checkpoint, or a read that borrowed it.
+	writerSem chan struct{}
+	closed    atomic.Bool
+	closeMu   sync.Mutex
 
 	fingerprint string
 	version     int
@@ -312,7 +321,7 @@ func Open(ctx context.Context, path string, opts Options) (*SQLStore, error) {
 		_ = writer.Close()
 		return nil, fmt.Errorf("govstore: open %s: %w", path, err)
 	}
-	s := &SQLStore{path: path, opts: opts, writer: writer}
+	s := &SQLStore{path: path, opts: opts, writer: writer, writerSem: make(chan struct{}, 1)}
 	if err := retryBusy(ctx, opts.BusyTimeout, func() error {
 		var err error
 		s.version, s.fingerprint, err = migrate(ctx, writer, opts.Now)
@@ -336,8 +345,41 @@ func Open(ctx context.Context, path string, opts Options) (*SQLStore, error) {
 	readers.SetMaxIdleConns(1)
 	readers.SetConnMaxIdleTime(opts.ReaderIdleTimeout)
 	s.readers = readers
-	s.reader = reader{q: readers, now: opts.Now}
+	s.reader = reader{q: readers, borrow: s.borrowForRead, now: opts.Now}
 	return s, nil
+}
+
+// lockWriter takes the writer connection for a write, check or checkpoint, waiting
+// for a borrowed read or another write to finish until ctx ends.
+func (s *SQLStore) lockWriter(ctx context.Context) error {
+	select {
+	case s.writerSem <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *SQLStore) unlockWriter() { <-s.writerSem }
+
+// borrowForRead returns the connection one read statement runs on and the function
+// that hands it back. The writer connection is lent when it is idle, so sequential
+// reads open no second connection. When it is busy the read goes to the reader pool
+// and never waits behind a write.
+func (s *SQLStore) borrowForRead(ctx context.Context) (queryer, func()) {
+	select {
+	case s.writerSem <- struct{}{}:
+		c, err := s.writer.Conn(ctx)
+		if err == nil {
+			return c, func() {
+				_ = c.Close()
+				s.unlockWriter()
+			}
+		}
+		s.unlockWriter()
+	default:
+	}
+	return s.readers, func() {}
 }
 
 // writerDSN configures the single writer: WAL, FULL sync, immediate transactions,
@@ -451,6 +493,10 @@ func (s *SQLStore) QuickCheck(ctx context.Context) error {
 	if s.closed.Load() {
 		return ErrClosed
 	}
+	if err := s.lockWriter(ctx); err != nil {
+		return err
+	}
+	defer s.unlockWriter()
 	return quickCheck(ctx, s.writer)
 }
 
@@ -476,6 +522,10 @@ func (s *SQLStore) Update(ctx context.Context, fn func(Tx) error) (err error) {
 	if s.closed.Load() {
 		return ErrClosed
 	}
+	if err := s.lockWriter(ctx); err != nil {
+		return err
+	}
+	defer s.unlockWriter() // runs after the rollback below
 	sqlTx, err := s.writer.BeginTx(ctx, nil)
 	if err != nil {
 		return mapErr(err)
@@ -506,7 +556,9 @@ func (s *SQLStore) Update(ctx context.Context, fn func(Tx) error) (err error) {
 	return nil
 }
 
-// View runs fn against one read snapshot on the reader pool.
+// View runs fn against one read snapshot on the reader pool. It never borrows the
+// writer connection, so fn may call Update (which then sees a newer state than fn's
+// snapshot).
 func (s *SQLStore) View(ctx context.Context, fn func(Reader) error) error {
 	if s.closed.Load() {
 		return ErrClosed
@@ -584,6 +636,10 @@ func (s *SQLStore) Checkpoint(ctx context.Context) error {
 	if s.closed.Load() {
 		return ErrClosed
 	}
+	if err := s.lockWriter(ctx); err != nil {
+		return err
+	}
+	defer s.unlockWriter()
 	var busy, logFrames, checkpointed int
 	if err := s.writer.QueryRowContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)").Scan(&busy, &logFrames, &checkpointed); err != nil {
 		return mapErr(err)
@@ -619,7 +675,7 @@ func (s *SQLStore) SchemaInfo(ctx context.Context) (SchemaInfo, error) {
 		{"freelist_count", &info.FreelistCount},
 		{"journal_mode", &info.JournalMode},
 	} {
-		if err := s.readers.QueryRowContext(ctx, "PRAGMA "+p.pragma).Scan(p.dst); err != nil {
+		if err := s.queryRow(ctx, "PRAGMA "+p.pragma).Scan(p.dst); err != nil {
 			return info, mapErr(err)
 		}
 	}
@@ -661,16 +717,35 @@ func (c *stmtCache) get(ctx context.Context, query string) (*sql.Stmt, error) {
 // rowScanner is the part of *sql.Row the store uses. errRow carries a prepare error.
 type rowScanner interface{ Scan(dest ...any) error }
 
+// resultRows is a result set that hands a borrowed connection back when it is closed.
+// Every query's rows are closed (deferred) by the method that ran it.
+type resultRows struct {
+	*sql.Rows
+	release func()
+}
+
+// Close closes the rows and returns the connection they ran on. It is idempotent.
+func (r *resultRows) Close() error {
+	err := r.Rows.Close()
+	if r.release != nil {
+		r.release()
+		r.release = nil
+	}
+	return err
+}
+
 type errRow struct{ err error }
 
 func (r errRow) Scan(...any) error { return r.err }
 
-// reader implements Reader over the reader pool, a read snapshot or a write
-// transaction.
+// reader implements Reader over the store (each statement on the idle writer or the
+// reader pool), a read snapshot or a write transaction.
 type reader struct {
 	q     queryer
 	stmts *stmtCache
-	now   func() time.Time
+	// borrow, set on the store's own reader, picks the connection for one statement.
+	borrow func(context.Context) (queryer, func())
+	now    func() time.Time
 }
 
 func (r *reader) exec(ctx context.Context, query string, args ...any) (sql.Result, error) {
@@ -686,17 +761,25 @@ func (r *reader) exec(ctx context.Context, query string, args ...any) (sql.Resul
 	return res, mapErr(err)
 }
 
-func (r *reader) query(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+func (r *reader) query(ctx context.Context, query string, args ...any) (*resultRows, error) {
 	if r.stmts != nil {
 		st, err := r.stmts.get(ctx, query)
 		if err != nil {
 			return nil, err
 		}
 		rows, err := st.QueryContext(ctx, args...)
-		return rows, mapErr(err)
+		if err != nil {
+			return nil, mapErr(err)
+		}
+		return &resultRows{Rows: rows}, nil
 	}
-	rows, err := r.q.QueryContext(ctx, query, args...)
-	return rows, mapErr(err)
+	q, release := r.conn(ctx)
+	rows, err := q.QueryContext(ctx, query, args...)
+	if err != nil {
+		release()
+		return nil, mapErr(err)
+	}
+	return &resultRows{Rows: rows, release: release}, nil
 }
 
 func (r *reader) queryRow(ctx context.Context, query string, args ...any) rowScanner {
@@ -705,15 +788,32 @@ func (r *reader) queryRow(ctx context.Context, query string, args ...any) rowSca
 		if err != nil {
 			return errRow{err}
 		}
-		return mappedRow{st.QueryRowContext(ctx, args...)}
+		return &mappedRow{row: st.QueryRowContext(ctx, args...)}
 	}
-	return mappedRow{r.q.QueryRowContext(ctx, query, args...)}
+	q, release := r.conn(ctx)
+	return &mappedRow{row: q.QueryRowContext(ctx, query, args...), release: release}
 }
 
-type mappedRow struct{ row *sql.Row }
+// conn picks the connection for one statement outside a transaction.
+func (r *reader) conn(ctx context.Context) (queryer, func()) {
+	if r.borrow != nil {
+		return r.borrow(ctx)
+	}
+	return r.q, func() {}
+}
 
-func (m mappedRow) Scan(dest ...any) error {
+// mappedRow maps driver errors and hands a borrowed connection back once scanned.
+type mappedRow struct {
+	row     *sql.Row
+	release func()
+}
+
+func (m *mappedRow) Scan(dest ...any) error {
 	err := m.row.Scan(dest...)
+	if m.release != nil {
+		m.release()
+		m.release = nil
+	}
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrNotFound
 	}

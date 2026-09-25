@@ -187,7 +187,12 @@ func (r *reader) EntryContents(ctx context.Context, ids []string) (map[string]En
 			}
 			out[id] = c
 		}
-		if err := rows.Close(); err != nil {
+		// A failed step ends the loop early; report it instead of a partial result.
+		err = rows.Err()
+		if cerr := rows.Close(); err == nil {
+			err = cerr
+		}
+		if err != nil {
 			return nil, err
 		}
 	}
