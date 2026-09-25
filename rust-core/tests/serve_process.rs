@@ -275,6 +275,69 @@ fn failures_carry_the_cli_message_and_exit_code() {
     }
 }
 
+/// Every resident invocation the Go bridge sends (api-go/internal/rustcore), with
+/// the first argument for command families.
+const GO_BRIDGE_CALLS: &[&[&str]] = &[
+    &["scan-signals"],
+    &["build-repo-map"],
+    &["semantic-impact"],
+    &["path-symbols"],
+    &["explain-path"],
+    &["normalize-diagnostics"],
+    &["archive-diagnostics-payload"],
+    &["link-diagnostic-symbol"],
+    &["normalize-lsp-definition"],
+    &["normalize-lsp-references"],
+    &["normalize-lsp-document-symbols"],
+    &["normalize-lsp-workspace-symbols"],
+    &["parse-coverage-lcov"],
+    &["parse-coverage"],
+    &["symbolgraph", "blast-radius"],
+    &["symbolgraph", "impact"],
+    &["symbolgraph", "trace"],
+    &["symbolgraph", "clusters"],
+    &["changetrack", "fingerprint"],
+    &["changetrack", "drift"],
+    &["changetrack", "changed-since"],
+    &["changetrack", "working-changes"],
+    &["changetrack", "incorporate"],
+    &["changetrack", "lineage"],
+    &["ownership", "subsystems"],
+    &["ownership", "owners"],
+    &["search"],
+    &["repo-key"],
+    &["wiki"],
+];
+
+#[test]
+fn every_go_bridge_method_dispatches_to_its_handler() {
+    // Called without its remaining arguments, each method must reach its own handler,
+    // which answers with its own usage line (exit code 2), exactly as the CLI does.
+    let mut worker = Worker::start(&[]);
+    for call in GO_BRIDGE_CALLS {
+        let err = worker.call(call[0], &call[1..]).unwrap_err();
+        let cli = one_shot(call);
+        assert_eq!(err["code"], COMMAND_FAILED, "{call:?}: {err}");
+        assert_eq!(err["data"]["exit_code"], 2, "{call:?}: {err}");
+        let message = err["message"].as_str().unwrap();
+        assert!(
+            message.starts_with(&format!("usage: xmustard-core {}", call.join(" "))),
+            "{call:?} reached the wrong handler: {message}"
+        );
+        assert_eq!(cli.status.code(), Some(2), "{call:?}");
+        assert_eq!(
+            message,
+            String::from_utf8_lossy(&cli.stderr).trim_end(),
+            "{call:?}"
+        );
+    }
+    assert_eq!(
+        worker.stats()["requests"],
+        GO_BRIDGE_CALLS.len(),
+        "every call ran in-process"
+    );
+}
+
 #[test]
 fn whole_repository_builds_are_left_to_one_shot_processes() {
     let r = fixture();

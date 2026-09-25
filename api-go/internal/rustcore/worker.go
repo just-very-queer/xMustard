@@ -219,6 +219,28 @@ func CoreWorkerStats() WorkerStats {
 	return st
 }
 
+// RecycleCoreWorker retires the resident worker once its current calls finish, which
+// returns its retained heap to the OS; the next call starts a fresh worker. It is the
+// lever for a memory governor (WS-06) under pressure, and reports whether a worker
+// was running.
+func RecycleCoreWorker() bool {
+	s := coreWorker
+	s.mu.Lock()
+	p := s.proc
+	if p == nil {
+		s.mu.Unlock()
+		return false
+	}
+	s.proc = nil
+	p.retiring = true
+	idle := p.active == 0
+	s.mu.Unlock()
+	if idle {
+		p.retire()
+	}
+	return true
+}
+
 func backoff(min, max time.Duration, failures int) time.Duration {
 	d := min
 	for i := 1; i < failures && d < max; i++ {

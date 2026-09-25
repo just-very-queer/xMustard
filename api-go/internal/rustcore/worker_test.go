@@ -591,6 +591,45 @@ func TestWorkerIsReplacedWhenItsEnvironmentChanges(t *testing.T) {
 	waitFor(t, "the old worker to retire", 3*time.Second, func() bool { return processGone(first) })
 }
 
+func TestRecycleCoreWorkerRetiresAfterCurrentCalls(t *testing.T) {
+	logPath := useFakeWorker(t, "ok")
+	if RecycleCoreWorker() {
+		t.Fatal("no worker is running yet")
+	}
+	mustEcho(t, "a")
+	first := CoreWorkerStats().PID
+	before := CoreWorkerStats()
+	// a call in flight finishes on the old worker; the recycle waits for it.
+	done := make(chan error, 1)
+	go func() {
+		out, err := runCoreCtx(context.Background(), "sleep", "300")
+		if err == nil && string(out) != `"slept"` {
+			err = fmt.Errorf("unexpected output %s", out)
+		}
+		done <- err
+	}()
+	waitFor(t, "the call to start", 3*time.Second, func() bool {
+		coreWorker.mu.Lock()
+		defer coreWorker.mu.Unlock()
+		return coreWorker.proc != nil && coreWorker.proc.active == 1
+	})
+	if !RecycleCoreWorker() {
+		t.Fatal("a running worker must be recycled")
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("the in-flight call must complete on the recycled worker: %v", err)
+	}
+	waitFor(t, "the recycled worker to exit", 3*time.Second, func() bool { return processGone(first) })
+	mustEcho(t, "b")
+	after := CoreWorkerStats()
+	if after.PID == first || after.Crashes != before.Crashes || after.IdleExits != before.IdleExits {
+		t.Fatalf("stats before %+v after %+v", before, after)
+	}
+	if n := len(fakeLog(t, logPath, "serve ")); n != 2 {
+		t.Fatalf("want a fresh worker after the recycle: %d starts", n)
+	}
+}
+
 func TestWorkerIsTrackedForShutdown(t *testing.T) {
 	useFakeWorker(t, "ok")
 	mustEcho(t, "a")
