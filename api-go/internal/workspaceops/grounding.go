@@ -93,7 +93,7 @@ func BuildSessionGrounding(dataDir, workspaceID string) (*SessionGrounding, erro
 	return BuildSessionGroundingCtx(context.Background(), dataDir, workspaceID)
 }
 
-// BuildSessionGroundingCtx is the request-scoped variant: cancelling ctx kills its Rust/tool children.
+// BuildSessionGroundingCtx is the request-scoped variant: cancelling ctx cancels its Rust/tool work (see rustcore.runCoreCtx).
 func BuildSessionGroundingCtx(ctx context.Context, dataDir, workspaceID string) (*SessionGrounding, error) {
 	drift, err := WorkspaceDriftCtx(ctx, dataDir, workspaceID)
 	if err != nil {

@@ -40,7 +40,7 @@ func ExplainRunFailure(dataDir, workspaceID, runID string) (*FailureExplanation,
 	return ExplainRunFailureCtx(context.Background(), dataDir, workspaceID, runID)
 }
 
-// ExplainRunFailureCtx is the request-scoped variant: cancelling ctx kills its Rust/tool children.
+// ExplainRunFailureCtx is the request-scoped variant: cancelling ctx cancels its Rust/tool work (see rustcore.runCoreCtx).
 func ExplainRunFailureCtx(ctx context.Context, dataDir, workspaceID, runID string) (*FailureExplanation, error) {
 	run, err := ReadRun(dataDir, workspaceID, runID)
 	if err != nil {

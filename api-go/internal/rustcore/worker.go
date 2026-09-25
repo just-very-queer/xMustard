@@ -20,16 +20,22 @@ package rustcore
 //     reserved against the caller's budget scope before they are read. A refused
 //     response is drained without buffering it.
 //
-// Deadlines: a caller that gives up (context cancelled or timed out) gets its error at
-// once and releases its slot, and the worker is sent $/cancelRequest. The worker
-// cannot interrupt a running handler. If an abandoned request still has no answer
-// workerKillGrace after its deadline, the worker is killed and restarted, as the
-// one-shot path kills a child at its timeout.
+// Cancellation: a caller that gives up (context cancelled or timed out) gets its error
+// at once, and the worker is sent $/cancelRequest. A queued request is dropped at once;
+// a running handler cannot be interrupted. The call's ChildLimit slot stays held until
+// the worker has ended the request (answered it, or exited), so admission counts
+// abandoned work that is still running. If the request is still unanswered
+// workerKillGrace after it was abandoned, the worker is retired and replaced: new
+// calls start a fresh worker, calls already running on the old one finish under their
+// own deadlines, and the old worker exits once none is left (closing its stdin ends it
+// and the abandoned handler with it). Unrelated calls are therefore not failed by one
+// slow request. The one-shot path kills its child at once instead.
 //
 // Fallback: when the worker cannot be started (no built binary, a binary without
-// `serve`, a failed handshake), calls take the one-shot path and a restart is tried
-// after a backoff. Subcommands the worker does not run in-process (live LSP,
-// verification runners, goals) always take the one-shot path.
+// `serve`, a failed handshake), or the request could not be sent to it, calls take the
+// one-shot path and a restart is tried after a backoff. Subcommands the worker does
+// not run in-process (live LSP, verification runners, goals, whole-repository builds)
+// always take the one-shot path, and do not start a worker.
 
 import (
 	"bufio"
@@ -60,14 +66,16 @@ const (
 	maxWorkerNotice    = 64 << 10
 	maxWorkerHeaderLen = 1024
 	maxWorkerHeaders   = 16
-	// workerKillGrace is how long an abandoned request may outlive its deadline before
-	// the worker is killed. It matches the one-shot WaitDelay.
+	// workerKillGrace is how long an abandoned request may keep running before its
+	// worker is retired and replaced, and how long a retired worker may take to exit
+	// before it is killed. It matches the one-shot WaitDelay.
 	workerKillGrace = 2 * time.Second
 
-	// An idle worker keeps its heap (the allocator does not return it), so it exits
-	// after two minutes without calls: long enough to stay warm across an agent's
-	// turns, short enough that an idle API does not hold it. It drops its resident
-	// graph snapshots after 30 s.
+	// An idle worker keeps most of its heap: it drops its resident graph snapshots
+	// after 30 s, but the allocator returns little of the freed memory (measured on
+	// pi-mono: 0-3.5 MiB of 19-23 MiB). So it exits after two minutes without calls:
+	// long enough to stay warm across an agent's turns, short enough that an idle API
+	// does not hold it. A call after a longer gap starts a new worker (one exec).
 	defaultWorkerIdle  = 2 * time.Minute
 	defaultWorkerTrim  = 30 * time.Second
 	defaultWorkerStart = 10 * time.Second
@@ -90,6 +98,9 @@ var (
 	errWorkerExited   = errors.New("rust-core worker exited")
 	errWorkerBackoff  = errors.New("rust-core worker restart is backing off")
 	errWorkerProtocol = errors.New("rust-core worker protocol error")
+	// errWorkerUnsent means the request never reached the worker (it had exited or its
+	// stdin was gone), so nothing ran and the one-shot path may take the call.
+	errWorkerUnsent = errors.New("rust-core worker request not sent")
 )
 
 // workerEnabled reports whether XMUSTARD_CORE_WORKER selects the resident worker.
@@ -175,14 +186,16 @@ type WorkerStats struct {
 	StartFailures int64 `json:"start_failures"`
 	Crashes       int64 `json:"crashes"`
 	IdleExits     int64 `json:"idle_exits"`
-	DeadlineKills int64 `json:"deadline_kills"`
+	// WedgedRetires counts workers retired because an abandoned request kept running
+	// past workerKillGrace.
+	WedgedRetires int64 `json:"wedged_retires"`
 	Calls         int64 `json:"calls"`
 	Fallbacks     int64 `json:"fallbacks"`
 	Cancels       int64 `json:"cancels"`
 }
 
 type workerCounters struct {
-	starts, startFailures, crashes, idleExits, deadlineKills atomic.Int64
+	starts, startFailures, crashes, idleExits, wedgedRetires atomic.Int64
 	calls, fallbacks, cancels                                atomic.Int64
 }
 
@@ -195,7 +208,11 @@ type workerSupervisor struct {
 	retryAt    time.Time
 	startFails int
 	crashes    int
-	counters   workerCounters
+	// what the last handshake for knownKey said runs in-process, so a call that
+	// can only run one-shot does not start (or wait for) a worker.
+	knownKey string
+	known    workerResidency
+	counters workerCounters
 }
 
 // coreWorker is the process-wide resident worker supervisor.
@@ -210,7 +227,7 @@ func CoreWorkerStats() WorkerStats {
 		StartFailures: s.counters.startFailures.Load(),
 		Crashes:       s.counters.crashes.Load(),
 		IdleExits:     s.counters.idleExits.Load(),
-		DeadlineKills: s.counters.deadlineKills.Load(),
+		WedgedRetires: s.counters.wedgedRetires.Load(),
 		Calls:         s.counters.calls.Load(),
 		Fallbacks:     s.counters.fallbacks.Load(),
 		Cancels:       s.counters.cancels.Load(),
@@ -231,18 +248,67 @@ func RecycleCoreWorker() bool {
 	s := coreWorker
 	s.mu.Lock()
 	p := s.proc
+	s.mu.Unlock()
 	if p == nil {
-		s.mu.Unlock()
 		return false
 	}
-	s.proc = nil
+	s.retireProc(p)
+	return true
+}
+
+// retireProc detaches p, so the next call starts a fresh worker, and ends p once its
+// current callers are done (release retires it when the last one leaves). It reports
+// whether p was not already retiring.
+func (s *workerSupervisor) retireProc(p *workerProc) bool {
+	s.mu.Lock()
+	if s.proc == p {
+		s.proc = nil
+	}
+	first := !p.retiring
 	p.retiring = true
 	idle := p.active == 0
 	s.mu.Unlock()
 	if idle {
 		p.retire()
 	}
-	return true
+	return first
+}
+
+// mayRunResident reports whether sub with args may run on the worker, before one is
+// started: from the last handshake for this key when there was one, otherwise from
+// the one-shot hints. The handshake of the worker that takes the call decides.
+func (s *workerSupervisor) mayRunResident(key workerKey, sub string, args []string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.knownKey == key.id {
+		return s.known.residentFor(sub, args)
+	}
+	return !oneShotHint(sub, args)
+}
+
+// oneShotOnly and oneShotFamilies mirror the one-shot entries of the core's
+// subcommand table (rust-core/src/bin/xmustard-core.rs). They are hints for the time
+// before the first handshake; TestWorkerOneShotHintsMatchTheCore keeps them from
+// sending a resident call to the one-shot path.
+var (
+	oneShotOnly = map[string]bool{
+		"lsp-document-symbols": true, "lsp-hover": true, "lsp-references": true,
+		"lsp-definition": true, "lsp-implementation": true, "lsp-type-definition": true,
+		"lsp-rename": true, "run-verification-command": true, "run-managed-command": true,
+		"run-verification-profile": true, "goal": true, "swarm": true,
+		"semantic-search": true, "bench": true,
+	}
+	oneShotFamilies = map[string]map[string]bool{
+		"changetrack": {"index": true},
+		"symbolgraph": {"build": true, "build-lsp": true, "blast-radius": true},
+	}
+)
+
+func oneShotHint(sub string, args []string) bool {
+	if oneShotOnly[sub] {
+		return true
+	}
+	return len(args) > 0 && oneShotFamilies[sub][args[0]]
 }
 
 func backoff(min, max time.Duration, failures int) time.Duration {
@@ -267,7 +333,11 @@ func (s *workerSupervisor) acquire(ctx context.Context, key workerKey, set worke
 				// it exited; wait until its exit is accounted (onExit), which also
 				// sets the crash backoff, then decide again.
 				s.mu.Unlock()
-				<-p.done
+				select {
+				case <-p.done:
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
 				s.mu.Lock()
 				if s.proc == p {
 					s.proc = nil
@@ -281,13 +351,8 @@ func (s *workerSupervisor) acquire(ctx context.Context, key workerKey, set worke
 				return p, nil
 			}
 			// the configuration changed: retire it once its callers are done.
-			s.proc = nil
-			p.retiring = true
-			idle := p.active == 0
 			s.mu.Unlock()
-			if idle {
-				p.retire()
-			}
+			s.retireProc(p)
 			continue
 		}
 		if wait := s.starting; wait != nil {
@@ -324,6 +389,7 @@ func (s *workerSupervisor) acquire(ctx context.Context, key workerKey, set worke
 		}
 		s.startFails = 0
 		s.proc = p
+		s.knownKey, s.known = key.id, p.residency
 		p.active++
 		s.counters.starts.Add(1)
 		s.mu.Unlock()
@@ -392,19 +458,32 @@ func (s *workerSupervisor) onExit(p *workerProc, err error) {
 	log.Printf("rust-core worker %d exited unexpectedly: %v", p.pid, err)
 }
 
-// workerProc is one running `xmustard-core serve` process.
-type workerProc struct {
-	key     string
-	pid     int
-	cmd     *exec.Cmd
-	stdin   io.WriteCloser
-	untrack func()
+// workerResidency is what a worker's handshake said it runs in-process.
+type workerResidency struct {
 	methods map[string]bool
 	// oneShot lists, per resident family, the first arguments it runs one-shot.
-	oneShot   map[string]map[string]bool
+	oneShot map[string]map[string]bool
+}
+
+// residentFor reports whether the worker runs sub with args in-process.
+func (r workerResidency) residentFor(sub string, args []string) bool {
+	if !r.methods[sub] {
+		return false
+	}
+	return len(args) == 0 || !r.oneShot[sub][args[0]]
+}
+
+// workerProc is one running `xmustard-core serve` process.
+type workerProc struct {
+	key       string
+	pid       int
+	cmd       *exec.Cmd
+	stdin     io.WriteCloser
+	untrack   func()
+	residency workerResidency
 	counters  *workerCounters
 	idleAfter time.Duration
-	onExit    func(*workerProc, error)
+	sup       *workerSupervisor
 
 	writeMu sync.Mutex
 
@@ -432,9 +511,19 @@ type workerCall struct {
 	id        int64
 	scope     *budget.Scope
 	resp      chan workerResult
-	deadline  time.Time
 	abandoned bool
 	timer     *time.Timer
+	// slot releases the call's ChildLimit slot. It runs once, when the worker has
+	// ended the request: answered it, or exited. Guarded by the proc's mu.
+	slot func()
+}
+
+// endSlot releases c's ChildLimit slot once. p.mu must be held.
+func (c *workerCall) endSlot() {
+	if c.slot != nil {
+		c.slot()
+		c.slot = nil
+	}
 }
 
 type workerRPCError struct {
@@ -448,14 +537,6 @@ type workerResult struct {
 	result []byte
 	rpcErr *workerRPCError
 	err    error
-}
-
-// residentFor reports whether the worker runs sub with args in-process.
-func (p *workerProc) residentFor(sub string, args []string) bool {
-	if !p.methods[sub] {
-		return false
-	}
-	return len(args) == 0 || !p.oneShot[sub][args[0]]
 }
 
 func (p *workerProc) isDead() bool {
@@ -487,7 +568,7 @@ func (s *workerSupervisor) startWorker(ctx context.Context, key workerKey, set w
 		done:      make(chan struct{}),
 		counters:  &s.counters,
 		idleAfter: set.idle,
-		onExit:    s.onExit,
+		sup:       s,
 	}
 	cmd.Stderr = &workerLog{proc: p}
 	untrack, err := startTracked(cmd)
@@ -502,7 +583,7 @@ func (s *workerSupervisor) startWorker(ctx context.Context, key workerKey, set w
 	defer cancel()
 	scope := budget.NewScope(nil)
 	defer scope.Close()
-	r := p.call(hctx, scope, "initialize", nil)
+	r := p.call(hctx, scope, nil, "initialize", nil)
 	var init struct {
 		Protocol int                 `json:"protocol"`
 		Methods  []string            `json:"methods"`
@@ -526,31 +607,34 @@ func (s *workerSupervisor) startWorker(ctx context.Context, key workerKey, set w
 		log.Printf("rust-core worker %d did not start: %v", p.pid, err)
 		return nil, fmt.Errorf("start rust-core worker: %w", err)
 	}
-	p.methods = make(map[string]bool, len(init.Methods))
+	p.residency.methods = make(map[string]bool, len(init.Methods))
 	for _, m := range init.Methods {
-		p.methods[m] = true
+		p.residency.methods[m] = true
 	}
-	p.oneShot = make(map[string]map[string]bool, len(init.OneShot))
+	p.residency.oneShot = make(map[string]map[string]bool, len(init.OneShot))
 	for family, subs := range init.OneShot {
-		p.oneShot[family] = make(map[string]bool, len(subs))
+		p.residency.oneShot[family] = make(map[string]bool, len(subs))
 		for _, sub := range subs {
-			p.oneShot[family][sub] = true
+			p.residency.oneShot[family][sub] = true
 		}
 	}
 	p.started.Store(true)
 	return p, nil
 }
 
-// call sends one request and waits for its answer or for ctx to end. A caller that
-// gives up abandons the request (see abandon); its answer is discarded unread.
-func (p *workerProc) call(ctx context.Context, scope *budget.Scope, method string, args []string) workerResult {
-	c := &workerCall{scope: scope, resp: make(chan workerResult, 1)}
-	c.deadline, _ = ctx.Deadline()
+// call sends one request and waits for its answer or for ctx to end. It takes over
+// slot, the caller's ChildLimit release (nil for none), and runs it once the worker
+// has ended the request. A caller that gives up abandons the request (see abandon);
+// its answer is discarded unread. A request that could not be sent fails with
+// errWorkerUnsent.
+func (p *workerProc) call(ctx context.Context, scope *budget.Scope, slot func(), method string, args []string) workerResult {
+	c := &workerCall{scope: scope, resp: make(chan workerResult, 1), slot: slot}
 	p.mu.Lock()
 	if p.dead {
 		err := p.exitErr
+		c.endSlot()
 		p.mu.Unlock()
-		return workerResult{err: err}
+		return workerResult{err: fmt.Errorf("%w: %v", errWorkerUnsent, err)}
 	}
 	p.nextID++
 	c.id = p.nextID
@@ -568,9 +652,21 @@ func (p *workerProc) call(ctx context.Context, scope *budget.Scope, method strin
 		err = p.write(c.id, body)
 	}
 	if err != nil {
-		// a failed write means the process is gone; the read loop fails the call.
+		// The worker's stdin is gone, so the process is dead or dying. Fail this call
+		// now, without waiting for the read loop to see the exit, and mark the process
+		// unusable so later calls do not try it.
+		p.mu.Lock()
+		if p.pending[c.id] == c {
+			delete(p.pending, c.id)
+		}
+		c.endSlot()
+		if !p.dead {
+			p.dead = true
+			p.exitErr = fmt.Errorf("write request: %v", err)
+		}
+		p.mu.Unlock()
 		p.kill()
-		return <-c.resp
+		return workerResult{err: fmt.Errorf("%w: %v", errWorkerUnsent, err)}
 	}
 	select {
 	case r := <-c.resp:
@@ -587,9 +683,9 @@ func (p *workerProc) write(id int64, body []byte) error {
 	return writeWorkerFrame(p.stdin, id, true, body)
 }
 
-// abandon marks c's caller gone, asks the worker to cancel it, and arms the deadline
-// watchdog: a request still unanswered workerKillGrace after its deadline kills the
-// worker.
+// abandon marks c's caller gone, asks the worker to cancel it, and arms the watchdog:
+// a request still unanswered workerKillGrace after it was abandoned retires the
+// worker (see abandonedTooLong). c keeps its ChildLimit slot until the worker ends it.
 func (p *workerProc) abandon(c *workerCall) {
 	p.mu.Lock()
 	if p.pending[c.id] != c {
@@ -597,13 +693,7 @@ func (p *workerProc) abandon(c *workerCall) {
 		return
 	}
 	c.abandoned = true
-	wait := workerKillGrace
-	if !c.deadline.IsZero() {
-		if until := time.Until(c.deadline) + workerKillGrace; until > wait {
-			wait = until
-		}
-	}
-	c.timer = time.AfterFunc(wait, func() { p.deadlineExpired(c) })
+	c.timer = time.AfterFunc(workerKillGrace, func() { p.abandonedTooLong(c) })
 	p.mu.Unlock()
 	p.counters.cancels.Add(1)
 	go func() {
@@ -616,16 +706,21 @@ func (p *workerProc) abandon(c *workerCall) {
 	}()
 }
 
-func (p *workerProc) deadlineExpired(c *workerCall) {
+// abandonedTooLong runs workerKillGrace after c was abandoned. A handler that is
+// still running cannot be interrupted, so the worker is retired and replaced: new
+// calls go to a fresh worker, calls still running on this one finish, and this one
+// exits (abandoned handler included) when the last of them is done.
+func (p *workerProc) abandonedTooLong(c *workerCall) {
 	p.mu.Lock()
 	stillRunning := p.pending[c.id] == c && !p.dead
 	p.mu.Unlock()
-	if !stillRunning {
+	if !stillRunning || p.sup == nil {
 		return
 	}
-	p.counters.deadlineKills.Add(1)
-	log.Printf("rust-core worker %d: request %d outlived its deadline; killing the worker", p.pid, c.id)
-	p.kill()
+	if p.sup.retireProc(p) {
+		p.counters.wedgedRetires.Add(1)
+		log.Printf("rust-core worker %d: abandoned request %d is still running; retiring the worker", p.pid, c.id)
+	}
 }
 
 // deliver completes c with r unless it was already completed.
@@ -639,6 +734,7 @@ func (p *workerProc) deliver(c *workerCall, r workerResult) {
 	if c.timer != nil {
 		c.timer.Stop()
 	}
+	c.endSlot()
 	c.resp <- r
 }
 
@@ -652,6 +748,7 @@ func (p *workerProc) failAllPending(err error) {
 		if c.timer != nil {
 			c.timer.Stop()
 		}
+		c.endSlot()
 		c.resp <- workerResult{err: err}
 		delete(p.pending, id)
 	}
@@ -710,8 +807,8 @@ func (p *workerProc) readLoop(r *bufio.Reader) {
 	if p.untrack != nil {
 		p.untrack()
 	}
-	if p.onExit != nil {
-		p.onExit(p, cause)
+	if p.sup != nil {
+		p.sup.onExit(p, cause)
 	}
 	close(p.done)
 }
@@ -739,6 +836,7 @@ func (p *workerProc) readFrames(r *bufio.Reader) error {
 			if c.timer != nil {
 				c.timer.Stop()
 			}
+			c.endSlot()
 			c = nil
 		}
 		p.mu.Unlock()
@@ -919,6 +1017,9 @@ func runViaWorker(parent context.Context, sub string, args []string) (out []byte
 		return nil, false, nil
 	}
 	s := coreWorker
+	if !s.mayRunResident(key, sub, args) {
+		return nil, false, nil
+	}
 	ctx, cancel := context.WithTimeout(parent, coreCallTimeout)
 	defer cancel()
 	p, err := s.acquire(ctx, key, settings)
@@ -931,24 +1032,33 @@ func runViaWorker(parent context.Context, sub string, args []string) (out []byte
 	}
 	completed := false
 	defer func() { s.release(p, completed) }()
-	if !p.residentFor(sub, args) {
+	if !p.residency.residentFor(sub, args) {
 		return nil, false, nil
 	}
-	release, err := budget.Children.Acquire(parent)
+	// The slot is handed to the call, which releases it when the worker has ended the
+	// request: at once for an answered call, later for an abandoned one that is still
+	// running, so admission counts all Rust work in flight.
+	slot, err := budget.Children.Acquire(parent)
 	if err != nil {
 		return nil, true, fmt.Errorf("rust-core %s: %w", sub, err)
 	}
-	defer release()
 	scope, owned := budget.ScopeFor(parent)
 	if owned {
 		defer scope.Close()
 	}
 	s.counters.calls.Add(1)
-	r := p.call(ctx, scope, sub, args)
+	r := p.call(ctx, scope, slot, sub, args)
 	switch {
 	case r.err != nil:
 		if cerr := callerError(parent, ctx, sub); cerr != nil {
 			return nil, true, cerr
+		}
+		if errors.Is(r.err, errWorkerUnsent) {
+			// nothing ran: the one-shot path takes the call; the next call restarts
+			// the worker.
+			log.Printf("rust-core %s: worker %d unavailable (%v); running one-shot", sub, p.pid, r.err)
+			s.counters.fallbacks.Add(1)
+			return nil, false, nil
 		}
 		if errors.Is(r.err, budget.ErrOverloaded) {
 			log.Printf("rust-core %s: worker output refused by transient budget", sub)

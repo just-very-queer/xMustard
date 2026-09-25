@@ -31,7 +31,10 @@ const (
 // `-`-leading query/path/seed is read literally — no `--` delimiter is required.
 // The child is killed when the caller's ctx is cancelled or coreCallTimeout elapses,
 // whichever comes first. With XMUSTARD_CORE_WORKER on, resident subcommands run on
-// the resident worker instead (worker.go) under the same admission and deadlines.
+// the resident worker instead (worker.go) under the same admission and deadlines. A
+// cancelled worker request returns at once but keeps its child slot until the worker
+// has ended it; a handler still running workerKillGrace later gets its worker retired
+// and replaced.
 //
 // Admission: the child takes a slot from budget.Children, and its captured output is
 // reserved against budget.TransientBytes in chunks BEFORE it is buffered. When ctx

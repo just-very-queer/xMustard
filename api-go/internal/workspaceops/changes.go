@@ -56,7 +56,7 @@ func WorkspaceDrift(dataDir, workspaceID string) (json.RawMessage, error) {
 	return WorkspaceDriftCtx(context.Background(), dataDir, workspaceID)
 }
 
-// WorkspaceDriftCtx is the request-scoped variant: cancelling ctx kills its Rust/tool children.
+// WorkspaceDriftCtx is the request-scoped variant: cancelling ctx cancels its Rust/tool work (see rustcore.runCoreCtx).
 func WorkspaceDriftCtx(ctx context.Context, dataDir, workspaceID string) (json.RawMessage, error) {
 	root, absData, err := resolveChangeRoot(dataDir, workspaceID)
 	if err != nil {
@@ -74,7 +74,7 @@ func WorkspaceChangesSinceIndex(dataDir, workspaceID string) (json.RawMessage, e
 	return WorkspaceChangesSinceIndexCtx(context.Background(), dataDir, workspaceID)
 }
 
-// WorkspaceChangesSinceIndexCtx is the request-scoped variant: cancelling ctx kills its Rust/tool children.
+// WorkspaceChangesSinceIndexCtx is the request-scoped variant: cancelling ctx cancels its Rust/tool work (see rustcore.runCoreCtx).
 func WorkspaceChangesSinceIndexCtx(ctx context.Context, dataDir, workspaceID string) (json.RawMessage, error) {
 	root, absData, err := resolveChangeRoot(dataDir, workspaceID)
 	if err != nil {
@@ -93,7 +93,7 @@ func WorkspaceWorkingChanges(dataDir, workspaceID string) (json.RawMessage, erro
 	return WorkspaceWorkingChangesCtx(context.Background(), dataDir, workspaceID)
 }
 
-// WorkspaceWorkingChangesCtx is the request-scoped variant: cancelling ctx kills its Rust/tool children.
+// WorkspaceWorkingChangesCtx is the request-scoped variant: cancelling ctx cancels its Rust/tool work (see rustcore.runCoreCtx).
 func WorkspaceWorkingChangesCtx(ctx context.Context, dataDir, workspaceID string) (json.RawMessage, error) {
 	root, absData, err := resolveChangeRoot(dataDir, workspaceID)
 	if err != nil {

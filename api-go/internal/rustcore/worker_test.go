@@ -64,6 +64,7 @@ func fakeCore(mode string, args []string) int {
 		return 0
 	}
 	in := bufio.NewReaderSize(os.Stdin, 64<<10)
+	handshaken := false
 	var wmu sync.Mutex
 	send := func(id int64, body string) {
 		wmu.Lock()
@@ -100,6 +101,17 @@ func fakeCore(mode string, args []string) int {
 			continue
 		}
 		id := *req.ID
+		if mode == "deaf" && handshaken {
+			// Answer this request, then live on without the request pipe, as a worker
+			// that died before its exit was noticed: the supervisor's next write fails.
+			// stdin closes before the answer is sent, so no later request can be
+			// written into a pipe that nobody reads.
+			b, _ := json.Marshal(req.Params.Args)
+			os.Stdin.Close()
+			send(id, fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"result":%s}`, id, b))
+			time.Sleep(time.Hour)
+		}
+		handshaken = handshaken || req.Method == "initialize"
 		cancelled := make(chan struct{})
 		cancels.Store(id, cancelled)
 		go func() {
@@ -165,6 +177,7 @@ func resetWorker() {
 	p := s.proc
 	s.proc = nil
 	s.retryKey, s.retryAt, s.startFails, s.crashes = "", time.Time{}, 0, 0
+	s.knownKey, s.known = "", workerResidency{}
 	if p != nil {
 		p.retiring = true
 	}
@@ -352,11 +365,14 @@ func TestWorkerCrashMidRequestFailsTheCallAndTheNextCallRestarts(t *testing.T) {
 	}
 }
 
-func TestWorkerCancelSendsCancelAndReleasesTheChildSlot(t *testing.T) {
+func TestWorkerCancelSendsCancelAndFreesTheSlotWhenTheWorkEnds(t *testing.T) {
 	slots := withChildren(t, 1, 200*time.Millisecond)
 	logPath := useFakeWorker(t, "ok")
 	mustEcho(t, "warm")
-	for _, method := range []string{"sleep", "hang"} {
+	first := CoreWorkerStats().PID
+	before := CoreWorkerStats()
+	cancelled := func(method string) time.Time {
+		t.Helper()
 		ctx, cancel := context.WithCancel(context.Background())
 		done := make(chan error, 1)
 		go func() {
@@ -364,44 +380,55 @@ func TestWorkerCancelSendsCancelAndReleasesTheChildSlot(t *testing.T) {
 			done <- err
 		}()
 		waitFor(t, "the call to hold the slot", 3*time.Second, func() bool { return slots.InUse() == 1 })
+		at := time.Now()
 		cancel()
 		select {
 		case err := <-done:
 			if !errors.Is(err, context.Canceled) {
 				t.Fatalf("%s: cancelled call returned %v", method, err)
 			}
-		case <-time.After(3 * time.Second):
-			t.Fatalf("%s: cancelled call did not return", method)
+		case <-time.After(time.Second):
+			t.Fatalf("%s: a cancelled caller must return at once", method)
 		}
-		if slots.InUse() != 0 {
-			t.Fatalf("%s: slot still held after cancellation", method)
-		}
-		// the single slot is free while the worker still runs (hang) or has just
-		// dropped (sleep) the abandoned request.
-		start := time.Now()
-		mustEcho(t, "next-after-"+method)
-		if time.Since(start) > time.Second {
-			t.Fatalf("%s: the next call waited %v for a slot", method, time.Since(start))
-		}
-		waitFor(t, "the cancel message", 3*time.Second, func() bool {
-			return len(fakeLog(t, logPath, "cancel ")) >= map[string]int{"sleep": 1, "hang": 2}[method]
-		})
+		return at
 	}
-	if n := len(fakeLog(t, logPath, "serve ")); n != 1 {
-		t.Fatalf("cancellation must not restart the worker: %d starts", n)
+
+	// A handler that stops on the cancel message ends at once, and so does its slot.
+	cancelled("sleep")
+	waitFor(t, "the cancelled request to end and free its slot", time.Second, func() bool { return slots.InUse() == 0 })
+	waitFor(t, "the cancel message", 3*time.Second, func() bool { return len(fakeLog(t, logPath, "cancel ")) == 1 })
+	mustEcho(t, "after-sleep")
+
+	// A handler that ignores it keeps running, and keeps its slot: with a limit of one,
+	// no other Rust work is admitted until the worker has been retired and replaced.
+	at := cancelled("hang")
+	waitFor(t, "the cancel message", 3*time.Second, func() bool { return len(fakeLog(t, logPath, "cancel ")) == 2 })
+	if slots.InUse() != 1 {
+		t.Fatal("an abandoned request that is still running must keep its slot")
 	}
-	// the cancelled sleep was answered (-32800) and forgotten; only the hang remains.
-	coreWorker.mu.Lock()
-	p := coreWorker.proc
-	coreWorker.mu.Unlock()
-	waitFor(t, "the cancelled sleep to leave the pending map", 3*time.Second, func() bool {
-		p.mu.Lock()
-		defer p.mu.Unlock()
-		return len(p.pending) == 1
+	if _, err := runCoreCtx(context.Background(), "echo", "blocked"); !errors.Is(err, budget.ErrOverloaded) {
+		t.Fatalf("a call beyond the limit while abandoned work runs: want ErrOverloaded, got %v", err)
+	}
+	waitFor(t, "the wedged worker to exit and free the slot", workerKillGrace+3*time.Second, func() bool {
+		return slots.InUse() == 0 && processGone(first)
 	})
+	if waited := time.Since(at); waited < workerKillGrace {
+		t.Fatalf("the worker was retired %v after the cancel, before the %v grace", waited, workerKillGrace)
+	}
+	mustEcho(t, "after-hang")
+	if n := len(fakeLog(t, logPath, "serve ")); n != 2 {
+		t.Fatalf("want one replacement worker: %d starts", n)
+	}
+	after := CoreWorkerStats()
+	if after.WedgedRetires-before.WedgedRetires != 1 || after.Crashes != before.Crashes || after.PID == first {
+		t.Fatalf("stats before %+v after %+v", before, after)
+	}
+	if slots.Peak() > 1 {
+		t.Fatalf("admission let %d calls run at once with a limit of 1", slots.Peak())
+	}
 }
 
-func TestWorkerRequestPastItsDeadlineKillsAndRestartsTheWorker(t *testing.T) {
+func TestWorkerRequestPastItsDeadlineRetiresAndReplacesTheWorker(t *testing.T) {
 	logPath := useFakeWorker(t, "ok")
 	mustEcho(t, "warm")
 	first := CoreWorkerStats().PID
@@ -412,14 +439,114 @@ func TestWorkerRequestPastItsDeadlineKillsAndRestartsTheWorker(t *testing.T) {
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("want the caller's deadline error, got %v", err)
 	}
-	waitFor(t, "the wedged worker to be killed", workerKillGrace+3*time.Second, func() bool { return processGone(first) })
+	waitFor(t, "the wedged worker to exit", workerKillGrace+3*time.Second, func() bool { return processGone(first) })
 	after := CoreWorkerStats()
-	if after.DeadlineKills-before.DeadlineKills != 1 {
-		t.Fatalf("deadline kills: before %+v after %+v", before, after)
+	if after.WedgedRetires-before.WedgedRetires != 1 || after.Crashes != before.Crashes {
+		t.Fatalf("stats before %+v after %+v", before, after)
 	}
-	mustEcho(t, "after-kill")
+	mustEcho(t, "after-retire")
 	if n := len(fakeLog(t, logPath, "serve ")); n != 2 {
-		t.Fatalf("want a restart after the deadline kill: %d starts", n)
+		t.Fatalf("want a new worker after the retire: %d starts", n)
+	}
+}
+
+func TestWorkerRetiredForAnAbandonedRequestLetsOtherCallsFinish(t *testing.T) {
+	withChildren(t, 4, time.Second)
+	logPath := useFakeWorker(t, "ok")
+	mustEcho(t, "warm")
+	first := CoreWorkerStats().PID
+	before := CoreWorkerStats()
+	other := make(chan error, 1)
+	go func() {
+		out, err := runCoreCtx(context.Background(), "sleep", "5000")
+		if err == nil && string(out) != `"slept"` {
+			err = fmt.Errorf("unexpected output %s", out)
+		}
+		other <- err
+	}()
+	waitFor(t, "the unrelated call to start", 3*time.Second, func() bool {
+		coreWorker.mu.Lock()
+		defer coreWorker.mu.Unlock()
+		return coreWorker.proc != nil && coreWorker.proc.active == 1
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if _, err := runCoreCtx(ctx, "hang"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("want the caller's deadline error, got %v", err)
+	}
+	waitFor(t, "the worker to be retired", workerKillGrace+2*time.Second, func() bool {
+		return CoreWorkerStats().WedgedRetires-before.WedgedRetires == 1
+	})
+	// new calls go to a fresh worker while the retired one finishes its running call.
+	mustEcho(t, "fresh")
+	if pid := CoreWorkerStats().PID; pid == first || pid == 0 {
+		t.Fatalf("a call after the retire ran on worker %d (retired: %d)", pid, first)
+	}
+	if processGone(first) {
+		t.Fatal("the retired worker must stay until its running call has finished")
+	}
+	if err := <-other; err != nil {
+		t.Fatalf("an unrelated call on the retired worker failed: %v", err)
+	}
+	waitFor(t, "the retired worker to exit", 3*time.Second, func() bool { return processGone(first) })
+	if after := CoreWorkerStats(); after.Crashes != before.Crashes {
+		t.Fatalf("a retire is not a crash: before %+v after %+v", before, after)
+	}
+	if n := len(fakeLog(t, logPath, "serve ")); n != 2 {
+		t.Fatalf("want one replacement worker: %d starts", n)
+	}
+}
+
+func TestWorkerThatCannotBeReachedSendsTheCallOneShot(t *testing.T) {
+	logPath := useFakeWorker(t, "deaf")
+	mustEcho(t, "warm")
+	first := CoreWorkerStats().PID
+	before := CoreWorkerStats()
+	start := time.Now()
+	out, err := runCoreCtx(context.Background(), "echo", "x")
+	if err != nil || strings.TrimSpace(string(out)) != `{"oneshot":"echo"}` {
+		t.Fatalf("a request the worker never received must run one-shot: %s %v", out, err)
+	}
+	// it returns as soon as the write fails (plus one one-shot exec), not at its
+	// deadline after waiting for the read loop.
+	if d := time.Since(start); d > 10*time.Second {
+		t.Fatalf("the unsent call waited %v", d)
+	}
+	waitFor(t, "the unreachable worker to be ended", 3*time.Second, func() bool { return processGone(first) })
+	after := CoreWorkerStats()
+	if after.Fallbacks-before.Fallbacks != 1 {
+		t.Fatalf("stats before %+v after %+v", before, after)
+	}
+	// the next call starts a new worker (which is deaf too, after its handshake).
+	if _, err := runCoreCtx(context.Background(), "echo", "y"); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(fakeLog(t, logPath, "serve ")); n != 2 {
+		t.Fatalf("want a restart after the unreachable worker: %d starts", n)
+	}
+}
+
+func TestWorkerIsNotStartedForOneShotOnlyCalls(t *testing.T) {
+	t.Setenv("XMUSTARD_CORE_WORKER_START_MS", "1500")
+	logPath := useFakeWorker(t, "nohandshake")
+	before := CoreWorkerStats()
+	for _, call := range [][]string{
+		{"lsp-hover", "x"}, {"goal", "list"}, {"symbolgraph", "build", "/r", "ws"},
+		{"symbolgraph", "blast-radius", "/r", "ws", "X"}, {"changetrack", "index", "/d", "/r", "ws"},
+	} {
+		out, err := runCoreCtx(context.Background(), call[0], call[1:]...)
+		if err != nil || strings.TrimSpace(string(out)) != fmt.Sprintf(`{"oneshot":%q}`, call[0]) {
+			t.Fatalf("%v: want the one-shot result, got %s %v", call, out, err)
+		}
+	}
+	// a start attempt would have waited out the 1.5 s handshake bound and counted a
+	// start failure and a fallback.
+	if n := len(fakeLog(t, logPath, "serve ")); n != 0 {
+		t.Fatalf("one-shot-only calls started %d workers", n)
+	}
+	after := CoreWorkerStats()
+	if after.StartFailures != before.StartFailures || after.Fallbacks != before.Fallbacks {
+		t.Fatalf("stats before %+v after %+v", before, after)
 	}
 }
 
@@ -784,5 +911,131 @@ func TestWorkerMatchesOneShotWithTheRealCoreAndSpawnsOnce(t *testing.T) {
 	_, err := runCoreCtx(context.Background(), "explain-path", "ws", root, "missing.go")
 	if err == nil || err.Error() != "rust-core explain-path failed" {
 		t.Fatalf("missing path through the worker: %v", err)
+	}
+}
+
+// The one-shot hints must never send a call the core runs in-process to the
+// one-shot path, and must name every one-shot subcommand of a resident family.
+func TestWorkerOneShotHintsMatchTheCore(t *testing.T) {
+	core := realCore(t)
+	t.Setenv("XMUSTARD_CORE_BIN", core)
+	t.Setenv("XMUSTARD_CORE_WORKER", "1")
+	resetWorker()
+	t.Cleanup(resetWorker)
+	set := readWorkerSettings()
+	key, ok := workerKeyFor(set)
+	if !ok {
+		t.Fatal("no worker key for the real core")
+	}
+	p, err := coreWorker.acquire(context.Background(), key, set)
+	if err != nil {
+		t.Fatal(err)
+	}
+	coreWorker.release(p, true)
+	for name := range oneShotOnly {
+		if p.residency.methods[name] {
+			t.Errorf("hint sends %s one-shot, but the core runs it in-process", name)
+		}
+	}
+	for family, subs := range oneShotFamilies {
+		if !p.residency.methods[family] {
+			t.Errorf("family %s is not resident in the core", family)
+		}
+		for sub := range subs {
+			if !p.residency.oneShot[family][sub] {
+				t.Errorf("hint sends %s %s one-shot, but the core runs it in-process", family, sub)
+			}
+		}
+	}
+	for family, subs := range p.residency.oneShot {
+		for sub := range subs {
+			if !oneShotFamilies[family][sub] {
+				t.Errorf("the core runs %s %s one-shot; add it to oneShotFamilies", family, sub)
+			}
+		}
+	}
+	if !mustKnow(t, key).residentFor("search", nil) {
+		t.Fatal("the supervisor did not keep the handshake's residency")
+	}
+}
+
+func mustKnow(t *testing.T, key workerKey) workerResidency {
+	t.Helper()
+	coreWorker.mu.Lock()
+	defer coreWorker.mu.Unlock()
+	if coreWorker.knownKey != key.id {
+		t.Fatal("no handshake recorded for this key")
+	}
+	return coreWorker.known
+}
+
+// When the real worker dies mid-request, the call fails at once and the next call
+// starts a new worker, even while a process a git child left behind is still
+// running: the worker's protocol stream is close-on-exec, so no descendant holds it
+// open and the supervisor sees the exit.
+func TestWorkerCrashWithTheRealCoreIsSeenAtOnce(t *testing.T) {
+	core := realCore(t)
+	root := gitFixture(t)
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Skip("git not on PATH")
+	}
+	bin := t.TempDir()
+	pids := filepath.Join(bin, "pids")
+	script := "#!/bin/sh\nsleep 30 </dev/null >/dev/null 2>&1 &\necho $! >> '" + pids + "'\nsleep 0.3\nexec '" + realGit + "' \"$@\"\n"
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		raw, _ := os.ReadFile(pids)
+		for _, f := range strings.Fields(string(raw)) {
+			if pid, err := strconv.Atoi(f); err == nil {
+				_ = syscall.Kill(pid, syscall.SIGKILL)
+			}
+		}
+	})
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("XMUSTARD_CORE_BIN", core)
+	t.Setenv("XMUSTARD_CORE_WORKER", "1")
+	resetWorker()
+	t.Cleanup(resetWorker)
+
+	if _, err := runCoreCtx(context.Background(), "repo-key", root); err != nil {
+		t.Fatalf("warm call: %v", err)
+	}
+	victim := CoreWorkerStats().PID
+	before := CoreWorkerStats()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := runCoreCtx(ctx, "repo-key", root)
+		done <- err
+	}()
+	time.Sleep(200 * time.Millisecond)
+	if err := syscall.Kill(victim, syscall.SIGKILL); err != nil {
+		t.Fatal(err)
+	}
+	killed := time.Now()
+	select {
+	case err := <-done:
+		if err == nil || err.Error() != "rust-core repo-key failed" {
+			t.Fatalf("a call in flight on a killed worker: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a call in flight on a killed worker did not fail within 5 s")
+	}
+	t.Logf("in-flight call failed %v after the kill", time.Since(killed).Round(time.Millisecond))
+	waitFor(t, "the crash to be accounted", 3*time.Second, func() bool {
+		return CoreWorkerStats().Crashes-before.Crashes == 1
+	})
+	if _, err := runCoreCtx(context.Background(), "repo-key", root); err != nil {
+		t.Fatalf("the call after the crash must restart the worker: %v", err)
+	}
+	if pid := CoreWorkerStats().PID; pid == victim || pid == 0 {
+		t.Fatalf("no new worker after the crash (pid %d)", pid)
+	}
+	if raw, _ := os.ReadFile(pids); len(strings.Fields(string(raw))) == 0 {
+		t.Fatal("no git child left a process behind, so this test proves nothing")
 	}
 }
