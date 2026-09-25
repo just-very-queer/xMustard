@@ -428,6 +428,9 @@ func (s *Store) Capture(ctx context.Context, sp *Spool, req CaptureRequest) (*De
 		return nil, err
 	}
 	budget.NoteCapture(sp.n)
+	// Captures stream in O(window) memory and never use the heavy slot; anything this
+	// capture calls (reduction, identity sampling) must not wait for it either.
+	ctx = budget.WithoutHeavyWait(ctx)
 	d := &Delivery{Delivery: DeliveryVersion, Tool: req.Tool, CallID: req.CallID, Status: req.Status,
 		IsError: req.IsError, ContentType: req.ContentType, RawBytes: sp.n, RawSHA256: sum, Reducer: ReducerVersion}
 	proj, rec, err := Reduce(ctx, sp.f, sp.n, req.ContentType, s.limits.ProjectionTarget, s.limits.MaxProjection)

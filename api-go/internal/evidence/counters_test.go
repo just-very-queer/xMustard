@@ -2,7 +2,10 @@ package evidence
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"testing"
+	"time"
 
 	"xmustard/api-go/internal/budget"
 )
@@ -32,5 +35,52 @@ func TestCaptureIncrementsDataMovementCounters(t *testing.T) {
 	}
 	if got := after.BytesHashed - before.BytesHashed; got != raw {
 		t.Fatalf("hashed bytes counted %d, want %d", got, raw)
+	}
+}
+
+// No capture path waits on the heavy slot: work a capture triggers (here, identity
+// sampling) runs under a WithoutHeavyWait context, so heavy admission from it fails at
+// once while heavy work holds the slot instead of waiting for the bound.
+func TestCaptureNeverWaitsOnHeavySlot(t *testing.T) {
+	prev := budget.Gov
+	budget.Gov = budget.NewProcessGovernor(budget.GovernorConfig{SoftCeilingBytes: 1 << 40, HeavyWait: 10 * time.Second})
+	defer func() { budget.Gov = prev }()
+	release, err := budget.AcquireHeavy(context.Background(), "index_writer", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+
+	s, _ := testStore(t, nil)
+	sp, err := s.NewSpool("ws")
+	if err != nil {
+		t.Fatal(err)
+	}
+	big := bytes.Repeat([]byte(`{"kind":"symbol","name":"ok","path":"src/f.go"},`), 20000)
+	if _, err := sp.Write(append(append([]byte(`{"hits":[`), big...), []byte(`{}]}`)...)); err != nil {
+		t.Fatal(err)
+	}
+	var heavyErr error
+	var waited time.Duration
+	start := time.Now()
+	_, err = s.Capture(context.Background(), sp, CaptureRequest{WorkspaceID: "ws", Tool: "search", Status: 200, ContentType: "application/json",
+		RepoKey: func(ctx context.Context) Identity {
+			t0 := time.Now()
+			if r, e := budget.AcquireHeavy(ctx, "capture_side_work", 0); e == nil {
+				r()
+			} else {
+				heavyErr = e
+			}
+			waited = time.Since(t0)
+			return Identity{}
+		}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !errors.Is(heavyErr, budget.ErrOverloaded) || waited > time.Second || time.Since(start) > 3*time.Second {
+		t.Fatalf("capture side work must be refused at once, not wait: err=%v waited=%s", heavyErr, waited)
+	}
+	if st := budget.Status().HeavySlot; st.QueueLen != 0 || st.RefusedHotPath != 1 {
+		t.Fatalf("capture must never queue for the heavy slot: %+v", st)
 	}
 }
