@@ -66,9 +66,9 @@ func psSnapshot(ctx context.Context) ([]psProc, error) {
 	return procs, sc.Err()
 }
 
-// RoleKiB is one role's RSS in a sample.
-type RoleKiB struct {
-	Role   string `json:"role"`
+// RSSPart is the RSS of one role (xmustard-api, child:git, ...) or one phase.
+type RSSPart struct {
+	Name   string `json:"name"`
 	RSSKiB int64  `json:"rss_kib"`
 	Procs  int    `json:"procs"`
 }
@@ -81,9 +81,9 @@ type RSSSummary struct {
 	PSFailures      int       `json:"ps_failures"`
 	XmPeakKiB       int64     `json:"xmustard_peak_kib"`
 	XmPeakPhase     string    `json:"xmustard_peak_phase,omitempty"`
-	XmPeakRoles     []RoleKiB `json:"xmustard_peak_roles,omitempty"`
-	XmPeakByPhase   []RoleKiB `json:"xmustard_peak_by_phase,omitempty"` // Role holds the phase name
-	AgentPeakKiB    int64     `json:"agent_peak_kib"`                   // external line
+	XmPeakRoles     []RSSPart `json:"xmustard_peak_roles,omitempty"`
+	XmPeakByPhase   []RSSPart `json:"xmustard_peak_by_phase,omitempty"`
+	AgentPeakKiB    int64     `json:"agent_peak_kib"` // external line
 	XmWithinGate    *bool     `json:"xmustard_within_gate,omitempty"`
 	GateBytes       int64     `json:"gate_bytes"`
 	XmRolesObserved []string  `json:"xmustard_roles_observed,omitempty"`
@@ -160,10 +160,10 @@ func (s *rssSampler) sampleOnce() {
 		s.sum.PSFailures++
 		return
 	}
-	xm, agent := attribute(procs, s.xmRoots, s.agentRoot)
+	xm, agent := splitTrees(procs, s.xmRoots, s.agentRoot)
 	s.sum.Samples++
 	var xmTotal, agentTotal int64
-	roles := map[string]*RoleKiB{}
+	roles := map[string]*RSSPart{}
 	for _, p := range xm {
 		xmTotal += p.rssKiB
 		role := p.comm
@@ -173,7 +173,7 @@ func (s *rssSampler) sampleOnce() {
 		s.seenRoles[role] = true
 		r := roles[role]
 		if r == nil {
-			r = &RoleKiB{Role: role}
+			r = &RSSPart{Name: role}
 			roles[role] = r
 		}
 		r.RSSKiB += p.rssKiB
@@ -192,7 +192,7 @@ func (s *rssSampler) sampleOnce() {
 	}
 	found := false
 	for i := range s.sum.XmPeakByPhase {
-		if s.sum.XmPeakByPhase[i].Role == s.phase {
+		if s.sum.XmPeakByPhase[i].Name == s.phase {
 			found = true
 			if xmTotal > s.sum.XmPeakByPhase[i].RSSKiB {
 				s.sum.XmPeakByPhase[i].RSSKiB = xmTotal
@@ -201,7 +201,7 @@ func (s *rssSampler) sampleOnce() {
 		}
 	}
 	if !found {
-		s.sum.XmPeakByPhase = append(s.sum.XmPeakByPhase, RoleKiB{Role: s.phase, RSSKiB: xmTotal, Procs: len(xm)})
+		s.sum.XmPeakByPhase = append(s.sum.XmPeakByPhase, RSSPart{Name: s.phase, RSSKiB: xmTotal, Procs: len(xm)})
 	}
 	s.sum.AgentPeakKiB = max(s.sum.AgentPeakKiB, agentTotal)
 	if s.out != nil {
@@ -210,9 +210,9 @@ func (s *rssSampler) sampleOnce() {
 	}
 }
 
-// attribute splits a snapshot into the xMustard-owned tree and the agent's external
+// splitTrees splits a snapshot into the xMustard-owned tree and the agent's external
 // tree.
-func attribute(procs []psProc, xmRoots []int, agentRoot int) (xm, agent []psProc) {
+func splitTrees(procs []psProc, xmRoots []int, agentRoot int) (xm, agent []psProc) {
 	byPID := make(map[int]psProc, len(procs))
 	children := map[int][]int{}
 	for _, p := range procs {

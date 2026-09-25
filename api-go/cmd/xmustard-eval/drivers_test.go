@@ -32,8 +32,8 @@ func TestParseClaudeFinalEvent(t *testing.T) {
 	if tr.CostUSD == nil || *tr.CostUSD != 0.1234 || tr.CostSource != CostClientFinal {
 		t.Fatalf("cost %v %s", tr.CostUSD, tr.CostSource)
 	}
-	if tr.NumTurns != 4 || tr.Model != "claude-sonnet-4-5" || tr.UnparsedLine != 1 {
-		t.Fatalf("turns %d model %q unparsed %d", tr.NumTurns, tr.Model, tr.UnparsedLine)
+	if tr.NumTurns != 4 || tr.Model != "claude-sonnet-4-5" || tr.UnparsedLines != 1 {
+		t.Fatalf("turns %d model %q unparsed %d", tr.NumTurns, tr.Model, tr.UnparsedLines)
 	}
 	if tr.ToolCalls["mcp__xmustard__recall"] != 1 || tr.ToolCalls["Bash"] != 1 || tr.ToolCalls["mcp__serena__find_symbol"] != 1 {
 		t.Fatalf("tool calls %v", tr.ToolCalls)

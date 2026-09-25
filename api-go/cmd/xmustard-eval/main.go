@@ -316,7 +316,7 @@ func validateOneOracle(ctx context.Context, corpus *Corpus, t *Task, work, logRo
 	if t.Reference == nil {
 		return fail(errors.New("no reference patch: an oracle cannot be validated without one"))
 	}
-	repo, sha, err := materializeRepo(corpus, t, filepath.Join(work, "repos"))
+	repo, sha, err := prepareRepo(corpus, t, filepath.Join(work, "repos"))
 	if err != nil {
 		return fail(err)
 	}

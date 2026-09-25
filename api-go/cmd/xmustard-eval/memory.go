@@ -85,12 +85,12 @@ type MemoryMetrics struct {
 	StaleServedFlagged     int            `json:"stale_served_flagged"`
 	SupersededServedRate   *float64       `json:"superseded_served_rate,omitempty"`
 	DuplicatePairs         int            `json:"duplicate_pairs"`
-	DuplicateServedTogeth  int            `json:"duplicate_served_together"`
+	DuplicateTogether      int            `json:"duplicate_served_together"`
 	DuplicateRate          *float64       `json:"duplicate_rate,omitempty"`
 	ContradictionPairs     int            `json:"contradiction_pairs"`
 	ContradictionServed    int            `json:"contradiction_pairs_served"`
 	ContradictionFlagged   int            `json:"contradiction_pairs_flagged"`
-	FlaggedPairs           int            `json:"conflict_pairs_flagged"`
+	ConflictPairs          int            `json:"conflict_pairs_flagged"`
 	ContradictionPrecision *float64       `json:"contradiction_precision,omitempty"`
 	ContradictionRecall    *float64       `json:"contradiction_recall,omitempty"`
 	ScopeLeakage           int            `json:"scope_leakage"`  // foreign-scope memories delivered; must be 0
@@ -239,7 +239,7 @@ func memoryMetrics(taskID string, m *MemorySpec, xm []ToolResult, seeds []SeedRe
 				either = either || a || b
 			}
 			if together {
-				mm.DuplicateServedTogeth++
+				mm.DuplicateTogether++
 			}
 			if either {
 				eitherServed++
@@ -249,7 +249,7 @@ func memoryMetrics(taskID string, m *MemorySpec, xm []ToolResult, seeds []SeedRe
 			contradiction[pairKey(s.Key, s.Contradicts)] = true
 		}
 	}
-	mm.DuplicateRate = ratio(mm.DuplicateServedTogeth, eitherServed)
+	mm.DuplicateRate = ratio(mm.DuplicateTogether, eitherServed)
 
 	// contradictions: the server's conflict groups are compared with labeled pairs
 	// whose two sides were both delivered.
@@ -262,7 +262,7 @@ func memoryMetrics(taskID string, m *MemorySpec, xm []ToolResult, seeds []SeedRe
 			}
 		}
 	}
-	mm.FlaggedPairs = len(flagged)
+	mm.ConflictPairs = len(flagged)
 	truePos := 0
 	for p := range flagged {
 		if contradiction[p] {

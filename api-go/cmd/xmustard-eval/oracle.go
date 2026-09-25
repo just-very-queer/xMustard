@@ -221,9 +221,9 @@ func resolveContainment(mode string) (string, error) {
 	return "", fmt.Errorf("unknown containment %q (auto, sandbox-exec, bwrap, none)", mode)
 }
 
-// canonicalHidden resolves symlinks (macOS /tmp is /private/tmp; sandbox rules match
+// realPaths resolves symlinks (macOS /tmp is /private/tmp, and sandbox rules match
 // real paths) and drops paths that do not exist.
-func canonicalHidden(paths []string) []string {
+func realPaths(paths []string) []string {
 	var out []string
 	for _, p := range paths {
 		if real, err := filepath.EvalSymlinks(p); err == nil {
@@ -237,8 +237,8 @@ func canonicalHidden(paths []string) []string {
 // contain wraps inv so the client can neither read nor write the hidden paths, and
 // cannot write the read-only ones (the scratch repositories every run borrows from).
 func contain(mode string, hidden, readOnly []string, inv Invocation) (Invocation, error) {
-	hidden = canonicalHidden(hidden)
-	readOnly = canonicalHidden(readOnly)
+	hidden = realPaths(hidden)
+	readOnly = realPaths(readOnly)
 	switch mode {
 	case ContainNone, "":
 		return inv, nil

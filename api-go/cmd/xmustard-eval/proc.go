@@ -1,5 +1,3 @@
-//go:build unix
-
 package main
 
 import (
@@ -36,9 +34,4 @@ func killGroup(pid int, grace time.Duration) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	_ = syscall.Kill(-pid, syscall.SIGKILL)
-}
-
-// groupAlive reports whether any process of the group led by pid is still running.
-func groupAlive(pid int) bool {
-	return pid > 0 && syscall.Kill(-pid, 0) == nil
 }

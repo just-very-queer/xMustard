@@ -179,7 +179,7 @@ func (w *Worktree) gone() bool {
 	return err == nil && !registered
 }
 
-// registered reports whether git still lists dir as a worktree of repo.
+// registeredWorktree reports whether git still lists dir as a worktree of repo.
 func registeredWorktree(repo, dir string) (bool, error) {
 	out, err := git(repo, "worktree", "list", "--porcelain")
 	if err != nil {

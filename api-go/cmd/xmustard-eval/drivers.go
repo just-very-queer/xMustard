@@ -53,22 +53,22 @@ type ToolResult struct {
 
 // Transcript is what the harness extracts from one client event stream.
 type Transcript struct {
-	FinalEvent   bool           `json:"final_event"`
-	FinalKind    string         `json:"final_kind,omitempty"`
-	Usage        Usage          `json:"usage"`
-	UsageSource  string         `json:"usage_source,omitempty"`
-	CostUSD      *float64       `json:"cost_usd,omitempty"`
-	CostSource   string         `json:"cost_source"`
-	Model        string         `json:"model,omitempty"`
-	NumTurns     int            `json:"num_turns"`
-	IsError      bool           `json:"is_error,omitempty"`
-	ErrorText    string         `json:"error_text,omitempty"`
-	ToolCalls    map[string]int `json:"tool_calls"`
-	MCPServers   []string       `json:"mcp_servers,omitempty"`
-	XmResults    []ToolResult   `json:"xmustard_results,omitempty"`
-	PeerResults  []ToolResult   `json:"peer_results,omitempty"`
-	Events       int            `json:"events"`
-	UnparsedLine int            `json:"unparsed_lines,omitempty"`
+	FinalEvent    bool           `json:"final_event"`
+	FinalKind     string         `json:"final_kind,omitempty"`
+	Usage         Usage          `json:"usage"`
+	UsageSource   string         `json:"usage_source,omitempty"`
+	CostUSD       *float64       `json:"cost_usd,omitempty"`
+	CostSource    string         `json:"cost_source"`
+	Model         string         `json:"model,omitempty"`
+	NumTurns      int            `json:"num_turns"`
+	IsError       bool           `json:"is_error,omitempty"`
+	ErrorText     string         `json:"error_text,omitempty"`
+	ToolCalls     map[string]int `json:"tool_calls"`
+	MCPServers    []string       `json:"mcp_servers,omitempty"`
+	XmResults     []ToolResult   `json:"xmustard_results,omitempty"`
+	PeerResults   []ToolResult   `json:"peer_results,omitempty"`
+	Events        int            `json:"events"`
+	UnparsedLines int            `json:"unparsed_lines,omitempty"`
 }
 
 // Cost sources.
@@ -635,7 +635,7 @@ func eachJSONLine(r io.Reader, t *Transcript, fn func(map[string]any)) {
 				t.Events++
 				fn(ev)
 			} else {
-				t.UnparsedLine++
+				t.UnparsedLines++
 			}
 		}
 		if err != nil {

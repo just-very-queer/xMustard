@@ -333,12 +333,12 @@ func TestHiddenOracleIsolation(t *testing.T) {
 func TestWorktreeDetachedAndRemoved(t *testing.T) {
 	c := loadTestCorpus(t, writeFixtureCorpus(t, nil))
 	cache := t.TempDir()
-	repo, sha, err := materializeRepo(c, &c.Tasks[0], cache)
+	repo, sha, err := prepareRepo(c, &c.Tasks[0], cache)
 	if err != nil {
 		t.Fatal(err)
 	}
 	// fixtures commit deterministically
-	repo2, sha2, err := materializeRepo(c, &c.Tasks[0], t.TempDir())
+	repo2, sha2, err := prepareRepo(c, &c.Tasks[0], t.TempDir())
 	if err != nil || sha2 != sha || repo2 == repo {
 		t.Fatalf("fixture sha not deterministic: %s vs %s (%v)", sha, sha2, err)
 	}
@@ -388,7 +388,7 @@ func TestPathRepoHistoryStopsAtRef(t *testing.T) {
 	mustWrite(t, filepath.Join(dir, "o.sh"), "true\n")
 	mustWrite(t, filepath.Join(dir, "c.yaml"), "schema: xmustard.eval/v1\nname: p\ntasks:\n  - id: p\n    class: bugfix\n    repo: {path: "+src+", ref: "+base+"}\n    prompt: x\n    oracle: {cmd: [sh, -c, 'true']}\n")
 	c := loadTestCorpus(t, filepath.Join(dir, "c.yaml"))
-	repo, sha, err := materializeRepo(c, &c.Tasks[0], t.TempDir())
+	repo, sha, err := prepareRepo(c, &c.Tasks[0], t.TempDir())
 	if err != nil || sha != base {
 		t.Fatalf("materialize: %s %v", sha, err)
 	}
@@ -407,7 +407,7 @@ func TestPathRepoHistoryStopsAtRef(t *testing.T) {
 // configures stays in its own per-run repository.
 func TestRunsDoNotShareRepositoryState(t *testing.T) {
 	c := loadTestCorpus(t, writeFixtureCorpus(t, nil))
-	scratch, sha, err := materializeRepo(c, &c.Tasks[0], t.TempDir())
+	scratch, sha, err := prepareRepo(c, &c.Tasks[0], t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}

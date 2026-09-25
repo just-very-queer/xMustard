@@ -428,12 +428,12 @@ func isWithin(path, dir string) bool {
 // fixtureEpoch pins fixture commits so the same fixture always yields the same sha.
 const fixtureEpoch = "2026-01-01T00:00:00Z"
 
-// materializeRepo prepares the scratch repository worktrees are created from and
-// returns it with the full commit sha of the task's starting point. A fixture becomes
+// prepareRepo builds the scratch repository that per-run repositories borrow objects
+// from, and returns it with the full sha of the task's starting commit. A fixture becomes
 // a fresh single-commit repository with a pinned author and date. A path repository
 // is fetched into a scratch repository with history only up to its ref, so an agent
 // cannot find the future fix through `git log --all`.
-func materializeRepo(c *Corpus, t *Task, cacheDir string) (repo, sha string, err error) {
+func prepareRepo(c *Corpus, t *Task, cacheDir string) (repo, sha string, err error) {
 	repo = filepath.Join(cacheDir, t.ID)
 	if err := os.RemoveAll(repo); err != nil {
 		return "", "", err
@@ -512,8 +512,9 @@ func copyTree(src, dst string) error {
 	})
 }
 
-// git runs a git command in dir with hooks and the system/global config neutralised
-// where it could change results, returning trimmed stdout.
+// git runs a git command in dir and returns its trimmed stdout. Hooks, CRLF
+// conversion and the global excludes file are off, so results do not depend on the
+// operator's git setup.
 func git(dir string, args ...string) (string, error) {
 	return gitEnv(dir, nil, args...)
 }

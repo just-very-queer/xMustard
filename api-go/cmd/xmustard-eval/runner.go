@@ -76,6 +76,7 @@ type RunConfig struct {
 	outDir   string
 	workRoot string
 	contain  string
+	hidden   []string // paths the agent may neither read nor write
 	// dry-run knobs (never read from YAML)
 	fakeProbe   []string
 	fakeSleepMS int
@@ -211,12 +212,12 @@ func (c *RunConfig) prepare(corpus *Corpus, outDir string) error {
 	}
 	c.outDir = abs
 	// Anything the sandboxed agent must execute or load cannot live in a hidden path.
-	hidden := append(corpus.hiddenPaths(), c.outDir)
+	c.hidden = append(corpus.hiddenPaths(), c.outDir)
 	for _, p := range []string{c.Stack.MCPBin, c.client().Extension, c.client().Bin} {
 		if p == "" || !filepath.IsAbs(p) {
 			continue
 		}
-		for _, h := range hidden {
+		for _, h := range c.hidden {
 			if p == h || isWithin(p, h) {
 				errs = append(errs, fmt.Errorf("%s is inside %s, which the agent cannot read", p, h))
 			}
@@ -300,7 +301,6 @@ type executor struct {
 	corpus      *Corpus
 	driver      Driver
 	registry    *worktreeRegistry
-	hidden      []string
 	userServers []string
 	runsFile    *os.File
 }
@@ -331,7 +331,6 @@ func Execute(ctx context.Context, cfg *RunConfig, corpus *Corpus) (*Report, erro
 	}
 	ex := &executor{cfg: cfg, corpus: corpus, driver: d, registry: newWorktreeRegistry()}
 	defer func() { _ = ex.registry.removeAll() }()
-	ex.hidden = append(corpus.hiddenPaths(), cfg.outDir)
 
 	m := &Manifest{Schema: manifestSchema, StartedAt: nowUTC(), Corpus: corpus.Path, CorpusName: corpus.Name,
 		CorpusSHA256: corpus.SHA256, Config: *cfg, Containment: cfg.contain, DryRun: cfg.Fake || cfg.Stack.Kind == StackStub,
@@ -369,10 +368,10 @@ func Execute(ctx context.Context, cfg *RunConfig, corpus *Corpus) (*Report, erro
 	}
 	defer ex.runsFile.Close()
 
-	type prepared struct {
+	type source struct {
 		repo, sha, err string
 	}
-	repos := map[string]prepared{}
+	repos := map[string]source{}
 	var tasks []*Task
 	for i := range corpus.Tasks {
 		t := &corpus.Tasks[i]
@@ -380,8 +379,8 @@ func Execute(ctx context.Context, cfg *RunConfig, corpus *Corpus) (*Report, erro
 			continue
 		}
 		tasks = append(tasks, t)
-		repo, sha, err := materializeRepo(corpus, t, filepath.Join(workRoot, "repos"))
-		p := prepared{repo: repo, sha: sha}
+		repo, sha, err := prepareRepo(corpus, t, filepath.Join(workRoot, "repos"))
+		p := source{repo: repo, sha: sha}
 		if err != nil {
 			p.err = err.Error()
 		}
@@ -614,12 +613,12 @@ func (ex *executor) runOne(ctx context.Context, t *Task, arm Arm, rep int, repo,
 			return fail(StatusError, err.Error())
 		}
 	}
-	if inv, err = contain(cfg.contain, ex.hidden, []string{filepath.Join(cfg.workRoot, "repos")}, inv); err != nil {
+	if inv, err = contain(cfg.contain, cfg.hidden, []string{filepath.Join(cfg.workRoot, "repos")}, inv); err != nil {
 		return fail(StatusError, err.Error())
 	}
 	sampler.setPhase("agent")
 	exit, err := runClient(ctx, ex.driver, inv, wt.Dir, prompt, filepath.Join(art, "transcript.jsonl"), filepath.Join(art, "client.stderr.log"),
-		secondsOr(0, corpus.timeoutSec(t)), sampler.setAgentRoot)
+		time.Duration(corpus.timeoutSec(t))*time.Second, sampler.setAgentRoot)
 	sampler.setPhase("post")
 	finishSampler()
 	rec.Client = &exit

@@ -61,11 +61,11 @@ func TestMemoryMetricsScoreDeliveries(t *testing.T) {
 	if *mm.CurrentFactRecall != 1 || *mm.SupersededServedRate != 1 || *mm.StaleServedRate != 0 || mm.StaleServedFlagged != 1 {
 		t.Fatalf("recall/superseded/stale: %+v", mm)
 	}
-	if mm.DuplicatePairs != 1 || mm.DuplicateServedTogeth != 1 || *mm.DuplicateRate != 1 {
+	if mm.DuplicatePairs != 1 || mm.DuplicateTogether != 1 || *mm.DuplicateRate != 1 {
 		t.Fatalf("duplicates: %+v", mm)
 	}
 	// 4 entries in one group = 6 flagged pairs, one of which is the labeled contradiction
-	if mm.ContradictionPairs != 1 || mm.ContradictionServed != 1 || mm.ContradictionFlagged != 1 || mm.FlaggedPairs != 6 ||
+	if mm.ContradictionPairs != 1 || mm.ContradictionServed != 1 || mm.ContradictionFlagged != 1 || mm.ConflictPairs != 6 ||
 		*mm.ContradictionRecall != 1 || *mm.ContradictionPrecision != 1.0/6 {
 		t.Fatalf("contradictions: %+v", mm)
 	}

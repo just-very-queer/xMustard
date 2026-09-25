@@ -133,15 +133,15 @@ type NotCompletedRun struct {
 
 // RSSGateSummary is the sampled xMustard-tree peak across runs, against the gate.
 type RSSGateSummary struct {
-	GateBytes      int64    `json:"gate_bytes"`
-	RunsSampled    int      `json:"runs_with_xmustard_samples"`
-	MaxXmKiB       int64    `json:"max_xmustard_peak_kib"`
-	MaxXmRun       string   `json:"max_xmustard_peak_run,omitempty"`
-	OverGate       []string `json:"runs_over_gate,omitempty"`
-	MaxAgentKiB    int64    `json:"max_agent_peak_kib"`
-	ExecutorBytes  int64    `json:"executor_max_rss_bytes,omitempty"` // separate line, outside the tree
-	Note           string   `json:"note"`
-	StackIsProduct bool     `json:"stack_is_product"`
+	GateBytes     int64    `json:"gate_bytes"`
+	RunsSampled   int      `json:"runs_with_xmustard_samples"`
+	MaxXmKiB      int64    `json:"max_xmustard_peak_kib"`
+	MaxXmRun      string   `json:"max_xmustard_peak_run,omitempty"`
+	OverGate      []string `json:"runs_over_gate,omitempty"`
+	MaxAgentKiB   int64    `json:"max_agent_peak_kib"`
+	ExecutorBytes int64    `json:"executor_max_rss_bytes,omitempty"` // separate line, outside the tree
+	Note          string   `json:"note"`
+	RealStack     bool     `json:"real_stack"`
 }
 
 // writeReport rebuilds report.json and report.md from the output directory.
@@ -212,7 +212,7 @@ func buildReport(m *Manifest, recs []RunRecord) *Report {
 	r := &Report{Schema: reportSchema, Corpus: m.CorpusName, CorpusSHA256: m.CorpusSHA256, Driver: cfg.Driver, Model: cfg.Model,
 		ClientVersion: m.ClientVersion, DryRun: m.DryRun, Interrupted: m.Interrupted, Stack: cfg.Stack.Kind, Containment: m.Containment,
 		Seed: cfg.Seed, Repeats: cfg.Repeats, ReferenceArm: cfg.ReferenceArm, Arms: slices.Clone(cfg.Arms), Threshold: cfg.Thresholds,
-		Counts: map[string]int{}, RSSGate: RSSGateSummary{GateBytes: GateBytes, StackIsProduct: cfg.Stack.Kind == StackReal, ExecutorBytes: m.ExecutorMaxRSS}}
+		Counts: map[string]int{}, RSSGate: RSSGateSummary{GateBytes: GateBytes, RealStack: cfg.Stack.Kind == StackReal, ExecutorBytes: m.ExecutorMaxRSS}}
 	if cfg.Fake {
 		r.Driver = "fake:" + cfg.Driver
 	}
@@ -262,7 +262,7 @@ func buildReport(m *Manifest, recs []RunRecord) *Report {
 		}
 	}
 	switch {
-	case !r.RSSGate.StackIsProduct:
+	case !r.RSSGate.RealStack:
 		r.RSSGate.Note = "no product stack was measured (stub or none); RSS numbers are harness plumbing only"
 	case r.RSSGate.RunsSampled == 0:
 		r.RSSGate.Note = "no xMustard process was sampled"
