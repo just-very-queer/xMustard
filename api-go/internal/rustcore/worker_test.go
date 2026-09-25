@@ -185,6 +185,7 @@ func resetWorker() {
 	s.proc = nil
 	s.retryKey, s.retryAt, s.startFails, s.crashes = "", time.Time{}, 0, 0
 	s.knownKey, s.known = "", workerResidency{}
+	s.recycles, s.lastRecycled = nil, nil
 	if p != nil {
 		p.retiring = true
 	}
@@ -208,6 +209,11 @@ func useFakeWorker(t *testing.T, mode string) string {
 	t.Setenv("XMUSTARD_FAKE_WORKER", mode)
 	t.Setenv("XMUSTARD_FAKE_WORKER_LOG", logPath)
 	t.Setenv("XMUSTARD_CORE_WORKER", "1")
+	// The fake worker is this test binary, whose memory says nothing about a real
+	// worker's lines; the line recycles are tested on their own.
+	prevPeak, prevRunaway := workerPeakLine, workerRunawayLine
+	workerPeakLine, workerRunawayLine = 1<<40, 1<<40
+	t.Cleanup(func() { workerPeakLine, workerRunawayLine = prevPeak, prevRunaway })
 	resetWorker()
 	t.Cleanup(resetWorker)
 	return logPath
