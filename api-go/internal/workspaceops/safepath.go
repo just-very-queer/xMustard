@@ -2,6 +2,7 @@ package workspaceops
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"path/filepath"
 	"strings"
@@ -115,4 +116,67 @@ func readWorkspaceRegularFile(root, rel string) ([]byte, bool) {
 		return nil, false
 	}
 	return data, true
+}
+
+// ErrPathEscapesWorkspace is the error a caller-supplied path gets when it is absolute,
+// climbs out with "..", or resolves through a symlink to a location outside the root.
+var ErrPathEscapesWorkspace = errors.New("path escapes workspace")
+
+// ConfineWorkspacePath validates a caller-supplied repo-relative path (a memory
+// anchor, for instance) and returns it cleaned and slash-separated. Absolute paths
+// and ".." escapes are rejected lexically whether or not root is known; with a root,
+// resolveWorkspacePath also rejects a path that leaves the root through a symlink
+// (EvalSymlinks on the target or its nearest existing ancestor). The file need not
+// exist. Errors wrap both ErrPathEscapesWorkspace and ErrInvalidInput.
+func ConfineWorkspacePath(root, rel string) (string, error) {
+	cleaned := strings.TrimPrefix(strings.TrimSpace(rel), "./")
+	escape := func() (string, error) {
+		return "", fmt.Errorf("%w: %q: %w", ErrPathEscapesWorkspace, rel, ErrInvalidInput)
+	}
+	if cleaned == "" || strings.ContainsRune(cleaned, 0) {
+		return "", fmt.Errorf("empty or invalid path %q: %w", rel, ErrInvalidInput)
+	}
+	if filepath.IsAbs(cleaned) || strings.HasPrefix(cleaned, "/") || strings.HasPrefix(cleaned, `\`) || filepath.VolumeName(cleaned) != "" {
+		return escape()
+	}
+	cleaned = filepath.Clean(filepath.FromSlash(cleaned))
+	if cleaned == ".." || strings.HasPrefix(cleaned, ".."+string(filepath.Separator)) {
+		return escape()
+	}
+	if strings.TrimSpace(root) != "" {
+		if _, err := resolveWorkspacePath(root, cleaned); err != nil {
+			return escape()
+		}
+	}
+	return filepath.ToSlash(cleaned), nil
+}
+
+// confineAnchorPaths confines memory anchor paths to the workspace root (PAR-SEC-05).
+// The root comes from the small workspace registry, falling back to the snapshot;
+// with no known root only the lexical checks apply.
+func confineAnchorPaths(dataDir, workspaceID string, paths []string) ([]string, error) {
+	if len(paths) == 0 {
+		return paths, nil
+	}
+	root := ""
+	if items, err := ListWorkspaces(dataDir); err == nil {
+		for _, it := range items {
+			if it.WorkspaceID == workspaceID {
+				root = it.RootPath
+				break
+			}
+		}
+	}
+	if root == "" {
+		root = contextRoot(dataDir, workspaceID)
+	}
+	out := make([]string, 0, len(paths))
+	for _, p := range paths {
+		clean, err := ConfineWorkspacePath(root, p)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, clean)
+	}
+	return out, nil
 }
