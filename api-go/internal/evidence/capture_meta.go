@@ -93,6 +93,9 @@ func (s *Store) Observe(ctx context.Context, reg *Registry, in ObservationInput)
 		return given
 	}
 	meta.Tool = pick(body.ToolName, meta.Tool)
+	if meta.Tool == "" && body.Input["command"] != "" {
+		meta.Tool = "Shell" // Cursor afterShellExecution names no tool
+	}
 	if meta.Tool == "" {
 		return nil, fmt.Errorf("%w: the capture names no tool", ErrBadBody)
 	}
@@ -155,14 +158,12 @@ func (s *Store) Observe(ctx context.Context, reg *Registry, in ObservationInput)
 	}
 	res.Shape = ShapeOutput(ShapeInput{Client: meta.Client, Tool: meta.Tool, Body: bodyForShape(in.Format, body),
 		Proj: proj, Reduced: d.Reduced, Footer: res.Footer, RawBytes: d.RawBytes})
-	delivered := d.Projection
-	switch {
-	case res.Shape.Mode == ShapeReplace:
-		delivered = string(res.Shape.Payload)
-	case res.Footer != "":
-		delivered += "\n" + res.Footer
+	// the model reads the projection text and the recovery line (a shaped payload
+	// carries the same text in its fields; its JSON escaping is not model-visible)
+	res.DeliveredTokensEst = EstimateTokens(d.Projection)
+	if res.Footer != "" {
+		res.DeliveredTokensEst += EstimateTokens(res.Footer)
 	}
-	res.DeliveredTokensEst = EstimateTokens(delivered)
 	return res, nil
 }
 
@@ -230,7 +231,7 @@ func evidenceFooter(d *Delivery, ws string) string {
 		"handle": d.Handle, "workspace_id": ws, "resource_uri": d.ResourceURI, "raw_bytes": d.RawBytes,
 		"projected_bytes": d.ProjectedBytes, "omissions": len(d.Omissions), "reducer": d.Reducer,
 		"expires_at": d.ExpiresAt, "captured_identity": d.CapturedIdentity,
-		"search": "GET /api/workspaces/" + url.PathEscape(ws) + "/evidence/search?handle=" + d.Handle + "&pattern=RE2|&lines=A-B",
+		"search": "GET /api/workspaces/" + url.PathEscape(ws) + "/evidence/search?handle=" + d.Handle + "&pattern=<RE2> (or query=<text>, lines=<A-B>)",
 	}
 	raw, _ := json.Marshal(f)
 	return "[xmustard evidence] " + string(raw)

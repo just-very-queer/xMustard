@@ -213,3 +213,18 @@ func (r repeatReaderAt) ReadAt(p []byte, off int64) (int, error) {
 	}
 	return k, nil
 }
+
+// gitLogP: n commits, each touching two files with a few hunks (git log -p).
+func gitLogP(n int) []byte {
+	var b bytes.Buffer
+	for c := 0; c < n; c++ {
+		fmt.Fprintf(&b, "commit %040x\nAuthor: Dev <dev@example.com>\nDate:   Thu Sep 25 12:%02d:00 2026 +0000\n\n    fix: change number %d in the parser\n\n    Longer explanation of change %d.\n\n", c+1, c%60, c, c)
+		for f := 0; f < 2; f++ {
+			fmt.Fprintf(&b, "diff --git a/src/m%03d.go b/src/m%03d.go\nindex 1..2 100644\n--- a/src/m%03d.go\n+++ b/src/m%03d.go\n", (c+f)%50, (c+f)%50, (c+f)%50, (c+f)%50)
+			for h := 0; h < 3; h++ {
+				fmt.Fprintf(&b, "@@ -%d,4 +%d,5 @@\n ctx\n-old %d\n+new %d\n+more %d\n ctx\n", 10+h*9, 10+h*9, c, c, c)
+			}
+		}
+	}
+	return b.Bytes()
+}

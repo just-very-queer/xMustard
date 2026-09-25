@@ -269,6 +269,43 @@ func TestDiffKeepsFilesHunksAndCounts(t *testing.T) {
 	if len(p.Text) > 8<<10 {
 		t.Fatalf("projection %d bytes", len(p.Text))
 	}
+	// git log -p: commit headers are budgeted too
+	raw = gitLogP(300)
+	p, _ = reduceWith(t, raw, Selector{Tool: "Bash", Command: "git log -p -n 300"}, 16<<10)
+	dp = p.Structured.(*DiffProjection)
+	// file stats are per change (commit, path): 300 commits x 2 files
+	if dp.Commits != 300 || dp.Files != 600 || dp.Additions != 3600 || len(p.Text) > 16<<10 {
+		t.Fatalf("git log -p: commits %d files %d +%d, %d bytes", dp.Commits, dp.Files, dp.Additions, len(p.Text))
+	}
+	mustContain(t, p.Text, "commits=300 file_changes=600", "commit headers not shown", "fix: change number 0 in the parser",
+		"=== src/m000.go (+6 -3, 3 hunks)")
+}
+
+// Every family stays within the client target on large inputs.
+func TestFamilyProjectionsStayWithinTarget(t *testing.T) {
+	inputs := []struct {
+		raw []byte
+		sel Selector
+	}{
+		{unittestRun(5000, 200), Selector{Tool: "Bash", Command: "pytest"}},
+		{jestRun(5000), Selector{Tool: "Bash", Command: "jest"}},
+		{noisyShell(), Selector{Tool: "Bash", Command: "./x.sh"}},
+		{grepOutput(300, 20), Selector{Tool: "Bash", Command: "rg x"}},
+		{lintOutput(200, 30), Selector{Tool: "Bash", Command: "eslint ."}},
+		{sourceFile(20000), Selector{Tool: "Read", Path: "a.go"}},
+		{lsOutput(5000), Selector{Tool: "Bash", Command: "ls -la"}},
+		{globOutput(20000), Selector{Tool: "Glob"}},
+		{diffOutput(400, 9), Selector{Tool: "Bash", Command: "git diff"}},
+		{gitLogP(2000), Selector{Tool: "Bash", Command: "git log -p"}},
+	}
+	for _, target := range []int{4 << 10, 16 << 10, 32 << 10} {
+		for _, in := range inputs {
+			p, rec := reduceWith(t, in.raw, in.sel, target)
+			if len(p.Text) > target {
+				t.Errorf("%s at target %d: projection %d bytes", rec.Reducer, target, len(p.Text))
+			}
+		}
+	}
 }
 
 func TestLintGroupsErrorsFirst(t *testing.T) {

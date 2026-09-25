@@ -33,6 +33,9 @@ import (
 // reduces (read/write buffers, reducer windows, one long line).
 const captureWindowBytes = 2 << 20
 
+// searchWindowBytes is what one search holds: the chunk, a carried line and the result.
+const searchWindowBytes = evidence.SearchChunk + 1<<20 + 256<<10
+
 // streamsRequestBody reports routes whose handlers stream the request body to disk.
 func streamsRequestBody(r *http.Request) bool {
 	if r.Method != http.MethodPost {
@@ -153,6 +156,15 @@ func registerEvidenceCaptureRoutes(mux *http.ServeMux, store *evidence.Store) {
 		if req.FromLine, req.ToLine, err = lineRange(q.Get("lines")); err != nil {
 			badCapture(w, "invalid_lines", err.Error())
 			return
+		}
+		// one pooled 1 MiB chunk, at most a 1 MiB partial line and a page-sized result
+		if scope, owned := budget.ScopeFor(r.Context()); !owned {
+			if err := scope.Acquire(searchWindowBytes); err != nil {
+				writeOverloaded(w)
+				return
+			}
+		} else {
+			scope.Close()
 		}
 		res, err := store.Search(r.Context(), req)
 		if err != nil {

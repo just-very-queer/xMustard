@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"regexp"
 	"sort"
+	"strconv"
 )
 
 // Diff family (xm-diff/1): git diff/show/log -p and unified diffs. Pass 1 counts
@@ -61,6 +62,8 @@ func (diffReducer) Version() int   { return 1 }
 
 // diffScanner tracks where a line sits in a (possibly multi-commit) diff.
 type diffScanner struct {
+	commit     int // commits seen: file stats are per (commit, path) occurrence
+	keyBuf     []byte
 	inHunk     bool
 	gitFile    bool   // the current file began with "diff --git" (its ---/+++ lines are meta)
 	pendingOld []byte // "--- a/x" seen, waiting for "+++ b/x" (reused buffer)
@@ -85,6 +88,12 @@ const (
 )
 
 // headerPath returns the path of a "--- a/x" / "+++ b/x" line (tab suffix removed).
+// fileKey identifies one file occurrence: the path within the current commit.
+func (d *diffScanner) fileKey(path []byte) []byte {
+	d.keyBuf = strconv.AppendInt(append(d.keyBuf[:0], path...), int64(d.commit), 10)
+	return d.keyBuf
+}
+
 func headerPath(line []byte, strip string) []byte {
 	p := line[4:]
 	if i := bytes.IndexByte(p, '\t'); i >= 0 {
@@ -96,8 +105,9 @@ func headerPath(line []byte, strip string) []byte {
 // kind classifies one line; the returned path is a view valid until the next call.
 func (d *diffScanner) kind(line []byte) (diffKind, []byte) {
 	switch {
-	case commitRe.Match(line):
+	case bytes.HasPrefix(line, []byte("commit ")) && commitRe.Match(line):
 		d.inHunk, d.inCommit, d.commitMsg, d.gitFile = false, true, 0, false
+		d.commit++
 		return dkCommit, nil
 	case bytes.HasPrefix(line, []byte("diff --git a/")) && bytes.Contains(line, []byte(" b/")):
 		d.inHunk, d.inCommit, d.gitFile = false, false, true
@@ -156,14 +166,15 @@ func (diffReducer) Reduce(ctx context.Context, in *Input) (*Projection, error) {
 			case dkCommit:
 				commits++
 			case dkFile:
-				cur = files[string(path)]
+				key := ds.fileKey(path)
+				cur = files[string(key)]
 				if cur == nil {
 					if len(files) >= maxTrackedFiles {
 						untracked++
 						return nil
 					}
 					cur = &diffFile{path: string(validUTF8(path)), order: len(order)}
-					files[string(path)] = cur
+					files[string(key)] = cur
 					order = append(order, cur)
 				}
 			case dkHunk:
@@ -194,12 +205,20 @@ func (diffReducer) Reduce(ctx context.Context, in *Input) (*Projection, error) {
 	}
 	// files shown with hunks share three quarters of the budget; further files (up
 	// to maxDiffFiles) get their header line only, then a "largest omitted" summary
-	detail := min(nFiles, maxDiffFiles, max(1, (in.Target*3/4)/minFileShare))
-	share := max(minFileShare, (in.Target*3/4)/max(detail, 1))
+	// with commits (git log -p, git show), commit headers and messages share a fifth
+	detailBudget, commitBudget := in.Target*3/4, 0
+	if commits > 0 {
+		detailBudget, commitBudget = in.Target*3/5, in.Target/5
+	}
+	detail := min(nFiles, maxDiffFiles, max(1, detailBudget/minFileShare))
+	// what a shown file leaves of its share flows to the files after it
+	detailLeft, filesLeft := detailBudget, detail
+	share := minFileShare
 	headerOnlyBudget := in.Target / 5
+	commitUsed, commitsOmitted := 0, 0
 	header := fmt.Sprintf("[xmustard diff] xm-diff/1 files=%d +%d -%d hunks=%d", nFiles, totalAdds, totalDels, totalHunks)
 	if commits > 0 {
-		header += fmt.Sprintf(" commits=%d", commits)
+		header = fmt.Sprintf("[xmustard diff] xm-diff/1 commits=%d file_changes=%d +%d -%d hunks=%d", commits, nFiles, totalAdds, totalDels, totalHunks)
 	}
 	var out bytes.Buffer
 	out.WriteString(header)
@@ -226,6 +245,11 @@ func (diffReducer) Reduce(ctx context.Context, in *Input) (*Projection, error) {
 			if cur != nil && fileShown && omitHunks > 0 {
 				fmt.Fprintf(&part, "[xmustard: %d more hunks omitted in %s (+%d -%d)]\n", omitHunks, cur.path, omitAdds, omitDels)
 			}
+			if fileShown {
+				detailLeft -= fileUsed
+				filesLeft--
+				fileShown = false
+			}
 			omitHunks, omitAdds, omitDels = 0, 0, 0
 		}
 		emit := func(line []byte, start int64) {
@@ -246,25 +270,38 @@ func (diffReducer) Reduce(ctx context.Context, in *Input) (*Projection, error) {
 			gapLines++
 		}
 		inOmittedHunk := false
+		// a global guard over the per-file shares: the projection never passes the
+		// target (256 bytes stay for the closing summaries)
+		fits := func(n int) bool { return out.Len()+part.Len()+n+96 <= in.Target-256 }
 		err := scanLines(ctx, in.R, sec, func(idx int, line []byte, start, end int64) error {
 			k, path := ds.kind(line)
 			cost := min(len(line), plainDisplay) + 1
 			switch k {
-			case dkCommit, dkCommitMeta:
-				closeFile()
-				emit(line, start)
-			case dkCommitMsg:
-				if ds.commitMsg <= maxCommitMsgLines {
-					emit(line, start)
-				} else {
+			case dkCommit, dkCommitMeta, dkCommitMsg:
+				if k == dkCommit {
+					closeFile()
+				}
+				switch {
+				case k == dkCommitMsg && ds.commitMsg > maxCommitMsgLines:
 					skip(start)
+				case commitUsed+cost > commitBudget || !fits(cost):
+					if k == dkCommit {
+						commitsOmitted++
+					}
+					skip(start)
+				default:
+					commitUsed += cost
+					emit(line, start)
 				}
 			case dkFile:
 				closeFile()
-				cur = files[string(path)]
+				cur = files[string(ds.fileKey(path))]
 				fileUsed, inOmittedHunk = 0, false
-				fileShown = fileIdx < detail && cur != nil
-				headerOnly := !fileShown && cur != nil && fileIdx < maxDiffFiles && headerOnlyBudget > 0
+				fileShown = fileIdx < detail && cur != nil && detailLeft > 0 && fits(len(path)+48+minFileShare/2)
+				if fileShown {
+					share = min(max(minFileShare, detailLeft/max(filesLeft, 1)), max(detailLeft, 0)+minFileShare/2)
+				}
+				headerOnly := !fileShown && cur != nil && fileIdx < maxDiffFiles && headerOnlyBudget > 0 && fits(len(path)+48)
 				fileIdx++
 				if headerOnly {
 					headerOnlyBudget -= len(cur.path) + 40
@@ -282,7 +319,7 @@ func (diffReducer) Reduce(ctx context.Context, in *Input) (*Projection, error) {
 					skip(start)
 				}
 			case dkFileMeta:
-				if fileShown && (bytes.HasPrefix(line, []byte("rename ")) || bytes.HasPrefix(line, []byte("new file")) ||
+				if fileShown && fits(cost) && (bytes.HasPrefix(line, []byte("rename ")) || bytes.HasPrefix(line, []byte("new file")) ||
 					bytes.HasPrefix(line, []byte("deleted file")) || bytes.HasPrefix(line, []byte("Binary files"))) {
 					emit(line, start)
 				} else {
@@ -290,7 +327,7 @@ func (diffReducer) Reduce(ctx context.Context, in *Input) (*Projection, error) {
 				}
 			case dkHunk:
 				closeHunkCut()
-				if fileShown && fileUsed+cost+256 <= share {
+				if fileShown && fileUsed+cost+256 <= share && fits(cost) {
 					inOmittedHunk = false
 					fileUsed += cost
 					emit(line, start)
@@ -308,7 +345,7 @@ func (diffReducer) Reduce(ctx context.Context, in *Input) (*Projection, error) {
 						omitDels++
 					}
 					skip(start)
-				case hunkCut || fileUsed+cost > share:
+				case hunkCut || fileUsed+cost > share || !fits(cost):
 					hunkCut = true
 					if k == dkAdd {
 						cutAdds++
@@ -340,6 +377,9 @@ func (diffReducer) Reduce(ctx context.Context, in *Input) (*Projection, error) {
 			fmt.Fprintf(&out, "[%s]\n", sec.Name)
 		}
 		out.Write(part.Bytes())
+	}
+	if commitsOmitted > 0 {
+		fmt.Fprintf(&out, "[xmustard: %d of %d commit headers not shown]\n", commitsOmitted, commits)
 	}
 	if nFiles > listed {
 		rest := append([]*diffFile(nil), order[min(listed, len(order)):]...)
