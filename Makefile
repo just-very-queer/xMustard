@@ -76,7 +76,7 @@ BENCH_OUT ?= bench-out
 BENCH_ARGS ?=
 
 bench-test:
-	python3 -m unittest discover -s scripts/bench -p 'test_*.py'
+	python3 -m unittest discover -v -s scripts/bench -p 'test_*.py'
 
 bench-gate:
 	scripts/bench/rss_v2.sh run --suite ci --out $(BENCH_OUT)/gate $(BENCH_ARGS) \
