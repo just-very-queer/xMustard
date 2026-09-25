@@ -116,7 +116,8 @@ CREATE TABLE revisions (
 CREATE INDEX revisions_retention ON revisions (created_at) WHERE content IS NOT NULL;
 
 CREATE TRIGGER revisions_immutable BEFORE UPDATE ON revisions
-WHEN NEW.entry_id IS NOT OLD.entry_id
+WHEN NEW.pk IS NOT OLD.pk
+  OR NEW.entry_id IS NOT OLD.entry_id
   OR NEW.revision IS NOT OLD.revision
   OR NEW.base_revision IS NOT OLD.base_revision
   OR NEW.op IS NOT OLD.op
@@ -143,6 +144,16 @@ BEGIN
 END;
 
 CREATE TRIGGER revisions_no_delete BEFORE DELETE ON revisions
+BEGIN
+  SELECT RAISE(ABORT, 'govstore: revision history is immutable');
+END;
+
+-- INSERT OR REPLACE (and REPLACE INTO) deletes a conflicting row without firing any
+-- delete trigger while recursive_triggers is off, so an insert may never land on an
+-- existing revision: that would rewrite history past revisions_no_delete.
+CREATE TRIGGER revisions_no_replace BEFORE INSERT ON revisions
+WHEN EXISTS (SELECT 1 FROM revisions WHERE pk = NEW.pk)
+  OR EXISTS (SELECT 1 FROM revisions WHERE entry_id = NEW.entry_id AND revision = NEW.revision)
 BEGIN
   SELECT RAISE(ABORT, 'govstore: revision history is immutable');
 END;
@@ -187,9 +198,10 @@ BEGIN
   SELECT RAISE(ABORT, 'govstore: peer_verified requires distinct peer approvals');
 END;
 
--- Append-only memory history (PAR-PROV-01). Updates and deletes are rejected. The one
--- sanctioned change is purge redaction: the free text (note, data) of events that
--- belong to a purged entry may be cleared once, leaving every other column intact.
+-- Append-only memory history (PAR-PROV-01). Updates, deletes and REPLACE inserts are
+-- rejected. The one sanctioned change is purge redaction: the free text (note, data) of
+-- events that belong to a purged entry may be cleared once, leaving every other column
+-- intact.
 CREATE TABLE events (
   seq          INTEGER PRIMARY KEY AUTOINCREMENT,
   workspace_id TEXT NOT NULL,
@@ -212,6 +224,14 @@ CREATE INDEX events_entry ON events (entry_id, seq) WHERE entry_id IS NOT NULL;
 CREATE INDEX events_workspace ON events (workspace_id, seq);
 
 CREATE TRIGGER events_no_delete BEFORE DELETE ON events
+BEGIN
+  SELECT RAISE(ABORT, 'govstore: events are append-only');
+END;
+
+-- REPLACE conflict resolution would delete the old row without firing events_no_delete
+-- (recursive_triggers is off), so an insert may never reuse an existing seq.
+CREATE TRIGGER events_no_replace BEFORE INSERT ON events
+WHEN EXISTS (SELECT 1 FROM events WHERE seq = NEW.seq)
 BEGIN
   SELECT RAISE(ABORT, 'govstore: events are append-only');
 END;
@@ -333,6 +353,12 @@ CREATE INDEX session_events_session ON session_events (session_id, seq);
 CREATE INDEX session_events_retention ON session_events (retention_class, at);
 
 CREATE TRIGGER session_events_immutable BEFORE UPDATE ON session_events
+BEGIN
+  SELECT RAISE(ABORT, 'govstore: session events are immutable');
+END;
+
+CREATE TRIGGER session_events_no_replace BEFORE INSERT ON session_events
+WHEN EXISTS (SELECT 1 FROM session_events WHERE seq = NEW.seq)
 BEGIN
   SELECT RAISE(ABORT, 'govstore: session events are immutable');
 END;

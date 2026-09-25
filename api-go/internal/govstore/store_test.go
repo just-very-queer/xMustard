@@ -437,13 +437,54 @@ func TestEventsAreAppendOnly(t *testing.T) {
 			t.Fatalf("raw %s: %v", q, err)
 		}
 	}
+	// REPLACE conflict resolution deletes the old row without firing delete triggers, so
+	// every REPLACE form must be refused before it lands, in the store's transaction and
+	// from a raw connection alike.
+	forged := Digest("forged content")
+	for _, q := range []string{
+		"INSERT OR REPLACE INTO events (seq, workspace_id, entry_id, type, principal, at) VALUES (2, 'ws1', 'ctx_ev', 'vote', 'mallory', '2026-01-01T00:00:00.000000000Z')",
+		"REPLACE INTO events (seq, workspace_id, entry_id, type, principal, at) VALUES (1, 'ws1', 'ctx_ev', 'propose', 'mallory', '2026-01-01T00:00:00.000000000Z')",
+		"INSERT OR REPLACE INTO revisions (entry_id, revision, state, op, content, content_digest, content_bytes, author, author_key, created_at) " +
+			"VALUES ('ctx_ev', 1, 'accepted', 'propose', 'forged content', '" + forged + "', 14, 'mallory', 'mallory', '2026-01-01T00:00:00.000000000Z')",
+		"REPLACE INTO revisions (pk, entry_id, revision, state, op, content, content_digest, content_bytes, author, author_key, created_at) " +
+			"VALUES (1, 'ctx_ev', 7, 'accepted', 'propose', 'forged content', '" + forged + "', 14, 'mallory', 'mallory', '2026-01-01T00:00:00.000000000Z')",
+		"UPDATE OR REPLACE revisions SET pk = 99 WHERE entry_id = 'ctx_ev'",
+	} {
+		if err := s.Update(ctx, func(tx Tx) error { _, err := tx.(*txn).exec(ctx, q); return err }); !errors.Is(err, ErrAppendOnly) {
+			t.Fatalf("in-tx %s: got %v, want ErrAppendOnly", q, err)
+		}
+		if err := rawExec(t, s.Path(), q); err == nil || !(strings.Contains(err.Error(), "append-only") || strings.Contains(err.Error(), "immutable")) {
+			t.Fatalf("raw %s: %v", q, err)
+		}
+	}
+	if rv, err := s.GetRevision(ctx, "ctx_ev", 1); err != nil || rv.Content != "content" || rv.Author != "alice" {
+		t.Fatalf("revision 1 after REPLACE attempts = %+v %v", rv, err)
+	}
 	// Redaction is allowed only for a purged entry's events.
 	if err := rawExec(t, s.Path(), "UPDATE events SET note = NULL, data = NULL, redacted = 1 WHERE entry_id = 'ctx_ev'"); err == nil {
 		t.Fatal("redacted events of a live entry")
 	}
 	evs, _ := s.ListEvents(ctx, EventFilter{EntryID: "ctx_ev"})
-	if len(evs) != 2 || evs[1].Type != EventVote || evs[1].Principal != "bob" {
+	if len(evs) != 2 || evs[0].Type != EventPropose || evs[0].Principal != "alice" ||
+		evs[1].Type != EventVote || evs[1].Principal != "bob" || evs[1].NewDigest != Digest("content") {
 		t.Fatalf("events changed: %+v", evs)
+	}
+	// The session ledger is immutable the same way.
+	mustUpdate(t, s, func(tx Tx) error {
+		if _, err := tx.UpsertSession(ctx, SessionInput{ID: "sess-ev", WorkspaceID: "ws1"}, carol); err != nil {
+			return err
+		}
+		_, err := tx.AppendSessionEvent(ctx, SessionEventInput{SessionID: "sess-ev", Kind: "prompt", Body: "original"}, carol)
+		return err
+	})
+	ledger, _ := s.ListSessionEvents(ctx, SessionEventFilter{SessionID: "sess-ev"})
+	replaceLedger := fmt.Sprintf("INSERT OR REPLACE INTO session_events (seq, session_id, workspace_id, kind, body, at) "+
+		"VALUES (%d, 'sess-ev', 'ws1', 'prompt', 'rewritten', '2026-01-01T00:00:00.000000000Z')", ledger[0].Seq)
+	if err := s.Update(ctx, func(tx Tx) error { _, err := tx.(*txn).exec(ctx, replaceLedger); return err }); !errors.Is(err, ErrAppendOnly) {
+		t.Fatalf("ledger REPLACE: %v", err)
+	}
+	if err := rawExec(t, s.Path(), replaceLedger); err == nil || !strings.Contains(err.Error(), "immutable") {
+		t.Fatalf("raw ledger REPLACE: %v", err)
 	}
 	// Appending still works, including caller-authored events.
 	mustUpdate(t, s, func(tx Tx) error {
