@@ -678,8 +678,9 @@ func TestWorkerOutputThePoolCanNeverHoldIsPermanent(t *testing.T) {
 }
 
 // WS-06 on the worker path: the worker is started with the one-shot core's environment
-// (the Linux allocator cap, stood in here on any platform), and its start is the one
-// core spawn; the calls it answers start no process.
+// (the Linux allocator cap, stood in here on any platform), narrowed to one arena for
+// the resident worker (WS-14), and its start is the one core spawn; the calls it
+// answers start no process.
 func TestWorkerGetsTheCoreEnvironmentAndCountsOneSpawn(t *testing.T) {
 	t.Setenv("MALLOC_ARENA_MAX", "")
 	os.Unsetenv("MALLOC_ARENA_MAX")
@@ -690,8 +691,8 @@ func TestWorkerGetsTheCoreEnvironmentAndCountsOneSpawn(t *testing.T) {
 	before := budget.Counters()
 	for i := 0; i < 5; i++ {
 		out, err := runCoreCtx(context.Background(), "env", "MALLOC_ARENA_MAX")
-		if err != nil || string(out) != `"2"` {
-			t.Fatalf("the worker must get the core's allocator cap: %s %v", out, err)
+		if err != nil || string(out) != `"1"` {
+			t.Fatalf("the worker must get the resident allocator cap of one arena: %s %v", out, err)
 		}
 	}
 	after := budget.Counters()

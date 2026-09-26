@@ -28,11 +28,25 @@ var childEnv = budget.ChildEnv
 // programs never get it: the core hands its environment unchanged to what it spawns,
 // and a language server or the user's verification and managed commands are external
 // processes (PARITY_REQUIREMENTS §7.6) that must run in the operator's environment.
+//
+// The resident worker (serve) gets one arena instead of the default cap of two: its
+// queries run on a thread pool, and each arena kept its own high-water of query
+// transients. On Linux at 100k symbols the resident index measured +14.2 MiB over base
+// with two arenas and +10.6 MiB with one (WS-14). An operator's MALLOC_ARENA_MAX
+// always wins, because childEnv then returns nil.
 func coreChildEnv(sub string) []string {
 	if runsExternalPrograms(sub) {
 		return nil
 	}
-	return childEnv()
+	env := childEnv()
+	if sub == "serve" {
+		for i, kv := range env {
+			if strings.HasPrefix(kv, "MALLOC_ARENA_MAX=") {
+				env[i] = "MALLOC_ARENA_MAX=1"
+			}
+		}
+	}
+	return env
 }
 
 // runsExternalPrograms reports the subcommands that start programs outside xMustard:
