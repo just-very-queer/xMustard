@@ -419,6 +419,13 @@ Source: `docs/research/PARITY_REQUIREMENTS_2026-09-25.md` (requirements, process
 
 **Collision risk.** context_governance.go, feedback.go and main.go are hot. Must follow WS-00 (w0-kernel, w0-feedback). The diagnostics session's older tree also modified context_governance.go, so coordinate before its landing.
 
+**Delivered and accepted deviations (2026-09-26).**
+- Governed memory (propose, verify, edit, recall, trust labels) runs on govstore; context_entries.json is imported once and never written again. The five-file split is in place.
+- Feedback stays in agent_feedback.json rather than moving to govstore's path_feedback table. It is a ranking hint written off the request path by the coalescing recorder; moving it would put a store transaction on every flush for no trust gain. Instead every remaining JSON store (feedback, runs, tokens, the workspace registry, audit logs) now writes durably (fsync of the temp file, rename, fsync of the directory) and takes lockStore, which pairs the in-process mutex with an exclusive flock on a sibling `<store>.lock` file (unix; in-process only elsewhere). A lock file that cannot be taken fails the write closed. Moving feedback into govstore remains open for WS-49 if the kernel extraction wants one store.
+- Multi-process safety is tested by re-executing the test binary: `TestMemoryStoreAcrossProcessesLosesNoUpdates` (two API-style processes plus an ops-style handle on governance.db) and `TestJSONStoresLockAcrossProcesses` (three processes bumping one feedback counter, one run record and the token file). `TestJSONStoreWritesFsync` pins the fsync.
+- The one-time legacy import takes the heavy slot only for files of 1 MiB or more (`legacyImportHeavyFrom`). govstore owns that slot for its imports (WS-06B); workspaceops passes `ImportOptions.Inline` for a smaller file rather than taking the slot a second time. A smaller file imports in about one ordinary write, and queueing it behind an index build, or refusing it under memory pressure, would fail the first memory request of an upgraded workspace for no memory saving.
+- Trust tightening: the author of the served revision is not a peer (see docs/SECURITY.md, "Who counts as a peer verifier"). Two open-mode quorum tests now use a third principal for that reason.
+
 ### WS-13 — MCP Streamable HTTP endpoint on the API and native stdio relay
 
 **Goal.** Serve the nine tools, resources/read and cancellation over Streamable HTTP at :8042/mcp from the API process, using the mcpserver package. The bearer principal is taken per connection, and client profiles and read-only mode come from query params. Wire toolcompat normalization. Ship a tiny native Rust stdio-to-HTTP relay (target ≤3 MiB) for stdio-only clients. Record per-tool usage counters.

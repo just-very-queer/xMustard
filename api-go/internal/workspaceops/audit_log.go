@@ -48,7 +48,10 @@ func compactTimestamp(value string) string {
 // recordAuditEventNoGuard appends an event without re-validating the workspace
 // (callers that already hold the snapshot use this).
 func recordAuditEventNoGuard(dataDir, workspaceID string, event AuditEvent) error {
-	unlock := lockStore(auditLogPath(dataDir, workspaceID))
+	unlock, err := lockStore(auditLogPath(dataDir, workspaceID))
+	if err != nil {
+		return err
+	}
 	defer unlock()
 	events, err := loadAuditEvents(dataDir, workspaceID)
 	if err != nil {

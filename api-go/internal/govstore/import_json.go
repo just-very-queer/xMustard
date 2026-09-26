@@ -78,6 +78,10 @@ type ImportOptions struct {
 	Threshold int
 	// SkipInvalid skips malformed entries and reports them, instead of failing.
 	SkipInvalid bool
+	// Inline imports without the heavy slot. The caller sets it only when it has
+	// sized the source as small (about one ordinary write), so the import neither
+	// queues behind other heavy work nor is refused under memory pressure.
+	Inline bool
 }
 
 // ImportProblem names one entry the import changed or could not take.
@@ -157,14 +161,16 @@ func (s *SQLStore) ImportContextEntriesJSON(ctx context.Context, workspaceID str
 	if err := actor.validate(); err != nil {
 		return rep, err
 	}
-	release, err := acquireImportSlot(ctx, "context_entries.json")
-	if err != nil {
-		return rep, err
+	if !opts.Inline {
+		release, err := acquireImportSlot(ctx, "context_entries.json")
+		if err != nil {
+			return rep, err
+		}
+		defer release()
 	}
-	defer release()
 	h := sha256.New()
 	tee := io.TeeReader(bufio.NewReader(src), h)
-	err = s.Update(ctx, func(tx Tx) error {
+	err := s.Update(ctx, func(tx Tx) error {
 		t := tx.(*txn)
 		dec := json.NewDecoder(tee)
 		tok, err := dec.Token()
@@ -360,35 +366,26 @@ func normalizeLegacy(workspaceID string, le LegacyEntry, threshold int) (normali
 	return n, nil
 }
 
-// deriveVerificationMode labels a promoted legacy entry from its votes, like the
-// w0-kernel verificationMode: peer_verified needs `need` distinct approvals from
-// principals other than the author and the open-mode identity.
+// deriveVerificationMode labels a promoted legacy entry from its votes with the store's
+// one trust-label rule (VerificationMode). The tally mirrors Tally on revision 1, whose
+// author is the entry's author: the author and the open-mode identity are never peers.
 func deriveVerificationMode(le LegacyEntry, threshold int) string {
-	need := le.RequiredVerifications
-	if need <= 1 {
-		need = max(threshold, 1)
-	}
 	author := principalKey(le.Source)
-	peers, openAsserted := 0, false
+	var t Tally
 	for _, v := range le.Verifications {
-		key := principalKey(v.Agent)
-		switch {
-		case !v.Approve:
-		case key == OpenModeIdentity:
-			openAsserted = true
-		case key == author:
+		if !v.Approve {
+			continue
+		}
+		switch principalKey(v.Agent) {
+		case OpenModeIdentity:
+			t.OpenModeApproved = true
+		case author:
+			t.AuthorApproved = true
 		default:
-			peers++
+			t.PeerApprovals++
 		}
 	}
-	switch {
-	case peers >= need:
-		return ModePeerVerified
-	case openAsserted:
-		return ModeSelfAssertedOpenMode
-	default:
-		return ModeSingleAgent
-	}
+	return VerificationMode(t, le.RequiredVerifications, threshold)
 }
 
 // importEntry imports one legacy entry, or classifies it as unchanged or conflicting.

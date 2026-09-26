@@ -223,7 +223,10 @@ func TestFeedbackBufferOverflowIsCountedNotBlocking(t *testing.T) {
 		}
 	}
 
-	unlock := lockStore(feedbackPath(dir, ws))
+	unlock, err := lockStore(feedbackPath(dir, ws))
+	if err != nil {
+		t.Fatal(err)
+	}
 	flushed := make(chan struct{})
 	go func() { rec.flush(); close(flushed) }()
 	deadline := time.Now().Add(5 * time.Second)

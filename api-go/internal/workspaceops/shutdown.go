@@ -21,6 +21,7 @@ func ShutdownInFlight(dataDir string) {
 	closeAllTerminals()
 	feedbackRec.flush()
 	PgInlineFlush()
+	CloseMemoryStores()
 }
 
 func interruptInFlightRuns(dataDir string) {

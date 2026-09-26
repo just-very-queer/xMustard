@@ -123,3 +123,21 @@ func TestLegacyImportRunsInTheHeavySlot(t *testing.T) {
 		t.Fatalf("a refused import wrote %d feedback rows (%v)", rows, err)
 	}
 }
+
+// An Inline import (a source the caller sized as small) never takes the heavy slot, so
+// it runs while other heavy work holds it.
+func TestInlineImportSkipsTheHeavySlot(t *testing.T) {
+	g := quietGovernor(budget.GovernorConfig{HeavyWait: 50 * time.Millisecond})
+	useGovernor(t, g)
+	s := openTestStore(t, nil)
+	ctx := context.Background()
+	release, err := g.AcquireHeavy(ctx, "test_holder", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	legacy := `[{"id":"ctx_1","workspace_id":"ws1","kind":"fact","title":"t","body":"b","author":"alice","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}]`
+	if _, err := s.ImportContextEntriesJSON(ctx, "ws1", strings.NewReader(legacy), ImportOptions{SkipInvalid: true, Inline: true}); err != nil {
+		t.Fatalf("an inline import behind a busy slot: %v", err)
+	}
+}

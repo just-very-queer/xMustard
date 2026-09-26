@@ -31,6 +31,10 @@ func init() {
 		SteadyBytes: storeSteadyBytes,
 		PeakBytes:   storePeakBytes,
 		Enabled:     func() bool { return openStores.Load() > 0 },
+		// SQLite's page caches and schema live on the C heap, outside the Go heap the
+		// daemon line measures, so the store reports its own usage.
+		UsedBasis: "sqlite_heap",
+		Used:      func() (int64, bool) { return HeapInUse(), true },
 	})
 }
 
