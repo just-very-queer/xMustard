@@ -151,6 +151,7 @@ struct Files {
     off: Vec<u32>,
     inbound: Vec<u32>,
     dependents: Vec<u32>,
+    symbols: Vec<u32>,
 }
 
 impl Files {
@@ -162,6 +163,7 @@ impl Files {
             off,
             inbound: rows.iter().map(|r| r.inbound).collect(),
             dependents: rows.iter().map(|r| r.dependents).collect(),
+            symbols: rows.iter().map(|r| r.symbols).collect(),
         })
     }
 
@@ -348,7 +350,32 @@ impl QueryGraph for Snapshot {
             f(FileRef {
                 path: self.files.path(i as u32),
                 inbound: *inbound as usize,
+                symbols: self.files.symbols[i] as usize,
             });
+        }
+        Ok(())
+    }
+
+    fn for_each_edge(&self, f: &mut dyn FnMut(&str, &str)) -> Result<(), String> {
+        let seg = &self.seg;
+        let Some(structure) = seg.footer.layers.iter().position(|l| l == "structure") else {
+            return Ok(());
+        };
+        let files = seg.counts().files;
+        let file_of = |n: u32| -> Result<u32, String> {
+            match n.checked_sub(files) {
+                Some(s) => Ok(seg.symbol(s)?.file),
+                None => Ok(n),
+            }
+        };
+        for n in 0..seg.node_count() {
+            let from = file_of(n)?;
+            for e in seg.neighbours::<csr::Edge>(csr::OUT, n)? {
+                let to = file_of(e.node)?;
+                if e.layer as usize == structure && from != to {
+                    f(self.files.path(from), self.files.path(to));
+                }
+            }
         }
         Ok(())
     }

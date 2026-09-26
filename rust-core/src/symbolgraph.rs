@@ -2298,6 +2298,8 @@ pub struct SymbolRef<'a> {
 pub struct FileRef<'a> {
     pub path: &'a str,
     pub inbound: usize,
+    /// Symbols the file declares (non-local).
+    pub symbols: usize,
 }
 
 /// The graph reads behind search, explain and impact. The legacy per-call
@@ -2308,6 +2310,8 @@ pub trait QueryGraph: Send + Sync {
     fn symbol_count(&self) -> usize;
     fn for_each_symbol(&self, f: &mut dyn FnMut(SymbolRef<'_>)) -> Result<(), String>;
     fn for_each_file(&self, f: &mut dyn FnMut(FileRef<'_>)) -> Result<(), String>;
+    /// Every `structure` edge between two files as `(from, to)`, one per typed edge.
+    fn for_each_edge(&self, f: &mut dyn FnMut(&str, &str)) -> Result<(), String>;
     fn hotspots(&self, limit: usize) -> Result<Vec<Hotspot>, String>;
     fn impact(&self, symbol: &str, max_depth: usize) -> Result<SymbolImpact, String>;
     fn trace(&self, from: &str, to: &str) -> Result<SymbolTrace, String>;
@@ -2358,7 +2362,15 @@ impl QueryGraph for SymbolGraph {
             f(FileRef {
                 path: &file.path,
                 inbound: inbound.get(file.path.as_str()).copied().unwrap_or(0),
+                symbols: file.symbol_count,
             });
+        }
+        Ok(())
+    }
+
+    fn for_each_edge(&self, f: &mut dyn FnMut(&str, &str)) -> Result<(), String> {
+        for e in &self.edges {
+            f(&e.from_path, &e.to_path);
         }
         Ok(())
     }

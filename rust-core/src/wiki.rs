@@ -96,27 +96,37 @@ fn subsystem_fingerprint(
 /// served byte-identical from the page cache. The overview always re-renders (it
 /// reflects global counts/hotspots and is a single small page).
 pub fn generate_wiki(root: &Path, workspace_id: &str) -> RepoWiki {
-    let graph = symbolgraph::symbol_graph_for_query(root, workspace_id);
-    let hotspots = symbolgraph::compute_hotspots(&graph, 15);
+    // the code index's snapshot when the root has one, else the legacy graph
+    let graph = symbolgraph::query_source(root, workspace_id).graph;
+    let hotspots = graph.hotspots(15).unwrap_or_default();
 
     // group symbols by file, and files by subsystem (top dir). Sort for a stable
     // render order so the fingerprint cache is correct (same inputs → same bytes).
     let mut symbols_by_file: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for s in &graph.symbols {
-        symbols_by_file
-            .entry(s.path.clone())
-            .or_default()
-            .push(s.name.clone());
+    let mut files_by_subsystem: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut edge_count = 0usize;
+    let reads = [
+        graph.for_each_symbol(&mut |s| {
+            symbols_by_file
+                .entry(s.path.to_string())
+                .or_default()
+                .push(s.name.to_string());
+        }),
+        graph.for_each_file(&mut |f| {
+            files_by_subsystem
+                .entry(top_dir(f.path))
+                .or_default()
+                .push(f.path.to_string());
+        }),
+        graph.for_each_edge(&mut |_, _| edge_count += 1),
+    ];
+    for r in reads {
+        if let Err(e) = r {
+            eprintln!("wiki: graph read: {e}");
+        }
     }
     for syms in symbols_by_file.values_mut() {
         syms.sort();
-    }
-    let mut files_by_subsystem: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for f in &graph.files {
-        files_by_subsystem
-            .entry(top_dir(&f.path))
-            .or_default()
-            .push(f.path.clone());
     }
     for files in files_by_subsystem.values_mut() {
         files.sort();
@@ -138,7 +148,9 @@ pub fn generate_wiki(root: &Path, workspace_id: &str) -> RepoWiki {
     let _ = writeln!(
         overview,
         "{} files · {} symbols · {} reference edges.\n",
-        graph.file_count, graph.symbol_count, graph.edge_count
+        files_by_subsystem.values().map(Vec::len).sum::<usize>(),
+        graph.symbol_count(),
+        edge_count
     );
     let _ = writeln!(overview, "## Hotspots (most-depended-on files)\n");
     for h in &hotspots {
