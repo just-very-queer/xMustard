@@ -69,6 +69,7 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import urllib.parse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -1553,6 +1554,33 @@ def designated_gap(sc, head_state, base_state):
     return f"{sc}: {why}" if why else None
 
 
+def first_match(rules, ctx):
+    """The outcome of the first (predicate, outcome) rule whose predicate holds for ctx;
+    a None predicate always holds, so it ends a table as its default."""
+    return next(outcome(ctx) for pred, outcome in rules if pred is None or pred(ctx))
+
+
+DESIGN_FAILURES = {  # design-bound rule -> why a head p50 over its bound fails ("<process> <basis> <p50> MiB " + this)
+    "cumulative": ("is over its reference {ref} + merged lines + tolerance ({allowed}; base {base}): accumulated growth "
+                   "on a process already over its design line"),
+    "base-aware": "crossed its design line {steady} + tolerance ({allowed}); the base was within it ({base})",
+    "absolute": "is over its design line {steady} + tolerance (accumulated lines)",
+}
+
+LEDGER_VERDICTS = (  # first match decides (verdict, note) of ledger_check
+    (lambda c: not c.rows, lambda c: ("FAIL", "; ".join(["no common valid scenario between head and base"] + c.gaps))),
+    (lambda c: c.gaps or not all(r["ok"] for r in c.rows),
+     lambda c: ("FAIL", "; ".join([f"{r['scenario']}: {f}" for r in c.rows for f in r["failures"]] + c.gaps))),
+    (lambda c: c.designated and not c.measured_designated,
+     lambda c: ("NOT_CHECKABLE", f"the line is measured on {c.designated}, which could not be measured on both sides "
+                                 "(not run, or not runnable at the base); the generic checks held")),
+    (lambda c: not c.resolvable,
+     lambda c: ("BELOW_RESOLUTION", f"every check held, but the line ({c.line} MiB) is smaller than the {c.proc_tol} MiB "
+                                    "tolerance, so it is not verified")),
+    (None, lambda c: ("PASS", None)),
+)
+
+
 def ledger_check(ledger, workstream, head, base, head_status=None, base_status=None, merged=None):
     """Check a workstream's measured delta (head minus base: ledger_view() of two reports
     measured on one machine) against its ledger line.
@@ -1669,16 +1697,9 @@ def ledger_check(ledger, workstream, head, base, head_status=None, base_status=N
             des.append({"process": p, "p50_mib": cur, "basis": basis, "base_p50_mib": base_cur,
                         "design_steady_mib": dl["steady"], "allowed_mib": allowed_d, "rule": rule,
                         "grandfathered": grandfathered, "merged_since": merged_names, "over": over, "base_over": base_over, "ok": ok})
-            if ok:
-                continue
-            if rule == "cumulative":
-                fails.append(f"{p} {basis} {cur} MiB is over its reference {ref[p]} + merged lines + tolerance "
-                             f"({allowed_d}; base {base_cur}): accumulated growth on a process already over its design line")
-            elif rule == "base-aware":
-                fails.append(f"{p} {basis} {cur} MiB crossed its design line {dl['steady']} + tolerance ({allowed_d}); "
-                             f"the base was within it ({base_cur})")
-            else:
-                fails.append(f"{p} {basis} {cur} MiB is over its design line {dl['steady']} + tolerance (accumulated lines)")
+            if not ok:
+                fails.append(f"{p} {basis} {cur} MiB " + DESIGN_FAILURES[rule].format(
+                    ref=ref.get(p), allowed=allowed_d, base=base_cur, steady=dl["steady"]))
         row["design"] = des
         row["failures"] = fails
         row["ok"] = not fails
@@ -1688,27 +1709,57 @@ def ledger_check(ledger, workstream, head, base, head_status=None, base_status=N
     gaps = [g for g in (designated_gap(sc, hs.get(sc, "not run"), bs.get(sc, "not run")) for sc in designated) if g]
     proc_tol = component_tolerance(ledger, proc) if proc else t_tree
     resolvable = line != 0 and abs(line) >= proc_tol
-    measured_designated = [r["scenario"] for r in rows if r["designated"]]
-    if not rows:
-        verdict, note = "FAIL", "; ".join(["no common valid scenario between head and base"] + gaps)
-    elif gaps or not all(r["ok"] for r in rows):
-        verdict, note = "FAIL", "; ".join([f"{r['scenario']}: {f}" for r in rows for f in r["failures"]] + gaps)
-    elif designated and not measured_designated:
-        verdict, note = "NOT_CHECKABLE", (f"the line is measured on {designated}, which could not be measured on both "
-                                          "sides (not run, or not runnable at the base); the generic checks held")
-    elif not resolvable:
-        verdict, note = "BELOW_RESOLUTION", (f"every check held, but the line ({line} MiB) is smaller than the "
-                                             f"{proc_tol} MiB tolerance, so it is not verified")
-    else:
-        verdict, note = "PASS", None
+    c = types.SimpleNamespace(rows=rows, gaps=gaps, designated=designated, resolvable=resolvable, line=line,
+                              proc_tol=proc_tol, measured_designated=[r["scenario"] for r in rows if r["designated"]])
+    verdict, note = first_match(LEDGER_VERDICTS, c)
     return {"workstream": workstream, "line_mib": line, "process": proc, "scenarios_designated": designated, "why": why,
             "tolerance": tol, "rows": rows, "designated_gaps": gaps, "verdict": verdict, "blocking": verdict == "FAIL",
             "note": note}
 
 
+REGRESSION_RULES = (  # first match decides (blocking, why) for a scenario the base and the head both ran
+    (lambda c: c.h_med is None, lambda c: (True, f"the head has no measurement ({c.valid_h} of {c.runs_h} repeats valid)")),
+    (lambda c: c.b_med is None, lambda c: (True, "the base has no measurement (most repeats invalid): re-run the check")),
+    (lambda c: c.b_med > c.limit, lambda c: (False, f"the base median {c.b_med} MiB was already over the gate")),
+    (lambda c: c.h_med <= c.limit,
+     lambda c: (False, f"head median {c.h_med} MiB is within the gate (base median {c.b_med} MiB)")),
+    (lambda c: c.delta[0] <= c.noise,
+     lambda c: (False, f"head median {c.h_med} MiB is over the gate, {c.grew}: within the {c.noise} MiB noise "
+                       "allowance in the median or the max")),
+    (None, lambda c: (True, f"head median {c.h_med} MiB is over the gate, {c.grew}: beyond the {c.noise} MiB noise "
+                            "allowance in both")),
+)
+
+
+def _judge_coverage(c):
+    if c.b_state in ("valid", "invalid"):
+        return True, (f"skipped at the head ({c.r.get('reason', 'not run')}) but the base ran it: the pull request "
+                      "removed this measurement")
+    return False, "not run at the head or the base"
+
+
+GATE_RULES = {  # rule -> judge(ctx) -> (blocking, why); gate_blocking picks the rule
+    "coverage": _judge_coverage,
+    "absolute": lambda c: (c.verdict != "PASS", "a CI-suite scenario: its own verdict decides"),
+    "absolute (gate_blocking)": lambda c: (c.verdict != "PASS", "the workstream opted in: its own verdict decides"),
+    "new": lambda c: (c.verdict != "PASS", (f"the base could not run it ({c.br.get('reason') or 'not in the base report'}):"
+                                            " the pull request introduced it, so its own verdict decides")),
+    "regression": lambda c: first_match(REGRESSION_RULES, c),
+}
+
+GATE_RULE_ORDER = (  # (predicate, rule): which GATE_RULES entry judges a scenario
+    (lambda c: c.r.get("status") != "ran", lambda c: "coverage"),
+    (lambda c: in_ci_suite(c.sc), lambda c: "absolute"),
+    (lambda c: c.sc in c.opt_in, lambda c: "absolute (gate_blocking)"),
+    (lambda c: c.b_state in ("skipped", "not run"), lambda c: "new"),
+    (None, lambda c: "regression"),
+)
+
+
 def gate_blocking(ledger, workstream, report, base_report):
     """Which gate verdicts block a pull request (run --workstream with --baseline). One
-    row per scenario of the head report, by rule:
+    row per scenario of the head report, by rule (GATE_RULE_ORDER picks it, GATE_RULES
+    judges it):
 
       * absolute: a CI-suite scenario blocks on its own verdict, as on a push: any repeat
         over the gate, or an invalid run. So does a designated scenario of a workstream
@@ -1717,13 +1768,13 @@ def gate_blocking(ledger, workstream, report, base_report):
         the base report) also blocks on the head's own verdict. The pull request
         introduced it, so there is no base to compare with.
       * regression: any other scenario that ran (a workstream's designated parity-scale
-        scenario) blocks only on a regression beyond noise: the base median over its
-        valid repeats was within the gate, the head median is over the gate, and both
-        the median and the max rose by more than tolerance.tree_peak_mib (peak_delta).
-        One noisy repeat does not decide, and neither does a median that flipped between
-        the two clusters of a bimodal peak. An overrun the base already had is reported and
-        does not block; ledger_check still bounds its growth. A side without a
-        measurement (most repeats invalid) blocks: re-run the check.
+        scenario) blocks only on a regression beyond noise (REGRESSION_RULES): the base
+        median over its valid repeats was within the gate, the head median is over the
+        gate, and both the median and the max rose by more than tolerance.tree_peak_mib
+        (peak_delta). One noisy repeat does not decide, and neither does a median that
+        flipped between the two clusters of a bimodal peak. An overrun the base already
+        had is reported and does not block; ledger_check still bounds its growth. A side
+        without a measurement (most repeats invalid) blocks: re-run the check.
       * coverage: a scenario the base ran and the head skipped, because its feature went
         away, blocks whether it is in the CI suite or not: the pull request removed a
         measurement. Skipped on both sides is reported.
@@ -1738,54 +1789,19 @@ def gate_blocking(ledger, workstream, report, base_report):
     rows = []
     for sc, r in (report.get("scenarios") or {}).items():
         br = (base_report.get("scenarios") or {}).get(sc) or {}
-        b_state = bs.get(sc, "not run")
-        b_verdict = (br.get("gate") or {}).get("verdict", br.get("status", "not run"))
-        h_med, b_med = (hv.get(sc) or {}).get("gate_peak_mib"), (bv.get(sc) or {}).get("gate_peak_mib")
-        row = {"scenario": sc, "base_verdict": b_verdict, "head_median_mib": h_med, "base_median_mib": b_med}
-        if r.get("status") != "ran":
-            row["verdict"] = r.get("status") or "skipped"
-            row["rule"] = "coverage"
-            if b_state in ("valid", "invalid"):
-                row["blocking"], row["why"] = True, (f"skipped at the head ({r.get('reason', 'not run')}) but the base "
-                                                     "ran it: the pull request removed this measurement")
-            else:
-                row["blocking"], row["why"] = False, "not run at the head or the base"
-            rows.append(row)
-            continue
-        verdict = (r.get("gate") or {}).get("verdict")
-        row["verdict"] = verdict
-        if in_ci_suite(sc) or sc in opt_in:
-            rule = "absolute" if in_ci_suite(sc) else "absolute (gate_blocking)"
-            blocking = verdict != "PASS"
-            why_ = ("a CI-suite scenario" if in_ci_suite(sc) else "the workstream opted in") + ": its own verdict decides"
-        elif b_state in ("skipped", "not run"):
-            rule, blocking = "new", verdict != "PASS"
-            why_ = (f"the base could not run it ({br.get('reason') or 'not in the base report'}): the pull request "
-                    "introduced it, so its own verdict decides")
-        else:
-            rule = "regression"
-            rep = r.get("repeats") or {}
-            valid_h = rep.get("valid_runs", int(bool((r.get("gate") or {}).get("valid"))))
-            runs_h = rep.get("runs", 1)
-            if h_med is None:
-                blocking, why_ = True, f"the head has no measurement ({valid_h} of {runs_h} repeats valid)"
-            elif b_med is None:
-                blocking, why_ = True, "the base has no measurement (most repeats invalid): re-run the check"
-            elif b_med > limit:
-                blocking, why_ = False, f"the base median {b_med} MiB was already over the gate"
-            else:
-                d, d_med, d_max = peak_delta(hv[sc], bv[sc], "gate_peak_mib")
-                grew = f"{d_med} MiB above the base median {b_med} MiB, max delta {d_max} MiB"
-                if h_med <= limit:
-                    blocking, why_ = False, f"head median {h_med} MiB is within the gate (base median {b_med} MiB)"
-                elif d <= noise:
-                    blocking, why_ = False, (f"head median {h_med} MiB is over the gate, {grew}: within the {noise} MiB "
-                                             "noise allowance in the median or the max")
-                else:
-                    blocking, why_ = True, (f"head median {h_med} MiB is over the gate, {grew}: beyond the {noise} MiB "
-                                            "noise allowance in both")
-        row.update(rule=rule, blocking=blocking, why=why_)
-        rows.append(row)
+        rep = r.get("repeats") or {}
+        c = types.SimpleNamespace(
+            sc=sc, r=r, br=br, opt_in=opt_in, limit=limit, noise=noise, b_state=bs.get(sc, "not run"),
+            verdict=(r.get("gate") or {}).get("verdict") if r.get("status") == "ran" else r.get("status") or "skipped",
+            h_med=(hv.get(sc) or {}).get("gate_peak_mib"), b_med=(bv.get(sc) or {}).get("gate_peak_mib"),
+            valid_h=rep.get("valid_runs", int(bool((r.get("gate") or {}).get("valid")))), runs_h=rep.get("runs", 1))
+        c.delta = peak_delta(hv[sc], bv[sc], "gate_peak_mib") if sc in hv and sc in bv else (None, None, None)
+        c.grew = f"{c.delta[1]} MiB above the base median {c.b_med} MiB, max delta {c.delta[2]} MiB"
+        rule = first_match(GATE_RULE_ORDER, c)
+        blocking, why_ = GATE_RULES[rule](c)
+        rows.append({"scenario": sc, "base_verdict": (br.get("gate") or {}).get("verdict", br.get("status", "not run")),
+                     "head_median_mib": c.h_med, "base_median_mib": c.b_med, "verdict": c.verdict, "rule": rule,
+                     "blocking": blocking, "why": why_})
     ran = [r for r in rows if r["rule"] != "coverage"]
     return {"workstream": workstream, "limit_mib": round(limit, 1), "noise_allowance_mib": noise, "rows": rows,
             "blocking": not ran or any(r["blocking"] for r in rows), "note": None if ran else "no scenario ran"}
@@ -2132,15 +2148,19 @@ OFF_VALUES = frozenset({"", "off", "disabled", "absent", "none", "false", "no", 
 STATE_FIELDS = ("enabled", "state", "status")
 
 
+SCALAR_ON = {  # scalar type -> whether a value of it marks a feature on
+    type(None): lambda v: False,
+    bool: bool,
+    int: lambda v: v != 0,
+    float: lambda v: v != 0,
+    str: lambda v: v.strip().lower() not in OFF_VALUES,
+}
+
+
 def scalar_on(v):
-    """A scalar marker is on unless it is null, false, zero or an off word (OFF_VALUES)."""
-    if v is None or isinstance(v, bool):
-        return bool(v)
-    if isinstance(v, (int, float)):
-        return v != 0
-    if isinstance(v, str):
-        return v.strip().lower() not in OFF_VALUES
-    return False
+    """A scalar marker is on unless it is null, false, zero or an off word (OFF_VALUES);
+    any other type is off."""
+    return SCALAR_ON.get(type(v), lambda _: False)(v)
 
 
 def feature_present(feat, v):
@@ -2149,12 +2169,13 @@ def feature_present(feat, v):
     enabled/state/status fields, every one of them on; a list never."""
     if feat == "uncapped_index":
         return isinstance(v, dict) and v.get("truncated") is False
-    if isinstance(v, dict):
-        fields = [k for k in STATE_FIELDS if k in v]
-        return bool(fields) and all(scalar_on(v[k]) for k in fields)
-    if isinstance(v, list):
-        return False
-    return scalar_on(v)
+    return {dict: state_fields_on, list: lambda _: False}.get(type(v), scalar_on)(v)
+
+
+def state_fields_on(v):
+    """An object is on only through explicit enabled/state/status fields, all of them on."""
+    fields = [k for k in STATE_FIELDS if k in v]
+    return bool(fields) and all(scalar_on(v[k]) for k in fields)
 
 
 class FeatureState:
@@ -2566,6 +2587,14 @@ def probe_features(ctx):
 # Report
 # --------------------------------------------------------------------------------------
 
+PARITY_SCENARIO_GAPS = (  # first match: why a parity scenario's report does not support the claim, or None
+    (lambda r: r is None, lambda r: "not run in this invocation"),
+    (lambda r: r.get("status") != "ran", lambda r: f"{r.get('status')} ({r.get('reason')})"),
+    (lambda r: not r["gate"]["passed"], lambda r: f"gate {r['gate']['verdict']}"),
+    (None, lambda r: None),
+)
+
+
 def parity_claim(report, fixtures):
     """The parity-scale claim (PAR-EVAL-05) holds only when every parity scenario ran,
     passed, and every required product feature was present."""
@@ -2574,13 +2603,9 @@ def parity_claim(report, fixtures):
     for name, sc in SCENARIOS.items():
         if "parity" not in sc["suites"]:
             continue
-        r = scen.get(name)
-        if r is None:
-            missing.append(f"{name}: not run in this invocation")
-        elif r.get("status") != "ran":
-            missing.append(f"{name}: {r.get('status')} ({r.get('reason')})")
-        elif not r["gate"]["passed"]:
-            missing.append(f"{name}: gate {r['gate']['verdict']}")
+        gap = first_match(PARITY_SCENARIO_GAPS, scen.get(name))
+        if gap:
+            missing.append(f"{name}: {gap}")
     ran = [n for n, r in scen.items() if r.get("status") == "ran" and SCENARIOS.get(n, {}).get("kind") == "agents"
            and "parity" in SCENARIOS[n]["suites"]]
     for f, spec in fixtures["feature_probes"].items():
