@@ -1,0 +1,43 @@
+engine tree_sitter parse_errors false
+symbols
+  Class Widget arity=- lines=8-23 doc_from=6 exported=true local=false depth=0
+  Property Widget.hidden arity=- lines=9-9 doc_from=9 exported=false local=false depth=1
+  Method Widget.compute arity=2 lines=11-14 doc_from=11 exported=true local=false depth=1
+  Method Widget.secret arity=0 lines=16-16 doc_from=16 exported=false local=false depth=1
+  Method Widget.make arity=0 lines=19-21 doc_from=19 exported=true local=false depth=1
+  Class Thing arity=- lines=25-27 doc_from=25 exported=true local=false depth=0
+  Method Thing.run arity=0 lines=26-26 doc_from=26 exported=true local=false depth=1
+  Class Registry arity=- lines=29-31 doc_from=29 exported=true local=false depth=0
+  Method Registry.lookup arity=1 lines=30-30 doc_from=30 exported=true local=false depth=1
+  Function top arity=1 lines=33-33 doc_from=33 exported=true local=false depth=0
+  TypeAlias Name arity=- lines=35-35 doc_from=35 exported=true local=false depth=0
+imports
+  3 import kotlin.math.max name=- alias=-
+  4 import com.example.util.Helper name=- alias=H
+references (non-read)
+  3 import kotlin in -
+  3 import math in -
+  3 import max in -
+  4 import com in -
+  4 import example in -
+  4 import util in -
+  4 import Helper in -
+  4 import H in -
+  8 bind n in Widget
+  8 type Int in Widget
+  8 extends Base in Widget
+  8 implements Thing in Widget
+  11 bind a in Widget.compute
+  11 type Int in Widget.compute
+  11 bind b in Widget.compute
+  11 type Int in Widget.compute
+  11 type Int in Widget.compute
+  13 call helper in Widget.compute
+  19 type Widget in Widget.make
+  20 call Widget in Widget.make
+  30 bind key in Registry.lookup
+  30 type String in Registry.lookup
+  33 bind x in top
+  33 type Int in top
+  33 call max in top
+  35 type String in Name

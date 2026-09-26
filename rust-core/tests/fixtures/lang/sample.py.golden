@@ -1,0 +1,40 @@
+engine tree_sitter parse_errors false
+symbols
+  Variable LIMIT arity=- lines=7-7 doc_from=7 exported=true local=false depth=0
+  Function top arity=2 lines=11-13 doc_from=10 exported=true local=false depth=0
+  Class Outer arity=- lines=16-31 doc_from=16 exported=true local=false depth=0
+  Method Outer.method arity=2 lines=19-27 doc_from=19 exported=true local=false depth=1
+  Function Outer.method.local_fn arity=0 lines=24-25 doc_from=24 exported=false local=true depth=2
+  Class Outer.Inner arity=- lines=29-31 doc_from=29 exported=true local=false depth=1
+  Method Outer.Inner.deep arity=1 lines=30-31 doc_from=30 exported=true local=false depth=2
+  Function _private arity=0 lines=34-35 doc_from=34 exported=false local=false depth=0
+imports
+  1 import os name=- alias=-
+  2 import os.path name=- alias=osp
+  3 import pkg.mod name=helper alias=-
+  3 import pkg.mod name=other alias=alias_other
+  4 wildcard pkg.star name=- alias=-
+references (non-read)
+  1 import os in -
+  2 import os in -
+  2 import path in -
+  2 import osp in -
+  3 import pkg in -
+  3 import mod in -
+  3 import helper in -
+  3 import other in -
+  3 import alias_other in -
+  4 import pkg in -
+  4 import star in -
+  11 bind a in top
+  11 bind b in top
+  13 call helper in top
+  16 extends Base in Outer
+  19 bind self in Outer.method
+  19 bind v in Outer.method
+  20 write value in Outer.method
+  21 call check in Outer.method
+  22 member_call join in Outer.method
+  27 call local_fn in Outer.method
+  30 bind self in Outer.Inner.deep
+  31 call top in Outer.Inner.deep

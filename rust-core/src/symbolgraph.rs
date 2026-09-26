@@ -4,6 +4,7 @@
 //! derives hotspots (most-depended-on files) and blast radius (what a symbol
 //! change can affect). This is the brain impact analysis and ownership key off.
 
+use crate::index::lang::{Lang, LanguageCoverage, Support};
 use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -16,9 +17,6 @@ fn now() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
-const SOURCE_EXTS: &[&str] = &[
-    "rs", "go", "py", "ts", "tsx", "js", "jsx", "java", "rb", "c", "h", "cpp", "hpp", "cc",
-];
 const MAX_FILES: usize = 800;
 const MIN_NAME_LEN: usize = 4;
 // names this common produce noisy edges; skip as reference anchors.
@@ -27,12 +25,9 @@ const STOPWORD_SYMBOLS: &[&str] = &[
     "data", "name", "path", "self", "this", "type", "node", "item", "list",
 ];
 
+/// A file some language pack claims (`index::lang::PACKS`).
 fn is_source(path: &str) -> bool {
-    Path::new(path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| SOURCE_EXTS.contains(&e))
-        .unwrap_or(false)
+    Lang::for_path(path).is_some()
 }
 
 /// Bound on symbols held by one graph (memory); files past it report `symbol_budget`.
@@ -145,6 +140,10 @@ pub struct IndexCoverage {
     /// `excluded_path`, `unsupported_language`).
     #[serde(default)]
     pub extraction: BTreeMap<String, usize>,
+    /// Analyzed files per language pack by support (`supported`, `unsupported`: no
+    /// grammar in this build, `failed`: the grammar found no symbols the regex did).
+    #[serde(default)]
+    pub languages: BTreeMap<String, LanguageCoverage>,
     #[serde(default)]
     pub source_identity: SourceIdentitySummary,
     #[serde(default)]
@@ -1678,10 +1677,25 @@ fn build_graph(
     let mut kept_total = 0usize;
     let mut name_to_defs: HashMap<&str, Definer<'_>> = HashMap::new();
     let mut extraction: BTreeMap<String, usize> = BTreeMap::new();
+    let mut languages: BTreeMap<String, LanguageCoverage> = BTreeMap::new();
     let mut symbols_truncated_files = 0usize;
     let mut budget_hit = false;
     for (rel, f) in &next.files {
         *extraction.entry(f.engine.clone()).or_insert(0) += 1;
+        if let Some(lang) = Lang::for_path(rel) {
+            let support = match (f.engine.as_str(), lang.has_grammar()) {
+                ("excluded_path", _) => None,
+                (_, false) => Some(Support::Unsupported),
+                ("tree_sitter" | "none", true) => Some(Support::Supported),
+                (_, true) => Some(Support::Failed),
+            };
+            if let Some(support) = support {
+                languages
+                    .entry(lang.name().to_string())
+                    .or_default()
+                    .add(support);
+            }
+        }
         match f.engine.as_str() {
             "excluded_path" => loss(
                 rel,
@@ -1977,6 +1991,7 @@ fn build_graph(
             losses,
             losses_truncated,
             extraction,
+            languages,
             source_identity: identity_summary(id, stable),
             work: IndexWork::default(),
         },

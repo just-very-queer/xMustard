@@ -1,5 +1,7 @@
-//! Streaming per-file fact extraction for the existing tree-sitter languages (Go, Rust,
-//! TypeScript/TSX, JavaScript/JSX) with a precompiled lexical fallback for the rest.
+//! Streaming per-file fact extraction. Each language's pack (`lang::PACKS`) chooses the
+//! extractor: the hand-written walker below for Go, Rust, TypeScript/TSX and
+//! JavaScript/JSX, the tag-query engine (`lang::tags`) for the other grammar packs, and
+//! the precompiled lexical fallback (`lexical`) for files no grammar parses.
 //!
 //! One file is parsed, walked once with a cursor, and its tree dropped before the next
 //! file is read. The walk records:
@@ -12,10 +14,12 @@
 //! - function-aligned chunks.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
 
 use sha2::{Digest, Sha256};
-use tree_sitter::{Language, Node, Parser, TreeCursor};
+use tree_sitter::{Node, Parser, TreeCursor};
+
+pub use super::lang::Lang;
+use super::lang::{Extractor, tags};
 
 use super::chunks;
 use super::facts::{FileFacts, ImportFact, RefFact, SymbolFact, flow, ref_kind};
@@ -41,86 +45,15 @@ pub const MAX_QUALIFIED_BYTES: usize = 256;
 
 /// Syntax-tree depth past which leading doc comments are not looked up (each lookup
 /// walks the tree from the root: quadratic time on a deeply nested file).
-const MAX_DOC_DEPTH: usize = 256;
+pub(crate) const MAX_DOC_DEPTH: usize = 256;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Lang {
-    Rust,
-    Go,
-    TypeScript,
-    Tsx,
-    JavaScript,
-    Python,
-    Java,
-    Ruby,
-    C,
-    Cpp,
-}
-
-impl Lang {
-    pub fn for_path(path: &str) -> Option<Lang> {
-        let ext = Path::new(path)
-            .extension()
-            .and_then(|e| e.to_str())?
-            .to_ascii_lowercase();
-        Some(match ext.as_str() {
-            "rs" => Lang::Rust,
-            "go" => Lang::Go,
-            "ts" | "mts" | "cts" => Lang::TypeScript,
-            "tsx" => Lang::Tsx,
-            "js" | "jsx" | "mjs" | "cjs" => Lang::JavaScript,
-            "py" => Lang::Python,
-            "java" => Lang::Java,
-            "rb" => Lang::Ruby,
-            "c" | "h" => Lang::C,
-            "cpp" | "hpp" | "cc" | "cxx" | "hh" => Lang::Cpp,
-            _ => return None,
-        })
-    }
-
-    pub fn name(self) -> &'static str {
-        match self {
-            Lang::Rust => "rust",
-            Lang::Go => "go",
-            Lang::TypeScript => "typescript",
-            Lang::Tsx => "tsx",
-            Lang::JavaScript => "javascript",
-            Lang::Python => "python",
-            Lang::Java => "java",
-            Lang::Ruby => "ruby",
-            Lang::C => "c",
-            Lang::Cpp => "cpp",
-        }
-    }
-
-    fn grammar(self) -> Option<Language> {
-        Some(match self {
-            Lang::Rust => tree_sitter_rust::LANGUAGE.into(),
-            Lang::Go => tree_sitter_go::LANGUAGE.into(),
-            Lang::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-            Lang::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
-            Lang::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
-            _ => return None,
-        })
-    }
-
-    pub fn has_grammar(self) -> bool {
-        matches!(
-            self,
-            Lang::Rust | Lang::Go | Lang::TypeScript | Lang::Tsx | Lang::JavaScript
-        )
-    }
-
-    fn is_js_family(self) -> bool {
-        matches!(self, Lang::TypeScript | Lang::Tsx | Lang::JavaScript)
-    }
-}
-
-/// Grammar identities for the analyzer version (a grammar bump changes facts).
+/// Grammar identities for the analyzer version (a grammar bump, or a pack compiled in or
+/// out, changes facts).
 pub fn grammar_versions() -> String {
     format!(
-        "ts-abi-{};rust-0.24;go-0.25;typescript-0.23;javascript-0.25;extractor-{EXTRACTOR_REVISION};lexical-{}",
+        "ts-abi-{};{};extractor-{EXTRACTOR_REVISION};lexical-{}",
         tree_sitter::LANGUAGE_VERSION,
+        super::lang::grammar_ids(),
         lexical::LEXICAL_REVISION
     )
 }
@@ -283,6 +216,13 @@ pub fn extraction_mode(lang: Lang, text: &[u8], max_parse_bytes: usize) -> &'sta
 }
 
 fn extract_tree_sitter(lang: Lang, text: &str) -> Option<FileFacts> {
+    match lang.pack().extractor {
+        Extractor::Walker => walk_file(lang, text),
+        Extractor::Tags => tags::extract(lang, text),
+    }
+}
+
+fn walk_file(lang: Lang, text: &str) -> Option<FileFacts> {
     // A fresh parser per file: its internal stack is freed with it, and only grammars
     // of files actually parsed are ever touched.
     let mut parser = Parser::new();
@@ -388,6 +328,81 @@ fn is_function_value(kind: &str) -> bool {
 
 fn normalize_ws(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// `prefix.name`, with a prefix longer than MAX_QUALIFIED_BYTES replaced by
+/// `~<16 hex of its hash>` (deterministic, so UIDs stay stable); sets `truncated` then.
+pub(crate) fn qualify(prefix: &str, name: &str, truncated: &mut bool) -> String {
+    if prefix.is_empty() {
+        return name.to_string();
+    }
+    if prefix.len() + 1 + name.len() <= MAX_QUALIFIED_BYTES {
+        return format!("{prefix}.{name}");
+    }
+    *truncated = true;
+    let h = format!("{:x}", Sha256::digest(prefix.as_bytes()));
+    format!("~{}.{name}", &h[..16])
+}
+
+/// Hash of the whitespace-normalized text of `parts`; empty when there are none.
+pub(crate) fn signature_hash(src: &[u8], parts: &[Option<Node<'_>>]) -> String {
+    let mut s = String::new();
+    for p in parts.iter().flatten() {
+        s.push_str(&normalize_ws(
+            std::str::from_utf8(&src[p.byte_range()]).unwrap_or(""),
+        ));
+        s.push('|');
+    }
+    if s.is_empty() {
+        return String::new();
+    }
+    format!("{:x}", Sha256::digest(s.as_bytes()))[..16].to_string()
+}
+
+/// Last line of a declaration node (one ending at column 0 ends on the previous line).
+pub(crate) fn decl_end_line(decl: Node<'_>) -> u32 {
+    let end = decl.end_position();
+    if end.column == 0 && end.row > decl.start_position().row {
+        end.row as u32
+    } else {
+        end.row as u32 + 1
+    }
+}
+
+/// Leading doc comments and attributes directly above `outer`: the first line of the
+/// contiguous run, or `outer`'s own line. `too_deep` skips the lookup: tree-sitter's
+/// sibling lookups walk down from the root, so they cost O(depth) each, and past
+/// MAX_DOC_DEPTH a declaration starts at its own line.
+pub(crate) fn doc_start_line(outer: Node<'_>, too_deep: bool) -> u32 {
+    let mut line = outer.start_position().row as u32 + 1;
+    if too_deep {
+        return line;
+    }
+    let mut prev = outer.prev_sibling();
+    while let Some(p) = prev {
+        let is_doc = matches!(
+            p.kind(),
+            "comment"
+                | "line_comment"
+                | "block_comment"
+                | "attribute_item"
+                | "decorator"
+                | "attribute_list"
+        );
+        let end = p.end_position().row as u32 + 1;
+        // a line comment's node may end at column 0 of the next line.
+        let end = if p.end_position().column == 0 && end > 1 {
+            end - 1
+        } else {
+            end
+        };
+        if !is_doc || end + 1 < line {
+            break;
+        }
+        line = p.start_position().row as u32 + 1;
+        prev = p.prev_sibling();
+    }
+    line
 }
 
 impl<'a> Walker<'a> {
@@ -749,32 +764,7 @@ impl<'a> Walker<'a> {
     /// Leading doc comments and attributes directly above `outer`: the first line of the
     /// contiguous run, or `outer`'s own line.
     fn doc_start_line(&self, outer: Node<'_>) -> u32 {
-        let mut line = outer.start_position().row as u32 + 1;
-        // tree-sitter's sibling and parent lookups walk down from the root, so they cost
-        // O(depth) each; past MAX_DOC_DEPTH a declaration starts at its own line.
-        if self.anc.len() > MAX_DOC_DEPTH {
-            return line;
-        }
-        let mut prev = outer.prev_sibling();
-        while let Some(p) = prev {
-            let is_doc = matches!(
-                p.kind(),
-                "comment" | "line_comment" | "block_comment" | "attribute_item" | "decorator"
-            );
-            let end = p.end_position().row as u32 + 1;
-            // a line comment's node may end at column 0 of the next line.
-            let end = if p.end_position().column == 0 && end > 1 {
-                end - 1
-            } else {
-                end
-            };
-            if !is_doc || end + 1 < line {
-                break;
-            }
-            line = p.start_position().row as u32 + 1;
-            prev = p.prev_sibling();
-        }
-        line
+        doc_start_line(outer, self.anc.len() > MAX_DOC_DEPTH)
     }
 
     fn arity_of(&self, params: Option<Node<'_>>) -> u32 {
@@ -817,15 +807,7 @@ impl<'a> Walker<'a> {
     }
 
     fn signature_hash(&self, parts: &[Option<Node<'_>>]) -> String {
-        let mut s = String::new();
-        for p in parts.iter().flatten() {
-            s.push_str(&normalize_ws(self.text(*p)));
-            s.push('|');
-        }
-        if s.is_empty() {
-            return String::new();
-        }
-        format!("{:x}", Sha256::digest(s.as_bytes()))[..16].to_string()
+        signature_hash(self.src, parts)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -864,13 +846,7 @@ impl<'a> Walker<'a> {
         let idx = self.symbols.len() as u32;
         let callable = matches!(kind, "Function" | "Method" | "Constructor");
         let depth = self.scopes.iter().filter(|s| s.symbol.is_some()).count() as u32;
-        let end = decl.end_position();
-        // a node ending at column 0 ends on the previous line.
-        let end_line = if end.column == 0 && end.row > decl.start_position().row {
-            end.row as u32
-        } else {
-            end.row as u32 + 1
-        };
+        let end_line = decl_end_line(decl);
         self.symbols.push(SymbolFact {
             name,
             qualified_name: qualified,
@@ -907,15 +883,7 @@ impl<'a> Walker<'a> {
     /// `prefix.name`, with a prefix longer than MAX_QUALIFIED_BYTES replaced by
     /// `~<16 hex of its hash>` (deterministic, so UIDs stay stable).
     fn qualify(&mut self, prefix: &str, name: &str) -> String {
-        if prefix.is_empty() {
-            return name.to_string();
-        }
-        if prefix.len() + 1 + name.len() <= MAX_QUALIFIED_BYTES {
-            return format!("{prefix}.{name}");
-        }
-        self.nesting_truncated = true;
-        let h = format!("{:x}", Sha256::digest(prefix.as_bytes()));
-        format!("~{}.{name}", &h[..16])
+        qualify(prefix, name, &mut self.nesting_truncated)
     }
 
     fn name_of<'t>(&self, node: Node<'t>, field: &str) -> Option<(Node<'t>, String)> {

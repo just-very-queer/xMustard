@@ -1,0 +1,24 @@
+engine tree_sitter parse_errors false
+symbols
+  Macro LIMIT arity=- lines=4-4 doc_from=4 exported=true local=false depth=0
+  Macro SQUARE arity=- lines=5-5 doc_from=5 exported=true local=false depth=0
+  Struct Point arity=- lines=8-11 doc_from=7 exported=true local=false depth=0
+  Property Point.x arity=- lines=9-9 doc_from=9 exported=true local=false depth=1
+  Property Point.y arity=- lines=10-10 doc_from=10 exported=true local=false depth=1
+  TypeAlias point_t arity=- lines=13-13 doc_from=13 exported=true local=false depth=0
+  Enum Color arity=- lines=15-15 doc_from=15 exported=true local=false depth=0
+  EnumMember Color.RED arity=- lines=15-15 doc_from=15 exported=true local=false depth=1
+  EnumMember Color.GREEN arity=- lines=15-15 doc_from=15 exported=true local=false depth=1
+  Function helper arity=1 lines=18-20 doc_from=17 exported=false local=false depth=0
+  Function make arity=2 lines=22-26 doc_from=22 exported=true local=false depth=0
+imports
+  1 include stdio.h name=- alias=-
+  2 include local.h name=- alias=-
+references (non-read)
+  13 type Point in point_t
+  18 bind a in helper
+  22 type Point in make
+  22 bind p in make
+  22 bind n in make
+  24 write x in make
+  24 call helper in make

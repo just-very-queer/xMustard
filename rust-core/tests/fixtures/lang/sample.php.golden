@@ -1,0 +1,33 @@
+engine tree_sitter parse_errors false
+symbols
+  Namespace App\Models arity=- lines=2-2 doc_from=2 exported=true local=false depth=0
+  Class User arity=- lines=10-26 doc_from=8 exported=true local=false depth=0
+  Property User.name arity=- lines=12-12 doc_from=12 exported=false local=false depth=1
+  Method User.__construct arity=1 lines=14-17 doc_from=14 exported=true local=false depth=1
+  Method User.greet arity=2 lines=19-23 doc_from=19 exported=true local=false depth=1
+  Method User.hidden arity=0 lines=25-25 doc_from=25 exported=false local=false depth=1
+  Interface Thing arity=- lines=28-31 doc_from=28 exported=true local=false depth=0
+  Method Thing.run arity=0 lines=30-30 doc_from=30 exported=true local=false depth=1
+  Function top arity=1 lines=33-36 doc_from=33 exported=true local=false depth=0
+imports
+  4 import App\Contracts\Thing name=- alias=-
+  5 import Foo\Bar name=- alias=Baz
+  6 require boot.php name=- alias=-
+references (non-read)
+  4 import App in -
+  4 import Contracts in -
+  4 import Thing in -
+  5 import Foo in -
+  5 import Bar in -
+  5 import Baz in -
+  10 extends Model in User
+  10 implements Thing in User
+  14 bind name in User.__construct
+  16 write name in User.__construct
+  19 bind who in User.greet
+  19 bind n in User.greet
+  21 write s in User.greet
+  22 call helper in User.greet
+  22 member name in User.greet
+  33 bind x in top
+  35 call strlen in top

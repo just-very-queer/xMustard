@@ -1,8 +1,9 @@
-//! Lexical fallback for the languages without a grammar in this build (Python, Java,
-//! Ruby, C, C++) and for grammar files above `max_parse_bytes`: precompiled declaration
-//! patterns for symbols, and a language-aware scanner (`blank_comments_and_strings`)
-//! that blanks comments and string literals before collecting identifier references, so
-//! prose and literals never become references here either.
+//! Lexical fallback for packs whose grammar is not compiled into this build and for
+//! grammar files above the parse bounds: precompiled declaration patterns for symbols
+//! (each pack's `Pack::lexical`), and a language-aware scanner
+//! (`blank_comments_and_strings`) that blanks comments and string literals before
+//! collecting identifier references, so prose and literals never become references
+//! here either.
 //!
 //! The declaration patterns, import-line and inheritance heuristics are ported from
 //! `symbolgraph.rs` and `repomap.rs` (the legacy lexical graph), compiled once per
@@ -15,13 +16,14 @@ use regex::bytes::Regex;
 
 use super::extract::{Lang, MAX_REFS_PER_FILE, MAX_SYMBOLS_PER_FILE};
 use super::facts::{FileFacts, ImportFact, RefFact, SymbolFact, flow, ref_kind};
+use super::lang::PACKS;
 
-pub const LEXICAL_REVISION: u32 = 3;
+pub const LEXICAL_REVISION: u32 = 4;
 
 /// Longest span given to a fallback symbol (its end is the next declaration).
 const MAX_FALLBACK_SPAN: u32 = 80;
 
-type Patterns = Vec<(Regex, &'static str)>;
+pub(crate) type Patterns = Vec<(Regex, &'static str)>;
 
 /// Lazy-DFA cache per pattern. The default (2 MiB each) let seven patterns over a
 /// generated file add megabytes to the worker; declarations need far less.
@@ -46,72 +48,12 @@ fn compile(list: &[(&str, &'static str)]) -> Patterns {
         .collect()
 }
 
-/// Declaration patterns per language family, compiled once per process. The first
-/// capture group is the declared name. The TS/JS, Go and Rust sets serve files above
-/// `max_parse_bytes`; Python and the def/class/func/fn forms follow the legacy regexes.
-fn patterns(lang: Lang) -> &'static Patterns {
-    static JS: OnceLock<Patterns> = OnceLock::new();
-    static GO: OnceLock<Patterns> = OnceLock::new();
-    static RUST: OnceLock<Patterns> = OnceLock::new();
-    static PY: OnceLock<Patterns> = OnceLock::new();
-    static RUBY: OnceLock<Patterns> = OnceLock::new();
-    static JAVA: OnceLock<Patterns> = OnceLock::new();
-    static C: OnceLock<Patterns> = OnceLock::new();
-    match lang {
-        Lang::TypeScript | Lang::Tsx | Lang::JavaScript => JS.get_or_init(|| {
-            compile(&[
-                (r"^\s*(?:export\s+)?(?:default\s+)?(?:declare\s+)?(?:async\s+)?function\*?\s+([A-Za-z_$][\w$]*)", "Function"),
-                (r"^\s*(?:export\s+)?(?:default\s+)?(?:declare\s+)?(?:abstract\s+)?class\s+([A-Za-z_$][\w$]*)", "Class"),
-                (r"^\s*(?:export\s+)?(?:declare\s+)?interface\s+([A-Za-z_$][\w$]*)", "Interface"),
-                (r"^\s*(?:export\s+)?(?:declare\s+)?type\s+([A-Za-z_$][\w$]*)\s*(?:<[^=]*>)?\s*=", "TypeAlias"),
-                (r"^\s*(?:export\s+)?(?:declare\s+)?(?:const\s+)?enum\s+([A-Za-z_$][\w$]*)", "Enum"),
-                (r"^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=]*)?=\s*(?:async\s+)?(?:function\b|\([^)]*\)\s*(?::[^=]*)?=>|[A-Za-z_$][\w$]*\s*=>)", "Function"),
-                (r"^\s+(?:(?:public|private|protected|static|async|readonly|override|abstract|get|set)\s+)*([A-Za-z_$][\w$]*)\s*(?:<[^>]*>)?\([^)]*\)\s*(?::\s*[^{;]+)?\{\s*$", "Method"),
-            ])
-        }),
-        Lang::Go => GO.get_or_init(|| {
-            compile(&[
-                (r"^\s*func\s+(?:\([^)]+\)\s*)?([A-Za-z_][A-Za-z0-9_]*)\s*[\[(]", "Function"),
-                (r"^\s*type\s+([A-Za-z_][A-Za-z0-9_]*)\s+struct\b", "Struct"),
-                (r"^\s*type\s+([A-Za-z_][A-Za-z0-9_]*)\s+interface\b", "Interface"),
-                (r"^\s*type\s+([A-Za-z_][A-Za-z0-9_]*)\b", "TypeAlias"),
-            ])
-        }),
-        Lang::Rust => RUST.get_or_init(|| {
-            compile(&[
-                (r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:const\s+)?(?:async\s+)?(?:unsafe\s+)?(?:extern\s+\S+\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)", "Function"),
-                (r"^\s*(?:pub(?:\([^)]*\))?\s+)?struct\s+([A-Za-z_][A-Za-z0-9_]*)", "Struct"),
-                (r"^\s*(?:pub(?:\([^)]*\))?\s+)?enum\s+([A-Za-z_][A-Za-z0-9_]*)", "Enum"),
-                (r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:unsafe\s+)?trait\s+([A-Za-z_][A-Za-z0-9_]*)", "Trait"),
-                (r"^\s*(?:pub(?:\([^)]*\))?\s+)?type\s+([A-Za-z_][A-Za-z0-9_]*)", "TypeAlias"),
-            ])
-        }),
-        Lang::Python => PY.get_or_init(|| {
-            compile(&[
-                (r"^\s*(?:async\s+)?def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(", "Function"),
-                (r"^\s*class\s+([A-Za-z_][A-Za-z0-9_]*)\b", "Class"),
-            ])
-        }),
-        Lang::Ruby => RUBY.get_or_init(|| {
-            compile(&[
-                (r"^\s*def\s+(?:self\.)?([A-Za-z_][A-Za-z0-9_]*[?!]?)", "Function"),
-                (r"^\s*class\s+([A-Z][A-Za-z0-9_]*)\b", "Class"),
-                (r"^\s*module\s+([A-Z][A-Za-z0-9_]*)\b", "Module"),
-            ])
-        }),
-        Lang::Java => JAVA.get_or_init(|| {
-            compile(&[
-                (r"^\s*(?:(?:public|private|protected|static|final|abstract|sealed)\s+)*(?:class|interface|enum|record)\s+([A-Za-z_][A-Za-z0-9_]*)\b", "Class"),
-                (r"^\s*(?:(?:public|private|protected|static|final|abstract|synchronized|native|default)\s+)+[A-Za-z_][A-Za-z0-9_<>\[\], ?]*\s+([A-Za-z_][A-Za-z0-9_]*)\s*\([^;]*$", "Method"),
-            ])
-        }),
-        Lang::C | Lang::Cpp => C.get_or_init(|| {
-            compile(&[
-                (r"^\s*(?:typedef\s+)?(?:struct|union|enum|class)\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?::[^{]*)?\{", "Struct"),
-                (r"^[A-Za-z_][A-Za-z0-9_\s\*&:<>,]*[\s\*&]([A-Za-z_][A-Za-z0-9_:]*)\s*\([^;]*\)\s*(?:const\s*)?\{?\s*$", "Function"),
-            ])
-        }),
-    }
+/// The pack's declaration patterns (`Pack::lexical`), compiled once per process on
+/// first use. The first capture group is the declared name. Grammar packs use them for
+/// files above the parse bounds; packs whose grammar feature is off, for every file.
+pub(crate) fn patterns(lang: Lang) -> &'static Patterns {
+    static COMPILED: [OnceLock<Patterns>; PACKS.len()] = [const { OnceLock::new() }; PACKS.len()];
+    COMPILED[lang as usize].get_or_init(|| compile(lang.pack().lexical))
 }
 
 const KEYWORDS: &[&str] = &[
@@ -252,7 +194,7 @@ impl<'a> Blanker<'a> {
     }
 
     fn c_comments(&self) -> bool {
-        !matches!(self.lang, Lang::Python | Lang::Ruby)
+        !matches!(self.lang, Lang::Python | Lang::Ruby | Lang::Bash)
     }
 
     fn js(&self) -> bool {
@@ -465,6 +407,14 @@ impl<'a> Blanker<'a> {
         }
         match self.lang {
             Lang::Python if b[i] == b'#' => Some(self.eol(i)),
+            // PHP 8 attributes are `#[...]`
+            Lang::Php if b[i] == b'#' && b.get(i + 1) != Some(&b'[') => Some(self.eol(i)),
+            // `#` starts a comment at a word boundary (`$#` and `${#x}` are expansions)
+            Lang::Bash
+                if b[i] == b'#' && (i == 0 || matches!(b[i - 1], b' ' | b'\t' | b'\n' | b';')) =>
+            {
+                Some(self.eol(i))
+            }
             Lang::Ruby => {
                 if b[i] == b'#' {
                     return Some(self.eol(i));
@@ -563,7 +513,12 @@ impl<'a> Blanker<'a> {
                     self.quoted(i, c, false, true)
                 }
             }
-            (Lang::Java, b'"') if rest.starts_with(b"\"\"\"") => self.triple(i, b"\"\"\""),
+            (Lang::Java | Lang::Kotlin | Lang::Swift | Lang::CSharp, b'"')
+                if rest.starts_with(b"\"\"\"") =>
+            {
+                self.triple(i, b"\"\"\"")
+            }
+            (Lang::Bash, b'"' | b'\'') => self.quoted(i, c, true, c == b'"'),
             (Lang::Rust, b'"') => self.quoted(i, b'"', true, true),
             (Lang::Rust, b'\'') => return Some(self.rust_quote(i)),
             (Lang::Ruby, b'"' | b'`') => return Some(self.interpolated(i, c, c)),
@@ -1235,7 +1190,12 @@ fn is_import_line(lang: Lang, line: &str) -> bool {
         Lang::Rust => {
             t.starts_with("use ") || t.starts_with("pub use ") || t.starts_with("extern crate ")
         }
-        _ => t.starts_with("#include") || t.starts_with("#import") || t.starts_with("using "),
+        Lang::Kotlin | Lang::Swift => t.starts_with("import "),
+        Lang::Php => t.starts_with("use ") || t.starts_with("require") || t.starts_with("include"),
+        Lang::Bash => t.starts_with("source ") || t.starts_with(". "),
+        Lang::C | Lang::Cpp | Lang::CSharp => {
+            t.starts_with("#include") || t.starts_with("#import") || t.starts_with("using ")
+        }
     }
 }
 
@@ -1398,7 +1358,37 @@ fn parse_imports(lang: Lang, line_no: u32, raw: &str, out: &mut Vec<ImportFact>)
             };
             push(out, kind, module, name, None);
         }
-        _ => {
+        Lang::Kotlin | Lang::Swift | Lang::Php => {
+            let body = ["import ", "use "].iter().find_map(|kw| t.strip_prefix(kw));
+            let quoted = t
+                .split(['\'', '"'])
+                .nth(1)
+                .filter(|_| t.starts_with("require") || t.starts_with("include"));
+            match (body, quoted) {
+                (Some(b), _) => {
+                    let (module, alias) = match b.split_once(" as ") {
+                        Some((m, a)) => (m, Some(a)),
+                        None => (b, None),
+                    };
+                    push(out, "import", module, None, alias);
+                }
+                (None, Some(m)) => push(out, "require", m, None, None),
+                (None, None) => {}
+            }
+        }
+        Lang::Bash => {
+            let rest = t.strip_prefix("source ").or_else(|| t.strip_prefix(". "));
+            if let Some(m) = rest.and_then(|r| r.split_whitespace().next()) {
+                push(
+                    out,
+                    "require",
+                    m.trim_matches(|c| c == '"' || c == '\''),
+                    None,
+                    None,
+                );
+            }
+        }
+        Lang::C | Lang::Cpp | Lang::CSharp => {
             for kw in ["#include", "#import"] {
                 if let Some(rest) = t.strip_prefix(kw) {
                     let m = rest
@@ -1585,6 +1575,26 @@ pub fn extract(lang: Lang, text: &str) -> FileFacts {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pack_patterns_compile_once_per_process() {
+        // PAR-RT-11: the fallback compiled its patterns per file; now each pack's set is
+        // compiled on first use and every later file reuses it.
+        for p in PACKS.iter() {
+            let first = patterns(p.lang) as *const Patterns;
+            let started = std::time::Instant::now();
+            for _ in 0..1000 {
+                assert!(
+                    std::ptr::eq(patterns(p.lang), first),
+                    "{} recompiled",
+                    p.name
+                );
+            }
+            // 1,000 lookups of a compiled set take microseconds; one compile takes more
+            assert!(started.elapsed() < std::time::Duration::from_millis(50));
+            assert_eq!(patterns(p.lang).len(), p.lexical.len());
+        }
+    }
 
     #[test]
     fn comments_and_strings_are_blanked() {
