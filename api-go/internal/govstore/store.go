@@ -257,6 +257,29 @@ type Actor struct {
 	Branch    string
 	Dirty     *bool
 	Note      string
+	// Provenance of the write (PAR-PROV-04): the tool call that made it, the run it
+	// belongs to and the evidence handles it rests on. Every event the write appends
+	// records them under "provenance".
+	CallID   string
+	RunID    string
+	Evidence []string
+}
+
+// provenance is the event record of a's provenance, nil when it has none.
+func (a Actor) provenance() map[string]any {
+	p := map[string]any{}
+	for k, v := range map[string]string{"call_id": a.CallID, "run_id": a.RunID} {
+		if v != "" {
+			p[k] = v
+		}
+	}
+	if len(a.Evidence) > 0 {
+		p["evidence"] = a.Evidence
+	}
+	if len(p) == 0 {
+		return nil
+	}
+	return p
 }
 
 func (a Actor) validate() error {

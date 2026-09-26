@@ -47,6 +47,12 @@ type Principal struct {
 	// (per-worker token scoping). Empty/nil means unrestricted — backward-compatible
 	// with existing unscoped tokens and operator/env tokens.
 	Workspaces []string `json:"workspaces,omitempty"`
+	// Owner is who operates the principal and Kind whether it is a human or an agent
+	// (PAR-PROV-05, D-16). A token minted without them is its own owner, of kind agent.
+	// They are recorded with every memory write, and the owner-distinct policy compares
+	// owners instead of token ids.
+	Owner string `json:"owner,omitempty"`
+	Kind  string `json:"kind,omitempty"`
 }
 
 // AllowsWorkspace reports whether the principal may act on workspaceID. An empty
@@ -73,6 +79,41 @@ type tokenRecord struct {
 	ExpiresAt string `json:"expires_at,omitempty"`
 	// Workspaces restricts the token to these workspace ids (empty = all).
 	Workspaces []string `json:"workspaces,omitempty"`
+	TokenIdentity
+}
+
+// TokenIdentity is who operates a token (see Principal.Owner and Principal.Kind).
+type TokenIdentity struct {
+	Owner string `json:"owner,omitempty"`
+	Kind  string `json:"kind,omitempty"`
+}
+
+// Principal kinds.
+const (
+	PrincipalAgent = "agent"
+	PrincipalHuman = "human"
+)
+
+// normalize defaults the identity of token id and validates it.
+func (ti TokenIdentity) normalize(id string) (TokenIdentity, error) {
+	ti.Owner = fallbackString(strings.TrimSpace(ti.Owner), id)
+	ti.Kind = fallbackString(strings.ToLower(strings.TrimSpace(ti.Kind)), PrincipalAgent)
+	if err := validateSafeID("owner", ti.Owner); err != nil {
+		return TokenIdentity{}, err
+	}
+	if ti.Kind != PrincipalAgent && ti.Kind != PrincipalHuman {
+		return TokenIdentity{}, fmt.Errorf("kind %q is not agent or human: %w", ti.Kind, ErrInvalidInput)
+	}
+	return ti, nil
+}
+
+// principal is the identity a stored token resolves to. A record written before owners
+// existed is its own owner, of kind agent.
+func (r tokenRecord) principal() Principal {
+	p := newPrincipal(r.ID, fallbackString(r.Role, roleAgent), slices.Clone(r.Workspaces))
+	p.Owner = fallbackString(r.Owner, p.Owner)
+	p.Kind = fallbackString(r.Kind, p.Kind)
+	return p
 }
 
 // tokenExpired reports whether an RFC3339 ExpiresAt is set and in the past. A
@@ -119,7 +160,7 @@ type credential struct {
 }
 
 func newPrincipal(id, roleSpec string, workspaces []string) Principal {
-	return Principal{ID: id, Role: roleSpec, Roles: ExpandRoles(roleSpec), Workspaces: workspaces}
+	return Principal{ID: id, Role: roleSpec, Roles: ExpandRoles(roleSpec), Workspaces: workspaces, Owner: id, Kind: PrincipalAgent}
 }
 
 // Token store cache (PAR-SEC-07). The auth middleware resolves a token on every
@@ -176,7 +217,7 @@ func cachedTokenStore(dataDir string) (*tokenFileCache, error) {
 		if derr != nil || len(raw) != sha256.Size {
 			continue // a malformed digest can never match
 		}
-		cred := credential{principal: newPrincipal(r.ID, fallbackString(r.Role, roleAgent), r.Workspaces), expiresAt: r.ExpiresAt}
+		cred := credential{principal: r.principal(), expiresAt: r.ExpiresAt}
 		copy(cred.digest[:], raw)
 		c.creds = append(c.creds, cred)
 	}
@@ -349,12 +390,22 @@ func MintTokenTTL(dataDir, id, role string, ttlSeconds int) (string, error) {
 		return "", err
 	}
 	defer unlock()
-	return mintTokenLocked(dataDir, id, role, ttlSeconds, nil)
+	return mintTokenLocked(dataDir, id, role, ttlSeconds, nil, TokenIdentity{Owner: id, Kind: PrincipalAgent})
 }
 
 // MintScopedToken mints a token confined to the given workspace ids (empty = all).
 func MintScopedToken(dataDir, id, role string, ttlSeconds int, workspaces []string) (string, error) {
+	return MintIdentityToken(dataDir, id, role, ttlSeconds, workspaces, TokenIdentity{})
+}
+
+// MintIdentityToken mints a scoped token operated by ident's owner and kind (empty
+// fields default to the token id and agent).
+func MintIdentityToken(dataDir, id, role string, ttlSeconds int, workspaces []string, ident TokenIdentity) (string, error) {
 	if err := validateMintInputs(&id, &role, ttlSeconds); err != nil {
+		return "", err
+	}
+	ident, err := ident.normalize(id)
+	if err != nil {
 		return "", err
 	}
 	unlock, err := lockTokenStore(dataDir)
@@ -362,11 +413,11 @@ func MintScopedToken(dataDir, id, role string, ttlSeconds int, workspaces []stri
 		return "", err
 	}
 	defer unlock()
-	return mintTokenLocked(dataDir, id, role, ttlSeconds, workspaces)
+	return mintTokenLocked(dataDir, id, role, ttlSeconds, workspaces, ident)
 }
 
 // mintTokenLocked does the load-modify-write; the caller MUST hold lockTokenStore.
-func mintTokenLocked(dataDir, id, role string, ttlSeconds int, workspaces []string) (string, error) {
+func mintTokenLocked(dataDir, id, role string, ttlSeconds int, workspaces []string, ident TokenIdentity) (string, error) {
 	buf := make([]byte, 32)
 	if _, err := rand.Read(buf); err != nil {
 		return "", err
@@ -395,6 +446,9 @@ func mintTokenLocked(dataDir, id, role string, ttlSeconds int, workspaces []stri
 		CreatedAt:   nowUTC(),
 		ExpiresAt:   expiresAt,
 		Workspaces:  workspaces,
+		// Only an owner other than the id itself is written, so stored records stay
+		// as they were for tokens that never set one.
+		TokenIdentity: TokenIdentity{Owner: stripDefault(ident.Owner, id), Kind: stripDefault(ident.Kind, PrincipalAgent)},
 	})
 	if err := writeJSON(tokensPath(dataDir), next); err != nil {
 		return "", err
@@ -423,21 +477,14 @@ func RotateToken(dataDir, id string, ttlSeconds int) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	role := ""
-	var workspaces []string
-	found := false
 	for _, r := range recs {
 		if r.ID == id {
-			role = fallbackString(r.Role, roleAgent)
-			workspaces = r.Workspaces // preserve the workspace scope across rotation
-			found = true
-			break
+			// preserve the role, workspace scope and identity across rotation
+			p := r.principal()
+			return mintTokenLocked(dataDir, id, p.Role, ttlSeconds, r.Workspaces, TokenIdentity{Owner: p.Owner, Kind: p.Kind})
 		}
 	}
-	if !found {
-		return "", os.ErrNotExist
-	}
-	return mintTokenLocked(dataDir, id, role, ttlSeconds, workspaces)
+	return "", os.ErrNotExist
 }
 
 // ListPrincipals returns the configured principals and their roles (no secrets).
@@ -448,7 +495,7 @@ func ListPrincipals(dataDir string) []Principal {
 	}
 	if store, err := cachedTokenStore(dataDir); err == nil {
 		for _, r := range store.recs {
-			seen[r.ID] = newPrincipal(r.ID, fallbackString(r.Role, roleAgent), slices.Clone(r.Workspaces))
+			seen[r.ID] = r.principal()
 		}
 	}
 	out := make([]Principal, 0, len(seen))
@@ -457,6 +504,17 @@ func ListPrincipals(dataDir string) []Principal {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out
+}
+
+// PrincipalOwner is who operates principal id: its token's owner, or id itself when
+// the token records none or is gone (a revoked author still owns what it wrote).
+func PrincipalOwner(dataDir, id string) string {
+	for _, p := range ListPrincipals(dataDir) {
+		if p.ID == id {
+			return fallbackString(p.Owner, id)
+		}
+	}
+	return id
 }
 
 // RevokeToken removes a principal's token. Holds lockTokenStore across the
@@ -488,4 +546,12 @@ func RevokeToken(dataDir, id string) error {
 	}
 	invalidateTokenCache(dataDir)
 	return nil
+}
+
+// stripDefault is "" when v is the default def, so a default is never stored.
+func stripDefault(v, def string) string {
+	if v == def {
+		return ""
+	}
+	return v
 }

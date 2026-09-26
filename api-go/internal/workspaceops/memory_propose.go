@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"xmustard/api-go/internal/govstore"
+	"xmustard/api-go/internal/redact"
 )
 
 // Context governance: the trust layer for the MCP context engine. Agents don't
@@ -121,6 +122,9 @@ type ContextEntry struct {
 	Diff string `json:"diff,omitempty"`
 	// Warnings reports input that was accepted but ignored, e.g. a malformed expiry.
 	Warnings []string `json:"warnings,omitempty"`
+	// Redactions reports the secrets removed from the write before it was stored
+	// (PAR-SEC-04); nothing of a secret value is kept.
+	Redactions *redact.Report `json:"redactions,omitempty"`
 }
 
 type ProposeContextRequest struct {
@@ -144,6 +148,9 @@ type ProposeContextRequest struct {
 	// promoted at once as self_asserted_open_mode instead of waiting for a quorum that
 	// a single identity can never form.
 	OpenMode bool `json:"-"`
+	// Caller carries the writer's owner, kind and provenance (Remember sets it); Source
+	// and OpenMode still decide the author.
+	Caller ContextActor `json:"-"`
 }
 
 // ContextActor is who writes to an entry. ID is recorded as its author or verifier.
@@ -160,6 +167,15 @@ type ContextActor struct {
 	// verdict remember(op=retire) casts on promoted memory.
 	Verifier bool
 	OpenMode bool
+	// Owner and Kind come from the principal's token (PAR-PROV-05); SessionID and CallID
+	// from the transport. RunID and Evidence are the run and evidence handles the write
+	// cites, set by bindProvenance once they are checked.
+	Owner     string
+	Kind      string
+	SessionID string
+	CallID    string
+	RunID     string
+	Evidence  []string
 }
 
 // safeIDPattern rejects anything that could escape the data dir or be a path
@@ -238,7 +254,9 @@ func ProposeContext(dataDir, workspaceID string, req ProposeContextRequest) (*Co
 
 	ctx := context.Background()
 	root := contextRoot(dataDir, workspaceID)
-	actor := memoryActor(source, root)
+	caller := req.Caller
+	caller.ID, caller.OpenMode = source, req.OpenMode
+	actor := caller.storeActor(root)
 	title := strings.TrimSpace(req.Title)
 	var out ContextEntry
 	var promoted bool
@@ -403,6 +421,10 @@ type RememberRequest struct {
 	OldString    string  `json:"old_string,omitempty"`
 	NewString    string  `json:"new_string,omitempty"`
 	Description  *string `json:"description,omitempty"`
+	// Evidence and RunID bind the write to the evidence handles and the run it was
+	// derived from (PAR-PROV-04); both are checked before anything is written.
+	Evidence []string `json:"evidence,omitempty"`
+	RunID    string   `json:"run_id,omitempty"`
 }
 
 var rememberOps = map[string]func(dataDir, workspaceID string, req RememberRequest, actor ContextActor) (*ContextEntry, error){
@@ -430,13 +452,30 @@ var rememberOps = map[string]func(dataDir, workspaceID string, req RememberReque
 }
 
 // Remember runs one remember write as actor, who is always the author: a proposal is
-// attributed to actor, never to a Source in the request.
+// attributed to actor, never to a Source in the request. The evidence and run the write
+// cites are checked and bound to it first, and secrets are redacted from every text
+// field that is stored (old_string only locates stored text and is never stored).
 func Remember(dataDir, workspaceID string, req RememberRequest, actor ContextActor) (*ContextEntry, error) {
 	op := fallbackString(strings.ToLower(strings.TrimSpace(req.Op)), "propose")
 	run, ok := rememberOps[op]
 	if !ok {
 		return nil, fmt.Errorf("op %q is not propose, supersede, edit, retire or restore: %w", req.Op, ErrInvalidInput)
 	}
-	req.Source, req.OpenMode = actor.ID, actor.OpenMode
-	return run(dataDir, workspaceID, req, actor)
+	if err := validateSafeID("workspace", workspaceID); err != nil {
+		return nil, err
+	}
+	actor, err := bindProvenance(dataDir, workspaceID, actor, req.Evidence, req.RunID)
+	if err != nil {
+		return nil, err
+	}
+	var red ingestRedaction
+	red.scrub(&req.Title, &req.Content, &req.NewString, &req.Reason)
+	req.Description = red.scrubOptional(req.Description)
+	req.Source, req.OpenMode, req.Caller = actor.ID, actor.OpenMode, actor
+	out, err := run(dataDir, workspaceID, req, actor)
+	if err != nil {
+		return nil, err
+	}
+	red.annotate(out)
+	return out, nil
 }

@@ -24,38 +24,91 @@ func VerifyContextAs(dataDir, workspaceID, entryID string, voter ContextActor, a
 	return VerifyContextOutcome(dataDir, workspaceID, entryID, voter, VerifyRequest{Outcome: outcome, Note: note})
 }
 
-// Verify outcomes (WS-19A). WS-19B adds duplicate_of and the per-memory feedback
-// outcomes with evidence-bound votes.
+// Verify outcomes. approve, reject, retract and duplicate_of are votes on a revision;
+// helpful, misleading and stale_harm report how a served memory worked out for the
+// caller (PAR-GOV-16) and never change its verification.
 const (
-	OutcomeApprove = "approve"
-	OutcomeReject  = "reject"
-	OutcomeRetract = "retract"
+	OutcomeApprove     = "approve"
+	OutcomeReject      = "reject"
+	OutcomeRetract     = "retract"
+	OutcomeDuplicateOf = "duplicate_of"
+	OutcomeHelpful     = govstore.OutcomeHelpful
+	OutcomeMisleading  = govstore.OutcomeMisleading
+	OutcomeStaleHarm   = govstore.OutcomeStaleHarm
 )
 
-// verifyVerdicts maps a verify outcome to the verdict it stores.
-var verifyVerdicts = map[string]string{
-	OutcomeApprove: govstore.VerdictApprove,
-	OutcomeReject:  govstore.VerdictReject,
-	OutcomeRetract: govstore.VerdictRetract,
+// verifyCall is one verify outcome being applied inside the store transaction.
+type verifyCall struct {
+	dataDir, workspaceID, root string
+	entry                      govstore.Entry
+	view                       ContextEntry
+	voter                      ContextActor
+	actor                      govstore.Actor
+	req                        VerifyRequest
 }
 
-// VerifyRequest is one verdict. Revision 0 votes on the served revision; the number of
-// a pending revision votes on that edit. retract applies to the served revision only.
+// verifyOutcomes applies each outcome. newlyBaselined reports a promotion that captured
+// a drift baseline.
+var verifyOutcomes = map[string]func(context.Context, govstore.Tx, verifyCall) (ContextEntry, bool, error){
+	OutcomeApprove:     castVote(govstore.VerdictApprove),
+	OutcomeReject:      castVote(govstore.VerdictReject),
+	OutcomeRetract:     castVote(govstore.VerdictRetract),
+	OutcomeDuplicateOf: castVote(govstore.VerdictDuplicateOf),
+	OutcomeHelpful:     reportOutcome,
+	OutcomeMisleading:  reportOutcome,
+	OutcomeStaleHarm:   reportOutcome,
+}
+
+// verifyOutcomeNames lists the outcomes for error messages.
+const verifyOutcomeNames = "approve, reject, retract, duplicate_of, helpful, misleading or stale_harm"
+
+func castVote(verdict string) func(context.Context, govstore.Tx, verifyCall) (ContextEntry, bool, error) {
+	return func(ctx context.Context, tx govstore.Tx, c verifyCall) (ContextEntry, bool, error) {
+		return castVerdict(ctx, tx, c.dataDir, c.workspaceID, c.root, c.entry, c.view, c.voter, c.actor, govstore.VoteInput{
+			EntryID: c.entry.ID, Revision: c.req.Revision, Verdict: verdict, Target: c.req.Target, Note: c.req.Note,
+			EvidenceHandle: c.req.EvidenceHandle,
+		})
+	}
+}
+
+// reportOutcome records the caller's feedback on the served revision; the event carries
+// the evidence it cites through the actor's provenance.
+func reportOutcome(ctx context.Context, tx govstore.Tx, c verifyCall) (ContextEntry, bool, error) {
+	if c.req.Revision != 0 || c.req.Target != "" {
+		return ContextEntry{}, false, fmt.Errorf("%s reports on the served revision and takes no revision or target: %w",
+			c.req.Outcome, ErrInvalidInput)
+	}
+	if _, err := tx.RecordOutcome(ctx, govstore.OutcomeInput{EntryID: c.entry.ID, Outcome: c.req.Outcome, Note: c.req.Note}, c.actor); err != nil {
+		return ContextEntry{}, false, err
+	}
+	out, err := entryAfter(ctx, tx, c.workspaceID, c.entry.ID)
+	return out, false, err
+}
+
+// VerifyRequest is one verify outcome. Revision 0 votes on the served revision; the
+// number of a pending revision votes on that edit. retract and the feedback outcomes
+// apply to the served revision only. Target names the entry a duplicate_of vote points
+// to. EvidenceHandle is evidence the verdict rests on, checked when it is cast.
 type VerifyRequest struct {
-	Outcome  string
-	Revision int64
-	Note     string
+	Outcome        string
+	Revision       int64
+	Note           string
+	Target         string
+	EvidenceHandle string
 }
 
 // VerifyContextOutcome records voter's verdict and settles what it decides. Distinct
 // principals only: a principal's new verdict on a revision replaces its earlier one, so
-// one agent cannot satisfy a multi-agent gate by voting twice. A vote on the served
-// revision re-promotes or demotes the entry; a vote on a pending revision accepts or
-// rejects that edit once its quorum is reached, and the result carries the diff it voted
-// on; a retract takes the entry out of recall once enough distinct principals retract
-// it. The vote re-gates an entry the open-mode identity wrote for the kind of write it
-// is (regatedRequirement). The whole read-vote-reconcile runs in one store transaction,
-// so concurrent votes from any process are never lost.
+// one agent cannot satisfy a multi-agent gate by voting twice, and under the
+// owner-distinct policy two tokens of one owner cannot verify each other's memory. A
+// vote on the served revision re-promotes or demotes the entry; a vote on a pending
+// revision accepts or rejects that edit once its quorum is reached, and the result
+// carries the diff it voted on; a retract takes the entry out of recall once enough
+// distinct principals retract it. The vote re-gates an entry the open-mode identity
+// wrote for the kind of write it is (regatedRequirement). A cited evidence handle must
+// be readable by the voter at vote time, and secrets are redacted from the note. The
+// whole read-vote-reconcile runs in one store transaction, so concurrent votes from any
+// process are never lost.
 func VerifyContextOutcome(dataDir, workspaceID, entryID string, voter ContextActor, req VerifyRequest) (*ContextEntry, error) {
 	if err := validateSafeID("workspace", workspaceID); err != nil {
 		return nil, err
@@ -67,25 +120,37 @@ func VerifyContextOutcome(dataDir, workspaceID, entryID string, voter ContextAct
 	if agent == "" {
 		return nil, fmt.Errorf("agent is required")
 	}
-	verdict, ok := verifyVerdicts[fallbackString(strings.ToLower(strings.TrimSpace(req.Outcome)), OutcomeApprove)]
+	req.Outcome = fallbackString(strings.ToLower(strings.TrimSpace(req.Outcome)), OutcomeApprove)
+	apply, ok := verifyOutcomes[req.Outcome]
 	if !ok {
-		return nil, fmt.Errorf("outcome %q is not approve, reject or retract: %w", req.Outcome, ErrInvalidInput)
+		return nil, fmt.Errorf("outcome %q is not %s: %w", req.Outcome, verifyOutcomeNames, ErrInvalidInput)
 	}
 	if req.Revision < 0 {
 		return nil, fmt.Errorf("revision must be positive: %w", ErrInvalidInput)
 	}
+	if req.Target = strings.TrimSpace(req.Target); req.Target != "" {
+		if err := validateSafeID("target entry", req.Target); err != nil {
+			return nil, err
+		}
+	}
+	voter, err := bindProvenance(dataDir, workspaceID, voter, []string{req.EvidenceHandle}, "")
+	if err != nil {
+		return nil, err
+	}
+	req.EvidenceHandle = strings.TrimSpace(req.EvidenceHandle)
+	var red ingestRedaction
+	red.scrub(&req.Note)
 	ctx := context.Background()
-	root := contextRoot(dataDir, workspaceID)
-	actor := memoryActor(agent, root)
+	c := verifyCall{dataDir: dataDir, workspaceID: workspaceID, root: contextRoot(dataDir, workspaceID), voter: voter, req: req}
+	c.actor = voter.storeActor(c.root)
 	var out ContextEntry
 	var promoted bool
-	err := memoryUpdate(ctx, dataDir, workspaceID, func(tx govstore.Tx) error {
-		e, ce, err := loadEntryTx(ctx, tx, workspaceID, entryID)
-		if err != nil {
+	err = memoryUpdate(ctx, dataDir, workspaceID, func(tx govstore.Tx) error {
+		var err error
+		if c.entry, c.view, err = loadEntryTx(ctx, tx, workspaceID, entryID); err != nil {
 			return err
 		}
-		out, promoted, err = castVerdict(ctx, tx, dataDir, workspaceID, root, e, ce, voter, actor,
-			govstore.VoteInput{EntryID: entryID, Revision: req.Revision, Verdict: verdict, Note: req.Note})
+		out, promoted, err = apply(ctx, tx, c)
 		return err
 	})
 	if err != nil {
@@ -94,6 +159,7 @@ func VerifyContextOutcome(dataDir, workspaceID, entryID string, voter ContextAct
 	if promoted {
 		recordVerifyFeedback(dataDir, workspaceID, out.ID, out.Paths)
 	}
+	red.annotate(&out)
 	return &out, nil
 }
 
@@ -110,6 +176,9 @@ func castVerdict(ctx context.Context, tx govstore.Tx, dataDir, workspaceID, root
 		return ContextEntry{}, false, &govstore.ConflictError{EntryID: in.EntryID, BaseRevision: in.Revision,
 			CurrentRevision: e.Revision, CurrentDigest: e.ContentDigest, HeadRevision: e.HeadRevision,
 			Reason: "only the served revision or the pending head revision takes votes"}
+	}
+	if err := checkOwnerDistinct(ctx, tx, dataDir, e, in, voter); err != nil {
+		return ContextEntry{}, false, err
 	}
 	if _, err := tx.RecordVote(ctx, in, actor); err != nil {
 		return ContextEntry{}, false, err

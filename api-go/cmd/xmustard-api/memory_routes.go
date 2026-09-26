@@ -45,10 +45,12 @@ func registerMemoryRoutes(mux routeRegistrar) {
 			return
 		}
 		var req struct {
-			Approve  bool   `json:"approve"`
-			Outcome  string `json:"outcome"`
-			Revision int64  `json:"revision"`
-			Note     string `json:"note"`
+			Approve        bool   `json:"approve"`
+			Outcome        string `json:"outcome"`
+			Revision       int64  `json:"revision"`
+			Note           string `json:"note"`
+			Target         string `json:"target"`
+			EvidenceHandle string `json:"evidence_handle"`
 		}
 		// body optional (query params are the MCP-bridge path), but never malformed
 		if !requireWellFormedJSON(w, r, &req) {
@@ -79,7 +81,8 @@ func registerMemoryRoutes(mux routeRegistrar) {
 		// open mode all unauthenticated callers collapse to a single identity, so N
 		// fabricated agent names cannot satisfy the multi-agent gate.
 		result, err := workspaceops.VerifyContextOutcome(dataDir(), r.PathValue("workspace_id"), r.PathValue("entry_id"),
-			caller.actor(), workspaceops.VerifyRequest{Outcome: req.Outcome, Revision: req.Revision, Note: req.Note})
+			caller.actor(), workspaceops.VerifyRequest{Outcome: req.Outcome, Revision: req.Revision, Note: req.Note,
+				Target: req.Target, EvidenceHandle: req.EvidenceHandle})
 		respondMemoryWrite(w, r, caller, result, err)
 	})
 	mux.HandleFunc("PUT /api/workspaces/{workspace_id}/context/{entry_id}", func(w http.ResponseWriter, r *http.Request) {
@@ -141,7 +144,8 @@ func approverLifecycleWrite(w http.ResponseWriter, r *http.Request,
 
 // memoryAuthorityErrors are the refusals of a memory write that answer 403 and are
 // audited: the caller is authenticated but lacks authority over this entry.
-var memoryAuthorityErrors = []error{workspaceops.ErrNotEntryAuthor, workspaceops.ErrApproverRequired, workspaceops.ErrVerifierRequired}
+var memoryAuthorityErrors = []error{workspaceops.ErrNotEntryAuthor, workspaceops.ErrApproverRequired,
+	workspaceops.ErrVerifierRequired, workspaceops.ErrSameOwner}
 
 // respondMemoryWrite answers a governed-memory write.
 func respondMemoryWrite(w http.ResponseWriter, r *http.Request, caller memoryCaller, result any, err error) {

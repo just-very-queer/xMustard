@@ -2,7 +2,7 @@ package mcpserver
 
 import "testing"
 
-// The WS-19A lifecycle arguments reach the API in the shapes its handlers decode:
+// The WS-19A lifecycle and WS-19B provenance arguments reach the API in the shapes its handlers decode:
 // integers as JSON numbers, lists as arrays, fetch-by-id on the recall route.
 func TestLifecycleArgumentsBuild(t *testing.T) {
 	cases := []struct {
@@ -18,6 +18,12 @@ func TestLifecycleArgumentsBuild(t *testing.T) {
 			"/api/workspaces/w/context", `{"content":"c","expires":"2026-12-31","supersedes":["e1","e2"]}`},
 		{verifyTool, map[string]string{"workspace_id": "w", "entry_id": "e1", "outcome": "retract", "revision": "2"},
 			"/api/workspaces/w/context/e1/verify?approve=true", `{"outcome":"retract","revision":2}`},
+		// WS-19B provenance and evidence-bound votes
+		{rememberTool, map[string]string{"workspace_id": "w", "content": "c", "evidence": "h1,h2", "run_id": "run_1"},
+			"/api/workspaces/w/context", `{"content":"c","evidence":["h1","h2"],"run_id":"run_1"}`},
+		{verifyTool, map[string]string{"workspace_id": "w", "entry_id": "e1", "outcome": "duplicate_of", "target": "e2",
+			"evidence_handle": "h1"},
+			"/api/workspaces/w/context/e1/verify?approve=true", `{"evidence_handle":"h1","outcome":"duplicate_of","target":"e2"}`},
 		{recallTool, map[string]string{"workspace_id": "w", "entry_id": "e1", "history": "true"},
 			"/api/workspaces/w/context/active?entry_id=e1&history=true", ""},
 	}

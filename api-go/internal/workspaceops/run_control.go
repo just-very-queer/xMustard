@@ -82,6 +82,9 @@ type appSettings struct {
 	// multiple agents before promotion, and how many distinct approvals are needed.
 	RequireMultiAgentVerification *bool `json:"require_multi_agent_verification,omitempty"`
 	ContextVerificationThreshold  int   `json:"context_verification_threshold,omitempty"`
+	// PrincipalDistinctness is the verifier distinctness policy (D-16): "token" (the
+	// default) or "owner".
+	PrincipalDistinctness string `json:"principal_distinctness,omitempty"`
 }
 
 type PlanApproveRequest struct {

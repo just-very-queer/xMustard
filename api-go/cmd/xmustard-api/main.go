@@ -282,6 +282,9 @@ func requireRole(w http.ResponseWriter, r *http.Request, role string) bool {
 type memoryCaller struct {
 	principal *workspaceops.Principal // nil in open mode
 	openMode  bool
+	// session and callID are the transport's provenance of the write (the MCP bridge
+	// sends its session and the JSON-RPC id of the tool call).
+	session, callID string
 }
 
 // id is the identity recorded as author/verifier. It is never caller-asserted.
@@ -297,12 +300,17 @@ func (c memoryCaller) id() string {
 // the open-mode caller already passes every requireRole gate (it is the local
 // operator), so it edits as admin.
 func (c memoryCaller) actor() workspaceops.ContextActor {
-	return workspaceops.ContextActor{
+	a := workspaceops.ContextActor{
 		ID: c.id(), OpenMode: c.openMode,
-		Admin:    c.openMode || c.principal.Has(workspaceops.RoleAdmin),
-		Approver: c.openMode || c.principal.Has(workspaceops.RoleHumanApprover),
-		Verifier: c.openMode || c.principal.Has(workspaceops.RoleVerifier),
+		Admin:     c.openMode || c.principal.Has(workspaceops.RoleAdmin),
+		Approver:  c.openMode || c.principal.Has(workspaceops.RoleHumanApprover),
+		Verifier:  c.openMode || c.principal.Has(workspaceops.RoleVerifier),
+		SessionID: c.session, CallID: c.callID,
 	}
+	if c.principal != nil {
+		a.Owner, a.Kind = c.principal.Owner, c.principal.Kind
+	}
+	return a
 }
 
 // requireMemoryCaller gates a governed-memory write on role (proposer to propose or
@@ -325,7 +333,15 @@ func requireMemoryCaller(w http.ResponseWriter, r *http.Request, role string) (m
 		writeJSON(w, http.StatusForbidden, map[string]any{"error": fmt.Sprintf("principal id %q is reserved for open mode; mint a token under another id", p.ID)})
 		return memoryCaller{}, false
 	}
-	return memoryCaller{principal: p, openMode: p == nil}, true
+	caller := memoryCaller{principal: p, openMode: p == nil,
+		session: r.Header.Get("X-Xmustard-Session-Id"), callID: r.Header.Get("X-Xmustard-Call-Id")}
+	for kind, v := range map[string]string{"X-Xmustard-Session-Id": caller.session, "X-Xmustard-Call-Id": caller.callID} {
+		if err := workspaceops.CheckProvenanceLabel(kind, v); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return memoryCaller{}, false
+		}
+	}
+	return caller, true
 }
 
 // requireWellFormedJSON decodes a body that may be absent or blank (the handler then
@@ -744,6 +760,9 @@ func registerRoutes(mux routeRegistrar) {
 			Roles      []string `json:"roles"` // alternative to role: a list of roles
 			TTLSeconds int      `json:"ttl_seconds"`
 			Workspaces []string `json:"workspaces"` // optional: confine the token to these workspaces
+			// optional: who operates the token (default: the id) and whether it is a
+			// human or an agent (default agent), for the owner-distinct policy
+			workspaceops.TokenIdentity
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON body"})
@@ -756,7 +775,7 @@ func registerRoutes(mux routeRegistrar) {
 			}
 			req.Role = strings.Join(req.Roles, "+")
 		}
-		raw, err := workspaceops.MintScopedToken(dataDir(), req.ID, req.Role, req.TTLSeconds, req.Workspaces)
+		raw, err := workspaceops.MintIdentityToken(dataDir(), req.ID, req.Role, req.TTLSeconds, req.Workspaces, req.TokenIdentity)
 		if err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 			return

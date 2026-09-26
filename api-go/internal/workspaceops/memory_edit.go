@@ -33,10 +33,12 @@ func UpdateContextContent(dataDir, workspaceID, entryID, content string, editor 
 	if strings.TrimSpace(content) == "" {
 		return nil, fmt.Errorf("content is required: %w", ErrInvalidInput)
 	}
+	var red ingestRedaction
+	red.scrub(&content)
 	requireMulti, threshold := contextDefaults(dataDir)
 	ctx := context.Background()
 	root := contextRoot(dataDir, workspaceID)
-	actor := memoryActor(fallbackString(strings.TrimSpace(editor.ID), adminEditor), root)
+	actor := editor.storeActor(root)
 	var out ContextEntry
 	err := memoryUpdate(ctx, dataDir, workspaceID, func(tx govstore.Tx) error {
 		e, ce, err := loadEntryTx(ctx, tx, workspaceID, entryID)
@@ -68,6 +70,7 @@ func UpdateContextContent(dataDir, workspaceID, entryID, content string, editor 
 	}
 	out.Content = content
 	out.ContentDigest = ""
+	red.annotate(&out)
 	return &out, nil
 }
 
@@ -142,7 +145,7 @@ func EditContext(dataDir, workspaceID, entryID string, req EditRequest, editor C
 	requireMulti, threshold := contextDefaults(dataDir)
 	ctx := context.Background()
 	root := contextRoot(dataDir, workspaceID)
-	actor := memoryActor(fallbackString(strings.TrimSpace(editor.ID), adminEditor), root)
+	actor := editor.storeActor(root)
 	var out ContextEntry
 	err := memoryUpdate(ctx, dataDir, workspaceID, func(tx govstore.Tx) error {
 		e, ce, err := loadEntryTx(ctx, tx, workspaceID, entryID)
@@ -292,7 +295,7 @@ func RetireContext(dataDir, workspaceID, entryID, reason string, actor ContextAc
 	}
 	ctx := context.Background()
 	root := contextRoot(dataDir, workspaceID)
-	by := memoryActor(fallbackString(strings.TrimSpace(actor.ID), adminEditor), root)
+	by := actor.storeActor(root)
 	var out ContextEntry
 	err := memoryUpdate(ctx, dataDir, workspaceID, func(tx govstore.Tx) error {
 		e, ce, err := loadEntryTx(ctx, tx, workspaceID, entryID)

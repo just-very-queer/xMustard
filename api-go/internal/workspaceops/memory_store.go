@@ -222,13 +222,6 @@ func importLegacyContextEntries(ctx context.Context, s *govstore.SQLStore, dataD
 
 // --- actors and repository state ---------------------------------------------------
 
-// memoryActor is the store actor for a governance write by principal, carrying the
-// workspace HEAD so every event records the repository state it was made against.
-func memoryActor(principal, root string) govstore.Actor {
-	sha, branch := gitHead(root)
-	return govstore.Actor{Principal: principal, HeadSHA: sha, Branch: branch}
-}
-
 // gitHead reads HEAD's commit and branch from the repository files, without spawning
 // git. Worktrees and packed refs are followed; anything unreadable yields "".
 func gitHead(root string) (sha, branch string) {

@@ -18,10 +18,14 @@ var verifyTool = &Tool{
 		{Name: "approve", Type: typeBoolean, Desc: "approve (default true) or reject"},
 		{Name: "note", Type: typeString, MaxLen: maxVerifyNote, Desc: "reason for the verdict, stored with the vote"},
 	},
-	// Lifecycle outcomes (WS-19A): listed only in the full schema profile.
+	// Lifecycle outcomes (WS-19A) and evidence-bound votes (WS-19B): listed only in the
+	// full schema profile.
 	Advanced: []Arg{
-		{Name: "outcome", Type: typeString, Enum: []string{"approve", "reject", "retract"}, Desc: "overrides approve"},
+		{Name: "outcome", Type: typeString, Enum: []string{"approve", "reject", "retract", "duplicate_of", "helpful",
+			"misleading", "stale_harm"}, Desc: "overrides approve"},
 		{Name: "revision", Type: typeInteger, Min: 1, Max: maxRevision, Desc: "pending edit to vote on"},
+		{Name: "target", Type: typeString, Desc: "duplicate_of: the kept entry"},
+		{Name: "evidence_handle", Type: typeString, Desc: "evidence the verdict rests on"},
 	},
 	// A reject can demote a promoted memory (destructive); a repeated vote replaces the
 	// caller's own prior verdict, so the call is idempotent.
@@ -37,7 +41,7 @@ var verifyTool = &Tool{
 		}
 		// the note travels in the body, like memory content (XM-NEW-018)
 		payload := map[string]any{}
-		for _, k := range []string{"note", "outcome"} {
+		for _, k := range []string{"note", "outcome", "target", "evidence_handle"} {
 			if a[k] != "" {
 				payload[k] = a[k]
 			}

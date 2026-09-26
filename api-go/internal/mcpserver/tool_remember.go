@@ -30,6 +30,9 @@ var rememberTool = &Tool{
 		{Name: "description", Type: typeString, Desc: "edit: new description"},
 		{Name: "supersedes", Type: typeString, List: true, MaxLen: 1024, Desc: "entries this replaces"},
 		{Name: "expires", Type: typeString, Desc: "last UTC date served (YYYY-MM-DD)"},
+		// Provenance (WS-19B): checked before the write.
+		{Name: "evidence", Type: typeString, List: true, MaxLen: 1024, Desc: "evidence handles it rests on"},
+		{Name: "run_id", Type: typeString, Desc: "run it came from"},
 	},
 	// Proposing is additive (never destroys state) and not idempotent: each call is a
 	// new proposal.
@@ -42,12 +45,12 @@ var rememberTool = &Tool{
 		// content goes in the JSON BODY, not the URL, so durable memory text is not
 		// exposed in access logs / error strings (XM-NEW-018).
 		payload := map[string]any{}
-		for _, k := range []string{"content", "title", "op", "entry_id", "reason", "old_string", "new_string", "description", "expires"} {
+		for _, k := range []string{"content", "title", "op", "entry_id", "reason", "old_string", "new_string", "description", "expires", "run_id"} {
 			if a[k] != "" {
 				payload[k] = a[k]
 			}
 		}
-		for _, k := range []string{"paths", "supersedes"} {
+		for _, k := range []string{"paths", "supersedes", "evidence"} {
 			if a[k] != "" {
 				payload[k] = splitCSV(a[k])
 			}

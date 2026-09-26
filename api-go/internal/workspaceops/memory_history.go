@@ -60,6 +60,9 @@ func GetContextEntry(dataDir, workspaceID, entryID string, history, reviewer boo
 		}
 		ce.ContentDigest = ""
 		out["entry"] = ce
+		if err := addDerivation(ctx, r, e, out); err != nil {
+			return err
+		}
 		if !reviewer {
 			return nil
 		}
@@ -117,6 +120,26 @@ func pendingRevisionView(ctx context.Context, r govstore.Reader, e govstore.Entr
 		"revision": rv.Revision, "base_revision": rv.BaseRevision, "op": rv.Op, "reason": rv.Reason,
 		"author": rv.Author, "content_digest": rv.ContentDigest, "diff": diff, "votes": votes,
 	}, nil
+}
+
+// addDerivation adds how the entry was derived and what its verification rests on
+// (PAR-PROV-04/05): provenance, the counting verdicts with their owners and evidence, and
+// the outcome feedback principals reported.
+func addDerivation(ctx context.Context, r govstore.Reader, e govstore.Entry, out map[string]any) error {
+	prov, err := entryProvenance(ctx, r, e)
+	if err != nil {
+		return err
+	}
+	basis, err := verificationBasis(ctx, r, e)
+	if err != nil {
+		return err
+	}
+	feedback, err := r.SummarizeOutcomes(ctx, e.ID)
+	if err != nil {
+		return err
+	}
+	out["provenance"], out["verification_basis"], out["feedback"] = prov, basis, feedback
+	return nil
 }
 
 // addHistory adds the revisions (newest first, without content), the relations and the
@@ -343,8 +366,10 @@ func lifecycleWrite(dataDir, workspaceID, entryID, reason string, actor ContextA
 	if strings.TrimSpace(reason) == "" {
 		return nil, fmt.Errorf("reason is required: %w", ErrInvalidInput)
 	}
+	var red ingestRedaction
+	red.scrub(&reason)
 	ctx := context.Background()
-	by := memoryActor(fallbackString(strings.TrimSpace(actor.ID), adminEditor), contextRoot(dataDir, workspaceID))
+	by := actor.storeActor(contextRoot(dataDir, workspaceID))
 	var out ContextEntry
 	err := memoryUpdate(ctx, dataDir, workspaceID, func(tx govstore.Tx) error {
 		e, ce, err := loadAnyEntryTx(ctx, tx, workspaceID, entryID)
@@ -360,6 +385,7 @@ func lifecycleWrite(dataDir, workspaceID, entryID, reason string, actor ContextA
 	if err != nil {
 		return nil, err
 	}
+	red.annotate(&out)
 	return &out, nil
 }
 
