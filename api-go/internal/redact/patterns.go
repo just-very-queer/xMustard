@@ -393,9 +393,10 @@ func emailAt(buf []byte, pos, from, n int, eof bool, out []candidate) []candidat
 // or dashes, that pass the Luhn check.
 type cardRule struct{}
 
-func (cardRule) find(buf []byte, from, to, n int, eof bool, out []candidate) []candidate {
+func (cardRule) find(buf []byte, from, to, n int, eof bool, out []candidate) ([]candidate, int) {
 	isDigit := func(c byte) bool { return '0' <= c && c <= '9' }
-	for i := from; i < to; i++ {
+	i := from
+	for ; i < to; i++ {
 		if !isDigit(buf[i]) || isWordByte(buf[i-1]) {
 			continue
 		}
@@ -414,14 +415,16 @@ func (cardRule) find(buf []byte, from, to, n int, eof bool, out []candidate) []c
 			}
 		}
 		if last == n && !eof {
-			return out // undecided; deferred to the next window
+			return out, i // undecided; deferred to the next window
 		}
 		if digits >= 13 && (last == n || !alnum[buf[last]]) && luhn(buf[i:last]) {
 			out = push(out, candidate{anchor: i, start: i, end: last, label: RulePaymentCard, rule: RulePaymentCard, prio: 91})
 		}
 		i = last
 	}
-	return out
+	// A run that began before to may end past it: the next window resumes at
+	// its end rather than part-way through it, on the groups one scan tries.
+	return out, i
 }
 
 func luhn(b []byte) bool {
@@ -895,7 +898,7 @@ func newLiteralRule(env []EnvSecret) *literalRule {
 	return &lr
 }
 
-func (l *literalRule) find(buf []byte, from, to, n int, eof bool, out []candidate) []candidate {
+func (l *literalRule) find(buf []byte, from, to, n int, eof bool, out []candidate) ([]candidate, int) {
 	for i, v := range l.values {
 		for pos := from; pos < to; {
 			j := bytes.Index(buf[pos:min(n, to+len(v)-1)], v)
@@ -907,7 +910,7 @@ func (l *literalRule) find(buf []byte, from, to, n int, eof bool, out []candidat
 			pos = s + len(v)
 		}
 	}
-	return out
+	return out, from
 }
 
 // keyClass is how strongly a key name marks its value as secret.
@@ -1094,7 +1097,7 @@ func (m *runMemo) scan(buf []byte, v, n int, set *byteSet) int {
 	return m.end
 }
 
-func (keyedRule) find(buf []byte, from, to, n int, eof bool, out []candidate) []candidate {
+func (keyedRule) find(buf []byte, from, to, n int, eof bool, out []candidate) ([]candidate, int) {
 	memo := &runMemo{}
 	for i := from; i < to; {
 		j := bytes.IndexAny(buf[i:to], ":=-")
@@ -1117,7 +1120,7 @@ func (keyedRule) find(buf []byte, from, to, n int, eof bool, out []candidate) []
 			}
 		}
 	}
-	return out
+	return out, from // what a value covers resumes through its candidate
 }
 
 // assignedValue handles "key: value", "key=value", "key := value" and

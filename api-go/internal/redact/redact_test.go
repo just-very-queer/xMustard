@@ -1066,6 +1066,47 @@ func TestSecretsPastTheDecisionLimit(t *testing.T) {
 	}
 }
 
+// digitGroups returns runs of digit groups split by single spaces or dashes,
+// the shape a payment-card scan reads, broken by line ends.
+func digitGroups(rng *rand.Rand, size int) string {
+	var b strings.Builder
+	for b.Len() < size {
+		b.WriteString(randToken(rng, "0123456789", 1+rng.Intn(5)))
+		b.WriteByte(" -  -\n"[rng.Intn(5)])
+	}
+	return b.String()[:size]
+}
+
+// Payment-card detection jumps over the digit groups it has read, so where a
+// scan starts decides which runs it tries. A window must resume where the
+// previous window's scan stopped: starting at its limit, part-way through a
+// run, tried other runs and emitted a card one window redacts in clear.
+func TestCardScanAcrossWindowBoundaries(t *testing.T) {
+	r := New(WithPII())
+	rng := rand.New(rand.NewSource(47))
+	check := func(name, in string) {
+		t.Helper()
+		want := sameAsOneShot(t, r, name, in)
+		_, wantRep, _ := oneShot(r, in)
+		if got, rep := streamAll(t, r, &chunkReader{data: []byte(in), rng: rng, max: 1 + rng.Intn(9000)}); got != want || rep.Count != wantRep.Count {
+			t.Fatalf("%s: stream differs from one window", name)
+		}
+	}
+	tail := filler(rng, 40000)
+	check("reported run", padTo(firstLimit-13)+"005 06 003 6 2443 0081 00400 0099 00050 884 28007 51 03\n"+tail)
+	step := 1
+	if testing.Short() {
+		step = 5
+	}
+	for d := 1; d <= 80; d += step {
+		check(fmt.Sprint("run at ", d), padTo(firstLimit-d)+digitGroups(rng, 200)+"\n"+tail)
+	}
+	for i := range 6 {
+		// digit groups all the way, so every later window boundary falls in a run
+		check(fmt.Sprint("dense ", i), digitGroups(rng, 3*windowSize+rng.Intn(windowSize)))
+	}
+}
+
 // denseInput packs fragments whose secrets start well past their anchors
 // (URL passwords, the later lines of split keys, YAML block scalars, flag and
 // header values, webhook paths) next to secrets that may lie between, so every

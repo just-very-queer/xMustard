@@ -210,8 +210,10 @@ type triggered interface {
 type scanner interface {
 	// find appends candidates whose anchor lies in [from, to); it may read up
 	// to n. buf[:from] is already-emitted context (at least one byte),
-	// available for lookbehind.
-	find(buf []byte, from, to, n int, eof bool, out []candidate) []candidate
+	// available for lookbehind. It returns where its scan stopped: a scan
+	// that jumps over what it has read (cardRule over digit groups) may stop
+	// past to, and the next window resumes it there (see engine.resume).
+	find(buf []byte, from, to, n int, eof bool, out []candidate) ([]candidate, int)
 }
 
 func (r *Redactor) add(d triggered) {
@@ -586,8 +588,9 @@ type engine struct {
 	keyAnchor, keyFinding int
 	// resume holds, per scanner, the input offset its scan resumes from. A
 	// scanner may skip what a value it found covers (keyedRule does not look
-	// for keys inside a bare value); a later window skips it as well, so where
-	// a window ends does not change what is found.
+	// for keys inside a bare value) or what it has already read (cardRule
+	// jumps over a run of digit groups); a later window skips it as well, so
+	// where a window ends does not change what is found.
 	resume []int
 	// pending holds candidates, in input offsets, that a window decided but
 	// could not emit: they start past what it consumed, where secrets anchored
@@ -664,7 +667,9 @@ func (e *engine) window(out, buf []byte, from, n int, eof bool) ([]byte, int) {
 	}
 	for i, d := range e.r.scanners {
 		k := len(e.cands)
-		e.cands = d.find(buf, min(limit, max(start, e.resume[i]-e.base)), limit, n, eof, e.cands)
+		var stop int
+		e.cands, stop = d.find(buf, min(limit, max(start, e.resume[i]-e.base)), limit, n, eof, e.cands)
+		e.resume[i] = max(e.resume[i], e.base+stop)
 		for ; k < len(e.cands); k++ {
 			e.cands[k].scanner = int8(i + 1)
 		}
