@@ -237,7 +237,7 @@ func TestShimResponseSizesOnTheDefaultPool(t *testing.T) {
 // the shared session or on its cached workspace listing.
 func newTestSession(t *testing.T, version string) *mcpserver.Session {
 	t.Helper()
-	s := mcpserver.New(mcpserver.Options{Backend: backend, Delivery: evidenceDelivery{}, Resources: evidenceResources{}}).NewSession(nil)
+	s := mcpserver.New(mcpserver.Options{Backend: backend, Delivery: evidence, Resources: evidence}).NewSession(nil)
 	if _, rerr := s.Handle(context.Background(), "initialize", json.RawMessage(`{"protocolVersion":"`+version+`","capabilities":{},"clientInfo":{"name":"t","version":"1"}}`)); rerr != nil {
 		t.Fatalf("initialize %s: %+v", version, rerr)
 	}
