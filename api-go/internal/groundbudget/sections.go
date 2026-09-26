@@ -19,14 +19,16 @@ import (
 // Budget bounds, in characters of the JSON result (enforced on its UTF-8 bytes,
 // which are never fewer than its characters).
 const (
-	// DefaultMaxChars applies when max_chars is omitted: about 1.5k tokens, inside
-	// the 10,000-character additionalContext cap a SessionStart hook can inject.
+	// DefaultMaxChars applies when max_chars is omitted from a budgeted call (the MCP
+	// ground tool always budgets): about 1.5k tokens, inside the 10,000-character
+	// additionalContext cap a SessionStart hook can inject.
 	DefaultMaxChars = 6000
 	// MinMaxChars is the smallest budget accepted: the always-returned summary
 	// section plus a report of every other section omitted fits in it.
 	MinMaxChars = 2000
 	// MaxMaxChars is the evidence projection target (64 KiB): a larger ground result
-	// would be reduced by evidence delivery anyway.
+	// would be reduced by evidence delivery anyway. Beyond it the retained
+	// unbudgeted result (Recovery) is the way to the rest.
 	MaxMaxChars = 65536
 	// ReportMember is the result member that reports what the budget did.
 	ReportMember = "output_budget"
@@ -38,12 +40,13 @@ const (
 type Member struct {
 	Name string
 	// Signal marks a failure, stale or trust signal. It is reduced at most to its
-	// count (a list) or its flags (an object), never removed while its section is
-	// returned, and when the section is omitted its value moves to
-	// output_budget.signals.
+	// count (a list) or its flags (an object: every boolean plus its Keep keys),
+	// never removed while its section is returned, and when the section is omitted
+	// its value moves to output_budget.signals (a list or nested list as its length).
 	Signal bool
-	// Keep lists the keys an object member keeps at the counts stage. Nil keeps the
-	// whole object (minus nested lists) for a signal and drops it otherwise.
+	// Keep lists the keys an object member keeps at the counts stage, besides a
+	// signal's booleans. Nil keeps the whole object (minus nested lists) for a
+	// signal and drops it otherwise.
 	Keep []string
 }
 
@@ -54,7 +57,8 @@ type Section struct {
 	Pinned bool
 	// Cap is the section's own budget in characters. It keeps one large section
 	// from crowding out the others; it is lifted when the section is the only one
-	// requested besides the pinned summary, so a caller can page it in full.
+	// requested (besides the pinned summary, or the summary alone), so a caller can
+	// get it in full.
 	Cap     int
 	Members []Member
 	// Recover says how to get the section in full after it was reduced.
@@ -63,9 +67,14 @@ type Section struct {
 }
 
 // otherSection holds members no section declares. A test keeps every member of the
-// ground result declared; this is the runtime safety net, ranked least important and
-// reported by member name, so nothing a later change adds is dropped silently.
+// ground result declared; this is the runtime safety net, ranked least important,
+// treated as signals and reported by member name, so nothing a later change adds is
+// dropped silently. It cannot be requested by name: only the retained unbudgeted
+// result returns it in full once it was reduced.
 const otherSection = "other"
+
+// otherRecover is the recover hint of otherSection.
+const otherRecover = "recover_uri (undeclared members cannot be requested by section)"
 
 // sections are ordered most important first: the ladder reduces them in reverse.
 var sections = []Section{
@@ -76,13 +85,13 @@ var sections = []Section{
 			{Name: "blocked_by_dirty_state", Signal: true}, {Name: "blocked_by_failing_verification", Signal: true},
 			{Name: "unknown", Signal: true}, {Name: "generated_at"},
 		},
-		Recover: "call ground with a larger max_chars",
+		Recover: "ground sections=summary lifts its cap",
 		Doc:     "one-line summary with every count, the blocked flags, and any fields ground could not determine",
 	},
 	{
 		Name: "runs", Cap: 1536,
 		Members: []Member{{Name: "recent_failed_runs", Signal: true}},
-		Recover: "ground sections=runs max_chars=N; why_failed run_id=ID per run",
+		Recover: "ground sections=runs max_chars=N; past 65536 chars, recover_uri; why_failed run_id=ID",
 		Doc:     "failed, errored or cancelled runs, newest first",
 	},
 	{
@@ -91,8 +100,8 @@ var sections = []Section{
 			{Name: "changed_files", Signal: true}, {Name: "dirty_symbols", Signal: true},
 			{Name: "contract_breaks", Signal: true}, {Name: "broken_contracts", Signal: true},
 		},
-		Recover: "impact with no arguments lists every changed file and dirty symbol",
-		Doc:     "working-tree changes against the indexed baseline and changed signatures",
+		Recover: "ground sections=index max_chars=N; past 65536 chars, recover_uri",
+		Doc:     "working-tree changes against the indexed baseline, and changed signatures in the order the index lists them",
 	},
 	{
 		Name: "memory", Cap: 768,
@@ -100,20 +109,23 @@ var sections = []Section{
 			{Name: "stale_memory", Signal: true}, {Name: "stale_memory_checked"}, {Name: "stale_memory_total"},
 			{Name: "stale_memory_complete", Signal: true}, {Name: "memory_verification_modes", Signal: true},
 		},
-		Recover: "recall flags each stale memory; ground sections=memory",
+		Recover: "ground sections=memory; recall flags each stale memory",
 		Doc:     "promoted memory whose files drifted, and promoted memory by verification mode",
 	},
 	{
 		Name: "drift", Cap: 1536,
-		Members: []Member{{Name: "drift", Signal: true, Keep: []string{"stale", "has_baseline", "head_changed", "content_changed"}}},
+		// Keep names Rust's DriftReport flags; a signal keeps every boolean anyway
+		Members: []Member{{Name: "drift", Signal: true, Keep: []string{"stale", "has_baseline", "head_changed", "content_changed", "sibling_clone"}}},
 		Recover: "ground sections=drift",
 		Doc:     "whether the index baseline drifted from the working tree, and why",
 	},
 	{
 		Name: "principal", Cap: 512,
-		Members: []Member{{Name: "principal", Keep: []string{"id", "role", "open_mode"}}},
+		// a trust signal: in open mode, memory this caller writes is
+		// self_asserted_open_mode, never peer-verified
+		Members: []Member{{Name: "principal", Signal: true, Keep: []string{"id", "role", "open_mode"}}},
 		Recover: "ground sections=principal",
-		Doc:     "the caller's identity and roles",
+		Doc:     "the caller's identity and roles, and whether auth is off (open_mode)",
 	},
 }
 

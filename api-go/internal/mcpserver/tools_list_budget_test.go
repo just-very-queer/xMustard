@@ -148,6 +148,12 @@ func TestAdvancedArgumentsAreAcceptedNotAdvertised(t *testing.T) {
 		if p := api.lastTool(t).Path; p != "/api/workspaces/ws/session-grounding?sections=runs%2Cindex&max_chars=3000" {
 			t.Fatalf("%s: ground forwarded %q", profile, p)
 		}
+		// the MCP tool always budgets: over HTTP the budget is opt-in, so an omitted
+		// max_chars is sent as the documented default
+		_, _ = call(t, s, "ground", map[string]any{"workspace_id": "ws", "sections": "runs"})
+		if p := api.lastTool(t).Path; p != "/api/workspaces/ws/session-grounding?sections=runs&max_chars=6000" {
+			t.Fatalf("%s: ground without max_chars forwarded %q", profile, p)
+		}
 	}
 	// the full profile's extra schema still uses only portable keywords
 	for _, tl := range Tools() {

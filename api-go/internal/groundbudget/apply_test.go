@@ -1,10 +1,12 @@
 package groundbudget
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"math/rand"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -173,6 +175,7 @@ func TestUnrequestedSectionsKeepTheirSignals(t *testing.T) {
 		"memory_verification_modes.peer_verified": 4.0, "memory_verification_modes.self_asserted_open_mode": 0.0,
 		"memory_verification_modes.single_agent": 86.0,
 		"drift.stale":                            true, "drift.has_baseline": true, "drift.head_changed": false, "drift.content_changed": true,
+		"drift.reasons": 3.0,
 	}
 	if !reflect.DeepEqual(rep.Signals, want) {
 		t.Fatalf("signals of unrequested sections:\n got %v\nwant %v", rep.Signals, want)
@@ -314,8 +317,10 @@ func TestPinnedSummaryIsNeverOmitted(t *testing.T) {
 	}
 }
 
-// Members no section declares are returned with a full request, reduced first under
-// pressure (by name, never silently), and not returned for a narrow request.
+// Members no section declares are returned with a full request and reduced first
+// under pressure. They are treated as signals and reported by name, also when a
+// narrow request leaves them out (they cannot be requested by name), so a failure
+// member a later change adds is never dropped without a trace.
 func TestUndeclaredMembersAreReportedByName(t *testing.T) {
 	g := groundResult(1, 1, 1, 0)
 	g["future_section"] = map[string]any{"items": []string{strings.Repeat("y", 200), strings.Repeat("z", 200)}}
@@ -332,9 +337,222 @@ func TestUndeclaredMembersAreReportedByName(t *testing.T) {
 	if sr := rep.Sections[otherSection]; sr.State != "omitted" || !reflect.DeepEqual(sr.Members, []string{"future_section"}) {
 		t.Fatalf("undeclared member must be reported by name: %+v", sr)
 	}
-	_, rep, _ = apply(t, g, Request{Sections: map[string]bool{"runs": true}})
-	if !contains(rep.NotRequested, otherSection) {
-		t.Fatalf("a narrow request lists undeclared members as not requested: %v", rep.NotRequested)
+	if rep.Signals["future_section.items"] != 2.0 {
+		t.Fatalf("an omitted undeclared member keeps its counts as signals: %v", rep.Signals)
+	}
+	// a narrow request: the undeclared members are named, and their lists counted
+	g = groundResult(1, 1, 1, 0)
+	g["verification_failures"] = []string{"v1", "v2"}
+	g["future_flag"] = true
+	got, rep, _ = apply(t, g, Request{Sections: map[string]bool{"runs": true}})
+	if _, ok := got["verification_failures"]; ok {
+		t.Fatal("undeclared members are not part of a narrow request")
+	}
+	sr, ok := rep.Sections[otherSection]
+	if !ok || sr.State != "omitted" || sr.Reason != reasonNotRequested || !reflect.DeepEqual(sr.Members, []string{"future_flag", "verification_failures"}) ||
+		sr.Recover != otherRecover {
+		t.Fatalf("a narrow request must name the undeclared members it leaves out: %+v", rep)
+	}
+	if rep.Signals["verification_failures"] != 2.0 || rep.Signals["future_flag"] != true {
+		t.Fatalf("undeclared members keep their signals: %v", rep.Signals)
+	}
+	if contains(rep.NotRequested, otherSection) || rep.DegradedStage != "full" || rep.Docs != DocsURI {
+		t.Fatalf("other is reported as left out, not as not requested, and no requested section was degraded: %+v", rep)
+	}
+}
+
+// Every flag of a signal object survives the counts and omitted stages, including
+// flags its Keep list does not name, and its nested lists stay counted. The drift
+// object is shaped like Rust's DriftReport (rust-core/src/changetrack.rs), plus a
+// flag a later change might add.
+func TestSignalObjectsKeepEveryFlag(t *testing.T) {
+	g := groundResult(100, 40, 20, 0)
+	g["drift"] = map[string]any{
+		"workspace_id": "ws1", "has_baseline": true, "stale": true, "head_changed": false, "content_changed": false,
+		"sibling_clone": true, "baseline_head": "0123456789abcdef0123456789abcdef01234567", "current_head": "0123456789abcdef0123456789abcdef01234567",
+		"baseline_remote": "git@example.com:a/b.git", "current_remote": "git@example.com:c/d.git",
+		"reasons": []string{"index baseline was built from a sibling clone"}, "generated_at": "2026-09-25T00:00:00Z",
+		"future_flag": true,
+	}
+	flags := []string{"has_baseline", "stale", "head_changed", "content_changed", "sibling_clone", "future_flag"}
+	drift := g["drift"].(map[string]any)
+	sawCounts, sawOmitted := false, false
+	for max := MaxMaxChars; max >= MinMaxChars; max -= 50 {
+		got, rep, _ := apply(t, g, Request{MaxChars: max})
+		switch rep.Sections["drift"].State {
+		case "counts":
+			sawCounts = true
+			d := got["drift"].(map[string]any)
+			for _, f := range flags {
+				if d[f] != drift[f] {
+					t.Fatalf("max_chars=%d: drift at counts lost flag %s: %v", max, f, d)
+				}
+			}
+			if rep.Sections["drift"].Total["drift.reasons"] != 1 {
+				t.Fatalf("drift.reasons must be counted: %+v", rep.Sections["drift"])
+			}
+		case "omitted":
+			sawOmitted = true
+			for _, f := range flags {
+				if rep.Signals["drift."+f] != drift[f] {
+					t.Fatalf("max_chars=%d: omitted drift lost flag %s from signals: %v", max, f, rep.Signals)
+				}
+			}
+			if rep.Signals["drift.reasons"] != 1.0 {
+				t.Fatalf("omitted drift must keep its reasons count: %v", rep.Signals)
+			}
+		}
+	}
+	if !sawCounts || !sawOmitted {
+		t.Fatalf("the budgets tried did not reach both stages (counts %v, omitted %v)", sawCounts, sawOmitted)
+	}
+	// not requested: the same signals
+	_, rep, _ := apply(t, g, Request{Sections: map[string]bool{"runs": true}})
+	for _, f := range flags {
+		if rep.Signals["drift."+f] != drift[f] {
+			t.Fatalf("unrequested drift lost flag %s: %v", f, rep.Signals)
+		}
+	}
+}
+
+// open_mode is a trust signal: memory an open-mode caller writes is never
+// peer-verified. It survives when principal is not requested or omitted.
+func TestPrincipalOpenModeIsASignal(t *testing.T) {
+	g := groundResult(100, 40, 20, 0)
+	g["principal"] = map[string]any{"id": "local", "role": "open-mode", "roles": []string{"admin", "agent"}, "open_mode": true}
+	for _, req := range []Request{{Sections: map[string]bool{"runs": true}, MaxChars: MinMaxChars}, {MaxChars: MinMaxChars}} {
+		got, rep, _ := apply(t, g, req)
+		if _, ok := got["principal"]; ok {
+			continue
+		}
+		if rep.Signals["principal.open_mode"] != true || rep.Signals["principal.role"] != "open-mode" || rep.Signals["principal.roles"] != 2.0 {
+			t.Fatalf("%+v: principal left out without its open_mode signal: %v", req, rep.Signals)
+		}
+	}
+}
+
+// The pinned summary is held to its cap in a full request, and sections=summary alone
+// lifts it, so its recover hint works.
+func TestSummaryAloneLiftsItsCap(t *testing.T) {
+	g := groundResult(0, 0, 0, 0)
+	u := make([]map[string]string, 8)
+	for i := range u {
+		u[i] = map[string]string{"field": fmt.Sprintf("field_%d", i), "reason": strings.Repeat("r", 200)}
+	}
+	g["unknown"] = u
+	for _, max := range []int{DefaultMaxChars, MaxMaxChars} {
+		got, rep, _ := apply(t, g, Request{MaxChars: max})
+		if n := len(got["unknown"].([]any)); n == 8 || rep.Sections["summary"].Reason != reasonSectionCap {
+			t.Fatalf("max_chars=%d: the summary cap applies in a full request: %d of 8 kept, %+v", max, n, rep.Sections["summary"])
+		}
+		if !strings.Contains(rep.Sections["summary"].Recover, "sections=summary") {
+			t.Fatalf("recover hint: %q", rep.Sections["summary"].Recover)
+		}
+	}
+	got, rep, _ := apply(t, g, Request{Sections: map[string]bool{"summary": true}, MaxChars: MaxMaxChars})
+	if n := len(got["unknown"].([]any)); n != 8 || rep.Sections != nil {
+		t.Fatalf("sections=summary alone must return the summary in full: %d of 8, %+v", n, rep.Sections)
+	}
+	// with another section requested the summary keeps its cap
+	got, _, _ = apply(t, g, Request{Sections: map[string]bool{"summary": true, "runs": true}, MaxChars: MaxMaxChars})
+	if n := len(got["unknown"].([]any)); n == 8 {
+		t.Fatal("the summary cap is lifted only when the summary is the one section requested")
+	}
+}
+
+// A caller that can retain the unbudgeted result is asked to exactly when anything it
+// requested was reduced, and the report names what it returned, within max_chars.
+func TestRecoveryIsNamedOnlyWhenReduced(t *testing.T) {
+	calls := 0
+	retain := func() Recovery {
+		calls++
+		return Recovery{Handle: "xm1." + strings.Repeat("A", 43), URI: "xmustard://evidence/xm1." + strings.Repeat("A", 43) + "?workspace_id=repo-0123456789"}
+	}
+	small := mustJSON(groundResult(2, 1, 1, 0))
+	out, err := ApplyRecoverable(small, Request{}, retain)
+	if err != nil || calls != 0 || strings.Contains(string(out), `"recover_`) {
+		t.Fatalf("a result returned in full needs no recovery: calls=%d %s", calls, out)
+	}
+	// a narrow request that only leaves out unrequested sections is not a reduction
+	if out, _ = ApplyRecoverable(small, Request{Sections: map[string]bool{"runs": true}}, retain); calls != 0 {
+		t.Fatalf("not requesting a section is not a reduction: %s", out)
+	}
+	rng := rand.New(rand.NewSource(5454))
+	for i := 0; i < 200; i++ {
+		calls = 0
+		raw := mustJSON(groundResult(rng.Intn(400), rng.Intn(120), rng.Intn(80), rng.Intn(20)))
+		req := Request{MaxChars: MinMaxChars + rng.Intn(MaxMaxChars-MinMaxChars+1)}
+		out, err := ApplyRecoverable(raw, req, retain)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got map[string]any
+		if err := json.Unmarshal(out, &got); err != nil {
+			t.Fatalf("case %d: not JSON: %v", i, err)
+		}
+		rep := got[ReportMember].(map[string]any)
+		_, reduced := rep["sections"]
+		if reduced != (calls == 1) || calls > 1 {
+			t.Fatalf("case %d: retain called %d times for reduced=%v", i, calls, reduced)
+		}
+		if reduced && (rep["recover_uri"] == nil || rep["recover_handle"] == nil) {
+			t.Fatalf("case %d: a reduced result must name its recovery: %v", i, rep)
+		}
+		if len(out) > req.MaxChars || rep["used_chars"] != float64(len(out)) {
+			t.Fatalf("case %d: %d bytes against max_chars %d (report %v)", i, len(out), req.MaxChars, rep)
+		}
+	}
+	// no handle: the reason is reported instead
+	out, _ = ApplyRecoverable(mustJSON(groundResult(300, 0, 1, 0)), Request{}, func() Recovery { return Recovery{Unavailable: "evidence quota_full"} })
+	if !strings.Contains(string(out), `"recover_unavailable":"evidence quota_full"`) || strings.Contains(string(out), `"recover_uri":`) {
+		t.Fatalf("unavailable recovery: %s", out)
+	}
+}
+
+// Budgeting does not copy the result: Apply allocates its element tables and the
+// output, and WorkingSet (what the API admits) covers that plus the result itself.
+func TestApplyDoesNotCopyTheResult(t *testing.T) {
+	raw := mustJSON(groundResult(2000, 20000, 50, 5)) // about 2 MB, most of it list elements
+	req := Request{MaxChars: DefaultMaxChars}
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	if _, err := Apply(raw, req); err != nil {
+		t.Fatal(err)
+	}
+	runtime.ReadMemStats(&after)
+	alloc := int64(after.TotalAlloc - before.TotalAlloc)
+	if alloc > int64(len(raw))/4 {
+		t.Fatalf("Apply allocated %d bytes for a %d-byte result; it must not copy the result", alloc, len(raw))
+	}
+	if ws := WorkingSet(raw, req); ws < int64(len(raw))+alloc {
+		t.Fatalf("WorkingSet %d does not cover the result (%d) plus Apply's allocations (%d)", ws, len(raw), alloc)
+	}
+	t.Logf("result %d bytes: Apply allocated %d bytes; WorkingSet %d", len(raw), alloc, WorkingSet(raw, req))
+}
+
+// Result bytes are copied through exactly, whitespace and escapes included.
+func TestApplyKeepsTheResultBytes(t *testing.T) {
+	in := []byte(` { "workspace_id" : "w\u0073" , "summary":"a \"quoted\" line",` +
+		` "recent_failed_runs" : [ "r1" , "r\\2", "r]3" ] , "drift": {"stale": true, "reasons": [ "x" ] } } `)
+	out, err := Apply(in, Request{Sections: map[string]bool{"runs": true}, MaxChars: MaxMaxChars})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("not JSON: %v\n%s", err, out)
+	}
+	if got["workspace_id"] != "ws" || !reflect.DeepEqual(got["recent_failed_runs"], []any{"r1", "r\\2", "r]3"}) || got["drift"] != nil {
+		t.Fatalf("members changed: %s", out)
+	}
+	if !bytes.Contains(out, []byte(`[ "r1" , "r\\2", "r]3" ]`)) {
+		t.Fatalf("a list returned in full is its original bytes: %s", out)
+	}
+	for _, bad := range []string{`[1,2]`, `{"a":`, `nope`} {
+		if _, err := Apply([]byte(bad), Request{}); err == nil {
+			t.Fatalf("%s must be refused", bad)
+		}
 	}
 }
 
@@ -437,6 +655,21 @@ func BenchmarkApply(b *testing.B) {
 	raw := mustJSON(groundResult(120, 200, 10, 2))
 	b.SetBytes(int64(len(raw)))
 	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := Apply(raw, Request{MaxChars: DefaultMaxChars}); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkApplyLarge budgets a 1.6 MB result (20,000 contract breaks, 2,000 failed
+// runs) to the default.
+func BenchmarkApplyLarge(b *testing.B) {
+	raw := mustJSON(groundResult(2000, 20000, 50, 5))
+	b.SetBytes(int64(len(raw)))
+	b.ReportAllocs()
+	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		if _, err := Apply(raw, Request{MaxChars: DefaultMaxChars}); err != nil {
 			b.Fatal(err)

@@ -19,7 +19,7 @@ const ReducerVersion = "xm-reduce/1"
 // Record is the persisted description of one projection: what was kept and omitted.
 type Record struct {
 	Reducer        string     `json:"reducer"`
-	Mode           string     `json:"mode"` // passthrough | json | text
+	Mode           string     `json:"mode"` // passthrough | json | text | retained (kept whole, projected by its caller)
 	Reduced        bool       `json:"reduced"`
 	RawBytes       int64      `json:"raw_bytes"`
 	ProjectedBytes int        `json:"projected_bytes"`

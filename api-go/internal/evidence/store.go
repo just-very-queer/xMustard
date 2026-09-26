@@ -145,6 +145,10 @@ type CaptureRequest struct {
 	// RepoKey returns the repository identity at capture time. It is asked only when
 	// BeforeKey is complete, because only then can the two bind.
 	RepoKey func(ctx context.Context) Identity
+	// Retain keeps the original even though no reduction ran: the caller projected
+	// the result itself (ground's output budget) and names the returned handle in its
+	// reply. The delivery then carries no projection.
+	Retain bool
 }
 
 // Identity is a repository identity observation (Rust `repo-key` contract: key plus
@@ -413,8 +417,8 @@ func (sp *Spool) Discard() {
 	sp.st.mu.Unlock()
 }
 
-// Capture stores the spooled original (when reduction omits anything) and returns the
-// delivery. It always consumes the spool.
+// Capture stores the spooled original (when reduction omits anything, or the caller
+// asks to Retain it) and returns the delivery. It always consumes the spool.
 func (s *Store) Capture(ctx context.Context, sp *Spool, req CaptureRequest) (*Delivery, error) {
 	defer sp.Discard()
 	if sp.ws != req.WorkspaceID {
@@ -442,12 +446,15 @@ func (s *Store) Capture(ctx context.Context, sp *Spool, req CaptureRequest) (*De
 	ctx = budget.WithoutHeavyWait(ctx)
 	d := &Delivery{Delivery: DeliveryVersion, Tool: req.Tool, CallID: req.CallID, Status: req.Status,
 		IsError: req.IsError, ContentType: req.ContentType, RawBytes: sp.n, RawSHA256: sum, Reducer: ReducerVersion}
-	proj, rec, err := Reduce(ctx, sp.f, sp.n, req.ContentType, s.limits.ProjectionTarget, s.limits.MaxProjection)
-	if err != nil {
-		return nil, err
+	var proj string
+	rec := Record{Reducer: ReducerVersion, Mode: "retained", RawBytes: sp.n}
+	if !req.Retain {
+		if proj, rec, err = Reduce(ctx, sp.f, sp.n, req.ContentType, s.limits.ProjectionTarget, s.limits.MaxProjection); err != nil {
+			return nil, err
+		}
 	}
 	d.Projection, d.ProjectedBytes, d.Omissions, d.Reduced, d.ProjectionMode = proj, len(proj), rec.Omissions, rec.Reduced, rec.Mode
-	if !rec.Reduced {
+	if !rec.Reduced && !req.Retain {
 		// nothing omitted: nothing retained, no handle, identity not sampled
 		d.CapturedIdentity = "unknown"
 		return d, nil

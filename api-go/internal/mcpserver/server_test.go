@@ -675,7 +675,7 @@ func TestCallToolMissingArg(t *testing.T) {
 func TestStructuredContentMirrorsText(t *testing.T) {
 	api := &fakeAPI{handle: func(r Request) *APIResponse {
 		switch {
-		case strings.HasSuffix(r.Path, "/session-grounding"):
+		case strings.Contains(r.Path, "/session-grounding?"):
 			return &APIResponse{Status: 200, Body: `{"workspace_id":"ws","changed_files":3,"summary":"3 changed"}`}
 		case strings.Contains(r.Path, "/why-failed"):
 			return &APIResponse{Status: 200, Body: `["not","an","object"]`}
@@ -930,7 +930,7 @@ func TestEveryToolResolvesWorkspaceFromEnv(t *testing.T) {
 	// an explicit argument wins over the binding, adds no echo line, and still reports
 	// its root
 	res, _ := call(t, s, "ground", map[string]any{"workspace_id": "explicit"})
-	if p := api.lastTool(t).Path; p != "/api/workspaces/explicit/session-grounding" || strings.Contains(allText(res), "[xmustard workspace]") {
+	if p := api.lastTool(t).Path; p != "/api/workspaces/explicit/session-grounding?max_chars=6000" || strings.Contains(allText(res), "[xmustard workspace]") {
 		t.Fatalf("explicit workspace_id: %s / %s", p, allText(res))
 	}
 	if ws := res["_meta"].(map[string]any)["xmustard/workspace"].(Workspace); ws.Root != "/r/explicit" || ws.Source != SourceArgument {
@@ -1049,7 +1049,7 @@ func TestUnregisteredRepoIsAutoRegistered(t *testing.T) {
 		t.Fatalf("%v %v", rerr, res)
 	}
 	want := WorkspaceIDForPath(repo)
-	if p := api.lastTool(t).Path; p != "/api/workspaces/"+want+"/session-grounding" {
+	if p := api.lastTool(t).Path; p != "/api/workspaces/"+want+"/session-grounding?max_chars=6000" {
 		t.Fatalf("registered workspace not used: %s", p)
 	}
 	ws := res["_meta"].(map[string]any)["xmustard/workspace"].(Workspace)
