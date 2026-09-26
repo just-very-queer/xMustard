@@ -94,3 +94,28 @@ func TestHeavyCoreBuildThatCanNeverFitIsPermanent(t *testing.T) {
 		t.Fatalf("a refused build ran: %d execs", n)
 	}
 }
+
+// The heavy table: whole-repository builds and WS-07's index writes are heavy with
+// their declarations; reads and queries of the same families are not.
+func TestHeavyCoreOpClassification(t *testing.T) {
+	for _, tc := range []struct {
+		call     []string
+		owner    string
+		declared int64
+	}{
+		{[]string{"symbolgraph", "build", "/r", "ws"}, "rust:symbolgraph/build", heavyBuildBytes},
+		{[]string{"symbolgraph", "build-lsp", "/r", "ws"}, "rust:symbolgraph/build-lsp", heavyBuildBytes},
+		{[]string{"changetrack", "index", "/d", "/r", "ws"}, "rust:changetrack/index", heavyBuildBytes},
+		{[]string{"index", "build", "/r"}, "rust:index/build", heavyIndexBytes},
+		{[]string{"index", "update", "/r", "--paths", "a.go"}, "rust:index/update", heavyIndexBytes},
+		{[]string{"index", "stats", "/r"}, "", 0},
+		{[]string{"symbolgraph", "impact", "/r", "ws", "X", "2"}, "", 0},
+		{[]string{"changetrack", "drift", "/d", "/r", "ws"}, "", 0},
+		{[]string{"index"}, "", 0},
+	} {
+		owner, declared, ok := heavyCoreOp(tc.call[0], tc.call[1:])
+		if owner != tc.owner || declared != tc.declared || ok != (tc.owner != "") {
+			t.Errorf("%v: got %q %d %v, want %q %d", tc.call, owner, declared, ok, tc.owner, tc.declared)
+		}
+	}
+}
