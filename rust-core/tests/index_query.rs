@@ -760,6 +760,89 @@ fn freshness_envelope_on_search_explain_and_impact_reports_the_commit_relation()
     }
 }
 
+// A read that observed another repository identity than the index was brought to (its
+// refresh was refused, failed or is still running) is answered by the graph for the
+// current tree, so an edit is searchable before the index catches up.
+#[test]
+fn an_index_behind_the_reads_identity_falls_back_so_edits_stay_visible() {
+    let r = fixture();
+    let root = r.path().to_str().unwrap();
+    run_json(&["index", "update", root, "--identity-key", "key-a"]);
+    fs::OpenOptions::new()
+        .append(true)
+        .open(r.path().join("web/src/total.ts"))
+        .and_then(|mut f| {
+            std::io::Write::write_all(
+                &mut f,
+                b"\nexport function brandNewWidgetTotal() { return 1; }\n",
+            )
+        })
+        .unwrap();
+    let found = |v: &Value| {
+        v["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|h| h["name"] == "brandNewWidgetTotal")
+    };
+    let search = |key: &str| {
+        run_json(&[
+            "search",
+            &format!("--identity-key={key}"),
+            root,
+            "ws",
+            "brandNewWidgetTotal",
+            "10",
+        ])
+    };
+
+    // the index is at this read's identity: it answers (and lacks the edit)
+    let at_index = search("key-a");
+    assert_eq!(at_index["freshness"]["source"], "index", "{at_index}");
+    assert!(!found(&at_index), "{at_index}");
+
+    // the tree moved on (key-b) and the index did not: the current graph answers
+    let behind = search("key-b");
+    assert_eq!(behind["freshness"]["source"], "legacy_graph", "{behind}");
+    assert!(found(&behind), "the edit is searchable: {behind}");
+    let detail = behind["coverage"]["work"]["graph_cache_detail"]
+        .as_str()
+        .unwrap();
+    assert!(detail.contains("behind this read"), "{detail}");
+
+    // impact and explain take the same flag, after the subcommand
+    let impact = run_json(&[
+        "symbolgraph",
+        "impact",
+        "--identity-key=key-b",
+        root,
+        "ws",
+        "brandNewWidgetTotal",
+        "4",
+    ]);
+    assert_eq!(impact["freshness"]["source"], "legacy_graph", "{impact}");
+    assert_eq!(
+        impact["defined_in"],
+        json!(["web/src/total.ts"]),
+        "{impact}"
+    );
+    let explain = run_json(&[
+        "symbolgraph",
+        "cluster-of",
+        "--identity-key=key-a",
+        root,
+        "ws",
+        "web/src/total.ts",
+    ]);
+    assert_eq!(explain["freshness"]["source"], "index", "{explain}");
+
+    // once the index is brought to key-b, it answers again, edit included
+    run_json(&["index", "update", root, "--identity-key", "key-b"]);
+    let caught_up = search("key-b");
+    assert_eq!(caught_up["freshness"]["source"], "index", "{caught_up}");
+    assert!(found(&caught_up), "{caught_up}");
+}
+
 #[test]
 fn coverage_reports_envelope_losses_instead_of_silent_capping() {
     let r = fixture();
@@ -971,16 +1054,35 @@ impl Serve {
     }
 
     fn call(&mut self, method: &str, args: &[&str]) -> Value {
-        self.next += 1;
-        let id = self.next;
-        let body = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": {"args": args}});
-        write_frame(&mut self.stdin, Some(id), &[body.to_string().as_bytes()]).unwrap();
-        let header = read_header(&mut self.stdout).unwrap();
-        let mut buf = vec![0; header.len];
-        self.stdout.read_exact(&mut buf).unwrap();
-        let v: Value = serde_json::from_slice(&buf).unwrap();
-        assert!(v.get("error").is_none(), "{method} {args:?}: {v}");
-        v["result"].clone()
+        let args = args.iter().map(|a| a.to_string()).collect();
+        self.pipelined(&[(method, args)]).remove(0)
+    }
+
+    /// Send every call before reading any answer, so up to `--max-inflight` of them
+    /// run in the service at once. Answers arrive in completion order and are matched
+    /// by id. The requests are small enough to sit in the pipe while answers queue.
+    fn pipelined(&mut self, calls: &[(&str, Vec<String>)]) -> Vec<Value> {
+        let first = self.next + 1;
+        for (method, args) in calls {
+            self.next += 1;
+            let body = json!({"jsonrpc": "2.0", "id": self.next, "method": method, "params": {"args": args}});
+            write_frame(
+                &mut self.stdin,
+                Some(self.next),
+                &[body.to_string().as_bytes()],
+            )
+            .unwrap();
+        }
+        let mut out = vec![Value::Null; calls.len()];
+        for _ in calls {
+            let header = read_header(&mut self.stdout).unwrap();
+            let mut buf = vec![0; header.len];
+            self.stdout.read_exact(&mut buf).unwrap();
+            let v: Value = serde_json::from_slice(&buf).unwrap();
+            assert!(v.get("error").is_none(), "{v}");
+            out[(v["id"].as_i64().unwrap() - first) as usize] = v["result"].clone();
+        }
+        out
     }
 
     fn rss(&self) -> u64 {
@@ -1011,17 +1113,44 @@ fn rss_of(pid: u32) -> u64 {
 }
 
 /// Queries every tool path runs, several times over.
-fn query_round(s: &mut Serve, root: &str, i: usize) -> Value {
+/// One agent's query round: search, impact, trace and explain (cluster-of).
+fn round_calls(root: &str, i: usize) -> Vec<(&'static str, Vec<String>)> {
     let name = synthetic_name(i * 37 % 60_000);
     let other = synthetic_name(i * 53 % 60_000 + 1);
-    let search = s.call("search", &[root, "ws", &name, "10"]);
-    s.call("symbolgraph", &["impact", root, "ws", &name, "4"]);
-    s.call("symbolgraph", &["trace", root, "ws", &name, &other]);
-    s.call(
-        "symbolgraph",
-        &["cluster-of", root, "ws", "pkg001/module02/file00120.ts"],
-    );
-    search
+    let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    vec![
+        ("search", v(&[root, "ws", &name, "10"])),
+        ("symbolgraph", v(&["impact", root, "ws", &name, "4"])),
+        ("symbolgraph", v(&["trace", root, "ws", &name, &other])),
+        (
+            "symbolgraph",
+            v(&["cluster-of", root, "ws", "pkg001/module02/file00120.ts"]),
+        ),
+    ]
+}
+
+/// How the clients' requests reach the service.
+#[derive(Clone, Copy, Debug)]
+enum Load {
+    /// One request in flight at a time, the clients' rounds interleaved.
+    Sequential,
+    /// Every client's round sent at once, so up to `--max-inflight=4` run together.
+    Overlapping,
+}
+
+/// One round per client; returns each client's search result.
+fn client_rounds(s: &mut Serve, root: &str, load: Load, i: usize) -> Vec<Value> {
+    let calls: Vec<_> = (0..CLIENTS)
+        .flat_map(|c| round_calls(root, c * 100 + i))
+        .collect();
+    let answers: Vec<Value> = match load {
+        Load::Overlapping => s.pipelined(&calls),
+        Load::Sequential => calls
+            .iter()
+            .flat_map(|c| s.pipelined(std::slice::from_ref(c)))
+            .collect(),
+    };
+    answers.into_iter().step_by(calls.len() / CLIENTS).collect()
 }
 
 struct Measured {
@@ -1034,9 +1163,14 @@ struct Measured {
     generations: BTreeSet<i64>,
 }
 
+/// Agents querying the service at once.
+const CLIENTS: usize = 4;
+/// Regression guard for four overlapping clients (not the acceptance line, see below).
+const OVERLAP_GUARD_MIB: f64 = 32.0;
+
 /// Measure the service on the synthetic store: base after the handshake, then after
 /// queries, then during and after a snapshot swap with queries in flight.
-fn measure(storage: &str) -> Measured {
+fn measure(storage: &str, load: Load) -> Measured {
     let r = repo(&[("README.md", "synthetic\n")]);
     let root = r.path().to_str().unwrap().to_string();
     let head = git(r.path(), &["rev-parse", "HEAD"]);
@@ -1050,19 +1184,19 @@ fn measure(storage: &str) -> Measured {
     let base = s.rss();
     let mut gens = BTreeSet::new();
     for i in 0..4 {
-        let v = query_round(&mut s, &root, i);
-        gens.insert(v["freshness"]["snapshot_generation"].as_i64().unwrap());
-        assert_eq!(
-            v["freshness"]["source"], "resident_index",
-            "{}",
-            v["freshness"]
-        );
+        for v in client_rounds(&mut s, &root, load, i) {
+            gens.insert(v["freshness"]["snapshot_generation"].as_i64().unwrap());
+            assert_eq!(
+                v["freshness"]["source"], "resident_index",
+                "{}",
+                v["freshness"]
+            );
+        }
     }
     let steady = s.rss();
 
     // swap: a new generation lands while four clients keep querying
     let pid = s.child.id();
-    let s = Arc::new(Mutex::new(s));
     let stop = Arc::new(AtomicBool::new(false));
     let sampler = {
         let stop = stop.clone();
@@ -1075,21 +1209,20 @@ fn measure(storage: &str) -> Measured {
             peak
         })
     };
-    let clients: Vec<_> = (0..4)
-        .map(|c| {
-            let (s, stop, root) = (s.clone(), stop.clone(), root.clone());
-            std::thread::spawn(move || {
-                let mut seen = BTreeSet::new();
-                let mut i = c * 100;
-                while !stop.load(Ordering::Relaxed) {
-                    let v = query_round(&mut s.lock().unwrap(), &root, i);
+    let clients = {
+        let (stop, root) = (stop.clone(), root.clone());
+        std::thread::spawn(move || {
+            let mut seen = BTreeSet::new();
+            let mut i = 10;
+            while !stop.load(Ordering::Relaxed) {
+                for v in client_rounds(&mut s, &root, load, i) {
                     seen.insert(v["freshness"]["snapshot_generation"].as_i64().unwrap());
-                    i += 1;
                 }
-                seen
-            })
+                i += 1;
+            }
+            (s, seen)
         })
-        .collect();
+    };
     let next = dir.path().join("next.db");
     synthetic_store(&next, &head, 2);
     {
@@ -1100,14 +1233,13 @@ fn measure(storage: &str) -> Measured {
     fs::rename(&next, &db).unwrap();
     std::thread::sleep(Duration::from_secs(3));
     stop.store(true, Ordering::Relaxed);
-    for c in clients {
-        gens.extend(c.join().unwrap());
-    }
+    let (mut s, seen) = clients.join().unwrap();
+    gens.extend(seen);
     let peak = sampler.join().unwrap();
-    let mut s = Arc::try_unwrap(s).ok().unwrap().into_inner().unwrap();
     for i in 0..4 {
-        let v = query_round(&mut s, &root, i + 500);
-        gens.insert(v["freshness"]["snapshot_generation"].as_i64().unwrap());
+        for v in client_rounds(&mut s, &root, load, i + 500) {
+            gens.insert(v["freshness"]["snapshot_generation"].as_i64().unwrap());
+        }
     }
     let swapped = s.rss();
     let stats = s.call("$/stats", &[]);
@@ -1119,7 +1251,7 @@ fn measure(storage: &str) -> Measured {
         generations: gens,
     };
     eprintln!(
-        "{storage}: base {:.1} MiB, steady +{:.1}, swap peak +{:.1}, after swap +{:.1}; index {}",
+        "{storage}, {load:?}: base {:.1} MiB, steady +{:.1}, swap peak +{:.1}, after swap +{:.1}; index {}",
         base as f64 / MIB,
         m.steady,
         m.swap_peak,
@@ -1130,21 +1262,40 @@ fn measure(storage: &str) -> Measured {
 }
 
 /// PAR-IMP-02 / WS-14 acceptance: with file-backed segments (the default), the
-/// service's steady RSS on a 100k-symbol graph at five resolved edges per symbol stays
-/// within 15 MiB of its base, including a snapshot swap under concurrent readers.
+/// service's RSS on a 100k-symbol graph at five resolved edges per symbol stays within
+/// 15 MiB of its base while four clients' queries arrive one at a time, including a
+/// snapshot swap under that load.
+///
+/// With the four clients' queries in flight together, each pool thread holds its own
+/// query transients (impact's file list, search's candidate pool): +13.4 to +15.2 MiB
+/// on Linux with one glibc arena, +22 to +27 MiB on macOS. That reaches or passes the
+/// line and is recorded as open in the benchmark note; the bound here only guards
+/// against regressions past it.
 /// The in-memory layout is measured for the record (see the benchmark note).
 #[test]
 fn resident_rss_on_a_100k_symbol_resolved_graph_stays_within_the_line() {
-    let m = measure("file");
-    assert!(
-        m.generations.contains(&1) && m.generations.contains(&2),
-        "the service swapped snapshots under load: {:?}",
-        m.generations
-    );
-    assert!(m.steady <= 15.0, "steady +{:.1} MiB", m.steady);
-    assert!(m.swap_peak <= 15.0, "swap peak +{:.1} MiB", m.swap_peak);
-    assert!(m.after_swap <= 15.0, "after swap +{:.1} MiB", m.after_swap);
+    for (load, line) in [
+        (Load::Sequential, 15.0),
+        (Load::Overlapping, OVERLAP_GUARD_MIB),
+    ] {
+        let m = measure("file", load);
+        assert!(
+            m.generations.contains(&1) && m.generations.contains(&2),
+            "{load:?}: the service swapped snapshots under load: {:?}",
+            m.generations
+        );
+        for (what, mib) in [
+            ("steady", m.steady),
+            ("swap peak", m.swap_peak),
+            ("after swap", m.after_swap),
+        ] {
+            assert!(
+                mib <= line,
+                "{load:?}: {what} +{mib:.1} MiB over {line} MiB"
+            );
+        }
+    }
     if std::env::var_os("XMUSTARD_MEASURE_MEM_STORAGE").is_some() {
-        measure("mem");
+        measure("mem", Load::Sequential);
     }
 }

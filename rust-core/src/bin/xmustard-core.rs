@@ -588,10 +588,10 @@ fn ownership(mut args: Args) -> CmdResult {
             let usage = "xmustard-core ownership subsystems <root> <workspace_id>";
             let root = need(&mut args, usage)?;
             let ws = need(&mut args, usage)?;
-            json(&xmustard_core::ownership::build_subsystems(
-                Path::new(&root),
-                &ws,
-            ))
+            json(
+                &xmustard_core::ownership::build_subsystems(Path::new(&root), &ws)
+                    .map_err(|e| CmdError::failed(format!("ownership subsystems: {e}")))?,
+            )
         }
         "owners" => {
             let usage = "xmustard-core ownership owners <root> <path>";
@@ -609,8 +609,26 @@ fn ownership(mut args: Args) -> CmdResult {
     }
 }
 
-fn search(mut args: Args) -> CmdResult {
-    let usage = "xmustard-core search <root> <workspace_id> <query> [limit] [seed]";
+/// A leading `--identity-key=K`: the repository identity the caller observed for this
+/// graph read. The code index answers only when it was brought to that identity; else
+/// the legacy graph for the current tree does (`symbolgraph::query_source_for`). Only
+/// the first argument is looked at, so a query or symbol is never taken for the flag.
+fn identity_flag(args: Args) -> (Option<String>, Args) {
+    let mut v: Vec<String> = args.collect();
+    let key = v
+        .first()
+        .and_then(|a| a.strip_prefix("--identity-key="))
+        .map(str::to_string);
+    if key.is_some() {
+        v.remove(0);
+    }
+    (key.filter(|k| !k.is_empty()), v.into_iter())
+}
+
+fn search(args: Args) -> CmdResult {
+    let usage =
+        "xmustard-core search [--identity-key=K] <root> <workspace_id> <query> [limit] [seed]";
+    let (key, mut args) = identity_flag(args);
     let root = need(&mut args, usage)?;
     let ws = need(&mut args, usage)?;
     let query = need(&mut args, usage)?;
@@ -620,9 +638,10 @@ fn search(mut args: Args) -> CmdResult {
         .unwrap_or(25);
     // optional 5th positional: a seed symbol for the graph-proximity lane.
     let seed = args.next().filter(|s| !s.trim().is_empty());
-    json(&xmustard_core::search::hybrid_search(
+    json(&xmustard_core::search::hybrid_search_for(
         &PathBuf::from(root),
         &ws,
+        key.as_deref(),
         &query,
         limit,
         seed.as_deref(),
@@ -644,10 +663,10 @@ fn wiki(mut args: Args) -> CmdResult {
     let usage = "xmustard-core wiki <root> <workspace_id>";
     let root = need(&mut args, usage)?;
     let ws = need(&mut args, usage)?;
-    json(&xmustard_core::wiki::generate_wiki(
-        &PathBuf::from(root),
-        &ws,
-    ))
+    json(
+        &xmustard_core::wiki::generate_wiki(&PathBuf::from(root), &ws)
+            .map_err(|e| CmdError::failed(format!("wiki: {e}")))?,
+    )
 }
 
 /// Dispatch the `goal` subcommand family over the durable goal runtime.
@@ -874,9 +893,13 @@ fn run_symbolgraph_command(mut args: Args) -> CmdResult {
 
     let sub = need(
         &mut args,
-        "xmustard-core symbolgraph <build|hotspots|clusters|cluster-of|impact|trace|blast-radius> ...",
+        "xmustard-core symbolgraph <build|hotspots|clusters|cluster-of|impact|trace|blast-radius> [--identity-key=K] ...",
     )?;
-    let usage = |rest: &str| format!("xmustard-core symbolgraph {sub} <root> <workspace_id>{rest}");
+    let (key, mut args) = identity_flag(args);
+    let source = |root: &str, ws: &str| sg::query_source_for(Path::new(root), ws, key.as_deref());
+    let usage = |rest: &str| {
+        format!("xmustard-core symbolgraph {sub} [--identity-key=K] <root> <workspace_id>{rest}")
+    };
     let failed = |e: String| CmdError::failed(format!("symbolgraph {sub}: {e}"));
     match sub.as_str() {
         "build" => {
@@ -889,7 +912,7 @@ fn run_symbolgraph_command(mut args: Args) -> CmdResult {
             let u = usage("");
             let root = need(&mut args, &u)?;
             let ws = need(&mut args, &u)?;
-            let src = sg::query_source(Path::new(&root), &ws);
+            let src = source(&root, &ws);
             json(&src.graph.clusters().map_err(failed)?)
         }
         "cluster-of" => {
@@ -897,7 +920,7 @@ fn run_symbolgraph_command(mut args: Args) -> CmdResult {
             let root = need(&mut args, &u)?;
             let ws = need(&mut args, &u)?;
             let path = need(&mut args, &u)?;
-            let src = sg::query_source(Path::new(&root), &ws);
+            let src = source(&root, &ws);
             let cluster = src.graph.cluster_of(&path).map_err(failed)?;
             let (freshness, coverage) = src.annotate([path.as_str()]);
             json(&serde_json::json!({
@@ -916,7 +939,7 @@ fn run_symbolgraph_command(mut args: Args) -> CmdResult {
                 .next()
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(4);
-            let src = sg::query_source(Path::new(&root), &ws);
+            let src = source(&root, &ws);
             let mut out = src.graph.impact(&symbol, depth).map_err(failed)?;
             let paths = out
                 .defined_in
@@ -931,7 +954,7 @@ fn run_symbolgraph_command(mut args: Args) -> CmdResult {
             let ws = need(&mut args, &u)?;
             let from = need(&mut args, &u)?;
             let to = need(&mut args, &u)?;
-            let src = sg::query_source(Path::new(&root), &ws);
+            let src = source(&root, &ws);
             let mut out = src.graph.trace(&from, &to).map_err(failed)?;
             (out.freshness, out.coverage) = src.annotate(out.path.iter().map(String::as_str));
             json(&out)
@@ -944,7 +967,7 @@ fn run_symbolgraph_command(mut args: Args) -> CmdResult {
                 .next()
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(20);
-            let src = sg::query_source(Path::new(&root), &ws);
+            let src = source(&root, &ws);
             json(&src.graph.hotspots(limit).map_err(failed)?)
         }
         "blast-radius" => {

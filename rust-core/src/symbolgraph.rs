@@ -162,6 +162,24 @@ pub struct IndexCoverage {
     pub envelope: Option<crate::index::meta::Envelope>,
 }
 
+impl IndexCoverage {
+    /// Record a graph read that failed while answering (a corrupt or truncated segment,
+    /// an I/O error): the answer is partial, so it is no longer reported complete.
+    pub fn note_read_error(&mut self, what: &str, err: &str) {
+        eprintln!("graph read ({what}): {err}");
+        *self
+            .loss_counts
+            .entry("graph_read_error".into())
+            .or_default() += 1;
+        self.complete = false;
+        let msg = format!("graph read failed ({what}): {err}");
+        self.degraded_reason = Some(match self.degraded_reason.take() {
+            Some(r) => format!("{r}; {msg}"),
+            None => msg,
+        });
+    }
+}
+
 /// One `git ls-files -s -z` index entry.
 struct IndexEntry {
     mode: String,
@@ -2436,14 +2454,39 @@ pub struct QuerySource {
 /// The source for a query on `root`: the resident (or one-shot) index snapshot when
 /// the root is indexed, else the legacy per-call graph.
 pub fn query_source(root: &Path, workspace_id: &str) -> QuerySource {
-    if let Some(opened) = crate::index::reader::open(root) {
-        return QuerySource {
-            graph: opened.snapshot.clone(),
-            coverage: opened.coverage(),
-            answered: Answered::Index(opened),
-        };
+    query_source_for(root, workspace_id, None)
+}
+
+/// [`query_source`] for a read that observed the repository identity `identity_key`
+/// (the orchestrator's key, the one `index update --identity-key` stamps). An index
+/// last brought to another identity is behind the working tree: its refresh was
+/// refused, failed or is still running. The legacy graph, built for the tree as it is
+/// now and bounded by the same envelope, answers that read instead, so edits never
+/// drop out of search, explain and impact while the index catches up.
+pub fn query_source_for(
+    root: &Path,
+    workspace_id: &str,
+    identity_key: Option<&str>,
+) -> QuerySource {
+    let behind = match crate::index::reader::open(root) {
+        Some(opened) if identity_key.is_none_or(|k| k == opened.meta.identity_key) => {
+            return QuerySource {
+                graph: opened.snapshot.clone(),
+                coverage: opened.coverage(),
+                answered: Answered::Index(opened),
+            };
+        }
+        Some(opened) => Some(opened.snapshot.generation),
+        None => None,
+    };
+    let (graph, mut coverage) = symbol_graph_with_coverage(root, workspace_id);
+    if let Some(generation) = behind {
+        coverage.work.graph_cache_detail = format!(
+            "code index generation {generation} is behind this read's repository identity; \
+             the graph for the current identity answered ({})",
+            coverage.work.graph_cache_detail
+        );
     }
-    let (graph, coverage) = symbol_graph_with_coverage(root, workspace_id);
     // the legacy graph is built from the working tree's identity at this call
     let id = &coverage.source_identity;
     let relation = Relation {
@@ -2495,6 +2538,24 @@ mod tests {
     use super::*;
     use std::process::Command;
     use tempfile::TempDir;
+
+    // A failed graph read makes the answer partial: coverage stops claiming complete,
+    // counts the failure and keeps any earlier degradation reason.
+    #[test]
+    fn a_graph_read_error_marks_coverage_incomplete() {
+        let mut c = IndexCoverage {
+            complete: true,
+            degraded_reason: Some("coverage losses: oversized=1".into()),
+            ..Default::default()
+        };
+        c.note_read_error("symbols", "segment truncated");
+        c.note_read_error("files", "I/O error");
+        assert!(!c.complete);
+        assert_eq!(c.loss_counts["graph_read_error"], 2);
+        let reason = c.degraded_reason.unwrap();
+        assert!(reason.starts_with("coverage losses: oversized=1; graph read failed (symbols)"));
+        assert!(reason.ends_with("graph read failed (files): I/O error"));
+    }
 
     // The openat fd-walk refuses a symlink at EVERY path component (final file AND
     // intermediate directory), so a swap can't redirect the explain/symbols read into

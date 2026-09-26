@@ -228,26 +228,40 @@ pub fn hybrid_search(
     limit: usize,
     seed: Option<&str>,
 ) -> SearchResult {
-    let source = symbolgraph::query_source(root, workspace_id);
+    hybrid_search_for(root, workspace_id, None, query, limit, seed)
+}
+
+/// [`hybrid_search`] for a read that observed the repository identity `identity_key`
+/// (see [`symbolgraph::query_source_for`]).
+pub fn hybrid_search_for(
+    root: &Path,
+    workspace_id: &str,
+    identity_key: Option<&str>,
+    query: &str,
+    limit: usize,
+    seed: Option<&str>,
+) -> SearchResult {
+    let source = symbolgraph::query_source_for(root, workspace_id, identity_key);
     let graph = source.graph.as_ref();
-    let coverage = source.coverage.clone();
-    // a graph read that fails leaves its lane empty; the result still reports coverage
-    let warn = |what: &str, r: Result<(), String>| {
-        if let Err(e) = r {
-            eprintln!("search: {what}: {e}");
+    let mut coverage = source.coverage.clone();
+    // A graph read that fails leaves its lane empty and marks the result's coverage
+    // incomplete (`graph_read_error`), so a partial answer never reads as complete.
+    let mut read_errors: Vec<(&str, String)> = Vec::new();
+    let hotspots: HashSet<String> = match graph.hotspots(30) {
+        Ok(h) => h.into_iter().map(|h| h.path).collect(),
+        Err(e) => {
+            read_errors.push(("hotspots", e));
+            HashSet::new()
         }
     };
-    let hotspots: HashSet<String> = graph
-        .hotspots(30)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|h| h.path)
-        .collect();
 
     let mut qtokens: Vec<String> = tokens(query);
     qtokens.sort();
     qtokens.dedup();
     if qtokens.is_empty() {
+        for (what, e) in &read_errors {
+            coverage.note_read_error(what, e);
+        }
         return SearchResult {
             workspace_id: workspace_id.to_string(),
             query: query.to_string(),
@@ -259,13 +273,18 @@ pub fn hybrid_search(
         };
     }
     let query_lc = query.trim().to_lowercase();
+    let mut check = |what: &'static str, r: Result<(), String>| {
+        if let Err(e) = r {
+            read_errors.push((what, e));
+        }
+    };
 
     // document frequency of each query token across symbol-name tokens (idf).
     // Token sets are computed per symbol and dropped (not materialized for every
     // symbol at once); the candidate pass below recomputes them the same way.
     let n = graph.symbol_count().max(1) as f64;
     let mut df: HashMap<String, usize> = HashMap::new();
-    warn(
+    check(
         "symbols",
         graph.for_each_symbol(&mut |s| {
             let set: HashSet<String> = tokens(s.name).into_iter().collect();
@@ -314,7 +333,7 @@ pub fn hybrid_search(
     };
 
     let mut cands: Vec<Cand> = Vec::new();
-    warn(
+    check(
         "symbols",
         graph.for_each_symbol(&mut |sym| {
             let name_tokens: HashSet<String> = tokens(sym.name).into_iter().collect();
@@ -351,7 +370,7 @@ pub fn hybrid_search(
             });
         }),
     );
-    warn(
+    check(
         "files",
         graph.for_each_file(&mut |f| {
             let path_tokens: HashSet<String> = tokens(f.path).into_iter().collect();
@@ -393,9 +412,13 @@ pub fn hybrid_search(
             .min_by(|a, b| a.path.cmp(&b.path).then(a.line.cmp(&b.line)))
             .map(|c| c.name.to_string()),
     };
-    if let Some(seed_name) = &effective_seed
-        && let Ok(impact) = graph.impact(seed_name, PROXIMITY_DEPTH)
-    {
+    let seed_impact = effective_seed.as_ref().and_then(|seed_name| {
+        graph
+            .impact(seed_name, PROXIMITY_DEPTH)
+            .inspect_err(|e| read_errors.push(("seed impact", e.clone())))
+            .ok()
+    });
+    if let Some(impact) = seed_impact {
         let mut prox: HashMap<String, f64> = HashMap::new();
         for d in &impact.defined_in {
             prox.insert(d.clone(), 1.0); // the seed's own file: distance 0
@@ -521,6 +544,9 @@ pub fn hybrid_search(
             .then(a.name.cmp(&b.name))
     });
     hits.truncate(limit);
+    for (what, e) in &read_errors {
+        coverage.note_read_error(what, e);
+    }
     let freshness = source.freshness(
         hits.iter()
             .filter(|h| h.kind != "doc")

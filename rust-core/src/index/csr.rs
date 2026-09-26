@@ -33,8 +33,8 @@
 //! the graph size and however many snapshots overlap.
 //!
 //! A segment is written once per index generation, by the index worker after a build
-//! or update commits (or by a reader that finds none), to a temporary name and renamed
-//! into place. A reader holds its file descriptor, so a later rename never changes the
+//! or update commits, to a temporary name and renamed into place; readers never write
+//! one (a store without a segment is unreadable until its next update). A reader holds its file descriptor, so a later rename never changes the
 //! bytes under it: snapshots are immutable.
 
 use std::collections::{BTreeMap, HashMap};
@@ -385,7 +385,7 @@ impl BlockCache {
     }
 }
 
-/// The process-wide block cache (`XMUSTARD_GRAPH_CACHE_KIB`, default 4 MiB).
+/// The process-wide block cache (`XMUSTARD_GRAPH_CACHE_KIB`, default 2 MiB, [`DEFAULT_CACHE_KIB`]).
 pub fn block_cache() -> &'static BlockCache {
     static CACHE: OnceLock<BlockCache> = OnceLock::new();
     CACHE.get_or_init(|| {

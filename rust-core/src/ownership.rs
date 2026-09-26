@@ -45,7 +45,8 @@ fn subsystem_name(path: &str) -> String {
 /// Subsystems (top-level directories) with their size and cohesion. The graph is the
 /// code index's snapshot when the root has an index (resident inside `serve`), else
 /// the legacy graph through its shared cache, so this never rebuilds the repository.
-pub fn build_subsystems(root: &Path, workspace_id: &str) -> Vec<Subsystem> {
+/// A failed graph read is an error: partial totals would read as the whole repository.
+pub fn build_subsystems(root: &Path, workspace_id: &str) -> Result<Vec<Subsystem>, String> {
     let graph = symbolgraph::query_source(root, workspace_id).graph;
     let mut file_to_subsystem: HashMap<String, String> = HashMap::new();
     let mut totals: HashMap<String, (usize, usize, usize, usize)> = HashMap::new(); // file_count, symbol_count, internal, external
@@ -75,11 +76,7 @@ pub fn build_subsystems(root: &Path, workspace_id: &str) -> Vec<Subsystem> {
             }
         }
     });
-    for r in [files, edges] {
-        if let Err(e) = r {
-            eprintln!("ownership: graph read: {e}");
-        }
-    }
+    files.and(edges).map_err(|e| format!("graph read: {e}"))?;
 
     let mut subsystems: Vec<Subsystem> = totals
         .into_iter()
@@ -108,7 +105,7 @@ pub fn build_subsystems(root: &Path, workspace_id: &str) -> Vec<Subsystem> {
             .cmp(&a.file_count)
             .then_with(|| a.name.cmp(&b.name))
     });
-    subsystems
+    Ok(subsystems)
 }
 
 pub fn likely_owners(root: &Path, path: &str) -> OwnerSuggestion {
@@ -206,7 +203,7 @@ mod tests {
     #[test]
     fn builds_core_subsystem_from_file_paths() {
         let repo = temp_repo();
-        let subsystems = build_subsystems(repo.path(), "ws");
+        let subsystems = build_subsystems(repo.path(), "ws").unwrap();
         let core = subsystems
             .iter()
             .find(|s| s.name == "core")

@@ -513,8 +513,9 @@ fn legacy_coverage(m: &StoreMeta, symbols: usize) -> IndexCoverage {
         max_files: c.envelope.max_files,
         degraded_reason: (!degraded.is_empty())
             .then(|| format!("coverage losses: {}", degraded.join(", "))),
-        selected_files: c.eligible_files
-            - c.loss_counts.get("envelope_files").copied().unwrap_or(0),
+        selected_files: c
+            .eligible_files
+            .saturating_sub(c.loss_counts.get("envelope_files").copied().unwrap_or(0)),
         complete: c.complete,
         worktree_deleted_files: c.worktree_deleted_files,
         symbols_truncated_files: symbols_truncated,
@@ -557,7 +558,9 @@ pub struct Opened {
 impl Opened {
     /// The snapshot's coverage with the identity the store was last brought to. The
     /// read itself parses nothing: index work happens in the index worker, and the
-    /// orchestrator reports the refresh it ran for the call.
+    /// orchestrator reports the refresh it ran for the call. `stable` holds when `HEAD`
+    /// is still the indexed commit; working-tree edits since the generation are listed
+    /// per result path by the freshness envelope.
     pub fn coverage(&self) -> IndexCoverage {
         let mut c = self.snapshot.coverage.clone();
         c.source_identity = SourceIdentitySummary {
@@ -565,7 +568,7 @@ impl Opened {
             head: self.meta.last_commit.clone(),
             parser_version: self.meta.analyzer_version.clone(),
             identity_complete: !self.meta.identity_key.is_empty(),
-            stable: true,
+            stable: self.relation.status == envelope::Status::Current,
             limitations: 0,
         };
         c
@@ -820,4 +823,25 @@ pub fn enable_resident(max_roots: usize) -> &'static Snapshots {
 
 pub fn resident() -> Option<&'static Snapshots> {
     RESIDENT.get()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Coverage comes from meta JSON with defaulted fields, so its counts need not agree:
+    // more envelope losses than eligible files must not underflow.
+    #[test]
+    fn legacy_coverage_survives_inconsistent_counts() {
+        let mut c = meta::Coverage {
+            eligible_files: 3,
+            ..Default::default()
+        };
+        c.loss_counts.insert("envelope_files".into(), 7);
+        let m = StoreMeta {
+            coverage: Some(c),
+            ..Default::default()
+        };
+        assert_eq!(legacy_coverage(&m, 0).selected_files, 0);
+    }
 }
