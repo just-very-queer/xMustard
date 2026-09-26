@@ -566,11 +566,20 @@ func TestReaderWritesNameMissingRole(t *testing.T) {
 }
 
 // With the auth middleware's reader short-circuit gone, the gate table alone keeps
-// reader-only tokens read-only: no non-GET route may grant reader.
+// reader-only tokens read-only: no non-GET route may grant reader. The MCP endpoint
+// is the one exemption: its messages change nothing themselves, and every tool call
+// re-enters the API through that tool's own gate as the caller (mcp_routes.go).
 func TestNoWriteRouteGrantsReader(t *testing.T) {
+	reentrant := map[string]bool{"POST /mcp": true, "DELETE /mcp": true}
 	for pattern, g := range routeGateTable {
 		switch patternMethod(pattern) {
 		case "", http.MethodGet, http.MethodHead:
+			continue
+		}
+		if reentrant[pattern] {
+			if !g.ReadSafe || !g.Core {
+				t.Errorf("%s: the MCP endpoint must be core and read-safe", pattern)
+			}
 			continue
 		}
 		if g.Role == roleReader {
