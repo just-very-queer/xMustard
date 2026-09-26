@@ -48,7 +48,9 @@ pub struct Loss {
     pub path: String,
     /// `oversized` | `unreadable` | `symlink` | `not_regular` | `missing` |
     /// `envelope_files` | `envelope_bytes` | `symbol_budget` | `symbols_truncated` |
-    /// `nesting_truncated` | `parse_errors` | `invalid_utf8` | `lexical_fallback`
+    /// `nesting_truncated` | `parse_errors` | `invalid_utf8` | `lexical_fallback` |
+    /// `ignore_budget` (the ignore rules could not decide the file within the scan's
+    /// matching budget)
     pub reason: String,
     /// Whether the file's content still contributed rows (partial, not absent).
     pub content_indexed: bool,
@@ -71,7 +73,8 @@ pub struct Coverage {
     /// Eligible files whose content was read and extracted.
     pub indexed_files: usize,
     pub ignored_files: usize,
-    /// Ignore-file lines skipped by the matcher's bounds (too long, too many rules).
+    /// Ignore-file lines and files skipped by the matcher's bounds (too long, too many
+    /// rules or pattern bytes, an ignore file above 64 KiB).
     pub ignore_rules_dropped: usize,
     pub invalid_paths: usize,
     /// Tracked files deleted from the worktree (not eligible, not a loss).

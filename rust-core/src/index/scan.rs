@@ -12,25 +12,34 @@
 //!
 //! The scan also applies the file and byte bounds of the scale envelope (PAR-RT-09), so
 //! its memory never grows with the number of tracked files: at most
-//! `max_files + MAX_LOSS_ROWS` candidates are materialized (the smallest paths, kept in a
-//! bounded heap); every other eligible file is only counted, by loss reason. In path
-//! order, the first `max_files` readable files whose sizes fit `max_total_bytes` are
-//! indexed; a readable file that does not fit the byte budget is an `envelope_bytes`
-//! loss, and every file after the `max_files`-th readable one is an `envelope_files`
-//! loss. The kept set is therefore a pure function of the tree, so full builds and
-//! incremental updates agree on it.
+//! `max_files + MAX_LOSS_ROWS` readable candidates and `MAX_LOSS_ROWS` candidates with a
+//! pre-read loss are materialized (the smallest paths, kept in two bounded heaps, so
+//! loss rows never displace readable files); every other eligible file is only counted,
+//! by loss reason. In path order, the first `max_files` readable files whose sizes fit
+//! `max_total_bytes` are indexed; a readable file that does not fit the byte budget is
+//! an `envelope_bytes` loss, and every file after the `max_files`-th readable one is an
+//! `envelope_files` loss. The kept set is therefore a pure function of the tree, so full
+//! builds and incremental updates agree on it.
+//!
+//! Git's watchdog times Git, not this side: time spent classifying records (lstat,
+//! ignore matching) while Git waits on the pipe is not counted against `git_timeout`, so
+//! a slow filesystem or an expensive ignore file makes the scan slower, never failed.
+//! Ignore matching itself is budgeted (`ignore::MATCH_BUDGET`); paths it cannot decide
+//! are the `ignore_budget` loss.
 
 use std::collections::{BTreeMap, BinaryHeap};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
+use std::time::{Duration, Instant};
 
 use crate::indexcache::{git_timeout, run_git_bounded};
 
 use super::config::IndexConfig;
 use super::extract::Lang;
-use super::ignore::{Ignore, XMUSTARD_IGNORE};
+use super::ignore::{DirMemo, Ignore, Verdict, XMUSTARD_IGNORE};
 use super::meta::MAX_LOSS_ENTRIES;
 
 /// Candidates with a pre-read loss (symlink, oversized, envelope_bytes...) kept as rows;
@@ -272,7 +281,9 @@ fn head(root: &Path) -> String {
 }
 
 /// Run git and hand each NUL-terminated record of its stdout to `on_record` as it
-/// arrives. The output is never held whole; the run is killed after `git_timeout`.
+/// arrives. The output is never held whole. Git is killed once it has run for
+/// `git_timeout` not counting the time `on_record` takes (Git only waits on the pipe
+/// then), so slow record handling never fails the listing.
 fn stream_git_records(
     root: &Path,
     args: &[&str],
@@ -293,16 +304,28 @@ fn stream_git_records(
     let child = Arc::new(Mutex::new(child));
     let (done_tx, done_rx) = mpsc::channel::<()>();
     let timeout = git_timeout();
+    // nanoseconds spent in `on_record`, excluded from Git's run time
+    let handling = Arc::new(AtomicU64::new(0));
     let watchdog = {
         let child = Arc::clone(&child);
+        let handling = Arc::clone(&handling);
         std::thread::spawn(move || {
-            if let Err(mpsc::RecvTimeoutError::Timeout) = done_rx.recv_timeout(timeout) {
-                if let Ok(mut c) = child.lock() {
-                    let _ = c.kill();
+            let started = Instant::now();
+            loop {
+                let ran = started
+                    .elapsed()
+                    .saturating_sub(Duration::from_nanos(handling.load(Ordering::Relaxed)));
+                if ran >= timeout {
+                    if let Ok(mut c) = child.lock() {
+                        let _ = c.kill();
+                    }
+                    return true;
                 }
-                return true;
+                match done_rx.recv_timeout((timeout - ran).min(Duration::from_millis(250))) {
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    _ => return false,
+                }
             }
-            false
         })
     };
     let mut buf = vec![0u8; 64 << 10];
@@ -319,6 +342,7 @@ fn stream_git_records(
                 break;
             }
         };
+        let t = Instant::now();
         let mut start = 0;
         for i in 0..n {
             if buf[i] != 0 {
@@ -345,6 +369,7 @@ fn stream_git_records(
                 partial.extend_from_slice(&buf[start..n]);
             }
         }
+        handling.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
     if !partial.is_empty() && !skipping {
         on_record(&partial);
@@ -398,8 +423,11 @@ type Collected = (
 struct Collector<'a> {
     root: &'a Path,
     cfg: &'a IndexConfig,
-    cap: usize,
-    heap: BinaryHeap<ByPath>,
+    /// The smallest readable candidates: at most `max_files + MAX_LOSS_ROWS` (the kept
+    /// files plus `envelope_bytes` rows).
+    readable: BinaryHeap<ByPath>,
+    /// The smallest candidates with a pre-read loss: at most `MAX_LOSS_ROWS`.
+    lost: BinaryHeap<ByPath>,
     beyond: BTreeMap<String, usize>,
     /// The smallest paths beyond the bound (max-heap of at most MAX_LOSS_ENTRIES).
     sample: BinaryHeap<(String, String)>,
@@ -411,8 +439,8 @@ impl<'a> Collector<'a> {
         Collector {
             root,
             cfg,
-            cap: cfg.max_files.saturating_add(MAX_LOSS_ROWS),
-            heap: BinaryHeap::new(),
+            readable: BinaryHeap::new(),
+            lost: BinaryHeap::new(),
             beyond: BTreeMap::new(),
             sample: BinaryHeap::new(),
             worktree_deleted: 0,
@@ -427,11 +455,20 @@ impl<'a> Collector<'a> {
     }
 
     fn push(&mut self, c: Candidate) {
-        self.heap.push(ByPath(c));
-        if self.heap.len() > self.cap
-            && let Some(ByPath(ev)) = self.heap.pop()
+        let (heap, cap) = if c.loss.is_none() {
+            (
+                &mut self.readable,
+                self.cfg.max_files.saturating_add(MAX_LOSS_ROWS),
+            )
+        } else {
+            (&mut self.lost, MAX_LOSS_ROWS)
+        };
+        heap.push(ByPath(c));
+        if heap.len() > cap
+            && let Some(ByPath(ev)) = heap.pop()
         {
-            // `cap` smaller paths exist, so this one is past any row `finish` keeps.
+            // `cap` smaller paths of its kind exist, so this one is past any row
+            // `finish` keeps.
             let reason = ev.loss.unwrap_or("envelope_files");
             self.push_beyond(ev.path, reason);
         }
@@ -448,9 +485,10 @@ impl<'a> Collector<'a> {
     }
 
     fn finish(mut self) -> Collected {
-        let mut all: Vec<Candidate> = std::mem::take(&mut self.heap)
+        let mut all: Vec<Candidate> = std::mem::take(&mut self.readable)
             .into_vec()
             .into_iter()
+            .chain(std::mem::take(&mut self.lost).into_vec())
             .map(|ByPath(c)| c)
             .collect();
         all.sort_by(|a, b| a.path.cmp(&b.path));
@@ -537,6 +575,7 @@ fn scan_git(root: &Path, git_dir: PathBuf, cfg: &IndexConfig) -> Result<Scan, St
     ig.load_xmustard(root, &ignore_files);
 
     let mut col = Collector::new(root, cfg);
+    let mut memo = DirMemo::default();
     let mut ignored = 0usize;
     let mut invalid_paths = 0usize;
     let mut on_entry = |raw: &[u8], mode: Mode, col: &mut Collector<'_>| {
@@ -549,11 +588,9 @@ fn scan_git(root: &Path, git_dir: PathBuf, cfg: &IndexConfig) -> Result<Scan, St
         let Some(lang) = Lang::for_path(path) else {
             return;
         };
-        if ig.is_ignored(path, false) {
-            ignored += 1;
-            return;
+        if admit(&ig, &mut memo, path, &mut ignored, col) {
+            col.add(path.to_string(), lang, mode);
         }
-        col.add(path.to_string(), lang, mode);
     };
     let mut last: Vec<u8> = Vec::new();
     stream_git_records(root, &["ls-files", "-s", "-z"], |rec| {
@@ -601,6 +638,7 @@ fn scan_walk(root: &Path, cfg: &IndexConfig) -> Scan {
     let mut ignored = 0usize;
     let mut invalid_paths = 0usize;
     let mut ig = Ignore::with_defaults();
+    let mut memo = DirMemo::default();
     // .gitignore files are applied top-down as directories are entered.
     let mut it = walkdir::WalkDir::new(root)
         .follow_links(false)
@@ -621,7 +659,8 @@ fn scan_walk(root: &Path, cfg: &IndexConfig) -> Scan {
         }
         let ft = entry.file_type();
         if ft.is_dir() {
-            if ig.is_ignored(&rel, true) {
+            // an undecided directory is entered: its files are then reported one by one
+            if ig.check(&mut memo, &rel, true) == Verdict::Ignored {
                 it.skip_current_dir();
                 continue;
             }
@@ -631,11 +670,9 @@ fn scan_walk(root: &Path, cfg: &IndexConfig) -> Scan {
         let Some(lang) = Lang::for_path(&rel) else {
             continue;
         };
-        if ig.is_ignored(&rel, false) {
-            ignored += 1;
-            continue;
+        if admit(&ig, &mut memo, &rel, &mut ignored, &mut col) {
+            col.add(rel, lang, Mode::Regular);
         }
-        col.add(rel, lang, Mode::Regular);
     }
     let (candidates, beyond, beyond_sample, _) = col.finish();
     Scan {
@@ -654,6 +691,28 @@ fn scan_walk(root: &Path, cfg: &IndexConfig) -> Scan {
     }
 }
 
+/// Whether the ignore rules admit source file `path`; an ignored file is counted, and a
+/// file they cannot decide within the scan's budget is an `ignore_budget` loss.
+fn admit(
+    ig: &Ignore,
+    memo: &mut DirMemo,
+    path: &str,
+    ignored: &mut usize,
+    col: &mut Collector<'_>,
+) -> bool {
+    match ig.check(memo, path, false) {
+        Verdict::Included => true,
+        Verdict::Ignored => {
+            *ignored += 1;
+            false
+        }
+        Verdict::OverBudget => {
+            col.push_beyond(path.to_string(), "ignore_budget");
+            false
+        }
+    }
+}
+
 fn load_dir_ignores(root: &Path, rel_dir: &str, ig: &mut Ignore) {
     for name in [".gitignore", XMUSTARD_IGNORE] {
         let rel = if rel_dir.is_empty() {
@@ -661,9 +720,7 @@ fn load_dir_ignores(root: &Path, rel_dir: &str, ig: &mut Ignore) {
         } else {
             format!("{rel_dir}/{name}")
         };
-        if let Ok(bytes) = crate::symbolgraph::read_repo_bytes_beneath_capped(root, &rel, 1 << 20) {
-            ig.add_file(rel_dir, &String::from_utf8_lossy(&bytes));
-        }
+        ig.load_file(root, &rel, rel_dir);
     }
 }
 
@@ -750,12 +807,59 @@ mod tests {
         for i in (0..n).rev() {
             col.push(cand(&format!("p{i:05}.ts"), 1, Some("symlink")));
         }
-        assert_eq!(col.heap.len(), MAX_LOSS_ROWS + 1);
+        assert_eq!(col.lost.len(), MAX_LOSS_ROWS);
         let (out, beyond, sample, _) = col.finish();
         assert_eq!(out.len(), MAX_LOSS_ROWS);
         assert_eq!(out[0].path, "p00000.ts");
         assert_eq!(beyond.get("symlink"), Some(&5));
         assert_eq!(sample.len(), 5);
         assert_eq!(sample[0].0, format!("p{:05}.ts", MAX_LOSS_ROWS));
+    }
+
+    #[test]
+    fn loss_rows_never_displace_readable_files() {
+        // more pre-read losses than MAX_LOSS_ROWS sort before every readable file
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg = IndexConfig {
+            max_files: 60,
+            ..Default::default()
+        };
+        let mut col = Collector::new(dir.path(), &cfg);
+        for i in 0..MAX_LOSS_ROWS + 100 {
+            col.push(cand(&format!("a{i:05}.ts"), 0, Some("symlink")));
+        }
+        for i in 0..50 {
+            col.push(cand(&format!("z{i:05}.ts"), 10, None));
+        }
+        let (out, beyond, _, _) = col.finish();
+        let kept = out.iter().filter(|c| c.loss.is_none()).count();
+        assert_eq!(kept, 50, "{beyond:?}");
+        assert_eq!(beyond.get("envelope_files"), None);
+        assert_eq!(beyond.get("symlink"), Some(&100));
+        assert_eq!(out.len(), MAX_LOSS_ROWS + 50);
+    }
+
+    #[test]
+    fn undecided_paths_are_reported_as_ignore_budget_losses() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg = IndexConfig::default();
+        let mut col = Collector::new(dir.path(), &cfg);
+        let mut ig = Ignore::with_defaults();
+        ig.add_file("", "*x*y*z*\n");
+        let (mut ignored, mut memo) = (0usize, DirMemo::with_budget(0, 0));
+        assert!(!admit(&ig, &mut memo, "src/a.ts", &mut ignored, &mut col));
+        let mut memo = DirMemo::default();
+        assert!(admit(&ig, &mut memo, "src/a.ts", &mut ignored, &mut col));
+        assert!(!admit(
+            &ig,
+            &mut memo,
+            "node_modules/b.ts",
+            &mut ignored,
+            &mut col
+        ));
+        let (_, beyond, sample, _) = col.finish();
+        assert_eq!(beyond.get("ignore_budget"), Some(&1));
+        assert_eq!(sample, vec![("src/a.ts".into(), "ignore_budget".into())]);
+        assert_eq!(ignored, 1);
     }
 }
