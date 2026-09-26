@@ -7,12 +7,12 @@
 PREFIX ?= /usr/local
 BINDIR := $(PREFIX)/bin
 
-.PHONY: build install backend backend-platform go-api frontend go-api-build rust-core-check \
+.PHONY: build install relay backend backend-platform go-api frontend go-api-build rust-core-check \
 	rust-core-scan migration-check dev build-ui scan check check-backend check-frontend
 .PHONY: bench-test bench-gate bench-parity bench-retrieval
 
 build:
-	cd rust-core && cargo build --release --bin xmustard-core
+	cd rust-core && cargo build --release --bin xmustard-core --bin xmustard-relay
 	cd api-go && go build -o bin/xmustard-api ./cmd/xmustard-api
 	cd api-go && go build -o bin/xmustard-mcp ./cmd/xmustard-mcp
 	cd api-go && go build -o bin/xmustard-ops ./cmd/xmustard-ops
@@ -20,9 +20,15 @@ build:
 install: build
 	install -d "$(BINDIR)"
 	install -m 0755 rust-core/target/release/xmustard-core "$(BINDIR)/xmustard-core"
+	install -m 0755 rust-core/target/release/xmustard-relay "$(BINDIR)/xmustard-relay"
 	install -m 0755 api-go/bin/xmustard-api "$(BINDIR)/xmustard-api"
 	install -m 0755 api-go/bin/xmustard-mcp "$(BINDIR)/xmustard-mcp"
 	install -m 0755 api-go/bin/xmustard-ops "$(BINDIR)/xmustard-ops"
+
+# The native stdio relay for MCP clients that can only launch a command: it speaks to
+# the API's Streamable HTTP endpoint (/mcp), std-only Rust, about 2 MiB RSS.
+relay:
+	cd rust-core && cargo build --release --bin xmustard-relay
 
 # The API defaults to the core profile (the nine tools, memory, evidence, auth).
 # The UI calls platform routes, so the UI targets start it with XMUSTARD_PROFILE=platform.

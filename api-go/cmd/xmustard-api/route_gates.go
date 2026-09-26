@@ -79,6 +79,11 @@ var routeGateTable = map[string]routeGate{
 	"PUT /api/workspaces/{workspace_id}/context/{entry_id}":         coreGate(roleProposer, "", "memory edit; author or admin only"),
 	"GET /api/workspaces/{workspace_id}/context":                    coreGate(roleAdmin, "", "full memory history"),
 
+	// --- core: MCP over Streamable HTTP (mcp_routes.go) ---
+	"POST /mcp":   {Core: true, Role: roleReader, ReadSafe: true, Note: "MCP messages; each tool call re-enters the API through its own route gate as the caller"},
+	"GET /mcp":    coreGate(roleReader, "", "no server-initiated stream: 405"),
+	"DELETE /mcp": {Core: true, Role: roleReader, ReadSafe: true, Note: "ends the caller's own MCP session"},
+
 	// --- core: evidence delivery and recovery ---
 	"POST /api/workspaces/{workspace_id}/evidence":            {Core: true, Role: roleProposer, ReadSafe: true, Note: "projection of the caller's own tool result"},
 	"GET /api/workspaces/{workspace_id}/evidence/{handle}":    coreGate(roleReader, "", "issuer-bound expansion"),

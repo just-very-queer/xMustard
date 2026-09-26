@@ -345,6 +345,9 @@ whether `XMUSTARD_READ_ONLY=1` still serves the route.
 | `GET /api/workspaces/{workspace_id}/runs/{run_id}/why-failed` | core | reader | served | why_failed |  |
 | `GET /api/workspaces/{workspace_id}/search` | core | reader | served | search |  |
 | `GET /api/workspaces/{workspace_id}/session-grounding` | core | reader | served | ground |  |
+| `DELETE /mcp` | core | reader | served |  | ends the caller's own MCP session |
+| `GET /mcp` | core | reader | served |  | no server-initiated stream: 405 |
+| `POST /mcp` | core | reader | served |  | MCP messages; each tool call re-enters the API through its own route gate as the caller |
 | `GET /api/agent/capabilities` | platform | reader | served |  |  |
 | `POST /api/integrations/test` | platform | admin | refused |  | uses supplied credentials |
 | `POST /api/postgres/bootstrap` | platform | admin | refused |  | schema DDL |

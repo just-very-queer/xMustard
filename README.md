@@ -57,26 +57,58 @@ HTTP API supports retained operator workflows; MCP exposes the nine tools.
 
 ## Using the MCP tools
 
-`xmustard-mcp` is a stdio MCP server. It speaks JSON-RPC 2.0 over stdin/stdout and
-proxies to the xMustard HTTP API (`XMUSTARD_API_BASE`, default
-`http://127.0.0.1:8042`). Point any MCP client at it.
+The API serves the nine tools over MCP Streamable HTTP at `http://127.0.0.1:8042/mcp`,
+from its own process. Clients that take a URL connect to it directly; clients that
+can only launch a command use `xmustard-relay`, a native stdio relay of about 2 MiB
+RSS (measured: [2026-09-26 relay RSS](docs/benchmarks/2026-09-26-ws13-relay-rss.md)).
+The older Go stdio shim `xmustard-mcp` still works but is deprecated: it costs about
+13.5 MiB per agent and will be removed.
 
-### Register it (Claude Code example)
+### Register it
+
+`xmustard-ops mcp-config` prints the entry for one project. It binds the session to
+the project's workspace, because HTTP has no working directory to resolve it from:
+
+```bash
+xmustard-ops mcp-config --root "$PWD" [--client claude-code] [--mode readonly] [--transport relay]
+```
 
 ```jsonc
-// .mcp.json / client config
+// .mcp.json / client config: URL-capable client
 {
   "mcpServers": {
     "xmustard": {
-      "command": "xmustard-mcp",
-      "env": {
-        "XMUSTARD_API_BASE": "http://127.0.0.1:8042",
-        "XMUSTARD_API_TOKEN": "xmt_…"   // optional; required when the API enforces auth
-      }
+      "type": "http",
+      "url": "http://127.0.0.1:8042/mcp?workspace=<id>&client=claude-code",
+      "headers": { "Authorization": "Bearer ${XMUSTARD_API_TOKEN}", "X-Xmustard-Workspace": "<id>" }
+    }
+  }
+}
+// stdio-only client: the relay (plain http:// only; loopback, or a local TLS proxy)
+{
+  "mcpServers": {
+    "xmustard": {
+      "command": "xmustard-relay",
+      "args": ["--url", "http://127.0.0.1:8042/mcp", "--workspace", "<id>"],
+      "env": { "XMUSTARD_API_TOKEN": "${XMUSTARD_API_TOKEN}" }
     }
   }
 }
 ```
+
+Query parameters on `/mcp` (the relay's flags of the same names): `workspace=<id>`
+(or the `X-Xmustard-Workspace` header) binds the session; `mode=readonly` lists and
+serves only the seven read tools; `client=claude-code|codex|cursor|opencode|pi|letta`
+attributes usage; `schema=lean|full` picks the tools/list schema profile. The token
+always travels in `Authorization`, never in the URL. A session belongs to the
+principal that opened it; each tool call re-enters the API as that principal, so
+caller-scoped tools/list, route gates, evidence resources and registration scope
+apply as they do for any other caller. The API holds at most 64 sessions and 16 per
+principal: past its share a principal's least recently used idle session ends, and a
+full table ends an idle session of the largest holder, so one principal cannot lock
+the others out. The relay sends the token only to a loopback host unless it is given
+`--allow-insecure-remote`. Per-tool usage counters are in
+`/api/health` under `mcp_usage` (shown to authenticated callers).
 
 Each agent should authenticate with an `XMUSTARD_API_TOKEN` (mint one with
 `xmustard-api mint-token <principal-id> agent`). The authenticated stable
@@ -131,10 +163,11 @@ remember content="auth identity = stable Principal.ID; bearer token is a rotatin
 ### Quick check from a shell
 
 ```bash
-printf '%s\n%s\n' \
+printf '%s\n%s\n%s\n' \
+  '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{}}}' \
   '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' \
   '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"ground","arguments":{"workspace_id":"my-ws"}}}' \
-  | XMUSTARD_API_BASE=http://127.0.0.1:8042 xmustard-mcp
+  | xmustard-relay --url http://127.0.0.1:8042/mcp
 ```
 
 ## Supporting capabilities
@@ -177,8 +210,10 @@ In another shell with the same data-directory configuration, load a repository:
 ./api-go/bin/xmustard-ops workspace load --root-path /absolute/path/to/repository
 ```
 
-Use the returned `workspace_id` in MCP calls. Point your MCP client at the absolute
-path to `api-go/bin/xmustard-mcp`, or put the binaries on `PATH`. Use an explicit
+Use the returned `workspace_id` in MCP calls (or bind it with `xmustard-ops
+mcp-config`). Point a URL-capable MCP client at `http://127.0.0.1:8042/mcp`, or a
+stdio-only one at `rust-core/target/release/xmustard-relay`; or put the binaries on
+`PATH`. Use an explicit
 absolute `XMUSTARD_DATA_DIR` when running outside the source checkout; the current
 fallback is relative to the process working directory.
 
@@ -186,7 +221,7 @@ fallback is relative to the process working directory.
 and build plus Rust tests and Clippy. `make check-frontend` runs the separate
 frontend lint/build checks when UI changes are in scope.
 
-`make install PREFIX=/your/prefix` copies the four binaries. Optional Postgres
+`make install PREFIX=/your/prefix` copies the five binaries. Optional Postgres
 bootstrap still needs the SQL schema from the checkout. The Homebrew formula is
 a development packaging starting point: there is no published tagged release or
 tap verified by the [September audit](docs/STATUS.md).

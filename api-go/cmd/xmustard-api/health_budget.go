@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"xmustard/api-go/internal/budget"
+	"xmustard/api-go/internal/mcpserver"
 	"xmustard/api-go/internal/rustcore"
 	"xmustard/api-go/internal/workspaceops"
 )
@@ -37,7 +38,7 @@ type publicBudget struct {
 }
 
 // healthResponse is the /api/health body. Health stays public for liveness probes. The
-// full view (the budget block, and the live pool and child counters) shows host-wide
+// full view (the budget block, the live pool and child counters, and mcp_usage) shows host-wide
 // activity: captures, hashed bytes, spawns, the owned tree and live external processes,
 // the stdio shims on the host, the heavy-slot owner and queue, and the worker's pid and
 // memory. Each uncached call also samples the process tree. So while authentication is
@@ -58,6 +59,8 @@ func healthResponse(r *http.Request) map[string]any {
 	body["transient_pool"] = map[string]any{"max": budget.TransientBytes.Max(), "in_use": budget.TransientBytes.InUse(), "peak": budget.TransientBytes.Peak()}
 	body["children"] = map[string]any{"cap": budget.Children.Cap(), "in_use": budget.Children.InUse(), "peak": budget.Children.Peak()}
 	body["budget"] = healthBudgetBlock()
+	// the /mcp endpoint's per-tool and per-client counters are activity too
+	body["mcp_usage"] = mcpserver.Usage()
 	return body
 }
 

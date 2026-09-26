@@ -19,10 +19,11 @@ import (
 )
 
 // Where a call's workspace came from, in resolution order: an explicit argument, the
-// XMUSTARD_WORKSPACE_ID binding, an absolute path argument, the client's roots
+// connection's workspace binding, XMUSTARD_WORKSPACE_ID, an absolute path argument, the client's roots
 // (roots/list), then the server's working directory.
 const (
 	SourceArgument = "argument"
+	SourceBinding  = "binding"
 	SourceEnv      = "env"
 	SourcePath     = "path"
 	SourceRoots    = "roots"
@@ -90,6 +91,9 @@ func (s *Session) resolveWorkspace(ctx context.Context, t *Tool, args map[string
 	}
 	if id := strings.TrimSpace(args["workspace_id"]); id != "" {
 		return bound(id, SourceArgument)
+	}
+	if id := strings.TrimSpace(s.srv.opts.WorkspaceID); id != "" {
+		return bound(id, SourceBinding)
 	}
 	if id := strings.TrimSpace(s.srv.opts.Getenv("XMUSTARD_WORKSPACE_ID")); id != "" {
 		return bound(id, SourceEnv)

@@ -155,6 +155,16 @@ type Options struct {
 	Cwd string
 	// Getenv reads XMUSTARD_WORKSPACE_ID (os.Getenv when nil).
 	Getenv func(string) string
+	// WorkspaceID binds the connection to one workspace (the HTTP endpoint's
+	// ?workspace= or X-Xmustard-Workspace, written by client setup): it resolves
+	// every call that names no workspace_id, before XMUSTARD_WORKSPACE_ID. HTTP has no
+	// working directory, so this is the per-project signal it keeps.
+	WorkspaceID string
+	// ReadOnly lists and serves only the read-only tools; a write tool is refused
+	// before any API call.
+	ReadOnly bool
+	// Client is the client profile (ClientProfiles), attributed in usage counters.
+	Client string
 	// AutoRegister lets a git repository found from roots, cwd or a path argument be
 	// registered with the API when no registered workspace contains it.
 	AutoRegister bool
@@ -227,7 +237,7 @@ func (s *Session) Handle(ctx context.Context, method string, params json.RawMess
 	case "ping":
 		return map[string]any{}, nil
 	case "tools/list":
-		return s.toolsList(s.callerTools(ctx)), nil
+		return s.toolsList(s.modeFilter(s.callerTools(ctx))), nil
 	case "tools/call":
 		return s.callTool(ctx, params)
 	case "resources/list":
