@@ -1,6 +1,7 @@
 package workspaceops
 
 import (
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -224,5 +225,43 @@ func TestAuthAuditFieldClip(t *testing.T) {
 	ev := ListAuthAudit(dir, 0)[0]
 	if len(ev.Path) > authFieldMax+4 || len(ev.RemoteAddr) > authFieldMax+4 {
 		t.Fatalf("attacker fields must be clipped: path=%d addr=%d", len(ev.Path), len(ev.RemoteAddr))
+	}
+}
+
+// Token administration outlives every other auth audit event: a flood of
+// registrations or denials rolls off before one mint, revoke or rotate.
+func TestAuthAuditKeepsTokenAdministration(t *testing.T) {
+	events := []AuthAuditEvent{{Action: "mint", Detail: "first"}}
+	for i := 0; i < 10; i++ {
+		events = append(events, AuthAuditEvent{Action: "register", Detail: strconv.Itoa(i)})
+	}
+	events = append(events, AuthAuditEvent{Action: "revoke"}, AuthAuditEvent{Action: "denied", Detail: "last"})
+	kept := trimAuthAudit(append([]AuthAuditEvent(nil), events...), 4)
+	if len(kept) != 4 || kept[0].Action != "mint" || kept[1].Detail != "9" || kept[2].Action != "revoke" || kept[3].Detail != "last" {
+		t.Fatalf("want mint, the newest register, revoke, the denial; got %+v", kept)
+	}
+	admins := []AuthAuditEvent{{Action: "mint", Detail: "a"}, {Action: "rotate", Detail: "b"}, {Action: "revoke", Detail: "c"}}
+	if kept := trimAuthAudit(admins, 2); len(kept) != 2 || kept[0].Detail != "b" {
+		t.Fatalf("over the cap with token administration alone, the oldest goes: %+v", kept)
+	}
+
+	dataDir := t.TempDir()
+	seed := []AuthAuditEvent{{EventID: "m", Action: "mint", Actor: "root-op", TokenID: "ci-bot", CreatedAt: "2026-01-01T00:00:00Z"}}
+	for i := 1; i < authAuditMax; i++ {
+		seed = append(seed, AuthAuditEvent{EventID: strconv.Itoa(i), Action: "register", Actor: "ada", CreatedAt: "2026-01-01T00:00:01Z"})
+	}
+	if err := writeJSON(authAuditPath(dataDir), seed); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 20; i++ {
+		RecordAuthAudit(dataDir, AuthAuditEvent{Action: "register", Actor: "ada"})
+	}
+	all := ListAuthAudit(dataDir, 0)
+	mint := false
+	for _, ev := range all {
+		mint = mint || (ev.Action == "mint" && ev.TokenID == "ci-bot")
+	}
+	if len(all) != authAuditMax || !mint {
+		t.Fatalf("registrations evicted the mint: %d events, mint kept %v", len(all), mint)
 	}
 }
