@@ -13,12 +13,13 @@
 //! Usage:
 //!
 //! ```text
-//! xmustard-relay [--url URL] [--workspace ID] [--client NAME] [--mode full|readonly] [--schema lean|full]
+//! xmustard-relay [--url URL] [--workspace ID] [--client NAME] [--mode full|readonly] [--schema lean|full] [--allow-insecure-remote]
 //! ```
 //!
 //! `--url` defaults to `XMUSTARD_MCP_URL`, else `XMUSTARD_API_BASE` + `/mcp` (the Go
 //! shim's setting, so the relay is a drop-in for it), else `http://127.0.0.1:8042/mcp`. The bearer
-//! token is read from `XMUSTARD_API_TOKEN` (sent as a header, never in the URL);
+//! token is read from `XMUSTARD_API_TOKEN` (sent as a header, never in the URL, and
+//! only to a loopback host unless `--allow-insecure-remote` is given);
 //! `--workspace` defaults to `XMUSTARD_WORKSPACE_ID` and is sent as
 //! `X-Xmustard-Workspace`. Each request runs on its own thread, so a long tool call
 //! never blocks a cancellation or a roots/list answer behind it; notifications and
@@ -76,6 +77,7 @@ impl Config {
             .unwrap_or_else(|| "http://127.0.0.1:8042/mcp".to_string());
         let mut workspace = nonblank(getenv("XMUSTARD_WORKSPACE_ID"));
         let mut query: Vec<(String, String)> = Vec::new();
+        let mut allow_remote = false;
         let mut args = args;
         while let Some(flag) = args.next() {
             let (name, inline) = match flag.split_once('=') {
@@ -84,6 +86,10 @@ impl Config {
             };
             let key = match name.as_str() {
                 "--url" | "--workspace" | "--client" | "--mode" | "--schema" => name,
+                "--allow-insecure-remote" => {
+                    allow_remote = true;
+                    continue;
+                }
                 "-h" | "--help" => return Err(USAGE.to_string()),
                 _ => return Err(format!("unknown argument {flag}\n{USAGE}")),
             };
@@ -97,6 +103,15 @@ impl Config {
             }
         }
         let (host, port, mut target) = parse_http_url(&url)?;
+        let token = nonblank(getenv("XMUSTARD_API_TOKEN"));
+        // plain http:// carries the bearer token in cleartext: loopback only, unless the
+        // operator opts in (a TLS-terminating proxy on another host is their call)
+        if token.is_some() && !allow_remote && !is_loopback(&host) {
+            return Err(format!(
+                "{url}: refusing to send XMUSTARD_API_TOKEN over plain http to a non-loopback host; \
+                 use the loopback API or a local TLS proxy, or pass --allow-insecure-remote"
+            ));
+        }
         for (k, v) in query {
             target.push(if target.contains('?') { '&' } else { '?' });
             target.push_str(&k);
@@ -107,13 +122,22 @@ impl Config {
             host,
             port,
             target,
-            token: nonblank(getenv("XMUSTARD_API_TOKEN")),
+            token,
             workspace,
         })
     }
 }
 
-const USAGE: &str = "usage: xmustard-relay [--url URL] [--workspace ID] [--client NAME] [--mode full|readonly] [--schema lean|full]";
+const USAGE: &str = "usage: xmustard-relay [--url URL] [--workspace ID] [--client NAME] [--mode full|readonly] [--schema lean|full] [--allow-insecure-remote]";
+
+/// localhost, 127.0.0.0/8 or ::1 (bracketed or not).
+fn is_loopback(host: &str) -> bool {
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    bare.eq_ignore_ascii_case("localhost")
+        || bare
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
 
 /// Splits `http://host[:port]/path[?query]`. Only plain HTTP is spoken.
 fn parse_http_url(url: &str) -> Result<(String, u16, String), String> {
@@ -267,7 +291,7 @@ fn relay(cfg: &Config, session: &Shared, out: &Output, line: &str, head: &Head, 
     if !initialize
         && sid.is_some()
         && matches!(&resp, Ok(r) if r.status == 404)
-        && reinitialize(cfg, session)
+        && reinitialize(cfg, session, sid.as_deref().unwrap_or_default())
     {
         let sid = session.lock().unwrap_or_else(|e| e.into_inner()).id.clone();
         resp = send(cfg, "POST", line.as_bytes(), sid.as_deref());
@@ -300,9 +324,13 @@ fn relay(cfg: &Config, session: &Shared, out: &Output, line: &str, head: &Head, 
 
 /// Replays the client's initialize (and initialized notification) to open a new
 /// session after the endpoint forgot the old one. The answer is not relayed: the
-/// client already has one.
-fn reinitialize(cfg: &Config, session: &Shared) -> bool {
+/// client already has one. Only the first of several requests that got a 404 for the
+/// same `stale` id replays it; the others retry with the session it opened.
+fn reinitialize(cfg: &Config, session: &Shared, stale: &str) -> bool {
     let mut s = session.lock().unwrap_or_else(|e| e.into_inner());
+    if s.id.as_deref() != Some(stale) {
+        return s.id.is_some();
+    }
     let Some(init) = s.init.clone() else {
         return false;
     };
@@ -715,6 +743,35 @@ mod tests {
             .is_err()
         );
         assert!(Config::from_args(["--bogus"].iter().map(|s| s.to_string()), |_| None).is_err());
+        // the token never goes to a non-loopback host over plain http without opt-in
+        let remote = |extra: &[&str]| {
+            let args = ["--url", "http://api.example.com:8042/mcp"]
+                .iter()
+                .chain(extra)
+                .map(|s| s.to_string());
+            Config::from_args(args, env)
+        };
+        assert!(remote(&[]).is_err());
+        assert!(remote(&["--allow-insecure-remote"]).is_ok());
+        for url in [
+            "http://127.0.0.2:1/mcp",
+            "http://[::1]:1/mcp",
+            "http://LOCALHOST/mcp",
+        ] {
+            assert!(
+                Config::from_args(["--url", url].iter().map(|s| s.to_string()), env).is_ok(),
+                "{url}"
+            );
+        }
+        assert!(
+            Config::from_args(
+                ["--url", "http://api.example.com/mcp"]
+                    .iter()
+                    .map(|s| s.to_string()),
+                |_| None
+            )
+            .is_ok()
+        );
         let base = |k: &str| (k == "XMUSTARD_API_BASE").then(|| "http://127.0.0.1:9/".to_string());
         let b = Config::from_args(std::iter::empty(), base).unwrap();
         assert_eq!((b.port, b.target.as_str()), (9, "/mcp"));
@@ -976,6 +1033,21 @@ mod tests {
             !out.iter().any(|l| l.contains("slow-1")),
             "a cancelled call was answered: {out:?}"
         );
+    }
+
+    #[test]
+    fn a_session_already_replaced_is_not_reinitialized_again() {
+        // a dead endpoint: any replay would fail and return false
+        let cfg = config(1);
+        let session: Shared = Arc::default();
+        {
+            let mut s = session.lock().unwrap();
+            s.init = Some(r#"{"jsonrpc":"2.0","id":0,"method":"initialize"}"#.into());
+            s.id = Some("s2".into());
+        }
+        assert!(reinitialize(&cfg, &session, "s1"));
+        assert_eq!(session.lock().unwrap().id.as_deref(), Some("s2"));
+        assert!(!reinitialize(&cfg, &session, "s2"));
     }
 
     #[test]

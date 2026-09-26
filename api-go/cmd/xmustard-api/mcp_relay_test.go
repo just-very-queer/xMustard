@@ -52,15 +52,16 @@ func (p *relayPeer) send(msg map[string]any) {
 	}
 }
 
-// reply reads stdout until the response to id (skipping notifications).
-func (p *relayPeer) reply(id int) map[string]any {
+// reply reads stdout until the response to id (skipping notifications); a nil id
+// matches an error answered with a null id.
+func (p *relayPeer) reply(id any) map[string]any {
 	p.t.Helper()
 	for p.out.Scan() {
 		var m map[string]any
 		if err := json.Unmarshal(p.out.Bytes(), &m); err != nil {
 			p.t.Fatalf("relay wrote a non-JSON line %q", p.out.Text())
 		}
-		if m["id"] == float64(id) {
+		if fmt.Sprint(m["id"]) == fmt.Sprint(id) {
 			return m
 		}
 	}
@@ -172,6 +173,51 @@ func TestNativeRelayRootsList(t *testing.T) {
 		return
 	}
 	t.Fatal("no answer to the tool call")
+}
+
+// The stdio shim's protocol cases (cmd/xmustard-mcp main_test.go and framing), run
+// end to end through the relay and the API's /mcp endpoint: a relayed client sees the
+// same answers as a shim client.
+func TestNativeRelayShimProtocolCases(t *testing.T) {
+	srv, _, tokens := mcpServer(t, exposurePosture{}, map[string]string{"alice": "agent"})
+	p, _, _ := startRelay(t, srv.URL, tokens["alice"], "XMUSTARD_WORKSPACE_ID=ws")
+	p.send(map[string]any{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": map[string]any{
+		"protocolVersion": "2025-06-18", "capabilities": map[string]any{}, "clientInfo": map[string]any{"name": "t", "version": "1"}}})
+	if r := p.reply(1)["result"].(map[string]any); r["protocolVersion"] != "2025-06-18" || r["instructions"] == nil {
+		t.Fatalf("initialize: %v", r)
+	}
+	p.send(map[string]any{"jsonrpc": "2.0", "method": "notifications/initialized"})
+	errCode := func(code float64) func(map[string]any) bool {
+		return func(m map[string]any) bool { e, _ := m["error"].(map[string]any); return e != nil && e["code"] == code }
+	}
+	isError := func(want bool) func(map[string]any) bool {
+		return func(m map[string]any) bool {
+			r, _ := m["result"].(map[string]any)
+			return r != nil && (r["isError"] == true) == want
+		}
+	}
+	cases := []struct {
+		name string
+		id   any
+		line string
+		ok   func(map[string]any) bool
+	}{
+		{"unknown method", 2, `{"jsonrpc":"2.0","id":2,"method":"bogus/method"}`, errCode(-32601)},
+		{"stray params field", 3, `{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"recall","arguments":{},"extra":1}}`, errCode(-32602)},
+		{"_meta accepted", 4, `{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"recall","arguments":{},"_meta":{"progressToken":"p"}}}`, isError(false)},
+		{"malformed params", 5, `{"jsonrpc":"2.0","id":5,"method":"tools/call","params":"x"}`, errCode(-32602)},
+		{"unknown tool is a result", 6, `{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"nope","arguments":{}}}`, isError(true)},
+		{"oversized frame", nil, strings.Repeat("a", 8<<20+1024), errCode(-32600)},
+		{"ping after an oversized frame", 7, `{"jsonrpc":"2.0","id":7,"method":"ping"}`, func(m map[string]any) bool { return m["result"] != nil }},
+	}
+	for _, c := range cases {
+		if _, err := p.in.Write([]byte(c.line + "\n")); err != nil {
+			t.Fatal(err)
+		}
+		if m := p.reply(c.id); !c.ok(m) {
+			t.Errorf("%s: %v", c.name, m)
+		}
+	}
 }
 
 // processRSSKiB reads a process's resident set size with ps (0 when unavailable).
