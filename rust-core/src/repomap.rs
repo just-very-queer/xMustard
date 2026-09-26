@@ -43,12 +43,6 @@ fn repo_map_file_role(relative_path: &str) -> Option<&'static str> {
     None
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RepoMapMilestone {
-    pub name: &'static str,
-    pub outcome: &'static str,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct RustRepoMapDirectoryRecord {
     pub path: String,
@@ -200,23 +194,6 @@ pub struct RustSemanticImpactReport {
     pub derivation_source: String,
     pub warnings: Vec<String>,
     pub generated_at: String,
-}
-
-pub fn initial_repomap_plan() -> Vec<RepoMapMilestone> {
-    vec![
-        RepoMapMilestone {
-            name: "directory_summary",
-            outcome: "Port top-directory and key-file summary generation from the Python repo-map logic.",
-        },
-        RepoMapMilestone {
-            name: "path_ranking",
-            outcome: "Port issue-aware related-path ranking as a standalone Rust service boundary.",
-        },
-        RepoMapMilestone {
-            name: "symbol_expansion",
-            outcome: "Add tree-sitter based symbol summaries inspired by aider's repo map design.",
-        },
-    ]
 }
 
 pub fn build_repo_map(

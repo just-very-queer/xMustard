@@ -1,10 +1,9 @@
 //! xMustard Rust core: systems-safe ownership of scanning, repo maps,
-//! verification, diagnostics, and the durable goal/swarm runtime.
+//! verification, diagnostics, and the durable goal runtime.
 //!
 //! Memory safety is compiler-enforced for the whole crate.
 #![forbid(unsafe_code)]
 
-pub mod benchmark;
 pub mod changetrack;
 pub mod diagnostics;
 pub mod dispatch;
@@ -21,7 +20,6 @@ pub mod search;
 pub mod secretpath;
 pub mod semantic;
 pub mod serve;
-pub mod swarm;
 pub mod symbolgraph;
 pub mod treesitter;
 pub mod verification;

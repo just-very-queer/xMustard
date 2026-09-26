@@ -53,15 +53,6 @@ const COMMANDS: &[Command] = &[
         lsp_document_symbols,
     ),
     cmd("lsp-hover", Residency::OneShot, lsp_hover),
-    cmd("lsp-references", Residency::OneShot, lsp_references),
-    cmd("lsp-definition", Residency::OneShot, lsp_definition),
-    cmd("lsp-implementation", Residency::OneShot, lsp_implementation),
-    cmd(
-        "lsp-type-definition",
-        Residency::OneShot,
-        lsp_type_definition,
-    ),
-    cmd("lsp-rename", Residency::OneShot, lsp_rename),
     cmd(
         "normalize-lsp-workspace-symbols",
         Residency::Resident,
@@ -89,17 +80,14 @@ const COMMANDS: &[Command] = &[
         run_verification_profile,
     ),
     cmd("goal", Residency::OneShot, run_goal_command),
-    cmd("swarm", Residency::OneShot, run_swarm_command),
     cmd("semantic-search", Residency::OneShot, semantic_search),
-    cmd("bench", Residency::OneShot, run_bench_command),
     // Whole-repository work runs one-shot so its transient heap leaves with the process
     // (PAR-RT-02): measured on pi-mono, one `changetrack index` left a serve worker at
     // 36.8 MiB instead of the 24.4 MiB query-only plateau. `symbolgraph build`
-    // rebuilds and prints the full graph; build-lsp also starts language servers;
-    // blast-radius reads every tracked source file on each call and uses no cached
-    // graph, so residency saves it nothing. None of them is on a nine-tool query path.
-    // Queries over the graph (impact, trace, clusters, flow, hotspots, ownership
-    // subsystems) read the shared snapshot and stay resident.
+    // rebuilds and prints the full graph; blast-radius reads every tracked source file
+    // on each call and uses no cached graph, so residency saves it nothing. Neither is
+    // on a nine-tool query path. Queries over the graph (impact, trace, clusters,
+    // hotspots, ownership subsystems) read the shared snapshot and stay resident.
     cmd(
         "changetrack",
         Residency::ResidentExcept(&["index"]),
@@ -110,7 +98,7 @@ const COMMANDS: &[Command] = &[
     cmd("index", Residency::OneShot, xmustard_core::index::run),
     cmd(
         "symbolgraph",
-        Residency::ResidentExcept(&["build", "build-lsp", "blast-radius"]),
+        Residency::ResidentExcept(&["build", "blast-radius"]),
         run_symbolgraph_command,
     ),
     cmd("ownership", Residency::Resident, ownership),
@@ -437,77 +425,6 @@ fn lsp_hover(mut args: Args) -> CmdResult {
             json(&serde_json::json!({"available": false, "reason": msg}))
         }
         Err(err) => Err(CmdError::failed(format!("lsp-hover failed: {err}"))),
-    }
-}
-
-fn lsp_references(args: Args) -> CmdResult {
-    lsp_live("lsp-references", args)
-}
-
-fn lsp_definition(args: Args) -> CmdResult {
-    lsp_live("lsp-definition", args)
-}
-
-fn lsp_implementation(args: Args) -> CmdResult {
-    lsp_live("lsp-implementation", args)
-}
-
-fn lsp_type_definition(args: Args) -> CmdResult {
-    lsp_live("lsp-type-definition", args)
-}
-
-fn lsp_rename(args: Args) -> CmdResult {
-    lsp_live("lsp-rename", args)
-}
-
-/// The live-LSP position queries: `<method> <root> <path> <line> <character>
-/// [<new_name>] [timeout_secs]`.
-fn lsp_live(method: &str, mut args: Args) -> CmdResult {
-    use xmustard_core::lsp_session::{
-        LspSessionError, live_definition, live_implementation, live_references, live_rename,
-        live_type_definition,
-    };
-    let needs_name = method == "lsp-rename";
-    let usage = format!(
-        "xmustard-core {method} <root_path> <relative_path> <line> <character>{} [timeout_secs]",
-        if needs_name { " <new_name>" } else { "" }
-    );
-    let root = need(&mut args, &usage)?;
-    let relative_path = need(&mut args, &usage)?;
-    let line = need(&mut args, &usage)?
-        .parse::<u32>()
-        .map_err(|_| CmdError::usage(&usage))?;
-    let character = need(&mut args, &usage)?
-        .parse::<u32>()
-        .map_err(|_| CmdError::usage(&usage))?;
-    let new_name = if needs_name {
-        need(&mut args, &usage)?
-    } else {
-        String::new()
-    };
-    let timeout = args
-        .next()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(45);
-    let root = PathBuf::from(root);
-    let outcome: Result<serde_json::Value, LspSessionError> = match method {
-        "lsp-references" => live_references(&root, &relative_path, line, character, true, timeout),
-        "lsp-definition" => live_definition(&root, &relative_path, line, character, timeout),
-        "lsp-implementation" => {
-            live_implementation(&root, &relative_path, line, character, timeout)
-        }
-        "lsp-type-definition" => {
-            live_type_definition(&root, &relative_path, line, character, timeout)
-        }
-        "lsp-rename" => live_rename(&root, &relative_path, line, character, &new_name, timeout),
-        other => return Err(CmdError::new(2, format!("unknown command: {other}"))),
-    };
-    match outcome {
-        Ok(result) => json(&result),
-        Err(LspSessionError::Unavailable(msg)) => {
-            json(&serde_json::json!({"available": false, "reason": msg}))
-        }
-        Err(err) => Err(CmdError::failed(format!("{method} failed: {err}"))),
     }
 }
 
@@ -863,97 +780,6 @@ fn goal_fail(err: xmustard_core::goalruntime::GoalError) -> CmdError {
     CmdError::new(goal_exit_code(&err), format!("goal: {err}"))
 }
 
-fn swarm_fail(err: xmustard_core::goalruntime::GoalError) -> CmdError {
-    CmdError::new(goal_exit_code(&err), format!("swarm: {err}"))
-}
-
-/// Dispatch the `swarm` subcommand family: multi-lane orchestration + the
-/// controller gate over a goal.
-fn run_swarm_command(mut args: Args) -> CmdResult {
-    use xmustard_core::swarm;
-
-    let sub = need(
-        &mut args,
-        "xmustard-core swarm <plan|status|gate|record> ...",
-    )?;
-    match sub.as_str() {
-        "plan" | "status" => {
-            let usage = "xmustard-core swarm plan <data_dir> <workspace_id> <goal_id>";
-            let data_dir = need(&mut args, usage)?;
-            let workspace_id = need(&mut args, usage)?;
-            let goal_id = need(&mut args, usage)?;
-            let plan =
-                swarm::plan(Path::new(&data_dir), &workspace_id, &goal_id).map_err(swarm_fail)?;
-            json(&plan)
-        }
-        "gate" => {
-            let usage = "xmustard-core swarm gate <data_dir> <workspace_id> <goal_id>";
-            let data_dir = need(&mut args, usage)?;
-            let workspace_id = need(&mut args, usage)?;
-            let goal_id = need(&mut args, usage)?;
-            let gate =
-                swarm::gate(Path::new(&data_dir), &workspace_id, &goal_id).map_err(swarm_fail)?;
-            json(&gate)
-        }
-        "record" => {
-            let usage = "xmustard-core swarm record <data_dir> <workspace_id> <goal_id> <role> <request_json_path>";
-            let data_dir = need(&mut args, usage)?;
-            let workspace_id = need(&mut args, usage)?;
-            let goal_id = need(&mut args, usage)?;
-            let role_raw = need(&mut args, usage)?;
-            let request_path = need(&mut args, usage)?;
-            let role = swarm::SwarmRole::parse(&role_raw).map_err(swarm_fail)?;
-            let content = fs::read_to_string(&request_path).map_err(|err| {
-                CmdError::failed(format!(
-                    "swarm: failed to read request {request_path}: {err}"
-                ))
-            })?;
-            let request = serde_json::from_str(&content).map_err(|err| {
-                CmdError::failed(format!(
-                    "swarm: failed to decode request {request_path}: {err}"
-                ))
-            })?;
-            let (record, report) =
-                swarm::record_lane(Path::new(&data_dir), &workspace_id, &goal_id, role, request)
-                    .map_err(swarm_fail)?;
-            json(&serde_json::json!({
-                "iteration": record,
-                "slop": report,
-            }))
-        }
-        other => Err(CmdError::new(
-            2,
-            format!("unknown swarm subcommand: {other}"),
-        )),
-    }
-}
-
-/// `bench [iterations]` — run the goal/swarm micro-benchmarks against a scratch
-/// dir (default 1000 iterations) and return a JSON timing report.
-fn run_bench_command(mut args: Args) -> CmdResult {
-    use xmustard_core::benchmark;
-
-    let iterations = args
-        .next()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(1000);
-    let scratch = env::temp_dir().join(format!("xm-bench-{}", std::process::id()));
-    fs::create_dir_all(&scratch).map_err(|err| {
-        CmdError::failed(format!(
-            "bench: failed to create scratch {}: {err}",
-            scratch.display()
-        ))
-    })?;
-    let result = benchmark::run(iterations, &scratch);
-    let _ = fs::remove_dir_all(&scratch);
-    match result {
-        Ok(report) => Ok(Output::Json(
-            serde_json::to_string_pretty(&report).expect("bench report should serialize"),
-        )),
-        Err(err) => Err(CmdError::failed(format!("bench: {err}"))),
-    }
-}
-
 /// `changetrack <fingerprint|index|drift|changed-since|working-changes> ...` —
 /// gitnexus-style repo change tracking.
 fn run_changetrack_command(mut args: Args) -> CmdResult {
@@ -1055,17 +881,6 @@ fn run_symbolgraph_command(mut args: Args) -> CmdResult {
             let ws = need(&mut args, usage)?;
             json(&sg::build_symbol_graph(Path::new(&root), &ws))
         }
-        "build-lsp" => {
-            let usage = "xmustard-core symbolgraph build-lsp <root> <workspace_id> [budget]";
-            let root = need(&mut args, usage)?;
-            let ws = need(&mut args, usage)?;
-            let budget = args
-                .next()
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(150);
-            let graph = sg::build_symbol_graph(Path::new(&root), &ws);
-            json(&sg::upgrade_graph_with_lsp(Path::new(&root), graph, budget))
-        }
         "clusters" => {
             let usage = "xmustard-core symbolgraph clusters <root> <workspace_id>";
             let root = need(&mut args, usage)?;
@@ -1095,28 +910,6 @@ fn run_symbolgraph_command(mut args: Args) -> CmdResult {
             let to = need(&mut args, usage)?;
             let graph = sg::symbol_graph_for_query(Path::new(&root), &ws);
             json(&sg::trace_symbols(&graph, &from, &to))
-        }
-        "flow" => {
-            let usage = "xmustard-core symbolgraph flow <root> <workspace_id> [path_filter]";
-            let root = need(&mut args, usage)?;
-            let ws = need(&mut args, usage)?;
-            let filter = args.next();
-            let graph = sg::symbol_graph_for_query(Path::new(&root), &ws);
-            let edges: Vec<&sg::GraphEdge> = graph
-                .flow_edges
-                .iter()
-                .filter(|e| {
-                    filter
-                        .as_deref()
-                        .is_none_or(|f| e.from_path.contains(f) || e.to_path.contains(f))
-                })
-                .collect();
-            json(&serde_json::json!({
-                "workspace_id": ws,
-                "flow_edge_count": graph.flow_edge_count,
-                "shown": edges.len(),
-                "flow_edges": edges,
-            }))
         }
         "hotspots" => {
             let usage = "xmustard-core symbolgraph hotspots <root> <workspace_id> [limit]";
@@ -1185,6 +978,88 @@ mod tests {
         ("wiki", &[]),
     ];
 
+    /// rust-core/go-calls.txt: every call code reachable from an api-go main makes
+    /// (`called`) and the commands kept without one (`kept ... -- reason`).
+    /// TestCoreCallManifestMatchesGoSources (api-go/internal/rustcore) holds the file
+    /// to the Go sources, so this list cannot drift from what Go calls.
+    const GO_CALL_MANIFEST: &str = include_str!("../../go-calls.txt");
+
+    /// (kind, subcommand, family member) for each line of the manifest.
+    fn go_call_manifest() -> Vec<(&'static str, &'static str, Option<&'static str>)> {
+        GO_CALL_MANIFEST
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .map(|line| {
+                let (spec, reason) = match line.split_once(" -- ") {
+                    Some((spec, reason)) => (spec, Some(reason.trim())),
+                    None => (line, None),
+                };
+                let words: Vec<&str> = spec.split_whitespace().collect();
+                let ok = match (words.first().copied(), reason) {
+                    (Some("called"), None) => true,
+                    (Some("kept"), Some(reason)) => !reason.is_empty(),
+                    _ => false,
+                };
+                assert!(ok && (2..=3).contains(&words.len()), "go-calls.txt: {line}");
+                (words[0], words[1], words.get(2).copied())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn go_called_commands_exist() {
+        let manifest = go_call_manifest();
+        assert!(
+            manifest
+                .iter()
+                .filter(|(kind, ..)| *kind == "called")
+                .count()
+                >= 30,
+            "go-calls.txt lost its calls"
+        );
+        for (kind, name, member) in manifest {
+            let entry = dispatch::find(COMMANDS, name).unwrap_or_else(|| {
+                panic!("go-calls.txt lists `{kind} {name}`, but COMMANDS has no {name}")
+            });
+            // A member alone never has the rest of its arguments, so a handler that
+            // knows it answers with its usage line instead of running.
+            if let Some(member) = member
+                && let Err(err) = (entry.run)(strings(&[member]).into_iter())
+            {
+                assert_ne!(
+                    err.message,
+                    format!("unknown {name} subcommand: {member}"),
+                    "go-calls.txt lists `{kind} {name} {member}`"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn subcommands_without_a_caller_stay_removed() {
+        // WS-25 removed these: no Go caller, no script caller.
+        for name in [
+            "swarm",
+            "bench",
+            "lsp-references",
+            "lsp-definition",
+            "lsp-implementation",
+            "lsp-type-definition",
+            "lsp-rename",
+        ] {
+            assert!(dispatch::find(COMMANDS, name).is_none(), "{name}");
+        }
+        let sg = dispatch::find(COMMANDS, "symbolgraph").unwrap();
+        for sub in ["build-lsp", "flow"] {
+            let err = (sg.run)(strings(&[sub, "/r", "ws"]).into_iter()).unwrap_err();
+            assert_eq!(
+                err.message,
+                format!("unknown symbolgraph subcommand: {sub}")
+            );
+        }
+    }
+
     #[test]
     fn every_go_worker_call_is_resident() {
         for (name, args) in GO_WORKER_CALLS {
@@ -1202,24 +1077,17 @@ mod tests {
         for name in [
             "lsp-document-symbols",
             "lsp-hover",
-            "lsp-references",
-            "lsp-definition",
-            "lsp-implementation",
-            "lsp-type-definition",
-            "lsp-rename",
             "run-verification-command",
             "run-managed-command",
             "run-verification-profile",
             "goal",
-            "swarm",
             "semantic-search",
-            "bench",
         ] {
             let entry = dispatch::find(COMMANDS, name).unwrap();
             assert!(!entry.is_resident(), "{name} must stay one-shot");
         }
         let sg = dispatch::find(COMMANDS, "symbolgraph").unwrap();
-        for sub in ["build-lsp", "build", "blast-radius"] {
+        for sub in ["build", "blast-radius"] {
             assert!(!sg.resident_for(&strings(&[sub, "/r", "ws"])), "{sub}");
         }
         let ct = dispatch::find(COMMANDS, "changetrack").unwrap();
@@ -1242,8 +1110,8 @@ mod tests {
     #[test]
     fn handlers_report_usage_instead_of_exiting() {
         // Every handler returns a usage error (never exits the process) when its
-        // required arguments are missing; `bench` takes none and is not called.
-        for entry in COMMANDS.iter().filter(|c| c.name != "bench") {
+        // required arguments are missing.
+        for entry in COMMANDS {
             let err = (entry.run)(Vec::new().into_iter())
                 .expect_err("a handler with no arguments must fail");
             assert_eq!(err.code, 2, "{}: {}", entry.name, err.message);
@@ -1258,7 +1126,7 @@ mod tests {
 
     #[test]
     fn unknown_family_subcommands_fail_with_code_two() {
-        for name in ["symbolgraph", "changetrack", "ownership", "goal", "swarm"] {
+        for name in ["symbolgraph", "changetrack", "ownership", "goal"] {
             let entry = dispatch::find(COMMANDS, name).unwrap();
             let err = (entry.run)(strings(&["nope"]).into_iter()).unwrap_err();
             assert_eq!(err.code, 2);
