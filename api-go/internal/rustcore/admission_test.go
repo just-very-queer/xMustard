@@ -324,3 +324,23 @@ func TestRunCoreRefusalKillsChildAndGrandchild(t *testing.T) {
 	}
 	assertTreeGone(t, child, grand)
 }
+
+// WS-FIX-02 decision: the evidence capture limit (evidence.DefaultMaxOriginal, 16 MiB)
+// is not derived from the transient pool, and core output is not streamed to the
+// evidence spool. The spool writes to disk in O(window) memory, so posted results and
+// streamed tool output reach 16 MiB under any pool; a core-backed tool decodes and
+// re-encodes the core's JSON, so its result is held in memory and coreStdoutCap is its
+// true bound. Under the default 24 MiB pool that bound sits near 7 MiB, and larger core
+// output is the permanent "output too large" error; a pool of about 52 MiB
+// (XMUSTARD_TRANSIENT_BYTE_BUDGET, which needs a new resource measurement) admits a
+// 16 MiB core result. This pins those figures so a change to either side is noticed.
+func TestCoreOutputCapAgainstTheEvidenceCaptureLimit(t *testing.T) {
+	const maxOriginal = 16 << 20 // evidence.DefaultMaxOriginal (evidence does not import rustcore)
+	capAt := func(pool int64) int { return coreStdoutCap(budget.NewScope(budget.NewByteBudget(pool)), true) }
+	if got := capAt(budget.DefaultTransientBudgetBytes); got >= maxOriginal || got < 6<<20 {
+		t.Fatalf("default pool: request-scoped core output cap %d, want about 7 MiB (below the %d capture limit)", got, maxOriginal)
+	}
+	if got := capAt(52 << 20); got < maxOriginal {
+		t.Fatalf("a 52 MiB pool caps core output at %d, below the %d capture limit", got, maxOriginal)
+	}
+}

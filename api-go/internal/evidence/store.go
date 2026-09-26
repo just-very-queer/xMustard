@@ -36,6 +36,14 @@ import (
 
 // Default limits. Configuration may LOWER them (XMUSTARD_EVIDENCE_*); an increase needs
 // a new resource measurement and retention statement, so larger values are clamped.
+//
+// DefaultMaxOriginal bounds the spool, which streams to disk in O(window) memory, so it
+// is not derived from the transient pool: posted results and streamed tool output reach
+// it under any pool. A core-backed tool's result is decoded and re-encoded in memory
+// before it reaches the spool, so its own bound is the pool-derived core output cap
+// (rustcore.coreStdoutCap: about 7 MiB under the default 24 MiB pool, 16 MiB from a
+// pool of about 52 MiB); past it the tool answers the permanent "output too large"
+// error, never a truncated capture (WS-FIX-02).
 const (
 	DefaultMaxOriginal      = 16 << 20
 	DefaultMaxProjection    = 1 << 20
