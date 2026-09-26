@@ -524,107 +524,117 @@ func (s *state) remove(field, rule string) {
 	s.norms = append(s.norms, Normalization{Op: OpRemove, Field: field, Rule: rule})
 }
 
-// repairKind applies the per-kind repairs ported from cursor-bridge's
-// normalizeBridgeToolArgs, plus repairs for kinds cursor-bridge does not have.
+// repair is one step of a kind's argument repair.
+type repair func(*state)
+
+// promote copies the first non-blank value among keys into field, through
+// clean when it is set; a value that clean empties (a URI that is not a local
+// path) is left alone.
+func promote(field, rule string, clean func(string) string, keys ...string) repair {
+	return func(s *state) {
+		key, v := s.first(keys...)
+		if v != "" && clean != nil {
+			v = clean(v)
+		}
+		if v != "" {
+			s.put(field, v, rule, key)
+		}
+	}
+}
+
+// promoteFrom is promote for a value that a lookup finds (nested objects,
+// joined model names) rather than a plain key list.
+func promoteFrom(field, rule string, find func(*state) (string, string)) repair {
+	return func(s *state) {
+		if key, v := find(s); v != "" {
+			s.put(field, v, rule, key)
+		}
+	}
+}
+
+var (
+	pathKeys          = []string{"path", "file_path", "target_file", "relative_workspace_path", "relative_path", "file_name", "uri"}
+	filePathRepair    = promote("path", "local_path", CleanLocalPath, pathKeys...)
+	serverRepair      = promote("server", "server", nil, "server", "name")
+	mcpServerRepairs  = []repair{serverRepair, repairServerName}
+	mcpResourceRepair = promoteFrom("uri", "uri", func(s *state) (string, string) { return mcpResourceURI(s.args) })
+)
+
+// kindRepairs are the per-kind repairs ported from cursor-bridge's
+// normalizeBridgeToolArgs, plus repairs for kinds cursor-bridge does not have,
+// applied in order. For get_mcp_prompt "name" is the prompt's name, not the
+// server's.
+var kindRepairs = map[Kind][]repair{
+	KindShellStdin: {repairStdinSession},
+	KindShell: {
+		promote("command", "command", nil, "command", "prompt"),
+		promote("cwd", "cwd", nil, "cwd", "directory", "path"),
+	},
+	KindReadFile:   {filePathRepair},
+	KindWriteFile:  {filePathRepair},
+	KindDeleteFile: {filePathRepair},
+	KindApplyPatch: {filePathRepair, repairApplyPatch},
+	KindListDir:    {promote("directory", "local_path", CleanLocalPath, "directory", "path", "relative_workspace_path", "relative_path", "uri")},
+	KindGlob: {
+		promote("glob_pattern", "glob", RepairGlob, "glob_pattern", "pattern", "query"),
+		promote("target_directory", "local_path", CleanLocalPath, "target_directory", "directory", "path"),
+	},
+	KindGrep: {
+		promote("pattern", "pattern", nil, "pattern", "query", "search_term"),
+		promote("path", "local_path", CleanLocalPath, "path"),
+		promote("glob", "glob", RepairGlob, "glob"),
+		promote("include", "glob", RepairGlob, "include"),
+	},
+	KindWebFetch:         {promote("url", "url", strings.TrimSpace, "url", "uri", "link")},
+	KindCallMCPTool:      {repairMCPToolRef, promote("tool", "tool", nil, "tool", "name")},
+	KindGetMCPServer:     mcpServerRepairs,
+	KindListMCPTools:     mcpServerRepairs,
+	KindListMCPResources: mcpServerRepairs,
+	KindListMCPPrompts:   mcpServerRepairs,
+	KindReadMCPResource:  {serverRepair, repairServerName, mcpResourceRepair},
+	KindGetMCPPrompt: {
+		promote("server", "server", nil, "server"),
+		repairServerName,
+		promote("prompt", "prompt", nil, "prompt", "name", "prompt_name"),
+	},
+	KindTask: {
+		promote("description", "description", nil, "description", "prompt", "task", "message"),
+		promote("subagent_type", "subagent_type", nil, "subagent_type", "agent_type", "type"),
+		promoteFrom("model", "model", modelSelection),
+	},
+	KindAwaitTask: {
+		promoteFrom("task_id", "task_id", func(s *state) (string, string) { return taskIDArg(s.args) }),
+		func(s *state) { coerceIntArg(s, "timeout_ms") },
+		func(s *state) { coerceIntArg(s, "timeout_seconds") },
+	},
+}
+
+// repairKind applies k's repairs.
 func repairKind(k Kind, s *state) {
-	switch k {
-	case KindShellStdin:
-		if key, taskID := s.first("task_id", "id"); taskID != "" && strings.TrimSpace(s.str("session_id")) == "" {
-			s.put("task_id", taskID, "task_id", key)
-			s.put("session_id", taskID, "session_from_task_id", key)
-		}
-	case KindShell:
-		if key, command := s.first("command", "prompt"); command != "" {
-			s.put("command", command, "command", key)
-		}
-		if key, cwd := s.first("cwd", "directory", "path"); cwd != "" {
-			s.put("cwd", cwd, "cwd", key)
-		}
-	case KindReadFile, KindWriteFile, KindDeleteFile, KindApplyPatch:
-		key, raw := s.first("path", "file_path", "target_file", "relative_workspace_path", "relative_path", "file_name", "uri")
-		if p := CleanLocalPath(raw); p != "" {
-			s.put("path", p, "local_path", key)
-		}
-		if k == KindApplyPatch {
-			repairApplyPatch(s)
-		}
-	case KindListDir:
-		key, raw := s.first("directory", "path", "relative_workspace_path", "relative_path", "uri")
-		if dir := CleanLocalPath(raw); dir != "" {
-			s.put("directory", dir, "local_path", key)
-		}
-	case KindGlob:
-		if key, pattern := s.first("glob_pattern", "pattern", "query"); pattern != "" {
-			s.put("glob_pattern", RepairGlob(pattern), "glob", key)
-		}
-		key, raw := s.first("target_directory", "directory", "path")
-		if dir := CleanLocalPath(raw); dir != "" {
-			s.put("target_directory", dir, "local_path", key)
-		}
-	case KindGrep:
-		if key, pattern := s.first("pattern", "query", "search_term"); pattern != "" {
-			s.put("pattern", pattern, "pattern", key)
-		}
-		if raw := s.str("path"); strings.TrimSpace(raw) != "" {
-			if p := CleanLocalPath(raw); p != "" {
-				s.put("path", p, "local_path", "")
-			}
-		}
-		for _, g := range []string{"glob", "include"} {
-			if raw := s.str(g); strings.TrimSpace(raw) != "" {
-				s.put(g, RepairGlob(raw), "glob", "")
-			}
-		}
-	case KindWebFetch:
-		if key, u := s.first("url", "uri", "link"); u != "" {
-			s.put("url", strings.TrimSpace(u), "url", key)
-		}
-	case KindCallMCPTool:
-		repairMCPToolRef(s)
-		if key, tool := s.first("tool", "name"); tool != "" {
-			s.put("tool", tool, "tool", key)
-		}
-	case KindGetMCPServer, KindListMCPTools, KindListMCPResources, KindReadMCPResource, KindListMCPPrompts, KindGetMCPPrompt:
-		serverKeys := []string{"server", "name"}
-		if k == KindGetMCPPrompt {
-			serverKeys = serverKeys[:1] // "name" is the prompt's name here
-		}
-		if key, server := s.first(serverKeys...); server != "" {
-			s.put("server", server, "server", key)
-		}
-		if raw := s.str("server"); strings.TrimSpace(raw) != "" {
-			if normalized, placeholder := requestedMCPServer(raw); placeholder {
-				s.remove("server", "placeholder_server")
-			} else {
-				s.put("server", normalized, "trim", "")
-			}
-		}
-		if k == KindReadMCPResource {
-			if key, uri := mcpResourceURI(s.args); uri != "" {
-				s.put("uri", uri, "uri", key)
-			}
-		}
-		if k == KindGetMCPPrompt {
-			if key, prompt := s.first("prompt", "name", "prompt_name"); prompt != "" {
-				s.put("prompt", prompt, "prompt", key)
-			}
-		}
-	case KindTask:
-		if key, description := s.first("description", "prompt", "task", "message"); description != "" {
-			s.put("description", description, "description", key)
-		}
-		if key, agent := s.first("subagent_type", "agent_type", "type"); agent != "" {
-			s.put("subagent_type", agent, "subagent_type", key)
-		}
-		if key, model := modelSelection(s); model != "" {
-			s.put("model", model, "model", key)
-		}
-	case KindAwaitTask:
-		if key, taskID := taskIDArg(s.args); taskID != "" {
-			s.put("task_id", taskID, "task_id", key)
-		}
-		coerceIntArg(s, "timeout_ms")
-		coerceIntArg(s, "timeout_seconds")
+	for _, r := range kindRepairs[k] {
+		r(s)
+	}
+}
+
+// repairStdinSession names the shell session after a task id when no session
+// id was given.
+func repairStdinSession(s *state) {
+	if key, taskID := s.first("task_id", "id"); taskID != "" && strings.TrimSpace(s.str("session_id")) == "" {
+		s.put("task_id", taskID, "task_id", key)
+		s.put("session_id", taskID, "session_from_task_id", key)
+	}
+}
+
+// repairServerName trims the server name and drops a placeholder one.
+func repairServerName(s *state) {
+	raw := s.str("server")
+	if strings.TrimSpace(raw) == "" {
+		return
+	}
+	if normalized, placeholder := requestedMCPServer(raw); placeholder {
+		s.remove("server", "placeholder_server")
+	} else {
+		s.put("server", normalized, "trim", "")
 	}
 }
 
@@ -730,13 +740,7 @@ func repairMCPToolRef(s *state) {
 			}
 		}
 	}
-	if raw := s.str("server"); strings.TrimSpace(raw) != "" {
-		if normalized, placeholder := requestedMCPServer(raw); placeholder {
-			s.remove("server", "placeholder_server")
-		} else {
-			s.put("server", normalized, "trim", "")
-		}
-	}
+	repairServerName(s)
 	key, ref := s.first("tool", "name")
 	if ref == "" {
 		return
@@ -1034,72 +1038,58 @@ func validate(spec Spec, args map[string]any) *ValidationError {
 // validateKind is the required-field check for harness tool families, ported
 // from cursor-bridge's validateBridgeToolArgs.
 func validateKind(k Kind, args map[string]any) *ValidationError {
-	has := func(keys ...string) bool {
-		for _, key := range keys {
-			if v, _ := args[key].(string); strings.TrimSpace(v) != "" {
-				return true
-			}
-		}
-		return false
+	req, ok := kindRequired[k]
+	if !ok || (req.list && nonEmptyList(args[req.field])) {
+		return nil
 	}
-	required := func(field, message string) *ValidationError {
-		return &ValidationError{Field: field, Code: CodeRequired, Message: message}
-	}
-	switch k {
-	case KindReadFile, KindWriteFile, KindDeleteFile:
-		if !has("path", "file_path", "target_file") {
-			return required("path", "path is required")
-		}
-	case KindApplyPatch:
-		if !has("patch", "diff", "input") && !has("path", "file_path", "target_file") {
-			return required("path", "path is required")
-		}
-	case KindGrep:
-		if !has("pattern", "query", "search_term") {
-			return required("pattern", "pattern is required")
-		}
-	case KindSearchSymbols:
-		if !has("query", "symbol") {
-			return required("query", "query is required")
-		}
-	case KindSemanticSearch:
-		if !has("query", "content", "pattern") { // "text" is canonicalized to "content"
-			return required("query", "query is required")
-		}
-	case KindShell:
-		if !has("command") && !nonEmptyList(args["command"]) {
-			return required("command", "command is required")
-		}
-	case KindShellStdin, KindKillShell:
-		if !has("session_id", "task_id", "id") {
-			return required("session_id", "session_id or task_id is required")
-		}
-	case KindWebFetch:
-		if !has("url") {
-			return required("url", "url is required")
-		}
-	case KindCallMCPTool:
-		if !has("tool", "name") {
-			return required("tool", "tool is required")
-		}
-	case KindReadMCPResource:
-		if !has("uri") {
-			return required("uri", "uri is required")
-		}
-	case KindGetMCPPrompt:
-		if !has("prompt") {
-			return required("prompt", "prompt is required")
-		}
-	case KindTask:
-		if !has("description") {
-			return required("description", "description is required")
-		}
-	case KindAwaitTask:
-		if !has("task_id") {
-			return required("task_id", "task_id is required")
+	for _, key := range req.keys {
+		if v, _ := args[key].(string); strings.TrimSpace(v) != "" {
+			return nil
 		}
 	}
-	return nil
+	message := req.message
+	if message == "" {
+		message = req.field + " is required"
+	}
+	return &ValidationError{Field: req.field, Code: CodeRequired, Message: message}
+}
+
+// requirement is a kind's required argument: field is reported missing unless
+// one of keys holds a non-blank string (or, with list, field holds a non-empty
+// list). message defaults to "<field> is required".
+type requirement struct {
+	field   string
+	keys    []string
+	list    bool
+	message string
+}
+
+var (
+	pathRequired    = requirement{field: "path", keys: []string{"path", "file_path", "target_file"}}
+	sessionRequired = requirement{field: "session_id", keys: []string{"session_id", "task_id", "id"}, message: "session_id or task_id is required"}
+)
+
+// requireField is the requirement that field itself holds a value.
+func requireField(field string) requirement { return requirement{field: field, keys: []string{field}} }
+
+var kindRequired = map[Kind]requirement{
+	KindReadFile:   pathRequired,
+	KindWriteFile:  pathRequired,
+	KindDeleteFile: pathRequired,
+	// a patch names its files itself
+	KindApplyPatch:      {field: "path", keys: []string{"patch", "diff", "input", "path", "file_path", "target_file"}},
+	KindGrep:            {field: "pattern", keys: []string{"pattern", "query", "search_term"}},
+	KindSearchSymbols:   {field: "query", keys: []string{"query", "symbol"}},
+	KindSemanticSearch:  {field: "query", keys: []string{"query", "content", "pattern"}}, // "text" is canonicalized to "content"
+	KindShell:           {field: "command", keys: []string{"command"}, list: true},
+	KindShellStdin:      sessionRequired,
+	KindKillShell:       sessionRequired,
+	KindWebFetch:        requireField("url"),
+	KindCallMCPTool:     {field: "tool", keys: []string{"tool", "name"}},
+	KindReadMCPResource: requireField("uri"),
+	KindGetMCPPrompt:    requireField("prompt"),
+	KindTask:            requireField("description"),
+	KindAwaitTask:       requireField("task_id"),
 }
 
 // CleanLocalPath turns a path argument into a clean local path. A file:// URI
@@ -1230,7 +1220,8 @@ func hasType(v any, t Type) bool {
 }
 
 func article(t Type) string {
-	if t == TypeArray || t == TypeInteger || t == TypeObject {
+	switch t {
+	case TypeArray, TypeInteger, TypeObject:
 		return "an"
 	}
 	return "a"
