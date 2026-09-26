@@ -715,8 +715,9 @@ pub fn extract_source_symbols(relative_path: &str, content: &str, max: usize) ->
             truncated: false,
         };
     }
-    if let Some((symbols, truncated)) =
-        treesitter::extract_symbols_limited(relative_path, content, max)
+    let parsed = treesitter::extract_symbols_limited(relative_path, content, max);
+    let parsed_any = parsed.is_some();
+    if let Some((symbols, truncated)) = parsed
         && !symbols.is_empty()
     {
         let mapped = symbols
@@ -743,12 +744,14 @@ pub fn extract_source_symbols(relative_path: &str, content: &str, max: usize) ->
         };
     }
     let (fallback, truncated) = extract_symbols_with_regex(relative_path, content, max);
-    // a language pack without its grammar in this build has no symbol extractor
-    let grammarless = Lang::for_path(relative_path).is_some_and(|l| !l.has_grammar());
-    let engine = match (fallback.is_empty(), grammarless) {
-        (false, _) => "regex",
-        (true, true) => "unsupported_language",
-        (true, false) => "none",
+    let grammar = Lang::for_path(relative_path).map(Lang::has_grammar);
+    let engine = match (fallback.is_empty(), grammar, parsed_any) {
+        (false, ..) => "regex",
+        // a language pack without its grammar in this build has no symbol extractor
+        (true, Some(false), _) => "unsupported_language",
+        // past the parse bounds: only the regexes ran, whatever they found
+        (true, Some(true), false) => "regex",
+        _ => "none",
     };
     SourceSymbols {
         symbols: fallback,

@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{Node, Parser, QueryCursor};
 
-use super::{Lang, fact_kind, tag_query};
+use super::{Lang, METHOD_OWNERS, fact_kind, tag_query};
 use crate::index::extract::{
     MAX_DOC_DEPTH, MAX_REFS_PER_FILE, MAX_SYMBOLS_PER_FILE, decl_end_line, doc_start_line, qualify,
     signature_hash,
@@ -37,18 +37,6 @@ struct Def<'t> {
     /// `FileFacts` kind of the `@definition.<label>`.
     kind: &'static str,
 }
-
-/// Kinds whose nested functions are methods (a module-level or namespace-level function
-/// stays a function).
-const METHOD_OWNERS: &[&str] = &[
-    "Class",
-    "Struct",
-    "Interface",
-    "Trait",
-    "Enum",
-    "Impl",
-    "Module",
-];
 
 fn list_arity(list: Node<'_>) -> u32 {
     let mut c = list.walk();

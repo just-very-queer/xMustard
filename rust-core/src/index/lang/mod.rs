@@ -269,6 +269,18 @@ pub fn fact_kind(label: &str) -> Option<&'static str> {
     })
 }
 
+/// Kinds whose nested functions are methods (a module-level or namespace-level function
+/// stays a function).
+pub const METHOD_OWNERS: &[&str] = &[
+    "Class",
+    "Struct",
+    "Interface",
+    "Trait",
+    "Enum",
+    "Impl",
+    "Module",
+];
+
 /// Legacy repo-map kind (`function`, `method`, `class`, `type`) for a label; None for
 /// labels the legacy symbol list never carried (they still act as scopes).
 pub fn legacy_kind(label: &str) -> Option<&'static str> {

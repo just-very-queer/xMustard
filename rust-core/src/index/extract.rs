@@ -101,6 +101,14 @@ fn parse_refusal(lang: Lang, bytes: &[u8], max_parse_bytes: usize) -> Option<Par
     }
 }
 
+/// Whether tree-sitter may parse `lang` text of these bytes under the default bounds:
+/// the legacy repo-map path (`treesitter`) shares the index's parse refusal, so neither
+/// path parses a file past `DEFAULT_MAX_PARSE_BYTES`, `MAX_PARSE_TOKENS` or
+/// `MAX_PARSE_NESTING`.
+pub fn within_parse_bounds(lang: Lang, bytes: &[u8]) -> bool {
+    parse_refusal(lang, bytes, DEFAULT_MAX_PARSE_BYTES).is_none()
+}
+
 /// One pass over `bytes` for the parse guards (`MAX_PARSE_TOKENS`, `MAX_PARSE_NESTING`);
 /// stops at the first bound crossed.
 fn parse_limit(bytes: &[u8]) -> Option<ParseLimit> {

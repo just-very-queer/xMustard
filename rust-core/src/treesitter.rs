@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet};
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{Parser, QueryCursor};
 
+use crate::index::extract::within_parse_bounds;
 use crate::index::lang::{self, Lang};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,13 +41,17 @@ pub fn extract_symbols(relative_path: &str, source: &str) -> Option<Vec<TsSymbol
 }
 
 /// Extract at most `max` symbols; the flag is true when more symbols existed. None when
-/// the file's language has no grammar in this build.
+/// the file's language has no grammar in this build, or when the file is past the
+/// index's parse bounds (size, tokens, nesting): the caller then uses its regexes.
 pub fn extract_symbols_limited(
     relative_path: &str,
     source: &str,
     max: usize,
 ) -> Option<(Vec<TsSymbol>, bool)> {
     let lang = Lang::for_path(relative_path)?;
+    if !within_parse_bounds(lang, source.as_bytes()) {
+        return None;
+    }
     let grammar = lang.grammar()?;
     let mut parser = Parser::new();
     if parser.set_language(&grammar).is_err() {
@@ -63,6 +68,8 @@ pub fn extract_symbols_limited(
     // definition node id -> (label, name) for every match, so scopes can be looked up
     let mut defs: Vec<(tree_sitter::Node<'_>, tree_sitter::Node<'_>, &str)> = Vec::new();
     let mut containers: HashMap<usize, &str> = HashMap::new();
+    // every definition's label: the nearest one decides whether a function is a method
+    let mut labels: HashMap<usize, &str> = HashMap::new();
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(&query, tree.root_node(), src);
     while let Some(mat) = matches.next() {
@@ -80,6 +87,7 @@ pub fn extract_symbols_limited(
         let Ok(text) = name.utf8_text(src) else {
             continue;
         };
+        labels.entry(node.id()).or_insert(label);
         if lang::is_container(label) {
             containers.entry(node.id()).or_insert(text.trim());
         }
@@ -102,12 +110,21 @@ pub fn extract_symbols_limited(
         if symbols.len() >= max {
             return Some((symbols, true));
         }
-        // the nearest container declaration above this one; a symbol is never its own
-        // scope (the `impl Foo` type capture).
-        let enclosing_scope = std::iter::successors(node.parent(), |n| n.parent())
+        // walk from the parent so a symbol is never its own scope, but a constructor
+        // named like its class still gets the class
+        let ancestors = || std::iter::successors(node.parent(), |n| n.parent());
+        let enclosing_scope = ancestors()
             .find_map(|n| containers.get(&n.id()))
-            .map(|s| s.to_string())
-            .filter(|s| s != symbol);
+            .map(|s| s.to_string());
+        // the same method rule as the index (`tags`): a function whose nearest enclosing
+        // definition is a type or module is a method
+        let owner = ancestors()
+            .find_map(|n| labels.get(&n.id()))
+            .and_then(|l| lang::fact_kind(l));
+        let kind = match (kind, owner) {
+            ("function", Some(o)) if lang::METHOD_OWNERS.contains(&o) => "method",
+            (kind, _) => kind,
+        };
         symbols.push(TsSymbol {
             symbol: symbol.to_string(),
             kind: kind.to_string(),
@@ -207,5 +224,59 @@ mod tests {
         assert!(list.contains(&("render", "function")));
         assert!(list.contains(&("Props", "type")));
         assert!(list.contains(&("Widget", "class")));
+    }
+
+    fn find<'a>(symbols: &'a [TsSymbol], name: &str) -> &'a TsSymbol {
+        symbols.iter().find(|s| s.symbol == name).unwrap()
+    }
+
+    #[cfg(all(feature = "lang-java", feature = "lang-cpp"))]
+    #[test]
+    fn constructor_named_like_its_class_keeps_the_class_scope() {
+        let java = "class Sample {\n  Sample(int n) {}\n}\n";
+        let symbols = extract_symbols("Sample.java", java).unwrap();
+        let ctor = symbols
+            .iter()
+            .find(|s| s.symbol == "Sample" && s.kind == "method")
+            .unwrap();
+        assert_eq!(ctor.enclosing_scope.as_deref(), Some("Sample"));
+        let cpp = "class Shape {\n public:\n  Shape() {}\n  int area() { return 0; }\n};\n";
+        let symbols = extract_symbols("shape.cpp", cpp).unwrap();
+        let ctor = symbols
+            .iter()
+            .find(|s| s.symbol == "Shape" && s.kind == "method")
+            .unwrap();
+        assert_eq!(ctor.enclosing_scope.as_deref(), Some("Shape"));
+        // in-class functions are methods, as in the index's tag extractor
+        assert_eq!(find(&symbols, "area").kind, "method");
+    }
+
+    #[cfg(feature = "lang-ruby")]
+    #[test]
+    fn ruby_functions_in_a_class_are_methods() {
+        let rb = "def top; end\nclass Widget\n  def initialize; end\nend\n";
+        let symbols = extract_symbols("w.rb", rb).unwrap();
+        assert_eq!(find(&symbols, "initialize").kind, "method");
+        assert_eq!(find(&symbols, "top").kind, "function");
+    }
+
+    #[test]
+    fn files_past_the_parse_bounds_are_not_parsed() {
+        let over_size: String = (0..6000).map(|i| format!("fn f{i}() {{}}\n")).collect();
+        assert!(over_size.len() > crate::index::extract::DEFAULT_MAX_PARSE_BYTES);
+        assert!(extract_symbols("big.rs", &over_size).is_none());
+        let deep = format!("fn f() {{ {} }}\n", "(".repeat(300) + &")".repeat(300));
+        assert!(extract_symbols("deep.rs", &deep).is_none());
+        // the repo-map entry point falls back to its regexes for them
+        let out = crate::repomap::extract_source_symbols("big.rs", &over_size, 10);
+        assert_eq!(out.engine, "regex");
+        assert!(out.truncated);
+        // and a refused file the regexes find nothing in still reports the regex engine,
+        // so graph coverage counts it as failed rather than supported
+        let blank = format!("// {}\n", "x".repeat(70_000));
+        assert_eq!(
+            crate::repomap::extract_source_symbols("blank.rs", &blank, 10).engine,
+            "regex"
+        );
     }
 }
