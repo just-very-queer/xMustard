@@ -19,8 +19,9 @@ It also reduces what Pi's own tools put into context:
   advances only in polling windows. The latest failure and files being edited are
   never masked.
 - **Compaction** at `session_before_compact`: a deterministic snapshot of at most 2 KB
-  replaces Pi's model-written summary. The compaction entry's `details` carry a
-  recovery handle for every summarized output.
+  replaces Pi's model-written summary. Every output it removes stays recoverable:
+  larger outputs by their own handle, everything else through one retained index
+  document that the snapshot names.
 
 ## Pin
 
@@ -121,9 +122,15 @@ keeps Pi's `details` with an `xmustard` member added (path, handle, raw and proj
 bytes, reducer, family). Captured bytes arrive after the fact, so they are always
 `captured_identity: "unknown"`.
 
-Smaller results, results with images, and results of other tools are left alone and
-never reach Go (Go would return a small result unchanged). The session's workspace is
-resolved as for the nine tools, within the projection deadline.
+Smaller results, results with images, and results of other tools are not projected
+and do not reach Go here (Go would return a small result unchanged); only compaction's
+index (below) carries them, so that nothing compacted away is lost. The session's
+workspace is resolved as for the nine tools, within the projection deadline. Built-in
+captures send `tool_version=pi-coding-agent/<Pi VERSION>`.
+
+`xmustard_expand` is inactive at `session_start` unless the branch already names a
+handle (a mask stub, an xMustard compaction or a projected result), so a resumed,
+reloaded or forked session can still recover what it masked or compacted.
 
 ## Masking (turn_end)
 
@@ -151,6 +158,12 @@ A result that already has a handle reuses it: a built-in or xMustard projection,
 `xmustard_expand` page, whose stub then names the page offset. Any other result is
 first retained through the capture route with `format=raw&target=1024`, so the handle
 recovers exactly the text the model saw. If that fails, the result stays unmasked.
+Handles expire (24 h by default). A handle that expires within an hour counts as
+absent, so the text is retained again under a fresh one, and the stub names the
+expiry (`; expires <RFC 3339>`). When a stub's handle has expired, the next `turn_end`
+(window or not) rewrites it from the raw entry, which the session still holds.
+Tool paths resolve as Pi's tools resolve them (`@` prefix, `~`, `file://`, unicode
+spaces), so `@src/a.go` and `src/a.go` are the same active file.
 Pi's session is append-only: the original entry is kept and only the `context_edit`
 entry is added. Pi composes boundary handlers, so the adapter returns the entries that
 earlier handlers proposed plus its own, and skips targets another handler already
@@ -166,26 +179,35 @@ summarize:
      verified memory;
   2. the goal (the first user message) and the latest request;
   3. up to 3 open failures (a failure with no later success of the same command or
-     path), each with its handle;
+     path), each with its handle and its last line of tool output;
   4. modified and read files;
   5. memory proposals still pending, and this session's memory decisions (remember
      results with their verification mode, verify verdicts);
   6. the last progress (the last assistant text) and an earlier non-xMustard
      summary;
-  7. as many recoverable outputs as fit, newest first, then `(+N more)`.
+  7. as many recoverable outputs as fit, newest first, then `(+N more in the index)`.
+- the index: when everything does not fit in 2 KB, one document is retained
+  (`tool=pi_compaction`) and named on the summary's second line. It holds the
+  snapshot unclipped, every open failure and handle (with expiry), an earlier
+  model-written summary in full, and the compacted messages, with tool outputs above
+  1 KiB by handle and smaller ones inline. When the whole document fits in 2 KB, it is
+  the summary and no index is retained.
 - `details`: `readFiles` and `modifiedFiles` (Pi's shape), and
   `xmustard: {version: "xmustard.pi-compaction/v1", derived: true,
-  verified_memory: false, workspace_id, snapshot, handles[], carried, summary_bytes}`.
-  Every summarized tool output above 1 KiB has a handle. Outputs that already had
-  one reuse it; the rest are retained first (`target=1024`). Handles recorded by an
-  earlier xMustard compaction are carried forward, up to 1,024.
+  verified_memory: false, workspace_id, snapshot, handles[], carried, expired_dropped,
+  index?, summary_bytes}`. Every summarized tool output above 1 KiB has a live handle
+  (one that outlives the next hour): a live existing one is reused, the rest are
+  retained first (`target=1024`). Handles recorded by an earlier xMustard compaction
+  are carried forward (up to 1,024 in details; the index names all of them); expired
+  ones are retained again from the branch or counted in `expired_dropped`.
 
 Pi's own compaction runs instead in three cases:
 
 - the user gave `/compact` instructions, which only Pi's summarizer can honor;
 - capture is unavailable (paused after an outage, unreachable, or no redactor) while
   some summarized output still needs a handle;
-- retaining any output fails, or more than 512 outputs would need retaining.
+- retaining any output or the index fails, more than 512 outputs would need
+  retaining, or the index would exceed 8 MiB.
 
 Failure behavior of the capture paths:
 
