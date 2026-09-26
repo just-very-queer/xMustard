@@ -119,7 +119,10 @@ func laterTimestamp(a, b string) string {
 
 // mergeFeedback folds deltas into the on-disk store in one locked read-modify-write.
 func mergeFeedback(dataDir, workspaceID string, deltas map[string]feedbackDelta) error {
-	unlock := lockStore(feedbackPath(dataDir, workspaceID))
+	unlock, err := lockStore(feedbackPath(dataDir, workspaceID))
+	if err != nil {
+		return err
+	}
 	defer unlock()
 	m, err := loadFeedback(dataDir, workspaceID)
 	if err != nil {

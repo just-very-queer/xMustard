@@ -17,10 +17,12 @@ import (
 	"time"
 )
 
-// tokenStoreMu serializes the load-modify-write on agent_tokens.json. Without it,
-// concurrent mint/rotate/revoke calls race (last-writer-wins drops the other's
-// change — a lost revoke would silently resurrect a token while reporting success).
-var tokenStoreMu sync.Mutex
+// lockTokenStore serializes the load-modify-write on agent_tokens.json, in this
+// process and across processes (the API and the ops CLI both mint and revoke).
+// Without it, concurrent mint/rotate/revoke calls race (last-writer-wins drops the
+// other's change — a lost revoke would silently resurrect a token while reporting
+// success).
+func lockTokenStore(dataDir string) (func(), error) { return lockStore(tokensPath(dataDir)) }
 
 // maxTTLSeconds bounds a token's lifetime well under the int64-nanosecond overflow
 // of time.Duration (~292 years), so an attacker-supplied huge ttl can't wrap to a
@@ -342,22 +344,28 @@ func MintTokenTTL(dataDir, id, role string, ttlSeconds int) (string, error) {
 	if err := validateMintInputs(&id, &role, ttlSeconds); err != nil {
 		return "", err
 	}
-	tokenStoreMu.Lock()
-	defer tokenStoreMu.Unlock()
+	unlock, err := lockTokenStore(dataDir)
+	if err != nil {
+		return "", err
+	}
+	defer unlock()
 	return mintTokenLocked(dataDir, id, role, ttlSeconds, nil)
 }
 
-// mintTokenLocked does the load-modify-write; the caller MUST hold tokenStoreMu.
 // MintScopedToken mints a token confined to the given workspace ids (empty = all).
 func MintScopedToken(dataDir, id, role string, ttlSeconds int, workspaces []string) (string, error) {
 	if err := validateMintInputs(&id, &role, ttlSeconds); err != nil {
 		return "", err
 	}
-	tokenStoreMu.Lock()
-	defer tokenStoreMu.Unlock()
+	unlock, err := lockTokenStore(dataDir)
+	if err != nil {
+		return "", err
+	}
+	defer unlock()
 	return mintTokenLocked(dataDir, id, role, ttlSeconds, workspaces)
 }
 
+// mintTokenLocked does the load-modify-write; the caller MUST hold lockTokenStore.
 func mintTokenLocked(dataDir, id, role string, ttlSeconds int, workspaces []string) (string, error) {
 	buf := make([]byte, 32)
 	if _, err := rand.Read(buf); err != nil {
@@ -406,8 +414,11 @@ func RotateToken(dataDir, id string, ttlSeconds int) (string, error) {
 	if ttlSeconds < 0 || ttlSeconds > maxTTLSeconds {
 		return "", fmt.Errorf("ttl_seconds must be between 0 and %d", maxTTLSeconds)
 	}
-	tokenStoreMu.Lock()
-	defer tokenStoreMu.Unlock()
+	unlock, err := lockTokenStore(dataDir)
+	if err != nil {
+		return "", err
+	}
+	defer unlock()
 	recs, err := loadTokenRecords(dataDir)
 	if err != nil {
 		return "", err
@@ -448,11 +459,14 @@ func ListPrincipals(dataDir string) []Principal {
 	return out
 }
 
-// RevokeToken removes a principal's token. Holds tokenStoreMu across the
+// RevokeToken removes a principal's token. Holds lockTokenStore across the
 // load-modify-write so a concurrent mint/rotate can't resurrect the revoked token.
 func RevokeToken(dataDir, id string) error {
-	tokenStoreMu.Lock()
-	defer tokenStoreMu.Unlock()
+	unlock, err := lockTokenStore(dataDir)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	recs, err := loadTokenRecords(dataDir)
 	if err != nil {
 		return err

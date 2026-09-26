@@ -287,7 +287,10 @@ func getWorkspaceRecord(dataDir string, workspaceID string) (workspaceRecord, er
 // same registry. reg applies only when the record is created; an existing record
 // keeps who registered it.
 func upsertLoadedWorkspace(dataDir, rootPath, name, now string, reg *NonAdminRegistration) (workspaceRecord, error) {
-	unlock := lockStore(workspacesPath(dataDir))
+	unlock, err := lockStore(workspacesPath(dataDir))
+	if err != nil {
+		return workspaceRecord{}, err
+	}
 	defer unlock()
 	workspaces, err := ListWorkspaces(dataDir)
 	if err != nil {
@@ -365,7 +368,10 @@ func registeredByNonAdmin(dataDir, workspaceID string) (registerRoot, principal 
 // registrations (several agents' first MCP calls, each registering its repository)
 // overwrite each other and drop records.
 func saveWorkspaceRecord(dataDir string, workspace workspaceRecord) error {
-	unlock := lockStore(workspacesPath(dataDir))
+	unlock, err := lockStore(workspacesPath(dataDir))
+	if err != nil {
+		return err
+	}
 	defer unlock()
 	return saveWorkspaceRecordLocked(dataDir, workspace)
 }

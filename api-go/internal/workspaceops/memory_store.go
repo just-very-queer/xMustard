@@ -110,7 +110,11 @@ func closeIdleMemoryStoresLocked(keep int) {
 	}
 }
 
-// CloseMemoryStores closes every idle governance store (shutdown).
+// CloseMemoryStores closes every idle governance store at shutdown, which runs after
+// the HTTP server has drained its handlers. A store still held by a caller (a request
+// that outlived the drain) is left open rather than closed under it: every committed
+// transaction is already in the WAL, and SQLite replays the WAL on the next open, so
+// skipping its checkpoint loses nothing.
 func CloseMemoryStores() {
 	memoryStores.Lock()
 	defer memoryStores.Unlock()
@@ -118,8 +122,12 @@ func CloseMemoryStores() {
 }
 
 // withMemoryStore runs fn against the data dir's store after the workspace's legacy
-// JSON, if any, has been imported.
+// JSON, if any, has been imported. The workspace id is checked first: it names the
+// legacy file the import reads and renames, so it must not reach a path unvalidated.
 func withMemoryStore(ctx context.Context, dataDir, workspaceID string, fn func(*govstore.SQLStore) error) error {
+	if err := validateSafeID("workspace", workspaceID); err != nil {
+		return err
+	}
 	s, release, err := acquireMemoryStore(ctx, dataDir)
 	if err != nil {
 		return err
@@ -221,7 +229,12 @@ func importLegacyContextEntries(ctx context.Context, s *govstore.SQLStore, dataD
 	if _, err := os.Stat(backup); err == nil {
 		backup = fmt.Sprintf("%s.govstore-import.%d.bak", src, time.Now().UnixNano())
 	}
-	return os.Rename(src, backup)
+	// Another process may have imported the same file and moved it aside first; the
+	// import above was idempotent, so its entries are in the store either way.
+	if err := os.Rename(src, backup); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
 }
 
 // --- actors and repository state ---------------------------------------------------
@@ -438,22 +451,4 @@ func attachContent(ctx context.Context, r govstore.Reader, entries []ContextEntr
 		kept = append(kept, e)
 	}
 	return kept, withheld, nil
-}
-
-// loadContextEntries returns every active entry of the workspace with its content.
-func loadContextEntries(dataDir, workspaceID string) ([]ContextEntry, error) {
-	ctx := context.Background()
-	var out []ContextEntry
-	err := memoryView(ctx, dataDir, workspaceID, func(r govstore.Reader) error {
-		entries, err := listWorkspaceEntries(ctx, r, govstore.EntryFilter{WorkspaceID: workspaceID})
-		if err != nil {
-			return err
-		}
-		out, _, err = attachContent(ctx, r, entries)
-		return err
-	})
-	if out == nil && err == nil {
-		out = []ContextEntry{}
-	}
-	return out, err
 }

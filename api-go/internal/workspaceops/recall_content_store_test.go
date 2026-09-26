@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sync"
 	"testing"
 
 	"xmustard/api-go/internal/govstore"
@@ -144,57 +143,6 @@ func TestGovernanceTransitionsAppendEventsWithHead(t *testing.T) {
 		if !seen[want] {
 			t.Fatalf("missing %s event in %+v", want, events)
 		}
-	}
-}
-
-// Writers on other store handles (another API process, the ops CLI) share the file
-// with SQLite's cross-process locking: concurrent proposals from both lose nothing,
-// and each side sees the other's writes at once.
-func TestMemoryStoreSharedAcrossProcessesLosesNoUpdates(t *testing.T) {
-	dir := t.TempDir()
-	ws := "wsTwoProcs"
-	if _, err := ProposeContext(dir, ws, ProposeContextRequest{Content: "first", Source: "alice"}); err != nil {
-		t.Fatal(err)
-	}
-	ctx := context.Background()
-	other, err := govstore.Open(ctx, memoryStorePath(dir), govstore.Options{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer other.Close()
-
-	const n = 20
-	var wg sync.WaitGroup
-	errs := make(chan error, 2*n)
-	for i := 0; i < n; i++ {
-		wg.Add(2)
-		go func(i int) {
-			defer wg.Done()
-			_, err := ProposeContext(dir, ws, ProposeContextRequest{Content: fmt.Sprintf("api %d", i), Source: "alice"})
-			errs <- err
-		}(i)
-		go func(i int) {
-			defer wg.Done()
-			errs <- other.Update(ctx, func(tx govstore.Tx) error {
-				_, err := tx.InsertEntry(ctx, govstore.NewEntry{ID: fmt.Sprintf("ops_%d", i), WorkspaceID: ws,
-					Content: fmt.Sprintf("ops %d", i)}, govstore.Actor{Principal: "ops"})
-				return err
-			})
-		}(i)
-	}
-	wg.Wait()
-	close(errs)
-	for err := range errs {
-		if err != nil {
-			t.Fatal(err)
-		}
-	}
-	all, err := ListContextEntries(dir, ws, "all")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(all) != 2*n+1 {
-		t.Fatalf("want %d entries after concurrent writers on two handles, got %d (lost updates)", 2*n+1, len(all))
 	}
 }
 

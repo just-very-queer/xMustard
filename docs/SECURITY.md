@@ -86,6 +86,15 @@ In open mode no credentials exist. Every caller is the single identity
 `anonymous`, passes every role gate, and memory it writes is labelled
 `self_asserted_open_mode`, never peer-verified.
 
+### Who counts as a peer verifier
+
+Promotion needs approvals from distinct principals other than the author. Since the
+govstore cutover (WS-12) the author of the entry's *served revision* is excluded
+too, not only the original proposer: an admin who rewrites an entry cannot then
+count toward that revision's quorum, so rewriting and approving one text needs a
+further principal. This is a deliberate tightening; it matches the store's own
+peer invariant, so the API and the store agree on who is a peer.
+
 ### Changes for existing tokens
 
 Before the role table, an `agent` token could call every route except the admin

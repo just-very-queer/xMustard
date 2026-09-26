@@ -55,3 +55,21 @@ func storeUpdate(t *testing.T, dataDir, workspaceID string, fn func(govstore.Tx)
 		t.Fatal(err)
 	}
 }
+
+// loadContextEntries returns every active entry of the workspace with its content.
+func loadContextEntries(dataDir, workspaceID string) ([]ContextEntry, error) {
+	ctx := context.Background()
+	var out []ContextEntry
+	err := memoryView(ctx, dataDir, workspaceID, func(r govstore.Reader) error {
+		entries, err := listWorkspaceEntries(ctx, r, govstore.EntryFilter{WorkspaceID: workspaceID})
+		if err != nil {
+			return err
+		}
+		out, _, err = attachContent(ctx, r, entries)
+		return err
+	})
+	if out == nil && err == nil {
+		out = []ContextEntry{}
+	}
+	return out, err
+}
