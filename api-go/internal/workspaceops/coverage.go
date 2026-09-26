@@ -202,6 +202,14 @@ func loadSnapshot(dataDir string, workspaceID string) (*workspaceSnapshot, error
 		return nil, fmt.Errorf("load snapshot: %w", err)
 	}
 	snapshot.Issues = normalizeIssueSlices(snapshot.Issues)
+	// Every caller reads the root from here. A snapshot scanned since a non-admin
+	// registered the root says so; the registry covers one written before that.
+	if snapshot.Workspace.RegisterRoot == "" {
+		snapshot.Workspace.RegisterRoot, snapshot.Workspace.RegisteredBy = registeredByNonAdmin(dataDir, workspaceID)
+	}
+	if err := verifyRegisteredRoot(snapshot.Workspace); err != nil {
+		return nil, err
+	}
 	return &snapshot, nil
 }
 

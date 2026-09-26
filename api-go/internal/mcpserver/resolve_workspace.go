@@ -251,9 +251,22 @@ func (s *Session) register(ctx context.Context, repo string) error {
 		return fatalOn(fmt.Errorf("registering git repository %s: %w", repo, budget.ErrOverloaded))
 	}
 	if resp.Status >= 400 {
-		return fmt.Errorf("git repository %s is not registered and the API refused to register it (%s: %s)", repo, statusText(resp.Status), clip(resp.Body, 200))
+		// the API's message names the rule that refused it (a non-admin token
+		// registers only under the operator's XMUSTARD_REGISTER_ROOTS)
+		return fmt.Errorf("git repository %s is not registered and the API refused to register it (%s: %s)", repo, statusText(resp.Status), clip(apiErrorText(resp.Body), 200))
 	}
 	return nil
+}
+
+// apiErrorText is the "error" message of an API error body, else the body itself.
+func apiErrorText(body string) string {
+	var e struct {
+		Error string `json:"error"`
+	}
+	if json.Unmarshal([]byte(body), &e) == nil && strings.TrimSpace(e.Error) != "" {
+		return e.Error
+	}
+	return body
 }
 
 // listWorkspaces returns the workspaces the caller's token may see, cached for the

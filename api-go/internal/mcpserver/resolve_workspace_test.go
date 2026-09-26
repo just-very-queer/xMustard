@@ -240,3 +240,23 @@ func TestPathCacheIsBounded(t *testing.T) {
 		t.Fatalf("path cache holds %d entries, over %d", len(s.byPath), maxPathCache)
 	}
 }
+
+// A refused registration reports the API's message, not its JSON envelope, so the
+// rule that refused it (and XMUSTARD_REGISTER_ROOTS) survives the clip.
+func TestRefusedRegistrationReportsTheAPIMessage(t *testing.T) {
+	repo := tempRepo(t)
+	msg := "non-admin registration is off: the operator has configured no registration roots (XMUSTARD_REGISTER_ROOTS), so an admin must register " + repo
+	body, _ := json.Marshal(map[string]any{"error": msg, "reason": "registration_not_allowed", "refusal": "no_register_roots"})
+	api := &fakeAPI{handle: func(r Request) *APIResponse {
+		if r.Path == "/api/workspaces/load" {
+			return &APIResponse{Status: 403, Body: string(body)}
+		}
+		return nil
+	}}
+	s := newSession(t, api, Options{Cwd: filepath.Join(repo, "src"), AutoRegister: true}, nil, "2025-06-18")
+	res, _ := call(t, s, "ground", map[string]any{})
+	out := text(res)
+	if res["isError"] != true || !strings.Contains(out, "(403 Forbidden: non-admin registration is off") || !strings.Contains(out, "XMUSTARD_REGISTER_ROOTS") || strings.Contains(out, `"reason"`) {
+		t.Fatalf("refusal must carry the API's message: %s", out)
+	}
+}

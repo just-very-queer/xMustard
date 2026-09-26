@@ -51,6 +51,9 @@ export type WorkspaceRecord = {
   name: string
   root_path: string
   latest_scan_at?: string | null
+  // set when a non-admin token registered the root under XMUSTARD_REGISTER_ROOTS
+  register_root?: string
+  registered_by?: string
 }
 
 export type WorktreeStatus = {

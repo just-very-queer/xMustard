@@ -10,9 +10,10 @@ import (
 )
 
 // Global (not workspace-scoped) audit trail of authentication/authorization events:
-// token mint/revoke/rotate and denied requests. Distinct from the per-workspace
-// governance audit log (audit_log.go). Append-only with a bounded tail so a flood
-// of denied requests can't fill the disk — the oldest events roll off.
+// token mint/revoke/rotate, workspace registrations and denied requests. Distinct
+// from the per-workspace governance audit log (audit_log.go). Append-only with a
+// bounded tail so a flood of denied requests can't fill the disk — the oldest events
+// roll off, token administration last (trimAuthAudit).
 
 const authAuditMax = 5000
 
@@ -51,7 +52,7 @@ func clipField(s string) string {
 
 type AuthAuditEvent struct {
 	EventID    string `json:"event_id"`
-	Action     string `json:"action"` // mint | revoke | rotate | denied
+	Action     string `json:"action"` // mint | revoke | rotate | denied | register
 	Actor      string `json:"actor"`  // principal id performing the action (or "anonymous")
 	TokenID    string `json:"token_id,omitempty"`
 	Role       string `json:"role,omitempty"`
@@ -114,10 +115,36 @@ func RecordAuthAudit(dataDir string, ev AuthAuditEvent) {
 	ev.CreatedAt = now
 	ev.EventID = "authaudit_" + compactTimestamp(now) + "_" + padCount(int(auditSeq.Add(1)))
 	events = append(events, ev)
-	if len(events) > authAuditMax {
-		events = events[len(events)-authAuditMax:]
+	_ = writeJSON(authAuditPath(dataDir), trimAuthAudit(events, authAuditMax))
+}
+
+// tokenAdministration reports whether action changed which tokens exist: an admin's
+// mint, revoke or rotate.
+func tokenAdministration(action string) bool {
+	return action == "mint" || action == "revoke" || action == "rotate"
+}
+
+// trimAuthAudit keeps the newest max events, but rolls token administration off
+// last: other events (denied requests, and registrations, which a non-admin token
+// can cause) go first, oldest first. So neither a flood nor an agent's
+// registrations can evict the mint/revoke/rotate history an admin audits.
+func trimAuthAudit(events []AuthAuditEvent, max int) []AuthAuditEvent {
+	excess := len(events) - max
+	if excess <= 0 {
+		return events
 	}
-	_ = writeJSON(authAuditPath(dataDir), events)
+	kept := events[:0]
+	for _, ev := range events {
+		if excess > 0 && !tokenAdministration(ev.Action) {
+			excess--
+			continue
+		}
+		kept = append(kept, ev)
+	}
+	if len(kept) > max {
+		kept = kept[len(kept)-max:]
+	}
+	return kept
 }
 
 // ListAuthAudit returns auth events newest-first (capped by limit; 0 = all).
