@@ -268,10 +268,11 @@ type Actor struct {
 // provenance is the event record of a's provenance, nil when it has none.
 func (a Actor) provenance() map[string]any {
 	p := map[string]any{}
-	for k, v := range map[string]string{"call_id": a.CallID, "run_id": a.RunID} {
-		if v != "" {
-			p[k] = v
-		}
+	if a.CallID != "" {
+		p["call_id"] = a.CallID
+	}
+	if a.RunID != "" {
+		p["run_id"] = a.RunID
 	}
 	if len(a.Evidence) > 0 {
 		p["evidence"] = a.Evidence
