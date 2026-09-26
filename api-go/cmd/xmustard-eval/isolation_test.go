@@ -182,7 +182,7 @@ func TestHarnessGitIgnoresAgentConfig(t *testing.T) {
 	}
 	root := t.TempDir()
 	marks := t.TempDir()
-	w, err := newRunWorktree(scratch, sha, filepath.Join(root, "r"), filepath.Join(root, "w"), filepath.Join(root, "h"))
+	w, err := newRunWorktree(scratch, sha, filepath.Join(root, "r"), filepath.Join(root, "w"), "app", filepath.Join(root, "h"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -470,7 +470,7 @@ tasks:
     verify: {cmd: [sh, verify.sh]}
     oracle:
       files: [{src: oracles/check.sh, dest: oracle/check.sh}]
-      cmd: [sh, oracle/check.sh]
+      cmd: [sh, -c, "sleep 0.3; sh oracle/check.sh"]
     reference: {patch: references/fix.patch}
 `)
 	return path
@@ -507,7 +507,9 @@ func killSurvivors(pids []int) {
 // for the oracle. It must neither read nor rewrite its own run's oracle nor reach any
 // later run's worktree or oracle: the oracle judges a copy of the final tree that no
 // run's agent, setup or verify profile can reach, and every profile hides the whole
-// area of per-run directories except the run's own.
+// area of per-run directories except the run's own. While the oracle runs (it sleeps
+// first, so the survivor has time), its own worktree path is a link to that copy:
+// reading through the link must be denied, and the link must not be removable.
 func TestVerifyTimeSurvivorCannotReachTheOracle(t *testing.T) {
 	mode := availableContainment(t)
 	logDir := t.TempDir()
@@ -535,7 +537,7 @@ func TestVerifyTimeSurvivorCannotReachTheOracle(t *testing.T) {
 		}
 		killed += r.Isolation.EscapedKilled
 	}
-	for _, bad := range []string{"LEAK", "TAMPERED", "READ"} {
+	for _, bad := range []string{"LEAK", "TAMPERED", "READ", "REPLACED"} {
 		if strings.Contains(logs, bad) {
 			t.Fatalf("a verify-time survivor reached another run's files or an oracle under %s:\n%s", mode, logs)
 		}
@@ -666,10 +668,15 @@ func TestStageOracleRefusesSymlinks(t *testing.T) {
 
 // TestSandboxHidesRunDirectoriesCreatedLater: a profile made when a run starts must
 // hide the worktrees and judge copies of runs that start after it, and the oracle's
-// profile allows only its own judge copy.
+// profile allows only its own judge copy, which it reaches through the link at the run
+// directory's path. A process that started under the run's profile before the link
+// (a survivor, possible on macOS) can neither read through the link nor replace it.
 func TestSandboxHidesRunDirectoriesCreatedLater(t *testing.T) {
 	mode := availableContainment(t)
-	root := t.TempDir()
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	ex := &executor{cfg: &RunConfig{contain: mode, workRoot: root}}
 	if err := makeRunAreas(root); err != nil {
 		t.Fatal(err)
@@ -677,29 +684,32 @@ func TestSandboxHidesRunDirectoriesCreatedLater(t *testing.T) {
 	own := filepath.Join(root, "wt", "aaaa", "app")
 	mustWrite(t, filepath.Join(own, "value.txt"), "own\n")
 	sb := ex.sandboxFor("aaaa")
-	judge := filepath.Join(root, "judge", "aaaa", "app")
+	site := &judgeSite{run: filepath.Join(root, "wt", "aaaa"), name: "app",
+		held: filepath.Join(root, "judge", "aaaa", "held"), copy: filepath.Join(root, "judge", "aaaa", "copy")}
+	judged := filepath.Join(site.judgedWorktree(), "oracle", "check.sh")
 	later := filepath.Join(root, "wt", "bbbb", "app", "value.txt")
-	laterJudge := filepath.Join(root, "judge", "bbbb", "app", "oracle", "check.sh")
+	laterJudge := filepath.Join(root, "judge", "bbbb", "copy", "app", "oracle", "check.sh")
 	mustWrite(t, later, "later\n")
 	mustWrite(t, laterJudge, "secret\n")
-	mustWrite(t, filepath.Join(judge, "oracle", "check.sh"), "own secret\n")
-	readable := func(sb *sandbox, p string) bool {
-		bin, args, err := sb.wrap("cat", []string{p})
+	mustWrite(t, judged, "own secret\n")
+	run := func(sb *sandbox, argv ...string) bool {
+		bin, args, err := sb.wrap(argv[0], argv[1:])
 		if err != nil {
 			t.Fatal(err)
 		}
 		return exec.Command(bin, args...).Run() == nil
 	}
+	readable := func(sb *sandbox, p string) bool { return run(sb, "cat", p) }
 	if !readable(sb, filepath.Join(own, "value.txt")) {
 		t.Fatal("the run cannot read its own worktree")
 	}
-	for _, p := range []string{later, laterJudge, filepath.Join(judge, "oracle", "check.sh")} {
+	for _, p := range []string{later, laterJudge, judged} {
 		if readable(sb, p) {
 			t.Fatalf("the run's profile can read %s", p)
 		}
 	}
-	jb := ex.judgeSandbox(judge)
-	if !readable(jb, filepath.Join(judge, "oracle", "check.sh")) {
+	jb := ex.judgeSandbox(site)
+	if !readable(jb, judged) {
 		t.Fatal("the oracle cannot read its judge copy")
 	}
 	for _, p := range []string{later, laterJudge, filepath.Join(own, "value.txt")} {
@@ -707,12 +717,52 @@ func TestSandboxHidesRunDirectoriesCreatedLater(t *testing.T) {
 			t.Fatalf("the oracle's profile can read %s", p)
 		}
 	}
+	// commands under the run's profile made before the link, run while it stands
+	through := filepath.Join(own, "oracle", "check.sh")
+	type cmd struct {
+		bin  string
+		args []string
+	}
+	var early []cmd
+	for _, argv := range [][]string{{"cat", through}, {"rm", site.run}, {"sh", "-c", "rm -f " + site.run + "; mkdir " + site.run}} {
+		bin, args, err := sb.wrap(argv[0], argv[1:])
+		if err != nil {
+			t.Fatal(err)
+		}
+		early = append(early, cmd{bin, args})
+	}
+	// while the oracle runs, the run directory's path is a link to the copy
+	if err := os.Rename(site.run, site.held); err != nil {
+		t.Fatal(err)
+	}
+	if err := site.link(); err != nil {
+		t.Fatal(err)
+	}
+	defer site.restore()
+	if !readable(ex.judgeSandbox(site), through) {
+		t.Fatal("the oracle cannot reach its copy through the worktree's path")
+	}
+	if readable(sb, through) {
+		t.Fatal("a profile made now reads the judge copy through the link")
+	}
+	if mode == ContainSandbox { // under bwrap nothing outlives its sandbox
+		if exec.Command(early[0].bin, early[0].args...).Run() == nil {
+			t.Fatal("the run's profile reads the judge copy through the link at its own path")
+		}
+		for _, c := range early[1:] {
+			_ = exec.Command(c.bin, c.args...).Run()
+		}
+	}
+	if target, err := os.Readlink(site.run); err != nil || target != site.copy {
+		t.Fatalf("a process of the run replaced the link: %q %v", target, err)
+	}
 }
 
 // TestJudgeCopyKeepsTheSnapshot: the judge copy holds exactly the snapshotted tree
-// (a gitlink of a submodule that is not checked out included), keeps ignored files,
-// drops what changed after the snapshot, keeps links as links, and is not a git
-// repository.
+// (a gitlink of a submodule that is not checked out included), keeps ignored files
+// and what the agent left beside its worktree, drops what changed after the snapshot,
+// keeps links as links, and is not a git repository. While linked, the worktree's
+// own path reaches the copy; restore puts the worktree back.
 func TestJudgeCopyKeepsTheSnapshot(t *testing.T) {
 	src := t.TempDir()
 	mustWrite(t, filepath.Join(src, "value.txt"), "old\n")
@@ -729,7 +779,7 @@ func TestJudgeCopyKeepsTheSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 	root := t.TempDir()
-	w, err := newRunWorktree(src, sha, filepath.Join(root, "r"), filepath.Join(root, "w", "app"), filepath.Join(root, "h"))
+	w, err := newRunWorktree(src, sha, filepath.Join(root, "r"), filepath.Join(root, "w", "run1"), "app", filepath.Join(root, "h"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -746,15 +796,25 @@ func TestJudgeCopyKeepsTheSnapshot(t *testing.T) {
 	// changed after the snapshot (by verify, or by a process the run left behind)
 	mustWrite(t, filepath.Join(w.Dir, "value.txt"), "changed later\n")
 	mustWrite(t, filepath.Join(w.Dir, "extra.txt"), "later\n")
-	judge := filepath.Join(root, "judge", "app")
-	if err := w.JudgeCopy(final, judge); err != nil {
+	mustWrite(t, filepath.Join(w.runDir, "beside.txt"), "left beside\n")
+	site := newJudgeSite(w, filepath.Join(root, "judge", "run1"))
+	defer site.restore()
+	held, err := site.hold(w)
+	if err != nil {
 		t.Fatal(err)
 	}
+	if err := site.prepare(held, final); err != nil {
+		t.Fatal(err)
+	}
+	judge := site.judgedWorktree()
 	if b, _ := os.ReadFile(filepath.Join(judge, "value.txt")); string(b) != "new\n" {
 		t.Fatalf("judge value.txt %q", b)
 	}
 	if b, _ := os.ReadFile(filepath.Join(judge, "deps/lib.txt")); string(b) != "installed\n" {
 		t.Fatalf("ignored file not carried over: %q", b)
+	}
+	if b, _ := os.ReadFile(filepath.Join(site.copy, "beside.txt")); string(b) != "left beside\n" {
+		t.Fatalf("file beside the worktree not carried over: %q", b)
 	}
 	if fi, err := os.Lstat(filepath.Join(judge, "link")); err != nil || fi.Mode()&os.ModeSymlink == 0 {
 		t.Fatalf("link not kept as a link: %v %v", fi, err)
@@ -764,15 +824,51 @@ func TestJudgeCopyKeepsTheSnapshot(t *testing.T) {
 			t.Fatalf("%s in the judge copy: %v", gone, err)
 		}
 	}
-	// a worktree replaced by a link is not copied through
-	moved := filepath.Join(root, "moved")
-	if err := os.Rename(w.Dir, moved); err != nil {
+	if err := site.link(); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Symlink(moved, w.Dir); err != nil {
+	if b, _ := os.ReadFile(filepath.Join(w.Dir, "value.txt")); string(b) != "new\n" {
+		t.Fatalf("the worktree's path does not reach the copy: %q", b)
+	}
+	if err := site.restore(); err != nil {
 		t.Fatal(err)
 	}
-	if err := w.JudgeCopy(final, filepath.Join(root, "judge2", "app")); err == nil {
-		t.Fatal("copied a worktree that had been replaced by a link")
+	if b, _ := os.ReadFile(filepath.Join(w.Dir, "value.txt")); string(b) != "changed later\n" {
+		t.Fatalf("restore did not put the worktree back: %q", b)
+	}
+	// a worktree, or a run directory, replaced by a link is held, never read
+	outside := t.TempDir()
+	mustWrite(t, filepath.Join(outside, "app", "secret.txt"), "outside\n")
+	for _, replace := range []string{w.Dir, w.runDir} {
+		moved := filepath.Join(t.TempDir(), "moved")
+		if err := os.Rename(replace, moved); err != nil {
+			t.Fatal(err)
+		}
+		target := outside
+		if replace == w.Dir {
+			target = filepath.Join(outside, "app")
+		}
+		if err := os.Symlink(target, replace); err != nil {
+			t.Fatal(err)
+		}
+		site := newJudgeSite(w, filepath.Join(root, "judge2", "run1"))
+		if _, err := site.hold(w); err == nil || !strings.Contains(err.Error(), "worktree_replaced") {
+			t.Fatalf("held a replaced %s: %v", replace, err)
+		}
+		if err := site.restore(); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Remove(replace); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Rename(moved, replace); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w.Remove(); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(outside, "app", "secret.txt")); string(b) != "outside\n" {
+		t.Fatal("the harness changed a directory a link pointed to")
 	}
 }

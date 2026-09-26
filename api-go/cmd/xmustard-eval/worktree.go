@@ -3,15 +3,12 @@ package main
 import (
 	"errors"
 	"fmt"
-	"io"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 )
 
 // Worktree is one fresh, detached checkout of a task's starting commit. Every run gets
@@ -31,13 +28,18 @@ type Worktree struct {
 	Dir     string
 	SHA     string
 	ownRepo bool   // Repo is a per-run repository, removed with the worktree
+	runDir  string // the per-run directory holding Dir (per-run repositories only)
 	hdir    string // harness-owned git directory (hidden from the agent)
 	hindex  string // harness-owned index inside hdir
 }
 
 // newRunWorktree creates runRepo borrowing scratch's objects, a detached worktree of
-// it at sha in dir, and the harness's own git directory for it in harnessDir.
-func newRunWorktree(scratch, sha, runRepo, dir, harnessDir string) (*Worktree, error) {
+// it at sha in runDir/name, and the harness's own git directory for it in harnessDir.
+// runDir is the run's own directory. Only the harness may write its parent, and the
+// agent may replace runDir itself (with a link, say), so it is removed as a whole and
+// never through a path below it.
+func newRunWorktree(scratch, sha, runRepo, runDir, name, harnessDir string) (*Worktree, error) {
+	dir := filepath.Join(runDir, name)
 	if err := os.MkdirAll(filepath.Dir(runRepo), 0o755); err != nil {
 		return nil, err
 	}
@@ -47,6 +49,7 @@ func newRunWorktree(scratch, sha, runRepo, dir, harnessDir string) (*Worktree, e
 	fail := func(err error) (*Worktree, error) {
 		_ = os.RemoveAll(runRepo)
 		_ = os.RemoveAll(harnessDir)
+		_ = os.RemoveAll(runDir)
 		return nil, err
 	}
 	objects, err := filepath.Abs(filepath.Join(scratch, ".git", "objects"))
@@ -67,7 +70,7 @@ func newRunWorktree(scratch, sha, runRepo, dir, harnessDir string) (*Worktree, e
 	if err != nil {
 		return fail(err)
 	}
-	w.ownRepo = true
+	w.ownRepo, w.runDir = true, runDir
 	if err := w.initHarnessGit(objects, harnessDir); err != nil {
 		_ = w.Remove()
 		return fail(err)
@@ -98,6 +101,12 @@ func (w *Worktree) initHarnessGit(objects, harnessDir string) error {
 	}
 	w.hdir, w.hindex = harnessDir, filepath.Join(harnessDir, "index")
 	return os.WriteFile(w.hindex, b, 0o600)
+}
+
+// at is a view of w's worktree at dir (moved there by the harness), for the
+// harness's git only.
+func (w *Worktree) at(dir string) *Worktree {
+	return &Worktree{Repo: w.Repo, Dir: dir, SHA: w.SHA, hdir: w.hdir, hindex: w.hindex}
 }
 
 // hgit runs git on the worktree through the harness-owned git directory and index.
@@ -208,11 +217,14 @@ func (w *Worktree) Detached() (bool, error) {
 
 // Remove deletes the worktree directory and its administrative entry. It is safe to
 // call more than once and after a partial creation. A per-run repository is deleted
-// outright: the agent could have configured it, so git is not run through it.
+// outright: the agent could have configured it, so git is not run through it. Its
+// worktree goes with the whole run directory: removing a path below it would follow
+// a link the agent put in its place (os.RemoveAll follows every component but the
+// last), and delete whatever the link names.
 func (w *Worktree) Remove() error {
 	if w.ownRepo {
 		var errs []error
-		for _, p := range []string{w.Dir, w.Repo, w.hdir} {
+		for _, p := range []string{w.runDir, w.Repo, w.hdir} {
 			if p != "" {
 				errs = append(errs, os.RemoveAll(p))
 			}
@@ -234,16 +246,16 @@ func (w *Worktree) Remove() error {
 // gone reports whether the worktree and (for a per-run repository) its repository no
 // longer exist, and git no longer lists the worktree.
 func (w *Worktree) gone() bool {
-	if _, err := os.Stat(w.Dir); !os.IsNotExist(err) {
-		return false
-	}
 	if w.ownRepo {
-		for _, p := range []string{w.Repo, w.hdir} {
-			if _, err := os.Stat(p); p != "" && !os.IsNotExist(err) {
+		for _, p := range []string{w.runDir, w.Repo, w.hdir} {
+			if _, err := os.Lstat(p); p != "" && !os.IsNotExist(err) {
 				return false
 			}
 		}
 		return true
+	}
+	if _, err := os.Stat(w.Dir); !os.IsNotExist(err) {
+		return false
 	}
 	registered, err := registeredWorktree(w.Repo, w.Dir)
 	return err == nil && !registered
@@ -303,144 +315,6 @@ func (w *Worktree) RestoreTree(tree string) error {
 		return fmt.Errorf("worktree is %s after restoring %s", got, tree)
 	}
 	return nil
-}
-
-// JudgeCopy makes dst, the tree the oracle judges. It copies the worktree, so ignored
-// files such as installed dependencies come along, then resets every non-ignored file
-// to tree through the harness's git directory, so dst holds exactly the agent's final
-// snapshot whatever happened to the worktree since. dst must lie where no process of
-// the run can reach it (the run profiles hide it), so nothing the run left behind can
-// change the judged tree or read the oracle staged into it. dst is not a git
-// repository: the copied .git file, which names the agent-writable run repository,
-// is dropped.
-func (w *Worktree) JudgeCopy(tree, dst string) error {
-	if w.hdir == "" {
-		return errors.New("worktree has no harness git directory")
-	}
-	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
-		return err
-	}
-	if err := copyWorktree(w.Dir, dst); err != nil {
-		return fmt.Errorf("copy the worktree: %w", err)
-	}
-	if err := os.RemoveAll(filepath.Join(dst, ".git")); err != nil {
-		return err
-	}
-	j := &Worktree{Dir: dst, hdir: w.hdir, hindex: filepath.Join(w.hdir, "judge-index")}
-	defer os.Remove(j.hindex)
-	// start the copy's index from tree, so entries a fresh `add -A` would not see
-	// (gitlinks of submodules that are not checked out) stay as snapshotted
-	if _, err := j.hgit(nil, "read-tree", tree); err != nil {
-		return err
-	}
-	return j.RestoreTree(tree)
-}
-
-// copyWorktree copies src to dst (which must not exist) without following symbolic
-// links: links are copied as links, and sockets, pipes and devices are left out. On
-// macOS the directory is cloned in one clonefile call (copy-on-write on APFS);
-// elsewhere, or when cloning fails, files are copied one by one (on Linux io.Copy
-// between files uses copy_file_range, which shares extents where the filesystem can).
-// Directories in the copy are owner-writable, so the reset to the snapshot can
-// rewrite them.
-func copyWorktree(src, dst string) error {
-	// the agent can replace its worktree with a link; the harness must not copy (and
-	// then write) through one
-	if fi, err := os.Lstat(src); err != nil || !fi.IsDir() {
-		return fmt.Errorf("%s is no longer a directory: %v", src, err)
-	}
-	err := cloneDir(src, dst)
-	if err == nil {
-		err = tidyCopy(dst)
-	} else {
-		_ = os.RemoveAll(dst)
-		err = walkCopy(src, dst)
-	}
-	if err != nil {
-		return err
-	}
-	if fi, err := os.Lstat(dst); err != nil || !fi.IsDir() {
-		return fmt.Errorf("the copy of %s is not a directory: %v", src, err)
-	}
-	return nil
-}
-
-func walkCopy(src, dst string) error {
-	return filepath.WalkDir(src, func(p string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		rel, err := filepath.Rel(src, p)
-		if err != nil {
-			return err
-		}
-		target := filepath.Join(dst, rel)
-		switch typ := d.Type(); {
-		case typ.IsDir():
-			info, err := d.Info()
-			if err != nil {
-				return err
-			}
-			return os.Mkdir(target, info.Mode().Perm()|0o700)
-		case typ&fs.ModeSymlink != 0:
-			link, err := os.Readlink(p)
-			if err != nil {
-				return err
-			}
-			return os.Symlink(link, target)
-		case typ.IsRegular():
-			return copyRegular(p, target)
-		}
-		return nil
-	})
-}
-
-// copyRegular copies one regular file with its permission bits. The source is opened
-// without following a link and without blocking, and anything that turns out not to
-// be a regular file is skipped.
-func copyRegular(src, dst string) error {
-	in, err := os.OpenFile(src, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-	info, err := in.Stat()
-	if err != nil || !info.Mode().IsRegular() {
-		return err
-	}
-	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, info.Mode().Perm())
-	if err != nil {
-		return err
-	}
-	if _, err := io.Copy(out, in); err != nil {
-		out.Close()
-		return err
-	}
-	return out.Close()
-}
-
-// tidyCopy removes sockets, pipes and devices from a cloned tree and makes its
-// directories owner-writable.
-func tidyCopy(root string) error {
-	return filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		switch typ := d.Type(); {
-		case typ.IsDir():
-			info, err := d.Info()
-			if err != nil {
-				return err
-			}
-			if info.Mode().Perm()&0o700 != 0o700 {
-				return os.Chmod(p, info.Mode().Perm()|0o700)
-			}
-		case typ.IsRegular(), typ&fs.ModeSymlink != 0:
-		default:
-			return os.Remove(p)
-		}
-		return nil
-	})
 }
 
 // DiffChurn is the size of an agent's change between two snapshots.

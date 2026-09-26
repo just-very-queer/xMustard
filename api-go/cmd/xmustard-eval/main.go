@@ -9,7 +9,7 @@
 // outside the measured xMustard process tree.
 //
 //	xmustard-eval run      --corpus eval/tasks/seed.yaml --out DIR [--config run.yaml] [flags]
-//	xmustard-eval validate --corpus eval/tasks/seed.yaml [--oracles]
+//	xmustard-eval validate --corpus eval/tasks/seed.yaml [--oracles] [--out DIR]
 //	xmustard-eval report   --out DIR
 //
 // A dry run needs no credentials: --driver fake:claude (or fake:codex, fake:pi).
@@ -75,7 +75,8 @@ func usage(w io.Writer) {
                     [--model M] [--arms a,b] [--repeats N] [--seed S] [--tasks id,id]
                     [--stack real|stub|none] [--api-bin P] [--mcp-bin P] [--core-bin P]
                     [--containment auto|sandbox-exec|bwrap|none] [--fake-fail-arms a,b] [--keep-worktrees]
-  xmustard-eval validate --corpus FILE [--oracles] [--tasks id,id]
+  xmustard-eval validate --corpus FILE [--oracles] [--tasks id,id] [--out DIR]
+                         [--containment auto|sandbox-exec|bwrap|none]
   xmustard-eval report --out DIR
 `)
 }
@@ -235,12 +236,14 @@ func loadYAMLStrict(path string, v any) error {
 
 // OracleValidation is one task's `validate --oracles` result.
 type OracleValidation struct {
-	TaskID            string `json:"task_id"`
-	OracleFailsBase   bool   `json:"oracle_fails_on_baseline"`
-	OraclePassesRef   bool   `json:"oracle_passes_on_reference"`
-	VerifyPassesRef   *bool  `json:"visible_verify_passes_on_reference,omitempty"`
-	Valid             bool   `json:"valid"`
-	Error             string `json:"error,omitempty"`
+	TaskID          string   `json:"task_id"`
+	OracleFailsBase bool     `json:"oracle_fails_on_baseline"`
+	OraclePassesRef bool     `json:"oracle_passes_on_reference"`
+	VerifyPassesRef *bool    `json:"visible_verify_passes_on_reference,omitempty"`
+	Valid           bool     `json:"valid"`
+	Error           string   `json:"error,omitempty"`
+	Warnings        []string `json:"warnings,omitempty"`
+	// log paths, with --out only
 	BaselineOracleLog string `json:"baseline_oracle_log,omitempty"`
 	RefOracleLog      string `json:"reference_oracle_log,omitempty"`
 }
@@ -251,6 +254,8 @@ func cmdValidate(args []string, stdout, stderr io.Writer) int {
 	corpusPath := fs.String("corpus", "", "task corpus YAML")
 	oracles := fs.Bool("oracles", false, "also check every oracle fails on the untouched task and passes on its reference patch")
 	tasks := fs.String("tasks", "", "comma-separated task ids")
+	out := fs.String("out", "", "keep the setup, verify and oracle logs in this directory (they hold hidden oracle output; without it they are deleted)")
+	containment := fs.String("containment", "", "auto | sandbox-exec | bwrap | none, as for run")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -269,7 +274,7 @@ func cmdValidate(args []string, stdout, stderr io.Writer) int {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	results, err := validateOracles(ctx, corpus, splitList(*tasks))
+	results, err := validateOracles(ctx, corpus, splitList(*tasks), *containment, *out)
 	enc := json.NewEncoder(stdout)
 	enc.SetIndent("", "  ")
 	_ = enc.Encode(results)
@@ -279,6 +284,9 @@ func cmdValidate(args []string, stdout, stderr io.Writer) int {
 	}
 	for _, r := range results {
 		if !r.Valid {
+			if *out == "" {
+				fmt.Fprintln(stderr, "logs were not kept; pass --out DIR to keep them")
+			}
 			return 1
 		}
 	}
@@ -286,22 +294,46 @@ func cmdValidate(args []string, stdout, stderr io.Writer) int {
 }
 
 // validateOracles checks WS-63's corpus rule: each oracle fails on the untouched
-// starting state and passes once the reference patch is applied.
-func validateOracles(ctx context.Context, corpus *Corpus, only []string) ([]OracleValidation, error) {
+// starting state and passes once the reference patch is applied. Every command runs
+// as in a run: setup and verify under a run's profile, the oracle under the judge
+// profile, in a copy reached through a link at the worktree's own path. Logs hold
+// hidden oracle output, so they are kept only in logDir, when given.
+func validateOracles(ctx context.Context, corpus *Corpus, only []string, containment, logDir string) ([]OracleValidation, error) {
+	mode, err := resolveContainment(containment)
+	if err != nil {
+		return nil, err
+	}
+	hidden := corpus.hiddenPaths()
+	hidden = append(hidden, repoPaths(hidden)...)
+	if logDir != "" {
+		if logDir, err = filepath.Abs(logDir); err != nil {
+			return nil, err
+		}
+		if err := os.MkdirAll(logDir, 0o755); err != nil {
+			return nil, err
+		}
+		hidden = append(hidden, logDir)
+	}
 	work, err := os.MkdirTemp("", "xmustard-eval-validate-")
 	if err != nil {
 		return nil, err
 	}
-	// Logs outlive the scratch worktrees so a failing oracle can be inspected.
-	logs, err := os.MkdirTemp("", "xmustard-eval-validate-logs-")
-	if err != nil {
-		return nil, err
+	if real, err := filepath.EvalSymlinks(work); err == nil {
+		work = real
 	}
 	reg := newWorktreeRegistry()
 	defer func() {
 		_ = reg.removeAll()
 		_ = os.RemoveAll(work)
 	}()
+	if err := makeRunAreas(work); err != nil {
+		return nil, err
+	}
+	logRoot := logDir
+	if logRoot == "" {
+		logRoot = filepath.Join(work, "harness", "logs")
+	}
+	ex := &executor{cfg: &RunConfig{contain: mode, workRoot: work, hidden: hidden}, corpus: corpus}
 	var out []OracleValidation
 	for i := range corpus.Tasks {
 		t := &corpus.Tasks[i]
@@ -311,12 +343,13 @@ func validateOracles(ctx context.Context, corpus *Corpus, only []string) ([]Orac
 		if ctx.Err() != nil {
 			return out, ctx.Err()
 		}
-		out = append(out, validateOneOracle(ctx, corpus, t, work, logs, reg))
+		out = append(out, ex.validateOneOracle(ctx, t, logRoot, logDir != "", reg))
 	}
 	return out, nil
 }
 
-func validateOneOracle(ctx context.Context, corpus *Corpus, t *Task, work, logRoot string, reg *worktreeRegistry) (v OracleValidation) {
+func (ex *executor) validateOneOracle(ctx context.Context, t *Task, logRoot string, keepLogs bool, reg *worktreeRegistry) (v OracleValidation) {
+	corpus, work := ex.corpus, ex.cfg.workRoot
 	v.TaskID = t.ID
 	fail := func(err error) OracleValidation {
 		v.Error = err.Error()
@@ -329,7 +362,8 @@ func validateOneOracle(ctx context.Context, corpus *Corpus, t *Task, work, logRo
 	if err != nil {
 		return fail(err)
 	}
-	wt, err := newRunWorktree(repo, sha, filepath.Join(work, "runrepos", t.ID), filepath.Join(work, "wt", t.ID), filepath.Join(work, "harness", t.ID))
+	wt, err := newRunWorktree(repo, sha, filepath.Join(work, "runrepos", t.ID), filepath.Join(work, "wt", t.ID),
+		repoDirName(corpus, t), filepath.Join(work, "harness", t.ID))
 	if err != nil {
 		return fail(err)
 	}
@@ -339,13 +373,16 @@ func validateOneOracle(ctx context.Context, corpus *Corpus, t *Task, work, logRo
 	if err := os.MkdirAll(logs, 0o755); err != nil {
 		return fail(err)
 	}
-	// validate runs only the corpus's own commands and the reference patch (no agent
-	// code), so nothing here is contained
-	step := func(spec CommandSpec, logPath string) CheckResult {
-		return check{argv: spec.Cmd, dir: wt.Dir, env: spec.Env, timeout: secondsOr(spec.TimeoutSec, 600), logPath: logPath, logRel: logPath}.run(ctx)
+	cmd := func(spec CommandSpec, name string, sb *sandbox) check {
+		c := check{argv: spec.Cmd, dir: wt.Dir, env: spec.Env, sb: sb, timeout: secondsOr(spec.TimeoutSec, 600), logPath: filepath.Join(logs, name)}
+		if keepLogs {
+			c.logRel = c.logPath
+		}
+		return c
 	}
+	sb := ex.sandboxFor(t.ID)
 	for i, s := range t.Setup {
-		if r := step(s, filepath.Join(logs, fmt.Sprintf("setup-%d.log", i))); !r.Passed {
+		if r := cmd(s, fmt.Sprintf("setup-%d.log", i), sb).run(ctx); !r.Passed {
 			return fail(fmt.Errorf("setup step %d failed (exit %d)", i, r.ExitCode))
 		}
 	}
@@ -355,29 +392,36 @@ func validateOneOracle(ctx context.Context, corpus *Corpus, t *Task, work, logRo
 	if err := scanForOracleLeaks(corpus, t, wt.Dir); err != nil {
 		return fail(err)
 	}
-	// the oracle judges a copy of the tree, as in a run
-	runOracle := func(name string) (CheckResult, error) {
-		tree, err := wt.SnapshotTree()
-		if err != nil {
-			return CheckResult{}, err
+	runOracle := func(which string) (CheckResult, error) {
+		judgeRun := filepath.Join(work, "judge", t.ID)
+		site := newJudgeSite(wt, judgeRun)
+		defer func() {
+			_ = site.restore()
+			_ = os.RemoveAll(judgeRun)
+		}()
+		var held *Worktree
+		var tree string
+		for _, step := range []func() error{
+			func() (err error) { held, err = site.hold(wt); return err },
+			func() (err error) { tree, err = held.SnapshotTree(); return err },
+			func() error { return site.prepare(held, tree) },
+			func() error { return stageOracle(corpus, t, site.judgedWorktree()) },
+			site.link,
+		} {
+			if err := step(); err != nil {
+				return CheckResult{}, err
+			}
 		}
-		judgeRun := filepath.Join(work, "judge", t.ID, strings.TrimSuffix(name, ".log"))
-		defer os.RemoveAll(judgeRun)
-		judge := filepath.Join(judgeRun, repoDirName(corpus, t))
-		if err := wt.JudgeCopy(tree, judge); err != nil {
-			return CheckResult{}, err
-		}
-		if err := stageOracle(corpus, t, judge); err != nil {
-			return CheckResult{}, err
-		}
-		r := check{argv: t.Oracle.Cmd, dir: judge, env: t.Oracle.Env, timeout: secondsOr(t.Oracle.TimeoutSec, 600),
-			logPath: filepath.Join(logs, name), logRel: filepath.Join(logs, name)}.run(ctx)
+		r := cmd(CommandSpec{Cmd: t.Oracle.Cmd, Env: t.Oracle.Env, TimeoutSec: t.Oracle.TimeoutSec}, "oracle-"+which+".log", ex.judgeSandbox(site)).run(ctx)
 		if r.Error != "" {
 			return r, errors.New("oracle did not run: " + r.Error)
 		}
+		if w := unrunnableOracle(r.ExitCode); w != "" {
+			v.Warnings = append(v.Warnings, which+": "+w)
+		}
 		return r, nil
 	}
-	base, err := runOracle("oracle-baseline.log")
+	base, err := runOracle("baseline")
 	if err != nil {
 		return fail(err)
 	}
@@ -390,10 +434,10 @@ func validateOneOracle(ctx context.Context, corpus *Corpus, t *Task, work, logRo
 		return fail(err)
 	}
 	if t.Verify != nil {
-		r := step(*t.Verify, filepath.Join(logs, "verify-reference.log"))
+		r := cmd(*t.Verify, "verify-reference.log", sb).run(ctx)
 		v.VerifyPassesRef = &r.Passed
 	}
-	ref, err := runOracle("oracle-reference.log")
+	ref, err := runOracle("reference")
 	if err != nil {
 		return fail(err)
 	}

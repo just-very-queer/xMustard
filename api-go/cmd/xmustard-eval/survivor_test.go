@@ -25,7 +25,9 @@ const survivorArg = "xmeval-test-survivor"
 // so the child is reparented before any process sampler can see it). watch logs, for
 // each path it manages to read, "LEAK <path>" (the file holds SECRET; it then tries
 // to overwrite it with a passing oracle and logs "TAMPERED <path>") or "READ <path>"
-// (another run's file), until LOGDIR/stop exists or 30 s pass.
+// (another run's file), and "REPLACED <path>" if it could remove the link that stands
+// at its run directory's path while the oracle runs, until LOGDIR/stop exists or 30 s
+// pass.
 func runSurvivor(args []string) int {
 	if len(args) < 1 {
 		return 2
@@ -64,13 +66,13 @@ func runSurvivor(args []string) int {
 		}
 		defer logf.Close()
 		_, _ = logf.WriteString("started " + own + "\n")
-		repo := filepath.Base(own)
+		repo, runDir := filepath.Base(own), filepath.Dir(own)
 		oracles := []string{filepath.Join(own, "oracle", "check.sh")}
 		var others []string
 		for _, id := range runIDs {
 			oracles = append(oracles,
 				filepath.Join(workRoot, "wt", id, repo, "oracle", "check.sh"),
-				filepath.Join(workRoot, "judge", id, repo, "oracle", "check.sh"))
+				filepath.Join(workRoot, "judge", id, "copy", repo, "oracle", "check.sh"))
 			if filepath.Join(workRoot, "wt", id, repo) != own {
 				others = append(others, filepath.Join(workRoot, "wt", id, repo, "value.txt"))
 			}
@@ -94,6 +96,12 @@ func runSurvivor(args []string) int {
 				if _, err := os.ReadFile(p); err == nil && !seen[p] {
 					seen[p] = true
 					_, _ = logf.WriteString("READ " + p + "\n")
+				}
+			}
+			if fi, err := os.Lstat(runDir); err == nil && fi.Mode()&os.ModeSymlink != 0 && !seen[runDir] {
+				if os.Remove(runDir) == nil {
+					seen[runDir] = true
+					_, _ = logf.WriteString("REPLACED " + runDir + "\n")
 				}
 			}
 			time.Sleep(5 * time.Millisecond)

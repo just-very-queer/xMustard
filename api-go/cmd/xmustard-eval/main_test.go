@@ -427,7 +427,7 @@ func TestRunsDoNotShareRepositoryState(t *testing.T) {
 		t.Fatal(err)
 	}
 	root := t.TempDir()
-	w1, err := newRunWorktree(scratch, sha, filepath.Join(root, "r1"), filepath.Join(root, "w1"), filepath.Join(root, "h1"))
+	w1, err := newRunWorktree(scratch, sha, filepath.Join(root, "r1"), filepath.Join(root, "w1"), "app", filepath.Join(root, "h1"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -441,7 +441,7 @@ func TestRunsDoNotShareRepositoryState(t *testing.T) {
 	if err := w1.Remove(); err != nil || !w1.gone() {
 		t.Fatalf("remove: %v", err)
 	}
-	w2, err := newRunWorktree(scratch, sha, filepath.Join(root, "r2"), filepath.Join(root, "w2"), filepath.Join(root, "h2"))
+	w2, err := newRunWorktree(scratch, sha, filepath.Join(root, "r2"), filepath.Join(root, "w2"), "app", filepath.Join(root, "h2"))
 	if err != nil {
 		t.Fatal(err)
 	}

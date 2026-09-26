@@ -22,13 +22,17 @@ import (
 //
 //  1. Oracle files never enter the worktree. After the agent's process group is dead,
 //     every process of the run the sweep can find has been killed, and the visible
-//     verify step has run, the harness copies the worktree into a judge directory
-//     that every run's agent, setup and verify profile hides, resets the copy's
-//     non-ignored files to the agent's final snapshot, and stages the oracle there.
-//     The oracle runs in that copy under its own profile, which hides every run's
-//     worktree and allows only the copy. A process the run left behind that no sweep
-//     found keeps the profile it started under, so it can reach neither the copy nor
-//     any later run's directories.
+//     verify step has run, the harness moves the run directory where no run's profile
+//     reaches, copies it into a judge directory that every run's agent, setup and
+//     verify profile hides (never following a link), resets the copy's worktree to the
+//     agent's final snapshot, and stages the oracle there (see judgeSite). The oracle
+//     runs under its own profile, which hides every run's worktree and allows only the
+//     copy, at the worktree's own path: that path is a link to the copy while the
+//     oracle runs, so absolute paths setup recorded resolve into the copy. A process
+//     the run left behind that no sweep found keeps the profile it started under,
+//     which allows the link's path but not the copy it resolves to, so it can reach
+//     neither the copy nor any later run's directories. That profile pins the run
+//     directory's own entry, so it cannot replace the link either.
 //  2. Oracle files are written from the bytes read when the corpus was loaded, never
 //     re-read from disk, and the on-disk files are checked against their load-time
 //     digests before staging. Staging runs with the operator's rights, so it goes
@@ -137,6 +141,19 @@ func secondsOr(n, def int) time.Duration {
 		return time.Duration(n) * time.Second
 	}
 	return time.Duration(def) * time.Second
+}
+
+// unrunnableOracle explains an oracle exit status that usually means a command did not
+// run at all, rather than that a check failed: 126 (found but not executable, or
+// denied by containment) and 127 (not found). "" for any other status.
+func unrunnableOracle(code int) string {
+	switch code {
+	case 126:
+		return "the oracle exited 126: a command it ran could not be executed or was denied (is what setup installed reachable from the judged tree?)"
+	case 127:
+		return "the oracle exited 127: a command it ran was not found"
+	}
+	return ""
 }
 
 // scanForOracleLeaks fails when any oracle file's bytes already exist somewhere in
@@ -309,6 +326,32 @@ func realPaths(paths []string) []string {
 	return slices.Compact(out)
 }
 
+// parentReal resolves every component of each path but the last, which may be a link
+// or not exist yet.
+func parentReal(paths []string) []string {
+	var out []string
+	for _, p := range paths {
+		if parent, err := filepath.EvalSymlinks(filepath.Dir(p)); err == nil {
+			out = append(out, filepath.Join(parent, filepath.Base(p)))
+		}
+	}
+	return out
+}
+
+// ownPaths is parentReal without the paths that do not exist or are links: allowing a
+// link would allow wherever it points (while the oracle runs, a run directory's path
+// leads to the judge copy).
+func ownPaths(paths []string) []string {
+	var out []string
+	for _, p := range parentReal(paths) {
+		if fi, err := os.Lstat(p); err == nil && fi.Mode()&fs.ModeSymlink == 0 {
+			out = append(out, p)
+		}
+	}
+	slices.Sort(out)
+	return slices.Compact(out)
+}
+
 // realPathOrParent resolves p, or (when p does not exist yet) its parent, so a rule
 // can also cover a file the process might create.
 func realPathOrParent(p string) (string, bool) {
@@ -329,6 +372,13 @@ type sandbox struct {
 	hidden   []string // neither readable nor writable
 	readOnly []string // readable, not writable (may not exist yet)
 	allow    []string // readable and writable although inside a hidden path
+	// pinned are allowed directories whose own entry the process may not create,
+	// remove, rename or change (sandbox-exec; under bwrap every allowed directory is a
+	// mount point, which cannot be replaced either)
+	pinned []string
+	// links inside a hidden path that the process may resolve, each to a directory in
+	// allow: the judge site's link at the run directory's path
+	links []string
 }
 
 // with returns a copy that also allows the given paths.
@@ -346,7 +396,7 @@ func (s *sandbox) wrap(bin string, args []string) (string, []string, error) {
 	if s == nil || s.mode == ContainNone || s.mode == "" {
 		return bin, args, nil
 	}
-	hidden, allow := realPaths(s.hidden), realPaths(s.allow)
+	hidden, allow := realPaths(s.hidden), ownPaths(s.allow)
 	switch s.mode {
 	case ContainSandbox:
 		var rules strings.Builder
@@ -375,13 +425,24 @@ func (s *sandbox) wrap(bin string, args []string) (string, []string, error) {
 		}
 		// Later rules win: re-allow the process's own directories inside a hidden
 		// path, plus metadata of their hidden ancestors so path resolution works.
-		for _, p := range allow {
-			fmt.Fprintf(&rules, "(allow file-read* file-write* (subpath %s))", sbplString(p))
+		hiddenAncestors := func(p string) {
 			for a := filepath.Dir(p); a != filepath.Dir(a); a = filepath.Dir(a) {
 				if slices.ContainsFunc(hidden, func(h string) bool { return a == h || isWithin(a, h) }) {
 					fmt.Fprintf(&rules, "(allow file-read-metadata (literal %s))", sbplString(a))
 				}
 			}
+		}
+		for _, p := range allow {
+			fmt.Fprintf(&rules, "(allow file-read* file-write* (subpath %s))", sbplString(p))
+			hiddenAncestors(p)
+		}
+		for _, p := range parentReal(s.pinned) {
+			fmt.Fprintf(&rules, "(deny file-write* (literal %s))", sbplString(p))
+		}
+		// A link itself only: what it resolves to is matched by its own path.
+		for _, l := range parentReal(s.links) {
+			fmt.Fprintf(&rules, "(allow file-read* (literal %s))", sbplString(l))
+			hiddenAncestors(l)
 		}
 		return "sandbox-exec", append([]string{"-p", rules.String(), bin}, args...), nil
 	case ContainBwrap:
@@ -404,6 +465,17 @@ func (s *sandbox) wrap(bin string, args []string) (string, []string, error) {
 		}
 		for _, p := range allow {
 			out = append(out, "--bind", p, p)
+		}
+		// the hidden area's tmpfs covers the link on disk; recreate it inside
+		for _, l := range parentReal(s.links) {
+			if fi, err := os.Lstat(l); err != nil || fi.Mode()&fs.ModeSymlink == 0 {
+				continue // not a link (yet): nothing to recreate
+			}
+			target, err := filepath.EvalSymlinks(l)
+			if err != nil {
+				return bin, args, fmt.Errorf("resolve %s: %w", l, err)
+			}
+			out = append(out, "--symlink", target, l)
 		}
 		out = append(out, "--", bin)
 		return "bwrap", append(out, args...), nil

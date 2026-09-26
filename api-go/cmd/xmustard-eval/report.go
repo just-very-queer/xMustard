@@ -282,6 +282,11 @@ func buildReport(m *Manifest, recs []RunRecord) *Report {
 		if iso := rec.Isolation; iso != nil && iso.VerifyChangedTree {
 			r.Warnings = append(r.Warnings, fmt.Sprintf("%s/%s: the visible verify step changed the tree; the oracle judged the agent's final tree after a restore", pairID(rec), rec.Arm))
 		}
+		if rec.Oracle != nil {
+			if w := unrunnableOracle(rec.Oracle.ExitCode); w != "" {
+				r.Warnings = append(r.Warnings, fmt.Sprintf("%s/%s: %s; the run counts as unresolved", pairID(rec), rec.Arm, w))
+			}
+		}
 		if iso := rec.Isolation; iso != nil && iso.EscapedKilled > 0 {
 			r.Warnings = append(r.Warnings, fmt.Sprintf("%s/%s: %d process(es) outlived the run's process groups and were killed before judging", pairID(rec), rec.Arm, iso.EscapedKilled))
 		}

@@ -95,15 +95,17 @@ func sweepRunProcesses(marker string, dirs []string, tracked map[int]int64) (kil
 
 // findRunProcesses lists this user's processes (other than the executor) that are
 // tracked and still the same process, carry marker in their environment, or have a
-// working directory at or below one of dirs.
+// working directory at or below one of dirs. Only each dir's parent is resolved: the
+// agent may have replaced a run directory with a link (to "/", say), and following it
+// would kill every process under the link's target.
 func findRunProcesses(marker string, dirs []string, tracked map[int]int64) ([]int, error) {
 	var realDirs []string
 	for _, d := range dirs {
 		if d == "" {
 			continue
 		}
-		if r, err := filepath.EvalSymlinks(d); err == nil {
-			d = r
+		if r, err := filepath.EvalSymlinks(filepath.Dir(d)); err == nil {
+			d = filepath.Join(r, filepath.Base(d))
 		}
 		realDirs = append(realDirs, d)
 	}
