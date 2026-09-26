@@ -41,7 +41,7 @@ func promoted(t *testing.T, dir, ws, author, content string, extra ...func(*Reme
 
 func entryView(t *testing.T, dir, ws, id string, history bool) (ContextEntry, map[string]any) {
 	t.Helper()
-	res, err := GetContextEntry(dir, ws, id, history)
+	res, err := GetContextEntry(dir, ws, id, history, true)
 	if err != nil {
 		t.Fatalf("get %s: %v", id, err)
 	}
@@ -181,7 +181,10 @@ func TestRetireAndRetractAreGoverned(t *testing.T) {
 	dir, ws := multiAgentDir(t), "ws"
 	e := promoted(t, dir, ws, "author", "use tabs")
 	// retiring promoted memory takes the same quorum that verified it
-	got, err := Remember(dir, ws, RememberRequest{Op: "retire", EntryID: e.ID, Reason: "obsolete"}, ContextActor{ID: "author"})
+	if _, err := Remember(dir, ws, RememberRequest{Op: "retire", EntryID: e.ID, Reason: "obsolete"}, ContextActor{ID: "author"}); !errors.Is(err, ErrVerifierRequired) {
+		t.Fatalf("a proposer without the verifier role voted to retire: %v", err)
+	}
+	got, err := Remember(dir, ws, RememberRequest{Op: "retire", EntryID: e.ID, Reason: "obsolete"}, ContextActor{ID: "author", Verifier: true})
 	if err != nil || got.Lifecycle != "" {
 		t.Fatalf("one retire must not remove shared memory: %v %+v", err, got)
 	}
@@ -197,7 +200,7 @@ func TestRetireAndRetractAreGoverned(t *testing.T) {
 	}
 	// the author withdraws an unpromoted proposal at once
 	own, _ := Remember(dir, ws, RememberRequest{ProposeContextRequest: ProposeContextRequest{Content: "draft"}}, ContextActor{ID: "author"})
-	if _, err := Remember(dir, ws, RememberRequest{Op: "retire", EntryID: own.ID, Reason: "r"}, ContextActor{ID: "peer-1"}); err != nil {
+	if _, err := Remember(dir, ws, RememberRequest{Op: "retire", EntryID: own.ID, Reason: "r"}, ContextActor{ID: "peer-1", Verifier: true}); err != nil {
 		t.Fatal(err) // a peer's retire of a pending entry is a retract vote
 	}
 	got, err = Remember(dir, ws, RememberRequest{Op: "retire", EntryID: own.ID, Reason: "draft"}, ContextActor{ID: "author"})
@@ -265,7 +268,11 @@ func TestExpiredEntriesHiddenFetchableRestorable(t *testing.T) {
 	if _, err := Remember(dir, ws, RememberRequest{Op: "restore", EntryID: e.ID, Reason: "extended"}, ContextActor{ID: "peer-1"}); !errors.Is(err, ErrNotEntryAuthor) {
 		t.Fatalf("a non-author cleared the expiry: %v", err)
 	}
-	got, err := Remember(dir, ws, RememberRequest{Op: "restore", EntryID: e.ID, Reason: "extended"}, ContextActor{ID: "author"})
+	// peers approved the expiry with the entry, so its author cannot clear it alone
+	if _, err := Remember(dir, ws, RememberRequest{Op: "restore", EntryID: e.ID, Reason: "extended"}, ContextActor{ID: "author"}); !errors.Is(err, ErrApproverRequired) {
+		t.Fatalf("the author cleared a peer-approved expiry: %v", err)
+	}
+	got, err := RestoreContext(dir, ws, e.ID, "extended", ContextActor{ID: "human", Approver: true})
 	if err != nil || got.ExpiresAt != "" || !got.Promoted {
 		t.Fatalf("restore: %v %+v", err, got)
 	}
@@ -282,5 +289,101 @@ func TestExpiredEntriesHiddenFetchableRestorable(t *testing.T) {
 func TestRememberRejectsUnknownOp(t *testing.T) {
 	if _, err := Remember(t.TempDir(), "ws", RememberRequest{Op: "delete"}, ContextActor{ID: "a"}); !IsInvalidInput(err) {
 		t.Fatalf("unknown op: %v", err)
+	}
+}
+
+// An expiry on peer-verified memory is governed like retirement: its author cannot set
+// a past one to drop it from recall without the retract quorum.
+func TestAuthorCannotExpirePeerVerifiedMemory(t *testing.T) {
+	dir, ws := multiAgentDir(t), "ws"
+	e := promoted(t, dir, ws, "author", "keep the lockfile")
+	_, err := Remember(dir, ws, RememberRequest{Op: "edit", EntryID: e.ID, BaseRevision: 1, Reason: "gone",
+		ProposeContextRequest: ProposeContextRequest{Expires: "2000-01-01"}}, ContextActor{ID: "author"})
+	if !errors.Is(err, ErrApproverRequired) {
+		t.Fatalf("the author expired peer-verified memory: %v", err)
+	}
+	if got, _ := entryView(t, dir, ws, e.ID, false); got.ExpiresAt != "" || !recalledIDs(t, dir, ws)[e.ID] {
+		t.Fatalf("the entry left recall: %+v", got)
+	}
+	// the author of an unpromoted proposal still sets its expiry
+	own, _ := Remember(dir, ws, RememberRequest{ProposeContextRequest: ProposeContextRequest{Content: "draft"}}, ContextActor{ID: "author"})
+	got, err := Remember(dir, ws, RememberRequest{Op: "edit", EntryID: own.ID, BaseRevision: 1, Reason: "short-lived",
+		ProposeContextRequest: ProposeContextRequest{Expires: "2099-01-01"}}, ContextActor{ID: "author"})
+	if err != nil || got.ExpiresAt == "" {
+		t.Fatalf("author expiry of an unpromoted entry: %v %+v", err, got)
+	}
+}
+
+// One pending edit at a time: a second edit waits until the first is decided, so the
+// first can always be accepted.
+func TestEditWhilePendingIsRefused(t *testing.T) {
+	dir, ws := multiAgentDir(t), "ws"
+	e := promoted(t, dir, ws, "author", "alpha")
+	edit := func(base int64, add string) error {
+		_, err := Remember(dir, ws, RememberRequest{Op: "edit", EntryID: e.ID, BaseRevision: base, Reason: "r", NewString: add},
+			ContextActor{ID: "author"})
+		return err
+	}
+	if err := edit(1, "beta"); err != nil {
+		t.Fatal(err)
+	}
+	for _, base := range []int64{1, 2} {
+		if _, ok := govstore.IsConflict(edit(base, "gamma")); !ok {
+			t.Fatalf("an edit on base %d stacked on the pending revision", base)
+		}
+	}
+	for _, p := range []string{"peer-1", "peer-2"} {
+		if _, err := VerifyContextOutcome(dir, ws, e.ID, ContextActor{ID: p}, VerifyRequest{Outcome: OutcomeApprove, Revision: 2}); err != nil {
+			t.Fatalf("%s: %v", p, err)
+		}
+	}
+	if got, _ := entryView(t, dir, ws, e.ID, false); got.Revision != 2 || got.Content != "alpha\nbeta" {
+		t.Fatalf("revision 2 not accepted: %+v", got)
+	}
+}
+
+// A replacement takes the strictest gate of what it supersedes: in single-agent mode a
+// self-asserted proposal cannot remove an entry that required peer verification.
+func TestSupersedeHonoursTheOldGate(t *testing.T) {
+	dir, ws := t.TempDir(), "ws"
+	single := false
+	writeTestSettings(t, dir, appSettings{RequireMultiAgentVerification: &single, ContextVerificationThreshold: 2})
+	strict := true
+	old := promoted(t, dir, ws, "author", "never force-push main", func(r *RememberRequest) { r.RequireVerification = &strict })
+	newer, err := Remember(dir, ws, RememberRequest{Op: "supersede", ProposeContextRequest: ProposeContextRequest{
+		Content: "force-push is fine", Supersedes: []string{old.ID}}}, ContextActor{ID: "author"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if newer.Promoted || newer.RequiredVerifications != 2 {
+		t.Fatalf("the replacement self-promoted past the old gate: %+v", newer)
+	}
+	if got, _ := entryView(t, dir, ws, old.ID, false); got.Lifecycle != "" {
+		t.Fatalf("the strict entry was superseded on one word: %+v", got)
+	}
+}
+
+// A reader fetching by id sees verified content only; unverified text, the pending
+// edit and history are for reviewers.
+func TestFetchByIDWithholdsUnverifiedFromReaders(t *testing.T) {
+	dir, ws := multiAgentDir(t), "ws"
+	e := promoted(t, dir, ws, "author", "served text")
+	Remember(dir, ws, RememberRequest{Op: "edit", EntryID: e.ID, BaseRevision: 1, Reason: "r", NewString: "unverified edit"},
+		ContextActor{ID: "author"})
+	draft, _ := Remember(dir, ws, RememberRequest{ProposeContextRequest: ProposeContextRequest{Content: "unverified draft"}}, ContextActor{ID: "author"})
+
+	res, err := GetContextEntry(dir, ws, e.ID, false, false)
+	if err != nil || res["entry"].(ContextEntry).Content != "served text" || res["pending"] != nil {
+		t.Fatalf("reader view of a verified entry: %v %+v", err, res)
+	}
+	res, err = GetContextEntry(dir, ws, draft.ID, false, false)
+	if err != nil || res["entry"].(ContextEntry).Content != "" || res["content_withheld"] != unverifiedWithheld {
+		t.Fatalf("reader saw an unverified draft: %v %+v", err, res)
+	}
+	if _, err := GetContextEntry(dir, ws, e.ID, true, false); !errors.Is(err, ErrVerifierRequired) {
+		t.Fatalf("reader read history: %v", err)
+	}
+	if res, _ := GetContextEntry(dir, ws, draft.ID, false, true); res["entry"].(ContextEntry).Content != "unverified draft" {
+		t.Fatalf("reviewer view: %+v", res)
 	}
 }

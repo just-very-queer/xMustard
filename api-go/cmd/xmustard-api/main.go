@@ -301,6 +301,7 @@ func (c memoryCaller) actor() workspaceops.ContextActor {
 		ID: c.id(), OpenMode: c.openMode,
 		Admin:    c.openMode || c.principal.Has(workspaceops.RoleAdmin),
 		Approver: c.openMode || c.principal.Has(workspaceops.RoleHumanApprover),
+		Verifier: c.openMode || c.principal.Has(workspaceops.RoleVerifier),
 	}
 }
 
@@ -3874,9 +3875,18 @@ func registerRoutes(mux routeRegistrar) {
 			return
 		}
 		// recall(entry_id) fetches one entry by id in any lifecycle state (expired,
-		// superseded, retired, purged tombstone); history=true adds its revisions and events.
+		// superseded, retired, purged tombstone). A reader sees verified content only;
+		// unverified text and history=true (revisions and events) need a reviewer: the
+		// verifier or human-approver role (admin holds both; open mode is the operator).
 		if id := q.Get("entry_id"); id != "" {
-			result, err := workspaceops.GetContextEntry(dd, r.PathValue("workspace_id"), id, q.Get("history") == "true")
+			p := principalFromContext(r.Context())
+			reviewer := p == nil || p.Has(workspaceops.RoleVerifier) || p.Has(workspaceops.RoleHumanApprover)
+			history := q.Get("history") == "true"
+			if history && !reviewer {
+				denyMissingRole(w, r, p, workspaceops.RoleVerifier)
+				return
+			}
+			result, err := workspaceops.GetContextEntry(dd, r.PathValue("workspace_id"), id, history, reviewer)
 			issueIntel(w, err, result)
 			return
 		}

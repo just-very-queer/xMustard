@@ -45,6 +45,10 @@ const OpenModeIdentity = govstore.OpenModeIdentity
 // ErrNotEntryAuthor: only an entry's author or an admin may amend its content.
 var ErrNotEntryAuthor = errors.New("only the entry's author or an admin may edit it")
 
+// ErrVerifierRequired: casting a verdict (a retire of promoted memory is a retract
+// verdict) or reading unverified memory history needs the verifier role.
+var ErrVerifierRequired = errors.New("only a principal with the verifier role may do this")
+
 // ErrReadonlyVerified: a readonly entry that is already verified can only be superseded
 // by a new proposal. UpdateContextContent wraps it in a Conflict, so HTTP returns 409.
 var ErrReadonlyVerified = errors.New("readonly entry is verified")
@@ -152,6 +156,9 @@ type ContextActor struct {
 	// Approver holds the human-approver role: it may retract, restore and purge
 	// directly, like an admin (PAR-GOV-06).
 	Approver bool
+	// Verifier holds the verifier role: it may cast verdicts, including the retract
+	// verdict remember(op=retire) casts on promoted memory.
+	Verifier bool
 	OpenMode bool
 }
 
@@ -228,12 +235,6 @@ func ProposeContext(dataDir, workspaceID string, req ProposeContextRequest) (*Co
 	if req.OpenMode {
 		source = OpenModeIdentity
 	}
-	// selfNote, when set, promotes the entry on the proposer's own assertion.
-	selfNote := selfAssertion(req.OpenMode, tighten, requireMulti)
-	required := threshold
-	if selfNote != "" {
-		required = 1
-	}
 
 	ctx := context.Background()
 	root := contextRoot(dataDir, workspaceID)
@@ -242,15 +243,27 @@ func ProposeContext(dataDir, workspaceID string, req ProposeContextRequest) (*Co
 	var out ContextEntry
 	var promoted bool
 	err = memoryUpdate(ctx, dataDir, workspaceID, func(tx govstore.Tx) error {
+		// A replacement removes what it supersedes, so it passes the strictest gate
+		// among them: an entry that needs peers is never superseded on one word.
+		supersededGate := 0
 		for _, id := range supersedes {
-			if _, _, err := loadEntryTx(ctx, tx, workspaceID, id); err != nil {
+			_, old, err := loadEntryTx(ctx, tx, workspaceID, id)
+			if err != nil {
 				return err
 			}
+			supersededGate = max(supersededGate, old.RequiredVerifications)
+		}
+		peersOnly := tighten || supersededGate > 1
+		// selfNote, when set, promotes the entry on the proposer's own assertion.
+		selfNote := selfAssertion(req.OpenMode, peersOnly, requireMulti)
+		required := max(threshold, supersededGate)
+		if selfNote != "" {
+			required = 1
 		}
 		e, err := tx.InsertEntry(ctx, govstore.NewEntry{
 			ID:          "ctx_" + hashID(workspaceID, req.Title, req.Content+nowUTC())[:12],
 			WorkspaceID: workspaceID, Title: title, Content: req.Content, Permission: permission,
-			RequiredVerifications: required, RequireVerification: tighten,
+			RequiredVerifications: required, RequireVerification: peersOnly,
 			Paths: cleanPaths(anchors), SearchTokens: memoryTokenList(title + " " + req.Content),
 			ExpiresAt: expiresAt, Metadata: supersedesMetadata(supersedes),
 		}, actor)

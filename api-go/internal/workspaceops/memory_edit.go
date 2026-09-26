@@ -152,9 +152,11 @@ func EditContext(dataDir, workspaceID, entryID string, req EditRequest, editor C
 		if err := authorizeEdit(editor, ce); err != nil {
 			return err
 		}
-		if req.BaseRevision != e.HeadRevision {
+		// One pending edit at a time: an edit stacked on an undecided one would build on
+		// unverified content and leave the older revision impossible to accept.
+		if req.BaseRevision != e.HeadRevision || e.HeadRevision != e.Revision {
 			return &govstore.ConflictError{EntryID: entryID, BaseRevision: req.BaseRevision, CurrentRevision: e.Revision,
-				CurrentDigest: e.ContentDigest, HeadRevision: e.HeadRevision, Reason: "base revision is not the newest revision"}
+				CurrentDigest: e.ContentDigest, HeadRevision: e.HeadRevision, Reason: editConflictReason(e)}
 		}
 		base, err := tx.GetRevision(ctx, entryID, e.HeadRevision)
 		if err != nil {
@@ -168,6 +170,9 @@ func EditContext(dataDir, workspaceID, entryID string, req EditRequest, editor C
 			return fmt.Errorf("the edit changes nothing (give old_string/new_string, content, description or expires): %w", ErrInvalidInput)
 		}
 		if expiresAt != "" {
+			if err := editor.authorizeExpiry(ce); err != nil {
+				return err
+			}
 			if _, err := tx.SetExpiry(ctx, entryID, expiresAt, actor); err != nil {
 				return err
 			}
@@ -205,6 +210,31 @@ func EditContext(dataDir, workspaceID, entryID string, req EditRequest, editor C
 		out.Warnings = append(out.Warnings, fmt.Sprintf("expires %q is not a date or RFC 3339 time; no expiry set", req.Expires))
 	}
 	return &out, nil
+}
+
+// editConflictReason says why an edit's base is refused: a pending edit must be decided
+// first, otherwise the base is stale.
+func editConflictReason(e govstore.Entry) string {
+	if e.HeadRevision != e.Revision {
+		return fmt.Sprintf("revision %d is pending verification; it must be accepted or rejected before another edit", e.HeadRevision)
+	}
+	return "base revision is not the newest revision"
+}
+
+// authorizeExpiry lets an admin or a human approver change an entry's expiry, and its
+// author while the entry is unpromoted or rests on a single assertion. On memory that
+// peers verified, the expiry is part of what they approved, and setting a past one
+// would retire it without the retract quorum (PAR-GOV-04).
+func (a ContextActor) authorizeExpiry(ce ContextEntry) error {
+	switch {
+	case a.hasLifecycleAuthority():
+		return nil
+	case a.ID == "" || a.ID != ce.Source:
+		return ErrNotEntryAuthor
+	case ce.Promoted && ce.RequiredVerifications > 1:
+		return fmt.Errorf("entry %s is peer-verified, so its expiry is governed: %w", ce.ID, ErrApproverRequired)
+	}
+	return nil
 }
 
 // settleRevision decides a pending revision from the votes cast on it, by the rule that
@@ -245,11 +275,11 @@ func settleRevision(ctx context.Context, tx govstore.Tx, workspaceID, entryID st
 }
 
 // RetireContext takes an entry out of recall (PAR-GOV-04). An admin or a human
-// approver, or the author of an
-// entry that was never promoted, archives it at once: nothing verified is withdrawn and
-// it stays restorable. Retiring promoted memory is governed: the call casts the caller's
-// retract verdict, and the entry is retracted once as many distinct principals retract
-// it as its gate requires.
+// approver, or the author of an entry that was never promoted, archives it at once:
+// nothing verified is withdrawn and it stays restorable. Retiring promoted memory is
+// governed: the call casts the caller's retract verdict, which needs the verifier role
+// (ErrVerifierRequired), and the entry is retracted once as many distinct principals
+// retract it as its gate requires.
 func RetireContext(dataDir, workspaceID, entryID, reason string, actor ContextActor) (*ContextEntry, error) {
 	if err := validateSafeID("workspace", workspaceID); err != nil {
 		return nil, err
@@ -275,6 +305,9 @@ func RetireContext(dataDir, workspaceID, entryID, reason string, actor ContextAc
 			}
 			out, err = entryAfter(ctx, tx, workspaceID, entryID)
 			return err
+		}
+		if !actor.Verifier {
+			return ErrVerifierRequired
 		}
 		out, _, err = castVerdict(ctx, tx, dataDir, workspaceID, root, e, ce, actor, by,
 			govstore.VoteInput{EntryID: entryID, Verdict: govstore.VerdictRetract, Note: "retire: " + reason})

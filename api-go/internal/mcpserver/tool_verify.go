@@ -21,7 +21,7 @@ var verifyTool = &Tool{
 	// Lifecycle outcomes (WS-19A): listed only in the full schema profile.
 	Advanced: []Arg{
 		{Name: "outcome", Type: typeString, Enum: []string{"approve", "reject", "retract"}, Desc: "overrides approve"},
-		{Name: "revision", Type: typeInteger, Min: 1, Max: maxRevision, Desc: "pending edit revision to vote on"},
+		{Name: "revision", Type: typeInteger, Min: 1, Max: maxRevision, Desc: "pending edit to vote on"},
 	},
 	// A reject can demote a promoted memory (destructive); a repeated vote replaces the
 	// caller's own prior verdict, so the call is idempotent.

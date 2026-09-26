@@ -2,8 +2,10 @@ package workspaceops
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 
 	"xmustard/api-go/internal/govstore"
@@ -18,19 +20,30 @@ import (
 // ErrApproverRequired: the lifecycle change needs an admin or a human approver.
 var ErrApproverRequired = errors.New("only an admin or a human approver may do this")
 
-// historyRevisionLimit and historyEventLimit bound one history read.
+// historyRevisionLimit and historyEventLimit bound one history read, and
+// historyByteBudget bounds its encoded size: the oldest events and revisions are
+// dropped first. Revisions are listed without their content.
 const (
 	historyRevisionLimit = 50
 	historyEventLimit    = 200
+	historyByteBudget    = 48 << 10
 )
 
-// GetContextEntry returns one entry by id in any lifecycle state, with its served
-// content bound to its digest (withheld when purged or tampered) and, while an edit is
-// pending, that revision with its diff from the served one. history adds the revisions,
-// the relations and the event log.
-func GetContextEntry(dataDir, workspaceID, entryID string, history bool) (map[string]any, error) {
+// unverifiedWithheld is why a reader does not see an entry's content.
+const unverifiedWithheld = "content is not verified; reading it needs the verifier or human-approver role"
+
+// GetContextEntry returns one entry by id in any lifecycle state, with its lifecycle
+// fields and content digest. The served content is bound to its digest (withheld when
+// purged or tampered). A plain reader sees it only once it is verified, as recall
+// would; a reviewer (a verifier, a human approver or an admin) also sees unverified
+// text, the pending edit with its diff and votes, and with history the revisions,
+// relations and event log. History without reviewer is refused (ErrVerifierRequired).
+func GetContextEntry(dataDir, workspaceID, entryID string, history, reviewer bool) (map[string]any, error) {
 	if err := validateSafeID("entry", entryID); err != nil {
 		return nil, err
+	}
+	if history && !reviewer {
+		return nil, fmt.Errorf("memory history: %w", ErrVerifierRequired)
 	}
 	ctx := context.Background()
 	var out map[string]any
@@ -39,19 +52,17 @@ func GetContextEntry(dataDir, workspaceID, entryID string, history bool) (map[st
 		if err != nil {
 			return err
 		}
-		contents, err := r.EntryContents(ctx, []string{entryID})
-		if err != nil {
+		out = map[string]any{"workspace_id": workspaceID, "content_digest": e.ContentDigest}
+		if withheld, err := servedContent(ctx, r, e, &ce, reviewer); err != nil {
 			return err
+		} else if withheld != "" {
+			out["content_withheld"] = withheld
 		}
-		out = map[string]any{"workspace_id": workspaceID}
-		if c := contents[entryID]; c.Withheld == "" && c.Digest == e.ContentDigest {
-			ce.Content = c.Content
-		} else {
-			out["content_withheld"] = fallbackString(c.Withheld, "content does not match its digest")
-		}
-		out["content_digest"] = e.ContentDigest
 		ce.ContentDigest = ""
 		out["entry"] = ce
+		if !reviewer {
+			return nil
+		}
 		if e.HeadRevision > e.Revision {
 			pending, err := pendingRevisionView(ctx, r, e)
 			if err != nil {
@@ -68,6 +79,24 @@ func GetContextEntry(dataDir, workspaceID, entryID string, history bool) (map[st
 		return nil, err
 	}
 	return out, nil
+}
+
+// servedContent fills ce.Content with the served revision when the caller may read it
+// and it still matches its digest; otherwise it says why the content is withheld.
+func servedContent(ctx context.Context, r govstore.Reader, e govstore.Entry, ce *ContextEntry, reviewer bool) (string, error) {
+	if !reviewer && !ce.Promoted {
+		return unverifiedWithheld, nil
+	}
+	contents, err := r.EntryContents(ctx, []string{e.ID})
+	if err != nil {
+		return "", err
+	}
+	c := contents[e.ID]
+	if c.Withheld != "" || c.Digest != e.ContentDigest {
+		return fallbackString(c.Withheld, "content does not match its digest"), nil
+	}
+	ce.Content = c.Content
+	return "", nil
 }
 
 // pendingRevisionView is the newest pending revision as a verifier reads it.
@@ -90,6 +119,8 @@ func pendingRevisionView(ctx context.Context, r govstore.Reader, e govstore.Entr
 	}, nil
 }
 
+// addHistory adds the revisions (newest first, without content), the relations and the
+// event log (oldest first), within historyByteBudget.
 func addHistory(ctx context.Context, r govstore.Reader, e govstore.Entry, out map[string]any) error {
 	revisions, err := r.ListRevisions(ctx, e.ID, govstore.RevisionFilter{Limit: historyRevisionLimit})
 	if err != nil {
@@ -103,8 +134,42 @@ func addHistory(ctx context.Context, r govstore.Reader, e govstore.Entry, out ma
 	if err != nil {
 		return err
 	}
+	revSizes, evSizes := encodedSizes(revisions), encodedSizes(events)
+	kept := len(revisions) + len(events)
+	total := sumInts(revSizes) + sumInts(evSizes)
+	// Drop the oldest of whichever list is longer, keeping the newest of each.
+	for total > historyByteBudget && len(revisions)+len(events) > 2 {
+		if len(events) >= len(revisions) {
+			total -= evSizes[0]
+			events, evSizes = events[1:], evSizes[1:]
+		} else {
+			total -= revSizes[len(revSizes)-1]
+			revisions, revSizes = revisions[:len(revisions)-1], revSizes[:len(revSizes)-1]
+		}
+	}
+	if len(revisions)+len(events) < kept {
+		out["history_truncated"] = true
+	}
 	out["revisions"], out["relations"], out["events"] = revisions, relations, events
 	return nil
+}
+
+// encodedSizes is each item's JSON size.
+func encodedSizes[T any](items []T) []int {
+	out := make([]int, len(items))
+	for i, it := range items {
+		b, _ := json.Marshal(it)
+		out[i] = len(b)
+	}
+	return out
+}
+
+func sumInts(xs []int) int {
+	n := 0
+	for _, x := range xs {
+		n += x
+	}
+	return n
 }
 
 // revisionDiff is the line diff from revision from to revision to of an entry.
@@ -203,7 +268,7 @@ func prefixed(p string, lines []string) []string {
 func (a ContextActor) hasLifecycleAuthority() bool { return a.Admin || a.Approver }
 
 // RestoreContext brings an entry back into recall. An expired entry is restored by
-// clearing its expiry, which its author may do; an archived, retracted or superseded
+// clearing its expiry (authorizeExpiry: its author, unless peers verified it); an archived, retracted or superseded
 // entry needs an admin or a human approver, and one restored from retracted or
 // superseded must be verified again (govstore.TransitionInput). A purged entry cannot
 // be restored.
@@ -214,8 +279,8 @@ func RestoreContext(dataDir, workspaceID, entryID, reason string, actor ContextA
 		case e.Lifecycle == govstore.LifecycleActive && e.ExpiresAt == "":
 			return fmt.Errorf("entry %s is active and unexpired; nothing to restore: %w", entryID, ErrInvalidInput)
 		case e.Lifecycle == govstore.LifecycleActive:
-			if !actor.hasLifecycleAuthority() && (actor.ID == "" || actor.ID != ce.Source) {
-				return ErrNotEntryAuthor
+			if err := actor.authorizeExpiry(ce); err != nil {
+				return err
 			}
 			_, err := tx.SetExpiry(ctx, entryID, "", by)
 			return err
@@ -255,8 +320,14 @@ func PurgeContext(dataDir, workspaceID, entryID, reason string, actor ContextAct
 	if err != nil {
 		return nil, err
 	}
+	// The purge is committed; a failed checkpoint only delays the text leaving the WAL
+	// until the next one, so it is reported, not returned as a failure to retry.
 	ctx := context.Background()
-	return out, withMemoryStore(ctx, dataDir, workspaceID, func(s *govstore.SQLStore) error { return s.Checkpoint(ctx) })
+	if err := withMemoryStore(ctx, dataDir, workspaceID, func(s *govstore.SQLStore) error { return s.Checkpoint(ctx) }); err != nil {
+		log.Printf("memory purge: checkpoint for workspace %s entry %s failed: %v", workspaceID, entryID, err)
+		out.Warnings = append(out.Warnings, "checkpoint failed; the purged text may remain in the WAL until the next checkpoint")
+	}
+	return out, nil
 }
 
 // lifecycleWrite runs one reasoned lifecycle change in a store transaction and returns

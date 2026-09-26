@@ -21,15 +21,15 @@ var rememberTool = &Tool{
 	// profile, documented at DocsURI.
 	Advanced: []Arg{
 		{Name: "op", Type: typeString, Enum: []string{"propose", "supersede", "edit", "retire", "restore"},
-			Desc: "default propose; edit/retire/restore act on entry_id"},
-		{Name: "entry_id", Type: typeString, Desc: "entry to edit, retire or restore"},
-		{Name: "base_revision", Type: typeInteger, Min: 1, Max: maxRevision, Desc: "edit: revision read (compare-and-set)"},
-		{Name: "reason", Type: typeString, MaxLen: maxVerifyNote, Desc: "required by edit, retire, restore"},
-		{Name: "old_string", Type: typeString, Desc: "edit: exact text to replace (once)"},
-		{Name: "new_string", Type: typeString, Desc: "edit: replacement; alone, appended"},
+			Desc: "default propose"},
+		{Name: "entry_id", Type: typeString, Desc: "target of edit/retire/restore"},
+		{Name: "base_revision", Type: typeInteger, Min: 1, Max: maxRevision, Desc: "edit: revision read (CAS)"},
+		{Name: "reason", Type: typeString, MaxLen: maxVerifyNote, Desc: "required unless proposing"},
+		{Name: "old_string", Type: typeString, Desc: "edit: text to replace once"},
+		{Name: "new_string", Type: typeString, Desc: "edit: replacement, or appended"},
 		{Name: "description", Type: typeString, Desc: "edit: new description"},
-		{Name: "supersedes", Type: typeString, List: true, MaxLen: 1024, Desc: "entries replaced once this is promoted"},
-		{Name: "expires", Type: typeString, Desc: "hide after this UTC date (YYYY-MM-DD, inclusive)"},
+		{Name: "supersedes", Type: typeString, List: true, MaxLen: 1024, Desc: "entries this replaces"},
+		{Name: "expires", Type: typeString, Desc: "last UTC date served (YYYY-MM-DD)"},
 	},
 	// Proposing is additive (never destroys state) and not idempotent: each call is a
 	// new proposal.

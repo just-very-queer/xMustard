@@ -12,8 +12,8 @@
       "2025-06-18": {"reader": 6646, "proposer": 7745, "verifier": 7680, "agent": 8779}
     },
     "full": {
-      "2024-11-05": {"reader": 4407, "proposer": 5973, "verifier": 5250, "agent": 6816},
-      "2025-06-18": {"reader": 7054, "proposer": 9026, "verifier": 8300, "agent": 10272}
+      "2024-11-05": {"reader": 4391, "proposer": 5853, "verifier": 5225, "agent": 6687},
+      "2025-06-18": {"reader": 7038, "proposer": 8906, "verifier": 8275, "agent": 10143}
     }
   }
 }

@@ -106,6 +106,11 @@ func castVerdict(ctx context.Context, tx govstore.Tx, dataDir, workspaceID, root
 		return ContextEntry{}, false, fmt.Errorf("retract applies to the served revision %d, not revision %d: %w",
 			e.Revision, in.Revision, ErrInvalidInput)
 	}
+	if onPending && in.Revision != e.HeadRevision {
+		return ContextEntry{}, false, &govstore.ConflictError{EntryID: in.EntryID, BaseRevision: in.Revision,
+			CurrentRevision: e.Revision, CurrentDigest: e.ContentDigest, HeadRevision: e.HeadRevision,
+			Reason: "only the served revision or the pending head revision takes votes"}
+	}
 	if _, err := tx.RecordVote(ctx, in, actor); err != nil {
 		return ContextEntry{}, false, err
 	}

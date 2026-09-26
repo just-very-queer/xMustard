@@ -15,8 +15,8 @@ var recallTool = &Tool{
 	},
 	// Fetch by id (WS-19A): any lifecycle state, listed only in the full schema profile.
 	Advanced: []Arg{
-		{Name: "entry_id", Type: typeString, Desc: "fetch one entry by id, even expired or retired"},
-		{Name: "history", Type: typeBoolean, Desc: "with entry_id: add revisions and events"},
+		{Name: "entry_id", Type: typeString, Desc: "fetch one entry, any state"},
+		{Name: "history", Type: typeBoolean, Desc: "with entry_id: revisions, events (verifier)"},
 	},
 	// Claude Code drops a tool argument named exactly "query", so the advertised name
 	// is q; "query" stays accepted for clients that already send it.

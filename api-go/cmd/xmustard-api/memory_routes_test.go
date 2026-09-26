@@ -15,7 +15,8 @@ func TestMemoryLifecycleOverHTTP(t *testing.T) {
 	srv, dir := newRouteServer(t)
 	base := srv.URL + "/api/workspaces/wsLifecycle"
 	tok := map[string]string{}
-	for id, role := range map[string]string{"alice": "agent", "bob": "agent", "carol": "agent", "hana": "human-approver", "root": "admin"} {
+	for id, role := range map[string]string{"alice": "agent", "bob": "agent", "carol": "agent", "hana": "human-approver", "root": "admin",
+		"pat": "proposer", "quinn": "proposer", "rita": "reader"} {
 		raw, err := workspaceops.MintToken(dir, id, role)
 		if err != nil {
 			t.Fatal(err)
@@ -55,12 +56,27 @@ func TestMemoryLifecycleOverHTTP(t *testing.T) {
 		t.Fatalf("recall(entry_id, history): %v", got)
 	}
 
+	// a reader fetches verified content by id, but not the history
+	if got := call("rita", "GET", "/context/active?entry_id="+id, "", http.StatusOK); got["entry"].(map[string]any)["content"] != "listen on 9000" {
+		t.Fatalf("reader fetch: %v", got)
+	}
+	call("rita", "GET", "/context/active?entry_id="+id+"&history=true", "", http.StatusForbidden)
+	// retiring promoted memory is a retract verdict: proposer-only tokens cannot cast it
+	for _, who := range []string{"pat", "quinn"} {
+		call(who, "POST", "/context", `{"op":"retire","entry_id":"`+id+`","reason":"x"}`, http.StatusForbidden)
+	}
+
 	for who, want := range map[string]int{"": http.StatusUnauthorized, "alice": http.StatusForbidden} {
 		call(who, "DELETE", "/context/"+id+"?reason=x", "", want)
 	}
 	call("hana", "DELETE", "/context/"+id, "", http.StatusBadRequest) // a reason is required
 	if r := call("hana", "DELETE", "/context/"+id+"?reason=wrong", "", http.StatusOK); r["lifecycle"] != "retracted" {
 		t.Fatalf("approver retract: %v", r)
+	}
+	// a pure approver restores through its own route; an agent cannot use it
+	call("alice", "POST", "/context/"+id+"/restore?reason=x", "", http.StatusForbidden)
+	if r := call("hana", "POST", "/context/"+id+"/restore?reason=was+right", "", http.StatusOK); r["lifecycle"] != nil || r["promoted"] == true {
+		t.Fatalf("approver restore: %v", r)
 	}
 	if r := call("root", "DELETE", "/context/"+id+"?purge=true&reason=secret", "", http.StatusOK); r["lifecycle"] != "purged" {
 		t.Fatalf("admin purge: %v", r)

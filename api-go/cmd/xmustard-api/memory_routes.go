@@ -11,7 +11,7 @@ import (
 
 // registerMemoryRoutes mounts the governed-memory writes: remember (propose, supersede,
 // edit, retire, restore), verify, the legacy in-place edit and the approver's
-// retract/purge. Every write is attributed to the authenticated principal, never to a
+// retract/purge/restore. Every write is attributed to the authenticated principal, never to a
 // caller-asserted name; open-mode callers collapse to one identity.
 func registerMemoryRoutes(mux routeRegistrar) {
 	mux.HandleFunc("POST /api/workspaces/{workspace_id}/context", func(w http.ResponseWriter, r *http.Request) {
@@ -103,35 +103,45 @@ func registerMemoryRoutes(mux routeRegistrar) {
 		result, err := workspaceops.UpdateContextContent(dataDir(), r.PathValue("workspace_id"), r.PathValue("entry_id"), req.Content, caller.actor())
 		respondMemoryWrite(w, r, caller, result, err)
 	})
+	// The approver's lifecycle routes, not MCP tools: DELETE retracts at once, or with
+	// purge=true deletes the entry's text (secrets, PII) and keeps a digest tombstone;
+	// restore brings a retired, retracted, superseded or expired entry back.
 	mux.HandleFunc("DELETE /api/workspaces/{workspace_id}/context/{entry_id}", func(w http.ResponseWriter, r *http.Request) {
-		// Retract at once, or with purge=true delete the entry's text (secrets, PII) and
-		// keep a digest tombstone. Admin or human approver only, and not an MCP tool.
-		caller, ok := requireMemoryCaller(w, r, workspaceops.RoleHumanApprover)
-		if !ok {
-			return
-		}
-		var req struct {
-			Reason string `json:"reason"`
-		}
-		if !requireWellFormedJSON(w, r, &req) {
-			return
-		}
-		q := r.URL.Query()
-		if req.Reason == "" {
-			req.Reason = q.Get("reason")
-		}
 		remove := workspaceops.RetractContext
-		if q.Get("purge") == "true" {
+		if r.URL.Query().Get("purge") == "true" {
 			remove = workspaceops.PurgeContext
 		}
-		result, err := remove(dataDir(), r.PathValue("workspace_id"), r.PathValue("entry_id"), req.Reason, caller.actor())
-		respondMemoryWrite(w, r, caller, result, err)
+		approverLifecycleWrite(w, r, remove)
 	})
+	mux.HandleFunc("POST /api/workspaces/{workspace_id}/context/{entry_id}/restore", func(w http.ResponseWriter, r *http.Request) {
+		approverLifecycleWrite(w, r, workspaceops.RestoreContext)
+	})
+}
+
+// approverLifecycleWrite runs one reasoned lifecycle change as an admin or human
+// approver. The reason comes from the body or the query.
+func approverLifecycleWrite(w http.ResponseWriter, r *http.Request,
+	change func(dataDir, workspaceID, entryID, reason string, actor workspaceops.ContextActor) (*workspaceops.ContextEntry, error)) {
+	caller, ok := requireMemoryCaller(w, r, workspaceops.RoleHumanApprover)
+	if !ok {
+		return
+	}
+	var req struct {
+		Reason string `json:"reason"`
+	}
+	if !requireWellFormedJSON(w, r, &req) {
+		return
+	}
+	if req.Reason == "" {
+		req.Reason = r.URL.Query().Get("reason")
+	}
+	result, err := change(dataDir(), r.PathValue("workspace_id"), r.PathValue("entry_id"), req.Reason, caller.actor())
+	respondMemoryWrite(w, r, caller, result, err)
 }
 
 // memoryAuthorityErrors are the refusals of a memory write that answer 403 and are
 // audited: the caller is authenticated but lacks authority over this entry.
-var memoryAuthorityErrors = []error{workspaceops.ErrNotEntryAuthor, workspaceops.ErrApproverRequired}
+var memoryAuthorityErrors = []error{workspaceops.ErrNotEntryAuthor, workspaceops.ErrApproverRequired, workspaceops.ErrVerifierRequired}
 
 // respondMemoryWrite answers a governed-memory write.
 func respondMemoryWrite(w http.ResponseWriter, r *http.Request, caller memoryCaller, result any, err error) {
