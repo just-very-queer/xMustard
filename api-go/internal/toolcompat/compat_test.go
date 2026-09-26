@@ -101,6 +101,13 @@ func TestPortedBridgeNormalization(t *testing.T) {
 			}},
 		{"RepairsAwaitTaskFromNestedTaskObject", KindAwaitTask, `{"task":{"id":"task-22"},"timeout_ms":"1500"}`,
 			[]check{eq("task_id", "task-22"), eq("timeout_ms", 1500), valid}},
+		{"KeepsCanonicalNestedKeyOverAlias", KindApplyPatch, `{
+			"path":"sample.txt","edits":[{"oldString":"x","old_string":"alpha","new_string":"b"}]}`,
+			[]check{nested("edits", 0, map[string]any{"old_string": "alpha", "new_string": "b"}), valid}},
+		{"RepairsMCPResourceFromNestedObject", KindReadMCPResource, `{"server":"docs","resource":{"resource_uri":" mem://notes "}}`,
+			[]check{eq("uri", "mem://notes")}},
+		{"RepairsModelObjectWithProvider", KindTask, `{"prompt":"p","model":{"name":"sonnet","vendor":"anthropic"}}`,
+			[]check{eq("model", "anthropic/sonnet"), eq("provider", "anthropic")}},
 		{"RepairsMCPToolRef", KindCallMCPTool, `{"name":"read_file@filesystem"}`,
 			[]check{eq("tool", "read_file"), eq("server", "filesystem"), valid}},
 		{"DropsPlaceholderMCPServer", KindListMCPResources, `{"server":"dummy"}`,

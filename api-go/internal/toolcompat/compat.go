@@ -56,6 +56,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -407,22 +408,45 @@ func Signature(tool string, args map[string]any, message string) string {
 // is dropped and recorded. For a mutating spec, two spellings of one field with
 // different values are an ambiguity error rather than a silent choice.
 func canonicalizeKeys(spec Spec, args map[string]any) (map[string]any, []Normalization, *ValidationError) {
-	keys := make([]string, 0, len(args))
-	for k := range args {
+	return canonicalizeMap(args, keyRenamer{
+		resolve: func(k string) string { return resolveKey(spec, k) },
+		field:   func(c string) string { return c },
+		conflict: func(c, first, k string, existing, v any) *ValidationError {
+			if !spec.mutating() || reflect.DeepEqual(existing, v) {
+				return nil
+			}
+			return &ValidationError{
+				Field:   c,
+				Code:    CodeAmbiguous,
+				Message: fmt.Sprintf("arguments %q and %q both set %q for %s with different values", first, k, c, spec.toolName()),
+			}
+		},
+	})
+}
+
+// keyRenamer is how canonicalizeMap renames the keys of one map: resolve names
+// a key's canonical field, field names that field in a Normalization, and
+// conflict decides whether a second spelling of a field is an error.
+type keyRenamer struct {
+	resolve  func(key string) string
+	field    func(canonical string) string
+	conflict func(canonical, first, key string, existing, v any) *ValidationError
+}
+
+// canonicalizeMap renames the keys of m in sorted order, canonical spellings
+// first, so which alias wins does not depend on map order.
+func canonicalizeMap(m map[string]any, r keyRenamer) (map[string]any, []Normalization, *ValidationError) {
+	keys := make([]string, 0, len(m))
+	for k := range m {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
 	resolved := make(map[string]string, len(keys))
+	out := make(map[string]any, len(m))
+	source := make(map[string]string, len(m))
 	for _, k := range keys {
-		resolved[k] = resolveKey(spec, k)
-	}
-
-	out := make(map[string]any, len(args))
-	source := make(map[string]string, len(args))
-	for _, k := range keys {
-		if resolved[k] == k {
-			out[k] = args[k]
-			source[k] = k
+		if resolved[k] = r.resolve(k); resolved[k] == k {
+			out[k], source[k] = m[k], k
 		}
 	}
 	var norms []Normalization
@@ -432,19 +456,14 @@ func canonicalizeKeys(spec Spec, args map[string]any) (map[string]any, []Normali
 			continue
 		}
 		if existing, ok := out[c]; ok {
-			if spec.mutating() && !reflect.DeepEqual(existing, args[k]) {
-				return out, norms, &ValidationError{
-					Field:   c,
-					Code:    CodeAmbiguous,
-					Message: fmt.Sprintf("arguments %q and %q both set %q for %s with different values", source[c], k, c, spec.toolName()),
-				}
+			if err := r.conflict(c, source[c], k, existing, m[k]); err != nil {
+				return out, norms, err
 			}
-			norms = append(norms, Normalization{Op: OpDrop, Field: c, From: k, Rule: "duplicate"})
+			norms = append(norms, Normalization{Op: OpDrop, Field: r.field(c), From: k, Rule: "duplicate"})
 			continue
 		}
-		out[c] = args[k]
-		source[c] = k
-		norms = append(norms, Normalization{Op: OpAlias, Field: c, From: k})
+		out[c], source[c] = m[k], k
+		norms = append(norms, Normalization{Op: OpAlias, Field: r.field(c), From: k})
 	}
 	return out, norms, nil
 }
@@ -484,14 +503,7 @@ func (s *state) str(key string) string {
 }
 
 // first returns the first key whose string value is not blank, and that value.
-func (s *state) first(keys ...string) (string, string) {
-	for _, k := range keys {
-		if v := s.str(k); strings.TrimSpace(v) != "" {
-			return k, v
-		}
-	}
-	return "", ""
-}
+func (s *state) first(keys ...string) (string, string) { return firstIn(s.args, keys...) }
 
 // put sets field to v and records the change. A field that was absent or blank
 // is derived; one that held a different value is repaired.
@@ -557,7 +569,7 @@ var (
 	filePathRepair    = promote("path", "local_path", CleanLocalPath, pathKeys...)
 	serverRepair      = promote("server", "server", nil, "server", "name")
 	mcpServerRepairs  = []repair{serverRepair, repairServerName}
-	mcpResourceRepair = promoteFrom("uri", "uri", func(s *state) (string, string) { return mcpResourceURI(s.args) })
+	mcpResourceRepair = promoteFrom("uri", "uri", func(s *state) (string, string) { return mcpResourceArg.find(s.args) })
 )
 
 // kindRepairs are the per-kind repairs ported from cursor-bridge's
@@ -603,7 +615,7 @@ var kindRepairs = map[Kind][]repair{
 		promoteFrom("model", "model", modelSelection),
 	},
 	KindAwaitTask: {
-		promoteFrom("task_id", "task_id", func(s *state) (string, string) { return taskIDArg(s.args) }),
+		promoteFrom("task_id", "task_id", func(s *state) (string, string) { return taskIDArg.find(s.args) }),
 		func(s *state) { coerceIntArg(s, "timeout_ms") },
 		func(s *state) { coerceIntArg(s, "timeout_seconds") },
 	},
@@ -671,31 +683,13 @@ func repairApplyPatch(s *state) {
 			if !ok {
 				continue
 			}
-			keys := make([]string, 0, len(m))
-			for k := range m {
-				keys = append(keys, k)
-			}
-			sort.Strings(keys)
-			out := make(map[string]any, len(m))
-			for _, k := range keys {
-				if CanonicalKey(k) == k {
-					out[k] = m[k]
-				}
-			}
-			for _, k := range keys {
-				c := CanonicalKey(k)
-				if c == k {
-					continue
-				}
-				field := fmt.Sprintf("%s[%d].%s", list, i, c)
-				if _, exists := out[c]; exists {
-					s.norms = append(s.norms, Normalization{Op: OpDrop, Field: field, From: k, Rule: "duplicate"})
-					continue
-				}
-				out[c] = m[k]
-				s.norms = append(s.norms, Normalization{Op: OpAlias, Field: field, From: k})
-			}
+			out, norms, _ := canonicalizeMap(m, keyRenamer{
+				resolve:  CanonicalKey,
+				field:    func(c string) string { return fmt.Sprintf("%s[%d].%s", list, i, c) },
+				conflict: func(string, string, string, any, any) *ValidationError { return nil },
+			})
 			items[i] = out
+			s.norms = append(s.norms, norms...)
 		}
 	}
 }
@@ -784,50 +778,42 @@ func requestedMCPServer(requested string) (string, bool) {
 	}
 }
 
-func mcpResourceURI(args map[string]any) (string, string) {
-	for _, k := range []string{"uri", "resource_uri", "resource"} {
-		if v, _ := args[k].(string); strings.TrimSpace(v) != "" {
-			return k, strings.TrimSpace(v)
-		}
+// argLookup finds a string argument under one of its flat keys, or else under
+// one of nestedKeys inside the object at nested ("resource": {"uri": ...}).
+type argLookup struct {
+	flat       []string
+	nested     string
+	nestedKeys []string
+}
+
+// find returns the key path it read ("resource.uri" for a nested one) and the
+// trimmed value, or two empty strings.
+func (l argLookup) find(args map[string]any) (string, string) {
+	if key, v := firstIn(args, l.flat...); v != "" {
+		return key, strings.TrimSpace(v)
 	}
-	if resource, ok := args["resource"].(map[string]any); ok {
-		if key, uri := firstIn(resource, "uri", "resource_uri"); uri != "" {
-			return "resource." + key, strings.TrimSpace(uri)
+	if obj, ok := args[l.nested].(map[string]any); ok {
+		if key, v := firstIn(obj, l.nestedKeys...); v != "" {
+			return l.nested + "." + key, strings.TrimSpace(v)
 		}
 	}
 	return "", ""
 }
 
-func taskIDArg(args map[string]any) (string, string) {
-	for _, k := range []string{"task_id", "id"} {
-		if v, _ := args[k].(string); strings.TrimSpace(v) != "" {
-			return k, strings.TrimSpace(v)
-		}
-	}
-	if task, ok := args["task"].(map[string]any); ok {
-		if key, id := firstIn(task, "id", "task_id"); id != "" {
-			return "task." + key, strings.TrimSpace(id)
-		}
-	}
-	return "", ""
-}
+var (
+	mcpResourceArg = argLookup{flat: []string{"uri", "resource_uri", "resource"}, nested: "resource", nestedKeys: []string{"uri", "resource_uri"}}
+	taskIDArg      = argLookup{flat: []string{"task_id", "id"}, nested: "task", nestedKeys: []string{"id", "task_id"}}
+	modelArg       = argLookup{flat: []string{"model", "submodel", "requested_model", "model_name"}, nested: "model", nestedKeys: []string{"id", "name", "model"}}
+)
 
 // modelSelection joins a model with its provider as "provider/model" unless the
-// model is already qualified.
+// model is already qualified. A model given as an object may carry its
+// provider, which fills a blank provider argument.
 func modelSelection(s *state) (string, string) {
-	key, model := s.first("model", "submodel", "requested_model", "model_name")
-	model = strings.TrimSpace(model)
-	if model == "" {
-		if nested, ok := s.args["model"].(map[string]any); ok {
-			var nkey string
-			nkey, model = firstIn(nested, "id", "name", "model")
-			model = strings.TrimSpace(model)
-			key = "model." + nkey
-			if strings.TrimSpace(s.str("provider")) == "" {
-				if pkey, provider := firstIn(nested, "provider", "vendor"); strings.TrimSpace(provider) != "" {
-					s.put("provider", strings.TrimSpace(provider), "model_object", "model."+pkey)
-				}
-			}
+	key, model := modelArg.find(s.args)
+	if nested, ok := s.args[modelArg.nested].(map[string]any); ok && !slices.Contains(modelArg.flat, key) && strings.TrimSpace(s.str("provider")) == "" {
+		if pkey, provider := firstIn(nested, "provider", "vendor"); provider != "" {
+			s.put("provider", strings.TrimSpace(provider), "model_object", modelArg.nested+"."+pkey)
 		}
 	}
 	if model == "" {
