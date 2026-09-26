@@ -1,12 +1,17 @@
 # WS-14 resident index query side: memory and the graph-storage decision — 2026-09-26
 
-Status: **measured on both platforms.** The resident service reads the code graph
-from file-backed segments through a 2 MiB block cache. On a 100k-symbol graph with
-five resolved edges per symbol, and including a snapshot swap under four concurrent
-clients, its RSS stays within 15 MiB of its base:
+Status: **measured on both platforms; WS-14 acceptance still blocked (see "Open").**
+The resident service reads the code graph from file-backed segments through a 2 MiB
+block cache. On a 100k-symbol graph with five resolved edges per symbol, and
+including a snapshot swap under that load, four clients whose queries reach the
+service one at a time keep its RSS within 15 MiB of its base:
 
 - macOS: +10.5 to +14.1 MiB above base;
 - Linux: +8.9 to +10.6 MiB above base, with the resident worker's single glibc arena.
+
+With the four clients' queries in flight together (`--max-inflight=4`), each pool
+thread holds its own query transients, and the service measures +13.4 to +15.2 MiB
+on Linux and +22.0 to +27.2 MiB on macOS. That reaches or passes the 15 MiB line.
 
 Holding the same segment in memory costs 31–33 MiB steady and 56.6 MiB during the
 swap.
@@ -15,8 +20,39 @@ Gate v2 results:
 
 - CI suite: PASS at 74.1 MiB.
 - Parity `agents-2`: PASS at 94.0 MiB.
-- Parity `snapshot-swap-under-load`: INVALID. The heavy-slot admission refused the
-  index refreshes because the tree was over the soft ceiling (see "Gate v2").
+- Parity `snapshot-swap-under-load`: INVALID, a blocking open item. The heavy-slot
+  admission refused the index refreshes because the tree was over the soft ceiling
+  (see "Gate v2").
+
+## Open (blocking WS-14 acceptance)
+
+- **Swap under load at parity scale.** `snapshot-swap-under-load` has no passing run.
+  The gate ran the core per call, so the resident service was never exercised at
+  parity scale in gate v2. Acceptance needs the budget reconciliation in
+  `scripts/bench/budget_ledger.json` (the daemon over its line, the stdio shims WS-13
+  removes) so the heavy slot admits refreshes, then a passing rerun with the resident
+  worker on. The ledger's WS-14 entry records this as `open`.
+- **Overlapping queries.** Four clients with queries in flight together pass the
+  15 MiB line on macOS and touch it on Linux (above). Impact at depth 4 and search's
+  seeded proximity lane walk most files of the synthetic graph; their per-query file
+  lists are the transients each pool thread keeps. The test asserts the line for
+  sequential arrival and a 32 MiB regression guard for overlapping arrival.
+
+## Reads while the index lags
+
+Before this change, once a root had an index, every read answered from it, and only
+the refresh before a read moved it forward. In the swap scenario the governor refused
+every refresh, so the last edit never became searchable. Now each read passes the
+repository identity it observed (`--identity-key=K`, after `search` or after the
+`symbolgraph` subcommand). The core answers from the index only when the index was
+brought to that identity (meta `identity_key`). Otherwise the legacy graph for the
+tree as it is now answers, bounded by the same envelope; `freshness.source` says
+`legacy_graph` and `coverage.work.graph_cache_detail` says the index is behind. This
+covers a refused heavy slot, a failed update, a refresh still running and a daemon
+restart. Each read waits at most 5 s for a running refresh, or 30 s when this process
+has not brought the root's index up yet, and never past its request. The cost is the
+pre-WS-14 one: the legacy graph for that identity is built (and cached) in the
+resident worker while the index lags.
 
 ## What was decided (D-02, the open half)
 
@@ -58,7 +94,10 @@ anywhere, which gives 437,092 distinct file pairs. The worker writes the segment
 service (`xmustard-core serve --max-inflight=4`) then answers rounds of `search`,
 `symbolgraph impact`, `trace` and `cluster-of`. A second generation replaces the store
 while four clients query, and the service swaps snapshots under that load. ps-RSS is
-sampled every 50 ms during the swap.
+sampled every 50 ms during the swap. The test runs the clients two ways: their
+requests reach the service one at a time (the rows below), and all four clients'
+rounds are sent before any answer is read, so four run together (the "overlapping"
+rows).
 
 | Storage | Base | Steady | Swap peak | After swap | Segment heap |
 |---|---|---|---|---|---|
@@ -69,11 +108,15 @@ sampled every 50 ms during the swap.
 | file, Linux, glibc default arenas (release) | 6.0 MiB | +15.8 | +18.7 | +19.0 | 0 |
 | file, 4 MiB cache (release, earlier run) | 6.7 MiB | +13.7 | — | +16.0 | 0 |
 | mem (release) | 6.6 MiB | +31.0 to +32.6 | +56.6 | +35.1 to +56.6 | 23.3 MiB |
+| file, overlapping, macOS (release) | 6.5 MiB | +22.0 to +22.7 | +24.0 to +26.8 | +25.3 to +27.2 | 0 |
+| file, overlapping, Linux, `MALLOC_ARENA_MAX=1` (release) | 5.5 MiB | +13.4 | +13.7 | +15.2 | 0 |
 
 With the 2 MiB cache, a first query that loads the snapshot costs about 6.6 MiB. That
 covers the cache, the per-file table, SQLite for the meta read, and the code pages
 that the new paths touch. The test asserts steady, swap peak and after-swap all at
-≤15 MiB above base.
+≤15 MiB above base for sequential arrival, and ≤32 MiB (a regression guard, not the
+line) for overlapping arrival. Overlapping on macOS, search alone reached +22.6 MiB and
+impact alone +18.7; trace and cluster-of stayed under +10.
 
 The Linux rows are from the borrowed build box (Ubuntu, 6 cores). On glibc, each pool
 thread's arena keeps its own high-water mark of query transients. The Go supervisor
@@ -178,8 +221,10 @@ measured tree and stdio shims 71–87 MB + declared 26214400 > 94371840 bytes
 
 With two stdio shims (about 29 MiB) and a Go daemon at 39–41 MiB, the tree is already
 over 65 MiB. The governor therefore refuses every 25 MiB index update, as designed.
-The refresh fails open: the reads keep answering from the last generation, and the
-freshness envelope lists the edited result paths as dirty.
+The refresh failed open: the reads kept answering from the last generation, and the
+freshness envelope listed the edited result paths as dirty, but new symbols did not
+appear. Reads now fall back to the graph for the current identity while the index
+lags (see "Reads while the index lags"); the scenario still has no passing run.
 
 A realistic declaration would not change this. A one-file composite update measures
 24–25 MiB, which is the heavy line itself. The remedy is the open reconciliation in
