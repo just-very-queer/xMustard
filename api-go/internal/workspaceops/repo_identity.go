@@ -248,15 +248,15 @@ func (f repoFingerprint) settled() bool { return f.quietBefore(f.startedAt) }
 // isolated after a pairing expired unused (see observe), whose sample the next read
 // within the TTL pairs with its own walk instead; a read that finds the tree changed
 // is one walk and one run (plus a second walk when the change is inside the racy
-// window). The cost judge below turns the walk off for a while once one costs more
-// than half a run, which keeps a read under about twice base and a read with no live
-// pairing under about 1.5 times.
+// window). The cost judge below turns the walk off for a while once two walks in a
+// row cost more than half a run, which keeps a read under about twice base and a
+// read with no live pairing under about 1.5 times.
 //
 // The fingerprint is not used (every observation samples, as without the cache)
 // when: the TTL is 0; the platform cannot fingerprint; the root's repo-key reports
 // no ignored-directory listing; a walk failed or exceeded its bounds (retried after
-// fingerprintRetryAfter); or the last walk was not clearly cheaper than the last
-// repo-key run (walk > repo-key/2, re-measured after fingerprintRetryAfter).
+// fingerprintRetryAfter); or the last two walks were not clearly cheaper than
+// repo-key (both > repo-key/2, re-measured after fingerprintRetryAfter).
 // Concurrent callers share one in-flight sample and one in-flight walk per root.
 // Watcher and edit events can call InvalidateRepoIdentity.
 
@@ -320,7 +320,8 @@ type rootState struct {
 	epoch      uint64 // bumped by invalidation: nothing begun earlier is paired or reused
 	sample     *sampleFlight
 	walk       *walkFlight
-	walkNs     int64 // last walk duration (0 = not measured)
+	walkNs     int64 // judged walk cost: the cheaper of the last two Git walks (0 until both are measured)
+	lastWalkNs int64 // the last Git walk's duration
 	keyNs      int64 // repo-key duration, smoothed
 	fpOffUntil time.Time
 	lastUsed   time.Time
@@ -663,13 +664,27 @@ func (c *identityCacheT) fingerprintOn(root string, now time.Time) bool {
 	return !now.Before(c.state(root).fpOffUntil)
 }
 
-// judge turns the fingerprint off for a while when the last walk was not clearly
-// cheaper than repo-key (it replaces a spawn only if it costs less than half of
-// one). Caller holds mu.
+// noteWalk records a Git walk's duration and judges it. The judged cost is the
+// cheaper of the last two walks: a walk's wall time includes any GC pause or
+// preemption it sat through, and one such stall (p99 walks run 10-40 times the
+// median under load) must not turn the fingerprint off for fingerprintRetryAfter,
+// while a tree that is really costly to walk is costly twice in a row. Caller holds mu.
+func (st *rootState) noteWalk(ns int64, now time.Time) {
+	st.walkNs = ns
+	if st.lastWalkNs < ns {
+		st.walkNs = st.lastWalkNs
+	}
+	st.lastWalkNs = ns
+	st.judge(now)
+}
+
+// judge turns the fingerprint off for a while when walking was not clearly cheaper
+// than repo-key (it replaces a spawn only if it costs less than half of one). Caller
+// holds mu.
 func (st *rootState) judge(now time.Time) {
 	if fingerprintCostJudged && st.walkNs > 0 && st.keyNs > 0 && 2*st.walkNs > st.keyNs {
 		st.fpOffUntil = now.Add(fingerprintRetryAfter)
-		st.walkNs = 0 // the next probe measures afresh
+		st.walkNs, st.lastWalkNs = 0, 0 // the next probes measure afresh
 	}
 }
 
@@ -767,8 +782,7 @@ func (c *identityCacheT) runWalk(root string, f *walkFlight, epoch uint64, regis
 		case !f.fp.ok:
 			st.fpOffUntil = identityNow().Add(fingerprintRetryAfter) // unavailable here: retry later
 		case f.fp.git:
-			st.walkNs = took
-			st.judge(identityNow())
+			st.noteWalk(took, identityNow())
 		}
 		c.mu.Unlock()
 		close(f.done)

@@ -763,13 +763,40 @@ func TestIdentityCacheStopsWalkingWhereTheFingerprintCannotHelp(t *testing.T) {
 		fingerprintCostJudged = true // the fake repo-key costs ~nothing: any walk loses
 		root := initGitRepo(t)
 		walks := fingerprintWalks.Load()
-		for i := 0; i < 3; i++ {
+		for i := 0; i < 4; i++ {
 			CurrentRepoIdentity(ctx, root)
 		}
-		if f.runs.Load() != 3 || fingerprintWalks.Load()-walks != 1 {
+		// read 1 runs and pairs (walk 1), read 2 is a hit (walk 2, the second costly
+		// walk in a row turns the fingerprint off), reads 3 and 4 run without walking
+		if f.runs.Load() != 3 || fingerprintWalks.Load()-walks != 2 {
 			t.Fatalf("runs=%d walks=%d", f.runs.Load(), fingerprintWalks.Load()-walks)
 		}
 	})
+}
+
+// One stalled walk (a GC pause or preemption inside its wall time) must not turn the
+// fingerprint off; two costly walks in a row do. The remote Linux gate lost the
+// 16 MiB expansion's cache to one 3 ms walk among 90 us ones against a 4 ms fake
+// repo-key: the fingerprint went off for a minute and most pages spawned repo-key.
+func TestCostJudgeIgnoresOneStalledWalk(t *testing.T) {
+	prev := fingerprintCostJudged
+	fingerprintCostJudged = true
+	t.Cleanup(func() { fingerprintCostJudged = prev })
+	now := time.Now()
+	const cheap, stall, key = 90_000, 3_000_000, 4_000_000
+	st := &rootState{keyNs: key}
+	for i, ns := range []int64{cheap, stall, cheap, cheap, stall, cheap} {
+		if st.noteWalk(ns, now); !st.fpOffUntil.IsZero() {
+			t.Fatalf("walk %d (%d ns) turned the fingerprint off after a single stall", i, ns)
+		}
+	}
+	st.noteWalk(stall, now)
+	if st.noteWalk(stall, now); !st.fpOffUntil.Equal(now.Add(fingerprintRetryAfter)) {
+		t.Fatal("two costly walks in a row must turn the fingerprint off")
+	}
+	if st.walkNs != 0 || st.lastWalkNs != 0 {
+		t.Fatalf("after judging off the next probes measure afresh: %+v", st)
+	}
 }
 
 func TestFingerprintLayouts(t *testing.T) {
