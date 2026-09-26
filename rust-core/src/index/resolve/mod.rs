@@ -53,8 +53,6 @@ pub const RESOLVER_REVISION: u32 = 1;
 
 /// Global-tier names shorter than this are too common to bind by name alone.
 const MIN_GLOBAL_NAME: usize = 4;
-/// Top-level definitions fetched per global-tier name (two files make it ambiguous).
-const GLOBAL_CANDIDATES: usize = 8;
 /// Global lookups cached per run before the cache is cleared (bounded transient).
 const GLOBAL_CACHE_MAX: usize = 4096;
 /// Base types searched for a member, first-wins.
@@ -608,14 +606,13 @@ impl<'c> Resolver<'c> {
                 if self.globals.len() >= GLOBAL_CACHE_MAX {
                     self.globals.clear();
                 }
-                let defs = self.db.top_level(ctx.family, name, GLOBAL_CANDIDATES)?;
-                let files: BTreeSet<i64> = defs.iter().map(|(s, _)| s.file).collect();
-                let u = match (files.len(), defs.first()) {
-                    (1, Some((s, _))) => Global::One {
-                        id: s.id,
-                        file: s.file,
+                // two definer files make the name ambiguous
+                let u = match self.db.top_level_files(ctx.family, name, 2)?[..] {
+                    [] => Global::None,
+                    [file] => match self.db.in_file(file, name, name)?.first() {
+                        Some(s) => Global::One { id: s.id, file },
+                        None => Global::None,
                     },
-                    (0, _) => Global::None,
                     _ => Global::Many,
                 };
                 self.globals.insert(key, u);
@@ -657,6 +654,11 @@ pub enum Export {
         name: Option<String>,
         alias: Option<String>,
     },
+    /// The base names (`extends`/`implements`, Go embedding) of a type: members bind
+    /// through them.
+    Bases { qname: String, bases: Vec<String> },
+    /// The file uses ES export syntax, so its unexported declarations are not exports.
+    EsModule,
 }
 
 pub type Signature = BTreeSet<Export>;
@@ -690,6 +692,27 @@ pub fn signature(conn: &Connection, fid: i64) -> rusqlite::Result<Signature> {
     })? {
         out.insert(row?);
     }
+    let mut st = conn.prepare_cached(
+        "SELECT s.qualified_name, n.name FROM refs r
+         JOIN symbols s ON s.id = r.symbol_id JOIN names n ON n.id = r.name_id
+         WHERE r.file_id = ?1 AND r.kind IN (?2, ?3) AND s.local = 0
+         ORDER BY s.qualified_name, r.start_byte",
+    )?;
+    let mut bases: HashMap<String, Vec<String>> = HashMap::new();
+    for row in st.query_map(params![fid, ref_kind::EXTENDS, ref_kind::IMPLEMENTS], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    })? {
+        let (qname, base) = row?;
+        bases.entry(qname).or_default().push(base);
+    }
+    out.extend(
+        bases
+            .into_iter()
+            .map(|(qname, bases)| Export::Bases { qname, bases }),
+    );
+    if (Db { conn }).has_es_exports(fid)? {
+        out.insert(Export::EsModule);
+    }
     Ok(out)
 }
 
@@ -713,7 +736,8 @@ impl Dependents {
         before: &Signature,
         after: &Signature,
     ) -> rusqlite::Result<()> {
-        let mut reexports_changed = false;
+        // exports bound without being named here: re-exports, CommonJS declarations
+        let mut importers_changed = false;
         for e in before.symmetric_difference(after) {
             match e {
                 Export::Symbol {
@@ -732,8 +756,14 @@ impl Dependents {
                         self.files.extend(go_type_files(conn, path, ty)?);
                     }
                 }
+                // members bound through the old or the new bases may rebind: every
+                // member name of either hierarchy
+                Export::Bases { bases, .. } => {
+                    self.names.extend(hierarchy_member_names(conn, bases)?);
+                }
+                Export::EsModule => importers_changed = true,
                 Export::Reexport { name, alias, .. } => {
-                    reexports_changed = true;
+                    importers_changed = true;
                     for n in [name, alias].into_iter().flatten() {
                         if let Some(id) = (Db { conn }).name_id(n)? {
                             self.names.insert(id);
@@ -742,8 +772,8 @@ impl Dependents {
                 }
             }
         }
-        if reexports_changed {
-            // anything bound through this file's re-exports: its importers
+        if importers_changed {
+            // anything bound through this file's exports without naming them: its importers
             let mut st = conn.prepare_cached(
                 "SELECT DISTINCT file_id FROM imports WHERE resolved_file_id = ?1",
             )?;
@@ -753,6 +783,50 @@ impl Dependents {
         }
         Ok(())
     }
+}
+
+/// Name ids of the members of the types named `bases` and of their own bases, up to
+/// `MAX_INHERITANCE_DEPTH`. Types are matched by name across the repository (and an
+/// aliased named import by its original name): an over-approximation, so a rebinding
+/// through a base is never missed.
+fn hierarchy_member_names(conn: &Connection, bases: &[String]) -> rusqlite::Result<Vec<i64>> {
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut level: Vec<String> = bases.to_vec();
+    let mut out = Vec::new();
+    let mut original = conn.prepare_cached(
+        "SELECT DISTINCT name FROM imports WHERE alias = ?1 AND name IS NOT NULL",
+    )?;
+    let mut types = conn.prepare_cached(&format!(
+        "SELECT {} FROM symbols s JOIN names n ON n.id = s.name_id
+         WHERE s.qualified_name = ?1 AND s.local = 0",
+        scope::SYM_COLS
+    ))?;
+    let mut members = conn.prepare_cached(
+        "SELECT DISTINCT name_id FROM symbols
+         WHERE local = 0 AND substr(qualified_name, 1, length(?1) + 1) = ?1 || '.'",
+    )?;
+    let db = Db { conn };
+    for _ in 0..=MAX_INHERITANCE_DEPTH {
+        let mut next = Vec::new();
+        for name in std::mem::take(&mut level) {
+            let aliased = original
+                .query_map([&name], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            for ty in std::iter::once(name).chain(aliased) {
+                if !seen.insert(ty.clone()) {
+                    continue;
+                }
+                for m in members.query_map([&ty], |r| r.get::<_, i64>(0))? {
+                    out.push(m?);
+                }
+                for s in types.query_map([&ty], scope::sym)? {
+                    next.extend(db.bases(&s?)?);
+                }
+            }
+        }
+        level = next;
+    }
+    Ok(out)
 }
 
 /// Files in `path`'s Go package that declare the top-level type `ty`.

@@ -96,11 +96,11 @@ impl Sym {
     }
 }
 
-const SYM_COLS: &str = "s.id, s.file_id, s.name_id, n.name, s.qualified_name, s.kind, s.container_id, s.exported, s.local";
+pub(super) const SYM_COLS: &str = "s.id, s.file_id, s.name_id, n.name, s.qualified_name, s.kind, s.container_id, s.exported, s.local";
 /// Column of the file path appended after `SYM_COLS`.
 const PATH_COL: usize = 9;
 
-fn sym(r: &Row<'_>) -> rusqlite::Result<Sym> {
+pub(super) fn sym(r: &Row<'_>) -> rusqlite::Result<Sym> {
     Ok(Sym {
         id: r.get(0)?,
         file: r.get(1)?,
@@ -419,27 +419,38 @@ impl Db<'_> {
             .collect())
     }
 
-    /// Top-level definitions of `name` in the family's files, up to `limit`, with
-    /// each file's path.
-    pub fn top_level(
+    /// Files of the family defining `name` at top level, in path order, at most
+    /// `limit` (two decide uniqueness however many rows one file holds).
+    pub fn top_level_files(
         &self,
         family: Family,
         name: &str,
         limit: usize,
-    ) -> rusqlite::Result<Vec<(Sym, String)>> {
+    ) -> rusqlite::Result<Vec<i64>> {
         let sql = format!(
-            "SELECT {SYM_COLS}, f.path FROM symbols s JOIN names n ON n.id = s.name_id
+            "SELECT DISTINCT s.file_id FROM symbols s JOIN names n ON n.id = s.name_id
              JOIN files f ON f.id = s.file_id
              WHERE n.name = ?1 AND s.qualified_name = ?1 AND s.local = 0
-               AND f.lang IN ({}) ORDER BY f.path, s.ord LIMIT ?2",
+               AND f.lang IN ({}) ORDER BY f.path LIMIT ?2",
             family.langs()
         );
         self.conn
             .prepare_cached(&sql)?
-            .query_map(rusqlite::params![name, limit as i64], |r| {
-                Ok((sym(r)?, r.get::<_, String>(PATH_COL)?))
-            })?
+            .query_map(rusqlite::params![name, limit as i64], |r| r.get(0))?
             .collect()
+    }
+
+    /// The file uses ES export syntax: an exported declaration, an export specifier
+    /// or a re-export.
+    pub fn has_es_exports(&self, fid: i64) -> rusqlite::Result<bool> {
+        self.conn
+            .prepare_cached(
+                "SELECT EXISTS (SELECT 1 FROM symbols WHERE file_id = ?1 AND exported = 1)
+                     OR EXISTS (SELECT 1 FROM refs WHERE file_id = ?1 AND kind = ?2)
+                     OR EXISTS (SELECT 1 FROM imports WHERE file_id = ?1
+                                AND kind IN ('reexport', 'reexport_all'))",
+            )?
+            .query_row(rusqlite::params![fid, ref_kind::EXPORT], |r| r.get(0))
     }
 
     /// Base-type names a type declares (`extends`/`implements` references it encloses).

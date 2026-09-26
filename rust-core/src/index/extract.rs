@@ -31,7 +31,7 @@ pub const MAX_SYMBOLS_PER_FILE: usize = crate::treesitter::MAX_SYMBOLS_PER_FILE;
 pub const MAX_REFS_PER_FILE: usize = 100_000;
 
 /// Bump when extraction output changes for the same bytes. Part of the analyzer version.
-pub const EXTRACTOR_REVISION: u32 = 4;
+pub const EXTRACTOR_REVISION: u32 = 5;
 
 /// Longest container prefix spelled out in a qualified name. A deeper prefix is replaced
 /// by `~<hash of the prefix>`, so qualified names, UIDs and scope frames stay bounded
@@ -459,8 +459,37 @@ impl<'a> Walker<'a> {
     }
 
     fn grandparent(&self) -> Option<&Anc> {
+        self.ancestor(2)
+    }
+
+    /// The ancestor `up` levels above the current node (1 = parent).
+    fn ancestor(&self, up: usize) -> Option<&Anc> {
         let n = self.anc.len();
-        (n >= 3).then(|| &self.anc[n - 3])
+        (n > up).then(|| &self.anc[n - 1 - up])
+    }
+
+    /// The ancestor `up - 1` levels above the current node (0: the node itself), held
+    /// in slot `field` of the ancestor at `up`, is written by an assignment or increment.
+    fn is_write_target(&self, up: usize, field: &str) -> bool {
+        let at = |k: usize| {
+            self.ancestor(k)
+                .map_or(("", ""), |a| (a.kind, a.field.unwrap_or("")))
+        };
+        let (pk, pf) = at(up);
+        let gk = at(up + 1).0;
+        match (pk, field) {
+            (
+                "assignment_expression"
+                | "augmented_assignment_expression"
+                | "compound_assignment_expr"
+                | "assignment_statement",
+                "left",
+            )
+            | ("update_expression" | "inc_statement" | "dec_statement", _) => true,
+            // Go: `a, s.N = ...` puts the targets in an expression_list
+            ("expression_list", _) => pf == "left" && gk == "assignment_statement",
+            _ => false,
+        }
     }
 
     fn in_callable(&self) -> bool {
@@ -832,15 +861,6 @@ impl<'a> Walker<'a> {
         let pf = parent.and_then(|p| p.field).unwrap_or("");
         let gk = self.grandparent().map(|g| g.kind).unwrap_or("");
         let f = field.unwrap_or("");
-        let is_assign = |k: &str| {
-            matches!(
-                k,
-                "assignment_expression"
-                    | "augmented_assignment_expression"
-                    | "compound_assignment_expr"
-                    | "assignment_statement"
-            )
-        };
         if (pk == "call_expression" && f == "function")
             || (pk == "new_expression" && f == "constructor")
             || (pk == "macro_invocation" && f == "macro")
@@ -857,7 +877,7 @@ impl<'a> Walker<'a> {
             {
                 return ref_kind::MEMBER_CALL;
             }
-            if pf == "left" && is_assign(gk) {
+            if self.is_write_target(2, pf) {
                 return ref_kind::WRITE;
             }
             return ref_kind::MEMBER;
@@ -865,12 +885,7 @@ impl<'a> Walker<'a> {
         if pk == "scoped_type_identifier" && f == "name" {
             return ref_kind::TYPE;
         }
-        if (is_assign(pk) && f == "left")
-            || pk == "update_expression"
-            || pk == "inc_statement"
-            || pk == "dec_statement"
-            || (pk == "expression_list" && pf == "left" && gk == "assignment_statement")
-        {
+        if self.is_write_target(1, f) {
             return ref_kind::WRITE;
         }
         if pk == "export_specifier" {

@@ -288,6 +288,10 @@ fn envelope(
         // name-matched file edges are leads, never a complete answer
         *out.causes.entry("lexical_graph".to_string()).or_default() += 1;
     }
+    if out.truncated {
+        // the walk stopped at MAX_IMPACTED: dependents past it are not listed
+        out.causes.insert("truncated".to_string(), 1);
+    }
     let mut drops = conn.prepare_cached(
         "SELECT r.cause, n.name, f.path, r.count FROM resolve_drops r
          JOIN names n ON n.id = r.name_id JOIN files f ON f.id = r.file_id

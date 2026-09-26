@@ -504,6 +504,8 @@ Source: `docs/research/PARITY_REQUIREMENTS_2026-09-25.md` (requirements, process
 
 **Acceptance.** impact on Go and TS/JS returns resolved symbol edges with confidence and provenance. Lexical edges remain only as provenance=lexical fallback. The precision number is recorded for EVAL-09.
 
+**Decision (2026-09-26).** Go and TS/JS files keep their lexical `structure` and `flow` layers next to the `symbol` layer. `index impact` reads only the symbol layer for these languages, so the lexical layers are the fallback in data, not in queries. They stay because WS-14 ports the legacy consumers (repo map, MCP `impact`) onto `index.db` and needs file edges at legacy parity for every language first. Cost: 2 to 7 s more on a full build (`docs/benchmarks/2026-09-26-ws17-resolver.md`). Revisit after WS-14: when nothing reads the lexical layers for resolver languages, skip them where `resolve::resolves(lang)` holds.
+
 **Collision risk.** schema.rs (from WS-07) gets an edges table addition. No in-flight collisions.
 
 ### WS-18 — Code BM25 lane, hybrid fusion, snippets and explainable reasons

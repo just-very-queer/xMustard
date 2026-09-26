@@ -51,8 +51,14 @@ fn find(
     }
     seen.push((fid, name.to_string()));
     let own = db.in_file(fid, name, name)?;
-    // an exported declaration wins; CommonJS files export without the keyword.
-    if let Some(s) = own.iter().find(|s| s.exported).or(own.first()) {
+    // an exported declaration wins; a CommonJS file (no ES export syntax) exports
+    // without the keyword.
+    let exported = match own.iter().find(|s| s.exported) {
+        Some(s) => Some(s),
+        None if !own.is_empty() && !db.has_es_exports(fid)? => own.first(),
+        None => None,
+    };
+    if let Some(s) = exported {
         return Ok(Some((s.clone(), depth > 0)));
     }
     let Some((ctx, _)) = db.file_ctx(fid)? else {

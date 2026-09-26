@@ -211,6 +211,8 @@ const GO_EXTRA: &str = r#"package store
 
 func (s *Store) bump() {}
 
+func (s *Store) Clear() { s.items = nil }
+
 func (s *Store) Get(k string) int { return s.items[k] + helper() }
 
 func helper() int { return 1 }
@@ -356,6 +358,13 @@ fn resolution_tiers_imports_reexports_namespaces_packages_and_receivers() {
     let items = edge(&e, (s, "Store.Put"), "ACCESSES", "read", (s, "Store.items"));
     assert_eq!(items.0, 0.95);
     edge(&e, (x, "Store.Get"), "ACCESSES", "read", (s, "Store.items"));
+    edge(
+        &e,
+        (x, "Store.Clear"),
+        "ACCESSES",
+        "write",
+        (s, "Store.items"),
+    );
     edge(&e, (x, "Store.Get"), "CALLS", "", (x, "helper"));
     edge(&e, (s, "Store"), "HAS_METHOD", "", (s, "Store.Put"));
     let far = edge(&e, (s, "Store"), "HAS_METHOD", "", (x, "Store.bump"));
@@ -574,6 +583,100 @@ fn updates_re_resolve_only_the_dependents_of_changed_exports() {
     let incremental = digest(r.path());
     index("build", r.path(), &[]);
     assert_eq!(incremental, digest(r.path()));
+}
+
+#[test]
+fn changing_a_base_class_re_resolves_callers_of_inherited_members() {
+    let r = repo(&[
+        (
+            "web/base.ts",
+            "export class Parent {\n  greetPeople(): string { return 'p'; }\n}\n\
+             export class Other {\n  greetPeople(): string { return 'o'; }\n}\n",
+        ),
+        (
+            "web/child.ts",
+            "import { Parent, Other } from './base';\nexport class Child extends Parent {}\n",
+        ),
+        (
+            "web/use.ts",
+            "import { Child } from './child';\n\
+             export function caller(c: Child): string { return c.greetPeople(); }\n",
+        ),
+    ]);
+    let (u, b) = (("web/use.ts", "caller"), "web/base.ts");
+    let e = symbol_edges(&db(&index("build", r.path(), &[])));
+    edge(&e, u, "CALLS", "", (b, "Parent.greetPeople"));
+
+    let child = "import { Parent, Other } from './base';\nexport class Child extends Other {}\n";
+    write(r.path(), "web/child.ts", child);
+    let rep = index("update", r.path(), &[]);
+    assert_eq!(rep["mode"], "incremental");
+    let e = symbol_edges(&db(&rep));
+    edge(&e, u, "CALLS", "", (b, "Other.greetPeople"));
+    assert!(
+        !e.keys()
+            .any(|k| k.0 == "web/use.ts" && k.5 == "Parent.greetPeople"),
+        "stale edge: {e:#?}"
+    );
+    let incremental = digest(r.path());
+    index("build", r.path(), &[]);
+    assert_eq!(
+        incremental,
+        digest(r.path()),
+        "update drifted from a full build"
+    );
+}
+
+#[test]
+fn es_modules_hide_unexported_names_and_many_rows_in_one_file_stay_ambiguous() {
+    let overloads = "function dupeName(x: number): void;\n".repeat(9);
+    let r = repo(&[
+        ("web/cjs.js", "function hiddenHelper() { return 1; }\n"),
+        (
+            "web/esm.ts",
+            "export const shown = 1;\nfunction hiddenHelper() { return 2; }\n",
+        ),
+        (
+            "web/use.ts",
+            "import { hiddenHelper } from './esm';\nimport { hiddenHelper as h } from './cjs';\n\
+             export function useThem() { return hiddenHelper() + h() + dupeName(1); }\n",
+        ),
+        (
+            "web/a.ts",
+            &format!("{overloads}function dupeName(x: number): void {{}}\n"),
+        ),
+        ("web/b.ts", "function dupeName(x: number): void {}\n"),
+    ]);
+    let rep = index("build", r.path(), &[]);
+    let e = symbol_edges(&db(&rep));
+    let to = |path: &str| {
+        e.keys()
+            .any(|k| k.0 == "web/use.ts" && k.2 == "CALLS" && k.4 == path)
+    };
+    // an ES module's unexported declaration is no export; a CommonJS one is
+    assert!(!to("web/esm.ts") && to("web/cjs.js"), "{e:#?}");
+    let d = drops(&db(&rep));
+    let has = |n: &str, c: &str| d.contains_key(&("web/use.ts".into(), n.into(), c.into()));
+    assert!(has("hiddenHelper", "unresolved"), "{d:#?}");
+    // nine rows in a.ts do not hide b.ts: ambiguous, not a unique global
+    assert!(!to("web/a.ts") && !to("web/b.ts"), "{e:#?}");
+    assert!(has("dupeName", "ambiguous"), "{d:#?}");
+
+    // dropping the module's last export makes its declarations CommonJS exports again
+    write(
+        r.path(),
+        "web/esm.ts",
+        "function hiddenHelper() { return 2; }\n",
+    );
+    let rep = index("update", r.path(), &[]);
+    assert_eq!(rep["mode"], "incremental");
+    let incremental = digest(r.path());
+    index("build", r.path(), &[]);
+    assert_eq!(
+        incremental,
+        digest(r.path()),
+        "update drifted from a full build"
+    );
 }
 
 /// Copy a fixture tree into a fresh repository.
