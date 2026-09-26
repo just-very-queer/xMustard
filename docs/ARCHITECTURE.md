@@ -28,7 +28,10 @@ Optional React UI -> full HTTP surface
 ```
 
 The Rust core is invoked on demand. A resident index daemon is not the current
-architecture. Graph and per-file symbol caches, plus the tracked-file hash stat
+architecture. With `XMUSTARD_CORE_WORKER=1` (opt-in, off by default) one resident
+`xmustard-core serve` worker answers the resident subcommands instead of a process
+per call; the budget governor reports its memory and recycles it under pressure.
+Graph and per-file symbol caches, plus the tracked-file hash stat
 cache that change tracking uses, live under `.git/xmustard-cache/` for Git
 repositories. The default Rust build does not enable `semantic-onnx`.
 
@@ -50,7 +53,7 @@ repositories. The default Rust build does not enable `semantic-onnx`.
 | Search, impact and change tracking | `search.rs`, `semantic.rs`, `changetrack.rs`, `hashcache.rs` | Retrieval lanes, graph traversal, baseline and signature differences; stat-keyed file-hash cache with a racy-timestamp guard |
 | Diagnostics and live language servers | `diagnostics.rs`, `lsp.rs`, `lsp_session.rs`; Go LSP adapters | LSP is optional; transient results do not require Postgres |
 | Verification and retained goal runtime | `verification.rs`, `goalruntime.rs`; Go run control | Process execution, evidence and persisted operational state |
-| Resource accounting | `api-go/internal/budget/` | 24 MiB transient-byte pool and helper-child limit: work that does not fit now gets 503/-32000, work that could never fit the pool gets a permanent answer (413, -32600 or a tool error); static component reservations; one heavy slot (bounded wait, owner label) behind an RSS watchdog over the owned tree plus the stdio shims, with no production callers yet, so it governs nothing today; Go memory limit at the daemon's 28 MiB line with a GOGC floor; data-movement counters; the `/api/health` budget block, which needs a bearer token while auth is enforced. Byte admission is still not a complete RSS bound |
+| Resource accounting | `api-go/internal/budget/` | 24 MiB transient-byte pool and helper-child limit: work that does not fit now gets 503/-32000, work that could never fit the pool gets a permanent answer (413, -32600 or a tool error); static component reservations, including the opt-in resident Rust worker (`rustcore/worker_governor.go`); one heavy slot (bounded wait, owner label) behind an RSS watchdog over the owned tree plus the stdio shims, taken by the whole-repository Rust builds (`symbolgraph build`, `build-lsp`, `changetrack index`; `rustcore/heavy.go`) and never by captures or queries; reclaim before refusing heavy work and when a sample is over the soft ceiling, which recycles the worker (it is also recycled idle above its lines or while memory is tight); Go memory limit at the daemon's 28 MiB line with a GOGC floor; data-movement counters; the `/api/health` budget block, shown in full only to an operator token (admin, or another non-reader token with no workspace scope) while auth is enforced. Byte admission is still not a complete RSS bound |
 | Shared wire models | Go request/record structs, each Rust module's own `Serialize` output types, `frontend/src/lib/types.ts` | Contract changes need matching consumers |
 | Optional operator UI | `frontend/src/` | Full API consumer; outside the current development focus |
 
