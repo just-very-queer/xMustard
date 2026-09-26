@@ -5,14 +5,19 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"os"
 	"strings"
 	"testing"
-	"time"
 )
 
 // seedPromoted writes n promoted single-agent entries (e0000 oldest … newest last).
 func seedPromoted(t *testing.T, dir, ws string, n int) []ContextEntry {
+	t.Helper()
+	return seedPromotedWith(t, dir, ws, n, nil)
+}
+
+// seedPromotedWith is seedPromoted with a hook that adjusts each entry before it is
+// stored.
+func seedPromotedWith(t *testing.T, dir, ws string, n int, adjust func(*ContextEntry)) []ContextEntry {
 	t.Helper()
 	entries := make([]ContextEntry, 0, n)
 	for i := 0; i < n; i++ {
@@ -32,12 +37,12 @@ func seedPromoted(t *testing.T, dir, ws string, n int) []ContextEntry {
 			CreatedAt:             fmt.Sprintf("2026-06-01T00:00:00.%09dZ", i),
 			UpdatedAt:             fmt.Sprintf("2026-06-01T00:00:00.%09dZ", i),
 		})
+		if adjust != nil {
+			adjust(&entries[i])
+		}
 	}
 	if err := saveContextEntries(dir, ws, entries); err != nil {
 		t.Fatal(err)
-	}
-	for _, e := range entries {
-		writeContextContentFile(dir, ws, e.ID, e.Content)
 	}
 	return entries
 }
@@ -116,81 +121,42 @@ func TestPlainRecallWithDirtyTreeStillReturnsRecencyTopN(t *testing.T) {
 	}
 }
 
-// writeRawMetaCache writes a recall meta cache from raw JSON maps (so the test can
-// express legacy and adversarial shapes) and makes it strictly fresher than the source.
-func writeRawMetaCache(t *testing.T, dir, ws string, metas []map[string]any) {
-	t.Helper()
-	if err := writeJSON(contextMetaCachePath(dir, ws), metas); err != nil {
-		t.Fatal(err)
-	}
-	future := time.Now().Add(time.Hour)
-	if err := os.Chtimes(contextMetaCachePath(dir, ws), future, future); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func rawMeta(e ContextEntry, shortHash string) map[string]any {
-	return map[string]any{
-		"id": e.ID, "workspace_id": e.WorkspaceID, "title": e.Title, "source": e.Source,
-		"permission": e.Permission, "status": e.Status, "promoted": e.Promoted,
-		"verifications": e.Verifications, "required_verifications": e.RequiredVerifications,
-		"created_at": e.CreatedAt, "updated_at": e.UpdatedAt, "search_tokens": e.SearchTokens,
-		"content_hash": shortHash,
-	}
-}
-
-// Root hardening: a legacy meta cache (64-bit filename hash, no full digest) must not
-// be trusted to bind content to an approval. Recall falls back to the source and the
-// cache is migrated to full digests.
-func TestRecallLegacyShortHashCacheFailsClosedAndMigrates(t *testing.T) {
+// Root hardening: acceptance compares the FULL SHA-256 digest of the revision each
+// entry was ranked with. When the store keeps changing the served revision between
+// ranking and content load, the mismatched entry is withheld after the bounded
+// retries, never returned under the approval of another version.
+func TestRecallWithholdsContentWhenStoreKeepsMoving(t *testing.T) {
 	dir := t.TempDir()
-	ws := "wsLegacyCache"
-	entries := seedPromoted(t, dir, ws, 1)
-	src := entries[0]
-	// the source holds the current body; a stale body's content file still exists.
-	const stale = "STALE_BODY_FROM_OLD_VERSION"
-	writeContextContentFile(dir, ws, src.ID, stale)
-	legacy := rawMeta(src, hashContent(stale))
-	writeRawMetaCache(t, dir, ws, []map[string]any{legacy})
-
-	res, err := RecallContext(dir, ws, "", nil, 8)
+	ws := "wsFullDigest"
+	disable := false
+	writeTestSettings(t, dir, appSettings{RequireMultiAgentVerification: &disable})
+	entry, err := ProposeContext(dir, ws, ProposeContextRequest{Content: "approved text", Source: "solo", Permission: "readwrite"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := res["entries"].([]ContextEntry)
-	if len(got) != 1 || got[0].Content != src.Content {
-		t.Fatalf("legacy cache must fall back to the source body %q, got %+v", src.Content, got)
+	edits := 0
+	recallBeforeContentLoad = func() {
+		edits++
+		// edit and re-approve, so the entry is promoted again at every ranking pass but
+		// serves a different revision by the time its content is read
+		if _, err := UpdateContextContent(dir, ws, entry.ID, fmt.Sprintf("moving text %d", edits), ContextActor{Admin: true}); err != nil {
+			t.Errorf("update: %v", err)
+		}
+		if _, err := VerifyContext(dir, ws, entry.ID, "solo", true, ""); err != nil {
+			t.Errorf("verify: %v", err)
+		}
 	}
-	var metas []contextEntryMeta
-	if err := readJSON(contextMetaCachePath(dir, ws), &metas); err != nil {
-		t.Fatal(err)
-	}
-	if len(metas) != 1 || metas[0].ContentDigest != contentDigest(src.Content) {
-		t.Fatalf("legacy cache was not migrated to a full digest: %+v", metas)
-	}
-}
-
-// Root hardening: acceptance compares the FULL SHA-256 digest recorded with the ranked
-// metadata. A body whose 64-bit filename hash matches but whose full digest does not is
-// withheld, never returned under the approval.
-func TestRecallTrustComparisonUsesFullDigest(t *testing.T) {
-	dir := t.TempDir()
-	ws := "wsFullDigest"
-	entries := seedPromoted(t, dir, ws, 1)
-	src := entries[0]
-	m := rawMeta(src, hashContent(src.Content))
-	m["content_digest"] = contentDigestForTest("the approved version had different text")
-	writeRawMetaCache(t, dir, ws, []map[string]any{m})
+	defer func() { recallBeforeContentLoad = nil }()
 
 	res, err := RecallContext(dir, ws, "", nil, 8)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got := res["entries"].([]ContextEntry); len(got) != 0 {
-		t.Fatalf("body with matching short hash but different full digest was returned: %+v", got)
+		t.Fatalf("content of a revision other than the ranked one was returned: %+v", got)
 	}
-	if res["consistency_withheld"] != 1 {
-		t.Fatalf("expected the mismatched entry to be withheld, got %v", res["consistency_withheld"])
+	if res["consistency_withheld"] != 1 || res["consistency_attempts"] != recallConsistencyAttempts {
+		t.Fatalf("expected the mismatched entry to be withheld after %d attempts, got %v", recallConsistencyAttempts, res)
 	}
 }
 
@@ -199,16 +165,23 @@ func contentDigestForTest(s string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// The binding digest is the full SHA-256 of the served content.
+func TestContentDigestIsFullSHA256(t *testing.T) {
+	if contentDigest("x") != contentDigestForTest("x") {
+		t.Fatal("content digest must be the full SHA-256")
+	}
+}
+
 // Fable review #1: with no query/paths, the current working changes must actually
 // boost matching memories (they were computed and then discarded).
 func TestPlainRecallBoostsMemoryAboutChangedFiles(t *testing.T) {
 	dir := t.TempDir()
 	ws := "wsRecallFocus"
-	entries := seedPromoted(t, dir, ws, 12)
-	entries[0].Paths = []string{"changed.go"} // the OLDEST memory is about the changed file
-	if err := saveContextEntries(dir, ws, entries); err != nil {
-		t.Fatal(err)
-	}
+	entries := seedPromotedWith(t, dir, ws, 12, func(e *ContextEntry) {
+		if e.ID == "e0000" {
+			e.Paths = []string{"changed.go"} // the OLDEST memory is about the changed file
+		}
+	})
 	recallChangedFiles = func(context.Context, string, string) []string { return []string{"changed.go"} }
 	defer func() { recallChangedFiles = currentChangedFiles }()
 	res, err := RecallContext(dir, ws, "", nil, 0)

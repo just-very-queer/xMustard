@@ -1,9 +1,12 @@
 package workspaceops
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"xmustard/api-go/internal/govstore"
 )
 
 // A referenced path that is missing at verify time is baselined as a sentinel, so a
@@ -51,11 +54,17 @@ func TestEditClearsDriftBaseline(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	entries, _ := loadContextEntries(dir, ws)
-	entries[0].PathHashes = map[string]string{"a.go": "deadbeef"}
-	entries[0].Stale = true
-	entries[0].StalePaths = []string{"a.go"}
-	_ = saveContextEntries(dir, ws, entries)
+	storeUpdate(t, dir, ws, func(tx govstore.Tx) error {
+		actor := govstore.Actor{Principal: "test"}
+		if err := tx.SetBaselines(context.Background(), entry.ID, pathBaselines(map[string]string{"a.go": "deadbeef"}), "", actor); err != nil {
+			return err
+		}
+		_, err := tx.MarkStale(context.Background(), entry.ID, []govstore.AnchorRef{{Kind: govstore.AnchorPath, Value: "a.go"}}, "", actor)
+		return err
+	})
+	if before, _ := loadContextEntries(dir, ws); before[0].PathHashes["a.go"] != "deadbeef" {
+		t.Fatalf("setup: baseline not recorded: %+v", before[0])
+	}
 
 	if _, err := UpdateContextContent(dir, ws, entry.ID, "second", ContextActor{Admin: true}); err != nil {
 		t.Fatal(err)

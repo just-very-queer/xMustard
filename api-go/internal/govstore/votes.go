@@ -71,6 +71,8 @@ type Tally struct {
 // VoteReader reads votes.
 type VoteReader interface {
 	ListVotes(ctx context.Context, entryID string, revision int64) ([]Vote, error)
+	// ServedVotes returns ListVotes(id, 0) for many entries at once, keyed by entry id.
+	ServedVotes(ctx context.Context, ids []string) (map[string][]Vote, error)
 	Tally(ctx context.Context, entryID string, revision int64) (Tally, error)
 }
 
@@ -115,6 +117,65 @@ func (r *reader) ListVotes(ctx context.Context, entryID string, revision int64) 
 		out = append(out, v)
 	}
 	return out, rows.Err()
+}
+
+// ServedVotes reads the counting verdicts on each entry's served revision in bounded
+// batches, so a listing costs one query per batch instead of one per entry.
+func (r *reader) ServedVotes(ctx context.Context, ids []string) (map[string][]Vote, error) {
+	out := make(map[string][]Vote, len(ids))
+	for start := 0; start < len(ids); start += maxInArgs {
+		chunk := ids[start:min(start+maxInArgs, len(ids))]
+		args := make([]any, len(chunk))
+		for i, id := range chunk {
+			args[i] = id
+		}
+		rows, err := r.query(ctx, `SELECT v.entry_id, v.revision, v.principal, v.principal_owner, v.principal_kind,
+			v.verdict, v.target, v.note, v.evidence_handle, v.content_digest, v.session_id, v.ordinal, v.epoch, v.at
+			FROM votes v JOIN entries e ON e.id = v.entry_id AND e.vote_epoch = v.epoch AND e.revision = v.revision
+			WHERE v.entry_id IN (`+placeholders(len(chunk))+`) ORDER BY v.entry_id, v.ordinal, v.pk`, args...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var v Vote
+			if err := rows.Scan(&v.EntryID, &v.Revision, &v.Principal, &v.PrincipalOwner, &v.PrincipalKind, &v.Verdict,
+				&v.Target, &v.Note, &v.EvidenceHandle, &v.ContentDigest, &v.SessionID, &v.Ordinal, &v.Epoch, &v.At); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			out[v.EntryID] = append(out[v.EntryID], v)
+		}
+		err = rows.Err()
+		if cerr := rows.Close(); err == nil {
+			err = cerr
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+// VerificationMode labels how a promoted entry's served revision earned promotion, from
+// its tally. It is the one trust-label rule: the importer and the governance kernel
+// both call it, and the peer_verified invariant (peerShortfall) enforces its first case.
+// peer_verified needs `required` peer approvals, or the workspace threshold when a
+// single assertion promoted the entry (required <= 1). Otherwise the open-mode
+// identity's approval makes it self_asserted_open_mode, and anything else is one
+// authenticated principal's word (single_agent).
+func VerificationMode(t Tally, required, threshold int) string {
+	need := required
+	if need <= 1 {
+		need = max(threshold, 1)
+	}
+	switch {
+	case t.PeerApprovals >= need:
+		return ModePeerVerified
+	case t.OpenModeApproved:
+		return ModeSelfAssertedOpenMode
+	default:
+		return ModeSingleAgent
+	}
 }
 
 // Tally counts the verdicts on a revision (0 = served).

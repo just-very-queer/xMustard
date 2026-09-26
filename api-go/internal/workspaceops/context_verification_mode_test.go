@@ -184,7 +184,12 @@ func TestAuthenticatedWritesRegateOpenModeEntry(t *testing.T) {
 	if got, _ = VerifyContextAs(dir, ws, e.ID, root, true, ""); got.Promoted {
 		t.Fatalf("one principal must not re-promote rewritten open-mode memory alone")
 	}
-	got, _ = VerifyContext(dir, ws, e.ID, "bob", true, "")
+	// the editor wrote the served revision, so its approval is not a peer's (WS-12:
+	// the store's peer rule excludes the revision author as well as the entry author)
+	if got, _ = VerifyContext(dir, ws, e.ID, "bob", true, ""); got.Promoted {
+		t.Fatalf("the editor plus one peer must not promote rewritten memory under a quorum of 2")
+	}
+	got, _ = VerifyContext(dir, ws, e.ID, "carol", true, "")
 	if !got.Promoted || got.VerificationMode != VerificationPeer {
 		t.Fatalf("two distinct peers must promote as peer_verified, got promoted=%v mode=%q", got.Promoted, got.VerificationMode)
 	}
@@ -226,7 +231,7 @@ func TestOpenModeVerifyAssertsLegacyPendingEntry(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(dir, "workspaces", ws), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeJSON(contextEntriesPath(dir, ws), []map[string]any{pending("legacy", OpenModeIdentity), pending("authed", "alice")}); err != nil {
+	if err := writeJSON(legacyContextEntriesPath(dir, ws), []map[string]any{pending("legacy", OpenModeIdentity), pending("authed", "alice")}); err != nil {
 		t.Fatal(err)
 	}
 	on := true
@@ -282,7 +287,7 @@ func TestLegacyEntriesInferVerificationMode(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(dir, "workspaces", ws), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeJSON(contextEntriesPath(dir, ws), legacy); err != nil {
+	if err := writeJSON(legacyContextEntriesPath(dir, ws), legacy); err != nil {
 		t.Fatal(err)
 	}
 	want := map[string]string{
@@ -318,18 +323,20 @@ func TestLegacyEntriesInferVerificationMode(t *testing.T) {
 	if m := recallModes(t, res); m[VerificationPeer] != 1 || m[VerificationSingleAgent] != 2 || m[VerificationSelfAssertedOpen] != 1 {
 		t.Fatalf("recall mode counts = %v", m)
 	}
-	// the meta-cache path (a cache written without the field) labels the same way
-	entries, _ := loadContextEntries(dir, ws)
-	writeContextMetaCache(dir, ws, entries)
-	if _, ok := loadPromotedMetaCached(dir, ws); !ok {
-		t.Fatal("expected recall to use the meta cache")
+	// the legacy file was imported once and moved aside as a backup
+	if _, err := os.Stat(legacyContextEntriesPath(dir, ws)); !os.IsNotExist(err) {
+		t.Fatalf("legacy context_entries.json must be moved aside after import, stat err = %v", err)
 	}
+	if _, err := os.Stat(legacyContextEntriesPath(dir, ws) + ".govstore-import.bak"); err != nil {
+		t.Fatalf("legacy import must keep a backup: %v", err)
+	}
+	// a second read labels the same way from the store alone
 	res, err = RecallContext(dir, ws, "legacy", nil, 8)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if m := recallModes(t, res); m[VerificationPeer] != 1 || m[VerificationSingleAgent] != 2 || m[VerificationSelfAssertedOpen] != 1 {
-		t.Fatalf("cached recall mode counts = %v", m)
+		t.Fatalf("recall mode counts after import = %v", m)
 	}
 }
 

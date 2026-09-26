@@ -12,11 +12,11 @@ import "sync"
 //
 // Usage:
 //
-//	unlock := lockStore(contextEntriesPath(dataDir, ws))
+//	unlock := lockStore(feedbackPath(dataDir, ws))
 //	defer unlock()
-//	entries, _ := loadContextEntries(dataDir, ws)
+//	entries, _ := loadFeedback(dataDir, ws)
 //	... mutate ...
-//	saveContextEntries(dataDir, ws, entries)
+//	saveFeedback(dataDir, ws, entries)
 //
 // Hold the lock across the full load→save span. Do NOT lock the load/save helpers
 // themselves, and never acquire the same key re-entrantly within one goroutine

@@ -7,7 +7,6 @@ import (
 	"slices"
 	"strings"
 	"testing"
-	"time"
 )
 
 func unknownFields(g *SessionGrounding) []string {
@@ -128,18 +127,12 @@ func TestGroundReportsUnreadableRunRecords(t *testing.T) {
 	}
 }
 
-// An unreadable memory store used to read as "0 stale memory".
+// An unreadable memory store used to read as "0 stale memory". A torn legacy file
+// that cannot be imported leaves the store unreadable for the workspace (fail closed).
 func TestGroundReportsUnreadableMemoryAsUnknown(t *testing.T) {
 	dataDir, ws := seedGroundBenchWorkspace(t)
-	src := contextEntriesPath(dataDir, ws)
+	src := legacyContextEntriesPath(dataDir, ws)
 	if err := os.WriteFile(src, []byte(`[{"id":"torn",`), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	// the torn store is newer than the metadata cache the seed wrote: on a coarse
-	// filesystem clock (Linux) both writes can share an mtime, and the cache is then
-	// trusted, as it is unless older than its source
-	later := time.Now().Add(time.Second)
-	if err := os.Chtimes(src, later, later); err != nil {
 		t.Fatal(err)
 	}
 	g, err := BuildSessionGrounding(dataDir, ws)
