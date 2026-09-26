@@ -417,7 +417,10 @@ func TestRegisteredRootIsRecheckedOnUse(t *testing.T) {
 		_, e1 := getWorkspaceRecord(dataDir, rec.WorkspaceID)
 		_, e2 := loadSnapshot(dataDir, rec.WorkspaceID)
 		_, e3 := confineAnchorPaths(dataDir, rec.WorkspaceID, []string{"secret.txt"})
-		return []error{e1, e2, e3}
+		// tool paths resolve through the registry, not loadSnapshot
+		_, e4 := resolveWorkspace(dataDir, rec.WorkspaceID)
+		e5 := requireWorkspaceSnapshot(dataDir, rec.WorkspaceID)
+		return []error{e1, e2, e3, e4, e5}
 	}
 	for i, err := range uses() {
 		if err != nil {

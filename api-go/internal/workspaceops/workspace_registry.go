@@ -135,7 +135,7 @@ func resolveWorkspace(dataDir, workspaceID string) (ResolvedWorkspace, error) {
 		e.lastUsed = now
 		ws := e.ws
 		registry.mu.Unlock()
-		return withScope(ws), nil
+		return verifiedScope(ws)
 	}
 	registry.mu.Unlock()
 
@@ -144,9 +144,16 @@ func resolveWorkspace(dataDir, workspaceID string) (ResolvedWorkspace, error) {
 		return ResolvedWorkspace{}, fmt.Errorf("load snapshot: %w", err)
 	}
 	ws := ResolvedWorkspace{WorkspaceID: workspaceID, Root: header.RootPath, Record: header}
-	if ws.Root == "" {
+	if ws.Root == "" || ws.Record.RegisterRoot == "" {
 		if rec, ok, _ := registryRecord(dataDir, workspaceID, recMark, now); ok {
-			ws.Root = rec.RootPath
+			if ws.Root == "" {
+				ws.Root = rec.RootPath
+			}
+			// as loadSnapshot: a snapshot written before a non-admin registered the
+			// root does not carry it; workspaces.json does.
+			if ws.Record.RegisterRoot == "" {
+				ws.Record.RegisterRoot, ws.Record.RegisteredBy = rec.RegisterRoot, rec.RegisteredBy
+			}
 		}
 	}
 	registry.mu.Lock()
@@ -156,6 +163,20 @@ func resolveWorkspace(dataDir, workspaceID string) (ResolvedWorkspace, error) {
 	registry.entries[key] = &registryEntry{snap: snap, records: recMark,
 		trusted: snap.trusted(now) && (!recMark.exists || recMark.trusted(now)), ws: ws, lastUsed: now}
 	registry.mu.Unlock()
+	return verifiedScope(ws)
+}
+
+// verifiedScope re-runs verifyRegisteredRoot for a non-admin-registered root on
+// every lookup (never cached, like the scope): a symlink or .git re-pointed after
+// registration fails closed on the next request.
+func verifiedScope(ws ResolvedWorkspace) (ResolvedWorkspace, error) {
+	rec := ws.Record
+	if rec.RootPath == "" {
+		rec.RootPath = ws.Root
+	}
+	if err := verifyRegisteredRoot(rec); err != nil {
+		return ResolvedWorkspace{}, err
+	}
 	return withScope(ws), nil
 }
 
