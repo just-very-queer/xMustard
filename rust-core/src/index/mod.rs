@@ -1,19 +1,22 @@
 //! Per-workspace code index store (PAR-STORE-03) and its transient worker
-//! (`xmustard-core index build|update|stats`, PAR-RT-02).
+//! (`xmustard-core index build|update|stats|impact`, PAR-RT-02).
 //!
 //! One SQLite file, `<git-dir>/xmustard-cache/index-v3/<scope>/index.db`, holds files,
 //! symbols with nested qualified names and stable UIDs, references (never from comments
 //! or string literals), imports, function-aligned chunks with contentless FTS5 postings,
-//! lexical file edges, the content-addressed per-file fact cache and meta.
+//! lexical file edges, resolved Go and TS/JS symbol edges with their drop counters (see
+//! `resolve`), the content-addressed per-file fact cache and meta.
 //!
 //! The worker takes the index lock, then scans and streams one file at a time on one
 //! thread: read, parse, extract, drop the tree, write the rows in batched transactions.
 //! A full build writes a fresh file, fsyncs it and swaps it in; an incremental update
 //! rewrites only changed files in place under the `incremental_in_progress` dirty flag
-//! and re-resolves edges only for changed files and the files that name a declaration
-//! whose definer changed (PAR-FRESH-04). A leftover dirty flag, a schema, analyzer or
-//! configuration change, a corrupt store, or a write set above 50% of the files and at
-//! least 50 files forces a full rebuild.
+//! and re-resolves edges only for changed files and the dependents of changed exports:
+//! files naming an added, removed or changed declaration, importers of changed
+//! re-exports, and files whose edges pointed at a symbol that is gone (PAR-FRESH-04).
+//! Symbol edges into a rewritten file are carried over by UID. A leftover dirty flag, a
+//! schema, analyzer or configuration change, a corrupt store, or a write set above 50%
+//! of the files and at least 50 files forces a full rebuild.
 //!
 //! The declared scale envelope (PAR-RT-09) bounds files, bytes and symbols; beyond it
 //! the index is partial and says so in `coverage`, never by growing the worker. Which
@@ -34,8 +37,10 @@ pub mod edges;
 pub mod extract;
 pub mod facts;
 pub mod ignore;
+pub mod impact;
 pub mod lexical;
 pub mod meta;
+pub mod resolve;
 pub mod scan;
 pub mod schema;
 pub mod uid;
@@ -75,7 +80,11 @@ const CORRUPT_ERROR: &str = "index store corrupt";
 /// Analyzer identity: extraction rules and grammar versions. A change forces a full
 /// rebuild and invalidates the fact cache.
 pub fn analyzer_version() -> String {
-    format!("xm-analyzer-1;{}", extract::grammar_versions())
+    format!(
+        "xm-analyzer-1;{};resolver-{}",
+        extract::grammar_versions(),
+        resolve::RESOLVER_REVISION
+    )
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -99,6 +108,8 @@ pub struct Counters {
     pub escalated: bool,
     pub bytes_read: u64,
     pub edges_written: usize,
+    /// Scope resolver totals: symbol edges by tier and drops by cause.
+    pub resolve: resolve::counters::ResolveCounters,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -685,14 +696,18 @@ fn full_build(
         writer::resolve_imports(&conn, None).map_err(sql_err)?;
         let defs = edges::Definers::load(&conn).map_err(sql_err)?;
         let files = indexed_files(&conn).map_err(sql_err)?;
+        let mut resolver = resolve::Resolver::new(&conn, &scan.root);
         for (i, (fid, path)) in files.iter().enumerate() {
             counters.edges_written +=
                 edges::rebuild_file_edges(&conn, &defs, *fid, path).map_err(sql_err)?;
+            counters.edges_written += resolver.resolve_file(*fid).map_err(sql_err)?;
             if (i + 1) % BATCH_FILES == 0 {
                 conn.execute_batch("COMMIT; BEGIN").map_err(sql_err)?;
             }
         }
         counters.reresolved = files.len();
+        counters.resolve = std::mem::take(&mut resolver.counters);
+        drop(resolver);
         drop(defs);
         edges_ms = te.elapsed().as_millis() as u64;
         set_meta_common(&conn, &scan, cfg, generation).map_err(sql_err)?;
@@ -1196,8 +1211,10 @@ fn incremental(
 
     // ---- apply in place under the dirty flag ----
     meta::set(&conn, meta::DIRTY_FLAG, "1").map_err(sql_err)?;
-    let defs_before = edges::Definers::load(&conn).map_err(sql_err)?;
-    let mut candidate_names: BTreeSet<i64> = BTreeSet::new();
+    // what other files' edges read from the rewritten files: export signatures (their
+    // difference names the dependents) and symbol ids (remapped by UID).
+    let mut deps = resolve::Dependents::default();
+    let mut orphaned: BTreeSet<i64> = BTreeSet::new();
     let mut touched_paths: Vec<String> = Vec::new();
     let mut changed_ids: Vec<i64> = Vec::new();
     counters.rebudgeted = rebudget.len();
@@ -1206,20 +1223,40 @@ fn incremental(
     {
         let mut w = Writer::new(&conn, cfg.content_retention).map_err(sql_err)?;
         conn.execute_batch("BEGIN").map_err(sql_err)?;
+        let mut into_file = conn
+            .prepare_cached(
+                "SELECT DISTINCT src_file FROM edges WHERE dst_file = ?1 AND src_file != ?1",
+            )
+            .map_err(sql_err)?;
         for (path, id) in &deleted {
-            candidate_names.extend(edges::defined_names(&conn, *id).map_err(sql_err)?);
+            let before = resolve::signature(&conn, *id).map_err(sql_err)?;
+            deps.note_change(&conn, *id, path, &before, &resolve::Signature::new())
+                .map_err(sql_err)?;
+            for f in into_file
+                .query_map([id], |r| r.get::<_, i64>(0))
+                .map_err(sql_err)?
+            {
+                orphaned.insert(f.map_err(sql_err)?);
+            }
             writer::delete_file_rows(&conn, *id, false).map_err(sql_err)?;
             counters.deleted += 1;
             touched_paths.push(path.clone());
         }
+        drop(into_file);
         for (i, cand) in writes.iter().enumerate() {
             let prior = existing.get(&cand.path).map(|e| e.id);
-            if let Some(id) = prior {
-                candidate_names.extend(edges::defined_names(&conn, id).map_err(sql_err)?);
-                writer::delete_file_rows(&conn, id, true).map_err(sql_err)?;
-            } else {
-                touched_paths.push(cand.path.clone());
-            }
+            let (before, old_ids) = match prior {
+                Some(id) => {
+                    let before = resolve::signature(&conn, id).map_err(sql_err)?;
+                    let old_ids = resolve::symbol_ids(&conn, id).map_err(sql_err)?;
+                    writer::delete_file_rows(&conn, id, true).map_err(sql_err)?;
+                    (before, old_ids)
+                }
+                None => {
+                    touched_paths.push(cand.path.clone());
+                    (resolve::Signature::new(), Vec::new())
+                }
+            };
             let mut uncounted = Counters::default();
             let tally = if precounted.contains(cand.path.as_str()) {
                 &mut uncounted
@@ -1235,15 +1272,20 @@ fn incremental(
                 .map_err(sql_err)?;
             counters.written += 1;
             changed_ids.push(fid);
-            candidate_names.extend(edges::defined_names(&conn, fid).map_err(sql_err)?);
+            let after = resolve::signature(&conn, fid).map_err(sql_err)?;
+            deps.note_change(&conn, fid, &cand.path, &before, &after)
+                .map_err(sql_err)?;
+            orphaned.extend(resolve::remap_symbol_ids(&conn, fid, &old_ids).map_err(sql_err)?);
             if (i + 1) % BATCH_FILES == 0 {
                 conn.execute_batch("COMMIT; BEGIN").map_err(sql_err)?;
             }
         }
     }
 
-    // ---- re-resolve: changed files, importers of added/removed paths, and files that
-    // name a declaration whose unique definer changed ----
+    // ---- re-resolve only the dependents of changed exports: the changed files,
+    // importers of added/removed paths, files naming a changed export, files bound
+    // through a changed re-export or owning a Go type whose methods changed, and files
+    // whose edges pointed at a symbol that is gone ----
     let te = Instant::now();
     let mut affected: BTreeSet<i64> = changed_ids.iter().copied().collect();
     {
@@ -1263,16 +1305,11 @@ fn incremental(
     }
     let resolve_ids: Vec<i64> = affected.iter().copied().collect();
     writer::resolve_imports(&conn, Some(&resolve_ids)).map_err(sql_err)?;
+    affected.extend(edges::files_referencing(&conn, &deps.names).map_err(sql_err)?);
+    affected.extend(&deps.files);
+    affected.extend(&orphaned);
     let defs_after = edges::Definers::load(&conn).map_err(sql_err)?;
-    let before = defs_before.snapshot(&candidate_names);
-    let after = defs_after.snapshot(&candidate_names);
-    let changed_names: BTreeSet<i64> = candidate_names
-        .iter()
-        .copied()
-        .filter(|n| before.get(n) != after.get(n))
-        .collect();
-    drop(defs_before);
-    affected.extend(edges::files_referencing(&conn, &changed_names).map_err(sql_err)?);
+    let mut resolver = resolve::Resolver::new(&conn, &scan.root);
     let mut path_of = conn
         .prepare_cached("SELECT path, parse_status FROM files WHERE id = ?1")
         .map_err(sql_err)?;
@@ -1291,8 +1328,11 @@ fn incremental(
         }
         counters.edges_written +=
             edges::rebuild_file_edges(&conn, &defs_after, *fid, &path).map_err(sql_err)?;
+        counters.edges_written += resolver.resolve_file(*fid).map_err(sql_err)?;
         counters.reresolved += 1;
     }
+    counters.resolve = std::mem::take(&mut resolver.counters);
+    drop(resolver);
     drop(path_of);
     let edges_ms = te.elapsed().as_millis() as u64;
 
@@ -1346,10 +1386,12 @@ fn gc_fact_cache(conn: &Connection) -> rusqlite::Result<usize> {
     )
 }
 
-/// `index stats`: the stored index's identity, freshness inputs and coverage; with
-/// `digest`, its content digest. Read-only: it never takes the writer lock and never
-/// opens the store for writing.
-pub fn stats(root: &Path, cfg: &IndexConfig, digest: bool) -> Result<serde_json::Value, String> {
+/// The stored index of `root`, opened read-only (never locked, never written):
+/// (canonical root, index path, connection when the file exists).
+fn open_read_only(
+    root: &Path,
+    cfg: &IndexConfig,
+) -> Result<(PathBuf, PathBuf, Option<Connection>), String> {
     let root = fs::canonicalize(root).map_err(|e| format!("{}: {e}", root.display()))?;
     let git_dir = crate::indexcache::run_git_bounded(
         &root,
@@ -1360,19 +1402,50 @@ pub fn stats(root: &Path, cfg: &IndexConfig, digest: bool) -> Result<serde_json:
     .ok()
     .and_then(|b| String::from_utf8(b).ok())
     .map(|s| PathBuf::from(s.trim()));
-    let dir = index_dir(&root, git_dir.as_deref(), cfg);
-    let path = dir.join(DB_FILE);
+    let path = index_dir(&root, git_dir.as_deref(), cfg).join(DB_FILE);
     if !path.exists() {
+        return Ok((root, path, None));
+    }
+    let conn =
+        Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(sql_err)?;
+    schema::configure(&conn).map_err(sql_err)?;
+    Ok((root, path, Some(conn)))
+}
+
+/// `index impact`: dependents of a symbol with the completeness envelope. Read-only.
+pub fn impact(
+    root: &Path,
+    cfg: &IndexConfig,
+    symbol: &str,
+    depth: usize,
+) -> Result<serde_json::Value, String> {
+    let (root, path, conn) = open_read_only(root, cfg)?;
+    let Some(conn) = conn else {
+        return Err(format!(
+            "no index at {} (run `index build` first)",
+            path.display()
+        ));
+    };
+    let result = impact::impact(&conn, cfg, symbol, depth).map_err(sql_err)?;
+    let mut v = serde_json::to_value(result).map_err(|e| e.to_string())?;
+    v["command"] = "impact".into();
+    v["root"] = root.to_string_lossy().into();
+    Ok(v)
+}
+
+/// `index stats`: the stored index's identity, freshness inputs and coverage; with
+/// `digest`, its content digest. Read-only: it never takes the writer lock and never
+/// opens the store for writing.
+pub fn stats(root: &Path, cfg: &IndexConfig, digest: bool) -> Result<serde_json::Value, String> {
+    let (root, path, conn) = open_read_only(root, cfg)?;
+    let Some(conn) = conn else {
         return Ok(serde_json::json!({
             "command": "stats",
             "exists": false,
             "root": root.to_string_lossy(),
             "index_path": path.to_string_lossy(),
         }));
-    }
-    let conn =
-        Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(sql_err)?;
-    schema::configure(&conn).map_err(sql_err)?;
+    };
     let get = |k: &str| meta::get(&conn, k).ok().flatten().unwrap_or_default();
     let stored_retention =
         ContentRetention::parse(&get("content_retention")).unwrap_or(cfg.content_retention);
@@ -1413,10 +1486,14 @@ pub fn stats(root: &Path, cfg: &IndexConfig, digest: bool) -> Result<serde_json:
     Ok(v)
 }
 
-const USAGE: &str = "xmustard-core index <build|update|stats> <root> \
+/// Reverse hops `index impact` walks by default.
+const DEFAULT_IMPACT_DEPTH: usize = 4;
+
+const USAGE: &str = "xmustard-core index <build|update|stats|impact> <root> \
     [--content-retention full|symbol|none] [--max-file-size N] [--max-files N] \
     [--max-symbols N] [--max-total-bytes N] [--max-parse-bytes N] [--index-dir DIR] \
-    [--allow-non-git] [--include-untracked] [--no-cache] [--paths P ...] [--digest]";
+    [--allow-non-git] [--include-untracked] [--no-cache] [--paths P ...] [--digest] \
+    [--symbol NAME|QUALIFIED|UID] [--depth N]";
 
 /// `xmustard-core index <build|update|stats> <root> [flags]`: the subcommand-table
 /// handler. It returns its JSON or error as a value and never prints.
@@ -1432,6 +1509,8 @@ pub fn run(args: crate::dispatch::Args) -> crate::dispatch::CmdResult {
         IndexConfig::load(&root).map_err(|e| CmdError::new(2, format!("index: config: {e}")))?;
     let mut paths: Option<Vec<String>> = None;
     let mut digest = false;
+    let mut symbol: Option<String> = None;
+    let mut depth = DEFAULT_IMPACT_DEPTH;
     let mut i = 2;
     while i < args.len() {
         let a = args[i].as_str();
@@ -1449,6 +1528,17 @@ pub fn run(args: crate::dispatch::Args) -> crate::dispatch::CmdResult {
             "--digest" => {
                 digest = true;
                 1
+            }
+            "--symbol" => {
+                symbol = args.get(i + 1).cloned();
+                2
+            }
+            "--depth" => {
+                depth = args
+                    .get(i + 1)
+                    .and_then(|d| d.parse().ok())
+                    .ok_or_else(|| CmdError::new(2, "index: --depth needs a number"))?;
+                2
             }
             _ if cfg.apply_switch(a) => 1,
             _ => match cfg.apply_flag(a, args.get(i + 1).map(String::as_str)) {
@@ -1470,6 +1560,10 @@ pub fn run(args: crate::dispatch::Args) -> crate::dispatch::CmdResult {
         "build" => to_value(build(&root, &cfg)),
         "update" => to_value(update(&root, &cfg, paths.as_deref())),
         "stats" => stats(&root, &cfg, digest),
+        "impact" => match symbol.as_deref() {
+            Some(sym) => impact(&root, &cfg, sym, depth),
+            None => return Err(CmdError::usage(USAGE)),
+        },
         _ => return Err(CmdError::usage(USAGE)),
     };
     out.map(|v| Output::Json(v.to_string()))
