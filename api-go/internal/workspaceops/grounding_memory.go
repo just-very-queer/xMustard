@@ -8,7 +8,8 @@ import (
 )
 
 // groundingMemory is the memory section of `ground`: promoted memory whose
-// referenced files drifted, and how promoted memory is trusted.
+// referenced files drifted, how promoted memory is trusted, and the verification
+// queue waiting on the caller.
 type groundingMemory struct {
 	// StaleMemory is null when the memory store could not be read (see unknown).
 	StaleMemory *int `json:"stale_memory"`
@@ -22,48 +23,74 @@ type groundingMemory struct {
 	// self_asserted_open_mode, single_agent), so an agent can tell peer-verified
 	// shared memory from self-asserted memory before it relies on recall.
 	MemoryVerificationModes map[string]int `json:"memory_verification_modes"`
+	// PendingForYou counts the pending entries the caller neither authored nor voted
+	// on: what recall(status=awaiting_me) lists (PAR-GOV-02).
+	PendingForYou *int `json:"pending_for_you"`
+	// MemoryPressure sizes the store (PAR-RCL-06).
+	MemoryPressure *MemoryPressure `json:"memory_pressure"`
+}
+
+// MemoryPressure is how full shared memory is: the percentage of served memory in the
+// core tier (always delivered), and how many proposals wait for verification.
+type MemoryPressure struct {
+	CorePct      int `json:"core_pct"`
+	PendingCount int `json:"pending_count"`
 }
 
 // build runs the stale verified-memory check (drift-on-recall): memory whose
 // referenced files changed. Bounded: only the most recent groundStaleWindow
 // baselined memories are hashed, and the result says whether that covered every one.
-// When the memory store cannot be read, nothing was checked: stale_memory and
-// stale_memory_total are null, stale_memory_complete is false,
-// memory_verification_modes is null, and the fields are listed unknown.
-func (s *groundingMemory) build(dataDir, workspaceID string) []GroundingUnknown {
-	stale, checked, total, complete, modes, err := boundedStaleMemory(dataDir, workspaceID, groundStaleWindow)
-	s.StaleMemoryChecked, s.StaleMemoryComplete, s.MemoryVerificationModes = checked, complete, modes
+// When the memory store cannot be read, nothing was checked: stale_memory,
+// stale_memory_total, memory_verification_modes, pending_for_you and memory_pressure
+// are null, stale_memory_complete is false, and the fields are listed unknown.
+func (s *groundingMemory) build(dataDir, workspaceID, caller string) []GroundingUnknown {
+	scan, err := scanGroundMemory(dataDir, workspaceID, caller, groundStaleWindow)
+	s.StaleMemoryChecked, s.StaleMemoryComplete, s.MemoryVerificationModes = scan.checked, scan.complete, scan.modes
 	if err != nil {
 		reason := "memory store unreadable: " + err.Error()
-		return []GroundingUnknown{{Field: "stale_memory", Reason: reason}, {Field: "stale_memory_total", Reason: reason},
-			{Field: "memory_verification_modes", Reason: reason}}
+		var out []GroundingUnknown
+		for _, f := range []string{"stale_memory", "stale_memory_total", "memory_verification_modes", "pending_for_you", "memory_pressure"} {
+			out = append(out, GroundingUnknown{Field: f, Reason: reason})
+		}
+		return out
 	}
-	s.StaleMemory, s.StaleMemoryTotal = &stale, &total
+	s.StaleMemory, s.StaleMemoryTotal, s.PendingForYou = &scan.stale, &scan.total, &scan.forYou
+	s.MemoryPressure = &scan.pressure
 	return nil
 }
 
 // groundStaleWindow bounds how many promoted memories `ground` drift-checks.
 const groundStaleWindow = 64
 
-// boundedStaleMemory drift-checks at most window promoted memories that carry path
-// baselines, most recently updated first, from content-free metadata. It returns the
-// stale count, how many were checked, the promoted total, whether every baselined
-// memory was checked, the promoted count per verification mode, and the error that
-// prevented the check.
-func boundedStaleMemory(dataDir, workspaceID string, window int) (stale, checked, total int, complete bool, modes map[string]int, err error) {
+// groundMemoryScan is what ground reads from the memory store.
+type groundMemoryScan struct {
+	stale, checked, total int
+	complete              bool
+	modes                 map[string]int
+	forYou                int
+	pressure              MemoryPressure
+}
+
+// scanGroundMemory reads served and pending memory from content-free metadata in one
+// ranking view. It drift-checks at most window served memories that carry path
+// baselines, most recently updated first, counts the served memory per verification
+// mode and in the core tier, and counts the pending entries awaiting the caller.
+func scanGroundMemory(dataDir, workspaceID, caller string, window int) (groundMemoryScan, error) {
 	ctx := context.Background()
-	var ranking []govstore.RankEntry
+	var view []govstore.RankEntry
 	var checkedEntries []ContextEntry
 	baselined := 0
-	err = memoryView(ctx, dataDir, workspaceID, func(r govstore.Reader) error {
+	err := memoryView(ctx, dataDir, workspaceID, func(r govstore.Reader) error {
 		var err error
-		if ranking, err = r.ServedRanking(ctx, workspaceID); err != nil {
+		view, err = r.Ranking(ctx, govstore.RankQuery{WorkspaceID: workspaceID, Caller: caller,
+			States: []string{govstore.RankServed, govstore.RankPending}})
+		if err != nil {
 			return err
 		}
-		sort.SliceStable(ranking, func(a, b int) bool { return ranking[a].UpdatedAt > ranking[b].UpdatedAt })
+		sort.SliceStable(view, func(a, b int) bool { return view[a].UpdatedAt > view[b].UpdatedAt })
 		var ids []string
-		for _, e := range ranking {
-			if !e.Baselined {
+		for _, e := range view {
+			if e.State != govstore.RankServed || !e.Baselined {
 				continue
 			}
 			if baselined++; len(ids) < window {
@@ -74,20 +101,36 @@ func boundedStaleMemory(dataDir, workspaceID string, window int) (stale, checked
 		return err
 	})
 	if err != nil {
-		return 0, 0, 0, false, nil, err
+		return groundMemoryScan{}, err
 	}
-	modes = newModeCounts()
-	for _, e := range ranking {
-		if e.VerificationMode != "" {
-			modes[e.VerificationMode]++
+	scan := groundMemoryScan{modes: newModeCounts()}
+	core := 0
+	for _, e := range view {
+		if e.State == govstore.RankPending {
+			scan.pressure.PendingCount++
+			if !e.ByCaller && !e.VotedByCaller {
+				scan.forYou++
+			}
+			continue
 		}
+		scan.total++
+		if e.VerificationMode != "" {
+			scan.modes[e.VerificationMode]++
+		}
+		if e.Tier == "core" {
+			core++
+		}
+	}
+	if scan.total > 0 {
+		scan.pressure.CorePct = core * 100 / scan.total
 	}
 	root := contextRoot(dataDir, workspaceID)
 	for i := range checkedEntries {
 		computeStaleness(root, &checkedEntries[i])
 		if checkedEntries[i].Stale {
-			stale++
+			scan.stale++
 		}
 	}
-	return stale, len(checkedEntries), len(ranking), len(checkedEntries) == baselined, modes, nil
+	scan.checked, scan.complete = len(checkedEntries), len(checkedEntries) == baselined
+	return scan, nil
 }

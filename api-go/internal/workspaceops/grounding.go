@@ -89,6 +89,12 @@ func BuildSessionGrounding(dataDir, workspaceID string) (*SessionGrounding, erro
 
 // BuildSessionGroundingCtx is the request-scoped variant: cancelling ctx cancels its Rust/tool work (see rustcore.runCoreCtx).
 func BuildSessionGroundingCtx(ctx context.Context, dataDir, workspaceID string) (*SessionGrounding, error) {
+	return BuildSessionGroundingFor(ctx, dataDir, workspaceID, "")
+}
+
+// BuildSessionGroundingFor grounds a session for caller: pending_for_you counts the
+// pending memory caller neither authored nor voted on.
+func BuildSessionGroundingFor(ctx context.Context, dataDir, workspaceID, caller string) (*SessionGrounding, error) {
 	g := &SessionGrounding{WorkspaceID: workspaceID}
 	unknown, err := g.groundingIndex.build(ctx, dataDir, workspaceID)
 	if err != nil {
@@ -106,7 +112,7 @@ func BuildSessionGroundingCtx(ctx context.Context, dataDir, workspaceID string) 
 		g.BlockedByFailingVerification = &failing
 	}
 	g.stampGenerated()
-	g.Unknown = append(g.Unknown, g.groundingMemory.build(dataDir, workspaceID)...)
+	g.Unknown = append(g.Unknown, g.groundingMemory.build(dataDir, workspaceID, caller)...)
 	g.summarize()
 	return g, nil
 }

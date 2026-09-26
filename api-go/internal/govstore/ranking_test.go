@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 )
 
 // VerificationMode is the one trust-label rule: peer approvals against the entry's
@@ -93,5 +94,54 @@ func TestSetRequiredVerificationsKeepsInvariant(t *testing.T) {
 	evs, err := s.ListEvents(ctx, EventFilter{EntryID: "g1", Types: []string{EventGate}})
 	if err != nil || len(evs) != 1 {
 		t.Fatalf("a gate change appends one gate event: %+v %v", evs, err)
+	}
+}
+
+// Ranking reads the requested rank states, labels each entry with the state its Go
+// twin (Entry.RankState) computes, flags the caller's authorship and votes, and counts
+// outcomes on the served revision; MemoryScores ranks with IDF across states.
+func TestRankingStatesCallerFlagsAndOutcomes(t *testing.T) {
+	s := openTestStore(t, newClock())
+	ctx := context.Background()
+	propose(t, s, "p1", "pending", "queue body")
+	propose(t, s, "p2", "pending two", "queue body rare")
+	vote(t, s, "p2", bob, VerdictApprove)
+	propose(t, s, "v1", "served", "served body")
+	vote(t, s, "v1", bob, VerdictApprove)
+	vote(t, s, "v1", carol, VerdictApprove)
+	promotePeer(t, s, "v1")
+	mustUpdate(t, s, func(tx Tx) error {
+		if _, err := tx.RecordOutcome(ctx, OutcomeInput{EntryID: "v1", Outcome: OutcomeHelpful}, bob); err != nil {
+			return err
+		}
+		_, err := tx.RecordOutcome(ctx, OutcomeInput{EntryID: "v1", Outcome: OutcomeStaleHarm}, carol)
+		return err
+	})
+	got, err := s.Ranking(ctx, RankQuery{WorkspaceID: "ws1", States: []string{RankServed, RankPending}, Caller: "BOB"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	byID := map[string]RankEntry{}
+	for _, e := range got {
+		byID[e.ID] = e
+		full, err := s.GetEntry(ctx, e.ID)
+		if err != nil || full.RankState(time.Now()) != e.State {
+			t.Fatalf("%s: SQL state %q, Go twin %q (%v)", e.ID, e.State, full.RankState(time.Now()), err)
+		}
+	}
+	p1, p2, v1 := byID["p1"], byID["p2"], byID["v1"]
+	if len(got) != 3 || p1.State != RankPending || v1.State != RankServed || p1.VotedByCaller || !p2.VotedByCaller ||
+		p2.PeerApprovals != 1 || v1.Helpful != 1 || v1.StaleHarm != 1 || p1.ByCaller || p1.Author != "alice" {
+		t.Fatalf("ranking = %+v", got)
+	}
+	if served, _ := s.ServedRanking(ctx, "ws1"); len(served) != 1 || served[0].ID != "v1" {
+		t.Fatalf("served ranking = %+v", served)
+	}
+	if _, err := s.Ranking(ctx, RankQuery{WorkspaceID: "ws1", States: []string{"'; DROP TABLE entries; --"}}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("unknown state: %v", err)
+	}
+	scores, err := s.MemoryScores(ctx, "ws1", "queue rare")
+	if err != nil || len(scores) != 2 || scores["p2"] <= scores["p1"] {
+		t.Fatalf("scores = %v %v", scores, err)
 	}
 }

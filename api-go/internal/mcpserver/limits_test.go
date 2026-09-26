@@ -1,9 +1,11 @@
 package mcpserver
 
 import (
+	"slices"
 	"testing"
 
 	"xmustard/api-go/internal/evidence"
+	"xmustard/api-go/internal/workspaceops"
 )
 
 // The advertised maxResultSizeChars stays within what Claude Code honors, covers the
@@ -24,5 +26,18 @@ func TestMaxResultCharsCoversTheProjectionCap(t *testing.T) {
 		if tl.Annotations.ReadOnly != (tl.MaxResultChars == boundedResultChars) {
 			t.Errorf("%s: maxResultSizeChars should be declared on exactly the read tools", tl.Name)
 		}
+	}
+}
+
+// The recall budget bounds and the memory kinds are duplicated from workspaceops so
+// the shim does not link the memory store; they must stay equal.
+func TestRecallBoundsAndKindsMirrorWorkspaceops(t *testing.T) {
+	got := [3]int{recallDefaultMaxChars, recallMinMaxChars, recallMaxMaxChars}
+	want := [3]int{workspaceops.RecallDefaultMaxChars, workspaceops.RecallMinMaxChars, workspaceops.RecallMaxMaxChars}
+	if got != want {
+		t.Fatalf("recall budget bounds %v != workspaceops %v", got, want)
+	}
+	if !slices.Equal(memoryKinds, workspaceops.MemoryKinds) {
+		t.Fatalf("memory kinds %v != workspaceops %v", memoryKinds, workspaceops.MemoryKinds)
 	}
 }

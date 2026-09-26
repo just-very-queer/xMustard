@@ -554,7 +554,7 @@ func TestHiddenQueryAliasAcceptedButNotAdvertised(t *testing.T) {
 	if _, rerr := call(t, s, "recall", map[string]any{"workspace_id": "ws", "query": "auth"}); rerr != nil {
 		t.Fatal(rerr)
 	}
-	if p := api.lastTool(t).Path; p != "/api/workspaces/ws/context/active?query=auth" {
+	if p := api.lastTool(t).Path; p != "/api/workspaces/ws/context/active?query=auth&max_chars=4000" {
 		t.Fatalf("recall alias: %s", p)
 	}
 	// the same value under both names is fine; different values are a conflict

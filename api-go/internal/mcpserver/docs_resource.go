@@ -46,7 +46,14 @@ func renderToolsDoc(tools []*Tool) string {
 		}
 		fmt.Fprintf(&b, "\n## %s\n\n", t.Name)
 		for _, a := range t.Advanced {
-			fmt.Fprintf(&b, "- `%s` (%s): %s\n", a.Name, argShape(a), a.Desc)
+			fmt.Fprintf(&b, "- `%s` (%s)", a.Name, argShape(a))
+			if a.Desc != "" {
+				b.WriteString(": " + a.Desc)
+			}
+			b.WriteString("\n")
+		}
+		if t.Doc != "" {
+			b.WriteString("\n" + t.Doc + "\n")
 		}
 		if t.Name == groundTool.Name {
 			b.WriteString("\n" + groundbudget.Markdown())

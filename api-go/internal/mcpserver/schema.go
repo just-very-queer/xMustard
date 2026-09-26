@@ -51,6 +51,8 @@ type Tool struct {
 	// but are not advertised in the lean tools/list (SchemaLean), which every session
 	// pays for in its prompt prefix; they are documented at DocsURI instead.
 	Advanced []Arg
+	// Doc documents the tool's Advanced arguments further at DocsURI only.
+	Doc string
 	// Aliases maps a hidden argument name to its canonical one. Aliases are accepted
 	// on tools/call and never advertised in tools/list.
 	Aliases     map[string]string

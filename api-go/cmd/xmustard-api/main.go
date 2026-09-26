@@ -3915,17 +3915,18 @@ func registerRoutes(mux routeRegistrar) {
 			issueIntel(w, err, result)
 			return
 		}
-		var paths []string
-		if q.Get("paths") != "" {
-			paths = strings.Split(q.Get("paths"), ",")
+		req, err := recallRequest(r)
+		if err != nil {
+			respondError(w, err)
+			return
 		}
-		limit := 0
-		if v := q.Get("limit"); v != "" {
-			if n, err := strconv.Atoi(v); err == nil && n > 0 {
-				limit = min(n, maxRecallLimit) // clamp: recall stays bounded
-			}
+		// the verification queue is unverified text: a reviewer's read, like history
+		if p := principalFromContext(r.Context()); req.ReadsUnverified() && p != nil &&
+			!p.Has(workspaceops.RoleVerifier) && !p.Has(workspaceops.RoleHumanApprover) {
+			denyMissingRole(w, r, p, workspaceops.RoleVerifier)
+			return
 		}
-		result, err := workspaceops.RecallContextCtx(r.Context(), dd, r.PathValue("workspace_id"), q.Get("query"), paths, limit)
+		result, err := workspaceops.RecallWith(r.Context(), dd, r.PathValue("workspace_id"), req)
 		issueIntel(w, err, result)
 	})
 	registerMemoryRoutes(mux)

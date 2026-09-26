@@ -117,6 +117,24 @@ func (e Entry) Served(now time.Time) bool {
 	return e.ExpiresAt == "" || e.ExpiresAt > canonTime(now)
 }
 
+// RankState is the rank state the ranking view labels the entry with at time now (the
+// Go twin of rankStateCases), or "" when recall never ranks it.
+func (e Entry) RankState(now time.Time) string {
+	unexpired := e.ExpiresAt == "" || e.ExpiresAt > canonTime(now)
+	active := e.Lifecycle == LifecycleActive
+	switch {
+	case e.Promoted && active && unexpired:
+		return RankServed
+	case e.Promoted && active:
+		return RankExpired
+	case !e.Promoted && active && unexpired && e.Status == StatusPending:
+		return RankPending
+	case e.Lifecycle == LifecycleSuperseded:
+		return RankSuperseded
+	}
+	return ""
+}
+
 // NewEntry is a proposal. The author is always the writing Actor's principal: scope
 // and author are derived server-side, never taken from the payload (SEC-05).
 type NewEntry struct {

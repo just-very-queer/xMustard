@@ -4,6 +4,9 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
+	"maps"
+	"slices"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -191,12 +194,8 @@ func GetActiveContext(dataDir, workspaceID string) (map[string]any, error) {
 	}, nil
 }
 
-// RecallContext is ranked, query-aware recall — the fix for "recall dumps every
-// memory." It scores each verified entry by multi-signal relevance (lexical match
-// on title+content, path overlap with the query paths or the current working
-// changes, verification strength, recency, with a stale penalty) and returns the
-// top-N, so an agent grounds on the few facts that matter rather than the whole
-// store. With no query or paths it falls back to recency-ranked top-N.
+// RecallContext is ranked, query-aware recall of served memory — RecallWith with only
+// a query, focus paths and a limit.
 func RecallContext(dataDir, workspaceID, query string, paths []string, limit int) (map[string]any, error) {
 	return RecallContextCtx(context.Background(), dataDir, workspaceID, query, paths, limit)
 }
@@ -204,28 +203,186 @@ func RecallContext(dataDir, workspaceID, query string, paths []string, limit int
 // RecallContextCtx is RecallContext bound to the request context, so the working-change
 // lookup's Rust child is killed when the caller cancels.
 func RecallContextCtx(ctx context.Context, dataDir, workspaceID, query string, paths []string, limit int) (map[string]any, error) {
+	return RecallWith(ctx, dataDir, workspaceID, RecallRequest{Query: query, Paths: paths, Limit: limit})
+}
+
+// RecallRequest is one recall (WS-20). Filters combine with AND across fields and OR
+// within a list; status and the include flags pick the rank states read.
+type RecallRequest struct {
+	Query string
+	Paths []string
+	Limit int
+	// Explain adds score_details (the signed signals and their reasons) to each entry.
+	Explain bool
+	Kinds   []string
+	Tags    []string
+	// Topic matches the topic or any topic under it ("a/b" matches "a/b/c").
+	Topic      string
+	PathPrefix string
+	// Since and Until bound updated_at: a UTC date (YYYY-MM-DD) or an RFC 3339 time.
+	Since, Until string
+	// By keeps entries authored by this principal.
+	By string
+	// Status is "" or promoted (served memory), pending (the verification queue) or
+	// awaiting_me (pending entries the caller neither authored nor voted on).
+	Status            string
+	IncludePending    bool
+	IncludeSuperseded bool
+	ShowExpired       bool
+	// Cursor continues a previous page (next_cursor).
+	Cursor string
+	// NamesOnly returns ids, titles, topic, state, stale and paths only.
+	NamesOnly bool
+	// Render is full (default) or compact (one line per entry).
+	Render string
+	// MaxChars budgets the whole JSON result; 0 leaves it unbudgeted.
+	MaxChars int
+	// SessionID enables session-seen suppression: an entry already returned to this
+	// caller's session is left out until its content, stale or state changes.
+	SessionID string
+	// Caller is the principal recalling, for awaiting_me and the seen-set key.
+	Caller string
+}
+
+// Recall output budget bounds, in characters of the JSON result (Mem0's default).
+const (
+	RecallDefaultMaxChars = 4000
+	RecallMinMaxChars     = 1000
+	RecallMaxMaxChars     = 10000
+)
+
+// recallStatuses maps a status to the rank states it reads.
+var recallStatuses = map[string]func(RecallRequest) []string{
+	"":            servedStates,
+	"promoted":    servedStates,
+	"pending":     pendingStates,
+	"awaiting_me": pendingStates,
+}
+
+// servedStates is served memory plus the states the include flags opt into.
+func servedStates(r RecallRequest) []string {
+	states := []string{govstore.RankServed}
+	for _, opt := range []struct {
+		on    bool
+		state string
+	}{{r.IncludePending, govstore.RankPending}, {r.IncludeSuperseded, govstore.RankSuperseded}, {r.ShowExpired, govstore.RankExpired}} {
+		if opt.on {
+			states = append(states, opt.state)
+		}
+	}
+	return states
+}
+
+func pendingStates(RecallRequest) []string { return []string{govstore.RankPending} }
+
+// States is the rank states the request reads, or an error for an unknown status.
+func (r RecallRequest) States() ([]string, error) {
+	pick, ok := recallStatuses[r.Status]
+	if !ok {
+		return nil, fmt.Errorf("status %q is not promoted, pending or awaiting_me: %w", r.Status, ErrInvalidInput)
+	}
+	return pick(r), nil
+}
+
+// ReadsUnverified reports whether the request can return pending (unverified) text,
+// which only a reviewer may read.
+func (r RecallRequest) ReadsUnverified() bool {
+	states, _ := r.States()
+	return slices.Contains(states, govstore.RankPending)
+}
+
+// validate checks the arguments that are rejected, never clamped.
+func (r *RecallRequest) validate() error {
+	if _, err := r.States(); err != nil {
+		return err
+	}
+	if !slices.Contains(recallRenderArgs, r.Render) {
+		return fmt.Errorf("render %q is not full or compact: %w", r.Render, ErrInvalidInput)
+	}
+	if r.MaxChars != 0 && (r.MaxChars < RecallMinMaxChars || r.MaxChars > RecallMaxMaxChars) {
+		return fmt.Errorf("max_chars %d is outside %d..%d: %w", r.MaxChars, RecallMinMaxChars, RecallMaxMaxChars, ErrInvalidInput)
+	}
+	for _, b := range []*string{&r.Since, &r.Until} {
+		t, err := parseRecallTime(*b)
+		if err != nil {
+			return err
+		}
+		*b = t
+	}
+	return nil
+}
+
+// parseRecallTime reads a since/until bound as the store's canonical time text.
+func parseRecallTime(s string) (string, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "", nil
+	}
+	for _, layout := range []string{time.RFC3339Nano, time.DateOnly} {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t.UTC().Format(storeTimeLayout), nil
+		}
+	}
+	return "", fmt.Errorf("time %q is not a date or RFC 3339 time: %w", s, ErrInvalidInput)
+}
+
+// storeTimeLayout is govstore's canonical time text: fixed width, so it orders as text.
+const storeTimeLayout = "2006-01-02T15:04:05.000000000Z"
+
+// filters are the request's entry predicates, one per given field.
+func (r RecallRequest) filters() []func(govstore.RankEntry) bool {
+	var out []func(govstore.RankEntry) bool
+	add := func(given bool, f func(govstore.RankEntry) bool) {
+		if given {
+			out = append(out, f)
+		}
+	}
+	add(len(r.Kinds) > 0, func(e govstore.RankEntry) bool { return slices.Contains(r.Kinds, e.Kind) })
+	add(len(r.Tags) > 0, func(e govstore.RankEntry) bool {
+		return slices.ContainsFunc(e.Tags, func(t string) bool { return slices.Contains(r.Tags, t) })
+	})
+	add(r.Topic != "", func(e govstore.RankEntry) bool {
+		return e.Topic == r.Topic || strings.HasPrefix(e.Topic, strings.TrimSuffix(r.Topic, "/")+"/")
+	})
+	add(r.PathPrefix != "", func(e govstore.RankEntry) bool {
+		return slices.ContainsFunc(e.Paths, func(p string) bool { return strings.HasPrefix(p, r.PathPrefix) })
+	})
+	add(r.Since != "", func(e govstore.RankEntry) bool { return e.UpdatedAt >= r.Since })
+	add(r.Until != "", func(e govstore.RankEntry) bool { return e.UpdatedAt < r.Until })
+	add(r.By != "", func(e govstore.RankEntry) bool {
+		return strings.EqualFold(strings.TrimSpace(e.Author), strings.TrimSpace(r.By))
+	})
+	add(r.Status == "awaiting_me", func(e govstore.RankEntry) bool { return !e.ByCaller && !e.VotedByCaller })
+	return out
+}
+
+// RecallWith runs one recall. Content is bound to the exact revision whose metadata was
+// ranked: a concurrent edit between the metadata pass and the content load yields a
+// digest mismatch, and the whole recall is retried against the new state. If the store
+// keeps moving, mismatched entries are withheld (fail closed) and counted.
+func RecallWith(ctx context.Context, dataDir, workspaceID string, req RecallRequest) (map[string]any, error) {
 	if err := validateSafeID("workspace", workspaceID); err != nil {
 		return nil, err
 	}
-	// Content is bound to the exact promoted revision whose metadata was ranked: a
-	// concurrent edit between the metadata pass and the content load yields a digest
-	// mismatch, and the whole recall is retried against the new state. If the store
-	// keeps moving, mismatched entries are withheld (fail closed) and counted.
+	if err := req.validate(); err != nil {
+		return nil, err
+	}
 	var res map[string]any
+	var page recallPage
 	for attempt := 1; attempt <= recallConsistencyAttempts; attempt++ {
 		var mismatched int
 		var err error
-		res, mismatched, err = recallOnce(ctx, dataDir, workspaceID, query, paths, limit, attempt == recallConsistencyAttempts)
+		res, page, mismatched, err = recallOnce(ctx, dataDir, workspaceID, req, attempt == recallConsistencyAttempts)
 		if err != nil {
 			return nil, err
 		}
 		res["consistency_attempts"] = attempt
 		if mismatched == 0 {
-			return res, nil
+			break
 		}
 		res["consistency_withheld"] = mismatched
 	}
-	return res, nil
+	return finishRecall(workspaceID, req, res, page), nil
 }
 
 // recallConsistencyAttempts bounds how often recall re-reads when content changed
@@ -233,166 +390,145 @@ func RecallContextCtx(ctx context.Context, dataDir, workspaceID, query string, p
 const recallConsistencyAttempts = 3
 
 type scoredEntry struct {
-	entry ContextEntry
-	score float64
+	entry   ContextEntry
+	rank    govstore.RankEntry
+	details ScoreDetails
 }
 
+// sortByScore orders by score, then the newest first, then by id: a total order, so
+// ranking and pagination are deterministic.
 func sortByScore(s []scoredEntry) {
 	sort.SliceStable(s, func(a, b int) bool {
-		if s[a].score != s[b].score {
-			return s[a].score > s[b].score
+		x, y := s[a], s[b]
+		if x.details.Total != y.details.Total {
+			return x.details.Total > y.details.Total
 		}
-		return s[a].entry.UpdatedAt > s[b].entry.UpdatedAt
+		if x.rank.UpdatedAt != y.rank.UpdatedAt {
+			return x.rank.UpdatedAt > y.rank.UpdatedAt
+		}
+		return x.rank.ID < y.rank.ID
 	})
 }
 
-// recallOnce is one ranked-recall pass. It reports how many candidates changed between
-// ranking and loading (their served revision moved, or they stopped being served); when
-// withhold is set those entries are removed from the result instead of being returned.
-func recallOnce(ctx context.Context, dataDir, workspaceID, query string, paths []string, limit int, withhold bool) (map[string]any, int, error) {
-	// metadata-first: rank on the lean ranking view (no content, no vote rows), so
-	// recall's reads and allocation don't scale with content size; full state and
-	// content are loaded only for the bounded candidate window below (XM-PRO-010).
-	var ranking []govstore.RankEntry
-	if err := memoryView(ctx, dataDir, workspaceID, func(r govstore.Reader) error {
-		var err error
-		ranking, err = r.ServedRanking(ctx, workspaceID)
-		return err
-	}); err != nil {
-		return nil, 0, err
+// recallRanking is the ranked, filtered and relevance-gated view one recall pass pages.
+type recallRanking struct {
+	ranked    []scoredEntry
+	hasSignal bool
+	// read counts the entries read in the request's states, before filters and gating.
+	read int
+}
+
+// rankRecall reads the ranking view in the request's states, filters it, and scores
+// every entry (content-free); the stale penalty is left to the candidate window.
+func rankRecall(ctx context.Context, dataDir, workspaceID string, req RecallRequest) (recallRanking, error) {
+	states, err := req.States()
+	if err != nil {
+		return recallRanking{}, err
 	}
-	if limit <= 0 {
-		limit = defaultRecallLimit
+	qtokens := memoryTokens(req.Query)
+	var ranking []govstore.RankEntry
+	var bm25 map[string]float64
+	err = memoryView(ctx, dataDir, workspaceID, func(r govstore.Reader) error {
+		var err error
+		if ranking, err = r.Ranking(ctx, govstore.RankQuery{WorkspaceID: workspaceID, States: states, Caller: req.Caller}); err != nil {
+			return err
+		}
+		if len(qtokens) > 0 {
+			bm25, err = r.MemoryScores(ctx, workspaceID, strings.Join(slices.Sorted(maps.Keys(qtokens)), " "))
+		}
+		return err
+	})
+	if err != nil {
+		return recallRanking{}, err
 	}
 	// path signal: explicit query paths, else the files currently being worked on.
 	// Explicit query/paths gate relevance; with neither, the current working changes
 	// only boost matching memories so a dirty tree still yields recency top-N.
-	focusPaths := cleanPaths(paths)
-	explicitSignal := query != "" || len(focusPaths) > 0
-	if !explicitSignal {
-		focusPaths = recallChangedFiles(ctx, dataDir, workspaceID)
+	focus := cleanPaths(req.Paths)
+	explicit := req.Query != "" || len(focus) > 0
+	if !explicit {
+		focus = recallChangedFiles(ctx, dataDir, workspaceID)
 	}
-	focusSet := map[string]struct{}{}
-	for _, p := range focusPaths {
-		focusSet[p] = struct{}{}
-	}
-	qtokens := memoryTokens(query)
-	legacyTokens, err := legacySearchTokens(ctx, dataDir, workspaceID, ranking, len(qtokens) > 0)
-	if err != nil {
-		return nil, 0, err
-	}
-
-	newest := ""
+	sig := newRecallSignals(ranking, bm25, focus)
+	hasSignal := explicit && (len(qtokens) > 0 || len(focus) > 0)
+	filters := req.filters()
+	out := recallRanking{hasSignal: hasSignal, read: len(ranking), ranked: make([]scoredEntry, 0, len(ranking))}
 	for _, e := range ranking {
-		if e.UpdatedAt > newest {
-			newest = e.UpdatedAt
-		}
-	}
-	hasSignal := explicitSignal && (len(qtokens) > 0 || len(focusSet) > 0)
-	ranked := make([]scoredEntry, 0, len(ranking))
-	for _, e := range ranking {
-		// relevance = the task-match signal (lexical + path overlap). boost = trust
-		// + recency, applied on top but never enough on its own to surface an
-		// irrelevant memory when a query/paths signal is present.
-		relevance := 0.0
-		if len(qtokens) > 0 {
-			etoks := legacyTokens[e.ID]
-			if etoks == nil {
-				etoks = tokenSet(e.SearchTokens) // precomputed; no content scan per recall
-			}
-			for t := range qtokens {
-				if _, ok := etoks[t]; ok {
-					relevance += 1.0
-				}
-			}
-		}
-		for _, p := range e.Paths {
-			if _, ok := focusSet[p]; ok {
-				relevance += 1.5
-			}
-		}
-		boost := 0.25 * float64(e.Approvals)
-		if e.UpdatedAt == newest && newest != "" {
-			boost += 0.5
-		}
-		// NB: no stale penalty here — staleness is unknown until the bounded drift
-		// check below; the penalty is applied to the candidate window only.
-		score := relevance + boost
-		if hasSignal && relevance <= 0 {
-			// explicit query/paths gate relevance: irrelevant memory is dropped below.
+		if !slices.ContainsFunc(filters, func(keep func(govstore.RankEntry) bool) bool { return !keep(e) }) {
+			d := sig.score(e)
+			// explicit query/paths gate relevance: irrelevant memory is dropped.
 			// Implicit working-change focus only adds to the score.
-			score = -1 // sentinel: filtered out
+			if hasSignal && d.relevance() < minRelevance {
+				continue
+			}
+			out.ranked = append(out.ranked, scoredEntry{ContextEntry{ID: e.ID, UpdatedAt: e.UpdatedAt, ContentDigest: e.ContentDigest}, e, d})
 		}
-		ranked = append(ranked, scoredEntry{ContextEntry{ID: e.ID, UpdatedAt: e.UpdatedAt, ContentDigest: e.ContentDigest}, score})
 	}
-	sortByScore(ranked)
+	sortByScore(out.ranked)
+	return out, nil
+}
 
-	// Drop relevance-gated entries, then take a BOUNDED candidate window — only these
-	// are loaded and drift-checked, so recall I/O is O(window), not O(history). The
-	// window is a few × limit so the stale penalty can still re-order without missing a
-	// result.
-	candidates := make([]scoredEntry, 0, min(len(ranked), recallCandidateWindow(limit)))
-	for _, s := range ranked {
-		if hasSignal && s.score < 0 {
-			continue
-		}
-		candidates = append(candidates, s)
-		if len(candidates) >= recallCandidateWindow(limit) {
-			break
-		}
+// recallOnce is one ranked-recall pass. It reports how many candidates changed between
+// ranking and loading (their revision or rank state moved); when withhold is set those
+// entries are removed from the result instead of being returned.
+func recallOnce(ctx context.Context, dataDir, workspaceID string, req RecallRequest, withhold bool) (map[string]any, recallPage, int, error) {
+	// metadata-first: rank on the lean ranking view (no content, no vote rows), so
+	// recall's reads and allocation don't scale with content size; full state and
+	// content are loaded only for the bounded candidate window below (XM-PRO-010).
+	rk, err := rankRecall(ctx, dataDir, workspaceID, req)
+	if err != nil {
+		return nil, recallPage{}, 0, err
 	}
+	limit := req.Limit
+	if limit <= 0 {
+		limit = defaultRecallLimit
+	}
+	offset, err := decodeRecallCursor(req.Cursor, req.fingerprint())
+	if err != nil {
+		return nil, recallPage{}, 0, err
+	}
+	// Take a BOUNDED candidate window — only these are loaded and drift-checked, so
+	// recall I/O is O(window), not O(history). The window is a few × (offset+limit) so
+	// the stale penalty can still re-order without missing a result.
+	window := rk.ranked[:min(len(rk.ranked), recallCandidateWindow(offset+limit))]
+	candidates := slices.Clone(window)
 	if recallBeforeContentLoad != nil {
 		recallBeforeContentLoad()
 	}
 	candidates, mismatched, err := loadCandidates(ctx, dataDir, workspaceID, candidates, withhold)
 	if err != nil {
-		return nil, 0, err
+		return nil, recallPage{}, 0, err
 	}
 	// drift-check ONLY the candidate window; apply the stale penalty, then re-rank.
 	root := contextRoot(dataDir, workspaceID)
 	for i := range candidates {
-		computeStaleness(root, &candidates[i].entry)
-		if candidates[i].entry.Stale {
-			candidates[i].score -= 1.0
-		}
+		c := &candidates[i]
+		computeStaleness(root, &c.entry)
+		c.details.stale(c.entry.StalePaths)
 	}
 	sortByScore(candidates)
 
-	out := make([]ContextEntry, 0, limit)
-	staleCount := 0
-	for _, s := range candidates {
-		if s.entry.Stale {
-			staleCount++
-		}
-		out = append(out, s.entry)
-		if len(out) >= limit {
-			break
-		}
-	}
 	requireMulti, threshold := contextDefaults(dataDir)
 	return map[string]any{
 		"workspace_id":           workspaceID,
-		"query":                  query,
-		"ranked":                 hasSignal,
+		"query":                  req.Query,
+		"status":                 fallbackString(req.Status, "promoted"),
+		"ranked":                 rk.hasSignal,
 		"bounded":                true,
 		"limit":                  limit,
 		"require_multi_agent":    requireMulti,
 		"verification_threshold": threshold,
-		"total_active":           len(ranking),
-		"active_count":           len(ranking),
-		"returned":               len(out),
-		"verification_modes":     countVerificationModes(out), // per-mode counts of the returned entries
-		"stale_count":            staleCount,
+		"total_active":           rk.read,
+		"active_count":           rk.read,
+		"total_matches":          len(rk.ranked),
 		"drift_checked":          len(candidates), // every returned entry is in this set (checked)
-		"conflicts":              overlappingMemory(out),
-		"entries":                out,
 		"generated_at":           nowUTC(),
-	}, mismatched, nil
+	}, recallPage{candidates: candidates, offset: offset, limit: limit, total: len(rk.ranked)}, mismatched, nil
 }
 
 // loadCandidates replaces each ranked candidate with its full state and content, read
 // in one snapshot. Content is bound to the revision the candidate was ranked with: a
-// candidate that is no longer served, or now serves another revision, is mismatched.
+// candidate that left its rank state, or now carries another revision, is mismatched.
 // A mismatched candidate is dropped when withhold is set; otherwise it stays in the
 // ranking without content, and the caller retries against the new state.
 func loadCandidates(ctx context.Context, dataDir, workspaceID string, candidates []scoredEntry, withhold bool) ([]scoredEntry, int, error) {
@@ -401,27 +537,28 @@ func loadCandidates(ctx context.Context, dataDir, workspaceID string, candidates
 	}
 	loaded := map[string]ContextEntry{}
 	err := memoryView(ctx, dataDir, workspaceID, func(r govstore.Reader) error {
-		served := make([]govstore.Entry, 0, len(candidates))
+		bound := make([]govstore.Entry, 0, len(candidates))
 		ranked := map[string]string{}
+		now := time.Now()
 		for _, c := range candidates {
 			e, err := r.GetEntry(ctx, c.entry.ID)
 			if err != nil {
 				return err
 			}
-			if e.Served(time.Now()) && e.ContentDigest == c.entry.ContentDigest {
-				served = append(served, e)
+			if e.RankState(now) == c.rank.State && e.ContentDigest == c.entry.ContentDigest {
+				bound = append(bound, e)
 				ranked[e.ID] = c.entry.ContentDigest
 			}
 		}
-		full, err := projectEntries(ctx, r, served)
+		full, err := projectEntries(ctx, r, bound)
 		if err != nil {
 			return err
 		}
 		for i := range full {
 			full[i].ContentDigest = ranked[full[i].ID]
 		}
-		bound, _, err := attachContent(ctx, r, full)
-		for _, e := range bound {
+		withContent, _, err := attachContent(ctx, r, full)
+		for _, e := range withContent {
 			loaded[e.ID] = e
 		}
 		return err
@@ -439,43 +576,10 @@ func loadCandidates(ctx context.Context, dataDir, workspaceID string, candidates
 			}
 			e = c.entry
 		}
-		kept = append(kept, scoredEntry{e, c.score})
+		c.entry = e
+		kept = append(kept, c)
 	}
 	return kept, mismatched, nil
-}
-
-// legacySearchTokens tokenizes the content of served entries stored without
-// precomputed SearchTokens (written before the field existed), so they still rank. It
-// reads content for those entries only, and only when the query has tokens.
-func legacySearchTokens(ctx context.Context, dataDir, workspaceID string, ranking []govstore.RankEntry, needed bool) (map[string]map[string]struct{}, error) {
-	var ids []string
-	for _, e := range ranking {
-		if needed && len(e.SearchTokens) == 0 {
-			ids = append(ids, e.ID)
-		}
-	}
-	if len(ids) == 0 {
-		return nil, nil
-	}
-	out := make(map[string]map[string]struct{}, len(ids))
-	err := memoryView(ctx, dataDir, workspaceID, func(r govstore.Reader) error {
-		contents, err := r.EntryContents(ctx, ids)
-		for id, c := range contents {
-			if c.Withheld == "" {
-				out[id] = memoryTokens(c.Content)
-			}
-		}
-		return err
-	})
-	return out, err
-}
-
-func tokenSet(tokens []string) map[string]struct{} {
-	set := make(map[string]struct{}, len(tokens))
-	for _, t := range tokens {
-		set[t] = struct{}{}
-	}
-	return set
 }
 
 // stalenessChecks counts drift checks that hash referenced files — a test hook for
@@ -531,16 +635,6 @@ func memoryTokenList(text string) []string {
 	}
 	sort.Strings(out)
 	return out
-}
-
-// entrySearchTokenSet returns the entry's relevance token set, using the persisted
-// SearchTokens when present (no content scan) and falling back to tokenizing
-// title+content only for legacy entries written before the field existed.
-func entrySearchTokenSet(e *ContextEntry) map[string]struct{} {
-	if len(e.SearchTokens) > 0 {
-		return tokenSet(e.SearchTokens)
-	}
-	return memoryTokens(e.Title + " " + e.Content)
 }
 
 // MemoryConflict flags a file that two or more active memories reference, so the
