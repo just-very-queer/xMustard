@@ -38,7 +38,9 @@ func realCoreBinary(t *testing.T) string {
 
 // WS-02: with XMUSTARD_CORE_WORKER=1 the real API binary serves the nine tools' Rust
 // work from one resident worker (no per-call xmustard-core exec), and shutdown ends
-// the worker with the API.
+// the worker with the API. WS-14: the only other exec is the code index worker
+// (`index update`, one-shot by design under the heavy slot), once for the unchanged
+// tree, and the graph reads are answered from the worker's resident index.
 func TestAPIWithTheCoreWorkerServesToolRoutesWithoutPerCallExecs(t *testing.T) {
 	core := realCoreBinary(t)
 	repo := t.TempDir()
@@ -114,12 +116,20 @@ func TestAPIWithTheCoreWorkerServesToolRoutesWithoutPerCallExecs(t *testing.T) {
 			if resp.StatusCode != http.StatusOK {
 				t.Fatalf("%s: status %d %.300s\nlog:\n%s", route, resp.StatusCode, body, p.stderr.String())
 			}
+			if round == 1 && strings.HasPrefix(route, "/search") && !strings.Contains(string(body), `"source":"resident_index"`) {
+				t.Fatalf("search was not answered from the resident index: %.600s", body)
+			}
 		}
 	}
 	all := execs()
 	var workerPID int
+	indexRuns := 0
 	for _, line := range all {
 		sub, pid, _ := strings.Cut(line, " ")
+		if sub == "index" {
+			indexRuns++
+			continue
+		}
 		if sub != "serve" {
 			t.Fatalf("a tool route exec'd `xmustard-core %s` with the worker on; execs: %v", sub, all)
 		}
@@ -127,6 +137,9 @@ func TestAPIWithTheCoreWorkerServesToolRoutesWithoutPerCallExecs(t *testing.T) {
 			t.Fatalf("the worker started more than once: %v", all)
 		}
 		workerPID, _ = strconv.Atoi(pid)
+	}
+	if indexRuns != 1 {
+		t.Fatalf("want one index update for the unchanged tree, got %d; execs: %v", indexRuns, all)
 	}
 	if workerPID == 0 || !alive(workerPID) {
 		t.Fatalf("no running worker after the tool calls: execs %v\nlog:\n%s", all, p.stderr.String())

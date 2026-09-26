@@ -129,7 +129,7 @@ impl Drop for Worker {
 }
 
 /// Drop fields that legitimately differ between two runs of the same query: clock
-/// readings, per-call ids, and per-call cache accounting (graph cache hit or miss,
+/// readings (including the freshness observation's age), per-call ids, and per-call cache accounting (graph cache hit or miss,
 /// lock waits, timings, wiki pages regenerated versus reused).
 fn normalize(v: &mut Value) {
     match v {
@@ -137,6 +137,7 @@ fn normalize(v: &mut Value) {
             map.retain(|k, _| {
                 !(k.ends_with("_at")
                     || k == "elapsed_ms"
+                    || k == "identity_age_ms"
                     || k == "work"
                     || k == "result_id"
                     || k == "regenerated_slugs"

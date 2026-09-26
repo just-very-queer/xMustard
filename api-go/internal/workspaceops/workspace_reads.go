@@ -180,6 +180,10 @@ type CodeExplainerResult struct {
 	Hints           []string `json:"hints"`
 	Warnings        []string `json:"warnings"`
 	GeneratedAt     string   `json:"generated_at"`
+	// Freshness and Coverage describe the code graph behind the explanation's cluster
+	// (set by the explain route).
+	Freshness json.RawMessage `json:"freshness,omitempty"`
+	Coverage  json.RawMessage `json:"coverage,omitempty"`
 }
 
 type ImpactPathRecord struct {

@@ -30,7 +30,8 @@ func WorkspaceSearchCtx(ctx context.Context, dataDir, workspaceID, query string,
 	if limit <= 0 {
 		limit = 25
 	}
-	coreArgs := []string{root, workspaceID, query, strconv.Itoa(limit)}
+	read := ensureCodeIndex(ctx, root)
+	coreArgs := append(read.flags(), root, workspaceID, query, strconv.Itoa(limit))
 	if seed != "" {
 		// the seed is the CLI's optional 5th positional arg, after limit.
 		coreArgs = append(coreArgs, seed)
@@ -39,7 +40,7 @@ func WorkspaceSearchCtx(ctx context.Context, dataDir, workspaceID, query string,
 	if err != nil {
 		return nil, err
 	}
-	return json.RawMessage(out), nil
+	return read.annotate(out), nil
 }
 
 // WorkspaceSearchWithFeedback runs the live search, fuses the agent-feedback boost
@@ -99,7 +100,8 @@ type searchResult struct {
 	Query       string          `json:"query"`
 	Total       int             `json:"total"`
 	Hits        []searchHit     `json:"hits"`
-	Coverage    json.RawMessage `json:"coverage,omitempty"` // pass index coverage through to the agent
+	Coverage    json.RawMessage `json:"coverage,omitempty"`  // pass index coverage through to the agent
+	Freshness   json.RawMessage `json:"freshness,omitempty"` // and the graph's freshness envelope
 	GeneratedAt string          `json:"generated_at"`
 }
 

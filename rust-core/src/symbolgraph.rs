@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::index::envelope::{Freshness, Relation, Status};
 use crate::repomap;
 
 fn now() -> String {
@@ -19,7 +20,6 @@ fn now() -> String {
 const SOURCE_EXTS: &[&str] = &[
     "rs", "go", "py", "ts", "tsx", "js", "jsx", "java", "rb", "c", "h", "cpp", "hpp", "cc",
 ];
-const MAX_FILES: usize = 800;
 const MIN_NAME_LEN: usize = 4;
 // names this common produce noisy edges; skip as reference anchors.
 const STOPWORD_SYMBOLS: &[&str] = &[
@@ -35,8 +35,15 @@ fn is_source(path: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Bound on symbols held by one graph (memory); files past it report `symbol_budget`.
-pub const MAX_GRAPH_SYMBOLS: usize = 100_000;
+/// The declared scale envelope (PAR-RT-09) that bounds this graph as it bounds the code
+/// index: the index configuration's file and symbol bounds (defaults, the repository's
+/// `.xmustard.json`, `XMUSTARD_INDEX_*`). Files past them are reported as
+/// `envelope_files` / `symbol_budget` losses; there is no fixed file cap.
+fn graph_envelope(root: &Path) -> (usize, usize) {
+    let cfg = crate::index::config::IndexConfig::load(root).unwrap_or_default();
+    (cfg.max_files, cfg.max_symbols)
+}
+
 /// Bound on per-file loss entries listed in coverage (`loss_counts` stays exact).
 pub const MAX_LOSS_ENTRIES: usize = 200;
 
@@ -44,7 +51,7 @@ pub const MAX_LOSS_ENTRIES: usize = 200;
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct CoverageLoss {
     pub path: String,
-    /// `file_cap` | `oversized` | `unreadable` | `symlink` | `not_regular` |
+    /// `envelope_files` | `oversized` | `unreadable` | `symlink` | `not_regular` |
     /// `invalid_path_encoding` | `invalid_utf8` | `excluded_path` |
     /// `unsupported_language` | `symbols_truncated` | `symbol_budget`
     pub reason: String,
@@ -149,6 +156,28 @@ pub struct IndexCoverage {
     pub source_identity: SourceIdentitySummary,
     #[serde(default)]
     pub work: IndexWork,
+    /// The declared scale envelope (PAR-RT-09) and which bounds cut this index; set
+    /// when the code index answered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub envelope: Option<crate::index::meta::Envelope>,
+}
+
+impl IndexCoverage {
+    /// Record a graph read that failed while answering (a corrupt or truncated segment,
+    /// an I/O error): the answer is partial, so it is no longer reported complete.
+    pub fn note_read_error(&mut self, what: &str, err: &str) {
+        eprintln!("graph read ({what}): {err}");
+        *self
+            .loss_counts
+            .entry("graph_read_error".into())
+            .or_default() += 1;
+        self.complete = false;
+        let msg = format!("graph read failed ({what}): {err}");
+        self.degraded_reason = Some(match self.degraded_reason.take() {
+            Some(r) => format!("{r}; {msg}"),
+            None => msg,
+        });
+    }
 }
 
 /// One `git ls-files -s -z` index entry.
@@ -193,7 +222,7 @@ fn ls_files_stage(root: &Path) -> Result<Vec<IndexEntry>, crate::indexcache::Git
 fn git_unavailable_coverage(why: &str) -> IndexCoverage {
     IndexCoverage {
         repo_mode: "git-unavailable".into(),
-        max_files: MAX_FILES,
+        max_files: crate::index::config::DEFAULT_MAX_FILES,
         degraded_reason: Some(format!(
             "git ls-files failed ({why}); the symbol graph is EMPTY, not authoritative"
         )),
@@ -1041,7 +1070,7 @@ pub fn compute_clusters(graph: &SymbolGraph) -> Vec<FileCluster> {
 }
 
 // the most common top-level directory among a cluster's files (a readable name).
-fn dominant_directory(files: &[String]) -> String {
+pub(crate) fn dominant_directory(files: &[String]) -> String {
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
     for f in files {
         let dir = f.split('/').next().unwrap_or("(root)");
@@ -1515,6 +1544,7 @@ fn build_graph(
 ) -> SymbolGraph {
     use crate::indexcache::{DirtyContent, source_identity};
 
+    let (max_files, max_symbols) = graph_envelope(root);
     let listing = match id.layout {
         Some(_) => ls_files_stage(root).map_err(|e| e.to_string()),
         None => Err("no .git / git missing / unsafe directory".to_string()),
@@ -1591,11 +1621,11 @@ fn build_graph(
             continue;
         }
         eligible += 1;
-        if selected >= MAX_FILES {
+        if selected >= max_files {
             loss(
                 &rel,
-                "file_cap",
-                format!("beyond the {MAX_FILES}-file cap"),
+                "envelope_files",
+                format!("beyond the declared envelope of {max_files} files"),
                 false,
             );
             continue;
@@ -1717,14 +1747,14 @@ fn build_graph(
                 true,
             );
         }
-        let room = MAX_GRAPH_SYMBOLS.saturating_sub(kept_total);
+        let room = max_symbols.saturating_sub(kept_total);
         if f.symbols.len() > room {
             budget_hit = true;
             loss(
                 rel,
                 "symbol_budget",
                 format!(
-                    "graph symbol budget {MAX_GRAPH_SYMBOLS} reached; {} of {} symbols indexed",
+                    "graph symbol budget {max_symbols} reached; {} of {} symbols indexed",
                     room,
                     f.symbols.len()
                 ),
@@ -1901,17 +1931,17 @@ fn build_graph(
     let total_losses = losses.len();
     let losses_truncated = total_losses > MAX_LOSS_ENTRIES;
     losses.truncate(MAX_LOSS_ENTRIES);
-    let file_capped = loss_counts.contains_key("file_cap");
+    let file_capped = loss_counts.contains_key("envelope_files");
     let truncated = file_capped || symbols_truncated_files > 0 || budget_hit;
     let mut reasons: Vec<String> = Vec::new();
     if file_capped {
         reasons.push(format!(
-            "indexed first {selected} of {eligible} source files; results beyond the cap are incomplete"
+            "indexed first {selected} of {eligible} source files; results beyond the envelope are incomplete"
         ));
     }
     let other: Vec<String> = loss_counts
         .iter()
-        .filter(|(r, _)| r.as_str() != "file_cap")
+        .filter(|(r, _)| r.as_str() != "envelope_files")
         .map(|(r, n)| format!("{r}={n}"))
         .collect();
     if !other.is_empty() {
@@ -1967,7 +1997,7 @@ fn build_graph(
             eligible_files: eligible,
             indexed_files,
             truncated,
-            max_files: MAX_FILES,
+            max_files,
             degraded_reason: (!reasons.is_empty()).then(|| reasons.join("; ")),
             selected_files: selected,
             complete,
@@ -1979,6 +2009,7 @@ fn build_graph(
             extraction,
             source_identity: identity_summary(id, stable),
             work: IndexWork::default(),
+            envelope: None,
         },
         generated_at: now(),
     };
@@ -2007,7 +2038,7 @@ pub struct ImpactedFile {
     pub distance: usize,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Default)]
 pub struct SymbolImpact {
     pub symbol: String,
     pub defined_in: Vec<String>,
@@ -2015,6 +2046,10 @@ pub struct SymbolImpact {
     pub impacted_count: usize,
     pub max_depth: usize,
     pub generated_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub freshness: Option<Freshness>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coverage: Option<CoverageSummary>,
 }
 
 // files that define a given symbol (by symbol-node match).
@@ -2079,10 +2114,11 @@ pub fn symbol_impact(graph: &SymbolGraph, symbol: &str, max_depth: usize) -> Sym
         impacted,
         max_depth,
         generated_at: now(),
+        ..Default::default()
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Default)]
 pub struct SymbolTrace {
     pub from: String,
     pub to: String,
@@ -2090,6 +2126,10 @@ pub struct SymbolTrace {
     pub length: usize,
     pub found: bool,
     pub generated_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub freshness: Option<Freshness>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coverage: Option<CoverageSummary>,
 }
 
 /// Shortest dependency path between two symbols: BFS over the undirected file graph
@@ -2147,6 +2187,7 @@ pub fn trace_symbols(graph: &SymbolGraph, from: &str, to: &str) -> SymbolTrace {
         found: !path.is_empty(),
         path,
         generated_at: now(),
+        ..Default::default()
     }
 }
 
@@ -2257,11 +2298,264 @@ pub fn blast_radius(root: &Path, workspace_id: &str, symbol: &str) -> BlastRadiu
     }
 }
 
+// ---------------------------------------------------------------------------
+// The query side: one interface over the legacy graph and the code index
+// ---------------------------------------------------------------------------
+
+/// One symbol as a query sees it.
+pub struct SymbolRef<'a> {
+    pub name: &'a str,
+    pub path: &'a str,
+    /// 1-based line of the declaration.
+    pub line: Option<usize>,
+    /// Inbound structure weight of the symbol's file.
+    pub file_inbound: usize,
+}
+
+/// One file as a query sees it.
+pub struct FileRef<'a> {
+    pub path: &'a str,
+    pub inbound: usize,
+    /// Symbols the file declares (non-local).
+    pub symbols: usize,
+}
+
+/// The graph reads behind search, explain and impact. The legacy per-call
+/// [`SymbolGraph`] and the code index's snapshot (`index::reader::Snapshot`) implement
+/// it with the same rules and orderings, so a query does not know which one answered.
+pub trait QueryGraph: Send + Sync {
+    /// Symbols the source lists (the corpus size for idf).
+    fn symbol_count(&self) -> usize;
+    fn for_each_symbol(&self, f: &mut dyn FnMut(SymbolRef<'_>)) -> Result<(), String>;
+    fn for_each_file(&self, f: &mut dyn FnMut(FileRef<'_>)) -> Result<(), String>;
+    /// Every `structure` edge between two files as `(from, to)`, one per typed edge.
+    fn for_each_edge(&self, f: &mut dyn FnMut(&str, &str)) -> Result<(), String>;
+    fn hotspots(&self, limit: usize) -> Result<Vec<Hotspot>, String>;
+    fn impact(&self, symbol: &str, max_depth: usize) -> Result<SymbolImpact, String>;
+    fn trace(&self, from: &str, to: &str) -> Result<SymbolTrace, String>;
+    fn clusters(&self) -> Result<Vec<FileCluster>, String>;
+    /// The cluster holding `path`.
+    fn cluster_of(&self, path: &str) -> Result<Option<FileCluster>, String> {
+        Ok(self
+            .clusters()?
+            .into_iter()
+            .find(|c| c.files.iter().any(|f| f == path)))
+    }
+    /// The size and mtime the source recorded for `path`, for dirty checks; None when
+    /// it records none.
+    fn indexed_stat(&self, _path: &str) -> Option<(u64, i64)> {
+        None
+    }
+}
+
+fn inbound_by_path(graph: &SymbolGraph) -> HashMap<&str, usize> {
+    let mut inbound: HashMap<&str, usize> = HashMap::new();
+    for e in &graph.edges {
+        *inbound.entry(e.to_path.as_str()).or_insert(0) += e.weight;
+    }
+    inbound
+}
+
+impl QueryGraph for SymbolGraph {
+    fn symbol_count(&self) -> usize {
+        self.symbols.len()
+    }
+
+    fn for_each_symbol(&self, f: &mut dyn FnMut(SymbolRef<'_>)) -> Result<(), String> {
+        let inbound = inbound_by_path(self);
+        for s in &self.symbols {
+            f(SymbolRef {
+                name: &s.name,
+                path: &s.path,
+                line: s.line_start,
+                file_inbound: inbound.get(s.path.as_str()).copied().unwrap_or(0),
+            });
+        }
+        Ok(())
+    }
+
+    fn for_each_file(&self, f: &mut dyn FnMut(FileRef<'_>)) -> Result<(), String> {
+        let inbound = inbound_by_path(self);
+        for file in &self.files {
+            f(FileRef {
+                path: &file.path,
+                inbound: inbound.get(file.path.as_str()).copied().unwrap_or(0),
+                symbols: file.symbol_count,
+            });
+        }
+        Ok(())
+    }
+
+    fn for_each_edge(&self, f: &mut dyn FnMut(&str, &str)) -> Result<(), String> {
+        for e in &self.edges {
+            f(&e.from_path, &e.to_path);
+        }
+        Ok(())
+    }
+
+    fn hotspots(&self, limit: usize) -> Result<Vec<Hotspot>, String> {
+        Ok(compute_hotspots(self, limit))
+    }
+
+    fn impact(&self, symbol: &str, max_depth: usize) -> Result<SymbolImpact, String> {
+        Ok(symbol_impact(self, symbol, max_depth))
+    }
+
+    fn trace(&self, from: &str, to: &str) -> Result<SymbolTrace, String> {
+        Ok(trace_symbols(self, from, to))
+    }
+
+    fn clusters(&self) -> Result<Vec<FileCluster>, String> {
+        Ok(compute_clusters(self))
+    }
+}
+
+/// Coverage in brief, for results that list files rather than the whole index
+/// (impact, explain): counts per loss reason instead of silent capping.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct CoverageSummary {
+    pub eligible_files: usize,
+    pub indexed_files: usize,
+    pub truncated: bool,
+    pub complete: bool,
+    pub max_files: usize,
+    pub loss_counts: BTreeMap<String, usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub envelope: Option<crate::index::meta::Envelope>,
+}
+
+impl From<&IndexCoverage> for CoverageSummary {
+    fn from(c: &IndexCoverage) -> Self {
+        CoverageSummary {
+            eligible_files: c.eligible_files,
+            indexed_files: c.indexed_files,
+            truncated: c.truncated,
+            complete: c.complete,
+            max_files: c.max_files,
+            loss_counts: c.loss_counts.clone(),
+            envelope: c.envelope.clone(),
+        }
+    }
+}
+
+enum Answered {
+    Index(crate::index::reader::Opened),
+    Legacy(Relation),
+}
+
+/// The graph one query reads, with the coverage and freshness it reports. The code
+/// index answers whenever the root has one; otherwise the legacy graph does.
+pub struct QuerySource {
+    pub graph: Arc<dyn QueryGraph>,
+    pub coverage: IndexCoverage,
+    answered: Answered,
+}
+
+/// The source for a query on `root`: the resident (or one-shot) index snapshot when
+/// the root is indexed, else the legacy per-call graph.
+pub fn query_source(root: &Path, workspace_id: &str) -> QuerySource {
+    query_source_for(root, workspace_id, None)
+}
+
+/// [`query_source`] for a read that observed the repository identity `identity_key`
+/// (the orchestrator's key, the one `index update --identity-key` stamps). An index
+/// last brought to another identity is behind the working tree: its refresh was
+/// refused, failed or is still running. The legacy graph, built for the tree as it is
+/// now and bounded by the same envelope, answers that read instead, so edits never
+/// drop out of search, explain and impact while the index catches up.
+pub fn query_source_for(
+    root: &Path,
+    workspace_id: &str,
+    identity_key: Option<&str>,
+) -> QuerySource {
+    let behind = match crate::index::reader::open(root) {
+        Some(opened) if identity_key.is_none_or(|k| k == opened.meta.identity_key) => {
+            return QuerySource {
+                graph: opened.snapshot.clone(),
+                coverage: opened.coverage(),
+                answered: Answered::Index(opened),
+            };
+        }
+        Some(opened) => Some(opened.snapshot.generation),
+        None => None,
+    };
+    let (graph, mut coverage) = symbol_graph_with_coverage(root, workspace_id);
+    if let Some(generation) = behind {
+        coverage.work.graph_cache_detail = format!(
+            "code index generation {generation} is behind this read's repository identity; \
+             the graph for the current identity answered ({})",
+            coverage.work.graph_cache_detail
+        );
+    }
+    // the legacy graph is built from the working tree's identity at this call
+    let id = &coverage.source_identity;
+    let relation = Relation {
+        indexed_commit: id.head.clone(),
+        head: id.head.clone(),
+        status: if id.stable {
+            Status::Current
+        } else {
+            Status::Unknown
+        },
+        behind_by: None,
+        at: std::time::Instant::now(),
+    };
+    QuerySource {
+        graph,
+        coverage,
+        answered: Answered::Legacy(relation),
+    }
+}
+
+impl QuerySource {
+    /// The freshness envelope for a result touching `paths`.
+    pub fn freshness<'a>(&self, paths: impl IntoIterator<Item = &'a str>) -> Freshness {
+        match &self.answered {
+            Answered::Index(opened) => opened.freshness(paths),
+            Answered::Legacy(rel) => Freshness::from_relation(
+                "legacy_graph",
+                rel,
+                crate::indexcache::INDEX_FORMAT_VERSION.to_string(),
+                None,
+            ),
+        }
+    }
+
+    /// Freshness and coverage summary for a result touching `paths`.
+    pub fn annotate<'a>(
+        &self,
+        paths: impl IntoIterator<Item = &'a str>,
+    ) -> (Option<Freshness>, Option<CoverageSummary>) {
+        (
+            Some(self.freshness(paths)),
+            Some(CoverageSummary::from(&self.coverage)),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::process::Command;
     use tempfile::TempDir;
+
+    // A failed graph read makes the answer partial: coverage stops claiming complete,
+    // counts the failure and keeps any earlier degradation reason.
+    #[test]
+    fn a_graph_read_error_marks_coverage_incomplete() {
+        let mut c = IndexCoverage {
+            complete: true,
+            degraded_reason: Some("coverage losses: oversized=1".into()),
+            ..Default::default()
+        };
+        c.note_read_error("symbols", "segment truncated");
+        c.note_read_error("files", "I/O error");
+        assert!(!c.complete);
+        assert_eq!(c.loss_counts["graph_read_error"], 2);
+        let reason = c.degraded_reason.unwrap();
+        assert!(reason.starts_with("coverage losses: oversized=1; graph read failed (symbols)"));
+        assert!(reason.ends_with("graph read failed (files): I/O error"));
+    }
 
     // The openat fd-walk refuses a symlink at EVERY path component (final file AND
     // intermediate directory), so a swap can't redirect the explain/symbols read into

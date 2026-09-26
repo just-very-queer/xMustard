@@ -42,43 +42,41 @@ fn subsystem_name(path: &str) -> String {
     )
 }
 
-/// Subsystems (top-level directories) with their size and cohesion. The graph comes
-/// through the shared cache (inside `serve`, the resident snapshot), so this reads an
-/// existing graph instead of rebuilding the whole repository on every call.
-pub fn build_subsystems(root: &Path, workspace_id: &str) -> Vec<Subsystem> {
-    let graph = symbolgraph::symbol_graph_for_query(root, workspace_id);
+/// Subsystems (top-level directories) with their size and cohesion. The graph is the
+/// code index's snapshot when the root has an index (resident inside `serve`), else
+/// the legacy graph through its shared cache, so this never rebuilds the repository.
+/// A failed graph read is an error: partial totals would read as the whole repository.
+pub fn build_subsystems(root: &Path, workspace_id: &str) -> Result<Vec<Subsystem>, String> {
+    let graph = symbolgraph::query_source(root, workspace_id).graph;
     let mut file_to_subsystem: HashMap<String, String> = HashMap::new();
     let mut totals: HashMap<String, (usize, usize, usize, usize)> = HashMap::new(); // file_count, symbol_count, internal, external
 
-    for file in &graph.files {
-        let subsystem = subsystem_name(&file.path);
-        file_to_subsystem.insert(file.path.clone(), subsystem.clone());
+    let files = graph.for_each_file(&mut |file| {
+        let subsystem = subsystem_name(file.path);
+        file_to_subsystem.insert(file.path.to_string(), subsystem.clone());
         let entry = totals.entry(subsystem).or_insert((0, 0, 0, 0));
         entry.0 += 1;
-        entry.1 += file.symbol_count;
-    }
-
-    for edge in &graph.edges {
-        let from = file_to_subsystem.get(&edge.from_path);
-        let to = file_to_subsystem.get(&edge.to_path);
-        match (from, to) {
-            (Some(from_sub), Some(to_sub)) => {
-                if from_sub == to_sub {
-                    if let Some(entry) = totals.get_mut(from_sub) {
-                        entry.2 += 1;
-                    }
-                } else {
-                    if let Some(entry) = totals.get_mut(from_sub) {
-                        entry.3 += 1;
-                    }
-                    if let Some(entry) = totals.get_mut(to_sub) {
-                        entry.3 += 1;
-                    }
+        entry.1 += file.symbols;
+    });
+    let edges = graph.for_each_edge(&mut |from, to| {
+        let (Some(from_sub), Some(to_sub)) =
+            (file_to_subsystem.get(from), file_to_subsystem.get(to))
+        else {
+            return;
+        };
+        if from_sub == to_sub {
+            if let Some(entry) = totals.get_mut(from_sub) {
+                entry.2 += 1;
+            }
+        } else {
+            for side in [from_sub, to_sub] {
+                if let Some(entry) = totals.get_mut(side) {
+                    entry.3 += 1;
                 }
             }
-            _ => continue,
         }
-    }
+    });
+    files.and(edges).map_err(|e| format!("graph read: {e}"))?;
 
     let mut subsystems: Vec<Subsystem> = totals
         .into_iter()
@@ -107,7 +105,7 @@ pub fn build_subsystems(root: &Path, workspace_id: &str) -> Vec<Subsystem> {
             .cmp(&a.file_count)
             .then_with(|| a.name.cmp(&b.name))
     });
-    subsystems
+    Ok(subsystems)
 }
 
 pub fn likely_owners(root: &Path, path: &str) -> OwnerSuggestion {
@@ -205,7 +203,7 @@ mod tests {
     #[test]
     fn builds_core_subsystem_from_file_paths() {
         let repo = temp_repo();
-        let subsystems = build_subsystems(repo.path(), "ws");
+        let subsystems = build_subsystems(repo.path(), "ws").unwrap();
         let core = subsystems
             .iter()
             .find(|s| s.name == "core")
