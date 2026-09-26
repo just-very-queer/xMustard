@@ -27,17 +27,16 @@ import (
 // a cold build peaked at 20.8-21.0 MiB ps RSS on pi-mono and 23.0-23.1 on cline, an
 // update at 18.3-18.8. `index stats` is a read and never takes the slot.
 //
-// build-lsp builds the same graph and starts language servers, which are external
-// processes on their own line. Captures never take the slot (they stream to the spool
-// in O(window)), and neither do the graph queries (impact, trace, clusters, hotspots,
-// blast-radius): they are query paths bounded by the child limit.
+// Captures never take the slot (they stream to the spool in O(window)), and neither
+// do the graph queries (impact, trace, clusters, hotspots, blast-radius): they are
+// query paths bounded by the child limit.
 const (
 	heavyBuildBytes int64 = 44 << 20
 	heavyIndexBytes int64 = 25 << 20
 )
 
 var heavyCoreOps = map[string]map[string]int64{
-	"symbolgraph": {"build": heavyBuildBytes, "build-lsp": heavyBuildBytes},
+	"symbolgraph": {"build": heavyBuildBytes},
 	"changetrack": {"index": heavyBuildBytes},
 	"index":       {"build": heavyIndexBytes, "update": heavyIndexBytes},
 }

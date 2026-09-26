@@ -329,7 +329,7 @@ var (
 	oneShotOnly = map[string]bool{
 		"lsp-document-symbols": true, "lsp-hover": true, "run-verification-command": true,
 		"run-managed-command": true, "run-verification-profile": true, "goal": true,
-		"semantic-search": true,
+		"semantic-search": true, "index": true,
 	}
 	oneShotFamilies = map[string]map[string]bool{
 		"changetrack": {"index": true},

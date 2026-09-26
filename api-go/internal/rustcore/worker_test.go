@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -1055,9 +1056,34 @@ func TestWorkerOneShotHintsMatchTheCore(t *testing.T) {
 			}
 		}
 	}
+	// The handshake lists only resident commands, so whole one-shot commands come
+	// from the core's subcommand table.
+	for _, name := range coreOneShotCommands(t) {
+		if !oneShotOnly[name] {
+			t.Errorf("the core runs %s one-shot; add it to oneShotOnly", name)
+		}
+	}
 	if !mustKnow(t, key).residentFor("search", nil) {
 		t.Fatal("the supervisor did not keep the handshake's residency")
 	}
+}
+
+// coreOneShotCommands reads the whole commands the core marks Residency::OneShot
+// from its subcommand table.
+func coreOneShotCommands(t *testing.T) []string {
+	t.Helper()
+	src, err := os.ReadFile(filepath.Join(rustCoreDir(), "src", "bin", "xmustard-core.rs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, m := range regexp.MustCompile(`cmd\(\s*"([a-z-]+)",\s*Residency::OneShot\b`).FindAllSubmatch(src, -1) {
+		names = append(names, string(m[1]))
+	}
+	if len(names) == 0 {
+		t.Fatal("no one-shot commands found in the core's subcommand table")
+	}
+	return names
 }
 
 func mustKnow(t *testing.T, key workerKey) workerResidency {

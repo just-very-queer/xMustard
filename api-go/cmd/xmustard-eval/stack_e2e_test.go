@@ -46,6 +46,11 @@ func TestRealStackDryRun(t *testing.T) {
 				if r.Stack == nil || r.Stack.Kind != StackReal || !r.Stack.CoreOnly || r.Stack.WorkspaceID == "" {
 					t.Fatalf("%s: stack %+v", r.Arm, r.Stack)
 				}
+				// The eval reads /api/health as its admin, so the operator view with the
+				// data-movement counters (PAR-EVAL-04) reaches every record.
+				if b, _ := r.Stack.Health["budget"].(map[string]any); b == nil || b["counters"] == nil {
+					t.Fatalf("%s: health has no budget counters: %+v", r.Arm, r.Stack.Health)
+				}
 				if len(r.Transcript.XmResults) != 2 {
 					t.Fatalf("%s: xMustard results %+v", r.Arm, r.Transcript.XmResults)
 				}

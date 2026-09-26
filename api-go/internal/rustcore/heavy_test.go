@@ -104,7 +104,6 @@ func TestHeavyCoreOpClassification(t *testing.T) {
 		declared int64
 	}{
 		{[]string{"symbolgraph", "build", "/r", "ws"}, "rust:symbolgraph/build", heavyBuildBytes},
-		{[]string{"symbolgraph", "build-lsp", "/r", "ws"}, "rust:symbolgraph/build-lsp", heavyBuildBytes},
 		{[]string{"changetrack", "index", "/d", "/r", "ws"}, "rust:changetrack/index", heavyBuildBytes},
 		{[]string{"index", "build", "/r"}, "rust:index/build", heavyIndexBytes},
 		{[]string{"index", "update", "/r", "--paths", "a.go"}, "rust:index/update", heavyIndexBytes},
