@@ -157,9 +157,14 @@ func (s *SQLStore) ImportContextEntriesJSON(ctx context.Context, workspaceID str
 	if err := actor.validate(); err != nil {
 		return rep, err
 	}
+	release, err := acquireImportSlot(ctx, "context_entries.json")
+	if err != nil {
+		return rep, err
+	}
+	defer release()
 	h := sha256.New()
 	tee := io.TeeReader(bufio.NewReader(src), h)
-	err := s.Update(ctx, func(tx Tx) error {
+	err = s.Update(ctx, func(tx Tx) error {
 		t := tx.(*txn)
 		dec := json.NewDecoder(tee)
 		tok, err := dec.Token()
@@ -654,8 +659,13 @@ func (s *SQLStore) ImportFeedbackJSON(ctx context.Context, workspaceID string, s
 	if err := validID("workspace", workspaceID); err != nil {
 		return 0, err
 	}
+	release, err := acquireImportSlot(ctx, "agent_feedback.json")
+	if err != nil {
+		return 0, err
+	}
+	defer release()
 	n := 0
-	err := s.Update(ctx, func(tx Tx) error {
+	err = s.Update(ctx, func(tx Tx) error {
 		t := tx.(*txn)
 		dec := json.NewDecoder(bufio.NewReader(src))
 		tok, err := dec.Token()

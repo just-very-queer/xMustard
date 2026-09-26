@@ -55,7 +55,7 @@ func platformGate(role, note string) routeGate { return routeGate{Role: role, No
 
 var routeGateTable = map[string]routeGate{
 	// --- core: liveness, identity and token administration ---
-	"/api/health":                               coreGate(roleReader, "", "public liveness and budget counters"),
+	"/api/health":                               coreGate(roleReader, "", "public liveness and limits; the budget block needs an operator token while auth is enforced"),
 	"GET /api/auth/whoami":                      coreGate(roleReader, "", "caller principal, roles and usable tools"),
 	"GET /api/auth/principals":                  coreGate(roleAdmin, "", ""),
 	"POST /api/auth/tokens":                     coreGate(roleAdmin, "", "mint"),

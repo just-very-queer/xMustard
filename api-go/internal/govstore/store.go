@@ -346,6 +346,7 @@ func Open(ctx context.Context, path string, opts Options) (*SQLStore, error) {
 	readers.SetConnMaxIdleTime(opts.ReaderIdleTimeout)
 	s.readers = readers
 	s.reader = reader{q: readers, borrow: s.borrowForRead, now: opts.Now}
+	openStores.Add(1)
 	return s, nil
 }
 
@@ -510,6 +511,7 @@ func (s *SQLStore) Close() error {
 	if s.closed.Swap(true) {
 		return nil
 	}
+	openStores.Add(-1)
 	err := s.readers.Close()
 	if werr := s.writer.Close(); err == nil {
 		err = werr

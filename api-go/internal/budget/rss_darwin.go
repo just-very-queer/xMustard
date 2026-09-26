@@ -138,3 +138,5 @@ func darwinChildPIDs(pid int, buf []int32) []int {
 	}
 	return out
 }
+
+func measureProcess(pid int) (procMem, bool) { return darwinProcMem(pid) }

@@ -86,6 +86,9 @@ func TestAPIWithTheCoreWorkerServesToolRoutesWithoutPerCallExecs(t *testing.T) {
 	}
 	p := startAPIProc(t, map[string]string{
 		"XMUSTARD_DATA_DIR": dir, "XMUSTARD_CORE_BIN": wrapper, "XMUSTARD_CORE_WORKER": "1",
+		// The worker samples the tree when it goes idle, and the tree counts this
+		// user's stdio shims on the host; other sessions' shims must not recycle it.
+		"XMUSTARD_RSS_SOFT_CEILING_BYTES": strconv.Itoa(1 << 40),
 	})
 	base := p.base + "/api/workspaces/" + ws
 	// The read tools with Rust work. diagnostics needs Postgres and why_failed a
