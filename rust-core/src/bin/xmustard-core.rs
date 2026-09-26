@@ -974,59 +974,62 @@ mod tests {
         ("wiki", &[]),
     ];
 
-    /// Every table command the Go bridge (api-go/internal/rustcore) calls, resident or
-    /// one-shot. The Makefile's `scan-signals` and scripts/e2e's `repo-key` are among
-    /// them. TestEveryCoreSubcommandGoCallsExists finds the Go calls by parsing the Go
-    /// sources and checks each one against the built core.
-    const GO_CALLS: &[&str] = &[
-        "scan-signals",
-        "build-repo-map",
-        "semantic-impact",
-        "path-symbols",
-        "explain-path",
-        "normalize-diagnostics",
-        "archive-diagnostics-payload",
-        "link-diagnostic-symbol",
-        "normalize-lsp-definition",
-        "normalize-lsp-references",
-        "normalize-lsp-document-symbols",
-        "lsp-document-symbols",
-        "lsp-hover",
-        "normalize-lsp-workspace-symbols",
-        "parse-coverage-lcov",
-        "parse-coverage",
-        "run-verification-command",
-        "run-managed-command",
-        "run-verification-profile",
-        "goal",
-        "changetrack",
-        "symbolgraph",
-        "ownership",
-        "search",
-        "repo-key",
-        "wiki",
-    ];
+    /// rust-core/go-calls.txt: every call code reachable from an api-go main makes
+    /// (`called`) and the commands kept without one (`kept ... -- reason`).
+    /// TestCoreCallManifestMatchesGoSources (api-go/internal/rustcore) holds the file
+    /// to the Go sources, so this list cannot drift from what Go calls.
+    const GO_CALL_MANIFEST: &str = include_str!("../../go-calls.txt");
 
-    /// Table commands kept without a caller, with the reason.
-    const KEPT_WITHOUT_CALLER: &[(&str, &str)] = &[(
-        "semantic-search",
-        "WS-37 owns semantic.rs; the Go ast-grep path runs sg itself",
-    )];
+    /// (kind, subcommand, family member) for each line of the manifest.
+    fn go_call_manifest() -> Vec<(&'static str, &'static str, Option<&'static str>)> {
+        GO_CALL_MANIFEST
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .map(|line| {
+                let (spec, reason) = match line.split_once(" -- ") {
+                    Some((spec, reason)) => (spec, Some(reason.trim())),
+                    None => (line, None),
+                };
+                let words: Vec<&str> = spec.split_whitespace().collect();
+                let ok = match (words.first().copied(), reason) {
+                    (Some("called"), None) => true,
+                    (Some("kept"), Some(reason)) => !reason.is_empty(),
+                    _ => false,
+                };
+                assert!(ok && (2..=3).contains(&words.len()), "go-calls.txt: {line}");
+                (words[0], words[1], words.get(2).copied())
+            })
+            .collect()
+    }
 
     #[test]
-    fn every_command_has_a_caller() {
-        let mut table: Vec<&str> = COMMANDS.iter().map(|c| c.name).collect();
-        let mut expected: Vec<&str> = GO_CALLS
-            .iter()
-            .copied()
-            .chain(KEPT_WITHOUT_CALLER.iter().map(|(name, _)| *name))
-            .collect();
-        table.sort_unstable();
-        expected.sort_unstable();
-        assert_eq!(
-            table, expected,
-            "a subcommand nothing calls is unreachable code: remove it, or name its caller"
+    fn go_called_commands_exist() {
+        let manifest = go_call_manifest();
+        assert!(
+            manifest
+                .iter()
+                .filter(|(kind, ..)| *kind == "called")
+                .count()
+                >= 30,
+            "go-calls.txt lost its calls"
         );
+        for (kind, name, member) in manifest {
+            let entry = dispatch::find(COMMANDS, name).unwrap_or_else(|| {
+                panic!("go-calls.txt lists `{kind} {name}`, but COMMANDS has no {name}")
+            });
+            // A member alone never has the rest of its arguments, so a handler that
+            // knows it answers with its usage line instead of running.
+            if let Some(member) = member
+                && let Err(err) = (entry.run)(strings(&[member]).into_iter())
+            {
+                assert_ne!(
+                    err.message,
+                    format!("unknown {name} subcommand: {member}"),
+                    "go-calls.txt lists `{kind} {name} {member}`"
+                );
+            }
+        }
     }
 
     #[test]

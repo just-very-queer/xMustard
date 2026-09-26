@@ -384,17 +384,16 @@ pub fn run_verification_profile(
             .as_ref()
             .map(|item| item.success)
             .unwrap_or(true);
-        if coverage_ok {
-            if let Some(report_path) = resolved_report_path.as_ref() {
-                if report_path.exists() {
-                    coverage_result = Some(parse_coverage_file(
-                        report_path,
-                        &profile.workspace_id,
-                        run_id,
-                        issue_id,
-                    )?);
-                }
-            }
+        if coverage_ok
+            && let Some(report_path) = resolved_report_path.as_ref()
+            && report_path.exists()
+        {
+            coverage_result = Some(parse_coverage_file(
+                report_path,
+                &profile.workspace_id,
+                run_id,
+                issue_id,
+            )?);
         }
     }
 

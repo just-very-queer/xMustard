@@ -1,0 +1,58 @@
+# xmustard-core calls from api-go, one per line.
+#
+#   called <subcommand> [member]            code reachable from an api-go main makes it
+#   kept <subcommand> [member] -- <reason>  kept although nothing reachable makes it
+#
+# TestCoreCallManifestMatchesGoSources (api-go/internal/rustcore/bridge_test.go) holds
+# this file to the Go sources: every call reachable from a main is `called`, every
+# `called` line is reachable, and a call only dead Go code makes is `kept`. The core's
+# go_called_commands_exist test (rust-core/src/bin/xmustard-core.rs) fails when a
+# listed subcommand or family member leaves the table. A new subcommand with no Go
+# caller (a script or hook entry point) needs no line here.
+
+called archive-diagnostics-payload
+called build-repo-map
+called changetrack changed-since
+called changetrack drift
+called changetrack fingerprint
+called changetrack incorporate
+called changetrack index
+called changetrack lineage
+called changetrack working-changes
+called explain-path
+called goal context
+called goal create
+called goal get
+called goal iterate
+called goal ledger
+called goal list
+called goal status
+called link-diagnostic-symbol
+called lsp-document-symbols
+called normalize-diagnostics
+called normalize-lsp-definition
+called normalize-lsp-document-symbols
+called normalize-lsp-references
+called normalize-lsp-workspace-symbols
+called ownership owners
+called ownership subsystems
+called parse-coverage
+called path-symbols
+called repo-key
+called run-managed-command
+called run-verification-profile
+called scan-signals
+called search
+called semantic-impact
+called symbolgraph blast-radius
+called symbolgraph build
+called symbolgraph clusters
+called symbolgraph hotspots
+called symbolgraph impact
+called symbolgraph trace
+called wiki
+
+kept lsp-hover -- rustcore.RunLspHover has no caller; WS-25's spec keeps the command for the LSP lane (PAR-SYM-06)
+kept parse-coverage-lcov -- rustcore.ParseLCOVCoverage has no caller (ParseCoverage sends parse-coverage); the serve residency tests use the command
+kept run-verification-command -- rustcore.RunVerificationCommand has no caller; the environment-hygiene test runs its one-shot path
+kept semantic-search -- no Go wrapper: Go runs ast-grep itself; WS-37 owns semantic.rs and decides
