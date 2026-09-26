@@ -192,7 +192,10 @@ func loadCoverageResults(dataDir string, workspaceID string, issueID string) ([]
 	return results, nil
 }
 
+// loadSnapshot parses the whole workspace snapshot. Tool paths never call it: they
+// resolve the workspace through the registry (workspace_registry.go).
 func loadSnapshot(dataDir string, workspaceID string) (*workspaceSnapshot, error) {
+	snapshotLoads.Add(1)
 	snapshotPath := filepath.Join(dataDir, "workspaces", workspaceID, "snapshot.json")
 	var snapshot workspaceSnapshot
 	if err := readJSON(snapshotPath, &snapshot); err != nil {

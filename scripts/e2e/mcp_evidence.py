@@ -113,7 +113,8 @@ def main():
         orig, pages = mcp.read_all(uri)
         checks.check("resources/read pages the exact original", orig is not None and sha256_hex(orig) == meta["raw_sha256"]
                      and all(p["length"] <= 65536 for p in pages),
-                     f"{len(pages)} pages, client ms per page {[p.get('_client_ms') for p in pages]} (each page samples repo identity)")
+                     f"{len(pages)} pages, client ms per page {[p.get('_client_ms') for p in pages]}, "
+                     f"identity cached on {sum(1 for p in pages if p.get('current_key_cached'))} (no repo-key run)")
         checks.check("original is the complete bounded recall", orig is not None and len(json.loads(orig)["entries"]) == proj.get("returned"))
         checks.check("fresh capture labeled current", pages and pages[0]["freshness"] == "current", pages and pages[0]["freshness"])
 

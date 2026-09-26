@@ -41,7 +41,18 @@ type ObservationInput struct {
 	Sel Selector
 	// Redact wraps the spool writer (the WS-05 streaming redactor).
 	Redact func(io.Writer) StreamRedactor
+	// Target lowers the client policy's projection target for this capture (0 keeps
+	// the policy's; a larger value is ignored): a client may ask for less, never more.
+	// Adapters that must retain an output they will replace later (Pi masking and
+	// compaction) ask for MinCaptureTarget, so any output above it gets a handle.
+	Target int
 }
+
+// MinCaptureTarget and MaxCaptureTarget bound ObservationInput.Target.
+const (
+	MinCaptureTarget = 1 << 10
+	MaxCaptureTarget = DefaultMaxProjection
+)
 
 // ObservationResult is the capture envelope: the store's delivery plus capture
 // metadata, extracted facts, the per-kind projection and the client-shaped payload.
@@ -56,6 +67,9 @@ type ObservationResult struct {
 	TokenEstimator     string       `json:"token_estimator"`
 	Shape              *ShapeResult `json:"shape,omitempty"`
 	Policy             ClientPolicy `json:"policy"`
+	// TargetBytes is the projection target this capture used: the policy's, or the
+	// caller's lower Target.
+	TargetBytes int `json:"target_bytes"`
 }
 
 // Observe captures one tool output.
@@ -129,12 +143,16 @@ func (s *Store) Observe(ctx context.Context, reg *Registry, in ObservationInput)
 	sel := selectorFor(meta, body, in.Sel)
 	red, argv0 := reg.Select(sel)
 	pol := PolicyFor(meta.Client)
+	target := pol.Target
+	if in.Target > 0 && in.Target < target {
+		target = in.Target
+	}
 	meta.OutputShape = shapeName(pol.Client, meta.Tool)
 	if in.Format == FormatRaw || in.Format == "" {
 		meta.OutputShape = "raw"
 	}
 	hook := &reduceHook{reducer: red, argv0: argv0, shape: meta.OutputShape, meta: &meta,
-		in: Input{Sel: sel, Sections: body.Sections, Target: pol.Target}}
+		in: Input{Sel: sel, Sections: body.Sections, Target: target}}
 	if sel.Family == "" && NamespacedTool(meta.Tool) {
 		// another server's tool: its name selects a family only for non-JSON output
 		hook.structured, _ = reg.Lookup(FamilyStructured)
@@ -148,7 +166,7 @@ func (s *Store) Observe(ctx context.Context, reg *Registry, in ObservationInput)
 	if err != nil {
 		return nil, err
 	}
-	res := &ObservationResult{Delivery: d, Capture: meta, Family: hook.reducer.Family(), Policy: pol, TokenEstimator: TokenEstimator}
+	res := &ObservationResult{Delivery: d, Capture: meta, Family: hook.reducer.Family(), Policy: pol, TokenEstimator: TokenEstimator, TargetBytes: target}
 	proj := hook.out
 	if proj == nil {
 		proj = &Projection{Text: d.Projection, Parts: map[string]string{}}

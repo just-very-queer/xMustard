@@ -57,7 +57,7 @@ func SymbolImpact(dataDir, workspaceID, symbol string, maxDepth int) (json.RawMe
 
 // SymbolImpactCtx is the request-scoped variant: cancelling ctx cancels its Rust/tool work (see rustcore.runCoreCtx).
 func SymbolImpactCtx(ctx context.Context, dataDir, workspaceID, symbol string, maxDepth int) (json.RawMessage, error) {
-	root, _, err := resolveChangeRoot(dataDir, workspaceID)
+	root, _, err := resolveChangeRootCtx(ctx, dataDir, workspaceID)
 	if err != nil {
 		return nil, err
 	}
@@ -78,7 +78,7 @@ func TraceSymbols(dataDir, workspaceID, from, to string) (json.RawMessage, error
 
 // TraceSymbolsCtx is the request-scoped variant: cancelling ctx cancels its Rust/tool work (see rustcore.runCoreCtx).
 func TraceSymbolsCtx(ctx context.Context, dataDir, workspaceID, from, to string) (json.RawMessage, error) {
-	root, _, err := resolveChangeRoot(dataDir, workspaceID)
+	root, _, err := resolveChangeRootCtx(ctx, dataDir, workspaceID)
 	if err != nil {
 		return nil, err
 	}

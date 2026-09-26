@@ -486,3 +486,29 @@ func TestAbandonedSpoolIsSwept(t *testing.T) {
 		t.Fatalf("abandoned spool not swept")
 	}
 }
+
+// Small originals (a capture may ask for a 1 KiB target) are charged at least
+// MinRetainedCharge each, so the quota bounds how many originals and their metadata a
+// workspace keeps, not only their bytes.
+func TestSmallOriginalsChargeTheMinimum(t *testing.T) {
+	raw := manyResults(30, 1)
+	if len(raw) >= MinRetainedCharge || len(raw) <= 1024 {
+		t.Fatalf("fixture must be between 1 KiB and the minimum charge, got %d bytes", len(raw))
+	}
+	s, _ := testStore(t, func(l *Limits) { l.ProjectionTarget = 1024; l.WorkspaceQuota = 2*MinRetainedCharge + 100 })
+	for i := 0; i < 2; i++ {
+		d, err := capture(t, s, "ws", "", raw, nil)
+		if err != nil {
+			t.Fatalf("capture %d: %v", i, err)
+		}
+		if d.Handle == "" {
+			t.Fatalf("capture %d retained no original", i)
+		}
+	}
+	if used, _ := s.Retained("ws"); used != 2*MinRetainedCharge {
+		t.Fatalf("retained charge = %d, want %d", used, 2*MinRetainedCharge)
+	}
+	if _, err := capture(t, s, "ws", "", raw, nil); !errors.Is(err, ErrQuotaFull) {
+		t.Fatalf("a third small original must exceed the quota, got %v", err)
+	}
+}

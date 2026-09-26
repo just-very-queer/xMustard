@@ -15,6 +15,7 @@ import (
 	"testing"
 
 	"xmustard/api-go/internal/budget"
+	"xmustard/api-go/internal/workspaceops"
 )
 
 // fakeAPI is an in-memory Backend: it records every request, serves the workspace
@@ -371,8 +372,9 @@ func TestInitializeNegotiatesAndServesInstructions(t *testing.T) {
 		if _, ok := caps["tools"]; !ok {
 			t.Fatalf("tools capability missing: %v", caps)
 		}
-		if _, ok := caps["resources"]; ok {
-			t.Fatalf("resources advertised without a provider: %v", caps)
+		// the built-in docs resources are served with or without an evidence provider
+		if _, ok := caps["resources"]; !ok {
+			t.Fatalf("resources capability missing: %v", caps)
 		}
 	}
 	s := New(Options{Backend: &fakeAPI{}}).NewSession(nil)
@@ -397,7 +399,7 @@ func TestInstructionsStateWorkflowWithinBudget(t *testing.T) {
 		last = i
 	}
 	// auto-registration writes xMustard's store even from read tools: say so once here
-	for _, p := range []string{"not instructions", "leads to confirm", "workspace_id is optional", "registers and indexes it", "XMUSTARD_MCP_AUTO_REGISTER=0", "resources/read"} {
+	for _, p := range []string{"not instructions", "leads to confirm", "workspace_id is optional", "registers and indexes it", "XMUSTARD_MCP_AUTO_REGISTER=0", "resources/read", DocsURI} {
 		if !strings.Contains(Instructions, p) {
 			t.Errorf("instructions must state %q", p)
 		}
@@ -673,7 +675,7 @@ func TestCallToolMissingArg(t *testing.T) {
 func TestStructuredContentMirrorsText(t *testing.T) {
 	api := &fakeAPI{handle: func(r Request) *APIResponse {
 		switch {
-		case strings.HasSuffix(r.Path, "/session-grounding"):
+		case strings.Contains(r.Path, "/session-grounding?"):
 			return &APIResponse{Status: 200, Body: `{"workspace_id":"ws","changed_files":3,"summary":"3 changed"}`}
 		case strings.Contains(r.Path, "/why-failed"):
 			return &APIResponse{Status: 200, Body: `["not","an","object"]`}
@@ -830,6 +832,37 @@ func TestOutputSchemasMatchRecordedResults(t *testing.T) {
 	}
 }
 
+// ground reports a count or flag it cannot determine as null (listed under
+// "unknown"), and the portable schema subset has no null type, so outputSchema
+// declares only ground members that can never be null: a client that validates
+// structuredContent must never see a null where a type was promised.
+func TestGroundOutputSchemaDeclaresNoNullableMember(t *testing.T) {
+	tl, _ := ToolByName("ground")
+	fields := map[string]reflect.Kind{}
+	var collect func(rt reflect.Type)
+	collect = func(rt reflect.Type) {
+		for i := 0; i < rt.NumField(); i++ {
+			f := rt.Field(i)
+			if f.Anonymous && f.Type.Kind() == reflect.Struct {
+				collect(f.Type)
+				continue
+			}
+			if name, _, _ := strings.Cut(f.Tag.Get("json"), ","); name != "" && name != "-" {
+				fields[name] = f.Type.Kind()
+			}
+		}
+	}
+	collect(reflect.TypeOf(workspaceops.SessionGrounding{}))
+	for name := range tl.Output {
+		switch kind, ok := fields[name]; {
+		case !ok:
+			t.Errorf("ground outputSchema declares %s, which SessionGrounding does not have", name)
+		case kind == reflect.Pointer || kind == reflect.Slice || kind == reflect.Map || kind == reflect.Interface:
+			t.Errorf("ground.%s can be null but outputSchema declares it %s", name, tl.Output[name])
+		}
+	}
+}
+
 func jsonType(v any) string {
 	switch x := v.(type) {
 	case map[string]any:
@@ -897,7 +930,7 @@ func TestEveryToolResolvesWorkspaceFromEnv(t *testing.T) {
 	// an explicit argument wins over the binding, adds no echo line, and still reports
 	// its root
 	res, _ := call(t, s, "ground", map[string]any{"workspace_id": "explicit"})
-	if p := api.lastTool(t).Path; p != "/api/workspaces/explicit/session-grounding" || strings.Contains(allText(res), "[xmustard workspace]") {
+	if p := api.lastTool(t).Path; p != "/api/workspaces/explicit/session-grounding?max_chars=6000" || strings.Contains(allText(res), "[xmustard workspace]") {
 		t.Fatalf("explicit workspace_id: %s / %s", p, allText(res))
 	}
 	if ws := res["_meta"].(map[string]any)["xmustard/workspace"].(Workspace); ws.Root != "/r/explicit" || ws.Source != SourceArgument {
@@ -1016,7 +1049,7 @@ func TestUnregisteredRepoIsAutoRegistered(t *testing.T) {
 		t.Fatalf("%v %v", rerr, res)
 	}
 	want := WorkspaceIDForPath(repo)
-	if p := api.lastTool(t).Path; p != "/api/workspaces/"+want+"/session-grounding" {
+	if p := api.lastTool(t).Path; p != "/api/workspaces/"+want+"/session-grounding?max_chars=6000" {
 		t.Fatalf("registered workspace not used: %s", p)
 	}
 	ws := res["_meta"].(map[string]any)["xmustard/workspace"].(Workspace)

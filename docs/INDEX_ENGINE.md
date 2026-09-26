@@ -65,7 +65,9 @@ retrieval-ledger seed writing to an `agent_feedback` segment.
 - **Phase 2 — bidirectional:** *(done)* `feedback.go` segment written from search /
   verify / run outcomes; `WorkspaceSearchWithFeedback` fuses a recency-decayed boost
   into the default ranking.
-- **Phase 3 — graph parity:** *(done)* LSP-backed CALLS edges (`build-lsp`),
+- **Phase 3 — graph parity:** *(done)* LSP-backed CALLS edges (`build-lsp`; the
+  CLI entry was removed on 2026-09-25 by WS-25 because nothing called it, and
+  `symbolgraph::upgrade_graph_with_lsp` is kept for the LSP lane),
   `impact?symbol=` BFS blast radius + `impact?from=&to=` trace over precomputed
   adjacency, ast-grep `search?mode=pattern`, communities/clusters.
 

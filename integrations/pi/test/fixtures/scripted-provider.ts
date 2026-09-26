@@ -1,8 +1,9 @@
 // Test-only Pi extension: an offline, scripted model provider built on pi-ai's faux
 // core. It never opens a network connection and needs no credential. Each model
 // request is answered from the JSON scenario at $XM_PI_SCENARIO and recorded (active
-// tools plus the tool results that arrived since the previous assistant turn) as one
-// JSONL line in $XM_PI_TRACE, so tests can prove what the model actually received.
+// tools, the tool results that arrived since the previous assistant turn, a digest of
+// every tool result in the request and its user texts) as one JSONL line in
+// $XM_PI_TRACE, so tests can prove what the model actually received.
 //
 // Scenario: { "steps": Step[] }, consumed in order, where Step is one of
 //   { "calls": [{ "name": string, "args": object }], "delay_ms"?: number }
@@ -30,10 +31,11 @@ interface ToolResultLike {
 	toolCallId?: string;
 	toolName?: string;
 	isError?: boolean;
-	content?: { type: string; text?: string }[];
+	content?: string | { type: string; text?: string }[];
 }
 
-const textOf = (m: ToolResultLike): string => (m.content ?? []).map((c) => (c.type === "text" ? (c.text ?? "") : `[${c.type}]`)).join("");
+const textOf = (m: ToolResultLike): string =>
+	typeof m.content === "string" ? m.content : (m.content ?? []).map((c) => (c.type === "text" ? (c.text ?? "") : `[${c.type}]`)).join("");
 
 function latestJsonLine(messages: ToolResultLike[], prefix: string): Record<string, Json> | undefined {
 	for (let i = messages.length - 1; i >= 0; i--) {
@@ -159,6 +161,14 @@ export default function scriptedProvider(pi: ExtensionAPI): void {
 					// full definitions once, so conformance checks see what the model sees
 					...(request === 1 ? { tools: tools.map((t) => ({ name: t.name, description: t.description, parameters: t.parameters })) } : {}),
 					tool_results: fresh.map((m) => ({ toolCallId: m.toolCallId, toolName: m.toolName, isError: m.isError, text: textOf(m) })),
+					// every tool result in this request (masked ones show their stub)
+					context_results: messages
+						.filter((m) => m.role === "toolResult")
+						.map((m) => {
+							const text = textOf(m);
+							return { toolCallId: m.toolCallId, toolName: m.toolName, isError: m.isError, bytes: Buffer.byteLength(text), head: text.slice(0, 600) };
+						}),
+					user_texts: messages.filter((m) => m.role === "user").map((m) => (typeof m.content === "string" ? m.content : textOf(m)).slice(0, 8192)),
 				};
 				appendFileSync(tracePath, `${JSON.stringify(line)}\n`);
 			}

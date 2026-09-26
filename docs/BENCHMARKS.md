@@ -4,7 +4,12 @@
 > Use [VISION.md](VISION.md), [STATUS.md](STATUS.md), and [ROADMAP.md](ROADMAP.md)
 > for current direction, verified behavior, and remaining work.
 
-Reproducible micro-benchmarks for the Rust goal/swarm runtime (`rust-core`).
+Micro-benchmarks for the Rust goal/swarm runtime (`rust-core`).
+
+> **Removed 2026-09-25 (WS-25):** the `xmustard-core bench` subcommand,
+> `rust-core/src/benchmark.rs` and the swarm runtime had no caller and were
+> deleted, so the commands and the first table below cannot be reproduced from
+> the current binary. The warm symbol-index section still reproduces.
 
 Run them yourself:
 

@@ -355,6 +355,14 @@ pub struct SourceIdentity {
     /// entries are never read by the graph, so only these block graph caching.
     #[serde(skip)]
     pub tracked_unhashed: Vec<String>,
+    /// `repo-key` only: the directories `git status --ignored=matching` reports as
+    /// ignored as a whole (top-level relative, trailing `/`). Git never descends into
+    /// them, so nothing inside can change the key; the Go identity cache skips them
+    /// when it fingerprints the working tree. None when not requested or not fully
+    /// reportable (a non-UTF-8 path, more than `MAX_IGNORED_DIRS`, or a status that
+    /// had to be re-run without the listing). Never part of the key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ignored_dirs: Option<Vec<String>>,
 }
 
 impl SourceIdentity {
@@ -416,6 +424,10 @@ fn change_token(meta: &fs::Metadata) -> String {
     format!("{}:{m}", meta.len())
 }
 
+/// Bounds on the ignored-directory listing `repo-key` reports (count and total bytes).
+pub const MAX_IGNORED_DIRS: usize = 8192;
+pub const MAX_IGNORED_DIR_BYTES: usize = 256 << 10;
+
 fn push_field(h: &mut Sha256, bytes: &[u8]) {
     h.update((bytes.len() as u64).to_le_bytes());
     h.update(bytes);
@@ -423,6 +435,35 @@ fn push_field(h: &mut Sha256, bytes: &[u8]) {
 
 /// Compute the source identity of the working tree at `root` (see module docs).
 pub fn source_identity(root: &Path) -> SourceIdentity {
+    source_identity_with(root, false)
+}
+
+/// `source_identity` plus the ignored-directory listing (`ignored_dirs`) the
+/// `repo-key` command reports. The key is the same as `source_identity`'s.
+pub fn repo_key_identity(root: &Path) -> SourceIdentity {
+    source_identity_with(root, true)
+}
+
+/// Collect the whole-directory `!!` entries of a `--ignored=matching` status, or None
+/// when they cannot all be reported.
+fn ignored_dir_listing(entries: &[StatusEntry]) -> Option<Vec<String>> {
+    let mut dirs = Vec::new();
+    let mut bytes = 0usize;
+    for e in entries.iter().filter(|e| e.xy == *b"!!") {
+        if e.path.last() != Some(&b'/') {
+            continue; // an individually ignored file: its bytes never enter the key
+        }
+        let dir = String::from_utf8(e.path.clone()).ok()?;
+        bytes += dir.len();
+        if dirs.len() >= MAX_IGNORED_DIRS || bytes > MAX_IGNORED_DIR_BYTES {
+            return None;
+        }
+        dirs.push(dir);
+    }
+    Some(dirs)
+}
+
+fn source_identity_with(root: &Path, list_ignored: bool) -> SourceIdentity {
     let canonical = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let root_str = canonical.to_string_lossy().into_owned();
     let mut id = SourceIdentity {
@@ -441,6 +482,7 @@ pub fn source_identity(root: &Path) -> SourceIdentity {
         dirty: BTreeMap::new(),
         layout: None,
         tracked_unhashed: Vec::new(),
+        ignored_dirs: None,
     };
     let mut h = Sha256::new();
     h.update(b"xm-source-key-v1\0");
@@ -464,20 +506,32 @@ pub fn source_identity(root: &Path) -> SourceIdentity {
         .unwrap_or_default();
     push_field(&mut h, id.head.as_bytes());
 
-    let status = match run_git_bounded(
-        root,
-        // explicit flags override config that would hide working state
-        // (`status.showUntrackedFiles`, `submodule.<name>.ignore`, `diff.ignoreSubmodules`).
-        &[
-            "status",
-            "--porcelain=v1",
-            "-z",
-            "--untracked-files=all",
-            "--ignore-submodules=none",
-        ],
-        MAX_GIT_OUTPUT_BYTES,
-        git_timeout(),
-    ) {
+    // explicit flags override config that would hide working state
+    // (`status.showUntrackedFiles`, `submodule.<name>.ignore`, `diff.ignoreSubmodules`).
+    let status_args = [
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--untracked-files=all",
+        "--ignore-submodules=none",
+    ];
+    let mut listed_ignored = list_ignored;
+    let mut status = if list_ignored {
+        // `matching` lists a directory that matches an ignore pattern without
+        // descending into it, so the listing costs no extra traversal.
+        let mut args = status_args.to_vec();
+        args.push("--ignored=matching");
+        run_git_bounded(root, &args, MAX_GIT_OUTPUT_BYTES, git_timeout())
+    } else {
+        run_git_bounded(root, &status_args, MAX_GIT_OUTPUT_BYTES, git_timeout())
+    };
+    if list_ignored && matches!(status, Err(GitRunError::Overflow(_))) {
+        // many individually ignored files: identify without the listing rather
+        // than lose the identity to the output cap
+        listed_ignored = false;
+        status = run_git_bounded(root, &status_args, MAX_GIT_OUTPUT_BYTES, git_timeout());
+    }
+    let status = match status {
         Ok(status) => status,
         Err(e) => {
             id.identity_complete = false;
@@ -493,6 +547,11 @@ pub fn source_identity(root: &Path) -> SourceIdentity {
         }
     };
     let mut entries = parse_porcelain_v1_z(&status);
+    if listed_ignored {
+        id.ignored_dirs = ignored_dir_listing(&entries);
+    }
+    // ignored entries are not working state: they never enter the key
+    entries.retain(|e| e.xy != *b"!!");
     // `git status` hides worktree edits to assume-unchanged / skip-worktree entries;
     // identify their bytes directly so no known working-state content is omitted.
     match hidden_index_entries(&layout.toplevel) {
@@ -636,11 +695,6 @@ fn hidden_index_entries(toplevel: &Path) -> Result<Vec<StatusEntry>, GitRunError
         });
     }
     Ok(hidden)
-}
-
-/// sha256 of a tracked file's current content through the bounded no-follow opener.
-pub fn file_hash(root: &Path, rel: &str) -> Option<String> {
-    crate::symbolgraph::hash_repo_file_beneath(root, rel)
 }
 
 /// The trust scope a cache is shared within. Set `XMUSTARD_INDEX_TRUST_SCOPE` to the
@@ -988,6 +1042,55 @@ mod tests {
         fs::remove_file(r.path().join("u.txt")).unwrap();
         fs::write(r.path().join("a.rs"), b"fn a() {}\n").unwrap();
         assert_eq!(source_identity(r.path()).key, clean.key);
+    }
+
+    #[test]
+    fn repo_key_lists_whole_ignored_dirs_without_changing_the_key() {
+        let r = repo_with(&[
+            (".gitignore", b"build/\n*.log\nlogs/*.tmp\n"),
+            ("a.rs", b"fn a() {}\n"),
+        ]);
+        assert!(source_identity(r.path()).ignored_dirs.is_none());
+        fs::create_dir_all(r.path().join("build/deep")).unwrap();
+        fs::write(r.path().join("build/deep/x.o"), b"obj").unwrap();
+        fs::write(r.path().join("app.log"), b"log").unwrap();
+        fs::create_dir_all(r.path().join("logs")).unwrap();
+        fs::write(r.path().join("logs/a.tmp"), b"t").unwrap();
+        fs::create_dir_all(r.path().join("new/build")).unwrap();
+        fs::write(r.path().join("new/build/y.o"), b"obj").unwrap();
+        fs::write(r.path().join("new/keep.rs"), b"fn k() {}\n").unwrap();
+        let listed = repo_key_identity(r.path());
+        let plain = source_identity(r.path());
+        assert_eq!(listed.key, plain.key, "the listing never enters the key");
+        assert_eq!(listed.untracked_entries, 1, "only new/keep.rs is untracked");
+        assert!(listed.identity_complete);
+        let mut dirs = listed.ignored_dirs.clone().unwrap();
+        dirs.sort();
+        // logs/ is not listed: only files inside it match, so git descends into it
+        assert_eq!(dirs, vec!["build/".to_string(), "new/build/".to_string()]);
+        fs::write(r.path().join("build/deep/x.o"), b"changed").unwrap();
+        assert_eq!(repo_key_identity(r.path()).key, listed.key);
+        let json = serde_json::to_value(&listed).unwrap();
+        assert!(json["ignored_dirs"].is_array());
+        assert!(serde_json::to_value(&plain).unwrap().get("ignored_dirs").is_none());
+    }
+
+    #[test]
+    fn ignored_dir_listing_is_all_or_nothing() {
+        let e = |p: &[u8]| StatusEntry {
+            xy: *b"!!",
+            path: p.to_vec(),
+            orig_path: None,
+        };
+        assert_eq!(
+            ignored_dir_listing(&[e(b"a/"), e(b"f.log")]),
+            Some(vec!["a/".to_string()])
+        );
+        assert_eq!(ignored_dir_listing(&[e(b"a/"), e(b"\xff/")]), None);
+        let many: Vec<_> = (0..=MAX_IGNORED_DIRS)
+            .map(|i| e(format!("d{i}/").as_bytes()))
+            .collect();
+        assert_eq!(ignored_dir_listing(&many), None);
     }
 
     #[test]

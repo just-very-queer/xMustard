@@ -48,6 +48,16 @@ const (
 	ResourceScheme          = "xmustard://evidence/"
 )
 
+// MinRetainedCharge is the least one retained original counts against its workspace
+// quota. Each original also keeps a metadata file and a directory the byte count does
+// not see; since a capture may ask for a 1 KiB target, charging small originals at
+// least this much keeps the number of originals (and that overhead) per quota where it
+// was when every retained original exceeded a 16 KiB client target.
+const MinRetainedCharge = 16 << 10
+
+// retainedCharge is what an original of raw bytes counts against the quota.
+func retainedCharge(raw int64) int64 { return max(raw, MinRetainedCharge) }
+
 var (
 	ErrMissing       = errors.New("evidence not found")
 	ErrExpired       = errors.New("evidence expired")
@@ -142,17 +152,25 @@ type CaptureRequest struct {
 	ContentType  string
 	// BeforeKey is the identity sampled before the tool executed (nil when unknown).
 	BeforeKey *Identity
-	// RepoKey returns the repository identity at capture time.
+	// RepoKey returns the repository identity at capture time. It is asked only when
+	// BeforeKey is complete, because only then can the two bind.
 	RepoKey func(ctx context.Context) Identity
+	// Retain keeps the original even though no reduction ran: the caller projected
+	// the result itself (ground's output budget) and names the returned handle in its
+	// reply. The delivery then carries no projection.
+	Retain bool
 }
 
 // Identity is a repository identity observation (Rust `repo-key` contract: key plus
 // whether it covers the complete working state). An incomplete or failed identity can
-// never make evidence look current.
+// never make evidence look current. Cached and AgeMs say whether it was served from
+// the identity cache and how long ago it was sampled.
 type Identity struct {
 	Key         string   `json:"key"`
 	Complete    bool     `json:"identity_complete"`
 	Limitations []string `json:"limitations,omitempty"`
+	Cached      bool     `json:"cached,omitempty"`
+	AgeMs       int64    `json:"age_ms,omitempty"`
 }
 
 // Delivery is what travels in the tool result: the projection and how to recover the rest.
@@ -204,6 +222,11 @@ type Page struct {
 	Freshness string `json:"freshness"`
 	Stale     bool   `json:"stale"`
 	ExpiresAt string `json:"expires_at"`
+	// CurrentKeyCached / CurrentKeyAgeMs: the current identity came from the identity
+	// cache (no repo-key run for this page) and was sampled that long ago. A capture
+	// whose identity is not bound never needs the current identity, so none is read.
+	CurrentKeyCached bool  `json:"current_key_cached"`
+	CurrentKeyAgeMs  int64 `json:"current_key_age_ms"`
 }
 
 // ReadRequest asks for one page.
@@ -232,7 +255,7 @@ type Store struct {
 type wsState struct {
 	mu      sync.Mutex
 	loaded  bool  // used reflects disk (rebuilt lazily after restart or on pressure)
-	used    int64 // retained unexpired original bytes
+	used    int64 // quota charge of retained unexpired originals (retainedCharge)
 	pending int64 // bytes in open spools
 }
 
@@ -404,8 +427,8 @@ func (sp *Spool) Discard() {
 	sp.st.mu.Unlock()
 }
 
-// Capture stores the spooled original (when reduction omits anything) and returns the
-// delivery. It always consumes the spool.
+// Capture stores the spooled original (when reduction omits anything, or the caller
+// asks to Retain it) and returns the delivery. It always consumes the spool.
 func (s *Store) Capture(ctx context.Context, sp *Spool, req CaptureRequest) (*Delivery, error) {
 	defer sp.Discard()
 	if sp.ws != req.WorkspaceID {
@@ -433,12 +456,15 @@ func (s *Store) Capture(ctx context.Context, sp *Spool, req CaptureRequest) (*De
 	ctx = budget.WithoutHeavyWait(ctx)
 	d := &Delivery{Delivery: DeliveryVersion, Tool: req.Tool, CallID: req.CallID, Status: req.Status,
 		IsError: req.IsError, ContentType: req.ContentType, RawBytes: sp.n, RawSHA256: sum, Reducer: ReducerVersion}
-	proj, rec, err := Reduce(ctx, sp.f, sp.n, req.ContentType, s.limits.ProjectionTarget, s.limits.MaxProjection)
-	if err != nil {
-		return nil, err
+	var proj string
+	rec := Record{Reducer: ReducerVersion, Mode: "retained", RawBytes: sp.n}
+	if !req.Retain {
+		if proj, rec, err = Reduce(ctx, sp.f, sp.n, req.ContentType, s.limits.ProjectionTarget, s.limits.MaxProjection); err != nil {
+			return nil, err
+		}
 	}
 	d.Projection, d.ProjectedBytes, d.Omissions, d.Reduced, d.ProjectionMode = proj, len(proj), rec.Omissions, rec.Reduced, rec.Mode
-	if !rec.Reduced {
+	if !rec.Reduced && !req.Retain {
 		// nothing omitted: nothing retained, no handle, identity not sampled
 		d.CapturedIdentity = "unknown"
 		return d, nil
@@ -459,12 +485,15 @@ func (s *Store) Capture(ctx context.Context, sp *Spool, req CaptureRequest) (*De
 		Projection: rec,
 	}
 	// identity is bound only when complete identities sampled before and after
-	// execution agree; otherwise freshness of this evidence is unknown forever.
-	if req.RepoKey != nil {
+	// execution agree; otherwise freshness of this evidence is unknown forever. An
+	// incomplete or missing before-identity can never bind, so the after-identity is
+	// not sampled for it.
+	if b := req.BeforeKey; b != nil && b.Complete && b.Key != "" && req.RepoKey != nil {
 		after := req.RepoKey(ctx)
 		obs.CapturedKey = after.Key
-		b := req.BeforeKey
-		obs.CapturedKeyOK = b != nil && b.Complete && after.Complete && after.Key != "" && b.Key == after.Key
+		obs.CapturedKeyOK = after.Complete && after.Key != "" && b.Key == after.Key
+	} else if b != nil {
+		obs.CapturedKey = b.Key
 	}
 	d.CapturedIdentity = "unknown"
 	if obs.CapturedKeyOK {
@@ -477,10 +506,11 @@ func (s *Store) Capture(ctx context.Context, sp *Spool, req CaptureRequest) (*De
 	if err != nil {
 		return nil, err
 	}
-	// this spool's bytes are already inside pending; converting them to retained
-	// cannot exceed the quota that admitted them (re-checked after a reclaim).
-	if used+st.pending > s.limits.WorkspaceQuota {
-		if used, err = s.retainedLocked(req.WorkspaceID, st, true); err != nil || used+st.pending > s.limits.WorkspaceQuota {
+	// this spool's bytes are already inside pending; converting them to retained adds
+	// only the charge beyond them (re-checked after a reclaim).
+	extra := retainedCharge(sp.n) - sp.n
+	if used+st.pending+extra > s.limits.WorkspaceQuota {
+		if used, err = s.retainedLocked(req.WorkspaceID, st, true); err != nil || used+st.pending+extra > s.limits.WorkspaceQuota {
 			return nil, fmt.Errorf("%w (%d of %d bytes retained for workspace %s)", ErrQuotaFull, used, s.limits.WorkspaceQuota, req.WorkspaceID)
 		}
 	}
@@ -504,7 +534,7 @@ func (s *Store) Capture(ctx context.Context, sp *Spool, req CaptureRequest) (*De
 		_ = os.RemoveAll(dir)
 		return nil, err
 	}
-	st.used += sp.n
+	st.used += retainedCharge(sp.n)
 	st.pending = max(0, st.pending-sp.n)
 	sp.n = 0 // ownership moved to retained; Discard must not release it again
 	d.Handle, d.ResourceURI, d.ExpiresAt, d.CapturedKey, d.PageSize = handle, ResourceURI(handle, req.WorkspaceID), obs.ExpiresAt, obs.CapturedKey, s.limits.PageSize
@@ -550,10 +580,10 @@ func (s *Store) Read(ctx context.Context, req ReadRequest) (*Page, error) {
 		CapturedKey: obs.CapturedKey, ExpiresAt: obs.ExpiresAt}
 	p.EOF = p.NextOffset >= obs.RawBytes
 	var cur Identity
-	if req.RepoKey != nil {
+	if obs.CapturedKeyOK && req.RepoKey != nil {
 		cur = req.RepoKey(ctx)
 	}
-	p.CurrentKey = cur.Key
+	p.CurrentKey, p.CurrentKeyCached, p.CurrentKeyAgeMs = cur.Key, cur.Cached, cur.AgeMs
 	switch {
 	case !obs.CapturedKeyOK || !cur.Complete || cur.Key == "":
 		p.Freshness = "unknown"
@@ -589,7 +619,7 @@ func (s *Store) openOriginalLocked(req ReadRequest, dir string, st *wsState) (*o
 	exp, _ := time.Parse(time.RFC3339Nano, obs.ExpiresAt)
 	if !s.now().Before(exp) {
 		if err := os.RemoveAll(dir); err == nil && st.loaded {
-			st.used = max(0, st.used-obs.RawBytes)
+			st.used = max(0, st.used-retainedCharge(obs.RawBytes))
 		}
 		return nil, obs, ErrExpired
 	}
@@ -650,7 +680,7 @@ func (s *Store) Revoke(req ReadRequest) error {
 	}
 	obs.Revoked = true
 	if st.loaded {
-		st.used = max(0, st.used-obs.RawBytes)
+		st.used = max(0, st.used-retainedCharge(obs.RawBytes))
 	}
 	return writeJSONAtomic(filepath.Join(dir, "meta.json"), obs)
 }
@@ -668,7 +698,8 @@ func (s *Store) RevokeWorkspace(ws string) error {
 	return os.RemoveAll(dir)
 }
 
-// Retained reports the retained unexpired bytes for a workspace (sweeping expired ones).
+// Retained reports the quota charge of a workspace's retained unexpired originals
+// (retainedCharge each), sweeping expired ones.
 func (s *Store) Retained(ws string) (int64, error) {
 	st := s.state(ws)
 	st.mu.Lock()
@@ -714,7 +745,7 @@ func (s *Store) retainedLocked(ws string, st *wsState, rescan bool) (int64, erro
 			_ = os.RemoveAll(p)
 			continue
 		}
-		used += obs.RawBytes
+		used += retainedCharge(obs.RawBytes)
 	}
 	st.used, st.loaded = used, true
 	return used, nil

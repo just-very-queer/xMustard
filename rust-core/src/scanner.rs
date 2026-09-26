@@ -5,36 +5,6 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use walkdir::{DirEntry, WalkDir};
 
-const SCANNER_EXCLUDED_DIR_NAMES: &[&str] = &[
-    ".git",
-    ".hg",
-    ".svn",
-    ".venv",
-    "venv",
-    "__pycache__",
-    ".mypy_cache",
-    ".pytest_cache",
-    ".ruff_cache",
-    ".turbo",
-    ".next",
-    "node_modules",
-    "dist",
-    "build",
-    "coverage",
-    ".coverage",
-    "tmp",
-    "vendor",
-    "third_party",
-    "research",
-];
-
-const SCANNER_EXCLUDED_RELATIVE_DIRS: &[&str] = &["backend/data", "frontend/dist"];
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ScannerMilestone {
-    pub name: &'static str,
-    pub outcome: &'static str,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct RustEvidenceRef {
@@ -63,23 +33,6 @@ struct SignalRule {
     severity: &'static str,
     title: &'static str,
     patterns: Vec<Regex>,
-}
-
-pub fn initial_scanner_plan() -> Vec<ScannerMilestone> {
-    vec![
-        ScannerMilestone {
-            name: "ledger_ingestion",
-            outcome: "Mirror Bugs_*.md parsing and verdict merge behavior from the current Python scanner.",
-        },
-        ScannerMilestone {
-            name: "signal_detection",
-            outcome: "Port low-noise signal detection with the same excluded directory strategy.",
-        },
-        ScannerMilestone {
-            name: "parity_fixtures",
-            outcome: "Compare Python and Rust scanner outputs against backend test fixtures before cutover.",
-        },
-    ]
 }
 
 pub fn scan_repo_signals(root_path: &Path) -> Result<Vec<RustDiscoverySignal>, std::io::Error> {
@@ -212,23 +165,8 @@ fn relative_path(root_path: &Path, path: &Path) -> Option<String> {
 }
 
 fn should_ignore_relative_path(relative_path: &str) -> bool {
-    let normalized_parts: Vec<&str> = relative_path
-        .split('/')
-        .filter(|part| !part.is_empty() && *part != ".")
-        .collect();
-    if normalized_parts.is_empty() {
-        return false;
-    }
-    if normalized_parts
-        .iter()
-        .any(|part| SCANNER_EXCLUDED_DIR_NAMES.contains(part))
-    {
-        return true;
-    }
-    let normalized = normalized_parts.join("/");
-    SCANNER_EXCLUDED_RELATIVE_DIRS
-        .iter()
-        .any(|excluded| normalized == *excluded || normalized.starts_with(&format!("{excluded}/")))
+    // One exclusion list for the scanner, the repo map and the index (PAR-FRESH-08).
+    crate::index::ignore::is_default_excluded(relative_path)
 }
 
 fn should_scan_file(relative_path: &str) -> bool {
