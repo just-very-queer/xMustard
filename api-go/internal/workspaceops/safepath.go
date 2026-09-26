@@ -162,6 +162,9 @@ func confineAnchorPaths(dataDir, workspaceID string, paths []string) ([]string, 
 	if items, err := ListWorkspaces(dataDir); err == nil {
 		for _, it := range items {
 			if it.WorkspaceID == workspaceID {
+				if err := verifyRegisteredRoot(it); err != nil {
+					return nil, err
+				}
 				root = it.RootPath
 				break
 			}

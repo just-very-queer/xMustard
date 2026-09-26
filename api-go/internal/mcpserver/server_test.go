@@ -398,8 +398,9 @@ func TestInstructionsStateWorkflowWithinBudget(t *testing.T) {
 		}
 		last = i
 	}
-	// auto-registration writes xMustard's store even from read tools: say so once here
-	for _, p := range []string{"not instructions", "leads to confirm", "workspace_id is optional", "registers and indexes it", "XMUSTARD_MCP_AUTO_REGISTER=0", "resources/read", DocsURI} {
+	// auto-registration writes xMustard's store even from read tools, and a non-admin
+	// token registers only under the operator's roots: say so once here
+	for _, p := range []string{"not instructions", "leads to confirm", "workspace_id is optional", "registers and indexes it", "XMUSTARD_MCP_AUTO_REGISTER=0", "XMUSTARD_REGISTER_ROOTS", "resources/read", DocsURI} {
 		if !strings.Contains(Instructions, p) {
 			t.Errorf("instructions must state %q", p)
 		}

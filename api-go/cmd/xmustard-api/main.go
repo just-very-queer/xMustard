@@ -222,6 +222,7 @@ func buildHandler(c serverConfig, api http.Handler) http.Handler {
 	if c.posture.ReadOnly {
 		log.Printf("surface: READ-ONLY — mutating routes refused, write tools hidden")
 	}
+	logRegisterRoots(c.posture)
 	if c.authMode != "off" {
 		handler = authMiddleware(c.dataDir, c.authMode, handler)
 		if c.authMode == "required" || c.authConfigured {
@@ -601,6 +602,8 @@ func respondError(w http.ResponseWriter, err error) {
 }
 
 // workspaceIDFromPath extracts {id} from /api/workspaces/{id}/... ("" if not such a path).
+// /api/workspaces/load is the registration route, not a workspace named "load"; its
+// handler applies the token's workspace scope to the root being registered.
 func workspaceIDFromPath(p string) string {
 	const prefix = "/api/workspaces/"
 	if !strings.HasPrefix(p, prefix) {
@@ -609,6 +612,9 @@ func workspaceIDFromPath(p string) string {
 	rest := p[len(prefix):]
 	if i := strings.IndexByte(rest, '/'); i >= 0 {
 		return rest[:i]
+	}
+	if rest == "load" {
+		return ""
 	}
 	return rest
 }
@@ -1045,16 +1051,15 @@ func registerRoutes(mux routeRegistrar) {
 			})
 			return
 		}
-		if id, err := workspaceops.WorkspaceIDForRoot(dataDir(), request.RootPath); err != nil || !postureFrom(r).allowsWorkspace(id) {
-			writeJSON(w, http.StatusForbidden, map[string]any{"error": "workspace root is not served by this deployment", "reason": "workspace_not_allowed"})
+		admitted, ok := admitWorkspaceLoad(w, r, &request)
+		if !ok {
 			return
 		}
 		result, err := workspaceops.LoadWorkspace(
 			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
 			request,
 		)
-		if err != nil {
-			respondError(w, err)
+		if !admitted.finish(w, r, request.RootPath, err) {
 			return
 		}
 		writeJSON(w, http.StatusOK, result)
