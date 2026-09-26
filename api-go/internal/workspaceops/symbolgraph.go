@@ -64,12 +64,14 @@ func SymbolImpactCtx(ctx context.Context, dataDir, workspaceID, symbol string, m
 	if maxDepth <= 0 {
 		maxDepth = 4
 	}
-	ensureCodeIndex(ctx, root)
-	out, err := rustcore.RunSymbolgraph(ctx, "impact", root, workspaceID, symbol, strconv.Itoa(maxDepth))
+	read := ensureCodeIndex(ctx, root)
+	args := []string{"impact"}
+	args = append(append(args, read.flags()...), root, workspaceID, symbol, strconv.Itoa(maxDepth))
+	out, err := rustcore.RunSymbolgraph(ctx, args...)
 	if err != nil {
 		return nil, err
 	}
-	return json.RawMessage(out), nil
+	return read.annotate(out), nil
 }
 
 // TraceSymbols returns the shortest dependency path between two symbols.
@@ -83,12 +85,14 @@ func TraceSymbolsCtx(ctx context.Context, dataDir, workspaceID, from, to string)
 	if err != nil {
 		return nil, err
 	}
-	ensureCodeIndex(ctx, root)
-	out, err := rustcore.RunSymbolgraph(ctx, "trace", root, workspaceID, from, to)
+	read := ensureCodeIndex(ctx, root)
+	args := []string{"trace"}
+	args = append(append(args, read.flags()...), root, workspaceID, from, to)
+	out, err := rustcore.RunSymbolgraph(ctx, args...)
 	if err != nil {
 		return nil, err
 	}
-	return json.RawMessage(out), nil
+	return read.annotate(out), nil
 }
 
 // FileCluster mirrors rust-core's community-cluster output.
@@ -127,19 +131,22 @@ type PathGraph struct {
 }
 
 // PathGraphCtx reads path's cluster from the code index (refreshed first, see
-// ensureCodeIndex) or the legacy graph. Cancelling ctx cancels the Rust work.
+// ensureCodeIndex; the core takes the observed identity after the subcommand) or the
+// legacy graph. Cancelling ctx cancels the Rust work.
 func PathGraphCtx(ctx context.Context, dataDir, workspaceID, path string) (*PathGraph, error) {
 	root, _, err := resolveChangeRootCtx(ctx, dataDir, workspaceID)
 	if err != nil {
 		return nil, err
 	}
-	ensureCodeIndex(ctx, root)
-	out, err := rustcore.RunSymbolgraph(ctx, "cluster-of", root, workspaceID, path)
+	read := ensureCodeIndex(ctx, root)
+	args := []string{"cluster-of"}
+	args = append(append(args, read.flags()...), root, workspaceID, path)
+	out, err := rustcore.RunSymbolgraph(ctx, args...)
 	if err != nil {
 		return nil, err
 	}
 	var g PathGraph
-	if err := json.Unmarshal(out, &g); err != nil {
+	if err := json.Unmarshal(read.annotate(out), &g); err != nil {
 		return nil, err
 	}
 	return &g, nil

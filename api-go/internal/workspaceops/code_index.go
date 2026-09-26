@@ -20,18 +20,24 @@ import (
 // heavy slot, a one-shot core, so the index writer's peak never lands in the resident
 // worker). One refresh per root runs at a time and concurrent readers join it.
 //
-// Everything fails open. A reader waits at most codeIndexWait for a refresh when this
-// process has already brought the root's index up once; it then reads the index it
-// has, whose freshness envelope says how far behind it is. The first refresh of a root
-// in this process (possibly a full build) is waited for, bounded by the request. With
-// no identity, a refused heavy slot or a failed update, the read proceeds on whatever
-// index exists, or on the legacy graph when there is none. A key whose update failed
-// is not retried until the identity changes. While other heavy work holds or waits for
+// Every read passes the identity key it observed to the core (`--identity-key=K`). The
+// core answers from the index only when the index was brought to that key; otherwise
+// the legacy graph for the tree as it is now answers, bounded by the same envelope. So
+// an edit is never invisible while the index lags: a refused heavy slot, a failed
+// update, a refresh still running and a daemon restart all read the current tree.
+//
+// Every wait is bounded. A reader waits at most codeIndexWait for a running refresh,
+// or codeIndexFirstWait when this process has not brought the root's index up yet
+// (possibly a full build), and never past its request. A key whose update failed is
+// not retried until the identity changes. While other heavy work holds or waits for
 // the slot, no refresh starts, so a read never queues behind a build. WS-15's watcher
 // replaces this per-read check.
 
-// codeIndexWait bounds the wait for a refresh of an index that already answers.
+// codeIndexWait bounds the wait for a refresh of an index this process brought up.
 const codeIndexWait = 5 * time.Second
+
+// codeIndexFirstWait bounds the wait for the first refresh of a root in this process.
+const codeIndexFirstWait = 30 * time.Second
 
 // codeIndexUpdateTimeout bounds one index update (a first full build included).
 const codeIndexUpdateTimeout = 10 * time.Minute
@@ -106,47 +112,80 @@ func evictCodeIndexRoot() {
 	delete(codeIndex.roots, oldest)
 }
 
+// codeIndexRead is what one graph read takes to the core: the repository identity it
+// observed and the refresh it waited for (nil when none ran for it).
+type codeIndexRead struct {
+	key     string
+	refresh *indexRefresh
+}
+
+// flags are the core arguments carrying the observed identity.
+func (r codeIndexRead) flags() []string {
+	if r.key == "" {
+		return nil
+	}
+	return []string{"--identity-key=" + r.key}
+}
+
+// annotate reports the refresh this read waited for in the result's coverage.work
+// (see withRefreshWork); a result it cannot decode is returned as is.
+func (r codeIndexRead) annotate(out []byte) json.RawMessage {
+	if !r.refresh.changed() {
+		return out
+	}
+	var res map[string]json.RawMessage
+	if json.Unmarshal(out, &res) != nil || res["coverage"] == nil {
+		return out
+	}
+	res["coverage"] = withRefreshWork(res["coverage"], r.refresh)
+	b, err := json.Marshal(res)
+	if err != nil {
+		return out
+	}
+	return b
+}
+
 // ensureCodeIndex brings root's code index to its current identity before a graph
-// read and returns the refresh this read waited for, or nil when none ran for it.
-func ensureCodeIndex(ctx context.Context, root string) *indexRefresh {
+// read, waiting a bounded time, and returns what the read passes to the core.
+func ensureCodeIndex(ctx context.Context, root string) codeIndexRead {
 	root = canonicalRoot(root)
 	id := codeIndexIdentity(ctx, root)
+	read := codeIndexRead{key: id.Key}
 	if id.Key == "" {
-		return nil
+		return read
 	}
 	codeIndex.Lock()
 	st := codeIndexState(root)
 	if st.indexed == id.Key || st.failed == id.Key {
 		codeIndex.Unlock()
-		return nil
+		return read
 	}
 	f := st.flight
 	if f == nil && budget.HeavyBusy() {
-		// heavy work is running or queued: read the index as it is
+		// heavy work is running or queued: the core reads the current tree instead
 		codeIndex.Unlock()
-		return nil
+		return read
 	}
 	if f == nil {
 		f = &refreshFlight{key: id.Key, done: make(chan struct{})}
 		st.flight = f
 		go runCodeIndexRefresh(root, f)
 	}
-	first := st.indexed == ""
+	wait := codeIndexWait
+	if st.indexed == "" {
+		wait = codeIndexFirstWait
+	}
 	codeIndex.Unlock()
 
-	var timeout <-chan time.Time
-	if !first {
-		t := time.NewTimer(codeIndexWait)
-		defer t.Stop()
-		timeout = t.C
-	}
+	t := time.NewTimer(wait)
+	defer t.Stop()
 	select {
 	case <-f.done:
-		return f.report
-	case <-timeout:
+		read.refresh = f.report
+	case <-t.C:
 	case <-ctx.Done():
 	}
-	return nil
+	return read
 }
 
 // refreshOutcome is how a refresh ended: a refused heavy slot is retried on the next

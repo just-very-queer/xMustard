@@ -350,14 +350,14 @@
           "cluster": {
             "type": "object"
           },
+          "coverage": {
+            "type": "object"
+          },
           "explanation": {
             "type": "object"
           },
-          "line_count": {
-            "type": "integer"
-          },
-          "path": {
-            "type": "string"
+          "freshness": {
+            "type": "object"
           },
           "role": {
             "type": "string"
@@ -413,11 +413,14 @@
           "_xmustard": {
             "type": "object"
           },
+          "coverage": {
+            "type": "object"
+          },
           "found": {
             "type": "boolean"
           },
-          "generated_at": {
-            "type": "string"
+          "freshness": {
+            "type": "object"
           },
           "impacted": {
             "type": "array"
@@ -426,9 +429,6 @@
             "type": "integer"
           },
           "length": {
-            "type": "integer"
-          },
-          "max_depth": {
             "type": "integer"
           },
           "since": {

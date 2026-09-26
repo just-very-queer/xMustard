@@ -71,3 +71,29 @@ func TestCodeIndexRefreshRecordsOutcomePerIdentityKey(t *testing.T) {
 		t.Fatalf("an undecodable report must not replace the indexed key: %+v", st)
 	}
 }
+
+func TestCodeIndexReadCarriesTheIdentityAndReportsTheRefresh(t *testing.T) {
+	if got := (codeIndexRead{}).flags(); got != nil {
+		t.Fatalf("no identity, no flag: %v", got)
+	}
+	if got := (codeIndexRead{key: "k1"}).flags(); len(got) != 1 || got[0] != "--identity-key=k1" {
+		t.Fatalf("identity flag: %v", got)
+	}
+	out := []byte(`{"impacted":[],"coverage":{"work":{"graph_cache":"hit"}}}`)
+	if got := (codeIndexRead{key: "k1"}).annotate(out); string(got) != string(out) {
+		t.Fatalf("no refresh: result unchanged, got %s", got)
+	}
+	read := codeIndexRead{key: "k1", refresh: &indexRefresh{Mode: "incremental", Reason: "changes"}}
+	var got struct {
+		Impacted []any `json:"impacted"`
+		Coverage struct {
+			Work map[string]any `json:"work"`
+		} `json:"coverage"`
+	}
+	if err := json.Unmarshal(read.annotate(out), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Impacted == nil || got.Coverage.Work["graph_cache"] != "miss" {
+		t.Fatalf("refresh not reported on an impact result: %+v", got)
+	}
+}
