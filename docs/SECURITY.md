@@ -127,14 +127,19 @@ peer invariant, so the API and the store agree on who is a peer.
   agent; rotation keeps them. Env tokens (`XMUSTARD_AUTH_TOKENS`) are always their own
   owner.
 - `principal_distinctness` in settings is `token` (the default: every token is a
-  distinct verifier) or `owner`. Under `owner`, a principal whose owner is the owner
-  of the entry's author, or of the author of the revision voted on, cannot approve or
-  reject it on a peer-gated entry (403, audited). An unreadable settings file or an
+  distinct verifier) or `owner`. Under `owner`, the quorum counts owners: on a
+  peer-gated entry a principal cannot approve or reject a revision when its owner is
+  the owner of the entry's author or of the revision's author, or when another
+  principal of the same owner already has an approve or reject on that revision
+  (403, audited); a principal may still replace its own verdict. Owners are the ones
+  recorded at write time (the entry's source owner, the owner the edit event
+  carries), so revoking a token does not detach its writes from its owner. An unreadable settings file or an
   unknown value takes `owner`. The check runs when a vote is cast; votes cast before
   the policy was switched on keep counting.
 - Every memory write records its principal, owner and kind, the session and tool-call
-  ids the transport sent (`X-Xmustard-Session-Id`, `X-Xmustard-Call-Id`, at most 128
-  printable bytes, else 400), and the run and evidence handles it cites
+  ids the transport sent (`X-Xmustard-Session-Id`, `X-Xmustard-Call-Id`: printable
+  text, else 400; an id over 128 bytes is recorded as its prefix plus a digest, not
+  refused), and the run and evidence handles it cites
   (`remember evidence, run_id`; `verify evidence_handle`). Each event the write appends
   carries them under `provenance`. Entries keep HEAD and branch at propose and at
   promote; the dirty flag is not sampled (no git process is spawned per write).
@@ -147,8 +152,9 @@ peer invariant, so the API and the store agree on who is a peer.
   verification. `recall(entry_id)` returns `provenance`, `verification_basis` (each
   counting verdict with its owner, kind, evidence and target) and `feedback`.
 - Secrets are redacted with the shared `redact` rules before anything is stored:
-  remember's title, content, new_string, description and reason, the legacy PUT
-  content, a vote's note and an approver's lifecycle reason. The write answers
+  remember's title, content, new_string, description and reason, the full content an
+  edit produces (so a secret spliced from stored text and `new_string` is caught), the
+  legacy PUT content, a vote's note and an approver's lifecycle reason. The write answers
   `redactions` (count per rule) and a warning naming the rules. `old_string` only
   locates stored text and is never stored.
 

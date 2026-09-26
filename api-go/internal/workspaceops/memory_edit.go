@@ -147,7 +147,9 @@ func EditContext(dataDir, workspaceID, entryID string, req EditRequest, editor C
 	root := contextRoot(dataDir, workspaceID)
 	actor := editor.storeActor(root)
 	var out ContextEntry
+	var red ingestRedaction
 	err := memoryUpdate(ctx, dataDir, workspaceID, func(tx govstore.Tx) error {
+		red = ingestRedaction{}
 		e, ce, err := loadEntryTx(ctx, tx, workspaceID, entryID)
 		if err != nil {
 			return err
@@ -169,6 +171,9 @@ func EditContext(dataDir, workspaceID, entryID string, req EditRequest, editor C
 		if err != nil {
 			return err
 		}
+		// Redact the text that is stored, not only each input: an edit can splice a
+		// secret together from stored text and new_string (PAR-SEC-04).
+		red.scrub(&content)
 		if !changed && expiresAt == "" {
 			return fmt.Errorf("the edit changes nothing (give old_string/new_string, content, description or expires): %w", ErrInvalidInput)
 		}
@@ -212,6 +217,7 @@ func EditContext(dataDir, workspaceID, entryID string, req EditRequest, editor C
 	if !expiresOK {
 		out.Warnings = append(out.Warnings, fmt.Sprintf("expires %q is not a date or RFC 3339 time; no expiry set", req.Expires))
 	}
+	red.annotate(&out)
 	return &out, nil
 }
 

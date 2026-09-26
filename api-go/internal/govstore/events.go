@@ -77,8 +77,10 @@ type EventFilter struct {
 	WorkspaceID string
 	EntryID     string
 	Types       []string
-	AfterSeq    int64
-	Limit       int
+	// Revision, when set, keeps only the events of that revision.
+	Revision int64
+	AfterSeq int64
+	Limit    int
 }
 
 // EventInput is a caller-authored event, for transitions the typed writers do not
@@ -223,6 +225,10 @@ func (r *reader) ListEvents(ctx context.Context, f EventFilter) ([]Event, error)
 	}
 	where = append(where, "seq > ?")
 	args = append(args, f.AfterSeq)
+	if f.Revision > 0 {
+		where = append(where, "revision = ?")
+		args = append(args, f.Revision)
+	}
 	if len(f.Types) > 0 {
 		where = append(where, "type IN ("+placeholders(len(f.Types))+")")
 		for _, ty := range f.Types {

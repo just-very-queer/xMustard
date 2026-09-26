@@ -2,12 +2,15 @@ package workspaceops
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 
 	"xmustard/api-go/internal/evidence"
 	"xmustard/api-go/internal/govstore"
@@ -42,14 +45,26 @@ func (a ContextActor) storeActor(root string) govstore.Actor {
 	}
 }
 
-// CheckProvenanceLabel validates a session or tool-call id a transport supplies: at most
-// maxProvenanceLabel bytes of printable text. JSON-RPC ids keep their quotes, so the
-// check is on shape, not on an id alphabet.
-func CheckProvenanceLabel(kind, v string) error {
-	if len(v) > maxProvenanceLabel || strings.IndexFunc(v, func(r rune) bool { return !unicode.IsPrint(r) }) >= 0 {
-		return fmt.Errorf("%s is not printable text of at most %d bytes: %w", kind, maxProvenanceLabel, ErrInvalidInput)
+// ProvenanceLabel is the session or tool-call id a transport supplies, as it is
+// recorded: printable text (ErrInvalidInput otherwise) of at most maxProvenanceLabel
+// bytes. A longer id is still recorded, not refused, so a client with long JSON-RPC ids
+// can write memory: its prefix is kept and the rest becomes a digest, which keeps
+// distinct ids distinct. JSON-RPC ids keep their quotes, so the check is on shape, not
+// on an id alphabet.
+func ProvenanceLabel(kind, v string) (string, error) {
+	if strings.IndexFunc(v, func(r rune) bool { return !unicode.IsPrint(r) }) >= 0 {
+		return "", fmt.Errorf("%s is not printable text: %w", kind, ErrInvalidInput)
 	}
-	return nil
+	if len(v) <= maxProvenanceLabel {
+		return v, nil
+	}
+	sum := sha256.Sum256([]byte(v))
+	tail := "~sha256:" + hex.EncodeToString(sum[:8])
+	cut := maxProvenanceLabel - len(tail)
+	for cut > 0 && !utf8.RuneStart(v[cut]) {
+		cut--
+	}
+	return v[:cut] + tail, nil
 }
 
 // bindProvenance checks the evidence handles and run a write cites and binds them to
@@ -115,9 +130,13 @@ func principalDistinctness(dataDir string) string {
 var ownerBoundVerdicts = map[string]bool{govstore.VerdictApprove: true, govstore.VerdictReject: true}
 
 // checkOwnerDistinct refuses a verification verdict on a peer-gated entry when the
-// owner-distinct policy is on and the voter's owner is the owner of the entry's author
-// or of the author of the revision voted on. Single-assertion gates are the operator
-// opting out of peers, so they are left alone.
+// owner-distinct policy is on and the voter's owner already has a voice on the revision
+// voted on: it owns the entry's author or the revision's author, or another of its
+// principals has a counting verdict there. So the quorum counts distinct owners and two
+// tokens of one operator can neither verify each other's memory nor stack their votes;
+// the voter's own earlier verdict is replaced as usual. Owners are the ones recorded at
+// write time, falling back to the token store only for writes that recorded none.
+// Single-assertion gates are the operator opting out of peers, so they are left alone.
 func checkOwnerDistinct(ctx context.Context, r govstore.Reader, dataDir string, e govstore.Entry, in govstore.VoteInput,
 	voter ContextActor) error {
 	if !ownerBoundVerdicts[in.Verdict] || e.RequiredVerifications <= 1 || principalDistinctness(dataDir) != DistinctOwner {
@@ -131,13 +150,66 @@ func checkOwnerDistinct(ctx context.Context, r govstore.Reader, dataDir string, 
 	if err != nil {
 		return err
 	}
+	revOwner, err := revisionOwner(ctx, r, dataDir, e, rv)
+	if err != nil {
+		return err
+	}
 	mine := fallbackString(voter.Owner, voter.ID)
-	for _, author := range []string{fallbackString(e.SourceOwner, PrincipalOwner(dataDir, e.Source)), PrincipalOwner(dataDir, rv.Author)} {
-		if strings.EqualFold(strings.TrimSpace(author), strings.TrimSpace(mine)) {
-			return fmt.Errorf("%w: %s is owned by %s, like the author of %s revision %d", ErrSameOwner, voter.ID, mine, e.ID, rev)
+	refuse := func(whom string) error {
+		return fmt.Errorf("%w: %s is owned by %s, like %s of %s revision %d", ErrSameOwner, voter.ID, mine, whom, e.ID, rev)
+	}
+	if sameOwner(recordedOwner(dataDir, e.SourceOwner, e.Source), mine) {
+		return refuse("the entry's author")
+	}
+	if sameOwner(revOwner, mine) {
+		return refuse("the revision's author")
+	}
+	votes, err := r.ListVotes(ctx, e.ID, rev)
+	if err != nil {
+		return err
+	}
+	for _, v := range votes {
+		if ownerBoundVerdicts[v.Verdict] && !sameOwner(v.Principal, voter.ID) &&
+			sameOwner(recordedOwner(dataDir, v.PrincipalOwner, v.Principal), mine) {
+			return refuse("a principal (" + v.Principal + ") that already voted " + v.Verdict)
 		}
 	}
 	return nil
+}
+
+// revisionOwner is the owner recorded when rv was written: the entry's source owner for
+// the proposal, the owner its edit event carries for a later revision.
+func revisionOwner(ctx context.Context, r govstore.Reader, dataDir string, e govstore.Entry, rv govstore.Revision) (string, error) {
+	if rv.Revision == 1 && sameOwner(rv.Author, e.Source) {
+		return recordedOwner(dataDir, e.SourceOwner, e.Source), nil
+	}
+	events, err := r.ListEvents(ctx, govstore.EventFilter{WorkspaceID: e.WorkspaceID, EntryID: e.ID,
+		Types: []string{govstore.EventEdit}, Revision: rv.Revision, Limit: 1})
+	if err != nil {
+		return "", err
+	}
+	var recorded string
+	if len(events) > 0 {
+		var data struct {
+			Provenance struct {
+				Owner string `json:"owner"`
+			} `json:"provenance"`
+		}
+		if json.Unmarshal(events[0].Data, &data) == nil {
+			recorded = data.Provenance.Owner
+		}
+	}
+	return recordedOwner(dataDir, recorded, rv.Author), nil
+}
+
+// recordedOwner is the owner a write recorded for principal, or the token store's
+// answer for a write that recorded none.
+func recordedOwner(dataDir, recorded, principal string) string {
+	return fallbackString(strings.TrimSpace(recorded), PrincipalOwner(dataDir, principal))
+}
+
+func sameOwner(a, b string) bool {
+	return strings.EqualFold(strings.TrimSpace(a), strings.TrimSpace(b))
 }
 
 // ingestRedaction removes secrets from memory text before it is stored (PAR-SEC-04):
@@ -163,7 +235,8 @@ func (ir *ingestRedaction) scrubOptional(f *string) *string {
 	return &v
 }
 
-// annotate reports the redaction on the written entry.
+// annotate reports the redaction on the written entry, merged with any redaction an
+// inner write already reported there.
 func (ir *ingestRedaction) annotate(e *ContextEntry) {
 	if e == nil || !ir.rep.Redacted {
 		return
@@ -173,9 +246,13 @@ func (ir *ingestRedaction) annotate(e *ContextEntry) {
 		rules = append(rules, rule)
 	}
 	sort.Strings(rules)
-	rep := ir.rep
+	var rep redact.Report
+	rep.Merge(ir.rep)
+	if e.Redactions != nil {
+		rep.Merge(*e.Redactions)
+	}
 	e.Redactions = &rep
-	e.Warnings = append(e.Warnings, fmt.Sprintf("redacted %d secret value(s) (%s) before storing", rep.Count, strings.Join(rules, ", ")))
+	e.Warnings = append(e.Warnings, fmt.Sprintf("redacted %d secret value(s) (%s) before storing", ir.rep.Count, strings.Join(rules, ", ")))
 }
 
 // entryProvenance is how an entry was derived (PAR-PROV-04): the repository state at

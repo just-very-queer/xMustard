@@ -60,7 +60,13 @@ func TestMemoryProvenanceOverHTTP(t *testing.T) {
 	mcp := map[string]string{"X-Xmustard-Session-Id": "mcp-abc", "X-Xmustard-Call-Id": `"call-1"`}
 	e := send("alice-1", "POST", "/context", `{"content":"listen on 8042"}`, mcp, http.StatusOK)
 	id := e["id"].(string)
-	send("alice-1", "POST", "/context", `{"content":"x"}`, map[string]string{"X-Xmustard-Session-Id": strings.Repeat("s", 200)}, http.StatusBadRequest)
+	// a long JSON-RPC id is recorded as a bounded label, not refused; control characters are refused
+	long := send("alice-1", "POST", "/context", `{"content":"long ids"}`, map[string]string{"X-Xmustard-Call-Id": `"` + strings.Repeat("c", 300) + `"`}, http.StatusOK)
+	longProv := send("alice-1", "GET", "/context/active?entry_id="+long["id"].(string), "", nil, http.StatusOK)["provenance"].(map[string]any)
+	if cid, _ := longProv["derived_from"].(map[string]any)["call_id"].(string); len(cid) > 128 || !strings.Contains(cid, "~sha256:") {
+		t.Fatalf("long call id not bounded: %q", cid)
+	}
+	send("alice-1", "POST", "/context", `{"content":"x"}`, map[string]string{"X-Xmustard-Session-Id": "a\tb"}, http.StatusBadRequest)
 
 	// alice-2 is a distinct token of the same owner: refused under the owner policy
 	if out := send("alice-2", "POST", "/context/"+id+"/verify", `{"outcome":"approve"}`, nil, http.StatusForbidden); !strings.Contains(out["error"].(string), "owner-distinct") {
@@ -84,5 +90,18 @@ func TestMemoryProvenanceOverHTTP(t *testing.T) {
 	}
 	if fb := got["feedback"].(map[string]any); fb["helpful"] != float64(1) {
 		t.Fatalf("feedback: %v", fb)
+	}
+}
+
+// An unknown principal_distinctness is the operator's typo: 400, not a server fault.
+func TestSettingsRejectsUnknownDistinctnessAsBadRequest(t *testing.T) {
+	t.Setenv("XMUSTARD_PROFILE", "platform")
+	srv, dir := newRouteServer(t)
+	root, err := workspaceops.MintToken(dir, "root", "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code, out := sendJSON(t, "POST", srv.URL+"/api/settings", root, `{"principal_distinctness":"team"}`); code != http.StatusBadRequest {
+		t.Fatalf("unknown principal_distinctness: %d %v", code, out)
 	}
 }

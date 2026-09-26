@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"xmustard/api-go/internal/evidence"
 	"xmustard/api-go/internal/govstore"
@@ -116,6 +117,23 @@ func TestRememberRedactsSecretsBeforeStoring(t *testing.T) {
 		NewString: "backup " + secret}, ContextActor{ID: "author"})
 	if err != nil || e2.Redactions == nil || e2.Redactions.Count != 2 {
 		t.Fatalf("edit redaction: %v %+v", err, e2)
+	}
+	// a secret spliced together from stored text and new_string is caught in the stored revision
+	split, err := Remember(dir, ws, RememberRequest{ProposeContextRequest: ProposeContextRequest{Title: "split",
+		Content: "deploy with token ghp_MARK done"}}, ContextActor{ID: "author"})
+	if err != nil || split.Redactions != nil {
+		t.Fatalf("split propose: %v %+v", err, split)
+	}
+	spliced, err := Remember(dir, ws, RememberRequest{Op: "edit", EntryID: split.ID, BaseRevision: 1, Reason: "fill in",
+		OldString: "MARK", NewString: strings.TrimPrefix(secret, "ghp_")}, ContextActor{ID: "author"})
+	if err != nil || spliced.Redactions == nil || spliced.Redactions.Rules["github_token"] != 1 {
+		t.Fatalf("spliced secret not redacted: %v %+v", err, spliced)
+	}
+	_, res = entryView(t, dir, ws, split.ID, true)
+	for _, rv := range res["revisions"].([]govstore.Revision) {
+		if strings.Contains(rv.Content, secret) {
+			t.Fatalf("spliced secret stored in revision %d: %q", rv.Revision, rv.Content)
+		}
 	}
 	v, err := VerifyContextOutcome(dir, ws, e.ID, ContextActor{ID: "peer"}, VerifyRequest{Outcome: OutcomeHelpful, Note: secret})
 	if err != nil || v.Redactions == nil {
@@ -235,6 +253,65 @@ func TestOwnerDistinctPolicyBlocksSelfVerificationAcrossTokens(t *testing.T) {
 	}
 	if _, err := VerifyContextOutcome(dir, ws, e2.ID, ContextActor{ID: "bob-2", Owner: "bob-corp"}, VerifyRequest{}); !errors.Is(err, ErrSameOwner) {
 		t.Fatalf("same owner via token store: %v", err)
+	}
+}
+
+func TestOwnerDistinctPolicyCountsOwnersTowardTheQuorum(t *testing.T) {
+	dir, ws := ownerPolicyDir(t, DistinctOwner), "ws"
+	e, err := Remember(dir, ws, RememberRequest{ProposeContextRequest: ProposeContextRequest{Title: "t", Content: "c"}},
+		ContextActor{ID: "alice-1", Owner: "alice"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bob1, bob2 := ContextActor{ID: "bob-1", Owner: "bob"}, ContextActor{ID: "bob-2", Owner: "bob"}
+	if _, err := VerifyContextOutcome(dir, ws, e.ID, bob1, VerifyRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	// two sibling tokens of one non-author owner cannot make up a two-peer quorum
+	for _, outcome := range []string{OutcomeApprove, OutcomeReject} {
+		if _, err := VerifyContextOutcome(dir, ws, e.ID, bob2, VerifyRequest{Outcome: outcome}); !errors.Is(err, ErrSameOwner) {
+			t.Fatalf("%s by a sibling of a voter: %v", outcome, err)
+		}
+	}
+	if got, _ := entryView(t, dir, ws, e.ID, false); got.Promoted {
+		t.Fatalf("one owner promoted a two-peer gate: %+v", got)
+	}
+	// a voter may still change its own verdict, and a second owner completes the quorum
+	if _, err := VerifyContextOutcome(dir, ws, e.ID, bob1, VerifyRequest{}); err != nil {
+		t.Fatalf("revote by the same token: %v", err)
+	}
+	got, err := VerifyContextOutcome(dir, ws, e.ID, ContextActor{ID: "carol", Owner: "carol"}, VerifyRequest{})
+	if err != nil || !got.Promoted || got.VerificationMode != VerificationPeer {
+		t.Fatalf("distinct owners did not promote: %v %+v", err, got)
+	}
+}
+
+func TestOwnerDistinctUsesTheOwnerRecordedForAnEdit(t *testing.T) {
+	dir, ws := ownerPolicyDir(t, DistinctOwner), "ws"
+	e := promoted(t, dir, ws, "alice-1", "the build uses make")
+	// ops-1 holds no token in the store (revoked or never minted), so only the owner its
+	// edit recorded ties it to ops-2
+	editor := ContextActor{ID: "ops-1", Owner: "ops", Admin: true}
+	if _, err := EditContext(dir, ws, e.ID, EditRequest{BaseRevision: 1, Reason: "fix", NewString: "and go"}, editor); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := VerifyContextOutcome(dir, ws, e.ID, ContextActor{ID: "ops-2", Owner: "ops"}, VerifyRequest{Revision: 2}); !errors.Is(err, ErrSameOwner) {
+		t.Fatalf("sibling of a revoked editor voted on its edit: %v", err)
+	}
+}
+
+func TestProvenanceLabelBoundsLongIDs(t *testing.T) {
+	short, err := ProvenanceLabel("call", `"7"`)
+	if err != nil || short != `"7"` {
+		t.Fatalf("short id: %q %v", short, err)
+	}
+	a, _ := ProvenanceLabel("call", strings.Repeat("é", 200)+"a")
+	b, _ := ProvenanceLabel("call", strings.Repeat("é", 200)+"b")
+	if len(a) > maxProvenanceLabel || a == b || !strings.HasPrefix(a, "é") || !utf8.ValidString(a) {
+		t.Fatalf("long ids: %q %q", a, b)
+	}
+	if _, err := ProvenanceLabel("call", "a\nb"); !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("control character accepted: %v", err)
 	}
 }
 

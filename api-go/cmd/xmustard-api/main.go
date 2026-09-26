@@ -333,15 +333,17 @@ func requireMemoryCaller(w http.ResponseWriter, r *http.Request, role string) (m
 		writeJSON(w, http.StatusForbidden, map[string]any{"error": fmt.Sprintf("principal id %q is reserved for open mode; mint a token under another id", p.ID)})
 		return memoryCaller{}, false
 	}
-	caller := memoryCaller{principal: p, openMode: p == nil,
-		session: r.Header.Get("X-Xmustard-Session-Id"), callID: r.Header.Get("X-Xmustard-Call-Id")}
-	for kind, v := range map[string]string{"X-Xmustard-Session-Id": caller.session, "X-Xmustard-Call-Id": caller.callID} {
-		if err := workspaceops.CheckProvenanceLabel(kind, v); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
-			return memoryCaller{}, false
-		}
+	session, err := workspaceops.ProvenanceLabel("X-Xmustard-Session-Id", r.Header.Get("X-Xmustard-Session-Id"))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return memoryCaller{}, false
 	}
-	return caller, true
+	callID, err := workspaceops.ProvenanceLabel("X-Xmustard-Call-Id", r.Header.Get("X-Xmustard-Call-Id"))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return memoryCaller{}, false
+	}
+	return memoryCaller{principal: p, openMode: p == nil, session: session, callID: callID}, true
 }
 
 // requireWellFormedJSON decodes a body that may be absent or blank (the handler then
@@ -726,6 +728,10 @@ func registerRoutes(mux routeRegistrar) {
 			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
 			request,
 		)
+		if errors.Is(err, workspaceops.ErrInvalidInput) {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{
 				"error": err.Error(),
