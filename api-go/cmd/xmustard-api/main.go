@@ -4137,10 +4137,7 @@ func registerRoutes(mux routeRegistrar) {
 		result, err := workspaceops.FileLineage(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), path)
 		issueIntel(w, err, result)
 	})
-	mux.HandleFunc("GET /api/workspaces/{workspace_id}/session-grounding", func(w http.ResponseWriter, r *http.Request) {
-		result, err := workspaceops.BuildSessionGroundingCtx(r.Context(), envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))
-		issueIntel(w, err, groundResponse(r, result))
-	})
+	registerGroundRoutes(mux)
 	// --- run confidence, owner suggestions, ownership, eval timeline, ticket ingest, guidance customization ---
 	mux.HandleFunc("GET /api/workspaces/{workspace_id}/runs/{run_id}/confidence", func(w http.ResponseWriter, r *http.Request) {
 		result, err := workspaceops.ScoreRunConfidence(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), r.PathValue("run_id"))

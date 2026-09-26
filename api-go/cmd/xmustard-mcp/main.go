@@ -50,13 +50,17 @@ func mcpText(text string, isError bool) map[string]any { return mcpserver.TextRe
 var (
 	backend = &mcpserver.HTTPBackend{}
 	client  = newStdioClient()
-	session = mcpserver.New(mcpserver.Options{
+	// XMUSTARD_MCP_SCHEMA=full also lists the advanced arguments (default lean);
+	// an invalid value stops the server in main.
+	schemaProfile, schemaErr = mcpserver.ParseSchemaProfile(os.Getenv("XMUSTARD_MCP_SCHEMA"))
+	session                  = mcpserver.New(mcpserver.Options{
 		Backend:      backend,
 		Delivery:     evidenceDelivery{},
 		Resources:    evidenceResources{},
 		Cwd:          workingDir(),
 		AutoRegister: strings.TrimSpace(os.Getenv("XMUSTARD_MCP_AUTO_REGISTER")) != "0",
 		HomeDir:      homeDir(),
+		Schema:       schemaProfile,
 	}).NewSession(client)
 )
 
@@ -408,6 +412,10 @@ func notify(inflight *inflightRegistry, m rpcMessage) {
 }
 
 func main() {
+	if schemaErr != nil {
+		fmt.Fprintln(os.Stderr, "xmustard-mcp:", schemaErr)
+		os.Exit(2)
+	}
 	reader := bufio.NewReaderSize(os.Stdin, 64<<10)
 	writer := bufio.NewWriter(os.Stdout)
 	enc := json.NewEncoder(writer)

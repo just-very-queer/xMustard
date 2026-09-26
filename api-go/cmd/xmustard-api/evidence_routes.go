@@ -208,6 +208,40 @@ func evidenceDeliveryMiddleware(store *evidence.Store, next http.Handler) http.H
 			before = &b
 			afterKey = func(ctx context.Context) evidence.Identity { return captureIdentity(ctx, rc, true) }
 		}
+		captureReq := func(status int, contentType string) evidence.CaptureRequest {
+			// argument digest: method, path, canonical (sorted) query and consumed body.
+			argsHash := sha256.New()
+			io.WriteString(argsHash, r.Method+" "+r.URL.Path+"?"+r.URL.Query().Encode()+"\n")
+			argsHash.Write(body.h.Sum(nil))
+			actor, enforced := principalScope(r)
+			issuer := r.Header.Get("X-Xmustard-Issuer")
+			if issuer == "" {
+				issuer = "http"
+			}
+			return evidence.CaptureRequest{
+				WorkspaceID: ws, RepoScope: scope, Actor: actor, AuthEnforced: enforced, Issuer: issuer,
+				SessionID: r.Header.Get("X-Xmustard-Session-Id"), CallID: r.Header.Get("X-Xmustard-Call-Id"),
+				Tool: tool, ToolVersion: toolVersion, ArgsDigest: hex.EncodeToString(argsHash.Sum(nil)),
+				Status: status, IsError: status >= 400, ContentType: contentType,
+				BeforeKey: before, RepoKey: afterKey,
+			}
+		}
+		// A handler that projects its own result (ground's output budget) retains the
+		// unprojected original through this, under the same scope, identity and
+		// digest as the reply, and names the handle in its reply.
+		r = r.WithContext(context.WithValue(r.Context(), retainOriginalKey{}, retainOriginal(func(raw []byte) (*evidence.Delivery, error) {
+			osp, err := store.NewSpool(ws)
+			if err != nil {
+				return nil, err
+			}
+			defer osp.Discard()
+			if _, err := osp.Write(raw); err != nil {
+				return nil, err
+			}
+			req := captureReq(http.StatusOK, "application/json")
+			req.Retain = true
+			return store.Capture(captureCtx, osp, req)
+		})))
 		sw := &spoolWriter{header: http.Header{}, spool: sp}
 		next.ServeHTTP(sw, r)
 		if sw.status == 0 {
@@ -219,22 +253,7 @@ func evidenceDeliveryMiddleware(store *evidence.Store, next http.Handler) http.H
 			writeOverloaded(w)
 			return
 		}
-		// argument digest: method, path, canonical (sorted) query and consumed body.
-		argsHash := sha256.New()
-		io.WriteString(argsHash, r.Method+" "+r.URL.Path+"?"+r.URL.Query().Encode()+"\n")
-		argsHash.Write(body.h.Sum(nil))
-		actor, enforced := principalScope(r)
-		issuer := r.Header.Get("X-Xmustard-Issuer")
-		if issuer == "" {
-			issuer = "http"
-		}
-		d, err := store.Capture(captureCtx, sp, evidence.CaptureRequest{
-			WorkspaceID: ws, RepoScope: scope, Actor: actor, AuthEnforced: enforced, Issuer: issuer,
-			SessionID: r.Header.Get("X-Xmustard-Session-Id"), CallID: r.Header.Get("X-Xmustard-Call-Id"),
-			Tool: tool, ToolVersion: toolVersion, ArgsDigest: hex.EncodeToString(argsHash.Sum(nil)),
-			Status: sw.status, IsError: sw.status >= 400, ContentType: sw.header.Get("Content-Type"),
-			BeforeKey: before, RepoKey: afterKey,
-		})
+		d, err := store.Capture(captureCtx, sp, captureReq(sw.status, sw.header.Get("Content-Type")))
 		if err != nil {
 			writeEvidenceError(w, err)
 			return
@@ -253,8 +272,36 @@ func evidenceDeliveryMiddleware(store *evidence.Store, next http.Handler) http.H
 	})
 }
 
+// retainOriginal keeps a delivered handler's unprojected result as evidence and
+// returns the delivery naming its handle. It is in the request context only on a
+// delivered call.
+type retainOriginal func(raw []byte) (*evidence.Delivery, error)
+
+type retainOriginalKey struct{}
+
+func retainOriginalFrom(ctx context.Context) retainOriginal {
+	f, _ := ctx.Value(retainOriginalKey{}).(retainOriginal)
+	return f
+}
+
 // writeEvidenceError maps evidence errors to explicit, protocol-correct HTTP answers.
 func writeEvidenceError(w http.ResponseWriter, err error) {
+	status, reason := evidenceErrorStatus(err)
+	if reason == "corrupt" {
+		log.Printf("evidence: %v", err)
+		writeJSON(w, status, map[string]any{"error": err.Error(), "reason": reason})
+		return
+	}
+	if status == http.StatusInternalServerError {
+		log.Printf("evidence: %v", err)
+		writeJSON(w, status, map[string]any{"error": "internal error", "reason": reason})
+		return
+	}
+	writeJSON(w, status, map[string]any{"error": err.Error(), "reason": reason})
+}
+
+// evidenceErrorStatus classifies an evidence error as an HTTP status and a reason.
+func evidenceErrorStatus(err error) (int, string) {
 	status, reason := http.StatusInternalServerError, "internal"
 	switch {
 	case errors.Is(err, evidence.ErrTooLarge):
@@ -277,16 +324,8 @@ func writeEvidenceError(w http.ResponseWriter, err error) {
 		status, reason = http.StatusUnsupportedMediaType, "unsupported"
 	case errors.Is(err, evidence.ErrCorrupt):
 		status, reason = http.StatusInternalServerError, "corrupt"
-		log.Printf("evidence: %v", err)
-		writeJSON(w, status, map[string]any{"error": err.Error(), "reason": reason})
-		return
 	}
-	if status == http.StatusInternalServerError {
-		log.Printf("evidence: %v", err)
-		writeJSON(w, status, map[string]any{"error": "internal error", "reason": reason})
-		return
-	}
-	writeJSON(w, status, map[string]any{"error": err.Error(), "reason": reason})
+	return status, reason
 }
 
 func registerEvidenceRoutes(mux routeRegistrar, store *evidence.Store) {
