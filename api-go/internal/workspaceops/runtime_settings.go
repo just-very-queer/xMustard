@@ -36,6 +36,9 @@ type AppSettings struct {
 
 	RequireMultiAgentVerification *bool `json:"require_multi_agent_verification,omitempty"`
 	ContextVerificationThreshold  int   `json:"context_verification_threshold,omitempty"`
+	// PrincipalDistinctness is the verifier distinctness policy (D-16): "token" (the
+	// default) or "owner".
+	PrincipalDistinctness string `json:"principal_distinctness,omitempty"`
 }
 
 type LocalAgentCapabilities struct {
@@ -99,10 +102,15 @@ func GetSettings(dataDir string) (*AppSettings, error) {
 
 		RequireMultiAgentVerification: settings.RequireMultiAgentVerification,
 		ContextVerificationThreshold:  settings.ContextVerificationThreshold,
+		PrincipalDistinctness:         settings.PrincipalDistinctness,
 	}, nil
 }
 
 func UpdateSettings(dataDir string, settings AppSettings) (*AppSettings, error) {
+	distinct := strings.ToLower(strings.TrimSpace(settings.PrincipalDistinctness))
+	if distinct != "" && distinct != DistinctToken && distinct != DistinctOwner {
+		return nil, fmt.Errorf("principal_distinctness %q is not token or owner: %w", settings.PrincipalDistinctness, ErrInvalidInput)
+	}
 	next := appSettings{
 		LocalAgentType: fallbackString(strings.TrimSpace(settings.LocalAgentType), "codex"),
 		CodexBin:       trimOptional(settings.CodexBin),
@@ -115,6 +123,7 @@ func UpdateSettings(dataDir string, settings AppSettings) (*AppSettings, error) 
 
 		RequireMultiAgentVerification: settings.RequireMultiAgentVerification,
 		ContextVerificationThreshold:  settings.ContextVerificationThreshold,
+		PrincipalDistinctness:         distinct,
 	}
 	if err := writeJSON(filepath.Join(dataDir, "settings.json"), next); err != nil {
 		return nil, err

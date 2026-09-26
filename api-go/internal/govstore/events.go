@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"strings"
 )
 
@@ -76,8 +77,10 @@ type EventFilter struct {
 	WorkspaceID string
 	EntryID     string
 	Types       []string
-	AfterSeq    int64
-	Limit       int
+	// Revision, when set, keeps only the events of that revision.
+	Revision int64
+	AfterSeq int64
+	Limit    int
 }
 
 // EventInput is a caller-authored event, for transitions the typed writers do not
@@ -122,6 +125,9 @@ func (t *txn) insertEvent(ctx context.Context, actor Actor, ev eventRow) (int64,
 		return 0, fmt.Errorf("%w: event type %q", ErrInvalid, ev.Type)
 	}
 	var data any
+	if p := actor.provenance(); p != nil {
+		ev.Data = withProvenance(ev.Data, p)
+	}
 	if ev.Data != nil {
 		s, err := encodeJSON(ev.Data)
 		if err != nil {
@@ -145,6 +151,21 @@ func (t *txn) insertEvent(ctx context.Context, actor Actor, ev eventRow) (int64,
 		return 0, fmt.Errorf("append %s event: %w", ev.Type, err)
 	}
 	return res.LastInsertId()
+}
+
+// withProvenance adds the write's provenance to an event's data. Data of another shape
+// than a JSON object is nested under "data" so the provenance is never dropped.
+func withProvenance(data any, p map[string]any) map[string]any {
+	switch d := data.(type) {
+	case nil:
+		return map[string]any{"provenance": p}
+	case map[string]any:
+		out := make(map[string]any, len(d)+1)
+		maps.Copy(out, d)
+		out["provenance"] = p
+		return out
+	}
+	return map[string]any{"data": data, "provenance": p}
 }
 
 // AppendEvent appends a caller-authored event. An entry event must name an existing
@@ -204,6 +225,10 @@ func (r *reader) ListEvents(ctx context.Context, f EventFilter) ([]Event, error)
 	}
 	where = append(where, "seq > ?")
 	args = append(args, f.AfterSeq)
+	if f.Revision > 0 {
+		where = append(where, "revision = ?")
+		args = append(args, f.Revision)
+	}
 	if len(f.Types) > 0 {
 		where = append(where, "type IN ("+placeholders(len(f.Types))+")")
 		for _, ty := range f.Types {
