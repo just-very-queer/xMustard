@@ -7,32 +7,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use walkdir::{DirEntry, WalkDir};
 
-const SCANNER_EXCLUDED_DIR_NAMES: &[&str] = &[
-    ".git",
-    ".hg",
-    ".svn",
-    ".venv",
-    "venv",
-    "__pycache__",
-    ".mypy_cache",
-    ".pytest_cache",
-    ".ruff_cache",
-    ".turbo",
-    ".next",
-    "target",
-    "node_modules",
-    "dist",
-    "build",
-    "coverage",
-    ".coverage",
-    "tmp",
-    "vendor",
-    "third_party",
-    "research",
-];
-
-const SCANNER_EXCLUDED_RELATIVE_DIRS: &[&str] = &["backend/data", "frontend/dist"];
-
 const REPO_MAP_KEY_FILE_PATTERNS: &[(&str, &str)] = &[
     ("AGENTS.md", "guide"),
     ("CONVENTIONS.md", "guide"),
@@ -560,23 +534,8 @@ fn relative_path(root_path: &Path, path: &Path) -> Option<String> {
 }
 
 fn should_ignore_relative_path(relative_path: &str) -> bool {
-    let normalized_parts: Vec<&str> = relative_path
-        .split('/')
-        .filter(|part| !part.is_empty() && *part != ".")
-        .collect();
-    if normalized_parts.is_empty() {
-        return false;
-    }
-    if normalized_parts
-        .iter()
-        .any(|part| SCANNER_EXCLUDED_DIR_NAMES.contains(part))
-    {
-        return true;
-    }
-    let normalized = normalized_parts.join("/");
-    SCANNER_EXCLUDED_RELATIVE_DIRS
-        .iter()
-        .any(|excluded| normalized == *excluded || normalized.starts_with(&format!("{excluded}/")))
+    // One exclusion list for the scanner, the repo map and the index (PAR-FRESH-08).
+    crate::index::ignore::is_default_excluded(relative_path)
 }
 
 fn should_scan_file(relative_path: &str) -> bool {

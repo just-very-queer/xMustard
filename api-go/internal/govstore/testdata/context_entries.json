@@ -1,0 +1,154 @@
+[
+  {
+    "id": "ctx_3f9a1c2e4b5d",
+    "workspace_id": "repo-2d5d3dd8af",
+    "title": "Backend checks",
+    "content": "Run `make check-backend` before pushing: it runs go test, go build, cargo test and cargo clippy.",
+    "source": "agent-a",
+    "permission": "readonly",
+    "status": "verified",
+    "promoted": true,
+    "verifications": [
+      {
+        "agent": "agent-b",
+        "approve": true,
+        "note": "matches Makefile",
+        "at": "2026-09-20T08:16:00.5Z"
+      },
+      {
+        "agent": "agent-c",
+        "approve": true,
+        "at": "2026-09-20T08:17:12.123456789Z"
+      }
+    ],
+    "required_verifications": 2,
+    "verification_mode": "peer_verified",
+    "created_at": "2026-09-20T08:15:30.123456789Z",
+    "updated_at": "2026-09-20T08:17:12.123456789Z",
+    "paths": [
+      "Makefile",
+      "api-go/go.mod",
+      "docs/removed.md"
+    ],
+    "path_hashes": {
+      "Makefile": "9300d80c1a9ef3b4ed52668929d7cee1f196f803c0c44dc08b671ee6cb569e83",
+      "api-go/go.mod": "6cf5910e9528552548ab469d39b9905c7c89de354a937d4e285db2971a4b6a12",
+      "docs/removed.md": "\u0000missing"
+    },
+    "search_tokens": [
+      "backend",
+      "cargo",
+      "check",
+      "clippy",
+      "make",
+      "pushing"
+    ]
+  },
+  {
+    "id": "ctx_pending00001",
+    "workspace_id": "repo-2d5d3dd8af",
+    "title": "Status doc",
+    "content": "docs/STATUS.md is the source for completion claims; verify against source first.",
+    "source": "agent-b",
+    "permission": "readonly",
+    "status": "pending",
+    "promoted": false,
+    "verifications": [
+      {
+        "agent": "agent-c",
+        "approve": true,
+        "at": "2026-09-21T09:00:00Z"
+      }
+    ],
+    "required_verifications": 2,
+    "require_verification": true,
+    "verification_mode": "",
+    "created_at": "2026-09-21T08:59:00Z",
+    "updated_at": "2026-09-21T09:00:00Z",
+    "paths": [
+      "docs/STATUS.md"
+    ],
+    "search_tokens": [
+      "claims",
+      "status"
+    ]
+  },
+  {
+    "id": "ctx_rejected0001",
+    "workspace_id": "repo-2d5d3dd8af",
+    "title": "Wrong port",
+    "content": "The API listens on :8080.",
+    "source": "agent-c",
+    "permission": "readwrite",
+    "status": "rejected",
+    "promoted": false,
+    "verifications": [
+      {
+        "agent": "agent-a",
+        "approve": false,
+        "note": "it is :8042",
+        "at": "2026-09-22T10:00:00Z"
+      },
+      {
+        "agent": "agent-b",
+        "approve": false,
+        "at": "2026-09-22T10:05:00Z"
+      }
+    ],
+    "required_verifications": 2,
+    "verification_mode": "",
+    "created_at": "2026-09-22T09:55:00Z",
+    "updated_at": "2026-09-22T10:05:00Z"
+  },
+  {
+    "id": "ctx_single000001",
+    "workspace_id": "repo-2d5d3dd8af",
+    "title": "Release binary",
+    "content": "Rebuild rust-core/target/release/xmustard-core after any Rust change.",
+    "source": "operator",
+    "permission": "readwrite",
+    "status": "verified",
+    "promoted": true,
+    "verifications": [
+      {
+        "agent": "operator",
+        "approve": true,
+        "note": "single-agent mode",
+        "at": "2026-09-23T11:00:00Z"
+      }
+    ],
+    "required_verifications": 1,
+    "verification_mode": "single_agent",
+    "created_at": "2026-09-23T11:00:00Z",
+    "updated_at": "2026-09-23T11:00:00Z",
+    "paths": [
+      "rust-core/Cargo.toml"
+    ],
+    "path_hashes": {
+      "rust-core/Cargo.toml": "76ecd21315fa8c8dcf72b6c0cc75a283056a7d85b8cce5f18c41965e8ec8c273"
+    },
+    "content_digest": "a46a9e37d6df597124b4322a3b912ff4dcc9ad7826eed3286d1ce622c904d4ae"
+  },
+  {
+    "id": "ctx_openmode0001",
+    "workspace_id": "repo-2d5d3dd8af",
+    "title": "Caf\u00e9 notes \u2014 \u65e5\u672c\u8a9e",
+    "content": "Line one.\nLine two with unicode: na\u00efve r\u00e9sum\u00e9, \u65e5\u672c\u8a9e.\n\tIndented \"quoted\" <tag> & done.",
+    "source": "anonymous",
+    "permission": "readonly",
+    "status": "verified",
+    "promoted": true,
+    "verifications": [
+      {
+        "agent": "anonymous",
+        "approve": true,
+        "note": "open mode",
+        "at": "2026-09-24T12:00:00Z"
+      }
+    ],
+    "required_verifications": 2,
+    "verification_mode": "self_asserted_open_mode",
+    "created_at": "2026-09-24T12:00:00Z",
+    "updated_at": "2026-09-24T12:00:00Z"
+  }
+]

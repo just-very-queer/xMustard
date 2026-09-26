@@ -511,15 +511,15 @@ func ExplainPath(dataDir string, workspaceID string, relativePath string) (*Code
 
 // ExplainPathCtx is the request-scoped variant: cancelling ctx cancels its Rust/tool work (see rustcore.runCoreCtx).
 func ExplainPathCtx(ctx context.Context, dataDir string, workspaceID string, relativePath string) (*CodeExplainerResult, error) {
-	snapshot, err := loadSnapshot(dataDir, workspaceID)
+	root, _, err := resolveChangeRootCtx(ctx, dataDir, workspaceID)
 	if err != nil {
 		return nil, err
 	}
-	normalized, err := normalizeWorkspaceFile(snapshot.Workspace.RootPath, relativePath)
+	normalized, err := normalizeWorkspaceFile(root, relativePath)
 	if err != nil {
 		return nil, err
 	}
-	rustResult, err := readRustPathExplanation(ctx, workspaceID, snapshot.Workspace.RootPath, normalized)
+	rustResult, err := readRustPathExplanation(ctx, workspaceID, root, normalized)
 	if err != nil {
 		return nil, err
 	}

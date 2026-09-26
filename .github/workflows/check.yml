@@ -1,0 +1,318 @@
+# Backend checks, the retrieval gate and the budget gate v2 on every pull request
+# (PAR-EVAL-08). The parity-scale suite (pinned Apache/MIT fixtures, 5-10k files) runs
+# weekly and on demand. Actions are pinned to commit SHAs; the tag is in the comment.
+name: check
+
+on:
+  pull_request:
+    # labeled/unlabeled: re-run when a maintainer approves a budget ledger change
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      parity:
+        description: "Also run the parity-scale suite (clones the pinned fixtures)"
+        type: boolean
+        default: false
+  schedule:
+    - cron: "23 3 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: check-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: never
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  # Go tests that call the Rust core use the release binary built from this revision
+  # (XMUSTARD_CORE_BIN), as the repository guide prescribes after any Rust change.
+  backend:
+    name: make check-backend
+    needs: core-release
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: api-go/go.mod
+          cache-dependency-path: api-go/go.sum
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: rust-core
+      # cmd/xmustard-ops runs a verification profile whose command is `python3 -m pytest`;
+      # the runner's system Python has no pytest
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - run: python -m pip install pytest==9.1.1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: xmustard-core
+          path: ${{ runner.temp }}/core
+      - run: chmod +x "$RUNNER_TEMP/core/xmustard-core"
+      - run: XMUSTARD_CORE_BIN="$RUNNER_TEMP/core/xmustard-core" make check-backend
+
+  bench-unit:
+    name: gate v2 unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: make bench-test
+
+  integrations-pi:
+    name: pi adapter (node --test)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: integrations/pi
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+      - run: npm ci
+      - run: npm run check
+
+  core-release:
+    name: build xmustard-core (release)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: rust-core
+          key: release
+      - run: cd rust-core && cargo build --release --locked --bin xmustard-core
+      # the native stdio relay (WS-13), once this revision has one; its gate scenario skips until then
+      - run: |
+          if [ -f rust-core/src/bin/xmustard-relay.rs ]; then
+            cd rust-core && cargo build --release --locked --bin xmustard-relay
+          fi
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: xmustard-core
+          path: |
+            rust-core/target/release/xmustard-core
+            rust-core/target/release/xmustard-relay
+          if-no-files-found: error
+          retention-days: 3
+
+  retrieval-gate:
+    name: retrieval gate
+    needs: core-release
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: api-go/go.mod
+          cache-dependency-path: api-go/go.sum
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: xmustard-core
+          path: ${{ runner.temp }}/core
+      - name: Run the 12-query retrieval gate
+        run: |
+          chmod +x "$RUNNER_TEMP/core/xmustard-core"
+          mkdir -p bench-out
+          XMUSTARD_CORE_BIN="$RUNNER_TEMP/core/xmustard-core" scripts/bench/retrieval-gate.sh --report bench-out/retrieval-gate.json
+      - if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: retrieval-gate-report
+          path: bench-out/
+          if-no-files-found: ignore
+
+  budget-gate:
+    name: budget gate v2
+    needs: core-release
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: api-go/go.mod
+          cache-dependency-path: api-go/go.sum
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: xmustard-core
+          path: ${{ runner.temp }}/core
+      - run: chmod +x "$RUNNER_TEMP"/core/xmustard-*
+      # Pull requests: measure the base revision on this same runner, then the head (each
+      # the median of the valid runs among three), and check the head's delta against the
+      # workstream's ledger line. The workstream comes from the branch name (a path segment
+      # starting ws-NN); other branches get the default line of 0 MiB. The check reads the
+      # BASE revision's budget_ledger.json: a pull request that changes lines, tolerances,
+      # design lines or roles fails unless a maintainer adds the budget-ledger-change label.
+      # CI-suite scenarios block on their own gate verdict. A workstream's designated
+      # parity-scale scenario blocks only on a regression beyond noise (base median within
+      # 95.4 MiB, head median over it, median and max both more than tolerance.tree_peak_mib
+      # above the base's) unless its ledger entry sets gate_blocking (WS-13, WS-30, WS-55). A scenario the base
+      # cannot run is judged by the head's verdict; one the head stops running blocks.
+      # The base uses the head's binaries when rust-core is identical, else its own build.
+      - name: Prepare the base revision
+        if: github.event_name == 'pull_request'
+        id: base
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          git worktree add --detach "$RUNNER_TEMP/base" "$BASE_SHA"
+          if git diff --quiet "$BASE_SHA" HEAD -- rust-core; then
+            echo "bin=$RUNNER_TEMP/core" >> "$GITHUB_OUTPUT"
+            echo "build_core=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "bin=$RUNNER_TEMP/base/rust-core/target/release" >> "$GITHUB_OUTPUT"
+            echo "build_core=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Choose the ledger and the scenarios
+        if: github.event_name == 'pull_request'
+        id: plan
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+          LEDGER_CHANGE_APPROVED: ${{ contains(github.event.pull_request.labels.*.name, 'budget-ledger-change') }}
+        run: |
+          mkdir -p bench-out
+          LEDGER=scripts/bench/budget_ledger.json
+          BASE_LEDGER="$RUNNER_TEMP/base/scripts/bench/budget_ledger.json"
+          if [ -f "$BASE_LEDGER" ]; then
+            if scripts/bench/rss_v2.sh ledger --ledger "$LEDGER" --diff "$BASE_LEDGER" > bench-out/ledger-diff.json; then
+              LEDGER="$BASE_LEDGER"
+            elif [ "$LEDGER_CHANGE_APPROVED" = "true" ]; then
+              echo "::notice::budget_ledger.json changes approved by the budget-ledger-change label"
+            else
+              cat bench-out/ledger-diff.json
+              echo "::error::This pull request changes budget_ledger.json lines, tolerances, design lines or roles. It is measured against the base ledger and fails until a maintainer adds the budget-ledger-change label."
+              LEDGER="$BASE_LEDGER"
+              echo "ledger_unapproved=true" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+          echo "ledger=$LEDGER" >> "$GITHUB_OUTPUT"
+          scripts/bench/rss_v2.sh ci-plan --branch "$HEAD_REF" --ledger "$LEDGER" | tee -a "$GITHUB_OUTPUT"
+      - if: steps.plan.outputs.fixtures == 'true'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/fixtures
+          key: parity-fixtures-${{ hashFiles('scripts/bench/parity_fixtures.json') }}
+      - if: steps.base.outputs.build_core == 'true'
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch
+        with:
+          toolchain: stable
+      - name: Build the base core (rust-core differs)
+        if: steps.base.outputs.build_core == 'true'
+        run: |
+          cd "$RUNNER_TEMP/base/rust-core"
+          cargo build --release --locked --bin xmustard-core
+          if [ -f src/bin/xmustard-relay.rs ]; then
+            cargo build --release --locked --bin xmustard-relay
+          fi
+      - name: Gate v2 on the base revision
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_BIN: ${{ steps.base.outputs.bin }}
+          LEDGER: ${{ steps.plan.outputs.ledger }}
+          SCENARIOS: ${{ steps.plan.outputs.scenarios }}
+          XMUSTARD_FIXTURE_CACHE: ${{ runner.temp }}/fixtures
+        run: |
+          relay=()
+          if [ -x "$BASE_BIN/xmustard-relay" ]; then relay=(--relay-bin "$BASE_BIN/xmustard-relay"); fi
+          scripts/bench/rss_v2.sh run --scenarios "$SCENARIOS" --repeat 3 --ledger "$LEDGER" --source-root "$RUNNER_TEMP/base" \
+            --core-bin "$BASE_BIN/xmustard-core" "${relay[@]}" --out bench-out/base || true
+          test -f bench-out/base/report.json
+      - name: Gate v2 on the head (pull request, with the ledger check)
+        if: github.event_name == 'pull_request'
+        env:
+          LEDGER: ${{ steps.plan.outputs.ledger }}
+          SCENARIOS: ${{ steps.plan.outputs.scenarios }}
+          WS: ${{ steps.plan.outputs.workstream }}
+          XMUSTARD_FIXTURE_CACHE: ${{ runner.temp }}/fixtures
+        run: |
+          if [ -x "$RUNNER_TEMP/core/xmustard-relay" ]; then export XMUSTARD_RELAY_BIN="$RUNNER_TEMP/core/xmustard-relay"; fi
+          scripts/bench/rss_v2.sh run --scenarios "$SCENARIOS" --repeat 3 --ledger "$LEDGER" \
+            --core-bin "$RUNNER_TEMP/core/xmustard-core" --out bench-out/head \
+            --workstream "$WS" --baseline bench-out/base/report.json
+      - name: Unapproved ledger change
+        if: github.event_name == 'pull_request' && steps.plan.outputs.ledger_unapproved == 'true'
+        run: exit 1
+      - name: Gate v2 (push or manual run)
+        if: github.event_name != 'pull_request'
+        run: |
+          if [ -x "$RUNNER_TEMP/core/xmustard-relay" ]; then export XMUSTARD_RELAY_BIN="$RUNNER_TEMP/core/xmustard-relay"; fi
+          scripts/bench/rss_v2.sh run --suite ci --core-bin "$RUNNER_TEMP/core/xmustard-core" --out bench-out/head
+      - name: Report summary
+        if: always()
+        run: |
+          for f in bench-out/head/report.md bench-out/base/report.md; do
+            [ -f "$f" ] && { echo "## $f"; cat "$f"; } >> "$GITHUB_STEP_SUMMARY"
+          done
+          true
+      - if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: budget-gate-v2-report
+          path: bench-out/
+          if-no-files-found: ignore
+
+  # Reports the parity-scale status, three runs per scenario (a borderline single run
+  # flips between PASS and FAIL). It fails at this HEAD (per-agent shims and per-call
+  # cores exceed 95.4 MiB at 4 agents, two hot repos and four worktrees), so it does not
+  # fail the workflow until the final parity-scale gate (WS-50) makes it blocking. On a
+  # pull request only the designated scenarios of its workstream run (see budget-gate).
+  parity-scale:
+    name: parity-scale budget gate
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.parity)
+    needs: core-release
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: api-go/go.mod
+          cache-dependency-path: api-go/go.sum
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: xmustard-core
+          path: ${{ runner.temp }}/core
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/fixtures
+          key: parity-fixtures-${{ hashFiles('scripts/bench/parity_fixtures.json') }}
+      - name: Parity-scale suite (fixtures fetched at pinned shas and verified by hash)
+        env:
+          XMUSTARD_FIXTURE_CACHE: ${{ runner.temp }}/fixtures
+        run: |
+          chmod +x "$RUNNER_TEMP/core/xmustard-core"
+          make bench-parity BENCH_OUT=bench-out BENCH_ARGS="--repeat 3 --core-bin $RUNNER_TEMP/core/xmustard-core"
+      - name: Report summary
+        if: always()
+        run: |
+          [ -f bench-out/parity/report.md ] && cat bench-out/parity/report.md >> "$GITHUB_STEP_SUMMARY"
+          true
+      - if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: parity-scale-report
+          path: bench-out/
+          if-no-files-found: ignore
