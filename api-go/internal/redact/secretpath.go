@@ -28,7 +28,10 @@ var (
 		"**/.env",
 		"**/.env.*",
 	}
-	// secretPathExceptions are templates that the patterns would match.
+	// secretPathExceptions are templates that the .env patterns would match.
+	// An exception exempts only the patterns whose file name it is an instance
+	// of, so a template under a secret directory (".ssh/.env.example") stays
+	// secret, as in open-code-review, where it exempts only the .env rule.
 	secretPathExceptions = []string{
 		"**/.env.example",
 		"**/.env.sample",
@@ -67,17 +70,26 @@ func MatchSecretPath(path string) (string, bool) {
 	if len(names) == 0 {
 		return "", false
 	}
-	for _, p := range secretPathExceptions {
-		if globNames(strings.Split(p, "/"), names) {
-			return "", false
-		}
-	}
+	matches := func(p string) bool { return globNames(strings.Split(p, "/"), names) }
 	for _, p := range secretPathPatterns {
-		if globNames(strings.Split(p, "/"), names) {
+		if matches(p) && !exempt(p, matches) {
 			return p, true
 		}
 	}
 	return "", false
+}
+
+// exempt reports whether a matching exception is an instance of pattern's file
+// name: ".env.example" exempts "**/.env.*", never "**/.ssh/**".
+func exempt(pattern string, matches func(string) bool) bool {
+	fileName := func(p string) string { return p[strings.LastIndexByte(p, '/')+1:] }
+	name := fileName(pattern)
+	for _, e := range secretPathExceptions {
+		if name != "**" && globName(name, fileName(e)) && matches(e) {
+			return true
+		}
+	}
+	return false
 }
 
 // foldName returns the name a file system may open for name: ASCII letters in

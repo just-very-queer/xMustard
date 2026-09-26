@@ -25,7 +25,9 @@ pub const SECRET_PATH_PATTERNS: &[&str] = &[
     "**/.env.*",
 ];
 
-/// Templates that the patterns would match.
+/// Templates that the `.env` patterns would match. An exception exempts only
+/// the patterns whose file name it is an instance of, so a template under a
+/// secret directory (`.ssh/.env.example`) stays secret, as in open-code-review.
 pub const SECRET_PATH_EXCEPTIONS: &[&str] =
     &["**/.env.example", "**/.env.sample", "**/.env.template"];
 
@@ -51,10 +53,23 @@ pub fn match_secret_path(path: &str) -> Option<&'static str> {
     }
     let names: Vec<&str> = names.iter().map(String::as_str).collect();
     let matches = |p: &str| glob_names(&p.split('/').collect::<Vec<_>>(), &names);
-    if SECRET_PATH_EXCEPTIONS.iter().any(|p| matches(p)) {
-        return None;
+    SECRET_PATH_PATTERNS
+        .iter()
+        .copied()
+        .find(|p| matches(p) && !exempt(p, &matches))
+}
+
+/// Whether a matching exception is an instance of `pattern`'s file name:
+/// `.env.example` exempts `**/.env.*`, never `**/.ssh/**`.
+fn exempt(pattern: &str, matches: &impl Fn(&str) -> bool) -> bool {
+    fn file_name(p: &str) -> &str {
+        p.rsplit('/').next().unwrap_or(p)
     }
-    SECRET_PATH_PATTERNS.iter().copied().find(|p| matches(p))
+    let name = file_name(pattern);
+    name != "**"
+        && SECRET_PATH_EXCEPTIONS
+            .iter()
+            .any(|e| glob_name(name.as_bytes(), file_name(e).as_bytes()) && matches(e))
 }
 
 /// The name a file system may open for `name`: ASCII letters in lower case, and
