@@ -215,6 +215,12 @@ func TestMCPHTTPWorkspaceBinding(t *testing.T) {
 		if res["isError"] == true || ws["workspace_id"] != "ws" || ws["source"] != mcpserver.SourceBinding {
 			t.Fatalf("binding: %v", res)
 		}
+		// a bare evidence URI from before a reconnect resolves in the bound workspace
+		// (the API then answers for the handle), not "not issued in this session"
+		_, out := c.post(map[string]any{"jsonrpc": "2.0", "id": 3, "method": "resources/read", "params": map[string]any{"uri": mcpserver.ResourceScheme + "xm1.gone"}})
+		if e, _ := out["error"].(map[string]any); e == nil || strings.Contains(fmt.Sprint(e["message"]), "not issued in this session") {
+			t.Fatalf("bound bare handle: %v", out)
+		}
 	}
 	for _, q := range []string{"?workspace=other", "?workspace=../etc"} {
 		bad := &mcpHTTPClient{t: t, url: srv.URL + "/mcp" + q, token: tokens["alice"]}

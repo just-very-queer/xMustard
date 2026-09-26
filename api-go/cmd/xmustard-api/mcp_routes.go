@@ -87,7 +87,14 @@ func openMCPSession(r *http.Request) (*mcpserver.Server, error) {
 	}
 	backend := loopbackBackend{}
 	home, _ := os.UserHomeDir()
-	evidence := mcpserver.NewEvidence(backend, nil)
+	// a bare evidence URI this session did not issue (one from before a reconnect)
+	// resolves in the session's bound workspace, as XMUSTARD_WORKSPACE_ID does on stdio
+	evidence := mcpserver.NewEvidence(backend, func(k string) string {
+		if k == "XMUSTARD_WORKSPACE_ID" {
+			return ws
+		}
+		return ""
+	})
 	return mcpserver.New(mcpserver.Options{
 		Backend:     backend,
 		Delivery:    evidence,

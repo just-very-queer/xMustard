@@ -103,7 +103,11 @@ attributes usage; `schema=lean|full` picks the tools/list schema profile. The to
 always travels in `Authorization`, never in the URL. A session belongs to the
 principal that opened it; each tool call re-enters the API as that principal, so
 caller-scoped tools/list, route gates, evidence resources and registration scope
-apply as they do for any other caller. Per-tool usage counters are in
+apply as they do for any other caller. The API holds at most 64 sessions and 16 per
+principal: past its share a principal's least recently used idle session ends, and a
+full table ends an idle session of the largest holder, so one principal cannot lock
+the others out. The relay sends the token only to a loopback host unless it is given
+`--allow-insecure-remote`. Per-tool usage counters are in
 `/api/health` under `mcp_usage` (shown to authenticated callers).
 
 Each agent should authenticate with an `XMUSTARD_API_TOKEN` (mint one with

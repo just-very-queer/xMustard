@@ -98,8 +98,9 @@ func newStreamableServer(t *testing.T, api Backend, opts Options) *httptest.Serv
 			}
 			return New(o), nil
 		},
-		Owner:       func(r *http.Request) string { return r.Header.Get("X-Owner") },
-		MaxSessions: 4,
+		Owner:               func(r *http.Request) string { return r.Header.Get("X-Owner") },
+		MaxSessions:         4,
+		MaxSessionsPerOwner: 2,
 	})
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
@@ -332,15 +333,95 @@ func mustJSON(v any) string {
 	return string(b)
 }
 
-// The session table is bounded: past MaxSessions a new initialize is refused.
-func TestStreamableHTTPSessionCap(t *testing.T) {
+func initPeer(t *testing.T, srv *httptest.Server, owner string) *httpPeer {
+	p := &httpPeer{t: t, url: srv.URL, owner: owner, accept: "application/json, text/event-stream"}
+	p.initialize(map[string]any{})
+	return p
+}
+
+func (p *httpPeer) ping() int {
+	code, _ := p.post(map[string]any{"jsonrpc": "2.0", "id": "p", "method": "ping"})
+	return code
+}
+
+// startSearch posts a tool call that blocks in the API until cancelled.
+func (p *httpPeer) startSearch(wg *sync.WaitGroup, id string) {
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		call := *p
+		call.post(map[string]any{"jsonrpc": "2.0", "id": id, "method": "tools/call",
+			"params": map[string]any{"name": "search", "arguments": map[string]any{"workspace_id": "ws", "query": "q"}}})
+	}()
+}
+
+func (p *httpPeer) cancel(id string) {
+	p.post(map[string]any{"jsonrpc": "2.0", "method": "notifications/cancelled", "params": map[string]any{"requestId": id}})
+}
+
+// One caller cannot lock the others out of the session table: past its quota its
+// own least recently used session ends, and a full table gives up a session of the
+// largest holder rather than refusing someone else.
+func TestStreamableHTTPSessionQuota(t *testing.T) {
 	srv := newStreamableServer(t, &fakeAPI{}, Options{})
-	for i := 0; i < 4; i++ {
-		(&httpPeer{t: t, url: srv.URL, owner: "a", accept: "application/json"}).initialize(map[string]any{})
+	a1, a2 := initPeer(t, srv, "a"), initPeer(t, srv, "a")
+	a2.ping()
+	a3 := initPeer(t, srv, "a") // a1 is a's least recently used
+	if a1.ping() != http.StatusNotFound || a2.ping() != http.StatusOK || a3.ping() != http.StatusOK {
+		t.Fatal("a's quota did not end its least recently used session")
 	}
+	b1, b2 := initPeer(t, srv, "b"), initPeer(t, srv, "b")
+	// the table (4) is full with a:2 and b:2; c still gets in
+	c := initPeer(t, srv, "c")
+	alive := 0
+	for _, p := range []*httpPeer{a2, a3, b1, b2, c} {
+		if p.ping() == http.StatusOK {
+			alive++
+		}
+	}
+	if alive != 4 || c.ping() != http.StatusOK {
+		t.Fatalf("full table: %d sessions answer", alive)
+	}
+}
+
+// A session is never taken from under a running request: with all of a caller's
+// sessions busy, its next initialize is refused.
+func TestStreamableHTTPSessionQuotaBusy(t *testing.T) {
+	api := &blockingAPI{started: make(chan struct{}, 2), ended: make(chan error, 2)}
+	srv := newStreamableServer(t, api, Options{})
+	a1, a2 := initPeer(t, srv, "a"), initPeer(t, srv, "a")
+	var wg sync.WaitGroup
+	a1.startSearch(&wg, "s")
+	a2.startSearch(&wg, "s")
+	<-api.started
+	<-api.started
 	p := &httpPeer{t: t, url: srv.URL, owner: "a", accept: "application/json"}
 	code, _ := p.post(map[string]any{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": map[string]any{"protocolVersion": LatestProtocolVersion}})
 	if code != http.StatusServiceUnavailable || p.sid != "" {
-		t.Fatalf("fifth session: %d %q", code, p.sid)
+		t.Fatalf("third busy session: %d %q", code, p.sid)
 	}
+	initPeer(t, srv, "b") // another caller is unaffected
+	a1.cancel("s")
+	a2.cancel("s")
+	wg.Wait()
+}
+
+// A request id already in flight on the session is refused, so a later
+// notifications/cancelled names exactly one call.
+func TestStreamableHTTPDuplicateInflightID(t *testing.T) {
+	api := &blockingAPI{started: make(chan struct{}, 1), ended: make(chan error, 1)}
+	srv := newStreamableServer(t, api, Options{})
+	p := initPeer(t, srv, "a")
+	var wg sync.WaitGroup
+	p.startSearch(&wg, "d")
+	<-api.started
+	_, msgs := p.post(map[string]any{"jsonrpc": "2.0", "id": "d", "method": "ping"})
+	if e, _ := msgs[0]["error"].(map[string]any); e == nil || e["code"] != float64(CodeInvalidRequest) {
+		t.Fatalf("duplicate id: %v", msgs)
+	}
+	p.cancel("d")
+	if err := <-api.ended; err != context.Canceled {
+		t.Fatalf("first call ended with %v", err)
+	}
+	wg.Wait()
 }

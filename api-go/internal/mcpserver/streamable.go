@@ -46,13 +46,15 @@ type HTTPOptions struct {
 	Open func(r *http.Request) (*Server, error)
 	// Owner names the caller of r. A session answers only the caller that opened it.
 	Owner func(r *http.Request) string
-	// MaxSessions bounds open sessions (default 64); IdleTimeout ends a session
-	// unused that long (default 30m); MaxInflight bounds one session's concurrent
-	// requests (default 8); MaxMessageBytes bounds one message (default 8 MiB).
-	MaxSessions     int
-	IdleTimeout     time.Duration
-	MaxInflight     int
-	MaxMessageBytes int64
+	// MaxSessions bounds open sessions (default 64) and MaxSessionsPerOwner one
+	// caller's share of them (default 16); IdleTimeout ends a session unused that
+	// long (default 30m); MaxInflight bounds one session's concurrent requests
+	// (default 8); MaxMessageBytes bounds one message (default 8 MiB).
+	MaxSessions         int
+	MaxSessionsPerOwner int
+	IdleTimeout         time.Duration
+	MaxInflight         int
+	MaxMessageBytes     int64
 }
 
 // StreamableHTTP is the MCP endpoint's session table and handler.
@@ -66,6 +68,9 @@ type StreamableHTTP struct {
 func NewStreamableHTTP(opts HTTPOptions) *StreamableHTTP {
 	if opts.MaxSessions <= 0 {
 		opts.MaxSessions = 64
+	}
+	if opts.MaxSessionsPerOwner <= 0 {
+		opts.MaxSessionsPerOwner = 16
 	}
 	if opts.IdleTimeout <= 0 {
 		opts.IdleTimeout = 30 * time.Minute
@@ -203,24 +208,59 @@ func (h *StreamableHTTP) initialize(w http.ResponseWriter, r *http.Request, m rp
 		writeRPC(w, http.StatusOK, reply(m.ID, nil, rerr))
 		return
 	}
-	if !h.open(hs) {
-		writeRPC(w, http.StatusServiceUnavailable, reply(m.ID, nil, &RPCError{Code: CodeOverloaded,
-			Message: fmt.Sprintf("xmustard: %d MCP sessions are open; end one (DELETE) or retry after one idles out", h.opts.MaxSessions)}))
+	if why := h.open(hs); why != "" {
+		writeRPC(w, http.StatusServiceUnavailable, reply(m.ID, nil, &RPCError{Code: CodeOverloaded, Message: why}))
 		return
 	}
 	w.Header().Set(HeaderSessionID, hs.id)
 	writeRPC(w, http.StatusOK, reply(m.ID, result, nil))
 }
 
-// open stores a new session, first dropping the idle ones; false when the table is full.
-func (h *StreamableHTTP) open(hs *httpSession) bool {
+// open stores a new session, first dropping the expired ones. A caller at its quota
+// gives up its least recently used session with nothing in flight; a full table gives
+// up the least recently used such session of the caller holding the most. The reason
+// is returned when there is nothing to give up ("" when stored). One caller can
+// therefore never lock the others out: it holds at most MaxSessionsPerOwner.
+func (h *StreamableHTTP) open(hs *httpSession) string {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.pruneLocked()
+	held := map[string]int{}
+	for _, s := range h.sessions {
+		held[s.owner]++
+	}
+	if held[hs.owner] >= h.opts.MaxSessionsPerOwner && !h.evictLocked(func(s *httpSession) bool { return s.owner == hs.owner }) {
+		return fmt.Sprintf("xmustard: this caller has %d MCP sessions open, all busy; end one (DELETE) or retry shortly", held[hs.owner])
+	}
 	if len(h.sessions) >= h.opts.MaxSessions {
-		return false
+		top := 0
+		for _, n := range held {
+			top = max(top, n)
+		}
+		if !h.evictLocked(func(s *httpSession) bool { return held[s.owner] == top }) {
+			return fmt.Sprintf("xmustard: %d MCP sessions are open, all busy; retry shortly", len(h.sessions))
+		}
 	}
 	h.sessions[hs.id] = hs
+	return ""
+}
+
+// evictLocked ends the least recently used session matching pick that has nothing
+// in flight; false when there is none.
+func (h *StreamableHTTP) evictLocked(pick func(*httpSession) bool) bool {
+	var lru *httpSession
+	var lruAt time.Time
+	for _, s := range h.sessions {
+		at, busy := s.usage()
+		if pick(s) && !busy && (lru == nil || at.Before(lruAt)) {
+			lru, lruAt = s, at
+		}
+	}
+	if lru == nil {
+		return false
+	}
+	delete(h.sessions, lru.id)
+	lru.cancelAll()
 	return true
 }
 
@@ -274,20 +314,25 @@ func (hs *httpSession) touch() {
 	hs.mu.Unlock()
 }
 
+// usage reports when the session was last used and whether a request is in flight.
+func (hs *httpSession) usage() (time.Time, bool) {
+	hs.mu.Lock()
+	defer hs.mu.Unlock()
+	return hs.lastUsed, len(hs.inflight) > 0
+}
+
 // idleSince reports whether the session has been unused since before cutoff with no
 // request in flight.
 func (hs *httpSession) idleSince(cutoff time.Time) bool {
-	hs.mu.Lock()
-	defer hs.mu.Unlock()
-	return len(hs.inflight) == 0 && hs.lastUsed.Before(cutoff)
+	at, busy := hs.usage()
+	return !busy && at.Before(cutoff)
 }
 
 func (hs *httpSession) cancelAll() {
 	hs.mu.Lock()
 	defer hs.mu.Unlock()
-	for id, cancel := range hs.inflight {
+	for _, cancel := range hs.inflight {
 		cancel()
-		delete(hs.inflight, id)
 	}
 }
 
@@ -304,9 +349,9 @@ func (hs *httpSession) notify(m rpcMessage) {
 	if json.Unmarshal(m.Params, &p) != nil || len(p.RequestID) == 0 {
 		return
 	}
+	// the entry stays until its request returns, so the id cannot be reused meanwhile
 	hs.mu.Lock()
 	cancel := hs.inflight[string(p.RequestID)]
-	delete(hs.inflight, string(p.RequestID))
 	hs.mu.Unlock()
 	if cancel != nil {
 		cancel()
@@ -336,8 +381,16 @@ func (h *StreamableHTTP) request(w http.ResponseWriter, r *http.Request, hs *htt
 	defer cancel()
 	key := string(m.ID)
 	hs.mu.Lock()
-	hs.inflight[key] = cancel
+	_, dup := hs.inflight[key]
+	if !dup {
+		hs.inflight[key] = cancel
+	}
 	hs.mu.Unlock()
+	if dup {
+		// a second entry would make notifications/cancelled ambiguous
+		writeRPC(w, http.StatusOK, reply(m.ID, nil, &RPCError{Code: CodeInvalidRequest, Message: "request id " + key + " is already in flight on this session"}))
+		return
+	}
 	defer func() {
 		hs.mu.Lock()
 		delete(hs.inflight, key)
