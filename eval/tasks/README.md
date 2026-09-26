@@ -21,6 +21,7 @@ go build -o /tmp/xm/xmustard-eval ./cmd/xmustard-eval
 # schema only
 /tmp/xm/xmustard-eval validate --corpus ../eval/tasks/seed.yaml
 # every oracle fails on the untouched task and passes on its reference patch
+# (--out DIR keeps the logs, which hold hidden oracle output; without it they are deleted)
 /tmp/xm/xmustard-eval validate --corpus ../eval/tasks/seed.yaml --oracles
 
 # dry run: fake client, stub stack, no credentials, no model calls
@@ -221,24 +222,51 @@ running. So:
   - every other process of the run that the sweep finds is dead (see the next item);
   - the visible verify step has run and the sweep has run again.
 
-  The harness then copies the worktree into a judge directory under the work root.
-  Every agent, setup and verify profile hides that directory. The copy keeps ignored
-  files such as installed dependencies. On macOS it is one `clonefile` call; elsewhere
-  it is made file by file, with links copied as links. Its other files are reset to the
-  agent's final snapshot through the harness's git directory. The copy is not a git
-  repository. The oracle files are written into it from the bytes loaded with the
-  corpus, and the oracle runs there under its own profile. That profile hides every
-  run's worktree and allows only the judge copy. So the oracle judges exactly the tree
-  in `diff.patch` (ignored files aside, see below), whatever verify, or a process the
-  run left behind, did to the worktree afterwards. If verify changed non-ignored files,
-  the run records `verify_changed_tree` and the report warns. Staging runs with the
-  operator's rights.
-  It goes through an `os.Root`, and if any directory on a destination path is a
-  symbolic link the run fails as `oracle_path_symlink`. The judge copy is deleted with
-  the run, even with `--keep-worktrees`. Before the agent starts, the worktree is
-  scanned for any file whose bytes equal an oracle file, and for existing oracle
-  destinations. A hit fails the run as `oracle_visible`. `validate --oracles` judges
-  copies in the same way.
+  The agent can write, and replace, its run directory (`wt/<run>`, which holds the
+  worktree and anything it left beside it). The harness has the operator's rights, so
+  after the agent starts it reads that tree only where no process of the run can
+  reach it:
+  - **Held.** Before each snapshot, and before the copy, the harness moves the run
+    directory into the judge area, which every agent, setup and verify profile hides.
+    A process left behind loses access to the tree as it moves, because the sandbox
+    matches a file's current path. If the run directory or the worktree in it is no
+    longer a directory (the agent replaced it with a link or a file), the run fails as
+    `worktree_replaced`. Nothing the link names is read, copied, swept or deleted.
+  - **Copied.** The held run directory is copied into the judge area. On macOS this is
+    one `clonefile` call. Elsewhere, or when cloning fails, it is copied entry by
+    entry. Each entry is opened relative to its parent directory's handle, by name,
+    with `O_NOFOLLOW`, and must be the file the listing found. Links are copied as
+    links, and sockets, pipes and devices are left out. An entry swapped during the
+    copy fails the run instead of being followed. The copy keeps ignored files such
+    as installed dependencies. The worktree's other files are reset to the agent's
+    final snapshot through the harness's git directory, and its `.git` file is
+    dropped. The oracle files are written into it from the bytes loaded with the
+    corpus.
+  - **Linked.** While the oracle runs, the run directory's path is a link to the copy.
+    The oracle runs in the worktree's own
+    path, under a profile that hides every run's worktree and allows only the copy and
+    that link. Absolute paths that setup recorded, such as a virtualenv's interpreter or
+    an editable install, therefore resolve into the judged copy. A run's own profile
+    allows the link's path but not the copy it resolves to, and it pins the run
+    directory's own entry (sandbox-exec denies writes to it; under bwrap it is a mount
+    point), so a process left behind can neither read through the link nor replace
+    it. Afterwards the worktree moves back.
+
+  So the oracle judges exactly the tree in `diff.patch` (ignored files aside, see
+  below), whatever verify, or a process the run left behind, did to the worktree
+  afterwards. If verify changed non-ignored files, the run records
+  `verify_changed_tree` and the report warns. Staging goes through an `os.Root`, and
+  if any directory on a destination path is a symbolic link the run fails as
+  `oracle_path_symlink`. The judge copy is deleted with the run, even with
+  `--keep-worktrees`. Before the agent starts, the worktree is scanned for any file
+  whose bytes equal an oracle file, and for existing oracle destinations. A hit fails
+  the run as `oracle_visible`. An oracle that exits 126 or 127 (a command could not
+  be executed or was not found) is scored as unresolved, and the report warns.
+
+  `validate --oracles` runs every command as a run does: setup and verify under a
+  run's profile, and the oracle held, copied and linked as above under the oracle's
+  profile (`--containment`, default `auto`). Its logs hold hidden oracle output, so it
+  keeps them only under `--out DIR`, and it warns about oracle exits 126 and 127.
 - **Escaped processes.** Processes that leave their command's process group (`setsid`,
   as Pi's bash tool does for every command) are found and killed at three points:
   after the agent, after verify, and after the oracle. A run fails if any survive.
@@ -247,7 +275,9 @@ running. So:
     the oracle ran, identified by pid and start time;
   - by a per-run environment marker (Linux reads `/proc/<pid>/environ`; recent macOS no
     longer exposes other processes' environments);
-  - by a working directory inside the worktree or the judge copy.
+  - by a working directory inside the run directory or the run's judge area. These
+    paths are matched as the harness created them. A link the agent put in their place
+    is not followed, so the sweep never kills processes working where it points.
 
   On macOS some processes are not found. One example is a process that detaches within
   100 ms of starting, has a parent that exits just as fast, changes to another
@@ -260,7 +290,8 @@ running. So:
 - **Executor death.** A watchdog child process holds a pipe to the executor. If the
   executor dies without cleaning up (SIGKILL, an OOM kill, a test timeout), the
   watchdog kills the live process groups and the run's escaped processes, and removes
-  the work root (with `--keep-worktrees`, only the judge copies).
+  the work root (with `--keep-worktrees`, only the judge area, so the worktree of a run that was being
+  judged at that moment is lost).
 - **Kept worktrees.** `--keep-worktrees` keeps every run's worktree under the work
   root, which is printed at the end. The oracle was never in them. A kept worktree
   shows the tree after verify. Each is hidden from later runs' agents.
@@ -285,15 +316,18 @@ What containment does not cover:
 - The oracle runs code the agent wrote while the oracle files are present in the judge
   copy. Its profile hides every run's directories, but it does not confine writes. So
   code that runs at oracle time can copy the oracle to a place a later run can read,
-  such as the home directory or the shared build cache. Closing that would need the
-  oracle's writes confined to the judge copy, with private toolchain caches. A cold Go
-  build cache costs about 8 s and 66 MB per oracle run on the seed fixture.
+  such as the home directory or the shared build cache. An honest Go oracle also
+  writes its compiled hidden tests into the shared build cache. Closing that would need
+  the oracle's writes confined to the judge copy, with private toolchain caches. A cold
+  Go build cache costs about 8 s and 66 MB per oracle run on the seed fixture.
 - Copies of the corpus outside its repository's worktrees are not found. Keep oracle
   sources and reference patches out of any other place an agent could read, such as
   another clone or a synced folder.
 - Ignored files (per `.gitignore`) are outside every snapshot. The judge copy takes
   them from the worktree as they are after verify, so verify-time changes to them are
   not undone.
+- Only the run directory is judged in a copy. Absolute paths that setup recorded
+  outside it, such as a shared cache in the home directory, are used as they are.
 
 ## Drivers and accounting
 
@@ -406,8 +440,12 @@ and a budget, so an operator runs it:
 ## Authoring rules (for WS-63)
 
 - An oracle must fail on the untouched starting state (after `setup` and `drift`) and
-  pass once `reference.patch` is applied. `validate --oracles` checks both. Keep oracle
-  sources outside fixture directories. The loader rejects them there, and the leak scan
+  pass once `reference.patch` is applied. `validate --oracles` checks both, under the
+  same containment and judging as a run.
+- Setup may record absolute paths into the worktree (a virtualenv, `pip install -e`):
+  the oracle runs at the worktree's own path, which then leads to the judged copy.
+  Setup outputs placed outside the run directory are shared by every run as they are.
+- Keep oracle sources outside fixture directories. The loader rejects them there, and the leak scan
   catches copies inside a repository.
 - An oracle must not be reachable through anything the agent can read. The harness
   hides the corpus's files, the git directory of the repository that holds them, and
