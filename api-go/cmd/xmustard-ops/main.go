@@ -26,7 +26,7 @@ func (s *stringSliceFlag) Set(value string) error {
 func main() {
 	args := os.Args[1:]
 	if len(args) == 0 {
-		fatalUsage("usage: xmustard-ops <diagnostics|semantic-index|postgres|runtime|workspace> ...")
+		fatalUsage("usage: xmustard-ops <diagnostics|semantic-index|postgres|runtime|workspace|mcp-config> ...")
 	}
 	switch args[0] {
 	case "diagnostics":
@@ -39,8 +39,10 @@ func main() {
 		runRuntime(args[1:])
 	case "workspace":
 		runWorkspace(args[1:])
+	case "mcp-config":
+		runMCPConfig(args[1:])
 	default:
-		fatalUsage("usage: xmustard-ops <diagnostics|semantic-index|postgres|runtime|workspace> ...")
+		fatalUsage("usage: xmustard-ops <diagnostics|semantic-index|postgres|runtime|workspace|mcp-config> ...")
 	}
 }
 

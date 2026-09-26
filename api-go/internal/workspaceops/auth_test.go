@@ -80,7 +80,7 @@ func TestMintTokenValidation(t *testing.T) {
 func TestConcurrentTokenStoreNoLostUpdate(t *testing.T) {
 	dir := t.TempDir()
 	// Concurrent mints of distinct ids must all persist (no lost-update). Without
-	// tokenStoreMu the load-modify-write races and most records vanish.
+	// lockTokenStore the load-modify-write races and most records vanish.
 	const n = 16
 	var wg sync.WaitGroup
 	for i := 0; i < n; i++ {

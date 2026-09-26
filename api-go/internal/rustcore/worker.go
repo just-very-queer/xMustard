@@ -206,6 +206,13 @@ type WorkerStats struct {
 	Calls         int64 `json:"calls"`
 	Fallbacks     int64 `json:"fallbacks"`
 	Cancels       int64 `json:"cancels"`
+	// Recycles counts workers retired to give their memory back, by reason: the
+	// governor's heavy_admission and over_soft_ceiling, the idle policy's runaway,
+	// idle_tight and idle_over_line, and requested (RecycleCoreWorker). See
+	// worker_governor.go.
+	Recycles map[string]int64 `json:"recycles"`
+	// RecyclePending is set while a busy worker is marked to retire when its calls end.
+	RecyclePending bool `json:"recycle_pending"`
 }
 
 type workerCounters struct {
@@ -227,6 +234,12 @@ type workerSupervisor struct {
 	knownKey string
 	known    workerResidency
 	counters workerCounters
+	// recycles counts recycles by reason; lastRecycled is the last recycled worker, so
+	// a reclaim request can wait for its exit (worker_governor.go).
+	recycles     map[string]int64
+	lastRecycled *workerProc
+	// pressureCheck is set while an idle-time pressure check runs.
+	pressureCheck atomic.Bool
 }
 
 // coreWorker is the process-wide resident worker supervisor.
@@ -249,15 +262,21 @@ func CoreWorkerStats() WorkerStats {
 	s.mu.Lock()
 	if s.proc != nil {
 		st.PID = s.proc.pid
+		st.RecyclePending = s.proc.recycleAtIdle
+	}
+	st.Recycles = make(map[string]int64, len(s.recycles))
+	for k, v := range s.recycles {
+		st.Recycles[k] = v
 	}
 	s.mu.Unlock()
 	return st
 }
 
 // RecycleCoreWorker retires the resident worker once its current calls finish, which
-// returns its retained heap to the OS; the next call starts a fresh worker. It is the
-// lever for a memory governor (WS-06) under pressure, and reports whether a worker
-// was running.
+// returns its retained heap to the OS; the next call starts a fresh worker. It reports
+// whether a worker was running. The budget governor recycles through
+// reclaimCoreWorker instead (worker_governor.go), which does not start a second worker
+// beside a busy one.
 func RecycleCoreWorker() bool {
 	s := coreWorker
 	s.mu.Lock()
@@ -266,7 +285,9 @@ func RecycleCoreWorker() bool {
 	if p == nil {
 		return false
 	}
-	s.retireProc(p)
+	if s.retireProc(p) {
+		s.noteRecycle(p, reasonRequested)
+	}
 	return true
 }
 
@@ -308,7 +329,7 @@ var (
 	oneShotOnly = map[string]bool{
 		"lsp-document-symbols": true, "lsp-hover": true, "run-verification-command": true,
 		"run-managed-command": true, "run-verification-profile": true, "goal": true,
-		"semantic-search": true,
+		"semantic-search": true, "index": true,
 	}
 	oneShotFamilies = map[string]map[string]bool{
 		"changetrack": {"index": true},
@@ -410,8 +431,12 @@ func (s *workerSupervisor) acquire(ctx context.Context, key workerKey, set worke
 }
 
 // release ends a caller's use of p. ok reports a completed call, which clears the
-// crash backoff.
+// crash backoff. When p goes idle it is retired if the governor asked for its memory
+// while it was busy, or if it is above the runaway line; otherwise its idle exit and
+// idle pressure check are armed, and the governor samples the tree
+// (worker_governor.go).
 func (s *workerSupervisor) release(p *workerProc, ok bool) {
+	gov := budget.Gov // read on the caller's goroutine; the timers and checks keep it
 	s.mu.Lock()
 	p.active--
 	p.lastUsed = time.Now()
@@ -419,15 +444,32 @@ func (s *workerSupervisor) release(p *workerProc, ok bool) {
 		s.crashes = 0
 	}
 	retire := p.active == 0 && p.retiring
-	if p.active == 0 && s.proc == p && p.idleAfter > 0 {
+	idle := p.active == 0 && s.proc == p
+	reason := ""
+	if idle && p.recycleAtIdle {
+		s.proc, p.retiring = nil, true
+		retire, idle, reason = true, false, p.recycleReason
+	}
+	if idle && p.idleAfter > 0 {
 		if p.idleTimer != nil {
 			p.idleTimer.Stop()
 		}
 		p.idleTimer = time.AfterFunc(p.idleAfter, func() { s.idleCheck(p) })
 	}
+	if idle {
+		s.armIdlePressureCheck(p, gov)
+	}
 	s.mu.Unlock()
+	if reason != "" {
+		s.noteRecycle(p, reason)
+	}
 	if retire {
 		p.retire()
+		return
+	}
+	if idle {
+		s.checkRunaway(p)
+		s.checkPressureAtIdle(gov)
 	}
 }
 
@@ -453,8 +495,14 @@ func (s *workerSupervisor) onExit(p *workerProc, err error) {
 	if p.idleTimer != nil {
 		p.idleTimer.Stop()
 	}
+	if p.pressureTimer != nil {
+		p.pressureTimer.Stop()
+	}
 	if s.proc == p {
 		s.proc = nil
+	}
+	if s.lastRecycled == p {
+		s.lastRecycled = nil
 	}
 	if p.retiring || !p.started.Load() {
 		return
@@ -495,6 +543,8 @@ type workerProc struct {
 	residency workerResidency
 	counters  *workerCounters
 	idleAfter time.Duration
+	// trimAfter is the worker's idle trim period, when the idle pressure check runs.
+	trimAfter time.Duration
 	sup       *workerSupervisor
 
 	writeMu sync.Mutex
@@ -512,6 +562,11 @@ type workerProc struct {
 	retiring  bool
 	lastUsed  time.Time
 	idleTimer *time.Timer
+	// pressureTimer runs the idle pressure check; recycleAtIdle marks a busy worker
+	// the governor asked for memory, retired when its last call ends (recycleReason).
+	pressureTimer *time.Timer
+	recycleAtIdle bool
+	recycleReason string
 
 	// started is set once the handshake succeeded; an exit before that is a failed
 	// start (handled by acquire), not a crash.
@@ -584,6 +639,7 @@ func (s *workerSupervisor) startWorker(ctx context.Context, key workerKey, set w
 		done:      make(chan struct{}),
 		counters:  &s.counters,
 		idleAfter: set.idle,
+		trimAfter: set.trim,
 		sup:       s,
 	}
 	cmd.Stderr = &workerLog{proc: p}

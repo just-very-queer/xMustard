@@ -243,7 +243,7 @@ func buildHandler(c serverConfig, api http.Handler) http.Handler {
 	handler = bodyLimitMiddleware(handler)
 	// Outermost: refuse rebinding Hosts, cross-origin browsers and query-string keys
 	// before any other work.
-	return exposureMiddleware(c.posture, c.dataDir, handler)
+	return withLoopback(exposureMiddleware(c.posture, c.dataDir, handler))
 }
 
 // --- auth middleware + principal helpers ---
@@ -664,14 +664,7 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 // can exercise the real route table through httptest.
 func registerRoutes(mux routeRegistrar) {
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]any{
-			"status":  "ok",
-			"service": "api-go",
-			// admission counters (bench/diagnostics): bytes xMustard reserved, not RSS
-			"transient_pool": map[string]any{"max": budget.TransientBytes.Max(), "in_use": budget.TransientBytes.InUse(), "peak": budget.TransientBytes.Peak()},
-			"children":       map[string]any{"cap": budget.Children.Cap(), "in_use": budget.Children.InUse(), "peak": budget.Children.Peak()},
-			"budget":         healthBudgetFor(r),
-		})
+		writeJSON(w, http.StatusOK, healthResponse(r)) // health_budget.go
 	})
 	mux.HandleFunc("GET /api/runtimes", func(w http.ResponseWriter, r *http.Request) {
 		result, err := workspaceops.DetectRuntimes(
@@ -4143,6 +4136,7 @@ func registerRoutes(mux routeRegistrar) {
 		issueIntel(w, err, result)
 	})
 	registerGroundRoutes(mux)
+	registerMCPRoutes(mux)
 	// --- run confidence, owner suggestions, ownership, eval timeline, ticket ingest, guidance customization ---
 	mux.HandleFunc("GET /api/workspaces/{workspace_id}/runs/{run_id}/confidence", func(w http.ResponseWriter, r *http.Request) {
 		result, err := workspaceops.ScoreRunConfidence(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), r.PathValue("run_id"))

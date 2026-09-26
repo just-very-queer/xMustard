@@ -328,7 +328,10 @@ func runLockKey(dataDir, workspaceID, runID string) string {
 // terminal); a non-nil error aborts the transaction without writing. The *runRecord is
 // a private copy loaded under the lock — fn mutates it, not shared state.
 func mutateRun(dataDir, workspaceID, runID string, fn func(*runRecord) (bool, error)) (*runRecord, error) {
-	unlock := lockStore(runLockKey(dataDir, workspaceID, runID))
+	unlock, err := lockStore(runLockKey(dataDir, workspaceID, runID))
+	if err != nil {
+		return nil, err
+	}
 	defer unlock()
 	run, err := loadRun(dataDir, workspaceID, runID)
 	if err != nil {

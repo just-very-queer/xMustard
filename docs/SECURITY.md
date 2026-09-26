@@ -86,6 +86,15 @@ In open mode no credentials exist. Every caller is the single identity
 `anonymous`, passes every role gate, and memory it writes is labelled
 `self_asserted_open_mode`, never peer-verified.
 
+### Who counts as a peer verifier
+
+Promotion needs approvals from distinct principals other than the author. Since the
+govstore cutover (WS-12) the author of the entry's *served revision* is excluded
+too, not only the original proposer: an admin who rewrites an entry cannot then
+count toward that revision's quorum, so rewriting and approving one text needs a
+further principal. This is a deliberate tightening; it matches the store's own
+peer invariant, so the API and the store agree on who is a peer.
+
 ### Changes for existing tokens
 
 Before the role table, an `agent` token could call every route except the admin
@@ -285,6 +294,22 @@ symlink-refusing descriptor walk (`api-go/internal/workspaceops/safepath_unix.go
 so a path swapped for a symlink later is still refused. `explain` applies the same
 symlink check to its `path` before the core reads the file.
 
+## Health endpoint
+
+`/api/health` stays public so liveness probes need no token. Its full view shows
+host-wide activity: the data-movement counters (spawns, hashed bytes, captures),
+the owned process tree and the stdio shims on the host, live external processes,
+the heavy-slot owner labels and queue, the resident Rust worker's pid and memory,
+and the live pool and child counters. While authentication is enforced
+(`XMUSTARD_AUTH=required`, or `auto` with credentials minted), only an operator sees
+the full view: an `admin` token, or another token that holds more than `reader`, with
+no workspace scope. A reader-only token and a workspace-scoped token of any role
+(`admin` included) get the public view, which is the same as for a caller without a
+token: `status`, the pool size, the child cap, the budget gate and the soft ceiling,
+with a `detail` that says why. A public-view poll never samples the process tree.
+With `XMUSTARD_AUTH=off`, or `auto` with no credentials (the open loopback default),
+everyone gets the full view.
+
 ## Route gate table
 
 Every registered route appears here, core routes first. "Read-only mode" says
@@ -299,7 +324,7 @@ whether `XMUSTARD_READ_ONLY=1` still serves the route.
 | `DELETE /api/auth/tokens/{id}` | core | admin | served |  | revoke; served in read-only mode to cut off a leaked token |
 | `POST /api/auth/tokens/{id}/rotate` | core | admin | served |  | replaces the secret; the old one stops working |
 | `GET /api/auth/whoami` | core | reader | served |  | caller principal, roles and usable tools |
-| `ANY /api/health` | core | reader | served |  | public liveness and budget counters |
+| `ANY /api/health` | core | reader | served |  | public liveness and limits; the budget block needs an operator token while auth is enforced |
 | `GET /api/workspaces` | core | reader | served |  | filtered by token scope and workspace allowlist |
 | `POST /api/workspaces/load` | core | proposer | refused |  | workspace registration; below admin only a git work tree top level under XMUSTARD_REGISTER_ROOTS; id checked against the allowlist and token scope |
 | `GET /api/workspaces/{workspace_id}/changes/since-index` | core | reader | served | impact |  |
@@ -320,6 +345,9 @@ whether `XMUSTARD_READ_ONLY=1` still serves the route.
 | `GET /api/workspaces/{workspace_id}/runs/{run_id}/why-failed` | core | reader | served | why_failed |  |
 | `GET /api/workspaces/{workspace_id}/search` | core | reader | served | search |  |
 | `GET /api/workspaces/{workspace_id}/session-grounding` | core | reader | served | ground |  |
+| `DELETE /mcp` | core | reader | served |  | ends the caller's own MCP session |
+| `GET /mcp` | core | reader | served |  | no server-initiated stream: 405 |
+| `POST /mcp` | core | reader | served |  | MCP messages; each tool call re-enters the API through its own route gate as the caller |
 | `GET /api/agent/capabilities` | platform | reader | served |  |  |
 | `POST /api/integrations/test` | platform | admin | refused |  | uses supplied credentials |
 | `POST /api/postgres/bootstrap` | platform | admin | refused |  | schema DDL |

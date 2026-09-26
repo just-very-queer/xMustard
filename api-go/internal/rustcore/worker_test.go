@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -49,6 +50,9 @@ func fakeCore(mode string, args []string) int {
 			sub = args[0]
 		}
 		record("oneshot " + sub)
+		if ms, _ := strconv.Atoi(os.Getenv("XMUSTARD_FAKE_ONESHOT_SLEEP_MS")); ms > 0 {
+			time.Sleep(time.Duration(ms) * time.Millisecond)
+		}
 		fmt.Printf("{\"oneshot\":%q}\n", sub)
 		return 0
 	}
@@ -185,6 +189,7 @@ func resetWorker() {
 	s.proc = nil
 	s.retryKey, s.retryAt, s.startFails, s.crashes = "", time.Time{}, 0, 0
 	s.knownKey, s.known = "", workerResidency{}
+	s.recycles, s.lastRecycled = nil, nil
 	if p != nil {
 		p.retiring = true
 	}
@@ -208,6 +213,14 @@ func useFakeWorker(t *testing.T, mode string) string {
 	t.Setenv("XMUSTARD_FAKE_WORKER", mode)
 	t.Setenv("XMUSTARD_FAKE_WORKER_LOG", logPath)
 	t.Setenv("XMUSTARD_CORE_WORKER", "1")
+	// The fake worker is this test binary, whose memory says nothing about a real
+	// worker's lines; the line recycles are tested on their own.
+	prevPeak, prevRunaway := workerPeakLine, workerRunawayLine
+	workerPeakLine, workerRunawayLine = 1<<40, 1<<40
+	t.Cleanup(func() { workerPeakLine, workerRunawayLine = prevPeak, prevRunaway })
+	// Nor does the tree's: the worker samples it when it goes idle, and this test
+	// binary's memory must not recycle the fake. Tests of the policy swap in their own.
+	quietGovernor(t, budget.GovernorConfig{})
 	resetWorker()
 	t.Cleanup(resetWorker)
 	return logPath
@@ -534,6 +547,7 @@ func TestWorkerThatCannotBeReachedSendsTheCallOneShot(t *testing.T) {
 }
 
 func TestWorkerIsNotStartedForOneShotOnlyCalls(t *testing.T) {
+	quietGovernor(t, budget.GovernorConfig{}) // the builds take the heavy slot
 	t.Setenv("XMUSTARD_CORE_WORKER_START_MS", "1500")
 	logPath := useFakeWorker(t, "nohandshake")
 	before := CoreWorkerStats()
@@ -866,6 +880,9 @@ func realCore(t *testing.T) string {
 		// answers "unknown command: serve".
 		out, _ := exec.Command(bin, "serve", "--bogus=1").CombinedOutput()
 		if strings.HasPrefix(string(out), "usage: xmustard-core serve") {
+			// The worker samples the tree when it goes idle, and this test binary's
+			// memory (with other tests' fixtures) must not recycle it.
+			quietGovernor(t, budget.GovernorConfig{})
 			return bin
 		}
 	}
@@ -1039,9 +1056,34 @@ func TestWorkerOneShotHintsMatchTheCore(t *testing.T) {
 			}
 		}
 	}
+	// The handshake lists only resident commands, so whole one-shot commands come
+	// from the core's subcommand table.
+	for _, name := range coreOneShotCommands(t) {
+		if !oneShotOnly[name] {
+			t.Errorf("the core runs %s one-shot; add it to oneShotOnly", name)
+		}
+	}
 	if !mustKnow(t, key).residentFor("search", nil) {
 		t.Fatal("the supervisor did not keep the handshake's residency")
 	}
+}
+
+// coreOneShotCommands reads the whole commands the core marks Residency::OneShot
+// from its subcommand table.
+func coreOneShotCommands(t *testing.T) []string {
+	t.Helper()
+	src, err := os.ReadFile(filepath.Join(rustCoreDir(), "src", "bin", "xmustard-core.rs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, m := range regexp.MustCompile(`cmd\(\s*"([a-z-]+)",\s*Residency::OneShot\b`).FindAllSubmatch(src, -1) {
+		names = append(names, string(m[1]))
+	}
+	if len(names) == 0 {
+		t.Fatal("no one-shot commands found in the core's subcommand table")
+	}
+	return names
 }
 
 func mustKnow(t *testing.T, key workerKey) workerResidency {

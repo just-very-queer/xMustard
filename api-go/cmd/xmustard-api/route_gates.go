@@ -55,7 +55,7 @@ func platformGate(role, note string) routeGate { return routeGate{Role: role, No
 
 var routeGateTable = map[string]routeGate{
 	// --- core: liveness, identity and token administration ---
-	"/api/health":                               coreGate(roleReader, "", "public liveness and budget counters"),
+	"/api/health":                               coreGate(roleReader, "", "public liveness and limits; the budget block needs an operator token while auth is enforced"),
 	"GET /api/auth/whoami":                      coreGate(roleReader, "", "caller principal, roles and usable tools"),
 	"GET /api/auth/principals":                  coreGate(roleAdmin, "", ""),
 	"POST /api/auth/tokens":                     coreGate(roleAdmin, "", "mint"),
@@ -78,6 +78,11 @@ var routeGateTable = map[string]routeGate{
 	"GET /api/workspaces/{workspace_id}/runs/{run_id}/why-failed":   coreGate(roleReader, "why_failed", ""),
 	"PUT /api/workspaces/{workspace_id}/context/{entry_id}":         coreGate(roleProposer, "", "memory edit; author or admin only"),
 	"GET /api/workspaces/{workspace_id}/context":                    coreGate(roleAdmin, "", "full memory history"),
+
+	// --- core: MCP over Streamable HTTP (mcp_routes.go) ---
+	"POST /mcp":   {Core: true, Role: roleReader, ReadSafe: true, Note: "MCP messages; each tool call re-enters the API through its own route gate as the caller"},
+	"GET /mcp":    coreGate(roleReader, "", "no server-initiated stream: 405"),
+	"DELETE /mcp": {Core: true, Role: roleReader, ReadSafe: true, Note: "ends the caller's own MCP session"},
 
 	// --- core: evidence delivery and recovery ---
 	"POST /api/workspaces/{workspace_id}/evidence":            {Core: true, Role: roleProposer, ReadSafe: true, Note: "projection of the caller's own tool result"},

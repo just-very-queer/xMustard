@@ -42,13 +42,15 @@ const (
 	EventRevoke            = "revoke"
 	EventApplicability     = "applicability"
 	EventNote              = "note"
+	// EventGate records a change of an entry's required verification count.
+	EventGate = "gate"
 )
 
 var validEventTypes = set(EventPropose, EventImport, EventVote, EventReject, EventEdit, EventRevisionAccepted,
 	EventRevisionRejected, EventRevisionWithdrawn, EventPromote, EventDemote, EventStatus, EventSupersede,
 	EventMerge, EventRetract, EventArchive, EventRestore, EventPurge, EventExpiry, EventTierChange, EventClassify,
 	EventAnchors, EventBaseline, EventStaleObserved, EventDriftCleared, EventClaim, EventRelation, EventFeedback,
-	EventCollection, EventGrant, EventRevoke, EventApplicability, EventNote)
+	EventCollection, EventGrant, EventRevoke, EventApplicability, EventNote, EventGate)
 
 // Event is one immutable history record.
 type Event struct {

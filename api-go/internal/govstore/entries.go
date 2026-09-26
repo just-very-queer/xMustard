@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -214,6 +215,8 @@ type EntryWriter interface {
 	SetExpiry(ctx context.Context, id, expiresAt string, actor Actor) (Entry, error)
 	SetTier(ctx context.Context, id, tier string, actor Actor) (Entry, error)
 	SetClassification(ctx context.Context, id string, c Classification, actor Actor) (Entry, error)
+	// SetRequiredVerifications changes how many approvals the entry needs (its gate).
+	SetRequiredVerifications(ctx context.Context, id string, n int, actor Actor) (Entry, error)
 	// Purge hard-deletes an entry's text (secrets, PII) and keeps a digest tombstone.
 	Purge(ctx context.Context, id, reason string, actor Actor) error
 }
@@ -767,6 +770,20 @@ func (t *txn) SetTier(ctx context.Context, id, tier string, actor Actor) (Entry,
 		return Entry{}, fmt.Errorf("%w: tier %q", ErrInvalid, tier)
 	}
 	return t.updateField(ctx, id, actor, EventTierChange, "tier", tier, func(e Entry) string { return e.Tier }, tier)
+}
+
+// SetRequiredVerifications changes the entry's gate. The peer_verified invariant is
+// re-checked against the new count at commit.
+func (t *txn) SetRequiredVerifications(ctx context.Context, id string, n int, actor Actor) (Entry, error) {
+	if err := actor.validate(); err != nil {
+		return Entry{}, err
+	}
+	if n < 1 {
+		return Entry{}, fmt.Errorf("%w: required_verifications %d", ErrInvalid, n)
+	}
+	t.touch(id)
+	gate := func(e Entry) string { return strconv.Itoa(e.RequiredVerifications) }
+	return t.updateField(ctx, id, actor, EventGate, "required_verifications", n, gate, strconv.Itoa(n))
 }
 
 func (t *txn) updateField(ctx context.Context, id string, actor Actor, evType, column string, value any,

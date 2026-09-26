@@ -1,26 +1,37 @@
 package workspaceops
 
-import "sync"
+import (
+	"fmt"
+	"path/filepath"
+	"sync"
+)
 
-// Per-store transaction locking. The JSON state stores mutate by load → modify →
-// save. writeJSON is atomic per write, but the load-then-save window is unlocked, so
-// two concurrent writers both read the old file and the second clobbers the first
-// (lost update) — exactly the multi-agent load this product targets. A single global
-// lock would serialize every store; instead we key a lock by the store's file path so
-// mutations to *different* stores still run in parallel while mutations to the *same*
-// store serialize their whole transaction.
+// Per-store transaction locking for the JSON stores that remain (runs, tokens,
+// feedback, the workspace registry, audit logs). They mutate by load → modify → save.
+// writeJSON is atomic and durable per write (fsync, rename, directory fsync), but the
+// load-then-save window is not, so two writers both read the old file and the second
+// clobbers the first (lost update). lockStore closes that window twice over:
+//
+//   - in the process, a mutex keyed by the store's file path, so mutations to
+//     different stores still run in parallel;
+//   - across processes (a second API process, the ops CLI), an exclusive flock on a
+//     sibling "<store>.lock" file. The store itself cannot carry the lock because each
+//     save replaces its inode. On platforms without flock only the mutex applies.
 //
 // Usage:
 //
-//	unlock := lockStore(contextEntriesPath(dataDir, ws))
+//	unlock, err := lockStore(feedbackPath(dataDir, ws))
+//	if err != nil {
+//		return err
+//	}
 //	defer unlock()
-//	entries, _ := loadContextEntries(dataDir, ws)
+//	entries, _ := loadFeedback(dataDir, ws)
 //	... mutate ...
-//	saveContextEntries(dataDir, ws, entries)
+//	saveFeedback(dataDir, ws, entries)
 //
 // Hold the lock across the full load→save span. Do NOT lock the load/save helpers
 // themselves, and never acquire the same key re-entrantly within one goroutine
-// (sync.Mutex is not reentrant) — lock distinct store paths only.
+// (neither sync.Mutex nor a second flock descriptor is reentrant).
 
 type storeLockRegistry struct {
 	mu    sync.Mutex
@@ -40,11 +51,21 @@ func (r *storeLockRegistry) get(key string) *sync.Mutex {
 	return m
 }
 
-// lockStore acquires the lock for a store key (its file path) and returns the
-// unlock function. The registry map is bounded by (workspaces × store types), which
-// is bounded operational state, not per-request growth.
-func lockStore(key string) func() {
+// lockStore acquires the in-process and cross-process locks for a store key (its file
+// path) and returns the unlock function. A lock file that cannot be taken fails the
+// call: a store mutated without it could lose another process's update. The registry
+// map is bounded by (workspaces × store types), which is bounded operational state,
+// not per-request growth.
+func lockStore(key string) (func(), error) {
 	m := storeLocks.get(key)
 	m.Lock()
-	return m.Unlock
+	unlockFile, err := lockFile(key + ".lock")
+	if err != nil {
+		m.Unlock()
+		return nil, fmt.Errorf("lock store %s: %w", filepath.Base(key), err)
+	}
+	return func() {
+		unlockFile()
+		m.Unlock()
+	}, nil
 }

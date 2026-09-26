@@ -190,7 +190,7 @@ func TestOpenModeMemoryNeedsQuorumOnceTokensExist(t *testing.T) {
 	entryURL := base + "/context/" + e["id"].(string)
 
 	tok := map[string]string{}
-	for id, role := range map[string]string{"root": "admin", "bob": "agent"} {
+	for id, role := range map[string]string{"root": "admin", "bob": "agent", "carol": "agent"} {
 		raw, err := workspaceops.MintToken(dir, id, role)
 		if err != nil {
 			t.Fatal(err)
@@ -217,7 +217,10 @@ func TestOpenModeMemoryNeedsQuorumOnceTokensExist(t *testing.T) {
 		t.Fatalf("a one-principal rewrite must not be recalled: %v", rec)
 	}
 
+	// the rewriter authored the served revision, so only other principals are peers
 	code, got = sendJSON(t, "POST", entryURL+"/verify?approve=true", tok["bob"], "")
+	expect("the rewriter plus one peer", code, got)
+	code, got = sendJSON(t, "POST", entryURL+"/verify?approve=true", tok["carol"], "")
 	if code != http.StatusOK || got["promoted"] != true || got["verification_mode"] != workspaceops.VerificationPeer {
 		t.Fatalf("a second distinct peer must promote it as peer_verified: %d %v", code, got)
 	}

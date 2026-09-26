@@ -7,8 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"sort"
 	"strings"
+	"time"
 
 	"xmustard/api-go/internal/budget"
 )
@@ -45,15 +45,28 @@ func (s *Session) callTool(ctx context.Context, params json.RawMessage) (any, *R
 		// self-correct, matching MCP's tool-error convention.
 		return TextResult(fmt.Sprintf("unknown tool %q", p.Name), true), nil
 	}
-	args, aliased, rerr := BuildArgs(t, p.Arguments)
-	if rerr != nil {
-		return nil, rerr
-	}
-	res, rerr := s.RunTool(ctx, t, args, aliased)
+	start := time.Now()
+	res, norms, rerr := s.callKnownTool(ctx, t, p.Arguments)
+	s.recordUsage(t.Name, len(params), res, rerr, start, norms)
 	if rerr != nil {
 		return nil, rerr
 	}
 	return res, nil
+}
+
+// callKnownTool refuses a write tool on a read-only connection, validates (with the
+// toolcompat repair fallback) and runs the call. It returns how many arguments were
+// normalized, for usage accounting.
+func (s *Session) callKnownTool(ctx context.Context, t *Tool, raw map[string]any) (map[string]any, int, *RPCError) {
+	if s.srv.opts.ReadOnly && !t.Annotations.ReadOnly {
+		return TextResult(fmt.Sprintf("tool %s is not served on a read-only connection (mode=%s); it changes shared memory", t.Name, ModeReadOnly), true), 0, nil
+	}
+	args, norms, rerr := buildArgsCompat(t, raw)
+	if rerr != nil {
+		return nil, 0, rerr
+	}
+	res, rerr := s.runTool(ctx, t, args, norms)
+	return res, len(norms), rerr
 }
 
 // Normalization records one argument the server changed before the call, so the
@@ -61,19 +74,21 @@ func (s *Session) callTool(ctx context.Context, params json.RawMessage) (any, *R
 // path made workspace-relative.
 type Normalization struct {
 	Argument string `json:"argument"`
-	Kind     string `json:"kind"` // alias | relative_path
-	From     string `json:"from"`
-	To       string `json:"to"`
+	// Kind is alias or relative_path, or a toolcompat op (derive, repair, drop,
+	// remove) whose Rule names the repair.
+	Kind string `json:"kind"`
+	From string `json:"from"`
+	To   string `json:"to"`
+	Rule string `json:"rule,omitempty"`
 }
 
 // RunTool runs a validated call (BuildArgs output). A nil *RPCError with an isError
 // result is a tool failure; a non-nil one is a protocol error (admission refusal).
 func (s *Session) RunTool(ctx context.Context, t *Tool, args map[string]string, aliased map[string]string) (map[string]any, *RPCError) {
-	var norms []Normalization
-	for from, to := range aliased {
-		norms = append(norms, Normalization{Argument: to, Kind: "alias", From: from, To: to})
-	}
-	sort.Slice(norms, func(i, j int) bool { return norms[i].From < norms[j].From })
+	return s.runTool(ctx, t, args, aliasNorms(aliased))
+}
+
+func (s *Session) runTool(ctx context.Context, t *Tool, args map[string]string, norms []Normalization) (map[string]any, *RPCError) {
 	for _, a := range t.Args {
 		if a.Required && strings.TrimSpace(args[a.Name]) == "" {
 			return TextResult(fmt.Sprintf("missing required argument %q for %s", a.Name, t.Name), true), nil

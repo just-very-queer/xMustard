@@ -14,7 +14,9 @@ one Pi extension; it is not a general upstream MCP or provider gateway.
 
 ```text
 Existing coding agent
-  -> xmustard-mcp (stdio JSON-RPC; nine tools)
+  -> xmustard-api /mcp (MCP Streamable HTTP; nine tools) directly, or
+     xmustard-relay (std-only Rust stdio relay, ~2 MiB) -> /mcp, or
+     xmustard-mcp (deprecated Go stdio shim, ~13.5 MiB) -> the HTTP routes
   -> xmustard-api (Go HTTP, default 127.0.0.1:8042)
        -> workspaceops (memory, auth, operational records, coordination)
        -> evidence (scoped originals, bounded projection, recovery/resources)
@@ -28,7 +30,10 @@ Optional React UI -> full HTTP surface
 ```
 
 The Rust core is invoked on demand. A resident index daemon is not the current
-architecture. Graph and per-file symbol caches, plus the tracked-file hash stat
+architecture. With `XMUSTARD_CORE_WORKER=1` (opt-in, off by default) one resident
+`xmustard-core serve` worker answers the resident subcommands instead of a process
+per call; the budget governor reports its memory and recycles it under pressure.
+Graph and per-file symbol caches, plus the tracked-file hash stat
 cache that change tracking uses, live under `.git/xmustard-cache/` for Git
 repositories. The default Rust build does not enable `semantic-onnx`.
 
@@ -36,12 +41,12 @@ repositories. The default Rust build does not enable `semantic-onnx`.
 
 | Responsibility | Source owner | Important interface / constraint |
 | --- | --- | --- |
-| MCP protocol and tool schemas | `api-go/internal/mcpserver/` (tool table, one `tool_<name>.go` per tool); `api-go/cmd/xmustard-mcp/` (stdio transport, evidence resources: pages and search) | Nine tools; closed schemas with bounds; version negotiation (2025-06-18, 2024-11-05); `tools/list` limited to the caller's usable tools (`GET /api/auth/whoami`) and held under tested byte caps per schema profile, protocol version and role (`testdata/tools_list_budget.json`); advanced arguments accepted but listed only with `XMUSTARD_MCP_SCHEMA=full`, documented at `xmustard://docs/tools`; optional `workspace_id` resolution; HTTP proxy; bounded framing |
+| MCP protocol and tool schemas | `api-go/internal/mcpserver/` (tool table, one `tool_<name>.go` per tool); `api-go/internal/mcpserver/streamable.go` + `api-go/cmd/xmustard-api/mcp_routes.go` (Streamable HTTP at `/mcp`: sessions owned by the opening principal, tool calls re-entering the API as the caller, workspace binding, `mode=readonly`, client profiles, per-tool usage in `/api/health`); `rust-core/src/bin/xmustard-relay.rs` (stdio relay to `/mcp`); `api-go/internal/mcpserver/evidence.go` (evidence delivery and resources: pages and search, per connection); `api-go/cmd/xmustard-mcp/` (deprecated stdio transport) | Nine tools; closed schemas with bounds; version negotiation (2025-06-18, 2024-11-05); `tools/list` limited to the caller's usable tools (`GET /api/auth/whoami`) and held under tested byte caps per schema profile, protocol version and role (`testdata/tools_list_budget.json`); advanced arguments accepted but listed only with `XMUSTARD_MCP_SCHEMA=full`, documented at `xmustard://docs/tools`; optional `workspace_id` resolution; HTTP proxy; bounded framing |
 | HTTP, authentication, request limits | `api-go/cmd/xmustard-api/` | Go request routing and policy; route gate table (profile, role, read-only) and exposure middleware ([SECURITY](SECURITY.md)) |
 | Scoped evidence delivery | `api-go/internal/evidence/`, API/MCP evidence routes | Admission, stable opaque scoped handles, byte-safe original pages and search, projection and expiry. The nine tools use `xm-reduce/1`; any tool's output captured through `POST .../evidence/capture` (raw or a Claude, Codex, Cursor, Pi or OpenCode hook body, stream-decoded) is reduced by a versioned tool-family reducer (`registry.go`) and shaped and validated per client (`shapes.go`). A capture may pass a lower-only `target` (1 KiB to 1 MiB, `ObservationInput.Target`; 400 `invalid_target` otherwise) so a client can retain a small output behind a handle before masking or compacting it; each retained original counts at least `MinRetainedCharge` (16 KiB) against the workspace quota, which bounds the number of originals and their metadata. Capture is refused (503 `redaction_unavailable`) until a streaming secret redactor is wired, because originals are retained and searchable; enforced byte admission is not an RSS ceiling |
 | Pi client adapter | `integrations/pi/` | Pinned extension uses the shared Go evidence path; nine existing tools plus `xmustard_expand` (pages or search) only when a handle is issued |
 | Local operator commands | `api-go/cmd/xmustard-ops/` | Calls stores directly; local filesystem authority, not HTTP-token isolation |
-| Memory proposals, votes, recall and drift | `api-go/internal/workspaceops/context_governance.go` | Content, trust state, path hashes, ranking and conflict reporting |
+| Memory proposals, votes, recall and drift | `api-go/internal/workspaceops/memory_{propose,verify,edit,recall,store}.go` on `api-go/internal/govstore/` | One SQLite WAL database per data dir (`governance.db`) is the source of truth; every transition is one transaction with an append-only event (principal, time, HEAD, digests); edits add revisions, votes bind to the served revision; the trust label has one rule (`govstore.VerificationMode`); a workspace's legacy `context_entries.json` is imported once on first access (a file of 1 MiB or more under the heavy slot) and kept as `.govstore-import.bak`; SQLite's C heap is reported as the `govstore` budget component's usage |
 | Agent grounding and outcome feedback | `grounding.go`, `feedback.go`, `verifier_telemetry.go` in `workspaceops`; `api-go/internal/groundbudget/` | Compose current evidence and persist inspectable feedback; `ground` output budget (`sections`, `max_chars`, per-section caps, degradation ladder, `output_budget` report) |
 | JSON persistence, auth, workspace scope | `workspaceops` store/auth/workspace files | Operational records under the configured data directory |
 | Postgres materialization | `workspaceops/pg*.go`, `backend/sql/` | Optional; JSON remains operational write authority |
@@ -51,7 +56,7 @@ repositories. The default Rust build does not enable `semantic-onnx`.
 | Search, impact and change tracking | `search.rs`, `semantic.rs`, `changetrack.rs`, `hashcache.rs` | Retrieval lanes, graph traversal, baseline and signature differences; stat-keyed file-hash cache with a racy-timestamp guard |
 | Diagnostics and live language servers | `diagnostics.rs`, `lsp.rs`, `lsp_session.rs`; Go LSP adapters | LSP is optional; transient results do not require Postgres |
 | Verification and retained goal runtime | `verification.rs`, `goalruntime.rs`; Go run control | Process execution, evidence and persisted operational state |
-| Resource accounting | `api-go/internal/budget/` | 24 MiB transient-byte pool and helper-child limit: work that does not fit now gets 503/-32000, work that could never fit the pool gets a permanent answer (413, -32600 or a tool error); static component reservations; one heavy slot (bounded wait, owner label) behind an RSS watchdog over the owned tree plus the stdio shims, with no production callers yet, so it governs nothing today; Go memory limit at the daemon's 28 MiB line with a GOGC floor; data-movement counters; the `/api/health` budget block, which needs a bearer token while auth is enforced. Byte admission is still not a complete RSS bound |
+| Resource accounting | `api-go/internal/budget/` | 24 MiB transient-byte pool and helper-child limit: work that does not fit now gets 503/-32000, work that could never fit the pool gets a permanent answer (413, -32600 or a tool error); static component reservations, including the opt-in resident Rust worker (`rustcore/worker_governor.go`) and an open governance store (`govstore/governed.go`); one heavy slot (bounded wait, owner label) behind an RSS watchdog over the owned tree plus the stdio shims, taken by the whole-repository Rust builds (`symbolgraph build`, `changetrack index`, `index build`/`update`; `rustcore/heavy.go`) and by the governance store's legacy imports of 1 MiB or more, and never by captures or queries; reclaim before refusing heavy work and when a sample is over the soft ceiling, which recycles the worker (it is also recycled idle above its lines or while memory is tight); Go memory limit at the daemon's 28 MiB line with a GOGC floor; data-movement counters; the `/api/health` budget block, shown in full only to an operator token (admin, or another non-reader token with no workspace scope) while auth is enforced. Byte admission is still not a complete RSS bound |
 | Shared wire models | Go request/record structs, each Rust module's own `Serialize` output types, `frontend/src/lib/types.ts` | Contract changes need matching consumers |
 | Optional operator UI | `frontend/src/` | Full API consumer; outside the current development focus |
 

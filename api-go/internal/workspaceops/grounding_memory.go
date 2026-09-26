@@ -1,6 +1,11 @@
 package workspaceops
 
-import "sort"
+import (
+	"context"
+	"sort"
+
+	"xmustard/api-go/internal/govstore"
+)
 
 // groundingMemory is the memory section of `ground`: promoted memory whose
 // referenced files drifted, and how promoted memory is trusted.
@@ -46,30 +51,43 @@ const groundStaleWindow = 64
 // memory was checked, the promoted count per verification mode, and the error that
 // prevented the check.
 func boundedStaleMemory(dataDir, workspaceID string, window int) (stale, checked, total int, complete bool, modes map[string]int, err error) {
-	promoted, ok := loadPromotedMetaCached(dataDir, workspaceID)
-	if !ok {
-		if promoted, err = loadPromotedMeta(dataDir, workspaceID); err != nil {
-			return 0, 0, 0, false, nil, err
+	ctx := context.Background()
+	var ranking []govstore.RankEntry
+	var checkedEntries []ContextEntry
+	baselined := 0
+	err = memoryView(ctx, dataDir, workspaceID, func(r govstore.Reader) error {
+		var err error
+		if ranking, err = r.ServedRanking(ctx, workspaceID); err != nil {
+			return err
+		}
+		sort.SliceStable(ranking, func(a, b int) bool { return ranking[a].UpdatedAt > ranking[b].UpdatedAt })
+		var ids []string
+		for _, e := range ranking {
+			if !e.Baselined {
+				continue
+			}
+			if baselined++; len(ids) < window {
+				ids = append(ids, e.ID)
+			}
+		}
+		checkedEntries, err = projectByID(ctx, r, ids)
+		return err
+	})
+	if err != nil {
+		return 0, 0, 0, false, nil, err
+	}
+	modes = newModeCounts()
+	for _, e := range ranking {
+		if e.VerificationMode != "" {
+			modes[e.VerificationMode]++
 		}
 	}
-	_, threshold := contextDefaults(dataDir)
-	modes = labelVerificationModes(promoted, threshold)
-	sort.SliceStable(promoted, func(a, b int) bool { return promoted[a].UpdatedAt > promoted[b].UpdatedAt })
 	root := contextRoot(dataDir, workspaceID)
-	baselined := 0
-	for i := range promoted {
-		if len(promoted[i].PathHashes) == 0 {
-			continue
-		}
-		baselined++
-		if checked >= window {
-			continue
-		}
-		computeStaleness(root, &promoted[i])
-		checked++
-		if promoted[i].Stale {
+	for i := range checkedEntries {
+		computeStaleness(root, &checkedEntries[i])
+		if checkedEntries[i].Stale {
 			stale++
 		}
 	}
-	return stale, checked, len(promoted), checked == baselined, modes, nil
+	return stale, len(checkedEntries), len(ranking), len(checkedEntries) == baselined, modes, nil
 }

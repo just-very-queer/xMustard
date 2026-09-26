@@ -1,20 +1,25 @@
 package workspaceops
 
 import (
+	"context"
+	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	"xmustard/api-go/internal/budget"
+	"xmustard/api-go/internal/govstore"
 )
 
-// XM-PRO-010 build: the per-id content store bounds recall's PARSE time, not just its
-// allocation. Recall ranks on the content-free meta cache and reads the returned
-// window's content from per-id hash-named files — never parsing the source's content
-// bytes — with a transparent fallback to the source so the cache can't corrupt memory.
+// WS-12: governed memory lives in the govstore database. Recall ranks on content-free
+// metadata and reads the returned window's content from the served revisions, bound
+// to the digest it was ranked with.
 
-// Recall reads the returned window's content from the per-id content store, NOT from
-// the source: with a fresh meta cache + intact content file but a tampered source, the
-// real content is still returned.
-func TestRecallReadsFromPerIdContentStoreNotSource(t *testing.T) {
+// Recall returns the served revision's content, and the derived binding fields never
+// leak to callers. Nothing writes the legacy JSON files any more.
+func TestRecallServesContentFromStoreRevision(t *testing.T) {
 	dir := t.TempDir()
 	ws := "wsContentStore"
 	disable := false
@@ -29,50 +34,29 @@ func TestRecallReadsFromPerIdContentStoreNotSource(t *testing.T) {
 	if !entry.Promoted {
 		t.Fatalf("single-agent mode should promote immediately")
 	}
-
-	// the content file exists, named by the content hash.
-	cf := contextContentFilePath(dir, ws, entry.ID, hashContent(entry.Content))
-	if _, err := os.Stat(cf); err != nil {
-		t.Fatalf("expected per-id content file at %s: %v", cf, err)
-	}
-
-	// poison the SOURCE's content, then refresh the meta cache so it is fresher than
-	// the source (mtime guard) while still pointing at the REAL content's hash file.
-	src, err := loadContextEntries(dir, ws)
-	if err != nil {
-		t.Fatal(err)
-	}
-	real := make([]ContextEntry, len(src))
-	copy(real, src)
-	for i := range src {
-		src[i].Content = "WRONG_FROM_SOURCE"
-	}
-	if err := writeJSON(contextEntriesPath(dir, ws), src); err != nil {
-		t.Fatal(err)
-	}
-	writeContextMetaCache(dir, ws, real) // cache now fresher than source, hash → REAL file
-
 	res, err := RecallContext(dir, ws, "spend ceiling MARKER_REAL", nil, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
 	got := res["entries"].([]ContextEntry)
-	if len(got) != 1 {
-		t.Fatalf("want 1 entry, got %d", len(got))
+	if len(got) != 1 || got[0].Content != "REAL spend ceiling MARKER_REAL" {
+		t.Fatalf("recall must serve the promoted revision's content, got %+v", got)
 	}
-	if got[0].Content != "REAL spend ceiling MARKER_REAL" {
-		t.Fatalf("recall must serve content from the per-id store, got %q", got[0].Content)
+	if got[0].ContentHash != "" || got[0].ContentDigest != "" {
+		t.Fatalf("derived binding fields must not leak to callers: %+v", got[0])
 	}
-	if got[0].ContentHash != "" {
-		t.Fatalf("the derived ContentHash transport field must not leak to callers, got %q", got[0].ContentHash)
+	for _, name := range []string{"context_entries.json", "context_meta.json", "context_content"} {
+		if _, err := os.Stat(filepath.Join(dir, "workspaces", ws, name)); !os.IsNotExist(err) {
+			t.Fatalf("%s must no longer be written (stat err %v)", name, err)
+		}
 	}
 }
 
-// Updating an entry's content writes a new hash-named file and prunes the prior one,
-// so the store never accumulates stale-content files and recall returns the new text.
-func TestContentStorePrunesStaleHashOnUpdate(t *testing.T) {
+// An edit serves a new revision; the previous version stays in the history, and the
+// edit event binds the old and new digests (PAR-PROV-01).
+func TestEditKeepsPriorRevisionInHistory(t *testing.T) {
 	dir := t.TempDir()
-	ws := "wsContentPrune"
+	ws := "wsContentHistory"
 	disable := false
 	writeTestSettings(t, dir, appSettings{RequireMultiAgentVerification: &disable})
 
@@ -82,106 +66,168 @@ func TestContentStorePrunesStaleHashOnUpdate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	oldFile := contextContentFilePath(dir, ws, entry.ID, hashContent("v1 ORIGINAL_TOKEN"))
-	if _, err := os.Stat(oldFile); err != nil {
-		t.Fatalf("v1 content file should exist: %v", err)
-	}
-
 	updated, err := UpdateContextContent(dir, ws, entry.ID, "v2 UPDATED_TOKEN", ContextActor{Admin: true})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if updated.Content != "v2 UPDATED_TOKEN" {
-		t.Fatalf("update should return the new content, got %q", updated.Content)
+	if updated.Content != "v2 UPDATED_TOKEN" || updated.Promoted {
+		t.Fatalf("update should return the new, unverified content, got %+v", updated)
 	}
-	if _, err := os.Stat(oldFile); !os.IsNotExist(err) {
-		t.Fatalf("stale v1 content file must be pruned, stat err = %v", err)
+	all, err := ListContextEntries(dir, ws, "all")
+	if err != nil || len(all) != 1 || all[0].Content != "v2 UPDATED_TOKEN" {
+		t.Fatalf("list must serve the new revision: %+v %v", all, err)
 	}
-	newFile := contextContentFilePath(dir, ws, entry.ID, hashContent("v2 UPDATED_TOKEN"))
-	if _, err := os.Stat(newFile); err != nil {
-		t.Fatalf("v2 content file should exist: %v", err)
-	}
-	// the entry's directory holds exactly one (current) content file.
-	ents, err := os.ReadDir(contextContentEntryDir(dir, ws, entry.ID))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(ents) != 1 {
-		t.Fatalf("expected exactly one content file after update, got %d", len(ents))
-	}
-}
-
-// When a content file is missing (legacy entries, or a failed cache write leaving the
-// new-hash file absent), recall falls back to a streaming source read — correctness is
-// never sacrificed for the optimization.
-func TestRecallFallsBackToSourceWhenContentFileMissing(t *testing.T) {
-	dir := t.TempDir()
-	ws := "wsContentFallback"
-	disable := false
-	writeTestSettings(t, dir, appSettings{RequireMultiAgentVerification: &disable})
-
-	entry, err := ProposeContext(dir, ws, ProposeContextRequest{
-		Title: "fact", Content: "FALLBACK_MARKER lives in the source", Source: "solo",
+	ctx := context.Background()
+	err = memoryView(ctx, dir, ws, func(r govstore.Reader) error {
+		revs, err := r.ListRevisions(ctx, entry.ID, govstore.RevisionFilter{WithContent: true})
+		if err != nil {
+			return err
+		}
+		if len(revs) != 2 || revs[1].Content != "v1 ORIGINAL_TOKEN" || revs[0].Content != "v2 UPDATED_TOKEN" {
+			return fmt.Errorf("both versions must stay retrievable, got %+v", revs)
+		}
+		evs, err := r.ListEvents(ctx, govstore.EventFilter{EntryID: entry.ID, Types: []string{govstore.EventEdit}})
+		if err != nil {
+			return err
+		}
+		if len(evs) != 1 || evs[0].OldDigest != contentDigest("v1 ORIGINAL_TOKEN") ||
+			evs[0].NewDigest != contentDigest("v2 UPDATED_TOKEN") || evs[0].Principal != adminEditor {
+			return fmt.Errorf("edit event must bind principal and both digests, got %+v", evs)
+		}
+		return nil
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	// wipe the entire content store; the meta cache + source remain.
-	if err := os.RemoveAll(contextContentDir(dir, ws)); err != nil {
-		t.Fatal(err)
+}
+
+// Every governance transition appends an event carrying the principal, the time, the
+// workspace HEAD and the content digest.
+func TestGovernanceTransitionsAppendEventsWithHead(t *testing.T) {
+	dir := t.TempDir()
+	ws := "wsEvents"
+	root := t.TempDir()
+	writeSnapshotWithRoot(t, dir, ws, root)
+	const head = "0123456789abcdef0123456789abcdef01234567"
+	for name, body := range map[string]string{".git/HEAD": "ref: refs/heads/main\n", ".git/refs/heads/main": head + "\n"} {
+		if err := os.MkdirAll(filepath.Dir(filepath.Join(root, name)), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(root, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
 	}
-	res, err := RecallContext(dir, ws, "FALLBACK_MARKER source", nil, 1)
+	quorumSettings(t, dir)
+	entry, err := ProposeContext(dir, ws, ProposeContextRequest{Content: "fact", Source: "alice"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := res["entries"].([]ContextEntry)
-	if len(got) != 1 || got[0].ID != entry.ID {
-		t.Fatalf("want the proposed entry, got %+v", got)
+	for _, agent := range []string{"bob", "carol"} {
+		if _, err := VerifyContext(dir, ws, entry.ID, agent, true, ""); err != nil {
+			t.Fatal(err)
+		}
 	}
-	if got[0].Content != "FALLBACK_MARKER lives in the source" {
-		t.Fatalf("recall must fall back to source content when the file is gone, got %q", got[0].Content)
+	ctx := context.Background()
+	var events []govstore.Event
+	if err := memoryView(ctx, dir, ws, func(r govstore.Reader) error {
+		events, err = r.ListEvents(ctx, govstore.EventFilter{EntryID: entry.ID})
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]bool{}
+	for _, ev := range events {
+		seen[ev.Type] = true
+		if ev.Principal == "" || ev.At == "" || ev.HeadSHA != head {
+			t.Fatalf("event %s lacks principal, time or HEAD: %+v", ev.Type, ev)
+		}
+	}
+	for _, want := range []string{govstore.EventPropose, govstore.EventVote, govstore.EventPromote} {
+		if !seen[want] {
+			t.Fatalf("missing %s event in %+v", want, events)
+		}
 	}
 }
 
-// A source write that bypasses the cache (so the meta cache is older than the source)
-// must NOT be trusted: recall's mtime guard falls back to the source, seeing the new
-// entry the stale cache never knew about.
-func TestRecallMetaCacheStaleGuardFallsBackToSource(t *testing.T) {
+// The legacy import runs once per file and is idempotent: a context_entries.json that
+// reappears (an older build ran, or a backup was restored) imports as unchanged, and
+// each import keeps its own backup.
+func TestLegacyImportIsIdempotentAndKeepsBackups(t *testing.T) {
 	dir := t.TempDir()
-	ws := "wsMetaStale"
-	writeSnapshotWithRoot(t, dir, ws, t.TempDir())
+	ws := "wsReimport"
+	legacy := []byte(`[{"id":"ctx_old","workspace_id":"wsReimport","title":"t","content":"legacy body","source":"alice",
+		"permission":"readonly","status":"pending","promoted":false,"required_verifications":2,"verifications":[],
+		"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}]`)
+	src := legacyContextEntriesPath(dir, ws)
+	for round := 1; round <= 2; round++ {
+		if err := os.MkdirAll(filepath.Dir(src), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(src, legacy, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		all, err := ListContextEntries(dir, ws, "all")
+		if err != nil || len(all) != 1 || all[0].Content != "legacy body" {
+			t.Fatalf("round %d: %+v %v", round, all, err)
+		}
+		if _, err := os.Stat(src); !os.IsNotExist(err) {
+			t.Fatalf("round %d: the imported file must be moved aside", round)
+		}
+	}
+	backups, _ := filepath.Glob(src + ".govstore-import*.bak")
+	if len(backups) != 2 {
+		t.Fatalf("each import keeps a backup, got %v", backups)
+	}
+}
 
-	a := ContextEntry{
-		ID: "entryA", Title: "a", Content: "alpha CACHED_MARKER",
-		Status: "verified", Promoted: true,
-		CreatedAt: "2026-06-01T00:00:00.000000001Z", UpdatedAt: "2026-06-01T00:00:00.000000001Z",
-		SearchTokens: memoryTokenList("a alpha CACHED_MARKER"),
+// The legacy import sizes its file and govstore owns the heavy slot: a small file
+// imports inline even while other heavy work holds the slot, and a file of
+// legacyImportHeavyFrom or more runs in the slot exactly once (a second acquisition
+// around govstore's own would wait on itself and be refused).
+func TestLegacyImportSizesItsHeavySlot(t *testing.T) {
+	prev := budget.Gov
+	budget.Gov = budget.NewProcessGovernor(budget.GovernorConfig{
+		HeavyWait:    100 * time.Millisecond,
+		FreeOSMemory: func() {},
+		Sampler: func() (budget.TreeSample, error) {
+			return budget.TreeSample{At: time.Now(), Supported: true, Basis: "test", Processes: 1, RSSBytes: 10 << 20, SelfRSSBytes: 10 << 20}, nil
+		},
+	})
+	t.Cleanup(func() { budget.Gov = prev })
+	entry := func(id, body string) string {
+		return fmt.Sprintf(`{"id":%q,"workspace_id":"wsSized","title":"t","content":%q,"source":"alice",`+
+			`"permission":"readonly","status":"pending","promoted":false,"required_verifications":2,"verifications":[],`+
+			`"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}`, id, body)
 	}
-	if err := saveContextEntries(dir, ws, []ContextEntry{a}); err != nil { // writes fresh cache (knows only A)
-		t.Fatal(err)
+	write := func(dir, body string) {
+		src := legacyContextEntriesPath(dir, "wsSized")
+		if err := os.MkdirAll(filepath.Dir(src), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(src, []byte("["+body+"]"), 0o644); err != nil {
+			t.Fatal(err)
+		}
 	}
-	// append B to the SOURCE only, bumping the source past the cache's mtime.
-	b := ContextEntry{
-		ID: "entryB", Title: "b", Content: "beta UNCACHED_MARKER",
-		Status: "verified", Promoted: true,
-		CreatedAt: "2026-06-01T00:00:00.000000002Z", UpdatedAt: "2026-06-01T00:00:00.000000002Z",
-		SearchTokens: memoryTokenList("b beta UNCACHED_MARKER"),
-	}
-	if err := writeJSON(contextEntriesPath(dir, ws), []ContextEntry{a, b}); err != nil {
-		t.Fatal(err)
-	}
-	// force the source strictly newer than the cache so the guard is exercised
-	// deterministically regardless of filesystem mtime resolution.
-	future := time.Now().Add(time.Hour)
-	if err := os.Chtimes(contextEntriesPath(dir, ws), future, future); err != nil {
-		t.Fatal(err)
-	}
-	res, err := RecallContext(dir, ws, "UNCACHED_MARKER", nil, 1)
+
+	small := t.TempDir()
+	write(small, entry("ctx_small", "small body"))
+	release, err := budget.AcquireHeavy(context.Background(), "test_holder", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := res["entries"].([]ContextEntry)
-	if len(got) != 1 || got[0].ID != "entryB" {
-		t.Fatalf("stale meta cache must be bypassed in favor of the source, got %+v", got)
+	all, err := ListContextEntries(small, "wsSized", "all")
+	release()
+	if err != nil || len(all) != 1 {
+		t.Fatalf("a small import behind a busy slot must run inline: %+v %v", all, err)
+	}
+
+	large := t.TempDir()
+	write(large, entry("ctx_large", strings.Repeat("x", legacyImportHeavyFrom)))
+	all, err = ListContextEntries(large, "wsSized", "all")
+	if err != nil || len(all) != 1 {
+		t.Fatalf("a large import must run in the heavy slot once: %+v %v", all, err)
+	}
+	if st := budget.Gov.Snapshot().HeavySlot; st.Busy {
+		t.Fatalf("the heavy slot must be released after the import: %+v", st)
 	}
 }

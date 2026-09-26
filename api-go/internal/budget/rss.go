@@ -240,3 +240,15 @@ func parsePIDList(data []byte) []int {
 	}
 	return out
 }
+
+// ProcessMemory measures one process on the tree's two metrics: ps-RSS and the second
+// one (phys_footprint on macOS, PSS on Linux). ok is false for a process that is gone
+// or unreadable, and on platforms without a sampler. A resident component that lives in
+// a child process (the Rust worker) reports its use with it.
+func ProcessMemory(pid int) (rss, footprint int64, ok bool) {
+	if pid <= 0 {
+		return 0, 0, false
+	}
+	m, ok := measureProcess(pid)
+	return m.rss, m.footprint, ok
+}

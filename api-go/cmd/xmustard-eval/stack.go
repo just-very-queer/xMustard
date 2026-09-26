@@ -392,8 +392,9 @@ func (s *realStack) agentPhase(ctx context.Context) ([]int, error) {
 }
 
 func (s *realStack) finish(ctx context.Context) (map[string]any, *int) {
+	// The budget counters are an operator view: an unscoped admin token sees them.
 	var health map[string]any
-	if code, b, err := s.call(ctx, "GET", "/api/health", "", nil); err == nil && code == http.StatusOK {
+	if code, b, err := s.call(ctx, "GET", "/api/health", principalAdmin, nil); err == nil && code == http.StatusOK {
 		_ = json.Unmarshal(b, &health)
 	}
 	// Promotion errors: with one agent principal and a two-approval quorum, nothing

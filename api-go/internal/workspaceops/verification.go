@@ -413,12 +413,25 @@ func writeJSON(path string, payload any) error {
 		_ = os.Remove(tempPath)
 		return err
 	}
+	// fsync before the rename: otherwise a crash can leave the new name pointing at
+	// an empty or partial file.
+	if err := syncFile(temp); err != nil {
+		_ = temp.Close()
+		_ = os.Remove(tempPath)
+		return err
+	}
 	if err := temp.Close(); err != nil {
 		_ = os.Remove(tempPath)
 		return err
 	}
-	return os.Rename(tempPath, path)
+	if err := os.Rename(tempPath, path); err != nil {
+		return err
+	}
+	return syncDir(filepath.Dir(path))
 }
+
+// syncFile flushes a written store file to stable storage; tests count its calls.
+var syncFile = (*os.File).Sync
 
 func saveCoverageResult(dataDir string, result *rustcore.CoverageResult) error {
 	path := filepath.Join(dataDir, "coverage", result.ResultID+".json")

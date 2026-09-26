@@ -55,8 +55,8 @@ var (
 	schemaProfile, schemaErr = mcpserver.ParseSchemaProfile(os.Getenv("XMUSTARD_MCP_SCHEMA"))
 	session                  = mcpserver.New(mcpserver.Options{
 		Backend:      backend,
-		Delivery:     evidenceDelivery{},
-		Resources:    evidenceResources{},
+		Delivery:     evidence,
+		Resources:    evidence,
 		Cwd:          workingDir(),
 		AutoRegister: strings.TrimSpace(os.Getenv("XMUSTARD_MCP_AUTO_REGISTER")) != "0",
 		HomeDir:      homeDir(),

@@ -91,6 +91,8 @@ type AnchorHit struct {
 // AnchorReader reads anchors.
 type AnchorReader interface {
 	ListAnchors(ctx context.Context, entryID string) ([]Anchor, error)
+	// AnchorsFor returns ListAnchors for many entries at once, keyed by entry id.
+	AnchorsFor(ctx context.Context, ids []string) (map[string][]Anchor, error)
 	EntriesByAnchor(ctx context.Context, q AnchorQuery) ([]AnchorHit, error)
 }
 
@@ -176,16 +178,55 @@ func (r *reader) ListAnchors(ctx context.Context, entryID string) ([]Anchor, err
 	defer rows.Close()
 	var out []Anchor
 	for rows.Next() {
-		var a Anchor
-		var declared int
-		if err := rows.Scan(&a.EntryID, &a.Ordinal, &a.Kind, &a.Value, &declared, &a.SymbolUID, &a.BaselineState,
-			&a.BaselineHash, &a.BaselineKind, &a.BaselineCommit, &a.BaselineAt, &a.StaleSince, &a.StaleCommit); err != nil {
+		a, err := scanAnchor(rows)
+		if err != nil {
 			return nil, err
 		}
-		a.Declared = declared == 1
 		out = append(out, a)
 	}
 	return out, rows.Err()
+}
+
+func scanAnchor(s scanner) (Anchor, error) {
+	var a Anchor
+	var declared int
+	err := s.Scan(&a.EntryID, &a.Ordinal, &a.Kind, &a.Value, &declared, &a.SymbolUID, &a.BaselineState,
+		&a.BaselineHash, &a.BaselineKind, &a.BaselineCommit, &a.BaselineAt, &a.StaleSince, &a.StaleCommit)
+	a.Declared = declared == 1
+	return a, err
+}
+
+// AnchorsFor reads the anchors of many entries in bounded batches.
+func (r *reader) AnchorsFor(ctx context.Context, ids []string) (map[string][]Anchor, error) {
+	out := make(map[string][]Anchor, len(ids))
+	for start := 0; start < len(ids); start += maxInArgs {
+		chunk := ids[start:min(start+maxInArgs, len(ids))]
+		args := make([]any, len(chunk))
+		for i, id := range chunk {
+			args[i] = id
+		}
+		rows, err := r.query(ctx, "SELECT "+anchorCols+" FROM anchors WHERE entry_id IN ("+placeholders(len(chunk))+
+			") ORDER BY entry_id, ordinal, pk", args...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			a, err := scanAnchor(rows)
+			if err != nil {
+				rows.Close()
+				return nil, err
+			}
+			out[a.EntryID] = append(out[a.EntryID], a)
+		}
+		err = rows.Err()
+		if cerr := rows.Close(); err == nil {
+			err = cerr
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
 }
 
 // EntriesByAnchor finds the memories attached to any of q.Values.

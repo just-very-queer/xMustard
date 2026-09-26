@@ -30,7 +30,7 @@
 //
 // Governance policy (thresholds, open mode, roles) stays with the caller. The store
 // provides transactional primitives: a caller reads, decides and writes inside one
-// Update. Nothing consumes the package yet; WS-12 cuts governance over to it.
+// Update. The workspaceops governance kernel (WS-12) is its consumer.
 package govstore
 
 import (
@@ -50,6 +50,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"modernc.org/libc"
 	"modernc.org/sqlite"
 	sqlite3 "modernc.org/sqlite/lib"
 )
@@ -191,6 +192,7 @@ type Reader interface {
 	FeedbackReader
 	EvidenceReader
 	SearchReader
+	RankingReader
 }
 
 // Tx is a write transaction: every read plus every write. Methods are valid only
@@ -346,6 +348,7 @@ func Open(ctx context.Context, path string, opts Options) (*SQLStore, error) {
 	readers.SetConnMaxIdleTime(opts.ReaderIdleTimeout)
 	s.readers = readers
 	s.reader = reader{q: readers, borrow: s.borrowForRead, now: opts.Now}
+	openStores.Add(1)
 	return s, nil
 }
 
@@ -500,6 +503,10 @@ func (s *SQLStore) QuickCheck(ctx context.Context) error {
 	return quickCheck(ctx, s.writer)
 }
 
+// HeapInUse reports the bytes SQLite holds on its C heap in this process (every open
+// store shares it), for the budget governor's component accounting.
+func HeapInUse() int64 { return int64(libc.MemStat().Bytes) }
+
 // Path returns the database file path.
 func (s *SQLStore) Path() string { return s.path }
 
@@ -510,6 +517,7 @@ func (s *SQLStore) Close() error {
 	if s.closed.Swap(true) {
 		return nil
 	}
+	openStores.Add(-1)
 	err := s.readers.Close()
 	if werr := s.writer.Close(); err == nil {
 		err = werr
