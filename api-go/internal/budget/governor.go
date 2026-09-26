@@ -237,6 +237,19 @@ func heavyWaitForbidden(ctx context.Context) bool {
 	return v
 }
 
+// HeavyBusy reports whether heavy work holds the slot or waits for it, on the
+// process-wide governor.
+func HeavyBusy() bool { return Gov.HeavyBusy() }
+
+// HeavyBusy reports whether heavy work holds the slot or waits for it. Optional heavy
+// work a request would start (the code index refresh) skips itself while it does, so
+// a read never queues behind a build and never touches the slot of a capture path.
+func (g *Governor) HeavyBusy() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.holder != nil || len(g.queue) > 0
+}
+
 // AcquireHeavy takes the heavy slot on the process-wide governor.
 func AcquireHeavy(ctx context.Context, owner string, declaredBytes int64) (func(), error) {
 	return Gov.AcquireHeavy(ctx, owner, declaredBytes)

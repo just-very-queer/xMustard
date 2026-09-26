@@ -902,7 +902,8 @@ func gitFixture(t *testing.T) string {
 }
 
 // normalizeCoreJSON drops fields that differ between two runs of one query: clock
-// readings, per-call ids and per-call cache accounting.
+// readings (the freshness observation's age too), per-call ids and per-call cache
+// accounting.
 func normalizeCoreJSON(t *testing.T, raw []byte) any {
 	t.Helper()
 	var v any
@@ -914,7 +915,7 @@ func normalizeCoreJSON(t *testing.T, raw []byte) any {
 		switch x := v.(type) {
 		case map[string]any:
 			for k, child := range x {
-				if strings.HasSuffix(k, "_at") || k == "elapsed_ms" || k == "work" || k == "result_id" {
+				if strings.HasSuffix(k, "_at") || k == "elapsed_ms" || k == "identity_age_ms" || k == "work" || k == "result_id" {
 					delete(x, k)
 					continue
 				}

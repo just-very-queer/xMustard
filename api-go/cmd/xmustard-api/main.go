@@ -2676,12 +2676,22 @@ func registerRoutes(mux routeRegistrar) {
 			return
 		}
 		// enrich with the file's community cluster (its functional neighbourhood),
-		// so explain answers "where does this file sit in the repo" — best-effort.
+		// so explain answers "where does this file sit in the repo", and with the
+		// freshness and coverage of the code graph behind it — best-effort.
 		path := r.URL.Query().Get("path")
-		if cluster, cerr := workspaceops.PathCluster(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), workspaceID, path); cerr == nil && cluster != nil {
-			writeJSON(w, http.StatusOK, map[string]any{"explanation": result, "cluster": cluster})
+		graph, gerr := workspaceops.PathGraphCtx(r.Context(), envDefault("XMUSTARD_DATA_DIR", "../backend/data"), workspaceID, path)
+		if gerr != nil {
+			writeJSON(w, http.StatusOK, result)
 			return
 		}
+		if graph.Cluster != nil {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"explanation": result, "cluster": graph.Cluster,
+				"freshness": graph.Freshness, "coverage": graph.Coverage,
+			})
+			return
+		}
+		result.Freshness, result.Coverage = graph.Freshness, graph.Coverage
 		writeJSON(w, http.StatusOK, result)
 	})
 	mux.HandleFunc("GET /api/workspaces/{workspace_id}/clusters", func(w http.ResponseWriter, r *http.Request) {
