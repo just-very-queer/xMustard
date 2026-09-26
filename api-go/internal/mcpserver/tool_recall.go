@@ -13,6 +13,11 @@ var recallTool = &Tool{
 		{Name: "paths", Type: typeString, Desc: "comma-separated repo-relative files to focus on"},
 		{Name: "limit", Type: typeInteger, Min: 1, Max: maxRecallLimit, Desc: "max memories (default 8)"},
 	},
+	// Fetch by id (WS-19A): any lifecycle state, listed only in the full schema profile.
+	Advanced: []Arg{
+		{Name: "entry_id", Type: typeString, Desc: "fetch one entry, any state"},
+		{Name: "history", Type: typeBoolean, Desc: "with entry_id: revisions, events (verifier)"},
+	},
 	// Claude Code drops a tool argument named exactly "query", so the advertised name
 	// is q; "query" stays accepted for clients that already send it.
 	Aliases:     map[string]string{"query": "q"},
@@ -23,6 +28,7 @@ var recallTool = &Tool{
 	},
 	MaxResultChars: boundedResultChars,
 	Build: func(a map[string]string) (string, string, string) {
-		return "GET", query(wsPath(a, "/context/active"), "query", a["q"], "paths", a["paths"], "limit", a["limit"]), ""
+		return "GET", query(wsPath(a, "/context/active"), "query", a["q"], "paths", a["paths"], "limit", a["limit"],
+			"entry_id", a["entry_id"], "history", a["history"]), ""
 	},
 }

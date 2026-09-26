@@ -1,5 +1,5 @@
 {
-  "about": "Byte caps on the tools/list result (compact JSON, as the stdio shim writes it) per schema profile, protocol version and role profile. Measured 2026-09-25 (WS-54). Lower a cap when the list shrinks; never raise one to fit an addition: advertise less (declare the argument Advanced, documented at xmustard://docs/tools) or trim a description. cmd/xmustard-api checks role_profiles against the route gates.",
+  "about": "Byte caps on the tools/list result (compact JSON, as the stdio shim writes it) per schema profile, protocol version and role profile. Measured 2026-09-25 (WS-54); remember content made optional and the WS-19A lifecycle arguments added as Advanced 2026-09-26 (full caps grew by exactly their cost). Lower a cap when the list shrinks; never raise one to fit an addition: advertise less (declare the argument Advanced, documented at xmustard://docs/tools) or trim a description. cmd/xmustard-api checks role_profiles against the route gates.",
   "role_profiles": {
     "reader": ["ground", "recall", "search", "explain", "impact", "diagnostics", "why_failed"],
     "proposer": ["ground", "recall", "remember", "search", "explain", "impact", "diagnostics", "why_failed"],
@@ -8,12 +8,12 @@
   },
   "caps": {
     "lean": {
-      "2024-11-05": {"reader": 3999, "proposer": 4715, "verifier": 4630, "agent": 5346},
-      "2025-06-18": {"reader": 6646, "proposer": 7768, "verifier": 7680, "agent": 8802}
+      "2024-11-05": {"reader": 3999, "proposer": 4692, "verifier": 4630, "agent": 5323},
+      "2025-06-18": {"reader": 6646, "proposer": 7745, "verifier": 7680, "agent": 8779}
     },
     "full": {
-      "2024-11-05": {"reader": 4230, "proposer": 4946, "verifier": 4861, "agent": 5577},
-      "2025-06-18": {"reader": 6877, "proposer": 7999, "verifier": 7911, "agent": 9033}
+      "2024-11-05": {"reader": 4391, "proposer": 5853, "verifier": 5225, "agent": 6687},
+      "2025-06-18": {"reader": 7038, "proposer": 8906, "verifier": 8275, "agent": 10143}
     }
   }
 }

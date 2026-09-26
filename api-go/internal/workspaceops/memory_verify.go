@@ -14,13 +14,49 @@ func VerifyContext(dataDir, workspaceID, entryID, agent string, approve bool, no
 	return VerifyContextAs(dataDir, workspaceID, entryID, ContextActor{ID: agent}, approve, note)
 }
 
-// VerifyContextAs records voter's verdict on an entry's served revision and re-promotes
-// if the approval threshold is now met. Distinct agents only — a principal's new verdict
-// replaces its earlier one, so a single agent cannot satisfy a multi-agent gate by
-// voting twice. The vote re-gates an entry the open-mode identity wrote for the kind of
-// write it is (regatedRequirement). The whole read-vote-reconcile runs in one store
-// transaction, so concurrent votes from any process are never lost.
+// VerifyContextAs records voter's approve or reject on an entry's served revision. See
+// VerifyContextOutcome.
 func VerifyContextAs(dataDir, workspaceID, entryID string, voter ContextActor, approve bool, note string) (*ContextEntry, error) {
+	outcome := OutcomeReject
+	if approve {
+		outcome = OutcomeApprove
+	}
+	return VerifyContextOutcome(dataDir, workspaceID, entryID, voter, VerifyRequest{Outcome: outcome, Note: note})
+}
+
+// Verify outcomes (WS-19A). WS-19B adds duplicate_of and the per-memory feedback
+// outcomes with evidence-bound votes.
+const (
+	OutcomeApprove = "approve"
+	OutcomeReject  = "reject"
+	OutcomeRetract = "retract"
+)
+
+// verifyVerdicts maps a verify outcome to the verdict it stores.
+var verifyVerdicts = map[string]string{
+	OutcomeApprove: govstore.VerdictApprove,
+	OutcomeReject:  govstore.VerdictReject,
+	OutcomeRetract: govstore.VerdictRetract,
+}
+
+// VerifyRequest is one verdict. Revision 0 votes on the served revision; the number of
+// a pending revision votes on that edit. retract applies to the served revision only.
+type VerifyRequest struct {
+	Outcome  string
+	Revision int64
+	Note     string
+}
+
+// VerifyContextOutcome records voter's verdict and settles what it decides. Distinct
+// principals only: a principal's new verdict on a revision replaces its earlier one, so
+// one agent cannot satisfy a multi-agent gate by voting twice. A vote on the served
+// revision re-promotes or demotes the entry; a vote on a pending revision accepts or
+// rejects that edit once its quorum is reached, and the result carries the diff it voted
+// on; a retract takes the entry out of recall once enough distinct principals retract
+// it. The vote re-gates an entry the open-mode identity wrote for the kind of write it
+// is (regatedRequirement). The whole read-vote-reconcile runs in one store transaction,
+// so concurrent votes from any process are never lost.
+func VerifyContextOutcome(dataDir, workspaceID, entryID string, voter ContextActor, req VerifyRequest) (*ContextEntry, error) {
 	if err := validateSafeID("workspace", workspaceID); err != nil {
 		return nil, err
 	}
@@ -31,28 +67,25 @@ func VerifyContextAs(dataDir, workspaceID, entryID string, voter ContextActor, a
 	if agent == "" {
 		return nil, fmt.Errorf("agent is required")
 	}
-	verdict := govstore.VerdictReject
-	if approve {
-		verdict = govstore.VerdictApprove
+	verdict, ok := verifyVerdicts[fallbackString(strings.ToLower(strings.TrimSpace(req.Outcome)), OutcomeApprove)]
+	if !ok {
+		return nil, fmt.Errorf("outcome %q is not approve, reject or retract: %w", req.Outcome, ErrInvalidInput)
 	}
-	requireMulti, threshold := contextDefaults(dataDir)
+	if req.Revision < 0 {
+		return nil, fmt.Errorf("revision must be positive: %w", ErrInvalidInput)
+	}
 	ctx := context.Background()
 	root := contextRoot(dataDir, workspaceID)
 	actor := memoryActor(agent, root)
 	var out ContextEntry
 	var promoted bool
 	err := memoryUpdate(ctx, dataDir, workspaceID, func(tx govstore.Tx) error {
-		_, ce, err := loadEntryTx(ctx, tx, workspaceID, entryID)
+		e, ce, err := loadEntryTx(ctx, tx, workspaceID, entryID)
 		if err != nil {
 			return err
 		}
-		if _, err := tx.RecordVote(ctx, govstore.VoteInput{EntryID: entryID, Verdict: verdict, Note: note}, actor); err != nil {
-			return err
-		}
-		if err := regate(ctx, tx, ce, voter.OpenMode, requireMulti, threshold, actor); err != nil {
-			return err
-		}
-		out, promoted, err = settleEntry(ctx, tx, workspaceID, entryID, threshold, root, actor)
+		out, promoted, err = castVerdict(ctx, tx, dataDir, workspaceID, root, e, ce, voter, actor,
+			govstore.VoteInput{EntryID: entryID, Revision: req.Revision, Verdict: verdict, Note: req.Note})
 		return err
 	})
 	if err != nil {
@@ -62,6 +95,62 @@ func VerifyContextAs(dataDir, workspaceID, entryID string, voter ContextActor, a
 		recordVerifyFeedback(dataDir, workspaceID, out.ID, out.Paths)
 	}
 	return &out, nil
+}
+
+// castVerdict records one verdict inside tx and settles what it decides (see
+// VerifyContextOutcome). newlyBaselined reports a promotion that captured a baseline.
+func castVerdict(ctx context.Context, tx govstore.Tx, dataDir, workspaceID, root string, e govstore.Entry,
+	ce ContextEntry, voter ContextActor, actor govstore.Actor, in govstore.VoteInput) (ContextEntry, bool, error) {
+	onPending := in.Revision != 0 && in.Revision != e.Revision
+	if onPending && in.Verdict == govstore.VerdictRetract {
+		return ContextEntry{}, false, fmt.Errorf("retract applies to the served revision %d, not revision %d: %w",
+			e.Revision, in.Revision, ErrInvalidInput)
+	}
+	if onPending && in.Revision != e.HeadRevision {
+		return ContextEntry{}, false, &govstore.ConflictError{EntryID: in.EntryID, BaseRevision: in.Revision,
+			CurrentRevision: e.Revision, CurrentDigest: e.ContentDigest, HeadRevision: e.HeadRevision,
+			Reason: "only the served revision or the pending head revision takes votes"}
+	}
+	if _, err := tx.RecordVote(ctx, in, actor); err != nil {
+		return ContextEntry{}, false, err
+	}
+	requireMulti, threshold := contextDefaults(dataDir)
+	if err := regate(ctx, tx, ce, voter.OpenMode, requireMulti, threshold, actor); err != nil {
+		return ContextEntry{}, false, err
+	}
+	if onPending {
+		diff, err := revisionDiff(ctx, tx, in.EntryID, e.Revision, in.Revision)
+		if err != nil {
+			return ContextEntry{}, false, err
+		}
+		out, promoted, err := settleRevision(ctx, tx, workspaceID, in.EntryID, in.Revision, threshold, root, actor)
+		out.Diff = diff
+		return out, promoted, err
+	}
+	out, promoted, err := settleEntry(ctx, tx, workspaceID, in.EntryID, threshold, root, actor)
+	if err != nil || in.Verdict != govstore.VerdictRetract {
+		return out, promoted, err
+	}
+	return retractOnQuorum(ctx, tx, workspaceID, out, in.Note, actor)
+}
+
+// retractOnQuorum retracts an entry once as many distinct principals have retracted its
+// served revision as its gate requires. A retracted entry leaves recall, keeps its
+// history and can be restored by an admin, after which it must be verified again.
+func retractOnQuorum(ctx context.Context, tx govstore.Tx, workspaceID string, ce ContextEntry, reason string,
+	actor govstore.Actor) (ContextEntry, bool, error) {
+	tally, err := tx.Tally(ctx, ce.ID, 0)
+	if err != nil {
+		return ContextEntry{}, false, err
+	}
+	if tally.Retractions < max(ce.RequiredVerifications, 1) {
+		return ce, false, nil
+	}
+	if _, err := tx.Transition(ctx, ce.ID, govstore.TransitionInput{To: govstore.LifecycleRetracted, Reason: reason}, actor); err != nil {
+		return ContextEntry{}, false, err
+	}
+	out, err := entryAfter(ctx, tx, workspaceID, ce.ID)
+	return out, false, err
 }
 
 // settleEntry re-derives an entry's status and promotion from the votes on its served
@@ -94,6 +183,12 @@ func settleEntry(ctx context.Context, tx govstore.Tx, workspaceID, entryID strin
 		return ContextEntry{}, false, err
 	}
 	ce.UpdatedAt = e.UpdatedAt
+	if ce.Promoted {
+		if err := applySupersession(ctx, tx, e, actor); err != nil {
+			return ContextEntry{}, false, err
+		}
+		ce.Supersedes = nil
+	}
 	if ce.Promoted && len(ce.PathHashes) == 0 {
 		// just promoted: snapshot the referenced files so drift-on-recall has a baseline.
 		ce.PathHashes = capturePathHashes(root, ce.Paths)
