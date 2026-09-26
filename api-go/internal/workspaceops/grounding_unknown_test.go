@@ -56,7 +56,7 @@ func TestGroundReportsUndecodableChangesAsUnknown(t *testing.T) {
 func TestGroundReportsMissingChangeFieldsAsUnknown(t *testing.T) {
 	dataDir, ws := seedGroundBenchWorkspace(t)
 	core := filepath.Join(t.TempDir(), "xmustard-core")
-	script := "#!/bin/sh\ncase \"$1 $2\" in\n\"changetrack working-changes\") echo '{\"changed_files\":[]}' ;;\n*) echo '{}' ;;\nesac\n"
+	script := "#!/bin/sh\ncase \"$1 $2\" in\n\"changetrack working-changes\") echo '{\"changed_files\":[]}' ;;\n\"symbolgraph coverage\") echo '{\"languages\":{}}' ;;\n*) echo '{}' ;;\nesac\n"
 	if err := os.WriteFile(core, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}

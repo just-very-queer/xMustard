@@ -36,7 +36,7 @@ func TestGroundingSplitKeepsWireShape(t *testing.T) {
 		}
 	}
 	want := []string{"workspace_id", "drift", "changed_files", "dirty_symbols", "contract_breaks", "broken_contracts",
-		"recent_failed_runs", "blocked_by_dirty_state", "blocked_by_failing_verification", "stale_memory",
+		"coverage", "recent_failed_runs", "blocked_by_dirty_state", "blocked_by_failing_verification", "stale_memory",
 		"stale_memory_checked", "stale_memory_total", "stale_memory_complete", "memory_verification_modes",
 		"summary", "generated_at"}
 	if strings.Join(keys, ",") != strings.Join(want, ",") {
@@ -49,5 +49,8 @@ func TestGroundingSplitKeepsWireShape(t *testing.T) {
 	}
 	if want := "1 changed file(s), 1 dirty symbol(s), 1 contract break(s), 4 failed run(s), 0 stale memory."; g.Summary != want {
 		t.Fatalf("summary = %q, want %q", g.Summary, want)
+	}
+	if string(g.Coverage) == "" || !strings.Contains(string(g.Coverage), `"go":{"supported":1`) {
+		t.Fatalf("coverage = %s", g.Coverage)
 	}
 }

@@ -881,6 +881,15 @@ fn run_symbolgraph_command(mut args: Args) -> CmdResult {
             let ws = need(&mut args, usage)?;
             json(&sg::build_symbol_graph(Path::new(&root), &ws))
         }
+        "coverage" => {
+            // ground's coverage block: the per-language support counts search, explain
+            // and impact report, without the loss list
+            let usage = "xmustard-core symbolgraph coverage <root> <workspace_id>";
+            let root = need(&mut args, usage)?;
+            let ws = need(&mut args, usage)?;
+            let (_, cov) = sg::symbol_graph_with_coverage(Path::new(&root), &ws);
+            json(&serde_json::json!({ "complete": cov.complete, "languages": cov.languages }))
+        }
         "clusters" => {
             let usage = "xmustard-core symbolgraph clusters <root> <workspace_id>";
             let root = need(&mut args, usage)?;
@@ -965,6 +974,7 @@ mod tests {
         ("symbolgraph", &["impact"]),
         ("symbolgraph", &["trace"]),
         ("symbolgraph", &["clusters"]),
+        ("symbolgraph", &["coverage"]),
         ("changetrack", &["fingerprint"]),
         ("changetrack", &["drift"]),
         ("changetrack", &["changed-since"]),

@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+
+	"xmustard/api-go/internal/rustcore"
 )
 
 // groundingIndex is the index section of `ground`: drift against the indexed
@@ -16,6 +18,11 @@ type groundingIndex struct {
 	DirtySymbols    *int            `json:"dirty_symbols"`
 	ContractBreaks  *int            `json:"contract_breaks"`
 	BrokenContracts []string        `json:"broken_contracts,omitempty"`
+	// Coverage is the symbol graph's coverage block, the one search, explain and
+	// impact report: whether it is complete and, per language pack, how many files
+	// were extracted with a grammar (supported), had no grammar in this build
+	// (unsupported) or fell back to the regexes (failed).
+	Coverage json.RawMessage `json:"coverage"`
 }
 
 func (s *groundingIndex) build(ctx context.Context, dataDir, workspaceID string) ([]GroundingUnknown, error) {
@@ -28,6 +35,9 @@ func (s *groundingIndex) build(ctx context.Context, dataDir, workspaceID string)
 		return nil, err
 	}
 	var unknown []GroundingUnknown
+	if u := s.buildCoverage(ctx, dataDir, workspaceID); u != nil {
+		unknown = append(unknown, *u)
+	}
 	if json.Valid(drift) {
 		s.Drift = drift
 	} else {
@@ -75,4 +85,25 @@ func (s *groundingIndex) build(ctx context.Context, dataDir, workspaceID string)
 		unknown = append(unknown, GroundingUnknown{Field: "contract_breaks", Reason: "working-changes result has no contract_breaks"})
 	}
 	return unknown, nil
+}
+
+// buildCoverage fills Coverage; a failure leaves it null and is reported unknown,
+// never as a complete or empty coverage.
+func (s *groundingIndex) buildCoverage(ctx context.Context, dataDir, workspaceID string) *GroundingUnknown {
+	root, _, err := resolveChangeRootCtx(ctx, dataDir, workspaceID)
+	if err != nil {
+		return &GroundingUnknown{Field: "coverage", Reason: "workspace root unavailable: " + err.Error()}
+	}
+	out, err := rustcore.RunSymbolgraph(ctx, "coverage", root, workspaceID)
+	if err != nil {
+		return &GroundingUnknown{Field: "coverage", Reason: "symbol graph coverage failed: " + err.Error()}
+	}
+	var probe struct {
+		Languages map[string]json.RawMessage `json:"languages"`
+	}
+	if json.Unmarshal(out, &probe) != nil || probe.Languages == nil {
+		return &GroundingUnknown{Field: "coverage", Reason: "symbol graph coverage has no languages"}
+	}
+	s.Coverage = out
+	return nil
 }

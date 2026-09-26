@@ -71,8 +71,31 @@ Consequences:
   references only) and `failed` (grammar compiled in, but the file was extracted
   lexically past the parse bounds or parsed with errors).
 - Graph coverage (search, explain, impact) reports `languages` with the same three
-  counts. `failed` there means that tree-sitter found no symbols in the file but the
-  legacy regexes did.
+  counts. `failed` there means the file was extracted by the legacy regexes: it is past
+  the parse bounds, or tree-sitter found no symbols in it but the regexes did.
+- `ground` carries the graph's coverage block (`coverage`: `complete` and `languages`)
+  in its index section, from `xmustard-core symbolgraph coverage`. When the core cannot
+  give it, `coverage` is null and listed in `unknown`.
+
+## Parse bounds on the graph path
+
+The graph path (`repomap::extract_source_symbols`, used by search, explain and impact)
+applies the index's parse refusal (`DEFAULT_MAX_PARSE_BYTES`, `MAX_PARSE_TOKENS`,
+`MAX_PARSE_NESTING`) before tree-sitter. Before this, it parsed any grammar file up to
+8 MiB: a generated 1 MB C file peaked at 66 MiB footprint and a 4 MB one at 252 MiB.
+Files past the bounds now take the regexes (for every language, including Go, Rust,
+TS and JS, which were parsed to 8 MiB before) and count as `failed`.
+
+## Known limitations of `exported`
+
+The export rules read the declaration header only:
+
+- C++ members under a `private:` or `protected:` access specifier are reported
+  `exported=true` (the specifier is not in the member's header).
+- Java interface members and enum constants are implicitly public but are reported
+  `exported=false`.
+- In Kotlin and Swift, a word such as `private` inside an annotation argument in the
+  header (`@Suppress("private")`) flips the result.
 
 ## Query provenance
 
@@ -88,4 +111,3 @@ GitNexus. All ten added grammar crates are MIT-licensed.
   extractors). Imports are recorded with their semantics (`import`, `wildcard`,
   `namespace`, `require`, `include`) but are not resolved for the added languages.
 - Scala and Lua (optional in PAR-SYM-05) are not packed.
-- The `ground` tool does not carry per-language coverage.
