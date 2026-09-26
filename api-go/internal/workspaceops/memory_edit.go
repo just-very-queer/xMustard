@@ -172,9 +172,8 @@ func EditContext(dataDir, workspaceID, entryID string, req EditRequest, editor C
 				return err
 			}
 		}
-		out = ce
 		if !changed {
-			_, out, err = loadEntryTx(ctx, tx, workspaceID, entryID)
+			out, err = entryAfter(ctx, tx, workspaceID, entryID)
 			return err
 		}
 		rv, err := tx.AppendRevision(ctx, govstore.RevisionInput{
@@ -239,6 +238,7 @@ func settleRevision(ctx context.Context, tx govstore.Tx, workspaceID, entryID st
 			return ContextEntry{}, false, err
 		}
 	default:
+		ce.ContentDigest = ""
 		return ce, false, nil
 	}
 	return settleEntry(ctx, tx, workspaceID, entryID, threshold, root, actor)
