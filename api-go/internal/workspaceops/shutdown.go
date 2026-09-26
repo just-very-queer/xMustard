@@ -13,7 +13,7 @@ import (
 //  1. each live run: durably mark it `interrupted` (under the run transaction, so JSON +
 //     the PG mirror converge) and signal its process group, so a restart never re-attaches
 //     to or double-launches an orphaned worker.
-//  2. each terminal: mark closed, terminate the shell, close the PTY.
+//  2. each terminal: mark closed, end every process in the shell's session, close the PTY.
 //  3. merge the coalesced search-retrieval feedback into each workspace's store.
 //  4. flush the inline PG mirror workers so the interrupted run snapshots are mirrored.
 func ShutdownInFlight(dataDir string) {
@@ -74,13 +74,8 @@ func closeAllTerminals() {
 	terminalSessions.Range(func(k, v any) bool {
 		if s, ok := v.(*terminalSession); ok {
 			toClose = append(toClose, s)
-			terminalSessions.Delete(k)
 		}
 		return true
 	})
-	for _, s := range toClose {
-		s.markClosed()
-		terminateTerminalProcess(s.process)
-		s.closePTY()
-	}
+	shutdownTerminals(toClose)
 }

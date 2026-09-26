@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -47,13 +48,43 @@ type terminalSession struct {
 	terminalID   string
 	workspaceID  string
 	process      *exec.Cmd
+	shellStart   uint64 // the shell's process start time, 0 if unknown; see terminalSessionSweep
 	pty          *os.File
 	logPath      string
+	ttyPath      string // the replica's device path; teardown looks for processes holding it
 	mu           sync.RWMutex
 	closed       bool
 	lastActivity time.Time
 	closeOnce    sync.Once
+	teardownOnce sync.Once
+	pumpDone     chan struct{} // closed once the pump has released the PTY and log
+	tornDown     chan struct{} // closed once shutdown has finished
 }
+
+const (
+	// terminalTermDelay is how long a closing terminal's processes get after
+	// SIGHUP before they are also sent SIGTERM.
+	terminalTermDelay = 300 * time.Millisecond
+	// terminalKillGrace is how long a closing terminal's processes get to exit
+	// after SIGHUP before they are sent SIGKILL.
+	terminalKillGrace = 2 * time.Second
+	// terminalPumpDrain bounds each wait for the pump to reach the PTY's end. It
+	// runs out only while a process teardown did not end still holds the replica.
+	terminalPumpDrain = time.Second
+)
+
+// terminalTeardown says how far teardown goes with the processes a terminal's
+// shell leaves behind.
+type terminalTeardown int
+
+const (
+	// terminalHangUp is for a shell that exited on its own: what it left running
+	// gets SIGHUP and SIGCONT, as from a real terminal hang-up, and may outlive it.
+	terminalHangUp terminalTeardown = iota
+	// terminalKill is for a close, the idle reaper and server shutdown: SIGHUP,
+	// then SIGTERM, then SIGKILL until no process of the session is left.
+	terminalKill
+)
 
 // terminalIdleTTL closes a terminal session abandoned (no write/resize/read) past
 // this duration, so an opened-but-forgotten session can't leak its shell child, PTY,
@@ -74,23 +105,33 @@ func startTerminalReaper() {
 	})
 }
 
-// reapIdleTerminals closes + removes sessions idle past the TTL. Collected under the
-// map iteration, fully released (shell kill + PTY close → pump goroutine ends + log
-// handle closed) afterwards.
+// reapIdleTerminals closes and removes sessions idle past the TTL.
 func reapIdleTerminals() {
 	var toClose []*terminalSession
 	terminalSessions.Range(func(k, v any) bool {
 		if s, ok := v.(*terminalSession); ok && s.idleBeyond(terminalIdleTTL) {
 			toClose = append(toClose, s)
-			terminalSessions.Delete(k)
 		}
 		return true
 	})
-	for _, s := range toClose {
-		s.markClosed()
-		terminateTerminalProcess(s.process)
-		s.closePTY()
+	shutdownTerminals(toClose)
+}
+
+// shutdownTerminals tears the sessions down in parallel, since each may wait out
+// its grace period, and removes each from the map only once it is down, so a read
+// meanwhile does not report EOF early. A session opened under the same id in the
+// meantime stays.
+func shutdownTerminals(sessions []*terminalSession) {
+	var wg sync.WaitGroup
+	for _, s := range sessions {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s.shutdown(terminalKill)
+			terminalSessions.CompareAndDelete(s.terminalID, s)
+		}()
 	}
+	wg.Wait()
 }
 
 func (session *terminalSession) touch() {
@@ -160,22 +201,29 @@ func OpenTerminal(dataDir string, request TerminalOpenRequest) (*TerminalSession
 		return nil, err
 	}
 	_ = replicaHandle.Close()
+	// Recorded before anything can reap the shell, so the pid names it here.
+	shellStart, _ := terminalProcStart(cmd.Process.Pid)
 
 	session := &terminalSession{
 		terminalID:   terminalID,
 		workspaceID:  request.WorkspaceID,
 		process:      cmd,
+		shellStart:   shellStart,
 		pty:          ptyHandle,
 		logPath:      logPath,
+		ttyPath:      replicaHandle.Name(),
 		lastActivity: time.Now(),
+		pumpDone:     make(chan struct{}),
+		tornDown:     make(chan struct{}),
 	}
 	// reject a duplicate LIVE id rather than overwriting (and orphaning) its process
 	// handle (XM-POST-002). LoadOrStore is atomic; a stale closed entry is replaced.
 	if prev, loaded := terminalSessions.LoadOrStore(terminalID, session); loaded {
 		if existing, ok := prev.(*terminalSession); ok && !existing.isClosed() {
-			session.markClosed()
-			terminateTerminalProcess(cmd)
-			_ = ptyHandle.Close()
+			// never published and no pump started: tear down, reap, close the log
+			close(session.pumpDone)
+			session.shutdown(terminalKill)
+			_ = cmd.Wait()
 			_ = logHandle.Close()
 			return nil, fmt.Errorf("terminal %s already active", terminalID)
 		}
@@ -186,11 +234,17 @@ func OpenTerminal(dataDir string, request TerminalOpenRequest) (*TerminalSession
 	writer := &synchronizedLogWriter{file: logHandle}
 	go pumpTerminalStream(session, writer)
 	go func() {
+		// Teardown runs before the shell is reaped: until then its pid, and with it
+		// the session id teardown looks processes up by, cannot be reused. On a
+		// close, this waits for that teardown to finish. CloseTerminal stays
+		// idempotent; the idle reaper removes the closed map entry.
+		if waitTerminalShellExit(cmd.Process.Pid) {
+			session.shutdown(terminalHangUp)
+			_ = cmd.Wait()
+			return
+		}
 		_ = cmd.Wait()
-		// On natural exit the pump goroutine's deferred closePTY + writer.Close
-		// release the PTY/log; we just mark closed. The lingering (closed) map entry
-		// is removed by the idle reaper, while CloseTerminal stays idempotent.
-		session.markClosed()
+		session.shutdown(terminalHangUp)
 	}()
 
 	return &TerminalSessionRecord{
@@ -204,6 +258,9 @@ func WriteTerminal(workspaceID, terminalID string, data string) error {
 	if err != nil {
 		return err
 	}
+	if session.isClosed() {
+		return errTerminalClosed(terminalID)
+	}
 	session.touch()
 	_, err = io.WriteString(session.pty, data)
 	return err
@@ -214,19 +271,27 @@ func ResizeTerminal(workspaceID, terminalID string, cols int, rows int) error {
 	if err != nil {
 		return err
 	}
+	if session.isClosed() {
+		return errTerminalClosed(terminalID)
+	}
 	session.touch()
 	return resizeTerminalPTY(session.pty, cols, rows)
 }
 
+func errTerminalClosed(terminalID string) error {
+	return fmt.Errorf("terminal %s: %w", terminalID, os.ErrClosed)
+}
+
+// CloseTerminal ends every process of the terminal's session and returns once
+// they are gone and the log holds the last output. The session leaves the map
+// only then, so a read during teardown does not report EOF early.
 func CloseTerminal(workspaceID, terminalID string) error {
 	session, err := requireTerminalSession(workspaceID, terminalID)
 	if err != nil {
 		return err
 	}
-	session.markClosed()
-	terminalSessions.Delete(terminalID)
-	terminateTerminalProcess(session.process)
-	session.closePTY()
+	session.shutdown(terminalKill)
+	terminalSessions.CompareAndDelete(terminalID, session)
 	return nil
 }
 
@@ -257,7 +322,7 @@ func ReadTerminal(dataDir string, workspaceID string, terminalID string, offset 
 		if session, ok := sessionValue.(*terminalSession); ok && session.workspaceID == workspaceID {
 			session.touch()
 			logPath = session.logPath
-			eof = session.isClosed()
+			eof = session.isTornDown()
 		}
 	}
 	handle, err := os.Open(logPath)
@@ -311,10 +376,65 @@ func requireTerminalSession(workspaceID, terminalID string) (*terminalSession, e
 	return session, nil
 }
 
+// pumpTerminalStream copies the shell's output to the log until the master reports
+// that no process holds the replica any more, or until shutdown closes the master.
+// The master stays open until shutdown, so the replica's device path cannot pass to
+// another terminal while teardown looks for processes holding it.
 func pumpTerminalStream(session *terminalSession, writer io.WriteCloser) {
+	defer close(session.pumpDone)
 	defer writer.Close()
-	defer session.closePTY()
 	_, _ = io.Copy(writer, session.pty)
+}
+
+// shutdown marks the session closed, ends the processes its shell left as mode
+// says (endTerminalSession), lets the pump copy what they wrote, then closes the
+// master. It runs once, and the first caller's mode applies; a concurrent caller
+// blocks until that run has finished, so a return means the session is down.
+func (session *terminalSession) shutdown(mode terminalTeardown) {
+	session.markClosed()
+	session.teardownOnce.Do(func() {
+		endTerminalSession(session, mode)
+		// The pump ends at the master's EOF, once no process holds the replica.
+		// If one still does after the drain, closing the master hangs the replica
+		// up; on Linux it also ends the pump's pending read.
+		drained := session.waitPump(terminalPumpDrain)
+		session.closePTY()
+		if !drained && !session.waitPump(terminalPumpDrain) {
+			log.Printf("terminal %s: output pump still running after teardown", session.terminalID)
+		}
+		if session.tornDown != nil {
+			close(session.tornDown)
+		}
+	})
+}
+
+// waitPump reports whether the pump finished within d.
+func (session *terminalSession) waitPump(d time.Duration) bool {
+	if session.pumpDone == nil {
+		return true
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-session.pumpDone:
+		return true
+	case <-timer.C:
+		return false
+	}
+}
+
+// isTornDown reports whether shutdown has finished: teardown is over and the pump
+// has written the last output to the log.
+func (session *terminalSession) isTornDown() bool {
+	if session.tornDown == nil {
+		return session.isClosed()
+	}
+	select {
+	case <-session.tornDown:
+		return true
+	default:
+		return false
+	}
 }
 
 func (session *terminalSession) markClosed() {

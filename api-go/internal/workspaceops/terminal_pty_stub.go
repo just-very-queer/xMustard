@@ -19,5 +19,3 @@ func configureTerminalCommand(cmd *exec.Cmd, replica *os.File) {}
 func resizeTerminalPTY(handle *os.File, cols int, rows int) error {
 	return errTerminalPTYUnsupported
 }
-
-func terminateTerminalProcess(cmd *exec.Cmd) {}
