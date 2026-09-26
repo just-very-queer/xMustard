@@ -400,15 +400,17 @@ func (cardRule) find(buf []byte, from, to, n int, eof bool, out []candidate) []c
 			continue
 		}
 		j, last, digits := i, i, 0
+	scan:
 		for j < n && digits < 19 {
-			if isDigit(buf[j]) {
+			switch c := buf[j]; {
+			case isDigit(c):
 				digits++
 				j++
 				last = j
-			} else if (buf[j] == ' ' || buf[j] == '-') && j+1 < n && isDigit(buf[j+1]) {
+			case (c == ' ' || c == '-') && j+1 < n && isDigit(buf[j+1]):
 				j++
-			} else {
-				break
+			default:
+				break scan
 			}
 		}
 		if last == n && !eof {
@@ -930,35 +932,23 @@ var (
 	}
 )
 
-// hinted reports whether a flattened key contains a secret hint ("pass",
-// "pwd", "secret", "token", "key", "auth", "cookie", "credential",
-// "connection") in one pass.
+// secretHints are the substrings that mark a flattened key as a possible
+// secret, indexed by first byte so hinted looks at each byte once.
+var secretHints = [256][]string{
+	'p': {"pass", "pwd"},
+	's': {"secret"},
+	't': {"token"},
+	'k': {"key"},
+	'a': {"auth"},
+	'c': {"cookie", "credential", "connection"},
+}
+
+// hinted reports whether a flattened key contains one of secretHints in one
+// pass.
 func hinted(k []byte) bool {
-	has := func(i int, h string) bool { return len(k)-i >= len(h) && string(k[i:i+len(h)]) == h }
-	for i := 0; i < len(k); i++ {
-		switch k[i] {
-		case 'p':
-			if has(i, "pass") || has(i, "pwd") {
-				return true
-			}
-		case 's':
-			if has(i, "secret") {
-				return true
-			}
-		case 't':
-			if has(i, "token") {
-				return true
-			}
-		case 'k':
-			if has(i, "key") {
-				return true
-			}
-		case 'a':
-			if has(i, "auth") {
-				return true
-			}
-		case 'c':
-			if has(i, "cookie") || has(i, "credential") || has(i, "connection") {
+	for i, c := range k {
+		for _, h := range secretHints[c] {
+			if len(k)-i >= len(h) && string(k[i:i+len(h)]) == h {
 				return true
 			}
 		}
@@ -1598,11 +1588,12 @@ func (q *quotedCont) advance(buf []byte, from, n int, eof bool) (int, bool) {
 		if c == '\n' {
 			return i, false
 		}
-		if q.esc {
+		switch {
+		case q.esc:
 			q.esc = false
-		} else if c == '\\' {
+		case c == '\\':
 			q.esc = true
-		} else if c == q.quote {
+		case c == q.quote:
 			return i, false
 		}
 		i += width
