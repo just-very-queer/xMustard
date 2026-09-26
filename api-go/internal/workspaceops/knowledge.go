@@ -23,7 +23,7 @@ func WorkspaceSearch(dataDir, workspaceID, query string, limit int, seed string)
 
 // WorkspaceSearchCtx is the request-scoped variant: cancelling ctx cancels its Rust/tool work (see rustcore.runCoreCtx).
 func WorkspaceSearchCtx(ctx context.Context, dataDir, workspaceID, query string, limit int, seed string) (json.RawMessage, error) {
-	root, _, err := resolveChangeRoot(dataDir, workspaceID)
+	root, _, err := resolveChangeRootCtx(ctx, dataDir, workspaceID)
 	if err != nil {
 		return nil, err
 	}

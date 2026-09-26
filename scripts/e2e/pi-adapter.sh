@@ -59,8 +59,11 @@ have="$(node -p 'require(process.argv[1]).version' "$PI_DIR/node_modules/@earend
 [[ "$have" == "$PINNED_PI" ]] || { echo "pi-adapter e2e: pi-coding-agent $have installed, $PINNED_PI pinned" >&2; exit 1; }
 echo "pi-coding-agent $have"
 
-echo "== build xmustard-api / xmustard-mcp"
-(cd "$ROOT/api-go" && go build -o "$WORK/bin/xmustard-api" ./cmd/xmustard-api && go build -o "$WORK/bin/xmustard-mcp" ./cmd/xmustard-mcp)
+echo "== build xmustard-api (-tags xmustard_e2e) / xmustard-mcp"
+# The xmustard_e2e tag wires a test-only capture redactor (one fixed marker; see
+# api-go/cmd/xmustard-api/capture_redactor_e2e.go): production builds have none until
+# the WS-05 streaming redactor is wired, so POST .../evidence/capture answers 503.
+(cd "$ROOT/api-go" && go build -tags xmustard_e2e -o "$WORK/bin/xmustard-api" ./cmd/xmustard-api && go build -o "$WORK/bin/xmustard-mcp" ./cmd/xmustard-mcp)
 
 if [[ -z "${XMUSTARD_CORE_BIN:-}" ]]; then
 	echo "== build xmustard-core (release)"

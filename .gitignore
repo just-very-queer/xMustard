@@ -15,6 +15,7 @@ backend/data/workspaces/*/runs/*.out.json
 backend/data/workspaces/*/terminals/*.log
 
 research/
+bench-out/
 # Working notes and raw session/research material stay local by default.
 # Existing tracked historical docs remain tracked; curate new public entrypoints.
 docs/*

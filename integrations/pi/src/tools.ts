@@ -182,6 +182,14 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
 
 export const TOOL_NAMES: ReadonlySet<string> = new Set(TOOL_SPECS.map((t) => t.name));
 
+// Pi's built-in tools whose results the adapter projects through the capture API and
+// masks (not part of the MCP mirror above).
+export const BUILTIN_TOOLS = ["bash", "read", "grep", "find", "ls", "edit", "write"] as const;
+export type BuiltinTool = (typeof BUILTIN_TOOLS)[number];
+// Built-ins that address one file through their `path` argument (edit/write change it).
+export const FILE_TOOLS: ReadonlySet<string> = new Set(["read", "edit", "write"]);
+export const EDIT_TOOLS: ReadonlySet<string> = new Set(["edit", "write"]);
+
 // toJsonSchema renders a spec's input schema exactly as MCP `tools/list` does
 // (mcpserver Tool.InputSchema): closed, and `required` only when non-empty.
 export function toJsonSchema(t: ToolSpec): Record<string, unknown> {

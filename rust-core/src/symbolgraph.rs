@@ -1297,7 +1297,7 @@ pub fn build_symbol_graph_cached(root: &Path, workspace_id: &str) -> SymbolGraph
 }
 
 /// The symbol graph for read-only queries whose output reports neither per-call index
-/// work nor the graph's workspace id (impact, trace, clusters, flow, wiki). Inside
+/// work nor the graph's workspace id (impact, trace, clusters, wiki). Inside
 /// `serve` a resident snapshot is shared without a copy; otherwise this is
 /// `build_symbol_graph_cached`.
 pub fn symbol_graph_for_query(root: &Path, workspace_id: &str) -> Arc<SymbolGraph> {

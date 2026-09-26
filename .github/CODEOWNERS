@@ -1,0 +1,8 @@
+# A pull request is measured and judged by its own copies of the budget gate
+# (scripts/bench/) and the CI workflow (.github/). Branch protection with "Require
+# review from Code Owners" on the target branches makes this review binding. With one
+# owner who also authors these pull requests, GitHub cannot count the review (an author
+# cannot approve their own pull request): until a second owner is listed here, gate and
+# workflow changes are self-reviewed (scripts/bench/README.md, "First CI run").
+/scripts/bench/ @just-very-queer
+/.github/ @just-very-queer

@@ -111,7 +111,8 @@ to the Rust CLI through `rustcore.RunGoalCommand`. The duplicated Go
 implementation was deleted — one source of truth, not two. The
 `GoalRecord`/`GoalEvidence`/request types remain in Go as the wire contract, and
 `TestGoalRustWireParity` plus the lifecycle tests run the real Rust binary.
-Benchmarks live in `docs/BENCHMARKS.md`.
+Historical goal-runtime benchmark numbers are in `docs/BENCHMARKS.md`; the
+`xmustard-core bench` harness that produced them was removed on 2026-09-25 (WS-25).
 
 ## `/swarm`
 
@@ -131,7 +132,11 @@ goal
 The controller remains xMustard. Worker output is recorded as evidence and
 reviewed against acceptance criteria and verification commands.
 
-**Status:** the swarm *scaffold* is implemented in `rust-core/src/swarm.rs`
+**Status (2026-09-25): removed.** WS-25 deleted the Rust scaffold described
+below, because neither the Go API nor any script called it. `/swarm` is a design
+note again. The rest of this paragraph describes the removed code.
+
+The swarm *scaffold* was implemented in `rust-core/src/swarm.rs`
 (`xmustard-core swarm plan|status|gate|record`). It provides the role-tagged
 lanes and the deterministic controller gate (`accept | block | narrow |
 complete`): it blocks on failure outcomes, narrows when a builder edits outside
