@@ -12,12 +12,12 @@
 // XMUSTARD_PI_PROJECTION_TARGET_BYTES, XMUSTARD_PI_BUILTINS, XMUSTARD_PI_MASK*,
 // XMUSTARD_PI_COMPACTION.
 
-import type { ExtensionAPI, ExtensionContext, SessionBoundaryDraft } from "@earendil-works/pi-coding-agent";
+import { type ExtensionAPI, type ExtensionContext, type SessionBoundaryDraft, VERSION } from "@earendil-works/pi-coding-agent";
 import { type TSchema, Type } from "typebox";
-import { createCompactor } from "./compaction.ts";
+import { branchHoldsHandle, createCompactor } from "./compaction.ts";
 import { loadConfig } from "./config.ts";
 import { Capturer, EXPAND_TOOL, expand, PAGE_SIZE, PendingCalls, projectBuiltin, projectResult, runTool } from "./delivery.ts";
-import { createMasker } from "./masking.ts";
+import { createMasker, type EntryView } from "./masking.ts";
 import { TOOL_NAMES, TOOL_SPECS, type ToolArgs, type ToolSpec } from "./tools.ts";
 import { callerTools, WorkspaceResolver } from "./workspace.ts";
 
@@ -64,7 +64,7 @@ export default function xmustard(pi: ExtensionAPI): void {
 	const cfg = loadConfig();
 	const pending = new PendingCalls();
 	const workspaces = new WorkspaceResolver(cfg);
-	const capturer = new Capturer(cfg);
+	const capturer = new Capturer(cfg, Date.now, `pi-coding-agent/${VERSION}`);
 	// built-in projection, masking and compaction resolve the session's workspace
 	// within the projection deadline (the resolver caches it per directory)
 	const resolveWorkspace = async (cwd: string | undefined, signal?: AbortSignal): Promise<string> => {
@@ -101,14 +101,16 @@ export default function xmustard(pi: ExtensionAPI): void {
 		if (!active.includes(EXPAND_TOOL)) pi.setActiveTools([...active, EXPAND_TOOL]);
 	};
 
-	// Registered tools start active; expansion stays hidden until a handle is issued,
-	// and xMustard tools this caller cannot use are deactivated, so they never reach
-	// the model (registration itself stays load-time only, without network calls).
-	pi.on("session_start", async () => {
+	// Registered tools start active; expansion stays hidden until a handle is issued
+	// (or the resumed, reloaded or forked branch already names one), and xMustard tools
+	// this caller cannot use are deactivated, so they never reach the model
+	// (registration itself stays load-time only, without network calls).
+	pi.on("session_start", async (_event, ctx) => {
+		const holdsHandle = branchHoldsHandle(ctx.sessionManager.getBranch() as EntryView[]);
 		let active = pi.getActiveTools().filter((n) => n !== EXPAND_TOOL);
 		const allowed = await callerTools(cfg);
 		if (allowed) active = active.filter((n) => !TOOL_NAMES.has(n) || allowed.has(n));
-		pi.setActiveTools(active);
+		pi.setActiveTools(holdsHandle ? [...active, EXPAND_TOOL] : active);
 	});
 
 	pi.on("tool_result", async (event, ctx) => {

@@ -11,19 +11,32 @@
 // `everyTurns` turns (a polling window), so between windows the prompt prefix does not
 // change and the provider's prompt cache survives. The latest failure and results
 // about files edited within the last `afterTurns` turns are never masked. A result
-// that has no handle yet is first retained through the capture route (target 1 KiB,
-// so it gets one); if that fails it stays unmasked.
+// that has no live handle yet (none, or one that expires within EXPIRY_MARGIN_MS) is
+// first retained through the capture route (target 1 KiB, so it gets one); if that
+// fails it stays unmasked. A stub whose handle is about to expire is rewritten at the
+// next window, and one that has expired at the next turn_end, from the raw entry the
+// session still holds.
 //
 // This module reads Pi entries through minimal structural views, so it runs (and is
 // unit-tested) without Pi's module aliases.
 
 import { homedir } from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { MIN_CAPTURE_TARGET, type MaskConfig } from "./config.ts";
 import { argsDigestOf, type Capturer, EXPAND_TOOL, textBlocks } from "./delivery.ts";
 import { BUILTIN_TOOLS, EDIT_TOOLS, FILE_TOOLS, TOOL_NAMES } from "./tools.ts";
 
 export const MASK_PREFIX = "[xmustard masked: ";
+// A handle that expires within this margin is treated as gone: Go retains originals
+// for 24 h by default, and a stub or snapshot must not name a handle that dies before
+// the model can use it. Such results are retained again under a fresh handle.
+export const EXPIRY_MARGIN_MS = 60 * 60_000;
+
+// Lines the adapter itself adds to a result (recovery footer, page and search
+// headers): never the tool's own first or last line.
+const ADAPTER_LINE = /^\[xmustard (evidence|page|search)\] /;
+export const isAdapterLine = (line: string): boolean => ADAPTER_LINE.test(line);
 
 // Tools whose results may be masked: Pi's built-ins, the nine xMustard tools and
 // expansion pages. Other extensions' tools are left alone.
@@ -52,13 +65,23 @@ export interface EntryView {
 	fromHook?: boolean; // compaction
 }
 
-// HandleRef locates a retained original: the handle, its workspace and, for an
-// expansion page, where the page started.
+// HandleRef locates a retained original: the handle, its workspace, when Go stops
+// serving it and, for an expansion page, where the page started.
 export interface HandleRef {
 	handle: string;
 	workspace_id: string;
 	offset?: number;
+	expires_at?: string; // RFC 3339, as Go issued it; absent when unknown
 	source: "delivery" | "capture" | "expand" | "mask" | "retained";
+}
+
+// isLive reports whether a handle will still be served marginMs from now. An unknown
+// expiry counts as live (Go did not say); an unparsable one as expired.
+export function isLive(ref: HandleRef | undefined, now: number, marginMs = EXPIRY_MARGIN_MS): boolean {
+	if (!ref) return false;
+	if (ref.expires_at === undefined) return true;
+	const t = Date.parse(ref.expires_at);
+	return !Number.isNaN(t) && t - now > marginMs;
 }
 
 export interface ResultRecord {
@@ -71,6 +94,7 @@ export interface ResultRecord {
 	path?: string; // absolute path a file tool addressed
 	command?: string; // bash command
 	text: string; // model-visible text now (after context edits)
+	original?: string; // the raw entry's text, when a context edit replaced it
 	bytes: number;
 	lines: number;
 	image: boolean; // holds non-text content
@@ -112,22 +136,37 @@ export function countLines(text: string): number {
 	return text.endsWith("\n") ? n - 1 : n;
 }
 
-// resolvePath resolves a tool's path argument the way Pi does (~ expands to home).
+const UNICODE_SPACES = /[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g;
+
+// resolvePath resolves a tool's path argument the way Pi's tools do (resolveToCwd in
+// core/tools/path-utils.js): unicode spaces become spaces, a leading @ is dropped, ~
+// expands to home and file:// URLs become paths. Models often send "@src/a.go", so
+// "@src/a.go" and "src/a.go" must name the same file.
 export function resolvePath(p: string, cwd: string | undefined): string {
-	let v = p.trim();
+	let v = p.replace(UNICODE_SPACES, " ");
+	if (v.startsWith("@")) v = v.slice(1);
 	if (v === "~") v = homedir();
 	else if (v.startsWith("~/")) v = path.join(homedir(), v.slice(2));
+	else if (v.startsWith("file://")) {
+		try {
+			v = fileURLToPath(v);
+		} catch {
+			// not a valid file URL: resolved as written, as Pi would fail on it
+		}
+	}
 	return path.resolve(cwd ?? "/", v);
 }
 
-const STUB_RE = /^\[xmustard masked: [^\]\n]*?; handle (xm1\.[A-Za-z0-9_-]+)(?:; offset (\d+))?; workspace_id ([^\]\s;]+)\]/;
+const STUB_RE = /^\[xmustard masked: [^\]\n]*?; handle (xm1\.[A-Za-z0-9_-]+)(?:; offset (\d+))?; workspace_id ([^\]\s;]+)(?:; expires ([^\]\s;]+))?\]/;
 
 // parseStub returns the handle a mask stub names.
 export function parseStub(text: string): HandleRef | undefined {
 	const m = STUB_RE.exec(text);
 	if (!m) return undefined;
-	return { handle: m[1], workspace_id: m[3], ...(m[2] ? { offset: Number(m[2]) } : {}), source: "mask" };
+	return { handle: m[1], workspace_id: m[3], ...(m[2] ? { offset: Number(m[2]) } : {}), ...(m[4] ? { expires_at: m[4] } : {}), source: "mask" };
 }
+
+const expiresOf = (v: Record<string, unknown>): { expires_at?: string } => (str(v.expires_at) ? { expires_at: String(v.expires_at) } : {});
 
 // knownHandle finds a recovery handle a result already carries: a projection's
 // (built-in capture or xMustard delivery), an expansion page's, or a mask stub's.
@@ -141,16 +180,16 @@ export function knownHandle(toolName: string, details: unknown, args: Record<str
 	if (!isObject(details)) return undefined;
 	const xm = details.xmustard;
 	if (isObject(xm) && xm.path === "capture" && str(xm.handle) && str(xm.workspace_id)) {
-		return { handle: String(xm.handle), workspace_id: String(xm.workspace_id), source: "capture" };
+		return { handle: String(xm.handle), workspace_id: String(xm.workspace_id), ...expiresOf(xm), source: "capture" };
 	}
 	const delivery = details.delivery;
 	if (TOOL_NAMES.has(toolName) && isObject(delivery) && str(delivery.handle) && str(details.workspace_id)) {
-		return { handle: String(delivery.handle), workspace_id: String(details.workspace_id), source: "delivery" };
+		return { handle: String(delivery.handle), workspace_id: String(details.workspace_id), ...expiresOf(delivery), source: "delivery" };
 	}
 	if (toolName === EXPAND_TOOL && str(details.handle) && str(args.workspace_id)) {
 		// a page (offset) or a search result over the same original
 		const offset = typeof details.offset === "number" && typeof details.data_base64 === "string" ? details.offset : undefined;
-		return { handle: String(details.handle), workspace_id: String(args.workspace_id), ...(offset !== undefined ? { offset } : {}), source: "expand" };
+		return { handle: String(details.handle), workspace_id: String(args.workspace_id), ...(offset !== undefined ? { offset } : {}), ...expiresOf(details), source: "expand" };
 	}
 	return undefined;
 }
@@ -196,6 +235,7 @@ export function analyzeBranch(entries: readonly EntryView[], opts: AnalyzeOption
 			const edit = edits.get(e.id);
 			const omitted = edits.has(e.id) && edit === null;
 			const { text, image } = textOf(edit ? edit.content : m.content);
+			const original = edit ? textOf(m.content).text : undefined;
 			const args = calls.get(m.toolCallId) ?? {};
 			const toolName = m.toolName ?? "";
 			const p = str(args.path) ?? str(args.file_path);
@@ -209,6 +249,7 @@ export function analyzeBranch(entries: readonly EntryView[], opts: AnalyzeOption
 				...(p && (FILE_TOOLS.has(toolName) || toolName === "ls" || toolName === "grep" || toolName === "find") ? { path: resolvePath(p, opts.cwd) } : {}),
 				...(str(args.command) ? { command: String(args.command) } : {}),
 				text,
+				...(original !== undefined ? { original } : {}),
 				bytes: Buffer.byteLength(text, "utf8"),
 				lines: countLines(text),
 				image,
@@ -233,7 +274,14 @@ export interface MaskPlan {
 	turn: number;
 	cutoff: number; // results from turns <= cutoff are old
 	candidates: ResultRecord[];
+	// in-context stubs whose handle expires within the margin: rewritten from the raw entry
+	refresh: ResultRecord[];
 	exempt: { entryId: string; toolCallId: string; reason: ExemptReason }[];
+}
+
+export interface PlanOptions {
+	now?: number;
+	marginMs?: number; // a handle expiring within this is not live (EXPIRY_MARGIN_MS)
 }
 
 // isWindow reports whether the mask advances at this turn: only every everyTurns
@@ -249,10 +297,20 @@ export function countTurns(entries: readonly EntryView[]): number {
 	return n;
 }
 
-// planMask decides, deterministically, which results to mask at this turn.
-export function planMask(a: BranchAnalysis, cfg: MaskConfig): MaskPlan {
+// needsRefresh: an in-context stub this adapter wrote whose handle is not live.
+const needsRefresh = (r: ResultRecord, now: number, marginMs: number): boolean =>
+	r.masked && r.inContext && r.original !== undefined && r.handle?.source === "mask" && !isLive(r.handle, now, marginMs);
+
+// planMask decides, deterministically, which results to mask at this turn: new
+// candidates only at a window; stubs to rewrite whenever their handle is not live
+// (the caller passes a zero margin between windows, so only expired ones qualify).
+export function planMask(a: BranchAnalysis, cfg: MaskConfig, opts: PlanOptions = {}): MaskPlan {
+	const now = opts.now ?? Date.now();
+	const marginMs = opts.marginMs ?? EXPIRY_MARGIN_MS;
 	const cutoff = a.turn - cfg.afterTurns;
-	const plan: MaskPlan = { due: isWindow(a.turn, cfg), turn: a.turn, cutoff, candidates: [], exempt: [] };
+	const plan: MaskPlan = { due: isWindow(a.turn, cfg), turn: a.turn, cutoff, candidates: [], refresh: [], exempt: [] };
+	if (!cfg.enabled) return plan;
+	plan.refresh = a.results.filter((r) => needsRefresh(r, now, marginMs));
 	if (!plan.due) return plan;
 	const active = new Set<string>();
 	for (const [p, t] of a.lastEdit) if (t > cutoff) active.add(p);
@@ -271,16 +329,48 @@ export function planMask(a: BranchAnalysis, cfg: MaskConfig): MaskPlan {
 	return plan;
 }
 
+// hasExpiredStub reports, cheaply (no tool output is read), whether a stub in model
+// context names a handle that has expired: then the masker runs between windows too.
+export function hasExpiredStub(entries: readonly EntryView[], inContext: ReadonlySet<string> | undefined, now: number): boolean {
+	const latest = new Map<string, EntryView>();
+	for (const e of entries) if (e.type === "context_edit" && e.targetId) latest.set(e.targetId, e);
+	for (const [target, e] of latest) {
+		if (!e.replacement || (inContext && !inContext.has(target))) continue;
+		const { text } = textOf(e.replacement.content);
+		if (!text.startsWith(MASK_PREFIX)) continue;
+		const ref = parseStub(text);
+		if (ref && !isLive(ref, now, 0)) return true;
+	}
+	return false;
+}
+
 const clip = (s: string, n: number): string => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
 
+// preMaskText is what the model saw before this adapter masked a result: the raw
+// entry for a stub, else the current text.
+export const preMaskText = (r: ResultRecord): string => (r.masked && r.original !== undefined ? r.original : r.text);
+
+// unmasked returns a stub's result as it was before the mask (sizes of the original).
+function unmasked(r: ResultRecord): ResultRecord {
+	if (!r.masked || r.original === undefined) return r;
+	return { ...r, text: r.original, bytes: Buffer.byteLength(r.original, "utf8"), lines: countLines(r.original), masked: false };
+}
+
 // maskStub is the model-visible replacement of a masked result. Errors keep their
-// first and last non-empty lines, so a failure stays visible as a failure.
+// first and last non-empty lines of tool output, so a failure stays visible as a
+// failure: the adapter's own recovery footer or page header is never one of them.
 export function maskStub(r: ResultRecord, ref: HandleRef): string {
 	const what = `${r.lines} lines, ${r.bytes} bytes of ${r.toolName} output${r.isError ? " (error)" : ""}`;
-	const where = [`turn ${r.turn}`, `handle ${ref.handle}`, ...(ref.offset !== undefined ? [`offset ${ref.offset}`] : []), `workspace_id ${ref.workspace_id}`];
+	const where = [
+		`turn ${r.turn}`,
+		`handle ${ref.handle}`,
+		...(ref.offset !== undefined ? [`offset ${ref.offset}`] : []),
+		`workspace_id ${ref.workspace_id}`,
+		...(ref.expires_at ? [`expires ${ref.expires_at}`] : []),
+	];
 	let stub = `${MASK_PREFIX}${what}; ${where.join("; ")}] Recover it with ${EXPAND_TOOL}(workspace_id="${ref.workspace_id}", handle="${ref.handle}", offset=${ref.offset ?? 0}), or search it with pattern=<RE2> or lines=A-B.`;
 	if (r.isError) {
-		const lines = r.text.split("\n").filter((l) => l.trim() !== "");
+		const lines = r.text.split("\n").filter((l) => l.trim() !== "" && !isAdapterLine(l));
 		const first = clip(lines[0]?.trim() ?? "", 200);
 		const last = clip(lines.at(-1)?.trim() ?? "", 200);
 		if (first) stub += `\nfirst line: ${first}`;
@@ -297,16 +387,15 @@ export interface RetainDeps {
 	signal?: AbortSignal;
 }
 
-// retain returns a result's recovery handle, retaining its model-visible text
-// through the capture route (raw, 1 KiB target) when it has none yet.
-export async function retain(r: ResultRecord, deps: RetainDeps): Promise<HandleRef> {
-	if (r.handle) return r.handle;
+// retainText retains one text through the capture route (raw, 1 KiB target, so any
+// text above 1 KiB gets a handle) and returns the fresh handle.
+export async function retainText(r: Pick<ResultRecord, "toolName" | "toolCallId" | "isError" | "args" | "command" | "path">, body: string, deps: RetainDeps): Promise<HandleRef> {
 	if (!deps.workspaceId) throw new Error(deps.workspaceError ?? "no workspace to retain the output in");
 	const obs = await deps.capturer.observe(
 		deps.workspaceId,
 		{
 			format: "raw",
-			body: r.text,
+			body,
 			tool: r.toolName,
 			callId: r.toolCallId,
 			sessionId: deps.sessionId,
@@ -319,7 +408,14 @@ export async function retain(r: ResultRecord, deps: RetainDeps): Promise<HandleR
 		deps.signal,
 	);
 	if (!obs.handle) throw new Error(`capture retained no original (${obs.raw_bytes} bytes were not reduced)`);
-	return { handle: obs.handle, workspace_id: deps.workspaceId, source: "retained" };
+	return { handle: obs.handle, workspace_id: deps.workspaceId, ...(obs.expires_at ? { expires_at: obs.expires_at } : {}), source: "retained" };
+}
+
+// retain returns a result's recovery handle when it stays live past the margin, else
+// retains the text the model saw before any mask under a fresh one.
+export async function retain(r: ResultRecord, deps: RetainDeps, now = Date.now(), marginMs = EXPIRY_MARGIN_MS): Promise<HandleRef> {
+	if (r.handle && isLive(r.handle, now, marginMs)) return r.handle;
+	return retainText(r, preMaskText(r), deps);
 }
 
 // mapLimit runs fn over items with at most `limit` in flight, keeping order.
@@ -349,31 +445,38 @@ export interface ContextEditDraft {
 export interface MaskOutcome {
 	plan: MaskPlan;
 	drafts: ContextEditDraft[];
+	refreshed: string[]; // toolCallIds whose stub was rewritten under a fresh handle
 	failed: { toolCallId: string; reason: string }[];
 }
 
-// maskDrafts turns a plan into context edits, retaining handle-less results first.
-// A result whose handle cannot be obtained is not masked.
-export async function maskDrafts(plan: MaskPlan, deps: RetainDeps, skip: ReadonlySet<string> = new Set()): Promise<MaskOutcome> {
+// maskDrafts turns a plan into context edits, retaining first every result without a
+// live handle (stubs to refresh first). A result whose handle cannot be obtained is
+// not masked, and a stub that cannot be refreshed stays as it is.
+export async function maskDrafts(plan: MaskPlan, deps: RetainDeps, skip: ReadonlySet<string> = new Set(), opts: PlanOptions = {}): Promise<MaskOutcome> {
+	const now = opts.now ?? Date.now();
+	const marginMs = opts.marginMs ?? EXPIRY_MARGIN_MS;
+	const refresh = plan.refresh.filter((r) => !skip.has(r.entryId));
 	const todo = plan.candidates.filter((r) => !skip.has(r.entryId));
-	const withHandle = todo.filter((r) => r.handle);
-	const needs = todo.filter((r) => !r.handle).slice(0, MAX_RETAIN_PER_WINDOW);
-	const failed: MaskOutcome["failed"] = [];
 	const refs = new Map<string, HandleRef>();
-	for (const r of withHandle) refs.set(r.entryId, r.handle as HandleRef);
+	for (const r of todo) if (r.handle && isLive(r.handle, now, marginMs)) refs.set(r.entryId, r.handle);
+	const needs = [...refresh, ...todo.filter((r) => !refs.has(r.entryId))].slice(0, MAX_RETAIN_PER_WINDOW);
+	const failed: MaskOutcome["failed"] = [];
 	await mapLimit(needs, RETAIN_CONCURRENCY, async (r) => {
 		try {
-			refs.set(r.entryId, await retain(r, deps));
+			refs.set(r.entryId, await retainText(r, preMaskText(r), deps));
 		} catch (err) {
 			failed.push({ toolCallId: r.toolCallId, reason: err instanceof Error ? err.message : String(err) });
 		}
 	});
 	const drafts: ContextEditDraft[] = [];
-	for (const r of todo) {
+	const refreshed: string[] = [];
+	for (const r of [...refresh, ...todo]) {
 		const ref = refs.get(r.entryId);
-		if (ref) drafts.push({ type: "context_edit", targetId: r.entryId, replacement: { content: [{ type: "text", text: maskStub(r, ref) }] } });
+		if (!ref) continue;
+		drafts.push({ type: "context_edit", targetId: r.entryId, replacement: { content: [{ type: "text", text: maskStub(unmasked(r), ref) }] } });
+		if (r.masked) refreshed.push(r.toolCallId);
 	}
-	return { plan, drafts, failed };
+	return { plan, drafts, refreshed, failed };
 }
 
 // ---- the turn_end handler -------------------------------------------------------------
@@ -395,6 +498,7 @@ export interface MaskerDeps {
 	resolveWorkspace(cwd: string | undefined, signal?: AbortSignal): Promise<string>;
 	onHandle(): void;
 	onOutcome?(o: MaskOutcome): void;
+	now?: () => number;
 }
 
 export function sessionIdOf(ctx: SessionContextView): string | undefined {
@@ -407,19 +511,23 @@ export function sessionIdOf(ctx: SessionContextView): string | undefined {
 
 // createMasker returns Pi's turn_end handler. It returns the drafts proposed by
 // earlier handlers plus its own context edits (a boundary handler's `entries`
-// replace the proposed list), or undefined when this turn is not a window boundary.
+// replace the proposed list), or undefined when there is nothing to do: between
+// windows unless a stub in context names an expired handle.
 export function createMasker(deps: MaskerDeps) {
 	return async (event: TurnEndView, ctx: SessionContextView): Promise<{ entries: unknown[] } | undefined> => {
 		if (!deps.cfg.enabled) return undefined;
+		const now = (deps.now ?? Date.now)();
 		const branch = ctx.sessionManager.getBranch() as EntryView[];
-		if (!isWindow(countTurns(branch), deps.cfg)) return undefined; // between windows: no work
-		const proposed = event.entries ?? [];
 		const inContext = event.context?.contextEntries ? new Set(event.context.contextEntries.map((e) => e.sourceEntry.id)) : undefined;
+		const window = isWindow(countTurns(branch), deps.cfg);
+		if (!window && !hasExpiredStub(branch, inContext, now)) return undefined; // between windows: no work
+		const proposed = event.entries ?? [];
+		const opts: PlanOptions = { now, marginMs: window ? EXPIRY_MARGIN_MS : 0 };
 		const analysis = analyzeBranch(branch, { cwd: ctx.cwd, inContext });
-		const plan = planMask(analysis, deps.cfg);
-		if (!plan.due || plan.candidates.length === 0) return undefined;
+		const plan = planMask(analysis, deps.cfg, opts);
+		if (plan.candidates.length === 0 && plan.refresh.length === 0) return undefined;
 		const retainDeps: RetainDeps = { capturer: deps.capturer, sessionId: sessionIdOf(ctx), signal: ctx.signal };
-		if (plan.candidates.some((r) => !r.handle)) {
+		if (plan.refresh.length > 0 || plan.candidates.some((r) => !isLive(r.handle, now, opts.marginMs))) {
 			try {
 				retainDeps.workspaceId = await deps.resolveWorkspace(ctx.cwd, ctx.signal);
 			} catch (err) {
@@ -428,7 +536,7 @@ export function createMasker(deps: MaskerDeps) {
 		}
 		// another extension already edits these entries in this boundary: leave them
 		const skip = new Set(proposed.filter((d) => d.type === "context_edit" && d.targetId).map((d) => d.targetId as string));
-		const outcome = await maskDrafts(plan, retainDeps, skip);
+		const outcome = await maskDrafts(plan, retainDeps, skip, opts);
 		deps.onOutcome?.(outcome);
 		if (outcome.drafts.length === 0) return undefined;
 		deps.onHandle();

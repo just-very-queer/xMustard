@@ -9,7 +9,7 @@ import type net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { after, before, describe, test } from "node:test";
-import { buildCompaction, COMPACTION_VERSION, createCompactor, SNAPSHOT_HEADER, SNAPSHOT_MAX_BYTES } from "../src/compaction.ts";
+import { branchHoldsHandle, buildCompaction, COMPACTION_VERSION, createCompactor, SNAPSHOT_HEADER, SNAPSHOT_MAX_BYTES } from "../src/compaction.ts";
 import { type AdapterConfig, loadConfig, PI_POLICY_TARGET } from "../src/config.ts";
 import {
 	argsDigest,
@@ -23,11 +23,12 @@ import {
 	PendingCalls,
 	projectBuiltin,
 	projectResult,
+	renderDelivery,
 	renderPage,
 	runTool,
 } from "../src/delivery.ts";
 import { callerTools, WorkspaceResolver } from "../src/workspace.ts";
-import { analyzeBranch, createMasker, type EntryView, MASK_PREFIX, maskStub, parseStub, planMask } from "../src/masking.ts";
+import { analyzeBranch, createMasker, type EntryView, MASK_PREFIX, maskStub, parseStub, planMask, resolvePath } from "../src/masking.ts";
 import { send, XmustardHttpError } from "../src/http.ts";
 import { checkRequired, TOOL_SPECS, toJsonSchema } from "../src/tools.ts";
 
@@ -500,7 +501,7 @@ const observation = (over: Record<string, unknown> = {}) => ({
 	page_size: 65536,
 	projection_mode: "text",
 	captured_identity: "unknown",
-	expires_at: "2026-09-26T00:00:00Z",
+	expires_at: "2099-01-01T00:00:00Z",
 	family: "test",
 	target_bytes: 32768,
 	shape: { client: "pi", shape: "pi.tool_result", mode: "replace" },
@@ -771,7 +772,7 @@ describe("turn_end masking", () => {
 		// the stub names a handle that recovers the exact original, retained at 1 KiB target
 		const stub = w3.replacement.content[0].text as string;
 		assert.ok(stub.startsWith(MASK_PREFIX));
-		assert.match(stub, /^\[xmustard masked: 400 lines, \d+ bytes of bash output; turn 1; handle xm1\.H\d+; workspace_id w1\] Recover it with xmustard_expand/);
+		assert.match(stub, /^\[xmustard masked: 400 lines, \d+ bytes of bash output; turn 1; handle xm1\.H\d+; workspace_id w1; expires 2099-01-01T00:00:00Z\] Recover it with xmustard_expand/);
 		const ref = parseStub(stub);
 		assert.ok(ref);
 		assert.equal(srv.retained.get(ref.handle), T1, "the retained original is the model-visible text");
@@ -835,6 +836,60 @@ describe("turn_end masking", () => {
 		const stub = maskStub(plan.candidates[0], { handle: "xm1.A", workspace_id: "w", source: "retained" });
 		assert.deepEqual(parseStub(stub), { handle: "xm1.A", workspace_id: "w", source: "mask" });
 	});
+	test("a failing projected result's stub shows the tool's last line, never the recovery footer", () => {
+		const text = renderDelivery(observation({ is_error: true, handle: "xm1.ABC", projection: "FAIL test_a\nError: assertion failed at foo.ts:12\nexit code 1" }) as Delivery, "w1");
+		assert.match(text, /\n\[xmustard evidence\] /);
+		const b = new Branch();
+		b.turn([{ tool: "bash", args: { command: "npm test" }, text, isError: true, details: { xmustard: { path: "capture", handle: "xm1.ABC", workspace_id: "w1" } } }]);
+		const [r] = analyzeBranch(b.entries).results;
+		const stub = maskStub(r, r.handle!);
+		assert.match(stub, /\nfirst line: FAIL test_a\nlast line: exit code 1$/);
+	});
+	test("an expired or expiring handle is never reused: the text is retained again, and an expired stub is rewritten between windows", async () => {
+		const srv = captureServer();
+		const b = new Branch();
+		const T = bigText(400, "out");
+		b.turn([{ tool: "bash", args: { command: "make" }, text: T, details: { xmustard: { path: "capture", handle: "xm1.EXPIRED", workspace_id: "w1", expires_at: "2020-01-01T00:00:00Z" } } }]);
+		for (let i = 0; i < 2; i++) b.say("thinking");
+		let now = Date.parse("2026-09-26T00:00:00Z");
+		const masker = createMasker({ cfg: mask, capturer: new Capturer(cfg()), resolveWorkspace: async () => "w1", onHandle: () => {}, now: () => now });
+		const out = await masker({ entries: [] }, ctxOf(b));
+		const stub = (out?.entries[0] as any).replacement.content[0].text as string;
+		assert.doesNotMatch(stub, /xm1\.EXPIRED/);
+		const ref = parseStub(stub);
+		assert.ok(ref?.expires_at);
+		assert.equal(srv.retained.get(ref.handle), T, "the retained text is the model-visible original");
+		b.apply(out?.entries);
+		// between windows (turn 4): the stub's handle has since expired, so it is rewritten from the raw entry
+		b.say("more");
+		now = Date.parse("2099-01-02T00:00:00Z");
+		const again = await masker({ entries: [] }, ctxOf(b));
+		assert.equal(again?.entries.length, 1);
+		const fresh = (again?.entries[0] as any).replacement.content[0].text as string;
+		assert.notEqual(parseStub(fresh)?.handle, ref.handle);
+		assert.equal(srv.retained.get(parseStub(fresh)?.handle ?? ""), T, "re-retained from the raw entry, not from the stub");
+		assert.match(fresh, /^\[xmustard masked: 400 lines, /);
+	});
+	test("paths resolve as Pi's tools resolve them: @ prefix, unicode spaces, ~ and file URLs", () => {
+		assert.equal(resolvePath("@src/a.go", "/repo"), "/repo/src/a.go");
+		assert.equal(resolvePath("src/a\u00A0b.go", "/repo"), "/repo/src/a b.go");
+		assert.equal(resolvePath("file:///repo/x.go", "/other"), "/repo/x.go");
+		assert.equal(resolvePath("~/f", "/repo"), path.join(os.homedir(), "f"));
+	});
+	test("session start keeps xmustard_expand when the branch names a handle", () => {
+		const b = new Branch();
+		b.turn([{ tool: "bash", args: { command: "ls" }, text: "small" }]);
+		assert.equal(branchHoldsHandle(b.entries), false);
+		const stubbed = new Branch();
+		const [[, e]] = [...stubbed.turn([{ tool: "bash", text: bigText(300) }])];
+		stubbed.apply([{ type: "context_edit", targetId: e.id, replacement: { content: [{ type: "text", text: `${MASK_PREFIX}1 lines; turn 1; handle xm1.A; workspace_id w]` }] } }]);
+		assert.equal(branchHoldsHandle(stubbed.entries), true, "a mask stub");
+		const projected = new Branch();
+		projected.turn([{ tool: "read", args: { path: "a" }, text: "x", details: { xmustard: { path: "capture", handle: "xm1.P", workspace_id: "w" } } }]);
+		assert.equal(branchHoldsHandle(projected.entries), true, "a projected result");
+		const compacted: EntryView[] = [{ type: "compaction", id: "c", details: { xmustard: { version: COMPACTION_VERSION, handles: [], index: { handle: "xm1.I", workspace_id: "w" } } } }];
+		assert.equal(branchHoldsHandle(compacted), true, "a compaction index");
+	});
 });
 
 describe("session_before_compact snapshot", () => {
@@ -897,13 +952,14 @@ describe("session_before_compact snapshot", () => {
 		assert.match(c.summary, /\nModified files: a\.go\n/);
 		assert.match(c.summary, /\nMemory proposals awaiting a distinct verifier:\n- mem-1 "parser note" \(pending\)\n/);
 		assert.match(c.summary, /\nLast progress: next I will rerun the parser tests/);
-		assert.match(c.summary, /\nRecoverable outputs \(newest first; all of them are in the compaction details\):\n- bash `go vet`, \d+ B → xm1\.HAVE/);
+		assert.match(c.summary, /\nRecoverable outputs \(newest first\):\n- bash `go vet`, \d+ B → xm1\.HAVE/);
+		assert.equal(xm.index, undefined, "the whole document fits: no index is retained");
 		assert.deepEqual(c.details.modifiedFiles, ["a.go"]);
 		assert.deepEqual(c.details.readFiles, []);
 		assert.equal(xm.snapshot.failures[0].handle, byCall.get("c1_0")?.handle);
 	});
-	test("many outputs: the summary stays within budget and points at the details", async () => {
-		captureServer();
+	test("many outputs: the summary stays within budget and points at the index", async () => {
+		const srv = captureServer();
 		const b = new Branch();
 		b.user("long task");
 		for (let i = 0; i < 80; i++) b.turn([{ tool: "bash", args: { command: `step ${i}` }, text: bigText(200) }]);
@@ -916,7 +972,40 @@ describe("session_before_compact snapshot", () => {
 		assert.ok("compaction" in out);
 		assert.equal(out.compaction.details.xmustard.handles.length, 80);
 		assert.ok(Buffer.byteLength(out.compaction.summary) <= SNAPSHOT_MAX_BYTES);
-		assert.match(out.compaction.summary, /\n\(\+\d+ more\)$/);
+		assert.match(out.compaction.summary, /\n\(\+\d+ more in the index\)$/);
+		// the index names every handle, so none is only in details
+		const index = out.compaction.details.xmustard.index;
+		assert.ok(index);
+		assert.match(out.compaction.summary.split("\n")[1], new RegExp(`handle="${index.handle}"`));
+		const doc = srv.retained.get(index.handle) ?? "";
+		for (const h of out.compaction.details.xmustard.handles) assert.ok(doc.includes(`→ ${h.handle}`), h.handle);
+	});
+	test("a long earlier model-written summary and small outputs stay recoverable through the index", async () => {
+		const srv = captureServer();
+		const b = new Branch();
+		b.user("task");
+		for (let i = 0; i < 6; i++) b.turn([{ tool: "grep", args: { pattern: `p${i}` }, text: `small hit ${i}` }]);
+		const kept = b.say("done");
+		const previousSummary = `Pi summary ${"history ".repeat(700)} END-OF-SUMMARY`;
+		const out = await buildCompaction(
+			{ preparation: { firstKeptEntryId: kept, messagesToSummarize: b.messages(kept), tokensBefore: 1, previousSummary }, branchEntries: b.entries },
+			ctxOf(b),
+			{ enabled: true, capturer: new Capturer(cfg()), resolveWorkspace: async () => "w1", onHandle: () => {} },
+		);
+		assert.ok("compaction" in out);
+		const index = out.compaction.details.xmustard.index;
+		assert.ok(index);
+		assert.match(out.compaction.summary, /Earlier summary: .*\(full text in the index\)/);
+		const doc = srv.retained.get(index.handle) ?? "";
+		assert.ok(doc.includes("END-OF-SUMMARY"), "the earlier summary in full");
+		for (let i = 0; i < 6; i++) assert.ok(doc.includes(`small hit ${i}`), `small output ${i} inline`);
+	});
+	test("built-in captures carry Pi's version; adapter documents carry the adapter's", async () => {
+		const srv = captureServer();
+		const c = new Capturer(cfg(), Date.now, "pi-coding-agent/9.9.9");
+		await c.observe("w1", { format: "raw", body: bigText(300), tool: "bash", callId: "a", isError: false });
+		await c.observe("w1", { format: "raw", body: bigText(300), tool: "pi_compaction", callId: "b", isError: false });
+		assert.deepEqual(srv.captures().map((x) => x.query.get("tool_version")), ["pi-coding-agent/9.9.9", "pi-adapter/0.2.0"]);
 	});
 	test("Pi compacts itself when capture is unavailable or the user asked for a focus", async () => {
 		const srv = captureServer(() => ({ status: 503, body: { reason: "redaction_unavailable", error: "no redactor" } }));

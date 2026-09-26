@@ -25,7 +25,7 @@
 import { createHash } from "node:crypto";
 import { type AdapterConfig, MIN_CAPTURE_TARGET, PI_POLICY_TARGET } from "./config.ts";
 import { errorFromResponse, type HttpResponse, send, XmustardHttpError } from "./http.ts";
-import { checkRequired, goQueryEscape, type ToolArgs, type ToolSpec } from "./tools.ts";
+import { BUILTIN_TOOLS, checkRequired, goQueryEscape, type ToolArgs, type ToolSpec } from "./tools.ts";
 
 export const DELIVERY_VERSION = "xmustard.evidence/v1";
 export const DELIVERY_HEADER = "X-Xmustard-Delivery";
@@ -530,11 +530,15 @@ export interface CaptureInput {
 export class Capturer {
 	private readonly cfg: AdapterConfig;
 	private readonly now: () => number;
+	// tool_version of a built-in's output: the Pi that produced it (PAR-CTX-01); the
+	// adapter's own version stands for the nine tools and adapter documents
+	private readonly builtinVersion: string;
 	private pausedUntil = 0;
 	private pauseReason = "";
-	constructor(cfg: AdapterConfig, now: () => number = Date.now) {
+	constructor(cfg: AdapterConfig, now: () => number = Date.now, builtinVersion = ADAPTER_VERSION) {
 		this.cfg = cfg;
 		this.now = now;
+		this.builtinVersion = builtinVersion;
 	}
 
 	// paused names why capture is currently skipped, or is undefined.
@@ -549,7 +553,7 @@ export class Capturer {
 			format: input.format,
 			client: "pi",
 			tool: input.tool,
-			tool_version: ADAPTER_VERSION,
+			tool_version: (BUILTIN_TOOLS as readonly string[]).includes(input.tool) ? this.builtinVersion : ADAPTER_VERSION,
 			call_id: input.callId,
 			is_error: String(input.isError),
 		});
