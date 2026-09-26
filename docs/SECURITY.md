@@ -95,6 +95,18 @@ count toward that revision's quorum, so rewriting and approving one text needs a
 further principal. This is a deliberate tightening; it matches the store's own
 peer invariant, so the API and the store agree on who is a peer.
 
+### Who may change a memory's lifecycle (WS-19A)
+
+- A focused edit (`remember op=edit`) is a pending revision. It is accepted by the
+  same rule that promotes entries, with the edit's author excluded like the entry's,
+  so an author cannot accept their own edit in multi-agent mode.
+- Retiring or retracting promoted memory takes as many distinct retract verdicts as
+  the entry's gate. An author may archive only their own unpromoted proposal at once.
+- Only an admin or a human approver retracts, restores a retired entry or purges.
+  Purge (`DELETE .../context/{id}?purge=true`) is not an MCP tool. It keeps a
+  tombstone with every revision's digest.
+- An author may clear their own entry's expiry.
+
 ### Changes for existing tokens
 
 Before the role table, an `agent` token could call every route except the admin
@@ -331,6 +343,7 @@ whether `XMUSTARD_READ_ONLY=1` still serves the route.
 | `GET /api/workspaces/{workspace_id}/context` | core | admin | served |  | full memory history |
 | `POST /api/workspaces/{workspace_id}/context` | core | proposer | refused | remember | author is the principal |
 | `GET /api/workspaces/{workspace_id}/context/active` | core | reader | served | recall | scope=all needs admin |
+| `DELETE /api/workspaces/{workspace_id}/context/{entry_id}` | core | human-approver | refused |  | retract; purge=true deletes the text and keeps a digest tombstone |
 | `PUT /api/workspaces/{workspace_id}/context/{entry_id}` | core | proposer | refused |  | memory edit; author or admin only |
 | `POST /api/workspaces/{workspace_id}/context/{entry_id}/verify` | core | verifier | refused | verify | verifier is the principal |
 | `GET /api/workspaces/{workspace_id}/diagnostics` | core | reader | served | diagnostics |  |

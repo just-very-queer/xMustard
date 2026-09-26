@@ -93,13 +93,14 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
 			"Propose a durable memory (fact/decision/gotcha); pending until enough distinct agents verify it (open mode: promoted at once as self_asserted_open_mode). Pass content; optional title, paths (comma-separated files it is about, so recall flags it stale when they change).",
 		args: [
 			workspaceArg,
-			{ name: "content", type: "string", required: true, desc: "the memory text to propose" },
+			{ name: "content", type: "string", desc: "the memory text to propose" },
 			{ name: "title", type: "string", desc: "short title" },
 			{ name: "paths", type: "string", desc: "comma-separated repo-relative files the memory is about" },
 		],
 		build: (a) => {
 			// content travels in the JSON body, never the URL (XM-NEW-018)
-			const payload: Record<string, unknown> = { content: str(a, "content") };
+			const payload: Record<string, unknown> = {};
+			if (str(a, "content")) payload.content = str(a, "content");
 			if (str(a, "title")) payload.title = str(a, "title");
 			if (str(a, "paths")) payload.paths = splitCSV(str(a, "paths"));
 			return { method: "POST", path: ws(a, "/context"), body: JSON.stringify(payload) };

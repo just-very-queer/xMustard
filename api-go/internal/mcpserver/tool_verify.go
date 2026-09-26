@@ -3,6 +3,7 @@ package mcpserver
 import (
 	"encoding/json"
 	"net/url"
+	"strconv"
 )
 
 // maxVerifyNote bounds the reason stored with a vote.
@@ -17,6 +18,11 @@ var verifyTool = &Tool{
 		{Name: "approve", Type: typeBoolean, Desc: "approve (default true) or reject"},
 		{Name: "note", Type: typeString, MaxLen: maxVerifyNote, Desc: "reason for the verdict, stored with the vote"},
 	},
+	// Lifecycle outcomes (WS-19A): listed only in the full schema profile.
+	Advanced: []Arg{
+		{Name: "outcome", Type: typeString, Enum: []string{"approve", "reject", "retract"}, Desc: "overrides approve"},
+		{Name: "revision", Type: typeInteger, Min: 1, Max: maxRevision, Desc: "pending edit revision to vote on"},
+	},
 	// A reject can demote a promoted memory (destructive); a repeated vote replaces the
 	// caller's own prior verdict, so the call is idempotent.
 	Annotations: Annotations{Title: "Verify a memory", Destructive: true, Idempotent: true},
@@ -29,10 +35,19 @@ var verifyTool = &Tool{
 		if a["approve"] == "false" {
 			approve = "false"
 		}
+		// the note travels in the body, like memory content (XM-NEW-018)
+		payload := map[string]any{}
+		for _, k := range []string{"note", "outcome"} {
+			if a[k] != "" {
+				payload[k] = a[k]
+			}
+		}
+		if n, err := strconv.ParseInt(a["revision"], 10, 64); err == nil {
+			payload["revision"] = n
+		}
 		body := ""
-		if a["note"] != "" {
-			// the note travels in the body, like memory content (XM-NEW-018)
-			b, _ := json.Marshal(map[string]string{"note": a["note"]})
+		if len(payload) > 0 {
+			b, _ := json.Marshal(payload)
 			body = string(b)
 		}
 		return "POST", wsPath(a, "/context/"+url.PathEscape(a["entry_id"])+"/verify") + "?approve=" + approve, body

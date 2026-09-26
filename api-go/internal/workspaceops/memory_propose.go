@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"regexp"
 	"strings"
+	"time"
 
 	"xmustard/api-go/internal/govstore"
 )
@@ -99,6 +101,22 @@ type ContextEntry struct {
 	// Stale / StalePaths are computed at read time (drift-on-recall), never stored.
 	Stale      bool     `json:"stale,omitempty"`
 	StalePaths []string `json:"stale_paths,omitempty"`
+	// Lifecycle state (WS-19A). Revision is the served revision, the base_revision an
+	// edit compares against; PendingRevision is a proposed edit awaiting verification.
+	// Lifecycle is omitted while active. Supersedes lists the entries this one replaces
+	// once it is promoted; SupersededBy names the entry that replaced this one.
+	Revision        int64    `json:"revision,omitempty"`
+	PendingRevision int64    `json:"pending_revision,omitempty"`
+	Lifecycle       string   `json:"lifecycle,omitempty"`
+	Supersedes      []string `json:"supersedes,omitempty"`
+	SupersededBy    string   `json:"superseded_by,omitempty"`
+	InvalidatedAt   string   `json:"invalidated_at,omitempty"`
+	ExpiresAt       string   `json:"expires_at,omitempty"`
+	// Diff is the line diff from the served revision to the pending revision a verify
+	// voted on (PAR-GOV-05).
+	Diff string `json:"diff,omitempty"`
+	// Warnings reports input that was accepted but ignored, e.g. a malformed expiry.
+	Warnings []string `json:"warnings,omitempty"`
 }
 
 type ProposeContextRequest struct {
@@ -110,6 +128,13 @@ type ProposeContextRequest struct {
 	// RequireVerification can only TIGHTEN the gate: true requires the multi-agent
 	// threshold even in single-agent or open mode; false or nil uses the setting.
 	RequireVerification *bool `json:"require_verification,omitempty"`
+	// Supersedes lists active entries this proposal replaces (PAR-GOV-04). Nothing
+	// changes until the proposal is promoted; then every listed entry that is still
+	// active becomes superseded in the same transaction, and is never deleted.
+	Supersedes []string `json:"supersedes,omitempty"`
+	// Expires hides the entry after a UTC date (inclusive, YYYY-MM-DD) or an RFC 3339
+	// time (PAR-GOV-12). A malformed value fails open: no expiry, and a warning.
+	Expires string `json:"expires,omitempty"`
 	// OpenMode is set by the HTTP layer, never decoded from a client, when the caller
 	// is unauthenticated because no credentials are configured. The proposal is then
 	// promoted at once as self_asserted_open_mode instead of waiting for a quorum that
@@ -122,8 +147,11 @@ type ProposeContextRequest struct {
 // their ID. OpenMode marks a write made with no credentials configured (ID is then
 // OpenModeIdentity): open mode is a property of each write, not of the entry.
 type ContextActor struct {
-	ID       string
-	Admin    bool
+	ID    string
+	Admin bool
+	// Approver holds the human-approver role: it may retract, restore and purge
+	// directly, like an admin (PAR-GOV-06).
+	Approver bool
 	OpenMode bool
 }
 
@@ -177,6 +205,11 @@ func ProposeContext(dataDir, workspaceID string, req ProposeContextRequest) (*Co
 	if err != nil {
 		return nil, err
 	}
+	supersedes, err := cleanSupersedes(req.Supersedes)
+	if err != nil {
+		return nil, err
+	}
+	expiresAt, expiresOK := parseExpiry(req.Expires)
 	permission := strings.ToLower(strings.TrimSpace(req.Permission))
 	if permission != "readwrite" {
 		permission = "readonly" // default to the safest permission
@@ -196,16 +229,7 @@ func ProposeContext(dataDir, workspaceID string, req ProposeContextRequest) (*Co
 		source = OpenModeIdentity
 	}
 	// selfNote, when set, promotes the entry on the proposer's own assertion.
-	selfNote := ""
-	switch {
-	case req.OpenMode && !tighten:
-		// No credentials are configured, so every caller is OpenModeIdentity and a
-		// peer quorum can never form. Promote the entry labelled as self-asserted
-		// instead of leaving it pending forever.
-		selfNote = "open mode: self-asserted (no authentication configured)"
-	case !requireMulti:
-		selfNote = "single-agent mode"
-	}
+	selfNote := selfAssertion(req.OpenMode, tighten, requireMulti)
 	required := threshold
 	if selfNote != "" {
 		required = 1
@@ -218,11 +242,17 @@ func ProposeContext(dataDir, workspaceID string, req ProposeContextRequest) (*Co
 	var out ContextEntry
 	var promoted bool
 	err = memoryUpdate(ctx, dataDir, workspaceID, func(tx govstore.Tx) error {
+		for _, id := range supersedes {
+			if _, _, err := loadEntryTx(ctx, tx, workspaceID, id); err != nil {
+				return err
+			}
+		}
 		e, err := tx.InsertEntry(ctx, govstore.NewEntry{
 			ID:          "ctx_" + hashID(workspaceID, req.Title, req.Content+nowUTC())[:12],
 			WorkspaceID: workspaceID, Title: title, Content: req.Content, Permission: permission,
 			RequiredVerifications: required, RequireVerification: tighten,
 			Paths: cleanPaths(anchors), SearchTokens: memoryTokenList(title + " " + req.Content),
+			ExpiresAt: expiresAt, Metadata: supersedesMetadata(supersedes),
 		}, actor)
 		if err != nil {
 			return err
@@ -240,8 +270,160 @@ func ProposeContext(dataDir, workspaceID string, req ProposeContextRequest) (*Co
 		return nil, err
 	}
 	out.Content = req.Content
+	if !expiresOK {
+		out.Warnings = append(out.Warnings, fmt.Sprintf("expires %q is not a date or RFC 3339 time; no expiry set", req.Expires))
+	}
 	if promoted {
 		recordVerifyFeedback(dataDir, workspaceID, out.ID, out.Paths)
 	}
 	return &out, nil
+}
+
+// selfAssertion is the note of the author's own approval that promotes a write at once,
+// or "" when the write waits for peers. Open mode (no credentials, so a peer quorum can
+// never form) and single-agent mode (the operator's setting) self-assert unless the
+// entry asked for peer verification.
+func selfAssertion(openMode, requirePeers, requireMulti bool) string {
+	switch {
+	case requirePeers:
+		return ""
+	case openMode:
+		return "open mode: self-asserted (no authentication configured)"
+	case !requireMulti:
+		return "single-agent mode"
+	}
+	return ""
+}
+
+// maxSupersedes bounds how many entries one proposal may replace.
+const maxSupersedes = 16
+
+// supersedesKey is the entry metadata key that holds a proposal's pending supersession
+// until promotion applies it.
+const supersedesKey = "supersedes"
+
+func cleanSupersedes(ids []string) ([]string, error) {
+	out := cleanPaths(ids) // trimmed, non-empty, de-duplicated, order kept
+	if len(out) > maxSupersedes {
+		return nil, fmt.Errorf("supersedes lists more than %d entries: %w", maxSupersedes, ErrInvalidInput)
+	}
+	for _, id := range out {
+		if err := validateSafeID("entry", id); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+func supersedesMetadata(ids []string) map[string]string {
+	if len(ids) == 0 {
+		return nil
+	}
+	return map[string]string{supersedesKey: strings.Join(ids, ",")}
+}
+
+// pendingSupersedes is the supersession a proposal still waits to apply.
+func pendingSupersedes(e govstore.Entry) []string {
+	if v := e.Metadata[supersedesKey]; v != "" {
+		return strings.Split(v, ",")
+	}
+	return nil
+}
+
+// applySupersession runs when e is promoted: every entry it names that is still active
+// becomes superseded by it, atomically with the promotion, and the pending intent is
+// cleared so a later restore of an old entry is not undone by the next vote.
+func applySupersession(ctx context.Context, tx govstore.Tx, e govstore.Entry, actor govstore.Actor) error {
+	olds := pendingSupersedes(e)
+	if len(olds) == 0 {
+		return nil
+	}
+	var live []string
+	for _, id := range olds {
+		old, err := tx.GetEntry(ctx, id)
+		if err != nil {
+			return err
+		}
+		if old.WorkspaceID == e.WorkspaceID && old.Lifecycle == govstore.LifecycleActive {
+			live = append(live, id)
+		}
+	}
+	if len(live) > 0 {
+		if err := tx.Supersede(ctx, govstore.SupersedeInput{NewID: e.ID, OldIDs: live,
+			Reason: "superseded by promoted entry " + e.ID}, actor); err != nil {
+			return err
+		}
+	}
+	meta := maps.Clone(e.Metadata)
+	delete(meta, supersedesKey)
+	_, err := tx.SetClassification(ctx, e.ID, govstore.Classification{Kind: e.Kind, Topic: e.Topic, Tags: e.Tags, Metadata: meta}, actor)
+	return err
+}
+
+// parseExpiry reads an expiry: a UTC date is inclusive (hidden from the next midnight
+// UTC), an RFC 3339 time is exact. ok is false for a malformed value, which fails open
+// to no expiry (PAR-GOV-12).
+func parseExpiry(s string) (expiresAt string, ok bool) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "", true
+	}
+	if d, err := time.Parse(time.DateOnly, s); err == nil {
+		return d.AddDate(0, 0, 1).UTC().Format(time.RFC3339), true
+	}
+	if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
+		return t.UTC().Format(time.RFC3339Nano), true
+	}
+	return "", false
+}
+
+// RememberRequest is one remember write. Op selects it: propose (the default), supersede
+// (a proposal that must name Supersedes), edit (a focused edit of EntryID, see
+// EditRequest), retire (see RetireContext) or restore (see RestoreContext). Reason is
+// required by all but propose and supersede.
+type RememberRequest struct {
+	ProposeContextRequest
+	Op           string  `json:"op,omitempty"`
+	EntryID      string  `json:"entry_id,omitempty"`
+	BaseRevision int64   `json:"base_revision,omitempty"`
+	Reason       string  `json:"reason,omitempty"`
+	OldString    string  `json:"old_string,omitempty"`
+	NewString    string  `json:"new_string,omitempty"`
+	Description  *string `json:"description,omitempty"`
+}
+
+var rememberOps = map[string]func(dataDir, workspaceID string, req RememberRequest, actor ContextActor) (*ContextEntry, error){
+	"propose": func(dataDir, workspaceID string, req RememberRequest, _ ContextActor) (*ContextEntry, error) {
+		return ProposeContext(dataDir, workspaceID, req.ProposeContextRequest)
+	},
+	"supersede": func(dataDir, workspaceID string, req RememberRequest, _ ContextActor) (*ContextEntry, error) {
+		if len(req.Supersedes) == 0 {
+			return nil, fmt.Errorf("op supersede needs supersedes: %w", ErrInvalidInput)
+		}
+		return ProposeContext(dataDir, workspaceID, req.ProposeContextRequest)
+	},
+	"edit": func(dataDir, workspaceID string, req RememberRequest, actor ContextActor) (*ContextEntry, error) {
+		return EditContext(dataDir, workspaceID, req.EntryID, EditRequest{
+			BaseRevision: req.BaseRevision, Reason: req.Reason, OldString: req.OldString, NewString: req.NewString,
+			Content: req.Content, Description: req.Description, Expires: req.Expires,
+		}, actor)
+	},
+	"retire": func(dataDir, workspaceID string, req RememberRequest, actor ContextActor) (*ContextEntry, error) {
+		return RetireContext(dataDir, workspaceID, req.EntryID, req.Reason, actor)
+	},
+	"restore": func(dataDir, workspaceID string, req RememberRequest, actor ContextActor) (*ContextEntry, error) {
+		return RestoreContext(dataDir, workspaceID, req.EntryID, req.Reason, actor)
+	},
+}
+
+// Remember runs one remember write as actor, who is always the author: a proposal is
+// attributed to actor, never to a Source in the request.
+func Remember(dataDir, workspaceID string, req RememberRequest, actor ContextActor) (*ContextEntry, error) {
+	op := fallbackString(strings.ToLower(strings.TrimSpace(req.Op)), "propose")
+	run, ok := rememberOps[op]
+	if !ok {
+		return nil, fmt.Errorf("op %q is not propose, supersede, edit, retire or restore: %w", req.Op, ErrInvalidInput)
+	}
+	req.Source, req.OpenMode = actor.ID, actor.OpenMode
+	return run(dataDir, workspaceID, req, actor)
 }

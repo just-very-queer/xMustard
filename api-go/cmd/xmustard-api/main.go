@@ -297,7 +297,11 @@ func (c memoryCaller) id() string {
 // the open-mode caller already passes every requireRole gate (it is the local
 // operator), so it edits as admin.
 func (c memoryCaller) actor() workspaceops.ContextActor {
-	return workspaceops.ContextActor{ID: c.id(), Admin: c.openMode || c.principal.Has(workspaceops.RoleAdmin), OpenMode: c.openMode}
+	return workspaceops.ContextActor{
+		ID: c.id(), OpenMode: c.openMode,
+		Admin:    c.openMode || c.principal.Has(workspaceops.RoleAdmin),
+		Approver: c.openMode || c.principal.Has(workspaceops.RoleHumanApprover),
+	}
 }
 
 // requireMemoryCaller gates a governed-memory write on role (proposer to propose or
@@ -3869,6 +3873,13 @@ func registerRoutes(mux routeRegistrar) {
 			issueIntel(w, err, result)
 			return
 		}
+		// recall(entry_id) fetches one entry by id in any lifecycle state (expired,
+		// superseded, retired, purged tombstone); history=true adds its revisions and events.
+		if id := q.Get("entry_id"); id != "" {
+			result, err := workspaceops.GetContextEntry(dd, r.PathValue("workspace_id"), id, q.Get("history") == "true")
+			issueIntel(w, err, result)
+			return
+		}
 		var paths []string
 		if q.Get("paths") != "" {
 			paths = strings.Split(q.Get("paths"), ",")
@@ -3882,99 +3893,7 @@ func registerRoutes(mux routeRegistrar) {
 		result, err := workspaceops.RecallContextCtx(r.Context(), dd, r.PathValue("workspace_id"), q.Get("query"), paths, limit)
 		issueIntel(w, err, result)
 	})
-	mux.HandleFunc("POST /api/workspaces/{workspace_id}/context", func(w http.ResponseWriter, r *http.Request) {
-		caller, ok := requireMemoryCaller(w, r, workspaceops.RoleProposer)
-		if !ok {
-			return
-		}
-		var req workspaceops.ProposeContextRequest
-		// body optional (query params are the MCP-bridge path), but never malformed
-		if !requireWellFormedJSON(w, r, &req) {
-			return
-		}
-		q := r.URL.Query()
-		if req.Content == "" {
-			req.Content = q.Get("content")
-		}
-		if req.Title == "" {
-			req.Title = q.Get("title")
-		}
-		if req.Source == "" {
-			req.Source = q.Get("source")
-		}
-		if req.Permission == "" {
-			req.Permission = q.Get("permission")
-		}
-		if len(req.Paths) == 0 && q.Get("paths") != "" {
-			req.Paths = strings.Split(q.Get("paths"), ",")
-		}
-		// attribute to the authenticated principal; open-mode callers collapse to one
-		// identity and their proposals are promoted as self-asserted, not peer-verified.
-		req.Source = caller.id()
-		req.OpenMode = caller.openMode
-		result, err := workspaceops.ProposeContext(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), req)
-		issueIntel(w, err, result)
-	})
-	mux.HandleFunc("POST /api/workspaces/{workspace_id}/context/{entry_id}/verify", func(w http.ResponseWriter, r *http.Request) {
-		caller, ok := requireMemoryCaller(w, r, workspaceops.RoleVerifier)
-		if !ok {
-			return
-		}
-		var req struct {
-			Agent   string `json:"agent"`
-			Approve bool   `json:"approve"`
-			Note    string `json:"note"`
-		}
-		// body optional (query params are the MCP-bridge path), but never malformed
-		if !requireWellFormedJSON(w, r, &req) {
-			return
-		}
-		q := r.URL.Query()
-		if req.Agent == "" {
-			req.Agent = q.Get("agent")
-		}
-		if q.Has("approve") {
-			req.Approve = q.Get("approve") == "true" // only a literal "true" approves; anything else is a reject
-		}
-		if req.Note == "" {
-			req.Note = q.Get("note")
-		}
-		// The agent identity is the AUTHENTICATED principal, never a caller-asserted
-		// string (req.Agent is ignored). In open mode (no auth configured) all
-		// unauthenticated callers collapse to a single identity, so N fabricated agent
-		// names cannot satisfy the multi-agent gate.
-		result, err := workspaceops.VerifyContextAs(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), r.PathValue("entry_id"), caller.actor(), req.Approve, req.Note)
-		issueIntel(w, err, result)
-	})
-	mux.HandleFunc("PUT /api/workspaces/{workspace_id}/context/{entry_id}", func(w http.ResponseWriter, r *http.Request) {
-		// Editing memory is an agent action bound to the entry's author (or an admin):
-		// an edit resets the entry's verification, so an unbound edit would let any
-		// caller rewrite and demote any readwrite memory.
-		caller, ok := requireMemoryCaller(w, r, workspaceops.RoleProposer)
-		if !ok {
-			return
-		}
-		var req struct {
-			Content string `json:"content"`
-		}
-		// Same strict body handling as propose/verify, but required: 400 on an absent,
-		// malformed or trailing-junk body, 413 past the cap. Empty content is a 400
-		// from UpdateContextContent, so a misspelled field cannot blank a memory.
-		if !requireJSONBody(w, r, &req) {
-			return
-		}
-		dd := envDefault("XMUSTARD_DATA_DIR", "../backend/data")
-		result, err := workspaceops.UpdateContextContent(dd, r.PathValue("workspace_id"), r.PathValue("entry_id"), req.Content, caller.actor())
-		if errors.Is(err, workspaceops.ErrNotEntryAuthor) {
-			workspaceops.RecordAuthAudit(dd, workspaceops.AuthAuditEvent{
-				Action: "denied", Actor: caller.id(), Detail: "not the author of context entry " + r.PathValue("entry_id"),
-				Method: r.Method, Path: r.URL.Path, RemoteAddr: r.RemoteAddr,
-			})
-			writeJSON(w, http.StatusForbidden, map[string]any{"error": err.Error()})
-			return
-		}
-		issueIntel(w, err, result)
-	})
+	registerMemoryRoutes(mux)
 	mux.HandleFunc("GET /api/workspaces/{workspace_id}/hotspots", func(w http.ResponseWriter, r *http.Request) {
 		limit := 20
 		if v := r.URL.Query().Get("limit"); v != "" {

@@ -579,6 +579,12 @@ Source: `docs/research/PARITY_REQUIREMENTS_2026-09-25.md` (requirements, process
 
 **Correction.** Critic: split into WS-19a (lifecycle states, CAS edit, expiry) and WS-19b (provenance binding, evidence-bound votes, owner-distinct policy, ingest redaction).
 
+**WS-19A delivered (2026-09-26).** Lifecycle states, CAS edits and expiry go through the existing tools. None is advertised in the lean tools/list: remember takes op=propose|supersede|edit|retire|restore, entry_id, base_revision, reason, old_string, new_string, description, supersedes and expires. verify takes outcome=approve|reject|retract and revision. recall takes entry_id and history. remember's content is no longer required, because edit, retire and restore act on an existing entry. The full-profile caps grew by exactly the cost of the new Advanced arguments, and the lean caps shrank by 23 bytes. Accepted deviations:
+- A pending supersession is kept in the new entry's `supersedes` metadata. It is applied in the promoting transaction and then cleared, so no schema migration is needed.
+- There is no separate retire verdict. Retiring promoted memory casts the caller's retract verdict and needs the entry's quorum, like verify(outcome=retract). An admin or human approver archives at once, and an author archives their own unpromoted proposal at once. Protected-memory human gating waits for WS-31's tiers.
+- Fetch by id is served on the recall route (`GET context/active?entry_id=`), so the nine tool routes stay one per tool. Restore goes through remember(op=restore) and needs no separate route. Admin retract and purge are `DELETE context/{id}` in memory_routes.go.
+- duplicate_of and the helpful, misleading and stale_harm outcomes, with evidence handles checked at vote time, are left to WS-19B.
+
 ### WS-20 — Recall v2: ranking, filters, disclosure, budgets and verification-queue visibility
 
 **Goal.** Rebuild recall on govstore. FTS5 BM25 is fused with path overlap, trust, recency and a stale penalty, and explain=true returns score_details. Filters: kind, tags, topic, path_prefix, since/until, by, status (promoted, pending, awaiting_me), include_pending, include_superseded, show_expired. Add cursor pagination, names_only, a compact render with max_chars, session-seen suppression with TTL, and history=true. Add pending_for_you and memory_pressure to ground.

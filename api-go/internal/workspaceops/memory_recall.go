@@ -125,10 +125,9 @@ var contextFilters = map[string]func(*govstore.EntryFilter){
 	"verified": promotedFilter,
 }
 
-func promotedFilter(f *govstore.EntryFilter) {
-	promoted := true
-	f.Promoted = &promoted
-}
+// promotedFilter keeps what is served: promoted, active and unexpired. An expired
+// entry is hidden, never deleted (PAR-GOV-12); recall(entry_id) still fetches it.
+func promotedFilter(f *govstore.EntryFilter) { f.ServedOnly = true }
 
 // ListContextEntries returns entries filtered by status: "" / "all", "pending",
 // "promoted"/"active"/"verified", "rejected". An unknown filter selects nothing.

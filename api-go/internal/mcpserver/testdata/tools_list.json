@@ -137,9 +137,6 @@
             "type": "string"
           }
         },
-        "required": [
-          "content"
-        ],
         "type": "object"
       },
       "name": "remember",

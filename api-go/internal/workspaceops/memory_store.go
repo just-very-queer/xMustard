@@ -289,6 +289,14 @@ func contextEntryFrom(e govstore.Entry, votes []govstore.Vote, anchors []govstor
 		RequiredVerifications: e.RequiredVerifications, RequireVerification: e.RequireVerification,
 		VerificationMode: e.VerificationMode, CreatedAt: e.CreatedAt, UpdatedAt: e.UpdatedAt,
 		SearchTokens: e.SearchTokens, ContentDigest: e.ContentDigest,
+		Revision: e.Revision, SupersededBy: e.SupersededBy, InvalidatedAt: e.InvalidatedAt, ExpiresAt: e.ExpiresAt,
+		Supersedes: pendingSupersedes(e),
+	}
+	if e.HeadRevision > e.Revision {
+		ce.PendingRevision = e.HeadRevision
+	}
+	if e.Lifecycle != govstore.LifecycleActive {
+		ce.Lifecycle = e.Lifecycle
 	}
 	for _, v := range votes {
 		if v.Verdict == govstore.VerdictApprove || v.Verdict == govstore.VerdictReject {
@@ -337,11 +345,21 @@ func pathBaselines(hashes map[string]string) []govstore.Baseline {
 // loadEntryTx reads one entry of the workspace for a write. An entry of another
 // workspace is reported missing, never touched.
 func loadEntryTx(ctx context.Context, r govstore.Reader, workspaceID, entryID string) (govstore.Entry, ContextEntry, error) {
+	e, ce, err := loadAnyEntryTx(ctx, r, workspaceID, entryID)
+	if err == nil && e.Lifecycle != govstore.LifecycleActive {
+		err = fmt.Errorf("entry %s: %w", entryID, os.ErrNotExist)
+	}
+	return e, ce, err
+}
+
+// loadAnyEntryTx reads one entry of the workspace in any lifecycle state, for history
+// reads and lifecycle transitions.
+func loadAnyEntryTx(ctx context.Context, r govstore.Reader, workspaceID, entryID string) (govstore.Entry, ContextEntry, error) {
 	e, err := r.GetEntry(ctx, entryID)
 	if err != nil {
 		return govstore.Entry{}, ContextEntry{}, err
 	}
-	if e.WorkspaceID != workspaceID || e.Lifecycle != govstore.LifecycleActive {
+	if e.WorkspaceID != workspaceID {
 		return govstore.Entry{}, ContextEntry{}, fmt.Errorf("entry %s: %w", entryID, os.ErrNotExist)
 	}
 	ce, err := projectEntries(ctx, r, []govstore.Entry{e})

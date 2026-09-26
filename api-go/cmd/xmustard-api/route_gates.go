@@ -77,6 +77,7 @@ var routeGateTable = map[string]routeGate{
 	"GET /api/workspaces/{workspace_id}/diagnostics":                coreGate(roleReader, "diagnostics", ""),
 	"GET /api/workspaces/{workspace_id}/runs/{run_id}/why-failed":   coreGate(roleReader, "why_failed", ""),
 	"PUT /api/workspaces/{workspace_id}/context/{entry_id}":         coreGate(roleProposer, "", "memory edit; author or admin only"),
+	"DELETE /api/workspaces/{workspace_id}/context/{entry_id}":      coreGate(roleApprover, "", "retract; purge=true deletes the text and keeps a digest tombstone"),
 	"GET /api/workspaces/{workspace_id}/context":                    coreGate(roleAdmin, "", "full memory history"),
 
 	// --- core: MCP over Streamable HTTP (mcp_routes.go) ---
