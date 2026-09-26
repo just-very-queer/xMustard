@@ -1,4 +1,6 @@
-// Workspace resolution for calls that omit workspace_id, as the MCP server does
+// Who the caller is and where it works: callerTools scopes the nine tools to the
+// caller (GET /api/auth/whoami). Workspace resolution for calls that omit
+// workspace_id works as the MCP server's does
 // (api-go/internal/mcpserver/resolve_workspace.go): XMUSTARD_WORKSPACE_ID first, then
 // Pi's working directory, mapped to the registered workspace with the longest root
 // containing it. Unlike the MCP server the adapter never registers a repository; an
@@ -75,5 +77,25 @@ export class WorkspaceResolver {
 		if (res.status !== 200) throw errorFromResponse("GET /api/workspaces", res);
 		const parsed = JSON.parse(new TextDecoder().decode(res.body)) as unknown;
 		return Array.isArray(parsed) ? (parsed as Registered[]) : [];
+	}
+}
+
+// Bound on the whoami lookup at session start: a slow API never delays Pi by more.
+export const CALLER_TOOLS_TIMEOUT_MS = 2_000;
+
+// callerTools asks the API which of the nine tools this caller may use on this
+// deployment (GET /api/auth/whoami "tools": roles, read-only mode, disabled tools and
+// profile applied), as the MCP shim does for tools/list. It returns undefined when
+// the API cannot say (unreachable, 401, an older API without the field); every tool
+// then stays active and the API still enforces each call.
+export async function callerTools(cfg: AdapterConfig, signal?: AbortSignal): Promise<ReadonlySet<string> | undefined> {
+	try {
+		const res = await send(cfg, { method: "GET", path: "/api/auth/whoami", timeoutMs: CALLER_TOOLS_TIMEOUT_MS, signal, maxBytes: 64 << 10 });
+		if (res.status !== 200) throw errorFromResponse("GET /api/auth/whoami", res);
+		const who = JSON.parse(new TextDecoder().decode(res.body)) as { tools?: unknown };
+		if (!Array.isArray(who.tools)) return undefined;
+		return new Set(who.tools.filter((t): t is string => typeof t === "string"));
+	} catch {
+		return undefined;
 	}
 }

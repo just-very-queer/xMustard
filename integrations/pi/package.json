@@ -1,8 +1,8 @@
 {
   "name": "@xmustard/pi-extension",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
-  "description": "Pi extension exposing xMustard's nine tools over HTTP, with bounded evidence delivery and xmustard_expand paging.",
+  "description": "Pi extension exposing xMustard's nine tools over HTTP, with bounded evidence delivery and xmustard_expand paging, built-in tool projection, turn_end masking and snapshot compaction.",
   "type": "module",
   "license": "UNLICENSED",
   "engines": {

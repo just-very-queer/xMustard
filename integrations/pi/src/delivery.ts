@@ -15,15 +15,21 @@
 //
 // Either way only the bounded projection enters model context; originals stay on
 // the Go side and are read in pages through xmustard_expand until they expire.
+//
+// Pi's built-in tools (bash, read, grep, find, ls, edit, write) go through Go's
+// universal capture route instead (POST .../evidence/capture, format=pi): a result
+// larger than the projection target is replaced by its tool-family projection plus
+// the same [xmustard evidence] recovery line; isError and details are kept (details
+// gain an `xmustard` member). Anything that goes wrong leaves Pi's own result as is.
 
 import { createHash } from "node:crypto";
-import type { AdapterConfig } from "./config.ts";
+import { type AdapterConfig, MIN_CAPTURE_TARGET, PI_POLICY_TARGET } from "./config.ts";
 import { errorFromResponse, type HttpResponse, send, XmustardHttpError } from "./http.ts";
-import { checkRequired, goQueryEscape, type ToolArgs, type ToolSpec } from "./tools.ts";
+import { BUILTIN_TOOLS, checkRequired, goQueryEscape, type ToolArgs, type ToolSpec } from "./tools.ts";
 
 export const DELIVERY_VERSION = "xmustard.evidence/v1";
 export const DELIVERY_HEADER = "X-Xmustard-Delivery";
-export const ADAPTER_VERSION = "pi-adapter/0.1.0";
+export const ADAPTER_VERSION = "pi-adapter/0.2.0";
 export const EXPAND_TOOL = "xmustard_expand";
 
 // Inline limit for results that reach the model without a Go projection (Go's own
@@ -490,4 +496,253 @@ async function search(cfg: AdapterConfig, args: ExpandArgs, signal: AbortSignal 
 	}
 	if (!Array.isArray(parsed.lines)) throw new Error("xMustard GET /evidence/search: malformed result");
 	return renderSearch(parsed);
+}
+
+// ---- universal capture ----------------------------------------------------------------
+
+// A capture answer is an envelope plus capture metadata and the client shape.
+const MAX_CAPTURE_RESPONSE = 4 << 20;
+// After Go says capture is unavailable (no redactor wired, unreachable, hung), the
+// adapter stops asking for this long, so built-in results are not delayed each time.
+export const CAPTURE_PAUSE_MS = 30_000;
+
+// Observation mirrors evidence.ObservationResult (Go JSON), the fields the adapter reads.
+export interface Observation extends Delivery {
+	family?: string;
+	target_bytes?: number;
+	shape?: { client: string; shape: string; mode: string; reason?: string; chars?: number };
+}
+
+export interface CaptureInput {
+	format: "pi" | "raw";
+	body: string; // a Pi tool_result event (format pi) or the output itself (raw)
+	tool: string;
+	callId: string;
+	sessionId?: string;
+	isError: boolean;
+	target?: number; // lower the pi projection target for this capture (>= 1 KiB)
+	command?: string;
+	path?: string;
+	argsDigest?: string;
+}
+
+// Capturer posts outputs to the capture route and pauses after an outage.
+export class Capturer {
+	private readonly cfg: AdapterConfig;
+	private readonly now: () => number;
+	// tool_version of a built-in's output: the Pi that produced it (PAR-CTX-01); the
+	// adapter's own version stands for the nine tools and adapter documents
+	private readonly builtinVersion: string;
+	private pausedUntil = 0;
+	private pauseReason = "";
+	constructor(cfg: AdapterConfig, now: () => number = Date.now, builtinVersion = ADAPTER_VERSION) {
+		this.cfg = cfg;
+		this.now = now;
+		this.builtinVersion = builtinVersion;
+	}
+
+	// paused names why capture is currently skipped, or is undefined.
+	get paused(): string | undefined {
+		return this.now() < this.pausedUntil ? this.pauseReason : undefined;
+	}
+
+	async observe(workspaceId: string, input: CaptureInput, signal?: AbortSignal): Promise<Observation> {
+		const paused = this.paused;
+		if (paused) throw new Error(`capture paused: ${paused}`);
+		const params = new URLSearchParams({
+			format: input.format,
+			client: "pi",
+			tool: input.tool,
+			tool_version: (BUILTIN_TOOLS as readonly string[]).includes(input.tool) ? this.builtinVersion : ADAPTER_VERSION,
+			call_id: input.callId,
+			is_error: String(input.isError),
+		});
+		if (input.sessionId) params.set("session_id", input.sessionId);
+		if (input.target !== undefined) params.set("target", String(Math.max(MIN_CAPTURE_TARGET, Math.trunc(input.target))));
+		if (input.command) params.set("command", input.command.slice(0, 4096));
+		if (input.path) params.set("path", input.path.slice(0, 4096));
+		if (input.argsDigest) params.set("args_digest", input.argsDigest);
+		if (input.format === "raw") params.set("content_type", "text/plain; charset=utf-8");
+		const where = "POST /evidence/capture";
+		try {
+			const res = await send(this.cfg, {
+				method: "POST",
+				path: `/api/workspaces/${encodeURIComponent(workspaceId)}/evidence/capture?${params}`,
+				body: input.body,
+				contentType: input.format === "raw" ? "text/plain; charset=utf-8" : "application/json",
+				timeoutMs: this.cfg.projectionTimeoutMs,
+				signal,
+				maxBytes: MAX_CAPTURE_RESPONSE,
+			});
+			if (res.status >= 400) throw errorFromResponse(where, res);
+			let parsed: unknown;
+			try {
+				parsed = JSON.parse(utf8.decode(res.body));
+			} catch {
+				throw new XmustardHttpError("http", `xMustard ${where}: malformed capture envelope`, res.status);
+			}
+			if (!isDelivery(parsed)) throw new XmustardHttpError("http", `xMustard ${where}: unexpected capture envelope version`, res.status);
+			return parsed as Observation;
+		} catch (err) {
+			this.noteFailure(err, signal);
+			throw err;
+		}
+	}
+
+	// noteFailure pauses capture after an outage or a standing refusal: Go unreachable
+	// or hung, capture refused because no redactor is wired, or this principal may not
+	// capture (401/403). A caller's own abort is not an outage.
+	noteFailure(err: unknown, callerSignal?: AbortSignal): void {
+		if (!(err instanceof XmustardHttpError) || callerSignal?.aborted) return;
+		const outage =
+			err.failure === "unreachable" ||
+			err.failure === "timeout" ||
+			err.failure === "aborted" ||
+			err.status === 401 ||
+			err.status === 403 ||
+			(err.status === 503 && err.reason === "redaction_unavailable");
+		if (outage) {
+			this.pausedUntil = this.now() + CAPTURE_PAUSE_MS;
+			this.pauseReason = err.message;
+		}
+	}
+}
+
+// BuiltinEvidence is what a built-in result's details.xmustard records.
+export interface BuiltinEvidence {
+	path: "capture" | "passthrough";
+	workspace_id?: string;
+	handle?: string;
+	raw_bytes?: number;
+	raw_sha256?: string;
+	projected_bytes?: number;
+	reducer?: string;
+	family?: string;
+	omissions?: number;
+	captured_identity?: string;
+	expires_at?: string;
+	shape?: string;
+	reason?: string;
+}
+
+export interface BuiltinResultInput {
+	toolCallId: string;
+	toolName: string;
+	input: Record<string, unknown>;
+	content: unknown[];
+	details: unknown;
+	isError: boolean;
+}
+
+export interface BuiltinResultOutput {
+	content?: { type: "text"; text: string }[];
+	details?: unknown;
+}
+
+const isPlainObject = (v: unknown): v is Record<string, unknown> => !!v && typeof v === "object" && !Array.isArray(v);
+
+// withEvidence keeps a tool's own details and adds the xMustard record beside them.
+export function withEvidence(details: unknown, xm: BuiltinEvidence): unknown {
+	if (details === undefined || details === null) return { xmustard: xm };
+	if (isPlainObject(details)) return { ...details, xmustard: xm };
+	return details; // not an object: left exactly as the tool produced it
+}
+
+// textBlocks returns the text of a content array, or undefined when it holds anything
+// but text blocks (an image result is never captured).
+export function textBlocks(content: unknown[]): string[] | undefined {
+	const out: string[] = [];
+	for (const b of content) {
+		const block = b as { type?: unknown; text?: unknown };
+		if (block?.type !== "text" || typeof block.text !== "string") return undefined;
+		out.push(block.text);
+	}
+	return out;
+}
+
+// projectBuiltin is the tool_result handler for Pi's built-in tools. A text result
+// larger than the projection target is captured and replaced by its projection with
+// a recovery line; isError is never touched and details are kept. Every failure
+// leaves Pi's result as it is (a reason goes into details.xmustard).
+export async function projectBuiltin(
+	cfg: AdapterConfig,
+	capturer: Capturer,
+	resolveWorkspace: (signal?: AbortSignal) => Promise<string>,
+	ev: BuiltinResultInput,
+	meta: { sessionId?: string; signal?: AbortSignal },
+	onHandle: () => void,
+): Promise<BuiltinResultOutput | undefined> {
+	if (!cfg.builtins.has(ev.toolName)) return undefined;
+	const texts = textBlocks(ev.content);
+	if (!texts) return undefined;
+	const bytes = texts.reduce((n, t) => n + Buffer.byteLength(t, "utf8"), 0);
+	if (bytes <= cfg.projectionTarget) return undefined; // Go would pass it through unchanged
+	const passthrough = (reason: string): BuiltinResultOutput => ({ details: withEvidence(ev.details, { path: "passthrough", reason }) });
+	const paused = capturer.paused;
+	if (paused) return passthrough(`capture paused: ${paused}`);
+	let workspaceId: string;
+	try {
+		workspaceId = await resolveWorkspace(meta.signal);
+	} catch (err) {
+		capturer.noteFailure(err, meta.signal);
+		return passthrough(err instanceof Error ? err.message : String(err));
+	}
+	const body = JSON.stringify({
+		type: "tool_result",
+		toolName: ev.toolName,
+		toolCallId: ev.toolCallId,
+		...(meta.sessionId ? { sessionId: meta.sessionId } : {}),
+		input: ev.input ?? {},
+		content: ev.content,
+		isError: ev.isError,
+	});
+	let obs: Observation;
+	try {
+		obs = await capturer.observe(
+			workspaceId,
+			{
+				format: "pi",
+				body,
+				tool: ev.toolName,
+				callId: ev.toolCallId,
+				sessionId: meta.sessionId,
+				isError: ev.isError,
+				target: cfg.projectionTarget < PI_POLICY_TARGET ? cfg.projectionTarget : undefined,
+			},
+			meta.signal,
+		);
+	} catch (err) {
+		return passthrough(err instanceof Error ? err.message : String(err));
+	}
+	if (!obs.reduced || !obs.handle) return undefined; // nothing omitted: Pi's result stands
+	if (obs.shape?.mode !== "replace") {
+		// Go could not shape a Pi payload (e.g. status members the text cannot carry):
+		// the original stays; the capture is still retained behind the handle
+		return passthrough(`shape ${obs.shape?.mode ?? "missing"}: ${obs.shape?.reason ?? "no shape"}`);
+	}
+	onHandle();
+	return {
+		content: [{ type: "text", text: renderDelivery(obs, workspaceId) }],
+		details: withEvidence(ev.details, {
+			path: "capture",
+			workspace_id: workspaceId,
+			handle: obs.handle,
+			raw_bytes: obs.raw_bytes,
+			raw_sha256: obs.raw_sha256,
+			projected_bytes: obs.projected_bytes,
+			reducer: obs.reducer,
+			family: obs.family,
+			omissions: obs.omissions?.length ?? 0,
+			captured_identity: obs.captured_identity ?? "unknown",
+			expires_at: obs.expires_at,
+			shape: obs.shape?.shape,
+		}),
+	};
+}
+
+// argsDigestOf is audit metadata for a capture: SHA-256 of the tool input as JSON.
+export function argsDigestOf(input: unknown): string {
+	return createHash("sha256")
+		.update(JSON.stringify(input ?? {}))
+		.digest("hex");
 }

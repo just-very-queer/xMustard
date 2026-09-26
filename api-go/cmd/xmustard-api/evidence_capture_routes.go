@@ -22,6 +22,7 @@ import (
 //   POST /api/workspaces/{ws}/evidence/capture?format=raw|claude|codex|cursor|pi|opencode
 //        &client=&tool=&tool_version=&call_id=&session_id=&agent_id=&args_digest=
 //        &is_error=&exit_code=&content_type=&command=&path=&lines=A-B&start_line=&family=
+//        &target=<bytes>
 //   GET  /api/workspaces/{ws}/evidence/search?handle=&pattern=|query=&lines=A-B
 //        &max_matches=&context=&offset=&start_line=
 //
@@ -36,6 +37,10 @@ import (
 // redaction_unavailable until a streaming redactor is wired (captureRedactor; the
 // WS-05 redact.Stream plugs in there). Search stays available for originals that
 // were captured redacted.
+//
+// target lowers the client's projection target for one capture (1 KiB..1 MiB; a value
+// above the client policy's target changes nothing). The Pi adapter uses it to retain
+// an older tool result it is about to mask or compact behind a handle (WS-24).
 //
 // Route gates (WS-09): both routes register on the gated mux and are classified in
 // routeGateTable: capture is core, needs the proposer role and is served in
@@ -118,6 +123,11 @@ func registerEvidenceCaptureRoutes(mux routeRegistrar, store *evidence.Store) {
 		} else if v != nil {
 			sel.StartLine = *v
 		}
+		target, err := optionalInt(q.Get("target"))
+		if err != nil || (target != nil && (*target < evidence.MinCaptureTarget || *target > evidence.MaxCaptureTarget)) {
+			badCapture(w, "invalid_target", fmt.Sprintf("target must be an integer from %d to %d bytes", evidence.MinCaptureTarget, evidence.MaxCaptureTarget))
+			return
+		}
 		ws := r.PathValue("workspace_id")
 		// the body streams to disk: only the decode/reduce window is reserved
 		if scope, owned := budget.ScopeFor(r.Context()); !owned {
@@ -131,7 +141,7 @@ func registerEvidenceCaptureRoutes(mux routeRegistrar, store *evidence.Store) {
 		actor, enforced := principalScope(r)
 		res, err := store.Observe(r.Context(), reg, evidence.ObservationInput{
 			WorkspaceID: ws, RepoScope: workspaceops.WorkspaceRepoScope(dataDir(), ws), Actor: actor, AuthEnforced: enforced,
-			Format: format, Body: r.Body, Meta: meta, Sel: sel, Redact: redact,
+			Format: format, Body: r.Body, Meta: meta, Sel: sel, Redact: redact, Target: derefInt(target),
 		})
 		if err != nil {
 			writeCaptureError(w, err)
@@ -229,6 +239,13 @@ func writeCaptureError(w http.ResponseWriter, err error) {
 	default:
 		writeEvidenceError(w, err)
 	}
+}
+
+func derefInt(v *int) int {
+	if v == nil {
+		return 0
+	}
+	return *v
 }
 
 func optionalInt(v string) (*int, error) {
