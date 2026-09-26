@@ -950,6 +950,9 @@ impl Serve {
             .args(["serve", "--max-inflight=4", "--trim-idle-ms=0"])
             .env("XMUSTARD_INDEX_DIR", index_dir)
             .env("XMUSTARD_GRAPH_STORAGE", storage)
+            // as the Go supervisor starts the resident worker (rustcore.coreChildEnv):
+            // one glibc arena on Linux, no effect elsewhere
+            .env("MALLOC_ARENA_MAX", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())

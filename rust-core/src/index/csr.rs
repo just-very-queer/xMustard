@@ -3,7 +3,7 @@
 //!
 //! # Layout
 //!
-//! `MAGIC`, then the sections in [`Sec`] order, then a JSON footer, its length (u32 LE)
+//! `MAGIC`, then the sections (in any order), then a JSON footer, its length (u32 LE)
 //! and `MAGIC` again. The footer names each section's byte range, the counts and the
 //! string tables of the small closed sets (edge kinds, layers, provenances, symbol
 //! kinds). Every integer is little-endian.
@@ -140,6 +140,7 @@ pub struct FileRow {
     pub mtime_ns: i64,
     pub inbound: u32,
     pub dependents: u32,
+    /// Non-local symbols declared in the file.
     pub symbols: u32,
 }
 
@@ -687,11 +688,11 @@ impl Table {
     }
 }
 
-/// Sequential section writer that records each section's range.
+/// Section writer: appends sections in any order and records each one's range.
 struct SegWriter {
     out: BufWriter<File>,
     pos: u64,
-    sections: Vec<[u64; 2]>,
+    ranges: [[u64; 2]; SECTIONS],
 }
 
 impl SegWriter {
@@ -701,111 +702,66 @@ impl SegWriter {
         Ok(())
     }
 
-    fn begin(&mut self, sec: Sec) {
-        debug_assert_eq!(self.sections.len(), sec as usize, "sections out of order");
-        self.sections.push([self.pos, 0]);
-    }
-
-    fn end(&mut self) {
-        if let Some(s) = self.sections.last_mut() {
-            s[1] = self.pos - s[0];
-        }
-    }
-
-    /// Write a whole section from encoded rows.
-    fn section<T: Row>(&mut self, sec: Sec, rows: &[T]) -> Result<(), String> {
-        self.begin(sec);
-        let mut buf = Vec::with_capacity(rows.len().min(4096) * T::SIZE);
-        for r in rows {
-            r.encode(&mut buf);
-            if buf.len() >= 64 << 10 {
-                self.put(&buf)?;
-                buf.clear();
-            }
-        }
-        self.put(&buf)?;
-        self.end();
-        Ok(())
-    }
-
-    fn raw_section(&mut self, sec: Sec, bytes: &[u8]) -> Result<(), String> {
-        self.begin(sec);
-        self.put(bytes)?;
-        self.end();
-        Ok(())
-    }
-
-    /// Write one CSR direction from records that arrive grouped by node in ascending
-    /// order: the records first, then the `nodes + 1` offsets.
-    fn csr<T: Row>(
+    /// Write section `sec` from records produced by `fill`, streaming; returns the
+    /// record count.
+    fn stream<T: Row>(
         &mut self,
-        adj: Adj,
-        nodes: u32,
-        mut rows: impl FnMut(&mut dyn FnMut(u32, T) -> Result<(), String>) -> Result<(), String>,
+        sec: Sec,
+        fill: impl FnOnce(&mut dyn FnMut(T) -> Result<(), String>) -> Result<(), String>,
     ) -> Result<u32, String> {
-        let mut counts = vec![0u32; nodes as usize + 1];
-        let mut last = 0u32;
+        let start = self.pos;
         let mut buf = Vec::with_capacity(64 << 10);
-        // records section first so it streams; offsets follow it
-        let rec_start = self.pos;
-        let mut total = 0u32;
+        let mut n = 0u32;
         {
-            let mut push = |node: u32, rec: T| -> Result<(), String> {
-                if node < last || node >= nodes {
-                    return Err(format!(
-                        "edge node {node} out of order (after {last}, of {nodes})"
-                    ));
-                }
-                last = node;
-                counts[node as usize + 1] += 1;
-                total += 1;
+            let mut push = |rec: T| -> Result<(), String> {
                 rec.encode(&mut buf);
+                n += 1;
                 if buf.len() >= 64 << 10 {
-                    self.out.write_all(&buf).map_err(|e| e.to_string())?;
-                    self.pos += buf.len() as u64;
+                    self.put(&buf)?;
                     buf.clear();
                 }
                 Ok(())
             };
-            rows(&mut push)?;
+            fill(&mut push)?;
         }
         self.put(&buf)?;
-        let rec_len = self.pos - rec_start;
+        self.ranges[sec as usize] = [start, self.pos - start];
+        Ok(n)
+    }
+
+    fn rows<T: Row + Copy>(&mut self, sec: Sec, rows: &[T]) -> Result<(), String> {
+        self.stream(sec, |push| rows.iter().try_for_each(|r| push(*r)))
+            .map(drop)
+    }
+
+    /// Write one grouped posting: `items` arrive as `(group, record)` in ascending
+    /// group order; the records go to `rec`, and `groups + 1` offsets to `off`.
+    fn grouped<T: Row>(
+        &mut self,
+        off: Sec,
+        rec: Sec,
+        groups: u32,
+        fill: impl FnOnce(&mut dyn FnMut(u32, T) -> Result<(), String>) -> Result<(), String>,
+    ) -> Result<u32, String> {
+        let mut counts = vec![0u32; groups as usize + 1];
+        let mut last = 0u32;
+        let n = self.stream(rec, |push| {
+            fill(&mut |group: u32, r: T| {
+                if group < last || group >= groups {
+                    return Err(format!(
+                        "group {group} out of order (after {last}, of {groups})"
+                    ));
+                }
+                last = group;
+                counts[group as usize + 1] += 1;
+                push(r)
+            })
+        })?;
         for i in 1..counts.len() {
             counts[i] += counts[i - 1];
         }
-        // sections are recorded in Sec order: offsets precede records in the table
-        self.begin(adj.off);
-        let off_at = self.pos;
-        let mut ob = Vec::with_capacity(counts.len() * 4);
-        for c in &counts {
-            ob.extend_from_slice(&c.to_le_bytes());
-        }
-        self.put(&ob)?;
-        self.sections[adj.off as usize] = [off_at, self.pos - off_at];
-        self.sections.push([rec_start, rec_len]);
-        Ok(total)
-    }
-}
-
-/// Dense ids for `index.db` ids.
-struct Remap {
-    files: HashMap<i64, u32>,
-    /// Store ids of the symbols, ascending: a symbol's dense id is its index.
-    symbols: Vec<i64>,
-    file_count: u32,
-}
-
-impl Remap {
-    fn node(&self, file: i64, symbol: Option<i64>) -> Option<u32> {
-        match symbol {
-            Some(s) => self
-                .symbols
-                .binary_search(&s)
-                .ok()
-                .map(|d| self.file_count + d as u32),
-            None => self.files.get(&file).copied(),
-        }
+        self.rows(off, &counts)?;
+        Ok(n)
     }
 }
 
@@ -821,34 +777,74 @@ fn indexed_status_list() -> String {
         .join(",")
 }
 
-/// Order of one CSR direction's rows: grouped by that end's node in dense order (file
-/// nodes by path, then symbol nodes by id), then by the other end, kind and layer.
+/// Dense ids as temporary tables (`rowid - 1` is the dense id), so remapping and every
+/// ordering run inside SQLite with a small page cache and spill to temporary files
+/// instead of growing the writer: files in path order, the names their symbols use in
+/// name order, symbols in store-id order.
+fn dense_tables(conn: &Connection) -> Result<(), String> {
+    let statuses = indexed_status_list();
+    conn.execute_batch(&format!(
+        "DROP TABLE IF EXISTS temp.seg_files;
+         DROP TABLE IF EXISTS temp.seg_names;
+         DROP TABLE IF EXISTS temp.seg_syms;
+         CREATE TEMP TABLE seg_files(dense INTEGER PRIMARY KEY, fid INTEGER NOT NULL UNIQUE);
+         INSERT INTO seg_files(fid) SELECT id FROM files WHERE parse_status IN ({statuses}) ORDER BY path;
+         CREATE TEMP TABLE seg_names(dense INTEGER PRIMARY KEY, nid INTEGER NOT NULL UNIQUE);
+         INSERT INTO seg_names(nid) SELECT n.id FROM names n WHERE n.id IN
+           (SELECT s.name_id FROM symbols s JOIN seg_files f ON f.fid = s.file_id) ORDER BY n.name;
+         CREATE TEMP TABLE seg_syms(dense INTEGER PRIMARY KEY, sid INTEGER NOT NULL UNIQUE,
+           file INTEGER NOT NULL, name INTEGER NOT NULL, ord INTEGER NOT NULL,
+           line INTEGER NOT NULL, kind TEXT NOT NULL, local INTEGER NOT NULL);
+         INSERT INTO seg_syms(sid, file, name, ord, line, kind, local)
+           SELECT s.id, f.dense - 1, n.dense - 1, s.ord, max(s.name_line, 0), s.kind, s.local
+           FROM symbols s JOIN seg_files f ON f.fid = s.file_id JOIN seg_names n ON n.nid = s.name_id
+           ORDER BY s.id;"
+    ))
+    .map_err(sql)
+}
+
+fn drop_dense_tables(conn: &Connection) {
+    let _ = conn.execute_batch(
+        "DROP TABLE IF EXISTS temp.seg_files; DROP TABLE IF EXISTS temp.seg_names;
+         DROP TABLE IF EXISTS temp.seg_syms;",
+    );
+}
+
+/// One CSR direction over every edge: the node of the `from` end, then the other end,
+/// in dense order (files first, symbols after `files`).
 fn edge_query(from: &str, to: &str) -> String {
+    let node = |end: &str, f: &str, s: &str| {
+        format!("CASE WHEN e.{end}_symbol IS NULL THEN {f}.dense - 1 ELSE ?1 + {s}.dense - 1 END")
+    };
     format!(
-        "SELECT e.{from}_file, e.{from}_symbol, e.{to}_file, e.{to}_symbol, e.kind, e.layer,
-                e.weight, e.confidence, e.provenance
-         FROM edges e JOIN files a ON a.id = e.{from}_file JOIN files b ON b.id = e.{to}_file
-         ORDER BY e.{from}_symbol IS NOT NULL, CASE WHEN e.{from}_symbol IS NULL THEN a.path END,
-                  e.{from}_symbol, e.{to}_symbol IS NOT NULL,
-                  CASE WHEN e.{to}_symbol IS NULL THEN b.path END, e.{to}_symbol, e.kind, e.layer"
+        "SELECT {a} AS na, {b} AS nb, e.kind, e.layer, e.weight, e.confidence, e.provenance
+         FROM edges e JOIN seg_files fa ON fa.fid = e.{from}_file JOIN seg_files fb ON fb.fid = e.{to}_file
+         LEFT JOIN seg_syms sa ON sa.sid = e.{from}_symbol LEFT JOIN seg_syms sb ON sb.sid = e.{to}_symbol
+         WHERE (e.{from}_symbol IS NULL OR sa.dense IS NOT NULL)
+           AND (e.{to}_symbol IS NULL OR sb.dense IS NOT NULL)
+         ORDER BY na, nb, e.kind, e.layer",
+        a = node(from, "fa", "sa"),
+        b = node(to, "fb", "sb"),
     )
 }
 
+/// One direction of the file projection of the structure layer.
 fn file_edge_query(from: &str, to: &str) -> String {
     format!(
-        "SELECT e.{from}_file, e.{to}_file, sum(e.weight) FROM edges e
-         JOIN files a ON a.id = e.{from}_file JOIN files b ON b.id = e.{to}_file
+        "SELECT fa.dense - 1, fb.dense - 1, sum(e.weight) FROM edges e
+         JOIN seg_files fa ON fa.fid = e.{from}_file JOIN seg_files fb ON fb.fid = e.{to}_file
          WHERE e.layer = 'structure' AND e.src_file != e.dst_file
-         GROUP BY e.{from}_file, e.{to}_file ORDER BY a.path, b.path"
+         GROUP BY 1, 2 ORDER BY 1, 2"
     )
 }
 
 /// Write the segment of the state `conn` sees into `dir` and return its file name. Inside
 /// the caller's open transaction it sees that transaction's writes (an update writes
 /// the segment before it commits, so readers never meet a generation without one);
-/// otherwise it runs in its own read transaction. Either way the segment is one
-/// generation's graph. Memory is the dense-id maps and per-node offsets; edges stream
-/// from SQLite. Only index writers call this: readers never write.
+/// otherwise it runs in its own transaction. Either way the segment is one
+/// generation's graph. Remapping and ordering run in SQLite temporary tables with a
+/// small page cache, so the writer's own memory is per-file and per-name counters.
+/// Only index writers call this: readers never write.
 pub fn write_segment(conn: &Connection, dir: &Path) -> Result<String, String> {
     // small page caches while the segment's sorts and groupings run: they spill to
     // temporary files instead of growing the worker (restored after)
@@ -867,6 +863,7 @@ pub fn write_segment(conn: &Connection, dir: &Path) -> Result<String, String> {
     } else {
         write_segment_in_tx(conn, dir)
     };
+    drop_dense_tables(conn);
     let _ = conn.execute_batch(&format!("PRAGMA cache_size={cache};"));
     res
 }
@@ -896,9 +893,9 @@ fn write_segment_in_tx(conn: &Connection, dir: &Path) -> Result<String, String> 
     let mut w = SegWriter {
         out: BufWriter::with_capacity(64 << 10, file),
         pos: 0,
-        sections: Vec::with_capacity(SECTIONS),
+        ranges: [[0; 2]; SECTIONS],
     };
-    let result = write_body(conn, &mut w, generation);
+    let result = dense_tables(conn).and_then(|()| write_body(conn, &mut w, generation));
     let result = result.and_then(|()| {
         w.out.flush().map_err(|e| e.to_string())?;
         fs::rename(&tmp, &final_path).map_err(|e| format!("{}: {e}", final_path.display()))
@@ -910,223 +907,175 @@ fn write_segment_in_tx(conn: &Connection, dir: &Path) -> Result<String, String> 
     Ok(name)
 }
 
+/// Stream the rows of `query` (bound to `params`) into `f`.
+fn each_row(
+    conn: &Connection,
+    query: &str,
+    params: impl rusqlite::Params,
+    mut f: impl FnMut(&rusqlite::Row<'_>) -> Result<(), String>,
+) -> Result<(), String> {
+    let mut st = conn.prepare(query).map_err(sql)?;
+    let mut rows = st.query(params).map_err(sql)?;
+    while let Some(r) = rows.next().map_err(sql)? {
+        f(r)?;
+    }
+    Ok(())
+}
+
+fn count(conn: &Connection, table: &str) -> Result<u32, String> {
+    conn.query_row(&format!("SELECT count(*) FROM temp.{table}"), [], |r| {
+        r.get::<_, i64>(0)
+    })
+    .map(|n| n as u32)
+    .map_err(sql)
+}
+
+fn clamp_u32(v: i64) -> u32 {
+    v.clamp(0, u32::MAX as i64) as u32
+}
+
+/// Write a string heap from `query`'s first column, in order: the bytes, then the
+/// offsets.
+fn heap(
+    conn: &Connection,
+    w: &mut SegWriter,
+    bytes: Sec,
+    off: Sec,
+    query: &str,
+) -> Result<u32, String> {
+    let mut offsets = vec![0u32];
+    let start = w.pos;
+    each_row(conn, query, [], |r| {
+        let s = r
+            .get_ref(0)
+            .map_err(sql)?
+            .as_bytes()
+            .map_err(|e| e.to_string())?;
+        w.put(s)?;
+        let end = u32::try_from(w.pos - start).map_err(|_| "string heap over 4 GiB")?;
+        offsets.push(end);
+        Ok(())
+    })?;
+    w.ranges[bytes as usize] = [start, w.pos - start];
+    w.rows(off, &offsets)?;
+    Ok(offsets.len() as u32 - 1)
+}
+
 fn write_body(conn: &Connection, w: &mut SegWriter, generation: i64) -> Result<(), String> {
     w.put(MAGIC)?;
-    let statuses = indexed_status_list();
+    let files = count(conn, "seg_files")?;
+    let names = count(conn, "seg_names")?;
+    let symbols = count(conn, "seg_syms")?;
 
-    // ---- files, in path order, with structure stats ----
-    let mut stats: HashMap<i64, (u32, u32)> = HashMap::new();
-    {
-        let mut st = conn
-            .prepare(
-                "SELECT dst_file, sum(weight), count(DISTINCT src_file) FROM edges
-                 WHERE layer = 'structure' AND src_file != dst_file GROUP BY dst_file",
-            )
-            .map_err(sql)?;
-        let rows = st
-            .query_map([], |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, i64>(1)?,
-                    r.get::<_, i64>(2)?,
-                ))
-            })
-            .map_err(sql)?;
-        for row in rows {
-            let (f, wsum, deps) = row.map_err(sql)?;
-            stats.insert(f, (wsum.clamp(0, u32::MAX as i64) as u32, deps as u32));
-        }
-    }
-    let mut files = HashMap::new();
-    let mut file_rows = Vec::new();
-    let mut path_off = vec![0u32];
-    let mut path_heap = Vec::new();
-    {
-        let mut st = conn
-            .prepare(&format!(
-                "SELECT id, path, size, mtime_ns FROM files WHERE parse_status IN ({statuses}) ORDER BY path"
-            ))
-            .map_err(sql)?;
-        let rows = st
-            .query_map([], |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, i64>(2)?,
-                    r.get::<_, i64>(3)?,
-                ))
-            })
-            .map_err(sql)?;
-        for row in rows {
-            let (id, path, size, mtime_ns) = row.map_err(sql)?;
-            files.insert(id, file_rows.len() as u32);
-            let (inbound, dependents) = stats.get(&id).copied().unwrap_or_default();
-            file_rows.push(FileRow {
-                size: size.max(0) as u64,
-                mtime_ns,
-                inbound,
-                dependents,
-                symbols: 0,
-            });
-            path_heap.extend_from_slice(path.as_bytes());
-            path_off.push(u32::try_from(path_heap.len()).map_err(|_| "path heap over 4 GiB")?);
-        }
-    }
-    drop(stats);
-    let file_count = file_rows.len() as u32;
+    // ---- files: stats, then the path heap ----
+    w.stream::<FileRow>(Sec::FileRows, |push| {
+        each_row(
+            conn,
+            "SELECT f.size, f.mtime_ns, coalesce(st.w, 0), coalesce(st.d, 0), coalesce(sc.n, 0)
+             FROM temp.seg_files sf JOIN files f ON f.id = sf.fid
+             LEFT JOIN (SELECT dst_file, sum(weight) AS w, count(DISTINCT src_file) AS d FROM edges
+                        WHERE layer = 'structure' AND src_file != dst_file GROUP BY dst_file) st
+               ON st.dst_file = sf.fid
+             LEFT JOIN (SELECT file, count(*) AS n FROM temp.seg_syms WHERE local = 0 GROUP BY file) sc
+               ON sc.file = sf.dense - 1
+             ORDER BY sf.dense",
+            [],
+            |r| {
+                push(FileRow {
+                    size: r.get::<_, i64>(0).map_err(sql)?.max(0) as u64,
+                    mtime_ns: r.get(1).map_err(sql)?,
+                    inbound: clamp_u32(r.get(2).map_err(sql)?),
+                    dependents: clamp_u32(r.get(3).map_err(sql)?),
+                    symbols: clamp_u32(r.get(4).map_err(sql)?),
+                })
+            },
+        )
+    })?;
+    heap(
+        conn,
+        w,
+        Sec::PathHeap,
+        Sec::PathOff,
+        "SELECT f.path FROM temp.seg_files sf JOIN files f ON f.id = sf.fid ORDER BY sf.dense",
+    )?;
 
-    // ---- symbols, in id order; a dense id is the rank of the store id ----
+    // ---- symbols, the name heap and the postings ----
     let mut kinds = Table::default();
-    let mut sym_ids: Vec<i64> = Vec::new();
-    let mut sym_name_ids: Vec<i64> = Vec::new();
-    let mut sym_ord: Vec<u32> = Vec::new();
-    let mut sym_rows = Vec::new();
-    {
-        let mut st = conn
-            .prepare(
-                "SELECT id, file_id, name_id, name_line, kind, local, ord FROM symbols ORDER BY id",
+    let mut global_symbols = 0u32;
+    w.stream::<SymRow>(Sec::SymRows, |push| {
+        each_row(
+            conn,
+            "SELECT name, file, line, kind, local FROM temp.seg_syms ORDER BY dense",
+            [],
+            |r| {
+                let local = r.get::<_, i64>(4).map_err(sql)? != 0;
+                global_symbols += u32::from(!local);
+                let kind: String = r.get(3).map_err(sql)?;
+                push(SymRow {
+                    name: clamp_u32(r.get(0).map_err(sql)?),
+                    file: clamp_u32(r.get(1).map_err(sql)?),
+                    line: clamp_u32(r.get(2).map_err(sql)?),
+                    kind: kinds.id(&kind)?,
+                    local,
+                })
+            },
+        )
+    })?;
+    heap(
+        conn,
+        w,
+        Sec::NameHeap,
+        Sec::NameOff,
+        "SELECT n.name FROM temp.seg_names sn JOIN names n ON n.id = sn.nid ORDER BY sn.dense",
+    )?;
+    // name -> symbols and file -> symbols, both in (path, ord) order within a group
+    for (off, rec, groups, group, order) in [
+        (
+            Sec::NamePostOff,
+            Sec::NamePost,
+            names,
+            "name",
+            "name, file, ord",
+        ),
+        (Sec::FileSymOff, Sec::FileSyms, files, "file", "file, ord"),
+    ] {
+        w.grouped::<u32>(off, rec, groups, |push| {
+            each_row(
+                conn,
+                &format!("SELECT {group}, dense - 1 FROM temp.seg_syms ORDER BY {order}"),
+                [],
+                |r| {
+                    push(
+                        clamp_u32(r.get(0).map_err(sql)?),
+                        clamp_u32(r.get(1).map_err(sql)?),
+                    )
+                },
             )
-            .map_err(sql)?;
-        let mut rows = st.query([]).map_err(sql)?;
-        while let Some(r) = rows.next().map_err(sql)? {
-            let Some(&file) = files.get(&r.get::<_, i64>(1).map_err(sql)?) else {
-                continue;
-            };
-            let kind: String = r.get(4).map_err(sql)?;
-            sym_ids.push(r.get(0).map_err(sql)?);
-            sym_name_ids.push(r.get(2).map_err(sql)?);
-            sym_ord.push(r.get::<_, i64>(6).map_err(sql)?.max(0) as u32);
-            file_rows[file as usize].symbols += 1;
-            sym_rows.push(SymRow {
-                name: 0, // set once the names are ranked
-                file,
-                line: r.get::<_, i64>(3).map_err(sql)?.max(0) as u32,
-                kind: kinds.id(&kind)?,
-                local: r.get::<_, i64>(5).map_err(sql)? != 0,
-            });
-        }
+        })?;
     }
-    let sym_count = sym_rows.len() as u32;
-    let global_symbols = sym_rows.iter().filter(|s| !s.local).count() as u32;
-
-    // ---- the names those symbols use, sorted and interned: a scan of the names
-    // index in order (no sort), keeping the used ones ----
-    let mut used = sym_name_ids.clone();
-    used.sort_unstable();
-    used.dedup();
-    let mut rank = vec![0u32; used.len()];
-    let mut name_off = vec![0u32];
-    let mut name_heap = Vec::new();
-    {
-        let mut st = conn
-            .prepare("SELECT id, name FROM names ORDER BY name")
-            .map_err(sql)?;
-        let mut rows = st.query([]).map_err(sql)?;
-        while let Some(r) = rows.next().map_err(sql)? {
-            let Ok(i) = used.binary_search(&r.get::<_, i64>(0).map_err(sql)?) else {
-                continue;
-            };
-            rank[i] = name_off.len() as u32 - 1;
-            name_heap.extend_from_slice(
-                r.get_ref(1)
-                    .map_err(sql)?
-                    .as_bytes()
-                    .map_err(|e| e.to_string())?,
-            );
-            name_off.push(u32::try_from(name_heap.len()).map_err(|_| "name heap over 4 GiB")?);
-        }
-    }
-    for (row, id) in sym_rows.iter_mut().zip(&sym_name_ids) {
-        row.name = used
-            .binary_search(id)
-            .map(|i| rank[i])
-            .map_err(|_| "symbol names a missing name")?;
-    }
-    drop((sym_name_ids, used, rank));
-
-    // name -> symbols and file -> symbols postings, both in (path, ord) order
-    let key = |s: &u32| {
-        let r = &sym_rows[*s as usize];
-        (r.file, sym_ord[*s as usize])
-    };
-    let mut file_syms: Vec<u32> = (0..sym_count).collect();
-    file_syms.sort_unstable_by_key(key);
-    let mut name_post = file_syms.clone();
-    name_post.sort_by_key(|s| sym_rows[*s as usize].name); // stable: (path, ord) within a name
-    drop(sym_ord);
-    let offsets = |groups: usize, key: &dyn Fn(u32) -> u32, list: &[u32]| -> Vec<u32> {
-        let mut off = vec![0u32; groups + 1];
-        for &s in list {
-            off[key(s) as usize + 1] += 1;
-        }
-        for i in 1..off.len() {
-            off[i] += off[i - 1];
-        }
-        off
-    };
-    let name_post_off = offsets(
-        name_off.len() - 1,
-        &|s| sym_rows[s as usize].name,
-        &name_post,
-    );
-    let file_sym_off = offsets(
-        file_count as usize,
-        &|s| sym_rows[s as usize].file,
-        &file_syms,
-    );
-
-    w.section(Sec::FileRows, &file_rows)?;
-    w.section(Sec::PathOff, &path_off)?;
-    w.raw_section(Sec::PathHeap, &path_heap)?;
-    w.section(Sec::SymRows, &sym_rows)?;
-    w.section(Sec::NameOff, &name_off)?;
-    w.raw_section(Sec::NameHeap, &name_heap)?;
-    w.section(Sec::NamePostOff, &name_post_off)?;
-    w.section(Sec::NamePost, &name_post)?;
-    w.section(Sec::FileSymOff, &file_sym_off)?;
-    w.section(Sec::FileSyms, &file_syms)?;
-    let name_count = name_off.len() as u32 - 1;
-    drop((
-        file_rows, path_off, path_heap, sym_rows, name_off, name_heap,
-    ));
-    drop((name_post, file_syms, name_post_off, file_sym_off));
 
     // ---- every edge, forward and reverse ----
-    let remap = Remap {
-        files,
-        symbols: sym_ids,
-        file_count,
-    };
-    let nodes = file_count + sym_count;
+    let nodes = files + symbols;
     let (mut edge_kinds, mut layers, mut provs) =
         (Table::default(), Table::default(), Table::default());
     let mut edge_dir = |w: &mut SegWriter, adj: Adj, from: &str, to: &str| -> Result<u32, String> {
-        let mut st = conn.prepare(&edge_query(from, to)).map_err(sql)?;
-        w.csr::<Edge>(adj, nodes, |push| {
-            let mut rows = st.query([]).map_err(sql)?;
-            while let Some(r) = rows.next().map_err(sql)? {
-                let node = |f: usize, s: usize| -> Result<Option<u32>, String> {
-                    Ok(remap.node(r.get(f).map_err(sql)?, r.get(s).map_err(sql)?))
-                };
-                let (Some(a), Some(b)) = (node(0, 1)?, node(2, 3)?) else {
-                    continue;
-                };
-                let kind: String = r.get(4).map_err(sql)?;
-                let layer: String = r.get(5).map_err(sql)?;
-                let prov: String = r.get(8).map_err(sql)?;
+        w.grouped::<Edge>(adj.off, adj.rec, nodes, |push| {
+            each_row(conn, &edge_query(from, to), [files], |r| {
+                let kind: String = r.get(2).map_err(sql)?;
+                let layer: String = r.get(3).map_err(sql)?;
+                let prov: String = r.get(6).map_err(sql)?;
                 push(
-                    a,
+                    clamp_u32(r.get(0).map_err(sql)?),
                     Edge {
-                        node: b,
-                        weight: r.get::<_, i64>(6).map_err(sql)?.clamp(0, u32::MAX as i64) as u32,
+                        node: clamp_u32(r.get(1).map_err(sql)?),
+                        weight: clamp_u32(r.get(4).map_err(sql)?),
                         kind: edge_kinds.id(&kind)?,
                         layer: layers.id(&layer)?,
                         provenance: provs.id(&prov)?,
-                        confidence: quantize_confidence(r.get(7).map_err(sql)?),
+                        confidence: quantize_confidence(r.get(5).map_err(sql)?),
                     },
-                )?;
-            }
-            Ok(())
+                )
+            })
         })
     };
     let edges = edge_dir(w, OUT, "src", "dst")?;
@@ -1139,30 +1088,16 @@ fn write_body(conn: &Connection, w: &mut SegWriter, generation: i64) -> Result<(
 
     // ---- file projection of the structure layer ----
     let file_dir = |w: &mut SegWriter, adj: Adj, from: &str, to: &str| -> Result<u32, String> {
-        let mut st = conn.prepare(&file_edge_query(from, to)).map_err(sql)?;
-        w.csr::<FileEdge>(adj, file_count, |push| {
-            let rows = st
-                .query_map([], |r| {
-                    Ok((
-                        r.get::<_, i64>(0)?,
-                        r.get::<_, i64>(1)?,
-                        r.get::<_, i64>(2)?,
-                    ))
-                })
-                .map_err(sql)?;
-            for row in rows {
-                let (a, b, weight) = row.map_err(sql)?;
-                if let (Some(&a), Some(&b)) = (remap.files.get(&a), remap.files.get(&b)) {
-                    push(
-                        a,
-                        FileEdge {
-                            file: b,
-                            weight: weight.clamp(0, u32::MAX as i64) as u32,
-                        },
-                    )?;
-                }
-            }
-            Ok(())
+        w.grouped::<FileEdge>(adj.off, adj.rec, files, |push| {
+            each_row(conn, &file_edge_query(from, to), [], |r| {
+                push(
+                    clamp_u32(r.get(0).map_err(sql)?),
+                    FileEdge {
+                        file: clamp_u32(r.get(1).map_err(sql)?),
+                        weight: clamp_u32(r.get(2).map_err(sql)?),
+                    },
+                )
+            })
         })
     };
     let file_edges = file_dir(w, FILE_OUT, "src", "dst")?;
@@ -1172,14 +1107,14 @@ fn write_body(conn: &Connection, w: &mut SegWriter, generation: i64) -> Result<(
         version: FORMAT_VERSION,
         generation,
         counts: Counts {
-            files: file_count,
-            symbols: sym_count,
+            files,
+            symbols,
             global_symbols,
-            names: name_count,
+            names,
             edges,
             file_edges,
         },
-        sections: std::mem::take(&mut w.sections),
+        sections: w.ranges.to_vec(),
         edge_kinds: edge_kinds.names,
         layers: layers.names,
         provenances: provs.names,
