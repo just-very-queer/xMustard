@@ -48,6 +48,16 @@ const (
 	ResourceScheme          = "xmustard://evidence/"
 )
 
+// MinRetainedCharge is the least one retained original counts against its workspace
+// quota. Each original also keeps a metadata file and a directory the byte count does
+// not see; since a capture may ask for a 1 KiB target, charging small originals at
+// least this much keeps the number of originals (and that overhead) per quota where it
+// was when every retained original exceeded a 16 KiB client target.
+const MinRetainedCharge = 16 << 10
+
+// retainedCharge is what an original of raw bytes counts against the quota.
+func retainedCharge(raw int64) int64 { return max(raw, MinRetainedCharge) }
+
 var (
 	ErrMissing       = errors.New("evidence not found")
 	ErrExpired       = errors.New("evidence expired")
@@ -241,7 +251,7 @@ type Store struct {
 type wsState struct {
 	mu      sync.Mutex
 	loaded  bool  // used reflects disk (rebuilt lazily after restart or on pressure)
-	used    int64 // retained unexpired original bytes
+	used    int64 // quota charge of retained unexpired originals (retainedCharge)
 	pending int64 // bytes in open spools
 }
 
@@ -489,10 +499,11 @@ func (s *Store) Capture(ctx context.Context, sp *Spool, req CaptureRequest) (*De
 	if err != nil {
 		return nil, err
 	}
-	// this spool's bytes are already inside pending; converting them to retained
-	// cannot exceed the quota that admitted them (re-checked after a reclaim).
-	if used+st.pending > s.limits.WorkspaceQuota {
-		if used, err = s.retainedLocked(req.WorkspaceID, st, true); err != nil || used+st.pending > s.limits.WorkspaceQuota {
+	// this spool's bytes are already inside pending; converting them to retained adds
+	// only the charge beyond them (re-checked after a reclaim).
+	extra := retainedCharge(sp.n) - sp.n
+	if used+st.pending+extra > s.limits.WorkspaceQuota {
+		if used, err = s.retainedLocked(req.WorkspaceID, st, true); err != nil || used+st.pending+extra > s.limits.WorkspaceQuota {
 			return nil, fmt.Errorf("%w (%d of %d bytes retained for workspace %s)", ErrQuotaFull, used, s.limits.WorkspaceQuota, req.WorkspaceID)
 		}
 	}
@@ -516,7 +527,7 @@ func (s *Store) Capture(ctx context.Context, sp *Spool, req CaptureRequest) (*De
 		_ = os.RemoveAll(dir)
 		return nil, err
 	}
-	st.used += sp.n
+	st.used += retainedCharge(sp.n)
 	st.pending = max(0, st.pending-sp.n)
 	sp.n = 0 // ownership moved to retained; Discard must not release it again
 	d.Handle, d.ResourceURI, d.ExpiresAt, d.CapturedKey, d.PageSize = handle, ResourceURI(handle, req.WorkspaceID), obs.ExpiresAt, obs.CapturedKey, s.limits.PageSize
@@ -601,7 +612,7 @@ func (s *Store) openOriginalLocked(req ReadRequest, dir string, st *wsState) (*o
 	exp, _ := time.Parse(time.RFC3339Nano, obs.ExpiresAt)
 	if !s.now().Before(exp) {
 		if err := os.RemoveAll(dir); err == nil && st.loaded {
-			st.used = max(0, st.used-obs.RawBytes)
+			st.used = max(0, st.used-retainedCharge(obs.RawBytes))
 		}
 		return nil, obs, ErrExpired
 	}
@@ -662,7 +673,7 @@ func (s *Store) Revoke(req ReadRequest) error {
 	}
 	obs.Revoked = true
 	if st.loaded {
-		st.used = max(0, st.used-obs.RawBytes)
+		st.used = max(0, st.used-retainedCharge(obs.RawBytes))
 	}
 	return writeJSONAtomic(filepath.Join(dir, "meta.json"), obs)
 }
@@ -680,7 +691,8 @@ func (s *Store) RevokeWorkspace(ws string) error {
 	return os.RemoveAll(dir)
 }
 
-// Retained reports the retained unexpired bytes for a workspace (sweeping expired ones).
+// Retained reports the quota charge of a workspace's retained unexpired originals
+// (retainedCharge each), sweeping expired ones.
 func (s *Store) Retained(ws string) (int64, error) {
 	st := s.state(ws)
 	st.mu.Lock()
@@ -726,7 +738,7 @@ func (s *Store) retainedLocked(ws string, st *wsState, rescan bool) (int64, erro
 			_ = os.RemoveAll(p)
 			continue
 		}
-		used += obs.RawBytes
+		used += retainedCharge(obs.RawBytes)
 	}
 	st.used, st.loaded = used, true
 	return used, nil
