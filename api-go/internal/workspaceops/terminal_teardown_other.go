@@ -2,15 +2,15 @@
 
 package workspaceops
 
-import (
-	"os/exec"
-	"time"
-)
+// Terminals cannot open on these platforms (see terminal_pty_stub.go), so there is
+// no session to sweep.
 
-// killTerminalSession kills the shell. Terminals cannot open on these platforms
-// (see terminal_pty_stub.go), so no session exists to sweep.
-func killTerminalSession(cmd *exec.Cmd, grace time.Duration) {
-	if cmd != nil && cmd.Process != nil {
-		_ = cmd.Process.Kill()
+func endTerminalSession(session *terminalSession, mode terminalTeardown) {
+	if mode == terminalKill && session.process != nil && session.process.Process != nil {
+		_ = session.process.Process.Kill()
 	}
 }
+
+func terminalProcStart(pid int) (uint64, bool) { return 0, false }
+
+func waitTerminalShellExit(pid int) bool { return false }

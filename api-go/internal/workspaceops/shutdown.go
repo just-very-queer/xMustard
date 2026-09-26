@@ -2,7 +2,6 @@ package workspaceops
 
 import (
 	"log"
-	"sync"
 )
 
 // ShutdownInFlight performs a workload-aware drain AFTER HTTP admissions have stopped
@@ -75,18 +74,8 @@ func closeAllTerminals() {
 	terminalSessions.Range(func(k, v any) bool {
 		if s, ok := v.(*terminalSession); ok {
 			toClose = append(toClose, s)
-			terminalSessions.Delete(k)
 		}
 		return true
 	})
-	// in parallel: each teardown may wait out the SIGHUP grace period
-	var wg sync.WaitGroup
-	for _, s := range toClose {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			s.shutdown()
-		}()
-	}
-	wg.Wait()
+	shutdownTerminals(toClose)
 }

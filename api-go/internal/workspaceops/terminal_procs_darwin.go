@@ -29,15 +29,52 @@ func listTerminalProcs() ([]terminalProc, error) {
 				continue
 			}
 		}
-		start := info.Proc.P_starttime
 		procs = append(procs, terminalProc{
 			pid:    pid,
 			ppid:   int(info.Eproc.Ppid),
 			pgid:   int(info.Eproc.Pgid),
 			sid:    sid,
-			start:  uint64(start.Sec)*1_000_000 + uint64(start.Usec),
+			start:  kinfoStart(info),
 			exited: exited,
 		})
 	}
 	return procs, nil
+}
+
+func kinfoStart(info *unix.KinfoProc) uint64 {
+	start := info.Proc.P_starttime
+	return uint64(start.Sec)*1_000_000 + uint64(start.Usec)
+}
+
+// terminalProcStart returns the start time of pid as listTerminalProcs reports it.
+func terminalProcStart(pid int) (uint64, bool) {
+	info, err := unix.SysctlKinfoProc("kern.proc.pid", pid)
+	if err != nil || int(info.Proc.P_pid) != pid {
+		return 0, false
+	}
+	return kinfoStart(info), true
+}
+
+// waitTerminalShellExit blocks until the child pid has exited and reports whether
+// it has, without reaping it: a kqueue NOTE_EXIT event fires on exit and leaves
+// the zombie for wait(2).
+func waitTerminalShellExit(pid int) bool {
+	kq, err := unix.Kqueue()
+	if err != nil {
+		return false
+	}
+	defer unix.Close(kq)
+	change := unix.Kevent_t{Ident: uint64(pid), Filter: unix.EVFILT_PROC, Flags: unix.EV_ADD | unix.EV_ONESHOT, Fflags: unix.NOTE_EXIT}
+	events := make([]unix.Kevent_t, 1)
+	if _, err := unix.Kevent(kq, []unix.Kevent_t{change}, nil, nil); err != nil {
+		// ESRCH: the process has already exited; it stays a zombie until reaped
+		return err == unix.ESRCH
+	}
+	for {
+		n, err := unix.Kevent(kq, nil, events, nil)
+		if err == unix.EINTR {
+			continue
+		}
+		return err == nil && n == 1 && events[0].Fflags&unix.NOTE_EXIT != 0
+	}
 }

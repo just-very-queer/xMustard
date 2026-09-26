@@ -4,11 +4,17 @@ package workspaceops
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
+	"runtime"
+	"slices"
 	"strconv"
+	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -120,6 +126,227 @@ func TestCloseTerminalEndsSetsidDescendant(t *testing.T) {
 		t.Fatalf("close terminal: %v", err)
 	}
 	requireTerminalTornDown(t, live, escaped)
+}
+
+// A process that left the session and has no parent in it is still found while it
+// holds the terminal: a daemon that forked, let its parent exit and called
+// setsid(2), and, where util-linux provides it, the everyday `setsid cmd &`, which
+// forks because a job leads its process group. Neither may keep the pump, the
+// master or the log open either.
+func TestCloseTerminalEndsDetachedProcessesHoldingThePTY(t *testing.T) {
+	if _, err := exec.LookPath("perl"); err != nil {
+		t.Skip("perl is needed to call setsid(2) from the shell")
+	}
+	dataDir, workspaceID, record := newTerminalTestSession(t, 80, 24)
+	live := liveTerminalSession(t, record.TerminalID)
+
+	names := []string{"DAEMON"}
+	command := `perl -MPOSIX -e 'if (fork) { exit } POSIX::setsid(); print "__PID_DAEMON__:$$:\n"; sleep 60' &` + "\n"
+	if _, err := exec.LookPath("setsid"); err == nil && runtime.GOOS == "linux" {
+		names = append(names, "DETACHED")
+		command += `setsid sh -c 'printf "__PID_DETACHED__:%s:\n" $$; exec sleep 61' &` + "\n"
+	}
+	if err := WriteTerminal(workspaceID, record.TerminalID, command); err != nil {
+		t.Fatalf("write detached commands: %v", err)
+	}
+	var offset int64
+	found := waitForTerminalPIDs(t, dataDir, workspaceID, record.TerminalID, &offset, names...)
+	var pids []int
+	for _, name := range names {
+		pid := found[name]
+		t.Cleanup(func() { _ = unix.Kill(pid, unix.SIGKILL) })
+		pids = append(pids, pid)
+		requireOutsideSession(t, pid, live.process.Process.Pid)
+	}
+
+	if err := CloseTerminal(workspaceID, record.TerminalID); err != nil {
+		t.Fatalf("close terminal: %v", err)
+	}
+	requireTerminalTornDown(t, live, pids...)
+}
+
+// A job that treats SIGHUP as a reload still gets to shut down cleanly: teardown
+// follows SIGHUP with SIGTERM well before SIGKILL.
+func TestCloseTerminalSendsSIGTERMAfterSIGHUP(t *testing.T) {
+	dataDir, workspaceID, record := newTerminalTestSession(t, 80, 24)
+	live := liveTerminalSession(t, record.TerminalID)
+	marker := filepath.Join(t.TempDir(), "clean-exit")
+
+	job := fmt.Sprintf(`sh -c 'trap "echo reload" HUP; trap "echo clean > \"\$1\"; exit 0" TERM; printf "__PID_JOB__:%%s:\n" $$; while :; do sleep 0.1; done' _ %s`, shellQuote(marker))
+	if err := WriteTerminal(workspaceID, record.TerminalID, job+"\n"); err != nil {
+		t.Fatalf("write job: %v", err)
+	}
+	var offset int64
+	pid := waitForTerminalPIDs(t, dataDir, workspaceID, record.TerminalID, &offset, "JOB")["JOB"]
+
+	if err := CloseTerminal(workspaceID, record.TerminalID); err != nil {
+		t.Fatalf("close terminal: %v", err)
+	}
+	requireTerminalTornDown(t, live, pid)
+	// macOS /bin/sh (bash) may flush the HUP trap's echo, stranded by the revoked
+	// terminal, into the marker ahead of the TERM trap's line.
+	if content, err := os.ReadFile(marker); err != nil || !strings.HasSuffix(string(content), "clean\n") {
+		t.Fatalf("the job never got SIGTERM: marker %q, err %v", content, err)
+	}
+}
+
+// While a close is still tearing the session down, a read does not report EOF and
+// a write fails; once the close has returned, a read reports EOF.
+func TestReadTerminalReportsNoEOFWhileCloseTearsDown(t *testing.T) {
+	dataDir, workspaceID, record := newTerminalTestSession(t, 80, 24)
+	live := liveTerminalSession(t, record.TerminalID)
+	// Ignores SIGHUP and SIGTERM, so teardown waits out the grace period. A
+	// non-interactive sh sets the dispositions: an interactive zsh already ignores
+	// SIGTERM itself and restores it for exec.
+	if err := WriteTerminal(workspaceID, record.TerminalID, "sh -c 'trap \"\" HUP TERM; exec sleep 60' & printf '__PID_STUBBORN__:%s:\\n' $!\n"); err != nil {
+		t.Fatalf("write job: %v", err)
+	}
+	var offset int64
+	pid := waitForTerminalPIDs(t, dataDir, workspaceID, record.TerminalID, &offset, "STUBBORN")["STUBBORN"]
+
+	closed := make(chan error, 1)
+	go func() { closed <- CloseTerminal(workspaceID, record.TerminalID) }()
+	for deadline := time.Now().Add(5 * time.Second); !live.isClosed(); time.Sleep(5 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("close never started")
+		}
+	}
+	read, err := ReadTerminal(dataDir, workspaceID, record.TerminalID, offset)
+	if err != nil {
+		t.Fatalf("read during close: %v", err)
+	}
+	if read.EOF {
+		t.Fatal("a read during teardown reported EOF before the session was down")
+	}
+	if err := WriteTerminal(workspaceID, record.TerminalID, "true\n"); !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("a write during teardown must fail as closed, got %v", err)
+	}
+
+	if err := <-closed; err != nil {
+		t.Fatalf("close terminal: %v", err)
+	}
+	requireTerminalTornDown(t, live, pid)
+	read, err = ReadTerminal(dataDir, workspaceID, record.TerminalID, offset)
+	if err != nil {
+		t.Fatalf("read after close: %v", err)
+	}
+	if !read.EOF {
+		t.Fatal("a read after the close returned must report EOF")
+	}
+}
+
+// Known gap: a daemon that forks, lets its parent exit, calls setsid(2) and moves
+// its stdio off the terminal keeps no link to the terminal that teardown can find.
+// Only something like a cgroup per terminal would; the body shows the leak the
+// independent working-directory check reports.
+func TestCloseTerminalFullyDetachedDaemonIsNotFound(t *testing.T) {
+	t.Skip("known gap: a daemon with no parent, session or descriptor in the terminal survives teardown")
+	if _, err := exec.LookPath("perl"); err != nil {
+		t.Skip("perl is needed to call setsid(2) from the shell")
+	}
+	dataDir, workspaceID, record := newTerminalTestSession(t, 80, 24)
+	live := liveTerminalSession(t, record.TerminalID)
+	command := `perl -MPOSIX -e 'if (fork) { exit } POSIX::setsid(); print "__PID_GONE__:$$:\n"; open STDIN, "</dev/null"; open STDOUT, ">/dev/null"; open STDERR, ">/dev/null"; sleep 60' &` + "\n"
+	if err := WriteTerminal(workspaceID, record.TerminalID, command); err != nil {
+		t.Fatalf("write daemon command: %v", err)
+	}
+	var offset int64
+	pid := waitForTerminalPIDs(t, dataDir, workspaceID, record.TerminalID, &offset, "GONE")["GONE"]
+	t.Cleanup(func() { _ = unix.Kill(pid, unix.SIGKILL) })
+	if err := CloseTerminal(workspaceID, record.TerminalID); err != nil {
+		t.Fatalf("close terminal: %v", err)
+	}
+	requireTerminalTornDown(t, live, pid)
+}
+
+// Only the shell's own session counts as the terminal's: a process that does not
+// lead a session contributes nothing through its pid, and once the shell's pid
+// shows another start time, a session with that id is not the terminal's.
+func TestTerminalSessionSweepChecksTheLeader(t *testing.T) {
+	notLeader := startSweepFixture(t, &syscall.SysProcAttr{Setpgid: true})
+	sweep := terminalSessionSweep{leader: notLeader, descendants: true, tracked: map[int]uint64{}}
+	if members := sweepMemberPIDs(t, &sweep); len(members) != 0 {
+		t.Fatalf("pid %d leads no session, yet the sweep returned %v", notLeader, members)
+	}
+
+	leader := startSweepFixture(t, &syscall.SysProcAttr{Setsid: true})
+	start, ok := terminalProcStart(leader)
+	if !ok {
+		t.Fatalf("no start time for %d", leader)
+	}
+	sweep = terminalSessionSweep{leader: leader, leaderStart: start + 1, descendants: true, tracked: map[int]uint64{}}
+	if members := sweepMemberPIDs(t, &sweep); len(members) != 0 {
+		t.Fatalf("a reused pid %d must not name the session, yet the sweep returned %v", leader, members)
+	}
+	sweep = terminalSessionSweep{leader: leader, leaderStart: start, descendants: true, tracked: map[int]uint64{}}
+	if members := sweepMemberPIDs(t, &sweep); len(members) != 2 || !slices.Contains(members, leader) {
+		t.Fatalf("session %d has the leader and its sleep, got %v", leader, members)
+	}
+}
+
+// startSweepFixture starts `sh -c 'sleep 30 & wait'` and returns once the sleep
+// child exists. The whole process group is killed at cleanup.
+func startSweepFixture(t *testing.T, attr *syscall.SysProcAttr) int {
+	t.Helper()
+	cmd := exec.Command("/bin/sh", "-c", "sleep 30 & wait")
+	cmd.SysProcAttr = attr
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start fixture: %v", err)
+	}
+	pid := cmd.Process.Pid
+	t.Cleanup(func() {
+		_ = unix.Kill(-pid, unix.SIGKILL)
+		_ = cmd.Wait()
+	})
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		procs, err := listTerminalProcs()
+		if err != nil {
+			t.Fatalf("list processes: %v", err)
+		}
+		if slices.ContainsFunc(procs, func(proc terminalProc) bool { return proc.ppid == pid && !proc.exited }) {
+			return pid
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("fixture %d never started its child", pid)
+		}
+	}
+}
+
+func sweepMemberPIDs(t *testing.T, sweep *terminalSessionSweep) []int {
+	t.Helper()
+	members, err := sweep.members(false)
+	if err != nil {
+		t.Fatalf("members: %v", err)
+	}
+	var pids []int
+	for _, member := range members {
+		pids = append(pids, member.pid)
+	}
+	return pids
+}
+
+// requireOutsideSession asserts that pid neither is in the shell's session nor
+// descends from a process that is, so only its hold on the terminal can find it.
+func requireOutsideSession(t *testing.T, pid int, leader int) {
+	t.Helper()
+	procs, err := listTerminalProcs()
+	if err != nil {
+		t.Fatalf("list processes: %v", err)
+	}
+	parent := map[int]terminalProc{}
+	for _, proc := range procs {
+		parent[proc.pid] = proc
+	}
+	for at, hops := pid, 0; at > 1 && hops < 64; hops++ {
+		proc, ok := parent[at]
+		if !ok {
+			return
+		}
+		if proc.sid == leader {
+			t.Fatalf("pid %d is not detached: %d in its ancestry is in the shell's session", pid, at)
+		}
+		at = proc.ppid
+	}
 }
 
 // The idle reaper and server shutdown tear sessions down the same way CloseTerminal
@@ -241,10 +468,19 @@ func waitForTerminalPIDs(t *testing.T, dataDir, workspaceID, terminalID string, 
 	return pids
 }
 
-// requireTerminalTornDown asserts that shutdown finished with the PTY released, and
-// that neither the shell, nor any of pids, nor any process in the shell's session
-// or below it is still alive.
+// requireTerminalTornDown asserts that shutdown finished with the pump done and
+// that no process of the terminal is left: not the shell, none of pids, nothing in
+// the shell's session and nothing working in the workspace. The last two read the
+// process table directly rather than through the sweep teardown uses, so a process
+// teardown fails to find still fails the test.
 func requireTerminalTornDown(t *testing.T, session *terminalSession, pids ...int) {
+	t.Helper()
+	requireTerminalTornDownExcept(t, session, nil, pids...)
+}
+
+// requireTerminalTornDownExcept is requireTerminalTornDown for a terminal whose
+// survivors are expected to outlive it.
+func requireTerminalTornDownExcept(t *testing.T, session *terminalSession, survivors []int, pids ...int) {
 	t.Helper()
 	select {
 	case <-session.tornDown:
@@ -256,29 +492,49 @@ func requireTerminalTornDown(t *testing.T, session *terminalSession, pids ...int
 	default:
 		t.Fatalf("terminal %s: PTY pump still running after teardown", session.terminalID)
 	}
+	root, err := filepath.EvalSymlinks(session.process.Dir)
+	if err != nil {
+		t.Fatalf("resolve workspace root: %v", err)
+	}
 	leader := session.process.Process.Pid
 	pids = append(pids, leader)
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		var alive []int
-		for _, pid := range pids {
-			if terminalProcessAlive(t, pid) {
-				alive = append(alive, pid)
-			}
-		}
-		sweep := terminalSessionSweep{leader: leader, tracked: map[int]uint64{}}
-		members, err := sweep.members()
-		if err != nil {
-			t.Fatalf("list processes: %v", err)
-		}
-		if len(alive) == 0 && len(members) == 0 {
+		left := terminalLeftovers(t, leader, root, pids, survivors)
+		if len(left) == 0 {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("terminal %s left processes running: pids %v, session members %+v", session.terminalID, alive, members)
+			t.Fatalf("terminal %s left processes running:\n%s", session.terminalID, strings.Join(left, "\n"))
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
+}
+
+// terminalLeftovers describes each live process, other than survivors, that is
+// one of pids, is in the shell's session, or works under root.
+func terminalLeftovers(t *testing.T, leader int, root string, pids []int, survivors []int) []string {
+	t.Helper()
+	procs, err := listTerminalProcs()
+	if err != nil {
+		t.Fatalf("list processes: %v", err)
+	}
+	var left []string
+	for _, proc := range procs {
+		if proc.exited || proc.pid == os.Getpid() || slices.Contains(survivors, proc.pid) {
+			continue
+		}
+		cwd, _ := terminalProcCwd(proc.pid)
+		switch {
+		case slices.Contains(pids, proc.pid):
+			left = append(left, fmt.Sprintf("pid %d", proc.pid))
+		case proc.sid == leader:
+			left = append(left, fmt.Sprintf("pid %d in the shell's session", proc.pid))
+		case cwd == root || strings.HasPrefix(cwd, root+"/"):
+			left = append(left, fmt.Sprintf("pid %d working in %s", proc.pid, cwd))
+		}
+	}
+	return left
 }
 
 // terminalProcessAlive reports whether pid names a process that has not exited; a

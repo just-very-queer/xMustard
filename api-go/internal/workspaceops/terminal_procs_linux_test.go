@@ -2,7 +2,19 @@
 
 package workspaceops
 
-import "testing"
+import (
+	"os"
+	"strconv"
+	"testing"
+)
+
+// terminalProcCwd returns pid's working directory; the teardown tests use it to
+// find leftovers without the sweep. darwin's version needs cgo, so it lives with
+// the other proc_pidinfo(3) calls.
+func terminalProcCwd(pid int) (string, bool) {
+	cwd, err := os.Readlink("/proc/" + strconv.Itoa(pid) + "/cwd")
+	return cwd, err == nil
+}
 
 // The command name in /proc/<pid>/stat is free text, so a name holding spaces and
 // ')' must not shift the numeric fields.

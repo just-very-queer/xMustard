@@ -46,6 +46,56 @@ func listTerminalProcs() ([]terminalProc, error) {
 	return procs, nil
 }
 
+// terminalProcStart returns the start time of pid as listTerminalProcs reports it.
+func terminalProcStart(pid int) (uint64, bool) {
+	stat, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
+	if err != nil {
+		return 0, false
+	}
+	proc, ok := parseProcStat(pid, stat)
+	return proc.start, ok
+}
+
+// waitTerminalShellExit blocks until the child pid has exited and reports whether
+// it has, without reaping it (waitid with WNOWAIT).
+func waitTerminalShellExit(pid int) bool {
+	var info unix.Siginfo
+	for {
+		err := unix.Waitid(unix.P_PID, pid, &info, unix.WEXITED|unix.WNOWAIT, nil)
+		if err != unix.EINTR {
+			return err == nil
+		}
+	}
+}
+
+// terminalTTYHolders returns the live processes with a descriptor on ttyPath,
+// read from /proc/<pid>/fd. Descriptors of other users' processes are unreadable,
+// and those processes could not be signalled anyway. readlink never touches the
+// file a descriptor names, so a hung network mount cannot block the scan.
+func terminalTTYHolders(ttyPath string, procs []terminalProc) map[int]bool {
+	holders := make(map[int]bool)
+	link := make([]byte, len(ttyPath)+1)
+	for _, proc := range procs {
+		if proc.exited || proc.pid <= 1 {
+			continue
+		}
+		dir := "/proc/" + strconv.Itoa(proc.pid) + "/fd/"
+		handle, err := os.Open(dir)
+		if err != nil {
+			continue
+		}
+		names, _ := handle.Readdirnames(-1)
+		_ = handle.Close()
+		for _, name := range names {
+			if n, err := unix.Readlink(dir+name, link); err == nil && string(link[:n]) == ttyPath {
+				holders[proc.pid] = true
+				break
+			}
+		}
+	}
+	return holders
+}
+
 // parseProcStat parses /proc/<pid>/stat (proc(5)). The command name is
 // parenthesised and may itself contain spaces or ')', so fields are counted from
 // the last ')'.

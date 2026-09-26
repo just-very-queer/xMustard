@@ -23,9 +23,14 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// openTerminalPTY returns the master and the replica. The replica's name is its
+// device path, which teardown uses to find processes still holding it.
 func openTerminalPTY(cols int, rows int) (*os.File, *os.File, error) {
 	var primaryFD C.int
 	var replicaFD C.int
+	// openpty(3) copies the replica's path into name unbounded; device paths such
+	// as /dev/pts/12 or /dev/ttys012 are far shorter.
+	var name [256]C.char
 	windowSize := C.struct_winsize{
 		ws_col: C.ushort(normalizeTerminalDimension(cols, 80)),
 		ws_row: C.ushort(normalizeTerminalDimension(rows, 24)),
@@ -36,7 +41,7 @@ func openTerminalPTY(cols int, rows int) (*os.File, *os.File, error) {
 	// copy never hung up the PTY and closed terminals' shells outlived the process.
 	// ForkLock keeps any fork out of the gap between creating and marking them.
 	syscall.ForkLock.RLock()
-	rv, err := C.openpty(&primaryFD, &replicaFD, nil, nil, &windowSize)
+	rv, err := C.openpty(&primaryFD, &replicaFD, &name[0], nil, &windowSize)
 	if rv == 0 {
 		unix.CloseOnExec(int(primaryFD))
 		unix.CloseOnExec(int(replicaFD))
@@ -45,8 +50,19 @@ func openTerminalPTY(cols int, rows int) (*os.File, *os.File, error) {
 	if rv != 0 {
 		return nil, nil, err
 	}
+	// On Linux a non-blocking master joins Go's poller, so closing it ends a read
+	// that a process outside the session would otherwise keep blocked. On darwin
+	// the session leader's exit revokes the terminal, which already ends the read,
+	// so the master keeps its blocking descriptor there.
+	if runtime.GOOS == "linux" {
+		if err := unix.SetNonblock(int(primaryFD), true); err != nil {
+			_ = unix.Close(int(primaryFD))
+			_ = unix.Close(int(replicaFD))
+			return nil, nil, err
+		}
+	}
 	primary := os.NewFile(uintptr(primaryFD), "pty-primary")
-	replica := os.NewFile(uintptr(replicaFD), "pty-replica")
+	replica := os.NewFile(uintptr(replicaFD), C.GoString(&name[0]))
 	if primary == nil || replica == nil {
 		if primary != nil {
 			_ = primary.Close()
@@ -79,14 +95,23 @@ func resizeTerminalPTY(handle *os.File, cols int, rows int) error {
 	if handle == nil {
 		return os.ErrClosed
 	}
-	return unix.IoctlSetWinsize(
-		int(handle.Fd()),
-		unix.TIOCSWINSZ,
-		&unix.Winsize{
+	// through SyscallConn, so a concurrent close cannot free the descriptor number
+	// for reuse while the ioctl runs
+	conn, err := handle.SyscallConn()
+	if err != nil {
+		return err
+	}
+	var ioctlErr error
+	err = conn.Control(func(fd uintptr) {
+		ioctlErr = unix.IoctlSetWinsize(int(fd), unix.TIOCSWINSZ, &unix.Winsize{
 			Col: uint16(normalizeTerminalDimension(cols, 80)),
 			Row: uint16(normalizeTerminalDimension(rows, 24)),
-		},
-	)
+		})
+	})
+	if err != nil {
+		return err
+	}
+	return ioctlErr
 }
 
 // markInheritedDescriptorsCloseOnExec sets FD_CLOEXEC on every open descriptor

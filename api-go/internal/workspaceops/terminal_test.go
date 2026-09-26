@@ -85,7 +85,8 @@ func TestTerminalOpenWriteReadResizeAndLogReplay(t *testing.T) {
 }
 
 // When the shell exits on its own, a job it left running (disowned, so the shell
-// does not hang it up) still holds the PTY and must be ended with the session.
+// does not hang it up) gets SIGHUP from teardown, as from a real hang-up, and dies
+// of it. A close afterwards still succeeds.
 func TestCloseTerminalSucceedsAfterNaturalExit(t *testing.T) {
 	dataDir, workspaceID, session := newTerminalTestSession(t, 100, 28)
 	live := liveTerminalSession(t, session.TerminalID)
@@ -142,7 +143,7 @@ func TestCloseTerminalTearsDownBackgroundChild(t *testing.T) {
 	})
 
 	jobs := strings.Join([]string{
-		"(trap '' HUP; exec sleep 61) & printf '__PID_NOHUP__:%s:\\n' $!",
+		"sh -c 'trap \"\" HUP; exec sleep 61' & printf '__PID_NOHUP__:%s:\\n' $!",
 		"sleep 62 & kill -STOP $!; printf '__PID_STOPPED__:%s:\\n' $!",
 		"sh -c 'sleep 63 & wait' & printf '__PID_NESTED__:%s:\\n' $!",
 	}, "\n") + "\n"
