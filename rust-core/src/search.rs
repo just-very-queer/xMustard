@@ -10,6 +10,7 @@ use chrono::{SecondsFormat, Utc};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::rc::Rc;
 
 use crate::symbolgraph;
 
@@ -199,9 +200,13 @@ pub struct SearchResult {
     pub total: usize,
     pub hits: Vec<SearchHit>,
     /// Index coverage: lets an agent tell complete results from a degraded/empty/
-    /// truncated graph (no-git, >MAX_FILES) instead of trusting a partial answer.
+    /// truncated graph (no Git, past the declared envelope) instead of trusting a
+    /// partial answer.
     #[serde(default)]
     pub coverage: symbolgraph::IndexCoverage,
+    /// Freshness of the graph that answered (PAR-FRESH-05).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub freshness: Option<crate::index::envelope::Freshness>,
     pub generated_at: String,
 }
 
@@ -223,8 +228,18 @@ pub fn hybrid_search(
     limit: usize,
     seed: Option<&str>,
 ) -> SearchResult {
-    let (graph, coverage) = symbolgraph::symbol_graph_with_coverage(root, workspace_id);
-    let hotspots: HashSet<String> = symbolgraph::compute_hotspots(&graph, 30)
+    let source = symbolgraph::query_source(root, workspace_id);
+    let graph = source.graph.as_ref();
+    let coverage = source.coverage.clone();
+    // a graph read that fails leaves its lane empty; the result still reports coverage
+    let warn = |what: &str, r: Result<(), String>| {
+        if let Err(e) = r {
+            eprintln!("search: {what}: {e}");
+        }
+    };
+    let hotspots: HashSet<String> = graph
+        .hotspots(30)
+        .unwrap_or_default()
         .into_iter()
         .map(|h| h.path)
         .collect();
@@ -239,6 +254,7 @@ pub fn hybrid_search(
             total: 0,
             hits: Vec::new(),
             coverage,
+            freshness: Some(source.freshness([])),
             generated_at: now(),
         };
     }
@@ -247,36 +263,39 @@ pub fn hybrid_search(
     // document frequency of each query token across symbol-name tokens (idf).
     // Token sets are computed per symbol and dropped (not materialized for every
     // symbol at once); the candidate pass below recomputes them the same way.
-    let n = graph.symbols.len().max(1) as f64;
+    let n = graph.symbol_count().max(1) as f64;
     let mut df: HashMap<String, usize> = HashMap::new();
-    for s in &graph.symbols {
-        let set: HashSet<String> = tokens(&s.name).into_iter().collect();
-        for t in &qtokens {
-            if set.contains(t) {
-                *df.entry(t.clone()).or_insert(0) += 1;
+    warn(
+        "symbols",
+        graph.for_each_symbol(&mut |s| {
+            let set: HashSet<String> = tokens(s.name).into_iter().collect();
+            for t in &qtokens {
+                if set.contains(t) {
+                    *df.entry(t.clone()).or_insert(0) += 1;
+                }
             }
-        }
-    }
+        }),
+    );
     let idf = |t: &str| -> f64 {
         let d = *df.get(t).unwrap_or(&0) as f64;
         ((n + 1.0) / (d + 1.0)).ln() + 1.0
     };
 
-    // Query embedding (semantic lane) and full inbound weight (structural lane).
+    // Query embedding (semantic lane); the source supplies inbound weight (structural).
     let q_emb = embed(query);
-    let mut inbound: HashMap<String, usize> = HashMap::new();
-    for e in &graph.edges {
-        *inbound.entry(e.to_path.clone()).or_insert(0) += e.weight;
-    }
 
     // A retrieval candidate carries the raw per-lane signals; RRF fuses them below.
+    // The pool can hold every symbol of a large repository (a common query token), so
+    // a candidate is kept compact: paths are shared, matched query tokens are a bit
+    // set, and hit strings are built only for the results returned.
     struct Cand {
         kind: &'static str,
-        name: String,
-        path: String,
+        name: Box<str>,
+        path: Rc<str>,
         line: Option<usize>,
         lexical: f64,
-        matched: Vec<String>,
+        /// Bit i set: `qtokens[i]` matched the name (the first 128 tokens are named).
+        matched: u128,
         exact: bool,
         hotspot: bool,
         emb: f32,
@@ -284,76 +303,99 @@ pub fn hybrid_search(
         proximity: f64, // 1/(graph-distance+1) to the seed; 0.0 when no seed/unreachable
     }
     const EMB_GATE: f32 = 0.30; // a pure-semantic hit must clear this to enter the pool
+    let mut shared_paths: HashSet<Rc<str>> = HashSet::new();
+    let mut share = |p: &str| -> Rc<str> {
+        if let Some(r) = shared_paths.get(p) {
+            return r.clone();
+        }
+        let r: Rc<str> = p.into();
+        shared_paths.insert(r.clone());
+        r
+    };
 
     let mut cands: Vec<Cand> = Vec::new();
-    for sym in &graph.symbols {
-        let name_tokens: HashSet<String> = tokens(&sym.name).into_iter().collect();
-        let path_tokens: HashSet<String> = tokens(&sym.path).into_iter().collect();
-        let mut lexical = 0.0;
-        let mut matched = Vec::new();
-        for t in &qtokens {
-            if name_tokens.contains(t) {
-                lexical += idf(t);
-                matched.push(t.clone());
-            } else if path_tokens.contains(t) {
-                lexical += 0.3 * idf(t);
+    warn(
+        "symbols",
+        graph.for_each_symbol(&mut |sym| {
+            let name_tokens: HashSet<String> = tokens(sym.name).into_iter().collect();
+            let path_tokens: HashSet<String> = tokens(sym.path).into_iter().collect();
+            let mut lexical = 0.0;
+            let mut matched = 0u128;
+            for (i, t) in qtokens.iter().enumerate() {
+                if name_tokens.contains(t) {
+                    lexical += idf(t);
+                    if i < 128 {
+                        matched |= 1 << i;
+                    }
+                } else if path_tokens.contains(t) {
+                    lexical += 0.3 * idf(t);
+                }
             }
-        }
-        // semantic lane uses the symbol NAME only — path tokens dilute the signal.
-        let emb = cosine(&q_emb, &embed(&sym.name));
-        if lexical <= 0.0 && emb < EMB_GATE {
-            continue;
-        }
-        cands.push(Cand {
-            kind: "symbol",
-            name: sym.name.clone(),
-            path: sym.path.clone(),
-            line: sym.line_start,
-            lexical,
-            matched,
-            exact: sym.name.to_lowercase() == query_lc,
-            hotspot: hotspots.contains(&sym.path),
-            emb,
-            structural: *inbound.get(&sym.path).unwrap_or(&0),
-            proximity: 0.0,
-        });
-    }
-    for f in &graph.files {
-        let path_tokens: HashSet<String> = tokens(&f.path).into_iter().collect();
-        let mut lexical = 0.0;
-        for t in &qtokens {
-            if path_tokens.contains(t) {
-                lexical += 0.4 * idf(t);
+            // semantic lane uses the symbol NAME only — path tokens dilute the signal.
+            let emb = cosine(&q_emb, &embed(sym.name));
+            if lexical <= 0.0 && emb < EMB_GATE {
+                return;
             }
-        }
-        let emb = cosine(&q_emb, &embed(&f.path));
-        if lexical <= 0.0 && emb < EMB_GATE {
-            continue;
-        }
-        cands.push(Cand {
-            kind: "file",
-            name: f.path.clone(),
-            path: f.path.clone(),
-            line: None,
-            lexical,
-            matched: Vec::new(),
-            exact: false,
-            hotspot: hotspots.contains(&f.path),
-            emb,
-            structural: *inbound.get(&f.path).unwrap_or(&0),
-            proximity: 0.0,
-        });
-    }
+            cands.push(Cand {
+                kind: "symbol",
+                name: sym.name.into(),
+                path: share(sym.path),
+                line: sym.line,
+                lexical,
+                matched,
+                exact: sym.name.to_lowercase() == query_lc,
+                hotspot: hotspots.contains(sym.path),
+                emb,
+                structural: sym.file_inbound,
+                proximity: 0.0,
+            });
+        }),
+    );
+    warn(
+        "files",
+        graph.for_each_file(&mut |f| {
+            let path_tokens: HashSet<String> = tokens(f.path).into_iter().collect();
+            let mut lexical = 0.0;
+            for t in &qtokens {
+                if path_tokens.contains(t) {
+                    lexical += 0.4 * idf(t);
+                }
+            }
+            let emb = cosine(&q_emb, &embed(f.path));
+            if lexical <= 0.0 && emb < EMB_GATE {
+                return;
+            }
+            cands.push(Cand {
+                kind: "file",
+                name: f.path.into(),
+                path: share(f.path),
+                line: None,
+                lexical,
+                matched: 0,
+                exact: false,
+                hotspot: hotspots.contains(f.path),
+                emb,
+                structural: f.inbound,
+                proximity: 0.0,
+            });
+        }),
+    );
+    drop(shared_paths);
 
-    // Proximity lane: resolve the seed (explicit, else auto-seed from the top
-    // exact query→symbol match), BFS its blast radius over the reference graph,
-    // and fold distance→weight onto each candidate's defining file.
+    // Proximity lane: resolve the seed (explicit, else auto-seed from the exact
+    // query→symbol match first in path order), BFS its blast radius over the reference
+    // graph, and fold distance→weight onto each candidate's defining file.
     let effective_seed: Option<String> = match seed {
         Some(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
-        _ => cands.iter().find(|c| c.exact).map(|c| c.name.clone()),
+        _ => cands
+            .iter()
+            .filter(|c| c.exact)
+            .min_by(|a, b| a.path.cmp(&b.path).then(a.line.cmp(&b.line)))
+            .map(|c| c.name.to_string()),
     };
-    if let Some(seed_name) = &effective_seed {
-        let impact = symbolgraph::symbol_impact(&graph, seed_name, PROXIMITY_DEPTH);
+    if let Some(seed_name) = &effective_seed
+        && let Ok(impact) = graph.impact(seed_name, PROXIMITY_DEPTH)
+    {
         let mut prox: HashMap<String, f64> = HashMap::new();
         for d in &impact.defined_in {
             prox.insert(d.clone(), 1.0); // the seed's own file: distance 0
@@ -364,7 +406,7 @@ pub fn hybrid_search(
         }
         if !prox.is_empty() {
             for c in &mut cands {
-                if let Some(&p) = prox.get(&c.path) {
+                if let Some(&p) = prox.get(&*c.path) {
                     c.proximity = p;
                 }
             }
@@ -374,55 +416,79 @@ pub fn hybrid_search(
     // Reciprocal Rank Fusion across up to four lanes. Each lane ranks the pool by
     // its own signal; a candidate's fused score sums 1/(k + rank) over the lanes it
     // appears in, so agreement across diverse signals beats one loud signal.
-    let rank_by = |key: &dyn Fn(&Cand) -> f64| -> Vec<usize> {
-        let mut idxs: Vec<usize> = (0..cands.len()).filter(|&i| key(&cands[i]) > 0.0).collect();
+    let rank_by = |key: &dyn Fn(&Cand) -> f64| -> Vec<u32> {
+        let mut idxs: Vec<u32> = (0..cands.len() as u32)
+            .filter(|&i| key(&cands[i as usize]) > 0.0)
+            .collect();
         idxs.sort_by(|&a, &b| {
-            key(&cands[b])
-                .partial_cmp(&key(&cands[a]))
+            let (a, b) = (&cands[a as usize], &cands[b as usize]);
+            key(b)
+                .partial_cmp(&key(a))
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then(cands[a].name.cmp(&cands[b].name))
+                .then(a.name.cmp(&b.name))
         });
         idxs
     };
-    let lex_rank = rank_by(&|c| c.lexical);
-    let emb_rank = rank_by(&|c| c.emb as f64);
-    let str_rank = rank_by(&|c| c.structural as f64);
-    let prox_rank = rank_by(&|c| c.proximity);
+    const LANES: [&str; 4] = ["lexical", "semantic", "structural", "proximity"];
+    let rankings = [
+        rank_by(&|c| c.lexical),
+        rank_by(&|c| c.emb as f64),
+        rank_by(&|c| c.structural as f64),
+        rank_by(&|c| c.proximity),
+    ];
 
     let k = 60.0f64;
-    let mut rrf = vec![0.0f64; cands.len()];
-    let mut lanes = vec![Vec::<&'static str>::new(); cands.len()];
-    for (label, ranking) in [
-        ("lexical", &lex_rank),
-        ("semantic", &emb_rank),
-        ("structural", &str_rank),
-        ("proximity", &prox_rank),
-    ] {
+    // fused score (with the exact-match bonus) and the lanes each candidate ranked in
+    let mut score: Vec<f64> = cands
+        .iter()
+        .map(|c| if c.exact { 1.0 } else { 0.0 }) // an exact name match dominates
+        .collect();
+    let mut in_lanes = vec![0u8; cands.len()];
+    for (lane, ranking) in rankings.iter().enumerate() {
         for (rank, &i) in ranking.iter().enumerate() {
-            rrf[i] += 1.0 / (k + rank as f64 + 1.0);
-            lanes[i].push(label);
+            score[i as usize] += 1.0 / (k + rank as f64 + 1.0);
+            in_lanes[i as usize] |= 1 << lane;
         }
     }
+    drop(rankings);
 
-    let mut hits: Vec<SearchHit> = cands
-        .iter()
-        .enumerate()
-        .map(|(i, c)| {
-            let mut score = rrf[i];
-            if c.exact {
-                score += 1.0; // an exact name match dominates the fused ranking
-            }
+    // the best `limit` candidates, in the order the full ranking gives them
+    let by_rank = |a: &usize, b: &usize| {
+        score[*b]
+            .partial_cmp(&score[*a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(cands[*a].name.cmp(&cands[*b].name))
+    };
+    let mut order: Vec<usize> = (0..cands.len()).collect();
+    order.sort_by(by_rank);
+    order.truncate(limit);
+    let mut hits: Vec<SearchHit> = order
+        .into_iter()
+        .map(|i| {
+            let c = &cands[i];
             let reason = if c.exact {
                 "exact symbol match".to_string()
             } else {
-                let base = if !c.matched.is_empty() {
-                    format!("matched {}", c.matched.join("+"))
+                let base = if c.matched != 0 {
+                    let names: Vec<&str> = qtokens
+                        .iter()
+                        .enumerate()
+                        .filter(|(t, _)| *t < 128 && c.matched & (1 << t) != 0)
+                        .map(|(_, t)| t.as_str())
+                        .collect();
+                    format!("matched {}", names.join("+"))
                 } else if c.kind == "file" {
                     "path match".to_string()
                 } else {
                     "semantic match".to_string()
                 };
-                let mut r = format!("{base} · {}", lanes[i].join("+"));
+                let lanes: Vec<&str> = LANES
+                    .iter()
+                    .enumerate()
+                    .filter(|(l, _)| in_lanes[i] & (1 << l) != 0)
+                    .map(|(_, name)| *name)
+                    .collect();
+                let mut r = format!("{base} · {}", lanes.join("+"));
                 if c.hotspot {
                     r.push_str(" · hotspot");
                 }
@@ -430,19 +496,23 @@ pub fn hybrid_search(
             };
             SearchHit {
                 kind: c.kind.to_string(),
-                name: c.name.clone(),
-                path: c.path.clone(),
+                name: c.name.to_string(),
+                path: c.path.to_string(),
                 line: c.line,
-                score,
+                score: score[i],
                 reason,
             }
         })
         .collect();
+    let code_total = cands.len();
+    drop(cands);
 
     // Docs/guidance live OUTSIDE the code symbol graph, so fold a content search over
     // them into the same result set: an agent can now find a concept that only appears
     // in a README / AGENTS.md / design doc through the one search tool (XM-PRO-012).
-    hits.extend(search_docs(root, &qtokens, limit));
+    let docs = search_docs(root, &qtokens, limit);
+    let total = code_total + docs.len();
+    hits.extend(docs);
 
     hits.sort_by(|a, b| {
         b.score
@@ -450,14 +520,19 @@ pub fn hybrid_search(
             .unwrap_or(std::cmp::Ordering::Equal)
             .then(a.name.cmp(&b.name))
     });
-    let total = hits.len();
     hits.truncate(limit);
+    let freshness = source.freshness(
+        hits.iter()
+            .filter(|h| h.kind != "doc")
+            .map(|h| h.path.as_str()),
+    );
     SearchResult {
         workspace_id: workspace_id.to_string(),
         query: query.to_string(),
         total,
         hits,
         coverage,
+        freshness: Some(freshness),
         generated_at: now(),
     }
 }

@@ -5,13 +5,14 @@
 //! `last_commit`, `repo_mode`, `root`, `ignored_files`, `invalid_paths`,
 //! `worktree_deleted`, `ignore_rules_dropped`, `envelope_beyond` (JSON: count per loss
 //! reason of eligible files that have no row because they are past the envelope) and
-//! `envelope_beyond_sample` (JSON: the first of them by path), `generation`, `coverage`
+//! `envelope_beyond_sample` (JSON: the first of them by path), `generation` (monotonic
+//! per store directory, across full rebuilds too), `graph_segment`, `identity_key`, `coverage`
 //! (JSON, as of the last build or update) and `last_run` (that run's counters, JSON).
 
 use std::collections::BTreeMap;
 
 use rusqlite::{Connection, OptionalExtension, params};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::config::IndexConfig;
@@ -28,6 +29,13 @@ pub const MAX_LOSS_ENTRIES: usize = 200;
 pub const BEYOND: &str = "envelope_beyond";
 /// Meta key: the first of those files by path, `[[path, reason], ...]`.
 pub const BEYOND_SAMPLE: &str = "envelope_beyond_sample";
+/// Meta key: the file name of this generation's graph segment (`csr`), written by the
+/// index writer before the generation commits.
+pub const GRAPH_SEGMENT: &str = "graph_segment";
+/// Meta key: the repository identity key (`repo-key`) the orchestrator observed when it
+/// ran the last update (`index update --identity-key`); readers report it as the
+/// identity their answers reflect.
+pub const IDENTITY_KEY: &str = "identity_key";
 
 pub fn get(conn: &Connection, key: &str) -> rusqlite::Result<Option<String>> {
     conn.query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0))
@@ -43,7 +51,7 @@ pub fn set(conn: &Connection, key: &str, value: &str) -> rusqlite::Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Clone, Serialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct Loss {
     pub path: String,
     /// `oversized` | `unreadable` | `symlink` | `not_regular` | `missing` |
@@ -56,7 +64,8 @@ pub struct Loss {
     pub content_indexed: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default)]
 pub struct Envelope {
     pub max_files: usize,
     pub max_symbols: usize,
@@ -66,7 +75,8 @@ pub struct Envelope {
     pub exceeded: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default)]
 pub struct Coverage {
     /// Source files the ignore rules admit (those past the envelope have no row).
     pub eligible_files: usize,

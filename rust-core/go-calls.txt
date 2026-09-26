@@ -27,6 +27,7 @@ called goal iterate
 called goal ledger
 called goal list
 called goal status
+called index
 called link-diagnostic-symbol
 called lsp-document-symbols
 called normalize-diagnostics
@@ -46,6 +47,7 @@ called search
 called semantic-impact
 called symbolgraph blast-radius
 called symbolgraph build
+called symbolgraph cluster-of
 called symbolgraph clusters
 called symbolgraph hotspots
 called symbolgraph impact

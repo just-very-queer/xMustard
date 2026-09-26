@@ -865,68 +865,93 @@ fn run_changetrack_command(mut args: Args) -> CmdResult {
 }
 
 /// `symbolgraph <build|hotspots|blast-radius|...> ...` — the semantic symbol graph.
-/// The read-only queries share the resident snapshot when serving (see
-/// `symbolgraph::symbol_graph_for_query`).
+/// The read-only queries run on the code index's snapshot when the root has an index
+/// (resident when serving) and on the legacy graph otherwise (see
+/// `symbolgraph::query_source`); impact, trace and cluster-of carry freshness and
+/// coverage.
 fn run_symbolgraph_command(mut args: Args) -> CmdResult {
     use xmustard_core::symbolgraph as sg;
 
     let sub = need(
         &mut args,
-        "xmustard-core symbolgraph <build|hotspots|blast-radius> ...",
+        "xmustard-core symbolgraph <build|hotspots|clusters|cluster-of|impact|trace|blast-radius> ...",
     )?;
+    let usage = |rest: &str| format!("xmustard-core symbolgraph {sub} <root> <workspace_id>{rest}");
+    let failed = |e: String| CmdError::failed(format!("symbolgraph {sub}: {e}"));
     match sub.as_str() {
         "build" => {
-            let usage = "xmustard-core symbolgraph build <root> <workspace_id>";
-            let root = need(&mut args, usage)?;
-            let ws = need(&mut args, usage)?;
+            let u = usage("");
+            let root = need(&mut args, &u)?;
+            let ws = need(&mut args, &u)?;
             json(&sg::build_symbol_graph(Path::new(&root), &ws))
         }
         "clusters" => {
-            let usage = "xmustard-core symbolgraph clusters <root> <workspace_id>";
-            let root = need(&mut args, usage)?;
-            let ws = need(&mut args, usage)?;
-            let graph = sg::symbol_graph_for_query(Path::new(&root), &ws);
-            json(&sg::compute_clusters(&graph))
+            let u = usage("");
+            let root = need(&mut args, &u)?;
+            let ws = need(&mut args, &u)?;
+            let src = sg::query_source(Path::new(&root), &ws);
+            json(&src.graph.clusters().map_err(failed)?)
+        }
+        "cluster-of" => {
+            let u = usage(" <path>");
+            let root = need(&mut args, &u)?;
+            let ws = need(&mut args, &u)?;
+            let path = need(&mut args, &u)?;
+            let src = sg::query_source(Path::new(&root), &ws);
+            let cluster = src.graph.cluster_of(&path).map_err(failed)?;
+            let (freshness, coverage) = src.annotate([path.as_str()]);
+            json(&serde_json::json!({
+                "path": path,
+                "cluster": cluster,
+                "freshness": freshness,
+                "coverage": coverage,
+            }))
         }
         "impact" => {
-            let usage =
-                "xmustard-core symbolgraph impact <root> <workspace_id> <symbol> [max_depth]";
-            let root = need(&mut args, usage)?;
-            let ws = need(&mut args, usage)?;
-            let symbol = need(&mut args, usage)?;
+            let u = usage(" <symbol> [max_depth]");
+            let root = need(&mut args, &u)?;
+            let ws = need(&mut args, &u)?;
+            let symbol = need(&mut args, &u)?;
             let depth = args
                 .next()
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(4);
-            let graph = sg::symbol_graph_for_query(Path::new(&root), &ws);
-            json(&sg::symbol_impact(&graph, &symbol, depth))
+            let src = sg::query_source(Path::new(&root), &ws);
+            let mut out = src.graph.impact(&symbol, depth).map_err(failed)?;
+            let paths = out
+                .defined_in
+                .iter()
+                .chain(out.impacted.iter().map(|i| &i.path));
+            (out.freshness, out.coverage) = src.annotate(paths.map(String::as_str));
+            json(&out)
         }
         "trace" => {
-            let usage =
-                "xmustard-core symbolgraph trace <root> <workspace_id> <from_symbol> <to_symbol>";
-            let root = need(&mut args, usage)?;
-            let ws = need(&mut args, usage)?;
-            let from = need(&mut args, usage)?;
-            let to = need(&mut args, usage)?;
-            let graph = sg::symbol_graph_for_query(Path::new(&root), &ws);
-            json(&sg::trace_symbols(&graph, &from, &to))
+            let u = usage(" <from_symbol> <to_symbol>");
+            let root = need(&mut args, &u)?;
+            let ws = need(&mut args, &u)?;
+            let from = need(&mut args, &u)?;
+            let to = need(&mut args, &u)?;
+            let src = sg::query_source(Path::new(&root), &ws);
+            let mut out = src.graph.trace(&from, &to).map_err(failed)?;
+            (out.freshness, out.coverage) = src.annotate(out.path.iter().map(String::as_str));
+            json(&out)
         }
         "hotspots" => {
-            let usage = "xmustard-core symbolgraph hotspots <root> <workspace_id> [limit]";
-            let root = need(&mut args, usage)?;
-            let ws = need(&mut args, usage)?;
+            let u = usage(" [limit]");
+            let root = need(&mut args, &u)?;
+            let ws = need(&mut args, &u)?;
             let limit = args
                 .next()
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(20);
-            let graph = sg::symbol_graph_for_query(Path::new(&root), &ws);
-            json(&sg::compute_hotspots(&graph, limit))
+            let src = sg::query_source(Path::new(&root), &ws);
+            json(&src.graph.hotspots(limit).map_err(failed)?)
         }
         "blast-radius" => {
-            let usage = "xmustard-core symbolgraph blast-radius <root> <workspace_id> <symbol>";
-            let root = need(&mut args, usage)?;
-            let ws = need(&mut args, usage)?;
-            let symbol = need(&mut args, usage)?;
+            let u = usage(" <symbol>");
+            let root = need(&mut args, &u)?;
+            let ws = need(&mut args, &u)?;
+            let symbol = need(&mut args, &u)?;
             json(&sg::blast_radius(Path::new(&root), &ws, &symbol))
         }
         other => Err(CmdError::new(
@@ -965,6 +990,7 @@ mod tests {
         ("symbolgraph", &["impact"]),
         ("symbolgraph", &["trace"]),
         ("symbolgraph", &["clusters"]),
+        ("symbolgraph", &["cluster-of"]),
         ("changetrack", &["fingerprint"]),
         ("changetrack", &["drift"]),
         ("changetrack", &["changed-since"]),

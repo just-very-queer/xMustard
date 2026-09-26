@@ -2,9 +2,10 @@
 //!
 //! The Go API supervises one long-lived worker (`api-go/internal/rustcore/worker.go`)
 //! instead of starting `xmustard-core` for every call. The worker answers JSON-RPC 2.0
-//! requests over stdio and runs the subcommand table (`dispatch`) in-process. Symbol
-//! graphs stay in memory per source identity ([`GraphSnapshots`]), so a warm query
-//! neither spawns a process nor re-reads the graph JSON from disk.
+//! requests over stdio and runs the subcommand table (`dispatch`) in-process. Code
+//! index snapshots stay open per repository root (`index::reader::Snapshots`, WS-14),
+//! and so do legacy symbol graphs per source identity ([`GraphSnapshots`]) for roots
+//! without an index, so a warm query neither spawns a process nor parses a graph.
 //!
 //! # Framing
 //!
@@ -44,7 +45,7 @@
 //! Requests run on a fixed pool of `max_inflight` threads (the Go side passes its
 //! child limit). End of input on stdin ends the process at once, so a worker never
 //! outlives its supervisor's pipe. After `trim_idle` without requests, the resident
-//! graph snapshots are dropped; the allocator returns only part of that memory to the
+//! graph and index snapshots are dropped; the allocator returns only part of that memory to the
 //! OS, so the process keeps most of its peak RSS until it exits. The supervisor owns
 //! idle exit: it closes stdin. Children (git) never inherit the protocol stream.
 
@@ -458,6 +459,7 @@ impl Shared {
             "inflight": lock(&self.inflight).len(),
             "queued": lock(&self.queue).len(),
             "snapshots": self.snapshots.stats(),
+            "index": crate::index::reader::resident().map(|r| r.stats()),
         })
     }
 }
@@ -510,6 +512,7 @@ pub fn serve<R: BufRead>(
     writer: Box<dyn Write + Send>,
 ) -> i32 {
     let snapshots = RESIDENT_GRAPHS.get_or_init(|| GraphSnapshots::new(cfg.max_snapshots));
+    crate::index::reader::enable_resident(cfg.max_snapshots);
     let shared = Arc::new(Shared {
         writer: Mutex::new(writer),
         queue: Mutex::new(VecDeque::new()),
@@ -840,8 +843,11 @@ fn trim_thread(shared: &Shared) {
         std::thread::sleep(every);
         let idle = lock(&shared.last_activity).elapsed() >= shared.cfg.trim_idle;
         let busy = !lock(&shared.inflight).is_empty() || !lock(&shared.queue).is_empty();
-        if idle && !busy && !shared.snapshots.is_empty() {
+        let index = crate::index::reader::resident();
+        let resident = !shared.snapshots.is_empty() || index.is_some_and(|r| !r.is_empty());
+        if idle && !busy && resident {
             shared.snapshots.clear();
+            index.map(|r| r.clear());
             shared.counters.trims.fetch_add(1, Ordering::Relaxed);
         }
     }
