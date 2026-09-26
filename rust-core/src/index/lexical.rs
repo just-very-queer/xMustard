@@ -8,7 +8,7 @@
 //! `symbolgraph.rs` and `repomap.rs` (the legacy lexical graph), compiled once per
 //! process instead of once per file.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 use regex::bytes::Regex;
@@ -16,7 +16,7 @@ use regex::bytes::Regex;
 use super::extract::{Lang, MAX_REFS_PER_FILE, MAX_SYMBOLS_PER_FILE};
 use super::facts::{FileFacts, ImportFact, RefFact, SymbolFact, flow, ref_kind};
 
-pub const LEXICAL_REVISION: u32 = 2;
+pub const LEXICAL_REVISION: u32 = 3;
 
 /// Longest span given to a fallback symbol (its end is the next declaration).
 const MAX_FALLBACK_SPAN: u32 = 80;
@@ -140,6 +140,9 @@ const KEYWORDS: &[&str] = &[
 /// Nesting bound for template substitutions, interpolations and JSX elements.
 const MAX_LITERAL_DEPTH: u32 = 64;
 
+/// Parentheses tracked for `if (...) /re/` (deeper ones are plain parentheses).
+const MAX_PAREN_DEPTH: usize = 256;
+
 /// What the last significant token was, for the tokens whose meaning depends on it
 /// (`/` regex versus division, `<` JSX versus comparison, Ruby `%` and `<<` literals).
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -185,6 +188,9 @@ struct Blanker<'a> {
     jsx_on: bool,
     /// A regex attempt found no closing `/` before this offset (its line end).
     regex_dead_until: usize,
+    /// The last token was `if`, `while` or `for` (JS family): the `(` after it opens a
+    /// condition, and a `/` after its `)` starts a regex, not a division.
+    cond_keyword: bool,
 }
 
 fn is_word_start(c: u8) -> bool {
@@ -241,6 +247,7 @@ impl<'a> Blanker<'a> {
             jsx_failed: 0,
             jsx_on: matches!(lang, Lang::Tsx | Lang::JavaScript),
             regex_dead_until: 0,
+            cond_keyword: false,
         }
     }
 
@@ -275,6 +282,7 @@ impl<'a> Blanker<'a> {
     fn set_prev(&mut self, p: Prev) {
         self.prev = p;
         self.spaced = false;
+        self.cond_keyword = false;
     }
 
     fn at_line_start(&self, i: usize) -> bool {
@@ -297,6 +305,20 @@ impl<'a> Blanker<'a> {
             .map_or(self.b.len(), |p| i + p)
     }
 
+    /// End of the logical line from `i`: C and C++ backslash-newline continuations
+    /// included.
+    fn logical_eol(&self, i: usize) -> usize {
+        let b = self.b;
+        let mut e = self.eol(i);
+        while e < b.len()
+            && e > 0
+            && (b[e - 1] == b'\\' || (b[e - 1] == b'\r' && e > 1 && b[e - 2] == b'\\'))
+        {
+            e = self.eol(e + 1);
+        }
+        e
+    }
+
     fn find_from(&self, i: usize, needle: &[u8]) -> Option<usize> {
         if i >= self.b.len() {
             return None;
@@ -309,6 +331,10 @@ impl<'a> Blanker<'a> {
     fn code(&mut self, mut i: usize, nested: bool) -> usize {
         let n = self.b.len();
         let mut braces = 0usize;
+        // per open `(`: whether it opened an `if`/`while`/`for` condition (bounded; deeper
+        // parentheses count as plain ones)
+        let mut parens: Vec<bool> = Vec::new();
+        let mut deep_parens = 0usize;
         while i < n {
             let c = self.b[i];
             match c {
@@ -359,7 +385,25 @@ impl<'a> Blanker<'a> {
                     braces = braces.saturating_sub(1);
                     self.set_prev(Prev::Op);
                 }
-                b')' | b']' => self.set_prev(Prev::Value),
+                b'(' => {
+                    if parens.len() < MAX_PAREN_DEPTH {
+                        parens.push(self.cond_keyword);
+                    } else {
+                        deep_parens += 1;
+                    }
+                    self.set_prev(Prev::Op);
+                }
+                b')' => {
+                    let condition = if deep_parens > 0 {
+                        deep_parens -= 1;
+                        false
+                    } else {
+                        parens.pop().unwrap_or(false)
+                    };
+                    // `if (x) /re/.test(s)`: a statement, not a division, follows
+                    self.set_prev(if condition { Prev::Op } else { Prev::Value });
+                }
+                b']' => self.set_prev(Prev::Value),
                 _ => self.set_prev(Prev::Op),
             }
             i += 1;
@@ -388,7 +432,13 @@ impl<'a> Blanker<'a> {
         let rest = &b[i..];
         if self.c_comments() {
             if rest.starts_with(b"//") {
-                return Some(self.eol(i));
+                // C and C++ splice a line ending in a backslash onto the next one, even
+                // inside a `//` comment
+                return Some(if matches!(self.lang, Lang::C | Lang::Cpp) {
+                    self.logical_eol(i)
+                } else {
+                    self.eol(i)
+                });
             }
             if rest.starts_with(b"/*") {
                 if self.lang == Lang::Rust {
@@ -454,15 +504,7 @@ impl<'a> Blanker<'a> {
                 ) {
                     return None;
                 }
-                // the logical line, with backslash continuations
-                let mut e = self.eol(i);
-                while e < b.len()
-                    && e > 0
-                    && (b[e - 1] == b'\\' || (b[e - 1] == b'\r' && e > 1 && b[e - 2] == b'\\'))
-                {
-                    e = self.eol(e + 1);
-                }
-                Some(e)
+                Some(self.logical_eol(i))
             }
             _ if self.js() && i == 0 && rest.starts_with(b"#!") => Some(self.eol(i)),
             _ => None,
@@ -1021,6 +1063,7 @@ impl<'a> Blanker<'a> {
             _ => false,
         };
         self.set_prev(if keyword { Prev::Op } else { Prev::Value });
+        self.cond_keyword = self.js() && matches!(w, b"if" | b"while" | b"for");
         j
     }
 
@@ -1113,38 +1156,38 @@ fn is_ident_byte(c: u8) -> bool {
     c.is_ascii_alphanumeric() || c == b'_'
 }
 
-/// Identifier spans `(word, start_col, end_col)` on one line.
-fn identifier_spans(line: &str) -> Vec<(&str, usize, usize)> {
+/// Identifier spans `(word, start_col, end_col)` on one line, lazily (a minified line
+/// holds hundreds of thousands).
+fn identifier_spans(line: &str) -> impl Iterator<Item = (&str, usize, usize)> + '_ {
     let b = line.as_bytes();
-    let mut out = Vec::new();
     let mut i = 0;
-    while i < b.len() {
-        if is_ident_start(b[i]) && (i == 0 || !is_ident_byte(b[i - 1])) {
-            let s = i;
-            while i < b.len() && is_ident_byte(b[i]) {
-                i += 1;
+    std::iter::from_fn(move || {
+        while i < b.len() {
+            if is_ident_start(b[i]) && (i == 0 || !is_ident_byte(b[i - 1])) {
+                let s = i;
+                while i < b.len() && is_ident_byte(b[i]) {
+                    i += 1;
+                }
+                return Some((&line[s..i], s, i));
             }
-            out.push((&line[s..i], s, i));
-        } else {
             i += 1;
         }
-    }
-    out
+        None
+    })
 }
 
 const BRANCH_KEYWORDS: &[&str] = &["if", "while", "match", "switch", "elif", "when", "case"];
 
 /// Legacy `line_flows` semantics: an identifier after `return` returns, after a branch
-/// keyword branches, and one followed by an assignment operator is written.
-fn flow_of(line: &str, spans: &[(&str, usize, usize)], idx: usize) -> u8 {
-    let (_, start, end) = spans[idx];
-    if spans.iter().any(|(w, s, _)| *w == "return" && *s < start) {
+/// keyword branches, and one followed by an assignment operator is written. The
+/// keyword positions are the line's first `return` and first branch keyword
+/// (`line_keywords`), found once per line so long lines stay linear.
+fn flow_of(line: &str, keywords: (Option<usize>, Option<usize>), start: usize, end: usize) -> u8 {
+    let (first_return, first_branch) = keywords;
+    if first_return.is_some_and(|s| s < start) {
         return flow::RETURNS;
     }
-    if spans
-        .iter()
-        .any(|(w, s, _)| BRANCH_KEYWORDS.contains(w) && *s < start)
-    {
+    if first_branch.is_some_and(|s| s < start) {
         return flow::BRANCHES;
     }
     let after = line.get(end..).unwrap_or("").trim_start();
@@ -1156,6 +1199,23 @@ fn flow_of(line: &str, spans: &[(&str, usize, usize)], idx: usize) -> u8 {
         return flow::WRITES;
     }
     flow::NONE
+}
+
+/// Start columns of the first `return` and the first branch keyword on a line.
+fn line_keywords(line: &str) -> (Option<usize>, Option<usize>) {
+    let (mut ret, mut branch) = (None, None);
+    for (w, s, _) in identifier_spans(line) {
+        if ret.is_none() && w == "return" {
+            ret = Some(s);
+        }
+        if branch.is_none() && BRANCH_KEYWORDS.contains(&w) {
+            branch = Some(s);
+        }
+        if ret.is_some() && branch.is_some() {
+            break;
+        }
+    }
+    (ret, branch)
 }
 
 fn is_import_line(lang: Lang, line: &str) -> bool {
@@ -1473,10 +1533,10 @@ pub fn extract(lang: Lang, text: &str) -> FileFacts {
         if import {
             parse_imports(lang, line_no, raw, &mut imports);
         }
-        let supers = inheritance_names(lang, line);
-        let spans = identifier_spans(line);
-        for (k, (word, s, _)) in spans.iter().enumerate() {
-            if defs.get(&line_no).is_some_and(|d| d == word) || KEYWORDS.contains(word) {
+        let supers: HashSet<String> = inheritance_names(lang, line).into_iter().collect();
+        let keywords = line_keywords(line);
+        for (word, s, e) in identifier_spans(line) {
+            if defs.get(&line_no).is_some_and(|d| *d == word) || KEYWORDS.contains(&word) {
                 continue;
             }
             if refs.len() >= MAX_REFS_PER_FILE {
@@ -1485,16 +1545,16 @@ pub fn extract(lang: Lang, text: &str) -> FileFacts {
             }
             let kind = if import {
                 ref_kind::IMPORT
-            } else if supers.iter().any(|x| x == word) {
+            } else if supers.contains(word) {
                 ref_kind::EXTENDS
             } else {
                 ref_kind::WORD
             };
-            let ni = *name_ix.entry((*word).to_string()).or_insert_with(|| {
-                names.push((*word).to_string());
+            let ni = *name_ix.entry(word.to_string()).or_insert_with(|| {
+                names.push(word.to_string());
                 (names.len() - 1) as u32
             });
-            let off = offsets.get(i).copied().unwrap_or(0) + *s as u32;
+            let off = offsets.get(i).copied().unwrap_or(0) + s as u32;
             // fallback symbols are sorted and do not overlap: the last one starting at
             // or before this line contains it when its span reaches the line.
             let at = facts
@@ -1508,11 +1568,11 @@ pub fn extract(lang: Lang, text: &str) -> FileFacts {
             refs.push(RefFact(
                 ni,
                 line_no,
-                *s as u32,
+                s as u32,
                 off,
                 container,
                 kind,
-                flow_of(line, &spans, k),
+                flow_of(line, keywords, s, e),
             ));
         }
     }
@@ -1555,7 +1615,7 @@ mod tests {
         );
         let words: std::collections::HashSet<&str> = out
             .lines()
-            .flat_map(|l| identifier_spans(l).into_iter().map(|(w, _, _)| w))
+            .flat_map(|l| identifier_spans(l).map(|(w, _, _)| w))
             .collect();
         for w in code {
             assert!(words.contains(w), "{lang:?}: code word {w} lost in\n{out}");
@@ -1623,6 +1683,15 @@ mod tests {
             "const v = <Widget>thing;\n",
             &["Widget", "thing"],
             &[],
+        ); // a regex after the condition of `if`/`while`/`for` is a regex; after a call's
+        // `)` a `/` is still division
+        check(
+            Lang::Tsx,
+            "function f(props, s) {\n  if (props.x) /GhostRe2/.test(s);\n  while (next(s)) /GhostRe3/g.exec(s);\n  for (let i = 0; i < n(s); i++) /GhostRe4/.test(s);\n  return size(s) / scale / 2;\n}\n",
+            &[
+                "props", "x", "test", "next", "exec", "i", "n", "size", "scale",
+            ],
+            &["GhostRe2", "GhostRe3", "GhostRe4"],
         );
     }
 
@@ -1644,7 +1713,15 @@ mod tests {
                 "GhostRawCpp",
                 "GhostWide",
             ],
-        );
+        ); // a `//` comment ending in a backslash continues on the next line
+        for lang in [Lang::C, Lang::Cpp] {
+            check(
+                lang,
+                "int a = 1; // note \\\ncontinued GhostCont \\\r\nGhostCont2 more\nint b = use(a);\n",
+                &["a", "b", "use"],
+                &["continued", "GhostCont", "GhostCont2", "more", "note"],
+            );
+        }
     }
 
     #[test]
@@ -1713,6 +1790,35 @@ mod tests {
             "{:?}",
             t.elapsed()
         );
+    }
+
+    #[test]
+    fn long_single_lines_extract_in_linear_time() {
+        // minified-bundle shapes on one line (the reference flow of each identifier used
+        // to scan the whole line: 67-270 s at 1 MB in release builds); a quarter of the
+        // size in debug builds, where the old quadratic cost still takes minutes
+        let n = if cfg!(debug_assertions) { 4 } else { 1 };
+        let shapes: [(Lang, String); 4] = [
+            (Lang::Rust, "'a".repeat(500_000 / n)),
+            (Lang::Tsx, "a <b && <c ".repeat(90_000 / n)),
+            (Lang::JavaScript, "<a>{".repeat(250_000 / n)),
+            (
+                Lang::Java,
+                format!("class A extends {}B {{}}", "Base, ".repeat(160_000 / n)),
+            ),
+        ];
+        for (lang, src) in shapes {
+            let t = std::time::Instant::now();
+            let f = extract(lang, &src);
+            let limit = if cfg!(debug_assertions) { 30 } else { 5 };
+            assert!(
+                t.elapsed() < std::time::Duration::from_secs(limit),
+                "{lang:?}: {:?} for {} bytes ({} refs)",
+                t.elapsed(),
+                src.len(),
+                f.refs.len()
+            );
+        }
     }
 
     #[test]

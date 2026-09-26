@@ -67,6 +67,8 @@ pub const ESCALATE_MIN_FILES: usize = 50;
 const FACT_CACHE_KEEP_MIN: i64 = 256;
 /// Prefix of stored stat keys taken inside the racy window (see `stat_key_for`).
 const RACY_PREFIX: &str = "racy:";
+/// The loss status of a readable file the byte budget left out.
+const ENVELOPE_BYTES: &str = "envelope_bytes";
 /// Prefix of store errors that mean the file is damaged (a full rebuild replaces it).
 const CORRUPT_ERROR: &str = "index store corrupt";
 
@@ -177,9 +179,13 @@ pub fn index_dir(root: &Path, git_dir: Option<&Path>, cfg: &IndexConfig) -> Path
 
 /// Create `dir` (and missing parents) readable by its owner only, and refuse a
 /// directory that is a symlink or belongs to another user: the index holds identifiers
-/// and postings of the source, and with `full` retention the source itself.
-fn ensure_private_dir(dir: &Path) -> Result<(), String> {
+/// and postings of the source, and with `full` retention the source itself. An existing
+/// directory the operator named (`operator_named`: `--index-dir`, `XMUSTARD_INDEX_DIR`)
+/// keeps its mode, with a warning when others can list it (the index files themselves
+/// are always owner-only); the default per-scope directory is ours and is tightened.
+fn ensure_private_dir(dir: &Path, operator_named: bool) -> Result<(), String> {
     let err = |e: std::io::Error| format!("{}: {e}", dir.display());
+    let existed = fs::symlink_metadata(dir).is_ok();
     let mut b = fs::DirBuilder::new();
     b.recursive(true);
     #[cfg(unix)]
@@ -205,7 +211,16 @@ fn ensure_private_dir(dir: &Path) -> Result<(), String> {
             ));
         }
         if meta.mode() & 0o077 != 0 {
-            fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).map_err(err)?;
+            if existed && operator_named {
+                eprintln!(
+                    "index: warning: {} is accessible to other users (mode {:o}); the \
+                     index files in it are owner-only",
+                    dir.display(),
+                    meta.mode() & 0o777
+                );
+            } else {
+                fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).map_err(err)?;
+            }
         }
     }
     Ok(())
@@ -228,8 +243,8 @@ struct IndexLock {
     _file: fs::File,
 }
 
-fn lock(dir: &Path) -> Result<IndexLock, String> {
-    ensure_private_dir(dir)?;
+fn lock(dir: &Path, operator_named: bool) -> Result<IndexLock, String> {
+    ensure_private_dir(dir, operator_named)?;
     let path = dir.join("index.lock");
     let file = open_private_file(&path, false)?;
     let start = Instant::now();
@@ -330,19 +345,23 @@ struct Processed {
     bytes: Option<Vec<u8>>,
 }
 
-/// The stat key stored for a file scanned at `started_ns`. A file modified within the
-/// second before the scan may be modified again without changing its timestamp on a
-/// coarse filesystem (Git's "racily clean" case), so its key is marked racy and is never
+/// The stat key stored for a file scanned at `started_ns`. A file modified shortly
+/// before the scan may be modified again without changing its timestamp on a coarse
+/// filesystem (Git's "racily clean" case), so its key is marked racy and is never
 /// trusted: the next update hashes the file, and stores a trusted key once its mtime is
-/// safely in the past.
+/// safely in the past. The window covers the coarsest common timestamp granularity
+/// (FAT's 2 s: a stored mtime of `m` hides rewrites until `m + 2 s`, and the file was
+/// read after `started_ns`) with a second of margin.
 fn stat_key_for(stat: &scan::StatKey, started_ns: i64) -> String {
-    const RACY_WINDOW_NS: i64 = 1_000_000_000;
     if stat.mtime_ns >= started_ns - RACY_WINDOW_NS {
         format!("{RACY_PREFIX}{}", stat.encode())
     } else {
         stat.encode()
     }
 }
+
+/// How long before a scan a modification makes a stat key racy (see `stat_key_for`).
+const RACY_WINDOW_NS: i64 = 3_000_000_000;
 
 fn record_for(cand: &Candidate, started_ns: i64) -> FileRecord {
     FileRecord {
@@ -542,7 +561,7 @@ fn report(
 fn locked_scan(root: &Path, cfg: &IndexConfig) -> Result<(Scan, PathBuf, IndexLock, u64), String> {
     let layout = scan::layout(root, cfg)?;
     let dir = index_dir(&layout.root, layout.git_dir.as_deref(), cfg);
-    let lock = lock(&dir)?;
+    let lock = lock(&dir, cfg.index_dir.is_some())?;
     let t = Instant::now();
     let scan = scan::scan(&layout, cfg)?;
     Ok((scan, dir, lock, t.elapsed().as_millis() as u64))
@@ -797,7 +816,10 @@ struct Existing {
 }
 
 /// `index update [--paths ...]`: bring the index to the working tree, incrementally
-/// when possible. With `paths`, only those files are considered (a watcher's batch).
+/// when possible. With `paths` (a watcher's batch), only those files are read for
+/// changes; files the envelope admits or drops and rows the scan no longer lists are
+/// handled either way, so the result equals a full build whenever the batch names every
+/// changed file.
 pub fn update(
     root: &Path,
     cfg: &IndexConfig,
@@ -974,18 +996,25 @@ fn incremental(
     let db_total = existing.len();
 
     // ---- classify without extracting: trusted unchanged stat keys skip the read; other
-    // files are identified by hashing (or by the same read failure as before) ----
+    // files are identified by hashing (or by the same read failure as before). Envelope
+    // decisions depend on the files before this one, not on its own stat, so a file that
+    // enters or leaves the kept set, or the byte budget, is re-evaluated even outside a
+    // watcher batch. ----
     let mut changed: Vec<&Candidate> = Vec::new();
     // same bytes under a new stat key (touched, checked out again): refresh the key.
     let mut restat: Vec<(i64, String)> = Vec::new();
     let mut seen: HashSet<&str> = HashSet::with_capacity(scan.candidates.len());
     for cand in &scan.candidates {
         seen.insert(cand.path.as_str());
-        if !considered(&cand.path) {
+        let ex = existing.get(&cand.path);
+        let envelope_moved = ex.is_none_or(|e| {
+            (e.parse_status == ENVELOPE_BYTES) != (cand.loss == Some(ENVELOPE_BYTES))
+        });
+        if !envelope_moved && !considered(&cand.path) {
             continue;
         }
         counters.files_scanned += 1;
-        let Some(ex) = existing.get(&cand.path) else {
+        let Some(ex) = ex else {
             changed.push(cand);
             continue;
         };
@@ -999,6 +1028,12 @@ fn incremental(
             } else {
                 changed.push(cand);
             }
+            continue;
+        }
+        if ex.parse_status == ENVELOPE_BYTES {
+            // back inside the byte budget with the same stat key (the other pre-read
+            // losses follow the file's own stat, and read failures share their names)
+            changed.push(cand);
             continue;
         }
         let key = stat_key_for(&cand.stat, scan.started_ns);
@@ -1036,9 +1071,11 @@ fn incremental(
             st.execute(params![id, key]).map_err(sql_err)?;
         }
     }
+    // a row the scan no longer lists is gone from the tree or past the envelope; either
+    // way it goes, batch or not.
     let mut deleted: Vec<(String, i64)> = existing
         .iter()
-        .filter(|(p, _)| considered(p) && !seen.contains(p.as_str()))
+        .filter(|(p, _)| !seen.contains(p.as_str()))
         .map(|(p, e)| (p.clone(), e.id))
         .collect();
     deleted.sort();
@@ -1452,5 +1489,31 @@ pub fn run_cli(args: impl Iterator<Item = String>) -> i32 {
             eprintln!("index {sub} failed: {e}");
             1
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_stat_key_inside_fat_timestamp_granularity_is_racy() {
+        let started = 1_000_000_000_000_000_000i64;
+        let key = |mtime_ns: i64| {
+            stat_key_for(
+                &scan::StatKey {
+                    size: 1,
+                    mtime_ns,
+                    ..Default::default()
+                },
+                started,
+            )
+        };
+        // FAT stores even seconds: a file written at an even second and scanned 1.2 s
+        // later can be rewritten at +1.3 s without its mtime changing.
+        assert!(key(started - 1_200_000_000).starts_with(RACY_PREFIX));
+        assert!(key(started - 2_000_000_000).starts_with(RACY_PREFIX));
+        assert!(key(started + 5_000_000_000).starts_with(RACY_PREFIX));
+        assert!(!key(started - 3_500_000_000).starts_with(RACY_PREFIX));
     }
 }

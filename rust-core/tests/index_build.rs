@@ -1654,7 +1654,12 @@ fn an_index_past_the_envelope_updates_incrementally_and_exits_early() {
         })
         .collect();
     let r = repo_owned(&files);
-    for flags in [&["--max-files", "3"][..], &["--max-symbols", "7"][..]] {
+    // each file is 75 bytes: 200 bytes keep two, and the edits below move the boundary
+    for flags in [
+        &["--max-files", "3"][..],
+        &["--max-symbols", "7"][..],
+        &["--max-total-bytes", "200"][..],
+    ] {
         let rep = index("build", r.path(), flags);
         assert_eq!(rep["coverage"]["complete"], false, "{flags:?}");
         let rows: i64 = db(&rep)
@@ -1706,6 +1711,72 @@ fn an_index_past_the_envelope_updates_incrementally_and_exits_early() {
     }
 }
 
+/// Digest of a fresh full build of `root` with `flags`, in a scratch index directory.
+fn fresh_digest(root: &Path, flags: &[&str]) -> String {
+    let other = TempDir::new().unwrap();
+    let d = other.path().join("idx");
+    let d = d.to_str().unwrap();
+    let mut args: Vec<&str> = flags.to_vec();
+    args.extend(["--index-dir", d, "--no-cache"]);
+    index("build", root, &args);
+    let mut args: Vec<&str> = flags.to_vec();
+    args.extend(["--index-dir", d]);
+    digest(root, &args)
+}
+
+#[test]
+fn deletes_inside_the_envelope_admit_the_next_file_like_a_full_build() {
+    // 53-byte files with one symbol each: every bound keeps the first two or three
+    let files: Vec<(String, String)> = (0..6)
+        .map(|i| {
+            (
+                format!("m{i}.ts"),
+                format!("export function g{i}xxxxxxxxxxxxxxxxxx() {{ return {i}; }}\n"),
+            )
+        })
+        .collect();
+    let r = repo_owned(&files);
+    for flags in [
+        &["--max-total-bytes", "150"][..],
+        &["--max-files", "3"][..],
+        &["--max-symbols", "3"][..],
+    ] {
+        let rep = index("build", r.path(), flags);
+        assert_eq!(rep["coverage"]["complete"], false, "{flags:?}");
+        // a kept file deleted: the next one enters the envelope with its stat unchanged
+        fs::remove_file(r.path().join("m0.ts")).unwrap();
+        let up = index("update", r.path(), flags);
+        assert_eq!(up["mode"], "incremental", "{flags:?}: {up:#}");
+        assert_eq!(
+            digest(r.path(), flags),
+            fresh_digest(r.path(), flags),
+            "{flags:?}: incremental != full after a delete"
+        );
+        let again = index("update", r.path(), flags);
+        assert_eq!(again["mode"], "noop", "{flags:?}: {again:#}");
+        // a watcher batch naming only the deleted file admits the next one too
+        fs::remove_file(r.path().join("m1.ts")).unwrap();
+        let mut batch = flags.to_vec();
+        batch.extend(["--paths", "m1.ts"]);
+        let up = index("update", r.path(), &batch);
+        assert_eq!(up["mode"], "incremental", "{flags:?}: {up:#}");
+        assert_eq!(
+            digest(r.path(), flags),
+            fresh_digest(r.path(), flags),
+            "{flags:?}: watcher batch != full"
+        );
+        assert_eq!(index("update", r.path(), flags)["mode"], "noop");
+        // both files back: the boundary moves the other way
+        git(r.path(), &["checkout", "--", "m0.ts", "m1.ts"]);
+        index("update", r.path(), flags);
+        assert_eq!(
+            digest(r.path(), flags),
+            fresh_digest(r.path(), flags),
+            "{flags:?}: restore != full"
+        );
+    }
+}
+
 #[test]
 fn deep_nesting_is_bounded_and_reported() {
     // 4,600 nested functions in 64 KB: quadratic qualified names (measured 167 MiB) and a
@@ -1719,11 +1790,43 @@ fn deep_nesting_is_bounded_and_reported() {
     let mut named = format!("function {name}(){{").repeat(200);
     named.push_str(&"}".repeat(200));
     named.push('\n');
-    let dir = repo(&[
+    // shapes without brackets that nest just as deep (64,000 bytes each; measured before
+    // the guards: 53.9, 55.2, 47.5, 47.6, 28.7, 38.1, 68.1 MiB), and flat ones dense
+    // enough to cost as much (26.2 MiB for `a;` repeated, 26.2 MiB for a member chain)
+    let fill = |prefix: &str, unit: &str, suffix: &str| {
+        let n = (64_000 - prefix.len() - suffix.len()) / unit.len();
+        format!("{prefix}{}{suffix}", unit.repeat(n))
+    };
+    let mut ternary = String::from("const t = ");
+    for i in 0.. {
+        let step = format!("a?{i}:");
+        if ternary.len() + step.len() > 63_990 {
+            break;
+        }
+        ternary.push_str(&step);
+    }
+    ternary.push_str("0;\n");
+    let shapes = [
+        ("neg.rs", fill("fn f() { let x = ", "-", "1; }\n")),
+        ("refs.rs", fill("fn f() { let x = ", "&", "1; }\n")),
+        ("not.ts", fill("const x = ", "!", "x;\n")),
+        ("deref.go", fill("package p\nfunc f() { _ = ", "*", "p }\n")),
+        ("ternary.js", ternary),
+        (
+            "generic.ts",
+            format!("type T = {}B{};\n", "A<".repeat(21_000), ">".repeat(21_000)),
+        ),
+        ("ltexpr.ts", fill("const x = ", "a<", "a;\n")),
+        ("member.rs", fill("fn f() { let y = y", ".a", "; }\n")),
+        ("flat.ts", fill("", "a;", "\n")),
+    ];
+    let mut files: Vec<(&str, &str)> = vec![
         ("deep.ts", &deep),
         ("named.ts", &named),
         ("ok.ts", "export function ok() {}\n"),
-    ]);
+    ];
+    files.extend(shapes.iter().map(|(p, c)| (*p, c.as_str())));
+    let dir = repo(&files);
     let out_path = dir.path().join("report.json");
     let (peak, status) = child_peak_rss(
         Command::new(BIN)
@@ -1734,8 +1837,11 @@ fn deep_nesting_is_bounded_and_reported() {
     assert!(status.success());
     let rep: Value = serde_json::from_slice(&fs::read(&out_path).unwrap()).unwrap();
     let losses = &rep["coverage"]["loss_counts"];
-    assert_eq!(losses["nesting_truncated"], 2, "{losses:#}");
-    assert_eq!(losses["lexical_fallback"], 1, "{losses:#}");
+    // deep.ts and named.ts, plus the six unbracketed deep shapes
+    assert_eq!(losses["nesting_truncated"], 8, "{losses:#}");
+    // deep.ts and every shape: extracted lexically, still indexed
+    assert_eq!(losses["lexical_fallback"], 10, "{losses:#}");
+    assert_eq!(rep["coverage"]["indexed_files"], 12);
     let conn = db(&rep);
     let (named_syms, longest): (i64, i64) = conn
         .query_row(
@@ -1759,7 +1865,7 @@ fn deep_nesting_is_bounded_and_reported() {
         .unwrap();
     assert_eq!(engine, "tree_sitter");
     let mib = peak as f64 / (1u64 << 20) as f64;
-    eprintln!("deeply nested build: peak RSS {mib:.1} MiB");
+    eprintln!("deeply nested and dense build: peak RSS {mib:.1} MiB");
     assert!(mib <= 25.0, "peak RSS {mib:.1} MiB for nested 64 KB files");
 }
 
@@ -1936,4 +2042,97 @@ fn nested_and_untracked_ignore_files_apply() {
         paths(&index("build", r.path(), &["--include-untracked"])),
         vec!["lib/b.ts", "pkg/keep.ts"]
     );
+}
+
+#[test]
+fn max_size_ignore_files_keep_the_worker_bounded() {
+    // Ten nested .xmustardignore files at the 64 KiB cap, filled with rules that keep every
+    // automaton state alive, beside ten 1 MB ones (skipped whole), above 20 files with
+    // 200-byte names. Measured before the bounds: 322 MiB, then `git ls-files` timed out.
+    let dir = TempDir::new().unwrap();
+    let rule = |i: usize| format!("{}*b{i:03}*\n", "*a".repeat(30));
+    let capped: String = (0..970).map(rule).collect();
+    assert!(capped.len() <= 64 << 10);
+    let huge = format!("{}*b\n", "*a".repeat(500)).repeat(1000);
+    let mut nested = PathBuf::new();
+    for d in 0..10 {
+        nested = nested.join(format!("n{d}"));
+        let rel = nested.to_str().unwrap();
+        write(dir.path(), &format!("{rel}/.xmustardignore"), &capped);
+        write(dir.path(), &format!("big{d}/.xmustardignore"), &huge);
+    }
+    let rel = nested.to_str().unwrap().to_string();
+    for i in 0..20 {
+        write(
+            dir.path(),
+            &format!("{rel}/{}{i:03}.ts", "a".repeat(200)),
+            &format!("export const v{i} = {i};\n"),
+        );
+    }
+    git(dir.path(), &["init", "-q"]);
+    git(dir.path(), &["config", "user.email", "t@t"]);
+    git(dir.path(), &["config", "user.name", "t"]);
+    git(dir.path(), &["add", "-A"]);
+    git(dir.path(), &["commit", "-qm", "c"]);
+    let out_path = dir.path().join("report.json");
+    let t = std::time::Instant::now();
+    let (peak, _, status) = child_self_peak_rss(
+        Command::new(BIN)
+            .args(["index", "build", dir.path().to_str().unwrap(), "--no-cache"])
+            .stdout(Stdio::from(fs::File::create(&out_path).unwrap()))
+            .stderr(Stdio::inherit()),
+    );
+    let elapsed = t.elapsed();
+    assert!(status.success());
+    let rep: Value = serde_json::from_slice(&fs::read(&out_path).unwrap()).unwrap();
+    let cov = &rep["coverage"];
+    assert_eq!(cov["indexed_files"], 20, "{cov:#}");
+    // the ten 1 MB files, the lines past the per-file and total rule bounds, and the
+    // eight capped files left unread once the bounds were full
+    assert!(
+        cov["ignore_rules_dropped"].as_u64().unwrap() > 900,
+        "{cov:#}"
+    );
+    let mib = peak as f64 / (1u64 << 20) as f64;
+    eprintln!("max-size ignore files: worker peak RSS {mib:.1} MiB in {elapsed:?}");
+    assert!(mib <= 25.0, "worker peak RSS {mib:.1} MiB");
+    assert!(
+        elapsed < std::time::Duration::from_secs(60),
+        "{elapsed:?} for 20 files"
+    );
+}
+
+#[test]
+fn an_operator_named_index_dir_keeps_its_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    let r = repo(&[("a.ts", "export function a() {}\n")]);
+    let shared = TempDir::new().unwrap();
+    let named = shared.path().join("shared");
+    fs::create_dir(&named).unwrap();
+    fs::write(named.join("notes.txt"), "unrelated\n").unwrap();
+    fs::set_permissions(&named, fs::Permissions::from_mode(0o755)).unwrap();
+    let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    let out = run(&[
+        "index",
+        "build",
+        r.path().to_str().unwrap(),
+        "--index-dir",
+        named.to_str().unwrap(),
+    ]);
+    let rep = ok_json(&out);
+    assert_eq!(mode(&named), 0o755, "the operator's directory was chmodded");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("accessible to other users"),
+        "no warning"
+    );
+    assert_eq!(mode(Path::new(rep["index_path"].as_str().unwrap())), 0o600);
+    assert_eq!(mode(&named.join("index.lock")), 0o600);
+    // a directory the worker creates is private
+    let created = shared.path().join("new").join("idx");
+    index(
+        "build",
+        r.path(),
+        &["--index-dir", created.to_str().unwrap()],
+    );
+    assert_eq!(mode(&created), 0o700);
 }

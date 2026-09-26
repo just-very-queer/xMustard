@@ -300,12 +300,22 @@ pub fn is_secret_like(word: &str) -> bool {
 /// The postings of a chunk as an unordered bag: the tokens sorted, with repeats kept so
 /// BM25 term frequencies and lengths are unchanged. FTS5 still records positions, but
 /// they no longer follow the source, so the text cannot be read back from the index.
+/// Tokens are sorted as 8-byte offset pairs (a minified one-line chunk holds hundreds of
+/// thousands).
 pub fn unordered(tokens: &str) -> String {
-    let mut v: Vec<&str> = tokens.split(' ').filter(|t| !t.is_empty()).collect();
-    v.sort_unstable();
+    let mut spans: Vec<(u32, u32)> = Vec::new();
+    let mut start = 0usize;
+    for part in tokens.split(' ') {
+        if !part.is_empty() {
+            spans.push((start as u32, part.len() as u32));
+        }
+        start += part.len() + 1;
+    }
+    let word = |(s, l): (u32, u32)| &tokens[s as usize..(s + l) as usize];
+    spans.sort_unstable_by(|a, b| word(*a).cmp(word(*b)));
     let mut out = String::with_capacity(tokens.len());
-    for t in v {
-        out.push_str(t);
+    for sp in spans {
+        out.push_str(word(sp));
         out.push(' ');
     }
     out

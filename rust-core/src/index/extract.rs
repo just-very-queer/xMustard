@@ -25,11 +25,13 @@ use super::uid;
 /// Symbols kept per file (same bound as the legacy extractor); more sets
 /// `symbols_truncated`.
 pub const MAX_SYMBOLS_PER_FILE: usize = crate::treesitter::MAX_SYMBOLS_PER_FILE;
-/// References kept per file; a generated file past this is marked truncated.
-pub const MAX_REFS_PER_FILE: usize = 200_000;
+/// References kept per file; a generated file past this is marked truncated. Only
+/// lexically extracted files (above the parse bounds) come near it: 200,000 references
+/// from a 1 MB single-line file peaked at 26.0 MiB, 100,000 at 22.9 MiB.
+pub const MAX_REFS_PER_FILE: usize = 100_000;
 
 /// Bump when extraction output changes for the same bytes. Part of the analyzer version.
-pub const EXTRACTOR_REVISION: u32 = 2;
+pub const EXTRACTOR_REVISION: u32 = 3;
 
 /// Longest container prefix spelled out in a qualified name. A deeper prefix is replaced
 /// by `~<hash of the prefix>`, so qualified names, UIDs and scope frames stay bounded
@@ -130,48 +132,139 @@ pub fn grammar_versions() -> String {
 /// lexical extractor instead, reported as the `lexical_fallback` coverage loss.
 pub const DEFAULT_MAX_PARSE_BYTES: usize = 64 << 10;
 
-/// Bracket nesting past which a grammar file is extracted lexically. Tree-sitter's parse
-/// stack and tree grow with nesting depth (measured: 4,600 nested `if` blocks in 28 KB
-/// peak at 19 MiB, 4,600 nested functions in 64 KB at 24 MiB), while real code stays far
+/// Nesting past which a grammar file is extracted lexically: brackets, `<` left open
+/// in one statement (generic arguments, or comparisons that tree-sitter keeps
+/// ambiguous), and runs of prefix-operator characters (`- ! ~ & * ^ + | <`). Tree-sitter's
+/// parse stack and tree grow with nesting depth (measured on 64 KB files: 4,600 nested
+/// functions 24 MiB, 64,000 `-` 53.9 MiB, 32,000 `a<` 68.1 MiB), while real code stays far
 /// below this; deeper files are reported as `lexical_fallback` and `nesting_truncated`.
 pub const MAX_PARSE_NESTING: usize = 256;
 
-/// Whether bracket nesting in `bytes` exceeds `limit` (a cheap upper bound: brackets in
-/// strings and comments count too).
-fn nests_deeper_than(bytes: &[u8], limit: usize) -> bool {
-    let mut depth = 0usize;
-    for &c in bytes {
+/// Tokens (an upper bound: operators count per character, literal and comment words
+/// count too) past which a grammar file is extracted lexically, reported as
+/// `lexical_fallback`. Tree memory grows with tokens whatever the shape: 32,000 `a;`
+/// statements in 64 KB peaked at 26.2 MiB. Among 11,687 real Go, Rust, TS and JS files up
+/// to 64 KB (cline, pi-mono, gitnexus, OpenHands, letta-code and this repository) the
+/// densest has 19,508; the most expensive shapes the nesting guards admit peak at
+/// 23-24 MiB at this bound in an otherwise empty repository.
+pub const MAX_PARSE_TOKENS: usize = 24_000;
+
+/// Why tree-sitter does not get a file, if it does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParseLimit {
+    NoGrammar,
+    /// Above `max_parse_bytes`.
+    Size,
+    Tokens,
+    Nesting,
+}
+
+/// Why `lang` text of these bytes is extracted lexically; None when tree-sitter parses it.
+fn parse_refusal(lang: Lang, bytes: &[u8], max_parse_bytes: usize) -> Option<ParseLimit> {
+    match (lang.has_grammar(), bytes.len() <= max_parse_bytes) {
+        (false, _) => Some(ParseLimit::NoGrammar),
+        (true, false) => Some(ParseLimit::Size),
+        (true, true) => parse_limit(bytes),
+    }
+}
+
+/// One pass over `bytes` for the parse guards (`MAX_PARSE_TOKENS`, `MAX_PARSE_NESTING`);
+/// stops at the first bound crossed.
+fn parse_limit(bytes: &[u8]) -> Option<ParseLimit> {
+    let word = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$';
+    let (mut tokens, mut depth, mut run) = (0usize, 0usize, 0usize);
+    // `<` left open per bracket level (the stack is as deep as the brackets, so bounded)
+    let mut angles: Vec<usize> = vec![0];
+    let n = bytes.len();
+    let mut i = 0;
+    while i < n {
+        let c = bytes[i];
+        if c.is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        tokens += 1;
+        if tokens > MAX_PARSE_TOKENS {
+            return Some(ParseLimit::Tokens);
+        }
+        if word(c) {
+            while i < n && word(bytes[i]) {
+                i += 1;
+            }
+            run = 0;
+            continue;
+        }
+        if c >= 0x80 {
+            // one token per character
+            i += 1;
+            while i < n && (0x80..0xc0).contains(&bytes[i]) {
+                i += 1;
+            }
+            run = 0;
+            continue;
+        }
+        let prev = if i > 0 { bytes[i - 1] } else { 0 };
+        let next = bytes.get(i + 1).copied().unwrap_or(0);
+        let open = angles.last_mut().expect("the root level is never popped");
         match c {
             b'{' | b'(' | b'[' => {
                 depth += 1;
-                if depth > limit {
-                    return true;
+                if depth > MAX_PARSE_NESTING {
+                    return Some(ParseLimit::Nesting);
+                }
+                angles.push(0);
+                run = 0;
+            }
+            b'}' | b')' | b']' => {
+                depth = depth.saturating_sub(1);
+                if angles.len() > 1 {
+                    angles.pop();
+                }
+                if c == b'}' {
+                    *angles.last_mut().expect("root level") = 0;
+                }
+                run = 0;
+            }
+            b';' => {
+                *open = 0;
+                run = 0;
+            }
+            b'>' => {
+                if !matches!(prev, b'=' | b'-') && next != b'=' {
+                    *open = open.saturating_sub(1);
+                }
+                run = 0;
+            }
+            b'<' | b'-' | b'+' | b'!' | b'~' | b'&' | b'*' | b'^' | b'|' => {
+                if c == b'<' && !matches!(next, b'=' | b'<' | b'-') && prev != b'<' {
+                    *open += 1;
+                    if *open > MAX_PARSE_NESTING {
+                        return Some(ParseLimit::Nesting);
+                    }
+                }
+                run += 1;
+                if run > MAX_PARSE_NESTING {
+                    return Some(ParseLimit::Nesting);
                 }
             }
-            b'}' | b')' | b']' => depth = depth.saturating_sub(1),
-            _ => {}
+            _ => run = 0,
         }
+        i += 1;
     }
-    false
+    None
 }
 
 /// Extract the facts of one file. `text` is the decoded source (lossy when
-/// `invalid_utf8`). Grammar files up to `max_parse_bytes` and `MAX_PARSE_NESTING` are
-/// parsed with tree-sitter; the rest use the lexical extractor.
+/// `invalid_utf8`). Grammar files within `max_parse_bytes`, `MAX_PARSE_TOKENS` and
+/// `MAX_PARSE_NESTING` are parsed with tree-sitter; the rest use the lexical extractor.
 pub fn extract(lang: Lang, text: &str, invalid_utf8: bool, max_parse_bytes: usize) -> FileFacts {
-    let parse = extraction_mode(lang, text.as_bytes(), max_parse_bytes) == "ts";
-    let mut facts = if parse {
-        extract_tree_sitter(lang, text).unwrap_or_else(|| lexical::extract(lang, text))
-    } else {
-        lexical::extract(lang, text)
+    let refusal = parse_refusal(lang, text.as_bytes(), max_parse_bytes);
+    let mut facts = match refusal {
+        None => extract_tree_sitter(lang, text).unwrap_or_else(|| lexical::extract(lang, text)),
+        Some(_) => lexical::extract(lang, text),
     };
     facts.lexical_fallback = lang.has_grammar() && facts.engine != "tree_sitter";
-    if lang.has_grammar()
-        && text.len() <= max_parse_bytes
-        && nests_deeper_than(text.as_bytes(), MAX_PARSE_NESTING)
-    {
-        facts.nesting_truncated = true;
-    }
+    facts.nesting_truncated |= refusal == Some(ParseLimit::Nesting);
     facts.invalid_utf8 = invalid_utf8;
     uid::assign_suffixes(&mut facts.symbols);
     let starts = chunks::line_starts(text.as_bytes());
@@ -183,13 +276,9 @@ pub fn extract(lang: Lang, text: &str, invalid_utf8: bool, max_parse_bytes: usiz
 /// Which extractor `extract` uses for this (decoded) text: part of the fact-cache key,
 /// so a change of `max_parse_bytes` never serves facts made the other way.
 pub fn extraction_mode(lang: Lang, text: &[u8], max_parse_bytes: usize) -> &'static str {
-    if lang.has_grammar()
-        && text.len() <= max_parse_bytes
-        && !nests_deeper_than(text, MAX_PARSE_NESTING)
-    {
-        "ts"
-    } else {
-        "lex"
+    match parse_refusal(lang, text, max_parse_bytes) {
+        None => "ts",
+        Some(_) => "lex",
     }
 }
 
