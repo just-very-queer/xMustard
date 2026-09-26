@@ -105,6 +105,9 @@ const COMMANDS: &[Command] = &[
         Residency::ResidentExcept(&["index"]),
         run_changetrack_command,
     ),
+    // Builds or refreshes the durable per-workspace SQLite index: whole-repository
+    // work that writes owner-only state, so it keeps the per-call process boundary.
+    cmd("index", Residency::OneShot, xmustard_core::index::run),
     cmd(
         "symbolgraph",
         Residency::ResidentExcept(&["build", "build-lsp", "blast-radius"]),

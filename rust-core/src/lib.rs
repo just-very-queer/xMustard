@@ -10,6 +10,7 @@ pub mod diagnostics;
 pub mod dispatch;
 pub mod goalruntime;
 pub mod hashcache;
+pub mod index;
 pub mod indexcache;
 pub mod lsp;
 pub mod lsp_session;
