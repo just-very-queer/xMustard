@@ -602,29 +602,33 @@ pub fn detect_drift(data_dir: &Path, root: &Path, workspace_id: &str) -> DriftRe
         _ => baseline.fingerprint.root != current.root && report.head_changed,
     };
     report.stale = report.head_changed || report.content_changed || report.sibling_clone;
-    if report.head_changed {
-        report.reasons.push(format!(
-            "HEAD moved {} -> {}",
-            baseline.fingerprint.head_sha.as_deref().unwrap_or("?"),
-            current.head_sha.as_deref().unwrap_or("?")
-        ));
-    }
-    if report.content_changed {
-        report
-            .reasons
-            .push("tracked file content changed since indexing".to_string());
-    }
-    if report.sibling_clone {
-        report
-            .reasons
-            .push("index baseline came from a different clone/remote".to_string());
-    }
-    if current.dirty {
-        report.reasons.push(format!(
-            "{} uncommitted dirty path(s)",
-            current.dirty_path_count
-        ));
-    }
+    let flagged = [
+        (
+            report.head_changed,
+            format!(
+                "HEAD moved {} -> {}",
+                baseline.fingerprint.head_sha.as_deref().unwrap_or("?"),
+                current.head_sha.as_deref().unwrap_or("?")
+            ),
+        ),
+        (
+            report.content_changed,
+            "tracked file content changed since indexing".to_string(),
+        ),
+        (
+            report.sibling_clone,
+            "index baseline came from a different clone/remote".to_string(),
+        ),
+        (
+            current.dirty,
+            format!("{} uncommitted dirty path(s)", current.dirty_path_count),
+        ),
+    ];
+    report.reasons.extend(
+        flagged
+            .into_iter()
+            .filter_map(|(flag, reason)| flag.then_some(reason)),
+    );
     report
 }
 
