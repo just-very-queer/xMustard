@@ -589,6 +589,8 @@ func httpStatusForClass(c workspaceops.ErrorClass) int {
 		return http.StatusConflict
 	case workspaceops.ClassUnavailable:
 		return http.StatusServiceUnavailable
+	case workspaceops.ClassForbidden:
+		return http.StatusForbidden
 	default:
 		return http.StatusInternalServerError
 	}

@@ -187,6 +187,7 @@ type Reader interface {
 	ClaimReader
 	SessionReader
 	OutcomeReader
+	RunOutcomeReader
 	GrantReader
 	JobReader
 	FeedbackReader
@@ -207,6 +208,7 @@ type Tx interface {
 	ClaimWriter
 	SessionWriter
 	OutcomeWriter
+	RunOutcomeWriter
 	GrantWriter
 	JobWriter
 	FeedbackWriter

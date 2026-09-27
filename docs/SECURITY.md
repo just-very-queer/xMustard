@@ -37,12 +37,12 @@ A token carries a role spec: one role, or several joined with `+`.
 
 | Role | Grants |
 |---|---|
-| `reader` | read routes and the read tools (`ground`, `recall`, `search`, `explain`, `impact`, `diagnostics`, `why_failed`) |
-| `proposer` | reader, plus `remember`, editing memory it authored, platform writes, and registering a git work tree under `XMUSTARD_REGISTER_ROOTS` ([Workspace registration](#workspace-registration)) |
+| `reader` | read routes and the read tools (`ground`, `recall`, `search`, `explain`, `impact`, `diagnostics`, and `why_failed` reading a run or outcome by id) |
+| `proposer` | reader, plus `remember`, `why_failed` with a `log` or `evidence_handle` (records a run-independent outcome; never runs anything), editing memory it authored, platform writes, and registering a git work tree under `XMUSTARD_REGISTER_ROOTS` ([Workspace registration](#workspace-registration)) |
 | `verifier` | reader, plus `verify` |
 | `human-approver` | reader, plus policy changes and approvals (workspace policy, security acceptance criteria and dispositions, run-plan approve/reject, run accept) |
 | `indexer` | reader, plus `POST /api/workspaces/{id}/index` (rebaseline) |
-| `admin` | every role, plus token administration, settings, providers, Postgres bootstrap, integration credentials, verification-profile definitions, terminals and registering any directory as a workspace |
+| `admin` | every role, plus token administration, settings, providers, Postgres bootstrap, integration credentials, verification-profile definitions, terminals, registering any directory as a workspace and, only where the operator enabled command mode, `why_failed` with a `command` ([Commands why_failed runs](#commands-why_failed-runs-ws-21)) |
 
 The legacy names stay valid: `agent` is `proposer+verifier`, and `readonly` is
 `reader`. A blank role mints `agent`. An unknown role is refused at mint time, and a
@@ -200,6 +200,7 @@ gate and registers any directory.
 | Tool disable | `XMUSTARD_DISABLED_TOOLS=impact,why_failed` | The tool's route answers `403 tool_disabled` and the tool leaves `tools/list`. Unknown names stop startup. |
 | Workspace allowlist | `XMUSTARD_WORKSPACE_ALLOWLIST=ws-a,ws-b` | Other workspace ids answer `403 workspace_not_allowed`. The same rule filters `GET /api/workspaces` and checks `POST /api/workspaces/load` (by the id the root would get) and the terminal routes. |
 | Remote execution | profile | Terminals exist only in the platform profile and need `admin`. |
+| why_failed command mode | `XMUSTARD_WHY_FAILED_COMMANDS=1` (default `0`: off on every bind, loopback included) | Read at startup. On, `why_failed` with `command` runs a test, build or lint command for an authenticated `admin` only; off, every command answers `403 commands_disabled`. Enabled command mode is trusted execution of the repository's code on the server host by admin credentials; the program allow-list is not a sandbox ([Commands why_failed runs](#commands-why_failed-runs-ws-21)). Logs and evidence handles are explained either way. Anything but `0` or `1` stops startup. |
 | Registration roots | `XMUSTARD_REGISTER_ROOTS=/srv/checkouts:/home/ci/src` (OS path list: `:` on Unix, `;` on Windows) | Where a non-admin token may register a git work tree. Empty (the default) means only `admin` registers. Each entry must be an absolute path and not a filesystem root, or the API stops at startup. See [Workspace registration](#workspace-registration). |
 | Registration limit | `XMUSTARD_REGISTER_LIMIT=50` (the default) | How many workspaces one non-admin principal may register. A load over the limit answers `403 registration_not_allowed`, refusal `register_limit`. Anything but a positive integer stops startup. |
 
@@ -357,6 +358,111 @@ symlink-refusing descriptor walk (`api-go/internal/workspaceops/safepath_unix.go
 so a path swapped for a symlink later is still refused. `explain` applies the same
 symlink check to its `path` before the core reads the file.
 
+## Commands why_failed runs (WS-21)
+
+**Command mode is off by default.** `why_failed` with `command` (`POST
+/api/workspaces/{id}/why-failed`, or the MCP tool's `command` argument, which reaches
+the same route as its caller) runs a process on the server host. It runs only when both
+hold:
+
+1. the operator started the server with `XMUSTARD_WHY_FAILED_COMMANDS=1` (read once at
+   startup; there is no per-request or loopback default), and
+2. the caller is an authenticated principal holding `admin`. Open mode (no credentials)
+   has no authenticated principal, so it never runs a command.
+
+The route checks, in this order and before anything is spawned, a command slot is taken
+or an analysis window is admitted: the route gate (the `proposer` role, read-only mode,
+`XMUSTARD_DISABLED_TOOLS=why_failed`), exactly one source (a request that also carries
+`log` or `evidence_handle`, or a `run_id`, is refused with 400, so a log or an evidence
+handle can never start a command), the operator's opt-in (`403 commands_disabled`), an
+authenticated principal (`403 admin_required`) and the `admin` role (`403
+missing_role`, audited). `workspaceops.RunFailureCommand` checks the same permit again
+before its own checks. A read-only MCP connection refuses the argument before any API
+call, and the tool is annotated `readOnlyHint: false`, `destructiveHint: true`, so a
+client that auto-approves read-only tools still asks.
+
+**Enabled, command mode is trusted host-code execution by admin credentials.** A test
+or build runs the repository's own code as the daemon's operating-system user, and a
+check-named task runs whatever the repository's build file says it does. The closed
+program table below is defense in depth that narrows what a command looks like; it is
+**not a sandbox**, and an admin token on a server with command mode enabled should be
+treated like shell access to that host. Command-mode trust policy and hardening
+(isolation, and one environment-scrub policy in the Rust core for every `run-*`
+subcommand) are follow-up WS-21B in the parity build plan.
+
+The command checks (`api-go/internal/workspaceops/outcome_commands.go`) run in this
+order and fail closed:
+
+- the command runs as argv through the bounded Rust runner, never through a shell. A
+  word that starts like a shell operator or redirection (`|`, `&&`, `;`, `>`,
+  `2>/dev/null`, `<`) or holds a substitution (`$(`, a backtick) is refused; other text,
+  such as `$HOME` or `*`, reaches the program literally, unexpanded;
+- the program must be in a closed table, looked up by its last path element, and used
+  the way the table allows:
+  - subcommands: `go test|vet|build` of local packages only (`.`, `./...`, `./pkg`; not
+    `all`, the standard library or another module's import path) with `-mod` only
+    `readonly` or `vendor`; `cargo test|nextest|check|clippy|build`; `dotnet` and
+    `swift` with `test|build`; `golangci-lint run`; `ruff check`; `biome check|lint|ci`;
+  - package scripts: `npm`, `pnpm`, `yarn` and `bun` running a check-named script
+    (`npm test`, `npm run lint`, `yarn build:prod`, `bun test`);
+  - tasks: `make`, `just`, `task`, `gradle`/`gradlew` and `mvn`/`mvnw` with check-named
+    tasks and only the flags `-k`, `-s`, `-q`, `-B` and `-jN` (no `-f`, `-C`, `-I`,
+    `VAR=value` or default target). Maven takes lifecycle phases only: a word with a
+    colon names a plugin goal (`prefix:goal`, `group:artifact:version:goal`), which
+    Maven resolves and downloads, and is refused;
+  - test runners, linters and type checkers with any arguments: `pytest`, `jest`,
+    `vitest`, `mocha`, `rspec`, `phpunit`, `ctest`, `tsc`, `eslint`, `mypy`, `pylint`,
+    `flake8`, `pyright`, `staticcheck`, `shellcheck`, `rubocop`, `stylelint`, `oxlint`,
+    and `python -m pytest|unittest|mypy|pylint|flake8|ruff`.
+
+  A check name is `test`, `tests`, `check`, `lint`, `build`, `vet`, `verify`,
+  `typecheck`, `compile` or `e2e`, alone or continued by a separator or a capital
+  (`test-unit`, `lint:fix`, `testDebugUnitTest`). Everything else is refused: shells,
+  interpreters, wrappers (`sudo`, `env`, `npx`), `go run|generate|install`,
+  `cargo run|install`, `npm install|exec|publish`, `make deploy`, `mvn deploy`,
+  `gradle publish`. So are flags that choose a program, shell, linker, module file or
+  configuration: `go -exec|-toolexec|-vettool|-ldflags|-gccgoflags|-compiler|-modfile|-overlay`,
+  `cargo --config|-Z`, and the package managers'
+  `--script-shell|--node-options|--onload-script|--config`;
+- only the `gradlew` and `mvnw` wrappers may be named by a path; every other program is
+  a bare name (`./node_modules/.bin/jest`, `venv/bin/python` and `./make` are refused);
+- the working directory is the workspace root or a directory inside it (the path
+  confinement above, symlinks included);
+- no argument names a path outside the working directory: an absolute or `~` path, or a
+  `..` element, wherever a program may read a path in the argument (its start, after a
+  one-letter flag such as `-I`, or after `=`, `:`, `,`, `;`, `@`, a space or a quote), is
+  refused, and so is an argument or a flag's value that resolves through a symlink out
+  of the root. Pass paths relative to `cwd`, and set `cwd` to reach another part of the
+  tree;
+- a wrapper named by path is resolved from the working directory with its symlinks and
+  must be an executable file inside the workspace root (`./gradlew`); a bare name must
+  be on the daemon's `PATH`. The resolved file is what runs, and a program that cannot
+  start answers 400, not a retryable 503;
+- the timeout is 1 to 240 s (1 to 50 s through MCP, below the clients' call timeout);
+  at the timeout the runner sends TERM, then KILL, to the command's whole process group.
+  The run is detached from the request: a caller that disconnects or cancels gets no
+  answer, the command still ends by its timeout at the latest, and no outcome is
+  recorded;
+- one command runs at a time per server. A command holds one of the helper-process
+  slots every tool call shares, so a second one answers 503 at once instead of queueing.
+  The analysis window is admitted after the command ends, sized to its output.
+
+The command runs with the daemon's environment minus its own configuration (every
+`XMUSTARD_*` variable: tokens, the Postgres DSN, TLS keys, the data directory) and minus
+every variable the redactor classifies as a secret, so the repository's code cannot
+read the daemon's credentials from its environment. This scrub lives in the Go caller
+(`rustcore.RunManagedCommandEnv`); the other `run-*` subcommands of the core do not
+share it yet (WS-21B). Output is redacted (secret rules plus this process's
+secret-named environment values) before it is analyzed or stored, and only the last MiB
+is read. The command's processes are external to the owned process tree the budget
+gate measures.
+
+An outcome keeps a redacted tail, error lines and failing test names from its output.
+Revoking an evidence original (`DELETE .../evidence/{handle}`) or the admin purge
+(`DELETE .../evidence`) removes the outcomes made from it. An admin removes any other
+outcome with `DELETE .../outcomes/{outcome_id}`, for example one holding a secret the
+redactor missed.
+
 ## Health endpoint
 
 `/api/health` stays public so liveness probes need no token. Its full view shows
@@ -407,9 +513,12 @@ whether `XMUSTARD_READ_ONLY=1` still serves the route.
 | `GET /api/workspaces/{workspace_id}/evidence/{handle}` | core | reader | served |  | issuer-bound expansion |
 | `GET /api/workspaces/{workspace_id}/explain-path` | core | reader | served | explain |  |
 | `POST /api/workspaces/{workspace_id}/index` | core | indexer | refused |  | rebaseline the index; agents cannot reset it |
+| `GET /api/workspaces/{workspace_id}/outcomes` | core | reader | served |  | run-independent outcomes, newest first; reads only |
+| `DELETE /api/workspaces/{workspace_id}/outcomes/{outcome_id}` | core | admin | refused |  | removes one outcome (a secret the redactor missed in its command or tail) |
 | `GET /api/workspaces/{workspace_id}/runs/{run_id}/why-failed` | core | reader | served | why_failed |  |
 | `GET /api/workspaces/{workspace_id}/search` | core | reader | served | search |  |
 | `GET /api/workspaces/{workspace_id}/session-grounding` | core | reader | served | ground |  |
+| `POST /api/workspaces/{workspace_id}/why-failed` | core | proposer | refused | why_failed | reads an evidence tail or a log and records the outcome; a command runs only with XMUSTARD_WHY_FAILED_COMMANDS=1 and an authenticated admin (host-code execution; the closed program table is not a sandbox) |
 | `DELETE /mcp` | core | reader | served |  | ends the caller's own MCP session |
 | `GET /mcp` | core | reader | served |  | no server-initiated stream: 405 |
 | `POST /mcp` | core | reader | served |  | MCP messages; each tool call re-enters the API through its own route gate as the caller |

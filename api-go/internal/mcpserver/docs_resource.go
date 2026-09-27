@@ -48,8 +48,8 @@ func renderToolsDoc(tools []*Tool) string {
 		for _, a := range t.Advanced {
 			fmt.Fprintf(&b, "- `%s` (%s): %s\n", a.Name, argShape(a), a.Desc)
 		}
-		if t.Name == groundTool.Name {
-			b.WriteString("\n" + groundbudget.Markdown())
+		if t.Doc != "" {
+			b.WriteString("\n" + t.Doc)
 		}
 	}
 	b.WriteString("\n## Human approvers\n\nA remember or verify call made with a human approver's token (kind human, " +

@@ -8,8 +8,8 @@ import (
 
 // The advertised maxResultSizeChars stays within what Claude Code honors, covers the
 // evidence projection target (duplicated so the shim does not link the evidence
-// store) and the largest measured projection, and is declared on exactly the read
-// tools.
+// store) and the largest measured projection, and is declared on exactly the tools
+// that serve reads (why_failed reads a run or an outcome without a write argument).
 func TestMaxResultCharsCoversTheProjectionCap(t *testing.T) {
 	if projectionTarget != evidence.DefaultProjectionTarget {
 		t.Fatalf("projectionTarget %d != evidence.DefaultProjectionTarget %d", projectionTarget, evidence.DefaultProjectionTarget)
@@ -21,8 +21,8 @@ func TestMaxResultCharsCoversTheProjectionCap(t *testing.T) {
 		t.Fatalf("maxResultSizeChars %d does not cover a projection plus the recovery note", boundedResultChars)
 	}
 	for _, tl := range Tools() {
-		if tl.Annotations.ReadOnly != (tl.MaxResultChars == boundedResultChars) {
-			t.Errorf("%s: maxResultSizeChars should be declared on exactly the read tools", tl.Name)
+		if tl.servesReads() != (tl.MaxResultChars == boundedResultChars) {
+			t.Errorf("%s: maxResultSizeChars should be declared on exactly the tools that serve reads", tl.Name)
 		}
 	}
 }

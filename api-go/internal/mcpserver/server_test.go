@@ -223,7 +223,8 @@ func TestToolsListSnapshot(t *testing.T) {
 	if err := json.Unmarshal(got, &doc); err != nil {
 		t.Fatal(err)
 	}
-	reads := map[string]bool{"ground": true, "recall": true, "search": true, "explain": true, "impact": true, "diagnostics": true, "why_failed": true}
+	// why_failed reads a run without a write argument, but can run a command: not read-only
+	reads := map[string]bool{"ground": true, "recall": true, "search": true, "explain": true, "impact": true, "diagnostics": true}
 	for _, tl := range doc.Tools {
 		name := tl["name"].(string)
 		in := tl["inputSchema"].(map[string]any)
@@ -261,6 +262,9 @@ func TestToolsListSnapshot(t *testing.T) {
 	}
 	if a := byName["verify"]; a["destructiveHint"] != true || a["idempotentHint"] != true {
 		t.Errorf("verify can demote (destructive) and replaces the caller's vote (idempotent): %v", a)
+	}
+	if a := byName["why_failed"]; a["destructiveHint"] != true || a["idempotentHint"] != false {
+		t.Errorf("why_failed runs commands that can change the tree and records a new outcome each run: %v", a)
 	}
 }
 

@@ -493,8 +493,8 @@ func TestConcurrentOpensAndMigrationsWaitInsteadOfFailing(t *testing.T) {
 	if fb["open.go"].RetrievalCount != 48 {
 		t.Fatalf("feedback = %d, want 48", fb["open.go"].RetrievalCount)
 	}
-	if n := countRows(t, s, "SELECT count(*) FROM schema_migrations"); n != 1 {
-		t.Fatalf("migrations applied %d times", n)
+	if n := countRows(t, s, "SELECT count(*) FROM schema_migrations"); n != len(migrations) {
+		t.Fatalf("%d migration rows, want one per migration (%d)", n, len(migrations))
 	}
 }
 

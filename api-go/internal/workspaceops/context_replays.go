@@ -727,10 +727,3 @@ func newReplayID() string {
 func ptr[T any](value T) *T {
 	return &value
 }
-
-func min(a int, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}

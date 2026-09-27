@@ -551,22 +551,8 @@ func (s *Store) Capture(ctx context.Context, sp *Spool, req CaptureRequest) (*De
 
 // Read returns one authorized page of a retained original.
 func (s *Store) Read(ctx context.Context, req ReadRequest) (*Page, error) {
-	key, err := handleKey(req.Handle)
-	if err != nil {
-		return nil, err
-	}
-	wsd, err := s.wsDir(req.WorkspaceID)
-	if err != nil {
-		return nil, err
-	}
-	dir := filepath.Join(wsd, key)
-	// Resolve metadata and open the original under the workspace lock, so a concurrent
-	// Revoke/expiry is observed as revoked/expired (410), never as a torn read. Once
-	// open, the file stays readable even if it is unlinked afterwards.
-	st := s.state(req.WorkspaceID)
-	st.mu.Lock()
-	f, obs, err := s.openOriginalLocked(req, dir, st)
-	st.mu.Unlock()
+	// Revoke/expiry is observed as revoked/expired (410), never as a torn read (tail.go).
+	f, obs, err := s.openAuthorized(req)
 	if err != nil {
 		return nil, err
 	}

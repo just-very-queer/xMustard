@@ -27,6 +27,8 @@ type RetentionPolicy struct {
 	EvidenceGrace time.Duration
 	// FinishedJobs is how long done, failed and cancelled jobs are kept.
 	FinishedJobs time.Duration
+	// RunOutcomes is the maximum age of run-independent outcomes (WS-21).
+	RunOutcomes time.Duration
 	// RevisionContent drops the text of revisions that are no longer served nor
 	// pending (older accepted, rejected, withdrawn) once older than this. Their
 	// digests stay. Zero, the default, keeps every content version retrievable.
@@ -49,6 +51,7 @@ func DefaultRetentionPolicy() RetentionPolicy {
 		Deliveries:    30 * day,
 		EvidenceGrace: 7 * day,
 		FinishedJobs:  30 * day,
+		RunOutcomes:   30 * day,
 		BatchSize:     500,
 	}
 }
@@ -60,6 +63,7 @@ type RetentionReport struct {
 	Deliveries      int64 `json:"deliveries"`
 	Evidence        int64 `json:"evidence"`
 	Jobs            int64 `json:"jobs"`
+	RunOutcomes     int64 `json:"run_outcomes"`
 	RevisionContent int64 `json:"revision_content"`
 }
 
@@ -109,6 +113,10 @@ func (s *SQLStore) ApplyRetention(ctx context.Context, p RetentionPolicy) (Reten
 			`DELETE FROM jobs WHERE pk IN (SELECT pk FROM jobs
 				WHERE finished_at IS NOT NULL AND finished_at < ? AND state IN ('done', 'failed', 'cancelled') LIMIT ?)`,
 			func() []any { return []any{cutoff(p.FinishedJobs), batch} }},
+		step{&rep.RunOutcomes, p.RunOutcomes,
+			`DELETE FROM run_outcomes WHERE pk IN (SELECT pk FROM run_outcomes
+				WHERE retention_class <> 'keep' AND created_at < ? ORDER BY created_at LIMIT ?)`,
+			func() []any { return []any{cutoff(p.RunOutcomes), batch} }},
 		step{&rep.RevisionContent, p.RevisionContent,
 			`UPDATE revisions SET content = NULL, content_dropped_at = ?1, content_dropped_reason = 'retention'
 				WHERE pk IN (SELECT r.pk FROM revisions r JOIN entries e ON e.id = r.entry_id
