@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"io"
+	"maps"
 	"net/http"
 	"os"
 	"os/exec"
@@ -38,9 +39,10 @@ func realCoreBinary(t *testing.T) string {
 
 // WS-02: with XMUSTARD_CORE_WORKER=1 the real API binary serves the nine tools' Rust
 // work from one resident worker (no per-call xmustard-core exec), and shutdown ends
-// the worker with the API. WS-14: the only other exec is the code index worker
-// (`index update`, one-shot by design under the heavy slot), once for the unchanged
-// tree, and the graph reads are answered from the worker's resident index.
+// the worker with the API. WS-14: the only other execs are the code index worker
+// (`index update`) and, WS-22, the first ground's index baseline build (`changetrack
+// index`), both one-shot by design under the heavy slot and once for the unchanged
+// tree; the graph reads are answered from the worker's resident index.
 func TestAPIWithTheCoreWorkerServesToolRoutesWithoutPerCallExecs(t *testing.T) {
 	core := realCoreBinary(t)
 	repo := t.TempDir()
@@ -75,10 +77,10 @@ func TestAPIWithTheCoreWorkerServesToolRoutesWithoutPerCallExecs(t *testing.T) {
 	if err := os.WriteFile(snapPath, snap, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	// every core exec is logged as "<subcommand> <pid>"; exec keeps the pid.
+	// every core exec is logged as "<subcommand> <verb>|<pid>"; exec keeps the pid.
 	execLog := filepath.Join(t.TempDir(), "execs.log")
 	wrapper := filepath.Join(t.TempDir(), "xmustard-core")
-	script := "#!/bin/sh\necho \"$1 $$\" >> '" + execLog + "'\nexec '" + core + "' \"$@\"\n"
+	script := "#!/bin/sh\necho \"$1 $2|$$\" >> '" + execLog + "'\nexec '" + core + "' \"$@\"\n"
 	if err := os.WriteFile(wrapper, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -123,23 +125,27 @@ func TestAPIWithTheCoreWorkerServesToolRoutesWithoutPerCallExecs(t *testing.T) {
 	}
 	all := execs()
 	var workerPID int
-	indexRuns := 0
+	// one-shot by design, each once for the unchanged tree: the code index update
+	// (WS-14) and the first ground's index baseline build (WS-22)
+	oneShot := map[string]int{}
 	for _, line := range all {
-		sub, pid, _ := strings.Cut(line, " ")
-		if sub == "index" {
-			indexRuns++
-			continue
-		}
-		if sub != "serve" {
-			t.Fatalf("a tool route exec'd `xmustard-core %s` with the worker on; execs: %v", sub, all)
-		}
-		if workerPID != 0 {
+		call, pid, _ := strings.Cut(line, "|")
+		sub, _, _ := strings.Cut(call, " ")
+		switch {
+		case sub == "index":
+			oneShot[sub]++
+		case call == "changetrack index":
+			oneShot[call]++
+		case sub != "serve":
+			t.Fatalf("a tool route exec'd `xmustard-core %s` with the worker on; execs: %v", call, all)
+		case workerPID != 0:
 			t.Fatalf("the worker started more than once: %v", all)
+		default:
+			workerPID, _ = strconv.Atoi(pid)
 		}
-		workerPID, _ = strconv.Atoi(pid)
 	}
-	if indexRuns != 1 {
-		t.Fatalf("want one index update for the unchanged tree, got %d; execs: %v", indexRuns, all)
+	if want := map[string]int{"index": 1, "changetrack index": 1}; !maps.Equal(oneShot, want) {
+		t.Fatalf("want one index update and one baseline build for the unchanged tree, got %v; execs: %v", oneShot, all)
 	}
 	if workerPID == 0 || !alive(workerPID) {
 		t.Fatalf("no running worker after the tool calls: execs %v\nlog:\n%s", all, p.stderr.String())

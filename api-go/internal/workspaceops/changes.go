@@ -246,13 +246,13 @@ func maintainBaseline(ctx context.Context, dataDir, workspaceID string, drift js
 }
 
 // ensureLoadBaseline is the registration trigger: a loaded workspace gets its baseline
-// now (or a rebuild when HEAD moved on a clean worktree). It is best effort: a failure
-// is logged, and the first ground builds it instead.
+// now (or a rebuild when HEAD moved on a clean worktree). It is best effort: the first
+// ground builds it instead. A failed drift is already logged by the core bridge; a held
+// or failed build is logged here.
 func ensureLoadBaseline(dataDir, workspaceID string) {
 	ctx := context.Background()
 	drift, err := WorkspaceDriftCtx(ctx, dataDir, workspaceID)
 	if err != nil {
-		log.Printf("workspace %s: registration baseline skipped: drift failed: %v", workspaceID, err)
 		return
 	}
 	if _, held := maintainBaseline(ctx, dataDir, workspaceID, drift, BaselineRegistration); held != "" {
