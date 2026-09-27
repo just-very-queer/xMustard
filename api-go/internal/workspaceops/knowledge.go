@@ -2,18 +2,11 @@ package workspaceops
 
 import (
 	"context"
-	"crypto/hmac"
-	"crypto/rand"
-	"crypto/sha256"
-	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"math"
 	"sort"
 	"strconv"
-	"strings"
-	"sync"
 
 	"xmustard/api-go/internal/rustcore"
 )
@@ -43,18 +36,6 @@ type SearchRequest struct {
 	Limit  int
 }
 
-// Search cursors follow WS-20's recall cursor rule: base64url of "s2.<offset>.<mac>",
-// the mac an HMAC-SHA256 under a key held by this process only, over the offset and the
-// ranking it pages. A client can neither edit the offset nor reuse a cursor for another
-// query or workspace; a cursor stops being valid when the API restarts.
-
-// searchCursorKey is the process's search-cursor signing key.
-var searchCursorKey = sync.OnceValue(func() []byte {
-	k := make([]byte, 32)
-	rand.Read(k) // crypto/rand never fails on supported platforms
-	return k
-})
-
 // rankingKey names the ranking a cursor pages: the workspace and every argument that
 // orders or filters it. The page size may change between pages.
 func (r SearchRequest) rankingKey(workspaceID string) []byte {
@@ -62,15 +43,9 @@ func (r SearchRequest) rankingKey(workspaceID string) []byte {
 	return b
 }
 
-func searchCursorMAC(offset int, ranking []byte) string {
-	m := hmac.New(sha256.New, searchCursorKey())
-	fmt.Fprintf(m, "s2|%d|", offset)
-	m.Write(ranking)
-	return hex.EncodeToString(m.Sum(nil)[:16])
-}
-
+// encodeSearchCursor signs the offset of the next page (searchCursors).
 func encodeSearchCursor(offset int, ranking []byte) string {
-	return base64.RawURLEncoding.EncodeToString(fmt.Appendf(nil, "s2.%d.%s", offset, searchCursorMAC(offset, ranking)))
+	return searchCursors.encode(ranking, offset)
 }
 
 // decodeSearchCursor returns the offset a cursor continues from; "" starts at 0. A
@@ -80,23 +55,11 @@ func decodeSearchCursor(c string, ranking []byte) (int, error) {
 	if c == "" {
 		return 0, nil
 	}
-	invalid := fmt.Errorf("cursor is not a next_cursor of this search: %w", ErrInvalidInput)
-	if len(c) > maxSearchCursorLen {
-		return 0, invalid
+	nums, ok := searchCursors.decode(c, ranking)
+	if !ok || nums[0] <= 0 || nums[0] >= searchWindow {
+		return 0, fmt.Errorf("cursor is not a next_cursor of this search: %w", ErrInvalidInput)
 	}
-	raw, err := base64.RawURLEncoding.DecodeString(c)
-	parts := strings.Split(string(raw), ".")
-	if err != nil || len(parts) != 3 || parts[0] != "s2" {
-		return 0, invalid
-	}
-	n, err := strconv.Atoi(parts[1])
-	if err != nil || !hmac.Equal([]byte(parts[2]), []byte(searchCursorMAC(n, ranking))) {
-		return 0, invalid
-	}
-	if n <= 0 || n >= searchWindow {
-		return 0, invalid
-	}
-	return n, nil
+	return nums[0], nil
 }
 
 // WorkspaceSearch runs the in-process hybrid search. `seed`, when non-empty, is an

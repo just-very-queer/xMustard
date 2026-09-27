@@ -475,6 +475,7 @@ func TestOutOfRangeArgumentsAreRejectedNotClamped(t *testing.T) {
 		{"impact", map[string]any{"symbol": "S", "max_depth": 5}},
 		{"impact", map[string]any{"symbol": "S", "depth": 0}}, // through the hidden alias too
 		{"verify", map[string]any{"entry_id": "e", "note": strings.Repeat("n", maxVerifyNote+1)}},
+		{"recall", map[string]any{"session_id": strings.Repeat("s", recallMaxSessionID+1)}},
 	}
 	for _, c := range bad {
 		c.args["workspace_id"] = "ws"
@@ -498,6 +499,7 @@ func TestOutOfRangeArgumentsAreRejectedNotClamped(t *testing.T) {
 	}{
 		{"recall", map[string]any{"limit": 50}, "limit=50"},
 		{"recall", map[string]any{"limit": 1}, "limit=1"},
+		{"recall", map[string]any{"session_id": strings.Repeat("s", recallMaxSessionID)}, "session_id=" + strings.Repeat("s", recallMaxSessionID)},
 		{"search", map[string]any{"q": "x", "limit": 50}, "limit=50"},
 		{"impact", map[string]any{"symbol": "S", "max_depth": 1}, "depth=1"},
 		{"impact", map[string]any{"symbol": "S", "max_depth": 4}, "depth=4"},

@@ -305,7 +305,7 @@ func ProposeContext(dataDir, workspaceID string, req ProposeContextRequest) (*Co
 			RequiredVerifications: required, RequireVerification: peersOnly,
 			Paths: cleanPaths(anchors), SearchTokens: memoryTokenList(title + " " + req.Content),
 			ExpiresAt: expiresAt, Metadata: supersedesMetadata(supersedes),
-			Kind: req.Kind, Topic: strings.Trim(strings.TrimSpace(req.Topic), "/"), Tags: cleanPaths(req.Tags),
+			Kind: req.Kind, Topic: normalizeTopic(req.Topic), Tags: cleanPaths(req.Tags),
 		}, actor)
 		if err != nil {
 			return err

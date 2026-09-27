@@ -159,3 +159,39 @@ func TestRankingStatesCallerFlagsAndOutcomes(t *testing.T) {
 		t.Fatalf("scores = %v %v", scores, err)
 	}
 }
+
+// Only an entry that was once promoted ranks as superseded: a pending proposal that a
+// promoted entry replaced matches no rank state, in SQL and in the Go twin.
+func TestRankingSupersededNeedsPromotion(t *testing.T) {
+	s := openTestStore(t, newClock())
+	ctx := context.Background()
+	for _, id := range []string{"old", "raw", "new"} {
+		propose(t, s, id, id, id+" body")
+	}
+	for _, id := range []string{"old", "new"} {
+		vote(t, s, id, bob, VerdictApprove)
+		vote(t, s, id, carol, VerdictApprove)
+		promotePeer(t, s, id)
+	}
+	mustUpdate(t, s, func(tx Tx) error {
+		return tx.Supersede(ctx, SupersedeInput{NewID: "new", OldIDs: []string{"old", "raw"}}, carol)
+	})
+	got, err := s.Ranking(ctx, RankQuery{WorkspaceID: "ws1", States: []string{RankServed, RankPending, RankSuperseded}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{"new": RankServed, "old": RankSuperseded}
+	if len(got) != len(want) {
+		t.Fatalf("ranking = %+v, want only %v", got, want)
+	}
+	for _, e := range got {
+		if want[e.ID] != e.State {
+			t.Fatalf("%s ranks %q, want %q", e.ID, e.State, want[e.ID])
+		}
+	}
+	for _, id := range []string{"old", "raw", "new"} {
+		if full, err := s.GetEntry(ctx, id); err != nil || full.RankState(time.Now()) != want[id] {
+			t.Fatalf("%s: Go twin %q, want %q (%v)", id, full.RankState(time.Now()), want[id], err)
+		}
+	}
+}

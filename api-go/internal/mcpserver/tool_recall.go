@@ -12,6 +12,9 @@ const (
 	recallDefaultMaxChars = 4000
 	recallMinMaxChars     = 1000
 	recallMaxMaxChars     = 10000
+	// recallMaxSessionID is session_id's bound (workspaceops.RecallMaxSessionID bytes;
+	// maxLength counts characters, so a longer multi-byte id is refused by the API).
+	recallMaxSessionID = 128
 )
 
 // recallQueryArgs are the recall arguments that travel as query parameters under
@@ -51,7 +54,7 @@ var recallTool = &Tool{
 		{Name: "render", Type: typeString, Enum: []string{"full", "compact"}},
 		{Name: "max_chars", Type: typeInteger, Min: recallMinMaxChars, Max: recallMaxMaxChars},
 		{Name: "cursor", Type: typeString},
-		{Name: "session_id", Type: typeString},
+		{Name: "session_id", Type: typeString, MaxLen: recallMaxSessionID},
 	},
 	Doc: "Filters combine with AND across arguments and OR within a list. `status`: promoted (default), " +
 		"pending (the verification queue) or awaiting_me (pending entries you neither authored nor voted on); " +
@@ -66,7 +69,7 @@ var recallTool = &Tool{
 		"that do not fit are left out, the last one may come back with content_truncated, and output_budget " +
 		"reports what was cut. `cursor` takes next_cursor to continue with the same filters (it is signed: an " +
 		"edited cursor, another query's, or one from before an API restart is rejected); omitted counts the ranked " +
-		"entries after this page. `session_id` leaves out entries this session was already shown until their content, stale " +
+		"entries after this page. `session_id` (at most 128 bytes) leaves out entries this session was already shown until their content, stale " +
 		"flag or state changes (already_shown counts them; the set expires after 30 minutes unused); only a full " +
 		"render counts as shown, not names_only or compact. The promoted-title index is also the resource " +
 		MemoryIndexURI + ".",

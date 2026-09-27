@@ -11,19 +11,20 @@ import (
 const (
 	RankServed     = "served"     // promoted, active, unexpired
 	RankPending    = "pending"    // an active proposal awaiting verification
-	RankSuperseded = "superseded" // replaced by a newer promoted entry
+	RankSuperseded = "superseded" // once promoted, then replaced by a newer promoted entry
 	RankExpired    = "expired"    // promoted and active, past its expiry
 )
 
 // rankStateCases classify an entry into its rank state; ?1 is now. The conditions
 // exclude each other, so a view ORs the ones it reads instead of evaluating the CASE
-// per row. An entry matching none (rejected, retracted, merged, archived, purged) is
-// never ranked.
+// per row. An entry matching none (rejected, retracted, merged, archived, purged, or
+// superseded before it was ever promoted) is never ranked: a pending or rejected
+// proposal stays unverified text after a promoted entry replaces it.
 var rankStateCases = []struct{ state, when string }{
 	{RankServed, `e.promoted = 1 AND e.lifecycle = 'active' AND (e.expires_at IS NULL OR e.expires_at > ?1)`},
 	{RankExpired, `e.promoted = 1 AND e.lifecycle = 'active' AND e.expires_at <= ?1`},
 	{RankPending, `e.promoted = 0 AND e.status = 'pending' AND e.lifecycle = 'active' AND (e.expires_at IS NULL OR e.expires_at > ?1)`},
-	{RankSuperseded, `e.lifecycle = 'superseded'`},
+	{RankSuperseded, `e.promoted = 1 AND e.lifecycle = 'superseded'`},
 }
 
 // rankStateExpr is the SQL CASE that labels an entry with its rank state.

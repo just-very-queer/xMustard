@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"math/bits"
 	"os"
 	"path/filepath"
 	"slices"
@@ -264,6 +265,8 @@ func TestRecallFilters(t *testing.T) {
 		{RecallRequest{Topic: "api"}, []string{b.ID, a.ID}},
 		{RecallRequest{Topic: "api/auth"}, []string{a.ID}},
 		{RecallRequest{Topic: "ap"}, nil},
+		{RecallRequest{Topic: "api/"}, []string{b.ID, a.ID}}, // normalized as remember stores topics
+		{RecallRequest{Topic: " /api/auth/ "}, []string{a.ID}},
 		{RecallRequest{PathPrefix: "rust-core/"}, []string{b.ID}},
 		{RecallRequest{By: "ALICE"}, []string{a.ID}},
 		{RecallRequest{Since: "2000-01-01", Until: "2999-01-01"}, []string{b.ID, a.ID}},
@@ -281,6 +284,17 @@ func TestRecallFilters(t *testing.T) {
 		ContextActor{ID: "a"}); !IsInvalidInput(err) {
 		t.Fatalf("unknown kind: %v", err)
 	}
+	// the tag count is bounded: recall and ground decode every ranked entry's tags
+	tags := make([]string, govstore.MaxTags+1)
+	for i := range tags {
+		tags[i] = fmt.Sprintf("t%d", i)
+	}
+	for n, ok := range map[int]bool{govstore.MaxTags: true, govstore.MaxTags + 1: false} {
+		_, err := Remember(dir, ws, RememberRequest{ProposeContextRequest: ProposeContextRequest{Content: "tagged", Tags: tags[:n]}}, ContextActor{ID: "a"})
+		if (err == nil) != ok || (!ok && !IsInvalidInput(err)) {
+			t.Fatalf("%d tags: %v", n, err)
+		}
+	}
 }
 
 func equalIDs(a, b []string) bool {
@@ -296,8 +310,8 @@ func equalIDs(a, b []string) bool {
 }
 
 // Pages concatenate to the one-shot ranking with no repeats, next_cursor and omitted
-// describe what is left, and a cursor from another query or caller, an edited one and
-// one past the end of a shrunken ranking are rejected.
+// describe what is left, and a cursor from another workspace, query or caller, a
+// search cursor, an edited one and one past the end of a shrunken ranking are rejected.
 func TestRecallCursorIsStableAcrossPages(t *testing.T) {
 	dir, ws := t.TempDir(), "wsPages"
 	seeded := seedPromoted(t, dir, ws, 11)
@@ -329,10 +343,18 @@ func TestRecallCursorIsStableAcrossPages(t *testing.T) {
 		"another caller": {Cursor: first, Caller: "you"},
 		"edited offset":  {Cursor: edited, Caller: "me"},
 		"not a cursor":   {Cursor: "r2.4.16.00", Caller: "me"},
+		// signed over this very ranking, but a search cursor
+		"search cursor": {Cursor: searchCursors.encode(RecallRequest{Caller: "me"}.rankingKey(ws), 4), Caller: "me"},
 	} {
 		if _, err := RecallWith(context.Background(), dir, ws, bad); !IsInvalidInput(err) {
 			t.Fatalf("%s: %v", name, err)
 		}
+	}
+	// the same arguments on a larger workspace: the cursor names its workspace
+	other := t.TempDir() // seeded ids are unique per data dir
+	seedPromoted(t, other, "wsPagesOther", 30)
+	if _, err := RecallWith(context.Background(), other, "wsPagesOther", RecallRequest{Limit: 4, Cursor: first, Caller: "me"}); !IsInvalidInput(err) {
+		t.Fatalf("another workspace's cursor: %v", err)
 	}
 	// the page-2 cursor points at offset 4; retire 8 of 11 and the ranking ends at 3
 	for _, e := range seeded[:8] {
@@ -348,7 +370,8 @@ func TestRecallCursorIsStableAcrossPages(t *testing.T) {
 
 // With stale entries the stale penalty re-orders each block of the ranking, and every
 // page reads whole blocks: pages never repeat or skip an entry, even when the page
-// size changes between pages, and a deep page loads a bounded window, not O(offset).
+// size changes between pages, and a deep page loads a bounded window, not O(offset):
+// the ranking is several times the bound, so a window that grows with the offset fails.
 func TestRecallPagesAreStableWithStaleEntriesAndBounded(t *testing.T) {
 	dir, ws, root := t.TempDir(), "wsStalePages", t.TempDir()
 	writeSnapshotWithRoot(t, dir, ws, root)
@@ -358,10 +381,10 @@ func TestRecallPagesAreStableWithStaleEntriesAndBounded(t *testing.T) {
 	if err := os.WriteFile(file, []byte("v1"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	const n = 60
+	const n = 200
 	stale := map[string]bool{}
 	seedPromotedWith(t, dir, ws, n, func(e *ContextEntry) {
-		if e.ID[len(e.ID)-1]%3 == 0 { // ids ending 0, 3, 6 or 9, the newest (e0059) among them
+		if e.ID[len(e.ID)-1]%3 == 0 { // ids ending 0, 3, 6 or 9, the newest (e0199) among them
 			e.Paths = []string{"f.go"}
 			e.PathHashes = capturePathHashes(root, e.Paths)
 			stale[e.ID] = true
@@ -372,11 +395,12 @@ func TestRecallPagesAreStableWithStaleEntriesAndBounded(t *testing.T) {
 	}
 	seen := map[string]bool{}
 	cursor := ""
+	block := recallCandidateWindow(4) // the first page's limit fixes the block
 	for page := 0; ; page++ {
 		limit := []int{4, 7, 2}[page%3]
 		res := recallWith(t, dir, ws, RecallRequest{Limit: limit, Cursor: cursor})
-		if dc := res["drift_checked"].(int); dc > 2*recallCandidateWindow(4)+recallCandidateWindow(7) {
-			t.Fatalf("page %d loaded %d entries: the window grows with the offset", page, dc)
+		if dc, bound := res["drift_checked"].(int), 2*block+max(block, recallCandidateWindow(limit)); dc > bound {
+			t.Fatalf("page %d loaded %d entries, over the %d bound: the window grows with the offset", page, dc, bound)
 		}
 		for _, e := range entriesOf(res) {
 			if seen[e.ID] {
@@ -456,6 +480,49 @@ func TestRecallMaxCharsIsHonoured(t *testing.T) {
 	}
 }
 
+// fitRecallBudget keeps the prefix a linear scan keeps, sizes each entry once, builds
+// O(log n) times and never builds more than limit bytes of entries.
+func TestFitRecallBudgetBuildsLogarithmically(t *testing.T) {
+	entries := make([]ContextEntry, 50)
+	for i := range entries {
+		entries[i] = ContextEntry{ID: fmt.Sprintf("e%02d", i), Content: strings.Repeat("x", 100+i*37%400)}
+	}
+	size := func(e ContextEntry) int { return len(e.ID) + len(e.Content) + 20 }
+	result := func(kept []ContextEntry) (total, bytes int) {
+		total = 100 // the envelope
+		for _, e := range kept {
+			total += size(e) + 1
+			bytes += size(e)
+		}
+		return total, bytes
+	}
+	for _, limit := range []int{50, 500, 3000, 9000, 1 << 20} {
+		want := 0
+		for want < len(entries) {
+			if total, _ := result(entries[:want+1]); total > limit {
+				break
+			}
+			want++
+		}
+		builds, built := 0, -1
+		build := func(kept []ContextEntry, n int) int {
+			builds, built = builds+1, len(kept)
+			total, bytes := result(kept)
+			if bytes > limit {
+				t.Errorf("limit %d: built %d bytes of entries", limit, bytes)
+			}
+			return total
+		}
+		kept, cut := fitRecallBudget(entries, size, false, limit, build)
+		if len(kept) != want || cut != 0 || built != want {
+			t.Fatalf("limit %d: kept %d (built %d, cut %d), want %d", limit, len(kept), built, cut, want)
+		}
+		if most := 2 + bits.Len(uint(len(entries))); builds > most {
+			t.Fatalf("limit %d: %d builds, want at most %d", limit, builds, most)
+		}
+	}
+}
+
 // A session is not shown the same entry twice until it changes; names_only and compact
 // lines do not count as shown (a later full recall still returns the entry), and
 // another session or caller is unaffected.
@@ -503,13 +570,78 @@ func TestRecallSessionSeenSuppression(t *testing.T) {
 // Seen-sets expire after recallSeenTTL without use.
 func TestRecallSeenSetsExpire(t *testing.T) {
 	now := time.Unix(1_000_000, 0)
-	s := &seenSets{now: func() time.Time { return now }, sets: map[string]*seenSet{}}
-	s.mark("k", map[string]string{"e": "p"})
-	if s.shown("k")["e"] != "p" {
+	s := newSeenSets(func() time.Time { return now })
+	k, _ := recallSeenKey("ws", "me", "s1")
+	e := []scoredEntry{{rank: govstore.RankEntry{ID: "e"}}}
+	s.mark(k, map[string]seenPrint{"e": {1}})
+	if s.shown(k, e)["e"] != (seenPrint{1}) {
 		t.Fatal("mark not recorded")
 	}
 	now = now.Add(recallSeenTTL + time.Second)
-	if s.shown("k") != nil || len(s.sets) != 0 {
+	if s.shown(k, e) != nil || len(s.sets) != 0 || s.entries != 0 {
 		t.Fatal("expired set not evicted")
 	}
+}
+
+// A session id is bounded and the sets are keyed by a digest of it, and the sets hold
+// at most maxSeenEntries entries across every session: marking past it drops the least
+// recently used other sessions, and a session that alone would pass it starts over.
+func TestRecallSeenSetsAreBoundedGlobally(t *testing.T) {
+	dir, ws := t.TempDir(), "wsSeenBound"
+	for n, ok := range map[int]bool{RecallMaxSessionID: true, RecallMaxSessionID + 1: false} {
+		_, err := RecallWith(context.Background(), dir, ws, RecallRequest{SessionID: strings.Repeat("s", n)})
+		if (err == nil) != ok || (!ok && !IsInvalidInput(err)) {
+			t.Fatalf("a %d-byte session_id: %v", n, err)
+		}
+	}
+	a, _ := recallSeenKey("ws", "me\x00s", "1")
+	b, _ := recallSeenKey("ws", "me", "s\x001")
+	if a == b {
+		t.Fatal("the key must not confuse caller and session")
+	}
+
+	now := time.Unix(1_000_000, 0)
+	s := newSeenSets(func() time.Time { return now })
+	prints := func(prefix string, n int) map[string]seenPrint {
+		out := make(map[string]seenPrint, n)
+		for i := range n {
+			out[fmt.Sprintf("%s-%d", prefix, i)] = seenPrint{1}
+		}
+		return out
+	}
+	check := func(step string, sets, entries int) {
+		t.Helper()
+		sum := 0
+		for _, set := range s.sets {
+			sum += len(set.shown)
+		}
+		if len(s.sets) != sets || s.entries != entries || sum != entries {
+			t.Fatalf("%s: %d sets, %d entries (%d counted), want %d and %d", step, len(s.sets), s.entries, sum, sets, entries)
+		}
+	}
+	quarter := maxSeenEntries / 4
+	keys := make([]seenKey, 5)
+	for i := range keys {
+		keys[i], _ = recallSeenKey("ws", "me", fmt.Sprint(i))
+		now = now.Add(time.Second)
+		s.mark(keys[i], prints(fmt.Sprint(i), quarter))
+	}
+	check("five quarter sets", 4, maxSeenEntries)
+	if _, ok := s.sets[keys[0]]; ok {
+		t.Fatal("the least recently used set must go first")
+	}
+	now = now.Add(time.Second)
+	s.mark(keys[4], prints("big", maxSeenEntries-quarter+1))
+	check("one set past the cap", 1, maxSeenEntries-quarter+1)
+	if _, ok := s.sets[keys[4]]; !ok {
+		t.Fatal("the set being marked is never the one dropped")
+	}
+
+	s = newSeenSets(func() time.Time { return now })
+	for i := range maxSeenSessions + 1 {
+		k, _ := recallSeenKey("ws", "me", fmt.Sprint(i))
+		now = now.Add(time.Second)
+		s.mark(k, prints("e", 1))
+	}
+	check("one set per session past the session cap", maxSeenSessions, maxSeenSessions)
 }

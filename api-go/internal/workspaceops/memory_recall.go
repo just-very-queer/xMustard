@@ -238,7 +238,8 @@ type RecallRequest struct {
 	// MaxChars budgets the whole JSON result; 0 leaves it unbudgeted.
 	MaxChars int
 	// SessionID enables session-seen suppression: an entry already returned to this
-	// caller's session is left out until its content, stale or state changes.
+	// caller's session is left out until its content, stale or state changes. At most
+	// RecallMaxSessionID bytes.
 	SessionID string
 	// Caller is the principal recalling, for awaiting_me and the seen-set key.
 	Caller string
@@ -291,11 +292,16 @@ func (r RecallRequest) ReadsUnverified() bool {
 	return slices.Contains(states, govstore.RankPending)
 }
 
-// validate checks the arguments that are rejected, never clamped.
+// validate checks the arguments that are rejected, never clamped, and normalizes the
+// topic the way remember stores it.
 func (r *RecallRequest) validate() error {
 	if _, err := r.States(); err != nil {
 		return err
 	}
+	if len(r.SessionID) > RecallMaxSessionID {
+		return fmt.Errorf("session_id is longer than %d bytes: %w", RecallMaxSessionID, ErrInvalidInput)
+	}
+	r.Topic = normalizeTopic(r.Topic)
 	if !slices.Contains(recallRenderArgs, r.Render) {
 		return fmt.Errorf("render %q is not full or compact: %w", r.Render, ErrInvalidInput)
 	}
@@ -311,6 +317,10 @@ func (r *RecallRequest) validate() error {
 	}
 	return nil
 }
+
+// normalizeTopic is a topic as remember stores it and recall matches it: trimmed, with
+// no leading or trailing "/".
+func normalizeTopic(topic string) string { return strings.Trim(strings.TrimSpace(topic), "/") }
 
 // parseRecallTime reads a since/until bound as the store's canonical time text.
 func parseRecallTime(s string) (string, error) {
@@ -343,7 +353,7 @@ func (r RecallRequest) filters(awaits func(govstore.RankEntry) bool) []func(govs
 		return slices.ContainsFunc(e.Tags, func(t string) bool { return slices.Contains(r.Tags, t) })
 	})
 	add(r.Topic != "", func(e govstore.RankEntry) bool {
-		return e.Topic == r.Topic || strings.HasPrefix(e.Topic, strings.TrimSuffix(r.Topic, "/")+"/")
+		return e.Topic == r.Topic || strings.HasPrefix(e.Topic, r.Topic+"/")
 	})
 	add(r.PathPrefix != "", func(e govstore.RankEntry) bool {
 		return slices.ContainsFunc(e.Paths, func(p string) bool { return strings.HasPrefix(p, r.PathPrefix) })
@@ -520,7 +530,7 @@ func recallOnce(ctx context.Context, dataDir, workspaceID string, req RecallRequ
 	if limit <= 0 {
 		limit = defaultRecallLimit
 	}
-	cur, err := req.decodeCursor()
+	cur, err := req.decodeCursor(workspaceID)
 	if err != nil {
 		return nil, recallPage{}, 0, err
 	}

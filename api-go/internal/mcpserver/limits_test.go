@@ -29,13 +29,13 @@ func TestMaxResultCharsCoversTheProjectionCap(t *testing.T) {
 	}
 }
 
-// The recall budget bounds and the memory kinds are duplicated from workspaceops so
-// the shim does not link the memory store; they must stay equal.
+// The recall budget and session_id bounds and the memory kinds are duplicated from
+// workspaceops so the shim does not link the memory store; they must stay equal.
 func TestRecallBoundsAndKindsMirrorWorkspaceops(t *testing.T) {
-	got := [3]int{recallDefaultMaxChars, recallMinMaxChars, recallMaxMaxChars}
-	want := [3]int{workspaceops.RecallDefaultMaxChars, workspaceops.RecallMinMaxChars, workspaceops.RecallMaxMaxChars}
+	got := [4]int{recallDefaultMaxChars, recallMinMaxChars, recallMaxMaxChars, recallMaxSessionID}
+	want := [4]int{workspaceops.RecallDefaultMaxChars, workspaceops.RecallMinMaxChars, workspaceops.RecallMaxMaxChars, workspaceops.RecallMaxSessionID}
 	if got != want {
-		t.Fatalf("recall budget bounds %v != workspaceops %v", got, want)
+		t.Fatalf("recall bounds %v != workspaceops %v", got, want)
 	}
 	if !slices.Equal(memoryKinds, workspaceops.MemoryKinds) {
 		t.Fatalf("memory kinds %v != workspaceops %v", memoryKinds, workspaceops.MemoryKinds)

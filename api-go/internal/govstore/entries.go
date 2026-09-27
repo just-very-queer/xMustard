@@ -129,7 +129,7 @@ func (e Entry) RankState(now time.Time) string {
 		return RankExpired
 	case !e.Promoted && active && unexpired && e.Status == StatusPending:
 		return RankPending
-	case e.Lifecycle == LifecycleSuperseded:
+	case e.Promoted && e.Lifecycle == LifecycleSuperseded:
 		return RankSuperseded
 	}
 	return ""
@@ -396,7 +396,14 @@ func (r *reader) ListEntries(ctx context.Context, f EntryFilter) ([]Entry, error
 	return out, rows.Err()
 }
 
+// MaxTags bounds an entry's tags: recall and ground decode every ranked entry's tags,
+// so their count must not grow with what one proposer writes.
+const MaxTags = 32
+
 func validateTags(tags []string) error {
+	if len(tags) > MaxTags {
+		return fmt.Errorf("%w: %d tags, at most %d", ErrInvalid, len(tags), MaxTags)
+	}
 	for _, t := range tags {
 		if !tagPattern.MatchString(t) {
 			return fmt.Errorf("%w: tag %q (letters, digits, '_', '.', '-' only)", ErrInvalid, t)

@@ -1,17 +1,11 @@
 package workspaceops
 
 import (
-	"crypto/hmac"
-	"crypto/rand"
-	"crypto/sha256"
-	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"slices"
-	"strconv"
+	"sort"
 	"strings"
-	"sync"
 	"unicode/utf8"
 
 	"xmustard/api-go/internal/govstore"
@@ -71,6 +65,12 @@ var recallRenders = map[string]recallRender{
 	"full":    {list: func(es []ContextEntry) any { return es }, cut: true, delivers: true},
 	"compact": {list: func(es []ContextEntry) any { return mapRows(es, compactRow) }},
 	"names":   {list: func(es []ContextEntry) any { return mapRows(es, nameRow) }},
+}
+
+// size is what one entry adds to the rendered list, its separator aside.
+func (r recallRender) size(e ContextEntry) int {
+	b, _ := json.Marshal(r.list([]ContextEntry{e}))
+	return len(b) - len("[]")
 }
 
 // recallRenderArgs are the render values a caller may pass; names comes from names_only.
@@ -135,11 +135,14 @@ func (c scoredEntry) label(explain bool) ContextEntry {
 // finishRecall pages the candidates, suppresses what the session was shown, renders
 // and budgets the page, and completes the result.
 func finishRecall(workspaceID string, req RecallRequest, res map[string]any, page recallPage) map[string]any {
-	seenKey := recallSeenKey(workspaceID, req.Caller, req.SessionID)
-	shown := recallSeen.shown(seenKey)
+	seenKey, session := recallSeenKey(workspaceID, req.Caller, req.SessionID)
+	var shown map[string]seenPrint
+	if session {
+		shown = recallSeen.shown(seenKey, page.candidates[page.span.offset-page.span.lo:page.span.end-page.span.lo])
+	}
 	var picked []ContextEntry
-	var at []int                  // ranking position of each picked entry
-	prints := map[string]string{} // seen-print of each picked entry
+	var at []int                     // ranking position of each picked entry
+	prints := map[string]seenPrint{} // seen-print of each picked entry
 	alreadyShown, next := 0, page.span.offset
 	for pos := page.span.offset; pos < page.span.end && len(picked) < page.limit; pos++ {
 		next = pos + 1
@@ -171,22 +174,23 @@ func finishRecall(workspaceID string, req RecallRequest, res map[string]any, pag
 		res["omitted"] = max(page.total-resume, 0)
 		delete(res, "next_cursor")
 		if resume < page.total {
-			res["next_cursor"] = req.encodeCursor(recallCursor{offset: resume, block: page.cursor.block})
+			res["next_cursor"] = req.encodeCursor(workspaceID, recallCursor{offset: resume, block: page.cursor.block})
 		}
 		b, _ := json.Marshal(res)
 		return len(b)
 	}
 	kept := picked
-	build(kept, len(picked))
 	if req.MaxChars > 0 {
 		var truncated int
-		kept, truncated = fitRecallBudget(picked, render.cut, req.MaxChars-budgetReportReserve, build)
+		kept, truncated = fitRecallBudget(picked, render.size, render.cut, req.MaxChars-budgetReportReserve, build)
 		res["output_budget"] = map[string]any{
 			"max_chars": req.MaxChars, "returned": len(kept), "dropped": len(picked) - len(kept), "truncated": truncated,
 		}
+	} else {
+		build(kept, len(picked))
 	}
-	if render.delivers && req.SessionID != "" {
-		delivered := map[string]string{}
+	if render.delivers && session {
+		delivered := map[string]seenPrint{}
 		for _, e := range kept {
 			if !e.ContentTruncated {
 				delivered[e.ID] = prints[e.ID]
@@ -205,27 +209,34 @@ const budgetReportReserve = 128
 // appends the first entry that does not fit with its content cut when the render
 // allows it. It returns the kept entries and how many were cut (0 or 1); the result is
 // left built for them.
-func fitRecallBudget(entries []ContextEntry, cut bool, limit int, build func([]ContextEntry, int) int) ([]ContextEntry, int) {
-	for n := len(entries); n > 0; n-- {
-		kept := entries[:n:n]
-		if build(kept, n) > limit {
-			continue
+//
+// Every kept entry adds at least its own size, so the prefix whose sizes alone pass
+// limit bounds the search. Short of the whole page the result grows with each entry
+// (only the whole page can drop next_cursor, so it is tried first), so the longest
+// fitting prefix is a binary search: each entry is sized once, then O(log n) builds of
+// at most limit bytes of entries.
+func fitRecallBudget(entries []ContextEntry, size func(ContextEntry) int, cut bool, limit int, build func([]ContextEntry, int) int) ([]ContextEntry, int) {
+	bound, sum := 0, 0
+	for bound < len(entries) {
+		if sum += size(entries[bound]); sum > limit {
+			break
 		}
-		if n < len(entries) && cut {
-			if withCut, ok := cutToFit(kept, entries[n], n, limit, build); ok {
-				return withCut, 1
-			}
-			build(kept, n)
-		}
-		return kept, 0
+		bound++
 	}
-	if cut && len(entries) > 0 {
-		if withCut, ok := cutToFit(nil, entries[0], 0, limit, build); ok {
+	fits := func(n int) bool { return build(entries[:n:n], n) <= limit }
+	if bound == len(entries) && fits(bound) {
+		return entries, 0
+	}
+	bound = min(bound, len(entries)-1)
+	n := max(sort.Search(bound+1, func(k int) bool { return !fits(k) })-1, 0)
+	kept := entries[:n:n]
+	if n < len(entries) && cut {
+		if withCut, ok := cutToFit(kept, entries[n], n, limit, build); ok {
 			return withCut, 1
 		}
 	}
-	build(nil, 0)
-	return nil, 0
+	build(kept, n)
+	return kept, 0
 }
 
 // minCutChars is the least content worth returning cut rather than dropping.
@@ -258,69 +269,41 @@ func countStale(es []ContextEntry) int {
 	return n
 }
 
-// A recall cursor continues a ranking at an offset. It is signed with a key held by
-// this process only, over the offset, the block size and every argument that orders
-// or filters the ranking, so a client can neither edit the offset nor reuse a cursor
-// for another query or caller; a cursor stops being valid when the API restarts.
+// A recall cursor (recallCursors) continues a ranking at an offset. It is signed over
+// the offset, the block size, the workspace and every argument that orders or filters
+// the ranking, the caller included.
 type recallCursor struct {
 	offset int
 	// block is the stale-penalty block size the first page fixed (0 before it).
 	block int
 }
 
-// recallCursorKey is the process's cursor-signing key.
-var recallCursorKey = sync.OnceValue(func() []byte {
-	k := make([]byte, 32)
-	rand.Read(k) // crypto/rand never fails on supported platforms
-	return k
-})
-
-// rankingKey names the ranking a cursor pages: every argument that orders or filters
-// it, the caller included. The page size, render, budget and session may change
-// between pages.
-func (r RecallRequest) rankingKey() []byte {
+// rankingKey names the ranking a cursor pages: the workspace and every argument that
+// orders or filters it, the caller included. The page size, render, budget and
+// session may change between pages.
+func (r RecallRequest) rankingKey(workspaceID string) []byte {
 	r.Cursor, r.Limit, r.NamesOnly, r.Render, r.MaxChars, r.SessionID, r.Explain = "", 0, false, "", 0, "", false
-	b, _ := json.Marshal(r)
+	b, _ := json.Marshal(struct {
+		Workspace string
+		Request   RecallRequest
+	}{workspaceID, r})
 	return b
 }
 
-func (r RecallRequest) cursorMAC(c recallCursor) string {
-	m := hmac.New(sha256.New, recallCursorKey())
-	fmt.Fprintf(m, "r2|%d|%d|", c.offset, c.block)
-	m.Write(r.rankingKey())
-	return hex.EncodeToString(m.Sum(nil)[:16])
-}
-
-func (r RecallRequest) encodeCursor(c recallCursor) string {
-	return base64.RawURLEncoding.EncodeToString(fmt.Appendf(nil, "r2.%d.%d.%s", c.offset, c.block, r.cursorMAC(c)))
+func (r RecallRequest) encodeCursor(workspaceID string, c recallCursor) string {
+	return recallCursors.encode(r.rankingKey(workspaceID), c.offset, c.block)
 }
 
 // decodeCursor returns where the request's cursor continues; no cursor starts at 0. A
-// cursor that is malformed, edited, or from another query or caller is rejected.
-func (r RecallRequest) decodeCursor() (recallCursor, error) {
+// cursor that is malformed, edited, or from another workspace, query or caller is
+// rejected.
+func (r RecallRequest) decodeCursor(workspaceID string) (recallCursor, error) {
 	if r.Cursor == "" {
 		return recallCursor{}, nil
 	}
-	bad := fmt.Errorf("cursor is not a next_cursor of this query: %w", ErrInvalidInput)
-	raw, err := base64.RawURLEncoding.DecodeString(r.Cursor)
-	if err != nil {
-		return recallCursor{}, bad
+	nums, ok := recallCursors.decode(r.Cursor, r.rankingKey(workspaceID))
+	if !ok || nums[0] < 0 || nums[1] < 1 {
+		return recallCursor{}, fmt.Errorf("cursor is not a next_cursor of this query: %w", ErrInvalidInput)
 	}
-	parts := strings.Split(string(raw), ".")
-	if len(parts) != 4 || parts[0] != "r2" {
-		return recallCursor{}, bad
-	}
-	offset, errOffset := strconv.Atoi(parts[1])
-	block, errBlock := strconv.Atoi(parts[2])
-	if errOffset != nil || errBlock != nil {
-		return recallCursor{}, bad
-	}
-	c := recallCursor{offset: offset, block: block}
-	if !hmac.Equal([]byte(parts[3]), []byte(r.cursorMAC(c))) {
-		return recallCursor{}, bad
-	}
-	if c.offset < 0 || c.block < 1 {
-		return recallCursor{}, bad
-	}
-	return c, nil
+	return recallCursor{offset: nums[0], block: nums[1]}, nil
 }
