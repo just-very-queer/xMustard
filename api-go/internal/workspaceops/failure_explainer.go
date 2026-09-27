@@ -126,20 +126,13 @@ func readFileTail(path string, maxBytes int64) ([]byte, int64, error) {
 		return nil, 0, err
 	}
 	size := info.Size()
-	n := min64(size, maxBytes)
+	n := min(size, maxBytes)
 	buf := make([]byte, n)
 	m, err := f.ReadAt(buf, size-n)
 	if err != nil && !errors.Is(err, io.EOF) {
 		return nil, 0, err
 	}
 	return buf[:m], size, nil
-}
-
-func min64(a, b int64) int64 {
-	if a < b {
-		return a
-	}
-	return b
 }
 
 func runLooksFailed(run *runRecord, signals []string) bool {

@@ -406,6 +406,9 @@ func registerEvidenceRoutes(mux routeRegistrar, store *evidence.Store) {
 			writeEvidenceError(w, err)
 			return
 		}
+		if !forgetEvidenceOutcomes(w, r, r.PathValue("handle")) {
+			return
+		}
 		writeJSON(w, http.StatusOK, map[string]any{"revoked": true})
 	})
 	// Workspace-level revocation (there is no workspace-deletion API): removes every
@@ -418,6 +421,22 @@ func registerEvidenceRoutes(mux routeRegistrar, store *evidence.Store) {
 			writeEvidenceError(w, err)
 			return
 		}
+		if !forgetEvidenceOutcomes(w, r, "") {
+			return
+		}
 		writeJSON(w, http.StatusOK, map[string]any{"revoked": true})
 	})
+}
+
+// forgetEvidenceOutcomes removes the run outcomes made from a revoked original (handle
+// "": every original of the workspace), after the revocation, so an unauthorized
+// revoke removes nothing. A failure answers 500; the revoke is idempotent, so a retry
+// removes them.
+func forgetEvidenceOutcomes(w http.ResponseWriter, r *http.Request, handle string) bool {
+	if _, err := workspaceops.ForgetEvidenceOutcomes(r.Context(), dataDir(), r.PathValue("workspace_id"), handle); err != nil {
+		log.Printf("evidence revoke: outcomes made from %q not removed: %v", handle, err)
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "the original is revoked, but the outcomes made from it were not removed; retry the revoke"})
+		return false
+	}
+	return true
 }

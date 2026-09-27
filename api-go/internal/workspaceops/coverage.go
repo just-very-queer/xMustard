@@ -232,10 +232,3 @@ func setDifference(left []string, right []string) []string {
 func round2(value float64) float64 {
 	return math.Round(value*100) / 100
 }
-
-func max(a int, b int) int {
-	if a > b {
-		return a
-	}
-	return b
-}

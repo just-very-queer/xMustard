@@ -65,9 +65,9 @@ func (p *exposurePosture) profile() string {
 
 func (p *exposurePosture) readOnly() bool { return p != nil && p.ReadOnly }
 
-// runsCommands reports whether why_failed may run a command. A command runs the
-// repository's code, and its arguments are not confined, with the daemon's privileges,
-// so a deployment reachable beyond loopback serves it only when the operator opts in.
+// runsCommands reports whether why_failed may run a command. A command from the closed
+// table still runs the repository's code as the daemon's operating-system user, so a
+// deployment reachable beyond loopback serves it only when the operator opts in.
 func (p *exposurePosture) runsCommands() bool {
 	if p == nil {
 		return false

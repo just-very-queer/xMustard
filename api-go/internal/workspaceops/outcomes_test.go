@@ -2,6 +2,7 @@ package workspaceops
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -46,23 +47,31 @@ func seedOutcomeWorkspace(t *testing.T, changed ...string) (string, string, stri
 	return dataDir, ws, root
 }
 
-// stubRunner replaces the bounded runner for one test and records its calls.
+// stubRunner replaces the bounded runner for one test and records its calls; bare
+// program names resolve to /stub/bin/<name>.
 type runnerCall struct {
 	dir     string
 	timeout int
 	argv    []string
+	env     []string
 }
 
 func stubRunner(t *testing.T, res *rustcore.ManagedCommandResult) *[]runnerCall {
 	t.Helper()
 	var calls []runnerCall
-	prev := runManagedCommand
-	runManagedCommand = func(_ context.Context, dir string, timeout int, argv []string) (*rustcore.ManagedCommandResult, error) {
-		calls = append(calls, runnerCall{dir, timeout, slices.Clone(argv)})
+	stubRunnerFunc(t, func(_ context.Context, dir string, timeout int, argv, env []string) (*rustcore.ManagedCommandResult, error) {
+		calls = append(calls, runnerCall{dir, timeout, slices.Clone(argv), env})
 		return res, nil
-	}
-	t.Cleanup(func() { runManagedCommand = prev })
+	})
 	return &calls
+}
+
+func stubRunnerFunc(t *testing.T, run func(ctx context.Context, dir string, timeout int, argv, env []string) (*rustcore.ManagedCommandResult, error)) {
+	t.Helper()
+	prevRun, prevLook := runCheckCommand, lookPath
+	runCheckCommand = run
+	lookPath = func(name string) (string, error) { return "/stub/bin/" + name, nil }
+	t.Cleanup(func() { runCheckCommand, lookPath = prevRun, prevLook })
 }
 
 func feedbackRunFail(t *testing.T, dataDir, ws, path string) int {
@@ -93,7 +102,7 @@ func TestWhyFailedCommandRecordsTheOutcome(t *testing.T) {
 		t.Fatalf("runner calls = %d", len(*calls))
 	}
 	c := (*calls)[0]
-	if want, _ := filepath.EvalSymlinks(filepath.Join(root, "pkg")); c.dir != want || c.timeout != 20 || !slices.Equal(c.argv, []string{"go", "test", "./pkg/sub/..."}) {
+	if want, _ := filepath.EvalSymlinks(filepath.Join(root, "pkg")); c.dir != want || c.timeout != 20 || !slices.Equal(c.argv, []string{"/stub/bin/go", "test", "./pkg/sub/..."}) {
 		t.Fatalf("runner got dir %q timeout %d argv %q", c.dir, c.timeout, c.argv)
 	}
 	if !exp.Failed || exp.Status != govstore.RunFailed || exp.Source != govstore.RunSourceCommand || !IsRunOutcomeID(exp.RunID) ||
@@ -117,7 +126,7 @@ func TestWhyFailedCommandRecordsTheOutcome(t *testing.T) {
 	// the same command passing resolves the failure: ground stops listing it
 	*calls = nil
 	zero := 0
-	runManagedCommand = func(_ context.Context, dir string, timeout int, argv []string) (*rustcore.ManagedCommandResult, error) {
+	runCheckCommand = func(_ context.Context, dir string, timeout int, argv, env []string) (*rustcore.ManagedCommandResult, error) {
 		return &rustcore.ManagedCommandResult{ExitCode: &zero, Success: true, StdoutExcerpt: "ok  pkg/sub 0.1s"}, nil
 	}
 	pass, err := RecordFailureOutcome(context.Background(), dataDir, ws, FailureRequest{Argv: []string{"go", "test", "./pkg/sub/..."}, Cwd: "pkg", Actor: agent})
@@ -132,68 +141,10 @@ func TestWhyFailedCommandRecordsTheOutcome(t *testing.T) {
 	}
 }
 
-// Guards refuse, before anything runs, what the bounded runner must never execute.
-func TestWhyFailedCommandGuards(t *testing.T) {
-	dataDir, ws, root := seedOutcomeWorkspace(t)
-	calls := stubRunner(t, &rustcore.ManagedCommandResult{Success: true})
-	if err := os.Symlink(t.TempDir(), filepath.Join(root, "escape")); err != nil {
-		t.Fatal(err)
-	}
-	cases := map[string]FailureRequest{
-		"pipe":              {Command: "go test ./... | tail -5"},
-		"redirect":          {Argv: []string{"go", "test", ">", "out.txt"}},
-		"list":              {Command: "make test && rm -rf /"},
-		"not test or build": {Command: "rm -rf pkg"},
-		"shell":             {Command: `sh -c "go test ./..."`},
-		"wrapper":           {Command: "sudo go test ./..."},
-		"env wrapper":       {Command: "env GOFLAGS=-count=1 go test ./..."},
-		"program outside":   {Argv: []string{"/usr/bin/make", "test"}},
-		"program escapes":   {Argv: []string{"../make", "test"}},
-		"cwd escapes":       {Command: "go test ./...", Cwd: "../x"},
-		"cwd absolute":      {Command: "go test ./...", Cwd: "/tmp"},
-		"cwd symlink out":   {Command: "go test ./...", Cwd: "escape"},
-		"cwd missing":       {Command: "go test ./...", Cwd: "nope"},
-		"timeout":           {Command: "go test ./...", TimeoutSeconds: MaxWhyFailedTimeout + 1},
-		"unclosed quote":    {Command: `go test "./...`},
-		"no source":         {},
-		"two sources":       {Command: "go test ./...", Log: "FAIL"},
-		"command and argv":  {Command: "go test", Argv: []string{"go", "vet"}},
-		"nul":               {Argv: []string{"go", "test", "a\x00b"}},
-	}
-	for name, req := range cases {
-		req.Actor = agent
-		if _, err := RecordFailureOutcome(context.Background(), dataDir, ws, req); !IsInvalidInput(err) {
-			t.Errorf("%s: got %v, want an invalid-input refusal", name, err)
-		}
-	}
-	if len(*calls) != 0 {
-		t.Fatalf("a refused command reached the runner: %+v", *calls)
-	}
-	// the families it does run
-	for _, cmd := range []string{"go test ./...", "go vet ./...", "cargo build", "npm test", "make", "pytest -x", "eslint ."} {
-		if _, err := RecordFailureOutcome(context.Background(), dataDir, ws, FailureRequest{Command: cmd, Actor: agent}); err != nil {
-			t.Errorf("%s: %v", cmd, err)
-		}
-	}
-}
-
 // The real bounded runner kills the command's whole process group at the timeout,
 // including a grandchild, and the outcome records the timeout.
 func TestWhyFailedCommandTimeoutKillsTheProcessGroup(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("process groups are POSIX")
-	}
-	if _, err := exec.LookPath("make"); err != nil {
-		t.Skip("make is not installed")
-	}
-	core := realCoreForOutcomes(t)
-	dataDir, ws, root := seedOutcomeWorkspace(t)
-	t.Setenv("XMUSTARD_CORE_BIN", core)
-	pidFile := filepath.Join(root, "grandchild.pid")
-	makefile := "test:\n\t@echo '--- FAIL: TestSlow (0.00s)'\n\t@sleep 60 & echo $$! > " + pidFile + "; wait\n"
-	if err := os.WriteFile(filepath.Join(root, "Makefile"), []byte(makefile), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	dataDir, ws, pidFile := realCoreGrandchildWorkspace(t, "\t@echo '--- FAIL: TestSlow (0.00s)'\n")
 	start := time.Now()
 	exp, err := RecordFailureOutcome(context.Background(), dataDir, ws, FailureRequest{Argv: []string{"make", "test"}, TimeoutSeconds: 1, Actor: agent})
 	if err != nil {
@@ -205,6 +156,83 @@ func TestWhyFailedCommandTimeoutKillsTheProcessGroup(t *testing.T) {
 	if !exp.Failed || exp.Status != govstore.RunTimedOut || !exp.TimedOut || !slices.Contains(exp.Signals, "timed out after 1s; the command's process group was terminated") {
 		t.Fatalf("timeout outcome = %+v", exp)
 	}
+	waitGrandchildGone(t, pidFile)
+	if got, err := ExplainRunFailureCtx(context.Background(), dataDir, ws, exp.RunID); err != nil || got.Status != govstore.RunTimedOut {
+		t.Fatalf("recorded outcome = %+v, %v", got, err)
+	}
+}
+
+// A cancelled request (a client disconnect, an MCP cancellation, the stdio backend's
+// HTTP timeout) does not kill the runner: that would kill only the core and orphan the
+// command, in its own process group, without its timeout. The core still ends the
+// group at the timeout, the caller gets its cancellation, and nothing is recorded.
+func TestWhyFailedCancelledCommandStillEndsItsProcessGroup(t *testing.T) {
+	dataDir, ws, pidFile := realCoreGrandchildWorkspace(t, "")
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(1500*time.Millisecond, cancel)
+	start := time.Now()
+	_, err := RecordFailureOutcome(ctx, dataDir, ws, FailureRequest{Argv: []string{"make", "test"}, TimeoutSeconds: 3, Actor: agent})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("a cancelled request: %v", err)
+	}
+	if took := time.Since(start); took < 2*time.Second || took > 20*time.Second {
+		t.Fatalf("the call returned after %s: it must wait for the core to end the command (3 s timeout)", took)
+	}
+	waitGrandchildGone(t, pidFile)
+	if all, err := ListRunOutcomes(context.Background(), dataDir, ws, false, 0); err != nil || len(all) != 0 {
+		t.Fatalf("a cancelled command recorded %+v, %v", all, err)
+	}
+	if n := len(commandSlots); n != 0 {
+		t.Fatalf("%d command slot(s) still held", n)
+	}
+}
+
+// With the real core, the repository's code runs without the daemon's configuration
+// and secrets in its environment.
+func TestWhyFailedCommandEnvironmentHasNoDaemonSecrets(t *testing.T) {
+	dataDir, ws, _ := realCoreGrandchildWorkspace(t, "")
+	root := contextRoot(dataDir, ws)
+	makefile := "test:\n\t@echo \"tokens=[$${XMUSTARD_AUTH_TOKENS}] deploy=[$${DEPLOY_API_TOKEN}] visible=[$${XM_TEST_VISIBLE}]\"; exit 1\n"
+	if err := os.WriteFile(filepath.Join(root, "Makefile"), []byte(makefile), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XMUSTARD_AUTH_TOKENS", "root:admin:"+strings.Repeat("s3cr3tT0k3n", 3))
+	t.Setenv("DEPLOY_API_TOKEN", strings.Repeat("Zq9", 12))
+	t.Setenv("XM_TEST_VISIBLE", "visible")
+	exp, err := RecordFailureOutcome(context.Background(), dataDir, ws, FailureRequest{Argv: []string{"make", "test"}, TimeoutSeconds: 20, Actor: agent})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(exp.Output.Tail, "tokens=[] deploy=[] visible=[visible]") {
+		t.Fatalf("the command saw %q", exp.Output.Tail)
+	}
+}
+
+// realCoreGrandchildWorkspace seeds a workspace run by the built core whose `make test`
+// runs the recipe lines in prefix, then backgrounds a 30 s sleep (its pid written to the returned file) and
+// waits for it. It skips without make, the core or process groups.
+func realCoreGrandchildWorkspace(t *testing.T, prefix string) (dataDir, ws, pidFile string) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("process groups are POSIX")
+	}
+	if _, err := exec.LookPath("make"); err != nil {
+		t.Skip("make is not installed")
+	}
+	core := realCoreForOutcomes(t)
+	dataDir, ws, root := seedOutcomeWorkspace(t)
+	t.Setenv("XMUSTARD_CORE_BIN", core)
+	pidFile = filepath.Join(root, "grandchild.pid")
+	makefile := "test:\n" + prefix + "\t@sleep 30 & echo $$! > " + pidFile + "; wait\n"
+	if err := os.WriteFile(filepath.Join(root, "Makefile"), []byte(makefile), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return dataDir, ws, pidFile
+}
+
+// waitGrandchildGone waits up to 5 s for the pid in pidFile to exit.
+func waitGrandchildGone(t *testing.T, pidFile string) {
+	t.Helper()
 	raw, err := os.ReadFile(pidFile)
 	if err != nil {
 		t.Fatalf("the grandchild never started: %v", err)
@@ -217,12 +245,9 @@ func TestWhyFailedCommandTimeoutKillsTheProcessGroup(t *testing.T) {
 	for syscall.Kill(pid, 0) == nil {
 		if time.Now().After(deadline) {
 			_ = syscall.Kill(pid, syscall.SIGKILL)
-			t.Fatalf("grandchild %d survived the timeout", pid)
+			t.Fatalf("grandchild %d outlived the command", pid)
 		}
 		time.Sleep(50 * time.Millisecond)
-	}
-	if got, err := ExplainRunFailureCtx(context.Background(), dataDir, ws, exp.RunID); err != nil || got.Status != govstore.RunTimedOut {
-		t.Fatalf("recorded outcome = %+v, %v", got, err)
 	}
 }
 
@@ -458,18 +483,6 @@ func TestCapturedTestOutputsBecomeOutcomes(t *testing.T) {
 	all, err := ListRunOutcomes(ctx, dataDir, ws, false, 0)
 	if err != nil || len(all) != 2 {
 		t.Fatalf("outcomes = %+v, %v (a pass with no open failure and a read are not recorded)", all, err)
-	}
-}
-
-// The exact argv decides the family: a wrapper that runs something else is a shell.
-func TestCommandFamilyUsesTheExactArgv(t *testing.T) {
-	for argv, want := range map[string]evidence.Family{
-		"go test ./...": evidence.FamilyTest, "sudo go test": evidence.FamilyShell, "env X=1 go test": evidence.FamilyShell,
-		"./gradlew build": evidence.FamilyBuild, "make lint": evidence.FamilyLint,
-	} {
-		if got := evidence.CommandFamily(strings.Fields(argv)); got != want {
-			t.Errorf("%s: %s, want %s", argv, got, want)
-		}
 	}
 }
 

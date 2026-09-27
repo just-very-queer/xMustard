@@ -107,11 +107,16 @@ type RunOutcomeReader interface {
 	ListRunOutcomes(ctx context.Context, f RunOutcomeFilter) ([]RunOutcome, error)
 }
 
-// RunOutcomeWriter records run outcomes.
+// RunOutcomeWriter records and removes run outcomes.
 type RunOutcomeWriter interface {
 	// RecordRunOutcome stores in and reports whether it is new. A second report with the
 	// same source key returns the stored outcome unchanged (created false).
 	RecordRunOutcome(ctx context.Context, in RunOutcomeInput, actor Actor) (out RunOutcome, created bool, err error)
+	// DeleteRunOutcome removes one outcome; ErrNotFound when the workspace has none by id.
+	DeleteRunOutcome(ctx context.Context, workspaceID, id string) error
+	// DeleteEvidenceOutcomes removes the outcomes made from the evidence original handle,
+	// or with handle "" from any original, and reports how many it removed.
+	DeleteEvidenceOutcomes(ctx context.Context, workspaceID, handle string) (int, error)
 }
 
 const runOutcomeColumns = `id, workspace_id, source, subject_key, status, failed, exit_code, command, cwd, tool,
@@ -255,4 +260,38 @@ func (t *txn) RecordRunOutcome(ctx context.Context, in RunOutcomeInput, actor Ac
 		return RunOutcome{}, false, fmt.Errorf("%w: run outcome %s vanished inside its transaction", ErrInvariant, id)
 	}
 	return o, true, err
+}
+
+// DeleteRunOutcome removes one outcome of the workspace. Outcomes it resolved stay
+// resolved: the later outcome was recorded, whatever became of its row.
+func (t *txn) DeleteRunOutcome(ctx context.Context, workspaceID, id string) error {
+	if err := validID("workspace", workspaceID); err != nil {
+		return err
+	}
+	if err := validID("run outcome", id); err != nil {
+		return err
+	}
+	res, err := t.exec(ctx, `DELETE FROM run_outcomes WHERE workspace_id = ? AND id = ?`, workspaceID, id)
+	if err != nil {
+		return err
+	}
+	if rowsAffected(res) == 0 {
+		return fmt.Errorf("%w: run outcome %s", ErrNotFound, id)
+	}
+	return nil
+}
+
+// DeleteEvidenceOutcomes removes the workspace's outcomes made from the evidence original
+// handle, or with handle "" from any original: a revoked or purged original takes the
+// tail, error lines and failing tests its outcomes copied with it.
+func (t *txn) DeleteEvidenceOutcomes(ctx context.Context, workspaceID, handle string) (int, error) {
+	if err := validID("workspace", workspaceID); err != nil {
+		return 0, err
+	}
+	res, err := t.exec(ctx, `DELETE FROM run_outcomes WHERE workspace_id = ? AND evidence_handle <> ''
+		AND (? = '' OR evidence_handle = ?)`, workspaceID, handle, handle)
+	if err != nil {
+		return 0, err
+	}
+	return int(rowsAffected(res)), nil
 }

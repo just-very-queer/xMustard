@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"xmustard/api-go/internal/budget"
 	"xmustard/api-go/internal/evidence"
 	"xmustard/api-go/internal/govstore"
 	"xmustard/api-go/internal/redact"
@@ -25,15 +26,17 @@ import (
 
 // Run-independent failure outcomes (WS-21; PAR-HAR-06, PAR-RET-11, PAR-RT-11).
 //
-// why_failed works without platform runs. It runs a test, build or lint command
-// through the bounded Rust runner (argv exec, no shell, the working directory confined
-// to the workspace root, a timeout that terminates the whole process group), reads the
-// last MiB of a retained evidence original, or takes a pasted log. The output is
-// redacted, analyzed from its bounded tail and recorded once as a govstore run outcome,
-// and ground lists the open failures. Reading an outcome never writes: run_fail
-// feedback is recorded once, when an outcome is first recorded, for the changed files
-// it implicates. A captured failing test, build or lint output becomes an outcome the
-// same way (RecordCapturedOutcome), without a Rust or git spawn on the capture path.
+// why_failed works without platform runs. It runs a test, build or lint command from a
+// closed table through the bounded Rust runner (outcome_commands.go: argv exec, no
+// shell, the working directory and path arguments confined to the workspace root, no
+// daemon secrets in its environment, one at a time, a timeout that terminates the whole
+// process group), reads the last MiB of a retained evidence original, or takes a pasted
+// log. The output is redacted, analyzed from its bounded tail and recorded once as a
+// govstore run outcome, and ground lists the open failures. Reading an outcome never
+// writes: run_fail feedback is recorded once, when an outcome is first recorded, for the
+// changed files it implicates. A captured failing test, build or lint output becomes an
+// outcome the same way (RecordCapturedOutcome), without a Rust or git spawn on the
+// capture path. Revoking an evidence original removes the outcomes made from it.
 
 const (
 	// outcomeTailBytes is how much of an output is analyzed: its end, where runners and
@@ -212,6 +215,31 @@ func ListRunOutcomes(ctx context.Context, dataDir, workspaceID string, open bool
 	return out, nil
 }
 
+// DeleteRunOutcome removes one recorded outcome: the admin's answer to a secret the
+// redactor missed in an outcome's command or tail.
+func DeleteRunOutcome(ctx context.Context, dataDir, workspaceID, outcomeID string) error {
+	if err := validateSafeID("run", outcomeID); err != nil || !IsRunOutcomeID(outcomeID) {
+		return Invalid("not a run outcome id")
+	}
+	return memoryUpdate(ctx, dataDir, workspaceID, func(tx govstore.Tx) error {
+		return tx.DeleteRunOutcome(ctx, workspaceID, outcomeID)
+	})
+}
+
+// ForgetEvidenceOutcomes removes the outcomes made from the evidence original handle,
+// or, with handle "", from any original of the workspace. Revoking or purging an
+// original calls it, so the tail, error lines and failing tests an outcome copied from
+// the original go with it.
+func ForgetEvidenceOutcomes(ctx context.Context, dataDir, workspaceID, handle string) (int, error) {
+	var n int
+	err := memoryUpdate(ctx, dataDir, workspaceID, func(tx govstore.Tx) error {
+		var err error
+		n, err = tx.DeleteEvidenceOutcomes(ctx, workspaceID, handle)
+		return err
+	})
+	return n, err
+}
+
 // --- sources -------------------------------------------------------------------------
 
 func collectFailureOutput(ctx context.Context, root string, req FailureRequest) (*collectedOutput, error) {
@@ -242,117 +270,51 @@ func collectFailureOutput(ctx context.Context, root string, req FailureRequest) 
 		return runFailureCommand(ctx, root, req)
 	case req.EvidenceHandle != "":
 		return readEvidenceFailure(ctx, req)
-	default:
-		return pastedLogOutput(req.Log), nil
 	}
+	if err := admitAnalysis(ctx, int64(len(req.Log))); err != nil {
+		return nil, err
+	}
+	return pastedLogOutput(req.Log), nil
 }
 
-// shellOperators are argv words a shell would interpret. The command runs without a
-// shell, so they would reach the program as literal arguments: refuse them instead.
-var shellOperators = map[string]bool{
-	"|": true, "||": true, "&&": true, ";": true, "&": true, ">": true, ">>": true, "<": true, "<<": true,
-	"2>": true, "2>&1": true, "&>": true, "|&": true, "$(": true, "`": true,
-}
-
-// whyFailedFamilies are the command families why_failed runs and captures record.
+// whyFailedFamilies are the command families whose captured outputs become outcomes.
 var whyFailedFamilies = map[evidence.Family]bool{evidence.FamilyTest: true, evidence.FamilyBuild: true, evidence.FamilyLint: true}
 
 // CapturesOutcome reports whether a captured output of family can become an outcome.
 func CapturesOutcome(family evidence.Family) bool { return whyFailedFamilies[family] }
 
-// checkFailureArgv refuses what the bounded runner must never execute. The checks are
-// ordered and fail closed.
-func checkFailureArgv(root string, argv []string) error {
-	total := 0
-	for _, a := range argv {
-		total += len(a)
-		if strings.ContainsRune(a, 0) {
-			return Invalid("command arguments may not contain NUL")
-		}
-		if shellOperators[a] {
-			return Invalid(fmt.Sprintf("command runs as argv without a shell: %q (pipes, redirections and command lists) is not supported; run it in your shell and pass the output as log", a))
-		}
-	}
-	if len(argv) > maxWhyFailedArgs || total > maxWhyFailedArgv {
-		return Invalid(fmt.Sprintf("command is limited to %d arguments and %d bytes", maxWhyFailedArgs, maxWhyFailedArgv))
-	}
-	if strings.TrimSpace(argv[0]) == "" {
-		return Invalid("command has no program")
-	}
-	// A program named by path must be inside the workspace (./gradlew); a bare name is
-	// looked up on PATH.
-	if strings.ContainsAny(argv[0], `/\`) {
-		if _, err := ConfineWorkspacePath(root, argv[0]); err != nil {
-			return Invalid("command program " + argv[0] + " is outside the workspace root").WithCause(err)
-		}
-	}
-	if fam := evidence.CommandFamily(argv); !whyFailedFamilies[fam] {
-		return Invalid(fmt.Sprintf("why_failed runs test, build and lint commands only (%s is %s); run other commands in your shell and pass the output as log", argv[0], fam))
-	}
-	return nil
-}
-
-// confineCommandDir resolves the repo-relative working directory inside root.
-func confineCommandDir(root, cwd string) (dir, rel string, err error) {
-	if strings.TrimSpace(cwd) == "" || strings.TrimSpace(cwd) == "." {
-		return root, "", nil
-	}
-	rel, err = ConfineWorkspacePath(root, cwd)
-	if err != nil {
-		return "", "", Invalid("cwd must be a directory inside the workspace root").WithCause(err)
-	}
-	dir, err = resolveWorkspacePath(root, rel)
-	if err != nil {
-		return "", "", Invalid("cwd must be a directory inside the workspace root").WithCause(err)
-	}
-	if info, err := os.Stat(dir); err != nil || !info.IsDir() {
-		return "", "", Invalid("cwd " + rel + " is not a directory in the workspace")
-	}
-	return dir, rel, nil
-}
-
-// runFailureCommand runs argv through the bounded Rust runner. The runner kills the
-// command's process group at the timeout; the request context bounds the runner.
+// runFailureCommand checks the command (outcome_commands.go), runs it through the
+// bounded runner when no other why_failed command is running, and analyzes its output.
 func runFailureCommand(ctx context.Context, root string, req FailureRequest) (*collectedOutput, error) {
-	if strings.TrimSpace(root) == "" {
-		return nil, Invalid("the workspace has no root directory to run a command in")
-	}
-	if err := checkFailureArgv(root, req.Argv); err != nil {
-		return nil, err
-	}
-	timeout := req.TimeoutSeconds
-	if timeout == 0 {
-		timeout = DefaultWhyFailedTimeout
-	}
-	if timeout < 1 || timeout > MaxWhyFailedTimeout {
-		return nil, Invalid(fmt.Sprintf("timeout_seconds must be between 1 and %d", MaxWhyFailedTimeout))
-	}
-	dir, rel, err := confineCommandDir(root, req.Cwd)
+	cmd, err := prepareCommand(root, req)
 	if err != nil {
 		return nil, err
 	}
-	runCtx, cancel := context.WithTimeout(ctx, time.Duration(timeout)*time.Second+planningRustCoreBuffer)
-	defer cancel()
-	res, err := runManagedCommand(runCtx, dir, timeout, req.Argv)
+	release, err := acquireCommandSlot()
 	if err != nil {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-		return nil, Unavailable("the bounded command runner failed; the command's result is unknown").WithCause(err)
+		return nil, err
 	}
-	status := commandStatus(res)
+	res, err := cmd.run(ctx)
+	release()
+	if err != nil {
+		return nil, err
+	}
 	raw := combineCommandOutput(res.StdoutExcerpt, res.StderrExcerpt)
+	if err := admitAnalysis(ctx, int64(len(raw))); err != nil {
+		return nil, err
+	}
 	nonce, err := outcomeNonce()
 	if err != nil {
 		return nil, err
 	}
+	status := commandStatus(res)
 	out := analyzedOutput(raw, streamBytes(res.StdoutExcerpt)+streamBytes(res.StderrExcerpt))
 	out.analysis.TimedOut = res.TimedOut
-	out.analysis.Signals = append(statusSignals(status, res.ExitCode, timeout), out.analysis.Signals...)
+	out.analysis.Signals = append(statusSignals(status, res.ExitCode, cmd.timeout), out.analysis.Signals...)
 	out.in.Source, out.in.SourceKey = govstore.RunSourceCommand, "command:"+nonce
-	out.in.SubjectKey = commandSubject(rel, req.Argv)
+	out.in.SubjectKey = commandSubject(cmd.rel, req.Argv)
 	out.in.Status, out.in.ExitCode = status, res.ExitCode
-	out.in.Command, out.in.Cwd = redactedLine(strings.Join(req.Argv, " ")), rel
+	out.in.Command, out.in.Cwd = redactedLine(strings.Join(req.Argv, " ")), cmd.rel
 	return out, nil
 }
 
@@ -398,6 +360,9 @@ func statusSignals(status string, exitCode *int, timeout int) []string {
 func readEvidenceFailure(ctx context.Context, req FailureRequest) (*collectedOutput, error) {
 	if req.Evidence == nil {
 		return nil, Unavailable("evidence is not available on this server")
+	}
+	if err := admitAnalysis(ctx, outcomeTailBytes); err != nil {
+		return nil, err
 	}
 	tail, err := req.Evidence(ctx, req.EvidenceHandle, outcomeTailBytes)
 	switch {
@@ -509,6 +474,9 @@ func RecordCapturedOutcome(ctx context.Context, dataDir, workspaceID string, c C
 // like why_failed(evidence_handle), or the unretained text, keyed by the tool call.
 func capturedOutput(ctx context.Context, c CapturedOutcome) (*collectedOutput, error) {
 	if c.Handle == "" {
+		if err := admitAnalysis(ctx, int64(len(c.Text))); err != nil {
+			return nil, err
+		}
 		out := analyzedOutput(c.Text, int64(len(c.Text)))
 		sum := sha256.Sum256([]byte(c.Text))
 		out.in.SourceKey = "capture:" + digestHex(c.Session+"\x00"+c.Call+"\x00"+hex.EncodeToString(sum[:]))
@@ -518,6 +486,9 @@ func capturedOutput(ctx context.Context, c CapturedOutcome) (*collectedOutput, e
 	}
 	if c.Evidence == nil {
 		return nil, Unavailable("evidence is not available on this server")
+	}
+	if err := admitAnalysis(ctx, outcomeTailBytes); err != nil {
+		return nil, err
 	}
 	tail, err := c.Evidence(ctx, c.Handle, outcomeTailBytes)
 	if err != nil {
@@ -539,11 +510,32 @@ func openFailureFor(ctx context.Context, dataDir, workspaceID, subject string) b
 // --- analysis --------------------------------------------------------------------------
 
 // outputRedactor removes secrets, including the values of secret-named variables in
-// this process's environment (the command runs with it), before anything is analyzed
-// or stored.
+// this process's environment (a command runs without them, but its code can still find
+// and print one), before anything is analyzed or stored.
 var outputRedactor = sync.OnceValue(func() *redact.Redactor {
 	return redact.New(redact.WithEnv(redact.SecretEnv(os.Environ())...))
 })
+
+// analysisCopies is how many copies of an analyzed tail one analysis holds: as read, as
+// text and redacted (the analysis itself works line by line).
+const analysisCopies = 3
+
+// admitAnalysis reserves, in the request's transient budget, the memory analyzing n
+// bytes of output holds (their last outcomeTailBytes). A command's output is admitted
+// after the command ends, so the window is not held while it runs. Outside a request
+// (no scope) nothing is reserved.
+func admitAnalysis(ctx context.Context, n int64) error {
+	scope, owned := budget.ScopeFor(ctx)
+	if owned {
+		scope.Close()
+		return nil
+	}
+	err := scope.Acquire(analysisCopies * min(n, outcomeTailBytes))
+	if errors.Is(err, budget.ErrTooLarge) { // retrying cannot help: the pool is smaller
+		return Unavailable("this server's transient budget (XMUSTARD_TRANSIENT_BYTE_BUDGET) is too small to analyze the output").WithCause(err)
+	}
+	return err
+}
 
 // analyzedOutput redacts the last outcomeTailBytes of raw (total bytes long) and
 // analyzes it.
@@ -564,7 +556,7 @@ func analyzedOutput(raw string, total int64) *collectedOutput {
 		stored = strings.ToValidUTF8(stored[len(stored)-outcomeStoredTail:], "")
 	}
 	return &collectedOutput{
-		in:       govstore.RunOutcomeInput{OutputBytes: maxInt64(total, analyzed), AnalyzedBytes: analyzed, Tail: stored},
+		in:       govstore.RunOutcomeInput{OutputBytes: max(total, analyzed), AnalyzedBytes: analyzed, Tail: stored},
 		analysis: a,
 	}
 }

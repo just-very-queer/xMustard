@@ -5,7 +5,6 @@ import (
 	"log"
 	"net/http"
 
-	"xmustard/api-go/internal/budget"
 	"xmustard/api-go/internal/evidence"
 	"xmustard/api-go/internal/workspaceops"
 )
@@ -13,19 +12,23 @@ import (
 // Run-independent outcomes (WS-21; PAR-HAR-06, PAR-RET-11). why_failed works without
 // platform runs:
 //
-//   POST /api/workspaces/{ws}/why-failed  {"command": "go test ./pkg/..."} | {"argv": [...]}
-//        (+ "cwd", "timeout_seconds") | {"evidence_handle": "xm1..."} | {"log": "..."}
-//   GET  /api/workspaces/{ws}/outcomes?open=true&limit=N
+//   POST   /api/workspaces/{ws}/why-failed  {"command": "go test ./pkg/..."} | {"argv": [...]}
+//          (+ "cwd", "timeout_seconds") | {"evidence_handle": "xm1..."} | {"log": "..."}
+//   GET    /api/workspaces/{ws}/outcomes?open=true&limit=N
+//   DELETE /api/workspaces/{ws}/outcomes/{outcome_id}
 //
-// The POST runs a test, build or lint command through the bounded Rust runner (argv
-// exec, no shell, the working directory confined to the workspace root, a timeout that
-// terminates the process group), or reads the last MiB of an evidence original the
-// caller may read, or takes a pasted log; it records the outcome and answers the
-// explanation. A deployment reachable beyond loopback runs commands only with
-// XMUSTARD_WHY_FAILED_COMMANDS=1. Running a command and recording an outcome are agent
-// writes (proposer);
-// readers only read outcomes: GET .../runs/{outcome_id}/why-failed (main.go) and the
-// list above. Both routes are core and classified in routeGateTable.
+// The POST runs a test, build or lint command from a closed table through the bounded
+// Rust runner (workspaceops/outcome_commands.go: argv exec, no shell, the working
+// directory and path arguments confined to the workspace root, a scrubbed environment,
+// one command at a time, a timeout that terminates the process group), or reads the
+// last MiB of an evidence original the caller may read, or takes a pasted log; it
+// records the outcome and answers the explanation. A deployment reachable beyond
+// loopback runs commands only with XMUSTARD_WHY_FAILED_COMMANDS=1. Running a command
+// and recording an outcome are agent writes (proposer); readers only read outcomes:
+// GET .../runs/{outcome_id}/why-failed (main.go) and the list above. An admin removes
+// an outcome (a secret the redactor missed); revoking or purging an evidence original
+// removes the outcomes made from it (evidence_routes.go). The routes are core and
+// classified in routeGateTable.
 //
 // A captured test, build or lint output (POST .../evidence/capture) becomes an outcome
 // too (recordCaptureOutcome), unless the deployment is read-only.
@@ -33,10 +36,6 @@ import (
 // maxWhyFailedBody bounds the POST body: a pasted log (analyzed from its last MiB) and
 // its JSON escaping.
 const maxWhyFailedBody = 8 << 20
-
-// whyFailedWindowBytes is the transient memory one analysis holds: the 1 MiB tail as
-// read, as text, and redacted (the analysis itself works line by line).
-const whyFailedWindowBytes = 3 << 20
 
 type whyFailedBody struct {
 	Command        string   `json:"command"`
@@ -68,9 +67,6 @@ func registerOutcomeRoutes(mux routeRegistrar, store *evidence.Store) {
 				"error": "this deployment does not run why_failed commands (it is reachable beyond loopback; XMUSTARD_WHY_FAILED_COMMANDS=1 enables them); pass the output as log or evidence_handle"})
 			return
 		}
-		if !reserveWindow(w, r, whyFailedWindowBytes) {
-			return
-		}
 		ws := r.PathValue("workspace_id")
 		result, err := workspaceops.RecordFailureOutcome(r.Context(), dataDir(), ws, workspaceops.FailureRequest{
 			Command: body.Command, Argv: body.Argv, Cwd: body.Cwd, TimeoutSeconds: body.TimeoutSeconds,
@@ -97,6 +93,17 @@ func registerOutcomeRoutes(mux routeRegistrar, store *evidence.Store) {
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"workspace_id": ws, "open": open, "outcomes": list})
 	})
+	mux.HandleFunc("DELETE /api/workspaces/{workspace_id}/outcomes/{outcome_id}", func(w http.ResponseWriter, r *http.Request) {
+		if !requireRole(w, r, "admin") {
+			return
+		}
+		ws, id := r.PathValue("workspace_id"), r.PathValue("outcome_id")
+		if err := workspaceops.DeleteRunOutcome(r.Context(), dataDir(), ws, id); err != nil {
+			respondError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"deleted": true, "id": id})
+	})
 }
 
 // evidenceTail reads an evidence tail authorized as the request's caller.
@@ -105,21 +112,6 @@ func evidenceTail(r *http.Request, store *evidence.Store, ws string) workspaceop
 	return func(ctx context.Context, handle string, maxBytes int64) (*evidence.Tail, error) {
 		return store.Tail(ctx, evidence.ReadRequest{WorkspaceID: ws, Handle: handle, Actor: actor, AuthEnforced: enforced}, maxBytes)
 	}
-}
-
-// reserveWindow admits n transient bytes for the request, answering 503 when the
-// pool cannot hold them.
-func reserveWindow(w http.ResponseWriter, r *http.Request, n int64) bool {
-	scope, owned := budget.ScopeFor(r.Context())
-	if owned {
-		scope.Close() // no request ledger (direct callers/tests): nothing to hold
-		return true
-	}
-	if err := scope.Acquire(n); err != nil {
-		writeOverloaded(w)
-		return false
-	}
-	return true
 }
 
 // recordCaptureOutcome turns a captured test, build or lint result into a run outcome.
@@ -148,14 +140,8 @@ func recordCaptureOutcome(r *http.Request, store *evidence.Store, ws string, ret
 	if res.Handle == "" {
 		c.Text = res.Projection // nothing was retained: analyze what the agent saw
 	}
-	scope, owned := budget.ScopeFor(r.Context())
-	if !owned {
-		if err := scope.Acquire(whyFailedWindowBytes); err != nil {
-			return // under memory pressure the capture answers without recording
-		}
-	} else {
-		scope.Close()
-	}
+	// Under memory pressure (the analysis window is refused) the capture answers without
+	// recording, as for any other failure.
 	if err := workspaceops.RecordCapturedOutcome(r.Context(), dataDir(), ws, c); err != nil {
 		log.Printf("why_failed: capture outcome for workspace %s not recorded: %v", ws, err)
 	}
