@@ -340,6 +340,8 @@ fn references(
                     open.last().map(|o| o.1 as i32).unwrap_or(-1),
                     kind,
                     fl,
+                    // no qualifier: the scope resolver covers only walker languages
+                    -1,
                 ));
             }
         }

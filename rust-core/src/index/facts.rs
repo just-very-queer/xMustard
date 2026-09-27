@@ -90,9 +90,24 @@ impl SymbolFact {
 }
 
 /// One reference occurrence: (name index into `FileFacts::names`, 1-based line,
-/// 0-based byte column, byte offset, containing symbol index or -1, kind, flow).
+/// 0-based byte column, byte offset, containing symbol index or -1, kind, flow,
+/// qualifier name index or -1).
+///
+/// The qualifier is what the scope resolver types the reference through: for a member
+/// reference (`a.b`, `pkg.F`, `ns.T`) the simple object name (`a`, `pkg`, `this`), and
+/// for a binding (`BIND`) the declared or constructed type name (`s *Server`,
+/// `x := &Server{}`, `const w = new Widget()`). Anything more complex has none.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RefFact(pub u32, pub u32, pub u32, pub u32, pub i32, pub u8, pub u8);
+pub struct RefFact(
+    pub u32,
+    pub u32,
+    pub u32,
+    pub u32,
+    pub i32,
+    pub u8,
+    pub u8,
+    pub i32,
+);
 
 impl RefFact {
     pub fn name_idx(&self) -> usize {
@@ -115,6 +130,9 @@ impl RefFact {
     }
     pub fn flow(&self) -> u8 {
         self.6
+    }
+    pub fn qual_idx(&self) -> Option<usize> {
+        (self.7 >= 0).then_some(self.7 as usize)
     }
 }
 
@@ -217,6 +235,7 @@ impl FileFacts {
             w.uv((r.4 + 1) as u64);
             w.0.push(r.5);
             w.0.push(r.6);
+            w.uv((r.7 + 1) as u64);
             line = r.1 as i64;
             byte = r.3 as i64;
         }
@@ -291,7 +310,9 @@ impl FileFacts {
             let sym = r.uv()? as i64 - 1;
             let kind = r.byte()?;
             let flow = r.byte()?;
-            if (name as usize) >= names.len() || line < 0 || byte < 0 {
+            let qual = r.uv()? as i64 - 1;
+            if (name as usize) >= names.len() || line < 0 || byte < 0 || qual >= names.len() as i64
+            {
                 return None;
             }
             refs.push(RefFact(
@@ -302,6 +323,7 @@ impl FileFacts {
                 sym as i32,
                 kind,
                 flow,
+                qual as i32,
             ));
         }
         let mut imports = Vec::new();
@@ -369,7 +391,7 @@ impl FileFacts {
     }
 }
 
-const CODEC_VERSION: u8 = 2;
+const CODEC_VERSION: u8 = 3;
 
 struct Enc(Vec<u8>);
 
@@ -474,7 +496,7 @@ mod tests {
         let f = FileFacts {
             engine: "tree_sitter".into(),
             line_count: 3,
-            names: vec!["foo".into()],
+            names: vec!["foo".into(), "this".into()],
             symbols: vec![SymbolFact {
                 name: "a".into(),
                 qualified_name: "A.a".into(),
@@ -493,7 +515,7 @@ mod tests {
                 local: false,
                 uid_suffix: String::new(),
             }],
-            refs: vec![RefFact(0, 2, 4, 20, 0, ref_kind::CALL, flow::RETURNS)],
+            refs: vec![RefFact(0, 2, 4, 20, 0, ref_kind::CALL, flow::RETURNS, 1)],
             imports: vec![ImportFact {
                 line: 1,
                 kind: "import".into(),
@@ -508,6 +530,7 @@ mod tests {
         let back = FileFacts::decode(&bytes).unwrap();
         assert_eq!(back, f);
         assert_eq!(back.refs[0].symbol(), Some(0));
+        assert_eq!(back.refs[0].qual_idx(), Some(1));
         // truncated or extended input is rejected, never misread
         assert!(FileFacts::decode(&bytes[..bytes.len() - 1]).is_none());
         let mut longer = bytes.clone();
