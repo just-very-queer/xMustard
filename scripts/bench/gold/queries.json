@@ -2,7 +2,19 @@
   "version": 1,
   "description": "Internal 12-query retrieval regression gate for xMustard (Go, Rust, TypeScript). Spans are 1-based inclusive definition lines in scripts/bench/gold/repo. Not a competitor-parity or task-success benchmark.",
   "top_k": 5,
-  "pass_min": 11,
+  "pass_min": 12,
+  "thresholds_note": "WS-18: pass_min/span_min/mrr_min gate the 12 original queries; body_pass_min gates body_queries (terms only a function body holds). Set at the measured value minus the measured noise (0: three runs of three passes agreed exactly); before WS-18 pass_min was 11 and the base measured 12/12, spans 10/10, MRR 0.85-0.95, body 0/6; see docs/benchmarks/2026-09-28-ws18-hybrid-search.md.",
+  "span_min": 10,
+  "mrr_min": 1.0,
+  "body_pass_min": 6,
+  "body_queries": [
+    {"id": "body-debounce", "lang": "typescript", "query": "clearTimeout setTimeout", "gold": {"path": "web/src/debounce.ts", "span": [1, 8]}},
+    {"id": "body-evict", "lang": "rust", "query": "pop_front capacity", "gold": {"path": "src/cache.rs", "span": [10, 16]}},
+    {"id": "body-discount", "lang": "typescript", "query": "Math.floor subtotal percent", "gold": {"path": "web/src/checkout.ts", "span": [5, 10]}},
+    {"id": "body-query-pairs", "lang": "rust", "query": "split_once filter_map", "gold": {"path": "src/parser.rs", "span": [3, 10]}},
+    {"id": "body-health", "lang": "go", "query": "WriteHeader StatusOK", "gold": {"path": "httpapi/handlers.go", "span": [5, 9]}},
+    {"id": "body-retry", "lang": "go", "query": "time.Sleep delay", "gold": {"path": "store/retry.go", "span": [5, 17]}}
+  ],
   "queries": [
     {"id": "go-session", "lang": "go", "kind": "search", "query": "ValidateSession session token", "gold": {"path": "auth/session.go", "span": [14, 20]}},
     {"id": "go-bucket", "lang": "go", "kind": "search", "query": "TokenBucket rate limiter Allow", "gold": {"path": "ratelimit/bucket.go", "span": [5, 19]}},
