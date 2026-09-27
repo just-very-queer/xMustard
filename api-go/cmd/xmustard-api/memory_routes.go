@@ -36,6 +36,9 @@ func registerMemoryRoutes(mux routeRegistrar) {
 		if len(req.Paths) == 0 && q.Get("paths") != "" {
 			req.Paths = strings.Split(q.Get("paths"), ",")
 		}
+		if !requireHumanPresence(w, r, caller, rememberAction(r.PathValue("workspace_id"), req)) {
+			return
+		}
 		result, err := workspaceops.Remember(dataDir(), r.PathValue("workspace_id"), req, caller.actor())
 		respondMemoryWrite(w, r, caller, result, err)
 	})
@@ -76,6 +79,9 @@ func registerMemoryRoutes(mux routeRegistrar) {
 		}
 		if req.Outcome == "" && !req.Approve {
 			req.Outcome = workspaceops.OutcomeReject
+		}
+		if !requireHumanPresence(w, r, caller, verifyAction(r.PathValue("workspace_id"), r.PathValue("entry_id"), req.Outcome, req.Revision)) {
+			return
 		}
 		// The verifier is the AUTHENTICATED principal; a body "agent" is ignored. In
 		// open mode all unauthenticated callers collapse to a single identity, so N

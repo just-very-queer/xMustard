@@ -176,6 +176,9 @@ type ContextActor struct {
 	CallID    string
 	RunID     string
 	Evidence  []string
+	// Approval labels a human approver's write with where it was made and whether an
+	// agent process could have read the token (HumanApprovalLabel); "" otherwise.
+	Approval string
 }
 
 // safeIDPattern rejects anything that could escape the data dir or be a path
