@@ -819,19 +819,26 @@ fn run_changetrack_command(mut args: Args) -> CmdResult {
             }
         }
         "index" => {
-            let usage = "xmustard-core changetrack index <data_dir> <root> <workspace_id> [--reason=registration|first_ground|head_changed|admin]";
+            let usage = "xmustard-core changetrack index <data_dir> <root> <workspace_id> [--reason=registration|first_ground|head_changed|admin] [--stage]";
             let data_dir = need(&mut args, usage)?;
             let root = need(&mut args, usage)?;
             let ws = need(&mut args, usage)?;
-            // an explicit rebaseline unless the caller names the automatic trigger
-            let reason = match args.next() {
-                None => ct::BaselineReason::Admin,
-                Some(flag) => flag
-                    .strip_prefix("--reason=")
-                    .and_then(ct::BaselineReason::parse)
-                    .ok_or_else(|| CmdError::usage(usage))?,
-            };
-            match ct::rebaseline_summary(Path::new(&data_dir), Path::new(&root), &ws, reason) {
+            // an explicit rebaseline unless the caller names the automatic trigger;
+            // --stage leaves it beside the baseline for the caller to record and publish
+            let (mut reason, mut stage) = (ct::BaselineReason::Admin, false);
+            for flag in args {
+                match flag.as_str() {
+                    "--stage" => stage = true,
+                    other => {
+                        reason = other
+                            .strip_prefix("--reason=")
+                            .and_then(ct::BaselineReason::parse)
+                            .ok_or_else(|| CmdError::usage(usage))?
+                    }
+                }
+            }
+            match ct::rebaseline_summary(Path::new(&data_dir), Path::new(&root), &ws, reason, stage)
+            {
                 Ok(summary) => json(&summary),
                 Err(err) => Err(CmdError::failed(format!("changetrack index failed: {err}"))),
             }

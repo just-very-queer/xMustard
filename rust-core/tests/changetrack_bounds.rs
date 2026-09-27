@@ -292,7 +292,205 @@ fn drift_reports_the_baseline_reason() {
         !drift.has_baseline && drift.reasons[0].contains("unreadable"),
         "{drift:?}"
     );
+    assert!(
+        drift
+            .baseline_error
+            .as_deref()
+            .unwrap()
+            .contains("unreadable"),
+        "an unreadable baseline is told apart from a missing one: {drift:?}"
+    );
     for r in BaselineReason::ALL {
         assert_eq!(BaselineReason::parse(r.as_str()), Some(r));
     }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn sig_of<'a>(b: &'a ct::IndexBaseline, name: &str) -> Vec<&'a str> {
+    b.signatures
+        .values()
+        .filter(|s| s.contains(name))
+        .map(String::as_str)
+        .collect()
+}
+
+// An automatic baseline taken while the worktree has uncommitted changes used to take
+// them in, so their contract breaks read as 0 and were never reported. It is now the
+// committed state: each dirty tracked path as HEAD has it (content or absence), read
+// once from HEAD; untracked files are not part of it. An explicit rebaseline still
+// accepts the worktree, and says so.
+#[test]
+fn automatic_baseline_takes_the_committed_state_of_dirty_paths() {
+    let head_lib = "pub fn add(a: u32) -> u32 {\n    a\n}\n";
+    let head_gone = functions(1, 1);
+    let r = repo(&[
+        ("lib.rs", head_lib.to_string()),
+        ("gone.rs", head_gone.clone()),
+        ("other.rs", functions(2, 1)),
+        ("big.bin", "x".repeat(8 << 20) + "y"), // past the hashing cap, in HEAD too
+    ]);
+    let lib = "pub fn add(a: u32, b: u32) -> u32 {\n    a + b\n}\n";
+    write(
+        r.path(),
+        &[
+            ("lib.rs", lib.to_string()),
+            ("new.rs", functions(1, 1)),
+            ("notes.txt", "untracked\n".to_string()),
+            ("big.bin", "z".repeat(8 << 20) + "y"),
+        ],
+    );
+    git(r.path(), &["add", "new.rs"]);
+    fs::remove_file(r.path().join("gone.rs")).unwrap();
+    let data = TempDir::new().unwrap();
+
+    let (b, reads) = reads_during(|| {
+        ct::rebaseline(data.path(), r.path(), "ws", BaselineReason::Registration).unwrap()
+    });
+    assert_eq!(
+        reads, 3,
+        "lib.rs and gone.rs from HEAD, other.rs from the worktree"
+    );
+    assert_eq!(sig_of(&b, "fn add"), ["pub fn add(a: u32) -> u32"]);
+    assert_eq!(
+        b.file_hashes.get("lib.rs"),
+        Some(&sha256_hex(head_lib.as_bytes()))
+    );
+    assert_eq!(
+        b.file_hashes.get("gone.rs"),
+        Some(&sha256_hex(head_gone.as_bytes()))
+    );
+    for absent in ["new.rs", "notes.txt", "big.bin"] {
+        assert!(
+            !b.file_hashes.contains_key(absent),
+            "{absent} is not committed content"
+        );
+    }
+    assert_eq!((b.from_head, b.fingerprint.dirty), (4, false));
+    let summary = ct::BaselineSummary::from(&b);
+    assert!(!summary.dirty && summary.from_head == 4);
+
+    let cs = ct::working_tree_changes(data.path(), r.path(), "ws");
+    assert_eq!(cs.contract_breaks, Some(1), "{cs:?}");
+    let add = cs
+        .dirty_symbols
+        .as_ref()
+        .unwrap()
+        .iter()
+        .find(|s| s.symbol == "add");
+    assert!(add.is_some_and(|s| s.contract_break), "{cs:?}");
+    let drift = ct::detect_drift(data.path(), r.path(), "ws");
+    assert!(
+        drift.content_changed && drift.baseline_dirty == Some(false),
+        "{drift:?}"
+    );
+
+    // HEAD's bytes hash as the worktree's do: undoing the changes leaves no drift
+    git(r.path(), &["rm", "-q", "--cached", "new.rs"]);
+    git(
+        r.path(),
+        &["checkout", "-q", "--", "lib.rs", "gone.rs", "big.bin"],
+    );
+    let drift = ct::detect_drift(data.path(), r.path(), "ws");
+    assert!(!drift.content_changed && !drift.head_changed, "{drift:?}");
+
+    // an explicit rebaseline takes the edit in, and its fingerprint counts it
+    write(r.path(), &[("lib.rs", lib.to_string())]);
+    let b = ct::rebaseline(data.path(), r.path(), "ws", BaselineReason::Admin).unwrap();
+    assert_eq!(sig_of(&b, "fn add"), ["pub fn add(a: u32, b: u32) -> u32"]);
+    assert_eq!((b.from_head, b.fingerprint.dirty_path_count), (0, 1));
+    assert_eq!(
+        ct::detect_drift(data.path(), r.path(), "ws").baseline_dirty,
+        Some(true)
+    );
+    assert_eq!(
+        ct::working_tree_changes(data.path(), r.path(), "ws").contract_breaks,
+        Some(0)
+    );
+}
+
+// Before the first commit nothing is committed: an automatic baseline is empty and
+// every tracked file is uncommitted; an explicit one takes them in.
+#[test]
+fn automatic_baseline_of_an_unborn_branch_is_empty() {
+    let dir = TempDir::new().unwrap();
+    git(dir.path(), &["init", "-q"]);
+    write(dir.path(), &[("a.rs", functions(1, 1))]);
+    git(dir.path(), &["add", "a.rs"]);
+    let data = TempDir::new().unwrap();
+    let b = ct::rebaseline(data.path(), dir.path(), "ws", BaselineReason::FirstGround).unwrap();
+    assert!(b.file_hashes.is_empty() && b.signatures.is_empty() && b.from_head == 1);
+    assert!(b.fingerprint.head_sha.is_none());
+    let b = ct::rebaseline(data.path(), dir.path(), "ws", BaselineReason::Admin).unwrap();
+    assert_eq!((b.file_hashes.len(), b.fingerprint.dirty), (1, true));
+}
+
+// A staged build replaces nothing: the caller records it, then renames it into place.
+// Replacing a baseline that cannot be read says so instead of reporting none replaced.
+#[test]
+fn staged_rebaseline_replaces_nothing_and_names_an_unreadable_predecessor() {
+    let r = repo(&[("a.rs", functions(1, 1))]);
+    let data = TempDir::new().unwrap();
+    let path = data.path().join("workspaces/ws/index_baseline.json");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, b"{torn").unwrap();
+
+    let s = ct::rebaseline_summary(
+        data.path(),
+        r.path(),
+        "ws",
+        BaselineReason::HeadChanged,
+        true,
+    )
+    .unwrap();
+    assert!(s.replaced && s.previous_head.is_none(), "{s:?}");
+    assert!(
+        s.previous_error.as_deref().unwrap().contains("unreadable"),
+        "{s:?}"
+    );
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        b"{torn",
+        "a staged build leaves the baseline"
+    );
+    let staged = ct::staged_baseline_path(data.path(), "ws");
+    let b: ct::IndexBaseline = serde_json::from_slice(&fs::read(&staged).unwrap()).unwrap();
+    assert_eq!(b.reason, BaselineReason::HeadChanged);
+
+    fs::rename(&staged, &path).unwrap();
+    let s =
+        ct::rebaseline_summary(data.path(), r.path(), "ws", BaselineReason::Admin, false).unwrap();
+    assert!(s.replaced && s.previous_error.is_none());
+    assert_eq!(s.previous_head, b.fingerprint.head_sha);
+}
+
+// Changed files the extractor never reads (vendor/, node_modules/, ...) do not use up
+// the symbol-file cap or make the pass partial.
+#[test]
+fn symbol_file_cap_counts_only_files_the_extractor_reads() {
+    let r = repo(&[("a.rs", functions(1, 1))]);
+    let data = TempDir::new().unwrap();
+    ct::build_index_baseline(data.path(), r.path(), "ws").unwrap();
+    fs::create_dir_all(r.path().join("vendor/dep")).unwrap();
+    let vendored: Vec<(String, String)> = (0..3)
+        .map(|i| (format!("vendor/dep/v{i}.rs"), functions(1, 1)))
+        .collect();
+    let refs: Vec<(&str, String)> = vendored
+        .iter()
+        .map(|(p, b)| (p.as_str(), b.clone()))
+        .collect();
+    write(r.path(), &refs);
+    write(r.path(), &[("a.rs", functions(1, 2))]);
+    commit(r.path());
+    let bounds = ChangeBounds {
+        symbol_files: 1,
+        ..ChangeBounds::DEFAULT
+    };
+    let cs = ct::changed_since_baseline_bounded(data.path(), r.path(), "ws", bounds);
+    assert_eq!(cs.changed_files_total, Some(4));
+    assert_eq!(cs.contract_breaks, Some(1), "{cs:?}");
+    assert!(cs.truncation.is_none() && cs.unknown.is_empty(), "{cs:?}");
 }

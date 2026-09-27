@@ -169,18 +169,42 @@ pub fn run_git_bounded(
     max_bytes: usize,
     timeout: Duration,
 ) -> Result<Vec<u8>, GitRunError> {
+    run_git_bounded_input(root, args, Vec::new(), max_bytes, timeout)
+}
+
+/// `run_git_bounded` with `input` written to the command's stdin (a `cat-file --batch`
+/// request); empty input leaves stdin closed.
+pub fn run_git_bounded_input(
+    root: &Path,
+    args: &[&str],
+    input: Vec<u8>,
+    max_bytes: usize,
+    timeout: Duration,
+) -> Result<Vec<u8>, GitRunError> {
     use std::io::Read;
     use std::process::Stdio;
+    let stdin = if input.is_empty() {
+        Stdio::null()
+    } else {
+        Stdio::piped()
+    };
     let mut child = Command::new("git")
         .arg("--no-optional-locks")
         .arg("-C")
         .arg(root)
         .args(args)
-        .stdin(Stdio::null())
+        .stdin(stdin)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
         .map_err(|e| GitRunError::Spawn(e.to_string()))?;
+    if let Some(mut w) = child.stdin.take() {
+        // a writer of its own, so a large request cannot deadlock against the reader;
+        // a child that dies or is killed ends the write with an error, ignored here.
+        std::thread::spawn(move || {
+            let _ = w.write_all(&input);
+        });
+    }
     let mut stdout = child.stdout.take().expect("stdout is piped");
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -1073,7 +1097,12 @@ mod tests {
         assert_eq!(repo_key_identity(r.path()).key, listed.key);
         let json = serde_json::to_value(&listed).unwrap();
         assert!(json["ignored_dirs"].is_array());
-        assert!(serde_json::to_value(&plain).unwrap().get("ignored_dirs").is_none());
+        assert!(
+            serde_json::to_value(&plain)
+                .unwrap()
+                .get("ignored_dirs")
+                .is_none()
+        );
     }
 
     #[test]
