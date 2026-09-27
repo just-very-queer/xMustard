@@ -59,7 +59,7 @@ the BM25 cache is the difference.
 | pi-mono (1,929 files) | +6.2 MiB | +9.3 MiB | **+3.1 MiB** (steady = peak) | 1,119 |
 
 Both are under the ledger's `code_bm25` component (5 MiB steady, 8 MiB peak) and the
-WS-18 line (5 MiB on `rust_index_service`). The test asserts the 8 MiB peak.
+WS-18 line (5 MiB on `rust_index_service`). The test asserts both: steady ≤ 5 MiB and peak ≤ 8 MiB.
 
 ## One-shot search and the index writer (Linux, `/usr/bin/time -v`, release)
 
