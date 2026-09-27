@@ -8,6 +8,11 @@
 //! insertion), so FTS5's positions carry no source order and `fts5vocab` cannot rebuild
 //! the text; `symbol` also leaves credential-shaped words out, and `none` posts only
 //! code identifiers.
+//!
+//! Tracked docs and guidance (`docs`, `doc_chunks`, `doc_fts`, WS-18) are indexed apart
+//! from code: they have no symbols, references or edges, and their chunks are heading
+//! sections. The same retention rule applies to their postings, and `none` indexes no
+//! prose at all.
 
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
@@ -15,7 +20,7 @@ use sha2::{Digest, Sha256};
 use super::config::ContentRetention;
 
 /// Bump on any table or column change. Part of the schema fingerprint.
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// Table definitions. Secondary indexes are in `INDEX_DDL` so a full build can create
 /// them after the bulk insert.
@@ -141,6 +146,33 @@ CREATE TABLE resolve_drops(
   PRIMARY KEY(file_id, name_id, cause)
 ) WITHOUT ROWID;
 
+CREATE TABLE docs(
+  id INTEGER PRIMARY KEY,
+  path TEXT NOT NULL UNIQUE,
+  role TEXT NOT NULL,
+  stat_key TEXT NOT NULL,
+  content_hash TEXT NOT NULL,
+  status TEXT NOT NULL,
+  line_count INTEGER NOT NULL
+);
+
+CREATE TABLE doc_chunks(
+  id INTEGER PRIMARY KEY,
+  doc_id INTEGER NOT NULL,
+  ord INTEGER NOT NULL,
+  start_line INTEGER NOT NULL,
+  end_line INTEGER NOT NULL,
+  start_byte INTEGER NOT NULL,
+  end_byte INTEGER NOT NULL,
+  content_hash TEXT NOT NULL
+);
+
+CREATE VIRTUAL TABLE doc_fts USING fts5(
+  path, heading, body,
+  content='', contentless_delete=1, detail=full,
+  tokenize='unicode61 remove_diacritics 0'
+);
+
 CREATE TABLE fact_cache(
   content_key TEXT PRIMARY KEY,
   facts BLOB NOT NULL,
@@ -161,6 +193,7 @@ CREATE INDEX IF NOT EXISTS edges_dst ON edges(dst_file);
 CREATE INDEX IF NOT EXISTS edges_dst_symbol ON edges(dst_symbol);
 CREATE INDEX IF NOT EXISTS resolve_drops_name ON resolve_drops(name_id);
 CREATE INDEX IF NOT EXISTS fact_cache_used ON fact_cache(last_used);
+CREATE INDEX IF NOT EXISTS doc_chunks_doc ON doc_chunks(doc_id);
 "#;
 
 /// The schema fingerprint: schema version, both DDL strings and the content retention
@@ -222,10 +255,12 @@ pub fn configure_durable(conn: &Connection) -> rusqlite::Result<()> {
 pub fn create(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(TABLE_DDL)?;
     // persisted in the FTS5 config table, so incremental updates use it too.
-    conn.execute(
-        "INSERT INTO chunk_fts(chunk_fts, rank) VALUES('hashsize', ?1)",
-        [FTS_HASHSIZE],
-    )?;
+    for table in ["chunk_fts", "doc_fts"] {
+        conn.execute(
+            &format!("INSERT INTO {table}({table}, rank) VALUES('hashsize', ?1)"),
+            [FTS_HASHSIZE],
+        )?;
+    }
     Ok(())
 }
 

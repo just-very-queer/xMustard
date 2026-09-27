@@ -626,25 +626,44 @@ fn identity_flag(args: Args) -> (Option<String>, Args) {
 }
 
 fn search(args: Args) -> CmdResult {
-    let usage =
-        "xmustard-core search [--identity-key=K] <root> <workspace_id> <query> [limit] [seed]";
+    let usage = "xmustard-core search [--identity-key=K] <root> <workspace_id> <query> [limit] \
+                 [seed] [--offset=N] [--path-glob=GLOB]";
     let (key, mut args) = identity_flag(args);
     let root = need(&mut args, usage)?;
     let ws = need(&mut args, usage)?;
     let query = need(&mut args, usage)?;
-    let limit = args
+    // after the query: `--name=value` flags anywhere, positionals (limit, then an
+    // optional seed symbol for the graph-proximity lane) in order.
+    let (mut offset, mut path_glob) = (0usize, None::<String>);
+    let mut positional: Vec<String> = Vec::new();
+    for a in args {
+        match (a.strip_prefix("--offset="), a.strip_prefix("--path-glob=")) {
+            (Some(n), _) => {
+                offset = n
+                    .parse()
+                    .map_err(|_| CmdError::new(2, format!("search: bad --offset {n}\n{usage}")))?
+            }
+            (_, Some(g)) => path_glob = Some(g.to_string()),
+            _ => positional.push(a),
+        }
+    }
+    let mut positional = positional.into_iter();
+    let limit = positional
         .next()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(25);
-    // optional 5th positional: a seed symbol for the graph-proximity lane.
-    let seed = args.next().filter(|s| !s.trim().is_empty());
-    json(&xmustard_core::search::hybrid_search_for(
+    let seed = positional.next().filter(|s| !s.trim().is_empty());
+    json(&xmustard_core::search::search(
         &PathBuf::from(root),
         &ws,
         key.as_deref(),
         &query,
-        limit,
-        seed.as_deref(),
+        &xmustard_core::search::SearchOptions {
+            limit,
+            offset,
+            seed: seed.as_deref(),
+            path_glob: path_glob.as_deref(),
+        },
     ))
 }
 

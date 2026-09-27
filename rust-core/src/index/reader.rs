@@ -182,6 +182,10 @@ pub struct Snapshot {
     files: Files,
     root: PathBuf,
     clusters: OnceLock<Result<Communities, String>>,
+    /// The store this generation was read from.
+    db: PathBuf,
+    /// The text lanes' read-only connection (`fts`), opened on first use.
+    text: Mutex<Option<Connection>>,
 }
 
 impl Snapshot {
@@ -202,6 +206,8 @@ impl Snapshot {
                 root: root.to_path_buf(),
                 seg,
                 clusters: OnceLock::new(),
+                db: loc.db.clone(),
+                text: Mutex::new(None),
             },
             Arc::new(m),
         ))
@@ -209,6 +215,22 @@ impl Snapshot {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Run `f` on this snapshot's text connection (the BM25 lanes and chunk rows of
+    /// `index.db`), opened read-only on first use and kept with the snapshot: its page
+    /// cache (`fts::TEXT_CACHE_KIB`, no mmap) is the resident BM25 cache, and it goes
+    /// when a newer generation replaces the snapshot. Readers of one snapshot take turns.
+    pub fn with_text<R>(
+        &self,
+        f: impl FnOnce(&Connection) -> rusqlite::Result<R>,
+    ) -> Result<R, String> {
+        let mut text = lock(&self.text);
+        if text.is_none() {
+            *text = Some(super::fts::open(&self.db).map_err(sql)?);
+        }
+        let conn = text.as_ref().ok_or("index text connection unavailable")?;
+        f(conn).map_err(sql)
     }
 
     /// Files declaring `symbol` (non-local declarations), in path order.

@@ -169,6 +169,98 @@ fn push_gap(
     }
 }
 
+/// Longest doc chunk (WS-18); a longer heading section is split into windows.
+pub const MAX_DOC_CHUNK_LINES: u32 = 40;
+
+/// One chunk of a doc or guidance file: a heading section, or a window of a long one,
+/// with blank lines trimmed at both ends. Byte offsets index the file's raw bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocChunk {
+    pub start_line: u32,
+    pub end_line: u32,
+    pub start_byte: u32,
+    pub end_byte: u32,
+    /// Line of the heading that opens the chunk's section, if any.
+    pub heading: Option<u32>,
+    pub content_hash: String,
+}
+
+/// Whether `line` is a Markdown ATX heading: up to three spaces, one to six `#`, then a
+/// space or the end of the line.
+fn is_atx_heading(line: &[u8]) -> bool {
+    let indent = line.iter().take_while(|c| **c == b' ').count();
+    if indent > 3 {
+        return false;
+    }
+    let rest = &line[indent..];
+    let hashes = rest.iter().take_while(|c| **c == b'#').count();
+    (1..=6).contains(&hashes)
+        && rest
+            .get(hashes)
+            .is_none_or(|c| matches!(c, b' ' | b'\t' | b'\r' | b'\n'))
+}
+
+/// Whether `line` opens or closes a fenced code block.
+fn is_fence(line: &[u8]) -> bool {
+    let t = line.trim_ascii_start();
+    t.starts_with(b"```") || t.starts_with(b"~~~")
+}
+
+/// Plan the chunks of one doc: sections start at Markdown headings outside fenced code
+/// (`markdown`), and every section is cut into windows of at most MAX_DOC_CHUNK_LINES.
+pub fn plan_doc_chunks(bytes: &[u8], starts: &[u32], markdown: bool) -> Vec<DocChunk> {
+    let n = line_count(starts);
+    if n == 0 {
+        return Vec::new();
+    }
+    let text = |l: u32| &bytes[starts[(l - 1) as usize] as usize..starts[l as usize] as usize];
+    // (first line, heading line) of every section
+    let mut sections: Vec<(u32, Option<u32>)> = vec![(1, None)];
+    let mut fenced = false;
+    for l in 1..=n {
+        let line = text(l);
+        if markdown && is_fence(line) {
+            fenced = !fenced;
+        } else if markdown && !fenced && is_atx_heading(line) {
+            match l {
+                1 => sections[0].1 = Some(1),
+                _ => sections.push((l, Some(l))),
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for (i, &(a, heading)) in sections.iter().enumerate() {
+        let b = sections.get(i + 1).map_or(n, |next| next.0 - 1);
+        let (mut a, mut b) = (a, b);
+        while a <= b && is_blank(bytes, starts, a) {
+            a += 1;
+        }
+        while b >= a && is_blank(bytes, starts, b) {
+            b -= 1;
+        }
+        let mut s = a;
+        while s <= b {
+            let e = (s + MAX_DOC_CHUNK_LINES - 1).min(b);
+            let (sb, eb) = (starts[(s - 1) as usize], starts[e as usize]);
+            out.push(DocChunk {
+                start_line: s,
+                end_line: e,
+                start_byte: sb,
+                end_byte: eb,
+                heading,
+                content_hash: hash16(&bytes[sb as usize..eb as usize]),
+            });
+            s = e + 1;
+        }
+    }
+    out
+}
+
+/// The content hash a chunk row stores for its bytes (a snippet read compares it).
+pub fn chunk_hash(bytes: &[u8]) -> String {
+    hash16(bytes)
+}
+
 /// Split an identifier into camelCase / snake_case / digit-boundary subtokens.
 pub fn subtokens(word: &str) -> Vec<String> {
     let mut out = Vec::new();
@@ -417,6 +509,36 @@ mod tests {
             &src[chunks[1].start_byte as usize..chunks[1].end_byte as usize],
             "fn one() {\n  1\n}\n"
         );
+    }
+
+    #[test]
+    fn doc_chunks_follow_headings_outside_fences() {
+        let src = "# Title\nintro\n\n## Retry\nbackoff doubles\n```\n# not a heading\n```\n\n## Other\ntext\n";
+        let starts = line_starts(src.as_bytes());
+        let chunks = plan_doc_chunks(src.as_bytes(), &starts, true);
+        let spans: Vec<(u32, u32, Option<u32>)> = chunks
+            .iter()
+            .map(|c| (c.start_line, c.end_line, c.heading))
+            .collect();
+        assert_eq!(
+            spans,
+            vec![(1, 2, Some(1)), (4, 8, Some(4)), (10, 11, Some(10))]
+        );
+        assert_eq!(
+            &src[chunks[1].start_byte as usize..chunks[1].end_byte as usize],
+            "## Retry\nbackoff doubles\n```\n# not a heading\n```\n"
+        );
+        // plain text has no headings: one window per MAX_DOC_CHUNK_LINES lines
+        let long: String = (0..90).map(|i| format!("line {i}\n")).collect();
+        let starts = line_starts(long.as_bytes());
+        let spans: Vec<(u32, u32)> = plan_doc_chunks(long.as_bytes(), &starts, false)
+            .iter()
+            .map(|c| (c.start_line, c.end_line))
+            .collect();
+        assert_eq!(spans, vec![(1, 40), (41, 80), (81, 90)]);
+        assert!(is_atx_heading(b"### x"));
+        assert!(!is_atx_heading(b"#hashtag"));
+        assert!(!is_atx_heading(b"    # indented code"));
     }
 
     #[test]
