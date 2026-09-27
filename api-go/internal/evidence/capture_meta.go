@@ -70,6 +70,9 @@ type ObservationResult struct {
 	// TargetBytes is the projection target this capture used: the policy's, or the
 	// caller's lower Target.
 	TargetBytes int `json:"target_bytes"`
+	// Command is the shell command line the output came from (the body's tool input,
+	// else the caller's), for callers that act on it; it is not part of the reply.
+	Command string `json:"-"`
 }
 
 // Observe captures one tool output.
@@ -166,7 +169,8 @@ func (s *Store) Observe(ctx context.Context, reg *Registry, in ObservationInput)
 	if err != nil {
 		return nil, err
 	}
-	res := &ObservationResult{Delivery: d, Capture: meta, Family: hook.reducer.Family(), Policy: pol, TokenEstimator: TokenEstimator, TargetBytes: target}
+	res := &ObservationResult{Delivery: d, Capture: meta, Family: hook.reducer.Family(), Policy: pol, TokenEstimator: TokenEstimator,
+		TargetBytes: target, Command: sel.Command}
 	proj := hook.out
 	if proj == nil {
 		proj = &Projection{Text: d.Projection, Parts: map[string]string{}}

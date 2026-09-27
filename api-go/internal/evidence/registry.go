@@ -449,6 +449,15 @@ var (
 )
 
 // argvFamily classifies one simple command by argv0 and subcommand.
+// CommandFamily classifies one exact argv as it will be executed: no shell parsing
+// and no wrapper stripping, so `sudo go test` or `env X=1 go test` is shell, not test.
+func CommandFamily(argv []string) Family {
+	if len(argv) == 0 {
+		return FamilyShell
+	}
+	return argvFamily(argv)
+}
+
 func argvFamily(argv []string) Family {
 	a0 := strings.ToLower(path.Base(argv[0]))
 	sub := ""
