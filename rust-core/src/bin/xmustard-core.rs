@@ -811,15 +811,28 @@ fn run_changetrack_command(mut args: Args) -> CmdResult {
     match sub.as_str() {
         "fingerprint" => {
             let root = need(&mut args, "xmustard-core changetrack fingerprint <root>")?;
-            json(&ct::compute_fingerprint(Path::new(&root)))
+            match ct::compute_fingerprint(Path::new(&root)) {
+                Ok(fingerprint) => json(&fingerprint),
+                Err(err) => Err(CmdError::failed(format!(
+                    "changetrack fingerprint failed: {err}"
+                ))),
+            }
         }
         "index" => {
-            let usage = "xmustard-core changetrack index <data_dir> <root> <workspace_id>";
+            let usage = "xmustard-core changetrack index <data_dir> <root> <workspace_id> [--reason=registration|first_ground|head_changed|admin]";
             let data_dir = need(&mut args, usage)?;
             let root = need(&mut args, usage)?;
             let ws = need(&mut args, usage)?;
-            match ct::build_index_baseline(Path::new(&data_dir), Path::new(&root), &ws) {
-                Ok(baseline) => json(&baseline),
+            // an explicit rebaseline unless the caller names the automatic trigger
+            let reason = match args.next() {
+                None => ct::BaselineReason::Admin,
+                Some(flag) => flag
+                    .strip_prefix("--reason=")
+                    .and_then(ct::BaselineReason::parse)
+                    .ok_or_else(|| CmdError::usage(usage))?,
+            };
+            match ct::rebaseline_summary(Path::new(&data_dir), Path::new(&root), &ws, reason) {
+                Ok(summary) => json(&summary),
                 Err(err) => Err(CmdError::failed(format!("changetrack index failed: {err}"))),
             }
         }
