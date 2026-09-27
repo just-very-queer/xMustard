@@ -258,9 +258,10 @@ pub fn coverage(conn: &Connection, cfg: &IndexConfig) -> rusqlite::Result<Covera
 
 /// SHA-256 over the index content in a rowid-independent order: files by path, symbols
 /// by UID, references, imports, chunks, chunk text, edges (by paths), docs and their
-/// chunks, the FTS5 term statistics of both tables, and the stable meta keys. Two indexes of the same tree built by any
-/// sequence of full builds and incremental updates have the same digest. Timestamps,
-/// mtimes, counters and the fact cache are excluded.
+/// chunks, the FTS5 term statistics of both tables, and the stable meta keys. Two
+/// indexes of the same tree built by any sequence of full builds and incremental
+/// updates have the same digest. Timestamps, mtimes, counters and the fact cache are
+/// excluded.
 pub fn content_digest(conn: &Connection) -> rusqlite::Result<String> {
     let mut h = Sha256::new();
     let feed = |sql: &str, h: &mut Sha256| -> rusqlite::Result<()> {

@@ -25,11 +25,13 @@
 //! membership alone is worth nearly a lane's head (1/61 at rank 1, 1/70 at rank 10), so
 //! lanes are weighted (`Lane::weight`): the evidence lanes (bm25, name, docs) count
 //! fully, the fuzzy lane half and only above its similarity gate, and the prior lanes
-//! (structural, proximity) re-rank rather than outvote the evidence. The top RERANK_K fused candidates
-//! then gain RERANK_WEIGHT times their rerank score (`index::rerank`: declaration
-//! identifier match, window coverage and order, dense and symbol-like lines) and are
-//! reordered; the rest keep their fused order. Every ordering breaks ties by path,
-//! line, kind and name, so the same inputs render the same bytes.
+//! (structural, proximity) re-rank rather than outvote the evidence.
+//!
+//! Rerank: the top RERANK_K fused candidates gain RERANK_WEIGHT times their rerank
+//! score (`index::rerank`: declaration identifier match, window coverage and order,
+//! dense and symbol-like lines) and are reordered; the rest keep their fused order.
+//! Every ordering breaks ties by path, line, kind and name, so the same inputs render
+//! the same bytes.
 //!
 //! Pages: `offset` skips that many hits of the final order; `omitted` counts the ranked
 //! hits after the page. The API turns them into a bounded cursor.

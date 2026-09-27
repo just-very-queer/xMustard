@@ -24,6 +24,10 @@ const searchWindow = 200
 // maxSearchCursorLen bounds a cursor before it is decoded.
 const maxSearchCursorLen = 64
 
+// maxSearchPathGlobLen bounds path_glob (the MCP argument's maxLength): the core
+// matches it against every candidate path.
+const maxSearchPathGlobLen = 256
+
 // SearchRequest is one hybrid search call.
 type SearchRequest struct {
 	Query string
@@ -88,6 +92,9 @@ func WorkspaceSearchCtx(ctx context.Context, dataDir, workspaceID, query string,
 
 // workspaceSearch runs one page of the core search and adds its cursor.
 func workspaceSearch(ctx context.Context, dataDir, workspaceID string, req SearchRequest) (json.RawMessage, error) {
+	if len(req.PathGlob) > maxSearchPathGlobLen {
+		return nil, fmt.Errorf("path_glob is longer than %d bytes: %w", maxSearchPathGlobLen, ErrInvalidInput)
+	}
 	fp := req.fingerprint()
 	offset, err := decodeSearchCursor(req.Cursor, fp)
 	if err != nil {

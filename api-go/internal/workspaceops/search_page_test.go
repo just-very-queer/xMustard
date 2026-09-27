@@ -90,6 +90,7 @@ func TestSearchPagesCarryABoundCursor(t *testing.T) {
 		"recall cursor": {Query: "retry", PathGlob: "**/*.go", Cursor: recall},
 		"garbage":       {Query: "retry", PathGlob: "**/*.go", Cursor: "not-a-cursor"},
 		"over-long":     {Query: "retry", PathGlob: "**/*.go", Cursor: strings.Repeat("A", maxSearchCursorLen+1)},
+		"long glob":     {Query: "retry", PathGlob: strings.Repeat("*", maxSearchPathGlobLen+1)},
 	} {
 		if _, err := WorkspaceSearchPage(ctx, dir, ws, req); !IsInvalidInput(err) {
 			t.Errorf("%s: want invalid input, got %v", name, err)
@@ -110,7 +111,7 @@ func TestSearchCursorStopsAtTheEndAndTheWindow(t *testing.T) {
 	}
 	for _, c := range []struct {
 		offset, total, hits int
-		want               bool
+		want                bool
 	}{
 		{0, 10, 3, true},
 		{7, 10, 3, false},

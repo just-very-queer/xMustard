@@ -1,0 +1,42 @@
+BUILD cline base peak_kib=22628 wall=0:11.68 db_bytes=95088640 docs=null
+BUILD cline head peak_kib=22928 wall=0:11.68 db_bytes=96579584 docs={"beyond": 0, "bytes_read": 1699794, "deleted": 0, "scanned": 278, "unchanged": 0, "written": 278}
+ONESHOT cline lanes=off q='retry with exponential backoff' peak_kib=10448 wall=0:00.20 hits=25 0 358 ['bm25, docs, uid and snippets are off (XMUSTARD_SEARCH_TEXT_LANES=off)']
+ONESHOT cline lanes=off q='parse json response body' peak_kib=10672 wall=0:00.21 hits=25 0 920 ['bm25, docs, uid and snippets are off (XMUSTARD_SEARCH_TEXT_LANES=off)']
+ONESHOT cline lanes=off q='cache invalidation' peak_kib=10436 wall=0:00.21 hits=25 0 657 ['bm25, docs, uid and snippets are off (XMUSTARD_SEARCH_TEXT_LANES=off)']
+ONESHOT cline lanes=off q='readFile' peak_kib=10680 wall=0:00.21 hits=25 0 2089 ['bm25, docs, uid and snippets are off (XMUSTARD_SEARCH_TEXT_LANES=off)']
+ONESHOT cline lanes=off q='workspace folder path' peak_kib=10940 wall=0:00.21 hits=25 0 2142 ['bm25, docs, uid and snippets are off (XMUSTARD_SEARCH_TEXT_LANES=off)']
+ONESHOT cline lanes=on q='retry with exponential backoff' peak_kib=13320 wall=0:00.22 hits=25 20 454 None
+ONESHOT cline lanes=on q='parse json response body' peak_kib=13420 wall=0:00.22 hits=25 9 1015 None
+ONESHOT cline lanes=on q='cache invalidation' peak_kib=13296 wall=0:00.21 hits=25 20 749 None
+ONESHOT cline lanes=on q='readFile' peak_kib=13740 wall=0:00.21 hits=25 16 2185 None
+ONESHOT cline lanes=on q='workspace folder path' peak_kib=13680 wall=0:00.23 hits=25 6 2248 None
+ONESHOT-BASE cline q='retry with exponential backoff' peak_kib=10932 wall=0:00.38
+ONESHOT-BASE cline q='parse json response body' peak_kib=10484 wall=0:00.38
+ONESHOT-BASE cline q='cache invalidation' peak_kib=10852 wall=0:00.38
+ONESHOT-BASE cline q='readFile' peak_kib=11344 wall=0:00.39
+ONESHOT-BASE cline q='workspace folder path' peak_kib=10760 wall=0:00.39
+BUILD pi-mono base peak_kib=19384 wall=0:11.79 db_bytes=86552576 docs=null
+BUILD pi-mono head peak_kib=19132 wall=0:11.82 db_bytes=89325568 docs={"beyond": 0, "bytes_read": 3737774, "deleted": 0, "scanned": 166, "unchanged": 0, "written": 166}
+ONESHOT pi-mono lanes=off q='retry with exponential backoff' peak_kib=10368 wall=0:00.17 hits=25 0 652 ['bm25, docs, uid and snippets are off (XMUSTARD_SEARCH_TEXT_LANES=off)']
+ONESHOT pi-mono lanes=off q='parse json response body' peak_kib=10576 wall=0:00.16 hits=25 0 932 ['bm25, docs, uid and snippets are off (XMUSTARD_SEARCH_TEXT_LANES=off)']
+ONESHOT pi-mono lanes=off q='cache invalidation' peak_kib=10420 wall=0:00.16 hits=25 0 1045 ['bm25, docs, uid and snippets are off (XMUSTARD_SEARCH_TEXT_LANES=off)']
+ONESHOT pi-mono lanes=off q='readFile' peak_kib=10632 wall=0:00.17 hits=25 0 1010 ['bm25, docs, uid and snippets are off (XMUSTARD_SEARCH_TEXT_LANES=off)']
+ONESHOT pi-mono lanes=off q='workspace folder path' peak_kib=10320 wall=0:00.17 hits=25 0 939 ['bm25, docs, uid and snippets are off (XMUSTARD_SEARCH_TEXT_LANES=off)']
+ONESHOT pi-mono lanes=on q='retry with exponential backoff' peak_kib=13096 wall=0:00.18 hits=25 15 757 None
+ONESHOT pi-mono lanes=on q='parse json response body' peak_kib=12880 wall=0:00.18 hits=25 17 1021 None
+ONESHOT pi-mono lanes=on q='cache invalidation' peak_kib=13096 wall=0:00.18 hits=25 21 1125 None
+ONESHOT pi-mono lanes=on q='readFile' peak_kib=13188 wall=0:00.18 hits=25 22 1113 None
+ONESHOT pi-mono lanes=on q='workspace folder path' peak_kib=12896 wall=0:00.18 hits=25 11 1055 None
+ONESHOT-BASE pi-mono q='retry with exponential backoff' peak_kib=12280 wall=0:00.45
+ONESHOT-BASE pi-mono q='parse json response body' peak_kib=11964 wall=0:00.45
+ONESHOT-BASE pi-mono q='cache invalidation' peak_kib=11628 wall=0:00.45
+ONESHOT-BASE pi-mono q='readFile' peak_kib=12184 wall=0:00.44
+ONESHOT-BASE pi-mono q='workspace folder path' peak_kib=11900 wall=0:00.45
+cline: text lanes off: start 6.0 MiB, steady +8.2, peak +8.2 over 40 queries x3 (0 bm25 hits)
+cline: text lanes on: start 6.1 MiB, steady +10.8, peak +10.8 over 40 queries x3 (1368 bm25 hits)
+cline: BM25 cache: steady +2.6 MiB, peak +2.6 MiB
+pi-mono: text lanes off: start 6.1 MiB, steady +6.2, peak +6.2 over 40 queries x3 (0 bm25 hits)
+pi-mono: text lanes on: start 6.1 MiB, steady +9.3, peak +9.3 over 40 queries x3 (1119 bm25 hits)
+pi-mono: BM25 cache: steady +3.1 MiB, peak +3.1 MiB
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 113.87s
+remote_exit=0
