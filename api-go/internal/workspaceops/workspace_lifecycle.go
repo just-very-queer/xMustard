@@ -113,7 +113,19 @@ func ListWorkspaces(dataDir string) ([]workspaceRecord, error) {
 	return items, nil
 }
 
+// LoadWorkspace registers (or re-registers) request.RootPath and returns its snapshot.
+// A loaded workspace also gets its index baseline, the registration trigger of the
+// automatic baseline (PAR-FRESH-06): built when missing, rebuilt when HEAD moved on a
+// clean worktree. That step is best effort; the first ground retries it.
 func LoadWorkspace(dataDir string, request WorkspaceLoadRequest) (*workspaceSnapshot, error) {
+	snapshot, err := loadWorkspace(dataDir, request)
+	if err == nil {
+		ensureLoadBaseline(dataDir, snapshot.Workspace.WorkspaceID)
+	}
+	return snapshot, err
+}
+
+func loadWorkspace(dataDir string, request WorkspaceLoadRequest) (*workspaceSnapshot, error) {
 	rootPath, err := filepath.Abs(strings.TrimSpace(request.RootPath))
 	if err != nil {
 		return nil, err

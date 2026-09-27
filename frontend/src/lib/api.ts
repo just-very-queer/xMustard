@@ -870,13 +870,30 @@ export function readGoalContext(workspaceId: string, goalId: string) {
 
 export type ChangedFile = { path: string; change: string }
 export type DirtySymbol = { path: string; symbol: string; kind: string; change: string }
+// A count the core could not determine is null and named in `unknown`; a capped pass
+// says so in `truncation` (WS-22).
 export type ChangeSet = {
   workspace_id: string
   since: string
-  changed_files: ChangedFile[]
-  dirty_symbols: DirtySymbol[]
+  has_baseline?: boolean
+  changed_files: ChangedFile[] | null
+  changed_files_total?: number | null
+  dirty_symbols: DirtySymbol[] | null
+  dirty_symbols_total?: number | null
+  contract_breaks?: number | null
+  truncation?: {
+    reason: string
+    files_listed: number
+    files_total: number
+    symbol_files_read: number
+    symbol_files_total: number
+    symbols_listed: number
+    symbols_total: number
+  }
+  unknown?: { field: string; reason: string }[]
   generated_at: string
 }
+export type BaselineReason = 'registration' | 'first_ground' | 'head_changed' | 'admin'
 export type DriftReport = {
   workspace_id: string
   has_baseline: boolean
@@ -884,9 +901,13 @@ export type DriftReport = {
   head_changed: boolean
   content_changed: boolean
   sibling_clone: boolean
+  dirty?: boolean
   reasons: string[]
   current_head?: string | null
   baseline_head?: string | null
+  baseline_indexed_at?: string | null
+  baseline_reason?: BaselineReason | null
+  error?: string
 }
 export type Hotspot = { path: string; inbound_weight: number; dependent_count: number }
 export type BlastRadius = {
@@ -911,6 +932,8 @@ export type CockpitDashboard = {
 // which and why (never reported as 0).
 export type SessionGrounding = {
   workspace_id: string
+  // the index baseline ground compared against; null (and in `unknown`) when there is none
+  baseline?: { head: string | null; indexed_at: string; auto: boolean; reason: BaselineReason; held?: string } | null
   changed_files: number | null
   dirty_symbols: number | null
   recent_failed_runs: string[] | null

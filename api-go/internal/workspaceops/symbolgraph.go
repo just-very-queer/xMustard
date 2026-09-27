@@ -103,14 +103,15 @@ type FileCluster struct {
 	Size      int      `json:"size"`
 }
 
-// WorkspaceClusters returns the file communities (label-propagation clusters) for
-// the workspace's symbol graph.
-func WorkspaceClusters(dataDir, workspaceID string) ([]FileCluster, error) {
-	root, _, err := resolveChangeRoot(dataDir, workspaceID)
+// WorkspaceClustersCtx returns the file communities (label-propagation clusters) for
+// the workspace's symbol graph. Cancelling ctx cancels the clustering (see
+// rustcore.runCoreCtx).
+func WorkspaceClustersCtx(ctx context.Context, dataDir, workspaceID string) ([]FileCluster, error) {
+	root, _, err := resolveChangeRootCtx(ctx, dataDir, workspaceID)
 	if err != nil {
 		return nil, err
 	}
-	out, err := rustcore.RunSymbolgraph(context.Background(), "clusters", root, workspaceID)
+	out, err := rustcore.RunSymbolgraph(ctx, "clusters", root, workspaceID)
 	if err != nil {
 		return nil, err
 	}
