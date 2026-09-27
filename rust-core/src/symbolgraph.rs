@@ -232,7 +232,7 @@ fn git_unavailable_coverage(why: &str) -> IndexCoverage {
 /// repo_role is the SINGLE canonical classification of a tracked file, so code /
 /// tests / docs / guidance / config are decided in ONE place instead of the five
 /// divergent per-subsystem extension lists the review flagged (XM-PRO-012). "code"
-/// and "test" feed the symbol graph; "doc" and "guide" feed the docs search segment;
+/// and "test" feed the symbol graph; "doc" and "guide" feed the index's docs lane;
 /// "config"/"other" are listed but not deeply indexed.
 pub fn repo_role(path: &str) -> &'static str {
     let lower = path.to_lowercase();
@@ -274,25 +274,6 @@ pub fn repo_role(path: &str) -> &'static str {
         Some("toml" | "json" | "yaml" | "yml" | "ini" | "cfg" | "conf") => "config",
         _ => "other",
     }
-}
-
-/// tracked_doc_files lists the repo's git-tracked doc + guidance files — the docs
-/// search segment, so the single `search` tool can return hits from prose the symbol
-/// graph (code-only) never sees (XM-PRO-012). Empty when git is unavailable.
-/// Uses the bounded `ls-files -z` runner, so unusual names are not split or quoted.
-pub fn tracked_doc_files(root: &Path) -> Vec<String> {
-    let Ok(out) = crate::indexcache::run_git_bounded(
-        root,
-        &["ls-files", "-z"],
-        crate::indexcache::MAX_GIT_OUTPUT_BYTES,
-        crate::indexcache::git_timeout(),
-    ) else {
-        return Vec::new();
-    };
-    out.split(|b| *b == 0)
-        .filter_map(|p| String::from_utf8(p.to_vec()).ok())
-        .filter(|l| !l.is_empty() && matches!(repo_role(l), "doc" | "guide"))
-        .collect()
 }
 
 // SCANNABLE_* is the SINGLE broad "source file worth scanning" set — wider than the
@@ -2527,6 +2508,14 @@ pub fn query_source_for(
 }
 
 impl QuerySource {
+    /// The code index snapshot that answers, when the index (not the legacy graph) does.
+    pub fn index(&self) -> Option<&crate::index::reader::Opened> {
+        match &self.answered {
+            Answered::Index(opened) => Some(opened),
+            Answered::Legacy(_) => None,
+        }
+    }
+
     /// The freshness envelope for a result touching `paths`.
     pub fn freshness<'a>(&self, paths: impl IntoIterator<Item = &'a str>) -> Freshness {
         match &self.answered {

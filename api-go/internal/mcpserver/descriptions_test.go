@@ -11,8 +11,9 @@ import (
 
 // toolDescriptionBudget caps the bytes agents read in tools/list every session.
 // The nine descriptions totalled 1808 bytes before search/impact/recall were rewritten
-// to state their limits; they now total 1794. Lower this when one shrinks; do not raise it.
-const toolDescriptionBudget = 1794
+// to state their limits; they totalled 1794, and 1735 once search described BM25 (WS-18).
+// Lower this when one shrinks; do not raise it.
+const toolDescriptionBudget = 1735
 
 // Descriptions are an agent's only model of a tool. search, impact and recall must
 // name the heuristics they run on, so an agent does not read a name-level fuzzy match
@@ -20,9 +21,9 @@ const toolDescriptionBudget = 1794
 // contradiction.
 func TestToolDescriptionsStateImplementationLimits(t *testing.T) {
 	want := map[string][]string{
-		// the neural lane needs the build feature AND a configured model; either alone
-		// still runs the trigram hash.
-		"search": {"symbol names", "not function bodies", "typo tolerance", "semantic-onnx", "xmustard_embed_model", "rrf", "ast-grep"},
+		// bodies are searched by BM25 over chunks (WS-18); the trigram lane is typo
+		// tolerance, not meaning.
+		"search": {"bm25", "function bodies", "doc sections", "typo tolerance (not meaning)", "rrf (k=60)", "ast-grep"},
 		// symbol= is a file-level walk from the defining files; from=&to= ignores direction.
 		"impact": {"lexical reference graph", "import lines", "leads to confirm, not proof", "defining files", "undirected"},
 		// paths alone gate results; no args ranks by working-tree overlap.
@@ -41,7 +42,7 @@ func TestToolDescriptionsStateImplementationLimits(t *testing.T) {
 		}
 	}
 	stale := map[string][]string{
-		"search": {"lexical+semantic"},
+		"search": {"lexical+semantic", "not function bodies", "semantic"},
 		"impact": {"transitive dependents", "dependency path"},
 		"recall": {"recency top-n"},
 	}

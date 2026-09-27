@@ -4,8 +4,8 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
-	"strings"
 	"time"
 )
 
@@ -205,8 +205,9 @@ func applyFeedbackToHits(dataDir, workspaceID string, hits []searchHit) []search
 	for i := range hits {
 		if b, ok := boosts[hits[i].Path]; ok && b != 0 {
 			hits[i].Score += 0.1 * b
-			if !strings.Contains(hits[i].Reason, "feedback") {
+			if !slices.Contains(hits[i].Reasons, "feedback") {
 				hits[i].Reason += " · feedback"
+				hits[i].Reasons = append(hits[i].Reasons, "feedback")
 			}
 		}
 	}

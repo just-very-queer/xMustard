@@ -36,6 +36,14 @@ func TestFeedbackBoostsAndRanking(t *testing.T) {
 	if ranked[0].Path != "good.go" {
 		t.Fatalf("feedback should rank good.go first, got %s", ranked[0].Path)
 	}
+
+	// a boosted hit always lists the feedback reason, even when another reason
+	// mentions the word (a query term named feedback).
+	named := applyFeedbackToHits(dir, ws, []searchHit{{Kind: "symbol", Name: "feedback", Path: "good.go", Score: 1.0,
+		Reasons: []string{"name: matched feedback"}, Reason: "name: matched feedback"}})
+	if got := named[0].Reasons; len(got) != 2 || got[1] != "feedback" {
+		t.Fatalf("feedback reason missing: %q", got)
+	}
 }
 
 func TestRecordFeedbackRejectsBadWorkspace(t *testing.T) {

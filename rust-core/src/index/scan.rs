@@ -127,6 +127,30 @@ impl Mode {
     }
 }
 
+/// `lstat` of one listed path: its stat key and pre-read loss, or None when it is gone
+/// from the worktree. The key is empty for `symlink`, `not_regular` and `unreadable`.
+fn stat_file(
+    root: &Path,
+    path: &str,
+    mode: Mode,
+    max_file_size: u64,
+) -> Option<(StatKey, Option<&'static str>)> {
+    let meta = match std::fs::symlink_metadata(root.join(path)) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(_) => return Some((StatKey::default(), Some("unreadable"))),
+    };
+    if mode == Mode::Symlink || meta.file_type().is_symlink() {
+        return Some((StatKey::default(), Some("symlink")));
+    }
+    if mode == Mode::Gitlink || !meta.is_file() {
+        return Some((StatKey::default(), Some("not_regular")));
+    }
+    let stat = StatKey::of(&meta);
+    let loss = (stat.size > max_file_size).then_some("oversized");
+    Some((stat, loss))
+}
+
 /// Classify one listed path by `lstat`: None when it is gone from the worktree.
 fn stat_candidate(
     root: &Path,
@@ -135,41 +159,43 @@ fn stat_candidate(
     mode: Mode,
     max_file_size: u64,
 ) -> Option<Candidate> {
-    let meta = match std::fs::symlink_metadata(root.join(&path)) {
-        Ok(m) => m,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
-        Err(_) => {
-            return Some(Candidate {
-                path,
-                lang,
-                stat: StatKey::default(),
-                loss: Some("unreadable"),
-            });
-        }
-    };
-    let loss = if mode == Mode::Symlink || meta.file_type().is_symlink() {
-        Some("symlink")
-    } else if mode == Mode::Gitlink || !meta.is_file() {
-        Some("not_regular")
-    } else {
-        None
-    };
-    if loss.is_some() {
-        return Some(Candidate {
-            path,
-            lang,
-            stat: StatKey::default(),
-            loss,
-        });
-    }
-    let stat = StatKey::of(&meta);
-    let loss = (stat.size > max_file_size).then_some("oversized");
+    let (stat, loss) = stat_file(root, &path, mode, max_file_size)?;
     Some(Candidate {
         path,
         lang,
         stat,
         loss,
     })
+}
+
+/// The pre-read loss of a doc on a secret path (`secretpath`): listed, never read.
+pub const SECRET_PATH: &str = "secret_path";
+
+/// Tracked docs and guidance files the docs lane indexes at most (the smallest paths).
+pub const MAX_DOC_FILES: usize = 2000;
+/// Largest doc or guidance file read for the docs lane.
+pub const MAX_DOC_BYTES: u64 = 1 << 20;
+
+/// A doc or guidance file (`symbolgraph::repo_role` `doc` or `guide`) for the docs lane
+/// (WS-18). Docs are not code candidates: they have no symbols, references or edges,
+/// and the code envelope does not count them.
+#[derive(Debug, Clone)]
+pub struct DocCandidate {
+    pub path: String,
+    /// `doc` | `guide`
+    pub role: &'static str,
+    pub stat: StatKey,
+    /// Pre-read problem that keeps the file out of the docs lane: `secret_path` or one
+    /// of the code candidates' losses.
+    pub loss: Option<&'static str>,
+}
+
+/// The docs-lane role of a path that no language pack claims.
+fn doc_role(path: &str) -> Option<&'static str> {
+    match crate::symbolgraph::repo_role(path) {
+        role @ ("doc" | "guide") => Some(role),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -198,6 +224,10 @@ pub struct Scan {
     pub worktree_deleted: usize,
     /// Wall clock (ns since the epoch) before any file was stat'ed.
     pub started_ns: i64,
+    /// Doc and guidance files for the docs lane, sorted by path (at most MAX_DOC_FILES).
+    pub docs: Vec<DocCandidate>,
+    /// Doc and guidance files past MAX_DOC_FILES or undecided by the ignore budget.
+    pub docs_beyond: usize,
 }
 
 fn now_ns() -> i64 {
@@ -410,13 +440,35 @@ impl Ord for ByPath {
     }
 }
 
-/// `(candidates, beyond, beyond_sample, worktree_deleted)` of a finished collection.
-type Collected = (
-    Vec<Candidate>,
-    BTreeMap<String, usize>,
-    Vec<(String, String)>,
-    usize,
-);
+/// A finished collection.
+struct Collected {
+    candidates: Vec<Candidate>,
+    beyond: BTreeMap<String, usize>,
+    beyond_sample: Vec<(String, String)>,
+    worktree_deleted: usize,
+    docs: Vec<DocCandidate>,
+    docs_beyond: usize,
+}
+
+/// Order doc candidates by path in their bounded heap (largest on top, evicted first).
+struct DocByPath(DocCandidate);
+
+impl PartialEq for DocByPath {
+    fn eq(&self, o: &Self) -> bool {
+        self.0.path == o.0.path
+    }
+}
+impl Eq for DocByPath {}
+impl PartialOrd for DocByPath {
+    fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(o))
+    }
+}
+impl Ord for DocByPath {
+    fn cmp(&self, o: &Self) -> std::cmp::Ordering {
+        self.0.path.cmp(&o.0.path)
+    }
+}
 
 /// Collects eligible files in any order with memory bounded by the envelope, then
 /// applies the envelope in path order.
@@ -432,6 +484,9 @@ struct Collector<'a> {
     /// The smallest paths beyond the bound (max-heap of at most MAX_LOSS_ENTRIES).
     sample: BinaryHeap<(String, String)>,
     worktree_deleted: usize,
+    /// The smallest doc paths: at most MAX_DOC_FILES.
+    docs: BinaryHeap<DocByPath>,
+    docs_beyond: usize,
 }
 
 impl<'a> Collector<'a> {
@@ -444,6 +499,30 @@ impl<'a> Collector<'a> {
             beyond: BTreeMap::new(),
             sample: BinaryHeap::new(),
             worktree_deleted: 0,
+            docs: BinaryHeap::new(),
+            docs_beyond: 0,
+        }
+    }
+
+    /// A doc or guidance file for the docs lane; gone files are simply not indexed. A
+    /// secret path is listed with the `secret_path` loss, so its bytes are never read.
+    fn add_doc(&mut self, path: String, role: &'static str, mode: Mode) {
+        let cap = MAX_DOC_BYTES.min(self.cfg.max_file_size);
+        let Some((stat, loss)) = stat_file(self.root, &path, mode, cap) else {
+            return;
+        };
+        let loss = crate::secretpath::is_secret_path(&path)
+            .then_some(SECRET_PATH)
+            .or(loss);
+        self.docs.push(DocByPath(DocCandidate {
+            path,
+            role,
+            stat,
+            loss,
+        }));
+        if self.docs.len() > MAX_DOC_FILES {
+            self.docs.pop();
+            self.docs_beyond += 1;
         }
     }
 
@@ -526,7 +605,21 @@ impl<'a> Collector<'a> {
         }
         let mut sample = std::mem::take(&mut self.sample).into_vec();
         sample.sort();
-        (out, self.beyond, sample, self.worktree_deleted)
+        let mut docs: Vec<DocCandidate> = std::mem::take(&mut self.docs)
+            .into_vec()
+            .into_iter()
+            .map(|DocByPath(d)| d)
+            .collect();
+        docs.sort_by(|a, b| a.path.cmp(&b.path));
+        docs.dedup_by(|a, b| a.path == b.path);
+        Collected {
+            candidates: out,
+            beyond: self.beyond,
+            beyond_sample: sample,
+            worktree_deleted: self.worktree_deleted,
+            docs,
+            docs_beyond: self.docs_beyond,
+        }
     }
 }
 
@@ -585,11 +678,14 @@ fn scan_git(root: &Path, git_dir: PathBuf, cfg: &IndexConfig) -> Result<Scan, St
             }
             return;
         };
-        let Some(lang) = Lang::for_path(path) else {
-            return;
-        };
-        if admit(&ig, &mut memo, path, &mut ignored, col) {
-            col.add(path.to_string(), lang, mode);
+        match (Lang::for_path(path), doc_role(path)) {
+            (Some(lang), _) => {
+                if admit(&ig, &mut memo, path, &mut ignored, col) {
+                    col.add(path.to_string(), lang, mode);
+                }
+            }
+            (None, Some(role)) => admit_doc(&ig, &mut memo, path, role, mode, col),
+            (None, None) => {}
         }
     };
     let mut last: Vec<u8> = Vec::new();
@@ -615,20 +711,22 @@ fn scan_git(root: &Path, git_dir: PathBuf, cfg: &IndexConfig) -> Result<Scan, St
             |raw| on_entry(raw, Mode::Regular, &mut col),
         )?;
     }
-    let (candidates, beyond, beyond_sample, worktree_deleted) = col.finish();
+    let c = col.finish();
     Ok(Scan {
         repo_mode: "git",
         head: head(root),
         git_dir: Some(git_dir),
         root: root.to_path_buf(),
-        candidates,
-        beyond,
-        beyond_sample,
+        candidates: c.candidates,
+        beyond: c.beyond,
+        beyond_sample: c.beyond_sample,
         ignored,
         ignore_rules_dropped: ig.dropped_rules + ignore_files_dropped,
         invalid_paths,
-        worktree_deleted,
+        worktree_deleted: c.worktree_deleted,
         started_ns,
+        docs: c.docs,
+        docs_beyond: c.docs_beyond,
     })
 }
 
@@ -667,27 +765,32 @@ fn scan_walk(root: &Path, cfg: &IndexConfig) -> Scan {
             load_dir_ignores(root, &rel, &mut ig);
             continue;
         }
-        let Some(lang) = Lang::for_path(&rel) else {
-            continue;
-        };
-        if admit(&ig, &mut memo, &rel, &mut ignored, &mut col) {
-            col.add(rel, lang, Mode::Regular);
+        match (Lang::for_path(&rel), doc_role(&rel)) {
+            (Some(lang), _) => {
+                if admit(&ig, &mut memo, &rel, &mut ignored, &mut col) {
+                    col.add(rel, lang, Mode::Regular);
+                }
+            }
+            (None, Some(role)) => admit_doc(&ig, &mut memo, &rel, role, Mode::Regular, &mut col),
+            (None, None) => {}
         }
     }
-    let (candidates, beyond, beyond_sample, _) = col.finish();
+    let c = col.finish();
     Scan {
         repo_mode: "non-git",
         head: String::new(),
         git_dir: None,
         root: root.to_path_buf(),
-        candidates,
-        beyond,
-        beyond_sample,
+        candidates: c.candidates,
+        beyond: c.beyond,
+        beyond_sample: c.beyond_sample,
         ignored,
         ignore_rules_dropped: ig.dropped_rules,
         invalid_paths,
         worktree_deleted: 0,
         started_ns,
+        docs: c.docs,
+        docs_beyond: c.docs_beyond,
     }
 }
 
@@ -710,6 +813,23 @@ fn admit(
             col.push_beyond(path.to_string(), "ignore_budget");
             false
         }
+    }
+}
+
+/// Collect doc `path` when the ignore rules include it. Ignored docs are not counted
+/// with ignored source files; a doc the rules cannot decide within budget is beyond.
+fn admit_doc(
+    ig: &Ignore,
+    memo: &mut DirMemo,
+    path: &str,
+    role: &'static str,
+    mode: Mode,
+    col: &mut Collector<'_>,
+) {
+    match ig.check(memo, path, false) {
+        Verdict::Included => col.add_doc(path.to_string(), role, mode),
+        Verdict::Ignored => {}
+        Verdict::OverBudget => col.docs_beyond += 1,
     }
 }
 
@@ -771,7 +891,12 @@ mod tests {
         ] {
             col.push(cand(p, size, loss));
         }
-        let (out, beyond, sample, _) = col.finish();
+        let Collected {
+            candidates: out,
+            beyond,
+            beyond_sample: sample,
+            ..
+        } = col.finish();
         let got: Vec<(&str, Option<&str>)> =
             out.iter().map(|c| (c.path.as_str(), c.loss)).collect();
         assert_eq!(
@@ -808,7 +933,12 @@ mod tests {
             col.push(cand(&format!("p{i:05}.ts"), 1, Some("symlink")));
         }
         assert_eq!(col.lost.len(), MAX_LOSS_ROWS);
-        let (out, beyond, sample, _) = col.finish();
+        let Collected {
+            candidates: out,
+            beyond,
+            beyond_sample: sample,
+            ..
+        } = col.finish();
         assert_eq!(out.len(), MAX_LOSS_ROWS);
         assert_eq!(out[0].path, "p00000.ts");
         assert_eq!(beyond.get("symlink"), Some(&5));
@@ -831,7 +961,11 @@ mod tests {
         for i in 0..50 {
             col.push(cand(&format!("z{i:05}.ts"), 10, None));
         }
-        let (out, beyond, _, _) = col.finish();
+        let Collected {
+            candidates: out,
+            beyond,
+            ..
+        } = col.finish();
         let kept = out.iter().filter(|c| c.loss.is_none()).count();
         assert_eq!(kept, 50, "{beyond:?}");
         assert_eq!(beyond.get("envelope_files"), None);
@@ -857,7 +991,11 @@ mod tests {
             &mut ignored,
             &mut col
         ));
-        let (_, beyond, sample, _) = col.finish();
+        let Collected {
+            beyond,
+            beyond_sample: sample,
+            ..
+        } = col.finish();
         assert_eq!(beyond.get("ignore_budget"), Some(&1));
         assert_eq!(sample, vec![("src/a.ts".into(), "ignore_budget".into())]);
         assert_eq!(ignored, 1);
