@@ -207,6 +207,7 @@ func applyFeedbackToHits(dataDir, workspaceID string, hits []searchHit) []search
 			hits[i].Score += 0.1 * b
 			if !strings.Contains(hits[i].Reason, "feedback") {
 				hits[i].Reason += " · feedback"
+				hits[i].Reasons = append(hits[i].Reasons, "feedback")
 			}
 		}
 	}

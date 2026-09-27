@@ -3988,8 +3988,12 @@ func registerRoutes(mux routeRegistrar) {
 			result, err = workspaceops.WorkspaceSearchReranked(dd, r.PathValue("workspace_id"), query, r.URL.Query().Get("rerank"), r.URL.Query().Get("embed_model"), limit)
 		default:
 			// default search fuses the agent-feedback boost and records retrieval.
-			// optional ?seed=<symbol> activates the graph-proximity lane.
-			result, err = workspaceops.WorkspaceSearchWithFeedbackCtx(r.Context(), dd, r.PathValue("workspace_id"), query, r.URL.Query().Get("seed"), limit)
+			// optional ?seed=<symbol> activates the graph-proximity lane, ?path_glob=
+			// filters paths and ?cursor= continues a page (next_cursor).
+			q := r.URL.Query()
+			result, err = workspaceops.WorkspaceSearchPage(r.Context(), dd, r.PathValue("workspace_id"), workspaceops.SearchRequest{
+				Query: query, Seed: q.Get("seed"), PathGlob: q.Get("path_glob"), Cursor: q.Get("cursor"), Limit: limit,
+			})
 		}
 		issueIntel(w, err, result)
 	})
