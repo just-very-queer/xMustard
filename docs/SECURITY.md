@@ -37,8 +37,8 @@ A token carries a role spec: one role, or several joined with `+`.
 
 | Role | Grants |
 |---|---|
-| `reader` | read routes and the read tools (`ground`, `recall`, `search`, `explain`, `impact`, `diagnostics`, `why_failed`) |
-| `proposer` | reader, plus `remember`, editing memory it authored, platform writes, and registering a git work tree under `XMUSTARD_REGISTER_ROOTS` ([Workspace registration](#workspace-registration)) |
+| `reader` | read routes and the read tools (`ground`, `recall`, `search`, `explain`, `impact`, `diagnostics`, and `why_failed` reading a run or outcome by id) |
+| `proposer` | reader, plus `remember`, `why_failed` with a `command`, `log` or `evidence_handle` (runs a test, build or lint command; records a run-independent outcome), editing memory it authored, platform writes, and registering a git work tree under `XMUSTARD_REGISTER_ROOTS` ([Workspace registration](#workspace-registration)) |
 | `verifier` | reader, plus `verify` |
 | `human-approver` | reader, plus policy changes and approvals (workspace policy, security acceptance criteria and dispositions, run-plan approve/reject, run accept) |
 | `indexer` | reader, plus `POST /api/workspaces/{id}/index` (rebaseline) |
@@ -357,6 +357,33 @@ symlink-refusing descriptor walk (`api-go/internal/workspaceops/safepath_unix.go
 so a path swapped for a symlink later is still refused. `explain` applies the same
 symlink check to its `path` before the core reads the file.
 
+## Commands why_failed runs (WS-21)
+
+`why_failed` with `command` (`POST /api/workspaces/{id}/why-failed`) runs a process in
+the daemon's environment, so it is gated like a write: the `proposer` role, refused in
+read-only mode (`XMUSTARD_READ_ONLY=1`) and by `XMUSTARD_DISABLED_TOOLS=why_failed`, and
+refused on a read-only MCP connection. The MCP tool is annotated `readOnlyHint: false`,
+`destructiveHint: true`, so a client that auto-approves read-only tools still asks. The
+checks run in this order and fail closed:
+
+- the command runs as argv through the bounded Rust runner, never through a shell;
+  words a shell would interpret (`|`, `&&`, `;`, `>`, `2>&1`, `$(`, ...) are refused;
+- the exact argv must be a test, build or lint command (`go test`, `cargo build`,
+  `npm test`, `make`, `pytest`, `eslint`, ...: `evidence.CommandFamily`, without the
+  wrapper stripping capture uses, so `sudo go test` and `env X=1 go test` are refused);
+- a program named by path must resolve inside the workspace root (`./gradlew`); a bare
+  name is looked up on the daemon's `PATH`;
+- the working directory is the workspace root or a directory inside it (the path
+  confinement below, symlinks included);
+- the timeout is 1 to 240 s (1 to 50 s through MCP, below the clients' call timeout);
+  at the timeout the runner sends TERM, then KILL, to the command's whole process group.
+
+This narrows what the route runs; it is not a sandbox. A test or build runs the
+repository's own code with the daemon's privileges, as it would in the agent's shell.
+Output is redacted (secret rules plus this process's secret-named environment values)
+before it is analyzed or stored, and only the last MiB is read. The command's processes
+are external to the owned process tree the budget gate measures.
+
 ## Health endpoint
 
 `/api/health` stays public so liveness probes need no token. Its full view shows
@@ -407,9 +434,11 @@ whether `XMUSTARD_READ_ONLY=1` still serves the route.
 | `GET /api/workspaces/{workspace_id}/evidence/{handle}` | core | reader | served |  | issuer-bound expansion |
 | `GET /api/workspaces/{workspace_id}/explain-path` | core | reader | served | explain |  |
 | `POST /api/workspaces/{workspace_id}/index` | core | indexer | refused |  | rebaseline the index; agents cannot reset it |
+| `GET /api/workspaces/{workspace_id}/outcomes` | core | reader | served |  | run-independent outcomes, newest first; reads only |
 | `GET /api/workspaces/{workspace_id}/runs/{run_id}/why-failed` | core | reader | served | why_failed |  |
 | `GET /api/workspaces/{workspace_id}/search` | core | reader | served | search |  |
 | `GET /api/workspaces/{workspace_id}/session-grounding` | core | reader | served | ground |  |
+| `POST /api/workspaces/{workspace_id}/why-failed` | core | proposer | refused | why_failed | runs a test, build or lint command (argv, no shell, cwd inside the workspace root, timeout kills the process group) or reads an evidence tail or a log; records the outcome |
 | `DELETE /mcp` | core | reader | served |  | ends the caller's own MCP session |
 | `GET /mcp` | core | reader | served |  | no server-initiated stream: 405 |
 | `POST /mcp` | core | reader | served |  | MCP messages; each tool call re-enters the API through its own route gate as the caller |

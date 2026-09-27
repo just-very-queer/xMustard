@@ -45,15 +45,15 @@ func ParseMode(v string) (readOnly bool, err error) {
 	return false, fmt.Errorf("unknown mode %q; use %s or %s", v, ModeFull, ModeReadOnly)
 }
 
-// modeFilter narrows a tools/list allow set (nil: every tool) to the read-only tools
-// when the connection is read-only.
+// modeFilter narrows a tools/list allow set (nil: every tool) to the tools that serve
+// reads when the connection is read-only.
 func (s *Session) modeFilter(allowed map[string]bool) map[string]bool {
 	if !s.srv.opts.ReadOnly {
 		return allowed
 	}
 	out := map[string]bool{}
 	for _, t := range Tools() {
-		if t.Annotations.ReadOnly && (allowed == nil || allowed[t.Name]) {
+		if t.servesReads() && (allowed == nil || allowed[t.Name]) {
 			out[t.Name] = true
 		}
 	}

@@ -81,6 +81,10 @@ var routeGateTable = map[string]routeGate{
 	"POST /api/workspaces/{workspace_id}/context/{entry_id}/restore": coreGate(roleApprover, "", "restore a retired, retracted, superseded or expired entry"),
 	"GET /api/workspaces/{workspace_id}/context":                     coreGate(roleAdmin, "", "full memory history"),
 
+	// --- core: run-independent outcomes (outcome_routes.go, WS-21) ---
+	"POST /api/workspaces/{workspace_id}/why-failed": coreGate(roleProposer, "why_failed", "runs a test, build or lint command (argv, no shell, cwd inside the workspace root, timeout kills the process group) or reads an evidence tail or a log; records the outcome"),
+	"GET /api/workspaces/{workspace_id}/outcomes":    coreGate(roleReader, "", "run-independent outcomes, newest first; reads only"),
+
 	// --- core: MCP over Streamable HTTP (mcp_routes.go) ---
 	"POST /mcp":   {Core: true, Role: roleReader, ReadSafe: true, Note: "MCP messages; each tool call re-enters the API through its own route gate as the caller"},
 	"GET /mcp":    coreGate(roleReader, "", "no server-initiated stream: 405"),
@@ -384,11 +388,17 @@ func validGateRole(role string) bool {
 	return false
 }
 
-// toolGates maps each MCP tool to the pattern of the route that serves it.
+// toolGates maps each MCP tool to the pattern of its primary route: the one whose role
+// makes the tool usable. A tool served by more than one route (why_failed reads with
+// GET and records with POST) is usable through its read route; its other routes carry
+// the tool name so that disabling the tool refuses them too.
 func toolGates() map[string]string {
 	out := map[string]string{}
 	for pattern, g := range routeGateTable {
-		if g.Tool != "" {
+		if g.Tool == "" {
+			continue
+		}
+		if prev, ok := out[g.Tool]; !ok || routeGateTable[prev].mutating(prev) && !g.mutating(pattern) {
 			out[g.Tool] = pattern
 		}
 	}

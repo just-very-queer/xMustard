@@ -54,16 +54,21 @@ func (s *Session) callTool(ctx context.Context, params json.RawMessage) (any, *R
 	return res, nil
 }
 
-// callKnownTool refuses a write tool on a read-only connection, validates (with the
+// callKnownTool refuses a write on a read-only connection (a write tool before its
+// arguments are read, a writing call of a reading tool after), validates (with the
 // toolcompat repair fallback) and runs the call. It returns how many arguments were
 // normalized, for usage accounting.
 func (s *Session) callKnownTool(ctx context.Context, t *Tool, raw map[string]any) (map[string]any, int, *RPCError) {
-	if s.srv.opts.ReadOnly && !t.Annotations.ReadOnly {
+	if s.srv.opts.ReadOnly && !t.servesReads() {
 		return TextResult(fmt.Sprintf("tool %s is not served on a read-only connection (mode=%s); it changes shared memory", t.Name, ModeReadOnly), true), 0, nil
 	}
 	args, norms, rerr := buildArgsCompat(t, raw)
 	if rerr != nil {
 		return nil, 0, rerr
+	}
+	if s.srv.opts.ReadOnly && t.writes(args) {
+		return TextResult(fmt.Sprintf("tool %s is served on a read-only connection (mode=%s) only without %s, which write",
+			t.Name, ModeReadOnly, strings.Join(t.WriteArgs, ", ")), true), 0, nil
 	}
 	res, rerr := s.runTool(ctx, t, args, norms)
 	return res, len(norms), rerr

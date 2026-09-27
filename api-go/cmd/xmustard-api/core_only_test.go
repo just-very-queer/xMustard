@@ -147,6 +147,7 @@ func TestRouteGateTableMatchesRegisteredRoutes(t *testing.T) {
 	registerRoutes(mux)
 	registerEvidenceRoutes(mux, nil)
 	registerEvidenceCaptureRoutes(mux, nil)
+	registerOutcomeRoutes(mux, nil)
 	var missing, stale []string
 	for p := range routeGateTable {
 		if _, ok := mux.gates[p]; !ok {
