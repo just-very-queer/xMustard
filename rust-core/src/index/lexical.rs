@@ -1563,6 +1563,7 @@ pub fn extract(lang: Lang, text: &str) -> FileFacts {
                 container,
                 kind,
                 flow_of(line, keywords, s, e),
+                -1,
             ));
         }
     }

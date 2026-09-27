@@ -201,8 +201,8 @@ impl<'c> Writer<'c> {
         }
         {
             let mut ins = self.conn.prepare_cached(
-                "INSERT OR IGNORE INTO refs(file_id, start_byte, name_id, symbol_id, line, col, kind, flow)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+                "INSERT OR IGNORE INTO refs(file_id, start_byte, name_id, symbol_id, line, col, kind, flow, qual_id)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
             )?;
             for r in &f.refs {
                 ins.execute(params![
@@ -213,7 +213,8 @@ impl<'c> Writer<'c> {
                     r.line(),
                     r.col(),
                     r.kind(),
-                    r.flow()
+                    r.flow(),
+                    r.qual_idx().map(|q| ref_names[q])
                 ])?;
             }
         }
@@ -349,6 +350,7 @@ pub fn delete_file_rows(conn: &Connection, fid: i64, keep_file_row: bool) -> rus
         "DELETE FROM imports WHERE file_id = ?1",
         "DELETE FROM symbols WHERE file_id = ?1",
         "DELETE FROM edges WHERE src_file = ?1",
+        "DELETE FROM resolve_drops WHERE file_id = ?1",
     ] {
         conn.prepare_cached(sql)?.execute([fid])?;
     }

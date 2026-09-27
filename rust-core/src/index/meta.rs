@@ -305,9 +305,9 @@ pub fn content_digest(conn: &Connection) -> rusqlite::Result<String> {
         &mut h,
     )?;
     feed(
-        "SELECT f.path, r.start_byte, n.name, r.kind, r.flow, r.line, r.col, s.uid
+        "SELECT f.path, r.start_byte, n.name, r.kind, r.flow, r.line, r.col, s.uid, q.name
          FROM refs r JOIN files f ON f.id = r.file_id JOIN names n ON n.id = r.name_id
-         LEFT JOIN symbols s ON s.id = r.symbol_id
+         LEFT JOIN symbols s ON s.id = r.symbol_id LEFT JOIN names q ON q.id = r.qual_id
          ORDER BY f.path, r.start_byte, n.name, r.kind",
         &mut h,
     )?;
@@ -325,9 +325,17 @@ pub fn content_digest(conn: &Connection) -> rusqlite::Result<String> {
         &mut h,
     )?;
     feed(
-        "SELECT a.path, b.path, e.kind, e.layer, e.weight, e.confidence, e.provenance, e.via
+        "SELECT a.path, b.path, e.kind, e.layer, e.weight, e.confidence, e.provenance, e.via,
+                e.reason, e.access, s.uid, d.uid
          FROM edges e JOIN files a ON a.id = e.src_file JOIN files b ON b.id = e.dst_file
-         ORDER BY a.path, b.path, e.layer, e.kind",
+         LEFT JOIN symbols s ON s.id = e.src_symbol LEFT JOIN symbols d ON d.id = e.dst_symbol
+         ORDER BY a.path, b.path, e.layer, e.kind, s.uid, d.uid",
+        &mut h,
+    )?;
+    feed(
+        "SELECT f.path, n.name, r.cause, r.count
+         FROM resolve_drops r JOIN files f ON f.id = r.file_id JOIN names n ON n.id = r.name_id
+         ORDER BY f.path, n.name, r.cause",
         &mut h,
     )?;
     conn.execute_batch(
