@@ -1,0 +1,38 @@
+engine tree_sitter parse_errors false
+symbols
+  Class Widget arity=- lines=6-19 doc_from=4 exported=true local=false depth=0
+  Property Widget.count arity=- lines=7-7 doc_from=7 exported=false local=false depth=1
+  Constructor Widget.init arity=1 lines=9-11 doc_from=9 exported=true local=false depth=1
+  Method Widget.compute arity=2 lines=13-16 doc_from=13 exported=true local=false depth=1
+  Method Widget.secret arity=0 lines=18-18 doc_from=18 exported=false local=false depth=1
+  Struct Point arity=- lines=21-23 doc_from=21 exported=true local=false depth=0
+  Property Point.x arity=- lines=22-22 doc_from=22 exported=true local=false depth=1
+  Enum Mode arity=- lines=25-27 doc_from=25 exported=true local=false depth=0
+  EnumMember Mode.fast arity=- lines=26-26 doc_from=26 exported=true local=false depth=1
+  Interface Thing arity=- lines=29-31 doc_from=29 exported=true local=false depth=0
+  Method Thing.run arity=0 lines=30-30 doc_from=30 exported=true local=false depth=1
+  Impl Widget arity=- lines=33-35 doc_from=33 exported=true local=false depth=0
+  Method Widget.extra arity=0 lines=34-34 doc_from=34 exported=true local=false depth=1
+  Function top arity=1 lines=37-39 doc_from=37 exported=true local=false depth=0
+imports
+  1 import Foundation name=- alias=-
+  2 import Swift.Array name=- alias=-
+references (non-read)
+  1 import Foundation in -
+  2 import Swift in -
+  2 import Array in -
+  6 extends Base in Widget
+  6 extends Thing in Widget
+  9 bind n in Widget.init
+  9 type Int in Widget.init
+  10 write count in Widget.init
+  13 bind a in Widget.compute
+  13 type Int in Widget.compute
+  13 bind b in Widget.compute
+  13 type Int in Widget.compute
+  13 type Int in Widget.compute
+  15 call helper in Widget.compute
+  22 type Int in Point.x
+  37 bind x in top
+  37 type Int in top
+  37 type Int in top

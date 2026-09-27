@@ -1,3 +1,4 @@
+use crate::index::lang::Lang;
 use crate::treesitter;
 use chrono::Utc;
 use regex::Regex;
@@ -5,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use walkdir::{DirEntry, WalkDir};
 
 const REPO_MAP_KEY_FILE_PATTERNS: &[(&str, &str)] = &[
@@ -547,20 +549,14 @@ fn should_scan_file(relative_path: &str) -> bool {
 }
 
 fn semantic_language_for_path(relative_path: &str) -> Option<String> {
-    let path = PathBuf::from(relative_path);
-    let ext = path
+    if let Some(lang) = Lang::for_path(relative_path) {
+        return Some(lang.name().to_string());
+    }
+    let ext = Path::new(relative_path)
         .extension()
         .and_then(|value| value.to_str())
         .unwrap_or_default();
     match ext {
-        "py" => Some("python".to_string()),
-        "ts" => Some("typescript".to_string()),
-        "tsx" => Some("tsx".to_string()),
-        "js" | "jsx" => Some("javascript".to_string()),
-        "go" => Some("go".to_string()),
-        "rs" => Some("rust".to_string()),
-        "java" => Some("java".to_string()),
-        "sh" | "bash" => Some("bash".to_string()),
         "html" => Some("html".to_string()),
         "css" => Some("css".to_string()),
         "yaml" | "yml" => Some("yaml".to_string()),
@@ -709,9 +705,6 @@ pub struct SourceSymbols {
     pub truncated: bool,
 }
 
-/// Extensions indexed for references but with no symbol extractor at all.
-const UNSUPPORTED_SYMBOL_EXTS: &[&str] = &["c", "h", "cc", "cpp", "hpp", "cxx", "java", "rb"];
-
 /// Extract up to `max` symbols from already-read text, reporting truncation and the
 /// extraction engine. The single extraction entry point for indexing.
 pub fn extract_source_symbols(relative_path: &str, content: &str, max: usize) -> SourceSymbols {
@@ -722,8 +715,9 @@ pub fn extract_source_symbols(relative_path: &str, content: &str, max: usize) ->
             truncated: false,
         };
     }
-    if let Some((symbols, truncated)) =
-        treesitter::extract_symbols_limited(relative_path, content, max)
+    let parsed = treesitter::extract_symbols_limited(relative_path, content, max);
+    let parsed_any = parsed.is_some();
+    if let Some((symbols, truncated)) = parsed
         && !symbols.is_empty()
     {
         let mapped = symbols
@@ -750,21 +744,14 @@ pub fn extract_source_symbols(relative_path: &str, content: &str, max: usize) ->
         };
     }
     let (fallback, truncated) = extract_symbols_with_regex(relative_path, content, max);
-    let engine = if !fallback.is_empty() {
-        "regex"
-    } else if treesitter::supports(relative_path) {
-        "none"
-    } else {
-        let ext = Path::new(relative_path)
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        if UNSUPPORTED_SYMBOL_EXTS.contains(&ext.as_str()) {
-            "unsupported_language"
-        } else {
-            "none"
-        }
+    let grammar = Lang::for_path(relative_path).map(Lang::has_grammar);
+    let engine = match (fallback.is_empty(), grammar, parsed_any) {
+        (false, ..) => "regex",
+        // a language pack without its grammar in this build has no symbol extractor
+        (true, Some(false), _) => "unsupported_language",
+        // past the parse bounds: only the regexes ran, whatever they found
+        (true, Some(true), false) => "regex",
+        _ => "none",
     };
     SourceSymbols {
         symbols: fallback,
@@ -780,47 +767,51 @@ fn extract_symbols_from_file(
     extract_symbols_engine(root_path, relative_path).0
 }
 
+/// The legacy repo-map fallback patterns (language-agnostic def/class/func/fn forms),
+/// compiled once per process (PAR-RT-11: they were compiled per file).
+fn legacy_regex_patterns() -> &'static [(Regex, &'static str)] {
+    static PATTERNS: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
+        [
+            (r"^\s*def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(", "function"),
+            (r"^\s*class\s+([A-Za-z_][A-Za-z0-9_]*)\b", "class"),
+            (
+                r"^\s*func\s+(?:\([^)]+\)\s*)?([A-Za-z_][A-Za-z0-9_]*)\s*\(",
+                "function",
+            ),
+            (
+                r"^\s*(?:export\s+)?function\s+([A-Za-z_][A-Za-z0-9_]*)\b",
+                "function",
+            ),
+            (
+                r"^\s*(?:export\s+)?class\s+([A-Za-z_][A-Za-z0-9_]*)\b",
+                "class",
+            ),
+            (
+                r"^\s*(?:export\s+)?(?:interface|type)\s+([A-Za-z_][A-Za-z0-9_]*)\b",
+                "type",
+            ),
+            (
+                r"^\s*(?:pub\s+)?(?:struct|enum|trait)\s+([A-Za-z_][A-Za-z0-9_]*)\b",
+                "type",
+            ),
+            (
+                r"^\s*(?:pub\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(",
+                "function",
+            ),
+        ]
+        .into_iter()
+        .map(|(re, kind)| (Regex::new(re).expect("legacy pattern compiles"), kind))
+        .collect()
+    });
+    &PATTERNS
+}
+
 fn extract_symbols_with_regex(
     relative_path: &str,
     content: &str,
     max: usize,
 ) -> (Vec<RustChangedSymbolRecord>, bool) {
-    let patterns = [
-        (
-            Regex::new(r"^\s*def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(").unwrap(),
-            "function",
-        ),
-        (
-            Regex::new(r"^\s*class\s+([A-Za-z_][A-Za-z0-9_]*)\b").unwrap(),
-            "class",
-        ),
-        (
-            Regex::new(r"^\s*func\s+(?:\([^)]+\)\s*)?([A-Za-z_][A-Za-z0-9_]*)\s*\(").unwrap(),
-            "function",
-        ),
-        (
-            Regex::new(r"^\s*(?:export\s+)?function\s+([A-Za-z_][A-Za-z0-9_]*)\b").unwrap(),
-            "function",
-        ),
-        (
-            Regex::new(r"^\s*(?:export\s+)?class\s+([A-Za-z_][A-Za-z0-9_]*)\b").unwrap(),
-            "class",
-        ),
-        (
-            Regex::new(r"^\s*(?:export\s+)?(?:interface|type)\s+([A-Za-z_][A-Za-z0-9_]*)\b")
-                .unwrap(),
-            "type",
-        ),
-        (
-            Regex::new(r"^\s*(?:pub\s+)?(?:struct|enum|trait)\s+([A-Za-z_][A-Za-z0-9_]*)\b")
-                .unwrap(),
-            "type",
-        ),
-        (
-            Regex::new(r"^\s*(?:pub\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(").unwrap(),
-            "function",
-        ),
-    ];
+    let patterns = legacy_regex_patterns();
     let mut out = Vec::new();
     for (index, line) in content.lines().enumerate() {
         if out.len() >= max {
@@ -830,7 +821,7 @@ fn extract_symbols_with_regex(
             }
             continue;
         }
-        for (pattern, kind) in &patterns {
+        for (pattern, kind) in patterns {
             let Some(captures) = pattern.captures(line) else {
                 continue;
             };
@@ -1038,6 +1029,7 @@ fn push_unique(items: &mut Vec<String>, value: String, limit: usize) {
 #[cfg(test)]
 mod tests {
     use super::build_repo_map;
+    use crate::index::lang::Lang;
     use std::fs;
     use std::path::Path;
 
@@ -1193,7 +1185,25 @@ mod tests {
     }
 
     #[test]
-    fn path_symbols_falls_back_to_regex_for_non_treesitter_language() {
+    fn legacy_regex_fallback_compiles_once() {
+        let first = super::legacy_regex_patterns().as_ptr();
+        for _ in 0..1000 {
+            assert!(std::ptr::eq(super::legacy_regex_patterns().as_ptr(), first));
+        }
+        let (symbols, truncated) =
+            super::extract_symbols_with_regex("x.lua", "function lua_fn()\nclass K\n", 10);
+        assert_eq!(symbols.len(), 2);
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn path_symbols_use_the_python_pack_or_its_regex_fallback() {
+        // tree-sitter with the lang-python pack, the legacy regexes without it
+        let engine = if Lang::Python.has_grammar() {
+            "tree_sitter"
+        } else {
+            "regex"
+        };
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
 
@@ -1206,7 +1216,7 @@ mod tests {
 
         assert_eq!(result.workspace_id, "workspace-4");
         assert_eq!(result.path, "src/app.py");
-        assert_eq!(result.symbol_source, "regex");
+        assert_eq!(result.symbol_source, engine);
         assert_eq!(result.parser_language.as_deref(), Some("python"));
         assert!(
             result
@@ -1214,7 +1224,7 @@ mod tests {
                 .iter()
                 .any(|item| item.symbol == "ExportService" && item.kind == "class")
         );
-        assert_eq!(result.file_summary_row.symbol_source, "regex");
+        assert_eq!(result.file_summary_row.symbol_source, engine);
         assert_eq!(result.file_summary_row.symbol_count, 2);
     }
 

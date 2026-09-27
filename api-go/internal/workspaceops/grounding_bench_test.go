@@ -68,6 +68,7 @@ func seedGroundBenchWorkspace(tb testing.TB) (dataDir, ws string) {
 	script := `#!/bin/sh
 case "$1 $2" in
 "changetrack drift") echo '{"stale":false,"head_sha":"abc"}' ;;
+"symbolgraph coverage") echo '{"complete":true,"languages":{"go":{"supported":1,"unsupported":0,"failed":0}}}' ;;
 "changetrack working-changes") echo '{"changed_files":[{"path":"f.go"}],"dirty_symbols":[{"path":"f.go","symbol":"F","contract_break":true,"signature_change":"args"}],"contract_breaks":1}' ;;
 *) echo '{}' ;;
 esac

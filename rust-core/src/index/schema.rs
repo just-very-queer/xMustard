@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use super::config::ContentRetention;
 
 /// Bump on any table or column change. Part of the schema fingerprint.
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// Table definitions. Secondary indexes are in `INDEX_DDL` so a full build can create
 /// them after the bulk insert.
@@ -77,6 +77,7 @@ CREATE TABLE refs(
   col INTEGER NOT NULL,
   kind INTEGER NOT NULL,
   flow INTEGER NOT NULL,
+  qual_id INTEGER,
   PRIMARY KEY(file_id, start_byte)
 ) WITHOUT ROWID;
 
@@ -127,8 +128,18 @@ CREATE TABLE edges(
   weight INTEGER NOT NULL,
   confidence REAL NOT NULL,
   provenance TEXT NOT NULL,
-  via TEXT NOT NULL
+  via TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  access TEXT
 );
+
+CREATE TABLE resolve_drops(
+  file_id INTEGER NOT NULL,
+  name_id INTEGER NOT NULL,
+  cause TEXT NOT NULL,
+  count INTEGER NOT NULL,
+  PRIMARY KEY(file_id, name_id, cause)
+) WITHOUT ROWID;
 
 CREATE TABLE fact_cache(
   content_key TEXT PRIMARY KEY,
@@ -147,6 +158,8 @@ CREATE INDEX IF NOT EXISTS imports_resolved ON imports(resolved_file_id);
 CREATE INDEX IF NOT EXISTS chunks_file ON chunks(file_id);
 CREATE INDEX IF NOT EXISTS edges_src ON edges(src_file);
 CREATE INDEX IF NOT EXISTS edges_dst ON edges(dst_file);
+CREATE INDEX IF NOT EXISTS edges_dst_symbol ON edges(dst_symbol);
+CREATE INDEX IF NOT EXISTS resolve_drops_name ON resolve_drops(name_id);
 CREATE INDEX IF NOT EXISTS fact_cache_used ON fact_cache(last_used);
 "#;
 

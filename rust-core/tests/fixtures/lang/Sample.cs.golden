@@ -1,0 +1,30 @@
+engine tree_sitter parse_errors false
+symbols
+  Namespace App.Core arity=- lines=4-33 doc_from=4 exported=false local=false depth=0
+  Class App.Core.Widget arity=- lines=7-23 doc_from=6 exported=true local=false depth=1
+  Property App.Core.Widget.count arity=- lines=10-10 doc_from=9 exported=false local=false depth=2
+  Property App.Core.Widget.Name arity=- lines=12-12 doc_from=12 exported=true local=false depth=2
+  Constructor App.Core.Widget.Widget arity=1 lines=14-14 doc_from=14 exported=true local=false depth=2
+  Method App.Core.Widget.Compute arity=2 lines=16-20 doc_from=16 exported=true local=false depth=2
+  Method App.Core.Widget.Hidden arity=0 lines=22-22 doc_from=22 exported=false local=false depth=2
+  Interface App.Core.IThing arity=- lines=25-28 doc_from=25 exported=false local=false depth=1
+  Method App.Core.IThing.Run arity=0 lines=27-27 doc_from=27 exported=false local=false depth=2
+  Struct App.Core.Point arity=- lines=30-30 doc_from=30 exported=true local=false depth=1
+  Enum App.Core.Mode arity=- lines=32-32 doc_from=32 exported=false local=false depth=1
+  EnumMember App.Core.Mode.Fast arity=- lines=32-32 doc_from=32 exported=false local=false depth=2
+imports
+  1 namespace System name=- alias=-
+  2 namespace System.Text.Encoding name=- alias=Alias
+references (non-read)
+  1 import System in -
+  2 import Alias in -
+  2 import System in -
+  2 import Text in -
+  2 import Encoding in -
+  7 extends Base in App.Core.Widget
+  7 extends IThing in App.Core.Widget
+  14 bind c in App.Core.Widget.Widget
+  14 write count in App.Core.Widget.Widget
+  16 bind a in App.Core.Widget.Compute
+  16 bind b in App.Core.Widget.Compute
+  19 call Helper in App.Core.Widget.Compute

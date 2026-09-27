@@ -245,7 +245,9 @@ fn csr_equals_the_edges_table_and_reverse_edges_mirror_it() {
             for k in 1..=5 {
                 let (t, tf) = syms[(i * 7 + k * 3) % syms.len()];
                 conn.execute(
-                    "INSERT INTO edges VALUES (?1, ?2, ?3, ?4, ?5, 'structure', ?6, 0.93, 'resolved', '[]')",
+                    "INSERT INTO edges(src_file, dst_file, src_symbol, dst_symbol, kind, layer, weight,
+                     confidence, provenance, via, reason, access)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 'structure', ?6, 0.93, 'resolved', '[]', 'test', NULL)",
                     params![f, tf, s, t, ["calls", "accesses", "has_method"][k % 3], k as i64],
                 )
                 .unwrap();
@@ -972,7 +974,11 @@ fn synthetic_store(db: &Path, head: &str, generation: i64) {
             }
         }
         let mut edge = conn
-            .prepare("INSERT INTO edges VALUES (?1, ?2, ?3, ?4, ?5, 'structure', 1, 0.9, 'resolved', '[]')")
+            .prepare(
+                "INSERT INTO edges(src_file, dst_file, src_symbol, dst_symbol, kind, layer, weight,
+                 confidence, provenance, via, reason, access)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'structure', 1, 0.9, 'resolved', '[]', 'test', NULL)",
+            )
             .unwrap();
         for s in 0..n_syms {
             let f = s / SYMS_PER_FILE;

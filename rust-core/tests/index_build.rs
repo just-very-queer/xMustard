@@ -518,7 +518,11 @@ fn extraction_fixtures_cover_nesting_impls_methods_closures_and_reexports() {
         "{e:#?}"
     );
     let prov: String = conn
-        .query_row("SELECT DISTINCT provenance FROM edges", [], |r| r.get(0))
+        .query_row(
+            "SELECT DISTINCT provenance FROM edges WHERE layer != 'symbol'",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     assert_eq!(prov, "lexical");
 }

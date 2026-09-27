@@ -1,0 +1,16 @@
+engine tree_sitter parse_errors false
+symbols
+  Function build arity=0 lines=9-13 doc_from=8 exported=true local=false depth=0
+  Function deploy arity=0 lines=15-17 doc_from=15 exported=true local=false depth=0
+imports
+  2 require ./lib.sh name=- alias=-
+  3 require $HOME/env.sh name=- alias=-
+references (non-read)
+  2 import source in -
+  3 import HOME in -
+  6 write LIMIT in -
+  10 write out in build
+  11 call echo in build
+  12 call helper in build
+  16 call build in deploy
+  19 call deploy in -

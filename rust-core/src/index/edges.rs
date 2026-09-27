@@ -25,7 +25,7 @@ use super::facts::{flow, ref_kind};
 
 const MIN_NAME_LEN: usize = 4;
 /// Names this common produce noisy edges; they never anchor one (legacy list).
-const STOPWORD_SYMBOLS: &[&str] = &[
+pub(crate) const STOPWORD_SYMBOLS: &[&str] = &[
     "main", "test", "tests", "init", "new", "build", "run", "string", "error", "result", "value",
     "data", "name", "path", "self", "this", "type", "node", "item", "list",
 ];
@@ -110,22 +110,6 @@ impl Definers {
             _ => None,
         }
     }
-
-    /// Definer status of the given names, for detecting which names an update changed.
-    pub fn snapshot(&self, names: &BTreeSet<i64>) -> BTreeMap<i64, Option<(i64, bool)>> {
-        names
-            .iter()
-            .map(|n| {
-                (
-                    *n,
-                    self.map.get(n).map(|d| match d {
-                        Def::One { file, callable } => (*file, *callable),
-                        Def::Ambiguous => (-1, false),
-                    }),
-                )
-            })
-            .collect()
-    }
 }
 
 #[derive(Default)]
@@ -160,7 +144,7 @@ pub fn rebuild_file_edges(
     fid: i64,
     path: &str,
 ) -> rusqlite::Result<usize> {
-    conn.prepare_cached("DELETE FROM edges WHERE src_file = ?1")?
+    conn.prepare_cached("DELETE FROM edges WHERE src_file = ?1 AND layer != 'symbol'")?
         .execute([fid])?;
     let test = is_test_file(path);
     let mut structure: BTreeMap<(i64, &'static str), Agg> = BTreeMap::new();
@@ -276,14 +260,29 @@ pub fn rebuild_file_edges(
 
     let mut ins = conn.prepare_cached(
         "INSERT INTO edges(src_file, dst_file, src_symbol, dst_symbol, kind, layer, weight,
-         confidence, provenance, via) VALUES (?1, ?2, NULL, NULL, ?3, ?4, ?5, ?6, 'lexical', ?7)",
+         confidence, provenance, via, reason) VALUES (?1, ?2, NULL, NULL, ?3, ?4, ?5, ?6, 'lexical', ?7, ?8)",
     )?;
     let mut written = 0;
     for (layer, agg) in [("structure", structure), ("flow", flows)] {
         for ((to, kind), mut a) in agg {
             a.via.sort();
             let via = serde_json::to_string(&a.via).unwrap_or_else(|_| "[]".into());
-            ins.execute(params![fid, to, kind, layer, a.weight, a.confidence, via])?;
+            // only a relative import resolved to a file is more than a name match.
+            let reason = if a.confidence >= RELATIVE_IMPORT_CONFIDENCE {
+                "relative-import"
+            } else {
+                "unique-name"
+            };
+            ins.execute(params![
+                fid,
+                to,
+                kind,
+                layer,
+                a.weight,
+                a.confidence,
+                via,
+                reason
+            ])?;
             written += 1;
         }
     }
@@ -304,14 +303,4 @@ pub fn files_referencing(
         }
     }
     Ok(out)
-}
-
-/// Definer-kind name ids declared (non-locally) by a file.
-pub fn defined_names(conn: &Connection, fid: i64) -> rusqlite::Result<BTreeSet<i64>> {
-    let sql = format!(
-        "SELECT DISTINCT name_id FROM symbols WHERE file_id = ?1 AND local = 0 AND kind IN ({DEFINER_KINDS})"
-    );
-    let mut st = conn.prepare_cached(&sql)?;
-    let rows = st.query_map([fid], |r| r.get::<_, i64>(0))?;
-    rows.collect()
 }

@@ -522,6 +522,8 @@ Source: `docs/research/PARITY_REQUIREMENTS_2026-09-25.md` (requirements, process
 
 **Collision risk.** Cargo.toml is shared with WS-15 and WS-37 (dependency commits first). treesitter.rs was touched by WS-07. repomap.rs has no other in-flight edits.
 
+**Status.** Implemented on `parity/ws-16`: 15 packs (the 14 languages; TS and TSX are separate rows) in the `index::lang` provider table, the ten added grammars behind `lang-*` features (default `lang-all`), golden fixtures in `rust-core/tests/lang_fixtures.rs`, per-language `language_support` in index coverage and `languages` in graph coverage, and both regex fallbacks compiled once. Measurements (binary +22.2 MB; the spec fixture stays under 25 MiB RSS; with every pack parsed the worker peaks at about 50 MiB RSS, of which 16–21 MiB is dirty) are in `docs/benchmarks/2026-09-26-ws16-language-packs.md`. Import resolution for the added languages is WS-39. Entry-point patterns are WS-60.
+
 ### WS-17 — Scope/import resolver for Go and TS/JS with typed edges, confidence tiers and epistemic counters
 
 **Goal.** Replace lexical file-to-file edges with resolved symbol edges for Go and TS/JS. Edge kinds: CALLS, IMPORTS, EXTENDS, IMPLEMENTS, HAS_METHOD, HAS_PROPERTY, ACCESSES, USES. Confidence is 0.95 same-file, 0.9 import-scoped and 0.5 global. Provenance is lexical, scope, scip or lsp. Import semantics: named and namespace for TS, wildcard-leaf for Go. Receiver typing covers simple cases. Record drop counters for the epistemic envelope. Re-resolve only the dependents of changed exports.
@@ -540,6 +542,8 @@ Source: `docs/research/PARITY_REQUIREMENTS_2026-09-25.md` (requirements, process
 - Precision against gopls/tsserver ground truth on a small fixture is measured and reported
 
 **Acceptance.** impact on Go and TS/JS returns resolved symbol edges with confidence and provenance. Lexical edges remain only as provenance=lexical fallback. The precision number is recorded for EVAL-09.
+
+**Decision (2026-09-26).** Go and TS/JS files keep their lexical `structure` and `flow` layers next to the `symbol` layer. `index impact` reads only the symbol layer for these languages, so the lexical layers are the fallback in data, not in queries. They stay because WS-14 ports the legacy consumers (repo map, MCP `impact`) onto `index.db` and needs file edges at legacy parity for every language first. Cost: 2 to 7 s more on a full build (`docs/benchmarks/2026-09-26-ws17-resolver.md`). Revisit after WS-14: when nothing reads the lexical layers for resolver languages, skip them where `resolve::resolves(lang)` holds.
 
 **Collision risk.** schema.rs (from WS-07) gets an edges table addition. No in-flight collisions.
 

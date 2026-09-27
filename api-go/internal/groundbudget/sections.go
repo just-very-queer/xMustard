@@ -99,9 +99,10 @@ var sections = []Section{
 		Members: []Member{
 			{Name: "changed_files", Signal: true}, {Name: "dirty_symbols", Signal: true},
 			{Name: "contract_breaks", Signal: true}, {Name: "broken_contracts", Signal: true},
+			{Name: "coverage", Signal: true},
 		},
 		Recover: "ground sections=index max_chars=N; past 65536 chars, recover_uri",
-		Doc:     "working-tree changes against the indexed baseline, and changed signatures in the order the index lists them",
+		Doc:     "working-tree changes against the indexed baseline, changed signatures in the order the index lists them, and per-language symbol coverage",
 	},
 	{
 		Name: "memory", Cap: 1024,

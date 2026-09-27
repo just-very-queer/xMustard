@@ -1,5 +1,7 @@
-//! Streaming per-file fact extraction for the existing tree-sitter languages (Go, Rust,
-//! TypeScript/TSX, JavaScript/JSX) with a precompiled lexical fallback for the rest.
+//! Streaming per-file fact extraction. Each language's pack (`lang::PACKS`) chooses the
+//! extractor: the hand-written walker below for Go, Rust, TypeScript/TSX and
+//! JavaScript/JSX, the tag-query engine (`lang::tags`) for the other grammar packs, and
+//! the precompiled lexical fallback (`lexical`) for files no grammar parses.
 //!
 //! One file is parsed, walked once with a cursor, and its tree dropped before the next
 //! file is read. The walk records:
@@ -12,10 +14,12 @@
 //! - function-aligned chunks.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
 
 use sha2::{Digest, Sha256};
-use tree_sitter::{Language, Node, Parser, TreeCursor};
+use tree_sitter::{Node, Parser, TreeCursor};
+
+pub use super::lang::Lang;
+use super::lang::{Extractor, tags};
 
 use super::chunks;
 use super::facts::{FileFacts, ImportFact, RefFact, SymbolFact, flow, ref_kind};
@@ -31,7 +35,7 @@ pub const MAX_SYMBOLS_PER_FILE: usize = crate::treesitter::MAX_SYMBOLS_PER_FILE;
 pub const MAX_REFS_PER_FILE: usize = 100_000;
 
 /// Bump when extraction output changes for the same bytes. Part of the analyzer version.
-pub const EXTRACTOR_REVISION: u32 = 3;
+pub const EXTRACTOR_REVISION: u32 = 5;
 
 /// Longest container prefix spelled out in a qualified name. A deeper prefix is replaced
 /// by `~<hash of the prefix>`, so qualified names, UIDs and scope frames stay bounded
@@ -41,86 +45,15 @@ pub const MAX_QUALIFIED_BYTES: usize = 256;
 
 /// Syntax-tree depth past which leading doc comments are not looked up (each lookup
 /// walks the tree from the root: quadratic time on a deeply nested file).
-const MAX_DOC_DEPTH: usize = 256;
+pub(crate) const MAX_DOC_DEPTH: usize = 256;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Lang {
-    Rust,
-    Go,
-    TypeScript,
-    Tsx,
-    JavaScript,
-    Python,
-    Java,
-    Ruby,
-    C,
-    Cpp,
-}
-
-impl Lang {
-    pub fn for_path(path: &str) -> Option<Lang> {
-        let ext = Path::new(path)
-            .extension()
-            .and_then(|e| e.to_str())?
-            .to_ascii_lowercase();
-        Some(match ext.as_str() {
-            "rs" => Lang::Rust,
-            "go" => Lang::Go,
-            "ts" | "mts" | "cts" => Lang::TypeScript,
-            "tsx" => Lang::Tsx,
-            "js" | "jsx" | "mjs" | "cjs" => Lang::JavaScript,
-            "py" => Lang::Python,
-            "java" => Lang::Java,
-            "rb" => Lang::Ruby,
-            "c" | "h" => Lang::C,
-            "cpp" | "hpp" | "cc" | "cxx" | "hh" => Lang::Cpp,
-            _ => return None,
-        })
-    }
-
-    pub fn name(self) -> &'static str {
-        match self {
-            Lang::Rust => "rust",
-            Lang::Go => "go",
-            Lang::TypeScript => "typescript",
-            Lang::Tsx => "tsx",
-            Lang::JavaScript => "javascript",
-            Lang::Python => "python",
-            Lang::Java => "java",
-            Lang::Ruby => "ruby",
-            Lang::C => "c",
-            Lang::Cpp => "cpp",
-        }
-    }
-
-    fn grammar(self) -> Option<Language> {
-        Some(match self {
-            Lang::Rust => tree_sitter_rust::LANGUAGE.into(),
-            Lang::Go => tree_sitter_go::LANGUAGE.into(),
-            Lang::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-            Lang::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
-            Lang::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
-            _ => return None,
-        })
-    }
-
-    pub fn has_grammar(self) -> bool {
-        matches!(
-            self,
-            Lang::Rust | Lang::Go | Lang::TypeScript | Lang::Tsx | Lang::JavaScript
-        )
-    }
-
-    fn is_js_family(self) -> bool {
-        matches!(self, Lang::TypeScript | Lang::Tsx | Lang::JavaScript)
-    }
-}
-
-/// Grammar identities for the analyzer version (a grammar bump changes facts).
+/// Grammar identities for the analyzer version (a grammar bump, or a pack compiled in or
+/// out, changes facts).
 pub fn grammar_versions() -> String {
     format!(
-        "ts-abi-{};rust-0.24;go-0.25;typescript-0.23;javascript-0.25;extractor-{EXTRACTOR_REVISION};lexical-{}",
+        "ts-abi-{};{};extractor-{EXTRACTOR_REVISION};lexical-{}",
         tree_sitter::LANGUAGE_VERSION,
+        super::lang::grammar_ids(),
         lexical::LEXICAL_REVISION
     )
 }
@@ -166,6 +99,14 @@ fn parse_refusal(lang: Lang, bytes: &[u8], max_parse_bytes: usize) -> Option<Par
         (true, false) => Some(ParseLimit::Size),
         (true, true) => parse_limit(bytes),
     }
+}
+
+/// Whether tree-sitter may parse `lang` text of these bytes under the default bounds:
+/// the legacy repo-map path (`treesitter`) shares the index's parse refusal, so neither
+/// path parses a file past `DEFAULT_MAX_PARSE_BYTES`, `MAX_PARSE_TOKENS` or
+/// `MAX_PARSE_NESTING`.
+pub fn within_parse_bounds(lang: Lang, bytes: &[u8]) -> bool {
+    parse_refusal(lang, bytes, DEFAULT_MAX_PARSE_BYTES).is_none()
 }
 
 /// One pass over `bytes` for the parse guards (`MAX_PARSE_TOKENS`, `MAX_PARSE_NESTING`);
@@ -283,6 +224,13 @@ pub fn extraction_mode(lang: Lang, text: &[u8], max_parse_bytes: usize) -> &'sta
 }
 
 fn extract_tree_sitter(lang: Lang, text: &str) -> Option<FileFacts> {
+    match lang.pack().extractor {
+        Extractor::Walker => walk_file(lang, text),
+        Extractor::Tags => tags::extract(lang, text),
+    }
+}
+
+fn walk_file(lang: Lang, text: &str) -> Option<FileFacts> {
     // A fresh parser per file: its internal stack is freed with it, and only grammars
     // of files actually parsed are ever touched.
     let mut parser = Parser::new();
@@ -365,6 +313,11 @@ struct Walker<'a> {
     go_receivers: Vec<(u32, String)>,
     /// Names listed in local `export { ... }` clauses (JS/TS).
     exported_names: HashSet<String>,
+    /// Identifier node id → qualifier name index for the reference it will become (see
+    /// `RefFact`): set when the member expression or declaration above it is entered.
+    quals: HashMap<usize, u32>,
+    /// Interned names that are not source slices (see `intern_owned`).
+    owned_ix: HashMap<String, u32>,
     n_ret: u32,
     n_cond: u32,
     n_import: u32,
@@ -390,6 +343,81 @@ fn normalize_ws(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// `prefix.name`, with a prefix longer than MAX_QUALIFIED_BYTES replaced by
+/// `~<16 hex of its hash>` (deterministic, so UIDs stay stable); sets `truncated` then.
+pub(crate) fn qualify(prefix: &str, name: &str, truncated: &mut bool) -> String {
+    if prefix.is_empty() {
+        return name.to_string();
+    }
+    if prefix.len() + 1 + name.len() <= MAX_QUALIFIED_BYTES {
+        return format!("{prefix}.{name}");
+    }
+    *truncated = true;
+    let h = format!("{:x}", Sha256::digest(prefix.as_bytes()));
+    format!("~{}.{name}", &h[..16])
+}
+
+/// Hash of the whitespace-normalized text of `parts`; empty when there are none.
+pub(crate) fn signature_hash(src: &[u8], parts: &[Option<Node<'_>>]) -> String {
+    let mut s = String::new();
+    for p in parts.iter().flatten() {
+        s.push_str(&normalize_ws(
+            std::str::from_utf8(&src[p.byte_range()]).unwrap_or(""),
+        ));
+        s.push('|');
+    }
+    if s.is_empty() {
+        return String::new();
+    }
+    format!("{:x}", Sha256::digest(s.as_bytes()))[..16].to_string()
+}
+
+/// Last line of a declaration node (one ending at column 0 ends on the previous line).
+pub(crate) fn decl_end_line(decl: Node<'_>) -> u32 {
+    let end = decl.end_position();
+    if end.column == 0 && end.row > decl.start_position().row {
+        end.row as u32
+    } else {
+        end.row as u32 + 1
+    }
+}
+
+/// Leading doc comments and attributes directly above `outer`: the first line of the
+/// contiguous run, or `outer`'s own line. `too_deep` skips the lookup: tree-sitter's
+/// sibling lookups walk down from the root, so they cost O(depth) each, and past
+/// MAX_DOC_DEPTH a declaration starts at its own line.
+pub(crate) fn doc_start_line(outer: Node<'_>, too_deep: bool) -> u32 {
+    let mut line = outer.start_position().row as u32 + 1;
+    if too_deep {
+        return line;
+    }
+    let mut prev = outer.prev_sibling();
+    while let Some(p) = prev {
+        let is_doc = matches!(
+            p.kind(),
+            "comment"
+                | "line_comment"
+                | "block_comment"
+                | "attribute_item"
+                | "decorator"
+                | "attribute_list"
+        );
+        let end = p.end_position().row as u32 + 1;
+        // a line comment's node may end at column 0 of the next line.
+        let end = if p.end_position().column == 0 && end > 1 {
+            end - 1
+        } else {
+            end
+        };
+        if !is_doc || end + 1 < line {
+            break;
+        }
+        line = p.start_position().row as u32 + 1;
+        prev = p.prev_sibling();
+    }
+    line
+}
+
 impl<'a> Walker<'a> {
     fn new(lang: Lang, src: &'a [u8]) -> Self {
         Walker {
@@ -411,6 +439,8 @@ impl<'a> Walker<'a> {
             object_scopes: HashMap::new(),
             go_receivers: Vec::new(),
             exported_names: HashSet::new(),
+            quals: HashMap::new(),
+            owned_ix: HashMap::new(),
             n_ret: 0,
             n_cond: 0,
             n_import: 0,
@@ -452,8 +482,37 @@ impl<'a> Walker<'a> {
     }
 
     fn grandparent(&self) -> Option<&Anc> {
+        self.ancestor(2)
+    }
+
+    /// The ancestor `up` levels above the current node (1 = parent).
+    fn ancestor(&self, up: usize) -> Option<&Anc> {
         let n = self.anc.len();
-        (n >= 3).then(|| &self.anc[n - 3])
+        (n > up).then(|| &self.anc[n - 1 - up])
+    }
+
+    /// The ancestor `up - 1` levels above the current node (0: the node itself), held
+    /// in slot `field` of the ancestor at `up`, is written by an assignment or increment.
+    fn is_write_target(&self, up: usize, field: &str) -> bool {
+        let at = |k: usize| {
+            self.ancestor(k)
+                .map_or(("", ""), |a| (a.kind, a.field.unwrap_or("")))
+        };
+        let (pk, pf) = at(up);
+        let gk = at(up + 1).0;
+        match (pk, field) {
+            (
+                "assignment_expression"
+                | "augmented_assignment_expression"
+                | "compound_assignment_expr"
+                | "assignment_statement",
+                "left",
+            )
+            | ("update_expression" | "inc_statement" | "dec_statement", _) => true,
+            // Go: `a, s.N = ...` puts the targets in an expression_list
+            ("expression_list", _) => pf == "left" && gk == "assignment_statement",
+            _ => false,
+        }
     }
 
     fn in_callable(&self) -> bool {
@@ -530,13 +589,124 @@ impl<'a> Walker<'a> {
         });
 
         if node.is_named() {
+            self.note_quals(node, kind);
             self.declare(node, kind, field);
             self.maybe_import(node, kind);
             self.maybe_ref(node, kind, field);
         }
     }
 
+    /// Record the qualifiers of `node`'s identifier children: the object name of a
+    /// member access, or the type a declaration gives its binding names.
+    fn note_quals(&mut self, node: Node<'_>, kind: &str) {
+        if !(self.lang == Lang::Go || self.lang.is_js_family()) {
+            return;
+        }
+        if let Some((object, member)) = member_fields(kind) {
+            if let (Some(o), Some(m)) = (
+                node.child_by_field_name(object),
+                node.child_by_field_name(member),
+            ) && is_simple_qualifier(o)
+            {
+                let q = self.intern(self.text(o));
+                self.quals.insert(m.id(), q);
+            }
+            return;
+        }
+        let Some((bindings, ty)) = self.binding_type(node, kind) else {
+            return;
+        };
+        let hint = self.intern_owned(ty);
+        let mut c = node.walk();
+        for b in node.children_by_field_name(bindings, &mut c) {
+            // Go's short declaration binds through an expression list.
+            let b = match b.kind() {
+                "expression_list" => b.named_child(0).unwrap_or(b),
+                _ => b,
+            };
+            if b.kind() == "identifier" {
+                self.quals.insert(b.id(), hint);
+            }
+        }
+    }
+
+    /// For a declaration that types its binding names: the field holding them and the
+    /// type name, package- or namespace-qualified when written so (`pkg.T`).
+    fn binding_type(&self, node: Node<'_>, kind: &str) -> Option<(&'static str, String)> {
+        let (bindings, declared) = match kind {
+            "parameter_declaration" | "variadic_parameter_declaration" | "var_spec" => {
+                ("name", node.child_by_field_name("type"))
+            }
+            "required_parameter" | "optional_parameter" => {
+                ("pattern", node.child_by_field_name("type"))
+            }
+            "variable_declarator" => ("name", node.child_by_field_name("type")),
+            "short_var_declaration" => ("left", None),
+            _ => return None,
+        };
+        if let Some(t) = declared {
+            return type_name_node(t).map(|n| (bindings, self.type_text(n)));
+        }
+        let value = match kind {
+            "variable_declarator" => node.child_by_field_name("value")?,
+            "short_var_declaration" => {
+                let (left, right) = (
+                    node.child_by_field_name("left")?,
+                    node.child_by_field_name("right")?,
+                );
+                if left.named_child_count() != 1 || right.named_child_count() != 1 {
+                    return None;
+                }
+                right.named_child(0)?
+            }
+            _ => return None,
+        };
+        Some((bindings, self.constructed_type(value)?))
+    }
+
+    /// A type name as written, without whitespace (`pkg.T`, `ns.Widget`).
+    fn type_text(&self, n: Node<'_>) -> String {
+        self.text(n).split_whitespace().collect()
+    }
+
+    /// The type an initializer constructs: `new T()`, `T{...}`, `&T{...}`, `new(T)`,
+    /// and Go's `NewT(...)` / `pkg.NewT(...)` constructor convention.
+    fn constructed_type(&self, value: Node<'_>) -> Option<String> {
+        let named = |n: Option<Node<'_>>| n.and_then(type_name_node).map(|t| self.type_text(t));
+        match value.kind() {
+            "new_expression" => named(value.child_by_field_name("constructor")),
+            "composite_literal" => named(value.child_by_field_name("type")),
+            "unary_expression" => self.constructed_type(value.child_by_field_name("operand")?),
+            "call_expression" => {
+                let f = value.child_by_field_name("function")?;
+                let (package, callee) = match f.kind() {
+                    "selector_expression" => (
+                        f.child_by_field_name("operand")
+                            .filter(|o| o.kind() == "identifier")
+                            .map(|o| self.text(o)),
+                        f.child_by_field_name("field")?,
+                    ),
+                    _ => (None, f),
+                };
+                let name = self.text(callee);
+                if name == "new" {
+                    let args = value.child_by_field_name("arguments")?;
+                    return named(args.named_child(0));
+                }
+                let ty = name
+                    .strip_prefix("New")
+                    .filter(|t| t.starts_with(|c: char| c.is_ascii_uppercase()))?;
+                Some(match package {
+                    Some(p) => format!("{p}.{ty}"),
+                    None => ty.to_string(),
+                })
+            }
+            _ => None,
+        }
+    }
+
     fn leave(&mut self, node: Node<'_>) {
+        self.quals.remove(&node.id());
         if let Some(a) = self.anc.pop() {
             debug_assert_eq!(a.id, node.id());
             let c = a.counters;
@@ -609,8 +779,22 @@ impl<'a> Walker<'a> {
         }
     }
 
+    /// Intern a name that is not a slice of the source (a qualified type hint).
+    fn intern_owned(&mut self, name: String) -> u32 {
+        if let Some(&i) = self.name_ix.get(name.as_str()) {
+            return i;
+        }
+        if let Some(&i) = self.owned_ix.get(&name) {
+            return i;
+        }
+        let i = self.names.len() as u32;
+        self.names.push(name.clone());
+        self.owned_ix.insert(name, i);
+        i
+    }
+
     fn intern(&mut self, name: &'a str) -> u32 {
-        if let Some(&i) = self.name_ix.get(name) {
+        if let Some(&i) = self.name_ix.get(name).or_else(|| self.owned_ix.get(name)) {
             return i;
         }
         let i = self.names.len() as u32;
@@ -666,6 +850,7 @@ impl<'a> Walker<'a> {
         let pos = node.start_position();
         let container = self.container_symbol().map(|s| s as i32).unwrap_or(-1);
         let ni = self.intern(name);
+        let qual = self.quals.remove(&node.id()).map_or(-1, |q| q as i32);
         if rk == ref_kind::EXPORT {
             self.exported_names.insert(name.to_string());
         }
@@ -677,6 +862,7 @@ impl<'a> Walker<'a> {
             container,
             rk,
             fl,
+            qual,
         ));
     }
 
@@ -698,15 +884,6 @@ impl<'a> Walker<'a> {
         let pf = parent.and_then(|p| p.field).unwrap_or("");
         let gk = self.grandparent().map(|g| g.kind).unwrap_or("");
         let f = field.unwrap_or("");
-        let is_assign = |k: &str| {
-            matches!(
-                k,
-                "assignment_expression"
-                    | "augmented_assignment_expression"
-                    | "compound_assignment_expr"
-                    | "assignment_statement"
-            )
-        };
         if (pk == "call_expression" && f == "function")
             || (pk == "new_expression" && f == "constructor")
             || (pk == "macro_invocation" && f == "macro")
@@ -718,10 +895,12 @@ impl<'a> Walker<'a> {
             || (pk == "selector_expression" && f == "field")
             || (pk == "scoped_identifier" && f == "name");
         if member {
-            if pf == "function" && gk == "call_expression" {
+            if (pf == "function" && gk == "call_expression")
+                || (pf == "constructor" && gk == "new_expression")
+            {
                 return ref_kind::MEMBER_CALL;
             }
-            if pf == "left" && is_assign(gk) {
+            if self.is_write_target(2, pf) {
                 return ref_kind::WRITE;
             }
             return ref_kind::MEMBER;
@@ -729,12 +908,7 @@ impl<'a> Walker<'a> {
         if pk == "scoped_type_identifier" && f == "name" {
             return ref_kind::TYPE;
         }
-        if (is_assign(pk) && f == "left")
-            || pk == "update_expression"
-            || pk == "inc_statement"
-            || pk == "dec_statement"
-            || (pk == "expression_list" && pf == "left" && gk == "assignment_statement")
-        {
+        if self.is_write_target(1, f) {
             return ref_kind::WRITE;
         }
         if pk == "export_specifier" {
@@ -749,32 +923,7 @@ impl<'a> Walker<'a> {
     /// Leading doc comments and attributes directly above `outer`: the first line of the
     /// contiguous run, or `outer`'s own line.
     fn doc_start_line(&self, outer: Node<'_>) -> u32 {
-        let mut line = outer.start_position().row as u32 + 1;
-        // tree-sitter's sibling and parent lookups walk down from the root, so they cost
-        // O(depth) each; past MAX_DOC_DEPTH a declaration starts at its own line.
-        if self.anc.len() > MAX_DOC_DEPTH {
-            return line;
-        }
-        let mut prev = outer.prev_sibling();
-        while let Some(p) = prev {
-            let is_doc = matches!(
-                p.kind(),
-                "comment" | "line_comment" | "block_comment" | "attribute_item" | "decorator"
-            );
-            let end = p.end_position().row as u32 + 1;
-            // a line comment's node may end at column 0 of the next line.
-            let end = if p.end_position().column == 0 && end > 1 {
-                end - 1
-            } else {
-                end
-            };
-            if !is_doc || end + 1 < line {
-                break;
-            }
-            line = p.start_position().row as u32 + 1;
-            prev = p.prev_sibling();
-        }
-        line
+        doc_start_line(outer, self.anc.len() > MAX_DOC_DEPTH)
     }
 
     fn arity_of(&self, params: Option<Node<'_>>) -> u32 {
@@ -817,15 +966,7 @@ impl<'a> Walker<'a> {
     }
 
     fn signature_hash(&self, parts: &[Option<Node<'_>>]) -> String {
-        let mut s = String::new();
-        for p in parts.iter().flatten() {
-            s.push_str(&normalize_ws(self.text(*p)));
-            s.push('|');
-        }
-        if s.is_empty() {
-            return String::new();
-        }
-        format!("{:x}", Sha256::digest(s.as_bytes()))[..16].to_string()
+        signature_hash(self.src, parts)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -864,13 +1005,7 @@ impl<'a> Walker<'a> {
         let idx = self.symbols.len() as u32;
         let callable = matches!(kind, "Function" | "Method" | "Constructor");
         let depth = self.scopes.iter().filter(|s| s.symbol.is_some()).count() as u32;
-        let end = decl.end_position();
-        // a node ending at column 0 ends on the previous line.
-        let end_line = if end.column == 0 && end.row > decl.start_position().row {
-            end.row as u32
-        } else {
-            end.row as u32 + 1
-        };
+        let end_line = decl_end_line(decl);
         self.symbols.push(SymbolFact {
             name,
             qualified_name: qualified,
@@ -907,15 +1042,7 @@ impl<'a> Walker<'a> {
     /// `prefix.name`, with a prefix longer than MAX_QUALIFIED_BYTES replaced by
     /// `~<16 hex of its hash>` (deterministic, so UIDs stay stable).
     fn qualify(&mut self, prefix: &str, name: &str) -> String {
-        if prefix.is_empty() {
-            return name.to_string();
-        }
-        if prefix.len() + 1 + name.len() <= MAX_QUALIFIED_BYTES {
-            return format!("{prefix}.{name}");
-        }
-        self.nesting_truncated = true;
-        let h = format!("{:x}", Sha256::digest(prefix.as_bytes()));
-        format!("~{}.{name}", &h[..16])
+        qualify(prefix, name, &mut self.nesting_truncated)
     }
 
     fn name_of<'t>(&self, node: Node<'t>, field: &str) -> Option<(Node<'t>, String)> {
@@ -934,6 +1061,43 @@ fn strip_quotes(s: &str) -> String {
     s.trim()
         .trim_matches(|c| c == '"' || c == '\'' || c == '`')
         .to_string()
+}
+
+/// (object field, member field) of the member-access nodes the resolver types through.
+fn member_fields(kind: &str) -> Option<(&'static str, &'static str)> {
+    Some(match kind {
+        "member_expression" => ("object", "property"),
+        "selector_expression" => ("operand", "field"),
+        "qualified_type" => ("package", "name"),
+        "nested_type_identifier" => ("module", "name"),
+        _ => return None,
+    })
+}
+
+/// A member access's object is a plain name (`a`, `pkg`, `this`, `super`).
+fn is_simple_qualifier(object: Node<'_>) -> bool {
+    matches!(
+        object.kind(),
+        "identifier" | "package_identifier" | "type_identifier" | "this" | "super"
+    )
+}
+
+/// The named type a type expression is about: `T`, `*T`, `pkg.T`, `T<A>`, `: T`,
+/// `ns.T`; None for composite types (slices, maps, unions, functions).
+fn type_name_node(n: Node<'_>) -> Option<Node<'_>> {
+    match n.kind() {
+        "type_identifier" | "identifier" => Some(n),
+        "pointer_type" | "type_annotation" | "parenthesized_type" => {
+            n.named_child(0).and_then(type_name_node)
+        }
+        "generic_type" => n.child_by_field_name("type").and_then(type_name_node),
+        "qualified_type" | "nested_type_identifier" => Some(n),
+        "member_expression" => match n.child_by_field_name("object")?.kind() {
+            "identifier" => Some(n),
+            _ => n.child_by_field_name("property"),
+        },
+        _ => None,
+    }
 }
 
 fn go_exported(name: &str) -> bool {
