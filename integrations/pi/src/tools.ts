@@ -129,7 +129,7 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
 	{
 		name: "search",
 		description:
-			"Code search, path:line slices. Hybrid ranks symbol NAMES, paths and doc chunks, not function bodies: RRF of lexical IDF, trigram fuzzy match (typo tolerance, not meaning, unless built with semantic-onnx and XMUSTARD_EMBED_MODEL set), reference degree, proximity to seed=<symbol>. mode=pattern: ast-grep structural query (e.g. `$A && $A()`; optional lang).",
+			"Code search: path:line hits, snippets, reasons. RRF (K=60) of BM25 over function bodies, comments, names, paths and doc sections; identifier match; trigram typo tolerance (not meaning); reference degree; proximity to seed=<symbol>. mode=pattern: ast-grep query (e.g. `$A && $A()`; optional lang).",
 		args: [
 			workspaceArg,
 			{ name: "q", type: "string", required: true, desc: "the search query" },
@@ -140,7 +140,12 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
 		],
 		build: (a) => ({
 			method: "GET",
-			path: query(ws(a, "/search"), ...["q", "mode", "lang", "seed", "limit"].flatMap((k) => [k, str(a, k)])),
+			// cursor and path_glob are Advanced in the MCP server (not in the lean list this
+			// mirrors); forwarded when present so both clients issue the same request.
+			path: query(
+				ws(a, "/search"),
+				...["q", "mode", "lang", "seed", "limit", "cursor", "path_glob"].flatMap((k) => [k, str(a, k)]),
+			),
 		}),
 	},
 	{

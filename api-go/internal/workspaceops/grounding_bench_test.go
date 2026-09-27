@@ -67,7 +67,7 @@ func seedGroundBenchWorkspace(tb testing.TB) (dataDir, ws string) {
 	core := filepath.Join(tb.TempDir(), "xmustard-core")
 	script := `#!/bin/sh
 case "$1 $2" in
-"changetrack drift") echo '{"stale":false,"head_sha":"abc"}' ;;
+"changetrack drift") echo '{"has_baseline":true,"stale":false,"head_changed":false,"dirty":true,"baseline_head":"abc","baseline_indexed_at":"2026-09-25T00:00:00Z","baseline_reason":"registration"}' ;;
 "symbolgraph coverage") echo '{"complete":true,"languages":{"go":{"supported":1,"unsupported":0,"failed":0}}}' ;;
 "changetrack working-changes") echo '{"changed_files":[{"path":"f.go"}],"dirty_symbols":[{"path":"f.go","symbol":"F","contract_break":true,"signature_change":"args"}],"contract_breaks":1}' ;;
 *) echo '{}' ;;

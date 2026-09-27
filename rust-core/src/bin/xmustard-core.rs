@@ -626,25 +626,51 @@ fn identity_flag(args: Args) -> (Option<String>, Args) {
 }
 
 fn search(args: Args) -> CmdResult {
-    let usage =
-        "xmustard-core search [--identity-key=K] <root> <workspace_id> <query> [limit] [seed]";
-    let (key, mut args) = identity_flag(args);
+    let usage = "xmustard-core search [--identity-key=K] [--offset=N] [--path-glob=GLOB] \
+                 <root> <workspace_id> <query> [limit] [seed]";
+    let (key, args) = identity_flag(args);
+    // `--name=value` flags lead; the first other argument ends them, so a query or seed
+    // symbol that looks like a flag is never read as one.
+    let mut flags: Vec<String> = args.collect();
+    let lead = flags.iter().take_while(|a| a.starts_with("--")).count();
+    let mut args = flags.split_off(lead).into_iter();
+    let (mut offset, mut path_glob) = (0usize, None::<String>);
+    for flag in flags {
+        match flag.split_once('=') {
+            Some(("--offset", n)) => {
+                offset = n
+                    .parse()
+                    .map_err(|_| CmdError::new(2, format!("search: bad --offset {n}\n{usage}")))?
+            }
+            Some(("--path-glob", g)) => path_glob = Some(g.to_string()),
+            _ => {
+                return Err(CmdError::new(
+                    2,
+                    format!("search: unknown flag {flag}\n{usage}"),
+                ));
+            }
+        }
+    }
     let root = need(&mut args, usage)?;
     let ws = need(&mut args, usage)?;
     let query = need(&mut args, usage)?;
+    // then the limit and an optional seed symbol for the graph-proximity lane
     let limit = args
         .next()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(25);
-    // optional 5th positional: a seed symbol for the graph-proximity lane.
     let seed = args.next().filter(|s| !s.trim().is_empty());
-    json(&xmustard_core::search::hybrid_search_for(
+    json(&xmustard_core::search::search(
         &PathBuf::from(root),
         &ws,
         key.as_deref(),
         &query,
-        limit,
-        seed.as_deref(),
+        &xmustard_core::search::SearchOptions {
+            limit,
+            offset,
+            seed: seed.as_deref(),
+            path_glob: path_glob.as_deref(),
+        },
     ))
 }
 
@@ -811,15 +837,35 @@ fn run_changetrack_command(mut args: Args) -> CmdResult {
     match sub.as_str() {
         "fingerprint" => {
             let root = need(&mut args, "xmustard-core changetrack fingerprint <root>")?;
-            json(&ct::compute_fingerprint(Path::new(&root)))
+            match ct::compute_fingerprint(Path::new(&root)) {
+                Ok(fingerprint) => json(&fingerprint),
+                Err(err) => Err(CmdError::failed(format!(
+                    "changetrack fingerprint failed: {err}"
+                ))),
+            }
         }
         "index" => {
-            let usage = "xmustard-core changetrack index <data_dir> <root> <workspace_id>";
+            let usage = "xmustard-core changetrack index <data_dir> <root> <workspace_id> [--reason=registration|first_ground|head_changed|admin] [--stage]";
             let data_dir = need(&mut args, usage)?;
             let root = need(&mut args, usage)?;
             let ws = need(&mut args, usage)?;
-            match ct::build_index_baseline(Path::new(&data_dir), Path::new(&root), &ws) {
-                Ok(baseline) => json(&baseline),
+            // an explicit rebaseline unless the caller names the automatic trigger;
+            // --stage leaves it beside the baseline for the caller to record and publish
+            let (mut reason, mut stage) = (ct::BaselineReason::Admin, false);
+            for flag in args {
+                match flag.as_str() {
+                    "--stage" => stage = true,
+                    other => {
+                        reason = other
+                            .strip_prefix("--reason=")
+                            .and_then(ct::BaselineReason::parse)
+                            .ok_or_else(|| CmdError::usage(usage))?
+                    }
+                }
+            }
+            match ct::rebaseline_summary(Path::new(&data_dir), Path::new(&root), &ws, reason, stage)
+            {
+                Ok(summary) => json(&summary),
                 Err(err) => Err(CmdError::failed(format!("changetrack index failed: {err}"))),
             }
         }

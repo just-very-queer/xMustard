@@ -1,0 +1,13 @@
+run 1 21 0
+  cold score 12 spans 10 mrr 0.95 body 0 lat 0.0359 0.0503
+  warm score 12 spans 10 mrr 0.85 body 0 lat 0.0355 0.0389
+  after-one-file-edit score 12 spans 10 mrr 0.85 body 0 lat 0.0373 0.0451
+run 2 21 0
+  cold score 12 spans 10 mrr 0.95 body 0 lat 0.0403 0.0532
+  warm score 12 spans 10 mrr 0.85 body 0 lat 0.0409 0.0495
+  after-one-file-edit score 12 spans 10 mrr 0.85 body 0 lat 0.0482 0.0728
+run 3 21 0
+  cold score 12 spans 10 mrr 0.95 body 0 lat 0.0451 0.0777
+  warm score 12 spans 10 mrr 0.85 body 0 lat 0.0543 0.0705
+  after-one-file-edit score 12 spans 10 mrr 0.85 body 0 lat 0.0526 0.0875
+remote_exit=0

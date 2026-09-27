@@ -1,11 +1,14 @@
-"""12-query internal retrieval regression gate (plan Stage 5).
+"""12-query internal retrieval regression gate (plan Stage 5, extended by WS-18).
 
 Runs the committed gold fixture (scripts/bench/gold) through the real API and Rust
 core, cold then warm, then after a one-file edit. Requires >= pass_min/12 gold paths in
-the top five on every pass, explicit coverage loss for every omitted/unreadable fixture
-file, unchanged or improved recall after the edit without reparsing unchanged files,
-and no stale hit presented as current. Internal regression gate only: not competitor
-parity and not proof of task success. No model or provider calls.
+the top five on every pass, >= span_min gold spans, a gold-path MRR@top_k of at least
+mrr_min over the ten search queries, >= body_pass_min body queries (terms only a
+function body holds) with their gold span in the top five, explicit coverage loss for
+every omitted/unreadable fixture file, unchanged or improved recall after the edit
+without reparsing unchanged files, and no stale hit presented as current. Internal
+regression gate only: not competitor parity and not proof of task success. No model or
+provider calls.
 """
 
 import argparse
@@ -40,6 +43,14 @@ def judge_search(q, body, top_k):
     return path_hit, span_hit, [(h.get("path"), h.get("line")) for h in top]
 
 
+def reciprocal_rank(q, body, top_k):
+    """1/rank of the first hit on the gold path within top_k, else 0."""
+    for i, h in enumerate(((body or {}).get("hits") or [])[:top_k]):
+        if h.get("path") == q["gold"]["path"]:
+            return 1.0 / (i + 1)
+    return 0.0
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--report")
@@ -47,6 +58,8 @@ def main():
     args = ap.parse_args()
     spec = json.load(open(os.path.join(GOLD, "queries.json")))
     top_k, pass_min = spec["top_k"], spec["pass_min"]
+    span_min, mrr_min = spec.get("span_min", 0), spec.get("mrr_min", 0.0)
+    body_queries, body_pass_min = spec.get("body_queries", []), spec.get("body_pass_min", 0)
     checks = Checks("retrieval-gate")
     tmp = tempfile.mkdtemp(prefix="xm-gold-")
     api = None
@@ -82,7 +95,7 @@ def main():
             api.request("POST", f"/api/workspaces/{ws}/context", {"content": m, "paths": [contra["gold"]["path"]]})
 
         def run_pass(label):
-            score, spans, rows, coverage, latencies = 0, 0, [], None, []
+            score, spans, rows, coverage, latencies, rr = 0, 0, [], None, [], []
             for q in spec["queries"]:
                 ok, detail = False, ""
                 if q["kind"] == "search":
@@ -91,6 +104,7 @@ def main():
                     coverage = coverage or (body or {}).get("coverage")
                     ok, span_ok, top = judge_search(q, body, top_k)
                     spans += span_ok
+                    rr.append(reciprocal_rank(q, body, top_k))
                     detail = f"top{top_k}={top}"
                 elif q["kind"] == "failure_evidence":
                     log = "".join(f"PASS web/src/suite_{i:04d}.test.ts > case {i} ok\n" for i in range(q["log"]["passing_lines"]))
@@ -117,9 +131,23 @@ def main():
                     detail = f"returned={len(texts)} conflicts={len(body.get('conflicts') or [])}"
                 score += ok
                 rows.append({"id": q["id"], "ok": ok, "detail": detail})
-            results["passes"][label] = {"score": score, "span_hits": spans, "rows": rows,
+            body_score, body_rows = 0, []
+            for q in body_queries:
+                st, body, dt = search(api, ws, q["query"])
+                latencies.append(dt)
+                _, span_ok, top = judge_search(q, body, top_k)
+                body_score += span_ok
+                body_rows.append({"id": q["id"], "ok": span_ok, "detail": f"top{top_k}={top}"})
+            mrr = sum(rr) / len(rr)
+            results["passes"][label] = {"score": score, "span_hits": spans, "mrr": round(mrr, 4), "rows": rows,
+                                         "body_score": body_score, "body_rows": body_rows,
                                          "search_latency_s": {"mean": sum(latencies) / len(latencies), "max": max(latencies)}}
             checks.check(f"{label}: >= {pass_min}/12 gold in top {top_k}", score >= pass_min, f"{score}/12, spans {spans}/10; misses {[r['id'] for r in rows if not r['ok']]}")
+            checks.check(f"{label}: >= {span_min}/10 gold spans in top {top_k}", spans >= span_min, f"{spans}/10")
+            checks.check(f"{label}: gold-path MRR@{top_k} >= {mrr_min}", mrr >= mrr_min, f"{mrr:.4f}")
+            if body_queries:
+                checks.check(f"{label}: >= {body_pass_min}/{len(body_queries)} body queries with the gold span in top {top_k}",
+                             body_score >= body_pass_min, f"{body_score}/{len(body_queries)}; misses {[r['id'] for r in body_rows if not r['ok']]}")
             return score, coverage
 
         cold, coverage = run_pass("cold")

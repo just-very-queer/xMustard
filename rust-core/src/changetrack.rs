@@ -3,16 +3,25 @@
 //! stale-index + sibling-clone drift detection, changed-since computation, and
 //! dirty *symbols* (not just dirty files). This is the honesty layer the
 //! semantic index keys off of — it refuses to give stale answers silently.
+//!
+//! Per-call work is bounded (PAR-RT-11). A change set lists at most
+//! `ChangeBounds::listed_files` files and `symbols` dirty symbols, still counting every
+//! one, and reads at most `symbol_files` changed source files, each once whatever its
+//! symbol count; `truncation` says what was cut. A count it could not determine (a
+//! failed Git listing, changed source files left unread, no baseline to compare
+//! signatures against) is null and named in `unknown`, never 0.
 
 use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-use crate::repomap;
+use crate::repomap::{self, RustChangedSymbolRecord};
+use crate::symbolgraph::{MAX_REPO_FILE_BYTES, SourceReadFailure, read_source_beneath};
 
 fn now() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
@@ -32,35 +41,50 @@ fn git(root: &Path, args: &[&str]) -> Option<String> {
     if text.is_empty() { None } else { Some(text) }
 }
 
-fn tracked_files(root: &Path) -> Vec<String> {
-    // NUL-delimited and untrimmed, so whitespace/newline names stay exact.
+/// A result field that could not be determined, and why. It stands in for a count
+/// that would otherwise read as 0.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct Unknown {
+    pub field: String,
+    pub reason: String,
+}
+
+impl Unknown {
+    fn new(field: &str, reason: impl Into<String>) -> Self {
+        Unknown {
+            field: field.to_string(),
+            reason: reason.into(),
+        }
+    }
+}
+
+/// A bounded Git listing; a failure (not a repository, git missing, a timeout, output
+/// past the cap) is an error, never an empty listing.
+fn git_listing(root: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     crate::indexcache::run_git_bounded(
         root,
-        &["ls-files", "-z"],
+        args,
         crate::indexcache::MAX_GIT_OUTPUT_BYTES,
         crate::indexcache::git_timeout(),
     )
-    .map(|out| {
-        out.split(|b| *b == 0)
-            .filter(|p| !p.is_empty())
-            .filter_map(|p| String::from_utf8(p.to_vec()).ok())
-            .collect()
-    })
-    .unwrap_or_default()
+    .map_err(|e| format!("git {}: {e}", args[0]))
+}
+
+fn tracked_files(root: &Path) -> Result<Vec<String>, String> {
+    // NUL-delimited and untrimmed, so whitespace/newline names stay exact.
+    let out = git_listing(root, &["ls-files", "-z"])?;
+    Ok(out
+        .split(|b| *b == 0)
+        .filter(|p| !p.is_empty())
+        .filter_map(|p| String::from_utf8(p.to_vec()).ok())
+        .collect())
 }
 
 /// `git status --porcelain=v1 -z` parsed into (status_code, path), untrimmed; a rename
 /// reports its new path.
-fn dirty_paths(root: &Path) -> Vec<(String, String)> {
-    let Ok(out) = crate::indexcache::run_git_bounded(
-        root,
-        &["status", "--porcelain=v1", "-z"],
-        crate::indexcache::MAX_GIT_OUTPUT_BYTES,
-        crate::indexcache::git_timeout(),
-    ) else {
-        return Vec::new();
-    };
-    crate::indexcache::parse_porcelain_v1_z(&out)
+fn dirty_paths(root: &Path) -> Result<Vec<(String, String)>, String> {
+    let out = git_listing(root, &["status", "--porcelain=v1", "-z"])?;
+    Ok(crate::indexcache::parse_porcelain_v1_z(&out)
         .into_iter()
         .map(|e| {
             (
@@ -68,7 +92,7 @@ fn dirty_paths(root: &Path) -> Vec<(String, String)> {
                 String::from_utf8_lossy(&e.path).into_owned(),
             )
         })
-        .collect()
+        .collect())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -87,17 +111,19 @@ pub struct RepoFingerprint {
 /// Build the file-hash map (path -> sha256) over tracked files. Files are hashed through
 /// the no-follow, bounded, regular-file-checked opener; unchanged ones come from the
 /// stat cache in the Git dir, so only new, edited or racy files are read.
-fn file_hash_map(root: &Path) -> BTreeMap<String, String> {
-    file_hash_map_counted(root).0
+fn file_hash_map(root: &Path) -> Result<BTreeMap<String, String>, String> {
+    file_hash_map_counted(root).map(|(map, _)| map)
 }
 
-fn file_hash_map_counted(root: &Path) -> (BTreeMap<String, String>, crate::hashcache::HashPass) {
+fn file_hash_map_counted(
+    root: &Path,
+) -> Result<(BTreeMap<String, String>, crate::hashcache::HashPass), String> {
     // resolve the cache location (one `git rev-parse`) while `git ls-files` runs.
     let (rels, cache) = std::thread::scope(|s| {
         let cache = s.spawn(|| crate::hashcache::cache_file(root));
         (tracked_files(root), cache.join().ok().flatten())
     });
-    crate::hashcache::hash_files(root, rels, cache.as_deref())
+    Ok(crate::hashcache::hash_files(root, rels?, cache.as_deref()))
 }
 
 fn content_hash_of(map: &BTreeMap<String, String>) -> String {
@@ -111,26 +137,262 @@ fn content_hash_of(map: &BTreeMap<String, String>) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-/// Compute the current repo fingerprint.
-pub fn compute_fingerprint(root: &Path) -> RepoFingerprint {
-    let map = file_hash_map(root);
-    let dirty = dirty_paths(root);
+fn fingerprint_of(
+    root: &Path,
+    head_sha: Option<String>,
+    map: &BTreeMap<String, String>,
+    dirty_path_count: usize,
+) -> RepoFingerprint {
     RepoFingerprint {
         root: root.display().to_string(),
-        head_sha: git(root, &["rev-parse", "HEAD"]),
+        head_sha,
         branch: git(root, &["rev-parse", "--abbrev-ref", "HEAD"]),
         remote_url: git(root, &["remote", "get-url", "origin"]),
         tracked_file_count: map.len(),
-        content_hash: content_hash_of(&map),
-        dirty: !dirty.is_empty(),
-        dirty_path_count: dirty.len(),
+        content_hash: content_hash_of(map),
+        dirty: dirty_path_count > 0,
+        dirty_path_count,
         generated_at: now(),
+    }
+}
+
+/// Compute the current repo fingerprint. A worktree Git cannot list is an error, not
+/// the fingerprint of an empty repository.
+pub fn compute_fingerprint(root: &Path) -> Result<RepoFingerprint, String> {
+    let map = file_hash_map(root)?;
+    let dirty = dirty_paths(root)?;
+    let head = git(root, &["rev-parse", "HEAD"]);
+    Ok(fingerprint_of(root, head, &map, dirty.len()))
+}
+
+/// A tracked path whose index or worktree content differs from HEAD, and HEAD's entry
+/// for it: its mode (`000000` when HEAD has no such path) and blob.
+struct HeadEntry {
+    path: String,
+    mode: String,
+    oid: String,
+}
+
+impl HeadEntry {
+    /// HEAD holds a regular file here, not nothing, a symlink or a submodule.
+    fn is_regular(&self) -> bool {
+        matches!(self.mode.as_str(), "100644" | "100755")
+    }
+}
+
+/// The tracked paths under `root` with uncommitted changes against commit `head`
+/// (`git diff <head> --raw`, a rename split into a deletion and an addition), relative
+/// to `root`. Without a commit every tracked path in `tracked` is uncommitted.
+fn changed_from_head(
+    root: &Path,
+    head: Option<&str>,
+    tracked: &BTreeMap<String, String>,
+) -> Result<Vec<HeadEntry>, String> {
+    let Some(head) = head else {
+        return Ok(tracked
+            .keys()
+            .map(|path| HeadEntry {
+                path: path.clone(),
+                mode: "000000".into(),
+                oid: String::new(),
+            })
+            .collect());
+    };
+    let out = git_listing(
+        root,
+        &[
+            "diff",
+            "--raw",
+            "-z",
+            "--no-renames",
+            "--relative",
+            "--no-abbrev",
+            "--no-ext-diff",
+            "--no-color",
+            "--ignore-submodules=all",
+            head,
+            "--",
+        ],
+    )?;
+    parse_raw_diff(&out)
+}
+
+/// Parse `git diff --raw -z --no-renames`: `:srcmode dstmode srcoid dstoid status NUL
+/// path NUL` per path. A path that is not UTF-8 is skipped, as the tracked listing
+/// skips it; a malformed record fails the parse.
+fn parse_raw_diff(out: &[u8]) -> Result<Vec<HeadEntry>, String> {
+    let malformed = || "git diff: malformed --raw record".to_string();
+    let mut fields = out.split(|b| *b == 0).filter(|f| !f.is_empty());
+    let mut entries = Vec::new();
+    while let Some(meta) = fields.next() {
+        let meta = std::str::from_utf8(meta).map_err(|_| malformed())?;
+        let path = fields.next().ok_or_else(malformed)?;
+        let parts: Vec<&str> = meta
+            .strip_prefix(':')
+            .ok_or_else(malformed)?
+            .split(' ')
+            .collect();
+        let [mode, _, oid, _, _] = parts[..] else {
+            return Err(malformed());
+        };
+        if let Ok(path) = String::from_utf8(path.to_vec()) {
+            entries.push(HeadEntry {
+                path,
+                mode: mode.to_string(),
+                oid: oid.to_string(),
+            });
+        }
+    }
+    Ok(entries)
+}
+
+/// One `git cat-file` pass over `oids`: `--batch-check` reports each object's size,
+/// `--batch` its bytes too, in request order. An object that is missing or not a blob
+/// fails the pass.
+fn cat_file_blobs(
+    root: &Path,
+    mode: &str,
+    oids: &[&str],
+    max_bytes: usize,
+) -> Result<Vec<(u64, Vec<u8>)>, String> {
+    let input: Vec<u8> = oids.iter().flat_map(|o| o.bytes().chain([b'\n'])).collect();
+    let out = crate::indexcache::run_git_bounded_input(
+        root,
+        &["cat-file", mode],
+        input,
+        max_bytes,
+        crate::indexcache::git_timeout(),
+    )
+    .map_err(|e| format!("git cat-file: {e}"))?;
+    let with_bytes = mode == "--batch";
+    let mut rest = out.as_slice();
+    let mut blobs = Vec::with_capacity(oids.len());
+    for oid in oids {
+        let truncated = || format!("git cat-file: output ends before {oid}");
+        let nl = rest
+            .iter()
+            .position(|b| *b == b'\n')
+            .ok_or_else(truncated)?;
+        let header = String::from_utf8_lossy(&rest[..nl]).into_owned();
+        rest = &rest[nl + 1..];
+        let size = match header.split(' ').collect::<Vec<_>>()[..] {
+            [_, "blob", size] => size.parse::<u64>().ok(),
+            _ => None,
+        }
+        .ok_or_else(|| format!("git cat-file: HEAD blob {oid} unreadable: {header}"))?;
+        let mut body = Vec::new();
+        if with_bytes {
+            let n = usize::try_from(size).map_err(|_| truncated())?;
+            body = rest.get(..n).ok_or_else(truncated)?.to_vec();
+            rest = rest.get(n + 1..).ok_or_else(truncated)?; // the blob's trailing LF
+        }
+        blobs.push((size, body));
+    }
+    Ok(blobs)
+}
+
+/// The most HEAD content read in one `git cat-file --batch`; one blob always fits.
+const BLOB_BATCH_BYTES: u64 = MAX_REPO_FILE_BYTES;
+
+/// Room per object for its `--batch` header and trailing LF.
+const CAT_FILE_RECORD_BYTES: usize = 128;
+
+/// HEAD's content of `entries` (regular files), handed to `each` batch by batch. Sizes
+/// come first, so a blob past `MAX_REPO_FILE_BYTES` is never read: hashing leaves such
+/// a file out of the baseline too.
+fn for_each_head_blob(
+    root: &Path,
+    entries: Vec<&HeadEntry>,
+    mut each: impl FnMut(&HeadEntry, Vec<u8>),
+) -> Result<(), String> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let oids: Vec<&str> = entries.iter().map(|e| e.oid.as_str()).collect();
+    let sizes = cat_file_blobs(
+        root,
+        "--batch-check",
+        &oids,
+        CAT_FILE_RECORD_BYTES * oids.len(),
+    )?;
+    let wanted: Vec<(&HeadEntry, u64)> = entries
+        .into_iter()
+        .zip(sizes)
+        .map(|(e, (size, _))| (e, size))
+        .filter(|(_, size)| *size <= MAX_REPO_FILE_BYTES)
+        .collect();
+    let mut start = 0;
+    while start < wanted.len() {
+        let (mut end, mut total) = (start, 0u64);
+        while end < wanted.len() && (end == start || total + wanted[end].1 <= BLOB_BATCH_BYTES) {
+            total += wanted[end].1;
+            end += 1;
+        }
+        let batch = &wanted[start..end];
+        let oids: Vec<&str> = batch.iter().map(|(e, _)| e.oid.as_str()).collect();
+        let cap = usize::try_from(total)
+            .unwrap_or(usize::MAX)
+            .saturating_add(CAT_FILE_RECORD_BYTES * batch.len());
+        let blobs = cat_file_blobs(root, "--batch", &oids, cap)?;
+        for ((entry, _), (_, bytes)) in batch.iter().zip(blobs) {
+            each(entry, bytes);
+        }
+        start = end;
+    }
+    Ok(())
+}
+
+/// Why an index baseline was built (PAR-FRESH-06). Only `Admin` is an explicit request
+/// (POST /index, which needs the indexer or admin role); the others are automatic.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BaselineReason {
+    /// The workspace was registered.
+    Registration,
+    /// The first ground found no baseline.
+    FirstGround,
+    /// HEAD moved while the worktree was clean.
+    HeadChanged,
+    /// An explicit rebaseline; also every baseline written before reasons were recorded,
+    /// when POST /index was the only writer.
+    #[default]
+    Admin,
+}
+
+impl BaselineReason {
+    pub const ALL: [BaselineReason; 4] = [
+        BaselineReason::Registration,
+        BaselineReason::FirstGround,
+        BaselineReason::HeadChanged,
+        BaselineReason::Admin,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BaselineReason::Registration => "registration",
+            BaselineReason::FirstGround => "first_ground",
+            BaselineReason::HeadChanged => "head_changed",
+            BaselineReason::Admin => "admin",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|r| r.as_str() == s)
+    }
+
+    /// Whether the baseline was built without an explicit request.
+    pub fn auto(self) -> bool {
+        self != BaselineReason::Admin
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct IndexBaseline {
     pub workspace_id: String,
+    /// The fingerprint of the baseline's content. Its `dirty` and `dirty_path_count`
+    /// count the tracked paths whose uncommitted content the baseline took in: only an
+    /// explicit rebaseline takes the worktree as it is (see `build_baseline`). A
+    /// baseline written before that counted every uncommitted path, untracked included.
     pub fingerprint: RepoFingerprint,
     pub file_hashes: BTreeMap<String, String>,
     /// Per-symbol declaration signatures captured at index time, keyed by
@@ -139,7 +401,59 @@ pub struct IndexBaseline {
     /// modified file. `serde(default)` so pre-R2 baselines still load.
     #[serde(default)]
     pub signatures: BTreeMap<String, String>,
+    /// Why this baseline was built; baselines written before WS-22 read as `admin`.
+    #[serde(default)]
+    pub reason: BaselineReason,
+    /// Tracked paths with uncommitted changes that an automatic baseline took as HEAD
+    /// has them (their content, or their absence).
+    #[serde(default)]
+    pub from_head: usize,
     pub indexed_at: String,
+}
+
+/// What `changetrack index` reports: the new baseline's identity, not its per-file maps
+/// (those grow with the repository and stay in the baseline file).
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct BaselineSummary {
+    pub workspace_id: String,
+    pub head: Option<String>,
+    pub branch: Option<String>,
+    pub indexed_at: String,
+    pub auto: bool,
+    pub reason: BaselineReason,
+    /// The baseline took in uncommitted changes to tracked files: an explicit rebaseline
+    /// of a dirty worktree. Contract breaks in those changes are not reported against it.
+    pub dirty: bool,
+    /// Tracked paths with uncommitted changes that the baseline took as HEAD has them.
+    pub from_head: usize,
+    pub tracked_files: usize,
+    pub signatures: usize,
+    /// Whether a baseline file existed before this build, its HEAD, and why it could not
+    /// be read when it could not.
+    pub replaced: bool,
+    pub previous_head: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_error: Option<String>,
+}
+
+impl From<&IndexBaseline> for BaselineSummary {
+    fn from(b: &IndexBaseline) -> Self {
+        BaselineSummary {
+            workspace_id: b.workspace_id.clone(),
+            head: b.fingerprint.head_sha.clone(),
+            branch: b.fingerprint.branch.clone(),
+            indexed_at: b.indexed_at.clone(),
+            auto: b.reason.auto(),
+            reason: b.reason,
+            dirty: b.fingerprint.dirty,
+            from_head: b.from_head,
+            tracked_files: b.file_hashes.len(),
+            signatures: b.signatures.len(),
+            replaced: false,
+            previous_head: None,
+            previous_error: None,
+        }
+    }
 }
 
 /// Stable key for a symbol's signature across re-indexes: path + enclosing scope
@@ -154,18 +468,11 @@ fn signature_key(path: &str, scope: Option<&str>, symbol: &str) -> String {
 /// This captures the parameter list and return type so a change to either is
 /// detectable, while a change to the body (after `{`) leaves the signature
 /// unchanged — exactly the contract-vs-implementation distinction we want.
-fn symbol_signature(root: &Path, rel_path: &str, line_start: Option<usize>) -> Option<String> {
-    let ls = line_start?; // 1-based
-    if ls == 0 {
-        return None;
-    }
-    let full = crate::symbolgraph::read_repo_file_beneath(root, rel_path).ok()?;
-    let lines: Vec<&str> = full.lines().collect();
-    if ls > lines.len() {
-        return None;
-    }
+/// `lines` is the file's text, read once for all of its symbols.
+fn symbol_signature(lines: &[&str], line_start: Option<usize>) -> Option<String> {
+    let start = line_start.filter(|&ls| ls > 0 && ls <= lines.len())? - 1; // 1-based
     let mut sig = String::new();
-    for line in lines.iter().skip(ls - 1).take(6) {
+    for line in lines.iter().skip(start).take(6) {
         if let Some(idx) = line.find('{') {
             sig.push_str(&line[..idx]);
             break; // brace languages: the body starts here, stop before it
@@ -232,78 +539,260 @@ fn classify_signature_change(old: &str, new: &str) -> String {
     }
 }
 
-/// Capture a signature map over all tracked source files for the baseline.
-fn collect_signatures(root: &Path, workspace_id: &str) -> BTreeMap<String, String> {
-    let mut sigs = BTreeMap::new();
-    for path in file_hash_map(root).keys() {
-        if !is_source(path) {
-            continue;
-        }
-        if let Ok(result) =
-            repomap::extract_path_symbols_limited(root, workspace_id, path, usize::MAX)
-        {
-            for sym in &result.symbols {
-                if !is_contract_kind(&sym.kind) {
-                    continue;
-                }
-                if let Some(sig) = symbol_signature(root, path, sym.line_start) {
-                    sigs.insert(
-                        signature_key(path, sym.enclosing_scope.as_deref(), &sym.symbol),
-                        sig,
-                    );
-                }
-            }
-        }
+thread_local! {
+    static SOURCE_READS: Cell<u64> = const { Cell::new(0) };
+}
+
+/// How many source files this thread has read for symbols and signatures, from the
+/// worktree or (an automatic baseline's uncommitted paths) from HEAD. A pass reads each
+/// file at most once, whatever its symbol count (PAR-RT-11); tests hold it to that.
+pub fn source_reads_on_this_thread() -> u64 {
+    SOURCE_READS.with(Cell::get)
+}
+
+/// A symbol of a source file, with its declaration signature when it is a contract kind.
+struct FileSymbol {
+    record: RustChangedSymbolRecord,
+    signature: Option<String>,
+}
+
+/// Why a source file contributed no symbols.
+enum SourceSkip {
+    /// A path or file the extractor never reads: excluded, oversized, a symlink, not a
+    /// regular file, gone, or not UTF-8.
+    Policy,
+    /// A read error.
+    Error(String),
+}
+
+/// Read `rel` once and extract its symbols, each contract symbol with its signature
+/// taken from the same text.
+fn read_file_symbols(root: &Path, rel: &str) -> Result<Vec<FileSymbol>, SourceSkip> {
+    if !repomap::should_scan_file(rel) {
+        return Err(SourceSkip::Policy);
     }
-    sigs
+    SOURCE_READS.with(|n| n.set(n.get() + 1));
+    let bytes =
+        read_source_beneath(root, Path::new(rel), MAX_REPO_FILE_BYTES).map_err(|f| match f {
+            SourceReadFailure::Unreadable(e) => SourceSkip::Error(e),
+            _ => SourceSkip::Policy,
+        })?;
+    symbols_in(rel, bytes)
+}
+
+/// The symbols of `rel` from its content `bytes`, each contract symbol with its
+/// signature taken from the same text. Content that is not UTF-8 has none.
+fn symbols_in(rel: &str, bytes: Vec<u8>) -> Result<Vec<FileSymbol>, SourceSkip> {
+    let text = String::from_utf8(bytes).map_err(|_| SourceSkip::Policy)?;
+    let lines: Vec<&str> = text.lines().collect();
+    let extracted =
+        repomap::extract_source_symbols(rel, &text, crate::treesitter::MAX_SYMBOLS_PER_FILE);
+    Ok(extracted
+        .symbols
+        .into_iter()
+        .map(|record| FileSymbol {
+            signature: is_contract_kind(&record.kind)
+                .then(|| symbol_signature(&lines, record.line_start))
+                .flatten(),
+            record,
+        })
+        .collect())
+}
+
+/// The signature-map entries of `path`'s contract symbols.
+fn signature_entries(
+    path: &str,
+    symbols: Vec<FileSymbol>,
+) -> impl Iterator<Item = (String, String)> + '_ {
+    symbols.into_iter().filter_map(move |s| {
+        let key = signature_key(path, s.record.enclosing_scope.as_deref(), &s.record.symbol);
+        s.signature.map(|sig| (key, sig))
+    })
+}
+
+/// The signature map of the contract symbols in `paths`' source files, each read once.
+fn collect_signatures<'a>(
+    root: &Path,
+    paths: impl Iterator<Item = &'a String>,
+) -> BTreeMap<String, String> {
+    paths
+        .filter(|p| is_symbol_source(p))
+        .filter_map(|p| read_file_symbols(root, p).ok().map(|symbols| (p, symbols)))
+        .flat_map(|(p, symbols)| signature_entries(p, symbols))
+        .collect()
 }
 
 fn baseline_path(data_dir: &Path, workspace_id: &str) -> std::path::PathBuf {
-    data_dir
-        .join("workspaces")
-        .join(workspace_id)
-        .join("index_baseline.json")
+    workspace_dir_ct(data_dir, workspace_id).join("index_baseline.json")
 }
 
-/// Build and persist an index baseline for the current repo state.
+/// Where `changetrack index --stage` writes a baseline that replaces nothing yet: the
+/// caller records it in the governance history first and then renames it to the
+/// baseline path, so no baseline is replaced unrecorded.
+pub fn staged_baseline_path(data_dir: &Path, workspace_id: &str) -> std::path::PathBuf {
+    workspace_dir_ct(data_dir, workspace_id).join("index_baseline.staged.json")
+}
+
+/// Build and persist an explicit (admin) index baseline for the current repo state.
 pub fn build_index_baseline(
     data_dir: &Path,
     root: &Path,
     workspace_id: &str,
 ) -> std::io::Result<IndexBaseline> {
-    let map = file_hash_map(root);
-    let dirty = dirty_paths(root);
-    let fingerprint = RepoFingerprint {
-        root: root.display().to_string(),
-        head_sha: git(root, &["rev-parse", "HEAD"]),
-        branch: git(root, &["rev-parse", "--abbrev-ref", "HEAD"]),
-        remote_url: git(root, &["remote", "get-url", "origin"]),
-        tracked_file_count: map.len(),
-        content_hash: content_hash_of(&map),
-        dirty: !dirty.is_empty(),
-        dirty_path_count: dirty.len(),
-        generated_at: now(),
-    };
-    let signatures = collect_signatures(root, workspace_id);
-    let baseline = IndexBaseline {
-        workspace_id: workspace_id.to_string(),
-        fingerprint,
-        file_hashes: map,
-        signatures,
-        indexed_at: now(),
-    };
-    let path = baseline_path(data_dir, workspace_id);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let body = serde_json::to_vec_pretty(&baseline).map_err(std::io::Error::other)?;
-    fs::write(&path, body)?;
+    rebaseline(data_dir, root, workspace_id, BaselineReason::Admin)
+}
+
+/// Build an index baseline for the current repo state and replace the stored one
+/// atomically. A worktree Git cannot list fails the build: an empty baseline would
+/// silently reset every later diff.
+pub fn rebaseline(
+    data_dir: &Path,
+    root: &Path,
+    workspace_id: &str,
+    reason: BaselineReason,
+) -> std::io::Result<IndexBaseline> {
+    let baseline = build_baseline(root, workspace_id, reason).map_err(std::io::Error::other)?;
+    write_baseline(&baseline_path(data_dir, workspace_id), &baseline)?;
     Ok(baseline)
 }
 
+/// The baseline of the current repo state. An automatic baseline is the committed
+/// state: a tracked path with uncommitted changes is taken as HEAD has it (HEAD's
+/// content, read in `git cat-file` passes, or its absence), so those changes are still
+/// compared against it and their contract breaks reported. An explicit rebaseline
+/// (`admin`) accepts the worktree as it is, and its fingerprint counts the uncommitted
+/// paths it took in. Each source file is read once, from the worktree or from HEAD.
+fn build_baseline(
+    root: &Path,
+    workspace_id: &str,
+    reason: BaselineReason,
+) -> Result<IndexBaseline, String> {
+    let mut file_hashes = file_hash_map(root)?;
+    let head = git(root, &["rev-parse", "HEAD"]);
+    let uncommitted = changed_from_head(root, head.as_deref(), &file_hashes)?;
+    let committed = reason.auto();
+    let from_head: BTreeSet<&str> = if committed {
+        uncommitted.iter().map(|e| e.path.as_str()).collect()
+    } else {
+        BTreeSet::new()
+    };
+    let mut signatures = collect_signatures(
+        root,
+        file_hashes
+            .keys()
+            .filter(|p| !from_head.contains(p.as_str())),
+    );
+    if committed {
+        for entry in &uncommitted {
+            file_hashes.remove(&entry.path);
+        }
+        let regular = uncommitted.iter().filter(|e| e.is_regular()).collect();
+        for_each_head_blob(root, regular, |entry, bytes| {
+            let digest = Sha256::digest(&bytes);
+            file_hashes.insert(entry.path.clone(), crate::symbolgraph::hex_lower(&digest));
+            if is_symbol_source(&entry.path) {
+                SOURCE_READS.with(|n| n.set(n.get() + 1));
+                if let Ok(symbols) = symbols_in(&entry.path, bytes) {
+                    signatures.extend(signature_entries(&entry.path, symbols));
+                }
+            }
+        })?;
+    }
+    let taken_in = if committed { 0 } else { uncommitted.len() };
+    Ok(IndexBaseline {
+        workspace_id: workspace_id.to_string(),
+        fingerprint: fingerprint_of(root, head, &file_hashes, taken_in),
+        file_hashes,
+        signatures,
+        reason,
+        from_head: from_head.len(),
+        indexed_at: now(),
+    })
+}
+
+fn write_baseline(path: &Path, baseline: &IndexBaseline) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    crate::indexcache::atomic_write_with(path, |w| {
+        serde_json::to_writer(w, baseline).map_err(std::io::Error::other)
+    })
+}
+
+/// Build a baseline and report its summary with the baseline file it replaces, if
+/// any. With `stage` it is written to `staged_baseline_path` and replaces nothing yet.
+pub fn rebaseline_summary(
+    data_dir: &Path,
+    root: &Path,
+    workspace_id: &str,
+    reason: BaselineReason,
+    stage: bool,
+) -> std::io::Result<BaselineSummary> {
+    #[derive(Deserialize)]
+    struct Head {
+        head_sha: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct Stored {
+        fingerprint: Head,
+    }
+    // only the stored fingerprint's head is decoded, not the per-file maps
+    let previous = read_baseline_as::<Stored>(data_dir, workspace_id);
+    let baseline = build_baseline(root, workspace_id, reason).map_err(std::io::Error::other)?;
+    let target = if stage {
+        staged_baseline_path(data_dir, workspace_id)
+    } else {
+        baseline_path(data_dir, workspace_id)
+    };
+    write_baseline(&target, &baseline)?;
+    Ok(BaselineSummary {
+        replaced: !matches!(previous, Ok(None)),
+        previous_head: previous
+            .as_ref()
+            .ok()
+            .and_then(|p| p.as_ref()?.fingerprint.head_sha.clone()),
+        previous_error: previous.err(),
+        ..BaselineSummary::from(&baseline)
+    })
+}
+
+/// The stored baseline decoded as `T`: Ok(None) when there is none, Err when it cannot
+/// be read or decoded.
+fn read_baseline_as<T: serde::de::DeserializeOwned>(
+    data_dir: &Path,
+    workspace_id: &str,
+) -> Result<Option<T>, String> {
+    let bytes = match fs::read(baseline_path(data_dir, workspace_id)) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("index baseline unreadable: {e}")),
+    };
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|e| format!("index baseline unreadable: {e}"))
+}
+
+/// The stored baseline: Ok(None) when there is none, Err when it cannot be read.
+fn read_baseline(data_dir: &Path, workspace_id: &str) -> Result<Option<IndexBaseline>, String> {
+    read_baseline_as(data_dir, workspace_id)
+}
+
 pub fn load_index_baseline(data_dir: &Path, workspace_id: &str) -> Option<IndexBaseline> {
-    let bytes = fs::read(baseline_path(data_dir, workspace_id)).ok()?;
-    serde_json::from_slice(&bytes).ok()
+    read_baseline(data_dir, workspace_id).ok().flatten()
+}
+
+/// Why there is no usable baseline: none exists, or it cannot be read.
+fn missing_baseline_reason(read: &Result<Option<IndexBaseline>, String>) -> String {
+    match read {
+        Err(e) => e.clone(),
+        _ => "no index baseline exists".to_string(),
+    }
+}
+
+/// The reasons that are present, joined; None when there are none.
+fn join_reasons(parts: impl IntoIterator<Item = Option<String>>) -> Option<String> {
+    let parts: Vec<String> = parts.into_iter().flatten().collect();
+    (!parts.is_empty()).then(|| parts.join("; "))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -314,80 +803,114 @@ pub struct DriftReport {
     pub head_changed: bool,
     pub content_changed: bool,
     pub sibling_clone: bool,
+    /// The worktree has uncommitted changes now.
+    pub dirty: bool,
     pub baseline_head: Option<String>,
     pub current_head: Option<String>,
     pub baseline_remote: Option<String>,
     pub current_remote: Option<String>,
+    /// When the baseline was built and why (null without one); every reason but
+    /// `admin` is automatic.
+    pub baseline_indexed_at: Option<String>,
+    pub baseline_reason: Option<BaselineReason>,
+    /// Whether the baseline took in uncommitted changes to tracked files (null without
+    /// one); see `BaselineSummary::dirty`.
+    pub baseline_dirty: Option<bool>,
+    /// Why the stored baseline cannot be read. It is then reported missing but kept: an
+    /// automatic build must not replace what it cannot see, so an indexer rebaselines.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub baseline_error: Option<String>,
     pub reasons: Vec<String>,
+    /// Why the worktree could not be fingerprinted; the report is then stale and its
+    /// comparison flags are not determined.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
     pub generated_at: String,
 }
 
 /// Detect whether the index baseline has drifted from the current worktree.
 pub fn detect_drift(data_dir: &Path, root: &Path, workspace_id: &str) -> DriftReport {
-    let current = compute_fingerprint(root);
-    let baseline = load_index_baseline(data_dir, workspace_id);
-    let mut reasons = Vec::new();
-    let Some(baseline) = baseline else {
-        return DriftReport {
-            workspace_id: workspace_id.to_string(),
-            has_baseline: false,
-            stale: true,
-            head_changed: false,
-            content_changed: false,
-            sibling_clone: false,
-            baseline_head: None,
-            current_head: current.head_sha.clone(),
-            baseline_remote: None,
-            current_remote: current.remote_url.clone(),
-            reasons: vec!["no index baseline exists; results would be unindexed".to_string()],
-            generated_at: now(),
-        };
+    let read = read_baseline(data_dir, workspace_id);
+    let missing = missing_baseline_reason(&read);
+    let baseline_error = read.as_ref().err().cloned();
+    let baseline = read.ok().flatten();
+    let meta = baseline.as_ref();
+    let mut report = DriftReport {
+        workspace_id: workspace_id.to_string(),
+        has_baseline: baseline.is_some(),
+        stale: true,
+        head_changed: false,
+        content_changed: false,
+        sibling_clone: false,
+        dirty: false,
+        baseline_head: meta.and_then(|b| b.fingerprint.head_sha.clone()),
+        current_head: None,
+        baseline_remote: meta.and_then(|b| b.fingerprint.remote_url.clone()),
+        current_remote: None,
+        baseline_indexed_at: meta.map(|b| b.indexed_at.clone()),
+        baseline_reason: meta.map(|b| b.reason),
+        baseline_dirty: meta.map(|b| b.fingerprint.dirty),
+        baseline_error,
+        reasons: Vec::new(),
+        error: None,
+        generated_at: now(),
     };
-    let head_changed = baseline.fingerprint.head_sha != current.head_sha;
-    let content_changed = baseline.fingerprint.content_hash != current.content_hash;
+    let current = match compute_fingerprint(root) {
+        Ok(current) => current,
+        Err(e) => {
+            report
+                .reasons
+                .push(format!("cannot fingerprint the worktree: {e}"));
+            report.error = Some(e);
+            return report;
+        }
+    };
+    report.current_head = current.head_sha.clone();
+    report.current_remote = current.remote_url.clone();
+    report.dirty = current.dirty;
+    let Some(baseline) = baseline else {
+        report
+            .reasons
+            .push(format!("{missing}; results would be unindexed"));
+        return report;
+    };
+    report.head_changed = baseline.fingerprint.head_sha != current.head_sha;
+    report.content_changed = baseline.fingerprint.content_hash != current.content_hash;
     // sibling clone: same logical repo (remote) but the baseline was built from a
     // different checkout/path, or the remote differs entirely.
-    let sibling_clone = match (&baseline.fingerprint.remote_url, &current.remote_url) {
+    report.sibling_clone = match (&baseline.fingerprint.remote_url, &current.remote_url) {
         (Some(b), Some(c)) => b != c,
-        _ => baseline.fingerprint.root != current.root && head_changed,
+        _ => baseline.fingerprint.root != current.root && report.head_changed,
     };
-    if head_changed {
-        reasons.push(format!(
-            "HEAD moved {} -> {}",
-            baseline
-                .fingerprint
-                .head_sha
-                .clone()
-                .unwrap_or_else(|| "?".into()),
-            current.head_sha.clone().unwrap_or_else(|| "?".into())
-        ));
-    }
-    if content_changed {
-        reasons.push("tracked file content changed since indexing".to_string());
-    }
-    if sibling_clone {
-        reasons.push("index baseline came from a different clone/remote".to_string());
-    }
-    if current.dirty {
-        reasons.push(format!(
-            "{} uncommitted dirty path(s)",
-            current.dirty_path_count
-        ));
-    }
-    DriftReport {
-        workspace_id: workspace_id.to_string(),
-        has_baseline: true,
-        stale: head_changed || content_changed || sibling_clone,
-        head_changed,
-        content_changed,
-        sibling_clone,
-        baseline_head: baseline.fingerprint.head_sha,
-        current_head: current.head_sha,
-        baseline_remote: baseline.fingerprint.remote_url,
-        current_remote: current.remote_url,
-        reasons,
-        generated_at: now(),
-    }
+    report.stale = report.head_changed || report.content_changed || report.sibling_clone;
+    let flagged = [
+        (
+            report.head_changed,
+            format!(
+                "HEAD moved {} -> {}",
+                baseline.fingerprint.head_sha.as_deref().unwrap_or("?"),
+                current.head_sha.as_deref().unwrap_or("?")
+            ),
+        ),
+        (
+            report.content_changed,
+            "tracked file content changed since indexing".to_string(),
+        ),
+        (
+            report.sibling_clone,
+            "index baseline came from a different clone/remote".to_string(),
+        ),
+        (
+            current.dirty,
+            format!("{} uncommitted dirty path(s)", current.dirty_path_count),
+        ),
+    ];
+    report.reasons.extend(
+        flagged
+            .into_iter()
+            .filter_map(|(flag, reason)| flag.then_some(reason)),
+    );
+    report
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -412,16 +935,94 @@ pub struct DirtySymbol {
     pub signature_change: Option<String>,
 }
 
+/// Caps on one changed-since or working-changes pass (PAR-RT-11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChangeBounds {
+    /// Changed files listed in `changed_files`; every one is still counted.
+    pub listed_files: usize,
+    /// Changed source files read for dirty symbols (modified files first).
+    pub symbol_files: usize,
+    /// Dirty symbols listed; every one is still counted.
+    pub symbols: usize,
+}
+
+impl ChangeBounds {
+    /// The bounds of every changed-since and working-changes call.
+    pub const DEFAULT: ChangeBounds = ChangeBounds {
+        listed_files: 1000,
+        symbol_files: 200,
+        symbols: 2000,
+    };
+}
+
+/// How a change set was cut short.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct Truncation {
+    pub reason: String,
+    pub files_listed: usize,
+    pub files_total: usize,
+    /// Changed source files read for symbols, of those that could be.
+    pub symbol_files_read: usize,
+    pub symbol_files_total: usize,
+    /// Dirty symbols listed, of those found in the files read.
+    pub symbols_listed: usize,
+    pub symbols_total: usize,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ChangeSet {
     pub workspace_id: String,
     pub since: String,
-    pub changed_files: Vec<ChangedFile>,
-    pub dirty_symbols: Vec<DirtySymbol>,
+    /// Whether an index baseline was compared against. Without one, changed-since
+    /// lists tracked files as added (capped, no symbols) and contract breaks are unknown.
+    pub has_baseline: bool,
+    /// The changed files, at most `ChangeBounds::listed_files`; null when Git could
+    /// not list them.
+    pub changed_files: Option<Vec<ChangedFile>>,
+    /// Every changed file, listed or not; null when Git could not list them.
+    pub changed_files_total: Option<usize>,
+    /// Symbols of the changed source files read this pass, at most
+    /// `ChangeBounds::symbols` (contract breaks first); a partial pass is named in
+    /// `unknown`, and null means none could be determined.
+    pub dirty_symbols: Option<Vec<DirtySymbol>>,
+    /// Every dirty symbol, listed or not; null when the pass was partial.
+    pub dirty_symbols_total: Option<usize>,
     /// Count of dirty symbols whose signature broke vs the baseline (surfaced
-    /// prominently by `impact`/`ground`).
-    pub contract_breaks: usize,
+    /// prominently by `impact`/`ground`); null when the symbol pass was partial or
+    /// there is no baseline to compare against.
+    pub contract_breaks: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub truncation: Option<Truncation>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub unknown: Vec<Unknown>,
     pub generated_at: String,
+}
+
+impl ChangeSet {
+    fn new(workspace_id: &str, since: &str, has_baseline: bool) -> Self {
+        ChangeSet {
+            workspace_id: workspace_id.to_string(),
+            since: since.to_string(),
+            has_baseline,
+            changed_files: None,
+            changed_files_total: None,
+            dirty_symbols: None,
+            dirty_symbols_total: None,
+            contract_breaks: None,
+            truncation: None,
+            unknown: Vec::new(),
+            generated_at: now(),
+        }
+    }
+
+    /// Git could not list the changes: every count is unknown, for the same reason.
+    fn unlisted(mut self, reason: &str) -> Self {
+        self.unknown = ["changed_files", "dirty_symbols", "contract_breaks"]
+            .into_iter()
+            .map(|field| Unknown::new(field, reason))
+            .collect();
+        self
+    }
 }
 
 // Change-tracking treats the same files the symbol graph does (code + tests) as
@@ -429,6 +1030,12 @@ pub struct ChangeSet {
 // keeping its own duplicate extension list (XM-PRO-012).
 fn is_source(path: &str) -> bool {
     matches!(crate::symbolgraph::repo_role(path), "code" | "test")
+}
+
+/// A source file the symbol extractor reads: not under a default-excluded directory
+/// (vendor/, node_modules/, ...) or otherwise outside the scan policy.
+fn is_symbol_source(path: &str) -> bool {
+    is_source(path) && repomap::should_scan_file(path)
 }
 
 /// Pure diff of two file-hash maps into added/modified/deleted.
@@ -462,86 +1069,261 @@ fn diff_hash_maps(
     out
 }
 
-/// Collect symbols in the changed (added/modified) source files, best-effort.
-/// When `baseline_sigs` is provided, each function/method symbol's current
-/// signature is diffed against the baseline to flag contract breaks (only on
-/// `modified` files — an `added` file has no prior contract to break).
-fn dirty_symbols_for(
+/// A dirty symbol of changed file `cf`. With the baseline's signatures, a modified
+/// file's contract symbol whose signature changed is a contract break (an added file
+/// has no prior contract to break).
+fn dirty_symbol(
+    cf: &ChangedFile,
+    s: FileSymbol,
+    sigs: Option<&BTreeMap<String, String>>,
+) -> DirtySymbol {
+    let key = signature_key(
+        &cf.path,
+        s.record.enclosing_scope.as_deref(),
+        &s.record.symbol,
+    );
+    let old = match sigs {
+        Some(sigs) if cf.change == "modified" => sigs.get(&key),
+        _ => None,
+    };
+    let signature_change = match (old, &s.signature) {
+        (Some(old), Some(new)) if old != new => Some(classify_signature_change(old, new)),
+        _ => None,
+    };
+    DirtySymbol {
+        path: cf.path.clone(),
+        symbol: s.record.symbol,
+        kind: s.record.kind,
+        change: cf.change.clone(),
+        contract_break: signature_change.is_some(),
+        signature_change,
+    }
+}
+
+/// What the dirty-symbol pass found.
+struct SymbolPass {
+    /// The listed symbols, at most `ChangeBounds::symbols`, contract breaks first, in
+    /// changed-file order.
+    listed: Vec<DirtySymbol>,
+    /// Every symbol, and every contract break, of the files read.
+    symbols: usize,
+    breaks: usize,
+    files_read: usize,
+    files_total: usize,
+    /// Why the pass did not read every changed source file, if it did not.
+    partial: Option<String>,
+}
+
+/// The dirty-symbol pass over `changed` within `bounds`. Modified files are read first
+/// and a listed contract break is never displaced by a plain symbol, so the caps keep
+/// contract-break detection. Counts stay exact past the listing cap; only a file left
+/// unread makes the pass partial.
+fn symbol_pass(
     root: &Path,
-    workspace_id: &str,
     changed: &[ChangedFile],
-    baseline_sigs: Option<&BTreeMap<String, String>>,
-) -> Vec<DirtySymbol> {
-    let mut out = Vec::new();
-    for cf in changed {
-        if cf.change == "deleted" || !is_source(&cf.path) {
-            continue;
-        }
-        if let Ok(result) =
-            repomap::extract_path_symbols_limited(root, workspace_id, &cf.path, usize::MAX)
-        {
-            for sym in result.symbols {
-                let mut contract_break = false;
-                let mut signature_change = None;
-                if cf.change == "modified"
-                    && is_contract_kind(&sym.kind)
-                    && let Some(sigs) = baseline_sigs
-                {
-                    let key = signature_key(&cf.path, sym.enclosing_scope.as_deref(), &sym.symbol);
-                    if let (Some(old), Some(new)) = (
-                        sigs.get(&key),
-                        symbol_signature(root, &cf.path, sym.line_start),
-                    ) && old != &new
-                    {
-                        contract_break = true;
-                        signature_change = Some(classify_signature_change(old, &new));
-                    }
-                }
-                out.push(DirtySymbol {
-                    path: cf.path.clone(),
-                    symbol: sym.symbol,
-                    kind: sym.kind,
-                    change: cf.change.clone(),
-                    contract_break,
-                    signature_change,
-                });
+    sigs: Option<&BTreeMap<String, String>>,
+    bounds: ChangeBounds,
+) -> SymbolPass {
+    // only files the extractor reads count toward the cap and the total
+    let mut candidates: Vec<&ChangedFile> = changed
+        .iter()
+        .filter(|cf| cf.change != "deleted" && is_symbol_source(&cf.path))
+        .collect();
+    candidates.sort_by_key(|cf| cf.change != "modified"); // stable: modified first
+    let mut pass = SymbolPass {
+        listed: Vec::new(),
+        symbols: 0,
+        breaks: 0,
+        files_read: 0,
+        files_total: candidates.len(),
+        partial: None,
+    };
+    // (discovery order, symbol); breaks and the rest are capped apart
+    let (mut breaks, mut rest) = (Vec::new(), Vec::new());
+    let mut errors = Vec::new();
+    for cf in candidates.iter().take(bounds.symbol_files) {
+        pass.files_read += 1;
+        let found = match read_file_symbols(root, &cf.path) {
+            Ok(found) => found,
+            Err(SourceSkip::Error(e)) => {
+                errors.push(format!("{}: {e}", cf.path));
+                continue;
+            }
+            Err(SourceSkip::Policy) => continue,
+        };
+        for s in found {
+            let d = dirty_symbol(cf, s, sigs);
+            pass.symbols += 1;
+            pass.breaks += usize::from(d.contract_break);
+            let kept = if d.contract_break {
+                &mut breaks
+            } else {
+                &mut rest
+            };
+            if kept.len() < bounds.symbols {
+                kept.push((pass.symbols, d));
             }
         }
     }
-    out
+    let room = bounds.symbols - breaks.len();
+    let mut listed: Vec<(usize, DirtySymbol)> = breaks
+        .into_iter()
+        .chain(rest.into_iter().take(room))
+        .collect();
+    listed.sort_by(|(ai, a), (bi, b)| a.path.cmp(&b.path).then(ai.cmp(bi)));
+    pass.listed = listed.into_iter().map(|(_, d)| d).collect();
+    pass.partial = join_reasons([
+        (pass.files_read < candidates.len()).then(|| {
+            format!(
+                "symbols were read from {} of {} changed source files (cap {})",
+                pass.files_read,
+                candidates.len(),
+                bounds.symbol_files
+            )
+        }),
+        (!errors.is_empty()).then(|| {
+            format!(
+                "{} changed source file(s) could not be read ({})",
+                errors.len(),
+                errors[0]
+            )
+        }),
+    ]);
+    pass
 }
 
-fn count_breaks(symbols: &[DirtySymbol]) -> usize {
-    symbols.iter().filter(|s| s.contract_break).count()
+/// A change set over `listed` changed files: at most `bounds.listed_files` listed, the
+/// rest counted, and dirty symbols from the symbol pass. `baseline` is the compared
+/// baseline's signatures, or why there is none.
+fn change_set(
+    root: &Path,
+    mut set: ChangeSet,
+    listed: Result<Vec<ChangedFile>, String>,
+    baseline: Result<&BTreeMap<String, String>, String>,
+    bounds: ChangeBounds,
+) -> ChangeSet {
+    let mut changed = match listed {
+        Ok(changed) => changed,
+        Err(e) => return set.unlisted(&e),
+    };
+    let pass = symbol_pass(root, &changed, baseline.as_ref().ok().copied(), bounds);
+    let total = changed.len();
+    changed.truncate(bounds.listed_files);
+    let cuts = [
+        (total > changed.len())
+            .then(|| format!("listed {} of {total} changed files", changed.len())),
+        (pass.symbols > pass.listed.len()).then(|| {
+            format!(
+                "listed {} of {} dirty symbols, contract breaks first",
+                pass.listed.len(),
+                pass.symbols
+            )
+        }),
+        pass.partial.clone(),
+    ];
+    if let Some(reason) = join_reasons(cuts) {
+        set.truncation = Some(Truncation {
+            reason,
+            files_listed: changed.len(),
+            files_total: total,
+            symbol_files_read: pass.files_read,
+            symbol_files_total: pass.files_total,
+            symbols_listed: pass.listed.len(),
+            symbols_total: pass.symbols,
+        });
+    }
+    match &pass.partial {
+        Some(why) => set
+            .unknown
+            .push(Unknown::new("dirty_symbols", format!("partial: {why}"))),
+        None => set.dirty_symbols_total = Some(pass.symbols),
+    }
+    // a contract-break count is exact only from a complete pass against a baseline
+    match baseline.err().or(pass.partial) {
+        Some(why) => set.unknown.push(Unknown::new("contract_breaks", why)),
+        None => set.contract_breaks = Some(pass.breaks),
+    }
+    set.changed_files_total = Some(total);
+    set.changed_files = Some(changed);
+    set.dirty_symbols = Some(pass.listed);
+    set
 }
 
 /// Compute what changed since the index baseline, including dirty symbols.
 pub fn changed_since_baseline(data_dir: &Path, root: &Path, workspace_id: &str) -> ChangeSet {
-    let current = file_hash_map(root);
-    let baseline = load_index_baseline(data_dir, workspace_id);
-    let changed_files = match &baseline {
-        Some(baseline) => diff_hash_maps(&baseline.file_hashes, &current),
-        None => current
-            .keys()
-            .map(|p| ChangedFile {
-                path: p.clone(),
-                change: "added".into(),
-            })
-            .collect(),
+    changed_since_baseline_bounded(data_dir, root, workspace_id, ChangeBounds::DEFAULT)
+}
+
+/// `changed_since_baseline` within `bounds`. Without a baseline every tracked file
+/// counts as added: they are listed up to the cap and not read for symbols (there is
+/// nothing to diff them against), so dirty symbols and contract breaks are unknown.
+pub fn changed_since_baseline_bounded(
+    data_dir: &Path,
+    root: &Path,
+    workspace_id: &str,
+    bounds: ChangeBounds,
+) -> ChangeSet {
+    let read = read_baseline(data_dir, workspace_id);
+    if let Ok(Some(baseline)) = &read {
+        let listed =
+            file_hash_map(root).map(|current| diff_hash_maps(&baseline.file_hashes, &current));
+        let set = ChangeSet::new(workspace_id, "baseline", true);
+        return change_set(root, set, listed, Ok(&baseline.signatures), bounds);
+    }
+    let missing = missing_baseline_reason(&read);
+    let set = ChangeSet::new(workspace_id, "baseline", false);
+    let paths = match tracked_files(root) {
+        Ok(paths) => paths,
+        Err(e) => return set.unlisted(&e),
     };
-    let dirty_symbols = dirty_symbols_for(
-        root,
-        workspace_id,
-        &changed_files,
-        baseline.as_ref().map(|b| &b.signatures),
-    );
-    ChangeSet {
-        workspace_id: workspace_id.to_string(),
-        since: "baseline".into(),
-        contract_breaks: count_breaks(&dirty_symbols),
-        dirty_symbols,
-        changed_files,
-        generated_at: now(),
+    unbaselined_changes(set, paths, &missing, bounds)
+}
+
+/// The no-baseline change set: tracked files listed as added up to the cap, none read.
+fn unbaselined_changes(
+    mut set: ChangeSet,
+    paths: Vec<String>,
+    missing: &str,
+    bounds: ChangeBounds,
+) -> ChangeSet {
+    let total = paths.len();
+    let sources = paths.iter().filter(|p| is_symbol_source(p)).count();
+    let listed: Vec<ChangedFile> = paths
+        .into_iter()
+        .take(bounds.listed_files)
+        .map(|path| ChangedFile {
+            path,
+            change: "added".into(),
+        })
+        .collect();
+    set.truncation = Some(Truncation {
+        reason: format!(
+            "{missing}: tracked files are listed as added, at most {}, and not read for symbols",
+            bounds.listed_files
+        ),
+        files_listed: listed.len(),
+        files_total: total,
+        symbol_files_read: 0,
+        symbol_files_total: sources,
+        symbols_listed: 0,
+        symbols_total: 0,
+    });
+    set.unknown = ["dirty_symbols", "contract_breaks"]
+        .into_iter()
+        .map(|field| Unknown::new(field, format!("{missing}: nothing to diff against")))
+        .collect();
+    set.changed_files_total = Some(total);
+    set.changed_files = Some(listed);
+    set
+}
+
+/// How a porcelain status code reads as a change.
+fn status_change(code: &str) -> &'static str {
+    match code {
+        c if c.contains('D') => "deleted",
+        "??" => "added",
+        c if c.contains('A') => "added",
+        _ => "modified",
     }
 }
 
@@ -549,36 +1331,37 @@ pub fn changed_since_baseline(data_dir: &Path, root: &Path, workspace_id: &str) 
 /// Loads the index baseline (via `data_dir`) so it can flag contract breaks on
 /// modified files — the session-grounding view an agent sees on reconnect.
 pub fn working_tree_changes(data_dir: &Path, root: &Path, workspace_id: &str) -> ChangeSet {
-    let mut changed_files = Vec::new();
-    for (code, path) in dirty_paths(root) {
-        let change = if code.contains('D') {
-            "deleted"
-        } else if code.contains('A') || code == "??" {
-            "added"
-        } else {
-            "modified"
-        };
-        changed_files.push(ChangedFile {
-            path,
-            change: change.to_string(),
-        });
-    }
-    changed_files.sort_by(|a, b| a.path.cmp(&b.path));
-    let baseline = load_index_baseline(data_dir, workspace_id);
-    let dirty_symbols = dirty_symbols_for(
-        root,
-        workspace_id,
-        &changed_files,
-        baseline.as_ref().map(|b| &b.signatures),
-    );
-    ChangeSet {
-        workspace_id: workspace_id.to_string(),
-        since: "working-tree".into(),
-        contract_breaks: count_breaks(&dirty_symbols),
-        dirty_symbols,
-        changed_files,
-        generated_at: now(),
-    }
+    working_tree_changes_bounded(data_dir, root, workspace_id, ChangeBounds::DEFAULT)
+}
+
+/// `working_tree_changes` within `bounds`. Without a baseline the dirty symbols are
+/// listed but contract breaks are unknown: there are no signatures to compare.
+pub fn working_tree_changes_bounded(
+    data_dir: &Path,
+    root: &Path,
+    workspace_id: &str,
+    bounds: ChangeBounds,
+) -> ChangeSet {
+    let listed = dirty_paths(root).map(|paths| {
+        let mut changed: Vec<ChangedFile> = paths
+            .into_iter()
+            .map(|(code, path)| ChangedFile {
+                path,
+                change: status_change(&code).to_string(),
+            })
+            .collect();
+        changed.sort_by(|a, b| a.path.cmp(&b.path));
+        changed
+    });
+    let read = read_baseline(data_dir, workspace_id);
+    let missing = missing_baseline_reason(&read);
+    let baseline = read.ok().flatten();
+    let sigs = baseline
+        .as_ref()
+        .map(|b| &b.signatures)
+        .ok_or_else(|| format!("{missing}: no signatures to compare against"));
+    let set = ChangeSet::new(workspace_id, "working-tree", baseline.is_some());
+    change_set(root, set, listed, sigs, bounds)
 }
 
 // ---------------------------------------------------------------------------
@@ -613,7 +1396,8 @@ fn load_incorporation(data_dir: &Path, workspace_id: &str) -> Vec<IncorporationE
 
 /// Record incorporation events for any newly-added or changed (and deleted)
 /// tracked files since the last recording, appending to the durable lineage.
-/// Returns the events recorded this run.
+/// Returns the events recorded this run. A worktree Git cannot list is an error, not
+/// every file deleted.
 pub fn record_incorporation(
     data_dir: &Path,
     root: &Path,
@@ -633,7 +1417,7 @@ pub fn record_incorporation(
         }
     }
 
-    let current = file_hash_map(root);
+    let current = file_hash_map(root).map_err(std::io::Error::other)?;
     let head = git(root, &["rev-parse", "HEAD"]);
     let at = now();
     let mut new_events = Vec::new();
@@ -704,7 +1488,6 @@ pub fn file_lineage(data_dir: &Path, workspace_id: &str, path: &str) -> FileLine
         generated_at: now(),
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -751,11 +1534,11 @@ mod tests {
         fs::write(dir.path().join("new\nline.rs"), "NL\n").unwrap();
         fs::write(dir.path().join("old.rs"), "OLD\n").unwrap();
         git_commit(dir.path());
-        let fp = compute_fingerprint(dir.path());
+        let fp = compute_fingerprint(dir.path()).unwrap();
         assert_eq!(fp.tracked_file_count, 4, "odd names dropped: {fp:?}");
         let before = fp.content_hash;
         fs::write(dir.path().join(" lead.rs"), "REAL2\n").unwrap();
-        let after = compute_fingerprint(dir.path());
+        let after = compute_fingerprint(dir.path()).unwrap();
         assert_ne!(before, after.content_hash, "edit to ' lead.rs' not seen");
         Command::new("git")
             .arg("-C")
@@ -764,6 +1547,7 @@ mod tests {
             .output()
             .unwrap();
         let paths: Vec<String> = dirty_paths(dir.path())
+            .unwrap()
             .into_iter()
             .map(|(_, p)| p)
             .collect();
@@ -791,10 +1575,10 @@ mod tests {
             .collect();
         // leave the racy window so the first pass records entries a later pass trusts.
         std::thread::sleep(crate::hashcache::RACY_WINDOW + std::time::Duration::from_millis(200));
-        let (first, p1) = file_hash_map_counted(repo.path());
+        let (first, p1) = file_hash_map_counted(repo.path()).unwrap();
         assert_eq!((p1.hashed, p1.cache_written), (2, true), "{p1:?}");
         build_index_baseline(data.path(), repo.path(), "ws").unwrap();
-        let (second, p2) = file_hash_map_counted(repo.path());
+        let (second, p2) = file_hash_map_counted(repo.path()).unwrap();
         assert_eq!(
             (p2.hashed, p2.reused),
             (0, 2),
@@ -803,7 +1587,7 @@ mod tests {
         assert_eq!(first, direct);
         assert_eq!(second, direct);
         assert_eq!(
-            compute_fingerprint(repo.path()).content_hash,
+            compute_fingerprint(repo.path()).unwrap().content_hash,
             content_hash_of(&direct)
         );
         assert!(!detect_drift(data.path(), repo.path(), "ws").stale);
@@ -837,7 +1621,7 @@ mod tests {
         fs::write(repo.path().join("a.txt"), "main\n").unwrap();
         git_commit(repo.path());
         git(&["merge", "side"]);
-        let listed = tracked_files(repo.path());
+        let listed = tracked_files(repo.path()).unwrap();
         assert_eq!(
             listed.iter().filter(|p| *p == "a.txt").count(),
             3,
@@ -845,13 +1629,13 @@ mod tests {
         );
 
         std::thread::sleep(crate::hashcache::RACY_WINDOW + std::time::Duration::from_millis(200));
-        let (first, p1) = file_hash_map_counted(repo.path());
+        let (first, p1) = file_hash_map_counted(repo.path()).unwrap();
         assert_eq!(
             (first.len(), p1.hashed, p1.cache_written),
             (2, 2, true),
             "{p1:?}"
         );
-        let (second, p2) = file_hash_map_counted(repo.path());
+        let (second, p2) = file_hash_map_counted(repo.path()).unwrap();
         assert_eq!(
             (p2.hashed, p2.reused, p2.cache_written),
             (0, 2, false),
@@ -866,8 +1650,8 @@ mod tests {
         git_init(dir.path());
         fs::write(dir.path().join("a.rs"), "pub fn one() {}\n").unwrap();
         git_commit(dir.path());
-        let fp1 = compute_fingerprint(dir.path());
-        let fp2 = compute_fingerprint(dir.path());
+        let fp1 = compute_fingerprint(dir.path()).unwrap();
+        let fp2 = compute_fingerprint(dir.path()).unwrap();
         assert_eq!(fp1.content_hash, fp2.content_hash);
         assert!(fp1.head_sha.is_some());
         assert_eq!(fp1.tracked_file_count, 1);
@@ -877,7 +1661,7 @@ mod tests {
             "pub fn one() {}\npub fn two() {}\n",
         )
         .unwrap();
-        let fp3 = compute_fingerprint(dir.path());
+        let fp3 = compute_fingerprint(dir.path()).unwrap();
         assert_ne!(fp1.content_hash, fp3.content_hash);
         assert!(fp3.dirty);
     }
@@ -914,14 +1698,23 @@ mod tests {
         let cs = changed_since_baseline(data.path(), repo.path(), "ws");
         assert!(
             cs.changed_files
+                .as_ref()
+                .unwrap()
                 .iter()
                 .any(|c| c.path == "a.rs" && c.change == "modified")
         );
         // dirty symbols include the new function
-        assert!(cs.dirty_symbols.iter().any(|s| s.symbol == "two"));
+        assert!(
+            cs.dirty_symbols
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|s| s.symbol == "two")
+        );
         // adding a NEW function is not a contract break of an existing symbol.
         assert_eq!(
-            cs.contract_breaks, 0,
+            cs.contract_breaks,
+            Some(0),
             "a new symbol is not a break: {:?}",
             cs.dirty_symbols
         );
@@ -955,11 +1748,18 @@ mod tests {
 
         let cs = changed_since_baseline(data.path(), repo.path(), "ws");
         assert_eq!(
-            cs.contract_breaks, 1,
+            cs.contract_breaks,
+            Some(1),
             "only `add` should break: {:?}",
             cs.dirty_symbols
         );
-        let add = cs.dirty_symbols.iter().find(|s| s.symbol == "add").unwrap();
+        let add = cs
+            .dirty_symbols
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|s| s.symbol == "add")
+            .unwrap();
         assert!(add.contract_break, "add must be flagged: {add:?}");
         assert!(
             add.signature_change
@@ -971,6 +1771,8 @@ mod tests {
         );
         let keep = cs
             .dirty_symbols
+            .as_ref()
+            .unwrap()
             .iter()
             .find(|s| s.symbol == "keep")
             .unwrap();
@@ -1001,12 +1803,15 @@ mod tests {
         .unwrap();
         let cs = working_tree_changes(data.path(), repo.path(), "ws");
         assert_eq!(
-            cs.contract_breaks, 1,
+            cs.contract_breaks,
+            Some(1),
             "return-type change should break: {:?}",
             cs.dirty_symbols
         );
         let h = cs
             .dirty_symbols
+            .as_ref()
+            .unwrap()
             .iter()
             .find(|s| s.symbol == "handler")
             .unwrap();

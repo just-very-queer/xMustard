@@ -70,7 +70,7 @@ Legend: ✅ built · 🟡 partial/foundation · ⬜ planned (little/no code)
 
 ### D. Knowledge layer (storage + retrieval — PARTIAL)
 - ✅ **PostgreSQL store** — semantic index (`xm_files`/`xm_symbols`/`xm_edges`, `pgindex.go`) AND the ops layer (`xm_runs`/`xm_activity`/`xm_issues`, `pgops.go`: `/pg/ops/materialize`, `/pg/runs`, `/pg/issues/search`, MCP `pg_runs`/`pg_issue_search`) are materialized + queried in Postgres. JSON remains the durable write source; PG is the queryable index. ⬜ make PG the write path (run_plans/verification_* still JSON-only)
-- ✅ Hybrid search with **Reciprocal Rank Fusion**: in-process `rust-core/search.rs` fuses lexical (BM25 idf) + semantic (model-free hashing-trick embedding, char-trigram fuzzy) + structural lanes; Postgres `SearchPostgres` fuses ts_rank + inbound-edge lanes via window-function RRF. ⬜ graph-proximity lane + neural embeddings
+- ✅ Hybrid search with **Reciprocal Rank Fusion** (K=60, weighted lanes, WS-18): in-process `rust-core/search.rs` fuses FTS5 BM25 over function-aligned code chunks (bodies, comments, names, paths) and doc sections from the code index, identifier-name match, a char-trigram typo-tolerance lane (`fuzzy`; not meaning), structural and graph-proximity lanes, then reranks the top 40 with explainable reasons and returns line-numbered snippets and a bounded cursor; Postgres `SearchPostgres` fuses ts_rank + inbound-edge lanes via window-function RRF. ⬜ neural embeddings (WS-37)
 - ✅ Wiki generation (`rust-core/wiki.rs` generate_wiki: overview + per-subsystem pages from the symbol graph; MCP `wiki`); ⬜ incremental/review-first refinement
 
 ### E. Runtime + project discovery

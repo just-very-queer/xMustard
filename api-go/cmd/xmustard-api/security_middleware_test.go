@@ -28,6 +28,8 @@ func securityServer(t *testing.T, p exposurePosture) (*httptest.Server, string) 
 	cfg := serverConfig{host: "127.0.0.1", authMode: "auto", dataDir: dir, posture: p}
 	srv := httptest.NewServer(buildHandler(cfg, newAPIHandlerFor(p)))
 	t.Cleanup(srv.Close)
+	// runs before the env and temp dirs above are restored and removed
+	t.Cleanup(func() { waitRegistrationBaselines(t) })
 	return srv, dir
 }
 

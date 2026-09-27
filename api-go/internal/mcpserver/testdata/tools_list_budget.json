@@ -1,5 +1,5 @@
 {
-  "about": "Byte caps on the tools/list result (compact JSON, as the stdio shim writes it) per schema profile, protocol version and role profile. Measured 2026-09-25 (WS-54); remember content made optional and the WS-19A lifecycle arguments added as Advanced 2026-09-26, and the WS-19B provenance and evidence-bound vote arguments the same day (full caps grew by exactly their cost each time). WS-21 (2026-09-28): why_failed run_id became optional and the tool non-read-only (it runs commands); its lean entry stayed the same size at 2025-06-18 and shrank by 44 bytes at 2024-11-05 (caps lowered), and the full caps grew by exactly the cost of its five advanced source arguments. Lower a cap when the list shrinks; never raise one to fit an addition: advertise less (declare the argument Advanced, documented at xmustard://docs/tools) or trim a description. cmd/xmustard-api checks role_profiles against the route gates.",
+  "about": "Byte caps on the tools/list result (compact JSON, as the stdio shim writes it) per schema profile, protocol version and role profile. Measured 2026-09-25 (WS-54); remember content made optional and the WS-19A lifecycle arguments added as Advanced 2026-09-26, and the WS-19B provenance and evidence-bound vote arguments the same day (full caps grew by exactly their cost each time). WS-18 (2026-09-28): the search description now names BM25 over bodies and lost 59 bytes, search's outputSchema gained omitted and next_cursor (58 bytes, 2025-06-18 only), and the Advanced cursor and path_glob arguments cost 198 bytes in the full profile; lean caps were lowered to the measured sizes. WS-21 (2026-09-28): why_failed run_id became optional and the tool non-read-only (it runs commands); its lean entry stayed the same size at 2025-06-18 and shrank by 44 bytes at 2024-11-05 (caps lowered), and the full caps grew by exactly the cost of its five advanced source arguments. Lower a cap when the list shrinks; never raise one to fit an addition: advertise less (declare the argument Advanced, documented at xmustard://docs/tools) or trim a description. cmd/xmustard-api checks role_profiles against the route gates.",
   "role_profiles": {
     "reader": ["ground", "recall", "search", "explain", "impact", "diagnostics", "why_failed"],
     "proposer": ["ground", "recall", "remember", "search", "explain", "impact", "diagnostics", "why_failed"],
@@ -8,12 +8,12 @@
   },
   "caps": {
     "lean": {
-      "2024-11-05": {"reader": 3955, "proposer": 4648, "verifier": 4586, "agent": 5279},
-      "2025-06-18": {"reader": 6646, "proposer": 7745, "verifier": 7680, "agent": 8779}
+      "2024-11-05": {"reader": 3896, "proposer": 4589, "verifier": 4527, "agent": 5220},
+      "2025-06-18": {"reader": 6645, "proposer": 7744, "verifier": 7679, "agent": 8778}
     },
     "full": {
-      "2024-11-05": {"reader": 4980, "proposer": 6593, "verifier": 6019, "agent": 7632},
-      "2025-06-18": {"reader": 7668, "proposer": 9687, "verifier": 9110, "agent": 11129}
+      "2024-11-05": {"reader": 5119, "proposer": 6732, "verifier": 6158, "agent": 7771},
+      "2025-06-18": {"reader": 7868, "proposer": 9887, "verifier": 9310, "agent": 11329}
     }
   }
 }

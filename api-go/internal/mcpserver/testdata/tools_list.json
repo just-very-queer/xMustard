@@ -239,7 +239,7 @@
         "readOnlyHint": true,
         "title": "Search code"
       },
-      "description": "Code search, path:line slices. Hybrid ranks symbol NAMES, paths and doc chunks, not function bodies: RRF of lexical IDF, trigram fuzzy match (typo tolerance, not meaning, unless built with semantic-onnx and XMUSTARD_EMBED_MODEL set), reference degree, proximity to seed=\u003csymbol\u003e. mode=pattern: ast-grep structural query (e.g. `$A \u0026\u0026 $A()`; optional lang).",
+      "description": "Code search: path:line hits, snippets, reasons. RRF (K=60) of BM25 over function bodies, comments, names, paths and doc sections; identifier match; trigram typo tolerance (not meaning); reference degree; proximity to seed=\u003csymbol\u003e. mode=pattern: ast-grep query (e.g. `$A \u0026\u0026 $A()`; optional lang).",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -292,6 +292,12 @@
             "type": "array"
           },
           "match_count": {
+            "type": "integer"
+          },
+          "next_cursor": {
+            "type": "string"
+          },
+          "omitted": {
             "type": "integer"
           },
           "query": {

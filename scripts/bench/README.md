@@ -5,7 +5,7 @@ scratch repositories and data roots. None of them talks to a model provider.
 
 | Gate | Command | What passes |
 |---|---|---|
-| Retrieval | `make bench-retrieval` (`retrieval-gate.sh`) | ≥ 11/12 gold queries in the top 5, cold, warm and after a one-file edit |
+| Retrieval | `make bench-retrieval` (`retrieval-gate.sh`) | 12/12 gold queries and 10/10 spans in the top 5, gold-path MRR@5 1.0, 6/6 body-term queries, cold, warm and after a one-file edit (thresholds in `gold/queries.json`, WS-18) |
 | Budget v1 (frozen at `6411f391`) | `rss.sh` | sampled tree peak ≤ 100,000,000 bytes on the 501-file workload |
 | Budget v2 | `make bench-gate` (CI suite), `make bench-parity` (parity-scale suite) | ps-RSS of the xMustard-owned tree ≤ 95.4 MiB on a valid, complete workload |
 | Gate v2 unit tests | `make bench-test` | stdlib `unittest`, no binaries needed |
