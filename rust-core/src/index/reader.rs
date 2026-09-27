@@ -532,6 +532,9 @@ fn legacy_coverage(m: &StoreMeta, symbols: usize) -> IndexCoverage {
         loss_counts: c.loss_counts.clone(),
         losses_truncated: c.losses_truncated,
         extraction: c.extraction.clone(),
+        // per-language support (WS-16): the index's own counts, where `failed` is a
+        // lexical fallback past the parse bounds or a parse with errors
+        languages: c.language_support.clone(),
         work: IndexWork {
             graph_cache: "hit".into(),
             graph_cache_detail: format!("code index generation {}", m.generation),
@@ -843,5 +846,25 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(legacy_coverage(&m, 0).selected_files, 0);
+    }
+
+    // Search, explain and impact answered from the index report the index's
+    // per-language support counts (WS-16, PAR-SYM-05), as the legacy graph does.
+    #[test]
+    fn index_coverage_carries_per_language_support() {
+        use crate::index::lang::{LanguageCoverage, Support};
+        let mut python = LanguageCoverage::default();
+        python.add(Support::Supported);
+        python.add(Support::Failed);
+        let mut c = meta::Coverage::default();
+        c.language_support.insert("python".into(), python.clone());
+        let m = StoreMeta {
+            coverage: Some(c),
+            ..Default::default()
+        };
+        let cov = legacy_coverage(&m, 0);
+        assert_eq!(cov.languages.get("python"), Some(&python));
+        let summary = crate::symbolgraph::CoverageSummary::from(&cov);
+        assert_eq!(summary.languages.get("python"), Some(&python));
     }
 }

@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::config::IndexConfig;
+use super::lang::{LanguageCoverage, Support};
 
 pub const DIRTY_FLAG: &str = "incremental_in_progress";
 
@@ -92,6 +93,9 @@ pub struct Coverage {
     pub indexed_bytes: u64,
     /// Indexed files per language.
     pub languages: BTreeMap<String, usize>,
+    /// Indexed files per language by support: `supported` (grammar), `unsupported` (no
+    /// grammar in this build) and `failed` (lexical fallback or parse errors).
+    pub language_support: BTreeMap<String, LanguageCoverage>,
     /// Indexed files per extraction engine (`tree_sitter`, `regex`, `none`).
     pub extraction: BTreeMap<String, usize>,
     /// Exact count per loss reason.
@@ -144,6 +148,17 @@ pub fn coverage(conn: &Connection, cfg: &IndexConfig) -> rusqlite::Result<Covera
             if indexed {
                 c.indexed_files += 1;
                 c.indexed_bytes += size.max(0) as u64;
+                let fell_back =
+                    flags & (file_flag::LEXICAL_FALLBACK | file_flag::PARSE_ERRORS) != 0;
+                let support = match (fell_back, status.as_str()) {
+                    (true, _) => Support::Failed,
+                    (false, "tree_sitter") => Support::Supported,
+                    (false, _) => Support::Unsupported,
+                };
+                c.language_support
+                    .entry(lang.clone())
+                    .or_default()
+                    .add(support);
                 *c.languages.entry(lang).or_default() += 1;
                 *c.extraction.entry(status.clone()).or_default() += 1;
             } else {
@@ -290,9 +305,9 @@ pub fn content_digest(conn: &Connection) -> rusqlite::Result<String> {
         &mut h,
     )?;
     feed(
-        "SELECT f.path, r.start_byte, n.name, r.kind, r.flow, r.line, r.col, s.uid
+        "SELECT f.path, r.start_byte, n.name, r.kind, r.flow, r.line, r.col, s.uid, q.name
          FROM refs r JOIN files f ON f.id = r.file_id JOIN names n ON n.id = r.name_id
-         LEFT JOIN symbols s ON s.id = r.symbol_id
+         LEFT JOIN symbols s ON s.id = r.symbol_id LEFT JOIN names q ON q.id = r.qual_id
          ORDER BY f.path, r.start_byte, n.name, r.kind",
         &mut h,
     )?;
@@ -310,9 +325,17 @@ pub fn content_digest(conn: &Connection) -> rusqlite::Result<String> {
         &mut h,
     )?;
     feed(
-        "SELECT a.path, b.path, e.kind, e.layer, e.weight, e.confidence, e.provenance, e.via
+        "SELECT a.path, b.path, e.kind, e.layer, e.weight, e.confidence, e.provenance, e.via,
+                e.reason, e.access, s.uid, d.uid
          FROM edges e JOIN files a ON a.id = e.src_file JOIN files b ON b.id = e.dst_file
-         ORDER BY a.path, b.path, e.layer, e.kind",
+         LEFT JOIN symbols s ON s.id = e.src_symbol LEFT JOIN symbols d ON d.id = e.dst_symbol
+         ORDER BY a.path, b.path, e.layer, e.kind, s.uid, d.uid",
+        &mut h,
+    )?;
+    feed(
+        "SELECT f.path, n.name, r.cause, r.count
+         FROM resolve_drops r JOIN files f ON f.id = r.file_id JOIN names n ON n.id = r.name_id
+         ORDER BY f.path, n.name, r.cause",
         &mut h,
     )?;
     conn.execute_batch(

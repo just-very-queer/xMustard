@@ -1,0 +1,24 @@
+engine tree_sitter parse_errors false
+symbols
+  Namespace geo arity=- lines=3-25 doc_from=3 exported=true local=false depth=0
+  Class geo.Shape arity=- lines=6-13 doc_from=5 exported=true local=false depth=1
+  Method geo.Shape.Shape arity=1 lines=8-8 doc_from=8 exported=true local=false depth=2
+  Method geo.Shape.area arity=0 lines=9-9 doc_from=9 exported=true local=false depth=2
+  Property geo.Shape.side_ arity=- lines=12-12 doc_from=12 exported=true local=false depth=2
+  Method geo.perimeter arity=1 lines=15-18 doc_from=15 exported=true local=false depth=1
+  Function geo.twice arity=1 lines=21-23 doc_from=21 exported=true local=false depth=1
+  Struct Plain arity=- lines=29-31 doc_from=29 exported=true local=false depth=0
+  Method Plain.run arity=0 lines=30-30 doc_from=30 exported=true local=false depth=1
+imports
+  1 include vector name=- alias=-
+  27 namespace std name=- alias=-
+references (non-read)
+  6 extends Base in geo.Shape
+  8 bind side in geo.Shape.Shape
+  15 bind k in geo.perimeter
+  17 call area in geo.perimeter
+  20 type T in geo
+  21 type T in geo.twice
+  21 type T in geo.twice
+  21 bind v in geo.twice
+  27 import std in -

@@ -1,0 +1,35 @@
+engine tree_sitter parse_errors false
+symbols
+  Class Sample arity=- lines=7-27 doc_from=6 exported=true local=false depth=0
+  Property Sample.count arity=- lines=9-9 doc_from=8 exported=false local=false depth=1
+  Constructor Sample.Sample arity=1 lines=11-13 doc_from=11 exported=true local=false depth=1
+  Method Sample.compute arity=2 lines=15-18 doc_from=15 exported=true local=false depth=1
+  Method Sample.hidden arity=0 lines=20-20 doc_from=20 exported=false local=false depth=1
+  Interface Sample.Listener arity=- lines=22-24 doc_from=22 exported=false local=false depth=1
+  Method Sample.Listener.onEvent arity=1 lines=23-23 doc_from=23 exported=false local=false depth=2
+  Enum Sample.Mode arity=- lines=26-26 doc_from=26 exported=false local=false depth=1
+  EnumMember Sample.Mode.FAST arity=- lines=26-26 doc_from=26 exported=false local=false depth=2
+  EnumMember Sample.Mode.SLOW arity=- lines=26-26 doc_from=26 exported=false local=false depth=2
+imports
+  3 import java.util name=List alias=-
+  4 wildcard java.lang.Math name=- alias=-
+references (non-read)
+  3 import java in -
+  3 import util in -
+  3 import List in -
+  4 import java in -
+  4 import lang in -
+  4 import Math in -
+  7 extends Base in Sample
+  7 implements Runnable in Sample
+  7 implements Comparable in Sample
+  7 type Sample in Sample
+  11 bind count in Sample.Sample
+  12 write count in Sample.Sample
+  15 bind a in Sample.compute
+  15 type String in Sample.compute
+  15 bind b in Sample.compute
+  16 type String in Sample.compute
+  16 bind s in Sample.compute
+  17 call helper in Sample.compute
+  23 bind code in Sample.Listener.onEvent
