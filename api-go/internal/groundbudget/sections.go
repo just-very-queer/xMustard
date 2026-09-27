@@ -116,9 +116,14 @@ var sections = []Section{
 	{
 		Name: "drift", Cap: 1536,
 		// Keep names Rust's DriftReport flags; a signal keeps every boolean anyway
-		Members: []Member{{Name: "drift", Signal: true, Keep: []string{"stale", "has_baseline", "head_changed", "content_changed", "sibling_clone"}}},
+		Members: []Member{
+			{Name: "drift", Signal: true, Keep: []string{"stale", "has_baseline", "head_changed", "content_changed", "sibling_clone"}},
+			// which baseline ground compared against, whether it was reset automatically,
+			// and whether it took in uncommitted changes
+			{Name: "baseline", Signal: true, Keep: []string{"head", "indexed_at", "auto", "dirty"}},
+		},
 		Recover: "ground sections=drift",
-		Doc:     "whether the index baseline drifted from the working tree, and why",
+		Doc:     "whether the index baseline drifted from the working tree, and why; the baseline's HEAD, when and why it was built",
 	},
 	{
 		Name: "principal", Cap: 512,

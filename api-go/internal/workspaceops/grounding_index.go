@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"xmustard/api-go/internal/budget"
 	"xmustard/api-go/internal/rustcore"
 )
 
@@ -13,7 +14,11 @@ import (
 // A count is null (unknown) when the change-tracking result could not be decoded
 // or lacks it; it is never reported as 0.
 type groundingIndex struct {
-	Drift           json.RawMessage `json:"drift"`
+	Drift json.RawMessage `json:"drift"`
+	// Baseline is the index baseline drift and contract breaks compare against, after
+	// the automatic policy ran (see maintainBaseline); null, and listed unknown, when
+	// there is none.
+	Baseline        *GroundBaseline `json:"baseline"`
 	ChangedFiles    *int            `json:"changed_files"`
 	DirtySymbols    *int            `json:"dirty_symbols"`
 	ContractBreaks  *int            `json:"contract_breaks"`
@@ -28,11 +33,29 @@ type groundingIndex struct {
 	Coverage json.RawMessage `json:"coverage"`
 }
 
+// GroundBaseline is ground's view of the index baseline (PAR-FRESH-06): the HEAD it
+// was taken at, when, whether it was built automatically, and why. Dirty says it took
+// in uncommitted changes to tracked files (an explicit rebaseline of a dirty worktree),
+// whose contract breaks it then does not report; an automatic baseline never does.
+// Held says why a due automatic rebuild did not run (another build in progress, an
+// unreadable baseline, a failure).
+type GroundBaseline struct {
+	Head      *string `json:"head"`
+	IndexedAt string  `json:"indexed_at"`
+	Auto      bool    `json:"auto"`
+	Reason    string  `json:"reason"`
+	Dirty     bool    `json:"dirty"`
+	Held      string  `json:"held,omitempty"`
+}
+
 func (s *groundingIndex) build(ctx context.Context, dataDir, workspaceID string) ([]GroundingUnknown, error) {
 	drift, err := WorkspaceDriftCtx(ctx, dataDir, workspaceID)
 	if err != nil {
 		return nil, err
 	}
+	// ground never waits for the heavy slot or another build: either holds the rebuild
+	// to a later call
+	drift, held := maintainBaseline(budget.WithoutHeavyWait(ctx), dataDir, workspaceID, drift, groundTrigger)
 	changesRaw, err := WorkspaceWorkingChangesCtx(ctx, dataDir, workspaceID)
 	if err != nil {
 		return nil, err
@@ -46,32 +69,63 @@ func (s *groundingIndex) build(ctx context.Context, dataDir, workspaceID string)
 	} else {
 		unknown = append(unknown, GroundingUnknown{Field: "drift", Reason: "drift result is not valid JSON"})
 	}
+	if u := s.fillBaseline(drift, held); u != nil {
+		unknown = append(unknown, *u)
+	}
+	return append(unknown, s.buildChanges(changesRaw)...), nil
+}
+
+// fillBaseline fills Baseline from drift; without a baseline it stays null and is
+// reported unknown with the reason.
+func (s *groundingIndex) fillBaseline(drift json.RawMessage, held string) *GroundingUnknown {
+	var st baselineState
+	if err := json.Unmarshal(drift, &st); err != nil {
+		return &GroundingUnknown{Field: "baseline", Reason: "drift result undecodable: " + err.Error()}
+	}
+	switch {
+	case st.HasBaseline == nil:
+		return &GroundingUnknown{Field: "baseline", Reason: "drift result does not say whether a baseline exists"}
+	case !*st.HasBaseline && st.Error != "":
+		return &GroundingUnknown{Field: "baseline", Reason: "no index baseline, and drift could not fingerprint the worktree to build one: " + st.Error}
+	case !*st.HasBaseline:
+		return &GroundingUnknown{Field: "baseline", Reason: fallbackString(held, "no index baseline exists")}
+	case st.IndexedAt == nil || st.Reason == nil:
+		return &GroundingUnknown{Field: "baseline", Reason: "drift result lacks the baseline's indexed_at or reason"}
+	}
+	s.Baseline = &GroundBaseline{
+		Head: st.Head, IndexedAt: *st.IndexedAt, Auto: *st.Reason != BaselineAdmin, Reason: *st.Reason,
+		// a core that does not say is taken as dirty: the flag errs toward caution
+		Dirty: st.Dirty == nil || *st.Dirty, Held: held,
+	}
+	return nil
+}
+
+// buildChanges fills the change counts from the working-changes result. A count is
+// null and listed unknown when the core names it unknown (a failed listing, a partial
+// symbol pass, no baseline to compare signatures against) or the result lacks it.
+func (s *groundingIndex) buildChanges(raw json.RawMessage) []GroundingUnknown {
 	var changes struct {
-		ChangedFiles   *[]json.RawMessage `json:"changed_files"`
-		ContractBreaks *int               `json:"contract_breaks"`
-		DirtySymbols   *[]struct {
+		ChangedFiles      *[]json.RawMessage `json:"changed_files"`
+		ChangedFilesTotal *int               `json:"changed_files_total"`
+		DirtySymbolsTotal *int               `json:"dirty_symbols_total"`
+		ContractBreaks    *int               `json:"contract_breaks"`
+		DirtySymbols      *[]struct {
 			Path            string `json:"path"`
 			Symbol          string `json:"symbol"`
 			ContractBreak   bool   `json:"contract_break"`
 			SignatureChange string `json:"signature_change"`
 		} `json:"dirty_symbols"`
+		Unknown []GroundingUnknown `json:"unknown"`
 	}
-	if err := json.Unmarshal(changesRaw, &changes); err != nil {
-		reason := "working-changes result undecodable: " + err.Error()
-		return append(unknown,
-			GroundingUnknown{Field: "changed_files", Reason: reason},
-			GroundingUnknown{Field: "dirty_symbols", Reason: reason},
-			GroundingUnknown{Field: "contract_breaks", Reason: reason}), nil
-	}
-	if changes.ChangedFiles != nil {
-		n := len(*changes.ChangedFiles)
-		s.ChangedFiles = &n
-	} else {
-		unknown = append(unknown, GroundingUnknown{Field: "changed_files", Reason: "working-changes result has no changed_files"})
+	fields := []string{"changed_files", "dirty_symbols", "contract_breaks"}
+	if err := json.Unmarshal(raw, &changes); err != nil {
+		unknown := make([]GroundingUnknown, 0, len(fields))
+		for _, f := range fields {
+			unknown = append(unknown, GroundingUnknown{Field: f, Reason: "working-changes result undecodable: " + err.Error()})
+		}
+		return unknown
 	}
 	if changes.DirtySymbols != nil {
-		n := len(*changes.DirtySymbols)
-		s.DirtySymbols = &n
 		broken := []string{}
 		for _, sym := range *changes.DirtySymbols {
 			if sym.ContractBreak {
@@ -79,15 +133,53 @@ func (s *groundingIndex) build(ctx context.Context, dataDir, workspaceID string)
 			}
 		}
 		s.BrokenContracts = broken
-	} else {
-		unknown = append(unknown, GroundingUnknown{Field: "dirty_symbols", Reason: "working-changes result has no dirty_symbols"})
 	}
-	if changes.ContractBreaks != nil {
-		s.ContractBreaks = changes.ContractBreaks
-	} else {
-		unknown = append(unknown, GroundingUnknown{Field: "contract_breaks", Reason: "working-changes result has no contract_breaks"})
+	reported := map[string]string{}
+	for _, u := range changes.Unknown {
+		reported[u.Field] = u.Reason
 	}
-	return unknown, nil
+	counts := []struct {
+		field string
+		dst   **int
+		value *int
+	}{
+		// the totals count past the listing caps; a core without them lists everything
+		{"changed_files", &s.ChangedFiles, firstPresent(changes.ChangedFilesTotal, lengthOf(changes.ChangedFiles))},
+		{"dirty_symbols", &s.DirtySymbols, firstPresent(changes.DirtySymbolsTotal, lengthOf(changes.DirtySymbols))},
+		{"contract_breaks", &s.ContractBreaks, changes.ContractBreaks},
+	}
+	var unknown []GroundingUnknown
+	for _, c := range counts {
+		reason, isReported := reported[c.field]
+		switch {
+		case isReported:
+			unknown = append(unknown, GroundingUnknown{Field: c.field, Reason: reason})
+		case c.value != nil:
+			*c.dst = c.value
+		default:
+			unknown = append(unknown, GroundingUnknown{Field: c.field, Reason: "working-changes result has no " + c.field})
+		}
+	}
+	return unknown
+}
+
+// lengthOf is the length of a decoded list, nil when the list was absent or null.
+func lengthOf[T any](list *[]T) *int {
+	if list == nil {
+		return nil
+	}
+	n := len(*list)
+	return &n
+}
+
+// firstPresent is the first non-nil value.
+func firstPresent(values ...*int) *int {
+	for _, v := range values {
+		if v != nil {
+			return v
+		}
+	}
+	return nil
 }
 
 // buildCoverage fills Coverage; a failure leaves it null and is reported unknown,

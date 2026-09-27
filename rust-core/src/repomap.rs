@@ -540,7 +540,7 @@ fn should_ignore_relative_path(relative_path: &str) -> bool {
     crate::index::ignore::is_default_excluded(relative_path)
 }
 
-fn should_scan_file(relative_path: &str) -> bool {
+pub(crate) fn should_scan_file(relative_path: &str) -> bool {
     if should_ignore_relative_path(relative_path) {
         return false;
     }

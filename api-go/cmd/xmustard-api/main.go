@@ -1078,13 +1078,13 @@ func registerRoutes(mux routeRegistrar) {
 		if !ok {
 			return
 		}
-		result, err := workspaceops.LoadWorkspace(
-			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
-			request,
-		)
+		dataDir := envDefault("XMUSTARD_DATA_DIR", "../backend/data")
+		result, err := workspaceops.LoadWorkspace(dataDir, request)
 		if !admitted.finish(w, r, request.RootPath, err) {
 			return
 		}
+		// the automatic index baseline (PAR-FRESH-06), built after this answer
+		workspaceops.StartRegistrationBaseline(dataDir, result.Workspace.WorkspaceID)
 		writeJSON(w, http.StatusOK, result)
 	})
 	mux.HandleFunc("GET /api/workspaces/{workspace_id}/snapshot", func(w http.ResponseWriter, r *http.Request) {
@@ -2718,7 +2718,7 @@ func registerRoutes(mux routeRegistrar) {
 		writeJSON(w, http.StatusOK, result)
 	})
 	mux.HandleFunc("GET /api/workspaces/{workspace_id}/clusters", func(w http.ResponseWriter, r *http.Request) {
-		result, err := workspaceops.WorkspaceClusters(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))
+		result, err := workspaceops.WorkspaceClustersCtx(r.Context(), envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 			return
@@ -3837,7 +3837,9 @@ func registerRoutes(mux routeRegistrar) {
 		issueIntel(w, err, result)
 	})
 	mux.HandleFunc("POST /api/workspaces/{workspace_id}/index", func(w http.ResponseWriter, r *http.Request) {
-		result, err := workspaceops.IndexWorkspace(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))
+		// the route gate admits only the indexer and admin roles; the history records who
+		who := memoryCaller{principal: principalFromContext(r.Context())}.id()
+		result, err := workspaceops.RebaselineIndex(r.Context(), envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), who)
 		issueIntel(w, err, result)
 	})
 	mux.HandleFunc("GET /api/workspaces/{workspace_id}/changes/drift", func(w http.ResponseWriter, r *http.Request) {

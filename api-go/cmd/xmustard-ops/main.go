@@ -310,6 +310,14 @@ func runWorkspace(args []string) {
 			request.Name = &trimmedName
 		}
 		payload, err := workspaceops.LoadWorkspace(*dataDir, request)
+		if err == nil {
+			// one-shot: build the automatic index baseline (PAR-FRESH-06) before exiting
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+			if held := workspaceops.EnsureRegistrationBaseline(ctx, *dataDir, payload.Workspace.WorkspaceID); held != "" {
+				fmt.Fprintf(os.Stderr, "registration baseline: %s\n", held)
+			}
+			cancel()
+		}
 		writeJSON(payload, err)
 		return
 	}

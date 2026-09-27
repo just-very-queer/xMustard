@@ -34,7 +34,10 @@ func groundAPI(t *testing.T, breaks, runs int) (base, coreLog string) {
 			"contract_break": true, "signature_change": "fn(a int) -> fn(a, b int)"})
 	}
 	changes, _ := json.Marshal(map[string]any{"changed_files": []string{"a.go"}, "contract_breaks": breaks, "dirty_symbols": dirty})
-	drift := `{"workspace_id":"ws","has_baseline":true,"stale":true,"head_changed":true,"content_changed":false,"reasons":["HEAD moved"]}`
+	// stale by content (a.go changed), not by a HEAD move, which would rebaseline
+	drift := `{"workspace_id":"ws","has_baseline":true,"stale":true,"head_changed":false,"content_changed":true,"dirty":true,` +
+		`"baseline_head":"4f2c9e1","baseline_indexed_at":"2026-09-25T00:00:00Z","baseline_reason":"registration","baseline_dirty":false,` +
+		`"reasons":["tracked file content changed since indexing"]}`
 	fixtures := t.TempDir()
 	coverage := `{"complete":false,"languages":{"python":{"supported":3,"unsupported":0,"failed":1},"kotlin":{"supported":0,"unsupported":2,"failed":0}}}`
 	for name, body := range map[string]string{"changes.json": string(changes), "drift.json": drift, "coverage.json": coverage} {
@@ -201,8 +204,12 @@ func TestGroundFitsDefaultBudgetAndPagesSections(t *testing.T) {
 	if runs["total"].(map[string]any)["recent_failed_runs"] != 120.0 {
 		t.Fatalf("runs must count the failed runs it left out: %v", runs)
 	}
-	// the signals stay: counts and flags survive the trim
-	if m["contract_breaks"] != 150.0 || m["blocked_by_failing_verification"] != true || m["principal"] == nil {
+	// the signals stay: counts and flags survive the trim, and an omitted section's
+	// signals (principal, and drift with the baseline since WS-22) move to the report
+	sig := rep["signals"].(map[string]any)
+	if m["contract_breaks"] != 150.0 || m["blocked_by_failing_verification"] != true ||
+		(m["principal"] == nil && sig["principal.open_mode"] != true) ||
+		(m["baseline"] == nil && (sig["baseline.head"] != "4f2c9e1" || sig["baseline.auto"] != true || sig["baseline.indexed_at"] == nil)) {
 		t.Fatalf("signals lost: %v", m)
 	}
 	// newest run first
@@ -219,7 +226,7 @@ func TestGroundFitsDefaultBudgetAndPagesSections(t *testing.T) {
 	if _, ok := m["broken_contracts"]; ok {
 		t.Fatal("index was not requested")
 	}
-	sig := rep["signals"].(map[string]any)
+	sig = rep["signals"].(map[string]any)
 	if sig["contract_breaks"] != 150.0 || sig["drift.stale"] != true || sig["broken_contracts"] != 150.0 || sig["principal.open_mode"] != true {
 		t.Fatalf("unrequested sections must keep their signals: %v", sig)
 	}
