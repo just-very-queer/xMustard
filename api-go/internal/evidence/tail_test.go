@@ -112,7 +112,9 @@ func TestTailAllocatesTheWindowNotTheOriginal(t *testing.T) {
 	if err != nil || len(tail.Data) != 1<<20 {
 		t.Fatalf("tail: %d bytes, %v", len(tail.Data), err)
 	}
-	if grew := after.TotalAlloc - before.TotalAlloc; grew > 2<<20 {
+	grew := after.TotalAlloc - before.TotalAlloc
+	if grew > 2<<20 {
 		t.Fatalf("a 1 MiB tail of a 16 MiB original allocated %d bytes", grew)
 	}
+	t.Logf("a 1 MiB tail of a 16 MiB original allocated %d KiB", grew>>10)
 }
