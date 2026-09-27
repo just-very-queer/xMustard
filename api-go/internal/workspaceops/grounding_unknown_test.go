@@ -160,7 +160,7 @@ func TestGroundReportsUnreadableMemoryAsUnknown(t *testing.T) {
 func TestGroundTakesCoreUnknownsAndTotals(t *testing.T) {
 	dataDir, ws := seedGroundBenchWorkspace(t)
 	for _, tc := range []struct {
-		name, changes string
+		name, changes  string
 		changed, dirty *int
 		unknown        map[string]string
 	}{

@@ -907,6 +907,10 @@ export type DriftReport = {
   baseline_head?: string | null
   baseline_indexed_at?: string | null
   baseline_reason?: BaselineReason | null
+  // the baseline took in uncommitted changes (an explicit rebaseline of a dirty worktree)
+  baseline_dirty?: boolean | null
+  // the stored baseline exists but cannot be read; kept for an indexer to rebaseline
+  baseline_error?: string
   error?: string
 }
 export type Hotspot = { path: string; inbound_weight: number; dependent_count: number }
@@ -933,7 +937,14 @@ export type CockpitDashboard = {
 export type SessionGrounding = {
   workspace_id: string
   // the index baseline ground compared against; null (and in `unknown`) when there is none
-  baseline?: { head: string | null; indexed_at: string; auto: boolean; reason: BaselineReason; held?: string } | null
+  baseline?: {
+    head: string | null
+    indexed_at: string
+    auto: boolean
+    reason: BaselineReason
+    dirty: boolean
+    held?: string
+  } | null
   changed_files: number | null
   dirty_symbols: number | null
   recent_failed_runs: string[] | null

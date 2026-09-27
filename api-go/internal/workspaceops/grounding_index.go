@@ -34,13 +34,17 @@ type groundingIndex struct {
 }
 
 // GroundBaseline is ground's view of the index baseline (PAR-FRESH-06): the HEAD it
-// was taken at, when, whether it was built automatically, and why. Held says why a
-// due automatic rebuild did not run (a dirty worktree after a HEAD move, a failure).
+// was taken at, when, whether it was built automatically, and why. Dirty says it took
+// in uncommitted changes to tracked files (an explicit rebaseline of a dirty worktree),
+// whose contract breaks it then does not report; an automatic baseline never does.
+// Held says why a due automatic rebuild did not run (another build in progress, an
+// unreadable baseline, a failure).
 type GroundBaseline struct {
 	Head      *string `json:"head"`
 	IndexedAt string  `json:"indexed_at"`
 	Auto      bool    `json:"auto"`
 	Reason    string  `json:"reason"`
+	Dirty     bool    `json:"dirty"`
 	Held      string  `json:"held,omitempty"`
 }
 
@@ -49,8 +53,9 @@ func (s *groundingIndex) build(ctx context.Context, dataDir, workspaceID string)
 	if err != nil {
 		return nil, err
 	}
-	// ground never waits for the heavy slot: a busy slot holds the rebuild to a later call
-	drift, held := maintainBaseline(budget.WithoutHeavyWait(ctx), dataDir, workspaceID, drift, BaselineFirstGround)
+	// ground never waits for the heavy slot or another build: either holds the rebuild
+	// to a later call
+	drift, held := maintainBaseline(budget.WithoutHeavyWait(ctx), dataDir, workspaceID, drift, groundTrigger)
 	changesRaw, err := WorkspaceWorkingChangesCtx(ctx, dataDir, workspaceID)
 	if err != nil {
 		return nil, err
@@ -64,15 +69,15 @@ func (s *groundingIndex) build(ctx context.Context, dataDir, workspaceID string)
 	} else {
 		unknown = append(unknown, GroundingUnknown{Field: "drift", Reason: "drift result is not valid JSON"})
 	}
-	if u := s.buildBaseline(drift, held); u != nil {
+	if u := s.fillBaseline(drift, held); u != nil {
 		unknown = append(unknown, *u)
 	}
 	return append(unknown, s.buildChanges(changesRaw)...), nil
 }
 
-// buildBaseline fills Baseline from drift; without a baseline it stays null and is
+// fillBaseline fills Baseline from drift; without a baseline it stays null and is
 // reported unknown with the reason.
-func (s *groundingIndex) buildBaseline(drift json.RawMessage, held string) *GroundingUnknown {
+func (s *groundingIndex) fillBaseline(drift json.RawMessage, held string) *GroundingUnknown {
 	var st baselineState
 	if err := json.Unmarshal(drift, &st); err != nil {
 		return &GroundingUnknown{Field: "baseline", Reason: "drift result undecodable: " + err.Error()}
@@ -87,7 +92,11 @@ func (s *groundingIndex) buildBaseline(drift json.RawMessage, held string) *Grou
 	case st.IndexedAt == nil || st.Reason == nil:
 		return &GroundingUnknown{Field: "baseline", Reason: "drift result lacks the baseline's indexed_at or reason"}
 	}
-	s.Baseline = &GroundBaseline{Head: st.Head, IndexedAt: *st.IndexedAt, Auto: *st.Reason != BaselineAdmin, Reason: *st.Reason, Held: held}
+	s.Baseline = &GroundBaseline{
+		Head: st.Head, IndexedAt: *st.IndexedAt, Auto: *st.Reason != BaselineAdmin, Reason: *st.Reason,
+		// a core that does not say is taken as dirty: the flag errs toward caution
+		Dirty: st.Dirty == nil || *st.Dirty, Held: held,
+	}
 	return nil
 }
 

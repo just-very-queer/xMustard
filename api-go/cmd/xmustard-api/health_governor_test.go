@@ -151,7 +151,7 @@ func TestIndexRebaselineRunsInTheHeavySlot(t *testing.T) {
 	ran := dir + "/ran.log"
 	t.Setenv("XMUSTARD_CORE_BIN", writeScript(t, `echo "$1 $2" >> `+ran+`
 case "$1 $2" in
-"changetrack index") sleep 1; printf '{"indexed":true}' ;;
+"changetrack index") sleep 1; mkdir -p "$3/workspaces/$5" && echo staged > "$3/workspaces/$5/index_baseline.staged.json"; printf '{"indexed":true}' ;;
 *) echo '{}' ;;
 esac
 `))

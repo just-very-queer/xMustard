@@ -31,7 +31,8 @@ func TestAgentCannotResetTheBaselineAndRebaselinesAreRecorded(t *testing.T) {
 	srv, dir := securityServer(t, exposurePosture{})
 	seedCoreWorkspace(t, dir, "wsIdx")
 	t.Setenv("XMUSTARD_CORE_BIN", writeScript(t, `case "$1 $2" in
-"changetrack index") printf '{"workspace_id":"wsIdx","head":"h2","branch":"main","indexed_at":"2026-09-28T00:00:00Z","auto":false,"reason":"admin","dirty":false,"tracked_files":1,"signatures":0,"replaced":true,"previous_head":"h1"}' ;;
+"changetrack index") mkdir -p "$3/workspaces/$5" && echo staged > "$3/workspaces/$5/index_baseline.staged.json"
+  printf '{"workspace_id":"wsIdx","head":"h2","branch":"main","indexed_at":"2026-09-28T00:00:00Z","auto":false,"reason":"admin","dirty":false,"tracked_files":1,"signatures":0,"replaced":true,"previous_head":"h1"}' ;;
 *) echo '{}' ;;
 esac
 `))
@@ -68,8 +69,20 @@ esac
 	}
 }
 
+// waitRegistrationBaselines waits for the registration builds the load route started
+// after answering, so a test (or its temp dirs' cleanup) does not race them.
+func waitRegistrationBaselines(t *testing.T) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	if err := workspaceops.WaitRegistrationBaselines(ctx); err != nil {
+		t.Errorf("registration baseline builds still running: %v", err)
+	}
+}
+
 // Acceptance: on a fresh install in the core profile, registering a repository
-// baselines it, and ground and impact answer from that baseline with nothing unknown.
+// baselines it (after answering), and ground and impact answer from that baseline with
+// nothing unknown.
 func TestFreshInstallGroundAndImpactInTheCoreProfile(t *testing.T) {
 	core := realCoreBinary(t)
 	roomyGovernor(t)
@@ -101,6 +114,7 @@ func TestFreshInstallGroundAndImpactInTheCoreProfile(t *testing.T) {
 	}
 	ws, _ := snap["workspace"].(map[string]any)["workspace_id"].(string)
 	base := srv.URL + "/api/workspaces/" + ws
+	waitRegistrationBaselines(t)
 
 	code, g := call(t, "GET", base+"/session-grounding", agent, "", nil)
 	b, _ := g["baseline"].(map[string]any)

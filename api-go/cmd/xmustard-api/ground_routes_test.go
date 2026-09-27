@@ -34,9 +34,10 @@ func groundAPI(t *testing.T, breaks, runs int) (base, coreLog string) {
 			"contract_break": true, "signature_change": "fn(a int) -> fn(a, b int)"})
 	}
 	changes, _ := json.Marshal(map[string]any{"changed_files": []string{"a.go"}, "contract_breaks": breaks, "dirty_symbols": dirty})
-	// the worktree is dirty (a.go changed), so the HEAD move holds the automatic rebaseline
-	drift := `{"workspace_id":"ws","has_baseline":true,"stale":true,"head_changed":true,"content_changed":false,"dirty":true,` +
-		`"baseline_head":"4f2c9e1","baseline_indexed_at":"2026-09-25T00:00:00Z","baseline_reason":"registration","reasons":["HEAD moved"]}`
+	// stale by content (a.go changed), not by a HEAD move, which would rebaseline
+	drift := `{"workspace_id":"ws","has_baseline":true,"stale":true,"head_changed":false,"content_changed":true,"dirty":true,` +
+		`"baseline_head":"4f2c9e1","baseline_indexed_at":"2026-09-25T00:00:00Z","baseline_reason":"registration","baseline_dirty":false,` +
+		`"reasons":["tracked file content changed since indexing"]}`
 	fixtures := t.TempDir()
 	coverage := `{"complete":false,"languages":{"python":{"supported":3,"unsupported":0,"failed":1},"kotlin":{"supported":0,"unsupported":2,"failed":0}}}`
 	for name, body := range map[string]string{"changes.json": string(changes), "drift.json": drift, "coverage.json": coverage} {

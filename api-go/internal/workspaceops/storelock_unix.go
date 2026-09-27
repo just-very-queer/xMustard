@@ -11,8 +11,9 @@ import (
 )
 
 // lockFile takes an exclusive flock on path, creating it (and its directory) if
-// needed, and returns the release function. It blocks until the lock is free.
-func lockFile(path string) (func(), error) {
+// needed, and returns the release function. With wait it blocks until the lock is
+// free; without, a held lock fails at once with errStoreBusy.
+func lockFile(path string, wait bool) (func(), error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, err
 	}
@@ -20,12 +21,18 @@ func lockFile(path string) (func(), error) {
 	if err != nil {
 		return nil, err
 	}
-	fd := int(f.Fd())
+	fd, how := int(f.Fd()), unix.LOCK_EX
+	if !wait {
+		how |= unix.LOCK_NB
+	}
 	for {
-		err = unix.Flock(fd, unix.LOCK_EX)
+		err = unix.Flock(fd, how)
 		if !errors.Is(err, unix.EINTR) {
 			break
 		}
+	}
+	if errors.Is(err, unix.EWOULDBLOCK) {
+		err = errStoreBusy
 	}
 	if err != nil {
 		_ = f.Close()

@@ -1078,13 +1078,13 @@ func registerRoutes(mux routeRegistrar) {
 		if !ok {
 			return
 		}
-		result, err := workspaceops.LoadWorkspace(
-			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
-			request,
-		)
+		dataDir := envDefault("XMUSTARD_DATA_DIR", "../backend/data")
+		result, err := workspaceops.LoadWorkspace(dataDir, request)
 		if !admitted.finish(w, r, request.RootPath, err) {
 			return
 		}
+		// the automatic index baseline (PAR-FRESH-06), built after this answer
+		workspaceops.StartRegistrationBaseline(dataDir, result.Workspace.WorkspaceID)
 		writeJSON(w, http.StatusOK, result)
 	})
 	mux.HandleFunc("GET /api/workspaces/{workspace_id}/snapshot", func(w http.ResponseWriter, r *http.Request) {

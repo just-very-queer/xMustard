@@ -1,6 +1,7 @@
 package workspaceops
 
 import (
+	"errors"
 	"fmt"
 	"path/filepath"
 	"sync"
@@ -51,15 +52,29 @@ func (r *storeLockRegistry) get(key string) *sync.Mutex {
 	return m
 }
 
+// errStoreBusy is tryLockStore's answer when another caller holds the lock.
+var errStoreBusy = errors.New("held by another caller")
+
 // lockStore acquires the in-process and cross-process locks for a store key (its file
 // path) and returns the unlock function. A lock file that cannot be taken fails the
 // call: a store mutated without it could lose another process's update. The registry
 // map is bounded by (workspaces × store types), which is bounded operational state,
 // not per-request growth.
-func lockStore(key string) (func(), error) {
+func lockStore(key string) (func(), error) { return acquireStore(key, true) }
+
+// tryLockStore is lockStore for a caller that must not wait: when either lock is held
+// it fails at once with errStoreBusy.
+func tryLockStore(key string) (func(), error) { return acquireStore(key, false) }
+
+func acquireStore(key string, wait bool) (func(), error) {
 	m := storeLocks.get(key)
-	m.Lock()
-	unlockFile, err := lockFile(key + ".lock")
+	switch {
+	case wait:
+		m.Lock()
+	case !m.TryLock():
+		return nil, fmt.Errorf("lock store %s: %w", filepath.Base(key), errStoreBusy)
+	}
+	unlockFile, err := lockFile(key+".lock", wait)
 	if err != nil {
 		m.Unlock()
 		return nil, fmt.Errorf("lock store %s: %w", filepath.Base(key), err)
