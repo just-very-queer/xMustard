@@ -9,6 +9,12 @@ import (
 type ManagedCommandResult = VerificationCommandResult
 
 func RunManagedCommand(ctx context.Context, workspaceRoot string, timeoutSeconds int, commandArgs []string) (*ManagedCommandResult, error) {
+	return RunManagedCommandEnv(ctx, workspaceRoot, timeoutSeconds, commandArgs, nil)
+}
+
+// RunManagedCommandEnv is RunManagedCommand with env as the environment of the core, and
+// so of the command it runs; nil keeps the inherited one (coreChildEnv).
+func RunManagedCommandEnv(ctx context.Context, workspaceRoot string, timeoutSeconds int, commandArgs, env []string) (*ManagedCommandResult, error) {
 	if len(commandArgs) == 0 {
 		return nil, fmt.Errorf("managed command args cannot be empty")
 	}
@@ -20,6 +26,9 @@ func RunManagedCommand(ctx context.Context, workspaceRoot string, timeoutSeconds
 	args = append(args, commandArgs...)
 
 	cmd := coreCommandContext(ctx, "run-managed-command", args...)
+	if env != nil {
+		cmd.Env = env
+	}
 
 	stdout, stderr, over, err := runBoundedCmd(cmd)
 	if err != nil {

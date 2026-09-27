@@ -53,7 +53,14 @@ type Tool struct {
 	Advanced []Arg
 	// Aliases maps a hidden argument name to its canonical one. Aliases are accepted
 	// on tools/call and never advertised in tools/list.
-	Aliases     map[string]string
+	Aliases map[string]string
+	// Doc is markdown the docs resource (DocsURI) prints after the tool's Advanced
+	// arguments; tools/list never carries it.
+	Doc string
+	// WriteArgs name the arguments that make a call of a tool that otherwise only reads
+	// a write (why_failed runs a command). A read-only connection lists such a tool and
+	// serves its calls without them; its annotations describe the writing calls.
+	WriteArgs   []string
 	Annotations Annotations
 	// Output lists the documented top-level members of the tool's JSON result, for
 	// outputSchema. Results may carry more members, so the schema stays open.
@@ -67,6 +74,27 @@ type Tool struct {
 	// Build maps validated arguments (always including workspace_id) to the API call:
 	// method, path with query, and a JSON body ("" for none).
 	Build func(args map[string]string) (method, path, body string)
+}
+
+// servesReads reports whether some calls of t only read.
+func (t *Tool) servesReads() bool { return t.Annotations.ReadOnly || len(t.WriteArgs) > 0 }
+
+// writes reports whether the call with args changes state.
+func (t *Tool) writes(args map[string]string) bool {
+	if !t.servesReads() {
+		return true
+	}
+	return writesAny(args, t.WriteArgs)
+}
+
+// writesAny reports whether any of the write arguments is set.
+func writesAny(args map[string]string, writeArgs []string) bool {
+	for _, name := range writeArgs {
+		if args[name] != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func (t *Tool) arg(name string) (Arg, bool) {

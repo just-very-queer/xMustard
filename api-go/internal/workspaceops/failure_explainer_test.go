@@ -1,6 +1,7 @@
 package workspaceops
 
 import (
+	"slices"
 	"strings"
 	"testing"
 )
@@ -19,9 +20,20 @@ func TestSalientErrorLinesAndPathIntersection(t *testing.T) {
 	}
 
 	// the changed file named in the output is implicated; the other is not.
-	hits := intersectMentionedPaths(output, []string{"api-go/internal/foo.go", "unrelated/baz.go"})
+	hits := implicatedBy(mentionedPaths(output), "", []string{"api-go/internal/foo.go", "unrelated/baz.go"})
 	if len(hits) != 1 || hits[0] != "api-go/internal/foo.go" {
 		t.Fatalf("expected foo.go implicated, got %v", hits)
+	}
+}
+
+// A path is implicated by its whole repo-relative form, a trailing part of it (a
+// package-relative name, a bare file name), or an absolute path under the root.
+func TestImplicatedByMatchesTrailingAndAbsolutePaths(t *testing.T) {
+	changed := []string{"api-go/internal/foo.go", "web/src/app.ts", "docs/readme.md"}
+	output := "internal/foo.go:3: undefined: X\n/repo/web/src/app.ts(4,2): error TS2304\nsee https://example.com/readme.md\n"
+	hits := implicatedBy(mentionedPaths(output), "/repo", changed)
+	if want := []string{"api-go/internal/foo.go", "web/src/app.ts"}; !slices.Equal(hits, want) {
+		t.Fatalf("implicated = %v, want %v (a URL is not a path)", hits, want)
 	}
 }
 

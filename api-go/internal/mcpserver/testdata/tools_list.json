@@ -485,16 +485,18 @@
         "anthropic/maxResultSizeChars": 132096
       },
       "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
         "openWorldHint": false,
-        "readOnlyHint": true,
-        "title": "Explain a failed run"
+        "readOnlyHint": false,
+        "title": "Explain a failure"
       },
-      "description": "Explain why a run failed: failure signals, salient error lines, and which changed files are implicated.",
+      "description": "Why a run_id, log or evidence_handle failed: error lines, implicated files.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
           "run_id": {
-            "description": "the id of the run",
+            "description": "run/outcome id",
             "type": "string"
           },
           "workspace_id": {
@@ -502,9 +504,6 @@
             "type": "string"
           }
         },
-        "required": [
-          "run_id"
-        ],
         "type": "object"
       },
       "name": "why_failed",

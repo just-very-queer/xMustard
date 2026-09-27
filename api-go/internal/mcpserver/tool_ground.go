@@ -19,6 +19,7 @@ var groundTool = &Tool{
 		{Name: "max_chars", Type: typeInteger, Min: groundbudget.MinMaxChars, Max: groundbudget.MaxMaxChars,
 			Desc: "result budget in characters (default 6000)"},
 	},
+	Doc:         groundbudget.Markdown(),
 	Annotations: Annotations{Title: "Ground the session", ReadOnly: true},
 	// Only members that are never null are declared. A count or blocked flag ground
 	// cannot determine is null (and listed under "unknown"), and the portable schema

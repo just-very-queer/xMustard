@@ -109,7 +109,7 @@ func TestToolsListBudgetProfilesAreComplete(t *testing.T) {
 			if !ok {
 				t.Fatalf("profile %s names unknown tool %s", role, name)
 			}
-			if role == "reader" && !tl.Annotations.ReadOnly {
+			if role == "reader" && !tl.servesReads() {
 				t.Fatalf("the reader profile lists write tool %s", name)
 			}
 		}

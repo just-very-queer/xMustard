@@ -49,11 +49,12 @@ const (
 	ClassNotFound                       // 404
 	ClassConflict                       // 409 — state conflict (already exists, wrong phase)
 	ClassUnavailable                    // 503 — a dependency/runtime is not configured/ready
+	ClassForbidden                      // 403 — the deployment or the caller may not do this
 )
 
 // DomainError carries a typed class + a client-safe public message, decoupling HTTP
 // status (and what is disclosed) from the human-readable wording. Construct via
-// Invalid/NotFoundErr/Conflict/Unavailable; wrap an internal cause with WithCause.
+// Invalid/NotFoundErr/Conflict/Unavailable/Forbidden; wrap an internal cause with WithCause.
 type DomainError struct {
 	Class  ErrorClass
 	Public string // safe to return to the client
@@ -81,6 +82,9 @@ func NotFoundErr(public string) *DomainError {
 func Conflict(public string) *DomainError { return &DomainError{Class: ClassConflict, Public: public} }
 func Unavailable(public string) *DomainError {
 	return &DomainError{Class: ClassUnavailable, Public: public}
+}
+func Forbidden(public string) *DomainError {
+	return &DomainError{Class: ClassForbidden, Public: public}
 }
 
 // AsDomainError unwraps err to a *DomainError if one is in its chain.

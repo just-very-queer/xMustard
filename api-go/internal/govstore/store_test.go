@@ -135,11 +135,14 @@ func TestMigrationsIdempotentAndFingerprintRecorded(t *testing.T) {
 	var userVersion, appID int64
 	_ = s.readers.QueryRow("PRAGMA user_version").Scan(&userVersion)
 	_ = s.readers.QueryRow("PRAGMA application_id").Scan(&appID)
-	if userVersion != 1 || appID != applicationID {
+	if userVersion != int64(LatestSchemaVersion()) || appID != applicationID {
 		t.Fatalf("user_version %d application_id %#x", userVersion, appID)
 	}
 	// Running the migrator again, and reopening, applies nothing and keeps the
 	// fingerprint.
+	if err := s.readers.QueryRow("SELECT max(applied_at) FROM schema_migrations").Scan(&appliedAt); err != nil {
+		t.Fatal(err)
+	}
 	if _, fp, err := migrate(ctx, s.writer, time.Now); err != nil || fp != info.Fingerprint {
 		t.Fatalf("re-migrate: fp=%s err=%v", fp, err)
 	}
@@ -153,7 +156,7 @@ func TestMigrationsIdempotentAndFingerprintRecorded(t *testing.T) {
 	var rows int
 	var appliedAt2 string
 	_ = s2.readers.QueryRow("SELECT count(*), max(applied_at) FROM schema_migrations").Scan(&rows, &appliedAt2)
-	if rows != 1 || appliedAt2 != appliedAt || info2.Fingerprint != info.Fingerprint {
+	if rows != len(migrations) || appliedAt2 != appliedAt || info2.Fingerprint != info.Fingerprint {
 		t.Fatalf("reopen changed migrations: rows=%d applied %s->%s fp %s->%s", rows, appliedAt, appliedAt2, info.Fingerprint, info2.Fingerprint)
 	}
 }

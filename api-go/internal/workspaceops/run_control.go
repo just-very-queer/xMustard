@@ -839,7 +839,7 @@ func parseOpencodeModelsOutput(output string) []string {
 func sanitizeCodexArgs(raw string) ([]string, error) {
 	fields, err := splitShellArgs(raw)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("codex args: %w", err)
 	}
 	blockedWithValue := map[string]struct{}{
 		"-m": {}, "--model": {}, "-C": {}, "--cd": {}, "--cwd": {}, "-s": {}, "--sandbox": {}, "--sandbox-mode": {},
@@ -1069,10 +1069,10 @@ func splitShellArgs(raw string) ([]string, error) {
 		}
 	}
 	if escaped {
-		return nil, fmt.Errorf("unterminated escape sequence in codex args")
+		return nil, fmt.Errorf("unterminated escape sequence")
 	}
 	if inSingle || inDouble {
-		return nil, fmt.Errorf("unclosed quote in codex args")
+		return nil, fmt.Errorf("unclosed quote")
 	}
 	flush()
 	return args, nil
