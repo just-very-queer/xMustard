@@ -88,13 +88,16 @@ func feedbackRunFail(t *testing.T, dataDir, ws, path string) int {
 
 var agent = ContextActor{ID: "agent-a", SessionID: "s1"}
 
+// permitted is what the API grants an admin where the operator enabled commands.
+var permitted = CommandPermit{OperatorOptIn: true, Admin: "root"}
+
 // A command runs through the bounded runner in the confined directory with its
 // timeout, and its outcome is recorded, explained and listed by ground.
 func TestWhyFailedCommandRecordsTheOutcome(t *testing.T) {
 	dataDir, ws, root := seedOutcomeWorkspace(t, "pkg/sub/thing.go", "other.go")
 	one := 1
 	calls := stubRunner(t, &rustcore.ManagedCommandResult{ExitCode: &one, StdoutExcerpt: "--- FAIL: TestThing (0.00s)\n    thing_test.go:9: pkg/sub/thing.go:12: want 2, got 3\nFAIL\n", StderrExcerpt: "exit status 1"})
-	exp, err := RecordFailureOutcome(context.Background(), dataDir, ws, FailureRequest{Command: `go test "./pkg/sub/..."`, Cwd: "pkg", TimeoutSeconds: 20, Actor: agent})
+	exp, err := RunFailureCommand(context.Background(), dataDir, ws, CommandRequest{Command: `go test "./pkg/sub/..."`, Cwd: "pkg", TimeoutSeconds: 20, Permit: permitted, Actor: agent})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -129,7 +132,7 @@ func TestWhyFailedCommandRecordsTheOutcome(t *testing.T) {
 	runCheckCommand = func(_ context.Context, dir string, timeout int, argv, env []string) (*rustcore.ManagedCommandResult, error) {
 		return &rustcore.ManagedCommandResult{ExitCode: &zero, Success: true, StdoutExcerpt: "ok  pkg/sub 0.1s"}, nil
 	}
-	pass, err := RecordFailureOutcome(context.Background(), dataDir, ws, FailureRequest{Argv: []string{"go", "test", "./pkg/sub/..."}, Cwd: "pkg", Actor: agent})
+	pass, err := RunFailureCommand(context.Background(), dataDir, ws, CommandRequest{Argv: []string{"go", "test", "./pkg/sub/..."}, Cwd: "pkg", Permit: permitted, Actor: agent})
 	if err != nil || pass.Failed || pass.Status != govstore.RunPassed {
 		t.Fatalf("pass = %+v, %v", pass, err)
 	}
@@ -146,7 +149,7 @@ func TestWhyFailedCommandRecordsTheOutcome(t *testing.T) {
 func TestWhyFailedCommandTimeoutKillsTheProcessGroup(t *testing.T) {
 	dataDir, ws, pidFile := realCoreGrandchildWorkspace(t, "\t@echo '--- FAIL: TestSlow (0.00s)'\n")
 	start := time.Now()
-	exp, err := RecordFailureOutcome(context.Background(), dataDir, ws, FailureRequest{Argv: []string{"make", "test"}, TimeoutSeconds: 1, Actor: agent})
+	exp, err := RunFailureCommand(context.Background(), dataDir, ws, CommandRequest{Argv: []string{"make", "test"}, TimeoutSeconds: 1, Permit: permitted, Actor: agent})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -171,7 +174,7 @@ func TestWhyFailedCancelledCommandStillEndsItsProcessGroup(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	time.AfterFunc(1500*time.Millisecond, cancel)
 	start := time.Now()
-	_, err := RecordFailureOutcome(ctx, dataDir, ws, FailureRequest{Argv: []string{"make", "test"}, TimeoutSeconds: 3, Actor: agent})
+	_, err := RunFailureCommand(ctx, dataDir, ws, CommandRequest{Argv: []string{"make", "test"}, TimeoutSeconds: 3, Permit: permitted, Actor: agent})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("a cancelled request: %v", err)
 	}
@@ -199,7 +202,7 @@ func TestWhyFailedCommandEnvironmentHasNoDaemonSecrets(t *testing.T) {
 	t.Setenv("XMUSTARD_AUTH_TOKENS", "root:admin:"+strings.Repeat("s3cr3tT0k3n", 3))
 	t.Setenv("DEPLOY_API_TOKEN", strings.Repeat("Zq9", 12))
 	t.Setenv("XM_TEST_VISIBLE", "visible")
-	exp, err := RecordFailureOutcome(context.Background(), dataDir, ws, FailureRequest{Argv: []string{"make", "test"}, TimeoutSeconds: 20, Actor: agent})
+	exp, err := RunFailureCommand(context.Background(), dataDir, ws, CommandRequest{Argv: []string{"make", "test"}, TimeoutSeconds: 20, Permit: permitted, Actor: agent})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -431,7 +434,7 @@ func TestWhyFailedRedactsOutputBeforeStoring(t *testing.T) {
 	secret := "ghp_" + strings.Repeat("A1b2C3d4", 5)
 	one := 1
 	stubRunner(t, &rustcore.ManagedCommandResult{ExitCode: &one, StdoutExcerpt: "error: auth failed for token " + secret + "\nFAIL"})
-	exp, err := RecordFailureOutcome(context.Background(), dataDir, ws, FailureRequest{Command: "go test ./...", Actor: agent})
+	exp, err := RunFailureCommand(context.Background(), dataDir, ws, CommandRequest{Command: "go test ./...", Permit: permitted, Actor: agent})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -493,7 +496,7 @@ func TestWhyFailedCommandReportsTheRunnerWindow(t *testing.T) {
 	one := 1
 	stdout := "head\n...[dropped 4096 bytes of 5000 total]\ntail\n--- FAIL: TestX\n"
 	stubRunner(t, &rustcore.ManagedCommandResult{ExitCode: &one, StdoutExcerpt: stdout, StderrExcerpt: "exit status 1"})
-	exp, err := RecordFailureOutcome(context.Background(), dataDir, ws, FailureRequest{Command: "go test ./...", Actor: agent})
+	exp, err := RunFailureCommand(context.Background(), dataDir, ws, CommandRequest{Command: "go test ./...", Permit: permitted, Actor: agent})
 	if err != nil {
 		t.Fatal(err)
 	}

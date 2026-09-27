@@ -82,7 +82,7 @@ var routeGateTable = map[string]routeGate{
 	"GET /api/workspaces/{workspace_id}/context":                     coreGate(roleAdmin, "", "full memory history"),
 
 	// --- core: run-independent outcomes (outcome_routes.go, WS-21) ---
-	"POST /api/workspaces/{workspace_id}/why-failed":              coreGate(roleProposer, "why_failed", "runs a test, build or lint command from a closed table (argv, no shell, cwd and path arguments inside the workspace root, no daemon secrets in its environment, timeout kills the process group) or reads an evidence tail or a log; records the outcome"),
+	"POST /api/workspaces/{workspace_id}/why-failed":              coreGate(roleProposer, "why_failed", "reads an evidence tail or a log and records the outcome; a command runs only with XMUSTARD_WHY_FAILED_COMMANDS=1 and an authenticated admin (host-code execution; the closed program table is not a sandbox)"),
 	"GET /api/workspaces/{workspace_id}/outcomes":                 coreGate(roleReader, "", "run-independent outcomes, newest first; reads only"),
 	"DELETE /api/workspaces/{workspace_id}/outcomes/{outcome_id}": coreGate(roleAdmin, "", "removes one outcome (a secret the redactor missed in its command or tail)"),
 

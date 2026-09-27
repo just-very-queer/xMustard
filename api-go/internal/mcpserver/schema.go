@@ -54,6 +54,9 @@ type Tool struct {
 	// Aliases maps a hidden argument name to its canonical one. Aliases are accepted
 	// on tools/call and never advertised in tools/list.
 	Aliases map[string]string
+	// Doc is markdown the docs resource (DocsURI) prints after the tool's Advanced
+	// arguments; tools/list never carries it.
+	Doc string
 	// WriteArgs name the arguments that make a call of a tool that otherwise only reads
 	// a write (why_failed runs a command). A read-only connection lists such a tool and
 	// serves its calls without them; its annotations describe the writing calls.

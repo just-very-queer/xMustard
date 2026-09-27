@@ -49,9 +49,10 @@ type exposurePosture struct {
 	// RegisterLimit is how many workspaces one non-admin principal may register;
 	// 0 = workspaceops.DefaultRegisterLimit.
 	RegisterLimit int
-	// Commands is XMUSTARD_WHY_FAILED_COMMANDS: "1" or "0" force why_failed commands on
-	// or off; "" (auto) serves them only while the API binds loopback.
-	Commands string
+	// Commands is the operator's opt-in to why_failed commands
+	// (XMUSTARD_WHY_FAILED_COMMANDS=1, read at startup). Off by default on every bind;
+	// on, commands still serve authenticated admins only (outcome_routes.go).
+	Commands bool
 }
 
 func (p *exposurePosture) platform() bool { return p != nil && p.Profile == profilePlatform }
@@ -65,18 +66,10 @@ func (p *exposurePosture) profile() string {
 
 func (p *exposurePosture) readOnly() bool { return p != nil && p.ReadOnly }
 
-// runsCommands reports whether why_failed may run a command. A command from the closed
-// table still runs the repository's code as the daemon's operating-system user, so a
-// deployment reachable beyond loopback serves it only when the operator opts in.
-func (p *exposurePosture) runsCommands() bool {
-	if p == nil {
-		return false
-	}
-	if p.Commands != "" {
-		return p.Commands == "1"
-	}
-	return p.Loopback
-}
+// runsCommands reports whether the operator enabled why_failed commands. A command
+// runs the repository's code as the daemon's operating-system user, so it is off
+// unless the operator opted in; a posture that is missing runs none.
+func (p *exposurePosture) runsCommands() bool { return p != nil && p.Commands }
 
 func (p *exposurePosture) toolDisabled(tool string) bool {
 	return p != nil && tool != "" && p.DisabledTools[tool]
@@ -123,8 +116,8 @@ func (p *exposurePosture) disabledTools() []string {
 //	XMUSTARD_REGISTER_ROOTS=/a:/b    where non-admin tokens may register git work
 //	                                 trees (OS path list; default: admins only)
 //	XMUSTARD_REGISTER_LIMIT=n        workspaces one non-admin principal may register
-//	XMUSTARD_WHY_FAILED_COMMANDS=0|1 why_failed may run commands (default: only on a
-//	                                 loopback bind)
+//	XMUSTARD_WHY_FAILED_COMMANDS=1   why_failed may run commands, for authenticated
+//	                                 admins only (default 0: never)
 //
 // Conflicting profile settings and malformed values are startup errors.
 func loadExposurePosture() (exposurePosture, error) {
@@ -161,18 +154,12 @@ func loadExposurePosture() (exposurePosture, error) {
 	if len(votes) > 0 {
 		p.Profile = votes[0].profile
 	}
-	switch v := strings.TrimSpace(os.Getenv("XMUSTARD_READ_ONLY")); v {
-	case "", "0":
-	case "1":
-		p.ReadOnly = true
-	default:
-		return p, fmt.Errorf("invalid XMUSTARD_READ_ONLY=%q; use 0 or 1", v)
+	var err error
+	if p.ReadOnly, err = envSwitch("XMUSTARD_READ_ONLY"); err != nil {
+		return p, err
 	}
-	switch v := strings.TrimSpace(os.Getenv("XMUSTARD_WHY_FAILED_COMMANDS")); v {
-	case "", "0", "1":
-		p.Commands = v
-	default:
-		return p, fmt.Errorf("invalid XMUSTARD_WHY_FAILED_COMMANDS=%q; use 0 or 1", v)
+	if p.Commands, err = envSwitch("XMUSTARD_WHY_FAILED_COMMANDS"); err != nil {
+		return p, err
 	}
 	tools := toolGates()
 	for _, t := range splitCSV(os.Getenv("XMUSTARD_DISABLED_TOOLS")) {
@@ -222,6 +209,18 @@ func loadExposurePosture() (exposurePosture, error) {
 		return p, err
 	}
 	return p, nil
+}
+
+// envSwitch reads a 0|1 switch that is off when unset.
+func envSwitch(name string) (bool, error) {
+	switch v := strings.TrimSpace(os.Getenv(name)); v {
+	case "", "0":
+		return false, nil
+	case "1":
+		return true, nil
+	default:
+		return false, fmt.Errorf("invalid %s=%q; use 0 or 1", name, v)
+	}
 }
 
 // postureFromEnv is loadExposurePosture for callers that validated the environment

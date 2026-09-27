@@ -180,11 +180,12 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
 	},
 	{
 		name: "why_failed",
-		description: "Why a run_id, command, log or evidence_handle failed: error lines, implicated files.",
+		description: "Why a run_id, log or evidence_handle failed: error lines, implicated files.",
 		args: [workspaceArg, { name: "run_id", type: "string", desc: "run/outcome id" }],
-		// run_id reads a run or an outcome (GET). The command, log and evidence_handle
-		// sources are MCP advanced arguments this closed schema does not carry; without
-		// run_id the call goes to the recording route, which names what is missing.
+		// run_id reads a run or an outcome (GET). The log and evidence_handle sources (and
+		// the admin-only command, off unless the operator enabled it) are MCP advanced
+		// arguments this closed schema does not carry; without run_id the call goes to the
+		// recording route, which names what is missing.
 		build: (a) =>
 			str(a, "run_id")
 				? { method: "GET", path: ws(a, `/runs/${p(str(a, "run_id"))}/why-failed`) }

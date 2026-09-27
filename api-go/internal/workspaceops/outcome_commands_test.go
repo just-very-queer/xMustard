@@ -16,6 +16,57 @@ import (
 	"xmustard/api-go/internal/rustcore"
 )
 
+// The permit is checked first: without the operator's opt-in or an admin, nothing is
+// prepared, spawned, slotted or admitted, and the refusal is a 403.
+func TestWhyFailedCommandNeedsAPermit(t *testing.T) {
+	dataDir, ws, _ := seedOutcomeWorkspace(t)
+	calls := stubRunner(t, &rustcore.ManagedCommandResult{Success: true})
+	scope := budget.NewScope(budget.NewByteBudget(64 << 20))
+	defer scope.Close()
+	ctx := budget.WithScope(context.Background(), scope)
+	for name, req := range map[string]CommandRequest{
+		"zero permit":          {Command: "go test ./..."},
+		"opt-in without admin": {Command: "go test ./...", Permit: CommandPermit{OperatorOptIn: true}},
+		"admin without opt-in": {Command: "go test ./...", Permit: CommandPermit{Admin: "root"}},
+		"before its checks":    {Command: "curl http://example.com", Permit: CommandPermit{Admin: "root"}},
+	} {
+		req.Actor = agent
+		_, err := RunFailureCommand(ctx, dataDir, ws, req)
+		if de, ok := AsDomainError(err); !ok || de.Class != ClassForbidden {
+			t.Errorf("%s: %v, want a forbidden refusal", name, err)
+		}
+	}
+	if len(*calls) != 0 || len(commandSlots) != 0 || scope.Held() != 0 {
+		t.Fatalf("a refused permit reached the runner (%d calls), a slot (%d) or the budget (%d bytes)", len(*calls), len(commandSlots), scope.Held())
+	}
+	if all, err := ListRunOutcomes(ctx, dataDir, ws, false, 0); err != nil || len(all) != 0 {
+		t.Fatalf("a refused permit recorded %+v, %v", all, err)
+	}
+	if _, err := RunFailureCommand(ctx, dataDir, ws, CommandRequest{Command: "go test ./...", Permit: permitted, Actor: agent}); err != nil || len(*calls) != 1 {
+		t.Fatalf("a permitted command: %v, %d runner calls", err, len(*calls))
+	}
+}
+
+// An evidence handle or a log never runs anything, and exactly one of them is given.
+func TestWhyFailedReadsNeedExactlyOneSource(t *testing.T) {
+	dataDir, ws, _ := seedOutcomeWorkspace(t)
+	calls := stubRunner(t, &rustcore.ManagedCommandResult{Success: true})
+	for name, req := range map[string]FailureRequest{
+		"none": {}, "both": {EvidenceHandle: "xm1.h", Log: "FAIL"},
+	} {
+		req.Actor = agent
+		if _, err := RecordFailureOutcome(context.Background(), dataDir, ws, req); !IsInvalidInput(err) {
+			t.Errorf("%s: %v, want an invalid-input refusal", name, err)
+		}
+	}
+	if _, err := RecordFailureOutcome(context.Background(), dataDir, ws, FailureRequest{Log: "go test ./...\nFAIL", Actor: agent}); err != nil {
+		t.Fatal(err)
+	}
+	if len(*calls) != 0 {
+		t.Fatalf("a log reached the runner: %+v", *calls)
+	}
+}
+
 // The gate refuses, before anything runs, what the bounded runner must never execute:
 // shell syntax, programs and uses outside the closed table, flags that pick a program
 // to run, and paths outside the working directory. It admits the usual test, build and
@@ -26,7 +77,7 @@ func TestWhyFailedCommandGuards(t *testing.T) {
 	if err := os.Symlink(t.TempDir(), filepath.Join(root, "escape")); err != nil {
 		t.Fatal(err)
 	}
-	refused := map[string]FailureRequest{
+	refused := map[string]CommandRequest{
 		"pipe":              {Command: "go test ./... | tail -5"},
 		"redirect":          {Argv: []string{"go", "test", ">", "out.txt"}},
 		"redirect glued":    {Command: "go test ./... 2>/dev/null"},
@@ -50,6 +101,15 @@ func TestWhyFailedCommandGuards(t *testing.T) {
 		"go toolexec":       {Command: "go build -toolexec x ./..."},
 		"go vettool":        {Command: "go vet -vettool=x ./..."},
 		"go ldflags":        {Command: "go build -ldflags=-extld=x ./..."},
+		"go -mod=mod":       {Command: "go test -mod=mod ./..."},
+		"go -mod mod":       {Command: "go test -mod mod ./..."},
+		"go -mod last":      {Command: "go test ./... -mod"},
+		"go modfile":        {Command: "go test -modfile=evil.mod ./..."},
+		"go overlay":        {Command: "go build -overlay=o.json ./..."},
+		"go remote package": {Command: "go test github.com/evil/x/..."},
+		"go all":            {Command: "go test all"},
+		"go std package":    {Command: "go vet fmt"},
+		"go bare pattern":   {Command: "go test -v pkg/..."},
 		"cargo run":         {Command: "cargo run"},
 		"cargo install":     {Command: "cargo install evil"},
 		"cargo config":      {Command: `cargo test --config target.x.runner="x"`},
@@ -72,6 +132,12 @@ func TestWhyFailedCommandGuards(t *testing.T) {
 		"make eval":         {Command: "make --eval=x test"},
 		"just shell":        {Command: "just --shell x test"},
 		"mvn deploy":        {Command: "mvn deploy"},
+		"mvn plugin":        {Command: "mvn build-helper:test"},
+		"mvn coordinates":   {Command: "mvn -B org.evil:plugin:1.0:test"},
+		"mvnw plugin":       {Argv: []string{"./mvnw", "test-x:goal"}},
+		"path program":      {Argv: []string{"./node_modules/.bin/jest"}},
+		"path make":         {Argv: []string{"./make", "test"}},
+		"path python":       {Command: "venv/bin/python -m pytest"},
 		"gradle publish":    {Command: "gradle build publish"},
 		"dotnet run":        {Command: "dotnet run"},
 		"bazel run":         {Command: "bazel run //:x"},
@@ -98,14 +164,14 @@ func TestWhyFailedCommandGuards(t *testing.T) {
 		"timeout":           {Command: "go test ./...", TimeoutSeconds: MaxWhyFailedTimeout + 1},
 		"negative timeout":  {Command: "go test ./...", TimeoutSeconds: -1},
 		"unclosed quote":    {Command: `go test "./...`},
-		"no source":         {},
-		"two sources":       {Command: "go test ./...", Log: "FAIL"},
+		"no command":        {},
+		"blank command":     {Command: "  "},
 		"command and argv":  {Command: "go test", Argv: []string{"go", "vet"}},
 		"nul":               {Argv: []string{"go", "test", "a\x00b"}},
 	}
 	for name, req := range refused {
-		req.Actor = agent
-		if _, err := RecordFailureOutcome(context.Background(), dataDir, ws, req); !IsInvalidInput(err) {
+		req.Permit, req.Actor = permitted, agent
+		if _, err := RunFailureCommand(context.Background(), dataDir, ws, req); !IsInvalidInput(err) {
 			t.Errorf("%s: got %v, want an invalid-input refusal", name, err)
 		}
 	}
@@ -114,14 +180,15 @@ func TestWhyFailedCommandGuards(t *testing.T) {
 	}
 	admitted := []string{
 		"go test ./...", "go test -run 'TestA|TestB' -count=1 ./pkg/...", "go vet ./...", "go build ./...",
-		"go test -coverprofile=c.out ./...", "cargo test -p core -- --nocapture", "cargo clippy --all-targets",
+		"go test -coverprofile=c.out ./...", "go test -mod=readonly ./...", "go test -mod vendor -run TestA -count 1 .",
+		"go test ./... -args -v x", "go build -o bin/x ./cmd/x", "cargo test -p core -- --nocapture", "cargo clippy --all-targets",
 		"npm test", "npm run lint", "npm run test:unit -- --watch=false", "yarn build:prod", "pnpm test", "bun test",
 		"make test", "make -j4 check-backend", "make -k lint test", "just test", "gradle :app:testDebugUnitTest --offline",
-		"mvn -B verify", "pytest -x -k 'not slow' tests/", "python3 -m pytest -q", "python -m unittest", "eslint .",
+		"mvn -B verify", "mvn test-compile", "pytest -x -k 'not slow' tests/", "python3 -m pytest -q", "python -m unittest", "eslint .",
 		"ruff check .", "golangci-lint run ./...", "tsc -p tsconfig.json", "dotnet test",
 	}
 	for _, cmd := range admitted {
-		if _, err := RecordFailureOutcome(context.Background(), dataDir, ws, FailureRequest{Command: cmd, Actor: agent}); err != nil {
+		if _, err := RunFailureCommand(context.Background(), dataDir, ws, CommandRequest{Command: cmd, Permit: permitted, Actor: agent}); err != nil {
 			t.Errorf("%s: %v", cmd, err)
 		}
 	}
@@ -162,7 +229,7 @@ func TestWhyFailedProgramResolution(t *testing.T) {
 		{"pkg", "../gradlew", filepath.Join(croot, "gradlew")},
 	} {
 		*calls = nil
-		if _, err := RecordFailureOutcome(context.Background(), dataDir, ws, FailureRequest{Argv: []string{c.program, "test"}, Cwd: c.cwd, Actor: agent}); err != nil {
+		if _, err := RunFailureCommand(context.Background(), dataDir, ws, CommandRequest{Argv: []string{c.program, "test"}, Cwd: c.cwd, Permit: permitted, Actor: agent}); err != nil {
 			t.Fatalf("%s in %q: %v", c.program, c.cwd, err)
 		}
 		if len(*calls) != 1 || (*calls)[0].argv[0] != c.want {
@@ -171,12 +238,12 @@ func TestWhyFailedProgramResolution(t *testing.T) {
 	}
 	*calls = nil
 	for _, c := range []struct{ cwd, program string }{{"linked", "./gradlew"}, {"ios", "./gradlew"}, {"dirprog", "./gradlew"}} {
-		if _, err := RecordFailureOutcome(context.Background(), dataDir, ws, FailureRequest{Argv: []string{c.program, "test"}, Cwd: c.cwd, Actor: agent}); !IsInvalidInput(err) {
+		if _, err := RunFailureCommand(context.Background(), dataDir, ws, CommandRequest{Argv: []string{c.program, "test"}, Cwd: c.cwd, Permit: permitted, Actor: agent}); !IsInvalidInput(err) {
 			t.Errorf("%s in %q: %v, want a refusal", c.program, c.cwd, err)
 		}
 	}
 	lookPath = func(name string) (string, error) { return "", errors.New("executable file not found in $PATH") }
-	_, err := RecordFailureOutcome(context.Background(), dataDir, ws, FailureRequest{Command: "pytest -x", Actor: agent})
+	_, err := RunFailureCommand(context.Background(), dataDir, ws, CommandRequest{Command: "pytest -x", Permit: permitted, Actor: agent})
 	if !IsInvalidInput(err) || !strings.Contains(err.Error(), "not on the server's PATH") {
 		t.Fatalf("a program not on PATH: %v", err)
 	}
@@ -201,7 +268,7 @@ func TestCommandEnvDropsDaemonSecrets(t *testing.T) {
 	calls := stubRunner(t, &rustcore.ManagedCommandResult{Success: true})
 	t.Setenv("XMUSTARD_AUTH_TOKENS", "root:admin:"+strings.Repeat("s3cr3tT0k3n", 3))
 	dataDir, ws, _ := seedOutcomeWorkspace(t)
-	if _, err := RecordFailureOutcome(context.Background(), dataDir, ws, FailureRequest{Command: "go test ./...", Actor: agent}); err != nil {
+	if _, err := RunFailureCommand(context.Background(), dataDir, ws, CommandRequest{Command: "go test ./...", Permit: permitted, Actor: agent}); err != nil {
 		t.Fatal(err)
 	}
 	got := (*calls)[0].env
@@ -223,12 +290,12 @@ func TestWhyFailedRunsOneCommandAtATime(t *testing.T) {
 	})
 	first := make(chan error, 1)
 	go func() {
-		_, err := RecordFailureOutcome(context.Background(), dataDir, ws, FailureRequest{Command: "go test ./...", Actor: agent})
+		_, err := RunFailureCommand(context.Background(), dataDir, ws, CommandRequest{Command: "go test ./...", Permit: permitted, Actor: agent})
 		first <- err
 	}()
 	<-entered
 	start := time.Now()
-	_, err := RecordFailureOutcome(context.Background(), dataDir, ws, FailureRequest{Command: "go vet ./...", Actor: agent})
+	_, err := RunFailureCommand(context.Background(), dataDir, ws, CommandRequest{Command: "go vet ./...", Permit: permitted, Actor: agent})
 	if de, ok := AsDomainError(err); !ok || de.Class != ClassUnavailable || time.Since(start) > time.Second {
 		t.Fatalf("a second command while one runs: %v after %s", err, time.Since(start))
 	}
@@ -241,7 +308,7 @@ func TestWhyFailedRunsOneCommandAtATime(t *testing.T) {
 		t.Fatal(err)
 	}
 	go func() { <-entered }()
-	if _, err := RecordFailureOutcome(context.Background(), dataDir, ws, FailureRequest{Command: "go vet ./...", Actor: agent}); err != nil {
+	if _, err := RunFailureCommand(context.Background(), dataDir, ws, CommandRequest{Command: "go vet ./...", Permit: permitted, Actor: agent}); err != nil {
 		t.Fatalf("after the first ended: %v", err)
 	}
 }
@@ -259,7 +326,7 @@ func TestWhyFailedAdmitsTheAnalysisWindowAfterTheRun(t *testing.T) {
 		return &rustcore.ManagedCommandResult{StdoutExcerpt: out}, nil
 	})
 	ctx := budget.WithScope(context.Background(), scope)
-	if _, err := RecordFailureOutcome(ctx, dataDir, ws, FailureRequest{Command: "go test ./...", Actor: agent}); err != nil {
+	if _, err := RunFailureCommand(ctx, dataDir, ws, CommandRequest{Command: "go test ./...", Permit: permitted, Actor: agent}); err != nil {
 		t.Fatal(err)
 	}
 	// after the run the scope also holds what reading the changed files reserved
@@ -270,7 +337,7 @@ func TestWhyFailedAdmitsTheAnalysisWindowAfterTheRun(t *testing.T) {
 	// a pool that cannot hold the window refuses the analysis as an overload
 	tiny := budget.NewScope(budget.NewByteBudget(1 << 10))
 	defer tiny.Close()
-	_, err := RecordFailureOutcome(budget.WithScope(context.Background(), tiny), dataDir, ws, FailureRequest{Command: "go test ./...", Actor: agent})
+	_, err := RunFailureCommand(budget.WithScope(context.Background(), tiny), dataDir, ws, CommandRequest{Command: "go test ./...", Permit: permitted, Actor: agent})
 	if de, ok := AsDomainError(err); !ok || de.Class != ClassUnavailable {
 		t.Fatalf("an analysis the pool can never hold: %v", err)
 	}
@@ -280,7 +347,7 @@ func TestWhyFailedAdmitsTheAnalysisWindowAfterTheRun(t *testing.T) {
 	}
 	crowded := budget.NewScope(busy)
 	defer crowded.Close()
-	_, err = RecordFailureOutcome(budget.WithScope(context.Background(), crowded), dataDir, ws, FailureRequest{Command: "go test ./...", Actor: agent})
+	_, err = RunFailureCommand(budget.WithScope(context.Background(), crowded), dataDir, ws, CommandRequest{Command: "go test ./...", Permit: permitted, Actor: agent})
 	if !errors.Is(err, budget.ErrOverloaded) {
 		t.Fatalf("an analysis the pool cannot hold now: %v", err)
 	}

@@ -48,8 +48,8 @@ func renderToolsDoc(tools []*Tool) string {
 		for _, a := range t.Advanced {
 			fmt.Fprintf(&b, "- `%s` (%s): %s\n", a.Name, argShape(a), a.Desc)
 		}
-		if t.Name == groundTool.Name {
-			b.WriteString("\n" + groundbudget.Markdown())
+		if t.Doc != "" {
+			b.WriteString("\n" + t.Doc)
 		}
 	}
 	b.WriteString("\n## Hidden aliases\n\nAccepted on tools/call and never listed; each folds onto its canonical argument " +

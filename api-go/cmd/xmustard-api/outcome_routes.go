@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net/http"
+	"strings"
 
 	"xmustard/api-go/internal/evidence"
 	"xmustard/api-go/internal/workspaceops"
@@ -17,14 +19,18 @@ import (
 //   GET    /api/workspaces/{ws}/outcomes?open=true&limit=N
 //   DELETE /api/workspaces/{ws}/outcomes/{outcome_id}
 //
-// The POST runs a test, build or lint command from a closed table through the bounded
-// Rust runner (workspaceops/outcome_commands.go: argv exec, no shell, the working
-// directory and path arguments confined to the workspace root, a scrubbed environment,
-// one command at a time, a timeout that terminates the process group), or reads the
-// last MiB of an evidence original the caller may read, or takes a pasted log; it
-// records the outcome and answers the explanation. A deployment reachable beyond
-// loopback runs commands only with XMUSTARD_WHY_FAILED_COMMANDS=1. Running a command
-// and recording an outcome are agent writes (proposer); readers only read outcomes:
+// The POST reads the last MiB of an evidence original the caller may read, or takes a
+// pasted log, records the outcome and answers the explanation; recording one is an
+// agent write (proposer), and neither source ever runs anything. Command mode is off by
+// default: a command runs only when the operator set XMUSTARD_WHY_FAILED_COMMANDS=1 at
+// startup AND the caller is an authenticated admin (commandPermit, checked before
+// anything is spawned, reserved or admitted). Enabled, it is trusted host-code
+// execution by admin credentials: the closed program table (workspaceops/
+// outcome_commands.go: argv exec, no shell, the working directory and path arguments
+// confined to the workspace root, a scrubbed environment, one command at a time, a
+// timeout that terminates the process group) is defense in depth, not a sandbox
+// (docs/SECURITY.md). A request naming more than one source (a command with a log or an
+// evidence handle) is refused before either is used. Readers only read outcomes:
 // GET .../runs/{outcome_id}/why-failed (main.go) and the list above. An admin removes
 // an outcome (a secret the redactor missed); revoking or purging an evidence original
 // removes the outcomes made from it (evidence_routes.go). The routes are core and
@@ -47,6 +53,56 @@ type whyFailedBody struct {
 	RunID          string   `json:"run_id"`
 }
 
+// runsCommand reports whether the body asks to run a command. It refuses, before any
+// source is used, a body naming no source or more than one (a command with a log or an
+// evidence handle is never run), a run_id, and command options without a command.
+func (b whyFailedBody) runsCommand() (bool, error) {
+	if b.RunID != "" {
+		return false, fmt.Errorf("a run_id is read with GET .../runs/{run_id}/why-failed")
+	}
+	var named []string
+	for _, s := range []struct {
+		name string
+		set  bool
+	}{{"command", b.Command != ""}, {"argv", len(b.Argv) > 0}, {"evidence_handle", b.EvidenceHandle != ""}, {"log", b.Log != ""}} {
+		if s.set {
+			named = append(named, s.name)
+		}
+	}
+	if len(named) != 1 {
+		return false, fmt.Errorf("why_failed needs exactly one of command, argv, evidence_handle or log; got %d (%s)", len(named), strings.Join(named, ", "))
+	}
+	command := named[0] == "command" || named[0] == "argv"
+	if !command && (b.Cwd != "" || b.TimeoutSeconds != 0) {
+		return false, fmt.Errorf("cwd and timeout_seconds apply to a command only")
+	}
+	return command, nil
+}
+
+// commandPermit checks what running a why_failed command needs, in this order, before
+// anything is spawned, reserved or admitted: the operator's opt-in
+// (XMUSTARD_WHY_FAILED_COMMANDS=1, read at startup; off by default), an authenticated
+// principal (open mode has none) and the admin role. Each refusal is a 403 that names
+// what is missing; a missing role is audited.
+func commandPermit(w http.ResponseWriter, r *http.Request, caller memoryCaller) (workspaceops.CommandPermit, bool) {
+	if !postureFrom(r).runsCommands() {
+		writeJSON(w, http.StatusForbidden, map[string]any{"reason": "commands_disabled",
+			"error": "this server does not run why_failed commands (the operator enables them with XMUSTARD_WHY_FAILED_COMMANDS=1, for admins only); pass the output as log or evidence_handle"})
+		return workspaceops.CommandPermit{}, false
+	}
+	p := caller.principal
+	if p == nil {
+		writeJSON(w, http.StatusForbidden, map[string]any{"reason": "admin_required",
+			"error": "why_failed commands need an authenticated admin principal; this server has no credentials (open mode)"})
+		return workspaceops.CommandPermit{}, false
+	}
+	if !p.Has(workspaceops.GateRole(roleAdmin)) {
+		denyMissingRole(w, r, p, roleAdmin)
+		return workspaceops.CommandPermit{}, false
+	}
+	return workspaceops.CommandPermit{OperatorOptIn: true, Admin: p.ID}, true
+}
+
 func registerOutcomeRoutes(mux routeRegistrar, store *evidence.Store) {
 	mux.HandleFunc("POST /api/workspaces/{workspace_id}/why-failed", func(w http.ResponseWriter, r *http.Request) {
 		caller, ok := requireMemoryCaller(w, r, roleProposer)
@@ -58,20 +114,27 @@ func registerOutcomeRoutes(mux routeRegistrar, store *evidence.Store) {
 		if !requireJSONBody(w, r, &body) {
 			return
 		}
-		if body.RunID != "" {
-			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "a run_id is read with GET .../runs/{run_id}/why-failed"})
-			return
-		}
-		if (body.Command != "" || len(body.Argv) > 0) && !postureFrom(r).runsCommands() {
-			writeJSON(w, http.StatusForbidden, map[string]any{"reason": "commands_disabled",
-				"error": "this deployment does not run why_failed commands (it is reachable beyond loopback; XMUSTARD_WHY_FAILED_COMMANDS=1 enables them); pass the output as log or evidence_handle"})
+		command, err := body.runsCommand()
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 			return
 		}
 		ws := r.PathValue("workspace_id")
-		result, err := workspaceops.RecordFailureOutcome(r.Context(), dataDir(), ws, workspaceops.FailureRequest{
-			Command: body.Command, Argv: body.Argv, Cwd: body.Cwd, TimeoutSeconds: body.TimeoutSeconds,
-			EvidenceHandle: body.EvidenceHandle, Log: body.Log, Evidence: evidenceTail(r, store, ws), Actor: caller.actor(),
-		})
+		var result *workspaceops.FailureExplanation
+		if command {
+			permit, ok := commandPermit(w, r, caller)
+			if !ok {
+				return
+			}
+			result, err = workspaceops.RunFailureCommand(r.Context(), dataDir(), ws, workspaceops.CommandRequest{
+				Command: body.Command, Argv: body.Argv, Cwd: body.Cwd, TimeoutSeconds: body.TimeoutSeconds,
+				Permit: permit, Actor: caller.actor(),
+			})
+		} else {
+			result, err = workspaceops.RecordFailureOutcome(r.Context(), dataDir(), ws, workspaceops.FailureRequest{
+				EvidenceHandle: body.EvidenceHandle, Log: body.Log, Evidence: evidenceTail(r, store, ws), Actor: caller.actor(),
+			})
+		}
 		if err != nil {
 			respondError(w, err)
 			return

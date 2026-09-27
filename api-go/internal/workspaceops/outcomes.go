@@ -26,17 +26,16 @@ import (
 
 // Run-independent failure outcomes (WS-21; PAR-HAR-06, PAR-RET-11, PAR-RT-11).
 //
-// why_failed works without platform runs. It runs a test, build or lint command from a
-// closed table through the bounded Rust runner (outcome_commands.go: argv exec, no
-// shell, the working directory and path arguments confined to the workspace root, no
-// daemon secrets in its environment, one at a time, a timeout that terminates the whole
-// process group), reads the last MiB of a retained evidence original, or takes a pasted
-// log. The output is redacted, analyzed from its bounded tail and recorded once as a
-// govstore run outcome, and ground lists the open failures. Reading an outcome never
-// writes: run_fail feedback is recorded once, when an outcome is first recorded, for the
-// changed files it implicates. A captured failing test, build or lint output becomes an
-// outcome the same way (RecordCapturedOutcome), without a Rust or git spawn on the
-// capture path. Revoking an evidence original removes the outcomes made from it.
+// why_failed works without platform runs. It reads the last MiB of a retained evidence
+// original or takes a pasted log (RecordFailureOutcome, which never runs anything), or,
+// only where the operator enabled commands and for an authenticated admin, runs a
+// test, build or lint command (RunFailureCommand, outcome_commands.go). The output is
+// redacted, analyzed from its bounded tail and recorded once as a govstore run outcome,
+// and ground lists the open failures. Reading an outcome never writes: run_fail
+// feedback is recorded once, when an outcome is first recorded, for the changed files
+// it implicates. A captured failing test, build or lint output becomes an outcome the
+// same way (RecordCapturedOutcome), without a Rust or git spawn on the capture path.
+// Revoking an evidence original removes the outcomes made from it.
 
 const (
 	// outcomeTailBytes is how much of an output is analyzed: its end, where runners and
@@ -71,14 +70,9 @@ const (
 // authorized as the caller (evidence.Store.Tail).
 type EvidenceTailFunc func(ctx context.Context, handle string, maxBytes int64) (*evidence.Tail, error)
 
-// FailureRequest is one why_failed call without a platform run: exactly one of a
-// command (Argv, or Command split like a shell would split words, without expanding
-// anything), EvidenceHandle and Log is set.
+// FailureRequest is one why_failed call that explains an output it is given: exactly
+// one of EvidenceHandle and Log is set. It never runs a command (CommandRequest does).
 type FailureRequest struct {
-	Command        string
-	Argv           []string
-	Cwd            string // repo-relative; "" is the workspace root
-	TimeoutSeconds int    // 0 means DefaultWhyFailedTimeout
 	EvidenceHandle string
 	Log            string
 	// Evidence reads an evidence tail as the caller; required with EvidenceHandle.
@@ -119,23 +113,31 @@ type collectedOutput struct {
 	analysis outcomeAnalysis
 }
 
-// RecordFailureOutcome runs or reads req's source, records its outcome and explains
-// it. A log or evidence original already recorded returns its first outcome
+// RecordFailureOutcome reads req's evidence tail or log, records its outcome and
+// explains it. A log or evidence original already recorded returns its first outcome
 // (Created false) and feeds nothing back again.
 func RecordFailureOutcome(ctx context.Context, dataDir, workspaceID string, req FailureRequest) (*FailureExplanation, error) {
 	if err := validateSafeID("workspace", workspaceID); err != nil {
 		return nil, err
 	}
+	if (req.EvidenceHandle == "") == (req.Log == "") {
+		return nil, Invalid("why_failed explains exactly one of evidence_handle or log")
+	}
 	root, _, err := resolveChangeRootCtx(ctx, dataDir, workspaceID)
 	if err != nil {
 		return nil, err
 	}
-	out, err := collectFailureOutput(ctx, root, req)
+	out, err := readFailureOutput(ctx, req)
 	if err != nil {
 		return nil, err
 	}
+	return recordOutcome(ctx, dataDir, workspaceID, root, out, req.Actor)
+}
+
+// recordOutcome stores a collected output as an outcome and explains it.
+func recordOutcome(ctx context.Context, dataDir, workspaceID, root string, out *collectedOutput, actor ContextActor) (*FailureExplanation, error) {
 	out.in.WorkspaceID = workspaceID
-	rec, created, err := storeRunOutcome(ctx, dataDir, workspaceID, out, req.Actor.storeActor(root))
+	rec, created, err := storeRunOutcome(ctx, dataDir, workspaceID, out, actor.storeActor(root))
 	if err != nil {
 		return nil, err
 	}
@@ -242,33 +244,9 @@ func ForgetEvidenceOutcomes(ctx context.Context, dataDir, workspaceID, handle st
 
 // --- sources -------------------------------------------------------------------------
 
-func collectFailureOutput(ctx context.Context, root string, req FailureRequest) (*collectedOutput, error) {
-	if req.Command != "" {
-		if len(req.Argv) > 0 {
-			return nil, Invalid("pass command or argv, not both")
-		}
-		argv, err := splitShellArgs(req.Command)
-		if err != nil {
-			return nil, Invalid("command: " + err.Error())
-		}
-		if len(argv) == 0 {
-			return nil, Invalid("command has no program")
-		}
-		req.Argv = argv
-	}
-	sources := 0
-	for _, set := range []bool{len(req.Argv) > 0, req.EvidenceHandle != "", req.Log != ""} {
-		if set {
-			sources++
-		}
-	}
-	if sources != 1 {
-		return nil, Invalid("why_failed needs exactly one of command, evidence_handle or log (a run_id is read with GET)")
-	}
-	switch {
-	case len(req.Argv) > 0:
-		return runFailureCommand(ctx, root, req)
-	case req.EvidenceHandle != "":
+// readFailureOutput reads an evidence tail or takes a log; it runs nothing.
+func readFailureOutput(ctx context.Context, req FailureRequest) (*collectedOutput, error) {
+	if req.EvidenceHandle != "" {
 		return readEvidenceFailure(ctx, req)
 	}
 	if err := admitAnalysis(ctx, int64(len(req.Log))); err != nil {
@@ -283,22 +261,9 @@ var whyFailedFamilies = map[evidence.Family]bool{evidence.FamilyTest: true, evid
 // CapturesOutcome reports whether a captured output of family can become an outcome.
 func CapturesOutcome(family evidence.Family) bool { return whyFailedFamilies[family] }
 
-// runFailureCommand checks the command (outcome_commands.go), runs it through the
-// bounded runner when no other why_failed command is running, and analyzes its output.
-func runFailureCommand(ctx context.Context, root string, req FailureRequest) (*collectedOutput, error) {
-	cmd, err := prepareCommand(root, req)
-	if err != nil {
-		return nil, err
-	}
-	release, err := acquireCommandSlot()
-	if err != nil {
-		return nil, err
-	}
-	res, err := cmd.run(ctx)
-	release()
-	if err != nil {
-		return nil, err
-	}
+// commandOutput analyzes a finished command's output. Its analysis window is admitted
+// here, after the run, sized to the output.
+func commandOutput(ctx context.Context, cmd *preparedCommand, res *rustcore.ManagedCommandResult) (*collectedOutput, error) {
 	raw := combineCommandOutput(res.StdoutExcerpt, res.StderrExcerpt)
 	if err := admitAnalysis(ctx, int64(len(raw))); err != nil {
 		return nil, err
@@ -312,9 +277,9 @@ func runFailureCommand(ctx context.Context, root string, req FailureRequest) (*c
 	out.analysis.TimedOut = res.TimedOut
 	out.analysis.Signals = append(statusSignals(status, res.ExitCode, cmd.timeout), out.analysis.Signals...)
 	out.in.Source, out.in.SourceKey = govstore.RunSourceCommand, "command:"+nonce
-	out.in.SubjectKey = commandSubject(cmd.rel, req.Argv)
+	out.in.SubjectKey = commandSubject(cmd.rel, cmd.words)
 	out.in.Status, out.in.ExitCode = status, res.ExitCode
-	out.in.Command, out.in.Cwd = redactedLine(strings.Join(req.Argv, " ")), cmd.rel
+	out.in.Command, out.in.Cwd = redactedLine(strings.Join(cmd.words, " ")), cmd.rel
 	return out, nil
 }
 

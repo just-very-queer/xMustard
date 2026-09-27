@@ -18,13 +18,15 @@ import (
 	"xmustard/api-go/internal/rustcore"
 )
 
-// Commands why_failed runs (WS-21). A command is the caller's argv, checked against a
-// closed table of test, build and lint invocations and run through the bounded Rust
+// Commands why_failed runs (WS-21). Command mode is off unless the operator enabled it
+// at startup, and then serves only an authenticated admin: a test or build runs the
+// repository's own code as the daemon's operating-system user, so an enabled command
+// mode is trusted host-code execution by admin credentials (docs/SECURITY.md). A
+// command is the caller's argv, checked against a closed table of test, build and lint
+// invocations (defense in depth, not a sandbox) and run through the bounded Rust
 // runner: no shell, a working directory inside the workspace root, the daemon's
 // environment without its own configuration and secrets, and a timeout at which the
 // runner terminates the command's whole process group. One command runs at a time.
-// This narrows what a proposer can run; it is not a sandbox: a test or build runs the
-// repository's own code (docs/SECURITY.md).
 
 // runCheckCommand is the bounded runner; tests replace it.
 var runCheckCommand = rustcore.RunManagedCommandEnv
@@ -32,8 +34,67 @@ var runCheckCommand = rustcore.RunManagedCommandEnv
 // lookPath finds a bare program name on the daemon's PATH; tests replace it.
 var lookPath = exec.LookPath
 
+// CommandPermit is what an entry point checked, in this order, before it asks to run a
+// command: the operator's opt-in (XMUSTARD_WHY_FAILED_COMMANDS=1, read at startup) and
+// an authenticated admin principal. RunFailureCommand checks it again before anything
+// else; the zero value runs nothing.
+type CommandPermit struct {
+	OperatorOptIn bool
+	Admin         string // the authenticated admin principal's id
+}
+
+// CommandRequest is one why_failed command: Argv, or Command split into words like a
+// shell would split them, without expanding anything.
+type CommandRequest struct {
+	Command        string
+	Argv           []string
+	Cwd            string // repo-relative; "" is the workspace root
+	TimeoutSeconds int    // 0 means DefaultWhyFailedTimeout
+	Permit         CommandPermit
+	Actor          ContextActor
+}
+
+// RunFailureCommand runs req's command, records its outcome and explains it. Its guards
+// run in order and fail closed before any spawn, command slot or analysis window: the
+// permit (the operator's opt-in, then an admin), then the command's checks
+// (prepareCommand), then the single command slot.
+func RunFailureCommand(ctx context.Context, dataDir, workspaceID string, req CommandRequest) (*FailureExplanation, error) {
+	if !req.Permit.OperatorOptIn {
+		return nil, Forbidden("why_failed commands are off on this server; the operator enables them with XMUSTARD_WHY_FAILED_COMMANDS=1")
+	}
+	if req.Permit.Admin == "" {
+		return nil, Forbidden("why_failed commands need an authenticated admin principal")
+	}
+	if err := validateSafeID("workspace", workspaceID); err != nil {
+		return nil, err
+	}
+	root, _, err := resolveChangeRootCtx(ctx, dataDir, workspaceID)
+	if err != nil {
+		return nil, err
+	}
+	cmd, err := prepareCommand(root, req)
+	if err != nil {
+		return nil, err
+	}
+	release, err := acquireCommandSlot()
+	if err != nil {
+		return nil, err
+	}
+	res, err := cmd.run(ctx)
+	release()
+	if err != nil {
+		return nil, err
+	}
+	out, err := commandOutput(ctx, cmd, res)
+	if err != nil {
+		return nil, err
+	}
+	return recordOutcome(ctx, dataDir, workspaceID, root, out, req.Actor)
+}
+
 // preparedCommand is a checked command, ready for the runner.
 type preparedCommand struct {
+	words   []string // the argv as requested, for the record
 	argv    []string // argv[0] is the resolved program
 	dir     string   // the absolute working directory
 	rel     string   // the working directory relative to the root ("" is the root)
@@ -43,24 +104,28 @@ type preparedCommand struct {
 // prepareCommand checks req's command in this order, failing closed: its words, the
 // program's rule, the working directory, the arguments' paths, the program's file and
 // the timeout.
-func prepareCommand(root string, req FailureRequest) (*preparedCommand, error) {
+func prepareCommand(root string, req CommandRequest) (*preparedCommand, error) {
 	if strings.TrimSpace(root) == "" {
 		return nil, Invalid("the workspace has no root directory to run a command in")
 	}
-	if err := checkCommandWords(req.Argv); err != nil {
+	words, err := req.words()
+	if err != nil {
 		return nil, err
 	}
-	if err := checkCommandRule(req.Argv); err != nil {
+	if err := checkCommandWords(words); err != nil {
+		return nil, err
+	}
+	if err := checkCommandRule(words); err != nil {
 		return nil, err
 	}
 	dir, rel, err := confineCommandDir(root, req.Cwd)
 	if err != nil {
 		return nil, err
 	}
-	if err := checkArgumentPaths(root, rel, req.Argv[1:]); err != nil {
+	if err := checkArgumentPaths(root, rel, words[1:]); err != nil {
 		return nil, err
 	}
-	program, err := resolveProgram(root, rel, req.Argv[0])
+	program, err := resolveProgram(root, rel, words[0])
 	if err != nil {
 		return nil, err
 	}
@@ -68,7 +133,28 @@ func prepareCommand(root string, req FailureRequest) (*preparedCommand, error) {
 	if timeout < 1 || timeout > MaxWhyFailedTimeout {
 		return nil, Invalid(fmt.Sprintf("timeout_seconds must be between 1 and %d", MaxWhyFailedTimeout))
 	}
-	return &preparedCommand{argv: append([]string{program}, req.Argv[1:]...), dir: dir, rel: rel, timeout: timeout}, nil
+	return &preparedCommand{words: words, argv: append([]string{program}, words[1:]...), dir: dir, rel: rel, timeout: timeout}, nil
+}
+
+// words is the command's argv: Argv, or Command split into words.
+func (req CommandRequest) words() ([]string, error) {
+	if req.Command == "" {
+		if len(req.Argv) == 0 {
+			return nil, Invalid("command has no program")
+		}
+		return req.Argv, nil
+	}
+	if len(req.Argv) > 0 {
+		return nil, Invalid("pass command or argv, not both")
+	}
+	argv, err := splitShellArgs(req.Command)
+	if err != nil {
+		return nil, Invalid("command: " + err.Error())
+	}
+	if len(argv) == 0 {
+		return nil, Invalid("command has no program")
+	}
+	return argv, nil
 }
 
 // --- words --------------------------------------------------------------------------
@@ -116,19 +202,24 @@ type commandRule struct {
 	// refused are flag prefixes, in their one-dash spelling ("--config" is read as
 	// "-config"), that choose a program, shell, linker or configuration to run.
 	refused []string
+	// byPath admits the program named by a path inside the root: a build wrapper the
+	// repository carries (./gradlew, ./mvnw). Every other program is a bare name found
+	// on the daemon's PATH.
+	byPath bool
 }
 
 var (
 	directRule = commandRule{}
 	scriptRule = commandRule{args: checkScript, refused: []string{"-script-shell", "-node-options", "-onload-script", "-config"}}
 	taskRule   = commandRule{args: checkTasks}
+	mavenRule  = commandRule{args: checkPhases}
 )
 
 // whyFailedCommands is the closed table of programs why_failed runs, by the program's
 // last path element. Anything else (a shell, an interpreter, curl, a package install,
 // go run, cargo install, npm publish, make deploy) is refused.
 var whyFailedCommands = map[string]commandRule{
-	"go":            {args: verbs("test", "vet", "build"), refused: []string{"-exec", "-toolexec", "-vettool", "-ldflags", "-gccgoflags", "-compiler"}},
+	"go":            {args: checkGo, refused: []string{"-exec", "-toolexec", "-vettool", "-ldflags", "-gccgoflags", "-compiler", "-modfile", "-overlay"}},
 	"cargo":         {args: verbs("test", "nextest", "check", "clippy", "build"), refused: []string{"-config", "-Z"}},
 	"dotnet":        {args: verbs("test", "build")},
 	"swift":         {args: verbs("test", "build")},
@@ -138,7 +229,8 @@ var whyFailedCommands = map[string]commandRule{
 
 	"npm": scriptRule, "pnpm": scriptRule, "yarn": scriptRule, "bun": scriptRule,
 
-	"make": taskRule, "just": taskRule, "task": taskRule, "gradle": taskRule, "gradlew": taskRule, "mvn": taskRule, "mvnw": taskRule,
+	"make": taskRule, "just": taskRule, "task": taskRule, "gradle": taskRule, "mvn": mavenRule,
+	"gradlew": {args: checkTasks, byPath: true}, "mvnw": {args: checkPhases, byPath: true},
 
 	"pytest": directRule, "py.test": directRule, "unittest": directRule, "jest": directRule, "vitest": directRule,
 	"mocha": directRule, "rspec": directRule, "phpunit": directRule, "ctest": directRule, "tsc": directRule,
@@ -155,6 +247,9 @@ func checkCommandRule(argv []string) error {
 	rule, ok := whyFailedCommands[name]
 	if !ok {
 		return notACheck(argv[0], "is not a test, build or lint program")
+	}
+	if strings.ContainsAny(argv[0], `/\`) && !rule.byPath {
+		return notACheck(argv[0], "is named by a path; only the gradlew and mvnw wrappers run from the repository, other programs by their bare name")
 	}
 	if rule.args != nil {
 		if err := rule.args(args); err != nil {
@@ -196,6 +291,59 @@ func verbs(vs ...string) func([]string) error {
 		}
 		return nil
 	}
+}
+
+// goValueFlags are the go build and test flags that take a value, which may be the next
+// word (go help build, go help testflag). Any other word after the verb that is not a
+// flag is a package pattern.
+var goValueFlags = map[string]bool{
+	"-run": true, "-skip": true, "-bench": true, "-benchtime": true, "-count": true, "-cpu": true, "-parallel": true,
+	"-timeout": true, "-coverprofile": true, "-covermode": true, "-coverpkg": true, "-cpuprofile": true, "-memprofile": true,
+	"-memprofilerate": true, "-blockprofile": true, "-blockprofilerate": true, "-mutexprofile": true,
+	"-mutexprofilefraction": true, "-outputdir": true, "-trace": true, "-fuzz": true, "-fuzztime": true,
+	"-fuzzminimizetime": true, "-list": true, "-shuffle": true, "-vet": true, "-o": true, "-p": true, "-tags": true,
+	"-gcflags": true, "-asmflags": true, "-pkgdir": true, "-mod": true, "-buildmode": true, "-installsuffix": true, "-pgo": true,
+}
+
+// checkGo admits go test, vet and build of the module's own packages (., ./pkg/...) in
+// the readonly or vendor module mode: no package another module provides (go test all,
+// a dependency's import path), whose tests are code the module cache fetched, and no
+// -mod=mod, which lets the go command change go.mod.
+func checkGo(args []string) error {
+	if err := verbs("test", "vet", "build")(args); err != nil {
+		return err
+	}
+	for i := 1; i < len(args); i++ {
+		a := args[i]
+		if a == "-args" || a == "--args" {
+			return nil // the rest is the test binary's
+		}
+		if !strings.HasPrefix(a, "-") {
+			if a != "." && !strings.HasPrefix(a, "./") {
+				return fmt.Errorf("takes local package patterns only (., ./..., ./pkg), not %s; give a flag's value with = (-benchtime=1s)", a)
+			}
+			continue
+		}
+		name, value, hasValue := strings.Cut("-"+strings.TrimLeft(a, "-"), "=")
+		if goValueFlags[name] && !hasValue && i+1 < len(args) {
+			i++
+			value = args[i]
+		}
+		if name == "-mod" && value != "readonly" && value != "vendor" {
+			return errors.New("takes -mod=readonly or -mod=vendor only")
+		}
+	}
+	return nil
+}
+
+// checkPhases admits Maven lifecycle phases (mvn test, mvn -B verify) through
+// checkTasks. A word with a colon names a plugin goal (prefix:goal,
+// group:artifact:version:goal) that Maven resolves and downloads, so none is admitted.
+func checkPhases(args []string) error {
+	if i := slices.IndexFunc(args, func(a string) bool { return strings.Contains(a, ":") }); i >= 0 {
+		return fmt.Errorf("runs lifecycle phases only, not the plugin goal %s", args[i])
+	}
+	return checkTasks(args)
 }
 
 // checkScript admits a package script runner running a check-named script: npm test,
