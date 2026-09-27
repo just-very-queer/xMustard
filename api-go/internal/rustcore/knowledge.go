@@ -16,6 +16,14 @@ func RunWiki(ctx context.Context, args ...string) ([]byte, error) {
 	return runCore(ctx, "wiki", args...)
 }
 
+// RunIndex runs `xmustard-core index <build|update|stats> <root> [flags]`, the code
+// index worker. It is one-shot by design: its parse and write peak runs in a transient
+// process under the heavy slot, never in the resident worker, which only reads the
+// graph segment the update writes.
+func RunIndex(ctx context.Context, args ...string) ([]byte, error) {
+	return runCore(ctx, "index", args...)
+}
+
 // RunOwnership runs the ownership/subsystem model commands.
 func RunOwnership(ctx context.Context, args ...string) ([]byte, error) {
 	return runCore(ctx, "ownership", args...)

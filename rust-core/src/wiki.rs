@@ -94,29 +94,40 @@ fn subsystem_fingerprint(
 /// graph comes from the warm cache (only dirty files re-parsed), and each subsystem
 /// page is re-rendered only when its fingerprint changed — unchanged subsystems are
 /// served byte-identical from the page cache. The overview always re-renders (it
-/// reflects global counts/hotspots and is a single small page).
-pub fn generate_wiki(root: &Path, workspace_id: &str) -> RepoWiki {
-    let graph = symbolgraph::symbol_graph_for_query(root, workspace_id);
-    let hotspots = symbolgraph::compute_hotspots(&graph, 15);
+/// reflects global counts/hotspots and is a single small page). A failed graph read is
+/// an error, and nothing is cached from it: a partial wiki would read as the repository.
+pub fn generate_wiki(root: &Path, workspace_id: &str) -> Result<RepoWiki, String> {
+    // the code index's snapshot when the root has one, else the legacy graph
+    let graph = symbolgraph::query_source(root, workspace_id).graph;
+    let graph_err = |e: String| format!("graph read: {e}");
+    let hotspots = graph.hotspots(15).map_err(graph_err)?;
 
     // group symbols by file, and files by subsystem (top dir). Sort for a stable
     // render order so the fingerprint cache is correct (same inputs → same bytes).
     let mut symbols_by_file: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for s in &graph.symbols {
-        symbols_by_file
-            .entry(s.path.clone())
-            .or_default()
-            .push(s.name.clone());
-    }
+    let mut files_by_subsystem: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut edge_count = 0usize;
+    let reads = [
+        graph.for_each_symbol(&mut |s| {
+            symbols_by_file
+                .entry(s.path.to_string())
+                .or_default()
+                .push(s.name.to_string());
+        }),
+        graph.for_each_file(&mut |f| {
+            files_by_subsystem
+                .entry(top_dir(f.path))
+                .or_default()
+                .push(f.path.to_string());
+        }),
+        graph.for_each_edge(&mut |_, _| edge_count += 1),
+    ];
+    reads
+        .into_iter()
+        .collect::<Result<(), String>>()
+        .map_err(graph_err)?;
     for syms in symbols_by_file.values_mut() {
         syms.sort();
-    }
-    let mut files_by_subsystem: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for f in &graph.files {
-        files_by_subsystem
-            .entry(top_dir(&f.path))
-            .or_default()
-            .push(f.path.clone());
     }
     for files in files_by_subsystem.values_mut() {
         files.sort();
@@ -138,7 +149,9 @@ pub fn generate_wiki(root: &Path, workspace_id: &str) -> RepoWiki {
     let _ = writeln!(
         overview,
         "{} files · {} symbols · {} reference edges.\n",
-        graph.file_count, graph.symbol_count, graph.edge_count
+        files_by_subsystem.values().map(Vec::len).sum::<usize>(),
+        graph.symbol_count(),
+        edge_count
     );
     let _ = writeln!(overview, "## Hotspots (most-depended-on files)\n");
     for h in &hotspots {
@@ -197,14 +210,14 @@ pub fn generate_wiki(root: &Path, workspace_id: &str) -> RepoWiki {
         indexcache::store_wiki_cache_bytes(root, workspace_id, &bytes);
     }
 
-    RepoWiki {
+    Ok(RepoWiki {
         workspace_id: workspace_id.to_string(),
         page_count: pages.len(),
         pages,
         regenerated_slugs,
         reused_slugs,
         generated_at: now(),
-    }
+    })
 }
 
 /// Render a single subsystem page from its files + symbols (the cached unit).
@@ -288,7 +301,7 @@ mod tests {
             .output()
             .unwrap();
 
-        let wiki = generate_wiki(dir.path(), "ws");
+        let wiki = generate_wiki(dir.path(), "ws").unwrap();
         assert!(wiki.page_count >= 2);
         assert_eq!(wiki.pages[0].slug, "overview");
         assert!(wiki.pages[0].markdown.contains("Hotspots"));
@@ -336,7 +349,7 @@ mod tests {
         git_init_commit(dir.path());
 
         // first run: cold cache → both subsystems regenerate, nothing reused.
-        let first = generate_wiki(dir.path(), "ws");
+        let first = generate_wiki(dir.path(), "ws").unwrap();
         assert!(
             first
                 .regenerated_slugs
@@ -367,7 +380,7 @@ mod tests {
         )
         .unwrap();
 
-        let second = generate_wiki(dir.path(), "ws");
+        let second = generate_wiki(dir.path(), "ws").unwrap();
         assert!(
             second
                 .regenerated_slugs

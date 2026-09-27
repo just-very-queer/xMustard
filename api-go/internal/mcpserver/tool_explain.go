@@ -13,10 +13,12 @@ var explainTool = &Tool{
 	},
 	PathArg:     "path",
 	Annotations: Annotations{Title: "Explain a path", ReadOnly: true},
-	// {explanation, cluster} when the file has a cluster, else the explanation itself
+	// {explanation, cluster} when the file has a cluster, else the explanation itself;
+	// either way with the graph's freshness and coverage. The echoed path and
+	// line_count are returned but not listed, to keep tools/list within its cap.
 	Output: map[string]string{
-		"explanation": "object", "cluster": "object",
-		"path": "string", "role": "string", "summary": "string", "line_count": "integer",
+		"explanation": "object", "cluster": "object", "role": "string", "summary": "string",
+		"freshness": "object", "coverage": "object",
 	},
 	MaxResultChars: boundedResultChars,
 	Build: func(a map[string]string) (string, string, string) {

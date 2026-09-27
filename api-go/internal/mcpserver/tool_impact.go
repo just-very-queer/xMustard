@@ -16,10 +16,13 @@ var impactTool = &Tool{
 	},
 	Aliases:     map[string]string{"depth": "max_depth"}, // the API's query name
 	Annotations: Annotations{Title: "Estimate change impact", ReadOnly: true},
-	// symbol=: symbol, max_depth, impacted; from=&to=: found, length; neither: since
+	// symbol=: symbol, impacted; from=&to=: found, length; neither: since. Both graph
+	// reads carry the graph's freshness and coverage. Echoed inputs (max_depth) and
+	// generated_at are returned but not listed, to keep tools/list within its cap.
 	Output: map[string]string{
-		"symbol": "string", "max_depth": "integer", "impacted_count": "integer", "impacted": "array",
-		"found": "boolean", "length": "integer", "since": "string", "generated_at": "string",
+		"symbol": "string", "impacted_count": "integer", "impacted": "array",
+		"found": "boolean", "length": "integer", "since": "string",
+		"freshness": "object", "coverage": "object",
 	},
 	MaxResultChars: boundedResultChars,
 	Build: func(a map[string]string) (string, string, string) {

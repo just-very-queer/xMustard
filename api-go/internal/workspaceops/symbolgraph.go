@@ -64,11 +64,14 @@ func SymbolImpactCtx(ctx context.Context, dataDir, workspaceID, symbol string, m
 	if maxDepth <= 0 {
 		maxDepth = 4
 	}
-	out, err := rustcore.RunSymbolgraph(ctx, "impact", root, workspaceID, symbol, strconv.Itoa(maxDepth))
+	read := ensureCodeIndex(ctx, root)
+	args := []string{"impact"}
+	args = append(append(args, read.flags()...), root, workspaceID, symbol, strconv.Itoa(maxDepth))
+	out, err := rustcore.RunSymbolgraph(ctx, args...)
 	if err != nil {
 		return nil, err
 	}
-	return json.RawMessage(out), nil
+	return read.annotate(out), nil
 }
 
 // TraceSymbols returns the shortest dependency path between two symbols.
@@ -82,11 +85,14 @@ func TraceSymbolsCtx(ctx context.Context, dataDir, workspaceID, from, to string)
 	if err != nil {
 		return nil, err
 	}
-	out, err := rustcore.RunSymbolgraph(ctx, "trace", root, workspaceID, from, to)
+	read := ensureCodeIndex(ctx, root)
+	args := []string{"trace"}
+	args = append(append(args, read.flags()...), root, workspaceID, from, to)
+	out, err := rustcore.RunSymbolgraph(ctx, args...)
 	if err != nil {
 		return nil, err
 	}
-	return json.RawMessage(out), nil
+	return read.annotate(out), nil
 }
 
 // FileCluster mirrors rust-core's community-cluster output.
@@ -115,21 +121,35 @@ func WorkspaceClusters(dataDir, workspaceID string) ([]FileCluster, error) {
 	return clusters, nil
 }
 
-// PathCluster returns the cluster a file belongs to (its functional neighbourhood),
-// for enriching `explain` with where the file sits in the repo's communities.
-func PathCluster(dataDir, workspaceID, path string) (*FileCluster, error) {
-	clusters, err := WorkspaceClusters(dataDir, workspaceID)
+// PathGraph is where a file sits in the code graph, for `explain`: its community
+// cluster (its functional neighbourhood; nil when the file is in none) and the
+// freshness and coverage of the graph that answered.
+type PathGraph struct {
+	Cluster   *FileCluster    `json:"cluster"`
+	Freshness json.RawMessage `json:"freshness,omitempty"`
+	Coverage  json.RawMessage `json:"coverage,omitempty"`
+}
+
+// PathGraphCtx reads path's cluster from the code index (refreshed first, see
+// ensureCodeIndex; the core takes the observed identity after the subcommand) or the
+// legacy graph. Cancelling ctx cancels the Rust work.
+func PathGraphCtx(ctx context.Context, dataDir, workspaceID, path string) (*PathGraph, error) {
+	root, _, err := resolveChangeRootCtx(ctx, dataDir, workspaceID)
 	if err != nil {
 		return nil, err
 	}
-	for i := range clusters {
-		for _, f := range clusters[i].Files {
-			if f == path {
-				return &clusters[i], nil
-			}
-		}
+	read := ensureCodeIndex(ctx, root)
+	args := []string{"cluster-of"}
+	args = append(append(args, read.flags()...), root, workspaceID, path)
+	out, err := rustcore.RunSymbolgraph(ctx, args...)
+	if err != nil {
+		return nil, err
 	}
-	return nil, nil
+	var g PathGraph
+	if err := json.Unmarshal(read.annotate(out), &g); err != nil {
+		return nil, err
+	}
+	return &g, nil
 }
 
 // LiveDocumentSymbols runs a live LSP session (rust-core spawns the language

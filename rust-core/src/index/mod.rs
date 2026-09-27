@@ -23,19 +23,26 @@
 //!
 //! Readers: the full build renames a new file over `index.db` (after removing the old
 //! WAL and SHM by name). A reader that keeps a connection open across a rebuild keeps
-//! reading the old, unlinked file; long-lived readers (WS-14) must reopen when `meta`
+//! reading the old, unlinked file; long-lived readers must reopen when `meta`
 //! `generation` changes, and must never write. Every writer holds the index lock.
 //!
-//! No consumer reads this store yet; WS-14 switches the query side to it.
+//! The query side (WS-14) reads the graph segment (`csr`), which every build and update
+//! writes for its generation before the generation becomes visible (meta
+//! `graph_segment` names it); `reader` holds segments as snapshots and `envelope`
+//! reports their freshness.
 
 pub mod chunks;
 pub mod config;
+pub mod csr;
 pub mod edges;
+pub mod envelope;
 pub mod extract;
 pub mod facts;
 pub mod ignore;
 pub mod lexical;
 pub mod meta;
+pub mod names;
+pub mod reader;
 pub mod scan;
 pub mod schema;
 pub mod uid;
@@ -106,6 +113,8 @@ pub struct Timing {
     pub elapsed_ms: u64,
     pub scan_ms: u64,
     pub edges_ms: u64,
+    /// Writing the graph segment the resident service reads (WS-14).
+    pub segment_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -625,12 +634,7 @@ fn full_build(
     } else {
         None
     };
-    let generation = old
-        .as_ref()
-        .and_then(|c| meta::get(c, "generation").ok().flatten())
-        .and_then(|g| g.parse::<i64>().ok())
-        .unwrap_or(0)
-        + 1;
+    let generation = previous_generation(&final_path) + 1;
     let coverage;
     let edges_ms;
     {
@@ -713,21 +717,32 @@ fn full_build(
         conn.execute_batch("COMMIT").map_err(sql_err)?;
         conn.execute_batch("INSERT INTO chunk_fts(chunk_fts) VALUES('optimize');")
             .map_err(sql_err)?;
+        conn.close().map_err(|(_, e)| sql_err(e))?;
+    }
+    // The graph segment goes in before the file is published, from a fresh connection:
+    // the build's connection memory is free by then, so the two phases do not stack.
+    let (segment, segment_ms) = {
+        let conn = Connection::open(&tmp_path).map_err(sql_err)?;
+        schema::configure_bulk(&conn).map_err(sql_err)?;
+        let written = write_graph_segment(&conn, dir)?;
         // the finished file runs in WAL mode so readers keep a snapshot during updates.
         conn.execute_batch("PRAGMA journal_mode=WAL;")
             .map_err(sql_err)?;
         conn.close().map_err(|(_, e)| sql_err(e))?;
-    }
+        written
+    };
     // The bulk load ran without journal or fsync: make the file durable before the
     // rename can publish it (sync_all is F_FULLFSYNC on macOS).
     fs::File::open(&tmp_path)
         .and_then(|f| f.sync_all())
         .map_err(|e| format!("sync {}: {e}", tmp_path.display()))?;
     swap_into_place(&tmp_path, &final_path)?;
+    csr::sweep_segments(dir, &segment);
     let timing = Timing {
         elapsed_ms: t0.elapsed().as_millis() as u64,
         scan_ms,
         edges_ms,
+        segment_ms,
     };
     Ok(report(
         (command, "full", reason),
@@ -738,6 +753,58 @@ fn full_build(
         coverage,
         timing,
     ))
+}
+
+/// The stored generation of an existing store, compatible or not: generations only grow
+/// within one store directory, so a reader never takes a rebuilt store's state for an
+/// older one it has seen.
+fn previous_generation(path: &Path) -> i64 {
+    if !path.exists() {
+        return 0;
+    }
+    Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .ok()
+        .and_then(|c| meta::get(&c, "generation").ok().flatten())
+        .and_then(|g| g.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Write the graph segment of the state `conn` sees (inside its open transaction, if
+/// any) and point meta at it. Returns the segment's name and the milliseconds taken.
+fn write_graph_segment(conn: &Connection, dir: &Path) -> Result<(String, u64), String> {
+    let t = Instant::now();
+    let name = csr::write_segment(conn, dir)?;
+    meta::set(conn, meta::GRAPH_SEGMENT, &name).map_err(sql_err)?;
+    Ok((name, t.elapsed().as_millis() as u64))
+}
+
+/// Write the stored generation's segment when meta names none or it no longer opens (a
+/// store from before WS-14, a removed file). The caller holds the writer lock.
+fn ensure_segment_locked(conn: &Connection, dir: &Path) -> Result<u64, String> {
+    let generation: i64 = meta::get(conn, "generation")
+        .map_err(sql_err)?
+        .and_then(|g| g.parse().ok())
+        .unwrap_or(0);
+    let current = meta::get(conn, meta::GRAPH_SEGMENT)
+        .map_err(sql_err)?
+        .and_then(|n| csr::Segment::open(&dir.join(n), csr::GraphStorage::File).ok())
+        .is_some_and(|seg| seg.footer.generation == generation);
+    if current {
+        return Ok(0);
+    }
+    let (name, ms) = write_graph_segment(conn, dir)?;
+    csr::sweep_segments(dir, &name);
+    Ok(ms)
+}
+
+/// Make sure the store at `db` has the graph segment of its generation (the writer
+/// side of `reader::load_segment`), under the writer lock.
+pub fn ensure_graph_segment(db: &Path) -> Result<(), String> {
+    let dir = db.parent().ok_or("index store has no directory")?;
+    let _lock = lock(dir, true)?;
+    let conn = Connection::open(db).map_err(sql_err)?;
+    schema::configure(&conn).map_err(sql_err)?;
+    ensure_segment_locked(&conn, dir).map(drop)
 }
 
 /// Replace `final_path` with the finished (fsynced) build. The previous file is
@@ -1082,11 +1149,13 @@ fn incremental(
 
     if changed.is_empty() && deleted.is_empty() {
         set_scan_meta(&conn, scan).map_err(sql_err)?;
+        let segment_ms = ensure_segment_locked(&conn, dir)?;
         let coverage = meta::coverage(&conn, cfg).map_err(sql_err)?;
         let timing = Timing {
             elapsed_ms: t0.elapsed().as_millis() as u64,
             scan_ms,
             edges_ms: 0,
+            segment_ms,
         };
         return Ok(Step::Done(Box::new(report(
             ("update", "noop", "unchanged"),
@@ -1311,13 +1380,17 @@ fn incremental(
     )
     .map_err(sql_err)?;
     meta::set(&conn, meta::DIRTY_FLAG, "0").map_err(sql_err)?;
+    // the new generation's segment exists before the generation commits
+    let (segment, segment_ms) = write_graph_segment(&conn, dir)?;
     conn.execute_batch("COMMIT").map_err(sql_err)?;
+    csr::sweep_segments(dir, &segment);
     gc_fact_cache(&conn).map_err(sql_err)?;
     drop(conn);
     let timing = Timing {
         elapsed_ms: t0.elapsed().as_millis() as u64,
         scan_ms,
         edges_ms,
+        segment_ms,
     };
     Ok(Step::Done(Box::new(report(
         ("update", "incremental", "changes"),
@@ -1416,7 +1489,26 @@ pub fn stats(root: &Path, cfg: &IndexConfig, digest: bool) -> Result<serde_json:
 const USAGE: &str = "xmustard-core index <build|update|stats> <root> \
     [--content-retention full|symbol|none] [--max-file-size N] [--max-files N] \
     [--max-symbols N] [--max-total-bytes N] [--max-parse-bytes N] [--index-dir DIR] \
-    [--allow-non-git] [--include-untracked] [--no-cache] [--paths P ...] [--digest]";
+    [--allow-non-git] [--include-untracked] [--no-cache] [--paths P ...] [--digest] \
+    [--identity-key KEY]";
+
+/// Record the repository identity key a build or update was run for (`meta::IDENTITY_KEY`),
+/// under the writer lock; written only when it changed.
+fn stamp_identity(report: &IndexReport, key: &str, cfg: &IndexConfig) -> Result<(), String> {
+    let db = Path::new(&report.index_path);
+    let dir = db.parent().ok_or("index store has no directory")?;
+    let _lock = lock(dir, cfg.index_dir.is_some())?;
+    let conn = Connection::open(db).map_err(sql_err)?;
+    schema::configure(&conn).map_err(sql_err)?;
+    if meta::get(&conn, meta::IDENTITY_KEY)
+        .map_err(sql_err)?
+        .as_deref()
+        != Some(key)
+    {
+        meta::set(&conn, meta::IDENTITY_KEY, key).map_err(sql_err)?;
+    }
+    Ok(())
+}
 
 /// `xmustard-core index <build|update|stats> <root> [flags]`: the subcommand-table
 /// handler. It returns its JSON or error as a value and never prints.
@@ -1432,6 +1524,7 @@ pub fn run(args: crate::dispatch::Args) -> crate::dispatch::CmdResult {
         IndexConfig::load(&root).map_err(|e| CmdError::new(2, format!("index: config: {e}")))?;
     let mut paths: Option<Vec<String>> = None;
     let mut digest = false;
+    let mut identity: Option<String> = None;
     let mut i = 2;
     while i < args.len() {
         let a = args[i].as_str();
@@ -1450,6 +1543,10 @@ pub fn run(args: crate::dispatch::Args) -> crate::dispatch::CmdResult {
                 digest = true;
                 1
             }
+            "--identity-key" => {
+                identity = args.get(i + 1).cloned();
+                2
+            }
             _ if cfg.apply_switch(a) => 1,
             _ => match cfg.apply_flag(a, args.get(i + 1).map(String::as_str)) {
                 Ok(true) => 2,
@@ -1466,9 +1563,13 @@ pub fn run(args: crate::dispatch::Args) -> crate::dispatch::CmdResult {
     let to_value = |r: Result<IndexReport, String>| {
         r.and_then(|r| serde_json::to_value(r).map_err(|e| e.to_string()))
     };
+    let stamped = |r: Result<IndexReport, String>| match &identity {
+        Some(key) => r.and_then(|r| stamp_identity(&r, key, &cfg).map(|()| r)),
+        None => r,
+    };
     let out = match sub.as_str() {
-        "build" => to_value(build(&root, &cfg)),
-        "update" => to_value(update(&root, &cfg, paths.as_deref())),
+        "build" => to_value(stamped(build(&root, &cfg))),
+        "update" => to_value(stamped(update(&root, &cfg, paths.as_deref()))),
         "stats" => stats(&root, &cfg, digest),
         _ => return Err(CmdError::usage(USAGE)),
     };

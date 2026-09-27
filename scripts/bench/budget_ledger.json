@@ -79,7 +79,7 @@
   "WS-11": {"line_mib": 0, "process": null, "title": "outcome evaluation executor (outside the tree)"},
   "WS-12": {"line_mib": 0, "process": "go_daemon", "item": "sqlite_governance", "title": "governance cutover to govstore"},
   "WS-13": {"line_mib": -10, "process": "mcp_access", "scenarios": ["agents-2-small"], "gate_blocking": true, "title": "MCP over HTTP; removes per-agent Go shims"},
-  "WS-14": {"line_mib": 12, "process": "rust_index_service", "scenarios": ["agents-2"], "title": "resident index query side (CSR, names)"},
+  "WS-14": {"line_mib": 12, "process": "rust_index_service", "scenarios": ["agents-2"], "title": "resident index query side (CSR, names)", "open": "BLOCKING for WS-14 acceptance: parity snapshot-swap-under-load is INVALID (2026-09-26, gate peak 104.2 MiB; the heavy slot refused every index refresh with the tree at 71-87 MB, so no swap ran under load). Reads now fall back to the graph for the current identity while the index lags, so edits stay searchable, but the swap-under-load run with the resident worker still needs the reconciliation above (daemon line, WS-13 shim removal) and a passing rerun. Four overlapping clients measured +13.4 to +15.2 MiB (Linux) and +22 to +27 MiB (macOS) over base against the 15 MiB service line; see docs/benchmarks/2026-09-26-ws14-resident-index.md"},
   "WS-15": {"line_mib": 2, "process": "rust_index_service", "scenarios": ["agents-2"], "title": "watcher and incremental refresh"},
   "WS-16": {"line_mib": 0, "process": "rust_core_per_call", "title": "language packs (worker only)"},
   "WS-17": {"line_mib": 2, "process": "rust_index_service", "scenarios": ["agents-2"], "title": "Go and TS/JS resolver"},

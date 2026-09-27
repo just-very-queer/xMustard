@@ -252,7 +252,7 @@ func TestNineToolPathsNeverParseTheSnapshot(t *testing.T) {
 			if _, err := ExplainPathCtx(ctx, dataDir, ws, "f.go"); err != nil && !IsInvalidInput(err) {
 				return nil // the fake core's explain output is not a real explanation
 			}
-			_, _ = PathCluster(dataDir, ws, "f.go")
+			_, _ = PathGraphCtx(ctx, dataDir, ws, "f.go")
 			return nil
 		},
 		"impact": func() error {
