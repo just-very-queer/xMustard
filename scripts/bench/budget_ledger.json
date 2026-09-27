@@ -83,7 +83,7 @@
   "WS-15": {"line_mib": 2, "process": "rust_index_service", "scenarios": ["agents-2"], "title": "watcher and incremental refresh"},
   "WS-16": {"line_mib": 0, "process": "rust_core_per_call", "title": "language packs (worker only)"},
   "WS-17": {"line_mib": 2, "process": "rust_index_service", "scenarios": ["agents-2"], "title": "Go and TS/JS resolver"},
-  "WS-18": {"line_mib": 5, "process": "rust_index_service", "scenarios": ["agents-2"], "title": "code BM25 lane"},
+  "WS-18": {"line_mib": 5, "process": "rust_index_service", "scenarios": ["agents-2"], "title": "code BM25 lane", "measured": "Linux 2026-09-28, release, one glibc arena: the resident service's BM25 cache (text lanes on minus off, 40 queries x3, tests/search_hybrid.rs resident_bm25_cache_stays_within_its_line) is +2.6 MiB on cline and +3.1 MiB on pi-mono, steady and peak, under the code_bm25 component (5 steady / 8 peak); a one-shot search gains 2.5-2.9 MiB; the index writer peaks at 22.4 MiB on cline (base 22.1). Gate v2 does not start the resident worker, so its CI suite covers only the per-call path; see docs/benchmarks/2026-09-28-ws18-hybrid-search.md"},
   "WS-19": {"line_mib": 1, "process": "go_daemon", "item": "governance_caches", "title": "memory lifecycle writes"},
   "WS-20": {"line_mib": 1.5, "process": "go_daemon", "item": "governance_caches", "title": "recall v2"},
   "WS-21": {"line_mib": 0.5, "process": "go_daemon", "item": "evidence_caches", "title": "why_failed without platform runs"},

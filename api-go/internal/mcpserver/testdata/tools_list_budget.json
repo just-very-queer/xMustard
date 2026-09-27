@@ -1,5 +1,5 @@
 {
-  "about": "Byte caps on the tools/list result (compact JSON, as the stdio shim writes it) per schema profile, protocol version and role profile. Measured 2026-09-25 (WS-54); remember content made optional and the WS-19A lifecycle arguments added as Advanced 2026-09-26, and the WS-19B provenance and evidence-bound vote arguments the same day, and the WS-20 recall filters, disclosure and budget arguments and remember's kind, topic and tags the same day (full caps grew by exactly their cost each time; the WS-20 argument descriptions live at xmustard://docs/tools, not in the schema). Lower a cap when the list shrinks; never raise one to fit an addition: advertise less (declare the argument Advanced, documented at xmustard://docs/tools) or trim a description. cmd/xmustard-api checks role_profiles against the route gates.",
+  "about": "Byte caps on the tools/list result (compact JSON, as the stdio shim writes it) per schema profile, protocol version and role profile. Measured 2026-09-25 (WS-54); remember content made optional and the WS-19A lifecycle arguments added as Advanced 2026-09-26, and the WS-19B provenance and evidence-bound vote arguments the same day, and the WS-20 recall filters, disclosure and budget arguments and remember's kind, topic and tags the same day (full caps grew by exactly their cost each time; the WS-20 argument descriptions live at xmustard://docs/tools, not in the schema). WS-18 (2026-09-28): the search description now names BM25 over bodies and lost 59 bytes, search's outputSchema gained omitted and next_cursor (58 bytes, 2025-06-18 only), and the Advanced cursor and path_glob arguments cost 198 bytes in the full profile; lean caps were lowered to the measured sizes. Lower a cap when the list shrinks; never raise one to fit an addition: advertise less (declare the argument Advanced, documented at xmustard://docs/tools) or trim a description. cmd/xmustard-api checks role_profiles against the route gates.",
   "role_profiles": {
     "reader": ["ground", "recall", "search", "explain", "impact", "diagnostics", "why_failed"],
     "proposer": ["ground", "recall", "remember", "search", "explain", "impact", "diagnostics", "why_failed"],
@@ -8,12 +8,12 @@
   },
   "caps": {
     "lean": {
-      "2024-11-05": {"reader": 3999, "proposer": 4692, "verifier": 4630, "agent": 5323},
-      "2025-06-18": {"reader": 6646, "proposer": 7745, "verifier": 7680, "agent": 8779}
+      "2024-11-05": {"reader": 3940, "proposer": 4633, "verifier": 4571, "agent": 5264},
+      "2025-06-18": {"reader": 6645, "proposer": 7744, "verifier": 7679, "agent": 8778}
     },
     "full": {
-      "2024-11-05": {"reader": 5312, "proposer": 7222, "verifier": 6351, "agent": 8261},
-      "2025-06-18": {"reader": 7959, "proposer": 10275, "verifier": 9401, "agent": 11717}
+      "2024-11-05": {"reader": 5451, "proposer": 7361, "verifier": 6490, "agent": 8400},
+      "2025-06-18": {"reader": 8156, "proposer": 10472, "verifier": 9598, "agent": 11914}
     }
   }
 }

@@ -20,6 +20,8 @@ func newRouteServer(t *testing.T) (*httptest.Server, string) {
 	t.Setenv("XMUSTARD_DATA_DIR", dir)
 	srv := httptest.NewServer(bodyLimitMiddleware(authMiddleware(dir, "auto", newAPIHandler())))
 	t.Cleanup(srv.Close)
+	// runs before the env and temp dir above are restored and removed
+	t.Cleanup(func() { waitRegistrationBaselines(t) })
 	return srv, dir
 }
 

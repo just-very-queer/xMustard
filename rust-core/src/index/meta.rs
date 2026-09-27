@@ -257,10 +257,11 @@ pub fn coverage(conn: &Connection, cfg: &IndexConfig) -> rusqlite::Result<Covera
 }
 
 /// SHA-256 over the index content in a rowid-independent order: files by path, symbols
-/// by UID, references, imports, chunks, chunk text, edges (by paths), the FTS5 term
-/// statistics, and the stable meta keys. Two indexes of the same tree built by any
-/// sequence of full builds and incremental updates have the same digest. Timestamps,
-/// mtimes, counters and the fact cache are excluded.
+/// by UID, references, imports, chunks, chunk text, edges (by paths), docs and their
+/// chunks, the FTS5 term statistics of both tables, and the stable meta keys. Two
+/// indexes of the same tree built by any sequence of full builds and incremental
+/// updates have the same digest. Timestamps, mtimes, counters and the fact cache are
+/// excluded.
 pub fn content_digest(conn: &Connection) -> rusqlite::Result<String> {
     let mut h = Sha256::new();
     let feed = |sql: &str, h: &mut Sha256| -> rusqlite::Result<()> {
@@ -338,13 +339,24 @@ pub fn content_digest(conn: &Connection) -> rusqlite::Result<String> {
          ORDER BY f.path, n.name, r.cause",
         &mut h,
     )?;
-    conn.execute_batch(
-        "CREATE VIRTUAL TABLE IF NOT EXISTS temp.chunk_vocab USING fts5vocab(main, chunk_fts, col);",
-    )?;
     feed(
-        "SELECT term, col, doc, cnt FROM temp.chunk_vocab ORDER BY term, col",
+        "SELECT path, role, content_hash, status, line_count FROM docs ORDER BY path",
         &mut h,
     )?;
-    conn.execute_batch("DROP TABLE IF EXISTS temp.chunk_vocab;")?;
+    feed(
+        "SELECT d.path, c.ord, c.start_line, c.end_line, c.start_byte, c.end_byte, c.content_hash
+         FROM doc_chunks c JOIN docs d ON d.id = c.doc_id ORDER BY d.path, c.ord",
+        &mut h,
+    )?;
+    for table in ["chunk_fts", "doc_fts"] {
+        conn.execute_batch(&format!(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS temp.vocab USING fts5vocab(main, {table}, col);"
+        ))?;
+        feed(
+            "SELECT term, col, doc, cnt FROM temp.vocab ORDER BY term, col",
+            &mut h,
+        )?;
+        conn.execute_batch("DROP TABLE IF EXISTS temp.vocab;")?;
+    }
     Ok(format!("{:x}", h.finalize()))
 }

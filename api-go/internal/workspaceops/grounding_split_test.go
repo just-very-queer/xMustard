@@ -8,7 +8,8 @@ import (
 
 // The section split of grounding.go must not change the `ground` wire shape: the
 // same keys, in the same order, with the same values. ("unknown" is added only
-// when a field could not be determined; see grounding_unknown_test.go.)
+// when a field could not be determined; see grounding_unknown_test.go. WS-22 added
+// "baseline" after "drift".)
 func TestGroundingSplitKeepsWireShape(t *testing.T) {
 	dataDir, ws := seedGroundBenchWorkspace(t)
 	g, err := BuildSessionGrounding(dataDir, ws)
@@ -35,7 +36,7 @@ func TestGroundingSplitKeepsWireShape(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	want := []string{"workspace_id", "drift", "changed_files", "dirty_symbols", "contract_breaks", "broken_contracts",
+	want := []string{"workspace_id", "drift", "baseline", "changed_files", "dirty_symbols", "contract_breaks", "broken_contracts",
 		"coverage", "recent_failed_runs", "blocked_by_dirty_state", "blocked_by_failing_verification", "stale_memory",
 		"stale_memory_checked", "stale_memory_total", "stale_memory_complete", "memory_verification_modes",
 		"pending_for_you", "memory_pressure", "summary", "generated_at"}
@@ -46,6 +47,9 @@ func TestGroundingSplitKeepsWireShape(t *testing.T) {
 		len(g.RecentFailedRuns) != 4 || !*g.BlockedByDirtyState || !*g.BlockedByFailingVerification ||
 		*g.StaleMemory != 0 || *g.StaleMemoryTotal != 50 || g.StaleMemoryChecked != 50 || !g.StaleMemoryComplete || len(g.Unknown) != 0 {
 		t.Fatalf("ground values changed: %s", raw)
+	}
+	if b := g.Baseline; b == nil || *b.Head != "abc" || b.IndexedAt != "2026-09-25T00:00:00Z" || !b.Auto || b.Reason != "registration" || b.Held != "" {
+		t.Fatalf("baseline = %+v", b)
 	}
 	if want := "1 changed file(s), 1 dirty symbol(s), 1 contract break(s), 4 failed run(s), 0 stale memory."; g.Summary != want {
 		t.Fatalf("summary = %q, want %q", g.Summary, want)

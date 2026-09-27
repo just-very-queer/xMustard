@@ -37,10 +37,12 @@
 pub mod chunks;
 pub mod config;
 pub mod csr;
+pub mod docs;
 pub mod edges;
 pub mod envelope;
 pub mod extract;
 pub mod facts;
+pub mod fts;
 pub mod ignore;
 pub mod impact;
 pub mod lang;
@@ -48,6 +50,7 @@ pub mod lexical;
 pub mod meta;
 pub mod names;
 pub mod reader;
+pub mod rerank;
 pub mod resolve;
 pub mod scan;
 pub mod schema;
@@ -118,6 +121,8 @@ pub struct Counters {
     pub edges_written: usize,
     /// Scope resolver totals: symbol edges by tier and drops by cause.
     pub resolve: resolve::counters::ResolveCounters,
+    /// The docs lane's files (WS-18).
+    pub docs: docs::DocCounters,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -695,6 +700,7 @@ fn full_build(
         drop(old);
         drop(w);
         scan.candidates = Vec::new();
+        counters.docs = docs::sync(&conn, &scan, cfg.content_retention).map_err(sql_err)?;
         schema::create_indexes(&conn).map_err(sql_err)?;
         let te = Instant::now();
         conn.execute_batch("BEGIN").map_err(sql_err)?;
@@ -731,8 +737,11 @@ fn full_build(
         )
         .map_err(sql_err)?;
         conn.execute_batch("COMMIT").map_err(sql_err)?;
-        conn.execute_batch("INSERT INTO chunk_fts(chunk_fts) VALUES('optimize');")
-            .map_err(sql_err)?;
+        conn.execute_batch(
+            "INSERT INTO chunk_fts(chunk_fts) VALUES('optimize');
+             INSERT INTO doc_fts(doc_fts) VALUES('optimize');",
+        )
+        .map_err(sql_err)?;
         conn.close().map_err(|(_, e)| sql_err(e))?;
     }
     // The graph segment goes in before the file is published, from a fresh connection:
@@ -935,7 +944,7 @@ pub fn update(
     // full rebuild rather than failing every later update.
     match incremental(conn, &scan, cfg, &dir, paths, t0, scan_ms) {
         Ok(Step::Done(r)) => Ok(*r),
-        Ok(Step::Rebuild(reason, counters)) => full(scan, reason, counters),
+        Ok(Step::Rebuild(reason, counters)) => full(scan, reason, *counters),
         Err(e) if e.starts_with(CORRUPT_ERROR) => full(scan, "corrupt_index", Counters::default()),
         Err(e) => Err(e),
     }
@@ -961,7 +970,7 @@ fn normalize_paths(root: &Path, paths: &[String]) -> HashSet<String> {
 /// Outcome of the in-place path: finished, or a full rebuild is needed.
 enum Step {
     Done(Box<IndexReport>),
-    Rebuild(&'static str, Counters),
+    Rebuild(&'static str, Box<Counters>),
 }
 
 /// One file in the symbol-budget plan.
@@ -1154,6 +1163,9 @@ fn incremental(
             st.execute(params![id, key]).map_err(sql_err)?;
         }
     }
+    // docs are compared by stat key whatever the batch names: they have no edges, so a
+    // doc change rewrites only its own rows and never needs a new generation.
+    counters.docs = docs::sync(&conn, scan, cfg.content_retention).map_err(sql_err)?;
     // a row the scan no longer lists is gone from the tree or past the envelope; either
     // way it goes, batch or not.
     let mut deleted: Vec<(String, i64)> = existing
@@ -1276,7 +1288,7 @@ fn incremental(
             escalated: true,
             ..Default::default()
         };
-        return Ok(Step::Rebuild("escalated", c));
+        return Ok(Step::Rebuild("escalated", Box::new(c)));
     }
 
     // ---- apply in place under the dirty flag ----

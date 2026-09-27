@@ -164,8 +164,11 @@ export function Cockpit({ workspaceId }: { workspaceId: string }) {
         </section>
 
         <section className="cockpit-pane">
-          <h3>Change state {changes ? `(${changes.changed_files.length} files)` : ''}</h3>
-          {changes && changes.changed_files.length > 0 ? (
+          <h3>
+            Change state{' '}
+            {changes ? `(${changes.changed_files_total ?? changes.changed_files?.length ?? '?'} files)` : ''}
+          </h3>
+          {changes?.changed_files?.length ? (
             <>
               <ul className="cockpit-changes">
                 {changes.changed_files.slice(0, 12).map((f) => (
@@ -175,9 +178,9 @@ export function Cockpit({ workspaceId }: { workspaceId: string }) {
                 ))}
               </ul>
               <p className="cockpit-muted">
-                Dirty symbols: {changes.dirty_symbols.length}
-                {changes.dirty_symbols.slice(0, 6).length > 0 &&
-                  ` — ${changes.dirty_symbols
+                Dirty symbols: {changes.dirty_symbols_total ?? changes.dirty_symbols?.length ?? '?'}
+                {(changes.dirty_symbols ?? []).length > 0 &&
+                  ` — ${(changes.dirty_symbols ?? [])
                     .slice(0, 6)
                     .map((s) => s.symbol)
                     .join(', ')}…`}

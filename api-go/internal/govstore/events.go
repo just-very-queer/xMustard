@@ -45,13 +45,17 @@ const (
 	EventNote              = "note"
 	// EventGate records a change of an entry's required verification count.
 	EventGate = "gate"
+	// EventIndexBaseline records a workspace's change-tracking index baseline being
+	// built or replaced (PAR-FRESH-06): automatically or by an explicit rebaseline, the
+	// reason, and the HEAD it was taken at. It names no entry.
+	EventIndexBaseline = "index_baseline"
 )
 
 var validEventTypes = set(EventPropose, EventImport, EventVote, EventReject, EventEdit, EventRevisionAccepted,
 	EventRevisionRejected, EventRevisionWithdrawn, EventPromote, EventDemote, EventStatus, EventSupersede,
 	EventMerge, EventRetract, EventArchive, EventRestore, EventPurge, EventExpiry, EventTierChange, EventClassify,
 	EventAnchors, EventBaseline, EventStaleObserved, EventDriftCleared, EventClaim, EventRelation, EventFeedback,
-	EventCollection, EventGrant, EventRevoke, EventApplicability, EventNote, EventGate)
+	EventCollection, EventGrant, EventRevoke, EventApplicability, EventNote, EventGate, EventIndexBaseline)
 
 // Event is one immutable history record.
 type Event struct {
