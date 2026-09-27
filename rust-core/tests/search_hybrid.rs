@@ -396,6 +396,38 @@ fn retention_none_indexes_no_prose() {
     );
 }
 
+/// A store from before the docs tables (schema 3) still answers the graph lanes; the
+/// text lanes wait for the update that rebuilds it and say so.
+#[test]
+fn an_older_store_answers_without_text_lanes() {
+    let r = fixture();
+    build(r.path(), ContentRetention::Symbol);
+    let cfg = IndexConfig::load(r.path()).unwrap();
+    let db = index::stats(r.path(), &cfg, false).unwrap()["index_path"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute(
+            "UPDATE meta SET value = '3' WHERE key = 'schema_version'",
+            [],
+        )
+        .unwrap();
+    let res = query(r.path(), "RetryWithBackoff", 5);
+    assert_eq!(res.hits[0].name, "RetryWithBackoff");
+    assert!(res.hits.iter().all(|h| !h.lanes_matched.contains(&"bm25")));
+    assert!(
+        res.degradations
+            .iter()
+            .any(|d| d.contains("need index schema 4; the store is schema 3")),
+        "{:?}",
+        res.degradations
+    );
+    // an older store is a known state, not a failed read
+    assert!(!res.coverage.loss_counts.contains_key("graph_read_error"));
+}
+
 // ---------------------------------------------------------------------------
 // BM25 cache measurement (resident service, real corpora)
 // ---------------------------------------------------------------------------

@@ -51,8 +51,9 @@ use rusqlite::Connection;
 
 use crate::index::fts::{self, ChunkLoc, Decl, TextHit, TextLanes, TextMiss};
 use crate::index::ignore::Glob;
+use crate::index::reader::Opened;
 use crate::index::rerank::{self, Features, Query, Snippet};
-use crate::symbolgraph;
+use crate::symbolgraph::{self, QuerySource};
 
 /// The RRF constant (see the module docs).
 pub const RRF_K: f64 = 60.0;
@@ -600,7 +601,7 @@ pub fn search(
     }
 
     // ---- text lanes (code index only) ----
-    let index = source.index().filter(|_| text_lanes_on(&mut degradations));
+    let index = text_index(&source, &mut degradations);
     let text: TextLanes = match index {
         Some(opened) => {
             let read = opened
@@ -624,14 +625,6 @@ pub fn search(
                     TextLanes::default()
                 }
             }
-        }
-        None if source.index().is_none() => {
-            degradations.push(
-                "bm25, docs, uid and snippets need the code index, which does not answer this \
-                 read (see coverage.work)"
-                    .to_string(),
-            );
-            TextLanes::default()
         }
         None => TextLanes::default(),
     };
@@ -955,10 +948,29 @@ pub fn search(
     }
 }
 
-/// Whether the text lanes run: `XMUSTARD_SEARCH_TEXT_LANES=off` turns them (and the
-/// text reads of the rerank and snippets) off, for measurement and as an operator kill
-/// switch; the answer then says so under `degradations`.
-fn text_lanes_on(degradations: &mut Vec<String>) -> bool {
+/// The index snapshot the text lanes (and UIDs, spans and snippets) read, or None with
+/// the reason added to `degradations`. In order: the code index answers this read (not
+/// the legacy graph), its store has this schema's text tables, and the operator did not
+/// turn the lanes off (`XMUSTARD_SEARCH_TEXT_LANES=off`, for measurement and as a kill
+/// switch).
+fn text_index<'a>(source: &'a QuerySource, degradations: &mut Vec<String>) -> Option<&'a Opened> {
+    let Some(opened) = source.index() else {
+        degradations.push(
+            "bm25, docs, uid and snippets need the code index, which does not answer this read \
+             (see coverage.work)"
+                .to_string(),
+        );
+        return None;
+    };
+    let schema = crate::index::schema::SCHEMA_VERSION.to_string();
+    if opened.meta.schema_version != schema {
+        degradations.push(format!(
+            "bm25, docs, uid and snippets need index schema {schema}; the store is schema {} \
+             until its next update rebuilds it",
+            opened.meta.schema_version
+        ));
+        return None;
+    }
     let off = std::env::var("XMUSTARD_SEARCH_TEXT_LANES").is_ok_and(|v| {
         matches!(
             v.trim().to_ascii_lowercase().as_str(),
@@ -969,8 +981,9 @@ fn text_lanes_on(degradations: &mut Vec<String>) -> bool {
         degradations.push(
             "bm25, docs, uid and snippets are off (XMUSTARD_SEARCH_TEXT_LANES=off)".to_string(),
         );
+        return None;
     }
-    !off
+    Some(opened)
 }
 
 /// Order `idx` by `score` (highest first), ties by path, line, kind and name.
