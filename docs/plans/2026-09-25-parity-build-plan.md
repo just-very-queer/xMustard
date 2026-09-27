@@ -1496,6 +1496,56 @@ Instruction-pattern scan and data framing on everything injected; core tier and 
 
 xmustard-ops approve|reject|queue bound to a human-approver token, optional MCP elicitation; precondition for protected paths in WS-19 and WS-31.
 
+**Implementation record (branch parity/ws-57, 2026-09-28).** These notes record what was built and measured, and where it differs from the text above. The section above is one line, so the workstream direction was the spec: approve, reject and queue under a human-approver token (WS-09 roles), WS-71 folded in, optional elicitation behind capability negotiation, wiring to govstore's pending and verification queue, distinct-principal rules, fail-closed trust checks, no new MCP tool and no rise in the lean tools/list caps.
+- *Human approver.* A human approver is a principal of kind human (WS-19B's token kinds) that holds the human-approver role; admin holds that role too. `AuthorizeHumanApprover` runs these checks in order and fails closed:
+  - a token was given;
+  - it resolves, so it is known, not revoked and not expired;
+  - it is not the open-mode identity;
+  - it is of kind human;
+  - it holds human-approver;
+  - it is scoped to the workspace.
+
+  A refusal is audited as `denied` with the detail `human approval: <why>`. Open mode has no human approver.
+- *Token and assurance.* The ops CLI reads the token from `--token-file`, then from `XMUSTARD_APPROVER_TOKEN`, and otherwise prompts on the controlling terminal with echo off (`/dev/tty`, termios through `golang.org/x/sys/unix` on darwin and linux; other platforms have no prompt). Every write a human approver makes records `provenance.approval = "<surface>/<assurance>"`:
+  - `ops/user_presence` only when the token was typed at the terminal;
+  - `ops/advisory` when it came from a file or the environment;
+  - `mcp_elicitation/advisory` for a write the human confirmed through MCP;
+  - `http/advisory` for a direct API call.
+
+  Git children never inherit `XMUSTARD_*` variables.
+- *approve and reject.* `xmustard-ops approve|reject <ws> <entry_id> [--revision N] [--note]` calls `HumanVerdict`, which calls `VerifyContextOutcome`. The verdict is one more distinct principal's: it counts toward the quorum like a peer's, it never promotes alone past a multi-peer gate, and the owner-distinct policy applies. On top of that, a human approver never votes on memory they proposed or on an edit they authored (`ErrSelfApproval`), in any quorum mode. Revision 0 is pinned to the served revision the check read, so a revision served after the check conflicts instead of being voted on unchecked. Only approve and reject are accepted.
+- *queue (WS-19A/B lifecycle, WS-20 queue view, WS-22 events).* `xmustard-ops queue <ws> [--limit 50] [--baselines 10]` lists pending proposals (the served revision of an unpromoted entry) and pending edits (the head revision), oldest first. Each item carries:
+  - the text, cut at 2,000 bytes on a rune boundary and withheld when it does not match its digest or was purged;
+  - an edit's reason and diff;
+  - approvals, rejections and votes_needed;
+  - the human approvals already cast.
+
+  The awaiting_me rule of WS-20 applies: writes by the approver, writes the approver already voted on, and writes the owner-distinct policy blocks are left out and counted under `skipped.own`, `skipped.voted` and `skipped.same_owner`. `total` counts every eligible write, and `--limit` bounds only the items rendered. The queue also lists the newest `index_baseline` events (WS-22) with seq, time, principal, reason, auto, head, replaced and previous head. They need no approval; they are listed so a human sees every baseline reset, automatic or not.
+- *MCP elicitation.* The session records `capabilities.elicitation` at initialize, and every tool call now sends `X-Xmustard-Issuer: mcp`, with or without evidence delivery. The API refuses a remember or verify made under a human approver's token through the bridge unless the call carries `X-Xmustard-Approval: elicitation`. The refusal is a 403 with reason `human_presence_required` and an `action` text built only from safe ids (an unsafe id shows as `(invalid)`), and it is audited. The bridge asks the human only when the client declared elicitation under protocol 2025-06-18 and finished initialization. It sends `elicitation/create` with one required boolean, `confirm`, that has no default, waits up to 10 minutes, and repeats the call once with the header only on `accept` with `confirm: true`. In every other case nothing is recorded and the tool result says why: a decline, a cancel, a missing or false confirm, a malformed answer, a client error or timeout, or a client without the capability. Other refusals pass through unchanged. No tool, argument or tools/list byte was added (`tools_list_budget_test` passes unchanged in both profiles). The `xmustard://docs/tools` resource gained a short "Human approvers" paragraph.
+- *Merge attestation (WS-71, PAR-REV-14).*
+  - `xmustard-ops review approve <ws> --base REF [--head HEAD] [--review ID]... [--note]` appends a govstore `merge_approval` event (a new event type; no migration). It binds the workspace, the repository (its canonical root), the base ref, the merge base, the head, `diff_sha256` and `diff_bytes`, and the review record ids (at most 32 safe ids). It also records the assurance and the label `attestation only: xMustard never merges, never changes branch protection and never posts to a pull request; enforce merges with branch protection`. A head already contained in the base is refused.
+  - `review revoke --approval SEQ --reason TEXT` appends `merge_approval_revoked`. Any human approver may revoke, since revoking only removes trust. The reason is required, and revoking twice is a conflict.
+  - `review gate [--head REF]` reads only and takes no token. It prints the state and exits 0 when current, 3 when there is none and 4 when stale. Any error, including a state this build does not know, exits 1.
+  - An attestation is current only while the repository, merge base, head and digest all match. Another head is stale without running git again. The same head with a moved base is diffed again and is stale. A record that does not decode is an error, never an approval.
+  - The digested diff is hardened. System and global git config are ignored, every `GIT_*` and `XMUSTARD_*` variable is removed, and hooks and the fsmonitor are off. Every option repository config could change is pinned on the command line: myers, indent heuristic, `-U3`, inter-hunk context 0, `a/` and `b/` prefixes, no renames, no relative paths, full index, binary, `--submodule=short`, `-O/dev/null`, no external diff, no textconv and no color. A test sets each of these in the repository config, plus `.gitattributes` textconv, `GIT_DIR` and `GIT_EXTERNAL_DIFF`, and the digest does not change. The diff streams into SHA-256, so memory does not grow with its size.
+- *Measured (build box: Linux, 6 cores, git 2.53.0).* `BenchmarkMergeApprovalStateLargeDiff` gates a current attestation over 500 new files of 4 KiB each, a 2,174,928-byte diff: 34.8 to 37.8 ms per gate (three runs of 20; two `rev-parse` runs, one `merge-base` and one `diff`), 228 to 230 KB and about 660 allocations per call. The diff streams into the digest, so the Go heap does not hold it. The lean and full tools/list caps did not change: no schema was touched and `tools_list_budget_test` passes unchanged. A tool call without evidence delivery now also sends the 22-byte issuer header, which evidence delivery already sent.
+- *Checks.* The full Linux gate (`xm-remote-check.sh all -count=1`: Rust release build, tests and clippy, then go vet and every Go package) passes, with 6 clippy warnings, the same as the base `fd083c2`. No Rust code changed.
+- *Deviations.*
+  - The records are advisory by default. The governance store is a file the user's processes can write, so an attestation or a human verdict is evidence of a decision, not an enforcement; `user_presence` means only that the token was typed at the terminal (there is no keychain integration). Enforcement stays with branch protection, and no signed export (such as a git-notes ref) is written, so `review gate` serves the human's own pre-push hook, not CI.
+  - PAR-REV-14's ground member `review.human_approval` is not added. It would run git on every ground, and the critic orders it after the workstreams that create `grounding_review.go` (WS-67 and WS-68). Until then an agent reads the state with `xmustard-ops review gate`, which reads only and takes no token.
+  - Merge attestations bind review record ids as given. The review records store (WS-66) does not exist yet, so their authors cannot be checked for distinctness from the approver.
+  - The MCP presence rule covers remember and verify, the two governed-memory write tools. The approver's lifecycle routes (DELETE and restore) are HTTP only and not reachable over MCP.
+  - A human approval is one distinct verdict and does not override the quorum. WS-31 decides which protected paths also require one; it can recognize one as a counting approve vote with `principal_kind` human, and audit its surface and assurance under `provenance.approval`.
+  - WS-20 is not on `feat/parity-v2` yet, so the queue applies the same awaiting_me rule over govstore itself; it can reuse WS-20's ranking view once that lands.
+  - The hardened diff lives in `merge_approval.go`; WS-64 (the shared hardened diff module, folded into WS-35) should absorb it.
+  - Human tokens are minted through `POST /api/auth/tokens` with `"kind":"human"`. `xmustard-api mint-token` still mints agent tokens only.
+- *Files.* New: `api-go/internal/workspaceops/human_approval.go`, `merge_approval.go` and their tests; `api-go/internal/mcpserver/elicitation.go` and its test; `api-go/cmd/xmustard-api/human_presence.go` and its test; `api-go/cmd/xmustard-ops/approval.go`, `approval_tty_unix.go`, `approval_tty_darwin.go`, `approval_tty_linux.go`, `approval_tty_other.go` and `approval_test.go`. Changed:
+  - `govstore/events.go` (two event types) and `govstore/store.go` (`Actor.Approval` in the provenance);
+  - `workspaceops/memory_propose.go` and `memory_provenance.go` (`ContextActor.Approval`);
+  - `xmustard-api/main.go` and `memory_routes.go` (the label and the two presence checks);
+  - `mcpserver/server.go`, `dispatch.go`, `evidence.go` and `docs_resource.go`;
+  - `xmustard-ops/main.go`, three additive lines that dispatch to `approval.go`.
+
 ### WS-58 — Daemon lifecycle (critic addition)
 
 launchd/systemd unit or socket activation via xmustard-ops setup, health-checked auto-start, crash restart, log rotation, schema migration with connected clients; govstore backup (VACUUM INTO), quick_check on open, restore.
