@@ -626,33 +626,40 @@ fn identity_flag(args: Args) -> (Option<String>, Args) {
 }
 
 fn search(args: Args) -> CmdResult {
-    let usage = "xmustard-core search [--identity-key=K] <root> <workspace_id> <query> [limit] \
-                 [seed] [--offset=N] [--path-glob=GLOB]";
-    let (key, mut args) = identity_flag(args);
-    let root = need(&mut args, usage)?;
-    let ws = need(&mut args, usage)?;
-    let query = need(&mut args, usage)?;
-    // after the query: `--name=value` flags anywhere, positionals (limit, then an
-    // optional seed symbol for the graph-proximity lane) in order.
+    let usage = "xmustard-core search [--identity-key=K] [--offset=N] [--path-glob=GLOB] \
+                 <root> <workspace_id> <query> [limit] [seed]";
+    let (key, args) = identity_flag(args);
+    // `--name=value` flags lead; the first other argument ends them, so a query or seed
+    // symbol that looks like a flag is never read as one.
+    let mut flags: Vec<String> = args.collect();
+    let lead = flags.iter().take_while(|a| a.starts_with("--")).count();
+    let mut args = flags.split_off(lead).into_iter();
     let (mut offset, mut path_glob) = (0usize, None::<String>);
-    let mut positional: Vec<String> = Vec::new();
-    for a in args {
-        match (a.strip_prefix("--offset="), a.strip_prefix("--path-glob=")) {
-            (Some(n), _) => {
+    for flag in flags {
+        match flag.split_once('=') {
+            Some(("--offset", n)) => {
                 offset = n
                     .parse()
                     .map_err(|_| CmdError::new(2, format!("search: bad --offset {n}\n{usage}")))?
             }
-            (_, Some(g)) => path_glob = Some(g.to_string()),
-            _ => positional.push(a),
+            Some(("--path-glob", g)) => path_glob = Some(g.to_string()),
+            _ => {
+                return Err(CmdError::new(
+                    2,
+                    format!("search: unknown flag {flag}\n{usage}"),
+                ));
+            }
         }
     }
-    let mut positional = positional.into_iter();
-    let limit = positional
+    let root = need(&mut args, usage)?;
+    let ws = need(&mut args, usage)?;
+    let query = need(&mut args, usage)?;
+    // then the limit and an optional seed symbol for the graph-proximity lane
+    let limit = args
         .next()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(25);
-    let seed = positional.next().filter(|s| !s.trim().is_empty());
+    let seed = args.next().filter(|s| !s.trim().is_empty());
     json(&xmustard_core::search::search(
         &PathBuf::from(root),
         &ws,

@@ -29,7 +29,8 @@
 //!
 //! Rerank: the top RERANK_K fused candidates gain RERANK_WEIGHT times their rerank
 //! score (`index::rerank`: declaration identifier match, window coverage and order,
-//! dense and symbol-like lines) and are reordered; the rest keep their fused order.
+//! dense and symbol-like lines) and are reordered; the rest keep their fused order and
+//! report a rerank of 0 with no rerank reasons.
 //! Every ordering breaks ties by path, line, kind and name, so the same inputs render
 //! the same bytes.
 //!
@@ -889,9 +890,13 @@ pub fn search(
         }
         let top = RERANK_K.min(order.len());
         sort_by_score(&cands, &final_score, &mut order[..top]);
+        // a page past the reranked head reads its hits for the span and snippet only:
+        // no rerank moved them, so none is reported
         for &i in order.get(opts.offset..page_end).unwrap_or(&[]) {
-            ctx.entry(i)
-                .or_insert_with(|| context(conn, root, &q, &cands[i], &text));
+            ctx.entry(i).or_insert_with(|| Ctx {
+                features: Features::default(),
+                ..context(conn, root, &q, &cands[i], &text)
+            });
         }
     };
     let ran = match index {

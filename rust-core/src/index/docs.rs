@@ -8,7 +8,8 @@
 //! transaction. Docs have no symbols, references or edges, so a doc-only change never
 //! starts a new graph generation. Postings follow the content retention: `symbol`
 //! leaves credential-shaped words out and stores an unordered bag, `full` keeps word
-//! order, and `none` indexes no prose (the rows say `retention_none`).
+//! order, and `none` indexes no prose (the rows say `retention_none`). A doc on a secret
+//! path (`secretpath`) is listed with status `secret_path` and never read.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;

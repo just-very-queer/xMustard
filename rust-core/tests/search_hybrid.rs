@@ -76,13 +76,12 @@ fn query(root: &Path, q: &str, limit: usize) -> SearchResult {
     )
 }
 
+const RETRY_GO: &str = "package store\n\nimport \"time\"\n\n// RetryWithBackoff calls fn until it succeeds.\nfunc RetryWithBackoff(attempts int, base time.Duration, fn func() error) error {\n\tvar err error\n\tdelay := base\n\tfor i := 0; i < attempts; i++ {\n\t\tif err = fn(); err == nil {\n\t\t\treturn nil\n\t\t}\n\t\ttime.Sleep(delay)\n\t\tdelay *= 2\n\t}\n\treturn err\n}\n";
+
 /// A small service: the retry and bucket bodies hold words their names do not.
 fn fixture() -> TempDir {
     repo(&[
-        (
-            "store/retry.go",
-            "package store\n\nimport \"time\"\n\n// RetryWithBackoff calls fn until it succeeds.\nfunc RetryWithBackoff(attempts int, base time.Duration, fn func() error) error {\n\tvar err error\n\tdelay := base\n\tfor i := 0; i < attempts; i++ {\n\t\tif err = fn(); err == nil {\n\t\t\treturn nil\n\t\t}\n\t\ttime.Sleep(delay)\n\t\tdelay *= 2\n\t}\n\treturn err\n}\n",
-        ),
+        ("store/retry.go", RETRY_GO),
         (
             "ratelimit/bucket.go",
             "package ratelimit\n\n// TokenBucket is a rate limiter.\ntype TokenBucket struct {\n\ttokens int\n}\n\n// Allow consumes one token.\nfunc (b *TokenBucket) Allow() bool {\n\tif b.tokens == 0 {\n\t\treturn false\n\t}\n\tb.tokens--\n\treturn true\n}\n",
@@ -428,6 +427,206 @@ fn an_older_store_answers_without_text_lanes() {
     assert!(!res.coverage.loss_counts.contains_key("graph_read_error"));
 }
 
+/// Secret paths never put text into an answer: a doc under `.ssh/` or named `.env.*` is
+/// listed but never read or indexed, a code chunk of a `.env.*` file ranks without a
+/// snippet, and credential-shaped words in any other snippet are masked, under every
+/// retention.
+#[test]
+fn secret_paths_and_secret_words_never_reach_a_snippet() {
+    let r = repo(&[
+        (
+            ".ssh/notes.md",
+            "# Hosts\n\nzebrakey host prod-db password hunter2zebra\n",
+        ),
+        (".env.md", "# Env\n\nzebrakey staging password zebrapass\n"),
+        (
+            ".env.ts",
+            "export function zebraKey() {\n  return \"zebra-apikey-value\";\n}\n",
+        ),
+        (
+            "src/lib.rs",
+            "pub fn zebra_token() -> &'static str {\n    \"ghp_16C7e42F292c6912E7710c838347Ae178B4a\"\n}\n",
+        ),
+        ("README.md", "# Zebra\n\nzebrakey docs live here.\n"),
+    ]);
+    for retention in [ContentRetention::Symbol, ContentRetention::Full] {
+        build(r.path(), retention);
+        let res = query(r.path(), "zebra zebrakey", 25);
+        let body = serde_json::to_string(&res).unwrap();
+        for leak in [
+            "hunter2zebra",
+            "zebrapass",
+            "zebra-apikey-value",
+            "ghp_16C7",
+        ] {
+            assert!(!body.contains(leak), "{retention:?}: {leak} leaked: {body}");
+        }
+        assert!(
+            res.hits
+                .iter()
+                .all(|h| h.path != ".ssh/notes.md" && h.path != ".env.md"),
+            "{retention:?}: {:?}",
+            names(&res)
+        );
+        let env = res
+            .hits
+            .iter()
+            .find(|h| h.path == ".env.ts" && h.kind == "symbol")
+            .unwrap_or_else(|| panic!("{retention:?}: {:?}", names(&res)));
+        assert!(env.snippet.is_empty());
+        assert!(
+            env.reasons.iter().any(|r| r == "no snippet: secret path"),
+            "{:?}",
+            env.reasons
+        );
+        let lib = res
+            .hits
+            .iter()
+            .find(|h| h.path == "src/lib.rs" && !h.snippet.is_empty())
+            .unwrap_or_else(|| panic!("{retention:?}: {:?}", names(&res)));
+        assert!(
+            lib.snippet
+                .iter()
+                .any(|s| s.text.contains("\"[redacted]\"")),
+            "{:?}",
+            lib.snippet
+        );
+        // the secret docs are listed, never read: no chunks, status secret_path
+        let cfg = IndexConfig::load(r.path()).unwrap();
+        let db = index::stats(r.path(), &cfg, false).unwrap()["index_path"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let conn = rusqlite::Connection::open(db).unwrap();
+        let rows: Vec<(String, String, i64)> = conn
+            .prepare(
+                "SELECT d.path, d.status, (SELECT count(*) FROM doc_chunks c WHERE c.doc_id = d.id)
+                 FROM docs d WHERE d.path IN ('.ssh/notes.md', '.env.md') ORDER BY d.path",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                (".env.md".into(), "secret_path".into(), 0),
+                (".ssh/notes.md".into(), "secret_path".into(), 0)
+            ]
+        );
+    }
+}
+
+/// Under `content_retention=full` the stored chunk text answers, with no file read,
+/// only while the file's stat key is unchanged; an edit the index has not seen withholds
+/// the snippet, as under the default retention.
+#[test]
+fn stored_text_answers_only_while_the_file_is_unchanged() {
+    // one code file and no docs, so every chunk the query reads has stored text
+    let r = repo(&[("store/retry.go", RETRY_GO)]);
+    // an mtime well before the scan keeps the stat key out of the racy window
+    let old = Command::new("touch")
+        .args(["-t", "202001010000", "store/retry.go"])
+        .current_dir(r.path())
+        .status()
+        .unwrap();
+    assert!(old.success());
+    build(r.path(), ContentRetention::Full);
+    let top = |root: &Path| query(root, "time.Sleep delay", 5).hits.remove(0);
+
+    let before = fts::chunk_reads();
+    let fresh = top(r.path());
+    assert_eq!(fts::chunk_reads(), before, "the stored text answers");
+    assert!(
+        fresh
+            .snippet
+            .iter()
+            .any(|s| s.text.contains("time.Sleep(delay)")),
+        "{:?}",
+        fresh.snippet
+    );
+
+    let src = fs::read_to_string(r.path().join("store/retry.go")).unwrap();
+    write(
+        r.path(),
+        "store/retry.go",
+        &src.replace("time.Sleep(delay)", "time.Sleep(delay * 3)"),
+    );
+    let stale = top(r.path());
+    assert_eq!(stale.path, "store/retry.go");
+    assert!(stale.snippet.is_empty(), "{:?}", stale.snippet);
+    assert!(
+        stale
+            .reasons
+            .iter()
+            .any(|r| r == "no snippet: file changed since it was indexed"),
+        "{:?}",
+        stale.reasons
+    );
+}
+
+/// A page past the reranked head reports no rerank: its score is the fused score, and
+/// no rerank feature is given as a reason.
+#[test]
+fn hits_past_the_rerank_head_report_no_rerank() {
+    let src: String = (0..60)
+        .map(|i| format!("pub fn gadget_{i:02}() {{ gadget(); }}\n"))
+        .collect();
+    let r = repo(&[("lib.rs", &src), ("core.rs", "pub fn gadget() {}\n")]);
+    build(r.path(), ContentRetention::Symbol);
+    let head = query(r.path(), "gadget", search::RERANK_K);
+    assert!(head.hits.iter().any(|h| h.scores["rerank"] > 0.0));
+    let tail = run(
+        r.path(),
+        "gadget",
+        SearchOptions {
+            limit: 10,
+            offset: search::RERANK_K,
+            ..Default::default()
+        },
+    );
+    assert!(!tail.hits.is_empty(), "{} candidates", tail.total);
+    for h in &tail.hits {
+        assert_eq!(h.scores["rerank"], 0.0, "{h:?}");
+        assert_eq!(h.score, h.scores["rrf"], "{h:?}");
+        let rerank_reason = |r: &String| {
+            [
+                "declaration",
+                "identifier match",
+                "window coverage",
+                "dense line",
+                "symbol-like line",
+            ]
+            .iter()
+            .any(|f| r.contains(f))
+        };
+        assert!(!h.reasons.iter().any(rerank_reason), "{:?}", h.reasons);
+    }
+}
+
+/// The CLI reads flags only before the root: a query or seed shaped like a flag stays
+/// a positional, and an unknown leading flag is refused.
+#[test]
+fn cli_flags_lead_the_positionals() {
+    let r = fixture();
+    build(r.path(), ContentRetention::Symbol);
+    let root = r.path().to_str().unwrap();
+    let cli = |args: &[&str]| Command::new(BIN).arg("search").args(args).output().unwrap();
+    let out = cli(&["--offset=1", root, "ws", "retry delay", "3", "--offset=2"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["offset"], 1, "the seed --offset=2 is not a flag");
+    let out = cli(&[root, "ws", "--path-glob=x", "3"]);
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["query"], "--path-glob=x");
+    assert_eq!(cli(&["--limit=3", root, "ws", "q"]).status.code(), Some(2));
+}
+
 // ---------------------------------------------------------------------------
 // BM25 cache measurement (resident service, real corpora)
 // ---------------------------------------------------------------------------
@@ -554,7 +753,7 @@ fn corpus_queries(db: &Path) -> Vec<String> {
     out
 }
 
-/// WS-18 acceptance (BM25 cache, 5-8 MiB): the resident service's RSS growth over a
+/// WS-18 acceptance (BM25 cache, 5 MiB steady / 8 MiB peak): the resident service's RSS growth over a
 /// query mix on a real corpus, with the text lanes on minus off. Runs when
 /// XMUSTARD_PARITY_FIXTURES holds `cline` and `pi-mono` clones (Apache-2.0 / MIT); the
 /// index is written to a temporary directory, never into the fixtures. Results are
@@ -622,6 +821,10 @@ fn resident_bm25_cache_stays_within_its_line() {
         let steady = on.0.saturating_sub(off.0) as f64 / MIB;
         let peak = on.1.saturating_sub(off.1) as f64 / MIB;
         eprintln!("{name}: BM25 cache: steady +{steady:.1} MiB, peak +{peak:.1} MiB");
+        assert!(
+            steady <= 5.0,
+            "{name}: BM25 lanes add {steady:.1} MiB steady, over the 5 MiB line"
+        );
         assert!(
             peak <= 8.0,
             "{name}: BM25 lanes add {peak:.1} MiB at peak, over the 8 MiB line"

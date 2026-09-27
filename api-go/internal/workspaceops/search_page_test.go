@@ -79,28 +79,71 @@ func TestSearchPagesCarryABoundCursor(t *testing.T) {
 		t.Fatalf("the cursor must continue at offset 3: %q", args)
 	}
 
-	// another query, a tampered offset, a cursor past the window and an over-long one
-	// are rejected, never clamped.
-	forged := base64.RawURLEncoding.EncodeToString([]byte("s1.250." + SearchRequest{Query: "retry", PathGlob: "**/*.go"}.fingerprint()))
-	recall := base64.RawURLEncoding.EncodeToString([]byte("r1.3." + SearchRequest{Query: "retry", PathGlob: "**/*.go"}.fingerprint()))
+	// another query or workspace, an edited offset, a cursor past the window, an unsigned
+	// or recall-shaped one and an over-long one are rejected, never clamped.
+	req := SearchRequest{Query: "retry", PathGlob: "**/*.go"}
+	signed, _ := base64.RawURLEncoding.DecodeString(cursor)
+	parts := strings.Split(string(signed), ".")
+	b64 := func(s string) string { return base64.RawURLEncoding.EncodeToString([]byte(s)) }
+	for name, c := range map[string]string{
+		"edited offset": b64("s2.5." + parts[2]),
+		"past window":   encodeSearchCursor(searchWindow+50, req.rankingKey(ws)),
+		"unsigned":      b64("s1.3." + parts[2][:12]),
+		"recall cursor": b64("r2.3.1." + parts[2]),
+		"garbage":       "not-a-cursor",
+		"over-long":     strings.Repeat("A", maxSearchCursorLen+1),
+	} {
+		req.Cursor = c
+		if _, err := WorkspaceSearchPage(ctx, dir, ws, req); !IsInvalidInput(err) {
+			t.Errorf("%s: want invalid input, got %v", name, err)
+		}
+	}
 	for name, req := range map[string]SearchRequest{
-		"other query":   {Query: "backoff", PathGlob: "**/*.go", Cursor: cursor},
-		"other glob":    {Query: "retry", Cursor: cursor},
-		"past window":   {Query: "retry", PathGlob: "**/*.go", Cursor: forged},
-		"recall cursor": {Query: "retry", PathGlob: "**/*.go", Cursor: recall},
-		"garbage":       {Query: "retry", PathGlob: "**/*.go", Cursor: "not-a-cursor"},
-		"over-long":     {Query: "retry", PathGlob: "**/*.go", Cursor: strings.Repeat("A", maxSearchCursorLen+1)},
-		"long glob":     {Query: "retry", PathGlob: strings.Repeat("*", maxSearchPathGlobLen+1)},
+		"other query": {Query: "backoff", PathGlob: "**/*.go", Cursor: cursor},
+		"other glob":  {Query: "retry", Cursor: cursor},
+		"long glob":   {Query: "retry", PathGlob: strings.Repeat("*", maxSearchPathGlobLen+1)},
 	} {
 		if _, err := WorkspaceSearchPage(ctx, dir, ws, req); !IsInvalidInput(err) {
 			t.Errorf("%s: want invalid input, got %v", name, err)
 		}
 	}
+	req.Cursor = cursor
+	if _, err := decodeSearchCursor(cursor, req.rankingKey("wsOther")); !IsInvalidInput(err) {
+		t.Errorf("another workspace: want invalid input, got %v", err)
+	}
+}
+
+// Flags lead the core's positionals, so a seed shaped like a flag stays the seed.
+func TestSearchSeedNeverReadsAsAFlag(t *testing.T) {
+	ws := "wsSearchSeed"
+	dir := seedFeedbackWorkspace(t, ws)
+	useFeedbackRecorder(t, feedbackMaxPendingPaths)
+	argsFile := fakeSearchCore(t, searchPageBody)
+	if _, err := WorkspaceSearchPage(context.Background(), dir, ws, SearchRequest{Query: "--path-glob=x", Seed: "--offset=2", PathGlob: "**/*.go", Limit: 3}); err != nil {
+		t.Fatal(err)
+	}
+	args, _ := os.ReadFile(argsFile)
+	lines := strings.Split(strings.TrimSpace(string(args)), "\n")
+	var root int
+	for i, a := range lines {
+		if !strings.HasPrefix(a, "--") && a != "search" {
+			root = i
+			break
+		}
+	}
+	for _, a := range lines[1:root] {
+		if !strings.HasPrefix(a, "--identity-key=") && !strings.HasPrefix(a, "--path-glob=") {
+			t.Fatalf("unexpected leading flag %q in %q", a, lines)
+		}
+	}
+	if tail := lines[root+2:]; len(tail) != 3 || tail[0] != "--path-glob=x" || tail[2] != "--offset=2" {
+		t.Fatalf("query, limit and seed must follow the root as positionals: %q", lines)
+	}
 }
 
 // The last page, and a page that reaches the window, carry no next_cursor.
 func TestSearchCursorStopsAtTheEndAndTheWindow(t *testing.T) {
-	fp := SearchRequest{Query: "q"}.fingerprint()
+	ranking := SearchRequest{Query: "q"}.rankingKey("ws")
 	body := func(total, hits int) json.RawMessage {
 		hs := make([]map[string]any, hits)
 		for i := range hs {
@@ -120,13 +163,13 @@ func TestSearchCursorStopsAtTheEndAndTheWindow(t *testing.T) {
 		{0, 0, 0, false},
 	} {
 		var res map[string]any
-		_ = json.Unmarshal(withSearchCursor(body(c.total, c.hits), c.offset, fp), &res)
+		_ = json.Unmarshal(withSearchCursor(body(c.total, c.hits), c.offset, ranking), &res)
 		_, got := res["next_cursor"]
 		if got != c.want {
 			t.Errorf("offset %d total %d hits %d: next_cursor %v, want %v", c.offset, c.total, c.hits, got, c.want)
 		}
 		if got {
-			if n, err := decodeSearchCursor(res["next_cursor"].(string), fp); err != nil || n != c.offset+c.hits {
+			if n, err := decodeSearchCursor(res["next_cursor"].(string), ranking); err != nil || n != c.offset+c.hits {
 				t.Errorf("cursor decodes to %d, %v", n, err)
 			}
 		}

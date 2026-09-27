@@ -10,6 +10,7 @@
 //! FTS5). Chunk text is never stored under the default retention, so the rerank and
 //! the snippets read a hit's byte range from the file, once, and use it only when its
 //! hash still equals the indexed chunk's; nothing here lists or rereads the repository.
+//! A secret path (`secretpath`) is refused before any read: its hits carry no text.
 
 use std::cell::Cell;
 use std::path::Path;
@@ -351,6 +352,8 @@ pub fn locate(
 /// Why a chunk's text is not available.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TextMiss {
+    /// The file is a credential store (`secretpath`): its text never reaches an agent.
+    SecretPath,
     /// Larger than MAX_CHUNK_READ.
     TooLarge,
     /// The file is gone, unreadable, or its bytes no longer hash to the indexed chunk.
@@ -360,21 +363,23 @@ pub enum TextMiss {
 impl TextMiss {
     pub fn reason(self) -> &'static str {
         match self {
+            TextMiss::SecretPath => "secret path",
             TextMiss::TooLarge => "chunk larger than the snippet read bound",
             TextMiss::Changed => "file changed since it was indexed",
         }
     }
 }
 
-/// The text of `loc`: the stored text under `content_retention=full`, else its byte
-/// range read from the file (no symlink followed) and used only when it still hashes to
-/// the indexed chunk.
+/// The text of `loc`, which the rerank reads and the snippets show. A secret path is
+/// refused before anything is read. Under `content_retention=full` the stored text
+/// answers while the file's stat key still equals the indexed one; otherwise the byte
+/// range is read from the file (no symlink followed) and used only when it still hashes
+/// to the indexed chunk.
 pub fn chunk_text(conn: &Connection, root: &Path, loc: &ChunkLoc) -> Result<String, TextMiss> {
-    if !loc.doc
-        && let Ok(Some(t)) = conn
-            .prepare_cached("SELECT text FROM chunk_text WHERE chunk_id = ?1")
-            .and_then(|mut st| st.query_row([loc.id], |r| r.get::<_, String>(0)).optional())
-    {
+    if crate::secretpath::is_secret_path(&loc.path) {
+        return Err(TextMiss::SecretPath);
+    }
+    if let Some(t) = stored_text(conn, root, loc) {
         return Ok(t);
     }
     let len = loc.end_byte.saturating_sub(loc.start_byte);
@@ -388,6 +393,29 @@ pub fn chunk_text(conn: &Connection, root: &Path, loc: &ChunkLoc) -> Result<Stri
         return Err(TextMiss::Changed);
     }
     Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// The stored text of code chunk `loc` (`content_retention=full`) while its file is
+/// unchanged: the file's current stat key equals the indexed key, and that key was not
+/// racy. None sends the caller to the file.
+fn stored_text(conn: &Connection, root: &Path, loc: &ChunkLoc) -> Option<String> {
+    if loc.doc {
+        return None;
+    }
+    let (key, text): (String, String) = conn
+        .prepare_cached(
+            "SELECT f.stat_key, t.text FROM chunk_text t
+             JOIN chunks c ON c.id = t.chunk_id JOIN files f ON f.id = c.file_id
+             WHERE t.chunk_id = ?1",
+        )
+        .and_then(|mut st| {
+            st.query_row([loc.id], |r| Ok((r.get(0)?, r.get(1)?)))
+                .optional()
+        })
+        .ok()??;
+    let meta = std::fs::symlink_metadata(root.join(&loc.path)).ok()?;
+    let current = meta.is_file() && super::scan::StatKey::of(&meta).encode() == key;
+    (current && !key.starts_with(super::RACY_PREFIX)).then_some(text)
 }
 
 #[cfg(unix)]

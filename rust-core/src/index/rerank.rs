@@ -352,7 +352,10 @@ pub struct Snippet {
     pub text: String,
 }
 
-fn clip(line: &str) -> String {
+/// A snippet line: credential-shaped words masked (`chunks::mask_secret_words`), then
+/// clipped to MAX_SNIPPET_LINE_CHARS.
+fn snippet_line(line: &str) -> String {
+    let line = super::chunks::mask_secret_words(line);
     match line.char_indices().nth(MAX_SNIPPET_LINE_CHARS) {
         Some((cut, _)) => format!("{}…", &line[..cut]),
         None => line.to_string(),
@@ -360,7 +363,7 @@ fn clip(line: &str) -> String {
 }
 
 /// Render up to MAX_SNIPPETS windows of `text` (a chunk starting at file line `first`)
-/// around `anchors`, clipped to the chunk.
+/// around `anchors`, clipped to the chunk, with credential-shaped words masked.
 pub fn snippets(text: &str, first: u32, anchors: &[u32]) -> Vec<Snippet> {
     let lines: Vec<&str> = text.lines().collect();
     let last = first + lines.len() as u32;
@@ -371,7 +374,7 @@ pub fn snippets(text: &str, first: u32, anchors: &[u32]) -> Vec<Snippet> {
         .map(|&a| {
             let (lo, hi) = (a.saturating_sub(1).max(first), (a + 1).min(last - 1));
             let text = (lo..=hi)
-                .map(|l| format!("{l}: {}", clip(lines[(l - first) as usize])))
+                .map(|l| format!("{l}: {}", snippet_line(lines[(l - first) as usize])))
                 .collect::<Vec<_>>()
                 .join("\n");
             Snippet { line: a, text }

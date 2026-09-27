@@ -168,6 +168,9 @@ fn stat_candidate(
     })
 }
 
+/// The pre-read loss of a doc on a secret path (`secretpath`): listed, never read.
+pub const SECRET_PATH: &str = "secret_path";
+
 /// Tracked docs and guidance files the docs lane indexes at most (the smallest paths).
 pub const MAX_DOC_FILES: usize = 2000;
 /// Largest doc or guidance file read for the docs lane.
@@ -182,7 +185,8 @@ pub struct DocCandidate {
     /// `doc` | `guide`
     pub role: &'static str,
     pub stat: StatKey,
-    /// Pre-read problem that keeps the file out of the docs lane.
+    /// Pre-read problem that keeps the file out of the docs lane: `secret_path` or one
+    /// of the code candidates' losses.
     pub loss: Option<&'static str>,
 }
 
@@ -500,12 +504,16 @@ impl<'a> Collector<'a> {
         }
     }
 
-    /// A doc or guidance file for the docs lane; gone files are simply not indexed.
+    /// A doc or guidance file for the docs lane; gone files are simply not indexed. A
+    /// secret path is listed with the `secret_path` loss, so its bytes are never read.
     fn add_doc(&mut self, path: String, role: &'static str, mode: Mode) {
         let cap = MAX_DOC_BYTES.min(self.cfg.max_file_size);
         let Some((stat, loss)) = stat_file(self.root, &path, mode, cap) else {
             return;
         };
+        let loss = crate::secretpath::is_secret_path(&path)
+            .then_some(SECRET_PATH)
+            .or(loss);
         self.docs.push(DocByPath(DocCandidate {
             path,
             role,

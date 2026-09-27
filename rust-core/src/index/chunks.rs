@@ -323,6 +323,35 @@ pub fn tokenize_without_secrets(text: &str, out: &mut String) {
     }
 }
 
+/// What a snippet shows in place of a credential-shaped word.
+pub const SECRET_MASK: &str = "[redacted]";
+
+/// `text` with every credential-shaped word (see `is_secret_like`) replaced by
+/// SECRET_MASK: what a snippet line shows, under every retention.
+pub fn mask_secret_words(text: &str) -> std::borrow::Cow<'_, str> {
+    let mut out = String::new();
+    let (mut copied, mut word) = (0, None);
+    // a sentinel non-word character closes a word that ends the text
+    for (i, c) in text.char_indices().chain([(text.len(), ' ')]) {
+        match (c.is_alphanumeric() || c == '_', word) {
+            (true, None) => word = Some(i),
+            (false, Some(start)) => {
+                word = None;
+                if is_secret_like(&text[start..i]) {
+                    out.push_str(&text[copied..start]);
+                    out.push_str(SECRET_MASK);
+                    copied = i;
+                }
+            }
+            _ => {}
+        }
+    }
+    match copied {
+        0 => text.into(),
+        _ => (out + &text[copied..]).into(),
+    }
+}
+
 /// A heuristic for credential-shaped words in chunk text (not a redaction guarantee;
 /// PAR-SEC-04 owns the full pattern set): AWS access key ids, common token prefixes
 /// (`ghp_`, `github_pat_`, `xoxb`, `sk_live_`...) and long random-looking runs that mix
@@ -478,6 +507,19 @@ mod tests {
         tokenize_without_secrets("token = zq9xk2lmvbp7wr4tnd8hs3fy6gc1ej5a; ok", &mut out);
         assert_eq!(out, "token ok ");
         assert_eq!(unordered("b a c a "), "a a b c ");
+        assert_eq!(
+            mask_secret_words("let t = \"ghp_16C7e42F292c6912E7710c838347Ae178B4a\"; // é"),
+            "let t = \"[redacted]\"; // é"
+        );
+        assert_eq!(
+            mask_secret_words("AKIAIOSFODNN7EXAMPLE"),
+            SECRET_MASK,
+            "a word at both ends of the text"
+        );
+        assert!(matches!(
+            mask_secret_words("fn render_widget() {}"),
+            std::borrow::Cow::Borrowed(_)
+        ));
     }
 
     #[test]

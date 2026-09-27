@@ -2,6 +2,8 @@ package workspaceops
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -11,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"xmustard/api-go/internal/rustcore"
 )
@@ -40,24 +43,40 @@ type SearchRequest struct {
 	Limit  int
 }
 
-// fingerprint names the ranking a cursor pages: every argument that orders or filters
-// it. The page size may change between pages.
-func (r SearchRequest) fingerprint() string {
-	b, _ := json.Marshal([]string{r.Query, r.Seed, r.PathGlob})
-	sum := sha256.Sum256(b)
-	return hex.EncodeToString(sum[:6])
+// Search cursors follow WS-20's recall cursor rule: base64url of "s2.<offset>.<mac>",
+// the mac an HMAC-SHA256 under a key held by this process only, over the offset and the
+// ranking it pages. A client can neither edit the offset nor reuse a cursor for another
+// query or workspace; a cursor stops being valid when the API restarts.
+
+// searchCursorKey is the process's search-cursor signing key.
+var searchCursorKey = sync.OnceValue(func() []byte {
+	k := make([]byte, 32)
+	rand.Read(k) // crypto/rand never fails on supported platforms
+	return k
+})
+
+// rankingKey names the ranking a cursor pages: the workspace and every argument that
+// orders or filters it. The page size may change between pages.
+func (r SearchRequest) rankingKey(workspaceID string) []byte {
+	b, _ := json.Marshal([]string{workspaceID, r.Query, r.Seed, r.PathGlob})
+	return b
 }
 
-// Search cursors follow the recall cursor rule (WS-20): base64url of
-// "<kind>1.<offset>.<fingerprint>", bound to the ranking it pages; this one is kind s.
-func encodeSearchCursor(offset int, fp string) string {
-	return base64.RawURLEncoding.EncodeToString([]byte("s1." + strconv.Itoa(offset) + "." + fp))
+func searchCursorMAC(offset int, ranking []byte) string {
+	m := hmac.New(sha256.New, searchCursorKey())
+	fmt.Fprintf(m, "s2|%d|", offset)
+	m.Write(ranking)
+	return hex.EncodeToString(m.Sum(nil)[:16])
+}
+
+func encodeSearchCursor(offset int, ranking []byte) string {
+	return base64.RawURLEncoding.EncodeToString(fmt.Appendf(nil, "s2.%d.%s", offset, searchCursorMAC(offset, ranking)))
 }
 
 // decodeSearchCursor returns the offset a cursor continues from; "" starts at 0. A
-// cursor that is malformed, over-long, past the search window or from another query is
-// rejected, never clamped.
-func decodeSearchCursor(c, fp string) (int, error) {
+// cursor that is over-long, malformed, edited, from another ranking or past the search
+// window is rejected, never clamped.
+func decodeSearchCursor(c string, ranking []byte) (int, error) {
 	if c == "" {
 		return 0, nil
 	}
@@ -67,11 +86,14 @@ func decodeSearchCursor(c, fp string) (int, error) {
 	}
 	raw, err := base64.RawURLEncoding.DecodeString(c)
 	parts := strings.Split(string(raw), ".")
-	if err != nil || len(parts) != 3 || parts[0] != "s1" || parts[2] != fp {
+	if err != nil || len(parts) != 3 || parts[0] != "s2" {
 		return 0, invalid
 	}
 	n, err := strconv.Atoi(parts[1])
-	if err != nil || n <= 0 || n >= searchWindow {
+	if err != nil || !hmac.Equal([]byte(parts[2]), []byte(searchCursorMAC(n, ranking))) {
+		return 0, invalid
+	}
+	if n <= 0 || n >= searchWindow {
 		return 0, invalid
 	}
 	return n, nil
@@ -95,8 +117,8 @@ func workspaceSearch(ctx context.Context, dataDir, workspaceID string, req Searc
 	if len(req.PathGlob) > maxSearchPathGlobLen {
 		return nil, fmt.Errorf("path_glob is longer than %d bytes: %w", maxSearchPathGlobLen, ErrInvalidInput)
 	}
-	fp := req.fingerprint()
-	offset, err := decodeSearchCursor(req.Cursor, fp)
+	ranking := req.rankingKey(workspaceID)
+	offset, err := decodeSearchCursor(req.Cursor, ranking)
 	if err != nil {
 		return nil, err
 	}
@@ -110,26 +132,29 @@ func workspaceSearch(ctx context.Context, dataDir, workspaceID string, req Searc
 	}
 	limit = min(limit, searchWindow-offset) // a page stops at the window
 	read := ensureCodeIndex(ctx, root)
-	coreArgs := append(read.flags(), root, workspaceID, req.Query, strconv.Itoa(limit))
-	if req.Seed != "" {
-		// the seed is the CLI's optional 5th positional arg, after limit.
-		coreArgs = append(coreArgs, req.Seed)
-	}
+	// flags lead the positionals: the core stops reading flags at the root, so a query
+	// or seed that looks like a flag stays what it is.
+	coreArgs := read.flags()
 	if offset > 0 {
 		coreArgs = append(coreArgs, "--offset="+strconv.Itoa(offset))
 	}
 	if req.PathGlob != "" {
 		coreArgs = append(coreArgs, "--path-glob="+req.PathGlob)
 	}
+	coreArgs = append(coreArgs, root, workspaceID, req.Query, strconv.Itoa(limit))
+	if req.Seed != "" {
+		// the seed is the CLI's optional last positional, after limit.
+		coreArgs = append(coreArgs, req.Seed)
+	}
 	out, err := rustcore.RunSearch(ctx, coreArgs...)
 	if err != nil {
 		return nil, err
 	}
-	return withSearchCursor(read.annotate(out), offset, fp), nil
+	return withSearchCursor(read.annotate(out), offset, ranking), nil
 }
 
 // withSearchCursor adds next_cursor when ranked hits remain inside the window.
-func withSearchCursor(raw json.RawMessage, offset int, fp string) json.RawMessage {
+func withSearchCursor(raw json.RawMessage, offset int, ranking []byte) json.RawMessage {
 	var page struct {
 		Total int               `json:"total"`
 		Hits  []json.RawMessage `json:"hits"`
@@ -145,7 +170,7 @@ func withSearchCursor(raw json.RawMessage, offset int, fp string) json.RawMessag
 	if json.Unmarshal(raw, &res) != nil {
 		return raw
 	}
-	res["next_cursor"], _ = json.Marshal(encodeSearchCursor(next, fp))
+	res["next_cursor"], _ = json.Marshal(encodeSearchCursor(next, ranking))
 	b, err := json.Marshal(res)
 	if err != nil {
 		return raw
