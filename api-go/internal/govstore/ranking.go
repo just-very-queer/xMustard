@@ -15,11 +15,13 @@ const (
 	RankExpired    = "expired"    // promoted and active, past its expiry
 )
 
-// rankStateCases classify an entry into its rank state, in order; ?1 is now. An entry
-// matching none (rejected, retracted, merged, archived, purged) is never ranked.
+// rankStateCases classify an entry into its rank state; ?1 is now. The conditions
+// exclude each other, so a view ORs the ones it reads instead of evaluating the CASE
+// per row. An entry matching none (rejected, retracted, merged, archived, purged) is
+// never ranked.
 var rankStateCases = []struct{ state, when string }{
 	{RankServed, `e.promoted = 1 AND e.lifecycle = 'active' AND (e.expires_at IS NULL OR e.expires_at > ?1)`},
-	{RankExpired, `e.promoted = 1 AND e.lifecycle = 'active'`},
+	{RankExpired, `e.promoted = 1 AND e.lifecycle = 'active' AND e.expires_at <= ?1`},
 	{RankPending, `e.promoted = 0 AND e.status = 'pending' AND e.lifecycle = 'active' AND (e.expires_at IS NULL OR e.expires_at > ?1)`},
 	{RankSuperseded, `e.lifecycle = 'superseded'`},
 }
@@ -44,15 +46,17 @@ type RankEntry struct {
 	VerificationMode string
 	UpdatedAt        string
 	ContentDigest    string
-	SearchTokens     []string
 	// State is the rank state (RankServed, RankPending, ...).
-	State                 string
-	Status                string
-	Kind                  string
-	Topic                 string
-	Tier                  string
-	Tags                  []string
-	Author                string
+	State  string
+	Status string
+	Kind   string
+	Topic  string
+	Tier   string
+	Tags   []string
+	Author string
+	// AuthorOwner is the owner recorded for the author at write time ("" for writes
+	// that recorded none).
+	AuthorOwner           string
 	RequiredVerifications int
 	SupersededBy          string
 	// Approvals counts distinct principals approving the served revision in the
@@ -105,21 +109,22 @@ func (r *reader) Ranking(ctx context.Context, q RankQuery) ([]RankEntry, error) 
 	if len(states) == 0 {
 		states = []string{RankServed}
 	}
-	// the states are spliced into SQL, so only the fixed labels pass
-	quoted := make([]string, len(states))
+	// the conditions are spliced into SQL, so only the fixed states pass
+	whens := make([]string, len(states))
 	for i, s := range states {
-		if !validRankState(s) {
+		when, ok := rankStateWhen(s)
+		if !ok {
 			return nil, fmt.Errorf("%w: rank state %q", ErrInvalid, s)
 		}
-		quoted[i] = "'" + s + "'"
+		whens[i] = "(" + when + ")"
 	}
 	// ?1 now, ?2 workspace, ?3 caller key, ?4 open-mode identity. SQLite counts the
 	// parameters up to the highest index a statement uses, so each query passes a
 	// prefix: where, the outcome and the anchor queries use ?1 and ?2 only.
-	where := `e.workspace_id = ?2 AND (` + rankStateExpr + `) IN (` + strings.Join(quoted, ", ") + `)`
+	where := `e.workspace_id = ?2 AND (` + strings.Join(whens, " OR ") + `)`
 	args := []any{r.nowText(), q.WorkspaceID, principalKey(q.Caller), OpenModeIdentity}
-	rows, err := r.query(ctx, `SELECT e.id, e.title, e.verification_mode, e.updated_at, e.content_digest, e.search_tokens,
-		`+rankStateExpr+`, e.status, e.kind, e.topic, e.tier, e.tags, e.source, e.required_verifications,
+	rows, err := r.query(ctx, `SELECT e.id, e.title, e.verification_mode, e.updated_at, e.content_digest,
+		`+rankStateExpr+`, e.status, e.kind, e.topic, e.tier, e.tags, e.source, e.source_owner, e.required_verifications,
 		coalesce(e.superseded_by, ''), e.source_key = ?3 AND ?3 <> ''
 		FROM entries e WHERE `+where+` ORDER BY e.pk`, args[:3]...)
 	if err != nil {
@@ -128,17 +133,14 @@ func (r *reader) Ranking(ctx context.Context, q RankQuery) ([]RankEntry, error) 
 	var out []RankEntry
 	index := map[string]int{}
 	var e RankEntry
-	var tokens, tags string
+	var tags string
 	err = eachRow(rows, func() {
 		index[e.ID] = len(out)
 		out = append(out, e)
 	}, func() error {
 		e = RankEntry{}
-		if err := rows.Scan(&e.ID, &e.Title, &e.VerificationMode, &e.UpdatedAt, &e.ContentDigest, &tokens, &e.State,
-			&e.Status, &e.Kind, &e.Topic, &e.Tier, &tags, &e.Author, &e.RequiredVerifications, &e.SupersededBy, &e.ByCaller); err != nil {
-			return err
-		}
-		if err := decodeJSONColumn(tokens, &e.SearchTokens); err != nil {
+		if err := rows.Scan(&e.ID, &e.Title, &e.VerificationMode, &e.UpdatedAt, &e.ContentDigest, &e.State,
+			&e.Status, &e.Kind, &e.Topic, &e.Tier, &tags, &e.Author, &e.AuthorOwner, &e.RequiredVerifications, &e.SupersededBy, &e.ByCaller); err != nil {
 			return err
 		}
 		return decodeJSONColumn(tags, &e.Tags)
@@ -202,13 +204,14 @@ func (r *reader) Ranking(ctx context.Context, q RankQuery) ([]RankEntry, error) 
 	return out, nil
 }
 
-func validRankState(s string) bool {
+// rankStateWhen is the condition that selects state, or false for an unknown state.
+func rankStateWhen(state string) (string, bool) {
 	for _, c := range rankStateCases {
-		if c.state == s {
-			return true
+		if c.state == state {
+			return c.when, true
 		}
 	}
-	return false
+	return "", false
 }
 
 // eachRow scans every row and hands it to use, then closes. A failed step is reported

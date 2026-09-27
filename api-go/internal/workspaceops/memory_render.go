@@ -1,6 +1,8 @@
 package workspaceops
 
 import (
+	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -9,6 +11,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"unicode/utf8"
 
 	"xmustard/api-go/internal/govstore"
@@ -18,11 +21,13 @@ import (
 // minus what this session was already shown, rendered in full, compact or names-only
 // form, and fitted to max_chars with what was cut reported.
 
-// recallPage is the ranked, drift-checked candidate window of one recall and the page
-// of it the request asked for.
+// recallPage is the ranked, drift-checked candidate window of one recall (positions
+// span.lo to span.hi of the ranking) and the page of it the request asked for.
 type recallPage struct {
-	candidates           []scoredEntry
-	offset, limit, total int
+	candidates   []scoredEntry
+	span         recallSpan
+	cursor       recallCursor
+	limit, total int
 }
 
 // RecallLine is the compact render of an entry: one line of its text; fetch the full
@@ -53,8 +58,9 @@ type RecallName struct {
 const compactTextChars = 160
 
 // recallRender renders the returned entries. cut says the budget may shorten the last
-// entry's content instead of dropping it; delivers says the render shows the content,
-// so the entries count as shown to the session.
+// entry's content instead of dropping it; delivers says the render shows the whole
+// content, so the entries count as shown to the session (a compact line or a name does
+// not: a later full recall still returns the entry).
 type recallRender struct {
 	list     func([]ContextEntry) any
 	cut      bool
@@ -63,7 +69,7 @@ type recallRender struct {
 
 var recallRenders = map[string]recallRender{
 	"full":    {list: func(es []ContextEntry) any { return es }, cut: true, delivers: true},
-	"compact": {list: func(es []ContextEntry) any { return mapRows(es, compactRow) }, delivers: true},
+	"compact": {list: func(es []ContextEntry) any { return mapRows(es, compactRow) }},
 	"names":   {list: func(es []ContextEntry) any { return mapRows(es, nameRow) }},
 }
 
@@ -132,17 +138,20 @@ func finishRecall(workspaceID string, req RecallRequest, res map[string]any, pag
 	seenKey := recallSeenKey(workspaceID, req.Caller, req.SessionID)
 	shown := recallSeen.shown(seenKey)
 	var picked []ContextEntry
-	var at []int                  // candidate index of each picked entry
+	var at []int                  // ranking position of each picked entry
 	prints := map[string]string{} // seen-print of each picked entry
-	alreadyShown, next := 0, page.offset
-	for i := page.offset; i < len(page.candidates) && len(picked) < page.limit; i++ {
-		next = i + 1
-		c := page.candidates[i]
+	alreadyShown, next := 0, page.span.offset
+	for pos := page.span.offset; pos < page.span.end && len(picked) < page.limit; pos++ {
+		next = pos + 1
+		c := page.candidates[pos-page.span.lo]
+		if c.withheld {
+			continue
+		}
 		if fp, ok := shown[c.rank.ID]; ok && fp == c.seenPrint() {
 			alreadyShown++
 			continue
 		}
-		picked, at = append(picked, c.label(req.Explain)), append(at, i)
+		picked, at = append(picked, c.label(req.Explain)), append(at, pos)
 		prints[c.rank.ID] = c.seenPrint()
 	}
 	render := recallRenders[req.renderName()]
@@ -162,7 +171,7 @@ func finishRecall(workspaceID string, req RecallRequest, res map[string]any, pag
 		res["omitted"] = max(page.total-resume, 0)
 		delete(res, "next_cursor")
 		if resume < page.total {
-			res["next_cursor"] = encodeRecallCursor(resume, req.fingerprint())
+			res["next_cursor"] = req.encodeCursor(recallCursor{offset: resume, block: page.cursor.block})
 		}
 		b, _ := json.Marshal(res)
 		return len(b)
@@ -249,42 +258,69 @@ func countStale(es []ContextEntry) int {
 	return n
 }
 
-// fingerprint names the ranking a cursor pages: every argument that orders or filters
-// it. The page size, render, budget and session may change between pages.
-func (r RecallRequest) fingerprint() string {
+// A recall cursor continues a ranking at an offset. It is signed with a key held by
+// this process only, over the offset, the block size and every argument that orders
+// or filters the ranking, so a client can neither edit the offset nor reuse a cursor
+// for another query or caller; a cursor stops being valid when the API restarts.
+type recallCursor struct {
+	offset int
+	// block is the stale-penalty block size the first page fixed (0 before it).
+	block int
+}
+
+// recallCursorKey is the process's cursor-signing key.
+var recallCursorKey = sync.OnceValue(func() []byte {
+	k := make([]byte, 32)
+	rand.Read(k) // crypto/rand never fails on supported platforms
+	return k
+})
+
+// rankingKey names the ranking a cursor pages: every argument that orders or filters
+// it, the caller included. The page size, render, budget and session may change
+// between pages.
+func (r RecallRequest) rankingKey() []byte {
 	r.Cursor, r.Limit, r.NamesOnly, r.Render, r.MaxChars, r.SessionID, r.Explain = "", 0, false, "", 0, "", false
 	b, _ := json.Marshal(r)
-	sum := sha256.Sum256(b)
-	return hex.EncodeToString(sum[:6])
+	return b
 }
 
-func encodeRecallCursor(offset int, fp string) string {
-	return base64.RawURLEncoding.EncodeToString([]byte("r1." + strconv.Itoa(offset) + "." + fp))
+func (r RecallRequest) cursorMAC(c recallCursor) string {
+	m := hmac.New(sha256.New, recallCursorKey())
+	fmt.Fprintf(m, "r2|%d|%d|", c.offset, c.block)
+	m.Write(r.rankingKey())
+	return hex.EncodeToString(m.Sum(nil)[:16])
 }
 
-// cursorOffset reads a cursor's offset without checking which query it belongs to.
-func cursorOffset(c string) (int, string) {
-	raw, err := base64.RawURLEncoding.DecodeString(c)
+func (r RecallRequest) encodeCursor(c recallCursor) string {
+	return base64.RawURLEncoding.EncodeToString(fmt.Appendf(nil, "r2.%d.%d.%s", c.offset, c.block, r.cursorMAC(c)))
+}
+
+// decodeCursor returns where the request's cursor continues; no cursor starts at 0. A
+// cursor that is malformed, edited, or from another query or caller is rejected.
+func (r RecallRequest) decodeCursor() (recallCursor, error) {
+	if r.Cursor == "" {
+		return recallCursor{}, nil
+	}
+	bad := fmt.Errorf("cursor is not a next_cursor of this query: %w", ErrInvalidInput)
+	raw, err := base64.RawURLEncoding.DecodeString(r.Cursor)
+	if err != nil {
+		return recallCursor{}, bad
+	}
 	parts := strings.Split(string(raw), ".")
-	if err != nil || len(parts) != 3 || parts[0] != "r1" {
-		return -1, ""
+	if len(parts) != 4 || parts[0] != "r2" {
+		return recallCursor{}, bad
 	}
-	n, err := strconv.Atoi(parts[1])
-	if err != nil || n < 0 {
-		return -1, ""
+	offset, errOffset := strconv.Atoi(parts[1])
+	block, errBlock := strconv.Atoi(parts[2])
+	if errOffset != nil || errBlock != nil {
+		return recallCursor{}, bad
 	}
-	return n, parts[2]
-}
-
-// decodeRecallCursor returns the offset a cursor continues from; "" starts at 0. A
-// cursor from another query is rejected: its offset would page a different ranking.
-func decodeRecallCursor(c, fp string) (int, error) {
-	if c == "" {
-		return 0, nil
+	c := recallCursor{offset: offset, block: block}
+	if !hmac.Equal([]byte(parts[3]), []byte(r.cursorMAC(c))) {
+		return recallCursor{}, bad
 	}
-	n, got := cursorOffset(c)
-	if n < 0 || got != fp {
-		return 0, fmt.Errorf("cursor is not a next_cursor of this query: %w", ErrInvalidInput)
+	if c.offset < 0 || c.block < 1 {
+		return recallCursor{}, bad
 	}
-	return n, nil
+	return c, nil
 }

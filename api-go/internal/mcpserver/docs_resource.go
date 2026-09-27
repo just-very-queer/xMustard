@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -94,11 +95,40 @@ func argShape(a Arg) string {
 	return shape
 }
 
+// MemoryIndexURI is the promoted-title index of the session's workspace (PAR-RCL-05):
+// the instructions point to it, since they are static and cannot carry the titles.
+const MemoryIndexURI = "xmustard://memory/index"
+
 func docsList() []map[string]any {
 	return []map[string]any{{
 		"uri": DocsURI, "name": "xMustard tool arguments not in tools/list", "mimeType": "text/markdown",
 		"description": "Arguments tools/call accepts beyond the listed schema (ground sections and max_chars), ground's output-budget contract, and hidden aliases.",
+	}, {
+		"uri": MemoryIndexURI, "name": "xMustard promoted memory titles", "mimeType": "application/json",
+		"description": "recall(names_only=true) over promoted memory of the session's workspace: id, title, topic, state, stale and paths, " +
+			"best first; next_cursor continues it through recall. Fetch an entry with recall(entry_id).",
 	}}
+}
+
+// memoryIndex reads the promoted-title index: recall with names_only at the largest
+// page and output budget, for the workspace a tool call naming none would use. The
+// API applies the caller's role gates as for the tool.
+func (s *Session) memoryIndex(ctx context.Context) (any, *RPCError) {
+	res, rerr := s.RunTool(ctx, recallTool, map[string]string{
+		"names_only": "true", "limit": strconv.Itoa(maxRecallLimit), "max_chars": strconv.Itoa(recallMaxMaxChars),
+	}, nil)
+	if rerr != nil {
+		return nil, rerr
+	}
+	var text string
+	if content, _ := res["content"].([]map[string]any); len(content) > 0 {
+		text, _ = content[0]["text"].(string)
+	}
+	if isErr, _ := res["isError"].(bool); isErr {
+		return nil, &RPCError{Code: CodeInternal, Message: text, Data: map[string]any{"uri": MemoryIndexURI}}
+	}
+	return map[string]any{"contents": []map[string]any{{"uri": MemoryIndexURI, "mimeType": "application/json", "text": text}},
+		"_meta": res["_meta"]}, nil
 }
 
 // resourcesList lists the docs resources, then the provider's.
@@ -136,6 +166,9 @@ func (s *Session) readResource(ctx context.Context, params json.RawMessage) (any
 				Data: map[string]any{"uri": p.URI, "reason": "unknown_doc", "available": []string{DocsURI}}}
 		}
 		return map[string]any{"contents": []map[string]any{{"uri": DocsURI, "mimeType": "text/markdown", "text": toolsDoc()}}}, nil
+	}
+	if p.URI == MemoryIndexURI {
+		return s.memoryIndex(ctx)
 	}
 	if r := s.srv.opts.Resources; r != nil {
 		return r.Read(ctx, params)

@@ -329,8 +329,9 @@ func parseRecallTime(s string) (string, error) {
 // storeTimeLayout is govstore's canonical time text: fixed width, so it orders as text.
 const storeTimeLayout = "2006-01-02T15:04:05.000000000Z"
 
-// filters are the request's entry predicates, one per given field.
-func (r RecallRequest) filters() []func(govstore.RankEntry) bool {
+// filters are the request's entry predicates, one per given field. awaits decides
+// awaiting_me (see awaitingCaller).
+func (r RecallRequest) filters(awaits func(govstore.RankEntry) bool) []func(govstore.RankEntry) bool {
 	var out []func(govstore.RankEntry) bool
 	add := func(given bool, f func(govstore.RankEntry) bool) {
 		if given {
@@ -352,8 +353,34 @@ func (r RecallRequest) filters() []func(govstore.RankEntry) bool {
 	add(r.By != "", func(e govstore.RankEntry) bool {
 		return strings.EqualFold(strings.TrimSpace(e.Author), strings.TrimSpace(r.By))
 	})
-	add(r.Status == "awaiting_me", func(e govstore.RankEntry) bool { return !e.ByCaller && !e.VotedByCaller })
+	add(r.Status == "awaiting_me", awaits)
 	return out
+}
+
+// awaitingCaller reports whether a pending entry awaits caller's verdict: caller
+// neither wrote it nor voted on its revision and, under the owner-distinct policy on a
+// peer-gated entry, it was not written under caller's owner either (RecordVote would
+// refuse that vote with ErrSameOwner). An edit by a same-owner principal, or a sibling
+// token's earlier vote, is refused only when the vote is cast.
+func awaitingCaller(dataDir, caller string) func(govstore.RankEntry) bool {
+	fresh := func(e govstore.RankEntry) bool { return !e.ByCaller && !e.VotedByCaller }
+	if principalDistinctness(dataDir) != DistinctOwner {
+		return fresh
+	}
+	owners := map[string]string{} // principal -> token-store owner, read once each
+	ownerOf := func(recorded, principal string) string {
+		if o := strings.TrimSpace(recorded); o != "" {
+			return o
+		}
+		if _, ok := owners[principal]; !ok {
+			owners[principal] = PrincipalOwner(dataDir, principal)
+		}
+		return owners[principal]
+	}
+	mine := ownerOf("", caller)
+	return func(e govstore.RankEntry) bool {
+		return fresh(e) && (e.RequiredVerifications <= 1 || !sameOwner(ownerOf(e.AuthorOwner, e.Author), mine))
+	}
 }
 
 // RecallWith runs one recall. Content is bound to the exact revision whose metadata was
@@ -372,7 +399,7 @@ func RecallWith(ctx context.Context, dataDir, workspaceID string, req RecallRequ
 	for attempt := 1; attempt <= recallConsistencyAttempts; attempt++ {
 		var mismatched int
 		var err error
-		res, page, mismatched, err = recallOnce(ctx, dataDir, workspaceID, req, attempt == recallConsistencyAttempts)
+		res, page, mismatched, err = recallOnce(ctx, dataDir, workspaceID, req)
 		if err != nil {
 			return nil, err
 		}
@@ -393,6 +420,8 @@ type scoredEntry struct {
 	entry   ContextEntry
 	rank    govstore.RankEntry
 	details ScoreDetails
+	// withheld: the entry changed between ranking and loading, so it is not returned.
+	withheld bool
 }
 
 // sortByScore orders by score, then the newest first, then by id: a total order, so
@@ -449,29 +478,37 @@ func rankRecall(ctx context.Context, dataDir, workspaceID string, req RecallRequ
 	if !explicit {
 		focus = recallChangedFiles(ctx, dataDir, workspaceID)
 	}
-	sig := newRecallSignals(ranking, bm25, focus)
 	hasSignal := explicit && (len(qtokens) > 0 || len(focus) > 0)
-	filters := req.filters()
-	out := recallRanking{hasSignal: hasSignal, read: len(ranking), ranked: make([]scoredEntry, 0, len(ranking))}
-	for _, e := range ranking {
-		if !slices.ContainsFunc(filters, func(keep func(govstore.RankEntry) bool) bool { return !keep(e) }) {
-			d := sig.score(e)
-			// explicit query/paths gate relevance: irrelevant memory is dropped.
-			// Implicit working-change focus only adds to the score.
-			if hasSignal && d.relevance() < minRelevance {
-				continue
-			}
-			out.ranked = append(out.ranked, scoredEntry{ContextEntry{ID: e.ID, UpdatedAt: e.UpdatedAt, ContentDigest: e.ContentDigest}, e, d})
+	var awaits func(govstore.RankEntry) bool
+	if req.Status == "awaiting_me" {
+		awaits = awaitingCaller(dataDir, req.Caller)
+	}
+	filters := req.filters(awaits)
+	read := len(ranking)
+	// the signals are scaled over what the caller can see: an entry in another state,
+	// or filtered out, never sets the bm25 scale or the recency origin
+	visible := slices.DeleteFunc(ranking, func(e govstore.RankEntry) bool {
+		return slices.ContainsFunc(filters, func(keep func(govstore.RankEntry) bool) bool { return !keep(e) })
+	})
+	sig := newRecallSignals(visible, bm25, focus)
+	out := recallRanking{hasSignal: hasSignal, read: read, ranked: make([]scoredEntry, 0, len(visible))}
+	for _, e := range visible {
+		d := sig.score(e)
+		// explicit query/paths gate relevance: irrelevant memory is dropped.
+		// Implicit working-change focus only adds to the score.
+		if hasSignal && d.relevance() < minRelevance {
+			continue
 		}
+		out.ranked = append(out.ranked, scoredEntry{entry: ContextEntry{ID: e.ID, UpdatedAt: e.UpdatedAt, ContentDigest: e.ContentDigest}, rank: e, details: d})
 	}
 	sortByScore(out.ranked)
 	return out, nil
 }
 
 // recallOnce is one ranked-recall pass. It reports how many candidates changed between
-// ranking and loading (their revision or rank state moved); when withhold is set those
-// entries are removed from the result instead of being returned.
-func recallOnce(ctx context.Context, dataDir, workspaceID string, req RecallRequest, withhold bool) (map[string]any, recallPage, int, error) {
+// ranking and loading (their revision or rank state moved); those are flagged withheld
+// and never returned, and the caller retries while it has attempts left.
+func recallOnce(ctx context.Context, dataDir, workspaceID string, req RecallRequest) (map[string]any, recallPage, int, error) {
 	// metadata-first: rank on the lean ranking view (no content, no vote rows), so
 	// recall's reads and allocation don't scale with content size; full state and
 	// content are loaded only for the bounded candidate window below (XM-PRO-010).
@@ -483,30 +520,38 @@ func recallOnce(ctx context.Context, dataDir, workspaceID string, req RecallRequ
 	if limit <= 0 {
 		limit = defaultRecallLimit
 	}
-	offset, err := decodeRecallCursor(req.Cursor, req.fingerprint())
+	cur, err := req.decodeCursor()
 	if err != nil {
 		return nil, recallPage{}, 0, err
 	}
-	// Take a BOUNDED candidate window — only these are loaded and drift-checked, so
-	// recall I/O is O(window), not O(history). The window is a few × (offset+limit) so
-	// the stale penalty can still re-order without missing a result.
-	window := rk.ranked[:min(len(rk.ranked), recallCandidateWindow(offset+limit))]
-	candidates := slices.Clone(window)
+	if cur.offset > len(rk.ranked) {
+		return nil, recallPage{}, 0, fmt.Errorf("cursor offset %d is past the %d ranked entries (memory changed since that page); recall again without cursor: %w",
+			cur.offset, len(rk.ranked), ErrInvalidInput)
+	}
+	if cur.block == 0 {
+		cur.block = recallCandidateWindow(limit) // the first page fixes the block size for every later page
+	}
+	// Load a BOUNDED window: the whole blocks the page may scan, so recall I/O is
+	// O(block + limit) whatever the offset or history size.
+	span := pageSpan(cur, limit, len(rk.ranked))
+	candidates := slices.Clone(rk.ranked[span.lo:span.hi])
 	if recallBeforeContentLoad != nil {
 		recallBeforeContentLoad()
 	}
-	candidates, mismatched, err := loadCandidates(ctx, dataDir, workspaceID, candidates, withhold)
+	mismatched, err := loadCandidates(ctx, dataDir, workspaceID, candidates)
 	if err != nil {
 		return nil, recallPage{}, 0, err
 	}
-	// drift-check ONLY the candidate window; apply the stale penalty, then re-rank.
+	// drift-check ONLY the window; apply the stale penalty, then re-rank each block.
 	root := contextRoot(dataDir, workspaceID)
 	for i := range candidates {
 		c := &candidates[i]
 		computeStaleness(root, &c.entry)
 		c.details.stale(c.entry.StalePaths)
 	}
-	sortByScore(candidates)
+	for i := 0; i < len(candidates); i += cur.block {
+		sortByScore(candidates[i:min(len(candidates), i+cur.block)])
+	}
 
 	requireMulti, threshold := contextDefaults(dataDir)
 	return map[string]any{
@@ -523,17 +568,35 @@ func recallOnce(ctx context.Context, dataDir, workspaceID string, req RecallRequ
 		"total_matches":          len(rk.ranked),
 		"drift_checked":          len(candidates), // every returned entry is in this set (checked)
 		"generated_at":           nowUTC(),
-	}, recallPage{candidates: candidates, offset: offset, limit: limit, total: len(rk.ranked)}, mismatched, nil
+	}, recallPage{candidates: candidates, span: span, cursor: cur, limit: limit, total: len(rk.ranked)}, mismatched, nil
+}
+
+// recallSpan is the part of a ranking one page reads: it loads [lo, hi) and scans
+// positions [offset, end) for the page's entries.
+type recallSpan struct{ lo, hi, offset, end int }
+
+// pageSpan covers the positions a page scans (limit entries, with room to skip what
+// the session was already shown) with whole blocks. The stale penalty re-orders an
+// entry only within its block, so every block is loaded whole and the order of the
+// ranking does not depend on which page reads it: pages never repeat or skip an entry.
+func pageSpan(cur recallCursor, limit, total int) recallSpan {
+	if cur.offset >= total {
+		return recallSpan{lo: total, hi: total, offset: total, end: total}
+	}
+	end := min(total, cur.offset+max(cur.block, recallCandidateWindow(limit)))
+	return recallSpan{
+		lo: cur.offset / cur.block * cur.block, hi: min(total, (end+cur.block-1)/cur.block*cur.block),
+		offset: cur.offset, end: end,
+	}
 }
 
 // loadCandidates replaces each ranked candidate with its full state and content, read
 // in one snapshot. Content is bound to the revision the candidate was ranked with: a
-// candidate that left its rank state, or now carries another revision, is mismatched.
-// A mismatched candidate is dropped when withhold is set; otherwise it stays in the
-// ranking without content, and the caller retries against the new state.
-func loadCandidates(ctx context.Context, dataDir, workspaceID string, candidates []scoredEntry, withhold bool) ([]scoredEntry, int, error) {
+// candidate that left its rank state, or now carries another revision, is mismatched,
+// flagged withheld and left without content. It returns how many were mismatched.
+func loadCandidates(ctx context.Context, dataDir, workspaceID string, candidates []scoredEntry) (int, error) {
 	if len(candidates) == 0 {
-		return candidates, 0, nil
+		return 0, nil
 	}
 	loaded := map[string]ContextEntry{}
 	err := memoryView(ctx, dataDir, workspaceID, func(r govstore.Reader) error {
@@ -564,22 +627,20 @@ func loadCandidates(ctx context.Context, dataDir, workspaceID string, candidates
 		return err
 	})
 	if err != nil {
-		return nil, 0, err
+		return 0, err
 	}
-	kept, mismatched := candidates[:0], 0
-	for _, c := range candidates {
+	mismatched := 0
+	for i := range candidates {
+		c := &candidates[i]
 		e, ok := loaded[c.entry.ID]
 		if !ok {
 			mismatched++
-			if withhold {
-				continue
-			}
-			e = c.entry
+			c.withheld = true
+			continue
 		}
 		c.entry = e
-		kept = append(kept, c)
 	}
-	return kept, mismatched, nil
+	return mismatched, nil
 }
 
 // stalenessChecks counts drift checks that hash referenced files — a test hook for

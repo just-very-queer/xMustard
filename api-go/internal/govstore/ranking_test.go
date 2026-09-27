@@ -101,8 +101,18 @@ func TestSetRequiredVerificationsKeepsInvariant(t *testing.T) {
 // twin (Entry.RankState) computes, flags the caller's authorship and votes, and counts
 // outcomes on the served revision; MemoryScores ranks with IDF across states.
 func TestRankingStatesCallerFlagsAndOutcomes(t *testing.T) {
-	s := openTestStore(t, newClock())
+	clk := newClock()
+	s := openTestStore(t, clk)
 	ctx := context.Background()
+	mustUpdate(t, s, func(tx Tx) error {
+		_, err := tx.InsertEntry(ctx, NewEntry{ID: "x1", WorkspaceID: "ws1", Title: "expiring", Content: "expiring body",
+			ExpiresAt: canonTime(clk.Now().Add(time.Hour))}, alice)
+		return err
+	})
+	vote(t, s, "x1", bob, VerdictApprove)
+	vote(t, s, "x1", carol, VerdictApprove)
+	promotePeer(t, s, "x1")
+	clk.Advance(2 * time.Hour)
 	propose(t, s, "p1", "pending", "queue body")
 	propose(t, s, "p2", "pending two", "queue body rare")
 	vote(t, s, "p2", bob, VerdictApprove)
@@ -128,6 +138,10 @@ func TestRankingStatesCallerFlagsAndOutcomes(t *testing.T) {
 		if err != nil || full.RankState(time.Now()) != e.State {
 			t.Fatalf("%s: SQL state %q, Go twin %q (%v)", e.ID, e.State, full.RankState(time.Now()), err)
 		}
+	}
+	if expired, err := s.Ranking(ctx, RankQuery{WorkspaceID: "ws1", States: []string{RankServed, RankExpired, RankSuperseded}}); err != nil ||
+		len(expired) != 2 || expired[0].ID != "x1" || expired[0].State != RankExpired || expired[1].ID != "v1" {
+		t.Fatalf("expired view = %+v %v", expired, err)
 	}
 	p1, p2, v1 := byID["p1"], byID["p2"], byID["v1"]
 	if len(got) != 3 || p1.State != RankPending || v1.State != RankServed || p1.VotedByCaller || !p2.VotedByCaller ||

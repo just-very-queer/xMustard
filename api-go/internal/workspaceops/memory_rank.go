@@ -14,12 +14,13 @@ import (
 // reasons behind each non-zero signal.
 //
 //   - bm25: FTS5 BM25 over title, body and anchors (porter-stemmed, IDF-weighted),
-//     scaled so the best match in the view scores bm25Weight.
+//     scaled so the best match the caller can see (after states and filters) scores
+//     bm25Weight.
 //   - path: each declared path that is a focus path (the query paths, else the files
 //     being worked on). anchor: each declared path under a focus directory, or a
 //     declared directory holding a focus path.
 //   - trust: the verification mode, the approvals, and the rank state.
-//   - recency: decays with age behind the newest entry in the view.
+//   - recency: decays with age behind the newest entry the caller can see.
 //   - feedback: the helpful, misleading and stale_harm outcomes on the served revision.
 //   - stale_penalty: the entry's files drifted since it was verified (candidate window).
 const (
@@ -98,13 +99,11 @@ type recallSignals struct {
 
 func newRecallSignals(view []govstore.RankEntry, bm25 map[string]float64, focus []string) recallSignals {
 	s := recallSignals{bm25: bm25, focus: map[string]bool{}}
-	for _, v := range bm25 {
-		s.bestBM25 = math.Max(s.bestBM25, v)
-	}
 	for _, p := range focus {
 		s.focus[p] = true
 	}
 	for _, e := range view {
+		s.bestBM25 = math.Max(s.bestBM25, bm25[e.ID])
 		if t, ok := storeTime(e.UpdatedAt); ok && t.After(s.newest) {
 			s.newest = t
 		}

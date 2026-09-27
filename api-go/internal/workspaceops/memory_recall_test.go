@@ -1,10 +1,16 @@
 package workspaceops
 
 import (
+	"cmp"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"math"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -196,6 +202,48 @@ func TestRecallVerificationQueue(t *testing.T) {
 	}
 }
 
+// The bm25 signal is scaled over the entries the caller can see: a pending entry that
+// matches better does not shrink a served entry's score or name itself in the reasons.
+func TestRecallBM25ScaleIgnoresInvisibleEntries(t *testing.T) {
+	dir, ws := multiAgentDir(t), "wsScale"
+	served := promoted(t, dir, ws, "author", "the cache is warmed at boot")
+	propose(t, dir, ws, "author", "cache", "cache cache cache: the cache cache")
+	got := entriesOf(recallWith(t, dir, ws, RecallRequest{Query: "cache", Explain: true}))
+	if len(got) != 1 || got[0].ID != served.ID || got[0].ScoreDetails.BM25 != bm25Weight ||
+		!slices.Contains(got[0].ScoreDetails.Reasons, "text match 100% of the best") {
+		t.Fatalf("served entry scaled against an invisible one: %+v", got[0].ScoreDetails)
+	}
+}
+
+// Under the owner-distinct policy a sibling token of the author's owner cannot verify
+// the entry, so neither awaiting_me nor ground's pending_for_you offers it; a token
+// of another owner still sees it, and the token policy offers it to the sibling.
+func TestAwaitingMeHonoursTheOwnerDistinctPolicy(t *testing.T) {
+	for _, tc := range []struct {
+		policy  string
+		sibling int
+	}{{DistinctOwner, 0}, {DistinctToken, 1}} {
+		dir, ws := ownerPolicyDir(t, tc.policy), "wsOwnerQueue"
+		for id, owner := range map[string]string{"alice-1": "alice", "alice-2": "alice", "bob": "bob"} {
+			if _, err := MintIdentityToken(dir, id, "agent", 0, nil, TokenIdentity{Owner: owner}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := Remember(dir, ws, RememberRequest{ProposeContextRequest: ProposeContextRequest{Title: "t", Content: "queue text"}},
+			ContextActor{ID: "alice-1", Owner: "alice"}); err != nil {
+			t.Fatal(err)
+		}
+		for caller, want := range map[string]int{"alice-2": tc.sibling, "bob": 1, "alice-1": 0} {
+			got := ids(recallWith(t, dir, ws, RecallRequest{Status: "awaiting_me", Caller: caller}))
+			var g groundingMemory
+			g.build(dir, ws, caller)
+			if len(got) != want || *g.PendingForYou != want {
+				t.Fatalf("%s policy, %s: awaiting_me %v, pending_for_you %d, want %d", tc.policy, caller, got, *g.PendingForYou, want)
+			}
+		}
+	}
+}
+
 // kind, tags, topic, path_prefix, since/until and by combine with AND, lists with OR.
 func TestRecallFilters(t *testing.T) {
 	dir, ws := singleAgentDir(t), "wsFilters"
@@ -248,15 +296,16 @@ func equalIDs(a, b []string) bool {
 }
 
 // Pages concatenate to the one-shot ranking with no repeats, next_cursor and omitted
-// describe what is left, and a cursor from another query is rejected.
+// describe what is left, and a cursor from another query or caller, an edited one and
+// one past the end of a shrunken ranking are rejected.
 func TestRecallCursorIsStableAcrossPages(t *testing.T) {
 	dir, ws := t.TempDir(), "wsPages"
-	seedPromoted(t, dir, ws, 11)
+	seeded := seedPromoted(t, dir, ws, 11)
 	all := ids(recallWith(t, dir, ws, RecallRequest{Limit: 11}))
 	var paged []string
-	cursor := ""
+	cursor, first := "", ""
 	for page := 0; page < 6; page++ {
-		res := recallWith(t, dir, ws, RecallRequest{Limit: 4, Cursor: cursor})
+		res := recallWith(t, dir, ws, RecallRequest{Limit: 4, Cursor: cursor, Caller: "me"})
 		paged = append(paged, ids(res)...)
 		if res["omitted"] != 11-len(paged) {
 			t.Fatalf("page %d omitted=%v after %d returned", page, res["omitted"], len(paged))
@@ -266,12 +315,101 @@ func TestRecallCursorIsStableAcrossPages(t *testing.T) {
 			break
 		}
 		cursor = next
+		first = cmp.Or(first, next)
 	}
 	if !equalIDs(paged, all) {
 		t.Fatalf("pages %v != one-shot %v", paged, all)
 	}
-	if _, err := RecallWith(context.Background(), dir, ws, RecallRequest{Query: "entry", Cursor: cursor}); !IsInvalidInput(err) {
-		t.Fatalf("foreign cursor: %v", err)
+	raw, _ := base64.RawURLEncoding.DecodeString(first)
+	parts := strings.Split(string(raw), ".")
+	parts[1] = "1000000"
+	edited := base64.RawURLEncoding.EncodeToString([]byte(strings.Join(parts, ".")))
+	for name, bad := range map[string]RecallRequest{
+		"another query":  {Query: "entry", Cursor: first, Caller: "me"},
+		"another caller": {Cursor: first, Caller: "you"},
+		"edited offset":  {Cursor: edited, Caller: "me"},
+		"not a cursor":   {Cursor: "r2.4.16.00", Caller: "me"},
+	} {
+		if _, err := RecallWith(context.Background(), dir, ws, bad); !IsInvalidInput(err) {
+			t.Fatalf("%s: %v", name, err)
+		}
+	}
+	// the page-2 cursor points at offset 4; retire 8 of 11 and the ranking ends at 3
+	for _, e := range seeded[:8] {
+		if _, err := RetireContext(dir, ws, e.ID, "shrink", ContextActor{Admin: true}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := RecallWith(context.Background(), dir, ws, RecallRequest{Limit: 4, Cursor: first, Caller: "me"}); !IsInvalidInput(err) ||
+		!strings.Contains(err.Error(), "past the 3 ranked entries") {
+		t.Fatalf("out-of-range cursor: %v", err)
+	}
+}
+
+// With stale entries the stale penalty re-orders each block of the ranking, and every
+// page reads whole blocks: pages never repeat or skip an entry, even when the page
+// size changes between pages, and a deep page loads a bounded window, not O(offset).
+func TestRecallPagesAreStableWithStaleEntriesAndBounded(t *testing.T) {
+	dir, ws, root := t.TempDir(), "wsStalePages", t.TempDir()
+	writeSnapshotWithRoot(t, dir, ws, root)
+	recallChangedFiles = func(context.Context, string, string) []string { return nil }
+	defer func() { recallChangedFiles = currentChangedFiles }()
+	file := filepath.Join(root, "f.go")
+	if err := os.WriteFile(file, []byte("v1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	const n = 60
+	stale := map[string]bool{}
+	seedPromotedWith(t, dir, ws, n, func(e *ContextEntry) {
+		if e.ID[len(e.ID)-1]%3 == 0 { // ids ending 0, 3, 6 or 9, the newest (e0059) among them
+			e.Paths = []string{"f.go"}
+			e.PathHashes = capturePathHashes(root, e.Paths)
+			stale[e.ID] = true
+		}
+	})
+	if err := os.WriteFile(file, []byte("v2"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]bool{}
+	cursor := ""
+	for page := 0; ; page++ {
+		limit := []int{4, 7, 2}[page%3]
+		res := recallWith(t, dir, ws, RecallRequest{Limit: limit, Cursor: cursor})
+		if dc := res["drift_checked"].(int); dc > 2*recallCandidateWindow(4)+recallCandidateWindow(7) {
+			t.Fatalf("page %d loaded %d entries: the window grows with the offset", page, dc)
+		}
+		for _, e := range entriesOf(res) {
+			if seen[e.ID] {
+				t.Fatalf("page %d repeats %s", page, e.ID)
+			}
+			seen[e.ID] = true
+			if page == 0 && e.Stale {
+				t.Fatalf("the first page returned stale %s over fresh entries of its block", e.ID)
+			}
+		}
+		next, ok := res["next_cursor"].(string)
+		if !ok {
+			break
+		}
+		if cursor = next; page > n {
+			t.Fatal("paging does not end")
+		}
+	}
+	if len(seen) != n {
+		t.Fatalf("pages returned %d of %d entries", len(seen), n)
+	}
+}
+
+// Equal scores order by the newest first, then by id, so the same store renders the
+// same page every time.
+func TestRecallEqualScoresOrderByStableKey(t *testing.T) {
+	dir, ws := t.TempDir(), "wsTies"
+	seedPromotedWith(t, dir, ws, 6, func(e *ContextEntry) { e.CreatedAt, e.UpdatedAt = "2026-06-01T00:00:00Z", "2026-06-01T00:00:00Z" })
+	want := []string{"e0000", "e0001", "e0002", "e0003", "e0004", "e0005"}
+	for range 3 {
+		if got := ids(recallWith(t, dir, ws, RecallRequest{Limit: 6})); !equalIDs(got, want) {
+			t.Fatalf("ties ordered %v, want %v", got, want)
+		}
 	}
 }
 
@@ -318,15 +456,19 @@ func TestRecallMaxCharsIsHonoured(t *testing.T) {
 	}
 }
 
-// A session is not shown the same entry twice until it changes; names_only does not
-// count as shown, and another session or caller is unaffected.
+// A session is not shown the same entry twice until it changes; names_only and compact
+// lines do not count as shown (a later full recall still returns the entry), and
+// another session or caller is unaffected.
 func TestRecallSessionSeenSuppression(t *testing.T) {
 	dir, ws := singleAgentDir(t), "wsSeen"
 	a := propose(t, dir, ws, "a", "a", "the api listens on 8042")
 	b := propose(t, dir, ws, "a", "b", "the api logs to stderr")
 	req := RecallRequest{Query: "api", SessionID: "s1", Caller: "me"}
-	if got := ids(recallWith(t, dir, ws, RecallRequest{Query: "api", SessionID: "s1", Caller: "me", NamesOnly: true})); len(got) != 2 {
-		t.Fatalf("names_only: %v", got)
+	for _, partial := range []RecallRequest{{NamesOnly: true}, {Render: "compact"}, {Render: "compact"}} {
+		partial.Query, partial.SessionID, partial.Caller = req.Query, req.SessionID, req.Caller
+		if got := ids(recallWith(t, dir, ws, partial)); len(got) != 2 {
+			t.Fatalf("%+v: %v", partial, got)
+		}
 	}
 	if got := ids(recallWith(t, dir, ws, req)); len(got) != 2 {
 		t.Fatalf("first recall: %v", got)

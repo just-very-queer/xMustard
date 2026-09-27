@@ -2,6 +2,7 @@ package main
 
 import (
 	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"xmustard/api-go/internal/workspaceops"
@@ -51,4 +52,17 @@ func TestRecallVerificationQueueOverHTTP(t *testing.T) {
 	call("bob", "GET", "/context/active?max_chars=5", "", http.StatusBadRequest)
 	call("bob", "GET", "/context/active?max_chars=x", "", http.StatusBadRequest)
 	call("bob", "GET", "/context/active?status=everything", "", http.StatusBadRequest)
+
+	// XMUSTARD_AUTH=off while tokens exist: the anonymous caller is a reader, so the
+	// unverified reads fail closed (401) and verified recall still works
+	off := httptest.NewServer(bodyLimitMiddleware(newAPIHandler())) // buildHandler skips auth when off
+	t.Cleanup(off.Close)
+	for _, q := range []string{"?status=pending", "?status=awaiting_me", "?include_pending=true", "?entry_id=" + id + "&history=true"} {
+		if code, out := sendJSON(t, "GET", off.URL+"/api/workspaces/wsQueueHTTP/context/active"+q, "", ""); code != http.StatusUnauthorized {
+			t.Fatalf("anonymous %s: want 401, got %d %v", q, code, out)
+		}
+	}
+	if code, out := sendJSON(t, "GET", off.URL+"/api/workspaces/wsQueueHTTP/context/active?query=queue", "", ""); code != http.StatusOK {
+		t.Fatalf("anonymous verified recall: %d %v", code, out)
+	}
 }

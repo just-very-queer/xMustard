@@ -64,9 +64,12 @@ var recallTool = &Tool{
 		"`names_only` returns id, title, topic, state, stale and paths; `render=compact` one line per entry; " +
 		"fetch the full entry with `entry_id`. `max_chars` budgets the whole result (default 4000): entries " +
 		"that do not fit are left out, the last one may come back with content_truncated, and output_budget " +
-		"reports what was cut. `cursor` takes next_cursor to continue; omitted counts the ranked entries after " +
-		"this page. `session_id` leaves out entries this session was already shown until their content, stale " +
-		"flag or state changes (already_shown counts them; the set expires after 30 minutes unused).",
+		"reports what was cut. `cursor` takes next_cursor to continue with the same filters (it is signed: an " +
+		"edited cursor, another query's, or one from before an API restart is rejected); omitted counts the ranked " +
+		"entries after this page. `session_id` leaves out entries this session was already shown until their content, stale " +
+		"flag or state changes (already_shown counts them; the set expires after 30 minutes unused); only a full " +
+		"render counts as shown, not names_only or compact. The promoted-title index is also the resource " +
+		MemoryIndexURI + ".",
 	// Claude Code drops a tool argument named exactly "query", so the advertised name
 	// is q; "query" stays accepted for clients that already send it.
 	Aliases:     map[string]string{"query": "q"},

@@ -23,8 +23,8 @@ type groundingMemory struct {
 	// self_asserted_open_mode, single_agent), so an agent can tell peer-verified
 	// shared memory from self-asserted memory before it relies on recall.
 	MemoryVerificationModes map[string]int `json:"memory_verification_modes"`
-	// PendingForYou counts the pending entries the caller neither authored nor voted
-	// on: what recall(status=awaiting_me) lists (PAR-GOV-02).
+	// PendingForYou counts the pending entries awaiting the caller's verdict: what
+	// recall(status=awaiting_me) lists (PAR-GOV-02).
 	PendingForYou *int `json:"pending_for_you"`
 	// MemoryPressure sizes the store (PAR-RCL-06).
 	MemoryPressure *MemoryPressure `json:"memory_pressure"`
@@ -104,11 +104,12 @@ func scanGroundMemory(dataDir, workspaceID, caller string, window int) (groundMe
 		return groundMemoryScan{}, err
 	}
 	scan := groundMemoryScan{modes: newModeCounts()}
+	awaits := awaitingCaller(dataDir, caller)
 	core := 0
 	for _, e := range view {
 		if e.State == govstore.RankPending {
 			scan.pressure.PendingCount++
-			if !e.ByCaller && !e.VotedByCaller {
+			if awaits(e) {
 				scan.forYou++
 			}
 			continue

@@ -3914,14 +3914,11 @@ func registerRoutes(mux routeRegistrar) {
 		// unverified text and history=true (revisions and events) need a reviewer: the
 		// verifier or human-approver role (admin holds both; open mode is the operator).
 		if id := q.Get("entry_id"); id != "" {
-			p := principalFromContext(r.Context())
-			reviewer := p == nil || p.Has(workspaceops.RoleVerifier) || p.Has(workspaceops.RoleHumanApprover)
 			history := q.Get("history") == "true"
-			if history && !reviewer {
-				denyMissingRole(w, r, p, workspaceops.RoleVerifier)
+			if history && !requireReviewer(w, r) {
 				return
 			}
-			result, err := workspaceops.GetContextEntry(dd, r.PathValue("workspace_id"), id, history, reviewer)
+			result, err := workspaceops.GetContextEntry(dd, r.PathValue("workspace_id"), id, history, isReviewer(r))
 			issueIntel(w, err, result)
 			return
 		}
@@ -3931,9 +3928,7 @@ func registerRoutes(mux routeRegistrar) {
 			return
 		}
 		// the verification queue is unverified text: a reviewer's read, like history
-		if p := principalFromContext(r.Context()); req.ReadsUnverified() && p != nil &&
-			!p.Has(workspaceops.RoleVerifier) && !p.Has(workspaceops.RoleHumanApprover) {
-			denyMissingRole(w, r, p, workspaceops.RoleVerifier)
+		if req.ReadsUnverified() && !requireReviewer(w, r) {
 			return
 		}
 		result, err := workspaceops.RecallWith(r.Context(), dd, r.PathValue("workspace_id"), req)
