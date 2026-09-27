@@ -49,8 +49,9 @@ const GRAPH_SNAPSHOTS_KEPT: usize = 3;
 /// the regex-fallback revision. Part of the cache scope, reported by `repo-key`.
 pub fn parser_version() -> String {
     format!(
-        "{INDEX_FORMAT_VERSION};ts-abi-{};rust-0.24;go-0.25;typescript-0.23;javascript-0.25;regex-2",
-        tree_sitter::LANGUAGE_VERSION
+        "{INDEX_FORMAT_VERSION};ts-abi-{};{};regex-3",
+        tree_sitter::LANGUAGE_VERSION,
+        crate::index::lang::grammar_ids()
     )
 }
 

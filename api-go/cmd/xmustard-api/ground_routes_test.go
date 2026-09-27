@@ -36,7 +36,8 @@ func groundAPI(t *testing.T, breaks, runs int) (base, coreLog string) {
 	changes, _ := json.Marshal(map[string]any{"changed_files": []string{"a.go"}, "contract_breaks": breaks, "dirty_symbols": dirty})
 	drift := `{"workspace_id":"ws","has_baseline":true,"stale":true,"head_changed":true,"content_changed":false,"reasons":["HEAD moved"]}`
 	fixtures := t.TempDir()
-	for name, body := range map[string]string{"changes.json": string(changes), "drift.json": drift} {
+	coverage := `{"complete":false,"languages":{"python":{"supported":3,"unsupported":0,"failed":1},"kotlin":{"supported":0,"unsupported":2,"failed":0}}}`
+	for name, body := range map[string]string{"changes.json": string(changes), "drift.json": drift, "coverage.json": coverage} {
 		if err := os.WriteFile(filepath.Join(fixtures, name), []byte(body), 0o644); err != nil {
 			t.Fatal(err)
 		}
@@ -46,6 +47,7 @@ func groundAPI(t *testing.T, breaks, runs int) (base, coreLog string) {
 case "$1 $2" in
 "changetrack drift") cat `+filepath.Join(fixtures, "drift.json")+` ;;
 "changetrack working-changes") cat `+filepath.Join(fixtures, "changes.json")+` ;;
+"symbolgraph coverage") cat `+filepath.Join(fixtures, "coverage.json")+` ;;
 *) echo '{}' ;;
 esac
 `))
@@ -139,6 +141,35 @@ func TestGroundPlainCallIsUnbudgeted(t *testing.T) {
 		if _, ok := m[k]; !ok {
 			t.Fatalf("plain ground dropped %s", k)
 		}
+	}
+}
+
+// ground carries the symbol graph's per-language coverage (PAR-SYM-05), unbudgeted
+// and budgeted alike, and reports it unknown when the core cannot give it.
+func TestGroundCarriesPerLanguageCoverage(t *testing.T) {
+	base, _ := groundAPI(t, 1, 1)
+	for _, url := range []string{base, base + "?max_chars=6000"} {
+		code, body, m := getGround(t, url)
+		if code != http.StatusOK {
+			t.Fatalf("ground: %d %s", code, body)
+		}
+		cov, _ := m["coverage"].(map[string]any)
+		langs, _ := cov["languages"].(map[string]any)
+		py, _ := langs["python"].(map[string]any)
+		kt, _ := langs["kotlin"].(map[string]any)
+		if cov["complete"] != false || py["supported"] != 3.0 || py["failed"] != 1.0 || kt["unsupported"] != 2.0 {
+			t.Fatalf("%s: ground coverage = %v", url, m["coverage"])
+		}
+	}
+	t.Setenv("XMUSTARD_CORE_BIN", writeScript(t, `case "$1 $2" in
+"symbolgraph coverage") echo '{}' ;;
+"changetrack working-changes") echo '{"changed_files":[],"contract_breaks":0,"dirty_symbols":[]}' ;;
+*) echo '{}' ;;
+esac
+`))
+	_, body, m := getGround(t, base)
+	if m["coverage"] != nil || !strings.Contains(string(body), `"field":"coverage"`) {
+		t.Fatalf("coverage without languages must be null and listed unknown: %s", body)
 	}
 }
 

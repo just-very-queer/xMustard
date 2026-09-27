@@ -1,0 +1,25 @@
+engine tree_sitter parse_errors false
+symbols
+  Module Outer arity=- lines=5-24 doc_from=4 exported=true local=false depth=0
+  Class Outer.Widget arity=- lines=7-23 doc_from=7 exported=true local=false depth=1
+  Const Outer.Widget.LIMIT arity=- lines=9-9 doc_from=9 exported=true local=false depth=2
+  Method Outer.Widget.initialize arity=2 lines=11-14 doc_from=11 exported=true local=false depth=2
+  Method Outer.Widget.build arity=1 lines=16-18 doc_from=16 exported=true local=false depth=2
+  Method Outer.Widget.ready? arity=0 lines=20-22 doc_from=20 exported=true local=false depth=2
+  Function top_level arity=1 lines=26-28 doc_from=26 exported=true local=false depth=0
+imports
+  1 require json name=- alias=-
+  2 require lib/util name=- alias=-
+references (non-read)
+  1 import require in -
+  2 import require_relative in -
+  7 extends Base in Outer.Widget
+  8 call include in Outer.Widget
+  8 extends Mixin in Outer.Widget
+  11 bind a in Outer.Widget.initialize
+  11 bind b in Outer.Widget.initialize
+  12 call helper in Outer.Widget.initialize
+  13 write label in Outer.Widget.initialize
+  17 call new in Outer.Widget.build
+  26 bind x in top_level
+  27 member_call to_s in top_level

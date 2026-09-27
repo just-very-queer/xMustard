@@ -893,7 +893,7 @@ fn run_symbolgraph_command(mut args: Args) -> CmdResult {
 
     let sub = need(
         &mut args,
-        "xmustard-core symbolgraph <build|hotspots|clusters|cluster-of|impact|trace|blast-radius> [--identity-key=K] ...",
+        "xmustard-core symbolgraph <build|hotspots|clusters|cluster-of|coverage|impact|trace|blast-radius> [--identity-key=K] ...",
     )?;
     let (key, mut args) = identity_flag(args);
     let source = |root: &str, ws: &str| sg::query_source_for(Path::new(root), ws, key.as_deref());
@@ -907,6 +907,16 @@ fn run_symbolgraph_command(mut args: Args) -> CmdResult {
             let root = need(&mut args, &u)?;
             let ws = need(&mut args, &u)?;
             json(&sg::build_symbol_graph(Path::new(&root), &ws))
+        }
+        "coverage" => {
+            // ground's coverage block: the per-language support counts search, explain
+            // and impact report, without the loss list, from the same source they read
+            // (the code index's snapshot when the root has one, else the legacy graph)
+            let u = usage("");
+            let root = need(&mut args, &u)?;
+            let ws = need(&mut args, &u)?;
+            let cov = source(&root, &ws).coverage;
+            json(&serde_json::json!({ "complete": cov.complete, "languages": cov.languages }))
         }
         "clusters" => {
             let u = usage("");
@@ -1014,6 +1024,7 @@ mod tests {
         ("symbolgraph", &["trace"]),
         ("symbolgraph", &["clusters"]),
         ("symbolgraph", &["cluster-of"]),
+        ("symbolgraph", &["coverage"]),
         ("changetrack", &["fingerprint"]),
         ("changetrack", &["drift"]),
         ("changetrack", &["changed-since"]),

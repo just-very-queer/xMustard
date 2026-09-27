@@ -1,10 +1,14 @@
-use std::cell::RefCell;
+//! Legacy repo-map symbol extraction (`repomap`, `symbolgraph`) over the language packs
+//! (`index::lang`): each pack's tag query yields `@definition.*` matches, mapped to the
+//! legacy kinds (`function`, `method`, `class`, `type`).
+
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
-use std::rc::Rc;
 
 use streaming_iterator::StreamingIterator;
-use tree_sitter::{Language, Parser, Query, QueryCursor};
+use tree_sitter::{Parser, QueryCursor};
+
+use crate::index::extract::within_parse_bounds;
+use crate::index::lang::{self, Lang};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TsSymbol {
@@ -15,77 +19,19 @@ pub struct TsSymbol {
     /// 0-based column of the symbol NAME on its start line — the LSP position used
     /// to resolve references/definition for this symbol.
     pub name_column: usize,
-    /// Name of the nearest enclosing container (impl/class/module/trait/fn), e.g.
-    /// "impl AuthMiddleware" → "AuthMiddleware". None at top level.
+    /// Name of the nearest enclosing container (impl/class/module/trait/namespace), e.g.
+    /// "impl AuthMiddleware" → "AuthMiddleware". None at top level; functions are never
+    /// scopes.
     pub enclosing_scope: Option<String>,
-}
-
-// Container AST node kinds a symbol can be nested INSIDE. Deliberately excludes
-// function/struct/enum/type definitions so a symbol never reports its own
-// definition node as its scope — only true containers (impl/class/trait/module).
-const SCOPE_NODE_KINDS: &[&str] = &[
-    "impl_item",
-    "trait_item",
-    "mod_item",
-    "class_declaration",
-    "interface_declaration",
-    "namespace_declaration",
-];
-
-// Walk up from a node to the nearest enclosing named scope, returning its name
-// (the `name`/`type` child's text). Skips the symbol's own definition node.
-fn enclosing_scope_of(node: tree_sitter::Node, source: &[u8]) -> Option<String> {
-    let mut cur = node.parent();
-    while let Some(n) = cur {
-        if SCOPE_NODE_KINDS.contains(&n.kind()) {
-            // prefer a `name` child, else a `type` child (Rust impl blocks).
-            for field in ["name", "type"] {
-                if let Some(named) = n.child_by_field_name(field) {
-                    if let Ok(text) = named.utf8_text(source) {
-                        let text = text.trim();
-                        if !text.is_empty() {
-                            return Some(text.to_string());
-                        }
-                    }
-                }
-            }
-        }
-        cur = n.parent();
-    }
-    None
-}
-
-struct LanguageConfig {
-    /// Grammar identity for the compiled-query cache.
-    name: &'static str,
-    language: Language,
-    query: &'static str,
-}
-
-thread_local! {
-    /// Compiled queries per grammar. Compiling a query costs far more than parsing a
-    /// typical file, so it is done once per grammar per thread, not once per file.
-    static QUERY_CACHE: RefCell<HashMap<&'static str, Rc<Query>>> = RefCell::new(HashMap::new());
-}
-
-fn compiled_query(config: &LanguageConfig) -> Option<Rc<Query>> {
-    QUERY_CACHE.with(|cache| {
-        if let Some(q) = cache.borrow().get(config.name) {
-            return Some(q.clone());
-        }
-        let q = Rc::new(Query::new(&config.language, config.query).ok()?);
-        cache.borrow_mut().insert(config.name, q.clone());
-        Some(q)
-    })
 }
 
 /// Index-completeness bound on symbols extracted from one file. Display limits are
 /// applied by callers; reaching this bound is reported as `symbols_truncated`.
 pub const MAX_SYMBOLS_PER_FILE: usize = 4096;
 
-/// Whether `relative_path` has a tree-sitter grammar.
+/// Whether this build has a tree-sitter grammar for `relative_path`.
 pub fn supports(relative_path: &str) -> bool {
-    language_config(relative_path).is_some()
+    Lang::for_path(relative_path).is_some_and(Lang::has_grammar)
 }
 
 /// Extract semantic symbol candidates from a file using tree-sitter, up to
@@ -94,190 +40,102 @@ pub fn extract_symbols(relative_path: &str, source: &str) -> Option<Vec<TsSymbol
     extract_symbols_limited(relative_path, source, MAX_SYMBOLS_PER_FILE).map(|(s, _)| s)
 }
 
-/// Extract at most `max` symbols; the flag is true when more symbols existed.
+/// Extract at most `max` symbols; the flag is true when more symbols existed. None when
+/// the file's language has no grammar in this build, or when the file is past the
+/// index's parse bounds (size, tokens, nesting): the caller then uses its regexes.
 pub fn extract_symbols_limited(
     relative_path: &str,
     source: &str,
     max: usize,
 ) -> Option<(Vec<TsSymbol>, bool)> {
-    let config = language_config(relative_path)?;
+    let lang = Lang::for_path(relative_path)?;
+    if !within_parse_bounds(lang, source.as_bytes()) {
+        return None;
+    }
+    let grammar = lang.grammar()?;
     let mut parser = Parser::new();
-    if parser.set_language(&config.language).is_err() {
+    if parser.set_language(&grammar).is_err() {
         return Some((Vec::new(), false));
     }
-    let tree = match parser.parse(source, None) {
-        Some(tree) => tree,
-        None => return Some((Vec::new(), false)),
+    let Some(tree) = parser.parse(source, None) else {
+        return Some((Vec::new(), false));
     };
-    let query = match compiled_query(&config) {
-        Some(query) => query,
-        None => return Some((Vec::new(), false)),
+    let Some(query) = lang::tag_query(lang) else {
+        return Some((Vec::new(), false));
     };
+    let src = source.as_bytes();
+    let capture_names = query.capture_names();
+    // definition node id -> (label, name) for every match, so scopes can be looked up
+    let mut defs: Vec<(tree_sitter::Node<'_>, tree_sitter::Node<'_>, &str)> = Vec::new();
+    let mut containers: HashMap<usize, &str> = HashMap::new();
+    // every definition's label: the nearest one decides whether a function is a method
+    let mut labels: HashMap<usize, &str> = HashMap::new();
     let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(&query, tree.root_node(), src);
+    while let Some(mat) = matches.next() {
+        let (mut def, mut name) = (None, None);
+        for c in mat.captures {
+            match capture_names[c.index as usize].split_once('.') {
+                Some(("definition", label)) => def = Some((c.node, label)),
+                None if capture_names[c.index as usize] == "name" => name = Some(c.node),
+                _ => {}
+            }
+        }
+        let (Some((node, label)), Some(name)) = (def, name) else {
+            continue;
+        };
+        let Ok(text) = name.utf8_text(src) else {
+            continue;
+        };
+        labels.entry(node.id()).or_insert(label);
+        if lang::is_container(label) {
+            containers.entry(node.id()).or_insert(text.trim());
+        }
+        defs.push((node, name, label));
+    }
     let mut symbols = Vec::new();
     let mut seen = HashSet::<(String, usize)>::new();
-    let root_node = tree.root_node();
-    let capture_names = query.capture_names();
-    let mut matches = cursor.matches(&query, root_node, source.as_bytes());
-    while let Some(mat) = matches.next() {
-        for capture in mat.captures {
-            let Some(capture_name) = capture_names.get(capture.index as usize).copied() else {
-                continue;
-            };
-            let Some((_, kind)) = capture_name.split_once('.') else {
-                continue;
-            };
-            let Some(kind) = map_capture_kind(kind) else {
-                continue;
-            };
-            let symbol = match capture.node.utf8_text(source.as_bytes()) {
-                Ok(value) => value,
-                Err(_) => continue,
-            };
-            let symbol = symbol.trim();
-            if symbol.is_empty() {
-                continue;
-            }
-            let line_start = capture.node.start_position().row + 1;
-            let line_end = capture.node.end_position().row + 1;
-            let name_column = capture.node.start_position().column;
-            if !seen.insert((symbol.to_string(), line_start)) {
-                continue;
-            }
-            if symbols.len() >= max {
-                return Some((symbols, true));
-            }
-            // a symbol is never its own scope (e.g. the `impl Foo` type capture).
-            let enclosing_scope =
-                enclosing_scope_of(capture.node, source.as_bytes()).filter(|s| s != symbol);
-            symbols.push(TsSymbol {
-                symbol: symbol.to_string(),
-                kind: kind.to_string(),
-                line_start,
-                line_end,
-                name_column,
-                enclosing_scope,
-            });
+    for (node, name, label) in defs {
+        let Some(kind) = lang::legacy_kind(label) else {
+            continue;
+        };
+        let symbol = name.utf8_text(src).unwrap_or("").trim();
+        if symbol.is_empty() {
+            continue;
         }
+        let line_start = name.start_position().row + 1;
+        if !seen.insert((symbol.to_string(), line_start)) {
+            continue;
+        }
+        if symbols.len() >= max {
+            return Some((symbols, true));
+        }
+        // walk from the parent so a symbol is never its own scope, but a constructor
+        // named like its class still gets the class
+        let ancestors = || std::iter::successors(node.parent(), |n| n.parent());
+        let enclosing_scope = ancestors()
+            .find_map(|n| containers.get(&n.id()))
+            .map(|s| s.to_string());
+        // the same method rule as the index (`tags`): a function whose nearest enclosing
+        // definition is a type or module is a method
+        let owner = ancestors()
+            .find_map(|n| labels.get(&n.id()))
+            .and_then(|l| lang::fact_kind(l));
+        let kind = match (kind, owner) {
+            ("function", Some(o)) if lang::METHOD_OWNERS.contains(&o) => "method",
+            (kind, _) => kind,
+        };
+        symbols.push(TsSymbol {
+            symbol: symbol.to_string(),
+            kind: kind.to_string(),
+            line_start,
+            line_end: name.end_position().row + 1,
+            name_column: name.start_position().column,
+            enclosing_scope,
+        });
     }
     Some((symbols, false))
 }
-
-fn map_capture_kind(kind: &str) -> Option<&'static str> {
-    match kind {
-        "function" => Some("function"),
-        "method" => Some("method"),
-        "type" => Some("type"),
-        "class" => Some("class"),
-        "struct" => Some("type"),
-        "enum" => Some("type"),
-        "trait" => Some("type"),
-        "interface" => Some("type"),
-        _ => None,
-    }
-}
-
-fn language_config(relative_path: &str) -> Option<LanguageConfig> {
-    let extension = Path::new(relative_path)
-        .extension()
-        .and_then(|item| item.to_str())?
-        .to_ascii_lowercase();
-    match extension.as_str() {
-        "rs" => Some(LanguageConfig {
-            name: "rust",
-            language: tree_sitter_rust::LANGUAGE.into(),
-            query: RUST_QUERY,
-        }),
-        "go" => Some(LanguageConfig {
-            name: "go",
-            language: tree_sitter_go::LANGUAGE.into(),
-            query: GO_QUERY,
-        }),
-        "ts" => Some(LanguageConfig {
-            name: "typescript",
-            language: tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-            query: TYPESCRIPT_QUERY,
-        }),
-        "tsx" => Some(LanguageConfig {
-            name: "tsx",
-            language: tree_sitter_typescript::LANGUAGE_TSX.into(),
-            query: TYPESCRIPT_QUERY,
-        }),
-        "js" | "mjs" | "cjs" => Some(LanguageConfig {
-            name: "javascript",
-            language: tree_sitter_javascript::LANGUAGE.into(),
-            query: JAVASCRIPT_QUERY,
-        }),
-        "jsx" => Some(LanguageConfig {
-            name: "javascript",
-            language: tree_sitter_javascript::LANGUAGE.into(),
-            query: JAVASCRIPT_QUERY,
-        }),
-        _ => None,
-    }
-}
-
-const RUST_QUERY: &str = r#"
-(function_item
-  name: (identifier) @name.function)
-
-(impl_item
-  (declaration_list
-    (function_item
-      name: (identifier) @name.method)))
-
-(struct_item
-  name: (type_identifier) @name.type)
-
-(enum_item
-  name: (type_identifier) @name.type)
-
-(trait_item
-  name: (type_identifier) @name.type)
-
-(impl_item
-  type: (type_identifier) @name.type)
-"#;
-
-const TYPESCRIPT_QUERY: &str = r#"
-(function_declaration
-  name: (identifier) @name.function)
-
-(class_declaration
-  name: (type_identifier) @name.class)
-
-(interface_declaration
-  name: (type_identifier) @name.interface)
-
-(type_alias_declaration
-  name: (type_identifier) @name.type)
-
-(method_definition
-  name: (property_identifier) @name.method)
-"#;
-
-const JAVASCRIPT_QUERY: &str = r#"
-(function_declaration
-  name: (identifier) @name.function)
-
-(class_declaration
-  name: (identifier) @name.class)
-
-(method_definition
-  name: (property_identifier) @name.method)
-"#;
-
-const GO_QUERY: &str = r#"
-(function_declaration
-  name: (identifier) @name.function)
-
-(method_declaration
-  name: (field_identifier) @name.method)
-
-(type_declaration
-  (type_spec
-    name: (type_identifier) @name.type))
-"#;
 
 #[cfg(test)]
 mod tests {
@@ -366,5 +224,59 @@ mod tests {
         assert!(list.contains(&("render", "function")));
         assert!(list.contains(&("Props", "type")));
         assert!(list.contains(&("Widget", "class")));
+    }
+
+    fn find<'a>(symbols: &'a [TsSymbol], name: &str) -> &'a TsSymbol {
+        symbols.iter().find(|s| s.symbol == name).unwrap()
+    }
+
+    #[cfg(all(feature = "lang-java", feature = "lang-cpp"))]
+    #[test]
+    fn constructor_named_like_its_class_keeps_the_class_scope() {
+        let java = "class Sample {\n  Sample(int n) {}\n}\n";
+        let symbols = extract_symbols("Sample.java", java).unwrap();
+        let ctor = symbols
+            .iter()
+            .find(|s| s.symbol == "Sample" && s.kind == "method")
+            .unwrap();
+        assert_eq!(ctor.enclosing_scope.as_deref(), Some("Sample"));
+        let cpp = "class Shape {\n public:\n  Shape() {}\n  int area() { return 0; }\n};\n";
+        let symbols = extract_symbols("shape.cpp", cpp).unwrap();
+        let ctor = symbols
+            .iter()
+            .find(|s| s.symbol == "Shape" && s.kind == "method")
+            .unwrap();
+        assert_eq!(ctor.enclosing_scope.as_deref(), Some("Shape"));
+        // in-class functions are methods, as in the index's tag extractor
+        assert_eq!(find(&symbols, "area").kind, "method");
+    }
+
+    #[cfg(feature = "lang-ruby")]
+    #[test]
+    fn ruby_functions_in_a_class_are_methods() {
+        let rb = "def top; end\nclass Widget\n  def initialize; end\nend\n";
+        let symbols = extract_symbols("w.rb", rb).unwrap();
+        assert_eq!(find(&symbols, "initialize").kind, "method");
+        assert_eq!(find(&symbols, "top").kind, "function");
+    }
+
+    #[test]
+    fn files_past_the_parse_bounds_are_not_parsed() {
+        let over_size: String = (0..6000).map(|i| format!("fn f{i}() {{}}\n")).collect();
+        assert!(over_size.len() > crate::index::extract::DEFAULT_MAX_PARSE_BYTES);
+        assert!(extract_symbols("big.rs", &over_size).is_none());
+        let deep = format!("fn f() {{ {} }}\n", "(".repeat(300) + &")".repeat(300));
+        assert!(extract_symbols("deep.rs", &deep).is_none());
+        // the repo-map entry point falls back to its regexes for them
+        let out = crate::repomap::extract_source_symbols("big.rs", &over_size, 10);
+        assert_eq!(out.engine, "regex");
+        assert!(out.truncated);
+        // and a refused file the regexes find nothing in still reports the regex engine,
+        // so graph coverage counts it as failed rather than supported
+        let blank = format!("// {}\n", "x".repeat(70_000));
+        assert_eq!(
+            crate::repomap::extract_source_symbols("blank.rs", &blank, 10).engine,
+            "regex"
+        );
     }
 }

@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::config::IndexConfig;
+use super::lang::{LanguageCoverage, Support};
 
 pub const DIRTY_FLAG: &str = "incremental_in_progress";
 
@@ -92,6 +93,9 @@ pub struct Coverage {
     pub indexed_bytes: u64,
     /// Indexed files per language.
     pub languages: BTreeMap<String, usize>,
+    /// Indexed files per language by support: `supported` (grammar), `unsupported` (no
+    /// grammar in this build) and `failed` (lexical fallback or parse errors).
+    pub language_support: BTreeMap<String, LanguageCoverage>,
     /// Indexed files per extraction engine (`tree_sitter`, `regex`, `none`).
     pub extraction: BTreeMap<String, usize>,
     /// Exact count per loss reason.
@@ -144,6 +148,17 @@ pub fn coverage(conn: &Connection, cfg: &IndexConfig) -> rusqlite::Result<Covera
             if indexed {
                 c.indexed_files += 1;
                 c.indexed_bytes += size.max(0) as u64;
+                let fell_back =
+                    flags & (file_flag::LEXICAL_FALLBACK | file_flag::PARSE_ERRORS) != 0;
+                let support = match (fell_back, status.as_str()) {
+                    (true, _) => Support::Failed,
+                    (false, "tree_sitter") => Support::Supported,
+                    (false, _) => Support::Unsupported,
+                };
+                c.language_support
+                    .entry(lang.clone())
+                    .or_default()
+                    .add(support);
                 *c.languages.entry(lang).or_default() += 1;
                 *c.extraction.entry(status.clone()).or_default() += 1;
             } else {

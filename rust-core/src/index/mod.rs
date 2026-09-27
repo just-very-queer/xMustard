@@ -39,6 +39,7 @@ pub mod envelope;
 pub mod extract;
 pub mod facts;
 pub mod ignore;
+pub mod lang;
 pub mod lexical;
 pub mod meta;
 pub mod names;
