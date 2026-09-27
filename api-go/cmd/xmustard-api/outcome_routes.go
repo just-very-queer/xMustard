@@ -21,7 +21,9 @@ import (
 // exec, no shell, the working directory confined to the workspace root, a timeout that
 // terminates the process group), or reads the last MiB of an evidence original the
 // caller may read, or takes a pasted log; it records the outcome and answers the
-// explanation. Running a command and recording an outcome are agent writes (proposer);
+// explanation. A deployment reachable beyond loopback runs commands only with
+// XMUSTARD_WHY_FAILED_COMMANDS=1. Running a command and recording an outcome are agent
+// writes (proposer);
 // readers only read outcomes: GET .../runs/{outcome_id}/why-failed (main.go) and the
 // list above. Both routes are core and classified in routeGateTable.
 //
@@ -59,6 +61,11 @@ func registerOutcomeRoutes(mux routeRegistrar, store *evidence.Store) {
 		}
 		if body.RunID != "" {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "a run_id is read with GET .../runs/{run_id}/why-failed"})
+			return
+		}
+		if (body.Command != "" || len(body.Argv) > 0) && !postureFrom(r).runsCommands() {
+			writeJSON(w, http.StatusForbidden, map[string]any{"reason": "commands_disabled",
+				"error": "this deployment does not run why_failed commands (it is reachable beyond loopback; XMUSTARD_WHY_FAILED_COMMANDS=1 enables them); pass the output as log or evidence_handle"})
 			return
 		}
 		if !reserveWindow(w, r, whyFailedWindowBytes) {

@@ -18,6 +18,7 @@ func newOutcomeFixture(t *testing.T, env map[string]string) *evidenceFixture {
 	t.Helper()
 	f := &evidenceFixture{ws: "wsOut", dir: t.TempDir()}
 	t.Setenv("XMUSTARD_DATA_DIR", f.dir)
+	t.Setenv("XMUSTARD_WHY_FAILED_COMMANDS", "1") // the fixture has no loopback bind
 	for k, v := range env {
 		t.Setenv(k, v)
 	}
@@ -95,6 +96,35 @@ func TestWhyFailedRouteRecordsAndReadersRead(t *testing.T) {
 	}
 	if code, _, _ := f.do(t, "GET", base+"/outcomes?limit=0", rita, nil, nil); code != http.StatusBadRequest {
 		t.Errorf("limit=0: %d", code)
+	}
+}
+
+// Commands run on a loopback bind or with XMUSTARD_WHY_FAILED_COMMANDS=1 only; a log
+// is explained either way.
+func TestWhyFailedCommandsNeedLoopbackOrOptIn(t *testing.T) {
+	for _, c := range []struct {
+		posture exposurePosture
+		want    bool
+	}{
+		{exposurePosture{Loopback: true}, true}, {exposurePosture{}, false},
+		{exposurePosture{Commands: "1"}, true}, {exposurePosture{Loopback: true, Commands: "0"}, false},
+	} {
+		if got := c.posture.runsCommands(); got != c.want {
+			t.Errorf("%+v: runsCommands %v, want %v", c.posture, got, c.want)
+		}
+	}
+	t.Setenv("XMUSTARD_WHY_FAILED_COMMANDS", "yes")
+	if _, err := loadExposurePosture(); err == nil {
+		t.Fatal("a malformed XMUSTARD_WHY_FAILED_COMMANDS must stop startup")
+	}
+	off := newOutcomeFixture(t, map[string]string{"XMUSTARD_WHY_FAILED_COMMANDS": ""})
+	base := "/api/workspaces/" + off.ws
+	code, b, _ := off.do(t, "POST", base+"/why-failed", "", strings.NewReader(`{"command":"go test ./..."}`), nil)
+	if code != http.StatusForbidden || decodeMap(t, b)["reason"] != "commands_disabled" {
+		t.Fatalf("a non-loopback deployment ran a command: %d %s", code, b)
+	}
+	if code, b, _ := off.do(t, "POST", base+"/why-failed", "", strings.NewReader(`{"log":"FAIL"}`), nil); code != http.StatusOK {
+		t.Fatalf("a log is explained without commands: %d %s", code, b)
 	}
 }
 

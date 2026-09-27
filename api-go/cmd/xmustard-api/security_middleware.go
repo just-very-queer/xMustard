@@ -49,6 +49,9 @@ type exposurePosture struct {
 	// RegisterLimit is how many workspaces one non-admin principal may register;
 	// 0 = workspaceops.DefaultRegisterLimit.
 	RegisterLimit int
+	// Commands is XMUSTARD_WHY_FAILED_COMMANDS: "1" or "0" force why_failed commands on
+	// or off; "" (auto) serves them only while the API binds loopback.
+	Commands string
 }
 
 func (p *exposurePosture) platform() bool { return p != nil && p.Profile == profilePlatform }
@@ -61,6 +64,19 @@ func (p *exposurePosture) profile() string {
 }
 
 func (p *exposurePosture) readOnly() bool { return p != nil && p.ReadOnly }
+
+// runsCommands reports whether why_failed may run a command. A command runs the
+// repository's code, and its arguments are not confined, with the daemon's privileges,
+// so a deployment reachable beyond loopback serves it only when the operator opts in.
+func (p *exposurePosture) runsCommands() bool {
+	if p == nil {
+		return false
+	}
+	if p.Commands != "" {
+		return p.Commands == "1"
+	}
+	return p.Loopback
+}
 
 func (p *exposurePosture) toolDisabled(tool string) bool {
 	return p != nil && tool != "" && p.DisabledTools[tool]
@@ -107,6 +123,8 @@ func (p *exposurePosture) disabledTools() []string {
 //	XMUSTARD_REGISTER_ROOTS=/a:/b    where non-admin tokens may register git work
 //	                                 trees (OS path list; default: admins only)
 //	XMUSTARD_REGISTER_LIMIT=n        workspaces one non-admin principal may register
+//	XMUSTARD_WHY_FAILED_COMMANDS=0|1 why_failed may run commands (default: only on a
+//	                                 loopback bind)
 //
 // Conflicting profile settings and malformed values are startup errors.
 func loadExposurePosture() (exposurePosture, error) {
@@ -149,6 +167,12 @@ func loadExposurePosture() (exposurePosture, error) {
 		p.ReadOnly = true
 	default:
 		return p, fmt.Errorf("invalid XMUSTARD_READ_ONLY=%q; use 0 or 1", v)
+	}
+	switch v := strings.TrimSpace(os.Getenv("XMUSTARD_WHY_FAILED_COMMANDS")); v {
+	case "", "0", "1":
+		p.Commands = v
+	default:
+		return p, fmt.Errorf("invalid XMUSTARD_WHY_FAILED_COMMANDS=%q; use 0 or 1", v)
 	}
 	tools := toolGates()
 	for _, t := range splitCSV(os.Getenv("XMUSTARD_DISABLED_TOOLS")) {

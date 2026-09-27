@@ -200,6 +200,7 @@ gate and registers any directory.
 | Tool disable | `XMUSTARD_DISABLED_TOOLS=impact,why_failed` | The tool's route answers `403 tool_disabled` and the tool leaves `tools/list`. Unknown names stop startup. |
 | Workspace allowlist | `XMUSTARD_WORKSPACE_ALLOWLIST=ws-a,ws-b` | Other workspace ids answer `403 workspace_not_allowed`. The same rule filters `GET /api/workspaces` and checks `POST /api/workspaces/load` (by the id the root would get) and the terminal routes. |
 | Remote execution | profile | Terminals exist only in the platform profile and need `admin`. |
+| why_failed commands | `XMUSTARD_WHY_FAILED_COMMANDS=0\|1` (default: on only for a loopback bind) | `why_failed` with `command` runs a test, build or lint command for a `proposer` ([Commands why_failed runs](#commands-why_failed-runs-ws-21)). A deployment reachable beyond loopback refuses it with `403 commands_disabled` unless set to `1`; `0` refuses it on loopback too. Logs and evidence handles are explained either way. Anything but `0` or `1` stops startup. |
 | Registration roots | `XMUSTARD_REGISTER_ROOTS=/srv/checkouts:/home/ci/src` (OS path list: `:` on Unix, `;` on Windows) | Where a non-admin token may register a git work tree. Empty (the default) means only `admin` registers. Each entry must be an absolute path and not a filesystem root, or the API stops at startup. See [Workspace registration](#workspace-registration). |
 | Registration limit | `XMUSTARD_REGISTER_LIMIT=50` (the default) | How many workspaces one non-admin principal may register. A load over the limit answers `403 registration_not_allowed`, refusal `register_limit`. Anything but a positive integer stops startup. |
 
@@ -362,7 +363,10 @@ symlink check to its `path` before the core reads the file.
 `why_failed` with `command` (`POST /api/workspaces/{id}/why-failed`) runs a process in
 the daemon's environment, so it is gated like a write: the `proposer` role, refused in
 read-only mode (`XMUSTARD_READ_ONLY=1`) and by `XMUSTARD_DISABLED_TOOLS=why_failed`, and
-refused on a read-only MCP connection. The MCP tool is annotated `readOnlyHint: false`,
+refused on a read-only MCP connection. A deployment reachable beyond loopback does not
+run commands unless `XMUSTARD_WHY_FAILED_COMMANDS=1`: flags such as `go test -exec`,
+`make VAR=...` or `cargo --config` can make a test or build command run anything, so
+there an agent token would otherwise hold what terminals reserve for `admin`. The MCP tool is annotated `readOnlyHint: false`,
 `destructiveHint: true`, so a client that auto-approves read-only tools still asks. The
 checks run in this order and fail closed:
 
@@ -378,8 +382,10 @@ checks run in this order and fail closed:
 - the timeout is 1 to 240 s (1 to 50 s through MCP, below the clients' call timeout);
   at the timeout the runner sends TERM, then KILL, to the command's whole process group.
 
-This narrows what the route runs; it is not a sandbox. A test or build runs the
-repository's own code with the daemon's privileges, as it would in the agent's shell.
+This narrows what the route runs; it is not a sandbox. Arguments are not confined
+(`make -C` or an absolute test path can reach outside the root), and a test or build
+runs the repository's own code with the daemon's privileges, as it would in the
+agent's shell.
 Output is redacted (secret rules plus this process's secret-named environment values)
 before it is analyzed or stored, and only the last MiB is read. The command's processes
 are external to the owned process tree the budget gate measures.
