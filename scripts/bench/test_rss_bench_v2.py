@@ -1324,6 +1324,29 @@ class RepoWiring(unittest.TestCase):
         self.assertNotIn("grep -oiE 'ws-?[0-9]{2}'", text)  # the workstream comes from the anchored, tested parser
 
 
+class CoreWorker(unittest.TestCase):
+    """--core-worker runs the API with the resident worker (the watcher lives there), and
+    a workstream check never compares a worker run with a per-call one."""
+
+    def test_the_worker_is_on_only_when_asked(self):
+        self.assertEqual(v2.api_env({"core": "/bin/core"}), {"XMUSTARD_CORE_BIN": "/bin/core"})
+        self.assertEqual(v2.api_env({"core": "/bin/core", "core_worker": True}),
+                         {"XMUSTARD_CORE_BIN": "/bin/core", "XMUSTARD_CORE_WORKER": "1"})
+
+    def test_a_baseline_measured_the_other_way_is_refused(self):
+        d = tempfile.mkdtemp(prefix="xm-core-worker-")
+        try:
+            base = os.path.join(d, "base.json")
+            with open(base, "w") as f:
+                json.dump({"schema": 2, "core_worker": False, "scenarios": {}}, f)
+            with self.assertRaises(SystemExit) as e:
+                v2.main(["run", "--scenarios", "agents-2", "--core-worker", "--workstream", "WS-15",
+                         "--baseline", base, "--out", d])
+            self.assertIn("core_worker", str(e.exception))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+
 class Repeats(unittest.TestCase):
     def run_(self, peak, verdict="PASS", daemon=20.0):
         reasons = ["v2 disagrees with the frozen v1 sampler by 9 MiB"] if verdict == "INVALID" else []
