@@ -31,6 +31,7 @@ func apiRouteAreas() [][]routeSpec {
 	return [][]routeSpec{
 		authRoutes,
 		operatorRoutes,
+		postgresRoutes,
 		routesOf(registerInlineRoutes),
 	}
 }

@@ -716,54 +716,6 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 
 // registerInlineRoutes mounts the routes not yet moved to an area's table.
 func registerInlineRoutes(mux routeRegistrar) {
-	mux.HandleFunc("GET /api/postgres/plan", func(w http.ResponseWriter, r *http.Request) {
-		result, err := workspaceops.GetPostgresSchemaPlan(
-			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
-		)
-		if err != nil {
-			respondError(w, err)
-			return
-		}
-		writeJSON(w, http.StatusOK, result)
-	})
-	mux.HandleFunc("GET /api/postgres/render", func(w http.ResponseWriter, r *http.Request) {
-		sqlText, err := workspaceops.RenderPostgresSchemaSQL(
-			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
-			r.URL.Query().Get("schema"),
-		)
-		if err != nil {
-			respondError(w, err)
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]any{"sql": sqlText})
-	})
-	mux.HandleFunc("POST /api/postgres/bootstrap", func(w http.ResponseWriter, r *http.Request) {
-		var request workspaceops.PostgresBootstrapRequest
-		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]any{
-				"error": "invalid JSON body",
-			})
-			return
-		}
-		result, err := workspaceops.BootstrapPostgresSchema(
-			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
-			request,
-		)
-		if err != nil {
-			lowered := strings.ToLower(err.Error())
-			if strings.Contains(lowered, "required") || strings.Contains(lowered, "must ") {
-				writeJSON(w, http.StatusBadRequest, map[string]any{
-					"error": err.Error(),
-				})
-				return
-			}
-			writeJSON(w, http.StatusInternalServerError, map[string]any{
-				"error": err.Error(),
-			})
-			return
-		}
-		writeJSON(w, http.StatusOK, result)
-	})
 	mux.HandleFunc("POST /api/workspaces/{workspace_id}/agent/probe", func(w http.ResponseWriter, r *http.Request) {
 		workspaceID := r.PathValue("workspace_id")
 		var request workspaceops.RuntimeProbeRequest
@@ -3746,81 +3698,6 @@ func registerInlineRoutes(mux routeRegistrar) {
 	})
 	mux.HandleFunc("GET /api/workspaces/{workspace_id}/wiki", func(w http.ResponseWriter, r *http.Request) {
 		result, err := workspaceops.WorkspaceWiki(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))
-		issueIntel(w, err, result)
-	})
-	// --- Postgres primary store: materialize + FTS hybrid search ---
-	mux.HandleFunc("POST /api/workspaces/{workspace_id}/pg/materialize", func(w http.ResponseWriter, r *http.Request) {
-		result, err := workspaceops.MaterializePostgresIndex(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))
-		issueIntel(w, err, result)
-	})
-	mux.HandleFunc("GET /api/workspaces/{workspace_id}/pg/search", func(w http.ResponseWriter, r *http.Request) {
-		query := r.URL.Query().Get("q")
-		if query == "" {
-			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "q query param required"})
-			return
-		}
-		limit := 25
-		if v := r.URL.Query().Get("limit"); v != "" {
-			if n, err := strconv.Atoi(v); err == nil {
-				limit = n
-			}
-		}
-		result, err := workspaceops.SearchPostgres(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), query, limit)
-		issueIntel(w, err, result)
-	})
-	// --- ops layer in Postgres: runs / activity / issues ---
-	mux.HandleFunc("POST /api/workspaces/{workspace_id}/pg/ops/materialize", func(w http.ResponseWriter, r *http.Request) {
-		result, err := workspaceops.MaterializeOpsPostgres(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))
-		issueIntel(w, err, result)
-	})
-	mux.HandleFunc("GET /api/workspaces/{workspace_id}/pg/runs", func(w http.ResponseWriter, r *http.Request) {
-		limit := 50
-		if v := r.URL.Query().Get("limit"); v != "" {
-			if n, err := strconv.Atoi(v); err == nil {
-				limit = n
-			}
-		}
-		result, err := workspaceops.ListRunsPostgres(r.PathValue("workspace_id"), r.URL.Query().Get("status"), limit)
-		issueIntel(w, err, result)
-	})
-	mux.HandleFunc("GET /api/workspaces/{workspace_id}/pg/run-plans", func(w http.ResponseWriter, r *http.Request) {
-		limit := 50
-		if v := r.URL.Query().Get("limit"); v != "" {
-			if n, err := strconv.Atoi(v); err == nil {
-				limit = n
-			}
-		}
-		result, err := workspaceops.ListRunPlansPostgres(r.PathValue("workspace_id"), limit)
-		issueIntel(w, err, result)
-	})
-	mux.HandleFunc("GET /api/workspaces/{workspace_id}/pg/issues/search", func(w http.ResponseWriter, r *http.Request) {
-		query := r.URL.Query().Get("q")
-		if query == "" {
-			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "q query param required"})
-			return
-		}
-		limit := 25
-		if v := r.URL.Query().Get("limit"); v != "" {
-			if n, err := strconv.Atoi(v); err == nil {
-				limit = n
-			}
-		}
-		result, err := workspaceops.SearchIssuesPostgres(r.PathValue("workspace_id"), query, limit)
-		issueIntel(w, err, result)
-	})
-	// --- verification outcomes: materialize to Postgres, then query/filter ---
-	mux.HandleFunc("POST /api/workspaces/{workspace_id}/pg/verifications/materialize", func(w http.ResponseWriter, r *http.Request) {
-		result, err := workspaceops.MaterializeVerificationsPostgres(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))
-		issueIntel(w, err, result)
-	})
-	mux.HandleFunc("GET /api/workspaces/{workspace_id}/pg/verifications", func(w http.ResponseWriter, r *http.Request) {
-		limit := 50
-		if v := r.URL.Query().Get("limit"); v != "" {
-			if n, err := strconv.Atoi(v); err == nil {
-				limit = n
-			}
-		}
-		result, err := workspaceops.ListVerificationsPostgres(r.PathValue("workspace_id"), r.URL.Query().Get("status"), limit)
 		issueIntel(w, err, result)
 	})
 	// --- ownership, incorporation lineage, session grounding ---
