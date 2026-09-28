@@ -7,6 +7,8 @@
 #
 # Reproducibility: both toolchains are pinned below, dependencies are locked, and no build
 # cache is restored, so a release never consumes a cache written by a pull-request run.
+# `make release` strips build paths from the binaries and fixes the archive metadata, so
+# rebuilding a tag on the same runner image gives the same archive bytes.
 # Actions are pinned to commit SHAs; the tag is in the comment.
 name: release
 
@@ -38,8 +40,12 @@ jobs:
       matrix:
         include:
           # the platform label must equal `uname -s`-`uname -m` on the runner (checked below)
+          # The Rust binaries need the runner's glibc or newer (the Go binaries are
+          # static), so the oldest GitHub-hosted Ubuntu image sets the floor: 22.04, glibc
+          # 2.35. If that image is retired, keep the floor with an older-glibc container
+          # or cargo-zigbuild.
           - platform: linux-x86_64
-            runner: ubuntu-24.04 # glibc 2.39: the floor for the Linux binaries
+            runner: ubuntu-22.04
           - platform: darwin-arm64
             runner: macos-15
     runs-on: ${{ matrix.runner }}
