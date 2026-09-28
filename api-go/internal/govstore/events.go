@@ -55,6 +55,13 @@ const (
 	// name no entry, and they enforce nothing: branch protection does.
 	EventMergeApproval        = "merge_approval"
 	EventMergeApprovalRevoked = "merge_approval_revoked"
+	// Review subjects (WS-66, PAR-REV-06; review.go): a review record and each finding
+	// it holds are created once, a finding's triage verdicts and re-anchorings follow.
+	// These events name a review subject, never an entry (subject_kind).
+	EventReviewRecord   = "review_record"
+	EventReviewFinding  = "review_finding"
+	EventReviewTriage   = "review_triage"
+	EventReviewReanchor = "review_reanchor"
 )
 
 var validEventTypes = set(EventPropose, EventImport, EventVote, EventReject, EventEdit, EventRevisionAccepted,
@@ -62,7 +69,8 @@ var validEventTypes = set(EventPropose, EventImport, EventVote, EventReject, Eve
 	EventMerge, EventRetract, EventArchive, EventRestore, EventPurge, EventExpiry, EventTierChange, EventClassify,
 	EventAnchors, EventBaseline, EventStaleObserved, EventDriftCleared, EventClaim, EventRelation, EventFeedback,
 	EventCollection, EventGrant, EventRevoke, EventApplicability, EventNote, EventGate, EventIndexBaseline,
-	EventMergeApproval, EventMergeApprovalRevoked)
+	EventMergeApproval, EventMergeApprovalRevoked, EventReviewRecord, EventReviewFinding, EventReviewTriage,
+	EventReviewReanchor)
 
 // Event is one immutable history record.
 type Event struct {
@@ -118,6 +126,8 @@ type EventWriter interface {
 type eventRow struct {
 	WorkspaceID string
 	EntryID     string
+	// SubjectKind is what EntryID names: a memory ("" means memory) or a review subject.
+	SubjectKind string
 	Type        string
 	Revision    int64
 	OldDigest   string
@@ -154,10 +164,14 @@ func (t *txn) insertEvent(ctx context.Context, actor Actor, ev eventRow) (int64,
 	if ev.Revision > 0 {
 		revision = ev.Revision
 	}
+	subject := ev.SubjectKind
+	if subject == "" {
+		subject = SubjectMemory
+	}
 	res, err := t.exec(ctx, `INSERT INTO events (workspace_id, entry_id, type, principal, session_id, agent_id, head_sha,
-		revision, old_digest, new_digest, note, data, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		revision, old_digest, new_digest, note, data, at, subject_kind) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		ev.WorkspaceID, nullText(ev.EntryID), ev.Type, strings.TrimSpace(actor.Principal), actor.SessionID,
-		actor.AgentID, actor.HeadSHA, revision, ev.OldDigest, ev.NewDigest, nullText(note), data, t.nowText())
+		actor.AgentID, actor.HeadSHA, revision, ev.OldDigest, ev.NewDigest, nullText(note), data, t.nowText(), subject)
 	if err != nil {
 		return 0, fmt.Errorf("append %s event: %w", ev.Type, err)
 	}
