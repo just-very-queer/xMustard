@@ -135,7 +135,9 @@ export interface ActiveMemory {
   active_count: number
   verification_modes?: Record<string, number>
   stale_count: number
-  conflicts: { path: string; entry_ids: string[]; titles: string[] }[]
+  // advisory conflict candidates (WS-27): tier 1 claim, 2 contradiction, 3 path_overlap
+  // (only a path overlap names the shared path and the titles)
+  conflicts: { tier: number; kind: string; reason: string; entry_ids: string[]; path?: string; titles?: string[] }[]
   entries: MemoryEntry[]
 }
 

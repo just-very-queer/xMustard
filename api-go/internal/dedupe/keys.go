@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright 2026 xMustard contributors
+
 // Package dedupe finds duplicate memories deterministically (WS-27, PAR-GOV-03). It
 // normalizes a text, hashes its exact form, gates fuzzy matching on entropy, and
 // signs its character 3-grams with a 32-permutation MinHash split into LSH bands of 4.

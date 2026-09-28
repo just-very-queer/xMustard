@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright 2026 xMustard contributors
+
 package dedupe
 
 import (

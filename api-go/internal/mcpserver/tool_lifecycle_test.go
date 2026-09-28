@@ -26,6 +26,14 @@ func TestLifecycleArgumentsBuild(t *testing.T) {
 			"/api/workspaces/w/context/e1/verify?approve=true", `{"evidence_handle":"h1","outcome":"duplicate_of","target":"e2"}`},
 		{recallTool, map[string]string{"workspace_id": "w", "entry_id": "e1", "history": "true"},
 			"/api/workspaces/w/context/active?entry_id=e1&history=true", ""},
+		// WS-27 claims and relations, and the recall claim and merge filters
+		{rememberTool, map[string]string{"workspace_id": "w", "content": "c",
+			"claims": " go | pinned_to | 1.22 ; api|requires|postgres;bad", "relations": "refines:e1, contradicts:e2"},
+			"/api/workspaces/w/context", `{"claims":[{"object":"1.22","predicate":"pinned_to","subject":"go"},` +
+				`{"object":"postgres","predicate":"requires","subject":"api"},{"object":"","predicate":"","subject":"bad"}],` +
+				`"content":"c","relations":[{"kind":"refines","target":"e1"},{"kind":"contradicts","target":"e2"}]}`},
+		{recallTool, map[string]string{"workspace_id": "w", "subject": "go", "predicate": "pinned_to", "include_merged": "true"},
+			"/api/workspaces/w/context/active?include_merged=true&subject=go&predicate=pinned_to&max_chars=4000", ""},
 	}
 	for _, c := range cases {
 		_, path, body := c.tool.Build(c.args)
