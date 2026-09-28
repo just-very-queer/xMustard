@@ -1,6 +1,9 @@
 package injection
 
-import "strings"
+import (
+	"cmp"
+	"strings"
+)
 
 // Quarantine marks content whose origin xMustard cannot vouch for: web pages and search
 // results, another MCP server's output, and memory imported from outside the
@@ -66,12 +69,5 @@ func CaptureQuarantine(tool string) string {
 	if trusted {
 		return ""
 	}
-	return quarantineCapturePrefix + attrValue(cutUTF8(fallback(t, "unknown"), maxQuarantineTool))
-}
-
-func fallback(s, def string) string {
-	if s == "" {
-		return def
-	}
-	return s
+	return quarantineCapturePrefix + attrValue(cutUTF8(cmp.Or(t, "unknown"), maxQuarantineTool))
 }

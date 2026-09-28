@@ -125,9 +125,6 @@ type compiledRule struct {
 type trigger struct {
 	lit  string
 	rule int
-	// word: the trigger starts with a letter or digit, so it counts only at the start
-	// of a word.
-	word bool
 }
 
 // compiled is Rules compiled once, at package initialization; byFirst indexes their
@@ -159,7 +156,7 @@ func compileRules(rules []Rule) ([]compiledRule, *[256][]trigger) {
 			if lit == "" || strings.IndexFunc(lit, unicode.IsUpper) >= 0 {
 				panic(fmt.Sprintf("injection: rule %s trigger %q is empty or not lowercase", r.ID, lit))
 			}
-			index[lit[0]] = append(index[lit[0]], trigger{lit: lit, rule: i, word: isWordByte(lit[0])})
+			index[lit[0]] = append(index[lit[0]], trigger{lit: lit, rule: i})
 		}
 	}
 	return out, index

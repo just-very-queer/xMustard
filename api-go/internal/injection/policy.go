@@ -74,12 +74,6 @@ var surfaces = map[Surface]surfacePolicy{
 	SurfaceCore:     {push: true, minBasis: BasisHumanApproved},
 }
 
-// Known reports whether s is a surface of the policy table.
-func Known(s Surface) bool {
-	_, ok := surfaces[s]
-	return ok
-}
-
 // Pushed reports whether s reaches the agent without being asked for.
 func Pushed(s Surface) bool { return surfaces[s].push }
 

@@ -216,7 +216,7 @@ func TestBasisOf(t *testing.T) {
 	if Basis(-1).String() != "unverified" || Basis(99).String() != "unverified" {
 		t.Fatal("an out-of-range basis names itself unverified")
 	}
-	if !Pushed(SurfaceHook) || !Pushed(SurfaceCore) || Pushed(SurfaceRecall) || Pushed("nope") || Known("nope") {
+	if !Pushed(SurfaceHook) || !Pushed(SurfaceCore) || Pushed(SurfaceRecall) || Pushed("nope") {
 		t.Fatal("surface table")
 	}
 }

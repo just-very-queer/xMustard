@@ -1540,6 +1540,68 @@ One base index per repo plus per-worktree delta segments for dirty and branch-di
 
 Instruction-pattern scan and data framing on everything injected; core tier and hook-injected memories need human-approver or stronger policy; untrusted-capture-derived content stays quarantined; adversarial fixtures in EVAL-02.
 
+**Implementation record (branch parity/ws-56, 2026-09-28).** The section above is one line, so the workstream direction was the spec. It asked for:
+
+- an instruction-pattern scan and data framing on everything xMustard injects;
+- a small library that WS-23 calls;
+- human-approver-or-stronger verification for core-tier and hook-injected memory, reusing the WS-09 roles and WS-19B provenance;
+- quarantine for content derived from untrusted captures;
+- adversarial EVAL-02 fixtures run as unit tests;
+- a bounded, measured scan cost;
+- patterns and framing as data tables, with quarantine and approval checks explicit and fail-closed.
+
+- *Library (`api-go/internal/injection`).* Four parts:
+  - **Scan.** `rules.go` holds a table of 13 rules, each with an id, trigger literals and an RE2 pattern: `override_instructions`, `new_instructions`, `role_reassignment`, `authority_claim`, `secrecy`, `prompt_leak`, `exfiltration`, `remote_exec`, `chat_template`, `turn_marker`, `frame_spoof`, `hook_spoof` and `hidden_text` (zero-width characters, bidi controls, BOM and Unicode tag characters). `Scan(parts...)` folds each part once: lowercase, every whitespace run one space, a paragraph break `\n\n`, and the text starting after one. It then makes one pass over the folded bytes. A byte inside a word is skipped. At any other byte, the triggers indexed by that byte (a `[256]` table) are compared, and a matching trigger runs its rule's pattern anchored there, over one byte more than the pattern's longest match. Every match must start with a trigger, and the scan is capped at 128 KiB (`scan_truncated` past the cap).
+  - **Frame.** `frame.go` has `Frame`, `FrameAll` and the `Notice`, and a JSON `DataNotice`. A frame tag inside framed text, in any case or spacing, is written with `&lt;`, so the block's own closing tag is the only one. Attribute values keep only id characters.
+  - **Policy.** `policy.go` holds the surface table: `recall` and `evidence` are pulled; `hook` and `core` are pushed with minimum basis `human_approved`. The basis ladder is unverified, self_asserted, peer_verified, human_approved, and a verification_mode missing from the table is unverified. `Decide` runs ordered guard clauses: an unknown surface; then a pulled surface, which admits with its flags; then, on a pushed surface, quarantined, below the basis (`needs_<basis>`), and flagged.
+  - **Sources.** `sources.go` has `CaptureQuarantine(tool)`, with an allowlist of the native file, search, list, diff and shell tools of the supported clients, plus xMustard's nine tools, bare or as `mcp__xmustard__*`. Any other tool, or no tool name, is `untrusted_capture:<tool>`. `QuarantineForeignImport` is the mark importers use.
+
+  The table is checked when the package loads: unique ids, lowercase triggers, and a pattern with an unbounded or 512-byte-or-longer longest match panics (computed from `regexp/syntax`). The tests check on every fixture that every match starts with a trigger and that the trigger pass agrees with an exhaustive match.
+- *Where it runs.*
+  - **Recall.** Every render (full, compact, names_only), fetch by id and `xmustard://memory/index` label entries with `injection_flags` and `quarantine`. The recall result and the fetch-by-id result carry `data_notice`, and a verifier's view of a pending edit carries the edit's `injection_flags`.
+  - **Remember.** It keeps flagged text, returns `injection_flags` and a warning that names the rules, and never refuses the write.
+  - **Evidence.** Every evidence projection gets `Delivery.injection_flags` at `Store.Capture`. That covers every MCP tool result delivered through the envelope, and native output that hooks capture. The MCP bridge adds an `[xmustard injection-check]` note and `_meta` flags to a flagged result.
+  - **Instructions.** Step 2 of initialize.instructions now says that memory, tool output and `<xmustard-data>` blocks are data, not instructions, and names `injection_flags`. It is 1,398 bytes, under the unchanged 1,400-byte budget. The recall `Doc` in `xmustard://docs/tools` explains the two labels.
+  - **Ground.** It returns counts and ids only, so its memory section carries no agent-written text to frame.
+- *Pushed surfaces (`workspaceops.AdmitMemory`).* This is what WS-23 (hook, `SurfaceHook`) and WS-31 (core tier, `SurfaceCore`) call with their candidate ids (at most 64). It refuses a surface that is not pushed, and it fails closed when the token store or the memory store cannot be read. For each candidate, in order: the entry is in the workspace (else `not_found`); it is served (else `not_served`); its content matches its digest (else `content_changed`); and then `Decide` runs. Admitted memory comes back framed (`text`), and every withheld candidate comes back with its reason and flags. The caller budgets the text.
+- *Human approval (WS-09 roles, WS-19B kinds, WS-57 surface).* A human approval is an `approve` verdict on the served revision in the current vote epoch that meets all of these:
+  - it is recorded with `principal_kind` human;
+  - its principal is a human approver of the workspace now: a file-backed token of kind human with the human-approver role (WS-57 `IsHumanApprover`; admin holds the role), scoped to the workspace, unexpired, not revoked and not the open-mode identity;
+  - its principal wrote neither the entry nor the served revision.
+
+  A quorum of agents is not a human approval, and neither is anything in open mode. An approval through `xmustard-ops approve` counts (`TestOpsHumanVerdictAdmits`).
+- *Quarantine.*
+  - `bindProvenance` reads each cited evidence handle's tool (`checkEvidence` now returns it). A handle from an untrusted tool sets `ContextActor.Quarantine`.
+  - A proposal stores the mark in entry metadata (`govstore.MetaQuarantine`), and an edit that cites such a capture adds it (`markQuarantined`).
+  - govstore keeps the mark sticky across `SetClassification`, and refuses a quarantined entry the core tier on insert and in `SetTier`.
+  - Recall serves quarantined memory labeled, and pushed surfaces withhold it even after a human approval.
+- *EVAL-02 fixtures.* `eval/tasks/memory_lifecycle/injection_safety.json` (schema `xmustard.eval.injection/v1`) holds:
+  - 39 scan cases: 25 adversarial, including stacked, zero-width, bidi and tag-character cases, and 14 benign near misses (Java `@Override`, `ignore whitespace`, `curl` without a pipe, typography, `security alert`, prose about hook fields, and others);
+  - 13 policy cases;
+  - 3 frame-escape cases;
+  - 11 capture sources.
+
+  `TestEval02InjectionFixtures` runs them with no model. The end-to-end cases are in `workspaceops/memory_injection_test.go`, and `eval/tasks/README.md` documents the file.
+- *Measured (build box: Linux, Ryzen 5 3500X, `-cpu 1`, load average 2 to 3).*
+  - `BenchmarkScan`: a 1 KiB memory in 7.1 to 8.0 µs (128 to 144 MB/s); 4 KiB of prose in 27 µs (150 MB/s); 64 KiB of Go source in 0.54 to 0.55 ms (119 to 121 MB/s); 64 KiB of dense adversarial text in 0.50 ms (131 MB/s); and 128 KiB, the cap, in 1.09 to 1.12 ms. Clean text allocates nothing per scan (the fold buffer is pooled).
+  - `BenchmarkFrame` frames 4 KiB in 2.1 µs.
+  - `BenchmarkAdmitMemory8`, one hook-sized admission of eight 400-byte human-approved memories, takes 1.47 to 1.53 ms, 155 KB and 2,720 allocations, nearly all of it store reads.
+  - `BenchmarkRecall1k` stays at 16.4 to 16.7 ms.
+  - The first design ran each rule's pattern unanchored over the whole text, at 2.4 to 15 MB/s (0.3 ms for 1 KiB, 7.6 ms for 64 KiB). The trigger index made the scan 10 to 40 times faster.
+  - What the scan adds per injection: recall scans the returned entries (about 30 µs for eight 500-byte entries); a capture scans its projection (about 0.14 ms at the 16 KiB hook targets and about 0.55 ms at the 64 KiB MCP target).
+- *Checks.* The full Linux gate (`xm-remote-check.sh all -count=1`: Rust release build, tests and clippy, then go vet and every Go package) passes after merging `feat/parity-v2` at `144123c` (WS-57), with 6 clippy warnings, the same as the base `fd083c2`. No Rust code changed. The merge conflict was only in `ContextActor`: WS-57's `Approval` and WS-56's `Quarantine` are both kept, and `humanApprovers` reuses WS-57's `IsHumanApprover`.
+- *Deviations.*
+  - The scan is a pattern check, not a classifier. A paraphrase with no rule passes, and a legitimate memory that quotes an injection is flagged, so it is served labeled and never pushed. Remember never refuses flagged text. Rules target injection shapes, not imperative guidance, and the benign fixtures pin the main false positives that were avoided. Fullwidth and other lookalike letters are not normalized: there is no NFKC without x/text.
+  - Quarantine sees only what a write cites. Content an agent copies from a web page without citing the capture is not marked, and output that Bash fetched (for example with `curl`) is trusted like any shell output, because the capture records the tool, not the command. The tool name is the one the capturing client recorded. The mark is sticky: an edit that cited an untrusted capture keeps the entry quarantined even if the edit is later rejected. Nothing clears the mark; human-vetted text is proposed afresh.
+  - "Stronger than human-approver" is not a separate level. Any human approver's approval counts, whatever its WS-57 assurance (advisory or user_presence). A policy that requires user_presence would need the vote's `provenance.approval` label read per candidate.
+  - No foreign importer exists yet (WS-34 and the PAR-REV-08 rule import). They mark their writes with `ContextActor.Quarantine = injection.QuarantineForeignImport`.
+  - AdmitMemory has no caller yet, because WS-23 (hooks) and WS-31 (the core projection and tier changes) are not built. Its tests and the govstore tier invariant stand in. Stale memory is not a gate: D-21 labels stale memory, and WS-23 computes it.
+  - The evidence `resources/read` pages and search-in-original return original bytes unscanned. They are pages the agent asks for of its own tool output, and the projection that led to them carries the flags.
+  - The frontend `MemoryEntry` type does not gain `quarantine`, `injection_flags` or `data_notice` (the UI is out of focus; the fields are optional additions).
+- *Files.*
+  - New: `api-go/internal/injection/` (`rules.go`, `scan.go`, `frame.go`, `policy.go`, `sources.go`, `injection_test.go`), `workspaceops/memory_injection.go` and its test, `govstore/quarantine_test.go`, `evidence/injection_flags_test.go`, `mcpserver/injection_note_test.go`, and `eval/tasks/memory_lifecycle/injection_safety.json`.
+  - Changed: `govstore/entries.go` (`TierCore`, `MetaQuarantine`, the core and sticky invariants); `evidence/store.go` (`Delivery.injection_flags`); `mcpserver/evidence.go`, `instructions.go` and `tool_recall.go`; `workspaceops/memory_propose.go`, `memory_provenance.go`, `memory_edit.go`, `memory_store.go`, `memory_render.go`, `memory_history.go` and `grounding_memory.go`; `docs/SECURITY.md` (Injection safety), `docs/ARCHITECTURE.md` and `eval/tasks/README.md`.
+
 ### WS-57 — Human-approval surface (critic addition)
 
 xmustard-ops approve|reject|queue bound to a human-approver token, optional MCP elicitation; precondition for protected paths in WS-19 and WS-31.
