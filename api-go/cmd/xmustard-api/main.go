@@ -714,12 +714,8 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 	_ = json.NewEncoder(w).Encode(payload)
 }
 
-// registerRoutes mounts every HTTP route on mux. It is separate from main so tests
-// can exercise the real route table through httptest.
-func registerRoutes(mux routeRegistrar) {
-	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, healthResponse(r)) // health_budget.go
-	})
+// registerInlineRoutes mounts the routes not yet moved to an area's table.
+func registerInlineRoutes(mux routeRegistrar) {
 	mux.HandleFunc("GET /api/runtimes", func(w http.ResponseWriter, r *http.Request) {
 		result, err := workspaceops.DetectRuntimes(
 			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
@@ -770,113 +766,6 @@ func registerRoutes(mux routeRegistrar) {
 			return
 		}
 		writeJSON(w, http.StatusOK, result)
-	})
-	// --- auth: token admin (admin-gated) + whoami ---
-	mux.HandleFunc("GET /api/auth/whoami", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, whoamiResponse(r))
-	})
-	mux.HandleFunc("GET /api/auth/principals", func(w http.ResponseWriter, r *http.Request) {
-		if !requireRole(w, r, "admin") {
-			return
-		}
-		writeJSON(w, http.StatusOK, workspaceops.ListPrincipals(dataDir()))
-	})
-	auditActor := func(r *http.Request) string {
-		if p := principalFromContext(r.Context()); p != nil {
-			return p.ID
-		}
-		return "system"
-	}
-	mux.HandleFunc("POST /api/auth/tokens", func(w http.ResponseWriter, r *http.Request) {
-		if !requireRole(w, r, "admin") {
-			return
-		}
-		var req struct {
-			ID         string   `json:"id"`
-			Role       string   `json:"role"`  // one role, or several joined with "+"
-			Roles      []string `json:"roles"` // alternative to role: a list of roles
-			TTLSeconds int      `json:"ttl_seconds"`
-			Workspaces []string `json:"workspaces"` // optional: confine the token to these workspaces
-			// optional: who operates the token (default: the id) and whether it is a
-			// human or an agent (default agent), for the owner-distinct policy
-			workspaceops.TokenIdentity
-		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON body"})
-			return
-		}
-		if len(req.Roles) > 0 {
-			if req.Role != "" {
-				writeJSON(w, http.StatusBadRequest, map[string]any{"error": "send role or roles, not both"})
-				return
-			}
-			req.Role = strings.Join(req.Roles, "+")
-		}
-		raw, err := workspaceops.MintIdentityToken(dataDir(), req.ID, req.Role, req.TTLSeconds, req.Workspaces, req.TokenIdentity)
-		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
-			return
-		}
-		workspaceops.RecordAuthAudit(dataDir(), workspaceops.AuthAuditEvent{
-			Action: "mint", Actor: auditActor(r), TokenID: req.ID, Role: req.Role,
-			Method: r.Method, Path: r.URL.Path, RemoteAddr: r.RemoteAddr,
-		})
-		writeJSON(w, http.StatusOK, map[string]any{"id": req.ID, "token": raw, "note": "store this now; it is not recoverable"})
-	})
-	mux.HandleFunc("POST /api/auth/tokens/{id}/rotate", func(w http.ResponseWriter, r *http.Request) {
-		if !requireRole(w, r, "admin") {
-			return
-		}
-		var req struct {
-			TTLSeconds int `json:"ttl_seconds"`
-		}
-		_ = json.NewDecoder(r.Body).Decode(&req) // body optional
-		id := r.PathValue("id")
-		raw, err := workspaceops.RotateToken(dataDir(), id, req.TTLSeconds)
-		if err != nil {
-			status := http.StatusBadRequest
-			if errors.Is(err, os.ErrNotExist) {
-				status = http.StatusNotFound
-			}
-			writeJSON(w, status, map[string]any{"error": err.Error()})
-			return
-		}
-		workspaceops.RecordAuthAudit(dataDir(), workspaceops.AuthAuditEvent{
-			Action: "rotate", Actor: auditActor(r), TokenID: id,
-			Method: r.Method, Path: r.URL.Path, RemoteAddr: r.RemoteAddr,
-		})
-		writeJSON(w, http.StatusOK, map[string]any{"id": id, "token": raw, "note": "old token invalidated; store this now"})
-	})
-	mux.HandleFunc("DELETE /api/auth/tokens/{id}", func(w http.ResponseWriter, r *http.Request) {
-		if !requireRole(w, r, "admin") {
-			return
-		}
-		id := r.PathValue("id")
-		if err := workspaceops.RevokeToken(dataDir(), id); err != nil {
-			status := http.StatusInternalServerError
-			if errors.Is(err, os.ErrNotExist) {
-				status = http.StatusNotFound
-			}
-			writeJSON(w, status, map[string]any{"error": err.Error()})
-			return
-		}
-		workspaceops.RecordAuthAudit(dataDir(), workspaceops.AuthAuditEvent{
-			Action: "revoke", Actor: auditActor(r), TokenID: id,
-			Method: r.Method, Path: r.URL.Path, RemoteAddr: r.RemoteAddr,
-		})
-		writeJSON(w, http.StatusOK, map[string]any{"revoked": id})
-	})
-	mux.HandleFunc("GET /api/auth/audit", func(w http.ResponseWriter, r *http.Request) {
-		if !requireRole(w, r, "admin") {
-			return
-		}
-		limit := 100
-		if v := r.URL.Query().Get("limit"); v != "" {
-			if n, err := strconv.Atoi(v); err == nil {
-				limit = n
-			}
-		}
-		writeJSON(w, http.StatusOK, workspaceops.ListAuthAudit(dataDir(), limit))
 	})
 	// --- OpenAI-compatible providers (Ollama / vLLM / LM Studio / OpenAI / VLM) ---
 	respond := func(w http.ResponseWriter, err error, result any) {
