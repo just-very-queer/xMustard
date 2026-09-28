@@ -46,15 +46,15 @@ func splitAt(k int) func() int {
 
 // Every golden secret, split by every write boundary: a Writer buffers writes into
 // the Reader's windows, so the boundaries that matter are where a window ends (the
-// input a step sees stops there) and where its decisions stop (the lookahead). Each
-// sample is placed so that each boundary falls at every byte of it, and is written
-// in random-size and one-byte writes. The output is the one-window output, byte for
-// byte, and the report counts the same redactions.
+// input a step sees stops there), where its decisions stop (the lookahead) and where
+// the buffer is full and makes room. Each sample is placed so that each boundary
+// falls at every byte of it, and is written in random-size and one-byte writes. The
+// output is the one-window output, byte for byte, and the report counts the same
+// redactions.
 func TestWriterSplitsEveryGoldenSecretAtEveryBoundary(t *testing.T) {
 	r := Default()
-	first := contextLen + windowSize - 1 // input bytes in the first window
-	boundaries := map[string]int{"window end": first, "decision limit": first - lookahead}
-	prefix := filler(rand.New(rand.NewSource(11)), first+1)
+	boundaries := map[string]int{"window end": windowEnd, "decision limit": windowLimit, "buffer end": contextLen + windowSize - 1}
+	prefix := filler(rand.New(rand.NewSource(11)), contextLen+windowSize)
 	tail := " " + filler(rand.New(rand.NewSource(12)), 2000)
 	for _, s := range secretCorpus() {
 		t.Run(s.name, func(t *testing.T) {
@@ -233,57 +233,92 @@ func TestWriterMemoryIsBounded(t *testing.T) {
 		t.Fatalf("live heap grew by %d KiB while writing 32 MiB; want O(1) (< 1 MiB)", growth>>10)
 	}
 
-	// dense trigger literals and secrets: allocations stay bounded, the live heap too
-	const dense = 16 << 20
-	const allocBound, heapBound = 4 << 20, 2 << 20
-	fill := func(unit string) []byte { return bytes.Repeat([]byte(unit), dense/len(unit)+1)[:dense] }
-	for _, unit := range []string{"hf_", "sk-", "://", "token:", `"password":"`, "password=Zx9!Zx9!\n",
-		join("-----BEGIN ", "PRIVATE", " KEY-----"), "Authorization: Bearer abcdefghijklmnopqrstuvwxyz0123456789\n"} {
-		in := fill(unit)
-		var a, b runtime.MemStats
-		runtime.GC()
-		runtime.ReadMemStats(&a)
-		w := Default().NewWriter(io.Discard)
-		for rest := in; len(rest) > 0; {
-			k := min(32<<10, len(rest)) // the capture sink's write size
-			_, _ = w.Write(rest[:k])
-			rest = rest[k:]
-		}
-		_ = w.Flush()
-		runtime.ReadMemStats(&b)
-		runtime.GC()
-		var c runtime.MemStats
-		runtime.ReadMemStats(&c)
-		alloc, live := b.TotalAlloc-a.TotalAlloc, int64(c.HeapAlloc)-int64(a.HeapAlloc)
-		runtime.KeepAlive(w)
-		runtime.KeepAlive(in)
-		t.Logf("%-12.12q x16 MiB: %d redactions, allocated %d KiB, retained %d KiB", unit, w.Report().Count, alloc>>10, live>>10)
-		if alloc > allocBound || live > heapBound {
-			t.Errorf("%q: allocated %d KiB, retained %d KiB; want under %d and %d KiB", unit, alloc>>10, live>>10, allocBound>>10, heapBound>>10)
+	// Dense input, one unit repeated, in the capture decoder's 32 KiB writes: the
+	// trigger literals cost the detectors most, and the densest secrets (a candidate
+	// every 8 to 18 bytes, each replaced by a longer marker) cost a window's scratch
+	// and output most. A window decides decideSpan bytes whatever their density, so
+	// the allocations and the live heap, sampled after every MiB, stay bounded.
+	env := New(WithEnv(SecretEnv([]string{"DB_PASSWORD=hunter22"})...))
+	dense := []struct {
+		r    *Redactor
+		unit string
+	}{
+		{Default(), "hf_"}, {Default(), "sk-"}, {Default(), "://"}, {Default(), "token:"}, {Default(), `"password":"`},
+		{Default(), join("-----BEGIN ", "PRIVATE", " KEY-----")},
+		{Default(), "password=Zx9!Zx9!\n"}, {Default(), "secret=x\n"}, {Default(), `"secret":"x"`},
+		{Default(), "Authorization: Bearer abcdefghijklmnopqrstuvwxyz0123456789\n"},
+		{env, "hunter22"}, {env, "hunter22\n"},
+		// one long secret value that crosses every window's limit and holds an
+		// environment secret every 8 bytes, which the next window evaluates again
+		{env, "API_TOKEN=" + strings.Repeat("hunter22", 8<<10) + "\n"},
+		{env, `{"password":"` + strings.Repeat("hunter22", 8<<10) + `"}` + "\n"},
+	}
+	const allocBound, heapBound = 2 << 20, 512 << 10
+	for _, d := range dense {
+		w, alloc, peak := streamDense(d.r, d.unit, 16<<20)
+		t.Logf("%-14.14q x16 MiB: %7d redactions, allocated %5d KiB, live heap peak +%4d KiB", d.unit, w.Report().Count, alloc>>10, peak>>10)
+		if alloc > allocBound || peak > heapBound {
+			t.Errorf("%q: allocated %d KiB, live heap peak +%d KiB; want under %d and %d KiB", d.unit, alloc>>10, peak>>10, allocBound>>10, heapBound>>10)
 		}
 	}
 }
 
-// BenchmarkWriter16MiB redacts a 16 MiB stream (a secret pair every ~4 KiB) in the
-// capture sink's 32 KiB writes.
+// streamDense writes size bytes of unit, repeated, through a new Writer of r in
+// the capture decoder's 32 KiB writes, then flushes. It returns the Writer, the
+// bytes allocated, and the peak growth of the live heap, sampled after every MiB.
+func streamDense(r *Redactor, unit string, size int) (w *Writer, alloc uint64, peak int64) {
+	in := bytes.Repeat([]byte(unit), size/len(unit)+1)[:size]
+	var a, ms runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&a)
+	sample := func() {
+		runtime.GC()
+		runtime.ReadMemStats(&ms)
+		peak = max(peak, int64(ms.HeapAlloc)-int64(a.HeapAlloc))
+	}
+	w = r.NewWriter(io.Discard)
+	for off := 0; off < len(in); off += 32 << 10 {
+		_, _ = w.Write(in[off:min(off+32<<10, len(in))])
+		if (off+32<<10)%(1<<20) == 0 {
+			sample()
+		}
+	}
+	_ = w.Flush()
+	runtime.ReadMemStats(&ms)
+	alloc = ms.TotalAlloc - a.TotalAlloc
+	sample()
+	runtime.KeepAlive(w)
+	runtime.KeepAlive(in)
+	return w, alloc, peak
+}
+
+// BenchmarkWriter16MiB redacts 16 MiB in the capture sink's 32 KiB writes: a
+// stream with a secret pair every ~4 KiB, and one that is nothing but secrets.
 func BenchmarkWriter16MiB(b *testing.B) {
 	const size = 16 << 20
-	in, err := io.ReadAll(&genReader{left: size, rng: rand.New(rand.NewSource(1))})
+	sparse, err := io.ReadAll(&genReader{left: size, rng: rand.New(rand.NewSource(1))})
 	if err != nil {
 		b.Fatal(err)
 	}
-	b.SetBytes(size)
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		w := Default().NewWriter(io.Discard)
-		for rest := in; len(rest) > 0; {
-			k := min(32<<10, len(rest))
-			_, _ = w.Write(rest[:k])
-			rest = rest[k:]
-		}
-		if err := w.Flush(); err != nil {
-			b.Fatal(err)
-		}
+	inputs := []struct {
+		name string
+		in   []byte
+	}{{"sparse", sparse}, {"dense", bytes.Repeat([]byte("secret=x\n"), size/9+1)[:size]}}
+	for _, tc := range inputs {
+		b.Run(tc.name, func(b *testing.B) {
+			b.SetBytes(size)
+			b.ReportAllocs()
+			for b.Loop() {
+				w := Default().NewWriter(io.Discard)
+				for rest := tc.in; len(rest) > 0; {
+					k := min(32<<10, len(rest))
+					_, _ = w.Write(rest[:k])
+					rest = rest[k:]
+				}
+				if err := w.Flush(); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
 	}
 }

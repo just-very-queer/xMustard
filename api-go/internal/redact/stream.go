@@ -8,10 +8,19 @@ import (
 )
 
 // Stream sizing. A Reader or Writer holds one buffer of contextLen+windowSize
-// bytes, an output buffer and per-window scratch sized by one window, so a
-// stream of any length is redacted in memory bounded by the window.
+// bytes and redacts it window by window: each window decides at most
+// decideSpan bytes and reads the lookahead after them. Its output and its
+// scratch (the candidates its detectors find) are therefore sized by
+// decideSpan, not by the buffer, so a stream of any length and any density of
+// secrets is redacted in memory bounded by the window.
 const (
-	windowSize = 128 << 10 // input bytes buffered per step
+	windowSize = 128 << 10 // input bytes buffered per refill
+	// decideSpan is the most input one stream window decides. A window also
+	// reads the lookahead after it, and evaluates again the part of the
+	// previous lookahead that a region carried past what it consumed; its
+	// detectors run over that in slices of decideSpan (engine.span), so its
+	// scratch holds one slice's worth of candidates.
+	decideSpan = 8 << 10
 	// contextLen is how many consumed bytes the next window keeps: the part of
 	// the lookahead that a region carried past it consumed, which is evaluated
 	// again, plus room for the detectors' lookbehind (at most 256 bytes).
@@ -29,6 +38,7 @@ type streamBuf struct {
 }
 
 func newStreamBuf(e *engine) streamBuf {
+	e.span = decideSpan
 	s := streamBuf{eng: e, buf: make([]byte, contextLen+windowSize)}
 	s.reset()
 	return s
@@ -41,24 +51,37 @@ func (s *streamBuf) reset() {
 	s.eng.base = -1
 }
 
-// step redacts buf[from:n], appending the output to out. A final step (no
-// input follows) consumes all of it; otherwise the undecided tail and the
-// context the next window reads move to the front of buf.
+// ready reports whether buf holds a whole window past from: decideSpan bytes
+// and the lookahead after them.
+func (s *streamBuf) ready() bool { return s.n-s.from >= decideSpan+lookahead }
+
+// step redacts the next window of buf[from:n], appending the output to out. It
+// shows the engine at most decideSpan bytes and the lookahead after them; a
+// final step (no input follows buf[:n]) that reaches n tells the engine that
+// the input ends there. Every step consumes at least one byte, unless it is
+// not final and buf holds no more than the lookahead past from.
 func (s *streamBuf) step(out []byte, final bool) []byte {
-	out, consumed := s.eng.window(out, s.buf, s.from, s.n, final)
-	keep := min(contextLen, consumed)
-	copy(s.buf, s.buf[consumed-keep:s.n])
-	s.eng.base += consumed - keep
-	s.n = keep + s.n - consumed
-	s.from = keep
+	n := min(s.n, s.from+decideSpan+lookahead)
+	out, s.from = s.eng.window(out, s.buf, s.from, n, final && n == s.n)
 	return out
+}
+
+// compact makes room for input: the undecided input, and the consumed context
+// the next window reads, move to the front of buf.
+func (s *streamBuf) compact() {
+	keep := min(contextLen, s.from)
+	copy(s.buf, s.buf[s.from-keep:s.n])
+	s.eng.base += s.from - keep
+	s.n -= s.from - keep
+	s.from = keep
 }
 
 // Reader redacts another reader as it is read. Output is identical to
 // Bytes over the whole input, whatever the chunking of the source's reads:
-// the input is processed in fixed windows, and the last 33 KiB or so of each
-// window are held back until the next one arrives, so a secret that straddles
-// a read or window boundary is seen whole before any of it is emitted.
+// the input is processed in windows, and the 33 KiB or so after what each
+// window decides are read with it and held back until the next one, so a
+// secret that straddles a read or window boundary is seen whole before any of
+// it is emitted.
 //
 // If the source fails with an error other than io.EOF, the Reader emits what
 // it had already decided, withholds the undecided tail (it may hold part of a
@@ -104,33 +127,39 @@ func (rd *Reader) Report() Report { return rd.in.eng.rep.clone() }
 func (rd *Reader) step() {
 	rd.out, rd.outPos = rd.out[:0], 0
 	in := &rd.in
-	for zero := 0; in.n < len(in.buf) && !rd.eof; {
-		k, err := rd.src.Read(in.buf[in.n:])
-		in.n += k
-		switch {
-		case errors.Is(err, io.EOF):
-			rd.eof = true
-		case err != nil:
-			rd.err, rd.eof = err, true
-		case k == 0:
-			if zero++; zero > 100 {
-				rd.err, rd.eof = io.ErrNoProgress, true
+	if !rd.eof && !in.ready() {
+		in.compact()
+		for zero := 0; in.n < len(in.buf) && !rd.eof; {
+			k, err := rd.src.Read(in.buf[in.n:])
+			in.n += k
+			switch {
+			case errors.Is(err, io.EOF):
+				rd.eof = true
+			case err != nil:
+				rd.err, rd.eof = err, true
+			case k == 0:
+				if zero++; zero > 100 {
+					rd.err, rd.eof = io.ErrNoProgress, true
+				}
 			}
 		}
 	}
-	// the final step consumes everything; after a source error the undecided
-	// tail stays withheld
-	rd.out = in.step(rd.out, rd.eof && rd.err == nil)
-	rd.done = rd.eof
+	// The final input is decided to its end. After a source error, whole
+	// windows are decided while buf holds them, then one more up to the
+	// lookahead, and the undecided tail stays withheld.
+	final, whole := rd.eof && rd.err == nil, in.ready()
+	rd.out = in.step(rd.out, final)
+	rd.done = rd.eof && (in.from == in.n || !final && !whole)
 }
 
 // Writer redacts what is written to it into another writer. What it writes
 // is what Bytes returns for the input written since it was created or last
-// flushed, whatever the sizes of the writes: writes fill the fixed windows a
-// Reader reads into, and the undecided tail of each window (the lookahead,
-// which covers the longest span any detector reads past a match) is held back
-// until more input arrives or Flush ends the input. It holds at most one
-// window, never the stream.
+// flushed, whatever the sizes of the writes: writes fill the buffer a Reader
+// reads into, each window is decided as soon as the buffer holds it and its
+// lookahead, and the undecided tail (the lookahead, which covers the longest
+// span any detector reads past a match) is held back until more input arrives
+// or Flush ends the input. It holds one buffer and one window's output and
+// scratch, never the stream.
 //
 // Flush ends an input: everything held back is redacted and written, and the
 // next write starts a new input, whose start is a boundary as the start of any
@@ -154,10 +183,13 @@ func (r *Redactor) NewWriter(dst io.Writer) *Writer {
 func (w *Writer) Write(p []byte) (int, error) {
 	n := 0
 	for w.err == nil && n < len(p) {
+		if w.in.n == len(w.in.buf) {
+			w.in.compact() // the windows it held are decided
+		}
 		k := copy(w.in.buf[w.in.n:], p[n:])
 		w.in.n += k
 		n += k
-		if w.in.n == len(w.in.buf) {
+		for w.err == nil && w.in.ready() {
 			w.emit(false)
 		}
 	}
@@ -166,10 +198,13 @@ func (w *Writer) Write(p []byte) (int, error) {
 
 // Flush redacts and writes everything held back, and ends the input.
 func (w *Writer) Flush() error {
-	if w.err == nil {
+	for w.err == nil {
 		w.emit(true)
-		w.in.eng.restart()
-		w.in.reset()
+		if w.in.from == w.in.n {
+			w.in.eng.restart()
+			w.in.reset()
+			break
+		}
 	}
 	return w.err
 }
@@ -185,10 +220,10 @@ func (w *Writer) emit(final bool) {
 }
 
 // restart readies e for a new input after its final window, keeping the
-// report and the scratch slices.
+// report, the window span and the scratch slices.
 func (e *engine) restart() {
 	clear(e.resume)
-	*e = engine{r: e.r, rep: e.rep, order: e.order, discard: e.discard,
+	*e = engine{r: e.r, rep: e.rep, order: e.order, discard: e.discard, span: e.span,
 		cands: e.cands[:0], skip: e.skip, memo: e.memo, resume: e.resume, pending: e.pending[:0], open: e.open[:0]}
 }
 
