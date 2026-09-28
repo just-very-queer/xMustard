@@ -28,6 +28,7 @@ type dedupeFixtures struct {
 			Paths       []string      `json:"paths"`
 			Claims      []MemoryClaim `json:"claims"`
 			Quarantined bool          `json:"quarantined"`
+			Reviewer    bool          `json:"reviewer"`
 		} `json:"propose"`
 		Expect struct {
 			Outcome             string            `json:"outcome"`
@@ -69,7 +70,7 @@ func TestEval02DedupeConflictFixtures(t *testing.T) {
 				}
 				keys[e.ID] = s.Key
 			}
-			who := ContextActor{ID: "agent-b"}
+			who := ContextActor{ID: "agent-b", Verifier: c.Propose.Reviewer}
 			if c.Propose.Quarantined {
 				who.Quarantine = "untrusted_capture:webfetch"
 			}

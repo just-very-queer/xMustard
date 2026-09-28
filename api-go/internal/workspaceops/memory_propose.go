@@ -333,7 +333,8 @@ func ProposeContext(dataDir, workspaceID string, req ProposeContextRequest) (*Co
 	extracted, warnings := proposalAnchors(ctx, root, workspaceID, title+"\n"+req.Content, declared)
 	review := reviewInput{workspaceID: workspaceID, scope: "workspace", content: req.Content, declared: declared, anchors: extracted,
 		claims: claims, intent: len(supersedes)+len(claims)+len(relations) > 0, quarantine: caller.Quarantine,
-		kind: req.Kind, topic: normalizeTopic(req.Topic), tags: cleanPaths(req.Tags), expires: strings.TrimSpace(req.Expires)}
+		kind: req.Kind, topic: normalizeTopic(req.Topic), tags: cleanPaths(req.Tags), expires: strings.TrimSpace(req.Expires),
+		reviewer: caller.Verifier || caller.Approver}
 	quota := currentMemoryQuota()
 	var out ContextEntry
 	var promoted bool

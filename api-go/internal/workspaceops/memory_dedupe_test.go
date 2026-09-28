@@ -104,9 +104,14 @@ func TestNearDuplicatesAreReportedWithSimilarity(t *testing.T) {
 		t.Fatalf("mid-similarity restatement: %+v", similar.PossibleDuplicates)
 	}
 	pending := rememberAs(t, dir, ws, ContextActor{ID: "agent-d"}, "Integration tests use the fake gateway on port 9099.")
-	again := rememberAs(t, dir, ws, ContextActor{ID: "agent-e"}, "integration tests use the fake gateway on port 9099.")
+	again := rememberAs(t, dir, ws, ContextActor{ID: "agent-e", Verifier: true}, "integration tests use the fake gateway on port 9099.")
 	if again.Outcome != OutcomeCreated || dupIDs(again)[pending.ID] != MatchExact || again.PossibleDuplicates[0].State != govstore.RankPending {
 		t.Fatalf("exact duplicate of a pending entry: %+v", again)
+	}
+	// a proposer that may not read unverified memory is told nothing about it
+	blind := rememberAs(t, dir, ws, ContextActor{ID: "agent-f"}, "Integration tests use the fake gateway on port 9099!")
+	if _, ok := dupIDs(blind)[pending.ID]; ok {
+		t.Fatalf("pending text leaked to a proposer without the verifier role: %+v", blind.PossibleDuplicates)
 	}
 }
 

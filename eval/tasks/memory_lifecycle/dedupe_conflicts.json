@@ -2,7 +2,7 @@
   "schema": "xmustard.eval.dedupe_conflicts/v1",
   "requirement": "PAR-EVAL-02",
   "workstream": "WS-27",
-  "description": "Deterministic duplicate and contradiction fixtures for propose-time review (api-go/internal/workspaceops memory_dedupe.go and memory_conflicts.go). No model runs: TestEval02DedupeConflictFixtures seeds each case's memories (served ones are approved by two peers), proposes the case's text, and checks the result. expect.outcome is created or corroborated (duplicate_of names the seed restated); expect.duplicates and expect.conflicts map every seed the result names to its match (exact, near, similar) or conflict kind (claim, contradiction, path_overlap), and no other seed may appear; suggested_supersedes lists the seeds suggested, exactly. merge_into, when set, has two peers verify the proposal duplicate_of that seed; recall must then serve the seed and not the proposal. The service-port cases reuse the memories of eval/tasks/seed.yaml's service-agreed-port task.",
+  "description": "Deterministic duplicate and contradiction fixtures for propose-time review (api-go/internal/workspaceops memory_dedupe.go and memory_conflicts.go). No model runs: TestEval02DedupeConflictFixtures seeds each case's memories (served ones are approved by two peers), proposes the case's text (as a verifier when propose.reviewer is set, since only a reviewer is told about pending memory), and checks the result. expect.outcome is created or corroborated (duplicate_of names the seed restated); expect.duplicates and expect.conflicts map every seed the result names to its match (exact, near, similar) or conflict kind (claim, contradiction, path_overlap), and no other seed may appear; suggested_supersedes lists the seeds suggested, exactly. merge_into, when set, has two peers verify the proposal duplicate_of that seed; recall must then serve the seed and not the proposal. The service-port cases reuse the memories of eval/tasks/seed.yaml's service-agreed-port task.",
   "cases": [
     {
       "id": "exact-restatement-corroborates",
@@ -25,8 +25,15 @@
     {
       "id": "exact-duplicate-of-pending-is-created",
       "seed": [{"key": "draft", "content": "Integration tests use the fake gateway on port 9099.", "served": false}],
-      "propose": {"content": "integration tests use the fake gateway on port 9099."},
+      "propose": {"content": "integration tests use the fake gateway on port 9099.", "reviewer": true},
       "expect": {"outcome": "created", "duplicates": {"draft": "exact"}}
+    },
+    {
+      "id": "pending-text-is-hidden-from-a-non-reviewer",
+      "note": "A proposer without the verifier or human-approver role may not read unverified memory, so the review never reports a pending entry to it.",
+      "seed": [{"key": "draft", "content": "Integration tests use the fake gateway on port 9099.", "served": false}],
+      "propose": {"content": "integration tests use the fake gateway on port 9099."},
+      "expect": {"outcome": "created"}
     },
     {
       "id": "short-generic-text-never-merges-fuzzily",

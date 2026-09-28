@@ -106,6 +106,10 @@ type reviewInput struct {
 	kind, topic, expires string
 	tags                 []string
 	quarantine           string
+	// reviewer: the proposer may read unverified memory (verifier or human-approver).
+	// Pending entries are its duplicates and neighbours only then, so a proposal is
+	// never an oracle for pending text its author may not read.
+	reviewer bool
 }
 
 // classifiedOtherwise reports whether the proposal asks for a classification or expiry
@@ -270,8 +274,8 @@ func anchorNeighbours(ctx context.Context, r govstore.Reader, in reviewInput) ([
 }
 
 // loadReviewCandidates reads the active entries of the proposal's workspace and scope
-// among ids, with their served content, anchors and claims. An entry whose content is
-// withheld is skipped.
+// among ids that the proposer may read, with their served content, anchors and claims.
+// An entry whose content is withheld is skipped.
 func loadReviewCandidates(ctx context.Context, r govstore.Reader, in reviewInput, ids []string) ([]*reviewCandidate, error) {
 	if len(ids) == 0 {
 		return nil, nil
@@ -297,7 +301,8 @@ func loadReviewCandidates(ctx context.Context, r govstore.Reader, in reviewInput
 		}
 		content, ok := contents[id]
 		inScope := e.WorkspaceID == in.workspaceID && e.Scope == in.scope && e.ScopeKey == in.scopeKey
-		if !inScope || e.Lifecycle != govstore.LifecycleActive || !ok || content.Withheld != "" {
+		readable := e.Served(now) || in.reviewer
+		if !inScope || !readable || e.Lifecycle != govstore.LifecycleActive || !ok || content.Withheld != "" {
 			continue
 		}
 		view := contextEntryFrom(e, nil, anchors[id])
