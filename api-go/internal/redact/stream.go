@@ -102,6 +102,96 @@ func (rd *Reader) step() {
 	rd.from = keep
 }
 
+// Writer is the push-mode counterpart of Reader, for producers that write (the
+// evidence spool, WS-23): what is written to it reaches dst redacted. Flush ends a
+// segment: the held-back tail is decided as the end of input and written, and the
+// next Write starts a new segment. Each segment's output is identical to Bytes over
+// that segment, whatever the sizes of the writes, and a secret never spans two
+// segments (a caller flushes at boundaries a secret cannot cross, such as between two
+// JSON strings). Memory is bounded by the window, as for Reader.
+type Writer struct {
+	r   *Redactor
+	dst io.Writer
+	eng *engine
+	buf []byte
+	n   int // valid bytes in buf
+	// from is the first byte not yet presented to the engine as new input.
+	from int
+	out  []byte
+	err  error
+}
+
+// NewWriter returns a Writer that writes the redaction of what it is given to dst.
+func (r *Redactor) NewWriter(dst io.Writer) *Writer {
+	w := &Writer{r: r, dst: dst, buf: make([]byte, contextLen+windowSize)}
+	w.reset(Report{})
+	return w
+}
+
+// reset starts a segment, keeping the report so far.
+func (w *Writer) reset(rep Report) {
+	w.eng = &engine{r: w.r, rep: rep}
+	w.eng.base = -1
+	w.buf[0] = '\n' // synthetic left context: the start of a segment is a boundary
+	w.n, w.from = 1, 1
+}
+
+// Write implements io.Writer.
+func (w *Writer) Write(p []byte) (int, error) {
+	written := 0
+	for len(p) > 0 {
+		if w.err != nil {
+			return written, w.err
+		}
+		k := copy(w.buf[w.n:], p)
+		w.n, p, written = w.n+k, p[k:], written+k
+		if w.n == len(w.buf) {
+			w.window(false)
+		}
+	}
+	return written, w.err
+}
+
+// Flush writes out the held-back tail of the segment and starts a new one.
+func (w *Writer) Flush() error {
+	if w.err == nil {
+		w.window(true)
+	}
+	if w.err == nil {
+		w.reset(w.eng.rep)
+	}
+	return w.err
+}
+
+// Report returns the counts so far, across segments.
+func (w *Writer) Report() Report { return w.eng.rep.clone() }
+
+// window decides one window (final: every remaining window of the segment), writes
+// what it decided, and keeps the consumed context and the undecided lookahead.
+func (w *Writer) window(final bool) {
+	for {
+		var consumed int
+		w.out, consumed = w.eng.window(w.out[:0], w.buf, w.from, w.n, final)
+		if len(w.out) > 0 {
+			if _, err := w.dst.Write(w.out); err != nil {
+				w.err = err
+				return
+			}
+		}
+		if final && consumed >= w.n {
+			return
+		}
+		keep := min(contextLen, consumed)
+		copy(w.buf, w.buf[consumed-keep:w.n])
+		w.eng.base += consumed - keep
+		w.n = keep + w.n - consumed
+		w.from = keep
+		if !final {
+			return
+		}
+	}
+}
+
 // Copy redacts src into dst and returns the bytes written and the report.
 func (r *Redactor) Copy(dst io.Writer, src io.Reader) (int64, Report, error) {
 	rd := r.NewReader(src)

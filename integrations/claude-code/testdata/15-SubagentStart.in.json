@@ -1,0 +1,8 @@
+{
+  "session_id": "sess-7f3a",
+  "transcript_path": "/home/dev/.claude/projects/-repo/sess-7f3a.jsonl",
+  "cwd": "${ROOT}",
+  "hook_event_name": "SubagentStart",
+  "agent_id": "agent-9e1",
+  "agent_type": "Explore"
+}

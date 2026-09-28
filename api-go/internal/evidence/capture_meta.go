@@ -168,7 +168,7 @@ func (s *Store) Observe(ctx context.Context, reg *Registry, in ObservationInput)
 	}
 	d, err := s.Capture(withReduceHook(ctx, hook), sp, CaptureRequest{
 		WorkspaceID: in.WorkspaceID, RepoScope: in.RepoScope, Actor: in.Actor, AuthEnforced: in.AuthEnforced,
-		Issuer: "capture:" + meta.Client, SessionID: meta.SessionID, CallID: meta.CallID, Tool: meta.Tool,
+		Issuer: "capture:" + meta.Client, SessionID: meta.SessionID, AgentID: meta.AgentID, CallID: meta.CallID, Tool: meta.Tool,
 		ToolVersion: meta.ToolVersion, ArgsDigest: meta.ArgsDigest, IsError: meta.IsError, ContentType: meta.ContentType,
 		// no RepoKey: the producing repository state was not observed
 	})

@@ -112,6 +112,9 @@ const COMMANDS: &[Command] = &[
         Residency::Resident,
         xmustard_core::index::watch::run,
     ),
+    // Tree-sitter syntax errors of a few changed files (the hook service's post-edit
+    // diagnostics delta): bounded, in-process, no child.
+    cmd("syntax-check", Residency::Resident, syntax_check),
 ];
 
 const fn cmd(name: &'static str, residency: Residency, run: fn(Args) -> CmdResult) -> Command {
@@ -199,6 +202,16 @@ fn path_symbols(mut args: Args) -> CmdResult {
         Ok(result) => json(&result),
         Err(err) => Err(CmdError::failed(format!("path-symbols failed: {err}"))),
     }
+}
+
+fn syntax_check(mut args: Args) -> CmdResult {
+    let usage = "xmustard-core syntax-check <root_path> <relative_path>...";
+    let root = need(&mut args, usage)?;
+    let paths: Vec<String> = args.collect();
+    if paths.is_empty() {
+        return Err(CmdError::usage(usage));
+    }
+    json(&xmustard_core::syntaxcheck::check(&PathBuf::from(root), &paths))
 }
 
 fn explain_path(mut args: Args) -> CmdResult {

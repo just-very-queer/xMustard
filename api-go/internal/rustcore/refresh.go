@@ -182,6 +182,21 @@ func TakeRefresh(ctx context.Context, root string, force bool) *RefreshBatch {
 	return taken.Batch
 }
 
+// NoteChanged feeds root-relative paths a client reported changed (a Claude Code
+// hook's FileChanged, an edit, a Bash command's changed files; PAR-FRESH-07) to root's
+// watcher, where they join the pending batch like native events. It runs only on the
+// live worker and starts nothing (WithResidentOnly): with no watcher on root it does
+// nothing and reports false.
+func NoteChanged(ctx context.Context, root string, rels []string) bool {
+	if len(rels) == 0 || !Watched(root) {
+		return false
+	}
+	args := []string{"note", root}
+	args = append(args, rels...)
+	_, err := watchCall(WithResidentOnly(ctx), args...)
+	return err == nil
+}
+
 // FinishRefresh reports batch b done (ok) or failed; the watcher retries a failed batch
 // with backoff. report is the index update's report; its refresh counters (reparsed,
 // reresolved, escalated) go to the watcher's status.

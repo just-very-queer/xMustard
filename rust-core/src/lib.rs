@@ -21,6 +21,7 @@ pub mod secretpath;
 pub mod semantic;
 pub mod serve;
 pub mod symbolgraph;
+pub mod syntaxcheck;
 pub mod treesitter;
 pub mod verification;
 pub mod wiki;

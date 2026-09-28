@@ -1,0 +1,27 @@
+{
+  "session_id": "sess-7f3a",
+  "transcript_path": "/home/dev/.claude/projects/-repo/sess-7f3a.jsonl",
+  "cwd": "${ROOT}",
+  "permission_mode": "default",
+  "hook_event_name": "PostToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "git commit -am 'round half even'",
+    "description": "Commit"
+  },
+  "tool_response": {
+    "stdout": "[main 4b1f0c2] round half even\n 1 file changed, 2 insertions(+)\n",
+    "stderr": "",
+    "interrupted": false,
+    "isImage": false,
+    "bashEditDiff": {
+      "changedFiles": [
+        "${ROOT}/src/billing.go"
+      ],
+      "files": [],
+      "moreFiles": 1
+    }
+  },
+  "tool_use_id": "toolu_07Bash",
+  "duration_ms": 40
+}

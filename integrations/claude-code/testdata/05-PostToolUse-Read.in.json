@@ -1,0 +1,23 @@
+{
+  "session_id": "sess-7f3a",
+  "transcript_path": "/home/dev/.claude/projects/-repo/sess-7f3a.jsonl",
+  "cwd": "${ROOT}",
+  "permission_mode": "default",
+  "hook_event_name": "PostToolUse",
+  "tool_name": "Read",
+  "tool_input": {
+    "file_path": "${ROOT}/src/ledger.go"
+  },
+  "tool_response": {
+    "type": "text",
+    "file": {
+      "filePath": "${ROOT}/src/ledger.go",
+      "content": "${BIG_SOURCE}",
+      "numLines": 1200,
+      "startLine": 1,
+      "totalLines": 1200
+    }
+  },
+  "tool_use_id": "toolu_03Read",
+  "duration_ms": 4
+}

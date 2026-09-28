@@ -1,0 +1,6 @@
+{
+  "hookSpecificOutput": {
+    "hookEventName": "PreToolUse",
+    "additionalContext": "[xmustard] index hits for \"roundHalfEven\" (the xmustard search tool returns more, with snippets):\n\u003cxmustard-data kind=\"search\" trust=\"index\"\u003e\nsrc/billing.go:3-5 symbol roundHalfEven [bm25,name]\nsrc/ledger.go:1 chunk total [bm25]\nindex resident_index at 4b1f0c2d9e8a: current\n\u003c/xmustard-data\u003e"
+  }
+}

@@ -45,10 +45,7 @@ func openWorkspaceFileBeneath(root, rel string) (*os.File, error) {
 	}
 
 	parts := strings.Split(filepath.Clean(rel), string(filepath.Separator))
-	// opened, not cur == rootFd, says a component was opened: closing the parent
-	// before the next open lets the kernel hand a later component the root's old fd
-	// number, which made every two-component path look like the root.
-	opened := false
+	walked := false // a component was opened: cur is no longer the root
 	for i, part := range parts {
 		if part == "" || part == "." {
 			continue
@@ -71,11 +68,13 @@ func openWorkspaceFileBeneath(root, rel string) (*os.File, error) {
 			}
 			return nil, err
 		}
-		cur, opened = next, true
+		cur, walked = next, true
 	}
 
-	if !opened {
-		// rel cleaned to "." — that's the root directory, not a file.
+	if !walked {
+		// rel cleaned to "." — that's the root directory, not a file. (Comparing cur
+		// with rootFd cannot tell: the kernel reuses the root's descriptor number once
+		// it is closed, so an even-depth path such as "src/a.go" ended on it.)
 		closeCur()
 		return nil, errEmptyPath
 	}
