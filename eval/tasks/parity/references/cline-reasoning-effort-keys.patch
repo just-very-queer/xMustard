@@ -1,0 +1,52 @@
+diff --git a/sdk/packages/shared/src/llms/reasoning-effort.ts b/sdk/packages/shared/src/llms/reasoning-effort.ts
+index 1d16e695..f2a07cbf 100644
+--- a/sdk/packages/shared/src/llms/reasoning-effort.ts
++++ b/sdk/packages/shared/src/llms/reasoning-effort.ts
+@@ -11,15 +11,27 @@ export type ReasoningEffortValue = keyof typeof REASONING_EFFORT_RATIOS;
+ export const DEFAULT_REASONING_EFFORT: ReasoningEffortValue | undefined =
+ 	undefined;
+ 
++/**
++ * Normalizes a reasoning effort name. Only the table's own keys count, so inherited
++ * object keys such as "constructor" or "__proto__" are not effort levels.
++ */
++function parseReasoningEffort(value?: string): ReasoningEffortValue | undefined {
++	if (typeof value !== "string") {
++		return undefined;
++	}
++	const effort = value.trim().toLowerCase();
++	return Object.hasOwn(REASONING_EFFORT_RATIOS, effort)
++		? (effort as ReasoningEffortValue)
++		: undefined;
++}
++
+ export function resolveEffectiveReasoningEffort(
+ 	reasoningEffort?: string,
+ 	thinking?: boolean,
+ ): ReasoningEffortValue | undefined {
+-	if (
+-		typeof reasoningEffort === "string" &&
+-		reasoningEffort.toLowerCase() in REASONING_EFFORT_RATIOS
+-	) {
+-		return reasoningEffort.toLowerCase() as ReasoningEffortValue;
++	const effort = parseReasoningEffort(reasoningEffort);
++	if (effort) {
++		return effort;
+ 	}
+ 
+ 	return thinking ? DEFAULT_REASONING_EFFORT : undefined;
+@@ -29,11 +41,10 @@ export function resolveReasoningEffortRatio(
+ 	effort?: string,
+ 	options?: { fallbackEffort?: ReasoningEffortValue },
+ ): number | undefined {
+-	const normalizedEffort =
+-		typeof effort === "string" ? effort.toLowerCase() : undefined;
++	const normalizedEffort = parseReasoningEffort(effort);
+ 
+-	if (normalizedEffort && normalizedEffort in REASONING_EFFORT_RATIOS) {
+-		return REASONING_EFFORT_RATIOS[normalizedEffort as ReasoningEffortValue];
++	if (normalizedEffort) {
++		return REASONING_EFFORT_RATIOS[normalizedEffort];
+ 	}
+ 
+ 	if (options?.fallbackEffort) {

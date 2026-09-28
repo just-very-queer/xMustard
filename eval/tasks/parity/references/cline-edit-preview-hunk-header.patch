@@ -1,0 +1,15 @@
+diff --git a/apps/cli/src/tui/utils/diff.ts b/apps/cli/src/tui/utils/diff.ts
+index b30f7045..21b552e1 100644
+--- a/apps/cli/src/tui/utils/diff.ts
++++ b/apps/cli/src/tui/utils/diff.ts
+@@ -91,6 +91,10 @@ export function makeUnifiedDiff(
+ 			if (ops[k].type !== "-") newStart++;
+ 		}
+ 
++		// An empty range starts at the line before the change (0 at the start of the file).
++		if (oldCount === 0) oldStart--;
++		if (newCount === 0) newStart--;
++
+ 		output.push(`@@ -${oldStart},${oldCount} +${newStart},${newCount} @@`);
+ 		for (let k = hunkStart; k < hunkEnd; k++) {
+ 			const prefix = ops[k].type === " " ? " " : ops[k].type;

@@ -5,7 +5,7 @@
 # and an unreviewed note), and a coding-memory lifecycle task whose answer exists only
 # in shared memory. They are for dry runs and harness checks, not for parity claims; the
 # evaluation corpus proper (Apache/MIT repositories, oracles validated to fail on the
-# starting state and pass on the reference) is authored in WS-63.
+# starting state and pass on the reference) is parity/corpus.yaml (WS-63).
 schema: xmustard.eval/v1
 name: seed
 description: Harness seed tasks (bugfix, feature, memory lifecycle) on generated Go fixtures.
