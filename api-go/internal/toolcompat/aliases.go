@@ -109,6 +109,7 @@ var argAliases = map[string]string{
 	"absolutepath": "path",    // Cline
 	"regex":        "pattern", // Cline search_files
 	"filepattern":  "glob",    // Cline search_files, like Claude Code Grep's glob
+	"patchtext":    "patch",   // OpenCode apply_patch (tool/apply_patch.ts)
 }
 
 // kindAliases holds per-tool vocabulary for xMustard's nine MCP tools, keyed by
