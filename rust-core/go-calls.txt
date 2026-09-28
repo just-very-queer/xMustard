@@ -47,6 +47,7 @@ called search
 called semantic-impact
 called symbolgraph blast-radius
 called symbolgraph build
+called symbolgraph changes
 called symbolgraph cluster-of
 called symbolgraph clusters
 called symbolgraph coverage

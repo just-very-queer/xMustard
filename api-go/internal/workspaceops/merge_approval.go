@@ -10,10 +10,10 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"strings"
 	"time"
 
+	"xmustard/api-go/internal/gitdiff"
 	"xmustard/api-go/internal/govstore"
 )
 
@@ -56,7 +56,7 @@ const reviewDiffTimeout = 2 * time.Minute
 
 // ReviewedChange is the change an attestation binds to. Repository is the workspace's
 // canonical root; MergeBase is the merge base of BaseRef and Head; DiffSHA256 digests
-// the hardened diff from MergeBase to Head (reviewDiffArgs), DiffBytes is its size.
+// the hardened diff from MergeBase to Head (gitdiff.ReviewDiffArgs), DiffBytes is its size.
 type ReviewedChange struct {
 	WorkspaceID string `json:"workspace_id"`
 	Repository  string `json:"repository"`
@@ -174,73 +174,28 @@ func diffAt(ctx context.Context, workspaceID, root, baseRef, base, head string, 
 		sink = io.MultiWriter(h, text)
 	}
 	counted := &countingWriter{w: sink}
-	if err := reviewGit(ctx, root, counted, reviewDiffArgs(c.MergeBase, head)...); err != nil {
+	if err := reviewGit(ctx, root, counted, gitdiff.ReviewDiffArgs(c.MergeBase, head)...); err != nil {
 		return ReviewedChange{}, fmt.Errorf("diff %s..%s: %w", c.MergeBase, head, err)
 	}
 	c.DiffSHA256, c.DiffBytes = hex.EncodeToString(h.Sum(nil)), counted.n
 	return c, nil
 }
 
-// reviewDiffArgs is the diff an attestation digests. Every option that repository
-// configuration could change is pinned on the command line (algorithm, context,
-// prefixes, renames, relative paths, submodule format, order file, binary and full
-// index), and no external diff or text conversion runs.
-func reviewDiffArgs(from, to string) []string {
-	return []string{"diff", "--no-color", "--no-ext-diff", "--no-textconv", "--binary", "--full-index",
-		"--no-renames", "--no-relative", "--diff-algorithm=myers", "--indent-heuristic", "--inter-hunk-context=0",
-		"-U3", "--src-prefix=a/", "--dst-prefix=b/", "--ignore-submodules=none", "--submodule=short",
-		"-O" + os.DevNull, from, to, "--"}
-}
-
 // resolveCommit resolves ref to a full commit id. A ref shaped like an option is
 // refused before git sees it.
 func resolveCommit(ctx context.Context, root, ref string) (string, error) {
-	ref = strings.TrimSpace(ref)
-	if ref == "" || strings.HasPrefix(ref, "-") || len(ref) > 256 || strings.ContainsAny(ref, " \t\r\n\x00") {
-		return "", fmt.Errorf("ref %q is not a revision: %w", ref, ErrInvalidInput)
+	id, err := gitdiff.ResolveCommit(ctx, root, ref, reviewDiffTimeout)
+	if errors.Is(err, gitdiff.ErrBadRef) {
+		return "", fmt.Errorf("%w: %w", err, ErrInvalidInput)
 	}
-	var out bytes.Buffer
-	if err := reviewGit(ctx, root, &out, "rev-parse", "--verify", "--quiet", ref+"^{commit}"); err != nil {
-		return "", fmt.Errorf("ref %q does not name a commit: %w", ref, ErrInvalidInput)
-	}
-	return strings.TrimSpace(out.String()), nil
+	return id, err
 }
 
-// reviewGit runs reviewGitCommand to completion within reviewDiffTimeout, writing
-// stdout to w.
+// reviewGit runs git in root under the hardened diff policy (gitdiff: system and global
+// configuration ignored, hooks and the fsmonitor off, every GIT_* and XMUSTARD_*
+// variable removed, so the approver's token never reaches it), writing stdout to w.
 func reviewGit(ctx context.Context, root string, w io.Writer, args ...string) error {
-	ctx, cancel := context.WithTimeout(ctx, reviewDiffTimeout)
-	defer cancel()
-	cmd := reviewGitCommand(ctx, root, args...)
-	cmd.Stdout = w
-	var stderr bytes.Buffer
-	cmd.Stderr = &limitedBuffer{buf: &stderr, max: 4 << 10}
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("git %s: %w: %s", args[0], err, strings.TrimSpace(stderr.String()))
-	}
-	return nil
-}
-
-// reviewGitCommand is git in root with the system and global configuration ignored,
-// hooks and the fsmonitor off, and every GIT_* and XMUSTARD_* variable removed from its
-// environment (the approver's token never reaches it).
-func reviewGitCommand(ctx context.Context, root string, args ...string) *exec.Cmd {
-	full := append([]string{"-c", "core.hooksPath=" + os.DevNull, "-c", "core.fsmonitor=false", "-c", "core.quotePath=true"}, args...)
-	cmd := exec.CommandContext(ctx, "git", full...)
-	cmd.Dir, cmd.WaitDelay = root, time.Second
-	cmd.Env = append(scrubbedGitEnv(), "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL="+os.DevNull,
-		"GIT_TERMINAL_PROMPT=0", "GIT_OPTIONAL_LOCKS=0", "LC_ALL=C")
-	return cmd
-}
-
-func scrubbedGitEnv() []string {
-	var out []string
-	for _, kv := range os.Environ() {
-		if !strings.HasPrefix(kv, "GIT_") && !strings.HasPrefix(kv, "XMUSTARD_") {
-			out = append(out, kv)
-		}
-	}
-	return out
+	return gitdiff.Run(ctx, root, w, reviewDiffTimeout, args...)
 }
 
 type countingWriter struct {
@@ -252,19 +207,6 @@ func (c *countingWriter) Write(p []byte) (int, error) {
 	n, err := c.w.Write(p)
 	c.n += int64(n)
 	return n, err
-}
-
-// limitedBuffer keeps the first max bytes written and discards the rest.
-type limitedBuffer struct {
-	buf *bytes.Buffer
-	max int
-}
-
-func (l *limitedBuffer) Write(p []byte) (int, error) {
-	if room := l.max - l.buf.Len(); room > 0 {
-		l.buf.Write(p[:min(room, len(p))])
-	}
-	return len(p), nil
 }
 
 // ApproveMerge records h's attestation that they reviewed the change from the merge

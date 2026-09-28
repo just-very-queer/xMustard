@@ -34,7 +34,8 @@ esac
 	if n := len(f); n < 6 || f[1] != "impact-file" || f[n-3] != "wsImpact" || f[n-2] != "pkg/a.go" || f[n-1] != "2" {
 		t.Fatalf("core argv %q", raw)
 	}
-	for _, q := range []string{"?path=../outside.go", "?path=%2Fetc%2Fpasswd", "?path=a.go&symbol=Add", "?path=a.go&from=A&to=B", "?path=a.go&to=B"} {
+	for _, q := range []string{"?path=../outside.go", "?path=%2Fetc%2Fpasswd", "?path=a.go&symbol=Add", "?path=a.go&from=A&to=B", "?path=a.go&to=B",
+		"?path=a.go&depth=5", "?path=a.go&direction=upstream", "?path=a.go&scope=all"} {
 		if code, out := call(t, "GET", base+q, "", "", nil); code != http.StatusBadRequest {
 			t.Errorf("%s: want 400, got %d %v", q, code, out)
 		}

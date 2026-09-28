@@ -47,6 +47,7 @@ Backend work:
 - `cd api-go && go build ./...`
 - `cd api-go && go vet -tags review ...` and `go test -tags review -run 'Review|Merge' ...` on `cmd/xmustard-ops` and `internal/workspaceops` (the review build tag, off in the default build)
 - `cd rust-core && cargo test && cargo clippy`
+- `make check-rss-lines`: the release build's RSS lines (heavy slot, index service)
 
 Frontend work:
 

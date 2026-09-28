@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"xmustard/api-go/internal/anchor"
+	"xmustard/api-go/internal/gitdiff"
 	"xmustard/api-go/internal/review"
 )
 
@@ -193,7 +194,7 @@ func (h *headBlobs) start() (err error) {
 			cancel()
 		}
 	}()
-	cmd := reviewGitCommand(ctx, h.root, "cat-file", "--batch")
+	cmd := gitdiff.Command(ctx, h.root, "cat-file", "--batch")
 	in, err := cmd.StdinPipe()
 	if err != nil {
 		return err
