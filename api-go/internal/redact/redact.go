@@ -17,16 +17,18 @@
 // *RejectError.
 //
 // The same engine serves strings (String, Bytes, Check, Findings) and streams
-// (NewReader, Copy, WriteFile). Input is processed in fixed 128 KiB windows,
-// about 33 KiB of which are held back as lookahead, which covers everything a
-// detector reads past where it matched. A window emits text in clear only
-// before the positions it has decided; a secret it found that starts later
-// (the password of a URL whose scheme it saw) is merged with the next
-// window's findings. So a secret split across read or window boundaries is
-// still found, the output is what one pass over the whole input produces
-// whatever the chunking of reads or the window boundaries, and the engine's
-// memory is bounded by the window whatever the input length (the 16 MiB
-// stream test grows the live heap by under 0.5 MiB). String and Bytes
+// (NewReader, NewWriter, Copy, WriteFile). An input of up to 128 KiB is one
+// window. A longer one, and every stream, is buffered 128 KiB at a time and
+// decided in windows of 8 KiB, each read with the 33 KiB lookahead after it,
+// which covers everything a detector reads past where it matched. A window
+// emits text in clear only before the positions it has decided; a secret it
+// found that starts later (the password of a URL whose scheme it saw) is
+// merged with the next window's findings. So a secret split across read or
+// window boundaries is still found, the output is what one pass over the
+// whole input produces whatever the chunking of reads or the window
+// boundaries, and the engine's memory is bounded by its buffer and window
+// whatever the input length (streaming 16 MiB, ordinary text or nothing but
+// secrets, grows the live heap by about 0.4 MiB at most). String and Bytes
 // also hold their result, one copy of the input's size, and String returns its
 // input without copying when nothing is redacted; Check holds nothing;
 // Findings holds one entry per secret.
@@ -65,8 +67,8 @@
 //
 //   - Memory ingest (remember): Check to refuse content with a secret, or
 //     String to store it redacted; surface the Report as `redacted`.
-//   - Evidence capture: hash the original while storing redacted bytes with
-//     r.NewReader(io.TeeReader(src, sha256.New())).
+//   - Evidence capture: NewWriter over the spool writer, flushed at every
+//     section boundary (the capture route wires it; see evidence.StreamRedactor).
 //   - Transcript and session imports: NewReader per file, or Value per decoded
 //     JSON record.
 //   - Fixtures, overflow and handoff files: WriteFile (mode 0600, atomic).
@@ -79,9 +81,11 @@ package redact
 
 import (
 	"bytes"
+	"cmp"
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -574,6 +578,10 @@ type engine struct {
 	collect bool     // record Findings
 	found   []Finding
 	base    int // input offset of buf[0]; -1 while buf[0] is the synthetic newline
+	// span, when set, is the most input one window decides, a final window
+	// included (a stream's windows; see decideSpan). Zero decides all of a
+	// final window.
+	span int
 
 	// evalFrom is the input offset from which detector positions still need
 	// their final evaluation: positions in a window's lookahead are evaluated
@@ -608,7 +616,10 @@ const lookahead = pemSpan + 512
 
 // window redacts buf[from:n], appending output to out, and returns how far the
 // input was consumed. Unconsumed bytes must be presented again, after the
-// consumed prefix (kept as context), in the next call.
+// consumed prefix (kept as context), in the next call. eof reports that the
+// input ends at n; a window decides up to n then, or, with span set, up to
+// span bytes past from, and leaves the rest to the next call as a non-final
+// window leaves its lookahead.
 //
 // A region carried from the previous window (an open continuation) is swallowed
 // first. Detectors then run from the first position that has not had its final
@@ -648,47 +659,37 @@ func (e *engine) window(out, buf []byte, from, n int, eof bool) ([]byte, int) {
 		start = max(1, s)
 	}
 	e.cands = e.cands[:0]
-	if len(e.skip) < len(e.r.triggered) {
-		e.skip = make([]int, len(e.r.triggered))
-		e.memo = make([]runMemo, len(e.r.triggered))
-	}
-	clear(e.skip)
-	clear(e.memo)
 	limit := n
 	if !eof {
 		limit = max(from, n-lookahead)
+	}
+	if e.span > 0 {
+		limit = min(limit, from+e.span)
+	}
+	if limit < n {
 		e.evalFrom = e.base + limit
 	}
-	// Only anchors before limit are decided here, so nothing past it (or, for
-	// a literal, past limit+anchorReach) is looked at.
-	e.trigger(buf, start, min(n, limit+anchorReach), n, eof)
-	if len(e.resume) < len(e.r.scanners) {
-		e.resume = make([]int, len(e.r.scanners))
-	}
-	for i, d := range e.r.scanners {
-		k := len(e.cands)
-		var stop int
-		e.cands, stop = d.find(buf, min(limit, max(start, e.resume[i]-e.base)), limit, n, eof, e.cands)
-		e.resume[i] = max(e.resume[i], e.base+stop)
-		for ; k < len(e.cands); k++ {
-			e.cands[k].scanner = int8(i + 1)
+	// Only anchors before limit are decided here. With span set, the detectors
+	// run over slices of at most span bytes, each bounded as a window is, and
+	// each slice's candidates are settled before the next, so a window's
+	// scratch holds a slice's worth, not all it evaluates again inside a
+	// carried region.
+	for lo := start; ; {
+		hi := limit
+		if e.span > 0 && lo+e.span < limit {
+			hi = lo + e.span
 		}
+		k := len(e.cands)
+		e.detect(buf, lo, hi, n, eof)
+		e.cands = e.settle(e.cands, k, hi, done)
+		if hi == limit {
+			break
+		}
+		lo = hi
 	}
 
-	// Candidates anchored at or past limit are evaluated again, with their full
-	// lookahead, in the next window; the pending ones join the rest.
-	known := e.cands[:0]
-	for _, c := range e.cands {
-		if c.anchor >= limit {
-			continue
-		}
-		if c.covers {
-			e.resume[c.scanner-1] = max(e.resume[c.scanner-1], e.base+c.end)
-		} else {
-			c.scanner = 0
-		}
-		known = append(known, c)
-	}
+	// The pending candidates join the rest.
+	known := e.cands
 	for _, c := range e.pending {
 		c.anchor, c.start, c.end = c.anchor-e.base, c.start-e.base, c.end-e.base
 		if c.cont != nil { // a value that ran to the previous window's end
@@ -714,19 +715,7 @@ func (e *engine) window(out, buf []byte, from, n int, eof bool) ([]byte, int) {
 		}
 		kept = append(kept, c)
 	}
-	sort.SliceStable(kept, func(i, j int) bool {
-		a, b := &kept[i], &kept[j]
-		if a.start != b.start {
-			return a.start < b.start
-		}
-		if a.ext != b.ext {
-			return a.ext
-		}
-		if a.prio != b.prio {
-			return a.prio < b.prio
-		}
-		return a.anchor < b.anchor
-	})
+	slices.SortStableFunc(kept, commitOrder)
 
 	// Commit, in start order, what starts before limit, extends the region
 	// carried to done, or starts inside the region that crosses limit; the
@@ -794,6 +783,73 @@ func (e *engine) window(out, buf []byte, from, n int, eof bool) ([]byte, int) {
 		out = append(out, buf[pos:consumed]...)
 	}
 	return out, consumed
+}
+
+// detect appends to e.cands what the detectors find anchored in [from, to):
+// the triggered detectors evaluate their literals up to anchorReach past to,
+// since an anchor may precede its literal, and each scanner starts where it
+// resumes. Anchors before from were found by an earlier call.
+func (e *engine) detect(buf []byte, from, to, n int, eof bool) {
+	if len(e.skip) < len(e.r.triggered) {
+		e.skip = make([]int, len(e.r.triggered))
+		e.memo = make([]runMemo, len(e.r.triggered))
+	}
+	clear(e.skip)
+	clear(e.memo)
+	e.trigger(buf, from, min(n, to+anchorReach), n, eof)
+	if len(e.resume) < len(e.r.scanners) {
+		e.resume = make([]int, len(e.r.scanners))
+	}
+	for i, d := range e.r.scanners {
+		k := len(e.cands)
+		var stop int
+		e.cands, stop = d.find(buf, min(to, max(from, e.resume[i]-e.base)), to, n, eof, e.cands)
+		e.resume[i] = max(e.resume[i], e.base+stop)
+		for ; k < len(e.cands); k++ {
+			e.cands[k].scanner = int8(i + 1)
+		}
+	}
+}
+
+// settle drops, from the candidates found from index k on, those that the
+// window does not keep: those anchored at or past to, which a later call
+// evaluates again (the next window with its full lookahead), and those inside
+// the region already redacted up to done. A candidate whose scanner looks for
+// nothing inside it first moves that scanner's resume past it, so later calls
+// skip it as the scanner itself does.
+func (e *engine) settle(cands []candidate, k, to, done int) []candidate {
+	kept := cands[:k]
+	for _, c := range cands[k:] {
+		if c.anchor >= to {
+			continue
+		}
+		if c.covers {
+			e.resume[c.scanner-1] = max(e.resume[c.scanner-1], e.base+c.end)
+		} else {
+			c.scanner = 0
+		}
+		if c.start < done && c.end <= done && c.cont == nil {
+			continue // inside what was already redacted
+		}
+		kept = append(kept, c)
+	}
+	return kept
+}
+
+// commitOrder orders a window's candidates for commit: by start, the extension
+// of the carried region first, then by priority (lower wins the label) and
+// anchor. It allocates nothing, since a stream sorts once per window.
+func commitOrder(a, b candidate) int {
+	if c := cmp.Compare(a.start, b.start); c != 0 {
+		return c
+	}
+	if a.ext != b.ext {
+		if a.ext {
+			return -1
+		}
+		return 1
+	}
+	return cmp.Or(cmp.Compare(a.prio, b.prio), cmp.Compare(a.anchor, b.anchor))
 }
 
 // extendRegion records that the last redacted region now reaches end (a

@@ -14,8 +14,9 @@ import (
 	"xmustard/api-go/internal/budget"
 )
 
-// callTool handles tools/call: strict argument validation (a protocol error), then
-// the tool run, whose failures are tool results (isError) the agent can act on.
+// callTool handles tools/call. A malformed request or an unknown tool is a protocol
+// error (JSON-RPC -32602); argument validation and the tool run fail as tool results
+// (isError) the agent can act on, as MCP 2025-11-25 specifies.
 func (s *Session) callTool(ctx context.Context, params json.RawMessage) (any, *RPCError) {
 	// decoding arguments copies their text once more: reserve before decoding
 	if scope, owned := budget.ScopeFor(ctx); !owned {
@@ -42,9 +43,8 @@ func (s *Session) callTool(ctx context.Context, params json.RawMessage) (any, *R
 	}
 	t, ok := ToolByName(p.Name)
 	if !ok {
-		// Unknown tool is reported as a tool result (isError) so the agent can
-		// self-correct, matching MCP's tool-error convention.
-		return TextResult(fmt.Sprintf("unknown tool %q", p.Name), true), nil
+		return nil, &RPCError{Code: CodeInvalidParams, Message: fmt.Sprintf("Unknown tool: %s (tools: %s)", p.Name, strings.Join(toolNames(), ", ")),
+			Data: map[string]any{"tool": p.Name, "reason": "unknown_tool"}}
 	}
 	start := time.Now()
 	res, norms, rerr := s.callKnownTool(ctx, t, p.Arguments)
@@ -63,9 +63,9 @@ func (s *Session) callKnownTool(ctx context.Context, t *Tool, raw map[string]any
 	if s.srv.opts.ReadOnly && !t.servesReads() {
 		return TextResult(fmt.Sprintf("tool %s is not served on a read-only connection (mode=%s); it changes shared memory", t.Name, ModeReadOnly), true), 0, nil
 	}
-	args, norms, rerr := buildArgsCompat(t, raw)
-	if rerr != nil {
-		return nil, 0, rerr
+	args, norms, aerr := buildArgsCompat(t, raw)
+	if aerr != nil {
+		return argErrorResult(t, aerr), 0, nil
 	}
 	if s.srv.opts.ReadOnly && t.writes(args) {
 		return TextResult(fmt.Sprintf("tool %s is served on a read-only connection (mode=%s) only without %s, which write",
@@ -97,7 +97,8 @@ func (s *Session) RunTool(ctx context.Context, t *Tool, args map[string]string, 
 func (s *Session) runTool(ctx context.Context, t *Tool, args map[string]string, norms []Normalization) (map[string]any, *RPCError) {
 	for _, a := range t.Args {
 		if a.Required && strings.TrimSpace(args[a.Name]) == "" {
-			return TextResult(fmt.Sprintf("missing required argument %q for %s", a.Name, t.Name), true), nil
+			return argErrorResult(t, &ArgError{Tool: t.Name, Argument: a.Name, Reason: "required",
+				Message: fmt.Sprintf("missing required argument %q for %s", a.Name, t.Name)}), nil
 		}
 	}
 	ws, err := s.resolveWorkspace(ctx, t, args)

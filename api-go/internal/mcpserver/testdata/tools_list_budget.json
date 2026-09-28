@@ -1,5 +1,5 @@
 {
-  "about": "Byte caps on the tools/list result (compact JSON, as the stdio shim writes it) per schema profile, protocol version and role profile. Measured 2026-09-25 (WS-54); remember content made optional and the WS-19A lifecycle arguments added as Advanced 2026-09-26, and the WS-19B provenance and evidence-bound vote arguments the same day, and the WS-20 recall filters, disclosure and budget arguments and remember's kind, topic and tags the same day (full caps grew by exactly their cost each time; the WS-20 argument descriptions live at xmustard://docs/tools, not in the schema). WS-18 (2026-09-28): the search description now names BM25 over bodies and lost 59 bytes, search's outputSchema gained omitted and next_cursor (58 bytes, 2025-06-18 only), and the Advanced cursor and path_glob arguments cost 198 bytes in the full profile; lean caps were lowered to the measured sizes. WS-21 (2026-09-28): why_failed run_id became optional and the tool non-read-only (command mode runs commands); its lean entry shrank by 9 bytes at 2025-06-18 (command, off by default, left the description) and by 53 bytes at 2024-11-05 (caps lowered), and the full caps grew by exactly the cost of its five advanced source arguments (621 bytes at 2025-06-18, 577 at 2024-11-05). WS-20 review round 2 (2026-09-28): recall's Advanced session_id gained maxLength 128, 16 bytes in the full profile only. Lower a cap when the list shrinks; never raise one to fit an addition: advertise less (declare the argument Advanced, documented at xmustard://docs/tools) or trim a description. cmd/xmustard-api checks role_profiles against the route gates.",
+  "about": "Byte caps on the tools/list result (compact JSON, as the stdio shim writes it) per schema profile, protocol version and role profile. Measured 2026-09-25 (WS-54); remember content made optional and the WS-19A lifecycle arguments added as Advanced 2026-09-26, and the WS-19B provenance and evidence-bound vote arguments the same day, and the WS-20 recall filters, disclosure and budget arguments and remember's kind, topic and tags the same day (full caps grew by exactly their cost each time; the WS-20 argument descriptions live at xmustard://docs/tools, not in the schema). WS-18 (2026-09-28): the search description now names BM25 over bodies and lost 59 bytes, search's outputSchema gained omitted and next_cursor (58 bytes, 2025-06-18 only), and the Advanced cursor and path_glob arguments cost 198 bytes in the full profile; lean caps were lowered to the measured sizes. WS-21 (2026-09-28): why_failed run_id became optional and the tool non-read-only (command mode runs commands); its lean entry shrank by 9 bytes at 2025-06-18 (command, off by default, left the description) and by 53 bytes at 2024-11-05 (caps lowered), and the full caps grew by exactly the cost of its five advanced source arguments (621 bytes at 2025-06-18, 577 at 2024-11-05). WS-20 review round 2 (2026-09-28): recall's Advanced session_id gained maxLength 128, 16 bytes in the full profile only. Lower a cap when the list shrinks; never raise one to fit an addition: advertise less (declare the argument Advanced, documented at xmustard://docs/tools) or trim a description. cmd/xmustard-api checks role_profiles against the route gates. WS-FIX-05 (2026-09-28): impact gained path= (file-level blast radius), listed in the lean schema by owner decision; every cap rose by exactly its measured 119 bytes (the path property 79, the description's path= clause 34, max_depth's description naming path= 6), for every profile, role and protocol version.",
   "role_profiles": {
     "reader": ["ground", "recall", "search", "explain", "impact", "diagnostics", "why_failed"],
     "proposer": ["ground", "recall", "remember", "search", "explain", "impact", "diagnostics", "why_failed"],
@@ -8,12 +8,12 @@
   },
   "caps": {
     "lean": {
-      "2024-11-05": {"reader": 3887, "proposer": 4580, "verifier": 4518, "agent": 5211},
-      "2025-06-18": {"reader": 6636, "proposer": 7735, "verifier": 7670, "agent": 8769}
+      "2024-11-05": {"reader": 4006, "proposer": 4699, "verifier": 4637, "agent": 5330},
+      "2025-06-18": {"reader": 6755, "proposer": 7854, "verifier": 7789, "agent": 8888}
     },
     "full": {
-      "2024-11-05": {"reader": 6044, "proposer": 7954, "verifier": 7083, "agent": 8993},
-      "2025-06-18": {"reader": 8793, "proposer": 11109, "verifier": 10235, "agent": 12551}
+      "2024-11-05": {"reader": 6163, "proposer": 8073, "verifier": 7202, "agent": 9112},
+      "2025-06-18": {"reader": 8912, "proposer": 11228, "verifier": 10354, "agent": 12670}
     }
   }
 }

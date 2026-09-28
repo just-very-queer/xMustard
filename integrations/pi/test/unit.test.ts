@@ -158,6 +158,8 @@ describe("tool specs mirror the MCP server", () => {
 		assert.equal(spec("recall").build({ workspace_id: "w" }).path, "/api/workspaces/w/context/active?max_chars=4000");
 		assert.equal(spec("search").build({ workspace_id: "w", q: "x", limit: 50 }).path, "/api/workspaces/w/search?q=x&limit=50");
 		assert.equal(spec("impact").build({ workspace_id: "w", symbol: "S", max_depth: 2 }).path, "/api/workspaces/w/changes/since-index?symbol=S&depth=2");
+		assert.equal(spec("impact").build({ workspace_id: "w", path: "a/b.go", max_depth: 2 }).path, "/api/workspaces/w/changes/since-index?path=a%2Fb.go&depth=2");
+		assert.equal(spec("impact").build({ workspace_id: "w", path: "a.go", symbol: "S" }).path, "/api/workspaces/w/changes/since-index?path=a.go&symbol=S");
 		const v = spec("verify").build({ workspace_id: "w", entry_id: "e", approve: false, note: "stale: a.go" });
 		assert.equal(v.path, "/api/workspaces/w/context/e/verify?approve=false");
 		assert.equal(v.body, '{"note":"stale: a.go"}');
