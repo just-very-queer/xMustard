@@ -359,7 +359,27 @@ func (codexShaper) build(in ShapeInput) (json.RawMessage, error) {
 	}
 	// the recovery line goes last: a reason past the spill limit keeps its head and
 	// tail, so the handle survives the cut
-	return json.Marshal(map[string]any{"decision": "block", "reason": in.Proj.Text + "\n" + joinLines(in.Note, in.Footer)})
+	return json.Marshal(map[string]any{"decision": "block", "reason": joinLines(codexStatus(in), in.Proj.Text) + "\n" + joinLines(in.Note, in.Footer)})
+}
+
+// codexShell is the name Codex gives every shell tool in a hook payload
+// (core/src/tools/hook_names.rs).
+const codexShell = "Bash"
+
+// codexStatus is the line a shell call's reason starts with. The reason replaces the
+// whole model-facing output, header included, and that header's "Process exited with
+// code N" is the only place Codex puts the exit status: the payload has the output
+// text alone (core/src/tools/context.rs, ExecCommandToolOutput). So the reason gives
+// the status when the body carries one and otherwise says it is unknown, rather than
+// let a reduced output read as a finished success.
+func codexStatus(in ShapeInput) string {
+	switch {
+	case in.Tool != codexShell || in.Body == nil:
+		return ""
+	case in.Body.ExitCode != nil:
+		return fmt.Sprintf("[xmustard] %s exited with code %d. Its output, reduced:", in.Tool, *in.Body.ExitCode)
+	}
+	return "[xmustard] exit status unknown: Codex does not pass it to hooks. The " + in.Tool + " output below is reduced; the last line names the full original."
 }
 
 func (codexShaper) validate(_ string, v any) error {

@@ -541,10 +541,13 @@ Revoking an evidence original (`DELETE .../evidence/{handle}`) or the admin purg
 outcome with `DELETE .../outcomes/{outcome_id}`, for example one holding a secret the
 redactor missed.
 
-## Client hooks (WS-23)
+## Client hooks (WS-23, WS-40a)
 
 Claude Code posts hook events to `POST /api/hooks/claude/<Event>` (an http hook) or
-through the static client `xmustard-hook` over a Unix socket (a command hook).
+through the static client `xmustard-hook` over a Unix socket (a command hook). Codex has
+no http hook handler, so it runs the client for every event
+(`xmustard-hook codex <Event>`), which posts to `POST /api/hooks/codex/<Event>`. Both
+clients' routes share the handlers and every rule below.
 
 - **Authentication and roles.** Every hook route has a row in the route gate table
   below: core, the proposer role, served in read-only mode (a hook stores only the
@@ -592,7 +595,27 @@ through the static client `xmustard-hook` over a Unix socket (a command hook).
 - **Processes.** The daemon starts no process for a hook: Rust work runs only on a
   resident worker that is already running. Claude Code itself starts the static client
   once per event for the two command hooks, SessionStart and WorktreeRemove; every
-  other event is an http hook to the running daemon.
+  other event is an http hook to the running daemon. Codex starts the client, through
+  `$SHELL -lc`, for each event its hooks.json registers.
+- **Codex answers** carry only the keys of Codex's output schema for the event (its
+  wires deny unknown fields; `hooks.ValidateCodexAnswer` checks every golden and live
+  answer). A PostToolUse `decision: "block"` replaces the tool output the model sees
+  with the reduction, and nothing else is decided: no `permissionDecision`,
+  `updatedInput` or `continue`. A block reason says that a shell command's exit
+  status is unknown, because the block also hides Codex's own header, which carries
+  it.
+- **Codex hook trust.** Codex runs a user or project hook only while the hash of its
+  definition is trusted (`hooks.state.<key>.trusted_hash` in its config.toml), and
+  xMustard never writes that on its own. `xmustard-ops codex-hooks trust` asks
+  `codex app-server` for the hooks Codex would run (`hooks/list`). It offers only
+  xMustard's own untrusted or modified hooks: synchronous command hooks whose command
+  parses as exactly `xmustard-hook codex <Event> [--workspace <id>]` for the event it
+  is registered on. It shows each command and its source file, and it records their
+  hashes (`config/batchWrite`, `hooks.state`) only after the user types `trust` at the
+  controlling terminal. No flag skips the prompt, and without a terminal it refuses.
+  A hook changed afterwards has a new hash, and Codex stops running it until it is
+  trusted again. The hooks.json `--workspace` pin is a workspace id, checked by the
+  daemon like the header it becomes.
 
 ## Health endpoint
 
@@ -641,6 +664,14 @@ whether `XMUSTARD_READ_ONLY=1` still serves the route.
 | `POST /api/hooks/claude/SubagentStop` | core | proposer | served |  | hook: queued; answered at once |
 | `POST /api/hooks/claude/UserPromptSubmit` | core | proposer | served |  | hook: memories a prompt keyword triggers |
 | `POST /api/hooks/claude/WorktreeRemove` | core | proposer | served |  | hook: forgets the worktree's cached identity |
+| `POST /api/hooks/codex/PostCompact` | core | proposer | served |  | hook: queued; answered at once |
+| `POST /api/hooks/codex/PostToolUse` | core | proposer | served |  | hook: captures the caller's own tool output; decision=block with the projection as reason |
+| `POST /api/hooks/codex/PreToolUse` | core | proposer | served |  | hook: index hits and memories for a Bash search or the files of an apply_patch |
+| `POST /api/hooks/codex/SessionEnd` | core | proposer | served |  | hook: queued; answered at once |
+| `POST /api/hooks/codex/SessionStart` | core | proposer | served |  | hook: ground's spawn-free part and core-tier memories as context |
+| `POST /api/hooks/codex/SubagentStart` | core | proposer | served |  | hook: the same context for a subagent, which has steering state of its own |
+| `POST /api/hooks/codex/SubagentStop` | core | proposer | served |  | hook: queued; answered at once |
+| `POST /api/hooks/codex/UserPromptSubmit` | core | proposer | served |  | hook: memories a prompt keyword triggers |
 | `GET /api/workspaces` | core | reader | served |  | filtered by token scope and workspace allowlist |
 | `POST /api/workspaces/load` | core | proposer | refused |  | workspace registration; below admin only a git work tree top level under XMUSTARD_REGISTER_ROOTS; id checked against the allowlist and token scope |
 | `GET /api/workspaces/{workspace_id}/changes/since-index` | core | reader | served | impact |  |

@@ -109,6 +109,10 @@ bearer_token_env_var = "XMUSTARD_API_TOKEN"
 http_headers = { "X-Xmustard-Workspace" = "<id>" }
 ```
 
+Codex hooks (`integrations/codex/`) add the output reduction and pushed memory that the
+Claude Code plugin gives. `xmustard-ops codex-hooks config > ~/.codex/hooks.json` writes
+them, and `xmustard-ops codex-hooks trust` trusts them in Codex once you type `trust`.
+
 Query parameters on `/mcp` (the relay's flags of the same names): `workspace=<id>`
 (or the `X-Xmustard-Workspace` header) binds the session; `mode=readonly` lists and
 serves only the seven read tools; `client=claude-code|codex|cursor|opencode|pi|letta`

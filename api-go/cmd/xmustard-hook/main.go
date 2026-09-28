@@ -1,7 +1,8 @@
-// Command xmustard-hook is the static hook client (WS-23, PAR-HAR-01). Claude Code
-// runs it as a command hook for the events that take no http hook (SessionStart) and
-// for those whose failure must stay silent (WorktreeRemove: a failing hook there
-// blocks the removal). It reads the event's JSON on stdin, posts it to the daemon's
+// Command xmustard-hook is the static hook client (WS-23, WS-40a; PAR-HAR-01,
+// PAR-ADP-07). Claude Code runs it as a command hook for the events that take no http
+// hook (SessionStart) and for those whose failure must stay silent (WorktreeRemove: a
+// failing hook there blocks the removal); Codex, which has no http handler, runs it
+// for every event. It reads the event's JSON on stdin, posts it to the daemon's
 // /api/hooks/<client>/<Event> over the Unix socket (transport.SocketPath) or, when no
 // daemon listens there or the socket is not private to this user, over TCP
 // (XMUSTARD_API_BASE, default http://127.0.0.1:8042), and writes the daemon's JSON
@@ -12,10 +13,13 @@
 // HTTP/1.1 to post one request (no net/http, so the binary and its start stay small)
 // and starts no process.
 //
-//	usage: xmustard-hook <client> <Event>      e.g. xmustard-hook claude SessionStart
+//	usage: xmustard-hook <client> <Event> [--workspace <id>]
+//	       e.g. xmustard-hook claude SessionStart, xmustard-hook codex PostToolUse
 //
-// XMUSTARD_API_TOKEN is sent as the bearer token and XMUSTARD_WORKSPACE_ID as the
-// X-Xmustard-Workspace header, when set.
+// XMUSTARD_API_TOKEN is sent as the bearer token. The X-Xmustard-Workspace header pins
+// the event to a workspace: --workspace (a Codex hooks.json written for one project,
+// since Codex tells an MCP server or a hook nothing but the cwd), else
+// XMUSTARD_WORKSPACE_ID; without either the daemon binds the event by its cwd.
 package main
 
 import (
@@ -51,7 +55,8 @@ func main() {
 
 // run posts one event and writes the answer; it never fails.
 func run(args []string, stdin io.Reader, stdout io.Writer, getenv func(string) string) {
-	if len(args) != 2 || !segment(args[0]) || !segment(args[1]) {
+	route, workspace, ok := parseArgs(args, headerValue(getenv("XMUSTARD_WORKSPACE_ID")))
+	if !ok {
 		return
 	}
 	deadline := time.Now().Add(timeout(getenv))
@@ -59,8 +64,7 @@ func run(args []string, stdin io.Reader, stdout io.Writer, getenv func(string) s
 	if !ok {
 		return
 	}
-	req := request{path: "/api/hooks/" + args[0] + "/" + args[1], body: body,
-		token: headerValue(getenv("XMUSTARD_API_TOKEN")), workspace: headerValue(getenv("XMUSTARD_WORKSPACE_ID"))}
+	req := request{path: route, body: body, token: headerValue(getenv("XMUSTARD_API_TOKEN")), workspace: workspace}
 	for _, t := range targets(getenv) {
 		conn, err := t.dial(deadline)
 		if err != nil {
@@ -75,13 +79,35 @@ func run(args []string, stdin io.Reader, stdout io.Writer, getenv func(string) s
 	}
 }
 
+// parseArgs reads `<client> <Event> [--workspace <id>]` into the hook route and the
+// workspace to pin (the flag's, else envWorkspace); false for anything else.
+func parseArgs(args []string, envWorkspace string) (route, workspace string, ok bool) {
+	switch {
+	case len(args) == 4 && args[2] == "--workspace" && workspaceID(args[3]):
+		envWorkspace = args[3]
+	case len(args) != 2:
+		return "", "", false
+	}
+	if !segment(args[0]) || !segment(args[1]) {
+		return "", "", false
+	}
+	return "/api/hooks/" + args[0] + "/" + args[1], envWorkspace, true
+}
+
 // segment accepts a path segment of letters, digits, '_' and '-'.
-func segment(s string) bool {
-	if s == "" || len(s) > 64 {
+func segment(s string) bool { return charset(s, 64, "_-") }
+
+// workspaceID accepts an id of the daemon's safe-id characters (letters, digits, '_',
+// '.' and '-'), not "..".
+func workspaceID(s string) bool { return charset(s, 128, "_.-") && !strings.Contains(s, "..") }
+
+// charset reports a non-empty s of at most max letters, digits and extra bytes.
+func charset(s string, max int, extra string) bool {
+	if s == "" || len(s) > max {
 		return false
 	}
 	for _, r := range s {
-		if !(r == '_' || r == '-' || '0' <= r && r <= '9' || 'a' <= r && r <= 'z' || 'A' <= r && r <= 'Z') {
+		if !('0' <= r && r <= '9' || 'a' <= r && r <= 'z' || 'A' <= r && r <= 'Z' || strings.ContainsRune(extra, r)) {
 			return false
 		}
 	}

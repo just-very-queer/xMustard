@@ -1,8 +1,12 @@
 #!/bin/sh
-# Records Codex PostToolUse hook payloads with no model call: codex exec talks to a
-# local mock Responses API (mock-responses.mjs), runs one tool, and hook.mjs logs the
-# payload Codex hands the hook. Local paths are replaced by /Users/dev/... .
+# Records Codex hook payloads with no model call: codex exec talks to a local mock
+# Responses API (mock-responses.mjs), runs one tool, and hook.mjs logs the payload
+# Codex hands the hook. Local paths are replaced by /Users/dev/... .
 #   ./record.sh <out-dir> [port]      (needs codex and node on PATH)
+# writes the PostToolUse bodies to <out-dir> and, from two more turns with a hook on
+# every event they reach (one forced to compact), <out-dir>/events/<Event>.json
+# (WS-40a). SubagentStart and SubagentStop need a subagent, which the mock cannot
+# start (spawn_agent is an unsupported call for it): see integrations/codex/README.md.
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 out=${1:?out dir}; port=${2:-18765}
@@ -39,5 +43,39 @@ record() { # name prompt shell
 record post_tool_use_bash "run the SHELL step" "printf 'ok 1\\nFAIL 2\\n'; exit 3"
 record post_tool_use_bash_large "run the SHELL step" "$large"
 record post_tool_use_mcp "please CALL_MCP now" ""
+# one hook on each event a turn reaches; <out-dir>/events keeps each event's first body
+# (a SessionStart for another source than startup as SessionStart-<source>.json)
+hook_all() {
+	hooks=""
+	for ev in "$@"; do
+		hooks="$hooks\"$ev\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"node $here/hook.mjs $work/hook.jsonl\"}]}],"
+	done
+	printf '{"hooks":{%s}}\n' "${hooks%,}" > "$home/hooks.json"
+}
+split_events() {
+	mkdir -p "$out/events"
+	sed -e "s#$home#/Users/dev/.codex#g" -e "s#$app#/Users/dev/src/app#g" "$work/hook.jsonl" | node -e '
+const fs = require("fs"), seen = new Set();
+for (const line of fs.readFileSync(0, "utf8").split("\n").filter(Boolean)) {
+	const body = JSON.parse(line), source = body.source && body.source !== "startup" ? "-" + body.source : "";
+	const file = process.argv[1] + "/" + body.hook_event_name + source + ".json";
+	if (!seen.has(file) && !fs.existsSync(file)) { seen.add(file); fs.writeFileSync(file, line + "\n"); }
+}' "$out/events"
+}
+hook_all SessionStart UserPromptSubmit PreToolUse PostToolUse Stop SessionEnd
+record events "deploy check: run the SHELL step" "printf 'ok 1\\n'"
+split_events
+rm -f "$out/events.json"
+# compaction: with a tiny auto-compaction limit every turn compacts (the mock always
+# reports 110 tokens), so the run is stopped once the first compaction has fired
+hook_all PreCompact PostCompact SessionStart
+XM_SHELL="printf 'ok 1\\n'" node "$here/mock-responses.mjs" "$port" & mock=$!
+sleep 1
+rm -f "$work/hook.jsonl"
+(cd "$app" && CODEX_HOME="$home" CODEX_SQLITE_HOME="$home" exec codex exec --json --skip-git-repo-check \
+	--dangerously-bypass-hook-trust -s workspace-write -c model_auto_compact_token_limit=100 "run the SHELL step" </dev/null >/dev/null 2>&1) & run=$!
+sleep 15
+kill "$run" "$mock" 2>/dev/null || true; wait "$run" "$mock" 2>/dev/null || true
+split_events
 codex --version > "$out/VERSION"
 rm -rf "$work"

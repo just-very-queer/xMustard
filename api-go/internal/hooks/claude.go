@@ -1,15 +1,16 @@
-// Package hooks is the client-hook protocol of the daemon (WS-23; PAR-HAR-01,
-// PAR-HAR-02, PAR-ADP-06): the Claude Code hook events the API answers at
-// /api/hooks/claude/<event>, the part of each event's JSON it reads, the JSON it
-// answers with, and the steering state it keeps per session. The routes
-// (cmd/xmustard-api/hooks_routes.go) do the I/O; this package holds no store.
+// Package hooks is the client-hook protocol of the daemon (WS-23, WS-40a; PAR-HAR-01,
+// PAR-HAR-02, PAR-ADP-06, PAR-ADP-07): the hook events of each client (Claude Code,
+// Codex) the API answers at /api/hooks/<client>/<event>, the part of each event's JSON
+// it reads, the JSON it answers with in the client's schema, and the steering state it
+// keeps per session. The routes (cmd/xmustard-api/hooks_routes.go) do the I/O; this
+// package holds no store.
 //
-// Shapes follow the Claude Code hooks reference (code.claude.com/docs/en/hooks,
-// read 2026-09-28): common input fields (session_id, cwd, hook_event_name, agent_id,
+// Claude Code shapes follow its hooks reference (code.claude.com/docs/en/hooks, read
+// 2026-09-28): common input fields (session_id, cwd, hook_event_name, agent_id,
 // agent_type), each event's own fields, and the JSON output (hookSpecificOutput with
-// hookEventName, additionalContext, updatedToolOutput, watchPaths). An answer never
-// blocks or decides a permission: xMustard adds context, replaces an output with its
-// shape-matched reduction, or says nothing.
+// hookEventName, additionalContext, updatedToolOutput, watchPaths). Codex's are in
+// codex.go. An answer never allows, denies or rewrites a tool call: xMustard adds
+// context, replaces an output with its shape-matched reduction, or says nothing.
 package hooks
 
 import (
@@ -19,8 +20,8 @@ import (
 	"unicode/utf8"
 )
 
-// Client is the hook client this file speaks for.
-const Client = "claude"
+// Claude is Claude Code's hook protocol.
+var Claude = Client{Name: "claude", Format: "claude", Events: Events, reply: claudeReply}
 
 // Mode is how the service answers an event.
 type Mode int
@@ -70,15 +71,8 @@ var Events = []Event{
 	{Name: "SessionEnd", Mode: Enqueue},
 }
 
-// EventByName returns the event with a route, if any.
-func EventByName(name string) (Event, bool) {
-	for _, e := range Events {
-		if e.Name == name {
-			return e, true
-		}
-	}
-	return Event{}, false
-}
+// EventByName returns the Claude Code event with a route, if any.
+func EventByName(name string) (Event, bool) { return Claude.Event(name) }
 
 // Input is the part of a hook body the service reads. Tool responses are not decoded
 // here: PostToolUse capture stream-decodes the body itself (evidence.DecodeHookBody),
@@ -129,6 +123,19 @@ func (in ToolInput) TargetPath() string {
 	return in.NotebookPath
 }
 
+// Targets are the files a file tool call reads or changes: its file_path or
+// notebook_path, or the files a Codex apply_patch adds, updates, deletes or moves to
+// (PatchPaths, relative to the call's cwd).
+func (in Input) Targets() []string {
+	if in.ToolName == "apply_patch" {
+		return PatchPaths(in.ToolInput.Command, in.Cwd)
+	}
+	if p := in.ToolInput.TargetPath(); p != "" {
+		return []string{p}
+	}
+	return nil
+}
+
 // BatchCall is one call of a PostToolBatch.
 type BatchCall struct {
 	ToolName  string    `json:"tool_name"`
@@ -155,12 +162,14 @@ const (
 	ToolCapture
 )
 
-// toolClasses maps the built-in tools. An MCP tool (mcp__server__tool) is ToolCapture
-// unless it is xMustard's own (OwnTool), whose results are already reduced.
+// toolClasses maps the built-in tools of Claude Code and Codex (whose shell is "Bash"
+// too and whose file edits are all apply_patch). An MCP tool (mcp__server__tool, in
+// both) is ToolCapture unless it is xMustard's own (OwnTool), whose results are
+// already reduced.
 var toolClasses = map[string]ToolClass{
 	"Grep": ToolSearch, "Glob": ToolSearch,
 	"Read": ToolRead,
-	"Edit": ToolEdit, "Write": ToolEdit, "NotebookEdit": ToolEdit,
+	"Edit": ToolEdit, "Write": ToolEdit, "NotebookEdit": ToolEdit, "apply_patch": ToolEdit,
 	"Bash":     ToolShell,
 	"WebFetch": ToolCapture,
 }
@@ -226,6 +235,19 @@ func Answer(ev Event, context string, updated json.RawMessage, watch []string) *
 		return nil
 	}
 	return &Output{HookSpecificOutput: s}
+}
+
+// claudeReply writes Answer's output.
+func claudeReply(ev Event, r Result) *Reply {
+	out := Answer(ev, r.Context, r.Updated, r.Watch)
+	if out == nil {
+		return nil
+	}
+	body, err := json.Marshal(out)
+	if err != nil { // an Updated that is not JSON: say nothing, the client keeps its output
+		return nil
+	}
+	return &Reply{Body: body, Context: out.HookSpecificOutput.AdditionalContext}
 }
 
 // MaxContextChars is Claude Code's cap on one additionalContext string: past it the

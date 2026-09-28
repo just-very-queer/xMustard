@@ -77,6 +77,41 @@ func TestPostsTheEventAndPrintsTheAnswer(t *testing.T) {
 	}
 }
 
+// Codex runs `xmustard-hook codex <Event> --workspace <id>` from a hooks.json written
+// for one project: the flag pins the workspace over XMUSTARD_WORKSPACE_ID; a flag that
+// is not exactly --workspace with a safe id sends nothing.
+func TestCodexEventWithAWorkspacePin(t *testing.T) {
+	var path, ws atomic.Value
+	sock := serveUnix(t, func(w http.ResponseWriter, r *http.Request) {
+		path.Store(r.URL.Path)
+		ws.Store(r.Header.Get(transport.WorkspaceHeader))
+		io.WriteString(w, `{"decision":"block","reason":"reduced"}`)
+	})
+	vars := map[string]string{transport.SocketEnv: sock, "XMUSTARD_WORKSPACE_ID": "from-env", "XMUSTARD_API_BASE": closedPort(t)}
+	var out bytes.Buffer
+	run([]string{"codex", "PostToolUse", "--workspace", "xmustard-3f2a.b_1"}, strings.NewReader(`{"hook_event_name":"PostToolUse"}`), &out, env(vars))
+	if out.String() != `{"decision":"block","reason":"reduced"}` || path.Load() != "/api/hooks/codex/PostToolUse" || ws.Load() != "xmustard-3f2a.b_1" {
+		t.Fatalf("stdout %q path %v workspace %v", out.String(), path.Load(), ws.Load())
+	}
+	out.Reset()
+	run([]string{"codex", "SessionStart"}, strings.NewReader(`{}`), &out, env(vars))
+	if ws.Load() != "from-env" {
+		t.Fatalf("without the flag the env pin is sent: %v", ws.Load())
+	}
+	for _, args := range [][]string{
+		{"codex", "PostToolUse", "--workspace", "../etc"}, {"codex", "PostToolUse", "--workspace"},
+		{"codex", "PostToolUse", "--workspace", "a b"}, {"codex", "PostToolUse", "--other", "ws1"},
+		{"codex", "PostToolUse", "--workspace", "ws1", "extra"},
+	} {
+		path.Store("")
+		out.Reset()
+		run(args, strings.NewReader(`{}`), &out, env(vars))
+		if out.Len() != 0 || path.Load() != "" {
+			t.Errorf("%q posted to %v and printed %q", args, path.Load(), out.String())
+		}
+	}
+}
+
 func TestFallsBackToTCPWhenNoSocketListens(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
