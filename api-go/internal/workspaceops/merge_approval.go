@@ -45,10 +45,11 @@ const (
 // maxReviewRecords bounds the review record ids one attestation cites.
 const maxReviewRecords = 32
 
-// ErrReviewerNotDistinct: an attestation cites a review record its approver wrote, or,
-// under the owner-distinct policy, one written under the approver's owner.
-var ErrReviewerNotDistinct = errors.New("a merge approval cannot rest on a review record written by the approver " +
-	"or, under the owner-distinct policy, under the approver's owner")
+// ErrReviewerNotDistinct: an attestation cites a review record its approver wrote, one
+// written in open mode (whose author cannot be told apart from anyone), or, under the
+// owner-distinct policy, one written under the approver's owner.
+var ErrReviewerNotDistinct = errors.New("a merge approval cannot rest on a review record written by the approver, " +
+	"in open mode, or, under the owner-distinct policy, under the approver's owner")
 
 // reviewDiffTimeout bounds each git run of a review diff.
 const reviewDiffTimeout = 2 * time.Minute
@@ -311,10 +312,11 @@ func ApproveMerge(ctx context.Context, dataDir, workspaceID string, h HumanAppro
 }
 
 // checkReviewAuthors applies the WS-19B distinctness rule to the review records an
-// attestation cites: the approver may not rest a merge on a record they wrote, whatever
-// the policy, nor, under the owner-distinct policy, on one written under their owner (the
+// attestation cites, failing closed: the approver may not rest a merge on a record they
+// wrote, whatever the policy, nor on one written in open mode, whose author is no one in
+// particular, nor, under the owner-distinct policy, on one written under their owner (the
 // owner the record recorded, else the token store's). It returns the ids that name no
-// review record of the workspace, in order.
+// review record of the workspace (WS-57 binds those as given), in order.
 func checkReviewAuthors(ctx context.Context, r govstore.Reader, dataDir, workspaceID string, h HumanApprover, ids []string) ([]string, error) {
 	ownerPolicy := principalDistinctness(dataDir) == DistinctOwner
 	mine := fallbackString(h.Principal.Owner, h.Principal.ID)
@@ -328,6 +330,8 @@ func checkReviewAuthors(ctx context.Context, r govstore.Reader, dataDir, workspa
 			return nil, err
 		case sameOwner(rec.Author, h.Principal.ID):
 			return nil, fmt.Errorf("%w: %s wrote review record %s", ErrReviewerNotDistinct, h.Principal.ID, id)
+		case IsOpenModeIdentity(rec.Author):
+			return nil, fmt.Errorf("%w: review record %s was written in open mode", ErrReviewerNotDistinct, id)
 		case ownerPolicy && sameOwner(recordedOwner(dataDir, rec.AuthorOwner, rec.Author), mine):
 			return nil, fmt.Errorf("%w: review record %s was written by %s, owned by %s like the approver", ErrReviewerNotDistinct,
 				id, rec.Author, mine)

@@ -34,9 +34,9 @@ func storeReviewRecord(t *testing.T, dir, ws string, author ContextActor) string
 }
 
 // WS-57 binds review record ids as given; once review records exist (WS-66) the
-// approver may not rest a merge on a record they wrote, nor, under the owner-distinct
-// policy, on one written under their owner. An id that names no record stays bound and
-// is listed as unknown.
+// approver may not rest a merge on a record they wrote or one written in open mode, nor,
+// under the owner-distinct policy, on one written under their owner. An id that names no
+// record stays bound and is listed as unknown.
 func TestMergeApprovalReviewAuthorsAreDistinct(t *testing.T) {
 	ctx := context.Background()
 	dir, ws, _, _ := reviewRepo(t)
@@ -45,8 +45,11 @@ func TestMergeApprovalReviewAuthorsAreDistinct(t *testing.T) {
 	teammate := storeReviewRecord(t, dir, ws, ContextActor{ID: "bot", Owner: "team", Kind: PrincipalAgent})
 	peer := storeReviewRecord(t, dir, ws, ContextActor{ID: "carol", Owner: "carol", Kind: PrincipalAgent})
 
-	if _, err := ApproveMerge(ctx, dir, ws, h, "main", "HEAD", []string{peer, own}, ""); !errors.Is(err, ErrReviewerNotDistinct) {
-		t.Fatalf("resting on the approver's own review: %v", err)
+	anonymous := storeReviewRecord(t, dir, ws, ContextActor{ID: OpenModeIdentity, OpenMode: true})
+	for name, ids := range map[string][]string{"the approver's own review": {peer, own}, "an open-mode review": {anonymous}} {
+		if _, err := ApproveMerge(ctx, dir, ws, h, "main", "HEAD", ids, ""); !errors.Is(err, ErrReviewerNotDistinct) {
+			t.Fatalf("resting on %s: %v", name, err)
+		}
 	}
 	a, err := ApproveMerge(ctx, dir, ws, h, "main", "HEAD", []string{peer, teammate, "external-review-7"}, "")
 	if err != nil {

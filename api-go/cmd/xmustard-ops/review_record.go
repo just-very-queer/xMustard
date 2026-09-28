@@ -10,17 +10,19 @@ import (
 	"os"
 	"strings"
 
+	"xmustard/api-go/internal/review"
 	"xmustard/api-go/internal/workspaceops"
 )
 
 // `review record|show|triage` (WS-66), built only with the review build tag. record
 // stores one review of the change from the merge base of --base to --head: its findings,
-// deduplicated within the record's lineage, and its coverage over every file the change
-// touches. show prints a record with its findings as they stand; triage records a verdict
-// on a finding. record and triage run as the token in --token-file or XMUSTARD_API_TOKEN
-// (proposer to record; verifier or human-approver to triage), or as the open-mode
-// identity when no credentials are configured. A record is evidence for the human's
-// merge decision and never approves a change.
+// anchored against that change (WS-65) and deduplicated within the record's lineage, and
+// its coverage over every file the change touches. show prints a record with its
+// findings as they stand; triage records a verdict on a finding. record and triage run as
+// the token in --token-file or XMUSTARD_API_TOKEN (proposer to record; verifier or
+// human-approver to triage), or as the open-mode identity when no credentials are
+// configured. A record is evidence for the human's merge decision and never approves a
+// change.
 
 func init() {
 	reviewCommands["record"] = runReviewRecord
@@ -69,18 +71,20 @@ func readBounded(path string, limit int64) ([]byte, error) {
 	return b, err
 }
 
-// runReviewRecord records a review. --findings may repeat (each file holds at most 50).
+// runReviewRecord records a review. --findings and --evidence may repeat; each input
+// holds at most 50 findings, and a record at most 500.
 func runReviewRecord(e opsEnv, workspaceID string, args []string) int {
-	usage := "usage: xmustard-ops review record <workspace_id> --base REF [--head REF] [--findings FILE]... [--coverage FILE] " +
-		"[--lineage NAME] [--producer agent|ocr|human] [--token-file PATH] [--data-dir DIR]"
+	usage := "usage: xmustard-ops review record <workspace_id> --base REF [--head REF] [--findings FILE]... [--evidence HANDLE]... " +
+		"[--coverage FILE] [--lineage NAME] [--producer agent|ocr|human] [--token-file PATH] [--data-dir DIR]"
 	fs, rf := e.reviewFlagSet("record")
 	base := fs.String("base", "", "the ref the change merges into (required)")
 	head := fs.String("head", "HEAD", "the head of the reviewed change")
 	coverage := fs.String("coverage", "", "coverage JSON: [{path, status: reviewed|not_reviewed, reason}]")
 	lineage := fs.String("lineage", "", "the change's lineage (default: <base>@<merge base>)")
 	producer := fs.String("producer", "agent", "who produced the findings: agent, ocr or human")
-	var findings stringSliceFlag
-	fs.Var(&findings, "findings", "findings JSON: an array or {\"findings\": [...]}; may be repeated")
+	var files, handles stringSliceFlag
+	fs.Var(&files, "findings", "findings JSON: an array, {\"findings\": [...]} or open-code-review's --format json output; may repeat")
+	fs.Var(&handles, "evidence", "evidence handle of a captured findings JSON; may repeat")
 	if fs.Parse(args) != nil || fs.NArg() > 0 || strings.TrimSpace(*base) == "" {
 		return e.usage(usage)
 	}
@@ -89,26 +93,27 @@ func runReviewRecord(e opsEnv, workspaceID string, args []string) int {
 		return e.fail(err)
 	}
 	sub := workspaceops.ReviewSubmission{BaseRef: *base, HeadRef: *head, Lineage: *lineage, Producer: *producer}
-	for _, file := range findings {
-		data, err := readBounded(file, workspaceops.MaxReviewInputBytes)
+	// findingsFrom reads a findings file, or an evidence handle as the token's principal.
+	inputs := make([][2]string, 0, len(files)+len(handles))
+	for _, f := range files {
+		inputs = append(inputs, [2]string{f, ""})
+	}
+	for _, h := range handles {
+		inputs = append(inputs, [2]string{"", h})
+	}
+	for _, in := range inputs {
+		b, err := e.findingsFrom(*rf.dataDir, workspaceID, in[0], in[1], *rf.tokenFile)
 		if err != nil {
-			return e.fail(err)
+			return e.fail(fmt.Errorf("%s: %w", in[0]+in[1], err))
 		}
-		claims, notes, err := workspaceops.DecodeReviewFindings(data)
-		if err != nil {
-			return e.fail(fmt.Errorf("%s: %w", file, err))
-		}
-		sub.Findings = append(sub.Findings, claims...)
-		for _, n := range notes {
-			sub.Normalized = append(sub.Normalized, file+": "+n)
-		}
+		sub.Batches = append(sub.Batches, b)
 	}
 	if *coverage != "" {
-		data, err := readBounded(*coverage, workspaceops.MaxReviewInputBytes)
+		data, err := readBounded(*coverage, review.MaxFindingsBytes)
 		if err != nil {
 			return e.fail(err)
 		}
-		if sub.Coverage, err = workspaceops.DecodeReviewCoverage(data); err != nil {
+		if sub.Coverage, err = review.DecodeCoverage(data); err != nil {
 			return e.fail(fmt.Errorf("%s: %w", *coverage, err))
 		}
 	}
@@ -154,5 +159,5 @@ func runReviewTriage(e opsEnv, workspaceID string, args []string) int {
 	if err != nil {
 		return e.fail(err)
 	}
-	return e.emit(map[string]any{"finding": f, "label": workspaceops.ReviewEvidenceLabel})
+	return e.emit(map[string]any{"finding": f, "label": workspaceops.ReviewRecordLabel})
 }

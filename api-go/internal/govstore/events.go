@@ -1,6 +1,7 @@
 package govstore
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -72,6 +73,14 @@ var validEventTypes = set(EventPropose, EventImport, EventVote, EventReject, Eve
 	EventMergeApproval, EventMergeApprovalRevoked, EventReviewRecord, EventReviewFinding, EventReviewTriage,
 	EventReviewReanchor)
 
+// eventSubjects is the subject kind each review event type names. Every other type
+// names a memory (or nothing), so AppendEvent, which writes memory events, can never
+// forge a review subject's history.
+var eventSubjects = map[string]string{
+	EventReviewRecord: SubjectReviewRecord, EventReviewFinding: SubjectReviewFinding,
+	EventReviewTriage: SubjectReviewFinding, EventReviewReanchor: SubjectReviewFinding,
+}
+
 // Event is one immutable history record.
 type Event struct {
 	Seq         int64           `json:"seq"`
@@ -127,6 +136,7 @@ type eventRow struct {
 	WorkspaceID string
 	EntryID     string
 	// SubjectKind is what EntryID names: a memory ("" means memory) or a review subject.
+	// It must be the kind the event type names (eventSubjects).
 	SubjectKind string
 	Type        string
 	Revision    int64
@@ -144,6 +154,10 @@ func (t *txn) appendEvent(ctx context.Context, actor Actor, ev eventRow) error {
 func (t *txn) insertEvent(ctx context.Context, actor Actor, ev eventRow) (int64, error) {
 	if !validEventTypes[ev.Type] {
 		return 0, fmt.Errorf("%w: event type %q", ErrInvalid, ev.Type)
+	}
+	subject := cmp.Or(ev.SubjectKind, SubjectMemory)
+	if want := cmp.Or(eventSubjects[ev.Type], SubjectMemory); subject != want {
+		return 0, fmt.Errorf("%w: a %s event names a %s, not a %s", ErrInvalid, ev.Type, want, subject)
 	}
 	var data any
 	if p := actor.provenance(); p != nil {
@@ -163,10 +177,6 @@ func (t *txn) insertEvent(ctx context.Context, actor Actor, ev eventRow) (int64,
 	var revision any
 	if ev.Revision > 0 {
 		revision = ev.Revision
-	}
-	subject := ev.SubjectKind
-	if subject == "" {
-		subject = SubjectMemory
 	}
 	res, err := t.exec(ctx, `INSERT INTO events (workspace_id, entry_id, type, principal, session_id, agent_id, head_sha,
 		revision, old_digest, new_digest, note, data, at, subject_kind) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,

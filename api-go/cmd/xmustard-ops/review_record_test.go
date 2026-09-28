@@ -82,7 +82,8 @@ func TestReviewRecordShowAndTriageCommands(t *testing.T) {
 	rec := res["record"].(map[string]any)
 	f := res["findings"].([]any)[0].(map[string]any)
 	if rec["author"] != "rev-a" || rec["changed_files"] != float64(1) || rec["terminal_state"] != "complete" ||
-		f["anchor_status"] != "claimed" || f["category"] != "bug" || !strings.Contains(res["label"].(string), "evidence only") {
+		f["anchor_status"] != "exact_new" || f["start_line"] != float64(3) || f["support"] != "supported" || f["category"] != "bug" ||
+		!strings.Contains(res["label"].(string), "evidence only") {
 		t.Fatalf("record: %v", res)
 	}
 	recordID, findingID := rec["id"].(string), f["id"].(string)

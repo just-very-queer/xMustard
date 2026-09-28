@@ -14,9 +14,19 @@ func reviewChange(head string) ReviewChange {
 	return ReviewChange{Repository: "/repo", BaseRef: "main", MergeBase: "mb0", Head: head, DiffSHA256: "d-" + head, DiffBytes: 42}
 }
 
+// checked are the checks of a finding whose code WS-65 found in a changed hunk.
+var checked = ReviewChecks{CodePresent: "yes", InChangedHunk: "yes", InScope: "yes", SymbolResolved: "unknown"}
+
 func finding(path string, start, end int, code string) ReviewFindingInput {
 	return ReviewFindingInput{Path: path, StartLine: start, EndLine: end, Side: "new", AnchorStatus: "exact_new",
-		Category: "bug", Severity: "high", Content: "nil map write", ExistingCode: code}
+		Checks: checked, Support: "supported", Category: "bug", Severity: "high", Content: "nil map write", ExistingCode: code}
+}
+
+// unplaced is a finding the resolver could not place.
+func unplaced(path string) ReviewFindingInput {
+	return ReviewFindingInput{Path: path, AnchorStatus: AnchorUnanchored, AnchorReason: "no_snippet",
+		Checks:  ReviewChecks{CodePresent: "no", InChangedHunk: "no", InScope: "yes", SymbolResolved: "unknown"},
+		Support: "unsupported", Category: "bug", Severity: "low", Content: "x"}
 }
 
 func recordReview(t *testing.T, s Store, who Actor, in ReviewRecordInput) (ReviewRecord, []ReviewFinding) {
@@ -44,6 +54,12 @@ func recordReview(t *testing.T, s Store, who Actor, in ReviewRecordInput) (Revie
 		return err
 	})
 	return rec, fs
+}
+
+// with is f changed by edit.
+func with(f ReviewFindingInput, edit func(*ReviewFindingInput)) ReviewFindingInput {
+	edit(&f)
+	return f
 }
 
 func triage(s Store, who Actor, id, verdict string) (ReviewFinding, error) {
@@ -124,12 +140,18 @@ func TestReviewCoverageCountsEveryChangedFile(t *testing.T) {
 		"escaping changed file":     {ChangedFiles: []string{"../etc/passwd"}},
 		"changed file twice":        {ChangedFiles: []string{"a.go", "a.go"}},
 		"unknown producer":          {Producer: "bot"},
-		"unknown category":          {Findings: []ReviewFindingInput{{Path: "a.go", AnchorStatus: AnchorUnanchored, Category: "nit", Severity: "low", Content: "x"}}},
-		"lines without an anchor":   {Findings: []ReviewFindingInput{{Path: "a.go", StartLine: 3, EndLine: 3, AnchorStatus: AnchorUnanchored, Category: "bug", Severity: "low", Content: "x"}}},
-		"anchor without a side":     {Findings: []ReviewFindingInput{{Path: "a.go", StartLine: 3, EndLine: 3, AnchorStatus: "exact_new", Category: "bug", Severity: "low", Content: "x"}}},
-		"empty content":             {Findings: []ReviewFindingInput{{Path: "a.go", AnchorStatus: AnchorUnanchored, Category: "bug", Severity: "low", Content: " "}}},
+		"unknown category":          {Findings: []ReviewFindingInput{with(unplaced("a.go"), func(f *ReviewFindingInput) { f.Category = "nit" })}},
+		"lines without an anchor":   {Findings: []ReviewFindingInput{with(unplaced("a.go"), func(f *ReviewFindingInput) { f.StartLine, f.EndLine = 3, 3 })}},
+		"anchor without a side":     {Findings: []ReviewFindingInput{with(finding("a.go", 3, 3, "x"), func(f *ReviewFindingInput) { f.Side = "" })}},
+		"a claimed range":           {Findings: []ReviewFindingInput{with(finding("a.go", 3, 3, "x"), func(f *ReviewFindingInput) { f.AnchorStatus = "claimed" })}},
+		"unknown support":           {Findings: []ReviewFindingInput{with(finding("a.go", 3, 3, "x"), func(f *ReviewFindingInput) { f.Support = "plausible" })}},
+		"a check that is no fact":   {Findings: []ReviewFindingInput{with(finding("a.go", 3, 3, "x"), func(f *ReviewFindingInput) { f.Checks.InScope = "" })}},
+		"escaping refiled_from":     {Findings: []ReviewFindingInput{with(finding("a.go", 3, 3, "x"), func(f *ReviewFindingInput) { f.RefiledFrom = "../a.go" })}},
+		"too many notes":            {Findings: []ReviewFindingInput{with(finding("a.go", 3, 3, "x"), func(f *ReviewFindingInput) { f.Normalized = make([]string, maxReviewNotes+1) })}},
+		"empty content":             {Findings: []ReviewFindingInput{with(unplaced("a.go"), func(f *ReviewFindingInput) { f.Content = " " })}},
 		"absolute finding path":     {Findings: []ReviewFindingInput{finding("/a.go", 1, 1, "x")}},
 		"no lineage":                {Lineage: " "},
+		"a source without a digest": {Sources: []ReviewSource{{Kind: "findings_file", Ref: "f.json"}}},
 	} {
 		if in.ChangedFiles == nil {
 			in.ChangedFiles = []string{"a.go"}
@@ -162,7 +184,7 @@ func TestReviewDedupeIsExactOrPossible(t *testing.T) {
 	s := openTestStore(t, newClock())
 	_, first := recordReview(t, s, alice, ReviewRecordInput{Findings: []ReviewFindingInput{finding("a.go", 10, 14, "m[k] = v\nreturn m")}})
 	f1 := first[0]
-	if f1.Dedupe.Result != DedupeCreated || f1.Status != FindingOpen || f1.Head != "h1" || f1.CodeSHA256 == "" ||
+	if f1.Dedupe.Result != DedupeCreated || f1.Status != FindingOpen || f1.Commit != "h1" || f1.CodeSHA256 == "" ||
 		f1.Fingerprint == "" || f1.RecordID == "" {
 		t.Fatalf("first finding = %+v", f1)
 	}
@@ -214,6 +236,15 @@ func TestReviewDedupeIsExactOrPossible(t *testing.T) {
 	}
 	if len(now) != 6 { // f1, the 0.6 one, the possible duplicate, the single-line, the old-side one and the h2 one
 		t.Fatalf("open findings on a.go in the lineage = %d", len(now))
+	}
+	// Old-side lines count in the merge base, which a later head of the lineage shares:
+	// the same deleted code quoted at h2 is a duplicate of the h1 finding.
+	if got[5].Commit != "mb0" {
+		t.Fatalf("an old-side finding's lines count in %s, want the merge base", got[5].Commit)
+	}
+	_, again := recordReview(t, s, carol, ReviewRecordInput{Change: reviewChange("h2"), Findings: []ReviewFindingInput{old}})
+	if d := again[0].Dedupe; d.Result != DedupeDuplicateOf || d.Of != got[5].ID {
+		t.Fatalf("the old-side finding at a later head: %+v", d)
 	}
 }
 
@@ -274,7 +305,7 @@ func TestReviewReanchorMovesOrOutdates(t *testing.T) {
 	ctx := context.Background()
 	s := openTestStore(t, newClock())
 	_, fs := recordReview(t, s, alice, ReviewRecordInput{Findings: []ReviewFindingInput{
-		finding("a.go", 10, 12, "one()\ntwo()"), finding("a.go", 30, 30, "three()"), finding("b.go", 5, 5, "four()"),
+		finding("a.go", 10, 12, "one()\ntwo()"), finding("a.go", 30, 30, "three()"), finding("b.go", 5, 5, "four()"), unplaced("c.go"),
 	}})
 	if _, err := triage(s, bob, fs[2].ID, "confirm"); err != nil {
 		t.Fatal(err)
@@ -282,22 +313,24 @@ func TestReviewReanchorMovesOrOutdates(t *testing.T) {
 	var n int
 	mustUpdate(t, s, func(tx Tx) error {
 		var err error
-		n, err = tx.ReanchorReviewFindings(ctx, "ws1", "h2", []ReviewReanchor{
-			{FindingID: fs[0].ID, StartLine: 20, EndLine: 22, AnchorStatus: "file"},
-			{FindingID: fs[1].ID, Outdated: true},
-			{FindingID: fs[2].ID, Outdated: true},
+		n, err = tx.ReanchorReviewFindings(ctx, "ws1", []ReviewReanchor{
+			{FindingID: fs[0].ID, Commit: "h2", StartLine: 20, EndLine: 22, AnchorStatus: "file"},
+			{FindingID: fs[1].ID, Commit: "h2", Outdated: true},
+			{FindingID: fs[2].ID, Commit: "h2", Outdated: true},
+			{FindingID: fs[3].ID, Commit: "h2", StartLine: 1, EndLine: 1, AnchorStatus: "file"}, // unanchored: left alone
 		}, alice)
 		return err
 	})
 	got, _ := s.ListReviewFindings(ctx, ReviewFindingFilter{WorkspaceID: "ws1", Lineage: "main@mb0"})
-	if n != 3 || got[0].Head != "h2" || got[0].StartLine != 20 || got[0].EndLine != 22 || got[0].AnchorStatus != "file" ||
-		got[0].Status != FindingOpen || got[1].Status != FindingOutdated || got[1].OutdatedAt == "" || got[1].Head != "h1" ||
-		got[2].Status != FindingConfirmed || got[2].OutdatedAt == "" {
+	if n != 3 || got[0].Commit != "h2" || got[0].StartLine != 20 || got[0].EndLine != 22 || got[0].AnchorStatus != "file" ||
+		got[0].Status != FindingOpen || got[1].Status != FindingOutdated || got[1].OutdatedAt == "" || got[1].Commit != "h1" ||
+		got[2].Status != FindingConfirmed || got[2].OutdatedAt == "" || got[3].Commit != "h1" || got[3].StartLine != 0 {
 		t.Fatalf("after re-anchoring (%d): %+v", n, got)
 	}
 	mustUpdate(t, s, func(tx Tx) error { // a finding already at head, or outdated, is left alone
 		var err error
-		n, err = tx.ReanchorReviewFindings(ctx, "ws1", "h2", []ReviewReanchor{{FindingID: fs[0].ID, StartLine: 1, EndLine: 1, AnchorStatus: "file"}, {FindingID: fs[1].ID, Outdated: true}}, alice)
+		n, err = tx.ReanchorReviewFindings(ctx, "ws1", []ReviewReanchor{{FindingID: fs[0].ID, Commit: "h2", StartLine: 1, EndLine: 1, AnchorStatus: "file"},
+			{FindingID: fs[1].ID, Commit: "h2", Outdated: true}}, alice)
 		return err
 	})
 	if n != 0 {
@@ -314,11 +347,18 @@ func TestReviewReanchorMovesOrOutdates(t *testing.T) {
 		t.Fatalf("re-anchor events = %d", len(evs))
 	}
 	err := s.Update(ctx, func(tx Tx) error {
-		_, err := tx.ReanchorReviewFindings(ctx, "ws1", "h3", []ReviewReanchor{{FindingID: next[1].ID, StartLine: 5, EndLine: 4, AnchorStatus: "file"}}, alice)
+		_, err := tx.ReanchorReviewFindings(ctx, "ws1", []ReviewReanchor{{FindingID: next[1].ID, Commit: "h3", StartLine: 5, EndLine: 4, AnchorStatus: "file"}}, alice)
 		return err
 	})
 	if !errors.Is(err, ErrInvalid) {
 		t.Fatalf("a reversed range: %v", err)
+	}
+	err = s.Update(ctx, func(tx Tx) error {
+		_, err := tx.ReanchorReviewFindings(ctx, "ws1", []ReviewReanchor{{FindingID: next[1].ID, StartLine: 5, EndLine: 5, AnchorStatus: "file"}}, alice)
+		return err
+	})
+	if !errors.Is(err, ErrInvalid) {
+		t.Fatalf("a move without a commit: %v", err)
 	}
 }
 
@@ -365,6 +405,17 @@ func TestReviewSubjectsStayApartFromMemory(t *testing.T) {
 	}
 	if n := countRows(t, s, "SELECT count(*) FROM events WHERE entry_id = ? AND subject_kind = 'review_finding'", fs[0].ID); n != 2 {
 		t.Fatalf("finding events = %d", n)
+	}
+	// A caller-authored event writes memory history only: it cannot forge a review
+	// subject's creation or triage.
+	for _, typ := range []string{EventReviewRecord, EventReviewFinding, EventReviewTriage, EventReviewReanchor} {
+		err := s.Update(ctx, func(tx Tx) error {
+			_, err := tx.AppendEvent(ctx, EventInput{WorkspaceID: "ws1", Type: typ, Data: map[string]any{"status": "confirmed"}}, bob)
+			return err
+		})
+		if !errors.Is(err, ErrInvalid) {
+			t.Errorf("AppendEvent(%s): %v", typ, err)
+		}
 	}
 }
 
@@ -428,19 +479,28 @@ func TestMigrationUpgradesV2FileToReviewSubjects(t *testing.T) {
 	_ = again.Close()
 }
 
-// A record's findings, a path's findings in a lineage and one finding are index lookups,
-// whatever the store holds: no plan step scans the anchors, events or outcomes tables.
+// A record's findings, a lineage's findings, a path's findings in a lineage and one
+// finding are index lookups, whatever the store holds: no plan step scans the anchors,
+// events or outcomes tables, a lineage is found through its own index, not by reading
+// every review anchor's event, and each anchor's event through its entry id, not the
+// workspace's events.
 func TestReviewFindingQueriesUseIndexes(t *testing.T) {
 	s := openTestStore(t, newClock())
 	recordReview(t, s, alice, ReviewRecordInput{Findings: []ReviewFindingInput{finding("a.go", 1, 2, "x\ny")}})
 	for name, c := range map[string]struct {
-		f   ReviewFindingFilter
-		ids []string
+		f     ReviewFindingFilter
+		ids   []string
+		index string
 	}{
-		"a record's findings":        {ReviewFindingFilter{WorkspaceID: "ws1", Statuses: []string{FindingOpen}}, []string{"rvf_1", "rvf_2"}},
-		"a path's findings (dedupe)": {ReviewFindingFilter{WorkspaceID: "ws1", Lineage: "main@mb0", Path: "a.go"}, nil},
+		"a record's findings":        {ReviewFindingFilter{WorkspaceID: "ws1", Statuses: []string{FindingOpen}}, []string{"rvf_1", "rvf_2"}, ""},
+		"a path's findings (dedupe)": {ReviewFindingFilter{WorkspaceID: "ws1", Lineage: "main@mb0", Path: "a.go"}, nil, "anchors_review_lineage"},
+		"a lineage page":             {ReviewFindingFilter{WorkspaceID: "ws1", Lineage: "main@mb0", AfterSeq: 3, Limit: 500}, nil, "anchors_review_lineage"},
+		"one finding":                {ReviewFindingFilter{}, nil, ""},
 	} {
 		q, args := reviewFindingsSQL(c.f, c.ids)
+		if name == "one finding" {
+			q, args = reviewFindingQuery+" AND a.entry_id = ?)", []any{OpenModeIdentity, "ws1", "rvf_1"}
+		}
 		rows, err := s.readers.Query("EXPLAIN QUERY PLAN "+q, args...)
 		if err != nil {
 			t.Fatal(err)
@@ -455,6 +515,11 @@ func TestReviewFindingQueriesUseIndexes(t *testing.T) {
 			plan = append(plan, detail)
 		}
 		_ = rows.Close()
+		for _, index := range []string{c.index, "events_entry"} {
+			if index != "" && !slices.ContainsFunc(plan, func(step string) bool { return strings.Contains(step, "INDEX "+index+" ") }) {
+				t.Errorf("%s: plan does not use %s: %v", name, index, plan)
+			}
+		}
 		for _, step := range plan {
 			for _, table := range []string{"a", "ev", "t", "o"} {
 				if step == "SCAN "+table || strings.HasPrefix(step, "SCAN "+table+" ") {

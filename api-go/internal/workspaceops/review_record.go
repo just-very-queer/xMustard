@@ -4,71 +4,55 @@ package workspaceops
 
 import (
 	"bytes"
+	"cmp"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
 	"slices"
 	"strings"
-	"unicode/utf8"
 
+	"xmustard/api-go/internal/anchor"
 	"xmustard/api-go/internal/govstore"
 	"xmustard/api-go/internal/redact"
+	"xmustard/api-go/internal/review"
 )
 
-// Review records and findings (WS-66; PAR-REV-06), built only with the review build tag.
-// A record binds one review to the change merge approval digests (the merge base of a
-// base ref and a head): its coverage over every file the change touches and its findings,
-// which the store deduplicates within the record's lineage. Findings of the lineage
-// recorded at an earlier head are first moved to this head, lazily, so their lines are
-// comparable. A record is evidence for the human's merge decision; nothing here approves
-// a change.
+// Review records and findings (WS-66; PAR-REV-06 and the coverage of PAR-REV-07), built
+// only with the review build tag. A record binds one review to the change merge approval
+// digests (the merge base of a base ref and a head): its coverage over every file that
+// change touches, and its findings, anchored by WS-65 against the same diff bytes and
+// deduplicated by the store within the record's lineage. Before a record at a new head is
+// compared with its lineage, the lineage's earlier findings are re-anchored to it, lazily
+// and in one batch. A record is evidence for the human's merge decision; nothing here
+// approves a change.
 
-// ReviewEvidenceLabel is carried by every review result.
-const ReviewEvidenceLabel = "evidence only: a review record informs the human's merge decision; " +
+// ReviewRecordLabel is carried by every review record result.
+const ReviewRecordLabel = "evidence only: a review record informs the human's merge decision; " +
 	"no review result approves a change"
 
-// Review input bounds: a findings or coverage file, and the findings one file holds
-// (requirements §7: at most 50 findings per call).
-const (
-	MaxReviewInputBytes   = 4 << 20
-	MaxReviewFindingsCall = 50
-	maxFindingContentRune = 2000
-)
-
-// ReviewFindingClaim is a finding as its producer states it. start_line and end_line are
-// the producer's claim (open-code-review's comments carry them); placeFindings decides
-// where the finding is.
-type ReviewFindingClaim struct {
-	Path           string `json:"path"`
-	Content        string `json:"content"`
-	ExistingCode   string `json:"existing_code"`
-	SuggestionCode string `json:"suggestion_code"`
-	Category       string `json:"category"`
-	Severity       string `json:"severity"`
-	StartLine      int    `json:"start_line"`
-	EndLine        int    `json:"end_line"`
-}
+// maxReviewNote bounds one normalization note as a record stores it (a note can quote an
+// unknown category or severity at any length).
+const maxReviewNote = 256
 
 // ReviewSubmission is one review of the change from the merge base of BaseRef to
-// HeadRef. Lineage defaults to "<base_ref>@<merge_base>", so a branch's later heads on
-// the same merge base share one; Producer defaults to agent.
+// HeadRef: its findings inputs, decoded by WS-65's review package, and the reviewer's
+// coverage report. Lineage defaults to "<base_ref>@<merge_base>", so a branch's later
+// heads on the same merge base share one; Producer defaults to agent.
 type ReviewSubmission struct {
 	BaseRef  string
 	HeadRef  string
 	Lineage  string
 	Producer string
-	Findings []ReviewFindingClaim
-	Coverage []govstore.ReviewCoverage
-	// Normalized records what decoding changed, carried into the result.
-	Normalized []string
+	Batches  []*review.Batch
+	Coverage []review.Coverage
 }
 
-// ReviewReanchorReport counts how the lineage's findings from earlier heads moved to
-// this head: kept (their file did not change, so their lines stand), moved or outdated
-// (by a locator), and unresolved (their file changed and no locator is plugged in; they
-// stay at their head, out of positional dedupe).
+// ReviewReanchorReport counts how the lineage's earlier findings came to this change:
+// kept (their file did not change, so their lines stand), moved (their quoted code was
+// found once in the file's new version), outdated (it was found nowhere) and unresolved
+// (found several times, in a file not read, or with no code to search for; they stay
+// where they were, out of positional dedupe).
 type ReviewReanchorReport struct {
 	Kept       int      `json:"kept"`
 	Moved      int      `json:"moved"`
@@ -77,142 +61,17 @@ type ReviewReanchorReport struct {
 	Errors     []string `json:"errors,omitempty"`
 }
 
-// ReviewRecordResult is a record with its findings.
+// ReviewRecordResult is a record with its findings, and, when it holds findings, how
+// they were anchored.
 type ReviewRecordResult struct {
 	Record     govstore.ReviewRecord    `json:"record"`
 	Findings   []govstore.ReviewFinding `json:"findings"`
+	Counts     *review.Counts           `json:"counts,omitempty"`
+	HeadReads  *HeadReads               `json:"head_reads,omitempty"`
 	Reanchored *ReviewReanchorReport    `json:"reanchored,omitempty"`
 	Normalized []string                 `json:"normalized,omitempty"`
 	Redactions *redact.Report           `json:"redactions,omitempty"`
 	Label      string                   `json:"label"`
-}
-
-// placeFindings anchors a submission's findings in the change. WS-65's anchoring (its
-// review.Anchor over the diff this record digests) plugs in here; until then a finding
-// keeps its producer's line range, labeled claimed, or is unanchored when it names none.
-var placeFindings = claimedPlacement
-
-// relocateFindings finds, at head, findings whose file changed since the head they were
-// recorded at, returning a move or an outdated mark for each one it can decide. WS-65's
-// anchor.Reanchor over a `git cat-file --batch` read of head plugs in here; while it is
-// nil such findings stay unresolved.
-var relocateFindings func(ctx context.Context, root, head string, fs []govstore.ReviewFinding) ([]govstore.ReviewReanchor, error)
-
-// claimedPlacement keeps each finding where its producer put it: a range read as
-// open-code-review reads one (a missing or equal bound is a single line), on the new side.
-func claimedPlacement(_ context.Context, _ ReviewedChange, claims []ReviewFindingClaim) ([]govstore.ReviewFindingInput, error) {
-	out := make([]govstore.ReviewFindingInput, 0, len(claims))
-	for _, c := range claims {
-		f := govstore.ReviewFindingInput{Path: c.Path, Category: c.Category, Severity: c.Severity, Content: c.Content,
-			ExistingCode: c.ExistingCode, SuggestionCode: c.SuggestionCode, AnchorStatus: govstore.AnchorUnanchored}
-		start, end := min(c.StartLine, c.EndLine), max(c.StartLine, c.EndLine)
-		if start <= 0 {
-			start = end
-		}
-		if start > 0 {
-			f.StartLine, f.EndLine, f.Side, f.AnchorStatus = start, end, "new", govstore.AnchorClaimed
-		}
-		out = append(out, f)
-	}
-	return out, nil
-}
-
-// reviewEnum is a closed vocabulary with the value an unknown one becomes.
-type reviewEnum struct {
-	field, fallback string
-	values          []string
-}
-
-var (
-	reviewCategoryEnum = reviewEnum{"category", "other", []string{"bug", "security", "performance", "maintainability", "test", "style", "documentation", "other"}}
-	reviewSeverityEnum = reviewEnum{"severity", "low", []string{"critical", "high", "medium", "low"}}
-)
-
-// normalize folds case and maps an unknown value to the fallback, noting the change.
-func (e reviewEnum) normalize(i int, v string, notes *[]string) string {
-	low := strings.ToLower(strings.TrimSpace(v))
-	if slices.Contains(e.values, low) {
-		return low
-	}
-	*notes = append(*notes, fmt.Sprintf("finding %d: %s %q recorded as %s", i, e.field, v, e.fallback))
-	return e.fallback
-}
-
-// DecodeReviewFindings reads one findings file: a JSON array of findings or an object
-// {"findings": [...]}, each finding under a closed schema. It refuses input over
-// MaxReviewInputBytes or MaxReviewFindingsCall findings. It normalizes, and notes: an
-// unknown category or severity (other, low), content over 2,000 characters (cut) and
-// quoted or suggested code over the snippet bound (dropped).
-func DecodeReviewFindings(data []byte) ([]ReviewFindingClaim, []string, error) {
-	if len(data) > MaxReviewInputBytes {
-		return nil, nil, fmt.Errorf("findings are over %d bytes: %w", MaxReviewInputBytes, ErrInvalidInput)
-	}
-	data = bytes.TrimSpace(data)
-	if len(data) > 0 && data[0] == '{' {
-		var wrap struct {
-			Findings json.RawMessage `json:"findings"`
-		}
-		if err := strictJSON(data, &wrap); err != nil {
-			return nil, nil, err
-		}
-		data = wrap.Findings
-	}
-	var claims []ReviewFindingClaim
-	if err := strictJSON(data, &claims); err != nil {
-		return nil, nil, err
-	}
-	if len(claims) > MaxReviewFindingsCall {
-		return nil, nil, fmt.Errorf("%d findings, at most %d per call: %w", len(claims), MaxReviewFindingsCall, ErrInvalidInput)
-	}
-	var notes []string
-	for i := range claims {
-		c := &claims[i]
-		c.Path = strings.TrimPrefix(strings.TrimSpace(c.Path), "./")
-		c.Category = reviewCategoryEnum.normalize(i, c.Category, &notes)
-		c.Severity = reviewSeverityEnum.normalize(i, c.Severity, &notes)
-		if utf8.RuneCountInString(c.Content) > maxFindingContentRune {
-			c.Content = string([]rune(c.Content)[:maxFindingContentRune])
-			notes = append(notes, fmt.Sprintf("finding %d: content cut to %d characters", i, maxFindingContentRune))
-		}
-		for _, code := range []*string{&c.ExistingCode, &c.SuggestionCode} {
-			if len(*code) > reviewSnippetBytes {
-				*code = ""
-				notes = append(notes, fmt.Sprintf("finding %d: code over %d bytes dropped", i, reviewSnippetBytes))
-			}
-		}
-	}
-	return claims, notes, nil
-}
-
-// reviewSnippetBytes is the bound on quoted and suggested code (WS-65's snippet bound).
-const reviewSnippetBytes = 4 << 10
-
-// DecodeReviewCoverage reads a coverage file: a JSON array of {path, status, reason}.
-func DecodeReviewCoverage(data []byte) ([]govstore.ReviewCoverage, error) {
-	if len(data) > MaxReviewInputBytes {
-		return nil, fmt.Errorf("coverage is over %d bytes: %w", MaxReviewInputBytes, ErrInvalidInput)
-	}
-	var out []govstore.ReviewCoverage
-	if err := strictJSON(data, &out); err != nil {
-		return nil, err
-	}
-	for i := range out {
-		out[i].Path = strings.TrimPrefix(strings.TrimSpace(out[i].Path), "./")
-	}
-	return out, nil
-}
-
-// strictJSON decodes one JSON value with no unknown members and nothing after it.
-func strictJSON(data []byte, v any) error {
-	dec := json.NewDecoder(bytes.NewReader(data))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(v); err != nil {
-		return fmt.Errorf("decode: %v: %w", err, ErrInvalidInput)
-	}
-	if dec.More() {
-		return fmt.Errorf("decode: trailing data: %w", ErrInvalidInput)
-	}
-	return nil
 }
 
 // ReviewActor resolves the token a review command runs as, holding one of roles. With
@@ -240,11 +99,15 @@ func ReviewActor(dataDir, workspaceID, raw string, roles ...string) (ContextActo
 }
 
 // RecordReview records actor's review of the change from the merge base of sub.BaseRef
-// to sub.HeadRef. The coverage denominator is every file that change touches, computed
-// here from the same commits; the lineage's findings from earlier heads are moved to the
-// head first (reanchorLineage), then the store records and deduplicates.
+// to sub.HeadRef. The findings are anchored against that change (WS-65), the coverage
+// denominator is every file it touches, the lineage's earlier findings are re-anchored to
+// it, and then the store records and deduplicates.
 func RecordReview(ctx context.Context, dataDir, workspaceID string, actor ContextActor, sub ReviewSubmission) (*ReviewRecordResult, error) {
-	change, err := DiffReviewedChange(ctx, dataDir, workspaceID, sub.BaseRef, sub.HeadRef)
+	batch, sources, err := mergeBatches(sub.Batches)
+	if err != nil {
+		return nil, err
+	}
+	change, anchored, err := anchorSubmission(ctx, dataDir, workspaceID, sub.BaseRef, sub.HeadRef, batch)
 	if err != nil {
 		return nil, err
 	}
@@ -255,31 +118,35 @@ func RecordReview(ctx context.Context, dataDir, workspaceID string, actor Contex
 	if err != nil {
 		return nil, err
 	}
-	findings, err := placeFindings(ctx, change, sub.Findings)
-	if err != nil {
-		return nil, err
-	}
-	in := govstore.ReviewRecordInput{WorkspaceID: workspaceID, Lineage: fallbackString(sub.Lineage, change.BaseRef+"@"+change.MergeBase),
+	in := govstore.ReviewRecordInput{WorkspaceID: workspaceID, Lineage: cmp.Or(sub.Lineage, change.BaseRef+"@"+change.MergeBase),
 		Change: govstore.ReviewChange{Repository: change.Repository, BaseRef: change.BaseRef, MergeBase: change.MergeBase,
 			Head: change.Head, DiffSHA256: change.DiffSHA256, DiffBytes: change.DiffBytes},
-		ChangedFiles: files, Coverage: sub.Coverage, Producer: fallbackString(sub.Producer, "agent"), Findings: findings}
-	// Secrets are redacted after anchoring, which needs the code as the file holds it,
-	// and before the store hashes the quoted code.
+		ChangedFiles: files, Producer: cmp.Or(sub.Producer, "agent"), Sources: sources}
+	out := &ReviewRecordResult{Normalized: batch.Normalized, Label: ReviewRecordLabel}
 	var red ingestRedaction
-	for i := range in.Findings {
-		red.scrub(&in.Findings[i].Content, &in.Findings[i].ExistingCode, &in.Findings[i].SuggestionCode)
+	for _, c := range sub.Coverage {
+		red.scrub(&c.Reason)
+		in.Coverage = append(in.Coverage, govstore.ReviewCoverage{Path: c.Path, Status: c.Status, Reason: c.Reason})
 	}
-	moves, report, err := reanchorLineage(ctx, dataDir, workspaceID, in.Lineage, change)
-	if err != nil {
-		return nil, err
+	if anchored != nil {
+		out.Counts, out.HeadReads = &anchored.Counts, &anchored.HeadReads
+		for _, a := range anchored.Findings {
+			f := findingInput(a)
+			red.finding(&f)
+			in.Findings = append(in.Findings, f)
+		}
 	}
-	out := &ReviewRecordResult{Reanchored: report, Normalized: sub.Normalized, Label: ReviewEvidenceLabel}
 	if red.rep.Redacted {
 		out.Redactions = &red.rep
 	}
+	moves, report, err := reanchorLineage(ctx, dataDir, workspaceID, in.Lineage, in.Change)
+	if err != nil {
+		return nil, err
+	}
+	out.Reanchored = report
 	sa := actor.storeActor(change.Repository)
 	err = memoryUpdate(ctx, dataDir, workspaceID, func(tx govstore.Tx) error {
-		if _, err := tx.ReanchorReviewFindings(ctx, workspaceID, change.Head, moves, sa); err != nil {
+		if _, err := tx.ReanchorReviewFindings(ctx, workspaceID, moves, sa); err != nil {
 			return err
 		}
 		var err error
@@ -292,14 +159,91 @@ func RecordReview(ctx context.Context, dataDir, workspaceID string, actor Contex
 	return out, nil
 }
 
-// reanchorLineage computes the moves that bring the lineage's findings recorded at
-// earlier heads to change.Head. A finding whose file did not change between its head and
-// this one keeps its lines; the others go to relocateFindings when one is plugged in,
-// and are unresolved otherwise. Duplicates and outdated findings do not move. One diff
-// runs per earlier head; a head git cannot diff (rewritten away) leaves its findings
-// unresolved, with the error in the report.
-func reanchorLineage(ctx context.Context, dataDir, workspaceID, lineage string, change ReviewedChange) ([]govstore.ReviewReanchor, *ReviewReanchorReport, error) {
-	byHead := map[string][]govstore.ReviewFinding{}
+// mergeBatches joins a review's inputs into one batch, anchored together so re-filing
+// sees every finding's file. Each input is kept as a source and names its own notes.
+func mergeBatches(batches []*review.Batch) (*review.Batch, []govstore.ReviewSource, error) {
+	merged := &review.Batch{}
+	var sources []govstore.ReviewSource
+	for _, b := range batches {
+		merged.Findings = append(merged.Findings, b.Findings...)
+		for _, n := range b.Normalized {
+			merged.Normalized = append(merged.Normalized, b.Source.Ref+": "+n)
+		}
+		sources = append(sources, govstore.ReviewSource{Kind: b.Source.Kind, Ref: b.Source.Ref, Bytes: b.Source.Bytes, SHA256: b.Source.SHA256})
+	}
+	if n := len(merged.Findings); n > govstore.MaxReviewFindings {
+		return nil, nil, fmt.Errorf("%d findings, at most %d per record: %w", n, govstore.MaxReviewFindings, ErrInvalidInput)
+	}
+	return merged, sources, nil
+}
+
+// anchorSubmission seals the change and anchors the findings in its diff (WS-65). A
+// review without findings needs only the change's digest, so its diff is streamed into
+// the digest and never held.
+func anchorSubmission(ctx context.Context, dataDir, workspaceID, baseRef, headRef string, batch *review.Batch) (ReviewedChange, *ReviewAnchoring, error) {
+	if len(batch.Findings) == 0 {
+		change, err := DiffReviewedChange(ctx, dataDir, workspaceID, baseRef, headRef)
+		return change, nil, err
+	}
+	a, err := AnchorReviewFindings(ctx, dataDir, workspaceID, baseRef, headRef, batch)
+	if err != nil {
+		return ReviewedChange{}, nil, err
+	}
+	return a.Change, a, nil
+}
+
+// findingInput is an anchored finding as the store records it: at its anchor (a
+// re-filed finding under the file that holds its code), or, unanchored, under the path it
+// was filed against with no lines.
+func findingInput(a review.Anchored) govstore.ReviewFindingInput {
+	f := govstore.ReviewFindingInput{Path: a.Path, AnchorStatus: string(a.Anchor.Status), AnchorReason: a.Anchor.Reason,
+		RefiledFrom: a.Anchor.RefiledFrom, Support: a.Support, Category: a.Category, Severity: a.Severity, Content: a.Content,
+		ExistingCode: a.ExistingCode, SuggestionCode: a.SuggestionCode,
+		Checks: govstore.ReviewChecks{CodePresent: string(a.Checks.CodePresent), InChangedHunk: string(a.Checks.InChangedHunk),
+			InScope: string(a.Checks.InScope), SymbolResolved: string(a.Checks.SymbolResolved)}}
+	if a.Anchor.Status != anchor.Unanchored {
+		f.Path, f.StartLine, f.EndLine, f.Side = a.Anchor.Path, a.Anchor.StartLine, a.Anchor.EndLine, string(a.Anchor.Side)
+	}
+	for _, n := range a.Normalized {
+		if len(n) > maxReviewNote {
+			n = cutRunes(n, maxReviewNote-len("…")) + "…"
+		}
+		f.Normalized = append(f.Normalized, n)
+	}
+	return f
+}
+
+// finding scrubs secrets from a finding's text after anchoring, which needs the code as
+// the file holds it, and before the store hashes the quoted code. A marker can be longer
+// than the secret it replaces, so a field is cut back to the store's bound.
+func (ir *ingestRedaction) finding(f *govstore.ReviewFindingInput) {
+	quoted := f.ExistingCode
+	for _, field := range [...]struct {
+		v   *string
+		max int
+	}{{&f.Content, govstore.MaxFindingContent}, {&f.ExistingCode, govstore.MaxFindingCode}, {&f.SuggestionCode, govstore.MaxFindingCode}} {
+		ir.scrub(field.v)
+		if len(*field.v) > field.max {
+			*field.v = cutRunes(*field.v, field.max)
+		}
+	}
+	f.CodeRedacted = f.ExistingCode != quoted
+}
+
+// hop is a finding's move from the commit its lines count in to the one they count in
+// for the new change.
+type hop struct{ from, to string }
+
+// reanchorLineage computes the moves that bring the lineage's earlier findings to the
+// change, so the new findings are compared with lines of the same commit: the head for
+// the new side, the merge base for the old. A finding whose file did not change between
+// its commit and the target keeps its lines; the others are searched for in the file at
+// the target (reanchorAt). Duplicates and outdated or unanchored findings do not move.
+// One name-only diff runs per (from, to) pair and one batch reader per target; a commit
+// git cannot diff (rewritten away) leaves its findings unresolved, with the error in the
+// report.
+func reanchorLineage(ctx context.Context, dataDir, workspaceID, lineage string, change govstore.ReviewChange) ([]govstore.ReviewReanchor, *ReviewReanchorReport, error) {
+	hops := map[hop][]govstore.ReviewFinding{}
 	err := memoryView(ctx, dataDir, workspaceID, func(r govstore.Reader) error {
 		for after := int64(0); ; {
 			page, err := r.ListReviewFindings(ctx, govstore.ReviewFindingFilter{WorkspaceID: workspaceID, Lineage: lineage,
@@ -308,8 +252,9 @@ func reanchorLineage(ctx context.Context, dataDir, workspaceID, lineage string, 
 				return err
 			}
 			for _, f := range page {
-				if f.Head != change.Head && f.Status != govstore.FindingDuplicate && f.OutdatedAt == "" {
-					byHead[f.Head] = append(byHead[f.Head], f)
+				h := hop{f.Commit, change.LinesAt(f.Side)}
+				if h.from != h.to && f.StartLine > 0 && f.Status != govstore.FindingDuplicate && f.OutdatedAt == "" {
+					hops[h] = append(hops[h], f)
 				}
 			}
 			after = page[len(page)-1].Seq
@@ -320,40 +265,88 @@ func reanchorLineage(ctx context.Context, dataDir, workspaceID, lineage string, 
 	}
 	report := &ReviewReanchorReport{}
 	var moves []govstore.ReviewReanchor
-	var pending []govstore.ReviewFinding
-	for _, head := range slices.Sorted(maps.Keys(byHead)) {
-		changed, err := reviewChangedFiles(ctx, change.Repository, head, change.Head)
+	search := map[string][]govstore.ReviewFinding{}
+	for _, h := range slices.SortedFunc(maps.Keys(hops), func(a, b hop) int { return cmp.Or(cmp.Compare(a.from, b.from), cmp.Compare(a.to, b.to)) }) {
+		files, err := reviewChangedFiles(ctx, change.Repository, h.from, h.to)
 		if err != nil {
-			report.Unresolved += len(byHead[head])
+			report.Unresolved += len(hops[h])
 			report.Errors = append(report.Errors, err.Error())
 			continue
 		}
-		for _, f := range byHead[head] {
-			if slices.Contains(changed, f.Path) {
-				pending = append(pending, f)
+		changed := make(map[string]bool, len(files))
+		for _, p := range files {
+			changed[p] = true
+		}
+		for _, f := range hops[h] {
+			if changed[f.Path] {
+				search[h.to] = append(search[h.to], f)
 				continue
 			}
-			moves = append(moves, govstore.ReviewReanchor{FindingID: f.ID, StartLine: f.StartLine, EndLine: f.EndLine, AnchorStatus: f.AnchorStatus})
+			moves = append(moves, govstore.ReviewReanchor{FindingID: f.ID, Commit: h.to, StartLine: f.StartLine, EndLine: f.EndLine,
+				AnchorStatus: f.AnchorStatus})
 			report.Kept++
 		}
 	}
-	if relocateFindings == nil || len(pending) == 0 {
-		report.Unresolved += len(pending)
-		return moves, report, nil
+	for _, commit := range slices.Sorted(maps.Keys(search)) {
+		found, err := reanchorAt(ctx, change.Repository, commit, search[commit])
+		if err != nil {
+			return nil, nil, err
+		}
+		for _, m := range found {
+			if m.Outdated {
+				report.Outdated++
+			} else {
+				report.Moved++
+			}
+		}
+		report.Unresolved += len(search[commit]) - len(found)
+		moves = append(moves, found...)
 	}
-	located, err := relocateFindings(ctx, change.Repository, change.Head, pending)
-	if err != nil {
-		return nil, nil, err
+	return moves, report, nil
+}
+
+// reanchorAt looks for each finding's quoted code in its file at commit, read through
+// one `git cat-file --batch` under the anchoring's head bounds (anchor.Reanchor, which
+// keeps a finding whose code is still at its line when the code occurs more than once).
+// One match moves the finding; none, or a file commit does not hold, makes it outdated.
+// It returns a move for each finding it can decide: several matches, a file over the
+// bounds, and code it cannot search for (none quoted, or a secret redacted from it) are
+// left undecided.
+func reanchorAt(ctx context.Context, root, commit string, fs []govstore.ReviewFinding) ([]govstore.ReviewReanchor, error) {
+	blobs := &headBlobs{ctx: ctx, root: root, head: commit, left: headTotalLimit, linesLeft: headLinesLimit}
+	defer blobs.close()
+	type version struct {
+		content string
+		read    bool
 	}
-	for _, m := range located {
-		if m.Outdated {
-			report.Outdated++
-		} else {
-			report.Moved++
+	versions := map[string]version{}
+	var out []govstore.ReviewReanchor
+	for _, f := range fs {
+		snippet, err := anchor.NewSnippet(f.ExistingCode)
+		if err != nil || f.CodeRedacted {
+			continue
+		}
+		v, ok := versions[f.Path]
+		if !ok {
+			v.content, v.read = blobs.read(f.Path)
+			versions[f.Path] = v
+		}
+		if !v.read {
+			continue
+		}
+		a := anchor.Reanchor(anchor.Anchor{Path: f.Path, StartLine: f.StartLine, EndLine: f.EndLine}, v.content, snippet)
+		switch {
+		case a.Status != anchor.Unanchored:
+			out = append(out, govstore.ReviewReanchor{FindingID: f.ID, Commit: commit, StartLine: a.StartLine, EndLine: a.EndLine,
+				AnchorStatus: string(a.Status)})
+		case a.Reason == anchor.ReasonNotFound:
+			out = append(out, govstore.ReviewReanchor{FindingID: f.ID, Commit: commit, Outdated: true})
 		}
 	}
-	report.Unresolved += len(pending) - len(located)
-	return append(moves, located...), report, nil
+	if blobs.err != nil {
+		return nil, blobs.err
+	}
+	return out, nil
 }
 
 // reviewChangedFiles lists the files that differ between two commits, with the options
@@ -388,7 +381,7 @@ func TriageReviewFinding(ctx context.Context, dataDir, workspaceID string, actor
 	var red ingestRedaction
 	red.scrub(&note)
 	ownerPolicy := !govstore.AuthorMayTriage(verdict) && principalDistinctness(dataDir) == DistinctOwner
-	mine := fallbackString(actor.Owner, actor.ID)
+	mine := cmp.Or(actor.Owner, actor.ID)
 	var out govstore.ReviewFinding
 	err := memoryUpdate(ctx, dataDir, workspaceID, func(tx govstore.Tx) error {
 		f, err := tx.GetReviewFinding(ctx, workspaceID, findingID)
@@ -413,7 +406,7 @@ func ShowReviewRecord(ctx context.Context, dataDir, workspaceID, recordID string
 	if err := validateSafeID("review record", recordID); err != nil {
 		return nil, err
 	}
-	out := &ReviewRecordResult{Label: ReviewEvidenceLabel}
+	out := &ReviewRecordResult{Label: ReviewRecordLabel}
 	err := memoryView(ctx, dataDir, workspaceID, func(r govstore.Reader) error {
 		var err error
 		if out.Record, err = r.GetReviewRecord(ctx, workspaceID, recordID); err != nil {

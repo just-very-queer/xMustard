@@ -16,8 +16,9 @@ import (
 // memory is, and no table is review-only:
 //   - events hold what a record binds (the change, its coverage, its author) and what a
 //     finding says, plus every triage verdict and re-anchoring, append-only;
-//   - anchors hold a finding's place in the code: its path and line range, the head the
-//     lines count in, and the SHA-256 of its normalized quoted code as the baseline;
+//   - anchors hold a finding's place in the code: its path, line range and side, the
+//     commit the lines count in (the head, or the merge base for the old side), its
+//     lineage, and the SHA-256 of its normalized quoted code as the baseline;
 //   - outcomes hold each principal's latest triage verdict on a finding;
 //   - jobs hold a possible duplicate for someone to decide.
 //
@@ -25,7 +26,7 @@ import (
 //
 // A finding's identity is its id. A new finding is a duplicate of an earlier one only
 // on open-code-review's exact rule plus the quoted code: the same path and side, line
-// ranges counted at the same head whose intersection over union is strictly above 0.6
+// ranges counted in the same commit whose intersection over union is strictly above 0.6
 // (a single-line range never matches a multi-line one), and the same normalized quoted
 // code. A positional overlap alone makes it a possible duplicate: it is kept as its own
 // finding and a review_duplicate job asks someone to decide. Neither is corroboration,
@@ -93,28 +94,29 @@ const (
 	ReviewSkipped  = "skipped"
 )
 
-// Anchor statuses: WS-65's resolver's, plus claimed for a producer's own line range that
-// no resolver checked.
-const (
-	AnchorClaimed    = "claimed"
-	AnchorUnanchored = "unanchored"
-)
+// AnchorUnanchored is the anchor status of a finding with no place: WS-65's resolver
+// found its quoted code nowhere, or in several places, and never guesses.
+const AnchorUnanchored = "unanchored"
 
 var (
 	reviewCategories     = set("bug", "security", "performance", "maintainability", "test", "style", "documentation", "other")
 	reviewSeverities     = set("critical", "high", "medium", "low")
 	reviewProducers      = set("agent", "ocr", "human")
 	reviewSides          = set("new", "old")
-	reviewAnchorStatuses = set("exact_new", "exact_old", "file", "relocated", AnchorClaimed, AnchorUnanchored)
+	reviewAnchorStatuses = set("exact_new", "exact_old", "file", "relocated", AnchorUnanchored)
+	reviewFacts          = set("yes", "no", "unknown")
+	reviewSupports       = set("supported", "unsupported", "unchecked")
 )
 
 // Bounds (requirements §7 quotas: at most 500 findings per record).
 const (
 	MaxReviewFindings     = 500
 	MaxReviewChangedFiles = 20000
-	maxFindingContent     = 8 << 10 // 2,000 characters of up to four bytes
-	maxFindingCode        = 4 << 10 // WS-65's snippet bound
-	maxReviewLabel        = 256     // lineage, a coverage reason
+	MaxFindingContent     = 8 << 10 // 2,000 characters of up to four bytes
+	MaxFindingCode        = 4 << 10 // WS-65's snippet bound
+	maxReviewLabel        = 256     // lineage, a coverage reason, an anchor reason
+	maxReviewNotes        = 16      // normalization notes per finding
+	maxReviewSources      = 32      // inputs per record
 )
 
 // ErrSelfTriage: a finding's author may not confirm or dismiss it.
@@ -131,6 +133,33 @@ type ReviewChange struct {
 	DiffBytes  int64  `json:"diff_bytes"`
 }
 
+// LinesAt is the commit whose version of a file a range on side counts in: the merge
+// base for the old side, the head otherwise.
+func (c ReviewChange) LinesAt(side string) string {
+	if side == "old" {
+		return c.MergeBase
+	}
+	return c.Head
+}
+
+// ReviewSource is one input a record's findings came from (WS-65's review.Source): a
+// findings file or an evidence handle, with the size and SHA-256 of the bytes read.
+type ReviewSource struct {
+	Kind   string `json:"kind"`
+	Ref    string `json:"ref"`
+	Bytes  int    `json:"bytes"`
+	SHA256 string `json:"sha256"`
+}
+
+// ReviewChecks are WS-65's deterministic checks of a finding at the record's head, each
+// yes, no or unknown (PAR-REV-05).
+type ReviewChecks struct {
+	CodePresent    string `json:"code_present"`
+	InChangedHunk  string `json:"in_changed_hunk"`
+	InScope        string `json:"in_scope"`
+	SymbolResolved string `json:"symbol_resolved"`
+}
+
 // ReviewCoverage is one changed file's coverage.
 type ReviewCoverage struct {
 	Path   string `json:"path"`
@@ -138,21 +167,31 @@ type ReviewCoverage struct {
 	Reason string `json:"reason,omitempty"`
 }
 
-// ReviewFindingInput is one finding, already anchored: Path, the line range and Side
-// say where it is at the record's head and AnchorStatus how it was placed (0/0 when
-// unanchored). Category and Severity are the closed sets; a surface normalizes unknown
-// values before the store sees them.
+// ReviewFindingInput is one finding, already anchored by WS-65's resolver: Path, the
+// line range and Side say where it is in the record's change (lines on the new side
+// count in the head, on the old side in the merge base), and AnchorStatus how it was
+// placed (0/0 and no side when unanchored). AnchorReason, RefiledFrom, Checks and
+// Support are the resolver's account at the record's head. Category and Severity are
+// the closed sets; a surface normalizes unknown values, noting it in Normalized, before
+// the store sees them. CodeRedacted says a secret was redacted from ExistingCode, so the
+// stored code is not the file's and cannot be searched for again.
 type ReviewFindingInput struct {
-	Path           string `json:"path"`
-	StartLine      int    `json:"start_line"`
-	EndLine        int    `json:"end_line"`
-	Side           string `json:"side,omitempty"`
-	AnchorStatus   string `json:"anchor_status"`
-	Category       string `json:"category"`
-	Severity       string `json:"severity"`
-	Content        string `json:"content"`
-	ExistingCode   string `json:"existing_code,omitempty"`
-	SuggestionCode string `json:"suggestion_code,omitempty"`
+	Path           string       `json:"path"`
+	StartLine      int          `json:"start_line"`
+	EndLine        int          `json:"end_line"`
+	Side           string       `json:"side,omitempty"`
+	AnchorStatus   string       `json:"anchor_status"`
+	AnchorReason   string       `json:"anchor_reason,omitempty"`
+	RefiledFrom    string       `json:"refiled_from,omitempty"`
+	Checks         ReviewChecks `json:"checks"`
+	Support        string       `json:"support"`
+	Category       string       `json:"category"`
+	Severity       string       `json:"severity"`
+	Content        string       `json:"content"`
+	ExistingCode   string       `json:"existing_code,omitempty"`
+	SuggestionCode string       `json:"suggestion_code,omitempty"`
+	CodeRedacted   bool         `json:"code_redacted,omitempty"`
+	Normalized     []string     `json:"normalized,omitempty"`
 }
 
 // ReviewRecordInput records one review of one change. ChangedFiles is every file the
@@ -168,6 +207,7 @@ type ReviewRecordInput struct {
 	ChangedFiles []string
 	Coverage     []ReviewCoverage
 	Producer     string
+	Sources      []ReviewSource
 	Findings     []ReviewFindingInput
 }
 
@@ -189,6 +229,7 @@ type reviewRecordData struct {
 	Lineage       string           `json:"lineage"`
 	Change        ReviewChange     `json:"change"`
 	Producer      string           `json:"producer"`
+	Sources       []ReviewSource   `json:"sources,omitempty"`
 	Coverage      []ReviewCoverage `json:"coverage"`
 	ChangedFiles  int              `json:"changed_files"`
 	Reviewed      int              `json:"reviewed"`
@@ -207,14 +248,14 @@ type ReviewDedupe struct {
 	JobID  string  `json:"job_id,omitempty"`
 }
 
-// ReviewFinding is a stored finding with its current anchor (Head is the commit its
+// ReviewFinding is a stored finding with its current anchor (Commit is the commit its
 // lines count in), status and corroborations: the principals other than its author and
 // the open-mode identity whose verdict is confirm.
 type ReviewFinding struct {
 	ID          string `json:"id"`
 	WorkspaceID string `json:"workspace_id"`
 	reviewFindingData
-	Head           string `json:"head"`
+	Commit         string `json:"commit"`
 	Status         string `json:"status"`
 	Corroborations int    `json:"corroborations"`
 	OutdatedAt     string `json:"outdated_at,omitempty"`
@@ -258,10 +299,12 @@ type ReviewTriageInput struct {
 	Note        string
 }
 
-// ReviewReanchor moves a finding to a later head: to StartLine..EndLine (placed as
-// AnchorStatus), or, when Outdated, records that its quoted code is gone there.
+// ReviewReanchor moves a finding's lines to Commit, a later version of its file: to
+// StartLine..EndLine (placed as AnchorStatus), or, when Outdated, records that its quoted
+// code is gone there.
 type ReviewReanchor struct {
 	FindingID    string
+	Commit       string
 	Outdated     bool
 	StartLine    int
 	EndLine      int
@@ -278,14 +321,15 @@ type ReviewReader interface {
 // ReviewWriter records reviews, triage verdicts and re-anchorings.
 type ReviewWriter interface {
 	// RecordReview stores a record and its findings, deduplicating each finding against
-	// the lineage's earlier findings anchored at the same head (and the ones before it
-	// in the same call).
+	// the lineage's earlier findings whose lines count in the same commit (and the ones
+	// before it in the same call).
 	RecordReview(ctx context.Context, in ReviewRecordInput, actor Actor) (ReviewRecord, []ReviewFinding, error)
 	// TriageReviewFinding records actor's verdict on a finding and returns it updated.
 	TriageReviewFinding(ctx context.Context, in ReviewTriageInput, actor Actor) (ReviewFinding, error)
-	// ReanchorReviewFindings moves findings to head, or marks them outdated there. It
-	// returns how many it changed; a finding already at head is left alone.
-	ReanchorReviewFindings(ctx context.Context, workspaceID, head string, moves []ReviewReanchor, actor Actor) (int, error)
+	// ReanchorReviewFindings moves findings to a later commit, or marks them outdated
+	// there. It returns how many it changed; a finding already at its move's commit, a
+	// duplicate, an outdated or an unanchored one is left alone.
+	ReanchorReviewFindings(ctx context.Context, workspaceID string, moves []ReviewReanchor, actor Actor) (int, error)
 }
 
 // AuthorMayTriage reports whether a finding's author may cast verdict on it: fixed and
@@ -368,6 +412,11 @@ func (f ReviewFindingInput) validate() error {
 	if err := validReviewPath("finding", f.Path); err != nil {
 		return err
 	}
+	if f.RefiledFrom != "" {
+		if err := validReviewPath("refiled_from", f.RefiledFrom); err != nil {
+			return err
+		}
+	}
 	for _, c := range [...]struct {
 		field, v string
 		ok       bool
@@ -375,22 +424,34 @@ func (f ReviewFindingInput) validate() error {
 		{"category", f.Category, reviewCategories[f.Category]},
 		{"severity", f.Severity, reviewSeverities[f.Severity]},
 		{"anchor_status", f.AnchorStatus, reviewAnchorStatuses[f.AnchorStatus]},
+		{"support", f.Support, reviewSupports[f.Support]},
+		{"checks.code_present", f.Checks.CodePresent, reviewFacts[f.Checks.CodePresent]},
+		{"checks.in_changed_hunk", f.Checks.InChangedHunk, reviewFacts[f.Checks.InChangedHunk]},
+		{"checks.in_scope", f.Checks.InScope, reviewFacts[f.Checks.InScope]},
+		{"checks.symbol_resolved", f.Checks.SymbolResolved, reviewFacts[f.Checks.SymbolResolved]},
 	} {
 		if !c.ok {
 			return fmt.Errorf("%w: finding %s %q", ErrInvalid, c.field, c.v)
 		}
+	}
+	longestNote := 0
+	for _, n := range f.Normalized {
+		longestNote = max(longestNote, len(n))
 	}
 	for _, b := range [...]struct {
 		field string
 		n     int
 		max   int
 	}{
-		{"content", len(f.Content), maxFindingContent},
-		{"existing_code", len(f.ExistingCode), maxFindingCode},
-		{"suggestion_code", len(f.SuggestionCode), maxFindingCode},
+		{"content", len(f.Content), MaxFindingContent},
+		{"existing_code", len(f.ExistingCode), MaxFindingCode},
+		{"suggestion_code", len(f.SuggestionCode), MaxFindingCode},
+		{"anchor_reason", len(f.AnchorReason), maxReviewLabel},
+		{"normalized note", longestNote, maxReviewLabel},
+		{"normalized notes count", len(f.Normalized), maxReviewNotes},
 	} {
 		if b.n > b.max {
-			return fmt.Errorf("%w: finding %s is over %d bytes", ErrInvalid, b.field, b.max)
+			return fmt.Errorf("%w: finding %s is over %d", ErrInvalid, b.field, b.max)
 		}
 	}
 	if strings.TrimSpace(f.Content) == "" {
@@ -526,6 +587,19 @@ func validateReviewRecord(in ReviewRecordInput) (*reviewRecordData, error) {
 	if !reviewProducers[in.Producer] {
 		return nil, fmt.Errorf("%w: producer %q", ErrInvalid, in.Producer)
 	}
+	if len(in.Sources) > maxReviewSources {
+		return nil, fmt.Errorf("%w: a record names at most %d sources", ErrInvalid, maxReviewSources)
+	}
+	for _, src := range in.Sources {
+		for _, l := range [...]struct {
+			field, v string
+			max      int
+		}{{"source kind", src.Kind, maxReviewLabel}, {"source ref", src.Ref, maxPathLen}, {"source sha256", src.SHA256, maxReviewLabel}} {
+			if strings.TrimSpace(l.v) == "" || len(l.v) > l.max || strings.ContainsRune(l.v, 0) {
+				return nil, fmt.Errorf("%w: %s %q", ErrInvalid, l.field, l.v)
+			}
+		}
+	}
 	if len(in.Findings) > MaxReviewFindings {
 		return nil, fmt.Errorf("%w: a record holds at most %d findings", ErrInvalid, MaxReviewFindings)
 	}
@@ -538,7 +612,7 @@ func validateReviewRecord(in ReviewRecordInput) (*reviewRecordData, error) {
 	if err != nil {
 		return nil, err
 	}
-	d := &reviewRecordData{Lineage: in.Lineage, Change: c, Producer: in.Producer, Coverage: coverage}
+	d := &reviewRecordData{Lineage: in.Lineage, Change: c, Producer: in.Producer, Sources: in.Sources, Coverage: coverage}
 	d.withCounts()
 	return d, nil
 }
@@ -553,7 +627,8 @@ func (t *txn) insertFinding(ctx context.Context, in ReviewRecordInput, recordID,
 		d.CodeSHA256 = sha256Hex(code)
 	}
 	var err error
-	if d.Dedupe, err = t.dedupeFinding(ctx, in.WorkspaceID, in.Lineage, in.Change.Head, f, d.CodeSHA256); err != nil {
+	commit := in.Change.LinesAt(f.Side)
+	if d.Dedupe, err = t.dedupeFinding(ctx, in.WorkspaceID, in.Lineage, commit, f, d.CodeSHA256); err != nil {
 		return err
 	}
 	if d.Dedupe.Result == DedupePossibleDuplicate {
@@ -580,19 +655,19 @@ func (t *txn) insertFinding(ctx context.Context, in ReviewRecordInput, recordID,
 		baseline = BaselineHash
 	}
 	_, err = t.exec(ctx, `INSERT INTO anchors (subject_kind, entry_id, ordinal, kind, value, declared, baseline_state,
-		baseline_hash, baseline_kind, baseline_commit, baseline_at, start_line, end_line, side, anchor_status)
-		VALUES (?, ?, 0, ?, ?, 1, ?, ?, 'existing_code', ?, ?, ?, ?, ?, ?)`,
-		SubjectReviewFinding, id, AnchorReviewRange, f.Path, baseline, d.CodeSHA256, in.Change.Head, t.nowText(),
-		f.StartLine, f.EndLine, f.Side, f.AnchorStatus)
+		baseline_hash, baseline_kind, baseline_commit, baseline_at, start_line, end_line, side, anchor_status, lineage)
+		VALUES (?, ?, 0, ?, ?, 1, ?, ?, 'existing_code', ?, ?, ?, ?, ?, ?, ?)`,
+		SubjectReviewFinding, id, AnchorReviewRange, f.Path, baseline, d.CodeSHA256, commit, t.nowText(),
+		f.StartLine, f.EndLine, f.Side, f.AnchorStatus, in.Lineage)
 	return err
 }
 
 // dedupeFinding compares f with the lineage's findings on its path and side whose lines
-// count at head (earlier heads are incomparable until re-anchored), leaving out
-// duplicates and outdated anchors. The best exact match (IoU above the threshold and
+// count in commit (lines of another commit are incomparable until re-anchored), leaving
+// out duplicates and outdated anchors. The best exact match (IoU above the threshold and
 // the same quoted code) makes f a duplicate; otherwise the best positional match makes
 // it a possible duplicate.
-func (t *txn) dedupeFinding(ctx context.Context, ws, lineage, head string, f ReviewFindingInput, code string) (ReviewDedupe, error) {
+func (t *txn) dedupeFinding(ctx context.Context, ws, lineage, commit string, f ReviewFindingInput, code string) (ReviewDedupe, error) {
 	out := ReviewDedupe{Result: DedupeCreated}
 	if f.StartLine == 0 {
 		return out, nil
@@ -604,7 +679,7 @@ func (t *txn) dedupeFinding(ctx context.Context, ws, lineage, head string, f Rev
 	}
 	var exact, near ReviewDedupe
 	for _, g := range cands {
-		if g.Status == FindingDuplicate || g.OutdatedAt != "" || g.Head != head || g.Side != f.Side {
+		if g.Status == FindingDuplicate || g.OutdatedAt != "" || g.Commit != commit || g.Side != f.Side {
 			continue
 		}
 		iou := SpanIoU([2]int{f.StartLine, f.EndLine}, [2]int{g.StartLine, g.EndLine})
@@ -667,23 +742,23 @@ func (t *txn) TriageReviewFinding(ctx context.Context, in ReviewTriageInput, act
 	return t.GetReviewFinding(ctx, f.WorkspaceID, f.ID)
 }
 
-// ReanchorReviewFindings moves findings to head (see ReviewWriter). Only a finding that
-// is neither a duplicate nor already outdated moves; an outdated one keeps its last
-// place and records where its code went missing.
-func (t *txn) ReanchorReviewFindings(ctx context.Context, workspaceID, head string, moves []ReviewReanchor, actor Actor) (int, error) {
+// ReanchorReviewFindings moves findings to later commits (see ReviewWriter). Only an
+// anchored finding that is neither a duplicate nor already outdated moves; an outdated
+// one keeps its last place and records the commit where its code went missing.
+func (t *txn) ReanchorReviewFindings(ctx context.Context, workspaceID string, moves []ReviewReanchor, actor Actor) (int, error) {
 	if err := actor.validate(); err != nil {
-		return 0, err
-	}
-	if err := validReviewLabel("head", head, true); err != nil {
 		return 0, err
 	}
 	changed := 0
 	for _, m := range moves {
+		if err := validReviewLabel("commit", m.Commit, true); err != nil {
+			return changed, err
+		}
 		f, err := t.GetReviewFinding(ctx, workspaceID, m.FindingID)
 		if err != nil {
 			return changed, err
 		}
-		if f.Head == head || f.Status == FindingDuplicate || f.OutdatedAt != "" {
+		if f.Commit == m.Commit || f.Status == FindingDuplicate || f.OutdatedAt != "" || f.StartLine == 0 {
 			continue
 		}
 		to := f.ReviewFindingInput
@@ -694,16 +769,16 @@ func (t *txn) ReanchorReviewFindings(ctx context.Context, workspaceID, head stri
 			}
 		}
 		now := t.nowText()
-		query, args := `UPDATE anchors SET stale_since = ?, stale_commit = ?`, []any{now, head}
+		query, args := `UPDATE anchors SET stale_since = ?, stale_commit = ?`, []any{now, m.Commit}
 		if !m.Outdated {
 			query, args = `UPDATE anchors SET start_line = ?, end_line = ?, anchor_status = ?, baseline_commit = ?, baseline_at = ?`,
-				[]any{to.StartLine, to.EndLine, to.AnchorStatus, head, now}
+				[]any{to.StartLine, to.EndLine, to.AnchorStatus, m.Commit, now}
 		}
 		if _, err := t.exec(ctx, query+` WHERE subject_kind = ? AND entry_id = ? AND kind = ?`,
 			append(args, SubjectReviewFinding, f.ID, AnchorReviewRange)...); err != nil {
 			return changed, err
 		}
-		data := map[string]any{"from_head": f.Head, "to_head": head, "from": [2]int{f.StartLine, f.EndLine}, "outdated": m.Outdated}
+		data := map[string]any{"from_commit": f.Commit, "to_commit": m.Commit, "from": [2]int{f.StartLine, f.EndLine}, "outdated": m.Outdated}
 		if !m.Outdated {
 			data["to"], data["anchor_status"] = [2]int{to.StartLine, to.EndLine}, to.AnchorStatus
 		}
@@ -745,12 +820,15 @@ func (r *reader) GetReviewRecord(ctx context.Context, workspaceID, id string) (R
 }
 
 // reviewFindingQuery reads findings with their current anchor. The anchors drive the
-// join (CROSS JOIN fixes the order), so a record's ids or a path are index lookups
-// whatever the workspace holds. The status is derived: a duplicate stays one, else the
+// join (CROSS JOIN fixes the order), so a record's ids, a lineage and a lineage's path
+// are index lookups whatever the workspace holds (anchors_review_lineage), and the
+// events' JSON is read only for the rows they select. Each anchor's event is found by its
+// entry id: the unary plus on the workspace term keeps SQLite from joining through
+// events_workspace instead, which would read every event of the workspace per anchor. The status is derived: a duplicate stays one, else the
 // latest triage verdict decides, else an outdated anchor, else open.
-const reviewFindingQuery = `SELECT id, workspace_id, principal, seq, at, data, head, outdated_at, start_line, end_line, side,
-	anchor_status, corroborations, status FROM (
-	SELECT ev.entry_id AS id, ev.workspace_id, ev.principal, ev.seq, ev.at, ev.data, a.baseline_commit AS head,
+const reviewFindingQuery = `SELECT id, workspace_id, principal, seq, at, data, lines_at, outdated_at, start_line, end_line,
+	side, anchor_status, corroborations, status FROM (
+	SELECT ev.entry_id AS id, ev.workspace_id, ev.principal, ev.seq, ev.at, ev.data, a.baseline_commit AS lines_at,
 		coalesce(a.stale_since, '') AS outdated_at, a.start_line, a.end_line, a.side, a.anchor_status,
 		(SELECT count(*) FROM outcomes o WHERE o.entry_id = ev.entry_id AND o.subject_kind = 'review_finding'
 			AND o.outcome = 'confirm' AND o.principal_key <> json_extract(ev.data, '$.author_key')
@@ -763,7 +841,7 @@ const reviewFindingQuery = `SELECT id, workspace_id, principal, seq, at, data, h
 		END AS status
 	FROM anchors a CROSS JOIN events ev ON ev.entry_id = a.entry_id AND ev.subject_kind = 'review_finding'
 		AND ev.type = 'review_finding'
-	WHERE a.subject_kind = 'review_finding' AND a.kind = 'review_range' AND ev.workspace_id = ?`
+	WHERE a.subject_kind = 'review_finding' AND a.kind = 'review_range' AND +ev.workspace_id = ?`
 
 // ListReviewFindings lists findings (see ReviewReader), oldest first.
 func (r *reader) ListReviewFindings(ctx context.Context, f ReviewFindingFilter) ([]ReviewFinding, error) {
@@ -811,7 +889,7 @@ func reviewFindingsSQL(f ReviewFindingFilter, ids []string) (string, []any) {
 		v      any
 		set    bool
 	}{
-		{"json_extract(ev.data, '$.lineage') = ?", f.Lineage, f.Lineage != ""},
+		{"a.lineage = ?", f.Lineage, f.Lineage != ""},
 		{"a.value = ?", f.Path, f.Path != ""},
 		{"ev.seq > ?", f.AfterSeq, f.AfterSeq > 0},
 	} {
@@ -849,7 +927,7 @@ func scanReviewFinding(s scanner) (ReviewFinding, error) {
 	var f ReviewFinding
 	var data string
 	var place ReviewFindingInput
-	if err := s.Scan(&f.ID, &f.WorkspaceID, &f.Author, &f.Seq, &f.At, &data, &f.Head, &f.OutdatedAt, &place.StartLine,
+	if err := s.Scan(&f.ID, &f.WorkspaceID, &f.Author, &f.Seq, &f.At, &data, &f.Commit, &f.OutdatedAt, &place.StartLine,
 		&place.EndLine, &place.Side, &place.AnchorStatus, &f.Corroborations, &f.Status); err != nil {
 		return f, err
 	}

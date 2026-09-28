@@ -14,8 +14,6 @@
 ALTER TABLE events ADD COLUMN subject_kind TEXT NOT NULL DEFAULT 'memory' CHECK (subject_kind <> '');
 ALTER TABLE jobs ADD COLUMN subject_kind TEXT NOT NULL DEFAULT 'memory' CHECK (subject_kind <> '');
 
-CREATE INDEX events_subject ON events (workspace_id, subject_kind, type, seq) WHERE subject_kind <> 'memory';
-
 -- The append-only rule now also keeps subject_kind; purge redaction is otherwise as in
 -- migration 1.
 DROP TRIGGER events_no_update;
@@ -47,7 +45,9 @@ BEGIN
 END;
 
 -- Anchors gain a line range in the file value names (1-based and inclusive, 0 when the
--- anchor has none), the side of the change it counts in and how it was placed.
+-- anchor has none), the side of the change it counts in, how it was placed, and the
+-- lineage of changes a review finding is compared within, indexed with the path so
+-- dedupe and a lineage's findings are index lookups.
 CREATE TABLE anchors_v3 (
   pk              INTEGER PRIMARY KEY,
   entry_id        TEXT NOT NULL,
@@ -68,6 +68,7 @@ CREATE TABLE anchors_v3 (
   end_line        INTEGER NOT NULL DEFAULT 0 CHECK (end_line >= start_line),
   side            TEXT NOT NULL DEFAULT '' CHECK (side IN ('', 'new', 'old')),
   anchor_status   TEXT NOT NULL DEFAULT '',
+  lineage         TEXT NOT NULL DEFAULT '',
   CHECK (baseline_state <> 'hash' OR baseline_hash <> ''),
   CHECK ((start_line = 0) = (end_line = 0)),
   UNIQUE (entry_id, kind, value)
@@ -80,6 +81,7 @@ SELECT pk, entry_id, ordinal, kind, value, declared, symbol_uid, baseline_state,
 DROP TABLE anchors;
 ALTER TABLE anchors_v3 RENAME TO anchors;
 CREATE INDEX anchors_lookup ON anchors (kind, value);
+CREATE INDEX anchors_review_lineage ON anchors (lineage, value) WHERE subject_kind = 'review_finding';
 
 CREATE TRIGGER anchors_subject_exists BEFORE INSERT ON anchors
 WHEN (NEW.subject_kind = 'memory' AND NOT EXISTS (SELECT 1 FROM entries WHERE id = NEW.entry_id))
