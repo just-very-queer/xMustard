@@ -13,8 +13,12 @@
 package hooks
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"regexp"
 	"strings"
 	"unicode/utf8"
 )
@@ -107,6 +111,10 @@ type Input struct {
 	// Reason is SessionEnd's exit reason; Trigger is PreCompact/PostCompact's.
 	Reason  string `json:"reason"`
 	Trigger string `json:"trigger"`
+	// Error is PostToolUseFailure's error text.
+	Error string `json:"error"`
+	// TranscriptPath is the client's own transcript of the session (every event).
+	TranscriptPath string `json:"transcript_path"`
 	// ToolCalls is PostToolBatch's batch.
 	ToolCalls []BatchCall `json:"tool_calls"`
 }
@@ -279,6 +287,68 @@ func ComposeWithin(room int, parts ...string) string {
 		kept, n = append(kept, strings.TrimSpace(p)), n+size
 	}
 	return strings.Join(kept, "\n\n")
+}
+
+// ArgsDigest identifies a tool call's arguments for the session ledger: for a shell
+// call the command alone (its description varies between runs of the same command), for
+// any other tool its whole input as sent. Two runs of one call have the same digest.
+func ArgsDigest(in Input, body []byte) string {
+	if ClassOf(in.ToolName) == ToolShell {
+		return digest([]byte(strings.TrimSpace(in.ToolInput.Command)))
+	}
+	var raw struct {
+		ToolInput json.RawMessage `json:"tool_input"`
+	}
+	if json.Unmarshal(body, &raw) != nil || len(raw.ToolInput) == 0 {
+		return ""
+	}
+	var compact bytes.Buffer
+	if json.Compact(&compact, raw.ToolInput) != nil {
+		return ""
+	}
+	return digest(compact.Bytes())
+}
+
+func digest(b []byte) string {
+	sum := sha256.Sum256(b)
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
+// ownToolKinds maps an xMustard tool's name to the memory action the session ledger
+// records for it.
+var ownToolKinds = map[string]string{"remember": "memory_proposed", "verify": "memory_verified"}
+
+// memoryIDPattern finds the memory id an xMustard result names.
+var memoryIDPattern = regexp.MustCompile(`"(?:id|entry_id)"\s*:\s*"(ctx_[0-9a-f]{6,64})"`)
+
+// OwnMemoryCall reports, for a call of xMustard's own remember or verify tool, the
+// ledger kind of the memory action and the memory it names (from the tool input's
+// entry_id, else the result's id). ok is false for any other call, and for a remember
+// that stored no memory (a handoff capsule).
+func OwnMemoryCall(tool string, body []byte) (kind, entryID string, ok bool) {
+	if !OwnTool(tool) {
+		return "", "", false
+	}
+	kind, ok = ownToolKinds[tool[strings.LastIndex(tool, "__")+2:]]
+	if !ok {
+		return "", "", false
+	}
+	var call struct {
+		ToolInput struct {
+			EntryID string `json:"entry_id"`
+		} `json:"tool_input"`
+		ToolResponse json.RawMessage `json:"tool_response"`
+	}
+	_ = json.Unmarshal(body, &call)
+	entryID = call.ToolInput.EntryID
+	if entryID == "" {
+		// the response is the tool's result, often JSON quoted inside a text block
+		resp := strings.ReplaceAll(string(call.ToolResponse), `\"`, `"`)
+		if m := memoryIDPattern.FindStringSubmatch(resp); m != nil {
+			entryID = m[1]
+		}
+	}
+	return kind, entryID, entryID != ""
 }
 
 // Decode reads a hook body. A field of an unexpected type (an MCP tool's own "pattern"

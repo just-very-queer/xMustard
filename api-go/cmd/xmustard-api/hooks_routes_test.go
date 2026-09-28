@@ -44,6 +44,8 @@ func newHookFixture(t testing.TB) *hookFixture {
 	t.Helper()
 	f := &hookFixture{ws: hookRepoWS, memories: map[string]string{}}
 	f.dir = t.TempDir()
+	// the ledger writer finishes before the data dir is removed (cleanups run last first)
+	t.Cleanup(func() { settleHooks(t, f.dir) })
 	// A fixed-width root: its length reaches the goldens through captured sizes and
 	// reduction cuts, and t.TempDir's names vary in length.
 	root := fmt.Sprintf("/tmp/xmhook-%08x", rand.Uint32())
@@ -95,6 +97,19 @@ func newHookFixture(t testing.TB) *hookFixture {
 	return f
 }
 
+// settleHooks waits until every queued hook event has been handled and the session
+// ledger has written what it was given (its jobs included).
+func settleHooks(t testing.TB, dataDir string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for hookStats.drained.Load() < hookStats.enqueued.Load() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if !workspaceops.FlushSessionLedger(dataDir, 10*time.Second) {
+		t.Fatal("the session ledger did not settle")
+	}
+}
+
 // memory writes a promoted memory: two peer approvals, the second a human approver's
 // when human is set.
 func (f *hookFixture) memory(t testing.TB, name, title, content string, paths, tags []string, human bool) {
@@ -142,7 +157,7 @@ func (f *hookFixture) fakeWorker(t testing.TB) {
 	}
 }
 
-func (f *hookFixture) post(t *testing.T, token, event, body string) (int, []byte) {
+func (f *hookFixture) post(t testing.TB, token, event, body string) (int, []byte) {
 	t.Helper()
 	req, _ := http.NewRequest("POST", f.srv.URL+"/api/hooks/claude/"+event, strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
@@ -234,6 +249,7 @@ func TestHookGoldenSession(t *testing.T) {
 		if code != http.StatusOK {
 			t.Fatalf("%s: %d %s", name, code, body)
 		}
+		settleHooks(t, f.dir) // the next answer may read what the ledger wrote
 		got := f.normalize(body)
 		golden := filepath.Join(dir, "golden", name+".out.json")
 		if update {
@@ -817,6 +833,8 @@ func BenchmarkHookAnswers(b *testing.B) {
 		f.root, filepath.Join(f.root, "src", "billing.go"))
 	grep := fmt.Sprintf(`{"session_id":"%%d","cwd":%q,"hook_event_name":"PreToolUse","tool_name":"Grep","tool_input":{"pattern":"roundHalfEven"}}`, f.root)
 	start := fmt.Sprintf(`{"session_id":"%%d","cwd":%q,"hook_event_name":"SessionStart","source":"startup"}`, f.root)
+	compact := fmt.Sprintf(`{"session_id":"bench-compact","cwd":%q,"hook_event_name":"SessionStart","source":"compact"}`, f.root)
+	f.sessionEvents(b, "bench-compact", "Fix the rounding bug in billing.") // a session with a stored snapshot
 	stdout := goTestLog(1500)[:30000]
 	cases := []struct {
 		name, event string
@@ -825,7 +843,10 @@ func BenchmarkHookAnswers(b *testing.B) {
 		{"PreToolUse-Read", "PreToolUse", func(i int) string { return fmt.Sprintf(read, i) }},
 		{"PreToolUse-Grep", "PreToolUse", func(i int) string { return fmt.Sprintf(grep, i) }},
 		{"PostToolUse-Bash-30k", "PostToolUse", func(i int) string { return postToolUseBash(f.root, fmt.Sprint(i), "", stdout) }},
+		// startup: ground's part, the core tier and the prior session's handoff
 		{"SessionStart", "SessionStart", func(i int) string { return fmt.Sprintf(start, i) }},
+		// compact: the session's stored snapshot restored (WS-33)
+		{"SessionStart-compact", "SessionStart", func(int) string { return compact }},
 	}
 	for _, c := range cases {
 		b.Run(c.name, func(b *testing.B) {
