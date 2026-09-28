@@ -11,8 +11,9 @@
 //! waiting for the debounce.
 //!
 //! What the watcher watches. The whole root except the directories Git ignores as a
-//! whole (`git status --ignored=matching`, once per start and after an ignore file
-//! changes): every path `git status` can report is seen, and `node_modules/`, `target/`
+//! whole (`git status --ignored=matching`, once per start, after an ignore file changes
+//! and after the Git index changes, since a force-added file makes its directory
+//! tracked): every path `git status` can report is seen, and `node_modules/`, `target/`
 //! and the like cost no watch. FSEvents watches the root recursively with one stream;
 //! inotify gets one watch per directory (at most [`MAX_WATCH_DIRS`]), added as new
 //! directories appear. Inside the Git dir only HEAD, the Git index, refs, `logs/HEAD`,
@@ -53,7 +54,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
-use notify::event::{AccessKind, AccessMode, CreateKind, EventKind};
+use notify::event::{AccessKind, AccessMode, CreateKind, EventKind, ModifyKind};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher, WatcherKind};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -85,8 +86,8 @@ const TICK: Duration = Duration::from_millis(250);
 const COOKIE_PREFIX: &str = "xm-watch-cookie-";
 /// Ignore files anywhere in the tree.
 const IGNORE_FILES: &[&str] = &[".gitignore", ".xmustardignore"];
-/// Git dir entries that are Git state (HEAD, the Git index, refs and the origin).
-const GIT_STATE_FILES: &[&str] = &["HEAD", "index", "packed-refs", "config", "logs/HEAD"];
+/// Git dir entries besides the Git index that are Git state (HEAD, refs, the origin).
+const GIT_STATE_FILES: &[&str] = &["HEAD", "packed-refs", "config", "logs/HEAD"];
 
 /// The watcher state the freshness envelope reports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -127,8 +128,8 @@ impl WatcherState {
 pub enum Class {
     /// A root-relative worktree path.
     Path(String),
-    /// A Git state file.
-    Git,
+    /// A Git state file; `index` when it is the Git index.
+    Git { index: bool },
     /// An ignore file changed.
     IgnoreFile,
     /// This process's cookie number n came back.
@@ -174,10 +175,11 @@ impl Layout {
         };
         let rel = rel.to_string_lossy().replace('\\', "/");
         let name = rel.rsplit('/').next().unwrap_or_default();
+        // Git never reads an ignore file inside a directory it ignores
         match () {
             _ if rel.is_empty() || rel == ".git" || rel.starts_with(".git/") => Class::Skip,
-            _ if IGNORE_FILES.contains(&name) => Class::IgnoreFile,
             _ if self.ignored(&rel) => Class::Skip,
+            _ if IGNORE_FILES.contains(&name) => Class::IgnoreFile,
             _ => Class::Path(rel),
         }
     }
@@ -201,7 +203,8 @@ fn git_class(rel: &str) -> Class {
     }
     match rel.as_str() {
         "info/exclude" => Class::IgnoreFile,
-        r if GIT_STATE_FILES.contains(&r) || r.starts_with("refs/") => Class::Git,
+        "index" => Class::Git { index: true },
+        r if GIT_STATE_FILES.contains(&r) || r.starts_with("refs/") => Class::Git { index: false },
         _ => Class::Skip,
     }
 }
@@ -227,7 +230,8 @@ pub struct WatchCounters {
     pub git_events: u64,
     pub rescans: u64,
     pub errors: u64,
-    /// inotify directory watches (0 with a recursive native stream).
+    /// inotify directory watches (0 with a recursive native stream); `status` fills it
+    /// in from the watched set.
     pub dirs_watched: usize,
     pub cookies: u64,
     pub cookie_timeouts: u64,
@@ -240,6 +244,8 @@ pub struct WatchCounters {
 struct Inner {
     queue: RefreshQueue,
     native: Option<RecommendedWatcher>,
+    /// inotify: the directories watched (none with a recursive native stream).
+    watched: BTreeSet<PathBuf>,
     /// The thread is (re)establishing the native watcher.
     establishing: bool,
     detail: String,
@@ -248,6 +254,9 @@ struct Inner {
     rewatch_failures: u32,
     verify_at: Instant,
     reload_ignored: bool,
+    /// The Git index changed: learn the ignored directories again (see
+    /// `Root::recheck_ignored`).
+    recheck_ignored: bool,
     next_cookie: u64,
     cookies_seen: u64,
     memo: Option<(u64, Arc<RepoState>)>,
@@ -259,7 +268,8 @@ struct Inner {
 }
 
 pub struct Root {
-    layout: Mutex<Layout>,
+    /// Shared with every event being classified; replaced whole, never edited.
+    layout: Mutex<Arc<Layout>>,
     root: PathBuf,
     tx: Sender<notify::Result<Event>>,
     state: AtomicU8,
@@ -301,10 +311,10 @@ impl Root {
         let mut queue = RefreshQueue::new();
         queue.push(Change::Full(FullReason::Startup), now);
         let r = Arc::new(Root {
-            layout: Mutex::new(Layout {
+            layout: Mutex::new(Arc::new(Layout {
                 root: root.clone(),
                 ..Default::default()
-            }),
+            })),
             root,
             tx,
             state: AtomicU8::new(WatcherState::Overflow as u8),
@@ -314,6 +324,7 @@ impl Root {
             inner: Mutex::new(Inner {
                 queue,
                 native: None,
+                watched: BTreeSet::new(),
                 establishing: true,
                 detail: "starting: the whole tree is refreshed once".into(),
                 due_notified: None,
@@ -321,6 +332,7 @@ impl Root {
                 rewatch_failures: 0,
                 verify_at: now + VERIFY_EVERY,
                 reload_ignored: false,
+                recheck_ignored: false,
                 next_cookie: 0,
                 cookies_seen: 0,
                 memo: None,
@@ -338,6 +350,10 @@ impl Root {
 
     pub fn state(&self) -> WatcherState {
         WatcherState::from_u8(self.state.load(Ordering::Acquire))
+    }
+
+    fn layout(&self) -> Arc<Layout> {
+        lock(&self.layout).clone()
     }
 
     /// The watcher is `ok` and sees the Git state (HEAD, the Git index, refs).
@@ -393,16 +409,16 @@ impl Root {
 
     /// Learn the layout and the ignored directories, then start the native watcher.
     fn establish(&self, now: Instant) {
-        let layout = observe_layout(&self.root);
+        let layout = Arc::new(observe_layout(&self.root));
         *lock(&self.layout) = layout.clone();
         let max_dirs = lock(&self.inner).max_dirs;
         let outcome = start_native(&layout, self.tx.clone(), max_dirs);
         let mut inner = lock(&self.inner);
         inner.establishing = false;
         match outcome {
-            Ok((watcher, dirs)) => {
+            Ok((watcher, watched)) => {
                 inner.native = Some(watcher);
-                inner.counters.dirs_watched = dirs;
+                inner.watched = watched;
                 inner.rewatch_at = None;
                 inner.rewatch_failures = 0;
                 inner.detail.clear();
@@ -423,7 +439,7 @@ impl Root {
             NativeError::Other(d) => (FullReason::Rescan, d),
         };
         inner.native = None;
-        inner.counters.dirs_watched = 0;
+        inner.watched.clear();
         inner.rewatch_failures += 1;
         let backoff = REWATCH_AFTER
             .saturating_mul(1 << inner.rewatch_failures.saturating_sub(1).min(8))
@@ -460,12 +476,18 @@ impl Root {
         if inert(&ev.kind) {
             return;
         }
-        let created_dir = matches!(ev.kind, EventKind::Create(CreateKind::Folder))
-            || matches!(
-                ev.kind,
-                EventKind::Modify(notify::event::ModifyKind::Name(_))
-            );
-        let layout = lock(&self.layout).clone();
+        let created_dir = matches!(
+            ev.kind,
+            EventKind::Create(CreateKind::Folder) | EventKind::Modify(ModifyKind::Name(_))
+        );
+        // a removal or a rename can take watched directories away
+        if matches!(
+            ev.kind,
+            EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(_))
+        ) {
+            self.forget_gone_dirs(&ev.paths);
+        }
+        let layout = self.layout();
         for abs in &ev.paths {
             let class = layout.classify(abs);
             let mut inner = lock(&self.inner);
@@ -476,8 +498,9 @@ impl Root {
                     self.cookie_seen.notify_all();
                 }
                 Class::Skip => inner.counters.skipped += 1,
-                Class::Git => {
+                Class::Git { index } => {
                     inner.counters.git_events += 1;
+                    inner.recheck_ignored |= index;
                     inner.queue.push(Change::Git, now);
                     drop(inner);
                     self.bump(true);
@@ -503,33 +526,61 @@ impl Root {
                     drop(inner);
                     self.bump(false);
                     if new_dir && !recursive_native() {
-                        self.add_dir(&layout, abs, now);
+                        self.cover_dir(&layout, abs, now);
                     }
                 }
             }
         }
     }
 
-    /// inotify: watch a directory that appeared (and its subdirectories), and queue
-    /// the files already in it, whose own events came before the watch.
-    fn add_dir(&self, layout: &Layout, dir: &Path, now: Instant) {
+    /// inotify: notify drops the watches of a directory removed or renamed away, and
+    /// those of the directories below it. Forget them as well, so the watched set (and
+    /// the limit check) counts only live watches. The set is empty with a recursive
+    /// native stream.
+    fn forget_gone_dirs(&self, paths: &[PathBuf]) {
         let mut inner = lock(&self.inner);
-        let max = inner.max_dirs;
-        let Some(watcher) = inner.native.as_mut() else {
-            return;
-        };
-        let mut added = 0usize;
-        let mut files = Vec::new();
+        for abs in paths {
+            let gone = inner.watched.contains(abs)
+                && !std::fs::symlink_metadata(abs).is_ok_and(|m| m.is_dir());
+            if !gone {
+                continue;
+            }
+            let below: Vec<PathBuf> = inner
+                .watched
+                .range(abs.clone()..)
+                .take_while(|p| p.starts_with(abs))
+                .cloned()
+                .collect();
+            for p in &below {
+                inner.watched.remove(p);
+            }
+        }
+    }
+
+    /// Cover a directory the watcher did not see into: one that appeared (inotify) or
+    /// one Git no longer ignores as a whole. Queue its files, whose own events came
+    /// before (or were skipped), and on inotify watch it and its subdirectories.
+    fn cover_dir(&self, layout: &Layout, dir: &Path, now: Instant) {
+        let mut guard = lock(&self.inner);
+        let inner: &mut Inner = &mut guard;
         let mut failure = None;
+        // the walk yields a directory before it reads the entries, so each directory is
+        // watched first: a file created meanwhile is listed or has its own event
         for (path, is_dir) in walk_tree(layout, dir) {
             if !is_dir {
                 if let Class::Path(rel) = layout.classify(&path) {
-                    files.push(rel);
+                    inner.queue.push(Change::Path(rel), now);
                 }
                 continue;
             }
+            let Some(watcher) = inner.native.as_mut().filter(|_| !recursive_native()) else {
+                continue;
+            };
+            // notify answers Ok for a directory it already watches: the set counts it once
             match add_watch(watcher, &path, RecursiveMode::NonRecursive) {
-                Ok(()) => added += 1,
+                Ok(()) => {
+                    inner.watched.insert(path);
+                }
                 Err(None) => {}
                 Err(Some(e)) => {
                     failure = Some(e);
@@ -537,16 +588,42 @@ impl Root {
                 }
             }
         }
-        inner.counters.dirs_watched += added;
-        for rel in files {
-            inner.queue.push(Change::Path(rel), now);
-        }
-        let over = inner.counters.dirs_watched > max;
-        match (failure, over) {
-            (Some(e), _) => self.degrade(&mut inner, e, now),
-            (None, true) => self.degrade(&mut inner, limit_error(max), now),
+        let max = inner.max_dirs;
+        match (failure, inner.watched.len() > max) {
+            (Some(e), _) => self.degrade(inner, e, now),
+            (None, true) => self.degrade(inner, limit_error(max), now),
             (None, false) => {}
         }
+    }
+
+    /// The Git index changed, so a directory Git ignored as a whole may hold tracked
+    /// files now (`git add -f`). Learn the ignored directories again and cover each one
+    /// no longer ignored: its edits were skipped until now. Directories newly ignored
+    /// only cost events that are skipped. No native restart and no full refresh, unless
+    /// the listing appeared or went away (then as after an ignore file change).
+    fn recheck_ignored(&self, now: Instant) {
+        let old = self.layout();
+        let fresh = Arc::new(observe_layout(&self.root));
+        let uncovered: Vec<PathBuf> = match (&old.ignored, &fresh.ignored) {
+            (Some(before), Some(_)) => before
+                .iter()
+                .filter(|d| !fresh.ignored(d))
+                .map(|d| fresh.root.join(d))
+                .collect(),
+            (None, None) => return,
+            _ => {
+                lock(&self.inner).reload_ignored = true;
+                return;
+            }
+        };
+        *lock(&self.layout) = fresh.clone();
+        if uncovered.is_empty() {
+            return;
+        }
+        for dir in &uncovered {
+            self.cover_dir(&fresh, dir, now);
+        }
+        self.bump(false);
     }
 
     fn on_error(&self, e: notify::Error, now: Instant) {
@@ -574,6 +651,12 @@ impl Root {
         if now >= inner.verify_at {
             inner.verify_at = now + VERIFY_EVERY;
             inner.queue.push(Change::Full(FullReason::Verify), now);
+        }
+        // a reload below re-learns the ignored directories anyway
+        if std::mem::take(&mut inner.recheck_ignored) && !inner.reload_ignored {
+            drop(inner);
+            self.recheck_ignored(now);
+            inner = lock(&self.inner);
         }
         let rewatch = inner.native.is_none()
             && !inner.establishing
@@ -717,6 +800,10 @@ impl Root {
     pub fn status(&self) -> Value {
         let inner = lock(&self.inner);
         let q = &inner.queue;
+        let counters = WatchCounters {
+            dirs_watched: inner.watched.len(),
+            ..inner.counters.clone()
+        };
         json!({
             "root": self.root.to_string_lossy(),
             "watcher_state": self.state().as_str(),
@@ -727,7 +814,7 @@ impl Root {
             "due": q.is_due(Instant::now()),
             "failures": q.failures(),
             "queue": q.counters,
-            "counters": inner.counters,
+            "counters": counters,
             "last_refresh": inner.last_refresh,
         })
     }
@@ -857,12 +944,12 @@ fn add_watch(
 }
 
 /// Start the native watcher for `layout`: one recursive stream where the platform has
-/// one, else a watch per covered directory plus the Git state directories.
+/// one, else a watch per covered directory plus the Git state directories (returned).
 fn start_native(
     layout: &Layout,
     tx: Sender<notify::Result<Event>>,
     max_dirs: usize,
-) -> Result<(RecommendedWatcher, usize), NativeError> {
+) -> Result<(RecommendedWatcher, BTreeSet<PathBuf>), NativeError> {
     let mut w = RecommendedWatcher::new(tx, notify::Config::default())
         .map_err(|e| NativeError::Other(format!("the native watcher did not start: {e}")))?;
     let fatal = |e: Option<NativeError>| {
@@ -879,9 +966,9 @@ fn start_native(
         {
             add_watch(&mut w, dir, RecursiveMode::Recursive).map_err(fatal)?;
         }
-        return Ok((w, 0));
+        return Ok((w, BTreeSet::new()));
     }
-    let mut dirs = 0usize;
+    let mut watched = BTreeSet::new();
     // HEAD, the Git index, packed-refs, config and the cookies in the Git dir itself;
     // logs/HEAD; info/exclude; every refs directory
     let git_state_dirs = layout.git_dirs.iter().flat_map(|g| {
@@ -894,15 +981,17 @@ fn start_native(
         .map(|(p, _)| p);
     for dir in tree.chain(git_state_dirs) {
         match add_watch(&mut w, &dir, RecursiveMode::NonRecursive) {
-            Ok(()) => dirs += 1,
+            Ok(()) => {
+                watched.insert(dir);
+            }
             Err(None) if dir != layout.root => {}
             Err(e) => return Err(fatal(e)),
         }
-        if dirs > max_dirs {
+        if watched.len() > max_dirs {
             return Err(limit_error(max_dirs));
         }
     }
-    Ok((w, dirs))
+    Ok((w, watched))
 }
 
 fn walkdir_dirs(dir: PathBuf) -> impl Iterator<Item = PathBuf> {
@@ -963,6 +1052,22 @@ fn canonical(root: &Path) -> Result<PathBuf, String> {
     Ok(c)
 }
 
+/// Remove the least recently used roots beyond `MAX_WATCHED_ROOTS`; the caller
+/// retires them once the registry lock is released.
+fn evict_lru(roots: &mut Vec<Arc<Root>>) -> Vec<Arc<Root>> {
+    let mut evicted = Vec::new();
+    while roots.len() > MAX_WATCHED_ROOTS {
+        let oldest = roots
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, r)| *lock(&r.used))
+            .map(|(i, _)| i)
+            .expect("non-empty");
+        evicted.push(roots.remove(oldest));
+    }
+    evicted
+}
+
 impl Registry {
     /// Watch limit per root (tests lower it to reach the limit path).
     pub fn set_max_dirs(&self, n: usize) {
@@ -984,39 +1089,40 @@ impl Registry {
     }
 
     /// Watch `root` (idempotent); the least recently used root beyond
-    /// `MAX_WATCHED_ROOTS` stops.
+    /// `MAX_WATCHED_ROOTS` stops. Finding the root and registering it happen under one
+    /// lock: concurrent starts for one root (parallel first reads) register one watcher.
     pub fn start(&self, root: &Path) -> Result<Value, String> {
         if !self.enabled.load(Ordering::Acquire) {
             return Err("the watcher runs only inside xmustard-core serve".into());
         }
         let root = canonical(root)?;
-        if let Some(r) = self.find(&root) {
-            return Ok(r.status());
-        }
         let notifier = lock(&self.notifier).clone();
         let max_dirs = self.max_dirs.load(Ordering::Acquire) as usize;
-        let (r, rx) = Root::new(root, notifier, max_dirs);
-        let evicted = {
+        let (r, started) = {
             let mut roots = lock(&self.roots);
-            roots.push(r.clone());
-            let mut evicted = Vec::new();
-            while roots.len() > MAX_WATCHED_ROOTS {
-                let oldest = roots
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|(_, r)| *lock(&r.used))
-                    .map(|(i, _)| i)
-                    .expect("non-empty");
-                evicted.push(roots.remove(oldest));
+            match roots.iter().find(|r| r.root == root) {
+                Some(hit) => (hit.clone(), None),
+                None => {
+                    let (r, rx) = Root::new(root, notifier, max_dirs);
+                    roots.push(r.clone());
+                    let evicted = evict_lru(&mut roots);
+                    (r, Some((rx, evicted)))
+                }
             }
-            evicted
         };
-        evicted.iter().for_each(|r| r.retire());
+        *lock(&r.used) = Instant::now();
+        let Some((rx, evicted)) = started else {
+            return Ok(r.status());
+        };
+        evicted.iter().for_each(|e| e.retire());
         let thread = r.clone();
-        std::thread::Builder::new()
+        let spawned = std::thread::Builder::new()
             .name("xm-watch".into())
-            .spawn(move || thread.run(rx))
-            .map_err(|e| format!("cannot start the watcher thread: {e}"))?;
+            .spawn(move || thread.run(rx));
+        if let Err(e) = spawned {
+            lock(&self.roots).retain(|x| !Arc::ptr_eq(x, &r));
+            return Err(format!("cannot start the watcher thread: {e}"));
+        }
         Ok(r.status())
     }
 
@@ -1217,10 +1323,13 @@ mod tests {
             ("/r/node_modules/x/index.js", Class::Skip),
             ("/r/out/gen/a.go", Class::Skip),
             ("/r/out/keep.go", Class::Path("out/keep.go".into())),
-            ("/r/.git/HEAD", Class::Git),
-            ("/r/.git/index", Class::Git),
-            ("/r/.git/refs/heads/main", Class::Git),
-            ("/r/.git/logs/HEAD", Class::Git),
+            // Git reads no ignore file inside a directory it ignores
+            ("/r/node_modules/x/.gitignore", Class::Skip),
+            ("/r/out/gen/.xmustardignore", Class::Skip),
+            ("/r/.git/HEAD", Class::Git { index: false }),
+            ("/r/.git/index", Class::Git { index: true }),
+            ("/r/.git/refs/heads/main", Class::Git { index: false }),
+            ("/r/.git/logs/HEAD", Class::Git { index: false }),
             ("/r/.git/info/exclude", Class::IgnoreFile),
             ("/r/.git/objects/ab/cdef", Class::Skip),
             ("/r/.git/index.lock", Class::Skip),
@@ -1252,7 +1361,7 @@ mod tests {
 
     #[test]
     fn reads_and_opens_are_inert() {
-        use notify::event::{DataChange, ModifyKind};
+        use notify::event::DataChange;
         assert!(inert(&EventKind::Access(AccessKind::Open(
             notify::event::AccessMode::Any
         ))));

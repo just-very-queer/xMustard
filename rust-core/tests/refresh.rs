@@ -11,7 +11,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc::{self, Receiver};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Barrier, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -338,6 +338,114 @@ fn more_directories_than_the_watch_limit_degrade() {
     );
     let due = wait_due(r.path(), Duration::from_secs(5));
     assert_eq!(due["watcher_state"], "degraded");
+}
+
+// Concurrent starts for one root register one watcher: the worker runs calls on
+// several threads, and parallel first reads (or ground beside a read) all ask to watch.
+#[test]
+fn concurrent_starts_register_one_root() {
+    let _g = serial();
+    let r = repo(&ts_files(2));
+    let _u = Unwatch(r.path());
+    let barrier = Barrier::new(8);
+    std::thread::scope(|s| {
+        for _ in 0..8 {
+            s.spawn(|| {
+                barrier.wait();
+                watch::registry().start(r.path()).unwrap();
+            });
+        }
+    });
+    let want = canon(r.path()).to_string_lossy().into_owned();
+    let all = watch::registry().status(None);
+    let registered = all["roots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|s| s["root"] == want.as_str())
+        .count();
+    assert_eq!(registered, 1, "{all}");
+}
+
+fn batch_paths(taken: &Value) -> BTreeSet<String> {
+    taken["batch"]["paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p.as_str().unwrap().to_string())
+        .collect()
+}
+
+// A directory Git ignored as a whole when the watcher started holds a tracked file
+// after `git add -f`: the Git index change makes the watcher cover it, so the file is
+// refreshed and its later edits reach the batches.
+#[test]
+fn a_force_added_file_in_an_ignored_directory_is_watched() {
+    let _g = serial();
+    let mut files = ts_files(2);
+    files.push((".gitignore".into(), "build/\n".into()));
+    let r = repo(&files);
+    write(r.path(), "build/gen.ts", "export const gen = 1;\n");
+    index::build(r.path(), &cfg()).unwrap();
+    let _u = Unwatch(r.path());
+    watched(r.path());
+
+    git(r.path(), &["add", "-f", "build/gen.ts"]);
+    wait_due(r.path(), Duration::from_secs(5));
+    let (taken, _) = refresh(r.path(), false);
+    assert!(batch_paths(&taken).contains("build/gen.ts"), "{taken}");
+
+    write(r.path(), "build/gen.ts", "export const gen = 2;\n");
+    wait_due(r.path(), Duration::from_secs(5));
+    let (taken, _) = refresh(r.path(), false);
+    assert_eq!(
+        batch_paths(&taken),
+        BTreeSet::from(["build/gen.ts".to_string()])
+    );
+    assert_eq!(digest(r.path()), digest_of_full_build(r.path()));
+}
+
+// inotify: the directory watch count follows the tree. notify answers Ok for a
+// directory it already watches (`mkdir -p` reports each level), and it drops the
+// watches of a directory renamed or removed; neither may move the count.
+#[test]
+#[cfg(target_os = "linux")]
+fn the_directory_watch_count_follows_the_tree() {
+    let _g = serial();
+    let r = repo(&ts_files(2));
+    index::build(r.path(), &cfg()).unwrap();
+    let _u = Unwatch(r.path());
+    watched(r.path());
+    let dirs = || {
+        watch::registry().status(Some(r.path()))["counters"]["dirs_watched"]
+            .as_u64()
+            .unwrap()
+    };
+    let wait_dirs = |want: u64| {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while dirs() != want {
+            assert!(
+                Instant::now() < deadline,
+                "dirs_watched {}, wanted {want}: {}",
+                dirs(),
+                watch::registry().status(Some(r.path()))
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    let base = dirs();
+    for _ in 0..3 {
+        fs::create_dir_all(r.path().join("a/b/c")).unwrap();
+        write(r.path(), "a/b/c/x.ts", "export const x = 1;\n");
+        wait_dirs(base + 3);
+        fs::rename(r.path().join("a"), r.path().join("moved")).unwrap();
+        wait_dirs(base + 3);
+        fs::remove_dir_all(r.path().join("moved")).unwrap();
+        wait_dirs(base);
+    }
+    // settle: the count stays put once the events are in
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(dirs(), base);
 }
 
 // A crash mid-update (the dirty flag left set) turns the next refresh into a full

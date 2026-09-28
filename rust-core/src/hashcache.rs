@@ -72,6 +72,8 @@ pub struct HashPass {
     pub over_budget: usize,
     /// Files whose hash came from the cache without reading them.
     pub reused: usize,
+    /// Bytes those files hold (a budgeted pass charges them too).
+    pub bytes_reused: u64,
     /// Cached entries whose stat key matched but fell inside the racy window.
     pub racy: usize,
     /// A valid cache file was loaded.
@@ -180,11 +182,12 @@ pub fn hash_files(
 }
 
 /// `hash_files` for a pass that may read at most `budget` bytes: `rels` are taken in
-/// the given order (the caller's priority), a file that is not reused from the cache
-/// and does not fit what is left is not read and is left out of the map (counted in
-/// `over_budget`). Reused entries cost nothing. The source identity hashes the dirty
+/// the given order (the caller's priority), a file that does not fit what is left is
+/// not read and is left out of the map (counted in `over_budget`). A reused file is
+/// charged its size like a read one, so what the map holds depends on the files' sizes
+/// and order only, never on what the cache held. The source identity hashes the dirty
 /// and untracked files `git status` lists this way (PAR-FRESH-01), so an unchanged
-/// dirty file is not read again.
+/// dirty file is not read again and its key is a function of the tree.
 pub fn hash_files_budgeted(
     root: &Path,
     rels: Vec<String>,
@@ -282,17 +285,19 @@ fn hash_files_inner(
         }
         let key = StatKey::of(&meta);
         let prev = old.entries.remove(rel.as_str());
+        if meta.len() > left {
+            // not read: the caller reports it; its old entry is dropped
+            pass.over_budget += 1;
+            entries_changed |= prev.is_some();
+            continue;
+        }
+        left -= meta.len();
         let cached = prev.filter(|e| e.key == key);
         let digest = match cached {
             Some(e) if key.newest_ns() < trusted_before => {
                 pass.reused += 1;
+                pass.bytes_reused += meta.len();
                 e.digest
-            }
-            _ if meta.len() > left => {
-                // not read: the caller reports it; its old entry is dropped
-                pass.over_budget += 1;
-                entries_changed |= prev.is_some();
-                continue;
             }
             _ => {
                 if cached.is_some() {
@@ -300,7 +305,6 @@ fn hash_files_inner(
                 }
                 pass.hashed += 1;
                 pass.bytes_hashed += meta.len();
-                left -= meta.len();
                 let Some(digest) = symbolgraph::sha256_open_file(file) else {
                     entries_changed |= prev.is_some();
                     continue;
@@ -960,10 +964,11 @@ mod tests {
         }
     }
 
-    // The identity's pass: the caller's order claims the byte budget, a file that does
-    // not fit is left out and counted, and reused entries cost nothing.
+    // The identity's pass: the caller's order claims the byte budget and a file that
+    // does not fit is left out and counted. A reused entry is charged like a read one,
+    // so a warm pass keeps exactly what the cold pass kept.
     #[test]
-    fn a_budgeted_pass_keeps_the_callers_order_and_reuses_for_free() {
+    fn a_budgeted_pass_keeps_the_callers_order_whatever_the_cache_holds() {
         let (repo, _s, cache) = setup(&[]);
         write(repo.path(), "z_tracked.rs", &[b'a'; 100]);
         write(repo.path(), "a_untracked.rs", &[b'b'; 100]);
@@ -982,14 +987,13 @@ mod tests {
             "first in order wins the budget"
         );
         assert_eq!((p.hashed, p.bytes_hashed, p.over_budget), (1, 100, 1));
-        let (m, p) = hash_files_inner(repo.path(), order, Some(&cache), Duration::ZERO, Some(150));
+        let (warm, p) =
+            hash_files_inner(repo.path(), order, Some(&cache), Duration::ZERO, Some(150));
+        assert_eq!(warm, m, "the cache changed what the pass keeps");
         assert_eq!(
-            m.len(),
-            2,
-            "the reused entry leaves the budget to the other file"
+            (p.hashed, p.reused, p.bytes_reused, p.over_budget),
+            (0, 1, 100, 1)
         );
-        assert_eq!((p.hashed, p.reused, p.over_budget), (1, 1, 0));
-        assert_eq!(m["a_untracked.rs"], sha_hex(&[b'b'; 100]));
     }
 
     #[test]

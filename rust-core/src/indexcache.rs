@@ -136,9 +136,10 @@ pub const MAX_GIT_OUTPUT_BYTES: usize = 32 << 20;
 
 static GIT_SPAWNS: AtomicU64 = AtomicU64::new(0);
 
-/// Count one Git child started by this process. Every Git spawn in the crate goes
-/// through here, so `serve`'s `$/stats` can show that queries spawn none while the
-/// watcher vouches for the tree (PAR-FRESH-03).
+/// Count one Git child started by this process. Every Git spawn outside the tests
+/// calls this (`run_git_bounded*`, the index scan's streamed listings, change
+/// tracking's `git` helper, `ownership owners`), so `serve`'s `$/stats` can show that
+/// queries spawn none while the watcher vouches for the tree (PAR-FRESH-03).
 pub fn note_git_spawn() {
     GIT_SPAWNS.fetch_add(1, Ordering::Relaxed);
 }
@@ -670,7 +671,8 @@ fn source_identity_with(root: &Path, list_ignored: bool) -> (SourceIdentity, Vec
             .then_with(|| a.path.cmp(&b.path))
     });
     // Regular files come from the identity's stat cache: only new, changed or racy ones
-    // are read, and tracked entries claim the byte budget first (the entries' order).
+    // are read. Tracked entries claim the byte budget first (the entries' order), and
+    // reused files are charged too, so the key does not depend on the cache.
     let rels: Vec<String> = entries
         .iter()
         .filter_map(|e| std::str::from_utf8(&e.path).ok().map(str::to_string))
@@ -685,7 +687,7 @@ fn source_identity_with(root: &Path, list_ignored: bool) -> (SourceIdentity, Vec
     id.files_hashed = pass.hashed;
     id.bytes_hashed = pass.bytes_hashed;
     id.files_reused = pass.reused;
-    let mut budget = MAX_IDENTITY_BYTES - pass.bytes_hashed;
+    let mut budget = MAX_IDENTITY_BYTES.saturating_sub(pass.bytes_hashed + pass.bytes_reused);
     for e in &entries {
         if e.is_untracked() {
             id.untracked_entries += 1;

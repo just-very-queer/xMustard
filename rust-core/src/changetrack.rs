@@ -934,7 +934,13 @@ fn listed_content_changed(
     let mut current: BTreeMap<String, Option<String>> = BTreeMap::new();
     for e in state.status.iter().filter(|e| !e.is_untracked()) {
         let path = String::from_utf8(e.path.clone()).ok()?;
-        current.insert(path, comparable_hash(state.identity.dirty.get(&e.path)?)?);
+        let hash = match e.xy {
+            // deleted from the Git index (`git rm --cached`): not tracked, whatever
+            // the worktree still holds
+            [b'D', b' '] => None,
+            _ => comparable_hash(state.identity.dirty.get(&e.path)?)?,
+        };
+        current.insert(path, hash);
         if e.xy.contains(&b'R')
             && let Some(orig) = &e.orig_path
         {
@@ -1911,6 +1917,41 @@ mod tests {
             Some(0),
             "a new symbol is not a break: {:?}",
             cs.dirty_symbols
+        );
+    }
+
+    // `git rm --cached b.rs` keeps b.rs in the worktree (status `D ` plus `?? b.rs`) but
+    // takes it out of the tracked set: drift's listed comparison sees it gone, as
+    // changed-since's full comparison does.
+    #[test]
+    fn drift_sees_a_file_untracked_in_place() {
+        let data = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        git_init(repo.path());
+        fs::write(repo.path().join("a.rs"), "pub fn one() {}\n").unwrap();
+        fs::write(repo.path().join("b.rs"), "pub fn two() {}\n").unwrap();
+        git_commit(repo.path());
+        build_index_baseline(data.path(), repo.path(), "ws").unwrap();
+        assert!(!detect_drift(data.path(), repo.path(), "ws").stale);
+
+        Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .args(["rm", "-q", "--cached", "b.rs"])
+            .output()
+            .unwrap();
+        let drift = detect_drift(data.path(), repo.path(), "ws");
+        assert_eq!(drift.drift_checked.mode, "identity", "{drift:?}");
+        assert!(drift.stale && drift.content_changed, "{drift:?}");
+        let cs = changed_since_baseline(data.path(), repo.path(), "ws");
+        assert!(
+            cs.changed_files
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|c| c.path == "b.rs" && c.change == "deleted"),
+            "{:?}",
+            cs.changed_files
         );
     }
 
