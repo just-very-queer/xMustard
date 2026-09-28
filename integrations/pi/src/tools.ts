@@ -64,6 +64,9 @@ const query = (path: string, ...kv: string[]): string => {
 
 const workspaceArg: ArgSpec = { name: "workspace_id", type: "string", desc: "workspace id; auto-resolved if omitted" };
 
+// RECALL_DEFAULT_MAX_CHARS is recallDefaultMaxChars in api-go/internal/mcpserver/tool_recall.go.
+export const RECALL_DEFAULT_MAX_CHARS = 4000;
+
 export const TOOL_SPECS: readonly ToolSpec[] = [
 	{
 		name: "ground",
@@ -82,9 +85,12 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
 			{ name: "paths", type: "string", desc: "comma-separated repo-relative files to focus on" },
 			{ name: "limit", type: "integer", minimum: 1, maximum: 50, desc: "max memories (default 8)" },
 		],
+		// the MCP tool always budgets recall (max_chars, default 4000; tool_recall.go);
+		// Pi sends the same default so both clients issue the same request
 		build: (a) => ({
 			method: "GET",
-			path: query(ws(a, "/context/active"), "query", str(a, "q"), "paths", str(a, "paths"), "limit", str(a, "limit")),
+			path: query(ws(a, "/context/active"), "query", str(a, "q"), "paths", str(a, "paths"), "limit", str(a, "limit"),
+				"max_chars", String(RECALL_DEFAULT_MAX_CHARS)),
 		}),
 	},
 	{
