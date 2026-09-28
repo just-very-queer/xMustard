@@ -1395,7 +1395,7 @@ rm -rf backend/data && mv "$keep/data" backend/data && rmdir "$keep"
   - The safepath upgrade consequence is recorded above and in `docs/STATUS.md`.
   - Each new test fails with its fix reverted (fan-out 3 for 2, the live memory damped by retired ones, no claim redaction report, a duplicate_of verdict on a pending target accepted).
   - *Measured.* `TestProposeReviewRSSAt50kMemories`, run back to back against the pre-fix tree (233557a) on the shared box (load average 6 to 14): pre-fix 19.1 and 16.8 ms per proposal, fixed 17.9 and 21.9 ms, within the box's noise; RSS 27.9 to 28.2 MiB after 500 proposals in both (growth 5.3 to 5.8 MiB, Go heap 2.8 MiB), with identical outcomes (125 corroborations, 375 created, 2,447 possible duplicates, 1,991 conflict candidates).
-  - *Checks.* The full Linux gate (`xm-remote-check.sh all -count=1`) passes on 79c6507: `remote_exit=0`, Rust release build, tests and clippy (6 warnings, the base count), go vet and every Go package. gofmt is clean on the changed files. No Rust or Pi file changed in this round.
+  - *Checks.* The full Linux gate (`xm-remote-check.sh all -count=1`) passes on 79c6507, and again after merging `feat/parity-v2` at 866333a (WS-FIX-03, WS-FIX-05, WS-58; 032d056): `remote_exit=0`, Rust release build, tests and clippy (6 warnings, the base count), go vet and every Go package. The merge kept both sides of `go-calls.txt`, the symbolgraph usage line and the description phrases, and added WS-27's tools/list cap deltas to WS-FIX-05's +119. The Pi unit tests pass (45). gofmt is clean on the changed files. No Rust or Pi source changed in this round's fixes.
 
 ### WS-28 — Change-driven invalidation, as_of, graph-proximity recall and memories on explain/impact
 
