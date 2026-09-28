@@ -1,0 +1,27 @@
+# `symbolgraph impact <root> ws <probe>` (release, default arguments) and `symbolgraph coverage`
+# on fresh clones of the parity fixtures (cline ee59f81, pi-mono 5fd446c) and
+# open-code-review 486022d; Linux build box. base = 845868d (legacy file-level impact,
+# depth 4: impacted counts files), head = WS-35 final (impact v2, depth 3: counts symbols
+# and file-level code).
+base cline Controller           impacted 1565 files
+base cline buildApiHandler      impacted 1639 files
+base cline AnthropicHandler     impacted 830 files
+base pi-mono agentLoop          impacted 1530 files
+base pi-mono shouldCompact      impacted 1574 files
+base open-code-review Run       impacted 413 files
+base open-code-review NewClient impacted 347 files
+base open-code-review Execute   impacted 274 files
+head cline Controller           n 180 direct 180 risk CRITICAL lower_bound [ambiguous, coverage:lexical_fallback, coverage:parse_errors, receiver_untyped, unresolved_module]
+head cline buildApiHandler      n 0   direct 0   risk UNKNOWN  lower_bound [coverage:lexical_fallback, coverage:parse_errors, unresolved_module]
+head cline AnthropicHandler     n 3   direct 2   risk LOW      lower_bound [ambiguous, coverage:lexical_fallback, coverage:parse_errors, receiver_untyped, unresolved_module]
+head pi-mono agentLoop          n 0   direct 0   risk UNKNOWN  lower_bound [callable_value, coverage:lexical_fallback, coverage:parse_errors]
+head pi-mono shouldCompact      n 13  direct 4   risk LOW      lower_bound [coverage:lexical_fallback, coverage:parse_errors]
+head open-code-review Run       n 2   direct 1   risk LOW      lower_bound [coverage:lexical_fallback, receiver_untyped]
+head open-code-review NewClient n 3   direct 1   risk LOW      lower_bound [coverage:lexical_fallback]
+head open-code-review Execute   n 0   direct 0   risk UNKNOWN  lower_bound [coverage:lexical_fallback, receiver_untyped]
+head cline import_cycles            component_count 14 cycle_count 69 largest 37
+head pi-mono import_cycles          component_count 3  cycle_count 4  largest 3
+head open-code-review import_cycles component_count 0  cycle_count 0  largest 0
+# before the unresolved_module cause, head answered buildApiHandler with causes
+# [coverage:lexical_fallback, coverage:parse_errors] only: its three callers import it
+# through the tsconfig alias `@core/api`, which the resolver does not read.

@@ -200,7 +200,8 @@ def main():
             answers += a
             times += t
         steady = rss(s.p.pid)
-        impact = [a for a in answers[0::3]]
+        # answers arrive in completion order when overlapping: pick impact's by shape
+        impact = [a for a in answers if "impacted_count" in a]
         # the swap: one file edited and brought in while the rounds go on
         with open(os.path.join(work, edit_path), "a") as f:
             f.write("\nexport function ws35BenchAdded(): number { return 1; }\n" if edit_path.endswith("ts")

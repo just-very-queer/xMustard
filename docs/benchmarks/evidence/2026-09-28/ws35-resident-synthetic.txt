@@ -1,0 +1,31 @@
+# WS-14 resident RSS test (tests/index_query.rs), Linux build box, two runs each
+## base 845868d, debug
+file, Sequential: base 13.3 MiB, steady +13.3, swap peak +13.3, after swap +12.7
+file, Overlapping: base 12.0 MiB, steady +22.1, swap peak +22.1, after swap +19.5
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 425.62s
+file, Sequential: base 11.8 MiB, steady +15.6, swap peak +15.6, after swap +15.6
+thread 'resident_rss_on_a_100k_symbol_resolved_graph_stays_within_the_line' (2154666) panicked at tests/index_query.rs:1298:13:
+Sequential: steady +15.6 MiB over 15 MiB
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 7 filtered out; finished in 231.99s
+## WS-35, debug
+file, Sequential: base 13.5 MiB, steady +14.8, swap peak +14.9, after swap +15.0
+file, Overlapping: base 13.2 MiB, steady +17.3, swap peak +19.5, after swap +17.0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 336.84s
+file, Sequential: base 13.4 MiB, steady +14.9, swap peak +14.9, after swap +15.3
+thread 'resident_rss_on_a_100k_symbol_resolved_graph_stays_within_the_line' (2177541) panicked at tests/index_query.rs:1314:13:
+Sequential: after swap +15.3 MiB over 15 MiB
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 7 filtered out; finished in 179.10s
+## base 845868d, release (cargo test --release)
+file, Sequential: base 6.0 MiB, steady +12.9, swap peak +12.9, after swap +13.6
+file, Overlapping: base 5.9 MiB, steady +15.1, swap peak +17.2, after swap +13.0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 102.05s
+file, Sequential: base 6.3 MiB, steady +12.7, swap peak +13.0, after swap +13.4
+file, Overlapping: base 6.1 MiB, steady +15.0, swap peak +17.8, after swap +17.7
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 95.74s
+## WS-35, release
+file, Sequential: base 6.6 MiB, steady +13.6, swap peak +13.6, after swap +13.5
+file, Overlapping: base 6.5 MiB, steady +13.5, swap peak +18.1, after swap +15.5
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 84.49s
+file, Sequential: base 6.4 MiB, steady +13.5, swap peak +13.5, after swap +13.9
+file, Overlapping: base 6.5 MiB, steady +15.8, swap peak +18.4, after swap +15.9
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 81.39s
