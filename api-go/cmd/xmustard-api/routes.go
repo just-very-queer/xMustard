@@ -37,6 +37,7 @@ func apiRouteAreas() [][]routeSpec {
 		workspaceRoutes,
 		issueRoutes,
 		runRoutes,
+		verificationRoutes,
 		routesOf(registerInlineRoutes),
 	}
 }
@@ -196,6 +197,26 @@ func itemBodyCall[B, T any](item string, op func(dataDir, workspaceID, id string
 	}
 }
 
+// itemDelete deletes the workspace item the path value item names and answers
+// {"ok": true, item: its id}.
+func itemDelete(item string, op func(dataDir, workspaceID, id string) error) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id := r.PathValue(item)
+		err := op(dataDir(), r.PathValue("workspace_id"), id)
+		reply(w, map[string]any{"ok": true, item: id}, err, notFoundResource)
+	}
+}
+
+// issueItemDelete deletes the issue's item the path value item names and answers
+// {"ok": true, item: its id}.
+func issueItemDelete(item string, op func(dataDir, workspaceID, issueID, id string) error) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id := r.PathValue(item)
+		err := op(dataDir(), r.PathValue("workspace_id"), r.PathValue("issue_id"), id)
+		reply(w, map[string]any{"ok": true, item: id}, err, notFoundResource)
+	}
+}
+
 // decodeJSONBodyIfPresent is decodeJSONBody for a route whose body may be absent.
 func decodeJSONBodyIfPresent(w http.ResponseWriter, r *http.Request, dst any) bool {
 	if err := json.NewDecoder(r.Body).Decode(dst); err != nil && !errors.Is(err, io.EOF) {
@@ -212,6 +233,15 @@ func queryInt(r *http.Request, key string, def int) int {
 		return n
 	}
 	return def
+}
+
+// optionalBool reads a boolean query parameter: nil when it is absent or not a boolean.
+func optionalBool(r *http.Request, key string) *bool {
+	v, err := strconv.ParseBool(r.URL.Query().Get(key))
+	if err != nil {
+		return nil
+	}
+	return &v
 }
 
 // requireQuery reads a query parameter the route cannot run without; a missing one is

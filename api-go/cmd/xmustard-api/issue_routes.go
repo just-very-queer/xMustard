@@ -105,22 +105,3 @@ func compareContextReplay(w http.ResponseWriter, r *http.Request) {
 	result, err := workspaceops.CompareIssueContextReplay(dataDir(), r.PathValue("workspace_id"), r.PathValue("issue_id"), r.PathValue("replay_id"))
 	reply(w, result, err, notFoundResource)
 }
-
-// issueItemDelete deletes the issue's item the path value item names and answers
-// {"ok": true, item: its id}.
-func issueItemDelete(item string, op func(dataDir, workspaceID, issueID, id string) error) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		id := r.PathValue(item)
-		err := op(dataDir(), r.PathValue("workspace_id"), r.PathValue("issue_id"), id)
-		reply(w, map[string]any{"ok": true, item: id}, err, notFoundResource)
-	}
-}
-
-// optionalBool reads a boolean query parameter: nil when it is absent or not a boolean.
-func optionalBool(r *http.Request, key string) *bool {
-	v, err := strconv.ParseBool(r.URL.Query().Get(key))
-	if err != nil {
-		return nil
-	}
-	return &v
-}
