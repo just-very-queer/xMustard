@@ -40,8 +40,8 @@ func TestDuplicateMatches(t *testing.T) {
 	src := issueRecord{BugID: "a", Title: "Login button does nothing", Summary: strPtr("clicking login is a no-op"), Severity: "P2", Fingerprint: &fp, Source: "scan"}
 	others := []issueRecord{
 		{BugID: "b", Title: "Login button does nothing", Summary: strPtr("clicking login is a no-op"), Severity: "P2", Fingerprint: &fp, Source: "scan"}, // fingerprint
-		{BugID: "c", Title: "Login button does nothing on click", Summary: strPtr("clicking login is a no-op")}, // fuzzy (high token overlap, not identical title)
-		{BugID: "d", Title: "Totally unrelated database migration", Summary: strPtr("add a postgres index")},                                               // none
+		{BugID: "c", Title: "Login button does nothing on click", Summary: strPtr("clicking login is a no-op")},                                          // fuzzy (high token overlap, not identical title)
+		{BugID: "d", Title: "Totally unrelated database migration", Summary: strPtr("add a postgres index")},                                             // none
 	}
 	matches := duplicateMatches(src, others)
 	if len(matches) < 2 {
