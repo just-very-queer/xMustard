@@ -310,8 +310,11 @@ func (codexDriver) Build(req DriverRequest, prompt string) (Invocation, error) {
 
 func (codexDriver) Parse(r io.Reader, xmServer string) Transcript {
 	t := Transcript{ToolCalls: map[string]int{}, CostSource: CostUnpriced, UsageSource: "turn.completed"}
-	var input, cached, output, reasoning int64
+	var input, cached, cacheWrite, output, reasoning int64
 	turnsWithUsage, failed := 0, false
+	// codex emits an error event for retryable errors too (a stream reconnect, then
+	// willRetry): it is fatal only when no turn.completed follows it
+	pendingErr, errPending := "", false
 	eachJSONLine(r, &t, func(ev map[string]any) {
 		switch str(ev["type"]) {
 		case "item.completed":
@@ -353,8 +356,10 @@ func (codexDriver) Parse(r io.Reader, xmServer string) Transcript {
 			}
 			input += int64(num(u["input_tokens"]))
 			cached += int64(num(u["cached_input_tokens"]))
+			cacheWrite += int64(num(u["cache_write_input_tokens"]))
 			output += int64(num(u["output_tokens"]))
 			reasoning += int64(num(u["reasoning_output_tokens"]))
+			pendingErr, errPending = "", false
 		case "turn.failed":
 			t.FinalEvent, t.FinalKind = true, "turn.failed"
 			t.NumTurns++
@@ -362,13 +367,18 @@ func (codexDriver) Parse(r io.Reader, xmServer string) Transcript {
 			failed = true // a failed turn carries no usage, so the session total is unknown
 			t.ErrorText = str(obj(ev["error"])["message"])
 		case "error":
-			t.IsError = true
-			t.ErrorText = firstNonEmpty(t.ErrorText, str(ev["message"]))
+			pendingErr, errPending = firstNonEmpty(str(ev["message"]), pendingErr), true // the last one says why it gave up
 		}
 	})
-	// OpenAI usage counts cached tokens inside input_tokens and reasoning inside
-	// output_tokens; split the cache out so Input is the uncached share.
-	t.Usage = Usage{Input: max(input-cached, 0), CacheRead: cached, Output: output, Reasoning: reasoning, Total: input + output}
+	if errPending {
+		t.IsError = true
+		t.ErrorText = firstNonEmpty(t.ErrorText, pendingErr)
+	}
+	// OpenAI usage counts cached reads and cache writes inside input_tokens and
+	// reasoning inside output_tokens (codex-rs exec_events.rs Usage); split the cache
+	// out so Input is the uncached share.
+	t.Usage = Usage{Input: max(input-cached-cacheWrite, 0), CacheRead: cached, CacheWrite: cacheWrite, Output: output, Reasoning: reasoning,
+		Total: input + output}
 	t.UsageReported = turnsWithUsage > 0 && !failed
 	return t
 }

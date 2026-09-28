@@ -111,6 +111,12 @@ func UpdateSettings(dataDir string, settings AppSettings) (*AppSettings, error) 
 	if distinct != "" && distinct != DistinctToken && distinct != DistinctOwner {
 		return nil, fmt.Errorf("principal_distinctness %q is not token or owner: %w", settings.PrincipalDistinctness, ErrInvalidInput)
 	}
+	if settings.CodexArgs != nil {
+		// refused at save time as well as at run time: an admin sees the bad flag now
+		if _, err := sanitizeCodexArgs(*settings.CodexArgs); err != nil {
+			return nil, err
+		}
+	}
 	next := appSettings{
 		LocalAgentType: fallbackString(strings.TrimSpace(settings.LocalAgentType), "codex"),
 		CodexBin:       trimOptional(settings.CodexBin),

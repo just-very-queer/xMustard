@@ -1,0 +1,26 @@
+xMustard
+Copyright (c) 2026 xMustard contributors
+
+xMustard is licensed under the MIT License (see LICENSE), except for files whose
+header carries another SPDX-License-Identifier. The repository is mixed-licence:
+a file without an SPDX header is MIT, and a file with one is under the licence it
+names.
+
+This product includes software translated from open-code-review
+(https://github.com/alibaba/open-code-review), licensed under the Apache License,
+Version 2.0 (third_party/open-code-review/LICENSE). open-code-review ships no NOTICE
+file.
+
+  Copyright 2026 alibaba/open-code-review Contributors
+
+  Translated at upstream commit 486022d (2026-09-24), from internal/diff/hunk.go,
+  internal/diff/resolver.go, internal/diff/parser.go (splitDiffLines),
+  internal/llmloop/loop.go (the anchoring order) and their tests, into:
+
+    api-go/internal/anchor/hunk.go         api-go/internal/anchor/hunk_test.go
+    api-go/internal/anchor/resolve.go      api-go/internal/anchor/resolve_test.go
+    api-go/internal/anchor/relocate.go     api-go/internal/anchor/relocate_test.go
+
+  These files remain under the Apache License, Version 2.0. Each keeps upstream's
+  SPDX-License-Identifier and copyright lines and states the changes xMustard
+  contributors made to it.

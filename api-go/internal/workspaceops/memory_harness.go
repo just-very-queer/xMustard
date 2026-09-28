@@ -15,23 +15,23 @@ import (
 
 // MemoryArm names a comparison condition.
 const (
-	ArmMemoryOff        = "memory_off"
-	ArmUngoverned       = "ungoverned"
-	ArmGovernedNoDrift  = "governed_no_drift"
+	ArmMemoryOff         = "memory_off"
+	ArmUngoverned        = "ungoverned"
+	ArmGovernedNoDrift   = "governed_no_drift"
 	ArmGovernedWithDrift = "governed_drift"
 )
 
 // TaskOutcome is one task run under one arm. Solved = an accepted, test-verified patch.
 type TaskOutcome struct {
-	TaskID        string  `json:"task_id"`
-	Solved        bool    `json:"solved"`
+	TaskID                string  `json:"task_id"`
+	Solved                bool    `json:"solved"`
 	LocalizationRecallAtK float64 `json:"localization_recall_at_k"`
-	Tokens        int     `json:"tokens"`
-	CostUSD       float64 `json:"cost_usd"`
-	DurationMS    int     `json:"duration_ms"`
-	StaleMemoryHarm bool  `json:"stale_memory_harm"` // a stale memory misled this task
-	PromotionError  bool  `json:"promotion_error"`   // a wrong fact was promoted
-	HandoffSuccess  bool  `json:"handoff_success"`
+	Tokens                int     `json:"tokens"`
+	CostUSD               float64 `json:"cost_usd"`
+	DurationMS            int     `json:"duration_ms"`
+	StaleMemoryHarm       bool    `json:"stale_memory_harm"` // a stale memory misled this task
+	PromotionError        bool    `json:"promotion_error"`   // a wrong fact was promoted
+	HandoffSuccess        bool    `json:"handoff_success"`
 }
 
 // pairOutcomes aligns two arms' outcomes by TaskID, returning only the tasks both ran.
@@ -57,10 +57,10 @@ func pairOutcomes(a, b []TaskOutcome) (aSolved, bSolved []bool, ids []string) {
 // p-value for whether two arms differ on the SAME tasks (the correct test for paired
 // binary solved/not outcomes — not an unpaired proportion test).
 type McNemarResult struct {
-	Discordant      int     `json:"discordant"`        // b + c
-	BImprovedOverA  int     `json:"b_improved_over_a"` // A failed, B solved
-	AImprovedOverB  int     `json:"a_improved_over_b"` // A solved, B failed
-	PValue          float64 `json:"p_value"`
+	Discordant     int     `json:"discordant"`        // b + c
+	BImprovedOverA int     `json:"b_improved_over_a"` // A failed, B solved
+	AImprovedOverB int     `json:"a_improved_over_b"` // A solved, B failed
+	PValue         float64 `json:"p_value"`
 }
 
 // McNemar computes the exact-binomial McNemar test on paired solved outcomes (b = the
@@ -168,24 +168,24 @@ func clampIdx(i, n int) int {
 // the paired solved-rate improvement must be statistically significant (p ≤ MaxP) AND the
 // solved-rate delta CI must lie entirely above MinSolvedDelta (a real, not trivial, gain).
 type GoNoGoThreshold struct {
-	MaxP            float64 `json:"max_p"`
-	MinSolvedDelta  float64 `json:"min_solved_delta"`
-	BootstrapIters  int     `json:"bootstrap_iters"`
-	Seed            int64   `json:"seed"`
-	Alpha           float64 `json:"alpha"`
+	MaxP           float64 `json:"max_p"`
+	MinSolvedDelta float64 `json:"min_solved_delta"`
+	BootstrapIters int     `json:"bootstrap_iters"`
+	Seed           int64   `json:"seed"`
+	Alpha          float64 `json:"alpha"`
 }
 
 // ArmComparison is the full paired verdict of an experiment arm vs a baseline arm.
 type ArmComparison struct {
-	BaselineArm   string        `json:"baseline_arm"`
-	ExperimentArm string        `json:"experiment_arm"`
-	PairedTasks   int           `json:"paired_tasks"`
-	BaselineSolveRate   float64 `json:"baseline_solve_rate"`
-	ExperimentSolveRate float64 `json:"experiment_solve_rate"`
-	McNemar       McNemarResult `json:"mcnemar"`
-	SolveDeltaCI  BootstrapCI   `json:"solve_delta_ci"`
-	Decision      string        `json:"decision"` // GO | NO-GO
-	Rationale     string        `json:"rationale"`
+	BaselineArm         string        `json:"baseline_arm"`
+	ExperimentArm       string        `json:"experiment_arm"`
+	PairedTasks         int           `json:"paired_tasks"`
+	BaselineSolveRate   float64       `json:"baseline_solve_rate"`
+	ExperimentSolveRate float64       `json:"experiment_solve_rate"`
+	McNemar             McNemarResult `json:"mcnemar"`
+	SolveDeltaCI        BootstrapCI   `json:"solve_delta_ci"`
+	Decision            string        `json:"decision"` // GO | NO-GO
+	Rationale           string        `json:"rationale"`
 }
 
 // CompareArms produces the paired statistical verdict + the pre-registered go/no-go

@@ -373,7 +373,8 @@ func editLocalization(gold, touched []string) *Localization {
 	return l
 }
 
-// Price is a per-million-token price list entry for clients that report no cost.
+// Price is a per-million-token price list entry for clients that report no cost. An
+// unset cache_write_per_mtok bills cache writes at the input rate, as OpenAI does.
 type Price struct {
 	InputPerMTok       float64 `yaml:"input_per_mtok" json:"input_per_mtok"`
 	CachedInputPerMTok float64 `yaml:"cached_input_per_mtok" json:"cached_input_per_mtok"`
@@ -397,8 +398,12 @@ func priceUsage(t *Transcript, model string, pricing map[string]Price) {
 		t.CostSource = CostUnpriced
 		return
 	}
+	cacheWrite := p.CacheWritePerMTok
+	if cacheWrite == 0 {
+		cacheWrite = p.InputPerMTok
+	}
 	c := (float64(t.Usage.Input)*p.InputPerMTok + float64(t.Usage.CacheRead)*p.CachedInputPerMTok +
-		float64(t.Usage.CacheWrite)*p.CacheWritePerMTok + float64(t.Usage.Output)*p.OutputPerMTok) / 1e6
+		float64(t.Usage.CacheWrite)*cacheWrite + float64(t.Usage.Output)*p.OutputPerMTok) / 1e6
 	c = math.Round(c*1e8) / 1e8
 	t.CostUSD, t.CostSource = &c, CostPriceTable
 }

@@ -14,18 +14,18 @@ type PolicySummary struct {
 }
 
 type WorkspaceDashboard struct {
-	WorkspaceID       string               `json:"workspace_id"`
-	IssuesTotal       int                  `json:"issues_total"`
-	IssuesBySeverity  map[string]int       `json:"issues_by_severity"`
-	IssuesByStatus    map[string]int       `json:"issues_by_status"`
-	NeedsFollowup     int                  `json:"needs_followup_count"`
-	AvgQuality        int                  `json:"avg_quality"`
-	LowQualityCount   int                  `json:"low_quality_count"`
-	ReviewReadyCount  int                  `json:"review_ready_count"`
-	Policy            PolicySummary        `json:"policy"`
-	AuditEventCount   int                  `json:"audit_event_count"`
-	Security          SecurityReviewPacket `json:"security"`
-	GeneratedAt       string               `json:"generated_at"`
+	WorkspaceID      string               `json:"workspace_id"`
+	IssuesTotal      int                  `json:"issues_total"`
+	IssuesBySeverity map[string]int       `json:"issues_by_severity"`
+	IssuesByStatus   map[string]int       `json:"issues_by_status"`
+	NeedsFollowup    int                  `json:"needs_followup_count"`
+	AvgQuality       int                  `json:"avg_quality"`
+	LowQualityCount  int                  `json:"low_quality_count"`
+	ReviewReadyCount int                  `json:"review_ready_count"`
+	Policy           PolicySummary        `json:"policy"`
+	AuditEventCount  int                  `json:"audit_event_count"`
+	Security         SecurityReviewPacket `json:"security"`
+	GeneratedAt      string               `json:"generated_at"`
 }
 
 // BuildWorkspaceDashboard aggregates the workspace health rollup.

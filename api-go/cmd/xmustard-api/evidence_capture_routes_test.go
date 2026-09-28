@@ -125,6 +125,17 @@ func TestCaptureRouteClaudeBashAndSearch(t *testing.T) {
 	if code, _, _ := f.do(t, "POST", "/api/workspaces/"+f.ws+"/evidence/capture?format=xml", alice, strings.NewReader("x"), nil); code != http.StatusBadRequest {
 		t.Fatalf("bad format accepted")
 	}
+	// an unknown client would silently get another client's payload shape: refused; the
+	// MCP client profile name claude-code is Claude's policy
+	if code, b, _ := f.do(t, "POST", "/api/workspaces/"+f.ws+"/evidence/capture?format=claude&client=netscape", alice, strings.NewReader(claudeBashBody(log)), nil); code != http.StatusBadRequest ||
+		!strings.Contains(string(b), "invalid_client") || !strings.Contains(string(b), "claude-code") {
+		t.Fatalf("unknown client: %d %s", code, b)
+	}
+	code, b, _ = f.do(t, "POST", "/api/workspaces/"+f.ws+"/evidence/capture?format=claude&client=claude-code", alice, strings.NewReader(claudeBashBody(log)), nil)
+	_ = json.Unmarshal(b, &res)
+	if code != 200 || res.Capture.Client != "claude" || res.Shape.Shape != "claude.Bash" || res.Shape.Mode != evidence.ShapeReplace {
+		t.Fatalf("claude-code capture: %d %+v", code, res.Shape)
+	}
 	// raw capture of any tool, with the caller's metadata
 	code, b, _ = f.do(t, "POST", "/api/workspaces/"+f.ws+"/evidence/capture?client=pi&tool=bash&command=go%20test&exit_code=1&call_id=c9", alice, strings.NewReader(log), nil)
 	_ = json.Unmarshal(b, &res)

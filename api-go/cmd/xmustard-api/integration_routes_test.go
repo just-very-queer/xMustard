@@ -115,4 +115,3 @@ func uniqueIntegrationRoutePaths(specs []integrationRouteSpec) []string {
 	}
 	return paths
 }
-

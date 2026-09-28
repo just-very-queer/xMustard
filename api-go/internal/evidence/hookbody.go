@@ -34,7 +34,7 @@ type HookFormat string
 
 const (
 	FormatClaude   HookFormat = "claude"   // Claude Code PostToolUse / PostToolUseFailure
-	FormatCodex    HookFormat = "codex"    // Codex PostToolUse (Claude-compatible fields)
+	FormatCodex    HookFormat = "codex"    // Codex PostToolUse (codex-rs hooks/src/schema.rs PostToolUseCommandInput)
 	FormatCursor   HookFormat = "cursor"   // Cursor postToolUse / afterShellExecution / afterMCPExecution
 	FormatPi       HookFormat = "pi"       // Pi tool_result event
 	FormatOpenCode HookFormat = "opencode" // OpenCode tool.execute.after (tool, args, output)
@@ -102,6 +102,8 @@ type HookBody struct {
 	// inside an array, or past its bounds): a payload built from the projection text
 	// alone would lose it.
 	StatusDropped bool
+	// TurnID and TranscriptPath are the Codex turn and session transcript file.
+	TurnID, TranscriptPath string
 }
 
 // Scalar returns the raw JSON text of a scalar in the response skeleton by dotted
@@ -146,10 +148,12 @@ const (
 	roleCall
 	roleCwd
 	roleAgent
+	roleTurn
+	roleTranscript
 	roleInput
 	roleResponse       // the whole tool response
 	roleResponseMember // a member of the response object (Pi content/details)
-	roleError          // a failure message (Claude PostToolUseFailure "error")
+	roleError          // a failure message (Claude PostToolUseFailure "error"): a non-empty string
 	roleIsError
 	roleCommand // Cursor afterShellExecution command (a tool-input field at the root)
 )
@@ -157,8 +161,11 @@ const (
 var hookRoles = map[HookFormat]map[string]hookRole{
 	FormatClaude: {"hook_event_name": roleEvent, "tool_name": roleTool, "session_id": roleSession, "tool_use_id": roleCall,
 		"cwd": roleCwd, "agent_id": roleAgent, "tool_input": roleInput, "tool_response": roleResponse, "error": roleError},
+	// Codex sends no error member: PostToolUse runs only for a call that succeeded
+	// (a failing MCP call never reaches it; a shell call that exits non-zero does)
 	FormatCodex: {"hook_event_name": roleEvent, "tool_name": roleTool, "session_id": roleSession, "tool_use_id": roleCall,
-		"call_id": roleCall, "cwd": roleCwd, "tool_input": roleInput, "tool_response": roleResponse, "error": roleError},
+		"turn_id": roleTurn, "agent_id": roleAgent, "transcript_path": roleTranscript, "cwd": roleCwd,
+		"tool_input": roleInput, "tool_response": roleResponse},
 	FormatCursor: {"hook_event_name": roleEvent, "tool_name": roleTool, "conversation_id": roleSession, "tool_use_id": roleCall,
 		"tool_input": roleInput, "tool_output": roleResponse, "result_json": roleResponse, "output": roleResponse,
 		"command": roleCommand, "error": roleError},
@@ -194,8 +201,9 @@ var inputKeys = map[string]bool{
 	"start_line": true, "end_line": true, "line": true, "workdir": true, "cwd": true,
 }
 
-// exitKeys carry a process exit code in a response.
-var exitKeys = map[string]bool{"exit_code": true, "exitCode": true, "returnCode": true, "return_code": true, "exit_status": true, "exitStatus": true}
+// exitKeys carry a process exit code in a response (OpenCode bash: metadata.exit).
+var exitKeys = map[string]bool{"exit_code": true, "exitCode": true, "returnCode": true, "return_code": true, "exit_status": true,
+	"exitStatus": true, "exit": true}
 
 // sectionSink writes decoded output into the spool (through an optional redactor)
 // and records section boundaries at the spool offset.
@@ -770,6 +778,10 @@ func (d *hookDecoder) decodeRoot(roles map[string]hookRole) error {
 	if c != '{' {
 		return d.syntax("body is not a JSON object")
 	}
+	// the metadata roles, one string field each
+	b := d.body
+	fields := map[hookRole]*string{roleEvent: &b.Event, roleTool: &b.ToolName, roleSession: &b.SessionID, roleCall: &b.CallID,
+		roleCwd: &b.Cwd, roleAgent: &b.AgentID, roleTurn: &b.TurnID, roleTranscript: &b.TranscriptPath}
 	err = d.eachMember(func(key string) error {
 		role := roles[key]
 		c, err := d.peek()
@@ -784,19 +796,10 @@ func (d *hookDecoder) decodeRoot(roles map[string]hookRole) error {
 			*dst = s
 			return err
 		}
+		if dst := fields[role]; dst != nil {
+			return str(dst)
+		}
 		switch role {
-		case roleEvent:
-			return str(&d.body.Event)
-		case roleTool:
-			return str(&d.body.ToolName)
-		case roleSession:
-			return str(&d.body.SessionID)
-		case roleCall:
-			return str(&d.body.CallID)
-		case roleCwd:
-			return str(&d.body.Cwd)
-		case roleAgent:
-			return str(&d.body.AgentID)
 		case roleCommand:
 			var s string
 			err := str(&s)
@@ -822,12 +825,14 @@ func (d *hookDecoder) decodeRoot(roles map[string]hookRole) error {
 			}
 			return err
 		case roleError:
-			// a failure message (PostToolUseFailure): the output of a failed call
-			d.body.IsError = true
+			// a failure message (PostToolUseFailure): the output of a failed call. Only
+			// a non-empty string is one; "error": null, "" or a non-string says nothing
 			if c != '"' {
 				return d.skip(1)
 			}
+			before := d.sink.written
 			n, err := d.walk(key, "error", 0)
+			d.body.IsError = d.body.IsError || d.sink.written > before // a non-empty string opened a section
 			if d.body.Response == nil {
 				d.body.Response = n
 			}

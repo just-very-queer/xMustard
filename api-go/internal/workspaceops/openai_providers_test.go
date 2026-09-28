@@ -106,10 +106,10 @@ func TestOpenAIProviderCRUDAndClient(t *testing.T) {
 func TestProviderRejectsSSRFHosts(t *testing.T) {
 	dir := t.TempDir()
 	for _, bad := range []string{
-		"http://169.254.169.254/v1",   // AWS/GCP/Azure metadata
+		"http://169.254.169.254/v1", // AWS/GCP/Azure metadata
 		"http://169.254.169.254:80/v1",
-		"http://[fe80::1]/v1",          // link-local IPv6
-		"http://100.100.100.200/v1",    // Alibaba metadata
+		"http://[fe80::1]/v1",       // link-local IPv6
+		"http://100.100.100.200/v1", // Alibaba metadata
 	} {
 		if _, err := AddOpenAIProvider(dir, OpenAIProvider{Name: "evil", BaseURL: bad}); err == nil {
 			t.Fatalf("expected SSRF rejection for base_url %q", bad)

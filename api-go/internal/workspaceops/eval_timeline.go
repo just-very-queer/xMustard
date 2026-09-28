@@ -28,8 +28,8 @@ type EvalTimelineEntry struct {
 	AvgConfidence  float64 `json:"avg_confidence"` // 0 until verification confidence is recorded per run
 	Rank           int     `json:"rank"`
 	PrevRank       int     `json:"prev_rank"`
-	Movement       int     `json:"movement"`   // prev_rank - rank; positive = improved
-	WhyMoved       string  `json:"why_moved"`  // causal explanation of the change vs the prior batch
+	Movement       int     `json:"movement"`  // prev_rank - rank; positive = improved
+	WhyMoved       string  `json:"why_moved"` // causal explanation of the change vs the prior batch
 }
 
 type EvalTimeline struct {

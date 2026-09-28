@@ -13,9 +13,14 @@ backend/data/workspaces/*/runs/*.json
 backend/data/workspaces/*/runs/*.log
 backend/data/workspaces/*/runs/*.out.json
 backend/data/workspaces/*/terminals/*.log
+# All runtime data: XMUSTARD_DATA_DIR defaults to backend/data. Files committed before
+# this rule stay tracked until the owner runs the WS-26 untrack step (parity plan).
+backend/data/
 
 research/
 bench-out/
+# make release output
+/dist/
 # Working notes and raw session/research material stay local by default.
 # Existing tracked historical docs remain tracked; curate new public entrypoints.
 docs/*
@@ -26,6 +31,7 @@ docs/*
 !docs/STATUS.md
 !docs/ROADMAP.md
 !docs/SECURITY.md
+!docs/releases/
 !docs/history/
 docs/history/*
 !docs/history/README.md
@@ -111,6 +117,7 @@ node_modules/
 api-go/xmustard-api
 api-go/xmustard-mcp
 api-go/xmustard-ops
+api-go/xmustard-eval
 
 # downloaded research PDFs (kept on disk, not committed — see docs/research/RESEARCH_INDEX.md)
 docs/research/papers/*.pdf

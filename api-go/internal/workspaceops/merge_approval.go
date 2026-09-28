@@ -126,6 +126,12 @@ type mergeRevocationData struct {
 // DiffReviewedChange observes the change between the merge base of baseRef and headRef
 // in the workspace's repository.
 func DiffReviewedChange(ctx context.Context, dataDir, workspaceID, baseRef, headRef string) (ReviewedChange, error) {
+	return observeChange(ctx, dataDir, workspaceID, baseRef, headRef, nil)
+}
+
+// observeChange is DiffReviewedChange that also writes the diff text to text when it is
+// not nil, so what a caller reads is exactly what was digested.
+func observeChange(ctx context.Context, dataDir, workspaceID, baseRef, headRef string, text io.Writer) (ReviewedChange, error) {
 	if err := validateSafeID("workspace", workspaceID); err != nil {
 		return ReviewedChange{}, err
 	}
@@ -141,19 +147,23 @@ func DiffReviewedChange(ctx context.Context, dataDir, workspaceID, baseRef, head
 	if err != nil {
 		return ReviewedChange{}, err
 	}
-	return diffAt(ctx, workspaceID, root, baseRef, base, head)
+	return diffAt(ctx, workspaceID, root, baseRef, base, head, text)
 }
 
 // diffAt observes the change from the merge base of base (resolved from baseRef) and
-// head, both resolved commits.
-func diffAt(ctx context.Context, workspaceID, root, baseRef, base, head string) (ReviewedChange, error) {
+// head, both resolved commits. The diff text also goes to text when it is not nil.
+func diffAt(ctx context.Context, workspaceID, root, baseRef, base, head string, text io.Writer) (ReviewedChange, error) {
 	var mb bytes.Buffer
 	if err := reviewGit(ctx, root, &mb, "merge-base", base, head); err != nil {
 		return ReviewedChange{}, fmt.Errorf("merge base of %s and %s: %w", baseRef, head, err)
 	}
 	c := ReviewedChange{WorkspaceID: workspaceID, Repository: root, BaseRef: baseRef, MergeBase: strings.TrimSpace(mb.String()), Head: head}
 	h := sha256.New()
-	counted := &countingWriter{w: h}
+	var sink io.Writer = h
+	if text != nil {
+		sink = io.MultiWriter(h, text)
+	}
+	counted := &countingWriter{w: sink}
 	if err := reviewGit(ctx, root, counted, gitdiff.ReviewDiffArgs(c.MergeBase, head)...); err != nil {
 		return ReviewedChange{}, fmt.Errorf("diff %s..%s: %w", c.MergeBase, head, err)
 	}
@@ -324,7 +334,7 @@ func MergeApprovalState(ctx context.Context, dataDir, workspaceID, baseRef, head
 			continue
 		}
 		if st.Current == nil {
-			now, err := diffAt(ctx, workspaceID, root, baseRef, base, st.Head)
+			now, err := diffAt(ctx, workspaceID, root, baseRef, base, st.Head, nil)
 			if err != nil {
 				return nil, err
 			}

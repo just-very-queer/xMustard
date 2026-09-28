@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
+	"slices"
 	"sort"
 	"strings"
 	"unicode/utf8"
@@ -19,47 +21,96 @@ import (
 // validator that is independent of the builder, and on a mismatch falls back: the
 // client keeps its original output when that fits the client budget, else it gets an
 // explicit size error. The nine xMustard tools are not shaped here.
+//
+// Each client is one entry of clientPolicies: its budget and its shaper, which names,
+// builds and validates the client's payload and knows how the client names another
+// MCP server's tools. Adding a client adds one entry.
 
 // ClientPolicy is one client's delivery budget and replacement seam.
 type ClientPolicy struct {
 	Client string `json:"client"`
+	// Aliases are other names of the same client (the MCP client profile claude-code).
+	Aliases []string `json:"aliases,omitempty"`
 	// Target: outputs at or below it pass unchanged; larger are reduced to about it.
 	Target int `json:"projection_target_bytes"`
-	// MaxChars caps the text a replacement carries (characters).
-	MaxChars int `json:"max_chars"`
+	// MaxChars caps the text a replacement carries: characters, or UTF-8 bytes when
+	// MaxUnit is UnitBytes.
+	MaxChars int    `json:"max_chars"`
+	MaxUnit  string `json:"max_chars_unit,omitempty"`
 	// ContextChars / ContextTokens cap injected additional context.
 	ContextChars  int    `json:"additional_context_chars,omitempty"`
 	ContextTokens int    `json:"additional_context_tokens,omitempty"`
 	Replacement   string `json:"replacement"`
+	shaper        shaper
 }
+
+// UnitBytes is the MaxUnit of a client that measures replacement text in bytes.
+const UnitBytes = "bytes"
+
+// Codex spills hook text past 2,500 approximate tokens of 4 bytes each: the reason is
+// written to a temp file and the model gets a head-and-tail preview plus the file's
+// path (codex-rs hooks/src/output_spill.rs DEFAULT_HOOK_OUTPUT_TOKEN_LIMIT;
+// utils/string/src/truncate.rs approx_token_count). A whole block reason must fit in
+// codexHookTextBytes; the projection leaves codexFooterReserve of it for the recovery
+// line and the data-framing note.
+const (
+	codexHookTextBytes = 2500 * 4
+	codexFooterReserve = 1536
+)
 
 // clientPolicies is the adapter policy table. Targets lower the 64 KiB default where
 // the client's own limits make a smaller projection strictly better; caps come from
 // the clients' documented behavior (see docs/research/PARITY_REQUIREMENTS §4.11,
-// §6.10 and §12.2).
+// §6.10 and §12.2) and, for Codex, its source.
 var clientPolicies = map[string]ClientPolicy{
 	// Claude Code clamps Bash output at 30,000 characters and caps hook
 	// additionalContext at 10,000; built-in replacements must match the tool schema
-	"claude": {Client: "claude", Target: 16 << 10, MaxChars: 30000, ContextChars: 10000, Replacement: "PostToolUse hookSpecificOutput.updatedToolOutput (schema-matched for built-ins)"},
+	"claude": {Client: "claude", Aliases: []string{"claude-code"}, Target: 16 << 10, MaxChars: 30000, ContextChars: 10000,
+		Replacement: "PostToolUse hookSpecificOutput.updatedToolOutput (schema-matched for built-ins)", shaper: claudeShaper{}},
 	// Codex: PostToolUse decision "block" substitutes the reason as the result;
-	// additionalContextLimit defaults to 2,500 tokens
-	"codex": {Client: "codex", Target: 16 << 10, MaxChars: 30000, ContextTokens: 2500, Replacement: "PostToolUse decision=block reason"},
+	// additionalContextLimit defaults to 2,500 tokens and never raises the spill limit
+	"codex": {Client: "codex", Target: codexHookTextBytes - codexFooterReserve, MaxChars: codexHookTextBytes, MaxUnit: UnitBytes,
+		ContextTokens: 2500, Replacement: "PostToolUse decision=block reason", shaper: codexShaper{}},
 	// Cursor replaces MCP results only (updated_mcp_tool_output); built-ins are observe-only
-	"cursor": {Client: "cursor", Target: 16 << 10, MaxChars: 30000, Replacement: "postToolUse updated_mcp_tool_output (MCP tools only)"},
+	"cursor": {Client: "cursor", Target: 16 << 10, MaxChars: 30000, Replacement: "postToolUse updated_mcp_tool_output (MCP tools only)",
+		shaper: cursorShaper{}},
 	// Pi truncates its own tool output at 50 KB / 2,000 lines
-	"pi": {Client: "pi", Target: 32 << 10, MaxChars: 50000, Replacement: "tool_result {content, details, isError}"},
+	"pi": {Client: "pi", Target: 32 << 10, MaxChars: 50000, Replacement: "tool_result {content, details, isError}", shaper: piShaper{}},
 	// OpenCode tool.execute.after mutates {title, output, metadata}
-	"opencode": {Client: "opencode", Target: 32 << 10, MaxChars: 50000, Replacement: "tool.execute.after {title, output, metadata}"},
+	"opencode": {Client: "opencode", Target: 32 << 10, MaxChars: 50000, Replacement: "tool.execute.after {title, output, metadata}",
+		shaper: opencodeShaper{}},
 	// Letta Code reaches MCP through `letta mcp call` in Bash, clamped at 30,000 chars
-	"letta": {Client: "letta", Target: 24 << 10, MaxChars: 30000, ContextChars: 10000, Replacement: "MCP result via letta mcp call (30k Bash clamp)"},
+	"letta": {Client: "letta", Target: 24 << 10, MaxChars: 30000, ContextChars: 10000, Replacement: "MCP result via letta mcp call (30k Bash clamp)",
+		shaper: mcpShaper{}},
 	// MCP clients persist results above 25k tokens instead of showing them
-	"mcp":  {Client: "mcp", Target: DefaultProjectionTarget, MaxChars: 80000, Replacement: "MCP CallToolResult content"},
-	"http": {Client: "http", Target: DefaultProjectionTarget, MaxChars: 1 << 20, Replacement: "evidence envelope"},
+	"mcp":  {Client: "mcp", Target: DefaultProjectionTarget, MaxChars: 80000, Replacement: "MCP CallToolResult content", shaper: mcpShaper{}},
+	"http": {Client: "http", Target: DefaultProjectionTarget, MaxChars: 1 << 20, Replacement: "evidence envelope", shaper: mcpShaper{}},
 }
+
+// clientNames resolves every client name and alias to its clientPolicies key.
+var clientNames = func() map[string]string {
+	names := map[string]string{}
+	for key, p := range clientPolicies {
+		names[key] = key
+		for _, a := range p.Aliases {
+			names[a] = key
+		}
+	}
+	return names
+}()
+
+// LookupClient returns the policy of a known client name or alias.
+func LookupClient(client string) (ClientPolicy, bool) {
+	key, ok := clientNames[strings.ToLower(strings.TrimSpace(client))]
+	return clientPolicies[key], ok
+}
+
+// ClientNames lists every client name and alias LookupClient accepts, sorted.
+func ClientNames() []string { return slices.Sorted(maps.Keys(clientNames)) }
 
 // PolicyFor returns a client's policy (the http policy for unknown clients).
 func PolicyFor(client string) ClientPolicy {
-	if p, ok := clientPolicies[strings.ToLower(client)]; ok {
+	if p, ok := LookupClient(client); ok {
 		return p
 	}
 	return clientPolicies["http"]
@@ -73,6 +124,31 @@ func ClientPolicies() []ClientPolicy {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Client < out[j].Client })
 	return out
+}
+
+// ForeignTool reports a tool of another MCP server, by the client's naming.
+func (p ClientPolicy) ForeignTool(tool string) bool { return p.shaper.foreignTool(tool) }
+
+// size measures payload text in the policy's unit.
+func (p ClientPolicy) size(payload []byte) (int, string) {
+	if p.MaxUnit == UnitBytes {
+		return textSize(payload, func(s string) int { return len(s) }), UnitBytes
+	}
+	return textSize(payload, utf8.RuneCountInString), "characters"
+}
+
+// capContext bounds an injected notice: ContextChars, else ContextTokens at a
+// conservative 3 characters (bytes, for a byte-measured client) per token; neither
+// set leaves it whole.
+func (p ClientPolicy) capContext(s string) string {
+	n := p.ContextChars
+	if n == 0 {
+		n = p.ContextTokens * 3
+	}
+	if p.MaxUnit == UnitBytes {
+		return capBytes(s, n)
+	}
+	return capChars(s, n)
 }
 
 // Shape modes.
@@ -100,41 +176,6 @@ type ShapeResult struct {
 
 var errUnshapable = errors.New("payload cannot be rebuilt")
 
-// shapeName names the payload for a client tool.
-func shapeName(client, tool string) string {
-	switch client {
-	case "claude":
-		if t := claudeBuiltin(tool); t != "" {
-			return "claude." + t
-		}
-		return "claude.tool_response"
-	case "codex":
-		return "codex.decision_block"
-	case "cursor":
-		if isMCPTool(tool) {
-			return "cursor.mcp_result"
-		}
-		return "cursor.observe"
-	case "pi":
-		return "pi.tool_result"
-	case "opencode":
-		return "opencode.output"
-	}
-	return "mcp.call_tool_result"
-}
-
-func claudeBuiltin(tool string) string {
-	switch tool {
-	case "Bash", "Read", "Grep", "Glob", "LS", "WebFetch":
-		return tool
-	}
-	return ""
-}
-
-func isMCPTool(tool string) bool {
-	return strings.HasPrefix(tool, "mcp__") || strings.HasPrefix(tool, "MCP:") || strings.HasPrefix(strings.ToLower(tool), "mcp_")
-}
-
 // ShapeInput is what ShapeOutput needs.
 type ShapeInput struct {
 	Client   string
@@ -143,52 +184,84 @@ type ShapeInput struct {
 	Proj     *Projection // the reducer's result
 	Reduced  bool        // something was omitted
 	Footer   string      // "[xmustard evidence] {...}" recovery line
+	Note     string      // data-framing line for instruction-like text (WS-56), or ""
 	RawBytes int64       // size of the captured original
 	// IsError is the capture's error status (a failing hook body, is_error, a non-zero
 	// exit code, a failing status member): every isError field of a payload says it.
 	IsError bool
 }
 
+// footer is what a payload ends with: the recovery line, then the data-framing note.
+func (in ShapeInput) footer() string { return joinLines(in.Footer, in.Note) }
+
+// text is the projection followed by the footer.
+func (in ShapeInput) text() string { return in.Proj.Text + "\n" + in.footer() }
+
+func (in ShapeInput) isError() bool { return in.IsError || (in.Body != nil && in.Body.IsError) }
+
+// responseMember is the member of an object response named key, or nil.
+func (in ShapeInput) responseMember(key string) *Node {
+	if in.Body == nil || in.Body.Response == nil || in.Body.Response.Kind != 'o' {
+		return nil
+	}
+	for _, k := range in.Body.Response.Kids {
+		if k.Key == key {
+			return k
+		}
+	}
+	return nil
+}
+
+func joinLines(parts ...string) string {
+	var kept []string
+	for _, p := range parts {
+		if p != "" {
+			kept = append(kept, p)
+		}
+	}
+	return strings.Join(kept, "\n")
+}
+
 // ShapeOutput builds and validates the client payload for one reduced capture.
 func ShapeOutput(in ShapeInput) *ShapeResult {
 	pol := PolicyFor(in.Client)
-	res := &ShapeResult{Client: pol.Client, Shape: shapeName(pol.Client, in.Tool)}
+	name, replaceable := pol.shaper.shape(in.Tool)
+	res := &ShapeResult{Client: pol.Client, Shape: name}
 	switch {
 	case !in.Reduced:
 		res.Mode = ShapeUnchanged
 		return res
-	case res.Shape == "cursor.observe":
+	case !replaceable:
 		res.Mode = ShapeObserve
-		res.Notice = capChars(in.Footer, pol.ContextChars)
+		res.Notice = pol.capContext(in.footer())
 		return res
 	}
-	payload, err := buildPayload(pol, in)
+	payload, err := pol.shaper.build(in)
 	if err == nil {
-		err = ValidateShape(pol.Client, in.Tool, payload)
+		err = validatePayload(pol, in.Tool, payload)
 	}
 	if err == nil {
-		err = checkChars(payload, pol.MaxChars)
-	}
-	if err == nil && in.Body != nil && in.Body.Response != nil && pol.Client == "claude" && res.Shape == "claude.tool_response" {
-		err = sameShape(in.Body.Response, payload)
+		err = checkSize(pol, payload)
 	}
 	if err == nil {
-		res.Mode, res.Payload, res.Chars = ShapeReplace, payload, textChars(payload)
+		res.Mode, res.Payload, res.Chars = ShapeReplace, payload, textSize(payload, utf8.RuneCountInString)
 		return res
 	}
 	res.Reason = err.Error()
-	notice := fmt.Sprintf("[xmustard] the %d-byte %s output could not be shaped for %s (%s). %s", in.RawBytes, in.Tool, pol.Client, err, in.Footer)
+	notice := fmt.Sprintf("[xmustard] the %d-byte %s output could not be shaped for %s (%s). %s", in.RawBytes, in.Tool, pol.Client, err, in.footer())
 	if in.RawBytes <= int64(pol.MaxChars) {
 		res.Mode = ShapeFallback // the client keeps its original output
 	} else {
 		res.Mode = ShapeSizeError
 	}
-	cap := pol.ContextChars
-	if cap == 0 && pol.ContextTokens > 0 {
-		cap = pol.ContextTokens * 3 // conservative characters per token
-	}
-	res.Notice = capChars(notice, cap)
+	res.Notice = pol.capContext(notice)
 	return res
+}
+
+// shapeName names the payload for a client tool.
+func shapeName(client, tool string) string {
+	name, _ := PolicyFor(client).shaper.shape(tool)
+	return name
 }
 
 func capChars(s string, n int) string {
@@ -199,93 +272,287 @@ func capChars(s string, n int) string {
 	return string(r[:n-1]) + "…"
 }
 
-// buildPayload renders the client payload.
-func buildPayload(pol ClientPolicy, in ShapeInput) (json.RawMessage, error) {
-	text := in.Proj.Text + "\n" + in.Footer
-	isError := in.IsError || (in.Body != nil && in.Body.IsError)
-	if pol.Client != "claude" && in.Body != nil && in.Body.StatusDropped {
-		// the text carries the status line; a status member it could not hold would be lost
-		return nil, fmt.Errorf("%w: the tool response has status members the projection cannot carry", errUnshapable)
+// capBytes cuts s to at most n bytes on a rune boundary, the last three an ellipsis.
+func capBytes(s string, n int) string {
+	const ellipsis = "…"
+	if n <= len(ellipsis) || len(s) <= n {
+		return s
 	}
-	switch pol.Client {
-	case "codex":
-		return json.Marshal(map[string]any{"decision": "block", "reason": text})
-	case "cursor", "mcp", "letta", "http":
-		return json.Marshal(map[string]any{"content": []map[string]any{{"type": "text", "text": text}}, "isError": isError})
-	case "pi":
-		if in.Body != nil && in.Body.Dropped > 0 {
-			return nil, fmt.Errorf("%w: %d image blocks cannot be carried by a text projection", errUnshapable, in.Body.Dropped)
-		}
-		if in.Body != nil && in.Body.Incomplete {
-			return nil, fmt.Errorf("%w: details exceed the skeleton bounds", errUnshapable)
-		}
-		out := map[string]any{"content": []map[string]any{{"type": "text", "text": text}}, "isError": isError}
-		if in.Body != nil && in.Body.Response != nil {
-			for _, k := range in.Body.Response.Kids {
-				if k.Key == "details" {
-					raw, err := rebuild(k, in, nil)
-					if err != nil {
-						return nil, err
-					}
-					out["details"] = json.RawMessage(raw)
-				}
-			}
-		}
-		return json.Marshal(out)
-	case "opencode":
-		if in.Body != nil && in.Body.Incomplete {
-			return nil, fmt.Errorf("%w: metadata exceeds the skeleton bounds", errUnshapable)
-		}
-		title := in.Tool
-		var meta json.RawMessage = []byte("{}")
-		if in.Body != nil && in.Body.Response != nil && in.Body.Response.Kind == 'o' {
-			for _, k := range in.Body.Response.Kids {
-				switch {
-				case k.Key == "title" && k.Kind == 'v':
-					var s string
-					if json.Unmarshal(k.Raw, &s) == nil {
-						title = s
-					}
-				case k.Key == "metadata":
-					raw, err := rebuild(k, in, nil)
-					if err != nil {
-						return nil, err
-					}
-					meta = raw
-				}
-			}
-		}
-		return json.Marshal(map[string]any{"title": title, "output": text, "metadata": meta})
-	case "claude":
-		if in.Body == nil || in.Body.Response == nil {
-			return nil, fmt.Errorf("%w: no tool_response in the hook body", errUnshapable)
-		}
-		if in.Body.Incomplete || in.Body.Dropped > 0 {
-			return nil, fmt.Errorf("%w: tool_response has binary or unbounded structure", errUnshapable)
-		}
-		fix := claudeFixups(in)
-		return rebuild(in.Body.Response, in, fix)
-	}
-	return nil, fmt.Errorf("%w: unknown client %q", errUnshapable, pol.Client)
+	return strings.ToValidUTF8(s[:n-len(ellipsis)], "") + ellipsis
 }
 
-// claudeFixups adjusts scalars that describe the replaced text (Read numLines, Grep
-// numLines, Glob truncated) so the payload stays self-consistent. Each fixup reads
-// the rendered text of the section it describes, by name.
-func claudeFixups(in ShapeInput) map[string]func(parts map[string]string) json.RawMessage {
-	fix := map[string]func(map[string]string) json.RawMessage{}
-	lines := func(s string) json.RawMessage { return json.RawMessage(fmt.Sprint(countLines([]byte(s)))) }
-	switch in.Tool {
-	case "Read":
-		fix["file.numLines"] = func(p map[string]string) json.RawMessage { return lines(p["file.content"]) }
-	case "Grep":
-		if in.Body.Scalar("numLines") != "" {
-			fix["numLines"] = func(p map[string]string) json.RawMessage { return lines(p["content"]) }
-		}
-	case "Glob":
-		fix["truncated"] = func(map[string]string) json.RawMessage { return json.RawMessage("true") }
+// --- the per-client shapers ---
+
+// shaper renders one client's replacement payload. build and validate are
+// independent: validate checks the payload against the client's schema without
+// trusting what build produced.
+type shaper interface {
+	// shape names the payload for a tool; replaceable is false when the client can
+	// only observe that tool's output.
+	shape(tool string) (name string, replaceable bool)
+	build(in ShapeInput) (json.RawMessage, error)
+	// validate checks a decoded payload (json.Number for numbers).
+	validate(tool string, v any) error
+	// foreignTool reports another MCP server's tool, by the client's naming.
+	foreignTool(tool string) bool
+}
+
+// namespaced is the tool naming of clients whose MCP tools carry a server namespace
+// (NamespacedTool).
+type namespaced struct{}
+
+func (namespaced) foreignTool(tool string) bool { return NamespacedTool(tool) }
+
+// textOnly refuses a body that a payload of projection text cannot carry whole.
+func textOnly(in ShapeInput) error {
+	switch {
+	case in.Body == nil:
+		return nil
+	case in.Body.StatusDropped:
+		// the text carries the status line; a status member it could not hold would be lost
+		return fmt.Errorf("%w: the tool response has status members the projection cannot carry", errUnshapable)
+	case in.Body.Dropped > 0:
+		return fmt.Errorf("%w: %d image blocks cannot be carried by a text projection", errUnshapable, in.Body.Dropped)
 	}
-	return fix
+	return nil
+}
+
+func textContent(text string) []map[string]any {
+	return []map[string]any{{"type": "text", "text": text}}
+}
+
+// mcpShaper replaces a result with one MCP text content block: MCP clients, Letta
+// (through `letta mcp call`) and the http envelope.
+type mcpShaper struct{ namespaced }
+
+func (mcpShaper) shape(string) (string, bool) { return "mcp.call_tool_result", true }
+
+func (mcpShaper) build(in ShapeInput) (json.RawMessage, error) {
+	if err := textOnly(in); err != nil {
+		return nil, err
+	}
+	return json.Marshal(map[string]any{"content": textContent(in.text()), "isError": in.isError()})
+}
+
+func (mcpShaper) validate(_ string, v any) error {
+	return fields(asObject(v), "mcp", req("content", isContentBlocks(false)), opt("isError", isBool))
+}
+
+// cursorShaper replaces MCP results only; Cursor's built-in tools are observe-only.
+type cursorShaper struct{ mcpShaper }
+
+func (c cursorShaper) shape(tool string) (string, bool) {
+	if c.foreignTool(tool) {
+		return "cursor.mcp_result", true
+	}
+	return "cursor.observe", false
+}
+
+// codexShaper returns a PostToolUse decision=block whose reason replaces the result.
+type codexShaper struct{ namespaced }
+
+func (codexShaper) shape(string) (string, bool) { return "codex.decision_block", true }
+
+func (codexShaper) build(in ShapeInput) (json.RawMessage, error) {
+	if err := textOnly(in); err != nil {
+		return nil, err
+	}
+	// the recovery line goes last: a reason past the spill limit keeps its head and
+	// tail, so the handle survives the cut
+	return json.Marshal(map[string]any{"decision": "block", "reason": in.Proj.Text + "\n" + joinLines(in.Note, in.Footer)})
+}
+
+func (codexShaper) validate(_ string, v any) error {
+	obj := asObject(v)
+	if err := fields(obj, "codex", req("decision", isString), req("reason", isString)); err != nil {
+		return err
+	}
+	if obj["decision"] != "block" || obj["reason"] == "" {
+		return errors.New(`shape: codex replacement needs decision "block" and a reason`)
+	}
+	return nil
+}
+
+// piShaper returns a tool_result {content, details, isError}; details keep their
+// structure with each text section projected.
+type piShaper struct{ namespaced }
+
+func (piShaper) shape(string) (string, bool) { return "pi.tool_result", true }
+
+func (piShaper) build(in ShapeInput) (json.RawMessage, error) {
+	if err := textOnly(in); err != nil {
+		return nil, err
+	}
+	if in.Body != nil && in.Body.Incomplete {
+		return nil, fmt.Errorf("%w: details exceed the skeleton bounds", errUnshapable)
+	}
+	out := map[string]any{"content": textContent(in.text()), "isError": in.isError()}
+	if k := in.responseMember("details"); k != nil {
+		raw, err := rebuild(k, in, nil)
+		if err != nil {
+			return nil, err
+		}
+		out["details"] = raw
+	}
+	return json.Marshal(out)
+}
+
+func (piShaper) validate(_ string, v any) error {
+	return fields(asObject(v), "pi", req("content", isContentBlocks(true)), opt("isError", isBool))
+}
+
+// opencodeShaper returns tool.execute.after's {title, output, metadata}.
+type opencodeShaper struct{}
+
+func (opencodeShaper) shape(string) (string, bool) { return "opencode.output", true }
+
+func (opencodeShaper) build(in ShapeInput) (json.RawMessage, error) {
+	if err := textOnly(in); err != nil {
+		return nil, err
+	}
+	if in.Body != nil && in.Body.Incomplete {
+		return nil, fmt.Errorf("%w: metadata exceeds the skeleton bounds", errUnshapable)
+	}
+	title := in.Tool
+	if k := in.responseMember("title"); k != nil && k.Kind == 'v' {
+		var s string
+		if json.Unmarshal(k.Raw, &s) == nil {
+			title = s
+		}
+	}
+	var meta json.RawMessage = []byte("{}")
+	if k := in.responseMember("metadata"); k != nil {
+		raw, err := rebuild(k, in, nil)
+		if err != nil {
+			return nil, err
+		}
+		meta = raw
+	}
+	return json.Marshal(map[string]any{"title": title, "output": in.text(), "metadata": meta})
+}
+
+func (opencodeShaper) validate(_ string, v any) error {
+	return fields(asObject(v), "opencode", req("title", isString), req("output", isString), req("metadata", isObject))
+}
+
+// openCodeUnderscored are the OpenCode built-ins whose names hold an underscore. Any
+// other underscored name is another server's MCP tool, named <server>_<tool>
+// (opencode mcp/catalog.ts toolName), or a plugin's <namespace>_<tool>.
+var openCodeUnderscored = map[string]bool{"apply_patch": true, "plan_enter": true, "plan_exit": true}
+
+func (opencodeShaper) foreignTool(tool string) bool {
+	return NamespacedTool(tool) || strings.Contains(tool, "_") && !openCodeUnderscored[strings.ToLower(tool)]
+}
+
+// claudeShaper rebuilds the tool_response with each section projected: Claude Code
+// takes a built-in's updatedToolOutput only when it matches the tool's output schema,
+// and any other tool's when it keeps the original structure.
+type claudeShaper struct{ namespaced }
+
+// claudeTool is one Claude Code built-in: validate checks its payload schema; fixups
+// adjust the scalars that describe the replaced text (Read numLines, Grep numLines,
+// Glob truncated) so the payload stays self-consistent.
+type claudeTool struct {
+	validate func(v any) error
+	fixups   func(b *HookBody) map[string]fixup
+}
+
+// fixup renders a scalar from the rendered text of the sections, by name.
+type fixup func(parts map[string]string) json.RawMessage
+
+func linesOf(section string) fixup {
+	return func(p map[string]string) json.RawMessage {
+		return json.RawMessage(fmt.Sprint(countLines([]byte(p[section]))))
+	}
+}
+
+var claudeBuiltins = map[string]claudeTool{
+	"Bash": {validate: func(v any) error {
+		return fields(asObject(v), "Bash", req("stdout", isString), req("stderr", isString), req("interrupted", isBool), opt("isImage", isBool))
+	}},
+	"Read": {validate: validateClaudeRead, fixups: func(*HookBody) map[string]fixup {
+		return map[string]fixup{"file.numLines": linesOf("file.content")}
+	}},
+	"Grep": {validate: validateClaudeGrep, fixups: func(b *HookBody) map[string]fixup {
+		if b.Scalar("numLines") == "" {
+			return nil
+		}
+		return map[string]fixup{"numLines": linesOf("content")}
+	}},
+	"Glob": {validate: func(v any) error {
+		return fields(asObject(v), "Glob", req("filenames", isStringArray), req("numFiles", isNumber), req("truncated", isBool), opt("durationMs", isNumber))
+	}, fixups: func(*HookBody) map[string]fixup {
+		return map[string]fixup{"truncated": func(map[string]string) json.RawMessage { return json.RawMessage("true") }}
+	}},
+	"LS":       {validate: notNull},
+	"WebFetch": {validate: notNull},
+}
+
+func (claudeShaper) shape(tool string) (string, bool) {
+	if _, ok := claudeBuiltins[tool]; ok {
+		return "claude." + tool, true
+	}
+	return "claude.tool_response", true
+}
+
+func (claudeShaper) build(in ShapeInput) (json.RawMessage, error) {
+	if in.Body == nil || in.Body.Response == nil {
+		return nil, fmt.Errorf("%w: no tool_response in the hook body", errUnshapable)
+	}
+	if in.Body.Incomplete || in.Body.Dropped > 0 {
+		return nil, fmt.Errorf("%w: tool_response has binary or unbounded structure", errUnshapable)
+	}
+	t, builtin := claudeBuiltins[in.Tool]
+	var fix map[string]fixup
+	if t.fixups != nil {
+		fix = t.fixups(in.Body)
+	}
+	out, err := rebuild(in.Body.Response, in, fix)
+	if err != nil || builtin {
+		return out, err
+	}
+	// any other tool: every original member is back with the same JSON kind
+	return out, sameShape(in.Body.Response, out)
+}
+
+func (claudeShaper) validate(tool string, v any) error {
+	if t, ok := claudeBuiltins[tool]; ok {
+		return t.validate(v)
+	}
+	return notNull(v)
+}
+
+func validateClaudeRead(v any) error {
+	obj := asObject(v)
+	if err := fields(obj, "Read", req("type", isString), req("file", isObject)); err != nil {
+		return err
+	}
+	if obj["type"] != "text" {
+		return fmt.Errorf("shape: Read type %v is not replaceable", obj["type"])
+	}
+	return fields(asObject(obj["file"]), "Read.file", req("filePath", isString), req("content", isString), req("numLines", isNumber),
+		req("startLine", isNumber), req("totalLines", isNumber))
+}
+
+var claudeGrepModes = map[string]bool{"content": true, "files_with_matches": true, "count": true}
+
+func validateClaudeGrep(v any) error {
+	obj := asObject(v)
+	if err := fields(obj, "Grep", req("numFiles", isNumber), req("filenames", isStringArray), opt("mode", isString),
+		opt("content", isString), opt("numLines", isNumber)); err != nil {
+		return err
+	}
+	if m, ok := obj["mode"].(string); ok && !claudeGrepModes[m] {
+		return fmt.Errorf("shape: Grep mode %q", m)
+	}
+	return nil
+}
+
+func notNull(v any) error {
+	if v == nil {
+		return errors.New("shape: empty payload")
+	}
+	return nil
 }
 
 // primarySection is the largest output section: the recovery line goes there.
@@ -304,12 +571,13 @@ func primarySection(b *HookBody) int {
 
 // rebuild renders a skeleton value with each section replaced by its projection.
 // The footer is appended to the first text section (the primary output).
-func rebuild(root *Node, in ShapeInput, fix map[string]func(map[string]string) json.RawMessage) (json.RawMessage, error) {
+func rebuild(root *Node, in ShapeInput, fix map[string]fixup) (json.RawMessage, error) {
 	parts := map[string]string{} // rendered text per section name
 	primary := -1
 	if in.Body != nil {
 		primary = primarySection(in.Body)
 	}
+	footer := in.footer()
 	var buf bytes.Buffer
 	var walk func(n *Node, path string) error
 	walk = func(n *Node, path string) error {
@@ -348,8 +616,8 @@ func rebuild(root *Node, in ShapeInput, fix map[string]func(map[string]string) j
 			if !ok {
 				return fmt.Errorf("%w: no projection for section %q", errUnshapable, name)
 			}
-			if n.Section == primary && in.Footer != "" {
-				text = strings.TrimRight(text, "\n") + "\n" + in.Footer
+			if n.Section == primary && footer != "" {
+				text = strings.TrimRight(text, "\n") + "\n" + footer
 			}
 			parts[name] = text
 			if n.Kind == 'l' {
@@ -391,68 +659,31 @@ func rebuild(root *Node, in ShapeInput, fix map[string]func(map[string]string) j
 
 // ValidateShape checks that payload is a valid replacement for the client tool.
 func ValidateShape(client, tool string, payload []byte) error {
+	pol, ok := LookupClient(client)
+	if !ok {
+		return fmt.Errorf("shape: unknown client %q", client)
+	}
+	return validatePayload(pol, tool, payload)
+}
+
+func validatePayload(pol ClientPolicy, tool string, payload []byte) error {
 	var v any
 	dec := json.NewDecoder(bytes.NewReader(payload))
 	dec.UseNumber()
 	if err := dec.Decode(&v); err != nil {
 		return fmt.Errorf("shape: payload is not JSON: %w", err)
 	}
-	obj, _ := v.(map[string]any)
-	switch client {
-	case "claude":
-		switch claudeBuiltin(tool) {
-		case "Bash":
-			return fields(obj, "Bash", req("stdout", isString), req("stderr", isString), req("interrupted", isBool), opt("isImage", isBool))
-		case "Read":
-			if err := fields(obj, "Read", req("type", isString), req("file", isObject)); err != nil {
-				return err
-			}
-			if obj["type"] != "text" {
-				return fmt.Errorf("shape: Read type %v is not replaceable", obj["type"])
-			}
-			file, _ := obj["file"].(map[string]any)
-			return fields(file, "Read.file", req("filePath", isString), req("content", isString), req("numLines", isNumber),
-				req("startLine", isNumber), req("totalLines", isNumber))
-		case "Grep":
-			if err := fields(obj, "Grep", req("numFiles", isNumber), req("filenames", isStringArray), opt("mode", isString),
-				opt("content", isString), opt("numLines", isNumber)); err != nil {
-				return err
-			}
-			if m, ok := obj["mode"].(string); ok && m != "content" && m != "files_with_matches" && m != "count" {
-				return fmt.Errorf("shape: Grep mode %q", m)
-			}
-			return nil
-		case "Glob":
-			return fields(obj, "Glob", req("filenames", isStringArray), req("numFiles", isNumber), req("truncated", isBool), opt("durationMs", isNumber))
-		case "LS", "WebFetch":
-			if v == nil {
-				return errors.New("shape: empty payload")
-			}
-			return nil
-		}
-		if v == nil {
-			return errors.New("shape: empty payload")
-		}
+	return pol.shaper.validate(tool, v)
+}
+
+func checkSize(pol ClientPolicy, payload []byte) error {
+	if pol.MaxChars <= 0 {
 		return nil
-	case "codex":
-		if err := fields(obj, "codex", req("decision", isString), req("reason", isString)); err != nil {
-			return err
-		}
-		if obj["decision"] != "block" || obj["reason"] == "" {
-			return errors.New(`shape: codex replacement needs decision "block" and a reason`)
-		}
-		return nil
-	case "pi":
-		if err := fields(obj, "pi", req("content", isContentBlocks(true)), opt("isError", isBool)); err != nil {
-			return err
-		}
-		return nil
-	case "opencode":
-		return fields(obj, "opencode", req("title", isString), req("output", isString), req("metadata", isObject))
-	case "cursor", "mcp", "letta", "http":
-		return fields(obj, client, req("content", isContentBlocks(false)), opt("isError", isBool))
 	}
-	return fmt.Errorf("shape: unknown client %q", client)
+	if n, unit := pol.size(payload); n > pol.MaxChars {
+		return fmt.Errorf("shape: %d %s exceed the client cap of %d", n, unit, pol.MaxChars)
+	}
+	return nil
 }
 
 type fieldRule struct {
@@ -482,6 +713,8 @@ func fields(obj map[string]any, what string, rules ...fieldRule) error {
 	}
 	return nil
 }
+
+func asObject(v any) map[string]any { obj, _ := v.(map[string]any); return obj }
 
 func isString(v any) bool { _, ok := v.(string); return ok }
 func isBool(v any) bool   { _, ok := v.(bool); return ok }
@@ -587,8 +820,9 @@ func matchNode(n *Node, v any, path string) error {
 	return nil
 }
 
-// textChars counts the characters of every string in a payload.
-func textChars(payload []byte) int {
+// textSize sums the size of every string in a payload, measured by size (len for
+// bytes, utf8.RuneCountInString for characters).
+func textSize(payload []byte, size func(string) int) int {
 	var v any
 	if json.Unmarshal(payload, &v) != nil {
 		return 0
@@ -598,7 +832,7 @@ func textChars(payload []byte) int {
 	walk = func(x any) {
 		switch t := x.(type) {
 		case string:
-			n += utf8.RuneCountInString(t)
+			n += size(t)
 		case []any:
 			for _, e := range t {
 				walk(e)
@@ -611,13 +845,4 @@ func textChars(payload []byte) int {
 	}
 	walk(v)
 	return n
-}
-
-func checkChars(payload []byte, maxChars int) error {
-	if maxChars > 0 {
-		if n := textChars(payload); n > maxChars {
-			return fmt.Errorf("shape: %d characters exceed the client cap of %d", n, maxChars)
-		}
-	}
-	return nil
 }

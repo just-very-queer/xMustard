@@ -209,6 +209,38 @@ Source: `docs/research/PARITY_REQUIREMENTS_2026-09-25.md` (requirements, process
 
 **Decision: 16 MiB original against the 24 MiB default pool.** `DefaultMaxOriginal` stays 16 MiB and is not derived from the pool, and core output is not streamed to the evidence spool. The spool streams to disk in O(window) memory, so posted results and streamed tool output reach 16 MiB under any pool. A core-backed tool decodes and re-encodes the core's JSON before the spool sees it, so streaming core stdout past the handler would not remove the in-memory copy; the pool-derived core output cap (`coreStdoutCap`) is that path's real bound: 6.98 MiB under the default pool, 16 MiB from a pool of about 52 MiB. Past it the tool answers the permanent "output too large" error, not a truncated capture. The 16 MiB acceptance test keeps its 64 MiB pool because only a core-backed read binds its capture to an identity. `TestCoreOutputCapAgainstTheEvidenceCaptureLimit` (rustcore) pins those figures; the comment on `DefaultMaxOriginal` records the decision.
 
+### WS-FIX-04 — Client adapter corrections and a per-client shaper registry
+
+**Source.** The 2026-09-28 integrations comparison (xMustard against OpenCodeReview, checked against `research/codex` at 44fe510 and `research/opencode` at 03e6717), its findings C1-C12 and O1-O14 and adopt items 1-6, 11 and 14. Requirements touched: PAR-CTX-01 and PAR-CTX-03 (hook bodies, per-client shapes), PAR-ADP-05 (client profiles, `mcp-config`), PAR-ADP-07 and PAR-ADP-08 (the server side of the Codex and OpenCode adapters; the host-side hooks and plugin stay WS-40a/b), and the WS-11 eval driver.
+
+**Implementation record (branch parity/ws-fix-04, 2026-09-28).** These notes record what was built and measured, and where it differs from the direction the workstream was given.
+- *One shaper registry (adopt 11, §7).* `evidence/shapes.go` no longer switches on the client string in `shapeName`, `buildPayload` and `ValidateShape`, and `claudeBuiltin`/`claudeFixups` are gone. Each `clientPolicies` entry carries a `shaper` (unexported interface: `shape`, `build`, `validate`, `foreignTool`) with five implementations: `claudeShaper` (a table of the built-ins, each with its validator and its scalar fixups), `codexShaper`, `piShaper`, `opencodeShaper`, and `mcpShaper` for mcp, letta and http, which `cursorShaper` embeds and overrides only to observe built-ins. Adding a client is one entry. The shared guards live in one place: `textOnly` refuses a body with status members or image blocks a text payload cannot carry.
+- *claude vs claude-code.* A policy lists its aliases; `claude-code` (the MCP client profile) resolves to the `claude` policy through `LookupClient`, and a capture records the canonical name. `POST .../evidence/capture` refuses an unknown `?client=` with 400 `invalid_client` and lists `ClientNames()`; before, `client=claude-code` silently got the http envelope. `PolicyFor` keeps its http fallback for in-package callers (`client` blank or raw).
+- *Codex policy (C1, C8).* `MaxChars` is 10,000 and counts bytes (`MaxUnit: "bytes"`): Codex spills hook text past 2,500 approximate tokens of 4 bytes. `Target` is 8,464 bytes, the 10,000 less a 1,536-byte reserve for the recovery line and the data-framing note. The reason ends with the recovery line (the note moved before it), so a spilled reason's kept tail still names the handle; every other client keeps the recovery line first, then the note. The additional-context notice is capped in bytes for a byte-measured client. Image blocks now refuse the replacement for every text-only payload.
+- *Hook bodies (C2, O5, cross-client bug).* An `error` member marks a body failed only when it is a non-empty string (`"error": null`, `""` or an object says nothing). FormatCodex reads `turn_id`, `agent_id` and `transcript_path` (new `HookBody` and `CaptureMeta` fields) and no longer maps `call_id` or `error`, which Codex never sends. `exitKeys` include `exit` (OpenCode `metadata.exit`). The decoder's metadata roles fill their fields through one table instead of a case per role.
+- *OpenCode names (O7, O8).* `opencodeShaper.foreignTool` treats an underscored name as `<server>_<tool>` (or a plugin's `<namespace>_<tool>`) unless it is one of OpenCode's underscored built-ins (`apply_patch`, `plan_enter`, `plan_exit`), so another server's JSON result is reduced as structured output; the other clients keep `NamespacedTool` (Cursor now uses it too; it covers the old `isMCPTool` prefixes). toolcompat aliases `patchText` to `patch`.
+- *codex_args (C11).* `sanitizeCodexArgs` is an allow-list. The flags xMustard pins (model, working root, sandbox, approval, JSON output, `exec`) are dropped as before; `--ephemeral`, `--strict-config`, `--oss`, `--color` (always, never, auto) and `--local-provider` (lmstudio, ollama) pass; anything else is refused as invalid input (400), both when the settings are saved and when a run is built.
+- *mcp-config (C5, C6).* `--client codex` prints a `[mcp_servers.xmustard]` table for `config.toml`: `url`, `bearer_token_env_var = "XMUSTARD_API_TOKEN"` and `http_headers` with `X-Xmustard-Workspace`, or for the relay `command`, `args` and `env_vars = ["XMUSTARD_API_TOKEN"]`. Other clients keep the JSON `mcpServers` form. The URL and the relay's `--client` carry the normalized profile name. README shows the Codex form.
+- *Pi recall.* The Pi adapter sends `max_chars=4000` on recall, the MCP tool's default, so both clients issue the same request; a unit test reads the Go constant.
+- *Eval (C10).* A Codex `{"type":"error"}` event is fatal only when no `turn.completed` follows it; the error text is the last error's. `cache_write_input_tokens` is read (it is part of `input_tokens`, like cached reads), and an unset `cache_write_per_mtok` prices cache writes at the input rate.
+- *Fixtures.* `api-go/internal/evidence/testdata/codex/0.156.1/` holds three PostToolUse bodies recorded from the installed codex-cli 0.156.1 (a small Bash call, a 3,006-line Bash call, an MCP call) by `testdata/codex/record/record.sh`: `codex exec` runs against a local mock Responses API and a command hook logs the payload, with no model call; local paths are replaced by `/Users/dev/...`. `testdata/codex/schema/post_tool_use_subagent.json` is not a recording: it is derived from `hooks/src/schema.rs` `PostToolUseCommandInput` at 44fe510 (a subagent call with `agent_id`, `agent_type` and a null `transcript_path`), which the recorder cannot produce.
+- *Measured on codex-cli 0.156.1 (local, mock model).*
+  - A block reason of exactly 10,000 bytes reached the model unchanged; 10,001 bytes came back as a 10,103-byte head-and-tail preview plus `Full hook output saved to: <temp path>`, with the last line kept. The reason replaced the tool output the model saw (`function_call_output`).
+  - The Bash `tool_response` is the output text alone, already Codex's own preview: 40,109 bytes for a 3,006-line output, with the middle cut (`…9732 tokens truncated…`) before any hook runs, so a failure in the middle is gone before xMustard sees it. The exit status appears only in the model-facing header (`Process exited with code 3`), never in the payload (C4 holds).
+  - An MCP call that needed approval, and one whose result had `isError: true`, produced no PostToolUse payload (C3 holds). A successful MCP call's `tool_response` is `{content, isError: false}` and its `tool_name` is `mcp__cilogs__fetch_log`.
+  - `codex exec --json` usage carries `cache_write_input_tokens`, and a run against an unreachable backend emitted `{"type":"error","message":"Reconnecting... n/5 ..."}` before its final error (C10 holds).
+  - Both `mcp-config` TOML forms load: `codex mcp list --json` showed the http entry as `streamable_http` with `bearer_token_env_var` and the header, and the relay entry as `stdio` with `env_vars`.
+  - With a 96-character workspace id and an injection flag, the recovery line and note were 1,002 bytes and the reason 8,718 bytes (`TestCodexReasonKeepsTheHandleLastWithTheInjectionNote`).
+- *Deviations.*
+  - Target is 8,464 bytes, not a round 9 KiB: a 9 KiB projection plus a 1 KB footer would pass the spill limit. The 1,536-byte reserve holds workspace ids up to about 200 characters with every injection flag set; past that the byte check fails the shape and Codex gets the fallback notice, never a spilled reason.
+  - The image-block refusal applies to every text-only shaper (codex, mcp, letta, http, cursor, opencode, pi), not only Codex: the guard is shared, and those payloads dropped images silently before.
+  - `codex_args` refuses more than the flags listed in the direction: also `-p/--profile` (a config layer that can set the sandbox), `--ignore-rules`, `-o/--output-last-message`, `--worktree`, `-i/--image` and positional arguments. Two tests that expected `--profile` and `--config=fast` to pass were rewritten.
+  - The capture route's client check and the `turn_id`/`transcript_path` fields in `CaptureMeta` go beyond the listed items; both follow from the registry and the new roles.
+  - OpenCode's MCP payload (O1: set `content`, not `output`) and its `mcp` config form are unchanged; they wait for WS-40b's check against the installed OpenCode 2.0.1.
+  - The first recording attempt set `openai_base_url`, which 0.156.1 ignored: its requests went to api.openai.com with a dummy key and were refused with 401, so no model ran. The recorder uses a custom model provider instead.
+  - Pi was not type-checked (`npm run typecheck` needs `node_modules`, which this worktree lacks); `node --test test/unit.test.ts` passed 45/45.
+- *Checks.* No Rust file changed. On the Linux box, `xm-remote-check.sh all -count=1` passed on its second run: every Rust test target and all 14 Go packages passed, `go vet ./...` was clean, 6 clippy warnings (the base's count), remote_exit=0. The first run failed only outside this change: govstore could not create its databases because the box's shared `/tmp` filled for a moment ("database or disk is full"; the Go suite then passed on its own), and `index_build`'s debug-binary 25 MiB peak test, which sits at its line (WS-15 record), failed once and passed three times alone. Pi: `node --test test/unit.test.ts` 45/45 locally.
+
 ### WS-04 — MCP server package and protocol modernization
 
 **Goal.** Move the tool table and dispatch out of cmd/xmustard-mcp/main.go into api-go/internal/mcpserver, one file per tool, so the stdio shim, the HTTP endpoint (WS-13) and hooks share them. Add: protocol version negotiation, initialize.instructions (static workflow text for now), tool annotations, outputSchema plus structuredContent, rejection of out-of-range values, hidden compatibility aliases, optional workspace_id resolved from env/roots/cwd/path, and the API bounds that are already supported but hidden (recall limit, search limit, impact depth, verify note).
@@ -971,6 +1003,170 @@ No Rust or git spawn happens per hook.
 **Acceptance.** No machine-specific data is tracked, and a release can be cut reproducibly. Untracking is presented to the human for approval.
 
 **Collision risk.** .gitignore and the Makefile were modified in the diagnostics session's older tree. Coordinate. Do not edit README.md or docs/STATUS.md.
+
+**Implementation record (branch parity/ws-26, 2026-09-28).**
+- *Untracking: prepared for the owner, not run.* `git ls-files -- backend/data` lists 80 files (4.6 MB), the runtime state of a March–April 2026 install: `settings.json`, `workspaces.json`, two `metrics/run_*.json` files and six workspace directories (snapshots, activity logs, run records and logs, terminal logs, and a stray `run_ea4bf722c9b2.json.<hex>.tmp` from an interrupted write). 39 of them contain absolute `/Users/...` paths. A scan for credential shapes (OpenAI, GitHub, AWS and Slack token prefixes, private-key headers) found none. No code or test reads these files. The Go tests that name `backend/data` create it under `t.TempDir()`, the Rust tests use synthetic paths, and the API creates the directory on its first write. `git rm --cached` leaves the files in history; rewriting history is a separate owner decision. The owner approval packet below holds the list, the script and the procedure for other checkouts.
+- *The matching `.gitignore` change* is on this branch, additive: `backend/data/` (the older per-directory rules stay). Git does not apply ignore rules to tracked files, so until the script runs the 80 files stay tracked and runtime edits to them still show in `git status`. New runtime files (`govstore.db`, new workspaces) no longer show. The other additions are `/dist/` (release output), `!docs/releases/` (release notes are a curated public entry point) and `api-go/xmustard-eval` (the one Go binary the list missed). Nothing was removed, and nothing is appended at the end of the file, where the diagnostics branch appends its block.
+- *The script, checked in scratch clones of this branch.* It staged exactly 80 deletions and left all 80 files on disk. It refused a second run, an extra tracked file under backend/data, a `.gitignore` without the rule, and an index with a staged change. A second clone held live data: two tracked files modified, plus `govstore.db` and a new workspace directory. A plain merge of the untrack commit there refused because of the modified files. The procedure below then kept all 82 files byte-identical (sha256 of every file before and after) and left `git status` clean.
+- *Clean clone.* A fresh clone of the simulated untrack commit has no `backend/data`; `backend/` holds only `sql/`. On the build box that clone passed `cargo build --locked` (debug and release) and `make check-backend` with `GOFLAGS=-count=1`: all 14 Go packages and every cargo test binary passed, and clippy ran. `xmustard-api` then started with its default data directory (`../backend/data`) absent and answered `/api/health`. It does not create the directory at start-up; `writeJSON` creates it on the first write, which the settings tests exercise under `t.TempDir()`.
+- *`make release`* (Makefile, additive). `make release VERSION=vX.Y.Z` builds `xmustard-core` and `xmustard-relay` with `cargo build --release --locked`, and `xmustard-api`, `xmustard-mcp` and `xmustard-ops` with `CGO_ENABLED=0 go build -trimpath -ldflags="-s -w"`. These are the flags the v0.1.0 binaries show (`go version -m`: go1.26.1, `-trimpath=true`, `CGO_ENABLED=0`, stripped). Without cgo the Go binaries are static, but they lack the platform profile's PTY terminals (`terminal_pty_unix.go` needs cgo; the stub returns "pty terminals require cgo"). The core profile is unaffected, and the formula caveats state the limit. For the Rust build the recipe replaces `RUSTFLAGS` with `--remap-path-prefix` and `CFLAGS` with `-ffile-prefix-map` (tree-sitter's C asserts embed their source paths), mapping the checkout to `.` and `CARGO_HOME` to `/cargo`. It then checks that the core prints its usage (exit 2) and that `xmustard-mcp` answers `tools/list` with `remember`. It packs the five binaries and LICENSE into `dist/xmustard-<version>-<os>-<arch>.tar.gz`, the v0.1.0 asset naming (`uname -s` lower-cased, `uname -m`). Every entry gets the commit's time (`git log -1` in UTC; `SOURCE_DATE` overrides it), mode 0755 or 0644, and owner and group 0. Entries are listed in a fixed order, with no extended attributes (bsdtar otherwise stores `com.apple.provenance`) and no macOS `._` entries, and `gzip -n` drops the gzip timestamp. Finally it writes the archive's `.sha256` (`shasum -a 256`, present on both platforms), then runs `make release-sums`. That target checks every archive of `VERSION` in `DIST` against its `.sha256` (`shasum -c`) and writes `SHA256SUMS` from them, so a local run gives the same three kinds of file as the workflow. `VERSION` defaults to `git describe --tags --always --dirty`, or `dev` without git. The recipe parses and expands under macOS's GNU Make 3.81 (`make -n release`), and the tar and gzip flags were checked with the Mac's bsdtar 3.7.4 (two runs gave the same bytes); nothing was compiled on the Mac. It builds for the host only; there is no cross-compilation. `make release` and `make build` share `rust-core/target`, so switching between them rebuilds the Rust dependencies, because the flags differ.
+- *`.github/workflows/release.yml`* (new). It runs on a `v*` tag push, plus a manual dry run that only uploads artifacts. The build matrix is `ubuntu-22.04` (linux-x86_64) and `macos-15` (darwin-arm64). The Rust binaries need the build runner's glibc or newer, so the Linux leg uses the oldest GitHub-hosted Ubuntu image (glibc 2.35); the Go binaries are static. musl was not chosen: the RSS lines are set on Linux with glibc's allocator, and a musl build changes both allocator speed and resident memory, so it would ship binaries the gates never measured. If the 22.04 image is retired, an older-glibc container or cargo-zigbuild keeps the floor. Each leg validates the tag with an anchored regex (`vX.Y.Z` or `vX.Y.Z-pre`) and runs `make release VERSION=<tag>`. It checks that the archive carries the matrix platform name, so a runner-image change cannot mislabel an archive, then uploads the archive and its `.sha256`. The publish job runs only on tag pushes and is the only job with `contents: write`. It downloads both archives, runs `make release-sums VERSION=<tag>` (the same `shasum -c` and `SHA256SUMS` step as a local run), and runs `gh release create --draft --verify-tag`. Notes come from `docs/releases/<tag>.md` when present, else `--generate-notes`. The owner publishes the draft. `gh release create` fails on an existing release, so a re-pushed tag never replaces assets. Toolchains are pinned (Go 1.26.1, Rust 1.93.1: the versions that built v0.1.0, from the Go build info and the rustc commit in the core). No build cache is restored, so a release never consumes a cache written by a pull-request run. Checkout runs with `persist-credentials: false`. The actions are pinned to the same commit SHAs as check.yml. Each SHA was checked against its tag (GitHub tags API), and each input against the action's `action.yml` at that SHA. `actionlint` 1.7.12 (run on the build box) reports no problems in release.yml or check.yml. shellcheck was not installed, so the `run:` scripts were not shellchecked.
+- *Dry run of the workflow on the build box.* The workflow cannot run here because nothing is pushed. The equivalent ran on the Linux x86_64 build box (Ubuntu, glibc 2.43, go1.26.1, rustc 1.93.1, gcc 15.2, GNU tar 1.35) at a9689f8. It ran the build leg's `make release VERSION=v0.1.0-25-ga9689f8 SOURCE_DATE=202609280734.13` plus its name check, then the publish job's `shasum -c` and `SHA256SUMS` step. The box's copy has no `.git`, so the version and commit time were passed as a checkout of that commit computes them. The only step left out is `gh release create`. Artifacts:
+
+  | File | Bytes | sha256 |
+  |---|---|---|
+  | `xmustard-v0.1.0-25-ga9689f8-linux-x86_64.tar.gz` | 24,539,784 | `bf377ce42ed48a4f003ed51f6f04232dcd8a055fd5df2f6dcfcf746b1e163c89` |
+  | `xmustard-v0.1.0-25-ga9689f8-linux-x86_64.tar.gz.sha256` | 114 | (the line above) |
+  | `SHA256SUMS` | 114 | (the same line) |
+
+  Archive contents, all 0/0 and dated 2026-09-28 07:34:13 UTC: `xmustard-core` 37,167,848 bytes, `xmustard-api` 22,143,138, `xmustard-ops` 17,817,762, `xmustard-mcp` 7,057,570 (the same size as v0.1.0's), `xmustard-relay` 611,712, and `LICENSE` (0644). `strings` finds no `/home/` path, user name or checkout path in any of the five binaries. The core's 116 dependency source paths now read `/cargo/registry/src/...`. *Reproducibility:* a second `make release` ran from a copy at another path, with another `CARGO_HOME` (a copy of the registry) and an empty Rust target directory (81 crates compiled). It produced a byte-identical archive (the same sha256) and identical binaries. Each build took 79–93 s. Built on this box, the core needs glibc 2.39 and the relay 2.34, because the box has glibc 2.43. The ubuntu-22.04 leg links against glibc 2.35, so its floor can be at most 2.35. That was not measured, because the box has no container runtime. The first dry run at 54907b5, before the path remap, is superseded. Its binaries held build-box paths, and its archive bytes changed with every build.
+- *Homebrew formula.* The formula at branch time was no longer HEAD-only: main's 4ba4481 had pinned it to the v0.1.0 source tarball on every platform. A `stable do` block now gives every platform v0.1.0, checked against a sha256. macOS arm64 installs the prebuilt v0.1.0 archive, with the sha256 from the release's `SHA256SUMS` (downloaded and checked; it holds the five binaries under one top directory, which Homebrew enters). macOS Intel, Linux arm64 and Linux x86_64 build the tagged source tarball, whose sha256 `e4799036...` was checked by downloading it again. go and rust are build dependencies of that spec only. Linux x86_64 builds from source because v0.1.0's prebuilt Linux archive needs glibc 2.39 (core) and 2.34 (relay), so it would install and then fail to start on Ubuntu 22.04, Debian 12 or RHEL 9. It can move to the archive of a release that release.yml builds on ubuntu-22.04 (floor 2.35) when the owner bumps the formula. `head` builds main, with its own go and rust build dependencies. `install` builds whenever it finds `rust-core/Cargo.toml`, which the source tarball and HEAD have and the archives do not (they hold only the five binaries and LICENSE). The build is the base formula's: `cargo install --locked` through `std_cargo_args`, and `std_go_args` for the Go binaries, with cgo on, so source builds keep the PTY terminals. The source build was not run in this round: it compiles, which the Mac may not do, and the box has no Homebrew. The test block is unchanged; it passed against the darwin-arm64 archive on the Mac (core exit 2 with "usage"; `tools/list` names `ground` and `remember`). The formula was loaded with `Formulary.from_contents` under `Homebrew::SimulateSystem` (Homebrew 7.0.6) for the four os/arch pairs, and each gives stable 0.1.0. macOS arm64 gets the darwin-arm64 archive with no dependencies. macOS Intel, Linux x86_64 and Linux arm64 get the source tarball with go and rust as build dependencies. Head lists go and rust once on every pair. So `brew install xmustard` no longer stops in `install/check.rb`, which refuses a formula with no stable spec unless `--HEAD` is given. `brew style` reports no formula offense, only the Sorbet sigil and frozen-string cops that apply to files outside a tap; the base formula shows the same ones. It had asked for `version` inside the stable block, where it now is. The caveats ask for an absolute `XMUSTARD_DATA_DIR`, since the binaries default to `../backend/data`, which is relative to the working directory; the single-config fix belongs to WS-48. They also say the prebuilt binaries lack the platform profile's PTY terminals. The glibc caveat is gone, since no Linux platform installs a prebuilt binary.
+- *Formatting (separate commits, no logic).* `gofmt -w` on the 10 files `gofmt -l api-go` listed; `git diff -w` shows only two removed blank lines. `rustfmt` (edition 2024) changed `scanner.rs` and `verification.rs`. `indexcache.rs` was already clean after WS-15 merged, so it is unchanged. `cargo fmt --check` and `gofmt -l api-go` are now clean.
+- *Deviations from the spec.* (1) The untracking itself is not done: the packet waits for the owner, as the plan requires. Only the inert `.gitignore` rule is applied. (2) The formula was no longer HEAD-only at branch time (see above). Only macOS arm64 installs a prebuilt archive. The other platforms keep the base formula's checksummed source build: Linux x86_64 because of v0.1.0's glibc 2.39 floor, and macOS Intel and Linux arm64 because they have no archive. (3) `indexcache.rs` needed no rustfmt change. (4) Only the Linux archive was dry-run, because nothing may be compiled on the Mac. The darwin-arm64 leg is covered by `make -n release` under Make 3.81 and by the v0.1.0 darwin archive, which was built with the same flags. (5) The release is a draft that the owner publishes. The formula bump is a helper the owner runs after publishing (`packaging/homebrew/bump.sh`), not a workflow step: the formula lives in this repository, and the release job does not push. (6) The release toolchains are pinned (Go 1.26.1, Rust 1.93.1), while check.yml tests with go.mod's 1.26.0 and Rust stable. (7) Files outside the list: the formatting-only Go and Rust files above, `rust-core/tests/index_query.rs` (the Linux gate below) and the new `packaging/homebrew/bump.sh`. (8) The Linux leg's glibc floor on ubuntu-22.04 (at most 2.35) follows from the build glibc but was not measured. (9) Byte reproducibility was verified on one machine, with a different path, `CARGO_HOME` and target directory. Across machines it needs the same runner image, because the C compiler and system libraries also shape the bytes. (10) The Go binaries stay static (CGO off, as in v0.1.0), so the prebuilt binaries have no PTY terminals. The caveats say so.
+- *Review round 1 (2026-09-28).* (Major) The formula was HEAD-only on macOS Intel and Linux arm64, where `brew install` refuses; the plan's claim that `determine_active_spec` falls back to head was wrong. Fixed as above; SimulateSystem shows stable 0.1.0 on all four pairs. (Minor) The glibc 2.39 floor: release.yml builds the Linux leg on ubuntu-22.04, and Linux x86_64 builds v0.1.0 from source. (Minor) Build paths and non-reproducible archives: the path remap and archive normalization above, verified byte-identical. (Minor) CGO off drops the PTY terminals: stated in the caveats, the Makefile comment and this record, and the binaries stay static. (Minor) The keep-data steps: the packet now stops the processes first and uses a new `mktemp -d` holding directory for each run. In a scratch clone it kept all 82 live files byte-identical, left `git status` clean and did not touch a leftover holding directory. (Minor) The cwd-relative data directory: a caveat line; the real fix belongs to WS-48.
+- *Formula bump helper (resumed session).* `sh packaging/homebrew/bump.sh vX.Y.Z [formula]` needs only sh, curl, shasum, sed and awk. It validates the tag with release.yml's anchored regex and reads the current version and the homepage from the formula. It downloads the release's `SHA256SUMS` and the tagged source tarball, and hashes the tarball. Each `url` line that names the current tag moves to the new tag, and the `sha256` line under it gets that url's checksum; the `version` line moves too. The head url names no tag and is left alone. Which platforms take an archive stays as the formula says, and the script names the release archives the formula does not use (for v0.1.0, the Linux x86_64 archive). It refuses, leaving the formula unchanged, when no url names the current tag, a url has no checksum in the release, a url is not followed by its `sha256` line, a checksum line is malformed or a download fails. Otherwise it prints the diff and writes the formula. On the current tag it changes nothing, so rerunning it checks the formula against the release. Tested against the real v0.1.0 release on the Mac (BSD sed and awk) and on the build box (GNU sed 4.9, gawk 5.3.2). On the formula it reports no change. A copy set back to 0.0.9 with zeroed checksums came back identical to the formula below its header comment. It refused each of these: a url renamed to a platform the release lacks, a missing `sha256` line after the first or the third url, a tag without the `v`, a tag with a space or a newline after a valid tag (grep alone matches per line, so a character check runs first), an unknown tag (curl 404), and a formula whose urls had moved past its `version` line. The formula's header comment no longer names a version and points at the helper; `brew style` still reports only the three cops that apply to files outside a tap.
+- *`make release-sums`.* The `SHA256SUMS` step now has one definition. `make release` runs it for the host's archive, and the publish job runs it after downloading both platforms' archives. It lists only `xmustard-<VERSION>-*` archives, sorted by name in the C locale, so older builds left in `dist/` stay out and the order does not depend on the runner's locale. Checked with scratch archives on the Mac: it wrote the two v9.9.9 lines and left a v9.9.8 archive out. It refused a tampered archive without writing `SHA256SUMS`, and it refused a version with no archives. The Linux dry run was repeated on the box, on the tree committed as 6a0f6dd, with the same `VERSION=v0.1.0-25-ga9689f8 SOURCE_DATE=202609280734.13`, and the archive came out byte-identical (`bf377ce4...`, as at a9689f8): no shipped Rust or Go source changed in between. `SHA256SUMS` held that one line. actionlint 1.7.12 (`go run` on the box) is clean on both workflows. shellcheck is still not installed, so the `run:` scripts are still not shellchecked.
+- *RSS test gate.* `index_query::resident_rss_on_a_100k_symbol_resolved_graph_stays_within_the_line` now carries `#[cfg_attr(not(target_os = "linux"), ignore = ...)]`. Linux is the reference for the RSS lines, and macOS's allocator measures above them, so the test failed only there. The test still compiles everywhere, so its helpers stay in use and raise no dead-code warnings, and `--ignored` still runs it on macOS for measurement. On the build box it is listed as a normal test and passed (index_query: 8 passed, 0 ignored, 319 s in the debug profile). The skip on macOS was not observed, because nothing is compiled on the Mac.
+- *Checks.* `xm-remote-check.sh ws-26 all -count=1` gave remote_exit=0 at 6607ea3. The run covered the Rust release build, all cargo tests, clippy at 6 warnings (the base count; none new), `go vet`, and all 14 Go packages. `actionlint` 1.7.12 is clean on the final workflows. Two earlier full runs each failed one test, `index_build::build_of_5000_files_has_no_file_cap_and_peaks_under_25_mib`, whose line is 25.0 MiB; a later run of that binary measured 25.2 MiB. That test already sits at the edge on the base. Five interleaved runs of the index_build binary each gave 24.5–24.8 MiB on base 845868d and 24.5–24.9 MiB on this branch, whose Rust changes are formatting only. The margin (about 0.2–0.5 MiB) belongs to the index-build owner (WS-07/WS-22); this branch does not change it. Review round 1: `xm-remote-check.sh ws-26 all -count=1` gave remote_exit=0 at 1424c27 (the Rust release build, 14 cargo test binaries, clippy at 6 warnings, `go vet`, and all 14 Go packages). The first full run of the round failed the same `index_build` RSS test, and cargo then stopped before the later test binaries. Four runs of that test alone on this branch measured 24.4–24.6 MiB. A second run was killed locally before it printed anything, and the third passed. `gofmt -l api-go` is clean, and actionlint 1.7.12 is clean on both workflows. Resumed session: `xm-remote-check.sh ws-26 all -count=1` gave remote_exit=0 on the tree of 5c6baba (the Rust release build, 14 cargo test binaries all passing, among them index_query with the RSS test run on Linux in 306 s and index_build's RSS test inside its line; clippy at 6 warnings, the base count; `go vet`; all 14 Go packages). An earlier full run in this session was cut off locally after the Rust half had passed (clippy 6) and is not counted. The C-locale sort (c3ee67b) came after it and touches only `release-sums`, which the Mac and the box each ran on scratch archives. `bump.sh` and `release-sums` were rechecked on the box with GNU tools after the hardening. `gofmt -l api-go` and `cargo fmt --check` are clean.
+
+**Owner approval packet (WS-26 untracking).** Approve by merging parity/ws-26, then running the script once in the checkout that will carry the commit (normally main), reviewing `git status`, and committing. The script does not commit. The 80 tracked files; the script checks the sha256 of this exact `git ls-files -- backend/data` output, `69cdc113b9eb9739dc124b364af651ea3d19fe3dde57a856bfab82bb66f0e329`:
+
+```text
+backend/data/metrics/run_697b588ec115.json
+backend/data/metrics/run_a84ff0803884.json
+backend/data/settings.json
+backend/data/workspaces.json
+backend/data/workspaces/co-titan-0a54108278/activity.jsonl
+backend/data/workspaces/co-titan-0a54108278/issue_overrides.json
+backend/data/workspaces/co-titan-0a54108278/runs/run_32370bf2aaf8.json
+backend/data/workspaces/co-titan-0a54108278/runs/run_32370bf2aaf8.log
+backend/data/workspaces/co-titan-0a54108278/runs/run_32370bf2aaf8.out.json
+backend/data/workspaces/co-titan-0a54108278/runs/run_40221c2d0946.json
+backend/data/workspaces/co-titan-0a54108278/runs/run_40221c2d0946.log
+backend/data/workspaces/co-titan-0a54108278/runs/run_40221c2d0946.out.json
+backend/data/workspaces/co-titan-0a54108278/runs/run_5d272d8663dd.json
+backend/data/workspaces/co-titan-0a54108278/runs/run_5d272d8663dd.log
+backend/data/workspaces/co-titan-0a54108278/runs/run_66c68561e0f1.json
+backend/data/workspaces/co-titan-0a54108278/runs/run_66c68561e0f1.log
+backend/data/workspaces/co-titan-0a54108278/runs/run_66c68561e0f1.out.json
+backend/data/workspaces/co-titan-0a54108278/runs/run_67ae394f1c46.json
+backend/data/workspaces/co-titan-0a54108278/runs/run_67ae394f1c46.log
+backend/data/workspaces/co-titan-0a54108278/runs/run_78afd02e4014.json
+backend/data/workspaces/co-titan-0a54108278/runs/run_78afd02e4014.log
+backend/data/workspaces/co-titan-0a54108278/runs/run_94383c0c8bb6.json
+backend/data/workspaces/co-titan-0a54108278/runs/run_94383c0c8bb6.log
+backend/data/workspaces/co-titan-0a54108278/runs/run_94383c0c8bb6.out.json
+backend/data/workspaces/co-titan-0a54108278/runs/run_9b4f78ace92d.json
+backend/data/workspaces/co-titan-0a54108278/runs/run_9b4f78ace92d.log
+backend/data/workspaces/co-titan-0a54108278/runs/run_a19e15e8fd2d.json
+backend/data/workspaces/co-titan-0a54108278/runs/run_a19e15e8fd2d.log
+backend/data/workspaces/co-titan-0a54108278/runs/run_b1264cb8286c.json
+backend/data/workspaces/co-titan-0a54108278/runs/run_b1264cb8286c.log
+backend/data/workspaces/co-titan-0a54108278/runs/run_b1264cb8286c.out.json
+backend/data/workspaces/co-titan-0a54108278/runs/run_b30bc80f20a7.json
+backend/data/workspaces/co-titan-0a54108278/runs/run_b30bc80f20a7.log
+backend/data/workspaces/co-titan-0a54108278/runs/run_b874350b2178.json
+backend/data/workspaces/co-titan-0a54108278/runs/run_b874350b2178.log
+backend/data/workspaces/co-titan-0a54108278/runs/run_cf0f12a1f443.json
+backend/data/workspaces/co-titan-0a54108278/runs/run_cf0f12a1f443.log
+backend/data/workspaces/co-titan-0a54108278/runs/run_ea4bf722c9b2.json
+backend/data/workspaces/co-titan-0a54108278/runs/run_ea4bf722c9b2.json.ba5dfb6a4e2f43488feb1407694db46d.tmp
+backend/data/workspaces/co-titan-0a54108278/runs/run_ea4bf722c9b2.log
+backend/data/workspaces/co-titan-0a54108278/runs/run_f3d9bfe1d3da.json
+backend/data/workspaces/co-titan-0a54108278/runs/run_f3d9bfe1d3da.log
+backend/data/workspaces/co-titan-0a54108278/runs/run_f3f97e5aca1c.json
+backend/data/workspaces/co-titan-0a54108278/runs/run_f3f97e5aca1c.log
+backend/data/workspaces/co-titan-0a54108278/runs/run_f3f97e5aca1c.out.json
+backend/data/workspaces/co-titan-0a54108278/runs/run_ff4a98496e93.json
+backend/data/workspaces/co-titan-0a54108278/runs/run_ff4a98496e93.log
+backend/data/workspaces/co-titan-0a54108278/saved_views.json
+backend/data/workspaces/co-titan-0a54108278/snapshot.json
+backend/data/workspaces/co-titan-0a54108278/terminals/term_8b530a4ecfc6.log
+backend/data/workspaces/co-titan-0a54108278/terminals/term_d3a76fb1df5c.log
+backend/data/workspaces/repo-2d5d3dd8af/activity.jsonl
+backend/data/workspaces/repo-2d5d3dd8af/fix_records.json
+backend/data/workspaces/repo-2d5d3dd8af/issue_overrides.json
+backend/data/workspaces/repo-2d5d3dd8af/runs/run_smoke_fix.json
+backend/data/workspaces/repo-2d5d3dd8af/runs/run_smoke_fix.log
+backend/data/workspaces/repo-2d5d3dd8af/snapshot.json
+backend/data/workspaces/repo-2d5d3dd8af/tracker_issues.json
+backend/data/workspaces/repo-30ecdc5685/activity.jsonl
+backend/data/workspaces/repo-30ecdc5685/fix_records.json
+backend/data/workspaces/repo-30ecdc5685/issue_overrides.json
+backend/data/workspaces/repo-30ecdc5685/runs/run_smoke_fix.json
+backend/data/workspaces/repo-30ecdc5685/runs/run_smoke_fix.log
+backend/data/workspaces/repo-30ecdc5685/snapshot.json
+backend/data/workspaces/repo-30ecdc5685/tracker_issues.json
+backend/data/workspaces/repo-4d73ffdc46/activity.jsonl
+backend/data/workspaces/repo-4d73ffdc46/fix_records.json
+backend/data/workspaces/repo-4d73ffdc46/issue_overrides.json
+backend/data/workspaces/repo-4d73ffdc46/snapshot.json
+backend/data/workspaces/repo-4d73ffdc46/tracker_issues.json
+backend/data/workspaces/repo-cb6493e598/activity.jsonl
+backend/data/workspaces/repo-cb6493e598/snapshot.json
+backend/data/workspaces/repo-cb6493e598/tracker_issues.json
+backend/data/workspaces/repo-d56ef7ff29/activity.jsonl
+backend/data/workspaces/repo-d56ef7ff29/fix_records.json
+backend/data/workspaces/repo-d56ef7ff29/issue_overrides.json
+backend/data/workspaces/repo-d56ef7ff29/runs/run_smoke_fix.json
+backend/data/workspaces/repo-d56ef7ff29/runs/run_smoke_fix.log
+backend/data/workspaces/repo-d56ef7ff29/snapshot.json
+backend/data/workspaces/repo-d56ef7ff29/tracker_issues.json
+```
+
+The script (run it with `sh`; it needs git and shasum):
+
+```sh
+#!/bin/sh
+# WS-26: stop tracking the runtime files under backend/data. Run it in the checkout that
+# will carry the commit, after the owner approves. git rm --cached changes the index only:
+# every file stays on disk, and the backend/data/ rule in .gitignore keeps them out of
+# later commits. It refuses unless the tracked set is exactly the recorded list.
+set -eu
+cd "$(git rev-parse --show-toplevel)"
+
+expected_sha=69cdc113b9eb9739dc124b364af651ea3d19fe3dde57a856bfab82bb66f0e329 # of the 80-path list
+actual_sha=$(git ls-files -- backend/data | shasum -a 256 | cut -d ' ' -f 1)
+if [ "$actual_sha" != "$expected_sha" ]; then
+  echo "refusing: the tracked backend/data files differ from the WS-26 list (git ls-files -- backend/data)" >&2
+  exit 1
+fi
+if ! git check-ignore -q --no-index backend/data/settings.json; then
+  echo "refusing: .gitignore does not ignore backend/data/ (merge parity/ws-26 first)" >&2
+  exit 1
+fi
+if ! git diff --cached --quiet; then
+  echo "refusing: the index already has staged changes; commit or unstage them first" >&2
+  exit 1
+fi
+
+git rm -r --cached --quiet -- backend/data
+
+# Nothing under backend/data stays tracked, all 80 paths are staged as deletions, and no
+# runtime file shows up as untracked.
+test -z "$(git ls-files -- backend/data)"
+test "$(git diff --cached --name-only --diff-filter=D -- backend/data | wc -l | tr -d ' ')" = 80
+if git status --porcelain --untracked-files=all -- backend/data | grep -q '^??'; then
+  echo "unexpected: untracked files under backend/data; check .gitignore" >&2
+  exit 1
+fi
+echo "80 files leave the index and stay on disk. Review 'git status', then commit:"
+echo "  git commit -m 'chore(data): stop tracking backend/data runtime files (WS-26)'"
+```
+
+In every other checkout or worktree whose `backend/data` holds runtime data you want to keep, do this before pulling the untrack commit. Git deletes files that a pulled commit stops tracking, and it refuses the pull while tracked copies differ from HEAD. First stop `xmustard-api`, `xmustard-mcp`, `xmustard-ops` and anything else that writes to this checkout's `backend/data`: the API writes by path and creates missing directories, so a write after the `mv` lands in the restored copy and is lost. Then run this with `sh` from the checkout root:
+
+```sh
+set -eu
+keep=$(mktemp -d ../xmustard-backend-data.XXXXXX)   # a new directory for each run
+echo "live data held in $keep/data until this finishes"
+mv backend/data "$keep/data"                        # move the live data out of git's way
+git checkout HEAD -- backend/data                   # restore the tracked copies, unmodified
+git pull                                            # the untrack commit deletes those copies
+rm -rf backend/data && mv "$keep/data" backend/data && rmdir "$keep"
+```
+
+`mktemp -d` makes a new holding directory beside the checkout (normally the same filesystem, so `mv` renames), and worktrees that share a parent directory never reuse one. If a step fails, `set -e` stops the run and the data stays in the printed directory.
 
 ### WS-27 — Dedupe, code anchors, tiered conflicts and structured claims
 
@@ -1810,3 +2006,117 @@ Adopted per the critic's reduced plan in requirements §13.6. No tenth MCP tool.
 
 Budget: review features sit behind a profile/build tag that is off in the lean default until gate v2 (WS-10) shows headroom.
 
+
+### WS-65 — Deterministic finding anchoring (OCR port)
+
+Port open-code-review's resolver, hunk parser and re-filing (Apache-2.0, with a NOTICE and upstream's SPDX lines kept). It anchors a quoted snippet to the new or old side of a hunk, re-files a snippet to another changed file, runs a partial Ground-A check and bounds existing_code at 40 lines or 4 KB. It ships as a library for WS-27 (quoted-code anchors) and WS-28 (re-anchoring). Findings arrive through an evidence_handle or a findings file, never as nested MCP arrays. There is no tenth tool, and review features sit behind a profile or build tag that is off in the lean default. Requirements: PAR-REV-04 and PAR-REV-05, as corrected by the critic in requirements §13.6 (the WS-65 line).
+
+**Implementation record (branch parity/ws-65, 2026-09-28).** These notes record what was built and measured, and where it differs from the text above. The source was the local clone `research/open-code-review` at 486022d (`internal/diff/hunk.go`, `resolver.go`, `relocation.go`, `parser.go`, `internal/llmloop/loop.go:708-768` and their tests).
+- *Library (`api-go/internal/anchor`).*
+  - `NewSnippet` normalizes quoted code as upstream: each line trimmed, one leading `+` and one leading `-` stripped, blank lines dropped. It refuses code over 40 lines or 4,096 bytes (`snippet_too_large`) and code with no non-blank line (`no_snippet`).
+  - `NewFile(old, new, diff, head)` parses one file's hunks once. `File.Resolve` walks a table of three tiers: the hunks' new side (`exact_new`), their old side (`exact_old`), then the whole file at head (`file`), whose content is loaded on first need.
+  - The first tier holding the snippet decides. One match anchors it; several are `unanchored` with reason `ambiguous` and a candidate count.
+  - Matching is Knuth-Morris-Pratt over normalized lines, so one search costs at most two line comparisons per line searched, whatever the snippet repeats. A randomized test checks it against upstream's sliding window.
+  - A head the caller did not read (over a bound, binary) was never searched. A snippet no hunk holds is then `unanchored` with reason `head_unread`, never `not_found`, and `Anchor.Unchecked` reports it.
+  - `Set.PlaceAll` (and `Set.Place` for one snippet) follows upstream's order. It tries each finding's own file, then re-files a snippet that file does not hold (`relocated`, with `refiled_from`) only when exactly one other changed file holds it. Zero gives `not_found`; two or more give `ambiguous_across_files`. A snippet whose own file is `head_unread` is not re-filed, and while another file's head is unread no hit is unique, so the result is `head_unread`.
+  - `PlaceAll` tries every finding's own file before it re-files any, and re-filing first reads each changed file's head in diff order. Under a shared head budget, the files the findings name are read first, and re-filing sees the same heads whatever order the findings come in.
+  - A finding filed against a file the change does not touch is looked for in that file at head first, through the caller's `Set.Outside` (the whole-file tier, as `Locate`), and only then re-filed. It anchors with status `file`, and `in_scope` and `in_changed_hunk` are `no`. `Outside` is called once per path, and the file's normalized lines are kept for the next finding on it.
+  - A `Set` looks a path up at head before it looks it up as an old path. When a renamed file's old name is a new file's path in the same change, a finding on that name is the new file's in either diff order, and `Touches` finds an old-side anchor's file by its side.
+  - `Set.Touches` answers `in_changed_hunk`: does the anchored range hold an added line on the new side, or a deleted line on the old side (blank lines included)?
+  - `Locate(path, content, snippet)` is the memory quoted-code anchor for WS-27. `Reanchor(prev, content, snippet)` is refs_stale re-anchoring for WS-28: one match moves the anchor, and among several matches the one still at the previous line keeps it.
+  - Every anchor carries a status, a side, a reason, a candidate count and `refiled_from`. The package reads no file and runs no git.
+- *Changes from upstream.* Each ported file's header lists its changes.
+  - Several matches anchor nothing. Upstream takes the first match, so its two "first match wins" tests now expect `ambiguous`.
+  - Hunk sides skip blank lines, as the whole-file pass already did. A snippet that spans a blank line inside a hunk now anchors there instead of falling through to the file tier.
+  - A hunk ends when its header's line counts are used up. A trailing newline no longer adds an empty context line (upstream's CRLF test expected one), and text after a hunk is not read as part of it.
+  - A file outside the change is searched at head before re-filing. Upstream holds no diff for such a file and re-files at once, so code that is in the file the comment names is reported absent; PAR-REV-05's `code_present` asks about the subject file at head.
+  - An old-side anchor names a renamed file's old path.
+  - During re-filing, each other file places the snippet with `Resolve`, as if the finding had been filed there. The first tier holding it decides, so a hunk match counts once even when the same code also sits elsewhere in that file at head, which is the rule a finding's own file follows. A file where the deciding tier holds the snippet several times counts all of them toward the cross-file total, so it cannot make a hit elsewhere look unique.
+  - Matching is Knuth-Morris-Pratt instead of a sliding window, with the same matches.
+  - An unread head is `head_unread`, not an empty file, and re-filing counts it as a possible home.
+  - `PlaceAll` anchors a batch in two passes, own files first.
+  - A path at head wins over another file's old path. Upstream's `diffByPath` lets whichever file comes later in the diff take a shared name.
+  - The model re-location step (`relocation.go`) is not ported, as PAR-REV-04 says.
+- *Findings (`api-go/internal/review`).*
+  - `Decode` accepts three shapes: a JSON array, `{"findings": [...]}`, or open-code-review's `--format json --output` file, from which it takes `comments` and ignores the rest of the envelope. Either array may arrive as a JSON string; it is decoded once and the repair is recorded.
+  - The item schema is closed: xMustard's fields plus OCR's `start_line`, `end_line` and `thinking`. `thinking` is dropped and counted.
+  - Member names are read exactly. Go's `encoding/json` matches a name in any case (Unicode folding included) and lets the last repeat win, so an item member, or an envelope's `findings` or `comments`, written in another case or repeated refuses the input. Another reader of the same bytes, which `source.sha256` names, then sees the same findings. The names come from the item type's tags.
+  - The whole input is refused when it is over 4 MiB, holds more than 50 findings, or any finding has an unknown member, a wrong type, no content, or a path that is empty, absolute, escaping or contains a NUL.
+  - Other problems are recorded on the finding, which is kept:
+    - an unknown category or severity becomes `other` or `low`, and case is folded;
+    - content over 2,000 characters is cut;
+    - an existing_code or suggestion_code over the snippet bound is dropped, and the finding is `unanchored` with `snippet_too_large`;
+    - when the producer's own line range differs from the anchor, the note says the anchor replaced it.
+  - `SplitDiff` splits git diff output into files. A path comes from the `---`/`+++` lines (C-quoted names decoded, `/dev/null` for the missing side, git's trailing tab after a name with a space dropped). A binary or mode-only file takes its path from its `diff --git` line.
+  - `Anchor` places every finding with `PlaceAll` and computes its checks. Each check is `yes`, `no` or `unknown`:
+    - `code_present`, a partial Ground A: the quoted code is in the file the finding is filed or re-filed against, at head or on the old side. OCR's Ground A, judged by a model, asks whether the code is absent from the subject file's diff.
+    - `in_changed_hunk`.
+    - `in_scope`: the file is in the diff.
+    - `symbol_resolved`, always `unknown`.
+
+    A finding that fails `code_present` is labeled `unsupported` and kept. When a head the answer needed was not read (`head_unread`), `code_present` and `in_changed_hunk` are `unknown` and the finding is `unchecked`, never `unsupported`. Counts are given per status (`by_status`) and per support label (`by_support`).
+- *Surface: the `review` build tag, off by default.*
+  - `workspaceops.AnchorReviewFindings(ctx, dataDir, ws, base, head, batch)` anchors against the change merge approval digests. `observeChange` tees the hardened WS-57 diff from the merge base of `base` to `head` into the anchoring, so the result's `change.diff_sha256` equals what `review approve` binds. The tests check that equality.
+  - Head content for the whole-file tier comes from one `git cat-file --batch`. It runs under the same git isolation (now `reviewGitCommand`, shared with `reviewGit`) and starts only when a snippet reaches that tier. The same reader is `Set.Outside`: a path a finding names is resolved in head's tree (`<head>:<path>`, a cleaned repository-relative path), never on disk, and a path head does not hold is counted in `head_reads.missing`.
+  - Bounds: the diff text at 8 MiB and 262,144 lines (over either the anchoring is refused, since this command takes no heavy slot), one file at head at 1 MiB, and all head content at 16 MiB and 524,288 lines. A file over a head bound, a binary file, or a name the batch protocol cannot carry is searched in its hunks only, `head_reads` lists it, and a finding it could decide is `head_unread` and `unchecked`. The line bounds exist because memory and search time grow with lines, not bytes: a parsed line costs 24 bytes, or 48 for a context line, which is on both sides of its hunk.
+  - A failed head read fails the anchoring rather than return anchors that needed it.
+  - `close` stops the batch reader before it waits. After a malformed answer, the reader may still be writing output nobody reads, and the wait would otherwise last until the 2-minute timeout.
+  - `xmustard-ops review anchor <ws> --base REF [--head REF] (--findings FILE | --evidence HANDLE [--token-file PATH])` prints the change, source, files, findings with anchors and checks, counts, normalizations, head reads and the label `evidence only: ... no review result approves a change`. It stores nothing.
+  - An evidence handle is read the way the evidence store checks it:
+    - in open mode (no token store), at workspace scope;
+    - otherwise a valid token is required (`--token-file`, then `XMUSTARD_API_TOKEN`), and it must not be presence-only and must be scoped to the workspace. The read is then that principal's, so only its own captures are readable.
+
+    An original over 4 MiB is refused.
+- *Off by default.*
+  - `go list -deps` finds neither package in the default `xmustard-api`, `xmustard-mcp` or `xmustard-ops`.
+  - With `-tags review`, `xmustard-ops` grows by 123,800 bytes (25,069,968 to 25,193,768). `xmustard-api` grows by 11,136 bytes, because it links workspaceops' tagged file, which nothing in the API calls. Re-measured on the merged base in the third session: `xmustard-ops` grows by 123,904 bytes (25,241,496 to 25,365,400) and `xmustard-api` by 7,472 bytes (31,075,608 to 31,083,080).
+  - `review` usage now lists the registered subcommands. An untagged test asserts that `review anchor` is absent.
+  - `make check-backend` (and AGENTS.md) now also runs `go vet -tags review` and the tagged `Review|Merge` tests on `cmd/xmustard-ops` and `internal/workspaceops`.
+  - No MCP tool, argument or tools/list byte changed.
+- *Licensing.* This is the repository's first Apache-2.0 code:
+  - `NOTICE` is new. It states that the repository is mixed-licence and that a file without an SPDX header is MIT, and names the translated files and upstream commit.
+  - `third_party/open-code-review/LICENSE` is upstream's licence text.
+  - Each ported file, tests included, keeps `SPDX-License-Identifier: Apache-2.0` and upstream's copyright line, adds xMustard's, and lists its changes. The package's own files carry `SPDX-License-Identifier: MIT`.
+  - README gains a License section.
+- *Fixtures.* `anchor/testdata/fixtures.json` holds 26 deterministic cases, with no model, git or clock:
+  - CRLF in the diff, the snippet and the head content;
+  - ambiguity across two hunks, in the whole file and across files;
+  - every tier, a hunk match beating the same code elsewhere, a blank line inside a hunk;
+  - deleted and added files, re-filing (including from a file outside the change, and by the deciding tier of the other file);
+  - heads that were not read: `head_unread` in the file itself, a hunk match without the head, and no re-filing while another file's head is unread;
+  - indentation versus interior spacing, the 40-line bound either side, a blank snippet.
+
+  Upstream's hunk, resolver and relocation tests are ported in table form.
+- *Measured (build box: Linux, 6 cores).*
+  - `BenchmarkPlace` parses a 200-file change (300 lines at head each) and anchors 50 snippets: most in a hunk, a fifth only at head, and a tenth in no file, so re-filing reads every head. It took 4.6 to 5.9 ms per op at `eadf3dd` and 4.8 to 6.2 ms at `448f718`, with 3.6 MB and 7,620 allocations either way (3 runs of 20 each).
+  - `BenchmarkReviewAnchor` runs end to end over 200 files of 300 lines with two lines edited in each. Per anchoring it runs two `rev-parse`, one `merge-base`, one diff of 113,708 bytes, and one `cat-file` that reads 1,631,460 bytes, which is every head, because 5 of the 50 findings are found nowhere. It took 46.3 to 48.3 ms per op at `eadf3dd` and 41.3 to 42.5 ms at `448f718`, with 8.4 MB and about 14,400 allocations either way (3 runs of 10 each). Every finding there names a changed file, so `Set.Outside` is never called.
+  - Third session: `BenchmarkPlace` took 5.4 to 6.5 ms per op, with 3.65 MB and about 7,645 allocations (3 runs of 20). `BenchmarkReviewAnchor` took 40.8 to 43.5 ms per op, with 8.37 MB and about 14,420 allocations (4 runs of 10), at a box load average of about 7 on 6 cores. An earlier run at a higher load measured 55 ms, with the same bytes and allocations.
+  - Fourth session (review round 1), the worst case at the bounds. `BenchmarkPlaceAtTheBounds` builds 16 files at every bound: a diff of 262,144 lines and 8 MiB, all context, and 524,288 head lines and 16 MiB. Every line is the same 31 bytes, and 50 findings of 39 such lines and one other are found nowhere, so each searches every side and head. A sliding window would compare 40 lines at every line. It took 861 to 872 ms per op, allocated 83 MB and 1,455 objects, and kept 50.3 MiB live once the findings were placed (3 runs of 10, box load about 10). Before the fix, the reviewer's probe, with the byte bounds only and 2-byte lines, used about 280 MB of heap and 1.3 s for the first finding and 52 s for 49 more. Preallocating each hunk side, capped by the lines the hunk holds, took the allocation from 126 MB to 83 MB. `BenchmarkPlace` took 4.8 to 6.5 ms with 2.1 MB and about 5,895 allocations (3 runs of 10). `BenchmarkReviewAnchor` took 47.5 to 50.4 ms with 6.7 MB and about 10,620 allocations, against 46.7 to 48.6 ms with 8.35 MB and about 14,420 for the previous commit run back to back under the same load (load about 15). Runs of one version at a time at that load measured 98 to 154 ms for this commit and 103 to 113 ms for the previous one, so the time is git under contention.
+  - The anchoring runs in the short-lived ops process, not the daemon. The ledger line is 0, with a note that records the worst case above, which WS-67 must re-measure before it moves anchoring into the daemon.
+- *Checks.*
+  - The full Linux gate passes at `eadf3dd` with `remote_exit=0`: `xm-remote-check.sh all -count=1` runs the Rust release build, tests and clippy, then go vet and every Go package. Clippy reports 6 warnings, the same as the base; no Rust code changed.
+  - `go vet -tags review` and the tagged `Review|Merge` tests pass on `cmd/xmustard-ops` and `internal/workspaceops`.
+  - The bench unit tests pass (74 run, 3 skipped). The ledger consistency test now expects WS-65 after WS-63.
+  - Second session (`d0267cd`, `448f718`): `feat/parity-v2` at `845868d` (the WS-15 watcher, the v0.1.0 release notes and the Homebrew formula) was merged. It touched the architecture map, this plan, the budget ledger and its test, and merged cleanly: the ledger keeps WS-15's note and WS-65's line. The full Linux gate then passed at `448f718` with `remote_exit=0`: every Rust test binary and Go package green, 6 clippy warnings (the base's count). `go vet -tags review`, the tagged `Review|Merge` tests, the untagged `Review|Approval` ops tests and the bench unit tests (76 run, 3 skipped) pass, and `go list -deps` still finds neither package in the three default binaries.
+  - Third session (`09d2692`): a pre-review pass fixed three defects. First, a renamed file's old name that a new file reuses in the same change found whichever file came later in the diff. Second, repeated findings on one file outside the change read it at head each time, spending the 16 MiB head bound, so later findings on a large file became unsupported. Third, `close` could wait out the 2-minute timeout after a malformed batch answer. New tests: the reused name in both orders, `Outside` asked once per path, three findings on one outside file under a head bound that fits it once, and a presence-only token refused for an evidence read. `feat/parity-v2` had not moved from `845868d`. The full Linux gate passed with `remote_exit=0`: every Rust test binary and Go package green, including `internal/anchor` and `internal/review`, and 6 clippy warnings (the base's count). `go vet -tags review`, the tagged `Review|Merge` tests, the untagged `Review|Approval` ops tests and the bench unit tests (76 run, 3 skipped) pass, and `go list -deps` finds neither package in `xmustard-api`, `xmustard-mcp` or `xmustard-ops`.
+  - Fourth session, review round 1 (`75b251c`, `8674508`, merge `bb5185c`): the four findings were fixed as recorded above. Mutation runs on the build box show each fix is guarded by a test. These fail at least one test each: placing in one pass (the end-to-end order test included), re-filing past an unread head, reading an unread head as not found, decoding without exact member names, and dropping either line bound. `feat/parity-v2` had moved from `845868d` to `db04d40` (WS-26 release packaging, WS-FIX-04 client adapters). It touched the Makefile, README, the architecture map and this plan beside WS-65's lines, and merged cleanly. The full Linux gate then passed with `remote_exit=0`: every Rust test binary and Go package green, 6 clippy warnings (the base's count). Two earlier gate runs, at a box load of about 15, each failed one Rust memory test that this branch does not touch; its Rust tree is identical to `feat/parity-v2`. The tests were the snapshot-swap generations check in `index_query` and the 25 MiB build peak in `index_build`. Run alone, both passed (peak 17.1 MiB). `go vet -tags review`, the tagged `Review|Merge` tests, the untagged `Review|Approval` ops tests and the bench unit tests (76 run, 3 skipped) pass, and `go list -deps` finds neither package in `xmustard-api`, `xmustard-mcp` or `xmustard-ops`.
+- *Files.*
+  - New:
+    - `api-go/internal/anchor/`: `hunk.go`, `resolve.go` and `relocate.go` and their tests (Apache-2.0), plus `locate.go`, `doc.go`, `anchor_test.go` and `testdata/fixtures.json`;
+    - `api-go/internal/review/`: `findings.go`, `diffsplit.go`, `check.go` and `review_test.go`;
+    - `workspaceops/review_anchor.go` and its test, and `xmustard-ops/review_anchor.go` and its test, all under the review tag, plus `xmustard-ops/review_default_test.go`;
+    - `NOTICE` and `third_party/open-code-review/LICENSE`.
+  - Changed:
+    - `workspaceops/merge_approval.go`: `observeChange` and `reviewGitCommand`, with no behaviour change;
+    - `xmustard-ops/approval.go`: the usage lists the registered review subcommands;
+    - `Makefile`, `AGENTS.md`, `README.md`, `docs/ARCHITECTURE.md`, the PAR-REV-04 and PAR-REV-05 rows of the requirements, `scripts/bench/budget_ledger.json` and its test.
+- *Deviations.*
+  - **Go, not Rust.** The integrator's §13.6 proposal put the anchoring in `rust-core/src/review/`. The critic's binding WS-65 correction exposes it as a library for WS-27 and WS-28, which are Go. A Go-to-Go port keeps upstream's SPDX lines and structure, and anchoring is pure string work that needs no index. A Rust diff module (WS-64 folded into WS-35) can pass its diff text to it, or port the fixtures.
+  - **One diff mode.** Only range mode is supported: the merge base of `--base` to `--head`, the change merge approval binds. Workspace, staged and commit modes belong to WS-64/WS-35. A deleted file is anchored on its old side only.
+  - **Evidence, not stored.** Nothing is persisted, and `verify` does not take findings yet. WS-66 owns the store; WS-67 owns the scalar `verify(subject='change', evidence_handle|findings_file)` transport, and must confine a findings-file path, which the operator CLI takes as given.
+  - **`symbol_resolved` stays `unknown`.** The library runs no index query, so WS-67/WS-68 fill it from the resident index. `in_scope` means "in the diff": the REV-02 selection and its exclusion reasons do not exist yet.
+  - **Kept, not refused.** Content over 2,000 characters is cut rather than refused, and an oversized existing_code drops the snippet but keeps the finding. Both are recorded, so one long OCR comment does not reject a batch.
+  - **Operator reads.** The ops CLI reads the evidence store directly, as every ops command reads the data directory. It authorizes the read as a token's principal only when auth is configured.
+  - **Checks can be unknown.** PAR-REV-05 defines `code_present` as present or absent. A head over a bound was never searched, so for a finding it could decide `code_present` and `in_changed_hunk` are `unknown` and the support label is `unchecked`. All four checks are now `yes`, `no` or `unknown` strings, where `code_present`, `in_changed_hunk` and `in_scope` were booleans; nothing consumes them yet (WS-66 and WS-67 do).
+  - **Order still decides which named heads fit.** Every finding's own file is read before any re-filing, in finding order. When the heads the findings name pass the 16 MiB or 524,288-line budget by themselves, the later ones are `head_unread`, which is unknown, never a false fact.
+  - **Re-filing keeps the tier rule.** The review asked either to count every occurrence in a candidate file or to correct the text. The text is corrected: a candidate file places the snippet as a finding filed against it would, so a hunk match beats the same code elsewhere in that file, the rule the fixture `a hunk match wins over the same code elsewhere in the file` sets for a finding's own file. A new fixture pins the re-filing case.

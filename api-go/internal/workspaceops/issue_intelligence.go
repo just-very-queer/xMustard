@@ -45,14 +45,14 @@ type DuplicateMatch struct {
 }
 
 type TriageSuggestion struct {
-	IssueID          string   `json:"issue_id"`
-	WorkspaceID      string   `json:"workspace_id"`
-	SuggestedSeverity *string `json:"suggested_severity"`
-	SuggestedLabels  []string `json:"suggested_labels"`
-	SuggestedOwner   *string  `json:"suggested_owner"`
-	Confidence       float64  `json:"confidence"`
-	Reasoning        string   `json:"reasoning"`
-	CalculatedAt     string   `json:"calculated_at"`
+	IssueID           string   `json:"issue_id"`
+	WorkspaceID       string   `json:"workspace_id"`
+	SuggestedSeverity *string  `json:"suggested_severity"`
+	SuggestedLabels   []string `json:"suggested_labels"`
+	SuggestedOwner    *string  `json:"suggested_owner"`
+	Confidence        float64  `json:"confidence"`
+	Reasoning         string   `json:"reasoning"`
+	CalculatedAt      string   `json:"calculated_at"`
 }
 
 type TestSuggestion struct {
