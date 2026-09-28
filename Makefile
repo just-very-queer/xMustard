@@ -10,7 +10,7 @@ BINDIR := $(PREFIX)/bin
 .PHONY: build install relay backend backend-platform go-api frontend go-api-build rust-core-check \
 	rust-core-scan migration-check dev build-ui scan check check-backend check-frontend
 .PHONY: bench-test bench-gate bench-parity bench-retrieval
-.PHONY: release
+.PHONY: release release-sums
 
 build:
 	cd rust-core && cargo build --release --bin xmustard-core --bin xmustard-relay
@@ -35,12 +35,12 @@ relay:
 # and relay with cargo --locked and the Go binaries with -trimpath and CGO off (static, so
 # the platform profile's PTY terminals, which need cgo, are unavailable in them), checks
 # that the built binaries start, and writes $(DIST)/xmustard-<version>-<os>-<arch>.tar.gz
-# (the five binaries and LICENSE) with its .sha256. The tag workflow
-# (.github/workflows/release.yml) runs it once per platform. RUSTFLAGS and CFLAGS (for the
-# C in tree-sitter and SQLite) are replaced so the binaries hold no build-machine paths
-# (the checkout becomes ., CARGO_HOME /cargo), and every archive entry gets the commit's
-# time, a fixed mode and owner 0, so a rebuild of a commit with the same toolchains gives
-# the same archive bytes.
+# (the five binaries and LICENSE) with its .sha256, then SHA256SUMS (release-sums). The
+# tag workflow (.github/workflows/release.yml) runs it once per platform. RUSTFLAGS and
+# CFLAGS (for the C in tree-sitter and SQLite) are replaced so the binaries hold no
+# build-machine paths (the checkout becomes ., CARGO_HOME /cargo), and every archive entry
+# gets the commit's time, a fixed mode and owner 0, so a rebuild of a commit with the same
+# toolchains gives the same archive bytes.
 DIST ?= dist
 VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 SOURCE_DATE := $(shell TZ=UTC0 git log -1 --format=%cd --date=format-local:%Y%m%d%H%M.%S 2>/dev/null)
@@ -67,7 +67,14 @@ release:
 		-cf "$(RELEASE_NAME).tar" "$(RELEASE_NAME)" $(RELEASE_FILES:%=$(RELEASE_NAME)/%)
 	cd "$(DIST)" && gzip -n -9 "$(RELEASE_NAME).tar"
 	cd "$(DIST)" && shasum -a 256 "$(RELEASE_NAME).tar.gz" > "$(RELEASE_NAME).tar.gz.sha256"
-	cat "$(RELEASE_DIR).tar.gz.sha256"
+	$(MAKE) --no-print-directory release-sums VERSION="$(VERSION)" DIST="$(DIST)"
+
+# $(DIST)/SHA256SUMS for every platform archive of $(VERSION) in $(DIST), each checked
+# against its .sha256 first. The tag workflow runs it once both platforms' archives are in.
+release-sums:
+	cd "$(DIST)" && shasum -a 256 -c xmustard-$(VERSION)-*.tar.gz.sha256 && \
+		cat xmustard-$(VERSION)-*.tar.gz.sha256 | sort -k 2 > SHA256SUMS
+	cat "$(DIST)/SHA256SUMS"
 
 # The API defaults to the core profile (the nine tools, memory, evidence, auth).
 # The UI calls platform routes, so the UI targets start it with XMUSTARD_PROFILE=platform.

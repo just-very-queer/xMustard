@@ -114,11 +114,9 @@ jobs:
           path: dist
           merge-multiple: true
       - name: Verify the checksums and write SHA256SUMS
-        working-directory: dist
-        run: |
-          shasum -a 256 -c ./*.tar.gz.sha256
-          cat ./*.tar.gz.sha256 | sort -k 2 > SHA256SUMS
-          cat SHA256SUMS
+        env:
+          TAG: ${{ github.ref_name }}
+        run: make release-sums VERSION="$TAG"
       # Release notes come from docs/releases/<tag>.md when it exists. `gh release create`
       # fails if the release already exists, so a re-pushed tag never replaces assets.
       - name: Create the draft release
