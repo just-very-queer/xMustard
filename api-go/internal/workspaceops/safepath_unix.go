@@ -45,6 +45,10 @@ func openWorkspaceFileBeneath(root, rel string) (*os.File, error) {
 	}
 
 	parts := strings.Split(filepath.Clean(rel), string(filepath.Separator))
+	// opened, not cur == rootFd, says a component was opened: closing the parent
+	// before the next open lets the kernel hand a later component the root's old fd
+	// number, which made every two-component path look like the root.
+	opened := false
 	for i, part := range parts {
 		if part == "" || part == "." {
 			continue
@@ -67,10 +71,10 @@ func openWorkspaceFileBeneath(root, rel string) (*os.File, error) {
 			}
 			return nil, err
 		}
-		cur = next
+		cur, opened = next, true
 	}
 
-	if cur == rootFd {
+	if !opened {
 		// rel cleaned to "." — that's the root directory, not a file.
 		closeCur()
 		return nil, errEmptyPath
