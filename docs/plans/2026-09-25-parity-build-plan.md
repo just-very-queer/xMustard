@@ -972,6 +972,161 @@ No Rust or git spawn happens per hook.
 
 **Collision risk.** .gitignore and the Makefile were modified in the diagnostics session's older tree. Coordinate. Do not edit README.md or docs/STATUS.md.
 
+**Implementation record (branch parity/ws-26, 2026-09-28).**
+- *Untracking: prepared for the owner, not run.* `git ls-files -- backend/data` lists 80 files (4.6 MB), the runtime state of a March–April 2026 install: `settings.json`, `workspaces.json`, two `metrics/run_*.json` files and six workspace directories (snapshots, activity logs, run records and logs, terminal logs, and a stray `run_ea4bf722c9b2.json.<hex>.tmp` from an interrupted write). 39 of them contain absolute `/Users/...` paths. A scan for credential shapes (OpenAI, GitHub, AWS and Slack token prefixes, private-key headers) found none. No code or test reads these files. The Go tests that name `backend/data` create it under `t.TempDir()`, the Rust tests use synthetic paths, and the API creates the directory on its first write. `git rm --cached` leaves the files in history; rewriting history is a separate owner decision. The owner approval packet below holds the list, the script and the procedure for other checkouts.
+- *The matching `.gitignore` change* is on this branch, additive: `backend/data/` (the older per-directory rules stay). Git does not apply ignore rules to tracked files, so until the script runs the 80 files stay tracked and runtime edits to them still show in `git status`. New runtime files (`govstore.db`, new workspaces) no longer show. The other additions are `/dist/` (release output), `!docs/releases/` (release notes are a curated public entry point) and `api-go/xmustard-eval` (the one Go binary the list missed). Nothing was removed, and nothing is appended at the end of the file, where the diagnostics branch appends its block.
+- *The script, checked in scratch clones of this branch.* It staged exactly 80 deletions and left all 80 files on disk. It refused a second run, an extra tracked file under backend/data, a `.gitignore` without the rule, and an index with a staged change. A second clone held live data: two tracked files modified, plus `govstore.db` and a new workspace directory. A plain merge of the untrack commit there refused because of the modified files. The procedure below then kept all 82 files byte-identical (sha256 of every file before and after) and left `git status` clean.
+- *Clean clone.* A fresh clone of the simulated untrack commit has no `backend/data`; `backend/` holds only `sql/`. On the build box that clone passed `cargo build --locked` (debug and release) and `make check-backend` with `GOFLAGS=-count=1`: all 14 Go packages and every cargo test binary passed, and clippy ran. `xmustard-api` then started with its default data directory (`../backend/data`) absent and answered `/api/health`. It does not create the directory at start-up; `writeJSON` creates it on the first write, which the settings tests exercise under `t.TempDir()`.
+- *`make release`* (Makefile, additive). `make release VERSION=vX.Y.Z` builds `xmustard-core` and `xmustard-relay` with `cargo build --release --locked`, and `xmustard-api`, `xmustard-mcp` and `xmustard-ops` with `CGO_ENABLED=0 go build -trimpath -ldflags="-s -w"`. These are the flags the v0.1.0 binaries show (`go version -m`: go1.26.1, `-trimpath=true`, `CGO_ENABLED=0`, stripped). It then checks that the core prints its usage (exit 2) and that `xmustard-mcp` answers `tools/list` with `remember`. It packs the five binaries and LICENSE into `dist/xmustard-<version>-<os>-<arch>.tar.gz`, the v0.1.0 asset naming (`uname -s` lower-cased, `uname -m`), with owner and group 0 and no macOS `._` entries. Finally it writes the archive's `.sha256` (`shasum -a 256`, present on both platforms). `VERSION` defaults to `git describe --tags --always --dirty`, or `dev` without git. The recipe parses and expands under macOS's GNU Make 3.81 (`make -n release`); nothing was compiled on the Mac. It builds for the host only; there is no cross-compilation.
+- *`.github/workflows/release.yml`* (new). It runs on a `v*` tag push, plus a manual dry run that only uploads artifacts. The build matrix is `ubuntu-24.04` (linux-x86_64; glibc 2.39 floor) and `macos-15` (darwin-arm64). Each leg validates the tag with an anchored regex (`vX.Y.Z` or `vX.Y.Z-pre`) and runs `make release VERSION=<tag>`. It checks that the archive carries the matrix platform name, so a runner-image change cannot mislabel an archive, then uploads the archive and its `.sha256`. The publish job runs only on tag pushes and is the only job with `contents: write`. It downloads both archives, runs `shasum -c` on each `.sha256`, writes `SHA256SUMS`, and runs `gh release create --draft --verify-tag`. Notes come from `docs/releases/<tag>.md` when present, else `--generate-notes`. The owner publishes the draft. `gh release create` fails on an existing release, so a re-pushed tag never replaces assets. Toolchains are pinned (Go 1.26.1, Rust 1.93.1: the versions that built v0.1.0, from the Go build info and the rustc commit in the core). No build cache is restored, so a release never consumes a cache written by a pull-request run. Checkout runs with `persist-credentials: false`. The actions are pinned to the same commit SHAs as check.yml. Each SHA was checked against its tag (GitHub tags API), and each input against the action's `action.yml` at that SHA. `actionlint` 1.7.12 reports no problems in release.yml or check.yml (shellcheck was not installed, so the `run:` scripts were not shellchecked).
+- *Dry run of the workflow on the build box.* The workflow cannot run here because nothing is pushed. The equivalent ran on the Linux x86_64 build box (Ubuntu, glibc 2.43, go1.26.1, rustc 1.93.1) at 54907b5: the build leg's `make release VERSION=v0.1.0-22-g54907b5` plus its name check, then the publish job's `shasum -c` and `SHA256SUMS` step. The only step left out is `gh release create`. Artifacts:
+
+  | File | Bytes | sha256 |
+  |---|---|---|
+  | `xmustard-v0.1.0-22-g54907b5-linux-x86_64.tar.gz` | 24,736,920 | `4a27951baf741c3c582fba31b37dda44d253bb3b5a7ccb20cb984a0abe7571da` |
+  | `xmustard-v0.1.0-22-g54907b5-linux-x86_64.tar.gz.sha256` | 114 | (the line above) |
+  | `SHA256SUMS` | 114 | (the same line) |
+
+  Archive contents, all owned by 0/0: `xmustard-core` 37,167,344 bytes (glibc floor 2.39), `xmustard-api` 22,143,138, `xmustard-ops` 17,817,762, `xmustard-mcp` 7,057,570 (the same size as v0.1.0's), `xmustard-relay` 611,712 (glibc floor 2.34), and `LICENSE`. With warm caches `make release` took 43 s. The archive checksum changes from build to build because file mtimes are stored, so each release publishes its own checksums; the process is reproducible, the archive bytes are not.
+- *Homebrew formula.* The formula at branch time was no longer HEAD-only: main's 4ba4481 had pinned it to the v0.1.0 source tarball. It now installs the prebuilt v0.1.0 archives on macOS arm64 and Linux x86_64, with the sha256 values from the release's `SHA256SUMS`. Both archives were downloaded and checked against those values; each holds the five binaries under one top directory, which Homebrew enters. Other platforms have no archive, so they have no stable spec, and Homebrew's `determine_active_spec` falls back to `head`: main, built from source, with go and rust as head-only build dependencies. That build uses `cargo install --locked` through `std_cargo_args`, and `std_go_args` for the Go binaries. The test block is unchanged. It passes against the darwin-arm64 archive on the Mac and the linux-x86_64 archive on the box: core exit 2 with "usage", and `tools/list` names `ground` and `remember`. Loading the formula under `Homebrew::SimulateSystem` for the four os/arch pairs gave stable 0.1.0 from the right archive on macOS arm64 and Linux x86_64, and HEAD with go and rust as build dependencies on macOS Intel and Linux arm64. `brew style` reports no formula offense. It reports only the Sorbet sigil and frozen-string cops that apply to files outside a tap, and the base formula shows the same ones. A caveat names the glibc 2.39 floor.
+- *Formatting (separate commits, no logic).* `gofmt -w` on the 10 files `gofmt -l api-go` listed; `git diff -w` shows only two removed blank lines. `rustfmt` (edition 2024) changed `scanner.rs` and `verification.rs`. `indexcache.rs` was already clean after WS-15 merged, so it is unchanged. `cargo fmt --check` and `gofmt -l api-go` are now clean.
+- *Deviations from the spec.* (1) The untracking itself is not done: the packet waits for the owner, as the plan requires. Only the inert `.gitignore` rule is applied. (2) The formula was no longer HEAD-only at branch time (see above). Platforms without an archive now build HEAD, not the tagged source. (3) `indexcache.rs` needed no rustfmt change. (4) Only the Linux archive was dry-run, because nothing may be compiled on the Mac. The darwin-arm64 leg is covered by `make -n release` under Make 3.81 and by the v0.1.0 darwin archive, which was built with the same flags. (5) The release is a draft that the owner publishes, and bumping the formula stays a manual step. (6) The release toolchains are pinned (Go 1.26.1, Rust 1.93.1), while check.yml tests with go.mod's 1.26.0 and Rust stable. (7) Files outside the list: the formatting-only Go and Rust files above.
+- *Checks.* `xm-remote-check.sh ws-26 all -count=1` gave remote_exit=0 at 6607ea3. The run covered the Rust release build, all cargo tests, clippy at 6 warnings (the base count; none new), `go vet`, and all 14 Go packages. `actionlint` 1.7.12 is clean on the final workflows. Two earlier full runs each failed one test, `index_build::build_of_5000_files_has_no_file_cap_and_peaks_under_25_mib`, whose line is 25.0 MiB; a later run of that binary measured 25.2 MiB. That test already sits at the edge on the base. Five interleaved runs of the index_build binary each gave 24.5–24.8 MiB on base 845868d and 24.5–24.9 MiB on this branch, whose Rust changes are formatting only. The margin (about 0.2–0.5 MiB) belongs to the index-build owner (WS-07/WS-22); this branch does not change it.
+
+**Owner approval packet (WS-26 untracking).** Approve by merging parity/ws-26, then running the script once in the checkout that will carry the commit (normally main), reviewing `git status`, and committing. The script does not commit. The 80 tracked files; the script checks the sha256 of this exact `git ls-files -- backend/data` output, `69cdc113b9eb9739dc124b364af651ea3d19fe3dde57a856bfab82bb66f0e329`:
+
+```text
+backend/data/metrics/run_697b588ec115.json
+backend/data/metrics/run_a84ff0803884.json
+backend/data/settings.json
+backend/data/workspaces.json
+backend/data/workspaces/co-titan-0a54108278/activity.jsonl
+backend/data/workspaces/co-titan-0a54108278/issue_overrides.json
+backend/data/workspaces/co-titan-0a54108278/runs/run_32370bf2aaf8.json
+backend/data/workspaces/co-titan-0a54108278/runs/run_32370bf2aaf8.log
+backend/data/workspaces/co-titan-0a54108278/runs/run_32370bf2aaf8.out.json
+backend/data/workspaces/co-titan-0a54108278/runs/run_40221c2d0946.json
+backend/data/workspaces/co-titan-0a54108278/runs/run_40221c2d0946.log
+backend/data/workspaces/co-titan-0a54108278/runs/run_40221c2d0946.out.json
+backend/data/workspaces/co-titan-0a54108278/runs/run_5d272d8663dd.json
+backend/data/workspaces/co-titan-0a54108278/runs/run_5d272d8663dd.log
+backend/data/workspaces/co-titan-0a54108278/runs/run_66c68561e0f1.json
+backend/data/workspaces/co-titan-0a54108278/runs/run_66c68561e0f1.log
+backend/data/workspaces/co-titan-0a54108278/runs/run_66c68561e0f1.out.json
+backend/data/workspaces/co-titan-0a54108278/runs/run_67ae394f1c46.json
+backend/data/workspaces/co-titan-0a54108278/runs/run_67ae394f1c46.log
+backend/data/workspaces/co-titan-0a54108278/runs/run_78afd02e4014.json
+backend/data/workspaces/co-titan-0a54108278/runs/run_78afd02e4014.log
+backend/data/workspaces/co-titan-0a54108278/runs/run_94383c0c8bb6.json
+backend/data/workspaces/co-titan-0a54108278/runs/run_94383c0c8bb6.log
+backend/data/workspaces/co-titan-0a54108278/runs/run_94383c0c8bb6.out.json
+backend/data/workspaces/co-titan-0a54108278/runs/run_9b4f78ace92d.json
+backend/data/workspaces/co-titan-0a54108278/runs/run_9b4f78ace92d.log
+backend/data/workspaces/co-titan-0a54108278/runs/run_a19e15e8fd2d.json
+backend/data/workspaces/co-titan-0a54108278/runs/run_a19e15e8fd2d.log
+backend/data/workspaces/co-titan-0a54108278/runs/run_b1264cb8286c.json
+backend/data/workspaces/co-titan-0a54108278/runs/run_b1264cb8286c.log
+backend/data/workspaces/co-titan-0a54108278/runs/run_b1264cb8286c.out.json
+backend/data/workspaces/co-titan-0a54108278/runs/run_b30bc80f20a7.json
+backend/data/workspaces/co-titan-0a54108278/runs/run_b30bc80f20a7.log
+backend/data/workspaces/co-titan-0a54108278/runs/run_b874350b2178.json
+backend/data/workspaces/co-titan-0a54108278/runs/run_b874350b2178.log
+backend/data/workspaces/co-titan-0a54108278/runs/run_cf0f12a1f443.json
+backend/data/workspaces/co-titan-0a54108278/runs/run_cf0f12a1f443.log
+backend/data/workspaces/co-titan-0a54108278/runs/run_ea4bf722c9b2.json
+backend/data/workspaces/co-titan-0a54108278/runs/run_ea4bf722c9b2.json.ba5dfb6a4e2f43488feb1407694db46d.tmp
+backend/data/workspaces/co-titan-0a54108278/runs/run_ea4bf722c9b2.log
+backend/data/workspaces/co-titan-0a54108278/runs/run_f3d9bfe1d3da.json
+backend/data/workspaces/co-titan-0a54108278/runs/run_f3d9bfe1d3da.log
+backend/data/workspaces/co-titan-0a54108278/runs/run_f3f97e5aca1c.json
+backend/data/workspaces/co-titan-0a54108278/runs/run_f3f97e5aca1c.log
+backend/data/workspaces/co-titan-0a54108278/runs/run_f3f97e5aca1c.out.json
+backend/data/workspaces/co-titan-0a54108278/runs/run_ff4a98496e93.json
+backend/data/workspaces/co-titan-0a54108278/runs/run_ff4a98496e93.log
+backend/data/workspaces/co-titan-0a54108278/saved_views.json
+backend/data/workspaces/co-titan-0a54108278/snapshot.json
+backend/data/workspaces/co-titan-0a54108278/terminals/term_8b530a4ecfc6.log
+backend/data/workspaces/co-titan-0a54108278/terminals/term_d3a76fb1df5c.log
+backend/data/workspaces/repo-2d5d3dd8af/activity.jsonl
+backend/data/workspaces/repo-2d5d3dd8af/fix_records.json
+backend/data/workspaces/repo-2d5d3dd8af/issue_overrides.json
+backend/data/workspaces/repo-2d5d3dd8af/runs/run_smoke_fix.json
+backend/data/workspaces/repo-2d5d3dd8af/runs/run_smoke_fix.log
+backend/data/workspaces/repo-2d5d3dd8af/snapshot.json
+backend/data/workspaces/repo-2d5d3dd8af/tracker_issues.json
+backend/data/workspaces/repo-30ecdc5685/activity.jsonl
+backend/data/workspaces/repo-30ecdc5685/fix_records.json
+backend/data/workspaces/repo-30ecdc5685/issue_overrides.json
+backend/data/workspaces/repo-30ecdc5685/runs/run_smoke_fix.json
+backend/data/workspaces/repo-30ecdc5685/runs/run_smoke_fix.log
+backend/data/workspaces/repo-30ecdc5685/snapshot.json
+backend/data/workspaces/repo-30ecdc5685/tracker_issues.json
+backend/data/workspaces/repo-4d73ffdc46/activity.jsonl
+backend/data/workspaces/repo-4d73ffdc46/fix_records.json
+backend/data/workspaces/repo-4d73ffdc46/issue_overrides.json
+backend/data/workspaces/repo-4d73ffdc46/snapshot.json
+backend/data/workspaces/repo-4d73ffdc46/tracker_issues.json
+backend/data/workspaces/repo-cb6493e598/activity.jsonl
+backend/data/workspaces/repo-cb6493e598/snapshot.json
+backend/data/workspaces/repo-cb6493e598/tracker_issues.json
+backend/data/workspaces/repo-d56ef7ff29/activity.jsonl
+backend/data/workspaces/repo-d56ef7ff29/fix_records.json
+backend/data/workspaces/repo-d56ef7ff29/issue_overrides.json
+backend/data/workspaces/repo-d56ef7ff29/runs/run_smoke_fix.json
+backend/data/workspaces/repo-d56ef7ff29/runs/run_smoke_fix.log
+backend/data/workspaces/repo-d56ef7ff29/snapshot.json
+backend/data/workspaces/repo-d56ef7ff29/tracker_issues.json
+```
+
+The script (run it with `sh`; it needs git and shasum):
+
+```sh
+#!/bin/sh
+# WS-26: stop tracking the runtime files under backend/data. Run it in the checkout that
+# will carry the commit, after the owner approves. git rm --cached changes the index only:
+# every file stays on disk, and the backend/data/ rule in .gitignore keeps them out of
+# later commits. It refuses unless the tracked set is exactly the recorded list.
+set -eu
+cd "$(git rev-parse --show-toplevel)"
+
+expected_sha=69cdc113b9eb9739dc124b364af651ea3d19fe3dde57a856bfab82bb66f0e329 # of the 80-path list
+actual_sha=$(git ls-files -- backend/data | shasum -a 256 | cut -d ' ' -f 1)
+if [ "$actual_sha" != "$expected_sha" ]; then
+  echo "refusing: the tracked backend/data files differ from the WS-26 list (git ls-files -- backend/data)" >&2
+  exit 1
+fi
+if ! git check-ignore -q --no-index backend/data/settings.json; then
+  echo "refusing: .gitignore does not ignore backend/data/ (merge parity/ws-26 first)" >&2
+  exit 1
+fi
+if ! git diff --cached --quiet; then
+  echo "refusing: the index already has staged changes; commit or unstage them first" >&2
+  exit 1
+fi
+
+git rm -r --cached --quiet -- backend/data
+
+# Nothing under backend/data stays tracked, all 80 paths are staged as deletions, and no
+# runtime file shows up as untracked.
+test -z "$(git ls-files -- backend/data)"
+test "$(git diff --cached --name-only --diff-filter=D -- backend/data | wc -l | tr -d ' ')" = 80
+if git status --porcelain --untracked-files=all -- backend/data | grep -q '^??'; then
+  echo "unexpected: untracked files under backend/data; check .gitignore" >&2
+  exit 1
+fi
+echo "80 files leave the index and stay on disk. Review 'git status', then commit:"
+echo "  git commit -m 'chore(data): stop tracking backend/data runtime files (WS-26)'"
+```
+
+In every other checkout or worktree whose `backend/data` holds runtime data you want to keep, do this before pulling the untrack commit. Git deletes files that a pulled commit stops tracking, and it refuses the pull while tracked copies differ from HEAD:
+
+```sh
+mv backend/data ../xmustard-backend-data.keep   # move the live data out of git's way
+git checkout HEAD -- backend/data                # restore the tracked copies, unmodified
+git pull                                         # the untrack commit deletes those copies
+rm -rf backend/data && mv ../xmustard-backend-data.keep backend/data
+```
+
 ### WS-27 — Dedupe, code anchors, tiered conflicts and structured claims
 
 **Goal.** At propose time:
