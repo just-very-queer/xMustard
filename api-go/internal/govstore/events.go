@@ -49,13 +49,20 @@ const (
 	// built or replaced (PAR-FRESH-06): automatically or by an explicit rebaseline, the
 	// reason, and the HEAD it was taken at. It names no entry.
 	EventIndexBaseline = "index_baseline"
+	// EventMergeApproval records a human approver's attestation that they reviewed one
+	// change (WS-57, PAR-REV-14): the repository, the head and merge base, and the digest
+	// of the diff between them. EventMergeApprovalRevoked withdraws one by its seq. They
+	// name no entry, and they enforce nothing: branch protection does.
+	EventMergeApproval        = "merge_approval"
+	EventMergeApprovalRevoked = "merge_approval_revoked"
 )
 
 var validEventTypes = set(EventPropose, EventImport, EventVote, EventReject, EventEdit, EventRevisionAccepted,
 	EventRevisionRejected, EventRevisionWithdrawn, EventPromote, EventDemote, EventStatus, EventSupersede,
 	EventMerge, EventRetract, EventArchive, EventRestore, EventPurge, EventExpiry, EventTierChange, EventClassify,
 	EventAnchors, EventBaseline, EventStaleObserved, EventDriftCleared, EventClaim, EventRelation, EventFeedback,
-	EventCollection, EventGrant, EventRevoke, EventApplicability, EventNote, EventGate, EventIndexBaseline)
+	EventCollection, EventGrant, EventRevoke, EventApplicability, EventNote, EventGate, EventIndexBaseline,
+	EventMergeApproval, EventMergeApprovalRevoked)
 
 // Event is one immutable history record.
 type Event struct {

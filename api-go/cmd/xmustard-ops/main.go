@@ -28,6 +28,9 @@ func main() {
 	if len(args) == 0 {
 		fatalUsage("usage: xmustard-ops <diagnostics|semantic-index|postgres|runtime|workspace|mcp-config> ...")
 	}
+	if run, ok := approvalCommands[args[0]]; ok { // the human-approval surface (approval.go)
+		os.Exit(run(defaultOpsEnv(), args[1:]))
+	}
 	switch args[0] {
 	case "diagnostics":
 		runDiagnostics(args[1:])

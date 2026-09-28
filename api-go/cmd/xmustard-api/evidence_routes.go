@@ -238,8 +238,17 @@ func evidenceDeliveryMiddleware(store *evidence.Store, next http.Handler) http.H
 			req.Retain = true
 			return store.Capture(captureCtx, osp, req)
 		})))
+		// a human approver's write held for the human's confirmation (human_presence.go)
+		// is a protocol answer the bridge acts on, like an admission refusal: it passes
+		// through unchanged, never captured
+		var held map[string]any
+		r = r.WithContext(withHeldWriteSlot(r.Context(), &held))
 		sw := &spoolWriter{header: http.Header{}, spool: sp}
 		next.ServeHTTP(sw, r)
+		if held != nil {
+			writeJSON(w, http.StatusForbidden, held)
+			return
+		}
 		if sw.status == 0 {
 			sw.status = http.StatusOK
 		}

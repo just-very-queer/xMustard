@@ -72,7 +72,7 @@ func WithCallID(ctx context.Context, id json.RawMessage) context.Context {
 
 // Headers asks the API for the evidence envelope.
 func (e *Evidence) Headers(ctx context.Context) map[string]string {
-	h := map[string]string{DeliveryHeader: DeliveryVersion, "X-Xmustard-Issuer": "mcp", "X-Xmustard-Session-Id": e.SessionID}
+	h := map[string]string{DeliveryHeader: DeliveryVersion, IssuerHeader: IssuerMCP, "X-Xmustard-Session-Id": e.SessionID}
 	if id, ok := ctx.Value(callIDKey{}).(string); ok && id != "" {
 		h["X-Xmustard-Call-Id"] = id
 	}

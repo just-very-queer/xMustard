@@ -265,13 +265,16 @@ type Actor struct {
 	CallID   string
 	RunID    string
 	Evidence []string
+	// Approval labels a human approver's write (WS-57): where it was made and whether an
+	// agent process could read the token, as "<surface>/<assurance>".
+	Approval string
 }
 
 // provenance is the event record of a's provenance, nil when it has none.
 func (a Actor) provenance() map[string]any {
 	p := map[string]any{}
 	for _, f := range [...]struct{ key, v string }{
-		{"owner", a.Owner}, {"kind", a.Kind}, {"call_id", a.CallID}, {"run_id", a.RunID},
+		{"owner", a.Owner}, {"kind", a.Kind}, {"call_id", a.CallID}, {"run_id", a.RunID}, {"approval", a.Approval},
 	} {
 		if f.v != "" {
 			p[f.key] = f.v
