@@ -139,7 +139,9 @@ fn ro(db: &Path) -> Connection {
 // CSR equals the edges table
 // ---------------------------------------------------------------------------
 
-type EdgeKey = (u32, u32, String, String, u32, String, u8);
+/// (from, to, kind, layer, weight, provenance, confidence, reason, access): the
+/// segment keeps weight to u16 and reason and access in footer tables (format 2).
+type EdgeKey = (u32, u32, String, String, u32, String, u8, String, String);
 
 /// Every edge of the store, keyed by segment node ids (files by path rank, symbols by
 /// id rank after the files), from SQL alone.
@@ -179,7 +181,8 @@ fn db_edges(conn: &Connection) -> Vec<EdgeKey> {
     };
     let mut st = conn
         .prepare(
-            "SELECT src_file, src_symbol, dst_file, dst_symbol, kind, layer, weight, provenance, confidence FROM edges",
+            "SELECT src_file, src_symbol, dst_file, dst_symbol, kind, layer, weight, provenance, confidence,
+               reason, coalesce(access, '') FROM edges",
         )
         .unwrap();
     let mut out: Vec<EdgeKey> = st
@@ -189,9 +192,11 @@ fn db_edges(conn: &Connection) -> Vec<EdgeKey> {
                 node(r.get(2)?, r.get(3)?),
                 r.get::<_, String>(4)?,
                 r.get::<_, String>(5)?,
-                r.get::<_, i64>(6)? as u32,
+                r.get::<_, i64>(6)?.min(u16::MAX as i64) as u32,
                 r.get::<_, String>(7)?,
                 csr::quantize_confidence(r.get(8)?),
+                r.get::<_, String>(9)?,
+                r.get::<_, String>(10)?,
             ))
         })
         .unwrap()
@@ -220,9 +225,11 @@ fn key(seg: &Segment, a: u32, b: u32, e: &Edge) -> EdgeKey {
         b,
         seg.edge_kind(e.kind).to_string(),
         seg.layer(e.layer).to_string(),
-        e.weight,
+        u32::from(e.weight),
         seg.provenance(e.provenance).to_string(),
         e.confidence,
+        seg.reason(e.reason).to_string(),
+        seg.access(e.access).to_string(),
     )
 }
 
@@ -249,8 +256,17 @@ fn csr_equals_the_edges_table_and_reverse_edges_mirror_it() {
                 conn.execute(
                     "INSERT INTO edges(src_file, dst_file, src_symbol, dst_symbol, kind, layer, weight,
                      confidence, provenance, via, reason, access)
-                     VALUES (?1, ?2, ?3, ?4, ?5, 'structure', ?6, 0.93, 'resolved', '[]', 'test', NULL)",
-                    params![f, tf, s, t, ["calls", "accesses", "has_method"][k % 3], k as i64],
+                     VALUES (?1, ?2, ?3, ?4, ?5, 'structure', ?6, 0.93, 'resolved', '[]', ?7, ?8)",
+                    params![
+                        f,
+                        tf,
+                        s,
+                        t,
+                        ["calls", "accesses", "has_method"][k % 3],
+                        k as i64,
+                        ["import", "declaration"][k % 2],
+                        (k % 3 == 1).then_some(["read", "write"][k % 2]),
+                    ],
                 )
                 .unwrap();
             }
@@ -282,7 +298,7 @@ fn csr_equals_the_edges_table_and_reverse_edges_mirror_it() {
                 seg.symbol(n - nf).unwrap().file
             }
         };
-        for (a, b, _, layer, w, _, _) in &want {
+        for (a, b, _, layer, w, _, _, _, _) in &want {
             let (fa, fb) = (file_of(*a), file_of(*b));
             if layer == "structure" && fa != fb {
                 *proj.entry((fa, fb)).or_default() += w;
@@ -775,10 +791,10 @@ fn freshness_envelope_on_search_explain_and_impact_reports_the_commit_relation()
     }
 }
 
-// impact(path=) walks the reference graph from the file itself, as impact(symbol=)
-// walks it from the symbol's defining files: the same answer from the legacy graph and
-// the index, bounded by max_depth, and found=false (nothing impacted) for a path the
-// graph does not hold.
+// impact(path=) walks the file-level reference graph from the file itself (the walk
+// impact(symbol=) made from a symbol's defining files before impact v2, WS-35): the same
+// answer from the legacy graph and the index, bounded by max_depth, and found=false
+// (nothing impacted) for a path the graph does not hold.
 #[test]
 fn impact_file_walks_from_the_file_on_both_sources() {
     let r = fixture();
@@ -788,13 +804,14 @@ fn impact_file_walks_from_the_file_on_both_sources() {
     };
     let answers = || {
         let total = file("web/src/total.ts", "4");
+        // the file the symbol form resolves computeTotal to; its answer is impact v2's
+        // (depth tiers over typed edges), no longer this file walk
         let symbol = run_json(&["symbolgraph", "impact", root, "ws", "computeTotal", "4"]);
         assert_eq!(
             symbol["defined_in"],
             json!(["web/src/total.ts"]),
             "{symbol}"
         );
-        assert_eq!(total["impacted"], symbol["impacted"], "{total}\n{symbol}");
         assert_eq!(total["found"], true, "{total}");
         assert_eq!(total["path"], "web/src/total.ts");
         let direct: Vec<&str> = total["impacted"]

@@ -11,9 +11,11 @@ import (
 
 // toolDescriptionBudget caps the bytes agents read in tools/list every session.
 // The nine descriptions totalled 1808 bytes before search/impact/recall were rewritten
-// to state their limits; they totalled 1794, and 1735 once search described BM25 (WS-18).
+// to state their limits; they totalled 1794, 1735 once search described BM25 (WS-18),
+// 1703 once impact described the resolved graph (WS-35), and 1699 with impact's path=
+// clause (WS-FIX-05) merged into it.
 // Lower this when one shrinks; do not raise it.
-const toolDescriptionBudget = 1735
+const toolDescriptionBudget = 1699
 
 // Descriptions are an agent's only model of a tool. search, impact and recall must
 // name the heuristics they run on, so an agent does not read a name-level fuzzy match
@@ -24,9 +26,11 @@ func TestToolDescriptionsStateImplementationLimits(t *testing.T) {
 		// bodies are searched by BM25 over chunks (WS-18); the trigram lane is typo
 		// tolerance, not meaning.
 		"search": {"bm25", "function bodies", "doc sections", "typo tolerance (not meaning)", "rrf (k=60)", "ast-grep"},
-		// symbol= is a file-level walk from the defining files, path= the same walk from
-		// one file; from=&to= ignores direction.
-		"impact": {"lexical reference graph", "import lines", "leads to confirm, not proof", "defining files", "path= → the same from one file", "undirected"},
+		// Go/TS walk resolved symbol edges, other languages lexical name matches (WS-35);
+		// every answer states its completeness. path= is the file-level lexical walk
+		// (WS-FIX-05).
+		"impact": {"go/ts edges are resolved", "match names", "leads, not proof", "completeness", "per-hop edges",
+			"path= → a file's lexical referrers"},
 		// paths alone gate results; no args ranks by working-tree overlap.
 		"recall": {"conflicts", "path overlap, not contradiction", "non-matches dropped", "working-tree overlap"},
 	}
@@ -44,7 +48,7 @@ func TestToolDescriptionsStateImplementationLimits(t *testing.T) {
 	}
 	stale := map[string][]string{
 		"search": {"lexical+semantic", "not function bodies", "semantic"},
-		"impact": {"transitive dependents", "dependency path"},
+		"impact": {"transitive dependents", "dependency path", "lexical reference graph", "undirected", "defining files"},
 		"recall": {"recency top-n"},
 	}
 	for name, phrases := range stale {

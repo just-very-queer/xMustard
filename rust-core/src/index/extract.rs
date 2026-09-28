@@ -1044,6 +1044,15 @@ impl<'a> Walker<'a> {
     }
 }
 
+/// The import kind of a TS/JS import: `import_type` when it is type-only (erased at
+/// compile time), else `import`.
+fn import_kind(type_only: bool) -> &'static str {
+    match type_only {
+        true => "import_type",
+        false => "import",
+    }
+}
+
 fn has_child_kind(node: Node<'_>, kind: &str) -> bool {
     let mut c = node.walk();
     node.children(&mut c).any(|n| n.kind() == kind)
@@ -1863,6 +1872,8 @@ impl<'a> Walker<'a> {
                 let source = node
                     .child_by_field_name("source")
                     .map(|s| strip_quotes(self.text(s)));
+                // `import type ...` is erased at compile time: it never runs the module
+                let statement = import_kind(has_child_kind(node, "type"));
                 let mut c = node.walk();
                 let mut any = false;
                 for ch in node.named_children(&mut c) {
@@ -1878,7 +1889,7 @@ impl<'a> Walker<'a> {
                                         any = true;
                                         self.imports.push(ImportFact {
                                             line,
-                                            kind: "import".into(),
+                                            kind: statement.into(),
                                             module: module.clone(),
                                             name: Some("default".into()),
                                             alias: Some(self.text(part).to_string()),
@@ -1893,7 +1904,7 @@ impl<'a> Walker<'a> {
                                             .map(|n| self.text(n).to_string());
                                         self.imports.push(ImportFact {
                                             line,
-                                            kind: "import".into(),
+                                            kind: statement.into(),
                                             module: module.clone(),
                                             name: Some("*".into()),
                                             alias,
@@ -1912,9 +1923,14 @@ impl<'a> Walker<'a> {
                                             let alias = spec
                                                 .child_by_field_name("alias")
                                                 .map(|n| self.text(n).to_string());
+                                            // `import { type A }`: this name only
+                                            let kind = match has_child_kind(spec, "type") {
+                                                true => import_kind(true),
+                                                false => statement,
+                                            };
                                             self.imports.push(ImportFact {
                                                 line,
-                                                kind: "import".into(),
+                                                kind: kind.into(),
                                                 module: module.clone(),
                                                 name,
                                                 alias,
@@ -1950,7 +1966,7 @@ impl<'a> Walker<'a> {
                 if !any && let Some(module) = source {
                     self.imports.push(ImportFact {
                         line,
-                        kind: "import".into(),
+                        kind: statement.into(),
                         module,
                         name: None,
                         alias: None,
@@ -1962,6 +1978,11 @@ impl<'a> Walker<'a> {
                     return;
                 };
                 let module = strip_quotes(self.text(src));
+                // `export type { A } from` re-exports a type only
+                let reexport = match has_child_kind(node, "type") {
+                    true => "reexport_type",
+                    false => "reexport",
+                };
                 let mut c = node.walk();
                 let mut any = false;
                 for ch in node.named_children(&mut c) {
@@ -1975,7 +1996,7 @@ impl<'a> Walker<'a> {
                                 any = true;
                                 self.imports.push(ImportFact {
                                     line,
-                                    kind: "reexport".into(),
+                                    kind: reexport.into(),
                                     module: module.clone(),
                                     name: spec
                                         .child_by_field_name("name")
@@ -2032,9 +2053,15 @@ impl<'a> Walker<'a> {
                 if first.kind() != "string" {
                     return;
                 }
+                // a `require` inside a function runs when the function does
+                let kind = match (dynamic, self.in_callable()) {
+                    (true, _) => "dynamic",
+                    (false, true) => "require_local",
+                    (false, false) => "require",
+                };
                 self.imports.push(ImportFact {
                     line,
-                    kind: if dynamic { "dynamic" } else { "require" }.into(),
+                    kind: kind.into(),
                     module: strip_quotes(self.text(first)),
                     name: None,
                     alias: None,

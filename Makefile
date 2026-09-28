@@ -8,7 +8,8 @@ PREFIX ?= /usr/local
 BINDIR := $(PREFIX)/bin
 
 .PHONY: build install relay backend backend-platform go-api frontend go-api-build rust-core-check \
-	rust-core-scan migration-check dev build-ui scan check check-backend check-frontend
+	rust-core-scan migration-check dev build-ui scan check check-backend check-frontend \
+	check-rss-lines
 .PHONY: bench-test bench-gate bench-parity bench-retrieval
 .PHONY: release release-sums
 
@@ -128,7 +129,16 @@ check-backend:
 	cd api-go && go vet -tags review ./cmd/xmustard-ops/ ./internal/workspaceops/ && \
 		go test -tags review -run 'Review|Merge' ./cmd/xmustard-ops/ ./internal/workspaceops/
 	cd rust-core && cargo test
+	$(MAKE) check-rss-lines
 	cd rust-core && cargo clippy
+
+# The heavy slot's 25 MiB and the index service's 15 MiB RSS lines are the release
+# binary's (tests/memprobe): the debug `cargo test` above holds these guards to their
+# dirty-memory bounds and a looser RSS bound, this release run to the lines themselves.
+check-rss-lines:
+	cd rust-core && cargo test --release --test index_build --test index_query -- \
+		build_of_5000_files_has_no_file_cap_and_peaks_under_25_mib \
+		resident_rss_on_a_100k_symbol_resolved_graph_stays_within_the_line
 
 check-frontend:
 	cd frontend && npm run lint
