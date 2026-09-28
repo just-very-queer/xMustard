@@ -1,0 +1,16 @@
+diff --git a/apps/cli/src/wizards/schedule/cron-presets.ts b/apps/cli/src/wizards/schedule/cron-presets.ts
+index a1596c66..baebbdf5 100644
+--- a/apps/cli/src/wizards/schedule/cron-presets.ts
++++ b/apps/cli/src/wizards/schedule/cron-presets.ts
+@@ -15,6 +15,11 @@ export const CRON_PRESETS: CronPreset[] = [
+ 		value: "*/15 * * * *",
+ 		hint: "*/15 * * * *",
+ 	},
++	{
++		label: "Every 30 minutes",
++		value: "*/30 * * * *",
++		hint: "*/30 * * * *",
++	},
+ 	{
+ 		label: "Every hour",
+ 		value: "0 * * * *",

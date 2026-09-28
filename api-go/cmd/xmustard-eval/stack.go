@@ -17,6 +17,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"xmustard/api-go/internal/injection"
 )
 
 // An xMustard stack is what the xMustard arms give the client: an API process with the
@@ -444,8 +446,9 @@ func truncate(b []byte, n int) string {
 
 // stubStack serves the few API routes the fake agent and the stub MCP bridge use,
 // from an in-memory store. It is not xMustard: it serves every verified memory of the
-// task workspace and flags a memory stale when a drift edit touched its paths. It
-// exists so the harness pipeline can be exercised without building the product.
+// task workspace, flags a memory stale when a drift edit touched its paths, and labels
+// it with the product's injection scan (WS-56). It exists so the harness pipeline can
+// be exercised without building the product.
 type stubStack struct {
 	srv     *http.Server
 	base    string
@@ -462,6 +465,7 @@ type stubEntry struct {
 	Paths                    []string
 	Foreign, Pending         bool
 	Stale                    bool
+	InjectionFlags           []string
 }
 
 func startStubStack(st stackStart) (*stubStack, error) {
@@ -477,7 +481,8 @@ func startStubStack(st stackStart) (*stubStack, error) {
 		}
 		for _, sm := range st.memory.Seed {
 			e := stubEntry{ID: "stub-" + sm.Key, Title: sm.Title, Content: seededContent(st.taskID, sm), Paths: sm.Paths,
-				Foreign: sm.Label == LabelForeignScope, Pending: sm.Label == LabelPending, Mode: "peer_verified"}
+				Foreign: sm.Label == LabelForeignScope, Pending: sm.Label == LabelPending, Mode: "peer_verified",
+				InjectionFlags: injection.Scan(sm.Title, sm.Content).Flags}
 			for _, p := range sm.Paths {
 				e.Stale = e.Stale || drifted[p]
 			}
@@ -529,8 +534,12 @@ func (s *stubStack) recall(w http.ResponseWriter, r *http.Request) {
 		if e.Foreign || e.Pending {
 			continue
 		}
-		out = append(out, map[string]any{"id": e.ID, "title": e.Title, "content": e.Content, "paths": e.Paths,
-			"status": "verified", "verification_mode": e.Mode, "stale": e.Stale})
+		entry := map[string]any{"id": e.ID, "title": e.Title, "content": e.Content, "paths": e.Paths,
+			"status": "verified", "verification_mode": e.Mode, "stale": e.Stale}
+		if len(e.InjectionFlags) > 0 {
+			entry["injection_flags"] = e.InjectionFlags
+		}
+		out = append(out, entry)
 		for _, p := range e.Paths {
 			byPath[p] = append(byPath[p], e.ID)
 		}

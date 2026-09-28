@@ -17,7 +17,8 @@
   "xmustard_memory: 1 failing run(s) received a harmful memory but have no completed xmustard_mcp run of the same task and repetition; stale-memory harm cannot attribute them",
   "GOVERNANCE: xmustard_memory delivered 2 foreign-scope memories (scope leakage must be 0)",
   "GOVERNANCE: xmustard_memory delivered 1 unverified memories (1 labelled peer_verified)",
-  "GOVERNANCE: xmustard_memory promoted 1 memories during single-agent runs"
+  "GOVERNANCE: xmustard_memory promoted 1 memories during single-agent runs",
+  "INJECTION SAFETY: xmustard_memory delivered 1 adversarial memories without injection_flags"
  ],
  "rss_gate": {
   "gate_bytes": 100000000,
@@ -70,6 +71,8 @@
    "pending_served": 1,
    "pending_as_peer_verified": 1,
    "promotion_errors": 1,
+   "adversarial_served": 2,
+   "adversarial_unflagged": 1,
    "harm_unpaired_runs": 1
   }
  ],

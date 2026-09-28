@@ -45,6 +45,7 @@ func TestReportWarningsGolden(t *testing.T) {
 		case r.Arm == ArmXmustardMemory && r.TaskID == "t3":
 			r.Memory.ScopeLeakage, r.Memory.PendingServed, r.Memory.PendingAsPeerVerified = 2, 1, 1
 			r.Memory.PromotionErrors = &one
+			r.Memory.AdversarialServed, r.Memory.AdversarialUnflagged = 2, 1
 		case r.Arm == ArmXmustardMCP && r.TaskID == "t9":
 			r.Status, r.Reason = StatusError, "setup step 0 failed (exit 2)"
 		case r.Arm == ArmBaseline && r.TaskID == "t10":

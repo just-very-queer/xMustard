@@ -1,0 +1,25 @@
+diff --git a/packages/tui/src/fuzzy.ts b/packages/tui/src/fuzzy.ts
+index 1b5352c..42a78be 100644
+--- a/packages/tui/src/fuzzy.ts
++++ b/packages/tui/src/fuzzy.ts
+@@ -9,6 +9,11 @@ export interface FuzzyMatch {
+ 	score: number;
+ }
+ 
++/** An uppercase letter directly after a lowercase letter or a digit starts a camelCase word. */
++function isCamelHump(text: string, i: number): boolean {
++	return /[A-Z]/.test(text[i] ?? "") && /[a-z0-9]/.test(text[i - 1] ?? "");
++}
++
+ export function fuzzyMatch(query: string, text: string): FuzzyMatch {
+ 	const queryLower = query.toLowerCase();
+ 	const textLower = text.toLowerCase();
+@@ -31,7 +36,7 @@ export function fuzzyMatch(query: string, text: string): FuzzyMatch {
+ 			const i = textLower.indexOf(normalizedQuery[queryIndex]!, lastMatchIndex + 1);
+ 			if (i === -1) break;
+ 
+-			const isWordBoundary = i === 0 || /[\s\-_./:]/.test(textLower[i - 1]!);
++			const isWordBoundary = i === 0 || /[\s\-_./:]/.test(textLower[i - 1]!) || isCamelHump(text, i);
+ 
+ 			// Reward consecutive matches
+ 			if (lastMatchIndex === i - 1) {
