@@ -1744,3 +1744,97 @@ Adopted per the critic's reduced plan in requirements §13.6. No tenth MCP tool.
 
 Budget: review features sit behind a profile/build tag that is off in the lean default until gate v2 (WS-10) shows headroom.
 
+
+### WS-65 — Deterministic finding anchoring (OCR port)
+
+Port open-code-review's resolver, hunk parser and re-filing (Apache-2.0, with a NOTICE and upstream's SPDX lines kept). It anchors a quoted snippet to the new or old side of a hunk, re-files a snippet to another changed file, runs a partial Ground-A check and bounds existing_code at 40 lines or 4 KB. It ships as a library for WS-27 (quoted-code anchors) and WS-28 (re-anchoring). Findings arrive through an evidence_handle or a findings file, never as nested MCP arrays. There is no tenth tool, and review features sit behind a profile or build tag that is off in the lean default. Requirements: PAR-REV-04 and PAR-REV-05, as corrected by the critic in requirements §13.6 (the WS-65 line).
+
+**Implementation record (branch parity/ws-65, 2026-09-28).** These notes record what was built and measured, and where it differs from the text above. The source was the local clone `research/open-code-review` at 486022d (`internal/diff/hunk.go`, `resolver.go`, `relocation.go`, `parser.go`, `internal/llmloop/loop.go:708-768` and their tests).
+- *Library (`api-go/internal/anchor`).*
+  - `NewSnippet` normalizes quoted code as upstream: each line trimmed, one leading `+` and one leading `-` stripped, blank lines dropped. It refuses code over 40 lines or 4,096 bytes (`snippet_too_large`) and code with no non-blank line (`no_snippet`).
+  - `NewFile(old, new, diff, head)` parses one file's hunks once. `File.Resolve` walks a table of three tiers: the hunks' new side (`exact_new`), their old side (`exact_old`), then the whole file at head (`file`), whose content is loaded on first need.
+  - The first tier holding the snippet decides. One match anchors it; several are `unanchored` with reason `ambiguous` and a candidate count.
+  - `Set.Place` follows upstream's order. It tries the finding's own file, then re-files the snippet (`relocated`, with `refiled_from`) only when exactly one place in all the other changed files holds it. Zero places gives `not_found`; two or more give `ambiguous_across_files`.
+  - `Set.Touches` answers `in_changed_hunk`: does the anchored range hold an added line on the new side, or a deleted line on the old side (blank lines included)?
+  - `Locate(path, content, snippet)` is the memory quoted-code anchor for WS-27. `Reanchor(prev, content, snippet)` is refs_stale re-anchoring for WS-28: one match moves the anchor, and among several matches the one still at the previous line keeps it.
+  - Every anchor carries a status, a side, a reason, a candidate count and `refiled_from`. The package reads no file and runs no git.
+- *Changes from upstream.* Each ported file's header lists its changes.
+  - Several matches anchor nothing. Upstream takes the first match, so its two "first match wins" tests now expect `ambiguous`.
+  - Hunk sides skip blank lines, as the whole-file pass already did. A snippet that spans a blank line inside a hunk now anchors there instead of falling through to the file tier.
+  - A hunk ends when its header's line counts are used up. A trailing newline no longer adds an empty context line (upstream's CRLF test expected one), and text after a hunk is not read as part of it.
+  - An old-side anchor names a renamed file's old path.
+  - During re-filing, a file that holds the snippet more than once counts every match. That file therefore cannot make a hit elsewhere look unique.
+  - The model re-location step (`relocation.go`) is not ported, as PAR-REV-04 says.
+- *Findings (`api-go/internal/review`).*
+  - `Decode` accepts three shapes: a JSON array, `{"findings": [...]}`, or open-code-review's `--format json --output` file, from which it takes `comments` and ignores the rest of the envelope. Either array may arrive as a JSON string; it is decoded once and the repair is recorded.
+  - The item schema is closed: xMustard's fields plus OCR's `start_line`, `end_line` and `thinking`. `thinking` is dropped and counted.
+  - The whole input is refused when it is over 4 MiB, holds more than 50 findings, or any finding has an unknown member, a wrong type, no content, or a path that is empty, absolute, escaping or contains a NUL.
+  - Other problems are recorded on the finding, which is kept:
+    - an unknown category or severity becomes `other` or `low`, and case is folded;
+    - content over 2,000 characters is cut;
+    - an existing_code or suggestion_code over the snippet bound is dropped, and the finding is `unanchored` with `snippet_too_large`;
+    - when the producer's own line range differs from the anchor, the note says the anchor replaced it.
+  - `SplitDiff` splits git diff output into files. A path comes from the `---`/`+++` lines (C-quoted names decoded, `/dev/null` for the missing side, git's trailing tab after a name with a space dropped). A binary or mode-only file takes its path from its `diff --git` line.
+  - `Anchor` places every finding and computes its checks:
+    - `code_present`, a partial Ground A: the quoted code is in the file the finding is filed or re-filed against, at head or on the old side. OCR's Ground A, judged by a model, asks whether the code is absent from the subject file's diff.
+    - `in_changed_hunk`.
+    - `in_scope`: the file is in the diff.
+    - `symbol_resolved`, always `unknown`.
+
+    A finding that fails `code_present` is labeled `unsupported` and kept. Counts are given per status and per support label.
+- *Surface: the `review` build tag, off by default.*
+  - `workspaceops.AnchorReviewFindings(ctx, dataDir, ws, base, head, batch)` anchors against the change merge approval digests. `observeChange` tees the hardened WS-57 diff from the merge base of `base` to `head` into the anchoring, so the result's `change.diff_sha256` equals what `review approve` binds. The tests check that equality.
+  - Head content for the whole-file tier comes from one `git cat-file --batch`. It runs under the same git isolation (now `reviewGitCommand`, shared with `reviewGit`) and starts only when a snippet reaches that tier.
+  - Bounds: the diff text at 8 MiB (over it the anchoring is refused, since this command takes no heavy slot), one file at head at 1 MiB, and all head content at 16 MiB. A file over a head bound, a binary file, or a name the batch protocol cannot carry is searched in its hunks only, and `head_reads` lists it.
+  - A failed head read fails the anchoring rather than return anchors that needed it.
+  - `xmustard-ops review anchor <ws> --base REF [--head REF] (--findings FILE | --evidence HANDLE [--token-file PATH])` prints the change, source, files, findings with anchors and checks, counts, normalizations, head reads and the label `evidence only: ... no review result approves a change`. It stores nothing.
+  - An evidence handle is read the way the evidence store checks it:
+    - in open mode (no token store), at workspace scope;
+    - otherwise a valid token is required (`--token-file`, then `XMUSTARD_API_TOKEN`), and it must not be presence-only and must be scoped to the workspace. The read is then that principal's, so only its own captures are readable.
+
+    An original over 4 MiB is refused.
+- *Off by default.*
+  - `go list -deps` finds neither package in the default `xmustard-api`, `xmustard-mcp` or `xmustard-ops`.
+  - With `-tags review`, `xmustard-ops` grows by 123,800 bytes (25,069,968 to 25,193,768). `xmustard-api` grows by 11,136 bytes, because it links workspaceops' tagged file, which nothing in the API calls.
+  - `review` usage now lists the registered subcommands. An untagged test asserts that `review anchor` is absent.
+  - `make check-backend` (and AGENTS.md) now also runs `go vet -tags review` and the tagged `Review|Merge` tests on `cmd/xmustard-ops` and `internal/workspaceops`.
+  - No MCP tool, argument or tools/list byte changed.
+- *Licensing.* This is the repository's first Apache-2.0 code:
+  - `NOTICE` is new. It states that the repository is mixed-licence and that a file without an SPDX header is MIT, and names the translated files and upstream commit.
+  - `third_party/open-code-review/LICENSE` is upstream's licence text.
+  - Each ported file, tests included, keeps `SPDX-License-Identifier: Apache-2.0` and upstream's copyright line, adds xMustard's, and lists its changes. The package's own files carry `SPDX-License-Identifier: MIT`.
+  - README gains a License section.
+- *Fixtures.* `anchor/testdata/fixtures.json` holds 22 deterministic cases, with no model, git or clock:
+  - CRLF in the diff, the snippet and the head content;
+  - ambiguity across two hunks, in the whole file and across files;
+  - every tier, a hunk match beating the same code elsewhere, a blank line inside a hunk;
+  - deleted and added files, re-filing (including from a file outside the change);
+  - indentation versus interior spacing, the 40-line bound either side, a blank snippet.
+
+  Upstream's hunk, resolver and relocation tests are ported in table form.
+- *Measured (build box: Linux, 6 cores).*
+  - `BenchmarkPlace` parses a 200-file change (300 lines at head each) and anchors 50 snippets: most in a hunk, a fifth only at head, and a tenth in no file, so re-filing reads every head. It took 4.6 to 5.9 ms per op, with 3.6 MB and 7,620 allocations (3 runs of 20).
+  - `BenchmarkReviewAnchor` runs end to end over 200 files of 300 lines with two lines edited in each. Per anchoring it runs two `rev-parse`, one `merge-base`, one diff of 113,708 bytes, and one `cat-file` that reads 1,631,460 bytes, which is every head, because 5 of the 50 findings are found nowhere. It took 46.3 to 48.3 ms per op, with 8.4 MB and about 14,400 allocations (3 runs of 10).
+  - The anchoring runs in the short-lived ops process, not the daemon. The ledger line is 0, with a note.
+- *Checks.*
+  - The full Linux gate passes at `eadf3dd` with `remote_exit=0`: `xm-remote-check.sh all -count=1` runs the Rust release build, tests and clippy, then go vet and every Go package. Clippy reports 6 warnings, the same as the base; no Rust code changed.
+  - `go vet -tags review` and the tagged `Review|Merge` tests pass on `cmd/xmustard-ops` and `internal/workspaceops`.
+  - The bench unit tests pass (74 run, 3 skipped). The ledger consistency test now expects WS-65 after WS-63.
+  - `feat/parity-v2` moved to `94a3f37` (v0.1.0 release notes and the Homebrew formula), which touches none of these files, so it was not merged.
+- *Files.*
+  - New:
+    - `api-go/internal/anchor/`: `hunk.go`, `resolve.go` and `relocate.go` and their tests (Apache-2.0), plus `locate.go`, `doc.go`, `anchor_test.go` and `testdata/fixtures.json`;
+    - `api-go/internal/review/`: `findings.go`, `diffsplit.go`, `check.go` and `review_test.go`;
+    - `workspaceops/review_anchor.go` and its test, and `xmustard-ops/review_anchor.go` and its test, all under the review tag, plus `xmustard-ops/review_default_test.go`;
+    - `NOTICE` and `third_party/open-code-review/LICENSE`.
+  - Changed:
+    - `workspaceops/merge_approval.go`: `observeChange` and `reviewGitCommand`, with no behaviour change;
+    - `xmustard-ops/approval.go`: the usage lists the registered review subcommands;
+    - `Makefile`, `AGENTS.md`, `README.md`, `docs/ARCHITECTURE.md`, the PAR-REV-04 and PAR-REV-05 rows of the requirements, `scripts/bench/budget_ledger.json` and its test.
+- *Deviations.*
+  - **Go, not Rust.** The integrator's §13.6 proposal put the anchoring in `rust-core/src/review/`. The critic's binding WS-65 correction exposes it as a library for WS-27 and WS-28, which are Go. A Go-to-Go port keeps upstream's SPDX lines and structure, and anchoring is pure string work that needs no index. A Rust diff module (WS-64 folded into WS-35) can pass its diff text to it, or port the fixtures.
+  - **One diff mode.** Only range mode is supported: the merge base of `--base` to `--head`, the change merge approval binds. Workspace, staged and commit modes belong to WS-64/WS-35. A deleted file is anchored on its old side only.
+  - **Evidence, not stored.** Nothing is persisted, and `verify` does not take findings yet. WS-66 owns the store; WS-67 owns the scalar `verify(subject='change', evidence_handle|findings_file)` transport, and must confine a findings-file path, which the operator CLI takes as given.
+  - **`symbol_resolved` stays `unknown`.** The library runs no index query, so WS-67/WS-68 fill it from the resident index. `in_scope` means "in the diff": the REV-02 selection and its exclusion reasons do not exist yet.
+  - **Kept, not refused.** Content over 2,000 characters is cut rather than refused, and an oversized existing_code drops the snippet but keeps the finding. Both are recorded, so one long OCR comment does not reject a batch.
+  - **Operator reads.** The ops CLI reads the evidence store directly, as every ops command reads the data directory. It authorizes the read as a token's principal only when auth is configured.
