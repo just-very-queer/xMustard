@@ -246,3 +246,10 @@ and the [evidence-gated backlog](docs/ROADMAP.md).
   stdio server; calls the Rust core for the heavy work.
 - **Postgres** — durable semantic and operational index (JSON files remain the
   source of truth; Postgres is the queryable materialization).
+
+## License
+
+MIT (see [LICENSE](LICENSE)), except files whose header names another licence:
+the finding-anchoring files in `api-go/internal/anchor/` are Apache-2.0
+translations of [open-code-review](https://github.com/alibaba/open-code-review).
+See [NOTICE](NOTICE).

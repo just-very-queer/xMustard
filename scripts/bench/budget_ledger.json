@@ -128,7 +128,8 @@
   "WS-60": {"line_mib": null, "process": "rust_core_per_call", "title": "framework entry points, extra language packs (critic addition)"},
   "WS-61": {"line_mib": null, "process": "rust_index_service", "scenarios": ["agents-2"], "title": "personalized PageRank repo map (critic addition)"},
   "WS-62": {"line_mib": null, "process": "go_daemon", "item": "governance_caches", "title": "path-scoped rule-file export (critic addition)"},
-  "WS-63": {"line_mib": null, "process": null, "title": "evaluation corpus authoring (critic addition)"}
+  "WS-63": {"line_mib": null, "process": null, "title": "evaluation corpus authoring (critic addition)"},
+  "WS-65": {"line_mib": 0, "process": null, "title": "deterministic finding anchoring (OCR port)", "note": "Behind the review build tag, off by default: the default xmustard-api, xmustard-mcp and xmustard-ops builds do not link internal/anchor or internal/review (go list -deps). `xmustard-ops -tags review` is +124 KB of binary; an anchoring runs in that short-lived operator process, measured at 8.4 MB allocated per 50 findings over a 200-file change (BenchmarkReviewAnchor). WS-67 puts it on the daemon line when verify takes findings."}
  },
  "tolerance": {
    "tree_peak_mib": 10.0,

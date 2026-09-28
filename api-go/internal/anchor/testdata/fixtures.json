@@ -1,0 +1,459 @@
+{
+ "about": "WS-65 anchoring fixtures (anchor.Set.Place). Each case builds anchor.Files from files[] (head is the file at head, absent when unknown), anchors snippet filed against path, and expects want, an anchor.Anchor as JSON. A snippet NewSnippet refuses is unanchored with anchor.SnippetReason. Deterministic: no model, no git, no clock.",
+ "cases": [
+  {
+   "name": "new side",
+   "files": [
+    {
+     "old_path": "a.go",
+     "new_path": "a.go",
+     "diff": "diff --git a/a.go b/a.go\n--- a/a.go\n+++ b/a.go\n@@ -4,4 +4,5 @@ func A() {\n \tx := load()\n-\tif x == nil {\n+\tif x == nil || x.err != nil {\n+\t\tlog.Print(\"bad\")\n \t\treturn\n \t}\n",
+     "head": "package a\n\nfunc A() {\n\tx := load()\n\tif x == nil || x.err != nil {\n\t\tlog.Print(\"bad\")\n\t\treturn\n\t}\n\tuse(x)\n}\n\nfunc load() *T { return nil }\n"
+    }
+   ],
+   "path": "a.go",
+   "snippet": "if x == nil || x.err != nil {\n\tlog.Print(\"bad\")",
+   "want": {
+    "path": "a.go",
+    "start_line": 5,
+    "end_line": 6,
+    "side": "new",
+    "anchor_status": "exact_new"
+   }
+  },
+  {
+   "name": "old side for deleted code",
+   "files": [
+    {
+     "old_path": "a.go",
+     "new_path": "a.go",
+     "diff": "diff --git a/a.go b/a.go\n--- a/a.go\n+++ b/a.go\n@@ -4,4 +4,5 @@ func A() {\n \tx := load()\n-\tif x == nil {\n+\tif x == nil || x.err != nil {\n+\t\tlog.Print(\"bad\")\n \t\treturn\n \t}\n",
+     "head": "package a\n\nfunc A() {\n\tx := load()\n\tif x == nil || x.err != nil {\n\t\tlog.Print(\"bad\")\n\t\treturn\n\t}\n\tuse(x)\n}\n\nfunc load() *T { return nil }\n"
+    }
+   ],
+   "path": "a.go",
+   "snippet": "\tx := load()\n\tif x == nil {",
+   "want": {
+    "path": "a.go",
+    "start_line": 4,
+    "end_line": 5,
+    "side": "old",
+    "anchor_status": "exact_old"
+   }
+  },
+  {
+   "name": "whole file outside the hunks",
+   "files": [
+    {
+     "old_path": "a.go",
+     "new_path": "a.go",
+     "diff": "diff --git a/a.go b/a.go\n--- a/a.go\n+++ b/a.go\n@@ -4,4 +4,5 @@ func A() {\n \tx := load()\n-\tif x == nil {\n+\tif x == nil || x.err != nil {\n+\t\tlog.Print(\"bad\")\n \t\treturn\n \t}\n",
+     "head": "package a\n\nfunc A() {\n\tx := load()\n\tif x == nil || x.err != nil {\n\t\tlog.Print(\"bad\")\n\t\treturn\n\t}\n\tuse(x)\n}\n\nfunc load() *T { return nil }\n"
+    }
+   ],
+   "path": "a.go",
+   "snippet": "func load() *T { return nil }",
+   "want": {
+    "path": "a.go",
+    "start_line": 12,
+    "end_line": 12,
+    "side": "new",
+    "anchor_status": "file"
+   }
+  },
+  {
+   "name": "CRLF diff, LF snippet",
+   "files": [
+    {
+     "old_path": "a.go",
+     "new_path": "a.go",
+     "diff": "diff --git a/a.go b/a.go\r\n--- a/a.go\r\n+++ b/a.go\r\n@@ -4,4 +4,5 @@ func A() {\r\n \tx := load()\r\n-\tif x == nil {\r\n+\tif x == nil || x.err != nil {\r\n+\t\tlog.Print(\"bad\")\r\n \t\treturn\r\n \t}\r\n",
+     "head": "package a\r\n\r\nfunc A() {\r\n\tx := load()\r\n\tif x == nil || x.err != nil {\r\n\t\tlog.Print(\"bad\")\r\n\t\treturn\r\n\t}\r\n\tuse(x)\r\n}\r\n\r\nfunc load() *T { return nil }\r\n"
+    }
+   ],
+   "path": "a.go",
+   "snippet": "if x == nil || x.err != nil {\n\tlog.Print(\"bad\")",
+   "want": {
+    "path": "a.go",
+    "start_line": 5,
+    "end_line": 6,
+    "side": "new",
+    "anchor_status": "exact_new"
+   }
+  },
+  {
+   "name": "LF diff, CRLF snippet",
+   "files": [
+    {
+     "old_path": "a.go",
+     "new_path": "a.go",
+     "diff": "diff --git a/a.go b/a.go\n--- a/a.go\n+++ b/a.go\n@@ -4,4 +4,5 @@ func A() {\n \tx := load()\n-\tif x == nil {\n+\tif x == nil || x.err != nil {\n+\t\tlog.Print(\"bad\")\n \t\treturn\n \t}\n",
+     "head": "package a\n\nfunc A() {\n\tx := load()\n\tif x == nil || x.err != nil {\n\t\tlog.Print(\"bad\")\n\t\treturn\n\t}\n\tuse(x)\n}\n\nfunc load() *T { return nil }\n"
+    }
+   ],
+   "path": "a.go",
+   "snippet": "if x == nil || x.err != nil {\r\n\tlog.Print(\"bad\")\r\n",
+   "want": {
+    "path": "a.go",
+    "start_line": 5,
+    "end_line": 6,
+    "side": "new",
+    "anchor_status": "exact_new"
+   }
+  },
+  {
+   "name": "CRLF head content",
+   "files": [
+    {
+     "old_path": "a.go",
+     "new_path": "a.go",
+     "diff": "diff --git a/a.go b/a.go\n--- a/a.go\n+++ b/a.go\n@@ -4,4 +4,5 @@ func A() {\n \tx := load()\n-\tif x == nil {\n+\tif x == nil || x.err != nil {\n+\t\tlog.Print(\"bad\")\n \t\treturn\n \t}\n",
+     "head": "package a\r\n\r\nfunc A() {\r\n\tx := load()\r\n\tif x == nil || x.err != nil {\r\n\t\tlog.Print(\"bad\")\r\n\t\treturn\r\n\t}\r\n\tuse(x)\r\n}\r\n\r\nfunc load() *T { return nil }\r\n"
+    }
+   ],
+   "path": "a.go",
+   "snippet": "use(x)\n}",
+   "want": {
+    "path": "a.go",
+    "start_line": 9,
+    "end_line": 10,
+    "side": "new",
+    "anchor_status": "file"
+   }
+  },
+  {
+   "name": "snippet copied with diff markers",
+   "files": [
+    {
+     "old_path": "a.go",
+     "new_path": "a.go",
+     "diff": "diff --git a/a.go b/a.go\n--- a/a.go\n+++ b/a.go\n@@ -4,4 +4,5 @@ func A() {\n \tx := load()\n-\tif x == nil {\n+\tif x == nil || x.err != nil {\n+\t\tlog.Print(\"bad\")\n \t\treturn\n \t}\n",
+     "head": "package a\n\nfunc A() {\n\tx := load()\n\tif x == nil || x.err != nil {\n\t\tlog.Print(\"bad\")\n\t\treturn\n\t}\n\tuse(x)\n}\n\nfunc load() *T { return nil }\n"
+    }
+   ],
+   "path": "a.go",
+   "snippet": "+\tif x == nil || x.err != nil {\n+\t\tlog.Print(\"bad\")\n \t\treturn",
+   "want": {
+    "path": "a.go",
+    "start_line": 5,
+    "end_line": 7,
+    "side": "new",
+    "anchor_status": "exact_new"
+   }
+  },
+  {
+   "name": "ambiguous across two hunks",
+   "files": [
+    {
+     "old_path": "b.go",
+     "new_path": "b.go",
+     "diff": "@@ -1,3 +1,4 @@\n a()\n+\treturn nil\n b()\n c()\n@@ -20,3 +21,4 @@\n d()\n+\treturn nil\n e()\n f()\n"
+    }
+   ],
+   "path": "b.go",
+   "snippet": "return nil",
+   "want": {
+    "path": "b.go",
+    "start_line": 0,
+    "end_line": 0,
+    "anchor_status": "unanchored",
+    "reason": "ambiguous",
+    "candidates": 2
+   }
+  },
+  {
+   "name": "unique with context across two hunks",
+   "files": [
+    {
+     "old_path": "b.go",
+     "new_path": "b.go",
+     "diff": "@@ -1,3 +1,4 @@\n a()\n+\treturn nil\n b()\n c()\n@@ -20,3 +21,4 @@\n d()\n+\treturn nil\n e()\n f()\n"
+    }
+   ],
+   "path": "b.go",
+   "snippet": "d()\n\treturn nil",
+   "want": {
+    "path": "b.go",
+    "start_line": 21,
+    "end_line": 22,
+    "side": "new",
+    "anchor_status": "exact_new"
+   }
+  },
+  {
+   "name": "ambiguous in the whole file",
+   "files": [
+    {
+     "old_path": "c.go",
+     "new_path": "c.go",
+     "diff": "@@ -1 +1 @@\n-old\n+new\n",
+     "head": "new\n}\n\n}\nx\n"
+    }
+   ],
+   "path": "c.go",
+   "snippet": "}",
+   "want": {
+    "path": "c.go",
+    "start_line": 0,
+    "end_line": 0,
+    "anchor_status": "unanchored",
+    "reason": "ambiguous",
+    "candidates": 2
+   }
+  },
+  {
+   "name": "a hunk match wins over the same code elsewhere in the file",
+   "files": [
+    {
+     "old_path": "d.go",
+     "new_path": "d.go",
+     "diff": "@@ -2,2 +2,3 @@\n a\n+dup()\n b\n",
+     "head": "top\na\ndup()\nb\ndup()\n"
+    }
+   ],
+   "path": "d.go",
+   "snippet": "dup()",
+   "want": {
+    "path": "d.go",
+    "start_line": 3,
+    "end_line": 3,
+    "side": "new",
+    "anchor_status": "exact_new"
+   }
+  },
+  {
+   "name": "blank line inside a hunk",
+   "files": [
+    {
+     "old_path": "e.go",
+     "new_path": "e.go",
+     "diff": "@@ -1,2 +1,5 @@\n func E() {\n+\tone()\n+\n+\ttwo()\n }\n"
+    }
+   ],
+   "path": "e.go",
+   "snippet": "one()\ntwo()",
+   "want": {
+    "path": "e.go",
+    "start_line": 2,
+    "end_line": 4,
+    "side": "new",
+    "anchor_status": "exact_new"
+   }
+  },
+  {
+   "name": "deleted file",
+   "files": [
+    {
+     "old_path": "gone.go",
+     "new_path": "",
+     "diff": "diff --git a/gone.go b/gone.go\ndeleted file mode 100644\n--- a/gone.go\n+++ /dev/null\n@@ -1,3 +0,0 @@\n-package gone\n-\n-func Gone() {}\n"
+    }
+   ],
+   "path": "gone.go",
+   "snippet": "func Gone() {}",
+   "want": {
+    "path": "gone.go",
+    "start_line": 3,
+    "end_line": 3,
+    "side": "old",
+    "anchor_status": "exact_old"
+   }
+  },
+  {
+   "name": "added file",
+   "files": [
+    {
+     "old_path": "",
+     "new_path": "new.go",
+     "diff": "diff --git a/new.go b/new.go\nnew file mode 100644\n--- /dev/null\n+++ b/new.go\n@@ -0,0 +1,3 @@\n+package fresh\n+\n+func New() {}\n"
+    }
+   ],
+   "path": "new.go",
+   "snippet": "package fresh\nfunc New() {}",
+   "want": {
+    "path": "new.go",
+    "start_line": 1,
+    "end_line": 3,
+    "side": "new",
+    "anchor_status": "exact_new"
+   }
+  },
+  {
+   "name": "re-filed to the only file holding it",
+   "files": [
+    {
+     "old_path": "a.go",
+     "new_path": "a.go",
+     "diff": "diff --git a/a.go b/a.go\n--- a/a.go\n+++ b/a.go\n@@ -4,4 +4,5 @@ func A() {\n \tx := load()\n-\tif x == nil {\n+\tif x == nil || x.err != nil {\n+\t\tlog.Print(\"bad\")\n \t\treturn\n \t}\n",
+     "head": "package a\n\nfunc A() {\n\tx := load()\n\tif x == nil || x.err != nil {\n\t\tlog.Print(\"bad\")\n\t\treturn\n\t}\n\tuse(x)\n}\n\nfunc load() *T { return nil }\n"
+    },
+    {
+     "old_path": "f.go",
+     "new_path": "f.go",
+     "diff": "@@ -1,2 +1,3 @@\n func F() {\n+\tpanic(\"todo\")\n }\n"
+    }
+   ],
+   "path": "a.go",
+   "snippet": "panic(\"todo\")",
+   "want": {
+    "path": "f.go",
+    "start_line": 2,
+    "end_line": 2,
+    "side": "new",
+    "anchor_status": "relocated",
+    "refiled_from": "a.go"
+   }
+  },
+  {
+   "name": "not re-filed when two other files hold it",
+   "files": [
+    {
+     "old_path": "a.go",
+     "new_path": "a.go",
+     "diff": "diff --git a/a.go b/a.go\n--- a/a.go\n+++ b/a.go\n@@ -4,4 +4,5 @@ func A() {\n \tx := load()\n-\tif x == nil {\n+\tif x == nil || x.err != nil {\n+\t\tlog.Print(\"bad\")\n \t\treturn\n \t}\n",
+     "head": "package a\n\nfunc A() {\n\tx := load()\n\tif x == nil || x.err != nil {\n\t\tlog.Print(\"bad\")\n\t\treturn\n\t}\n\tuse(x)\n}\n\nfunc load() *T { return nil }\n"
+    },
+    {
+     "old_path": "f.go",
+     "new_path": "f.go",
+     "diff": "@@ -1,2 +1,3 @@\n func F() {\n+\tpanic(\"todo\")\n }\n"
+    },
+    {
+     "old_path": "g.go",
+     "new_path": "g.go",
+     "diff": "@@ -1,2 +1,3 @@\n func G() {\n+\tpanic(\"todo\")\n }\n"
+    }
+   ],
+   "path": "a.go",
+   "snippet": "panic(\"todo\")",
+   "want": {
+    "path": "a.go",
+    "start_line": 0,
+    "end_line": 0,
+    "anchor_status": "unanchored",
+    "reason": "ambiguous_across_files",
+    "candidates": 2
+   }
+  },
+  {
+   "name": "filed against a file outside the change",
+   "files": [
+    {
+     "old_path": "a.go",
+     "new_path": "a.go",
+     "diff": "diff --git a/a.go b/a.go\n--- a/a.go\n+++ b/a.go\n@@ -4,4 +4,5 @@ func A() {\n \tx := load()\n-\tif x == nil {\n+\tif x == nil || x.err != nil {\n+\t\tlog.Print(\"bad\")\n \t\treturn\n \t}\n",
+     "head": "package a\n\nfunc A() {\n\tx := load()\n\tif x == nil || x.err != nil {\n\t\tlog.Print(\"bad\")\n\t\treturn\n\t}\n\tuse(x)\n}\n\nfunc load() *T { return nil }\n"
+    }
+   ],
+   "path": "elsewhere.go",
+   "snippet": "log.Print(\"bad\")",
+   "want": {
+    "path": "a.go",
+    "start_line": 6,
+    "end_line": 6,
+    "side": "new",
+    "anchor_status": "relocated",
+    "refiled_from": "elsewhere.go"
+   }
+  },
+  {
+   "name": "indentation is ignored, interior spacing is not",
+   "files": [
+    {
+     "old_path": "a.go",
+     "new_path": "a.go",
+     "diff": "diff --git a/a.go b/a.go\n--- a/a.go\n+++ b/a.go\n@@ -4,4 +4,5 @@ func A() {\n \tx := load()\n-\tif x == nil {\n+\tif x == nil || x.err != nil {\n+\t\tlog.Print(\"bad\")\n \t\treturn\n \t}\n",
+     "head": "package a\n\nfunc A() {\n\tx := load()\n\tif x == nil || x.err != nil {\n\t\tlog.Print(\"bad\")\n\t\treturn\n\t}\n\tuse(x)\n}\n\nfunc load() *T { return nil }\n"
+    }
+   ],
+   "path": "a.go",
+   "snippet": "if x==nil || x.err != nil {",
+   "want": {
+    "path": "a.go",
+    "start_line": 0,
+    "end_line": 0,
+    "anchor_status": "unanchored",
+    "reason": "not_found"
+   }
+  },
+  {
+   "name": "not found",
+   "files": [
+    {
+     "old_path": "a.go",
+     "new_path": "a.go",
+     "diff": "diff --git a/a.go b/a.go\n--- a/a.go\n+++ b/a.go\n@@ -4,4 +4,5 @@ func A() {\n \tx := load()\n-\tif x == nil {\n+\tif x == nil || x.err != nil {\n+\t\tlog.Print(\"bad\")\n \t\treturn\n \t}\n",
+     "head": "package a\n\nfunc A() {\n\tx := load()\n\tif x == nil || x.err != nil {\n\t\tlog.Print(\"bad\")\n\t\treturn\n\t}\n\tuse(x)\n}\n\nfunc load() *T { return nil }\n"
+    }
+   ],
+   "path": "a.go",
+   "snippet": "no such code",
+   "want": {
+    "path": "a.go",
+    "start_line": 0,
+    "end_line": 0,
+    "anchor_status": "unanchored",
+    "reason": "not_found"
+   }
+  },
+  {
+   "name": "blank snippet",
+   "files": [
+    {
+     "old_path": "a.go",
+     "new_path": "a.go",
+     "diff": "diff --git a/a.go b/a.go\n--- a/a.go\n+++ b/a.go\n@@ -4,4 +4,5 @@ func A() {\n \tx := load()\n-\tif x == nil {\n+\tif x == nil || x.err != nil {\n+\t\tlog.Print(\"bad\")\n \t\treturn\n \t}\n",
+     "head": "package a\n\nfunc A() {\n\tx := load()\n\tif x == nil || x.err != nil {\n\t\tlog.Print(\"bad\")\n\t\treturn\n\t}\n\tuse(x)\n}\n\nfunc load() *T { return nil }\n"
+    }
+   ],
+   "path": "a.go",
+   "snippet": " \n\t\r\n",
+   "want": {
+    "path": "a.go",
+    "start_line": 0,
+    "end_line": 0,
+    "anchor_status": "unanchored",
+    "reason": "no_snippet"
+   }
+  },
+  {
+   "name": "41 lines is too large",
+   "files": [
+    {
+     "old_path": "a.go",
+     "new_path": "a.go",
+     "diff": "diff --git a/a.go b/a.go\n--- a/a.go\n+++ b/a.go\n@@ -4,4 +4,5 @@ func A() {\n \tx := load()\n-\tif x == nil {\n+\tif x == nil || x.err != nil {\n+\t\tlog.Print(\"bad\")\n \t\treturn\n \t}\n",
+     "head": "package a\n\nfunc A() {\n\tx := load()\n\tif x == nil || x.err != nil {\n\t\tlog.Print(\"bad\")\n\t\treturn\n\t}\n\tuse(x)\n}\n\nfunc load() *T { return nil }\n"
+    }
+   ],
+   "path": "a.go",
+   "snippet": "l0\nl1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\nl11\nl12\nl13\nl14\nl15\nl16\nl17\nl18\nl19\nl20\nl21\nl22\nl23\nl24\nl25\nl26\nl27\nl28\nl29\nl30\nl31\nl32\nl33\nl34\nl35\nl36\nl37\nl38\nl39\nl40",
+   "want": {
+    "path": "a.go",
+    "start_line": 0,
+    "end_line": 0,
+    "anchor_status": "unanchored",
+    "reason": "snippet_too_large"
+   }
+  },
+  {
+   "name": "40 lines is not",
+   "files": [
+    {
+     "old_path": "",
+     "new_path": "h.go",
+     "diff": "@@ -0,0 +1,40 @@\n+l0\n+l1\n+l2\n+l3\n+l4\n+l5\n+l6\n+l7\n+l8\n+l9\n+l10\n+l11\n+l12\n+l13\n+l14\n+l15\n+l16\n+l17\n+l18\n+l19\n+l20\n+l21\n+l22\n+l23\n+l24\n+l25\n+l26\n+l27\n+l28\n+l29\n+l30\n+l31\n+l32\n+l33\n+l34\n+l35\n+l36\n+l37\n+l38\n+l39\n"
+    }
+   ],
+   "path": "h.go",
+   "snippet": "l0\nl1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\nl11\nl12\nl13\nl14\nl15\nl16\nl17\nl18\nl19\nl20\nl21\nl22\nl23\nl24\nl25\nl26\nl27\nl28\nl29\nl30\nl31\nl32\nl33\nl34\nl35\nl36\nl37\nl38\nl39\n",
+   "want": {
+    "path": "h.go",
+    "start_line": 1,
+    "end_line": 40,
+    "side": "new",
+    "anchor_status": "exact_new"
+   }
+  }
+ ]
+}
