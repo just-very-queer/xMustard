@@ -13,13 +13,13 @@ are in the [v0.1.0 notes](releases/v0.1.0.md).
 
 | | |
 | --- | --- |
-| Release | [v0.1.1 on GitHub](https://github.com/just-very-queer/xMustard/releases/tag/v0.1.1), 2026-09-28; built by the tag-triggered release workflow |
+| Release | [v0.1.1 on GitHub](https://github.com/just-very-queer/xMustard/releases/tag/v0.1.1), cut 2026-09-28. The tag-triggered release workflow builds the archives and drafts the release; the owner publishes it |
 | Prebuilt archives | macOS arm64 (built on `macos-15`) and Linux x86_64 (built on `ubuntu-22.04`), each with a `.sha256` file, plus `SHA256SUMS` |
 | Binaries | `xmustard-api`, `xmustard-ops`, `xmustard-core`, `xmustard-relay`, and the older Go stdio shim `xmustard-mcp`. The Claude Code plugin's `xmustard-hook` is built from source |
 | MCP surface | Nine tools on protocol 2025-06-18 (2024-11-05 is also negotiated) |
 | Clients | Any MCP client, over Streamable HTTP or the stdio relay. Claude Code has a plugin with hooks, and Pi its own extension. Codex, OpenCode and Cursor connect through MCP configuration only |
 | Default posture | Local, no Docker. The API binds `127.0.0.1:8042` and serves the core profile |
-| License | MIT, except the Apache-2.0 finding-anchoring files (review build tag only; see `NOTICE`) |
+| License | MIT, except the Apache-2.0 finding-anchoring files (linked only into `review`-tagged builds; see `NOTICE`) |
 | Next | Codex, OpenCode and Cursor adapters, and the parity gate. Development continues on `feat/parity-v2`; see [In progress](#in-progress) |
 
 ## What ships in v0.1.1
@@ -46,10 +46,11 @@ the top 5, up from 0 of 6.
 **Index the whole repository.** The old 800-file cap is gone. Every eligible file is
 indexed up to a declared envelope (10,000 files and 100,000 symbols by default); past
 it, the index is partial and says so. On a cline clone it indexed 2,660 of 2,660 files
-(51,263 symbols) at a 21.8-23.8 MiB peak across the recorded runs, and a one-file
-update took 140-265 ms under shared load. Fifteen tree-sitter packs cover Rust, Go,
-TypeScript, TSX, JavaScript, Python, Java, C, C++, C#, Ruby, PHP, Kotlin, Swift and
-Bash, and coverage is reported per language. With the resident worker on, a watcher
+(51,263 symbols) at a 21.8-25.0 MiB peak across the recorded runs (25.0 MiB with the
+graph-segment write that v0.1.1's index build performs), and a one-file update took
+140-265 ms under shared load. Fifteen tree-sitter packs cover Rust, Go, TypeScript,
+TSX, JavaScript, Python, Java, C, C++, C#, Ruby, PHP, Kotlin, Swift and Bash, and
+coverage is reported per language. With the resident worker on, a watcher
 turns edits into incremental updates: on a 5,000-file tree an edit reached the index in
 p50 424 ms on Linux and 488 ms on macOS (in-process loop), 497 ms on Linux through the
 API.
@@ -107,22 +108,24 @@ single-machine results, not universal ceilings.
 
 | What | Result | Platform | Source |
 | --- | --- | --- | --- |
-| Budget gate v2, CI suite, v0.1.1 release tree | 66.6 MiB (frozen v1 workload, stdio shim) and 60.8 MiB (2 agents through `xmustard-relay`), both PASS; line 95.4 MiB. v0.1.0's release commit: 70.5 and 68.8 MiB | Linux x86_64, release core and relay, worker off | [Gate v2 report](benchmarks/evidence/2026-09-28/release-v0.1.1-gate-v2-ci.md), [release notes](releases/v0.1.1.md) |
-| Retrieval gate | 21 of 21 checks on the v0.1.1 release tree: 12/12 gold paths and 10/10 spans in the top 5, gold-path MRR@5 1.0, 6/6 body-term queries, cold, warm and after a one-file edit | Linux x86_64 | [Release notes](releases/v0.1.1.md), [WS-18](benchmarks/2026-09-28-ws18-hybrid-search.md) |
+| Budget gate v2, CI suite, v0.1.1 release tree | 66.6 MiB (frozen v1 workload, stdio shim) and 60.8 MiB (2 agents through `xmustard-relay`), both PASS; line 95.4 MiB. v0.1.0's release commit: 70.5 and 68.8 MiB | Linux x86_64, release core and relay, worker off | [Gate v2 report](benchmarks/evidence/2026-09-28/release-v0.1.1-gate-v2-ci.md), [v0.1.1 notes](releases/v0.1.1.md), [v0.1.0 notes](releases/v0.1.0.md) |
+| Retrieval gate | 21 of 21 checks on the v0.1.1 release tree: 12/12 gold paths and 10/10 spans in the top 5, gold-path MRR@5 1.0, 6/6 body-term queries, cold, warm and after a one-file edit | Linux x86_64 | [Release-tree log](benchmarks/evidence/2026-09-28/release-v0.1.1-checks.txt), [WS-18](benchmarks/2026-09-28-ws18-hybrid-search.md) |
 | Watcher freshness, edit to index | p50 424 ms (max 447) inotify and 488 ms (max 504) FSEvents in the in-process loop; 497 ms (max 549) through the API | 5,000-file tree; Linux x86_64 and Apple M1 | [WS-15](benchmarks/2026-09-28-ws15-watcher.md) |
-| Claude Code hooks under load | PreToolUse(Read) p50 4.2 ms, p95 7.5 ms; PostToolUse(Bash, 30,000 characters) p50 4.0 ms, p95 8.5 ms, 600 of 600 replaced; 0 spawns; API peak 41.7 MiB | Linux x86_64, 4 concurrent clients, 600 calls each | [Build plan, WS-23 record](plans/2026-09-25-parity-build-plan.md) |
+| Claude Code hooks under load | PreToolUse(Read) p50 4.2 ms, p95 7.5 ms; PostToolUse(Bash, 30,000 characters) p50 4.0 ms, p95 8.5 ms, 600 of 600 replaced; 0 spawns; API peak 41.7 MiB | Linux x86_64, 600 calls of each event from 4 concurrent clients | [Build plan, WS-23 record](plans/2026-09-25-parity-build-plan.md) |
 | Capture redactor | Live heap at most 0.4 MiB on 16 MiB of pure secrets; raw 16 MiB captures at 31.4-33.0 MB/s against 33.3-39.3 pass-through | Linux x86_64, load 6 to 10 | [Release notes](releases/v0.1.1.md#capture-redaction) |
 | Relay vs Go shim, RSS per stdio agent | 2,192-2,240 KiB vs 13,824-13,888 KiB | macOS arm64 | [WS-13](benchmarks/2026-09-26-ws13-relay-rss.md) |
-| Code index, full build | cline 2,660/2,660 files at 21.8-23.8 MiB; pi-mono 1,636/1,636 at 20.9-22.5 MiB (both runs) | macOS M1 | [WS-07](benchmarks/2026-09-25-ws07-index-rss.md) |
+| Code index, full build | cline 2,660/2,660 files at 21.8-25.0 MiB (25.0 with the graph-segment write); pi-mono 1,636/1,636 at 20.9-22.5 MiB | macOS M1 | [WS-07](benchmarks/2026-09-25-ws07-index-rss.md), [WS-14](benchmarks/2026-09-26-ws14-resident-index.md) |
 | `ground` output budget | 19,544 B unbudgeted, 4,550 B at the default 6,000-character budget | pi-mono clone | [Build plan, WS-54 record](plans/2026-09-25-parity-build-plan.md) |
 | `recall` over 1,000 memories | p50 28.5 ms, p95 31.0 ms; API RSS 31.5 MB after 600 recalls | Linux x86_64 | [Build plan, WS-20 record](plans/2026-09-25-parity-build-plan.md) |
 | Resolver precision (CALLS edges) | 30 of 30 correct, recall 0.938 | Small purpose-written fixtures | [WS-17](benchmarks/2026-09-26-ws17-resolver.md) |
 | `tools/list`, lean, all nine tools | Capped at 8,888 B on protocol 2025-06-18 (119 B more than v0.1.0, for `impact`'s `path`) | Enforced by a test | [`tools_list_budget.json`](../api-go/internal/mcpserver/testdata/tools_list_budget.json) |
 
 Checks that passed on the v0.1.1 release tree: every cargo test target and all 20 Go
-packages, the `review`-tagged vet and tests, `cargo build --release --locked`,
-`make bench-test` (76 tests, 3 skipped), the Pi check (45 tests) and a `make release`
-dry run for linux-x86_64. Clippy reports 6 warnings.
+packages, the `review`-tagged vet and tests, `make bench-test` (76 tests, 3 skipped),
+the retrieval gate, the Pi check (45 tests) and a local `make release` for
+linux-x86_64, which builds with `cargo build --release --locked`. Clippy reports 6
+warnings. The log:
+[release-v0.1.1-checks.txt](benchmarks/evidence/2026-09-28/release-v0.1.1-checks.txt).
 
 What these numbers do not show:
 
@@ -141,34 +144,49 @@ What these numbers do not show:
 ## Known limits in v0.1.1
 
 - **Not a parity claim.** The parity-scale suite (4 agents, 2 hot repositories, 4
-  worktrees) has not passed its 95.4 MiB line. With the resident worker on, every
-  parity-scale scenario measured is over it (agents-2 at 201-209 MiB; the worker alone
-  peaks at 171-185 MiB while it builds the legacy graph), before and after the watcher
-  alike. The final parity gate arrives with WS-50.
+  worktrees) has not passed its 95.4 MiB line; its 4-agent, two-repository and
+  four-worktree scenarios have not been run. With the resident worker on, the 2-agent
+  scenario is over the line (201-209 MiB, the worker alone at 171-185 MiB), before and
+  after the watcher alike; WS-15 reads that as the worker building the legacy graph,
+  which was not measured. With the worker off, WS-14 measured it at 94.0 MiB on macOS.
+  On the evaluation corpus's real repositories (pi-mono, cline), the process tree
+  peaked at 91.7-120.9 MiB through the stdio shim, over the line in 5, 8 and 7 of 10
+  runs. The final parity gate arrives with WS-50.
 - **The Pi adapter e2e passes in part: 9 of its 18 tests.** Its unit tests and the
   WS-24 capture suite pass. Nine tests need a multi-page result from `impact` with no
   arguments, which a freshly baselined fixture no longer produces; a large-result
   fixture is an open WS-24 follow-up.
 - **The Claude Code plugin needs a source checkout.** Its hook client is not in the
   release archive. Index hits and syntax reports in hooks, and the watcher, need
-  `XMUSTARD_CORE_WORKER=1`. Codex, OpenCode and Cursor get MCP configuration only;
-  their adapters are WS-40.
+  `XMUSTARD_CORE_WORKER=1`. A static hook client that gives up in the last ~20 ms of
+  its budget on a loaded host drops an answer the daemon counted as delivered, so those
+  memories are not pushed again in that context until compaction. Codex, OpenCode and
+  Cursor get MCP configuration only; their adapters are WS-40.
 - **Redaction is pattern-based.** A secret no rule knows is kept as written, and a
   secret file read through a shell (`cat .env`) or matched by a directory search is
-  checked by content only.
+  checked by content only. A secret split across two output strings of one hook body
+  is not joined.
 - **Upgrading from v0.1.0.** The governance store moves to schema version 3, which
-  v0.1.0 cannot open; back it up first (`xmustard-ops store backup`). Memories
-  promoted under v0.1.0 and anchored at an even path depth recorded that file as
-  missing, so recall now flags them stale.
+  v0.1.0 cannot open; back it up first (`xmustard-ops store backup`, with `--data-dir`
+  for a store at the relative default). Memories promoted under v0.1.0 and anchored at
+  an even path depth recorded that file as missing, so recall now flags them stale.
 - **`diagnostics` needs Postgres.** Without `postgres_dsn` in `<data dir>/settings.json`
   it returns "Postgres DSN is required to read diagnostics". The `XMUSTARD_PG_DSN`
   environment variable does not supply it.
 - **Set an absolute data directory.** `XMUSTARD_DATA_DIR` defaults to `../backend/data`
   relative to the process working directory, release binaries included. A service
-  installed by `xmustard-ops setup` gets an absolute one.
+  installed by `xmustard-ops setup` gets an absolute one. The service commands
+  (`setup`, `daemon`, `store`, `uninstall`) take `XMUSTARD_DATA_DIR` only when it is
+  absolute, and otherwise use the platform's data directory.
 - **The resident worker is opt-in.** `XMUSTARD_CORE_WORKER=1` turns it on. Without it,
-  each call starts a one-shot `xmustard-core` and nothing is watched. Each refresh batch
-  still scans the tracked files (16-23 ms at 5,000 files, 114-153 ms at 50,000).
+  each call starts a one-shot `xmustard-core` and nothing is watched. After the worker's
+  2-minute idle exit, nothing is watched until the next call. Each refresh batch still
+  scans the tracked files (16-23 ms at 5,000 files, 114-153 ms at 50,000).
+- **`impact` is lexical.** Its edges come from symbol names and import lines, and a
+  name shorter than 4 characters makes no edge.
+- **`search` in pattern mode needs `ast-grep` on `PATH`.** Without it, `mode=pattern`
+  answers engine `"none"` with no matches and no error, the same as a pattern that
+  matches nothing.
 - **First ground while xMustard is busy.** The memory governor can refuse the first
   auto-registration baseline. That ground then reports no baseline, and a later one
   builds it.
@@ -177,12 +195,19 @@ What these numbers do not show:
   `xattr -d com.apple.quarantine xmustard-*`. The Linux archive is built on Ubuntu
   22.04, so its Rust binaries need glibc 2.35 at most; the exact floor was not measured.
   The service needs launchd or systemd.
+- **Service.** launchd has no socket activation for the cgo-free API, so the macOS
+  agent refuses connections while it restarts. A hung daemon is not detected (no
+  watchdog). `store restore` is offline: it stops the daemon. Under systemd,
+  `daemon status` starts the daemon. The real-launchd integration test was not run.
 - **Homebrew.** The in-repo formula pins v0.1.0 (the prebuilt archive on macOS arm64,
   a source build elsewhere) until `packaging/homebrew/bump.sh` moves it. There is no
   tap yet.
-- **Rust memory tests near their lines.** The debug-build index-build and
-  resident-service RSS tests fail now and then under load on the shared build box and
-  pass alone; the resident-graph test is ignored off Linux, the reference platform.
+- **One Rust memory line is close.** Before WS-FIX-06, the debug-build index-build
+  and resident-service RSS tests failed now and then under load on the shared build
+  box; WS-FIX-06 gave debug builds their own RSS bounds, and every recorded full run
+  since has passed. The release-profile resident line is the close one (+12.9 to
+  +13.4 MiB against +15 MiB), and `make check-backend` runs only the debug profile.
+  The resident-graph test is ignored off Linux, the reference platform.
 - **Checks, not guarantees.** The injection scan matches known instruction patterns,
   so a paraphrase passes. Merge attestations are records; they block a merge only where
   a hook or CI check runs `xmustard-ops review gate`.
@@ -197,11 +222,10 @@ As of 2026-09-28. Workstream numbers refer to the
 **Merged into `feat/parity-v2` after the v0.1.1 cut**
 
 - **WS-35**: impact v2 (tiers, risk, epistemic envelope, typed filters).
+- **WS-27**: dedupe, code anchors, tiered conflicts and structured claims for memory.
 
 **On workstream branches, not yet merged**
 
-- **WS-27** (`parity/ws-27`): dedupe, code anchors, tiered conflicts and structured
-  claims for memory.
 - **WS-31** (`parity/ws-31`): tiered memory, write policy and guidance artifacts.
 - **WS-33** (`parity/ws-33`): session ledger, compaction snapshot and cross-client
   handoff.

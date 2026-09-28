@@ -69,15 +69,16 @@ measurements, upgrade steps and known limits:
 - The governance store migrates to schema version 3, which v0.1.0 cannot open.
 - `codex_args` for platform Codex runs is an allow-list.
 - Memory guard tests bound dirty memory strictly and RSS by build profile (WS-FIX-06);
-  if/else ladders became tables and small steps with byte-identical outputs
-  (WS-CQ-02); Go and Rust sources are `gofmt`- and `rustfmt`-clean (WS-26).
+  if/else ladders became tables and small steps, with byte-identical reducer outputs
+  and unchanged goldens (WS-CQ-02); WS-26 ran `gofmt` and `rustfmt` in
+  formatting-only commits, and the Go sources are `gofmt`-clean.
 
 ### Known limits
 - The Pi adapter e2e passes 9 of its 18 tests: nine need a multi-page `impact` result
   that a freshly baselined fixture no longer produces (a WS-24 follow-up).
 - The Claude Code plugin's hook client is not in the release archive; build it from a
   source checkout. Codex, OpenCode and Cursor get MCP configuration only.
-- The parity-scale suite still exceeds its 95.4 MiB line. The full list is in the
+- The parity-scale suite has not passed its 95.4 MiB line. The full list is in the
   [release notes](releases/v0.1.1.md#known-limits).
 
 ## [0.1.0] - 2026-09-28

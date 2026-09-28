@@ -59,13 +59,13 @@ Prebuilt binaries for macOS arm64 and Linux x86_64 are on the
   snippets and the reasons they ranked. 15 tree-sitter grammars cover Go, Rust, TypeScript, TSX,
   JavaScript, Python, Java, C, C++, C#, Ruby, PHP, Kotlin, Swift and Bash.
 - **Light enough to leave running.** Two agents on the relay peaked at 60.8 MiB for the whole
-  process tree on the v0.1.1 release tree (Linux x86_64). The relay itself uses about 2 MiB per
-  agent.
+  process tree on the v0.1.1 release tree (Linux x86_64), with the resident worker off. The
+  relay itself uses about 2 MiB per agent on macOS arm64 and up to 3 MiB on Linux.
 - **Failures explained and remembered.** `why_failed` reads a run, a pasted log or an evidence
   handle, points at the error lines, and records the failure so the next `ground` lists it.
 - **Hooks that shrink what the agent reads.** In Claude Code, the plugin replaces a large Bash,
-  Read or Grep output with a reduction whose last line names a recovery handle, redacted before
-  anything is kept, and adds memory a human approved before the agent reads or edits a file.
+  Read or Grep output with a reduction that names a recovery handle, redacted before anything
+  is kept, and adds memory a human approved before the agent reads or edits a file.
 
 ## How it compares
 
@@ -120,8 +120,11 @@ curl -fs --retry 5 --retry-connrefused http://127.0.0.1:8042/api/health > /dev/n
 
 Set `XMUSTARD_DATA_DIR` wherever you run `xmustard-api` or `xmustard-ops`. Its default,
 `../backend/data`, is relative to the current directory, so a shell without it reads and writes
-a different store. With no tokens minted, the API runs in open mode: every caller shares one
-identity, and a memory is promoted at once as `self_asserted_open_mode`.
+a different store. The service commands (`setup`, `daemon`, `store`, `uninstall`) take it only
+when it is absolute; otherwise they use the platform's data directory
+(`~/Library/Application Support/xmustard` on macOS, `$XDG_DATA_HOME/xmustard` or
+`~/.local/share/xmustard` on Linux). With no tokens minted, the API runs in open mode: every
+caller shares one identity, and a memory is promoted at once as `self_asserted_open_mode`.
 
 **3. Watch a memory go stale.** This uses a throwaway repository, so your own files stay
 untouched.
@@ -188,8 +191,8 @@ resource `xmustard://docs/tools`.
 
 Arguments are checked, never silently coerced. A wrong argument comes back as a tool error the
 agent can read (`isError`): what was wrong, a hint when the agent likely meant another tool or
-argument, and the tool's arguments. An unknown tool or a malformed request is a JSON-RPC
-`-32602`.
+argument, and the tool's arguments. An unknown tool or malformed `tools/call` parameters are a
+JSON-RPC `-32602`.
 
 ## Connect your agent
 
@@ -311,6 +314,10 @@ to restart the daemon on the new binaries; it migrates and checks the memory dat
 starts. The unit binds loopback only, never carries a token, and logs to a size-capped, rotated
 file.
 
+Stop the Quickstart's `xmustard-api` first (`kill %1` in the shell that started it): setup
+refuses a port that another API already answers on. With `XMUSTARD_DATA_DIR` set to an absolute
+path, as in the Quickstart, the service uses the same store.
+
 ```bash
 xmustard-ops setup [--root "$PWD" --client claude-code]  # --root also prints the MCP entry
 xmustard-ops daemon status|restart|stop
@@ -365,24 +372,47 @@ means proposer plus verifier.
   variable does not supply it.
 - **`explain` takes files only.** A directory path returns an error, although the tool
   description mentions directories.
+- **`search` in pattern mode needs `ast-grep` on `PATH`.** Without it, a `mode=pattern` search
+  answers engine `"none"` with no matches and no error, which looks like a pattern that matches
+  nothing.
+- **`impact` is lexical.** Its edges come from symbol names and import lines, so treat them as
+  leads, and a name shorter than 4 characters makes no edge.
 - **The Claude Code plugin needs a source checkout.** Its static hook client is not in the
   release archive, so building it needs Go. Index hits and syntax reports in hooks, and the
-  file watcher, need the opt-in resident worker (`XMUSTARD_CORE_WORKER=1`). Codex, Cursor and
-  OpenCode get MCP configuration only; their hook adapters are planned.
+  file watcher, need the opt-in resident worker (`XMUSTARD_CORE_WORKER=1`). A hook client that
+  gives up in the last ~20 ms of its budget on a loaded host drops an answer the API counted as
+  delivered, so those memories are not pushed again until compaction. Codex, Cursor and
+  OpenCode get MCP configuration only; their hook adapters are planned. The Pi extension's
+  end-to-end suite passes 9 of its 18 tests; the other nine need a multi-page `impact` result
+  that its fixture no longer produces.
 - **Redaction is pattern-based.** Captured output is redacted before it is kept, but a secret
-  no rule recognizes is kept as written, and a secret file read through a shell (`cat .env`)
-  is matched by content only. Revoke an original with `DELETE .../evidence/{handle}`.
+  no rule recognizes is kept as written. A secret file read through a shell (`cat .env`) or
+  matched by a directory search is checked by content only, and a secret split across two
+  output strings of one hook body is not joined. Revoke an original with
+  `DELETE .../evidence/{handle}`.
 - **Platforms.** Prebuilt archives cover macOS arm64 and Linux x86_64. The Linux archive is
   built on Ubuntu 22.04, so it needs glibc 2.35 at most; the exact floor was not measured.
   Neither CI nor the release covers any other system, so elsewhere a source build is the only
   option, and it is untested. There is no public Homebrew tap yet.
+- **The service.** On macOS the launchd agent has no socket activation, so connections are
+  refused while it restarts. A hung daemon is not detected (no watchdog). `store restore` stops
+  the daemon while it swaps the store. Under systemd, `daemon status` starts the daemon.
 - **Heavier workloads.** A larger benchmark suite (4 agents, 2 repositories, 4 worktrees) has
-  not passed its 95.4 MiB line yet.
+  not passed its 95.4 MiB line yet. The resident worker costs memory: with it on, gate v2's
+  2-agent parity scenario peaked at 201–209 MiB, the worker alone at 171–185 MiB. The 60.8 MiB
+  above is a lighter scenario with the worker off. After 2 idle minutes the worker exits, and
+  nothing is watched until the next call.
+- **The first `ground` while xMustard is busy** can report no baseline, because the memory
+  governor refused to build it; a later `ground` builds it.
 - **Upgrading from v0.1.0.** The memory database moves to a new schema that v0.1.0 cannot
-  open, so run `xmustard-ops store backup` before any other v0.1.1 command if you may go back.
-  Memories promoted under v0.1.0 and anchored at an even path depth, such as `pkg/auth.go`,
-  recorded that file as missing, so `recall` now flags them stale; check them and supersede
-  or retire them. The [release notes](docs/releases/v0.1.1.md#upgrading) have the steps.
+  open, so run `xmustard-ops store backup` before any other v0.1.1 command if you may go back;
+  for a store at v0.1.0's relative default, pass `--data-dir`. Memories promoted under v0.1.0
+  and anchored at an even path depth, such as `pkg/auth.go`, recorded that file as missing, so
+  `recall` now flags them stale; check them and supersede or retire them. The
+  [release notes](docs/releases/v0.1.1.md#upgrading) have the steps.
+
+The full list is in the [release notes](docs/releases/v0.1.1.md#known-limits) and on the
+[status page](docs/STATUS.md#known-limits-in-v011).
 
 ## How it works
 
@@ -459,10 +489,10 @@ workstream: [build plan](docs/plans/2026-09-25-parity-build-plan.md).
 
 ## Build from source
 
-With Go 1.26 and Rust 1.89 or newer, `make build` builds all five binaries. `make install`
-copies them into `$PREFIX/bin`; the default `PREFIX=/usr/local` usually needs `sudo`, and
-`make install PREFIX=$HOME/.local` does not. `make release VERSION=v0.1.1` builds the release
-archive for your platform. The Homebrew formula in
+With Go 1.26 and stable Rust (the release workflow pins 1.93.1), `make build` builds all five
+binaries. `make install` copies them into `$PREFIX/bin`; the default `PREFIX=/usr/local` usually
+needs `sudo`, and `make install PREFIX=$HOME/.local` does not. `make release VERSION=v0.1.1`
+builds the release archive for your platform. The Homebrew formula in
 [`packaging/homebrew/xmustard.rb`](packaging/homebrew/xmustard.rb) installs the v0.1.0 archive on
 macOS arm64 and builds the v0.1.0 tag from source elsewhere until it is moved to v0.1.1
 (`packaging/homebrew/bump.sh`); Homebrew installs formulae only from a tap, so copy it into a
@@ -480,5 +510,5 @@ Rust tests and Clippy) before you open a pull request.
 
 **License.** [MIT](LICENSE), except files whose header names another licence: the
 finding-anchoring files in `api-go/internal/anchor/` are Apache-2.0 translations of
-[open-code-review](https://github.com/alibaba/open-code-review), built only with the `review`
-build tag. See [NOTICE](NOTICE).
+[open-code-review](https://github.com/alibaba/open-code-review), linked only into builds with
+the `review` build tag. See [NOTICE](NOTICE).
