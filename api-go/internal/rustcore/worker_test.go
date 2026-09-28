@@ -1168,3 +1168,37 @@ func TestWorkerCrashWithTheRealCoreIsSeenAtOnce(t *testing.T) {
 		t.Fatal("no git child left a process behind, so this test proves nothing")
 	}
 }
+
+// A resident-only call (the hook hot path, PAR-RT-12) never starts a process: without a
+// running worker it fails with ErrNotResident, and with one it runs there.
+func TestResidentOnlyCallsNeverStartAProcess(t *testing.T) {
+	logPath := useFakeWorker(t, "ok")
+	ctx := WithResidentOnly(context.Background())
+	spawns := func() int64 { return budget.Counters().SpawnsTotal }
+	before := spawns()
+	if _, err := runCoreCtx(ctx, "echo", "cold"); !errors.Is(err, ErrNotResident) {
+		t.Fatalf("resident-only call without a worker: %v", err)
+	}
+	if _, err := runCoreCtx(ctx, "goal", "x"); !errors.Is(err, ErrNotResident) {
+		t.Fatalf("resident-only call of a one-shot-only subcommand: %v", err)
+	}
+	if n := len(fakeLog(t, logPath, "serve ")) + len(fakeLog(t, logPath, "oneshot ")); n != 0 || spawns() != before {
+		t.Fatalf("a resident-only call started %d processes (%d counted)", n, spawns()-before)
+	}
+	mustEcho(t, "warm") // an ordinary call starts the worker
+	warm := spawns()
+	out, err := runCoreCtx(ctx, "echo", "hot")
+	if err != nil || string(out) != `["hot"]` {
+		t.Fatalf("resident-only call on a live worker: %s %v", out, err)
+	}
+	if _, err := runCoreCtx(ctx, "notresident", "z"); !errors.Is(err, ErrNotResident) {
+		t.Fatalf("a call the worker refuses must not fall back: %v", err)
+	}
+	if n := len(fakeLog(t, logPath, "oneshot ")); n != 0 || spawns() != warm {
+		t.Fatalf("resident-only calls on a live worker spawned %d one-shots (%d counted)", n, spawns()-warm)
+	}
+	t.Setenv("XMUSTARD_CORE_WORKER", "0")
+	if _, err := runCoreCtx(ctx, "echo", "off"); !errors.Is(err, ErrNotResident) {
+		t.Fatalf("resident-only call with the worker off: %v", err)
+	}
+}
