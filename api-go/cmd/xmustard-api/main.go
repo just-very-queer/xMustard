@@ -82,10 +82,13 @@ func main() {
 	// (interrupted-run persistence, worker/terminal teardown, service close) to finish
 	// before the process exits.
 	shutdownDone := make(chan struct{})
+	// Registered before serving, not in the goroutine: a service manager may stop the
+	// daemon as soon as it answers, and a SIGTERM that beat the goroutine to Notify
+	// would kill it without the drain.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		defer close(shutdownDone)
-		sigCh := make(chan os.Signal, 1)
-		signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 		<-sigCh
 		log.Printf("shutdown: signal received; draining")
 		ctx, cancel := context.WithTimeout(context.Background(), shutdownDrain())
