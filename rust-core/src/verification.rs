@@ -215,7 +215,10 @@ pub struct RustManagedCommandResult {
 pub type RustVerificationCommandResult = RustManagedCommandResult;
 
 const VERIFICATION_COMMAND_EXCERPT_LIMIT: usize = 4_000;
-const MANAGED_COMMAND_EXCERPT_LIMIT: usize = 64 * 1024;
+/// A managed command's excerpt holds the whole bounded capture: the head, the
+/// dropped-bytes marker and the tail. At exactly HEAD + TAIL the marker pushed the last
+/// bytes of the tail (a failure summary, for why_failed) out of the excerpt.
+const MANAGED_COMMAND_EXCERPT_LIMIT: usize = CAPTURE_HEAD_BYTES + CAPTURE_TAIL_BYTES + 256;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RustVerificationProfileInput {
@@ -1144,6 +1147,31 @@ mod tests {
             result.stdout_excerpt.contains("dropped"),
             "a >cap output must carry the dropped-bytes marker proving the middle was discarded"
         );
+    }
+
+    // The excerpt of an output past the capture window keeps its last line: why_failed
+    // explains failures from the tail, where runners print their summary.
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn managed_command_excerpt_keeps_the_last_line() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let result = run_managed_command(
+            temp_dir.path(),
+            &[
+                "sh".to_string(),
+                "-c".to_string(),
+                "i=0; while [ $i -lt 4000 ]; do echo \"=== RUN TestCase$i ok\"; i=$((i+1)); done; echo FINAL-SUMMARY-LINE".to_string(),
+            ],
+            60,
+        )
+        .expect("should run");
+        assert!(result.stdout_excerpt.contains("dropped"), "the middle was dropped");
+        assert!(
+            result.stdout_excerpt.ends_with("FINAL-SUMMARY-LINE\n"),
+            "the last line survives the excerpt: {:?}",
+            &result.stdout_excerpt[result.stdout_excerpt.len().saturating_sub(80)..]
+        );
+        assert!(!result.stdout_excerpt.contains("[truncated"), "the excerpt holds the whole capture");
     }
 
     // P1-A: a command that exits NORMALLY but leaves a grandchild holding the stdout pipe

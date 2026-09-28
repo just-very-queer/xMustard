@@ -3,11 +3,12 @@ package workspaceops
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"log"
+	"io"
 	"os"
 	"regexp"
-	"sort"
+	"slices"
 	"strings"
 )
 
@@ -28,6 +29,25 @@ type FailureExplanation struct {
 	ChangedFiles    []string `json:"changed_files"`    // current working-tree changes
 	Summary         string   `json:"summary"`
 	GeneratedAt     string   `json:"generated_at"`
+
+	// Run-independent outcomes and the bounded read (WS-21; PAR-HAR-06, PAR-RT-11).
+	// Source is run (a platform run), command, evidence, log or capture.
+	Source         string             `json:"source,omitempty"`
+	Command        string             `json:"command,omitempty"`
+	Cwd            string             `json:"cwd,omitempty"`
+	TimedOut       bool               `json:"timed_out,omitempty"`
+	FailingTests   []string           `json:"failing_tests,omitempty"`
+	EvidenceHandle string             `json:"evidence_handle,omitempty"`
+	Output         *OutcomeOutput     `json:"output,omitempty"`
+	Memories       []ImplicatedMemory `json:"memories,omitempty"`
+	RecordedAt     string             `json:"recorded_at,omitempty"`
+	HeadSHA        string             `json:"head_sha,omitempty"`
+	// ResolvedBy names the later outcome of the same command that superseded this one.
+	ResolvedBy string `json:"resolved_by,omitempty"`
+	// Created is set by a recording call: false when this output was recorded before
+	// and the first outcome is returned.
+	Created *bool              `json:"created,omitempty"`
+	Unknown []GroundingUnknown `json:"unknown,omitempty"`
 }
 
 // pathLikePattern matches repo-relative-ish paths (a/b/c.ext) that appear in logs.
@@ -36,20 +56,36 @@ var pathLikePattern = regexp.MustCompile(`[\w./-]+\.[A-Za-z]{1,5}`)
 // errorLinePattern flags lines worth surfacing from a failure log.
 var errorLinePattern = regexp.MustCompile(`(?i)\b(error|fail(ed|ure)?|panic|exception|undefined|cannot|expected|traceback|fatal)\b`)
 
+// errorLineWords are the words errorLinePattern needs: a line holding none of them
+// (in lower case) cannot match, so most lines of a MiB-long log skip the regexp, which
+// costs about 35 times more per line.
+var errorLineWords = []string{"error", "fail", "panic", "exception", "undefined", "cannot", "expected", "traceback", "fatal"}
+
+func mayBeErrorLine(line string) bool {
+	lower := strings.ToLower(line)
+	return slices.ContainsFunc(errorLineWords, func(w string) bool { return strings.Contains(lower, w) })
+}
+
 func ExplainRunFailure(dataDir, workspaceID, runID string) (*FailureExplanation, error) {
 	return ExplainRunFailureCtx(context.Background(), dataDir, workspaceID, runID)
 }
 
 // ExplainRunFailureCtx is the request-scoped variant: cancelling ctx cancels its Rust/tool work (see rustcore.runCoreCtx).
+// runID names a platform run or a run-independent outcome (outcomes.go). It only reads:
+// run_fail feedback is recorded once, when an outcome is recorded, never on a GET.
 func ExplainRunFailureCtx(ctx context.Context, dataDir, workspaceID, runID string) (*FailureExplanation, error) {
+	if IsRunOutcomeID(runID) {
+		return ExplainRunOutcome(ctx, dataDir, workspaceID, runID)
+	}
 	run, err := ReadRun(dataDir, workspaceID, runID)
 	if err != nil {
 		return nil, err
 	}
-	output := ""
+	output, window := "", &OutcomeOutput{}
 	if strings.TrimSpace(run.OutputPath) != "" {
-		if content, readErr := os.ReadFile(run.OutputPath); readErr == nil {
+		if content, total, readErr := readFileTail(run.OutputPath, outcomeTailBytes); readErr == nil {
 			output = string(content)
+			window = &OutcomeOutput{TotalBytes: total, AnalyzedBytes: int64(len(content)), Truncated: int64(len(content)) < total}
 		}
 	}
 
@@ -59,21 +95,44 @@ func ExplainRunFailureCtx(ctx context.Context, dataDir, workspaceID, runID strin
 		ExitCode:    run.ExitCode,
 		Signals:     detectPatchIssues(run, output),
 		GeneratedAt: nowUTC(),
+		Source:      "run",
+		Output:      window,
 	}
 	exp.Failed = runLooksFailed(run, exp.Signals)
 
 	exp.ErrorLines = salientErrorLines(output, 8)
-	exp.ChangedFiles = currentChangedFiles(ctx, dataDir, workspaceID)
-	exp.ImplicatedPaths = intersectMentionedPaths(output, exp.ChangedFiles)
-	exp.Summary = summarizeFailure(exp)
-	// feed the outcome back into ranking: suppress the implicated paths of a failure.
-	// The signal is best-effort, so a failed write is logged, not returned.
-	if exp.Failed && len(exp.ImplicatedPaths) > 0 {
-		if err := RecordFeedback(dataDir, workspaceID, "run_fail", exp.ImplicatedPaths); err != nil {
-			log.Printf("feedback: run_fail signal for workspace %s run %s failed: %v", workspaceID, runID, err)
-		}
+	changed, changedErr := workingChangedFiles(ctx, dataDir, workspaceID)
+	if changedErr != nil {
+		exp.Unknown = append(exp.Unknown, GroundingUnknown{Field: "changed_files", Reason: changedErr.Error()})
 	}
+	mentioned := mentionedPaths(output)
+	exp.ChangedFiles = nonNil(changed)
+	exp.ImplicatedPaths = implicatedBy(mentioned, contextRoot(dataDir, workspaceID), changed)
+	exp.Memories, exp.Unknown = linkMemories(ctx, dataDir, workspaceID, exp.ImplicatedPaths, mentioned, exp.Unknown)
+	exp.Summary = summarizeFailure(exp)
 	return exp, nil
+}
+
+// readFileTail reads at most maxBytes from the end of a file, and its size, without
+// loading the rest (PAR-RT-11: a run's output can be arbitrarily large).
+func readFileTail(path string, maxBytes int64) ([]byte, int64, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, 0, err
+	}
+	size := info.Size()
+	n := min(size, maxBytes)
+	buf := make([]byte, n)
+	m, err := f.ReadAt(buf, size-n)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, 0, err
+	}
+	return buf[:m], size, nil
 }
 
 func runLooksFailed(run *runRecord, signals []string) bool {
@@ -93,7 +152,7 @@ func salientErrorLines(output string, limit int) []string {
 	out := []string{}
 	for _, raw := range strings.Split(output, "\n") {
 		line := strings.TrimSpace(raw)
-		if line == "" || !errorLinePattern.MatchString(line) {
+		if line == "" || !mayBeErrorLine(line) || !errorLinePattern.MatchString(line) {
 			continue
 		}
 		if len(line) > 200 {
@@ -111,37 +170,17 @@ func salientErrorLines(output string, limit int) []string {
 	return out
 }
 
-// intersectMentionedPaths returns changed files that are also named in the output —
-// the strongest signal for where the failure originates.
-func intersectMentionedPaths(output string, changed []string) []string {
-	if len(changed) == 0 || output == "" {
-		return nil
-	}
-	mentioned := map[string]struct{}{}
-	for _, m := range pathLikePattern.FindAllString(output, -1) {
-		mentioned[strings.TrimPrefix(m, "./")] = struct{}{}
-	}
-	var hits []string
-	for _, c := range changed {
-		base := c
-		if i := strings.LastIndex(c, "/"); i >= 0 {
-			base = c[i+1:]
-		}
-		_, full := mentioned[c]
-		_, byBase := mentioned[base]
-		if full || byBase {
-			hits = append(hits, c)
-		}
-	}
-	sort.Strings(hits)
-	return hits
-}
-
 // currentChangedFiles lists the working-tree changed paths (best-effort).
 func currentChangedFiles(ctx context.Context, dataDir, workspaceID string) []string {
+	out, _ := workingChangedFiles(ctx, dataDir, workspaceID)
+	return out
+}
+
+// workingChangedFiles lists the working-tree changed paths, or why they are unknown.
+func workingChangedFiles(ctx context.Context, dataDir, workspaceID string) ([]string, error) {
 	raw, err := WorkspaceWorkingChangesCtx(ctx, dataDir, workspaceID)
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("working changes unavailable: %w", err)
 	}
 	var cs struct {
 		ChangedFiles []struct {
@@ -149,7 +188,7 @@ func currentChangedFiles(ctx context.Context, dataDir, workspaceID string) []str
 		} `json:"changed_files"`
 	}
 	if err := json.Unmarshal(raw, &cs); err != nil {
-		return nil
+		return nil, fmt.Errorf("working changes undecodable: %w", err)
 	}
 	out := make([]string, 0, len(cs.ChangedFiles))
 	for _, f := range cs.ChangedFiles {
@@ -157,7 +196,7 @@ func currentChangedFiles(ctx context.Context, dataDir, workspaceID string) []str
 			out = append(out, f.Path)
 		}
 	}
-	return out
+	return out, nil
 }
 
 func summarizeFailure(exp *FailureExplanation) string {

@@ -99,7 +99,7 @@ func BuildSessionGroundingCtx(ctx context.Context, dataDir, workspaceID string) 
 		dirty := *g.ChangedFiles > 0
 		g.BlockedByDirtyState = &dirty
 	}
-	unknown, failuresKnown := g.groundingRuns.build(dataDir, workspaceID)
+	unknown, failuresKnown := g.groundingRuns.build(ctx, dataDir, workspaceID)
 	g.Unknown = append(g.Unknown, unknown...)
 	// a listed failure blocks even when other records are unreadable
 	if failing := len(g.RecentFailedRuns) > 0; failing || failuresKnown {

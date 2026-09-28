@@ -46,6 +46,9 @@ import (
 // routeGateTable: capture is core, needs the proposer role and is served in
 // read-only mode (it stores only the caller's own tool output); search is core and
 // needs the reader role.
+//
+// A captured test, build or lint output also becomes a run-independent outcome that
+// ground lists (WS-21, outcome_routes.go), except in read-only mode.
 
 // captureRedactor wraps the capture spool writer with the streaming secret redactor.
 // While it is nil, POST .../evidence/capture refuses (503 redaction_unavailable).
@@ -147,6 +150,7 @@ func registerEvidenceCaptureRoutes(mux routeRegistrar, store *evidence.Store) {
 			writeCaptureError(w, err)
 			return
 		}
+		recordCaptureOutcome(r, store, ws, target != nil, res) // WS-21: test/build/lint outcomes
 		// the reply encodes the projection, the shaped payload and the (bounded)
 		// structured projection, facts and omissions again: admit it
 		if scope, owned := budget.ScopeFor(r.Context()); !owned {

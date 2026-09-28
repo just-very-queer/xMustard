@@ -40,6 +40,7 @@ func newAPIHandlerFor(p exposurePosture) http.Handler {
 	store := evidence.NewStore(dataDir(), evidence.LimitsFromEnv())
 	registerEvidenceRoutes(mux, store)
 	registerEvidenceCaptureRoutes(mux, store)
+	registerOutcomeRoutes(mux, store)
 	return routeGateMiddleware(p, mux, evidenceDeliveryMiddleware(store, mux))
 }
 
@@ -53,37 +54,32 @@ var coreTools = map[string]bool{
 // observations of the repository, so no repository identity is sampled for them.
 var identityFreeTools = map[string]bool{"remember": true, "verify": true}
 
+// coreToolRoutes maps "METHOD sub-path" under /api/workspaces/{ws}/ to the tool it
+// serves; a {} segment matches one path segment.
+var coreToolRoutes = map[string]string{
+	"GET session-grounding":   "ground",
+	"GET context/active":      "recall",
+	"POST context":            "remember",
+	"GET search":              "search",
+	"GET explain-path":        "explain",
+	"GET changes/since-index": "impact",
+	"GET diagnostics":         "diagnostics",
+	"POST context/{}/verify":  "verify",
+	"GET runs/{}/why-failed":  "why_failed",
+	"POST why-failed":         "why_failed",
+}
+
 // coreToolFor returns the tool served by (method, path), or "".
 func coreToolFor(method, path string) string {
 	ws := workspaceIDFromPath(path)
 	if ws == "" {
 		return ""
 	}
-	sub := strings.TrimPrefix(path, "/api/workspaces/"+ws+"/")
-	switch {
-	case method == http.MethodGet && sub == "session-grounding":
-		return "ground"
-	case method == http.MethodGet && sub == "context/active":
-		return "recall"
-	case method == http.MethodPost && sub == "context":
-		return "remember"
-	case method == http.MethodGet && sub == "search":
-		return "search"
-	case method == http.MethodGet && sub == "explain-path":
-		return "explain"
-	case method == http.MethodGet && sub == "changes/since-index":
-		return "impact"
-	case method == http.MethodGet && sub == "diagnostics":
-		return "diagnostics"
+	seg := strings.Split(strings.TrimPrefix(path, "/api/workspaces/"+ws+"/"), "/")
+	if len(seg) == 3 {
+		seg[1] = "{}" // the entry or run id
 	}
-	seg := strings.Split(sub, "/")
-	if len(seg) == 3 && seg[0] == "context" && seg[2] == "verify" && method == http.MethodPost {
-		return "verify"
-	}
-	if len(seg) == 3 && seg[0] == "runs" && seg[2] == "why-failed" && method == http.MethodGet {
-		return "why_failed"
-	}
-	return ""
+	return coreToolRoutes[method+" "+strings.Join(seg, "/")]
 }
 
 // spoolWriter is the ResponseWriter a delivered handler writes into: the body goes to
@@ -410,6 +406,9 @@ func registerEvidenceRoutes(mux routeRegistrar, store *evidence.Store) {
 			writeEvidenceError(w, err)
 			return
 		}
+		if !forgetEvidenceOutcomes(w, r, r.PathValue("handle")) {
+			return
+		}
 		writeJSON(w, http.StatusOK, map[string]any{"revoked": true})
 	})
 	// Workspace-level revocation (there is no workspace-deletion API): removes every
@@ -422,6 +421,22 @@ func registerEvidenceRoutes(mux routeRegistrar, store *evidence.Store) {
 			writeEvidenceError(w, err)
 			return
 		}
+		if !forgetEvidenceOutcomes(w, r, "") {
+			return
+		}
 		writeJSON(w, http.StatusOK, map[string]any{"revoked": true})
 	})
+}
+
+// forgetEvidenceOutcomes removes the run outcomes made from a revoked original (handle
+// "": every original of the workspace), after the revocation, so an unauthorized
+// revoke removes nothing. A failure answers 500; the revoke is idempotent, so a retry
+// removes them.
+func forgetEvidenceOutcomes(w http.ResponseWriter, r *http.Request, handle string) bool {
+	if _, err := workspaceops.ForgetEvidenceOutcomes(r.Context(), dataDir(), r.PathValue("workspace_id"), handle); err != nil {
+		log.Printf("evidence revoke: outcomes made from %q not removed: %v", handle, err)
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "the original is revoked, but the outcomes made from it were not removed; retry the revoke"})
+		return false
+	}
+	return true
 }
