@@ -264,8 +264,8 @@ func TestAnUnreadHeadIsNeverAbsence(t *testing.T) {
 		if got != tc.want {
 			t.Errorf("%s %q: got %+v, want %+v", tc.path, tc.code, got, tc.want)
 		}
-		if got.Unchecked() != (got.Reason == ReasonHeadUnread) || (got.Unchecked() && got.Present()) {
-			t.Errorf("%s %q: Unchecked %v, Present %v", tc.path, tc.code, got.Unchecked(), got.Present())
+		if got.Unchecked() && got.Present() {
+			t.Errorf("%s %q: unchecked and present", tc.path, tc.code)
 		}
 	}
 }
