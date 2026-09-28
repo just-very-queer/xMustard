@@ -31,8 +31,20 @@ import (
 // or codeIndexFirstWait when this process has not brought the root's index up yet
 // (possibly a full build), and never past its request. A key whose update failed is
 // not retried until the identity changes. While other heavy work holds or waits for
-// the slot, no refresh starts, so a read never queues behind a build. WS-15's watcher
-// replaces this per-read check.
+// the slot, no refresh starts, so a read never queues behind a build.
+//
+// The watcher (WS-15, PAR-FRESH-03). With the resident worker on, every read (and
+// ground) registers its root with the worker's watcher (rustcore.WatchRoot), which
+// announces a debounced batch of changed paths when it is due; onRefreshDue then runs
+// the refresh in the background, so the index usually reaches a new identity before
+// any read asks. A refresh, whoever starts it, takes the watcher's batch and updates
+// only its paths (`--paths`); a read's refresh takes the batch at once rather than
+// waiting for the debounce. The whole tree is checked (no `--paths`) when there is no
+// watcher (the worker off or unavailable), when the batch is a full one (start-up,
+// overflow, an ignore file, a rescan, an OS watch limit) or unsynced, and when a read
+// finds the index behind its identity although the watcher saw nothing. The watcher
+// retries a failed batch with backoff. The identity check above stays: the core
+// answers from the index only for the identity it was brought to.
 
 // codeIndexWait bounds the wait for a refresh of an index this process brought up.
 const codeIndexWait = 5 * time.Second
@@ -67,7 +79,9 @@ type indexRefresh struct {
 func (r *indexRefresh) changed() bool { return r != nil && r.Mode != "noop" }
 
 type refreshFlight struct {
-	key    string
+	key string
+	// forced: a read started it, and takes the watcher's pending changes at once.
+	forced bool
 	done   chan struct{}
 	report *indexRefresh
 }
@@ -84,9 +98,50 @@ var codeIndex = struct {
 	roots map[string]*codeIndexRoot
 }{roots: map[string]*codeIndexRoot{}}
 
-// codeIndexRunner runs one index update; tests replace it.
-var codeIndexRunner = func(ctx context.Context, root, key string) ([]byte, error) {
-	return rustcore.RunIndex(ctx, "update", root, "--identity-key", key)
+// codeIndexRunner runs one index update with args; tests replace it.
+var codeIndexRunner = func(ctx context.Context, root string, args ...string) ([]byte, error) {
+	return rustcore.RunIndex(ctx, append([]string{"update", root}, args...)...)
+}
+
+// codeIndexFinishTimeout bounds reporting a batch's outcome to the watcher.
+const codeIndexFinishTimeout = 10 * time.Second
+
+func init() { rustcore.OnRefreshDue(onRefreshDue) }
+
+// onRefreshDue starts the background refresh of a watched root whose batch is due,
+// for the identity observed now. It leaves the batch pending while a refresh of the
+// root runs, or while other heavy work holds or waits for the slot, so a read never
+// joins a refresh queued behind a build; the watcher announces a batch nobody took
+// again (index::watch RENOTIFY_AFTER).
+func onRefreshDue(root string) {
+	root = canonicalRoot(root)
+	ctx, cancel := context.WithTimeout(context.Background(), codeIndexWait)
+	id, _ := CurrentRepoIdentity(ctx, root)
+	cancel()
+	codeIndex.Lock()
+	defer codeIndex.Unlock()
+	st := codeIndexState(root)
+	if st.flight != nil || budget.HeavyBusy() {
+		return
+	}
+	f := &refreshFlight{key: id.Key, done: make(chan struct{})}
+	st.flight = f
+	go runCodeIndexRefresh(root, f)
+}
+
+// refreshArgs are an update's flags: the identity it is run for, and the batch's paths
+// when the watcher's batch accounts for every change; otherwise the whole tree is
+// checked. A read's refresh with an empty batch found the index behind its identity
+// although the watcher saw nothing, so it checks the whole tree too.
+func refreshArgs(key string, b *rustcore.RefreshBatch, forced bool) []string {
+	var args []string
+	if key != "" {
+		args = append(args, "--identity-key", key)
+	}
+	if b == nil || b.Whole() || (forced && b.Empty()) {
+		return args
+	}
+	return append(append(args, "--paths"), b.Paths...)
 }
 
 func codeIndexState(root string) *codeIndexRoot {
@@ -150,6 +205,7 @@ func (r codeIndexRead) annotate(out []byte) json.RawMessage {
 // read, waiting a bounded time, and returns what the read passes to the core.
 func ensureCodeIndex(ctx context.Context, root string) codeIndexRead {
 	root = canonicalRoot(root)
+	rustcore.WatchRoot(ctx, root)
 	id := codeIndexIdentity(ctx, root)
 	read := codeIndexRead{key: id.Key}
 	if id.Key == "" {
@@ -168,7 +224,7 @@ func ensureCodeIndex(ctx context.Context, root string) codeIndexRead {
 		return read
 	}
 	if f == nil {
-		f = &refreshFlight{key: id.Key, done: make(chan struct{})}
+		f = &refreshFlight{key: id.Key, forced: true, done: make(chan struct{})}
 		st.flight = f
 		go runCodeIndexRefresh(root, f)
 	}
@@ -228,9 +284,17 @@ func runCodeIndexRefresh(root string, f *refreshFlight) {
 	}()
 	ctx, cancel := context.WithTimeout(context.Background(), codeIndexUpdateTimeout)
 	defer cancel()
+	batch := rustcore.TakeRefresh(ctx, root, f.forced)
+	if batch == nil && !f.forced && rustcore.Watched(root) {
+		return // the due batch was taken by a read's refresh meanwhile
+	}
 	// `index update` takes the governor's heavy slot inside rustcore (WS-06B); a
-	// refused slot comes back as budget.ErrOverloaded and is retried on the next read.
-	out, err := codeIndexRunner(ctx, root, f.key)
+	// refused slot comes back as budget.ErrOverloaded and is retried on the next read
+	// (and by the watcher, with backoff).
+	out, err := codeIndexRunner(ctx, root, refreshArgs(f.key, batch, f.forced)...)
+	fctx, fcancel := context.WithTimeout(context.Background(), codeIndexFinishTimeout)
+	rustcore.FinishRefresh(fctx, root, batch, err == nil, out)
+	fcancel()
 	if err != nil {
 		switch {
 		case errors.Is(err, budget.ErrOverloaded):

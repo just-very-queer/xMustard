@@ -1,0 +1,8 @@
+# WS-15 review round 1: the Git listing inside each watcher batch's `index update --paths`
+# Linux build box (6 cores, 22 GB, kernel 7.0.0-34-generic), release core of parity/ws-15,
+# 2026-09-28. bash ws15-scan-cost.sh target/release/xmustard-core 5000 20000 50000
+# One edited file per update, five updates per tree; timing fields from the update report.
+# git_ls_files_s_ms: `git ls-files -s -z` alone, mean of five runs.
+files=5000 scan_ms=18 17 23 16 16 update_elapsed_ms=69 73 80 68 68 git_ls_files_s_ms=4
+files=20000 scan_ms=50 50 49 52 50 update_elapsed_ms=153 153 149 154 151 git_ls_files_s_ms=7
+files=50000 scan_ms=120 114 153 118 148 update_elapsed_ms=221 219 279 225 260 git_ls_files_s_ms=17

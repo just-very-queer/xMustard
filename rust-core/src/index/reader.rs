@@ -82,6 +82,8 @@ pub struct StoreMeta {
     /// The repository identity key the last update was run for (`index update
     /// --identity-key`, stamped by the Go orchestrator), or empty.
     pub identity_key: String,
+    /// The last run's counters (meta `last_run`).
+    pub last_run: Option<envelope::RefreshCounters>,
     /// Coverage as of the generation; taken by the snapshot at load.
     pub coverage: Option<meta::Coverage>,
 }
@@ -102,6 +104,7 @@ fn read_meta(conn: &Connection) -> Result<StoreMeta, String> {
             "schema_version" => m.schema_version = v,
             "analyzer_version" => m.analyzer_version = v,
             meta::IDENTITY_KEY => m.identity_key = v,
+            "last_run" => m.last_run = serde_json::from_str(&v).ok(),
             "coverage" => m.coverage = serde_json::from_str(&v).ok(),
             _ => {}
         }
@@ -604,10 +607,12 @@ impl Opened {
         let s = &self.snapshot;
         let mut f = Freshness::from_relation(
             self.source,
+            &s.root,
             &self.relation,
             s.index_version.clone(),
             Some(s.generation),
         );
+        f.refresh = self.meta.last_run.clone();
         f.check_paths(&s.root, paths, |p| s.indexed_stat(p));
         f
     }
@@ -717,7 +722,7 @@ impl Snapshots {
         if let Some(e) = state.as_mut()
             && Some(e.stamp) == now_stamp
         {
-            if e.relation.at.elapsed() >= envelope::TTL {
+            if !e.relation.fresh(root) {
                 e.relation = envelope::relate(root, &e.relation.indexed_commit);
             }
             self.hits.fetch_add(1, Ordering::Relaxed);
@@ -757,10 +762,7 @@ impl Snapshots {
             self.swaps.fetch_add(1, Ordering::Relaxed);
         }
         let relation = match prev {
-            Some(p)
-                if p.relation.indexed_commit == meta.last_commit
-                    && p.relation.at.elapsed() < envelope::TTL =>
-            {
+            Some(p) if p.relation.indexed_commit == meta.last_commit && p.relation.fresh(root) => {
                 p.relation
             }
             _ => envelope::relate(root, &meta.last_commit),
@@ -775,6 +777,22 @@ impl Snapshots {
         let opened = e.opened();
         *state = Some(e);
         Some(opened)
+    }
+
+    /// Reload `root`'s snapshot when one is resident, so the next read finds the new
+    /// generation loaded (the watcher calls this after its refresh). A root with no
+    /// resident snapshot is left alone: loading it could evict another root's.
+    pub fn reload_if_resident(&self, root: &Path) {
+        let trust = crate::indexcache::trust_scope();
+        // the slot list is released before the slot's state is locked: a load in
+        // progress holds the state, and other roots' reads must not wait for it
+        let slot = lock(&self.slots)
+            .iter()
+            .find(|s| s.root == root && s.trust == trust)
+            .cloned();
+        if slot.is_some_and(|s| lock(&s.state).is_some()) {
+            self.open(root);
+        }
     }
 
     fn load(&self, root: &Path, loc: &Location) -> Option<(Arc<Snapshot>, Arc<StoreMeta>)> {

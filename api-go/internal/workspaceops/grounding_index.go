@@ -29,7 +29,9 @@ type groundingIndex struct {
 	// (unsupported) or fell back past the parse bounds or with parse errors (failed).
 	// It comes from the same source they read: the code index's snapshot when the
 	// root has one (as of its last generation; ground does not refresh the index, as
-	// its subsystems section does not), else the legacy graph.
+	// its subsystems section does not), else the legacy graph. Its freshness block
+	// says which: the snapshot generation, the watcher state and the last index
+	// run's counters (reparsed, reresolved, escalated).
 	Coverage json.RawMessage `json:"coverage"`
 }
 
@@ -189,6 +191,9 @@ func (s *groundingIndex) buildCoverage(ctx context.Context, dataDir, workspaceID
 	if err != nil {
 		return &GroundingUnknown{Field: "coverage", Reason: "workspace root unavailable: " + err.Error()}
 	}
+	// the watcher keeps the index fresh for later reads; the block's freshness says
+	// which generation answered and the watcher's state (WS-15)
+	rustcore.WatchRoot(ctx, canonicalRoot(root))
 	out, err := rustcore.RunSymbolgraph(ctx, "coverage", root, workspaceID)
 	if err != nil {
 		return &GroundingUnknown{Field: "coverage", Reason: "symbol graph coverage failed: " + err.Error()}

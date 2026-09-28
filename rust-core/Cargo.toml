@@ -45,6 +45,9 @@ percent-encoding = "2.3"
 # chunk postings) so the index never depends on the host library. D-02 measurement:
 # docs/benchmarks/2026-09-25-d02-fts5-vs-tantivy.md.
 rusqlite = { version = "0.32.1", features = ["bundled"] }
+# Watcher (WS-15, PAR-FRESH-03): FSEvents on macOS, inotify on Linux, through one API.
+# The resident service watches registered roots and queues debounced index refreshes.
+notify = "8.2"
 
 # Neural semantic lane (XM-PRO-012): the ort(onnxruntime)+tokenizers backend is a heavy
 # native dependency (~120-160 MB peak), so it is OPTIONAL and pulled in ONLY by the
