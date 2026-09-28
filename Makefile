@@ -73,7 +73,7 @@ release:
 # against its .sha256 first. The tag workflow runs it once both platforms' archives are in.
 release-sums:
 	cd "$(DIST)" && shasum -a 256 -c xmustard-$(VERSION)-*.tar.gz.sha256 && \
-		cat xmustard-$(VERSION)-*.tar.gz.sha256 | sort -k 2 > SHA256SUMS
+		cat xmustard-$(VERSION)-*.tar.gz.sha256 | LC_ALL=C sort -k 2 > SHA256SUMS
 	cat "$(DIST)/SHA256SUMS"
 
 # The API defaults to the core profile (the nine tools, memory, evidence, auth).
