@@ -17,6 +17,7 @@ build:
 	cd api-go && go build -o bin/xmustard-api ./cmd/xmustard-api
 	cd api-go && go build -o bin/xmustard-mcp ./cmd/xmustard-mcp
 	cd api-go && go build -o bin/xmustard-ops ./cmd/xmustard-ops
+	cd api-go && go build -o bin/xmustard-hook ./cmd/xmustard-hook
 
 install: build
 	install -d "$(BINDIR)"
@@ -25,6 +26,7 @@ install: build
 	install -m 0755 api-go/bin/xmustard-api "$(BINDIR)/xmustard-api"
 	install -m 0755 api-go/bin/xmustard-mcp "$(BINDIR)/xmustard-mcp"
 	install -m 0755 api-go/bin/xmustard-ops "$(BINDIR)/xmustard-ops"
+	install -m 0755 api-go/bin/xmustard-hook "$(BINDIR)/xmustard-hook"
 
 # The native stdio relay for MCP clients that can only launch a command: it speaks to
 # the API's Streamable HTTP endpoint (/mcp), std-only Rust, about 2 MiB RSS.
@@ -47,7 +49,7 @@ SOURCE_DATE := $(shell TZ=UTC0 git log -1 --format=%cd --date=format-local:%Y%m%
 RELEASE_NAME := xmustard-$(VERSION)-$(shell uname -s | tr '[:upper:]' '[:lower:]')-$(shell uname -m)
 RELEASE_DIR := $(abspath $(DIST))/$(RELEASE_NAME)
 RUST_BINS := xmustard-core xmustard-relay
-GO_BINS := xmustard-api xmustard-mcp xmustard-ops
+GO_BINS := xmustard-api xmustard-mcp xmustard-ops xmustard-hook
 RELEASE_FILES := $(sort LICENSE $(RUST_BINS) $(GO_BINS))
 
 release:

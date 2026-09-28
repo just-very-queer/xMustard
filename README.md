@@ -104,8 +104,8 @@ mkdir -p ~/.local/bin && cp $A/xmustard-* ~/.local/bin/
 export PATH="$HOME/.local/bin:$PATH"  # add this line to your shell profile as well
 ```
 
-The archive holds all five binaries: `xmustard-api`, `xmustard-ops`, `xmustard-relay`,
-`xmustard-core` and `xmustard-mcp`. The macOS ones are ad-hoc signed, not notarized: `curl`
+The archive holds six binaries: `xmustard-api`, `xmustard-ops`, `xmustard-relay`,
+`xmustard-core`, `xmustard-mcp` and `xmustard-hook` (the Claude Code plugin's hook client). The macOS ones are ad-hoc signed, not notarized: `curl`
 downloads run as they are, but after a browser download run
 `xattr -d com.apple.quarantine ~/.local/bin/xmustard-*`.
 
