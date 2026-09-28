@@ -321,12 +321,7 @@ fn references(
                     (false, Some(k)) => k,
                     (false, None) => ref_kind::READ,
                 };
-                let fl = match (n_ret > 0, n_cond > 0, kind == ref_kind::WRITE) {
-                    (true, _, _) => flow::RETURNS,
-                    (false, true, _) => flow::BRANCHES,
-                    (false, false, true) => flow::WRITES,
-                    _ => flow::NONE,
-                };
+                let fl = flow::classify(n_ret > 0, n_cond > 0, kind == ref_kind::WRITE);
                 let ni = *name_ix.entry(name.to_string()).or_insert_with(|| {
                     facts.names.push(name.to_string());
                     (facts.names.len() - 1) as u32

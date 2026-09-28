@@ -122,7 +122,7 @@ func (r listReducer) Reduce(ctx context.Context, in *Input) (*Projection, error)
 	summaries := 0
 	for _, sec := range secs {
 		var part bytes.Buffer
-		gapStart, gapLines := int64(-1), 0
+		gap := newLineGap()
 		err := scanLines(ctx, in.R, sec, func(idx int, line []byte, start, end int64) error {
 			name, dir, summary := listEntry(line)
 			keep := false
@@ -156,16 +156,10 @@ func (r listReducer) Reduce(ctx context.Context, in *Input) (*Projection, error)
 				}
 			}
 			if !keep {
-				if gapStart < 0 {
-					gapStart = start
-				}
-				gapLines++
+				gap.skip(start)
 				return nil
 			}
-			if gapStart >= 0 {
-				oms = append(oms, Omission{Kind: "lines", Start: gapStart, End: start, Items: gapLines})
-				gapStart, gapLines = -1, 0
-			}
+			oms = gap.flush(oms, start)
 			shownLine := displayLine(line)
 			part.Write(validUTF8(trimRune(shownLine[:min(len(shownLine), plainDisplay)])))
 			part.WriteByte('\n')
@@ -174,9 +168,7 @@ func (r listReducer) Reduce(ctx context.Context, in *Input) (*Projection, error)
 		if err != nil {
 			return nil, err
 		}
-		if gapStart >= 0 {
-			oms = append(oms, Omission{Kind: "lines", Start: gapStart, End: sec.End, Items: gapLines})
-		}
+		oms = gap.flush(oms, sec.End)
 		parts[sec.Name] = part.String()
 		if len(secs) > 1 {
 			fmt.Fprintf(&body, "[%s]\n", sec.Name)
@@ -233,15 +225,9 @@ func (r listReducer) Reduce(ctx context.Context, in *Input) (*Projection, error)
 		}
 		parts[secs[0].Name] += note
 	}
-	for _, s := range in.Sections {
-		if _, ok := parts[s.Name]; !ok {
-			parts[s.Name] = ""
-		}
-	}
-	facts := Facts{ExitCode: in.Sel.ExitCode, Entries: lp.Total, Shown: shown}
-	if facts.ExitCode != nil {
-		facts.ExitFrom = "tool"
-	}
+	fillParts(parts, in.Sections)
+	facts := Facts{Entries: lp.Total, Shown: shown}
+	facts.setToolExit(in.Sel.ExitCode)
 	return &Projection{Text: out.String(), Parts: parts, Structured: lp, Facts: facts,
 		Record: Record{Reducer: r.ID() + "/1", Mode: "text", Reduced: true, Omissions: capOmissions(oms)}}, nil
 }

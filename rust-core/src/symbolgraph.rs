@@ -12,6 +12,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::index::envelope::{Freshness, Relation, Status};
+use crate::index::facts::flow;
 use crate::repomap;
 
 fn now() -> String {
@@ -828,16 +829,14 @@ fn line_flows(line: &str) -> Vec<(&str, &'static str)> {
         if word.len() < MIN_NAME_LEN {
             continue;
         }
-        let kind = if ret.is_some_and(|i| i < start) {
-            "returns"
-        } else if branch.is_some_and(|i| i < start) {
-            "branches"
-        } else if is_assignment_target(line, end) {
-            "writes"
-        } else {
-            continue;
-        };
-        out.push((word, kind));
+        let fl = flow::classify(
+            ret.is_some_and(|i| i < start),
+            branch.is_some_and(|i| i < start),
+            is_assignment_target(line, end),
+        );
+        if let Some(kind) = flow::label(fl) {
+            out.push((word, kind));
+        }
     }
     out
 }
