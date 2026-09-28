@@ -49,7 +49,7 @@ use super::meta;
 
 /// Bump when resolution output changes for the same facts. Part of the analyzer
 /// version, so a change forces a full rebuild.
-pub const RESOLVER_REVISION: u32 = 1;
+pub const RESOLVER_REVISION: u32 = 2;
 
 /// Global-tier names shorter than this are too common to bind by name alone.
 const MIN_GLOBAL_NAME: usize = 4;
@@ -268,9 +268,10 @@ impl<'c> Resolver<'c> {
         {
             f.drops.note(id, Cause::Unresolved);
         }
-        let reason = match (&found, imp.kind.as_str()) {
-            (Some((_, true)), _) | (_, "reexport" | "reexport_all") => "re-export",
-            _ => "import",
+        // an import bound through a re-export chain forces the chain's modules too
+        let reason = match (&found, imp.reason) {
+            (Some((_, true)), "import") => "re-export",
+            (_, reason) => reason,
         };
         f.edges.add(
             None,
@@ -681,7 +682,7 @@ pub fn signature(conn: &Connection, fid: i64) -> rusqlite::Result<Signature> {
     }
     let mut st = conn.prepare_cached(
         "SELECT module, name, alias FROM imports
-         WHERE file_id = ?1 AND kind IN ('reexport', 'reexport_all')",
+         WHERE file_id = ?1 AND kind IN ('reexport', 'reexport_type', 'reexport_all')",
     )?;
     for row in st.query_map([fid], |r| {
         Ok(Export::Reexport {

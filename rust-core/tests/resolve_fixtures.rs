@@ -450,44 +450,69 @@ fn drop_counters_record_untyped_receivers_external_calls_and_boundaries() {
     assert!(!d.keys().any(|k| k.2 == "external"), "{d:#?}");
 }
 
+/// Every listed item of an impact v2 answer, with its depth.
+fn impact_items(v: &Value) -> Vec<(u64, &Value)> {
+    v["by_depth"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{v:#}"))
+        .iter()
+        .flat_map(|t| {
+            let d = t["depth"].as_u64().unwrap();
+            t["items"].as_array().unwrap().iter().map(move |i| (d, i))
+        })
+        .collect()
+}
+
+// `index impact` reads the graph segment (WS-35): the resolved symbol edges with their
+// confidence, provenance and reason, and the completeness envelope from the segment's
+// drop sections.
 #[test]
 fn impact_returns_resolved_edges_with_confidence_provenance_and_completeness() {
     let r = fixture();
     index("build", r.path(), &[]);
     let put = index("impact", r.path(), &["--symbol", "Store.Put"]);
     assert_eq!(put["graph"], "resolved");
-    assert_eq!(put["completeness"], "exact", "{put:#}");
-    let hits = put["impacted"].as_array().unwrap();
+    assert_eq!(put["epistemic"]["completeness"], "exact", "{put:#}");
+    let hits = impact_items(&put);
     assert_eq!(hits.len(), 1, "{put:#}");
-    assert_eq!(hits[0]["symbol"]["qualified_name"], "run");
-    assert_eq!(hits[0]["edge_kind"], "CALLS");
-    assert_eq!(hits[0]["confidence"], 0.9);
-    assert_eq!(hits[0]["provenance"], "scope");
+    let (depth, run) = hits[0];
+    assert_eq!(depth, 1);
+    assert_eq!(run["name"], "run");
+    assert_eq!(run["edge"], "CALLS");
+    assert_eq!(run["confidence"], 0.9);
+    assert_eq!(run["provenance"], "scope");
+    assert!(!run["reason"].as_str().unwrap().is_empty(), "{run:#}");
+    assert_eq!(put["risk"], "LOW");
 
-    // Store.Get is reachable through the Getter interface: a lower bound, with why
+    // Store.Get is reachable through the Getter interface: a lower bound, with why, and
+    // no dependent found is UNKNOWN risk
     let get = index("impact", r.path(), &["--symbol", "Store.Get"]);
-    assert_eq!(get["completeness"], "lower_bound", "{get:#}");
-    assert_eq!(get["causes"]["dispatch_boundary"], 1, "{get:#}");
+    assert_eq!(get["epistemic"]["completeness"], "lower_bound", "{get:#}");
+    assert_eq!(
+        get["epistemic"]["causes"]["dispatch_boundary"], 1,
+        "{get:#}"
+    );
     assert!(
-        get["boundaries"]
+        get["epistemic"]["boundaries"]
             .as_array()
             .unwrap()
             .iter()
             .any(|b| b["path"] == "cmd/main.go" && b["name"] == "Get")
     );
+    assert_eq!(get["risk"], "UNKNOWN");
+    assert!(get["risk_note"].as_str().unwrap().contains("lower bound"));
 
     // two hops, confidence multiplies along the path
     let fv = index("impact", r.path(), &["--symbol", "formatValue"]);
-    let two = fv["impacted"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|i| i["symbol"]["qualified_name"] == "makeWidget")
+    let (depth, two) = impact_items(&fv)
+        .into_iter()
+        .find(|(_, i)| i["name"] == "makeWidget")
         .unwrap_or_else(|| panic!("{fv:#}"));
-    assert_eq!(two["distance"], 2);
+    assert_eq!(depth, 2);
     assert_eq!(two["confidence"], 0.855);
+    assert_eq!(two["via"], "Widget.render");
     // makeWidget calls render on an untyped receiver elsewhere: lower bound
-    assert_eq!(fv["completeness"], "lower_bound");
+    assert_eq!(fv["epistemic"]["completeness"], "lower_bound");
 
     // a language the resolver does not own falls back to lexical file edges
     let rr = repo(&[
@@ -497,9 +522,12 @@ fn impact_returns_resolved_edges_with_confidence_provenance_and_completeness() {
     index("build", rr.path(), &[]);
     let lex = index("impact", rr.path(), &["--symbol", "compute_widget"]);
     assert_eq!(lex["graph"], "lexical");
-    assert_eq!(lex["completeness"], "lower_bound");
-    assert_eq!(lex["impacted"][0]["path"], "app.rs");
-    assert_eq!(lex["impacted"][0]["provenance"], "lexical");
+    assert_eq!(lex["epistemic"]["completeness"], "lower_bound");
+    assert_eq!(lex["epistemic"]["causes"]["lexical_graph"], 1);
+    let (_, app) = impact_items(&lex)[0];
+    assert_eq!(app["path"], "app.rs");
+    assert_eq!(app["kind"], "File");
+    assert_eq!(app["provenance"], "lexical");
 }
 
 #[test]

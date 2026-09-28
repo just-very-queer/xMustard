@@ -41,6 +41,8 @@
 pub mod chunks;
 pub mod config;
 pub mod csr;
+pub mod cycles;
+pub mod detect_changes;
 pub mod docs;
 pub mod edges;
 pub mod envelope;
@@ -59,6 +61,7 @@ pub mod rerank;
 pub mod resolve;
 pub mod scan;
 pub mod schema;
+pub mod trace;
 pub mod uid;
 pub mod watch;
 pub mod writer;
@@ -98,7 +101,7 @@ const CORRUPT_ERROR: &str = "index store corrupt";
 /// rebuild and invalidates the fact cache.
 pub fn analyzer_version() -> String {
     format!(
-        "xm-analyzer-1;{};resolver-{}",
+        "xm-analyzer-2;{};resolver-{}",
         extract::grammar_versions(),
         resolve::RESOLVER_REVISION
     )
@@ -1504,22 +1507,37 @@ fn open_read_only(
     Ok((root, path, Some(conn)))
 }
 
-/// `index impact`: dependents of a symbol with the completeness envelope. Read-only.
+/// `index impact`: impact v2 (WS-35) on the stored generation's graph segment, opened
+/// for this call, with its freshness. Read-only.
 pub fn impact(
     root: &Path,
     cfg: &IndexConfig,
-    symbol: &str,
-    depth: usize,
+    q: &impact::Query,
 ) -> Result<serde_json::Value, String> {
     let (root, path, conn) = open_read_only(root, cfg)?;
-    let Some(conn) = conn else {
+    if conn.is_none() {
         return Err(format!(
             "no index at {} (run `index build` first)",
             path.display()
         ));
-    };
-    let result = impact::impact(&conn, cfg, symbol, depth).map_err(sql_err)?;
+    }
+    drop(conn);
+    let opened = reader::open_at(&root, &path, csr::GraphStorage::from_env())?;
+    let result = impact::run(&*opened.snapshot, q, &opened.coverage().loss_counts)?;
+    let paths: Vec<String> = result
+        .defined_in
+        .iter()
+        .cloned()
+        .chain(
+            result
+                .by_depth
+                .iter()
+                .flat_map(|t| t.items.iter().flatten().map(|i| i.path.clone())),
+        )
+        .collect();
     let mut v = serde_json::to_value(result).map_err(|e| e.to_string())?;
+    v["freshness"] = serde_json::to_value(opened.freshness(paths.iter().map(String::as_str)))
+        .map_err(|e| e.to_string())?;
     v["command"] = "impact".into();
     v["root"] = root.to_string_lossy().into();
     Ok(v)
@@ -1578,14 +1596,13 @@ pub fn stats(root: &Path, cfg: &IndexConfig, digest: bool) -> Result<serde_json:
     Ok(v)
 }
 
-/// Reverse hops `index impact` walks by default.
-const DEFAULT_IMPACT_DEPTH: usize = 4;
-
 const USAGE: &str = "xmustard-core index <build|update|stats|impact> <root> \
     [--content-retention full|symbol|none] [--max-file-size N] [--max-files N] \
     [--max-symbols N] [--max-total-bytes N] [--max-parse-bytes N] [--index-dir DIR] \
     [--allow-non-git] [--include-untracked] [--no-cache] [--paths P ...] [--digest] \
-    [--identity-key KEY] [--symbol NAME|QUALIFIED|UID] [--depth N]";
+    [--identity-key KEY] [--symbol NAME|QUALIFIED|UID|PATH] [--depth N] [--direction=D] \
+    [--relation-types=A,B] [--min-confidence=C] [--include-tests=B] [--limit=N] [--offset=N] \
+    [--summary-only=B] [--timeout-ms=N]";
 
 /// Record the repository identity key a build or update was run for (`meta::IDENTITY_KEY`),
 /// under the writer lock; written only when it changed.
@@ -1621,7 +1638,7 @@ pub fn run(args: crate::dispatch::Args) -> crate::dispatch::CmdResult {
     let mut digest = false;
     let mut identity: Option<String> = None;
     let mut symbol: Option<String> = None;
-    let mut depth = DEFAULT_IMPACT_DEPTH;
+    let mut impact_flags: Vec<String> = Vec::new();
     let mut i = 2;
     while i < args.len() {
         let a = args[i].as_str();
@@ -1649,11 +1666,16 @@ pub fn run(args: crate::dispatch::Args) -> crate::dispatch::CmdResult {
                 2
             }
             "--depth" => {
-                depth = args
+                let d = args
                     .get(i + 1)
-                    .and_then(|d| d.parse().ok())
                     .ok_or_else(|| CmdError::new(2, "index: --depth needs a number"))?;
+                impact_flags.push(format!("--max-depth={d}"));
                 2
+            }
+            // impact v2's `--name=value` flags (validated by impact::Query)
+            _ if sub.as_str() == "impact" && a.starts_with("--") && a.contains('=') => {
+                impact_flags.push(a.to_string());
+                1
             }
             _ if cfg.apply_switch(a) => 1,
             _ => match cfg.apply_flag(a, args.get(i + 1).map(String::as_str)) {
@@ -1679,10 +1701,15 @@ pub fn run(args: crate::dispatch::Args) -> crate::dispatch::CmdResult {
         "build" => to_value(stamped(build(&root, &cfg))),
         "update" => to_value(stamped(update(&root, &cfg, paths.as_deref()))),
         "stats" => stats(&root, &cfg, digest),
-        "impact" => match symbol.as_deref() {
-            Some(sym) => impact(&root, &cfg, sym, depth),
-            None => return Err(CmdError::usage(USAGE)),
-        },
+        "impact" => {
+            let Some(sym) = symbol.as_deref() else {
+                return Err(CmdError::usage(USAGE));
+            };
+            let mut q = impact::Query::new(sym);
+            q.apply_flags(impact_flags)
+                .map_err(|e| CmdError::new(2, format!("index impact: {e}")))?;
+            impact(&root, &cfg, &q)
+        }
         _ => return Err(CmdError::usage(USAGE)),
     };
     out.map(|v| Output::Json(v.to_string()))

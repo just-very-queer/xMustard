@@ -1307,9 +1307,17 @@ fn build_of_5000_files_has_no_file_cap_and_peaks_under_25_mib() {
         "index build of 5,000 files: peak RSS {mib:.1} MiB, report {:?}",
         rep["timing"]
     );
+    // The heavy slot's 25 MiB line is the release worker's, the binary production runs.
+    // Most of a build's ps-RSS is the worker's own mapped image (code and grammar
+    // tables), and a debug image maps about 7 MiB more of it than a release one: WS-35
+    // measured 17.6-17.9 MiB release against 25.4-26.3 MiB debug on Linux, with the same
+    // 3.3-4.8 MiB heap (base 845868d: 16.3-16.6 and 23.4-24.5 MiB). So a release build
+    // (`cargo test --release`) is held to the line and a debug build to a regression
+    // guard of line plus that image difference.
+    let line = if cfg!(debug_assertions) { 28.0 } else { 25.0 };
     assert!(
-        mib <= 25.0,
-        "peak RSS {mib:.1} MiB exceeds the 25 MiB heavy-slot line"
+        mib <= line,
+        "peak RSS {mib:.1} MiB exceeds {line} MiB (the 25 MiB heavy-slot line, debug image allowed for)"
     );
 }
 
