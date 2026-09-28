@@ -18,7 +18,9 @@ import (
 //     bm25Weight.
 //   - path: each declared path that is a focus path (the query paths, else the files
 //     being worked on). anchor: each declared path under a focus directory, or a
-//     declared directory holding a focus path.
+//     declared directory holding a focus path; plus, for each anchor the query text
+//     or a focus path names that the entry holds (a focus path only when the entry
+//     merely mentions it), 0.5/(1+0.001(n-1)^2) with n the memories sharing it.
 //   - trust: the verification mode, the approvals, and the rank state.
 //   - recency: decays with age behind the newest entry the caller can see.
 //   - feedback: the helpful, misleading and stale_harm outcomes on the served revision.
@@ -50,7 +52,7 @@ var (
 	modeTrust = map[string]float64{
 		VerificationPeer: 0.5, VerificationSingleAgent: 0.25, VerificationSelfAssertedOpen: 0.1,
 	}
-	stateTrust = map[string]float64{govstore.RankSuperseded: -1.0, govstore.RankExpired: -0.5}
+	stateTrust = map[string]float64{govstore.RankSuperseded: -1.0, govstore.RankMerged: -1.0, govstore.RankExpired: -0.5}
 )
 
 // ScoreDetails is an entry's ranking, signal by signal. Total is their sum.
@@ -89,12 +91,16 @@ func (d *ScoreDetails) stale(paths []string) {
 
 func round3(v float64) float64 { return math.Round(v*1000) / 1000 }
 
-// recallSignals is what scoring compares every entry against.
+// recallSignals is what scoring compares every entry against. anchorBoost is each
+// entry's fan-out-damped boost from the anchors the recall names (queryAnchorBoosts),
+// anchorWhy the anchors behind it.
 type recallSignals struct {
-	bm25     map[string]float64
-	bestBM25 float64
-	focus    map[string]bool
-	newest   time.Time
+	bm25        map[string]float64
+	bestBM25    float64
+	focus       map[string]bool
+	newest      time.Time
+	anchorBoost map[string]float64
+	anchorWhy   map[string][]string
 }
 
 func newRecallSignals(view []govstore.RankEntry, bm25 map[string]float64, focus []string) recallSignals {
@@ -137,6 +143,10 @@ func (s recallSignals) score(e govstore.RankEntry) ScoreDetails {
 			d.Anchor += anchorWeight
 			d.because("anchor %s nests with a focus path", p)
 		}
+	}
+	if b := s.anchorBoost[e.ID]; b > 0 {
+		d.Anchor = round3(d.Anchor + b)
+		d.because("anchors %s", strings.Join(s.anchorWhy[e.ID], ", "))
 	}
 	approvals := min(e.Approvals, maxApprovals)
 	d.Trust = round3(modeTrust[e.VerificationMode] + stateTrust[e.State] + approvalWeight*float64(approvals))

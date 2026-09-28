@@ -24,3 +24,19 @@ file.
   These files remain under the Apache License, Version 2.0. Each keeps upstream's
   SPDX-License-Identifier and copyright lines and states the changes xMustard
   contributors made to it.
+
+This product includes software translated from Graphiti
+(https://github.com/getzep/graphiti), licensed under the Apache License, Version 2.0
+(third_party/graphiti/LICENSE). Graphiti ships no NOTICE file.
+
+  Copyright 2024, Zep Software, Inc.
+
+  Translated at upstream commit 47f6482 (2026-09-24), from
+  graphiti_core/utils/maintenance/dedup_helpers.py (the normalization, entropy gate,
+  3-gram shingles, 32-permutation MinHash, LSH bands of 4 and Jaccard similarity), into:
+
+    api-go/internal/dedupe/minhash.go
+
+  This file remains under the Apache License, Version 2.0. It keeps upstream's
+  copyright line, carries an SPDX-License-Identifier and states the changes xMustard
+  contributors made to it.

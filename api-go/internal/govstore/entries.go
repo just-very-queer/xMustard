@@ -142,6 +142,8 @@ func (e Entry) RankState(now time.Time) string {
 		return RankPending
 	case e.Promoted && e.Lifecycle == LifecycleSuperseded:
 		return RankSuperseded
+	case e.Lifecycle == LifecycleMerged:
+		return RankMerged
 	}
 	return ""
 }
@@ -568,6 +570,9 @@ func (t *txn) insertEntry(ctx context.Context, in NewEntry, o entryOrigin, actor
 	if err != nil {
 		return Entry{}, err
 	}
+	if err := t.putDedupeKeys(ctx, pk, in.WorkspaceID, in.Content); err != nil {
+		return Entry{}, err
+	}
 	if err := t.ftsPut(ctx, pk, title, joinBody(description, in.Content), anchorText); err != nil {
 		return Entry{}, err
 	}
@@ -968,6 +973,7 @@ func (t *txn) Purge(ctx context.Context, id, reason string, actor Actor) error {
 		{`UPDATE outcomes SET note = '' WHERE entry_id = ?`, []any{id}},
 		{`DELETE FROM anchors WHERE entry_id = ?`, []any{id}},
 		{`DELETE FROM claims WHERE entry_id = ?`, []any{id}},
+		{`DELETE FROM dedupe_keys WHERE entry_pk = ?`, []any{cur.Cursor}},
 		{`UPDATE events SET note = NULL, data = NULL, redacted = 1 WHERE entry_id = ? AND redacted = 0`, []any{id}},
 	}
 	for _, s := range steps {
