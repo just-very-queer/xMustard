@@ -445,10 +445,10 @@ func TestPEMWithoutEndIsBounded(t *testing.T) {
 		}
 	}
 
-	// The same around the first window boundary, from either side of the
+	// The same around a window boundary, from either side of the
 	// lookahead, whatever the chunking of reads.
-	first := contextLen + windowSize - 1 // input bytes in the first window
-	for _, at := range []int{first - lookahead - 3000, first - lookahead - 40, first - lookahead + 40, first - 2000} {
+	edge := windowEnd // input bytes up to a window's end
+	for _, at := range []int{edge - lookahead - 3000, edge - lookahead - 40, edge - lookahead + 40, edge - 2000} {
 		in := filler(rng, at) + "\n" + begin + "\n" + l1 + "\n" + l2 + strings.Repeat(" ", 300) + "\n" + `{"n":1}` + "\n" + filler(rng, 3000)
 		want := sameAsOneShot(t, r, "truncated key at boundary", in)
 		if !strings.Contains(want, begin+"[REDACTED:private_key]"+strings.Repeat(" ", 300)+"\n"+`{"n":1}`+"\n") {
@@ -866,19 +866,19 @@ func filler(rng *rand.Rand, n int) string {
 	return b.String()[:n]
 }
 
-// A secret placed across every window boundary position near the first
-// window's end is redacted exactly as in one-shot mode, under one-byte and
+// A secret placed across every window boundary position near a window's
+// end is redacted exactly as in one-shot mode, under one-byte and
 // random-size reads.
 func TestStreamSecretsAcrossWindowBoundaries(t *testing.T) {
 	r := Default()
 	rng := rand.New(rand.NewSource(3))
-	first := contextLen + windowSize - 1 // input bytes in the first window
+	edge := windowEnd // input bytes up to a window's end
 	offsets := []int{}
 	for d := -lookahead - 300; d <= 300; d += 37 {
-		offsets = append(offsets, first+d)
+		offsets = append(offsets, edge+d)
 	}
 	for _, d := range []int{-lookahead - 1, -lookahead, -lookahead + 1, -1, 0, 1} {
-		offsets = append(offsets, first+d)
+		offsets = append(offsets, edge+d)
 	}
 	corpus := secretCorpus()
 	for i, off := range offsets {
@@ -975,11 +975,11 @@ func TestStreamLongSecretsSpanWindows(t *testing.T) {
 // and reaches past its end extends that region, as one window over the whole
 // input would merge the two: here a key, and a quoted value that closes after
 // the region does, inside a long unterminated single-quoted value that crosses
-// the first window boundary.
+// a window boundary.
 func TestCarriedRegionExtendsIntoNextWindow(t *testing.T) {
 	r := Default()
 	rng := rand.New(rand.NewSource(12))
-	first := contextLen + windowSize - 1 // input bytes in the first window
+	edge := windowEnd // input bytes up to a window's end
 	begin, end := join("-----BEGIN ", "PRIVATE", " KEY-----"), join("-----END ", "PRIVATE", " KEY-----")
 	l1, l2 := randToken(rng, alphaNum+"+/", 64), randToken(rng, alphaNum+"+/", 64)
 	tok := "Zq8" + randToken(rng, alphaNum, 20) + "'" + randToken(rng, alphaNum, 20) + "7x"
@@ -990,7 +990,7 @@ func TestCarriedRegionExtendsIntoNextWindow(t *testing.T) {
 	}
 	for name, tail := range tails {
 		for _, lead := range []int{lookahead + 500, lookahead + 3000} {
-			pre := strings.Repeat("lorem ipsum\n", (first-lead)/12)
+			pre := strings.Repeat("lorem ipsum\n", (edge-lead)/12)
 			words := strings.Repeat("lorem ipsum ", (lead+2000)/12) // crosses the window end
 			in := pre + "note: password: 'draft " + words + tail
 			want := sameAsOneShot(t, r, name, in)
@@ -1008,9 +1008,17 @@ func TestCarriedRegionExtendsIntoNextWindow(t *testing.T) {
 	}
 }
 
-// firstLimit is the input offset of the first window's limit: anchors before
-// it are decided in the first window, the rest in the second.
-const firstLimit = contextLen + windowSize - 1 - lookahead
+// Stream windows decide decideSpan bytes each and read the lookahead after
+// them, so, with no region carried across a limit, every multiple of
+// decideSpan is a window's limit (anchors before it are decided in that
+// window, the rest in the next) and the window ends lookahead bytes past it.
+// windowLimit and windowEnd are those of the window that decides up to
+// 128 KiB, so the string APIs (String, Bytes, Findings) stream these inputs as
+// well.
+const (
+	windowLimit = windowSize / decideSpan * decideSpan
+	windowEnd   = windowLimit + lookahead
+)
 
 // padTo returns prose of exactly n bytes, ending in a line break.
 func padTo(n int) string {
@@ -1049,19 +1057,19 @@ func TestSecretsPastTheDecisionLimit(t *testing.T) {
 	for d := 1; d <= 400; d += step {
 		l1 := randToken(rng, alphaNum+"+/", 64)
 		// BEGIN just before the limit, the password and the key line after it
-		in := padTo(firstLimit-d) + `{"text":"my key: ` + begin + `"}` + "\n" + `{"cmd":"export DB_PASSWORD='` + pw + `'"}` + "\n" +
+		in := padTo(windowLimit-d) + `{"text":"my key: ` + begin + `"}` + "\n" + `{"cmd":"export DB_PASSWORD='` + pw + `'"}` + "\n" +
 			`{"text":"` + l1 + `"}` + "\n" + `{"text":"` + end + `"}` + "\n" + tail
 		check(fmt.Sprint("jsonl records ", d), in, pw)
 		// a key whose repeated line prefix holds a password
 		pre := "\n# password=\"" + randToken(rng, alphaNum, 6) + "!\" "
-		in = padTo(firstLimit-d) + "# " + begin + pre + l1 + pre + randToken(rng, alphaNum+"+/", 64) + pre + "Xk9pQ2w==" + pre + end + "\n" + tail
+		in = padTo(windowLimit-d) + "# " + begin + pre + l1 + pre + randToken(rng, alphaNum+"+/", 64) + pre + "Xk9pQ2w==" + pre + end + "\n" + tail
 		check(fmt.Sprint("prefixed key ", d), in, pre[len("\n# password=\""):len(pre)-2], l1, "Xk9pQ2w==")
 	}
 	gh := join("gh", "p_", randToken(rng, alphaNum, 36))
 	for d := 1; d <= 12; d++ {
-		in := padTo(firstLimit-d) + "https://" + gh + ":x-oauth-basic@github.com/org/repo.git\n" + tail
+		in := padTo(windowLimit-d) + "https://" + gh + ":x-oauth-basic@github.com/org/repo.git\n" + tail
 		check(fmt.Sprint("url user ", d), in, gh)
-		in = padTo(firstLimit-d) + "Authorization: Bearer " + randToken(rng, alphaNum, 40) + "\n" + tail
+		in = padTo(windowLimit-d) + "Authorization: Bearer " + randToken(rng, alphaNum, 40) + "\n" + tail
 		check(fmt.Sprint("bearer header ", d), in)
 	}
 }
@@ -1093,13 +1101,13 @@ func TestCardScanAcrossWindowBoundaries(t *testing.T) {
 		}
 	}
 	tail := filler(rng, 40000)
-	check("reported run", padTo(firstLimit-13)+"005 06 003 6 2443 0081 00400 0099 00050 884 28007 51 03\n"+tail)
+	check("reported run", padTo(windowLimit-13)+"005 06 003 6 2443 0081 00400 0099 00050 884 28007 51 03\n"+tail)
 	step := 1
 	if testing.Short() {
 		step = 5
 	}
 	for d := 1; d <= 80; d += step {
-		check(fmt.Sprint("run at ", d), padTo(firstLimit-d)+digitGroups(rng, 200)+"\n"+tail)
+		check(fmt.Sprint("run at ", d), padTo(windowLimit-d)+digitGroups(rng, 200)+"\n"+tail)
 	}
 	for i := range 6 {
 		// digit groups all the way, so every later window boundary falls in a run
@@ -1255,13 +1263,13 @@ func TestStreamMatchesOneShotSticky(t *testing.T) {
 func TestStreamPEMEndMarkerAcrossBoundary(t *testing.T) {
 	r := Default()
 	begin, end := join("-----BEGIN ", "EC PRIVATE", " KEY-----"), join("-----END ", "EC PRIVATE", " KEY-----")
-	first := contextLen + windowSize - 1
+	edge := windowEnd // input bytes up to a window's end
 	for split := 1; split < len(end); split += 3 {
 		bodyLen := pemMaxBody - 100
 		if split%2 == 0 {
 			bodyLen = 3000
 		}
-		head := strings.Repeat("a", first-split-len(begin)-bodyLen) // END starts split bytes before the window end
+		head := strings.Repeat("a", edge-split-len(begin)-bodyLen) // END starts split bytes before the window end
 		body := strings.Repeat("Q", bodyLen)
 		in := head + begin + body + end + "\nvisible"
 		want := sameAsOneShot(t, r, "pem end split", in)
@@ -1276,11 +1284,15 @@ func TestStreamPEMEndMarkerAcrossBoundary(t *testing.T) {
 // keeps its backslash: the output is the one-shot output and valid JSON.
 func TestStreamEscapedQuoteAcrossBoundary(t *testing.T) {
 	r := Default()
-	first := contextLen + windowSize - 1 // input bytes in the first window
+	// The value is a region carried from near the start of the input, so each
+	// window starts where the previous one ended: windows end at multiples of
+	// decideSpan plus the lookahead. This is the first such end past 128 KiB, so
+	// the string APIs stream as well.
+	edge := (windowSize/(decideSpan+lookahead) + 1) * (decideSpan + lookahead)
 	for shift := -2; shift <= 2; shift++ {
 		prefix := `{"filler":"` + strings.Repeat("f", 1000) + `","arguments":"{\"password\":\"`
-		value := strings.Repeat("s3cR", (first-len(prefix)-1+shift)/4)
-		value += strings.Repeat("x", first-len(prefix)-1+shift-len(value))
+		value := strings.Repeat("s3cR", (edge-len(prefix)-1+shift)/4)
+		value += strings.Repeat("x", edge-len(prefix)-1+shift-len(value))
 		in := prefix + value + `\",\"n\":1}"}`
 		if !json.Valid([]byte(in)) {
 			t.Fatal("fixture is not JSON")

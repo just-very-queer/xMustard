@@ -205,9 +205,8 @@ func TestPathArgumentsDoNotGrowTheSession(t *testing.T) {
 	if n := api.count("GET", "/api/workspaces"); n != 1 {
 		t.Fatalf("each path argument re-read the listing (%d reads)", n)
 	}
-	_, rerr := call(t, s, "explain", map[string]any{"path": "/" + strings.Repeat("a", maxPathArg)})
-	if rerr == nil || rerr.Code != CodeInvalidParams {
-		t.Fatalf("an explain path over %d characters must be rejected: %v", maxPathArg, rerr)
+	if _, d := argErr(t, s, "explain", map[string]any{"path": "/" + strings.Repeat("a", maxPathArg)}); d["maxLength"] != maxPathArg {
+		t.Fatalf("an explain path over %d characters must be rejected: %v", maxPathArg, d)
 	}
 }
 
