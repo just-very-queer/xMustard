@@ -1,0 +1,46 @@
+# WS-15 freshness on the 5,000-file synthetic tree, 2026-09-28
+
+## Linux (build box, inotify): cargo test --release --test refresh -- --ignored --nocapture fresh_within
+watch start + start-up refresh: 378 ms
+status: {"backend":"inotify","counters":{"cookie_timeouts":0,"cookies":1,"dirs_watched":57,"errors":0,"events":3,"git_events":0,"large_skipped":0,"memo_hits":0,"memo_misses":0,"native_restarts":0,"paths":0,"rescans":0,"skipped":0},"detail":"","due":false,"failures":0,"in_flight":false,"last_refresh":{"deleted":0,"elapsed_ms":77,"escalated":false,"mode":"noop","reason":"unchanged","reparsed":0,"reresolved":0},"pending":false,"queue":{"batches":1,"changes":2,"coalesced":0,"failures":0,"full_refreshes":1,"gave_up":0,"overflows":0,"retries":0,"superseded":0},"watcher_state":"ok"}
+edit 0: fresh after 423 ms (update {"edges_ms":8,"elapsed_ms":120,"scan_ms":15,"segment_ms":69}, reresolved 1)
+edit 1: fresh after 421 ms (update {"edges_ms":7,"elapsed_ms":119,"scan_ms":16,"segment_ms":69}, reresolved 1)
+edit 2: fresh after 420 ms (update {"edges_ms":7,"elapsed_ms":118,"scan_ms":16,"segment_ms":68}, reresolved 1)
+edit 3: fresh after 441 ms (update {"edges_ms":10,"elapsed_ms":138,"scan_ms":21,"segment_ms":75}, reresolved 1)
+edit 4: fresh after 425 ms (update {"edges_ms":7,"elapsed_ms":120,"scan_ms":17,"segment_ms":68}, reresolved 1)
+edit 5: fresh after 422 ms (update {"edges_ms":7,"elapsed_ms":120,"scan_ms":17,"segment_ms":68}, reresolved 1)
+edit 6: fresh after 447 ms (update {"edges_ms":13,"elapsed_ms":144,"scan_ms":28,"segment_ms":68}, reresolved 1)
+edit 7: fresh after 418 ms (update {"edges_ms":7,"elapsed_ms":115,"scan_ms":15,"segment_ms":67}, reresolved 1)
+edit 8: fresh after 424 ms (update {"edges_ms":7,"elapsed_ms":118,"scan_ms":16,"segment_ms":68}, reresolved 1)
+edit 9: fresh after 438 ms (update {"edges_ms":10,"elapsed_ms":136,"scan_ms":20,"segment_ms":75}, reresolved 1)
+p50 424 ms, max 447 ms
+
+## macOS (M1, 8 GB, FSEvents): same test
+watch start + start-up refresh: 560 ms
+status: {"backend":"fsevent","counters":{"cookie_timeouts":0,"cookies":1,"dirs_watched":0,"errors":0,"events":14,"git_events":0,"large_skipped":0,"memo_hits":0,"memo_misses":0,"native_restarts":0,"paths":0,"rescans":0,"skipped":9},"detail":"","due":false,"failures":0,"in_flight":false,"last_refresh":{"deleted":0,"elapsed_ms":244,"escalated":false,"mode":"noop","reason":"unchanged","reparsed":0,"reresolved":0},"pending":false,"queue":{"batches":1,"changes":2,"coalesced":0,"failures":0,"full_refreshes":1,"gave_up":0,"overflows":0,"retries":0,"superseded":0},"watcher_state":"ok"}
+edit 0: fresh after 488 ms (update {"edges_ms":5,"elapsed_ms":158,"scan_ms":63,"segment_ms":44}, reresolved 1)
+edit 1: fresh after 489 ms (update {"edges_ms":4,"elapsed_ms":164,"scan_ms":65,"segment_ms":45}, reresolved 1)
+edit 2: fresh after 493 ms (update {"edges_ms":4,"elapsed_ms":162,"scan_ms":65,"segment_ms":44}, reresolved 1)
+edit 3: fresh after 487 ms (update {"edges_ms":4,"elapsed_ms":158,"scan_ms":63,"segment_ms":44}, reresolved 1)
+edit 4: fresh after 485 ms (update {"edges_ms":5,"elapsed_ms":160,"scan_ms":64,"segment_ms":44}, reresolved 1)
+edit 5: fresh after 495 ms (update {"edges_ms":4,"elapsed_ms":164,"scan_ms":65,"segment_ms":45}, reresolved 1)
+edit 6: fresh after 504 ms (update {"edges_ms":5,"elapsed_ms":173,"scan_ms":69,"segment_ms":54}, reresolved 1)
+edit 7: fresh after 483 ms (update {"edges_ms":4,"elapsed_ms":153,"scan_ms":61,"segment_ms":44}, reresolved 1)
+edit 8: fresh after 478 ms (update {"edges_ms":4,"elapsed_ms":152,"scan_ms":61,"segment_ms":45}, reresolved 1)
+edit 9: fresh after 474 ms (update {"edges_ms":4,"elapsed_ms":144,"scan_ms":57,"segment_ms":44}, reresolved 1)
+p50 488 ms, max 504 ms
+
+## Linux, through the API (ws15-e2e-fresh.py; worker on, one-shot index update in the heavy slot)
+first search to watcher ok: 11.7 s
+edit 0: fresh after 513 ms; index update started at 376 ms with --paths ['mod03/util3.js']
+edit 1: fresh after 463 ms; index update started at 356 ms with --paths ['mod08/util8.js']
+edit 2: fresh after 457 ms; index update started at 348 ms with --paths ['mod13/util13.js']
+edit 3: fresh after 457 ms; index update started at 344 ms with --paths ['mod18/util18.js']
+edit 4: fresh after 517 ms; index update started at 365 ms with --paths ['mod23/util23.js']
+edit 5: fresh after 535 ms; index update started at 397 ms with --paths ['mod28/util28.js']
+edit 6: fresh after 549 ms; index update started at 370 ms with --paths ['mod33/util33.js']
+edit 7: fresh after 482 ms; index update started at 354 ms with --paths ['mod38/util38.js']
+edit 8: fresh after 478 ms; index update started at 340 ms with --paths ['mod43/util43.js']
+edit 9: fresh after 497 ms; index update started at 350 ms with --paths ['mod48/util48.js']
+p50 497 ms, max 549 ms over 10 edits
+search for the last edit: hit | source resident_index | core execs during the read: none
