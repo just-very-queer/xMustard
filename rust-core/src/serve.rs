@@ -34,7 +34,12 @@
 //!   removed and answered at once; a running one finishes, but its output is dropped,
 //!   and it is answered when its handler returns. Either way the answer is
 //!   [`REQUEST_CANCELLED`], so the client knows when the request's work has ended.
-//! - `$/stats` returns counters.
+//! - `$/stats` returns counters, the watched roots and the Git children started.
+//!
+//! The server also sends notifications (frames without an id) for the watcher
+//! (`index::watch`, WS-15): `$/refresh.due` when a watched root's batch is due and
+//! `$/watch.state` when a root's watcher state changes, each with the root's watch
+//! status as params.
 //! - Any resident subcommand, with params `{"args": [...]}`. The subcommand's JSON
 //!   output becomes `result` byte for byte: every result frame is written as
 //!   `{"jsonrpc":"2.0","id":N,"result":<output>}` in that order, so the client can
@@ -460,6 +465,8 @@ impl Shared {
             "queued": lock(&self.queue).len(),
             "snapshots": self.snapshots.stats(),
             "index": crate::index::reader::resident().map(|r| r.stats()),
+            "watch": crate::index::watch::registry().status(None),
+            "git_spawns": crate::indexcache::git_spawns(),
         })
     }
 }
@@ -525,6 +532,16 @@ pub fn serve<R: BufRead>(
         cfg: cfg.clone(),
         started: Instant::now(),
     });
+    {
+        // watcher notifications go out as frames without an id
+        let shared = Arc::downgrade(&shared);
+        crate::index::watch::enable(move |method, params| {
+            let body = json!({"jsonrpc": "2.0", "method": method, "params": params});
+            if let (Some(shared), Ok(body)) = (shared.upgrade(), serde_json::to_vec(&body)) {
+                shared.send(None, &[&body]);
+            }
+        });
+    }
     for n in 0..cfg.max_inflight {
         let shared = shared.clone();
         // Tree-sitter walks recurse; match the main thread's stack, not the 2 MiB

@@ -4,7 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"slices"
 	"testing"
+
+	"xmustard/api-go/internal/rustcore"
 )
 
 func TestWithRefreshWorkReportsTheUpdateBehindARead(t *testing.T) {
@@ -34,9 +37,9 @@ func TestCodeIndexRefreshRecordsOutcomePerIdentityKey(t *testing.T) {
 	prev := codeIndexRunner
 	t.Cleanup(func() { codeIndexRunner = prev })
 	run := func(root, key string, out string, err error) *refreshFlight {
-		codeIndexRunner = func(_ context.Context, gotRoot, gotKey string) ([]byte, error) {
-			if gotRoot != root || gotKey != key {
-				t.Fatalf("runner got %s %s", gotRoot, gotKey)
+		codeIndexRunner = func(_ context.Context, gotRoot string, args ...string) ([]byte, error) {
+			if gotRoot != root || len(args) != 2 || args[0] != "--identity-key" || args[1] != key {
+				t.Fatalf("runner got %s %v", gotRoot, args)
 			}
 			return []byte(out), err
 		}
@@ -95,5 +98,33 @@ func TestCodeIndexReadCarriesTheIdentityAndReportsTheRefresh(t *testing.T) {
 	}
 	if got.Impacted == nil || got.Coverage.Work["graph_cache"] != "miss" {
 		t.Fatalf("refresh not reported on an impact result: %+v", got)
+	}
+}
+
+// An update names the watcher's paths only when its batch accounts for every change;
+// anything else checks the whole tree.
+func TestRefreshArgsNameTheBatchPathsOnlyWhenTheBatchIsComplete(t *testing.T) {
+	paths := []string{"a.go", "b/c.ts"}
+	cases := []struct {
+		name   string
+		batch  *rustcore.RefreshBatch
+		forced bool
+		want   []string
+	}{
+		{"no watcher", nil, true, []string{"--identity-key", "k"}},
+		{"a synced batch", &rustcore.RefreshBatch{Paths: paths, Synced: true}, false, []string{"--identity-key", "k", "--paths", "a.go", "b/c.ts"}},
+		{"a Git state change only", &rustcore.RefreshBatch{Git: true, Synced: true}, false, []string{"--identity-key", "k", "--paths"}},
+		{"a full refresh", &rustcore.RefreshBatch{Full: "ignore_file", Synced: true}, false, []string{"--identity-key", "k"}},
+		{"an unsynced batch", &rustcore.RefreshBatch{Paths: paths}, false, []string{"--identity-key", "k"}},
+		{"a read found nothing pending", &rustcore.RefreshBatch{Synced: true}, true, []string{"--identity-key", "k"}},
+		{"a read took pending paths", &rustcore.RefreshBatch{Paths: paths, Synced: true}, true, []string{"--identity-key", "k", "--paths", "a.go", "b/c.ts"}},
+	}
+	for _, c := range cases {
+		if got := refreshArgs("k", c.batch, c.forced); !slices.Equal(got, c.want) {
+			t.Errorf("%s: %v, want %v", c.name, got, c.want)
+		}
+	}
+	if got := refreshArgs("", nil, false); len(got) != 0 {
+		t.Errorf("no identity and no batch: %v", got)
 	}
 }

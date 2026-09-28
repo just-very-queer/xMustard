@@ -109,6 +109,7 @@ pub fn build_subsystems(root: &Path, workspace_id: &str) -> Result<Vec<Subsystem
 }
 
 pub fn likely_owners(root: &Path, path: &str) -> OwnerSuggestion {
+    crate::indexcache::note_git_spawn();
     let output = Command::new("git")
         .arg("-C")
         .arg(root)

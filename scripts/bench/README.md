@@ -59,6 +59,11 @@ Scenarios (`--scenarios a,b` or `--suite ci|parity`):
   is reported as skipped with the missing requirement: `watcher-on` needs the watcher,
   `snapshot-swap-under-load` needs the resident index's `snapshot_generation` marker and
   checks that it advanced while the agents were querying.
+- `--core-worker` runs every API of the run (the feature probe too) with the resident
+  core worker (`XMUSTARD_CORE_WORKER=1`). The resident index service and the watcher
+  (WS-15) live in that worker, so `watcher-on` runs only with it, and the
+  `rust_index_service` line has a process to measure only with it. The report records
+  `core_worker`, and `--workstream` refuses a `--baseline` measured the other way.
 
 Feature markers are on only by `feature_on_rule` in `parity_fixtures.json`: a scalar that
 is not null, false, 0 or an off word, or an object with an `enabled`, `state` or `status`

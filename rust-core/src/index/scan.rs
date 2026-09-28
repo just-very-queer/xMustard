@@ -320,6 +320,7 @@ fn stream_git_records(
     mut on_record: impl FnMut(&[u8]),
 ) -> Result<(), String> {
     let what = || format!("git {}", args.join(" "));
+    crate::indexcache::note_git_spawn();
     let mut child = Command::new("git")
         .arg("--no-optional-locks")
         .arg("-C")

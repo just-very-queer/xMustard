@@ -2312,6 +2312,16 @@ def counter_delta(h0, h1):
     return out
 
 
+def api_env(ctx):
+    """The API's environment: the core binary, plus the resident core worker when the run
+    asks for it (--core-worker). The resident index service and the watcher (WS-15) live
+    in that worker; without it every Rust call is a per-call core."""
+    env = {"XMUSTARD_CORE_BIN": ctx["core"]}
+    if ctx.get("core_worker"):
+        env["XMUSTARD_CORE_WORKER"] = "1"
+    return env
+
+
 def run_agents_scenario(ctx, name, sc):
     fixtures, rounds = ctx["fixtures"], ctx["rounds"]
     feats = FeatureState(fixtures["feature_probes"])
@@ -2356,7 +2366,7 @@ def run_agents_scenario(ctx, name, sc):
         os.makedirs(data)
         with open(os.path.join(data, "settings.json"), "w") as f:
             json.dump({"require_multi_agent_verification": False}, f)
-        api = Api(ctx["api_bin"], data, {"XMUSTARD_CORE_BIN": ctx["core"]}).start()
+        api = Api(ctx["api_bin"], data, api_env(ctx)).start()
         http_ok, http_detail = probe_http_mcp(api.base)
         feats.values["http_mcp"] = http_ok
         relay = sc.get("transport") == "relay"
@@ -2558,7 +2568,7 @@ def probe_features(ctx):
     langs = {}
     feats = FeatureState(ctx["fixtures"]["feature_probes"])
     try:
-        api = Api(ctx["api_bin"], data, {"XMUSTARD_CORE_BIN": ctx["core"]}).start()
+        api = Api(ctx["api_bin"], data, api_env(ctx)).start()
         feats.values["http_mcp"] = probe_http_mcp(api.base)[0]
         st, snap, _ = api.request("POST", "/api/workspaces/load", {"root_path": repo, "auto_scan": True}, timeout=300)
         ws = snap["workspace"]["workspace_id"]
@@ -2927,6 +2937,9 @@ def cmd_run(args):
     if args.workstream and not args.baseline:
         raise SystemExit("--workstream needs --baseline <report.json> measured on the same machine")
     base = load_json(args.baseline) if args.baseline else None
+    if base is not None and bool(base.get("core_worker")) != args.core_worker:
+        raise SystemExit(f"--baseline was measured with core_worker={bool(base.get('core_worker'))} and this run has "
+                         f"core_worker={args.core_worker}: a worker process on one side only is not a workstream delta")
     ledger = load_json(args.ledger)
     fixtures = load_json(FIXTURES_PATH)
     source_root = os.path.abspath(args.source_root or REPO_ROOT)
@@ -2940,12 +2953,13 @@ def cmd_run(args):
     relay_bin = resolve_relay(source_root, args.relay_bin) if any(SCENARIOS[n].get("transport") == "relay" for n in names) else None
     ctx = {"ledger": ledger, "fixtures": fixtures, "registry": RoleRegistry(ledger["process_roles"]),
            "probe": default_probe(), "api_bin": api_bin, "mcp_bin": mcp_bin, "core": core, "relay_bin": relay_bin,
-           "work": work, "cache": cache, "keep": args.keep, "rounds": args.rounds}
+           "work": work, "cache": cache, "keep": args.keep, "rounds": args.rounds, "core_worker": args.core_worker}
     ctx["provenance"] = provenance_for(source_root, api_bin, mcp_bin, core, SCRIPTS)
     if relay_bin:
         ctx["provenance"]["binaries_sha256"]["xmustard-relay"] = sha_file(relay_bin)
     report = {"schema": 2, "generated_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
               "gate_limit_bytes": GATE_BYTES, "gate_limit_mib": GATE_MIB, "provenance": ctx["provenance"],
+              "core_worker": args.core_worker,
               "probe": ctx["probe"].name, "fixture_cache": cache, "scenarios": collections.OrderedDict(),
               "unmeasured": UNMEASURED}
     try:
@@ -3097,6 +3111,9 @@ def main(argv=None):
     r.add_argument("--rounds", type=int, default=3, help="query rounds per agent in parity scenarios")
     r.add_argument("--source-root", help="checkout to build the binaries from (default: this checkout)")
     r.add_argument("--core-bin", help="prebuilt xmustard-core (default: XMUSTARD_CORE_BIN or cargo build)")
+    r.add_argument("--core-worker", action="store_true",
+                   help="run the API with the resident core worker (XMUSTARD_CORE_WORKER=1), where the index service "
+                        "and the watcher live; a --baseline must have been measured the same way")
     r.add_argument("--relay-bin", help="prebuilt xmustard-relay (default: XMUSTARD_RELAY_BIN, or cargo build when the source has it)")
     r.add_argument("--fixture-cache", help="scratch directory for pinned fixture clones")
     r.add_argument("--ledger", default=LEDGER_PATH)

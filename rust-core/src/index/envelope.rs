@@ -5,7 +5,9 @@
 //!
 //! The commit relation costs one or two Git children. The resident service caches it
 //! per index for [`TTL`] and recomputes it early when the store's files change (an
-//! update commits); concurrent readers of one index share one computation. Git runs
+//! update commits); concurrent readers of one index share one computation. While the
+//! root's watcher is `ok` the relation is kept past the TTL until the watcher sees a
+//! Git state change (HEAD, the Git index, refs), so queries spawn no Git (WS-15). Git runs
 //! with a [`GIT_TIMEOUT`]; a failure or timeout makes the status `unknown`, never an
 //! error (fail open). The dirty-path check reads no Git state: it compares each result
 //! path's current size and mtime with the stat the index recorded.
@@ -13,7 +15,7 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::indexcache::run_git_bounded;
 
@@ -23,8 +25,6 @@ pub const TTL: Duration = Duration::from_secs(2);
 pub const GIT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Result paths checked and listed as dirty at most.
 pub const MAX_DIRTY_PATHS: usize = 50;
-/// No watcher runs yet (WS-15); an off word under the gate's feature rule.
-pub const WATCHER_STATE: &str = "absent";
 
 /// How the indexed commit relates to `HEAD`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -48,6 +48,20 @@ pub struct Relation {
     pub status: Status,
     pub behind_by: Option<u64>,
     pub at: Instant,
+    /// The watcher's Git state epoch when this was observed; None when no watcher
+    /// vouched for the root then.
+    pub git_epoch: Option<u64>,
+}
+
+impl Relation {
+    /// Whether this observation still stands: younger than `TTL`, or the root's
+    /// watcher has seen no Git state change since it was taken.
+    pub fn fresh(&self, root: &Path) -> bool {
+        self.at.elapsed() < TTL
+            || self
+                .git_epoch
+                .is_some_and(|e| super::watch::git_epoch(root) == Some(e))
+    }
 }
 
 fn git_line(root: &Path, args: &[&str]) -> Option<String> {
@@ -57,6 +71,8 @@ fn git_line(root: &Path, args: &[&str]) -> Option<String> {
 
 /// Relate the indexed commit to the current `HEAD` of `root`.
 pub fn relate(root: &Path, indexed_commit: &str) -> Relation {
+    // read before Git runs, so a HEAD move during the call invalidates the result
+    let git_epoch = super::watch::git_epoch(root);
     let head = git_line(root, &["rev-parse", "-q", "--verify", "HEAD"]);
     let (status, behind_by) = match head.as_deref() {
         None | Some("") if indexed_commit.is_empty() => (Status::Current, None), // both unborn
@@ -71,6 +87,7 @@ pub fn relate(root: &Path, indexed_commit: &str) -> Relation {
         status,
         behind_by,
         at: Instant::now(),
+        git_epoch,
     }
 }
 
@@ -113,12 +130,31 @@ pub struct Freshness {
     pub snapshot_generation: Option<i64>,
     /// Age of the commit observation.
     pub identity_age_ms: u64,
+    /// The root's watcher in this process (`ok`, `overflow`, `degraded` or `absent`;
+    /// see `index::watch::WatcherState`).
     pub watcher_state: &'static str,
+    /// The work of the index run that produced the answering generation (PAR-FRESH-04);
+    /// absent when the legacy graph answered.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refresh: Option<RefreshCounters>,
+}
+
+/// What the last index run (build or update) did, from its stored counters.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RefreshCounters {
+    /// Files parsed and extracted.
+    pub reparsed: usize,
+    /// Files whose outgoing edges were recomputed.
+    pub reresolved: usize,
+    /// The write set crossed the escalation gate and the run rebuilt the index whole.
+    pub escalated: bool,
 }
 
 impl Freshness {
     pub fn from_relation(
         source: &'static str,
+        root: &Path,
         rel: &Relation,
         index_version: String,
         generation: Option<i64>,
@@ -134,7 +170,8 @@ impl Freshness {
             index_version,
             snapshot_generation: generation,
             identity_age_ms: rel.at.elapsed().as_millis() as u64,
-            watcher_state: WATCHER_STATE,
+            watcher_state: super::watch::state_of(root).as_str(),
+            refresh: None,
         }
     }
 
