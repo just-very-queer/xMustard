@@ -838,15 +838,7 @@ impl<'a> Walker<'a> {
             return;
         }
         let rk = self.ref_kind(kind, field);
-        let fl = if self.n_ret > 0 {
-            flow::RETURNS
-        } else if self.n_cond > 0 {
-            flow::BRANCHES
-        } else if rk == ref_kind::WRITE {
-            flow::WRITES
-        } else {
-            flow::NONE
-        };
+        let fl = flow::classify(self.n_ret > 0, self.n_cond > 0, rk == ref_kind::WRITE);
         let pos = node.start_position();
         let container = self.container_symbol().map(|s| s as i32).unwrap_or(-1);
         let ni = self.intern(name);
