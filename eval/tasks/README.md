@@ -191,6 +191,22 @@ entry refusing an untrusted edit, human approval failing closed, and flagged mem
 served on recall but never pushed, are the `workspaceops` tests in
 `memory_injection_test.go`.
 
+### Duplicate and contradiction fixtures (PAR-EVAL-02, WS-27)
+
+`memory_lifecycle/dedupe_conflicts.json` holds deterministic fixtures for propose-time
+review (`workspaceops` `memory_dedupe.go`, `memory_conflicts.go`). No model runs:
+`cd api-go && go test -run TestEval02DedupeConflictFixtures ./internal/workspaceops/`
+seeds each case's memories (served ones approved by two peers), proposes its text, and
+requires the exact outcome (`created` or `corroborated`), the exact set of possible
+duplicates with their match (`exact`, `near`, `similar`), the exact set of conflict
+candidates with their kind (`claim`, `contradiction`, `path_overlap`) and the exact
+`suggested_supersedes`. A case with `merge_into` then has two peers verify the
+proposal `duplicate_of` that seed and requires recall to serve the seed alone. The two
+service-port cases reuse `seed.yaml`'s `service-agreed-port` memories: the infra ticket
+is flagged as a contradiction of the team decision, and the reminder, a paraphrase whose
+3-gram Jaccard with the decision is 0.29, is reported only as a path overlap until a
+verified `duplicate_of` merges it.
+
 ## Arms
 
 | Arm | Client configuration |

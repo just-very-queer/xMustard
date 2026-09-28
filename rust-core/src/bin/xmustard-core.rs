@@ -963,7 +963,7 @@ fn run_symbolgraph_command(mut args: Args) -> CmdResult {
 
     let sub = need(
         &mut args,
-        "xmustard-core symbolgraph <build|hotspots|clusters|cluster-of|coverage|impact|impact-file|trace|changes|blast-radius> [--identity-key=K] [--name=value ...] ...",
+        "xmustard-core symbolgraph <build|hotspots|clusters|cluster-of|coverage|impact|impact-file|trace|changes|resolve|blast-radius> [--identity-key=K] [--name=value ...] ...",
     )?;
     let (key, args) = identity_flag(args);
     let mut rest: Vec<String> = args.collect();
@@ -1145,6 +1145,19 @@ fn run_symbolgraph_command(mut args: Args) -> CmdResult {
             let src = source(&root, &ws);
             json(&src.graph.hotspots(limit).map_err(failed)?)
         }
+        "resolve" => {
+            // memory anchors (WS-27): the declarations of the names a memory mentions,
+            // from the source search and impact read
+            let u = usage(" <name>...");
+            let root = need(&mut args, &u)?;
+            let ws = need(&mut args, &u)?;
+            let names: Vec<String> = args.collect();
+            if names.is_empty() {
+                return Err(CmdError::usage(u));
+            }
+            let src = source(&root, &ws);
+            json(&sg::resolve_names(src.graph.as_ref(), &names).map_err(failed)?)
+        }
         "blast-radius" => {
             let u = usage(" <symbol>");
             let root = need(&mut args, &u)?;
@@ -1205,6 +1218,7 @@ mod tests {
         ("symbolgraph", &["clusters"]),
         ("symbolgraph", &["cluster-of"]),
         ("symbolgraph", &["coverage"]),
+        ("symbolgraph", &["resolve"]),
         ("changetrack", &["fingerprint"]),
         ("changetrack", &["drift"]),
         ("changetrack", &["changed-since"]),
