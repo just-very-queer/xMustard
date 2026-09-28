@@ -23,7 +23,7 @@ var postgresRoutes = []routeSpec{
 }
 
 // bootstrapFailure: the bootstrap reports bad input only in its error text.
-var bootstrapFailure = invalidWhenMentioning(withStatus(http.StatusInternalServerError), "required", "must ")
+var bootstrapFailure = invalidOnPhrase(withStatus(http.StatusInternalServerError), "required", "must ")
 
 func renderPostgresSchema(w http.ResponseWriter, r *http.Request) {
 	sqlText, err := workspaceops.RenderPostgresSchemaSQL(dataDir(), r.URL.Query().Get("schema"))

@@ -12,9 +12,8 @@ import (
 	"strings"
 )
 
-// Route registration (WS-CQ-01). Each area of the API keeps its routes in a table
-// in its own <area>_routes.go file, and registerRoutes mounts every table through
-// one loop. A row is the route's ServeMux pattern and its handler. The route's gate
+// Each area of the API keeps its routes in a table in its own <area>_routes.go file,
+// and registerRoutes mounts every table through one loop. A row is the route's ServeMux pattern and its handler. The route's gate
 // (profile, role, tool, read-only safety; WS-09) is the row routeGateTable keeps
 // under the same pattern in route_gates.go: the gated mux looks it up when the route
 // registers and panics on a route without one, so a new route needs both rows.
@@ -87,8 +86,8 @@ func reply(w http.ResponseWriter, result any, err error, fail failure) {
 	writeJSON(w, http.StatusOK, result)
 }
 
-// failure answers a failed call. Each route keeps the answer it gave before the
-// split: the typed mapper respondError, or one of the fixed mappings below.
+// failure answers a failed call: respondError for operations that return typed
+// errors, or one of the fixed mappings below for those whose errors are untyped.
 type failure func(http.ResponseWriter, error)
 
 // errorText, as notFound's message, answers os.ErrNotExist with the error's own text.
@@ -140,10 +139,10 @@ func withStatus(status int) failure {
 	}
 }
 
-// invalidWhenMentioning answers an error whose lowercased text contains one of
-// phrases with 400 and its text, and hands any other error to other: the routes whose
-// operations report bad input only in untyped error text.
-func invalidWhenMentioning(other failure, phrases ...string) failure {
+// invalidOnPhrase answers an error whose lowercased text contains one of phrases with
+// 400 and its text, and hands any other error to other: for operations that report
+// bad input only in their error text.
+func invalidOnPhrase(other failure, phrases ...string) failure {
 	return func(w http.ResponseWriter, err error) {
 		lowered := strings.ToLower(err.Error())
 		if slices.ContainsFunc(phrases, func(p string) bool { return strings.Contains(lowered, p) }) {

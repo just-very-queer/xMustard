@@ -35,9 +35,9 @@ var workspaceRoutes = []routeSpec{
 	{"POST /api/workspaces/{workspace_id}/guidance/starters", generateGuidanceStarter},
 }
 
-// listWorkspaces lists the workspaces the caller's token scope admits (a
-// workspace-scoped token cannot enumerate other tenants' repository roots; an
-// unscoped one sees all) and then those the deployment's allowlist serves.
+// listWorkspaces lists the workspaces both the caller's token scope and the
+// deployment's allowlist admit, so a workspace-scoped token cannot enumerate other
+// tenants' repository roots.
 func listWorkspaces(w http.ResponseWriter, r *http.Request) {
 	result, err := workspaceops.ListWorkspacesScoped(dataDir(), principalFromContext(r.Context()))
 	if err != nil {

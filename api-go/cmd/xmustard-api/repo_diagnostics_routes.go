@@ -10,8 +10,7 @@ import (
 
 // Diagnostics wiring, all of it in this file: the diagnostics tool's route (core) and
 // the platform's status, live and run routes, each handler with its error answer.
-// Nothing else in the API registers or answers diagnostics, so work on diagnostics
-// (the local diagnostics store, the live set) changes the handlers here.
+// Nothing else in the API registers or answers diagnostics.
 var diagnosticsRoutes = []routeSpec{
 	{"GET /api/workspaces/{workspace_id}/diagnostics", readDiagnostics},
 	{"GET /api/workspaces/{workspace_id}/diagnostics/status", readDiagnosticsStatus},

@@ -16,9 +16,8 @@ import (
 
 // XM_ROUTE_DUMP=<file> writes the answer of every route registerRoutes mounts to a
 // fixed set of requests: the status, the content type and the body, with directories,
-// the workspace id and timestamps masked. Two trees' dumps can be compared line by
-// line, which is how the route split (WS-CQ-01) was checked to keep every route's
-// answers. Each route is asked three times (no query or body, a query naming every
+// the workspace id and timestamps masked. Two trees' dumps compare line by line, so a
+// change to the route tables can be checked to keep every route's answers. Each route is asked three times (no query or body, a query naming every
 // parameter with its own value plus an empty JSON object, a malformed body) in two
 // data directories: an empty one, and one with a registered git work tree (scanned
 // when XM_ROUTE_DUMP_CORE names a core binary). Skipped unless XM_ROUTE_DUMP is set.

@@ -47,9 +47,9 @@ var runRoutes = []routeSpec{
 // The review operations report bad input only in their error text.
 var (
 	runReviewFailure = notFoundElse("Missing resource",
-		invalidWhenMentioning(withStatus(http.StatusInternalServerError), "workspace query", "only completed", "invalid disposition"))
+		invalidOnPhrase(withStatus(http.StatusInternalServerError), "workspace query", "only completed", "invalid disposition"))
 	runAcceptFailure = notFoundElse("Missing resource",
-		invalidWhenMentioning(withStatus(http.StatusInternalServerError), "workspace query", "already has a recorded fix"))
+		invalidOnPhrase(withStatus(http.StatusInternalServerError), "workspace query", "already has a recorded fix"))
 )
 
 // startIssueRun launches an agent run on an issue: an agent action, never a reader's.
