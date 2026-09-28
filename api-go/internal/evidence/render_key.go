@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -254,7 +256,7 @@ func (k Key) RevisionKey() string {
 }
 
 // writeFields writes each field length-prefixed, so no two field lists hash alike.
-func writeFields(h interface{ Write([]byte) (int, error) }, fields ...string) {
+func writeFields(h io.Writer, fields ...string) {
 	var n [8]byte
 	for _, f := range fields {
 		binary.BigEndian.PutUint64(n[:], uint64(len(f)))
@@ -348,7 +350,8 @@ func Render(tool string, body []byte) Rendered {
 	return r
 }
 
-// StableDigest is the SHA-256 of the stable text alone: what the result cache keeps.
+// StableDigest is the SHA-256 of the stable text alone: the key of the block a consumer
+// may cache or place before the live block (a provider prompt-cache prefix).
 func (r Rendered) StableDigest() [32]byte {
 	return sha256.Sum256(append([]byte(RendererVersion+"\x00"), r.Text...))
 }
@@ -396,7 +399,7 @@ func (st *stabilizer) walk(v any, match, full string) any {
 		for name, child := range t {
 			m, f := joinPath(match, name), joinPath(full, name)
 			switch {
-			case volatileNames[name] || st.volatilePath(m):
+			case volatileNames[name] || slices.Contains(st.pol.volatile, m):
 				st.note(f, child)
 				delete(t, name)
 			case bucketNames[name].as != "":
@@ -414,15 +417,6 @@ func (st *stabilizer) walk(v any, match, full string) any {
 		}
 	}
 	return v
-}
-
-func (st *stabilizer) volatilePath(path string) bool {
-	for _, p := range st.pol.volatile {
-		if p == path {
-			return true
-		}
-	}
-	return false
 }
 
 func (st *stabilizer) note(path string, v any) {
