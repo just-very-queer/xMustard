@@ -1699,6 +1699,69 @@ rm -rf backend/data && mv "$keep/data" backend/data && rmdir "$keep"
 
 **Collision risk.** New files only in the evidence package (store.go is not edited).
 
+**Implementation record (branch parity/ws-42, 2026-09-28).** These notes record what was built and measured, and where it differs from the text above and from the WS-74 fold (cache-stable rendering, folded in as a `must`). The ports are from the local copy `research/cursor-bridge`, which has no git history of its own, so they are pinned by SHA-256: `bridge_loop_guard.go` 57d40a97abac47aa61a480782be7830fac8ef6210f4989555ccb166d471ebbc9, `bridge_compaction.go` b94bfa747732e588572db6dc63c8e5ae7910a752fa5e22ee4cfb7b4eb2f00394 and `bridge_orchestrator_test.go` 2875e6a73ff54234d3e360e25be25cce82c3b16cb60cf5bc49440ad32a7dd59b (lines 809-916).
+- *Keys and cache-stable rendering (`evidence/render_key.go`, the WS-74 fold).*
+  - `NewKey` derives a call's key from its tool, its canonical arguments, the repo-key identity, the memory-store revision, the parser version, a source revision and `RendererVersion` (`xm-render/1`), length-prefixed under `xm-key/1`. xMustard's tools are named by bare or namespaced name (`mcp__xmustard__search`). `CanonicalArgs` sorts members, keeps numbers as written, reads empty or null arguments as `{}` and refuses anything but an object.
+  - A key needs a complete identity and every revision its tool's policy lists. Without one, the call is exempt from the guard and the cache (`identity_incomplete`, `revision_missing`, `args_invalid`).
+  - One policy table (`toolPolicies`, then `familyPolicies` by evidence family) gives each tool: side-effecting, exploratory, cacheable, the revisions it needs, its volatile paths and its live-session sections.
+    - search, explain and impact need the memory and parser revisions. diagnostics and why_failed need a source revision (the stored run they report). ground and recall need the memory revision.
+    - Side-effecting: remember and verify; shell, test, build, lint, log and git commands; edits; planner tools; and every other MCP server's tool, whatever its name. Read-only: reads, greps, globs, listings and diffs.
+  - `Render` splits a JSON result into canonical stable text (sorted members, no HTML escaping), a live block and a meta map of what it removed.
+    - Volatile anywhere: generated_at, elapsed_ms, duration_ms, lock_wait_ms, lock_contended and current_key_cached. Volatile per tool: search's and impact's `coverage.work`, and recall's `consistency_attempts`.
+    - Live: ground's principal, pending_for_you and summary; recall's already_shown and principal.
+    - Freshness stays in the text as a coarse bucket: `identity_age_ms`, `current_key_age_ms` and `age_ms` become `under_5s`, `under_1m`, `under_10m`, `under_1h` or `over_1h`.
+    - A result that is not one JSON document passes whole.
+    - `StableDigest` covers the text; `ContentDigest` covers the text and the live block.
+- *Repeat guard (`evidence/ledger.go`, PAR-CTX-06).*
+  - `Ledger.Observe` keys each delivered result by (key, ContentDigest) in a session scoped by workspace, stable principal and session id, so sessions of two principals never share entries.
+  - A repeat returns `Unchanged` with the earlier call's id and ordinal and its handle. `Decision.Notice` renders `[xmustard repeat] {...}` with the resource URI.
+  - It fires only when all of these hold: the arguments, identity, memory, parser and source revisions and the content digest are unchanged; the earlier handle has at least 60 s left; and the result is at least 512 bytes (a notice is 413).
+  - Side-effecting tools are exempt and never recorded. A caller may declare another MCP server's tool read-only (`ReadOnly`, from a trusted readOnlyHint), never a native or xMustard tool.
+  - `ClassifyError` classifies a failure by HTTP status (table), then by text (ordered phrase table), into validation, not_found, permission, timeout or tool_error.
+  - Repeated failures are annotated, never suppressed. The strict annotation fires when the same key fails with the same class more than MaxRepeat (2) times in a row. The coarse one fires when one tool fails with one class more than 3x MaxRepeat (6) times since its last success, or 6x (12) for exploratory tools. The annotation carries advice per class.
+  - Bounds: 64 sessions, 256 fingerprints per session, 2,048 fingerprints in all. Past a bound, whole least recently used sessions are dropped. Coarse counters are capped at 64 per session.
+- *Result cache (`evidence/result_cache.go`, PAR-CTX-14).*
+  - `ResultCache.Get` and `Put` serve only cacheable tools (search, explain, impact, diagnostics) with a derived key. Scope is workspace plus principal, and every lookup reports `CacheInfo{hit, revision_key}`.
+  - A hit returns the cached body with the earlier delivery's handle, which the store binds to the same principal. A revision change is another key, so it misses.
+  - The cap is in bytes (896 KiB by default; one entry at most 128 KiB). The accounted cost is the body's allocated capacity, the handle, content type and digest, plus 256 bytes per entry. Eviction is LRU.
+  - Errors are never cached. Neither is a result whose handle has less than a minute left, and such an entry is dropped at lookup. `Purge(workspace)` drops a workspace.
+- *History compaction (`internal/compaction`, PAR-CTX-08).*
+  - `Compact` reads a message array through a `Format` strategy: `anthropic` (tool_use and tool_result blocks) or `pi` (toolCall blocks and toolResult messages). It changes only tool-result content and user guidance text. Assistant messages, and every message nothing was replaced in, keep their exact bytes.
+  - The KeepRecent (3) most recent exchanges stay whole. The window snaps back to an assistant turn's start, so parallel results of one turn stay together, and it moves in steps of `Step`, so a hook compacting every turn changes its compacted prefix only every Step exchanges.
+  - Older results are replaced whole by a one-line stub: `[xmustard compacted] <summary> [is_error]` plus the handle, offset, length and resource URI of the retained original.
+    - Summaries are chosen by a tool table (task and MCP-bridge tools), xMustard's own JSON results, failures, then a family table (read, grep, glob/list, diff, the command families, structured). Commands report the exit status and first failure line.
+    - The result's tool_use_id/toolCallId and is_error/isError stay in place.
+  - Planner results (todo_write/TodoWrite, update_plan, create_plan, read/update_project, todo_read) other than the latest are replaced by `[xmustard compacted planner]`. That stub carries the todo delta (added, removed, completed, reopened, newly ready) against the result's original list, or else against the previous planner state in the history, plus the list's counts and the next action.
+  - Guidance: an older `<system-reminder>`, `BRIDGE GUIDANCE:` or `[xmustard ` text block is replaced by `[xmustard compacted guidance]` only when the same text appears again later. The 2 most recent guidance blocks are never replaced.
+  - Recovery (WS-08): every replaced original is retained before anything is replaced; if retention fails, the input comes back unchanged with the error.
+    - `StoreRetainer` retains one pass's originals as one evidence capture: one fsync and one minimum quota charge, each ref a byte range.
+    - `MemoRetainer` reuses the ref of an original it retained (keyed by id and content, at most 512), so repeated passes over the client's raw history write identical bytes.
+    - A stub also repeats the evidence URIs the replaced result named (a reduced delivery's own handle), so the original behind a reduced result stays one read away.
+  - Injection framing (WS-56):
+    - A stub quotes text from a result only as a single-line snippet of at most 120 runes that passes `injection.Scan`, with `<` escaped so no frame tag can open or close. It never quotes a tool `injection.CaptureQuarantine` names untrusted (identifiers such as task ids or server names excepted).
+    - The stub says when the original is from an untrusted source or holds instruction-like text.
+    - Planner stubs quote plan and next-action titles from planner results (the agent's own todo list) through the same scan and escaping, although the capture policy names planner tools untrusted; the stub carries no quarantine note for them.
+    - The retained bundle is captured as tool `xmustard_compaction`, so every page of it carries the quarantine label `untrusted_capture:xmustard_compaction`.
+  - A pass is deterministic and idempotent: a stub is never compacted again, and a stub replaces a result only when it is shorter.
+- *Measured (Linux build box).*
+  - Memory, at the default limits filled (`TestEvidenceCachesStayWithinTheirBudgetLine`, three runs, identical figures): the guard's 2,048 fingerprints across 64 sessions hold 453 KiB of live heap (226 B per fingerprint). The cache at its cap holds 804 KiB with 600-byte bodies, 886 KiB with 12 KiB bodies, 889 KiB just past the 32 KiB size-class boundary and 836 KiB with 100 KiB bodies. Together they hold 1.31 MiB against the 1.5 MiB WS-42 line (evidence_caches item); the test fails past the line.
+  - Context savings, compaction (`TestCompactFixturesMeasuredSavingsAndInvariants`): the fixtures are one generated session, 10 exchanges, emitted in both formats (`testdata/gen_sessions.py`). Its file reads are this repository at 866333a, its grep is real, and its test runs, edits and todos are written by the generator.
+    - Anthropic: 59,040 → 21,526 bytes (-63.5%), about 22,091 → 7,271 tokens (-67.1%, `xm-tokens/1`); 5 results replaced, 4 guidance blocks deduplicated, one retention.
+    - Pi: 60,960 → 23,874 bytes (-60.8%), about 22,987 → 8,289 tokens (-63.9%).
+  - Context savings, repeat guard (`TestLedgerNoticeSavingsOnToolFixtures`): the eight recorded results of the nine tools' goldens at or over 512 bytes (670-2,883 bytes) were each repeated with a new generated_at. All were recognized as unchanged and became 413-byte notices: 10,367 → 3,304 bytes (-68%).
+- *Deviations.*
+  - Library only, as the plan scopes it. Nothing is wired into the nine tools, the gateway (WS-43) or the hooks, so the daemon's RSS does not change until a consumer creates a ledger or cache.
+    - The tools' text still carries generated_at: making the delivered text itself byte-stable is the WS-04 renderer correction.
+    - The guard and cache key and compare through `Render`, so they already work over today's text. A consumer can deliver `Rendered.Text` and put `Rendered.Meta` in `_meta`.
+    - `Revisions.Memory` and `Source` are opaque to the library. No memory-store revision counter exists in govstore yet; the consumer supplies one (for example the last governance event id).
+  - Fingerprint budget: 2,048 fingerprints in all, not the 64 x 256 (16,384) of requirements §7.3, which at the measured 226 B each would hold about 3.6 MiB against the 1.5 MiB line. The cache cap is 896 KiB, not a round 1 MiB, so the two fit the line together.
+  - The whole `coverage.work` object is volatile, not only elapsed_ms and lock_wait_ms: graph_cache, files_parsed, files_reused and bytes_read differ between a cold and a warm call that give the same answer.
+  - "maxRepeat 2 strict, 3x coarse, 6x exploratory" is read as multiples of maxRepeat (strict 2, coarse 6, exploratory 12). Upstream never limited exploratory tools on the coarse count and blocked repeated failures; here they are annotated. A tool's coarse counts reset at its next success.
+  - The guard replaces only a result whose earlier original has a live handle. xMustard issues a handle only for a reduced result (over the 64 KiB projection target) or one captured with `CaptureRequest.Retain`, so a consumer that wants repeats of smaller results replaced must retain them.
+  - diagnostics and why_failed need a source revision, which the repository identity does not cover; a consumer that cannot name the stored run gets no key for them (fail closed).
+  - The most recent planner result stays whole even when older than the window; upstream summarized it with the rest. A stub never replaces a shorter result, so the ported tests pad the results they expect compacted; upstream compacted once the whole transcript passed a size threshold, and its tests appended thousands of noise lines.
+  - Upstream's head-and-tail fallback, which sliced the transcript once summaries were not enough, is not ported: compaction never cuts text (PAR-CTX-08).
+
 ### WS-43 — Opt-in upstream MCP gateway, progress event bus and memory notifications
 
 **Goal.** Deliver the following:

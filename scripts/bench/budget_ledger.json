@@ -107,7 +107,7 @@
   "WS-39": {"line_mib": 0, "process": "rust_core_per_call", "title": "resolvers for Rust, Python, Java"},
   "WS-40": {"line_mib": 0, "process": null, "title": "other client adapters"},
   "WS-41": {"line_mib": 0.5, "process": "go_daemon", "item": "evidence_caches", "title": "command-wrapper reducer"},
-  "WS-42": {"line_mib": 1.5, "process": "go_daemon", "item": "evidence_caches", "title": "repeat guard and result cache"},
+  "WS-42": {"line_mib": 1.5, "process": "go_daemon", "item": "evidence_caches", "title": "repeat guard and result cache", "note": "Library only: no daemon code creates a Ledger or ResultCache yet (the gateway, WS-43, and the hooks are the consumers), so the daemon's RSS is unchanged until one does. Filled at their defaults (TestEvidenceCachesStayWithinTheirBudgetLine, Linux): the repeat guard's 2,048 fingerprints (64 sessions, at most 256 each) hold 453 KiB of live heap (226 B per fingerprint) and the result cache at its 896 KiB byte cap 804-889 KiB (bodies of 600 B to 100 KiB), 1.31 MiB together; the test fails past 1.5 MiB. The §7.3 target of 64 sessions x 256 fingerprints would hold about 3.6 MiB, so the guard caps fingerprints at 2,048 in all."},
   "WS-43": {"line_mib": 5, "process": "go_daemon", "title": "opt-in upstream MCP gateway"},
   "WS-44": {"line_mib": 0, "process": null, "title": "install/doctor and conformance"},
   "WS-45": {"line_mib": 1.5, "process": "go_daemon", "title": "LSP pool wiring (servers are external)"},
