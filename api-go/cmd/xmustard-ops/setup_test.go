@@ -250,3 +250,44 @@ func TestStoreBackupCheckAndRestoreCommands(t *testing.T) {
 		t.Fatal("the replaced store was not kept")
 	}
 }
+
+// A package manager links its versioned binaries into one bin dir. The unit names the
+// link, which survives an upgrade that removes the old version, when PATH reaches the
+// sibling through it; otherwise the sibling of xmustard-ops, else PATH.
+func TestSetupBinaryPrefersAStableLinkToTheSibling(t *testing.T) {
+	root := t.TempDir()
+	cellar, linked, other := filepath.Join(root, "Cellar", "1.0", "bin"), filepath.Join(root, "bin"), filepath.Join(root, "other")
+	for _, d := range []string{cellar, linked, other} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	api := filepath.Join(cellar, "xmustard-api")
+	if err := os.WriteFile(api, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(api, filepath.Join(linked, "xmustard-api")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(other, "xmustard-api"), []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	lookIn := func(dir string) func(string) (string, error) {
+		return func(name string) (string, error) { return filepath.Join(dir, name), nil }
+	}
+	for _, c := range []struct {
+		name, exe string
+		look      func(string) (string, error)
+		want      string
+	}{
+		{"link to the sibling", filepath.Join(cellar, "xmustard-ops"), lookIn(linked), filepath.Join(linked, "xmustard-api")},
+		{"another install on PATH", filepath.Join(cellar, "xmustard-ops"), lookIn(other), api},
+		{"no sibling", filepath.Join(root, "xmustard-ops"), lookIn(other), filepath.Join(other, "xmustard-api")},
+		{"neither", filepath.Join(root, "xmustard-ops"), func(string) (string, error) { return "", errors.New("not found") }, ""},
+	} {
+		e := lifecycleEnv{exe: c.exe, lookPath: c.look}
+		if got := e.binary("xmustard-api"); got != c.want {
+			t.Errorf("%s: binary = %q, want %q", c.name, got, c.want)
+		}
+	}
+}

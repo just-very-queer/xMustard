@@ -19,7 +19,8 @@ type Platform interface {
 	// Start (re)loads the written units and (re)starts the daemon. changed lists the
 	// unit files whose content this install changed.
 	Start(ctx context.Context, run Runner, spec Spec, changed []string) error
-	// Stop stops the daemon so that nothing starts it again before the next Start.
+	// Stop stops the daemon so that nothing starts it again before the next Start or
+	// login (the units stay installed).
 	Stop(ctx context.Context, run Runner, spec Spec) error
 	// Remove stops the daemon and unregisters its units around deleteFiles.
 	Remove(ctx context.Context, run Runner, spec Spec, deleteFiles func() error) error

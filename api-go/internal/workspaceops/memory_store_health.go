@@ -77,6 +77,9 @@ func CheckMemoryStore(ctx context.Context, dataDir string) StoreHealth {
 	return h
 }
 
+// checkStore opens (migrates) and checks the store. The open store stays cached for
+// the memory calls that follow: closing it saves no resident memory, because what the
+// check adds is SQLite's code and allocator arenas, not the store's page cache.
 func checkStore(ctx context.Context, dataDir string) StoreHealth {
 	start := time.Now()
 	s, release, err := acquireGovStore(ctx, dataDir, true)

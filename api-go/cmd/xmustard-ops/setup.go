@@ -119,18 +119,29 @@ func (e lifecycleEnv) installer(p daemon.Platform, wait time.Duration) daemon.In
 }
 
 // binary finds name next to this executable, else on PATH; "" when neither has it.
+// When PATH reaches the sibling through a link (a package manager's bin dir, while
+// this executable resolved to its versioned directory), the unit names the link,
+// which an upgrade that removes the old version leaves in place.
 func (e lifecycleEnv) binary(name string) string {
+	onPath := ""
+	if p, err := e.lookPath(name); err == nil {
+		onPath, _ = filepath.Abs(p)
+	}
 	if e.exe != "" {
 		if p := filepath.Join(filepath.Dir(e.exe), name); isExecutableFile(p) {
+			if onPath != "" && sameFile(onPath, p) {
+				return onPath
+			}
 			return p
 		}
 	}
-	if p, err := e.lookPath(name); err == nil {
-		if abs, err := filepath.Abs(p); err == nil {
-			return abs
-		}
-	}
-	return ""
+	return onPath
+}
+
+func sameFile(a, b string) bool {
+	fa, errA := os.Stat(a)
+	fb, errB := os.Stat(b)
+	return errA == nil && errB == nil && os.SameFile(fa, fb)
 }
 
 func isExecutableFile(p string) bool {

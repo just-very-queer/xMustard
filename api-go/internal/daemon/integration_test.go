@@ -32,11 +32,12 @@ func TestRealServiceManagerIntegration(t *testing.T) {
 	}
 	ctx := context.Background()
 	home := t.TempDir()
-	t.Setenv("HOME", home)
 	api := filepath.Join(home, "bin", "xmustard-api")
+	// build before HOME moves, so go keeps its module and build caches
 	if out, err := exec.Command("go", "build", "-o", api, "../../cmd/xmustard-api").CombinedOutput(); err != nil {
 		t.Fatalf("build xmustard-api: %v\n%s", err, out)
 	}
+	t.Setenv("HOME", home)
 	s := p.Defaults(func(string) string { return "" }, home)
 	s.Label = fmt.Sprintf("xmustard-it-%d", os.Getpid())
 	s.APIBin, s.Path = api, "/usr/bin:/bin"
