@@ -239,7 +239,7 @@
         "readOnlyHint": true,
         "title": "Search code"
       },
-      "description": "Code search: path:line hits, snippets, reasons. RRF (K=60) of BM25 over function bodies, comments, names, paths and doc sections; identifier match; trigram typo tolerance (not meaning); reference degree; proximity to seed=\u003csymbol\u003e. mode=pattern: ast-grep (`$A \u0026\u0026 $A()`); mode=symbol: name path A/b.",
+      "description": "Code search: path:line hits, snippets, reasons. RRF (K=60) of BM25 over function bodies, comments, names, paths and doc sections; identifier match; trigram typo tolerance (not meaning); reference degree; proximity to seed=\u003csymbol\u003e. mode=pattern: ast-grep (`$A \u0026\u0026 $A()`); mode=symbol: name path.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -379,7 +379,7 @@
         "readOnlyHint": true,
         "title": "Estimate change impact"
       },
-      "description": "Blast radius over a LEXICAL reference graph (name matches + import lines, not resolved calls): distance≥1 edges are leads to confirm, not proof. No args → current changes (dirty symbols, contract_break). symbol= → files referencing its defining files, ≤4 hops; path= → the same from one file. from=\u0026to= → shortest undirected file path.",
+      "description": "Blast radius. symbol= (name, Container.name, UID, path) → dependents by depth (d1 breaks), risk, completeness. Go/TS edges are resolved; other languages match names: leads, not proof. path= → a file's lexical referrers. from=\u0026to= → shortest path, per-hop edges. No args → changes since the index baseline.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -388,8 +388,8 @@
             "type": "string"
           },
           "max_depth": {
-            "description": "max hops for symbol=/path= (default 4)",
-            "maximum": 4,
+            "description": "hops (default 3; path= 4)",
+            "maximum": 32,
             "minimum": 1,
             "type": "integer"
           },
@@ -419,6 +419,9 @@
           "_xmustard": {
             "type": "object"
           },
+          "by_depth": {
+            "type": "array"
+          },
           "coverage": {
             "type": "object"
           },
@@ -428,14 +431,14 @@
           "freshness": {
             "type": "object"
           },
-          "impacted": {
-            "type": "array"
-          },
           "impacted_count": {
             "type": "integer"
           },
           "length": {
             "type": "integer"
+          },
+          "risk": {
+            "type": "string"
           },
           "since": {
             "type": "string"

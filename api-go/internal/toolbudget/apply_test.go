@@ -431,6 +431,42 @@ func TestByDepthTiersKeepTheirFirstItems(t *testing.T) {
 	}
 }
 
+// The WS-35 scope shape: its dependents live in affected.by_depth, a nested list of
+// tiers, which keeps the same leading items per tier.
+func TestImpactScopeTrimsNestedTiers(t *testing.T) {
+	items := make([]map[string]any, 60)
+	for i := range items {
+		items[i] = map[string]any{"name": fmt.Sprintf("caller_%02d", i), "path": fmt.Sprintf("pkg/f%02d.go", i), "line": i, "edge": "CALLS"}
+	}
+	res := map[string]any{"scope": "all", "changed_files": []map[string]any{{"path": "pkg/a.go", "change": "modified"}}, "changed_files_total": 1,
+		"changed_symbols": []map[string]any{{"name": "Add", "path": "pkg/a.go", "contract_break": true}}, "contract_breaks": 1,
+		"affected": map[string]any{"risk": "HIGH", "counts": map[string]any{"total": 60},
+			"by_depth": []map[string]any{{"depth": 1, "items": items, "total": 60}, {"depth": 2, "items": items, "total": 60}}}}
+	a := run(t, "impact", res, Request{MaxChars: 4000}, Page{}, nil)
+	if a.rep.DegradedStage != "tiers_trimmed" {
+		t.Fatalf("stage %s (%v)", a.rep.DegradedStage, a.rep.Stages)
+	}
+	aff := a.out["affected"].(map[string]any)
+	tiers := aff["by_depth"].([]any)
+	n0, n1 := len(tiers[0].(map[string]any)["items"].([]any)), len(tiers[1].(map[string]any)["items"].([]any))
+	if n0 == 0 || n0 >= 60 || n0 != n1 || aff["risk"] != "HIGH" {
+		t.Fatalf("tiers kept %d and %d: %v", n0, n1, aff)
+	}
+	if a.out["contract_breaks"] != float64(1) || len(a.out["changed_symbols"].([]any)) != 1 {
+		t.Fatal("changed symbols and breaks stay")
+	}
+	hops := make([]map[string]any, 30)
+	for i := range hops {
+		hops[i] = map[string]any{"edge": "CALLS", "from": map[string]any{"name": fmt.Sprintf("f%02d", i), "path": "pkg/x.go"},
+			"to": map[string]any{"name": fmt.Sprintf("f%02d", i+1), "path": "pkg/y.go"}, "provenance": "scope", "confidence": 0.9}
+	}
+	trace := run(t, "impact", map[string]any{"found": true, "path": []string{"pkg/x.go", "pkg/y.go"}, "length": 30, "hops": hops},
+		Request{MaxChars: MinMaxChars}, Page{}, nil)
+	if trace.rep.DegradedStage != "hops_trimmed" || len(trace.out["path"].([]any)) != 2 {
+		t.Fatalf("trace: %s %v", trace.rep.DegradedStage, trace.out)
+	}
+}
+
 func TestImpactChangesListsBreaksLast(t *testing.T) {
 	files := make([]map[string]any, 200)
 	for i := range files {

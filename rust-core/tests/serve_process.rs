@@ -373,7 +373,7 @@ fn whole_repository_builds_are_left_to_one_shot_processes() {
     }
     assert_eq!(
         init["one_shot_subcommands"],
-        json!({"changetrack": ["index"], "symbolgraph": ["build", "blast-radius"]})
+        json!({"changetrack": ["index"], "symbolgraph": ["build", "blast-radius", "changes"]})
     );
 }
 
@@ -385,7 +385,7 @@ fn a_resident_snapshot_is_never_served_after_the_tree_changes() {
     let before = worker
         .call("symbolgraph", &["impact", root, "ws", "ComputeTotal", "3"])
         .unwrap();
-    assert!(before["impacted"].to_string().contains("src/handler.go"));
+    assert!(before["by_depth"].to_string().contains("src/handler.go"));
     let warm = worker
         .call("symbolgraph", &["impact", root, "ws", "ComputeTotal", "3"])
         .unwrap();
@@ -402,7 +402,7 @@ fn a_resident_snapshot_is_never_served_after_the_tree_changes() {
         .call("symbolgraph", &["impact", root, "ws", "ComputeTotal", "3"])
         .unwrap();
     assert!(
-        !after["impacted"].to_string().contains("src/handler.go"),
+        !after["by_depth"].to_string().contains("src/handler.go"),
         "served a stale snapshot after an edit: {after}"
     );
     let cli: Value = serde_json::from_slice(

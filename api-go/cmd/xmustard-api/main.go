@@ -3859,29 +3859,32 @@ func registerRoutes(mux routeRegistrar) {
 	mux.HandleFunc("GET /api/workspaces/{workspace_id}/changes/since-index", func(w http.ResponseWriter, r *http.Request) {
 		dd := envDefault("XMUSTARD_DATA_DIR", "../backend/data")
 		ws := r.PathValue("workspace_id")
-		q := r.URL.Query()
-		// impact enriched with the precomputed symbol graph: ?symbol= → blast radius;
-		// ?path= → the same from one file; ?from=&to= → shortest dependency path;
-		// otherwise the dirty-symbols view. A path mixed with another mode is refused,
-		// not silently outranked.
-		switch {
-		case q.Get("path") != "" && (q.Get("symbol") != "" || q.Get("from") != "" || q.Get("to") != ""):
-			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "impact takes one of path=, symbol= or from=&to="})
-		case q.Get("path") != "":
-			depth, _ := strconv.Atoi(q.Get("depth"))
-			result, err := workspaceops.FileImpactCtx(r.Context(), dd, ws, q.Get("path"), depth)
-			issueIntel(w, err, result)
-		case q.Get("from") != "" && q.Get("to") != "":
-			result, err := workspaceops.TraceSymbolsCtx(r.Context(), dd, ws, q.Get("from"), q.Get("to"))
-			issueIntel(w, err, result)
-		case q.Get("symbol") != "":
-			depth, _ := strconv.Atoi(q.Get("depth"))
-			result, err := workspaceops.SymbolImpactCtx(r.Context(), dd, ws, q.Get("symbol"), depth)
-			issueIntel(w, err, result)
-		default:
-			result, err := workspaceops.WorkspaceChangesSinceIndexCtx(r.Context(), dd, ws)
-			issueIntel(w, err, result)
+		// impact (WS-35): ?from=&to= → shortest path with per-hop edges; ?symbol= →
+		// blast radius by depth tier; ?path= → the files referencing one file
+		// (WS-FIX-05); ?scope= → the symbols a scoped diff touches; otherwise the
+		// changes since the index baseline. A parameter of another form (two targets
+		// among them), or a value out of range, is a 400 before any core runs.
+		q, params := r.URL.Query(), map[string]string{}
+		for name := range r.URL.Query() {
+			params[name] = q.Get(name)
 		}
+		form, rest, err := workspaceops.CheckImpactRequest(params)
+		var result json.RawMessage
+		if err == nil {
+			switch form {
+			case workspaceops.ImpactTrace:
+				result, err = workspaceops.TraceSymbolsCtx(r.Context(), dd, ws, q.Get("from"), q.Get("to"), rest)
+			case workspaceops.ImpactBlast:
+				result, err = workspaceops.SymbolImpactCtx(r.Context(), dd, ws, q.Get("symbol"), rest)
+			case workspaceops.ImpactFile:
+				result, err = workspaceops.FileImpactCtx(r.Context(), dd, ws, q.Get("path"), rest)
+			case workspaceops.ImpactChanges:
+				result, err = workspaceops.DetectChangesCtx(r.Context(), dd, ws, rest)
+			default:
+				result, err = workspaceops.WorkspaceChangesSinceIndexCtx(r.Context(), dd, ws)
+			}
+		}
+		issueIntel(w, err, result)
 	})
 	mux.HandleFunc("GET /api/workspaces/{workspace_id}/changes", func(w http.ResponseWriter, r *http.Request) {
 		result, err := workspaceops.WorkspaceWorkingChanges(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))

@@ -10,10 +10,10 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"strings"
 	"time"
 
+	"xmustard/api-go/internal/gitdiff"
 	"xmustard/api-go/internal/govstore"
 )
 
@@ -45,12 +45,18 @@ const (
 // maxReviewRecords bounds the review record ids one attestation cites.
 const maxReviewRecords = 32
 
+// ErrReviewerNotDistinct: an attestation cites a review record its approver wrote, one
+// written in open mode (whose author cannot be told apart from anyone), or, under the
+// owner-distinct policy, one written under the approver's owner.
+var ErrReviewerNotDistinct = errors.New("a merge approval cannot rest on a review record written by the approver, " +
+	"in open mode, or, under the owner-distinct policy, under the approver's owner")
+
 // reviewDiffTimeout bounds each git run of a review diff.
 const reviewDiffTimeout = 2 * time.Minute
 
 // ReviewedChange is the change an attestation binds to. Repository is the workspace's
 // canonical root; MergeBase is the merge base of BaseRef and Head; DiffSHA256 digests
-// the hardened diff from MergeBase to Head (reviewDiffArgs), DiffBytes is its size.
+// the hardened diff from MergeBase to Head (gitdiff.ReviewDiffArgs), DiffBytes is its size.
 type ReviewedChange struct {
 	WorkspaceID string `json:"workspace_id"`
 	Repository  string `json:"repository"`
@@ -71,15 +77,18 @@ func (c ReviewedChange) same(o ReviewedChange) bool {
 type MergeApproval struct {
 	Seq int64 `json:"seq"`
 	ReviewedChange
-	ReviewRecords []string         `json:"review_records"`
-	Approver      string           `json:"approver"`
-	ApproverOwner string           `json:"approver_owner"`
-	ApproverKind  string           `json:"approver_kind"`
-	Assurance     string           `json:"assurance"`
-	Note          string           `json:"note,omitempty"`
-	At            string           `json:"at"`
-	Enforcement   string           `json:"enforcement"`
-	Revoked       *MergeRevocation `json:"revoked,omitempty"`
+	ReviewRecords []string `json:"review_records"`
+	// ReviewRecordsUnknown are the cited ids that named no review record of the workspace
+	// (WS-66) when the attestation was made: bound as given, their authors unchecked.
+	ReviewRecordsUnknown []string         `json:"review_records_unknown,omitempty"`
+	Approver             string           `json:"approver"`
+	ApproverOwner        string           `json:"approver_owner"`
+	ApproverKind         string           `json:"approver_kind"`
+	Assurance            string           `json:"assurance"`
+	Note                 string           `json:"note,omitempty"`
+	At                   string           `json:"at"`
+	Enforcement          string           `json:"enforcement"`
+	Revoked              *MergeRevocation `json:"revoked,omitempty"`
 }
 
 // MergeRevocation withdraws an attestation.
@@ -113,9 +122,10 @@ type MergeApprovalStatus struct {
 // mergeApprovalData is the event record of an attestation.
 type mergeApprovalData struct {
 	ReviewedChange
-	ReviewRecords []string `json:"review_records"`
-	Assurance     string   `json:"assurance"`
-	Enforcement   string   `json:"enforcement"`
+	ReviewRecords        []string `json:"review_records"`
+	ReviewRecordsUnknown []string `json:"review_records_unknown,omitempty"`
+	Assurance            string   `json:"assurance"`
+	Enforcement          string   `json:"enforcement"`
 }
 
 // mergeRevocationData is the event record of a revocation.
@@ -164,73 +174,28 @@ func diffAt(ctx context.Context, workspaceID, root, baseRef, base, head string, 
 		sink = io.MultiWriter(h, text)
 	}
 	counted := &countingWriter{w: sink}
-	if err := reviewGit(ctx, root, counted, reviewDiffArgs(c.MergeBase, head)...); err != nil {
+	if err := reviewGit(ctx, root, counted, gitdiff.ReviewDiffArgs(c.MergeBase, head)...); err != nil {
 		return ReviewedChange{}, fmt.Errorf("diff %s..%s: %w", c.MergeBase, head, err)
 	}
 	c.DiffSHA256, c.DiffBytes = hex.EncodeToString(h.Sum(nil)), counted.n
 	return c, nil
 }
 
-// reviewDiffArgs is the diff an attestation digests. Every option that repository
-// configuration could change is pinned on the command line (algorithm, context,
-// prefixes, renames, relative paths, submodule format, order file, binary and full
-// index), and no external diff or text conversion runs.
-func reviewDiffArgs(from, to string) []string {
-	return []string{"diff", "--no-color", "--no-ext-diff", "--no-textconv", "--binary", "--full-index",
-		"--no-renames", "--no-relative", "--diff-algorithm=myers", "--indent-heuristic", "--inter-hunk-context=0",
-		"-U3", "--src-prefix=a/", "--dst-prefix=b/", "--ignore-submodules=none", "--submodule=short",
-		"-O" + os.DevNull, from, to, "--"}
-}
-
 // resolveCommit resolves ref to a full commit id. A ref shaped like an option is
 // refused before git sees it.
 func resolveCommit(ctx context.Context, root, ref string) (string, error) {
-	ref = strings.TrimSpace(ref)
-	if ref == "" || strings.HasPrefix(ref, "-") || len(ref) > 256 || strings.ContainsAny(ref, " \t\r\n\x00") {
-		return "", fmt.Errorf("ref %q is not a revision: %w", ref, ErrInvalidInput)
+	id, err := gitdiff.ResolveCommit(ctx, root, ref, reviewDiffTimeout)
+	if errors.Is(err, gitdiff.ErrBadRef) {
+		return "", fmt.Errorf("%w: %w", err, ErrInvalidInput)
 	}
-	var out bytes.Buffer
-	if err := reviewGit(ctx, root, &out, "rev-parse", "--verify", "--quiet", ref+"^{commit}"); err != nil {
-		return "", fmt.Errorf("ref %q does not name a commit: %w", ref, ErrInvalidInput)
-	}
-	return strings.TrimSpace(out.String()), nil
+	return id, err
 }
 
-// reviewGit runs reviewGitCommand to completion within reviewDiffTimeout, writing
-// stdout to w.
+// reviewGit runs git in root under the hardened diff policy (gitdiff: system and global
+// configuration ignored, hooks and the fsmonitor off, every GIT_* and XMUSTARD_*
+// variable removed, so the approver's token never reaches it), writing stdout to w.
 func reviewGit(ctx context.Context, root string, w io.Writer, args ...string) error {
-	ctx, cancel := context.WithTimeout(ctx, reviewDiffTimeout)
-	defer cancel()
-	cmd := reviewGitCommand(ctx, root, args...)
-	cmd.Stdout = w
-	var stderr bytes.Buffer
-	cmd.Stderr = &limitedBuffer{buf: &stderr, max: 4 << 10}
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("git %s: %w: %s", args[0], err, strings.TrimSpace(stderr.String()))
-	}
-	return nil
-}
-
-// reviewGitCommand is git in root with the system and global configuration ignored,
-// hooks and the fsmonitor off, and every GIT_* and XMUSTARD_* variable removed from its
-// environment (the approver's token never reaches it).
-func reviewGitCommand(ctx context.Context, root string, args ...string) *exec.Cmd {
-	full := append([]string{"-c", "core.hooksPath=" + os.DevNull, "-c", "core.fsmonitor=false", "-c", "core.quotePath=true"}, args...)
-	cmd := exec.CommandContext(ctx, "git", full...)
-	cmd.Dir, cmd.WaitDelay = root, time.Second
-	cmd.Env = append(scrubbedGitEnv(), "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL="+os.DevNull,
-		"GIT_TERMINAL_PROMPT=0", "GIT_OPTIONAL_LOCKS=0", "LC_ALL=C")
-	return cmd
-}
-
-func scrubbedGitEnv() []string {
-	var out []string
-	for _, kv := range os.Environ() {
-		if !strings.HasPrefix(kv, "GIT_") && !strings.HasPrefix(kv, "XMUSTARD_") {
-			out = append(out, kv)
-		}
-	}
-	return out
+	return gitdiff.Run(ctx, root, w, reviewDiffTimeout, args...)
 }
 
 type countingWriter struct {
@@ -244,21 +209,10 @@ func (c *countingWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
-// limitedBuffer keeps the first max bytes written and discards the rest.
-type limitedBuffer struct {
-	buf *bytes.Buffer
-	max int
-}
-
-func (l *limitedBuffer) Write(p []byte) (int, error) {
-	if room := l.max - l.buf.Len(); room > 0 {
-		l.buf.Write(p[:min(room, len(p))])
-	}
-	return len(p), nil
-}
-
 // ApproveMerge records h's attestation that they reviewed the change from the merge
-// base of baseRef to headRef, citing reviews (review record ids, at most 32).
+// base of baseRef to headRef, citing reviews (review record ids, at most 32). A cited
+// review record must be distinct from the approver (checkReviewAuthors); an id that
+// names no review record is bound as given and listed as unknown.
 func ApproveMerge(ctx context.Context, dataDir, workspaceID string, h HumanApprover, baseRef, headRef string,
 	reviews []string, note string) (*MergeApproval, error) {
 	if len(reviews) > maxReviewRecords {
@@ -278,13 +232,17 @@ func ApproveMerge(ctx context.Context, dataDir, workspaceID string, h HumanAppro
 	}
 	var red ingestRedaction
 	red.scrub(&note)
-	data, err := eventObject(mergeApprovalData{ReviewedChange: change, ReviewRecords: append([]string{}, reviews...),
-		Assurance: h.Assurance, Enforcement: MergeApprovalEnforcement})
-	if err != nil {
-		return nil, err
-	}
 	var ev govstore.Event
 	err = memoryUpdate(ctx, dataDir, workspaceID, func(tx govstore.Tx) error {
+		unknown, err := checkReviewAuthors(ctx, tx, dataDir, workspaceID, h, reviews)
+		if err != nil {
+			return err
+		}
+		data, err := eventObject(mergeApprovalData{ReviewedChange: change, ReviewRecords: append([]string{}, reviews...),
+			ReviewRecordsUnknown: unknown, Assurance: h.Assurance, Enforcement: MergeApprovalEnforcement})
+		if err != nil {
+			return err
+		}
 		ev, err = tx.AppendEvent(ctx, govstore.EventInput{WorkspaceID: workspaceID, Type: govstore.EventMergeApproval,
 			Note: note, Data: data}, h.storeActor(change.Head))
 		return err
@@ -293,6 +251,35 @@ func ApproveMerge(ctx context.Context, dataDir, workspaceID string, h HumanAppro
 		return nil, err
 	}
 	return mergeApprovalFrom(ev)
+}
+
+// checkReviewAuthors applies the WS-19B distinctness rule to the review records an
+// attestation cites, failing closed: the approver may not rest a merge on a record they
+// wrote, whatever the policy, nor on one written in open mode, whose author is no one in
+// particular, nor, under the owner-distinct policy, on one written under their owner (the
+// owner the record recorded, else the token store's). It returns the ids that name no
+// review record of the workspace (WS-57 binds those as given), in order.
+func checkReviewAuthors(ctx context.Context, r govstore.Reader, dataDir, workspaceID string, h HumanApprover, ids []string) ([]string, error) {
+	ownerPolicy := principalDistinctness(dataDir) == DistinctOwner
+	mine := fallbackString(h.Principal.Owner, h.Principal.ID)
+	var unknown []string
+	for _, id := range ids {
+		rec, err := r.GetReviewRecord(ctx, workspaceID, id)
+		switch {
+		case errors.Is(err, govstore.ErrNotFound):
+			unknown = append(unknown, id)
+		case err != nil:
+			return nil, err
+		case sameOwner(rec.Author, h.Principal.ID):
+			return nil, fmt.Errorf("%w: %s wrote review record %s", ErrReviewerNotDistinct, h.Principal.ID, id)
+		case IsOpenModeIdentity(rec.Author):
+			return nil, fmt.Errorf("%w: review record %s was written in open mode", ErrReviewerNotDistinct, id)
+		case ownerPolicy && sameOwner(recordedOwner(dataDir, rec.AuthorOwner, rec.Author), mine):
+			return nil, fmt.Errorf("%w: review record %s was written by %s, owned by %s like the approver", ErrReviewerNotDistinct,
+				id, rec.Author, mine)
+		}
+	}
+	return unknown, nil
 }
 
 // storeActor is the approver as the principal of an attestation event.
@@ -492,6 +479,6 @@ func mergeApprovalFrom(ev govstore.Event) (*MergeApproval, error) {
 		return nil, fmt.Errorf("merge approval %d is malformed: %w", ev.Seq, errors.New("no head or diff digest"))
 	}
 	return &MergeApproval{Seq: ev.Seq, ReviewedChange: d.ReviewedChange, ReviewRecords: d.ReviewRecords,
-		Approver: ev.Principal, ApproverOwner: d.Provenance.Owner, ApproverKind: d.Provenance.Kind,
-		Assurance: d.Assurance, Note: ev.Note, At: ev.At, Enforcement: MergeApprovalEnforcement}, nil
+		ReviewRecordsUnknown: d.ReviewRecordsUnknown, Approver: ev.Principal, ApproverOwner: d.Provenance.Owner,
+		ApproverKind: d.Provenance.Kind, Assurance: d.Assurance, Note: ev.Note, At: ev.At, Enforcement: MergeApprovalEnforcement}, nil
 }

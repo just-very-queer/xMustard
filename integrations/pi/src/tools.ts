@@ -135,7 +135,7 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
 	{
 		name: "search",
 		description:
-			"Code search: path:line hits, snippets, reasons. RRF (K=60) of BM25 over function bodies, comments, names, paths and doc sections; identifier match; trigram typo tolerance (not meaning); reference degree; proximity to seed=<symbol>. mode=pattern: ast-grep (`$A && $A()`); mode=symbol: name path A/b.",
+			"Code search: path:line hits, snippets, reasons. RRF (K=60) of BM25 over function bodies, comments, names, paths and doc sections; identifier match; trigram typo tolerance (not meaning); reference degree; proximity to seed=<symbol>. mode=pattern: ast-grep (`$A && $A()`); mode=symbol: name path.",
 		args: [
 			workspaceArg,
 			{ name: "q", type: "string", required: true, desc: "the search query" },
@@ -165,24 +165,22 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
 	{
 		name: "impact",
 		description:
-			"Blast radius over a LEXICAL reference graph (name matches + import lines, not resolved calls): distance≥1 edges are leads to confirm, not proof. No args → current changes (dirty symbols, contract_break). symbol= → files referencing its defining files, ≤4 hops; path= → the same from one file. from=&to= → shortest undirected file path.",
+			"Blast radius. symbol= (name, Container.name, UID, path) → dependents by depth (d1 breaks), risk, completeness. Go/TS edges are resolved; other languages match names: leads, not proof. path= → a file's lexical referrers. from=&to= → shortest path, per-hop edges. No args → changes since the index baseline.",
 		args: [
 			workspaceArg,
 			{ name: "symbol", type: "string", desc: "symbol to compute blast radius for" },
 			{ name: "path", type: "string", maxLength: 4096, desc: "a repo-relative file" },
 			{ name: "from", type: "string", desc: "trace path from this symbol" },
 			{ name: "to", type: "string", desc: "trace path to this symbol" },
-			{ name: "max_depth", type: "integer", minimum: 1, maximum: 4, desc: "max hops for symbol=/path= (default 4)" },
+			{ name: "max_depth", type: "integer", minimum: 1, maximum: 32, desc: "hops (default 3; path= 4)" },
 		],
-		// path= forwards every mode argument, so the API refuses path mixed with symbol or
-		// from/to (Go's Build does the same).
+		// The impact v2 filters, paging and diff scopes (WS-35) are MCP advanced arguments
+		// this closed schema does not carry. Every argument goes to the API, as Go's Build
+		// sends it, and the API refuses one of another form (two of symbol, path and
+		// from/to; max_depth alone) instead of it being dropped.
 		build: (a) => {
-			let path = ws(a, "/changes/since-index");
-			if (str(a, "path"))
-				path = query(path, ...["path", "symbol", "from", "to"].flatMap((k) => [k, str(a, k)]), "depth", str(a, "max_depth"));
-			else if (str(a, "from") && str(a, "to")) path = query(path, "from", str(a, "from"), "to", str(a, "to"));
-			else if (str(a, "symbol")) path = query(path, "symbol", str(a, "symbol"), "depth", str(a, "max_depth"));
-			return { method: "GET", path };
+			const args = ["path", "symbol", "from", "to"].flatMap((k) => [k, str(a, k)]);
+			return { method: "GET", path: query(ws(a, "/changes/since-index"), ...args, "depth", str(a, "max_depth")) };
 		},
 	},
 	{

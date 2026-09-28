@@ -215,6 +215,42 @@ var explainLadders = []*Ladder{
 
 var impactLadders = []*Ladder{
 	{
+		// impact v2 (WS-35) scope=: the symbols a diff touches and their dependents
+		Shape: "diff scope (changed_symbols)", Match: "changed_symbols",
+		Lists: []List{
+			{Member: "changed_files", GroupBy: "change"}, {Member: "affected.affected_modules"}, {Member: "affected.by_depth"},
+			{Member: "changed_symbols", GroupBy: "path"},
+		},
+		Signals: envelope,
+		Keep:    envelopeKeep,
+		Rungs: []Rung{
+			signalCounts,
+			signalFlags,
+			{Name: "files_trimmed", Op: opFit, List: "changed_files", Doc: "fewer changed files (changed_files_total keeps the count)"},
+			{Name: "modules_trimmed", Op: opFit, List: "affected.affected_modules", Doc: "fewer affected modules"},
+			{Name: "tiers_trimmed", Op: opFitEach, List: "affected.by_depth", Each: "items", Doc: "each dependent tier keeps its first items (total keeps the count)"},
+			{Name: "files_counts", Op: opCount, List: "changed_files", Doc: "changed files become changed_files_by_change"},
+			{Name: "tiers_total", Op: opTotal, List: "affected.by_depth", Doc: "only affected.counts remain"},
+			{Name: "symbols_trimmed", Op: opFit, List: "changed_symbols", Doc: "fewer changed symbols, in the order the diff lists them"},
+			{Name: "symbols_counts", Op: opCount, List: "changed_symbols", Doc: "changed symbols become changed_symbols_by_path"},
+		},
+		More: "limit and offset page a dependent tier; a narrower scope or max_chars up to 65536",
+	},
+	{
+		// impact v2 (WS-35) from=&to=: the path with per-hop edges
+		Shape: "trace (hops)", Match: "hops",
+		Lists:   []List{{Member: "hops"}},
+		Signals: envelope,
+		Keep:    envelopeKeep,
+		Rungs: []Rung{
+			signalCounts,
+			signalFlags,
+			{Name: "hops_trimmed", Op: opFit, List: "hops", Doc: "fewer per-hop edges, from the start (path keeps every file)"},
+			{Name: "hops_total", Op: opTotal, List: "hops", Doc: "only path and length remain"},
+		},
+		More: "a smaller max_depth, or max_chars up to 65536",
+	},
+	{
 		Shape: "changes (no arguments)", Match: "dirty_symbols",
 		Lists:   []List{{Member: "changed_files", GroupBy: "change"}, {Member: "dirty_symbols", GroupBy: "path"}},
 		Signals: []string{"truncation", "drift_checked"},

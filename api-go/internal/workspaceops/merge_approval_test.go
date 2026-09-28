@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"xmustard/api-go/internal/gitdiff"
 )
 
 // WS-57 (folding WS-71, PAR-REV-14): a human merge-approval attestation binds the
@@ -24,7 +26,7 @@ func reviewRepo(t testing.TB) (dataDir, ws, root string, git func(args ...string
 		t.Helper()
 		cmd := exec.Command("git", args...)
 		cmd.Dir = root
-		cmd.Env = append(scrubbedGitEnv(), "GIT_CONFIG_GLOBAL="+os.DevNull, "GIT_CONFIG_NOSYSTEM=1",
+		cmd.Env = append(gitdiff.Env(),
 			"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@example.com", "GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@example.com")
 		out, err := cmd.CombinedOutput()
 		if err != nil {
@@ -227,11 +229,23 @@ func TestReviewDiffIgnoresRepositoryAndEnvironmentConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// an fsmonitor hook that runs would leave this file behind
+	ran := filepath.Join(t.TempDir(), "fsmonitor-ran")
+	hook := filepath.Join(root, "fsmonitor.sh")
+	if err := os.WriteFile(hook, []byte("#!/bin/sh\ntouch "+ran+"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	attrs := filepath.Join(root, "attrs")
+	if err := os.WriteFile(attrs, []byte("*.go -diff\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	for _, kv := range [][2]string{
-		{"diff.noprefix", "true"}, {"diff.mnemonicPrefix", "true"}, {"diff.algorithm", "patience"},
+		{"diff.noprefix", "true"}, {"diff.mnemonicPrefix", "true"}, {"diff.algorithm", "histogram"},
 		{"diff.context", "10"}, {"diff.renames", "copies"}, {"diff.interHunkContext", "20"},
 		{"diff.external", "false"}, {"diff.boom.textconv", "false"}, {"color.ui", "always"},
 		{"diff.orderFile", filepath.Join(root, "order")}, {"core.quotePath", "false"},
+		{"diff.relative", "true"}, {"diff.indentHeuristic", "false"}, {"diff.suppressBlankEmpty", "true"},
+		{"core.bigFileThreshold", "1"}, {"core.fsmonitor", hook}, {"core.attributesFile", attrs},
 	} {
 		git("config", kv[0], kv[1])
 	}
@@ -243,12 +257,17 @@ func TestReviewDiffIgnoresRepositoryAndEnvironmentConfig(t *testing.T) {
 	}
 	t.Setenv("GIT_DIR", filepath.Join(t.TempDir(), "elsewhere"))
 	t.Setenv("GIT_EXTERNAL_DIFF", "false")
+	t.Setenv("GIT_DIFF_OPTS", "--unified=9")
+	t.Setenv("GIT_INDEX_FILE", filepath.Join(t.TempDir(), "index"))
 	after, err := DiffReviewedChange(ctx, dir, ws, "main", "HEAD")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if after.DiffSHA256 != before.DiffSHA256 || after.DiffBytes != before.DiffBytes {
 		t.Fatalf("repository or environment config changed the digested diff: %+v vs %+v", before, after)
+	}
+	if _, err := os.Stat(ran); err == nil {
+		t.Fatal("the repository's fsmonitor hook ran")
 	}
 }
 

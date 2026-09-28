@@ -86,6 +86,7 @@ func TestToolRouteCancellationKillsBlockedChild(t *testing.T) {
 		"impact":         "/changes/since-index",
 		"impact-symbol":  "/changes/since-index?symbol=Add",
 		"impact-trace":   "/changes/since-index?from=A&to=B",
+		"impact-scope":   "/changes/since-index?scope=all",
 		"impact-path":    "/changes/since-index?path=a.go",
 		"why_failed":     "/runs/r1/why-failed",
 	}

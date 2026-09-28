@@ -28,7 +28,7 @@ func TestArgumentErrorsAreToolResultsTheAgentCanRead(t *testing.T) {
 		want   []string
 	}{
 		{"impact", map[string]any{"workspace_id": "ws", "bogus": "x"}, "unknown",
-			[]string{`unknown argument "bogus" for tool impact.`, "Arguments of impact: workspace_id, symbol, path, from, to, max_depth (1-4)."}},
+			[]string{`unknown argument "bogus" for tool impact.`, "Arguments of impact: workspace_id, symbol, path, from, to, max_depth (1-32)."}},
 		{"impact", map[string]any{"workspace_id": "ws", "symbol": 3}, "must be a string", []string{`"symbol"`, "must be a string"}},
 		{"search", map[string]any{"workspace_id": "ws", "q": "x", "mode": "regex"}, "must be one of: hybrid, pattern",
 			[]string{"Arguments of search: workspace_id, q (required), mode (hybrid|pattern|symbol), lang, seed, limit (1-50).",
