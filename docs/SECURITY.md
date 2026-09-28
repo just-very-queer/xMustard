@@ -539,6 +539,49 @@ Revoking an evidence original (`DELETE .../evidence/{handle}`) or the admin purg
 outcome with `DELETE .../outcomes/{outcome_id}`, for example one holding a secret the
 redactor missed.
 
+## Evidence capture redaction (WS-FIX-03)
+
+Capture is on in every build, and every capture is redacted.
+`POST /api/workspaces/{id}/evidence/capture` streams the tool output (a raw body, or
+the output strings of a Claude, Codex, Cursor, Pi or OpenCode hook body) through the
+shared `redact` rules before a byte reaches the spool. The retained original, its
+pages, search inside it and the projection returned to the client therefore all hold
+the redacted text. In v0.1.0 no redactor was wired, so every capture answered
+`503 redaction_unavailable`.
+
+- **Rules.** Capture uses the rules `why_failed` applies to command output
+  (`workspaceops.OutputRedactor`): the default secret patterns (bearer and basic
+  credentials; AWS, GitHub, GitLab, Slack, OpenAI, Anthropic, Google, Stripe, npm,
+  Hugging Face and xMustard tokens; JWTs; URL userinfo passwords; private keys), the
+  key-aware detector for secret fields in JSON, YAML, env files, headers and flags,
+  and the literal values of this daemon's secret-named environment variables. Each
+  secret becomes `[REDACTED:<rule>]`.
+- **Streaming.** `redact.Writer` holds one 128 KiB window and a lookahead of about
+  33 KiB, the longest span any detector reads past a match (a private key body and
+  its END marker). A secret split across writes or windows is therefore seen whole,
+  and the output is byte for byte what one pass over the whole input gives. The
+  stream is never buffered: the redactor retains about 0.3 MiB, and at most about
+  1.2 MiB on input that is nothing but secrets, inside the 2 MiB capture window. The
+  hook decoder flushes it at each section boundary, so each output string is
+  redacted as one input.
+- **Secret paths.** When the capture's `path`, or the file path its hook body names
+  (in either order in the body), is on the secret-path denylist (`.ssh/`, SSH key
+  files, `.netrc`, `.npmrc`, `.pypirc`, `.dockercfg`, `.env` and `.env.*` other than
+  templates such as `.env.example`), the capture is refused with `422 secret_path`
+  and nothing is retained. The client keeps its own result.
+- **Fail closed.** A server without a redactor answers `503 redaction_unavailable`.
+  A redactor that fails (panics) answers `503 redaction_failed`. On every refusal
+  the spool is discarded, so nothing is retained.
+- **Limits.** Redaction is pattern-based. A secret that no rule recognizes is
+  retained as written: for example, a bare password in a line of code, or an
+  unquoted token-named value without a digit (the `redact` package documentation
+  lists the limits). Such an original can be revoked with
+  `DELETE .../evidence/{handle}`, and the admin purge (`DELETE .../evidence`)
+  removes every original of a workspace. A secret file read through a shell
+  (`cat .env`) is not matched by path, so its output passes through the content
+  rules only. `capture.body_sha256` is the digest of the body as received; it names
+  the body but does not reveal it.
+
 ## Health endpoint
 
 `/api/health` stays public so liveness probes need no token. Its full view shows
