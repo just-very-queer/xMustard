@@ -74,8 +74,8 @@ xmustard-ops mcp-config --root "$PWD" [--client claude-code] [--mode readonly] [
 ```
 
 It prints the form the client's config file takes: a `[mcp_servers.xmustard]` table
-for Codex's `~/.codex/config.toml` with `--client codex`, the JSON `mcpServers` entry
-otherwise.
+for Codex's `~/.codex/config.toml` with `--client codex`, the `mcp` object of
+`opencode.json` with `--client opencode`, the JSON `mcpServers` entry otherwise.
 
 ```jsonc
 // .mcp.json / client config: URL-capable client
@@ -99,6 +99,26 @@ otherwise.
   }
 }
 ```
+
+```jsonc
+// opencode.json (--client opencode): OpenCode 2.x's form, which substitutes {env:NAME}.
+// OpenCode 1.x takes the entry one level up (mcp.xmustard); 2.x reads that form too.
+{
+  "mcp": {
+    "servers": {
+      "xmustard": {
+        "type": "remote",
+        "url": "http://127.0.0.1:8042/mcp?client=opencode&workspace=<id>",
+        "headers": { "Authorization": "Bearer {env:XMUSTARD_API_TOKEN}", "X-Xmustard-Workspace": "<id>" },
+        "oauth": false
+      }
+    }
+  }
+}
+```
+
+The OpenCode plugin in [`integrations/opencode`](integrations/opencode/README.md) adds
+this entry itself and also reduces and masks large tool results.
 
 ```toml
 # ~/.codex/config.toml (--client codex). Codex sends no MCP roots, so the workspace
@@ -201,6 +221,7 @@ in [architecture](docs/ARCHITECTURE.md).
 - `backend/`: runtime data (`data/`) and SQL schema (`sql/`) only; the Python FastAPI/Typer stack was retired to `archive/2026-06-16-python-backend/`
 - `frontend/`: React and TypeScript UI surface (proxies `/api` → `:8042`)
 - `integrations/pi/`: version-pinned Pi extension (implementation candidate)
+- `integrations/opencode/`: OpenCode plugin (2.x API, with a 1.x entrypoint): MCP entry, result reduction and masking
 - `archive/`: retired implementations, including the legacy Python backend
 - `research/`: local reference repos used for product and architecture study; ignored from git
 - `docs/`: current product documents, audits, research, and indexed history
