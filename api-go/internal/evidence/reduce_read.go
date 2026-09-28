@@ -98,11 +98,7 @@ func (readReducer) Reduce(ctx context.Context, in *Input) (*Projection, error) {
 	}
 	out.WriteByte('\n')
 	out.Write(body.Bytes())
-	for _, s := range in.Sections {
-		if _, ok := parts[s.Name]; !ok {
-			parts[s.Name] = ""
-		}
-	}
+	fillParts(parts, in.Sections)
 	return &Projection{Text: out.String(), Parts: parts, Structured: rp, Facts: facts,
 		Record: Record{Reducer: "xm-read/1", Mode: "text", Reduced: true, Omissions: capOmissions(oms)}}, nil
 }
