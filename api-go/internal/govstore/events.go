@@ -1,6 +1,7 @@
 package govstore
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -55,6 +56,13 @@ const (
 	// name no entry, and they enforce nothing: branch protection does.
 	EventMergeApproval        = "merge_approval"
 	EventMergeApprovalRevoked = "merge_approval_revoked"
+	// Review subjects (WS-66, PAR-REV-06; review.go): a review record and each finding
+	// it holds are created once, a finding's triage verdicts and re-anchorings follow.
+	// These events name a review subject, never an entry (subject_kind).
+	EventReviewRecord   = "review_record"
+	EventReviewFinding  = "review_finding"
+	EventReviewTriage   = "review_triage"
+	EventReviewReanchor = "review_reanchor"
 )
 
 var validEventTypes = set(EventPropose, EventImport, EventVote, EventReject, EventEdit, EventRevisionAccepted,
@@ -62,7 +70,16 @@ var validEventTypes = set(EventPropose, EventImport, EventVote, EventReject, Eve
 	EventMerge, EventRetract, EventArchive, EventRestore, EventPurge, EventExpiry, EventTierChange, EventClassify,
 	EventAnchors, EventBaseline, EventStaleObserved, EventDriftCleared, EventClaim, EventRelation, EventFeedback,
 	EventCollection, EventGrant, EventRevoke, EventApplicability, EventNote, EventGate, EventIndexBaseline,
-	EventMergeApproval, EventMergeApprovalRevoked)
+	EventMergeApproval, EventMergeApprovalRevoked, EventReviewRecord, EventReviewFinding, EventReviewTriage,
+	EventReviewReanchor)
+
+// eventSubjects is the subject kind each review event type names. Every other type
+// names a memory (or nothing), so AppendEvent, which writes memory events, can never
+// forge a review subject's history.
+var eventSubjects = map[string]string{
+	EventReviewRecord: SubjectReviewRecord, EventReviewFinding: SubjectReviewFinding,
+	EventReviewTriage: SubjectReviewFinding, EventReviewReanchor: SubjectReviewFinding,
+}
 
 // Event is one immutable history record.
 type Event struct {
@@ -118,6 +135,9 @@ type EventWriter interface {
 type eventRow struct {
 	WorkspaceID string
 	EntryID     string
+	// SubjectKind is what EntryID names: a memory ("" means memory) or a review subject.
+	// It must be the kind the event type names (eventSubjects).
+	SubjectKind string
 	Type        string
 	Revision    int64
 	OldDigest   string
@@ -134,6 +154,10 @@ func (t *txn) appendEvent(ctx context.Context, actor Actor, ev eventRow) error {
 func (t *txn) insertEvent(ctx context.Context, actor Actor, ev eventRow) (int64, error) {
 	if !validEventTypes[ev.Type] {
 		return 0, fmt.Errorf("%w: event type %q", ErrInvalid, ev.Type)
+	}
+	subject := cmp.Or(ev.SubjectKind, SubjectMemory)
+	if want := cmp.Or(eventSubjects[ev.Type], SubjectMemory); subject != want {
+		return 0, fmt.Errorf("%w: a %s event names a %s, not a %s", ErrInvalid, ev.Type, want, subject)
 	}
 	var data any
 	if p := actor.provenance(); p != nil {
@@ -155,9 +179,9 @@ func (t *txn) insertEvent(ctx context.Context, actor Actor, ev eventRow) (int64,
 		revision = ev.Revision
 	}
 	res, err := t.exec(ctx, `INSERT INTO events (workspace_id, entry_id, type, principal, session_id, agent_id, head_sha,
-		revision, old_digest, new_digest, note, data, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		revision, old_digest, new_digest, note, data, at, subject_kind) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		ev.WorkspaceID, nullText(ev.EntryID), ev.Type, strings.TrimSpace(actor.Principal), actor.SessionID,
-		actor.AgentID, actor.HeadSHA, revision, ev.OldDigest, ev.NewDigest, nullText(note), data, t.nowText())
+		actor.AgentID, actor.HeadSHA, revision, ev.OldDigest, ev.NewDigest, nullText(note), data, t.nowText(), subject)
 	if err != nil {
 		return 0, fmt.Errorf("append %s event: %w", ev.Type, err)
 	}

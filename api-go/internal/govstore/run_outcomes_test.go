@@ -148,8 +148,8 @@ func TestRunOutcomeRejectsInvalidInput(t *testing.T) {
 	}
 }
 
-// A file created by a build that knew only migration 1 upgrades in place: migration 2
-// is applied once, the fingerprint is re-recorded, and the older data stays.
+// A file created by a build that knew only migration 1 upgrades in place: the later
+// migrations are applied once, the fingerprint is re-recorded, and the older data stays.
 func TestMigrationUpgradesV1FileToRunOutcomes(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "gov.db")
@@ -173,11 +173,11 @@ func TestMigrationUpgradesV1FileToRunOutcomes(t *testing.T) {
 	}
 	defer s.Close()
 	info, err := s.SchemaInfo(ctx)
-	if err != nil || info.Version != 2 {
+	if err != nil || info.Version != LatestSchemaVersion() {
 		t.Fatalf("schema after upgrade = %+v, %v", info, err)
 	}
-	if n := countRows(t, s, "SELECT count(*) FROM schema_migrations"); n != 2 {
-		t.Fatalf("migration rows = %d, want 2", n)
+	if n := countRows(t, s, "SELECT count(*) FROM schema_migrations"); n != len(migrations) {
+		t.Fatalf("migration rows = %d, want %d", n, len(migrations))
 	}
 	if fb, _ := s.GetFeedback(ctx, "ws1", []string{"a.go"}); fb["a.go"].RunFail != 1 {
 		t.Fatalf("v1 data lost in the upgrade: %+v", fb)

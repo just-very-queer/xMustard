@@ -651,7 +651,7 @@ class Ledger(unittest.TestCase):
         items = set(LEDGER["go_daemon_suballocation"]["items"])
         self.assertEqual(LEDGER["gate"]["limit_bytes"], v2.GATE_BYTES)
         # WS-00..WS-63, plus the Open Code Review adoption's new workstreams as they land
-        self.assertEqual(sorted(LEDGER["workstreams"]), [f"WS-{i:02d}" for i in range(64)] + ["WS-65"])
+        self.assertEqual(sorted(LEDGER["workstreams"]), [f"WS-{i:02d}" for i in range(64)] + ["WS-65", "WS-66"])
         for wid, w in LEDGER["workstreams"].items():
             self.assertTrue(w["process"] is None or w["process"] in procs | roles, wid)
             for sc in w.get("scenarios", []):
