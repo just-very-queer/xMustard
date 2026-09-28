@@ -1,0 +1,21 @@
+diff --git a/packages/protocol/README.md b/packages/protocol/README.md
+index 675c6cd..db7bb5d 100644
+--- a/packages/protocol/README.md
++++ b/packages/protocol/README.md
+@@ -38,4 +38,15 @@ decoder.end();
+ 
+ All envelope schemas reject unknown object properties, and codecs recursively reject non-JSON opaque payloads, including non-finite numbers, byte arrays, `undefined`, prototypes, and cycles. Envelope violations, malformed CBOR, and invalid framing throw `ProtocolValidationError`. Payload-specific adapters must perform their own semantic validation after decoding. Transports must preserve byte order. Peer authentication and authenticated service contexts are not implemented by the experimental transport.
+ 
+-Default limits are 16 MiB per CBOR payload/frame, 1,000,000 array elements or map entries, and 64 nested item levels. The protocol is experimental and has no compatibility guarantees.
++The protocol is experimental and has no compatibility guarantees.
++
++## Limits
++
++Default limits for untrusted payloads; decoders and codecs accept lower or higher values through their options.
++
++| Limit | Default |
++| --- | --- |
++| Maximum frame length (`DEFAULT_MAX_FRAME_LENGTH`), in bytes | 8388608 |
++| Maximum CBOR byte length (`DEFAULT_MAX_CBOR_BYTE_LENGTH`), in bytes | 16777216 |
++| Maximum CBOR container length (`DEFAULT_MAX_CBOR_CONTAINER_LENGTH`), array elements or map entries | 1000000 |
++| Maximum CBOR nesting depth (`DEFAULT_MAX_CBOR_DEPTH`), item levels | 32 |

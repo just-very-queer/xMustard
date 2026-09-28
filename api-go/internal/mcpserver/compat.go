@@ -20,6 +20,7 @@ var compatTypes = map[string]toolcompat.Type{
 	typeString:  toolcompat.TypeString,
 	typeBoolean: toolcompat.TypeBoolean,
 	typeInteger: toolcompat.TypeInteger,
+	typeNumber:  toolcompat.TypeNumber,
 }
 
 // compatSpec is the closed toolcompat spec of a tool: its arguments, advanced

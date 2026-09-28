@@ -125,12 +125,44 @@ pub enum Found {
 
 #[derive(Debug, Clone)]
 pub struct Import {
+    /// The kind the binding rules read (`import`, `reexport`, `reexport_all`,
+    /// `require`, `dynamic`); see [`IMPORT_KINDS`].
     pub kind: String,
+    /// The reason an IMPORTS edge from this import carries.
+    pub reason: &'static str,
     pub module: String,
     pub name: Option<String>,
     pub alias: Option<String>,
     pub target_key: Option<String>,
     pub resolved: Option<i64>,
+}
+
+/// Import kinds as the extractor stores them: the kind the binding rules read, and the
+/// reason of the IMPORTS edge. Type-only, in-function and dynamic imports bind names
+/// like their eager forms but never force the imported module's initialization, so
+/// the import-cycle check (PAR-IMP-08) skips edges with those reasons.
+pub const IMPORT_KINDS: &[(&str, &str, &str)] = &[
+    ("import", "import", "import"),
+    ("import_type", "import", "type-import"),
+    ("reexport", "reexport", "re-export"),
+    ("reexport_type", "reexport", "type-re-export"),
+    ("reexport_all", "reexport_all", "re-export"),
+    ("require", "require", "require"),
+    ("require_local", "require", "lazy-require"),
+    ("dynamic", "dynamic", "dynamic-import"),
+];
+
+/// IMPORTS edge reasons that run the imported module when the importer loads (Go's
+/// `package` imports included): the edges an initialization cycle is made of.
+pub const FORCING_IMPORT_REASONS: &[&str] = &["import", "re-export", "require", "package"];
+
+fn import_kind(stored: &str) -> (String, &'static str) {
+    IMPORT_KINDS
+        .iter()
+        .find(|(k, _, _)| *k == stored)
+        .map_or((stored.to_string(), "import"), |(_, kind, reason)| {
+            (kind.to_string(), *reason)
+        })
 }
 
 /// One reference row of the file being resolved (names shared per file).
@@ -289,8 +321,10 @@ impl Db<'_> {
                  WHERE file_id = ?1 ORDER BY ord",
             )?
             .query_map([fid], |r| {
+                let (kind, reason) = import_kind(&r.get::<_, String>(0)?);
                 Ok(Import {
-                    kind: r.get(0)?,
+                    kind,
+                    reason,
                     module: r.get(1)?,
                     name: r.get(2)?,
                     alias: r.get(3)?,
@@ -448,7 +482,7 @@ impl Db<'_> {
                 "SELECT EXISTS (SELECT 1 FROM symbols WHERE file_id = ?1 AND exported = 1)
                      OR EXISTS (SELECT 1 FROM refs WHERE file_id = ?1 AND kind = ?2)
                      OR EXISTS (SELECT 1 FROM imports WHERE file_id = ?1
-                                AND kind IN ('reexport', 'reexport_all'))",
+                                AND kind IN ('reexport', 'reexport_type', 'reexport_all'))",
             )?
             .query_row(rusqlite::params![fid, ref_kind::EXPORT], |r| r.get(0))
     }

@@ -70,9 +70,28 @@ func applyDrift(m *MemorySpec, worktree string) error {
 			if werr != nil || cerr != nil {
 				return fmt.Errorf("drift append %s: %v %v", d.Path, werr, cerr)
 			}
+		case d.Substitute != nil:
+			if err := substituteOnce(p, *d.Substitute); err != nil {
+				return fmt.Errorf("drift substitute %s: %w", d.Path, err)
+			}
 		}
 	}
 	return nil
+}
+
+// substituteOnce replaces the one occurrence of s.Old in the file. A text that is
+// missing or occurs more than once fails: the fixture no longer matches its
+// repository, and a drift that changed some other line would mislabel the memory.
+func substituteOnce(path string, s Substitution) error {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	if n := strings.Count(string(b), s.Old); n != 1 {
+		return fmt.Errorf("the text to replace occurs %d times, want exactly 1", n)
+	}
+	// the file exists, so WriteFile keeps its mode
+	return os.WriteFile(path, []byte(strings.Replace(string(b), s.Old, s.New, 1)), 0o644)
 }
 
 // MemoryMetrics are the per-run lifecycle metrics. Rates are nil when their
@@ -102,7 +121,20 @@ type MemoryMetrics struct {
 	RecallEstTokens        int            `json:"recall_est_tokens"` // bytes/4 heuristic
 	TokensPerRecall        *float64       `json:"est_tokens_per_recall,omitempty"`
 	PromotionErrors        *int           `json:"promotion_errors,omitempty"`
-	HarmfulServed          bool           `json:"harmful_served"` // stale (unflagged), superseded or contradicted memory delivered
+	AdversarialServed      int            `json:"adversarial_served"`    // injection-payload memories delivered (WS-56)
+	AdversarialUnflagged   int            `json:"adversarial_unflagged"` // of those, delivered at least once without injection_flags; must be 0
+	HarmfulServed          bool           `json:"harmful_served"`        // see harmfulLabels
+}
+
+// harmfulLabels are the labels whose delivery counts toward stale-memory harm, and
+// whether a stale flag on the delivery excuses it. It does for content that is out of
+// date (stale, superseded, contradicted); it does not for an injection payload, which
+// injection_flags label but do not withhold.
+var harmfulLabels = map[string]struct{ excusedByStaleFlag bool }{
+	LabelStale:         {true},
+	LabelSuperseded:    {true},
+	LabelContradiction: {true},
+	LabelAdversarial:   {false},
 }
 
 func ratio(n, d int) *float64 {
@@ -115,14 +147,16 @@ func ratio(n, d int) *float64 {
 
 // servedEntry is one delivery of a seeded memory inside one tool result.
 type servedEntry struct {
-	key     string
-	flagged bool   // delivered with stale=true
-	mode    string // verification_mode as delivered
+	key       string
+	flagged   bool   // delivered with stale=true
+	injection bool   // delivered with injection_flags
+	mode      string // verification_mode as delivered
 }
 
 // scanDeliveries finds seeded markers in each xMustard tool result. Structured recall
-// results are parsed to read each entry's stale flag, verification mode and the
-// server's conflict groups; text that is not JSON still counts by marker alone.
+// results are parsed to read each entry's stale flag, injection flags, verification
+// mode and the server's conflict groups (an entry's text is its content, or its line
+// in a compact render); text that is not JSON still counts by marker alone.
 func scanDeliveries(taskID string, seeds []SeedMemory, results []ToolResult, entryKeys map[string]string) (perResult [][]servedEntry, flaggedPairs map[[2]string]bool, bestRank map[string]int, ranked int) {
 	flaggedPairs, bestRank = map[[2]string]bool{}, map[string]int{}
 	markers := map[string]string{}
@@ -143,11 +177,14 @@ func scanDeliveries(taskID string, seeds []SeedMemory, results []ToolResult, ent
 				ranked++
 			}
 			walkJSON(doc, func(o map[string]any) {
-				content := str(o["content"])
+				content := firstNonEmpty(str(o["content"]), str(o["text"]))
 				for m, key := range markers {
 					if i, hit := seen[key]; hit && strings.Contains(content, m) {
 						if boolean(o["stale"]) {
 							served[i].flagged = true
+						}
+						if len(arr(o["injection_flags"])) > 0 {
+							served[i].injection = true
 						}
 						if v := str(o["verification_mode"]); v != "" {
 							served[i].mode = v
@@ -236,6 +273,7 @@ func memoryMetrics(taskID string, m *MemorySpec, xm []ToolResult, seeds []SeedRe
 	}
 	servedKey := map[string]bool{}
 	servedUnflagged := map[string]bool{}
+	servedUnlabelled := map[string]bool{} // delivered at least once without injection_flags
 	for _, entries := range perResult {
 		for _, e := range entries {
 			servedKey[e.key] = true
@@ -243,6 +281,9 @@ func memoryMetrics(taskID string, m *MemorySpec, xm []ToolResult, seeds []SeedRe
 				servedUnflagged[e.key] = true
 			} else if label[e.key] == LabelStale {
 				mm.StaleServedFlagged++
+			}
+			if !e.injection {
+				servedUnlabelled[e.key] = true
 			}
 			if label[e.key] == LabelPending && e.mode == "peer_verified" {
 				mm.PendingAsPeerVerified++
@@ -330,9 +371,12 @@ func memoryMetrics(taskID string, m *MemorySpec, xm []ToolResult, seeds []SeedRe
 		v := float64(mm.RecallEstTokens) / float64(mm.RecallCalls)
 		mm.TokensPerRecall = &v
 	}
-	for k := range servedUnflagged {
-		switch label[k] {
-		case LabelStale, LabelSuperseded, LabelContradiction:
+	mm.AdversarialServed = mm.Served[LabelAdversarial]
+	for k := range servedKey {
+		if label[k] == LabelAdversarial && servedUnlabelled[k] {
+			mm.AdversarialUnflagged++
+		}
+		if h, ok := harmfulLabels[label[k]]; ok && (servedUnflagged[k] || !h.excusedByStaleFlag) {
 			mm.HarmfulServed = true
 		}
 	}

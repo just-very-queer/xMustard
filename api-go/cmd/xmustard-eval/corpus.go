@@ -33,9 +33,10 @@ const (
 	LabelContradiction = "contradiction" // conflicts with another memory (`contradicts`)
 	LabelForeignScope  = "foreign_scope" // seeded into a different workspace; serving it is a scope leak
 	LabelPending       = "pending"       // proposed but never verified; serving it is a governance violation
+	LabelAdversarial   = "adversarial"   // verified, but its content carries an instruction-injection payload (WS-56)
 )
 
-var memoryLabels = []string{LabelCurrent, LabelStale, LabelSuperseded, LabelDuplicate, LabelContradiction, LabelForeignScope, LabelPending}
+var memoryLabels = []string{LabelCurrent, LabelStale, LabelSuperseded, LabelDuplicate, LabelContradiction, LabelForeignScope, LabelPending, LabelAdversarial}
 
 var taskIDPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}$`)
 
@@ -148,12 +149,33 @@ type SeedMemory struct {
 	DuplicateOf string   `yaml:"duplicate_of"`
 }
 
-// DriftEdit changes one file after seeding. Exactly one of Append, Replace or Delete.
+// DriftEdit changes one file after seeding. Exactly one of Append, Replace, Delete or
+// Substitute.
 type DriftEdit struct {
 	Path    string  `yaml:"path"`
 	Append  *string `yaml:"append"`
 	Replace *string `yaml:"replace"`
 	Delete  bool    `yaml:"delete"`
+	// Substitute replaces one exact occurrence of Old with New, which keeps a drift in a
+	// large file of a path repository to the lines that change.
+	Substitute *Substitution `yaml:"substitute"`
+}
+
+// Substitution is an exact, single-occurrence text replacement.
+type Substitution struct {
+	Old string `yaml:"old"`
+	New string `yaml:"new"`
+}
+
+// ops counts the edit operations the entry sets; a valid entry sets exactly one.
+func (d DriftEdit) ops() int {
+	n := 0
+	for _, set := range []bool{d.Append != nil, d.Replace != nil, d.Delete, d.Substitute != nil} {
+		if set {
+			n++
+		}
+	}
+	return n
 }
 
 // LoadCorpus reads, strictly decodes and validates a corpus file.
@@ -386,18 +408,11 @@ func validateMemory(m *MemorySpec) []error {
 		if !isCleanRelPath(d.Path) {
 			add("memory.drift[%d].path %q must be a clean relative path", i, d.Path)
 		}
-		n := 0
-		if d.Append != nil {
-			n++
+		if d.ops() != 1 {
+			add("memory.drift[%d]: set exactly one of append, replace, delete, substitute", i)
 		}
-		if d.Replace != nil {
-			n++
-		}
-		if d.Delete {
-			n++
-		}
-		if n != 1 {
-			add("memory.drift[%d]: set exactly one of append, replace, delete", i)
+		if d.Substitute != nil && d.Substitute.Old == "" {
+			add("memory.drift[%d].substitute.old is required", i)
 		}
 		drifted[d.Path] = true
 	}

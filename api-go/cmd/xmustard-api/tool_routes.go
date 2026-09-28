@@ -5,7 +5,6 @@ import (
 	"errors"
 	"net/http"
 	"os"
-	"strconv"
 
 	"xmustard/api-go/internal/workspaceops"
 )
@@ -95,26 +94,32 @@ func explainFailure(w http.ResponseWriter, err error) {
 	}
 }
 
-// impactSinceIndex is impact, enriched with the precomputed symbol graph: ?path= →
-// the files referencing one file; ?from=&to= → the shortest dependency path;
-// ?symbol= → blast radius; otherwise the dirty-symbols view since the index baseline.
-// A path mixed with another form is refused, not silently outranked.
+// impactSinceIndex is impact (WS-35): ?from=&to= → the shortest path with per-hop
+// edges; ?symbol= → blast radius by depth tier; ?path= → the files referencing one
+// file (WS-FIX-05); ?scope= → the symbols a scoped diff touches; otherwise the changes
+// since the index baseline. A parameter of another form (two targets among them), or
+// a value out of range, is a 400 before any core runs.
 func impactSinceIndex(w http.ResponseWriter, r *http.Request) {
 	dd, ws, q := dataDir(), r.PathValue("workspace_id"), r.URL.Query()
-	if q.Get("path") != "" && (q.Get("symbol") != "" || q.Get("from") != "" || q.Get("to") != "") {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "impact takes one of path=, symbol= or from=&to="})
+	params := map[string]string{}
+	for name := range q {
+		params[name] = q.Get(name)
+	}
+	form, rest, err := workspaceops.CheckImpactRequest(params)
+	if err != nil {
+		respondError(w, err)
 		return
 	}
-	depth, _ := strconv.Atoi(q.Get("depth"))
 	var result json.RawMessage
-	var err error
-	switch {
-	case q.Get("path") != "":
-		result, err = workspaceops.FileImpactCtx(r.Context(), dd, ws, q.Get("path"), depth)
-	case q.Get("from") != "" && q.Get("to") != "":
-		result, err = workspaceops.TraceSymbolsCtx(r.Context(), dd, ws, q.Get("from"), q.Get("to"))
-	case q.Get("symbol") != "":
-		result, err = workspaceops.SymbolImpactCtx(r.Context(), dd, ws, q.Get("symbol"), depth)
+	switch form {
+	case workspaceops.ImpactTrace:
+		result, err = workspaceops.TraceSymbolsCtx(r.Context(), dd, ws, q.Get("from"), q.Get("to"), rest)
+	case workspaceops.ImpactBlast:
+		result, err = workspaceops.SymbolImpactCtx(r.Context(), dd, ws, q.Get("symbol"), rest)
+	case workspaceops.ImpactFile:
+		result, err = workspaceops.FileImpactCtx(r.Context(), dd, ws, q.Get("path"), rest)
+	case workspaceops.ImpactChanges:
+		result, err = workspaceops.DetectChangesCtx(r.Context(), dd, ws, rest)
 	default:
 		result, err = workspaceops.WorkspaceChangesSinceIndexCtx(r.Context(), dd, ws)
 	}
