@@ -142,6 +142,8 @@ type CaptureMeta struct {
 	CallID           string `json:"call_id,omitempty"`
 	SessionID        string `json:"session_id,omitempty"`
 	AgentID          string `json:"agent_id,omitempty"`
+	TurnID           string `json:"turn_id,omitempty"`
+	TranscriptPath   string `json:"transcript_path,omitempty"`
 	Principal        string `json:"principal,omitempty"`
 	ArgsDigest       string `json:"args_digest,omitempty"`
 	IsError          bool   `json:"is_error"`
@@ -284,7 +286,8 @@ func SelectFamily(sel Selector) (Family, string) {
 
 // NamespacedTool reports a tool name that carries a server namespace (another MCP
 // server's tool): mcp__server__tool, server.tool, server/tool or MCP:tool. Native
-// client tools (Bash, Read, grep, exec_command) never do.
+// client tools (Bash, Read, grep, exec_command) never do. A client with its own MCP
+// naming (OpenCode's <server>_<tool>) says so through ClientPolicy.ForeignTool.
 func NamespacedTool(tool string) bool {
 	t := strings.ToLower(strings.TrimSpace(tool))
 	return strings.Contains(t, "__") || strings.ContainsAny(t, "./") || strings.HasPrefix(t, "mcp:") || strings.HasPrefix(t, "mcp_")
