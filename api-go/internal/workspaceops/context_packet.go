@@ -2076,56 +2076,69 @@ func readWorktreeStatus(root string) *WorktreeStatus {
 	result.Available = true
 	result.IsGitRepo = true
 	for _, line := range strings.Split(string(output), "\n") {
-		if strings.HasPrefix(line, "# branch.head ") {
-			value := strings.TrimSpace(strings.TrimPrefix(line, "# branch.head "))
-			if value != "" {
-				result.Branch = &value
-			}
-			continue
-		}
-		if strings.HasPrefix(line, "# branch.oid ") {
-			value := strings.TrimSpace(strings.TrimPrefix(line, "# branch.oid "))
-			if value != "" && value != "(initial)" {
-				result.HeadSHA = &value
-			}
-			continue
-		}
-		if strings.HasPrefix(line, "# branch.ab ") {
-			parts := strings.Fields(line)
-			for _, part := range parts {
-				if strings.HasPrefix(part, "+") {
-					result.Ahead = atoiSafe(strings.TrimPrefix(part, "+"))
-				}
-				if strings.HasPrefix(part, "-") {
-					result.Behind = atoiSafe(strings.TrimPrefix(part, "-"))
-				}
-			}
-			continue
-		}
-		if strings.HasPrefix(line, "? ") {
-			result.UntrackedFiles++
-			result.DirtyFiles++
-			result.DirtyPaths = append(result.DirtyPaths, strings.TrimSpace(strings.TrimPrefix(line, "? ")))
-			continue
-		}
-		if strings.HasPrefix(line, "1 ") || strings.HasPrefix(line, "2 ") || strings.HasPrefix(line, "u ") {
-			parts := strings.Fields(line)
-			if len(parts) < 3 {
-				continue
-			}
-			xy := parts[1]
-			path := parts[len(parts)-1]
-			result.DirtyFiles++
-			result.DirtyPaths = append(result.DirtyPaths, path)
-			if len(xy) > 0 && xy[0] != '.' {
-				result.StagedFiles++
-			}
-		}
+		result.addPorcelainV2Line(line)
 	}
 	if len(result.DirtyPaths) > 20 {
 		result.DirtyPaths = result.DirtyPaths[:20]
 	}
 	return result
+}
+
+// addPorcelainV2Line folds one line of `git status --branch --porcelain=v2` into the
+// status, by its record type: a branch header, an untracked path, or a changed entry
+// (ordinary, renamed or unmerged). Ignored ("!") and unknown lines are skipped.
+func (w *WorktreeStatus) addPorcelainV2Line(line string) {
+	kind, rest, ok := strings.Cut(line, " ")
+	if !ok {
+		return
+	}
+	switch kind {
+	case "#":
+		w.addBranchHeader(rest)
+	case "?":
+		w.UntrackedFiles++
+		w.DirtyFiles++
+		w.DirtyPaths = append(w.DirtyPaths, strings.TrimSpace(rest))
+	case "1", "2", "u":
+		parts := strings.Fields(line)
+		if len(parts) < 3 {
+			return
+		}
+		xy := parts[1]
+		w.DirtyFiles++
+		w.DirtyPaths = append(w.DirtyPaths, parts[len(parts)-1])
+		if len(xy) > 0 && xy[0] != '.' {
+			w.StagedFiles++
+		}
+	}
+}
+
+// addBranchHeader reads a "# branch.<key> <value>" header.
+func (w *WorktreeStatus) addBranchHeader(header string) {
+	key, value, ok := strings.Cut(header, " ")
+	if !ok {
+		return
+	}
+	value = strings.TrimSpace(value)
+	switch key {
+	case "branch.head":
+		if value != "" {
+			w.Branch = &value
+		}
+	case "branch.oid":
+		if value != "" && value != "(initial)" {
+			w.HeadSHA = &value
+		}
+	case "branch.ab":
+		for _, part := range strings.Fields(value) {
+			switch {
+			case strings.HasPrefix(part, "+"):
+				w.Ahead = atoiSafe(strings.TrimPrefix(part, "+"))
+			case strings.HasPrefix(part, "-"):
+				w.Behind = atoiSafe(strings.TrimPrefix(part, "-"))
+			}
+		}
+	}
 }
 
 func atoiSafe(value string) int {
