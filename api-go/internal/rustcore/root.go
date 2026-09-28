@@ -55,6 +55,10 @@ func runCoreCtx(parent context.Context, sub string, args ...string) ([]byte, err
 	if out, handled, err := runViaWorker(parent, sub, args); handled {
 		return out, err
 	}
+	if sub == watchSub {
+		// the watcher lives in the worker: a one-shot core would only refuse the call
+		return nil, fmt.Errorf("rust-core %s: %w", sub, errNoWorker)
+	}
 	release, err := budget.Children.Acquire(parent)
 	if err != nil {
 		return nil, fmt.Errorf("rust-core %s: %w", sub, err)
