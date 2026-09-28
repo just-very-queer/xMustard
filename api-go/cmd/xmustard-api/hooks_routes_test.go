@@ -407,6 +407,119 @@ func TestHookTimeoutFailsOpenWithEmptyOutput(t *testing.T) {
 	}
 }
 
+// hookEvent marshals a hook body.
+func hookEvent(fields map[string]any) string {
+	b, _ := json.Marshal(fields)
+	return string(b)
+}
+
+// hookContext is an answer's additionalContext ("" for an empty answer).
+func hookContext(t *testing.T, body []byte) string {
+	t.Helper()
+	if len(body) == 0 {
+		return ""
+	}
+	var out hooks.Output
+	if err := json.Unmarshal(body, &out); err != nil || out.HookSpecificOutput == nil {
+		t.Fatalf("answer %s", body)
+	}
+	return out.HookSpecificOutput.AdditionalContext
+}
+
+// A subagent starts with a fresh context: a memory pushed into the main thread is
+// pushed again into a subagent of the same session, and one pushed into a subagent
+// (whose context is then discarded) still reaches the main thread.
+func TestHookSubagentHasItsOwnContext(t *testing.T) {
+	f := newHookFixture(t)
+	read := func(session, agent string) string {
+		fields := map[string]any{"session_id": session, "cwd": f.root, "hook_event_name": "PreToolUse", "tool_name": "Read",
+			"tool_input": map[string]any{"file_path": filepath.Join(f.root, "src", "billing.go")}}
+		if agent != "" {
+			fields["agent_id"], fields["agent_type"] = agent, "Explore"
+		}
+		return hookEvent(fields)
+	}
+	for _, step := range []struct {
+		session, agent string
+		pushed         bool
+	}{
+		{"main-first", "", true}, {"main-first", "a1", true}, {"main-first", "a1", false}, {"main-first", "", false},
+		{"sub-first", "a2", true}, {"sub-first", "", true}, {"sub-first", "a3", true},
+	} {
+		_, body := f.post(t, f.agent, "PreToolUse", read(step.session, step.agent))
+		if got := strings.Contains(hookContext(t, body), "billing rounding"); got != step.pushed {
+			t.Fatalf("%s/%q: pushed %v, want %v: %s", step.session, step.agent, got, step.pushed, body)
+		}
+	}
+}
+
+// An admitted memory that does not fit in the context left is not lost silently: it is
+// counted too_large in the withheld note with the recall call, and the ones that fit
+// are pushed. A memory is marked pushed only once the answer carrying it is written:
+// when the budget runs out after admission, the next hook pushes it.
+func TestHookPushBudgetsFramesAndMarksOnlyWhatIsDelivered(t *testing.T) {
+	f := newHookFixture(t)
+	big := strings.Repeat("Ledger entries post in cents, rounded half-even at close. ", 200) // ~11,600 chars
+	f.memory(t, "ledger-big", "ledger posting", big, []string{"src/ledger.go"}, nil, true)
+	f.memory(t, "ledger-small", "ledger close", "Ledger close runs after the billing batch.", []string{"src/ledger.go"}, nil, true)
+	read := hookEvent(map[string]any{"session_id": "budget", "cwd": f.root, "hook_event_name": "PreToolUse", "tool_name": "Read",
+		"tool_input": map[string]any{"file_path": filepath.Join(f.root, "src", "ledger.go")}})
+	_, body := f.post(t, f.agent, "PreToolUse", read)
+	ctx := hookContext(t, body)
+	if !strings.Contains(ctx, "Ledger close runs after") || strings.Contains(ctx, "Ledger entries post") ||
+		!strings.Contains(ctx, "too_large: 1") || !strings.Contains(ctx, `recall(paths=["src/ledger.go"])`) {
+		t.Fatalf("budgeted push: %.600s", ctx)
+	}
+	if len(ctx) > hooks.MaxContextChars {
+		t.Fatalf("context of %d characters", len(ctx))
+	}
+	if _, body := f.post(t, f.agent, "PreToolUse", read); len(body) != 0 {
+		t.Fatalf("a delivered memory or note was given twice: %s", body)
+	}
+
+	// the budget runs out after admission (the pre-edit syntax baseline hangs)
+	t.Setenv("XMUSTARD_HOOK_BUDGET_MS", "800")
+	hookSyntax = func(ctx context.Context, _ workspaceops.ResolvedWorkspace, _ []string) (json.RawMessage, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	edit := hookEvent(map[string]any{"session_id": "late", "cwd": f.root, "hook_event_name": "PreToolUse", "tool_name": "Edit",
+		"tool_input": map[string]any{"file_path": filepath.Join(f.root, "src", "billing.go"), "old_string": "x", "new_string": "y"}})
+	if _, body := f.post(t, f.agent, "PreToolUse", edit); len(body) != 0 {
+		t.Fatalf("a timed-out hook answered %s", body)
+	}
+	readBilling := hookEvent(map[string]any{"session_id": "late", "cwd": f.root, "hook_event_name": "PreToolUse", "tool_name": "Read",
+		"tool_input": map[string]any{"file_path": filepath.Join(f.root, "src", "billing.go")}})
+	if _, body := f.post(t, f.agent, "PreToolUse", readBilling); !strings.Contains(hookContext(t, body), "billing rounding") {
+		t.Fatalf("a memory admitted into a timed-out answer was lost: %s", body)
+	}
+}
+
+// CwdChanged always sends watchPaths: into a directory of no workspace, [] clears the
+// previous workspace's list.
+func TestHookCwdChangedClearsTheWatchList(t *testing.T) {
+	f := newHookFixture(t)
+	elsewhere := t.TempDir()
+	_, body := f.post(t, f.agent, "CwdChanged", hookEvent(map[string]any{"session_id": "cwd", "cwd": elsewhere,
+		"hook_event_name": "CwdChanged", "old_cwd": f.root, "new_cwd": elsewhere}))
+	if string(body) != `{"hookSpecificOutput":{"hookEventName":"CwdChanged","watchPaths":[]}}` {
+		t.Fatalf("CwdChanged out of any workspace: %s", body)
+	}
+}
+
+// The withheld note of a keyword push names the trigger tag recall filters on.
+func TestHookTriggerNoteNamesTheTag(t *testing.T) {
+	f := newHookFixture(t)
+	f.memory(t, "deploy-peer", "deploy freeze", "No deploys on Fridays.", nil, []string{"trigger-deploy"}, false)
+	_, body := f.post(t, f.agent, "UserPromptSubmit", hookEvent(map[string]any{"session_id": "kw", "cwd": f.root,
+		"hook_event_name": "UserPromptSubmit", "prompt": "Please deploy the fix."}))
+	ctx := hookContext(t, body)
+	if !strings.Contains(ctx, "deploy canary") || !strings.Contains(ctx, "needs_human_approved: 1") ||
+		!strings.Contains(ctx, `recall(tags=["trigger-deploy"])`) {
+		t.Fatalf("trigger push: %s", ctx)
+	}
+}
+
 // barrierRedactor holds every capture's first write until n captures are in flight at
 // once, so a server that handled them one at a time would never release them.
 type barrierRedactor struct {
@@ -621,6 +734,30 @@ func TestHookSocketServesOnlyHookRoutes(t *testing.T) {
 	if _, err := listenHookSocket(filepath.Join(open, "hook.sock")); err == nil {
 		t.Fatal("listened in a directory others can enter")
 	}
+	// a file that is not a socket is never removed to make room
+	file := filepath.Join(dir, "run", "not-a-socket")
+	if err := os.WriteFile(file, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := listenHookSocket(file); err == nil {
+		t.Fatal("listened over a regular file")
+	}
+	if b, err := os.ReadFile(file); err != nil || string(b) != "keep" {
+		t.Fatalf("the regular file was removed or changed: %v", err)
+	}
+	// a stale socket of this user is replaced
+	stale := filepath.Join(dir, "run", "stale.sock")
+	sl, err := net.Listen("unix", stale)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sl.(*net.UnixListener).SetUnlinkOnClose(false)
+	sl.Close()
+	ln2, err := listenHookSocket(stale)
+	if err != nil {
+		t.Fatalf("a stale socket was not replaced: %v", err)
+	}
+	ln2.Close()
 }
 
 // BenchmarkHookAnswers times representative hooks through the full handler stack (auth,

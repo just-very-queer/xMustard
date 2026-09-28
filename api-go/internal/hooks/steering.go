@@ -2,15 +2,19 @@ package hooks
 
 import (
 	"fmt"
+	"maps"
 	"slices"
 	"sync"
 	"time"
 )
 
-// Steering (PAR-HAR-02): per-session state the hook service keeps in memory, bounded,
-// and lost on restart (a lost session only means a nudge or a memory is shown again).
-// A session is keyed by the caller's principal and the client's session id, so one
-// principal cannot read or reset another's state by reusing a session id.
+// Steering (PAR-HAR-02): per-context state the hook service keeps in memory, bounded,
+// and lost on restart (a lost state only means a nudge or a memory is shown again). A
+// context is keyed by the caller's principal, the client's session id and, inside a
+// subagent, the subagent's id: one principal cannot read or reset another's state by
+// reusing a session id, and a subagent, which starts with a fresh context, does not
+// count what was pushed into its parent (or a sibling) as seen, nor they what was
+// pushed into it.
 
 // Limits are the steering thresholds.
 type Limits struct {
@@ -37,7 +41,7 @@ const (
 	maxBaselines      = 32
 )
 
-// Session is one client session's steering state.
+// Session is one context's steering state.
 type Session struct {
 	searches  []time.Time
 	lastNudge time.Time
@@ -46,40 +50,41 @@ type Session struct {
 	lastBusy  time.Time
 	injected  map[string]bool
 	baselines map[string][]string
-	// Agents maps a subagent id to its type while it runs (attribution).
-	agents map[string]string
-	used   time.Time
+	used      time.Time
 }
 
-// Sessions holds the sessions. The zero value is not usable; use NewSessions.
+// Sessions holds the contexts' states. The zero value is not usable; use NewSessions.
 type Sessions struct {
 	mu     sync.Mutex
 	now    func() time.Time
 	limits Limits
-	m      map[string]*Session
+	m      map[SessionKey]*Session
 }
 
 // NewSessions returns an empty table; now is the clock (time.Now outside tests).
 func NewSessions(limits Limits, now func() time.Time) *Sessions {
-	return &Sessions{now: now, limits: limits, m: map[string]*Session{}}
+	return &Sessions{now: now, limits: limits, m: map[SessionKey]*Session{}}
 }
 
-// Key names a session: the principal and the client's session id. An empty session id
-// has no state: every call is a fresh session.
-func Key(principal, sessionID string) string {
-	if sessionID == "" {
-		return ""
-	}
-	return principal + "\x00" + sessionID
+// SessionKey names one context: the principal, the client's session id, and the
+// subagent's id inside a subagent ("" on the main thread; Claude Code sends agent_id
+// only from a subagent, with the parent's session_id).
+type SessionKey struct {
+	Principal, Session, Agent string
 }
 
-// with runs fn on the session under the lock, creating it; a keyless call gets a
-// throwaway session.
-func (s *Sessions) with(key string, fn func(*Session, time.Time)) {
+// Key names a context. An empty session id has no state: every call is a fresh context.
+func Key(principal, sessionID, agentID string) SessionKey {
+	return SessionKey{Principal: principal, Session: sessionID, Agent: agentID}
+}
+
+// with runs fn on the context's state under the lock, creating it; a call without a
+// session id gets a throwaway state.
+func (s *Sessions) with(key SessionKey, fn func(*Session, time.Time)) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := s.now()
-	if key == "" {
+	if key.Session == "" {
 		fn(&Session{}, now)
 		return
 	}
@@ -96,16 +101,16 @@ func (s *Sessions) with(key string, fn func(*Session, time.Time)) {
 }
 
 func (s *Sessions) evict() {
-	var oldest string
+	var oldest SessionKey
 	for k, v := range s.m {
-		if oldest == "" || v.used.Before(s.m[oldest].used) {
+		if old := s.m[oldest]; old == nil || v.used.Before(old.used) {
 			oldest = k
 		}
 	}
 	delete(s.m, oldest)
 }
 
-// Len is the number of sessions held.
+// Len is the number of contexts held.
 func (s *Sessions) Len() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -113,7 +118,7 @@ func (s *Sessions) Len() int {
 }
 
 // NoteSearch records one native search and reports whether the burst nudge is due.
-func (s *Sessions) NoteSearch(key string) (nudge bool) {
+func (s *Sessions) NoteSearch(key SessionKey) (nudge bool) {
 	s.with(key, func(ses *Session, now time.Time) {
 		ses.searches = append(slices.DeleteFunc(ses.searches, func(t time.Time) bool {
 			return now.Sub(t) > s.limits.BurstWindow
@@ -124,7 +129,7 @@ func (s *Sessions) NoteSearch(key string) (nudge bool) {
 }
 
 // NoteBatch reports whether a batch with that many searches earns the nudge.
-func (s *Sessions) NoteBatch(key string, searches int) (nudge bool) {
+func (s *Sessions) NoteBatch(key SessionKey, searches int) (nudge bool) {
 	s.with(key, func(ses *Session, now time.Time) {
 		nudge = searches >= s.limits.BatchSearches && s.nudgeDue(ses, now)
 	})
@@ -140,7 +145,7 @@ func (s *Sessions) nudgeDue(ses *Session, now time.Time) bool {
 }
 
 // GitNoticeDue reports whether the post-git notice may be given now.
-func (s *Sessions) GitNoticeDue(key string) (due bool) {
+func (s *Sessions) GitNoticeDue(key SessionKey) (due bool) {
 	s.with(key, func(ses *Session, now time.Time) {
 		if due = ses.lastGit.IsZero() || now.Sub(ses.lastGit) >= s.limits.GitCooldown; due {
 			ses.lastGit = now
@@ -150,12 +155,12 @@ func (s *Sessions) GitNoticeDue(key string) (due bool) {
 }
 
 // NoteBusy counts a hook skipped because the daemon was busy or out of time.
-func (s *Sessions) NoteBusy(key string) {
+func (s *Sessions) NoteBusy(key SessionKey) {
 	s.with(key, func(ses *Session, _ time.Time) { ses.busy++ })
 }
 
 // BusyNote returns the throttled note about skipped hooks, or "".
-func (s *Sessions) BusyNote(key string) (note string) {
+func (s *Sessions) BusyNote(key SessionKey) (note string) {
 	s.with(key, func(ses *Session, now time.Time) {
 		if ses.busy == 0 || !ses.lastBusy.IsZero() && now.Sub(ses.lastBusy) < s.limits.BusyCooldown {
 			return
@@ -166,8 +171,8 @@ func (s *Sessions) BusyNote(key string) (note string) {
 	return note
 }
 
-// Unseen returns the ids not yet pushed into this session, in order.
-func (s *Sessions) Unseen(key string, ids []string) (out []string) {
+// Unseen returns the ids not yet pushed into this context, in order.
+func (s *Sessions) Unseen(key SessionKey, ids []string) (out []string) {
 	s.with(key, func(ses *Session, _ time.Time) {
 		for _, id := range ids {
 			if !ses.injected[id] {
@@ -178,8 +183,9 @@ func (s *Sessions) Unseen(key string, ids []string) (out []string) {
 	return out
 }
 
-// MarkInjected records ids as pushed into this session.
-func (s *Sessions) MarkInjected(key string, ids []string) {
+// MarkInjected records ids as delivered into this context: the route calls it once the
+// answer that carries them has been written.
+func (s *Sessions) MarkInjected(key SessionKey, ids []string) {
 	s.with(key, func(ses *Session, _ time.Time) {
 		if ses.injected == nil {
 			ses.injected = map[string]bool{}
@@ -195,12 +201,12 @@ func (s *Sessions) MarkInjected(key string, ids []string) {
 
 // Compacted forgets what was pushed: compaction summarized it away, so it may be
 // pushed again.
-func (s *Sessions) Compacted(key string) {
+func (s *Sessions) Compacted(key SessionKey) {
 	s.with(key, func(ses *Session, _ time.Time) { ses.injected = nil })
 }
 
 // SetBaseline keeps a file's syntax errors from before an edit.
-func (s *Sessions) SetBaseline(key, path string, errs []string) {
+func (s *Sessions) SetBaseline(key SessionKey, path string, errs []string) {
 	s.with(key, func(ses *Session, _ time.Time) {
 		if ses.baselines == nil {
 			ses.baselines = map[string][]string{}
@@ -213,7 +219,7 @@ func (s *Sessions) SetBaseline(key, path string, errs []string) {
 }
 
 // TakeBaseline returns and forgets a file's pre-edit syntax errors.
-func (s *Sessions) TakeBaseline(key, path string) (errs []string, ok bool) {
+func (s *Sessions) TakeBaseline(key SessionKey, path string) (errs []string, ok bool) {
 	s.with(key, func(ses *Session, _ time.Time) {
 		errs, ok = ses.baselines[path]
 		delete(ses.baselines, path)
@@ -221,34 +227,18 @@ func (s *Sessions) TakeBaseline(key, path string) (errs []string, ok bool) {
 	return errs, ok
 }
 
-// AgentStarted records a subagent of the session; AgentStopped forgets it.
-func (s *Sessions) AgentStarted(key, agentID, agentType string) {
-	s.with(key, func(ses *Session, _ time.Time) {
-		if ses.agents == nil {
-			ses.agents = map[string]string{}
-		}
-		if len(ses.agents) < maxBaselines*4 {
-			ses.agents[agentID] = agentType
-		}
-	})
-}
-
-// AgentStopped forgets a subagent.
-func (s *Sessions) AgentStopped(key, agentID string) {
-	s.with(key, func(ses *Session, _ time.Time) { delete(ses.agents, agentID) })
-}
-
-// Agents returns how many subagents of the session are running.
-func (s *Sessions) Agents(key string) (n int) {
-	s.with(key, func(ses *Session, _ time.Time) { n = len(ses.agents) })
-	return n
-}
-
-// End drops a session.
-func (s *Sessions) End(key string) {
+// End drops a context. Ending the main thread's context (SessionEnd) drops the
+// session's subagent contexts too; ending a subagent's (SubagentStop) drops its own.
+func (s *Sessions) End(key SessionKey) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	delete(s.m, key)
+	if key.Agent != "" {
+		delete(s.m, key)
+		return
+	}
+	maps.DeleteFunc(s.m, func(k SessionKey, _ *Session) bool {
+		return k.Principal == key.Principal && k.Session == key.Session
+	})
 }
 
 // Nudge is the text of the burst nudge.

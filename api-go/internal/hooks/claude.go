@@ -40,7 +40,9 @@ type Event struct {
 	Mode Mode
 	// Context says whether the event's output may carry additionalContext.
 	Context bool
-	// WatchPaths says whether the event's output may carry watchPaths.
+	// WatchPaths says whether the event's output may carry watchPaths. Claude Code
+	// replaces its dynamic watch list with a CwdChanged answer's watchPaths, and an
+	// empty list clears it.
 	WatchPaths bool
 	// Replaces says whether the event's output may carry updatedToolOutput.
 	Replaces bool
@@ -199,12 +201,16 @@ type Specific struct {
 	HookEventName     string          `json:"hookEventName"`
 	AdditionalContext string          `json:"additionalContext,omitempty"`
 	UpdatedToolOutput json.RawMessage `json:"updatedToolOutput,omitempty"`
-	WatchPaths        []string        `json:"watchPaths,omitempty"`
+	// WatchPaths is a pointer so that an empty list is sent ([] clears Claude Code's
+	// dynamic watch list) while a nil one is left out.
+	WatchPaths *[]string `json:"watchPaths,omitempty"`
 }
 
 // Answer builds an event's output from what the handler produced, dropping what the
-// event cannot carry. It returns nil when there is nothing to say: the route then
-// answers 200 with an empty body, which Claude Code reads as success with no output.
+// event cannot carry. A nil watch says nothing about the watch list; a non-nil empty
+// one sends watchPaths: [] (CwdChanged into a directory with nothing to watch). It
+// returns nil when there is nothing to say: the route then answers 200 with an empty
+// body, which Claude Code reads as success with no output.
 func Answer(ev Event, context string, updated json.RawMessage, watch []string) *Output {
 	s := &Specific{HookEventName: ev.Name}
 	if ev.Context {
@@ -213,8 +219,8 @@ func Answer(ev Event, context string, updated json.RawMessage, watch []string) *
 	if ev.Replaces {
 		s.UpdatedToolOutput = updated
 	}
-	if ev.WatchPaths {
-		s.WatchPaths = watch
+	if ev.WatchPaths && watch != nil {
+		s.WatchPaths = &watch
 	}
 	if s.AdditionalContext == "" && len(s.UpdatedToolOutput) == 0 && s.WatchPaths == nil {
 		return nil
@@ -239,21 +245,38 @@ func CapContext(s string) string {
 	return cut + "…"
 }
 
-// Compose joins context parts in priority order, keeping whole parts while they fit in
-// MaxContextChars; a part that does not fit is left out, not cut.
-func Compose(parts ...string) string {
+// Size is the room a context part takes when composed: its characters and a
+// separator; nothing for a blank part.
+func Size(part string) int {
+	if part = strings.TrimSpace(part); part == "" {
+		return 0
+	}
+	return utf8.RuneCountInString(part) + 2
+}
+
+// Room is the context left for more parts after these.
+func Room(parts ...string) int {
+	n := MaxContextChars
+	for _, p := range parts {
+		n -= Size(p)
+	}
+	return n
+}
+
+// Compose joins context parts in priority order within MaxContextChars.
+func Compose(parts ...string) string { return ComposeWithin(MaxContextChars, parts...) }
+
+// ComposeWithin joins context parts in priority order, keeping whole parts while they
+// fit in room characters; a part that does not fit is left out, not cut.
+func ComposeWithin(room int, parts ...string) string {
 	var kept []string
 	n := 0
 	for _, p := range parts {
-		p = strings.TrimSpace(p)
-		if p == "" {
+		size := Size(p)
+		if size == 0 || n+size > room {
 			continue
 		}
-		size := utf8.RuneCountInString(p) + 2
-		if n+size > MaxContextChars {
-			continue
-		}
-		kept, n = append(kept, p), n+size
+		kept, n = append(kept, strings.TrimSpace(p)), n+size
 	}
 	return strings.Join(kept, "\n\n")
 }

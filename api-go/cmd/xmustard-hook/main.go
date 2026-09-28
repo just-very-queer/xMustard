@@ -3,8 +3,9 @@
 // for those whose failure must stay silent (WorktreeRemove: a failing hook there
 // blocks the removal). It reads the event's JSON on stdin, posts it to the daemon's
 // /api/hooks/<client>/<Event> over the Unix socket (transport.SocketPath) or, when no
-// daemon listens there, over TCP (XMUSTARD_API_BASE, default http://127.0.0.1:8042),
-// and writes the daemon's JSON answer to stdout.
+// daemon listens there or the socket is not private to this user, over TCP
+// (XMUSTARD_API_BASE, default http://127.0.0.1:8042), and writes the daemon's JSON
+// answer to stdout.
 //
 // It fails open: it always exits 0, and prints nothing when anything fails or the
 // budget runs out (XMUSTARD_HOOK_TIMEOUT_MS, default 200). It speaks just enough
@@ -63,7 +64,7 @@ func run(args []string, stdin io.Reader, stdout io.Writer, getenv func(string) s
 	for _, t := range targets(getenv) {
 		conn, err := t.dial(deadline)
 		if err != nil {
-			continue // no daemon there: try the next address
+			continue // no daemon there, or a socket this user does not own: try the next address
 		}
 		answer, err := req.send(conn, t.host, deadline)
 		_ = conn.Close()
@@ -129,11 +130,16 @@ type target struct {
 	dial func(deadline time.Time) (net.Conn, error)
 }
 
-// targets are the Unix socket, then the TCP address.
+// targets are the Unix socket, then the TCP address. The socket is dialed only when
+// it passes transport.CheckSocket: a socket in a directory another user owns or can
+// enter is skipped, so the token and the event never reach it.
 func targets(getenv func(string) string) []target {
 	var out []target
 	if path := transport.SocketPath(getenv); path != "" {
 		out = append(out, target{host: "localhost", dial: func(d time.Time) (net.Conn, error) {
+			if err := transport.CheckSocket(path); err != nil {
+				return nil, err
+			}
 			return (&net.Dialer{Deadline: d}).Dial("unix", path)
 		}})
 	}

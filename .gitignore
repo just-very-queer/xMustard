@@ -119,4 +119,4 @@ docs/research/papers/*.pdf
 api-go/bin/
 
 # built static hook client for the Claude Code plugin (integrations/claude-code/README.md)
-integrations/claude-code/bin/
+integrations/claude-code/hooks/bin/

@@ -556,22 +556,38 @@ through the static client `xmustard-hook` over a Unix socket (a command hook).
   never registers a repository). The workspace then passes the checks a workspace path
   gets, in order and failing closed: a safe id, served by this deployment, in the
   token's scope. A refusal answers empty and is audited.
-- **The socket.** It lives in a directory only its owner can enter (created 0700; a
-  directory others can use is refused), is created 0600, serves only `/api/hooks/`
-  through the full middleware stack, and is never taken over from a live daemon.
+- **The socket.** Both sides check it in order, failing closed
+  (`transport.CheckDir`, `transport.CheckSocket`): its directory must be a directory
+  (not a symlink) owned by the user, with no group or other permission bits, and the
+  socket must be a socket owned by the user. Another local user can create the
+  default directory under a shared temp dir first (`/tmp/xmustard-<uid>` when
+  `XDG_RUNTIME_DIR` is unset); the daemon then does not listen there, and the client
+  does not dial it, so its token and event go to the TCP address instead. The daemon
+  creates the directory 0700 and the socket 0600, replaces only a stale socket the user
+  owns (never another daemon's live socket, another user's file or a file that is not
+  a socket), and serves only `/api/hooks/` there through the full middleware stack.
   `XMUSTARD_HOOK_SOCKET=off` disables it.
 - **Captures.** A PostToolUse or PostToolUseFailure body is captured through the
   streaming redactor before anything is retained, bound to the calling principal, and
   recorded `captured_identity=unknown` (the producing repository state was not
   observed). The session and subagent ids are recorded for attribution only.
 - **What a hook may do.** An answer adds context, replaces a native output with its
-  shape-matched reduction, or says nothing. It never allows, denies or rewrites a tool
-  call, and every failure (a missing daemon, a timeout past the ~200 ms budget, an
-  error) is an empty 200, so Claude Code's own behavior is unchanged. WorktreeCreate is
-  not hooked: its hook replaces git worktree creation. WorktreeRemove goes through the
-  client, which always exits 0, because a failing WorktreeRemove hook blocks removal.
+  shape-matched reduction, sets the FileChanged watch list, or says nothing. It never
+  allows, denies or rewrites a tool call. A timeout past the ~200 ms budget, a body the
+  service cannot read and a workspace out of scope are empty 200s, so Claude Code's own
+  behavior is unchanged. Authentication stays fail-closed: a missing, expired, revoked
+  or reader-only token gets 401 or 403, which Claude Code shows as a non-blocking hook
+  error on every matched call (the static client prints nothing for it). A missing
+  daemon is a non-blocking error for an http hook and silence for the client.
+  WorktreeCreate is not hooked: its hook replaces git worktree creation. WorktreeRemove
+  goes through the client, which always exits 0, because a failing WorktreeRemove hook
+  blocks removal, and acts only on a worktree at or under the caller's workspace root.
 - **Pushed memory** follows the pushed-surface policy above; index hits are framed as
-  data and scanned. No hook starts a process: Rust work runs only on a resident worker
+  data and scanned. Each context (the main thread, and each subagent by its
+  `agent_id`) gets a memory at most once until compaction, and a memory counts as
+  given only when the answer that carries its frame, or the note that withheld it, was
+  written. A memory that does not fit in the ~10,000-character context left is counted
+  in the withheld note as `too_large`, with the `recall` call that shows it. No hook starts a process: Rust work runs only on a resident worker
   that is already running.
 
 ## Health endpoint
@@ -606,7 +622,7 @@ whether `XMUSTARD_READ_ONLY=1` still serves the route.
 | `POST /api/auth/tokens/{id}/rotate` | core | admin | served |  | replaces the secret; the old one stops working |
 | `GET /api/auth/whoami` | core | reader | served |  | caller principal, roles and usable tools |
 | `ANY /api/health` | core | reader | served |  | public liveness and limits; the budget block needs an operator token while auth is enforced |
-| `POST /api/hooks/claude/CwdChanged` | core | proposer | served |  | hook: watchPaths of the new directory's workspace |
+| `POST /api/hooks/claude/CwdChanged` | core | proposer | served |  | hook: watchPaths of the new directory's workspace ([] clears the list) |
 | `POST /api/hooks/claude/FileChanged` | core | proposer | served |  | hook: feeds the watcher's pending batch; drops the cached repository identity |
 | `POST /api/hooks/claude/PostCompact` | core | proposer | served |  | hook: queued; answered at once |
 | `POST /api/hooks/claude/PostToolBatch` | core | proposer | served |  | hook: batch search nudge |
@@ -617,7 +633,7 @@ whether `XMUSTARD_READ_ONLY=1` still serves the route.
 | `POST /api/hooks/claude/SessionEnd` | core | proposer | served |  | hook: queued; answered at once (1.5 s SessionEnd budget) |
 | `POST /api/hooks/claude/SessionStart` | core | proposer | served |  | hook: ground's spawn-free part and core-tier memories as context; watchPaths |
 | `POST /api/hooks/claude/Stop` | core | proposer | served |  | hook: queued; answered at once |
-| `POST /api/hooks/claude/SubagentStart` | core | proposer | served |  | hook: the same context for a subagent; records its id for attribution |
+| `POST /api/hooks/claude/SubagentStart` | core | proposer | served |  | hook: the same context for a subagent, which has steering state of its own |
 | `POST /api/hooks/claude/SubagentStop` | core | proposer | served |  | hook: queued; answered at once |
 | `POST /api/hooks/claude/UserPromptSubmit` | core | proposer | served |  | hook: memories a prompt keyword triggers |
 | `POST /api/hooks/claude/WorktreeRemove` | core | proposer | served |  | hook: forgets the worktree's cached identity |

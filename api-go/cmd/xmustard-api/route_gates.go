@@ -110,13 +110,13 @@ var routeGateTable = map[string]routeGate{
 
 	// --- core: Claude Code hook service (hooks_routes.go, WS-23) ---
 	"POST /api/hooks/claude/SessionStart":       hookGate("ground's spawn-free part and core-tier memories as context; watchPaths"),
-	"POST /api/hooks/claude/SubagentStart":      hookGate("the same context for a subagent; records its id for attribution"),
+	"POST /api/hooks/claude/SubagentStart":      hookGate("the same context for a subagent, which has steering state of its own"),
 	"POST /api/hooks/claude/UserPromptSubmit":   hookGate("memories a prompt keyword triggers"),
 	"POST /api/hooks/claude/PreToolUse":         hookGate("index hits and memories for a search pattern or a file"),
 	"POST /api/hooks/claude/PostToolUse":        hookGate("captures the caller's own tool output; shape-matched updatedToolOutput"),
 	"POST /api/hooks/claude/PostToolUseFailure": hookGate("captures the caller's own failed tool output for the run outcome"),
 	"POST /api/hooks/claude/PostToolBatch":      hookGate("batch search nudge"),
-	"POST /api/hooks/claude/CwdChanged":         hookGate("watchPaths of the new directory's workspace"),
+	"POST /api/hooks/claude/CwdChanged":         hookGate("watchPaths of the new directory's workspace ([] clears the list)"),
 	"POST /api/hooks/claude/FileChanged":        hookGate("feeds the watcher's pending batch; drops the cached repository identity"),
 	"POST /api/hooks/claude/WorktreeRemove":     hookGate("forgets the worktree's cached identity"),
 	"POST /api/hooks/claude/PreCompact":         hookGate("queued; answered at once"),

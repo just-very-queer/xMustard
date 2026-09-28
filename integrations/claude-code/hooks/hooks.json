@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/bin/xmustard-hook",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/bin/xmustard-hook",
             "args": [
               "claude",
               "SessionStart"
@@ -194,7 +194,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/bin/xmustard-hook",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/bin/xmustard-hook",
             "args": [
               "claude",
               "WorktreeRemove"

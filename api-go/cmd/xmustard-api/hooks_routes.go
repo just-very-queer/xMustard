@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"net"
 	"net/http"
@@ -45,17 +46,24 @@ import (
 //   - SessionStart and SubagentStart inject ground's spawn-free part and the core-tier
 //     memories; UserPromptSubmit the memories a prompt keyword triggers.
 //   - FileChanged feeds the dirty set (the resident watcher's pending batch, WS-15);
-//     CwdChanged and SessionStart return watchPaths.
+//     SessionStart returns watchPaths, and CwdChanged always does ([] clears the list).
 //   - Stop, SubagentStop, SessionEnd, PreCompact and PostCompact are recorded on a
 //     queue and answered at once (SessionEnd hooks share a 1.5 s budget).
 //
 // Every pushed memory passes the WS-56 injection policy for its surface (hook: human
-// approval, no quarantine, no instruction pattern) and arrives framed as data. The
-// service fails open: an answer not ready within the hook budget (~200 ms) is an empty
-// 200, and so is any error, so the client keeps its original output. No hook starts a
-// process: Rust work runs only on a resident worker that is already running, and the
-// repository identity is never sampled (a hook-delivered observation is
-// captured_identity=unknown).
+// approval, no quarantine, no instruction pattern) and arrives framed as data. Steering
+// state (what was pushed, nudges, edit baselines) is per context: a subagent's hooks
+// carry the parent's session_id and their own agent_id, and the subagent starts with a
+// fresh context, so it has state of its own (hooks.SessionKey). A memory counts as
+// pushed into a context only once the answer that carries it has been written.
+//
+// The service fails open: an answer not ready within the hook budget (~200 ms) is an
+// empty 200, and so is a body it cannot read or a workspace out of scope, so the client
+// keeps its original output. Authentication stays fail-closed: a missing, expired or
+// reader-only token gets the middleware's 401 or 403, which Claude Code shows as a
+// non-blocking hook error. No hook starts a process: Rust work runs only on a resident
+// worker that is already running, and the repository identity is never sampled (a
+// hook-delivered observation is captured_identity=unknown).
 //
 // Route gates: every event is its own route with a row in routeGateTable (hookGate): core,
 // the proposer role (a hook runs for an agent session; no non-GET route grants reader),
@@ -118,20 +126,23 @@ type hookCall struct {
 	ev     hooks.Event
 	in     hooks.Input
 	body   []byte
-	caller string // principal id; "" in open mode
-	key    string // session key (hooks.Key)
+	caller string           // principal id; "" in open mode
+	key    hooks.SessionKey // the context's steering state
 	ws     workspaceops.ResolvedWorkspace
 	bound  bool // ws was resolved and passed the scope checks
 }
 
-// hookResult is what a handler produced. after runs once the answer has been written
-// (recording an outcome, say), so it never delays the client. It gets the request with
-// a context of its own, bounded by hookAfterTimeout: the client may close the
-// connection as soon as it has read the answer, which cancels the request's context.
+// hookResult is what a handler produced. offered maps each memory a push considered to
+// the text whose presence in the answer marks it seen in this context (push). after
+// runs once the answer has been written (recording an outcome, say), so it never
+// delays the client. It gets the request with a context of its own, bounded by
+// hookAfterTimeout: the client may close the connection as soon as it has read the
+// answer, which cancels the request's context.
 type hookResult struct {
 	context string
 	updated json.RawMessage
 	watch   []string
+	offered map[string]string
 	after   func(*http.Request)
 }
 
@@ -154,18 +165,29 @@ var hookHandlers = map[string]func(*hookServer, context.Context, *hookCall) hook
 
 // hookQueued is an Enqueue-mode event waiting for the consumer.
 type hookQueued struct {
-	event, key, agent string
+	event string
+	key   hooks.SessionKey
 }
 
-// hookQueueEffects is what the consumer does with each Enqueue-mode event. Stop and
-// PreCompact only mark the queue contract today: WS-33 adds the session ledger and
-// the compaction snapshot behind them.
-var hookQueueEffects = map[string]func(*hooks.Sessions, hookQueued){
-	"SessionEnd":   func(s *hooks.Sessions, q hookQueued) { s.End(q.key) },
-	"SubagentStop": func(s *hooks.Sessions, q hookQueued) { s.AgentStopped(q.key, q.agent) },
-	"PostCompact":  func(s *hooks.Sessions, q hookQueued) { s.Compacted(q.key) },
-	"PreCompact":   func(*hooks.Sessions, hookQueued) {},
-	"Stop":         func(*hooks.Sessions, hookQueued) {},
+// hookQueueEffects is what the consumer does with each Enqueue-mode event: SessionEnd
+// drops the session's contexts, SubagentStop the subagent's, PostCompact forgets what
+// was pushed into the compacted context. Stop and PreCompact only mark the queue
+// contract today: WS-33 adds the session ledger and the compaction snapshot behind them.
+var hookQueueEffects = map[string]func(*hooks.Sessions, hooks.SessionKey){
+	"SessionEnd":   (*hooks.Sessions).End,
+	"SubagentStop": endSubagent,
+	"PostCompact":  (*hooks.Sessions).Compacted,
+	"PreCompact":   func(*hooks.Sessions, hooks.SessionKey) {},
+	"Stop":         func(*hooks.Sessions, hooks.SessionKey) {},
+}
+
+// endSubagent drops a subagent's context. Claude Code also fires SubagentStop for its
+// own internal agents; one without an agent id must not end the main thread's state.
+func endSubagent(s *hooks.Sessions, key hooks.SessionKey) {
+	if key.Agent == "" {
+		return
+	}
+	s.End(key)
 }
 
 func newHookServer(store *evidence.Store) *hookServer {
@@ -199,7 +221,7 @@ func (s *hookServer) handle(ev hooks.Event) http.HandlerFunc {
 			return
 		}
 		caller, _ := principalScope(r)
-		call := &hookCall{r: r, ev: ev, in: in, body: body, caller: caller, key: hooks.Key(caller, in.SessionID)}
+		call := &hookCall{r: r, ev: ev, in: in, body: body, caller: caller, key: hooks.Key(caller, in.SessionID, in.AgentID)}
 		if ev.Mode == hooks.Enqueue {
 			s.enqueue(call)
 			writeHookAnswer(w, nil)
@@ -208,8 +230,9 @@ func (s *hookServer) handle(ev hooks.Event) http.HandlerFunc {
 		ctx, cancel := context.WithTimeout(budget.WithoutHeavyWait(r.Context()), hookBudget())
 		defer cancel()
 		type answered struct {
-			out   *hooks.Output
-			after func(*http.Request)
+			out       *hooks.Output
+			delivered []string
+			after     func(*http.Request)
 		}
 		done := make(chan answered, 1)
 		go func() {
@@ -221,13 +244,15 @@ func (s *hookServer) handle(ev hooks.Event) http.HandlerFunc {
 				}
 				done <- a
 			}()
-			a.out, a.after = s.answer(ctx, call)
+			a.out, a.delivered, a.after = s.answer(ctx, call)
 		}()
 		var a answered
 		select {
 		case a = <-done:
-			writeHookAnswer(w, a.out)
-		case <-ctx.Done():
+			if writeHookAnswer(w, a.out) == nil {
+				s.sessions.MarkInjected(call.key, a.delivered)
+			}
+		case <-ctx.Done(): // nothing is marked pushed: the answer is empty
 			hookStats.timedOut.Add(1)
 			s.sessions.NoteBusy(call.key)
 			writeHookAnswer(w, nil)
@@ -242,22 +267,39 @@ func (s *hookServer) handle(ev hooks.Event) http.HandlerFunc {
 	}
 }
 
-// answer runs the event's handler and builds its output; nil when the budget ran out.
-func (s *hookServer) answer(ctx context.Context, c *hookCall) (*hooks.Output, func(*http.Request)) {
+// answer runs the event's handler and builds its output (nil when the budget ran out)
+// and the memory ids the output delivers.
+func (s *hookServer) answer(ctx context.Context, c *hookCall) (*hooks.Output, []string, func(*http.Request)) {
 	c.bound = s.resolve(c)
 	res := hookHandlers[c.ev.Name](s, ctx, c)
 	if ctx.Err() != nil {
-		return nil, res.after
+		return nil, nil, res.after
 	}
 	if c.ev.Context {
 		res.context = hooks.Compose(res.context, s.sessions.BusyNote(c.key))
 	}
 	hookStats.answered.Add(1)
-	return hooks.Answer(c.ev, res.context, res.updated, res.watch), res.after
+	out := hooks.Answer(c.ev, res.context, res.updated, res.watch)
+	return out, delivered(out, res.offered), res.after
+}
+
+// delivered lists the offered memory ids whose text the answer carries: a frame or a
+// note that was composed out, or cut by the context cap, delivers nothing.
+func delivered(out *hooks.Output, offered map[string]string) []string {
+	if out == nil {
+		return nil
+	}
+	var ids []string
+	for id, text := range offered {
+		if text != "" && strings.Contains(out.HookSpecificOutput.AdditionalContext, text) {
+			ids = append(ids, id)
+		}
+	}
+	return ids
 }
 
 // writeHookAnswer writes an answer: 200 with an empty body when there is nothing to say.
-func writeHookAnswer(w http.ResponseWriter, out *hooks.Output) {
+func writeHookAnswer(w http.ResponseWriter, out *hooks.Output) error {
 	var body []byte
 	if out != nil {
 		body, _ = json.Marshal(out)
@@ -265,10 +307,11 @@ func writeHookAnswer(w http.ResponseWriter, out *hooks.Output) {
 	}
 	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(body)
+	_, err := w.Write(body)
 	if f, ok := w.(http.Flusher); ok {
 		f.Flush()
 	}
+	return err
 }
 
 // resolve binds the call to its workspace: the one the X-Xmustard-Workspace header
@@ -314,8 +357,9 @@ func (s *hookServer) sessionStart(ctx context.Context, c *hookCall) hookResult {
 	return s.grounding(ctx, c, true)
 }
 
+// subagentStart grounds a subagent: its hooks carry its agent_id, so it gets a
+// context of its own (hooks.SessionKey) and the core tier is pushed into it too.
 func (s *hookServer) subagentStart(ctx context.Context, c *hookCall) hookResult {
-	s.sessions.AgentStarted(c.key, c.in.AgentID, c.in.AgentType)
 	return s.grounding(ctx, c, false)
 }
 
@@ -327,15 +371,15 @@ func (s *hookServer) grounding(ctx context.Context, c *hookCall, watch bool) hoo
 		return hookResult{}
 	}
 	g := workspaceops.HookGrounding(ctx, dataDir(), c.ws.WorkspaceID, c.caller)
-	parts := []string{groundLine(c.ws, g)}
-	var res hookResult
+	res := hookResult{context: groundLine(c.ws, g)}
 	if idx, err := workspaceops.ReadHookMemoryIndex(ctx, dataDir(), c.ws.WorkspaceID); err == nil {
-		parts = append(parts, s.push(ctx, c, injection.SurfaceCore, idx.Core, nil, "recall")...)
+		var memory string
+		memory, res.offered = s.push(ctx, c, injection.SurfaceCore, idx.Core, nil, "recall", hooks.Room(res.context))
+		res.context = hooks.Compose(res.context, memory)
 		if watch {
 			res.watch = watchPaths(c.ws, idx.Anchors)
 		}
 	}
-	res.context = hooks.Compose(parts...)
 	return res
 }
 
@@ -360,7 +404,7 @@ func groundLine(ws workspaceops.ResolvedWorkspace, g *workspaceops.SessionGround
 }
 
 // userPrompt pushes the memories a keyword of the prompt triggers (tags
-// "trigger:<keyword>").
+// "trigger-<keyword>", workspaceops.TriggerTagPrefix).
 func (s *hookServer) userPrompt(ctx context.Context, c *hookCall) hookResult {
 	if !c.bound || strings.TrimSpace(c.in.Prompt) == "" {
 		return hookResult{}
@@ -370,12 +414,22 @@ func (s *hookServer) userPrompt(ctx context.Context, c *hookCall) hookResult {
 		return hookResult{}
 	}
 	keywords, ids := triggered(idx.Triggers, c.in.Prompt)
-	pushed := s.push(ctx, c, injection.SurfaceHook, ids, nil, `recall(tags=["trigger:<keyword>"])`)
-	if strings.TrimSpace(strings.Join(pushed, "")) == "" {
+	head := "[xmustard] memory triggered by keywords in the prompt: " + strings.Join(keywords, ", ")
+	memory, offered := s.push(ctx, c, injection.SurfaceHook, ids, nil, triggerRecall(keywords), hooks.Room(head))
+	if memory == "" {
 		return hookResult{}
 	}
-	head := "[xmustard] memory triggered by keywords in the prompt: " + strings.Join(keywords, ", ")
-	return hookResult{context: hooks.Compose(append([]string{head}, pushed...)...)}
+	return hookResult{context: hooks.Compose(head, memory), offered: offered}
+}
+
+// triggerRecall is the recall call that lists the memories these keywords trigger
+// (recall's tags match any of the tags given).
+func triggerRecall(keywords []string) string {
+	tags := make([]string, len(keywords))
+	for i, k := range keywords {
+		tags[i] = strconv.Quote(workspaceops.TriggerTagPrefix + k)
+	}
+	return "recall(tags=[" + strings.Join(tags, ", ") + "])"
 }
 
 // triggered returns the trigger keywords a prompt names, in the order it names them,
@@ -430,9 +484,9 @@ func (s *hookServer) searchContext(ctx context.Context, c *hookCall) hookResult 
 	var hits json.RawMessage
 	var wg sync.WaitGroup
 	wg.Go(func() { hits, _ = hookSearch(ctx, c.ws, q, hookSearchHits) })
-	parts := s.memoryContext(ctx, c, q, nil)
+	memory, offered := s.memoryContext(ctx, c, q, nil)
 	wg.Wait()
-	return hookResult{context: hooks.Compose(append(parts, hooks.RenderHits(q, hits, hookSearchHits), nudge)...)}
+	return hookResult{context: hooks.Compose(memory, hooks.RenderHits(q, hits, hookSearchHits), nudge), offered: offered}
 }
 
 // fileContext is a Read or Edit's context: the memories bound to the file. Before an
@@ -446,16 +500,17 @@ func (s *hookServer) fileContext(ctx context.Context, c *hookCall) hookResult {
 	if hooks.ClassOf(c.in.ToolName) == hooks.ToolEdit {
 		wg.Go(func() { s.baseline(ctx, c, rel) })
 	}
-	parts := s.memoryContext(ctx, c, "", []string{rel})
+	memory, offered := s.memoryContext(ctx, c, "", []string{rel})
 	wg.Wait()
-	return hookResult{context: hooks.Compose(parts...)}
+	return hookResult{context: memory, offered: offered}
 }
 
-// memoryContext pushes the served memories recall ranks for a pattern or a path.
-func (s *hookServer) memoryContext(ctx context.Context, c *hookCall, query string, paths []string) []string {
+// memoryContext pushes the served memories recall ranks for a pattern or a path; they
+// come first in a pre-hook's context.
+func (s *hookServer) memoryContext(ctx context.Context, c *hookCall, query string, paths []string) (string, map[string]string) {
 	cands, err := workspaceops.HookMemories(ctx, dataDir(), c.ws.WorkspaceID, c.caller, query, paths, hookMemoryLimit)
 	if err != nil || len(cands) == 0 {
-		return nil
+		return "", nil
 	}
 	ids := make([]string, len(cands))
 	stale := map[string][]string{}
@@ -469,36 +524,61 @@ func (s *hookServer) memoryContext(ctx context.Context, c *hookCall, query strin
 	if len(paths) > 0 {
 		recall = fmt.Sprintf("recall(paths=[%q])", paths[0])
 	}
-	return s.push(ctx, c, injection.SurfaceHook, ids, stale, recall)
+	return s.push(ctx, c, injection.SurfaceHook, ids, stale, recall, hooks.MaxContextChars)
 }
 
+// hookNoteRoom is the room a push keeps for its withheld note.
+const hookNoteRoom = 512
+
+// hookTooLarge is the withheld reason of an admitted memory that did not fit in the
+// context left in its answer.
+const hookTooLarge = "too_large"
+
 // push admits candidate memories through the injection policy of a pushed surface
-// (workspaceops.AdmitMemory) and returns what the context carries: the admitted
-// memories framed as data, the stale labels of the admitted ones, and a note on the
-// withheld ones. A memory is considered once per session (until compaction); an
-// admission error pushes nothing (fail closed).
-func (s *hookServer) push(ctx context.Context, c *hookCall, surface injection.Surface, ids []string, stale map[string][]string, recall string) []string {
+// (workspaceops.AdmitMemory) and renders, within room characters, the injection notice
+// and each admitted memory framed as data (a stale one with its label), then one note
+// counting the withheld ones, by policy reason or too_large, with the recall call that
+// shows them. A candidate is considered once per context (until compaction): offered
+// maps each one to the text whose presence in the answer written marks it seen, its
+// frame or the note, so a memory whose frame or note never reached the client is
+// considered again. An admission error pushes nothing (fail closed).
+func (s *hookServer) push(ctx context.Context, c *hookCall, surface injection.Surface, ids []string, stale map[string][]string, recall string, room int) (string, map[string]string) {
 	ids = s.sessions.Unseen(c.key, ids)
 	ids = ids[:min(len(ids), hookMaxCandidates)]
 	if len(ids) == 0 {
-		return nil
+		return "", nil
 	}
 	m, err := workspaceops.AdmitMemory(ctx, dataDir(), c.ws.WorkspaceID, surface, ids)
 	if err != nil {
-		return nil
+		return "", nil
 	}
-	s.sessions.MarkInjected(c.key, ids)
-	staleAdmitted := map[string][]string{}
+	offered := map[string]string{}
+	var frames, reasons, noted []string
+	left := room - hookNoteRoom - hooks.Size(injection.Notice)
 	for _, a := range m.Admitted {
-		if p, ok := stale[a.ID]; ok {
-			staleAdmitted[a.ID] = p
+		frame := injection.Frame(a.Block())
+		if paths, ok := stale[a.ID]; ok {
+			frame += "\n" + hooks.StaleNote(map[string][]string{a.ID: paths})
 		}
+		if size := hooks.Size(frame); size <= left {
+			left -= size
+			frames = append(frames, frame)
+			offered[a.ID] = frame
+			continue
+		}
+		reasons, noted = append(reasons, hookTooLarge), append(noted, a.ID)
 	}
-	reasons := make([]string, len(m.Withheld))
-	for i, w := range m.Withheld {
-		reasons[i] = w.Reason
+	for _, w := range m.Withheld {
+		reasons, noted = append(reasons, w.Reason), append(noted, w.ID)
 	}
-	return []string{m.Text, hooks.StaleNote(staleAdmitted), hooks.WithheldNote(reasons, recall)}
+	note := hooks.WithheldNote(reasons, recall)
+	for _, id := range noted {
+		offered[id] = note
+	}
+	if len(frames) > 0 {
+		frames = append([]string{injection.Notice}, frames...)
+	}
+	return hooks.ComposeWithin(room, append(frames, note)...), offered
 }
 
 // baseline keeps a file's syntax errors before an edit. A file that does not exist
@@ -664,16 +744,19 @@ func (s *hookServer) postToolBatch(_ context.Context, c *hookCall) hookResult {
 
 // --- change events ---
 
-// cwdChanged returns the watch list of the workspace the new directory is in.
+// cwdChanged replaces Claude Code's dynamic watch list with the files memory is
+// anchored to in the new directory's workspace. The list is always sent: an empty one
+// clears it, so a directory outside any workspace the caller may use (or an unreadable
+// memory store) leaves nothing of the previous workspace watched.
 func (s *hookServer) cwdChanged(ctx context.Context, c *hookCall) hookResult {
+	res := hookResult{watch: []string{}}
 	if !c.bound {
-		return hookResult{}
+		return res
 	}
-	idx, err := workspaceops.ReadHookMemoryIndex(ctx, dataDir(), c.ws.WorkspaceID)
-	if err != nil {
-		return hookResult{}
+	if idx, err := workspaceops.ReadHookMemoryIndex(ctx, dataDir(), c.ws.WorkspaceID); err == nil {
+		res.watch = append(res.watch, watchPaths(c.ws, idx.Anchors)...)
 	}
-	return hookResult{watch: watchPaths(c.ws, idx.Anchors)}
+	return res
 }
 
 // fileChanged feeds the dirty set: the watcher's pending batch (NoteChangedPaths).
@@ -687,10 +770,17 @@ func (s *hookServer) fileChanged(ctx context.Context, c *hookCall) hookResult {
 	return hookResult{}
 }
 
-// worktreeRemove forgets a removed worktree's cached identity.
+// worktreeRemove forgets a removed worktree's cached identity, when the worktree is
+// the caller's workspace root or lies under it (Claude Code's worktrees live under
+// .claude/worktrees/ of the repository): like every handler, it acts only inside the
+// workspace that passed the scope checks.
 func (s *hookServer) worktreeRemove(_ context.Context, c *hookCall) hookResult {
-	if p := c.in.WorktreePath; filepath.IsAbs(p) {
-		workspaceops.ForgetRoot(filepath.Clean(p))
+	p := filepath.Clean(c.in.WorktreePath)
+	if !c.bound || !filepath.IsAbs(p) {
+		return hookResult{}
+	}
+	if p == filepath.Clean(c.ws.Root) || workspaceops.RelativeToRoot(c.ws, p) != "" {
+		workspaceops.ForgetRoot(p)
 	}
 	return hookResult{}
 }
@@ -718,7 +808,7 @@ func watchPaths(ws workspaceops.ResolvedWorkspace, anchors []string) []string {
 
 func (s *hookServer) enqueue(c *hookCall) {
 	select {
-	case s.queue <- hookQueued{event: c.ev.Name, key: c.key, agent: c.in.AgentID}:
+	case s.queue <- hookQueued{event: c.ev.Name, key: c.key}:
 		hookStats.enqueued.Add(1)
 	default:
 		hookStats.dropped.Add(1)
@@ -728,7 +818,7 @@ func (s *hookServer) enqueue(c *hookCall) {
 func (s *hookServer) drain() {
 	for q := range s.queue {
 		if f := hookQueueEffects[q.event]; f != nil {
-			f(s.sessions, q)
+			f(s.sessions, q.key)
 		}
 	}
 }
@@ -757,25 +847,35 @@ func serveHookSocket(h http.Handler) {
 	}
 }
 
-// listenHookSocket listens on path in a directory only this user can enter. A socket
-// another live daemon serves is left alone; a stale one is replaced.
+// listenHookSocket listens on path in a directory only this user owns and can enter
+// (transport.CheckDir, the check the client makes before it dials). Whatever already
+// sits at path is replaced only when it is a stale socket this user owns: a socket
+// another live daemon serves, another user's file and a file that is not a socket are
+// left alone, and the socket is not served.
 func listenHookSocket(path string) (net.Listener, error) {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
-	fi, err := os.Lstat(dir)
-	if err != nil {
+	if err := transport.CheckDir(dir); err != nil {
 		return nil, err
 	}
-	if !fi.IsDir() || fi.Mode().Perm()&0o077 != 0 {
-		return nil, fmt.Errorf("directory %s must be a directory only its owner can use (mode 0700)", dir)
+	switch _, err := os.Lstat(path); {
+	case errors.Is(err, fs.ErrNotExist):
+	case err != nil:
+		return nil, err
+	default:
+		if err := transport.CheckSocket(path); err != nil {
+			return nil, fmt.Errorf("not replacing %s: %w", path, err)
+		}
+		if conn, err := net.DialTimeout("unix", path, 100*time.Millisecond); err == nil {
+			_ = conn.Close()
+			return nil, errors.New("another daemon serves it")
+		}
+		if err := os.Remove(path); err != nil {
+			return nil, err
+		}
 	}
-	if conn, err := net.DialTimeout("unix", path, 100*time.Millisecond); err == nil {
-		_ = conn.Close()
-		return nil, errors.New("another daemon serves it")
-	}
-	_ = os.Remove(path)
 	ln, err := net.Listen("unix", path)
 	if err != nil {
 		return nil, err

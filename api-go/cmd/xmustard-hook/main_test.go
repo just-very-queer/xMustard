@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -91,6 +92,53 @@ func TestFallsBackToTCPWhenNoSocketListens(t *testing.T) {
 		env(map[string]string{transport.SocketEnv: filepath.Join(t.TempDir(), "none.sock"), "XMUSTARD_API_BASE": "http://" + ln.Addr().String()}))
 	if out.String() != `{"ok":true}` {
 		t.Fatalf("stdout %q", out.String())
+	}
+}
+
+// A socket in a directory other users can enter (another user may have made the
+// default directory first) or a path that is not a socket is never dialed: the token
+// and the event go to the TCP address instead, and the socket's answer is never read.
+func TestSkipsASocketThatIsNotPrivate(t *testing.T) {
+	var dialed atomic.Int64
+	injected := func(w http.ResponseWriter, r *http.Request) {
+		dialed.Add(1)
+		io.WriteString(w, `{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"INJECTED"}}`)
+	}
+	open := serveUnix(t, injected)
+	if err := os.Chmod(filepath.Dir(open), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	notSocket := filepath.Join(filepath.Dir(serveUnix(t, injected)), "file.sock")
+	if err := os.WriteFile(notSocket, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var auth atomic.Value
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth.Store(r.Header.Get("Authorization"))
+		io.WriteString(w, `{"via":"tcp"}`)
+	})}
+	go srv.Serve(ln)
+	defer srv.Close()
+	for _, sock := range []string{open, notSocket} {
+		var out bytes.Buffer
+		run([]string{"claude", "SessionStart"}, strings.NewReader(`{"session_id":"s"}`), &out, env(map[string]string{
+			transport.SocketEnv: sock, "XMUSTARD_API_TOKEN": "secret-token-123", "XMUSTARD_API_BASE": "http://" + ln.Addr().String()}))
+		if out.String() != `{"via":"tcp"}` || auth.Load() != "Bearer secret-token-123" {
+			t.Fatalf("%s: stdout %q, tcp auth %v", sock, out.String(), auth.Load())
+		}
+	}
+	if n := dialed.Load(); n != 0 {
+		t.Fatalf("the untrusted socket was sent %d request(s)", n)
+	}
+	if transport.CheckSocket(open) == nil || transport.CheckDir(filepath.Dir(open)) == nil {
+		t.Fatal("an open directory passed the check")
+	}
+	if err := transport.CheckSocket(serveUnix(t, injected)); err != nil {
+		t.Fatalf("a private socket failed the check: %v", err)
 	}
 }
 

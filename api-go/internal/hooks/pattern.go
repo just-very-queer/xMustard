@@ -8,10 +8,12 @@ import (
 
 // Pattern extraction (PAR-HAR-02): what a native search tool call looks for, as a query
 // the index and memory can answer. Grep and Glob carry the pattern in their input; a
-// Bash command is parsed for an rg or grep invocation, whose pattern is the first
-// non-flag argument of at least minPatternToken characters. Flags that take a value
-// skip that value too, so `rg -g '*.go' -A 3 handler` looks for "handler", not
-// "*.go" or "3". `-e`/`--regexp` names the pattern explicitly.
+// Bash command is parsed for an rg or grep invocation, whose pattern is its first
+// non-flag argument, whatever its length (the arguments after it are paths). Flags
+// that take a value skip that value too, so `rg -g '*.go' -A 3 handler` looks for
+// "handler", not "*.go" or "3". `-e`/`--regexp` names the pattern explicitly. A
+// pattern with no word of at least minPatternToken characters gives no query:
+// `grep -n id src/models.py` looks for nothing, not for "src models".
 
 // minPatternToken is the shortest argument taken as a pattern.
 const minPatternToken = 3
@@ -103,7 +105,10 @@ func (s searcher) pattern(args []string) string {
 		name, value, inline := strings.Cut(a, "=")
 		switch {
 		case a == "--":
-			return firstLong(args[i+1:])
+			if i+1 < len(args) {
+				return args[i+1]
+			}
+			return ""
 		case s.patternFlags[name] && inline:
 			return value
 		case s.patternFlags[a]:
@@ -116,30 +121,24 @@ func (s searcher) pattern(args []string) string {
 			i++ // the flag's value is not the pattern
 		case strings.HasPrefix(a, "-") && len(a) > 1:
 			// a boolean flag, or a cluster such as -rn
-		case len([]rune(a)) >= minPatternToken:
-			return a
+		default:
+			return a // the first positional is the pattern; the rest are paths
 		}
 	}
 	return ""
 }
 
-func firstLong(args []string) string {
-	for _, a := range args {
-		if len([]rune(a)) >= minPatternToken {
-			return a
-		}
-	}
-	return ""
-}
+// commandPrefixes run the command that follows them.
+var commandPrefixes = set("env", "command", "exec", "time", "nice")
 
-// skipAssignments drops leading VAR=value words and the env and command prefixes.
+// skipAssignments drops leading VAR=value words and the command prefixes.
 func skipAssignments(argv []string) []string {
 	for len(argv) > 0 {
 		a := argv[0]
 		name, _, isAssign := strings.Cut(a, "=")
 		switch {
 		case isAssign && name != "" && !strings.ContainsAny(name, "/-"):
-		case a == "env" || a == "command" || a == "exec" || a == "time" || a == "nice":
+		case commandPrefixes[a]:
 		default:
 			return argv
 		}

@@ -23,7 +23,10 @@ func TestShellSearchPatternSkipsValueTakingFlags(t *testing.T) {
 		{`cd src && FOO=1 rg -i "session token" | head -20`, "session token"},
 		{`cat x.log | grep -v DEBUG`, "DEBUG"},
 		{`env LC_ALL=C grep -c needle file.txt`, "needle"},
-		{`rg ab`, ""},             // shorter than three characters
+		{`rg ab`, "ab"},                    // short: SearchQuery makes no query of it
+		{`grep -n id src/models.py`, "id"}, // the operand is a path, never the pattern
+		{`rg -w db internal/storage/pool.go`, "db"},
+		{`rg -- id src/app.py`, "id"},
 		{`ls -la && echo hi`, ""}, // no searcher
 		{`echo "rg notapattern"`, ""},
 		{`grep -e`, ""},
@@ -47,6 +50,8 @@ func TestSearchQueryPerTool(t *testing.T) {
 		{"Glob", ToolInput{Pattern: "**/*.go"}, ""},
 		{"Bash", ToolInput{Command: `rg -n "retry_budget" api-go`}, "retry_budget"},
 		{"Bash", ToolInput{Command: `go test ./...`}, ""},
+		{"Bash", ToolInput{Command: `grep -n id src/models.py`}, ""},
+		{"Bash", ToolInput{Command: `rg -w db internal/storage/pool.go`}, ""},
 		{"Read", ToolInput{FilePath: "/x/y.go"}, ""},
 	}
 	for _, c := range cases {
@@ -82,7 +87,7 @@ func newTestSessions() (*Sessions, *clock) {
 	c := &clock{t: time.Unix(1_000_000, 0)}
 	return NewSessions(DefaultLimits, c.now), c
 }
-func burst(s *Sessions, key string, n int) (nudges int) {
+func burst(s *Sessions, key SessionKey, n int) (nudges int) {
 	for range n {
 		if s.NoteSearch(key) {
 			nudges++
@@ -93,7 +98,7 @@ func burst(s *Sessions, key string, n int) (nudges int) {
 
 func TestSteeringBurstNudgeHasACooldown(t *testing.T) {
 	s, c := newTestSessions()
-	k := Key("alice", "s1")
+	k := Key("alice", "s1", "")
 	if n := burst(s, k, DefaultLimits.BurstSearches-1); n != 0 {
 		t.Fatalf("nudged before the burst threshold")
 	}
@@ -109,7 +114,7 @@ func TestSteeringBurstNudgeHasACooldown(t *testing.T) {
 	}
 	// searches spread wider than the window never make a burst
 	c.advance(DefaultLimits.Cooldown + time.Second)
-	k2 := Key("alice", "s2")
+	k2 := Key("alice", "s2", "")
 	for range 10 {
 		c.advance(DefaultLimits.BurstWindow)
 		if s.NoteSearch(k2) {
@@ -117,7 +122,7 @@ func TestSteeringBurstNudgeHasACooldown(t *testing.T) {
 		}
 	}
 	// a batch shares the cooldown
-	k3 := Key("bob", "s1")
+	k3 := Key("bob", "s1", "")
 	if !s.NoteBatch(k3, DefaultLimits.BatchSearches) || s.NoteBatch(k3, 10) || burst(s, k3, 10) != 0 {
 		t.Fatal("batch nudge or its cooldown is wrong")
 	}
@@ -125,7 +130,7 @@ func TestSteeringBurstNudgeHasACooldown(t *testing.T) {
 
 func TestSteeringStateIsPerPrincipalAndSession(t *testing.T) {
 	s, _ := newTestSessions()
-	a, b := Key("alice", "same"), Key("mallory", "same")
+	a, b := Key("alice", "same", ""), Key("mallory", "same", "")
 	s.MarkInjected(a, []string{"m1", "m2"})
 	if got := s.Unseen(b, []string{"m1", "m3"}); !reflect.DeepEqual(got, []string{"m1", "m3"}) {
 		t.Fatalf("another principal's session state leaked: %v", got)
@@ -138,8 +143,8 @@ func TestSteeringStateIsPerPrincipalAndSession(t *testing.T) {
 		t.Fatal("compaction did not reset what was pushed")
 	}
 	// a keyless call keeps nothing
-	s.MarkInjected("", []string{"x"})
-	if got := s.Unseen("", []string{"x"}); len(got) != 1 || s.Len() != 2 {
+	s.MarkInjected(Key("alice", "", ""), []string{"x"})
+	if got := s.Unseen(Key("alice", "", ""), []string{"x"}); len(got) != 1 || s.Len() != 2 {
 		t.Fatalf("keyless state kept: %v, %d sessions", got, s.Len())
 	}
 	s.End(a)
@@ -150,7 +155,7 @@ func TestSteeringStateIsPerPrincipalAndSession(t *testing.T) {
 
 func TestSteeringGitAndBusyNotesAreThrottled(t *testing.T) {
 	s, c := newTestSessions()
-	k := Key("p", "s")
+	k := Key("p", "s", "")
 	if !s.GitNoticeDue(k) || s.GitNoticeDue(k) {
 		t.Fatal("git notice not throttled")
 	}
@@ -176,13 +181,16 @@ func TestSteeringGitAndBusyNotesAreThrottled(t *testing.T) {
 	}
 }
 
-func TestSteeringBaselinesAndAgents(t *testing.T) {
+func TestSteeringBaselines(t *testing.T) {
 	s, _ := newTestSessions()
-	k := Key("p", "s")
+	k := Key("p", "s", "")
 	if _, ok := s.TakeBaseline(k, "a.go"); ok {
 		t.Fatal("baseline without SetBaseline")
 	}
 	s.SetBaseline(k, "a.go", []string{"missing|}|h"})
+	if _, ok := s.TakeBaseline(Key("p", "s", "agent-1"), "a.go"); ok {
+		t.Fatal("a subagent took its parent's baseline")
+	}
 	if errs, ok := s.TakeBaseline(k, "a.go"); !ok || len(errs) != 1 {
 		t.Fatalf("baseline %v %v", errs, ok)
 	}
@@ -192,13 +200,34 @@ func TestSteeringBaselinesAndAgents(t *testing.T) {
 	for i := range maxBaselines + 5 {
 		s.SetBaseline(k, strings.Repeat("x", i+1), nil)
 	}
-	s.AgentStarted(k, "agent-1", "Explore")
-	if s.Agents(k) != 1 {
-		t.Fatal("agent not recorded")
+}
+
+// A subagent is a context of its own: what was pushed into the main thread is unseen
+// in a subagent of the same session, and the reverse. SubagentStop (End of the agent's
+// key) drops only that agent's state; SessionEnd (End of the main key) drops them all.
+func TestSteeringContextsArePerSubagent(t *testing.T) {
+	s, _ := newTestSessions()
+	parent, a1, a2 := Key("p", "s", ""), Key("p", "s", "a1"), Key("p", "s", "a2")
+	s.MarkInjected(parent, []string{"m1"})
+	s.MarkInjected(a1, []string{"m2"})
+	if got := s.Unseen(a1, []string{"m1", "m2"}); !reflect.DeepEqual(got, []string{"m1"}) {
+		t.Fatalf("subagent unseen = %v", got)
 	}
-	s.AgentStopped(k, "agent-1")
-	if s.Agents(k) != 0 {
-		t.Fatal("agent not forgotten")
+	if got := s.Unseen(parent, []string{"m1", "m2"}); !reflect.DeepEqual(got, []string{"m2"}) {
+		t.Fatalf("main unseen = %v", got)
+	}
+	s.MarkInjected(a2, []string{"m3"})
+	s.MarkInjected(Key("p", "other", ""), []string{"m1"})
+	s.End(a1)
+	if s.Len() != 3 {
+		t.Fatalf("SubagentStop left %d contexts, want 3", s.Len())
+	}
+	if got := s.Unseen(a1, []string{"m2"}); len(got) != 1 {
+		t.Fatal("SubagentStop kept the agent's state")
+	}
+	s.End(parent)
+	if s.Len() != 1 {
+		t.Fatalf("SessionEnd kept %d contexts, want only the other session's", s.Len())
 	}
 }
 
@@ -265,6 +294,9 @@ func TestComposeAndCapKeepTheClaudeCap(t *testing.T) {
 	if utf8.RuneCountInString(got) > MaxContextChars || !strings.HasPrefix(got, "first") || strings.Contains(got, "third") || !strings.HasSuffix(got, "last") {
 		t.Fatalf("compose kept %d chars", utf8.RuneCountInString(got))
 	}
+	if r := Room("abc", " ", "dé"); r != MaxContextChars-5-4 {
+		t.Fatalf("room %d", r)
+	}
 	capped := CapContext(strings.Repeat("é", MaxContextChars+50))
 	if utf8.RuneCountInString(capped) != MaxContextChars {
 		t.Fatalf("capped to %d runes", utf8.RuneCountInString(capped))
@@ -287,6 +319,14 @@ func TestAnswerCarriesOnlyWhatTheEventTakes(t *testing.T) {
 	b, _ = json.Marshal(Answer(ev("SessionStart"), "g", json.RawMessage(`{}`), []string{"/r/a.go"}))
 	if string(b) != `{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"g","watchPaths":["/r/a.go"]}}` {
 		t.Fatalf("SessionStart answer %s", b)
+	}
+	// an empty watch list is sent (it clears Claude Code's dynamic list); nil is not
+	b, _ = json.Marshal(Answer(ev("CwdChanged"), "", nil, []string{}))
+	if string(b) != `{"hookSpecificOutput":{"hookEventName":"CwdChanged","watchPaths":[]}}` {
+		t.Fatalf("CwdChanged clearing answer %s", b)
+	}
+	if Answer(ev("CwdChanged"), "", nil, nil) != nil || Answer(ev("SessionStart"), "", nil, nil) != nil {
+		t.Fatal("a nil watch list must say nothing")
 	}
 }
 
