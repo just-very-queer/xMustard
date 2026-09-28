@@ -31,9 +31,10 @@ func Note(tool string, flags []string) string {
 type Block struct {
 	// Kind names what the text is (memory, evidence).
 	Kind string
-	// ID, Trust and Flags label it: the memory id, its verification basis and the scan
-	// flags.
+	// ID, Rev, Trust and Flags label it: the memory id, the revision the text is (the
+	// served revision a push was approved on), its verification basis and the scan flags.
 	ID    string
+	Rev   string
 	Trust string
 	Flags []string
 	Text  string
@@ -51,7 +52,7 @@ func Frame(b Block) string {
 	sb.Grow(len(b.Text) + 96)
 	sb.WriteString("<" + FrameTag)
 	for _, a := range [...]struct{ name, value string }{
-		{"kind", b.Kind}, {"id", b.ID}, {"trust", b.Trust}, {"flags", strings.Join(b.Flags, ",")},
+		{"kind", b.Kind}, {"id", b.ID}, {"rev", b.Rev}, {"trust", b.Trust}, {"flags", strings.Join(b.Flags, ",")},
 	} {
 		if v := attrValue(a.value); v != "" {
 			sb.WriteString(" " + a.name + `="` + v + `"`)

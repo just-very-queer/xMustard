@@ -192,13 +192,13 @@ func TestRecallVerificationQueue(t *testing.T) {
 	}
 
 	var g groundingMemory
-	if unknown := g.build(dir, ws, "me"); len(unknown) != 0 {
+	if unknown := g.build(dir, ws, "me", groundMemoryOptions{since: noSince}); len(unknown) != 0 {
 		t.Fatal(unknown)
 	}
 	if *g.PendingForYou != 1 || g.MemoryPressure.PendingCount != 3 || g.MemoryPressure.CorePct != 0 || *g.StaleMemoryTotal != 1 {
 		t.Fatalf("ground pending_for_you=%d memory_pressure=%+v total=%d", *g.PendingForYou, *g.MemoryPressure, *g.StaleMemoryTotal)
 	}
-	if g.build(dir, ws, "author"); *g.PendingForYou != 1 {
+	if g.build(dir, ws, "author", groundMemoryOptions{since: noSince}); *g.PendingForYou != 1 {
 		t.Fatalf("author: pending_for_you=%d, want 1 (mine)", *g.PendingForYou)
 	}
 }
@@ -237,7 +237,7 @@ func TestAwaitingMeHonoursTheOwnerDistinctPolicy(t *testing.T) {
 		for caller, want := range map[string]int{"alice-2": tc.sibling, "bob": 1, "alice-1": 0} {
 			got := ids(recallWith(t, dir, ws, RecallRequest{Status: "awaiting_me", Caller: caller}))
 			var g groundingMemory
-			g.build(dir, ws, caller)
+			g.build(dir, ws, caller, groundMemoryOptions{since: noSince})
 			if len(got) != want || *g.PendingForYou != want {
 				t.Fatalf("%s policy, %s: awaiting_me %v, pending_for_you %d, want %d", tc.policy, caller, got, *g.PendingForYou, want)
 			}

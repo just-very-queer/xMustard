@@ -34,6 +34,9 @@ func main() {
 	if run, ok := lifecycleCommands[args[0]]; ok { // daemon lifecycle and store backup (setup.go)
 		os.Exit(run(defaultLifecycleEnv(), args[1:]))
 	}
+	if run, ok := governanceCommands[args[0]]; ok { // memory policy, tiers and guidance (policy.go, guidance.go)
+		os.Exit(run(defaultOpsEnv(), args[1:]))
+	}
 	switch args[0] {
 	case "diagnostics":
 		runDiagnostics(args[1:])

@@ -131,6 +131,10 @@ type ContextEntry struct {
 	Kind  string   `json:"kind,omitempty"`
 	Topic string   `json:"topic,omitempty"`
 	Tags  []string `json:"tags,omitempty"`
+	// Tier is core when the entry is in the core tier (WS-31); omitted when deferred.
+	// Description is its one-line description, the deferred index's.
+	Tier        string `json:"tier,omitempty"`
+	Description string `json:"description,omitempty"`
 	// Quarantine says why the entry is quarantined (WS-56): it derives from an untrusted
 	// capture or a foreign import. A quarantined entry is served labeled and never pushed
 	// into context unasked, and it cannot enter the core tier.
@@ -169,6 +173,13 @@ type ProposeContextRequest struct {
 	Kind  string   `json:"kind,omitempty"`
 	Topic string   `json:"topic,omitempty"`
 	Tags  []string `json:"tags,omitempty"`
+	// Tier is core or deferred (the default) (WS-31). tier is a protected field of the
+	// write policy: only a human approver proposes a core entry, and it must fit the core
+	// budget. With remember(op=tier) it is the tier an existing entry moves to.
+	Tier string `json:"tier,omitempty"`
+	// Description is the one-line description the deferred index shows; remember reads
+	// it from its own description field.
+	Description string `json:"-"`
 	// OpenMode is set by the HTTP layer, never decoded from a client, when the caller
 	// is unauthenticated because no credentials are configured. The proposal is then
 	// promoted at once as self_asserted_open_mode instead of waiting for a quorum that
@@ -268,10 +279,24 @@ func ProposeContext(dataDir, workspaceID string, req ProposeContextRequest) (*Co
 	if req.Kind != "" && !slices.Contains(MemoryKinds, req.Kind) {
 		return nil, fmt.Errorf("kind %q is not one of %s: %w", req.Kind, strings.Join(MemoryKinds, ", "), ErrInvalidInput)
 	}
+	tier, err := normalizeTier(req.Tier)
+	if err != nil {
+		return nil, err
+	}
 	expiresAt, expiresOK := parseExpiry(req.Expires)
 	permission := strings.ToLower(strings.TrimSpace(req.Permission))
 	if permission != "readwrite" {
 		permission = "readonly" // default to the safest permission
+	}
+	policy, err := LoadMemoryPolicy(dataDir, workspaceID)
+	if err != nil {
+		return nil, err
+	}
+	description := strings.TrimSpace(req.Description)
+	if err := policy.enforce(memoryWrite{Proposal: true, Title: req.Title, Content: req.Content, Description: description,
+		Kind: req.Kind, Topic: normalizeTopic(req.Topic), Paths: anchors, Tier: tier, Permission: permission,
+		Expires: strings.TrimSpace(req.Expires), Supersedes: supersedes}, req.Caller); err != nil {
+		return nil, err
 	}
 	requireMulti, threshold := contextDefaults(dataDir)
 	// A per-request override may only TIGHTEN the gate (force multi-agent ON),
@@ -307,6 +332,11 @@ func ProposeContext(dataDir, workspaceID string, req ProposeContextRequest) (*Co
 			}
 			supersededGate = max(supersededGate, old.RequiredVerifications)
 		}
+		if tier == govstore.TierCore {
+			if err := checkCoreBudget(ctx, tx, policy, workspaceID, "", memoryChars(title, req.Content)); err != nil {
+				return err
+			}
+		}
 		peersOnly := tighten || supersededGate > 1
 		// selfNote, when set, promotes the entry on the proposer's own assertion.
 		selfNote := selfAssertion(req.OpenMode, peersOnly, requireMulti)
@@ -320,7 +350,7 @@ func ProposeContext(dataDir, workspaceID string, req ProposeContextRequest) (*Co
 			RequiredVerifications: required, RequireVerification: peersOnly,
 			Paths: cleanPaths(anchors), SearchTokens: memoryTokenList(title + " " + req.Content),
 			ExpiresAt: expiresAt, Metadata: proposalMetadata(supersedes, caller.Quarantine),
-			Kind: req.Kind, Topic: normalizeTopic(req.Topic), Tags: cleanPaths(req.Tags),
+			Kind: req.Kind, Topic: normalizeTopic(req.Topic), Tags: cleanPaths(req.Tags), Tier: tier, Description: description,
 		}, actor)
 		if err != nil {
 			return err
@@ -472,8 +502,9 @@ func parseExpiry(s string) (expiresAt string, ok bool) {
 
 // RememberRequest is one remember write. Op selects it: propose (the default), supersede
 // (a proposal that must name Supersedes), edit (a focused edit of EntryID, see
-// EditRequest), retire (see RetireContext) or restore (see RestoreContext). Reason is
-// required by all but propose and supersede.
+// EditRequest), retire (see RetireContext), restore (see RestoreContext) or tier (move
+// EntryID to Tier, see SetMemoryTier). Reason is required by all but propose and
+// supersede.
 type RememberRequest struct {
 	ProposeContextRequest
 	Op           string  `json:"op,omitempty"`
@@ -491,13 +522,16 @@ type RememberRequest struct {
 
 var rememberOps = map[string]func(dataDir, workspaceID string, req RememberRequest, actor ContextActor) (*ContextEntry, error){
 	"propose": func(dataDir, workspaceID string, req RememberRequest, _ ContextActor) (*ContextEntry, error) {
-		return ProposeContext(dataDir, workspaceID, req.ProposeContextRequest)
+		return ProposeContext(dataDir, workspaceID, req.proposal())
 	},
 	"supersede": func(dataDir, workspaceID string, req RememberRequest, _ ContextActor) (*ContextEntry, error) {
 		if len(req.Supersedes) == 0 {
 			return nil, fmt.Errorf("op supersede needs supersedes: %w", ErrInvalidInput)
 		}
-		return ProposeContext(dataDir, workspaceID, req.ProposeContextRequest)
+		return ProposeContext(dataDir, workspaceID, req.proposal())
+	},
+	"tier": func(dataDir, workspaceID string, req RememberRequest, actor ContextActor) (*ContextEntry, error) {
+		return SetMemoryTier(dataDir, workspaceID, req.EntryID, req.Tier, req.Reason, actor)
 	},
 	"edit": func(dataDir, workspaceID string, req RememberRequest, actor ContextActor) (*ContextEntry, error) {
 		return EditContext(dataDir, workspaceID, req.EntryID, EditRequest{
@@ -513,12 +547,20 @@ var rememberOps = map[string]func(dataDir, workspaceID string, req RememberReque
 	},
 }
 
+// proposal is the proposal a propose or supersede op makes: the request with its
+// one-line description.
+func (req RememberRequest) proposal() ProposeContextRequest {
+	p := req.ProposeContextRequest
+	p.Description = derefStr(req.Description)
+	return p
+}
+
 // NormalizeRememberOp is the op Remember runs for raw: trimmed, lower case, propose
 // when blank. An unknown op is invalid input.
 func NormalizeRememberOp(raw string) (string, error) {
 	op := fallbackString(strings.ToLower(strings.TrimSpace(raw)), "propose")
 	if _, ok := rememberOps[op]; !ok {
-		return "", fmt.Errorf("op %q is not propose, supersede, edit, retire or restore: %w", raw, ErrInvalidInput)
+		return "", fmt.Errorf("op %q is not propose, supersede, edit, retire, restore or tier: %w", raw, ErrInvalidInput)
 	}
 	return op, nil
 }
@@ -549,7 +591,7 @@ func Remember(dataDir, workspaceID string, req RememberRequest, actor ContextAct
 		return nil, err
 	}
 	red.annotate(out)
-	flagInstructions(out, req.Title, req.Content, req.NewString)
+	flagInstructions(out, req.Title, derefStr(req.Description), req.Content, req.NewString)
 	return out, nil
 }
 

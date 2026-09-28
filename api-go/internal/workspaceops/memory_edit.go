@@ -35,17 +35,24 @@ func UpdateContextContent(dataDir, workspaceID, entryID, content string, editor 
 	}
 	var red ingestRedaction
 	red.scrub(&content)
+	policy, err := LoadMemoryPolicy(dataDir, workspaceID)
+	if err != nil {
+		return nil, err
+	}
 	requireMulti, threshold := contextDefaults(dataDir)
 	ctx := context.Background()
 	root := contextRoot(dataDir, workspaceID)
 	actor := editor.storeActor(root)
 	var out ContextEntry
-	err := memoryUpdate(ctx, dataDir, workspaceID, func(tx govstore.Tx) error {
+	err = memoryUpdate(ctx, dataDir, workspaceID, func(tx govstore.Tx) error {
 		e, ce, err := loadEntryTx(ctx, tx, workspaceID, entryID)
 		if err != nil {
 			return err
 		}
 		if err := authorizeEdit(editor, ce); err != nil {
+			return err
+		}
+		if err := policy.enforce(editedWrite(e, ce, content, e.Description, ""), editor); err != nil {
 			return err
 		}
 		_, err = tx.AppendRevision(ctx, govstore.RevisionInput{
@@ -72,6 +79,13 @@ func UpdateContextContent(dataDir, workspaceID, entryID, content string, editor 
 	out.ContentDigest = ""
 	red.annotate(&out)
 	return &out, nil
+}
+
+// editedWrite is an edit of e as the write policy reads it: the entry's classification
+// and anchors with the content and description the edit stores.
+func editedWrite(e govstore.Entry, ce ContextEntry, content, description, expires string) memoryWrite {
+	return memoryWrite{Title: e.Title, Content: content, Description: description, Kind: e.Kind, Topic: e.Topic,
+		Paths: ce.Paths, Expires: expires, Core: e.Tier == govstore.TierCore}
 }
 
 // authorizeEdit lets an entry's author or an admin change it. A readonly entry that is
@@ -142,13 +156,17 @@ func EditContext(dataDir, workspaceID, entryID string, req EditRequest, editor C
 		return nil, fmt.Errorf("base_revision is required (the revision the edit is based on): %w", ErrInvalidInput)
 	}
 	expiresAt, expiresOK := parseExpiry(req.Expires)
+	policy, err := LoadMemoryPolicy(dataDir, workspaceID)
+	if err != nil {
+		return nil, err
+	}
 	requireMulti, threshold := contextDefaults(dataDir)
 	ctx := context.Background()
 	root := contextRoot(dataDir, workspaceID)
 	actor := editor.storeActor(root)
 	var out ContextEntry
 	var red ingestRedaction
-	err := memoryUpdate(ctx, dataDir, workspaceID, func(tx govstore.Tx) error {
+	err = memoryUpdate(ctx, dataDir, workspaceID, func(tx govstore.Tx) error {
 		red = ingestRedaction{}
 		e, ce, err := loadEntryTx(ctx, tx, workspaceID, entryID)
 		if err != nil {
@@ -176,6 +194,13 @@ func EditContext(dataDir, workspaceID, entryID string, req EditRequest, editor C
 		red.scrub(&content)
 		if !changed && expiresAt == "" {
 			return fmt.Errorf("the edit changes nothing (give old_string/new_string, content, description or expires): %w", ErrInvalidInput)
+		}
+		description := e.Description
+		if req.Description != nil {
+			description = *req.Description
+		}
+		if err := policy.enforce(editedWrite(e, ce, content, description, expiresAt), editor); err != nil {
+			return err
 		}
 		if expiresAt != "" {
 			if err := editor.authorizeExpiry(ce); err != nil {

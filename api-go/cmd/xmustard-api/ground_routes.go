@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"xmustard/api-go/internal/budget"
@@ -35,7 +36,17 @@ func registerGroundRoutes(mux routeRegistrar) {
 			writeJSON(w, http.StatusBadRequest, body)
 			return
 		}
-		result, err := workspaceops.BuildSessionGroundingFor(r.Context(), dataDir(), r.PathValue("workspace_id"), callerOf(r).ID)
+		since := int64(-1)
+		if q.Has("since_revision") {
+			n, err := strconv.ParseInt(q.Get("since_revision"), 10, 64)
+			if err != nil || n < 0 || len(q["since_revision"]) > 1 {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"error": "since_revision must be one non-negative integer (a memory_revision ground returned)",
+					"argument": "since_revision", "reason": "invalid"})
+				return
+			}
+			since = n
+		}
+		result, err := workspaceops.BuildSessionGroundingSince(r.Context(), dataDir(), r.PathValue("workspace_id"), callerOf(r).ID, since)
 		if err != nil {
 			respondError(w, err)
 			return

@@ -95,6 +95,13 @@ func BuildSessionGroundingCtx(ctx context.Context, dataDir, workspaceID string) 
 // BuildSessionGroundingFor grounds a session for caller: pending_for_you counts the
 // pending memory caller neither authored nor voted on.
 func BuildSessionGroundingFor(ctx context.Context, dataDir, workspaceID, caller string) (*SessionGrounding, error) {
+	return BuildSessionGroundingSince(ctx, dataDir, workspaceID, caller, noSince)
+}
+
+// BuildSessionGroundingSince is BuildSessionGroundingFor that also reports what changed
+// in served memory after the memory revision since (memory_delta); a negative since
+// asks for no delta.
+func BuildSessionGroundingSince(ctx context.Context, dataDir, workspaceID, caller string, since int64) (*SessionGrounding, error) {
 	g := &SessionGrounding{WorkspaceID: workspaceID}
 	unknown, err := g.groundingIndex.build(ctx, dataDir, workspaceID)
 	if err != nil {
@@ -112,7 +119,8 @@ func BuildSessionGroundingFor(ctx context.Context, dataDir, workspaceID, caller 
 		g.BlockedByFailingVerification = &failing
 	}
 	g.stampGenerated()
-	g.Unknown = append(g.Unknown, g.groundingMemory.build(dataDir, workspaceID, caller)...)
+	g.Unknown = append(g.Unknown, g.groundingMemory.build(dataDir, workspaceID, caller,
+		groundMemoryOptions{since: max(since, noSince), budget: true})...)
 	g.summarize()
 	return g, nil
 }

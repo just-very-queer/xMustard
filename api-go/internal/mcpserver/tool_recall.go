@@ -19,7 +19,7 @@ const (
 
 // recallQueryArgs are the recall arguments that travel as query parameters under
 // their own names.
-var recallQueryArgs = []string{"paths", "limit", "entry_id", "history", "explain", "kind", "tags", "topic",
+var recallQueryArgs = []string{"paths", "limit", "entry_id", "history", "explain", "kind", "tier", "tags", "topic",
 	"path_prefix", "since", "until", "by", "status", "include_pending", "include_superseded", "show_expired",
 	"cursor", "names_only", "render", "session_id"}
 
@@ -43,6 +43,7 @@ var recallTool = &Tool{
 		{Name: "include_superseded", Type: typeBoolean},
 		{Name: "show_expired", Type: typeBoolean},
 		{Name: "kind", Type: typeString, List: true, MaxLen: 512},
+		{Name: "tier", Type: typeString, Enum: []string{"core", "deferred"}},
 		{Name: "tags", Type: typeString, List: true, MaxLen: 1024},
 		{Name: "topic", Type: typeString},
 		{Name: "path_prefix", Type: typeString},
@@ -60,7 +61,7 @@ var recallTool = &Tool{
 		"pending (the verification queue) or awaiting_me (pending entries you neither authored nor voted on); " +
 		"pending entries are labelled trust=unverified with votes_needed, and reading them needs the verifier or " +
 		"human-approver role. `include_pending`, `include_superseded` and `show_expired` add those states to " +
-		"promoted memory. `kind` is one of remember's kinds. `topic` matches the topic and every topic under it (a/b " +
+		"promoted memory. `kind` is one of remember's kinds; `tier` keeps core or deferred memory. `topic` matches the topic and every topic under it (a/b " +
 		"matches a/b/c). `path_prefix` keeps entries with a path under it. `since` and `until` bound updated_at " +
 		"(a UTC date or RFC 3339 time; until is exclusive). `by` keeps one author's entries. `explain` adds " +
 		"score_details (bm25, path, anchor, trust, recency, feedback, stale_penalty, total, reasons). " +

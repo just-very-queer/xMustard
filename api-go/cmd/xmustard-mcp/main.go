@@ -61,6 +61,8 @@ var (
 		AutoRegister: strings.TrimSpace(os.Getenv("XMUSTARD_MCP_AUTO_REGISTER")) != "0",
 		HomeDir:      homeDir(),
 		Schema:       schemaProfile,
+		// initialize appends the workspace's standing memory (WS-31)
+		StandingMemory: strings.TrimSpace(os.Getenv("XMUSTARD_MCP_STANDING_MEMORY")) != "0",
 	}).NewSession(client)
 )
 

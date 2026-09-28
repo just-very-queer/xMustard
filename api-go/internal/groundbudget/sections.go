@@ -105,14 +105,22 @@ var sections = []Section{
 		Doc:     "working-tree changes against the indexed baseline, changed signatures in the order the index lists them, and per-language symbol coverage",
 	},
 	{
-		Name: "memory", Cap: 1024,
+		Name: "memory", Cap: 2048,
 		Members: []Member{
 			{Name: "stale_memory", Signal: true}, {Name: "stale_memory_checked"}, {Name: "stale_memory_total"},
 			{Name: "stale_memory_complete", Signal: true}, {Name: "memory_verification_modes", Signal: true},
 			{Name: "pending_for_you", Signal: true}, {Name: "memory_pressure", Signal: true},
+			{Name: "memory_revision", Signal: true},
+			// a signal: superseded, stale and removed memory is never dropped silently
+			{Name: "memory_delta", Signal: true, Keep: []string{"since", "revision", "truncated"}},
+			{Name: "onboarding", Signal: true, Keep: []string{"needed"}},
+			{Name: "memory_budget", Keep: []string{"revision", "core_entries", "core_withheld", "tokens_est"}},
 		},
 		Recover: "ground sections=memory; recall flags each stale memory; recall status=awaiting_me lists pending_for_you",
-		Doc:     "promoted memory whose files drifted, promoted memory by verification mode, the pending memory awaiting your verification, and memory pressure (core_pct, pending_count)",
+		Doc: "promoted memory whose files drifted, promoted memory by verification mode, the pending memory awaiting your " +
+			"verification, memory pressure (core_pct, pending_count), the memory revision, what the session's standing-memory " +
+			"projection pushes (memory_budget), onboarding when no memory is promoted, and with since_revision what changed " +
+			"after that revision (memory_delta: added, changed, superseded, stale and removed entry ids)",
 	},
 	{
 		Name: "drift", Cap: 1536,

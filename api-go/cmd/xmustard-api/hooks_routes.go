@@ -9,6 +9,7 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"maps"
 	"net"
 	"net/http"
 	"os"
@@ -367,21 +368,27 @@ func (s *hookServer) subagentStart(ctx context.Context, c *hookCall) hookResult 
 }
 
 // grounding is SessionStart's and SubagentStart's context: ground's spawn-free part
-// and the core-tier memories, and (SessionStart) the files memory is anchored to as
-// watchPaths, so FileChanged reports their edits.
+// and the standing-memory projection (WS-31: the human-approved core tier, each entry
+// pinned to its approved served revision, and the deferred index, stamped with the
+// memory revision), and (SessionStart) the files memory is anchored to as watchPaths,
+// so FileChanged reports their edits. The projection is pushed once per context: when
+// every core entry it carries was already offered here (a resume), only the ground line
+// is sent. A projection that cannot be compiled pushes no memory (fail closed).
 func (s *hookServer) grounding(ctx context.Context, c *hookCall, watch bool) hookResult {
 	if !c.bound {
 		return hookResult{}
 	}
 	g := workspaceops.HookGrounding(ctx, dataDir(), c.ws.WorkspaceID, c.caller)
 	res := hookResult{context: groundLine(c.ws, g)}
-	if idx, err := workspaceops.ReadHookMemoryIndex(ctx, dataDir(), c.ws.WorkspaceID); err == nil {
-		var memory string
-		memory, res.offered = s.push(ctx, c, injection.SurfaceCore, idx.Core, nil, "recall", hooks.Room(res.context))
-		res.context = hooks.Compose(res.context, memory)
-		if watch {
-			res.watch = watchPaths(c.ws, idx.Anchors)
+	budget := min(hooks.Room(res.context), workspaceops.ProjectionMaxChars)
+	if p, err := workspaceops.CoreProjection(ctx, dataDir(), c.ws.WorkspaceID, budget); err == nil && p.Text != "" {
+		offered := p.ProjectionOffered()
+		if ids := slices.Collect(maps.Keys(offered)); len(ids) == 0 || len(s.sessions.Unseen(c.key, ids)) > 0 {
+			res.context, res.offered = hooks.Compose(res.context, p.Text), offered
 		}
+	}
+	if idx, err := workspaceops.ReadHookMemoryIndex(ctx, dataDir(), c.ws.WorkspaceID); err == nil && watch {
+		res.watch = watchPaths(c.ws, idx.Anchors)
 	}
 	return res
 }

@@ -216,6 +216,8 @@ type RecallRequest struct {
 	Explain bool
 	Kinds   []string
 	Tags    []string
+	// Tier keeps core or deferred entries (an entry stored with no tier is deferred).
+	Tier string
 	// Topic matches the topic or any topic under it ("a/b" matches "a/b/c").
 	Topic      string
 	PathPrefix string
@@ -302,6 +304,11 @@ func (r *RecallRequest) validate() error {
 		return fmt.Errorf("session_id is longer than %d bytes: %w", RecallMaxSessionID, ErrInvalidInput)
 	}
 	r.Topic = normalizeTopic(r.Topic)
+	tier, err := normalizeTier(r.Tier)
+	if err != nil {
+		return err
+	}
+	r.Tier = tier
 	if !slices.Contains(recallRenderArgs, r.Render) {
 		return fmt.Errorf("render %q is not full or compact: %w", r.Render, ErrInvalidInput)
 	}
@@ -349,6 +356,7 @@ func (r RecallRequest) filters(awaits func(govstore.RankEntry) bool) []func(govs
 		}
 	}
 	add(len(r.Kinds) > 0, func(e govstore.RankEntry) bool { return slices.Contains(r.Kinds, e.Kind) })
+	add(r.Tier != "", func(e govstore.RankEntry) bool { return fallbackString(e.Tier, TierDeferred) == r.Tier })
 	add(len(r.Tags) > 0, func(e govstore.RankEntry) bool {
 		return slices.ContainsFunc(e.Tags, func(t string) bool { return slices.Contains(r.Tags, t) })
 	})

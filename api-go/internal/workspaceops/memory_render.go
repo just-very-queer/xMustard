@@ -128,7 +128,7 @@ func cutRunes(s string, n int) string {
 // its text matches (WS-56).
 func (c scoredEntry) label(explain bool) ContextEntry {
 	e := c.entry
-	e.InjectionFlags = injection.Scan(e.Title, e.Content).Flags
+	e.InjectionFlags = injection.Scan(e.Title, e.Description, e.Content).Flags
 	e.State, e.Trust = c.rank.State, trustLabel(c.rank)
 	if c.rank.State == govstore.RankPending {
 		need := max(c.rank.RequiredVerifications-c.rank.PeerApprovals, 0)

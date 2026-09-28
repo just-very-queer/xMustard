@@ -155,7 +155,7 @@ func HookGrounding(ctx context.Context, dataDir, workspaceID, caller string) *Se
 		g.BlockedByFailingVerification = &failing
 	}
 	g.stampGenerated()
-	g.Unknown = append(g.Unknown, g.groundingMemory.build(dataDir, workspaceID, caller)...)
+	g.Unknown = append(g.Unknown, g.groundingMemory.build(dataDir, workspaceID, caller, groundMemoryOptions{since: noSince})...)
 	g.summarize()
 	return g
 }
