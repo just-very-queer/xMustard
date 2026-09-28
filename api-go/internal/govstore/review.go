@@ -18,7 +18,8 @@ import (
 //     finding says, plus every triage verdict and re-anchoring, append-only;
 //   - anchors hold a finding's place in the code: its path, line range and side, the
 //     commit the lines count in (the head, or the merge base for the old side), its
-//     lineage, and the SHA-256 of its normalized quoted code as the baseline;
+//     lineage, and the SHA-256 of its normalized quoted code as the baseline; a record's
+//     anchor holds its lineage and head, so a lineage's latest record is an index lookup;
 //   - outcomes hold each principal's latest triage verdict on a finding;
 //   - jobs hold a possible duplicate for someone to decide.
 //
@@ -32,6 +33,10 @@ import (
 // finding and a review_duplicate job asks someone to decide. Neither is corroboration,
 // which only an explicit confirm by a principal other than the author gives. Nothing
 // here approves a change: a record is evidence that informs the human's merge decision.
+//
+// A lineage's first record binds it to a repository and a base ref, and a record of
+// another is refused. Whether two heads lie on one line of history only the caller can
+// tell, so the caller decides which findings move (ReanchorReviewFindings).
 
 // Subject kinds: what a row's entry_id names.
 const (
@@ -40,9 +45,14 @@ const (
 	SubjectReviewFinding = "review_finding"
 )
 
-// AnchorReviewRange is a finding's anchor kind: its value is the file path and the row
-// carries the line range. It is not a memory anchor kind.
-const AnchorReviewRange = "review_range"
+// Review anchor kinds; neither is a memory anchor kind. A finding's anchor
+// (AnchorReviewRange) has the file path as its value and carries the line range. A
+// record's anchor (AnchorReviewLineage) has the record's lineage as its value and its
+// head as the baseline commit, so a lineage's records are an index lookup.
+const (
+	AnchorReviewRange   = "review_range"
+	AnchorReviewLineage = "review_lineage"
+)
 
 // Finding statuses. A finding is open until someone triages it; a duplicate stays one;
 // an open finding whose quoted code is gone at a later head is outdated, never deleted.
@@ -98,10 +108,14 @@ const (
 // found its quoted code nowhere, or in several places, and never guesses.
 const AnchorUnanchored = "unanchored"
 
+// producerHuman is both the producer a human's own review names and the principal kind
+// that alone may name it.
+const producerHuman = "human"
+
 var (
 	reviewCategories     = set("bug", "security", "performance", "maintainability", "test", "style", "documentation", "other")
 	reviewSeverities     = set("critical", "high", "medium", "low")
-	reviewProducers      = set("agent", "ocr", "human")
+	reviewProducers      = set("agent", "ocr", producerHuman)
 	reviewSides          = set("new", "old")
 	reviewAnchorStatuses = set("exact_new", "exact_old", "file", "relocated", AnchorUnanchored)
 	reviewFacts          = set("yes", "no", "unknown")
@@ -250,12 +264,16 @@ type ReviewDedupe struct {
 
 // ReviewFinding is a stored finding with its current anchor (Commit is the commit its
 // lines count in), status and corroborations: the principals other than its author and
-// the open-mode identity whose verdict is confirm.
+// the open-mode identity whose verdict is confirm. Findings move only when a record is
+// written, so AnchorCurrent says whether the lines count in the commit the lineage's
+// latest record reads that side at; it is false for an outdated or unanchored finding
+// and for one left at an earlier or another head.
 type ReviewFinding struct {
 	ID          string `json:"id"`
 	WorkspaceID string `json:"workspace_id"`
 	reviewFindingData
 	Commit         string `json:"commit"`
+	AnchorCurrent  bool   `json:"anchor_current"`
 	Status         string `json:"status"`
 	Corroborations int    `json:"corroborations"`
 	OutdatedAt     string `json:"outdated_at,omitempty"`
@@ -322,7 +340,8 @@ type ReviewReader interface {
 type ReviewWriter interface {
 	// RecordReview stores a record and its findings, deduplicating each finding against
 	// the lineage's earlier findings whose lines count in the same commit (and the ones
-	// before it in the same call).
+	// before it in the same call). It refuses producer human from a principal not of kind
+	// human, and a change of another repository or base ref than the lineage's records.
 	RecordReview(ctx context.Context, in ReviewRecordInput, actor Actor) (ReviewRecord, []ReviewFinding, error)
 	// TriageReviewFinding records actor's verdict on a finding and returns it updated.
 	TriageReviewFinding(ctx context.Context, in ReviewTriageInput, actor Actor) (ReviewFinding, error)
@@ -539,8 +558,15 @@ func (t *txn) RecordReview(ctx context.Context, in ReviewRecordInput, actor Acto
 	if err := actor.validate(); err != nil {
 		return ReviewRecord{}, nil, err
 	}
+	if in.Producer == producerHuman && actor.Kind != producerHuman {
+		return ReviewRecord{}, nil, fmt.Errorf("%w: producer human needs a principal of kind human; %s is of kind %q",
+			ErrInvalid, actor.Principal, actor.Kind)
+	}
 	data, err := validateReviewRecord(in)
 	if err != nil {
+		return ReviewRecord{}, nil, err
+	}
+	if err := t.bindLineage(ctx, in); err != nil {
 		return ReviewRecord{}, nil, err
 	}
 	recordID := newID("rvr_")
@@ -554,6 +580,11 @@ func (t *txn) RecordReview(ctx context.Context, in ReviewRecordInput, actor Acto
 	}
 	if _, err := t.insertEvent(ctx, actor, eventRow{WorkspaceID: in.WorkspaceID, EntryID: recordID,
 		SubjectKind: SubjectReviewRecord, Type: EventReviewRecord, NewDigest: in.Change.DiffSHA256, Data: obj}); err != nil {
+		return ReviewRecord{}, nil, err
+	}
+	if _, err := t.exec(ctx, `INSERT INTO anchors (subject_kind, entry_id, ordinal, kind, value, declared, baseline_commit,
+		baseline_at) VALUES (?, ?, 0, ?, ?, 1, ?, ?)`, SubjectReviewRecord, recordID, AnchorReviewLineage, in.Lineage,
+		in.Change.Head, t.nowText()); err != nil {
 		return ReviewRecord{}, nil, err
 	}
 	for i, f := range in.Findings {
@@ -617,6 +648,65 @@ func validateReviewRecord(in ReviewRecordInput) (*reviewRecordData, error) {
 	return d, nil
 }
 
+// bindLineage refuses a record whose change is of another repository or base ref than
+// the lineage's records. Each record was checked against the one before it, so the
+// latest record stands for the first, which bound the lineage.
+func (t *txn) bindLineage(ctx context.Context, in ReviewRecordInput) error {
+	c, ok, err := t.latestLineageChange(ctx, in.WorkspaceID, in.Lineage)
+	if err != nil || !ok {
+		return err
+	}
+	if c.Repository != in.Change.Repository || c.BaseRef != in.Change.BaseRef {
+		return fmt.Errorf("%w: lineage %q is bound to base %s of %s, not base %s of %s", ErrConflict, in.Lineage,
+			c.BaseRef, c.Repository, in.Change.BaseRef, in.Change.Repository)
+	}
+	return nil
+}
+
+// lineageLatestQuery reads the change of a lineage's latest record through the records'
+// lineage anchors (anchors_lookup), newest first, and each anchor's event by its entry id.
+const lineageLatestQuery = `SELECT json_extract(ev.data, '$.change') FROM anchors r CROSS JOIN events ev
+	ON ev.entry_id = r.entry_id AND ev.subject_kind = 'review_record' AND ev.type = 'review_record'
+	WHERE r.kind = 'review_lineage' AND r.value = ? AND r.subject_kind = 'review_record' AND +ev.workspace_id = ?
+	ORDER BY r.pk DESC LIMIT 1`
+
+// latestLineageChange is the change of the lineage's latest record; ok is false when the
+// lineage has none.
+func (r *reader) latestLineageChange(ctx context.Context, workspaceID, lineage string) (ReviewChange, bool, error) {
+	var c ReviewChange
+	var raw string
+	err := r.queryRow(ctx, lineageLatestQuery, lineage, workspaceID).Scan(&raw)
+	if errors.Is(err, ErrNotFound) {
+		return c, false, nil
+	}
+	if err != nil {
+		return c, false, err
+	}
+	if err := json.Unmarshal([]byte(raw), &c); err != nil {
+		return c, false, fmt.Errorf("govstore: lineage %q: %w", lineage, err)
+	}
+	return c, true, nil
+}
+
+// markCurrent sets each finding's AnchorCurrent: placed, not outdated, and at the commit
+// its lineage's latest record reads its side at. Each lineage is looked up once.
+func (r *reader) markCurrent(ctx context.Context, workspaceID string, fs []ReviewFinding) error {
+	latest := map[string]ReviewChange{}
+	for i := range fs {
+		f := &fs[i]
+		c, seen := latest[f.Lineage]
+		if !seen {
+			var err error
+			if c, _, err = r.latestLineageChange(ctx, workspaceID, f.Lineage); err != nil {
+				return err
+			}
+			latest[f.Lineage] = c
+		}
+		f.AnchorCurrent = f.StartLine > 0 && f.OutdatedAt == "" && f.Commit == c.LinesAt(f.Side)
+	}
+	return nil
+}
+
 // insertFinding deduplicates f against the lineage and stores its creation event, its
 // anchor and, for a possible duplicate, the job that asks about it.
 func (t *txn) insertFinding(ctx context.Context, in ReviewRecordInput, recordID, id string, f ReviewFindingInput, actor Actor) error {
@@ -666,32 +756,34 @@ func (t *txn) insertFinding(ctx context.Context, in ReviewRecordInput, recordID,
 // count in commit (lines of another commit are incomparable until re-anchored), leaving
 // out duplicates and outdated anchors. The best exact match (IoU above the threshold and
 // the same quoted code) makes f a duplicate; otherwise the best positional match makes
-// it a possible duplicate.
+// it a possible duplicate. Every candidate is read, page by page.
 func (t *txn) dedupeFinding(ctx context.Context, ws, lineage, commit string, f ReviewFindingInput, code string) (ReviewDedupe, error) {
 	out := ReviewDedupe{Result: DedupeCreated}
 	if f.StartLine == 0 {
 		return out, nil
 	}
-	cands, err := t.ListReviewFindings(ctx, ReviewFindingFilter{WorkspaceID: ws, Lineage: lineage, Path: f.Path,
-		Limit: maxListLimit})
-	if err != nil {
-		return out, err
-	}
 	var exact, near ReviewDedupe
-	for _, g := range cands {
-		if g.Status == FindingDuplicate || g.OutdatedAt != "" || g.Commit != commit || g.Side != f.Side {
-			continue
+	for after := int64(0); ; {
+		page, err := t.dedupeCandidates(ctx, ws, lineage, commit, f, after)
+		if err != nil {
+			return out, err
 		}
-		iou := SpanIoU([2]int{f.StartLine, f.EndLine}, [2]int{g.StartLine, g.EndLine})
-		if iou <= dedupeIoU {
-			continue
+		for _, g := range page {
+			iou := SpanIoU([2]int{f.StartLine, f.EndLine}, g.span)
+			if iou <= dedupeIoU {
+				continue
+			}
+			if code != "" && g.code == code && iou > exact.IoU {
+				exact = ReviewDedupe{Result: DedupeDuplicateOf, Of: g.id, IoU: iou}
+			}
+			if iou > near.IoU {
+				near = ReviewDedupe{Result: DedupePossibleDuplicate, Of: g.id, IoU: iou}
+			}
 		}
-		if code != "" && g.CodeSHA256 == code && iou > exact.IoU {
-			exact = ReviewDedupe{Result: DedupeDuplicateOf, Of: g.ID, IoU: iou}
+		if len(page) < dedupePageSize {
+			break
 		}
-		if iou > near.IoU {
-			near = ReviewDedupe{Result: DedupePossibleDuplicate, Of: g.ID, IoU: iou}
-		}
+		after = page[len(page)-1].pk
 	}
 	switch {
 	case exact.Of != "":
@@ -700,6 +792,50 @@ func (t *txn) dedupeFinding(ctx context.Context, ws, lineage, commit string, f R
 		return near, nil
 	}
 	return out, nil
+}
+
+// dedupeCandidatesQuery reads, in anchor order after a pk, the lineage's findings a new
+// one on a path and side can match: placed at lines that count in the same commit and
+// overlap its range, not outdated, and not duplicates. The anchor row carries every
+// filter but the workspace and the dedupe result, and anchors_review_lineage finds it by
+// lineage, path and pk; only the rows left read their event. The quoted code's hash is
+// the anchor's baseline.
+const dedupeCandidatesQuery = `SELECT a.pk, a.entry_id, a.start_line, a.end_line, a.baseline_hash
+	FROM anchors a CROSS JOIN events ev ON ev.entry_id = a.entry_id AND ev.subject_kind = 'review_finding'
+		AND ev.type = 'review_finding'
+	WHERE a.subject_kind = 'review_finding' AND a.kind = 'review_range' AND a.lineage = ? AND a.value = ? AND a.pk > ?
+		AND a.baseline_commit = ? AND a.side = ? AND a.stale_since IS NULL AND a.start_line BETWEEN 1 AND ? AND a.end_line >= ?
+		AND +ev.workspace_id = ? AND coalesce(json_extract(ev.data, '$.dedupe.result'), '') <> 'duplicate_of'
+	ORDER BY a.pk LIMIT ?`
+
+// dedupePageSize is the rows one page of dedupe candidates reads (a variable so a test
+// can page through a few).
+var dedupePageSize = maxListLimit
+
+// dedupeCandidate is one row of dedupeCandidatesQuery.
+type dedupeCandidate struct {
+	pk   int64
+	id   string
+	span [2]int
+	code string
+}
+
+// dedupeCandidates reads one page of f's dedupe candidates after pk after.
+func (t *txn) dedupeCandidates(ctx context.Context, ws, lineage, commit string, f ReviewFindingInput, after int64) ([]dedupeCandidate, error) {
+	rows, err := t.query(ctx, dedupeCandidatesQuery, lineage, f.Path, after, commit, f.Side, f.EndLine, f.StartLine, ws, dedupePageSize)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var page []dedupeCandidate
+	for rows.Next() {
+		var g dedupeCandidate
+		if err := rows.Scan(&g.pk, &g.id, &g.span[0], &g.span[1], &g.code); err != nil {
+			return nil, err
+		}
+		page = append(page, g)
+	}
+	return page, rows.Err()
 }
 
 // TriageReviewFinding records actor's verdict on a finding (see ReviewWriter). Guards,
@@ -761,26 +897,13 @@ func (t *txn) ReanchorReviewFindings(ctx context.Context, workspaceID string, mo
 		if f.Commit == m.Commit || f.Status == FindingDuplicate || f.OutdatedAt != "" || f.StartLine == 0 {
 			continue
 		}
-		to := f.ReviewFindingInput
-		to.StartLine, to.EndLine, to.AnchorStatus = m.StartLine, m.EndLine, m.AnchorStatus
-		if !m.Outdated {
-			if err := to.validate(); err != nil {
-				return changed, err
-			}
-		}
-		now := t.nowText()
-		query, args := `UPDATE anchors SET stale_since = ?, stale_commit = ?`, []any{now, m.Commit}
-		if !m.Outdated {
-			query, args = `UPDATE anchors SET start_line = ?, end_line = ?, anchor_status = ?, baseline_commit = ?, baseline_at = ?`,
-				[]any{to.StartLine, to.EndLine, to.AnchorStatus, m.Commit, now}
+		query, args, data, err := reanchorWrite(f, m, t.nowText())
+		if err != nil {
+			return changed, err
 		}
 		if _, err := t.exec(ctx, query+` WHERE subject_kind = ? AND entry_id = ? AND kind = ?`,
 			append(args, SubjectReviewFinding, f.ID, AnchorReviewRange)...); err != nil {
 			return changed, err
-		}
-		data := map[string]any{"from_commit": f.Commit, "to_commit": m.Commit, "from": [2]int{f.StartLine, f.EndLine}, "outdated": m.Outdated}
-		if !m.Outdated {
-			data["to"], data["anchor_status"] = [2]int{to.StartLine, to.EndLine}, to.AnchorStatus
 		}
 		if _, err := t.insertEvent(ctx, actor, eventRow{WorkspaceID: workspaceID, EntryID: f.ID, SubjectKind: SubjectReviewFinding,
 			Type: EventReviewReanchor, Data: data}); err != nil {
@@ -789,6 +912,25 @@ func (t *txn) ReanchorReviewFindings(ctx context.Context, workspaceID string, mo
 		changed++
 	}
 	return changed, nil
+}
+
+// reanchorWrite is move m of finding f as the anchor update (its SET clause and values)
+// and the event data that records it: an outdated finding keeps its place and records
+// where its code went missing; a moved one takes the new lines, which must fit its
+// anchor.
+func reanchorWrite(f ReviewFinding, m ReviewReanchor, now string) (string, []any, map[string]any, error) {
+	data := map[string]any{"from_commit": f.Commit, "to_commit": m.Commit, "from": [2]int{f.StartLine, f.EndLine}, "outdated": m.Outdated}
+	if m.Outdated {
+		return `UPDATE anchors SET stale_since = ?, stale_commit = ?`, []any{now, m.Commit}, data, nil
+	}
+	to := f.ReviewFindingInput
+	to.StartLine, to.EndLine, to.AnchorStatus = m.StartLine, m.EndLine, m.AnchorStatus
+	if err := to.validate(); err != nil {
+		return "", nil, nil, err
+	}
+	data["to"], data["anchor_status"] = [2]int{to.StartLine, to.EndLine}, to.AnchorStatus
+	return `UPDATE anchors SET start_line = ?, end_line = ?, anchor_status = ?, baseline_commit = ?, baseline_at = ?`,
+		[]any{to.StartLine, to.EndLine, to.AnchorStatus, m.Commit, now}, data, nil
 }
 
 // GetReviewRecord returns one record of the workspace.
@@ -856,6 +998,15 @@ func (r *reader) ListReviewFindings(ctx context.Context, f ReviewFindingFilter) 
 		}
 		ids = rec.FindingIDs
 	}
+	out, err := r.scanReviewFindings(ctx, f, ids)
+	if err != nil {
+		return nil, err
+	}
+	return out, r.markCurrent(ctx, f.WorkspaceID, out)
+}
+
+// scanReviewFindings runs reviewFindingsSQL and reads its rows.
+func (r *reader) scanReviewFindings(ctx context.Context, f ReviewFindingFilter, ids []string) ([]ReviewFinding, error) {
 	query, args := reviewFindingsSQL(f, ids)
 	rows, err := r.query(ctx, query, args...)
 	if err != nil {
@@ -918,7 +1069,12 @@ func (r *reader) GetReviewFinding(ctx context.Context, workspaceID, id string) (
 	if errors.Is(err, ErrNotFound) {
 		return f, fmt.Errorf("review finding %s: %w", id, ErrNotFound)
 	}
-	return f, err
+	if err != nil {
+		return f, err
+	}
+	one := []ReviewFinding{f}
+	err = r.markCurrent(ctx, workspaceID, one)
+	return one[0], err
 }
 
 // scanReviewFinding reads one row of reviewFindingQuery. The anchor's current place

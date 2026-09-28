@@ -80,8 +80,9 @@ func runReviewRecord(e opsEnv, workspaceID string, args []string) int {
 	base := fs.String("base", "", "the ref the change merges into (required)")
 	head := fs.String("head", "HEAD", "the head of the reviewed change")
 	coverage := fs.String("coverage", "", "coverage JSON: [{path, status: reviewed|not_reviewed, reason}]")
-	lineage := fs.String("lineage", "", "the change's lineage (default: <base>@<merge base>)")
-	producer := fs.String("producer", "agent", "who produced the findings: agent, ocr or human")
+	lineage := fs.String("lineage", "", "the change's lineage (default: <base>@<merge base>:<head branch>; "+
+		"required when --head is not a branch)")
+	producer := fs.String("producer", "agent", "who produced the findings: agent, ocr or human (human needs a token of kind human)")
 	var files, handles stringSliceFlag
 	fs.Var(&files, "findings", "findings JSON: an array, {\"findings\": [...]} or open-code-review's --format json output; may repeat")
 	fs.Var(&handles, "evidence", "evidence handle of a captured findings JSON; may repeat")

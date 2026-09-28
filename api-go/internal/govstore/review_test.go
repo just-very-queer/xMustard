@@ -3,6 +3,7 @@ package govstore
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -140,6 +141,7 @@ func TestReviewCoverageCountsEveryChangedFile(t *testing.T) {
 		"escaping changed file":     {ChangedFiles: []string{"../etc/passwd"}},
 		"changed file twice":        {ChangedFiles: []string{"a.go", "a.go"}},
 		"unknown producer":          {Producer: "bot"},
+		"producer human, no human":  {Producer: "human"}, // alice is of no kind
 		"unknown category":          {Findings: []ReviewFindingInput{with(unplaced("a.go"), func(f *ReviewFindingInput) { f.Category = "nit" })}},
 		"lines without an anchor":   {Findings: []ReviewFindingInput{with(unplaced("a.go"), func(f *ReviewFindingInput) { f.StartLine, f.EndLine = 3, 3 })}},
 		"anchor without a side":     {Findings: []ReviewFindingInput{with(finding("a.go", 3, 3, "x"), func(f *ReviewFindingInput) { f.Side = "" })}},
@@ -362,6 +364,74 @@ func TestReviewReanchorMovesOrOutdates(t *testing.T) {
 	}
 }
 
+// Dedupe reads every candidate, not a window of the path's oldest rows. With more than a
+// list's worth of rows on one path, a finding quoted again at the last row's line is its
+// duplicate; and read two to a page, the third of three findings at one place is found
+// on the second page.
+func TestReviewDedupeReadsPastAPage(t *testing.T) {
+	s := openTestStore(t, newClock())
+	line := func(n int, code string) ReviewFindingInput { return finding("a.go", n, n, code) }
+	var fs []ReviewFindingInput
+	for i := range maxListLimit + 1 {
+		fs = append(fs, line(i+1, fmt.Sprintf("v%d := step()", i)))
+	}
+	var last ReviewFinding
+	for chunk := range slices.Chunk(fs, MaxReviewFindings) {
+		_, got := recordReview(t, s, alice, ReviewRecordInput{Findings: chunk})
+		last = got[len(got)-1]
+	}
+	defer func(n int) { dedupePageSize = n }(dedupePageSize)
+	dedupePageSize = 2
+	_, placed := recordReview(t, s, bob, ReviewRecordInput{Findings: []ReviewFindingInput{
+		line(5000, "a()"), line(5000, "b()"), line(5000, "c()")}})
+	_, again := recordReview(t, s, carol, ReviewRecordInput{Findings: []ReviewFindingInput{fs[maxListLimit], line(5000, "c()")}})
+	for i, want := range []string{last.ID, placed[2].ID} {
+		if d := again[i].Dedupe; d.Result != DedupeDuplicateOf || d.Of != want {
+			t.Errorf("finding %d quoted again: %+v, want a duplicate of %s", i, d, want)
+		}
+	}
+}
+
+// A lineage's first record binds it to a repository and a base ref; a finding's lines are
+// current while they count in the commit the lineage's latest record reads their side
+// at; and only a principal of kind human records producer human.
+func TestReviewLineageIsBoundAndTracksItsLatestHead(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t, newClock())
+	old := finding("a.go", 3, 3, "gone()")
+	old.Side = "old"
+	_, fs := recordReview(t, s, alice, ReviewRecordInput{Findings: []ReviewFindingInput{finding("a.go", 1, 2, "x\ny"), old}})
+	if !fs[0].AnchorCurrent || !fs[1].AnchorCurrent {
+		t.Fatalf("a new record's findings are current: %+v", fs)
+	}
+	recordReview(t, s, bob, ReviewRecordInput{Change: reviewChange("h2")})
+	got, err := s.ListReviewFindings(ctx, ReviewFindingFilter{WorkspaceID: "ws1", Lineage: "main@mb0"})
+	one, oneErr := s.GetReviewFinding(ctx, "ws1", fs[0].ID)
+	if err != nil || oneErr != nil || got[0].AnchorCurrent || got[0].Commit != "h1" || one.AnchorCurrent || !got[1].AnchorCurrent {
+		t.Fatalf("after a record at h2: listed %+v, one %+v (%v, %v)", got, one, err, oneErr)
+	}
+	for name, c := range map[string]ReviewChange{
+		"another repository": {Repository: "/fork", BaseRef: "main", MergeBase: "mb0", Head: "h3", DiffSHA256: "d"},
+		"another base ref":   {Repository: "/repo", BaseRef: "release", MergeBase: "mb0", Head: "h3", DiffSHA256: "d"},
+	} {
+		err := s.Update(ctx, func(tx Tx) error {
+			_, _, err := tx.RecordReview(ctx, ReviewRecordInput{WorkspaceID: "ws1", Lineage: "main@mb0", Change: c,
+				ChangedFiles: []string{"a.go"}, Producer: "agent"}, bob)
+			return err
+		})
+		if !errors.Is(err, ErrConflict) {
+			t.Errorf("%s: %v, want ErrConflict", name, err)
+		}
+	}
+	recordReview(t, s, bob, ReviewRecordInput{Lineage: "fork@mb0", Change: ReviewChange{Repository: "/fork", BaseRef: "main",
+		MergeBase: "mb0", Head: "h3", DiffSHA256: "d"}})
+	hana := Actor{Principal: "hana", Kind: "human"}
+	if rec, _ := recordReview(t, s, hana, ReviewRecordInput{Change: reviewChange("h2"), Producer: "human"}); rec.Producer != "human" ||
+		rec.AuthorKind != "human" {
+		t.Fatalf("a human's own review: %+v", rec)
+	}
+}
+
 // Review subjects share the tables with memory without mixing: their ids never name an
 // entry, memory reads by entry id see memory rows only, and the rebuilt anchors and
 // outcomes still refuse a row that names no subject.
@@ -479,29 +549,31 @@ func TestMigrationUpgradesV2FileToReviewSubjects(t *testing.T) {
 	_ = again.Close()
 }
 
-// A record's findings, a lineage's findings, a path's findings in a lineage and one
-// finding are index lookups, whatever the store holds: no plan step scans the anchors,
-// events or outcomes tables, a lineage is found through its own index, not by reading
-// every review anchor's event, and each anchor's event through its entry id, not the
-// workspace's events.
+// A record's findings, a lineage's findings, a path's findings in a lineage, one finding,
+// a new finding's dedupe candidates and a lineage's latest record are index lookups,
+// whatever the store holds: no plan step scans the anchors, events or outcomes tables, a
+// lineage is found through its own index, not by reading every review anchor's event,
+// and each anchor's event through its entry id, not the workspace's events.
 func TestReviewFindingQueriesUseIndexes(t *testing.T) {
 	s := openTestStore(t, newClock())
 	recordReview(t, s, alice, ReviewRecordInput{Findings: []ReviewFindingInput{finding("a.go", 1, 2, "x\ny")}})
+	sqlOf := func(f ReviewFindingFilter, ids ...string) [2]any {
+		q, args := reviewFindingsSQL(f, ids)
+		return [2]any{q, args}
+	}
 	for name, c := range map[string]struct {
-		f     ReviewFindingFilter
-		ids   []string
+		q     [2]any
 		index string
 	}{
-		"a record's findings":        {ReviewFindingFilter{WorkspaceID: "ws1", Statuses: []string{FindingOpen}}, []string{"rvf_1", "rvf_2"}, ""},
-		"a path's findings (dedupe)": {ReviewFindingFilter{WorkspaceID: "ws1", Lineage: "main@mb0", Path: "a.go"}, nil, "anchors_review_lineage"},
-		"a lineage page":             {ReviewFindingFilter{WorkspaceID: "ws1", Lineage: "main@mb0", AfterSeq: 3, Limit: 500}, nil, "anchors_review_lineage"},
-		"one finding":                {ReviewFindingFilter{}, nil, ""},
+		"a record's findings": {sqlOf(ReviewFindingFilter{WorkspaceID: "ws1", Statuses: []string{FindingOpen}}, "rvf_1", "rvf_2"), ""},
+		"a path's findings":   {sqlOf(ReviewFindingFilter{WorkspaceID: "ws1", Lineage: "main@mb0", Path: "a.go"}), "anchors_review_lineage"},
+		"a lineage page":      {sqlOf(ReviewFindingFilter{WorkspaceID: "ws1", Lineage: "main@mb0", AfterSeq: 3, Limit: 500}), "anchors_review_lineage"},
+		"one finding":         {[2]any{reviewFindingQuery + " AND a.entry_id = ?)", []any{OpenModeIdentity, "ws1", "rvf_1"}}, ""},
+		"dedupe candidates": {[2]any{dedupeCandidatesQuery, []any{"main@mb0", "a.go", 0, "h1", "new", 2, 1, "ws1", maxListLimit}},
+			"anchors_review_lineage"},
+		"a lineage's latest record": {[2]any{lineageLatestQuery, []any{"main@mb0", "ws1"}}, "anchors_lookup"},
 	} {
-		q, args := reviewFindingsSQL(c.f, c.ids)
-		if name == "one finding" {
-			q, args = reviewFindingQuery+" AND a.entry_id = ?)", []any{OpenModeIdentity, "ws1", "rvf_1"}
-		}
-		rows, err := s.readers.Query("EXPLAIN QUERY PLAN "+q, args...)
+		rows, err := s.readers.Query("EXPLAIN QUERY PLAN "+c.q[0].(string), c.q[1].([]any)...)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -521,7 +593,7 @@ func TestReviewFindingQueriesUseIndexes(t *testing.T) {
 			}
 		}
 		for _, step := range plan {
-			for _, table := range []string{"a", "ev", "t", "o"} {
+			for _, table := range []string{"a", "r", "ev", "t", "o"} {
 				if step == "SCAN "+table || strings.HasPrefix(step, "SCAN "+table+" ") {
 					t.Errorf("%s: plan scans %s: %v", name, table, plan)
 				}

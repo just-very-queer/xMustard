@@ -8,7 +8,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
+	"os/exec"
 	"slices"
 	"strings"
 
@@ -23,22 +25,25 @@ import (
 // digests (the merge base of a base ref and a head): its coverage over every file that
 // change touches, and its findings, anchored by WS-65 against the same diff bytes and
 // deduplicated by the store within the record's lineage. Before a record at a new head is
-// compared with its lineage, the lineage's earlier findings are re-anchored to it, lazily
-// and in one batch. A record is evidence for the human's merge decision; nothing here
-// approves a change.
+// compared with its lineage, the lineage's earlier findings on that head's line of
+// history are re-anchored to it, lazily and in one batch; a finding at a commit that is
+// not an ancestor of the head stays where it is. A record is evidence for the human's
+// merge decision; nothing here approves a change.
 
 // ReviewRecordLabel is carried by every review record result.
 const ReviewRecordLabel = "evidence only: a review record informs the human's merge decision; " +
 	"no review result approves a change"
 
-// maxReviewNote bounds one normalization note as a record stores it (a note can quote an
-// unknown category or severity at any length).
+// maxReviewNote bounds one normalization note or anchor reason as a record stores it (a
+// note can quote an unknown category or severity at any length).
 const maxReviewNote = 256
 
 // ReviewSubmission is one review of the change from the merge base of BaseRef to
 // HeadRef: its findings inputs, decoded by WS-65's review package, and the reviewer's
-// coverage report. Lineage defaults to "<base_ref>@<merge_base>", so a branch's later
-// heads on the same merge base share one; Producer defaults to agent.
+// coverage report. Lineage defaults to "<base_ref>@<merge_base>:<head branch>" (the
+// branch's full ref name), so a branch's later heads on the same merge base share one
+// and sibling branches cut from one commit never do; a head that is not a branch needs a
+// named lineage. Producer defaults to agent; human needs a principal of kind human.
 type ReviewSubmission struct {
 	BaseRef  string
 	HeadRef  string
@@ -50,13 +55,16 @@ type ReviewSubmission struct {
 
 // ReviewReanchorReport counts how the lineage's earlier findings came to this change:
 // kept (their file did not change, so their lines stand), moved (their quoted code was
-// found once in the file's new version), outdated (it was found nowhere) and unresolved
-// (found several times, in a file not read, or with no code to search for; they stay
-// where they were, out of positional dedupe).
+// found once in the file's new version), outdated (it was found nowhere), diverged
+// (their commit is not an ancestor of this change's, so they lie on another line of
+// history) and unresolved (found several times, in a file not read, with no code to
+// search for, or at a commit git cannot read). Diverged and unresolved findings stay
+// where they were, out of positional dedupe.
 type ReviewReanchorReport struct {
 	Kept       int      `json:"kept"`
 	Moved      int      `json:"moved"`
 	Outdated   int      `json:"outdated"`
+	Diverged   int      `json:"diverged"`
 	Unresolved int      `json:"unresolved"`
 	Errors     []string `json:"errors,omitempty"`
 }
@@ -118,12 +126,19 @@ func RecordReview(ctx context.Context, dataDir, workspaceID string, actor Contex
 	if err != nil {
 		return nil, err
 	}
-	in := govstore.ReviewRecordInput{WorkspaceID: workspaceID, Lineage: cmp.Or(sub.Lineage, change.BaseRef+"@"+change.MergeBase),
+	lineage, err := reviewLineage(ctx, change, sub)
+	if err != nil {
+		return nil, err
+	}
+	in := govstore.ReviewRecordInput{WorkspaceID: workspaceID, Lineage: lineage,
 		Change: govstore.ReviewChange{Repository: change.Repository, BaseRef: change.BaseRef, MergeBase: change.MergeBase,
 			Head: change.Head, DiffSHA256: change.DiffSHA256, DiffBytes: change.DiffBytes},
 		ChangedFiles: files, Producer: cmp.Or(sub.Producer, "agent"), Sources: sources}
 	out := &ReviewRecordResult{Normalized: batch.Normalized, Label: ReviewRecordLabel}
 	var red ingestRedaction
+	for i := range out.Normalized {
+		red.scrub(&out.Normalized[i])
+	}
 	for _, c := range sub.Coverage {
 		red.scrub(&c.Reason)
 		in.Coverage = append(in.Coverage, govstore.ReviewCoverage{Path: c.Path, Status: c.Status, Reason: c.Reason})
@@ -157,6 +172,26 @@ func RecordReview(ctx context.Context, dataDir, workspaceID string, actor Contex
 		return nil, err
 	}
 	return out, nil
+}
+
+// reviewLineage is the submission's lineage or, by default, the change's base ref and
+// merge base with the head's branch, as git names it in full (refs/heads/... or
+// refs/remotes/...). A head that is no branch (a commit, a tag or a detached HEAD) has
+// no line of history to name, so it needs a named lineage.
+func reviewLineage(ctx context.Context, change ReviewedChange, sub ReviewSubmission) (string, error) {
+	if sub.Lineage != "" {
+		return sub.Lineage, nil
+	}
+	head := strings.TrimSpace(sub.HeadRef)
+	var out bytes.Buffer
+	if err := reviewGit(ctx, change.Repository, &out, "rev-parse", "--symbolic-full-name", head); err != nil {
+		return "", fmt.Errorf("branch of %s: %w", head, err)
+	}
+	ref := strings.TrimSpace(out.String())
+	if !strings.HasPrefix(ref, "refs/heads/") && !strings.HasPrefix(ref, "refs/remotes/") {
+		return "", fmt.Errorf("%s is not a branch, so the review needs a named lineage (--lineage): %w", head, ErrInvalidInput)
+	}
+	return change.BaseRef + "@" + change.MergeBase + ":" + ref, nil
 }
 
 // mergeBatches joins a review's inputs into one batch, anchored together so re-filing
@@ -198,30 +233,34 @@ func anchorSubmission(ctx context.Context, dataDir, workspaceID, baseRef, headRe
 func findingInput(a review.Anchored) govstore.ReviewFindingInput {
 	f := govstore.ReviewFindingInput{Path: a.Path, AnchorStatus: string(a.Anchor.Status), AnchorReason: a.Anchor.Reason,
 		RefiledFrom: a.Anchor.RefiledFrom, Support: a.Support, Category: a.Category, Severity: a.Severity, Content: a.Content,
-		ExistingCode: a.ExistingCode, SuggestionCode: a.SuggestionCode,
+		ExistingCode: a.ExistingCode, SuggestionCode: a.SuggestionCode, Normalized: slices.Clone(a.Normalized),
 		Checks: govstore.ReviewChecks{CodePresent: string(a.Checks.CodePresent), InChangedHunk: string(a.Checks.InChangedHunk),
 			InScope: string(a.Checks.InScope), SymbolResolved: string(a.Checks.SymbolResolved)}}
 	if a.Anchor.Status != anchor.Unanchored {
 		f.Path, f.StartLine, f.EndLine, f.Side = a.Anchor.Path, a.Anchor.StartLine, a.Anchor.EndLine, string(a.Anchor.Side)
 	}
-	for _, n := range a.Normalized {
-		if len(n) > maxReviewNote {
-			n = cutRunes(n, maxReviewNote-len("…")) + "…"
-		}
-		f.Normalized = append(f.Normalized, n)
-	}
 	return f
 }
 
-// finding scrubs secrets from a finding's text after anchoring, which needs the code as
-// the file holds it, and before the store hashes the quoted code. A marker can be longer
-// than the secret it replaces, so a field is cut back to the store's bound.
+// boundedText is a finding's text field and the bytes the store takes of it.
+type boundedText struct {
+	v   *string
+	max int
+}
+
+// finding scrubs secrets from every text field of a finding after anchoring, which needs
+// the code as the file holds it, and before the store hashes the quoted code: the
+// reviewer's text and code, and the anchor reason and normalization notes, which can
+// quote the producer's raw values. A marker can be longer than the secret it replaces,
+// so each field is then cut back to its bound.
 func (ir *ingestRedaction) finding(f *govstore.ReviewFindingInput) {
 	quoted := f.ExistingCode
-	for _, field := range [...]struct {
-		v   *string
-		max int
-	}{{&f.Content, govstore.MaxFindingContent}, {&f.ExistingCode, govstore.MaxFindingCode}, {&f.SuggestionCode, govstore.MaxFindingCode}} {
+	fields := []boundedText{{&f.Content, govstore.MaxFindingContent}, {&f.ExistingCode, govstore.MaxFindingCode},
+		{&f.SuggestionCode, govstore.MaxFindingCode}, {&f.AnchorReason, maxReviewNote}}
+	for i := range f.Normalized {
+		fields = append(fields, boundedText{&f.Normalized[i], maxReviewNote})
+	}
+	for _, field := range fields {
 		ir.scrub(field.v)
 		if len(*field.v) > field.max {
 			*field.v = cutRunes(*field.v, field.max)
@@ -236,12 +275,14 @@ type hop struct{ from, to string }
 
 // reanchorLineage computes the moves that bring the lineage's earlier findings to the
 // change, so the new findings are compared with lines of the same commit: the head for
-// the new side, the merge base for the old. A finding whose file did not change between
-// its commit and the target keeps its lines; the others are searched for in the file at
-// the target (reanchorAt). Duplicates and outdated or unanchored findings do not move.
-// One name-only diff runs per (from, to) pair and one batch reader per target; a commit
-// git cannot diff (rewritten away) leaves its findings unresolved, with the error in the
-// report.
+// the new side, the merge base for the old. Only a finding whose commit is an ancestor of
+// the target moves (hopFiles): one elsewhere lies on another line of history, where its
+// code being absent says nothing, so it stays where it is. A finding whose file did not
+// change between its commit and the target keeps its lines; the others are searched for
+// in the file at the target (reanchorAt). Duplicates and outdated or unanchored findings
+// do not move. One ancestry check and one name-only diff run per (from, to) pair and one
+// batch reader per target; a commit git cannot read (rewritten away) leaves its findings
+// unresolved, with the error in the report.
 func reanchorLineage(ctx context.Context, dataDir, workspaceID, lineage string, change govstore.ReviewChange) ([]govstore.ReviewReanchor, *ReviewReanchorReport, error) {
 	hops := map[hop][]govstore.ReviewFinding{}
 	err := memoryView(ctx, dataDir, workspaceID, func(r govstore.Reader) error {
@@ -267,10 +308,14 @@ func reanchorLineage(ctx context.Context, dataDir, workspaceID, lineage string, 
 	var moves []govstore.ReviewReanchor
 	search := map[string][]govstore.ReviewFinding{}
 	for _, h := range slices.SortedFunc(maps.Keys(hops), func(a, b hop) int { return cmp.Or(cmp.Compare(a.from, b.from), cmp.Compare(a.to, b.to)) }) {
-		files, err := reviewChangedFiles(ctx, change.Repository, h.from, h.to)
-		if err != nil {
+		files, related, err := hopFiles(ctx, change.Repository, h)
+		switch {
+		case err != nil:
 			report.Unresolved += len(hops[h])
 			report.Errors = append(report.Errors, err.Error())
+			continue
+		case !related:
+			report.Diverged += len(hops[h])
 			continue
 		}
 		changed := make(map[string]bool, len(files))
@@ -303,6 +348,21 @@ func reanchorLineage(ctx context.Context, dataDir, workspaceID, lineage string, 
 		moves = append(moves, found...)
 	}
 	return moves, report, nil
+}
+
+// hopFiles lists the files that differ along h when h.from is an ancestor of h.to
+// (related, by git merge-base --is-ancestor, which exits 1 for no); otherwise it lists
+// nothing.
+func hopFiles(ctx context.Context, root string, h hop) ([]string, bool, error) {
+	err := reviewGit(ctx, root, io.Discard, "merge-base", "--is-ancestor", h.from, h.to)
+	if exit := (*exec.ExitError)(nil); errors.As(err, &exit) && exit.ExitCode() == 1 {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, fmt.Errorf("ancestry of %s and %s: %w", h.from, h.to, err)
+	}
+	files, err := reviewChangedFiles(ctx, root, h.from, h.to)
+	return files, err == nil, err
 }
 
 // reanchorAt looks for each finding's quoted code in its file at commit, read through

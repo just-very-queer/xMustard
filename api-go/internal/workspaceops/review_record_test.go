@@ -3,6 +3,7 @@
 package workspaceops
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -63,7 +64,7 @@ func TestReviewRecordBindsTheChangeAndEveryChangedFile(t *testing.T) {
 			claim("a.go", "func A() int { return 2 }"), // in a.go's hunk, new side
 			claim("a.go", "func B() {}"),               // not in a.go: re-filed to b.go, the only file holding it
 			claim("a.go", "func A() int { return 1 }"), // deleted: a.go's old side
-			map[string]any{"path": "b.go", "category": "Style", "severity": "trivial", "content": "no doc comment; token " + secret},
+			map[string]any{"path": "b.go", "category": "Style", "severity": "trivial " + secret, "content": "no doc comment; token " + secret},
 		)},
 		Coverage: []review.Coverage{{Path: "a.go", Status: govstore.CoverageReviewed}},
 	})
@@ -73,7 +74,7 @@ func TestReviewRecordBindsTheChangeAndEveryChangedFile(t *testing.T) {
 	}
 	rec := res.Record
 	if rec.Change.DiffSHA256 != change.DiffSHA256 || rec.Change.Head != git("rev-parse", "HEAD") ||
-		rec.Lineage != "main@"+change.MergeBase || rec.Author != "rev-1" || rec.AuthorOwner != "rev-1" || rec.Producer != "agent" ||
+		rec.Lineage != "main@"+change.MergeBase+":refs/heads/feature" || rec.Author != "rev-1" || rec.AuthorOwner != "rev-1" || rec.Producer != "agent" ||
 		len(rec.Sources) != 1 || rec.Sources[0].Ref != "findings.json" || len(rec.Sources[0].SHA256) != 64 || res.Label != ReviewRecordLabel {
 		t.Fatalf("record = %+v", rec)
 	}
@@ -103,9 +104,13 @@ func TestReviewRecordBindsTheChangeAndEveryChangedFile(t *testing.T) {
 	if f[0].Checks.InChangedHunk != "yes" || f[0].Checks.SymbolResolved != "unknown" || f[3].AnchorReason != "no_snippet" {
 		t.Fatalf("checks %+v, reason %q", f[0].Checks, f[3].AnchorReason)
 	}
-	if f[3].Category != "style" || f[3].Severity != "low" || len(f[3].Normalized) != 1 ||
-		strings.Contains(f[3].Content, secret) || res.Redactions == nil || res.Counts == nil || res.Counts.Findings != 4 {
-		t.Fatalf("normalized %v, content %q, redactions %+v, counts %+v", f[3].Normalized, f[3].Content, res.Redactions, res.Counts)
+	// The note quoting the unknown severity is scrubbed as the content is, in the stored
+	// finding and in the notes the result echoes.
+	if f[3].Category != "style" || f[3].Severity != "low" || len(f[3].Normalized) != 1 || strings.Contains(f[3].Normalized[0], secret) ||
+		strings.Contains(strings.Join(res.Normalized, " "), secret) || strings.Contains(f[3].Content, secret) || res.Redactions == nil ||
+		res.Counts == nil || res.Counts.Findings != 4 {
+		t.Fatalf("normalized %v (%v), content %q, redactions %+v, counts %+v", f[3].Normalized, res.Normalized, f[3].Content,
+			res.Redactions, res.Counts)
 	}
 	shown, err := ShowReviewRecord(ctx, dir, ws, rec.ID)
 	if err != nil || shown.Record.ID != rec.ID || len(shown.Findings) != 4 {
@@ -123,11 +128,13 @@ func TestReviewRecordBindsTheChangeAndEveryChangedFile(t *testing.T) {
 	}
 	full := batchOf(t, fifty...)
 	for name, sub := range map[string]ReviewSubmission{
-		"coverage outside the change": {Coverage: []review.Coverage{{Path: "z.go", Status: govstore.CoverageReviewed}}},
-		"waived is no coverage state": {Coverage: []review.Coverage{{Path: "a.go", Status: "waived", Reason: "ok"}}},
-		"head already in base":        {BaseRef: "feature", HeadRef: "HEAD"},
-		"option-shaped ref":           {BaseRef: "--output=/tmp/x", HeadRef: "HEAD"},
-		"over 500 findings":           {Batches: slices.Repeat([]*review.Batch{full}, govstore.MaxReviewFindings/review.MaxFindings+1)},
+		"coverage outside the change":  {Coverage: []review.Coverage{{Path: "z.go", Status: govstore.CoverageReviewed}}},
+		"waived is no coverage state":  {Coverage: []review.Coverage{{Path: "a.go", Status: "waived", Reason: "ok"}}},
+		"head already in base":         {BaseRef: "feature", HeadRef: "HEAD"},
+		"option-shaped ref":            {BaseRef: "--output=/tmp/x", HeadRef: "HEAD"},
+		"over 500 findings":            {Batches: slices.Repeat([]*review.Batch{full}, govstore.MaxReviewFindings/review.MaxFindings+1)},
+		"a commit with no lineage":     {BaseRef: "main", HeadRef: change.Head},
+		"producer human from an agent": {Producer: "human"},
 	} {
 		if sub.BaseRef == "" {
 			sub.BaseRef, sub.HeadRef = "main", "HEAD"
@@ -187,17 +194,76 @@ func TestReviewRecordReanchorsTheLineageLazily(t *testing.T) {
 	type state struct {
 		status, commit string
 		start          int
+		current        bool
 	}
 	want := []state{
-		{govstore.FindingOpen, head2, 3},                         // ambiguous at the third head: left at the second
-		{govstore.FindingOutdated, head2, 4},                     // B is gone: outdated where it was last seen
-		{govstore.FindingOpen, first.Record.Change.MergeBase, 3}, // old side: the merge base never moved
+		{govstore.FindingOpen, head2, 3, false},                        // ambiguous at the third head: left at the second
+		{govstore.FindingOutdated, head2, 4, false},                    // B is gone: outdated where it was last seen
+		{govstore.FindingOpen, first.Record.Change.MergeBase, 3, true}, // old side: the merge base never moved
 	}
 	for i, w := range want {
 		f := shown.Findings[i]
-		if got := (state{f.Status, f.Commit, f.StartLine}); got != w {
+		if got := (state{f.Status, f.Commit, f.StartLine, f.AnchorCurrent}); got != w {
 			t.Errorf("first record's finding %d = %+v, want %+v", i, got, w)
 		}
+	}
+}
+
+// Sibling branches cut from one commit share a merge base, not a line of history. By
+// default their lineages differ, since the head's branch is part of the name. In a
+// lineage they are made to share, a finding at one branch's head is never re-anchored to
+// the other's (its commit is no ancestor of that head), so recording them alternately
+// leaves every finding open where it was, and each branch's repeat is a duplicate of its
+// own first finding. A shared lineage stays bound to its base ref.
+func TestReviewRecordKeepsSiblingBranchesApart(t *testing.T) {
+	ctx := context.Background()
+	dir, ws, root, git := reviewRepo(t)
+	git("checkout", "-q", "-b", "other", "main")
+	if err := os.WriteFile(filepath.Join(root, "c.go"), []byte("package a\n\nfunc C() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	git("add", ".")
+	git("commit", "-q", "-m", "sibling")
+	mergeBase := git("merge-base", "main", "feature")
+	x := ReviewSubmission{BaseRef: "main", HeadRef: "feature", Batches: []*review.Batch{batchOf(t, claim("b.go", "func B() {}"))}}
+	y := ReviewSubmission{BaseRef: "main", HeadRef: "other", Batches: []*review.Batch{batchOf(t, claim("c.go", "func C() {}"))}}
+	for _, lineage := range []string{"", "shared"} {
+		x.Lineage, y.Lineage = lineage, lineage
+		var firsts []*ReviewRecordResult
+		for round := range 2 {
+			for i, sub := range []ReviewSubmission{x, y} {
+				res := recordReviewOK(t, dir, ws, reviewer, sub)
+				r, d := res.Reanchored, res.Findings[0].Dedupe
+				wantLineage, diverged := cmp.Or(lineage, "main@"+mergeBase+":refs/heads/"+sub.HeadRef), 0
+				if lineage != "" && (round > 0 || i > 0) {
+					diverged = 1 // the sibling's finding
+				}
+				if res.Record.Lineage != wantLineage || r.Diverged != diverged || r.Kept+r.Moved+r.Outdated+r.Unresolved != 0 {
+					t.Fatalf("lineage %q round %d, %s: lineage %s, reanchored %+v", lineage, round, sub.HeadRef, res.Record.Lineage, r)
+				}
+				if round == 0 {
+					firsts = append(firsts, res)
+				} else if d.Result != govstore.DedupeDuplicateOf || d.Of != firsts[i].Findings[0].ID {
+					t.Fatalf("lineage %q, %s again: %+v, want a duplicate of %s", lineage, sub.HeadRef, d, firsts[i].Findings[0].ID)
+				}
+			}
+		}
+		for i, first := range firsts {
+			shown, err := ShowReviewRecord(ctx, dir, ws, first.Record.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			f := shown.Findings[0]
+			// y was recorded last, so in the shared lineage only its findings are current.
+			current := lineage == "" || i == 1
+			if f.Status != govstore.FindingOpen || f.OutdatedAt != "" || f.Commit != first.Record.Change.Head || f.AnchorCurrent != current {
+				t.Fatalf("lineage %q: %s's first finding is %+v", lineage, first.Record.Change.Head, f)
+			}
+		}
+	}
+	x.BaseRef, x.Lineage = "main~0", "shared"
+	if _, err := RecordReview(ctx, dir, ws, reviewer, x); !errors.Is(err, govstore.ErrConflict) {
+		t.Fatalf("the shared lineage from another base ref: %v", err)
 	}
 }
 
