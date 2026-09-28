@@ -40,8 +40,9 @@ const TierCore = "core"
 
 // MetaQuarantine is the metadata key that marks an entry quarantined (WS-56): content
 // derived from an untrusted capture or a foreign import. Its value says why. The mark
-// is sticky: a classification change keeps it, and a quarantined entry never enters
-// the core tier.
+// is sticky: a classification change keeps it. A quarantined entry never holds the core
+// tier: it is refused on creation, on a tier change, and when a core entry would take
+// the mark. The classify event that adds the mark records it.
 const MetaQuarantine = "quarantine"
 
 var (
@@ -820,7 +821,7 @@ func (t *txn) SetTier(ctx context.Context, id, tier string, actor Actor) (Entry,
 
 // quarantinedCore refuses a quarantined entry the core tier.
 func quarantinedCore(id, why string) error {
-	return fmt.Errorf("%w: entry %s is quarantined (%s) and cannot enter the core tier", ErrInvalid, id, why)
+	return fmt.Errorf("%w: entry %s is quarantined (%s) and cannot hold the core tier", ErrInvalid, id, why)
 }
 
 // SetRequiredVerifications changes the entry's gate. The peer_verified invariant is
@@ -892,6 +893,10 @@ func (t *txn) SetClassification(ctx context.Context, id string, c Classification
 		}
 		c.Metadata[MetaQuarantine] = q
 	}
+	quarantine := c.Metadata[MetaQuarantine]
+	if cur.Tier == TierCore && quarantine != "" {
+		return Entry{}, quarantinedCore(id, quarantine)
+	}
 	tags, err := encodeStrings(c.Tags)
 	if err != nil {
 		return Entry{}, err
@@ -904,9 +909,13 @@ func (t *txn) SetClassification(ctx context.Context, id string, c Classification
 		c.Kind, c.Topic, tags, meta, t.nowText(), id); err != nil {
 		return Entry{}, err
 	}
+	data := map[string]any{"kind": c.Kind, "topic": c.Topic, "tags": c.Tags}
+	if quarantine != cur.Metadata[MetaQuarantine] {
+		data["quarantine"] = quarantine // the mark is added: the history shows why
+	}
 	if err := t.appendEvent(ctx, actor, eventRow{
 		WorkspaceID: cur.WorkspaceID, EntryID: id, Type: EventClassify, Revision: cur.Revision,
-		Data: map[string]any{"kind": c.Kind, "topic": c.Topic, "tags": c.Tags},
+		Data: data,
 	}); err != nil {
 		return Entry{}, err
 	}

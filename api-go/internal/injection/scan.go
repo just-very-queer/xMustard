@@ -1,6 +1,7 @@
 package injection
 
 import (
+	"bytes"
 	"sync"
 	"unicode"
 	"unicode/utf8"
@@ -17,10 +18,28 @@ const MaxScanBytes = 128 << 10
 // is never pushed.
 const FlagTruncated = "scan_truncated"
 
+// FlagSaturated is reported when the text held so many trigger occurrences whose
+// patterns failed that the scan spent its match budget and stopped. Legitimate text
+// stays far below the budget; text dense with triggers is flagged, like a match.
+const FlagSaturated = "scan_saturated"
+
+// The match budget bounds how many patterns one scan tries: matchTriesBase, plus one
+// for every matchBytesPerTry bytes scanned. A failed try costs up to about 2.6 µs (a
+// long bounded run, or many alternatives, failing late), so a scan of MaxScanBytes
+// spends at most about 6 ms matching whatever the text holds. Legitimate text tries far
+// fewer: the repository's own sources and docs at most one pattern per 163 bytes, half
+// of them under one per 2,000 (TestMatchBudgetHeadroom keeps a sample under a quarter
+// of the budget).
+const (
+	matchTriesBase   = 128
+	matchBytesPerTry = 64
+)
+
 // Report is what a scan found.
 type Report struct {
-	// Flags are the ids of the rules that matched, in table order, then FlagTruncated
-	// when the text was cut. Empty means the scanned text is clean.
+	// Flags are the ids of the rules that matched, in table order, then FlagSaturated
+	// when the match budget ran out and FlagTruncated when the text was cut. Empty means
+	// the scanned text is clean.
 	Flags []string `json:"flags,omitempty"`
 	// Scanned is how many bytes were read.
 	Scanned int `json:"scanned_bytes"`
@@ -35,10 +54,14 @@ var foldBuffers = sync.Pool{New: func() any { return new([]byte) }}
 // Scan checks text, given as parts (a title and a body, say), for instruction patterns.
 // It reads at most MaxScanBytes in total and folds each part once; the cost is one pass
 // over the folded bytes plus a match bounded by the rule's window at each trigger
-// occurrence.
+// occurrence, and the match budget bounds the matches in all.
 func Scan(parts ...string) Report {
 	var rep Report
-	var hit uint64 // bit i: compiled[i] matched
+	total := 0
+	for _, p := range parts {
+		total += len(p)
+	}
+	sc := scanner{tries: matchTriesBase + min(total, MaxScanBytes)/matchBytesPerTry}
 	room, truncated := MaxScanBytes, false
 	bp := foldBuffers.Get().(*[]byte)
 	defer foldBuffers.Put(bp)
@@ -50,13 +73,16 @@ func Scan(parts ...string) Report {
 		rep.Scanned += len(p)
 		if p != "" {
 			*bp = fold((*bp)[:0], p)
-			hit = scanFolded(*bp, hit)
+			sc.scan(*bp)
 		}
 	}
 	for i, c := range compiled {
-		if hit&(1<<i) != 0 {
+		if sc.hit&(1<<i) != 0 {
 			rep.Flags = append(rep.Flags, c.id)
 		}
+	}
+	if sc.saturated {
+		rep.Flags = append(rep.Flags, FlagSaturated)
 	}
 	if truncated {
 		rep.Flags = append(rep.Flags, FlagTruncated)
@@ -67,13 +93,22 @@ func Scan(parts ...string) Report {
 // allRules has a bit set for every compiled rule.
 var allRules = uint64(1)<<len(compiled) - 1
 
-// scanFolded adds to hit the rules that match folded text. A byte inside a word starts
-// no trigger (word triggers count only at the start of a word), so it is skipped; at
-// any other byte, the triggers that start with it are compared, and a rule not yet
-// matched is tried from each of its triggers that occurs there.
-func scanFolded(f []byte, hit uint64) uint64 {
+// scanner is one scan's state across the parts it folds.
+type scanner struct {
+	hit       uint64 // bit i: compiled[i] matched
+	tries     int    // patterns the scan may still try
+	saturated bool   // the budget ran out; the scan stopped
+}
+
+// scan adds the rules that match folded text. A byte inside a word starts no trigger
+// (word triggers count only at the start of a word), so it is skipped; at any other
+// byte, the triggers that start with it are compared, and a rule not yet matched is
+// tried from each of its triggers that occurs there, when its window holds the byte the
+// rule needs. Each try spends one from the budget; the scan stops, saturated, when a
+// try would overspend it.
+func (sc *scanner) scan(f []byte) {
 	prevWord := false
-	for i := 0; i < len(f) && hit != allRules; i++ {
+	for i := 0; i < len(f) && sc.hit != allRules && !sc.saturated; i++ {
 		b := f[i]
 		word := isWordByte(b)
 		if word && prevWord {
@@ -81,16 +116,23 @@ func scanFolded(f []byte, hit uint64) uint64 {
 		}
 		prevWord = word
 		for _, t := range byFirst[b] {
-			if hit&(1<<t.rule) != 0 || !hasPrefix(f[i:], t.lit) {
+			if sc.hit&(1<<t.rule) != 0 || !hasPrefix(f[i:], t.lit) {
 				continue
 			}
-			c := compiled[t.rule]
-			if c.re.Match(f[i:min(len(f), i+c.window)]) {
-				hit |= 1 << t.rule
+			c := &compiled[t.rule]
+			w := f[i:min(len(f), i+c.window)]
+			if c.needs != 0 && bytes.IndexByte(w, c.needs) < 0 {
+				continue
+			}
+			if sc.tries--; sc.tries < 0 {
+				sc.saturated = true
+				return
+			}
+			if c.re.Match(w) {
+				sc.hit |= 1 << t.rule
 			}
 		}
 	}
-	return hit
 }
 
 func hasPrefix(b []byte, prefix string) bool {
@@ -99,10 +141,13 @@ func hasPrefix(b []byte, prefix string) bool {
 
 // fold appends s to dst lowercased, with every run of whitespace written as one space,
 // or as "\n\n" when the run holds a paragraph break (two newlines). The text is taken
-// to start after a paragraph break, so the output starts with "\n\n". Invalid UTF-8
-// bytes are kept as they are.
+// to start after a paragraph break, so the output starts with "\n\n". A run of
+// underscores between two letters or digits (snake_case, im_start) is kept; any other
+// run is markdown emphasis (_word_, __word__) and reads as whitespace, so the word it
+// opens starts a word. Invalid UTF-8 bytes are kept as they are.
 func fold(dst []byte, s string) []byte {
 	space, newlines := true, 2
+	alnum := false // the last rune written was a letter or digit
 	flush := func() {
 		switch {
 		case newlines >= 2:
@@ -118,12 +163,25 @@ func fold(dst []byte, s string) []byte {
 			i++
 			switch asciiClass[b] {
 			case asciiNewline:
-				space, newlines = true, newlines+1
+				space, newlines, alnum = true, newlines+1, false
 			case asciiSpace:
-				space = true
+				space, alnum = true, false
+			case asciiUnderscore:
+				j := i
+				for j < len(s) && s[j] == '_' {
+					j++
+				}
+				if alnum && alnumAt(s, j) {
+					flush()
+					dst = append(dst, s[i-1:j]...)
+				} else {
+					space = true
+				}
+				i, alnum = j, false
 			default:
 				flush()
 				dst = append(dst, asciiLower[b])
+				alnum = asciiClass[b] == asciiAlnum
 			}
 			continue
 		}
@@ -138,10 +196,23 @@ func fold(dst []byte, s string) []byte {
 			flush()
 			dst = utf8.AppendRune(dst, unicode.ToLower(r))
 		}
+		alnum = unicode.IsLetter(r) || unicode.IsDigit(r)
 		i += size
 	}
 	flush()
 	return dst
+}
+
+// alnumAt reports whether s holds a letter or digit at byte i.
+func alnumAt(s string, i int) bool {
+	if i >= len(s) {
+		return false
+	}
+	if s[i] < utf8.RuneSelf {
+		return asciiClass[s[i]] == asciiAlnum
+	}
+	r, _ := utf8.DecodeRuneInString(s[i:])
+	return unicode.IsLetter(r) || unicode.IsDigit(r)
 }
 
 // ASCII classes for fold.
@@ -149,10 +220,12 @@ const (
 	asciiOther = iota
 	asciiSpace
 	asciiNewline
+	asciiUnderscore
+	asciiAlnum
 )
 
-// asciiClass and asciiLower are fold's ASCII tables: the whitespace class of a byte,
-// and its lowercase.
+// asciiClass and asciiLower are fold's ASCII tables: the class of a byte, and its
+// lowercase.
 var asciiClass, asciiLower = asciiTables()
 
 func asciiTables() (class, lower [utf8.RuneSelf]byte) {
@@ -162,10 +235,19 @@ func asciiTables() (class, lower [utf8.RuneSelf]byte) {
 			lower[b] = b + 'a' - 'A'
 		}
 	}
-	for _, b := range []byte(" \t\r\v\f") {
-		class[b] = asciiSpace
+	for _, set := range [...]struct {
+		bytes string
+		class byte
+	}{
+		{" \t\r\v\f", asciiSpace},
+		{"\n", asciiNewline},
+		{"_", asciiUnderscore},
+		{"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ", asciiAlnum},
+	} {
+		for _, b := range []byte(set.bytes) {
+			class[b] = set.class
+		}
 	}
-	class['\n'] = asciiNewline
 	return class, lower
 }
 

@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"xmustard/api-go/internal/budget"
+	"xmustard/api-go/internal/injection"
 )
 
 // Universal observation capture (PAR-CTX-01): the output of ANY tool — a client's
@@ -62,7 +63,7 @@ type ObservationResult struct {
 	Family             Family       `json:"family"`
 	Facts              Facts        `json:"facts"`
 	Structured         any          `json:"projection_struct,omitempty"`
-	Footer             string       `json:"footer,omitempty"`
+	Footer             string       `json:"footer,omitempty"` // the recovery line, then the injection-check line when flagged
 	DeliveredTokensEst int          `json:"delivered_tokens_est"`
 	TokenEstimator     string       `json:"token_estimator"`
 	Shape              *ShapeResult `json:"shape,omitempty"`
@@ -182,6 +183,11 @@ func (s *Store) Observe(ctx context.Context, reg *Registry, in ObservationInput)
 	res.Facts, res.Structured = proj.Facts, proj.Structured
 	if d.Handle != "" {
 		res.Footer = evidenceFooter(d, in.WorkspaceID)
+	}
+	if len(d.InjectionFlags) > 0 {
+		// the shaped output xMustard puts in place of the native one carries the same
+		// data-framing line as an MCP result (WS-56)
+		res.Footer = strings.TrimPrefix(res.Footer+"\n"+injection.Note(meta.Tool, d.InjectionFlags), "\n")
 	}
 	res.Shape = ShapeOutput(ShapeInput{Client: meta.Client, Tool: meta.Tool, Body: bodyForShape(in.Format, body),
 		Proj: proj, Reduced: d.Reduced, Footer: res.Footer, RawBytes: d.RawBytes, IsError: meta.IsError})

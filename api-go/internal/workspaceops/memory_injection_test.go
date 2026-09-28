@@ -17,12 +17,19 @@ import (
 // handle.
 func capturedEvidence(t *testing.T, dir, ws, actor, tool string) string {
 	t.Helper()
+	return retainedOutput(t, dir, ws, actor, tool, "rate limit: 100 requests per minute\n")
+}
+
+// retainedOutput captures output as an original of tool's for actor and returns its
+// handle.
+func retainedOutput(t *testing.T, dir, ws, actor, tool, output string) string {
+	t.Helper()
 	s := evidence.NewStore(dir, evidence.DefaultLimits())
 	sp, err := s.NewSpool(ws)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := sp.Write([]byte("rate limit: 100 requests per minute\n")); err != nil {
+	if _, err := sp.Write([]byte(output)); err != nil {
 		t.Fatal(err)
 	}
 	d, err := s.Capture(context.Background(), sp, evidence.CaptureRequest{WorkspaceID: ws, Tool: tool,
@@ -228,6 +235,62 @@ func TestUntrustedCaptureQuarantines(t *testing.T) {
 	}
 	if got, _ := entryView(t, dir, ws, edited.ID, false); got.Quarantine != "untrusted_capture:mcp__fetch__fetch" {
 		t.Fatalf("edit did not quarantine: %+v", got)
+	}
+}
+
+// Quarantine carries through xMustard's own tools: a proposal that cites a recall result
+// which served a quarantined memory is quarantined for the same reason, and one that
+// cites a result without one is not.
+func TestQuarantineCarriesThroughRecall(t *testing.T) {
+	dir, ws := multiAgentDir(t), "ws"
+	web := capturedEvidence(t, dir, ws, "author", "WebFetch")
+	fromWeb, err := Remember(dir, ws, RememberRequest{ProposeContextRequest: ProposeContextRequest{Title: "limits",
+		Content: "the API allows 100 requests per minute", Permission: "readwrite"}, Evidence: []string{web}}, ContextActor{ID: "author"})
+	if err != nil || fromWeb.Quarantine == "" {
+		t.Fatalf("propose: %v %+v", err, fromWeb)
+	}
+	rec, err := RecallWith(context.Background(), dir, ws, RecallRequest{Query: "requests", IncludePending: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	served := mustJSONString(t, rec)
+	if !strings.Contains(served, fromWeb.ID) {
+		t.Fatalf("recall did not serve the quarantined proposal: %s", served)
+	}
+	carrying := retainedOutput(t, dir, ws, "author", "recall", served)
+	clean := retainedOutput(t, dir, ws, "author", "mcp__xmustard__recall", `{"entries":[],"data_notice":"`+injection.DataNotice+`"}`)
+	for handle, want := range map[string]string{carrying: fromWeb.Quarantine, clean: ""} {
+		e, err := Remember(dir, ws, RememberRequest{ProposeContextRequest: ProposeContextRequest{Title: "retry policy",
+			Content: "retry after the rate limit resets", Permission: "readwrite"}, Evidence: []string{handle}}, ContextActor{ID: "author"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if e.Quarantine != want {
+			t.Errorf("a proposal citing %s: quarantine %q, want %q", handle, e.Quarantine, want)
+		}
+	}
+}
+
+// A core-tier entry refuses an edit derived from an untrusted capture: the quarantine
+// mark it would take cannot hold the core tier, so the edit fails and nothing changes.
+func TestCoreEntryRefusesQuarantinedEdit(t *testing.T) {
+	dir, ws := multiAgentDir(t), "ws"
+	core := promoted(t, dir, ws, "author", "the config caps requests")
+	if err := memoryUpdate(context.Background(), dir, ws, func(tx govstore.Tx) error {
+		_, err := tx.SetTier(context.Background(), core.ID, govstore.TierCore, govstore.Actor{Principal: "admin"})
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	web := capturedEvidence(t, dir, ws, "author", "WebFetch")
+	_, err := Remember(dir, ws, RememberRequest{Op: "edit", EntryID: core.ID, BaseRevision: 1, Reason: "per the docs page",
+		NewString: "the config caps requests at 100 per minute", OldString: "the config caps requests", Evidence: []string{web}},
+		ContextActor{ID: "author"})
+	if !errors.Is(err, ErrInvalidInput) && !errors.Is(err, govstore.ErrInvalid) {
+		t.Fatalf("a core entry took an untrusted edit: %v", err)
+	}
+	if got, _ := entryView(t, dir, ws, core.ID, false); got.Quarantine != "" || got.Content != "the config caps requests" {
+		t.Fatalf("the refused edit changed the entry: %+v", got)
 	}
 }
 

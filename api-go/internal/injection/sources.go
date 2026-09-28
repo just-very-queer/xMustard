@@ -2,6 +2,7 @@ package injection
 
 import (
 	"cmp"
+	"regexp"
 	"strings"
 )
 
@@ -60,14 +61,40 @@ func setOf(vals ...string) map[string]bool {
 // when it is xMustard's own.
 func CaptureQuarantine(tool string) string {
 	t := strings.ToLower(strings.TrimSpace(tool))
-	trusted := workspaceTools[t] || xmustardTools[t]
-	for _, p := range xmustardToolPrefixes {
-		if rest, ok := strings.CutPrefix(t, p); ok {
-			trusted = xmustardTools[rest]
-		}
-	}
-	if trusted {
+	if workspaceTools[t] || OwnTool(t) {
 		return ""
 	}
 	return quarantineCapturePrefix + attrValue(cutUTF8(cmp.Or(t, "unknown"), maxQuarantineTool))
+}
+
+// OwnTool reports whether tool is one of xMustard's nine tools, by its bare name or as
+// an MCP tool of the xmustard server.
+func OwnTool(tool string) bool {
+	t := strings.ToLower(strings.TrimSpace(tool))
+	for _, p := range xmustardToolPrefixes {
+		if rest, ok := strings.CutPrefix(t, p); ok {
+			return xmustardTools[rest]
+		}
+	}
+	return xmustardTools[t]
+}
+
+// quarantineMember is how xMustard's tools render a quarantined memory: a JSON member
+// "quarantine" whose value is the reason (a quarantine name keeps attrValue's
+// characters). Inside a JSON string a quote is escaped, so tool-written text a result
+// quotes (a code snippet, a memory's content) never forms the member.
+var quarantineMember = regexp.MustCompile(`"quarantine"[ \t\r\n]{0,8}:[ \t\r\n]{0,8}"([A-Za-z0-9_.,:/-]{1,128})"`)
+
+// MaxQuarantineMember bounds the bytes of one quarantine member, so a caller reading a
+// result in chunks finds a member that spans two of them by carrying this many bytes.
+const MaxQuarantineMember = 160
+
+// CarriedQuarantine is the reason of the first quarantined memory an xMustard tool
+// result carries (recall, a memory fetched by id, a remember or verify reply), or "".
+// Content derived from such a result stays quarantined like the memory it quotes.
+func CarriedQuarantine(result []byte) string {
+	if m := quarantineMember.FindSubmatch(result); m != nil {
+		return string(m[1])
+	}
+	return ""
 }

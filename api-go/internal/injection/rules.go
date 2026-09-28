@@ -30,17 +30,22 @@ import (
 )
 
 // Rule is one instruction pattern. The scan folds the text once (lowercase, every run
-// of whitespace one space, a paragraph break "\n\n", and the text itself starting after
-// one), so a pattern separates words with a single space. Every match starts with one of
-// the rule's triggers: the scan tries the pattern only where a trigger occurs, and a
-// trigger that starts with a letter or digit only at the start of a word. The pattern
-// is matched from that position over at most matchWindow bytes, so a scan costs one pass
-// over the text plus a short anchored match per trigger occurrence.
+// of whitespace one space, a paragraph break "\n\n", the text itself starting after one,
+// and markdown's underscore emphasis read as a space), so a pattern separates words with
+// a single space. Every match starts with one of the rule's triggers: the scan tries the
+// pattern only where a trigger occurs, and a trigger that starts with a letter or digit
+// only at the start of a word. The pattern is matched from that position over at most
+// matchWindow bytes, so a scan costs one pass over the text plus a short anchored match
+// per trigger occurrence, and the scan's match budget bounds the sum of those matches.
 type Rule struct {
 	// ID is the flag reported when the rule matches.
 	ID string
 	// Triggers are lowercase literals of the folded text; every match starts with one.
 	Triggers []string
+	// Needs, when set, is a byte every match holds: the pattern runs only when the bytes
+	// it is matched over hold it, which spares the long failed matches of a pattern that
+	// scans far for a delimiter.
+	Needs byte
 	// Pattern is RE2 over the folded text, matched from the start of a trigger. Its
 	// matches are shorter than matchWindow (checked when the table is compiled).
 	Pattern string
@@ -83,7 +88,7 @@ var Rules = []Rule{
 		Pattern: `(?:send|upload|post|exfiltrate|leak|forward|email|transmit) (?:the |all |your |any )?` +
 			`(?:contents? of )?(?:~/\.ssh|id_rsa|id_ed25519|\.env\b|\.aws\b|\.netrc\b|api[ _-]?keys?\b|secrets\b|` +
 			`credentials\b|private keys?\b|access tokens?\b|passwords\b)`},
-	{ID: "remote_exec", Triggers: []string{"curl", "wget"},
+	{ID: "remote_exec", Triggers: []string{"curl", "wget"}, Needs: '|',
 		Pattern: `(?:curl|wget)\b[^\n|]{0,100}\| ?(?:sudo )?(?:ba|z|da|k)?sh\b`},
 	{ID: "chat_template", Triggers: []string{"<|", "[inst]", "[/inst]", "<<sys>>", "<</sys>>"},
 		Pattern: `<\|(?:im_start|im_end|im_sep|system|user|assistant|endoftext|eot_id|start_header_id|end_header_id|begin_of_text)\|>` +
@@ -92,17 +97,24 @@ var Rules = []Rule{
 		Pattern: `\n\n(?:human|assistant) ?:`},
 	{ID: "frame_spoof", Triggers: []string{"<" + FrameTag, "</" + FrameTag, "<system", "</system", "<instructions",
 		"</instructions", "<tool_", "</tool_", "<function_", "</function_", "<invoke", "</invoke", "<antml", "</antml",
-		"<user_query", "</user_query"},
+		"<user_query", "</user_query"}, Needs: '>',
 		Pattern: `</?(?:` + FrameTag + `|system|system-reminder|system_prompt|instructions|tool_result|tool_use|function_results|` +
 			`function_calls|invoke|antml:[a-z_]{1,40}|user_query)\b[^>\n]{0,100}>`},
 	{ID: "hook_spoof", Triggers: []string{`"hookspecificoutput"`, `"additionalcontext"`, `"permissiondecision"`,
 		`"updatedtooloutput"`, `"updatedinput"`},
 		Pattern: `"(?:hookspecificoutput|additionalcontext|permissiondecision|updatedtooloutput|updatedinput)" ?:`},
-	// Invisible text: zero-width characters, bidirectional overrides and isolates, the
-	// byte-order mark and Unicode tag characters (which can carry hidden ASCII). The
-	// triggers are the UTF-8 lead bytes of those blocks.
-	{ID: "hidden_text", Triggers: []string{"\xe2\x80", "\xe2\x81", "\xef\xbb\xbf", "\xf3\xa0"},
-		Pattern: `[\x{200B}-\x{200F}\x{202A}-\x{202E}\x{2060}-\x{2064}\x{2066}-\x{2069}\x{FEFF}\x{E0000}-\x{E007F}]`},
+	// Invisible text: the soft hyphen, the combining grapheme joiner, zero-width and
+	// filler characters (Hangul, Khmer, Mongolian), bidirectional marks, overrides and
+	// isolates, the byte-order mark, Unicode tag characters and the supplementary
+	// variation selectors (either can carry hidden ASCII, a byte per character). The
+	// variation selectors U+FE00-FE0F count only two in a row: an emoji takes one. The
+	// triggers are the UTF-8 encodings of those characters, or their shared lead bytes.
+	{ID: "hidden_text", Triggers: []string{"\xc2\xad", "\xcd\x8f", "\xd8\x9c", "\xe1\x85\x9f", "\xe1\x85\xa0",
+		"\xe1\x9e\xb4", "\xe1\x9e\xb5", "\xe1\xa0\x8e", "\xe2\x80", "\xe2\x81", "\xe3\x85\xa4", "\xef\xb8",
+		"\xef\xbb\xbf", "\xef\xbe\xa0", "\xf3\xa0"},
+		Pattern: `[\x{AD}\x{34F}\x{61C}\x{115F}\x{1160}\x{17B4}\x{17B5}\x{180E}\x{200B}-\x{200F}\x{202A}-\x{202E}` +
+			`\x{2060}-\x{2064}\x{2066}-\x{2069}\x{3164}\x{FEFF}\x{FFA0}\x{E0000}-\x{E007F}\x{E0100}-\x{E01EF}]` +
+			`|[\x{FE00}-\x{FE0F}]{2}`},
 }
 
 // matchWindow bounds every pattern's longest match. A pattern is matched from its
@@ -113,12 +125,13 @@ const matchWindow = 512
 // maxRules is how many rules the scan's match set holds.
 const maxRules = 64
 
-// compiledRule is a rule ready to run: its pattern anchored at the trigger, and the
-// bytes it is matched over.
+// compiledRule is a rule ready to run: its pattern anchored at the trigger, the bytes
+// it is matched over, and the byte those must hold (0: none).
 type compiledRule struct {
 	id     string
 	re     *regexp.Regexp
 	window int
+	needs  byte
 }
 
 // trigger is one rule trigger, indexed by its first byte.
@@ -141,7 +154,7 @@ func compileRules(rules []Rule) ([]compiledRule, *[256][]trigger) {
 	}
 	out := make([]compiledRule, len(rules))
 	index := new([256][]trigger)
-	seen := map[string]bool{FlagTruncated: true}
+	seen := map[string]bool{FlagTruncated: true, FlagSaturated: true}
 	for i, r := range rules {
 		if r.ID == "" || seen[r.ID] || len(r.Triggers) == 0 {
 			panic(fmt.Sprintf("injection: rule %d (%q) has an empty or duplicate id, or no triggers", i, r.ID))
@@ -151,7 +164,7 @@ func compileRules(rules []Rule) ([]compiledRule, *[256][]trigger) {
 		if n < 0 || n >= matchWindow {
 			panic(fmt.Sprintf("injection: rule %s matches up to %d bytes, not under the %d-byte window", r.ID, n, matchWindow))
 		}
-		out[i] = compiledRule{id: r.ID, re: regexp.MustCompile(`^(?:` + r.Pattern + `)`), window: n + 1}
+		out[i] = compiledRule{id: r.ID, re: regexp.MustCompile(`^(?:` + r.Pattern + `)`), window: n + 1, needs: r.Needs}
 		for _, lit := range r.Triggers {
 			if lit == "" || strings.IndexFunc(lit, unicode.IsUpper) >= 0 {
 				panic(fmt.Sprintf("injection: rule %s trigger %q is empty or not lowercase", r.ID, lit))

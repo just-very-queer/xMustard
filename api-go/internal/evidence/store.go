@@ -13,6 +13,7 @@
 package evidence
 
 import (
+	"cmp"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -142,6 +143,10 @@ type Observation struct {
 	WorkspaceQuota int64  `json:"workspace_quota"`
 	Revoked        bool   `json:"revoked,omitempty"`
 	Projection     Record `json:"projection"`
+	// Quarantine says why content derived from this capture is quarantined (WS-56): it
+	// captured an untrusted tool (injection.CaptureQuarantine), or an xMustard result
+	// that carried quarantined memory (injection.CarriedQuarantine). Empty when it is not.
+	Quarantine string `json:"quarantine,omitempty"`
 }
 
 // CaptureRequest describes one tool result being delivered.
@@ -234,6 +239,8 @@ type Page struct {
 	Freshness string `json:"freshness"`
 	Stale     bool   `json:"stale"`
 	ExpiresAt string `json:"expires_at"`
+	// Quarantine is the capture's Observation.Quarantine.
+	Quarantine string `json:"quarantine,omitempty"`
 	// CurrentKeyCached / CurrentKeyAgeMs: the current identity came from the identity
 	// cache (no repo-key run for this page) and was sampled that long ago. A capture
 	// whose identity is not bound never needs the current identity, so none is read.
@@ -458,7 +465,7 @@ func (s *Store) Capture(ctx context.Context, sp *Spool, req CaptureRequest) (*De
 	if err := ctx.Err(); err != nil {
 		return nil, err // a cancelled call never issues a handle
 	}
-	sum, err := hashFile(ctx, sp.f, sp.n)
+	sum, carried, err := digestFile(ctx, sp.f, sp.n, injection.OwnTool(req.Tool))
 	if err != nil {
 		return nil, err
 	}
@@ -476,7 +483,7 @@ func (s *Store) Capture(ctx context.Context, sp *Spool, req CaptureRequest) (*De
 		}
 	}
 	d.Projection, d.ProjectedBytes, d.Omissions, d.Reduced, d.ProjectionMode = proj, len(proj), rec.Omissions, rec.Reduced, rec.Mode
-	d.InjectionFlags = injection.Scan(proj).Flags
+	d.InjectionFlags = injection.ScanText(proj).Flags
 	if !rec.Reduced && !req.Retain {
 		// nothing omitted: nothing retained, no handle, identity not sampled
 		d.CapturedIdentity = "unknown"
@@ -495,7 +502,7 @@ func (s *Store) Capture(ctx context.Context, sp *Spool, req CaptureRequest) (*De
 		CapturedAt: now.Format(time.RFC3339Nano), Status: req.Status, IsError: req.IsError,
 		ContentType: req.ContentType, RawSHA256: sum, RawBytes: sp.n,
 		ExpiresAt: now.Add(s.limits.Retention).Format(time.RFC3339Nano), WorkspaceQuota: s.limits.WorkspaceQuota,
-		Projection: rec,
+		Projection: rec, Quarantine: cmp.Or(injection.CaptureQuarantine(req.Tool), carried),
 	}
 	// identity is bound only when complete identities sampled before and after
 	// execution agree; otherwise freshness of this evidence is unknown forever. An
@@ -576,7 +583,7 @@ func (s *Store) Read(ctx context.Context, req ReadRequest) (*Page, error) {
 	p := &Page{Handle: req.Handle, Tool: obs.Tool, CallID: obs.CallID, ContentType: obs.ContentType,
 		Offset: req.Offset, Length: length, TotalBytes: obs.RawBytes, NextOffset: req.Offset + int64(length),
 		Encoding: "base64", Data: base64.StdEncoding.EncodeToString(buf), RawSHA256: obs.RawSHA256,
-		CapturedKey: obs.CapturedKey, ExpiresAt: obs.ExpiresAt}
+		CapturedKey: obs.CapturedKey, ExpiresAt: obs.ExpiresAt, Quarantine: obs.Quarantine}
 	p.EOF = p.NextOffset >= obs.RawBytes
 	var cur Identity
 	if obs.CapturedKeyOK && req.RepoKey != nil {
@@ -750,25 +757,35 @@ func (s *Store) retainedLocked(ws string, st *wsState, rescan bool) (int64, erro
 	return used, nil
 }
 
-func hashFile(ctx context.Context, f *os.File, n int64) (string, error) {
+// digestFile hashes the n-byte original in f. When carries is set (a result of one of
+// xMustard's own tools) it also returns the first quarantine the original carries
+// (injection.CarriedQuarantine), found across chunk boundaries by keeping the tail of
+// each chunk in front of the next.
+func digestFile(ctx context.Context, f *os.File, n int64, carries bool) (sum, quarantine string, err error) {
 	h := sha256.New()
-	buf := make([]byte, 256<<10)
+	const chunk, tail = 256 << 10, injection.MaxQuarantineMember
+	buf := make([]byte, tail+chunk)
+	kept := 0 // bytes of the previous chunk's tail at the front of buf
 	for off := int64(0); off < n; {
 		if err := ctx.Err(); err != nil {
-			return "", err
+			return "", "", err
 		}
-		m, err := f.ReadAt(buf[:min(int64(len(buf)), n-off)], off)
-		h.Write(buf[:m])
+		m, err := f.ReadAt(buf[kept:kept+int(min(chunk, n-off))], off)
+		h.Write(buf[kept : kept+m])
 		budget.NoteHashed(int64(m))
 		off += int64(m)
 		if err != nil && !errors.Is(err, io.EOF) {
-			return "", err
+			return "", "", err
 		}
 		if m == 0 {
-			return "", ErrCorrupt
+			return "", "", ErrCorrupt
+		}
+		if carries && quarantine == "" {
+			quarantine = injection.CarriedQuarantine(buf[:kept+m])
+			kept = copy(buf, buf[max(0, kept+m-tail):kept+m])
 		}
 	}
-	return hex.EncodeToString(h.Sum(nil)), nil
+	return hex.EncodeToString(h.Sum(nil)), quarantine, nil
 }
 
 func readJSON(path string, v any) error {

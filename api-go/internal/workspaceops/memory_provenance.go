@@ -71,8 +71,9 @@ func ProvenanceLabel(kind, v string) (string, error) {
 // bindProvenance checks the evidence handles and run a write cites and binds them to
 // the actor. Fail closed: a handle must be a retained, unrevoked, unexpired original of
 // this workspace that the actor may read, and a run must exist in the workspace. A
-// handle that captured an untrusted tool's output (WebFetch, another MCP server) sets
-// the actor's quarantine, so what it writes is quarantined.
+// handle that captured an untrusted tool's output (WebFetch, another MCP server), or an
+// xMustard result that carried quarantined memory, sets the actor's quarantine, so what
+// it writes is quarantined.
 func bindProvenance(dataDir, workspaceID string, a ContextActor, handles []string, runID string) (ContextActor, error) {
 	handles = cleanPaths(handles)
 	if len(handles) > maxEvidenceHandles {
@@ -84,12 +85,12 @@ func bindProvenance(dataDir, workspaceID string, a ContextActor, handles []strin
 		}
 	}
 	for _, h := range handles {
-		tool, err := checkEvidence(dataDir, workspaceID, h, a)
+		quarantine, err := checkEvidence(dataDir, workspaceID, h, a)
 		if err != nil {
 			return a, err
 		}
 		// content derived from an untrusted capture is quarantined (WS-56)
-		a.Quarantine = fallbackString(a.Quarantine, injection.CaptureQuarantine(tool))
+		a.Quarantine = fallbackString(a.Quarantine, quarantine)
 	}
 	a.Evidence, a.RunID = handles, runID
 	return a, nil
@@ -98,7 +99,8 @@ func bindProvenance(dataDir, workspaceID string, a ContextActor, handles []strin
 // checkEvidence authorizes one evidence handle for a at this moment by reading the
 // first byte of its original under the evidence store's own rules: the workspace, the
 // principal binding, revocation, expiry and the stored length are all checked. It
-// returns the tool whose output the handle captured.
+// returns the quarantine of content derived from the capture: the one recorded when it
+// was captured, else (a capture from before captures recorded it) its tool's.
 func checkEvidence(dataDir, workspaceID, handle string, a ContextActor) (string, error) {
 	req := evidence.ReadRequest{WorkspaceID: workspaceID, Handle: handle, Length: 1}
 	if !a.OpenMode {
@@ -108,7 +110,7 @@ func checkEvidence(dataDir, workspaceID, handle string, a ContextActor) (string,
 	if err != nil {
 		return "", fmt.Errorf("evidence handle %q: %v: %w", handle, err, ErrInvalidInput)
 	}
-	return page.Tool, nil
+	return fallbackString(page.Quarantine, injection.CaptureQuarantine(page.Tool)), nil
 }
 
 // Principal distinctness policies (D-16). token counts every token as a distinct
