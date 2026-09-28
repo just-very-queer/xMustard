@@ -237,6 +237,11 @@ As of 2026-09-28. Workstream numbers refer to the
   eight Codex events to `/api/hooks/codex/<Event>`, and `xmustard-ops codex-hooks
   config|status|trust` writes `hooks.json` and records trust only after the user types
   `trust` at their own terminal. Needs a source build until the next release.
+- **WS-40b**: the OpenCode plugin (`integrations/opencode`), written against the 2.x
+  plugin API and checked against OpenCode 2.0.1, with a 1.x entrypoint. It adds the MCP
+  entry, reduces large tool results through `POST .../evidence/capture?format=opencode`
+  and masks older results on 2.x. `mcp-config --client opencode` prints `opencode.json`'s
+  `mcp` object. Loaded from a source checkout.
 
 **On workstream branches, not yet merged**
 
@@ -244,7 +249,6 @@ As of 2026-09-28. Workstream numbers refer to the
 - **WS-33** (`parity/ws-33`): session ledger, compaction snapshot and cross-client
   handoff.
 - **WS-36** (`parity/ws-36`): symbol navigation behind search, explain and impact.
-- **WS-40b** (`parity/ws-40b`): OpenCode adapter.
 - **WS-42** (`parity/ws-42`): repeat guard and revision-keyed result cache.
 - **WS-CQ-01** (`parity/ws-cq-01`): one route list for the API.
 

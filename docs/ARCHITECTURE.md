@@ -5,8 +5,8 @@ Source: `v0.1.1`. What shipped and its known limits:
 [v0.1.0 release notes](releases/v0.1.0.md) (tag `v0.1.0`, `8fca2d5`). Product direction:
 [VISION](VISION.md). Security posture: [SECURITY](SECURITY.md). Rows and notes marked
 "after v0.1.1" describe work merged into `feat/parity-v2` since the cut (WS-35 impact v2,
-WS-27 memory review, WS-40a Codex hooks) and not yet released; the
-[changelog](CHANGELOG.md#unreleased) lists it.
+WS-27 memory review, WS-40a Codex hooks, WS-40b the OpenCode plugin) and not yet released;
+the [changelog](CHANGELOG.md#unreleased) lists it.
 
 xMustard is small on purpose. A Go API owns delivery, policy and state. A Rust core owns
 repository semantics. Agents reach both through nine MCP tools. Everything runs
@@ -22,6 +22,8 @@ Coding agent (any MCP client, or Pi)
   |-- Claude Code plugin hooks (http) --------> xmustard-api  /api/hooks/claude/<Event>
   |     '-- SessionStart, WorktreeRemove -> xmustard-hook -> the same routes (Unix socket, else TCP)
   |-- Codex hooks (after v0.1.1) -> xmustard-hook -> xmustard-api  /api/hooks/codex/<Event>
+  |-- OpenCode plugin (after v0.1.1) ---------> xmustard-api  /mcp, and tool results to
+  |                                               .../evidence/capture?format=opencode
   '-- Pi -> integrations/pi extension --------> xmustard-api  tool routes (+ xmustard_expand)
             '-- Pi built-in tool output -------> .../evidence/capture (redacted, reduced, retained)
 
@@ -143,10 +145,11 @@ Without one, the legacy graph answers and search lists what is missing under
 | Postgres materialization | `workspaceops/pg*.go`, `backend/sql/` | Optional; diagnostics baseline and platform views |
 | Rust process invocation | `api-go/internal/rustcore/` | Binary resolution (`XMUSTARD_CORE_BIN`, then `xmustard-core` on `PATH`, then `rust-core/target/release/xmustard-core`, then `cargo run`), deadlines, bounded output, the opt-in resident worker and its governor. `refresh.go` is the watcher's orchestrator: every code-index read and ground registers its root (`WatchRoot`), a `$/refresh.due` notice takes the pending batch and runs `index update --paths` in the heavy slot, a replacement worker registers its predecessor's roots before it takes a call, and `watch` calls run only on the worker. `WithResidentOnly` makes a call run only on a worker that is already running (hooks) |
 | Resource accounting | `api-go/internal/budget/` | A 24 MiB transient-byte pool and a helper-child cap: work that does not fit now gets 503/-32000, work that could never fit gets a permanent answer (413, -32600 or a tool error). One heavy slot behind an RSS watchdog, taken by the whole-repository Rust builds (index build and update, legacy graph build, change-tracking baseline) and by bulk imports, never by captures. Go memory limit at the daemon's 28 MiB line with a GOGC floor. Byte admission is not a complete RSS bound. The 25 MiB line an `index build` declares for the heavy slot (`rustcore/heavy.go`) is the release binary's; the Rust memory guard tests (`rust-core/tests/memprobe/`) bound a process's dirty memory (`RssAnon + RssShmem` on Linux) strictly and its RSS by build profile |
-| Local operator CLI | `api-go/cmd/xmustard-ops/` | Works on the data dir directly (local filesystem authority, not HTTP-token isolation); `mcp-config` prints client entries for Streamable HTTP or the relay: a `[mcp_servers.xmustard]` table for Codex's `config.toml` with `--client codex`, the JSON `mcpServers` entry otherwise; after v0.1.1, `codex-hooks config\|status\|trust` writes Codex's `hooks.json` and, only after the user types `trust` at the controlling terminal outside an agent's shell, records the hooks' hashes through `codex app-server` |
+| Local operator CLI | `api-go/cmd/xmustard-ops/` | Works on the data dir directly (local filesystem authority, not HTTP-token isolation); `mcp-config` prints client entries for Streamable HTTP or the relay: a `[mcp_servers.xmustard]` table for Codex's `config.toml` with `--client codex`, after v0.1.1 the `mcp` object of `opencode.json` (`mcp.servers.xmustard`) with `--client opencode`, the JSON `mcpServers` entry otherwise; after v0.1.1, `codex-hooks config\|status\|trust` writes Codex's `hooks.json` and, only after the user types `trust` at the controlling terminal outside an agent's shell, records the hooks' hashes through `codex app-server` |
 | Daemon lifecycle | `api-go/internal/daemon/` (units, service managers, health probe, socket activation, rotated log); `api-go/cmd/xmustard-ops/setup.go` (`setup`, `uninstall`, `daemon`, `store`); `api-go/cmd/xmustard-api/daemon_lifecycle.go`; `govstore/backup.go`; `workspaceops/memory_store_health.go` | A launchd agent (RunAtLoad, KeepAlive on failure) or a systemd socket plus service (socket activation, Restart=on-failure), loopback only, no credential in the unit; setup waits for `/api/health`, puts the previous units back when the daemon does not answer and refuses units it did not write; the API adopts an activated socket under the bind interlock, logs to a size-capped rotated file with stdout and stderr on it, and migrates and quick_checks the store once it listens (a damaged store fails memory calls closed; `store` on `/api/health`); `store backup` (VACUUM INTO, verified) runs beside the daemon, `store restore` needs the store unused, keeps the replaced files and restarts the daemon; the relay waits up to 10 s for a restarting API ([SECURITY](SECURITY.md#daemon-service-ws-58)) |
 | Outcome evaluation | `api-go/cmd/xmustard-eval/`; `eval/tasks/parity/` (the `parity-v1` corpus) | Paired arms with real headless clients (`claude -p`, `codex exec --json`, `pi --mode rpc`) or fake drivers; runs outside the measured process tree. The corpus holds eight tasks on pi-mono (MIT) and cline (Apache-2.0) at pinned commits, each with a hidden oracle validated to fail on the starting state and pass on the reference, plus stale-memory (even and odd path depth) and adversarial-injection fixtures; `adversarial_unflagged` must be 0. No real-model run is recorded |
 | Pi client adapter | `integrations/pi/` | Pinned extension; the nine tools as direct HTTP calls plus `xmustard_expand` once a handle exists. Its built-in tool reduction, masking and compaction go through capture, which redacts in every build since v0.1.1; a refused capture leaves Pi's own result ([Pi README](../integrations/pi/README.md)). In v0.1.0 they fell back to Pi's own behavior |
+| OpenCode client plugin (after v0.1.1, WS-40b) | `integrations/opencode/` (2.x `setup`, 1.x `server`); the `opencode` format (`evidence/hookbody.go`) and shaper (`evidence/shapes.go`) | Written against the OpenCode 2.x plugin API and checked against 2.0.1. Adds the MCP entry unless one of that name exists. A large tool result's model text is posted as one flat body (`content`, scalar `metadata`, or `error`) to `POST .../evidence/capture?format=opencode` and replaced by the `{content}` payload, capped at OpenCode's 51,200-byte `tool_output.max_bytes`; `read` is observed only. 2.x masks older results in the session `context` hook. Every failure keeps OpenCode's result ([OpenCode README](../integrations/opencode/README.md)) |
 | Shared wire models | Go request and record structs, each Rust module's `Serialize` types, `frontend/src/lib/types.ts` | Contract changes need matching consumers |
 | Optional operator UI | `frontend/src/` | Needs `XMUSTARD_PROFILE=platform`; outside the current focus |
 
@@ -238,10 +241,10 @@ verification needs distinct principals, and `verify` needs the `verifier` role.
   The Go identity cache still validates with its own stat walk.
 - **Two packaged client adapters in v0.1.1.** `integrations/pi` and the Claude Code
   plugin (`integrations/claude-code`). After v0.1.1, Codex also gets hooks
-  (`integrations/codex`, WS-40a). OpenCode and Cursor get MCP configuration only
-  (`?client=` labels, `xmustard-ops mcp-config --client`); the capture route already
-  decodes and shapes their hook bodies (`evidence/hookbody.go`, `evidence/shapes.go`),
-  for their adapters (WS-40).
+  (`integrations/codex`, WS-40a) and OpenCode a plugin (`integrations/opencode`,
+  WS-40b). Cursor gets MCP configuration only (`?client=` labels, `xmustard-ops
+  mcp-config --client`); the capture route already decodes and shapes its hook bodies
+  (`evidence/hookbody.go`, `evidence/shapes.go`), for its adapter (WS-40c).
 - **`impact` walks a lexical graph in v0.1.1.** Edges come from name matches and
   import lines, so distance 1 or more is a lead, not proof. After v0.1.1 (WS-35),
   `symbol=`, `from=`/`to=` and `scope=` walk the typed resolver edges for Go and TS/JS

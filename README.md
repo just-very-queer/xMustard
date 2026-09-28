@@ -304,11 +304,50 @@ compaction go through the API's redacting capture. See [integrations/pi](integra
 </details>
 
 <details>
-<summary><b>Cursor, OpenCode and other MCP clients</b></summary>
+<summary><b>OpenCode</b></summary>
 
-Put the `mcp-config` output (`--client cursor` or `--client opencode`; add `--transport relay`
-for a command-only client) into the client's MCP config, in its format and token syntax.
-`--client` only labels usage.
+In v0.1.1, OpenCode takes the generic `mcp-config` entry, rewritten into `opencode.json`'s
+format and token syntax. After v0.1.1, `xmustard-ops mcp-config --root "$PWD" --client
+opencode` prints the `mcp` object of `opencode.json` in OpenCode 2.x's form, which substitutes
+`{env:NAME}` when it reads the file:
+
+```jsonc
+{
+  "mcp": {
+    "servers": {
+      "xmustard": {
+        "type": "remote",
+        "url": "http://127.0.0.1:8042/mcp?client=opencode&workspace=<id>",
+        "headers": { "Authorization": "Bearer {env:XMUSTARD_API_TOKEN}", "X-Xmustard-Workspace": "<id>" },
+        "oauth": false
+      }
+    }
+  }
+}
+```
+
+OpenCode 1.x takes the same entry one level up (`mcp.xmustard`), and 2.x reads that form too.
+
+The OpenCode plugin ([`integrations/opencode`](integrations/opencode/README.md)) adds this
+entry itself, reduces large tool results through the API's redacting capture, and on OpenCode
+2.x masks older results behind recovery handles. It was merged after v0.1.1 and is checked
+against OpenCode 2.0.1; the 1.x entrypoint is checked against the 1.18.33 source only. From a
+source checkout, register the repository first (`workspace load`, step 4 of the Quickstart),
+then add the plugin's directory to `opencode.json`, with `XMUSTARD_API_TOKEN` set in the
+environment OpenCode starts from once tokens are minted:
+
+```jsonc
+{ "plugins": ["/abs/path/to/xMustard/integrations/opencode"] }   // OpenCode 1.x: "plugin"
+```
+
+</details>
+
+<details>
+<summary><b>Cursor and other MCP clients</b></summary>
+
+Put the `mcp-config` output (`--client cursor`; add `--transport relay` for a command-only
+client) into the client's MCP config, in its format and token syntax. `--client` only labels
+usage.
 
 </details>
 
@@ -489,11 +528,11 @@ The full model is in [docs/SECURITY.md](docs/SECURITY.md).
   store backup and restore, file-level `impact`, and a tag-triggered release workflow.
 - **Merged since v0.1.1, not yet released:** impact v2 (depth tiers, risk, a completeness
   label, typed filters, diff-to-symbol scopes and import cycles), memory review at propose
-  time (duplicates, corroborations, code anchors, tiered conflicts and structured claims) and
-  Codex hooks with consent-gated trust. The [changelog](docs/CHANGELOG.md#unreleased) lists
-  them.
-- **Next:** an OpenCode plugin and Cursor hooks; the hook client in the release
-  archive; a Homebrew formula on the prebuilt Linux archive.
+  time (duplicates, corroborations, code anchors, tiered conflicts and structured claims),
+  Codex hooks with consent-gated trust, and an OpenCode plugin (the MCP entry, output
+  reduction and masking). The [changelog](docs/CHANGELOG.md#unreleased) lists them.
+- **Next:** Cursor hooks; the hook client in the release archive; a Homebrew formula on the
+  prebuilt Linux archive.
 - **Later:** a static-embedding search lane, symbol resolvers for Rust, Python and Java, session
   handoff between clients, and an evaluation suite for memory and context reduction.
 
@@ -516,7 +555,7 @@ local one (`brew tap-new`) until a public tap exists.
 - [Documentation map](docs/README.md), [vision](docs/VISION.md), [architecture](docs/ARCHITECTURE.md) and [status](docs/STATUS.md)
 - [Security model](docs/SECURITY.md), [v0.1.1 release notes](docs/releases/v0.1.1.md) and [v0.1.0 release notes](docs/releases/v0.1.0.md)
 - [Benchmarks and gates](scripts/bench/README.md) and the [measurement records](docs/benchmarks/)
-- [Claude Code plugin](integrations/claude-code/README.md), [Codex hooks](integrations/codex/README.md) (unreleased) and [Pi extension](integrations/pi/README.md)
+- [Claude Code plugin](integrations/claude-code/README.md), [Codex hooks](integrations/codex/README.md) (unreleased), [OpenCode plugin](integrations/opencode/README.md) (unreleased) and [Pi extension](integrations/pi/README.md)
 
 **Contributing.** Start with [AGENTS.md](AGENTS.md). Run `make check-backend` (Go tests and build,
 Rust tests and Clippy) before you open a pull request.

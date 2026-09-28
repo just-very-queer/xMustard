@@ -197,12 +197,12 @@ func TestErrorMemberCountsOnlyAsANonEmptyString(t *testing.T) {
 	}
 }
 
-// OpenCode reports a bash exit status as metadata.exit and names another server's MCP
+// OpenCode reports a shell exit status as metadata.exit and names another server's MCP
 // tools <server>_<tool>; a JSON result of one is reduced as structured output.
 func TestOpenCodeExitAndServerToolNames(t *testing.T) {
 	s := productionStore(t)
-	oc := `{"tool":"bash","sessionID":"ses_1","callID":"call_1","args":{"command":"go test ./..."},"output":{"title":"go test","output":` +
-		jsonString(string(goTestRun(3000))) + `,"metadata":{"exit":1,"description":"tests"}}}`
+	oc := `{"tool":"shell","sessionID":"ses_1","id":"call_1","input":{"command":"go test ./..."},"content":` +
+		jsonString(string(goTestRun(3000))) + `,"metadata":{"exit":1,"truncated":false}}`
 	res := observe(t, s, FormatOpenCode, oc, CaptureMeta{Client: "opencode"})
 	if res.Capture.ExitCode == nil || *res.Capture.ExitCode != 1 || !res.Capture.IsError {
 		t.Fatalf("opencode exit: %+v", res.Capture)

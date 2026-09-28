@@ -156,9 +156,8 @@ one applies and the tool's arguments; an unknown tool is a JSON-RPC `-32602`.
 - **Codex, OpenCode and Cursor: MCP configuration only.** v0.1.1 has no Codex hook
   package, OpenCode plugin or Cursor hook. The server already decodes their hook
   bodies and shapes results for each through one shaper registry
-  (`api-go/internal/evidence/`). Codex hooks were merged after v0.1.1
-  ([changelog](CHANGELOG.md#unreleased)); the OpenCode and Cursor adapters are planned
-  (WS-40).
+  (`api-go/internal/evidence/`). Codex hooks and an OpenCode plugin were merged after
+  v0.1.1 ([changelog](CHANGELOG.md#unreleased)); the Cursor adapter is planned (WS-40).
 
 ## Security and governance
 

@@ -61,8 +61,35 @@ review are listed in [Status](STATUS.md#in-progress).
   4. Review and trust the hooks in Codex's `/hooks` view, or run
      `xmustard-ops codex-hooks trust --cwd "$PWD" --hook-bin <the same path>` in your
      own terminal and type `trust`.
+- OpenCode plugin (WS-40b, [integrations/opencode](../integrations/opencode/README.md)),
+  written against the OpenCode 2.x plugin API and checked against OpenCode 2.0.1, with a
+  1.x entrypoint checked against the 1.18.33 source only. It adds the xMustard MCP entry
+  unless the config already has one of that name. A text result above the 32 KiB target
+  (shell or bash, grep, glob, list, webfetch, code mode's `execute`, other servers' MCP
+  tools) is posted to `POST .../evidence/capture?format=opencode`, and the model reads
+  the redacted reduction, with its recovery line last, instead. On 2.x, results older
+  than 10 assistant turns are masked in each model request behind a one-line stub naming
+  the handle. `read`, edits, xMustard's own tools and results with files are left alone,
+  and every failure keeps OpenCode's own result. To install, from a source checkout:
+  1. Run the API and register the repository (`xmustard-ops workspace load --root-path
+     "$PWD"`). Once tokens exist, export an agent token as `XMUSTARD_API_TOKEN` (and
+     `XMUSTARD_API_BASE` if the API is not on `http://127.0.0.1:8042`) in the
+     environment OpenCode starts from.
+  2. Add the plugin's directory to `opencode.json`: `"plugins":
+     ["/abs/path/to/xMustard/integrations/opencode"]` on 2.x, `"plugin": [...]` on 1.x.
+     OpenCode loads its `index.ts` with Bun, so nothing is built.
+- `xmustard-ops mcp-config --client opencode` prints the `mcp` object of `opencode.json`
+  in OpenCode 2.x's form (`mcp.servers.xmustard`, `{env:XMUSTARD_API_TOKEN}`, `oauth:
+  false`; with `--transport relay`, a local entry with an argv `command`). v0.1.1
+  printed the generic `mcpServers` entry.
 
 ### Changed
+- The `opencode` capture format is the plugin's flat body (`tool`, `sessionID`, `id`,
+  `input`, `content`, scalar-only `metadata`, or `error`), replacing
+  `{tool, sessionID, callID, args, output}`, which no client posted. Its shape payload is
+  `{"content": …}` for every tool (`read` is observed only), capped at OpenCode's
+  51,200-byte `tool_output.max_bytes` instead of 50,000 characters. The grep reducer
+  reads OpenCode's `path:` headings, `  Line N:` rows and parenthesized truncation notes.
 - `impact` refuses an argument of another form (for example `scope=` beside
   `symbol=`) instead of dropping it. `path=` still walks the lexical file graph.
 - Every Git diff, including the one merge attestations digest, runs through one
