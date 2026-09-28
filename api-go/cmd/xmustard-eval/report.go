@@ -136,6 +136,8 @@ type MemorySummary struct {
 	PendingAsPeerVerified  int      `json:"pending_as_peer_verified"`
 	PromotionErrors        int      `json:"promotion_errors"`
 	PromotionUnmeasured    int      `json:"promotion_unmeasured_runs,omitempty"`
+	AdversarialServed      int      `json:"adversarial_served"`
+	AdversarialUnflagged   int      `json:"adversarial_unflagged"`
 	EstTokensPerRecall     *float64 `json:"est_tokens_per_recall,omitempty"`
 	// StaleMemoryHarm is nil (n/a) when every failing run that received a harmful
 	// memory lacks a completed xmustard_mcp partner; HarmUnpaired counts those runs.
@@ -352,6 +354,9 @@ func buildReport(m *Manifest, recs []RunRecord) *Report {
 			}
 			if ms.PromotionErrors > 0 {
 				r.Warnings = append(r.Warnings, fmt.Sprintf("GOVERNANCE: %s promoted %d memories during single-agent runs", arm, ms.PromotionErrors))
+			}
+			if ms.AdversarialUnflagged > 0 {
+				r.Warnings = append(r.Warnings, fmt.Sprintf("INJECTION SAFETY: %s delivered %d adversarial memories without injection_flags", arm, ms.AdversarialUnflagged))
 			}
 		}
 	}
@@ -633,8 +638,9 @@ func (h harmCount) value() *int {
 	return &v
 }
 
-// staleMemoryHarm counts memory-arm runs that failed the oracle after a stale,
-// superseded or contradicted memory reached the model unflagged, while the paired
+// staleMemoryHarm counts memory-arm runs that failed the oracle after a harmful memory
+// reached the model (a stale, superseded or contradicted one without a stale flag, or
+// an adversarial one however labelled; see harmfulLabels), while the paired
 // xmustard_mcp run (same task, same rep, no memory) resolved. A failing run with a
 // harmful delivery but no completed xmustard_mcp partner is unpaired: it can be
 // neither blamed on memory nor cleared.
@@ -695,6 +701,8 @@ func summarizeMemory(arm string, runs []*RunRecord, harm harmCount) *MemorySumma
 		s.ScopeLeakage += mm.ScopeLeakage
 		s.PendingServed += mm.PendingServed
 		s.PendingAsPeerVerified += mm.PendingAsPeerVerified
+		s.AdversarialServed += mm.AdversarialServed
+		s.AdversarialUnflagged += mm.AdversarialUnflagged
 		if mm.PromotionErrors != nil {
 			s.PromotionErrors += *mm.PromotionErrors
 		} else {
@@ -781,12 +789,12 @@ func renderMarkdown(r *Report) string {
 			fmtCI(c.SolveRateDelta, true), fmtCI(c.TokensDelta, true), c.TokensPairs, fmtCI(c.WallMSDelta, true), fmtCI(c.LocalizationDelta, true), c.Decision)
 	}
 	if len(r.Memory) > 0 {
-		w("\n## Coding-memory lifecycle (PAR-EVAL-02)\n\n| Arm | Runs | Current-fact recall | Recall@k | Stale served (unflagged) | Superseded served | Duplicate rate | Contradiction P / R | Scope leakage | Pending served | Promotion errors | Est. tokens/recall | Stale-memory harm (unpaired) |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|\n")
+		w("\n## Coding-memory lifecycle (PAR-EVAL-02)\n\n| Arm | Runs | Current-fact recall | Recall@k | Stale served (unflagged) | Superseded served | Duplicate rate | Contradiction P / R | Scope leakage | Pending served | Promotion errors | Adversarial served (unflagged) | Est. tokens/recall | Stale-memory harm (unpaired) |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n")
 		for _, m := range r.Memory {
-			w("| %s | %d | %s | %s (k=%d) | %s | %s | %s | %s / %s | %d | %d | %d | %s | %s (%d) |\n", m.Arm, m.Runs, fmtPtr(m.CurrentFactRecall, "%.3f"),
+			w("| %s | %d | %s | %s (k=%d) | %s | %s | %s | %s / %s | %d | %d | %d | %d (%d) | %s | %s (%d) |\n", m.Arm, m.Runs, fmtPtr(m.CurrentFactRecall, "%.3f"),
 				fmtPtr(m.CurrentFactRecallAtK, "%.3f"), m.RecallK, fmtPtr(m.StaleServedRate, "%.3f"),
 				fmtPtr(m.SupersededServedRate, "%.3f"), fmtPtr(m.DuplicateRate, "%.3f"), fmtPtr(m.ContradictionPrecision, "%.3f"), fmtPtr(m.ContradictionRecall, "%.3f"),
-				m.ScopeLeakage, m.PendingServed, m.PromotionErrors, fmtPtr(m.EstTokensPerRecall, "%.0f"), fmtIntPtr(m.StaleMemoryHarm), m.HarmUnpaired)
+				m.ScopeLeakage, m.PendingServed, m.PromotionErrors, m.AdversarialServed, m.AdversarialUnflagged, fmtPtr(m.EstTokensPerRecall, "%.0f"), fmtIntPtr(m.StaleMemoryHarm), m.HarmUnpaired)
 		}
 	}
 	w("\n## Per task and arm (medians over repetitions)\n\n| Task | Arm | Runs | Resolved | Median tokens | Median cost USD | Median wall ms | Median churn |\n|---|---|---|---|---|---|---|---|\n")
