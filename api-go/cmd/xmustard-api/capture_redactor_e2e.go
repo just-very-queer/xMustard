@@ -12,10 +12,10 @@ import (
 
 // Test-only capture redactor for the Pi adapter e2e (scripts/e2e/pi-adapter.sh builds
 // the API with -tags xmustard_e2e). It is not a secret scanner and no production
-// build contains it: until the WS-05 streaming redactor is wired into
-// captureRedactor, POST .../evidence/capture refuses with 503 redaction_unavailable.
-// It replaces one fixed marker, e2eSecret, so the e2e can prove that Pi's built-in
-// tool output passes through the redaction seam before it is retained or projected.
+// build contains it: production builds wire the WS-05 streaming redactor
+// (capture_redactor.go, excluded by the tag). It replaces one fixed marker, e2eSecret,
+// so the e2e can prove that Pi's built-in tool output passes through the redaction
+// seam before it is retained or projected.
 
 var e2eSecret = regexp.MustCompile(`XM_E2E_SECRET_[A-Za-z0-9]+`)
 

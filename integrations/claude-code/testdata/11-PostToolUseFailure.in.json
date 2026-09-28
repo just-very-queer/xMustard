@@ -1,0 +1,16 @@
+{
+  "session_id": "sess-7f3a",
+  "transcript_path": "/home/dev/.claude/projects/-repo/sess-7f3a.jsonl",
+  "cwd": "${ROOT}",
+  "permission_mode": "default",
+  "hook_event_name": "PostToolUseFailure",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "go test ./src/...",
+    "description": "Run billing tests"
+  },
+  "tool_use_id": "toolu_08Bash",
+  "error": "Exit code 1\n--- FAIL: TestRoundHalfEven (0.00s)\n    billing_test.go:12: got 3, want 2\nFAIL\nFAIL\texample.com/repo/src\t0.004s\nFAIL\n",
+  "is_interrupt": false,
+  "duration_ms": 900
+}

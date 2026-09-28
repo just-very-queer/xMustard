@@ -1,0 +1,6 @@
+{
+  "hookSpecificOutput": {
+    "hookEventName": "PostToolBatch",
+    "additionalContext": "[xmustard] Several text searches ran in a short time. The xmustard search tool ranks code by BM25 over bodies, names, paths and docs with graph proximity in one call, and impact lists what depends on a file or symbol."
+  }
+}

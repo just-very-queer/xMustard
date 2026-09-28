@@ -104,6 +104,7 @@ func main() {
 		workspaceops.ClosePgPool()
 		log.Printf("shutdown: services closed")
 	}()
+	go serveHookSocket(srv.Handler) // the static hook client's Unix socket (WS-23)
 	log.Printf("xmustard api-go listening on %s (tls=%v)", cfg.addr(), cfg.hasTLS())
 	var serveErr error
 	if cfg.hasTLS() {

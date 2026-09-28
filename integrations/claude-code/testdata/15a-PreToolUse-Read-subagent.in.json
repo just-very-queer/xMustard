@@ -1,0 +1,14 @@
+{
+  "session_id": "sess-7f3a",
+  "transcript_path": "/home/dev/.claude/projects/-repo/sess-7f3a.jsonl",
+  "cwd": "${ROOT}",
+  "permission_mode": "default",
+  "hook_event_name": "PreToolUse",
+  "agent_id": "agent-9e1",
+  "agent_type": "Explore",
+  "tool_name": "Read",
+  "tool_input": {
+    "file_path": "${ROOT}/src/billing.go"
+  },
+  "tool_use_id": "toolu_09Read"
+}

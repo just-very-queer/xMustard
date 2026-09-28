@@ -1,0 +1,13 @@
+{
+  "session_id": "sess-7f3a",
+  "transcript_path": "/home/dev/.claude/projects/-repo/sess-7f3a.jsonl",
+  "cwd": "${ROOT}",
+  "permission_mode": "default",
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "rg -n -g '*.go' -A 2 ledgerBalance src",
+    "description": "Find ledgerBalance"
+  },
+  "tool_use_id": "toolu_05Bash"
+}

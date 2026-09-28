@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -1167,4 +1168,85 @@ func TestWorkerCrashWithTheRealCoreIsSeenAtOnce(t *testing.T) {
 	if raw, _ := os.ReadFile(pids); len(strings.Fields(string(raw))) == 0 {
 		t.Fatal("no git child left a process behind, so this test proves nothing")
 	}
+}
+
+// A resident-only call (the hook hot path, PAR-RT-12) never starts a process: without a
+// running worker it fails with ErrNotResident, and with one it runs there.
+func TestResidentOnlyCallsNeverStartAProcess(t *testing.T) {
+	logPath := useFakeWorker(t, "ok")
+	ctx := WithResidentOnly(context.Background())
+	spawns := func() int64 { return budget.Counters().SpawnsTotal }
+	before := spawns()
+	if _, err := runCoreCtx(ctx, "echo", "cold"); !errors.Is(err, ErrNotResident) {
+		t.Fatalf("resident-only call without a worker: %v", err)
+	}
+	if _, err := runCoreCtx(ctx, "goal", "x"); !errors.Is(err, ErrNotResident) {
+		t.Fatalf("resident-only call of a one-shot-only subcommand: %v", err)
+	}
+	if n := len(fakeLog(t, logPath, "serve ")) + len(fakeLog(t, logPath, "oneshot ")); n != 0 || spawns() != before {
+		t.Fatalf("a resident-only call started %d processes (%d counted)", n, spawns()-before)
+	}
+	mustEcho(t, "warm") // an ordinary call starts the worker
+	warm := spawns()
+	out, err := runCoreCtx(ctx, "echo", "hot")
+	if err != nil || string(out) != `["hot"]` {
+		t.Fatalf("resident-only call on a live worker: %s %v", out, err)
+	}
+	if _, err := runCoreCtx(ctx, "notresident", "z"); !errors.Is(err, ErrNotResident) {
+		t.Fatalf("a call the worker refuses must not fall back: %v", err)
+	}
+	if n := len(fakeLog(t, logPath, "oneshot ")); n != 0 || spawns() != warm {
+		t.Fatalf("resident-only calls on a live worker spawned %d one-shots (%d counted)", n, spawns()-warm)
+	}
+	t.Setenv("XMUSTARD_CORE_WORKER", "0")
+	if _, err := runCoreCtx(ctx, "echo", "off"); !errors.Is(err, ErrNotResident) {
+		t.Fatalf("resident-only call with the worker off: %v", err)
+	}
+}
+
+// A change a client reports (a hook's FileChanged) joins the real watcher's next batch
+// through the running worker, and noting it starts nothing; an unwatched root takes
+// nothing.
+func TestNoteChangedFeedsTheWatcherWithTheRealCore(t *testing.T) {
+	t.Setenv("XMUSTARD_CORE_BIN", realCore(t))
+	t.Setenv("XMUSTARD_CORE_WORKER", "1")
+	resetWorker()
+	t.Cleanup(resetWorker)
+	t.Cleanup(forgetWatched)
+	prev := refreshDue.Load()
+	t.Cleanup(func() { refreshDue.Store(prev) })
+	due := make(chan string, 16)
+	OnRefreshDue(func(root string) { due <- root })
+	root, err := filepath.EvalSymlinks(gitFixture(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if NoteChanged(ctx, root, []string{"src/engine.go"}) {
+		t.Fatal("an unwatched root took a note")
+	}
+	WatchRoot(ctx, root)
+	waitDue := func() {
+		t.Helper()
+		select {
+		case <-due:
+		case <-time.After(20 * time.Second):
+			t.Fatal("no $/refresh.due from the worker")
+		}
+	}
+	waitDue()
+	FinishRefresh(ctx, root, TakeRefresh(ctx, root, false), true, nil) // the start-up batch
+	spawns := budget.Counters().SpawnsTotal
+	if !NoteChanged(ctx, root, []string{"src/engine.go", "../outside.go"}) {
+		t.Fatal("the watcher did not take the note")
+	}
+	if budget.Counters().SpawnsTotal != spawns {
+		t.Fatal("noting a change started a process")
+	}
+	waitDue()
+	b := TakeRefresh(ctx, root, false)
+	if b == nil || !slices.Equal(b.Paths, []string{"src/engine.go"}) {
+		t.Fatalf("the noted path is not in the batch: %+v", b)
+	}
+	FinishRefresh(ctx, root, b, true, nil)
 }
