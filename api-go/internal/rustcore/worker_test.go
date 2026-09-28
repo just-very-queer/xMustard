@@ -554,6 +554,7 @@ func TestWorkerIsNotStartedForOneShotOnlyCalls(t *testing.T) {
 	for _, call := range [][]string{
 		{"lsp-hover", "x"}, {"goal", "list"}, {"symbolgraph", "build", "/r", "ws"},
 		{"symbolgraph", "blast-radius", "/r", "ws", "X"}, {"changetrack", "index", "/d", "/r", "ws"},
+		{"symbolgraph", "changes", "--scope=all", "/r", "ws"},
 	} {
 		out, err := runCoreCtx(context.Background(), call[0], call[1:]...)
 		if err != nil || strings.TrimSpace(string(out)) != fmt.Sprintf(`{"oneshot":%q}`, call[0]) {

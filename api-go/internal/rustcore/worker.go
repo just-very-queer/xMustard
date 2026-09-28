@@ -334,7 +334,7 @@ var (
 	}
 	oneShotFamilies = map[string]map[string]bool{
 		"changetrack": {"index": true},
-		"symbolgraph": {"build": true, "blast-radius": true},
+		"symbolgraph": {"build": true, "blast-radius": true, "changes": true},
 	}
 )
 

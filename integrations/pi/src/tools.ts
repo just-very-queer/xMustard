@@ -157,17 +157,20 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
 	{
 		name: "impact",
 		description:
-			"Blast radius over a LEXICAL reference graph (name matches + import lines, not resolved calls): distance≥1 edges are leads to confirm, not proof. No args → current changes (dirty symbols, contract_break). symbol= → files referencing its defining files, ≤4 hops. from=&to= → shortest undirected file path.",
+			"Blast radius. symbol= (name, Container.name, UID or path) → dependents by depth (d1 will break), risk, completeness. Go/TS edges are resolved; other languages match names: leads, not proof. from=&to= → shortest path, per-hop edges. No args → changes since the index baseline.",
 		args: [
 			workspaceArg,
 			{ name: "symbol", type: "string", desc: "symbol to compute blast radius for" },
 			{ name: "from", type: "string", desc: "trace path from this symbol" },
 			{ name: "to", type: "string", desc: "trace path to this symbol" },
-			{ name: "max_depth", type: "integer", minimum: 1, maximum: 4, desc: "max hops for symbol= (default 4)" },
+			{ name: "max_depth", type: "integer", minimum: 1, maximum: 32, desc: "max hops (default 3)" },
 		],
+		// The impact v2 filters, paging and diff scopes (WS-35) are MCP advanced arguments
+		// this closed schema does not carry; the API refuses from or to alone.
 		build: (a) => {
 			let path = ws(a, "/changes/since-index");
-			if (str(a, "from") && str(a, "to")) path = query(path, "from", str(a, "from"), "to", str(a, "to"));
+			if (str(a, "from") || str(a, "to"))
+				path = query(path, "from", str(a, "from"), "to", str(a, "to"), "depth", str(a, "max_depth"));
 			else if (str(a, "symbol")) path = query(path, "symbol", str(a, "symbol"), "depth", str(a, "max_depth"));
 			return { method: "GET", path };
 		},

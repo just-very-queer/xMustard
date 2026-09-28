@@ -381,7 +381,7 @@
         "readOnlyHint": true,
         "title": "Estimate change impact"
       },
-      "description": "Blast radius over a LEXICAL reference graph (name matches + import lines, not resolved calls): distance≥1 edges are leads to confirm, not proof. No args → current changes (dirty symbols, contract_break). symbol= → files referencing its defining files, ≤4 hops. from=\u0026to= → shortest undirected file path.",
+      "description": "Blast radius. symbol= (name, Container.name, UID or path) → dependents by depth (d1 will break), risk, completeness. Go/TS edges are resolved; other languages match names: leads, not proof. from=\u0026to= → shortest path, per-hop edges. No args → changes since the index baseline.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -390,8 +390,8 @@
             "type": "string"
           },
           "max_depth": {
-            "description": "max hops for symbol= (default 4)",
-            "maximum": 4,
+            "description": "max hops (default 3)",
+            "maximum": 32,
             "minimum": 1,
             "type": "integer"
           },
@@ -416,6 +416,9 @@
           "_xmustard": {
             "type": "object"
           },
+          "by_depth": {
+            "type": "array"
+          },
           "coverage": {
             "type": "object"
           },
@@ -425,14 +428,14 @@
           "freshness": {
             "type": "object"
           },
-          "impacted": {
-            "type": "array"
-          },
           "impacted_count": {
             "type": "integer"
           },
           "length": {
             "type": "integer"
+          },
+          "risk": {
+            "type": "string"
           },
           "since": {
             "type": "string"

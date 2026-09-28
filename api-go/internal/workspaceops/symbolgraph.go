@@ -49,46 +49,61 @@ func SymbolBlastRadius(dataDir, workspaceID, symbol string) (json.RawMessage, er
 	return json.RawMessage(out), nil
 }
 
-// SymbolImpact returns the true blast radius of a symbol — every file that
-// transitively references it (bounded BFS over the precomputed reference graph).
-func SymbolImpact(dataDir, workspaceID, symbol string, maxDepth int) (json.RawMessage, error) {
-	return SymbolImpactCtx(context.Background(), dataDir, workspaceID, symbol, maxDepth)
+// SymbolImpactCtx is impact v2 (WS-35) on a symbol, UID or path: its dependents or
+// dependencies by depth tier, with risk and the completeness envelope, over the code
+// index's resolved graph (the legacy graph when the root has no index). params are the
+// ImpactBlast parameters (ImpactFlags). Cancelling ctx cancels the Rust work.
+func SymbolImpactCtx(ctx context.Context, dataDir, workspaceID, symbol string, params map[string]string) (json.RawMessage, error) {
+	flags, err := ImpactFlags(ImpactBlast, params)
+	if err != nil {
+		return nil, err
+	}
+	return indexedRead(ctx, dataDir, workspaceID, func(root string, read codeIndexRead) ([]byte, error) {
+		args := []string{"impact"}
+		args = append(append(append(args, read.flags()...), flags...), root, workspaceID, symbol)
+		return rustcore.RunSymbolgraph(ctx, args...)
+	})
 }
 
-// SymbolImpactCtx is the request-scoped variant: cancelling ctx cancels its Rust/tool work (see rustcore.runCoreCtx).
-func SymbolImpactCtx(ctx context.Context, dataDir, workspaceID, symbol string, maxDepth int) (json.RawMessage, error) {
+// TraceSymbolsCtx is the shortest path from one symbol to another with per-hop edges
+// (WS-35); params are the ImpactTrace parameters. Cancelling ctx cancels the Rust work.
+func TraceSymbolsCtx(ctx context.Context, dataDir, workspaceID, from, to string, params map[string]string) (json.RawMessage, error) {
+	flags, err := ImpactFlags(ImpactTrace, params)
+	if err != nil {
+		return nil, err
+	}
+	return indexedRead(ctx, dataDir, workspaceID, func(root string, read codeIndexRead) ([]byte, error) {
+		args := []string{"trace"}
+		args = append(append(append(args, read.flags()...), flags...), root, workspaceID, from, to)
+		return rustcore.RunSymbolgraph(ctx, args...)
+	})
+}
+
+// DetectChangesCtx maps a scoped diff onto symbols (WS-35, PAR-IMP-06): the changed
+// symbols with contract breaks, and their dependents. params are the ImpactChanges
+// parameters, scope among them. The core parses the changed files in a one-shot
+// process. Cancelling ctx cancels the Rust work.
+func DetectChangesCtx(ctx context.Context, dataDir, workspaceID string, params map[string]string) (json.RawMessage, error) {
+	flags, err := ImpactFlags(ImpactChanges, params)
+	if err != nil {
+		return nil, err
+	}
+	return indexedRead(ctx, dataDir, workspaceID, func(root string, read codeIndexRead) ([]byte, error) {
+		args := []string{"changes"}
+		args = append(append(append(args, read.flags()...), flags...), root, workspaceID)
+		return rustcore.RunSymbolgraph(ctx, args...)
+	})
+}
+
+// indexedRead brings the workspace's code index to its observed identity, runs one
+// graph read and reports the refresh it waited for in the result's coverage.
+func indexedRead(ctx context.Context, dataDir, workspaceID string, run func(root string, read codeIndexRead) ([]byte, error)) (json.RawMessage, error) {
 	root, _, err := resolveChangeRootCtx(ctx, dataDir, workspaceID)
 	if err != nil {
 		return nil, err
 	}
-	if maxDepth <= 0 {
-		maxDepth = 4
-	}
 	read := ensureCodeIndex(ctx, root)
-	args := []string{"impact"}
-	args = append(append(args, read.flags()...), root, workspaceID, symbol, strconv.Itoa(maxDepth))
-	out, err := rustcore.RunSymbolgraph(ctx, args...)
-	if err != nil {
-		return nil, err
-	}
-	return read.annotate(out), nil
-}
-
-// TraceSymbols returns the shortest dependency path between two symbols.
-func TraceSymbols(dataDir, workspaceID, from, to string) (json.RawMessage, error) {
-	return TraceSymbolsCtx(context.Background(), dataDir, workspaceID, from, to)
-}
-
-// TraceSymbolsCtx is the request-scoped variant: cancelling ctx cancels its Rust/tool work (see rustcore.runCoreCtx).
-func TraceSymbolsCtx(ctx context.Context, dataDir, workspaceID, from, to string) (json.RawMessage, error) {
-	root, _, err := resolveChangeRootCtx(ctx, dataDir, workspaceID)
-	if err != nil {
-		return nil, err
-	}
-	read := ensureCodeIndex(ctx, root)
-	args := []string{"trace"}
-	args = append(append(args, read.flags()...), root, workspaceID, from, to)
-	out, err := rustcore.RunSymbolgraph(ctx, args...)
+	out, err := run(root, read)
 	if err != nil {
 		return nil, err
 	}

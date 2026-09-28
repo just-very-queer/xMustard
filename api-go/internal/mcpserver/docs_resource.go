@@ -87,7 +87,7 @@ func argShape(a Arg) string {
 	if a.List {
 		shape = "comma-separated string or array of strings"
 	}
-	if a.Type == typeInteger {
+	if a.Type == typeInteger || a.Type == typeNumber {
 		shape += fmt.Sprintf(", %d to %d", a.Min, a.Max)
 	}
 	if len(a.Enum) > 0 {

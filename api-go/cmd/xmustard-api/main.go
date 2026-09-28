@@ -3864,21 +3864,30 @@ func registerRoutes(mux routeRegistrar) {
 	mux.HandleFunc("GET /api/workspaces/{workspace_id}/changes/since-index", func(w http.ResponseWriter, r *http.Request) {
 		dd := envDefault("XMUSTARD_DATA_DIR", "../backend/data")
 		ws := r.PathValue("workspace_id")
-		q := r.URL.Query()
-		// impact enriched with the precomputed symbol graph: ?symbol= → blast radius;
-		// ?from=&to= → shortest dependency path; otherwise the dirty-symbols view.
-		switch {
-		case q.Get("from") != "" && q.Get("to") != "":
-			result, err := workspaceops.TraceSymbolsCtx(r.Context(), dd, ws, q.Get("from"), q.Get("to"))
-			issueIntel(w, err, result)
-		case q.Get("symbol") != "":
-			depth, _ := strconv.Atoi(q.Get("depth"))
-			result, err := workspaceops.SymbolImpactCtx(r.Context(), dd, ws, q.Get("symbol"), depth)
-			issueIntel(w, err, result)
-		default:
-			result, err := workspaceops.WorkspaceChangesSinceIndexCtx(r.Context(), dd, ws)
-			issueIntel(w, err, result)
+		// impact (WS-35): ?from=&to= → shortest path with per-hop edges; ?symbol= →
+		// blast radius by depth tier; ?scope= → the symbols a scoped diff touches;
+		// otherwise the changes since the index baseline. A parameter of another form
+		// is refused (workspaceops.ImpactFlags).
+		q, params := r.URL.Query(), map[string]string{}
+		for name := range r.URL.Query() {
+			params[name] = q.Get(name)
 		}
+		form, err := impactForm(params)
+		var result json.RawMessage
+		switch form {
+		case "":
+		case workspaceops.ImpactTrace:
+			result, err = workspaceops.TraceSymbolsCtx(r.Context(), dd, ws, q.Get("from"), q.Get("to"), without(params, "from", "to"))
+		case workspaceops.ImpactBlast:
+			result, err = workspaceops.SymbolImpactCtx(r.Context(), dd, ws, q.Get("symbol"), without(params, "symbol"))
+		case workspaceops.ImpactChanges:
+			result, err = workspaceops.DetectChangesCtx(r.Context(), dd, ws, params)
+		default:
+			if _, err = workspaceops.ImpactFlags(form, params); err == nil {
+				result, err = workspaceops.WorkspaceChangesSinceIndexCtx(r.Context(), dd, ws)
+			}
+		}
+		issueIntel(w, err, result)
 	})
 	mux.HandleFunc("GET /api/workspaces/{workspace_id}/changes", func(w http.ResponseWriter, r *http.Request) {
 		result, err := workspaceops.WorkspaceWorkingChanges(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))

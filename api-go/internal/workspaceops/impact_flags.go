@@ -1,0 +1,170 @@
+package workspaceops
+
+import (
+	"fmt"
+	"strconv"
+	"strings"
+
+	"xmustard/api-go/internal/gitdiff"
+)
+
+// Impact v2 (WS-35): the query parameters each impact form takes, the core flag each
+// becomes, and the check its value must pass. A value out of range is refused, never
+// clamped; a parameter of another form is refused too, so a caller never believes a
+// filter applied that did not.
+
+// ImpactForm is one shape of an impact read.
+type ImpactForm string
+
+const (
+	// ImpactBlast is symbol= (blast radius by depth tier).
+	ImpactBlast ImpactForm = "symbol"
+	// ImpactTrace is from=&to= (shortest path with per-hop edges).
+	ImpactTrace ImpactForm = "trace"
+	// ImpactChanges is scope= (the symbols a scoped diff touches, and their dependents).
+	ImpactChanges ImpactForm = "scope"
+	// ImpactSinceIndex is the no-argument read: changes since the index baseline.
+	ImpactSinceIndex ImpactForm = "since_index"
+)
+
+// RelationTypes are the relation types impact walks (PAR-IMP-01's edge kinds).
+var RelationTypes = []string{"CALLS", "IMPORTS", "EXTENDS", "IMPLEMENTS", "USES", "ACCESSES", "HAS_METHOD", "HAS_PROPERTY"}
+
+// ChangeScopes are the scope names (gitdiff's vocabulary; workspace is all).
+var ChangeScopes = []string{"unstaged", "staged", "all", "workspace", "compare", "commit", "range"}
+
+type impactParam struct {
+	param, flag string
+	check       func(string) error
+}
+
+func intIn(lo, hi int) func(string) error {
+	return func(v string) error {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < lo || n > hi {
+			return fmt.Errorf("must be a whole number from %d to %d", lo, hi)
+		}
+		return nil
+	}
+}
+
+func oneOf(values ...string) func(string) error {
+	return func(v string) error {
+		for _, ok := range values {
+			if v == ok {
+				return nil
+			}
+		}
+		return fmt.Errorf("must be one of %s", strings.Join(values, ", "))
+	}
+}
+
+func listOf(values ...string) func(string) error {
+	one := oneOf(values...)
+	return func(v string) error {
+		for _, e := range strings.Split(v, ",") {
+			if err := one(strings.ToUpper(strings.TrimSpace(e))); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+}
+
+func unitInterval(v string) error {
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil || f < 0 || f > 1 {
+		return fmt.Errorf("must be a number from 0 to 1")
+	}
+	return nil
+}
+
+func boolean(v string) error { return oneOf("true", "false")(v) }
+
+func checkoutPath(v string) error {
+	if len(v) > 4096 || strings.ContainsRune(v, 0) {
+		return fmt.Errorf("is not a path")
+	}
+	return nil
+}
+
+var (
+	walkParams = []impactParam{
+		{"relation_types", "relation-types", listOf(RelationTypes...)},
+		{"min_confidence", "min-confidence", unitInterval},
+		{"include_tests", "include-tests", boolean},
+	}
+	pageParams = []impactParam{
+		{"limit", "limit", intIn(1, 500)},
+		{"offset", "offset", intIn(0, 50_000)},
+		{"summary_only", "summary-only", boolean},
+		{"timeout_ms", "timeout-ms", intIn(1, 60_000)},
+	}
+	impactParams = map[ImpactForm][]impactParam{
+		ImpactBlast: concat(walkParams, pageParams, []impactParam{
+			{"depth", "max-depth", intIn(1, 32)},
+			{"direction", "direction", oneOf("upstream", "downstream")},
+		}),
+		ImpactTrace: concat(walkParams, []impactParam{{"depth", "max-depth", intIn(1, 30)}}),
+		ImpactChanges: concat(walkParams, pageParams, []impactParam{
+			{"depth", "max-depth", intIn(1, 32)},
+			{"scope", "scope", oneOf(ChangeScopes...)},
+			{"base", "base", gitdiff.CheckRef},
+			{"head", "head", gitdiff.CheckRef},
+			{"worktree", "worktree", checkoutPath},
+			{"symbols", "symbols", intIn(1, 500)},
+		}),
+		ImpactSinceIndex: nil,
+	}
+)
+
+func concat(lists ...[]impactParam) []impactParam {
+	var out []impactParam
+	for _, l := range lists {
+		out = append(out, l...)
+	}
+	return out
+}
+
+// impactParamNames is every parameter any form takes, the forms' own arguments
+// (symbol, from, to) included: a caller strips its form's before ImpactFlags.
+func impactParamNames() map[string]bool {
+	names := map[string]bool{"symbol": true, "from": true, "to": true}
+	for _, table := range impactParams {
+		for _, p := range table {
+			names[p.param] = true
+		}
+	}
+	return names
+}
+
+// ImpactFlags checks params against form and returns the core flags, in the table's
+// order. A parameter of another form, or a value that fails its check, is
+// ErrInvalidInput.
+func ImpactFlags(form ImpactForm, params map[string]string) ([]string, error) {
+	table, known := impactParams[form]
+	if !known {
+		return nil, fmt.Errorf("unknown impact form %q: %w", form, ErrInvalidInput)
+	}
+	takes := map[string]bool{}
+	for _, p := range table {
+		takes[p.param] = true
+	}
+	for name := range impactParamNames() {
+		if params[name] != "" && !takes[name] {
+			return nil, fmt.Errorf("%s does not apply to impact %s: %w", name, form, ErrInvalidInput)
+		}
+	}
+	var out []string
+	for _, p := range table {
+		v := params[p.param]
+		if v == "" {
+			continue
+		}
+		if err := p.check(v); err != nil {
+			return nil, fmt.Errorf("%s %q %v: %w", p.param, v, err, ErrInvalidInput)
+		}
+		out = append(out, "--"+p.flag+"="+v)
+	}
+	return out, nil
+}

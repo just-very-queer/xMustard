@@ -1,0 +1,148 @@
+{
+  "arguments": {
+    "scope": "all"
+  },
+  "result": {
+    "affected": {
+      "affected_flows": null,
+      "affected_modules": [
+        {
+          "count": 1,
+          "module": "."
+        }
+      ],
+      "by_depth": [
+        {
+          "depth": 1,
+          "items": [
+            {
+              "confidence": 0.9,
+              "edge": "CALLS",
+              "kind": "Function",
+              "line": 9,
+              "name": "main",
+              "path": "main.go",
+              "provenance": "scope",
+              "reason": "package",
+              "via": "Add"
+            }
+          ],
+          "label": "WILL BREAK",
+          "offset": 0,
+          "total": 1
+        }
+      ],
+      "counts": {
+        "below_confidence": 0,
+        "by_depth": [
+          1
+        ],
+        "direct": 1,
+        "files": 1,
+        "modules": 1,
+        "tests_excluded": 0,
+        "total": 1
+      },
+      "defined_in": [],
+      "direction": "upstream",
+      "epistemic": {
+        "causes": {},
+        "completeness": "exact"
+      },
+      "generated_at": "2026-09-28T11:59:29Z",
+      "graph": "resolved",
+      "impacted_count": 1,
+      "include_tests": false,
+      "max_depth": 2,
+      "relation_types": [
+        "CALLS",
+        "IMPORTS",
+        "EXTENDS",
+        "IMPLEMENTS"
+      ],
+      "risk": "LOW",
+      "symbol": "",
+      "targets": []
+    },
+    "changed_files": [
+      {
+        "change": "modified",
+        "path": "pkg/calc/calc.go",
+        "symbols": 2
+      }
+    ],
+    "changed_files_total": 1,
+    "changed_symbols": [
+      {
+        "change": "modified",
+        "contract_break": true,
+        "direct_dependents": 2,
+        "graph_match": "exact",
+        "kind": "Function",
+        "line": 4,
+        "name": "Add",
+        "path": "pkg/calc/calc.go",
+        "signature_change": "signature"
+      },
+      {
+        "change": "modified",
+        "contract_break": false,
+        "direct_dependents": 1,
+        "graph_match": "exact",
+        "kind": "Function",
+        "line": 7,
+        "name": "Double",
+        "path": "pkg/calc/calc.go"
+      }
+    ],
+    "changed_symbols_total": 2,
+    "contract_breaks": 1,
+    "coverage": {
+      "complete": true,
+      "eligible_files": 2,
+      "envelope": {
+        "exceeded": [],
+        "max_file_size": 1048576,
+        "max_files": 10000,
+        "max_symbols": 100000,
+        "max_total_bytes": 314572800
+      },
+      "indexed_files": 2,
+      "languages": {
+        "go": {
+          "failed": 0,
+          "supported": 2,
+          "unsupported": 0
+        }
+      },
+      "loss_counts": {},
+      "max_files": 10000,
+      "truncated": false
+    },
+    "freshness": {
+      "dirty_paths_touching_result": [
+        "pkg/calc/calc.go"
+      ],
+      "head": "c33de00d26e604cb1062e0efccb9582bffd2f248",
+      "identity_age_ms": 10,
+      "index_version": "schema-4.csr-2",
+      "indexed_commit": "c33de00d26e604cb1062e0efccb9582bffd2f248",
+      "refresh": {
+        "escalated": false,
+        "reparsed": 2,
+        "reresolved": 2
+      },
+      "snapshot_generation": 1,
+      "source": "index",
+      "status": "current",
+      "watcher_state": "absent"
+    },
+    "generated_at": "2026-09-28T11:59:29Z",
+    "head": "c33de00d26e604cb1062e0efccb9582bffd2f248",
+    "partial": false,
+    "scope": "all",
+    "truncated": false,
+    "untracked": true
+  },
+  "tool": "impact"
+}

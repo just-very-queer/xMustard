@@ -1,17 +1,94 @@
 {
   "arguments": {
-    "from": "Double",
+    "from": "main",
     "to": "Add"
   },
   "result": {
+    "caps": {
+      "fanout": 200,
+      "max_depth": 10,
+      "rows_per_level": 5000,
+      "visited": 50000
+    },
+    "caps_hit": {
+      "depth": false,
+      "fanout": 0,
+      "rows_per_level": false,
+      "visited": false
+    },
+    "coverage": {
+      "complete": true,
+      "eligible_files": 2,
+      "envelope": {
+        "exceeded": [],
+        "max_file_size": 1048576,
+        "max_files": 10000,
+        "max_symbols": 100000,
+        "max_total_bytes": 314572800
+      },
+      "indexed_files": 2,
+      "languages": {
+        "go": {
+          "failed": 0,
+          "supported": 2,
+          "unsupported": 0
+        }
+      },
+      "loss_counts": {},
+      "max_files": 10000,
+      "truncated": false
+    },
+    "direction": "downstream",
     "found": true,
-    "from": "Double",
-    "generated_at": "2026-09-25T08:23:37Z",
-    "length": 0,
+    "freshness": {
+      "dirty_paths_touching_result": [
+        "pkg/calc/calc.go"
+      ],
+      "head": "c33de00d26e604cb1062e0efccb9582bffd2f248",
+      "identity_age_ms": 0,
+      "index_version": "schema-4.csr-2",
+      "indexed_commit": "c33de00d26e604cb1062e0efccb9582bffd2f248",
+      "refresh": {
+        "escalated": false,
+        "reparsed": 2,
+        "reresolved": 2
+      },
+      "snapshot_generation": 1,
+      "source": "index",
+      "status": "current",
+      "watcher_state": "absent"
+    },
+    "from": "main",
+    "from_targets": 1,
+    "generated_at": "2026-09-28T11:59:29Z",
+    "hops": [
+      {
+        "confidence": 0.9,
+        "edge": "CALLS",
+        "from": {
+          "kind": "Function",
+          "line": 9,
+          "name": "main",
+          "path": "main.go"
+        },
+        "provenance": "scope",
+        "reason": "package",
+        "to": {
+          "kind": "Function",
+          "line": 4,
+          "name": "Add",
+          "path": "pkg/calc/calc.go"
+        }
+      }
+    ],
+    "length": 1,
     "path": [
+      "main.go",
       "pkg/calc/calc.go"
     ],
-    "to": "Add"
+    "to": "Add",
+    "to_targets": 1,
+    "truncated": false
   },
   "tool": "impact"
 }
