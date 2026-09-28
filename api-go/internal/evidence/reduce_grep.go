@@ -420,225 +420,113 @@ const maxGroupedSummaries = 8
 
 func reduceGrouped(ctx context.Context, in *Input, rules *groupedRules) (*Projection, error) {
 	secs := nonEmpty(in.Sections)
-	files := map[string]*fileStat{}
-	untracked := 0
-	var total, errs, warns, summaries int
-	headingMode := false
-	// pass 1: per-file and total counts
-	for _, sec := range secs {
-		st := &groupState{}
-		var prevFile []byte // a bare path not yet known to be a heading (reused buffer)
-		havePrev := false
-		err := scanLines(ctx, in.R, sec, func(idx int, line []byte, start, end int64) error {
-			it := rules.parse(st, line)
-			count := 0
-			switch it.kind {
-			case ikMatch:
-				count = 1
-				if it.sev == 2 {
-					errs++
-				} else if it.sev == 1 {
-					warns++
-				}
-			case ikCount:
-				count = it.count
-			case ikFile:
-				if havePrev {
-					// the previous bare path had no matches below it: a files-only entry
-					registerFile(files, prevFile, 1, 0, &untracked)
-					total++
-				}
-				prevFile, havePrev = append(prevFile[:0], it.path...), true
-				return nil
-			case ikSummary:
-				summaries++
-			}
-			if it.kind != ikMatch && it.kind != ikCount && it.kind != ikHeading && havePrev && it.kind != ikContext {
-				// the previous bare path had no matches below it: a files-only entry
-				registerFile(files, prevFile, 1, 0, &untracked)
-				total++
-				havePrev = false
-			}
-			if it.kind == ikMatch || it.kind == ikHeading {
-				if it.kind == ikMatch && len(st.heading) > 0 && bytes.Equal(it.path, st.heading) {
-					headingMode = true // rg --heading: bare paths are headings, not entries
-				}
-				havePrev = false
-			}
-			if count > 0 {
-				e := 0
-				if it.sev == 2 {
-					e = 1
-				}
-				registerFile(files, it.path, count, e, &untracked)
-				total += count
-			}
-			return nil
-		})
-		if err != nil {
-			return nil, err
-		}
-		if havePrev {
-			registerFile(files, prevFile, 1, 0, &untracked)
-			total++
-		}
+	c, err := countGrouped(ctx, in.R, secs, rules)
+	if err != nil {
+		return nil, err
 	}
-	if total == 0 {
+	if c.total == 0 {
 		if rules.family == FamilyLint {
 			return nil, errNoItems
 		}
 		return reduceLineSections(ctx, in, shellRules)
 	}
-	nFiles := len(files) + untracked
-	perFile := max(minPerFile, maxGroupedItems/max(nFiles, 1))
-	warnBudget := maxGroupedItems - min(errs, maxGroupedItems)
-	gp := &GroupedProjection{Kind: "search", Matches: total, Files: nFiles, PerFileCap: perFile}
-	if rules.family == FamilyLint {
-		gp.Kind, gp.Errors, gp.Warnings = "lint", errs, warns
-	}
-	// pass 2: select and render
-	var out bytes.Buffer
-	header := fmt.Sprintf("[xmustard %s] %s/1 matches=%d files=%d", rules.family, rules.id, total, nFiles)
-	if rules.sevName {
-		header = fmt.Sprintf("[xmustard %s] %s/1 diagnostics=%d errors=%d warnings=%d files=%d", rules.family, rules.id, total, errs, warns, nFiles)
-	}
-	parts := map[string]string{}
-	var oms []Omission
-	kept, keptWarn, keptSummaries := 0, 0, 0
-	var body bytes.Buffer
+	r := newGroupedRender(in, rules, c)
 	for _, sec := range secs {
-		var part bytes.Buffer
-		st := &groupState{}
-		curPath := "" // copied only when a kept item starts a new file group
-		gapStart, gapLines := int64(-1), 0
-		closeFile := func() {
-			if curPath == "" {
-				return
-			}
-			if fs := files[curPath]; fs != nil && fs.matches > fs.shown && !fs.lastSeen {
-				fmt.Fprintf(&part, "  … %d more in %s\n", fs.matches-fs.shown, shortPath([]byte(curPath)))
-				fs.lastSeen = true
-			}
+		if err := r.section(ctx, sec, len(secs) > 1); err != nil {
+			return nil, err
 		}
-		// used is what the projection holds so far; every kept item is checked with
-		// its own rendered size (and a file heading when it starts a new group)
-		used := func() int { return out.Len() + body.Len() + part.Len() }
-		var lastEnd int64
-		err := scanLines(ctx, in.R, sec, func(idx int, line []byte, start, end int64) error {
-			it := rules.parse(st, line)
-			lastEnd = end
-			keep := false
-			switch it.kind {
-			case ikFile:
-				if headingMode {
-					break // a heading: re-rendered above its first kept match
-				}
-				fallthrough
-			case ikMatch, ikCount:
-				fs := files[string(it.path)]
-				need := itemCost(it, line, sec.Array)
-				if string(it.path) != curPath {
-					need += min(len(it.path), groupedTextBytes) + 48 // heading and the previous group's "more" line
-				}
-				room := kept < maxGroupedItems && used()+need < in.Target-512
-				if it.kind == ikMatch && it.sev < 2 && rules.family == FamilyLint {
-					room = room && keptWarn < warnBudget
-				}
-				if fs != nil && fs.shown < perFile && room {
-					keep = true
-					fs.shown++
-					kept++
-					if it.sev < 2 {
-						keptWarn++
-					}
-				}
-			case ikSummary:
-				if keptSummaries < maxGroupedSummaries && used()+min(len(line), plainDisplay)+1 < in.Target-512 {
-					keep = true
-					keptSummaries++
-				}
-			}
-			if !keep {
-				// headings are re-rendered above their first kept match
-				if gapStart < 0 {
-					gapStart = start
-				}
-				gapLines++
-				return nil
-			}
-			if gapStart >= 0 {
-				oms = append(oms, Omission{Kind: "lines", Start: gapStart, End: start, Items: gapLines})
-				gapStart, gapLines = -1, 0
-			}
-			switch it.kind {
-			case ikSummary:
-				closeFile()
-				curPath = ""
-				part.Write(validUTF8(trimRune(line[:min(len(line), plainDisplay)])))
-				part.WriteByte('\n')
-				return nil
-			}
-			if string(it.path) != curPath {
-				closeFile()
-				curPath = string(it.path)
-				// array sections (Claude Grep filenames) render one entry per line
-				if !sec.Array && it.kind == ikMatch {
-					fmt.Fprintf(&part, "%s (%d)\n", shortPath(it.path), files[curPath].matches)
-				}
-			}
-			gm := GroupedMatch{Path: string(shortPath([]byte(curPath))), Line: string(it.line)}
-			switch {
-			case sec.Array:
-				part.Write(validUTF8(trimRune(line[:min(len(line), groupedTextBytes*2)])))
-				part.WriteByte('\n')
-			case it.kind == ikMatch:
-				text := bytes.TrimSpace(it.text)
-				short := trimRune(text[:min(len(text), groupedTextBytes)])
-				gm.Text = string(validUTF8(short))
-				if len(it.line) > 0 {
-					fmt.Fprintf(&part, "  %s: %s", it.line, gm.Text)
-				} else {
-					fmt.Fprintf(&part, "  %s", gm.Text)
-				}
-				if len(short) < len(text) {
-					fmt.Fprintf(&part, "…[+%d bytes]", len(text)-len(short))
-				}
-				part.WriteByte('\n')
-			case it.kind == ikCount:
-				fmt.Fprintf(&part, "%s: %d matches\n", shortPath(it.path), it.count)
-			default:
-				part.Write(shortPath(it.path))
-				part.WriteByte('\n')
-			}
-			gp.Results = append(gp.Results, gm)
+	}
+	return r.finish(secs), nil
+}
+
+// groupedCounts are pass 1's per-file and total counts.
+type groupedCounts struct {
+	files       map[string]*fileStat
+	untracked   int // files past maxTrackedFiles
+	total       int
+	errs, warns int
+	headingMode bool // rg --heading: bare paths are headings, not entries
+	// pending is a bare path not yet known to be a heading (reused buffer)
+	pending     []byte
+	havePending bool
+}
+
+func (c *groupedCounts) nFiles() int { return len(c.files) + c.untracked }
+
+// countGrouped is pass 1: per-file and total counts.
+func countGrouped(ctx context.Context, r io.ReaderAt, secs []Section, rules *groupedRules) (*groupedCounts, error) {
+	c := &groupedCounts{files: map[string]*fileStat{}}
+	for _, sec := range secs {
+		st := &groupState{}
+		c.havePending = false
+		err := scanLines(ctx, r, sec, func(idx int, line []byte, start, end int64) error {
+			c.observe(st, rules.parse(st, line))
 			return nil
 		})
 		if err != nil {
 			return nil, err
 		}
-		if gapStart >= 0 {
-			oms = append(oms, Omission{Kind: "lines", Start: gapStart, End: min(lastEnd, sec.End), Items: gapLines})
-		}
-		if !sec.Array {
-			closeFile()
-		}
-		parts[sec.Name] = part.String()
-		if len(secs) > 1 {
-			fmt.Fprintf(&body, "[%s]\n", sec.Name)
-		}
-		body.Write(part.Bytes())
+		c.flushPending()
 	}
-	gp.Shown = kept
-	headerLine := fmt.Sprintf("%s shown=%d per_file=%d\n", header, kept, perFile)
-	for _, sec := range secs {
-		if !sec.Array {
-			parts[sec.Name] = headerLine + parts[sec.Name] // the first text section carries the totals
-			break
+	return c, nil
+}
+
+// observe counts one parsed item. A bare path stays pending until the next item shows
+// what it was: the heading of the matches below it, or (followed by anything else) a
+// files-with-matches entry of its own.
+func (c *groupedCounts) observe(st *groupState, it groupedItem) {
+	switch it.kind {
+	case ikFile:
+		c.flushPending()
+		c.pending, c.havePending = append(c.pending[:0], it.path...), true
+	case ikMatch:
+		switch it.sev {
+		case 2:
+			c.errs++
+		case 1:
+			c.warns++
 		}
+		if len(st.heading) > 0 && bytes.Equal(it.path, st.heading) {
+			c.headingMode = true
+		}
+		c.havePending = false
+		c.register(it.path, 1, it.sev)
+	case ikHeading:
+		c.havePending = false
+	case ikCount:
+		c.register(it.path, it.count, it.sev)
+	case ikContext:
+	default:
+		c.flushPending()
 	}
-	// the biggest files with nothing shown, for orientation
+}
+
+// flushPending registers the pending bare path as a files-only entry.
+func (c *groupedCounts) flushPending() {
+	if c.havePending {
+		registerFile(c.files, c.pending, 1, 0, &c.untracked)
+		c.total++
+		c.havePending = false
+	}
+}
+
+func (c *groupedCounts) register(path []byte, n, sev int) {
+	if n <= 0 {
+		return
+	}
+	errs := 0
+	if sev == 2 {
+		errs = 1
+	}
+	registerFile(c.files, path, n, errs, &c.untracked)
+	c.total += n
+}
+
+// omittedFiles are the files with nothing shown, largest first (then in order of
+// appearance), for orientation.
+func (c *groupedCounts) omittedFiles() []FileCount {
 	var omitted []FileCount
-	for p, fs := range files {
+	for p, fs := range c.files {
 		if fs.shown == 0 {
 			omitted = append(omitted, FileCount{Path: p, Matches: fs.matches})
 		}
@@ -647,45 +535,221 @@ func reduceGrouped(ctx context.Context, in *Input, rules *groupedRules) (*Projec
 		if omitted[i].Matches != omitted[j].Matches {
 			return omitted[i].Matches > omitted[j].Matches
 		}
-		return files[omitted[i].Path].order < files[omitted[j].Path].order
+		return c.files[omitted[i].Path].order < c.files[omitted[j].Path].order
 	})
-	if len(omitted) > maxTopFiles {
-		gp.TopOmitted = omitted[:maxTopFiles]
-	} else {
-		gp.TopOmitted = omitted
+	return omitted
+}
+
+// groupedRender is pass 2: it keeps at most perFile items per file and
+// maxGroupedItems overall (lint keeps errors before warnings) and renders them grouped
+// by file.
+type groupedRender struct {
+	in         *Input
+	rules      *groupedRules
+	c          *groupedCounts
+	gp         *GroupedProjection
+	header     string
+	perFile    int
+	warnBudget int
+	kept       int
+	keptWarn   int
+	keptSums   int
+	body       bytes.Buffer // the sections rendered so far (the header is written last)
+	parts      map[string]string
+	oms        []Omission
+
+	// per section
+	part    bytes.Buffer
+	curPath string // copied only when a kept item starts a new file group
+	gap     lineGap
+}
+
+func newGroupedRender(in *Input, rules *groupedRules, c *groupedCounts) *groupedRender {
+	nFiles := c.nFiles()
+	r := &groupedRender{in: in, rules: rules, c: c, parts: map[string]string{},
+		perFile: max(minPerFile, maxGroupedItems/max(nFiles, 1)), warnBudget: maxGroupedItems - min(c.errs, maxGroupedItems)}
+	r.gp = &GroupedProjection{Kind: "search", Matches: c.total, Files: nFiles, PerFileCap: r.perFile}
+	if rules.family == FamilyLint {
+		r.gp.Kind, r.gp.Errors, r.gp.Warnings = "lint", c.errs, c.warns
 	}
+	r.header = fmt.Sprintf("[xmustard %s] %s/1 matches=%d files=%d", rules.family, rules.id, c.total, nFiles)
+	if rules.sevName {
+		r.header = fmt.Sprintf("[xmustard %s] %s/1 diagnostics=%d errors=%d warnings=%d files=%d", rules.family, rules.id, c.total, c.errs, c.warns, nFiles)
+	}
+	return r
+}
+
+// used is what the projection holds so far; every kept item is checked with its own
+// rendered size (and a file heading when it starts a new group).
+func (r *groupedRender) used() int { return r.body.Len() + r.part.Len() }
+
+// section renders one section.
+func (r *groupedRender) section(ctx context.Context, sec Section, labeled bool) error {
+	r.part = bytes.Buffer{}
+	r.curPath, r.gap = "", newLineGap()
+	st := &groupState{}
+	var lastEnd int64
+	err := scanLines(ctx, r.in.R, sec, func(idx int, line []byte, start, end int64) error {
+		it := r.rules.parse(st, line)
+		lastEnd = end
+		if !r.admit(it, line, sec.Array) {
+			r.gap.skip(start) // headings are re-rendered above their first kept match
+			return nil
+		}
+		r.oms = r.gap.flush(r.oms, start)
+		r.render(it, line, sec.Array)
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	r.oms = r.gap.flush(r.oms, min(lastEnd, sec.End))
+	if !sec.Array {
+		r.closeFile()
+	}
+	r.parts[sec.Name] = r.part.String()
+	if labeled {
+		fmt.Fprintf(&r.body, "[%s]\n", sec.Name)
+	}
+	r.body.Write(r.part.Bytes())
+	return nil
+}
+
+// admit decides whether an item is kept: matches, counts and files-only entries
+// within their file's cap, the item cap and the target; summary and notice lines up
+// to maxGroupedSummaries. Under rg --heading a bare path is a heading, re-rendered
+// above its first kept match.
+func (r *groupedRender) admit(it groupedItem, line []byte, array bool) bool {
+	switch it.kind {
+	case ikFile:
+		return !r.c.headingMode && r.admitItem(it, line, array)
+	case ikMatch, ikCount:
+		return r.admitItem(it, line, array)
+	case ikSummary:
+		if r.keptSums < maxGroupedSummaries && r.used()+min(len(line), plainDisplay)+1 < r.in.Target-512 {
+			r.keptSums++
+			return true
+		}
+	}
+	return false
+}
+
+func (r *groupedRender) admitItem(it groupedItem, line []byte, array bool) bool {
+	need := itemCost(it, line, array)
+	if string(it.path) != r.curPath {
+		need += min(len(it.path), groupedTextBytes) + 48 // heading and the previous group's "more" line
+	}
+	room := r.kept < maxGroupedItems && r.used()+need < r.in.Target-512
+	if it.kind == ikMatch && it.sev < 2 && r.rules.family == FamilyLint {
+		room = room && r.keptWarn < r.warnBudget
+	}
+	fs := r.c.files[string(it.path)]
+	if fs == nil || fs.shown >= r.perFile || !room {
+		return false
+	}
+	fs.shown++
+	r.kept++
+	if it.sev < 2 {
+		r.keptWarn++
+	}
+	return true
+}
+
+// render writes a kept item, under a heading when it starts a new file group.
+func (r *groupedRender) render(it groupedItem, line []byte, array bool) {
+	if it.kind == ikSummary {
+		r.closeFile()
+		r.curPath = ""
+		r.part.Write(validUTF8(trimRune(line[:min(len(line), plainDisplay)])))
+		r.part.WriteByte('\n')
+		return
+	}
+	if string(it.path) != r.curPath {
+		r.closeFile()
+		r.curPath = string(it.path)
+		// array sections (Claude Grep filenames) render one entry per line
+		if !array && it.kind == ikMatch {
+			fmt.Fprintf(&r.part, "%s (%d)\n", shortPath(it.path), r.c.files[r.curPath].matches)
+		}
+	}
+	gm := GroupedMatch{Path: string(shortPath([]byte(r.curPath))), Line: string(it.line)}
+	switch {
+	case array:
+		r.part.Write(validUTF8(trimRune(line[:min(len(line), groupedTextBytes*2)])))
+		r.part.WriteByte('\n')
+	case it.kind == ikMatch:
+		text := bytes.TrimSpace(it.text)
+		short := trimRune(text[:min(len(text), groupedTextBytes)])
+		gm.Text = string(validUTF8(short))
+		if len(it.line) > 0 {
+			fmt.Fprintf(&r.part, "  %s: %s", it.line, gm.Text)
+		} else {
+			fmt.Fprintf(&r.part, "  %s", gm.Text)
+		}
+		if len(short) < len(text) {
+			fmt.Fprintf(&r.part, "…[+%d bytes]", len(text)-len(short))
+		}
+		r.part.WriteByte('\n')
+	case it.kind == ikCount:
+		fmt.Fprintf(&r.part, "%s: %d matches\n", shortPath(it.path), it.count)
+	default:
+		r.part.Write(shortPath(it.path))
+		r.part.WriteByte('\n')
+	}
+	r.gp.Results = append(r.gp.Results, gm)
+}
+
+// closeFile ends the current file group with its "N more" line, once per file.
+func (r *groupedRender) closeFile() {
+	if r.curPath == "" {
+		return
+	}
+	if fs := r.c.files[r.curPath]; fs != nil && fs.matches > fs.shown && !fs.lastSeen {
+		fmt.Fprintf(&r.part, "  … %d more in %s\n", fs.matches-fs.shown, shortPath([]byte(r.curPath)))
+		fs.lastSeen = true
+	}
+}
+
+// finish writes the totals header and the closing "more not shown" summary.
+func (r *groupedRender) finish(secs []Section) *Projection {
+	c := r.c
+	r.gp.Shown = r.kept
+	headerLine := fmt.Sprintf("%s shown=%d per_file=%d\n", r.header, r.kept, r.perFile)
+	for _, sec := range secs {
+		if !sec.Array {
+			r.parts[sec.Name] = headerLine + r.parts[sec.Name] // the first text section carries the totals
+			break
+		}
+	}
+	omitted := c.omittedFiles()
+	r.gp.TopOmitted = omitted[:min(len(omitted), maxTopFiles)]
+	var out bytes.Buffer
 	out.WriteString(headerLine)
-	out.Write(body.Bytes())
-	if kept < total {
-		prefix := fmt.Sprintf("[xmustard: %d more of %d not shown", total-kept, total)
+	out.Write(r.body.Bytes())
+	if r.kept < c.total {
+		prefix := fmt.Sprintf("[xmustard: %d more of %d not shown", c.total-r.kept, c.total)
 		var items []string
 		if len(omitted) > 0 {
-			prefix += fmt.Sprintf("; %d files with none shown, largest:", len(omitted)+untracked)
-			for _, fc := range gp.TopOmitted {
+			prefix += fmt.Sprintf("; %d files with none shown, largest:", len(omitted)+c.untracked)
+			for _, fc := range r.gp.TopOmitted {
 				items = append(items, fmt.Sprintf(" %s (%d)", fc.Path, fc.Matches))
 			}
 		}
-		writeWithin(&out, in.Target, prefix, items, "; search the original with pattern=…]\n")
+		writeWithin(&out, r.in.Target, prefix, items, "; search the original with pattern=…]\n")
+		// the note follows the array sections and the first text section
+		note := fmt.Sprintf("[xmustard: %d more of %d not shown]\n", c.total-r.kept, c.total)
 		for _, sec := range secs {
-			if sec.Array {
-				parts[sec.Name] += fmt.Sprintf("[xmustard: %d more of %d not shown]\n", total-kept, total)
-			} else {
-				parts[sec.Name] += fmt.Sprintf("[xmustard: %d more of %d not shown]\n", total-kept, total)
+			r.parts[sec.Name] += note
+			if !sec.Array {
 				break
 			}
 		}
 	}
-	for _, s := range in.Sections {
-		if _, ok := parts[s.Name]; !ok {
-			parts[s.Name] = ""
-		}
-	}
-	facts := Facts{ExitCode: in.Sel.ExitCode, Matches: total, Files: nFiles, Shown: kept, Errors: errs, Warnings: warns}
-	if facts.ExitCode != nil {
-		facts.ExitFrom = "tool"
-	}
-	return &Projection{Text: out.String(), Parts: parts, Structured: gp, Facts: facts,
-		Record: Record{Reducer: rules.id + "/1", Mode: "text", Reduced: true, Omissions: capOmissions(oms)}}, nil
+	fillParts(r.parts, r.in.Sections)
+	facts := Facts{Matches: c.total, Files: c.nFiles(), Shown: r.kept, Errors: c.errs, Warnings: c.warns}
+	facts.setToolExit(r.in.Sel.ExitCode)
+	return &Projection{Text: out.String(), Parts: r.parts, Structured: r.gp, Facts: facts,
+		Record: Record{Reducer: r.rules.id + "/1", Mode: "text", Reduced: true, Omissions: capOmissions(r.oms)}}
 }
 
 // shortPath renders a path (or a bare output line taken for one) within

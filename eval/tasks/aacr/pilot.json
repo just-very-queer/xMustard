@@ -1,0 +1,111 @@
+{
+  "schema": "xmustard.eval.aacr-pilot/v1",
+  "status": "optional corpus; outside the WS-50 parity gate; not run",
+  "dataset": {
+    "id": "Alibaba-Aone/aacr-bench",
+    "revision": "47be1d6df1e7faf222cf531587772d92f79fe6b2",
+    "license": "apache-2.0",
+    "license_source": "dataset card metadata (README.md front matter) at the pinned revision",
+    "retrieved": "2026-09-28",
+    "files": {
+      "dataset.json": {
+        "sha256": "0804505f0a474765ce2840c832cfeaa6c4f0250dd6ccb169fe73c6758b245a86",
+        "bytes": 2101497
+      },
+      "README.md": {
+        "sha256": "0fdabc165cc3d6b9fe622a18c0ff1daf1a2e587f8e2ef382a98845321d8da49e",
+        "bytes": 2422
+      }
+    },
+    "rows": 2145,
+    "rows_correct": 1505,
+    "pull_requests": 200,
+    "repositories": 50
+  },
+  "selection": "seven languages, one permissively licensed repository each (MIT, Apache-2.0 or BSD by the GitHub API spdx_id on 2026-09-28); in each repository, the pull request with the most expert-verified correct comments among those changing at most 400 lines",
+  "pull_requests": [
+    {
+      "pr_url": "https://github.com/cline/cline/pull/4676",
+      "repository_license": "Apache-2.0",
+      "language": "TypeScript",
+      "pr_source_commit": "0262e13ac48bbbc29f6c76b6b9a72e7e2ed2eb4b",
+      "pr_target_commit": "d0a8db831cbe657faf792f00c0e3325de0b75fb4",
+      "pr_change_line_count": 179,
+      "comments_correct": 15,
+      "comments_incorrect": 6,
+      "files_with_correct_comments": 4
+    },
+    {
+      "pr_url": "https://github.com/ollama/ollama/pull/12185",
+      "repository_license": "MIT",
+      "language": "Go",
+      "pr_source_commit": "92b96d54efd6b49322b7cf046f9a0dc16b00cd0a",
+      "pr_target_commit": "b6002f6b6c69370f8c18a9e6c1cafa8463273a6b",
+      "pr_change_line_count": 64,
+      "comments_correct": 12,
+      "comments_incorrect": 4,
+      "files_with_correct_comments": 9
+    },
+    {
+      "pr_url": "https://github.com/vllm-project/vllm/pull/17425",
+      "repository_license": "Apache-2.0",
+      "language": "Python",
+      "pr_source_commit": "d8037867313eef09779b265ea4bace76d2d118ba",
+      "pr_target_commit": "134705b1474ddcfac234a0a01313874f7c8b59bc",
+      "pr_change_line_count": 154,
+      "comments_correct": 8,
+      "comments_incorrect": 3,
+      "files_with_correct_comments": 4
+    },
+    {
+      "pr_url": "https://github.com/astral-sh/uv/pull/11088",
+      "repository_license": "Apache-2.0",
+      "language": "Rust",
+      "pr_source_commit": "1fae8dbf1789717f45e82ea290c1c99642d05139",
+      "pr_target_commit": "ed57db2b34c2a7a955b2dc76583dce7ace02e628",
+      "pr_change_line_count": 113,
+      "comments_correct": 6,
+      "comments_incorrect": 1,
+      "files_with_correct_comments": 2
+    },
+    {
+      "pr_url": "https://github.com/keycloak/keycloak/pull/38723",
+      "repository_license": "Apache-2.0",
+      "language": "Java",
+      "pr_source_commit": "8521b9952a989d0dac17697278610b053c613528",
+      "pr_target_commit": "805c204a9dbfb5b8128de8f70c9f3fbd6d6583f9",
+      "pr_change_line_count": 83,
+      "comments_correct": 10,
+      "comments_incorrect": 0,
+      "files_with_correct_comments": 3
+    },
+    {
+      "pr_url": "https://github.com/ClickHouse/ClickHouse/pull/80345",
+      "repository_license": "Apache-2.0",
+      "language": "C++",
+      "pr_source_commit": "e29021aed71bfebb76c0305f554375061adb8bf9",
+      "pr_target_commit": "5fb6ee38d2d7d2fc6e1a67005b12d3b9aaac418f",
+      "pr_change_line_count": 373,
+      "comments_correct": 11,
+      "comments_incorrect": 5,
+      "files_with_correct_comments": 4
+    },
+    {
+      "pr_url": "https://github.com/valkey-io/valkey/pull/2059",
+      "repository_license": "BSD-3-Clause",
+      "language": "C",
+      "pr_source_commit": "b5c7743971df5476acbdbbbd3b378496e885e1e4",
+      "pr_target_commit": "1379171021c18b009fa02c42088e82caf0e33203",
+      "pr_change_line_count": 283,
+      "comments_correct": 11,
+      "comments_incorrect": 11,
+      "files_with_correct_comments": 6
+    }
+  ],
+  "totals": {
+    "pull_requests": 7,
+    "comments_correct": 73,
+    "comments_incorrect": 30,
+    "pr_change_line_count": 1249
+  }
+}

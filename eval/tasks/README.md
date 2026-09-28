@@ -7,10 +7,20 @@ localization against gold files (a PAR-EVAL-09 component). It is an operator too
 macOS and Linux. It runs outside the measured xMustard process tree and never ships
 with the product.
 
-This directory holds the corpus schema (this file), a seed corpus (`seed.yaml`) and an
-example run config (`run-config.example.yaml`). The seed tasks exercise the harness. They
-are not evidence for a parity claim. WS-63 authors the evaluation corpus proper, and
-WS-50 defines the numeric parity thresholds.
+This directory holds the corpus schema (this file), a seed corpus (`seed.yaml`), an
+example run config (`run-config.example.yaml`) and two corpora:
+
+- `parity/`: the evaluation corpus proper (WS-63). Eight tasks on pinned clones of
+  pi-mono (MIT) and cline (Apache-2.0), each with a hidden oracle validated to fail on
+  the starting state and pass with its reference patch. It includes coding-memory
+  lifecycle fixtures (stale-memory harm, a drifted stale memory at an even path depth,
+  and adversarial injection memories). `parity/README.md` has the fetch step and the
+  operator commands.
+- `aacr/`: an optional AACR-Bench review pilot (WS-76, folded into WS-63). It is outside
+  the WS-50 parity gate, has passed its licence gate and has not been run.
+
+The seed tasks exercise the harness and are not evidence for a parity claim. WS-50
+defines the numeric parity thresholds.
 
 ## Quick start
 
@@ -120,7 +130,9 @@ memory:
     - {key: other-repo-port, label: foreign_scope, content: "..."}   # seeded into another workspace
     - {key: unreviewed-port, label: pending, content: "..."}         # proposed, never verified
   drift:
-    - {path: server/timeouts.go, replace: "..."}   # exactly one of append | replace | delete
+    - {path: server/timeouts.go, replace: "..."}   # exactly one of append | replace | delete | substitute
+    - path: server/limits.go                       # substitute: the one exact occurrence of old becomes new;
+      substitute: {old: "MaxBody = 16 << 20", new: "MaxBody = 8 << 20"}   # missing or repeated text fails the run
 ```
 
 | Label | Meaning | Served (delivered to the model) counts as |
@@ -132,6 +144,7 @@ memory:
 | `contradiction` | conflicts with `contradicts` | scored against the server's conflict groups (precision, recall) |
 | `foreign_scope` | lives in a different workspace | scope leakage; must be 0 |
 | `pending` | never verified | governance violation if served; worse if shown as `peer_verified` |
+| `adversarial` | verified, but its content carries an instruction-injection payload (WS-56) | adversarial served; one delivered without `injection_flags` is an injection-safety warning |
 
 The harness puts a marker (`[xmem-<hash>]`) at the start of each seeded memory's content.
 It then scans the tool results in the client's transcript, so "served" means the model
@@ -139,9 +152,13 @@ actually received the memory. Current-fact recall counts a current fact delivere
 anywhere. Recall@k counts it only when a ranked `recall` result lists it among its first
 `recall_k` entries. When no recall result has a ranked `entries` list, recall@k is n/a.
 Promotion errors count entries that became verified during a single-principal run.
-Stale-memory harm counts memory-arm runs that failed the oracle after a harmful memory
-was delivered, where the paired `xmustard_mcp` run (same task, same repetition, no
-memory) passed. A failing run with a harmful delivery but no completed `xmustard_mcp`
+Injection flags are read like the stale flag, from the entry that carries the marker (its
+`content`, or its `text` in a compact render). Stale-memory harm counts memory-arm runs
+that failed the oracle after a harmful memory was delivered, where the paired
+`xmustard_mcp` run (same task, same repetition, no memory) passed. A harmful delivery is
+a stale, superseded or contradicted memory that arrived without a stale flag, or an
+adversarial memory however it arrived: `injection_flags` label such a memory but do not
+withhold it. A failing run with a harmful delivery but no completed `xmustard_mcp`
 partner is counted as unpaired and reported with a warning. When every such run is
 unpaired, harm is n/a, not 0. Tokens per recall use the bytes/4 heuristic and are
 labelled as estimates.
@@ -382,7 +399,8 @@ a fake agent that speaks the client's protocol. The fake agent calls `ground` an
 `recall` through the arm's wiring (MCP for claude and codex, HTTP like the Pi adapter
 for pi), applies the task's reference patch unless `--fake-fail-arms` names the arm,
 and emits deterministic usage. `stack: stub` serves ground and recall from memory for
-dry runs only. Records and the report carry `dry_run`.
+dry runs only; it flags a memory stale when a drift edit touched its paths and labels it
+with the product's injection scan. Records and the report carry `dry_run`.
 
 ## RSS
 
@@ -408,6 +426,7 @@ and agent RSS maxima. It also reports per-task and per-arm medians over repetiti
 resolve rate by task class, and memory-lifecycle aggregates. It flags governance
 violations (scope leakage, delivered pending memories, promotion errors) as warnings and
 names every run that did not complete, with its reason. It also warns about:
+- adversarial memories delivered without `injection_flags` (`INJECTION SAFETY`);
 - client errors;
 - runs without reported usage;
 - verify steps that changed the tree;
@@ -439,9 +458,10 @@ and a budget, so an operator runs it:
    above plus `cargo build --release --bin xmustard-core`). Keep the binaries outside the
    output directory and outside any path repository used by a task. The agent cannot
    read those paths.
-3. Prepare fixtures: Apache/MIT repositories (for example cline, pi-mono) cloned to
-   scratch at pinned shas. GitNexus stays a design reference only. Do not use its code
-   or fixtures, and do not run it as a peer without an explicit owner decision.
+3. Prepare fixtures: Apache/MIT repositories at pinned shas. For the parity corpus,
+   `eval/tasks/parity/fetch-repos.sh` makes the pinned pi-mono and cline commits
+   available under `research/`. GitNexus stays a design reference only. Do not use its
+   code or fixtures, and do not run it as a peer without an explicit owner decision.
 4. Run `validate --oracles` on the corpus. Every task must be valid.
 5. Copy `run-config.example.yaml`, then set `model`, `repeats` (at least 3), `seed`,
    the pre-registered `thresholds`, the client `max_budget_usd` (claude) and `pricing`
@@ -459,7 +479,7 @@ and a budget, so an operator runs it:
    - `ABORTED`. Transcripts can contain repository content, so
    review them before sharing the output directory.
 
-## Authoring rules (for WS-63)
+## Authoring rules
 
 - An oracle must fail on the untouched starting state (after `setup` and `drift`) and
   pass once `reference.patch` is applied. `validate --oracles` checks both, under the
@@ -478,3 +498,11 @@ and a budget, so an operator runs it:
   run. It should pass on the reference, and it must not need the oracle's files.
 - Use Apache/MIT repositories, pin full shas, and prefer tasks that fail on `baseline`
   for a reason xMustard is designed to address. Record the licence of every fixture.
+- A reference patch applies after `setup` and `drift`, so write it against the drifted
+  tree.
+- Keep answers out of files the agent can read. The corpus, oracle sources and
+  reference patches are hidden at run time; a README next to them is not, so it names
+  tasks but not their solutions, gold files or seeded facts.
+- An oracle that imports TypeScript runs under Node's type stripping only when every
+  module it reaches uses erasable syntax and resolves without `node_modules`. The parity
+  corpus picks such modules, so its oracles need no install.

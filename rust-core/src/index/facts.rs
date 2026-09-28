@@ -35,6 +35,29 @@ pub mod flow {
     pub const RETURNS: u8 = 1;
     pub const BRANCHES: u8 = 2;
     pub const WRITES: u8 = 3;
+
+    /// The flow of a reference, by priority: inside a `return` it returns, else inside
+    /// a branch condition it branches, else as an assignment target it writes. Every
+    /// extractor (tree-sitter, tags, lexical, the legacy symbol graph) applies this one
+    /// rule.
+    pub fn classify(in_return: bool, in_condition: bool, assigned: bool) -> u8 {
+        match (in_return, in_condition, assigned) {
+            (true, _, _) => RETURNS,
+            (_, true, _) => BRANCHES,
+            (_, _, true) => WRITES,
+            _ => NONE,
+        }
+    }
+
+    /// The edge label of a flow, or None for a plain read.
+    pub fn label(flow: u8) -> Option<&'static str> {
+        match flow {
+            RETURNS => Some("returns"),
+            BRANCHES => Some("branches"),
+            WRITES => Some("writes"),
+            _ => None,
+        }
+    }
 }
 
 /// `files.flags` bits.

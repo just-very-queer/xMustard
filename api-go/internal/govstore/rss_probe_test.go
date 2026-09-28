@@ -104,6 +104,13 @@ type rssReport struct {
 	FootprintServing int64 `json:"footprint_serving"`
 	TextServing      int64 `json:"text_serving"`
 	ReaderConns      int   `json:"reader_conns"`
+	// SettledRSS is the resident set after the run, once the Go heap is returned: what
+	// the run left resident (review probe).
+	SettledRSS int64 `json:"settled_rss"`
+	// Timings a probe reports, in milliseconds, and settled RSS marks it takes (review
+	// probe).
+	Millis map[string]float64 `json:"millis,omitempty"`
+	Marks  map[string]int64   `json:"marks,omitempty"`
 }
 
 // openCost is the conservative open delta: on macOS, ps-RSS deltas drop below what
@@ -199,6 +206,12 @@ func goHeapResident() uint64 {
 
 type probeFn func(ctx context.Context, s *SQLStore, sample func()) error
 
+// probeMillis and probeMarks collect the timings and settled RSS marks a probe reports.
+var (
+	probeMillis = map[string]float64{}
+	probeMarks  = map[string]int64{}
+)
+
 func rssProbe(run probeFn) error {
 	ctx := context.Background()
 	rep := rssReport{Mode: os.Getenv(helperEnv)}
@@ -237,6 +250,8 @@ func rssProbe(run probeFn) error {
 	rep.PeakRSS = max(rep.MaxRSS, rep.SampledPeak)
 	rep.OverOpen = rep.PeakRSS - rep.OpenRSS
 	rep.OverBase = rep.PeakRSS - rep.BaseRSS
+	rep.SettledRSS = settle()
+	rep.Millis, rep.Marks = probeMillis, probeMarks
 	if rep.Mode == "rss_reopen" {
 		if err := readDuringWrite(ctx, s); err != nil {
 			return err

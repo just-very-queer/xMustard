@@ -202,10 +202,8 @@ type sectionPlan struct {
 // section is planned and emitted before the next is read, so one plan is alive at a
 // time; the labels are charged against the budget before it is shared.
 func reduceLineSections(ctx context.Context, in *Input, rules *lineRules) (*Projection, error) {
-	facts := Facts{ExitCode: in.Sel.ExitCode}
-	if facts.ExitCode != nil {
-		facts.ExitFrom = "tool"
-	}
+	var facts Facts
+	facts.setToolExit(in.Sel.ExitCode)
 	secs := nonEmpty(in.Sections)
 	shares := sectionShares(secs, in.Target-512-labelCost(secs))
 	var body bytes.Buffer
@@ -245,11 +243,7 @@ func reduceLineSections(ctx context.Context, in *Input, rules *lineRules) (*Proj
 		}
 		parts[secs[0].Name] = header + string(first[:firstLen])
 	}
-	for _, s := range in.Sections {
-		if _, ok := parts[s.Name]; !ok {
-			parts[s.Name] = ""
-		}
-	}
+	fillParts(parts, in.Sections)
 	return &Projection{Text: header + body.String(), Parts: parts, Facts: facts,
 		Record: Record{Reducer: rules.id + "/" + strconv.Itoa(rules.version), Mode: "text", Reduced: true, Omissions: capOmissions(oms)}}, nil
 }
@@ -316,57 +310,65 @@ func capOmissions(oms []Omission) []Omission {
 	return append(out, last)
 }
 
+// lineGap collects a run of consecutive omitted lines into one "lines" omission.
+type lineGap struct {
+	start int64 // -1: no run is open
+	lines int
+}
+
+func newLineGap() lineGap { return lineGap{start: -1} }
+
+// skip adds the line starting at start to the open run, opening one if needed.
+func (g *lineGap) skip(start int64) {
+	if g.start < 0 {
+		g.start = start
+	}
+	g.lines++
+}
+
+// take closes the open run at end and returns its omission; ok is false when no run
+// was open.
+func (g *lineGap) take(end int64) (o Omission, ok bool) {
+	if g.start < 0 {
+		return Omission{}, false
+	}
+	o = Omission{Kind: "lines", Start: g.start, End: end, Items: g.lines}
+	g.start, g.lines = -1, 0
+	return o, true
+}
+
+// flush closes the open run at end, appending its omission to oms.
+func (g *lineGap) flush(oms []Omission, end int64) []Omission {
+	if o, ok := g.take(end); ok {
+		return append(oms, o)
+	}
+	return oms
+}
+
+// fillParts gives every section without a projection part an empty one.
+func fillParts(parts map[string]string, secs []Section) {
+	for _, s := range secs {
+		if _, ok := parts[s.Name]; !ok {
+			parts[s.Name] = ""
+		}
+	}
+}
+
+// setToolExit records the exit code the client reported for the tool, if any.
+func (f *Facts) setToolExit(code *int) {
+	f.ExitCode = code
+	if code != nil {
+		f.ExitFrom = "tool"
+	}
+}
+
 // planLines is pass 1 over one section.
 func planLines(ctx context.Context, r io.ReaderAt, sec Section, budget int, rules *lineRules, facts *Facts) (*sectionPlan, error) {
-	p := &sectionPlan{keep: map[int]bool{}, salient: map[int]bool{}, budget: budget}
-	failCap := budget * 7 / 10
-	plainCost := func(n int64) int { return int(min(n, plainDisplay+48)) + 1 }
-	salientCost := func(n int64) int { return int(min(n, salientDisplay+plainDisplay/2+96)) + 1 }
-	add := func(idx, c int) bool {
-		if p.keep[idx] {
-			return false
-		}
-		// each run of kept lines costs about one gap marker: a line that joins no run
-		// opens one, a line that joins two runs closes one
-		switch prev, next := p.keep[idx-1], p.keep[idx+1]; {
-		case !prev && !next:
-			c += gapMarkerCost
-		case prev && next:
-			c -= gapMarkerCost
-		}
-		p.keep[idx] = true
-		p.used += c
-		return true
+	lp := &linePlanner{
+		p:     &sectionPlan{keep: map[int]bool{}, salient: map[int]bool{}, budget: budget},
+		rules: rules, facts: facts, st: &lineState{facts: facts},
+		failCap: budget * 7 / 10, tail: make([]candidate, 0, 64), lastSalient: -100,
 	}
-	var fillOrder []candidate // optional head/tail lines, lowest priority last
-	var head []candidate
-	headUsed := 0
-	tail := make([]candidate, 0, 64) // ring of the newest plain lines
-	tailPos := 0
-	var recent []candidate // the last lineContextBefore plain lines
-	var look []candidate   // lookback: the newest lines of the current test
-	var blockHead []candidate
-	after := 0
-	summaries := 0
-	st := &lineState{facts: facts}
-	// stack-trace run: its first and last frame groups are kept when the run is
-	// attached to failure evidence; the frames between them are omitted.
-	inRun, runAttached, firstStarted := false, false, false
-	var runFirst, runLast []candidate
-	keepRun := func() {
-		if p.used >= failCap {
-			return
-		}
-		for _, g := range runFirst {
-			add(g.idx, g.cost)
-		}
-		for _, g := range runLast {
-			add(g.idx, g.cost)
-		}
-	}
-	lastSalient := -100
-	var prevKey uint64
-	havePrev := false
 	lr := newLineReader(r, sec)
 	defer lr.release()
 	for idx := 0; ; idx++ {
@@ -382,177 +384,267 @@ func planLines(ctx context.Context, r io.ReaderAt, sec Section, budget int, rule
 		if full > maxSalienceLine {
 			return nil, fmt.Errorf("%w: text line of %d bytes exceeds the %d-byte failure-detection limit", ErrUnsupported, full, maxSalienceLine)
 		}
-		p.lines++
-		facts.Lines++
-		line := displayLine(raw)
-		key := lineKey(line, rules.normalize)
-		repeat := havePrev && key == prevKey && len(bytes.TrimSpace(line)) > 0
-		prevKey, havePrev = key, true
-		if facts.ExitCode == nil && mayCarryExit(line) {
-			if m := exitText.FindSubmatch(line); m != nil {
-				st.lastExit = exitFrom(m)
-			}
-		}
-		class := rules.classify(st, line)
-		// stack frames are judged before generic failure keywords, so a frame such as
-		// "panic(...)" or "at Assert.assertEquals" is a frame, not a failure line
-		frame := class != lcSummary && class != lcSalient && isFrame(line, inRun)
-		cont := !frame && inRun && class == lcPlain && frameContinuation(line)
-		if !frame && !cont && class != lcSalient && class != lcSummary && class != lcCollapse && class != lcBoundary {
-			if ok, serr := st.salient(line); serr != nil {
-				return nil, serr
-			} else if ok {
-				class = lcSalient
-			}
-		}
-		if repeat && class != lcSummary {
-			facts.Repeats++
-			class = lcCollapse
-		}
-		c := plainCost(full)
-		switch {
-		case frame && !inRun:
-			inRun, runAttached = true, idx-lastSalient <= lineContextBefore+3
-			firstStarted = !goroutineHeader(line)
-			runFirst, runLast = []candidate{{idx, c}}, nil
-		case frame && isFrameStart(line):
-			if !firstStarted {
-				runFirst = append(runFirst, candidate{idx, c})
-				firstStarted = true
-			} else {
-				runLast = []candidate{{idx, c}}
-			}
-		case frame || cont:
-			if runLast == nil {
-				if len(runFirst) < 5 {
-					runFirst = append(runFirst, candidate{idx, c})
-				}
-			} else if len(runLast) < 3 {
-				runLast = append(runLast, candidate{idx, c})
-			}
-		case inRun:
-			// the run ended; a trace followed by its exception line (Python) is attached
-			inRun = false
-			if runAttached || class == lcSalient {
-				keepRun()
-			}
-		}
-		switch class {
-		case lcBoundary:
-			look, blockHead = look[:0], blockHead[:0]
-			st.block = 0
-			facts.Collapsed++
-		case lcCollapse:
-			facts.Collapsed++
-		case lcSummary:
-			if summaries < maxSummaryLines {
-				add(idx, plainCost(full))
-				summaries++
-			}
-		case lcSalient:
-			facts.FailureLines++
-			if p.used+salientCost(full) > failCap && p.used > 0 {
-				break // over the failure share: counted, searchable in the original
-			}
-			add(idx, salientCost(full))
-			p.salient[idx] = true
-			facts.FailuresShown++
-			lastSalient = idx
-			for _, rc := range recent {
-				add(rc.idx, rc.cost)
-			}
-			if rules.lookback {
-				for _, rc := range blockHead {
-					add(rc.idx, rc.cost)
-				}
-				for _, rc := range look {
-					add(rc.idx, rc.cost)
-				}
-				look, blockHead = look[:0], blockHead[:0]
-			}
-			after = lineContextAfter
-		}
-		if class == lcPlain && !frame && !cont {
-			switch {
-			case after > 0:
-				add(idx, c)
-				after--
-			case st.block > 0 && p.used < failCap:
-				add(idx, c) // inside a failure report block (test family)
-				st.block--
-			}
-		}
-		if class == lcPlain {
-			if len(head) < maxRingLines && headUsed+c <= budget*3/10 {
-				head = append(head, candidate{idx, c})
-				headUsed += c
-			}
-			if len(tail) < maxRingLines {
-				tail = append(tail, candidate{idx, c})
-			} else {
-				tail[tailPos] = candidate{idx, c}
-				tailPos = (tailPos + 1) % maxRingLines
-			}
-			if !frame && !cont {
-				recent = pushRing(recent, candidate{idx, c}, lineContextBefore)
-				if rules.lookback {
-					if len(blockHead) < maxLookback/2 {
-						blockHead = append(blockHead, candidate{idx, c})
-					} else {
-						look = pushRing(look, candidate{idx, c}, maxLookback)
-					}
-				}
-			}
+		if perr := lp.line(idx, displayLine(raw), full); perr != nil {
+			return nil, perr
 		}
 		if err != nil {
 			break
 		}
 	}
-	if inRun && runAttached {
-		keepRun()
+	if lp.run.in && lp.run.attached {
+		lp.keepRun()
 	}
-	if facts.ExitCode == nil && st.lastExit != nil {
-		facts.ExitCode, facts.ExitFrom = st.lastExit, "text"
+	if facts.ExitCode == nil && lp.st.lastExit != nil {
+		facts.ExitCode, facts.ExitFrom = lp.st.lastExit, "text"
 	}
 	if sec.End-sec.Start <= int64(budget) {
-		p.all = true // the whole section fits its share: nothing is omitted
-		return p, nil
+		lp.p.all = true // the whole section fits its share: nothing is omitted
+		return lp.p, nil
 	}
-	ordered := make([]candidate, 0, len(tail))
-	ordered = append(ordered, tail[tailPos:]...)
-	ordered = append(ordered, tail[:tailPos]...)
-	fillTail := func(limit int) {
-		for k := len(ordered) - 1; k >= 0; k-- {
-			t := ordered[k]
-			if p.keep[t.idx] {
-				continue
-			}
-			if p.used+t.cost+gapMarkerCost > limit {
-				return
-			}
-			if add(t.idx, t.cost) {
-				fillOrder = append(fillOrder, t)
-			}
+	lp.fillHeadAndTail()
+	return lp.p, nil
+}
+
+// linePlanner is the state of pass 1 over one section: the selection so far, the
+// head, tail and context rings, and the stack-trace run being read.
+type linePlanner struct {
+	p       *sectionPlan
+	rules   *lineRules
+	facts   *Facts
+	st      *lineState
+	failCap int // failure evidence may use up to 70% of the budget
+
+	head      []candidate // the first plain lines, up to 30% of the budget
+	headUsed  int
+	tail      []candidate // ring of the newest plain lines
+	tailPos   int
+	recent    []candidate // the last lineContextBefore plain lines
+	look      []candidate // lookback: the newest lines of the current test
+	blockHead []candidate // lookback: the first lines of the current test
+	after     int         // context lines still owed after failure evidence
+	summaries int         // summary lines kept
+
+	run         frameRun
+	lastSalient int
+	prevKey     uint64
+	havePrev    bool
+}
+
+// frameRun is a stack-trace run: its first and last frame groups are kept when the
+// run is attached to failure evidence; the frames between them are omitted.
+type frameRun struct {
+	in, attached, firstStarted bool
+	first, last                []candidate
+}
+
+func plainCost(n int64) int   { return int(min(n, plainDisplay+48)) + 1 }
+func salientCost(n int64) int { return int(min(n, salientDisplay+plainDisplay/2+96)) + 1 }
+
+// add selects a line. Each run of kept lines costs about one gap marker: a line that
+// joins no run opens one, a line that joins two runs closes one.
+func (lp *linePlanner) add(idx, c int) bool {
+	p := lp.p
+	if p.keep[idx] {
+		return false
+	}
+	switch prev, next := p.keep[idx-1], p.keep[idx+1]; {
+	case !prev && !next:
+		c += gapMarkerCost
+	case prev && next:
+		c -= gapMarkerCost
+	}
+	p.keep[idx] = true
+	p.used += c
+	return true
+}
+
+func (lp *linePlanner) addAll(cands []candidate) {
+	for _, c := range cands {
+		lp.add(c.idx, c.cost)
+	}
+}
+
+// line classifies one line (failure evidence, summary, passing/progress noise,
+// repeats, stack frames) and keeps what it may emit.
+func (lp *linePlanner) line(idx int, line []byte, full int64) error {
+	lp.p.lines++
+	lp.facts.Lines++
+	key := lineKey(line, lp.rules.normalize)
+	repeat := lp.havePrev && key == lp.prevKey && len(bytes.TrimSpace(line)) > 0
+	lp.prevKey, lp.havePrev = key, true
+	if lp.facts.ExitCode == nil && mayCarryExit(line) {
+		if m := exitText.FindSubmatch(line); m != nil {
+			lp.st.lastExit = exitFrom(m)
 		}
 	}
-	fillHead := func(limit int) {
-		for _, h := range head {
-			if p.keep[h.idx] {
-				continue
-			}
-			if p.used+h.cost+gapMarkerCost > limit {
-				return
-			}
-			if add(h.idx, h.cost) {
-				fillOrder = append(fillOrder, h)
-			}
+	class := lp.rules.classify(lp.st, line)
+	// stack frames are judged before generic failure keywords, so a frame such as
+	// "panic(...)" or "at Assert.assertEquals" is a frame, not a failure line
+	frame := class != lcSummary && class != lcSalient && isFrame(line, lp.run.in)
+	cont := !frame && lp.run.in && class == lcPlain && frameContinuation(line)
+	if !frame && !cont && class == lcPlain {
+		ok, err := lp.st.salient(line)
+		if err != nil {
+			return err
+		}
+		if ok {
+			class = lcSalient
 		}
 	}
-	fillTail(p.used + budget*3/10)
-	fillHead(p.used + budget*3/10)
-	fillTail(budget)
-	fillHead(budget)
-	return p, nil
+	if repeat && class != lcSummary {
+		lp.facts.Repeats++
+		class = lcCollapse
+	}
+	c := plainCost(full)
+	lp.trackFrames(candidate{idx, c}, line, frame, cont, class)
+	lp.keepByClass(idx, full, class)
+	if class == lcPlain {
+		lp.plainLine(candidate{idx, c}, frame || cont)
+	}
+	return nil
+}
+
+// trackFrames follows the stack-trace run: a frame opens it (attached when failure
+// evidence was just seen), a frame-group start begins the last group, frames and
+// continuation lines extend the current group, and any other line ends it (a trace
+// followed by its exception line, as Python prints it, is attached).
+func (lp *linePlanner) trackFrames(cand candidate, line []byte, frame, cont bool, class lineClass) {
+	r := &lp.run
+	switch {
+	case frame && !r.in:
+		r.in, r.attached = true, cand.idx-lp.lastSalient <= lineContextBefore+3
+		r.firstStarted = !goroutineHeader(line)
+		r.first, r.last = []candidate{cand}, nil
+	case frame && isFrameStart(line) && !r.firstStarted:
+		r.first = append(r.first, cand)
+		r.firstStarted = true
+	case frame && isFrameStart(line):
+		r.last = []candidate{cand}
+	case (frame || cont) && r.last == nil:
+		if len(r.first) < 5 {
+			r.first = append(r.first, cand)
+		}
+	case frame || cont:
+		if len(r.last) < 3 {
+			r.last = append(r.last, cand)
+		}
+	case r.in:
+		r.in = false
+		if r.attached || class == lcSalient {
+			lp.keepRun()
+		}
+	}
+}
+
+func (lp *linePlanner) keepRun() {
+	if lp.p.used >= lp.failCap {
+		return
+	}
+	lp.addAll(lp.run.first)
+	lp.addAll(lp.run.last)
+}
+
+// keepByClass counts a line by its class and keeps summaries and failure evidence.
+func (lp *linePlanner) keepByClass(idx int, full int64, class lineClass) {
+	switch class {
+	case lcBoundary:
+		lp.look, lp.blockHead = lp.look[:0], lp.blockHead[:0]
+		lp.st.block = 0
+		lp.facts.Collapsed++
+	case lcCollapse:
+		lp.facts.Collapsed++
+	case lcSummary:
+		if lp.summaries < maxSummaryLines {
+			lp.add(idx, plainCost(full))
+			lp.summaries++
+		}
+	case lcSalient:
+		lp.keepFailure(idx, full)
+	}
+}
+
+// keepFailure keeps failure evidence with the context before it (and, for test
+// runners, the lines of the current test) up to the failure share; beyond it the line
+// is counted and searchable in the original.
+func (lp *linePlanner) keepFailure(idx int, full int64) {
+	lp.facts.FailureLines++
+	if lp.p.used+salientCost(full) > lp.failCap && lp.p.used > 0 {
+		return
+	}
+	lp.add(idx, salientCost(full))
+	lp.p.salient[idx] = true
+	lp.facts.FailuresShown++
+	lp.lastSalient = idx
+	lp.addAll(lp.recent)
+	if lp.rules.lookback {
+		lp.addAll(lp.blockHead)
+		lp.addAll(lp.look)
+		lp.look, lp.blockHead = lp.look[:0], lp.blockHead[:0]
+	}
+	lp.after = lineContextAfter
+}
+
+// plainLine keeps a plain line owed as failure context (outside a trace) and
+// remembers it as a head, tail, context or lookback candidate.
+func (lp *linePlanner) plainLine(cand candidate, inTrace bool) {
+	if !inTrace {
+		switch {
+		case lp.after > 0:
+			lp.add(cand.idx, cand.cost)
+			lp.after--
+		case lp.st.block > 0 && lp.p.used < lp.failCap:
+			lp.add(cand.idx, cand.cost) // inside a failure report block (test family)
+			lp.st.block--
+		}
+	}
+	if len(lp.head) < maxRingLines && lp.headUsed+cand.cost <= lp.p.budget*3/10 {
+		lp.head = append(lp.head, cand)
+		lp.headUsed += cand.cost
+	}
+	if len(lp.tail) < maxRingLines {
+		lp.tail = append(lp.tail, cand)
+	} else {
+		lp.tail[lp.tailPos] = cand
+		lp.tailPos = (lp.tailPos + 1) % maxRingLines
+	}
+	if inTrace {
+		return
+	}
+	lp.recent = pushRing(lp.recent, cand, lineContextBefore)
+	if lp.rules.lookback {
+		if len(lp.blockHead) < maxLookback/2 {
+			lp.blockHead = append(lp.blockHead, cand)
+		} else {
+			lp.look = pushRing(lp.look, cand, maxLookback)
+		}
+	}
+}
+
+// fillHeadAndTail spends what is left of the budget: the tail (newest lines first) up
+// to 30%, the head (in order) up to 30%, then any remainder to the tail and the head.
+func (lp *linePlanner) fillHeadAndTail() {
+	newest := make([]candidate, 0, len(lp.tail))
+	for k := len(lp.tail) - 1; k >= 0; k-- {
+		newest = append(newest, lp.tail[(lp.tailPos+k)%len(lp.tail)])
+	}
+	share := lp.p.budget * 3 / 10
+	lp.fill(newest, lp.p.used+share)
+	lp.fill(lp.head, lp.p.used+share)
+	lp.fill(newest, lp.p.budget)
+	lp.fill(lp.head, lp.p.budget)
+}
+
+// fill keeps candidates in order until the next one would pass limit.
+func (lp *linePlanner) fill(cands []candidate, limit int) {
+	for _, c := range cands {
+		if lp.p.keep[c.idx] {
+			continue
+		}
+		if lp.p.used+c.cost+gapMarkerCost > limit {
+			return
+		}
+		lp.add(c.idx, c.cost)
+	}
 }
 
 // pushRing appends to a small ring kept in place (no reallocation per line).
