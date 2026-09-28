@@ -707,9 +707,11 @@ func clientError(exit ClientExit, tr *Transcript) string {
 	return strings.Join(parts, "; ")
 }
 
-// runOne executes one (task, arm, repetition) in a fresh detached worktree.
+// runOne executes one (task, arm, repetition) in a fresh detached worktree: setup,
+// the agent, then the judge. The first failure of any phase ends the run, and the
+// run's cleanup runs whatever the outcome.
 func (ex *executor) runOne(ctx context.Context, t *Task, arm Arm, rep int, repo, sha string) (rec RunRecord) {
-	cfg, corpus := ex.cfg, ex.corpus
+	cfg := ex.cfg
 	rec = ex.baseRecord(t, arm, rep, sha)
 	if reason := armSkipReason(arm, t, cfg); reason != "" {
 		rec.Status, rec.Reason = StatusSkipped, reason
@@ -718,89 +720,152 @@ func (ex *executor) runOne(ctx context.Context, t *Task, arm Arm, rep int, repo,
 	rec.StartedAt = nowUTC()
 	defer func() { rec.FinishedAt = nowUTC() }()
 	rel := filepath.Join("runs", t.ID, armDir(arm.Name), "r"+strconv.Itoa(rep))
-	art := filepath.Join(cfg.outDir, rel)
 	rec.Artifacts = filepath.ToSlash(rel)
-	fail := func(status, reason string) RunRecord {
-		rec.Status, rec.Reason = status, reason
+	fail := func(f *runFailure) RunRecord {
+		rec.Status, rec.Reason = f.status, f.reason
 		if ctx.Err() != nil {
 			rec.Status = StatusInterrupted
 		}
 		return rec
 	}
-	if err := os.MkdirAll(art, 0o755); err != nil {
-		return fail(StatusError, err.Error())
+	e := &runEnv{t: t, arm: arm, rec: &rec, art: filepath.Join(cfg.outDir, rel)}
+	if err := os.MkdirAll(e.art, 0o755); err != nil {
+		return fail(runError(err.Error()))
 	}
-	iso := &Isolation{Containment: cfg.contain, OracleLeakScan: "skipped"}
-	rec.Isolation = iso
+	e.iso = &Isolation{Containment: cfg.contain, OracleLeakScan: "skipped"}
+	rec.Isolation = e.iso
+	if f := ex.openRun(e, rep, repo, sha); f != nil {
+		return fail(f)
+	}
+	defer ex.closeRun(e)
+	if f := ex.setupPhase(ctx, e); f != nil {
+		return fail(f)
+	}
+	if f := ex.agentPhase(ctx, e); f != nil {
+		return fail(f)
+	}
+	if f := ex.judgePhase(ctx, e); f != nil {
+		return fail(f)
+	}
+	return rec
+}
 
-	// Paths the agent can see (its working directory, the workspace id derived from
-	// it, `git worktree list`) must not reveal the arm: an opaque run id plus the
-	// repository's own name, identical across arms.
-	runID := opaqueRunID(t.ID, arm.Name, rep)
+// runFailure ends a run early: its status and reason.
+type runFailure struct{ status, reason string }
+
+func runError(reason string) *runFailure { return &runFailure{StatusError, reason} }
+
+// runEnv is one run's harness state, shared by its phases.
+type runEnv struct {
+	t         *Task
+	arm       Arm
+	rec       *RunRecord
+	iso       *Isolation
+	art       string // the run's artifact directory
+	runID     string
+	marker    string // the run's environment marker
+	sb        *sandbox
+	wt        *Worktree
+	site      *judgeSite
+	judgeRun  string
+	runDirs   []string
+	tracked   *procSet // processes seen in the trees of the run's commands
+	baseTree  string   // the snapshot the agent starts from
+	configDir string   // the client's configuration, once written
+}
+
+// step runs one of the task's commands (setup, verify) in the worktree, contained
+// like the agent.
+func (e *runEnv) step(ctx context.Context, spec CommandSpec, logName string, def int) CheckResult {
+	return check{argv: spec.Cmd, dir: e.wt.Dir, env: spec.Env, extraEnv: []string{e.marker}, sb: e.sb, track: e.tracked,
+		timeout: secondsOr(spec.TimeoutSec, def), logPath: filepath.Join(e.art, logName), logRel: logName}.run(ctx)
+}
+
+// openRun creates the run's detached worktree and registers what its sweeps and
+// cleanup need. Paths the agent can see (its working directory, the workspace id
+// derived from it, `git worktree list`) must not reveal the arm: an opaque run id plus
+// the repository's own name, identical across arms.
+func (ex *executor) openRun(e *runEnv, rep int, repo, sha string) *runFailure {
+	cfg := ex.cfg
+	e.runID = opaqueRunID(e.t.ID, e.arm.Name, rep)
 	marker, err := newRunMarker()
 	if err != nil {
-		return fail(StatusError, err.Error())
+		return runError(err.Error())
 	}
-	sb := ex.sandboxFor(runID)
-	runDir := filepath.Join(cfg.workRoot, "wt", runID)
-	wt, err := newRunWorktree(repo, sha, filepath.Join(cfg.workRoot, "runrepos", runID),
-		runDir, repoDirName(corpus, t), filepath.Join(cfg.workRoot, "harness", runID))
+	e.marker = marker
+	e.sb = ex.sandboxFor(e.runID)
+	runDir := filepath.Join(cfg.workRoot, "wt", e.runID)
+	wt, err := newRunWorktree(repo, sha, filepath.Join(cfg.workRoot, "runrepos", e.runID),
+		runDir, repoDirName(ex.corpus, e.t), filepath.Join(cfg.workRoot, "harness", e.runID))
 	if err != nil {
-		return fail(StatusError, "create worktree: "+err.Error())
+		return runError("create worktree: " + err.Error())
 	}
+	e.wt = wt
 	ex.registry.add(wt)
-	iso.WorktreeDetached = true
-	judgeRun := filepath.Join(cfg.workRoot, "judge", runID)
-	site := newJudgeSite(wt, judgeRun)
-	runDirs := []string{runDir, judgeRun}
-	trackRun(marker, runDirs...)
-	fakeDir := filepath.Join(cfg.workRoot, "fake", runID)
-	tracked := newProcSet() // processes seen in the trees of the run's commands
-	defer func() {
-		// Nothing the run started may outlive it that the sweep can find.
-		if err := sweep(marker, runDirs, tracked, iso); err != nil && (rec.Status == StatusCompleted || rec.Status == StatusClientError) {
-			rec.Status, rec.Reason = StatusError, "after the oracle: "+err.Error()
-		}
-		trackRun("")
-		// the worktree goes back to its path; the judge copy holds the staged oracle, so
-		// it never outlives the run
-		if err := site.restore(); err != nil && rec.Reason == "" {
-			rec.Reason = "judge cleanup: " + err.Error()
-		}
-		if err := os.RemoveAll(judgeRun); err != nil && rec.Reason == "" {
-			rec.Reason = "judge cleanup: " + err.Error()
-		}
-		if cfg.KeepWorktrees {
-			ex.registry.forget(wt)
-			iso.KeptAt = wt.Dir
-			return
-		}
-		_ = os.RemoveAll(fakeDir)
-		// this removes the whole run directory, with anything the agent left in it
-		if err := ex.registry.remove(wt); err != nil && rec.Reason == "" {
-			rec.Reason = "worktree cleanup: " + err.Error()
-		}
-		iso.WorktreeRemoved = wt.gone()
-	}()
-	runStep := func(spec CommandSpec, logName string, def int) CheckResult {
-		return check{argv: spec.Cmd, dir: wt.Dir, env: spec.Env, extraEnv: []string{marker}, sb: sb, track: tracked,
-			timeout: secondsOr(spec.TimeoutSec, def), logPath: filepath.Join(art, logName), logRel: logName}.run(ctx)
-	}
+	e.iso.WorktreeDetached = true
+	e.judgeRun = filepath.Join(cfg.workRoot, "judge", e.runID)
+	e.site = newJudgeSite(wt, e.judgeRun)
+	e.runDirs = []string{runDir, e.judgeRun}
+	trackRun(marker, e.runDirs...)
+	e.tracked = newProcSet()
+	return nil
+}
 
-	for i, s := range t.Setup {
-		res := runStep(s, fmt.Sprintf("setup-%d.log", i), 600)
-		rec.Setup = append(rec.Setup, res)
+// closeRun is the run's cleanup, whatever its outcome. Nothing the run started may
+// outlive it that the sweep can find; the worktree goes back to its path; the judge
+// copy holds the staged oracle, so it never outlives the run; and the run directory
+// is removed with anything the agent left in it, unless worktrees are kept.
+func (ex *executor) closeRun(e *runEnv) {
+	cfg, rec, iso := ex.cfg, e.rec, e.iso
+	if e.configDir != "" {
+		_ = os.RemoveAll(e.configDir)
+	}
+	if err := sweep(e.marker, e.runDirs, e.tracked, iso); err != nil && (rec.Status == StatusCompleted || rec.Status == StatusClientError) {
+		rec.Status, rec.Reason = StatusError, "after the oracle: "+err.Error()
+	}
+	trackRun("")
+	if err := e.site.restore(); err != nil && rec.Reason == "" {
+		rec.Reason = "judge cleanup: " + err.Error()
+	}
+	if err := os.RemoveAll(e.judgeRun); err != nil && rec.Reason == "" {
+		rec.Reason = "judge cleanup: " + err.Error()
+	}
+	if cfg.KeepWorktrees {
+		ex.registry.forget(e.wt)
+		iso.KeptAt = e.wt.Dir
+		return
+	}
+	_ = os.RemoveAll(filepath.Join(cfg.workRoot, "fake", e.runID))
+	if err := ex.registry.remove(e.wt); err != nil && rec.Reason == "" {
+		rec.Reason = "worktree cleanup: " + err.Error()
+	}
+	iso.WorktreeRemoved = e.wt.gone()
+}
+
+// setupPhase runs the task's setup steps, then checks that no oracle file is visible
+// in the worktree.
+func (ex *executor) setupPhase(ctx context.Context, e *runEnv) *runFailure {
+	for i, s := range e.t.Setup {
+		res := e.step(ctx, s, fmt.Sprintf("setup-%d.log", i), 600)
+		e.rec.Setup = append(e.rec.Setup, res)
 		if !res.Passed {
-			return fail(StatusError, fmt.Sprintf("setup step %d failed (exit %d)", i, res.ExitCode))
+			return runError(fmt.Sprintf("setup step %d failed (exit %d)", i, res.ExitCode))
 		}
 	}
-	if err := scanForOracleLeaks(corpus, t, wt.Dir); err != nil {
-		iso.OracleLeakScan = "leaked"
-		return fail(StatusError, "oracle_visible: "+err.Error())
+	if err := scanForOracleLeaks(ex.corpus, e.t, e.wt.Dir); err != nil {
+		e.iso.OracleLeakScan = "leaked"
+		return runError("oracle_visible: " + err.Error())
 	}
-	iso.OracleLeakScan = "clean"
+	e.iso.OracleLeakScan = "clean"
+	return nil
+}
 
-	sampler := startRSSSampler(100*time.Millisecond, filepath.Join(art, "rss.jsonl"), cfg.xmNames)
+// agentPhase runs the client on the task, sampled for RSS: the arm's stack or peer
+// server, the memory drift, the prompt, then the client under the run's containment
+// (this executable's fake agent in a dry run).
+func (ex *executor) agentPhase(ctx context.Context, e *runEnv) *runFailure {
+	cfg, t, arm, rec := ex.cfg, e.t, e.arm, e.rec
+	sampler := startRSSSampler(100*time.Millisecond, filepath.Join(e.art, "rss.jsonl"), cfg.xmNames)
 	samplerDone := false
 	finishSampler := func() {
 		if !samplerDone {
@@ -810,44 +875,105 @@ func (ex *executor) runOne(ctx context.Context, t *Task, arm Arm, rep int, repo,
 		}
 	}
 	defer finishSampler()
-
-	var stk stackRun
-	var peer *MCPServer
-	if arm.UsesStack {
-		var mem *MemorySpec
-		if arm.SeedsMemory {
-			mem = t.Memory
-		}
-		stackDir := filepath.Join(art, "stack")
-		rec.Stack = &StackInfo{Kind: cfg.Stack.Kind, CoreOnly: cfg.Stack.Kind == StackReal && cfg.Stack.coreOnly()}
-		stk, err = startStack(ctx, cfg.Stack, stackStart{runDir: stackDir, worktree: wt.Dir, taskID: t.ID, memory: mem, sampler: sampler, self: cfg.self,
-			sb: sb.with(stackDir), marker: marker})
-		if err != nil {
-			rec.Stack.Error = err.Error()
-			return fail(StatusError, "start xMustard stack: "+err.Error())
-		}
+	stk, f := ex.startArmStack(ctx, e, sampler)
+	if f != nil {
+		return f
+	}
+	if stk != nil {
 		defer stk.stop()
-		rec.Stack.WorkspaceID = stk.workspaceID()
-		rec.Stack.Seeds = stk.seeds()
 	}
-	if arm.Peer != "" {
-		p, _ := cfg.peer(arm.Peer)
-		peer = &MCPServer{Name: p.Name, Command: p.Command, Args: p.Args, Env: p.Env}
+	if err := applyDrift(t.Memory, e.wt.Dir); err != nil {
+		return runError(err.Error())
 	}
-	if err := applyDrift(t.Memory, wt.Dir); err != nil {
-		return fail(StatusError, err.Error())
-	}
-	baseTree, err := wt.SnapshotTree()
+	baseTree, err := e.wt.SnapshotTree()
 	if err != nil {
-		return fail(StatusError, "snapshot: "+err.Error())
+		return runError("snapshot: " + err.Error())
 	}
+	e.baseTree = baseTree
+	req, prompt, f := ex.clientRequest(ctx, e, stk, sampler)
+	if f != nil {
+		return f
+	}
+	inv, err := ex.driver.Build(req, prompt)
+	if err != nil {
+		return runError("build client invocation: " + err.Error())
+	}
+	if cfg.Fake {
+		if inv, err = ex.fakeInvocation(inv, t, arm, e.runID); err != nil {
+			return runError(err.Error())
+		}
+	}
+	inv.Env = append(inv.Env, e.marker)
+	if inv, err = contain(e.sb, inv); err != nil {
+		return runError(err.Error())
+	}
+	sampler.setPhase("agent")
+	exit, err := runClient(ctx, ex.driver, inv, e.wt.Dir, prompt, filepath.Join(e.art, "transcript.jsonl"), filepath.Join(e.art, "client.stderr.log"),
+		time.Duration(ex.corpus.timeoutSec(t))*time.Second, sampler.setAgentRoot)
+	sampler.setPhase("post")
+	finishSampler()
+	e.tracked.merge(sampler.agentProcesses())
+	rec.Client = &exit
+	if err != nil {
+		return runError("client: " + err.Error())
+	}
+	if tf, err := os.Open(filepath.Join(e.art, "transcript.jsonl")); err == nil {
+		tr := ex.driver.Parse(tf, req.XmServerName)
+		tf.Close()
+		priceUsage(&tr, cfg.Model, cfg.Pricing)
+		rec.Transcript = &tr
+	}
+	rec.ClientError = clientError(exit, rec.Transcript)
+	if exit.Canceled {
+		return &runFailure{StatusInterrupted, "interrupted during the agent run"}
+	}
+	if stk != nil {
+		health, promo := stk.finish(ctx)
+		rec.Stack.Health = health
+		stk.stop()
+		if arm.SeedsMemory && rec.Transcript != nil {
+			rec.Memory = memoryMetrics(t.ID, t.Memory, rec.Transcript.XmResults, stk.seeds(), promo)
+		}
+	}
+	return nil
+}
 
-	configDir := filepath.Join(cfg.workRoot, "clientcfg", runID)
-	if err := os.MkdirAll(configDir, 0o700); err != nil {
-		return fail(StatusError, err.Error())
+// startArmStack starts the xMustard stack of an arm that uses one, seeded with the
+// task's memory when the arm seeds memory; nil for any other arm.
+func (ex *executor) startArmStack(ctx context.Context, e *runEnv, sampler *rssSampler) (stackRun, *runFailure) {
+	cfg, rec := ex.cfg, e.rec
+	if !e.arm.UsesStack {
+		return nil, nil
 	}
-	defer os.RemoveAll(configDir)
-	req := DriverRequest{Arm: arm, Model: cfg.Model, WorkDir: wt.Dir, Client: cfg.client(), ConfigDir: configDir,
+	var mem *MemorySpec
+	if e.arm.SeedsMemory {
+		mem = e.t.Memory
+	}
+	stackDir := filepath.Join(e.art, "stack")
+	rec.Stack = &StackInfo{Kind: cfg.Stack.Kind, CoreOnly: cfg.Stack.Kind == StackReal && cfg.Stack.coreOnly()}
+	stk, err := startStack(ctx, cfg.Stack, stackStart{runDir: stackDir, worktree: e.wt.Dir, taskID: e.t.ID, memory: mem, sampler: sampler, self: cfg.self,
+		sb: e.sb.with(stackDir), marker: e.marker})
+	if err != nil {
+		rec.Stack.Error = err.Error()
+		return nil, runError("start xMustard stack: " + err.Error())
+	}
+	rec.Stack.WorkspaceID = stk.workspaceID()
+	rec.Stack.Seeds = stk.seeds()
+	return stk, nil
+}
+
+// clientRequest writes the client's configuration directory and prompt and returns
+// the driver request: the stack's MCP server (renamed away from an operator server of
+// the same name) or the arm's peer, the arm's hooks, and the prompt, whose digest is
+// recorded.
+func (ex *executor) clientRequest(ctx context.Context, e *runEnv, stk stackRun, sampler *rssSampler) (DriverRequest, string, *runFailure) {
+	cfg, arm := ex.cfg, e.arm
+	configDir := filepath.Join(cfg.workRoot, "clientcfg", e.runID)
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		return DriverRequest{}, "", runError(err.Error())
+	}
+	e.configDir = configDir
+	req := DriverRequest{Arm: arm, Model: cfg.Model, WorkDir: e.wt.Dir, Client: cfg.client(), ConfigDir: configDir,
 		UserServers: ex.userServers, XmServerName: "xmustard", ExternalSandbox: cfg.contain == ContainSandbox}
 	if arm.NeedsHooks {
 		req.HookArgs = cfg.Hooks[cfg.Driver]
@@ -856,7 +982,7 @@ func (ex *executor) runOne(ctx context.Context, t *Task, arm Arm, rep int, repo,
 	if stk != nil {
 		roots, err := stk.agentPhase(ctx)
 		if err != nil {
-			return fail(StatusError, "xMustard agent phase: "+err.Error())
+			return DriverRequest{}, "", runError("xMustard agent phase: " + err.Error())
 		}
 		sampler.setXmRoots(roots...)
 		ws = stk.workspaceID()
@@ -869,145 +995,116 @@ func (ex *executor) runOne(ctx context.Context, t *Task, arm Arm, rep int, repo,
 		req.Servers = []MCPServer{srv}
 		req.PiEnv = stk.piEnv()
 	}
-	if peer != nil {
-		req.Servers = []MCPServer{*peer}
+	if arm.Peer != "" {
+		p, _ := cfg.peer(arm.Peer)
+		req.Servers = []MCPServer{{Name: p.Name, Command: p.Command, Args: p.Args, Env: p.Env}}
 	}
-	prompt := buildPrompt(t, arm, ws)
-	if err := os.WriteFile(filepath.Join(art, "prompt.txt"), []byte(prompt), 0o644); err != nil {
-		return fail(StatusError, err.Error())
+	prompt := buildPrompt(e.t, arm, ws)
+	if err := os.WriteFile(filepath.Join(e.art, "prompt.txt"), []byte(prompt), 0o644); err != nil {
+		return DriverRequest{}, "", runError(err.Error())
 	}
 	ps := sha256.Sum256([]byte(prompt))
-	rec.PromptSHA256 = hex.EncodeToString(ps[:])
+	e.rec.PromptSHA256 = hex.EncodeToString(ps[:])
+	return req, prompt, nil
+}
 
-	inv, err := ex.driver.Build(req, prompt)
+// judgePhase judges the agent's final tree. The client's group is dead; so must be
+// everything else the run started (a command the agent detached with setsid) before
+// the tree is judged. From then on the harness reads the tree only while it is held
+// where no process of the run can reach it: the agent may have replaced its worktree
+// or run directory with a link, and the harness has the operator's rights.
+func (ex *executor) judgePhase(ctx context.Context, e *runEnv) *runFailure {
+	cfg, corpus, t, rec, iso, site := ex.cfg, ex.corpus, e.t, e.rec, e.iso, e.site
+	if err := sweep(e.marker, e.runDirs, e.tracked, iso); err != nil {
+		return runError(err.Error())
+	}
+	held, err := site.hold(e.wt)
 	if err != nil {
-		return fail(StatusError, "build client invocation: "+err.Error())
-	}
-	if cfg.Fake {
-		inv, err = ex.fakeInvocation(inv, t, arm, runID)
-		if err != nil {
-			return fail(StatusError, err.Error())
-		}
-	}
-	inv.Env = append(inv.Env, marker)
-	if inv, err = contain(sb, inv); err != nil {
-		return fail(StatusError, err.Error())
-	}
-	sampler.setPhase("agent")
-	exit, err := runClient(ctx, ex.driver, inv, wt.Dir, prompt, filepath.Join(art, "transcript.jsonl"), filepath.Join(art, "client.stderr.log"),
-		time.Duration(corpus.timeoutSec(t))*time.Second, sampler.setAgentRoot)
-	sampler.setPhase("post")
-	finishSampler()
-	tracked.merge(sampler.agentProcesses())
-	rec.Client = &exit
-	if err != nil {
-		return fail(StatusError, "client: "+err.Error())
-	}
-	if tf, err := os.Open(filepath.Join(art, "transcript.jsonl")); err == nil {
-		tr := ex.driver.Parse(tf, req.XmServerName)
-		tf.Close()
-		priceUsage(&tr, cfg.Model, cfg.Pricing)
-		rec.Transcript = &tr
-	}
-	rec.ClientError = clientError(exit, rec.Transcript)
-	if exit.Canceled {
-		return fail(StatusInterrupted, "interrupted during the agent run")
-	}
-	if stk != nil {
-		health, promo := stk.finish(ctx)
-		rec.Stack.Health = health
-		stk.stop()
-		if arm.SeedsMemory && rec.Transcript != nil {
-			rec.Memory = memoryMetrics(t.ID, t.Memory, rec.Transcript.XmResults, stk.seeds(), promo)
-		}
-	}
-	// The client's group is dead; so must be everything else the run started (a
-	// command the agent detached with setsid) before the tree is judged.
-	if err := sweep(marker, runDirs, tracked, iso); err != nil {
-		return fail(StatusError, err.Error())
-	}
-
-	// From here on the harness reads the tree only while it is held where no process
-	// of the run can reach it: the agent may have replaced its worktree or run
-	// directory with a link, and the harness has the operator's rights.
-	held, err := site.hold(wt)
-	if err != nil {
-		return fail(StatusError, err.Error())
+		return runError(err.Error())
 	}
 	finalTree, err := held.SnapshotTree()
 	if err != nil {
-		return fail(StatusError, "snapshot: "+err.Error())
+		return runError("snapshot: " + err.Error())
 	}
-	churn, err := diffChurn(held, baseTree, finalTree, filepath.Join(art, "diff.patch"))
+	churn, err := diffChurn(held, e.baseTree, finalTree, filepath.Join(e.art, "diff.patch"))
 	if err != nil {
-		return fail(StatusError, "diff: "+err.Error())
+		return runError("diff: " + err.Error())
 	}
 	rec.Churn = &churn
 	rec.Localization = editLocalization(t.GoldFiles, churn.Files)
-
-	// Verify runs code the agent wrote, so it is contained like the agent, and it runs
-	// after the final snapshot: the oracle judges that snapshot, not what verify left.
 	if t.Verify != nil {
-		if err := site.release(); err != nil {
-			return fail(StatusError, err.Error())
+		var f *runFailure
+		if held, f = ex.verifyPhase(ctx, e, finalTree); f != nil {
+			return f
 		}
-		v := runStep(*t.Verify, "verify.log", 600)
-		rec.Verify = &v
-		if ctx.Err() != nil {
-			return fail(StatusInterrupted, "interrupted before the oracle")
-		}
-		if err := sweep(marker, runDirs, tracked, iso); err != nil {
-			return fail(StatusError, "after verify: "+err.Error())
-		}
-		if held, err = site.hold(wt); err != nil {
-			return fail(StatusError, "after verify: "+err.Error())
-		}
-		// the change is recorded, not undone: the judge copy is reset instead
-		afterVerify, err := held.SnapshotTree()
-		if err != nil {
-			return fail(StatusError, "snapshot: "+err.Error())
-		}
-		iso.VerifyChangedTree = afterVerify != finalTree
 	}
 	if ctx.Err() != nil {
-		return fail(StatusInterrupted, "interrupted before the oracle")
+		return &runFailure{StatusInterrupted, "interrupted before the oracle"}
 	}
 	// A corpus file that changed on disk means something escaped containment: the run
 	// fails and no further run starts.
 	if err := corpus.checkIntegrity(); err != nil {
 		ex.aborted = "corpus_changed: " + err.Error()
-		return fail(StatusError, ex.aborted)
+		return runError(ex.aborted)
 	}
 	// The oracle judges a copy of the final snapshot that no run's agent, setup or
 	// verify profile can reach, through a link at the worktree's own path, so a process
 	// of this run that the sweeps did not find can neither change the judged tree nor
 	// read the staged oracle.
 	if err := site.prepare(held, finalTree); err != nil {
-		return fail(StatusError, "judge copy: "+err.Error())
+		return runError("judge copy: " + err.Error())
 	}
 	iso.OracleJudgedCopy = true
 	if err := stageOracle(corpus, t, site.judgedWorktree()); err != nil {
-		return fail(StatusError, "stage oracle: "+err.Error())
+		return runError("stage oracle: " + err.Error())
 	}
 	iso.OracleStagedPost = true
 	if err := site.link(); err != nil {
-		return fail(StatusError, "judge copy: "+err.Error())
+		return runError("judge copy: " + err.Error())
 	}
-	o := check{argv: t.Oracle.Cmd, dir: wt.Dir, env: t.Oracle.Env, extraEnv: []string{marker}, sb: ex.judgeSandbox(site), track: tracked,
-		timeout: secondsOr(t.Oracle.TimeoutSec, 600), logPath: filepath.Join(art, "oracle.log"), logRel: "oracle.log"}.run(ctx)
+	o := check{argv: t.Oracle.Cmd, dir: e.wt.Dir, env: t.Oracle.Env, extraEnv: []string{e.marker}, sb: ex.judgeSandbox(site), track: e.tracked,
+		timeout: secondsOr(t.Oracle.TimeoutSec, 600), logPath: filepath.Join(e.art, "oracle.log"), logRel: "oracle.log"}.run(ctx)
 	rec.Oracle = &o
 	if ctx.Err() != nil {
-		return fail(StatusInterrupted, "interrupted during the oracle")
+		return &runFailure{StatusInterrupted, "interrupted during the oracle"}
 	}
 	if o.Error != "" {
-		return fail(StatusError, "oracle did not run: "+o.Error)
+		return runError("oracle did not run: " + o.Error)
 	}
 	rec.Resolved = o.Passed
 	rec.Status = StatusCompleted
 	if cfg.ExcludeClientErrors && rec.ClientError != "" {
 		rec.Status, rec.Reason = StatusClientError, "client error (exclude_client_errors): "+rec.ClientError
 	}
-	return rec
+	return nil
+}
+
+// verifyPhase runs the task's visible verify step and holds the tree again. Verify
+// runs code the agent wrote, so it is contained like the agent, and it runs after the
+// final snapshot: the oracle judges that snapshot, not what verify left. A change
+// verify makes is recorded, not undone (the judge copy is reset instead).
+func (ex *executor) verifyPhase(ctx context.Context, e *runEnv, finalTree string) (*Worktree, *runFailure) {
+	if err := e.site.release(); err != nil {
+		return nil, runError(err.Error())
+	}
+	v := e.step(ctx, *e.t.Verify, "verify.log", 600)
+	e.rec.Verify = &v
+	if ctx.Err() != nil {
+		return nil, &runFailure{StatusInterrupted, "interrupted before the oracle"}
+	}
+	if err := sweep(e.marker, e.runDirs, e.tracked, e.iso); err != nil {
+		return nil, runError("after verify: " + err.Error())
+	}
+	held, err := e.site.hold(e.wt)
+	if err != nil {
+		return nil, runError("after verify: " + err.Error())
+	}
+	afterVerify, err := held.SnapshotTree()
+	if err != nil {
+		return nil, runError("snapshot: " + err.Error())
+	}
+	e.iso.VerifyChangedTree = afterVerify != finalTree
+	return held, nil
 }
 
 // fakeInvocation swaps the client binary for this executable's fake agent and gives
