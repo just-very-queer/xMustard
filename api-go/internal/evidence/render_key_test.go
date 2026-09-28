@@ -92,7 +92,8 @@ const searchBody = `{"workspace_id":"ws","query":"Double","total":1,"generated_a
   "work":{"elapsed_ms":435,"lock_wait_ms":0,"graph_cache":"miss","files_parsed":2,"lock":"not_used"}}}`
 
 const impactBody = `{"path":"a.go","impacted_count":1,"impacted":[{"distance":1,"path":"b.go"}],"generated_at":"x",
- "freshness":{"status":"current","identity_age_ms":0,"head":"7eb1","watcher_state":"absent"}}`
+ "freshness":{"status":"current","identity_age_ms":0,"head":"7eb1","watcher_state":"absent",
+  "refresh":{"escalated":false,"reparsed":2,"reresolved":2},"snapshot_generation":1}}`
 
 func TestRenderIgnoresSearchVolatileFieldsAndBucketsFreshness(t *testing.T) {
 	base := Render("search", []byte(searchBody))
@@ -116,9 +117,11 @@ func TestRenderIgnoresSearchVolatileFieldsAndBucketsFreshness(t *testing.T) {
 	if !strings.Contains(string(imp.Text), `"identity_age":"under_5s"`) || imp.Meta["freshness.identity_age_ms"] == nil {
 		t.Fatalf("freshness age not bucketed: %s meta %v", imp.Text, imp.Meta)
 	}
-	sameBucket := Render("impact", mutate(t, impactBody, map[string]any{"freshness.identity_age_ms": 4200}))
-	if sameBucket.ContentDigest() != imp.ContentDigest() {
-		t.Fatal("an age inside the same freshness bucket changed the digest")
+	// a warm call: another age in the same bucket, nothing reparsed, a later snapshot
+	warm = Render("impact", mutate(t, impactBody, map[string]any{"freshness.identity_age_ms": 4200,
+		"freshness.refresh": map[string]any{"escalated": false, "reparsed": 0, "reresolved": 0}, "freshness.snapshot_generation": 2}))
+	if warm.ContentDigest() != imp.ContentDigest() {
+		t.Fatalf("a warm impact call rendered differently:\n%s\n%s", imp.Text, warm.Text)
 	}
 	older := Render("impact", mutate(t, impactBody, map[string]any{"freshness.identity_age_ms": 90_000}))
 	if older.ContentDigest() == imp.ContentDigest() || !strings.Contains(string(older.Text), `"identity_age":"under_10m"`) {

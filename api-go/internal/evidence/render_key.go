@@ -101,6 +101,12 @@ type ToolPolicy struct {
 	live     []string
 }
 
+// indexWork are the members of an index-backed result that say how the answer was
+// computed, not what it is: they differ between a cold and a warm call with the same
+// answer (files parsed, graph cache hit, reparsed and re-resolved counts, which index
+// snapshot served it).
+var indexWork = []string{"coverage.work", "freshness.refresh", "freshness.snapshot_generation"}
+
 // readTool is the policy of a read-only exploratory tool.
 var readTool = ToolPolicy{Exploratory: true}
 
@@ -113,11 +119,9 @@ var sideEffecting = ToolPolicy{SideEffecting: true}
 // cover, so it needs that run's revision (source). ground and recall carry per-caller
 // sections (principal, pending_for_you, already_shown), which are live.
 var toolPolicies = map[string]ToolPolicy{
-	"search": {Exploratory: true, Cacheable: true, needs: needMemory | needParser,
-		volatile: []string{"coverage.work"}},
-	"explain": {Exploratory: true, Cacheable: true, needs: needMemory | needParser},
-	"impact": {Exploratory: true, Cacheable: true, needs: needMemory | needParser,
-		volatile: []string{"coverage.work"}},
+	"search":      {Exploratory: true, Cacheable: true, needs: needMemory | needParser, volatile: indexWork},
+	"explain":     {Exploratory: true, Cacheable: true, needs: needMemory | needParser, volatile: indexWork},
+	"impact":      {Exploratory: true, Cacheable: true, needs: needMemory | needParser, volatile: indexWork},
 	"diagnostics": {Cacheable: true, needs: needSource},
 	"ground": {needs: needMemory,
 		live: []string{"principal", "pending_for_you", "summary"}},
