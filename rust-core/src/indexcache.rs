@@ -9,6 +9,12 @@
 //! bounded read never claims identity for bytes it did not read. The same key drives
 //! graph-cache invalidation and `xmustard-core repo-key`.
 //!
+//! Dirty and untracked files are hashed through a stat cache of their own
+//! (`hashcache::identity_cache_file_for`, PAR-FRESH-01), so an unchanged dirty file is
+//! not read again: `files_hashed` counts the files read, `files_reused` the ones the
+//! cache vouched for. Inside `serve`, the watcher keeps the last [`RepoState`] per
+//! watched root and reuses it while nothing under the root changed (`repo_state`).
+//!
 //! Caches live in `<git-dir>/xmustard-cache/index-v2/<scope>/`, where the scope hashes
 //! the canonical repository root, the caller's trust scope and the parser version.
 //! Workspace IDs never select a cache: agents in the same repo and trust scope share
@@ -20,6 +26,8 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
@@ -126,6 +134,20 @@ pub fn sweep_stale_temps(dir: &Path, max_age: Duration) -> usize {
 /// Stdout cap for index/identity Git commands (`status -z`, `ls-files -s -z`).
 pub const MAX_GIT_OUTPUT_BYTES: usize = 32 << 20;
 
+static GIT_SPAWNS: AtomicU64 = AtomicU64::new(0);
+
+/// Count one Git child started by this process. Every Git spawn in the crate goes
+/// through here, so `serve`'s `$/stats` can show that queries spawn none while the
+/// watcher vouches for the tree (PAR-FRESH-03).
+pub fn note_git_spawn() {
+    GIT_SPAWNS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Git children this process has started.
+pub fn git_spawns() -> u64 {
+    GIT_SPAWNS.load(Ordering::Relaxed)
+}
+
 /// Why a bounded Git command produced no usable output.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GitRunError {
@@ -188,6 +210,7 @@ pub fn run_git_bounded_input(
     } else {
         Stdio::piped()
     };
+    note_git_spawn();
     let mut child = Command::new("git")
         .arg("--no-optional-locks")
         .arg("-C")
@@ -370,8 +393,11 @@ pub struct SourceIdentity {
     /// Assume-unchanged / skip-worktree index entries hashed directly because
     /// `git status` does not report their worktree edits.
     pub hidden_entries: usize,
+    /// Dirty or untracked files read and hashed by this call.
     pub files_hashed: usize,
     pub bytes_hashed: u64,
+    /// Dirty or untracked files whose hash the stat cache vouched for (not read).
+    pub files_reused: usize,
     #[serde(skip)]
     pub dirty: BTreeMap<Vec<u8>, DirtyContent>,
     #[serde(skip)]
@@ -460,18 +486,63 @@ fn push_field(h: &mut Sha256, bytes: &[u8]) {
 
 /// Compute the source identity of the working tree at `root` (see module docs).
 pub fn source_identity(root: &Path) -> SourceIdentity {
-    source_identity_with(root, false)
+    source_identity_with(root, false).0
 }
 
 /// `source_identity` plus the ignored-directory listing (`ignored_dirs`) the
 /// `repo-key` command reports. The key is the same as `source_identity`'s.
 pub fn repo_key_identity(root: &Path) -> SourceIdentity {
-    source_identity_with(root, true)
+    source_identity_with(root, true).0
+}
+
+/// One observation of a working tree: its source identity, the status entries the
+/// identity was computed from (porcelain entries, untracked included, plus the hidden
+/// assume-unchanged/skip-worktree entries with `xy[0] == b'!'`), and its branch and
+/// origin remote. Change tracking (drift, working changes) reads it instead of running
+/// its own Git listings (PAR-FRESH-01: one identity scheme).
+#[derive(Debug)]
+pub struct RepoState {
+    pub identity: SourceIdentity,
+    pub status: Vec<StatusEntry>,
+    pub branch: Option<String>,
+    pub remote_url: Option<String>,
+}
+
+/// Observe `root` now: the source identity, its status entries, branch and remote.
+pub fn observe_repo_state(root: &Path) -> RepoState {
+    let (identity, status) = source_identity_with(root, false);
+    let line = |args: &[&str]| {
+        run_git_bounded(root, args, 64 << 10, git_timeout())
+            .ok()
+            .map(|b| String::from_utf8_lossy(&b).trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    let (branch, remote_url) = match identity.layout {
+        Some(_) => (
+            line(&["rev-parse", "--abbrev-ref", "HEAD"]),
+            line(&["remote", "get-url", "origin"]),
+        ),
+        None => (None, None),
+    };
+    RepoState {
+        identity,
+        status,
+        branch,
+        remote_url,
+    }
+}
+
+/// The repository state of `root`: the watcher's last observation while it vouches
+/// that nothing under the root changed since (inside `serve`, a watched root with no
+/// Git spawn and no hashing), else a new observation. The flag says whether the
+/// watcher's copy answered.
+pub fn repo_state(root: &Path) -> (Arc<RepoState>, bool) {
+    crate::index::watch::memo(root, || Arc::new(observe_repo_state(root)))
 }
 
 /// Collect the whole-directory `!!` entries of a `--ignored=matching` status, or None
 /// when they cannot all be reported.
-fn ignored_dir_listing(entries: &[StatusEntry]) -> Option<Vec<String>> {
+pub(crate) fn ignored_dir_listing(entries: &[StatusEntry]) -> Option<Vec<String>> {
     let mut dirs = Vec::new();
     let mut bytes = 0usize;
     for e in entries.iter().filter(|e| e.xy == *b"!!") {
@@ -488,7 +559,7 @@ fn ignored_dir_listing(entries: &[StatusEntry]) -> Option<Vec<String>> {
     Some(dirs)
 }
 
-fn source_identity_with(root: &Path, list_ignored: bool) -> SourceIdentity {
+fn source_identity_with(root: &Path, list_ignored: bool) -> (SourceIdentity, Vec<StatusEntry>) {
     let canonical = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let root_str = canonical.to_string_lossy().into_owned();
     let mut id = SourceIdentity {
@@ -504,6 +575,7 @@ fn source_identity_with(root: &Path, list_ignored: bool) -> SourceIdentity {
         hidden_entries: 0,
         files_hashed: 0,
         bytes_hashed: 0,
+        files_reused: 0,
         dirty: BTreeMap::new(),
         layout: None,
         tracked_unhashed: Vec::new(),
@@ -524,7 +596,7 @@ fn source_identity_with(root: &Path, list_ignored: bool) -> SourceIdentity {
         });
         h.update(b"git-unavailable");
         id.key = format!("{:x}", h.finalize());
-        return id;
+        return (id, Vec::new());
     };
     id.head = git_output(root, &["rev-parse", "-q", "--verify", "HEAD^{commit}"])
         .map(|b| String::from_utf8_lossy(&b).trim().to_string())
@@ -568,7 +640,7 @@ fn source_identity_with(root: &Path, list_ignored: bool) -> SourceIdentity {
             h.update(b"status-failed");
             id.key = format!("{:x}", h.finalize());
             id.layout = Some(layout);
-            return id;
+            return (id, Vec::new());
         }
     };
     let mut entries = parse_porcelain_v1_z(&status);
@@ -597,7 +669,23 @@ fn source_identity_with(root: &Path, list_ignored: bool) -> SourceIdentity {
             .cmp(&b.is_untracked())
             .then_with(|| a.path.cmp(&b.path))
     });
-    let mut budget = MAX_IDENTITY_BYTES;
+    // Regular files come from the identity's stat cache: only new, changed or racy ones
+    // are read, and tracked entries claim the byte budget first (the entries' order).
+    let rels: Vec<String> = entries
+        .iter()
+        .filter_map(|e| std::str::from_utf8(&e.path).ok().map(str::to_string))
+        .collect();
+    let cache = crate::hashcache::identity_cache_file_for(&layout);
+    let (cached, pass) = crate::hashcache::hash_files_budgeted(
+        &layout.toplevel,
+        rels,
+        Some(&cache),
+        MAX_IDENTITY_BYTES,
+    );
+    id.files_hashed = pass.hashed;
+    id.bytes_hashed = pass.bytes_hashed;
+    id.files_reused = pass.reused;
+    let mut budget = MAX_IDENTITY_BYTES - pass.bytes_hashed;
     for e in &entries {
         if e.is_untracked() {
             id.untracked_entries += 1;
@@ -607,7 +695,12 @@ fn source_identity_with(root: &Path, list_ignored: bool) -> SourceIdentity {
             id.dirty_entries += 1;
         }
         let rel = path_from_bytes(&e.path);
-        let content = if budget == 0 {
+        let from_cache = std::str::from_utf8(&e.path)
+            .ok()
+            .and_then(|p| cached.get(p));
+        let content = if let Some(hex) = from_cache {
+            DirtyContent::Sha256(hex.clone())
+        } else if budget == 0 {
             DirtyContent::Unhashed
         } else {
             match read_source_beneath(&layout.toplevel, &rel, MAX_REPO_FILE_BYTES.min(budget)) {
@@ -681,7 +774,7 @@ fn source_identity_with(root: &Path, list_ignored: bool) -> SourceIdentity {
     id.identity_complete = id.limitations.is_empty();
     id.key = format!("{:x}", h.finalize());
     id.layout = Some(layout);
-    id
+    (id, entries)
 }
 
 /// The source-identity key (kept for callers of the former size/mtime key).

@@ -66,6 +66,10 @@ const CHECKSUM_BYTES: usize = 32;
 pub struct HashPass {
     /// Files whose bytes were read this pass (new, changed, racy, or no usable cache).
     pub hashed: usize,
+    /// Bytes those files held.
+    pub bytes_hashed: u64,
+    /// Files left out because reading them would pass the pass's byte budget.
+    pub over_budget: usize,
     /// Files whose hash came from the cache without reading them.
     pub reused: usize,
     /// Cached entries whose stat key matched but fell inside the racy window.
@@ -175,35 +179,85 @@ pub fn hash_files(
     hash_files_with(root, rels, cache, RACY_WINDOW)
 }
 
+/// `hash_files` for a pass that may read at most `budget` bytes: `rels` are taken in
+/// the given order (the caller's priority), a file that is not reused from the cache
+/// and does not fit what is left is not read and is left out of the map (counted in
+/// `over_budget`). Reused entries cost nothing. The source identity hashes the dirty
+/// and untracked files `git status` lists this way (PAR-FRESH-01), so an unchanged
+/// dirty file is not read again.
+pub fn hash_files_budgeted(
+    root: &Path,
+    rels: Vec<String>,
+    cache: Option<&Path>,
+    budget: u64,
+) -> (BTreeMap<String, String>, HashPass) {
+    hash_files_inner(root, rels, cache, RACY_WINDOW, Some(budget))
+}
+
 /// The stat-cache file for `root`, or None outside Git.
 pub fn cache_file(root: &Path) -> Option<PathBuf> {
+    scoped_cache_file(root, "")
+}
+
+/// The stat-cache file of the source identity's pass over the dirty and untracked
+/// files of the worktree `layout` describes (top-level relative paths). A file of its
+/// own, because a pass keeps only the entries it was given.
+pub fn identity_cache_file_for(layout: &indexcache::GitLayout) -> PathBuf {
+    scope_file(layout, &layout.toplevel, "identity")
+}
+
+fn scoped_cache_file(root: &Path, kind: &str) -> Option<PathBuf> {
     let layout = indexcache::git_layout(root)?;
     let canonical = fs::canonicalize(root).ok()?;
+    Some(scope_file(&layout, &canonical, kind))
+}
+
+fn scope_file(layout: &indexcache::GitLayout, root: &Path, kind: &str) -> PathBuf {
     let mut h = Sha256::new();
     h.update(b"xm-filehash-scope-v1\0");
-    h.update(canonical.as_os_str().as_encoded_bytes());
+    h.update(root.as_os_str().as_encoded_bytes());
+    if !kind.is_empty() {
+        h.update(b"\0");
+        h.update(kind.as_bytes());
+    }
     let scope = symbolgraph::hex_lower(&h.finalize()[..16]);
-    Some(
-        indexcache::xmustard_cache_dir(&layout)
-            .join("filehash-v1")
-            .join(format!("{scope}.bin")),
-    )
+    indexcache::xmustard_cache_dir(layout)
+        .join("filehash-v1")
+        .join(format!("{scope}.bin"))
 }
 
 fn hash_files_with(
     root: &Path,
+    rels: Vec<String>,
+    cache: Option<&Path>,
+    racy_window: Duration,
+) -> (BTreeMap<String, String>, HashPass) {
+    hash_files_inner(root, rels, cache, racy_window, None)
+}
+
+fn hash_files_inner(
+    root: &Path,
     mut rels: Vec<String>,
     cache: Option<&Path>,
     racy_window: Duration,
+    budget: Option<u64>,
 ) -> (BTreeMap<String, String>, HashPass) {
     // Taken before any stat. The filesystem reading subtracts the pass's duration, so
     // neither reading of the start depends on how long hashing took.
     let start = PassStart::now();
-    // `git ls-files` lists an unmerged path once per conflict stage. Sorted and unique,
-    // every path is hashed once and `map` keys come out in push order, so `entries`
-    // lines up with them.
-    rels.sort_unstable();
-    rels.dedup();
+    // `git ls-files` lists an unmerged path once per conflict stage: every path is
+    // hashed once. Without a budget the paths are sorted up front, so rows come out in
+    // map order; with one they keep the caller's order and are sorted at the end.
+    let mut seen = std::collections::HashSet::new();
+    match budget {
+        None => {
+            rels.sort_unstable();
+            rels.dedup();
+        }
+        Some(_) => rels.retain(|r| seen.insert(r.clone())),
+    }
+    drop(seen);
+    let mut left = budget.unwrap_or(u64::MAX);
     let mut pass = HashPass::default();
     let (mut old, replace_invalid) = match cache.map(load) {
         Some(Loaded::Valid(c)) => {
@@ -216,8 +270,7 @@ fn hash_files_with(
     let window_ns = i64::try_from(racy_window.as_nanos()).unwrap_or(i64::MAX);
     let trusted_before = old.recorded_at_ns.saturating_sub(window_ns);
 
-    let mut map = BTreeMap::new();
-    let mut entries: Vec<Entry> = Vec::with_capacity(rels.len());
+    let mut rows: Vec<(String, Entry)> = Vec::with_capacity(rels.len());
     let mut entries_changed = false;
     for rel in rels {
         // a path skipped here keeps its old entry in `old`, which marks the cache stale.
@@ -235,11 +288,19 @@ fn hash_files_with(
                 pass.reused += 1;
                 e.digest
             }
+            _ if meta.len() > left => {
+                // not read: the caller reports it; its old entry is dropped
+                pass.over_budget += 1;
+                entries_changed |= prev.is_some();
+                continue;
+            }
             _ => {
                 if cached.is_some() {
                     pass.racy += 1;
                 }
                 pass.hashed += 1;
+                pass.bytes_hashed += meta.len();
+                left -= meta.len();
                 let Some(digest) = symbolgraph::sha256_open_file(file) else {
                     entries_changed |= prev.is_some();
                     continue;
@@ -249,7 +310,15 @@ fn hash_files_with(
         };
         let entry = Entry { key, digest };
         entries_changed |= prev != Some(entry);
-        map.insert(rel, symbolgraph::hex_lower(&digest));
+        rows.push((rel, entry));
+    }
+    if budget.is_some() {
+        rows.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    }
+    let mut map = BTreeMap::new();
+    let mut entries: Vec<Entry> = Vec::with_capacity(rows.len());
+    for (rel, entry) in rows {
+        map.insert(rel, symbolgraph::hex_lower(&entry.digest));
         entries.push(entry);
     }
     // Entries still in `old` belong to paths that left the tracked set or can no longer
@@ -889,6 +958,38 @@ mod tests {
             assert_eq!(m, direct(repo.path(), &names));
             assert_eq!(m.keys().collect::<Vec<_>>(), ["ok.rs"]);
         }
+    }
+
+    // The identity's pass: the caller's order claims the byte budget, a file that does
+    // not fit is left out and counted, and reused entries cost nothing.
+    #[test]
+    fn a_budgeted_pass_keeps_the_callers_order_and_reuses_for_free() {
+        let (repo, _s, cache) = setup(&[]);
+        write(repo.path(), "z_tracked.rs", &[b'a'; 100]);
+        write(repo.path(), "a_untracked.rs", &[b'b'; 100]);
+        settle();
+        let order = rels(&["z_tracked.rs", "a_untracked.rs"]);
+        let (m, p) = hash_files_inner(
+            repo.path(),
+            order.clone(),
+            Some(&cache),
+            Duration::ZERO,
+            Some(150),
+        );
+        assert_eq!(
+            m.keys().collect::<Vec<_>>(),
+            ["z_tracked.rs"],
+            "first in order wins the budget"
+        );
+        assert_eq!((p.hashed, p.bytes_hashed, p.over_budget), (1, 100, 1));
+        let (m, p) = hash_files_inner(repo.path(), order, Some(&cache), Duration::ZERO, Some(150));
+        assert_eq!(
+            m.len(),
+            2,
+            "the reused entry leaves the budget to the other file"
+        );
+        assert_eq!((p.hashed, p.reused, p.over_budget), (1, 1, 0));
+        assert_eq!(m["a_untracked.rs"], sha_hex(&[b'b'; 100]));
     }
 
     #[test]

@@ -4,6 +4,18 @@
 //! dirty *symbols* (not just dirty files). This is the honesty layer the
 //! semantic index keys off of — it refuses to give stale answers silently.
 //!
+//! One identity scheme (PAR-FRESH-01). Drift and the working changes read the
+//! repository state `indexcache::repo_state` observes: the source identity (HEAD,
+//! `git status`, and the SHA-256 of each dirty or untracked file through its stat
+//! cache) with its status entries. While HEAD equals the baseline's, drift compares
+//! only the paths `git status` lists (and those an explicit baseline took in) with the
+//! baseline's hashes, so an unchanged tree hashes no file; inside `serve`, a watched
+//! root's state is reused while the watcher saw no change, with no Git spawn at all.
+//! The per-file map over every tracked file (through the stat cache in the Git dir)
+//! is kept for a HEAD move, a root below its worktree's top level and a baseline that
+//! does not say what it took in; `drift_checked` reports which path ran and what it
+//! read.
+//!
 //! Per-call work is bounded (PAR-RT-11). A change set lists at most
 //! `ChangeBounds::listed_files` files and `symbols` dirty symbols, still counting every
 //! one, and reads at most `symbol_files` changed source files, each once whatever its
@@ -28,6 +40,7 @@ fn now() -> String {
 }
 
 fn git(root: &Path, args: &[&str]) -> Option<String> {
+    crate::indexcache::note_git_spawn();
     let out = Command::new("git")
         .arg("-C")
         .arg(root)
@@ -408,6 +421,11 @@ pub struct IndexBaseline {
     /// has them (their content, or their absence).
     #[serde(default)]
     pub from_head: usize,
+    /// The tracked paths whose uncommitted content the baseline took in (only an
+    /// explicit rebaseline takes any). None in baselines written before WS-15: drift
+    /// then compares every tracked file when the baseline is dirty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub taken_in: Option<Vec<String>>,
     pub indexed_at: String,
 }
 
@@ -698,14 +716,18 @@ fn build_baseline(
             }
         })?;
     }
-    let taken_in = if committed { 0 } else { uncommitted.len() };
+    let taken_in: Vec<String> = match committed {
+        true => Vec::new(),
+        false => uncommitted.iter().map(|e| e.path.clone()).collect(),
+    };
     Ok(IndexBaseline {
         workspace_id: workspace_id.to_string(),
-        fingerprint: fingerprint_of(root, head, &file_hashes, taken_in),
+        fingerprint: fingerprint_of(root, head, &file_hashes, taken_in.len()),
         file_hashes,
         signatures,
         reason,
         from_head: from_head.len(),
+        taken_in: Some(taken_in),
         indexed_at: now(),
     })
 }
@@ -825,7 +847,148 @@ pub struct DriftReport {
     /// comparison flags are not determined.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// How content was compared and what it read (PAR-FRESH-01).
+    pub drift_checked: DriftChecked,
     pub generated_at: String,
+}
+
+/// How drift decided whether tracked content changed, and what it read.
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+pub struct DriftChecked {
+    /// `watcher`: the watcher's last observation of the root answered, with no Git
+    /// spawn and nothing read. `identity`: one observation of the worktree. With either,
+    /// HEAD equals the baseline's and only the paths `git status` lists (and those an
+    /// explicit baseline took in) are compared. `full`: every tracked file through the
+    /// stat cache (HEAD moved, the root is below its worktree's top level, or a listed
+    /// path could not be identified). `none`: nothing was compared (no baseline, or the
+    /// worktree could not be observed).
+    pub mode: &'static str,
+    /// Files read and hashed by this check.
+    pub hashed: usize,
+    /// Files a stat cache vouched for without reading them.
+    pub stat_skipped: usize,
+    /// Paths compared with the baseline.
+    pub compared: usize,
+}
+
+impl DriftChecked {
+    fn none() -> Self {
+        DriftChecked {
+            mode: "none",
+            ..Default::default()
+        }
+    }
+}
+
+/// Why the worktree could not be observed: Git is missing, the root is not a worktree,
+/// or `git status` failed.
+fn observation_error(state: &crate::indexcache::RepoState) -> Option<String> {
+    state
+        .identity
+        .limitations
+        .iter()
+        .find(|l| matches!(l.reason.as_str(), "git_unavailable" | "git_status_failed"))
+        .map(|l| {
+            format!(
+                "git {}: {}",
+                l.reason.trim_start_matches("git_").replace('_', " "),
+                l.detail
+            )
+        })
+}
+
+/// A listed path's current content in the terms of the baseline's hash map: its
+/// SHA-256, or None where the map has no entry (deleted, a symlink, not a regular file,
+/// or past the file cap). None overall when the observation could not tell (unreadable,
+/// or past the identity's byte budget).
+fn comparable_hash(content: &crate::indexcache::DirtyContent) -> Option<Option<String>> {
+    use crate::indexcache::DirtyContent as C;
+    match content {
+        C::Sha256(x) => Some(Some(x.clone())),
+        C::Deleted | C::Symlink(_) | C::Incomplete(SourceReadFailure::NotRegular) => Some(None),
+        C::Incomplete(SourceReadFailure::Oversized(n)) if *n > MAX_REPO_FILE_BYTES => Some(None),
+        C::Incomplete(_) | C::Unhashed => None,
+    }
+}
+
+/// The content comparison when HEAD equals the baseline's: a path `git status` does
+/// not list holds HEAD's content, which is the baseline's unless the baseline took in
+/// an uncommitted version of it. So only the listed tracked paths and the taken-in ones
+/// are compared. None when that cannot decide (the root is below its worktree's top
+/// level, a legacy dirty baseline, a path that is not UTF-8 or could not be
+/// identified); the caller then compares every tracked file. Returns (changed,
+/// paths compared).
+fn listed_content_changed(
+    baseline: &IndexBaseline,
+    state: &crate::indexcache::RepoState,
+) -> Option<(bool, usize)> {
+    let layout = state.identity.layout.as_ref()?;
+    if !layout.prefix.is_empty() {
+        return None;
+    }
+    let taken_in: BTreeSet<&str> = match &baseline.taken_in {
+        Some(paths) => paths.iter().map(String::as_str).collect(),
+        None if !baseline.fingerprint.dirty => BTreeSet::new(),
+        None => return None,
+    };
+    let mut current: BTreeMap<String, Option<String>> = BTreeMap::new();
+    for e in state.status.iter().filter(|e| !e.is_untracked()) {
+        let path = String::from_utf8(e.path.clone()).ok()?;
+        current.insert(path, comparable_hash(state.identity.dirty.get(&e.path)?)?);
+        if e.xy.contains(&b'R')
+            && let Some(orig) = &e.orig_path
+        {
+            // the rename's source left the index
+            current
+                .entry(String::from_utf8(orig.clone()).ok()?)
+                .or_insert(None);
+        }
+    }
+    // a taken-in path that is clean now holds HEAD's content, not what was taken in
+    let reverted = taken_in.iter().any(|p| !current.contains_key(*p));
+    let changed = reverted
+        || current
+            .iter()
+            .any(|(p, h)| baseline.file_hashes.get(p) != h.as_ref());
+    Some((changed, current.len() + taken_in.len()))
+}
+
+/// Whether tracked content differs from the baseline, and how that was decided.
+fn content_changed(
+    root: &Path,
+    baseline: &IndexBaseline,
+    state: &crate::indexcache::RepoState,
+    watched: bool,
+    head_changed: bool,
+) -> Result<(bool, DriftChecked), String> {
+    let listed = (!head_changed)
+        .then(|| listed_content_changed(baseline, state))
+        .flatten();
+    if let Some((changed, compared)) = listed {
+        let id = &state.identity;
+        let checked = match watched {
+            true => DriftChecked {
+                mode: "watcher",
+                compared,
+                ..Default::default()
+            },
+            false => DriftChecked {
+                mode: "identity",
+                hashed: id.files_hashed,
+                stat_skipped: id.files_reused,
+                compared,
+            },
+        };
+        return Ok((changed, checked));
+    }
+    let (current, pass) = file_hash_map_counted(root)?;
+    let checked = DriftChecked {
+        mode: "full",
+        hashed: pass.hashed,
+        stat_skipped: pass.reused,
+        compared: current.len(),
+    };
+    Ok((current != baseline.file_hashes, checked))
 }
 
 /// Detect whether the index baseline has drifted from the current worktree.
@@ -853,34 +1016,44 @@ pub fn detect_drift(data_dir: &Path, root: &Path, workspace_id: &str) -> DriftRe
         baseline_error,
         reasons: Vec::new(),
         error: None,
+        drift_checked: DriftChecked::none(),
         generated_at: now(),
     };
-    let current = match compute_fingerprint(root) {
-        Ok(current) => current,
-        Err(e) => {
-            report
-                .reasons
-                .push(format!("cannot fingerprint the worktree: {e}"));
-            report.error = Some(e);
-            return report;
-        }
+    let fail = |mut report: DriftReport, e: String| {
+        report
+            .reasons
+            .push(format!("cannot fingerprint the worktree: {e}"));
+        report.error = Some(e);
+        report
     };
-    report.current_head = current.head_sha.clone();
-    report.current_remote = current.remote_url.clone();
-    report.dirty = current.dirty;
+    let (state, watched) = crate::indexcache::repo_state(root);
+    if let Some(e) = observation_error(&state) {
+        return fail(report, e);
+    }
+    let head = Some(state.identity.head.clone()).filter(|h| !h.is_empty());
+    let dirty_paths = state.status.iter().filter(|e| e.xy[0] != b'!').count();
+    report.current_head = head.clone();
+    report.current_remote = state.remote_url.clone();
+    report.dirty = dirty_paths > 0;
     let Some(baseline) = baseline else {
         report
             .reasons
             .push(format!("{missing}; results would be unindexed"));
         return report;
     };
-    report.head_changed = baseline.fingerprint.head_sha != current.head_sha;
-    report.content_changed = baseline.fingerprint.content_hash != current.content_hash;
+    report.head_changed = baseline.fingerprint.head_sha != head;
+    match content_changed(root, &baseline, &state, watched, report.head_changed) {
+        Ok((changed, checked)) => {
+            report.content_changed = changed;
+            report.drift_checked = checked;
+        }
+        Err(e) => return fail(report, e),
+    }
     // sibling clone: same logical repo (remote) but the baseline was built from a
     // different checkout/path, or the remote differs entirely.
-    report.sibling_clone = match (&baseline.fingerprint.remote_url, &current.remote_url) {
+    report.sibling_clone = match (&baseline.fingerprint.remote_url, &state.remote_url) {
         (Some(b), Some(c)) => b != c,
-        _ => baseline.fingerprint.root != current.root && report.head_changed,
+        _ => baseline.fingerprint.root != root.display().to_string() && report.head_changed,
     };
     report.stale = report.head_changed || report.content_changed || report.sibling_clone;
     let flagged = [
@@ -889,7 +1062,7 @@ pub fn detect_drift(data_dir: &Path, root: &Path, workspace_id: &str) -> DriftRe
             format!(
                 "HEAD moved {} -> {}",
                 baseline.fingerprint.head_sha.as_deref().unwrap_or("?"),
-                current.head_sha.as_deref().unwrap_or("?")
+                head.as_deref().unwrap_or("?")
             ),
         ),
         (
@@ -901,8 +1074,8 @@ pub fn detect_drift(data_dir: &Path, root: &Path, workspace_id: &str) -> DriftRe
             "index baseline came from a different clone/remote".to_string(),
         ),
         (
-            current.dirty,
-            format!("{} uncommitted dirty path(s)", current.dirty_path_count),
+            report.dirty,
+            format!("{dirty_paths} uncommitted dirty path(s)"),
         ),
     ];
     report.reasons.extend(
@@ -995,6 +1168,10 @@ pub struct ChangeSet {
     pub truncation: Option<Truncation>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub unknown: Vec<Unknown>,
+    /// How tracked content was compared with the baseline and what that read
+    /// (PAR-FRESH-01); absent when nothing was compared.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub drift_checked: Option<DriftChecked>,
     pub generated_at: String,
 }
 
@@ -1011,6 +1188,7 @@ impl ChangeSet {
             contract_breaks: None,
             truncation: None,
             unknown: Vec::new(),
+            drift_checked: None,
             generated_at: now(),
         }
     }
@@ -1265,9 +1443,17 @@ pub fn changed_since_baseline_bounded(
 ) -> ChangeSet {
     let read = read_baseline(data_dir, workspace_id);
     if let Ok(Some(baseline)) = &read {
-        let listed =
-            file_hash_map(root).map(|current| diff_hash_maps(&baseline.file_hashes, &current));
-        let set = ChangeSet::new(workspace_id, "baseline", true);
+        // every tracked file through the stat cache: only stat-changed ones are read
+        let mut set = ChangeSet::new(workspace_id, "baseline", true);
+        let listed = file_hash_map_counted(root).map(|(current, pass)| {
+            set.drift_checked = Some(DriftChecked {
+                mode: "full",
+                hashed: pass.hashed,
+                stat_skipped: pass.reused,
+                compared: current.len(),
+            });
+            diff_hash_maps(&baseline.file_hashes, &current)
+        });
         return change_set(root, set, listed, Ok(&baseline.signatures), bounds);
     }
     let missing = missing_baseline_reason(&read);
@@ -1342,17 +1528,25 @@ pub fn working_tree_changes_bounded(
     workspace_id: &str,
     bounds: ChangeBounds,
 ) -> ChangeSet {
-    let listed = dirty_paths(root).map(|paths| {
-        let mut changed: Vec<ChangedFile> = paths
-            .into_iter()
-            .map(|(code, path)| ChangedFile {
-                path,
-                change: status_change(&code).to_string(),
-            })
-            .collect();
-        changed.sort_by(|a, b| a.path.cmp(&b.path));
-        changed
-    });
+    let (state, _) = crate::indexcache::repo_state(root);
+    let listed = match observation_error(&state) {
+        Some(e) => Err(e),
+        None => {
+            // `git status` entries; the hidden assume-unchanged/skip-worktree ones the
+            // identity adds are not working changes
+            let mut changed: Vec<ChangedFile> = state
+                .status
+                .iter()
+                .filter(|e| e.xy[0] != b'!')
+                .map(|e| ChangedFile {
+                    path: String::from_utf8_lossy(&e.path).into_owned(),
+                    change: status_change(String::from_utf8_lossy(&e.xy).trim()).to_string(),
+                })
+                .collect();
+            changed.sort_by(|a, b| a.path.cmp(&b.path));
+            Ok(changed)
+        }
+    };
     let read = read_baseline(data_dir, workspace_id);
     let missing = missing_baseline_reason(&read);
     let baseline = read.ok().flatten();
