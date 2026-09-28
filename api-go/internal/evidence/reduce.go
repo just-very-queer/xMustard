@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -788,13 +789,22 @@ func (j *jsonReducer) reduceArray(out *bytes.Buffer, start, end int64, budget in
 		// failure elements beyond what can be tracked cannot all be kept
 		return errHardCap
 	}
-	remaining := budget - 2
-	chosen := make(map[int]int, len(els)) // element slot -> budget (-1 verbatim)
+	chosen, err := j.chooseElements(els, budget-2)
+	if err != nil {
+		return err
+	}
+	return j.writeArray(out, els, chosen, total, end, ptr, depth)
+}
+
+// chooseElements gives every kept element slot its budget (-1: verbatim). Failure
+// evidence is mandatory: every salient element is kept — whole when the target plus
+// the shared slack (up to the hard cap) allows, otherwise reduced into an equal share
+// that keeps its failure windows. If even that cannot fit, the projection fails with
+// an explicit size error rather than dropping failures. Leading elements then take
+// what is left, verbatim.
+func (j *jsonReducer) chooseElements(els []element, remaining int) (map[int]int, error) {
+	chosen := make(map[int]int, len(els))
 	size := func(k int) int { return int(els[k].end-els[k].start) + 1 }
-	// Failure evidence is mandatory: every salient element is kept — whole when the
-	// target plus the shared slack (up to the hard cap) allows, otherwise reduced into an
-	// equal share that keeps its failure windows. If even that cannot fit, the
-	// projection fails with an explicit size error rather than dropping failures.
 	var salientIdx []int
 	for k := range els {
 		if els[k].salient {
@@ -813,13 +823,14 @@ func (j *jsonReducer) reduceArray(out *bytes.Buffer, start, end int64, budget in
 				need += per
 			}
 		}
-		if need <= remaining {
+		switch {
+		case need <= remaining:
 			remaining -= need
-		} else if need-remaining <= j.extra {
+		case need-remaining <= j.extra:
 			j.extra -= need - remaining
 			remaining = 0
-		} else {
-			return errHardCap
+		default:
+			return nil, errHardCap
 		}
 	}
 	for k := range els {
@@ -835,10 +846,16 @@ func (j *jsonReducer) reduceArray(out *bytes.Buffer, start, end int64, budget in
 		// even the first element is too large: reduce it into the whole budget
 		chosen[0] = remaining
 	}
+	return chosen, nil
+}
+
+// writeArray writes the chosen elements in order. Each run of elements left out
+// (including unrecorded ones beyond maxSpans) becomes one array_items omission.
+func (j *jsonReducer) writeArray(out *bytes.Buffer, els []element, chosen map[int]int, total int, end int64, ptr string, depth int) error {
 	if err := j.write(out, []byte{'['}); err != nil {
 		return err
 	}
-	kept, first := 0, true
+	kept := 0
 	var gap *Omission
 	flush := func() {
 		if gap != nil {
@@ -863,18 +880,13 @@ func (j *jsonReducer) reduceArray(out *bytes.Buffer, start, end int64, budget in
 		}
 		flush()
 		lastIndex = e.index
-		if !first {
+		if kept > 0 {
 			if err := j.write(out, []byte{','}); err != nil {
 				return err
 			}
 		}
-		first = false
 		kept++
-		if b == -1 {
-			if err := j.write(out, j.src.read(e.start, e.end)); err != nil {
-				return err
-			}
-		} else if err := j.reduce(out, e.start, e.end, max(b, 64), ptr+"/"+strconv.Itoa(e.index), depth+1); err != nil {
+		if err := j.writeElement(out, e, b, ptr, depth); err != nil {
 			return err
 		}
 	}
@@ -895,6 +907,14 @@ func (j *jsonReducer) reduceArray(out *bytes.Buffer, start, end int64, budget in
 		}
 	}
 	return nil
+}
+
+// writeElement writes one chosen element: verbatim, or reduced into its budget.
+func (j *jsonReducer) writeElement(out *bytes.Buffer, e element, budget int, ptr string, depth int) error {
+	if budget == -1 {
+		return j.write(out, j.src.read(e.start, e.end))
+	}
+	return j.reduce(out, e.start, e.end, max(budget, 64), ptr+"/"+strconv.Itoa(e.index), depth+1)
 }
 
 var pointerEscaper = strings.NewReplacer("~", "~0", "/", "~1")
@@ -921,169 +941,200 @@ const (
 	textLineOverhead = 96
 )
 
-type lineInfo struct {
-	start, end int64
-}
-
-type lineCost struct{ idx, cost int }
-
 // reduceText selects the MANDATORY lines first — every failure/status line with its
 // context and stack-trace continuation — and only then spends what is left of the
 // target on the head and the tail. Required evidence may use up to hardMax; if it
 // cannot fit even there, the reduction fails explicitly rather than returning a
 // success-looking projection without it.
 func reduceText(ctx context.Context, r io.ReaderAt, n int64, target, hardMax int) (string, []Omission, error) {
-	cost := func(full int64) int { return int(min(full, textMaxLine)) + textLineOverhead }
-	// pass 1: mandatory lines and the costs of head/tail candidates
-	mandatory := map[int]int{}
-	whole := map[int]bool{} // lines emitted whole because they carry failure evidence
-	var recent, head, tail []lineCost
-	after, total := 0, 0
-	inTrace := false
+	tp, err := planText(ctx, r, n)
+	if err != nil {
+		return "", nil, err
+	}
+	keep, err := tp.keepLines(target, hardMax)
+	if err != nil {
+		return "", nil, err
+	}
+	return tp.emit(r, n, keep, hardMax)
+}
+
+// textPlan is pass 1 of the text reduction: the mandatory lines and the costs of the
+// head and tail candidates.
+type textPlan struct {
+	mandatory map[int]int  // line index → cost
+	whole     map[int]bool // lines emitted whole because they carry failure evidence
+	head      []candidate
+	tail      []candidate // the last textTail lines
+	recent    []candidate // the last textContext lines
+	after     int         // context lines still owed after failure evidence
+	inTrace   bool
+	total     int
+}
+
+func textLineCost(full int64) int { return int(min(full, textMaxLine)) + textLineOverhead }
+
+func planText(ctx context.Context, r io.ReaderAt, n int64) (*textPlan, error) {
+	tp := &textPlan{mandatory: map[int]int{}, whole: map[int]bool{}}
 	br := bufio.NewReaderSize(io.NewSectionReader(r, 0, n), 64<<10)
 	for {
-		if total&4095 == 0 {
+		if tp.total&4095 == 0 {
 			if err := ctx.Err(); err != nil {
-				return "", nil, err
+				return nil, err
 			}
 		}
 		line, full, err := readLine(br, maxSalienceLine)
 		if len(line) > 0 || err == nil {
-			c := cost(full)
-			if full > maxSalienceLine {
-				// the whole line could not be examined for failure evidence
-				return "", nil, fmt.Errorf("%w: text line of %d bytes exceeds the %d-byte failure-detection limit", ErrUnsupported, full, maxSalienceLine)
+			if lerr := tp.line(line, full); lerr != nil {
+				return nil, lerr
 			}
-			isSalient, serr := salientMatch(line)
-			if serr != nil {
-				return "", nil, serr
-			}
-			if isSalient || (inTrace && stackLine.Match(line)) {
-				for _, p := range recent {
-					if !whole[p.idx] { // never shrink a whole failure line to context cost
-						mandatory[p.idx] = p.cost
-					}
-				}
-				// a line carrying failure evidence is kept whole (its failure bytes may
-				// sit past the 4 KiB display cut); context lines stay truncated
-				mandatory[total] = int(full) + textLineOverhead
-				whole[total] = true
-				after, inTrace = textContext, true
-			} else {
-				inTrace = false
-				if after > 0 {
-					mandatory[total] = c
-					after--
-				}
-			}
-			if len(mandatory) > maxRequiredLines {
-				return "", nil, fmt.Errorf("%w: more than %d required failure lines", ErrUnsupported, maxRequiredLines)
-			}
-			recent = append(recent, lineCost{total, c})
-			if len(recent) > textContext {
-				recent = recent[1:]
-			}
-			if total < textHead {
-				head = append(head, lineCost{total, c})
-			}
-			tail = append(tail, lineCost{total, c})
-			if len(tail) > textTail {
-				tail = tail[1:]
-			}
-			total++
 		}
 		if err != nil {
-			break
+			return tp, nil
 		}
 	}
+}
+
+// line reads one line: failure evidence (and a stack trace continuing it) is
+// mandatory with the context before and after it.
+func (tp *textPlan) line(line []byte, full int64) error {
+	c := textLineCost(full)
+	if full > maxSalienceLine {
+		// the whole line could not be examined for failure evidence
+		return fmt.Errorf("%w: text line of %d bytes exceeds the %d-byte failure-detection limit", ErrUnsupported, full, maxSalienceLine)
+	}
+	isSalient, err := salientMatch(line)
+	if err != nil {
+		return err
+	}
+	if isSalient || (tp.inTrace && stackLine.Match(line)) {
+		for _, p := range tp.recent {
+			if !tp.whole[p.idx] { // never shrink a whole failure line to context cost
+				tp.mandatory[p.idx] = p.cost
+			}
+		}
+		// a line carrying failure evidence is kept whole (its failure bytes may sit
+		// past the 4 KiB display cut); context lines stay truncated
+		tp.mandatory[tp.total] = int(full) + textLineOverhead
+		tp.whole[tp.total] = true
+		tp.after, tp.inTrace = textContext, true
+	} else {
+		tp.inTrace = false
+		if tp.after > 0 {
+			tp.mandatory[tp.total] = c
+			tp.after--
+		}
+	}
+	if len(tp.mandatory) > maxRequiredLines {
+		return fmt.Errorf("%w: more than %d required failure lines", ErrUnsupported, maxRequiredLines)
+	}
+	cand := candidate{tp.total, c}
+	tp.recent = append(tp.recent, cand)
+	if len(tp.recent) > textContext {
+		tp.recent = tp.recent[1:]
+	}
+	if tp.total < textHead {
+		tp.head = append(tp.head, cand)
+	}
+	tp.tail = append(tp.tail, cand)
+	if len(tp.tail) > textTail {
+		tp.tail = tp.tail[1:]
+	}
+	tp.total++
+	return nil
+}
+
+// keepLines selects the mandatory lines, then spends what is left of the target: the
+// tail (newest lines first) may take up to half, the head (in order) takes the rest,
+// and the tail any remainder.
+func (tp *textPlan) keepLines(target, hardMax int) (map[int]bool, error) {
 	used := 0
-	keep := make(map[int]bool, len(mandatory)+textHead+textTail)
-	for idx, c := range mandatory {
+	keep := make(map[int]bool, len(tp.mandatory)+textHead+textTail)
+	for idx, c := range tp.mandatory {
 		keep[idx] = true
 		used += c
 	}
 	if used > hardMax {
-		return "", nil, fmt.Errorf("%w: required failure evidence (%d bytes) exceeds the %d-byte projection limit", ErrUnsupported, used, hardMax)
+		return nil, fmt.Errorf("%w: required failure evidence (%d bytes) exceeds the %d-byte projection limit", ErrUnsupported, used, hardMax)
 	}
-	// then what is left of the target: the tail (newest lines first) may take up to half,
-	// the head (in order) takes the rest, and the tail any remainder.
-	fillTail := func(limit int) {
-		for k := len(tail) - 1; k >= 0; k-- {
-			t := tail[k]
-			if keep[t.idx] {
+	fill := func(cands []candidate, limit int) {
+		for _, c := range cands {
+			if keep[c.idx] {
 				continue
 			}
-			if used+t.cost > limit {
+			if used+c.cost > limit {
 				return
 			}
-			keep[t.idx], used = true, used+t.cost
+			keep[c.idx], used = true, used+c.cost
 		}
 	}
-	fillTail(used + max(0, target-used)/2)
-	for _, h := range head {
-		if keep[h.idx] {
-			continue
-		}
-		if used+h.cost > target {
-			break
-		}
-		keep[h.idx], used = true, used+h.cost
-	}
-	fillTail(target)
-	// pass 2: emit exactly the selected lines, in input order
+	newest := slices.Clone(tp.tail)
+	slices.Reverse(newest)
+	fill(newest, used+max(0, target-used)/2)
+	fill(tp.head, target)
+	fill(newest, target)
+	return keep, nil
+}
+
+// emit is pass 2: exactly the selected lines, in input order, with a marker (and an
+// omission) for every run of lines left out.
+func (tp *textPlan) emit(r io.ReaderAt, n int64, keep map[int]bool, hardMax int) (string, []Omission, error) {
 	var out bytes.Buffer
 	var oms []Omission
-	br = bufio.NewReaderSize(io.NewSectionReader(r, 0, n), 64<<10)
+	gapMarker := func(o Omission) {
+		fmt.Fprintf(&out, "[xmustard: %d lines omitted, bytes %d-%d]\n", o.Items, o.Start, o.End)
+		oms = append(oms, o)
+	}
+	br := bufio.NewReaderSize(io.NewSectionReader(r, 0, n), 64<<10)
+	gap := newLineGap()
 	var off int64
-	gapStart, gapLines := int64(-1), 0
-	for idx := 0; idx < total; idx++ {
+	for idx := 0; idx < tp.total; idx++ {
 		keepBytes := textMaxLine + 1
-		if whole[idx] {
+		if tp.whole[idx] {
 			keepBytes = maxSalienceLine // pass 1 refused anything longer
 		}
 		line, full, _ := readLine(br, keepBytes)
-		info := lineInfo{off, off + full}
-		off = info.end
+		start := off
+		off += full
 		if !keep[idx] {
-			if gapStart < 0 {
-				gapStart = info.start
-			}
-			gapLines++
+			gap.skip(start)
 			continue
 		}
-		if gapStart >= 0 {
-			fmt.Fprintf(&out, "[xmustard: %d lines omitted, bytes %d-%d]\n", gapLines, gapStart, info.start)
-			oms = append(oms, Omission{Kind: "lines", Start: gapStart, End: info.start, Items: gapLines})
-			gapStart, gapLines = -1, 0
+		if o, ok := gap.take(start); ok {
+			gapMarker(o)
 		}
-		emitted := line
-		if full > textMaxLine && !whole[idx] {
-			emitted = line[:textMaxLine]
-			for k := 0; k < utf8.UTFMax && len(emitted) > 0 && !utf8.Valid(emitted); k++ {
-				emitted = emitted[:len(emitted)-1] // do not split a trailing rune
-			}
-		}
-		if utf8.Valid(emitted) {
-			out.Write(emitted)
-		} else {
-			// the projection must be valid UTF-8 (JSON transports rewrite anything
-			// else); the exact bytes stay recoverable through the handle
-			out.WriteString(strings.ToValidUTF8(string(emitted), "�"))
-			oms = append(oms, Omission{Kind: "invalid_utf8", Start: info.start, End: info.end})
-		}
-		if full > int64(len(emitted)) {
-			fmt.Fprintf(&out, "…[xmustard: %d bytes omitted]\n", full-int64(len(emitted)))
-			oms = append(oms, Omission{Kind: "line_tail", Start: info.start + int64(len(emitted)), End: info.end})
-		}
+		oms = writeTextLine(&out, oms, line, full, start, tp.whole[idx])
 	}
-	if gapStart >= 0 {
-		fmt.Fprintf(&out, "[xmustard: %d lines omitted, bytes %d-%d]\n", gapLines, gapStart, n)
-		oms = append(oms, Omission{Kind: "lines", Start: gapStart, End: n, Items: gapLines})
+	if o, ok := gap.take(n); ok {
+		gapMarker(o)
 	}
 	if out.Len() > hardMax {
 		return "", nil, fmt.Errorf("%w: text projection %d bytes exceeds %d", ErrUnsupported, out.Len(), hardMax)
 	}
 	return out.String(), oms, nil
+}
+
+// writeTextLine writes one kept line starting at start: cut to textMaxLine unless it
+// is kept whole, never splitting a rune, and always valid UTF-8 (JSON transports
+// rewrite anything else; the exact bytes stay recoverable through the handle).
+func writeTextLine(out *bytes.Buffer, oms []Omission, line []byte, full, start int64, whole bool) []Omission {
+	emitted := line
+	if full > textMaxLine && !whole {
+		emitted = line[:textMaxLine]
+		for k := 0; k < utf8.UTFMax && len(emitted) > 0 && !utf8.Valid(emitted); k++ {
+			emitted = emitted[:len(emitted)-1] // do not split a trailing rune
+		}
+	}
+	if utf8.Valid(emitted) {
+		out.Write(emitted)
+	} else {
+		out.WriteString(strings.ToValidUTF8(string(emitted), "�"))
+		oms = append(oms, Omission{Kind: "invalid_utf8", Start: start, End: start + full})
+	}
+	if full > int64(len(emitted)) {
+		fmt.Fprintf(out, "…[xmustard: %d bytes omitted]\n", full-int64(len(emitted)))
+		oms = append(oms, Omission{Kind: "line_tail", Start: start + int64(len(emitted)), End: start + full})
+	}
+	return oms
 }
 
 // readLine returns the next line including its newline (the final line may lack one)

@@ -27,16 +27,24 @@ const (
 	JobAgeingProposal    = "ageing_proposal"
 	JobSessionDigest     = "session_digest"
 	JobInitSeed          = "init_seed"
+	// JobReviewDuplicate asks whether two review findings that overlap in place but not
+	// in quoted code describe one defect (WS-66). Its candidates are finding ids.
+	JobReviewDuplicate = "review_duplicate"
 )
 
-var validJobKinds = set(JobDedupeCluster, JobStaleAnchor, JobOrphanedAnchor, JobSupersessionChain, JobAgeingProposal,
-	JobSessionDigest, JobInitSeed)
+// jobKindSubjects is every job kind and the kind of subject its candidate ids name.
+var jobKindSubjects = map[string]string{
+	JobDedupeCluster: SubjectMemory, JobStaleAnchor: SubjectMemory, JobOrphanedAnchor: SubjectMemory,
+	JobSupersessionChain: SubjectMemory, JobAgeingProposal: SubjectMemory, JobSessionDigest: SubjectMemory,
+	JobInitSeed: SubjectMemory, JobReviewDuplicate: SubjectReviewFinding,
+}
 
 // Job is one consolidation work item.
 type Job struct {
 	ID                string          `json:"id"`
 	WorkspaceID       string          `json:"workspace_id"`
 	Kind              string          `json:"kind"`
+	SubjectKind       string          `json:"subject_kind"`
 	State             string          `json:"state"`
 	ConflictSignature string          `json:"conflict_signature"`
 	CandidateIDs      []string        `json:"candidate_ids"`
@@ -133,14 +141,14 @@ type JobWriter interface {
 	AdvanceWatermark(ctx context.Context, in WatermarkAdvance, actor Actor) (Watermark, error)
 }
 
-const jobCols = `id, workspace_id, kind, state, conflict_signature, candidate_ids, evidence_refs, instructions, payload,
+const jobCols = `id, workspace_id, kind, subject_kind, state, conflict_signature, candidate_ids, evidence_refs, instructions, payload,
 	lease_owner, coalesce(lease_expires_at, ''), lease_version, attempts, max_attempts, coalesce(result, ''), error,
 	created_at, updated_at, coalesce(finished_at, '')`
 
 func scanJob(s scanner) (Job, error) {
 	var j Job
 	var cands, refs, payload, result string
-	err := s.Scan(&j.ID, &j.WorkspaceID, &j.Kind, &j.State, &j.ConflictSignature, &cands, &refs, &j.Instructions, &payload,
+	err := s.Scan(&j.ID, &j.WorkspaceID, &j.Kind, &j.SubjectKind, &j.State, &j.ConflictSignature, &cands, &refs, &j.Instructions, &payload,
 		&j.LeaseOwner, &j.LeaseExpiresAt, &j.LeaseVersion, &j.Attempts, &j.MaxAttempts, &result, &j.Error,
 		&j.CreatedAt, &j.UpdatedAt, &j.FinishedAt)
 	if err != nil {
@@ -225,7 +233,8 @@ func (t *txn) EnqueueJob(ctx context.Context, in JobInput, actor Actor) (Job, bo
 	if err := validID("workspace", in.WorkspaceID); err != nil {
 		return Job{}, false, err
 	}
-	if !validJobKinds[in.Kind] {
+	subject, ok := jobKindSubjects[in.Kind]
+	if !ok {
 		return Job{}, false, fmt.Errorf("%w: job kind %q", ErrInvalid, in.Kind)
 	}
 	if strings.TrimSpace(in.ConflictSignature) == "" || validName("conflict signature", in.ConflictSignature) != nil {
@@ -259,9 +268,9 @@ func (t *txn) EnqueueJob(ctx context.Context, in JobInput, actor Actor) (Job, bo
 	}
 	id := newID("job_")
 	now := t.nowText()
-	if _, err := t.exec(ctx, `INSERT INTO jobs (id, workspace_id, kind, conflict_signature, candidate_ids, evidence_refs,
-		instructions, payload, max_attempts, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		id, in.WorkspaceID, in.Kind, in.ConflictSignature, cands, refs, in.Instructions, payload, maxAttempts, now, now); err != nil {
+	if _, err := t.exec(ctx, `INSERT INTO jobs (id, workspace_id, kind, subject_kind, conflict_signature, candidate_ids,
+		evidence_refs, instructions, payload, max_attempts, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		id, in.WorkspaceID, in.Kind, subject, in.ConflictSignature, cands, refs, in.Instructions, payload, maxAttempts, now, now); err != nil {
 		return Job{}, false, err
 	}
 	j, err := t.GetJob(ctx, id)

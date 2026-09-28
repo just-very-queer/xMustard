@@ -598,6 +598,28 @@ func analyzeRunOutput(run *runRecord, output string) []ImprovementSuggestion {
 	return improvements
 }
 
+// outputFailureSignal is one failure marker detectPatchIssues looks for in a run's
+// lower-cased output: any of the markers, unless the output also carries unless.
+type outputFailureSignal struct {
+	anyOf  []string
+	unless string
+	issue  string
+}
+
+var outputFailureSignals = []outputFailureSignal{
+	{anyOf: []string{"traceback"}, issue: "Python traceback found in output"},
+	{anyOf: []string{"exception"}, unless: "caught", issue: "Uncaught exception detected in output"},
+	{anyOf: []string{"panic"}, issue: "Panic detected in output"},
+	{anyOf: []string{"segmentation fault", "segfault"}, issue: "Segmentation fault detected"},
+}
+
+func (s outputFailureSignal) matches(lower string) bool {
+	if s.unless != "" && strings.Contains(lower, s.unless) {
+		return false
+	}
+	return slices.ContainsFunc(s.anyOf, func(m string) bool { return strings.Contains(lower, m) })
+}
+
 func detectPatchIssues(run *runRecord, output string) []string {
 	issues := []string{}
 	if run.ExitCode != nil && *run.ExitCode != 0 {
@@ -611,17 +633,10 @@ func detectPatchIssues(run *runRecord, output string) []string {
 		issues = append(issues, "Run had error: "+text)
 	}
 	lower := strings.ToLower(output)
-	if strings.Contains(lower, "traceback") {
-		issues = append(issues, "Python traceback found in output")
-	}
-	if strings.Contains(lower, "exception") && !strings.Contains(lower, "caught") {
-		issues = append(issues, "Uncaught exception detected in output")
-	}
-	if strings.Contains(lower, "panic") {
-		issues = append(issues, "Panic detected in output")
-	}
-	if strings.Contains(lower, "segmentation fault") || strings.Contains(lower, "segfault") {
-		issues = append(issues, "Segmentation fault detected")
+	for _, sig := range outputFailureSignals {
+		if sig.matches(lower) {
+			issues = append(issues, sig.issue)
+		}
 	}
 	if strings.TrimSpace(output) == "" {
 		issues = append(issues, "Empty output - no changes generated")
