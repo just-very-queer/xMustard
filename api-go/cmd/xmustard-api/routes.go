@@ -42,6 +42,7 @@ func apiRouteAreas() [][]routeSpec {
 		governanceRoutes,
 		codeIntelRoutes,
 		terminalRoutes,
+		diagnosticsRoutes, // repo_diagnostics_routes.go: all of the diagnostics wiring
 		routesOf(registerInlineRoutes),
 	}
 }
