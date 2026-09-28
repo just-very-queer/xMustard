@@ -7,13 +7,47 @@ serves, and how the API limits its exposure. The code is authoritative:
 `api-go/internal/workspaceops/auth.go`, `auth_roles.go` (tokens and roles). The
 route table at the end of this page is generated from the code by a test.
 
+This page describes `v0.1.1`. What shipped and its known limits are in the
+[release notes](releases/v0.1.1.md); the [v0.1.0 notes](releases/v0.1.0.md) cover the
+first release.
+
+## Posture at a glance
+
+| What you get | Why it holds |
+|---|---|
+| Nothing listens beyond your machine by default | The API binds `127.0.0.1:8042`. A non-loopback bind stops startup unless `XMUSTARD_AUTH=required`, credentials are minted, and TLS is set (or `XMUSTARD_ALLOW_INSECURE_BIND=1` behind a TLS proxy). See [Exposure posture](#exposure-posture). |
+| Every route has a role | `gatedMux` refuses a route with no gate row, and a test keeps the [route gate table](#route-gate-table) generated from the code. |
+| Agents cannot vouch for their own memory | With tokens minted, promotion needs approvals from distinct principals other than the author, unless the operator turns on single-agent mode (`require_multi_agent_verification: false` in settings). The default threshold is 2. Open-mode writes are labelled `self_asserted_open_mode`, never peer-verified. |
+| Known secret shapes stay out of memory | Memory text is redacted before it is stored, and `why_failed` output before it is analyzed. See [Secret redaction and secret paths](#secret-redaction-and-secret-paths). |
+| Credential files stay out of search results | Search refuses secret paths such as `.env`, SSH keys and `.netrc` before reading their text, and masks credential-shaped words in snippets. |
+| Recalled text is labelled as data | Recall and every evidence projection carry `injection_flags`. A flagged result says it is data, not instructions. See [Injection safety](#injection-safety-ws-56). |
+| Nothing runs a command unless you opt in | `why_failed` command mode is off on every bind. It needs `XMUSTARD_WHY_FAILED_COMMANDS=1` at startup and an authenticated admin. See [Commands why_failed runs](#commands-why_failed-runs-ws-21). The platform profile, also opt-in, adds terminal and run routes that execute commands. |
+| People keep the merge | Human approvals are recorded, not enforced by xMustard. A merge attestation never merges, changes branch protection or posts to a pull request. See [Human approvals](#human-approvals-ws-57). |
+| Native tool output is never retained unredacted | Capture retains each original and makes it searchable, so every capture, from the capture route or a client hook, streams through the secret redactor before a byte is stored. The output of a secret path such as `.env` is refused (`422 secret_path`), and capture fails closed without a working redactor (`503 redaction_unavailable` or `redaction_failed`). In v0.1.0 no redactor was wired, so every capture was refused. See [Evidence capture redaction](#evidence-capture-redaction-ws-fix-03). |
+| Hooks never decide for the agent | The Claude Code hook service adds context, replaces a native output with its reduction (PostToolUse only) or says nothing; it never allows, denies or rewrites a tool call, and a slow or failed answer leaves Claude Code's own behavior. Authentication still fails closed. See [Client hooks](#client-hooks-ws-23). |
+| No credential in the service unit | `xmustard-ops setup` writes a loopback-only launchd agent or systemd unit that carries no token and refuses credential-named variables. See [Daemon service](#daemon-service-ws-58). |
+
+## Authentication modes
+
+`XMUSTARD_AUTH` picks the mode. It is read at startup, and anything else stops the API.
+
+| `XMUSTARD_AUTH` | Behavior |
+|---|---|
+| `auto` (default) | Open mode while no credentials exist: every caller is the single identity `anonymous` and passes every role gate. Minting the first token (`xmustard-api mint-token <id> [role]`) enforces auth on the running API; the check runs on every request, so no restart is needed. |
+| `required` | Every request needs a bearer token. Startup stops when no credentials are configured. A non-loopback bind needs this mode. |
+| `off` | No authentication. Loopback binds only: a non-loopback bind stops startup. |
+
+`/api/health` stays public in every mode ([Health endpoint](#health-endpoint)). Send
+tokens only as `Authorization: Bearer <token>`; a credential in the query string is
+refused.
+
 ## Profiles
 
 The API serves one of two route sets.
 
 | Profile | Selected by | Serves |
 |---|---|---|
-| `core` (default) | nothing, `XMUSTARD_PROFILE=core`, or the legacy `XMUSTARD_CORE_ONLY=1` | the nine MCP tools, governed memory (propose, verify, edit, full list), evidence capture and recovery, token administration, workspace list and registration, index rebaseline, health |
+| `core` (default) | nothing, `XMUSTARD_PROFILE=core`, or the legacy `XMUSTARD_CORE_ONLY=1` | the nine MCP tools, governed memory (propose, verify, edit, full list), evidence capture (redacted) and recovery, the Claude Code hook routes, token administration, workspace list and registration, index rebaseline, health |
 | `platform` | `XMUSTARD_PROFILE=platform`, `XMUSTARD_PLATFORM=1`, or the legacy `XMUSTARD_CORE_ONLY=0` | core plus the platform routes: issues, runs, terminals, providers, Postgres, integrations and the other routes the React UI calls |
 
 In the core profile a platform route answers
@@ -40,15 +74,16 @@ A token carries a role spec: one role, or several joined with `+`.
 | `reader` | read routes and the read tools (`ground`, `recall`, `search`, `explain`, `impact`, `diagnostics`, and `why_failed` reading a run or outcome by id) |
 | `proposer` | reader, plus `remember`, `why_failed` with a `log` or `evidence_handle` (records a run-independent outcome; never runs anything), editing memory it authored, platform writes, and registering a git work tree under `XMUSTARD_REGISTER_ROOTS` ([Workspace registration](#workspace-registration)) |
 | `verifier` | reader, plus `verify` |
-| `human-approver` | reader, plus policy changes and approvals (workspace policy, security acceptance criteria and dispositions, run-plan approve/reject, run accept) |
+| `human-approver` | reader, plus policy changes and approvals (workspace policy, security acceptance criteria and dispositions, run-plan approve/reject, run accept); with a token of kind `human`, the `xmustard-ops` approval commands ([Human approvals](#human-approvals-ws-57)) |
 | `indexer` | reader, plus `POST /api/workspaces/{id}/index` (rebaseline) |
 | `admin` | every role, plus token administration, settings, providers, Postgres bootstrap, integration credentials, verification-profile definitions, terminals, registering any directory as a workspace and, only where the operator enabled command mode, `why_failed` with a `command` ([Commands why_failed runs](#commands-why_failed-runs-ws-21)) |
 
 The legacy names stay valid: `agent` is `proposer+verifier`, and `readonly` is
 `reader`. A blank role mints `agent`. An unknown role is refused at mint time, and a
 stored or environment role that cannot be parsed resolves to `reader`. A principal
-that holds only `reader` may use only GET routes: every non-GET route needs a higher
-role, and a test enforces that. A reader's write is refused by the route gate, so
+that holds only `reader` may use only GET routes, `/api/health` and the `/mcp`
+endpoint (each tool call through it meets that tool's own route gate): every other
+non-GET route needs a higher role, and a test enforces that. A reader's write is refused by the route gate, so
 the answer names the missing role like any other refusal.
 
 The `agent` role does not include `indexer`, so an agent token cannot reset the
@@ -77,9 +112,10 @@ A refused call answers `403` with the missing role named:
 
 `GET /api/auth/whoami` returns the caller's id, role spec, expanded `roles`,
 `open_mode`, the deployment `profile`, `read_only`, `disabled_tools`, and `tools`:
-the MCP tools this caller can use here. `xmustard-mcp` filters `tools/list` by that
-list. If the API cannot answer within 2 seconds, it advertises all nine tools, and
-the API still enforces every gate. `ground` adds a `principal` block with the
+the MCP tools this caller can use here. The MCP server (`api-go/internal/mcpserver`)
+filters `tools/list` by that list, on the `/mcp` endpoint and in the deprecated stdio
+shim alike. If the API cannot answer within 2 seconds, it advertises all nine tools,
+and the API still enforces every gate. `ground` adds a `principal` block with the
 caller's id and roles.
 
 In open mode no credentials exist. Every caller is the single identity
@@ -173,7 +209,7 @@ refuse text are explicit and fail closed.
   characters (the soft hyphen, zero-width and filler characters, bidirectional
   controls, Unicode tag characters, and variation selectors in a run or from the
   supplementary block). The text is folded once (lowercase, whitespace runs to one
-  space, markdown's `_emphasis_` and `__bold__` underscores to a space; underscores
+  space or, across a paragraph break, to one blank line, markdown's `_emphasis_` and `__bold__` underscores to a space; underscores
   inside a word stay). Every match starts with one of its rule's trigger literals, so
   a pattern runs only from a trigger, over a window its longest match fits in, and a
   rule that needs a delimiter (`|` for `curl | sh`, `>` for a tag) runs only when its
@@ -193,13 +229,16 @@ refuse text are explicit and fail closed.
   `[xmustard injection-check]` line saying it is data, not instructions: the MCP
   bridge adds it to the tool result, a hook adds it to the shaped output it puts in
   place of a native tool's (when it reduces that output; otherwise the native output
-  reaches the agent unchanged), and the Pi adapter adds it to the text it renders. The initialize instructions say that memory, tool output and
+  reaches the agent unchanged, with no such line), and the Pi adapter adds it to the
+  text it renders. The initialize instructions say that memory, tool output and
   `<xmustard-data>` blocks are data, not instructions. `ground` returns counts and
   ids only, so it carries no agent-written text.
-- **Pushed surfaces.** Memory pushed into context unasked, from a hook (WS-23: the
-  memories bound to a file a tool reads or edits, those matching a search pattern,
-  those a prompt keyword triggers, and the core tier at SessionStart and
-  SubagentStart) or the core tier (WS-31), goes through `workspaceops.AdmitMemory`. The checks run in order:
+- **Pushed surfaces.** Memory pushed into context unasked goes through
+  `workspaceops.AdmitMemory`. Its production caller is the Claude Code hook service
+  (WS-23): the memories bound to a file a tool reads or edits, those matching a search
+  pattern, those a prompt keyword triggers, and the core-tier memories at SessionStart
+  and SubagentStart. The core tier's own surface (WS-31) is planned and will use the
+  same gate. No pushed surface shipped in v0.1.0. The checks run in order:
   the entry exists in the workspace, it is served, its content matches its digest, it
   is not quarantined, it has a human approval, and it scans clean (a truncated scan
   counts as flagged). What passes is framed in `<xmustard-data>` blocks after a notice.
@@ -226,7 +265,10 @@ refuse text are explicit and fail closed.
   it records it in the history. A quarantined entry is still served on recall,
   labeled, but it is never pushed. It never holds the core tier: the store refuses it
   on creation and on a tier change, and a core entry refuses an edit that would mark
-  it.
+  it. Capture is on since v0.1.1, so a hook's capture of WebFetch or another server's
+  MCP tool can now mark a memory that cites it. In v0.1.0 capture was
+  refused, every retained original was filed under one of xMustard's own nine tools,
+  and `untrusted_capture` had nothing to fire on.
 - **Limits.** The scan is a pattern check: a paraphrase it has no rule for passes, and
   a legitimate memory that quotes an injection is flagged (and so never pushed).
   Quarantine sees only what a write cites; content an agent copies from the web
@@ -274,7 +316,7 @@ gate and registers any directory.
 | Host allowlist | `XMUSTARD_ALLOWED_HOSTS=name,...` | On a loopback bind only `localhost` and loopback IPs are accepted as `Host`, plus listed names. This blocks DNS rebinding. On other binds the list applies when it is set. A refusal answers `403 host_not_allowed`. |
 | Origin check | `XMUSTARD_ALLOWED_ORIGINS=https://ui.example,...` | A request that carries `Origin` must come from a loopback origin (loopback bind), the same origin (other binds), or a listed origin. `Origin: null` is refused. A refusal answers `403 origin_not_allowed`. |
 | No keys in URLs | none | `token`, `access_token`, `api_key`, `key`, `password` and similar query parameters answer `400 query_credentials`, even when an `Authorization` header is also present. Send `Authorization: Bearer <token>`. |
-| Read-only mode | `XMUSTARD_READ_ONLY=1` | Mutating routes answer `403 read_only`, and `remember`/`verify` disappear from `tools/list`. Three kinds of non-GET route stay available: capture and revocation of the caller's own tool output, policy evaluation, and token revoke and rotate, so an admin can cut off a leaked token without leaving read-only mode. Minting and the workspace-wide evidence purge are refused. |
+| Read-only mode | `XMUSTARD_READ_ONLY=1` | Mutating routes answer `403 read_only`, and `remember`/`verify` disappear from `tools/list`. Three kinds of non-GET route stay available: capture and revocation of the caller's own tool output (the Claude Code hook routes included; read-only mode records no run outcome from them), policy evaluation, and token revoke and rotate, so an admin can cut off a leaked token without leaving read-only mode. The `/mcp` endpoint stays available too; its tool calls meet their own gates. Minting and the workspace-wide evidence purge are refused. |
 | Tool disable | `XMUSTARD_DISABLED_TOOLS=impact,why_failed` | The tool's route answers `403 tool_disabled` and the tool leaves `tools/list`. Unknown names stop startup. |
 | Workspace allowlist | `XMUSTARD_WORKSPACE_ALLOWLIST=ws-a,ws-b` | Other workspace ids answer `403 workspace_not_allowed`. The same rule filters `GET /api/workspaces` and checks `POST /api/workspaces/load` (by the id the root would get) and the terminal routes. |
 | Remote execution | profile | Terminals exist only in the platform profile and need `admin`. |
@@ -305,9 +347,10 @@ rotate and revoke drop the cached copy explicitly.
 ## Workspace registration
 
 `POST /api/workspaces/load` registers a directory as a workspace and scans it into
-xMustard's store. `xmustard-mcp` calls it on an agent's first tool call in an
-unregistered git repository (auto-registration, `XMUSTARD_MCP_AUTO_REGISTER=0`
-turns it off), with the agent's own token. The code is
+xMustard's store. The MCP server calls it on an agent's first tool call in an
+unregistered git repository, on the `/mcp` endpoint and in the stdio shim alike
+(auto-registration, `api-go/internal/mcpserver/resolve_workspace.go`;
+`XMUSTARD_MCP_AUTO_REGISTER=0` turns it off), with the agent's own token. The code is
 `api-go/cmd/xmustard-api/workspace_register.go` (the HTTP policy) and
 `api-go/internal/workspaceops/register_roots.go` (the path checks).
 
@@ -360,7 +403,7 @@ A refusal of checks 1 to 5 and 7, or of the token scope, answers `403` with
 `not_work_tree_top`, `not_git_work_tree`, `register_limit` or `token_scope`) and a
 message that names what to do. It is written to the auth audit log as a `denied`
 event (denied events are throttled to one a second, with a count of those
-suppressed). The MCP shim puts the message in its resolution error, so the agent
+suppressed). The MCP server puts the message in its resolution error, so the agent
 can tell the user that an admin has to register the repository or add its parent
 directory to `XMUSTARD_REGISTER_ROOTS`.
 
@@ -436,6 +479,15 @@ symlink-refusing descriptor walk (`api-go/internal/workspaceops/safepath_unix.go
 so a path swapped for a symlink later is still refused. `explain` applies the same
 symlink check to its `path` before the core reads the file.
 
+Fixed in v0.1.1, a known issue in v0.1.0: that walk compared its final descriptor
+with the root descriptor it had already closed, so when the OS handed the same number
+back, a present file read as missing (every path of even depth, such as
+`pkg/auth.go`). It failed closed: nothing outside the root was read. The cost was
+freshness, since a memory anchored to such a path was baselined as missing and never
+flagged stale when the file changed. The walk now tracks whether it opened a
+component (`TestConfinedReadOfEveryDepth`;
+[Architecture](ARCHITECTURE.md#fixed-since-v010)).
+
 ## Commands why_failed runs (WS-21)
 
 **Command mode is off by default.** `why_failed` with `command` (`POST
@@ -484,11 +536,12 @@ order and fail closed:
   - package scripts: `npm`, `pnpm`, `yarn` and `bun` running a check-named script
     (`npm test`, `npm run lint`, `yarn build:prod`, `bun test`);
   - tasks: `make`, `just`, `task`, `gradle`/`gradlew` and `mvn`/`mvnw` with check-named
-    tasks and only the flags `-k`, `-s`, `-q`, `-B` and `-jN` (no `-f`, `-C`, `-I`,
+    tasks and only the flags `-k`, `-s`, `-q`, `-B` and `-jN`, their long forms, and
+    `--offline`, `--continue`, `--stacktrace`, `--info` and `--no-daemon` (no `-f`, `-C`, `-I`,
     `VAR=value` or default target). Maven takes lifecycle phases only: a word with a
     colon names a plugin goal (`prefix:goal`, `group:artifact:version:goal`), which
     Maven resolves and downloads, and is refused;
-  - test runners, linters and type checkers with any arguments: `pytest`, `jest`,
+  - test runners, linters and type checkers with any arguments: `pytest`, `py.test`, `unittest`, `jest`,
     `vitest`, `mocha`, `rspec`, `phpunit`, `ctest`, `tsc`, `eslint`, `mypy`, `pylint`,
     `flake8`, `pyright`, `staticcheck`, `shellcheck`, `rubocop`, `stylelint`, `oxlint`,
     and `python -m pytest|unittest|mypy|pylint|flake8|ruff`.
@@ -529,7 +582,7 @@ The command runs with the daemon's environment minus its own configuration (ever
 `XMUSTARD_*` variable: tokens, the Postgres DSN, TLS keys, the data directory) and minus
 every variable the redactor classifies as a secret, so the repository's code cannot
 read the daemon's credentials from its environment. This scrub lives in the Go caller
-(`rustcore.RunManagedCommandEnv`); the other `run-*` subcommands of the core do not
+(`workspaceops.commandEnv`, handed to `rustcore.RunManagedCommandEnv`); the other `run-*` subcommands of the core do not
 share it yet (WS-21B). Output is redacted (secret rules plus this process's
 secret-named environment values) before it is analyzed or stored, and only the last MiB
 is read. The command's processes are external to the owned process tree the budget
@@ -540,6 +593,178 @@ Revoking an evidence original (`DELETE .../evidence/{handle}`) or the admin purg
 (`DELETE .../evidence`) removes the outcomes made from it. An admin removes any other
 outcome with `DELETE .../outcomes/{outcome_id}`, for example one holding a secret the
 redactor missed.
+
+## Human approvals (WS-57)
+
+A human approver records a human's decision on memory and on merges. The record is
+advisory: it says what a person decided, and enforcement stays with branch
+protection or whatever policy consumes it. xMustard never merges.
+
+**Who is a human approver.** A principal of kind `human` that holds the
+`human-approver` role (`admin` holds it too), unexpired, not revoked, and allowed on
+the workspace. `xmustard-api mint-token` mints tokens of kind `agent`, so mint an
+approver through the admin API:
+
+```bash
+curl -H "Authorization: Bearer $ADMIN" \
+  -d '{"id":"alice","role":"human-approver","kind":"human","presence_only":true}' \
+  http://127.0.0.1:8042/api/auth/tokens
+```
+
+`presence_only` is optional. A presence-only token is accepted only when typed at the
+`xmustard-ops` prompt: the API refuses it as a bearer token (`401
+presence_only_token`), and `xmustard-ops` refuses it from a file or the environment.
+Both refusals are audited.
+
+**The CLI.** `xmustard-ops` reads the approver's token from `--token-file`, then from
+`XMUSTARD_APPROVER_TOKEN`, and otherwise prompts at the terminal with echo off.
+
+| Command | Does |
+|---|---|
+| `xmustard-ops approve <workspace_id> <entry_id> [--revision N] [--note TEXT]` | Casts an approve verdict on the served revision, or on a pending edit with `--revision` |
+| `xmustard-ops reject <workspace_id> <entry_id> [--revision N] [--note TEXT]` | Casts a reject verdict the same way |
+| `xmustard-ops queue <workspace_id> [--limit N] [--baselines N]` | Lists the pending memory writes this approver may vote on, oldest first, and recent index baseline builds |
+| `xmustard-ops review approve <workspace_id> --base REF [--head REF] [--review ID]... [--note TEXT]` | Records a merge attestation |
+| `xmustard-ops review revoke <workspace_id> --approval SEQ --reason TEXT` | Withdraws an attestation |
+| `xmustard-ops review gate <workspace_id> --base REF [--head REF]` | Reports the attestation state; needs no token |
+
+Every command takes `--data-dir` (default `XMUSTARD_DATA_DIR`, else
+`../backend/data`). Exit codes: 0 done, 1 error, 2 usage; `review gate` exits 0 for a
+current attestation, 3 for none and 4 for a stale one.
+
+**What a verdict counts for.** A human verdict is one more distinct vote. It counts
+toward the entry's quorum like any peer's, under the same owner-distinct policy, and
+never promotes on its own when the gate needs more peers. A human approver cannot
+approve or reject memory they wrote or a revision they authored. A verdict on the
+served revision is pinned to the revision that was checked, so a newer revision is
+refused rather than voted on unseen.
+
+**Merge attestations.** `review approve` binds to one reviewed change: the repository,
+the merge base of `--base` and `--head`, the head commit, and the SHA-256 of the diff
+between them. The attestation turns stale as soon as any of those differ. A human
+approver can revoke it, and it stops counting when its approver's token is revoked.
+Attestations are created only from `xmustard-ops`, never over MCP or HTTP. Each one is
+labelled `attestation only: xMustard never merges, never changes branch protection and
+never posts to a pull request; enforce merges with branch protection`. `review gate`
+is meant for a person's own pre-push hook. It has no signed export, so it is not a CI
+control.
+
+An attestation may cite review records (`--review ID`). It is refused, failing closed,
+when a cited record was written by the approver, was written in open mode, or, under
+the owner-distinct policy, was written under the approver's owner. An id that names
+no record is bound as given and listed as `review_records_unknown`. Review records
+themselves (`xmustard-ops review record|show|triage`) exist only in builds with the
+`review` tag, which release builds leave off: `record` needs the proposer role and
+`triage` the verifier or human-approver role, the author of a finding can mark it
+`fixed` or `wont_fix` but never confirm or dismiss it, and only a distinct principal's
+`confirm` corroborates. Secrets are redacted from a finding's text, quoted code and
+notes before it is stored. A review record is evidence; it never approves a change.
+
+**MCP elicitation.** A governed-memory write made under a human approver's token
+through the MCP bridge is held with `human_presence_required`, together with the text
+the human must confirm and its SHA-256 digest. When the client declared the
+elicitation capability, the bridge shows the human that text and repeats the call
+once with the confirmation and the digest. The write runs only while the digest still
+matches. A decline, a cancel, a timeout, or a client that cannot be asked leaves the
+write unrecorded.
+
+**Assurance labels.** Every human-approver write records `<surface>/<assurance>`.
+The surface is `ops`, `mcp_elicitation` or `http`. The assurance is `user_presence`
+only for a presence-only token typed at the `xmustard-ops` prompt; every other write
+is `advisory`, because the same token also works from files, the environment and
+client configurations that agent processes of the same user can read.
+`user_presence` is not proof of presence either: a process that learns a
+presence-only token can type it into a pseudo-terminal.
+
+## Secret redaction and secret paths
+
+**Redaction.** `api-go/internal/redact` is one engine for strings and streams. It
+replaces each secret with a marker that names its rule, `[REDACTED:rule]`, or
+`[REDACTED:env:NAME]` for an environment value. Its rules cover bearer and basic
+credentials, AWS, GitHub, GitLab, Slack, OpenAI, Anthropic, Google, Stripe, npm,
+Hugging Face and xMustard tokens, JWTs, URL passwords and PEM private keys, plus a
+key-aware detector for secret fields in JSON, YAML, env files, headers and command
+flags. Generic key/value hits pass an entropy and placeholder check, so hashes, UUIDs
+and `${TOKEN}` references are left alone.
+
+It runs on memory ingest ([Provenance, evidence-bound votes and ingest
+redaction](#provenance-evidence-bound-votes-and-ingest-redaction-ws-19b)), on
+`why_failed` output, on review findings recorded under the review build tag, and,
+since v0.1.1, on every evidence capture.
+
+### Evidence capture redaction (WS-FIX-03)
+
+Capture is on in every build, and every capture is redacted.
+`POST /api/workspaces/{id}/evidence/capture` streams the tool output (a raw body, or
+the output strings of a Claude, Codex, Cursor, Pi or OpenCode hook body) through the
+shared `redact` rules before a byte reaches the spool. The retained original, its
+pages, search inside it and the projection returned to the client therefore all hold
+the redacted text. The route refuses a `client` it does not know with
+`400 invalid_client`.
+
+In v0.1.0 no redactor was wired into `captureRedactor`
+(`api-go/cmd/xmustard-api/evidence_capture_routes.go`), so every capture answered
+`503 redaction_unavailable`: the Pi adapter's built-in reduction and compaction fell
+back to Pi's own behavior, and no hook body could be captured. Only the
+`-tags xmustard_e2e` test build captured, with a test-only marker. That build now
+chains its marker in front of the production redactor, so the e2e runs the
+production rules too.
+
+- **Rules.** Capture uses the rules `why_failed` applies to command output
+  (`workspaceops.OutputRedactor`): the default secret patterns (bearer and basic
+  credentials; AWS, GitHub, GitLab, Slack, OpenAI, Anthropic, Google, Stripe, npm,
+  Hugging Face and xMustard tokens; JWTs; URL userinfo passwords; private keys), the
+  key-aware detector for secret fields in JSON, YAML, env files, headers and flags,
+  and the literal values of this daemon's secret-named environment variables. Each
+  secret becomes `[REDACTED:<rule>]`.
+- **Streaming.** `redact.Writer` buffers 128 KiB and decides it 8 KiB at a time.
+  Each window is read with the lookahead after it, about 33 KiB, the longest span
+  any detector reads past a match (a private key body and its END marker). A secret
+  split across writes or windows is therefore seen whole, and the output is byte
+  for byte what one pass over the whole input gives. The stream is never buffered,
+  and a window's scratch and output are sized by the 8 KiB it decides, not by how
+  many secrets it holds. Measured on 16 MiB in the decoder's 32 KiB writes, the
+  redactor's live heap peaks at 0.4 MiB at most, on input that is nothing but
+  secrets (an 8-byte secret environment value repeated, the densest case), under a
+  quarter of the 2 MiB capture window. The hook decoder flushes it at each section
+  boundary, so each output string is redacted as one input.
+- **Secret paths.** When any path the capture names is on the secret-path denylist
+  (below), the capture is refused with `422 secret_path` and nothing is retained. The
+  paths checked are the caller's `path`, every path field of the hook body's tool
+  input (`file_path`, `filePath`, `path`, `target_file`, `notebook_path`,
+  `directory`, `dir_path`), and every such field of its response (Claude Read's
+  `file.filePath`), wherever they appear in the body. One path cannot hide another: a
+  caller's `path=README.md` does not admit a body that reads `.env`. The client keeps
+  its own result.
+- **Fail closed.** A server without a redactor answers `503 redaction_unavailable`.
+  A redactor that fails (panics) answers `503 redaction_failed`. On every refusal
+  the spool is discarded, so nothing is retained. The [hook routes](#client-hooks-ws-23)
+  capture through the same redactor, wrapper and checks; a hook whose capture is
+  refused retains nothing and leaves the client its native output.
+- **Limits.** Redaction is pattern-based. A secret that no rule recognizes is
+  retained as written: for example, a bare password in a line of code, or an
+  unquoted token-named value without a digit (the `redact` package documentation
+  lists the limits). Such an original can be revoked with
+  `DELETE .../evidence/{handle}`, and the admin purge (`DELETE .../evidence`)
+  removes every original of a workspace. Only named paths are matched: a secret
+  file read through a shell (`cat .env`), and the matches of a search over a
+  directory (a Grep over `/repo`, with or without a `glob` such as `.env*`), pass
+  through the content rules only. A secret split across two output strings of one
+  hook body, which are redacted as separate inputs, is not joined. The 16 MiB limit on
+  a retained original applies to the redacted bytes. `capture.body_sha256` is the
+  digest of the body as received; it names the body but does not reveal it.
+
+### Secret paths
+
+Some files are credential stores whatever redaction would find in them: `**/.ssh/**`, `id_rsa`, `id_dsa`, `id_ecdsa`, `id_ed25519`, `.netrc`, `_netrc`,
+`.npmrc`, `.pypirc`, `.dockercfg`, `.env` and `.env.*`, except the `.env.example`,
+`.env.sample` and `.env.template` templates. The list lives in
+`api-go/internal/redact/secretpath.go`, with a copy in `rust-core/src/secretpath.rs`;
+both are tested against `rust-core/src/testdata/secret_path_golden.tsv`. Search never
+shows their text: the index lists a secret doc with the `secret_path` loss and never
+reads it, and a snippet read refuses a secret path before it opens the file. Snippet
+lines also mask credential-shaped words. Capture refuses the output of a secret path
+(`422 secret_path`, above), and the hook service's syntax check refuses one too.
 
 ## Client hooks (WS-23)
 
@@ -568,7 +793,8 @@ through the static client `xmustard-hook` over a Unix socket (a command hook).
   a socket), and serves only `/api/hooks/` there through the full middleware stack.
   `XMUSTARD_HOOK_SOCKET=off` disables it.
 - **Captures.** A PostToolUse or PostToolUseFailure body is captured through the
-  capture route's redactor and checks (see Evidence capture redaction below) before
+  capture route's redactor and checks ([Evidence capture
+  redaction](#evidence-capture-redaction-ws-fix-03)) before
   anything is retained, bound to the calling principal, and recorded
   `captured_identity=unknown` (the producing repository state was not observed). The
   session and subagent ids are recorded for attribution only. A capture refused for a
@@ -597,58 +823,43 @@ through the static client `xmustard-hook` over a Unix socket (a command hook).
   once per event for the two command hooks, SessionStart and WorktreeRemove; every
   other event is an http hook to the running daemon.
 
-## Evidence capture redaction (WS-FIX-03)
+## Daemon service (WS-58)
 
-Capture is on in every build, and every capture is redacted.
-`POST /api/workspaces/{id}/evidence/capture` streams the tool output (a raw body, or
-the output strings of a Claude, Codex, Cursor, Pi or OpenCode hook body) through the
-shared `redact` rules before a byte reaches the spool. The retained original, its
-pages, search inside it and the projection returned to the client therefore all hold
-the redacted text. In v0.1.0 no redactor was wired, so every capture answered
-`503 redaction_unavailable`.
+`xmustard-ops setup` installs the API as a per-user service: a launchd agent on macOS,
+a systemd socket and service on Linux (`api-go/internal/daemon`).
 
-- **Rules.** Capture uses the rules `why_failed` applies to command output
-  (`workspaceops.OutputRedactor`): the default secret patterns (bearer and basic
-  credentials; AWS, GitHub, GitLab, Slack, OpenAI, Anthropic, Google, Stripe, npm,
-  Hugging Face and xMustard tokens; JWTs; URL userinfo passwords; private keys), the
-  key-aware detector for secret fields in JSON, YAML, env files, headers and flags,
-  and the literal values of this daemon's secret-named environment variables. Each
-  secret becomes `[REDACTED:<rule>]`.
-- **Streaming.** `redact.Writer` buffers 128 KiB and decides it 8 KiB at a time.
-  Each window is read with the lookahead after it, about 33 KiB, the longest span
-  any detector reads past a match (a private key body and its END marker). A secret
-  split across writes or windows is therefore seen whole, and the output is byte
-  for byte what one pass over the whole input gives. The stream is never buffered,
-  and a window's scratch and output are sized by the 8 KiB it decides, not by how
-  many secrets it holds. Measured on 16 MiB in the decoder's 32 KiB writes, the
-  redactor's live heap peaks at 0.4 MiB at most, on input that is nothing but
-  secrets (an 8-byte secret environment value repeated, the densest case), under a
-  quarter of the 2 MiB capture window. The hook decoder flushes it at each section
-  boundary, so each output string is redacted as one input.
-- **Secret paths.** When any path the capture names is on the secret-path denylist
-  (`.ssh/`, SSH key files, `.netrc`, `.npmrc`, `.pypirc`, `.dockercfg`, `.env` and
-  `.env.*` other than templates such as `.env.example`), the capture is refused with
-  `422 secret_path` and nothing is retained. The paths checked are the caller's
-  `path`, every path field of the hook body's tool input (`file_path`, `filePath`,
-  `path`, `target_file`, `notebook_path`, `directory`, `dir_path`), and every such
-  field of its response (Claude Read's `file.filePath`), wherever they appear in the
-  body. One path cannot hide another: a caller's `path=README.md` does not admit a
-  body that reads `.env`. The client keeps its own result.
-- **Fail closed.** A server without a redactor answers `503 redaction_unavailable`.
-  A redactor that fails (panics) answers `503 redaction_failed`. On every refusal
-  the spool is discarded, so nothing is retained. The WS-23 hook routes capture
-  through the same redactor, wrapper and checks; a hook whose capture is refused
-  retains nothing and leaves the client its native output.
-- **Limits.** Redaction is pattern-based. A secret that no rule recognizes is
-  retained as written: for example, a bare password in a line of code, or an
-  unquoted token-named value without a digit (the `redact` package documentation
-  lists the limits). Such an original can be revoked with
-  `DELETE .../evidence/{handle}`, and the admin purge (`DELETE .../evidence`)
-  removes every original of a workspace. Only named paths are matched: a secret
-  file read through a shell (`cat .env`), and the matches of a search over a
-  directory (a Grep over `/repo`, with or without a `glob` such as `.env*`), pass
-  through the content rules only. `capture.body_sha256` is the digest of the body
-  as received; it names the body but does not reveal it.
+- **Loopback only, no credential in the unit.** Every unit binds `127.0.0.1`. Setup
+  refuses an extra variable (`--env`) whose name looks like a credential (the four
+  token variables, or any name containing TOKEN, SECRET, PASSWORD, PASSWD,
+  CREDENTIAL, APIKEY, API_KEY, PRIVATE_KEY or DSN), one that sets what setup sets
+  itself, and values with control characters. The systemd service also unsets
+  `XMUSTARD_APPROVER_TOKEN`, `XMUSTARD_API_TOKEN`, `XMUSTARD_TOKEN` and
+  `XMUSTARD_AUTH_TOKENS`, so a token imported into the user manager does not reach
+  the daemon; such a daemon takes bearer tokens only from its data dir
+  (`xmustard-api mint-token`). `launchctl` and `systemctl` run without the credential
+  variables in their environment.
+- **Only its own units.** Setup writes units atomically (0644) with the marker
+  `generated by xmustard-ops setup`, and replaces or removes only files that carry
+  it; a hand-written unit under the same label is refused before any service-manager
+  command runs. On a first install it refuses when another xMustard API already
+  answers on the port. When the new daemon does not answer `/api/health`, the units
+  it changed are put back.
+- **The process.** The API drops `XMUSTARD_APPROVER_TOKEN` from its own environment
+  before anything starts, so no helper it runs inherits it. A socket that systemd
+  passes is adopted only when `LISTEN_PID` names this process and it is exactly one
+  TCP socket, and the address it serves meets the same non-loopback interlock as a
+  bind ([Exposure posture](#exposure-posture)). The data dir and the log dir are
+  created 0700, the rotated log 0600 (10 MiB, 3 generations by default).
+- **The store.** Once it listens, the API migrates the governance store and runs
+  `PRAGMA quick_check`; a store that fails is refused to every memory call, reads
+  included, until a backup is restored. `xmustard-ops store backup` writes a verified
+  `VACUUM INTO` copy (0600, created exclusively) on a read-only connection;
+  `store restore` refuses a source with a write-ahead log beside it or one that fails
+  verification, needs every connection closed, and moves the replaced store aside
+  instead of deleting it.
+- **Limits.** launchd has no socket activation for the cgo-free API, so the macOS
+  agent is resident from login. Health is checked when setup or `daemon restart`
+  starts the daemon, not continuously: a hung daemon is not detected.
 
 ## Health endpoint
 
@@ -656,14 +867,16 @@ the redacted text. In v0.1.0 no redactor was wired, so every capture answered
 host-wide activity: the data-movement counters (spawns, hashed bytes, captures),
 the owned process tree and the stdio shims on the host, live external processes,
 the heavy-slot owner labels and queue, the resident Rust worker's pid and memory,
-the live pool and child counters, and the MCP and hook usage counters (`mcp_usage`,
-`hook_usage`). While authentication is enforced
+the live pool and child counters, the MCP and hook usage counters (`mcp_usage`,
+`hook_usage`), and the governance store's startup check with its timing and detail.
+While authentication is enforced
 (`XMUSTARD_AUTH=required`, or `auto` with credentials minted), only an operator sees
 the full view: an `admin` token, or another token that holds more than `reader`, with
 no workspace scope. A reader-only token and a workspace-scoped token of any role
 (`admin` included) get the public view, which is the same as for a caller without a
 token: `status`, the pool size, the child cap, the budget gate and the soft ceiling,
-with a `detail` that says why. A public-view poll never samples the process tree.
+with a `detail` that says why, and, once the daemon has checked its store, the store's
+`status` and `schema_version`. A public-view poll never samples the process tree.
 With `XMUSTARD_AUTH=off`, or `auto` with no credentials (the open loopback default),
 everyone gets the full view.
 
