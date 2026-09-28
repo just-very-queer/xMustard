@@ -206,7 +206,8 @@ func TestNativeRelayShimProtocolCases(t *testing.T) {
 		{"stray params field", 3, `{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"recall","arguments":{},"extra":1}}`, errCode(-32602)},
 		{"_meta accepted", 4, `{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"recall","arguments":{},"_meta":{"progressToken":"p"}}}`, isError(false)},
 		{"malformed params", 5, `{"jsonrpc":"2.0","id":5,"method":"tools/call","params":"x"}`, errCode(-32602)},
-		{"unknown tool is a result", 6, `{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"nope","arguments":{}}}`, isError(true)},
+		{"unknown tool is a protocol error", 6, `{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"nope","arguments":{}}}`, errCode(-32602)},
+		{"unknown argument is a result", 8, `{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"recall","arguments":{"bogus":1}}}`, isError(true)},
 		{"oversized frame", nil, strings.Repeat("a", 8<<20+1024), errCode(-32600)},
 		{"ping after an oversized frame", 7, `{"jsonrpc":"2.0","id":7,"method":"ping"}`, func(m map[string]any) bool { return m["result"] != nil }},
 	}

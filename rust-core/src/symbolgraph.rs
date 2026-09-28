@@ -2048,6 +2048,38 @@ pub struct SymbolImpact {
     pub coverage: Option<CoverageSummary>,
 }
 
+/// Blast radius of one file (`impact(path=)`): the files that reference a symbol it
+/// defines, up to `max_depth` hops, walked like [`SymbolImpact`] from the file itself.
+/// `found` is false when the graph does not hold the file (not indexed, excluded, a
+/// directory or no such file); nothing is then impacted.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct FileImpact {
+    pub path: String,
+    pub found: bool,
+    pub impacted: Vec<ImpactedFile>,
+    pub impacted_count: usize,
+    pub max_depth: usize,
+    pub generated_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub freshness: Option<Freshness>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coverage: Option<CoverageSummary>,
+}
+
+impl FileImpact {
+    pub fn new(path: &str, found: bool, impacted: Vec<ImpactedFile>, max_depth: usize) -> Self {
+        FileImpact {
+            path: path.to_string(),
+            found,
+            impacted_count: impacted.len(),
+            impacted,
+            max_depth,
+            generated_at: now(),
+            ..Default::default()
+        }
+    }
+}
+
 // files that define a given symbol (by symbol-node match).
 fn files_defining(graph: &SymbolGraph, symbol: &str) -> Vec<String> {
     let mut set = BTreeSet::new();
@@ -2078,10 +2110,32 @@ fn reverse_adjacency(graph: &SymbolGraph) -> HashMap<String, BTreeSet<String>> {
 /// `impact?symbol=` answer, not just the dirty-symbols view.
 pub fn symbol_impact(graph: &SymbolGraph, symbol: &str, max_depth: usize) -> SymbolImpact {
     let defined_in = files_defining(graph, symbol);
+    let impacted = dependents(graph, &defined_in, max_depth);
+    SymbolImpact {
+        symbol: symbol.to_string(),
+        defined_in,
+        impacted_count: impacted.len(),
+        impacted,
+        max_depth,
+        generated_at: now(),
+        ..Default::default()
+    }
+}
+
+/// The blast radius of one file: [`symbol_impact`]'s walk from `path` itself.
+pub fn file_impact(graph: &SymbolGraph, path: &str, max_depth: usize) -> FileImpact {
+    let found = graph.files.iter().any(|f| f.path == path);
+    let start: Vec<String> = found.then(|| path.to_string()).into_iter().collect();
+    FileImpact::new(path, found, dependents(graph, &start, max_depth), max_depth)
+}
+
+/// The files that reference `start`, transitively up to `max_depth` hops, each with
+/// its distance, nearest first and in path order within a distance.
+fn dependents(graph: &SymbolGraph, start: &[String], max_depth: usize) -> Vec<ImpactedFile> {
     let rev = reverse_adjacency(graph);
-    let mut visited: BTreeSet<String> = defined_in.iter().cloned().collect();
+    let mut visited: BTreeSet<String> = start.iter().cloned().collect();
     let mut impacted: Vec<ImpactedFile> = Vec::new();
-    let mut frontier: Vec<String> = defined_in.clone();
+    let mut frontier: Vec<String> = start.to_vec();
     let mut depth = 1;
     while !frontier.is_empty() && depth <= max_depth {
         let mut next: BTreeSet<String> = BTreeSet::new();
@@ -2103,15 +2157,7 @@ pub fn symbol_impact(graph: &SymbolGraph, symbol: &str, max_depth: usize) -> Sym
         frontier = next.into_iter().collect();
         depth += 1;
     }
-    SymbolImpact {
-        symbol: symbol.to_string(),
-        defined_in,
-        impacted_count: impacted.len(),
-        impacted,
-        max_depth,
-        generated_at: now(),
-        ..Default::default()
-    }
+    impacted
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -2328,6 +2374,7 @@ pub trait QueryGraph: Send + Sync {
     fn for_each_edge(&self, f: &mut dyn FnMut(&str, &str)) -> Result<(), String>;
     fn hotspots(&self, limit: usize) -> Result<Vec<Hotspot>, String>;
     fn impact(&self, symbol: &str, max_depth: usize) -> Result<SymbolImpact, String>;
+    fn file_impact(&self, path: &str, max_depth: usize) -> Result<FileImpact, String>;
     fn trace(&self, from: &str, to: &str) -> Result<SymbolTrace, String>;
     fn clusters(&self) -> Result<Vec<FileCluster>, String>;
     /// The cluster holding `path`.
@@ -2395,6 +2442,10 @@ impl QueryGraph for SymbolGraph {
 
     fn impact(&self, symbol: &str, max_depth: usize) -> Result<SymbolImpact, String> {
         Ok(symbol_impact(self, symbol, max_depth))
+    }
+
+    fn file_impact(&self, path: &str, max_depth: usize) -> Result<FileImpact, String> {
+        Ok(file_impact(self, path, max_depth))
     }
 
     fn trace(&self, from: &str, to: &str) -> Result<SymbolTrace, String> {

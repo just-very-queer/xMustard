@@ -50,25 +50,25 @@ func compatSpec(t *Tool) toolcompat.Spec {
 
 // buildArgsCompat validates a call with BuildArgs, falling back to a toolcompat
 // repair when it is rejected. The original rejection stands when no repair applies.
-func buildArgsCompat(t *Tool, raw map[string]any) (map[string]string, []Normalization, *RPCError) {
-	args, aliased, rerr := BuildArgs(t, raw)
-	if rerr == nil {
+func buildArgsCompat(t *Tool, raw map[string]any) (map[string]string, []Normalization, *ArgError) {
+	args, aliased, aerr := BuildArgs(t, raw)
+	if aerr == nil {
 		return args, aliasNorms(aliased), nil
 	}
 	res := toolcompat.Normalize(compatSpec(t), raw)
 	if res.Err != nil {
 		if res.Err.Code == toolcompat.CodeNeedsRepair {
-			return nil, nil, &RPCError{Code: CodeInvalidParams, Message: res.Err.Message, Data: map[string]any{
-				"tool": t.Name, "argument": res.Err.Field, "reason": res.Err.Code, "expected": res.Err.Expected, "signature": res.Err.Signature}}
+			return nil, nil, &ArgError{Tool: t.Name, Argument: res.Err.Field, Reason: res.Err.Code, Message: res.Err.Message,
+				Detail: map[string]any{"expected": res.Err.Expected, "signature": res.Err.Signature}}
 		}
-		return nil, nil, rerr
+		return nil, nil, aerr
 	}
 	if !res.Applied() || slices.ContainsFunc(res.Normalizations, func(n toolcompat.Normalization) bool { return n.Op == toolcompat.OpCoerce }) {
-		return nil, nil, rerr
+		return nil, nil, aerr
 	}
 	args, aliased, again := BuildArgs(t, res.Args)
 	if again != nil {
-		return nil, nil, rerr
+		return nil, nil, aerr
 	}
 	norms := aliasNorms(aliased)
 	for _, n := range res.Normalizations {
