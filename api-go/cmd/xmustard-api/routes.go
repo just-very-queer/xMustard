@@ -39,6 +39,7 @@ func apiRouteAreas() [][]routeSpec {
 		runRoutes,
 		verificationRoutes,
 		goalRoutes,
+		governanceRoutes,
 		routesOf(registerInlineRoutes),
 	}
 }

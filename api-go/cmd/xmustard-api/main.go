@@ -1258,95 +1258,6 @@ func registerInlineRoutes(mux routeRegistrar) {
 		}
 		writeJSON(w, http.StatusOK, result)
 	}
-	// --- workspace policy / governance ---
-	mux.HandleFunc("GET /api/workspaces/{workspace_id}/policy", func(w http.ResponseWriter, r *http.Request) {
-		result, err := workspaceops.GetWorkspacePolicy(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))
-		issueIntel(w, err, result)
-	})
-	mux.HandleFunc("PUT /api/workspaces/{workspace_id}/policy", func(w http.ResponseWriter, r *http.Request) {
-		var policy workspaceops.WorkspacePolicy
-		if err := json.NewDecoder(r.Body).Decode(&policy); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON body"})
-			return
-		}
-		result, err := workspaceops.SetWorkspacePolicy(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), policy)
-		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				writeJSON(w, http.StatusNotFound, map[string]any{"error": "Workspace not found"})
-				return
-			}
-			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
-			return
-		}
-		writeJSON(w, http.StatusOK, result)
-	})
-	mux.HandleFunc("POST /api/workspaces/{workspace_id}/policy/evaluate", func(w http.ResponseWriter, r *http.Request) {
-		var input workspaceops.RunPolicyInput
-		if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON body"})
-			return
-		}
-		result, err := workspaceops.EvaluateRunAgainstPolicy(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), input)
-		issueIntel(w, err, result)
-	})
-	// --- audit log ---
-	mux.HandleFunc("GET /api/workspaces/{workspace_id}/audit-log", func(w http.ResponseWriter, r *http.Request) {
-		limit := 0
-		if v := r.URL.Query().Get("limit"); v != "" {
-			if n, err := strconv.Atoi(v); err == nil {
-				limit = n
-			}
-		}
-		result, err := workspaceops.ListAuditEvents(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), limit)
-		issueIntel(w, err, result)
-	})
-	mux.HandleFunc("POST /api/workspaces/{workspace_id}/audit-log", func(w http.ResponseWriter, r *http.Request) {
-		var event workspaceops.AuditEvent
-		if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON body"})
-			return
-		}
-		result, err := workspaceops.RecordAuditEvent(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), event)
-		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				writeJSON(w, http.StatusNotFound, map[string]any{"error": "Workspace not found"})
-				return
-			}
-			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
-			return
-		}
-		writeJSON(w, http.StatusOK, result)
-	})
-	// --- security review depth ---
-	mux.HandleFunc("GET /api/workspaces/{workspace_id}/security/dispositions", func(w http.ResponseWriter, r *http.Request) {
-		result, err := workspaceops.ListSecurityDispositions(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))
-		issueIntel(w, err, result)
-	})
-	mux.HandleFunc("GET /api/workspaces/{workspace_id}/security/findings/{finding_id}/disposition", func(w http.ResponseWriter, r *http.Request) {
-		result, err := workspaceops.GetSecurityDisposition(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), r.PathValue("finding_id"))
-		issueIntel(w, err, result)
-	})
-	mux.HandleFunc("PUT /api/workspaces/{workspace_id}/security/findings/{finding_id}/disposition", func(w http.ResponseWriter, r *http.Request) {
-		var in workspaceops.SecurityDisposition
-		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON body"})
-			return
-		}
-		result, err := workspaceops.SetSecurityDisposition(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), r.PathValue("finding_id"), in)
-		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				writeJSON(w, http.StatusNotFound, map[string]any{"error": "Workspace not found"})
-				return
-			}
-			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
-			return
-		}
-		writeJSON(w, http.StatusOK, result)
-	})
-	mux.HandleFunc("GET /api/workspaces/{workspace_id}/security/review-packet", func(w http.ResponseWriter, r *http.Request) {
-		result, err := workspaceops.BuildSecurityReviewPacket(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))
-		issueIntel(w, err, result)
-	})
 	mux.HandleFunc("POST /api/workspaces/{workspace_id}/index", func(w http.ResponseWriter, r *http.Request) {
 		// the route gate admits only the indexer and admin roles; the history records who
 		who := memoryCaller{principal: principalFromContext(r.Context())}.id()
@@ -1549,32 +1460,6 @@ func registerInlineRoutes(mux routeRegistrar) {
 	registerMCPRoutes(mux)
 	mux.HandleFunc("GET /api/workspaces/{workspace_id}/runs/{run_id}/why-failed", func(w http.ResponseWriter, r *http.Request) {
 		result, err := workspaceops.ExplainRunFailureCtx(r.Context(), envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), r.PathValue("run_id"))
-		issueIntel(w, err, result)
-	})
-	// --- explicit security acceptance criteria ---
-	mux.HandleFunc("GET /api/workspaces/{workspace_id}/security/acceptance-criteria", func(w http.ResponseWriter, r *http.Request) {
-		result, err := workspaceops.GetSecurityAcceptanceCriteria(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))
-		issueIntel(w, err, result)
-	})
-	mux.HandleFunc("PUT /api/workspaces/{workspace_id}/security/acceptance-criteria", func(w http.ResponseWriter, r *http.Request) {
-		var in workspaceops.SecurityAcceptanceCriteria
-		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON body"})
-			return
-		}
-		result, err := workspaceops.SetSecurityAcceptanceCriteria(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), in)
-		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				writeJSON(w, http.StatusNotFound, map[string]any{"error": "Workspace not found"})
-				return
-			}
-			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
-			return
-		}
-		writeJSON(w, http.StatusOK, result)
-	})
-	mux.HandleFunc("GET /api/workspaces/{workspace_id}/security/acceptance-evaluation", func(w http.ResponseWriter, r *http.Request) {
-		result, err := workspaceops.EvaluateSecurityAcceptance(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))
 		issueIntel(w, err, result)
 	})
 	mux.HandleFunc("POST /api/terminal/open", func(w http.ResponseWriter, r *http.Request) {
