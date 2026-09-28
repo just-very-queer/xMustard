@@ -164,6 +164,18 @@ secondary-platform defects.
 - Existing tracked runtime data needs a separate hygiene review. This pass
   preserved the records and did not remove data or rewrite Git history.
 
+## Known upgrade consequences
+
+- **Even-depth memory paths go stale once (WS-27, parity program).** Before the
+  confined-read fix (`safepath_unix.go`, 7d380c4 on `feat/parity-v2`), a declared
+  memory path with an even number of components, such as `server/config.go`, read as
+  missing, so memories promoted then hold the missing-file sentinel as that path's
+  drift baseline. After the upgrade the file reads as present, which drift-on-recall
+  treats as missing-to-present drift: each such memory is marked stale on its first
+  drift check, once. Re-verifying it takes a fresh baseline. No migration rewrites the
+  baselines, because a stored sentinel cannot be told apart from a file that was
+  really missing.
+
 ## Reorganization completed in this review
 
 - Established [one documentation entrypoint](README.md), current vision,
