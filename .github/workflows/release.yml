@@ -1,9 +1,10 @@
 # Tagged release (PAR-OPS-03). Pushing a tag vX.Y.Z runs `make release` on each platform
 # (cargo --locked, Go -trimpath with CGO off, a start-up check of the built binaries) and
 # creates a DRAFT GitHub release holding the archives, their .sha256 files and SHA256SUMS.
-# The owner reviews the draft and publishes it, then bumps packaging/homebrew/xmustard.rb
-# from SHA256SUMS. A manual run builds and uploads the archives as workflow artifacts
-# without creating a release (a dry run).
+# The owner reviews the draft and publishes it, then moves the Homebrew formula to it with
+# `sh packaging/homebrew/bump.sh <tag>` (urls and sha256s from SHA256SUMS). A manual run
+# builds and uploads the archives as workflow artifacts without creating a release (a dry
+# run).
 #
 # Reproducibility: both toolchains are pinned below, dependencies are locked, and no build
 # cache is restored, so a release never consumes a cache written by a pull-request run.

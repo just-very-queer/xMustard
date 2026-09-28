@@ -1,10 +1,11 @@
-# Every platform installs v0.1.0 checked against a sha256. macOS arm64 takes the prebuilt
-# release archive. The other platforms build the tagged source tarball: macOS Intel and
-# Linux arm64 have no archive, and v0.1.0's Linux x86_64 archive needs glibc 2.39, which
-# Ubuntu 22.04, Debian 12 and RHEL 9 lack. `make release` builds the archives and
-# .github/workflows/release.yml publishes them (its Linux leg now builds on Ubuntu 22.04,
-# glibc 2.35). To bump: set version, the source tarball's sha256, and each archive
-# url/sha256 pair from the release's SHA256SUMS.
+# Every platform installs the tagged release, checked against a sha256. macOS arm64 takes
+# the prebuilt release archive. The other platforms build the tagged source tarball: macOS
+# Intel and Linux arm64 have no archive, and v0.1.0's Linux x86_64 archive needs glibc
+# 2.39, which Ubuntu 22.04, Debian 12 and RHEL 9 lack. `make release` builds the archives
+# and .github/workflows/release.yml publishes them. Its Linux leg builds on Ubuntu 22.04
+# (glibc 2.35), so from its first release Linux x86_64 can take the archive (an on_intel
+# block under on_linux). To move every url and sha256 to a published release, run
+# `sh packaging/homebrew/bump.sh vX.Y.Z`.
 class Xmustard < Formula
   desc "Governed runtime memory and grounding for coding agents (MCP server)"
   homepage "https://github.com/just-very-queer/xMustard"
