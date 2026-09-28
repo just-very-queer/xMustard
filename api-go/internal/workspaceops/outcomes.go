@@ -474,10 +474,11 @@ func openFailureFor(ctx context.Context, dataDir, workspaceID, subject string) b
 
 // --- analysis --------------------------------------------------------------------------
 
-// outputRedactor removes secrets, including the values of secret-named variables in
-// this process's environment (a command runs without them, but its code can still find
-// and print one), before anything is analyzed or stored.
-var outputRedactor = sync.OnceValue(func() *redact.Redactor {
+// OutputRedactor removes secrets from command and tool output, including the values of
+// secret-named variables in this process's environment (a command runs without them,
+// but its code can still find and print one), before anything is analyzed or stored.
+// why_failed analyses and evidence capture (the capture route's stream redactor) share it.
+var OutputRedactor = sync.OnceValue(func() *redact.Redactor {
 	return redact.New(redact.WithEnv(redact.SecretEnv(os.Environ())...))
 })
 
@@ -509,7 +510,7 @@ func analyzedOutput(raw string, total int64) *collectedOutput {
 		raw = raw[len(raw)-outcomeTailBytes:]
 	}
 	analyzed := int64(len(raw))
-	text, rep := outputRedactor().String(raw)
+	text, rep := OutputRedactor().String(raw)
 	a := outcomeAnalysis{
 		Signals:        outputSignals(text),
 		ErrorLines:     salientErrorLines(text, maxOutcomeErrorLines),
@@ -728,7 +729,7 @@ func outcomeNonce() (string, error) {
 
 // redactedLine redacts a command line and bounds it for storage.
 func redactedLine(s string) string {
-	out, _ := outputRedactor().String(s)
+	out, _ := OutputRedactor().String(s)
 	if len(out) > 1024 {
 		out = strings.ToValidUTF8(out[:1024], "") + "…"
 	}

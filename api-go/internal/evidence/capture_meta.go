@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/url"
@@ -13,6 +14,7 @@ import (
 
 	"xmustard/api-go/internal/budget"
 	"xmustard/api-go/internal/injection"
+	"xmustard/api-go/internal/redact"
 )
 
 // Universal observation capture (PAR-CTX-01): the output of ANY tool — a client's
@@ -26,6 +28,12 @@ import (
 
 // FormatRaw is a body that is the tool output itself.
 const FormatRaw HookFormat = "raw"
+
+// ErrSecretPath refuses the capture of a tool output whose path is a secret file or
+// directory (redact.MatchSecretPath: SSH keys, netrc, registry tokens, .env files).
+// Such content is a credential store whatever the redactor finds in it, so it is
+// neither retained nor projected; the client keeps its own result.
+var ErrSecretPath = errors.New("the captured output comes from a secret path and is not retained")
 
 // ObservationInput is one capture request.
 type ObservationInput struct {
@@ -76,7 +84,8 @@ type ObservationResult struct {
 	Command string `json:"-"`
 }
 
-// Observe captures one tool output.
+// Observe captures one tool output. The output of a secret path is refused
+// (ErrSecretPath) once the body has named its path; the spool is discarded.
 func (s *Store) Observe(ctx context.Context, reg *Registry, in ObservationInput) (*ObservationResult, error) {
 	if reg == nil {
 		reg = DefaultRegistry()
@@ -145,6 +154,9 @@ func (s *Store) Observe(ctx context.Context, reg *Registry, in ObservationInput)
 		meta.BodySHA256, meta.BodyBytes = body.BodySHA256, body.BodyBytes
 	}
 	sel := selectorFor(meta, body, in.Sel)
+	if pattern, secret := redact.MatchSecretPath(sel.Path); secret {
+		return nil, fmt.Errorf("%w (%q matches %s)", ErrSecretPath, sel.Path, pattern)
+	}
 	red, argv0 := reg.Select(sel)
 	pol := PolicyFor(meta.Client)
 	target := pol.Target

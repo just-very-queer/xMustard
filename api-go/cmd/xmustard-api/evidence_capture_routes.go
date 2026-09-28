@@ -33,10 +33,11 @@ import (
 // the in-flight large-body semaphore; its memory is admitted by the budget instead.)
 //
 // Redaction (PAR-CTX-01 "Redaction applies") is fail-closed: an original is retained
-// for the whole retention window and is searchable, so capture refuses with 503
-// redaction_unavailable until a streaming redactor is wired (captureRedactor; the
-// WS-05 redact.Stream plugs in there). Search stays available for originals that
-// were captured redacted.
+// for the whole retention window and is searchable, so every capture streams through
+// the WS-05 secret redactor before it reaches the spool (captureRedactor,
+// capture_redactor.go). Capture refuses with 503 redaction_unavailable if no redactor
+// is set, with 503 redaction_failed if it fails, and with 422 secret_path for the
+// output of a secret path; nothing is retained then.
 //
 // target lowers the client's projection target for one capture (1 KiB..1 MiB; a value
 // above the client policy's target changes nothing). The Pi adapter uses it to retain
@@ -49,10 +50,6 @@ import (
 //
 // A captured test, build or lint output also becomes a run-independent outcome that
 // ground lists (WS-21, outcome_routes.go), except in read-only mode.
-
-// captureRedactor wraps the capture spool writer with the streaming secret redactor.
-// While it is nil, POST .../evidence/capture refuses (503 redaction_unavailable).
-var captureRedactor func(io.Writer) evidence.StreamRedactor
 
 // captureWindowBytes is the transient memory one capture holds while it decodes and
 // reduces (read/write buffers, reducer windows, one long line).
@@ -144,7 +141,8 @@ func registerEvidenceCaptureRoutes(mux routeRegistrar, store *evidence.Store) {
 		actor, enforced := principalScope(r)
 		res, err := store.Observe(r.Context(), reg, evidence.ObservationInput{
 			WorkspaceID: ws, RepoScope: workspaceops.WorkspaceRepoScope(dataDir(), ws), Actor: actor, AuthEnforced: enforced,
-			Format: format, Body: r.Body, Meta: meta, Sel: sel, Redact: redact, Target: derefInt(target),
+			Format: format, Body: r.Body, Meta: meta, Sel: sel, Target: derefInt(target),
+			Redact: func(w io.Writer) evidence.StreamRedactor { return &failClosed{next: redact(w)} },
 		})
 		if err != nil {
 			writeCaptureError(w, err)
@@ -228,21 +226,34 @@ func badCapture(w http.ResponseWriter, reason, msg string) {
 	writeJSON(w, http.StatusBadRequest, map[string]any{"error": msg, "reason": reason})
 }
 
-// writeCaptureError maps capture/search errors; the rest are the evidence errors.
+// captureErrors are the capture and search errors, in match order; the rest are the
+// evidence errors (writeEvidenceError).
+var captureErrors = []struct {
+	err    error
+	status int
+	reason string
+}{
+	{io.ErrUnexpectedEOF, http.StatusBadRequest, "incomplete_body"},
+	{evidence.ErrBadBody, http.StatusBadRequest, "bad_body"},
+	{evidence.ErrInvalidSearch, http.StatusBadRequest, "invalid_search"},
+	{evidence.ErrSecretPath, http.StatusUnprocessableEntity, "secret_path"},
+	{errRedactionFailed, http.StatusServiceUnavailable, "redaction_failed"},
+}
+
+// writeCaptureError maps capture/search errors.
 func writeCaptureError(w http.ResponseWriter, err error) {
 	var tooBig *http.MaxBytesError
-	switch {
-	case errors.As(err, &tooBig):
+	if errors.As(err, &tooBig) {
 		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]any{"error": "request body too large", "reason": "too_large"})
-	case errors.Is(err, io.ErrUnexpectedEOF):
-		badCapture(w, "incomplete_body", "the request body ended early")
-	case errors.Is(err, evidence.ErrBadBody):
-		badCapture(w, "bad_body", err.Error())
-	case errors.Is(err, evidence.ErrInvalidSearch):
-		badCapture(w, "invalid_search", err.Error())
-	default:
-		writeEvidenceError(w, err)
+		return
 	}
+	for _, m := range captureErrors {
+		if errors.Is(err, m.err) {
+			writeJSON(w, m.status, map[string]any{"error": err.Error(), "reason": m.reason})
+			return
+		}
+	}
+	writeEvidenceError(w, err)
 }
 
 func derefInt(v *int) int {
