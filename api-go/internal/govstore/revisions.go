@@ -263,7 +263,7 @@ func (t *txn) AppendRevision(ctx context.Context, in RevisionInput, actor Actor)
 		return Revision{}, err
 	}
 	if in.Activate {
-		if err := t.serveRevision(ctx, cur, next, title, description, digest, in.SearchTokens, actor); err != nil {
+		if err := t.serveRevision(ctx, cur, next, title, description, in.Content, digest, in.SearchTokens, actor); err != nil {
 			return Revision{}, err
 		}
 	} else if _, err := t.exec(ctx, "UPDATE entries SET head_revision = ?, updated_at = ? WHERE id = ?", next, now, in.EntryID); err != nil {
@@ -292,7 +292,7 @@ func (t *txn) AppendRevision(ctx context.Context, in RevisionInput, actor Actor)
 // promotion, the verification mode and the drift baselines: votes and baselines bind
 // to the revision they were cast on, so nothing unverified can look verified. Pending
 // revisions older than rev are withdrawn.
-func (t *txn) serveRevision(ctx context.Context, cur Entry, rev int64, title, description, digest string,
+func (t *txn) serveRevision(ctx context.Context, cur Entry, rev int64, title, description, content, digest string,
 	tokens []string, actor Actor) error {
 	now := t.nowText()
 	tokenJSON, err := encodeStrings(tokens)
@@ -306,6 +306,9 @@ func (t *txn) serveRevision(ctx context.Context, cur Entry, rev int64, title, de
 		return err
 	}
 	if err := t.clearBaselines(ctx, cur.ID); err != nil {
+		return err
+	}
+	if err := t.putDedupeKeys(ctx, cur.Cursor, cur.WorkspaceID, content); err != nil {
 		return err
 	}
 	res, err := t.exec(ctx, `UPDATE revisions SET state = 'withdrawn', decided_at = ?
@@ -362,7 +365,7 @@ func (t *txn) AcceptRevision(ctx context.Context, in AcceptInput, actor Actor) (
 		t.nowText(), in.EntryID, in.Revision); err != nil {
 		return Entry{}, err
 	}
-	if err := t.serveRevision(ctx, cur, in.Revision, rv.Title, rv.Description, rv.ContentDigest, in.SearchTokens, actor); err != nil {
+	if err := t.serveRevision(ctx, cur, in.Revision, rv.Title, rv.Description, rv.Content, rv.ContentDigest, in.SearchTokens, actor); err != nil {
 		return Entry{}, err
 	}
 	if err := t.appendEvent(ctx, actor, eventRow{

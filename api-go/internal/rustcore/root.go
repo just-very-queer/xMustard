@@ -24,11 +24,28 @@ const (
 	// call lowers it to what the transient pool can admit (coreStdoutCap).
 	maxCoreStdout = 64 << 20 // 64 MiB
 	maxCoreStderr = 64 << 10 // 64 KiB
+	// refusedExit is the core's exit code for a request it refused: a usage error, a
+	// flag it does not take, or input that names nothing (a revision that names no
+	// commit, a worktree that is not a checkout of the repository).
+	refusedExit = 2
+	// maxRefusalText bounds a refusal's Reason.
+	maxRefusalText = 512
 )
+
+// Refusal is a request a one-shot core refused (exit refusedExit): the caller's error,
+// not a failure. Error() stays sanitized like every bridge error; Reason is the first
+// line of the core's stderr, for a caller whose core refusals name only its own input
+// (impact's scope= form) to pass on.
+type Refusal struct {
+	Sub, Reason string
+}
+
+func (r *Refusal) Error() string { return "rust-core " + r.Sub + " refused the request" }
 
 // runCoreCtx is the single hardened bridge runner: binary-first resolution,
 // context timeout, bounded stdout/stderr, full server-side logging on failure, and a
-// SANITIZED error to the caller (no raw child stderr / host paths leaked). The rust
+// SANITIZED error to the caller (no raw child stderr / host paths leaked; a refusal's
+// Reason is kept apart, see Refusal). The rust
 // bin parses args positionally (args.next()), not via a flag parser, so a
 // `-`-leading query/path/seed is read literally — no `--` delimiter is required.
 // The child is killed when the caller's ctx is cancelled or coreCallTimeout elapses,
@@ -106,6 +123,10 @@ func runCoreCtx(parent context.Context, sub string, args ...string) ([]byte, err
 		if ctx.Err() == context.DeadlineExceeded {
 			return nil, fmt.Errorf("rust-core %s timed out", sub)
 		}
+		var exit *exec.ExitError
+		if errors.As(runErr, &exit) && exit.ExitCode() == refusedExit {
+			return nil, &Refusal{Sub: sub, Reason: refusalText(errb.String())}
+		}
 		return nil, fmt.Errorf("rust-core %s failed", sub)
 	}
 	// Without a request scope (owned), the reservation ends when this call returns;
@@ -121,6 +142,15 @@ func runCoreCtx(parent context.Context, sub string, args ...string) ([]byte, err
 		}
 	}
 	return out.Bytes(), nil
+}
+
+// refusalText is the first line of a refusal's stderr, bounded.
+func refusalText(stderr string) string {
+	line, _, _ := strings.Cut(strings.TrimSpace(stderr), "\n")
+	if len(line) > maxRefusalText {
+		line = line[:maxRefusalText] + "…"
+	}
+	return line
 }
 
 // runBoundedCmd runs an already-built rust-core command with BOUNDED stdout/stderr

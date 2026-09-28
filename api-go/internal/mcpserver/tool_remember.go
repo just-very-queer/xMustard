@@ -3,6 +3,7 @@ package mcpserver
 import (
 	"encoding/json"
 	"strconv"
+	"strings"
 )
 
 // memoryKinds mirrors workspaceops.MemoryKinds (a test keeps them equal).
@@ -41,10 +42,39 @@ var rememberTool = &Tool{
 		{Name: "kind", Type: typeString, Enum: memoryKinds},
 		{Name: "topic", Type: typeString, Desc: "a/b/c"},
 		{Name: "tags", Type: typeString, List: true, MaxLen: 1024},
+		// Structured claims and typed relations (WS-27).
+		{Name: "claims", Type: typeString, MaxLen: 4096},
+		{Name: "relations", Type: typeString, List: true, MaxLen: 1024},
 		// Tiers (WS-31): core is pushed into every session; a protected field.
 		{Name: "tier", Type: typeString, Enum: []string{"core", "deferred"}, Desc: "core needs a human approver"},
 	},
-	Doc: "`tier`: core memory is pushed into every session (initialize instructions, SessionStart) once a human approver " +
+	Doc: "A proposal is checked against the workspace before it is written. An exact restatement (after " +
+		"lower-casing and collapsing whitespace) of a served memory is recorded as a corroboration of it: " +
+		"`outcome` is `corroborated`, `duplicate_of` names it and `corroborations` counts the principals that " +
+		"restated it; nothing new is created. It is created instead, with a warning saying why, when it names " +
+		"`supersedes`, `claims` or `relations`, asks for another kind, topic, tags or expiry, declares a path " +
+		"the memory does not have, or cites an untrusted capture the memory is clean of (dedupe never launders " +
+		"quarantine). Otherwise `outcome` is `created`. Either way `possible_duplicates` lists active memories " +
+		"it restates: " +
+		"`exact`, `near` (Jaccard of character 3-grams >= 0.9) or `similar` (>= 0.5), with `similarity`; short " +
+		"or low-entropy text only matches exactly. `possible_conflicts` are advisory: tier 1 `claim` (claims " +
+		"on one subject exclude each other), tier 2 `contradiction` (a shared anchor and most words in common, " +
+		"but different numbers, versions or commands, or only one negates or deprecates), tier 3 " +
+		"`path_overlap`. `suggested_supersedes` names served memories it may replace (near duplicates and tier " +
+		"1-2 conflicts): pass them as `supersedes`, or verify the other `duplicate_of` the served one (the " +
+		"target must be served), which merges it once its gate's number of principals agree. `anchors` are " +
+		"what the text is about: paths, symbols (identifiers resolved against the code index), identifiers, " +
+		"commands, env and config keys, error " +
+		"codes, URLs and quoted code placed on file lines, each with `fanout`, the memories you may read that " +
+		"share it (served ones, and pending ones for the verifier and human-approver roles). Secrets are " +
+		"redacted from claims as from the text. " +
+		"`claims` states `subject|predicate|object` statements separated by `;`, the predicate one of " +
+		"requires, forbids, runs_with, configured_as, pinned_to, deprecated_by, owned_by, replaces; subjects " +
+		"compare case-insensitively, and recall filters on them with `subject` and `predicate`. `relations` " +
+		"are `kind:entry_id` edges, the kind one of refines, contradicts, duplicates, references. A principal " +
+		"may hold at most XMUSTARD_MEMORY_PENDING_QUOTA (500) pending proposals per workspace, and a " +
+		"workspace at most XMUSTARD_MEMORY_ACTIVE_ENVELOPE (100000) active memories. " +
+		"`tier`: core memory is pushed into every session (initialize instructions, SessionStart) once a human approver " +
 		"approved its served revision; deferred memory (the default) appears there only as a title in the deferred index. " +
 		"Choosing a tier, at proposal or with op=tier (entry_id, tier, reason), needs a human approver, and core must fit the " +
 		"workspace's core budget. The workspace's write policy checks every write server-side: a refusal lists its " +
@@ -70,10 +100,44 @@ var rememberTool = &Tool{
 				payload[k] = splitCSV(a[k])
 			}
 		}
+		if claims := parseClaims(a["claims"]); len(claims) > 0 {
+			payload["claims"] = claims
+		}
+		if rels := parseRelations(a["relations"]); len(rels) > 0 {
+			payload["relations"] = rels
+		}
 		if n, err := strconv.ParseInt(a["base_revision"], 10, 64); err == nil {
 			payload["base_revision"] = n
 		}
 		b, _ := json.Marshal(payload)
 		return "POST", wsPath(a, "/context"), string(b)
 	},
+}
+
+// parseClaims reads "subject|predicate|object" claims separated by ";". A claim with
+// another shape keeps its text as the subject, so the API refuses it by name.
+func parseClaims(s string) []map[string]string {
+	var out []map[string]string
+	for _, c := range strings.Split(s, ";") {
+		if c = strings.TrimSpace(c); c == "" {
+			continue
+		}
+		parts := strings.SplitN(c, "|", 3)
+		if len(parts) != 3 {
+			parts = []string{c, "", ""}
+		}
+		out = append(out, map[string]string{"subject": strings.TrimSpace(parts[0]),
+			"predicate": strings.TrimSpace(parts[1]), "object": strings.TrimSpace(parts[2])})
+	}
+	return out
+}
+
+// parseRelations reads "kind:entry_id" relations.
+func parseRelations(s string) []map[string]string {
+	var out []map[string]string
+	for _, r := range splitCSV(s) {
+		kind, target, _ := strings.Cut(r, ":")
+		out = append(out, map[string]string{"kind": strings.TrimSpace(kind), "target": strings.TrimSpace(target)})
+	}
+	return out
 }

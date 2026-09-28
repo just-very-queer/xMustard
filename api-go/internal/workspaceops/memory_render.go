@@ -23,6 +23,8 @@ type recallPage struct {
 	span         recallSpan
 	cursor       recallCursor
 	limit, total int
+	// claims are the candidates' structured claims, for the T1 conflict tier.
+	claims map[string][]govstore.Claim
 }
 
 // RecallLine is the compact render of an entry: one line of its text; fetch the full
@@ -166,6 +168,7 @@ func finishRecall(workspaceID string, req RecallRequest, res map[string]any, pag
 		picked, at = append(picked, c.label(req.Explain)), append(at, pos)
 		prints[c.rank.ID] = c.seenPrint()
 	}
+	pairs := pairConflicts(picked, page.claims) // T1 and T2, once; each build keeps those it returns
 	render := recallRenders[req.renderName()]
 	res["render"] = req.renderName()
 	res["already_shown"] = alreadyShown
@@ -180,7 +183,7 @@ func finishRecall(workspaceID string, req RecallRequest, res map[string]any, pag
 		res["returned"] = len(kept)
 		res["verification_modes"] = countVerificationModes(kept) // per-mode counts of the returned entries
 		res["stale_count"] = countStale(kept)
-		res["conflicts"] = overlappingMemory(kept)
+		res["conflicts"] = keptConflicts(pairs, kept)
 		res["omitted"] = max(page.total-resume, 0)
 		delete(res, "next_cursor")
 		if resume < page.total {

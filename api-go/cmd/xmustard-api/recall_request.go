@@ -20,11 +20,12 @@ func recallRequest(r *http.Request) (workspaceops.RecallRequest, error) {
 		Query: q.Get("query"), Paths: csvList(q, "paths"), Kinds: csvList(q, "kind"), Tags: csvList(q, "tags"),
 		Topic: q.Get("topic"), PathPrefix: q.Get("path_prefix"), Since: q.Get("since"), Until: q.Get("until"),
 		By: q.Get("by"), Status: q.Get("status"), Cursor: q.Get("cursor"), Render: q.Get("render"),
-		SessionID: q.Get("session_id"), Tier: q.Get("tier"), Caller: callerOf(r).ID,
+		SessionID: q.Get("session_id"), Tier: q.Get("tier"), Subject: q.Get("subject"), Predicate: q.Get("predicate"),
+		Caller: callerOf(r).ID,
 	}
 	for name, dst := range map[string]*bool{
 		"explain": &req.Explain, "names_only": &req.NamesOnly, "include_pending": &req.IncludePending,
-		"include_superseded": &req.IncludeSuperseded, "show_expired": &req.ShowExpired,
+		"include_superseded": &req.IncludeSuperseded, "show_expired": &req.ShowExpired, "include_merged": &req.IncludeMerged,
 	} {
 		*dst = q.Get(name) == "true"
 	}

@@ -1,0 +1,39 @@
+# `index build --no-cache` of tests/index_build.rs's 5,000 synthetic files, Linux build box.
+# VmHWM and the largest RssAnon/RssFile sampled from /proc/<pid>/status every 1 ms; the
+# second block breaks the largest sampled smaps total down by mapping (every 3 ms).
+# base = 845868d, head = WS-35 before the drop-cause change (the image numbers did not move after it).
+
+head 0 hwm 26.3 MiB RssAnon 4.3 RssFile 22.0 VmRSS 26.3 binary 134 MB   (debug)
+head 1 hwm 26.1 MiB RssAnon 4.3 RssFile 21.8 VmRSS 26.1 binary 134 MB   (debug)
+head 2 hwm 26.0 MiB RssAnon 4.3 RssFile 21.7 VmRSS 26.0 binary 134 MB   (debug)
+base 0 hwm 23.4 MiB RssAnon 4.3 RssFile 19.2 VmRSS 23.4 binary 126 MB   (debug)
+base 1 hwm 23.5 MiB RssAnon 4.3 RssFile 19.2 VmRSS 23.5 binary 126 MB   (debug)
+base 2 hwm 23.9 MiB RssAnon 4.3 RssFile 19.6 VmRSS 23.9 binary 126 MB   (debug)
+headrel 0 hwm 17.7 MiB RssAnon 4.0 RssFile 13.7 VmRSS 17.7 binary 38 MB
+headrel 1 hwm 17.6 MiB RssAnon 3.9 RssFile 13.7 VmRSS 17.6 binary 38 MB
+headrel 2 hwm 17.7 MiB RssAnon 3.9 RssFile 13.7 VmRSS 17.7 binary 38 MB
+baserel 0 hwm 16.3 MiB RssAnon 3.9 RssFile 12.4 VmRSS 16.3 binary 37 MB
+baserel 1 hwm 16.4 MiB RssAnon 3.9 RssFile 12.5 VmRSS 16.4 binary 37 MB
+baserel 2 hwm 16.3 MiB RssAnon 3.9 RssFile 12.3 VmRSS 16.3 binary 37 MB
+
+# by mapping (MiB)
+headrel 0 total 17.8 xmustard-core 11.7; [heap] 3.4; libc.so.6 1.8; libm.so.6 0.4; ld-linux 0.2
+headrel 1 total 17.9 xmustard-core 11.4; [heap] 3.8; libc.so.6 1.8; libm.so.6 0.4; ld-linux 0.2
+baserel 0 total 16.6 xmustard-core 10.6; [heap] 3.4; libc.so.6 1.8; libm.so.6 0.4; ld-linux 0.2
+baserel 1 total 16.2 xmustard-core 10.2; [heap] 3.4; libc.so.6 1.8; libm.so.6 0.4; ld-linux 0.2
+head 0 total 25.9 xmustard-core 19.8; [heap] 3.4; libc.so.6 1.8; libm.so.6 0.4; ld-linux 0.2   (debug)
+head 1 total 25.8 xmustard-core 18.3; [heap] 4.8; libc.so.6 1.8; libm.so.6 0.4; ld-linux 0.2   (debug)
+base 0 total 23.6 xmustard-core 17.5; [heap] 3.4; libc.so.6 1.8; libm.so.6 0.4; ld-linux 0.2   (debug)
+base 1 total 23.8 xmustard-core 17.7; [heap] 3.4; libc.so.6 1.8; libm.so.6 0.4; ld-linux 0.2   (debug)
+# both images read into the page cache first (cat > /dev/null), debug
+base 0 total 24.4 xmustard-core 18.3; [heap] 3.4
+base 1 total 24.5 xmustard-core 18.4; [heap] 3.4
+head 0 total 25.7 xmustard-core 18.4; [heap] 4.6
+head 1 total 25.4 xmustard-core 19.4; [heap] 3.3
+# a head variant that writes no drop sections, release
+exprel 0 total 17.5 xmustard-core 11.5; [heap] 3.4
+exprel 1 total 17.4 xmustard-core 11.3; [heap] 3.4
+headrel 0 total 17.6 xmustard-core 11.5; [heap] 3.4
+headrel 1 total 17.7 xmustard-core 11.7; [heap] 3.4
+# tests/index_build.rs build_of_5000_files (wait4 maxrss), head before the drop-cause change
+debug: 26.2, 25.8, 26.2 MiB (over the old 25 MiB debug line); release: 17.2 MiB

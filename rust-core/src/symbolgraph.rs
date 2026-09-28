@@ -2159,6 +2159,95 @@ fn dependents(graph: &SymbolGraph, start: &[String], max_depth: usize) -> Vec<Im
     impacted
 }
 
+/// Bounds of one `resolve` call: names per call, declarations kept per name.
+pub const RESOLVE_MAX_NAMES: usize = 16;
+pub const RESOLVE_MAX_DEFINITIONS: usize = 4;
+
+/// One declaration of a resolved name.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Definition {
+    pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line: Option<usize>,
+}
+
+/// A name a memory mentions, resolved against the graph (WS-27 anchors). `count` is how
+/// many declarations matched; `definitions` keeps the first
+/// [`RESOLVE_MAX_DEFINITIONS`] by path, then line.
+#[derive(Debug, Clone, Serialize)]
+pub struct ResolvedName {
+    pub name: String,
+    pub count: usize,
+    pub definitions: Vec<Definition>,
+}
+
+/// The last segment of a qualified name (`pkg.Func`, `Type::method`, `mod#fn`) and its
+/// qualifier, lower-cased, when it has one.
+fn split_qualified(name: &str) -> (&str, Option<String>) {
+    match name.rfind(['.', ':', '#']) {
+        Some(i) => {
+            let qualifier = name[..i].trim_end_matches([':', '.', '#']);
+            let last = qualifier
+                .rsplit(['.', ':', '#', '/'])
+                .next()
+                .unwrap_or(qualifier);
+            (
+                &name[i + 1..],
+                Some(last.to_lowercase()).filter(|q| !q.is_empty()),
+            )
+        }
+        None => (name, None),
+    }
+}
+
+/// Resolves up to [`RESOLVE_MAX_NAMES`] names in one pass over the graph's symbols.
+/// A name matches a declaration by its last segment; a qualified name keeps only the
+/// declarations whose path mentions its qualifier, when any does.
+pub fn resolve_names(
+    graph: &dyn QueryGraph,
+    names: &[String],
+) -> Result<Vec<ResolvedName>, String> {
+    let names = &names[..names.len().min(RESOLVE_MAX_NAMES)];
+    let wanted: Vec<(&str, Option<String>)> = names.iter().map(|n| split_qualified(n)).collect();
+    let mut found: Vec<Vec<Definition>> = vec![Vec::new(); names.len()];
+    graph.for_each_symbol(&mut |s| {
+        for (i, (last, _)) in wanted.iter().enumerate() {
+            if s.name == *last {
+                found[i].push(Definition {
+                    path: s.path.to_string(),
+                    line: s.line,
+                });
+            }
+        }
+    })?;
+    Ok(names
+        .iter()
+        .zip(wanted)
+        .zip(found)
+        .map(|((name, (_, qualifier)), mut defs)| {
+            if let Some(q) = qualifier {
+                let qualified: Vec<Definition> = defs
+                    .iter()
+                    .filter(|d| d.path.to_lowercase().contains(&q))
+                    .cloned()
+                    .collect();
+                if !qualified.is_empty() {
+                    defs = qualified;
+                }
+            }
+            defs.sort();
+            defs.dedup();
+            let count = defs.len();
+            defs.truncate(RESOLVE_MAX_DEFINITIONS);
+            ResolvedName {
+                name: name.clone(),
+                count,
+                definitions: defs,
+            }
+        })
+        .collect())
+}
+
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct SymbolTrace {
     pub from: String,
@@ -2388,6 +2477,9 @@ pub trait QueryGraph: Send + Sync {
     fn indexed_stat(&self, _path: &str) -> Option<(u64, i64)> {
         None
     }
+    /// Call `f` with this source as the graph impact v2, trace and the import-cycle
+    /// check walk (WS-35).
+    fn with_walk_graph(&self, f: &mut dyn FnMut(&dyn crate::index::impact::Graph));
 }
 
 fn inbound_by_path(graph: &SymbolGraph) -> HashMap<&str, usize> {
@@ -2453,6 +2545,10 @@ impl QueryGraph for SymbolGraph {
 
     fn clusters(&self) -> Result<Vec<FileCluster>, String> {
         Ok(compute_clusters(self))
+    }
+
+    fn with_walk_graph(&self, f: &mut dyn FnMut(&dyn crate::index::impact::Graph)) {
+        f(&crate::index::impact::LegacyGraph::new(self));
     }
 }
 
@@ -2580,6 +2676,36 @@ impl QuerySource {
                 None,
             ),
         }
+    }
+
+    /// Impact v2 (WS-35) on this source.
+    pub fn impact(
+        &self,
+        q: &crate::index::impact::Query,
+    ) -> Result<crate::index::impact::Impact, String> {
+        let mut out = Err("the graph was not walked".to_string());
+        self.graph.with_walk_graph(&mut |g| {
+            out = crate::index::impact::run(g, q, &self.coverage.loss_counts);
+        });
+        out
+    }
+
+    /// Trace v2 (WS-35) on this source.
+    pub fn trace(
+        &self,
+        q: &crate::index::trace::TraceQuery,
+    ) -> Result<crate::index::trace::Trace, String> {
+        let mut out = Err("the graph was not walked".to_string());
+        self.graph
+            .with_walk_graph(&mut |g| out = crate::index::trace::run(g, q));
+        out
+    }
+
+    /// The import-cycle summary (PAR-IMP-08) of the code index; None when the legacy
+    /// graph answers (its imports are lexical).
+    pub fn import_cycles(&self) -> Option<Result<crate::index::cycles::CycleSummary, String>> {
+        self.index()
+            .map(|o| o.snapshot.cycles().map(|r| r.summary()))
     }
 
     /// Freshness and coverage summary for a result touching `paths`.
@@ -2945,6 +3071,44 @@ mod tests {
         );
         // a uniquely-defined symbol still resolves.
         assert!(graph.edges.iter().all(|e| e.resolution == "lexical"));
+    }
+
+    #[test]
+    fn resolve_names_finds_declarations_and_narrows_by_qualifier() {
+        let repo = git_repo(&[
+            (
+                "server/config.go",
+                "package server\n\nfunc ListenPort() int { return 8081 }\n",
+            ),
+            (
+                "client/config.go",
+                "package client\n\nfunc ListenPort() int { return 0 }\n",
+            ),
+            ("lib.rs", "pub fn compute_widget() {}\n"),
+        ]);
+        let graph = build_symbol_graph(repo.path(), "ws");
+        let names = [
+            "ListenPort",
+            "server.ListenPort",
+            "compute_widget",
+            "missing_name",
+        ]
+        .map(String::from);
+        let got = resolve_names(&graph, &names).unwrap();
+        let paths = |i: usize| -> Vec<&str> {
+            got[i].definitions.iter().map(|d| d.path.as_str()).collect()
+        };
+        assert_eq!(got[0].count, 2);
+        assert_eq!(paths(0), ["client/config.go", "server/config.go"]);
+        assert_eq!((got[1].count, paths(1)), (1, vec!["server/config.go"]));
+        assert_eq!(paths(2), ["lib.rs"]);
+        assert_eq!(got[2].definitions[0].line, Some(1));
+        assert_eq!((got[3].count, got[3].definitions.len()), (0, 0));
+        let many: Vec<String> = (0..40).map(|i| format!("n{i}")).collect();
+        assert_eq!(
+            resolve_names(&graph, &many).unwrap().len(),
+            RESOLVE_MAX_NAMES
+        );
     }
 
     #[test]

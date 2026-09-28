@@ -16,10 +16,12 @@ const (
 	AnchorConfig     = "config"
 	AnchorErrorCode  = "error_code"
 	AnchorURL        = "url"
+	// AnchorCode is quoted code placed on lines of a file: "path#Lstart-Lend" (WS-27).
+	AnchorCode = "code"
 )
 
 var validAnchorKinds = set(AnchorPath, AnchorSymbol, AnchorIdentifier, AnchorCommand, AnchorEnv, AnchorConfig,
-	AnchorErrorCode, AnchorURL)
+	AnchorErrorCode, AnchorURL, AnchorCode)
 
 // Baseline states: a hash, or the path was missing when the baseline was taken (so its
 // later appearance is drift too).
@@ -34,6 +36,9 @@ type AnchorInput struct {
 	Kind      string
 	Value     string
 	SymbolUID string // resolved against the code index, when known
+	// Extracted: found in the memory's text rather than declared by its author. An
+	// extracted anchor feeds the inverted index but is not one of the entry's paths.
+	Extracted bool
 }
 
 // Anchor is a stored anchor with its drift baseline.
@@ -68,12 +73,17 @@ type AnchorRef struct {
 	Value string `json:"value"`
 }
 
-// AnchorQuery looks memories up through the anchor inverted index.
+// AnchorQuery looks memories up through the anchor inverted index. ActiveOnly keeps
+// active entries, pending ones included; ServedOnly keeps promoted, active, unexpired
+// ones (it implies ActiveOnly). With neither, entries of every lifecycle count.
 type AnchorQuery struct {
 	WorkspaceID string
 	Kind        string
 	Values      []string
+	ActiveOnly  bool
 	ServedOnly  bool
+	// NewestFirst orders hits by the newest entry instead of by value.
+	NewestFirst bool
 	Limit       int
 }
 
@@ -83,6 +93,7 @@ type AnchorHit struct {
 	EntryID       string `json:"entry_id"`
 	Kind          string `json:"kind"`
 	Value         string `json:"value"`
+	Declared      bool   `json:"declared"`
 	BaselineState string `json:"baseline_state"`
 	StaleSince    string `json:"stale_since,omitempty"`
 	Fanout        int    `json:"fanout"`
@@ -94,6 +105,9 @@ type AnchorReader interface {
 	// AnchorsFor returns ListAnchors for many entries at once, keyed by entry id.
 	AnchorsFor(ctx context.Context, ids []string) (map[string][]Anchor, error)
 	EntriesByAnchor(ctx context.Context, q AnchorQuery) ([]AnchorHit, error)
+	// AnchorFanout counts, per value of q.Values, the workspace's entries holding it as
+	// an anchor of q.Kind, under q's lifecycle flags (Limit and NewestFirst are unused).
+	AnchorFanout(ctx context.Context, q AnchorQuery) (map[string]int, error)
 }
 
 // AnchorWriter writes anchors, baselines and drift observations.
@@ -157,7 +171,7 @@ func (t *txn) insertAnchors(ctx context.Context, entryID string, paths []string,
 		}
 		seen[ref] = true
 		if _, err := t.exec(ctx, `INSERT INTO anchors (entry_id, ordinal, kind, value, declared, symbol_uid)
-			VALUES (?, ?, ?, ?, 1, ?)`, entryID, ordinal, a.Kind, a.Value, a.SymbolUID); err != nil {
+			VALUES (?, ?, ?, ?, ?, ?)`, entryID, ordinal, a.Kind, a.Value, boolInt(!a.Extracted), a.SymbolUID); err != nil {
 			return "", err
 		}
 		ordinal++
@@ -247,18 +261,17 @@ func (r *reader) EntriesByAnchor(ctx context.Context, q AnchorQuery) ([]AnchorHi
 	for _, v := range q.Values {
 		args = append(args, v)
 	}
-	args = append(args, q.WorkspaceID)
-	served := ""
-	if q.ServedOnly {
-		served = " AND e.promoted = 1 AND e.lifecycle = 'active' AND (e.expires_at IS NULL OR e.expires_at > ?)"
-		args = append(args, r.nowText())
+	lifecycle, lifecycleArgs := r.anchorLifecycle(q)
+	args = append(append(append(args, q.WorkspaceID), lifecycleArgs...), clampLimit(q.Limit))
+	order := "a.value, e.pk"
+	if q.NewestFirst {
+		order = "e.pk DESC, a.value"
 	}
-	args = append(args, clampLimit(q.Limit))
-	rows, err := r.query(ctx, `SELECT a.entry_id, a.kind, a.value, a.baseline_state, coalesce(a.stale_since, ''),
+	rows, err := r.query(ctx, `SELECT a.entry_id, a.kind, a.value, a.declared, a.baseline_state, coalesce(a.stale_since, ''),
 		count(*) OVER (PARTITION BY a.kind, a.value)
 		FROM anchors a JOIN entries e ON e.id = a.entry_id
-		WHERE a.kind = ? AND a.value IN (`+placeholders(len(q.Values))+`) AND e.workspace_id = ?`+served+`
-		ORDER BY a.value, e.pk LIMIT ?`, args...)
+		WHERE a.kind = ? AND a.value IN (`+placeholders(len(q.Values))+`) AND e.workspace_id = ?`+lifecycle+`
+		ORDER BY `+order+` LIMIT ?`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -266,12 +279,52 @@ func (r *reader) EntriesByAnchor(ctx context.Context, q AnchorQuery) ([]AnchorHi
 	var out []AnchorHit
 	for rows.Next() {
 		var h AnchorHit
-		if err := rows.Scan(&h.EntryID, &h.Kind, &h.Value, &h.BaselineState, &h.StaleSince, &h.Fanout); err != nil {
+		if err := rows.Scan(&h.EntryID, &h.Kind, &h.Value, &h.Declared, &h.BaselineState, &h.StaleSince, &h.Fanout); err != nil {
 			return nil, err
 		}
 		out = append(out, h)
 	}
 	return out, rows.Err()
+}
+
+// anchorLifecycle is the condition on the joined entries e that q's lifecycle flags ask
+// for, with its arguments.
+func (r *reader) anchorLifecycle(q AnchorQuery) (string, []any) {
+	switch {
+	case q.ServedOnly:
+		return " AND e.promoted = 1 AND e.lifecycle = 'active' AND (e.expires_at IS NULL OR e.expires_at > ?)", []any{r.nowText()}
+	case q.ActiveOnly:
+		return " AND e.lifecycle = 'active'", nil
+	}
+	return "", nil
+}
+
+// AnchorFanout counts the entries holding each value under q's lifecycle flags.
+func (r *reader) AnchorFanout(ctx context.Context, q AnchorQuery) (map[string]int, error) {
+	if err := validID("workspace", q.WorkspaceID); err != nil {
+		return nil, err
+	}
+	lifecycle, lifecycleArgs := r.anchorLifecycle(q)
+	out := map[string]int{}
+	for start := 0; start < len(q.Values); start += maxInArgs {
+		chunk := q.Values[start:min(start+maxInArgs, len(q.Values))]
+		args := []any{q.Kind}
+		for _, v := range chunk {
+			args = append(args, v)
+		}
+		rows, err := r.query(ctx, `SELECT a.value, count(*) FROM anchors a JOIN entries e ON e.id = a.entry_id
+			WHERE a.kind = ? AND a.value IN (`+placeholders(len(chunk))+`) AND e.workspace_id = ?`+lifecycle+`
+			GROUP BY a.value`, append(append(args, q.WorkspaceID), lifecycleArgs...)...)
+		if err != nil {
+			return nil, err
+		}
+		var v string
+		var n int
+		if err := eachRow(rows, func() { out[v] = n }, func() error { return rows.Scan(&v, &n) }); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
 }
 
 func (t *txn) liveEntry(ctx context.Context, id string) (Entry, error) {

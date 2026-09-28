@@ -47,12 +47,14 @@ called search
 called semantic-impact
 called symbolgraph blast-radius
 called symbolgraph build
+called symbolgraph changes
 called symbolgraph cluster-of
 called symbolgraph clusters
 called symbolgraph coverage
 called symbolgraph hotspots
 called symbolgraph impact
 called symbolgraph impact-file
+called symbolgraph resolve
 called symbolgraph trace
 called syntax-check
 called watch done

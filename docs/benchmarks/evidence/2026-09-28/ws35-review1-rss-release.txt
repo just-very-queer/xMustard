@@ -1,0 +1,9 @@
+index build of 5,000 files: dirty peak 3.9 MiB, RSS peak 17.3 MiB (own 17.5), report Object {"edges_ms": Number(4377), "elapsed_ms": Number(6166), "scan_ms": Number(19), "segment_ms": Number(173)}
+test build_of_5000_files_has_no_file_cap_and_peaks_under_25_mib ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 28 filtered out; finished in 6.61s
+file, Sequential: base 6.3 MiB (dirty 0.6), steady +13.6 (dirty +9.6), swap peak +13.7 (dirty +9.7), after swap +13.9 (dirty +9.9); index {"block_cache":{"block_bytes":16384,"blocks":128,"cap_blocks":128,"hits":11387170,"misses":34321},"hits":205,"loads":2,"max_roots":1,"resident":[{"counts":{"drops":0,"edges":500000,"file_edges":437092,"files":10000,"global_symbols":100000,"names":60000,"symbols":100000},"generation":2,"segment_heap_bytes":0,"storage":"file"}],"swaps":1}
+test resident_rss_on_a_100k_symbol_resolved_graph_stays_within_the_line has been running for over 60 seconds
+file, Overlapping: base 6.4 MiB (dirty 0.6), steady +16.5 (dirty +12.6), swap peak +17.5 (dirty +13.8), after swap +16.1 (dirty +12.5); index {"block_cache":{"block_bytes":16384,"blocks":128,"cap_blocks":128,"hits":8934058,"misses":24492},"hits":157,"loads":2,"max_roots":1,"resident":[{"counts":{"drops":0,"edges":500000,"file_edges":437092,"files":10000,"global_symbols":100000,"names":60000,"symbols":100000},"generation":2,"segment_heap_bytes":0,"storage":"file"}],"swaps":1}
+test resident_rss_on_a_100k_symbol_resolved_graph_stays_within_the_line ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 115.87s
+remote_exit=0
