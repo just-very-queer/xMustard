@@ -86,6 +86,10 @@ const (
 	// hookMaxCandidates is AdmitMemory's bound on one admission; later candidates wait
 	// for a later push.
 	hookMaxCandidates = 64
+	// hookProjectionChars budgets SessionStart's standing memory: a fixed budget under
+	// the additionalContext cap (the ground line takes a few hundred characters), so the
+	// projection cached at it serves every session until memory changes.
+	hookProjectionChars = 9000
 )
 
 // hookBudget is XMUSTARD_HOOK_BUDGET_MS, from 20 to 5,000 ms (default 180).
@@ -380,7 +384,7 @@ func (s *hookServer) grounding(ctx context.Context, c *hookCall, watch bool) hoo
 	}
 	g := workspaceops.HookGrounding(ctx, dataDir(), c.ws.WorkspaceID, c.caller)
 	res := hookResult{context: groundLine(c.ws, g)}
-	budget := min(hooks.Room(res.context), workspaceops.ProjectionMaxChars)
+	budget := min(hooks.Room(res.context), hookProjectionChars)
 	if p, err := workspaceops.CoreProjection(ctx, dataDir(), c.ws.WorkspaceID, budget); err == nil && p.Text != "" {
 		offered := p.ProjectionOffered()
 		if ids := slices.Collect(maps.Keys(offered)); len(ids) == 0 || len(s.sessions.Unseen(c.key, ids)) > 0 {

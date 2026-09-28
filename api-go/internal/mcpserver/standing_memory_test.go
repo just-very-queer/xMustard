@@ -12,7 +12,7 @@ import (
 // projectionAPI answers the projection route for workspace ws with text.
 func projectionAPI(ws, text string) *fakeAPI {
 	return &fakeAPI{handle: func(r Request) *APIResponse {
-		if r.Path == "/api/workspaces/"+ws+"/memory/core?max_chars=4000" {
+		if r.Path == "/api/workspaces/"+ws+"/memory/core?max_chars=6000" {
 			b, _ := json.Marshal(map[string]any{"revision": 7, "text": text})
 			return &APIResponse{Status: 200, Body: string(b)}
 		}

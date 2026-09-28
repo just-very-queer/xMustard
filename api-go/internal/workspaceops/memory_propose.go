@@ -293,9 +293,11 @@ func ProposeContext(dataDir, workspaceID string, req ProposeContextRequest) (*Co
 		return nil, err
 	}
 	description := strings.TrimSpace(req.Description)
+	writer := req.Caller
+	writer.OpenMode = writer.OpenMode || req.OpenMode // open mode has no human approver
 	if err := policy.enforce(memoryWrite{Proposal: true, Title: req.Title, Content: req.Content, Description: description,
 		Kind: req.Kind, Topic: normalizeTopic(req.Topic), Paths: anchors, Tier: tier, Permission: permission,
-		Expires: strings.TrimSpace(req.Expires), Supersedes: supersedes}, req.Caller); err != nil {
+		Expires: strings.TrimSpace(req.Expires), Supersedes: supersedes}, writer); err != nil {
 		return nil, err
 	}
 	requireMulti, threshold := contextDefaults(dataDir)

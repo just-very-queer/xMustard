@@ -37,6 +37,9 @@ func TestRecallBoundsAndKindsMirrorWorkspaceops(t *testing.T) {
 	if got != want {
 		t.Fatalf("recall bounds %v != workspaceops %v", got, want)
 	}
+	if instructionsMemoryChars != workspaceops.ProjectionDefaultChars {
+		t.Fatalf("the instructions' projection budget %d != workspaceops %d", instructionsMemoryChars, workspaceops.ProjectionDefaultChars)
+	}
 	if !slices.Equal(memoryKinds, workspaceops.MemoryKinds) {
 		t.Fatalf("memory kinds %v != workspaceops %v", memoryKinds, workspaceops.MemoryKinds)
 	}

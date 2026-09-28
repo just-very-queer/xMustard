@@ -178,9 +178,12 @@ func (h HumanApprover) TierActor() ContextActor {
 
 // --- the projection ------------------------------------------------------------------
 
-// Projection budget bounds, in characters of the rendered text.
+// Projection budget bounds, in characters of the rendered text. The default (about
+// 1.5k tokens, read once per session in initialize.instructions) holds the default core
+// budget with the frames' overhead of about 90 characters per entry for up to about 18
+// entries; the deferred index takes what the core leaves.
 const (
-	ProjectionDefaultChars = 4000
+	ProjectionDefaultChars = 6000
 	ProjectionMinChars     = 500
 	ProjectionMaxChars     = 20000
 )
@@ -193,12 +196,14 @@ const (
 	indexFieldRunes = 120
 	// maxProjectionScan bounds the served entries one compile reads.
 	maxProjectionScan = 5000
-	// projectionNoteRoom is kept for the withheld and truncation notes.
-	projectionNoteRoom = 320
 )
 
-// Why the projection leaves out a core entry the policy admitted.
-const withheldTooLarge = "too_large"
+// Why the projection leaves out a core entry: the policy admitted it but it does not
+// fit the budget, or it is past the newest maxInjectionCandidates core entries.
+const (
+	withheldTooLarge = "too_large"
+	withheldTooMany  = "too_many"
+)
 
 // ProjectedMemory is a core entry the projection pushes: the served revision whose
 // human approval admitted it.
@@ -368,18 +373,24 @@ func compileProjection(ctx context.Context, r govstore.Reader, workspaceID strin
 	}
 	validUntil := ""
 	var coreIDs []string
+	var overflow []WithheldMemory // core entries past one admission's candidates
 	for _, e := range served {
 		if e.ExpiresAt != "" && (validUntil == "" || e.ExpiresAt < validUntil) {
 			validUntil = e.ExpiresAt
 		}
-		if e.Tier == govstore.TierCore && len(coreIDs) < maxInjectionCandidates {
+		switch {
+		case e.Tier != govstore.TierCore:
+		case len(coreIDs) < maxInjectionCandidates:
 			coreIDs = append(coreIDs, e.ID)
+		default:
+			overflow = append(overflow, WithheldMemory{ID: e.ID, Reason: withheldTooMany})
 		}
 	}
 	adm, err := admitIn(ctx, r, workspaceID, injection.SurfaceCore, coreIDs, gate)
 	if err != nil {
 		return nil, "", err
 	}
+	adm.Withheld = append(adm.Withheld, overflow...)
 	p := &MemoryProjection{WorkspaceID: workspaceID, Revision: rev, Budget: budget, CoreBudget: gate.policy.CoreBudgetChars,
 		Core: []ProjectedMemory{}, Withheld: adm.Withheld, Complete: complete, TokenEstimator: evidence.TokenEstimator,
 		Deferred: DeferredIndex{Withheld: map[string]int{}, Groups: map[string]int{}}}
@@ -391,28 +402,35 @@ func compileProjection(ctx context.Context, r govstore.Reader, workspaceID strin
 	}
 	header := fmt.Sprintf("[xmustard memory] workspace %s at memory revision %d: core memory is human-approved standing "+
 		"guidance; the deferred index lists the rest by title (recall fetches it).", workspaceID, rev)
-	// the core goes first; the notes and the index take what it leaves
+	// the core goes first, newest first; the withheld note and the index take what it
+	// leaves, and a frame gives way to the note that counts what was left out
 	used := hooksSize(header) + hooksSize(injection.Notice)
-	room := budget - used - projectionNoteRoom
-	var frames []string
-	pushed := map[string]bool{}
 	for _, m := range adm.Admitted {
 		frame := injection.Frame(m.Block())
-		if size := hooksSize(frame); size <= room {
-			room, used = room-size, used+size
-			frames = append(frames, frame)
-			pushed[m.ID] = true
-			chars := memoryChars(m.Title, m.Content)
-			p.CoreChars += chars
-			p.Core = append(p.Core, ProjectedMemory{ID: m.ID, Revision: m.Revision, Title: m.Title, Basis: m.Basis, Chars: chars,
-				TokensEst: evidence.EstimateTokens(frame), Content: m.Content, Frame: frame})
+		if size := hooksSize(frame); used+size <= budget {
+			used += size
+			p.Core = append(p.Core, ProjectedMemory{ID: m.ID, Revision: m.Revision, Title: m.Title, Basis: m.Basis,
+				Chars: memoryChars(m.Title, m.Content), TokensEst: evidence.EstimateTokens(frame), Content: m.Content, Frame: frame})
 			continue
 		}
 		p.Withheld = append(p.Withheld, WithheldMemory{ID: m.ID, Reason: withheldTooLarge})
 	}
+	note := withheldCoreNote(p.Withheld)
+	for len(p.Core) > 0 && note != "" && used+hooksSize(note) > budget {
+		last := p.Core[len(p.Core)-1]
+		p.Core, used = p.Core[:len(p.Core)-1], used-hooksSize(last.Frame)
+		p.Withheld = append(p.Withheld, WithheldMemory{ID: last.ID, Reason: withheldTooLarge})
+		note = withheldCoreNote(p.Withheld)
+	}
 	parts := []string{header}
-	if note := withheldCoreNote(p.Withheld); note != "" {
+	if note != "" {
 		parts, used = append(parts, note), used+hooksSize(note)
+	}
+	pushed := make(map[string]bool, len(p.Core))
+	frames := make([]string, len(p.Core))
+	for i, m := range p.Core {
+		pushed[m.ID], frames[i] = true, m.Frame
+		p.CoreChars += m.Chars
 	}
 	index := renderDeferredIndex(served, pushed, budget-used, &p.Deferred)
 	if len(frames) > 0 || index != "" {

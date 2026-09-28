@@ -44,7 +44,9 @@ type MemoryPolicy struct {
 	MaxTitleChars       int `json:"max_title_chars"`
 	MaxDescriptionChars int `json:"max_description_chars"`
 	// CoreBudgetChars caps the served core tier: the title and content of every served
-	// core entry together. Letta's core budget, 65,536, is the ceiling.
+	// core entry together. The default fits ProjectionDefaultChars with its frames;
+	// Letta's core budget, 65,536, is the ceiling (a projection budget cuts what does not
+	// fit, labeled too_large).
 	CoreBudgetChars int `json:"core_budget_chars"`
 	// MaxTopicDepth caps a topic's "/"-separated segments.
 	MaxTopicDepth int `json:"max_topic_depth"`
@@ -82,7 +84,7 @@ var pushApprovalSurfaces = []injection.Surface{injection.SurfaceCore, injection.
 // DefaultMemoryPolicy is the policy of a workspace that has none.
 func DefaultMemoryPolicy() MemoryPolicy {
 	return MemoryPolicy{
-		MaxEntryChars: 20000, MaxTitleChars: 200, MaxDescriptionChars: 200, CoreBudgetChars: 8000, MaxTopicDepth: 6,
+		MaxEntryChars: 20000, MaxTitleChars: 200, MaxDescriptionChars: 200, CoreBudgetChars: 4000, MaxTopicDepth: 6,
 		RequiredFields: []string{}, AllowedKinds: []string{}, ProtectedFields: []string{protectedTier},
 		ProtectedPatterns: []ProtectedPattern{},
 		PushApproval: map[string]string{

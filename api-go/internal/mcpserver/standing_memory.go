@@ -26,9 +26,10 @@ import (
 const MemoryCoreURI = "xmustard://memory/core"
 
 const (
-	// instructionsMemoryChars budgets the projection initialize appends: about 1k
-	// tokens, read once per session.
-	instructionsMemoryChars = 4000
+	// instructionsMemoryChars budgets the projection initialize appends: about 1.5k
+	// tokens, read once per session (workspaceops.ProjectionDefaultChars; a test keeps
+	// them equal).
+	instructionsMemoryChars = 6000
 	// standingMemoryTimeout bounds the projection lookup so a slow API cannot stall
 	// session start; on any failure the static instructions are served.
 	standingMemoryTimeout = 1500 * time.Millisecond

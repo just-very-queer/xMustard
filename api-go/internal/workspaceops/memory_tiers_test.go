@@ -579,3 +579,103 @@ func TestMemoryTokenReport(t *testing.T) {
 		t.Fatalf("the report carries memory text: %s", b)
 	}
 }
+
+// projectionBenchDir holds eight human-approved core memories of about 400 bytes and
+// deferred single-agent memories, n in all.
+func projectionBenchDir(b *testing.B, deferred int) (string, string) {
+	b.Helper()
+	dir, ws := b.TempDir(), "ws"
+	single := false
+	if err := writeJSON(dir+"/settings.json", appSettings{RequireMultiAgentVerification: &single}); err != nil {
+		b.Fatal(err)
+	}
+	if _, err := MintIdentityToken(dir, "hum", "verifier+human-approver", 0, nil, TokenIdentity{Kind: PrincipalHuman}); err != nil {
+		b.Fatal(err)
+	}
+	body := strings.Repeat("Deploys go through make release after the checks pass on main. ", 6)
+	for i := range 8 {
+		e, err := Remember(dir, ws, RememberRequest{ProposeContextRequest: ProposeContextRequest{Title: "deploy rule " + strconv.Itoa(i),
+			Content: body + strings.Repeat("x", i)}}, ContextActor{ID: "author"})
+		if err != nil {
+			b.Fatal(err)
+		}
+		if _, err := VerifyContextOutcome(dir, ws, e.ID, ContextActor{ID: "hum", Kind: PrincipalHuman, Verifier: true}, VerifyRequest{}); err != nil {
+			b.Fatal(err)
+		}
+		if _, err := SetMemoryTier(dir, ws, e.ID, "core", "bench", humanActor("hum")); err != nil {
+			b.Fatal(err)
+		}
+	}
+	desc := "one line that says what the entry holds"
+	for i := range deferred {
+		if _, err := Remember(dir, ws, RememberRequest{ProposeContextRequest: ProposeContextRequest{Title: "fact " + strconv.Itoa(i),
+			Content: "the service " + strconv.Itoa(i) + " listens on its own port", Kind: MemoryKinds[i%len(MemoryKinds)]},
+			Description: &desc}, ContextActor{ID: "author"}); err != nil {
+			b.Fatal(err)
+		}
+	}
+	return dir, ws
+}
+
+// BenchmarkCoreProjectionCompile measures compiling the projection at the default
+// budget (8 core entries admitted, 500 deferred entries indexed): the cold path after
+// every memory write.
+func BenchmarkCoreProjectionCompile(b *testing.B) {
+	dir, ws := projectionBenchDir(b, 500)
+	ctx := context.Background()
+	b.ReportAllocs()
+	for b.Loop() {
+		projectionCache.Lock()
+		clear(projectionCache.m)
+		projectionCache.Unlock()
+		p, err := CoreProjection(ctx, dir, ws, 0)
+		if err != nil || len(p.Core) != 8 || p.Cached {
+			b.Fatalf("projection: %v %+v", err, p)
+		}
+	}
+}
+
+// BenchmarkCoreProjectionCached measures the warm path: the revision read that proves
+// the cached projection current.
+func BenchmarkCoreProjectionCached(b *testing.B) {
+	dir, ws := projectionBenchDir(b, 500)
+	ctx := context.Background()
+	if _, err := CoreProjection(ctx, dir, ws, 0); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	for b.Loop() {
+		p, err := CoreProjection(ctx, dir, ws, 0)
+		if err != nil || !p.Cached {
+			b.Fatalf("projection: %v %+v", err, p)
+		}
+	}
+}
+
+// BenchmarkSinceRevisionDelta measures ground's memory section with a delta over 200
+// changes.
+func BenchmarkSinceRevisionDelta(b *testing.B) {
+	dir, ws := projectionBenchDir(b, 0)
+	var g groundingMemory
+	g.build(dir, ws, "me", groundMemoryOptions{since: noSince})
+	since := *g.MemoryRevision
+	projectionBenchSingle(b, dir, ws, 200)
+	b.ReportAllocs()
+	for b.Loop() {
+		var g groundingMemory
+		if unknown := g.build(dir, ws, "me", groundMemoryOptions{since: since}); len(unknown) != 0 || len(g.MemoryDelta.Added) != 200 {
+			b.Fatalf("delta: %v %+v", unknown, g.MemoryDelta)
+		}
+	}
+}
+
+// projectionBenchSingle adds n single-agent memories.
+func projectionBenchSingle(b *testing.B, dir, ws string, n int) {
+	b.Helper()
+	for i := range n {
+		if _, err := Remember(dir, ws, RememberRequest{ProposeContextRequest: ProposeContextRequest{Title: "added " + strconv.Itoa(i),
+			Content: "a fact added after the revision " + strconv.Itoa(i)}}, ContextActor{ID: "author"}); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
