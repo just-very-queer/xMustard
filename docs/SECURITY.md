@@ -556,19 +556,26 @@ the redacted text. In v0.1.0 no redactor was wired, so every capture answered
   key-aware detector for secret fields in JSON, YAML, env files, headers and flags,
   and the literal values of this daemon's secret-named environment variables. Each
   secret becomes `[REDACTED:<rule>]`.
-- **Streaming.** `redact.Writer` holds one 128 KiB window and a lookahead of about
-  33 KiB, the longest span any detector reads past a match (a private key body and
-  its END marker). A secret split across writes or windows is therefore seen whole,
-  and the output is byte for byte what one pass over the whole input gives. The
-  stream is never buffered: the redactor retains about 0.3 MiB, and at most about
-  1.2 MiB on input that is nothing but secrets, inside the 2 MiB capture window. The
-  hook decoder flushes it at each section boundary, so each output string is
-  redacted as one input.
-- **Secret paths.** When the capture's `path`, or the file path its hook body names
-  (in either order in the body), is on the secret-path denylist (`.ssh/`, SSH key
-  files, `.netrc`, `.npmrc`, `.pypirc`, `.dockercfg`, `.env` and `.env.*` other than
-  templates such as `.env.example`), the capture is refused with `422 secret_path`
-  and nothing is retained. The client keeps its own result.
+- **Streaming.** `redact.Writer` buffers 128 KiB and decides it 8 KiB at a time.
+  Each window is read with the lookahead after it, about 33 KiB, the longest span
+  any detector reads past a match (a private key body and its END marker). A secret
+  split across writes or windows is therefore seen whole, and the output is byte
+  for byte what one pass over the whole input gives. The stream is never buffered,
+  and a window's scratch and output are sized by the 8 KiB it decides, not by how
+  many secrets it holds. Measured on 16 MiB in the decoder's 32 KiB writes, the
+  redactor's live heap peaks at 0.4 MiB at most, on input that is nothing but
+  secrets (an 8-byte secret environment value repeated, the densest case), under a
+  quarter of the 2 MiB capture window. The hook decoder flushes it at each section
+  boundary, so each output string is redacted as one input.
+- **Secret paths.** When any path the capture names is on the secret-path denylist
+  (`.ssh/`, SSH key files, `.netrc`, `.npmrc`, `.pypirc`, `.dockercfg`, `.env` and
+  `.env.*` other than templates such as `.env.example`), the capture is refused with
+  `422 secret_path` and nothing is retained. The paths checked are the caller's
+  `path`, every path field of the hook body's tool input (`file_path`, `filePath`,
+  `path`, `target_file`, `notebook_path`, `directory`, `dir_path`), and every such
+  field of its response (Claude Read's `file.filePath`), wherever they appear in the
+  body. One path cannot hide another: a caller's `path=README.md` does not admit a
+  body that reads `.env`. The client keeps its own result.
 - **Fail closed.** A server without a redactor answers `503 redaction_unavailable`.
   A redactor that fails (panics) answers `503 redaction_failed`. On every refusal
   the spool is discarded, so nothing is retained.
@@ -577,10 +584,11 @@ the redacted text. In v0.1.0 no redactor was wired, so every capture answered
   unquoted token-named value without a digit (the `redact` package documentation
   lists the limits). Such an original can be revoked with
   `DELETE .../evidence/{handle}`, and the admin purge (`DELETE .../evidence`)
-  removes every original of a workspace. A secret file read through a shell
-  (`cat .env`) is not matched by path, so its output passes through the content
-  rules only. `capture.body_sha256` is the digest of the body as received; it names
-  the body but does not reveal it.
+  removes every original of a workspace. Only named paths are matched: a secret
+  file read through a shell (`cat .env`), and the matches of a search over a
+  directory (a Grep over `/repo`, with or without a `glob` such as `.env*`), pass
+  through the content rules only. `capture.body_sha256` is the digest of the body
+  as received; it names the body but does not reveal it.
 
 ## Health endpoint
 

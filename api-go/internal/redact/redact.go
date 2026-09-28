@@ -26,12 +26,12 @@
 // merged with the next window's findings. So a secret split across read or
 // window boundaries is still found, the output is what one pass over the
 // whole input produces whatever the chunking of reads or the window
-// boundaries, and the engine's memory is bounded by the window whatever the
-// input length or its density of secrets (streaming 16 MiB, ordinary text or
-// nothing but secrets, grows the live heap by about 0.4 MiB at most). String
-// and Bytes also hold their result, one copy of the input's size, and String
-// returns its input without copying when nothing is redacted; Check holds
-// nothing; Findings holds one entry per secret.
+// boundaries, and the engine's memory is bounded by its buffer and window
+// whatever the input length (streaming 16 MiB, ordinary text or nothing but
+// secrets, grows the live heap by about 0.4 MiB at most). String and Bytes
+// also hold their result, one copy of the input's size, and String returns its
+// input without copying when nothing is redacted; Check holds nothing;
+// Findings holds one entry per secret.
 //
 // A private key is replaced between its BEGIN and END markers. When separators
 // interrupt it (quoted lines joined by "+" or written as adjacent literals,
