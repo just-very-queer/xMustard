@@ -91,58 +91,164 @@ func splitNumbered(t []byte, sep byte) (path, line, rest []byte, ok bool) {
 	return nil, nil, nil, false
 }
 
+// grepLineRule recognizes one form of grep output line (ok false: not this form).
+type grepLineRule func(st *groupState, t []byte) (groupedItem, bool)
+
+// grepLineRules are tried in order and the first that recognizes a line wins; a line
+// none recognizes is a bare path. The order matters where forms overlap: a heading's
+// numbered rows before "path:12:text", OpenCode's "path:" heading before the
+// unnumbered "path:text".
+var grepLineRules = []grepLineRule{
+	grepSeparator,         // blank, or "--" between context groups
+	grepHeadedRow,         // rg --heading: "12:text" or "12-context" under a path line
+	grepOpenCodeRow,       // OpenCode: "  Line 12: text" under a "path:" heading
+	grepNumbered,          // grep -n, rg, Pi: "path:12:text" (or "path:12:3:text")
+	grepCount,             // grep -c: "path:3"
+	grepOpenCodeHeading,   // OpenCode: "/abs/path:" above its "  Line N:" rows
+	grepNumberedContext,   // "path-12-context"
+	grepSummary,           // "Found N matches", "No matches found", "[… limit reached]"
+	grepUnnumbered,        // "path:text" (rg writing to a pipe, grep -r)
+	grepUnnumberedContext, // "path-text" after an unnumbered match
+}
+
 func parseGrepLine(st *groupState, line []byte) groupedItem {
 	t := bytes.TrimRight(line, "\r")
-	switch {
-	case len(bytes.TrimSpace(t)) == 0 || bytes.Equal(t, []byte("--")):
-		return groupedItem{kind: ikOther}
-	case len(st.heading) > 0 && numberAt(t, 0) > 0:
-		k := numberAt(t, 0)
-		switch {
-		case k < len(t) && t[k] == ':':
-			rest := t[k+1:]
-			if c := numberAt(rest, 0); c > 0 && c < len(rest) && rest[c] == ':' {
-				rest = rest[c+1:]
-			}
-			return groupedItem{kind: ikMatch, path: st.heading, line: t[:k], text: rest}
-		case k < len(t) && t[k] == '-':
-			return groupedItem{kind: ikContext, path: st.heading}
+	for _, rule := range grepLineRules {
+		if it, ok := rule(st, t); ok {
+			return it
 		}
-	}
-	if p, ln, rest, ok := splitNumbered(t, ':'); ok {
-		st.heading = st.heading[:0]
-		return groupedItem{kind: ikMatch, path: p, line: ln, text: rest}
-	}
-	if i := bytes.LastIndexByte(t, ':'); i > 0 && i < len(t)-1 && numberAt(t, i+1) == len(t) {
-		return groupedItem{kind: ikCount, path: t[:i], count: atoi(t[i+1:])}
-	}
-	if p, _, _, ok := splitNumbered(t, '-'); ok && (len(st.heading) == 0 || bytes.Equal(p, st.heading)) {
-		return groupedItem{kind: ikContext, path: p}
-	}
-	if isNotice(t) || bytes.HasPrefix(t, []byte("Found ")) || bytes.HasPrefix(t, []byte("No files found")) {
-		return groupedItem{kind: ikSummary} // notices (Pi "[100 matches limit reached]")
-	}
-	// "path:text" without a line number (rg writing to a pipe, grep -r)
-	if p, rest, ok := splitUnnumbered(t); ok {
-		st.heading = st.heading[:0]
-		st.lastPath = append(st.lastPath[:0], p...)
-		return groupedItem{kind: ikMatch, path: p, text: rest}
-	}
-	// "path-text": unnumbered context of the file just matched
-	if n := len(st.lastPath); n > 0 && len(t) > n && t[n] == '-' && bytes.HasPrefix(t, st.lastPath) {
-		return groupedItem{kind: ikContext, path: t[:n]}
 	}
 	// a bare path: a heading when matches follow, else a files-with-matches entry
 	st.heading = append(st.heading[:0], t...)
 	return groupedItem{kind: ikFile, path: st.heading}
 }
 
-// noticeRe recognizes a tool's bracketed notice ("[100 matches limit reached. Use
-// limit=200 for more]", "[50KB limit reached]"); other lines starting with '[' are
-// output like any other.
-var noticeRe = regexp.MustCompile(`(?i)^\[[^\[\]]*\b(limit reached|more (lines|entries|results|matches|files)|truncated|omitted|not shown|no (matches|results|files))\b[^\[\]]*\]$`)
+func grepSeparator(_ *groupState, t []byte) (groupedItem, bool) {
+	return groupedItem{kind: ikOther}, len(bytes.TrimSpace(t)) == 0 || bytes.Equal(t, []byte("--"))
+}
 
-func isNotice(t []byte) bool { return len(t) > 2 && len(t) <= 512 && t[0] == '[' && noticeRe.Match(t) }
+func grepHeadedRow(st *groupState, t []byte) (groupedItem, bool) {
+	k := numberAt(t, 0)
+	if len(st.heading) == 0 || k == 0 || k >= len(t) {
+		return groupedItem{}, false
+	}
+	switch t[k] {
+	case ':':
+		rest := t[k+1:]
+		if c := numberAt(rest, 0); c > 0 && c < len(rest) && rest[c] == ':' {
+			rest = rest[c+1:]
+		}
+		return groupedItem{kind: ikMatch, path: st.heading, line: t[:k], text: rest}, true
+	case '-':
+		return groupedItem{kind: ikContext, path: st.heading}, true
+	}
+	return groupedItem{}, false
+}
+
+var openCodeRowPrefix = []byte("  Line ")
+
+// grepOpenCodeRow reads OpenCode's grep rows (tool/grep.ts in 1.18.33, the grep
+// tool's formatter in 2.0.1): "  Line 12: text" below the file's "path:" heading.
+func grepOpenCodeRow(st *groupState, t []byte) (groupedItem, bool) {
+	if len(st.heading) == 0 || !bytes.HasPrefix(t, openCodeRowPrefix) {
+		return groupedItem{}, false
+	}
+	rest := t[len(openCodeRowPrefix):]
+	k := numberAt(rest, 0)
+	if k == 0 || k >= len(rest) || rest[k] != ':' {
+		return groupedItem{}, false
+	}
+	return groupedItem{kind: ikMatch, path: st.heading, line: rest[:k], text: bytes.TrimPrefix(rest[k+1:], []byte(" "))}, true
+}
+
+func grepNumbered(st *groupState, t []byte) (groupedItem, bool) {
+	p, ln, rest, ok := splitNumbered(t, ':')
+	if !ok {
+		return groupedItem{}, false
+	}
+	st.heading = st.heading[:0]
+	return groupedItem{kind: ikMatch, path: p, line: ln, text: rest}, true
+}
+
+func grepCount(_ *groupState, t []byte) (groupedItem, bool) {
+	i := bytes.LastIndexByte(t, ':')
+	if i <= 0 || i >= len(t)-1 || numberAt(t, i+1) != len(t) {
+		return groupedItem{}, false
+	}
+	return groupedItem{kind: ikCount, path: t[:i], count: atoi(t[i+1:])}, true
+}
+
+// grepOpenCodeHeading reads OpenCode's file heading: an absolute path (OpenCode
+// resolves every match path) and a colon, with no other colon but a drive letter's.
+func grepOpenCodeHeading(st *groupState, t []byte) (groupedItem, bool) {
+	n := len(t)
+	if n < 3 || t[n-1] != ':' {
+		return groupedItem{}, false
+	}
+	p := t[:n-1]
+	if len(p) > 3 && p[1] == ':' && (p[2] == '\\' || p[2] == '/') {
+		p = p[2:] // C:\repo\a.go
+	}
+	if (p[0] != '/' && p[0] != '\\') || bytes.IndexByte(p, ':') >= 0 {
+		return groupedItem{}, false
+	}
+	st.heading = append(st.heading[:0], t[:n-1]...)
+	return groupedItem{kind: ikHeading, path: st.heading}, true
+}
+
+func grepNumberedContext(st *groupState, t []byte) (groupedItem, bool) {
+	p, _, _, ok := splitNumbered(t, '-')
+	if !ok || (len(st.heading) > 0 && !bytes.Equal(p, st.heading)) {
+		return groupedItem{}, false
+	}
+	return groupedItem{kind: ikContext, path: p}, true
+}
+
+// grepSummaryPrefixes start the tools' own count and empty-result lines.
+var grepSummaryPrefixes = [][]byte{[]byte("Found "), []byte("No files found"), []byte("No matches found")}
+
+func grepSummary(_ *groupState, t []byte) (groupedItem, bool) {
+	if isNotice(t) {
+		return groupedItem{kind: ikSummary}, true // Pi "[100 matches limit reached]", OpenCode "(Results are truncated: …)"
+	}
+	for _, p := range grepSummaryPrefixes {
+		if bytes.HasPrefix(t, p) {
+			return groupedItem{kind: ikSummary}, true
+		}
+	}
+	return groupedItem{}, false
+}
+
+func grepUnnumbered(st *groupState, t []byte) (groupedItem, bool) {
+	p, rest, ok := splitUnnumbered(t)
+	if !ok {
+		return groupedItem{}, false
+	}
+	st.heading = st.heading[:0]
+	st.lastPath = append(st.lastPath[:0], p...)
+	return groupedItem{kind: ikMatch, path: p, text: rest}, true
+}
+
+func grepUnnumberedContext(st *groupState, t []byte) (groupedItem, bool) {
+	n := len(st.lastPath)
+	if n == 0 || len(t) <= n || t[n] != '-' || !bytes.HasPrefix(t, st.lastPath) {
+		return groupedItem{}, false
+	}
+	return groupedItem{kind: ikContext, path: t[:n]}, true
+}
+
+// noticeRe recognizes a tool's bracketed or parenthesized notice ("[100 matches limit
+// reached. Use limit=200 for more]", "[50KB limit reached]", OpenCode's "(Results are
+// truncated: showing first 100 results. …)"); other lines starting with '[' or '(' are
+// output like any other.
+var noticeRe = func() *regexp.Regexp {
+	const words = `\b(limit reached|more (lines|entries|results|matches|files)|truncated|omitted|not shown|no (matches|results|files))\b`
+	return regexp.MustCompile(`(?i)^(\[[^\[\]]*` + words + `[^\[\]]*\]|\([^()]*` + words + `[^()]*\))$`)
+}()
+
+func isNotice(t []byte) bool {
+	return len(t) > 2 && len(t) <= 512 && (t[0] == '[' || t[0] == '(') && noticeRe.Match(t)
+}
 
 // splitUnnumbered splits "path:text" when the part before the first ':' looks like
 // a file path: no whitespace, a '/' or a '.', and not a URL scheme or a drive letter.
