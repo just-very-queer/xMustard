@@ -125,6 +125,8 @@ check: check-backend check-frontend
 check-backend:
 	cd api-go && go test ./...
 	cd api-go && go build ./...
+	cd api-go && go vet -tags review ./cmd/xmustard-ops/ ./internal/workspaceops/ && \
+		go test -tags review -run 'Review|Merge' ./cmd/xmustard-ops/ ./internal/workspaceops/
 	cd rust-core && cargo test
 	cd rust-core && cargo clippy
 

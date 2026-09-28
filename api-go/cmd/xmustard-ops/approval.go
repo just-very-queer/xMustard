@@ -6,7 +6,9 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"maps"
 	"os"
+	"slices"
 	"strings"
 
 	"xmustard/api-go/internal/workspaceops"
@@ -148,23 +150,22 @@ func runApprovalQueue(e opsEnv, args []string) int {
 	return e.emit(q)
 }
 
-// reviewCommands are the `review` subcommands.
+// reviewCommands are the `review` subcommands. The review build tag adds anchor
+// (review_anchor.go).
 var reviewCommands = map[string]func(opsEnv, string, []string) int{
 	"approve": runReviewApprove,
 	"revoke":  runReviewRevoke,
 	"gate":    runReviewGate,
 }
 
-// runReview is `review <approve|revoke|gate> <workspace_id> [flags]`.
+// runReview is `review <subcommand> <workspace_id> [flags]`.
 func runReview(e opsEnv, args []string) int {
-	if len(args) < 2 {
-		return e.usage("usage: xmustard-ops review <approve|revoke|gate> <workspace_id> [flags]")
+	if len(args) >= 2 {
+		if run, ok := reviewCommands[args[0]]; ok {
+			return run(e, args[1], args[2:])
+		}
 	}
-	run, ok := reviewCommands[args[0]]
-	if !ok {
-		return e.usage("usage: xmustard-ops review <approve|revoke|gate> <workspace_id> [flags]")
-	}
-	return run(e, args[1], args[2:])
+	return e.usage("usage: xmustard-ops review <" + strings.Join(slices.Sorted(maps.Keys(reviewCommands)), "|") + "> <workspace_id> [flags]")
 }
 
 // runReviewApprove attests the change from the merge base of --base to --head.
